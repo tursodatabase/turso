@@ -1714,12 +1714,9 @@ async fn eval_delta(
         }
     }
 
-    let min_max_deltas = co.with(|ctx| ctx.operator.extract_min_max_deltas(&delta));
-    let mut recompute =
-        co.with(|ctx| RecomputeMinMax::new(min_max_deltas, &existing_groups, ctx.operator));
     if co.with(|ctx| ctx.operator.has_min_max()) {
-        co.io(|ctx| recompute.process(&mut existing_groups, ctx.operator, ctx.cursors))
-            .await;
+        let min_max_deltas = co.with(|ctx| ctx.operator.extract_min_max_deltas(&delta));
+        recompute_min_max(co, min_max_deltas, &mut existing_groups).await?;
     }
 
     let (output_delta, computed_states) = co.with(|ctx| {
@@ -1765,500 +1762,262 @@ async fn fetch_group_rowid(
     Ok(co.io(|ctx| ctx.cursors.index_cursor.rowid()).await)
 }
 
-/// State machine for recomputing MIN/MAX values after deletion
-#[derive(Debug)]
-pub enum RecomputeMinMax {
-    ProcessElements {
-        /// Current column being processed
-        current_column_idx: usize,
-        /// Columns to process (combined MIN and MAX)
-        columns_to_process: Vec<(String, usize, bool)>, // (group_key, column_name, is_min)
-        /// MIN/MAX deltas for checking values and weights
-        min_max_deltas: MinMaxDeltas,
-    },
-    Scan {
-        /// Columns still to process
-        columns_to_process: Vec<(String, usize, bool)>,
-        /// Current index in columns_to_process (will resume from here)
-        current_column_idx: usize,
-        /// MIN/MAX deltas for checking values and weights
-        min_max_deltas: MinMaxDeltas,
-        /// Current group key being processed
-        group_key: String,
-        /// Current column name being processed
-        column_name: usize,
-        /// Whether we're looking for MIN (true) or MAX (false)
-        is_min: bool,
-        /// The scan state machine for finding the new MIN/MAX
-        scan_state: Box<ScanState>,
-    },
-    Done,
+/// Finds the new MIN or MAX of every column whose current value the delta
+/// retracts, and the first MIN or MAX of every column the delta inserts a
+/// value into.
+async fn recompute_min_max(
+    co: &mut Co<AggregateStep>,
+    min_max_deltas: MinMaxDeltas,
+    existing_groups: &mut HashMap<String, AggregateState>,
+) -> Result<(), Box<LimboError>> {
+    let columns_to_process =
+        co.with(|ctx| min_max_columns_to_check(&min_max_deltas, existing_groups, ctx.operator));
+
+    for (group_key, column_name, is_min) in columns_to_process {
+        let (storage_id, zset_hash) = co.with(|ctx| {
+            let operator = &ctx.operator;
+            let column_info = operator
+                .column_min_max
+                .get(&column_name)
+                .expect("Column should exist in column_min_max map");
+            (
+                generate_storage_id(operator.operator_id, column_info.index, AGG_TYPE_MINMAX),
+                operator.generate_group_hash(&group_key),
+            )
+        });
+        let current_value = existing_groups.get(&group_key).and_then(|state| {
+            if is_min {
+                state.mins.get(&column_name).cloned()
+            } else {
+                state.maxs.get(&column_name).cloned()
+            }
+        });
+        let group_values = min_max_deltas.get(&group_key).cloned().unwrap_or_default();
+
+        let new_value = find_min_max(
+            co,
+            current_value,
+            column_name,
+            storage_id,
+            zset_hash,
+            &group_values,
+            is_min,
+        )
+        .await?;
+
+        let state = existing_groups.entry(group_key).or_default();
+        let values = if is_min {
+            &mut state.mins
+        } else {
+            &mut state.maxs
+        };
+        match new_value {
+            Some(value) => {
+                values.insert(column_name, value);
+            }
+            None => {
+                values.remove(&column_name);
+            }
+        }
+    }
+    Ok(())
 }
 
-impl RecomputeMinMax {
-    pub fn new(
-        min_max_deltas: MinMaxDeltas,
-        existing_groups: &HashMap<String, AggregateState>,
-        operator: &AggregateOperator,
-    ) -> Self {
-        let mut groups_to_check: HashSet<(String, usize, bool)> = HashSet::default();
+/// The (group, column, is_min) triples whose MIN or MAX the delta can
+/// change: a deletion of the current MIN or MAX of a group, or an insert
+/// into a column that has MIN or MAX.
+fn min_max_columns_to_check(
+    min_max_deltas: &MinMaxDeltas,
+    existing_groups: &HashMap<String, AggregateState>,
+    operator: &AggregateOperator,
+) -> Vec<(String, usize, bool)> {
+    let mut groups_to_check: HashSet<(String, usize, bool)> = HashSet::default();
 
-        // Remember the min_max_deltas are essentially just the only column that is affected by
-        // this min/max, in delta (actually ZSet - consolidated delta) format. This makes it easier
-        // for us to consume it in here.
-        //
-        // The most challenging case is the case where there is a retraction, since we need to go
-        // back to the index.
-        for (group_key_str, values) in &min_max_deltas {
-            for ((col_name, hashable_row), weight) in values {
-                let col_info = operator.column_min_max.get(col_name);
+    // Remember the min_max_deltas are essentially just the only column that is affected by
+    // this min/max, in delta (actually ZSet - consolidated delta) format. This makes it easier
+    // for us to consume it in here.
+    //
+    // The most challenging case is the case where there is a retraction, since we need to go
+    // back to the index.
+    for (group_key_str, values) in min_max_deltas {
+        for ((col_name, hashable_row), weight) in values {
+            let col_info = operator.column_min_max.get(col_name);
 
-                let value = &hashable_row.values[0];
+            let value = &hashable_row.values[0];
 
-                if *weight < 0 {
-                    // Deletion detected - check if it's the current MIN/MAX
-                    if let Some(state) = existing_groups.get(group_key_str) {
-                        // Check for MIN
-                        if let Some(current_min) = state.mins.get(col_name) {
-                            if current_min == value {
-                                groups_to_check.insert((group_key_str.clone(), *col_name, true));
-                            }
-                        }
-                        // Check for MAX
-                        if let Some(current_max) = state.maxs.get(col_name) {
-                            if current_max == value {
-                                groups_to_check.insert((group_key_str.clone(), *col_name, false));
-                            }
-                        }
-                    }
-                } else if *weight > 0 {
-                    // If it is not found in the existing groups, then we only need to care
-                    // about this if this is a new record being inserted
-                    if let Some(info) = col_info {
-                        if info.has_min {
+            if *weight < 0 {
+                // Deletion detected - check if it's the current MIN/MAX
+                if let Some(state) = existing_groups.get(group_key_str) {
+                    if let Some(current_min) = state.mins.get(col_name) {
+                        if current_min == value {
                             groups_to_check.insert((group_key_str.clone(), *col_name, true));
                         }
-                        if info.has_max {
+                    }
+                    if let Some(current_max) = state.maxs.get(col_name) {
+                        if current_max == value {
                             groups_to_check.insert((group_key_str.clone(), *col_name, false));
                         }
                     }
                 }
+            } else if *weight > 0 {
+                // If it is not found in the existing groups, then we only need to care
+                // about this if this is a new record being inserted
+                if let Some(info) = col_info {
+                    if info.has_min {
+                        groups_to_check.insert((group_key_str.clone(), *col_name, true));
+                    }
+                    if info.has_max {
+                        groups_to_check.insert((group_key_str.clone(), *col_name, false));
+                    }
+                }
             }
         }
+    }
 
-        if groups_to_check.is_empty() {
-            // No recomputation or initialization needed
-            Self::Done
+    groups_to_check.into_iter().collect()
+}
+
+/// The MIN or MAX of one column of one group after the delta. Starts from
+/// the current value, reads the next candidate from the index while the
+/// delta retracts the candidate, then compares the candidate with the
+/// values the delta inserts.
+async fn find_min_max(
+    co: &mut Co<AggregateStep>,
+    mut candidate: Option<Value>,
+    column_name: usize,
+    storage_id: i64,
+    zset_hash: Hash128,
+    group_values: &HashMap<(usize, HashableRow), isize>,
+    is_min: bool,
+) -> Result<Option<Value>, Box<LimboError>> {
+    while let Some(cand_val) = &candidate {
+        let key = (column_name, HashableRow::new(0, vec![cand_val.clone()]));
+        let is_retracted = group_values.get(&key).is_some_and(|weight| *weight <= 0);
+        if !is_retracted {
+            break;
+        }
+        let index_key = vec![
+            Value::from_i64(storage_id),
+            zset_hash.to_value()?,
+            cand_val.clone(),
+        ];
+        let index_record = ImmutableRecord::from_values(&index_key, index_key.len())?;
+        let seek_op = if is_min { SeekOp::GT } else { SeekOp::LT };
+        let seek_result = co
+            .io(|ctx| {
+                ctx.cursors
+                    .index_cursor
+                    .seek(SeekKey::IndexKey(index_record.as_record_ref()), seek_op)
+            })
+            .await;
+        candidate = if matches!(seek_result, SeekResult::Found) {
+            co.io(|ctx| {
+                candidate_of_index_row(&mut ctx.cursors.index_cursor, storage_id, zset_hash)
+            })
+            .await
         } else {
-            // Convert HashSet to Vec for indexed processing
-            let groups_to_check_vec: Vec<_> = groups_to_check.into_iter().collect();
-            Self::ProcessElements {
-                current_column_idx: 0,
-                columns_to_process: groups_to_check_vec,
-                min_max_deltas,
-            }
-        }
+            None
+        };
     }
-
-    pub fn process(
-        &mut self,
-        existing_groups: &mut HashMap<String, AggregateState>,
-        operator: &AggregateOperator,
-        cursors: &mut DbspStateCursors,
-    ) -> IOResultOr<()> {
-        loop {
-            match self {
-                RecomputeMinMax::ProcessElements {
-                    current_column_idx,
-                    columns_to_process,
-                    min_max_deltas,
-                } => {
-                    if *current_column_idx >= columns_to_process.len() {
-                        *self = RecomputeMinMax::Done;
-                        return Ok(IOResult::Done(()));
-                    }
-
-                    let (group_key, column_name, is_min) =
-                        columns_to_process[*current_column_idx].clone();
-
-                    // Column name is already the index
-                    // Get the storage index from column_min_max map
-                    let column_info = operator
-                        .column_min_max
-                        .get(&column_name)
-                        .expect("Column should exist in column_min_max map");
-                    let storage_index = column_info.index;
-
-                    // Get current value from existing state
-                    let current_value = existing_groups.get(&group_key).and_then(|state| {
-                        if is_min {
-                            state.mins.get(&column_name).cloned()
-                        } else {
-                            state.maxs.get(&column_name).cloned()
-                        }
-                    });
-
-                    // Create storage keys for index lookup
-                    let storage_id =
-                        generate_storage_id(operator.operator_id, storage_index, AGG_TYPE_MINMAX);
-                    let zset_hash = operator.generate_group_hash(&group_key);
-
-                    // Get the values for this group from min_max_deltas
-                    let group_values = min_max_deltas.get(&group_key).cloned().unwrap_or_default();
-
-                    let columns_to_process = std::mem::take(columns_to_process);
-                    let min_max_deltas = std::mem::take(min_max_deltas);
-
-                    let scan_state = if is_min {
-                        Box::new(ScanState::new_for_min(
-                            current_value,
-                            group_key.clone(),
-                            column_name,
-                            storage_id,
-                            zset_hash,
-                            group_values,
-                        ))
-                    } else {
-                        Box::new(ScanState::new_for_max(
-                            current_value,
-                            group_key.clone(),
-                            column_name,
-                            storage_id,
-                            zset_hash,
-                            group_values,
-                        ))
-                    };
-
-                    *self = RecomputeMinMax::Scan {
-                        columns_to_process,
-                        current_column_idx: *current_column_idx,
-                        min_max_deltas,
-                        group_key,
-                        column_name,
-                        is_min,
-                        scan_state,
-                    };
-                }
-                RecomputeMinMax::Scan {
-                    columns_to_process,
-                    current_column_idx,
-                    min_max_deltas,
-                    group_key,
-                    column_name,
-                    is_min,
-                    scan_state,
-                } => {
-                    // Find new value using the scan state machine
-                    let new_value = return_if_io!(scan_state.find_new_value(cursors));
-
-                    // Update the state with new value (create if doesn't exist)
-                    let state = existing_groups.entry(group_key.clone()).or_default();
-
-                    if *is_min {
-                        if let Some(min_val) = new_value {
-                            state.mins.insert(*column_name, min_val);
-                        } else {
-                            state.mins.remove(column_name);
-                        }
-                    } else if let Some(max_val) = new_value {
-                        state.maxs.insert(*column_name, max_val);
-                    } else {
-                        state.maxs.remove(column_name);
-                    }
-
-                    // Move to next column
-                    let min_max_deltas = std::mem::take(min_max_deltas);
-                    let columns_to_process = std::mem::take(columns_to_process);
-                    *self = RecomputeMinMax::ProcessElements {
-                        current_column_idx: *current_column_idx + 1,
-                        columns_to_process,
-                        min_max_deltas,
-                    };
-                }
-                RecomputeMinMax::Done => {
-                    return Ok(IOResult::Done(()));
-                }
-            }
-        }
-    }
+    Ok(best_min_max(candidate, column_name, group_values, is_min))
 }
 
-/// State machine for scanning through the index to find new MIN/MAX values
-#[derive(Debug)]
-pub enum ScanState {
-    CheckCandidate {
-        /// Current candidate value for MIN/MAX
-        candidate: Option<Value>,
-        /// Group key being processed
-        group_key: String,
-        /// Column name being processed
-        column_name: usize,
-        /// Storage ID for the index seek
-        storage_id: i64,
-        /// ZSet ID for the group
-        zset_hash: Hash128,
-        /// Group values from MinMaxDeltas: (column_name, HashableRow) -> weight
-        group_values: HashMap<(usize, HashableRow), isize>,
-        /// Whether we're looking for MIN (true) or MAX (false)
-        is_min: bool,
-    },
-    FetchNextCandidate {
-        /// Current candidate to seek past
-        current_candidate: Value,
-        /// Group key being processed
-        group_key: String,
-        /// Column name being processed
-        column_name: usize,
-        /// Storage ID for the index seek
-        storage_id: i64,
-        /// ZSet ID for the group
-        zset_hash: Hash128,
-        /// Group values from MinMaxDeltas: (column_name, HashableRow) -> weight
-        group_values: HashMap<(usize, HashableRow), isize>,
-        /// Whether we're looking for MIN (true) or MAX (false)
-        is_min: bool,
-    },
-    Done {
-        /// The final MIN/MAX value found
-        result: Option<Value>,
-    },
-}
+/// The value of the index row the cursor is on, or None when that row
+/// belongs to another operator or group: then this group has no more
+/// candidates.
+fn candidate_of_index_row(
+    cursor: &mut BTreeCursor,
+    storage_id: i64,
+    zset_hash: Hash128,
+) -> IOResultOr<Option<Value>> {
+    let record = return_if_io!(cursor.record()).ok_or_else(|| {
+        LimboError::InternalError("Record found on the cursor, but could not be read".to_string())
+    })?;
 
-impl ScanState {
-    pub fn new_for_min(
-        current_min: Option<Value>,
-        group_key: String,
-        column_name: usize,
-        storage_id: i64,
-        zset_hash: Hash128,
-        group_values: HashMap<(usize, HashableRow), isize>,
-    ) -> Self {
-        Self::CheckCandidate {
-            candidate: current_min,
-            group_key,
-            column_name,
-            storage_id,
-            zset_hash,
-            group_values,
-            is_min: true,
+    let mut values = record.iter()?;
+
+    let Some(rec_storage_id) = values.next() else {
+        return Ok(IOResult::Done(None));
+    };
+
+    let Some(rec_zset_hash) = values.next() else {
+        return Ok(IOResult::Done(None));
+    };
+
+    if let ValueRef::Numeric(Numeric::Integer(rec_sid)) = rec_storage_id? {
+        if rec_sid != storage_id {
+            return Ok(IOResult::Done(None));
         }
+    } else {
+        return Ok(IOResult::Done(None));
     }
 
-    // Extract a new candidate from the index. It is possible that, when searching,
-    // we end up going into a different operator altogether. That means we have
-    // exhausted this operator (or group) entirely, and no good candidate was found
-    fn extract_new_candidate(
-        cursors: &mut DbspStateCursors,
-        index_record: &ImmutableRecord,
-        seek_op: SeekOp,
-        storage_id: i64,
-        zset_hash: Hash128,
-    ) -> IOResultOr<Option<Value>> {
-        let seek_result = return_if_io!(cursors
-            .index_cursor
-            .seek(SeekKey::IndexKey(index_record.as_record_ref()), seek_op));
-        if !matches!(seek_result, SeekResult::Found) {
-            return Ok(IOResult::Done(None));
-        }
-
-        let record = return_if_io!(cursors.index_cursor.record()).ok_or_else(|| {
-            LimboError::InternalError(
-                "Record found on the cursor, but could not be read".to_string(),
-            )
-        })?;
-
-        let mut values = record.iter()?;
-
-        let Some(rec_storage_id) = values.next() else {
-            return Ok(IOResult::Done(None));
-        };
-
-        let Some(rec_zset_hash) = values.next() else {
-            return Ok(IOResult::Done(None));
-        };
-
-        // Check if we're still in the same group
-        if let ValueRef::Numeric(Numeric::Integer(rec_sid)) = rec_storage_id? {
-            if rec_sid != storage_id {
+    if let ValueRef::Blob(rec_zset_blob) = rec_zset_hash? {
+        if let Some(rec_hash) = Hash128::from_blob(rec_zset_blob) {
+            if rec_hash != zset_hash {
                 return Ok(IOResult::Done(None));
             }
         } else {
             return Ok(IOResult::Done(None));
         }
+    } else {
+        return Ok(IOResult::Done(None));
+    }
 
-        // Compare zset_hash as blob
-        if let ValueRef::Blob(rec_zset_blob) = rec_zset_hash? {
-            if let Some(rec_hash) = Hash128::from_blob(rec_zset_blob) {
-                if rec_hash != zset_hash {
-                    return Ok(IOResult::Done(None));
+    let Some(third) = values.next() else {
+        return Ok(IOResult::Done(None));
+    };
+
+    Ok(IOResult::Done(Some(third?.to_owned()?)))
+}
+
+/// The better of the candidate and the best value the delta inserts into
+/// the column. NULL values do not take part in MIN/MAX.
+fn best_min_max(
+    candidate: Option<Value>,
+    column_name: usize,
+    group_values: &HashMap<(usize, HashableRow), isize>,
+    is_min: bool,
+) -> Option<Value> {
+    let mut best_from_zset: Option<Value> = None;
+    for ((col, hashable_val), weight) in group_values.iter() {
+        if *col == column_name && *weight > 0 {
+            let value = &hashable_val.values[0];
+            if value == &Value::Null {
+                continue;
+            }
+            if let Some(ref current_best) = best_from_zset {
+                if is_min {
+                    if value.cmp(current_best) == std::cmp::Ordering::Less {
+                        best_from_zset = Some(value.clone());
+                    }
+                } else if value.cmp(current_best) == std::cmp::Ordering::Greater {
+                    best_from_zset = Some(value.clone());
                 }
             } else {
-                return Ok(IOResult::Done(None));
+                best_from_zset = Some(value.clone());
             }
-        } else {
-            return Ok(IOResult::Done(None));
-        }
-
-        let third = values.next();
-        let Some(third) = third else {
-            return Ok(IOResult::Done(None));
-        };
-
-        // Get the value (3rd element)
-        Ok(IOResult::Done(Some(third?.to_owned()?)))
-    }
-
-    pub fn new_for_max(
-        current_max: Option<Value>,
-        group_key: String,
-        column_name: usize,
-        storage_id: i64,
-        zset_hash: Hash128,
-        group_values: HashMap<(usize, HashableRow), isize>,
-    ) -> Self {
-        Self::CheckCandidate {
-            candidate: current_max,
-            group_key,
-            column_name,
-            storage_id,
-            zset_hash,
-            group_values,
-            is_min: false,
         }
     }
 
-    pub fn find_new_value(&mut self, cursors: &mut DbspStateCursors) -> IOResultOr<Option<Value>> {
-        loop {
-            match self {
-                ScanState::CheckCandidate {
-                    candidate,
-                    group_key,
-                    column_name,
-                    storage_id,
-                    zset_hash,
-                    group_values,
-                    is_min,
-                } => {
-                    // First, check if we have a candidate
-                    if let Some(cand_val) = candidate {
-                        // Check if the candidate is retracted (weight <= 0)
-                        // Create a HashableRow to look up the weight
-                        let hashable_cand = HashableRow::new(0, vec![cand_val.clone()]);
-                        let key = (*column_name, hashable_cand);
-                        let is_retracted =
-                            group_values.get(&key).is_some_and(|weight| *weight <= 0);
-
-                        if is_retracted {
-                            // Candidate is retracted, need to fetch next from index
-                            *self = ScanState::FetchNextCandidate {
-                                current_candidate: cand_val.clone(),
-                                group_key: std::mem::take(group_key),
-                                column_name: std::mem::take(column_name),
-                                storage_id: *storage_id,
-                                zset_hash: *zset_hash,
-                                group_values: std::mem::take(group_values),
-                                is_min: *is_min,
-                            };
-                            continue;
-                        }
-                    }
-
-                    // Candidate is valid or we have no candidate
-                    // Now find the best value from insertions in group_values
-                    let mut best_from_zset = None;
-                    for ((col, hashable_val), weight) in group_values.iter() {
-                        if col == column_name && *weight > 0 {
-                            let value = &hashable_val.values[0];
-                            // Skip NULL values - they don't participate in MIN/MAX
-                            if value == &Value::Null {
-                                continue;
-                            }
-                            // This is an insertion for our column
-                            if let Some(ref current_best) = best_from_zset {
-                                if *is_min {
-                                    if value.cmp(current_best) == std::cmp::Ordering::Less {
-                                        best_from_zset = Some(value.clone());
-                                    }
-                                } else if value.cmp(current_best) == std::cmp::Ordering::Greater {
-                                    best_from_zset = Some(value.clone());
-                                }
-                            } else {
-                                best_from_zset = Some(value.clone());
-                            }
-                        }
-                    }
-
-                    // Compare candidate with best from ZSet, filtering out NULLs
-                    let result = match (&candidate, &best_from_zset) {
-                        (Some(cand), Some(zset_val)) if cand != &Value::Null => {
-                            if *is_min {
-                                if zset_val.cmp(cand) == std::cmp::Ordering::Less {
-                                    Some(zset_val.clone())
-                                } else {
-                                    Some(cand.clone())
-                                }
-                            } else if zset_val.cmp(cand) == std::cmp::Ordering::Greater {
-                                Some(zset_val.clone())
-                            } else {
-                                Some(cand.clone())
-                            }
-                        }
-                        (Some(cand), None) if cand != &Value::Null => Some(cand.clone()),
-                        (None, Some(zset_val)) => Some(zset_val.clone()),
-                        (Some(cand), Some(_)) if cand == &Value::Null => best_from_zset,
-                        _ => None,
-                    };
-
-                    *self = ScanState::Done { result };
+    match (&candidate, &best_from_zset) {
+        (Some(cand), Some(zset_val)) if cand != &Value::Null => {
+            if is_min {
+                if zset_val.cmp(cand) == std::cmp::Ordering::Less {
+                    Some(zset_val.clone())
+                } else {
+                    Some(cand.clone())
                 }
-
-                ScanState::FetchNextCandidate {
-                    current_candidate,
-                    group_key,
-                    column_name,
-                    storage_id,
-                    zset_hash,
-                    group_values,
-                    is_min,
-                } => {
-                    // Seek to the next value in the index
-                    let index_key = vec![
-                        Value::from_i64(*storage_id),
-                        zset_hash.to_value()?,
-                        current_candidate.clone(),
-                    ];
-                    let index_record = ImmutableRecord::from_values(&index_key, index_key.len())?;
-
-                    let seek_op = if *is_min {
-                        SeekOp::GT // For MIN, seek greater than current
-                    } else {
-                        SeekOp::LT // For MAX, seek less than current
-                    };
-
-                    let new_candidate = return_if_io!(Self::extract_new_candidate(
-                        cursors,
-                        &index_record,
-                        seek_op,
-                        *storage_id,
-                        *zset_hash
-                    ));
-
-                    *self = ScanState::CheckCandidate {
-                        candidate: new_candidate,
-                        group_key: std::mem::take(group_key),
-                        column_name: std::mem::take(column_name),
-                        storage_id: *storage_id,
-                        zset_hash: *zset_hash,
-                        group_values: std::mem::take(group_values),
-                        is_min: *is_min,
-                    };
-                }
-
-                ScanState::Done { result } => {
-                    return Ok(IOResult::Done(result.clone()));
-                }
+            } else if zset_val.cmp(cand) == std::cmp::Ordering::Greater {
+                Some(zset_val.clone())
+            } else {
+                Some(cand.clone())
             }
         }
+        (Some(cand), None) if cand != &Value::Null => Some(cand.clone()),
+        (None, Some(zset_val)) => Some(zset_val.clone()),
+        (Some(cand), Some(_)) if cand == &Value::Null => best_from_zset,
+        _ => None,
     }
 }
 
