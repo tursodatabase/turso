@@ -17,8 +17,9 @@
 //! the same FTS index concurrently. In WAL mode the same format runs with
 //! degenerate concurrency: the pager write lock serializes writers.
 
+use crate::coro::{with_handle, BoxedResumable, Co, Runner, StepContext, YieldSlot};
 use crate::sync::{Arc, Weak};
-use crate::types::IOResultOr;
+use crate::types::{IOCompletions, IOResultOr, ImmutableRecord};
 use crate::{
     index_method::{
         parse_patterns, BackingColumn, BackingIndex, BackingSchema, BackingStore, BackingStoreOp,
@@ -888,69 +889,105 @@ struct PendingPublish {
     apply: PublishApply,
 }
 
-/// Driver states for the open/scan machine. Everything that must survive
-/// an I/O yield inside one state lives in the variant; scan results shared
-/// across states live in scratch fields on the cursor
-/// (`scan_descriptors`, `scan_tombs`, `scan_data`).
+/// Where the cursor is between an open of the store and a reset.
 #[derive(Debug)]
 enum FtsState {
-    /// Initial state.
+    /// Nothing is open.
     Init,
-    /// Seeking the v2 control row, which marks a v2 store.
-    SeekControl,
-    /// Advancing after the control seek returned `TryAdvance`.
-    AdvanceToControl,
-    /// Positioned at (or after) where the control row would be.
-    ReadControl,
-    /// No control row: rewinding to tell an empty store from one written
-    /// by the pre-registry FTS implementation (which is refused).
-    ProbeFormat { rewound: bool },
-    /// Range-scanning the visible `(SEGMENT, *)` registry rows.
-    ScanSegments { seeked: bool, advance_pending: bool },
-    /// Range-scanning the visible tombstone rows.
-    ScanTombs { seeked: bool, advance_pending: bool },
-    /// Loading chunk rows for visible segments absent from the byte cache.
-    /// `queue` holds indices into `scan_descriptors`.
-    LoadChunks {
-        queue: Vec<usize>,
-        pos: usize,
-        /// file_ord -> (chunk_no -> bytes) for the segment at `queue[pos]`.
-        chunks: HashMap<u32, HashMap<i64, Vec<u8>>>,
-        seeked: bool,
-        advance_pending: bool,
-    },
-    /// Assembling the Tantivy view over the loaded segment set.
-    BuildIndex,
-    /// Snapshot (or format probe) complete.
+    /// `drive_open` is in progress. Its runner holds where it is.
+    /// `from_ready` says that it continues an open that stopped at the
+    /// control row, so a failed open goes back to `Ready`.
+    Opening { from_ready: bool },
+    /// The control row is decoded. The snapshot is loaded too, unless
+    /// `probe_only` stopped the open at the control row.
     Ready,
 }
 
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
-enum OptimizeState {
-    #[default]
-    Start,
-    Open,
-    LoadSnapshot,
-    Flush,
-    PublishFlush,
-    Claim,
-    PublishMerge,
+/// Names [`FtsCtx`] as the context type of the async operations of the
+/// FTS cursor.
+struct FtsStep;
+
+impl StepContext for FtsStep {
+    type Error = Box<LimboError>;
+    type Ctx<'a> = FtsCtx<'a>;
 }
 
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
-enum StatementCommitState {
-    #[default]
-    Start,
-    PublishFlush {
-        auto_merge: bool,
-    },
-    CheckMerge,
-    LoadSnapshot {
-        threshold: usize,
-    },
-    Claim,
-    PublishMerge,
-    Finish,
+/// The context of one step of an async FTS cursor operation. The async
+/// function gets it back on every step, so it never keeps the cursor or
+/// the index method context across a yield.
+struct FtsCtx<'a> {
+    cursor: &'a mut FtsCursor,
+    /// The index method context of the step, for the operations that get
+    /// one on every call.
+    context: Option<&'a IndexMethodContext>,
+    io: Option<IOCompletions>,
+    err: Option<Box<LimboError>>,
+}
+
+impl YieldSlot<Box<LimboError>> for FtsCtx<'_> {
+    fn park_io(&mut self, io: IOCompletions) {
+        self.io = Some(io);
+    }
+
+    fn take_io(&mut self) -> Option<IOCompletions> {
+        self.io.take()
+    }
+
+    fn park_err(&mut self, err: Box<LimboError>) {
+        self.err = Some(err);
+    }
+
+    fn take_err(&mut self) -> Option<Box<LimboError>> {
+        self.err.take()
+    }
+}
+
+impl FtsCtx<'_> {
+    /// The completion to yield at `point` when a test injector asks for
+    /// one.
+    #[cfg(any(test, injected_yields))]
+    fn injected_yield(
+        &self,
+        point: crate::index_method::IndexMethodYieldPoint,
+    ) -> Option<IOCompletions> {
+        use crate::mvcc::yield_hooks::ProvidesYieldContext;
+        let yield_context = self.context?.yield_context();
+        match crate::mvcc::yield_hooks::maybe_inject_io_yield::<(), _>(
+            yield_context.injector.as_ref(),
+            yield_context.instance_id,
+            yield_context.selection_key,
+            point,
+        ) {
+            Some(IOResult::IO(io)) => Some(io),
+            _ => None,
+        }
+    }
+}
+
+type FtsOp = BoxedResumable<FtsStep, (), ()>;
+
+/// The runners of the cursor operations. Each one is boxed on first use
+/// and reused for the next operation.
+#[derive(Default)]
+struct FtsOps {
+    open: Option<FtsOp>,
+    statement_commit: Option<FtsOp>,
+    optimize: Option<FtsOp>,
+}
+
+impl FtsOps {
+    fn cancel_all(&mut self) {
+        for op in [
+            &mut self.open,
+            &mut self.statement_commit,
+            &mut self.optimize,
+        ]
+        .into_iter()
+        .flatten()
+        {
+            op.cancel();
+        }
+    }
 }
 
 /// Streaming query support: one segment's scorer plus its rowid column.
@@ -1070,8 +1107,8 @@ pub struct FtsCursor {
     publish: Option<PendingPublish>,
     /// A merge that is still claiming its input segments.
     merge_claim: Option<SegmentClaimer>,
-    optimize_state: OptimizeState,
-    statement_commit_state: StatementCommitState,
+    /// The async operations of the cursor.
+    ops: FtsOps,
     /// Segment ids this transaction published into the shared byte cache;
     /// purged on rollback.
     own_published: Vec<SegmentId>,
@@ -1137,8 +1174,7 @@ impl FtsCursor {
             pending_tombstone_rows: Vec::new(),
             publish: None,
             merge_claim: None,
-            optimize_state: OptimizeState::Start,
-            statement_commit_state: StatementCommitState::Start,
+            ops: FtsOps::default(),
             own_published: Vec::new(),
             state: FtsState::Init,
             opening_for_write: false,
@@ -1372,6 +1408,61 @@ impl FtsCursor {
     /// pre-registry FTS implementation; the latter is refused with a
     /// rebuild hint, since that layout is not readable by this code.
     fn drive_open(&mut self) -> IOResultOr<()> {
+        self.connection
+            .as_ref()
+            .and_then(Weak::upgrade)
+            .ok_or_else(|| {
+                LimboError::InternalError("FTS cursor has no live connection".to_string())
+            })?;
+        self.database_id.ok_or_else(|| {
+            LimboError::InternalError("FTS database id is not initialized".to_string())
+        })?;
+        if matches!(self.state, FtsState::Ready) && self.snapshot_loaded {
+            return Ok(IOResult::Done(()));
+        }
+        let mut op = self
+            .ops
+            .open
+            .take()
+            .unwrap_or_else(|| Runner::boxed(|co, args| with_handle(co, args, run_open)));
+        let mut ctx = FtsCtx {
+            cursor: self,
+            context: None,
+            io: None,
+            err: None,
+        };
+        let result = op.resume(&mut ctx, ());
+        let active = op.is_active();
+        self.ops.open = Some(op);
+        if result.is_err() && !active {
+            if let FtsState::Opening { from_ready } = self.state {
+                self.state = if from_ready {
+                    FtsState::Ready
+                } else {
+                    FtsState::Init
+                };
+            }
+        }
+        result
+    }
+
+    fn dir_cursor(&mut self) -> Result<&mut dyn CursorTrait, Box<LimboError>> {
+        self.fts_dir_cursor
+            .as_deref_mut()
+            .ok_or_else(|| LimboError::InternalError("cursor not initialized".into()).into())
+    }
+
+    /// Marks the open as in progress. Returns true when the open starts
+    /// from a closed store, false when it continues an open that stopped
+    /// at the control row.
+    fn begin_open(&mut self) -> bool {
+        let from_ready = matches!(self.state, FtsState::Ready);
+        self.state = FtsState::Opening { from_ready };
+        !from_ready
+    }
+
+    /// Opens the backing cursor and clears the scan scratch.
+    fn start_scan(&mut self) -> Result<()> {
         let conn = self
             .connection
             .as_ref()
@@ -1382,415 +1473,157 @@ impl FtsCursor {
         let database_id = self.database_id.ok_or_else(|| {
             LimboError::InternalError("FTS database id is not initialized".to_string())
         })?;
-        loop {
-            match &mut self.state {
-                FtsState::Init => {
-                    self.open_cursor(&conn, database_id)?;
-                    self.scan_descriptors.clear();
-                    self.scan_tombs.clear();
-                    self.scan_data.clear();
-                    self.state = FtsState::SeekControl;
-                }
-                FtsState::SeekControl => {
-                    let cursor = self.fts_dir_cursor.as_mut().ok_or_else(|| {
-                        LimboError::InternalError("cursor not initialized".into())
-                    })?;
-                    let seek_key = seek_key_for_path(FTS2_CONTROL_PATH)?;
-                    let seek_result = return_if_io!(cursor.seek(
-                        SeekKey::IndexKey(seek_key.as_record_ref()),
-                        SeekOp::GE { eq_only: false },
-                    ));
-                    self.state = match seek_result {
-                        SeekResult::NotFound => FtsState::ProbeFormat { rewound: false },
-                        SeekResult::TryAdvance => FtsState::AdvanceToControl,
-                        SeekResult::Found => FtsState::ReadControl,
-                    };
-                }
-                FtsState::AdvanceToControl => {
-                    let cursor = self.fts_dir_cursor.as_mut().ok_or_else(|| {
-                        LimboError::InternalError("cursor not initialized".into())
-                    })?;
-                    return_if_io!(cursor.next());
-                    self.state = if cursor.has_record() {
-                        FtsState::ReadControl
-                    } else {
-                        FtsState::ProbeFormat { rewound: false }
-                    };
-                }
-                FtsState::ReadControl => {
-                    let cursor = self.fts_dir_cursor.as_mut().ok_or_else(|| {
-                        LimboError::InternalError("cursor not initialized".into())
-                    })?;
-                    if !cursor.has_record() {
-                        self.state = FtsState::ProbeFormat { rewound: false };
-                        continue;
-                    }
-                    let record = return_if_io!(cursor.record()).ok_or_else(|| {
-                        LimboError::Corrupt("FTS cursor has no record payload".into())
-                    })?;
-                    let (path, _, bytes) = row_fields(record)?;
-                    if path != FTS2_CONTROL_PATH {
-                        self.state = FtsState::ProbeFormat { rewound: false };
-                        continue;
-                    }
-                    self.control = Some(match FtsControl::decode(&bytes)? {
-                        ControlRecord::Current(control) => control,
-                        ControlRecord::OtherVersion(format_version) => {
-                            return Err(self.unsupported_format_error(format_version).into());
-                        }
-                    });
-                    if self.probe_only {
-                        // Insert fast path: the store is v2; nothing else
-                        // needs loading to append segments.
-                        self.state = FtsState::Ready;
-                        return Ok(IOResult::Done(()));
-                    }
-                    self.state = FtsState::ScanSegments {
-                        seeked: false,
-                        advance_pending: false,
-                    };
-                }
-                FtsState::ProbeFormat { rewound } => {
-                    let cursor = self.fts_dir_cursor.as_mut().ok_or_else(|| {
-                        LimboError::InternalError("cursor not initialized".into())
-                    })?;
-                    if !*rewound {
-                        return_if_io!(cursor.rewind());
-                        *rewound = true;
-                    }
-                    if !cursor.has_record() {
-                        // Empty store with no control row. `create()` always
-                        // stages the control row in the same transaction as
-                        // the table, so this only happens when the backing
-                        // table was recreated behind the index's back. A read
-                        // sees an empty index; a write must not append
-                        // segments the reader will later refuse for lacking
-                        // a control row.
-                        if self.opening_for_write {
-                            return Err(LimboError::Corrupt(format!(
-                                "FTS index {name} has a backing store with no control row \
-                                 and cannot be written; rebuild it with `DROP INDEX {name}` \
-                                 followed by `CREATE INDEX ... USING fts`",
-                                name = self.index_name
-                            ))
-                            .into());
-                        }
-                        self.segments.clear();
-                        self.snapshot_loaded = true;
-                        self.state = FtsState::BuildIndex;
-                        continue;
-                    }
-                    let record = return_if_io!(cursor.record()).ok_or_else(|| {
-                        LimboError::Corrupt("FTS cursor has no record payload".into())
-                    })?;
-                    let (path, _, _) = row_fields(record)?;
-                    if path.starts_with(FTS2_PATH_PREFIX) {
-                        // v2 rows must be accompanied by the control row,
-                        // which sorts inside the same scan range and was not
-                        // found.
-                        return Err(LimboError::Corrupt(
-                            "FTS v2 store has rows but no control record".into(),
-                        )
-                        .into());
-                    }
-                    // Rows without the `fts2/` prefix were written by the
-                    // pre-registry FTS implementation (a whole Tantivy
-                    // directory keyed by file name). That layout is not
-                    // supported; the index has to be rebuilt from the base
-                    // table. `DROP INDEX` does not open the store, so the
-                    // rebuild always works.
-                    return Err(LimboError::InvalidArgument(format!(
-                        "FTS index {name} was created by an older version of Turso \
-                         and its storage format is no longer supported; rebuild it \
-                         with `DROP INDEX {name}` followed by `CREATE INDEX ... USING fts`",
-                        name = self.index_name
-                    ))
-                    .into());
-                }
-                FtsState::ScanSegments {
-                    seeked,
-                    advance_pending,
-                } => {
-                    let cursor = self.fts_dir_cursor.as_mut().ok_or_else(|| {
-                        LimboError::InternalError("cursor not initialized".into())
-                    })?;
-                    if !*seeked {
-                        let seek_key = seek_key_for_path(FTS2_SEGMENT_PREFIX)?;
-                        let seek_result = return_if_io!(cursor.seek(
-                            SeekKey::IndexKey(seek_key.as_record_ref()),
-                            SeekOp::GE { eq_only: false },
-                        ));
-                        *seeked = true;
-                        match seek_result {
-                            SeekResult::NotFound => {
-                                self.state = FtsState::ScanTombs {
-                                    seeked: false,
-                                    advance_pending: false,
-                                };
-                                continue;
-                            }
-                            SeekResult::TryAdvance => {
-                                *advance_pending = true;
-                            }
-                            SeekResult::Found => {}
-                        }
-                    }
-                    if *advance_pending {
-                        return_if_io!(cursor.next());
-                        *advance_pending = false;
-                    }
-                    if !cursor.has_record() {
-                        self.state = FtsState::ScanTombs {
-                            seeked: false,
-                            advance_pending: false,
-                        };
-                        continue;
-                    }
-                    let record = return_if_io!(cursor.record()).ok_or_else(|| {
-                        LimboError::Corrupt("FTS cursor has no record payload".into())
-                    })?;
-                    let (path, _, bytes) = row_fields(record)?;
-                    let Some(uuid) = path.strip_prefix(FTS2_SEGMENT_PREFIX) else {
-                        // Rows sit in key order and nothing sorts between
-                        // the segment and tombstone ranges, so the only
-                        // legitimate range end is a tombstone row (or no
-                        // row at all, handled above). Anything else is a
-                        // corrupted registry row; stopping silently here
-                        // would drop every segment after it.
-                        if !path.starts_with(FTS2_TOMB_PREFIX) {
-                            return Err(LimboError::Corrupt(format!(
-                                "FTS registry scan hit an unrecognized row: {path}"
-                            ))
-                            .into());
-                        }
-                        self.state = FtsState::ScanTombs {
-                            seeked: false,
-                            advance_pending: false,
-                        };
-                        continue;
-                    };
-                    let segment_id = parse_segment_id(uuid)?;
-                    let descriptor = SegmentDescriptor::decode(segment_id, &bytes)?;
-                    // Duplicate segment ids in one searcher trip a
-                    // SearcherGeneration assert inside Tantivy; dedupe the
-                    // registry scan defensively.
-                    if self
-                        .scan_descriptors
-                        .iter()
-                        .all(|existing| existing.segment_id != segment_id)
-                    {
-                        self.scan_descriptors.push(descriptor);
-                    } else {
-                        let existing = self
-                            .scan_descriptors
-                            .iter()
-                            .find(|existing| existing.segment_id == segment_id);
-                        tracing::error!(
-                            segment = %segment_id.uuid_string(),
-                            identical = existing == Some(&descriptor),
-                            existing = ?existing,
-                            duplicate = ?descriptor,
-                            "duplicate FTS registry row; keeping the first"
-                        );
-                    }
-                    *advance_pending = true;
-                }
-                FtsState::ScanTombs {
-                    seeked,
-                    advance_pending,
-                } => {
-                    let cursor = self.fts_dir_cursor.as_mut().ok_or_else(|| {
-                        LimboError::InternalError("cursor not initialized".into())
-                    })?;
-                    if !*seeked {
-                        let seek_key = seek_key_for_path(FTS2_TOMB_PREFIX)?;
-                        let seek_result = return_if_io!(cursor.seek(
-                            SeekKey::IndexKey(seek_key.as_record_ref()),
-                            SeekOp::GE { eq_only: false },
-                        ));
-                        *seeked = true;
-                        match seek_result {
-                            SeekResult::NotFound => {
-                                self.state = self.chunk_load_state();
-                                continue;
-                            }
-                            SeekResult::TryAdvance => {
-                                *advance_pending = true;
-                            }
-                            SeekResult::Found => {}
-                        }
-                    }
-                    if *advance_pending {
-                        return_if_io!(cursor.next());
-                        *advance_pending = false;
-                    }
-                    if !cursor.has_record() {
-                        self.state = self.chunk_load_state();
-                        continue;
-                    }
-                    let record = return_if_io!(cursor.record()).ok_or_else(|| {
-                        LimboError::Corrupt("FTS cursor has no record payload".into())
-                    })?;
-                    let (path, _, _) = row_fields(record)?;
-                    let Some(identity) = path.strip_prefix(FTS2_TOMB_PREFIX) else {
-                        // Tombstones are the last v2 range; no row
-                        // legitimately follows them. A mismatch mid-scan is
-                        // a corrupted tombstone row, and stopping silently
-                        // would resurrect every deleted doc after it.
-                        return Err(LimboError::Corrupt(format!(
-                            "FTS tombstone scan hit an unrecognized row: {path}"
-                        ))
-                        .into());
-                    };
-                    self.scan_tombs.insert(parse_document_identity(identity)?);
-                    *advance_pending = true;
-                }
-                FtsState::LoadChunks {
-                    queue,
-                    pos,
-                    chunks,
-                    seeked,
-                    advance_pending,
-                } => {
-                    let Some(descriptor_idx) = queue.get(*pos).copied() else {
-                        self.state = FtsState::BuildIndex;
-                        continue;
-                    };
-                    let segment_id = self.scan_descriptors[descriptor_idx].segment_id;
-                    let prefix = segment_chunk_prefix(&segment_id);
-                    let cursor = self.fts_dir_cursor.as_mut().ok_or_else(|| {
-                        LimboError::InternalError("cursor not initialized".into())
-                    })?;
-                    if !*seeked {
-                        let seek_key = seek_key_for_path(&prefix)?;
-                        let seek_result = return_if_io!(cursor.seek(
-                            SeekKey::IndexKey(seek_key.as_record_ref()),
-                            SeekOp::GE { eq_only: false },
-                        ));
-                        *seeked = true;
-                        if matches!(seek_result, SeekResult::TryAdvance) {
-                            *advance_pending = true;
-                        }
-                    }
-                    if *advance_pending {
-                        return_if_io!(cursor.next());
-                        *advance_pending = false;
-                    }
-                    let mut segment_done = !cursor.has_record();
-                    if !segment_done {
-                        let record = return_if_io!(cursor.record()).ok_or_else(|| {
-                            LimboError::Corrupt("FTS cursor has no record payload".into())
-                        })?;
-                        let (path, chunk_no, bytes) = row_fields(record)?;
-                        match path.strip_prefix(prefix.as_str()) {
-                            Some(file_ord) => {
-                                let file_ord: u32 = file_ord.parse().map_err(|_| {
-                                    LimboError::Corrupt(format!(
-                                        "FTS chunk row has malformed file ordinal: {path}"
-                                    ))
-                                })?;
-                                if chunks
-                                    .entry(file_ord)
-                                    .or_default()
-                                    .insert(chunk_no, bytes)
-                                    .is_some()
-                                {
-                                    return Err(LimboError::Corrupt(format!(
-                                        "duplicate FTS chunk {path}:{chunk_no}"
-                                    ))
-                                    .into());
-                                }
-                                *advance_pending = true;
-                            }
-                            None => segment_done = true,
-                        }
-                    }
-                    if segment_done {
-                        let descriptor = &self.scan_descriptors[descriptor_idx];
-                        let files = assemble_segment_files(descriptor, std::mem::take(chunks))?;
-                        let data = Arc::new(segment_data_from_files(
-                            &self.shared,
-                            &self.schema,
-                            descriptor.segment_id,
-                            descriptor.max_doc,
-                            files,
-                        )?);
-                        self.shared
-                            .stats
-                            .segment_loads
-                            .fetch_add(1, Ordering::Relaxed);
-                        self.shared.segment_bytes.lock().put(
-                            descriptor.segment_id,
-                            Arc::clone(&data),
-                            fts_max_retained_cache_bytes(),
-                        );
-                        self.scan_data.insert(descriptor.segment_id, data);
-                        *pos += 1;
-                        *seeked = false;
-                        *advance_pending = false;
-                    }
-                }
-                FtsState::BuildIndex => {
-                    if !self.snapshot_loaded {
-                        // Adopt the scan results as the visible set.
-                        let descriptors = std::mem::take(&mut self.scan_descriptors);
-                        let tombs = std::mem::take(&mut self.scan_tombs);
-                        let mut data_by_id = std::mem::take(&mut self.scan_data);
-                        let mut applied_tombstones = 0usize;
-                        self.segments = descriptors
-                            .into_iter()
-                            .map(|descriptor| {
-                                let id = descriptor.segment_id;
-                                let data = data_by_id.remove(&id).ok_or_else(|| {
-                                    LimboError::Corrupt(format!(
-                                        "FTS segment {} has a registry row but no loaded data",
-                                        id.uuid_string()
-                                    ))
-                                })?;
-                                // A tombstone names a document, not a
-                                // segment. Find the position of each visible
-                                // tombstone in this segment. A merge can
-                                // move the document after the delete.
-                                let deleted = data.identities.tombstoned_positions(&tombs);
-                                applied_tombstones += deleted.len();
-                                Ok(LoadedSegment::new(descriptor, data, deleted))
-                            })
-                            .collect::<Result<Vec<_>>>()?;
-                        if applied_tombstones < tombs.len() {
-                            // A tombstone that names no visible document.
-                            // A merge deletes the tombstones of the
-                            // documents it drops, and nobody can delete a
-                            // document twice, because the base row
-                            // conflicts. So only a bug or a damaged store
-                            // produces these. Skipping them is harmless,
-                            // but they must not vanish silently.
-                            tracing::warn!(
-                                tombstones = tombs.len(),
-                                applied = applied_tombstones,
-                                "FTS store has tombstone rows naming no visible document"
-                            );
-                        }
-                        self.snapshot_loaded = true;
-                        // A full scan is ground truth for the auto-merge
-                        // trigger heuristic; reconcile any drift.
-                        self.shared
-                            .visible_segment_estimate
-                            .store(self.segments.len(), Ordering::Relaxed);
-                    }
-                    self.ensure_searcher()?;
-                    self.state = FtsState::Ready;
-                    return Ok(IOResult::Done(()));
-                }
-                FtsState::Ready => {
-                    return Ok(IOResult::Done(()));
-                }
-            }
-        }
+        self.open_cursor(&conn, database_id)?;
+        self.scan_descriptors.clear();
+        self.scan_tombs.clear();
+        self.scan_data.clear();
+        Ok(())
     }
 
-    /// The state that loads chunk rows for scanned descriptors the byte
-    /// cache does not already hold. Cache hits are collected here.
-    fn chunk_load_state(&mut self) -> FtsState {
+    /// Reads the row the cursor is on. Returns true when it is the control
+    /// row, which is then decoded.
+    fn read_control_row(&mut self) -> IOResultOr<bool> {
+        let (path, _, bytes) = match read_row_fields(self.dir_cursor()?)? {
+            IOResult::Done(fields) => fields,
+            IOResult::IO(io) => return Ok(IOResult::IO(io)),
+        };
+        if path != FTS2_CONTROL_PATH {
+            return Ok(IOResult::Done(false));
+        }
+        self.control = Some(match FtsControl::decode(&bytes)? {
+            ControlRecord::Current(control) => control,
+            ControlRecord::OtherVersion(format_version) => {
+                return Err(self.unsupported_format_error(format_version).into());
+            }
+        });
+        Ok(IOResult::Done(true))
+    }
+
+    /// The store has no control row and the cursor is at its first row.
+    /// An empty store is either empty or was written by the pre-registry
+    /// FTS implementation; the latter is refused with a rebuild hint,
+    /// since that layout is not readable by this code.
+    fn adopt_store_without_control(&mut self) -> IOResultOr<()> {
+        if !self.dir_cursor()?.has_record() {
+            // Empty store with no control row. `create()` always
+            // stages the control row in the same transaction as
+            // the table, so this only happens when the backing
+            // table was recreated behind the index's back. A read
+            // sees an empty index; a write must not append
+            // segments the reader will later refuse for lacking
+            // a control row.
+            if self.opening_for_write {
+                return Err(LimboError::Corrupt(format!(
+                    "FTS index {name} has a backing store with no control row \
+                     and cannot be written; rebuild it with `DROP INDEX {name}` \
+                     followed by `CREATE INDEX ... USING fts`",
+                    name = self.index_name
+                ))
+                .into());
+            }
+            self.segments.clear();
+            self.snapshot_loaded = true;
+            return Ok(IOResult::Done(()));
+        }
+        let (path, _, _) = match read_row_fields(self.dir_cursor()?)? {
+            IOResult::Done(fields) => fields,
+            IOResult::IO(io) => return Ok(IOResult::IO(io)),
+        };
+        if path.starts_with(FTS2_PATH_PREFIX) {
+            // v2 rows must be accompanied by the control row,
+            // which sorts inside the same scan range and was not
+            // found.
+            return Err(
+                LimboError::Corrupt("FTS v2 store has rows but no control record".into()).into(),
+            );
+        }
+        // Rows without the `fts2/` prefix were written by the
+        // pre-registry FTS implementation (a whole Tantivy
+        // directory keyed by file name). That layout is not
+        // supported; the index has to be rebuilt from the base
+        // table. `DROP INDEX` does not open the store, so the
+        // rebuild always works.
+        Err(LimboError::InvalidArgument(format!(
+            "FTS index {name} was created by an older version of Turso \
+             and its storage format is no longer supported; rebuild it \
+             with `DROP INDEX {name}` followed by `CREATE INDEX ... USING fts`",
+            name = self.index_name
+        ))
+        .into())
+    }
+
+    /// Reads one registry row of the `(SEGMENT, *)` range. Returns false
+    /// at the end of the range.
+    fn scan_segment_row(&mut self) -> IOResultOr<bool> {
+        let (path, _, bytes) = match read_row_fields(self.dir_cursor()?)? {
+            IOResult::Done(fields) => fields,
+            IOResult::IO(io) => return Ok(IOResult::IO(io)),
+        };
+        let Some(uuid) = path.strip_prefix(FTS2_SEGMENT_PREFIX) else {
+            // Rows sit in key order and nothing sorts between
+            // the segment and tombstone ranges, so the only
+            // legitimate range end is a tombstone row (or no
+            // row at all, handled by the caller). Anything else is a
+            // corrupted registry row; stopping silently here
+            // would drop every segment after it.
+            if !path.starts_with(FTS2_TOMB_PREFIX) {
+                return Err(LimboError::Corrupt(format!(
+                    "FTS registry scan hit an unrecognized row: {path}"
+                ))
+                .into());
+            }
+            return Ok(IOResult::Done(false));
+        };
+        let segment_id = parse_segment_id(uuid)?;
+        let descriptor = SegmentDescriptor::decode(segment_id, &bytes)?;
+        // Duplicate segment ids in one searcher trip a
+        // SearcherGeneration assert inside Tantivy; dedupe the
+        // registry scan defensively.
+        if self
+            .scan_descriptors
+            .iter()
+            .all(|existing| existing.segment_id != segment_id)
+        {
+            self.scan_descriptors.push(descriptor);
+        } else {
+            let existing = self
+                .scan_descriptors
+                .iter()
+                .find(|existing| existing.segment_id == segment_id);
+            tracing::error!(
+                segment = %segment_id.uuid_string(),
+                identical = existing == Some(&descriptor),
+                existing = ?existing,
+                duplicate = ?descriptor,
+                "duplicate FTS registry row; keeping the first"
+            );
+        }
+        Ok(IOResult::Done(true))
+    }
+
+    /// Reads one tombstone row. Tombstones are the last v2 range, so no
+    /// row legitimately follows them.
+    fn scan_tomb_row(&mut self) -> IOResultOr<()> {
+        let (path, _, _) = match read_row_fields(self.dir_cursor()?)? {
+            IOResult::Done(fields) => fields,
+            IOResult::IO(io) => return Ok(IOResult::IO(io)),
+        };
+        let Some(identity) = path.strip_prefix(FTS2_TOMB_PREFIX) else {
+            // A mismatch mid-scan is a corrupted tombstone row, and
+            // stopping silently would resurrect every deleted doc after
+            // it.
+            return Err(LimboError::Corrupt(format!(
+                "FTS tombstone scan hit an unrecognized row: {path}"
+            ))
+            .into());
+        };
+        self.scan_tombs.insert(parse_document_identity(identity)?);
+        Ok(IOResult::Done(()))
+    }
+
+    /// The scanned descriptors whose bytes the cache does not hold, as
+    /// indices into `scan_descriptors`. Cache hits are collected here.
+    fn segments_to_load(&mut self) -> Vec<usize> {
         let mut queue = Vec::new();
         let mut cache = self.shared.segment_bytes.lock();
         for (idx, descriptor) in self.scan_descriptors.iter().enumerate() {
@@ -1801,13 +1634,120 @@ impl FtsCursor {
                 None => queue.push(idx),
             }
         }
-        FtsState::LoadChunks {
-            queue,
-            pos: 0,
-            chunks: HashMap::default(),
-            seeked: false,
-            advance_pending: false,
+        queue
+    }
+
+    /// Reads one chunk row of the segment whose chunk paths start with
+    /// `prefix` into `chunks`. Returns false when the row belongs to
+    /// another segment.
+    fn collect_chunk_row(
+        &mut self,
+        prefix: &str,
+        chunks: &mut HashMap<u32, HashMap<i64, Vec<u8>>>,
+    ) -> IOResultOr<bool> {
+        let (path, chunk_no, bytes) = match read_row_fields(self.dir_cursor()?)? {
+            IOResult::Done(fields) => fields,
+            IOResult::IO(io) => return Ok(IOResult::IO(io)),
+        };
+        let Some(file_ord) = path.strip_prefix(prefix) else {
+            return Ok(IOResult::Done(false));
+        };
+        let file_ord: u32 = file_ord.parse().map_err(|_| {
+            LimboError::Corrupt(format!("FTS chunk row has malformed file ordinal: {path}"))
+        })?;
+        if chunks
+            .entry(file_ord)
+            .or_default()
+            .insert(chunk_no, bytes)
+            .is_some()
+        {
+            return Err(
+                LimboError::Corrupt(format!("duplicate FTS chunk {path}:{chunk_no}")).into(),
+            );
         }
+        Ok(IOResult::Done(true))
+    }
+
+    /// Assembles the segment at `descriptor_idx` from its chunk rows and
+    /// keeps its bytes in the cache and in the scan scratch.
+    fn finish_segment_load(
+        &mut self,
+        descriptor_idx: usize,
+        chunks: HashMap<u32, HashMap<i64, Vec<u8>>>,
+    ) -> Result<()> {
+        let descriptor = &self.scan_descriptors[descriptor_idx];
+        let files = assemble_segment_files(descriptor, chunks)?;
+        let data = Arc::new(segment_data_from_files(
+            &self.shared,
+            &self.schema,
+            descriptor.segment_id,
+            descriptor.max_doc,
+            files,
+        )?);
+        self.shared
+            .stats
+            .segment_loads
+            .fetch_add(1, Ordering::Relaxed);
+        self.shared.segment_bytes.lock().put(
+            descriptor.segment_id,
+            Arc::clone(&data),
+            fts_max_retained_cache_bytes(),
+        );
+        self.scan_data.insert(descriptor.segment_id, data);
+        Ok(())
+    }
+
+    /// Adopts the scan results as the visible set, unless the snapshot is
+    /// loaded already, and assembles the Tantivy view over it.
+    fn finish_open(&mut self) -> Result<()> {
+        if !self.snapshot_loaded {
+            let descriptors = std::mem::take(&mut self.scan_descriptors);
+            let tombs = std::mem::take(&mut self.scan_tombs);
+            let mut data_by_id = std::mem::take(&mut self.scan_data);
+            let mut applied_tombstones = 0usize;
+            self.segments = descriptors
+                .into_iter()
+                .map(|descriptor| {
+                    let id = descriptor.segment_id;
+                    let data = data_by_id.remove(&id).ok_or_else(|| {
+                        LimboError::Corrupt(format!(
+                            "FTS segment {} has a registry row but no loaded data",
+                            id.uuid_string()
+                        ))
+                    })?;
+                    // A tombstone names a document, not a
+                    // segment. Find the position of each visible
+                    // tombstone in this segment. A merge can
+                    // move the document after the delete.
+                    let deleted = data.identities.tombstoned_positions(&tombs);
+                    applied_tombstones += deleted.len();
+                    Ok(LoadedSegment::new(descriptor, data, deleted))
+                })
+                .collect::<Result<Vec<_>>>()?;
+            if applied_tombstones < tombs.len() {
+                // A tombstone that names no visible document.
+                // A merge deletes the tombstones of the
+                // documents it drops, and nobody can delete a
+                // document twice, because the base row
+                // conflicts. So only a bug or a damaged store
+                // produces these. Skipping them is harmless,
+                // but they must not vanish silently.
+                tracing::warn!(
+                    tombstones = tombs.len(),
+                    applied = applied_tombstones,
+                    "FTS store has tombstone rows naming no visible document"
+                );
+            }
+            self.snapshot_loaded = true;
+            // A full scan is ground truth for the auto-merge
+            // trigger heuristic; reconcile any drift.
+            self.shared
+                .visible_segment_estimate
+                .store(self.segments.len(), Ordering::Relaxed);
+        }
+        self.ensure_searcher()?;
+        self.state = FtsState::Ready;
+        Ok(())
     }
 
     /// The error for a store whose control row has another format version.
@@ -1835,16 +1775,19 @@ impl FtsCursor {
         if self.snapshot_loaded {
             return Ok(IOResult::Done(()));
         }
-        if matches!(self.state, FtsState::Ready) {
-            // The fast path stopped after format detection; resume with the
-            // registry scan (the control row is already decoded).
-            self.state = FtsState::ScanSegments {
-                seeked: false,
-                advance_pending: false,
-            };
-        }
         self.probe_only = false;
         self.drive_open()
+    }
+
+    /// Drives the open for a write: `opening_for_write` is set only while
+    /// the open runs.
+    fn open_for_write(&mut self) -> IOResultOr<()> {
+        self.opening_for_write = true;
+        let result = self.drive_open();
+        if !matches!(result, Ok(IOResult::IO(_))) {
+            self.opening_for_write = false;
+        }
+        result
     }
 
     /// Make sure that the backing store exists. The first `create` creates
@@ -1951,6 +1894,72 @@ impl FtsCursor {
             apply: PublishApply::AppendSegment(new_segment),
         });
         Ok(())
+    }
+
+    /// Stages the flush of the statement, when it has buffered work and no
+    /// publication is in flight. Returns true when the flush publishes a
+    /// new segment, so an auto merge can follow it.
+    fn stage_statement_flush(&mut self) -> Result<bool> {
+        if self.is_publishing() || self.pending_op_count() == 0 {
+            return Ok(false);
+        }
+        self.stage_flush()?;
+        Ok(matches!(
+            self.publish.as_ref().map(|publish| &publish.apply),
+            Some(PublishApply::AppendSegment(Some(_)))
+        ))
+    }
+
+    /// The merge threshold of the connection when the visible set is over
+    /// it.
+    fn auto_merge_threshold(&self) -> Option<usize> {
+        let conn = self.connection.as_ref().and_then(Weak::upgrade)?;
+        let threshold = conn.get_fts_merge_threshold();
+        if threshold <= 0
+            || self
+                .shared
+                .visible_segment_estimate
+                .load(Ordering::Relaxed)
+                .max(self.segments.len())
+                <= threshold as usize
+        {
+            return None;
+        }
+        Some(threshold as usize)
+    }
+
+    /// Stages the claim of an auto merge when the loaded visible set is
+    /// over `threshold` and has candidates. Returns true when it did.
+    fn stage_auto_merge(&mut self, threshold: usize) -> bool {
+        if self.segments.len() <= threshold {
+            return false;
+        }
+        let candidates = self.auto_merge_candidates();
+        if candidates.is_empty() {
+            return false;
+        }
+        self.stage_merge_claim(&candidates);
+        true
+    }
+
+    /// Stages the flush of the buffered work before an optimize.
+    fn stage_optimize_flush(&mut self) -> Result<()> {
+        if self.pending_op_count() > 0 {
+            self.stage_flush()?;
+        }
+        Ok(())
+    }
+
+    /// Stages the claim of every visible segment for an optimize. Returns
+    /// false when one segment without deleted documents is all there is.
+    fn stage_optimize_merge(&mut self) -> bool {
+        let total_tombstones: usize = self.segments.iter().map(|s| s.deleted.len()).sum();
+        if self.segments.len() <= 1 && total_tombstones == 0 {
+            return false;
+        }
+        let all_visible = self.segments.iter().map(LoadedSegment::id).collect();
+        self.stage_merge_claim(&all_visible);
+        true
     }
 
     /// Serialize the buffered documents into one immutable segment through
@@ -2399,8 +2408,7 @@ impl FtsCursor {
         self.pending_tombstone_rows.clear();
         self.publish = None;
         self.merge_claim = None;
-        self.optimize_state = OptimizeState::Start;
-        self.statement_commit_state = StatementCommitState::Start;
+        self.ops.cancel_all();
         self.segments.clear();
         self.snapshot_loaded = false;
         self.scan_descriptors.clear();
@@ -2417,6 +2425,182 @@ impl FtsCursor {
         self.opening_for_write = false;
         self.state = FtsState::Init;
     }
+}
+
+/// Opens the store: decodes the control row, then, unless `probe_only`
+/// asks for the format only, scans the visible registry rows and loads
+/// the chunk rows of the segments the byte cache does not hold. An open
+/// that continues from `Ready` skips the control row.
+async fn run_open(co: &mut Co<FtsStep>, _: ()) -> Result<(), Box<LimboError>> {
+    let scan = if co.with(|ctx| ctx.cursor.begin_open()) {
+        co.with(|ctx| ctx.cursor.start_scan())?;
+        let seek_key = seek_key_for_path(FTS2_CONTROL_PATH)?;
+        let on_row = seek_dir(co, &seek_key).await;
+        let control_found = on_row && co.io(|ctx| ctx.cursor.read_control_row()).await;
+        if !control_found {
+            co.io(|ctx| ctx.cursor.dir_cursor()?.rewind()).await;
+            co.io(|ctx| ctx.cursor.adopt_store_without_control()).await;
+            false
+        } else if co.with(|ctx| ctx.cursor.probe_only) {
+            // Insert fast path: the store is v2; nothing else
+            // needs loading to append segments.
+            co.with(|ctx| ctx.cursor.state = FtsState::Ready);
+            return Ok(());
+        } else {
+            true
+        }
+    } else {
+        true
+    };
+    if scan {
+        scan_segments(co).await?;
+        scan_tombs(co).await?;
+        load_chunks(co).await?;
+    }
+    co.with(|ctx| ctx.cursor.finish_open())?;
+    Ok(())
+}
+
+/// Range-scans the visible `(SEGMENT, *)` registry rows into
+/// `scan_descriptors`.
+async fn scan_segments(co: &mut Co<FtsStep>) -> Result<(), Box<LimboError>> {
+    let seek_key = seek_key_for_path(FTS2_SEGMENT_PREFIX)?;
+    let mut on_row = seek_dir(co, &seek_key).await;
+    while on_row && co.io(|ctx| ctx.cursor.scan_segment_row()).await {
+        on_row = advance_dir(co).await;
+    }
+    Ok(())
+}
+
+/// Range-scans the visible tombstone rows into `scan_tombs`.
+async fn scan_tombs(co: &mut Co<FtsStep>) -> Result<(), Box<LimboError>> {
+    let seek_key = seek_key_for_path(FTS2_TOMB_PREFIX)?;
+    let mut on_row = seek_dir(co, &seek_key).await;
+    while on_row {
+        co.io(|ctx| ctx.cursor.scan_tomb_row()).await;
+        on_row = advance_dir(co).await;
+    }
+    Ok(())
+}
+
+/// Loads the chunk rows of every scanned segment the byte cache does not
+/// hold.
+async fn load_chunks(co: &mut Co<FtsStep>) -> Result<(), Box<LimboError>> {
+    let queue = co.with(|ctx| ctx.cursor.segments_to_load());
+    for descriptor_idx in queue {
+        let prefix = co.with(|ctx| {
+            segment_chunk_prefix(&ctx.cursor.scan_descriptors[descriptor_idx].segment_id)
+        });
+        let seek_key = seek_key_for_path(&prefix)?;
+        let mut chunks = HashMap::default();
+        let mut on_row = seek_dir(co, &seek_key).await;
+        while on_row
+            && co
+                .io(|ctx| ctx.cursor.collect_chunk_row(&prefix, &mut chunks))
+                .await
+        {
+            on_row = advance_dir(co).await;
+        }
+        co.with(|ctx| ctx.cursor.finish_segment_load(descriptor_idx, chunks))?;
+    }
+    Ok(())
+}
+
+/// Seeks the backing cursor to the first row at or after `seek_key`.
+/// Returns true when the cursor is on a row afterwards.
+async fn seek_dir(co: &mut Co<FtsStep>, seek_key: &ImmutableRecord) -> bool {
+    let seek_result = co
+        .io(|ctx| {
+            ctx.cursor.dir_cursor()?.seek(
+                SeekKey::IndexKey(seek_key.as_record_ref()),
+                SeekOp::GE { eq_only: false },
+            )
+        })
+        .await;
+    match seek_result {
+        SeekResult::NotFound => false,
+        SeekResult::TryAdvance => advance_dir(co).await,
+        SeekResult::Found => co.with(|ctx| ctx.cursor.dir_cursor().is_ok_and(|c| c.has_record())),
+    }
+}
+
+/// Moves the backing cursor to the next row. Returns true when it is on
+/// a row afterwards.
+async fn advance_dir(co: &mut Co<FtsStep>) -> bool {
+    co.io(|ctx| ctx.cursor.dir_cursor()?.next()).await;
+    co.with(|ctx| ctx.cursor.dir_cursor().is_ok_and(|c| c.has_record()))
+}
+
+/// The fields of the row the cursor is on.
+fn read_row_fields(cursor: &mut dyn CursorTrait) -> IOResultOr<(String, i64, Vec<u8>)> {
+    let record = match cursor.record()? {
+        IOResult::Done(record) => record,
+        IOResult::IO(io) => return Ok(IOResult::IO(io)),
+    };
+    let record =
+        record.ok_or_else(|| LimboError::Corrupt("FTS cursor has no record payload".into()))?;
+    Ok(IOResult::Done(row_fields(record)?))
+}
+
+/// Yields at the named [`IndexMethodYieldPoint`] when a test injector asks
+/// for it. Runs inside an async FTS operation.
+macro_rules! yield_point {
+    ($co:expr, $point:ident) => {{
+        #[cfg(any(test, injected_yields))]
+        if let Some(io) =
+            $co.with(|ctx| ctx.injected_yield(crate::index_method::IndexMethodYieldPoint::$point))
+        {
+            $co.yield_io(io).await;
+        }
+    }};
+}
+
+/// Publishes the statement's segment and tombstone rows, then merges the
+/// visible set down when the flush published a segment and the set is
+/// over `PRAGMA fts_merge_threshold`.
+async fn run_statement_commit(co: &mut Co<FtsStep>, _: ()) -> Result<(), Box<LimboError>> {
+    let auto_merge = co.with(|ctx| ctx.cursor.stage_statement_flush())?;
+    yield_point!(co, FtsStatementFlushStaged);
+    co.io(|ctx| ctx.cursor.drive_publish()).await;
+    if auto_merge {
+        if let Some(threshold) = co.with(|ctx| ctx.cursor.auto_merge_threshold()) {
+            co.io(|ctx| ctx.cursor.ensure_snapshot_loaded()).await;
+            if co.with(|ctx| ctx.cursor.stage_auto_merge(threshold)) {
+                yield_point!(co, FtsAutoMergeClaimStaged);
+                co.io(|ctx| ctx.cursor.drive_merge_claim()).await;
+                yield_point!(co, FtsAutoMergeStaged);
+                co.io(|ctx| ctx.cursor.drive_publish()).await;
+            }
+        }
+    }
+    co.with(|ctx| ctx.cursor.release_writer_slot());
+    Ok(())
+}
+
+/// Merges the visible segments into one and drops the deleted documents.
+async fn run_optimize(co: &mut Co<FtsStep>, _: ()) -> Result<(), Box<LimboError>> {
+    co.io(|ctx| ctx.cursor.drive_publish()).await;
+    if !co.with(|ctx| matches!(ctx.cursor.state, FtsState::Ready)) {
+        co.io(|ctx| {
+            let context = ctx.context.expect("optimize runs with a context");
+            ctx.cursor.ensure_backing_store(context)
+        })
+        .await;
+        co.io(|ctx| ctx.cursor.open_for_write()).await;
+    }
+    co.with(|ctx| ctx.cursor.claim_writer_slot())?;
+    co.io(|ctx| ctx.cursor.ensure_snapshot_loaded()).await;
+    co.with(|ctx| ctx.cursor.stage_optimize_flush())?;
+    yield_point!(co, FtsOptimizeFlushStaged);
+    co.io(|ctx| ctx.cursor.drive_publish()).await;
+    if !co.with(|ctx| ctx.cursor.stage_optimize_merge()) {
+        return Ok(());
+    }
+    yield_point!(co, FtsOptimizeClaimStaged);
+    co.io(|ctx| ctx.cursor.drive_merge_claim()).await;
+    yield_point!(co, FtsOptimizeMergeStaged);
+    co.io(|ctx| ctx.cursor.drive_publish()).await;
+    Ok(())
 }
 
 /// Load one segment's resident state from its assembled files: the bytes
@@ -2817,6 +3001,7 @@ impl IndexMethodCursor for FtsCursor {
         if let Some(op) = self.pending_store_op.as_mut() {
             return_if_io!(op.step());
             self.pending_store_op = None;
+            self.ops.cancel_all();
             self.state = FtsState::Init;
             return Ok(IOResult::Done(()));
         }
@@ -2847,6 +3032,7 @@ impl IndexMethodCursor for FtsCursor {
             return Ok(IOResult::IO(io));
         }
 
+        self.ops.cancel_all();
         self.state = FtsState::Init;
         Ok(IOResult::Done(()))
     }
@@ -3317,90 +3503,19 @@ impl IndexMethodCursor for FtsCursor {
     /// new segment and the visible set exceeds `PRAGMA fts_merge_threshold`,
     /// merges it down in the same transaction (skipped silently on
     /// maintenance contention).
-    fn stage_statement_commit(&mut self, _context: &IndexMethodContext) -> IOResultOr<()> {
-        loop {
-            match self.statement_commit_state {
-                StatementCommitState::Start => {
-                    let mut auto_merge = false;
-                    if !self.is_publishing() && self.pending_op_count() > 0 {
-                        self.stage_flush()?;
-                        auto_merge = matches!(
-                            self.publish.as_ref().map(|publish| &publish.apply),
-                            Some(PublishApply::AppendSegment(Some(_)))
-                        );
-                    }
-                    self.statement_commit_state = StatementCommitState::PublishFlush { auto_merge };
-                    crate::mvcc::yield_points::inject_io_yield!(
-                        _context,
-                        crate::index_method::IndexMethodYieldPoint::FtsStatementFlushStaged
-                    );
-                }
-                StatementCommitState::PublishFlush { auto_merge } => {
-                    return_if_io!(self.drive_publish());
-                    self.statement_commit_state = if auto_merge {
-                        StatementCommitState::CheckMerge
-                    } else {
-                        StatementCommitState::Finish
-                    };
-                }
-                StatementCommitState::CheckMerge => {
-                    let Some(conn) = self.connection.as_ref().and_then(Weak::upgrade) else {
-                        self.statement_commit_state = StatementCommitState::Finish;
-                        continue;
-                    };
-                    let threshold = conn.get_fts_merge_threshold();
-                    self.statement_commit_state = if threshold <= 0
-                        || self
-                            .shared
-                            .visible_segment_estimate
-                            .load(Ordering::Relaxed)
-                            .max(self.segments.len())
-                            <= threshold as usize
-                    {
-                        StatementCommitState::Finish
-                    } else {
-                        StatementCommitState::LoadSnapshot {
-                            threshold: threshold as usize,
-                        }
-                    };
-                }
-                StatementCommitState::LoadSnapshot { threshold } => {
-                    return_if_io!(self.ensure_snapshot_loaded());
-                    if self.segments.len() <= threshold {
-                        self.statement_commit_state = StatementCommitState::Finish;
-                        continue;
-                    }
-                    let candidates = self.auto_merge_candidates();
-                    if candidates.is_empty() {
-                        self.statement_commit_state = StatementCommitState::Finish;
-                        continue;
-                    }
-                    self.stage_merge_claim(&candidates);
-                    self.statement_commit_state = StatementCommitState::Claim;
-                    crate::mvcc::yield_points::inject_io_yield!(
-                        _context,
-                        crate::index_method::IndexMethodYieldPoint::FtsAutoMergeClaimStaged
-                    );
-                }
-                StatementCommitState::Claim => {
-                    return_if_io!(self.drive_merge_claim());
-                    self.statement_commit_state = StatementCommitState::PublishMerge;
-                    crate::mvcc::yield_points::inject_io_yield!(
-                        _context,
-                        crate::index_method::IndexMethodYieldPoint::FtsAutoMergeStaged
-                    );
-                }
-                StatementCommitState::PublishMerge => {
-                    return_if_io!(self.drive_publish());
-                    self.statement_commit_state = StatementCommitState::Finish;
-                }
-                StatementCommitState::Finish => {
-                    self.release_writer_slot();
-                    self.statement_commit_state = StatementCommitState::Start;
-                    return Ok(IOResult::Done(()));
-                }
-            }
-        }
+    fn stage_statement_commit(&mut self, context: &IndexMethodContext) -> IOResultOr<()> {
+        let mut op = self.ops.statement_commit.take().unwrap_or_else(|| {
+            Runner::boxed(|co, args| with_handle(co, args, run_statement_commit))
+        });
+        let mut ctx = FtsCtx {
+            cursor: self,
+            context: Some(context),
+            io: None,
+            err: None,
+        };
+        let result = op.resume(&mut ctx, ());
+        self.ops.statement_commit = Some(op);
+        result
     }
 
     fn abort_statement(&mut self, _context: &IndexMethodContext) {
@@ -3458,72 +3573,20 @@ impl IndexMethodCursor for FtsCursor {
         self.database_id = Some(database_id);
         self.connection = Some(Arc::downgrade(&conn));
 
-        loop {
-            match self.optimize_state {
-                OptimizeState::Start => {
-                    return_if_io!(self.drive_publish());
-                    if matches!(self.state, FtsState::Ready) {
-                        self.optimize_state = OptimizeState::LoadSnapshot;
-                    } else {
-                        return_if_io!(self.ensure_backing_store(context));
-                        self.optimize_state = OptimizeState::Open;
-                    }
-                }
-                OptimizeState::Open => {
-                    self.opening_for_write = true;
-                    let result = self.drive_open();
-                    if !matches!(result, Ok(IOResult::IO(_))) {
-                        self.opening_for_write = false;
-                    }
-                    return_if_io!(result);
-                    self.optimize_state = OptimizeState::LoadSnapshot;
-                }
-                OptimizeState::LoadSnapshot => {
-                    self.claim_writer_slot()?;
-                    return_if_io!(self.ensure_snapshot_loaded());
-                    self.optimize_state = OptimizeState::Flush;
-                }
-                OptimizeState::Flush => {
-                    if self.pending_op_count() > 0 {
-                        self.stage_flush()?;
-                    }
-                    self.optimize_state = OptimizeState::PublishFlush;
-                    crate::mvcc::yield_points::inject_io_yield!(
-                        context,
-                        crate::index_method::IndexMethodYieldPoint::FtsOptimizeFlushStaged
-                    );
-                }
-                OptimizeState::PublishFlush => {
-                    return_if_io!(self.drive_publish());
-                    let total_tombstones: usize =
-                        self.segments.iter().map(|s| s.deleted.len()).sum();
-                    if self.segments.len() <= 1 && total_tombstones == 0 {
-                        self.optimize_state = OptimizeState::Start;
-                        return Ok(IOResult::Done(()));
-                    }
-                    let all_visible = self.segments.iter().map(LoadedSegment::id).collect();
-                    self.stage_merge_claim(&all_visible);
-                    self.optimize_state = OptimizeState::Claim;
-                    crate::mvcc::yield_points::inject_io_yield!(
-                        context,
-                        crate::index_method::IndexMethodYieldPoint::FtsOptimizeClaimStaged
-                    );
-                }
-                OptimizeState::Claim => {
-                    return_if_io!(self.drive_merge_claim());
-                    self.optimize_state = OptimizeState::PublishMerge;
-                    crate::mvcc::yield_points::inject_io_yield!(
-                        context,
-                        crate::index_method::IndexMethodYieldPoint::FtsOptimizeMergeStaged
-                    );
-                }
-                OptimizeState::PublishMerge => {
-                    return_if_io!(self.drive_publish());
-                    self.optimize_state = OptimizeState::Start;
-                    return Ok(IOResult::Done(()));
-                }
-            }
-        }
+        let mut op = self
+            .ops
+            .optimize
+            .take()
+            .unwrap_or_else(|| Runner::boxed(|co, args| with_handle(co, args, run_optimize)));
+        let mut ctx = FtsCtx {
+            cursor: self,
+            context: Some(context),
+            io: None,
+            err: None,
+        };
+        let result = op.resume(&mut ctx, ());
+        self.ops.optimize = Some(op);
+        result
     }
 
     /// Estimates the cost of executing a query with the given pattern.
