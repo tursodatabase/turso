@@ -2578,11 +2578,8 @@ pub fn op_type_check(
         insn
     );
     assert!(table_reference.is_strict);
-    table_reference
-        .columns()
-        .iter()
-        .enumerate()
-        .try_for_each(|(column_idx, col)| {
+    table_reference.columns().iter().enumerate().try_for_each(
+        |(column_idx, col)| -> Result<(), LimboError> {
             if col.is_virtual_generated() && !check_generated {
                 return Ok(());
             }
@@ -2600,9 +2597,7 @@ pub fn op_type_check(
                 )
             } else if col.is_rowid_alias() && matches!(reg.get_value(), Value::Null) {
                 // Handle INTEGER PRIMARY KEY for null as usual (Rowid will be auto-assigned)
-                // (Turbofish pins the closure's error type; the bail macros are
-                // polymorphic over boxed and unboxed LimboError.)
-                return Ok::<(), LimboError>(());
+                return Ok(());
             } else if matches!(reg.get_value(), Value::Null) {
                 // STRICT only enforces type affinity on non-NULL values.
                 // NULL is valid in any column without NOT NULL constraint.
@@ -2623,7 +2618,8 @@ pub fn op_type_check(
                 }
             }
             Ok(())
-        })?;
+        },
+    )?;
 
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
