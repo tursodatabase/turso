@@ -4,7 +4,7 @@ use crate::turso_debug_assert;
 use crate::{
     error::{SQLITE_CONSTRAINT_NOTNULL, SQLITE_CONSTRAINT_PRIMARYKEY, SQLITE_CONSTRAINT_UNIQUE},
     schema::{
-        self, BTreeTable, ColDef, Column, Index, IndexColumn, ResolvedFkRef, Table,
+        self, BTreeTable, ColDef, ColDefFlags, Column, Index, IndexColumn, ResolvedFkRef, Table,
         EXPR_INDEX_SENTINEL, SQLITE_SEQUENCE_TABLE_NAME,
     },
     sync::Arc,
@@ -911,7 +911,6 @@ pub fn translate_insert(
         insertion.col_mappings.iter().map(|m| m.column),
         insertion.base_reg,
         insertion.record_register(),
-        ctx.table.is_strict,
     );
 
     if has_fks {
@@ -2274,7 +2273,7 @@ fn init_source_emission<'a>(
                             .columns()
                             .iter()
                             .filter(|col| !col.hidden() && !col.is_generated())
-                            .map(|col| col.affinity_with_strict(ctx.table.is_strict).aff_mask())
+                            .map(|col| col.affinity().aff_mask())
                             .collect::<String>()
                     } else {
                         columns
@@ -2289,9 +2288,7 @@ fn init_source_emission<'a>(
                                 }
                                 table
                                     .get_column_by_name(&column_name)
-                                    .map(|(_, col)| {
-                                        col.affinity_with_strict(ctx.table.is_strict).aff_mask()
-                                    })
+                                    .map(|(_, col)| col.affinity().aff_mask())
                                     .ok_or_else(|| {
                                         crate::error::LimboError::ParseError(format!(
                                             "table {} has no column named {}",
@@ -2412,13 +2409,8 @@ pub static ROWID_COLUMN: std::sync::LazyLock<Column> = std::sync::LazyLock::new(
         schema::Type::Integer,
         None,
         ColDef {
-            primary_key: true,
-            rowid_alias: true,
-            notnull: true,
-            explicit_notnull: false,
-            hidden: false,
-            unique: false,
-            notnull_conflict_clause: None,
+            flags: ColDefFlags::PrimaryKey | ColDefFlags::RowIdAlias | ColDefFlags::NotNull,
+            ..Default::default()
         },
     )
 });
@@ -2867,9 +2859,7 @@ fn emit_pk_uniqueness_check(
                 let col = insertion
                     .get_col_mapping_by_name(name)
                     .unwrap_or_else(|| panic!("primary key column missing from insertion: {name}"));
-                col.column
-                    .affinity_with_strict(ctx.table.is_strict)
-                    .aff_mask()
+                col.column.affinity().aff_mask()
             })
             .collect::<String>();
         for (i, (name, _)) in ctx.table.primary_key_columns.iter().enumerate() {
@@ -3106,9 +3096,7 @@ fn emit_unique_index_check(
             if ic.expr.is_some() {
                 Affinity::Blob.aff_mask()
             } else {
-                ctx.table.columns()[ic.pos_in_table]
-                    .affinity_with_strict(ctx.table.is_strict)
-                    .aff_mask()
+                ctx.table.columns()[ic.pos_in_table].affinity().aff_mask()
             }
         })
         .collect::<String>();
@@ -3917,7 +3905,6 @@ fn emit_replace_delete_conflicting_row(
                 table.columns(),
                 main_cursor_id,
                 ctx.conflict_rowid_reg,
-                table.is_strict,
             ))
         } else {
             None
@@ -4205,9 +4192,7 @@ fn build_parent_key_image_for_insert(
                 let (_, col) = parent_table.get_column(name).ok_or_else(|| {
                     crate::LimboError::InternalError(format!("parent col {name} missing"))
                 })?;
-                Ok::<_, crate::LimboError>(
-                    col.affinity_with_strict(parent_table.is_strict).aff_mask(),
-                )
+                Ok::<_, crate::LimboError>(col.affinity().aff_mask())
             })
             .collect::<Result<String, _>>()?
     };

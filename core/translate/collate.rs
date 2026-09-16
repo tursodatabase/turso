@@ -610,7 +610,7 @@ mod tests {
     use turso_parser::ast::{Literal, Name, Operator, TableInternalId, UnaryOperator};
 
     use crate::{
-        schema::{BTreeCharacteristics, BTreeTable, ColDef, Column, Table, Type},
+        schema::{BTreeCharacteristics, BTreeTable, ColDef, ColDefFlags, Column, Table, Type},
         translate::plan::{ColumnUsedMask, IterationDirection, JoinedTable, Operation, Scan},
     };
 
@@ -1126,13 +1126,8 @@ mod tests {
             Type::Integer,
             collation,
             ColDef {
-                primary_key: true,
-                rowid_alias: true,
-                notnull: false,
-                explicit_notnull: false,
-                unique: true,
-                hidden: false,
-                notnull_conflict_clause: None,
+                flags: ColDefFlags::PrimaryKey | ColDefFlags::RowIdAlias | ColDefFlags::Unique,
+                ..Default::default()
             },
         )];
         table_references.add_joined_table(JoinedTable {

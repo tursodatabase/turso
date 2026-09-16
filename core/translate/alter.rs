@@ -16,7 +16,8 @@ use crate::{
     function::{AlterTableFunc, Func},
     schema::{
         collect_column_dependencies_of_expr, BTreeTable, CheckConstraint, Column, ColumnLayout,
-        ForeignKey, Index, Table, EXPR_INDEX_SENTINEL, RESERVED_TABLE_PREFIXES,
+        ForeignKey, FromDefinitionFlags, Index, Table, EXPR_INDEX_SENTINEL,
+        RESERVED_TABLE_PREFIXES,
     },
     translate::{
         emitter::{emit_check_constraints, gencol::compute_virtual_columns, Resolver},
@@ -1267,7 +1268,11 @@ pub fn translate_alter_table(
                 }
             }
             let constraints = col_def.constraints.clone();
-            let mut column = Column::try_from(&col_def)?;
+            let mut column = Column::from_definition(
+                &col_def,
+                FromDefinitionFlags::empty()
+                    .with(FromDefinitionFlags::InStrictTable, btree.is_strict),
+            )?;
 
             if btree.columns().len() >= crate::types::MAX_COLUMN {
                 return Err(LimboError::ParseError(format!(
@@ -1873,7 +1878,11 @@ pub fn translate_alter_table(
                 match rename {
                     true => (false, false, None),
                     false => {
-                        let replacement_column = Column::try_from(&definition)?;
+                        let replacement_column = Column::from_definition(
+                            &definition,
+                            FromDefinitionFlags::empty()
+                                .with(FromDefinitionFlags::InStrictTable, btree.is_strict),
+                        )?;
                         let old_column = &btree.columns()[column_index];
                         let becomes_generated =
                             !old_column.is_generated() && replacement_column.is_generated();
@@ -1891,8 +1900,8 @@ pub fn translate_alter_table(
                         // serial type and SQLite's `PRAGMA integrity_check` reports the
                         // file as corrupt (e.g. "NUMERIC value in <table>.<col>" when
                         // changing NUMERIC -> TEXT). See issue #3706.
-                        let affinity_changed = old_column.affinity_with_strict(btree.is_strict)
-                            != replacement_column.affinity_with_strict(btree.is_strict);
+                        let affinity_changed =
+                            old_column.affinity() != replacement_column.affinity();
                         let rewrites_physical_layout =
                             becomes_generated || virtuality_changed || affinity_changed;
                         (
@@ -2628,7 +2637,7 @@ fn non_virtual_affinity_str(table: &BTreeTable) -> String {
         .columns()
         .iter()
         .filter(|col| !col.is_virtual_generated())
-        .map(|col| col.affinity_with_strict(table.is_strict).aff_mask())
+        .map(|col| col.affinity().aff_mask())
         .collect()
 }
 

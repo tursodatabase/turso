@@ -1334,7 +1334,6 @@ pub fn translate_drop_index(
                 sqlite_table.columns(),
                 sqlite_schema_cursor_id,
                 row_id_reg,
-                sqlite_table.is_strict,
             ))
         } else {
             None

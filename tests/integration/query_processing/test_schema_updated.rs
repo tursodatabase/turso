@@ -310,3 +310,76 @@ fn test_alter_table_alter_column_clears_autoincrement_reopen() {
         conn.close().unwrap();
     }
 }
+
+#[test]
+fn test_strict_generated_any_index_after_reopen() -> Result<()> {
+    for (create_sql, alter_sql) in [
+        (
+            "CREATE TABLE t(id INTEGER PRIMARY KEY, a ANY, g aNy AS(a)) STRICT",
+            None,
+        ),
+        (
+            "CREATE TABLE t(id INTEGER PRIMARY KEY, a ANY) STRICT",
+            Some("ALTER TABLE t ADD COLUMN g aNy AS(a)"),
+        ),
+        (
+            "CREATE TABLE t(id INTEGER PRIMARY KEY, a ANY, c ANY) STRICT",
+            Some("ALTER TABLE t ALTER COLUMN c TO g aNy AS(a)"),
+        ),
+    ] {
+        let temp_dir = TempDir::new().unwrap();
+        let path = temp_dir.path().join("generated_any.db");
+        let opts = turso_core::DatabaseOpts::new().with_generated_columns(true);
+        let expected = vec![
+            (1, "'00042'".to_string(), "text".to_string()),
+            (2, "42".to_string(), "integer".to_string()),
+            (3, "'42'".to_string(), "text".to_string()),
+        ];
+
+        {
+            let db = TempDatabase::new_with_existent_with_opts(&path, opts);
+            let conn = db.connect_limbo();
+            conn.execute(create_sql)?;
+            conn.execute("INSERT INTO t(id,a) VALUES(1,'00042'),(2,42)")?;
+            if let Some(alter_sql) = alter_sql {
+                conn.execute(alter_sql)?;
+            }
+            conn.execute("CREATE UNIQUE INDEX t_g ON t(g)")?;
+            conn.execute("INSERT INTO t(id,a) VALUES(3,'42')")?;
+            let rows: Vec<(i64, String, String)> =
+                conn.exec_rows("SELECT id,quote(g),typeof(g) FROM t INDEXED BY t_g ORDER BY id");
+            assert_that!(rows)
+                .named(create_sql)
+                .is_equal_to(expected.clone());
+            conn.close()?;
+        }
+
+        {
+            let db = TempDatabase::new_with_existent_with_opts(&path, opts);
+            let conn = db.connect_limbo();
+            for access in ["NOT INDEXED", "INDEXED BY t_g"] {
+                let rows: Vec<(i64, String, String)> = conn.exec_rows(&format!(
+                    "SELECT id,quote(g),typeof(g) FROM t {access} ORDER BY id"
+                ));
+                assert_that!(rows)
+                    .named(create_sql)
+                    .is_equal_to(expected.clone());
+            }
+
+            conn.execute("UPDATE t SET a='00043' WHERE g='00042'")?;
+            conn.execute("DELETE FROM t WHERE g=42")?;
+            let rows: Vec<(i64, String, String)> =
+                conn.exec_rows("SELECT id,quote(g),typeof(g) FROM t INDEXED BY t_g ORDER BY id");
+            assert_that!(rows).named(create_sql).is_equal_to(vec![
+                (1, "'00043'".to_string(), "text".to_string()),
+                (3, "'42'".to_string(), "text".to_string()),
+            ]);
+            let integrity: Vec<(String,)> = conn.exec_rows("PRAGMA integrity_check");
+            assert_that!(integrity)
+                .named(create_sql)
+                .is_equal_to(vec![("ok".to_string(),)]);
+            conn.close()?;
+        }
+    }
+    Ok(())
+}

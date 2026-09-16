@@ -1,6 +1,6 @@
 use crate::alloc::TursoIteratorExt;
 use crate::numeric::StrToF64;
-use crate::schema::ColDef;
+use crate::schema::{ColDef, FromDefinitionFlags};
 use crate::translate::emitter::TransactionMode;
 use crate::translate::expr::{walk_expr, walk_expr_mut, WalkControl};
 use crate::translate::plan::{BitSet, JoinedTable};
@@ -1016,7 +1016,7 @@ pub fn columns_from_create_table_body(
 
     columns
         .iter()
-        .map(Column::try_from)
+        .map(|column| Column::from_definition(column, FromDefinitionFlags::empty()))
         .collect::<crate::Result<Vec<Column>>>()
 }
 

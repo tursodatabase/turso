@@ -1136,11 +1136,7 @@ pub fn emit_upsert(
                             || {
                                 table
                                     .get_column_by_name(&c.name)
-                                    .map(|(_, col)| {
-                                        let is_strict =
-                                            table.btree().is_some_and(|btree| btree.is_strict);
-                                        col.affinity_with_strict(is_strict).aff_mask()
-                                    })
+                                    .map(|(_, col)| col.affinity().aff_mask())
                                     .unwrap_or('B')
                             },
                             |_| crate::vdbe::affinity::Affinity::Blob.aff_mask(),
@@ -1278,13 +1274,7 @@ pub fn emit_upsert(
 
     // Build NEW table payload
     let record_reg = program.alloc_register();
-    emit_make_record(
-        program,
-        table.columns().iter(),
-        new_start,
-        record_reg,
-        table.btree().is_some_and(|bt| bt.is_strict),
-    );
+    emit_make_record(program, table.columns().iter(), new_start, record_reg);
 
     // If rowid changed, delete+insert (uniqueness of the new rowid was
     // already verified before index maintenance above)
@@ -1384,7 +1374,6 @@ pub fn emit_upsert(
                     table.columns(),
                     ctx.cursor_id,
                     ctx.conflict_rowid_reg,
-                    table.btree().is_some_and(|btree| btree.is_strict),
                 ))
             } else {
                 None
@@ -1439,7 +1428,6 @@ pub fn emit_upsert(
                     table.columns(),
                     ctx.cursor_id,
                     ctx.conflict_rowid_reg,
-                    table.btree().is_some_and(|btree| btree.is_strict),
                 ))
             } else {
                 None

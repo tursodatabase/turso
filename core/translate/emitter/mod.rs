@@ -219,26 +219,16 @@ struct SelfTableScope {
 impl SelfTableScope {
     fn new(context: SelfTableContext) -> Self {
         let affinities = match &context {
-            SelfTableContext::ForDML { table, .. } => Some(
-                table
-                    .columns()
-                    .iter()
-                    .map(|c| c.affinity_with_strict(table.is_strict))
-                    .collect(),
-            ),
+            SelfTableContext::ForDML { table, .. } => {
+                Some(table.columns().iter().map(|c| c.affinity()).collect())
+            }
             SelfTableContext::ForSelect {
                 table_ref_id,
                 referenced_tables,
             } => referenced_tables
                 .find_table_by_internal_id(*table_ref_id)
                 .and_then(|(_, table_ref)| table_ref.btree())
-                .map(|btree| {
-                    btree
-                        .columns()
-                        .iter()
-                        .map(|c| c.affinity_with_strict(btree.is_strict))
-                        .collect()
-                }),
+                .map(|btree| btree.columns().iter().map(|c| c.affinity()).collect()),
         };
 
         Self {
@@ -1248,11 +1238,10 @@ pub fn emit_cdc_patch_record(
             extra_amount: 0,
         });
         let storable_count = columns.iter().filter(|c| !c.is_virtual_generated()).count();
-        let is_strict = table.btree().is_some_and(|btree| btree.is_strict);
         let affinity_str = columns
             .iter()
             .filter(|col| !col.is_virtual_generated())
-            .map(|col| col.affinity_with_strict(is_strict).aff_mask())
+            .map(|col| col.affinity().aff_mask())
             .collect::<String>();
 
         program.emit_insn(Insn::MakeRecord {
@@ -1273,7 +1262,6 @@ pub(super) fn emit_make_record<'a>(
     cols: impl IntoIterator<Item = &'a Column>,
     start_reg: usize,
     dest_reg: usize,
-    is_strict: bool,
 ) {
     let storable_cols: Vec<&Column> = cols
         .into_iter()
@@ -1283,7 +1271,7 @@ pub(super) fn emit_make_record<'a>(
 
     let affinity_str: String = storable_cols
         .iter()
-        .map(|c| c.affinity_with_strict(is_strict).aff_mask())
+        .map(|c| c.affinity().aff_mask())
         .collect();
 
     program.emit_insn(Insn::MakeRecord {
@@ -1300,7 +1288,6 @@ pub fn emit_cdc_full_record(
     columns: &[Column],
     table_cursor_id: usize,
     rowid_reg: usize,
-    is_strict: bool,
 ) -> usize {
     let storable_count = columns.iter().filter(|c| !c.is_virtual_generated()).count();
     let columns_reg = program.alloc_registers(storable_count + 1);
@@ -1323,7 +1310,7 @@ pub fn emit_cdc_full_record(
     let affinity_str = columns
         .iter()
         .filter(|col| !col.is_virtual_generated())
-        .map(|col| col.affinity_with_strict(is_strict).aff_mask())
+        .map(|col| col.affinity().aff_mask())
         .collect::<String>();
 
     program.emit_insn(Insn::MakeRecord {
