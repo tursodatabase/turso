@@ -14,3 +14,20 @@ test mvcc-left-join-null-row {
 expect {
     1|
 }
+
+# Virtual generated columns on the null-extended side go through IfNullRow,
+# which must read the null-row flag from the MVCC cursor instead of
+# insisting on a btree cursor.
+test mvcc-left-join-null-row-generated-column {
+    PRAGMA journal_mode = 'mvcc';
+    CREATE TABLE l(x);
+    CREATE TABLE r(a, g AS (1));
+    INSERT INTO l VALUES (1);
+    SELECT x, a, g, typeof(g) FROM l LEFT JOIN r ON false;
+    SELECT x FROM l LEFT JOIN r ON false WHERE g IS NULL;
+}
+expect {
+    mvcc
+    1|||null
+    1
+}

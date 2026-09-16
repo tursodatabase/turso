@@ -2412,27 +2412,22 @@ pub fn translate_expr(
                         match table_column.generated_type() {
                             // if we're reading from an index that contains this virtual column,
                             // the index already has the computed value, so read it from the index
-                            GeneratedType::Virtual { expr, .. } if !read_from_index => {
-                                resolver.with_self_table_context(
+                            GeneratedType::Virtual { .. } if !read_from_index => {
+                                do_emit_table_column(
                                     program,
-                                    Some(&SelfTableContext::ForSelect {
+                                    table_cursor_id
+                                        .or(index_cursor_id)
+                                        .expect("cursor should be opened"),
+                                    &SelfTableContext::ForSelect {
                                         table_ref_id: *table_ref_id,
                                         referenced_tables: referenced_tables.unwrap().clone(),
-                                    }),
-                                    |program, _| {
-                                        translate_expr(
-                                            program,
-                                            referenced_tables,
-                                            expr,
-                                            target_register,
-                                            resolver,
-                                        )?;
-                                        Ok(())
                                     },
+                                    referenced_tables,
+                                    table_column,
+                                    *column,
+                                    target_register,
+                                    resolver,
                                 )?;
-
-                                program
-                                    .emit_column_affinity(target_register, table_column.affinity());
                                 // The virtual column's declared collation must override
                                 // whatever collation the inner expression resolved to.
                                 program.set_collation(Some((table_column.collation(), false)));

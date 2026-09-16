@@ -71,11 +71,38 @@ pub(super) fn do_emit_table_column(
 ) -> Result<()> {
     match column.generated_type() {
         GeneratedType::Virtual { expr, .. } => {
+            let end_column_emission = match self_table_context {
+                SelfTableContext::ForSelect { .. } => {
+                    program.constant_span_end_all();
+                    let end = program.allocate_label();
+                    program.emit_insn(Insn::IfNullRow {
+                        cursor_id,
+                        target_pc: end,
+                        null_reg: target_register,
+                    });
+                    Some(end)
+                }
+                SelfTableContext::ForDML { .. } => None,
+            };
             resolver.with_self_table_context(program, Some(self_table_context), |program, _| {
-                translate_expr(program, referenced_tables, expr, target_register, resolver)?;
+                if end_column_emission.is_some() {
+                    translate_expr_no_constant_opt(
+                        program,
+                        referenced_tables,
+                        expr,
+                        target_register,
+                        resolver,
+                        NoConstantOptReason::RegisterReuse,
+                    )?;
+                } else {
+                    translate_expr(program, referenced_tables, expr, target_register, resolver)?;
+                }
                 Ok(())
             })?;
             program.emit_column_affinity(target_register, column.affinity());
+            if let Some(end) = end_column_emission {
+                program.preassign_label_to_next_insn(end);
+            }
         }
         _ => {
             program.emit_column_or_rowid(cursor_id, column_index, target_register);
