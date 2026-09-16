@@ -68,14 +68,6 @@ enum ExistsState {
 }
 
 #[derive(Debug, Clone, Copy)]
-enum SeekState {
-    /// Seeking in btree (MVCC seek already done)
-    SeekBtree,
-    /// Pick winner and finalize
-    PickWinner,
-}
-
-#[derive(Debug, Clone, Copy)]
 enum CountState {
     Rewind,
     NextBtree { count: usize },
@@ -84,7 +76,6 @@ enum CountState {
 #[derive(Debug, Clone)]
 enum MvccLazyCursorState {
     Exists(ExistsState),
-    Seek(SeekState, IterationDirection),
 }
 
 #[cfg(any(test, injected_yields))]
@@ -541,7 +532,7 @@ type CursorRunner<Clock, A, Args, Out> = BoxedResumable<MvCursorStep<Clock, A>, 
 struct CursorOps<Clock: LogicalClock + 'static, A: ConcurrentAllocator> {
     rewind: Option<CursorRunner<Clock, A, IterationDirection, ()>>,
     move_row: Option<CursorRunner<Clock, A, IterationDirection, ()>>,
-    seek_btree: Option<CursorRunner<Clock, A, (IterationDirection, SeekOp), ()>>,
+    seek: Option<CursorRunner<Clock, A, SeekOp, SeekResult>>,
 }
 
 impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> Default for CursorOps<Clock, A> {
@@ -549,7 +540,7 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> Default for CursorOp
         Self {
             rewind: None,
             move_row: None,
-            seek_btree: None,
+            seek: None,
         }
     }
 }
@@ -572,7 +563,7 @@ enum CursorOp {
     Rewind,
     Next,
     Prev,
-    SeekBtree,
+    Seek,
 }
 
 /// Runs one step of the async cursor operation `$op` whose runner lives in
@@ -1029,6 +1020,142 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> MvccLazyCursor<Clock
         self.invalidate_record();
     }
 
+    /// Resets the cursor and seeks the MVCC iterator to `seek_key`.
+    #[inline(always)]
+    fn begin_seek(&mut self, seek_key: SeekKey<'_>, op: SeekOp) -> Result<()> {
+        self.begin_rewind();
+        self.invalidate_record();
+        // We need to clear the null flag for the table cursor before seeking,
+        // because it might have been set to false by an unmatched left-join row
+        // during the previous iteration on the outer loop.
+        self.set_null_flag(false);
+
+        let direction = op.iteration_direction();
+        let inclusive = matches!(op, SeekOp::GE { .. } | SeekOp::LE { .. });
+
+        match &seek_key {
+            SeekKey::TableRowId(row_id) => {
+                let rowid = RowID {
+                    table_id: self.table_id,
+                    row_id: RowKey::Int(*row_id),
+                };
+                let mvcc_rowid = self.db.seek_rowid(
+                    rowid,
+                    inclusive,
+                    op.eq_only(),
+                    direction,
+                    self.tx_id,
+                    &mut self.table_iterator,
+                );
+                self.dual_peek.mvcc_peek = match mvcc_rowid {
+                    Some((rid, payload)) => {
+                        self.eq_seek_row = payload;
+                        CursorPeek::Row {
+                            key: rid.row_id,
+                            versions: None,
+                        }
+                    }
+                    None => CursorPeek::Exhausted,
+                };
+            }
+            SeekKey::IndexKey(index_key) => {
+                let index_info = {
+                    let MvccCursorType::Index(index_info) = &self.mv_cursor_type else {
+                        panic!("SeekKey::IndexKey requires Index cursor type");
+                    };
+                    Arc::new(IndexInfo::new_in(
+                        index_info.key_info.iter().cloned(),
+                        index_info.has_rowid,
+                        index_key.column_count(),
+                        index_info.is_unique,
+                        self.db.allocator(),
+                    )?)
+                };
+                let sortable_key = SortableIndexKey::new_from_payload_in(
+                    index_key,
+                    index_info,
+                    self.db.allocator(),
+                )?;
+                let mvcc_rowid = self.db.seek_index(
+                    self.table_id,
+                    sortable_key,
+                    inclusive,
+                    op.eq_only(),
+                    direction,
+                    self.tx_id,
+                    &mut self.index_iterator,
+                )?;
+                self.dual_peek.mvcc_peek = match &mvcc_rowid {
+                    Some(rid) => CursorPeek::Row {
+                        key: rid.row_id.clone(),
+                        versions: None,
+                    },
+                    None => CursorPeek::Exhausted,
+                };
+            }
+        }
+        Ok(())
+    }
+
+    /// Picks the row that comes first in the direction of the seek from the
+    /// two peeks, and says whether it matches `seek_key`.
+    #[inline(always)]
+    fn finish_seek(&mut self, seek_key: SeekKey<'_>, op: SeekOp) -> Result<SeekResult> {
+        let winner_pos = self.position_from_peeks(op.iteration_direction());
+        let CursorPosition::Loaded {
+            row_id,
+            in_btree,
+            versions,
+        } = winner_pos
+        else {
+            // Nothing found in either cursor
+            let forwards = matches!(op, SeekOp::GE { .. } | SeekOp::GT);
+            self.current_pos = if forwards {
+                CursorPosition::End
+            } else {
+                CursorPosition::BeforeFirst
+            };
+            return Ok(SeekResult::NotFound);
+        };
+        let winner_key = row_id.row_id.clone();
+        self.current_pos = CursorPosition::Loaded {
+            row_id,
+            in_btree,
+            versions,
+        };
+        if !op.eq_only() {
+            return Ok(SeekResult::Found);
+        }
+        let found = match &seek_key {
+            SeekKey::TableRowId(row_id) => winner_key == RowKey::Int(*row_id),
+            SeekKey::IndexKey(index_key) => {
+                let RowKey::Record(found_key) = &winner_key else {
+                    panic!("Found rowid is not a record");
+                };
+                let MvccCursorType::Index(index_info) = &self.mv_cursor_type else {
+                    panic!("Index cursor expected");
+                };
+                let key_info: Vec<_> = index_info
+                    .key_info
+                    .iter()
+                    .take(index_key.column_count())
+                    .cloned()
+                    .collect();
+                compare_immutable(
+                    index_key.get_values()?,
+                    found_key.key.get_values()?,
+                    &key_info,
+                )
+                .is_eq()
+            }
+        };
+        if found {
+            Ok(SeekResult::Found)
+        } else {
+            Ok(SeekResult::NotFound)
+        }
+    }
+
     /// Seeks the B-tree cursor. `None` means the B-tree has no row for this
     /// cursor.
     #[inline(always)]
@@ -1269,21 +1396,6 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> MvccLazyCursor<Clock
         self.index_shadow_scan.reset();
     }
 
-    /// Seek btree cursor and set btree_peek to the result.
-    /// Skips rows that are shadowed by MVCC.
-    /// Returns IOResult indicating if we need to yield for IO or are done.
-    fn seek_btree_and_set_peek(&mut self, seek_key: SeekKey<'_>, op: SeekOp) -> IOResultOr<()> {
-        let dir = op.iteration_direction();
-        run_cursor_op!(
-            self,
-            CursorOp::SeekBtree,
-            seek_btree,
-            seek_btree,
-            (dir, op),
-            CursorArgs::Seek { key: seek_key }
-        )
-    }
-
     /// Initialize MVCC iterator for forward iteration (used when next() is called without rewind())
     fn init_mvcc_iterator_forward(&mut self) -> Result<(), TryReserveError> {
         if self.table_iterator.is_some() || self.index_iterator.is_some() {
@@ -1443,7 +1555,7 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> CursorTrait
         //    exhausted, current_pos becomes CursorPosition::End, and the next Insn::Next
         //    INCORRECTLY finds the index cursor exhausted and breaks out of the delete loop, even
         //    though there are still b-tree-resident rows to delete.
-        if self.state.is_none() && op.eq_only() {
+        if self.active.is_none() && op.eq_only() {
             if let CursorPosition::Loaded {
                 row_id, in_btree, ..
             } = &self.current_pos
@@ -1474,176 +1586,14 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> CursorTrait
             }
         }
 
-        loop {
-            let state = self.state.clone();
-            match state {
-                None => {
-                    // Initial state: Reset and do MVCC seek
-                    let _ = self.table_iterator.take();
-                    let _ = self.index_iterator.take();
-                    self.reset_dual_peek();
-                    self.invalidate_record();
-                    // We need to clear the null flag for the table cursor before seeking,
-                    // because it might have been set to false by an unmatched left-join row
-                    // during the previous iteration on the outer loop.
-                    self.set_null_flag(false);
-
-                    let direction = op.iteration_direction();
-                    let inclusive = matches!(op, SeekOp::GE { .. } | SeekOp::LE { .. });
-
-                    match &seek_key {
-                        SeekKey::TableRowId(row_id) => {
-                            let rowid = RowID {
-                                table_id: self.table_id,
-                                row_id: RowKey::Int(*row_id),
-                            };
-
-                            // Seek in MVCC (synchronous)
-                            let mvcc_rowid = self.db.seek_rowid(
-                                rowid.clone(),
-                                inclusive,
-                                op.eq_only(),
-                                direction,
-                                self.tx_id,
-                                &mut self.table_iterator,
-                            );
-
-                            // Set MVCC peek
-                            {
-                                self.dual_peek.mvcc_peek = match mvcc_rowid {
-                                    Some((rid, payload)) => {
-                                        self.eq_seek_row = payload;
-                                        CursorPeek::Row {
-                                            key: rid.row_id,
-                                            versions: None,
-                                        }
-                                    }
-                                    None => CursorPeek::Exhausted,
-                                };
-                            }
-                        }
-                        SeekKey::IndexKey(index_key) => {
-                            let index_info = {
-                                let MvccCursorType::Index(index_info) = &self.mv_cursor_type else {
-                                    panic!("SeekKey::IndexKey requires Index cursor type");
-                                };
-                                Arc::new(IndexInfo::new_in(
-                                    index_info.key_info.iter().cloned(),
-                                    index_info.has_rowid,
-                                    index_key.column_count(),
-                                    index_info.is_unique,
-                                    self.db.allocator(),
-                                )?)
-                            };
-                            let sortable_key = SortableIndexKey::new_from_payload_in(
-                                index_key,
-                                index_info,
-                                self.db.allocator(),
-                            )?;
-
-                            // Seek in MVCC (synchronous)
-                            let mvcc_rowid = self.db.seek_index(
-                                self.table_id,
-                                sortable_key.clone(),
-                                inclusive,
-                                op.eq_only(),
-                                direction,
-                                self.tx_id,
-                                &mut self.index_iterator,
-                            )?;
-
-                            // Set MVCC peek
-                            {
-                                self.dual_peek.mvcc_peek = match &mvcc_rowid {
-                                    Some(rid) => CursorPeek::Row {
-                                        key: rid.row_id.clone(),
-                                        versions: None,
-                                    },
-                                    None => CursorPeek::Exhausted,
-                                };
-                            }
-                        }
-                    }
-
-                    // Move to btree seek state
-                    self.state
-                        .replace(MvccLazyCursorState::Seek(SeekState::SeekBtree, direction));
-                    inject_io_yield!(self, CursorYieldPoint::SeekStart);
-                }
-                Some(MvccLazyCursorState::Seek(SeekState::SeekBtree, direction)) => {
-                    return_if_io!(self.seek_btree_and_set_peek(seek_key.clone(), op));
-                    self.state
-                        .replace(MvccLazyCursorState::Seek(SeekState::PickWinner, direction));
-                    inject_io_yield!(self, CursorYieldPoint::SeekBtreeProgress);
-                }
-                Some(MvccLazyCursorState::Seek(SeekState::PickWinner, direction)) => {
-                    // Pick winner and return result
-                    // Now pick the winner based on direction
-                    let winner_pos = self.position_from_peeks(direction);
-                    self.state = None;
-                    if let CursorPosition::Loaded {
-                        row_id,
-                        in_btree,
-                        versions,
-                    } = winner_pos
-                    {
-                        let winner_key = row_id.row_id.clone();
-                        self.current_pos = CursorPosition::Loaded {
-                            row_id,
-                            in_btree,
-                            versions,
-                        };
-
-                        if op.eq_only() {
-                            // Check if the winner matches the seek key
-                            let found = match &seek_key {
-                                SeekKey::TableRowId(row_id) => winner_key == RowKey::Int(*row_id),
-                                SeekKey::IndexKey(index_key) => {
-                                    let RowKey::Record(found_key) = &winner_key else {
-                                        panic!("Found rowid is not a record");
-                                    };
-                                    let MvccCursorType::Index(index_info) = &self.mv_cursor_type
-                                    else {
-                                        panic!("Index cursor expected");
-                                    };
-                                    let key_info: Vec<_> = index_info
-                                        .key_info
-                                        .iter()
-                                        .take(index_key.column_count())
-                                        .cloned()
-                                        .collect();
-                                    let cmp = compare_immutable(
-                                        index_key.get_values()?,
-                                        found_key.key.get_values()?,
-                                        &key_info,
-                                    );
-                                    cmp.is_eq()
-                                }
-                            };
-                            if found {
-                                return Ok(IOResult::Done(SeekResult::Found));
-                            } else {
-                                return Ok(IOResult::Done(SeekResult::NotFound));
-                            }
-                        } else {
-                            return Ok(IOResult::Done(SeekResult::Found));
-                        }
-                    } else {
-                        // Nothing found in either cursor
-                        let forwards = matches!(op, SeekOp::GE { .. } | SeekOp::GT);
-                        if forwards {
-                            self.current_pos = CursorPosition::End;
-                        } else {
-                            self.current_pos = CursorPosition::BeforeFirst;
-                        }
-                        return Ok(IOResult::Done(SeekResult::NotFound));
-                    }
-                }
-                _ => {
-                    panic!("Invalid state in seek: {:?}", self.state);
-                }
-            }
-        }
+        run_cursor_op!(
+            self,
+            CursorOp::Seek,
+            seek,
+            seek_cursor,
+            op,
+            CursorArgs::Seek { key: seek_key }
+        )
     }
 
     /// Insert a row into the table or index.
@@ -2160,6 +2110,31 @@ async fn rewind_cursor<Clock: LogicalClock + 'static, A: ConcurrentAllocator>(
     co.io(|ctx| ctx.cursor.finish_rewind(dir).map(IOResult::Done))
         .await;
     Ok(())
+}
+
+/// Seeks to the seek key that the current step passes in its context: the
+/// MVCC iterator first, then the B-tree cursor, then picks the row that
+/// comes first in the direction of the seek.
+async fn seek_cursor<Clock: LogicalClock + 'static, A: ConcurrentAllocator>(
+    co: &mut Co<MvCursorStep<Clock, A>>,
+    op: SeekOp,
+) -> Result<SeekResult, Box<LimboError>> {
+    let dir = op.iteration_direction();
+    co.io(|ctx| {
+        let key = ctx.args.seek_key();
+        ctx.cursor.begin_seek(key, op).map(IOResult::Done)
+    })
+    .await;
+    inject_cursor_yield!(co, CursorYieldPoint::SeekStart);
+    seek_btree(co, (dir, op)).await?;
+    inject_cursor_yield!(co, CursorYieldPoint::SeekBtreeProgress);
+    let result = co
+        .io(|ctx| {
+            let key = ctx.args.seek_key();
+            ctx.cursor.finish_seek(key, op).map(IOResult::Done)
+        })
+        .await;
+    Ok(result)
 }
 
 /// Seeks the B-tree cursor to the seek key that the current step passes in
