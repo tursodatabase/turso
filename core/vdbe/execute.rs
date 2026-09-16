@@ -95,7 +95,6 @@ use branches::{mark_unlikely, unlikely};
 use either::Either;
 use smallvec::SmallVec;
 use std::any::Any;
-use std::ptr::NonNull;
 use std::str::FromStr;
 use std::{
     borrow::BorrowMut,
@@ -104,7 +103,7 @@ use std::{
 };
 use turso_macros::{match_ignore_ascii_case, turso_debug_assert};
 
-use crate::coro::{BoxedResumable, Co, Runner};
+use crate::coro::{with_handle, BoxedResumable, Co, Runner, StepContext, YieldSlot};
 
 use crate::pseudo::PseudoCursor;
 
@@ -2011,9 +2010,14 @@ fn op_column_deferred(
     cursor_id: usize,
 ) -> InsnResult {
     let mut op = state.active_op_state.take_column_deferred();
-    // SAFETY: the context is consumed by this step, and the references
-    // outlive the call.
-    let result = op.resume(unsafe { VdbeCtx::new(program, state, insn) }, cursor_id);
+    let result = op.resume(
+        VdbeCtx {
+            program,
+            state,
+            insn,
+        },
+        cursor_id,
+    );
     state
         .active_op_state
         .put_column_deferred(op, matches!(result, Ok(IOResult::IO(_))));
@@ -2027,23 +2031,25 @@ fn op_column_deferred(
 }
 
 /// The async Column operation, boxed once per program state and reused.
-pub(crate) struct ColumnDeferredOp(BoxedResumable<VdbeCtx, usize, (), Box<LimboError>>);
+pub(crate) struct ColumnDeferredOp(BoxedResumable<VdbeStep, usize, (), Box<LimboError>>);
 
 impl ColumnDeferredOp {
     pub(crate) fn new() -> Self {
-        Self(Runner::boxed(column_deferred))
+        Self(Runner::boxed(|co, cursor_id| {
+            with_handle(co, cursor_id, column_deferred)
+        }))
     }
 
     fn is_active(&self) -> bool {
         self.0.is_active()
     }
 
-    fn resume(&mut self, mut ctx: VdbeCtx, cursor_id: usize) -> IOResultOr<()> {
-        self.0.as_mut().resume(&mut ctx, cursor_id)
+    fn resume(&mut self, mut ctx: VdbeCtx<'_>, cursor_id: usize) -> IOResultOr<()> {
+        self.0.resume(&mut ctx, cursor_id)
     }
 
     pub(crate) fn cancel(&mut self) {
-        self.0.as_mut().cancel();
+        self.0.cancel();
     }
 }
 
@@ -2057,73 +2063,54 @@ impl std::fmt::Debug for ColumnDeferredOp {
     }
 }
 
-/// The context of one step of an async VDBE operation. The async function
-/// gets it back on every step, so it never keeps a reference across a yield.
-pub(crate) struct VdbeCtx {
-    program: NonNull<Program>,
-    state: NonNull<ProgramState>,
-    insn: NonNull<Insn>,
+/// Names [`VdbeCtx`] as the context type of the async VDBE operations.
+pub(crate) struct VdbeStep;
+
+impl StepContext for VdbeStep {
+    type Ctx<'a> = VdbeCtx<'a>;
 }
 
-impl VdbeCtx {
-    /// # Safety
-    ///
-    /// The caller must not use `program`, `state`, or `insn` until it has
-    /// dropped the context.
-    unsafe fn new(program: &Program, state: &mut ProgramState, insn: &Insn) -> Self {
-        Self {
-            program: NonNull::from(program),
-            state: NonNull::from(state),
-            insn: NonNull::from(insn),
-        }
+/// The context of one step of an async VDBE operation. The async function
+/// gets it back on every step, so it never keeps a reference across a yield.
+pub(crate) struct VdbeCtx<'a> {
+    program: &'a Program,
+    state: &'a mut ProgramState,
+    insn: &'a Insn,
+}
+
+impl YieldSlot for VdbeCtx<'_> {
+    fn park_io(&mut self, io: IOCompletions) {
+        self.state.suspend_on_io(io);
     }
 
-    fn state(&mut self) -> &mut ProgramState {
-        // SAFETY: see `new`.
-        unsafe { self.state.as_mut() }
-    }
-
-    fn parts(&mut self) -> (&Program, &mut ProgramState, &Insn) {
-        // SAFETY: see `new`.
-        unsafe {
-            (
-                self.program.as_ref(),
-                self.state.as_mut(),
-                self.insn.as_ref(),
-            )
-        }
+    fn take_io(&mut self) -> Option<IOCompletions> {
+        self.state.io_completions.take()
     }
 }
 
 /// Column when a deferred seek is pending or the fetch was suspended for IO:
 /// reads the rowid from the index cursor, seeks the table cursor, fetches.
-async fn column_deferred(mut co: Co<VdbeCtx>, cursor_id: usize) -> Result<(), Box<LimboError>> {
-    if let Some(deferred) = co.with(|ctx| ctx.state().deferred_seeks[cursor_id].take()) {
+async fn column_deferred(co: &mut Co<VdbeStep>, cursor_id: usize) -> Result<(), Box<LimboError>> {
+    if let Some(deferred) = co.with(|ctx| ctx.state.deferred_seeks[cursor_id].take()) {
         let rowid = co
-            .io(|ctx| index_cursor_rowid(ctx.state(), deferred.index_cursor_id))
+            .io(|ctx| index_cursor_rowid(ctx.state, deferred.index_cursor_id))
             .await?;
         let Some(rowid) = rowid else {
-            co.with(|ctx| {
-                let (_, state, insn) = ctx.parts();
-                column_fetch_of(insn).write_null_regs(state);
-            });
+            co.with(|ctx| column_fetch_of(ctx.insn).write_null_regs(ctx.state));
             return Ok(());
         };
-        co.io(|ctx| seek_table_row(ctx.state(), deferred.table_cursor_id, rowid))
+        co.io(|ctx| seek_table_row(ctx.state, deferred.table_cursor_id, rowid))
             .await?;
         co.with(|ctx| {
-            let metrics = &mut ctx.state().metrics;
+            let metrics = &mut ctx.state.metrics;
             metrics.btree_seeks = metrics.btree_seeks.wrapping_add(1);
             metrics.btree_table_seeks = metrics.btree_table_seeks.wrapping_add(1);
             metrics.btree_deferred_seeks = metrics.btree_deferred_seeks.wrapping_add(1);
             metrics.search_count = metrics.search_count.wrapping_add(1);
         });
     }
-    co.io(|ctx| {
-        let (program, state, insn) = ctx.parts();
-        fetch_columns(program, state, insn, cursor_id)
-    })
-    .await
+    co.io(|ctx| fetch_columns(ctx.program, ctx.state, ctx.insn, cursor_id))
+        .await
 }
 
 #[inline(always)]

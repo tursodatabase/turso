@@ -1,61 +1,78 @@
 //! Runs an `async fn` as a step function that returns [`IOResult`].
 //!
 //! The async function does not run on an executor. The caller calls
-//! [`Resumable::step`] and passes the context for that one step. The async
+//! [`Resumable::resume`] and passes the context for that one step. The async
 //! function reads the context through [`Co::with`] and asks for I/O with
-//! [`Co::io`] or [`Co::yield_io`]. A yield returns the completion to the
-//! caller as `IOResult::IO`. The next `step` call resumes the function after
-//! the yield.
+//! [`Co::io`] or [`Co::yield_io`]. A yield parks its completion in the
+//! context and returns `Pending`, and `resume` hands the completion to its
+//! caller as `IOResult::IO`. The next `resume` call continues the function
+//! after the yield.
 //!
-//! One [`Runner`] holds one async function at a time. A runner is boxed and
-//! pinned once, then reused: `start` builds a new future in place, so no
-//! allocation happens per operation.
+//! The future outlives every step, so it cannot borrow the context. The
+//! runner stores a pointer to the context in a slot that it shares with the
+//! handle, and only for the duration of one poll. The slot is the only place
+//! where this module needs `unsafe`: the deref of that pointer.
+//!
+//! One [`Runner`] holds one async function at a time. The future lives in a
+//! box that is allocated once and reused: a new operation builds its future
+//! in place, so no allocation happens per operation.
 
-use std::cell::Cell;
 use std::future::Future;
-use std::marker::{PhantomData, PhantomPinned};
+use std::marker::PhantomData;
 use std::pin::Pin;
-use std::ptr::NonNull;
+use std::ptr;
+use std::sync::atomic::{AtomicPtr, Ordering};
+use std::sync::Arc;
 use std::task::{Context, Poll, Waker};
 
 use crate::types::{IOCompletions, IOResult};
 
-/// The handle an async function uses to reach its context and to yield.
-pub struct Co<Ctx> {
-    slot: NonNull<Slot<Ctx>>,
-    _ctx: PhantomData<*mut Ctx>,
+/// Names the context type of a step for every step lifetime. The future
+/// names its context through this trait, so it does not carry a lifetime.
+pub trait StepContext {
+    type Ctx<'a>: YieldSlot;
 }
 
-// SAFETY: the handle only points into the runner that owns its future, and
-// the two always move together. All access goes through `&mut self`.
-unsafe impl<Ctx> Send for Co<Ctx> {}
-unsafe impl<Ctx> Sync for Co<Ctx> {}
+/// Where a step parks the completion of a yield until `resume` picks it up.
+pub trait YieldSlot {
+    fn park_io(&mut self, io: IOCompletions);
+    fn take_io(&mut self) -> Option<IOCompletions>;
+}
 
-impl<Ctx> Co<Ctx> {
+/// The handle an async function uses to reach its context and to yield.
+pub struct Co<C> {
+    /// Points to the context of the running step, null between steps.
+    ctx: Arc<AtomicPtr<()>>,
+    _family: PhantomData<C>,
+}
+
+impl<C: StepContext> Co<C> {
     /// Runs `f` with the context of the current step.
     ///
-    /// The reference is valid only inside `f`, so it can never live across
-    /// an await.
+    /// `f` must accept the context for every lifetime, so the reference can
+    /// never leave `f` and never lives across an await.
     #[inline(always)]
-    pub fn with<R>(&mut self, f: impl FnOnce(&mut Ctx) -> R) -> R {
-        // SAFETY: the slot lives in the pinned runner that owns this future,
-        // and the runner sets the pointer only for the duration of one poll.
-        let slot = unsafe { self.slot.as_ref() };
-        let mut ctx = slot
-            .ctx
-            .get()
-            .expect("context is only available while a step runs");
-        // SAFETY: the runner holds `&mut Ctx` for the whole step and does not
-        // touch it while the future runs. `&mut self` prevents a nested call.
-        f(unsafe { ctx.as_mut() })
+    pub fn with<R>(&mut self, f: impl for<'a> FnOnce(&mut C::Ctx<'a>) -> R) -> R {
+        let ctx = self.ctx.load(Ordering::Relaxed).cast::<C::Ctx<'_>>();
+        assert!(
+            !ctx.is_null(),
+            "context is only available while a step runs"
+        );
+        // SAFETY: `Runner::resume` stores the pointer from a `&mut C::Ctx`
+        // that it holds for the whole step, and clears it before it returns.
+        // The runner does not touch the context while it polls the future.
+        // The future is the only owner of this handle, `&mut self` rules out
+        // a nested call, and `f` cannot keep the reference. So this is the
+        // only live reference to the context inside `f`.
+        f(unsafe { &mut *ctx })
     }
 
     /// Calls `f` until it returns `Done`. Each `IO` result is yielded to the
-    /// caller of `step`, and `f` runs again after the I/O completes.
+    /// caller of `resume`, and `f` runs again after the I/O completes.
     #[inline(always)]
-    pub fn io<T, E, F>(&mut self, f: F) -> Io<'_, Ctx, F>
+    pub fn io<T, E, F>(&mut self, f: F) -> Io<'_, C, F>
     where
-        F: FnMut(&mut Ctx) -> Result<IOResult<T>, E>,
+        F: for<'a> FnMut(&mut C::Ctx<'a>) -> Result<IOResult<T>, E>,
     {
         Io { co: self, f }
     }
@@ -63,7 +80,7 @@ impl<Ctx> Co<Ctx> {
     /// Hands `io` to the caller of `resume` and pauses until the next resume.
     #[cfg_attr(not(test), allow(dead_code))]
     #[inline(always)]
-    pub fn yield_io(&mut self, io: IOCompletions) -> YieldIo<'_, Ctx> {
+    pub fn yield_io(&mut self, io: IOCompletions) -> YieldIo<'_, C> {
         YieldIo {
             co: self,
             io: Some(io),
@@ -72,57 +89,53 @@ impl<Ctx> Co<Ctx> {
 }
 
 /// Future returned by [`Co::io`]: runs the step function on every poll.
-pub struct Io<'a, Ctx, F> {
-    co: &'a mut Co<Ctx>,
+pub struct Io<'co, C, F> {
+    co: &'co mut Co<C>,
     f: F,
 }
 
-impl<Ctx, F, T, E> Future for Io<'_, Ctx, F>
+/// The step function is called in place and never pinned, so the future
+/// can move.
+impl<C, F> Unpin for Io<'_, C, F> {}
+
+impl<C, F, T, E> Future for Io<'_, C, F>
 where
-    F: FnMut(&mut Ctx) -> Result<IOResult<T>, E>,
+    C: StepContext,
+    F: for<'a> FnMut(&mut C::Ctx<'a>) -> Result<IOResult<T>, E>,
 {
     type Output = Result<T, E>;
 
     #[inline(always)]
-    fn poll(self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Self::Output> {
-        // SAFETY: `f` is called in place and never moved out.
-        let this = unsafe { self.get_unchecked_mut() };
-        // SAFETY: see `Co::with`.
-        let slot = unsafe { this.co.slot.as_ref() };
-        let mut ctx = slot
-            .ctx
-            .get()
-            .expect("context is only available while a step runs");
-        // SAFETY: see `Co::with`.
-        match (this.f)(unsafe { ctx.as_mut() }) {
+    fn poll(mut self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Self::Output> {
+        let Io { co, f } = &mut *self;
+        co.with(|ctx| match f(ctx) {
             Ok(IOResult::Done(value)) => Poll::Ready(Ok(value)),
             Ok(IOResult::IO(io)) => {
-                slot.io.set(Some(io));
+                ctx.park_io(io);
                 Poll::Pending
             }
             Err(error) => Poll::Ready(Err(error)),
-        }
+        })
     }
 }
 
 /// Future returned by [`Co::yield_io`]: pending once, then ready.
-pub struct YieldIo<'a, Ctx> {
-    co: &'a mut Co<Ctx>,
+pub struct YieldIo<'co, C> {
+    co: &'co mut Co<C>,
     io: Option<IOCompletions>,
 }
 
-impl<Ctx> Unpin for YieldIo<'_, Ctx> {}
+impl<C> Unpin for YieldIo<'_, C> {}
 
-impl<Ctx> Future for YieldIo<'_, Ctx> {
+impl<C: StepContext> Future for YieldIo<'_, C> {
     type Output = ();
 
     #[inline(always)]
     fn poll(mut self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<()> {
-        match self.io.take() {
+        let YieldIo { co, io } = &mut *self;
+        match io.take() {
             Some(io) => {
-                // SAFETY: see `Co::with`.
-                let slot = unsafe { self.co.slot.as_ref() };
-                slot.io.set(Some(io));
+                co.with(|ctx| ctx.park_io(io));
                 Poll::Pending
             }
             None => Poll::Ready(()),
@@ -130,116 +143,95 @@ impl<Ctx> Future for YieldIo<'_, Ctx> {
     }
 }
 
-struct Slot<Ctx> {
-    ctx: Cell<Option<NonNull<Ctx>>>,
-    io: Cell<Option<IOCompletions>>,
-}
-
-// SAFETY: the slot is only touched through `Pin<&mut Runner>`, either by
-// `step` itself or by the future that `step` polls.
-unsafe impl<Ctx> Send for Slot<Ctx> {}
-unsafe impl<Ctx> Sync for Slot<Ctx> {}
-
-/// A pinned, boxed [`Runner`] behind the [`Resumable`] trait.
-pub type BoxedResumable<Ctx, Args, Out, E> =
-    Pin<Box<dyn Resumable<Ctx, Args, Out, E> + Send + Sync>>;
+/// A boxed [`Runner`] behind the [`Resumable`] trait.
+pub type BoxedResumable<C, Args, Out, E> = Box<dyn Resumable<C, Args, Out, E> + Send + Sync>;
 
 /// A step function built from an async function.
-pub trait Resumable<Ctx, Args, Out, E> {
+pub trait Resumable<C: StepContext, Args, Out, E> {
     /// True between the first `resume` and the one that returns `Done` or an
     /// error.
     fn is_active(&self) -> bool;
 
     /// Starts a new operation with `args` if none is active, then runs it
     /// until it yields for I/O or finishes. `args` is ignored on a resume.
-    fn resume(self: Pin<&mut Self>, ctx: &mut Ctx, args: Args) -> Result<IOResult<Out>, E>;
+    fn resume(&mut self, ctx: &mut C::Ctx<'_>, args: Args) -> Result<IOResult<Out>, E>;
 
     /// Drops the future of an active operation.
-    fn cancel(self: Pin<&mut Self>);
+    fn cancel(&mut self);
 }
 
-/// Holds one async function and the slot it talks to. Create it with
-/// [`Runner::new`], pin it in a box, and keep the box for reuse.
-pub struct Runner<Ctx, Args, F, M> {
-    slot: Slot<Ctx>,
+/// Holds one async function, the handle it borrows, and the slot the two
+/// share. Build it with [`Runner::boxed`] and keep the box for reuse.
+pub struct Runner<C, F, M> {
+    ctx: Arc<AtomicPtr<()>>,
+    /// The handle between two operations. The future borrows it through
+    /// [`with_handle`] and gives it back when it finishes.
+    co: Option<Co<C>>,
     make: M,
     /// Stays in place after the operation finishes: dropping it there would
     /// copy the whole future, so `active` tracks the state instead.
-    future: Option<F>,
+    future: Pin<Box<Option<F>>>,
     active: bool,
-    _args: PhantomData<fn(Args)>,
-    _pin: PhantomPinned,
 }
 
-impl<Ctx, Args, Out, E, F, M> Runner<Ctx, Args, F, M>
-where
-    F: Future<Output = Result<Out, E>>,
-    M: Fn(Co<Ctx>, Args) -> F,
-{
-    pub fn new(make: M) -> Self {
-        Self {
-            slot: Slot {
-                ctx: Cell::new(None),
-                io: Cell::new(None),
-            },
-            make,
-            future: None,
-            active: false,
-            _args: PhantomData,
-            _pin: PhantomPinned,
-        }
-    }
-
-    /// Boxes and pins a new runner behind the `Resumable` trait.
-    pub fn boxed(make: M) -> BoxedResumable<Ctx, Args, Out, E>
+impl<C, F, M> Runner<C, F, M> {
+    /// Boxes a new runner behind the `Resumable` trait. `make` builds the
+    /// future of one operation, usually through [`with_handle`].
+    pub fn boxed<Args, Out, E>(make: M) -> BoxedResumable<C, Args, Out, E>
     where
+        C: StepContext,
+        F: Future<Output = (Co<C>, Result<Out, E>)>,
+        M: Fn(Co<C>, Args) -> F,
         Self: Send + Sync + 'static,
     {
-        Box::pin(Self::new(make))
+        Box::new(Self {
+            ctx: Arc::new(AtomicPtr::new(ptr::null_mut())),
+            co: None,
+            make,
+            future: Box::pin(None),
+            active: false,
+        })
     }
 }
 
-impl<Ctx, Args, Out, E, F, M> Resumable<Ctx, Args, Out, E> for Runner<Ctx, Args, F, M>
+impl<C, Args, Out, E, F, M> Resumable<C, Args, Out, E> for Runner<C, F, M>
 where
-    F: Future<Output = Result<Out, E>>,
-    M: Fn(Co<Ctx>, Args) -> F,
+    C: StepContext,
+    F: Future<Output = (Co<C>, Result<Out, E>)>,
+    M: Fn(Co<C>, Args) -> F,
 {
     #[inline(always)]
     fn is_active(&self) -> bool {
         self.active
     }
 
-    fn resume(self: Pin<&mut Self>, ctx: &mut Ctx, args: Args) -> Result<IOResult<Out>, E> {
-        // SAFETY: `future` is replaced in place, only polled through `Pin`,
-        // and never moved out.
-        let this = unsafe { self.get_unchecked_mut() };
-        if !this.active {
-            let co = Co {
-                slot: NonNull::from(&this.slot),
-                _ctx: PhantomData,
-            };
-            this.future = Some((this.make)(co, args));
-            this.active = true;
+    fn resume(&mut self, ctx: &mut C::Ctx<'_>, args: Args) -> Result<IOResult<Out>, E> {
+        if !self.active {
+            let co = self.co.take().unwrap_or_else(|| Co {
+                ctx: Arc::clone(&self.ctx),
+                _family: PhantomData,
+            });
+            self.future.as_mut().set(Some((self.make)(co, args)));
+            self.active = true;
         }
-        let future = this
+        let future = self
             .future
             .as_mut()
+            .as_pin_mut()
             .expect("an active runner holds a future");
-        // SAFETY: the runner is pinned, so `future` never moves.
-        let future = unsafe { Pin::new_unchecked(future) };
-        this.slot.ctx.set(Some(NonNull::from(ctx)));
+        self.ctx
+            .store(ptr::from_mut(ctx).cast::<()>(), Ordering::Relaxed);
         let polled = future.poll(&mut Context::from_waker(Waker::noop()));
-        this.slot.ctx.set(None);
+        self.ctx.store(ptr::null_mut(), Ordering::Relaxed);
         match polled {
-            Poll::Ready(result) => {
-                this.active = false;
+            Poll::Ready((co, result)) => {
+                self.co = Some(co);
+                self.active = false;
                 result.map(IOResult::Done)
             }
             Poll::Pending => {
-                let io = this
-                    .slot
-                    .io
-                    .take()
+                let io = ctx
+                    .take_io()
                     .expect("future returned Pending without an I/O yield");
                 Ok(IOResult::IO(io))
             }
@@ -247,12 +239,25 @@ where
     }
 
     #[inline(always)]
-    fn cancel(self: Pin<&mut Self>) {
-        // SAFETY: the future is dropped in place.
-        let this = unsafe { self.get_unchecked_mut() };
-        this.future = None;
-        this.active = false;
+    fn cancel(&mut self) {
+        self.future.as_mut().set(None);
+        self.active = false;
     }
+}
+
+/// Runs `body` with the handle borrowed, then gives the handle back to the
+/// runner. A borrowed handle cannot leave `body`, and the runner reuses it
+/// for the next operation.
+pub async fn with_handle<C, Args, Out, E, B>(
+    mut co: Co<C>,
+    args: Args,
+    body: B,
+) -> (Co<C>, Result<Out, E>)
+where
+    B: AsyncFnOnce(&mut Co<C>, Args) -> Result<Out, E>,
+{
+    let result = body(&mut co, args).await;
+    (co, result)
 }
 
 #[cfg(test)]
@@ -261,15 +266,39 @@ mod tests {
     use crate::io::{Completion, CompletionType};
     use crate::types::IOCompletions;
 
+    struct Counting;
+
+    impl StepContext for Counting {
+        type Ctx<'a> = Counter;
+    }
+
     struct Counter {
         steps: usize,
+        io: Option<IOCompletions>,
+    }
+
+    impl Counter {
+        fn new(steps: usize) -> Self {
+            Self { steps, io: None }
+        }
+    }
+
+    impl YieldSlot for Counter {
+        fn park_io(&mut self, io: IOCompletions) {
+            assert!(self.io.is_none(), "a step parks at most one completion");
+            self.io = Some(io);
+        }
+
+        fn take_io(&mut self) -> Option<IOCompletions> {
+            self.io.take()
+        }
     }
 
     fn completion() -> IOCompletions {
         IOCompletions(Completion::new(CompletionType::Yield))
     }
 
-    async fn count_to(mut co: Co<Counter>, target: usize) -> Result<usize, ()> {
+    async fn count_to(co: &mut Co<Counting>, target: usize) -> Result<usize, ()> {
         let mut yields = 0;
         while co.with(|counter| counter.steps) < target {
             co.with(|counter| counter.steps += 1);
@@ -279,7 +308,7 @@ mod tests {
         Ok(yields)
     }
 
-    async fn fail_after_one_yield(mut co: Co<Counter>, _: usize) -> Result<usize, ()> {
+    async fn fail_after_one_yield(co: &mut Co<Counting>, _: usize) -> Result<usize, ()> {
         co.yield_io(completion()).await;
         co.with(|counter| counter.steps += 1);
         Err(())
@@ -287,19 +316,19 @@ mod tests {
 
     #[test]
     fn yields_once_per_step_until_done() {
-        let mut runner = Runner::boxed(count_to);
-        let mut counter = Counter { steps: 0 };
+        let mut runner = Runner::boxed(|co, args| with_handle(co, args, count_to));
+        let mut counter = Counter::new(0);
         assert!(!runner.is_active());
         for expected in 1..=3 {
             assert!(matches!(
-                runner.as_mut().resume(&mut counter, 3),
+                runner.resume(&mut counter, 3),
                 Ok(IOResult::IO(_))
             ));
             assert!(runner.is_active());
             assert_eq!(counter.steps, expected);
         }
         assert!(matches!(
-            runner.as_mut().resume(&mut counter, 3),
+            runner.resume(&mut counter, 3),
             Ok(IOResult::Done(3))
         ));
         assert!(!runner.is_active());
@@ -307,19 +336,19 @@ mod tests {
 
     #[test]
     fn runner_is_reused_for_the_next_operation() {
-        let mut runner = Runner::boxed(count_to);
-        let mut counter = Counter { steps: 0 };
+        let mut runner = Runner::boxed(|co, args| with_handle(co, args, count_to));
+        let mut counter = Counter::new(0);
         assert!(matches!(
-            runner.as_mut().resume(&mut counter, 0),
+            runner.resume(&mut counter, 0),
             Ok(IOResult::Done(0))
         ));
         assert!(matches!(
-            runner.as_mut().resume(&mut counter, 1),
+            runner.resume(&mut counter, 1),
             Ok(IOResult::IO(_))
         ));
-        let mut other = Counter { steps: 5 };
+        let mut other = Counter::new(5);
         assert!(matches!(
-            runner.as_mut().resume(&mut other, 99),
+            runner.resume(&mut other, 99),
             Ok(IOResult::Done(1))
         ));
         assert_eq!(counter.steps, 1);
@@ -328,30 +357,103 @@ mod tests {
 
     #[test]
     fn error_ends_the_operation() {
-        let mut runner = Runner::boxed(fail_after_one_yield);
-        let mut counter = Counter { steps: 0 };
+        let mut runner = Runner::boxed(|co, args| with_handle(co, args, fail_after_one_yield));
+        let mut counter = Counter::new(0);
         assert!(matches!(
-            runner.as_mut().resume(&mut counter, 0),
+            runner.resume(&mut counter, 0),
             Ok(IOResult::IO(_))
         ));
-        assert!(matches!(runner.as_mut().resume(&mut counter, 0), Err(())));
+        assert!(matches!(runner.resume(&mut counter, 0), Err(())));
         assert!(!runner.is_active());
         assert_eq!(counter.steps, 1);
     }
 
     #[test]
     fn cancel_drops_a_suspended_operation() {
-        let mut runner = Runner::boxed(count_to);
-        let mut counter = Counter { steps: 0 };
+        let mut runner = Runner::boxed(|co, args| with_handle(co, args, count_to));
+        let mut counter = Counter::new(0);
         assert!(matches!(
-            runner.as_mut().resume(&mut counter, 2),
+            runner.resume(&mut counter, 2),
             Ok(IOResult::IO(_))
         ));
-        runner.as_mut().cancel();
+        runner.cancel();
         assert!(!runner.is_active());
         assert!(matches!(
-            runner.as_mut().resume(&mut counter, 0),
+            runner.resume(&mut counter, 0),
             Ok(IOResult::Done(0))
         ));
+    }
+
+    struct Borrowing;
+
+    impl StepContext for Borrowing {
+        type Ctx<'a> = Borrowed<'a>;
+    }
+
+    /// A context that borrows its data for one step only, like the VDBE one.
+    struct Borrowed<'a> {
+        steps: &'a mut usize,
+        io: &'a mut Option<IOCompletions>,
+    }
+
+    impl YieldSlot for Borrowed<'_> {
+        fn park_io(&mut self, io: IOCompletions) {
+            *self.io = Some(io);
+        }
+
+        fn take_io(&mut self) -> Option<IOCompletions> {
+            self.io.take()
+        }
+    }
+
+    async fn count_borrowed(co: &mut Co<Borrowing>, target: usize) -> Result<usize, ()> {
+        let mut yields = 0;
+        while co.with(|ctx| *ctx.steps) < target {
+            co.with(|ctx| *ctx.steps += 1);
+            co.yield_io(completion()).await;
+            yields += 1;
+        }
+        Ok(yields)
+    }
+
+    #[test]
+    fn each_step_gets_its_own_borrowed_context() {
+        let mut runner = Runner::boxed(|co, args| with_handle(co, args, count_borrowed));
+        let mut first = 0;
+        let mut second = 1;
+        let mut io = None;
+        assert!(matches!(
+            runner.resume(
+                &mut Borrowed {
+                    steps: &mut first,
+                    io: &mut io
+                },
+                2
+            ),
+            Ok(IOResult::IO(_))
+        ));
+        assert_eq!(first, 1);
+        assert!(matches!(
+            runner.resume(
+                &mut Borrowed {
+                    steps: &mut second,
+                    io: &mut io
+                },
+                2
+            ),
+            Ok(IOResult::IO(_))
+        ));
+        assert_eq!(second, 2);
+        assert!(matches!(
+            runner.resume(
+                &mut Borrowed {
+                    steps: &mut second,
+                    io: &mut io
+                },
+                2
+            ),
+            Ok(IOResult::Done(2))
+        ));
+        assert!(io.is_none());
     }
 }
