@@ -1,4 +1,5 @@
 use crate::alloc::{ConcurrentAllocator, TryReserveError, TursoAllocator};
+use crate::coro::{with_handle, BoxedResumable, Co, Runner, StepContext, YieldSlot};
 use crate::skiplist::{comparator::BasicComparator, map::Entry};
 use crate::turso_assert;
 use crate::types::IOResultOr;
@@ -21,6 +22,7 @@ use crate::vdbe::Register;
 use crate::{return_if_io, Completion, Connection, LimboError, Pager, Result};
 use std::any::Any;
 use std::fmt::Debug;
+use std::marker::PhantomData;
 use std::ops::Bound;
 #[cfg(any(test, injected_yields))]
 use strum::EnumCount;
@@ -63,15 +65,6 @@ impl<A: ConcurrentAllocator> Debug for CursorPosition<A> {
 #[derive(Debug, Clone, Copy)]
 enum ExistsState {
     ExistsBtree,
-}
-
-#[derive(Debug, Clone, Copy)]
-/// State machine for advancing the btree cursor.
-/// Advancing means advancing the btree iterator that could be going either forwards or backwards.
-enum AdvanceBtreeState {
-    RewindCheckBtreeKey, // Check if first key found is valid
-    NextBtree,           // Advance to next key
-    NextCheckBtreeKey,   // Check if next key found is valid, if it isn't go back to NextBtree
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -522,6 +515,55 @@ impl<A: ConcurrentAllocator> IndexShadowScan<A> {
     }
 }
 
+/// Names [`MvCursorCtx`] as the context type of the async cursor operations.
+struct MvCursorStep<Clock, A>(PhantomData<fn() -> (Clock, A)>);
+
+impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> StepContext for MvCursorStep<Clock, A> {
+    type Error = Box<LimboError>;
+    type Ctx<'a> = MvCursorCtx<'a, Clock, A>;
+}
+
+/// The context of one step of an async cursor operation. The async function
+/// gets it back on every step, so it never keeps a reference across a yield.
+struct MvCursorCtx<'a, Clock: LogicalClock + 'static, A: ConcurrentAllocator> {
+    cursor: &'a mut MvccLazyCursor<Clock, A>,
+    io: Option<IOCompletions>,
+    err: Option<Box<LimboError>>,
+}
+
+impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> YieldSlot<Box<LimboError>>
+    for MvCursorCtx<'_, Clock, A>
+{
+    fn park_io(&mut self, io: IOCompletions) {
+        self.io = Some(io);
+    }
+
+    fn take_io(&mut self) -> Option<IOCompletions> {
+        self.io.take()
+    }
+
+    fn park_err(&mut self, err: Box<LimboError>) {
+        self.err = Some(err);
+    }
+
+    fn take_err(&mut self) -> Option<Box<LimboError>> {
+        self.err.take()
+    }
+}
+
+type CursorRunner<Clock, A, Args, Out> = BoxedResumable<MvCursorStep<Clock, A>, Args, Out>;
+
+/// The runner of each async cursor operation, boxed on first use and reused.
+struct CursorOps<Clock: LogicalClock + 'static, A: ConcurrentAllocator> {
+    advance: Option<CursorRunner<Clock, A, (IterationDirection, bool), ()>>,
+}
+
+impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> Default for CursorOps<Clock, A> {
+    fn default() -> Self {
+        Self { advance: None }
+    }
+}
+
 pub struct MvccLazyCursor<Clock: LogicalClock + 'static, A: ConcurrentAllocator = TursoAllocator> {
     pub db: Arc<MvStore<Clock, A>>,
     /// Weak so a cursor retained past its statement (an index-method cursor
@@ -549,7 +591,8 @@ pub struct MvccLazyCursor<Clock: LogicalClock + 'static, A: ConcurrentAllocator 
     state: Option<MvccLazyCursorState>,
     // we keep count_state separate to be able to call other public functions like rewind and next
     count_state: Option<CountState>,
-    btree_advance_state: Option<AdvanceBtreeState>,
+    /// The runners of the async operations of this cursor.
+    ops: CursorOps<Clock, A>,
     /// Dual-cursor peek state for proper iteration
     dual_peek: DualCursorPeek<A>,
     /// Forward scan over `index_rows`; see [`IndexShadowScan`].
@@ -617,7 +660,7 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> MvccLazyCursor<Clock
             creating_new_rowid: false,
             state: None,
             count_state: None,
-            btree_advance_state: None,
+            ops: CursorOps::default(),
             dual_peek: DualCursorPeek::default(),
             index_shadow_scan: IndexShadowScan::default(),
         })
@@ -877,178 +920,111 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> MvccLazyCursor<Clock
 
     /// Advance btree cursor forward and set btree peek to the first valid row key (skipping rows shadowed by MVCC)
     fn advance_btree_forward(&mut self) -> IOResultOr<()> {
-        self._advance_btree_forward(true)
+        self.drive_advance_btree(IterationDirection::Forwards, true)
     }
 
     /// Advance btree cursor forward from current position (cursor already positioned by seek)
     fn advance_btree_forward_from_current(&mut self) -> IOResultOr<()> {
-        self._advance_btree_forward(false)
-    }
-
-    fn _advance_btree_forward(&mut self, initialize: bool) -> IOResultOr<()> {
-        loop {
-            let state = self.btree_advance_state;
-            match state {
-                None => {
-                    if !self.is_btree_allocated() {
-                        self.dual_peek.btree_peek = CursorPeek::Exhausted;
-                        self.btree_advance_state = None;
-                        return Ok(IOResult::Done(()));
-                    }
-                    // If the btree is uninitialized AND we should initialize, do the equivalent of rewind() to find the first valid row
-                    if initialize && self.dual_peek.btree_uninitialized() {
-                        return_if_io!(self.btree_cursor.rewind());
-                        self.btree_advance_state = Some(AdvanceBtreeState::RewindCheckBtreeKey);
-                    } else {
-                        self.btree_advance_state = Some(AdvanceBtreeState::NextBtree);
-                    }
-                    inject_io_yield!(self, CursorYieldPoint::AdvanceBtreeForwardProgress);
-                }
-                Some(AdvanceBtreeState::RewindCheckBtreeKey) => {
-                    let key = self.get_btree_current_key()?;
-                    match key {
-                        Some(k) if self.btree_row_is_valid_forward(&k) => {
-                            self.dual_peek.btree_peek = CursorPeek::Row {
-                                key: k,
-                                versions: None,
-                            };
-                            self.btree_advance_state = None;
-                            return Ok(IOResult::Done(()));
-                        }
-                        Some(_) => {
-                            // shadowed by MVCC, continue to next
-                            self.btree_advance_state = Some(AdvanceBtreeState::NextBtree);
-                        }
-                        None => {
-                            self.dual_peek.btree_peek = CursorPeek::Exhausted;
-                            self.btree_advance_state = None;
-                            return Ok(IOResult::Done(()));
-                        }
-                    }
-                }
-                Some(AdvanceBtreeState::NextBtree) => {
-                    let peek = &mut self.dual_peek;
-                    return_if_io!(self.btree_cursor.next());
-                    let found = self.btree_cursor.has_record();
-                    if !found {
-                        peek.btree_peek = CursorPeek::Exhausted;
-                        self.btree_advance_state = None;
-                        return Ok(IOResult::Done(()));
-                    }
-                    self.btree_advance_state = Some(AdvanceBtreeState::NextCheckBtreeKey);
-                    inject_io_yield!(self, CursorYieldPoint::AdvanceBtreeForwardProgress);
-                }
-                Some(AdvanceBtreeState::NextCheckBtreeKey) => {
-                    let key = self.get_btree_current_key()?;
-                    if let Some(key) = key {
-                        if self.btree_row_is_valid_forward(&key) {
-                            self.dual_peek.btree_peek = CursorPeek::Row {
-                                key,
-                                versions: None,
-                            };
-                            self.btree_advance_state = None;
-                            return Ok(IOResult::Done(()));
-                        }
-                        // Row is shadowed by MVCC, continue to next
-                        // FIXME: do we want to iterate over all shadowed rows? If every row is shadowed by MVCC, we will iterate the whole btree in a single `next` call
-                        self.btree_advance_state = Some(AdvanceBtreeState::NextBtree);
-                    } else {
-                        self.dual_peek.btree_peek = CursorPeek::Exhausted;
-                        self.btree_advance_state = None;
-                        return Ok(IOResult::Done(()));
-                    }
-                }
-            }
-        }
+        self.drive_advance_btree(IterationDirection::Forwards, false)
     }
 
     /// Advance btree cursor backward and set btree peek to the first valid row key (skipping rows shadowed by MVCC)
     fn advance_btree_backward(&mut self) -> IOResultOr<()> {
-        self._advance_btree_backward(true)
+        self.drive_advance_btree(IterationDirection::Backwards, true)
     }
 
     /// Advance btree cursor backward from current position (cursor already positioned by seek)
     fn advance_btree_backward_from_current(&mut self) -> IOResultOr<()> {
-        self._advance_btree_backward(false)
+        self.drive_advance_btree(IterationDirection::Backwards, false)
     }
 
-    fn _advance_btree_backward(&mut self, initialize: bool) -> IOResultOr<()> {
-        loop {
-            let state = self.btree_advance_state;
-            match state {
-                None => {
-                    if !self.is_btree_allocated() {
-                        let peek = &mut self.dual_peek;
-                        peek.btree_peek = CursorPeek::Exhausted;
-                        self.btree_advance_state = None;
-                        return Ok(IOResult::Done(()));
-                    }
-                    // If the btree is uninitialized AND we should initialize, do the equivalent of last() to find the last valid row
-                    if initialize && self.dual_peek.btree_uninitialized() {
-                        return_if_io!(self.btree_cursor.last());
-                        self.btree_advance_state = Some(AdvanceBtreeState::RewindCheckBtreeKey);
-                    } else {
-                        self.btree_advance_state = Some(AdvanceBtreeState::NextBtree);
-                    }
-                    inject_io_yield!(self, CursorYieldPoint::AdvanceBtreeBackwardProgress);
-                }
-                Some(AdvanceBtreeState::RewindCheckBtreeKey) => {
-                    let key = self.get_btree_current_key()?;
-                    match key {
-                        Some(k) if self.query_btree_version_is_valid(&k) => {
-                            self.dual_peek.btree_peek = CursorPeek::Row {
-                                key: k,
-                                versions: None,
-                            };
-                            self.btree_advance_state = None;
-                            return Ok(IOResult::Done(()));
-                        }
-                        Some(_) => {
-                            // shadowed by MVCC, continue to prev
-                            self.btree_advance_state = Some(AdvanceBtreeState::NextBtree);
-                        }
-                        None => {
-                            self.dual_peek.btree_peek = CursorPeek::Exhausted;
-                            self.btree_advance_state = None;
-                            return Ok(IOResult::Done(()));
-                        }
-                    }
-                }
-                Some(AdvanceBtreeState::NextBtree) => {
-                    return_if_io!(self.btree_cursor.prev());
-                    let peek = &mut self.dual_peek;
-                    let found = self.btree_cursor.has_record();
-                    if !found {
-                        peek.btree_peek = CursorPeek::Exhausted;
-                        self.btree_advance_state = None;
-                        return Ok(IOResult::Done(()));
-                    }
-                    self.btree_advance_state = Some(AdvanceBtreeState::NextCheckBtreeKey);
-                    inject_io_yield!(self, CursorYieldPoint::AdvanceBtreeBackwardProgress);
-                }
-                Some(AdvanceBtreeState::NextCheckBtreeKey) => {
-                    let key = self.get_btree_current_key()?;
-                    match key {
-                        Some(k) if self.query_btree_version_is_valid(&k) => {
-                            self.dual_peek.btree_peek = CursorPeek::Row {
-                                key: k,
-                                versions: None,
-                            };
-                            self.btree_advance_state = None;
-                            return Ok(IOResult::Done(()));
-                        }
-                        Some(_) => {
-                            // shadowed by MVCC, continue to prev
-                            self.btree_advance_state = Some(AdvanceBtreeState::NextBtree);
-                        }
-                        None => {
-                            self.dual_peek.btree_peek = CursorPeek::Exhausted;
-                            self.btree_advance_state = None;
-                            return Ok(IOResult::Done(()));
-                        }
-                    }
-                }
-            }
+    fn drive_advance_btree(&mut self, dir: IterationDirection, initialize: bool) -> IOResultOr<()> {
+        let mut op = self.ops.advance.take().unwrap_or_else(|| {
+            Runner::boxed(|co, args| {
+                with_handle(co, args, async |co, (dir, initialize)| {
+                    advance_btree(co, dir, initialize).await
+                })
+            })
+        });
+        let mut ctx = MvCursorCtx {
+            cursor: self,
+            io: None,
+            err: None,
+        };
+        let result = op.resume(&mut ctx, (dir, initialize));
+        self.ops.advance = Some(op);
+        result
+    }
+
+    /// Starts one B-tree advance. `None` means the B-tree has no row for
+    /// this cursor. `Some(true)` means the cursor was moved to the first or
+    /// last row and that row must be checked before the cursor moves again.
+    #[inline(always)]
+    fn begin_btree_advance(
+        &mut self,
+        dir: IterationDirection,
+        initialize: bool,
+    ) -> IOResultOr<Option<bool>> {
+        if !self.is_btree_allocated() {
+            self.dual_peek.btree_peek = CursorPeek::Exhausted;
+            return Ok(IOResult::Done(None));
+        }
+        if initialize && self.dual_peek.btree_uninitialized() {
+            return_if_io!(match dir {
+                IterationDirection::Forwards => self.btree_cursor.rewind(),
+                IterationDirection::Backwards => self.btree_cursor.last(),
+            });
+            return Ok(IOResult::Done(Some(true)));
+        }
+        Ok(IOResult::Done(Some(false)))
+    }
+
+    /// Reads the key under the B-tree cursor. Returns true when the advance
+    /// is done: the row is visible and stored in the B-tree peek, or the
+    /// B-tree has no row left. Returns false when MVCC shadows the row.
+    #[inline(always)]
+    fn peek_btree_key(&mut self, dir: IterationDirection) -> IOResultOr<bool> {
+        let Some(key) = self.get_btree_current_key()? else {
+            self.dual_peek.btree_peek = CursorPeek::Exhausted;
+            return Ok(IOResult::Done(true));
+        };
+        let valid = match dir {
+            IterationDirection::Forwards => self.btree_row_is_valid_forward(&key),
+            IterationDirection::Backwards => self.query_btree_version_is_valid(&key),
+        };
+        if valid {
+            self.dual_peek.btree_peek = CursorPeek::Row {
+                key,
+                versions: None,
+            };
+        }
+        Ok(IOResult::Done(valid))
+    }
+
+    /// Moves the B-tree cursor one row in `dir`. Returns whether the cursor
+    /// is on a row afterwards.
+    #[inline(always)]
+    fn step_btree(&mut self, dir: IterationDirection) -> IOResultOr<bool> {
+        return_if_io!(match dir {
+            IterationDirection::Forwards => self.btree_cursor.next(),
+            IterationDirection::Backwards => self.btree_cursor.prev(),
+        });
+        Ok(IOResult::Done(self.btree_cursor.has_record()))
+    }
+
+    /// The completion of an injected yield at `point`, when the yield
+    /// injector of the connection asks for one.
+    #[cfg(any(test, injected_yields))]
+    fn injected_yield(&self, point: CursorYieldPoint) -> Option<IOCompletions> {
+        let yield_context = self.yield_context();
+        match crate::mvcc::yield_hooks::maybe_inject_io_yield::<(), _>(
+            yield_context.injector.as_ref(),
+            yield_context.instance_id,
+            yield_context.selection_key,
+            point,
+        ) {
+            Some(IOResult::IO(io)) => Some(io),
+            _ => None,
         }
     }
 
@@ -2307,6 +2283,55 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> CursorTrait
     /// Returns true if this cursor operates in MVCC mode.
     fn is_mvcc(&self) -> bool {
         true
+    }
+}
+
+/// Yields to the caller when the yield injector of the cursor asks for a
+/// yield at `point`.
+macro_rules! inject_cursor_yield {
+    ($co:expr, $point:expr) => {{
+        #[cfg(any(test, injected_yields))]
+        if let Some(io) = $co.with(|ctx| ctx.cursor.injected_yield($point)) {
+            $co.yield_io(io).await;
+        }
+    }};
+}
+
+/// Moves the B-tree cursor in `dir` until it is on a row that MVCC does not
+/// shadow, and stores that row in the B-tree peek. With `initialize`, an
+/// uninitialized B-tree peek first moves the cursor to the first or last
+/// row of the B-tree.
+async fn advance_btree<Clock: LogicalClock + 'static, A: ConcurrentAllocator>(
+    co: &mut Co<MvCursorStep<Clock, A>>,
+    dir: IterationDirection,
+    initialize: bool,
+) -> Result<(), Box<LimboError>> {
+    let Some(mut check_current) = co
+        .io(|ctx| ctx.cursor.begin_btree_advance(dir, initialize))
+        .await
+    else {
+        return Ok(());
+    };
+    inject_cursor_yield!(co, advance_yield_point(dir));
+    loop {
+        if check_current && co.io(|ctx| ctx.cursor.peek_btree_key(dir)).await {
+            return Ok(());
+        }
+        let found = co.io(|ctx| ctx.cursor.step_btree(dir)).await;
+        if !found {
+            co.with(|ctx| ctx.cursor.dual_peek.btree_peek = CursorPeek::Exhausted);
+            return Ok(());
+        }
+        inject_cursor_yield!(co, advance_yield_point(dir));
+        check_current = true;
+    }
+}
+
+#[cfg(any(test, injected_yields))]
+fn advance_yield_point(dir: IterationDirection) -> CursorYieldPoint {
+    match dir {
+        IterationDirection::Forwards => CursorYieldPoint::AdvanceBtreeForwardProgress,
+        IterationDirection::Backwards => CursorYieldPoint::AdvanceBtreeBackwardProgress,
     }
 }
 
