@@ -12,6 +12,8 @@ use crate::mvcc::database::{
 use crate::mvcc::yield_hooks::{ProvidesYieldContext, YieldContext, YieldPointMarker};
 use crate::mvcc::yield_points::{inject_transition_failure, inject_transition_yield};
 use crate::schema::{Index, Schema};
+use crate::skiplist::base::RefEntry;
+use crate::skiplist::SkiplistAllocator;
 use crate::state_machine::{StateMachine, StateTransition, TransitionResult};
 use crate::storage::btree::{BTreeCursor, CursorTrait};
 use crate::storage::pager::CreateBTreeFlags;
@@ -27,6 +29,7 @@ use crate::{
     CheckpointResult, Completion, Connection, Database, IOExt, LimboError, Numeric, Pager, Result,
     SyncMode, TransactionState, Value, ValueRef,
 };
+use crossbeam_epoch as epoch;
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 use std::num::NonZeroU64;
 use std::ops::Bound;
@@ -1146,7 +1149,10 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
             Some(last) => (Bound::Unbounded, Bound::Excluded(last)),
         };
         let mut processed = 0;
-        for entry in self.mvstore.rows.range(bounds).rev() {
+        let guard = epoch::pin();
+        let mut range = self.mvstore.rows.range(bounds);
+        while let Some(pinned) = range.inner.next_back(&guard) {
+            let entry = CollectEntry::new(pinned, &guard);
             let key = entry.key();
             tracing::trace!("collecting {key:?}");
             self.collect_table_cursor = Some(key.clone());
@@ -1337,8 +1343,11 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
                 Some(last) => (Bound::Included(last), Bound::Unbounded),
             };
         let mut processed = 0;
-        for entry in self.mvstore.index_rows.range(outer_bounds) {
-            let index_id = *entry.key();
+        let guard = epoch::pin();
+        let mut outer_range = self.mvstore.index_rows.range(outer_bounds);
+        while let Some(pinned) = outer_range.inner.next(&guard) {
+            let outer = CollectEntry::new(pinned, &guard);
+            let index_id = *outer.key();
 
             // Skip destroyed indexes - we won't checkpoint rows for indexes that will be destroyed
             if self.destroyed_indexes.contains(&index_id) {
@@ -1347,13 +1356,15 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
                 continue;
             }
 
-            let index_rows_map = entry.value();
+            let index_rows_map = outer.value();
             let inner_bounds: (Bound<Arc<SortableIndexKey>>, Bound<Arc<SortableIndexKey>>) =
                 match self.collect_index_key_cursor.clone() {
                     None => (Bound::Unbounded, Bound::Unbounded),
                     Some(last) => (Bound::Excluded(last), Bound::Unbounded),
                 };
-            for entry in index_rows_map.range(inner_bounds) {
+            let mut inner_range = index_rows_map.range(inner_bounds);
+            while let Some(pinned) = inner_range.inner.next(&guard) {
+                let entry = CollectEntry::new(pinned, &guard);
                 let versions = entry.value().read();
                 self.collect_index_tableid_cursor = Some(index_id);
                 self.collect_index_key_cursor = Some(entry.key().clone());
@@ -3059,6 +3070,39 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
                     })?,
                 ))
             }
+        }
+    }
+}
+
+struct CollectEntry<'a, 'g, K, V, C, A: SkiplistAllocator> {
+    entry: Option<RefEntry<'a, K, V, C, A>>,
+    guard: &'g epoch::Guard,
+}
+
+impl<'a, 'g, K, V, C, A: SkiplistAllocator> CollectEntry<'a, 'g, K, V, C, A> {
+    fn new(entry: RefEntry<'a, K, V, C, A>, guard: &'g epoch::Guard) -> Self {
+        Self {
+            entry: Some(entry),
+            guard,
+        }
+    }
+
+    fn key(&self) -> &'a K {
+        self.entry.as_ref().expect("collect entry still held").key()
+    }
+
+    fn value(&self) -> &'a V {
+        self.entry
+            .as_ref()
+            .expect("collect entry still held")
+            .value()
+    }
+}
+
+impl<K, V, C, A: SkiplistAllocator> Drop for CollectEntry<'_, '_, K, V, C, A> {
+    fn drop(&mut self) {
+        if let Some(entry) = self.entry.take() {
+            entry.release(self.guard);
         }
     }
 }
