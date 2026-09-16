@@ -1516,7 +1516,6 @@ pub struct Pager {
     /// Note that schema cookie is 32-bits, but we use 64-bit field so we can
     /// represent case where value is not set.
     schema_cookie: AtomicU64,
-    free_page_state: RwLock<FreePageState>,
     /// State machine for async cache spilling.
     spill_state: RwLock<SpillState>,
     /// State machine for async cacheflush operation.
@@ -1673,13 +1672,6 @@ enum FreelistSearch {
         number_of_freelist_leaves: u32,
         completion: Option<Completion>,
     },
-}
-
-#[derive(Debug, Clone)]
-enum FreePageState {
-    Start,
-    AddToTrunk { page: Arc<Page> },
-    NewTrunk { page: Arc<Page> },
 }
 
 /// State machine for async cache spilling.
@@ -1861,6 +1853,7 @@ struct PagerOps {
     btree_create_vacuum_full: AsyncOp<PagerStep, PageType, u32>,
     allocate_page1: AsyncOp<PagerStep, (), PageRef>,
     allocate_page: AsyncOp<PagerStep, (), PageRef>,
+    free_page: AsyncOp<PagerStep, (Option<PageRef>, usize), ()>,
 }
 
 impl PagerOps {
@@ -1888,6 +1881,9 @@ impl PagerOps {
             }),
             allocate_page: AsyncOp::new(|| {
                 Runner::boxed(|co, args| with_handle(co, args, Pager::allocate_page_async))
+            }),
+            free_page: AsyncOp::new(|| {
+                Runner::boxed(|co, args| with_handle(co, args, Pager::free_page_async))
             }),
         }
     }
@@ -1950,7 +1946,6 @@ impl Pager {
             page_size: AtomicU32::new(0), // 0 means not set
             reserved_space: AtomicU16::new(RESERVED_SPACE_NOT_SET),
             schema_cookie: AtomicU64::new(Self::SCHEMA_COOKIE_NOT_SET),
-            free_page_state: RwLock::new(FreePageState::Start),
             spill_state: RwLock::new(SpillState::Idle),
             cacheflush_state: RwLock::new(CacheFlushState::default()),
             max_page_count: AtomicU32::new(DEFAULT_MAX_PAGE_COUNT),
@@ -5496,142 +5491,170 @@ impl Pager {
     // Providing a page is optional, if provided it will be used to avoid reading the page from disk.
     // This is implemented in accordance with sqlite freepage2() function.
     #[instrument(skip_all, level = Level::DEBUG)]
-    pub fn free_page(&self, mut page: Option<PageRef>, page_id: usize) -> IOResultOr<()> {
+    pub fn free_page(&self, page: Option<PageRef>, page_id: usize) -> IOResultOr<()> {
         tracing::trace!("free_page(page_id={})", page_id);
+        self.step_op(&self.ops.free_page, (page, page_id))
+    }
+
+    /// Adds the page to the first freelist trunk page, or makes the page the
+    /// new first trunk page when there is none or the first one is full.
+    async fn free_page_async(
+        co: &mut Co<PagerStep>,
+        (mut page, page_id): (Option<PageRef>, usize),
+    ) -> Result<(), Box<LimboError>> {
+        let (page, completion, trunk_page_id) = co
+            .io(|ctx| {
+                ctx.pager.with_header_mut_step(|pager, header| {
+                    pager.free_page_start(header, &mut page, page_id)
+                })
+            })
+            .await;
+        if let Some(c) = completion {
+            if !c.succeeded() {
+                co.yield_io(IOCompletions(c)).await;
+            }
+        }
+        let added_to_trunk = trunk_page_id != 0
+            && co
+                .io(|ctx| {
+                    ctx.pager.with_header_mut_step(|pager, header| {
+                        pager.free_page_add_to_trunk(header, &page, page_id)
+                    })
+                })
+                .await;
+        if !added_to_trunk {
+            co.io(|ctx| {
+                ctx.pager.with_header_mut_step(|pager, header| {
+                    pager.free_page_new_trunk(header, &page, page_id)?;
+                    Ok(IOResult::Done(()))
+                })
+            })
+            .await;
+        }
+        Ok(())
+    }
+
+    /// Gets the page to free, counts it in the header and pins it. Returns
+    /// the page, its read if one is in flight, and the first trunk page id.
+    fn free_page_start(
+        &self,
+        header: &mut DatabaseHeader,
+        page: &mut Option<PageRef>,
+        page_id: usize,
+    ) -> IOResultOr<(PageRef, Option<Completion>, u32)> {
+        if page_id < 2 || page_id > header.database_size.get() as usize {
+            return Err(LimboError::Corrupt(format!(
+                "Invalid page number {page_id} for free operation"
+            ))
+            .into());
+        }
+
+        // If the caller passes `Some(page)`, no IO occurs and the mutations
+        // below run synchronously. If the caller passes `None` and
+        // `read_page` yields for spill, this step runs again (the pager's
+        // `pending_reads` memoization returns the same `PageRef` the next
+        // time). Crucially, the non-idempotent mutations (`freelist_pages`
+        // increment, `page.pin()`) all happen AFTER both branches converge.
+        let (page, c) = match page.take() {
+            Some(page) => {
+                turso_assert_eq!(
+                    page.get().id(),
+                    page_id,
+                    "free_page page id mismatch",
+                    { "expected": page_id, "actual": page.get().id() }
+                );
+                (page, None)
+            }
+            None => return_if_io!(self.read_page(page_id as i64)),
+        };
+        page.get().overflow_cells.clear();
+        header.freelist_pages = (header.freelist_pages.get() + 1).into();
+
+        let trunk_page_id = header.freelist_trunk_page.get();
+
+        // Pin page to prevent eviction while stored in state machine
+        page.pin();
+        Ok(IOResult::Done((page, c, trunk_page_id)))
+    }
+
+    /// Adds the page as a leaf of the first trunk page. Returns false when
+    /// the trunk page is full and the page must become a new trunk page.
+    fn free_page_add_to_trunk(
+        &self,
+        header: &mut DatabaseHeader,
+        page: &PageRef,
+        page_id: usize,
+    ) -> IOResultOr<bool> {
         // Number of reserved slots in trunk header (next pointer + leaf count)
         const RESERVED_SLOTS: usize = 2;
 
-        let header_ref = return_if_io!(HeaderRefMut::from_pager(self));
-        let header = header_ref.borrow_mut();
-
-        let mut state = self.free_page_state.write();
-        tracing::debug!(?state);
-        loop {
-            match &mut *state {
-                FreePageState::Start => {
-                    if page_id < 2 || page_id > header.database_size.get() as usize {
-                        return Err(LimboError::Corrupt(format!(
-                            "Invalid page number {page_id} for free operation"
-                        ))
-                        .into());
-                    }
-
-                    // The first yield point is the `HeaderRefMut::from_pager`
-                    // acquisition above the loop, not this read fork: if it
-                    // yields for the page-1 read, re-entry re-runs that prefix
-                    // (it is idempotent — the pager cache returns the same
-                    // header page) before reaching `Start` again, where `state`
-                    // is still `Start`. The read fork below is likewise safe:
-                    // if the caller passes `Some(page)`, no IO occurs and the
-                    // mutations below run synchronously. If the caller passes
-                    // `None` and `read_page` yields for spill, we leave `state`
-                    // at `Start` so re-entry re-takes either branch (the
-                    // pager's `pending_reads` memoization returns the same
-                    // `PageRef` the next time). Crucially, the non-idempotent
-                    // mutations (`freelist_pages` increment, `page.pin()`,
-                    // state advance) all happen AFTER both branches converge.
-                    let (page, c) = match page.take() {
-                        Some(page) => {
-                            turso_assert_eq!(
-                                page.get().id(),
-                                page_id,
-                                "free_page page id mismatch",
-                                { "expected": page_id, "actual": page.get().id() }
-                            );
-                            (page, None)
-                        }
-                        None => return_if_io!(self.read_page(page_id as i64)),
-                    };
-                    page.get().overflow_cells.clear();
-                    header.freelist_pages = (header.freelist_pages.get() + 1).into();
-
-                    let trunk_page_id = header.freelist_trunk_page.get();
-
-                    // Pin page to prevent eviction while stored in state machine
-                    page.pin();
-
-                    if trunk_page_id != 0 {
-                        *state = FreePageState::AddToTrunk { page };
-                    } else {
-                        *state = FreePageState::NewTrunk { page };
-                    }
-                    if let Some(c) = c {
-                        if !c.succeeded() {
-                            io_yield_one!(c);
-                        }
-                    }
-                }
-                FreePageState::AddToTrunk { page } => {
-                    let trunk_page_id = header.freelist_trunk_page.get();
-                    // Spill yield here keeps `state` at `AddToTrunk`. The
-                    // subsequent writes / `unpin()` only run after we have
-                    // a loaded `trunk_page`; on re-entry the pager's
-                    // `pending_reads` returns the same `trunk_page`, and the
-                    // writes are byte-identical (we haven't written yet so
-                    // `number_of_leaf_pages` is unchanged).
-                    let (trunk_page, c) = return_if_io!(self.read_page(trunk_page_id as i64));
-                    if let Some(c) = c {
-                        if !c.succeeded() {
-                            io_yield_one!(c);
-                        }
-                    }
-                    turso_assert!(trunk_page.is_loaded(), "trunk_page should be loaded");
-
-                    let trunk_page_contents = trunk_page.get_contents();
-                    let number_of_leaf_pages =
-                        trunk_page_contents.read_u32_no_offset(FREELIST_TRUNK_OFFSET_LEAF_COUNT);
-
-                    let max_free_list_entries =
-                        (header.usable_space() / FREELIST_LEAF_PTR_SIZE) - RESERVED_SLOTS;
-
-                    if number_of_leaf_pages < max_free_list_entries as u32 {
-                        turso_assert!(
-                            trunk_page.get().id() == trunk_page_id as usize,
-                            "trunk page has unexpected id"
-                        );
-                        self.add_dirty(&trunk_page)?;
-
-                        trunk_page_contents.write_u32_no_offset(
-                            FREELIST_TRUNK_OFFSET_LEAF_COUNT,
-                            number_of_leaf_pages + 1,
-                        );
-                        trunk_page_contents.write_u32_no_offset(
-                            FREELIST_TRUNK_OFFSET_FIRST_LEAF_PTR
-                                + (number_of_leaf_pages as usize * FREELIST_LEAF_PTR_SIZE),
-                            page_id as u32,
-                        );
-
-                        // Unpin page before finishing - it's added to freelist
-                        page.unpin();
-                        break;
-                    }
-                    // page remains pinned as it transitions to NewTrunk state
-                    *state = FreePageState::NewTrunk { page: page.clone() };
-                }
-                FreePageState::NewTrunk { page } => {
-                    turso_assert!(page.is_loaded(), "page should be loaded");
-                    // If we get here, need to make this page a new trunk
-                    turso_assert!(page.get().id() == page_id, "page has unexpected id");
-                    self.add_dirty(page)?;
-
-                    let trunk_page_id = header.freelist_trunk_page.get();
-
-                    let contents = page.get_contents();
-                    // Point to previous trunk
-                    contents
-                        .write_u32_no_offset(FREELIST_TRUNK_OFFSET_NEXT_TRUNK_PTR, trunk_page_id);
-                    // Zero leaf count
-                    contents.write_u32_no_offset(FREELIST_TRUNK_OFFSET_LEAF_COUNT, 0);
-                    // Update page 1 to point to new trunk
-                    header.freelist_trunk_page = (page_id as u32).into();
-                    // Unpin page before finishing - it's now a trunk page
-                    page.unpin();
-                    break;
-                }
+        let trunk_page_id = header.freelist_trunk_page.get();
+        // A spill yield or a read in flight runs this step again. The
+        // writes / `unpin()` only run after we have a loaded `trunk_page`;
+        // on re-entry the pager's `pending_reads` returns the same
+        // `trunk_page`, and the writes are byte-identical (we haven't
+        // written yet so `number_of_leaf_pages` is unchanged).
+        let (trunk_page, c) = return_if_io!(self.read_page(trunk_page_id as i64));
+        if let Some(c) = c {
+            if !c.succeeded() {
+                io_yield_one!(c);
             }
         }
-        *state = FreePageState::Start;
-        Ok(IOResult::Done(()))
+        turso_assert!(trunk_page.is_loaded(), "trunk_page should be loaded");
+
+        let trunk_page_contents = trunk_page.get_contents();
+        let number_of_leaf_pages =
+            trunk_page_contents.read_u32_no_offset(FREELIST_TRUNK_OFFSET_LEAF_COUNT);
+
+        let max_free_list_entries =
+            (header.usable_space() / FREELIST_LEAF_PTR_SIZE) - RESERVED_SLOTS;
+
+        if number_of_leaf_pages >= max_free_list_entries as u32 {
+            // page remains pinned as it becomes a new trunk page
+            return Ok(IOResult::Done(false));
+        }
+        turso_assert!(
+            trunk_page.get().id() == trunk_page_id as usize,
+            "trunk page has unexpected id"
+        );
+        self.add_dirty(&trunk_page)?;
+
+        trunk_page_contents
+            .write_u32_no_offset(FREELIST_TRUNK_OFFSET_LEAF_COUNT, number_of_leaf_pages + 1);
+        trunk_page_contents.write_u32_no_offset(
+            FREELIST_TRUNK_OFFSET_FIRST_LEAF_PTR
+                + (number_of_leaf_pages as usize * FREELIST_LEAF_PTR_SIZE),
+            page_id as u32,
+        );
+
+        // Unpin page before finishing - it's added to freelist
+        page.unpin();
+        Ok(IOResult::Done(true))
+    }
+
+    /// Makes the page the first trunk page, in front of the current one.
+    fn free_page_new_trunk(
+        &self,
+        header: &mut DatabaseHeader,
+        page: &PageRef,
+        page_id: usize,
+    ) -> Result<()> {
+        turso_assert!(page.is_loaded(), "page should be loaded");
+        turso_assert!(page.get().id() == page_id, "page has unexpected id");
+        self.add_dirty(page)?;
+
+        let trunk_page_id = header.freelist_trunk_page.get();
+
+        let contents = page.get_contents();
+        // Point to previous trunk
+        contents.write_u32_no_offset(FREELIST_TRUNK_OFFSET_NEXT_TRUNK_PTR, trunk_page_id);
+        // Zero leaf count
+        contents.write_u32_no_offset(FREELIST_TRUNK_OFFSET_LEAF_COUNT, 0);
+        // Update page 1 to point to new trunk
+        header.freelist_trunk_page = (page_id as u32).into();
+        // Unpin page before finishing - it's now a trunk page
+        page.unpin();
+        Ok(())
     }
 
     #[instrument(skip_all, level = Level::DEBUG)]
@@ -6180,7 +6203,7 @@ impl Pager {
         self.syncing.store(false, Ordering::SeqCst);
         self.commit_info.write().reset();
         self.ops.allocate_page.cancel();
-        *self.free_page_state.write() = FreePageState::Start;
+        self.ops.free_page.cancel();
         *self.spill_state.write() = SpillState::Idle;
         self.ops.read_header_page.cancel();
         #[cfg(feature = "autovacuum")]
