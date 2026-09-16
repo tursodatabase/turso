@@ -297,6 +297,58 @@ fn aborted_transaction_rejects_write_set_insert() {
     tx.insert_to_write_set(row_id, row_versions);
 }
 
+#[test]
+fn rollback_only_reports_rowids_restored_by_a_delete() {
+    let tx_id = 1;
+    let row_id = RowID::new(MVTableId::from(-2), RowKey::Int(666));
+    let row = Row::new_table_row(row_id, &[], 0).unwrap();
+
+    let mut replacement = RowVersion::new(
+        1,
+        Some(TxTimestampOrID::TxID(tx_id)),
+        None,
+        row.clone(),
+        true,
+    );
+    assert!(!rollback_row_version(tx_id, &mut replacement));
+
+    let mut deleted_existing_row = RowVersion::new(
+        2,
+        Some(TxTimestampOrID::Timestamp(1)),
+        Some(TxTimestampOrID::TxID(tx_id)),
+        row.clone(),
+        true,
+    );
+    assert!(rollback_row_version(tx_id, &mut deleted_existing_row));
+
+    let mut deleted_btree_row = RowVersion::new(
+        3,
+        None,
+        Some(TxTimestampOrID::TxID(tx_id)),
+        row.clone(),
+        true,
+    );
+    assert!(rollback_row_version(tx_id, &mut deleted_btree_row));
+
+    let mut deleted_replacement = RowVersion::new(
+        4,
+        Some(TxTimestampOrID::TxID(tx_id)),
+        Some(TxTimestampOrID::TxID(tx_id)),
+        row.clone(),
+        true,
+    );
+    assert!(rollback_row_version(tx_id, &mut deleted_replacement));
+
+    let mut inserted_then_deleted = RowVersion::new(
+        5,
+        Some(TxTimestampOrID::TxID(tx_id)),
+        Some(TxTimestampOrID::TxID(tx_id)),
+        row,
+        false,
+    );
+    assert!(!rollback_row_version(tx_id, &mut inserted_then_deleted));
+}
+
 unsafe impl crate::alloc::ApiAllocator for FailOnDemandAlloc {
     fn allocate(
         &self,

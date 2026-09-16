@@ -7124,8 +7124,16 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         // row-version-chain locks.
         let write_set = tx.write_set.lock().take();
         for (_rowid, row_versions) in write_set.entries {
+            let mut restored_rowid = None;
             for rv in row_versions.write().iter_mut() {
-                rollback_row_version(tx_id, rv);
+                if rollback_row_version(tx_id, rv) {
+                    restored_rowid = Some(rv.row.id.clone());
+                }
+            }
+            // Rollback made this row visible again. For example, if rowid 3 is restored,
+            // the next INSERT without an explicit rowid must choose 4, not reuse 3.
+            if let Some(rowid) = restored_rowid {
+                self.bump_rowid_allocator_for_restored_row(&rowid);
             }
         }
 
@@ -7349,9 +7357,13 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
 
         for (rowid, version_id) in created_table_versions {
             touched_rowids.insert(rowid.clone());
+            let mut restored_rowid = false;
             if let Some(entry) = self.rows.get(&rowid) {
                 let mut versions = entry.value().write();
                 let before = versions.len();
+                restored_rowid = versions
+                    .iter()
+                    .any(|rv| rv.id == version_id && rollback_restores_rowid(tx_id, rv));
                 versions.retain(|rv| rv.id != version_id);
                 self.dec_live_version_count_approx(before - versions.len());
                 tracing::debug!(
@@ -7360,6 +7372,9 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                     rowid.row_id,
                     version_id
                 );
+            }
+            if restored_rowid {
+                self.bump_rowid_allocator_for_restored_row(&rowid);
             }
         }
 
@@ -7381,10 +7396,12 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
 
         for (rowid, version_id) in deleted_table_versions {
             touched_rowids.insert(rowid.clone());
+            let mut restored_rowid = false;
             if let Some(entry) = self.rows.get(&rowid) {
                 let mut versions = entry.value().write();
                 for rv in versions.iter_mut() {
                     if rv.id == version_id {
+                        restored_rowid = rollback_restores_rowid(tx_id, rv);
                         rv.set_end(None);
                         tracing::debug!(
                             "rollback_savepoint: restored table version(table_id={}, row_id={}, version_id={})",
@@ -7395,6 +7412,9 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                         break;
                     }
                 }
+            }
+            if restored_rowid {
+                self.bump_rowid_allocator_for_restored_row(&rowid);
             }
         }
 
@@ -7427,6 +7447,18 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         let tx = tx.value();
         *tx.header.write() = header;
         tx.header_dirty.store(header_dirty, Ordering::Release);
+    }
+
+    // Rollback can make an old integer rowid visible again without going through INSERT.
+    // For example, rowid 3 may exist in the B-tree, then a transaction deletes it.
+    // Until rollback, that transaction sees rowid 3 as gone and may initialize the
+    // allocator from rowid 2. Bump the allocator so the next automatic rowid allocation
+    // returns 4, not 3.
+    fn bump_rowid_allocator_for_restored_row(&self, rowid: &RowID) {
+        if let RowKey::Int(restored_rowid) = &rowid.row_id {
+            self.get_rowid_allocator(&rowid.table_id)
+                .insert_row_id_maybe_update(*restored_rowid);
+        }
     }
 
     fn row_has_uncommitted_version_for_tx(&self, rowid: &RowID, tx_id: TxID) -> bool {
@@ -10314,7 +10346,8 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
     }
 }
 
-fn rollback_row_version(tx_id: u64, rv: &mut RowVersion) {
+fn rollback_row_version(tx_id: u64, rv: &mut RowVersion) -> bool {
+    let restores_rowid = rollback_restores_rowid(tx_id, rv);
     if rv.begin() == Some(TxTimestampOrID::TxID(tx_id)) {
         // If the transaction has aborted,
         // it marks all its new versions as garbage and sets their Begin
@@ -10326,6 +10359,15 @@ fn rollback_row_version(tx_id: u64, rv: &mut RowVersion) {
         // undo deletions by this transaction
         rv.set_end(None);
     }
+    restores_rowid
+}
+
+fn rollback_restores_rowid(tx_id: u64, rv: &RowVersion) -> bool {
+    let created_by_tx = rv.begin() == Some(TxTimestampOrID::TxID(tx_id));
+    let deleted_by_tx = rv.end() == Some(TxTimestampOrID::TxID(tx_id));
+    // An inserted row already advanced the allocator. If this transaction both created and
+    // deleted the version, rollback restores an older row only when it still exists in the B-tree.
+    deleted_by_tx && (!created_by_tx || rv.btree_resident)
 }
 
 impl RowidAllocator {
