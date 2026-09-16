@@ -104,7 +104,7 @@ use std::{
         atomic::{AtomicI64, AtomicIsize, Ordering},
         Arc,
     },
-    task::Waker,
+    task::{Poll, Waker},
 };
 use tracing::{instrument, Level};
 
@@ -230,6 +230,51 @@ impl From<ProgramStep> for Result<StepResult, Box<LimboError>> {
             ProgramStep::Error(err) => Err(err),
         }
     }
+}
+
+impl ProgramStep {
+    /// How the instruction loop hands this result to the async loop that
+    /// runs it: a pause the caller sees as this step, or the end of the
+    /// statement.
+    fn into_exit(self, state: &mut ProgramState) -> Exit {
+        match self {
+            ProgramStep::Row => state.suspend(Suspend::Row),
+            ProgramStep::IO => state.suspend(Suspend::IO),
+            ProgramStep::Yield => state.suspend(Suspend::Yield),
+            ProgramStep::Busy => state.suspend(Suspend::Busy),
+            ProgramStep::Done | ProgramStep::Interrupt | ProgramStep::Error(_) => {
+                Exit::Finished(self)
+            }
+        }
+    }
+}
+
+/// Why the instruction loop returned to the async loop that runs it.
+pub(crate) enum Exit {
+    /// The statement finished: done, interrupted, or failed.
+    Finished(ProgramStep),
+    /// The statement must pause; `ProgramState::suspend_reason` says why.
+    Suspended,
+    /// The instruction at `pc` continues as an async operation.
+    Async(execute::AsyncOp),
+}
+
+/// Why the instruction loop paused.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) enum Suspend {
+    #[default]
+    None,
+    /// A result row is ready.
+    Row,
+    /// The completion in `io_completions` has not finished.
+    IO,
+    /// An explicit yield to the cooperative scheduler.
+    Yield,
+    /// A busy error; the same instruction runs again on the next step.
+    Busy,
+    /// The completion in `io_completions` finished during the step; the
+    /// loop checks its outcome and continues without returning.
+    Retry,
 }
 
 #[derive(Debug)]
@@ -616,7 +661,6 @@ enum ActiveOpState {
     IdxInsert(OpIdxInsertState),
     Insert(OpInsertState),
     NoConflict(OpNoConflictState),
-    ColumnDeferred,
     RowId(OpRowIdState),
     Transaction(OpTransactionState),
     Attach(OpAttachState),
@@ -642,7 +686,6 @@ impl std::fmt::Debug for ActiveOpState {
             ActiveOpState::IdxInsert(_) => "IdxInsert",
             ActiveOpState::Insert(_) => "Insert",
             ActiveOpState::NoConflict(_) => "NoConflict",
-            ActiveOpState::ColumnDeferred => "ColumnDeferred",
             ActiveOpState::RowId(_) => "RowId",
             ActiveOpState::Transaction(_) => "Transaction",
             ActiveOpState::Attach(_) => "Attach",
@@ -659,7 +702,6 @@ impl std::fmt::Debug for ActiveOpState {
 #[derive(Debug, Default)]
 struct ActiveOpStateSlot {
     state: ActiveOpState,
-    column_deferred: Option<execute::ColumnDeferredOp>,
 }
 
 macro_rules! active_state_accessor {
@@ -693,46 +735,9 @@ impl Default for ActiveOpState {
 
 impl ActiveOpStateSlot {
     fn clear(&mut self) {
-        match self.state {
-            ActiveOpState::None => {}
-            ActiveOpState::ColumnDeferred => {
-                if let Some(op) = &mut self.column_deferred {
-                    op.cancel();
-                }
-                self.state = ActiveOpState::None;
-            }
-            _ => self.state = ActiveOpState::None,
+        if !matches!(self.state, ActiveOpState::None) {
+            self.state = ActiveOpState::None;
         }
-    }
-
-    /// Takes the async Column operation out of the slot for one step. The
-    /// first call allocates it; later calls reuse it.
-    fn take_column_deferred(&mut self) -> execute::ColumnDeferredOp {
-        assert!(
-            matches!(
-                self.state,
-                ActiveOpState::None | ActiveOpState::ColumnDeferred
-            ),
-            "active opcode state mismatch: expected ColumnDeferred, got {:?}",
-            self.state
-        );
-        self.column_deferred
-            .take()
-            .unwrap_or_else(execute::ColumnDeferredOp::new)
-    }
-
-    /// Puts the async Column operation back after a step. `active` is true
-    /// when the step yielded for I/O, so the next Column resumes it.
-    fn put_column_deferred(&mut self, op: execute::ColumnDeferredOp, active: bool) {
-        debug_assert!(self.column_deferred.is_none());
-        std::mem::forget(self.column_deferred.replace(op));
-        let state = if active {
-            ActiveOpState::ColumnDeferred
-        } else {
-            ActiveOpState::None
-        };
-        // The old state is None or ColumnDeferred; neither owns anything.
-        std::mem::forget(std::mem::replace(&mut self.state, state));
     }
 
     /// True when no multi-step opcode is suspended. Hot opcodes use this to
@@ -973,6 +978,12 @@ pub struct ProgramState {
     #[cfg(feature = "json")]
     json_cache: JsonCacheCell,
     active_op_state: ActiveOpStateSlot,
+    /// Why the instruction loop paused, read by `normal_step` when the
+    /// loop returns `Pending`.
+    suspend_reason: Suspend,
+    /// The async instruction loop, allocated on the first step and kept
+    /// for the lifetime of the statement.
+    loop_runner: Option<execute::LoopRunner>,
     seek_state: OpSeekState,
     /// Metrics collected for the lifetime of this prepared statement.
     pub metrics: StatementMetrics,
@@ -1104,6 +1115,8 @@ impl ProgramState {
             #[cfg(feature = "json")]
             json_cache: JsonCacheCell::new(),
             active_op_state: ActiveOpStateSlot::default(),
+            suspend_reason: Suspend::None,
+            loop_runner: None,
             seek_state: OpSeekState::Start,
             metrics: StatementMetrics::new(),
             distinct_key_values: Vec::new(),
@@ -1189,6 +1202,10 @@ impl ProgramState {
 
     pub fn reset(&mut self, max_registers: Option<usize>, max_cursors: Option<usize>) {
         self.io_completions = None;
+        self.suspend_reason = Suspend::None;
+        if let Some(runner) = &mut self.loop_runner {
+            runner.cancel();
+        }
         self.pc = 0;
 
         if let Some(max_cursors) = max_cursors {
@@ -1445,6 +1462,31 @@ impl ProgramState {
         self.io_completions
             .take()
             .expect("an instruction that reports IO leaves its completion in the state")
+    }
+
+    /// Records why the instruction loop pauses; the async loop then pauses
+    /// and `normal_step` reads the reason back.
+    #[inline(always)]
+    fn suspend(&mut self, reason: Suspend) -> Exit {
+        self.suspend_reason = reason;
+        Exit::Suspended
+    }
+
+    fn take_suspend_reason(&mut self) -> Suspend {
+        std::mem::take(&mut self.suspend_reason)
+    }
+
+    /// Takes the async instruction loop out for one step. The first call
+    /// allocates it; later calls reuse it.
+    fn take_loop_runner(&mut self) -> execute::LoopRunner {
+        self.loop_runner
+            .take()
+            .unwrap_or_else(execute::LoopRunner::new)
+    }
+
+    fn put_loop_runner(&mut self, runner: execute::LoopRunner) {
+        debug_assert!(self.loop_runner.is_none());
+        std::mem::forget(self.loop_runner.replace(runner));
     }
 
     /// Runs `f` on the metrics of this statement including its active and
@@ -2282,13 +2324,26 @@ impl Program {
         waker: Option<&Waker>,
     ) -> ProgramStep {
         state.execution_state = ProgramExecutionState::Running;
-        let enable_tracing = tracing::enabled!(tracing::Level::TRACE);
-        let vdbe_trace = self.connection.get_vdbe_trace();
-        let result = if enable_tracing || vdbe_trace {
-            dispatch_loop_traced(self, state, pager, waker, enable_tracing, vdbe_trace)
-        } else {
-            dispatch_loop::<false>(self, state, pager, waker, false, false)
+        let mut runner = state.take_loop_runner();
+        let result = loop {
+            if state.io_completions.is_some() {
+                if let Some(result) = self.finish_pending_io(state, pager, waker) {
+                    break result;
+                }
+            }
+            match runner.resume(&mut execute::VdbeCtx::new(self, state, pager, waker)) {
+                Poll::Ready(result) => break result,
+                Poll::Pending => match state.take_suspend_reason() {
+                    Suspend::Row => break ProgramStep::Row,
+                    Suspend::IO => break ProgramStep::IO,
+                    Suspend::Yield => break ProgramStep::Yield,
+                    Suspend::Busy => break ProgramStep::Busy,
+                    Suspend::Retry => continue,
+                    Suspend::None => unreachable!("the instruction loop paused without a reason"),
+                },
+            }
         };
+        state.put_loop_runner(runner);
         match &result {
             ProgramStep::Row => {}
             ProgramStep::Done => {
@@ -2302,7 +2357,25 @@ impl Program {
             }
             _ => {}
         }
-        return result;
+        result
+    }
+
+    /// Runs instructions until the statement finishes, must pause, or
+    /// reaches an instruction that continues as an async operation.
+    #[inline(never)]
+    fn dispatch(
+        &self,
+        state: &mut ProgramState,
+        pager: &Arc<Pager>,
+        waker: Option<&Waker>,
+    ) -> Exit {
+        let enable_tracing = tracing::enabled!(tracing::Level::TRACE);
+        let vdbe_trace = self.connection.get_vdbe_trace();
+        return if enable_tracing || vdbe_trace {
+            dispatch_loop_traced(self, state, pager, waker, enable_tracing, vdbe_trace)
+        } else {
+            dispatch_loop::<false>(self, state, pager, waker, false, false)
+        };
 
         #[inline(never)]
         fn dispatch_loop_traced(
@@ -2312,7 +2385,7 @@ impl Program {
             waker: Option<&Waker>,
             enable_tracing: bool,
             vdbe_trace: bool,
-        ) -> ProgramStep {
+        ) -> Exit {
             dispatch_loop::<true>(program, state, pager, waker, enable_tracing, vdbe_trace)
         }
 
@@ -2324,7 +2397,7 @@ impl Program {
             waker: Option<&Waker>,
             enable_tracing: bool,
             vdbe_trace: bool,
-        ) -> ProgramStep {
+        ) -> Exit {
             // Reborrow the instruction list once: reloading it through `program`
             // every iteration defeats LLVM's hoisting because the opcode call
             // below is opaque to it.
@@ -2339,12 +2412,12 @@ impl Program {
             'io_check: loop {
                 if state.io_completions.is_some() {
                     if let Some(result) = program.finish_pending_io(state, pager, waker) {
-                        return result;
+                        return result.into_exit(state);
                     }
                 }
                 if state.pending_fail_prepare_error.is_some() {
                     match program.prepare_pending_fail(state, pager, waker) {
-                        Some(result) => return result,
+                        Some(result) => return result.into_exit(state),
                         None => continue 'io_check,
                     }
                 }
@@ -2352,7 +2425,7 @@ impl Program {
                     state.check_countdown = state.check_countdown.wrapping_sub(1);
                     if state.check_countdown == 0 {
                         if let Some(result) = program.periodic_checks(state, pager) {
-                            return result;
+                            return result.into_exit(state);
                         }
                     }
 
@@ -2381,7 +2454,7 @@ impl Program {
                                 Ok(InsnFunctionStepResult::Row) => {
                                     state.metrics.insn_executed =
                                         state.metrics.insn_executed.wrapping_add(1);
-                                    return ProgramStep::Row;
+                                    return state.suspend(Suspend::Row);
                                 }
                                 other => other,
                             }
@@ -2418,10 +2491,10 @@ impl Program {
                     if let Ok(InsnFunctionStepResult::Row) = result {
                         // Instruction completed (ResultRow already incremented PC)
                         state.metrics.insn_executed = state.metrics.insn_executed.wrapping_add(1);
-                        return ProgramStep::Row;
+                        return state.suspend(Suspend::Row);
                     }
-                    match dispatch_cold(program, state, pager, waker, result) {
-                        Some(result) => return result,
+                    match dispatch_cold(program, state, pager, waker, insn, result) {
+                        Some(exit) => return exit,
                         None => continue 'io_check,
                     }
                 }
@@ -2433,20 +2506,28 @@ impl Program {
                 state: &mut ProgramState,
                 pager: &Arc<Pager>,
                 waker: Option<&Waker>,
+                insn: &Insn,
                 result: execute::InsnResult,
-            ) -> Option<ProgramStep> {
+            ) -> Option<Exit> {
                 match result {
                     Ok(InsnFunctionStepResult::Done) => {
                         // Instruction completed execution
                         state.metrics.insn_executed = state.metrics.insn_executed.wrapping_add(1);
                         state.auto_txn_cleanup = TxnCleanup::None;
-                        Some(ProgramStep::Done)
+                        Some(Exit::Finished(ProgramStep::Done))
                     }
                     Ok(InsnFunctionStepResult::IO) => {
                         let io = state.take_suspended_io();
-                        program.park_on_io(state, io, waker)
+                        program
+                            .park_on_io(state, io, waker)
+                            .map(|step| step.into_exit(state))
                     }
-                    Err(boxed_err) => program.fail_step(state, pager, *boxed_err),
+                    Ok(InsnFunctionStepResult::Async) => {
+                        Some(Exit::Async(execute::AsyncOp::of(insn)))
+                    }
+                    Err(boxed_err) => program
+                        .fail_step(state, pager, *boxed_err)
+                        .map(|step| step.into_exit(state)),
                     Ok(InsnFunctionStepResult::Step) | Ok(InsnFunctionStepResult::Row) => {
                         unreachable!("the dispatch loop settles steps and rows itself")
                     }

@@ -1575,7 +1575,8 @@ impl Statement {
                             break;
                         }
                         Ok(vdbe::execute::InsnFunctionStepResult::Row)
-                        | Ok(vdbe::execute::InsnFunctionStepResult::Step) => {
+                        | Ok(vdbe::execute::InsnFunctionStepResult::Step)
+                        | Ok(vdbe::execute::InsnFunctionStepResult::Async) => {
                             capture_reset_error(
                                 &mut reset_error,
                                 LimboError::InternalError(

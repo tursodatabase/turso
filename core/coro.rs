@@ -1,12 +1,11 @@
-//! Runs an `async fn` as a step function that returns [`IOResult`].
+//! Runs an `async fn` as a step function.
 //!
 //! The async function does not run on an executor. The caller calls
 //! [`Resumable::resume`] and passes the context for that one step. The async
-//! function reads the context through [`Co::with`] and asks for I/O with
-//! [`Co::io`] or [`Co::yield_io`]. A yield parks its completion in the
-//! context and returns `Pending`, and `resume` hands the completion to its
-//! caller as `IOResult::IO`. The next `resume` call continues the function
-//! after the yield.
+//! function reads the context through [`Co::with`], asks for I/O with
+//! [`Co::io`], and pauses with [`Co::pause`]. A pause makes `resume` return
+//! `Pending`, and the caller reads from its own context why the function
+//! paused. The next `resume` call continues the function after the pause.
 //!
 //! The future outlives every step, so it cannot borrow the context. The
 //! runner stores a pointer to the context in a slot that it shares with the
@@ -33,13 +32,12 @@ pub trait StepContext {
     type Ctx<'a>: YieldSlot;
 }
 
-/// Where a step parks the completion of a yield until `resume` picks it up.
+/// Where a step parks the completion of an I/O yield.
 pub trait YieldSlot {
     fn park_io(&mut self, io: IOCompletions);
-    fn take_io(&mut self) -> Option<IOCompletions>;
 }
 
-/// The handle an async function uses to reach its context and to yield.
+/// The handle an async function uses to reach its context and to pause.
 pub struct Co<C> {
     /// Points to the context of the running step, null between steps.
     ctx: Arc<AtomicPtr<()>>,
@@ -67,8 +65,8 @@ impl<C: StepContext> Co<C> {
         f(unsafe { &mut *ctx })
     }
 
-    /// Calls `f` until it returns `Done`. Each `IO` result is yielded to the
-    /// caller of `resume`, and `f` runs again after the I/O completes.
+    /// Calls `f` until it returns `Done`. Each `IO` result is parked in the
+    /// context and pauses the function, and `f` runs again after the resume.
     #[inline(always)]
     pub fn io<T, E, F>(&mut self, f: F) -> Io<'_, C, F>
     where
@@ -77,14 +75,10 @@ impl<C: StepContext> Co<C> {
         Io { co: self, f }
     }
 
-    /// Hands `io` to the caller of `resume` and pauses until the next resume.
-    #[cfg_attr(not(test), allow(dead_code))]
+    /// Pauses the function until the next `resume`.
     #[inline(always)]
-    pub fn yield_io(&mut self, io: IOCompletions) -> YieldIo<'_, C> {
-        YieldIo {
-            co: self,
-            io: Some(io),
-        }
+    pub fn pause(&mut self) -> Pause {
+        Pause { paused: false }
     }
 }
 
@@ -119,42 +113,37 @@ where
     }
 }
 
-/// Future returned by [`Co::yield_io`]: pending once, then ready.
-pub struct YieldIo<'co, C> {
-    co: &'co mut Co<C>,
-    io: Option<IOCompletions>,
+/// Future returned by [`Co::pause`]: pending once, then ready.
+pub struct Pause {
+    paused: bool,
 }
 
-impl<C> Unpin for YieldIo<'_, C> {}
-
-impl<C: StepContext> Future for YieldIo<'_, C> {
+impl Future for Pause {
     type Output = ();
 
     #[inline(always)]
     fn poll(mut self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<()> {
-        let YieldIo { co, io } = &mut *self;
-        match io.take() {
-            Some(io) => {
-                co.with(|ctx| ctx.park_io(io));
-                Poll::Pending
-            }
-            None => Poll::Ready(()),
+        if self.paused {
+            Poll::Ready(())
+        } else {
+            self.paused = true;
+            Poll::Pending
         }
     }
 }
 
 /// A boxed [`Runner`] behind the [`Resumable`] trait.
-pub type BoxedResumable<C, Args, Out, E> = Box<dyn Resumable<C, Args, Out, E> + Send + Sync>;
+pub type BoxedResumable<C, Args, Out> = Box<dyn Resumable<C, Args, Out> + Send + Sync>;
 
 /// A step function built from an async function.
-pub trait Resumable<C: StepContext, Args, Out, E> {
-    /// True between the first `resume` and the one that returns `Done` or an
-    /// error.
+pub trait Resumable<C: StepContext, Args, Out> {
+    /// True between the first `resume` and the one that returns `Ready`.
+    #[cfg_attr(not(test), allow(dead_code))]
     fn is_active(&self) -> bool;
 
     /// Starts a new operation with `args` if none is active, then runs it
-    /// until it yields for I/O or finishes. `args` is ignored on a resume.
-    fn resume(&mut self, ctx: &mut C::Ctx<'_>, args: Args) -> Result<IOResult<Out>, E>;
+    /// until it pauses or finishes. `args` is ignored on a resume.
+    fn resume(&mut self, ctx: &mut C::Ctx<'_>, args: Args) -> Poll<Out>;
 
     /// Drops the future of an active operation.
     fn cancel(&mut self);
@@ -177,10 +166,10 @@ pub struct Runner<C, F, M> {
 impl<C, F, M> Runner<C, F, M> {
     /// Boxes a new runner behind the `Resumable` trait. `make` builds the
     /// future of one operation, usually through [`with_handle`].
-    pub fn boxed<Args, Out, E>(make: M) -> BoxedResumable<C, Args, Out, E>
+    pub fn boxed<Args, Out>(make: M) -> BoxedResumable<C, Args, Out>
     where
         C: StepContext,
-        F: Future<Output = (Co<C>, Result<Out, E>)>,
+        F: Future<Output = (Co<C>, Out)>,
         M: Fn(Co<C>, Args) -> F,
         Self: Send + Sync + 'static,
     {
@@ -194,10 +183,10 @@ impl<C, F, M> Runner<C, F, M> {
     }
 }
 
-impl<C, Args, Out, E, F, M> Resumable<C, Args, Out, E> for Runner<C, F, M>
+impl<C, Args, Out, F, M> Resumable<C, Args, Out> for Runner<C, F, M>
 where
     C: StepContext,
-    F: Future<Output = (Co<C>, Result<Out, E>)>,
+    F: Future<Output = (Co<C>, Out)>,
     M: Fn(Co<C>, Args) -> F,
 {
     #[inline(always)]
@@ -205,7 +194,7 @@ where
         self.active
     }
 
-    fn resume(&mut self, ctx: &mut C::Ctx<'_>, args: Args) -> Result<IOResult<Out>, E> {
+    fn resume(&mut self, ctx: &mut C::Ctx<'_>, args: Args) -> Poll<Out> {
         if !self.active {
             let co = self.co.take().unwrap_or_else(|| Co {
                 ctx: Arc::clone(&self.ctx),
@@ -224,17 +213,12 @@ where
         let polled = future.poll(&mut Context::from_waker(Waker::noop()));
         self.ctx.store(ptr::null_mut(), Ordering::Relaxed);
         match polled {
-            Poll::Ready((co, result)) => {
+            Poll::Ready((co, out)) => {
                 self.co = Some(co);
                 self.active = false;
-                result.map(IOResult::Done)
+                Poll::Ready(out)
             }
-            Poll::Pending => {
-                let io = ctx
-                    .take_io()
-                    .expect("future returned Pending without an I/O yield");
-                Ok(IOResult::IO(io))
-            }
+            Poll::Pending => Poll::Pending,
         }
     }
 
@@ -248,16 +232,12 @@ where
 /// Runs `body` with the handle borrowed, then gives the handle back to the
 /// runner. A borrowed handle cannot leave `body`, and the runner reuses it
 /// for the next operation.
-pub async fn with_handle<C, Args, Out, E, B>(
-    mut co: Co<C>,
-    args: Args,
-    body: B,
-) -> (Co<C>, Result<Out, E>)
+pub async fn with_handle<C, Args, Out, B>(mut co: Co<C>, args: Args, body: B) -> (Co<C>, Out)
 where
-    B: AsyncFnOnce(&mut Co<C>, Args) -> Result<Out, E>,
+    B: AsyncFnOnce(&mut Co<C>, Args) -> Out,
 {
-    let result = body(&mut co, args).await;
-    (co, result)
+    let out = body(&mut co, args).await;
+    (co, out)
 }
 
 #[cfg(test)]
@@ -288,49 +268,46 @@ mod tests {
             assert!(self.io.is_none(), "a step parks at most one completion");
             self.io = Some(io);
         }
-
-        fn take_io(&mut self) -> Option<IOCompletions> {
-            self.io.take()
-        }
     }
 
     fn completion() -> IOCompletions {
         IOCompletions(Completion::new(CompletionType::Yield))
     }
 
+    fn yields(polled: Poll<Result<usize, ()>>, counter: &mut Counter) -> bool {
+        polled.is_pending() && counter.io.take().is_some()
+    }
+
     async fn count_to(co: &mut Co<Counting>, target: usize) -> Result<usize, ()> {
         let mut yields = 0;
         while co.with(|counter| counter.steps) < target {
-            co.with(|counter| counter.steps += 1);
-            co.yield_io(completion()).await;
+            co.with(|counter| {
+                counter.steps += 1;
+                counter.park_io(completion());
+            });
+            co.pause().await;
             yields += 1;
         }
         Ok(yields)
     }
 
-    async fn fail_after_one_yield(co: &mut Co<Counting>, _: usize) -> Result<usize, ()> {
-        co.yield_io(completion()).await;
+    async fn fail_after_one_pause(co: &mut Co<Counting>, _: usize) -> Result<usize, ()> {
+        co.pause().await;
         co.with(|counter| counter.steps += 1);
         Err(())
     }
 
     #[test]
-    fn yields_once_per_step_until_done() {
+    fn pauses_once_per_step_until_done() {
         let mut runner = Runner::boxed(|co, args| with_handle(co, args, count_to));
         let mut counter = Counter::new(0);
         assert!(!runner.is_active());
         for expected in 1..=3 {
-            assert!(matches!(
-                runner.resume(&mut counter, 3),
-                Ok(IOResult::IO(_))
-            ));
+            assert!(yields(runner.resume(&mut counter, 3), &mut counter));
             assert!(runner.is_active());
             assert_eq!(counter.steps, expected);
         }
-        assert!(matches!(
-            runner.resume(&mut counter, 3),
-            Ok(IOResult::Done(3))
-        ));
+        assert!(matches!(runner.resume(&mut counter, 3), Poll::Ready(Ok(3))));
         assert!(!runner.is_active());
     }
 
@@ -338,50 +315,37 @@ mod tests {
     fn runner_is_reused_for_the_next_operation() {
         let mut runner = Runner::boxed(|co, args| with_handle(co, args, count_to));
         let mut counter = Counter::new(0);
-        assert!(matches!(
-            runner.resume(&mut counter, 0),
-            Ok(IOResult::Done(0))
-        ));
-        assert!(matches!(
-            runner.resume(&mut counter, 1),
-            Ok(IOResult::IO(_))
-        ));
+        assert!(matches!(runner.resume(&mut counter, 0), Poll::Ready(Ok(0))));
+        assert!(yields(runner.resume(&mut counter, 1), &mut counter));
         let mut other = Counter::new(5);
-        assert!(matches!(
-            runner.resume(&mut other, 99),
-            Ok(IOResult::Done(1))
-        ));
+        assert!(matches!(runner.resume(&mut other, 99), Poll::Ready(Ok(1))));
         assert_eq!(counter.steps, 1);
         assert_eq!(other.steps, 5);
     }
 
     #[test]
-    fn error_ends_the_operation() {
-        let mut runner = Runner::boxed(|co, args| with_handle(co, args, fail_after_one_yield));
+    fn a_pause_without_io_is_pending_once() {
+        let mut runner = Runner::boxed(|co, args| with_handle(co, args, fail_after_one_pause));
         let mut counter = Counter::new(0);
+        assert!(runner.resume(&mut counter, 0).is_pending());
+        assert!(counter.io.is_none());
+        assert!(runner.is_active());
         assert!(matches!(
             runner.resume(&mut counter, 0),
-            Ok(IOResult::IO(_))
+            Poll::Ready(Err(()))
         ));
-        assert!(matches!(runner.resume(&mut counter, 0), Err(())));
         assert!(!runner.is_active());
         assert_eq!(counter.steps, 1);
     }
 
     #[test]
-    fn cancel_drops_a_suspended_operation() {
+    fn cancel_drops_a_paused_operation() {
         let mut runner = Runner::boxed(|co, args| with_handle(co, args, count_to));
         let mut counter = Counter::new(0);
-        assert!(matches!(
-            runner.resume(&mut counter, 2),
-            Ok(IOResult::IO(_))
-        ));
+        assert!(yields(runner.resume(&mut counter, 2), &mut counter));
         runner.cancel();
         assert!(!runner.is_active());
-        assert!(matches!(
-            runner.resume(&mut counter, 0),
-            Ok(IOResult::Done(0))
-        ));
+        assert!(matches!(runner.resume(&mut counter, 0), Poll::Ready(Ok(0))));
     }
 
     struct Borrowing;
@@ -400,20 +364,23 @@ mod tests {
         fn park_io(&mut self, io: IOCompletions) {
             *self.io = Some(io);
         }
+    }
 
-        fn take_io(&mut self) -> Option<IOCompletions> {
-            self.io.take()
+    fn step_of(
+        steps: &mut usize,
+    ) -> impl for<'a> FnMut(&mut Borrowed<'a>) -> Result<IOResult<usize>, ()> + '_ {
+        move |ctx| {
+            if *ctx.steps < *steps {
+                *ctx.steps += 1;
+                Ok(IOResult::IO(completion()))
+            } else {
+                Ok(IOResult::Done(*ctx.steps))
+            }
         }
     }
 
-    async fn count_borrowed(co: &mut Co<Borrowing>, target: usize) -> Result<usize, ()> {
-        let mut yields = 0;
-        while co.with(|ctx| *ctx.steps) < target {
-            co.with(|ctx| *ctx.steps += 1);
-            co.yield_io(completion()).await;
-            yields += 1;
-        }
-        Ok(yields)
+    async fn count_borrowed(co: &mut Co<Borrowing>, mut target: usize) -> Result<usize, ()> {
+        co.io(step_of(&mut target)).await
     }
 
     #[test]
@@ -422,28 +389,28 @@ mod tests {
         let mut first = 0;
         let mut second = 1;
         let mut io = None;
-        assert!(matches!(
-            runner.resume(
+        assert!(runner
+            .resume(
                 &mut Borrowed {
                     steps: &mut first,
                     io: &mut io
                 },
                 2
-            ),
-            Ok(IOResult::IO(_))
-        ));
+            )
+            .is_pending());
         assert_eq!(first, 1);
-        assert!(matches!(
-            runner.resume(
+        assert!(io.take().is_some());
+        assert!(runner
+            .resume(
                 &mut Borrowed {
                     steps: &mut second,
                     io: &mut io
                 },
                 2
-            ),
-            Ok(IOResult::IO(_))
-        ));
+            )
+            .is_pending());
         assert_eq!(second, 2);
+        assert!(io.take().is_some());
         assert!(matches!(
             runner.resume(
                 &mut Borrowed {
@@ -452,7 +419,7 @@ mod tests {
                 },
                 2
             ),
-            Ok(IOResult::Done(2))
+            Poll::Ready(Ok(2))
         ));
         assert!(io.is_none());
     }
