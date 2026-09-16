@@ -12,6 +12,7 @@ use std::rc::Rc;
 
 use crate::alloc::vec;
 use crate::alloc::*;
+use crate::coro::{with_handle, BoxedResumable, Co, Runner, StepContext, YieldSlot};
 use crate::io::TempFile;
 use crate::types::{cmp_in_column, cmp_with_sort, IOCompletions, ValueIterator};
 use crate::{
@@ -22,7 +23,7 @@ use crate::{
     types::{IOResult, ImmutableRecord, KeyInfo, RecordBuf, ValueRef},
     Result,
 };
-use crate::{io_yield_one, return_if_io, CompletionError};
+use crate::{return_if_io, CompletionError};
 
 /// A custom comparison function for sorting custom type columns.
 /// Takes two value references and returns an Ordering.
@@ -132,24 +133,51 @@ fn normalized_prefix(class: u64, bytes: &[u8]) -> u64 {
     (class << NORM_CLASS_SHIFT) | (p56 << 5) | (bytes.len().min(8) as u64)
 }
 
-#[derive(Debug, Clone, Copy)]
-enum SortState {
-    Start,
-    Flush,
-    InitHeap,
-    Next,
+/// Names [`SorterCtx`] as the context type of the async sorter operations.
+struct SorterStep;
+
+impl StepContext for SorterStep {
+    type Error = Box<LimboError>;
+    type Ctx<'a> = SorterCtx<'a>;
 }
 
-#[derive(Debug, Clone, Copy)]
-enum InsertState {
-    Start,
-    Insert,
+/// The context of one step of an async sorter operation. The async
+/// function gets it back on every step, so it never keeps a reference
+/// across a yield.
+struct SorterCtx<'a> {
+    sorter: &'a mut Sorter,
+    /// The record that `insert` gets on every step. `None` for `sort`.
+    record: Option<&'a ImmutableRecord>,
+    io: Option<IOCompletions>,
+    err: Option<Box<LimboError>>,
 }
 
-#[derive(Debug, Clone, Copy)]
-enum InitChunkHeapState {
-    Start,
-    PushChunk,
+impl YieldSlot<Box<LimboError>> for SorterCtx<'_> {
+    fn park_io(&mut self, io: IOCompletions) {
+        self.io = Some(io);
+    }
+
+    fn take_io(&mut self) -> Option<IOCompletions> {
+        self.io.take()
+    }
+
+    fn park_err(&mut self, err: Box<LimboError>) {
+        self.err = Some(err);
+    }
+
+    fn take_err(&mut self) -> Option<Box<LimboError>> {
+        self.err.take()
+    }
+}
+
+type SorterOp = BoxedResumable<SorterStep, (), ()>;
+
+/// The runners of the sorter operations. Each one is boxed on first use
+/// and reused for the next operation.
+#[derive(Default)]
+struct SorterOps {
+    sort: Option<SorterOp>,
+    insert: Option<SorterOp>,
 }
 
 pub struct Sorter {
@@ -188,12 +216,8 @@ pub struct Sorter {
     temp_file: Option<TempFile>,
     /// Offset where the next chunk will be placed in the `temp_file`
     next_chunk_offset: usize,
-    /// State machine for [Sorter::sort]
-    sort_state: SortState,
-    /// State machine for [Sorter::insert]
-    insert_state: InsertState,
-    /// State machine for [Sorter::init_chunk_heap]
-    init_chunk_heap_state: InitChunkHeapState,
+    /// The async operations of the sorter.
+    ops: SorterOps,
     /// Pending IO completion along with the chunk index that needs to be retried after IO completes.
     pending_completion: Option<(Completion, usize)>,
     /// Temp storage mode (memory vs file) for spilled data
@@ -239,9 +263,7 @@ impl Sorter {
             io,
             temp_file: None,
             next_chunk_offset: 0,
-            sort_state: SortState::Start,
-            insert_state: InsertState::Start,
-            init_chunk_heap_state: InitChunkHeapState::Start,
+            ops: SorterOps::default(),
             pending_completion: None,
             temp_store,
         };
@@ -258,55 +280,44 @@ impl Sorter {
 
     // We do the sorting here since this is what is called by the SorterSort instruction
     pub fn sort(&mut self) -> IOResultOr<()> {
-        loop {
-            match self.sort_state {
-                SortState::Start => {
-                    if self.chunks.is_empty() {
-                        // Sort ascending then reverse - we pop from end so this gives ascending output.
-                        // NOTE: We can't just sort descending because stable sort preserves insertion
-                        // order for equal elements, and descending sort doesn't reverse equal elements.
-                        // SAFETY: All pointers in records are valid (arena hasn't been reset).
-                        self.records
-                            .sort_by(|a, b| unsafe { a.as_ref().cmp(b.as_ref()) });
-                        self.records.reverse();
-                        self.sort_state = SortState::Next;
-                    } else {
-                        self.sort_state = SortState::Flush;
-                    }
-                }
-                SortState::Flush => {
-                    self.sort_state = SortState::InitHeap;
-                    if let Some(c) = self.flush()? {
-                        io_yield_one!(c);
-                    }
-                }
-                SortState::InitHeap => {
-                    // Check for write errors before proceeding
-                    if self.chunks.iter().any(|chunk| {
-                        matches!(*chunk.io_state.read(), SortedChunkIOState::WriteError)
-                    }) {
-                        return Err(CompletionError::IOError(
-                            std::io::ErrorKind::WriteZero,
-                            "sorter write",
-                        )
-                        .into());
-                    }
-                    turso_assert!(
-                        !self.chunks.iter().any(|chunk| {
-                            matches!(*chunk.io_state.read(), SortedChunkIOState::WaitingForWrite)
-                        }),
-                        "chunks should been written"
-                    );
-                    return_if_io!(self.init_chunk_heap());
-                    self.sort_state = SortState::Next;
-                }
-                SortState::Next => {
-                    return_if_io!(self.next());
-                    self.sort_state = SortState::Start;
-                    return Ok(IOResult::Done(()));
-                }
-            }
+        let mut op = self
+            .ops
+            .sort
+            .take()
+            .unwrap_or_else(|| Runner::boxed(|co, args| with_handle(co, args, run_sort)));
+        let mut ctx = SorterCtx {
+            sorter: self,
+            record: None,
+            io: None,
+            err: None,
+        };
+        let result = op.resume(&mut ctx, ());
+        self.ops.sort = Some(op);
+        result
+    }
+
+    /// Sorts the in-memory records so that `next` pops them in ascending
+    /// order. Sort ascending then reverse: a stable sort keeps the insertion
+    /// order of equal elements, and a descending sort does not reverse them.
+    fn sort_in_memory(&mut self) {
+        // SAFETY: All pointers in records are valid (arena hasn't been reset).
+        self.records
+            .sort_by(|a, b| unsafe { a.as_ref().cmp(b.as_ref()) });
+        self.records.reverse();
+    }
+
+    /// Fails when the write of a chunk failed.
+    fn write_error(&self) -> Result<()> {
+        if self
+            .chunks
+            .iter()
+            .any(|chunk| matches!(*chunk.io_state.read(), SortedChunkIOState::WriteError))
+        {
+            return Err(
+                CompletionError::IOError(std::io::ErrorKind::WriteZero, "sorter write").into(),
+            );
         }
+        Ok(())
     }
 
     #[allow(clippy::should_implement_trait)]
@@ -373,91 +384,79 @@ impl Sorter {
         current
     }
 
+    /// Inserts a record. A record that fits in the buffer is pushed at
+    /// once. Otherwise the buffer is flushed to a chunk file first, and the
+    /// flush can yield for I/O.
     pub fn insert(&mut self, record: &ImmutableRecord) -> IOResultOr<()> {
         let payload_size = record.get_payload().len();
-        loop {
-            match self.insert_state {
-                InsertState::Start => {
-                    self.insert_state = InsertState::Insert;
-                    if self.current_buffer_size + payload_size > self.max_buffer_size {
-                        if let Some(c) = self.flush()? {
-                            if !c.succeeded() {
-                                io_yield_one!(c);
-                            }
-                        }
-                        // Check for write errors immediately after flush completes
-                        if self.chunks.iter().any(|chunk| {
-                            matches!(*chunk.io_state.read(), SortedChunkIOState::WriteError)
-                        }) {
-                            return Err(CompletionError::IOError(
-                                std::io::ErrorKind::WriteZero,
-                                "sorter write",
-                            )
-                            .into());
-                        }
-                    }
-                }
-                InsertState::Insert => {
-                    let sortable_record = ArenaSortableRecord::new(
-                        &self.arena,
-                        record,
-                        self.key_len,
-                        &self.index_key_info,
-                        &self.comparators,
-                    )?;
-                    let record_ref = self.arena.try_alloc(sortable_record)?;
-                    // SAFETY: try_alloc returns a valid, aligned, non-null pointer.
-                    self.records.try_push(NonNull::from(record_ref))?;
-                    self.current_buffer_size += payload_size;
-                    self.max_payload_size_in_buffer =
-                        self.max_payload_size_in_buffer.max(payload_size);
-                    self.insert_state = InsertState::Start;
-                    return Ok(IOResult::Done(()));
-                }
-            }
+        let insert_active = self.ops.insert.as_ref().is_some_and(|op| op.is_active());
+        if !insert_active && self.current_buffer_size + payload_size <= self.max_buffer_size {
+            self.push_record(record, payload_size)?;
+            return Ok(IOResult::Done(()));
         }
+        let mut op = self
+            .ops
+            .insert
+            .take()
+            .unwrap_or_else(|| Runner::boxed(|co, args| with_handle(co, args, run_insert)));
+        let mut ctx = SorterCtx {
+            sorter: self,
+            record: Some(record),
+            io: None,
+            err: None,
+        };
+        let result = op.resume(&mut ctx, ());
+        self.ops.insert = Some(op);
+        result
     }
 
-    fn init_chunk_heap(&mut self) -> IOResultOr<()> {
-        match self.init_chunk_heap_state {
-            InitChunkHeapState::Start => {
-                let mut group = CompletionGroup::new(|_| {});
-                for chunk in self.chunks.iter_mut() {
-                    if let Err(e) = chunk.read(Some(&mut group)) {
-                        tracing::error!("Failed to read chunk: {e}");
-                        group.cancel();
-                        self.io.drain_completions(group.completions())?;
-                        return Err(e.into());
-                    }
-                }
-                self.init_chunk_heap_state = InitChunkHeapState::PushChunk;
-                let completion = group.build();
-                io_yield_one!(completion);
-            }
-            InitChunkHeapState::PushChunk => {
-                // Make sure all chunks read at least one record into their buffer.
-                turso_assert!(
-                    !self.chunks.iter().any(|chunk| matches!(
-                        *chunk.io_state.read(),
-                        SortedChunkIOState::WaitingForRead
-                    )),
-                    "chunks should have been read"
-                );
-                self.chunk_heap.try_reserve(self.chunks.len())?;
-                // TODO: blocking will be unnecessary here with IO completions
-                let mut group = CompletionGroup::new(|_| {});
-                for chunk_idx in 0..self.chunks.len() {
-                    self.push_to_chunk_heap(chunk_idx, Some(&mut group))?;
-                }
-                self.init_chunk_heap_state = InitChunkHeapState::Start;
-                let completion = group.build();
-                if completion.finished() {
-                    Ok(IOResult::Done(()))
-                } else {
-                    io_yield_one!(completion);
-                }
+    fn push_record(&mut self, record: &ImmutableRecord, payload_size: usize) -> Result<()> {
+        let sortable_record = ArenaSortableRecord::new(
+            &self.arena,
+            record,
+            self.key_len,
+            &self.index_key_info,
+            &self.comparators,
+        )?;
+        let record_ref = self.arena.try_alloc(sortable_record)?;
+        // SAFETY: try_alloc returns a valid, aligned, non-null pointer.
+        self.records.try_push(NonNull::from(record_ref))?;
+        self.current_buffer_size += payload_size;
+        self.max_payload_size_in_buffer = self.max_payload_size_in_buffer.max(payload_size);
+        Ok(())
+    }
+
+    /// Starts a read of every chunk and returns the completion of the group.
+    fn read_all_chunks(&mut self) -> Result<Completion> {
+        let mut group = CompletionGroup::new(|_| {});
+        for chunk in self.chunks.iter_mut() {
+            if let Err(e) = chunk.read(Some(&mut group)) {
+                tracing::error!("Failed to read chunk: {e}");
+                group.cancel();
+                self.io.drain_completions(group.completions())?;
+                return Err(e);
             }
         }
+        Ok(group.build())
+    }
+
+    /// Pushes the first record of every chunk onto the heap. A chunk that
+    /// needs another read adds it to the group whose completion is returned.
+    fn push_all_chunks_to_heap(&mut self) -> Result<Completion> {
+        // Make sure all chunks read at least one record into their buffer.
+        turso_assert!(
+            !self
+                .chunks
+                .iter()
+                .any(|chunk| matches!(*chunk.io_state.read(), SortedChunkIOState::WaitingForRead)),
+            "chunks should have been read"
+        );
+        self.chunk_heap.try_reserve(self.chunks.len())?;
+        let mut group = CompletionGroup::new(|_| {});
+        for chunk_idx in 0..self.chunks.len() {
+            self.push_to_chunk_heap(chunk_idx, Some(&mut group))?;
+        }
+        Ok(group.build())
     }
 
     /// Returns the next record from the chunk heap in sorted order.
@@ -575,10 +574,92 @@ impl Sorter {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
-enum NextState {
-    Start,
-    Finish,
+/// Sorts the records: in memory when nothing was flushed, else through a
+/// merge of the chunk files. Ends with the first record loaded.
+async fn run_sort(co: &mut Co<SorterStep>, _: ()) -> Result<(), Box<LimboError>> {
+    if co.with(|ctx| ctx.sorter.chunks.is_empty()) {
+        co.with(|ctx| ctx.sorter.sort_in_memory());
+    } else {
+        if let Some(c) = co.with(|ctx| ctx.sorter.flush())? {
+            co.yield_io(IOCompletions(c)).await;
+        }
+        co.with(|ctx| {
+            ctx.sorter.write_error()?;
+            turso_assert!(
+                !ctx.sorter.chunks.iter().any(|chunk| {
+                    matches!(*chunk.io_state.read(), SortedChunkIOState::WaitingForWrite)
+                }),
+                "chunks should been written"
+            );
+            Ok::<(), Box<LimboError>>(())
+        })?;
+        run_init_chunk_heap(co).await?;
+    }
+    co.io(|ctx| ctx.sorter.next()).await;
+    Ok(())
+}
+
+/// Reads the start of every chunk file and pushes its first record onto
+/// the heap.
+async fn run_init_chunk_heap(co: &mut Co<SorterStep>) -> Result<(), Box<LimboError>> {
+    let completion = co.with(|ctx| ctx.sorter.read_all_chunks())?;
+    co.yield_io(IOCompletions(completion)).await;
+    let completion = co.with(|ctx| ctx.sorter.push_all_chunks_to_heap())?;
+    if !completion.finished() {
+        co.yield_io(IOCompletions(completion)).await;
+    }
+    Ok(())
+}
+
+/// Flushes the buffer to a chunk file, then pushes the record of the step
+/// that runs after the flush.
+async fn run_insert(co: &mut Co<SorterStep>, _: ()) -> Result<(), Box<LimboError>> {
+    if let Some(c) = co.with(|ctx| ctx.sorter.flush())? {
+        if !c.succeeded() {
+            co.yield_io(IOCompletions(c)).await;
+        }
+    }
+    co.with(|ctx| {
+        ctx.sorter.write_error()?;
+        let record = ctx.record.expect("insert runs with a record");
+        ctx.sorter.push_record(record, record.get_payload().len())
+    })?;
+    Ok(())
+}
+
+/// Names [`ChunkCtx`] as the context type of the async chunk operations.
+struct ChunkStep;
+
+impl StepContext for ChunkStep {
+    type Error = Box<LimboError>;
+    type Ctx<'a> = ChunkCtx<'a>;
+}
+
+/// The context of one step of [`SortedChunk::next`].
+struct ChunkCtx<'a> {
+    chunk: &'a mut SortedChunk,
+    /// The group that a read of this step joins, when the caller gave one.
+    group: Option<&'a mut CompletionGroup>,
+    io: Option<IOCompletions>,
+    err: Option<Box<LimboError>>,
+}
+
+impl YieldSlot<Box<LimboError>> for ChunkCtx<'_> {
+    fn park_io(&mut self, io: IOCompletions) {
+        self.io = Some(io);
+    }
+
+    fn take_io(&mut self) -> Option<IOCompletions> {
+        self.io.take()
+    }
+
+    fn park_err(&mut self, err: Box<LimboError>) {
+        self.err = Some(err);
+    }
+
+    fn take_err(&mut self) -> Option<Box<LimboError>> {
+        self.err.take()
+    }
 }
 
 /// A sorted chunk represents a portion of sorted data that has been written to disk
@@ -634,8 +715,8 @@ struct SortedChunk {
     io_state: Arc<RwLock<SortedChunkIOState>>,
     /// Cumulative bytes read from disk. When this equals `chunk_size`, we've read everything.
     total_bytes_read: Arc<atomic::AtomicUsize>,
-    /// State machine for the `next()` method.
-    next_state: NextState,
+    /// The runner of `next`, boxed on first use and reused.
+    next_op: Option<BoxedResumable<ChunkStep, (), Option<ImmutableRecord>>>,
 }
 
 enum ChunkNextResult {
@@ -654,7 +735,7 @@ impl SortedChunk {
             records: vec![],
             io_state: Arc::new(RwLock::new(SortedChunkIOState::None)),
             total_bytes_read: Arc::new(atomic::AtomicUsize::new(0)),
-            next_state: NextState::Start,
+            next_op: None,
         })
     }
 
@@ -670,85 +751,86 @@ impl SortedChunk {
     ///
     /// May return `ChunkNextResult::IO` if async IO is needed, in which case
     /// the caller should wait for the completion and call `next()` again.
-    ///
-    /// Internally manages a two-phase state machine:
-    /// - `Start`: Parse records from buffer, issue prefetch read if needed
-    /// - `Finish`: Return the next parsed record
-    fn next(&mut self, mut group: Option<&mut CompletionGroup>) -> Result<ChunkNextResult> {
-        loop {
-            match self.next_state {
-                NextState::Start => {
-                    let mut buffer_len = self.buffer_len();
-                    if self.records.is_empty() && buffer_len == 0 {
-                        return Ok(ChunkNextResult::Done(None));
-                    }
-
-                    if self.records.is_empty() {
-                        let mut buffer_ref = self.buffer.write();
-                        let buffer = buffer_ref.as_mut_slice();
-                        let mut buffer_offset = 0;
-                        while buffer_offset < buffer_len {
-                            // Extract records from the buffer until we run out of the buffer or we hit an incomplete record.
-                            let (record_size, bytes_read) =
-                                match read_varint(&buffer[buffer_offset..buffer_len]) {
-                                    Ok((record_size, bytes_read)) => {
-                                        (record_size as usize, bytes_read)
-                                    }
-                                    Err(LimboError::Corrupt(_))
-                                        if *self.io_state.read() != SortedChunkIOState::ReadEOF =>
-                                    {
-                                        // Failed to decode a partial varint.
-                                        break;
-                                    }
-                                    Err(e) => {
-                                        return Err(e);
-                                    }
-                                };
-                            if record_size > buffer_len - (buffer_offset + bytes_read) {
-                                if *self.io_state.read() == SortedChunkIOState::ReadEOF {
-                                    crate::bail_corrupt_error!("Incomplete record");
-                                }
-                                break;
-                            }
-                            buffer_offset += bytes_read;
-
-                            let mut record = ImmutableRecord::new(record_size)?;
-                            record.start_serialization(
-                                &buffer[buffer_offset..buffer_offset + record_size],
-                            )?;
-                            buffer_offset += record_size;
-
-                            self.records.try_push(record)?;
-                        }
-                        if buffer_offset < buffer_len {
-                            buffer.copy_within(buffer_offset..buffer_len, 0);
-                            buffer_len -= buffer_offset;
-                        } else {
-                            buffer_len = 0;
-                        }
-                        self.set_buffer_len(buffer_len);
-
-                        self.records.reverse();
-                    }
-
-                    self.next_state = NextState::Finish;
-                    // Prefetch: if down to last record, try to read more data into the buffer.
-                    if self.records.len() == 1
-                        && *self.io_state.read() != SortedChunkIOState::ReadEOF
-                    {
-                        if let Some(c) = self.read(group.as_deref_mut())? {
-                            if !c.succeeded() {
-                                return Ok(ChunkNextResult::IO(c));
-                            }
-                        }
-                    }
-                }
-                NextState::Finish => {
-                    self.next_state = NextState::Start;
-                    return Ok(ChunkNextResult::Done(self.records.pop()));
-                }
-            }
+    fn next(&mut self, group: Option<&mut CompletionGroup>) -> Result<ChunkNextResult> {
+        let mut op = self
+            .next_op
+            .take()
+            .unwrap_or_else(|| Runner::boxed(|co, args| with_handle(co, args, run_chunk_next)));
+        let mut ctx = ChunkCtx {
+            chunk: self,
+            group,
+            io: None,
+            err: None,
+        };
+        let result = op.resume(&mut ctx, ());
+        self.next_op = Some(op);
+        match result? {
+            IOResult::Done(record) => Ok(ChunkNextResult::Done(record)),
+            IOResult::IO(IOCompletions(c)) => Ok(ChunkNextResult::IO(c)),
         }
+    }
+
+    /// Parses the records of the buffer when none are parsed yet. Returns
+    /// false when the chunk has no record left.
+    fn parse_records(&mut self) -> Result<bool> {
+        let mut buffer_len = self.buffer_len();
+        if self.records.is_empty() && buffer_len == 0 {
+            return Ok(false);
+        }
+        if !self.records.is_empty() {
+            return Ok(true);
+        }
+
+        let mut buffer_ref = self.buffer.write();
+        let buffer = buffer_ref.as_mut_slice();
+        let mut buffer_offset = 0;
+        while buffer_offset < buffer_len {
+            // Extract records from the buffer until we run out of the buffer or we hit an incomplete record.
+            let (record_size, bytes_read) = match read_varint(&buffer[buffer_offset..buffer_len]) {
+                Ok((record_size, bytes_read)) => (record_size as usize, bytes_read),
+                Err(LimboError::Corrupt(_))
+                    if *self.io_state.read() != SortedChunkIOState::ReadEOF =>
+                {
+                    // Failed to decode a partial varint.
+                    break;
+                }
+                Err(e) => {
+                    return Err(e);
+                }
+            };
+            if record_size > buffer_len - (buffer_offset + bytes_read) {
+                if *self.io_state.read() == SortedChunkIOState::ReadEOF {
+                    crate::bail_corrupt_error!("Incomplete record");
+                }
+                break;
+            }
+            buffer_offset += bytes_read;
+
+            let mut record = ImmutableRecord::new(record_size)?;
+            record.start_serialization(&buffer[buffer_offset..buffer_offset + record_size])?;
+            buffer_offset += record_size;
+
+            self.records.try_push(record)?;
+        }
+        if buffer_offset < buffer_len {
+            buffer.copy_within(buffer_offset..buffer_len, 0);
+            buffer_len -= buffer_offset;
+        } else {
+            buffer_len = 0;
+        }
+        self.set_buffer_len(buffer_len);
+
+        self.records.reverse();
+        Ok(true)
+    }
+
+    /// Reads more data into the buffer when only the last parsed record is
+    /// left. Returns the completion of that read.
+    fn prefetch(&mut self, group: Option<&mut CompletionGroup>) -> Result<Option<Completion>> {
+        if self.records.len() == 1 && *self.io_state.read() != SortedChunkIOState::ReadEOF {
+            return self.read(group);
+        }
+        Ok(None)
     }
 
     /// Issues an async read to fill the buffer with more data from the chunk file.
@@ -1121,6 +1203,23 @@ impl PartialEq for BoxedSortableRecord {
 }
 
 impl Eq for BoxedSortableRecord {}
+
+/// Parses the buffer, starts a read for the next records when only one is
+/// left, and pops the next record.
+async fn run_chunk_next(
+    co: &mut Co<ChunkStep>,
+    _: (),
+) -> Result<Option<ImmutableRecord>, Box<LimboError>> {
+    if !co.with(|ctx| ctx.chunk.parse_records())? {
+        return Ok(None);
+    }
+    if let Some(c) = co.with(|ctx| ctx.chunk.prefetch(ctx.group.as_deref_mut()))? {
+        if !c.succeeded() {
+            co.yield_io(IOCompletions(c)).await;
+        }
+    }
+    Ok(co.with(|ctx| ctx.chunk.records.pop()))
+}
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 enum SortedChunkIOState {
