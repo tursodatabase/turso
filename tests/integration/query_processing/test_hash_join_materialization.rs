@@ -336,6 +336,7 @@ fn hash_join_unmatched_rows_apply_payload_backed_predicates() {
     }
     conn.execute("COMMIT").unwrap();
     sqlite_conn.execute("COMMIT", []).unwrap();
+    limbo_exec_rows(&conn, "ANALYZE");
 
     for predicate in [
         "t3.d IS t4.d",

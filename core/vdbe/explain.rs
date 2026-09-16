@@ -2558,7 +2558,7 @@ pub fn insn_to_row(
             0,
             String::new(),
         ),
-        Insn::HashProbe{hash_table_id: hash_table_reg, key_start_reg, num_keys, dest_reg, target_pc, payload_dest_reg, num_payload, probe_rowid_reg: _} => {
+        Insn::HashProbe{hash_table_id: hash_table_reg, key_start_reg, num_keys, dest_reg, target_pc, deferred_target_pc: _, payload_dest_reg, num_payload, probe_rowid_reg: _} => {
             let payload_info = if let Some(p_reg) = payload_dest_reg {
                 format!(" payload=r[{}]..r[{}]", p_reg, p_reg + num_payload - 1)
             } else {

@@ -760,6 +760,7 @@ impl<'a, 'plan> HashProbeSetupEmitter<'a, 'plan> {
             num_keys: to_u32(num_keys),
             dest_reg: to_u32(match_reg),
             target_pc: hash_probe_miss_label,
+            deferred_target_pc: self.next,
             payload_dest_reg: payload_dest_reg.map(to_u32),
             num_payload: to_u32(num_payload),
             // Main probe loop always carries the probe rowid so spilled build
@@ -1306,6 +1307,7 @@ impl GraceHashLoop {
             num_keys: to_u32(hash_ctx.num_keys),
             dest_reg: to_u32(match_reg),
             target_pc: grace_outer_check,
+            deferred_target_pc: grace_probe_top,
             payload_dest_reg: payload_dest_reg.map(to_u32),
             num_payload: to_u32(num_payload),
             probe_rowid_reg: None, // grace-only: HashGraceLoadPartition already loaded this partition

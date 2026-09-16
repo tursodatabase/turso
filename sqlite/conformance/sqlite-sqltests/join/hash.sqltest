@@ -275,6 +275,41 @@ expect {
     900|600|600
 }
 
+@cross-check-integrity
+test grace-full-outer-does-not-emit-deferred-probe-rows {
+    PRAGMA temp_store=FILE;
+    CREATE TABLE t1(a INTEGER, payload TEXT);
+    CREATE TABLE t2(b INTEGER, payload TEXT);
+    INSERT INTO t1
+        SELECT value, printf('%080d', value) FROM generate_series(1, 1500);
+    INSERT INTO t2
+        SELECT value, 'right-' || value FROM generate_series(1, 1500);
+    SELECT count(*), count(t1.a), count(t2.b),
+           sum(t1.a IS NULL), sum(t2.b IS NULL)
+    FROM t1 FULL OUTER JOIN t2 ON t1.a = t2.b;
+}
+expect {
+    1500|1500|1500|0|0
+}
+
+@cross-check-integrity
+test grace-full-outer-materialized-prefix-does-not-emit-deferred-probe-rows {
+    PRAGMA temp_store=FILE;
+    CREATE TABLE a(id INTEGER PRIMARY KEY, k INTEGER, k2 INTEGER);
+    CREATE TABLE b(id INTEGER PRIMARY KEY, k INTEGER, k2 INTEGER);
+    CREATE TABLE c(id INTEGER PRIMARY KEY, k INTEGER, k2 INTEGER);
+    INSERT INTO a SELECT value, value % 10, value % 7 FROM generate_series(1, 60);
+    INSERT INTO b SELECT value, value % 10, value % 7 FROM generate_series(1, 70);
+    INSERT INTO c SELECT value, value % 10, value % 7 FROM generate_series(1, 80);
+    SELECT count(*), count(a.id), count(b.id), count(c.id),
+           sum(a.id IS NULL), sum(b.id IS NULL), sum(c.id IS NULL)
+    FROM a JOIN b ON a.k = b.k
+    FULL JOIN c ON b.k2 = c.k2;
+}
+expect {
+    4800|4800|4800|4800|0|0|0
+}
+
 # =============================================================================
 # 8. Aggregation correctness over grace hash joins
 # =============================================================================

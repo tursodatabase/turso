@@ -17890,6 +17890,7 @@ pub fn op_hash_probe(
             num_keys,
             dest_reg,
             target_pc,
+            deferred_target_pc,
             payload_dest_reg,
             num_payload,
             probe_rowid_reg,
@@ -17950,7 +17951,7 @@ pub fn op_hash_probe(
         // Main probe loop: buffer probe rows targeting spilled build partitions.
         if let Some(rowid_reg) = probe_rowid_reg {
             if probe_buffered {
-                state.pc = target_pc.as_offset_int();
+                state.pc = deferred_target_pc.as_offset_int();
                 state.active_op_state.clear();
                 return Ok(InsnFunctionStepResult::Step);
             }
@@ -17976,8 +17977,7 @@ pub fn op_hash_probe(
                         return Ok(state.suspend_on_io(io));
                     }
                 }
-                // Jump to target_pc: this row is deferred to grace processing.
-                state.pc = target_pc.as_offset_int();
+                state.pc = deferred_target_pc.as_offset_int();
                 state.active_op_state.clear();
                 return Ok(InsnFunctionStepResult::Step);
             }
@@ -19958,6 +19958,7 @@ mod tests {
             num_keys: 1,
             dest_reg: 1,
             target_pc: BranchOffset::Offset(99),
+            deferred_target_pc: BranchOffset::Offset(98),
             payload_dest_reg: None,
             num_payload: 0,
             probe_rowid_reg: None,
@@ -20012,6 +20013,7 @@ mod tests {
             num_keys: 1,
             dest_reg: 1,
             target_pc: BranchOffset::Offset(99),
+            deferred_target_pc: BranchOffset::Offset(98),
             payload_dest_reg: None,
             num_payload: 0,
             probe_rowid_reg: None,
