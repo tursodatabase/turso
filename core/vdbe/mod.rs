@@ -82,10 +82,7 @@ use crate::{
 };
 use branches::{mark_unlikely, unlikely};
 use builder::{CursorKey, QueryMode};
-use execute::{
-    InsnFunction, InsnFunctionStepResult, OpIdxDeleteState, OpIntegrityCheckState,
-    OpOpenEphemeralState,
-};
+use execute::{InsnFunction, InsnFunctionStepResult, OpIntegrityCheckState, OpOpenEphemeralState};
 use turso_parser::ast::{EqpFormat, ResolveType};
 
 use crate::io::TempFile;
@@ -606,7 +603,6 @@ pub struct OpHashProbeState {
 enum ActiveOpState {
     None,
     Delete(OpDeleteState),
-    IdxDelete(OpIdxDeleteState),
     IntegrityCheck(OpIntegrityCheckState),
     OpenEphemeral(OpOpenEphemeralState),
     Program(OpProgramState),
@@ -631,7 +627,6 @@ impl std::fmt::Debug for ActiveOpState {
         let name = match self {
             ActiveOpState::None => "None",
             ActiveOpState::Delete(_) => "Delete",
-            ActiveOpState::IdxDelete(_) => "IdxDelete",
             ActiveOpState::IntegrityCheck(_) => "IntegrityCheck",
             ActiveOpState::OpenEphemeral(_) => "OpenEphemeral",
             ActiveOpState::Program(_) => "Program",
@@ -756,12 +751,6 @@ impl ActiveOpStateSlot {
             sub_state: OpDeleteSubState::MaybeCaptureRecord,
             deleted_record: None,
         }
-    );
-    active_state_accessor!(
-        idx_delete,
-        IdxDelete,
-        OpIdxDeleteState,
-        OpIdxDeleteState::Seeking
     );
     active_state_accessor!(
         integrity_check,

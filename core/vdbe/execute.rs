@@ -2055,6 +2055,7 @@ async_ops! {
     RowIdDeferred => row_id_deferred: row_id_deferred,
     Destroy => destroy: destroy,
     ClearBtree => clear_btree: clear_btree,
+    IdxDelete => idx_delete: idx_delete,
 }
 
 /// Runs one step of the async opcode `op`: starts it when none is suspended
@@ -6927,6 +6928,34 @@ pub fn seek_internal(
         state.seek_state = OpSeekState::Start;
     }
     result
+}
+
+/// Runs one step of a seek for an async opcode: `true` when the cursor is on
+/// a matching record.
+#[allow(clippy::too_many_arguments)]
+#[inline(always)]
+fn seek_step(
+    program: &Program,
+    state: &mut ProgramState,
+    pager: &Arc<Pager>,
+    record_source: RecordSource,
+    cursor_id: usize,
+    is_index: bool,
+    op: SeekOp,
+) -> IOResultOr<bool> {
+    match seek_internal(
+        program,
+        state,
+        pager,
+        record_source,
+        cursor_id,
+        is_index,
+        op,
+    )? {
+        SeekInternalResult::Found => Ok(IOResult::Done(true)),
+        SeekInternalResult::NotFound => Ok(IOResult::Done(false)),
+        SeekInternalResult::IO(io) => Ok(IOResult::IO(io)),
+    }
 }
 
 /// Returns the tie-breaker ordering for SQLite index comparison opcodes.
@@ -12897,12 +12926,6 @@ pub fn op_delete(
     Ok(InsnFunctionStepResult::Step)
 }
 
-#[derive(Debug)]
-pub enum OpIdxDeleteState {
-    Seeking,
-    Verifying,
-    Deleting,
-}
 pub fn op_idx_delete(
     program: &Program,
     state: &mut ProgramState,
@@ -12914,7 +12937,7 @@ pub fn op_idx_delete(
             cursor_id,
             start_reg,
             num_regs,
-            raise_error_if_no_matching_entry,
+            ..
         },
         insn
     );
@@ -12929,90 +12952,101 @@ pub fn op_idx_delete(
         return Ok(InsnFunctionStepResult::Step);
     }
 
-    loop {
-        #[cfg(debug_assertions)]
-        tracing::debug!(
-            "op_idx_delete(cursor_id={}, start_reg={}, num_regs={}, rootpage={}, state={:?})",
-            cursor_id,
-            start_reg,
-            num_regs,
-            state.get_cursor(*cursor_id).as_btree_mut().root_page(),
-            state.active_op_state.idx_delete()
+    step_async_op(program, state, insn, pager, AsyncOp::IdxDelete)
+}
+
+/// Deletes the index entry that matches the key in the registers: seeks to
+/// it, reads its rowid, deletes the cell.
+async fn idx_delete(co: &mut Co<VdbeStep>) -> Result<(), Box<LimboError>> {
+    let (cursor_id, start_reg, num_regs, raise_error_if_no_matching_entry) = co.with(|ctx| {
+        load_insn!(
+            IdxDelete {
+                cursor_id,
+                start_reg,
+                num_regs,
+                raise_error_if_no_matching_entry,
+            },
+            ctx.insn
         );
-        match state.active_op_state.idx_delete() {
-            OpIdxDeleteState::Seeking => {
-                let found = match seek_internal(
-                    program,
-                    state,
-                    pager,
-                    RecordSource::Unpacked {
-                        start_reg: *start_reg,
-                        num_regs: *num_regs,
-                    },
-                    *cursor_id,
-                    true,
-                    SeekOp::GE { eq_only: true },
-                ) {
-                    Ok(SeekInternalResult::Found) => true,
-                    Ok(SeekInternalResult::NotFound) => false,
-                    Ok(SeekInternalResult::IO(io)) => return Ok(state.suspend_on_io(io)),
-                    Err(e) => return Err(e.into()),
-                };
+        (
+            *cursor_id,
+            *start_reg,
+            *num_regs,
+            *raise_error_if_no_matching_entry,
+        )
+    });
+    let record_source = RecordSource::Unpacked {
+        start_reg,
+        num_regs,
+    };
 
-                if !found {
-                    // If we didn't find it because a txn we depended on was aborted, then it means it isn't really corrupt, we simply
-                    // might have found some garbage data because other tx trashed all row versions we depended on (basically it sets begin: None, end: None).
-                    if program.connection.mvcc_tx_should_abort() {
-                        return Err(LimboError::CommitDependencyAborted.into());
-                    }
-                    // If P5 is not zero, then raise an SQLITE_CORRUPT_INDEX error if no matching index entry is found
-                    // Also, do not raise this (self-correcting and non-critical) error if in writable_schema mode.
-
-                    if *raise_error_if_no_matching_entry {
-                        let reg_values = (*start_reg..*start_reg + *num_regs)
-                            .map(|i| &state.registers[i])
-                            .collect::<Vec<_>>();
-                        return Err(LimboError::Corrupt(format!(
-                            "IdxDelete: no matching index entry found for key {reg_values:?} while seeking"
-                        )).into());
-                    }
-                    state.pc += 1;
-                    state.active_op_state.clear();
-                    return Ok(InsnFunctionStepResult::Step);
-                }
-                *state.active_op_state.idx_delete() = OpIdxDeleteState::Verifying;
+    let found = co
+        .io(|ctx| {
+            seek_step(
+                ctx.program,
+                ctx.state,
+                ctx.pager,
+                record_source,
+                cursor_id,
+                true,
+                SeekOp::GE { eq_only: true },
+            )
+        })
+        .await;
+    if !found {
+        return co.with(|ctx| {
+            // If we didn't find it because a txn we depended on was aborted, then it means it isn't really corrupt, we simply
+            // might have found some garbage data because other tx trashed all row versions we depended on (basically it sets begin: None, end: None).
+            if ctx.program.connection.mvcc_tx_should_abort() {
+                return Err(LimboError::CommitDependencyAborted.into());
             }
-            OpIdxDeleteState::Verifying => {
-                let rowid = {
-                    let cursor = state.get_cursor(*cursor_id);
-                    let cursor = cursor.as_btree_mut();
-                    return_if_io!(state, cursor.rowid())
-                };
-
-                if rowid.is_none() && *raise_error_if_no_matching_entry {
-                    let reg_values = (*start_reg..*start_reg + *num_regs)
-                        .map(|i| &state.registers[i])
-                        .collect::<Vec<_>>();
-                    return Err(LimboError::Corrupt(format!(
-                        "IdxDelete: no matching index entry found for key while verifying: {reg_values:?}"
-                    )).into());
-                }
-                *state.active_op_state.idx_delete() = OpIdxDeleteState::Deleting;
+            // If P5 is not zero, then raise an SQLITE_CORRUPT_INDEX error if no matching index entry is found
+            // Also, do not raise this (self-correcting and non-critical) error if in writable_schema mode.
+            if raise_error_if_no_matching_entry {
+                return Err(corrupt_missing_index_entry(
+                    ctx.state, start_reg, num_regs, "seeking",
+                ));
             }
-            OpIdxDeleteState::Deleting => {
-                {
-                    let cursor = state.get_cursor(*cursor_id);
-                    let cursor = cursor.as_btree_mut();
-                    return_if_io!(state, cursor.delete());
-                }
-                // Increment metrics for index write (delete is a write operation)
-                state.record_rows_written(1);
-                state.pc += 1;
-                state.active_op_state.clear();
-                return Ok(InsnFunctionStepResult::Step);
-            }
-        }
+            ctx.state.pc += 1;
+            Ok(())
+        });
     }
+
+    let rowid = co
+        .io(|ctx| ctx.state.get_cursor(cursor_id).as_btree_mut().rowid())
+        .await;
+    if rowid.is_none() && raise_error_if_no_matching_entry {
+        return Err(
+            co.with(|ctx| corrupt_missing_index_entry(ctx.state, start_reg, num_regs, "verifying"))
+        );
+    }
+
+    co.io(|ctx| ctx.state.get_cursor(cursor_id).as_btree_mut().delete())
+        .await;
+    co.with(|ctx| {
+        // Increment metrics for index write (delete is a write operation)
+        ctx.state.record_rows_written(1);
+        ctx.state.pc += 1;
+    });
+    Ok(())
+}
+
+/// The error an IdxDelete raises when the index has no entry for the key in
+/// the registers.
+#[inline(never)]
+fn corrupt_missing_index_entry(
+    state: &ProgramState,
+    start_reg: usize,
+    num_regs: usize,
+    while_doing: &str,
+) -> Box<LimboError> {
+    let reg_values = (start_reg..start_reg + num_regs)
+        .map(|i| &state.registers[i])
+        .collect::<Vec<_>>();
+    LimboError::Corrupt(format!(
+        "IdxDelete: no matching index entry found for key {reg_values:?} while {while_doing}"
+    ))
+    .into()
 }
 
 #[derive(Debug, PartialEq, Copy, Clone)]
