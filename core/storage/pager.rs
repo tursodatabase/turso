@@ -1346,16 +1346,6 @@ const fn auto_vacuum_header_fields(mode: AutoVacuumMode) -> (u32, u32) {
     }
 }
 
-#[derive(Debug, Clone)]
-#[cfg(feature = "autovacuum")]
-enum PtrMapPutState {
-    Start,
-    Deserialize {
-        ptrmap_page: PageRef,
-        offset_in_ptrmap_page: usize,
-    },
-}
-
 #[cfg(feature = "autovacuum")]
 #[derive(Debug, Clone, Copy)]
 enum BtreeCreateVacuumFullState {
@@ -1678,8 +1668,6 @@ impl SpillYieldHook {
 
 #[cfg(feature = "autovacuum")]
 pub struct VacuumState {
-    /// State machine for [Pager::ptrmap_put]
-    ptrmap_put_state: PtrMapPutState,
     btree_create_vacuum_full_state: BtreeCreateVacuumFullState,
 }
 
@@ -1900,6 +1888,8 @@ struct PagerOps {
     read_header_page: AsyncOp<PagerStep, (), PageRef>,
     #[cfg(feature = "autovacuum")]
     ptrmap_get: AsyncOp<PagerStep, u32, Option<PtrmapEntry>>,
+    #[cfg(feature = "autovacuum")]
+    ptrmap_put: AsyncOp<PagerStep, (u32, PtrmapType, u32), ()>,
 }
 
 impl PagerOps {
@@ -1911,6 +1901,10 @@ impl PagerOps {
             #[cfg(feature = "autovacuum")]
             ptrmap_get: AsyncOp::new(|| {
                 Runner::boxed(|co, args| with_handle(co, args, Pager::ptrmap_get_async))
+            }),
+            #[cfg(feature = "autovacuum")]
+            ptrmap_put: AsyncOp::new(|| {
+                Runner::boxed(|co, args| with_handle(co, args, Pager::ptrmap_put_async))
             }),
         }
     }
@@ -1987,7 +1981,6 @@ impl Pager {
             ops: PagerOps::new(),
             #[cfg(feature = "autovacuum")]
             vacuum_state: RwLock::new(VacuumState {
-                ptrmap_put_state: PtrMapPutState::Start,
                 btree_create_vacuum_full_state: BtreeCreateVacuumFullState::Start,
             }),
             io_ctx: RwLock::new(IOContext::default()),
@@ -2832,88 +2825,97 @@ impl Pager {
             entry_type,
             parent_page_no
         );
-        loop {
-            let ptrmap_put_state = {
-                let vacuum_state = self.vacuum_state.read();
-                vacuum_state.ptrmap_put_state.clone()
-            };
-            match ptrmap_put_state {
-                PtrMapPutState::Start => {
-                    let page_size =
-                        return_if_io!(self.with_header(|header| header.page_size)).get() as usize;
+        self.step_op(
+            &self.ops.ptrmap_put,
+            (db_page_no_to_update, entry_type, parent_page_no),
+        )
+    }
 
-                    if db_page_no_to_update < FIRST_PTRMAP_PAGE_NO
-                        || is_ptrmap_page(db_page_no_to_update, page_size)
-                    {
-                        turso_soft_unreachable!("Cannot set ptrmap entry for header/ptrmap page or invalid page", { "page": db_page_no_to_update });
-                        return Err(LimboError::InternalError(format!(
-                        "Cannot set ptrmap entry for page {db_page_no_to_update}: it's a header/ptrmap page or invalid."
-                    )).into());
-                    }
+    /// Reads the pointer map page of `db_page_no_to_update`, marks it dirty
+    /// and writes the entry into it.
+    #[cfg(feature = "autovacuum")]
+    async fn ptrmap_put_async(
+        co: &mut Co<PagerStep>,
+        (db_page_no_to_update, entry_type, parent_page_no): (u32, PtrmapType, u32),
+    ) -> Result<(), Box<LimboError>> {
+        let page_size = co
+            .io(|ctx| ctx.pager.with_header(|header| header.page_size))
+            .await
+            .get() as usize;
 
-                    let ptrmap_pg_no =
-                        get_ptrmap_page_no_for_db_page(db_page_no_to_update, page_size);
-                    let offset_in_ptrmap_page =
-                        get_ptrmap_offset_in_page(db_page_no_to_update, ptrmap_pg_no, page_size)?;
-                    tracing::trace!(
-                        "ptrmap_put(page_idx = {}, entry_type = {:?}, parent_page_no = {}) = ptrmap_pg_no = {}, offset_in_ptrmap_page = {}",
-                        db_page_no_to_update,
-                        entry_type,
-                        parent_page_no,
-                        ptrmap_pg_no,
-                        offset_in_ptrmap_page
-                    );
-
-                    // `return_if_io!` keeps `ptrmap_put_state` at `Start` on
-                    // spill so re-entry resumes via pending-read tracking.
-                    let (ptrmap_page, c) = return_if_io!(self.read_page(ptrmap_pg_no as i64));
-                    self.vacuum_state.write().ptrmap_put_state = PtrMapPutState::Deserialize {
-                        ptrmap_page,
-                        offset_in_ptrmap_page,
-                    };
-                    if let Some(c) = c {
-                        io_yield_one!(c);
-                    }
-                }
-                PtrMapPutState::Deserialize {
-                    ptrmap_page,
-                    offset_in_ptrmap_page,
-                } => {
-                    turso_assert!(ptrmap_page.is_loaded(), "page should be loaded");
-                    self.add_dirty(&ptrmap_page)?;
-                    let page_content = ptrmap_page.get_contents();
-                    let ptrmap_pg_no = page_content.id();
-
-                    let full_buffer_slice = page_content.as_ptr();
-
-                    if offset_in_ptrmap_page + PTRMAP_ENTRY_SIZE > full_buffer_slice.len() {
-                        return Err(LimboError::InternalError(format!(
-                        "Ptrmap offset {} + entry size {} out of bounds for page {} (actual data len {})",
-                        offset_in_ptrmap_page,
-                        PTRMAP_ENTRY_SIZE,
-                        ptrmap_pg_no,
-                        full_buffer_slice.len()
-                    )).into());
-                    }
-
-                    let entry = PtrmapEntry {
-                        entry_type,
-                        parent_page_no,
-                    };
-                    entry.serialize(
-                        &mut full_buffer_slice
-                            [offset_in_ptrmap_page..offset_in_ptrmap_page + PTRMAP_ENTRY_SIZE],
-                    )?;
-
-                    turso_assert!(
-                        ptrmap_page.get().id() == ptrmap_pg_no,
-                        "ptrmap page has unexpected number"
-                    );
-                    self.vacuum_state.write().ptrmap_put_state = PtrMapPutState::Start;
-                    break Ok(IOResult::Done(()));
-                }
-            }
+        if db_page_no_to_update < FIRST_PTRMAP_PAGE_NO
+            || is_ptrmap_page(db_page_no_to_update, page_size)
+        {
+            turso_soft_unreachable!("Cannot set ptrmap entry for header/ptrmap page or invalid page", { "page": db_page_no_to_update });
+            return Err(LimboError::InternalError(format!(
+                "Cannot set ptrmap entry for page {db_page_no_to_update}: it's a header/ptrmap page or invalid."
+            )).into());
         }
+
+        let ptrmap_pg_no = get_ptrmap_page_no_for_db_page(db_page_no_to_update, page_size);
+        let offset_in_ptrmap_page =
+            get_ptrmap_offset_in_page(db_page_no_to_update, ptrmap_pg_no, page_size)?;
+        tracing::trace!(
+            "ptrmap_put(page_idx = {}, entry_type = {:?}, parent_page_no = {}) = ptrmap_pg_no = {}, offset_in_ptrmap_page = {}",
+            db_page_no_to_update,
+            entry_type,
+            parent_page_no,
+            ptrmap_pg_no,
+            offset_in_ptrmap_page
+        );
+
+        let (ptrmap_page, c) = co.io(|ctx| ctx.pager.read_page(ptrmap_pg_no as i64)).await;
+        if let Some(c) = c {
+            co.yield_io(IOCompletions(c)).await;
+        }
+        let entry = PtrmapEntry {
+            entry_type,
+            parent_page_no,
+        };
+        co.io(|ctx| {
+            ctx.pager
+                .write_ptrmap_entry(&ptrmap_page, offset_in_ptrmap_page, entry)
+                .map(IOResult::Done)
+        })
+        .await;
+        Ok(())
+    }
+
+    /// Writes `entry` into the loaded pointer map page at the given offset.
+    #[cfg(feature = "autovacuum")]
+    fn write_ptrmap_entry(
+        &self,
+        ptrmap_page: &PageRef,
+        offset_in_ptrmap_page: usize,
+        entry: PtrmapEntry,
+    ) -> Result<()> {
+        turso_assert!(ptrmap_page.is_loaded(), "page should be loaded");
+        self.add_dirty(ptrmap_page)?;
+        let page_content = ptrmap_page.get_contents();
+        let ptrmap_pg_no = page_content.id();
+
+        let full_buffer_slice = page_content.as_ptr();
+
+        if offset_in_ptrmap_page + PTRMAP_ENTRY_SIZE > full_buffer_slice.len() {
+            return Err(LimboError::InternalError(format!(
+                "Ptrmap offset {} + entry size {} out of bounds for page {} (actual data len {})",
+                offset_in_ptrmap_page,
+                PTRMAP_ENTRY_SIZE,
+                ptrmap_pg_no,
+                full_buffer_slice.len()
+            )));
+        }
+
+        entry.serialize(
+            &mut full_buffer_slice
+                [offset_in_ptrmap_page..offset_in_ptrmap_page + PTRMAP_ENTRY_SIZE],
+        )?;
+
+        turso_assert!(
+            ptrmap_page.get().id() == ptrmap_pg_no,
+            "ptrmap page has unexpected number"
+        );
+        Ok(())
     }
 
     /// This method is used to allocate a new root page for a btree, both for tables and indexes
@@ -6126,13 +6128,14 @@ impl Pager {
         #[cfg(feature = "autovacuum")]
         {
             let mut vacuum_state = self.vacuum_state.write();
-            vacuum_state.ptrmap_put_state = PtrMapPutState::Start;
             vacuum_state.btree_create_vacuum_full_state = BtreeCreateVacuumFullState::Start;
         }
 
         self.ops.read_header_page.cancel();
         #[cfg(feature = "autovacuum")]
         self.ops.ptrmap_get.cancel();
+        #[cfg(feature = "autovacuum")]
+        self.ops.ptrmap_put.cancel();
     }
 
     pub fn with_header<T>(&self, f: impl Fn(&DatabaseHeader) -> T) -> IOResultOr<T> {
