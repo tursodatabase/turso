@@ -399,55 +399,18 @@ impl YieldSlot<Box<LimboError>> for AggregateCtx<'_> {
     }
 }
 
+/// The eval of an aggregate operator as a step function. It returns the
+/// output delta and the new state of every group the delta touched.
+pub type AggregateEvalOp = OpRunner<AggregateStep, Delta, (Delta, ComputedStates)>;
+
 /// The commit of an aggregate operator as a step function.
 type AggregateCommitOp = OpRunner<AggregateStep, Delta, Delta>;
 
 /// The runners of the aggregate operations, boxed on first use and reused.
 #[derive(Debug, Default)]
 struct AggregateOps {
+    eval: Option<AggregateEvalOp>,
     commit: Option<AggregateCommitOp>,
-}
-
-// Aggregate-specific eval states
-#[derive(Debug)]
-pub enum AggregateEvalState {
-    FetchKey {
-        delta: Delta, // Keep original delta for merge operation
-        current_idx: usize,
-        groups_to_read: Vec<(String, Vec<Value>)>, // Changed to Vec for index-based access
-        existing_groups: HashMap<String, AggregateState>,
-        old_values: HashMap<String, Vec<Value>>,
-        pre_existing_groups: HashSet<String>, // Track groups that existed before this delta
-    },
-    FetchAggregateState {
-        delta: Delta, // Keep original delta for merge operation
-        current_idx: usize,
-        groups_to_read: Vec<(String, Vec<Value>)>, // Changed to Vec for index-based access
-        existing_groups: HashMap<String, AggregateState>,
-        old_values: HashMap<String, Vec<Value>>,
-        rowid: Option<i64>, // Rowid found by FetchKey (None if not found)
-        read_record_state: Box<ReadRecord>,
-        pre_existing_groups: HashSet<String>, // Track groups that existed before this delta
-    },
-    FetchDistinctValues {
-        delta: Delta, // Keep original delta for merge operation
-        current_idx: usize,
-        groups_to_read: Vec<(String, Vec<Value>)>, // Changed to Vec for index-based access
-        existing_groups: HashMap<String, AggregateState>,
-        old_values: HashMap<String, Vec<Value>>,
-        fetch_distinct_state: Box<FetchDistinctState>,
-        pre_existing_groups: HashSet<String>, // Track groups that existed before this delta
-    },
-    RecomputeMinMax {
-        delta: Delta,
-        existing_groups: HashMap<String, AggregateState>,
-        old_values: HashMap<String, Vec<Value>>,
-        recompute_state: Box<RecomputeMinMax>,
-        pre_existing_groups: HashSet<String>, // Track groups that existed before this delta
-    },
-    Done {
-        output: (Delta, ComputedStates),
-    },
 }
 
 /// Note that the AggregateOperator essentially implements a ZSet, even
@@ -497,251 +460,6 @@ pub struct AggregateState {
     // (column_index, value) -> weight
     // Populated during FetchKey for values mentioned in the delta
     pub(crate) distinct_value_weights: HashMap<(usize, HashableRow), i64>,
-}
-
-impl AggregateEvalState {
-    /// Process a delta through the aggregate state machine.
-    ///
-    /// Control flow is strictly linear for maintainability:
-    /// 1. FetchKey → FetchAggregateState (always)
-    /// 2. FetchAggregateState → FetchKey (always, loops until all groups processed)
-    /// 3. FetchKey (when done) → FetchDistinctValues (always)
-    /// 4. FetchDistinctValues → RecomputeMinMax (always)
-    /// 5. RecomputeMinMax → Done (always)
-    ///
-    /// Some states may be no-ops depending on the operator configuration:
-    /// - FetchAggregateState: For plain DISTINCT, skips reading aggregate blob (no aggregates to fetch)
-    /// - FetchDistinctValues: No-op if no distinct columns exist (distinct_columns is empty)
-    /// - RecomputeMinMax: No-op if no MIN/MAX aggregates exist (has_min_max() returns false)
-    ///
-    /// This deterministic flow ensures each state always transitions to the same next state,
-    /// making the state machine easier to understand and debug.
-    fn process_delta(
-        &mut self,
-        operator: &mut AggregateOperator,
-        cursors: &mut DbspStateCursors,
-    ) -> IOResultOr<(Delta, ComputedStates)> {
-        loop {
-            match self {
-                AggregateEvalState::FetchKey {
-                    delta,
-                    current_idx,
-                    groups_to_read,
-                    existing_groups,
-                    old_values,
-                    pre_existing_groups,
-                } => {
-                    if *current_idx >= groups_to_read.len() {
-                        // All groups have been fetched, move to FetchDistinctValues
-                        // Create FetchDistinctState based on the delta and existing groups
-                        let fetch_distinct_state = FetchDistinctState::new(
-                            delta,
-                            &operator.distinct_columns,
-                            |values| operator.extract_group_key(values),
-                            AggregateOperator::group_key_to_string,
-                            existing_groups,
-                            operator.is_distinct_only,
-                        );
-
-                        *self = AggregateEvalState::FetchDistinctValues {
-                            delta: std::mem::take(delta),
-                            current_idx: 0,
-                            groups_to_read: std::mem::take(groups_to_read),
-                            existing_groups: std::mem::take(existing_groups),
-                            old_values: std::mem::take(old_values),
-                            fetch_distinct_state: Box::new(fetch_distinct_state),
-                            pre_existing_groups: std::mem::take(pre_existing_groups),
-                        };
-                    } else {
-                        // Get the current group to read
-                        let (group_key_str, _group_key) = &groups_to_read[*current_idx];
-
-                        // For plain DISTINCT, we still need to transition to FetchAggregateState
-                        // to add the group to existing_groups, but we won't read any aggregate blob
-
-                        // Build the key for regular aggregate state: (operator_id, zset_hash, element_id=0)
-                        let operator_storage_id =
-                            generate_storage_id(operator.operator_id, 0, AGG_TYPE_REGULAR);
-                        let zset_hash = operator.generate_group_hash(group_key_str);
-                        let element_id = Hash128::new(0, 0); // Always zeros for aggregate state
-
-                        // Create index key values
-                        let index_key_values = vec![
-                            Value::from_i64(operator_storage_id),
-                            zset_hash.to_value()?,
-                            element_id.to_value()?,
-                        ];
-
-                        // Create an immutable record for the index key
-                        let index_record = ImmutableRecord::from_values(
-                            &index_key_values,
-                            index_key_values.len(),
-                        )?;
-
-                        // Seek in the index to find if this row exists
-                        let seek_result = return_if_io!(cursors.index_cursor.seek(
-                            SeekKey::IndexKey(index_record.as_record_ref()),
-                            SeekOp::GE { eq_only: true }
-                        ));
-
-                        let rowid = if matches!(seek_result, SeekResult::Found) {
-                            // Found in index, get the table rowid
-                            // The btree code handles extracting the rowid from the index record for has_rowid indexes
-                            return_if_io!(cursors.index_cursor.rowid())
-                        } else {
-                            // Not found in index, no existing state
-                            None
-                        };
-
-                        // Always transition to FetchAggregateState
-                        let taken_existing = std::mem::take(existing_groups);
-                        let taken_old_values = std::mem::take(old_values);
-                        let next_state = AggregateEvalState::FetchAggregateState {
-                            delta: std::mem::take(delta),
-                            current_idx: *current_idx,
-                            groups_to_read: std::mem::take(groups_to_read),
-                            existing_groups: taken_existing,
-                            old_values: taken_old_values,
-                            rowid,
-                            read_record_state: Box::new(ReadRecord::new()),
-                            pre_existing_groups: std::mem::take(pre_existing_groups), // Pass through existing
-                        };
-                        *self = next_state;
-                    }
-                }
-                AggregateEvalState::FetchAggregateState {
-                    delta,
-                    current_idx,
-                    groups_to_read,
-                    existing_groups,
-                    old_values,
-                    rowid,
-                    read_record_state,
-                    pre_existing_groups,
-                } => {
-                    // Get the current group to read
-                    let (group_key_str, group_key) = &groups_to_read[*current_idx];
-
-                    // For plain DISTINCT, skip aggregate state fetch entirely
-                    // The distinct values are handled separately in FetchDistinctValues
-                    if operator.is_distinct_only {
-                        // Always insert the group key so FetchDistinctState will process it
-                        // The count will be set properly when we fetch distinct values
-                        existing_groups.insert(group_key_str.clone(), AggregateState::default());
-                    } else if let Some(rowid) = rowid {
-                        let key = SeekKey::TableRowId(*rowid);
-                        // Regular aggregates - read the blob
-                        let state = return_if_io!(
-                            read_record_state.read_record(key, &mut cursors.table_cursor)
-                        );
-                        // Process the fetched state
-                        if let Some(state) = state {
-                            let mut old_row = group_key.clone();
-                            old_row.extend(state.to_values(&operator.aggregates));
-                            old_values.insert(group_key_str.clone(), old_row);
-                            existing_groups.insert(group_key_str.clone(), state);
-                            // Track that this group exists in storage
-                            pre_existing_groups.insert(group_key_str.clone());
-                        }
-                    }
-                    // If no rowid, there's no existing state for this group
-
-                    // Always move to next group via FetchKey
-                    let next_idx = *current_idx + 1;
-
-                    let taken_existing = std::mem::take(existing_groups);
-                    let taken_old_values = std::mem::take(old_values);
-                    let taken_pre_existing_groups = std::mem::take(pre_existing_groups);
-                    let next_state = AggregateEvalState::FetchKey {
-                        delta: std::mem::take(delta),
-                        current_idx: next_idx,
-                        groups_to_read: std::mem::take(groups_to_read),
-                        existing_groups: taken_existing,
-                        old_values: taken_old_values,
-                        pre_existing_groups: taken_pre_existing_groups,
-                    };
-                    *self = next_state;
-                }
-                AggregateEvalState::FetchDistinctValues {
-                    delta,
-                    current_idx: _,
-                    groups_to_read: _,
-                    existing_groups,
-                    old_values,
-                    fetch_distinct_state,
-                    pre_existing_groups,
-                } => {
-                    // Use FetchDistinctState to read distinct values from BTree storage
-                    return_if_io!(fetch_distinct_state.fetch_distinct_values(
-                        operator.operator_id,
-                        existing_groups,
-                        cursors,
-                        |group_key| operator.generate_group_hash(group_key),
-                        operator.is_distinct_only
-                    ));
-
-                    // For plain DISTINCT, mark groups as "from storage" if they have distinct values
-                    if operator.is_distinct_only {
-                        for (group_key_str, state) in existing_groups.iter() {
-                            // Check if this group has any distinct values with positive weight
-                            let has_values = state.distinct_value_weights.values().any(|&w| w > 0);
-                            if has_values {
-                                pre_existing_groups.insert(group_key_str.clone());
-                            }
-                        }
-                    }
-
-                    // Extract MIN/MAX deltas for recomputation
-                    let min_max_deltas = operator.extract_min_max_deltas(delta);
-
-                    // Create RecomputeMinMax before moving existing_groups
-                    let recompute_state = Box::new(RecomputeMinMax::new(
-                        min_max_deltas,
-                        existing_groups,
-                        operator,
-                    ));
-
-                    // Transition to RecomputeMinMax
-                    let next_state = AggregateEvalState::RecomputeMinMax {
-                        delta: std::mem::take(delta),
-                        existing_groups: std::mem::take(existing_groups),
-                        old_values: std::mem::take(old_values),
-                        recompute_state,
-                        pre_existing_groups: std::mem::take(pre_existing_groups),
-                    };
-                    *self = next_state;
-                }
-                AggregateEvalState::RecomputeMinMax {
-                    delta,
-                    existing_groups,
-                    old_values,
-                    recompute_state,
-                    pre_existing_groups,
-                } => {
-                    if operator.has_min_max() {
-                        // Process MIN/MAX recomputation - this will update existing_groups with correct MIN/MAX
-                        return_if_io!(recompute_state.process(existing_groups, operator, cursors));
-                    }
-
-                    // Now compute final output with updated MIN/MAX values
-                    let (output_delta, computed_states) = operator.merge_delta_with_existing(
-                        delta,
-                        existing_groups,
-                        old_values,
-                        pre_existing_groups,
-                    )?;
-
-                    *self = AggregateEvalState::Done {
-                        output: (output_delta, computed_states),
-                    };
-                }
-                AggregateEvalState::Done { output } => {
-                    let (delta, computed_states) = output.clone();
-                    return Ok(IOResult::Done((delta, computed_states)));
-                }
-            }
-        }
-    }
 }
 
 impl AggregateState {
@@ -1464,7 +1182,11 @@ impl AggregateOperator {
         !self.distinct_columns.is_empty() || self.is_distinct_only
     }
 
-    fn eval_internal(
+    /// Runs one step of the eval: starts a new eval from an `Init` state and
+    /// resumes a suspended one from an `Aggregate` state. The runner lives
+    /// in the state while the eval waits for I/O, and in the operator
+    /// otherwise.
+    fn step_eval(
         &mut self,
         state: &mut EvalState,
         cursors: &mut DbspStateCursors,
@@ -1479,32 +1201,12 @@ impl AggregateOperator {
                     deltas.right.is_empty(),
                     "AggregateOperator expects right_delta to be empty"
                 );
-
                 if deltas.left.changes.is_empty() {
                     *state = EvalState::Done;
                     return Ok(IOResult::Done((Delta::new(), HashMap::default())));
                 }
-
-                let mut groups_to_read = BTreeMap::new();
-                for (row, _weight) in &deltas.left.changes {
-                    let group_key = self.extract_group_key(&row.values);
-                    let group_key_str = Self::group_key_to_string(&group_key);
-                    groups_to_read.insert(group_key_str, group_key);
-                }
-
-                let delta = std::mem::take(&mut deltas.left);
-                *state = EvalState::Aggregate(Box::new(AggregateEvalState::FetchKey {
-                    delta,
-                    current_idx: 0,
-                    groups_to_read: groups_to_read.into_iter().collect(),
-                    existing_groups: HashMap::default(),
-                    old_values: HashMap::default(),
-                    pre_existing_groups: HashSet::default(), // Initialize empty
-                }));
             }
-            EvalState::Aggregate(_agg_state) => {
-                // Already in progress, continue processing below.
-            }
+            EvalState::Aggregate(_) => {}
             EvalState::Done => {
                 panic!("unreachable state! should have returned");
             }
@@ -1512,15 +1214,40 @@ impl AggregateOperator {
                 panic!("Join state should not appear in aggregate operator");
             }
         }
-
-        // Process the delta through the aggregate state machine
-        match state {
-            EvalState::Aggregate(agg_state) => {
-                let result = return_if_io!(agg_state.process_delta(self, cursors));
-                Ok(IOResult::Done(result))
-            }
-            _ => panic!("Invalid state for aggregate processing"),
+        let (mut op, delta) = match std::mem::replace(state, EvalState::Uninitialized) {
+            EvalState::Init { mut deltas } => (
+                self.ops.eval.take().unwrap_or_else(new_eval_runner),
+                std::mem::take(&mut deltas.left),
+            ),
+            EvalState::Aggregate(op) => (op, Delta::new()),
+            _ => unreachable!("checked above"),
+        };
+        let mut ctx = AggregateCtx {
+            operator: self,
+            cursors,
+            io: None,
+            err: None,
+        };
+        let result = op.resume(&mut ctx, delta);
+        if op.is_active() {
+            *state = EvalState::Aggregate(op);
+        } else {
+            *state = EvalState::Done;
+            self.ops.eval = Some(op);
         }
+        result
+    }
+
+    /// The groups the delta touches, in key order, with the key values of
+    /// each group.
+    fn groups_of(&self, delta: &Delta) -> Vec<(String, Vec<Value>)> {
+        let mut groups_to_read = BTreeMap::new();
+        for (row, _weight) in &delta.changes {
+            let group_key = self.extract_group_key(&row.values);
+            let group_key_str = Self::group_key_to_string(&group_key);
+            groups_to_read.insert(group_key_str, group_key);
+        }
+        groups_to_read.into_iter().collect()
     }
 
     fn merge_delta_with_existing(
@@ -1769,10 +1496,6 @@ impl AggregateOperator {
         Ok((index_key, record_values, weight))
     }
 
-    pub fn set_tracker(&mut self, tracker: Arc<Mutex<ComputationTracker>>) {
-        self.tracker = Some(tracker);
-    }
-
     /// Generate a hash for a group
     /// For no GROUP BY: returns a zero hash
     /// For GROUP BY: returns a 128-bit hash of the group key string
@@ -1819,7 +1542,7 @@ impl AggregateOperator {
 
 impl IncrementalOperator for AggregateOperator {
     fn eval(&mut self, state: &mut EvalState, cursors: &mut DbspStateCursors) -> IOResultOr<Delta> {
-        let (delta, _) = return_if_io!(self.eval_internal(state, cursors));
+        let (delta, _) = return_if_io!(self.step_eval(state, cursors));
         Ok(IOResult::Done(delta))
     }
 
@@ -1871,10 +1594,7 @@ async fn commit_delta(co: &mut Co<AggregateStep>, delta: Delta) -> Result<Delta,
         (min_max_deltas, distinct_deltas)
     });
 
-    let mut eval_state = EvalState::from_delta(delta);
-    let (output_delta, computed_states) = co
-        .io(|ctx| ctx.operator.eval_internal(&mut eval_state, ctx.cursors))
-        .await;
+    let (output_delta, computed_states) = eval_delta(co, delta).await?;
 
     // Plain DISTINCT has no aggregate state: only the distinct values are stored.
     if !co.with(|ctx| ctx.operator.is_distinct_only) {
@@ -1922,6 +1642,137 @@ async fn commit_delta(co: &mut Co<AggregateStep>, delta: Delta) -> Result<Delta,
     }
 
     Ok(output_delta)
+}
+
+fn new_eval_runner() -> AggregateEvalOp {
+    OpRunner::new(Runner::boxed(|co, args| with_handle(co, args, eval_delta)))
+}
+
+/// Evaluates a delta: reads the stored state of every group the delta
+/// touches, then the distinct values and the MIN/MAX values that state
+/// needs, and merges the delta into that state.
+///
+/// The steps always run in this order, and a step is a no-op when the
+/// operator does not need it:
+/// - The aggregate state read is skipped for plain DISTINCT, which has no aggregates.
+/// - The distinct value read does nothing without distinct columns.
+/// - The MIN/MAX recompute does nothing without MIN/MAX aggregates.
+async fn eval_delta(
+    co: &mut Co<AggregateStep>,
+    delta: Delta,
+) -> Result<(Delta, ComputedStates), Box<LimboError>> {
+    if delta.changes.is_empty() {
+        return Ok((Delta::new(), HashMap::default()));
+    }
+    let groups_to_read = co.with(|ctx| ctx.operator.groups_of(&delta));
+    let mut existing_groups: HashMap<String, AggregateState> = HashMap::default();
+    let mut old_values: HashMap<String, Vec<Value>> = HashMap::default();
+    let mut pre_existing_groups: HashSet<String> = HashSet::default();
+
+    for (group_key_str, group_key) in &groups_to_read {
+        let rowid = fetch_group_rowid(co, group_key_str).await?;
+        if co.with(|ctx| ctx.operator.is_distinct_only) {
+            // The group must exist so that the distinct value read fills it in.
+            existing_groups.insert(group_key_str.clone(), AggregateState::default());
+        } else if let Some(rowid) = rowid {
+            let mut read = ReadRecord::new();
+            let state = co
+                .io(|ctx| {
+                    read.read_record(SeekKey::TableRowId(rowid), &mut ctx.cursors.table_cursor)
+                })
+                .await;
+            if let Some(state) = state {
+                let mut old_row = group_key.clone();
+                old_row.extend(co.with(|ctx| state.to_values(&ctx.operator.aggregates)));
+                old_values.insert(group_key_str.clone(), old_row);
+                existing_groups.insert(group_key_str.clone(), state);
+                pre_existing_groups.insert(group_key_str.clone());
+            }
+        }
+    }
+
+    let mut fetch_distinct = co.with(|ctx| {
+        let operator = &ctx.operator;
+        FetchDistinctState::new(
+            &delta,
+            &operator.distinct_columns,
+            |values| operator.extract_group_key(values),
+            AggregateOperator::group_key_to_string,
+            &existing_groups,
+            operator.is_distinct_only,
+        )
+    });
+    co.io(|ctx| {
+        let operator = &ctx.operator;
+        fetch_distinct.fetch_distinct_values(
+            operator.operator_id,
+            &mut existing_groups,
+            ctx.cursors,
+            |group_key| operator.generate_group_hash(group_key),
+            operator.is_distinct_only,
+        )
+    })
+    .await;
+
+    // For plain DISTINCT, a group with a stored distinct value existed before this delta.
+    if co.with(|ctx| ctx.operator.is_distinct_only) {
+        for (group_key_str, state) in existing_groups.iter() {
+            let has_values = state.distinct_value_weights.values().any(|&w| w > 0);
+            if has_values {
+                pre_existing_groups.insert(group_key_str.clone());
+            }
+        }
+    }
+
+    let min_max_deltas = co.with(|ctx| ctx.operator.extract_min_max_deltas(&delta));
+    let mut recompute =
+        co.with(|ctx| RecomputeMinMax::new(min_max_deltas, &existing_groups, ctx.operator));
+    if co.with(|ctx| ctx.operator.has_min_max()) {
+        co.io(|ctx| recompute.process(&mut existing_groups, ctx.operator, ctx.cursors))
+            .await;
+    }
+
+    let (output_delta, computed_states) = co.with(|ctx| {
+        ctx.operator.merge_delta_with_existing(
+            &delta,
+            &mut existing_groups,
+            &mut old_values,
+            &pre_existing_groups,
+        )
+    })?;
+    Ok((output_delta, computed_states))
+}
+
+/// The rowid of the stored state of one group, or None when the group has
+/// no stored state.
+async fn fetch_group_rowid(
+    co: &mut Co<AggregateStep>,
+    group_key_str: &str,
+) -> Result<Option<i64>, Box<LimboError>> {
+    let index_key_values = co.with(|ctx| {
+        let operator = &ctx.operator;
+        let operator_storage_id = generate_storage_id(operator.operator_id, 0, AGG_TYPE_REGULAR);
+        let zset_hash = operator.generate_group_hash(group_key_str);
+        let element_id = Hash128::new(0, 0);
+        Ok::<_, LimboError>(vec![
+            Value::from_i64(operator_storage_id),
+            zset_hash.to_value()?,
+            element_id.to_value()?,
+        ])
+    })?;
+    let index_record = ImmutableRecord::from_values(&index_key_values, index_key_values.len())?;
+    let seek_result = co
+        .io(|ctx| {
+            ctx.cursors.index_cursor.seek(
+                SeekKey::IndexKey(index_record.as_record_ref()),
+                SeekOp::GE { eq_only: true },
+            )
+        })
+        .await;
+    if !matches!(seek_result, SeekResult::Found) {
+        return Ok(None);
+    }
+    Ok(co.io(|ctx| ctx.cursors.index_cursor.rowid()).await)
 }
 
 /// State machine for recomputing MIN/MAX values after deletion

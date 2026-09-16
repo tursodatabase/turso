@@ -3,7 +3,7 @@
 // Based on Feldera DBSP design but adapted for Turso's architecture
 
 pub use crate::incremental::aggregate_operator::{
-    AggregateEvalState, AggregateFunction, AggregateState,
+    AggregateEvalOp, AggregateFunction, AggregateState,
 };
 pub use crate::incremental::filter_operator::{FilterOperator, FilterPredicate};
 pub use crate::incremental::input_operator::InputOperator;
@@ -111,7 +111,8 @@ pub enum EvalState {
     Init {
         deltas: DeltaPair,
     },
-    Aggregate(Box<AggregateEvalState>),
+    /// An eval of an aggregate operator that waits for I/O.
+    Aggregate(AggregateEvalOp),
     /// An eval of a join operator that waits for I/O.
     Join(JoinEvalOp),
     Done,
