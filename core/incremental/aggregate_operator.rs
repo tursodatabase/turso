@@ -10,7 +10,7 @@ use crate::incremental::operator::{
 };
 use crate::incremental::persistence::{ReadRecord, WriteRow};
 use crate::numeric::Numeric;
-use crate::storage::btree::CursorTrait;
+use crate::storage::btree::{BTreeCursor, CursorTrait};
 use crate::sync::Arc;
 use crate::sync::Mutex;
 use crate::translate::plan::ColumnMask;
@@ -1691,9 +1691,9 @@ async fn eval_delta(
         }
     }
 
-    let mut fetch_distinct = co.with(|ctx| {
+    let groups_to_fetch = co.with(|ctx| {
         let operator = &ctx.operator;
-        FetchDistinctState::new(
+        distinct_values_to_fetch(
             &delta,
             &operator.distinct_columns,
             |values| operator.extract_group_key(values),
@@ -1702,17 +1702,7 @@ async fn eval_delta(
             operator.is_distinct_only,
         )
     });
-    co.io(|ctx| {
-        let operator = &ctx.operator;
-        fetch_distinct.fetch_distinct_values(
-            operator.operator_id,
-            &mut existing_groups,
-            ctx.cursors,
-            |group_key| operator.generate_group_hash(group_key),
-            operator.is_distinct_only,
-        )
-    })
-    .await;
+    fetch_distinct_values(co, groups_to_fetch, &mut existing_groups).await?;
 
     // For plain DISTINCT, a group with a stored distinct value existed before this delta.
     if co.with(|ctx| ctx.operator.is_distinct_only) {
@@ -2298,308 +2288,175 @@ pub enum MinMaxPersistState {
     Done,
 }
 
-/// State machine for fetching distinct values from BTree storage
-#[derive(Debug)]
-pub enum FetchDistinctState {
-    Init {
-        groups_to_fetch: Vec<(String, HashMap<usize, HashSet<HashableRow>>)>,
-    },
-    FetchGroup {
-        groups_to_fetch: Vec<(String, HashMap<usize, HashSet<HashableRow>>)>,
-        group_idx: usize,
-        value_idx: usize,
-        values_to_fetch: Vec<(usize, Value)>,
-    },
-    ReadValue {
-        groups_to_fetch: Vec<(String, HashMap<usize, HashSet<HashableRow>>)>,
-        group_idx: usize,
-        value_idx: usize,
-        values_to_fetch: Vec<(usize, Value)>,
-        group_key: String,
-        column_idx: usize,
-        value: Value,
-    },
-    Done,
+/// The distinct values whose stored weights the eval of `delta` needs,
+/// by group and column. For plain DISTINCT the group itself is the value.
+/// DISTINCT aggregates only read values of groups that already exist.
+fn distinct_values_to_fetch(
+    delta: &Delta,
+    distinct_columns: &ColumnMask,
+    extract_group_key: impl Fn(&[Value]) -> Vec<Value>,
+    group_key_to_string: impl Fn(&[Value]) -> String,
+    existing_groups: &HashMap<String, AggregateState>,
+    is_plain_distinct: bool,
+) -> Vec<(String, HashMap<usize, HashSet<HashableRow>>)> {
+    let mut groups_to_fetch: HashMap<String, HashMap<usize, HashSet<HashableRow>>> =
+        HashMap::default();
+
+    for (row, _weight) in &delta.changes {
+        let group_key = extract_group_key(&row.values);
+        let group_key_str = group_key_to_string(&group_key);
+
+        if !is_plain_distinct && !existing_groups.contains_key(&group_key_str) {
+            continue;
+        }
+
+        let group_entry = groups_to_fetch.entry(group_key_str.clone()).or_default();
+
+        if is_plain_distinct {
+            add_plain_distinct_fetch(group_entry, &group_key_str);
+        } else {
+            add_aggregate_distinct_fetch(group_entry, &row.values, distinct_columns);
+        }
+    }
+
+    groups_to_fetch.into_iter().collect()
 }
 
-impl FetchDistinctState {
-    /// Add fetch entry for plain DISTINCT - the group itself is the distinct value
-    fn add_plain_distinct_fetch(
-        group_entry: &mut HashMap<usize, HashSet<HashableRow>>,
-        group_key_str: &str,
-    ) {
-        let group_value = Value::Text(group_key_str.to_string().into());
-        group_entry
-            .entry(0)
-            .or_default()
-            .insert(HashableRow::new(0, vec![group_value]));
-    }
+/// Add fetch entry for plain DISTINCT - the group itself is the distinct value
+fn add_plain_distinct_fetch(
+    group_entry: &mut HashMap<usize, HashSet<HashableRow>>,
+    group_key_str: &str,
+) {
+    let group_value = Value::Text(group_key_str.to_string().into());
+    group_entry
+        .entry(0)
+        .or_default()
+        .insert(HashableRow::new(0, vec![group_value]));
+}
 
-    /// Add fetch entries for DISTINCT aggregates - individual column values
-    fn add_aggregate_distinct_fetch(
-        group_entry: &mut HashMap<usize, HashSet<HashableRow>>,
-        row_values: &[Value],
-        distinct_columns: &ColumnMask,
-    ) {
-        for col_idx in distinct_columns {
-            if let Some(val) = row_values.get(col_idx) {
-                if val != &Value::Null {
-                    group_entry
-                        .entry(col_idx)
-                        .or_default()
-                        .insert(HashableRow::new(col_idx as i64, vec![val.clone()]));
-                }
+/// Add fetch entries for DISTINCT aggregates - individual column values
+fn add_aggregate_distinct_fetch(
+    group_entry: &mut HashMap<usize, HashSet<HashableRow>>,
+    row_values: &[Value],
+    distinct_columns: &ColumnMask,
+) {
+    for col_idx in distinct_columns {
+        if let Some(val) = row_values.get(col_idx) {
+            if val != &Value::Null {
+                group_entry
+                    .entry(col_idx)
+                    .or_default()
+                    .insert(HashableRow::new(col_idx as i64, vec![val.clone()]));
+            }
+        }
+    }
+}
+
+/// Reads the stored weight of every distinct value in `groups_to_fetch`
+/// into the state of its group. For plain DISTINCT, the count of a group
+/// is the sum of those weights.
+async fn fetch_distinct_values(
+    co: &mut Co<AggregateStep>,
+    groups_to_fetch: Vec<(String, HashMap<usize, HashSet<HashableRow>>)>,
+    existing_groups: &mut HashMap<String, AggregateState>,
+) -> Result<(), Box<LimboError>> {
+    for (group_key, cols_values) in &groups_to_fetch {
+        for (col_idx, values) in cols_values {
+            for hashable_row in values {
+                let value = hashable_row.values.first().ok_or_else(|| {
+                    LimboError::InternalError(
+                        "hashable_row should have at least one value".to_string(),
+                    )
+                })?;
+                let Some(weight) = read_distinct_weight(co, group_key, *col_idx, value).await?
+                else {
+                    continue;
+                };
+                let state = existing_groups.entry(group_key.clone()).or_default();
+                state.distinct_value_weights.insert(
+                    (
+                        *col_idx,
+                        HashableRow::new(*col_idx as i64, vec![value.clone()]),
+                    ),
+                    weight,
+                );
             }
         }
     }
 
-    pub fn new(
-        delta: &Delta,
-        distinct_columns: &ColumnMask,
-        extract_group_key: impl Fn(&[Value]) -> Vec<Value>,
-        group_key_to_string: impl Fn(&[Value]) -> String,
-        existing_groups: &HashMap<String, AggregateState>,
-        is_plain_distinct: bool,
-    ) -> Self {
-        let mut groups_to_fetch: HashMap<String, HashMap<usize, HashSet<HashableRow>>> =
-            HashMap::default();
-
-        for (row, _weight) in &delta.changes {
-            let group_key = extract_group_key(&row.values);
-            let group_key_str = group_key_to_string(&group_key);
-
-            // Skip groups we don't need to fetch
-            // For DISTINCT aggregates, only fetch for existing groups
-            if !is_plain_distinct && !existing_groups.contains_key(&group_key_str) {
-                continue;
-            }
-
-            let group_entry = groups_to_fetch.entry(group_key_str.clone()).or_default();
-
-            if is_plain_distinct {
-                Self::add_plain_distinct_fetch(group_entry, &group_key_str);
-            } else {
-                Self::add_aggregate_distinct_fetch(group_entry, &row.values, distinct_columns);
-            }
-        }
-
-        let groups_to_fetch: Vec<_> = groups_to_fetch.into_iter().collect();
-
-        if groups_to_fetch.is_empty() {
-            Self::Done
-        } else {
-            Self::Init { groups_to_fetch }
+    if co.with(|ctx| ctx.operator.is_distinct_only) {
+        for state in existing_groups.values_mut() {
+            state.count = state.distinct_value_weights.values().sum();
         }
     }
+    Ok(())
+}
 
-    pub fn fetch_distinct_values(
-        &mut self,
-        operator_id: i64,
-        existing_groups: &mut HashMap<String, AggregateState>,
-        cursors: &mut DbspStateCursors,
-        generate_group_hash: impl Fn(&str) -> Hash128,
-        is_plain_distinct: bool,
-    ) -> IOResultOr<()> {
-        loop {
-            match self {
-                FetchDistinctState::Init { groups_to_fetch } => {
-                    if groups_to_fetch.is_empty() {
-                        *self = FetchDistinctState::Done;
-                        continue;
-                    }
+/// The stored weight of one distinct value of a group, or None when the
+/// value has no stored row. The row is found through the index, as in
+/// the row write.
+async fn read_distinct_weight(
+    co: &mut Co<AggregateStep>,
+    group_key: &str,
+    column_idx: usize,
+    value: &Value,
+) -> Result<Option<i64>, Box<LimboError>> {
+    let index_key = co.with(|ctx| {
+        let operator = &ctx.operator;
+        let storage_id = generate_storage_id(operator.operator_id, column_idx, AGG_TYPE_DISTINCT);
+        let zset_hash = operator.generate_group_hash(group_key);
+        let element_id = hash_value(value, column_idx);
+        Ok::<_, LimboError>(vec![
+            Value::from_i64(storage_id),
+            zset_hash.to_value()?,
+            element_id.to_value()?,
+        ])
+    })?;
+    let index_record = ImmutableRecord::from_values(&index_key, index_key.len())?;
 
-                    let groups = std::mem::take(groups_to_fetch);
-                    *self = FetchDistinctState::FetchGroup {
-                        groups_to_fetch: groups,
-                        group_idx: 0,
-                        value_idx: 0,
-                        values_to_fetch: Vec::new(),
-                    };
-                }
-                FetchDistinctState::FetchGroup {
-                    groups_to_fetch,
-                    group_idx,
-                    value_idx,
-                    values_to_fetch,
-                } => {
-                    if *group_idx >= groups_to_fetch.len() {
-                        *self = FetchDistinctState::Done;
-                        continue;
-                    }
-
-                    // Build list of values to fetch for current group if not done
-                    if values_to_fetch.is_empty() && *group_idx < groups_to_fetch.len() {
-                        let (_group_key, cols_values) = &groups_to_fetch[*group_idx];
-                        for (col_idx, values) in cols_values {
-                            for hashable_row in values {
-                                // Extract the value from HashableRow
-                                let value = hashable_row.values.first().ok_or_else(|| {
-                                    LimboError::InternalError(
-                                        "hashable_row should have at least one value".to_string(),
-                                    )
-                                })?;
-                                values_to_fetch.push((*col_idx, value.clone()));
-                            }
-                        }
-                    }
-
-                    if *value_idx >= values_to_fetch.len() {
-                        // Move to next group
-                        *group_idx += 1;
-                        *value_idx = 0;
-                        values_to_fetch.clear();
-                        continue;
-                    }
-
-                    // Fetch current value
-                    let (group_key, _) = groups_to_fetch[*group_idx].clone();
-                    let (column_idx, value) = values_to_fetch[*value_idx].clone();
-
-                    let groups = std::mem::take(groups_to_fetch);
-                    let values = std::mem::take(values_to_fetch);
-                    *self = FetchDistinctState::ReadValue {
-                        groups_to_fetch: groups,
-                        group_idx: *group_idx,
-                        value_idx: *value_idx,
-                        values_to_fetch: values,
-                        group_key,
-                        column_idx,
-                        value,
-                    };
-                }
-                FetchDistinctState::ReadValue {
-                    groups_to_fetch,
-                    group_idx,
-                    value_idx,
-                    values_to_fetch,
-                    group_key,
-                    column_idx,
-                    value,
-                } => {
-                    // Read the record from BTree using the same pattern as WriteRow:
-                    // 1. Seek in index to find the entry
-                    // 2. Get rowid from index cursor
-                    // 3. Use rowid to read from table cursor
-                    let storage_id =
-                        generate_storage_id(operator_id, *column_idx, AGG_TYPE_DISTINCT);
-                    let zset_hash = generate_group_hash(group_key);
-                    let element_id = hash_value(value, *column_idx);
-
-                    // First, seek in the index cursor
-                    let index_key = vec![
-                        Value::from_i64(storage_id),
-                        zset_hash.to_value()?,
-                        element_id.to_value()?,
-                    ];
-                    let index_record = ImmutableRecord::from_values(&index_key, index_key.len())?;
-
-                    let seek_result = return_if_io!(cursors.index_cursor.seek(
-                        SeekKey::IndexKey(index_record.as_record_ref()),
-                        SeekOp::GE { eq_only: true }
-                    ));
-
-                    // Early exit if not found in index
-                    if !matches!(seek_result, SeekResult::Found) {
-                        let groups = std::mem::take(groups_to_fetch);
-                        let values = std::mem::take(values_to_fetch);
-                        *self = FetchDistinctState::FetchGroup {
-                            groups_to_fetch: groups,
-                            group_idx: *group_idx,
-                            value_idx: *value_idx + 1,
-                            values_to_fetch: values,
-                        };
-                        continue;
-                    }
-
-                    // Get the rowid from the index cursor
-                    let rowid = return_if_io!(cursors.index_cursor.rowid());
-
-                    // Early exit if no rowid
-                    let rowid = match rowid {
-                        Some(id) => id,
-                        None => {
-                            let groups = std::mem::take(groups_to_fetch);
-                            let values = std::mem::take(values_to_fetch);
-                            *self = FetchDistinctState::FetchGroup {
-                                groups_to_fetch: groups,
-                                group_idx: *group_idx,
-                                value_idx: *value_idx + 1,
-                                values_to_fetch: values,
-                            };
-                            continue;
-                        }
-                    };
-
-                    // Now seek in the table cursor using the rowid
-                    let table_result = return_if_io!(cursors
-                        .table_cursor
-                        .seek(SeekKey::TableRowId(rowid), SeekOp::GE { eq_only: true }));
-
-                    // Early exit if not found in table
-                    if !matches!(table_result, SeekResult::Found) {
-                        let groups = std::mem::take(groups_to_fetch);
-                        let values = std::mem::take(values_to_fetch);
-                        *self = FetchDistinctState::FetchGroup {
-                            groups_to_fetch: groups,
-                            group_idx: *group_idx,
-                            value_idx: *value_idx + 1,
-                            values_to_fetch: values,
-                        };
-                        continue;
-                    }
-
-                    // Read the actual record from the table cursor
-                    let record = return_if_io!(cursors.table_cursor.record());
-
-                    if let Some(r) = record {
-                        // The table has 5 columns: storage_id, zset_hash, element_id, blob, weight
-                        // The weight is at index 4
-                        if let Some(weight) = r.get_value_opt(4) {
-                            // Get the weight directly from column 5(index 4)
-                            let weight = match weight.to_owned()? {
-                                Value::Numeric(Numeric::Integer(w)) => w,
-                                _ => 0,
-                            };
-
-                            // Store the weight in the existing group's state
-                            let state = existing_groups.entry(group_key.clone()).or_default();
-                            state.distinct_value_weights.insert(
-                                (
-                                    *column_idx,
-                                    HashableRow::new(*column_idx as i64, vec![value.clone()]),
-                                ),
-                                weight,
-                            );
-                        }
-                    }
-
-                    // Move to next value
-                    let groups = std::mem::take(groups_to_fetch);
-                    let values = std::mem::take(values_to_fetch);
-                    *self = FetchDistinctState::FetchGroup {
-                        groups_to_fetch: groups,
-                        group_idx: *group_idx,
-                        value_idx: *value_idx + 1,
-                        values_to_fetch: values,
-                    };
-                }
-                FetchDistinctState::Done => {
-                    // For plain DISTINCT, construct AggregateState from the weights we fetched
-                    if is_plain_distinct {
-                        for (_group_key_str, state) in existing_groups.iter_mut() {
-                            // For plain DISTINCT, sum all the weights to get total count
-                            // Each weight represents how many times the distinct value appears
-                            let total_weight: i64 = state.distinct_value_weights.values().sum();
-
-                            // Set the count based on total weight
-                            state.count = total_weight;
-                        }
-                    }
-                    return Ok(IOResult::Done(()));
-                }
-            }
-        }
+    let seek_result = co
+        .io(|ctx| {
+            ctx.cursors.index_cursor.seek(
+                SeekKey::IndexKey(index_record.as_record_ref()),
+                SeekOp::GE { eq_only: true },
+            )
+        })
+        .await;
+    if !matches!(seek_result, SeekResult::Found) {
+        return Ok(None);
     }
+    let Some(rowid) = co.io(|ctx| ctx.cursors.index_cursor.rowid()).await else {
+        return Ok(None);
+    };
+    let table_result = co
+        .io(|ctx| {
+            ctx.cursors
+                .table_cursor
+                .seek(SeekKey::TableRowId(rowid), SeekOp::GE { eq_only: true })
+        })
+        .await;
+    if !matches!(table_result, SeekResult::Found) {
+        return Ok(None);
+    }
+    Ok(co
+        .io(|ctx| stored_weight(&mut ctx.cursors.table_cursor))
+        .await)
+}
+
+/// The weight column of the record the table cursor is on, or None when
+/// the record has no weight. A weight that is not an integer counts as 0.
+fn stored_weight(cursor: &mut BTreeCursor) -> IOResultOr<Option<i64>> {
+    let Some(record) = return_if_io!(cursor.record()) else {
+        return Ok(IOResult::Done(None));
+    };
+    let Some(weight) = record.get_value_opt(4) else {
+        return Ok(IOResult::Done(None));
+    };
+    let weight = match weight.to_owned()? {
+        Value::Numeric(Numeric::Integer(w)) => w,
+        _ => 0,
+    };
+    Ok(IOResult::Done(Some(weight)))
 }
 
 /// State machine for persisting distinct values to BTree storage
