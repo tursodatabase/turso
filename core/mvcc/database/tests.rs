@@ -7787,24 +7787,24 @@ fn test_commit_dependency_speculative_ignore() {
     );
 }
 
-/// Regression: the forward-scan [`IndexShadowFinger`] must NOT evaluate the
+/// Regression: the forward-scan [`IndexShadowScan`] must NOT evaluate the
 /// shadow predicate (and thus must not fire its `register_commit_dependency`
-/// side effect) for index versions whose keys it merely *steps over* — i.e.
+/// side effect) for index versions whose keys it merely *steps over*, i.e.
 /// MVCC-only keys with no matching B-tree row. The authoritative
 /// `query_btree_version_is_valid` path only ever evaluates the version chain for
 /// keys that exactly match a B-tree row (`index_rows.get(btree_key)`), so an
-/// eager finger that resolved the shadow bit on every advance would register a
-/// commit dependency on a `Preparing` writer for a row the scan never observes —
-/// a spurious dependency that cascade-aborts the reader if that writer aborts.
+/// eager scan that resolved the shadow bit on every advance would register a
+/// commit dependency on a `Preparing` writer for a row the scan never observes.
+/// That spurious dependency cascade-aborts the reader if that writer aborts.
 ///
 /// Setup: B-tree keys 10 and 30 (no MVCC versions), plus a single MVCC-only
 /// tombstone at key 20 deleted by a `Preparing` writer that the reader would
-/// speculatively invalidate. A forward scan checks 10 (finger ahead → visible)
-/// then 30 (finger behind → steps over key 20). Key 20 is never an exact match,
+/// speculatively invalidate. A forward scan checks 10 (scan ahead → visible)
+/// then 30 (scan behind → steps over key 20). Key 20 is never an exact match,
 /// so no dependency may be registered.
 #[test]
-fn test_index_finger_no_spurious_dep_on_stepped_over_key() {
-    use crate::mvcc::cursor::IndexShadowFinger;
+fn test_index_shadow_scan_no_spurious_dep_on_stepped_over_key() {
+    use crate::mvcc::cursor::IndexShadowScan;
 
     let db = MvccTestDb::new();
     let store = &db.mvcc_store;
@@ -7869,19 +7869,19 @@ fn test_index_finger_no_spurious_dep_on_stepped_over_key() {
         .value()
         .insert(key20, Arc::new(RwLock::new(tombstone_versions)));
 
-    let mut finger = IndexShadowFinger::default();
-    // B-tree key 10: finger seeds at the first index key >= 10 (key 20), which is
+    let mut scan = IndexShadowScan::default();
+    // B-tree key 10: scan seeds at the first index key >= 10 (key 20), which is
     // ahead → row visible, predicate not evaluated.
-    assert!(finger.btree_row_is_valid(store, table_id, reader_id, &idx_key(10)));
-    // B-tree key 30: finger (at key 20) is behind → steps over the tombstone.
+    assert!(scan.btree_row_is_valid(store, table_id, reader_id, &idx_key(10)));
+    // B-tree key 30: scan (at key 20) is behind → steps over the tombstone.
     // It must advance past it WITHOUT evaluating the shadow predicate.
-    assert!(finger.btree_row_is_valid(store, table_id, reader_id, &idx_key(30)));
+    assert!(scan.btree_row_is_valid(store, table_id, reader_id, &idx_key(30)));
 
     let reader = store.txs.get(&reader_id).unwrap();
     assert_eq!(
         reader.value().commit_dep_counter.load(Ordering::Acquire),
         0,
-        "finger registered a spurious commit dependency for a key it only stepped over"
+        "scan registered a spurious commit dependency for a key it only stepped over"
     );
     let writer = store.txs.get(&writer_id).unwrap();
     assert!(

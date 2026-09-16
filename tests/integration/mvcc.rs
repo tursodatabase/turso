@@ -1420,7 +1420,7 @@ fn test_mvcc_update_btree_only_row_after_truncate_checkpoint(
 ///
 /// An active MVCC index scan must not return a row deleted after the scan
 /// cursor was opened. Pre-fix, the scan panicked with
-/// `index finger diverged from query_btree_version_is_valid` in
+/// `index shadow scan diverged from query_btree_version_is_valid` in
 /// core/mvcc/cursor.rs (or, without the assertion, returned the deleted row).
 #[turso_macros::test]
 fn test_mvcc_index_scan_does_not_return_row_deleted_mid_scan(
