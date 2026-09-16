@@ -10,7 +10,6 @@ use crate::mvcc::database::{
 };
 #[cfg(any(test, injected_yields))]
 use crate::mvcc::yield_hooks::{ProvidesYieldContext, YieldContext, YieldPointMarker};
-use crate::mvcc::yield_points::inject_io_yield;
 use crate::storage::btree::{BTreeCursor, BTreeKey, CursorTrait};
 use crate::sync::Arc;
 use crate::translate::plan::IterationDirection;
@@ -62,12 +61,6 @@ impl<A: ConcurrentAllocator> Debug for CursorPosition<A> {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
-enum CountState {
-    Rewind,
-    NextBtree { count: usize },
-    CheckBtreeKey { count: usize },
-}
 #[cfg(any(test, injected_yields))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, strum_macros::EnumCount)]
 #[repr(u8)]
@@ -533,6 +526,7 @@ struct CursorOps<Clock: LogicalClock + 'static, A: ConcurrentAllocator> {
     move_row: Option<CursorRunner<Clock, A, IterationDirection, ()>>,
     seek: Option<CursorRunner<Clock, A, SeekOp, SeekResult>>,
     exists: Option<CursorRunner<Clock, A, (), bool>>,
+    count: Option<CursorRunner<Clock, A, (), usize>>,
 }
 
 impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> Default for CursorOps<Clock, A> {
@@ -542,6 +536,7 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> Default for CursorOp
             move_row: None,
             seek: None,
             exists: None,
+            count: None,
         }
     }
 }
@@ -566,6 +561,7 @@ enum CursorOp {
     Prev,
     Seek,
     Exists,
+    Count,
 }
 
 /// Runs one step of the async cursor operation `$op` whose runner lives in
@@ -623,8 +619,6 @@ pub struct MvccLazyCursor<Clock: LogicalClock + 'static, A: ConcurrentAllocator 
     btree_cursor: Box<dyn CursorTrait>,
     null_flag: bool,
     creating_new_rowid: bool,
-    // we keep count_state separate to be able to call other public functions like rewind and next
-    count_state: Option<CountState>,
     /// The runners of the async operations of this cursor.
     ops: CursorOps<Clock, A>,
     /// The async operation that is suspended, if any.
@@ -694,7 +688,6 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> MvccLazyCursor<Clock
             btree_cursor,
             null_flag: false,
             creating_new_rowid: false,
-            count_state: None,
             ops: CursorOps::default(),
             active: None,
             dual_peek: DualCursorPeek::default(),
@@ -1901,43 +1894,7 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> CursorTrait
     }
 
     fn count(&mut self) -> IOResultOr<usize> {
-        loop {
-            let state = self.count_state;
-            match state {
-                None => {
-                    self.count_state.replace(CountState::Rewind);
-                    inject_io_yield!(self, CursorYieldPoint::CountProgress);
-                }
-                Some(CountState::Rewind) => {
-                    return_if_io!(self.rewind());
-                    self.count_state
-                        .replace(CountState::CheckBtreeKey { count: 0 });
-                    inject_io_yield!(self, CursorYieldPoint::CountProgress);
-                }
-                Some(CountState::CheckBtreeKey { count }) => {
-                    if let CursorPosition::Loaded {
-                        row_id: _,
-                        in_btree: _,
-                        ..
-                    } = self.get_current_pos()
-                    {
-                        self.count_state
-                            .replace(CountState::NextBtree { count: count + 1 });
-                        inject_io_yield!(self, CursorYieldPoint::CountProgress);
-                    } else {
-                        self.count_state = None;
-                        return Ok(IOResult::Done(count));
-                    }
-                }
-                Some(CountState::NextBtree { count }) => {
-                    // advance the btree cursor skips non valid keys
-                    return_if_io!(self.next());
-                    self.count_state
-                        .replace(CountState::CheckBtreeKey { count });
-                    inject_io_yield!(self, CursorYieldPoint::CountProgress);
-                }
-            }
-        }
+        run_cursor_op!(self, CursorOp::Count, count, count_rows, ())
     }
 
     /// Returns true if the is not pointing to any row.
@@ -2097,6 +2054,26 @@ async fn rewind_cursor<Clock: LogicalClock + 'static, A: ConcurrentAllocator>(
     co.io(|ctx| ctx.cursor.finish_rewind(dir).map(IOResult::Done))
         .await;
     Ok(())
+}
+
+/// Counts the rows of the table: rewinds the cursor and moves it forward
+/// until it runs past the last row.
+async fn count_rows<Clock: LogicalClock + 'static, A: ConcurrentAllocator>(
+    co: &mut Co<MvCursorStep<Clock, A>>,
+    (): (),
+) -> Result<usize, Box<LimboError>> {
+    inject_cursor_yield!(co, CursorYieldPoint::CountProgress);
+    co.with(|ctx| ctx.cursor.set_null_flag(false));
+    rewind_cursor(co, IterationDirection::Forwards).await?;
+    inject_cursor_yield!(co, CursorYieldPoint::CountProgress);
+    let mut count = 0;
+    while co.with(|ctx| ctx.cursor.has_record()) {
+        count += 1;
+        inject_cursor_yield!(co, CursorYieldPoint::CountProgress);
+        move_cursor(co, IterationDirection::Forwards).await?;
+        inject_cursor_yield!(co, CursorYieldPoint::CountProgress);
+    }
+    Ok(count)
 }
 
 /// Says whether the table has a visible row with the integer key that the
