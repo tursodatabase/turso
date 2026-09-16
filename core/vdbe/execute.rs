@@ -186,7 +186,7 @@ use crate::{
     json::jsonb_set, json::raw_jsonb_element_len, json::Conv,
 };
 
-use super::{Exit, Program, ProgramState, ProgramStep, Register, Suspend};
+use super::{Program, ProgramState, ProgramStep, Register, Suspend};
 
 #[cfg(feature = "fs")]
 use crate::connection::resolve_ext_path;
@@ -2002,93 +2002,78 @@ impl ColumnFetch<'_> {
     }
 }
 
-/// The async instruction loop of a statement, boxed once per program state
-/// and reused. It pauses to return a row, to wait for I/O, to yield, or on a
-/// busy error, and it finishes with the statement.
-pub(crate) struct LoopRunner(BoxedResumable<VdbeStep, (), ProgramStep>);
+/// Runs one async instruction at a time. The box holds the future and is
+/// allocated once per statement.
+pub(crate) struct AsyncInsnRunner {
+    active: bool,
+    inner: BoxedResumable<VdbeStep, AsyncOp, Result<(), Box<LimboError>>>,
+}
 
-impl LoopRunner {
+impl AsyncInsnRunner {
     pub(crate) fn new() -> Self {
-        Self(Runner::boxed(run_program))
+        Self {
+            active: false,
+            inner: Runner::boxed(run_async_insn),
+        }
     }
 
+    /// True while an async instruction is paused.
     #[inline(always)]
-    pub(crate) fn resume(&mut self, ctx: &mut VdbeCtx<'_>) -> Poll<ProgramStep> {
-        self.0.resume(ctx, ())
+    pub(crate) fn is_active(&self) -> bool {
+        self.active
+    }
+
+    /// Starts `op` and runs it until it pauses or finishes.
+    pub(crate) fn start(
+        &mut self,
+        ctx: &mut VdbeCtx<'_>,
+        op: AsyncOp,
+    ) -> Poll<Result<(), Box<LimboError>>> {
+        let polled = self.inner.start(ctx, op);
+        self.active = polled.is_pending();
+        polled
+    }
+
+    /// Continues the paused instruction until it pauses again or finishes.
+    pub(crate) fn resume(&mut self, ctx: &mut VdbeCtx<'_>) -> Poll<Result<(), Box<LimboError>>> {
+        let polled = self.inner.resume(ctx);
+        self.active = polled.is_pending();
+        polled
     }
 
     pub(crate) fn cancel(&mut self) {
-        self.0.cancel();
+        if self.active {
+            self.inner.cancel();
+            self.active = false;
+        }
     }
 }
 
-/// Names [`VdbeCtx`] as the context type of the async instruction loop.
+/// Names [`VdbeCtx`] as the context type of the async instructions.
 pub(crate) struct VdbeStep;
 
 impl StepContext for VdbeStep {
     type Ctx<'a> = VdbeCtx<'a>;
 }
 
-/// The context of one step of the async instruction loop. The loop and the
-/// async opcodes get it back on every step, so they never keep a reference
-/// across a pause.
+/// The context of one step of an async instruction. The instruction gets
+/// it back on every step, so it never keeps a reference across a pause.
 pub(crate) struct VdbeCtx<'a> {
     program: &'a Program,
     state: &'a mut ProgramState,
-    pager: &'a Arc<Pager>,
     waker: Option<&'a Waker>,
-    traced: bool,
-    enable_tracing: bool,
-    vdbe_trace: bool,
 }
 
 impl<'a> VdbeCtx<'a> {
     pub(crate) fn new(
         program: &'a Program,
         state: &'a mut ProgramState,
-        pager: &'a Arc<Pager>,
         waker: Option<&'a Waker>,
     ) -> Self {
-        let enable_tracing = tracing::enabled!(tracing::Level::TRACE);
-        let vdbe_trace = program.connection.get_vdbe_trace();
         Self {
             program,
             state,
-            pager,
             waker,
-            traced: enable_tracing || vdbe_trace,
-            enable_tracing,
-            vdbe_trace,
-        }
-    }
-
-    #[inline(always)]
-    fn dispatch(&mut self) -> Exit {
-        self.program.dispatch(
-            self.state,
-            self.pager,
-            self.waker,
-            self.traced,
-            self.enable_tracing,
-            self.vdbe_trace,
-        )
-    }
-
-    /// Books the instruction that an async operation finished, or fails
-    /// the step with the error of the operation. `None` means the loop
-    /// goes on with the next instruction.
-    #[inline(always)]
-    fn finish_async_op(&mut self, result: Result<(), Box<LimboError>>) -> Option<Exit> {
-        match result {
-            Ok(()) => {
-                self.state.pc += 1;
-                self.state.metrics.insn_executed = self.state.metrics.insn_executed.wrapping_add(1);
-                None
-            }
-            Err(err) => self
-                .program
-                .fail_step(self.state, self.pager, *err)
-                .map(|step| step.into_exit(self.state)),
         }
     }
 }
@@ -2104,56 +2089,26 @@ impl YieldSlot for VdbeCtx<'_> {
     }
 }
 
-/// The instruction loop of a statement. Synchronous instructions run in
-/// [`Program::dispatch`]; the loop awaits the async ones and pauses whenever
-/// the statement must return to its caller.
-async fn run_program(mut co: Co<VdbeStep>, _: ()) -> ProgramStep {
-    loop {
-        let op = match co.with(|ctx| ctx.dispatch()) {
-            Exit::Finished(step) => return step,
-            Exit::Suspended => {
-                co.pause().await;
-                continue;
-            }
-            Exit::Async(op) => op,
-        };
-        let result = match op {
-            AsyncOp::ColumnDeferred {
-                cursor_id,
-                deferred,
-            } => op_column_deferred(&mut co, cursor_id, deferred).await,
-        };
-        match co.with(|ctx| ctx.finish_async_op(result)) {
-            None => {}
-            Some(Exit::Finished(step)) => return step,
-            Some(Exit::Suspended) => co.pause().await,
-            Some(Exit::Async(_)) => {
-                unreachable!("finishing an instruction starts no async operation")
-            }
-        }
+/// Runs one async instruction to completion.
+async fn run_async_insn(mut co: Co<VdbeStep>, op: AsyncOp) -> Result<(), Box<LimboError>> {
+    match op {
+        AsyncOp::ColumnDeferred { cursor_id } => op_column_deferred(&mut co, cursor_id).await,
     }
 }
 
 /// An instruction that continues as an async operation, with the arguments
-/// the operation takes from the program state when it starts.
-#[derive(Clone, Debug)]
+/// the operation needs.
+#[derive(Clone, Copy, Debug)]
 pub(crate) enum AsyncOp {
-    ColumnDeferred {
-        cursor_id: usize,
-        deferred: DeferredSeekState,
-    },
+    ColumnDeferred { cursor_id: usize },
 }
 
 impl AsyncOp {
-    pub(crate) fn start(insn: &Insn, state: &mut ProgramState) -> Self {
+    pub(crate) fn of(insn: &Insn) -> Self {
         match insn {
             Insn::Column { cursor_id, .. } | Insn::ColumnRange { cursor_id, .. } => {
-                let deferred = state.deferred_seeks[*cursor_id]
-                    .take()
-                    .expect("a Column continues as an async operation only with a deferred seek");
                 AsyncOp::ColumnDeferred {
                     cursor_id: *cursor_id,
-                    deferred,
                 }
             }
             _ => unreachable!("only Column and ColumnRange continue as async operations"),
@@ -2166,8 +2121,10 @@ impl AsyncOp {
 async fn op_column_deferred(
     co: &mut Co<VdbeStep>,
     cursor_id: usize,
-    deferred: DeferredSeekState,
 ) -> Result<(), Box<LimboError>> {
+    let deferred = co
+        .with(|ctx| ctx.state.deferred_seeks[cursor_id].take())
+        .expect("a Column continues as an async operation only with a deferred seek");
     let rowid = co
         .io(|ctx| index_cursor_rowid(ctx.state, deferred.index_cursor_id))
         .await?;

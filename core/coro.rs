@@ -1,11 +1,13 @@
 //! Runs an `async fn` as a step function.
 //!
-//! The async function does not run on an executor. The caller calls
-//! [`Resumable::resume`] and passes the context for that one step. The async
-//! function reads the context through [`Co::with`], asks for I/O with
-//! [`Co::io`], and pauses with [`Co::pause`]. A pause makes `resume` return
-//! `Pending`, and the caller reads from its own context why the function
-//! paused. The next `resume` call continues the function after the pause.
+//! The async function does not run on an executor. The caller starts an
+//! operation with [`Resumable::start`] and continues it with
+//! [`Resumable::resume`], and passes the context for that one step each
+//! time. The async function reads the context through [`Co::with`], asks
+//! for I/O with [`Co::io`], and pauses with [`Co::pause`]. A pause makes the
+//! step return `Pending`, and the caller reads from its own context why the
+//! function paused. The next `resume` call continues the function after the
+//! pause.
 //!
 //! The future outlives every step, so it cannot borrow the context. The
 //! runner stores a pointer to the context in a slot that it shares with the
@@ -77,6 +79,7 @@ impl<C: StepContext> Co<C> {
     }
 
     /// Pauses the function until the next `resume`.
+    #[cfg_attr(not(test), allow(dead_code))]
     #[inline(always)]
     pub fn pause(&mut self) -> Pause {
         Pause { paused: false }
@@ -138,13 +141,16 @@ pub type BoxedResumable<C, Args, Out> = Box<dyn Resumable<C, Args, Out> + Send +
 
 /// A step function built from an async function.
 pub trait Resumable<C: StepContext, Args, Out> {
-    /// True between the first `resume` and the one that returns `Ready`.
+    /// True between `start` and the step that returns `Ready`.
     #[cfg_attr(not(test), allow(dead_code))]
     fn is_active(&self) -> bool;
 
-    /// Starts a new operation with `args` if none is active, then runs it
-    /// until it pauses or finishes. `args` is ignored on a resume.
-    fn resume(&mut self, ctx: &mut C::Ctx<'_>, args: Args) -> Poll<Out>;
+    /// Starts a new operation with `args` and runs it until it pauses or
+    /// finishes. No operation may be active.
+    fn start(&mut self, ctx: &mut C::Ctx<'_>, args: Args) -> Poll<Out>;
+
+    /// Continues the active operation until it pauses or finishes.
+    fn resume(&mut self, ctx: &mut C::Ctx<'_>) -> Poll<Out>;
 
     /// Drops the future of an active operation.
     fn cancel(&mut self);
@@ -194,15 +200,38 @@ where
         self.active
     }
 
-    fn resume(&mut self, ctx: &mut C::Ctx<'_>, args: Args) -> Poll<Out> {
-        if !self.active {
-            let co = Co {
-                ctx: Arc::clone(&self.ctx),
-                _family: PhantomData,
-            };
-            self.future.as_mut().set(Some((self.make)(co, args)));
-            self.active = true;
+    fn start(&mut self, ctx: &mut C::Ctx<'_>, args: Args) -> Poll<Out> {
+        assert!(!self.active, "an operation is already active");
+        let co = Co {
+            ctx: Arc::clone(&self.ctx),
+            _family: PhantomData,
+        };
+        self.future.as_mut().set(Some((self.make)(co, args)));
+        self.active = true;
+        self.poll_once(ctx)
+    }
+
+    fn resume(&mut self, ctx: &mut C::Ctx<'_>) -> Poll<Out> {
+        assert!(self.active, "no operation is active");
+        self.poll_once(ctx)
+    }
+
+    #[inline(always)]
+    fn cancel(&mut self) {
+        if self.active {
+            self.future.as_mut().set(None);
+            self.active = false;
         }
+    }
+}
+
+impl<C, F, M> Runner<C, F, M>
+where
+    C: StepContext,
+    F: Future,
+{
+    #[inline(always)]
+    fn poll_once(&mut self, ctx: &mut C::Ctx<'_>) -> Poll<F::Output> {
         let future = self
             .future
             .as_mut()
@@ -216,12 +245,6 @@ where
             self.active = false;
         }
         polled
-    }
-
-    #[inline(always)]
-    fn cancel(&mut self) {
-        self.future.as_mut().set(None);
-        self.active = false;
     }
 }
 
@@ -287,12 +310,14 @@ mod tests {
         let mut runner = Runner::boxed(count_to);
         let mut counter = Counter::new(0);
         assert!(!runner.is_active());
-        for expected in 1..=3 {
-            assert!(yields(runner.resume(&mut counter, 3), &mut counter));
+        assert!(yields(runner.start(&mut counter, 3), &mut counter));
+        assert_eq!(counter.steps, 1);
+        for expected in 2..=3 {
             assert!(runner.is_active());
+            assert!(yields(runner.resume(&mut counter), &mut counter));
             assert_eq!(counter.steps, expected);
         }
-        assert!(matches!(runner.resume(&mut counter, 3), Poll::Ready(Ok(3))));
+        assert!(matches!(runner.resume(&mut counter), Poll::Ready(Ok(3))));
         assert!(!runner.is_active());
     }
 
@@ -300,10 +325,10 @@ mod tests {
     fn runner_is_reused_for_the_next_operation() {
         let mut runner = Runner::boxed(count_to);
         let mut counter = Counter::new(0);
-        assert!(matches!(runner.resume(&mut counter, 0), Poll::Ready(Ok(0))));
-        assert!(yields(runner.resume(&mut counter, 1), &mut counter));
+        assert!(matches!(runner.start(&mut counter, 0), Poll::Ready(Ok(0))));
+        assert!(yields(runner.start(&mut counter, 1), &mut counter));
         let mut other = Counter::new(5);
-        assert!(matches!(runner.resume(&mut other, 99), Poll::Ready(Ok(1))));
+        assert!(matches!(runner.resume(&mut other), Poll::Ready(Ok(1))));
         assert_eq!(counter.steps, 1);
         assert_eq!(other.steps, 5);
     }
@@ -312,13 +337,10 @@ mod tests {
     fn a_pause_without_io_is_pending_once() {
         let mut runner = Runner::boxed(fail_after_one_pause);
         let mut counter = Counter::new(0);
-        assert!(runner.resume(&mut counter, 0).is_pending());
+        assert!(runner.start(&mut counter, 0).is_pending());
         assert!(counter.io.is_none());
         assert!(runner.is_active());
-        assert!(matches!(
-            runner.resume(&mut counter, 0),
-            Poll::Ready(Err(()))
-        ));
+        assert!(matches!(runner.resume(&mut counter), Poll::Ready(Err(()))));
         assert!(!runner.is_active());
         assert_eq!(counter.steps, 1);
     }
@@ -327,10 +349,10 @@ mod tests {
     fn cancel_drops_a_paused_operation() {
         let mut runner = Runner::boxed(count_to);
         let mut counter = Counter::new(0);
-        assert!(yields(runner.resume(&mut counter, 2), &mut counter));
+        assert!(yields(runner.start(&mut counter, 2), &mut counter));
         runner.cancel();
         assert!(!runner.is_active());
-        assert!(matches!(runner.resume(&mut counter, 0), Poll::Ready(Ok(0))));
+        assert!(matches!(runner.start(&mut counter, 0), Poll::Ready(Ok(0))));
     }
 
     struct Borrowing;
@@ -375,7 +397,7 @@ mod tests {
         let mut second = 1;
         let mut io = None;
         assert!(runner
-            .resume(
+            .start(
                 &mut Borrowed {
                     steps: &mut first,
                     io: &mut io
@@ -386,24 +408,18 @@ mod tests {
         assert_eq!(first, 1);
         assert!(io.take().is_some());
         assert!(runner
-            .resume(
-                &mut Borrowed {
-                    steps: &mut second,
-                    io: &mut io
-                },
-                2
-            )
+            .resume(&mut Borrowed {
+                steps: &mut second,
+                io: &mut io
+            })
             .is_pending());
         assert_eq!(second, 2);
         assert!(io.take().is_some());
         assert!(matches!(
-            runner.resume(
-                &mut Borrowed {
-                    steps: &mut second,
-                    io: &mut io
-                },
-                2
-            ),
+            runner.resume(&mut Borrowed {
+                steps: &mut second,
+                io: &mut io
+            }),
             Poll::Ready(Ok(2))
         ));
         assert!(io.is_none());

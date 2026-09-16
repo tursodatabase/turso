@@ -293,8 +293,8 @@ fn combine_arithmetic_primitive(
 pub struct Statement {
     pub(crate) program: vdbe::Program,
     state: vdbe::ProgramState,
-    /// The async instruction loop of this statement.
-    loop_runner: vdbe::execute::LoopRunner,
+    /// Runs the async instructions of this statement.
+    loop_runner: vdbe::execute::AsyncInsnRunner,
     pager: Arc<Pager>,
     /// indicates if the statement is a NORMAL/EXPLAIN/EXPLAIN QUERY PLAN
     query_mode: QueryMode,
@@ -393,7 +393,7 @@ impl Statement {
         Self {
             program,
             state,
-            loop_runner: vdbe::execute::LoopRunner::new(),
+            loop_runner: vdbe::execute::AsyncInsnRunner::new(),
             pager,
             query_mode,
             busy: false,

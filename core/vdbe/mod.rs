@@ -232,48 +232,26 @@ impl From<ProgramStep> for Result<StepResult, Box<LimboError>> {
     }
 }
 
-impl ProgramStep {
-    /// How the instruction loop hands this result to the async loop that
-    /// runs it: a pause the caller sees as this step, or the end of the
-    /// statement.
-    fn into_exit(self, state: &mut ProgramState) -> Exit {
-        match self {
-            ProgramStep::Row => state.suspend(Suspend::Row),
-            ProgramStep::IO => state.suspend(Suspend::IO),
-            ProgramStep::Yield => state.suspend(Suspend::Yield),
-            ProgramStep::Busy => state.suspend(Suspend::Busy),
-            ProgramStep::Done | ProgramStep::Interrupt | ProgramStep::Error(_) => {
-                Exit::Finished(self)
-            }
-        }
-    }
-}
-
-/// Why the instruction loop returned to the async loop that runs it.
+/// What the dispatch loop returned to `normal_step`.
 pub(crate) enum Exit {
-    /// The statement finished: done, interrupted, or failed.
-    Finished(ProgramStep),
-    /// The statement must pause; `ProgramState::suspend_reason` says why.
-    Suspended,
+    /// The statement paused or finished with this result.
+    Step(ProgramStep),
     /// The instruction at `pc` continues as an async operation.
     Async(execute::AsyncOp),
 }
 
-/// Why the instruction loop paused.
+/// Why an async instruction paused.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) enum Suspend {
     #[default]
     None,
-    /// A result row is ready.
-    Row,
     /// The completion in `io_completions` has not finished.
     IO,
     /// An explicit yield to the cooperative scheduler.
     Yield,
-    /// A busy error; the same instruction runs again on the next step.
-    Busy,
     /// The completion in `io_completions` finished during the step; the
-    /// loop checks its outcome and continues without returning.
+    /// loop checks its outcome and resumes the instruction without
+    /// returning.
     Retry,
 }
 
@@ -978,8 +956,8 @@ pub struct ProgramState {
     #[cfg(feature = "json")]
     json_cache: JsonCacheCell,
     active_op_state: ActiveOpStateSlot,
-    /// Why the instruction loop paused, read by `normal_step` when the
-    /// loop returns `Pending`.
+    /// Why an async instruction paused, read by `normal_step` when the
+    /// instruction returns `Pending`.
     suspend_reason: Suspend,
     seek_state: OpSeekState,
     /// Metrics collected for the lifetime of this prepared statement.
@@ -1455,14 +1433,6 @@ impl ProgramState {
         self.io_completions
             .take()
             .expect("an instruction that reports IO leaves its completion in the state")
-    }
-
-    /// Records why the instruction loop pauses; the async loop then pauses
-    /// and `normal_step` reads the reason back.
-    #[inline(always)]
-    fn suspend(&mut self, reason: Suspend) -> Exit {
-        self.suspend_reason = reason;
-        Exit::Suspended
     }
 
     fn take_suspend_reason(&mut self) -> Suspend {
@@ -2025,7 +1995,7 @@ impl Program {
     #[inline(always)]
     pub fn step(
         &self,
-        runner: &mut execute::LoopRunner,
+        runner: &mut execute::AsyncInsnRunner,
         state: &mut ProgramState,
         pager: &Arc<Pager>,
         query_mode: QueryMode,
@@ -2300,27 +2270,40 @@ impl Program {
     #[inline(always)]
     pub(crate) fn normal_step(
         &self,
-        runner: &mut execute::LoopRunner,
+        runner: &mut execute::AsyncInsnRunner,
         state: &mut ProgramState,
         pager: &Arc<Pager>,
         waker: Option<&Waker>,
     ) -> ProgramStep {
         state.execution_state = ProgramExecutionState::Running;
+        let enable_tracing = tracing::enabled!(tracing::Level::TRACE);
+        let vdbe_trace = self.connection.get_vdbe_trace();
         let result = loop {
             if state.io_completions.is_some() {
                 if let Some(result) = self.finish_pending_io(state, pager, waker) {
                     break result;
                 }
             }
-            match runner.resume(&mut execute::VdbeCtx::new(self, state, pager, waker)) {
-                Poll::Ready(result) => break result,
+            let polled = if runner.is_active() {
+                runner.resume(&mut execute::VdbeCtx::new(self, state, waker))
+            } else {
+                match self.dispatch(state, pager, waker, enable_tracing, vdbe_trace) {
+                    Exit::Step(result) => break result,
+                    Exit::Async(op) => {
+                        runner.start(&mut execute::VdbeCtx::new(self, state, waker), op)
+                    }
+                }
+            };
+            match polled {
+                Poll::Ready(result) => match self.finish_async_insn(state, pager, result) {
+                    Some(result) => break result,
+                    None => continue,
+                },
                 Poll::Pending => match state.take_suspend_reason() {
-                    Suspend::Row => break ProgramStep::Row,
                     Suspend::IO => break ProgramStep::IO,
                     Suspend::Yield => break ProgramStep::Yield,
-                    Suspend::Busy => break ProgramStep::Busy,
                     Suspend::Retry => continue,
-                    Suspend::None => unreachable!("the instruction loop paused without a reason"),
+                    Suspend::None => unreachable!("an async instruction paused without a reason"),
                 },
             }
         };
@@ -2340,19 +2323,37 @@ impl Program {
         result
     }
 
-    /// Runs instructions until the statement finishes, must pause, or
-    /// reaches an instruction that continues as an async operation.
+    /// Books the instruction that an async operation finished, or fails
+    /// the step with the error of the operation. `None` means the loop
+    /// goes on with the next instruction.
+    fn finish_async_insn(
+        &self,
+        state: &mut ProgramState,
+        pager: &Arc<Pager>,
+        result: Result<(), Box<LimboError>>,
+    ) -> Option<ProgramStep> {
+        match result {
+            Ok(()) => {
+                state.pc += 1;
+                state.metrics.insn_executed = state.metrics.insn_executed.wrapping_add(1);
+                None
+            }
+            Err(err) => self.fail_step(state, pager, *err),
+        }
+    }
+
+    /// Runs instructions until the statement pauses, finishes, or reaches
+    /// an instruction that continues as an async operation.
     #[inline(always)]
     fn dispatch(
         &self,
         state: &mut ProgramState,
         pager: &Arc<Pager>,
         waker: Option<&Waker>,
-        traced: bool,
         enable_tracing: bool,
         vdbe_trace: bool,
     ) -> Exit {
-        return if traced {
+        return if enable_tracing || vdbe_trace {
             dispatch_loop_traced(self, state, pager, waker, enable_tracing, vdbe_trace)
         } else {
             dispatch_loop::<false>(self, state, pager, waker, false, false)
@@ -2393,12 +2394,12 @@ impl Program {
             'io_check: loop {
                 if state.io_completions.is_some() {
                     if let Some(result) = program.finish_pending_io(state, pager, waker) {
-                        return result.into_exit(state);
+                        return Exit::Step(result);
                     }
                 }
                 if state.pending_fail_prepare_error.is_some() {
                     match program.prepare_pending_fail(state, pager, waker) {
-                        Some(result) => return result.into_exit(state),
+                        Some(result) => return Exit::Step(result),
                         None => continue 'io_check,
                     }
                 }
@@ -2406,7 +2407,7 @@ impl Program {
                     state.check_countdown = state.check_countdown.wrapping_sub(1);
                     if state.check_countdown == 0 {
                         if let Some(result) = program.periodic_checks(state, pager) {
-                            return result.into_exit(state);
+                            return Exit::Step(result);
                         }
                     }
 
@@ -2435,7 +2436,7 @@ impl Program {
                                 Ok(InsnFunctionStepResult::Row) => {
                                     state.metrics.insn_executed =
                                         state.metrics.insn_executed.wrapping_add(1);
-                                    return state.suspend(Suspend::Row);
+                                    return Exit::Step(ProgramStep::Row);
                                 }
                                 other => other,
                             }
@@ -2472,10 +2473,10 @@ impl Program {
                     if let Ok(InsnFunctionStepResult::Row) = result {
                         // Instruction completed (ResultRow already incremented PC)
                         state.metrics.insn_executed = state.metrics.insn_executed.wrapping_add(1);
-                        return state.suspend(Suspend::Row);
+                        return Exit::Step(ProgramStep::Row);
                     }
                     if let Ok(InsnFunctionStepResult::Async) = result {
-                        return Exit::Async(execute::AsyncOp::start(insn, state));
+                        return Exit::Async(execute::AsyncOp::of(insn));
                     }
                     match dispatch_cold(program, state, pager, waker, result) {
                         Some(exit) => return exit,
@@ -2497,17 +2498,13 @@ impl Program {
                         // Instruction completed execution
                         state.metrics.insn_executed = state.metrics.insn_executed.wrapping_add(1);
                         state.auto_txn_cleanup = TxnCleanup::None;
-                        Some(Exit::Finished(ProgramStep::Done))
+                        Some(Exit::Step(ProgramStep::Done))
                     }
                     Ok(InsnFunctionStepResult::IO) => {
                         let io = state.take_suspended_io();
-                        program
-                            .park_on_io(state, io, waker)
-                            .map(|step| step.into_exit(state))
+                        program.park_on_io(state, io, waker).map(Exit::Step)
                     }
-                    Err(boxed_err) => program
-                        .fail_step(state, pager, *boxed_err)
-                        .map(|step| step.into_exit(state)),
+                    Err(boxed_err) => program.fail_step(state, pager, *boxed_err).map(Exit::Step),
                     Ok(InsnFunctionStepResult::Step)
                     | Ok(InsnFunctionStepResult::Row)
                     | Ok(InsnFunctionStepResult::Async) => {
