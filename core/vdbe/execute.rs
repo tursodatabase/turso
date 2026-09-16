@@ -104,7 +104,7 @@ use std::{
 };
 use turso_macros::{match_ignore_ascii_case, turso_debug_assert};
 
-use crate::coro::{with_handle, BoxedResumable, Co, Runner, StepContext, YieldSlot};
+use crate::coro::{BoxedResumable, Co, Runner, StepContext, YieldSlot};
 
 use crate::pseudo::PseudoCursor;
 
@@ -2009,7 +2009,7 @@ pub(crate) struct LoopRunner(BoxedResumable<VdbeStep, (), ProgramStep>);
 
 impl LoopRunner {
     pub(crate) fn new() -> Self {
-        Self(Runner::boxed(|co, args| with_handle(co, args, run_program)))
+        Self(Runner::boxed(run_program))
     }
 
     #[inline(always)]
@@ -2037,6 +2037,8 @@ pub(crate) struct VdbeCtx<'a> {
     state: &'a mut ProgramState,
     pager: &'a Arc<Pager>,
     waker: Option<&'a Waker>,
+    enable_tracing: bool,
+    vdbe_trace: bool,
 }
 
 impl<'a> VdbeCtx<'a> {
@@ -2051,30 +2053,38 @@ impl<'a> VdbeCtx<'a> {
             state,
             pager,
             waker,
+            enable_tracing: tracing::enabled!(tracing::Level::TRACE),
+            vdbe_trace: program.connection.get_vdbe_trace(),
         }
     }
 
     #[inline(always)]
     fn dispatch(&mut self) -> Exit {
-        self.program.dispatch(self.state, self.pager, self.waker)
+        self.program.dispatch(
+            self.state,
+            self.pager,
+            self.waker,
+            self.enable_tracing,
+            self.vdbe_trace,
+        )
     }
 
     /// Books the instruction that an async operation finished, or fails
-    /// the step with the error of the operation, then runs the next
-    /// instructions.
-    fn finish_async_op(&mut self, result: Result<(), Box<LimboError>>) -> Exit {
+    /// the step with the error of the operation. `None` means the loop
+    /// goes on with the next instruction.
+    #[inline(always)]
+    fn finish_async_op(&mut self, result: Result<(), Box<LimboError>>) -> Option<Exit> {
         match result {
             Ok(()) => {
                 self.state.pc += 1;
                 self.state.metrics.insn_executed = self.state.metrics.insn_executed.wrapping_add(1);
+                None
             }
-            Err(err) => {
-                if let Some(step) = self.program.fail_step(self.state, self.pager, *err) {
-                    return step.into_exit(self.state);
-                }
-            }
+            Err(err) => self
+                .program
+                .fail_step(self.state, self.pager, *err)
+                .map(|step| step.into_exit(self.state)),
         }
-        self.dispatch()
     }
 }
 
@@ -2092,20 +2102,27 @@ impl YieldSlot for VdbeCtx<'_> {
 /// The instruction loop of a statement. Synchronous instructions run in
 /// [`Program::dispatch`]; the loop awaits the async ones and pauses whenever
 /// the statement must return to its caller.
-async fn run_program(co: &mut Co<VdbeStep>, _: ()) -> ProgramStep {
-    let mut exit = co.with(|ctx| ctx.dispatch());
+async fn run_program(mut co: Co<VdbeStep>, _: ()) -> ProgramStep {
     loop {
-        exit = match exit {
+        let op = match co.with(|ctx| ctx.dispatch()) {
             Exit::Finished(step) => return step,
             Exit::Suspended => {
                 co.pause().await;
-                co.with(|ctx| ctx.dispatch())
+                continue;
             }
-            Exit::Async(AsyncOp::ColumnDeferred { cursor_id }) => {
-                let result = op_column_deferred(co, cursor_id).await;
-                co.with(|ctx| ctx.finish_async_op(result))
-            }
+            Exit::Async(op) => op,
         };
+        let result = match op {
+            AsyncOp::ColumnDeferred { cursor_id } => op_column_deferred(&mut co, cursor_id).await,
+        };
+        match co.with(|ctx| ctx.finish_async_op(result)) {
+            None => {}
+            Some(Exit::Finished(step)) => return step,
+            Some(Exit::Suspended) => co.pause().await,
+            Some(Exit::Async(_)) => {
+                unreachable!("finishing an instruction starts no async operation")
+            }
+        }
     }
 }
 

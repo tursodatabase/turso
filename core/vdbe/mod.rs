@@ -2362,15 +2362,15 @@ impl Program {
 
     /// Runs instructions until the statement finishes, must pause, or
     /// reaches an instruction that continues as an async operation.
-    #[inline(never)]
+    #[inline(always)]
     fn dispatch(
         &self,
         state: &mut ProgramState,
         pager: &Arc<Pager>,
         waker: Option<&Waker>,
+        enable_tracing: bool,
+        vdbe_trace: bool,
     ) -> Exit {
-        let enable_tracing = tracing::enabled!(tracing::Level::TRACE);
-        let vdbe_trace = self.connection.get_vdbe_trace();
         return if enable_tracing || vdbe_trace {
             dispatch_loop_traced(self, state, pager, waker, enable_tracing, vdbe_trace)
         } else {
@@ -2493,7 +2493,10 @@ impl Program {
                         state.metrics.insn_executed = state.metrics.insn_executed.wrapping_add(1);
                         return state.suspend(Suspend::Row);
                     }
-                    match dispatch_cold(program, state, pager, waker, insn, result) {
+                    if let Ok(InsnFunctionStepResult::Async) = result {
+                        return Exit::Async(execute::AsyncOp::of(insn));
+                    }
+                    match dispatch_cold(program, state, pager, waker, result) {
                         Some(exit) => return exit,
                         None => continue 'io_check,
                     }
@@ -2506,7 +2509,6 @@ impl Program {
                 state: &mut ProgramState,
                 pager: &Arc<Pager>,
                 waker: Option<&Waker>,
-                insn: &Insn,
                 result: execute::InsnResult,
             ) -> Option<Exit> {
                 match result {
@@ -2522,14 +2524,15 @@ impl Program {
                             .park_on_io(state, io, waker)
                             .map(|step| step.into_exit(state))
                     }
-                    Ok(InsnFunctionStepResult::Async) => {
-                        Some(Exit::Async(execute::AsyncOp::of(insn)))
-                    }
                     Err(boxed_err) => program
                         .fail_step(state, pager, *boxed_err)
                         .map(|step| step.into_exit(state)),
-                    Ok(InsnFunctionStepResult::Step) | Ok(InsnFunctionStepResult::Row) => {
-                        unreachable!("the dispatch loop settles steps and rows itself")
+                    Ok(InsnFunctionStepResult::Step)
+                    | Ok(InsnFunctionStepResult::Row)
+                    | Ok(InsnFunctionStepResult::Async) => {
+                        unreachable!(
+                            "the dispatch loop settles steps, rows and async operations itself"
+                        )
                     }
                 }
             }

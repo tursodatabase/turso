@@ -14,7 +14,8 @@
 //!
 //! One [`Runner`] holds one async function at a time. The future lives in a
 //! box that is allocated once and reused: a new operation builds its future
-//! in place, so no allocation happens per operation.
+//! in place, so no allocation happens per operation. Each operation owns
+//! its handle, which shares the slot of the runner.
 
 use std::future::Future;
 use std::marker::PhantomData;
@@ -149,14 +150,12 @@ pub trait Resumable<C: StepContext, Args, Out> {
     fn cancel(&mut self);
 }
 
-/// Holds one async function, the handle it borrows, and the slot the two
-/// share. Build it with [`Runner::boxed`] and keep the box for reuse.
+/// Holds one async function and the slot it shares with the handle of the
+/// function. Build it with [`Runner::boxed`] and keep the box for reuse.
 pub struct Runner<C, F, M> {
     ctx: Arc<AtomicPtr<()>>,
-    /// The handle between two operations. The future borrows it through
-    /// [`with_handle`] and gives it back when it finishes.
-    co: Option<Co<C>>,
     make: M,
+    _family: PhantomData<C>,
     /// Stays in place after the operation finishes: dropping it there would
     /// copy the whole future, so `active` tracks the state instead.
     future: Pin<Box<Option<F>>>,
@@ -165,18 +164,19 @@ pub struct Runner<C, F, M> {
 
 impl<C, F, M> Runner<C, F, M> {
     /// Boxes a new runner behind the `Resumable` trait. `make` builds the
-    /// future of one operation, usually through [`with_handle`].
+    /// future of one operation from its handle and arguments; an `async fn`
+    /// with that signature fits.
     pub fn boxed<Args, Out>(make: M) -> BoxedResumable<C, Args, Out>
     where
         C: StepContext,
-        F: Future<Output = (Co<C>, Out)>,
+        F: Future<Output = Out>,
         M: Fn(Co<C>, Args) -> F,
         Self: Send + Sync + 'static,
     {
         Box::new(Self {
             ctx: Arc::new(AtomicPtr::new(ptr::null_mut())),
-            co: None,
             make,
+            _family: PhantomData,
             future: Box::pin(None),
             active: false,
         })
@@ -186,7 +186,7 @@ impl<C, F, M> Runner<C, F, M> {
 impl<C, Args, Out, F, M> Resumable<C, Args, Out> for Runner<C, F, M>
 where
     C: StepContext,
-    F: Future<Output = (Co<C>, Out)>,
+    F: Future<Output = Out>,
     M: Fn(Co<C>, Args) -> F,
 {
     #[inline(always)]
@@ -196,10 +196,10 @@ where
 
     fn resume(&mut self, ctx: &mut C::Ctx<'_>, args: Args) -> Poll<Out> {
         if !self.active {
-            let co = self.co.take().unwrap_or_else(|| Co {
+            let co = Co {
                 ctx: Arc::clone(&self.ctx),
                 _family: PhantomData,
-            });
+            };
             self.future.as_mut().set(Some((self.make)(co, args)));
             self.active = true;
         }
@@ -212,14 +212,10 @@ where
             .store(ptr::from_mut(ctx).cast::<()>(), Ordering::Relaxed);
         let polled = future.poll(&mut Context::from_waker(Waker::noop()));
         self.ctx.store(ptr::null_mut(), Ordering::Relaxed);
-        match polled {
-            Poll::Ready((co, out)) => {
-                self.co = Some(co);
-                self.active = false;
-                Poll::Ready(out)
-            }
-            Poll::Pending => Poll::Pending,
+        if polled.is_ready() {
+            self.active = false;
         }
+        polled
     }
 
     #[inline(always)]
@@ -227,17 +223,6 @@ where
         self.future.as_mut().set(None);
         self.active = false;
     }
-}
-
-/// Runs `body` with the handle borrowed, then gives the handle back to the
-/// runner. A borrowed handle cannot leave `body`, and the runner reuses it
-/// for the next operation.
-pub async fn with_handle<C, Args, Out, B>(mut co: Co<C>, args: Args, body: B) -> (Co<C>, Out)
-where
-    B: AsyncFnOnce(&mut Co<C>, Args) -> Out,
-{
-    let out = body(&mut co, args).await;
-    (co, out)
 }
 
 #[cfg(test)]
@@ -278,7 +263,7 @@ mod tests {
         polled.is_pending() && counter.io.take().is_some()
     }
 
-    async fn count_to(co: &mut Co<Counting>, target: usize) -> Result<usize, ()> {
+    async fn count_to(mut co: Co<Counting>, target: usize) -> Result<usize, ()> {
         let mut yields = 0;
         while co.with(|counter| counter.steps) < target {
             co.with(|counter| {
@@ -291,7 +276,7 @@ mod tests {
         Ok(yields)
     }
 
-    async fn fail_after_one_pause(co: &mut Co<Counting>, _: usize) -> Result<usize, ()> {
+    async fn fail_after_one_pause(mut co: Co<Counting>, _: usize) -> Result<usize, ()> {
         co.pause().await;
         co.with(|counter| counter.steps += 1);
         Err(())
@@ -299,7 +284,7 @@ mod tests {
 
     #[test]
     fn pauses_once_per_step_until_done() {
-        let mut runner = Runner::boxed(|co, args| with_handle(co, args, count_to));
+        let mut runner = Runner::boxed(count_to);
         let mut counter = Counter::new(0);
         assert!(!runner.is_active());
         for expected in 1..=3 {
@@ -313,7 +298,7 @@ mod tests {
 
     #[test]
     fn runner_is_reused_for_the_next_operation() {
-        let mut runner = Runner::boxed(|co, args| with_handle(co, args, count_to));
+        let mut runner = Runner::boxed(count_to);
         let mut counter = Counter::new(0);
         assert!(matches!(runner.resume(&mut counter, 0), Poll::Ready(Ok(0))));
         assert!(yields(runner.resume(&mut counter, 1), &mut counter));
@@ -325,7 +310,7 @@ mod tests {
 
     #[test]
     fn a_pause_without_io_is_pending_once() {
-        let mut runner = Runner::boxed(|co, args| with_handle(co, args, fail_after_one_pause));
+        let mut runner = Runner::boxed(fail_after_one_pause);
         let mut counter = Counter::new(0);
         assert!(runner.resume(&mut counter, 0).is_pending());
         assert!(counter.io.is_none());
@@ -340,7 +325,7 @@ mod tests {
 
     #[test]
     fn cancel_drops_a_paused_operation() {
-        let mut runner = Runner::boxed(|co, args| with_handle(co, args, count_to));
+        let mut runner = Runner::boxed(count_to);
         let mut counter = Counter::new(0);
         assert!(yields(runner.resume(&mut counter, 2), &mut counter));
         runner.cancel();
@@ -379,13 +364,13 @@ mod tests {
         }
     }
 
-    async fn count_borrowed(co: &mut Co<Borrowing>, mut target: usize) -> Result<usize, ()> {
+    async fn count_borrowed(mut co: Co<Borrowing>, mut target: usize) -> Result<usize, ()> {
         co.io(step_of(&mut target)).await
     }
 
     #[test]
     fn each_step_gets_its_own_borrowed_context() {
-        let mut runner = Runner::boxed(|co, args| with_handle(co, args, count_borrowed));
+        let mut runner = Runner::boxed(count_borrowed);
         let mut first = 0;
         let mut second = 1;
         let mut io = None;
