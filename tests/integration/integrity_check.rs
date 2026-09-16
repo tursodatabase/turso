@@ -9,13 +9,159 @@
 #[cfg(not(feature = "checksum"))]
 use asserting::prelude::*;
 
-use crate::common::TempDatabase;
+use crate::common::{ExecRows, TempDatabase};
 #[cfg(not(feature = "checksum"))]
 use std::fs::OpenOptions;
 #[cfg(not(feature = "checksum"))]
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::sync::Arc;
 use turso_core::{Numeric, Value};
+
+#[test]
+fn test_integrity_check_strict_stored_types() {
+    for (ty, value, expected) in [
+        ("INT", "'abc'", "non-INT value in t.b"),
+        ("int", "'abc'", "non-INT value in t.b"),
+        ("INTEGER", "'123'", "non-INTEGER value in t.b"),
+        ("REAL", "'abc'", "non-REAL value in t.b"),
+        ("TEXT", "42", "non-TEXT value in t.b"),
+        ("BLOB", "'abc'", "non-BLOB value in t.b"),
+        ("INT", "1.5", "non-INT value in t.b"),
+        ("REAL", "42", "ok"),
+        ("ANY", "'abc'", "ok"),
+        ("INT", "NULL", "ok"),
+        ("INT NOT NULL", "NULL", "NULL value in t.b"),
+    ] {
+        check_strict_column("CREATE TABLE t(a, b)", ty, value, false, expected);
+    }
+}
+
+#[test]
+fn test_integrity_check_strict_generated_types() {
+    for (ty, value, expected) in [
+        ("INT", "'abc'", "non-INT value in t.b"),
+        ("int", "'abc'", "non-INT value in t.b"),
+        ("INT", "'123'", "ok"),
+        ("INT NOT NULL", "'abc'", "non-INT value in t.b"),
+        ("TEXT", "42", "ok"),
+        ("REAL", "42", "ok"),
+        ("ANY", "'abc'", "ok"),
+        ("INT", "NULL", "ok"),
+        ("INT NOT NULL", "NULL", "NULL value in t.b"),
+    ] {
+        check_strict_column("CREATE TABLE t(a, b AS(a))", ty, value, true, expected);
+    }
+}
+
+#[test]
+fn test_integrity_check_healthy_strict_table() {
+    let db = TempDatabase::builder()
+        .with_opts(turso_core::DatabaseOpts::new().with_generated_columns(true))
+        .build();
+    let conn = db.connect_limbo();
+    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, a ANY, b INT AS(a) NOT NULL, c REAL, d TEXT, e BLOB) STRICT").unwrap();
+    conn.execute(
+        "INSERT INTO t(a,c,d,e) VALUES ('123', 42, 'text', x'0102'), (456, 1.5, NULL, NULL)",
+    )
+    .unwrap();
+    assert_eq!(run_integrity_check(&conn), "ok");
+}
+
+#[test]
+fn test_integrity_check_strict_custom_types() {
+    for custom_types in [false, true] {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let path = temp_dir.path().join("strict_custom_types.db");
+        let opts = turso_core::DatabaseOpts::new().with_custom_types(true);
+        {
+            let db = TempDatabase::new_with_existent_with_opts(&path, opts);
+            let conn = db.connect_limbo();
+            conn.execute(
+                "CREATE TYPE cents BASE integer ENCODE value * 100 DECODE value / 100 DEFAULT 0",
+            )
+            .unwrap();
+            conn.execute("CREATE TABLE t(amount cents) STRICT").unwrap();
+            conn.execute("INSERT INTO t VALUES (5)").unwrap();
+            let rows: Vec<(i64,)> = conn.exec_rows("SELECT amount FROM t");
+            assert_eq!(rows, vec![(5,)]);
+            assert_eq!(run_integrity_check(&conn), "ok");
+            assert_eq!(run_quick_check(&conn), "ok");
+            conn.close().unwrap();
+        }
+        {
+            let db =
+                TempDatabase::new_with_existent_with_opts(&path, opts.with_custom_types(false));
+            let conn = db.connect_limbo();
+            let rows: Vec<(i64,)> = conn.exec_rows("SELECT amount FROM t");
+            assert_eq!(rows, vec![(500,)]);
+            conn.execute("UPDATE t SET amount = 'abc'").unwrap();
+            let rows: Vec<(String,)> = conn.exec_rows("SELECT amount FROM t");
+            assert_eq!(rows, vec![("abc".to_string(),)]);
+            conn.close().unwrap();
+        }
+        let db =
+            TempDatabase::new_with_existent_with_opts(&path, opts.with_custom_types(custom_types));
+        let conn = db.connect_limbo();
+        let expected = if custom_types {
+            "non-INTEGER value in t.amount"
+        } else {
+            "ok"
+        };
+        assert_eq!(run_integrity_check(&conn), expected);
+        assert_eq!(run_quick_check(&conn), expected);
+        conn.close().unwrap();
+    }
+}
+
+#[test]
+fn test_integrity_check_strict_custom_type_arrays() {
+    let db = TempDatabase::builder()
+        .with_opts(turso_core::DatabaseOpts::new().with_custom_types(true))
+        .build();
+    let conn = db.connect_limbo();
+    conn.execute("CREATE TYPE cents BASE integer ENCODE value * 100 DECODE value / 100 DEFAULT 0")
+        .unwrap();
+    conn.execute("CREATE TABLE t(amounts cents[], numbers INTEGER[]) STRICT")
+        .unwrap();
+    conn.execute("INSERT INTO t VALUES (ARRAY[5, 7], ARRAY[1, 2])")
+        .unwrap();
+    let rows: Vec<(String, String)> =
+        conn.exec_rows("SELECT typeof(amounts), typeof(numbers) FROM t");
+    assert_eq!(rows, vec![("blob".to_string(), "blob".to_string())]);
+    assert_eq!(run_integrity_check(&conn), "ok");
+    assert_eq!(run_quick_check(&conn), "ok");
+}
+
+fn check_strict_column(schema: &str, ty: &str, value: &str, generated: bool, expected: &str) {
+    let opts = turso_core::DatabaseOpts::new().with_generated_columns(true);
+    let db = TempDatabase::builder().with_opts(opts).build();
+    let conn = db.connect_limbo();
+    conn.execute(schema).unwrap();
+    let insert = if generated {
+        format!("INSERT INTO t(a) VALUES ({value})")
+    } else {
+        format!("INSERT INTO t VALUES (NULL, {value})")
+    };
+    conn.execute(insert).unwrap();
+    let generated_sql = if generated { " AS(a)" } else { "" };
+    // Turso has no writable_schema pragma. Use the same schema-write bypass as
+    // VACUUM during prepare, then execute normally so the write is committed.
+    conn.start_nested();
+    let stmt = conn.prepare(format!(
+        "UPDATE sqlite_schema SET sql = 'CREATE TABLE t(a ANY, b {ty}{generated_sql}) STRICT' WHERE name = 't'"
+    ));
+    conn.end_nested();
+    stmt.unwrap().run_ignore_rows().unwrap();
+    checkpoint_database(&conn);
+    let path = db.path.clone();
+    drop(conn);
+    drop(db);
+
+    let reopened = TempDatabase::new_with_existent_with_opts(&path, opts);
+    let conn = reopened.connect_limbo();
+    assert_eq!(run_integrity_check(&conn), expected, "{ty}, {value}");
+    assert_eq!(run_quick_check(&conn), expected, "{ty}, {value}");
+}
 
 /// Default page size
 #[cfg(not(feature = "checksum"))]
