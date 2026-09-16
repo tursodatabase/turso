@@ -5283,10 +5283,9 @@ pub enum GeneratedType {
 }
 
 impl Column {
+    #[inline]
     pub fn affinity(&self) -> Affinity {
-        self.info
-            .affinity()
-            .unwrap_or_else(|| Affinity::affinity(&self.ty_str))
+        self.info.affinity()
     }
 
     pub fn new_default_text(
@@ -7573,6 +7572,39 @@ mod tests {
             );
         }
     }
+
+    #[test]
+    fn column_metadata_changes_preserve_affinity() {
+        for affinity in [
+            Affinity::Blob,
+            Affinity::Text,
+            Affinity::Numeric,
+            Affinity::Integer,
+            Affinity::Real,
+            Affinity::None,
+        ] {
+            let mut col = Column::new(
+                Some("x".to_string()),
+                "BLOB".to_string(),
+                None,
+                None,
+                Type::Blob,
+                None,
+                ColDef::default(),
+            );
+            col.override_affinity(affinity);
+            for enabled in [true, false] {
+                col.set_rowid_alias(enabled);
+                col.set_notnull(enabled);
+                col.set_unique(enabled);
+                col.set_hidden(enabled);
+                col.set_ty(if enabled { Type::Real } else { Type::Null });
+                col.set_collation(enabled.then_some(CollationSeq::NoCase));
+                col.set_array_dimensions(if enabled { 7 } else { 0 });
+                assert_eq!(col.affinity(), affinity);
+            }
+        }
+    }
 }
 
 mod column_info {
@@ -7746,9 +7778,9 @@ mod column_info {
         }
 
         #[inline]
-        pub fn affinity(&self) -> Option<Affinity> {
+        pub fn affinity(&self) -> Affinity {
             let v = (self.0 & BASE_AFF_MASK) >> BASE_AFF_SHIFT;
-            Affinity::from_repr(v)
+            Affinity::from_repr(v).expect("column affinity must be initialized")
         }
 
         #[inline]
