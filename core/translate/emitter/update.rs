@@ -1544,6 +1544,7 @@ fn emit_update_insns<'a>(
     let has_returning = returning.as_ref().is_some_and(|r| !r.is_empty());
     if let Table::BTree(ref btree) = target_table.table {
         if btree.is_strict {
+            // pre-encode typecheck for updated columns
             program.emit_insn(Insn::TypeCheck {
                 start_reg: start,
                 count: layout.num_non_virtual_cols(),
@@ -1579,6 +1580,7 @@ fn emit_update_insns<'a>(
                 .is_some_and(expr_references_virtual)
         });
 
+        // compute virtual columns pre-encoding, so that we can type-check them later
         if btree.is_strict
             || update_affects_virtual_columns
             || has_before_triggers
@@ -1683,8 +1685,7 @@ fn emit_update_insns<'a>(
     // This ensures that if a constraint fails, indexes remain consistent.
     if let Some(btree_table) = target_table.table.btree() {
         if btree_table.is_strict {
-            // Encode only SET clause columns. Non-SET columns were read from disk
-            // and are already encoded; re-encoding them would corrupt data.
+            // Encode updated columns (the others are already encoded)
             crate::translate::expr::emit_custom_type_encode_columns(
                 program,
                 &t_ctx.resolver,
@@ -1699,6 +1700,7 @@ fn emit_update_insns<'a>(
             program.emit_insn(Insn::TypeCheck {
                 start_reg: start,
                 count: btree_table.columns().len(),
+                //TODO we should only type-check the generated columns whose dependencies were updated.
                 check_generated: true,
                 table_reference: BTreeTable::type_check_table_ref(
                     &btree_table,

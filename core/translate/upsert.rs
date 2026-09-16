@@ -713,9 +713,27 @@ pub fn emit_upsert(
         }
     }
 
+    if let Some(bt) = table.btree() {
+        if bt.is_strict {
+            // Pre-encode TypeCheck: all columns are decoded (user-facing) at this point.
+            // We need to do this before regenerating virtual columns, because TypeCheck applies
+            // affinity in-place to its registers, which could affect virtual columns.
+            program.emit_insn(Insn::TypeCheck {
+                start_reg: new_start,
+                count: layout.num_non_virtual_cols(),
+                check_generated: false,
+                table_reference: BTreeTable::input_type_check_table_ref(
+                    &bt,
+                    resolver.schema(),
+                    None,
+                )?,
+            });
+        }
+    }
+
     // Recompute virtual columns for the new row after SET clauses have modified base columns.
     // This must happen before CHECK constraints, triggers, and index updates.
-    if ctx.table.has_virtual_columns() {
+    if ctx.table.has_virtual_columns {
         let rowid_reg = new_rowid_reg.unwrap_or(ctx.conflict_rowid_reg);
         let dml_ctx =
             DmlColumnContext::layout(ctx.table.columns(), new_start, rowid_reg, layout.clone());
@@ -730,27 +748,6 @@ pub fn emit_upsert(
 
     if let Some(bt) = table.btree() {
         if bt.is_strict {
-            // Pre-encode TypeCheck: all columns are decoded (user-facing) at this point.
-            program.emit_insn(Insn::TypeCheck {
-                start_reg: new_start,
-                count: layout.num_non_virtual_cols(),
-                check_generated: false,
-                table_reference: BTreeTable::input_type_check_table_ref(
-                    &bt,
-                    resolver.schema(),
-                    None,
-                )?,
-            });
-
-            // Generated expressions must see base values after STRICT affinity coercion.
-            let dml_ctx = DmlColumnContext::layout(
-                bt.columns(),
-                new_start,
-                new_rowid_reg.unwrap_or(ctx.conflict_rowid_reg),
-                layout.clone(),
-            );
-            compute_virtual_columns(program, &bt.columns_topo_sort()?, &dml_ctx, resolver, &bt)?;
-
             // Encode ALL columns. Both non-SET columns (decoded from disk above)
             // and SET columns (user-facing values from expressions) need encoding
             // before being written to disk.

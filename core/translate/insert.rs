@@ -643,15 +643,13 @@ pub fn translate_insert(
     program.preassign_label_to_next_insn(ctx.key_labels.key_ready_for_check);
 
     //TODO building the type-check table is expensive, we should cache it somehow.
-    let storage_type_check_table = ctx
+    let maybe_type_check_table = ctx
         .table
         .is_strict
         .then(|| BTreeTable::type_check_table_ref(ctx.table, resolver.schema()));
-    if let Some(table_reference) = &storage_type_check_table {
-        // Pre-encode TypeCheck: validate input types match the custom type's
-        // declared value type BEFORE encoding. This catches type mismatches
-        // (e.g. TEXT into an INTEGER-based custom type) that would otherwise
-        // be silently converted by the encode expression.
+    if let Some(type_check_table) = &maybe_type_check_table {
+        // Pre-encoding TypeCheck: validate input types match the custom type's declared value type
+        // to catch things like a TEXT value inserted into an INTEGER-based custom type.
         program.emit_insn(Insn::TypeCheck {
             start_reg: insertion.first_col_register(),
             count: insertion.num_non_virtual_cols,
@@ -666,13 +664,14 @@ pub fn translate_insert(
         // Encode values for columns with custom types.
         emit_custom_type_encode(program, resolver, &insertion, &ctx.table.name)?;
 
-        // Post-encode TypeCheck: validate that encode produced the correct
-        // storage type (BASE).
+        // Post-encode TypeCheck: validate that encode produced the correct storage type (BASE).
+        // We don't check generated columns in this initial pass because their dependencies could
+        // still be REPLACEd.
         program.emit_insn(Insn::TypeCheck {
             start_reg: insertion.first_col_register(),
             count: insertion.num_non_virtual_cols,
             check_generated: false,
-            table_reference: Arc::clone(table_reference),
+            table_reference: Arc::clone(type_check_table),
         });
     }
     // Non-STRICT tables: Affinity was already emitted earlier (before BEFORE triggers).
@@ -805,12 +804,14 @@ pub fn translate_insert(
             &btree_table,
         )?;
 
-        if let Some(table_reference) = storage_type_check_table {
+        if let Some(type_check_table) = maybe_type_check_table {
             program.emit_insn(Insn::TypeCheck {
                 start_reg: insertion.first_col_register(),
                 count: ctx.table.columns().len(),
+                //TODO here we could eventually type-check only virtual columns and the stored
+                // columns that have NOT NULL REPLACE.
                 check_generated: true,
-                table_reference,
+                table_reference: type_check_table,
             });
         }
 
