@@ -1,0 +1,20 @@
+@database :memory:
+
+@cross-check-integrity
+test materialized-subquery-preserves-duplicate-rows {
+    CREATE TABLE t1(id INTEGER PRIMARY KEY, d INT);
+    CREATE TABLE t2(id INTEGER PRIMARY KEY, a INT, b INT, c INT, d INT);
+    INSERT INTO t1 VALUES (1, -5), (2, -5);
+    INSERT INTO t2 VALUES (10, 1, NULL, NULL, -5), (11, 1, NULL, NULL, -5);
+    SELECT sub_t1.id, sub_t2.a
+        FROM (SELECT * FROM t1) AS sub_t1
+        JOIN (SELECT a, b, c, d, c + d AS cd FROM t2) AS sub_t2
+            ON sub_t1.d = sub_t2.d
+        ORDER BY sub_t1.id, sub_t2.a;
+}
+expect {
+    1|1
+    1|1
+    2|1
+    2|1
+}
