@@ -1920,7 +1920,7 @@ pub fn op_column(
         }
         return Ok(result);
     }
-    op_column_deferred(program, state, insn, *cursor_id)
+    op_column_deferred(program, state, insn)
 }
 
 // Not in test builds: inline(always) makes fn-item coercions produce
@@ -1950,7 +1950,7 @@ pub fn op_column_range(
         }
         return Ok(result);
     }
-    op_column_deferred(program, state, insn, *cursor_id)
+    op_column_deferred(program, state, insn)
 }
 
 /// What a Column-family instruction fetches once the cursor is positioned.
@@ -2003,62 +2003,93 @@ impl ColumnFetch<'_> {
 /// Column when a deferred seek is pending or the fetch was suspended for
 /// IO inside the seek: drives the op-state machine to completion.
 #[inline(never)]
-fn op_column_deferred(
+fn op_column_deferred(program: &Program, state: &mut ProgramState, insn: &Insn) -> InsnResult {
+    step_async_op(program, state, insn, AsyncOp::ColumnDeferred)
+}
+
+/// The opcodes that run as async functions, with the async function of
+/// each. Every one has a slot in the program state that keeps its boxed
+/// future between steps and reuses it for the next operation.
+macro_rules! async_ops {
+    ($($op:ident => $slot:ident: $body:path,)+) => {
+        #[repr(u8)]
+        #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+        pub(crate) enum AsyncOp {
+            $($op,)+
+        }
+
+        impl AsyncOp {
+            /// Boxes the runner of this opcode. Runs once per program state
+            /// and opcode, on the first step.
+            pub(super) fn new_runner(self) -> VdbeOp {
+                match self {
+                    $(AsyncOp::$op => VdbeOp(Runner::boxed(|co, ()| {
+                        with_handle(co, (), async |co, ()| $body(co).await)
+                    })),)+
+                }
+            }
+        }
+
+        #[derive(Debug, Default)]
+        pub(crate) struct AsyncOpSlots {
+            $($slot: Option<VdbeOp>,)+
+        }
+
+        impl AsyncOpSlots {
+            pub(super) fn slot(&mut self, op: AsyncOp) -> &mut Option<VdbeOp> {
+                match op {
+                    $(AsyncOp::$op => &mut self.$slot,)+
+                }
+            }
+        }
+    };
+}
+
+async_ops! {
+    ColumnDeferred => column_deferred: column_deferred,
+}
+
+/// Runs one step of the async opcode `op`: starts it when none is suspended
+/// and resumes it otherwise. The async function sets the program counter
+/// before it finishes, so a finished step only reports `Step`.
+#[inline(always)]
+pub(crate) fn step_async_op(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    cursor_id: usize,
+    op: AsyncOp,
 ) -> InsnResult {
-    let mut op = state.active_op_state.take_column_deferred();
-    let result = op.resume(
-        VdbeCtx {
-            program,
-            state,
-            insn,
-            err: None,
-        },
-        cursor_id,
-    );
-    let active = op.is_active();
-    state.active_op_state.put_column_deferred(op, active);
+    let mut runner = state.active_op_state.take_async(op);
+    let mut ctx = VdbeCtx {
+        program,
+        state,
+        insn,
+        err: None,
+    };
+    let result = runner.0.resume(&mut ctx, ());
+    let active = runner.0.is_active();
+    state.active_op_state.put_async(op, runner, active);
     match result? {
-        IOResult::Done(()) => {
-            state.pc += 1;
-            Ok(InsnFunctionStepResult::Step)
-        }
+        IOResult::Done(()) => Ok(InsnFunctionStepResult::Step),
         IOResult::IO(io) => Ok(state.suspend_on_io(io)),
     }
 }
 
-/// The async Column operation, boxed once per program state and reused.
-pub(crate) struct ColumnDeferredOp(BoxedResumable<VdbeStep, usize, ()>);
+/// The runner of one async opcode, boxed once per program state and reused.
+pub(crate) struct VdbeOp(BoxedResumable<VdbeStep, (), ()>);
 
-impl ColumnDeferredOp {
-    pub(crate) fn new() -> Self {
-        Self(Runner::boxed(|co, cursor_id| {
-            with_handle(co, cursor_id, column_deferred)
-        }))
-    }
-
-    fn is_active(&self) -> bool {
-        self.0.is_active()
-    }
-
-    fn resume(&mut self, mut ctx: VdbeCtx<'_>, cursor_id: usize) -> IOResultOr<()> {
-        self.0.resume(&mut ctx, cursor_id)
-    }
-
+impl VdbeOp {
     pub(crate) fn cancel(&mut self) {
         self.0.cancel();
     }
 }
 
-impl std::fmt::Debug for ColumnDeferredOp {
+impl std::fmt::Debug for VdbeOp {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(if self.is_active() {
-            "ColumnDeferredOp(active)"
+        f.write_str(if self.0.is_active() {
+            "VdbeOp(active)"
         } else {
-            "ColumnDeferredOp(idle)"
+            "VdbeOp(idle)"
         })
     }
 }
@@ -2101,13 +2132,17 @@ impl YieldSlot<Box<LimboError>> for VdbeCtx<'_> {
 
 /// Column when a deferred seek is pending or the fetch was suspended for IO:
 /// reads the rowid from the index cursor, seeks the table cursor, fetches.
-async fn column_deferred(co: &mut Co<VdbeStep>, cursor_id: usize) -> Result<(), Box<LimboError>> {
+async fn column_deferred(co: &mut Co<VdbeStep>) -> Result<(), Box<LimboError>> {
+    let cursor_id = co.with(|ctx| column_cursor_of(ctx.insn));
     if let Some(deferred) = co.with(|ctx| ctx.state.deferred_seeks[cursor_id].take()) {
         let rowid = co
             .io(|ctx| index_cursor_rowid(ctx.state, deferred.index_cursor_id))
             .await;
         let Some(rowid) = rowid else {
-            co.with(|ctx| column_fetch_of(ctx.insn).write_null_regs(ctx.state));
+            co.with(|ctx| {
+                column_fetch_of(ctx.insn).write_null_regs(ctx.state);
+                ctx.state.pc += 1;
+            });
             return Ok(());
         };
         co.io(|ctx| seek_table_row(ctx.state, deferred.table_cursor_id, rowid))
@@ -2149,8 +2184,9 @@ fn seek_table_row(
     }
 }
 
-/// Runs the fetch of a Column-family instruction. A fetch parks its
-/// completion in the program state, so this takes it out again for the yield.
+/// Runs the fetch of a Column-family instruction and moves to the next
+/// instruction when it is done. A fetch parks its completion in the program
+/// state, so this takes it out again for the yield.
 #[inline(always)]
 fn fetch_columns(
     program: &Program,
@@ -2159,14 +2195,19 @@ fn fetch_columns(
     cursor_id: usize,
 ) -> IOResultOr<()> {
     match column_fetch_of(insn).fetch(program, state, cursor_id)? {
-        InsnFunctionStepResult::IO => {
-            let io = state
-                .io_completions
-                .take()
-                .expect("an IO step parks a completion");
-            Ok(IOResult::IO(io))
+        InsnFunctionStepResult::IO => Ok(IOResult::IO(state.take_suspended_io())),
+        _ => {
+            state.pc += 1;
+            Ok(IOResult::Done(()))
         }
-        _ => Ok(IOResult::Done(())),
+    }
+}
+
+#[inline(always)]
+fn column_cursor_of(insn: &Insn) -> usize {
+    match insn {
+        Insn::Column { cursor_id, .. } | Insn::ColumnRange { cursor_id, .. } => *cursor_id,
+        _ => unreachable!("column_deferred runs only for Column and ColumnRange"),
     }
 }
 

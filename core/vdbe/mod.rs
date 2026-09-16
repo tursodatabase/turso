@@ -55,10 +55,11 @@ use crate::{
     types::{IOCompletions, IOResult},
     vdbe::{
         execute::{
-            OpAttachState, OpClearBtreeState, OpDeleteState, OpDeleteSubState, OpDestroyState,
-            OpIdxInsertState, OpInitCdcVersionState, OpInsertState, OpInsertSubState,
-            OpJournalModeState, OpNewRowidState, OpNoConflictState, OpParseSchemaState,
-            OpProgramState, OpRowIdState, OpSeekState, OpTransactionState, VacuumIntoOpContext,
+            AsyncOp, AsyncOpSlots, OpAttachState, OpClearBtreeState, OpDeleteState,
+            OpDeleteSubState, OpDestroyState, OpIdxInsertState, OpInitCdcVersionState,
+            OpInsertState, OpInsertSubState, OpJournalModeState, OpNewRowidState,
+            OpNoConflictState, OpParseSchemaState, OpProgramState, OpRowIdState, OpSeekState,
+            OpTransactionState, VacuumIntoOpContext,
         },
         hash_table::HashTable,
         metrics::StatementMetrics,
@@ -616,7 +617,9 @@ enum ActiveOpState {
     IdxInsert(OpIdxInsertState),
     Insert(OpInsertState),
     NoConflict(OpNoConflictState),
-    ColumnDeferred,
+    /// An async opcode is suspended. Its future lives in the slot of
+    /// [`AsyncOpSlots`] for this opcode.
+    Async(AsyncOp),
     RowId(OpRowIdState),
     Transaction(OpTransactionState),
     Attach(OpAttachState),
@@ -642,7 +645,7 @@ impl std::fmt::Debug for ActiveOpState {
             ActiveOpState::IdxInsert(_) => "IdxInsert",
             ActiveOpState::Insert(_) => "Insert",
             ActiveOpState::NoConflict(_) => "NoConflict",
-            ActiveOpState::ColumnDeferred => "ColumnDeferred",
+            ActiveOpState::Async(op) => return write!(f, "{op:?}"),
             ActiveOpState::RowId(_) => "RowId",
             ActiveOpState::Transaction(_) => "Transaction",
             ActiveOpState::Attach(_) => "Attach",
@@ -659,7 +662,7 @@ impl std::fmt::Debug for ActiveOpState {
 #[derive(Debug, Default)]
 struct ActiveOpStateSlot {
     state: ActiveOpState,
-    column_deferred: Option<execute::ColumnDeferredOp>,
+    async_ops: AsyncOpSlots,
 }
 
 macro_rules! active_state_accessor {
@@ -695,9 +698,9 @@ impl ActiveOpStateSlot {
     fn clear(&mut self) {
         match self.state {
             ActiveOpState::None => {}
-            ActiveOpState::ColumnDeferred => {
-                if let Some(op) = &mut self.column_deferred {
-                    op.cancel();
+            ActiveOpState::Async(op) => {
+                if let Some(runner) = self.async_ops.slot(op) {
+                    runner.cancel();
                 }
                 self.state = ActiveOpState::None;
             }
@@ -705,33 +708,37 @@ impl ActiveOpStateSlot {
         }
     }
 
-    /// Takes the async Column operation out of the slot for one step. The
-    /// first call allocates it; later calls reuse it.
-    fn take_column_deferred(&mut self) -> execute::ColumnDeferredOp {
+    /// Takes the runner of the async opcode `op` out of its slot for one
+    /// step. The first step in this program state allocates it; later steps
+    /// reuse it.
+    fn take_async(&mut self, op: AsyncOp) -> execute::VdbeOp {
         assert!(
-            matches!(
-                self.state,
-                ActiveOpState::None | ActiveOpState::ColumnDeferred
-            ),
-            "active opcode state mismatch: expected ColumnDeferred, got {:?}",
+            match self.state {
+                ActiveOpState::None => true,
+                ActiveOpState::Async(active) => active == op,
+                _ => false,
+            },
+            "active opcode state mismatch: expected {op:?}, got {:?}",
             self.state
         );
-        self.column_deferred
+        self.async_ops
+            .slot(op)
             .take()
-            .unwrap_or_else(execute::ColumnDeferredOp::new)
+            .unwrap_or_else(|| op.new_runner())
     }
 
-    /// Puts the async Column operation back after a step. `active` is true
-    /// when the step yielded for I/O, so the next Column resumes it.
-    fn put_column_deferred(&mut self, op: execute::ColumnDeferredOp, active: bool) {
-        debug_assert!(self.column_deferred.is_none());
-        std::mem::forget(self.column_deferred.replace(op));
+    /// Puts the runner of `op` back after a step. `active` is true when the
+    /// step suspended, so the next step of the same opcode resumes it.
+    fn put_async(&mut self, op: AsyncOp, runner: execute::VdbeOp, active: bool) {
+        let slot = self.async_ops.slot(op);
+        debug_assert!(slot.is_none());
+        std::mem::forget(slot.replace(runner));
         let state = if active {
-            ActiveOpState::ColumnDeferred
+            ActiveOpState::Async(op)
         } else {
             ActiveOpState::None
         };
-        // The old state is None or ColumnDeferred; neither owns anything.
+        // The old state is None or Async; neither owns anything.
         std::mem::forget(std::mem::replace(&mut self.state, state));
     }
 
