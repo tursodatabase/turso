@@ -1245,7 +1245,7 @@ pub fn try_hash_join_access_method(
     probe_constraints: &TableConstraints,
     where_clause: &mut [WhereTerm],
     equal_terms: impl Iterator<Item = (usize, TableInternalId, TableInternalId)>,
-    build_base_cardinality: f64,
+    max_distinct_build_keys: f64,
     build_cardinality: f64,
     probe_cardinality: f64,
     probe_multiplier: f64,
@@ -1470,7 +1470,7 @@ pub fn try_hash_join_access_method(
         &join_keys,
         where_clause,
     ) {
-        probe_cardinality / build_base_cardinality.max(1.0)
+        probe_cardinality / max_distinct_build_keys.max(1.0)
     } else {
         probe_cardinality * join_selectivity
     };

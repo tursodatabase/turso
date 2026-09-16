@@ -25,8 +25,9 @@ use crate::{
                 AccessMethodParams,
             },
             cost::{
-                estimate_rows_per_seek, rows_per_leaf_page_for_index, where_expr_steps, AnalyzeCtx,
-                Cost, IndexInfo, RowCountEstimate,
+                estimate_rows_per_seek, index_access_is_unique_point_lookup,
+                rows_per_leaf_page_for_index, where_expr_steps, AnalyzeCtx, Cost, IndexInfo,
+                RowCountEstimate,
             },
             order::plan_satisfies_order_target,
         },
@@ -782,6 +783,25 @@ fn join_lhs_and_rhs<'a>(
                 build_access_method.map(|method| &method.params),
                 Some(AccessMethodParams::InSeek { .. })
             );
+            let build_read_is_unique_point_lookup = build_access_method.is_some_and(|method| {
+                matches!(
+                    &method.params,
+                    AccessMethodParams::BTreeTable {
+                        index,
+                        build_index: false,
+                        constraint_refs,
+                        ..
+                    } if index_access_is_unique_point_lookup(index.as_deref(), constraint_refs)
+                )
+            });
+            // A joined prefix can reach the same unique row more than once.
+            // Do not assume that it has more distinct keys than prefix rows.
+            let max_distinct_build_keys = if lhs.data.len() > 1 && build_read_is_unique_point_lookup
+            {
+                input_cardinality.min(*build_base_rows)
+            } else {
+                *build_base_rows
+            };
             let hash_can_replace_build_index =
                 can_replace_build_index_with_hash(rhs_constraints, build_read_is_in_seek);
 
@@ -826,7 +846,7 @@ fn join_lhs_and_rhs<'a>(
                             .is_none_or(|owner| owner == rhs_table_reference.internal_id)
                             .then_some((index, left, right))
                     }),
-                    *build_base_rows,
+                    max_distinct_build_keys,
                     build_cardinality,
                     probe_cardinality,
                     probe_multiplier,
