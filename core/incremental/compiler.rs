@@ -5,12 +5,13 @@
 //!
 //! Based on the DBSP paper: "DBSP: Automatic Incremental View Maintenance for Rich Query Languages"
 
+use crate::coro::{with_handle, Co, Runner, StepContext, YieldSlot};
 use crate::incremental::aggregate_operator::AggregateOperator;
 use crate::incremental::dbsp::{Delta, DeltaPair};
 use crate::incremental::expr_compiler::CompiledExpression;
 use crate::incremental::operator::{
     create_dbsp_state_index, DbspStateCursors, EvalState, FilterOperator, FilterPredicate,
-    IncrementalOperator, InputOperator, JoinOperator, JoinType, ProjectOperator,
+    IncrementalOperator, InputOperator, JoinOperator, JoinType, OpRunner, ProjectOperator,
 };
 use crate::schema::Type;
 use crate::storage::btree::{BTreeCursor, BTreeKey, CursorTrait};
@@ -23,193 +24,65 @@ use crate::translate::logical::{
     BinaryOperator, Column, ColumnInfo, JoinType as LogicalJoinType, LogicalExpr, LogicalPlan,
     LogicalSchema, SchemaRef,
 };
-use crate::types::{IOResult, ImmutableRecord, SeekKey, SeekOp, SeekResult, Value};
+use crate::types::{IOCompletions, IOResult, ImmutableRecord, SeekKey, SeekOp, SeekResult, Value};
 use crate::Pager;
-use crate::{return_and_restore_if_io, return_if_io, LimboError, Result};
+use crate::{return_if_io, LimboError, Result};
 use rustc_hash::FxHashMap as HashMap;
 use std::fmt::{self, Display, Formatter};
 
 // The state table has 5 columns: operator_id, zset_id, element_id, value, weight
 const OPERATOR_COLUMNS: usize = 5;
 
-/// State machine for writing rows to simple materialized views (table-only, no index)
-///
-/// Each arm issues exactly one cursor op and advances only after it returns `Done`:
-/// `IOResult::IO` means "call me again", so advancing first abandons an in-flight
-/// balance. The seek therefore gets its own arm.
+/// Names [`CircuitCtx`] as the context type of the async circuit
+/// operations.
+pub struct CircuitStep;
+
+impl StepContext for CircuitStep {
+    type Error = Box<LimboError>;
+    type Ctx<'a> = CircuitCtx<'a>;
+}
+
+/// The context of one step of a circuit operation: the circuit, and the
+/// slot for what suspends the step.
+pub struct CircuitCtx<'a> {
+    circuit: &'a mut DbspCircuit,
+    io: Option<IOCompletions>,
+    err: Option<Box<LimboError>>,
+}
+
+impl YieldSlot<Box<LimboError>> for CircuitCtx<'_> {
+    fn park_io(&mut self, io: IOCompletions) {
+        self.io = Some(io);
+    }
+
+    fn take_io(&mut self) -> Option<IOCompletions> {
+        self.io.take()
+    }
+
+    fn park_err(&mut self, err: Box<LimboError>) {
+        self.err = Some(err);
+    }
+
+    fn take_err(&mut self) -> Option<Box<LimboError>> {
+        self.err.take()
+    }
+}
+
+/// A run of the circuit on input deltas as a step function.
+pub type ExecuteOp = OpRunner<CircuitStep, (Arc<Pager>, DeltaSet), Delta>;
+
+/// A commit of input deltas to the circuit as a step function.
+type CommitOp = OpRunner<CircuitStep, (Arc<Pager>, DeltaSet), Delta>;
+
+/// The runners of the circuit operations, boxed on first use and reused.
 #[derive(Debug, Default)]
-pub enum WriteRowView {
-    #[default]
-    GetRecord,
-    Delete,
-    Insert {
-        final_weight: isize,
-    },
-    InsertRow {
-        final_weight: isize,
-    },
-    Done,
+struct CircuitOps {
+    execute: Option<ExecuteOp>,
+    commit: Option<CommitOp>,
 }
 
-impl WriteRowView {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    /// Write a row with weight management for table-only storage.
-    ///
-    /// # Arguments
-    /// * `cursor` - BTree cursor for the storage
-    /// * `key` - The key to seek (TableRowId)
-    /// * `build_record` - Function that builds the record values to insert.
-    ///   Takes the final_weight and returns the complete record values.
-    /// * `weight` - The weight delta to apply
-    pub fn write_row(
-        &mut self,
-        cursor: &mut BTreeCursor,
-        key: SeekKey,
-        build_record: impl Fn(isize) -> Vec<Value>,
-        weight: isize,
-    ) -> IOResultOr<()> {
-        loop {
-            match self {
-                WriteRowView::GetRecord => {
-                    let res = return_if_io!(cursor.seek(key.clone(), SeekOp::GE { eq_only: true }));
-                    if !matches!(res, SeekResult::Found) {
-                        *self = WriteRowView::Insert {
-                            final_weight: weight,
-                        };
-                    } else {
-                        let existing_record = return_if_io!(cursor.record());
-                        let r = existing_record.ok_or_else(|| {
-                            LimboError::InternalError(format!(
-                                "Found key {key:?} in storage but could not read record"
-                            ))
-                        })?;
-                        let last = r.iter()?.last();
-
-                        // Weight is always the last value
-                        let existing_weight = match last {
-                            Some(val) => match val?.to_owned()? {
-                                Value::Numeric(Numeric::Integer(w)) => w as isize,
-                                _ => {
-                                    return Err(LimboError::InternalError(format!(
-                                        "Invalid weight value in storage for key {key:?}"
-                                    ))
-                                    .into())
-                                }
-                            },
-                            None => {
-                                return Err(LimboError::InternalError(format!(
-                                    "No weight value found in storage for key {key:?}"
-                                ))
-                                .into())
-                            }
-                        };
-
-                        let final_weight = existing_weight + weight;
-                        if final_weight <= 0 {
-                            *self = WriteRowView::Delete
-                        } else {
-                            *self = WriteRowView::Insert { final_weight }
-                        }
-                    }
-                }
-                WriteRowView::Delete => {
-                    return_if_io!(cursor.delete());
-                    *self = WriteRowView::Done;
-                }
-                WriteRowView::Insert { final_weight } => {
-                    return_if_io!(cursor.seek(key.clone(), SeekOp::GE { eq_only: true }));
-                    *self = WriteRowView::InsertRow {
-                        final_weight: *final_weight,
-                    };
-                }
-                WriteRowView::InsertRow { final_weight } => {
-                    // Extract the row ID from the key
-                    let key_i64 = match key {
-                        SeekKey::TableRowId(id) => id,
-                        _ => {
-                            return Err(LimboError::InternalError(
-                                "Expected TableRowId for storage".to_string(),
-                            )
-                            .into())
-                        }
-                    };
-
-                    // Build the record values using the provided function
-                    let record_values = build_record(*final_weight);
-
-                    // Create an ImmutableRecord from the values
-                    let immutable_record =
-                        ImmutableRecord::from_values(&record_values, record_values.len())?;
-                    let btree_key = BTreeKey::new_table_rowid(key_i64, Some(&immutable_record));
-
-                    return_if_io!(cursor.insert(&btree_key));
-                    *self = WriteRowView::Done;
-                }
-                WriteRowView::Done => {
-                    return Ok(IOResult::Done(()));
-                }
-            }
-        }
-    }
-}
-
-/// State machine for commit operations
-pub enum CommitState {
-    /// Initial state - ready to start commit
-    Init,
-
-    /// Running circuit with commit_operators flag set to true
-    CommitOperators {
-        /// Execute state for running the circuit
-        execute_state: Box<ExecuteState>,
-        /// Persistent cursors for operator state (table and index)
-        state_cursors: Box<DbspStateCursors>,
-    },
-
-    /// Updating the materialized view with the delta
-    UpdateView {
-        /// Delta to write to the view
-        delta: Delta,
-        /// Current index in delta.changes being processed
-        current_index: usize,
-        /// State for writing individual rows
-        write_row_state: WriteRowView,
-        /// Cursor for view data btree - created fresh for each row
-        view_cursor: Box<BTreeCursor>,
-    },
-}
-
-impl std::fmt::Debug for CommitState {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Init => write!(f, "Init"),
-            Self::CommitOperators { execute_state, .. } => f
-                .debug_struct("CommitOperators")
-                .field("execute_state", execute_state)
-                .field("has_state_table_cursor", &true)
-                .field("has_state_index_cursor", &true)
-                .finish(),
-            Self::UpdateView {
-                delta,
-                current_index,
-                write_row_state,
-                ..
-            } => f
-                .debug_struct("UpdateView")
-                .field("delta", delta)
-                .field("current_index", current_index)
-                .field("write_row_state", write_row_state)
-                .field("has_view_cursor", &true)
-                .finish(),
-        }
-    }
-}
-
-/// State machine for circuit execution across I/O operations
-/// Similar to EvalState but for tracking execution state through the circuit
+/// The state of a run of the circuit, owned by the caller so that runs
+/// from different cursors do not share it.
 #[derive(Debug)]
 pub enum ExecuteState {
     /// Empty state so we can allocate the space without executing
@@ -221,21 +94,11 @@ pub enum ExecuteState {
         input_data: DeltaSet,
     },
 
-    /// Processing multiple inputs (for recursive node processing)
-    ProcessingInputs {
-        /// Collection of (node_id, state) pairs to process
-        input_states: Vec<(i64, ExecuteState)>,
-        /// Current index being processed
-        current_index: usize,
-        /// Collected deltas from processed inputs
-        input_deltas: Vec<Delta>,
-    },
+    /// A run that waits for I/O.
+    Running(ExecuteOp),
 
-    /// Processing a specific node in the circuit
-    ProcessingNode {
-        /// Node's evaluation state (includes the delta in its Init state)
-        eval_state: Box<EvalState>,
-    },
+    /// The run is over. A new run starts from `Init`.
+    Done,
 }
 
 /// A set of deltas for multiple tables/operators
@@ -364,34 +227,6 @@ impl std::fmt::Debug for DbspNode {
     }
 }
 
-impl DbspNode {
-    fn process_node(
-        &mut self,
-        eval_state: &mut EvalState,
-        commit_operators: bool,
-        cursors: &mut DbspStateCursors,
-    ) -> IOResultOr<Delta> {
-        // Process delta using the executable operator
-        let op = &mut self.executable;
-
-        let state = if commit_operators {
-            // Clone the deltas from eval_state - don't extract them
-            // in case we need to re-execute due to I/O
-            let deltas = match eval_state {
-                EvalState::Init { deltas } => deltas.clone(),
-                _ => panic!("commit can only be called when eval_state is in Init state"),
-            };
-            let result = return_if_io!(op.commit(deltas, cursors));
-            // After successful commit, move state to Done
-            *eval_state = EvalState::Done;
-            result
-        } else {
-            return_if_io!(op.eval(eval_state, cursors))
-        };
-        Ok(IOResult::Done(state))
-    }
-}
-
 /// Version number for the DBSP circuit format
 /// This should be incremented when the circuit structure changes
 pub const DBSP_CIRCUIT_VERSION: u32 = 1;
@@ -408,8 +243,7 @@ pub struct DbspCircuit {
     /// Output schema of the circuit (schema of the root node)
     pub(super) output_schema: SchemaRef,
 
-    /// State machine for commit operation
-    commit_state: CommitState,
+    ops: CircuitOps,
 
     /// Root page for the main materialized view data
     pub(super) main_data_root: i64,
@@ -440,7 +274,7 @@ impl DbspCircuit {
             next_id: 1, // Start from 1 to reserve 0 for metadata
             root: None,
             output_schema: empty_schema,
-            commit_state: CommitState::Init,
+            ops: CircuitOps::default(),
             main_data_root,
             internal_state_root,
             internal_state_index_root,
@@ -475,53 +309,46 @@ impl DbspCircuit {
         id
     }
 
-    pub fn run_circuit(
-        &mut self,
-        execute_state: &mut ExecuteState,
-        pager: &Arc<Pager>,
-        state_cursors: &mut DbspStateCursors,
-        commit_operators: bool,
-    ) -> IOResultOr<Delta> {
-        if let Some(root_id) = self.root {
-            self.execute_node(
-                root_id,
-                pager.clone(),
-                execute_state,
-                commit_operators,
-                state_cursors,
-            )
-        } else {
-            Err(LimboError::ParseError("Circuit has no root node".to_string()).into())
-        }
-    }
-
-    /// Execute the circuit with incremental input data (deltas).
-    ///
-    /// # Arguments
-    /// * `pager` - Pager for btree access
-    /// * `context` - Execution context for tracking operator states
-    /// * `execute_state` - State machine containing input deltas and tracking execution progress
+    /// Runs the circuit on the input deltas in `execute_state` and returns
+    /// the output delta of the root, without a change to the stored state.
+    /// Starts a new run from an `Init` state and resumes a suspended one
+    /// from a `Running` state. The runner lives in the state while the run
+    /// waits for I/O, and in the circuit otherwise.
     pub fn execute(
         &mut self,
         pager: Arc<Pager>,
         execute_state: &mut ExecuteState,
     ) -> IOResultOr<Delta> {
-        if let Some(root_id) = self.root {
-            // Create temporary cursors for execute (non-commit) operations
-            let table_cursor =
-                BTreeCursor::new_table(pager.clone(), self.internal_state_root, OPERATOR_COLUMNS);
-            let index_def = create_dbsp_state_index(self.internal_state_index_root);
-            let index_cursor = BTreeCursor::new_index(
-                pager.clone(),
-                self.internal_state_index_root,
-                &index_def,
-                3,
-            )?;
-            let mut cursors = DbspStateCursors::new(table_cursor, index_cursor);
-            self.execute_node(root_id, pager, execute_state, false, &mut cursors)
-        } else {
-            Err(LimboError::ParseError("Circuit has no root node".to_string()).into())
+        if self.root.is_none() {
+            return Err(LimboError::ParseError("Circuit has no root node".to_string()).into());
         }
+        let (mut op, input_data) =
+            match std::mem::replace(execute_state, ExecuteState::Uninitialized) {
+                ExecuteState::Uninitialized => {
+                    panic!("Trying to execute an uninitialized ExecuteState state machine");
+                }
+                ExecuteState::Done => {
+                    panic!("Trying to execute a finished ExecuteState state machine");
+                }
+                ExecuteState::Init { input_data } => (
+                    self.ops.execute.take().unwrap_or_else(new_execute_runner),
+                    input_data,
+                ),
+                ExecuteState::Running(op) => (op, DeltaSet::empty()),
+            };
+        let mut ctx = CircuitCtx {
+            circuit: self,
+            io: None,
+            err: None,
+        };
+        let result = op.resume(&mut ctx, (pager, input_data));
+        if op.is_active() {
+            *execute_state = ExecuteState::Running(op);
+        } else {
+            *execute_state = ExecuteState::Done;
+            self.ops.execute = Some(op);
+        }
+        result
     }
 
     /// Commit deltas to the circuit, updating internal operator state and persisting to btree.
@@ -539,251 +366,238 @@ impl DbspCircuit {
         if self.root.is_none() {
             return Ok(IOResult::Done(Delta::new()));
         }
-
-        // Get btree root pages
-        let main_data_root = self.main_data_root;
-
-        // Add 1 for the weight column that we store in the btree
-        let num_columns = self.output_schema.columns.len() + 1;
-
-        // Convert input_data to DeltaSet once, outside the loop
-        let input_delta_set = DeltaSet::from_map(input_data);
-
-        loop {
-            // Take ownership of the state for processing, to avoid borrow checker issues (we have
-            // to call run_circuit, which takes &mut self. Because of that, cannot use
-            // return_if_io. We have to use the version that restores the state before returning.
-            let mut state = std::mem::replace(&mut self.commit_state, CommitState::Init);
-            match &mut state {
-                CommitState::Init => {
-                    // Create state cursors when entering CommitOperators state
-                    let state_table_cursor = BTreeCursor::new_table(
-                        pager.clone(),
-                        self.internal_state_root,
-                        OPERATOR_COLUMNS,
-                    );
-                    let index_def = create_dbsp_state_index(self.internal_state_index_root);
-                    let state_index_cursor = BTreeCursor::new_index(
-                        pager.clone(),
-                        self.internal_state_index_root,
-                        &index_def,
-                        3, // Index on first 3 columns
-                    )?;
-
-                    let state_cursors = Box::new(DbspStateCursors::new(
-                        state_table_cursor,
-                        state_index_cursor,
-                    ));
-
-                    self.commit_state = CommitState::CommitOperators {
-                        execute_state: Box::new(ExecuteState::Init {
-                            input_data: input_delta_set.clone(),
-                        }),
-                        state_cursors,
-                    };
-                }
-                CommitState::CommitOperators {
-                    ref mut execute_state,
-                    ref mut state_cursors,
-                } => {
-                    let delta = return_and_restore_if_io!(
-                        &mut self.commit_state,
-                        state,
-                        self.run_circuit(execute_state, &pager, state_cursors, true,)
-                    );
-
-                    // Create view cursor when entering UpdateView state
-                    let view_cursor = Box::new(BTreeCursor::new_table(
-                        pager.clone(),
-                        main_data_root,
-                        num_columns,
-                    ));
-
-                    self.commit_state = CommitState::UpdateView {
-                        delta,
-                        current_index: 0,
-                        write_row_state: WriteRowView::new(),
-                        view_cursor,
-                    };
-                }
-                CommitState::UpdateView {
-                    delta,
-                    current_index,
-                    write_row_state,
-                    view_cursor,
-                } => {
-                    if *current_index >= delta.changes.len() {
-                        self.commit_state = CommitState::Init;
-                        let delta = std::mem::take(delta);
-                        return Ok(IOResult::Done(delta));
-                    } else {
-                        let (row, weight) = delta.changes[*current_index].clone();
-
-                        // If we're starting a new row (GetRecord state), we need a fresh cursor
-                        // due to btree cursor state machine limitations
-                        if matches!(write_row_state, WriteRowView::GetRecord) {
-                            *view_cursor = Box::new(BTreeCursor::new_table(
-                                pager.clone(),
-                                main_data_root,
-                                num_columns,
-                            ));
-                        }
-
-                        // Build the view row format: row values + weight
-                        let key = SeekKey::TableRowId(row.rowid);
-                        let row_values = row.values.clone();
-                        let build_fn = move |final_weight: isize| -> Vec<Value> {
-                            let mut values = row_values.clone();
-                            values.push(Value::from_i64(final_weight as i64));
-                            values
-                        };
-
-                        return_and_restore_if_io!(
-                            &mut self.commit_state,
-                            state,
-                            write_row_state.write_row(view_cursor, key, build_fn, weight)
-                        );
-
-                        // Move to next row
-                        let delta = std::mem::take(delta);
-                        // Take ownership of view_cursor - we'll create a new one for next row if needed
-                        let view_cursor = std::mem::replace(
-                            view_cursor,
-                            Box::new(BTreeCursor::new_table(
-                                pager.clone(),
-                                main_data_root,
-                                num_columns,
-                            )),
-                        );
-
-                        self.commit_state = CommitState::UpdateView {
-                            delta,
-                            current_index: *current_index + 1,
-                            write_row_state: WriteRowView::new(),
-                            view_cursor,
-                        };
-                    }
-                }
-            }
-        }
+        let mut op = self.ops.commit.take().unwrap_or_else(new_commit_runner);
+        let mut ctx = CircuitCtx {
+            circuit: self,
+            io: None,
+            err: None,
+        };
+        let result = op.resume(&mut ctx, (pager, DeltaSet::from_map(input_data)));
+        self.ops.commit = Some(op);
+        result
     }
 
-    /// Execute a specific node in the circuit
-    fn execute_node(
-        &mut self,
-        node_id: i64,
-        pager: Arc<Pager>,
-        execute_state: &mut ExecuteState,
-        commit_operators: bool,
-        cursors: &mut DbspStateCursors,
-    ) -> IOResultOr<Delta> {
-        loop {
-            match execute_state {
-                ExecuteState::Uninitialized => {
-                    panic!("Trying to execute an uninitialized ExecuteState state machine");
-                }
-                ExecuteState::Init { input_data } => {
-                    let node = self
-                        .nodes
-                        .get(&node_id)
-                        .ok_or_else(|| LimboError::ParseError("Node not found".to_string()))?;
-
-                    // Check if this is an Input node
-                    match &node.operator {
-                        DbspOperator::Input { name, .. } => {
-                            // Input nodes get their delta directly from input_data
-                            let delta = input_data.get(name);
-                            *execute_state = ExecuteState::ProcessingNode {
-                                eval_state: Box::new(EvalState::Init {
-                                    deltas: delta.into(),
-                                }),
-                            };
-                        }
-                        _ => {
-                            // Non-input nodes need to process their inputs
-                            let input_data = std::mem::take(input_data);
-                            let input_node_ids = node.inputs.clone();
-
-                            let input_states: Vec<(i64, ExecuteState)> = input_node_ids
-                                .iter()
-                                .map(|&input_id| {
-                                    (
-                                        input_id,
-                                        ExecuteState::Init {
-                                            input_data: input_data.clone(),
-                                        },
-                                    )
-                                })
-                                .collect();
-
-                            *execute_state = ExecuteState::ProcessingInputs {
-                                input_states,
-                                current_index: 0,
-                                input_deltas: Vec::new(),
-                            };
-                        }
-                    }
-                }
-                ExecuteState::ProcessingInputs {
-                    input_states,
-                    current_index,
-                    input_deltas,
-                } => {
-                    if *current_index >= input_states.len() {
-                        // All inputs processed
-                        let left_delta = input_deltas.first().cloned().unwrap_or_else(Delta::new);
-                        let right_delta = input_deltas.get(1).cloned().unwrap_or_else(Delta::new);
-
-                        *execute_state = ExecuteState::ProcessingNode {
-                            eval_state: Box::new(EvalState::Init {
-                                deltas: DeltaPair::new(left_delta, right_delta),
-                            }),
-                        };
-                    } else {
-                        // Get the (node_id, state) pair for the current index
-                        let (input_node_id, input_state) = &mut input_states[*current_index];
-
-                        // Create temporary cursors for the recursive call
-                        let temp_table_cursor = BTreeCursor::new_table(
-                            pager.clone(),
-                            self.internal_state_root,
-                            OPERATOR_COLUMNS,
-                        );
-                        let index_def = create_dbsp_state_index(self.internal_state_index_root);
-                        let temp_index_cursor = BTreeCursor::new_index(
-                            pager.clone(),
-                            self.internal_state_index_root,
-                            &index_def,
-                            3,
-                        )?;
-                        let mut temp_cursors =
-                            DbspStateCursors::new(temp_table_cursor, temp_index_cursor);
-
-                        let delta = return_if_io!(self.execute_node(
-                            *input_node_id,
-                            pager.clone(),
-                            input_state,
-                            commit_operators,
-                            &mut temp_cursors
-                        ));
-                        input_deltas.push(delta);
-                        *current_index += 1;
-                    }
-                }
-                ExecuteState::ProcessingNode { eval_state } => {
-                    // Get mutable reference to node for eval
-                    let node = self
-                        .nodes
-                        .get_mut(&node_id)
-                        .ok_or_else(|| LimboError::ParseError("Node not found".to_string()))?;
-
-                    let output_delta =
-                        return_if_io!(node.process_node(eval_state, commit_operators, cursors));
-                    return Ok(IOResult::Done(output_delta));
-                }
-            }
-        }
+    /// New cursors on the DBSP state table and its index.
+    fn new_state_cursors(&self, pager: &Arc<Pager>) -> Result<DbspStateCursors> {
+        let table_cursor =
+            BTreeCursor::new_table(pager.clone(), self.internal_state_root, OPERATOR_COLUMNS);
+        let index_def = create_dbsp_state_index(self.internal_state_index_root);
+        let index_cursor =
+            BTreeCursor::new_index(pager.clone(), self.internal_state_index_root, &index_def, 3)?;
+        Ok(DbspStateCursors::new(table_cursor, index_cursor))
     }
+
+    /// Where a node gets its input: the delta of one table for an input
+    /// node, or the outputs of other nodes.
+    fn node_inputs(&self, node_id: i64) -> Result<NodeInputs> {
+        let node = self
+            .nodes
+            .get(&node_id)
+            .ok_or_else(|| LimboError::ParseError("Node not found".to_string()))?;
+        Ok(match &node.operator {
+            DbspOperator::Input { name, .. } => NodeInputs::Table(name.clone()),
+            _ => NodeInputs::Nodes(node.inputs.clone()),
+        })
+    }
+
+    fn node_mut(&mut self, node_id: i64) -> Result<&mut DbspNode> {
+        self.nodes
+            .get_mut(&node_id)
+            .ok_or_else(|| LimboError::ParseError("Node not found".to_string()))
+    }
+}
+
+/// Where a node gets its input.
+enum NodeInputs {
+    Table(String),
+    Nodes(Vec<i64>),
+}
+
+fn new_execute_runner() -> ExecuteOp {
+    OpRunner::new(Runner::boxed(|co, args| {
+        with_handle(co, args, execute_circuit)
+    }))
+}
+
+/// Runs the circuit on the input deltas with cursors of its own and
+/// returns the output delta of the root.
+async fn execute_circuit(
+    co: &mut Co<CircuitStep>,
+    (pager, input_data): (Arc<Pager>, DeltaSet),
+) -> Result<Delta, Box<LimboError>> {
+    let root_id = co
+        .with(|ctx| ctx.circuit.root)
+        .expect("execute checks that the circuit has a root");
+    let mut cursors = co.with(|ctx| ctx.circuit.new_state_cursors(&pager))?;
+    execute_node(co, root_id, pager, input_data, false, &mut cursors).await
+}
+
+fn new_commit_runner() -> CommitOp {
+    OpRunner::new(Runner::boxed(|co, args| {
+        with_handle(co, args, commit_circuit)
+    }))
+}
+
+/// Commits the input deltas: commits every operator from the leaves to
+/// the root, then writes the output delta of the root to the view.
+async fn commit_circuit(
+    co: &mut Co<CircuitStep>,
+    (pager, input_data): (Arc<Pager>, DeltaSet),
+) -> Result<Delta, Box<LimboError>> {
+    let root_id = co
+        .with(|ctx| ctx.circuit.root)
+        .expect("commit checks that the circuit has a root");
+    let mut state_cursors = co.with(|ctx| ctx.circuit.new_state_cursors(&pager))?;
+    let delta = execute_node(
+        co,
+        root_id,
+        pager.clone(),
+        input_data,
+        true,
+        &mut state_cursors,
+    )
+    .await?;
+
+    // Add 1 for the weight column that we store in the btree
+    let (main_data_root, num_columns) = co.with(|ctx| {
+        let circuit = &ctx.circuit;
+        (
+            circuit.main_data_root,
+            circuit.output_schema.columns.len() + 1,
+        )
+    });
+    for (row, weight) in &delta.changes {
+        // Each row gets a fresh cursor because of the btree cursor state machine limitations.
+        let mut view_cursor = BTreeCursor::new_table(pager.clone(), main_data_root, num_columns);
+        write_view_row(co, &mut view_cursor, row.rowid, &row.values, *weight).await?;
+    }
+    Ok(delta)
+}
+
+/// Runs one node on the input deltas: runs its input nodes first, each
+/// with cursors of its own, then evaluates the node with the deltas they
+/// return, or commits it when `commit_operators` is set.
+async fn execute_node(
+    co: &mut Co<CircuitStep>,
+    node_id: i64,
+    pager: Arc<Pager>,
+    input_data: DeltaSet,
+    commit_operators: bool,
+    cursors: &mut DbspStateCursors,
+) -> Result<Delta, Box<LimboError>> {
+    let deltas = match co.with(|ctx| ctx.circuit.node_inputs(node_id))? {
+        NodeInputs::Table(name) => input_data.get(&name).into(),
+        NodeInputs::Nodes(input_ids) => {
+            let mut input_deltas = Vec::new();
+            for input_id in input_ids {
+                let mut input_cursors = co.with(|ctx| ctx.circuit.new_state_cursors(&pager))?;
+                let delta = Box::pin(execute_node(
+                    co,
+                    input_id,
+                    pager.clone(),
+                    input_data.clone(),
+                    commit_operators,
+                    &mut input_cursors,
+                ))
+                .await?;
+                input_deltas.push(delta);
+            }
+            let left_delta = input_deltas.first().cloned().unwrap_or_else(Delta::new);
+            let right_delta = input_deltas.get(1).cloned().unwrap_or_else(Delta::new);
+            DeltaPair::new(left_delta, right_delta)
+        }
+    };
+
+    if commit_operators {
+        let output = co
+            .io(|ctx| {
+                ctx.circuit
+                    .node_mut(node_id)?
+                    .executable
+                    .commit(deltas.clone(), cursors)
+            })
+            .await;
+        Ok(output)
+    } else {
+        let mut eval_state = EvalState::Init { deltas };
+        let output = co
+            .io(|ctx| {
+                ctx.circuit
+                    .node_mut(node_id)?
+                    .executable
+                    .eval(&mut eval_state, cursors)
+            })
+            .await;
+        Ok(output)
+    }
+}
+
+/// Writes one row of a view with weight management: adds `weight` to the
+/// row under `rowid` when the row exists, deletes the row when the sum is
+/// zero or less, and inserts the row with `weight` otherwise.
+///
+/// Each cursor operation is one step, and the write moves on only after
+/// the operation returns `Done`: `IOResult::IO` means "call me again", so
+/// moving on first would abandon an in-flight balance.
+async fn write_view_row<C: StepContext<Error = Box<LimboError>>>(
+    co: &mut Co<C>,
+    cursor: &mut BTreeCursor,
+    rowid: i64,
+    row_values: &[Value],
+    weight: isize,
+) -> Result<(), Box<LimboError>> {
+    let res = co
+        .io(|_| cursor.seek(SeekKey::TableRowId(rowid), SeekOp::GE { eq_only: true }))
+        .await;
+    let final_weight = if matches!(res, SeekResult::Found) {
+        let existing_weight = co.io(|_| weight_of_view_record(cursor, rowid)).await;
+        let final_weight = existing_weight + weight;
+        if final_weight <= 0 {
+            co.io(|_| cursor.delete()).await;
+            return Ok(());
+        }
+        final_weight
+    } else {
+        weight
+    };
+
+    co.io(|_| cursor.seek(SeekKey::TableRowId(rowid), SeekOp::GE { eq_only: true }))
+        .await;
+    let mut record_values = row_values.to_vec();
+    record_values.push(Value::from_i64(final_weight as i64));
+    let immutable_record = ImmutableRecord::from_values(&record_values, record_values.len())?;
+    let btree_key = BTreeKey::new_table_rowid(rowid, Some(&immutable_record));
+    co.io(|_| cursor.insert(&btree_key)).await;
+    Ok(())
+}
+
+/// The weight of the view record the cursor is on: always the last value.
+fn weight_of_view_record(cursor: &mut BTreeCursor, rowid: i64) -> IOResultOr<isize> {
+    let key = SeekKey::TableRowId(rowid);
+    let existing_record = return_if_io!(cursor.record());
+    let r = existing_record.ok_or_else(|| {
+        LimboError::InternalError(format!(
+            "Found key {key:?} in storage but could not read record"
+        ))
+    })?;
+    let weight = match r.iter()?.last() {
+        Some(val) => match val?.to_owned()? {
+            Value::Numeric(Numeric::Integer(w)) => w as isize,
+            _ => {
+                return Err(LimboError::InternalError(format!(
+                    "Invalid weight value in storage for key {key:?}"
+                ))
+                .into())
+            }
+        },
+        None => {
+            return Err(LimboError::InternalError(format!(
+                "No weight value found in storage for key {key:?}"
+            ))
+            .into())
+        }
+    };
+    Ok(IOResult::Done(weight))
 }
 
 impl Display for DbspCircuit {
@@ -6170,7 +5984,8 @@ mod tests {
     }
 
     mod write_row_view_repoll {
-        use super::super::WriteRowView;
+        use super::super::write_view_row;
+        use crate::coro::{with_handle, BoxedResumable, Runner, StepContext, YieldSlot};
         use crate::incremental::yield_test_support::OneShotYieldInjector;
         use crate::mvcc::yield_hooks::YieldPointMarker;
         use crate::storage::btree::{
@@ -6178,9 +5993,57 @@ mod tests {
         };
         use crate::storage::pager::CreateBTreeFlags;
         use crate::sync::Arc;
-        use crate::types::{SeekKey, SeekOp, SeekResult};
+        use crate::types::{IOCompletions, SeekKey, SeekOp, SeekResult};
         use crate::util::IOExt;
-        use crate::{Connection, Database, MemoryIO, SqliteDialect, Value, IO};
+        use crate::{Connection, Database, LimboError, MemoryIO, SqliteDialect, Value, IO};
+
+        /// A step context with nothing but the yield slot: the row write
+        /// gets its cursor as an argument.
+        struct RowStep;
+
+        impl StepContext for RowStep {
+            type Error = Box<LimboError>;
+            type Ctx<'a> = RowCtx;
+        }
+
+        struct RowCtx {
+            io: Option<IOCompletions>,
+            err: Option<Box<LimboError>>,
+        }
+
+        impl YieldSlot<Box<LimboError>> for RowCtx {
+            fn park_io(&mut self, io: IOCompletions) {
+                self.io = Some(io);
+            }
+
+            fn take_io(&mut self) -> Option<IOCompletions> {
+                self.io.take()
+            }
+
+            fn park_err(&mut self, err: Box<LimboError>) {
+                self.err = Some(err);
+            }
+
+            fn take_err(&mut self) -> Option<Box<LimboError>> {
+                self.err.take()
+            }
+        }
+
+        /// The cursor is only read when a run starts, so a resume passes None.
+        type RowArgs = (Option<BTreeCursor>, i64, Vec<Value>, isize);
+
+        fn write_row_runner() -> BoxedResumable<RowStep, RowArgs, ()> {
+            Runner::boxed(|co, args: RowArgs| {
+                with_handle(
+                    co,
+                    args,
+                    async |co, (cursor, rowid, values, weight): RowArgs| {
+                        let mut cursor = cursor.expect("a new run gets a cursor");
+                        write_view_row(co, &mut cursor, rowid, &values, weight).await
+                    },
+                )
+            })
+        }
 
         fn setup() -> (Arc<Connection>, Arc<crate::Pager>, i64) {
             let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
@@ -6195,7 +6058,7 @@ mod tests {
             (conn, pager, root)
         }
 
-        /// Same re-poll contract as `persistence::WriteRow`, for the per-row view cursor:
+        /// Same re-poll contract as `persistence::write_row`, for the per-row view cursor:
         /// a mid-balance yield must not lose the matview row.
         #[test]
         fn write_row_view_completes_yielded_overflowing_insert() {
@@ -6209,23 +6072,23 @@ mod tests {
 
             // ~1200-byte on-page cells fill leaves; the insert that overflows a page
             // triggers the mid-balance yield. Fresh per-row cursor, as in UpdateView.
+            let mut write = write_row_runner();
             let mut victim_rowid = None;
             for rowid in 1i64..=200 {
                 let mut cursor = BTreeCursor::new_table(pager.clone(), root, 2);
                 cursor.install_yield_context(&conn);
+                let mut cursor = Some(cursor);
+                let values = vec![Value::from_slice(&[0xcd_u8; 1200]).unwrap()];
 
-                let key = SeekKey::TableRowId(rowid);
-                let build = move |final_weight: isize| -> Vec<Value> {
-                    vec![
-                        Value::from_slice(&[0xcd_u8; 1200]).unwrap(),
-                        Value::from_i64(final_weight as i64),
-                    ]
-                };
-
-                let mut wr = WriteRowView::new();
                 pager
                     .io
-                    .block(|| wr.write_row(&mut cursor, key.clone(), build, 1))
+                    .block(|| {
+                        let mut ctx = RowCtx {
+                            io: None,
+                            err: None,
+                        };
+                        write.resume(&mut ctx, (cursor.take(), rowid, values.clone(), 1))
+                    })
                     .unwrap();
 
                 if injector.fired() {
@@ -6249,7 +6112,7 @@ mod tests {
                 .unwrap();
             assert!(
                 matches!(found, SeekResult::Found),
-                "matview row {victim_rowid} lost: WriteRowView advanced to Done past a yielded insert"
+                "matview row {victim_rowid} lost: write_view_row moved on past a yielded insert"
             );
         }
     }

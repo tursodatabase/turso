@@ -1,7 +1,6 @@
 // Aggregate operator for DBSP-style incremental computation
 
 use crate::coro::{with_handle, Co, Runner, StepContext, YieldSlot};
-use crate::function::{AggFunc, Func};
 use crate::incremental::dbsp::Hash128;
 use crate::incremental::dbsp::{Delta, DeltaPair, HashableRow};
 use crate::incremental::operator::{
@@ -128,12 +127,6 @@ impl Display for AggregateFunction {
 }
 
 impl AggregateFunction {
-    /// Get the default output column name for this aggregate function
-    #[inline]
-    pub fn default_output_name(&self) -> String {
-        self.to_string()
-    }
-
     /// Serialize this aggregate function to a Value
     /// Returns a vector of values: [type_code, optional_column_index]
     pub fn to_values(&self) -> Vec<Value> {
@@ -302,27 +295,6 @@ impl AggregateFunction {
         };
 
         Ok(agg_fn)
-    }
-
-    /// Create an AggregateFunction from a SQL function and its arguments
-    /// Returns None if the function is not a supported aggregate
-    pub fn from_sql_function(
-        func: &crate::function::Func,
-        input_column_idx: Option<usize>,
-    ) -> Option<Self> {
-        match func {
-            Func::Agg(agg_func) => {
-                match agg_func {
-                    AggFunc::Count | AggFunc::Count0 => Some(AggregateFunction::Count),
-                    AggFunc::Sum => input_column_idx.map(AggregateFunction::Sum),
-                    AggFunc::Avg => input_column_idx.map(AggregateFunction::Avg),
-                    AggFunc::Min => input_column_idx.map(AggregateFunction::Min),
-                    AggFunc::Max => input_column_idx.map(AggregateFunction::Max),
-                    _ => None, // Other aggregate functions not yet supported in DBSP
-                }
-            }
-            _ => None, // Not an aggregate function
-        }
     }
 }
 
