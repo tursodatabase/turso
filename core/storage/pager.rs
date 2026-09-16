@@ -1516,8 +1516,6 @@ pub struct Pager {
     /// Note that schema cookie is 32-bits, but we use 64-bit field so we can
     /// represent case where value is not set.
     schema_cookie: AtomicU64,
-    /// State machine for async cache spilling.
-    spill_state: RwLock<SpillState>,
     /// State machine for async cacheflush operation.
     cacheflush_state: RwLock<CacheFlushState>,
     /// Maximum number of pages allowed in the database. Default is 1073741823 (SQLite default).
@@ -1674,41 +1672,6 @@ enum FreelistSearch {
     },
 }
 
-/// State machine for async cache spilling.
-/// Tracks progress of writing dirty pages to WAL or disk.
-#[derive(Debug, Default, Clone)]
-enum SpillState {
-    #[default]
-    /// No spill operation in progress
-    Idle,
-    /// Lazily initializing the WAL header before the first spill write.
-    /// Waiting for the header write (and possible truncate) to complete.
-    /// The pinned pages destined for spilling are carried across the yield.
-    PreparingWalStart {
-        pages: Vec<PinGuard>,
-        completion: Completion,
-    },
-    /// WAL header written; waiting for the fsync that marks the WAL
-    /// initialized before we append spill frames.
-    PreparingWalFinish {
-        pages: Vec<PinGuard>,
-        completion: Completion,
-    },
-    /// WAL spill in progress, waiting for write completions
-    WritingToWal {
-        /// Pinned pages being spilled
-        pages: Vec<PinGuard>,
-        /// Completions to wait for
-        completions: Vec<Completion>,
-    },
-    /// Writing ephemeral tables pages directly to disk
-    WritingToDisk {
-        /// Pages being spilled
-        pages: Vec<PinGuard>,
-        /// Completions to wait for
-        completions: Vec<Completion>,
-    },
-}
 enum CacheFlushStep {
     /// Yield to caller with pending I/O, resume with given phase
     Yield(CacheFlushState, IOCompletions),
@@ -1854,6 +1817,7 @@ struct PagerOps {
     allocate_page1: AsyncOp<PagerStep, (), PageRef>,
     allocate_page: AsyncOp<PagerStep, (), PageRef>,
     free_page: AsyncOp<PagerStep, (Option<PageRef>, usize), ()>,
+    spill: AsyncOp<PagerStep, (), ()>,
 }
 
 impl PagerOps {
@@ -1884,6 +1848,9 @@ impl PagerOps {
             }),
             free_page: AsyncOp::new(|| {
                 Runner::boxed(|co, args| with_handle(co, args, Pager::free_page_async))
+            }),
+            spill: AsyncOp::new(|| {
+                Runner::boxed(|co, args| with_handle(co, args, Pager::try_spill_dirty_pages_async))
             }),
         }
     }
@@ -1946,7 +1913,6 @@ impl Pager {
             page_size: AtomicU32::new(0), // 0 means not set
             reserved_space: AtomicU16::new(RESERVED_SPACE_NOT_SET),
             schema_cookie: AtomicU64::new(Self::SCHEMA_COOKIE_NOT_SET),
-            spill_state: RwLock::new(SpillState::Idle),
             cacheflush_state: RwLock::new(CacheFlushState::default()),
             max_page_count: AtomicU32::new(DEFAULT_MAX_PAGE_COUNT),
             ops: PagerOps::new(),
@@ -4174,166 +4140,137 @@ impl Pager {
     /// For ephemeral tables: writes pages directly to the temp database file.
     #[instrument(skip_all, level = Level::DEBUG)]
     fn try_spill_dirty_pages(&self) -> IOResultOr<()> {
-        loop {
-            let state = self.spill_state.read().clone();
-            match state {
-                SpillState::Idle => {
-                    // Check if spilling is needed
-                    let spill_result = {
-                        let cache = self.page_cache.read();
-                        cache.check_spill(IOV_MAX)
-                    };
-                    match spill_result {
-                        SpillResult::NotNeeded | SpillResult::Disabled => {
-                            return Ok(IOResult::Done(()));
-                        }
-                        SpillResult::CacheFull => {
-                            tracing::debug!(
-                                "try_spill_dirty_pages: cache full, no spillable pages"
-                            );
-                            return Ok(IOResult::Done(()));
-                        }
-                        SpillResult::PagesToSpill(pages) => {
-                            if pages.is_empty() {
-                                return Ok(IOResult::Done(()));
-                            }
-                            let page_count = pages.len();
-                            tracing::debug!("try_spill_dirty_pages: spilling {} pages", page_count);
-                            if let Some(wal) = self.wal.as_ref() {
-                                let page_sz = self.get_page_size().unwrap_or_default();
+        self.step_op(&self.ops.spill, ())
+    }
 
-                                // Ensure WAL is initialized. Most of the time this
-                                // is a no-op (returns None). When it does require
-                                // IO we transition through `PreparingWalStart` /
-                                // `PreparingWalFinish` and yield rather than block,
-                                // carrying the pinned `pages` across each yield.
-                                match wal.prepare_wal_start(page_sz)? {
-                                    Some(c) => {
-                                        *self.spill_state.write() = SpillState::PreparingWalStart {
-                                            pages,
-                                            completion: c,
-                                        };
-                                        // Loop to handle the new state (which will
-                                        // yield if the completion isn't finished).
-                                        continue;
-                                    }
-                                    None => {
-                                        // WAL already initialized — append directly.
-                                        return self.spill_append_frames_to_wal(pages);
-                                    }
-                                }
-                            } else {
-                                let mut group = CompletionGroup::new(|_| {});
-                                // Ephemeral table case: write directly to temp file
-                                for page in &pages {
-                                    page.set_write_pending();
-                                }
-                                let completions = self.spill_pages_to_disk(&pages, &mut group)?;
-                                if completions.is_empty() {
-                                    self.finish_ephemeral_spill(&pages);
-                                    return Ok(IOResult::Done(()));
-                                }
-                                *self.spill_state.write() =
-                                    SpillState::WritingToDisk { pages, completions };
-                                io_yield_one!(group.build());
-                            }
-                        }
-                    }
+    /// Writes the spillable dirty pages to the WAL, or to the database file
+    /// of an ephemeral table, and marks them spilled once the writes are
+    /// done. Does nothing when the cache does not need a spill.
+    async fn try_spill_dirty_pages_async(
+        co: &mut Co<PagerStep>,
+        (): (),
+    ) -> Result<(), Box<LimboError>> {
+        let Some(pages) = co.with(|ctx| ctx.pager.pages_to_spill()) else {
+            return Ok(());
+        };
+        tracing::debug!("try_spill_dirty_pages: spilling {} pages", pages.len());
+        if co.with(|ctx| ctx.pager.wal.is_none()) {
+            // Ephemeral table case: write directly to temp file
+            for page in &pages {
+                page.set_write_pending();
+            }
+            let mut group = CompletionGroup::new(|_| {});
+            let completions = co.with(|ctx| ctx.pager.spill_pages_to_disk(&pages, &mut group))?;
+            if completions.is_empty() {
+                co.with(|ctx| ctx.pager.finish_ephemeral_spill(&pages));
+                return Ok(());
+            }
+            co.yield_io(IOCompletions(group.build())).await;
+            while let Some(c) = completions.iter().find(|c| !c.succeeded()) {
+                co.yield_io(IOCompletions(c.clone())).await;
+            }
+            // All I/O complete, finish ephemeral spill
+            co.with(|ctx| ctx.pager.finish_ephemeral_spill(&pages));
+            trace!(
+                "try_spill_dirty_pages: successfully spilled {} pages to disk",
+                pages.len()
+            );
+            return Ok(());
+        }
+
+        let page_sz = co.with(|ctx| ctx.pager.get_page_size().unwrap_or_default());
+        // Ensure WAL is initialized. Most of the time this is a no-op
+        // (returns None). When it does require IO we wait for the header
+        // write and the fsync that marks the WAL initialized, and keep the
+        // pinned `pages` across each yield.
+        let prepare = co.with(|ctx| ctx.pager.spill_wal().prepare_wal_start(page_sz))?;
+        let c = match prepare {
+            None => {
+                // WAL already initialized: append directly. An error here
+                // ends the spill.
+                co.with(|ctx| ctx.pager.append_spill_frames(&pages))?
+            }
+            Some(c) => {
+                while !c.succeeded() {
+                    co.yield_io(IOCompletions(c.clone())).await;
                 }
-                SpillState::PreparingWalStart { pages, completion } => {
-                    if !completion.succeeded() {
-                        io_yield_one!(completion);
-                    }
-                    // Header (and any truncate) durable — issue the fsync that
-                    // marks the WAL initialized.
-                    let wal = self.wal.as_ref().expect("PreparingWalStart requires a WAL");
-                    let finish_c = wal.prepare_wal_finish(self.get_sync_type())?;
-                    *self.spill_state.write() = SpillState::PreparingWalFinish {
-                        pages,
-                        completion: finish_c,
-                    };
-                    continue;
+                // Header (and any truncate) durable: issue the fsync that
+                // marks the WAL initialized.
+                let finish = co
+                    .io(|ctx| {
+                        let sync_type = ctx.pager.get_sync_type();
+                        ctx.pager
+                            .spill_wal()
+                            .prepare_wal_finish(sync_type)
+                            .map(IOResult::Done)
+                    })
+                    .await;
+                while !finish.succeeded() {
+                    co.yield_io(IOCompletions(finish.clone())).await;
                 }
-                SpillState::PreparingWalFinish { pages, completion } => {
-                    if !completion.succeeded() {
-                        io_yield_one!(completion);
-                    }
-                    // WAL is now initialized; append the spill frames.
-                    return self.spill_append_frames_to_wal(pages);
-                }
-                SpillState::WritingToWal { pages, completions } => {
-                    for c in &completions {
-                        if !c.succeeded() {
-                            io_yield_one!(c.clone());
-                        }
-                    }
-                    // All I/O complete, pages are now in WAL.
-                    // Mark spilled pages so they can be evicted while dirty.
-                    // Only do so if page wasn't modified since write started (each page has valid wal_tag).
-                    let mut spilled_count = 0;
-                    {
-                        let mut cache = self.page_cache.write();
-                        for page in &pages {
-                            if page.has_wal_tag() {
-                                let key = PageCacheKey::new(page.get().id());
-                                cache.notify_page_spilled(key);
-                                page.set_spilled();
-                                spilled_count += 1;
-                            } else {
-                                // Page was modified during write, it will need to be re-spilled
-                                tracing::debug!(
-                                "try_spill_dirty_pages: page {} modified during write, not marking as spilled",
-                                page.get().id()
-                            );
-                            }
-                        }
-                    }
-                    if spilled_count == 0 && !pages.is_empty() {
-                        tracing::warn!(
-                        "try_spill_dirty_pages: no pages marked as spilled out of {}, all were modified during write",
-                        pages.len()
-                    );
-                    }
-                    *self.spill_state.write() = SpillState::Idle;
-                    trace!(
-                        "try_spill_dirty_pages: successfully spilled {} / {} pages to WAL",
-                        spilled_count,
-                        pages.len(),
-                    );
-                    return Ok(IOResult::Done(()));
-                }
-                SpillState::WritingToDisk { pages, completions } => {
-                    let all_done = completions.iter().all(|c| c.succeeded());
-                    if !all_done {
-                        for c in &completions {
-                            if !c.succeeded() {
-                                io_yield_one!(c.clone());
-                            }
-                        }
-                    }
-                    // All I/O complete, finish ephemeral spill
-                    self.finish_ephemeral_spill(&pages);
-                    *self.spill_state.write() = SpillState::Idle;
-                    trace!(
-                        "try_spill_dirty_pages: successfully spilled {} pages to disk",
-                        pages.len()
-                    );
-                    return Ok(IOResult::Done(()));
+                // WAL is now initialized; append the spill frames. An error
+                // here runs this step again.
+                co.io(|ctx| ctx.pager.append_spill_frames(&pages).map(IOResult::Done))
+                    .await
+            }
+        };
+        if c.succeeded() {
+            // Synchronous completion, WAL tags already set by callback.
+            co.with(|ctx| ctx.pager.mark_pages_spilled(&pages));
+            return Ok(());
+        }
+        co.yield_io(IOCompletions(c.clone())).await;
+        while !c.succeeded() {
+            co.yield_io(IOCompletions(c.clone())).await;
+        }
+        // All I/O complete, pages are now in WAL.
+        let spilled_count = co.with(|ctx| ctx.pager.mark_pages_spilled(&pages));
+        if spilled_count == 0 && !pages.is_empty() {
+            tracing::warn!(
+                "try_spill_dirty_pages: no pages marked as spilled out of {}, all were modified during write",
+                pages.len()
+            );
+        }
+        trace!(
+            "try_spill_dirty_pages: successfully spilled {} / {} pages to WAL",
+            spilled_count,
+            pages.len(),
+        );
+        Ok(())
+    }
+
+    /// The pinned dirty pages the cache wants spilled, or None when no
+    /// spill is needed or possible.
+    fn pages_to_spill(&self) -> Option<Vec<PinGuard>> {
+        let spill_result = {
+            let cache = self.page_cache.read();
+            cache.check_spill(IOV_MAX)
+        };
+        match spill_result {
+            SpillResult::NotNeeded | SpillResult::Disabled => None,
+            SpillResult::CacheFull => {
+                tracing::debug!("try_spill_dirty_pages: cache full, no spillable pages");
+                None
+            }
+            SpillResult::PagesToSpill(pages) => {
+                if pages.is_empty() {
+                    None
+                } else {
+                    Some(pages)
                 }
             }
         }
     }
 
-    /// Append the prepared spill `pages` as WAL frames. Returns `Done` if
-    /// the write completed synchronously, otherwise transitions to
-    /// `SpillState::WritingToWal` and yields the write completion. The WAL
-    /// must already be initialized (callers route through `PreparingWal*`
-    /// first).
-    fn spill_append_frames_to_wal(&self, pages: Vec<PinGuard>) -> IOResultOr<()> {
-        let wal = self
-            .wal
+    fn spill_wal(&self) -> &Arc<dyn Wal> {
+        self.wal
             .as_ref()
-            .expect("spill_append_frames_to_wal requires a WAL");
+            .expect("a spill to the WAL requires a WAL")
+    }
+
+    /// Appends the spill `pages` as WAL frames and returns the write. The
+    /// WAL must already be initialized.
+    fn append_spill_frames(&self, pages: &[PinGuard]) -> Result<Completion> {
         let page_sz = self.get_page_size().unwrap_or_default();
         let wal_pages: Vec<PageRef> = pages
             .iter()
@@ -4345,36 +4282,37 @@ impl Pager {
                 Ok(p.to_page())
             })
             .collect::<Result<Vec<_>>>()?;
-        let c = wal.append_frames_vectored(wal_pages, page_sz)?;
+        self.spill_wal().append_frames_vectored(wal_pages, page_sz)
+    }
 
-        if c.succeeded() {
-            // Synchronous completion, WAL tags already set by callback.
-            {
-                let mut cache = self.page_cache.write();
-                for page in &pages {
-                    if page.has_wal_tag() {
-                        let key = PageCacheKey::new(page.get().id());
-                        cache.notify_page_spilled(key);
-                        page.set_spilled();
-                    }
-                }
+    /// Marks the written pages spilled so they can be evicted while dirty.
+    /// A page modified since its write started has no WAL tag and stays as
+    /// it is; it will need to be spilled again. Returns how many pages were
+    /// marked.
+    fn mark_pages_spilled(&self, pages: &[PinGuard]) -> usize {
+        let mut spilled_count = 0;
+        let mut cache = self.page_cache.write();
+        for page in pages {
+            if page.has_wal_tag() {
+                let key = PageCacheKey::new(page.get().id());
+                cache.notify_page_spilled(key);
+                page.set_spilled();
+                spilled_count += 1;
+            } else {
+                tracing::debug!(
+                    "try_spill_dirty_pages: page {} modified during write, not marking as spilled",
+                    page.get().id()
+                );
             }
-            *self.spill_state.write() = SpillState::Idle;
-            return Ok(IOResult::Done(()));
         }
-        *self.spill_state.write() = SpillState::WritingToWal {
-            pages,
-            completions: vec![c.clone()],
-        };
-        io_yield_one!(c);
+        spilled_count
     }
 
     /// Wait for any in-flight spill writes to finish.
     /// This prevents publishing WAL metadata that references frames that are not yet durable.
     fn wait_for_spill_completions(&self) -> IOResultOr<()> {
         loop {
-            let state = self.spill_state.read().clone();
-            if matches!(state, SpillState::Idle) {
+            if !self.ops.spill.is_active() {
                 return Ok(IOResult::Done(()));
             }
             match self.try_spill_dirty_pages()? {
@@ -6204,7 +6142,7 @@ impl Pager {
         self.commit_info.write().reset();
         self.ops.allocate_page.cancel();
         self.ops.free_page.cancel();
-        *self.spill_state.write() = SpillState::Idle;
+        self.ops.spill.cancel();
         self.ops.read_header_page.cancel();
         #[cfg(feature = "autovacuum")]
         self.ops.ptrmap_get.cancel();
