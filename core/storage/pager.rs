@@ -1154,17 +1154,6 @@ impl Page {
     }
 }
 
-#[derive(Debug, Default)]
-struct CheckpointState {
-    phase: CheckpointPhase,
-    /// The checkpoint result, set after WAL checkpoint completes
-    result: Option<CheckpointResult>,
-    /// The checkpoint mode, used to determine if WAL truncation is needed
-    mode: Option<CheckpointMode>,
-    /// The checkpoint state machine should acquire the lock or use the one by caller
-    lock_source: CheckpointLockSource,
-}
-
 #[derive(Clone, Debug)]
 struct PendingCheckpointDbIdentityRead {
     max_frame: u64,
@@ -1174,45 +1163,25 @@ struct PendingCheckpointDbIdentityRead {
     completion: Option<Completion>,
 }
 
-#[derive(Clone, Debug, Default)]
-enum CheckpointPhase {
-    #[default]
-    NotCheckpointing,
-    Checkpoint {
-        mode: CheckpointMode,
-        sync_mode: crate::SyncMode,
-        clear_page_cache: bool,
-    },
+/// No database identity read is in flight.
+const NO_DB_IDENTITY_READ: u64 = 0;
+
+/// The steps of a checkpoint after the WAL checkpoint, in order. Each one
+/// decides which step comes next.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CheckpointStep {
     /// Truncate the database file if everything was backfilled and file is larger than expected.
-    TruncateDbFile {
-        sync_mode: crate::SyncMode,
-        clear_page_cache: bool,
-        /// Whether we've invalidated page 1 from cache (needed because checkpoint may write
-        /// pages directly from WALto DB file, so cached page 1 of the checkpointer connection may have stale database_size)
-        page1_invalidated: bool,
-    },
+    TruncateDbFile,
     /// Sync the database file after checkpoint (if sync_mode != Off and we backfilled any frames from the WAL).
-    SyncDbFile { clear_page_cache: bool },
-    /// Read the synced database header before installing the durable backfill proof.
-    ReadDbIdentity {
-        clear_page_cache: bool,
-        read: PendingCheckpointDbIdentityRead,
-    },
-    /// Wait for backend-specific durable proof sync to finish before publishing nbackfills.
-    SyncBackfillProof {
-        clear_page_cache: bool,
-        max_frame: u64,
-    },
-    /// Publish the durable backfill progress after the proof is installed and synced.
-    PublishBackfill {
-        clear_page_cache: bool,
-        max_frame: u64,
-    },
+    SyncDbFile,
+    /// Read the synced database header, install the durable backfill proof
+    /// and publish the backfill.
+    ReadDbIdentity,
     /// Truncate the WAL file after DB file is safely synced (only for TRUNCATE checkpoint mode).
     /// This must happen AFTER SyncDbFile to ensure data durability.
-    TruncateWalFile { clear_page_cache: bool },
-    /// Finalize: release guard and optionally clear page cache.
-    Finalize { clear_page_cache: bool },
+    TruncateWalFile,
+    /// Release the guard and optionally clear the page cache.
+    Finalize,
 }
 
 /// The mode of allocating a btree page.
@@ -1458,7 +1427,9 @@ pub struct Pager {
     subjournal: RwLock<Option<Subjournal>>,
     savepoints: Arc<RwLock<Vec<Savepoint>>>,
     commit_info: RwLock<CommitInfo>,
-    checkpoint_state: RwLock<CheckpointState>,
+    /// The backfill target of the database identity read of a suspended
+    /// checkpoint, or `NO_DB_IDENTITY_READ`.
+    checkpoint_db_identity_read: AtomicU64,
     syncing: Arc<AtomicBool>,
     auto_vacuum_mode: AtomicU8,
     /// Mutex for synchronizing database initialization to prevent race conditions
@@ -1745,6 +1716,11 @@ struct PagerOps {
     spill: AsyncOp<PagerStep, (), ()>,
     cacheflush: AsyncOp<PagerStep, (), Vec<Completion>>,
     commit: AsyncOp<PagerStep, (WalAutoActions, SyncMode, bool), ()>,
+    checkpoint: AsyncOp<
+        PagerStep,
+        (CheckpointMode, SyncMode, bool, CheckpointLockSource),
+        CheckpointResult,
+    >,
 }
 
 impl PagerOps {
@@ -1784,6 +1760,9 @@ impl PagerOps {
             }),
             commit: AsyncOp::new(|| {
                 Runner::boxed(|co, args| with_handle(co, args, Pager::commit_wal_async))
+            }),
+            checkpoint: AsyncOp::new(|| {
+                Runner::boxed(|co, args| with_handle(co, args, Pager::checkpoint_async))
             }),
         }
     }
@@ -1836,7 +1815,7 @@ impl Pager {
                 prepared_frames: Vec::new(),
             }),
             syncing: Arc::new(AtomicBool::new(false)),
-            checkpoint_state: RwLock::new(CheckpointState::default()),
+            checkpoint_db_identity_read: AtomicU64::new(NO_DB_IDENTITY_READ),
             buffer_pool,
             auto_vacuum_mode: AtomicU8::new(AutoVacuumMode::None.into()),
             init_lock,
@@ -4567,10 +4546,7 @@ impl Pager {
     }
 
     pub fn is_checkpointing(&self) -> bool {
-        !matches!(
-            self.checkpoint_state.read().phase.clone(),
-            CheckpointPhase::NotCheckpointing
-        )
+        self.ops.checkpoint.is_active()
     }
 
     fn reset_checkpoint_state(&self) {
@@ -4582,11 +4558,9 @@ impl Pager {
     /// Reset checkpoint state machine to initial state.
     /// Use this to clean up after a failed explicit checkpoint (PRAGMA wal_checkpoint).
     pub fn clear_checkpoint_state(&self) {
-        let mut state = self.checkpoint_state.write();
-        state.phase = CheckpointPhase::NotCheckpointing;
-        state.result = None;
-        state.mode = None;
-        state.lock_source = CheckpointLockSource::Acquire;
+        self.ops.checkpoint.cancel();
+        self.checkpoint_db_identity_read
+            .store(NO_DB_IDENTITY_READ, Ordering::Release);
     }
 
     /// Clean up after a auto-checkpoint failure.
@@ -4599,42 +4573,6 @@ impl Pager {
         self.reset_checkpoint_state();
         if let Some(wal) = self.wal.as_ref() {
             wal.abort_checkpoint();
-        }
-    }
-
-    fn next_post_sync_checkpoint_phase(&self, clear_page_cache: bool) -> CheckpointPhase {
-        let state = self.checkpoint_state.read();
-        let result = state.result.as_ref().expect("result should be set");
-        let mode = state.mode.expect("mode should be set");
-        if result.wal_checkpoint_backfilled > 0
-            && !matches!(
-                mode,
-                CheckpointMode::Restart | CheckpointMode::Truncate { .. }
-            )
-        {
-            // if we are using a custom codec, then we might have to read the whole page 1 so that
-            // it can be decoded. Otherwise reading the header is enough.
-            let read_page = self.io_ctx.read().has_codec_transform();
-            let read_size = if read_page {
-                self.get_page_size_unchecked().get() as usize
-            } else {
-                PageSize::MIN as usize
-            };
-            return CheckpointPhase::ReadDbIdentity {
-                clear_page_cache,
-                read: PendingCheckpointDbIdentityRead {
-                    max_frame: result.wal_total_backfilled,
-                    header_buf: Arc::new(Buffer::new_temporary(read_size)),
-                    bytes_read: Arc::new(AtomicUsize::new(usize::MAX)),
-                    read_page,
-                    completion: None,
-                },
-            };
-        }
-        if matches!(mode, CheckpointMode::Truncate { .. }) {
-            CheckpointPhase::TruncateWalFile { clear_page_cache }
-        } else {
-            CheckpointPhase::Finalize { clear_page_cache }
         }
     }
 
@@ -4673,7 +4611,6 @@ impl Pager {
         )
     }
 
-    #[aristo::intent("The nbackfills counter advances after frames are durable, so recovery never replays already-checkpointed frames\n", id = "aristos:wal_nbackfills_orders_with_recovery", verify = "full", parent = "wal_protocol_correctness")]
     fn checkpoint_inner(
         &self,
         mode: CheckpointMode,
@@ -4681,368 +4618,327 @@ impl Pager {
         clear_page_cache: bool,
         lock_source: CheckpointLockSource,
     ) -> IOResultOr<CheckpointResult> {
-        let Some(wal) = self.wal.as_ref() else {
+        if self.wal.is_none() {
             turso_soft_unreachable!("checkpoint() called on database without WAL");
             return Err(LimboError::InternalError(
                 "checkpoint() called on database without WAL".to_string(),
             )
             .into());
+        }
+        self.step_op(
+            &self.ops.checkpoint,
+            (mode, sync_mode, clear_page_cache, lock_source),
+        )
+    }
+
+    /// Runs the WAL checkpoint, then makes its result durable: truncates
+    /// the database file in TRUNCATE mode, syncs it, installs the durable
+    /// backfill proof, truncates the WAL in TRUNCATE mode, and releases the
+    /// checkpoint locks. An error before the last step keeps the checkpoint
+    /// suspended until `clear_checkpoint_state`, as the old phases did.
+    #[aristo::intent("The nbackfills counter advances after frames are durable, so recovery never replays already-checkpointed frames\n", id = "aristos:wal_nbackfills_orders_with_recovery", verify = "full", parent = "wal_protocol_correctness")]
+    async fn checkpoint_async(
+        co: &mut Co<PagerStep>,
+        (mode, sync_mode, clear_page_cache, lock_source): (
+            CheckpointMode,
+            crate::SyncMode,
+            bool,
+            CheckpointLockSource,
+        ),
+    ) -> Result<CheckpointResult, Box<LimboError>> {
+        let mut res = co
+            .io(|ctx| match lock_source {
+                CheckpointLockSource::Acquire => ctx
+                    .pager
+                    .checked_wal()
+                    .checkpoint(ctx.pager, mode, sync_mode),
+                CheckpointLockSource::HeldByCaller => ctx
+                    .pager
+                    .checked_wal()
+                    .vacuum_checkpoint_with_held_lock(ctx.pager, sync_mode),
+            })
+            .await;
+        let is_truncate = matches!(mode, CheckpointMode::Truncate { .. });
+        // `should_truncate` will be true for successful truncate checkpoint
+        let mut next = if is_truncate && res.should_truncate() {
+            CheckpointStep::TruncateDbFile
+        } else if res.wal_checkpoint_backfilled == 0 || sync_mode == crate::SyncMode::Off {
+            CheckpointStep::Finalize
+        } else {
+            CheckpointStep::SyncDbFile
         };
-        loop {
-            // Clone the phase to check what state we're in, but keep result in place
-            // This is important because we need to be careful not to e.g. clone and drop the checkpoint result which
-            // causes a drop of CheckpointLocks prematurely and results in a panic.
-            let phase = self.checkpoint_state.read().phase.clone();
-            match phase {
-                CheckpointPhase::NotCheckpointing => {
-                    let mut state = self.checkpoint_state.write();
-                    state.phase = CheckpointPhase::Checkpoint {
-                        mode,
-                        sync_mode,
-                        clear_page_cache,
-                    };
-                    state.mode = Some(mode);
-                    state.lock_source = lock_source;
-                }
-                CheckpointPhase::Checkpoint {
-                    mode,
-                    sync_mode,
-                    clear_page_cache,
-                } => {
-                    let checkpoint_lock_source = self.checkpoint_state.read().lock_source;
-                    let res = return_if_io!(match checkpoint_lock_source {
-                        CheckpointLockSource::Acquire => wal.checkpoint(self, mode, sync_mode),
-                        CheckpointLockSource::HeldByCaller => {
-                            wal.vacuum_checkpoint_with_held_lock(self, sync_mode)
-                        }
-                    });
-                    let mut state = self.checkpoint_state.write();
-                    if matches!(mode, CheckpointMode::Truncate { .. })
-                        // `should_truncate` will be true for successful truncate checkpoint
-                        && res.should_truncate()
-                    {
-                        state.phase = CheckpointPhase::TruncateDbFile {
-                            sync_mode,
-                            clear_page_cache,
-                            page1_invalidated: false,
-                        };
-                    } else if res.wal_checkpoint_backfilled == 0
-                        || sync_mode == crate::SyncMode::Off
-                    {
-                        state.phase = CheckpointPhase::Finalize { clear_page_cache };
-                    } else {
-                        state.phase = CheckpointPhase::SyncDbFile { clear_page_cache };
-                    }
-                    state.result = Some(res);
-                }
-                CheckpointPhase::TruncateDbFile {
-                    sync_mode,
-                    clear_page_cache,
-                    page1_invalidated,
-                } => {
-                    let should_skip_truncate_db_file = {
-                        let state = self.checkpoint_state.read();
-                        turso_assert!(
-                            matches!(state.mode, Some(CheckpointMode::Truncate { .. })),
-                            "mode should be truncate in CheckpointPhase::TruncateDbFile"
-                        );
-                        let result = state.result.as_ref().expect("result should be set");
-                        // Skip if we already sent truncate
-                        result.db_truncate_sent
-                    };
-
-                    if should_skip_truncate_db_file {
-                        let mut state = self.checkpoint_state.write();
-                        if sync_mode == crate::SyncMode::Off {
-                            // Skip DB sync, proceed to WAL truncation
-                            state.phase = CheckpointPhase::TruncateWalFile { clear_page_cache };
-                        } else {
-                            // Sync DB first, then SyncDbFile will transition to TruncateWalFile
-                            state.phase = CheckpointPhase::SyncDbFile { clear_page_cache };
-                        }
-                        continue;
-                    }
-                    // Invalidate page 1 (header) in cache before reading - checkpoint potentially wrote pages
-                    // directly to DB file from the WAL, so the checkpointer connections' page 1 may have stale database_size.
-                    if !page1_invalidated {
-                        let page1_key = PageCacheKey::new(DatabaseHeader::PAGE_ID);
-                        self.page_cache.write().delete(page1_key)?;
-                        let mut state = self.checkpoint_state.write();
-                        state.phase = CheckpointPhase::TruncateDbFile {
-                            sync_mode,
-                            clear_page_cache,
-                            page1_invalidated: true,
-                        };
-                    }
-
-                    // Truncate the database file unless already at correct size
-                    let db_size =
-                        return_if_io!(self.with_header(|header| header.database_size)).get();
-                    let page_size = self.get_page_size().unwrap_or_default();
-                    let expected = db_size as u64 * page_size.get() as u64;
-                    let should_skip_db_truncate = match self.db_file.size() {
-                        Ok(current_size) => expected >= current_size,
-                        Err(err) => {
-                            // e.g. file.size() is not supported in web worker environment, so we should
-                            // skip the truncate if we can't check the size.
-                            tracing::debug!(
-                                "checkpoint(TRUNCATE): db_file.size unavailable, skipping db truncate pre-check: {err}"
-                            );
-                            true
-                        }
-                    };
-                    if should_skip_db_truncate {
-                        // No DB truncation needed (or unsupported size pre-check), move to next phase.
-                        let mut state = self.checkpoint_state.write();
-                        if sync_mode == crate::SyncMode::Off {
-                            // Skip DB sync, proceed to WAL truncation
-                            state.phase = CheckpointPhase::TruncateWalFile { clear_page_cache };
-                        } else {
-                            // Sync DB first, then SyncDbFile will transition to TruncateWalFile
-                            state.phase = CheckpointPhase::SyncDbFile { clear_page_cache };
-                        }
-                        continue;
-                    }
-                    let c = self.db_file.truncate(
-                        expected as usize,
-                        Completion::new_trunc(move |_| {
-                            tracing::trace!(
-                                "Database file truncated to expected size: {} bytes",
-                                expected
-                            );
-                        }),
-                    )?;
-                    self.checkpoint_state
-                        .write()
-                        .result
-                        .as_mut()
-                        .expect("result should be set")
-                        .db_truncate_sent = true;
-                    io_yield_one!(c);
-                }
-                CheckpointPhase::SyncDbFile { clear_page_cache } => {
-                    let need_sync_db_file = {
-                        let state = self.checkpoint_state.read();
-                        let result = state.result.as_ref().expect("result should be set");
-                        !result.db_sync_sent
-                    };
-
-                    if !need_sync_db_file {
-                        turso_assert!(
-                            !self.syncing.load(Ordering::SeqCst),
-                            "syncing should be done"
-                        );
-                        self.checkpoint_state.write().phase =
-                            self.next_post_sync_checkpoint_phase(clear_page_cache);
-                        continue;
-                    }
-
-                    let c = sqlite3_ondisk::begin_sync(
-                        self.db_file.as_ref(),
-                        self.syncing.clone(),
-                        self.get_sync_type(),
-                    )?;
-                    self.checkpoint_state
-                        .write()
-                        .result
-                        .as_mut()
-                        .expect("result should be set")
-                        .db_sync_sent = true;
-                    io_yield_one!(c);
-                }
-                CheckpointPhase::ReadDbIdentity {
-                    clear_page_cache,
-                    mut read,
-                } => {
-                    if read.completion.is_none() {
-                        let header_buf = read.header_buf.clone();
-                        let bytes_read = read.bytes_read.clone();
-                        let completion = Completion::new_read(header_buf, {
-                            Box::new(move |res| {
-                                if let Ok((_buf, count)) = res {
-                                    bytes_read.store(count as usize, Ordering::Release);
-                                }
-                                None
-                            })
-                        });
-                        let c = if read.read_page {
-                            self.db_file.read_page(
-                                DatabaseHeader::PAGE_ID,
-                                &self.io_ctx.read(),
-                                completion,
-                            )?
-                        } else {
-                            self.db_file.read_header(completion)?
-                        };
-                        read.completion = Some(c.clone());
-                        self.checkpoint_state.write().phase = CheckpointPhase::ReadDbIdentity {
-                            clear_page_cache,
-                            read,
-                        };
-                        io_yield_one!(c);
-                    }
-
-                    let completion = read
-                        .completion
-                        .as_ref()
-                        .expect("database identity read completion should be set");
-                    if !completion.finished() {
-                        io_yield_one!(completion.clone());
-                    }
-                    if !completion.succeeded() {
-                        return Err(completion
-                            .get_error()
-                            .expect("finished database identity read should have an error")
-                            .into());
-                    }
-                    let bytes_read = read.bytes_read.load(Ordering::Acquire);
-                    turso_assert!(
-                        bytes_read != usize::MAX,
-                        "successful database identity read must record the byte count"
-                    );
-                    if read.read_page && bytes_read != read.header_buf.len() {
-                        return Err(CompletionError::ShortRead {
-                            page_idx: DatabaseHeader::PAGE_ID,
-                            expected: read.header_buf.len(),
-                            actual: bytes_read,
-                        }
-                        .into());
-                    }
-                    if bytes_read < DatabaseHeader::SIZE {
-                        return Err(LimboError::Corrupt(
-                            "database header unreadable after checkpoint sync".into(),
-                        )
-                        .into());
-                    }
-                    let (db_size_pages, db_header_crc32c) =
-                        super::wal::database_identity_from_header_bytes(
-                            &read.header_buf.as_slice()[..DatabaseHeader::SIZE],
-                        )?;
-                    if let Some(c) = wal.install_durable_backfill_proof(
-                        read.max_frame,
-                        db_size_pages,
-                        db_header_crc32c,
-                        self.get_sync_type(),
-                    )? {
-                        self.checkpoint_state.write().phase = CheckpointPhase::SyncBackfillProof {
-                            clear_page_cache,
-                            max_frame: read.max_frame,
-                        };
-                        io_yield_one!(c);
-                    }
-                    self.checkpoint_state.write().phase = CheckpointPhase::PublishBackfill {
-                        clear_page_cache,
-                        max_frame: read.max_frame,
-                    };
-                    continue;
-                }
-                CheckpointPhase::SyncBackfillProof {
-                    clear_page_cache,
-                    max_frame,
-                } => {
-                    self.checkpoint_state.write().phase = CheckpointPhase::PublishBackfill {
-                        clear_page_cache,
-                        max_frame,
-                    };
-                    continue;
-                }
-                CheckpointPhase::PublishBackfill {
-                    clear_page_cache,
-                    max_frame,
-                } => {
-                    {
-                        let state = self.checkpoint_state.read();
-                        let result = state.result.as_ref().expect("result should be set");
-                        turso_assert!(
-                            result.wal_checkpoint_backfilled > 0,
-                            "PublishBackfill phase requires frames backfilled during checkpoint",
-                            {
-                                "publish_backfill": max_frame,
-                                "wal_max_frame": result.wal_max_frame,
-                                "wal_total_backfilled": result.wal_total_backfilled,
-                                "wal_checkpoint_backfilled": result.wal_checkpoint_backfilled
-                            }
-                        );
-                        turso_assert!(
-                            max_frame == result.wal_total_backfilled,
-                            "PublishBackfill target must match checkpoint result",
-                            {
-                                "publish_backfill": max_frame,
-                                "wal_total_backfilled": result.wal_total_backfilled
-                            }
-                        );
-                        turso_assert!(
-                            result.wal_total_backfilled <= result.wal_max_frame,
-                            "checkpoint result cannot backfill beyond WAL max frame",
-                            {
-                                "wal_total_backfilled": result.wal_total_backfilled,
-                                "wal_max_frame": result.wal_max_frame
-                            }
-                        );
-                    }
-                    wal.publish_backfill(max_frame);
-                    let next_phase = {
-                        let state = self.checkpoint_state.read();
-                        if matches!(state.mode, Some(CheckpointMode::Truncate { .. })) {
-                            CheckpointPhase::TruncateWalFile { clear_page_cache }
-                        } else {
-                            CheckpointPhase::Finalize { clear_page_cache }
-                        }
-                    };
-                    self.checkpoint_state.write().phase = next_phase;
-                    continue;
-                }
-                CheckpointPhase::TruncateWalFile { clear_page_cache } => {
-                    // Truncate WAL file after DB is safely synced - this ensures data durability.
-                    // If crash occurred after WAL truncate but before DB sync, data would be lost.
-                    let need_wal_truncate = {
-                        let state = self.checkpoint_state.read();
-                        turso_assert!(
-                            matches!(state.mode, Some(CheckpointMode::Truncate { .. })),
-                            "mode should be truncate in CheckpointPhase::TruncateWalFile"
-                        );
-                        let result = state.result.as_ref().expect("result should be set");
-                        !result.wal_truncate_sent || !result.wal_sync_sent
-                    };
-
-                    if !need_wal_truncate {
-                        self.checkpoint_state.write().phase =
-                            CheckpointPhase::Finalize { clear_page_cache };
-                        continue;
-                    }
-
-                    // Call WAL truncate
-                    return_if_io!(wal.truncate_wal(
-                        self.checkpoint_state
-                            .write()
-                            .result
-                            .as_mut()
-                            .expect("result should be set"),
-                        self.get_sync_type(),
-                    ));
-                }
-                CheckpointPhase::Finalize { clear_page_cache } => {
-                    let mut state = self.checkpoint_state.write();
-                    let mut res = state.result.take().expect("result should be set");
-                    state.phase = CheckpointPhase::NotCheckpointing;
-                    state.mode = None;
-                    state.lock_source = CheckpointLockSource::Acquire;
-
-                    // Clear page cache only if requested (explicit checkpoints do this, auto-checkpoint does not)
-                    if clear_page_cache {
-                        self.invalidate_all_cursors();
-                        self.page_cache.write().clear(false).map_err(|e| {
-                            res.release_guard();
-                            LimboError::InternalError(format!("Failed to clear page cache: {e:?}"))
-                        })?;
-                    }
-
-                    // Release checkpoint guard
-                    res.release_guard();
-
-                    return Ok(IOResult::Done(res));
-                }
+        if next == CheckpointStep::TruncateDbFile {
+            let mut page1_invalidated = false;
+            let truncate = co
+                .io(|ctx| {
+                    ctx.pager
+                        .truncate_db_file_step(&mut res, &mut page1_invalidated)
+                })
+                .await;
+            if let Some(c) = truncate {
+                co.yield_io(IOCompletions(c)).await;
             }
+            next = if sync_mode == crate::SyncMode::Off {
+                // Skip DB sync, proceed to WAL truncation
+                CheckpointStep::TruncateWalFile
+            } else {
+                // Sync DB first, then truncate the WAL
+                CheckpointStep::SyncDbFile
+            };
+        }
+        if next == CheckpointStep::SyncDbFile {
+            let c = co
+                .io(|ctx| {
+                    sqlite3_ondisk::begin_sync(
+                        ctx.pager.db_file.as_ref(),
+                        ctx.pager.syncing.clone(),
+                        ctx.pager.get_sync_type(),
+                    )
+                    .map(IOResult::Done)
+                })
+                .await;
+            res.db_sync_sent = true;
+            co.yield_io(IOCompletions(c)).await;
+            turso_assert!(
+                !co.with(|ctx| ctx.pager.syncing.load(Ordering::SeqCst)),
+                "syncing should be done"
+            );
+            next = if res.wal_checkpoint_backfilled > 0
+                && !matches!(
+                    mode,
+                    CheckpointMode::Restart | CheckpointMode::Truncate { .. }
+                ) {
+                CheckpointStep::ReadDbIdentity
+            } else if is_truncate {
+                CheckpointStep::TruncateWalFile
+            } else {
+                CheckpointStep::Finalize
+            };
+        }
+        if next == CheckpointStep::ReadDbIdentity {
+            let mut read = co.with(|ctx| ctx.pager.db_identity_read_of(&res));
+            let proof_sync = co
+                .io(|ctx| ctx.pager.read_db_identity_step(&mut read))
+                .await;
+            if let Some(c) = proof_sync {
+                co.yield_io(IOCompletions(c)).await;
+            }
+            co.with(|ctx| ctx.pager.publish_backfill(&res, read.max_frame));
+            next = if is_truncate {
+                CheckpointStep::TruncateWalFile
+            } else {
+                CheckpointStep::Finalize
+            };
+        }
+        if next == CheckpointStep::TruncateWalFile {
+            // Truncate WAL file after DB is safely synced - this ensures data durability.
+            // If crash occurred after WAL truncate but before DB sync, data would be lost.
+            turso_assert!(is_truncate, "mode should be truncate to truncate the WAL");
+            co.io(|ctx| {
+                let sync_type = ctx.pager.get_sync_type();
+                ctx.pager.checked_wal().truncate_wal(&mut res, sync_type)
+            })
+            .await;
+        }
+
+        // Clear page cache only if requested (explicit checkpoints do this, auto-checkpoint does not)
+        if clear_page_cache {
+            co.with(|ctx| {
+                ctx.pager.invalidate_all_cursors();
+                ctx.pager.page_cache.write().clear(false).map_err(|e| {
+                    res.release_guard();
+                    LimboError::InternalError(format!("Failed to clear page cache: {e:?}"))
+                })
+            })?;
+        }
+
+        // Release checkpoint guard
+        res.release_guard();
+
+        Ok(res)
+    }
+
+    /// Truncates the database file to the size in the header when the file
+    /// is larger. Returns the truncate when one was started. Page 1 is read
+    /// again first, because the checkpoint may have written it to the
+    /// database file from the WAL, so the cached copy of this connection
+    /// may have a stale database_size.
+    fn truncate_db_file_step(
+        &self,
+        res: &mut CheckpointResult,
+        page1_invalidated: &mut bool,
+    ) -> IOResultOr<Option<Completion>> {
+        if !*page1_invalidated {
+            let page1_key = PageCacheKey::new(DatabaseHeader::PAGE_ID);
+            self.page_cache.write().delete(page1_key)?;
+            *page1_invalidated = true;
+        }
+
+        // Truncate the database file unless already at correct size
+        let db_size = return_if_io!(self.with_header(|header| header.database_size)).get();
+        let page_size = self.get_page_size().unwrap_or_default();
+        let expected = db_size as u64 * page_size.get() as u64;
+        let should_skip_db_truncate = match self.db_file.size() {
+            Ok(current_size) => expected >= current_size,
+            Err(err) => {
+                // e.g. file.size() is not supported in web worker environment, so we should
+                // skip the truncate if we can't check the size.
+                tracing::debug!(
+                    "checkpoint(TRUNCATE): db_file.size unavailable, skipping db truncate pre-check: {err}"
+                );
+                true
+            }
+        };
+        if should_skip_db_truncate {
+            return Ok(IOResult::Done(None));
+        }
+        let c = self.db_file.truncate(
+            expected as usize,
+            Completion::new_trunc(move |_| {
+                tracing::trace!(
+                    "Database file truncated to expected size: {} bytes",
+                    expected
+                );
+            }),
+        )?;
+        res.db_truncate_sent = true;
+        Ok(IOResult::Done(Some(c)))
+    }
+
+    /// The read of the database header that proves the backfill of `res`
+    /// is durable. With a page codec the whole page 1 is read, so it can
+    /// be decoded. Otherwise reading the header is enough.
+    fn db_identity_read_of(&self, res: &CheckpointResult) -> PendingCheckpointDbIdentityRead {
+        let read_page = self.io_ctx.read().has_codec_transform();
+        let read_size = if read_page {
+            self.get_page_size_unchecked().get() as usize
+        } else {
+            PageSize::MIN as usize
+        };
+        PendingCheckpointDbIdentityRead {
+            max_frame: res.wal_total_backfilled,
+            header_buf: Arc::new(Buffer::new_temporary(read_size)),
+            bytes_read: Arc::new(AtomicUsize::new(usize::MAX)),
+            read_page,
+            completion: None,
+        }
+    }
+
+    /// Reads the synced database header, then installs the durable backfill
+    /// proof. The first run starts the read and yields it. Returns the sync
+    /// of the proof when the WAL started one.
+    fn read_db_identity_step(
+        &self,
+        read: &mut PendingCheckpointDbIdentityRead,
+    ) -> IOResultOr<Option<Completion>> {
+        if read.completion.is_none() {
+            let header_buf = read.header_buf.clone();
+            let bytes_read = read.bytes_read.clone();
+            let completion = Completion::new_read(header_buf, {
+                Box::new(move |res| {
+                    if let Ok((_buf, count)) = res {
+                        bytes_read.store(count as usize, Ordering::Release);
+                    }
+                    None
+                })
+            });
+            let c = if read.read_page {
+                self.db_file
+                    .read_page(DatabaseHeader::PAGE_ID, &self.io_ctx.read(), completion)?
+            } else {
+                self.db_file.read_header(completion)?
+            };
+            read.completion = Some(c.clone());
+            self.checkpoint_db_identity_read
+                .store(read.max_frame, Ordering::Release);
+            io_yield_one!(c);
+        }
+
+        let completion = read
+            .completion
+            .as_ref()
+            .expect("database identity read completion should be set");
+        if !completion.finished() {
+            io_yield_one!(completion.clone());
+        }
+        if !completion.succeeded() {
+            return Err(completion
+                .get_error()
+                .expect("finished database identity read should have an error")
+                .into());
+        }
+        let bytes_read = read.bytes_read.load(Ordering::Acquire);
+        turso_assert!(
+            bytes_read != usize::MAX,
+            "successful database identity read must record the byte count"
+        );
+        if read.read_page && bytes_read != read.header_buf.len() {
+            return Err(CompletionError::ShortRead {
+                page_idx: DatabaseHeader::PAGE_ID,
+                expected: read.header_buf.len(),
+                actual: bytes_read,
+            }
+            .into());
+        }
+        if bytes_read < DatabaseHeader::SIZE {
+            return Err(LimboError::Corrupt(
+                "database header unreadable after checkpoint sync".into(),
+            )
+            .into());
+        }
+        let (db_size_pages, db_header_crc32c) = super::wal::database_identity_from_header_bytes(
+            &read.header_buf.as_slice()[..DatabaseHeader::SIZE],
+        )?;
+        let proof_sync = self.checked_wal().install_durable_backfill_proof(
+            read.max_frame,
+            db_size_pages,
+            db_header_crc32c,
+            self.get_sync_type(),
+        )?;
+        self.checkpoint_db_identity_read
+            .store(NO_DB_IDENTITY_READ, Ordering::Release);
+        Ok(IOResult::Done(proof_sync))
+    }
+
+    /// Publishes the durable backfill progress after the proof is installed and synced.
+    fn publish_backfill(&self, res: &CheckpointResult, max_frame: u64) {
+        turso_assert!(
+            res.wal_checkpoint_backfilled > 0,
+            "PublishBackfill phase requires frames backfilled during checkpoint",
+            {
+                "publish_backfill": max_frame,
+                "wal_max_frame": res.wal_max_frame,
+                "wal_total_backfilled": res.wal_total_backfilled,
+                "wal_checkpoint_backfilled": res.wal_checkpoint_backfilled
+            }
+        );
+        turso_assert!(
+            max_frame == res.wal_total_backfilled,
+            "PublishBackfill target must match checkpoint result",
+            {
+                "publish_backfill": max_frame,
+                "wal_total_backfilled": res.wal_total_backfilled
+            }
+        );
+        turso_assert!(
+            res.wal_total_backfilled <= res.wal_max_frame,
+            "checkpoint result cannot backfill beyond WAL max frame",
+            {
+                "wal_total_backfilled": res.wal_total_backfilled,
+                "wal_max_frame": res.wal_max_frame
+            }
+        );
+        self.checked_wal().publish_backfill(max_frame);
+    }
+
+    /// The backfill target of the database identity read a suspended
+    /// checkpoint waits on, if one is in flight. Tests stop a checkpoint
+    /// in the gap between the database file sync and the publish.
+    #[cfg(any(test, feature = "simulator"))]
+    pub(crate) fn checkpoint_db_identity_read(&self) -> Option<u64> {
+        match self.checkpoint_db_identity_read.load(Ordering::Acquire) {
+            NO_DB_IDENTITY_READ => None,
+            max_frame => Some(max_frame),
         }
     }
 
@@ -5062,15 +4958,10 @@ impl Pager {
                 IOResult::IO(io) => io.wait(self.io.as_ref())?,
             }
 
-            let state = self.checkpoint_state.read();
-            let Some(result) = state.result.as_ref() else {
-                continue;
-            };
-            if matches!(state.phase, CheckpointPhase::ReadDbIdentity { .. })
-                && result.db_sync_sent
-                && !self.syncing.load(Ordering::SeqCst)
-            {
-                return Ok(result.wal_total_backfilled);
+            if let Some(max_frame) = self.checkpoint_db_identity_read() {
+                if !self.syncing.load(Ordering::SeqCst) {
+                    return Ok(max_frame);
+                }
             }
         }
     }
@@ -5887,7 +5778,7 @@ impl Pager {
 
     fn reset_internal_states(&self) {
         self.pending_reads.write().clear();
-        *self.checkpoint_state.write() = CheckpointState::default();
+        self.clear_checkpoint_state();
         self.syncing.store(false, Ordering::SeqCst);
         self.ops.commit.cancel();
         self.commit_info.write().reset();
@@ -7017,12 +6908,7 @@ mod checkpoint_phase_tests {
                 IOResult::IO(io) => io.wait(pager.io.as_ref()).unwrap(),
             }
 
-            let state = pager.checkpoint_state.read();
-            let Some(result) = state.result.as_ref() else {
-                continue;
-            };
-            if matches!(state.phase, CheckpointPhase::ReadDbIdentity { .. })
-                && result.db_sync_sent
+            if pager.checkpoint_db_identity_read().is_some()
                 && !pager.syncing.load(Ordering::SeqCst)
             {
                 break;
