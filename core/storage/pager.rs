@@ -1346,14 +1346,6 @@ const fn auto_vacuum_header_fields(mode: AutoVacuumMode) -> (u32, u32) {
     }
 }
 
-#[cfg(feature = "autovacuum")]
-#[derive(Debug, Clone, Copy)]
-enum BtreeCreateVacuumFullState {
-    Start,
-    AllocatePage { root_page_num: u32 },
-    PtrMapPut { allocated_page_id: u32 },
-}
-
 #[derive(Debug, Clone)]
 enum SavepointKind {
     Statement,
@@ -1537,8 +1529,6 @@ pub struct Pager {
     max_page_count: AtomicU32,
     /// The runner slots of the async pager operations.
     ops: PagerOps,
-    #[cfg(feature = "autovacuum")]
-    vacuum_state: RwLock<VacuumState>,
     pub(crate) io_ctx: RwLock<IOContext>,
     /// encryption is an opt-in feature. we will enable it only if the flag is passed
     enable_encryption: AtomicBool,
@@ -1664,11 +1654,6 @@ impl SpillYieldHook {
             false
         }
     }
-}
-
-#[cfg(feature = "autovacuum")]
-pub struct VacuumState {
-    btree_create_vacuum_full_state: BtreeCreateVacuumFullState,
 }
 
 #[derive(Debug, Clone)]
@@ -1890,6 +1875,8 @@ struct PagerOps {
     ptrmap_get: AsyncOp<PagerStep, u32, Option<PtrmapEntry>>,
     #[cfg(feature = "autovacuum")]
     ptrmap_put: AsyncOp<PagerStep, (u32, PtrmapType, u32), ()>,
+    #[cfg(feature = "autovacuum")]
+    btree_create_vacuum_full: AsyncOp<PagerStep, PageType, u32>,
 }
 
 impl PagerOps {
@@ -1905,6 +1892,12 @@ impl PagerOps {
             #[cfg(feature = "autovacuum")]
             ptrmap_put: AsyncOp::new(|| {
                 Runner::boxed(|co, args| with_handle(co, args, Pager::ptrmap_put_async))
+            }),
+            #[cfg(feature = "autovacuum")]
+            btree_create_vacuum_full: AsyncOp::new(|| {
+                Runner::boxed(|co, args| {
+                    with_handle(co, args, Pager::btree_create_vacuum_full_async)
+                })
             }),
         }
     }
@@ -1979,10 +1972,6 @@ impl Pager {
             allocate_page_state: RwLock::new(AllocatePageState::Start),
             max_page_count: AtomicU32::new(DEFAULT_MAX_PAGE_COUNT),
             ops: PagerOps::new(),
-            #[cfg(feature = "autovacuum")]
-            vacuum_state: RwLock::new(VacuumState {
-                btree_create_vacuum_full_state: BtreeCreateVacuumFullState::Start,
-            }),
             io_ctx: RwLock::new(IOContext::default()),
             enable_encryption: AtomicBool::new(false),
             init_page_1,
@@ -2944,94 +2933,85 @@ impl Pager {
                         return_if_io!(self.do_allocate_page(page_type, 0, BtreePageAllocMode::Any));
                     Ok(IOResult::Done(page.get().id() as u32))
                 }
-                AutoVacuumMode::Full => {
-                    loop {
-                        let btree_create_vacuum_full_state = {
-                            let vacuum_state = self.vacuum_state.read();
-                            vacuum_state.btree_create_vacuum_full_state
-                        };
-                        match btree_create_vacuum_full_state {
-                            BtreeCreateVacuumFullState::Start => {
-                                let (mut root_page_num, page_size) = return_if_io!(self
-                                    .with_header(|header| {
-                                        (
-                                            header.vacuum_mode_largest_root_page.get(),
-                                            header.page_size.get(),
-                                        )
-                                    }));
-
-                                turso_assert_greater_than!(root_page_num, 0, "Largest root page number cannot be 0 because that is set to 1 when creating the database with autovacuum enabled");
-                                root_page_num += 1;
-                                turso_assert_greater_than_or_equal!(
-                                    root_page_num,
-                                    FIRST_PTRMAP_PAGE_NO,
-                                    "can never be less than 2 because we have already incremented"
-                                );
-
-                                while is_ptrmap_page(root_page_num, page_size as usize) {
-                                    root_page_num += 1;
-                                }
-                                turso_assert_greater_than_or_equal!(
-                                    root_page_num,
-                                    3,
-                                    "root page must be >= 3 (number of the first root page)"
-                                );
-                                self.vacuum_state.write().btree_create_vacuum_full_state =
-                                    BtreeCreateVacuumFullState::AllocatePage { root_page_num };
-                            }
-                            BtreeCreateVacuumFullState::AllocatePage { root_page_num } => {
-                                //  root_page_num here is the desired root page
-                                let page = return_if_io!(self.do_allocate_page(
-                                    page_type,
-                                    0,
-                                    BtreePageAllocMode::Exact(root_page_num),
-                                ));
-                                let allocated_page_id = page.get().id() as u32;
-
-                                return_if_io!(self.with_header_mut(|header| {
-                                    if allocated_page_id
-                                        > header.vacuum_mode_largest_root_page.get()
-                                    {
-                                        tracing::debug!(
-                                            "Updating largest root page in header from {} to {}",
-                                            header.vacuum_mode_largest_root_page.get(),
-                                            allocated_page_id
-                                        );
-                                        header.vacuum_mode_largest_root_page =
-                                            allocated_page_id.into();
-                                    }
-                                }));
-
-                                if allocated_page_id != root_page_num {
-                                    //  TODO(Zaid): Handle swapping the allocated page with the desired root page
-                                }
-
-                                //  TODO(Zaid): Update the header metadata to reflect the new root page number
-                                self.vacuum_state.write().btree_create_vacuum_full_state =
-                                    BtreeCreateVacuumFullState::PtrMapPut { allocated_page_id };
-                            }
-                            BtreeCreateVacuumFullState::PtrMapPut { allocated_page_id } => {
-                                //  For now map allocated_page_id since we are not swapping it with root_page_num
-                                return_if_io!(self.ptrmap_put(
-                                    allocated_page_id,
-                                    PtrmapType::RootPage,
-                                    0,
-                                ));
-                                self.vacuum_state.write().btree_create_vacuum_full_state =
-                                    BtreeCreateVacuumFullState::Start;
-                                return Ok(IOResult::Done(allocated_page_id));
-                            }
-                        }
-                    }
-                }
-                AutoVacuumMode::Incremental => {
-                    return Err(LimboError::InternalError(
-                        "Incremental auto-vacuum is not supported".to_string(),
-                    )
-                    .into());
-                }
+                AutoVacuumMode::Full => self.step_op(&self.ops.btree_create_vacuum_full, page_type),
+                AutoVacuumMode::Incremental => Err(LimboError::InternalError(
+                    "Incremental auto-vacuum is not supported".to_string(),
+                )
+                .into()),
             }
         }
+    }
+
+    /// Allocates a root page in a database with full auto-vacuum: the page
+    /// after the largest root page, then records it in the pointer map.
+    #[cfg(feature = "autovacuum")]
+    async fn btree_create_vacuum_full_async(
+        co: &mut Co<PagerStep>,
+        page_type: PageType,
+    ) -> Result<u32, Box<LimboError>> {
+        let (mut root_page_num, page_size) = co
+            .io(|ctx| {
+                ctx.pager.with_header(|header| {
+                    (
+                        header.vacuum_mode_largest_root_page.get(),
+                        header.page_size.get(),
+                    )
+                })
+            })
+            .await;
+
+        turso_assert_greater_than!(root_page_num, 0, "Largest root page number cannot be 0 because that is set to 1 when creating the database with autovacuum enabled");
+        root_page_num += 1;
+        turso_assert_greater_than_or_equal!(
+            root_page_num,
+            FIRST_PTRMAP_PAGE_NO,
+            "can never be less than 2 because we have already incremented"
+        );
+
+        while is_ptrmap_page(root_page_num, page_size as usize) {
+            root_page_num += 1;
+        }
+        turso_assert_greater_than_or_equal!(
+            root_page_num,
+            3,
+            "root page must be >= 3 (number of the first root page)"
+        );
+
+        //  root_page_num here is the desired root page
+        let page = co
+            .io(|ctx| {
+                ctx.pager
+                    .do_allocate_page(page_type, 0, BtreePageAllocMode::Exact(root_page_num))
+            })
+            .await;
+        let allocated_page_id = page.get().id() as u32;
+
+        co.io(|ctx| {
+            ctx.pager.with_header_mut(|header| {
+                if allocated_page_id > header.vacuum_mode_largest_root_page.get() {
+                    tracing::debug!(
+                        "Updating largest root page in header from {} to {}",
+                        header.vacuum_mode_largest_root_page.get(),
+                        allocated_page_id
+                    );
+                    header.vacuum_mode_largest_root_page = allocated_page_id.into();
+                }
+            })
+        })
+        .await;
+
+        if allocated_page_id != root_page_num {
+            //  TODO(Zaid): Handle swapping the allocated page with the desired root page
+        }
+
+        //  TODO(Zaid): Update the header metadata to reflect the new root page number
+        //  For now map allocated_page_id since we are not swapping it with root_page_num
+        co.io(|ctx| {
+            ctx.pager
+                .ptrmap_put(allocated_page_id, PtrmapType::RootPage, 0)
+        })
+        .await;
+        Ok(allocated_page_id)
     }
 
     /// Allocate a new overflow page.
@@ -6125,17 +6105,13 @@ impl Pager {
         *self.allocate_page_state.write() = AllocatePageState::Start;
         *self.free_page_state.write() = FreePageState::Start;
         *self.spill_state.write() = SpillState::Idle;
-        #[cfg(feature = "autovacuum")]
-        {
-            let mut vacuum_state = self.vacuum_state.write();
-            vacuum_state.btree_create_vacuum_full_state = BtreeCreateVacuumFullState::Start;
-        }
-
         self.ops.read_header_page.cancel();
         #[cfg(feature = "autovacuum")]
         self.ops.ptrmap_get.cancel();
         #[cfg(feature = "autovacuum")]
         self.ops.ptrmap_put.cancel();
+        #[cfg(feature = "autovacuum")]
+        self.ops.btree_create_vacuum_full.cancel();
     }
 
     pub fn with_header<T>(&self, f: impl Fn(&DatabaseHeader) -> T) -> IOResultOr<T> {
