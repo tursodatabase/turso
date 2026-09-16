@@ -1516,8 +1516,6 @@ pub struct Pager {
     /// Note that schema cookie is 32-bits, but we use 64-bit field so we can
     /// represent case where value is not set.
     schema_cookie: AtomicU64,
-    /// State machine for async cacheflush operation.
-    cacheflush_state: RwLock<CacheFlushState>,
     /// Maximum number of pages allowed in the database. Default is 1073741823 (SQLite default).
     max_page_count: AtomicU32,
     /// The runner slots of the async pager operations.
@@ -1672,42 +1670,12 @@ enum FreelistSearch {
     },
 }
 
-enum CacheFlushStep {
-    /// Yield to caller with pending I/O, resume with given phase
-    Yield(CacheFlushState, IOCompletions),
-    /// Continue immediately to next phase (no I/O wait)
-    Continue(CacheFlushState),
-    /// Flush complete, return accumulated completions
-    Done(Vec<Completion>),
-}
-
-#[derive(Default)]
-pub enum CacheFlushState {
-    #[default]
-    Init,
-    WalPrepareStart {
-        dirty_ids: Vec<usize>,
-        completion: Completion,
-    },
-    WalPrepareFinish {
-        dirty_ids: Vec<usize>,
-        completion: Completion,
-    },
-    Collecting(CollectingState),
-    WaitingForRead {
-        state: CollectingState,
-        page_id: usize,
-        page: PageRef,
-        completion: Completion,
-    },
-}
-
-#[derive(Default)]
-pub struct CollectingState {
-    pub dirty_ids: Vec<usize>,
-    pub current_idx: usize,
-    pub collected_pages: Vec<PageRef>,
-    pub completions: Vec<Completion>,
+/// The progress of a cache flush through the dirty pages.
+struct CollectingState {
+    dirty_ids: Vec<usize>,
+    current_idx: usize,
+    collected_pages: Vec<PageRef>,
+    completions: Vec<Completion>,
 }
 
 /// Names [`PagerCtx`] as the context type of the async pager operations.
@@ -1818,6 +1786,7 @@ struct PagerOps {
     allocate_page: AsyncOp<PagerStep, (), PageRef>,
     free_page: AsyncOp<PagerStep, (Option<PageRef>, usize), ()>,
     spill: AsyncOp<PagerStep, (), ()>,
+    cacheflush: AsyncOp<PagerStep, (), Vec<Completion>>,
 }
 
 impl PagerOps {
@@ -1851,6 +1820,9 @@ impl PagerOps {
             }),
             spill: AsyncOp::new(|| {
                 Runner::boxed(|co, args| with_handle(co, args, Pager::try_spill_dirty_pages_async))
+            }),
+            cacheflush: AsyncOp::new(|| {
+                Runner::boxed(|co, args| with_handle(co, args, Pager::cacheflush_async))
             }),
         }
     }
@@ -1913,7 +1885,6 @@ impl Pager {
             page_size: AtomicU32::new(0), // 0 means not set
             reserved_space: AtomicU16::new(RESERVED_SPACE_NOT_SET),
             schema_cookie: AtomicU64::new(Self::SCHEMA_COOKIE_NOT_SET),
-            cacheflush_state: RwLock::new(CacheFlushState::default()),
             max_page_count: AtomicU32::new(DEFAULT_MAX_PAGE_COUNT),
             ops: PagerOps::new(),
             io_ctx: RwLock::new(IOContext::default()),
@@ -3861,242 +3832,115 @@ impl Pager {
     /// Unlike commit_wal, this function does not commit, checkpoint nor sync the WAL/Database.
     #[instrument(skip_all, level = Level::DEBUG)]
     pub fn cacheflush(&self) -> IOResultOr<Vec<Completion>> {
-        let wal = self
-            .wal
-            .as_ref()
-            .ok_or_else(|| LimboError::InternalError("cacheflush() called without WAL".into()))?;
-        let page_sz = self.get_page_size().unwrap_or_default();
-
-        loop {
-            let phase = std::mem::take(&mut *self.cacheflush_state.write());
-
-            match self.cacheflush_step(wal, page_sz, phase)? {
-                CacheFlushStep::Yield(next_phase, io) => {
-                    *self.cacheflush_state.write() = next_phase;
-                    return Ok(IOResult::IO(io));
-                }
-                CacheFlushStep::Continue(next_phase) => {
-                    *self.cacheflush_state.write() = next_phase;
-                }
-                CacheFlushStep::Done(completions) => {
-                    *self.cacheflush_state.write() = CacheFlushState::Init;
-                    return Ok(IOResult::Done(completions));
-                }
-            }
+        if self.wal.is_none() {
+            return Err(LimboError::InternalError("cacheflush() called without WAL".into()).into());
         }
+        self.step_op(&self.ops.cacheflush, ())
     }
 
-    /// Executes one step of the cache flush state machine.
-    #[inline]
-    fn cacheflush_step(
-        &self,
-        wal: &Arc<dyn Wal>,
-        page_sz: PageSize,
-        phase: CacheFlushState,
-    ) -> Result<CacheFlushStep> {
-        match phase {
-            CacheFlushState::Init => self.cacheflush_init(wal, page_sz),
-            CacheFlushState::WalPrepareStart {
-                dirty_ids,
-                completion,
-            } => self.cacheflush_wal_prepare_start(wal, dirty_ids, completion),
-            CacheFlushState::WalPrepareFinish {
-                dirty_ids,
-                completion,
-            } => self.cacheflush_wal_prepare_finish(dirty_ids, completion),
-            CacheFlushState::Collecting(state) => self.cacheflush_collect(wal, page_sz, state),
-            CacheFlushState::WaitingForRead {
-                state,
-                page_id,
-                page,
-                completion,
-            } => self.cacheflush_handle_read(wal, page_sz, state, page_id, page, completion),
-        }
-    }
-
-    /// Init phase: gather dirty page IDs and begin WAL preparation.
-    fn cacheflush_init(&self, wal: &Arc<dyn Wal>, page_sz: PageSize) -> Result<CacheFlushStep> {
-        let dirty_ids: Vec<usize> = self.dirty_pages.read().iter().map(|x| x as usize).collect();
-
+    /// Prepares the WAL, then appends every dirty page to it in batches.
+    /// A dirty page that was evicted from the cache is read again first.
+    /// Any error ends the flush. Returns the writes still in flight.
+    async fn cacheflush_async(
+        co: &mut Co<PagerStep>,
+        (): (),
+    ) -> Result<Vec<Completion>, Box<LimboError>> {
+        let page_sz = co.with(|ctx| ctx.pager.get_page_size().unwrap_or_default());
+        let dirty_ids: Vec<usize> = co.with(|ctx| {
+            ctx.pager
+                .dirty_pages
+                .read()
+                .iter()
+                .map(|x| x as usize)
+                .collect()
+        });
         if dirty_ids.is_empty() {
-            return Ok(CacheFlushStep::Done(Vec::new()));
+            return Ok(Vec::new());
         }
 
         // Start WAL preparation
-        match wal.prepare_wal_start(page_sz)? {
-            Some(completion) => Ok(CacheFlushStep::Yield(
-                CacheFlushState::WalPrepareStart {
-                    dirty_ids,
-                    completion: completion.clone(),
-                },
-                IOCompletions(completion),
-            )),
-            None => {
-                // No async prep needed, go straight to finish
-                let completion = wal.prepare_wal_finish(self.get_sync_type())?;
-                Ok(CacheFlushStep::Yield(
-                    CacheFlushState::WalPrepareFinish {
-                        dirty_ids,
-                        completion: completion.clone(),
-                    },
-                    IOCompletions(completion),
-                ))
+        if let Some(c) = co.with(|ctx| ctx.pager.checked_wal().prepare_wal_start(page_sz))? {
+            co.yield_io(IOCompletions(c.clone())).await;
+            while !c.succeeded() {
+                co.yield_io(IOCompletions(c.clone())).await;
             }
         }
-    }
-
-    #[inline]
-    /// Wait for WAL prepare_start, then call prepare_finish.
-    fn cacheflush_wal_prepare_start(
-        &self,
-        wal: &Arc<dyn Wal>,
-        dirty_ids: Vec<usize>,
-        completion: Completion,
-    ) -> Result<CacheFlushStep> {
-        if !completion.succeeded() {
-            return Ok(CacheFlushStep::Yield(
-                CacheFlushState::WalPrepareStart {
-                    dirty_ids,
-                    completion: completion.clone(),
-                },
-                IOCompletions(completion),
-            ));
+        let finish = co.with(|ctx| {
+            let sync_type = ctx.pager.get_sync_type();
+            ctx.pager.checked_wal().prepare_wal_finish(sync_type)
+        })?;
+        co.yield_io(IOCompletions(finish.clone())).await;
+        while !finish.succeeded() {
+            co.yield_io(IOCompletions(finish.clone())).await;
         }
 
-        let finish_completion = wal.prepare_wal_finish(self.get_sync_type())?;
-        Ok(CacheFlushStep::Yield(
-            CacheFlushState::WalPrepareFinish {
-                dirty_ids,
-                completion: finish_completion.clone(),
-            },
-            IOCompletions(finish_completion),
-        ))
-    }
-
-    #[inline]
-    /// Wait for WAL prepare_finish, then start collecting pages.
-    fn cacheflush_wal_prepare_finish(
-        &self,
-        dirty_ids: Vec<usize>,
-        completion: Completion,
-    ) -> Result<CacheFlushStep> {
-        if !completion.succeeded() {
-            return Ok(CacheFlushStep::Yield(
-                CacheFlushState::WalPrepareFinish {
-                    dirty_ids,
-                    completion: completion.clone(),
-                },
-                IOCompletions(completion),
-            ));
-        }
-
-        Ok(CacheFlushStep::Continue(CacheFlushState::Collecting(
-            CollectingState {
-                dirty_ids,
-                current_idx: 0,
-                collected_pages: Vec::new(),
-                completions: Vec::new(),
-            },
-        )))
-    }
-
-    #[inline]
-    /// Main collection loop: fetch pages from cache, handle evictions, write batches.
-    fn cacheflush_collect(
-        &self,
-        wal: &Arc<dyn Wal>,
-        page_sz: PageSize,
-        mut state: CollectingState,
-    ) -> Result<CacheFlushStep> {
+        let mut state = CollectingState {
+            dirty_ids,
+            current_idx: 0,
+            collected_pages: Vec::new(),
+            completions: Vec::new(),
+        };
         while state.current_idx < state.dirty_ids.len() {
             let page_id = state.dirty_ids[state.current_idx];
-            let cache_result = self.page_cache.write().get(&PageCacheKey::new(page_id))?;
-
-            match cache_result {
+            let cache_result = co.with(|ctx| {
+                ctx.pager
+                    .page_cache
+                    .write()
+                    .get(&PageCacheKey::new(page_id))
+            })?;
+            let page = match cache_result {
                 Some(page) => {
                     trace!(
                         "cacheflush(page={}, page_type={:?})",
                         page_id,
                         page.get_contents().page_type().ok()
                     );
-                    state.collected_pages.push(page);
-                    state.current_idx += 1;
+                    page
                 }
                 None => {
                     // Page evicted, need async read from WAL
                     trace!("cacheflush: page {} evicted, reading from WAL", page_id);
-                    let (page, completion) =
-                        self.read_page_no_cache(page_id as i64, None, false, None)?;
-
-                    if !completion.succeeded() {
-                        return Ok(CacheFlushStep::Yield(
-                            CacheFlushState::WaitingForRead {
-                                state,
-                                page_id,
-                                page,
-                                completion: completion.clone(),
-                            },
-                            IOCompletions(completion),
-                        ));
+                    let (page, completion) = co.with(|ctx| {
+                        ctx.pager
+                            .read_page_no_cache(page_id as i64, None, false, None)
+                    })?;
+                    if completion.succeeded() {
+                        trace!(
+                            "cacheflush(page={}, page_type={:?}) [re-read sync]",
+                            page_id,
+                            page.get_contents().page_type().ok()
+                        );
+                    } else {
+                        co.yield_io(IOCompletions(completion.clone())).await;
+                        while !completion.succeeded() {
+                            if completion.finished() {
+                                let err = completion.get_error().expect(
+                                    "finished unsuccessful cacheflush read must have an error",
+                                );
+                                return Err(err.into());
+                            }
+                            co.yield_io(IOCompletions(completion.clone())).await;
+                        }
+                        trace!(
+                            "cacheflush(page={}, page_type={:?}) [re-read complete]",
+                            page_id,
+                            page.get_contents().page_type().ok()
+                        );
                     }
-
-                    // Sync read completed immediately
-                    trace!(
-                        "cacheflush(page={}, page_type={:?}) [re-read sync]",
-                        page_id,
-                        page.get_contents().page_type().ok()
-                    );
-                    state.collected_pages.push(page);
-                    state.current_idx += 1;
+                    page
                 }
-            }
+            };
+            state.collected_pages.push(page);
+            state.current_idx += 1;
             if Self::should_flush_batch(&state) {
-                self.flush_page_batch(wal, page_sz, &mut state)?;
+                co.with(|ctx| {
+                    ctx.pager
+                        .flush_page_batch(ctx.pager.checked_wal(), page_sz, &mut state)
+                })?;
             }
         }
         // All pages collected and written
-        Ok(CacheFlushStep::Done(state.completions))
-    }
-
-    /// Handle completion of async page read for evicted page.
-    fn cacheflush_handle_read(
-        &self,
-        wal: &Arc<dyn Wal>,
-        page_sz: PageSize,
-        mut state: CollectingState,
-        page_id: usize,
-        page: PageRef,
-        completion: Completion,
-    ) -> Result<CacheFlushStep> {
-        if !completion.succeeded() {
-            if completion.finished() {
-                let err = completion
-                    .get_error()
-                    .expect("finished unsuccessful cacheflush read must have an error");
-                return Err(err.into());
-            }
-            return Ok(CacheFlushStep::Yield(
-                CacheFlushState::WaitingForRead {
-                    state,
-                    page_id,
-                    page,
-                    completion: completion.clone(),
-                },
-                IOCompletions(completion),
-            ));
-        }
-        trace!(
-            "cacheflush(page={}, page_type={:?}) [re-read complete]",
-            page_id,
-            page.get_contents().page_type().ok()
-        );
-        state.collected_pages.push(page);
-        state.current_idx += 1;
-        if Self::should_flush_batch(&state) {
-            self.flush_page_batch(wal, page_sz, &mut state)?;
-        }
-
-        Ok(CacheFlushStep::Continue(CacheFlushState::Collecting(state)))
+        Ok(state.completions)
     }
 
     #[inline]
@@ -4183,7 +4027,7 @@ impl Pager {
         // (returns None). When it does require IO we wait for the header
         // write and the fsync that marks the WAL initialized, and keep the
         // pinned `pages` across each yield.
-        let prepare = co.with(|ctx| ctx.pager.spill_wal().prepare_wal_start(page_sz))?;
+        let prepare = co.with(|ctx| ctx.pager.checked_wal().prepare_wal_start(page_sz))?;
         let c = match prepare {
             None => {
                 // WAL already initialized: append directly. An error here
@@ -4200,7 +4044,7 @@ impl Pager {
                     .io(|ctx| {
                         let sync_type = ctx.pager.get_sync_type();
                         ctx.pager
-                            .spill_wal()
+                            .checked_wal()
                             .prepare_wal_finish(sync_type)
                             .map(IOResult::Done)
                     })
@@ -4262,10 +4106,9 @@ impl Pager {
         }
     }
 
-    fn spill_wal(&self) -> &Arc<dyn Wal> {
-        self.wal
-            .as_ref()
-            .expect("a spill to the WAL requires a WAL")
+    /// The WAL of an operation that checked it exists before it started.
+    fn checked_wal(&self) -> &Arc<dyn Wal> {
+        self.wal.as_ref().expect("the operation checked the WAL")
     }
 
     /// Appends the spill `pages` as WAL frames and returns the write. The
@@ -4282,7 +4125,8 @@ impl Pager {
                 Ok(p.to_page())
             })
             .collect::<Result<Vec<_>>>()?;
-        self.spill_wal().append_frames_vectored(wal_pages, page_sz)
+        self.checked_wal()
+            .append_frames_vectored(wal_pages, page_sz)
     }
 
     /// Marks the written pages spilled so they can be evicted while dirty.
@@ -6547,8 +6391,9 @@ mod tests {
     use crate::util::IOExt;
     use arc_swap::ArcSwapOption;
 
-    use super::{default_page1, CacheFlushState, CollectingState, Page, PageRef, Pager};
-    use crate::{Buffer, Completion, CompletionError, LimboError};
+    use super::{default_page1, Page, PageRef, Pager};
+    use crate::storage::page_transform::{PageCodec, PageCodecContext, PageCodecId};
+    use crate::{Buffer, CompletionError, IOResult, LimboError};
 
     #[test]
     fn page_id_changes_keep_header_access_at_the_correct_offset() {
@@ -6678,32 +6523,71 @@ mod tests {
         );
     }
 
+    /// A page codec that copies every page and fails to decode one of them.
+    #[derive(Debug)]
+    struct FailDecodeOfPage(u32);
+
+    impl PageCodec for FailDecodeOfPage {
+        fn codec_id(&self) -> PageCodecId {
+            PageCodecId::new(*b"pager-fail-decod")
+        }
+
+        fn required_reserved_bytes(&self) -> u8 {
+            0
+        }
+
+        fn encode_page(
+            &self,
+            _context: PageCodecContext,
+            input: &[u8],
+            output: &mut [u8],
+        ) -> crate::Result<()> {
+            output.copy_from_slice(input);
+            Ok(())
+        }
+
+        fn decode_page(
+            &self,
+            context: PageCodecContext,
+            input: &[u8],
+            output: &mut [u8],
+        ) -> crate::Result<()> {
+            if context.page_no == self.0 {
+                return Err(LimboError::InternalError("codec decode failed".into()));
+            }
+            output.copy_from_slice(input);
+            Ok(())
+        }
+    }
+
     /// Verifies that cacheflush returns a codec error when rereading an evicted page fails,
     /// and resets its state so a later flush can retry.
     #[test]
     fn cacheflush_propagates_failed_page_codec_reread() {
         let pager = pager_with_cache_capacity(5, 2);
-        let page = Arc::new(Page::new(2));
-        page.set_loaded();
-        let completion =
-            Completion::new_read(Arc::new(Buffer::new_temporary(4096)), Box::new(|_| None));
-        completion.error(CompletionError::PageCodecError { page_idx: 2 });
-        *pager.cacheflush_state.write() = CacheFlushState::WaitingForRead {
-            state: CollectingState::default(),
-            page_id: 2,
-            page,
-            completion,
-        };
+        let writes = pager.io.block(|| pager.cacheflush()).unwrap();
+        for write in writes {
+            pager.io.wait_for_completion(write).unwrap();
+        }
+        assert!(pager.dirty_pages.read().contains(2));
 
-        let err = pager.cacheflush().unwrap_err();
+        pager.set_page_codec(Arc::new(FailDecodeOfPage(2))).unwrap();
+        assert!(pager.cache_get(2).unwrap().is_none());
+
+        let err = loop {
+            match pager.cacheflush() {
+                Ok(IOResult::Done(_)) => panic!("the flush must fail on the reread of page 2"),
+                Ok(IOResult::IO(io)) => {
+                    let _ = io.wait(pager.io.as_ref());
+                }
+                Err(err) => break err,
+            }
+        };
         assert!(matches!(
             *err,
             LimboError::CompletionError(CompletionError::PageCodecError { page_idx: 2 })
         ));
-        assert!(matches!(
-            *pager.cacheflush_state.read(),
-            CacheFlushState::Init
-        ));
+        assert!(!pager.ops.cacheflush.is_active());
     }
 
     #[test]
