@@ -1649,6 +1649,49 @@ pub fn test_mvcc_writer_stale_snapshot_after_schema_updated() {
     conn1.execute("COMMIT").unwrap();
 }
 
+/// A commit whose eval waits for I/O must still store the MIN/MAX values
+/// of its delta. The database is reopened before the first delete, so the
+/// pages of the view state are not in the page cache and the eval yields.
+/// If the delete of 3 does not remove 3 from the stored values, the delete
+/// of 5 finds 3 as the next candidate and the MAX is wrong.
+#[turso_macros::test(views)]
+fn test_matview_max_after_reopen_and_deletes(tmp_db: TempDatabase) -> anyhow::Result<()> {
+    let conn = tmp_db.connect_limbo();
+    common::run_query(
+        &tmp_db,
+        &conn,
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)",
+    )?;
+    common::run_query(
+        &tmp_db,
+        &conn,
+        "CREATE MATERIALIZED VIEW mv AS SELECT MAX(v) AS m FROM t",
+    )?;
+    common::run_query(
+        &tmp_db,
+        &conn,
+        "INSERT INTO t VALUES (1, 1), (2, 2), (3, 3)",
+    )?;
+    conn.close()?;
+    drop(conn);
+
+    let reopened = TempDatabase::builder()
+        .with_db_path(&tmp_db.path)
+        .with_views(true)
+        .build();
+    let conn = reopened.connect_limbo();
+    common::run_query(&reopened, &conn, "DELETE FROM t WHERE v = 3")?;
+    common::run_query(&reopened, &conn, "INSERT INTO t VALUES (5, 5)")?;
+    common::run_query(&reopened, &conn, "DELETE FROM t WHERE v = 5")?;
+
+    let mut max = None;
+    common::run_query_on_row(&reopened, &conn, "SELECT m FROM mv", |row| {
+        max = Some(row.get::<i64>(0).unwrap());
+    })?;
+    assert_eq!(max, Some(2), "MAX(v) after the deletes of 3 and 5");
+    Ok(())
+}
+
 /// Test materialized view population with enough rows to trigger btree page splits.
 ///
 /// This test exposes a bug where the matview code doesn't properly handle
