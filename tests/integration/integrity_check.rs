@@ -142,14 +142,15 @@ fn check_strict_column(schema: &str, ty: &str, value: &str, generated: bool, exp
     } else {
         format!("INSERT INTO t VALUES (NULL, {value})")
     };
-    conn.execute(insert).unwrap();
+    conn.execute(&insert).unwrap();
     let generated_sql = if generated { " AS(a)" } else { "" };
+    let update_schema = format!(
+        "UPDATE sqlite_schema SET sql = 'CREATE TABLE t(a ANY, b {ty}{generated_sql}) STRICT' WHERE name = 't'"
+    );
     // Turso has no writable_schema pragma. Use the same schema-write bypass as
     // VACUUM during prepare, then execute normally so the write is committed.
     conn.start_nested();
-    let stmt = conn.prepare(format!(
-        "UPDATE sqlite_schema SET sql = 'CREATE TABLE t(a ANY, b {ty}{generated_sql}) STRICT' WHERE name = 't'"
-    ));
+    let stmt = conn.prepare(&update_schema);
     conn.end_nested();
     stmt.unwrap().run_ignore_rows().unwrap();
     checkpoint_database(&conn);
@@ -161,6 +162,28 @@ fn check_strict_column(schema: &str, ty: &str, value: &str, generated: bool, exp
     let conn = reopened.connect_limbo();
     assert_eq!(run_integrity_check(&conn), expected, "{ty}, {value}");
     assert_eq!(run_quick_check(&conn), expected, "{ty}, {value}");
+
+    let sqlite_dir = tempfile::TempDir::new().unwrap();
+    let sqlite_path = sqlite_dir.path().join("strict_column.db");
+    let sqlite_conn = rusqlite::Connection::open(&sqlite_path).unwrap();
+    sqlite_conn.execute_batch(schema).unwrap();
+    sqlite_conn.execute_batch(&insert).unwrap();
+    sqlite_conn
+        .execute_batch("PRAGMA writable_schema = ON")
+        .unwrap();
+    sqlite_conn.execute_batch(&update_schema).unwrap();
+    sqlite_conn.close().unwrap();
+
+    let sqlite_conn = rusqlite::Connection::open(&sqlite_path).unwrap();
+    for pragma in ["integrity_check", "quick_check"] {
+        let mut stmt = sqlite_conn.prepare(&format!("PRAGMA {pragma}")).unwrap();
+        let rows = stmt
+            .query_map([], |row| row.get::<_, String>(0))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        assert_eq!(rows.join("\n"), expected, "SQLite {pragma}: {ty}, {value}");
+    }
 }
 
 /// Default page size
