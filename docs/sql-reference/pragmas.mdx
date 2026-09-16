@@ -318,6 +318,29 @@ PRAGMA ignore_check_constraints = 1;   -- disable CHECK constraints
 PRAGMA ignore_check_constraints = 0;   -- enable CHECK constraints
 ```
 
+### writable_schema
+
+When enabled, `INSERT`, `UPDATE` and `DELETE` work on the `sqlite_schema`
+table, and a new table, index or view can have a name that starts with
+`sqlite_`. The setting is off by default. Each connection has its own
+value.
+
+`PRAGMA writable_schema = RESET` turns the setting off and reads the schema
+again from `sqlite_schema`. Use it after you change a row of that table,
+because Turso keeps the schema it read before. RESET does not work while a
+transaction is open.
+
+<Warning>
+  A wrong write to `sqlite_schema` can make the database file unusable.
+</Warning>
+
+```sql
+PRAGMA writable_schema;         -- read the setting
+PRAGMA writable_schema = ON;    -- let statements change sqlite_schema
+PRAGMA writable_schema = OFF;   -- protect sqlite_schema again
+PRAGMA writable_schema = RESET; -- protect it and read the schema again
+```
+
 ### data_sync_retry
 
 Controls whether Turso retries a disk sync (fsync) after a failure instead of treating it as fatal.

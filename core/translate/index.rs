@@ -3,7 +3,10 @@ use crate::error::SQLITE_CONSTRAINT_UNIQUE;
 use crate::function::Func;
 use crate::index_method::IndexMethodConfiguration;
 use crate::numeric::Numeric;
-use crate::schema::{Column, GeneratedType, Table, EXPR_INDEX_SENTINEL, RESERVED_TABLE_PREFIXES};
+use crate::schema::{
+    reserved_object_name_prefixes, Column, GeneratedType, Table, EXPR_INDEX_SENTINEL,
+    RESERVED_TABLE_PREFIXES,
+};
 use crate::sync::Arc;
 use crate::translate::{
     collate::CollationSeq,
@@ -69,11 +72,13 @@ fn validate(
     if tbl_name.eq_ignore_ascii_case("sqlite_sequence") {
         crate::bail_parse_error!("table sqlite_sequence may not be indexed");
     }
-    if RESERVED_TABLE_PREFIXES
+    let index_name_is_reserved = reserved_object_name_prefixes(connection.get_writable_schema())
         .iter()
-        .any(|prefix| idx_name.starts_with(prefix) || tbl_name.starts_with(prefix))
-        && !connection.is_nested_stmt()
-    {
+        .any(|prefix| idx_name.starts_with(prefix));
+    let table_name_is_reserved = RESERVED_TABLE_PREFIXES
+        .iter()
+        .any(|prefix| tbl_name.starts_with(prefix));
+    if (index_name_is_reserved || table_name_is_reserved) && !connection.is_nested_stmt() {
         bail_parse_error!(
             "Object name reserved for internal use: {}",
             original_idx_name

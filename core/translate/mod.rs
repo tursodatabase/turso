@@ -293,6 +293,7 @@ pub fn translate_inner(
         } => view::translate_create_view(
             &view_name,
             resolver,
+            connection,
             &select,
             &columns,
             temporary,

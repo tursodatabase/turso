@@ -289,7 +289,7 @@ avoid this window.
 | PRAGMA vdbe_trace                | ✅ Yes        |                                              |
 | PRAGMA wal_autocheckpoint        | ❌ No         |                                              |
 | PRAGMA wal_checkpoint            | 🚧 Partial    | Not Needed calling with param (pragma-value) |
-| PRAGMA writable_schema           | ❌ No         |                                              |
+| PRAGMA writable_schema           | ✅ Yes        | `=256` is ON here, OFF in SQLite (8-bit cast)|
 
 ##### Turso-specific PRAGMAs
 

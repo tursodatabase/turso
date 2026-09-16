@@ -406,3 +406,537 @@ fn test_pragma_vtab_query_with_limit_then_write(db: TempDatabase) {
         .named("rows committed after a pragma vtab query with LIMIT")
         .is_equal_to(vec![row![2]]);
 }
+
+fn writable_schema_flag(conn: &std::sync::Arc<turso_core::Connection>) -> i64 {
+    let rows = limbo_exec_rows(conn, "PRAGMA writable_schema");
+    match rows.as_slice() {
+        [row] => match row.as_slice() {
+            [RValue::Integer(value)] => *value,
+            other => panic!("expected one integer, got {other:?}"),
+        },
+        other => panic!("expected one row, got {other:?}"),
+    }
+}
+
+fn user_schema_rows(
+    conn: &std::sync::Arc<turso_core::Connection>,
+    columns: &str,
+) -> Vec<Vec<RValue>> {
+    const NOT_INTERNAL: &str = r"name NOT LIKE '\_\_turso%' ESCAPE '\'";
+    limbo_exec_rows(
+        conn,
+        &format!("SELECT {columns} FROM sqlite_schema WHERE {NOT_INTERNAL} ORDER BY name"),
+    )
+}
+
+fn error_message(conn: &std::sync::Arc<turso_core::Connection>, sql: &str) -> String {
+    conn.execute(sql)
+        .expect_err("statement should fail")
+        .to_string()
+}
+
+#[turso_macros::test(mvcc)]
+fn writable_schema_starts_off(db: TempDatabase) {
+    let conn = db.connect_limbo();
+    assert_eq!(writable_schema_flag(&conn), 0);
+}
+
+#[turso_macros::test(mvcc)]
+fn writable_schema_accepts_every_boolean_spelling(db: TempDatabase) {
+    let conn = db.connect_limbo();
+    let cases = [
+        ("ON", 1),
+        ("OFF", 0),
+        ("TRUE", 1),
+        ("FALSE", 0),
+        ("YES", 1),
+        ("NO", 0),
+        ("on", 1),
+        ("oFf", 0),
+        ("1", 1),
+        ("0", 0),
+        ("2", 1),
+        ("00", 0),
+        ("0.0", 0),
+        ("1.5", 1),
+        ("0x1", 1),
+        ("0x0", 0),
+        ("-1", 0),
+        ("+1", 1),
+        ("'on'", 1),
+        ("'off'", 0),
+        ("'1'", 1),
+        ("extra", 0),
+        ("full", 0),
+        ("banana", 0),
+    ];
+    for (written, expected) in cases {
+        conn.execute("PRAGMA writable_schema = ON").unwrap();
+        conn.execute(format!("PRAGMA writable_schema = {written}"))
+            .unwrap();
+        assert_eq!(
+            writable_schema_flag(&conn),
+            expected,
+            "PRAGMA writable_schema = {written}"
+        );
+    }
+}
+
+#[turso_macros::test(mvcc)]
+fn writable_schema_accepts_the_call_form(db: TempDatabase) {
+    let conn = db.connect_limbo();
+    conn.execute("PRAGMA writable_schema(1)").unwrap();
+    assert_eq!(writable_schema_flag(&conn), 1);
+    conn.execute("PRAGMA writable_schema(0)").unwrap();
+    assert_eq!(writable_schema_flag(&conn), 0);
+}
+
+#[turso_macros::test(mvcc)]
+fn writable_schema_accepts_a_schema_name(db: TempDatabase) {
+    let conn = db.connect_limbo();
+    conn.execute("PRAGMA main.writable_schema = ON").unwrap();
+    let rows = limbo_exec_rows(&conn, "PRAGMA main.writable_schema");
+    assert_eq!(rows, vec![vec![RValue::Integer(1)]]);
+}
+
+#[turso_macros::test(mvcc)]
+fn writable_schema_appears_in_pragma_list(db: TempDatabase) {
+    let conn = db.connect_limbo();
+    let rows = limbo_exec_rows(&conn, "PRAGMA pragma_list");
+    assert!(
+        rows.contains(&vec![RValue::Text("writable_schema".to_string())]),
+        "pragma_list must name writable_schema, got {rows:?}"
+    );
+}
+
+#[turso_macros::test(mvcc)]
+fn pragma_writable_schema_table_function_reads_the_flag(db: TempDatabase) {
+    let conn = db.connect_limbo();
+    let rows = limbo_exec_rows(&conn, "SELECT * FROM pragma_writable_schema");
+    assert_eq!(rows, vec![vec![RValue::Integer(0)]]);
+
+    conn.execute("PRAGMA writable_schema = ON").unwrap();
+    let rows = limbo_exec_rows(&conn, "SELECT * FROM pragma_writable_schema");
+    assert_eq!(rows, vec![vec![RValue::Integer(1)]]);
+}
+
+#[turso_macros::test(mvcc)]
+fn writable_schema_off_blocks_every_write_to_the_schema_table(db: TempDatabase) {
+    let conn = db.connect_limbo();
+    conn.execute("CREATE TABLE t(a)").unwrap();
+
+    for (sql, table) in [
+        (
+            "UPDATE sqlite_schema SET name = 'x' WHERE name = 't'",
+            "sqlite_schema",
+        ),
+        (
+            "DELETE FROM sqlite_schema WHERE name = 't'",
+            "sqlite_schema",
+        ),
+        (
+            "INSERT INTO sqlite_schema VALUES ('table','x','x',0,'CREATE TABLE x(a)')",
+            "sqlite_schema",
+        ),
+        (
+            "UPDATE sqlite_master SET name = 'x' WHERE name = 't'",
+            "sqlite_master",
+        ),
+        (
+            "DELETE FROM sqlite_master WHERE name = 't'",
+            "sqlite_master",
+        ),
+    ] {
+        let message = error_message(&conn, sql);
+        assert!(
+            message.contains(&format!("table {table} may not be modified")),
+            "{sql} gave {message}"
+        );
+    }
+}
+
+#[turso_macros::test(mvcc)]
+fn writable_schema_on_allows_writes_to_the_schema_table(db: TempDatabase) {
+    let conn = db.connect_limbo();
+    conn.execute("CREATE TABLE t(a)").unwrap();
+    conn.execute("PRAGMA writable_schema = ON").unwrap();
+
+    conn.execute("UPDATE sqlite_schema SET name = 'renamed' WHERE name = 't'")
+        .unwrap();
+    assert_eq!(
+        user_schema_rows(&conn, "type, name, tbl_name"),
+        vec![vec![
+            RValue::Text("table".to_string()),
+            RValue::Text("renamed".to_string()),
+            RValue::Text("t".to_string()),
+        ]]
+    );
+
+    conn.execute(
+        "INSERT INTO sqlite_schema VALUES ('table','ghost','ghost',0,'CREATE TABLE ghost(a)')",
+    )
+    .unwrap();
+    assert_eq!(
+        user_schema_rows(&conn, "name"),
+        vec![
+            vec![RValue::Text("ghost".to_string())],
+            vec![RValue::Text("renamed".to_string())],
+        ]
+    );
+
+    conn.execute("DELETE FROM sqlite_schema WHERE name IN ('ghost', 'renamed')")
+        .unwrap();
+    assert!(user_schema_rows(&conn, "name").is_empty());
+}
+
+#[turso_macros::test(mvcc)]
+fn writable_schema_on_allows_writes_through_the_sqlite_master_name(db: TempDatabase) {
+    let conn = db.connect_limbo();
+    conn.execute("CREATE TABLE t(a)").unwrap();
+    conn.execute("PRAGMA writable_schema = ON").unwrap();
+    conn.execute("UPDATE sqlite_master SET name = 'renamed' WHERE name = 't'")
+        .unwrap();
+    assert_eq!(
+        user_schema_rows(&conn, "name"),
+        vec![vec![RValue::Text("renamed".to_string())]]
+    );
+}
+
+#[turso_macros::test(mvcc)]
+fn writable_schema_off_again_blocks_the_schema_table(db: TempDatabase) {
+    let conn = db.connect_limbo();
+    conn.execute("CREATE TABLE t(a)").unwrap();
+    conn.execute("PRAGMA writable_schema = ON").unwrap();
+    conn.execute("DELETE FROM sqlite_schema WHERE name = 'nothing'")
+        .unwrap();
+
+    conn.execute("PRAGMA writable_schema = OFF").unwrap();
+    let message = error_message(&conn, "DELETE FROM sqlite_schema WHERE name = 't'");
+    assert!(
+        message.contains("table sqlite_schema may not be modified"),
+        "got {message}"
+    );
+}
+
+#[turso_macros::test(mvcc)]
+fn writable_schema_on_allows_object_names_that_start_with_sqlite(db: TempDatabase) {
+    let conn = db.connect_limbo();
+    conn.execute("PRAGMA writable_schema = ON").unwrap();
+
+    conn.execute("CREATE TABLE sqlite_new(a)").unwrap();
+    conn.execute("CREATE TABLE indexed(a)").unwrap();
+    conn.execute("CREATE INDEX sqlite_ix ON indexed(a)")
+        .unwrap();
+    conn.execute("CREATE VIEW sqlite_v AS SELECT 1").unwrap();
+    conn.execute("CREATE TABLE plain(a)").unwrap();
+    conn.execute("ALTER TABLE plain RENAME TO sqlite_renamed")
+        .unwrap();
+
+    assert_eq!(
+        user_schema_rows(&conn, "name"),
+        vec![
+            vec![RValue::Text("indexed".to_string())],
+            vec![RValue::Text("sqlite_ix".to_string())],
+            vec![RValue::Text("sqlite_new".to_string())],
+            vec![RValue::Text("sqlite_renamed".to_string())],
+            vec![RValue::Text("sqlite_v".to_string())],
+        ]
+    );
+}
+
+#[turso_macros::test(mvcc)]
+fn writable_schema_still_refuses_an_index_on_a_sqlite_table(db: TempDatabase) {
+    let conn = db.connect_limbo();
+    conn.execute("PRAGMA writable_schema = ON").unwrap();
+    conn.execute("CREATE TABLE sqlite_new(a)").unwrap();
+
+    let message = error_message(&conn, "CREATE INDEX ix ON sqlite_new(a)");
+    assert!(
+        message.contains("reserved for internal use"),
+        "got {message}"
+    );
+}
+
+#[turso_macros::test(mvcc)]
+fn writable_schema_off_blocks_object_names_that_start_with_sqlite(db: TempDatabase) {
+    let conn = db.connect_limbo();
+    conn.execute("CREATE TABLE plain(a)").unwrap();
+
+    for sql in [
+        "CREATE TABLE sqlite_new(a)",
+        "CREATE INDEX sqlite_ix ON plain(a)",
+        "CREATE VIEW sqlite_v AS SELECT 1",
+        "ALTER TABLE plain RENAME TO sqlite_renamed",
+    ] {
+        let message = error_message(&conn, sql);
+        assert!(
+            message.contains("reserved for internal use"),
+            "{sql} gave {message}"
+        );
+    }
+}
+
+#[turso_macros::test(mvcc)]
+fn writable_schema_on_still_protects_turso_internal_tables(db: TempDatabase) {
+    let conn = db.connect_limbo();
+    conn.execute("PRAGMA writable_schema = ON").unwrap();
+
+    let message = error_message(&conn, "CREATE TABLE __turso_internal_x(a)");
+    assert!(
+        message.contains("reserved for internal use"),
+        "got {message}"
+    );
+
+    conn.execute("CREATE TABLE t(a INTEGER PRIMARY KEY AUTOINCREMENT)")
+        .unwrap();
+    conn.execute("INSERT INTO t VALUES (1)").unwrap();
+    let rows = limbo_exec_rows(
+        &conn,
+        r"SELECT name FROM sqlite_schema WHERE name LIKE '\_\_turso%' ESCAPE '\'",
+    );
+    let RValue::Text(backing_table) = rows[0][0].clone() else {
+        panic!("expected a table name, got {rows:?}");
+    };
+    let message = error_message(&conn, &format!("DELETE FROM {backing_table}"));
+    assert!(message.contains("may not be modified"), "got {message}");
+}
+
+#[turso_macros::test(mvcc)]
+fn writable_schema_reset_turns_the_flag_off_and_reads_the_schema_again(db: TempDatabase) {
+    let conn = db.connect_limbo();
+    conn.execute("CREATE TABLE t(a)").unwrap();
+    conn.execute("PRAGMA writable_schema = ON").unwrap();
+    conn.execute("UPDATE sqlite_schema SET sql = 'CREATE TABLE t(a,b)' WHERE name = 't'")
+        .unwrap();
+
+    let rows = limbo_exec_rows(&conn, "SELECT name FROM pragma_table_info('t')");
+    assert_eq!(
+        rows,
+        vec![vec![RValue::Text("a".to_string())]],
+        "the schema in memory must stay as it was until RESET"
+    );
+
+    conn.execute("PRAGMA writable_schema = RESET").unwrap();
+    assert_eq!(writable_schema_flag(&conn), 0);
+    let rows = limbo_exec_rows(&conn, "SELECT name FROM pragma_table_info('t')");
+    assert_eq!(
+        rows,
+        vec![
+            vec![RValue::Text("a".to_string())],
+            vec![RValue::Text("b".to_string())],
+        ]
+    );
+}
+
+#[turso_macros::test(mvcc)]
+fn writable_schema_reset_matches_any_letter_case(db: TempDatabase) {
+    let conn = db.connect_limbo();
+    conn.execute("CREATE TABLE t(a)").unwrap();
+    conn.execute("PRAGMA writable_schema = ON").unwrap();
+    conn.execute("UPDATE sqlite_schema SET sql = 'CREATE TABLE t(a,b)' WHERE name = 't'")
+        .unwrap();
+    conn.execute("PRAGMA writable_schema = ReSeT").unwrap();
+    let rows = limbo_exec_rows(&conn, "SELECT name FROM pragma_table_info('t')");
+    assert_eq!(
+        rows.len(),
+        2,
+        "RESET in mixed case must read the schema again"
+    );
+}
+
+#[turso_macros::test(mvcc)]
+fn writable_schema_off_does_not_read_the_schema_again(db: TempDatabase) {
+    let conn = db.connect_limbo();
+    conn.execute("CREATE TABLE t(a)").unwrap();
+    conn.execute("PRAGMA writable_schema = ON").unwrap();
+    conn.execute("UPDATE sqlite_schema SET sql = 'CREATE TABLE t(a,b)' WHERE name = 't'")
+        .unwrap();
+    conn.execute("PRAGMA writable_schema = OFF").unwrap();
+    let rows = limbo_exec_rows(&conn, "SELECT name FROM pragma_table_info('t')");
+    assert_eq!(rows, vec![vec![RValue::Text("a".to_string())]]);
+}
+
+#[turso_macros::test(mvcc)]
+fn writable_schema_reset_fails_inside_a_transaction(db: TempDatabase) {
+    let conn = db.connect_limbo();
+    conn.execute("CREATE TABLE t(a)").unwrap();
+    conn.execute("BEGIN").unwrap();
+    conn.execute("INSERT INTO t VALUES (1)").unwrap();
+
+    let message = error_message(&conn, "PRAGMA writable_schema = RESET");
+    assert!(
+        message.contains("Cannot execute PRAGMA writable_schema=RESET inside a transaction"),
+        "got {message}"
+    );
+
+    conn.execute("COMMIT").unwrap();
+    conn.execute("PRAGMA writable_schema = RESET").unwrap();
+}
+
+#[turso_macros::test(mvcc)]
+fn writable_schema_is_set_for_one_connection_only(db: TempDatabase) {
+    let first = db.connect_limbo();
+    let second = db.connect_limbo();
+    first.execute("PRAGMA writable_schema = ON").unwrap();
+
+    assert_eq!(writable_schema_flag(&first), 1);
+    assert_eq!(writable_schema_flag(&second), 0);
+
+    second.execute("CREATE TABLE t(a)").unwrap();
+    let message = error_message(&second, "DELETE FROM sqlite_schema WHERE name = 't'");
+    assert!(
+        message.contains("table sqlite_schema may not be modified"),
+        "got {message}"
+    );
+}
+
+#[turso_macros::test]
+fn writable_schema_is_not_kept_in_the_database_file(db: TempDatabase) {
+    let conn = db.connect_limbo();
+    conn.execute("PRAGMA writable_schema = ON").unwrap();
+    conn.execute("CREATE TABLE t(a)").unwrap();
+    assert_eq!(writable_schema_flag(&conn), 1);
+    conn.close().unwrap();
+
+    let reopened = db.connect_limbo();
+    assert_eq!(writable_schema_flag(&reopened), 0);
+}
+
+#[turso_macros::test]
+fn writable_schema_write_is_saved_to_the_database_file(db: TempDatabase) {
+    let conn = db.connect_limbo();
+    conn.execute("CREATE TABLE t(a)").unwrap();
+    conn.execute("PRAGMA writable_schema = ON").unwrap();
+    conn.execute("UPDATE sqlite_schema SET sql = 'CREATE TABLE t(a,b)' WHERE name = 't'")
+        .unwrap();
+    conn.close().unwrap();
+
+    let reopened = db.connect_limbo();
+    assert_eq!(
+        user_schema_rows(&reopened, "sql"),
+        vec![vec![RValue::Text("CREATE TABLE t(a,b)".to_string())]]
+    );
+}
+
+#[turso_macros::test(mvcc)]
+fn writable_schema_off_stops_a_statement_prepared_while_it_was_on(db: TempDatabase) {
+    let conn = db.connect_limbo();
+    conn.execute("CREATE TABLE t(a)").unwrap();
+    conn.execute("PRAGMA writable_schema = ON").unwrap();
+
+    let mut stmt = conn
+        .prepare("DELETE FROM sqlite_schema WHERE name = 't'")
+        .expect("the statement must compile while the flag is on");
+
+    conn.execute("PRAGMA writable_schema = OFF").unwrap();
+
+    let message = stmt
+        .step()
+        .expect_err("the statement must compile again and fail")
+        .to_string();
+    assert!(
+        message.contains("table sqlite_schema may not be modified"),
+        "got {message}"
+    );
+    assert_eq!(
+        user_schema_rows(&conn, "name"),
+        vec![vec![RValue::Text("t".to_string())]]
+    );
+}
+
+#[turso_macros::test(mvcc)]
+fn writable_schema_off_stops_the_statement_from_compiling(db: TempDatabase) {
+    let conn = db.connect_limbo();
+    conn.execute("CREATE TABLE t(a)").unwrap();
+
+    let message = conn
+        .prepare("DELETE FROM sqlite_schema WHERE name = 't'")
+        .expect_err("a schema-table write must not compile while the flag is off")
+        .to_string();
+    assert!(
+        message.contains("table sqlite_schema may not be modified"),
+        "got {message}"
+    );
+}
+
+#[turso_macros::test(mvcc)]
+fn writable_schema_does_not_change_reads_of_the_schema_table(db: TempDatabase) {
+    let conn = db.connect_limbo();
+    conn.execute("CREATE TABLE t(a)").unwrap();
+    assert_eq!(
+        user_schema_rows(&conn, "type, name"),
+        vec![vec![
+            RValue::Text("table".to_string()),
+            RValue::Text("t".to_string()),
+        ]]
+    );
+}
+
+#[turso_macros::test(mvcc)]
+fn writable_schema_can_change_inside_a_transaction(db: TempDatabase) {
+    let conn = db.connect_limbo();
+    conn.execute("BEGIN").unwrap();
+    conn.execute("PRAGMA writable_schema = ON").unwrap();
+    assert_eq!(writable_schema_flag(&conn), 1);
+    conn.execute("COMMIT").unwrap();
+    assert_eq!(writable_schema_flag(&conn), 1);
+}
+
+#[turso_macros::test(mvcc)]
+fn writable_schema_stays_on_after_a_rollback(db: TempDatabase) {
+    let conn = db.connect_limbo();
+    conn.execute("BEGIN").unwrap();
+    conn.execute("PRAGMA writable_schema = ON").unwrap();
+    conn.execute("ROLLBACK").unwrap();
+    assert_eq!(writable_schema_flag(&conn), 1);
+}
+
+#[turso_macros::test(mvcc)]
+fn writable_schema_write_rolls_back_with_its_transaction(db: TempDatabase) {
+    let conn = db.connect_limbo();
+    conn.execute("CREATE TABLE t(a)").unwrap();
+    conn.execute("PRAGMA writable_schema = ON").unwrap();
+    conn.execute("BEGIN").unwrap();
+    conn.execute("DELETE FROM sqlite_schema WHERE name = 't'")
+        .unwrap();
+    conn.execute("ROLLBACK").unwrap();
+    assert_eq!(
+        user_schema_rows(&conn, "name"),
+        vec![vec![RValue::Text("t".to_string())]]
+    );
+}
+
+#[turso_macros::test(mvcc)]
+fn query_only_still_stops_a_write_to_the_schema_table(db: TempDatabase) {
+    let conn = db.connect_limbo();
+    conn.execute("CREATE TABLE t(a)").unwrap();
+    conn.execute("PRAGMA writable_schema = ON").unwrap();
+    conn.execute("PRAGMA query_only = 1").unwrap();
+
+    let message = error_message(&conn, "DELETE FROM sqlite_schema WHERE name = 't'");
+    assert!(
+        message.contains("query_only"),
+        "query_only must stop the write, got {message}"
+    );
+}
+
+#[test]
+fn writable_schema_applies_to_an_attached_database() {
+    let db = TempDatabase::builder()
+        .with_opts(turso_core::DatabaseOpts::new().with_attach(true))
+        .build();
+    let conn = db.connect_limbo();
+    let aux_path = db.path.with_extension("writable_schema_attached.db");
+    conn.execute(format!("ATTACH '{}' AS aux", aux_path.display()))
+        .unwrap();
+    conn.execute("CREATE TABLE aux.t(a)").unwrap();
+
+    let message = error_message(&conn, "DELETE FROM aux.sqlite_schema WHERE name = 't'");
+    assert!(message.contains("may not be modified"), "got {message}");
+
+    conn.execute("PRAGMA writable_schema = ON").unwrap();
+    conn.execute("DELETE FROM aux.sqlite_schema WHERE name = 't'")
+        .unwrap();
+    let rows = limbo_exec_rows(&conn, "SELECT count(*) FROM aux.sqlite_schema");
+    assert_eq!(rows, vec![vec![RValue::Integer(0)]]);
+}

@@ -321,20 +321,6 @@ fn update_pragma(
     schema_was_explicit: bool,
     program: &mut ProgramBuilder,
 ) -> crate::Result<TransactionMode> {
-    let parse_pragma_enabled = |expr: &ast::Expr| -> bool {
-        if let Expr::Literal(Literal::Numeric(n)) = expr {
-            return !matches!(n.as_str(), "0");
-        };
-        let name_bytes = match expr {
-            Expr::Literal(Literal::Keyword(name)) => name.as_bytes(),
-            Expr::Name(name) | Expr::Id(name) => name.as_str().as_bytes(),
-            _ => "".as_bytes(),
-        };
-        match_ignore_ascii_case!(match name_bytes {
-            b"ON" | b"TRUE" | b"YES" | b"1" => true,
-            _ => false,
-        })
-    };
     match pragma {
         PragmaName::ApplicationId => {
             let data = parse_signed_number(&value)?;
@@ -737,6 +723,14 @@ fn update_pragma(
             connection.set_check_constraints_ignored(enabled);
             Ok(TransactionMode::None)
         }
+        PragmaName::WritableSchema => {
+            let argument = pragma_argument_text(&value).unwrap_or_default();
+            connection.set_writable_schema(pragma_text_is_true(&argument));
+            if argument.eq_ignore_ascii_case("reset") {
+                connection.reset_schema()?;
+            }
+            Ok(TransactionMode::None)
+        }
         #[cfg(target_vendor = "apple")]
         PragmaName::Fullfsync => {
             let enabled = parse_pragma_enabled(&value);
@@ -807,6 +801,45 @@ fn update_pragma(
             program,
         ),
     }
+}
+
+fn parse_pragma_enabled(value: &ast::Expr) -> bool {
+    pragma_text_is_true(&pragma_argument_text(value).unwrap_or_default())
+}
+
+fn pragma_argument_text(value: &ast::Expr) -> Option<String> {
+    match value {
+        Expr::Literal(Literal::Numeric(n)) => Some(n.to_string()),
+        Expr::Literal(Literal::Keyword(k)) => Some(k.to_string()),
+        Expr::Name(name) | Expr::Id(name) => Some(name.as_str().to_string()),
+        Expr::Unary(ast::UnaryOperator::Positive, inner) => pragma_argument_text(inner),
+        Expr::Unary(ast::UnaryOperator::Negative, inner) => {
+            pragma_argument_text(inner).map(|text| format!("-{text}"))
+        }
+        _ => None,
+    }
+}
+
+fn pragma_text_is_true(text: &str) -> bool {
+    if text.as_bytes().first().is_some_and(u8::is_ascii_digit) {
+        return leading_number_is_not_zero(text);
+    }
+    match_ignore_ascii_case!(match text.as_bytes() {
+        b"on" | b"yes" | b"true" => true,
+        _ => false,
+    })
+}
+
+fn leading_number_is_not_zero(text: &str) -> bool {
+    if let Some(digits) = text.strip_prefix("0x").or_else(|| text.strip_prefix("0X")) {
+        return digits
+            .bytes()
+            .take_while(u8::is_ascii_hexdigit)
+            .any(|digit| digit != b'0');
+    }
+    text.bytes()
+        .take_while(u8::is_ascii_digit)
+        .any(|digit| digit != b'0')
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1576,6 +1609,13 @@ fn query_pragma(
 
             Ok(TransactionMode::None)
         }
+        PragmaName::WritableSchema => {
+            let register = program.alloc_register();
+            program.emit_int(connection.get_writable_schema() as i64, register);
+            program.emit_result_row(register, 1);
+            program.add_pragma_result_column(pragma.to_string());
+            Ok(TransactionMode::None)
+        }
         PragmaName::VdbeTrace => Ok(TransactionMode::None),
         PragmaName::FreelistCount => {
             let value = pager.freepage_list();
@@ -1940,4 +1980,41 @@ fn update_cache_size(
 fn update_page_size(connection: Arc<crate::Connection>, page_size: u32) -> crate::Result<()> {
     connection.reset_page_size(page_size)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{leading_number_is_not_zero, pragma_text_is_true};
+
+    #[test]
+    fn pragma_boolean_names_follow_sqlite() {
+        for text in ["on", "ON", "On", "yes", "YES", "true", "TRUE"] {
+            assert!(pragma_text_is_true(text), "{text} must read as true");
+        }
+        for text in [
+            "off", "OFF", "no", "NO", "false", "FALSE", "reset", "RESET", "extra", "full", "",
+            "banana", "-1", "+", "onn",
+        ] {
+            assert!(!pragma_text_is_true(text), "{text} must read as false");
+        }
+    }
+
+    #[test]
+    fn pragma_boolean_numbers_follow_sqlite() {
+        for text in ["1", "2", "9", "1.5", "0x1", "0XA", "10"] {
+            assert!(pragma_text_is_true(text), "{text} must read as true");
+        }
+        for text in ["0", "00", "0.0", "0x0", "0x", "0.5"] {
+            assert!(!pragma_text_is_true(text), "{text} must read as false");
+        }
+    }
+
+    #[test]
+    fn leading_number_stops_at_the_first_character_that_is_not_a_digit() {
+        assert!(leading_number_is_not_zero("1abc"));
+        assert!(!leading_number_is_not_zero("0abc"));
+        assert!(!leading_number_is_not_zero("0.9"));
+        assert!(leading_number_is_not_zero("0x00f"));
+        assert!(!leading_number_is_not_zero("0x00g1"));
+    }
 }
