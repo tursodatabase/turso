@@ -468,7 +468,7 @@ impl<A: ConcurrentAllocator> IndexShadowScan<A> {
             self.epoch = epoch;
         }
         if matches!(self.state, IndexShadowScanState::Uninitialized) {
-            // Scoped so the skiplist guard drops before `step` re-borrows `db`.
+            // Scoped so the skiplist guard drops before later `db` borrows.
             let iter = {
                 // Avoid allocating skiplist here with `try_get_or_insert_with`
                 let index_rows = db.index_rows.get(&table_id);
