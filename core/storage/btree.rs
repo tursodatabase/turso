@@ -29,7 +29,7 @@ use crate::{
             FREELIST_TRUNK_OFFSET_NEXT_TRUNK_PTR, INTERIOR_PAGE_HEADER_SIZE_BYTES,
             LEAF_PAGE_HEADER_SIZE_BYTES, LEFT_CHILD_PTR_SIZE_BYTES,
         },
-        state_machines::{AdvanceState, MoveToState, SeekEndState},
+        state_machines::{AdvanceState, MoveToState},
     },
     translate::plan::IterationDirection,
     turso_assert,
@@ -900,8 +900,6 @@ pub struct BTreeCursor {
     rightmost_page_id: Option<usize>,
     /// State machine for [BTreeCursor::next] and [BTreeCursor::prev]
     advance_state: AdvanceState,
-    /// State machine for [BTreeCursor::seek_end]
-    seek_end_state: SeekEndState,
     /// State machine for [BTreeCursor::move_to]
     move_to_state: MoveToState,
     /// Whether the next call to [BTreeCursor::next()] should be a no-op.
@@ -1249,6 +1247,7 @@ macro_rules! cursor_ops {
 cursor_ops! {
     count / run_count: () => usize = count,
     rewind / run_rewind: () => () = rewind,
+    seek_end / run_seek_end: () => () = seek_end,
     last / run_last: () => () = last,
     seek_to_last / run_seek_to_last: () => () = seek_to_last,
 }
@@ -1282,6 +1281,19 @@ async fn rewind(co: &mut Co<BtreeStep>, (): ()) -> OpResult<()> {
     co.io(|ctx| ctx.cursor.get_next_record()).await;
     co.with(|ctx| ctx.cursor.read_overflow_state = None);
     Ok(())
+}
+
+/// Moves the cursor past the last cell of the rightmost leaf, where an
+/// append goes.
+async fn seek_end(co: &mut Co<BtreeStep>, (): ()) -> OpResult<()> {
+    co.with(|ctx| ctx.cursor.clear_saved_seek());
+    move_to_root(co).await;
+    loop {
+        match co.with(|ctx| ctx.cursor.seek_end_step())? {
+            None => return Ok(()),
+            Some(page_id) => descend_rightmost(co, page_id).await,
+        }
+    }
 }
 
 /// Moves the cursor to the last record: the `Last` opcode.
@@ -1440,6 +1452,23 @@ impl BTreeCursor {
         }
     }
 
+    /// Looks at the page on top of the stack during the descent to the
+    /// rightmost leaf for an append. On the leaf, moves just past its last
+    /// cell and returns None. On an interior page, returns its rightmost
+    /// child.
+    fn seek_end_step(&mut self) -> OpResult<Option<u32>> {
+        let mem_page = self.stack.top_ref();
+        let contents = mem_page.get_contents();
+        if contents.is_leaf() {
+            self.stack.set_cell_index(contents.cell_count() as i32);
+            return Ok(None);
+        }
+        match contents.rightmost_pointer()? {
+            Some(right_most_pointer) => Ok(Some(right_most_pointer)),
+            None => unreachable!("interior page must have rightmost pointer"),
+        }
+    }
+
     /// If the rightmost page is known and the cursor is on it, moves to its
     /// last cell without a seek. True if the page has a cell. The known
     /// page is safe to trust: every change of this btree, by this cursor
@@ -1543,7 +1572,6 @@ impl BTreeCursor {
             ops: CursorOps::default(),
             rightmost_page_id: None,
             advance_state: AdvanceState::Start,
-            seek_end_state: SeekEndState::Start,
             move_to_state: MoveToState::Start,
             skip_advance: false,
             reusable_cell_payload: crate::alloc::vec![],
@@ -7756,41 +7784,7 @@ impl CursorTrait for BTreeCursor {
         if self.valid_state == CursorValidState::Invalid {
             return Ok(IOResult::Done(()));
         }
-        loop {
-            match self.seek_end_state {
-                SeekEndState::Start => {
-                    self.clear_saved_seek();
-                    let c = return_if_io!(self.move_to_root_nonblock());
-                    self.seek_end_state = SeekEndState::ProcessPage;
-                    if let Some(c) = c {
-                        io_yield_one!(c);
-                    }
-                }
-                SeekEndState::ProcessPage => {
-                    let mem_page = self.stack.top_ref();
-                    let contents = mem_page.get_contents();
-                    if contents.is_leaf() {
-                        // set cursor just past the last cell to append
-                        self.stack.set_cell_index(contents.cell_count() as i32);
-                        self.seek_end_state = SeekEndState::Start;
-                        return Ok(IOResult::Done(()));
-                    }
-
-                    match contents.rightmost_pointer()? {
-                        Some(right_most_pointer) => {
-                            let (child, c) =
-                                return_if_io!(self.read_page(right_most_pointer as i64));
-                            self.stack.set_cell_index(contents.cell_count() as i32 + 1); // invalid on interior
-                            self.stack.push(child);
-                            if let Some(c) = c {
-                                io_yield_one!(c);
-                            }
-                        }
-                        None => unreachable!("interior page must have rightmost pointer"),
-                    }
-                }
-            }
-        }
+        self.run_seek_end(())
     }
 
     #[cfg_attr(debug_assertions, instrument(skip_all, level = Level::DEBUG))]
