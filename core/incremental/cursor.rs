@@ -1,3 +1,4 @@
+use crate::coro::{with_handle, BoxedResumable, Co, Runner, StepContext, YieldSlot};
 use crate::numeric::Numeric;
 use crate::sync::Arc;
 use crate::sync::Mutex;
@@ -10,32 +11,55 @@ use crate::{
     },
     return_if_io,
     storage::btree::CursorTrait,
-    types::{IOResult, SeekKey, SeekOp, SeekResult, Value},
+    types::{IOCompletions, IOResult, SeekKey, SeekOp, SeekResult, Value},
     LimboError, Pager, Result,
 };
 
-/// State machine for seek operations
-#[derive(Debug)]
-enum SeekState {
-    /// Initial state before seeking
-    Init,
+/// Names [`SeekCtx`] as the context type of the seek of a view cursor.
+struct SeekStep;
 
-    /// Actively seeking with btree and uncommitted iterators
-    Seek {
-        /// The row we are trying to find
-        target: i64,
-    },
+impl StepContext for SeekStep {
+    type Error = Box<LimboError>;
+    type Ctx<'a> = SeekCtx<'a>;
+}
 
-    /// Btree seek returned TryAdvance, now advancing with next()/prev()
-    Advancing {
-        /// The row we are trying to find
-        target: i64,
-        /// The seek operation (determines direction of advance)
-        op: SeekOp,
-    },
+/// The context of one step of a seek: the cursor, and the slot for what
+/// suspends the step.
+struct SeekCtx<'a> {
+    cursor: &'a mut MaterializedViewCursor,
+    io: Option<IOCompletions>,
+    err: Option<Box<LimboError>>,
+}
 
-    /// Seek completed successfully
+impl YieldSlot<Box<LimboError>> for SeekCtx<'_> {
+    fn park_io(&mut self, io: IOCompletions) {
+        self.io = Some(io);
+    }
+
+    fn take_io(&mut self) -> Option<IOCompletions> {
+        self.io.take()
+    }
+
+    fn park_err(&mut self, err: Box<LimboError>) {
+        self.err = Some(err);
+    }
+
+    fn take_err(&mut self) -> Option<Box<LimboError>> {
+        self.err.take()
+    }
+}
+
+/// The seek of a view cursor as a step function, boxed once per cursor and
+/// reused for every seek.
+type SeekRunner = BoxedResumable<SeekStep, (i64, SeekOp), SeekResult>;
+
+/// What a seek does after it merged the btree row with the uncommitted
+/// changes.
+enum SeekNext {
+    /// The seek is over. The current row says whether a row was found.
     Done,
+    /// Every row seen so far cancelled out, so seek again from this target.
+    SeekAgain { target: i64 },
 }
 
 /// Cursor for reading materialized views that combines:
@@ -67,8 +91,8 @@ pub struct MaterializedViewCursor {
     // Execution state for circuit processing
     execute_state: ExecuteState,
 
-    // State machine for seek operations
-    seek_state: SeekState,
+    // The seek that is in progress, or the runner of the last one
+    seek: Option<SeekRunner>,
 }
 
 impl MaterializedViewCursor {
@@ -87,7 +111,7 @@ impl MaterializedViewCursor {
             last_tx_state_len: 0,
             current_row: None,
             execute_state: ExecuteState::Uninitialized,
-            seek_state: SeekState::Init,
+            seek: None,
         })
     }
 
@@ -167,15 +191,37 @@ impl MaterializedViewCursor {
         )]))
     }
 
+    /// Runs one step of the seek: starts a new seek when none is suspended,
+    /// and resumes the suspended one otherwise. The target and the operation
+    /// are ignored on a resume.
+    fn do_seek(&mut self, target_rowid: i64, op: SeekOp) -> IOResultOr<SeekResult> {
+        let mut seek = self
+            .seek
+            .take()
+            .unwrap_or_else(|| Runner::boxed(|co, args| with_handle(co, args, seek_row)));
+        let mut ctx = SeekCtx {
+            cursor: self,
+            io: None,
+            err: None,
+        };
+        let result = seek.resume(&mut ctx, (target_rowid, op));
+        self.seek = Some(seek);
+        result
+    }
+
+    /// True while a seek waits for I/O.
+    fn seek_is_pending(&self) -> bool {
+        self.seek.as_ref().is_some_and(|seek| seek.is_active())
+    }
+
     /// Process btree changes: merge with uncommitted, build zset, and determine result.
-    /// Returns the next state action: either Done with a result, or updates seek_state for another iteration.
     fn process_btree_changes(
         &mut self,
         target: i64,
         target_rowid: i64,
         op: SeekOp,
         changes: Vec<(HashableRow, isize)>,
-    ) -> IOResultOr<()> {
+    ) -> SeekNext {
         let mut btree_entries = Delta { changes };
         let changes = self.uncommitted.seek(target, op);
 
@@ -185,8 +231,7 @@ impl MaterializedViewCursor {
         // if empty pre-zset, means nothing was found. Empty post-zset can mean that
         // we just canceled weights.
         if btree_entries.is_empty() {
-            self.seek_state = SeekState::Done;
-            return Ok(IOResult::Done(()));
+            return SeekNext::Done;
         }
 
         let min_seen = btree_entries
@@ -208,8 +253,7 @@ impl MaterializedViewCursor {
         if !ret.is_empty() {
             let (row, _) = &ret[0];
             self.current_row = Some((row.rowid, row.values.clone()));
-            self.seek_state = SeekState::Done;
-            return Ok(IOResult::Done(()));
+            return SeekNext::Done;
         }
 
         let new_target = match op {
@@ -220,91 +264,17 @@ impl MaterializedViewCursor {
             SeekOp::LE { eq_only: true } | SeekOp::GE { eq_only: true } => None,
         };
 
-        if let Some(target) = new_target {
-            self.seek_state = SeekState::Seek { target };
-        } else {
-            self.seek_state = SeekState::Done;
+        match new_target {
+            Some(target) => SeekNext::SeekAgain { target },
+            None => SeekNext::Done,
         }
-        Ok(IOResult::Done(()))
     }
 
-    /// Internal seek implementation that doesn't check preconditions
-    fn do_seek(&mut self, target_rowid: i64, op: SeekOp) -> IOResultOr<SeekResult> {
-        loop {
-            // Process state machine - need to handle mutable borrow carefully
-            match &mut self.seek_state {
-                SeekState::Init => {
-                    self.current_row = None;
-                    self.seek_state = SeekState::Seek {
-                        target: target_rowid,
-                    };
-                }
-                SeekState::Seek { target } => {
-                    let target = *target;
-                    let btree_result =
-                        return_if_io!(self.btree_cursor.seek(SeekKey::TableRowId(target), op));
-
-                    let changes = match btree_result {
-                        SeekResult::Found => return_if_io!(self.read_btree_delta_entry()),
-                        SeekResult::TryAdvance => {
-                            // Transition to Advancing state before calling next/prev.
-                            // This ensures that if next/prev returns IO, we resume in
-                            // Advancing state and don't redundantly call seek again.
-                            self.seek_state = SeekState::Advancing { target, op };
-                            continue;
-                        }
-                        SeekResult::NotFound => Vec::new(),
-                    };
-
-                    return_if_io!(self.process_btree_changes(target, target_rowid, op, changes));
-
-                    // Check if we're done or need to continue seeking
-                    if matches!(self.seek_state, SeekState::Done) {
-                        let result = if self.current_row.is_some() {
-                            SeekResult::Found
-                        } else {
-                            SeekResult::NotFound
-                        };
-                        return Ok(IOResult::Done(result));
-                    }
-                    // Otherwise state is Seek with new target, loop continues
-                }
-                SeekState::Advancing { target, op } => {
-                    let target = *target;
-                    let op = *op;
-
-                    // Cursor is positioned at the leaf but current entry doesn't match.
-                    // Advance in the appropriate direction to find the next matching entry.
-                    match op {
-                        SeekOp::GT | SeekOp::GE { .. } => {
-                            return_if_io!(self.btree_cursor.next())
-                        }
-                        SeekOp::LT | SeekOp::LE { .. } => {
-                            return_if_io!(self.btree_cursor.prev())
-                        }
-                    };
-                    // read_btree_delta_entry handles the case where cursor is at end
-                    let changes = return_if_io!(self.read_btree_delta_entry());
-
-                    return_if_io!(self.process_btree_changes(target, target_rowid, op, changes));
-
-                    // Check if we're done or need to continue seeking
-                    if matches!(self.seek_state, SeekState::Done) {
-                        let result = if self.current_row.is_some() {
-                            SeekResult::Found
-                        } else {
-                            SeekResult::NotFound
-                        };
-                        return Ok(IOResult::Done(result));
-                    }
-                    // Otherwise state is Seek with new target, loop continues
-                }
-                SeekState::Done => {
-                    // We always return before setting the state to done. Meaning if we got here,
-                    // this is a new seek.
-                    self.seek_state = SeekState::Init;
-                }
-            }
+    fn seek_result(&self) -> SeekResult {
+        if self.current_row.is_some() {
+            SeekResult::Found
+        } else {
+            SeekResult::NotFound
         }
     }
 
@@ -327,12 +297,9 @@ impl MaterializedViewCursor {
 
     pub fn next(&mut self) -> IOResultOr<bool> {
         // If there's a pending seek operation (due to IO), complete it first.
-        // SeekState::Seek or SeekState::Advancing means IO was interrupted mid-seek and we need to resume.
-        // SeekState::Init means cursor was never positioned - don't resume, fall through to check current_row.
-        if matches!(
-            self.seek_state,
-            SeekState::Seek { .. } | SeekState::Advancing { .. }
-        ) {
+        // A cursor that was never positioned has no pending seek, so fall
+        // through to check current_row.
+        if self.seek_is_pending() {
             // target is ignored when resuming
             let result = return_if_io!(self.do_seek(0, SeekOp::GT));
             return Ok(IOResult::Done(result == SeekResult::Found));
@@ -372,6 +339,52 @@ impl MaterializedViewCursor {
 
     pub fn is_valid(&self) -> Result<bool> {
         Ok(self.current_row.is_some())
+    }
+}
+
+/// Finds the row that `op` selects against the target: seeks the btree,
+/// merges the row it lands on with the uncommitted changes, and seeks again
+/// past rows whose weights cancel out.
+async fn seek_row(
+    co: &mut Co<SeekStep>,
+    (target_rowid, op): (i64, SeekOp),
+) -> Result<SeekResult, Box<LimboError>> {
+    co.with(|ctx| ctx.cursor.current_row = None);
+    let mut target = target_rowid;
+    loop {
+        let btree_result = co
+            .io(|ctx| {
+                ctx.cursor
+                    .btree_cursor
+                    .seek(SeekKey::TableRowId(target), op)
+            })
+            .await;
+        let changes = match btree_result {
+            SeekResult::Found => co.io(|ctx| ctx.cursor.read_btree_delta_entry()).await,
+            SeekResult::TryAdvance => {
+                // The cursor is on the leaf but the entry there does not
+                // match, so advance in the direction of the seek.
+                match op {
+                    SeekOp::GT | SeekOp::GE { .. } => {
+                        co.io(|ctx| ctx.cursor.btree_cursor.next()).await
+                    }
+                    SeekOp::LT | SeekOp::LE { .. } => {
+                        co.io(|ctx| ctx.cursor.btree_cursor.prev()).await
+                    }
+                }
+                // read_btree_delta_entry handles the case where cursor is at end
+                co.io(|ctx| ctx.cursor.read_btree_delta_entry()).await
+            }
+            SeekResult::NotFound => Vec::new(),
+        };
+        let next = co.with(|ctx| {
+            ctx.cursor
+                .process_btree_changes(target, target_rowid, op, changes)
+        });
+        match next {
+            SeekNext::Done => return Ok(co.with(|ctx| ctx.cursor.seek_result())),
+            SeekNext::SeekAgain { target: again } => target = again,
+        }
     }
 }
 
