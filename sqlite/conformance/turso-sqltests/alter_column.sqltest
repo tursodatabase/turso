@@ -873,3 +873,16 @@ expect {
     a2|a2c2|c2
     ok
 }
+
+test alter-column-strict-any-gencol-affinity {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, a TEXT, c ANY) STRICT;
+    ALTER TABLE t ALTER COLUMN c TO g ANY AS (a);
+    INSERT INTO t(id,a) VALUES(1,'42');
+    SELECT typeof(g) FROM t;
+    CREATE INDEX t_g ON t(g);
+    PRAGMA integrity_check;
+}
+expect {
+    text
+    ok
+}

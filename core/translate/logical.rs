@@ -2406,7 +2406,7 @@ mod tests {
     use super::*;
     use crate::alloc::vec;
     use crate::schema::{
-        BTreeCharacteristics, BTreeTable, ColDef, Column as SchemaColumn, Schema, Type,
+        BTreeCharacteristics, BTreeTable, ColDef, ColDefFlags, Column as SchemaColumn, Schema, Type,
     };
     use turso_parser::parser::Parser;
 
@@ -2423,9 +2423,7 @@ mod tests {
                 Type::Integer,
                 None,
                 ColDef {
-                    primary_key: true,
-                    rowid_alias: true,
-                    notnull: true,
+                    flags: ColDefFlags::PrimaryKey | ColDefFlags::RowIdAlias | ColDefFlags::NotNull,
                     ..Default::default()
                 },
             ),
@@ -2458,9 +2456,7 @@ mod tests {
                 Type::Integer,
                 None,
                 ColDef {
-                    primary_key: true,
-                    rowid_alias: true,
-                    notnull: true,
+                    flags: ColDefFlags::PrimaryKey | ColDefFlags::RowIdAlias | ColDefFlags::NotNull,
                     ..Default::default()
                 },
             ),
@@ -2505,9 +2501,7 @@ mod tests {
                 Type::Integer,
                 None,
                 ColDef {
-                    primary_key: true,
-                    rowid_alias: true,
-                    notnull: true,
+                    flags: ColDefFlags::PrimaryKey | ColDefFlags::RowIdAlias | ColDefFlags::NotNull,
                     ..Default::default()
                 },
             ),

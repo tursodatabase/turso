@@ -1422,7 +1422,7 @@ mod tests {
     use super::*;
     use crate::alloc::vec;
     use crate::schema::{
-        BTreeCharacteristics, BTreeTable, ColDef, Column as SchemaColumn, Schema, Type,
+        BTreeCharacteristics, BTreeTable, ColDef, ColDefFlags, Column as SchemaColumn, Schema, Type,
     };
     use crate::sync::Arc;
     use turso_parser::ast;
@@ -1442,13 +1442,8 @@ mod tests {
                 Type::Integer,
                 None,
                 ColDef {
-                    primary_key: true,
-                    rowid_alias: true,
-                    notnull: true,
-                    explicit_notnull: false,
-                    unique: false,
-                    hidden: false,
-                    notnull_conflict_clause: None,
+                    flags: ColDefFlags::PrimaryKey | ColDefFlags::RowIdAlias | ColDefFlags::NotNull,
+                    ..Default::default()
                 },
             ),
             SchemaColumn::new_default_text(Some("name".to_string()), "TEXT".to_string(), None),
@@ -1475,13 +1470,8 @@ mod tests {
                 Type::Integer,
                 None,
                 ColDef {
-                    primary_key: true,
-                    rowid_alias: true,
-                    notnull: true,
-                    explicit_notnull: false,
-                    unique: false,
-                    hidden: false,
-                    notnull_conflict_clause: None,
+                    flags: ColDefFlags::PrimaryKey | ColDefFlags::RowIdAlias | ColDefFlags::NotNull,
+                    ..Default::default()
                 },
             ),
             SchemaColumn::new(
@@ -1521,13 +1511,8 @@ mod tests {
                 Type::Integer,
                 None,
                 ColDef {
-                    primary_key: true,
-                    rowid_alias: true,
-                    notnull: true,
-                    explicit_notnull: false,
-                    unique: false,
-                    hidden: false,
-                    notnull_conflict_clause: None,
+                    flags: ColDefFlags::PrimaryKey | ColDefFlags::RowIdAlias | ColDefFlags::NotNull,
+                    ..Default::default()
                 },
             ),
             SchemaColumn::new_default_text(Some("name".to_string()), "TEXT".to_string(), None),

@@ -13,8 +13,8 @@ use crate::mvcc::database::{
 use crate::mvcc::MvccClock;
 use crate::numeric::Numeric;
 use crate::schema::{
-    render_gencol_expr_sql_with_new_names, Schema, Table, EXPR_INDEX_SENTINEL, SCHEMA_TABLE_NAME,
-    SQLITE_SEQUENCE_TABLE_NAME,
+    render_gencol_expr_sql_with_new_names, FromDefinitionFlags, Schema, Table, EXPR_INDEX_SENTINEL,
+    SCHEMA_TABLE_NAME, SQLITE_SEQUENCE_TABLE_NAME,
 };
 use crate::state_machine::StateMachine;
 use crate::storage::btree::{
@@ -17172,20 +17172,24 @@ pub fn op_alter_column(
     let conn = program.connection.clone();
 
     let normalized_table_name = normalize_ident(table_name.as_str());
-    let old_column_name = conn.with_schema(*db, |schema| {
+    let (old_column_name, is_strict) = conn.with_schema(*db, |schema| {
         let table = schema
             .tables
             .get(&normalized_table_name)
             .expect("table being ALTERed should be in schema");
-        table
+        let old_column_name = table
             .get_column_at(*column_index)
             .expect("column being ALTERed should be in schema")
             .name
             .as_ref()
             .expect("column being ALTERed should be named")
-            .clone()
+            .clone();
+        (old_column_name, table.is_strict())
     });
-    let new_column = crate::schema::Column::try_from(definition.as_ref())?;
+    let new_column = crate::schema::Column::from_definition(
+        definition.as_ref(),
+        FromDefinitionFlags::empty().with(FromDefinitionFlags::InStrictTable, is_strict),
+    )?;
     let new_name = definition.col_name.as_str().to_owned();
 
     let view_rewrites: Vec<(usize, String, RewrittenView)> = if *rename {

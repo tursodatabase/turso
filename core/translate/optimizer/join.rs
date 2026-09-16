@@ -2374,8 +2374,8 @@ mod tests {
     use crate::alloc::TursoSliceExt;
     use crate::{
         schema::{
-            BTreeCharacteristics, BTreeTable, ColDef, Column, Index, IndexColumn, Schema, Table,
-            Type,
+            BTreeCharacteristics, BTreeTable, ColDef, ColDefFlags, Column, Index, IndexColumn,
+            Schema, Table, Type,
         },
         stats::AnalyzeStats,
         translate::{
@@ -4126,8 +4126,7 @@ mod tests {
             c.ty,
             None,
             ColDef {
-                primary_key: false,
-                rowid_alias: c.is_rowid_alias,
+                flags: ColDefFlags::empty().with(ColDefFlags::RowIdAlias, c.is_rowid_alias),
                 ..Default::default()
             },
         )

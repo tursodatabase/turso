@@ -5438,6 +5438,35 @@ expect {
     ok
 }
 
+test gencol_issue6161_strict_coercion_all_write_paths {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, b INTEGER AS(a), a TEXT, c ANY AS(a), d TEXT AS(b)) STRICT;
+    INSERT INTO t(id,a) VALUES(1,'42'),(2,NULL);
+    SELECT id,b,typeof(b),c,typeof(c),d,typeof(d) FROM t ORDER BY id;
+    UPDATE t SET a='43' WHERE id=1;
+    SELECT b,typeof(b),c,typeof(c),d,typeof(d) FROM t WHERE id=1;
+    INSERT INTO t(id,a) VALUES(1,'44') ON CONFLICT(id) DO UPDATE SET a=excluded.a;
+    SELECT b,typeof(b),c,typeof(c),d,typeof(d) FROM t WHERE id=1;
+}
+expect {
+    1|42|integer|42|text|42|text
+    2||null||null||null
+    43|integer|43|text|43|text
+    44|integer|44|text|44|text
+}
+
+test gencol_issue6161_strict_any_gencol_via_alter {
+    CREATE TABLE al(id INTEGER PRIMARY KEY, a TEXT) STRICT;
+    INSERT INTO al VALUES(1,'42');
+    ALTER TABLE al ADD COLUMN c ANY AS (a);
+    SELECT id, c, typeof(c) FROM al;
+    CREATE INDEX al_c ON al(c);
+    PRAGMA integrity_check;
+}
+expect {
+    1|42|text
+    ok
+}
+
 # Issue #7058: ALTER TABLE ADD COLUMN must reject a column that has
 # both DEFAULT and a GENERATED clause.
 

@@ -4858,6 +4858,19 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
                     primary_key = true;
                 }
 
+                let flags = ColDefFlags::empty()
+                    .with(ColDefFlags::InStrictTable, is_strict)
+                    .with(ColDefFlags::PrimaryKey, primary_key)
+                    .with(
+                        ColDefFlags::RowIdAlias,
+                        typename_exactly_integer
+                            && primary_key
+                            && !primary_key_desc_columns_constraint,
+                    )
+                    .with(ColDefFlags::NotNull, notnull)
+                    .with(ColDefFlags::ExplicitNotNull, explicit_notnull)
+                    .with(ColDefFlags::Unique, unique);
+
                 let mut col = Column::new(
                     Some(name),
                     ty_str,
@@ -4866,14 +4879,7 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
                     ty,
                     collation,
                     ColDef {
-                        primary_key,
-                        rowid_alias: typename_exactly_integer
-                            && primary_key
-                            && !primary_key_desc_columns_constraint,
-                        notnull,
-                        explicit_notnull,
-                        unique,
-                        hidden: false,
+                        flags,
                         notnull_conflict_clause,
                     },
                 );
@@ -5212,13 +5218,55 @@ pub struct Column {
 
 #[derive(Default)]
 pub struct ColDef {
-    pub primary_key: bool,
-    pub rowid_alias: bool,
-    pub notnull: bool,
-    pub explicit_notnull: bool,
-    pub unique: bool,
-    pub hidden: bool,
     pub notnull_conflict_clause: Option<ResolveType>,
+    pub flags: ColDefFlags,
+}
+
+bitflags! {
+    #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+    pub struct ColDefFlags: u8 {
+        const InStrictTable = 1 << 0;
+        const PrimaryKey = 1 << 1;
+        const RowIdAlias = 1 << 2;
+        const NotNull = 1 << 3;
+        const ExplicitNotNull = 1 << 4;
+        const Unique = 1 << 5;
+        const Hidden = 1 << 6;
+    }
+}
+
+bitflags! {
+    #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+    pub struct FromDefinitionFlags: u8 {
+        const InStrictTable = 1 << 0;
+    }
+}
+
+impl FromDefinitionFlags {
+    #[inline]
+    pub const fn with(self, flags: Self, enabled: bool) -> Self {
+        if enabled {
+            self.union(flags)
+        } else {
+            self.difference(flags)
+        }
+    }
+}
+
+impl ColDefFlags {
+    #[inline]
+    pub const fn from_def_flags(flags: &FromDefinitionFlags) -> Self {
+        Self::from_bits_truncate(flags.bits())
+    }
+
+    #[inline]
+    pub const fn with(self, flags: Self, enabled: bool) -> Self {
+        if enabled {
+            self.union(flags)
+        } else {
+            self.difference(flags)
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -5248,6 +5296,7 @@ impl Column {
             self.affinity()
         }
     }
+
     pub fn new_default_text(
         name: Option<String>,
         ty_str: String,
@@ -5260,7 +5309,7 @@ impl Column {
             None,
             Type::Text,
             None,
-            ColDef::default(),
+            Default::default(),
         )
     }
     pub fn new_default_integer(
@@ -5275,7 +5324,7 @@ impl Column {
             None,
             Type::Integer,
             None,
-            ColDef::default(),
+            Default::default(),
         )
     }
     #[inline]
@@ -5300,7 +5349,11 @@ impl Column {
             collation: col,
             coldef: &coldef,
         });
-        info.override_affinity(Affinity::affinity(&ty_str));
+        if coldef.flags.contains(ColDefFlags::InStrictTable) && ty_str.eq_ignore_ascii_case("ANY") {
+            info.override_affinity(Affinity::Blob);
+        } else {
+            info.override_affinity(Affinity::affinity(&ty_str));
+        }
 
         Self {
             name,
@@ -5309,9 +5362,111 @@ impl Column {
             default,
             generated_type,
             info,
-            explicit_notnull: coldef.explicit_notnull,
+            explicit_notnull: coldef.flags.contains(ColDefFlags::ExplicitNotNull),
             notnull_conflict_clause: coldef.notnull_conflict_clause,
         }
+    }
+
+    pub fn from_definition(value: &ColumnDefinition, flags: FromDefinitionFlags) -> Result<Self> {
+        let name = value.col_name.as_str();
+
+        let mut default = None;
+        let mut generated = None;
+        let mut coldef = ColDef {
+            flags: ColDefFlags::from_def_flags(&flags),
+            ..Default::default()
+        };
+        let mut primary_key_order = SortOrder::Asc;
+        let mut collation = None;
+
+        for ast::NamedColumnConstraint { constraint, .. } in &value.constraints {
+            match constraint {
+                ast::ColumnConstraint::PrimaryKey { order, .. } => {
+                    coldef.flags.insert(ColDefFlags::PrimaryKey);
+                    primary_key_order = order.unwrap_or(SortOrder::Asc);
+                }
+                ast::ColumnConstraint::NotNull {
+                    nullable,
+                    conflict_clause,
+                    ..
+                } => {
+                    coldef.flags.set(
+                        ColDefFlags::NotNull | ColDefFlags::ExplicitNotNull,
+                        !nullable,
+                    );
+                    coldef.notnull_conflict_clause = *conflict_clause;
+                }
+                ast::ColumnConstraint::Unique(..) => coldef.flags.insert(ColDefFlags::Unique),
+                ast::ColumnConstraint::Default(expr) => {
+                    default.replace(
+                        translate_ident_to_string_literal(expr).unwrap_or_else(|| expr.clone()),
+                    );
+                }
+                ast::ColumnConstraint::Collate { collation_name } => {
+                    let collation_seq = CollationSeq::new(collation_name.as_str())?;
+                    if collation_seq.is_custom() {
+                        crate::bail_parse_error!(
+                            "custom collations are not supported in schema definitions"
+                        );
+                    }
+                    collation.replace(collation_seq);
+                }
+                ast::ColumnConstraint::Generated { expr, .. } => {
+                    generated = Some(expr.clone());
+                }
+                _ => {}
+            };
+        }
+
+        let (ty, typename_exactly_integer) = match value.col_type {
+            Some(ref data_type) => type_from_name(&data_type.name),
+            None => (Type::Null, false),
+        };
+
+        let ty_str = value
+            .col_type
+            .as_ref()
+            .map(|t| t.name.to_string())
+            .unwrap_or_default();
+
+        let ty_params: std::vec::Vec<Box<turso_parser::ast::Expr>> = match &value.col_type {
+            Some(ast::Type {
+                size: Some(ast::TypeSize::MaxSize(ref expr)),
+                ..
+            }) => std::vec![expr.clone()],
+            Some(ast::Type {
+                size: Some(ast::TypeSize::TypeSize(ref e1, ref e2)),
+                ..
+            }) => std::vec![e1.clone(), e2.clone()],
+            _ => std::vec::Vec::new(),
+        };
+
+        coldef
+            .flags
+            .set(ColDefFlags::Hidden, ty_str.contains("HIDDEN"));
+        coldef.flags.set(
+            ColDefFlags::RowIdAlias,
+            coldef.flags.contains(ColDefFlags::PrimaryKey)
+                && typename_exactly_integer
+                && primary_key_order != SortOrder::Desc,
+        );
+
+        let mut col = Column::new(
+            Some(name.to_string()),
+            ty_str,
+            default,
+            generated,
+            ty,
+            collation,
+            coldef,
+        );
+        col.ty_params = ty_params;
+        if let Some(t) = value.col_type.as_ref() {
+            if t.is_array() {
+                col.set_array_dimensions(t.array_dimensions);
+            }
+        }
+        Ok(col)
     }
 
     #[inline]
@@ -5451,106 +5606,6 @@ impl Column {
     #[inline]
     pub fn set_array_dimensions(&mut self, dims: u32) {
         self.info.set_array_dimensions(dims)
-    }
-}
-
-// TODO: This might replace some of util::columns_from_create_table_body
-impl TryFrom<&ColumnDefinition> for Column {
-    type Error = crate::LimboError;
-
-    fn try_from(value: &ColumnDefinition) -> crate::Result<Self> {
-        let name = value.col_name.as_str();
-
-        let mut default = None;
-        let mut generated = None;
-        let mut notnull = false;
-        let mut notnull_conflict_clause = None;
-        let mut primary_key = false;
-        let mut unique = false;
-        let mut collation = None;
-
-        for ast::NamedColumnConstraint { constraint, .. } in &value.constraints {
-            match constraint {
-                ast::ColumnConstraint::PrimaryKey { .. } => primary_key = true,
-                ast::ColumnConstraint::NotNull {
-                    nullable,
-                    conflict_clause,
-                    ..
-                } => {
-                    notnull = !nullable;
-                    notnull_conflict_clause = *conflict_clause;
-                }
-                ast::ColumnConstraint::Unique(..) => unique = true,
-                ast::ColumnConstraint::Default(expr) => {
-                    default.replace(
-                        translate_ident_to_string_literal(expr).unwrap_or_else(|| expr.clone()),
-                    );
-                }
-                ast::ColumnConstraint::Collate { collation_name } => {
-                    let collation_seq = CollationSeq::new(collation_name.as_str())?;
-                    if collation_seq.is_custom() {
-                        crate::bail_parse_error!(
-                            "custom collations are not supported in schema definitions"
-                        );
-                    }
-                    collation.replace(collation_seq);
-                }
-                ast::ColumnConstraint::Generated { expr, .. } => {
-                    generated = Some(expr.clone());
-                }
-                _ => {}
-            };
-        }
-
-        let ty = match value.col_type {
-            Some(ref data_type) => type_from_name(&data_type.name).0,
-            None => Type::Null,
-        };
-
-        let ty_str = value
-            .col_type
-            .as_ref()
-            .map(|t| t.name.to_string())
-            .unwrap_or_default();
-
-        let ty_params: std::vec::Vec<Box<turso_parser::ast::Expr>> = match &value.col_type {
-            Some(ast::Type {
-                size: Some(ast::TypeSize::MaxSize(ref expr)),
-                ..
-            }) => std::vec![expr.clone()],
-            Some(ast::Type {
-                size: Some(ast::TypeSize::TypeSize(ref e1, ref e2)),
-                ..
-            }) => std::vec![e1.clone(), e2.clone()],
-            _ => std::vec::Vec::new(),
-        };
-
-        let hidden = ty_str.contains("HIDDEN");
-
-        let mut col = Column::new(
-            Some(name.to_string()),
-            ty_str,
-            default,
-            generated,
-            ty,
-            collation,
-            ColDef {
-                primary_key,
-                rowid_alias: primary_key && matches!(ty, Type::Integer),
-                notnull,
-                explicit_notnull: notnull,
-                unique,
-                hidden,
-                notnull_conflict_clause,
-            },
-        );
-        col.ty_params = ty_params;
-        if let Some(t) = value.col_type.as_ref() {
-            if t.is_array() {
-                col.set_array_dimensions(t.array_dimensions);
-            }
-        }
-        Ok(col)
     }
 }
 
@@ -6101,6 +6156,184 @@ impl Index {
 mod tests {
     use super::*;
     use crate::alloc::vec;
+
+    #[test]
+    fn test_column_definition_flag_conversion() {
+        for bits in 0..=u8::MAX {
+            let Some(flags) = FromDefinitionFlags::from_bits(bits) else {
+                continue;
+            };
+            let mut expected = ColDefFlags::empty();
+            for (name, _) in flags.iter_names() {
+                expected.insert(ColDefFlags::from_name(name).expect("column flag must exist"));
+            }
+            assert_eq!(ColDefFlags::from_def_flags(&flags), expected, "{flags:?}");
+        }
+    }
+
+    #[test]
+    fn test_from_definition_flags_with() {
+        let flags = FromDefinitionFlags::empty().with(FromDefinitionFlags::InStrictTable, true);
+        assert_eq!(flags, FromDefinitionFlags::InStrictTable);
+        assert_eq!(flags.with(FromDefinitionFlags::InStrictTable, true), flags);
+        assert_eq!(flags.with(FromDefinitionFlags::empty(), false), flags);
+        assert_eq!(
+            flags.with(FromDefinitionFlags::InStrictTable, false),
+            FromDefinitionFlags::empty()
+        );
+        assert_eq!(
+            FromDefinitionFlags::empty()
+                .with(FromDefinitionFlags::InStrictTable, true)
+                .with(FromDefinitionFlags::InStrictTable, false)
+                .with(FromDefinitionFlags::InStrictTable, true),
+            FromDefinitionFlags::InStrictTable
+        );
+    }
+
+    #[test]
+    fn test_coldef_flags_with() {
+        let flags = ColDefFlags::PrimaryKey | ColDefFlags::Hidden;
+        assert_eq!(
+            flags.with(ColDefFlags::NotNull, true),
+            ColDefFlags::PrimaryKey | ColDefFlags::Hidden | ColDefFlags::NotNull
+        );
+        assert_eq!(
+            flags.with(ColDefFlags::PrimaryKey, false),
+            ColDefFlags::Hidden
+        );
+        assert_eq!(flags.with(ColDefFlags::NotNull, false), flags);
+        assert_eq!(flags.with(ColDefFlags::empty(), false), flags);
+        assert_eq!(
+            ColDefFlags::empty()
+                .with(ColDefFlags::PrimaryKey | ColDefFlags::RowIdAlias, true)
+                .with(ColDefFlags::PrimaryKey, false)
+                .with(ColDefFlags::NotNull, true),
+            ColDefFlags::RowIdAlias | ColDefFlags::NotNull
+        );
+    }
+
+    #[test]
+    fn test_column_definition_flags_preserve_properties() {
+        for bits in 0..=u8::MAX {
+            let Some(flags) = ColDefFlags::from_bits(bits) else {
+                continue;
+            };
+            let column = Column::new(
+                Some("a".to_string()),
+                "ANY".to_string(),
+                None,
+                None,
+                Type::Numeric,
+                Some(CollationSeq::NoCase),
+                ColDef {
+                    flags,
+                    notnull_conflict_clause: Some(ResolveType::Ignore),
+                },
+            );
+            for (actual, flag) in [
+                (column.primary_key(), ColDefFlags::PrimaryKey),
+                (column.is_rowid_alias(), ColDefFlags::RowIdAlias),
+                (column.notnull(), ColDefFlags::NotNull),
+                (column.explicit_notnull(), ColDefFlags::ExplicitNotNull),
+                (column.unique(), ColDefFlags::Unique),
+                (column.hidden(), ColDefFlags::Hidden),
+            ] {
+                assert_eq!(actual, flags.contains(flag), "{flags:?}: {flag:?}");
+            }
+            assert_eq!(column.ty(), Type::Numeric, "{flags:?}");
+            assert_eq!(
+                column.collation_opt(),
+                Some(CollationSeq::NoCase),
+                "{flags:?}"
+            );
+            assert_eq!(
+                column.notnull_conflict_clause,
+                Some(ResolveType::Ignore),
+                "{flags:?}"
+            );
+            let affinity = if flags.contains(ColDefFlags::InStrictTable) {
+                Affinity::Blob
+            } else {
+                Affinity::Numeric
+            };
+            assert_eq!(column.affinity(), affinity, "{flags:?}");
+        }
+    }
+
+    #[test]
+    fn test_column_definition_matches_create_table() -> Result<()> {
+        for sql in [
+            "CREATE TABLE t(a)",
+            "CREATE TABLE t(a INTEGER PRIMARY KEY)",
+            "CREATE TABLE t(a INT PRIMARY KEY)",
+            "CREATE TABLE t(a InTeGeR PRIMARY KEY ASC)",
+            "CREATE TABLE t(a INTEGER PRIMARY KEY DESC)",
+            "CREATE TABLE t(a BIGINT PRIMARY KEY)",
+            "CREATE TABLE t(a TEXT PRIMARY KEY)",
+            "CREATE TABLE t(a INTEGER PRIMARY KEY NOT NULL UNIQUE)",
+            "CREATE TABLE t(a TEXT UNIQUE NOT NULL ON CONFLICT IGNORE DEFAULT hello COLLATE NOCASE)",
+            "CREATE TABLE t(a TEXT NOT NULL NULL)",
+            "CREATE TABLE t(a TEXT NULL NOT NULL ON CONFLICT REPLACE DEFAULT 'x')",
+            "CREATE TABLE t(a NUMERIC(10, 2) DEFAULT (1 + 2))",
+            "CREATE TABLE t(a VARCHAR(40) COLLATE RTRIM)",
+            "CREATE TABLE t(a ANY)",
+            "CREATE TABLE t(a aNy) STRICT",
+            "CREATE TABLE t(a INTEGER[]) STRICT",
+            "CREATE TABLE t(a INTEGER[][]) STRICT",
+            "CREATE TABLE t(a TEXT, b ANY AS (a))",
+            "CREATE TABLE t(a TEXT, b aNy AS (a)) STRICT",
+        ] {
+            let Some(Cmd::Stmt(Stmt::CreateTable { body, .. })) =
+                Parser::new(sql.as_bytes()).next_cmd()?
+            else {
+                panic!("expected CREATE TABLE: {sql}");
+            };
+            let table = create_table("t", &body, 0)?;
+            let CreateTableBody::ColumnsAndConstraints { columns, .. } = body else {
+                panic!("expected column definitions: {sql}");
+            };
+            let flags = FromDefinitionFlags::empty()
+                .with(FromDefinitionFlags::InStrictTable, table.is_strict);
+            assert_eq!(columns.len(), table.columns().len(), "{sql}");
+            for (definition, expected) in columns.iter().zip(table.columns()) {
+                let actual = Column::from_definition(definition, flags)?;
+                assert_eq!(actual.name, expected.name, "{sql}");
+                assert_eq!(actual.ty_str, expected.ty_str, "{sql}");
+                assert_eq!(actual.ty_params, expected.ty_params, "{sql}");
+                assert_eq!(actual.default, expected.default, "{sql}");
+                assert_eq!(actual.ty(), expected.ty(), "{sql}");
+                assert_eq!(actual.affinity(), expected.affinity(), "{sql}");
+                assert_eq!(actual.collation_opt(), expected.collation_opt(), "{sql}");
+                assert_eq!(actual.primary_key(), expected.primary_key(), "{sql}");
+                assert_eq!(actual.is_rowid_alias(), expected.is_rowid_alias(), "{sql}");
+                assert_eq!(actual.notnull(), expected.notnull(), "{sql}");
+                assert_eq!(actual.explicit_notnull(), expected.explicit_notnull(), "{sql}");
+                assert_eq!(actual.unique(), expected.unique(), "{sql}");
+                assert_eq!(actual.hidden(), expected.hidden(), "{sql}");
+                assert_eq!(
+                    actual.notnull_conflict_clause,
+                    expected.notnull_conflict_clause,
+                    "{sql}"
+                );
+                assert_eq!(actual.array_dimensions(), expected.array_dimensions(), "{sql}");
+                match (actual.generated_type(), expected.generated_type()) {
+                    (
+                        GeneratedType::Virtual {
+                            original_sql: actual,
+                            ..
+                        },
+                        GeneratedType::Virtual {
+                            original_sql: expected,
+                            ..
+                        },
+                    ) => assert_eq!(actual, expected, "{sql}"),
+                    (GeneratedType::NotGenerated, GeneratedType::NotGenerated) => {}
+                    _ => panic!("generated column types differ: {sql}"),
+                }
+            }
+        }
+        Ok(())
+    }
 
     #[test]
     pub fn test_has_rowid_true() -> Result<()> {
@@ -7351,7 +7584,7 @@ mod tests {
 }
 
 mod column_info {
-    use crate::schema::{ColDef, Type};
+    use crate::schema::{ColDef, ColDefFlags, Type};
     use crate::vdbe::affinity::Affinity;
     use crate::vdbe::CollationSeq;
 
@@ -7396,19 +7629,19 @@ mod column_info {
             if let Some(c) = params.collation {
                 raw |= (u32::from(c.to_bits()) << COLL_SHIFT) & COLL_MASK;
             }
-            if params.coldef.primary_key {
+            if params.coldef.flags.contains(ColDefFlags::PrimaryKey) {
                 raw |= F_PRIMARY_KEY
             }
-            if params.coldef.rowid_alias {
+            if params.coldef.flags.contains(ColDefFlags::RowIdAlias) {
                 raw |= F_ROWID_ALIAS
             }
-            if params.coldef.notnull {
+            if params.coldef.flags.contains(ColDefFlags::NotNull) {
                 raw |= F_NOTNULL
             }
-            if params.coldef.unique {
+            if params.coldef.flags.contains(ColDefFlags::Unique) {
                 raw |= F_UNIQUE
             }
-            if params.coldef.hidden {
+            if params.coldef.flags.contains(ColDefFlags::Hidden) {
                 raw |= F_HIDDEN
             }
 
