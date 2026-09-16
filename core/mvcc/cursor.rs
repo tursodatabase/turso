@@ -68,13 +68,6 @@ enum ExistsState {
 }
 
 #[derive(Debug, Clone, Copy)]
-/// Rewind state is used to track the state of the rewind **AND** last operation. Since both seem to do similiar
-/// operations we can use the same enum for both.
-enum RewindState {
-    Advance,
-}
-
-#[derive(Debug, Clone, Copy)]
 enum NextState {
     AdvanceUnitialized,
     CheckNeedsAdvance,
@@ -115,7 +108,6 @@ enum CountState {
 enum MvccLazyCursorState {
     Next(NextState),
     Prev(PrevState),
-    Rewind(RewindState),
     Exists(ExistsState),
     Seek(SeekState, IterationDirection),
 }
@@ -550,18 +542,56 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> YieldSlot<Box<LimboE
         self.err.take()
     }
 }
-
 type CursorRunner<Clock, A, Args, Out> = BoxedResumable<MvCursorStep<Clock, A>, Args, Out>;
 
 /// The runner of each async cursor operation, boxed on first use and reused.
 struct CursorOps<Clock: LogicalClock + 'static, A: ConcurrentAllocator> {
     advance: Option<CursorRunner<Clock, A, (IterationDirection, bool), ()>>,
+    rewind: Option<CursorRunner<Clock, A, IterationDirection, ()>>,
 }
 
 impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> Default for CursorOps<Clock, A> {
     fn default() -> Self {
-        Self { advance: None }
+        Self {
+            advance: None,
+            rewind: None,
+        }
     }
+}
+
+/// The cursor operation that is suspended, if any. A cursor runs one
+/// operation at a time: a call to another operation while one is suspended
+/// is a bug in the caller.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CursorOp {
+    Rewind,
+}
+
+/// Runs one step of the async cursor operation `$op` whose runner lives in
+/// `$slot`: starts it with `$args` when none is suspended and resumes it
+/// otherwise. `$body` is the async function of the operation.
+macro_rules! run_cursor_op {
+    ($self:ident, $op:expr, $slot:ident, $body:path, $args:expr) => {{
+        turso_assert!(
+            $self.active.is_none_or(|active| active == $op),
+            "another cursor operation is suspended",
+            { "active": format!("{:?}", $self.active), "op": format!("{:?}", $op) }
+        );
+        let mut runner = $self.ops.$slot.take().unwrap_or_else(|| {
+            Runner::boxed(|co, args| {
+                with_handle(co, args, async |co, args| $body(co, args).await)
+            })
+        });
+        let mut ctx = MvCursorCtx {
+            cursor: $self,
+            io: None,
+            err: None,
+        };
+        let result = runner.resume(&mut ctx, $args);
+        $self.active = if runner.is_active() { Some($op) } else { None };
+        $self.ops.$slot = Some(runner);
+        result
+    }};
 }
 
 pub struct MvccLazyCursor<Clock: LogicalClock + 'static, A: ConcurrentAllocator = TursoAllocator> {
@@ -593,6 +623,8 @@ pub struct MvccLazyCursor<Clock: LogicalClock + 'static, A: ConcurrentAllocator 
     count_state: Option<CountState>,
     /// The runners of the async operations of this cursor.
     ops: CursorOps<Clock, A>,
+    /// The async operation that is suspended, if any.
+    active: Option<CursorOp>,
     /// Dual-cursor peek state for proper iteration
     dual_peek: DualCursorPeek<A>,
     /// Forward scan over `index_rows`; see [`IndexShadowScan`].
@@ -661,6 +693,7 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> MvccLazyCursor<Clock
             state: None,
             count_state: None,
             ops: CursorOps::default(),
+            active: None,
             dual_peek: DualCursorPeek::default(),
             index_shadow_scan: IndexShadowScan::default(),
         })
@@ -936,6 +969,54 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> MvccLazyCursor<Clock
     /// Advance btree cursor backward from current position (cursor already positioned by seek)
     fn advance_btree_backward_from_current(&mut self) -> IOResultOr<()> {
         self.drive_advance_btree(IterationDirection::Backwards, false)
+    }
+
+    /// Drops the MVCC iterators and the peeks before a rewind or a seek.
+    #[inline(always)]
+    fn begin_rewind(&mut self) {
+        let _ = self.table_iterator.take();
+        let _ = self.index_iterator.take();
+        self.reset_dual_peek();
+    }
+
+    /// Loads the MVCC peek at the first or last row and picks the cursor
+    /// position from both peeks, after the B-tree peek is loaded.
+    #[inline(always)]
+    fn finish_rewind(&mut self, dir: IterationDirection) -> Result<()> {
+        self.invalidate_record();
+        match dir {
+            IterationDirection::Forwards => {
+                self.current_pos = CursorPosition::BeforeFirst;
+                self.init_mvcc_iterator_forward()?;
+                self.advance_mvcc_iterator();
+            }
+            IterationDirection::Backwards => {
+                self.current_pos = CursorPosition::End;
+                let last_key = match &self.mv_cursor_type {
+                    MvccCursorType::Table => self.db.get_last_table_rowid(
+                        self.table_id,
+                        &mut self.table_iterator,
+                        self.tx_id,
+                    ),
+                    MvccCursorType::Index(_) => self.db.get_last_index_rowid(
+                        self.table_id,
+                        self.tx_id,
+                        &mut self.index_iterator,
+                    )?,
+                };
+                tracing::trace!("last: mvcc_key: {:?}", last_key);
+                self.dual_peek.mvcc_peek = match last_key {
+                    Some(key) => CursorPeek::Row {
+                        key,
+                        versions: None,
+                    },
+                    None => CursorPeek::Exhausted,
+                };
+            }
+        }
+        self.refresh_current_position(dir);
+        self.invalidate_record();
+        Ok(())
     }
 
     fn drive_advance_btree(&mut self, dir: IterationDirection, initialize: bool) -> IOResultOr<()> {
@@ -1248,72 +1329,13 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> CursorTrait
         // A cursor may be NullRow'd during outer-join unmatched emission.
         // Repositioning to a real row must clear that synthetic NULL state.
         self.set_null_flag(false);
-        let state = self.state.clone();
-        if state.is_none() {
-            let _ = self.table_iterator.take();
-            let _ = self.index_iterator.take();
-            self.reset_dual_peek();
-            self.state
-                .replace(MvccLazyCursorState::Rewind(RewindState::Advance));
-        }
-
-        turso_assert!(
-            matches!(
-                self.state
-                    .as_ref()
-                    .expect("rewind state is not initialized"),
-                MvccLazyCursorState::Rewind(RewindState::Advance)
-            ),
-            "invalid last state",
-            { "state": format!("{:?}", self.state) }
-        );
-
-        // Initialize btree cursor to last position
-        return_if_io!(self.advance_btree_backward());
-
-        self.invalidate_record();
-        self.current_pos = CursorPosition::End;
-
-        // Initialize MVCC iterator to last position
-        match &self.mv_cursor_type {
-            MvccCursorType::Table => match self.db.get_last_table_rowid(
-                self.table_id,
-                &mut self.table_iterator,
-                self.tx_id,
-            ) {
-                Some(k) => {
-                    tracing::trace!("last: mvcc_key: {:?}", k);
-                    self.dual_peek.mvcc_peek = CursorPeek::Row {
-                        key: k,
-                        versions: None,
-                    };
-                }
-                None => {
-                    self.dual_peek.mvcc_peek = CursorPeek::Exhausted;
-                }
-            },
-            MvccCursorType::Index(_) => match self.db.get_last_index_rowid(
-                self.table_id,
-                self.tx_id,
-                &mut self.index_iterator,
-            )? {
-                Some(k) => {
-                    self.dual_peek.mvcc_peek = CursorPeek::Row {
-                        key: k,
-                        versions: None,
-                    };
-                }
-                None => {
-                    self.dual_peek.mvcc_peek = CursorPeek::Exhausted;
-                }
-            },
-        };
-
-        self.refresh_current_position(IterationDirection::Backwards);
-        self.invalidate_record();
-        self.state = None;
-
-        Ok(IOResult::Done(()))
+        run_cursor_op!(
+            self,
+            CursorOp::Rewind,
+            rewind,
+            rewind_cursor,
+            IterationDirection::Backwards
+        )
     }
 
     /// Move the cursor to the next row. Returns true if the cursor moved to the next row, false if the cursor is at the end of the table.
@@ -2161,69 +2183,13 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> CursorTrait
         // A cursor may be NullRow'd during outer-join unmatched emission.
         // Repositioning to a real row must clear that synthetic NULL state.
         self.set_null_flag(false);
-        let state = self.state.clone();
-        if state.is_none() {
-            let _ = self.table_iterator.take();
-            let _ = self.index_iterator.take();
-            self.reset_dual_peek();
-            self.state
-                .replace(MvccLazyCursorState::Rewind(RewindState::Advance));
-        }
-
-        turso_assert!(
-            matches!(
-                self.state
-                    .as_ref()
-                    .expect("rewind state is not initialized"),
-                MvccLazyCursorState::Rewind(RewindState::Advance)
-            ),
-            "invalid rewind state",
-            { "state": format!("{:?}", self.state) }
-        );
-        // First run btree_cursor rewind so that we don't need a explicit state machine.
-        return_if_io!(self.advance_btree_forward());
-
-        self.invalidate_record();
-        self.current_pos = CursorPosition::BeforeFirst;
-
-        // Initialize MVCC iterators for rewind operation; in practice there is only one of these
-        // depending on the cursor type, so we should at some point refactor the iterator thing to be
-        // generic over the type instead of having two on the struct.
-        match &self.mv_cursor_type {
-            MvccCursorType::Table => {
-                // For table cursors, initialize iterator from the correct table id + i64::MIN;
-                // this is because table rows from all tables are stored in the same map
-                let start_rowid = RowID {
-                    table_id: self.table_id,
-                    row_id: RowKey::Int(i64::MIN),
-                };
-                let range = (
-                    std::ops::Bound::Included(start_rowid),
-                    std::ops::Bound::Unbounded,
-                );
-                let iter_box = Box::new(self.db.rows.range(range));
-                self.table_iterator = Some(static_iterator_hack!(iter_box, RowID, A));
-            }
-            MvccCursorType::Index(_) => {
-                // For index cursors, initialize the iterator to the beginning
-                let index_rows = self.db.get_or_create_index_rows(self.table_id)?;
-                let index_rows = index_rows.value();
-                let iter_box: Box<
-                    dyn Iterator<Item = MvccEntry<'_, Arc<SortableIndexKey>, A>> + Send + Sync,
-                > = Box::new(index_rows.iter());
-                self.index_iterator =
-                    Some(static_iterator_hack!(iter_box, Arc<SortableIndexKey>, A));
-            }
-        }
-
-        // Rewind mvcc iterator
-        self.advance_mvcc_iterator();
-
-        self.refresh_current_position(IterationDirection::Forwards);
-
-        self.invalidate_record();
-        self.state = None;
-        Ok(IOResult::Done(()))
+        run_cursor_op!(
+            self,
+            CursorOp::Rewind,
+            rewind,
+            rewind_cursor,
+            IterationDirection::Forwards
+        )
     }
 
     fn has_record(&self) -> bool {
@@ -2295,6 +2261,20 @@ macro_rules! inject_cursor_yield {
             $co.yield_io(io).await;
         }
     }};
+}
+
+/// Positions the cursor before the first row (`Forwards`) or after the last
+/// row (`Backwards`) of the table or index, and loads the peek of both the
+/// MVCC iterator and the B-tree cursor for the following `next` or `prev`.
+async fn rewind_cursor<Clock: LogicalClock + 'static, A: ConcurrentAllocator>(
+    co: &mut Co<MvCursorStep<Clock, A>>,
+    dir: IterationDirection,
+) -> Result<(), Box<LimboError>> {
+    co.with(|ctx| ctx.cursor.begin_rewind());
+    advance_btree(co, dir, true).await?;
+    co.io(|ctx| ctx.cursor.finish_rewind(dir).map(IOResult::Done))
+        .await;
+    Ok(())
 }
 
 /// Moves the B-tree cursor in `dir` until it is on a row that MVCC does not
