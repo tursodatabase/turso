@@ -3,12 +3,12 @@ use std::sync::atomic::Ordering;
 use std::sync::{Arc, Weak};
 
 use crate::{
+    coro::{with_handle, BoxedResumable, Co, Runner, StepContext, YieldSlot},
     index_method::{btree_root_page, IndexMethodContext, BACKING_BTREE_INDEX_METHOD_NAME},
     mvcc::{cursor::MvccCursorType, database::MVTableId},
-    return_if_io,
     schema::{Type, TURSO_INTERNAL_PREFIX},
     storage::btree::{BTreeCursor, CursorTrait},
-    types::{IOResult, IOResultOr, IndexInfo, KeyInfo},
+    types::{IOCompletions, IOResult, IOResultOr, IndexInfo, KeyInfo},
     util::quote_identifier,
     Connection, LimboError, MvCursor, MvStore, Result,
 };
@@ -357,22 +357,40 @@ impl BackingStore {
 /// I/O inside the opcode.
 pub struct BackingStoreOp {
     ddl: Option<NestedDdl>,
+    /// The runner of the statements, boxed on the first step and reused.
+    op: Option<BoxedResumable<DdlStep, (), ()>>,
 }
 
 impl BackingStoreOp {
     fn new(connection: &Arc<Connection>, statements: Vec<String>) -> Self {
         Self {
             ddl: (!statements.is_empty()).then(|| NestedDdl::new(connection, statements)),
+            op: None,
         }
     }
 
     pub fn step(&mut self) -> IOResultOr<()> {
-        let Some(ddl) = self.ddl.as_mut() else {
+        if self.ddl.is_none() {
             return Ok(IOResult::Done(()));
+        }
+        let mut op = self
+            .op
+            .take()
+            .unwrap_or_else(|| Runner::boxed(|co, args| with_handle(co, args, run_ddl)));
+        let mut ctx = DdlCtx {
+            op: self,
+            io: None,
+            err: None,
         };
-        return_if_io!(ddl.step());
-        self.ddl = None;
-        Ok(IOResult::Done(()))
+        let result = op.resume(&mut ctx, ());
+        self.op = Some(op);
+        result
+    }
+
+    fn ddl_mut(&mut self) -> &mut NestedDdl {
+        self.ddl
+            .as_mut()
+            .expect("the operation runs with statements left")
     }
 }
 
@@ -383,6 +401,51 @@ impl std::fmt::Debug for BackingStoreOp {
             .field("pending", &self.ddl.is_some())
             .finish()
     }
+}
+
+/// Names [`DdlCtx`] as the context type of the async backing store
+/// operation.
+struct DdlStep;
+
+impl StepContext for DdlStep {
+    type Error = Box<LimboError>;
+    type Ctx<'a> = DdlCtx<'a>;
+}
+
+/// The context of one step of a backing store operation.
+struct DdlCtx<'a> {
+    op: &'a mut BackingStoreOp,
+    io: Option<IOCompletions>,
+    err: Option<Box<LimboError>>,
+}
+
+impl YieldSlot<Box<LimboError>> for DdlCtx<'_> {
+    fn park_io(&mut self, io: IOCompletions) {
+        self.io = Some(io);
+    }
+
+    fn take_io(&mut self) -> Option<IOCompletions> {
+        self.io.take()
+    }
+
+    fn park_err(&mut self, err: Box<LimboError>) {
+        self.err = Some(err);
+    }
+
+    fn take_err(&mut self) -> Option<Box<LimboError>> {
+        self.err.take()
+    }
+}
+
+/// Runs the statements one at a time. A statement that fails ends the
+/// operation with its error, and the next step goes on with the statement
+/// after it.
+async fn run_ddl(co: &mut Co<DdlStep>, _: ()) -> Result<(), Box<LimboError>> {
+    while co.with(|ctx| ctx.op.ddl_mut().prepare_next())? {
+        co.io(|ctx| ctx.op.ddl_mut().step_current()).await?;
+    }
+    co.with(|ctx| ctx.op.ddl = None);
+    Ok(())
 }
 
 /// Nested DDL statements that run for an index method. They are stepped one
@@ -409,28 +472,44 @@ impl NestedDdl {
         }
     }
 
-    fn step(&mut self) -> IOResultOr<()> {
-        let connection = self.connection.upgrade().ok_or_else(|| {
+    fn connection(&self) -> Result<Arc<Connection>> {
+        self.connection.upgrade().ok_or_else(|| {
             LimboError::InternalError("backing store DDL outlived its connection".into())
-        })?;
-        loop {
-            if self.current.is_none() {
-                let Some(sql) = self.pending.pop_front() else {
-                    return Ok(IOResult::Done(()));
-                };
-                self.current = Some(Self::prepare(&connection, sql)?);
-            }
-            let statement = self.current.as_mut().expect("prepared above");
-            connection.start_nested();
-            let result = statement.run_ignore_rows_nonblock();
-            if !matches!(result, Ok(IOResult::IO(_))) {
-                // Drop a finished or failed statement while the connection
-                // is still nested. The reset of the statement reads
-                // `is_nested_stmt()`.
-                self.current = None;
-            }
-            connection.end_nested();
-            return_if_io!(result);
+        })
+    }
+
+    /// Prepares the next statement when none is in progress. Returns false
+    /// when no statement is left.
+    fn prepare_next(&mut self) -> Result<bool> {
+        if self.current.is_some() {
+            return Ok(true);
+        }
+        let Some(sql) = self.pending.pop_front() else {
+            return Ok(false);
+        };
+        let connection = self.connection()?;
+        self.current = Some(Self::prepare(&connection, sql)?);
+        Ok(true)
+    }
+
+    /// Steps the statement in progress while the connection is nested. A
+    /// finished or failed statement is dropped while the connection is
+    /// still nested, because the reset of the statement reads
+    /// `is_nested_stmt()`. The error of a failed statement is the value of
+    /// the step, so that the caller ends the operation with it.
+    fn step_current(&mut self) -> IOResultOr<Result<(), Box<LimboError>>> {
+        let connection = self.connection()?;
+        let statement = self.current.as_mut().expect("a statement is prepared");
+        connection.start_nested();
+        let result = statement.run_ignore_rows_nonblock();
+        if !matches!(result, Ok(IOResult::IO(_))) {
+            self.current = None;
+        }
+        connection.end_nested();
+        match result {
+            Ok(IOResult::IO(io)) => Ok(IOResult::IO(io)),
+            Ok(IOResult::Done(())) => Ok(IOResult::Done(Ok(()))),
+            Err(err) => Ok(IOResult::Done(Err(err))),
         }
     }
 
