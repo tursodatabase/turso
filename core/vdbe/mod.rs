@@ -981,9 +981,6 @@ pub struct ProgramState {
     /// Why the instruction loop paused, read by `normal_step` when the
     /// loop returns `Pending`.
     suspend_reason: Suspend,
-    /// The async instruction loop, allocated on the first step and kept
-    /// for the lifetime of the statement.
-    loop_runner: Option<execute::LoopRunner>,
     seek_state: OpSeekState,
     /// Metrics collected for the lifetime of this prepared statement.
     pub metrics: StatementMetrics,
@@ -1116,7 +1113,6 @@ impl ProgramState {
             json_cache: JsonCacheCell::new(),
             active_op_state: ActiveOpStateSlot::default(),
             suspend_reason: Suspend::None,
-            loop_runner: None,
             seek_state: OpSeekState::Start,
             metrics: StatementMetrics::new(),
             distinct_key_values: Vec::new(),
@@ -1203,9 +1199,6 @@ impl ProgramState {
     pub fn reset(&mut self, max_registers: Option<usize>, max_cursors: Option<usize>) {
         self.io_completions = None;
         self.suspend_reason = Suspend::None;
-        if let Some(runner) = &mut self.loop_runner {
-            runner.cancel();
-        }
         self.pc = 0;
 
         if let Some(max_cursors) = max_cursors {
@@ -1474,19 +1467,6 @@ impl ProgramState {
 
     fn take_suspend_reason(&mut self) -> Suspend {
         std::mem::take(&mut self.suspend_reason)
-    }
-
-    /// Takes the async instruction loop out for one step. The first call
-    /// allocates it; later calls reuse it.
-    fn take_loop_runner(&mut self) -> execute::LoopRunner {
-        self.loop_runner
-            .take()
-            .unwrap_or_else(execute::LoopRunner::new)
-    }
-
-    fn put_loop_runner(&mut self, runner: execute::LoopRunner) {
-        debug_assert!(self.loop_runner.is_none());
-        std::mem::forget(self.loop_runner.replace(runner));
     }
 
     /// Runs `f` on the metrics of this statement including its active and
@@ -2045,13 +2025,14 @@ impl Program {
     #[inline(always)]
     pub fn step(
         &self,
+        runner: &mut execute::LoopRunner,
         state: &mut ProgramState,
         pager: &Arc<Pager>,
         query_mode: QueryMode,
         waker: Option<&Waker>,
     ) -> Result<StepResult, Box<LimboError>> {
         if let QueryMode::Normal = query_mode {
-            return self.normal_step(state, pager, waker).into();
+            return self.normal_step(runner, state, pager, waker).into();
         }
         state.execution_state = ProgramExecutionState::Running;
         let result = self.explain_step_for_mode(state, pager, query_mode);
@@ -2319,12 +2300,12 @@ impl Program {
     #[inline(always)]
     pub(crate) fn normal_step(
         &self,
+        runner: &mut execute::LoopRunner,
         state: &mut ProgramState,
         pager: &Arc<Pager>,
         waker: Option<&Waker>,
     ) -> ProgramStep {
         state.execution_state = ProgramExecutionState::Running;
-        let mut runner = state.take_loop_runner();
         let result = loop {
             if state.io_completions.is_some() {
                 if let Some(result) = self.finish_pending_io(state, pager, waker) {
@@ -2343,7 +2324,6 @@ impl Program {
                 },
             }
         };
-        state.put_loop_runner(runner);
         match &result {
             ProgramStep::Row => {}
             ProgramStep::Done => {
@@ -2368,10 +2348,11 @@ impl Program {
         state: &mut ProgramState,
         pager: &Arc<Pager>,
         waker: Option<&Waker>,
+        traced: bool,
         enable_tracing: bool,
         vdbe_trace: bool,
     ) -> Exit {
-        return if enable_tracing || vdbe_trace {
+        return if traced {
             dispatch_loop_traced(self, state, pager, waker, enable_tracing, vdbe_trace)
         } else {
             dispatch_loop::<false>(self, state, pager, waker, false, false)
@@ -2494,7 +2475,7 @@ impl Program {
                         return state.suspend(Suspend::Row);
                     }
                     if let Ok(InsnFunctionStepResult::Async) = result {
-                        return Exit::Async(execute::AsyncOp::of(insn));
+                        return Exit::Async(execute::AsyncOp::start(insn, state));
                     }
                     match dispatch_cold(program, state, pager, waker, result) {
                         Some(exit) => return exit,

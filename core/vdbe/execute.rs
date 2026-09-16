@@ -2037,6 +2037,7 @@ pub(crate) struct VdbeCtx<'a> {
     state: &'a mut ProgramState,
     pager: &'a Arc<Pager>,
     waker: Option<&'a Waker>,
+    traced: bool,
     enable_tracing: bool,
     vdbe_trace: bool,
 }
@@ -2048,13 +2049,16 @@ impl<'a> VdbeCtx<'a> {
         pager: &'a Arc<Pager>,
         waker: Option<&'a Waker>,
     ) -> Self {
+        let enable_tracing = tracing::enabled!(tracing::Level::TRACE);
+        let vdbe_trace = program.connection.get_vdbe_trace();
         Self {
             program,
             state,
             pager,
             waker,
-            enable_tracing: tracing::enabled!(tracing::Level::TRACE),
-            vdbe_trace: program.connection.get_vdbe_trace(),
+            traced: enable_tracing || vdbe_trace,
+            enable_tracing,
+            vdbe_trace,
         }
     }
 
@@ -2064,6 +2068,7 @@ impl<'a> VdbeCtx<'a> {
             self.state,
             self.pager,
             self.waker,
+            self.traced,
             self.enable_tracing,
             self.vdbe_trace,
         )
@@ -2113,7 +2118,10 @@ async fn run_program(mut co: Co<VdbeStep>, _: ()) -> ProgramStep {
             Exit::Async(op) => op,
         };
         let result = match op {
-            AsyncOp::ColumnDeferred { cursor_id } => op_column_deferred(&mut co, cursor_id).await,
+            AsyncOp::ColumnDeferred {
+                cursor_id,
+                deferred,
+            } => op_column_deferred(&mut co, cursor_id, deferred).await,
         };
         match co.with(|ctx| ctx.finish_async_op(result)) {
             None => {}
@@ -2127,18 +2135,25 @@ async fn run_program(mut co: Co<VdbeStep>, _: ()) -> ProgramStep {
 }
 
 /// An instruction that continues as an async operation, with the arguments
-/// the operation needs.
-#[derive(Clone, Copy, Debug)]
+/// the operation takes from the program state when it starts.
+#[derive(Clone, Debug)]
 pub(crate) enum AsyncOp {
-    ColumnDeferred { cursor_id: usize },
+    ColumnDeferred {
+        cursor_id: usize,
+        deferred: DeferredSeekState,
+    },
 }
 
 impl AsyncOp {
-    pub(crate) fn of(insn: &Insn) -> Self {
+    pub(crate) fn start(insn: &Insn, state: &mut ProgramState) -> Self {
         match insn {
             Insn::Column { cursor_id, .. } | Insn::ColumnRange { cursor_id, .. } => {
+                let deferred = state.deferred_seeks[*cursor_id]
+                    .take()
+                    .expect("a Column continues as an async operation only with a deferred seek");
                 AsyncOp::ColumnDeferred {
                     cursor_id: *cursor_id,
+                    deferred,
                 }
             }
             _ => unreachable!("only Column and ColumnRange continue as async operations"),
@@ -2146,15 +2161,13 @@ impl AsyncOp {
     }
 }
 
-/// Column when a deferred seek is pending: reads the rowid from the index
-/// cursor, seeks the table cursor, and fetches the columns.
+/// Column after a deferred seek: reads the rowid from the index cursor,
+/// seeks the table cursor, and fetches the columns.
 async fn op_column_deferred(
     co: &mut Co<VdbeStep>,
     cursor_id: usize,
+    deferred: DeferredSeekState,
 ) -> Result<(), Box<LimboError>> {
-    let deferred = co
-        .with(|ctx| ctx.state.deferred_seeks[cursor_id].take())
-        .expect("a Column continues as an async operation only with a deferred seek");
     let rowid = co
         .io(|ctx| index_cursor_rowid(ctx.state, deferred.index_cursor_id))
         .await?;
