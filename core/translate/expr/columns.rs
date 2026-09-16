@@ -71,7 +71,7 @@ pub(super) fn do_emit_table_column(
 ) -> Result<()> {
     match column.generated_type() {
         GeneratedType::Virtual { expr, .. } => {
-            let null_row_expr = match self_table_context {
+            let can_be_null_row = match self_table_context {
                 SelfTableContext::ForSelect {
                     table_ref_id,
                     referenced_tables,
@@ -79,7 +79,7 @@ pub(super) fn do_emit_table_column(
                     let tables = referenced_tables.joined_tables();
                     // Outer-scope references have no join metadata here. A later FULL
                     // JOIN can also null out this table, even if its own join is inner.
-                    let can_be_null_row = tables
+                    tables
                         .iter()
                         .position(|t| t.internal_id == *table_ref_id)
                         .is_none_or(|i| {
@@ -87,22 +87,31 @@ pub(super) fn do_emit_table_column(
                                 || tables[i + 1..].iter().any(|t| {
                                     t.join_info.as_ref().is_some_and(|j| j.is_full_outer())
                                 })
-                        });
-                    can_be_null_row.then(|| ast::Expr::IfNullRow {
-                        table: *table_ref_id,
-                        expr: expr.clone(),
-                    })
+                        })
                 }
-                SelfTableContext::ForDML { .. } => None,
+                SelfTableContext::ForDML { .. } => false,
             };
             resolver.with_self_table_context(program, Some(self_table_context), |program, _| {
-                translate_expr(
-                    program,
-                    referenced_tables,
-                    null_row_expr.as_ref().unwrap_or(expr),
-                    target_register,
-                    resolver,
-                )?;
+                if can_be_null_row {
+                    program.constant_span_end_all();
+                    let end = program.allocate_label();
+                    program.emit_insn(Insn::IfNullRow {
+                        cursor_id,
+                        target_pc: end,
+                        null_reg: target_register,
+                    });
+                    translate_expr_no_constant_opt(
+                        program,
+                        referenced_tables,
+                        expr,
+                        target_register,
+                        resolver,
+                        NoConstantOptReason::RegisterReuse,
+                    )?;
+                    program.preassign_label_to_next_insn(end);
+                } else {
+                    translate_expr(program, referenced_tables, expr, target_register, resolver)?;
+                }
                 Ok(())
             })?;
             program.emit_column_affinity(target_register, column.affinity());

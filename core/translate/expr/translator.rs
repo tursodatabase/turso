@@ -2672,27 +2672,6 @@ pub fn translate_expr(
                 }
             }
         }
-        ast::Expr::IfNullRow { table, expr } => {
-            let cursor_id = program
-                .resolve_cursor_id_safe(&CursorKey::table(*table))
-                .unwrap_or_else(|| program.resolve_any_index_cursor_id_for_table(*table));
-            let end = program.allocate_label();
-            program.emit_insn(Insn::IfNullRow {
-                cursor_id,
-                target_pc: end,
-                null_reg: target_register,
-            });
-            translate_expr_no_constant_opt(
-                program,
-                referenced_tables,
-                expr,
-                target_register,
-                resolver,
-                NoConstantOptReason::RegisterReuse,
-            )?;
-            program.preassign_label_to_next_insn(end);
-            Ok(target_register)
-        }
         ast::Expr::RowId {
             database: _,
             table: table_ref_id,
