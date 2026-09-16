@@ -2047,6 +2047,7 @@ macro_rules! async_ops {
 
 async_ops! {
     ColumnDeferred => column_deferred: column_deferred,
+    RowIdDeferred => row_id_deferred: row_id_deferred,
 }
 
 /// Runs one step of the async opcode `op`: starts it when none is suspended
@@ -6178,26 +6179,12 @@ pub fn op_row_data(
     Ok(InsnFunctionStepResult::Step)
 }
 
-#[derive(Debug, Clone, Copy)]
-pub enum OpRowIdState {
-    Start,
-    Record {
-        index_cursor_id: usize,
-        table_cursor_id: usize,
-    },
-    Seek {
-        rowid: i64,
-        table_cursor_id: usize,
-    },
-    GetRowid,
-}
-
 // Not in test builds: inline(always) makes fn-item coercions produce
 // per-site copies in debug, breaking test_make_sure_correct_insn_table's
 // pointer-identity check.
 #[cfg_attr(not(test), inline(always))]
 pub fn op_row_id(
-    _program: &Program,
+    program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
     _pager: &Arc<Pager>,
@@ -6213,86 +6200,66 @@ pub fn op_row_id(
         }
         return Ok(result);
     }
-    op_row_id_deferred(state, *cursor_id, *dest)
+    step_async_op(program, state, insn, AsyncOp::RowIdDeferred)
 }
 
 /// RowId when a deferred seek is pending or the read was suspended for IO
-/// inside the seek: drives the op-state machine to completion.
-#[inline(never)]
-fn op_row_id_deferred(state: &mut ProgramState, cursor_id: usize, dest: usize) -> InsnResult {
-    loop {
-        match *state.active_op_state.row_id() {
-            OpRowIdState::Start => {
-                if let Some(deferred) = state.deferred_seeks[cursor_id].take() {
-                    *state.active_op_state.row_id() = OpRowIdState::Record {
-                        index_cursor_id: deferred.index_cursor_id,
-                        table_cursor_id: deferred.table_cursor_id,
-                    };
-                } else {
-                    *state.active_op_state.row_id() = OpRowIdState::GetRowid;
-                }
-            }
-            OpRowIdState::Record {
-                index_cursor_id,
-                table_cursor_id,
-            } => {
-                let rowid = {
-                    let index_cursor = state.get_cursor(index_cursor_id);
-                    match index_cursor {
-                        Cursor::BTree(_) | Cursor::Dyn(_) => {
-                            let index_cursor = index_cursor.as_btree_mut();
-                            let record = return_if_io!(state, index_cursor.record());
-                            let record =
-                                record.as_ref().expect("index cursor should have a record");
-                            let rowid = record
-                                .last_value()
-                                .expect("record should have a last value");
-                            match rowid {
-                                Ok(ValueRef::Numeric(Numeric::Integer(rowid))) => rowid,
-                                _ => unreachable!(),
-                            }
-                        }
-                        Cursor::IndexMethod(index_cursor) => {
-                            return_if_io!(state, index_cursor.query_rowid())
-                                .expect("index cursor should have a rowid")
-                        }
-                        _ => panic!("unexpected cursor type"),
-                    }
-                };
-                *state.active_op_state.row_id() = OpRowIdState::Seek {
-                    rowid,
-                    table_cursor_id,
-                }
-            }
-            OpRowIdState::Seek {
-                rowid,
-                table_cursor_id,
-            } => {
-                {
-                    let table_cursor = state.get_cursor(table_cursor_id);
-                    let table_cursor = table_cursor.as_btree_mut();
-                    return_if_io!(
-                        state,
-                        table_cursor.seek(SeekKey::TableRowId(rowid), SeekOp::GE { eq_only: true })
-                    );
-                }
-                *state.active_op_state.row_id() = OpRowIdState::GetRowid;
-            }
-            OpRowIdState::GetRowid => {
-                let result = op_row_id_read(state, cursor_id, dest)?;
-                if !matches!(result, InsnFunctionStepResult::Step) {
-                    // IO yield: the slot stays at GetRowid so the resume
-                    // re-enters this arm.
-                    return Ok(result);
-                }
-                break;
+/// inside the seek: reads the rowid from the record of the index cursor,
+/// seeks the table cursor, reads the rowid.
+async fn row_id_deferred(co: &mut Co<VdbeStep>) -> Result<(), Box<LimboError>> {
+    let (cursor_id, dest) = co.with(|ctx| {
+        load_insn!(RowId { cursor_id, dest }, ctx.insn);
+        (*cursor_id, *dest)
+    });
+    if let Some(deferred) = co.with(|ctx| ctx.state.deferred_seeks[cursor_id].take()) {
+        let rowid = co
+            .io(|ctx| index_record_rowid(ctx.state, deferred.index_cursor_id))
+            .await;
+        co.io(|ctx| seek_table_row(ctx.state, deferred.table_cursor_id, rowid))
+            .await;
+    }
+    co.io(|ctx| read_row_id(ctx.state, cursor_id, dest)).await;
+    Ok(())
+}
+
+/// The rowid at the end of the record the index cursor is on.
+#[inline(always)]
+fn index_record_rowid(state: &mut ProgramState, index_cursor_id: usize) -> IOResultOr<i64> {
+    let index_cursor = state.get_cursor(index_cursor_id);
+    match index_cursor {
+        Cursor::BTree(_) | Cursor::Dyn(_) => {
+            let record = match index_cursor.as_btree_mut().record()? {
+                IOResult::Done(record) => record,
+                IOResult::IO(io) => return Ok(IOResult::IO(io)),
+            };
+            let record = record.as_ref().expect("index cursor should have a record");
+            let rowid = record
+                .last_value()
+                .expect("record should have a last value");
+            match rowid {
+                Ok(ValueRef::Numeric(Numeric::Integer(rowid))) => Ok(IOResult::Done(rowid)),
+                _ => unreachable!(),
             }
         }
+        Cursor::IndexMethod(index_cursor) => Ok(index_cursor
+            .query_rowid()?
+            .map(|rowid| rowid.expect("index cursor should have a rowid"))),
+        _ => panic!("unexpected cursor type"),
     }
+}
 
-    state.active_op_state.clear();
-    state.pc += 1;
-    Ok(InsnFunctionStepResult::Step)
+/// Reads the rowid into the register and moves to the next instruction. The
+/// read parks its completion in the program state, so this takes it out
+/// again for the yield.
+#[inline(always)]
+fn read_row_id(state: &mut ProgramState, cursor_id: usize, dest: usize) -> IOResultOr<()> {
+    match op_row_id_read(state, cursor_id, dest)? {
+        InsnFunctionStepResult::IO => Ok(IOResult::IO(state.take_suspended_io())),
+        _ => {
+            state.pc += 1;
+            Ok(IOResult::Done(()))
+        }
+    }
 }
 
 /// Reads the rowid of the cursor's current position into a register.

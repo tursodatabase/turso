@@ -58,8 +58,8 @@ use crate::{
             AsyncOp, AsyncOpSlots, OpAttachState, OpClearBtreeState, OpDeleteState,
             OpDeleteSubState, OpDestroyState, OpIdxInsertState, OpInitCdcVersionState,
             OpInsertState, OpInsertSubState, OpJournalModeState, OpNewRowidState,
-            OpNoConflictState, OpParseSchemaState, OpProgramState, OpRowIdState, OpSeekState,
-            OpTransactionState, VacuumIntoOpContext,
+            OpNoConflictState, OpParseSchemaState, OpProgramState, OpSeekState, OpTransactionState,
+            VacuumIntoOpContext,
         },
         hash_table::HashTable,
         metrics::StatementMetrics,
@@ -620,7 +620,6 @@ enum ActiveOpState {
     /// An async opcode is suspended. Its future lives in the slot of
     /// [`AsyncOpSlots`] for this opcode.
     Async(AsyncOp),
-    RowId(OpRowIdState),
     Transaction(OpTransactionState),
     Attach(OpAttachState),
     JournalMode(OpJournalModeState),
@@ -646,7 +645,6 @@ impl std::fmt::Debug for ActiveOpState {
             ActiveOpState::Insert(_) => "Insert",
             ActiveOpState::NoConflict(_) => "NoConflict",
             ActiveOpState::Async(op) => return write!(f, "{op:?}"),
-            ActiveOpState::RowId(_) => "RowId",
             ActiveOpState::Transaction(_) => "Transaction",
             ActiveOpState::Attach(_) => "Attach",
             ActiveOpState::JournalMode(_) => "JournalMode",
@@ -819,7 +817,6 @@ impl ActiveOpStateSlot {
         OpNoConflictState,
         OpNoConflictState::Start
     );
-    active_state_accessor!(row_id, RowId, OpRowIdState, OpRowIdState::Start);
     active_state_accessor!(
         transaction,
         Transaction,
@@ -4163,12 +4160,40 @@ mod tests {
         let mut state = ProgramState::new(1, 0);
 
         assert!(matches!(state.active_op_state.state, ActiveOpState::None));
-        assert!(matches!(
-            state.active_op_state.row_id(),
-            OpRowIdState::Start
-        ));
+        let runner = state.active_op_state.take_async(AsyncOp::RowIdDeferred);
+        state
+            .active_op_state
+            .put_async(AsyncOp::RowIdDeferred, runner, false);
+        assert!(matches!(state.active_op_state.state, ActiveOpState::None));
         state.active_op_state.clear();
         assert!(state.active_op_state.parse_schema().is_none());
+    }
+
+    #[test]
+    fn async_opcode_slot_keeps_a_suspended_runner_until_clear() {
+        let mut state = ProgramState::new(1, 0);
+
+        let runner = state.active_op_state.take_async(AsyncOp::RowIdDeferred);
+        state
+            .active_op_state
+            .put_async(AsyncOp::RowIdDeferred, runner, true);
+        assert!(matches!(
+            state.active_op_state.state,
+            ActiveOpState::Async(AsyncOp::RowIdDeferred)
+        ));
+        assert!(!state.active_op_state.is_idle());
+
+        let panic = catch_unwind(AssertUnwindSafe(|| {
+            let _ = state.active_op_state.take_async(AsyncOp::ColumnDeferred);
+        }));
+        assert!(
+            panic.is_err(),
+            "mismatched async opcode resume should panic"
+        );
+
+        state.active_op_state.clear();
+        assert!(state.active_op_state.is_idle());
+        let _ = state.active_op_state.take_async(AsyncOp::ColumnDeferred);
     }
 
     #[test]
@@ -4194,7 +4219,7 @@ mod tests {
     #[test]
     fn active_opcode_helpers_reject_mismatched_resumes() {
         let mut state = ProgramState::new(1, 0);
-        *state.active_op_state.row_id() = OpRowIdState::GetRowid;
+        *state.active_op_state.no_conflict() = OpNoConflictState::Start;
 
         let panic = catch_unwind(AssertUnwindSafe(|| {
             let _ = state.active_op_state.parse_schema();
