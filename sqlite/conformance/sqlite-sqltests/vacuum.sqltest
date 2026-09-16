@@ -1,5 +1,6 @@
 @database :temp:
 
+@skip-if mvcc "plain VACUUM requires PRAGMA wal_checkpoint(TRUNCATE) first on an MVCC database"
 test vacuum-basic {
     CREATE TABLE t1(a INTEGER PRIMARY KEY, b TEXT, c REAL);
     INSERT INTO t1 VALUES(1, 'hello', 3.125);
@@ -16,6 +17,7 @@ expect {
     3|test|1.625
 }
 
+@skip-if mvcc "plain VACUUM requires PRAGMA wal_checkpoint(TRUNCATE) first on an MVCC database"
 test vacuum-preserves-metadata {
     CREATE TABLE t(a INTEGER);
     INSERT INTO t VALUES(1);
@@ -36,6 +38,7 @@ expect {
     2
 }
 
+@skip-if mvcc "plain VACUUM requires PRAGMA wal_checkpoint(TRUNCATE) first on an MVCC database"
 test vacuum-preserves-autoincrement {
     CREATE TABLE t1(a INTEGER PRIMARY KEY AUTOINCREMENT, b TEXT);
     INSERT INTO t1(b) VALUES('one');

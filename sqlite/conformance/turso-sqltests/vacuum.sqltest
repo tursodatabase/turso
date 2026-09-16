@@ -7,6 +7,7 @@ expect error {
     no such database: nonexistent
 }
 
+@skip-if mvcc "plain VACUUM requires PRAGMA wal_checkpoint(TRUNCATE) first on an MVCC database"
 test vacuum-preserves-user-sequence {
     CREATE SEQUENCE s START WITH 1 INCREMENT BY 1;
     SELECT nextval('s');
