@@ -11,6 +11,7 @@ use super::{
     sqlite3_ondisk::{IndexInteriorCell, OverflowCell, MINIMUM_CELL_SIZE},
 };
 use crate::alloc::{TursoFromIterator, TursoSliceExt, TursoVecExt};
+use crate::coro::{with_handle, BoxedResumable, Co, Runner, StepContext, YieldSlot};
 #[cfg(any(test, injected_yields))]
 use crate::mvcc::yield_hooks::{ProvidesYieldContext, YieldContext, YieldPointMarker};
 use crate::mvcc::yield_points::inject_io_yield;
@@ -29,8 +30,7 @@ use crate::{
             LEAF_PAGE_HEADER_SIZE_BYTES, LEFT_CHILD_PTR_SIZE_BYTES,
         },
         state_machines::{
-            AdvanceState, CountState, EmptyTableState, MoveToRightState, MoveToState, RewindState,
-            SeekEndState, SeekToLastState,
+            AdvanceState, CountState, MoveToRightState, MoveToState, RewindState, SeekEndState,
         },
     },
     translate::plan::IterationDirection,
@@ -893,13 +893,11 @@ pub struct BTreeCursor {
     /// Separate state to read a record with overflow pages. This separation from `state` is necessary as
     /// we can be in a function that relies on `state`, but also needs to process overflow pages
     read_overflow_state: Option<ReadPayloadOverflow>,
-    /// State machine for [BTreeCursor::is_empty_table]
-    is_empty_table_state: EmptyTableState,
+    /// The async operations of the cursor and their suspended state.
+    ops: CursorOps,
     /// State machine for [BTreeCursor::move_to_rightmost] and, optionally, the id of the rightmost page in the btree.
     /// If we know the rightmost page id and are already on that page, we can skip a seek.
     move_to_right_state: (MoveToRightState, Option<usize>),
-    /// State machine for [BTreeCursor::seek_to_last]
-    seek_to_last_state: SeekToLastState,
     /// State machine for [BTreeCursor::rewind]
     rewind_state: RewindState,
     /// State machine for [BTreeCursor::next] and [BTreeCursor::prev]
@@ -1145,6 +1143,138 @@ fn blob_locate_column_in_header(
 crate::assert::assert_send!(BTreeCursor);
 crate::assert::assert_sync!(BTreeCursor);
 
+/// The result of an async cursor operation, or of one of its steps.
+type OpResult<T> = std::result::Result<T, Box<LimboError>>;
+
+/// Names [`BtreeCtx`] as the context type of the async cursor operations.
+struct BtreeStep;
+
+impl StepContext for BtreeStep {
+    type Error = Box<LimboError>;
+    type Ctx<'a> = BtreeCtx<'a>;
+}
+
+/// The context of one step of an async cursor operation. The async function
+/// gets it back on every step, so it never keeps a reference to the cursor
+/// across a yield.
+struct BtreeCtx<'a> {
+    cursor: &'a mut BTreeCursor,
+    /// The completion of a step that yielded, until `resume` picks it up.
+    io: Option<IOCompletions>,
+    /// The error of a step that failed, until `resume` picks it up.
+    err: Option<Box<LimboError>>,
+}
+
+impl YieldSlot<Box<LimboError>> for BtreeCtx<'_> {
+    fn park_io(&mut self, io: IOCompletions) {
+        turso_assert!(self.io.is_none(), "a step parks at most one completion");
+        self.io = Some(io);
+    }
+
+    fn take_io(&mut self) -> Option<IOCompletions> {
+        self.io.take()
+    }
+
+    fn park_err(&mut self, err: Box<LimboError>) {
+        turso_assert!(self.err.is_none(), "a step parks at most one error");
+        self.err = Some(err);
+    }
+
+    fn take_err(&mut self) -> Option<Box<LimboError>> {
+        self.err.take()
+    }
+}
+
+/// One async cursor operation: its boxed runner, built on first use and
+/// reused, and whether an operation is suspended in it.
+struct OpSlot<Args, Out> {
+    runner: Option<BoxedResumable<BtreeStep, Args, Out>>,
+    active: bool,
+}
+
+impl<Args, Out> Default for OpSlot<Args, Out> {
+    fn default() -> Self {
+        Self {
+            runner: None,
+            active: false,
+        }
+    }
+}
+
+/// The async cursor operations: one slot each, and one method each that
+/// runs one step. A step starts a new operation when none is suspended and
+/// resumes the suspended one otherwise. The runner leaves its slot for the
+/// step, so the context can borrow the cursor.
+macro_rules! cursor_ops {
+    ($($slot:ident / $run:ident: $args:ty => $out:ty = $body:path,)+) => {
+        #[derive(Default)]
+        struct CursorOps {
+            $($slot: OpSlot<$args, $out>,)+
+        }
+
+        impl BTreeCursor {
+            $(
+            #[inline]
+            fn $run(&mut self, start: $args) -> IOResultOr<$out> {
+                let mut runner = self.ops.$slot.runner.take().unwrap_or_else(|| {
+                    Runner::boxed(|co, start| with_handle(co, start, $body))
+                });
+                let mut ctx = BtreeCtx {
+                    cursor: self,
+                    io: None,
+                    err: None,
+                };
+                let result = runner.resume(&mut ctx, start);
+                let active = runner.is_active();
+                turso_assert!(
+                    self.ops.$slot.runner.is_none(),
+                    "a cursor operation resumed itself"
+                );
+                self.ops.$slot.runner = Some(runner);
+                self.ops.$slot.active = active;
+                result
+            }
+            )+
+        }
+    };
+}
+
+cursor_ops! {
+    seek_to_last / run_seek_to_last: () => () = seek_to_last,
+}
+
+/// Hands the disk read completion of a page to the caller, if the read
+/// needs one, and continues after it completed.
+async fn wait_for_read(co: &mut Co<BtreeStep>, completion: Option<Completion>) {
+    if let Some(completion) = completion {
+        co.yield_io(IOCompletions(completion)).await;
+    }
+}
+
+/// Moves the cursor to the rightmost record, or to the empty root page.
+async fn seek_to_last(co: &mut Co<BtreeStep>, (): ()) -> OpResult<()> {
+    let has_record = co.io(|ctx| ctx.cursor.move_to_rightmost()).await;
+    co.with(|ctx| {
+        ctx.cursor.invalidate_record();
+        ctx.cursor.set_has_record(has_record);
+        ctx.cursor.read_overflow_state = None;
+    });
+    if !has_record {
+        let is_empty = is_empty_table(co).await;
+        turso_assert!(is_empty);
+    }
+    Ok(())
+}
+
+/// True if the root page has no cells.
+async fn is_empty_table(co: &mut Co<BtreeStep>) -> bool {
+    let root_page = co.with(|ctx| ctx.cursor.root_page);
+    let (page, completion) = co.io(|ctx| ctx.cursor.pager.read_page(root_page)).await;
+    wait_for_read(co, completion).await;
+    turso_assert!(page.is_loaded(), "page should be loaded");
+    page.get_contents().cell_count() == 0
+}
+
 /// We store the cell index and cell count for each page in the stack.
 /// The reason we store the cell count is because we need to know when we are at the end of the page,
 /// without having to perform IO to get the ancestor pages.
@@ -1208,9 +1338,8 @@ impl BTreeCursor {
             valid_state,
             seek_state: CursorSeekState::Start,
             read_overflow_state: None,
-            is_empty_table_state: EmptyTableState::Start,
+            ops: CursorOps::default(),
             move_to_right_state: (MoveToRightState::Start, None),
-            seek_to_last_state: SeekToLastState::Start,
             rewind_state: RewindState::Start,
             advance_state: AdvanceState::Start,
             count_state: CountState::Start,
@@ -1318,33 +1447,6 @@ impl BTreeCursor {
             ),
         };
         Some(rowid)
-    }
-
-    /// Check if the table is empty.
-    /// This is done by checking if the root page has no cells.
-    #[cfg_attr(debug_assertions, instrument(skip_all, level = Level::DEBUG))]
-    fn is_empty_table(&mut self) -> IOResultOr<bool> {
-        loop {
-            let state = self.is_empty_table_state.clone();
-            match state {
-                EmptyTableState::Start => {
-                    // On spill `return_if_io!` propagates `IO` up unchanged —
-                    // we have not produced a page yet, the state stays at
-                    // `Start`, and re-entry resumes here with the pager's
-                    // pending-read tracking returning the same PageRef.
-                    let (page, c) = return_if_io!(self.pager.read_page(self.root_page));
-                    self.is_empty_table_state = EmptyTableState::ReadPage { page };
-                    if let Some(c) = c {
-                        io_yield_one!(c);
-                    }
-                }
-                EmptyTableState::ReadPage { page } => {
-                    turso_assert!(page.is_loaded(), "page should be loaded");
-                    let cell_count = page.get_contents().cell_count();
-                    break Ok(IOResult::Done(cell_count == 0));
-                }
-            }
-        }
     }
 
     /// Move the cursor to the previous record and return it.
@@ -7708,31 +7810,11 @@ impl CursorTrait for BTreeCursor {
 
     #[cfg_attr(debug_assertions, instrument(skip_all, level = Level::DEBUG))]
     fn seek_to_last(&mut self) -> IOResultOr<()> {
-        loop {
-            match self.seek_to_last_state {
-                SeekToLastState::Start => {
-                    // A write through another cursor may save this cursor's old
-                    // position. We need the current largest rowid, not that old
-                    // position. Otherwise rowid() restores the old position.
-                    self.clear_saved_seek();
-                    let has_record = return_if_io!(self.move_to_rightmost());
-                    self.invalidate_record();
-                    self.set_has_record(has_record);
-                    self.read_overflow_state = None;
-                    if !has_record {
-                        self.seek_to_last_state = SeekToLastState::IsEmpty;
-                        continue;
-                    }
-                    return Ok(IOResult::Done(()));
-                }
-                SeekToLastState::IsEmpty => {
-                    let is_empty = return_if_io!(self.is_empty_table());
-                    turso_assert!(is_empty);
-                    self.seek_to_last_state = SeekToLastState::Start;
-                    return Ok(IOResult::Done(()));
-                }
-            }
-        }
+        // A write through another cursor may save this cursor's old
+        // position. We need the current largest rowid, not that old
+        // position. Otherwise rowid() restores the old position.
+        self.clear_saved_seek();
+        self.run_seek_to_last(())
     }
 }
 
