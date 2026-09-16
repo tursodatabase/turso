@@ -34,7 +34,7 @@ addr  opcode               p1  p2  p3  p4                                       
   11      HashBuild         2   5   1  r=[1] budget=67108864 payload=r[6]..r[7]   0
   12    Next                2   7   0                                             0
   13    HashBuildFinalize   1   0   0                                             0
-  14    HashResetMatched    1   0   0                                             0
+  14    HashBeginProbe      1   0   0                                             0
   15    Rewind              1  33   0                                             0  Rewind table h_items
   16      Column            1   1   8                                             0  r[8]=h_items.order_name
   17      Affinity          8   1   0                                             0  r[8..9] = A

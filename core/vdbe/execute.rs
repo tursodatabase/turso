@@ -18109,15 +18109,15 @@ pub fn op_hash_clear(
     Ok(InsnFunctionStepResult::Step)
 }
 
-pub fn op_hash_reset_matched(
+pub fn op_hash_begin_probe(
     _program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
     _pager: &Arc<Pager>,
 ) -> InsnResult {
-    load_insn!(HashResetMatched { hash_table_id }, insn);
+    load_insn!(HashBeginProbe { hash_table_id }, insn);
     if let Some(hash_table) = state.hash_tables.get_mut(hash_table_id) {
-        hash_table.reset_matched_bits();
+        hash_table.begin_probe();
     }
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)

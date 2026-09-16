@@ -2015,10 +2015,7 @@ pub enum Insn {
         hash_table_id: usize,
     },
 
-    /// Reset all matched_bits in a hash table to false.
-    /// Emitted at the start of each outer-loop iteration so that marks from
-    /// a previous probe pass don't suppress NULL-fill rows in the current one.
-    HashResetMatched {
+    HashBeginProbe {
         hash_table_id: usize,
     },
 
@@ -2336,7 +2333,7 @@ impl InsnVariants {
             InsnVariants::HashClose => execute::op_hash_close,
             InsnVariants::HashClear => execute::op_hash_clear,
             InsnVariants::HashMarkMatched => execute::op_hash_mark_matched,
-            InsnVariants::HashResetMatched => execute::op_hash_reset_matched,
+            InsnVariants::HashBeginProbe => execute::op_hash_begin_probe,
             InsnVariants::HashScanUnmatched => execute::op_hash_scan_unmatched,
             InsnVariants::HashNextUnmatched => execute::op_hash_next_unmatched,
             InsnVariants::HashGraceInit => execute::op_hash_grace_init,
