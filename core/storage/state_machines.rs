@@ -1,10 +1,4 @@
 #[derive(Debug, Clone, Copy)]
-pub enum MoveToRightState {
-    Start,
-    ProcessPage,
-}
-
-#[derive(Debug, Clone, Copy)]
 pub enum RewindState {
     Start,
     NextRecord,

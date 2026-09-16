@@ -29,9 +29,7 @@ use crate::{
             FREELIST_TRUNK_OFFSET_NEXT_TRUNK_PTR, INTERIOR_PAGE_HEADER_SIZE_BYTES,
             LEAF_PAGE_HEADER_SIZE_BYTES, LEFT_CHILD_PTR_SIZE_BYTES,
         },
-        state_machines::{
-            AdvanceState, CountState, MoveToRightState, MoveToState, RewindState, SeekEndState,
-        },
+        state_machines::{AdvanceState, CountState, MoveToState, RewindState, SeekEndState},
     },
     translate::plan::IterationDirection,
     turso_assert,
@@ -895,9 +893,10 @@ pub struct BTreeCursor {
     read_overflow_state: Option<ReadPayloadOverflow>,
     /// The async operations of the cursor and their suspended state.
     ops: CursorOps,
-    /// State machine for [BTreeCursor::move_to_rightmost] and, optionally, the id of the rightmost page in the btree.
-    /// If we know the rightmost page id and are already on that page, we can skip a seek.
-    move_to_right_state: (MoveToRightState, Option<usize>),
+    /// The id of the rightmost page in the btree, if known. When the cursor
+    /// is already on that page, a move to the rightmost record skips the
+    /// seek.
+    rightmost_page_id: Option<usize>,
     /// State machine for [BTreeCursor::rewind]
     rewind_state: RewindState,
     /// State machine for [BTreeCursor::next] and [BTreeCursor::prev]
@@ -1240,20 +1239,24 @@ macro_rules! cursor_ops {
 }
 
 cursor_ops! {
+    last / run_last: () => () = last,
     seek_to_last / run_seek_to_last: () => () = seek_to_last,
 }
 
-/// Hands the disk read completion of a page to the caller, if the read
-/// needs one, and continues after it completed.
-async fn wait_for_read(co: &mut Co<BtreeStep>, completion: Option<Completion>) {
-    if let Some(completion) = completion {
-        co.yield_io(IOCompletions(completion)).await;
-    }
+/// Moves the cursor to the last record: the `Last` opcode.
+async fn last(co: &mut Co<BtreeStep>, (): ()) -> OpResult<()> {
+    let has_record = move_to_rightmost(co).await?;
+    co.with(|ctx| {
+        ctx.cursor.set_has_record(has_record);
+        ctx.cursor.invalidate_record();
+        ctx.cursor.read_overflow_state = None;
+    });
+    Ok(())
 }
 
 /// Moves the cursor to the rightmost record, or to the empty root page.
 async fn seek_to_last(co: &mut Co<BtreeStep>, (): ()) -> OpResult<()> {
-    let has_record = co.io(|ctx| ctx.cursor.move_to_rightmost()).await;
+    let has_record = move_to_rightmost(co).await?;
     co.with(|ctx| {
         ctx.cursor.invalidate_record();
         ctx.cursor.set_has_record(has_record);
@@ -1266,6 +1269,21 @@ async fn seek_to_last(co: &mut Co<BtreeStep>, (): ()) -> OpResult<()> {
     Ok(())
 }
 
+/// Moves the cursor to the rightmost record of the btree. True if the
+/// btree has a record.
+async fn move_to_rightmost(co: &mut Co<BtreeStep>) -> OpResult<bool> {
+    if let Some(has_record) = co.with(|ctx| ctx.cursor.stay_on_known_rightmost_page()) {
+        return Ok(has_record);
+    }
+    move_to_root(co).await;
+    loop {
+        match co.with(|ctx| ctx.cursor.rightmost_step())? {
+            Rightmost::Leaf(has_record) => return Ok(has_record),
+            Rightmost::Child(page_id) => descend_rightmost(co, page_id).await,
+        }
+    }
+}
+
 /// True if the root page has no cells.
 async fn is_empty_table(co: &mut Co<BtreeStep>) -> bool {
     let root_page = co.with(|ctx| ctx.cursor.root_page);
@@ -1273,6 +1291,78 @@ async fn is_empty_table(co: &mut Co<BtreeStep>) -> bool {
     wait_for_read(co, completion).await;
     turso_assert!(page.is_loaded(), "page should be loaded");
     page.get_contents().cell_count() == 0
+}
+
+/// Reads the rightmost child of the page on top of the stack and moves
+/// the cursor into it.
+async fn descend_rightmost(co: &mut Co<BtreeStep>, page_id: u32) {
+    let (child, completion) = co.io(|ctx| ctx.cursor.read_page(page_id as i64)).await;
+    co.with(|ctx| {
+        let cell_count = ctx.cursor.stack.top_ref().get_contents().cell_count();
+        ctx.cursor.stack.set_cell_index(cell_count as i32 + 1);
+        ctx.cursor.stack.push(child);
+    });
+    wait_for_read(co, completion).await;
+}
+
+/// Moves the cursor to the root page of the btree.
+async fn move_to_root(co: &mut Co<BtreeStep>) {
+    let completion = co.io(|ctx| ctx.cursor.move_to_root_nonblock()).await;
+    wait_for_read(co, completion).await;
+}
+
+/// Hands the disk read completion of a page to the caller, if the read
+/// needs one, and continues after it completed.
+async fn wait_for_read(co: &mut Co<BtreeStep>, completion: Option<Completion>) {
+    if let Some(completion) = completion {
+        co.yield_io(IOCompletions(completion)).await;
+    }
+}
+
+/// One page of the descent to the rightmost leaf.
+enum Rightmost {
+    /// The cursor is on the leaf. True if the leaf has a cell.
+    Leaf(bool),
+    /// The page is an interior page: this is its rightmost child.
+    Child(u32),
+}
+
+impl BTreeCursor {
+    /// If the rightmost page is known and the cursor is on it, moves to its
+    /// last cell without a seek. True if the page has a cell. The known
+    /// page is safe to trust: every change of this btree, by this cursor
+    /// or by a peer cursor, forgets it.
+    fn stay_on_known_rightmost_page(&mut self) -> Option<bool> {
+        let rightmost_page_id = self.rightmost_page_id?;
+        let current_page = self.stack.top_ref();
+        if current_page.get().id() != rightmost_page_id {
+            return None;
+        }
+        let cell_count = current_page.get_contents().cell_count();
+        self.stack.set_cell_index(cell_count as i32 - 1);
+        Some(cell_count > 0)
+    }
+
+    /// Looks at the page on top of the stack during the descent to the
+    /// rightmost leaf. On the leaf, remembers it as the rightmost page and
+    /// moves to its last cell.
+    fn rightmost_step(&mut self) -> OpResult<Rightmost> {
+        let page = self.stack.top_ref();
+        let page_idx = page.get().id();
+        let contents = page.get_contents();
+        if contents.is_leaf() {
+            self.rightmost_page_id = Some(page_idx);
+            if contents.cell_count() > 0 {
+                self.stack.set_cell_index(contents.cell_count() as i32 - 1);
+                return Ok(Rightmost::Leaf(true));
+            }
+            return Ok(Rightmost::Leaf(false));
+        }
+        match contents.rightmost_pointer()? {
+            Some(right_most_pointer) => Ok(Rightmost::Child(right_most_pointer)),
+            None => unreachable!("interior page should have a rightmost pointer"),
+        }
+    }
 }
 
 /// We store the cell index and cell count for each page in the stack.
@@ -1339,7 +1429,7 @@ impl BTreeCursor {
             seek_state: CursorSeekState::Start,
             read_overflow_state: None,
             ops: CursorOps::default(),
-            move_to_right_state: (MoveToRightState::Start, None),
+            rightmost_page_id: None,
             rewind_state: RewindState::Start,
             advance_state: AdvanceState::Start,
             count_state: CountState::Start,
@@ -1968,69 +2058,6 @@ impl BTreeCursor {
         self.stack.clear();
         self.stack.push(mem_page);
         Ok(IOResult::Done(c))
-    }
-
-    /// Move the cursor to the rightmost record in the btree.
-    #[cfg_attr(debug_assertions, instrument(skip(self), level = Level::DEBUG))]
-    fn move_to_rightmost(&mut self) -> IOResultOr<bool> {
-        loop {
-            let (move_to_right_state, rightmost_page_id) = &self.move_to_right_state;
-            match *move_to_right_state {
-                MoveToRightState::Start => {
-                    if let Some(rightmost_page_id) = rightmost_page_id {
-                        // If we know the rightmost page and are already on it, we can skip a seek.
-                        // The cache is safe to trust: any modification of this btree — our own
-                        // balancing, or a peer cursor's write (e.g. a trigger subprogram's, via
-                        // the saveAllCursors pass) — invalidates it.
-                        let current_page = self.stack.top_ref();
-                        if current_page.get().id() == *rightmost_page_id {
-                            let contents = current_page.get_contents();
-                            let cell_count = contents.cell_count();
-                            self.stack.set_cell_index(cell_count as i32 - 1);
-                            return Ok(IOResult::Done(cell_count > 0));
-                        }
-                    }
-                    let rightmost_page_id = *rightmost_page_id;
-                    let c = return_if_io!(self.move_to_root_nonblock());
-                    self.move_to_right_state = (MoveToRightState::ProcessPage, rightmost_page_id);
-                    if let Some(c) = c {
-                        io_yield_one!(c);
-                    }
-                }
-                MoveToRightState::ProcessPage => {
-                    let mem_page = self.stack.top_ref();
-                    let page_idx = mem_page.get().id();
-                    let contents = mem_page.get_contents();
-                    if contents.is_leaf() {
-                        self.move_to_right_state = (MoveToRightState::Start, Some(page_idx));
-                        if contents.cell_count() > 0 {
-                            self.stack.set_cell_index(contents.cell_count() as i32 - 1);
-                            return Ok(IOResult::Done(true));
-                        }
-                        return Ok(IOResult::Done(false));
-                    }
-
-                    match contents.rightmost_pointer()? {
-                        Some(right_most_pointer) => {
-                            // On `IO(spill_c)` the stack is unchanged, so re-entry
-                            // re-reads the same parent contents and retries the
-                            // descent — the disk-read for this child is memoized
-                            // in `pending_reads`, so no duplicate IO is issued.
-                            let (mem_page, c) =
-                                return_if_io!(self.read_page(right_most_pointer as i64));
-                            self.stack.set_cell_index(contents.cell_count() as i32 + 1);
-                            self.stack.push(mem_page);
-                            if let Some(c) = c {
-                                io_yield_one!(c);
-                            }
-                        }
-                        None => {
-                            unreachable!("interior page should have a rightmost pointer");
-                        }
-                    }
-                }
-            }
-        }
     }
 
     /// Specialized version of move_to() for table btrees.
@@ -3442,7 +3469,7 @@ impl BTreeCursor {
     #[cfg_attr(debug_assertions, instrument(skip(self), level = Level::DEBUG))]
     fn balance_quick(&mut self) -> IOResultOr<()> {
         // Since we are going to change the btree structure, let's forget our cached knowledge of the rightmost page.
-        let _ = self.move_to_right_state.1.take();
+        let _ = self.rightmost_page_id.take();
 
         // Allocate a new leaf page and insert the overflow cell payload in it.
         let new_rightmost_leaf = return_if_io!(self.pager.do_allocate_page(
@@ -3539,7 +3566,7 @@ impl BTreeCursor {
                 }
                 BalanceSubState::NonRootPickSiblings => {
                     // Since we are going to change the btree structure, let's forget our cached knowledge of the rightmost page.
-                    let _ = self.move_to_right_state.1.take();
+                    let _ = self.rightmost_page_id.take();
 
                     let (parent_page_idx, page_type, cell_count, over_cell_count) = {
                         let parent_page = self.stack.top_ref();
@@ -5329,7 +5356,7 @@ impl BTreeCursor {
         /* if we are in root page then we just need to create a new root and push key there */
 
         // Since we are going to change the btree structure, let's forget our cached knowledge of the rightmost page.
-        let _ = self.move_to_right_state.1.take();
+        let _ = self.rightmost_page_id.take();
 
         let root = self.stack.top();
         let root_contents = root.get_contents();
@@ -6748,11 +6775,7 @@ impl CursorTrait for BTreeCursor {
             return Ok(IOResult::Done(()));
         }
         self.clear_saved_seek();
-        let cursor_has_record = return_if_io!(self.move_to_rightmost());
-        self.set_has_record(cursor_has_record);
-        self.invalidate_record();
-        self.read_overflow_state = None;
-        Ok(IOResult::Done(()))
+        self.run_last(())
     }
 
     #[cfg_attr(debug_assertions, instrument(skip_all, level = Level::DEBUG))]
@@ -7377,7 +7400,7 @@ impl CursorTrait for BTreeCursor {
             // Every page in this btree is about to be freed, so our own cached
             // rightmost page id is meaningless too (the id may even be
             // reallocated to an unrelated page after a refill).
-            self.move_to_right_state.1 = None;
+            self.rightmost_page_id = None;
         }
         self.destroy_btree_contents(true)
     }
@@ -7626,7 +7649,7 @@ impl CursorTrait for BTreeCursor {
         self.stack.clear();
         self.has_record = false;
         self.noted_payload = NotedPayload::NONE;
-        self.move_to_right_state.1 = None;
+        self.rightmost_page_id = None;
         self.invalidate_count_cache();
         self.blob_cache.reset();
     }
@@ -7682,7 +7705,7 @@ impl CursorTrait for BTreeCursor {
         // (move_to_rightmost's skip-a-seek optimization) and the memoized
         // count. Positional state is preserved separately via save_context.
         // Idempotent, so safe across IO re-entry into this function.
-        self.move_to_right_state.1 = None;
+        self.rightmost_page_id = None;
         self.invalidate_count_cache();
         if self.valid_state != CursorValidState::Valid || !self.has_record() {
             // Nothing to save: cursor has no live position. No invalidation
