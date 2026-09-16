@@ -873,3 +873,20 @@ expect {
     a2|a2c2|c2
     ok
 }
+
+# An ANY generated column introduced through ALTER COLUMN on a STRICT table
+# must get the same affinity treatment as one written in CREATE TABLE, or
+# its type flips when the schema text is re-parsed on reopen and index keys
+# built before the reopen no longer match.
+test alter-column-strict-any-gencol-affinity {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, a TEXT, c ANY) STRICT;
+    ALTER TABLE t ALTER COLUMN c TO g ANY AS (a);
+    INSERT INTO t(id,a) VALUES(1,'42');
+    SELECT typeof(g) FROM t;
+    CREATE INDEX t_g ON t(g);
+    PRAGMA integrity_check;
+}
+expect {
+    text
+    ok
+}
