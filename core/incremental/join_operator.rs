@@ -7,7 +7,7 @@ use crate::incremental::operator::{
     generate_storage_id, ComputationTracker, DbspStateCursors, EvalState, IncrementalOperator,
     OpRunner,
 };
-use crate::incremental::persistence::WriteRow;
+use crate::incremental::persistence::{write_row, CursorStep};
 use crate::numeric::Numeric;
 use crate::storage::btree::CursorTrait;
 use crate::sync::Arc;
@@ -33,6 +33,12 @@ pub struct JoinCtx<'a> {
     cursors: &'a mut DbspStateCursors,
     io: Option<IOCompletions>,
     err: Option<Box<LimboError>>,
+}
+
+impl CursorStep for JoinStep {
+    fn cursors<'c, 'a>(ctx: &'c mut JoinCtx<'a>) -> &'c mut DbspStateCursors {
+        ctx.cursors
+    }
 }
 
 impl YieldSlot<Box<LimboError>> for JoinCtx<'_> {
@@ -458,16 +464,7 @@ async fn commit_deltas(co: &mut Co<JoinStep>, deltas: DeltaPair) -> Result<Delta
             let join_key = operator.extract_join_key(&row.values, &operator.left_key_indices);
             stored_row(operator.left_storage_id(), &join_key, row)
         })?;
-        let mut write_row = WriteRow::new();
-        co.io(|ctx| {
-            write_row.write_row(
-                ctx.cursors,
-                index_key.clone(),
-                record_values.clone(),
-                *weight,
-            )
-        })
-        .await;
+        write_row(co, index_key, record_values, *weight).await?;
     }
 
     for (row, weight) in &deltas.right.changes {
@@ -476,16 +473,7 @@ async fn commit_deltas(co: &mut Co<JoinStep>, deltas: DeltaPair) -> Result<Delta
             let join_key = operator.extract_join_key(&row.values, &operator.right_key_indices);
             stored_row(operator.right_storage_id(), &join_key, row)
         })?;
-        let mut write_row = WriteRow::new();
-        co.io(|ctx| {
-            write_row.write_row(
-                ctx.cursors,
-                index_key.clone(),
-                record_values.clone(),
-                *weight,
-            )
-        })
-        .await;
+        write_row(co, index_key, record_values, *weight).await?;
     }
 
     Ok(output)

@@ -8,7 +8,7 @@ use crate::incremental::operator::{
     generate_storage_id, ComputationTracker, DbspStateCursors, EvalState, IncrementalOperator,
     OpRunner,
 };
-use crate::incremental::persistence::{ReadRecord, WriteRow};
+use crate::incremental::persistence::{read_record, write_row, CursorStep};
 use crate::numeric::Numeric;
 use crate::storage::btree::{BTreeCursor, CursorTrait};
 use crate::sync::Arc;
@@ -379,6 +379,12 @@ pub struct AggregateCtx<'a> {
     cursors: &'a mut DbspStateCursors,
     io: Option<IOCompletions>,
     err: Option<Box<LimboError>>,
+}
+
+impl CursorStep for AggregateStep {
+    fn cursors<'c, 'a>(ctx: &'c mut AggregateCtx<'a>) -> &'c mut DbspStateCursors {
+        ctx.cursors
+    }
 }
 
 impl YieldSlot<Box<LimboError>> for AggregateCtx<'_> {
@@ -1603,16 +1609,7 @@ async fn commit_delta(co: &mut Co<AggregateStep>, delta: Delta) -> Result<Delta,
                 ctx.operator
                     .stored_group(group_key_str, group_key, agg_state)
             })?;
-            let mut write_row = WriteRow::new();
-            co.io(|ctx| {
-                write_row.write_row(
-                    ctx.cursors,
-                    index_key.clone(),
-                    record_values.clone(),
-                    weight,
-                )
-            })
-            .await;
+            write_row(co, index_key, record_values, weight).await?;
         }
     }
 
@@ -1661,16 +1658,7 @@ async fn persist_min_max(
                     ],
                 ))
             })?;
-            let mut write_row = WriteRow::new();
-            co.io(|ctx| {
-                write_row.write_row(
-                    ctx.cursors,
-                    index_key.clone(),
-                    record_values.clone(),
-                    *weight,
-                )
-            })
-            .await;
+            write_row(co, index_key, record_values, *weight).await?;
         }
     }
     Ok(())
@@ -1713,16 +1701,7 @@ async fn persist_distinct_values(
                     ],
                 ))
             })?;
-            let mut write_row = WriteRow::new();
-            co.io(|ctx| {
-                write_row.write_row(
-                    ctx.cursors,
-                    index_key.clone(),
-                    record_values.clone(),
-                    *weight,
-                )
-            })
-            .await;
+            write_row(co, index_key, record_values, *weight).await?;
         }
     }
     Ok(())
@@ -1759,13 +1738,7 @@ async fn eval_delta(
             // The group must exist so that the distinct value read fills it in.
             existing_groups.insert(group_key_str.clone(), AggregateState::default());
         } else if let Some(rowid) = rowid {
-            let mut read = ReadRecord::new();
-            let state = co
-                .io(|ctx| {
-                    read.read_record(SeekKey::TableRowId(rowid), &mut ctx.cursors.table_cursor)
-                })
-                .await;
-            if let Some(state) = state {
+            if let Some(state) = read_record(co, rowid).await? {
                 let mut old_row = group_key.clone();
                 old_row.extend(co.with(|ctx| state.to_values(&ctx.operator.aggregates)));
                 old_values.insert(group_key_str.clone(), old_row);
