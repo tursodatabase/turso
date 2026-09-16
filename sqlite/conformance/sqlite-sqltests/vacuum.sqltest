@@ -1,0 +1,66 @@
+@database :temp:
+
+test vacuum-basic {
+    CREATE TABLE t1(a INTEGER PRIMARY KEY, b TEXT, c REAL);
+    INSERT INTO t1 VALUES(1, 'hello', 3.125);
+    INSERT INTO t1 VALUES(2, 'world', 2.725);
+    INSERT INTO t1 VALUES(3, 'test', 1.625);
+    DELETE FROM t1 WHERE a = 2;
+    VACUUM;
+    PRAGMA integrity_check;
+    SELECT a, b, c FROM t1 ORDER BY a;
+}
+expect {
+    ok
+    1|hello|3.125
+    3|test|1.625
+}
+
+test vacuum-preserves-metadata {
+    CREATE TABLE t(a INTEGER);
+    INSERT INTO t VALUES(1);
+    PRAGMA user_version = 42;
+    PRAGMA application_id = 99;
+    PRAGMA schema_version;
+    VACUUM;
+    PRAGMA integrity_check;
+    PRAGMA user_version;
+    PRAGMA application_id;
+    PRAGMA schema_version;
+}
+expect {
+    1
+    ok
+    42
+    99
+    2
+}
+
+test vacuum-preserves-autoincrement {
+    CREATE TABLE t1(a INTEGER PRIMARY KEY AUTOINCREMENT, b TEXT);
+    INSERT INTO t1(b) VALUES('one');
+    INSERT INTO t1(b) VALUES('two');
+    INSERT INTO t1(b) VALUES('three');
+    DELETE FROM t1 WHERE b = 'two';
+    VACUUM;
+    PRAGMA integrity_check;
+    SELECT name, seq FROM sqlite_sequence;
+    INSERT INTO t1(b) VALUES('four');
+    SELECT a, b FROM t1 ORDER BY a;
+}
+expect {
+    ok
+    t1|3
+    1|one
+    3|three
+    4|four
+}
+
+test vacuum-rejects-active-transaction {
+    CREATE TABLE t(a INTEGER);
+    BEGIN;
+    VACUUM;
+}
+expect error {
+    cannot VACUUM from within a transaction
+}

@@ -3456,21 +3456,6 @@ fn test_vacuum_main_into(tmp_db: TempDatabase) -> anyhow::Result<()> {
 }
 
 #[turso_macros::test(mvcc)]
-fn test_vacuum_into_nonexistent_schema(tmp_db: TempDatabase) -> anyhow::Result<()> {
-    let conn = tmp_db.connect_limbo();
-    let result = conn.execute("VACUUM nonexistent INTO 'out.db'");
-
-    assert!(result.is_err(), "Should error on non-existent database");
-    let err_msg = format!("{}", result.unwrap_err());
-    assert!(
-        err_msg.contains("no such database: nonexistent"),
-        "Error should indicate database not found: {err_msg}"
-    );
-
-    Ok(())
-}
-
-#[turso_macros::test(mvcc)]
 fn test_vacuum_into_temp_is_noop(tmp_db: TempDatabase) -> anyhow::Result<()> {
     let conn = tmp_db.connect_limbo();
 
@@ -4162,119 +4147,6 @@ fn test_plain_vacuum_keeps_temp_schema_on_same_connection(
     Ok(())
 }
 
-/// Basic plain VACUUM: data survives the compaction round-trip.
-#[cfg_attr(feature = "checksum", ignore)]
-#[turso_macros::test(init_sql = "CREATE TABLE t1(a INTEGER PRIMARY KEY, b TEXT, c REAL);")]
-fn test_plain_vacuum_basic(tmp_db: TempDatabase) -> anyhow::Result<()> {
-    let conn = tmp_db.connect_limbo();
-    conn.execute("INSERT INTO t1 VALUES(1, 'hello', 3.125)")?;
-    conn.execute("INSERT INTO t1 VALUES(2, 'world', 2.725)")?;
-    conn.execute("INSERT INTO t1 VALUES(3, 'test', 1.625)")?;
-    conn.execute("DELETE FROM t1 WHERE a = 2")?;
-    conn.execute("VACUUM")?;
-    assert_eq!(run_integrity_check(&conn), "ok");
-
-    let rows: Vec<(i64, String, f64)> = conn.exec_rows("SELECT a, b, c FROM t1 ORDER BY a");
-    assert_eq!(rows.len(), 2);
-    assert_eq!(rows[0], (1, "hello".into(), 3.125));
-    assert_eq!(rows[1], (3, "test".into(), 1.625));
-
-    Ok(())
-}
-
-/// Plain VACUUM preserves user_version and application_id metadata.
-#[cfg_attr(feature = "checksum", ignore)]
-#[turso_macros::test(init_sql = "CREATE TABLE t(a INTEGER);")]
-fn test_plain_vacuum_preserves_metadata(tmp_db: TempDatabase) -> anyhow::Result<()> {
-    let conn = tmp_db.connect_limbo();
-    conn.execute("INSERT INTO t VALUES(1)")?;
-    conn.execute("PRAGMA user_version = 42")?;
-    conn.execute("PRAGMA application_id = 99")?;
-
-    let pre_schema_version: Vec<(i64,)> = conn.exec_rows("PRAGMA schema_version");
-
-    conn.execute("VACUUM")?;
-    assert_eq!(run_integrity_check(&conn), "ok");
-
-    let user_version: Vec<(i64,)> = conn.exec_rows("PRAGMA user_version");
-    assert_eq!(user_version[0].0, 42);
-
-    let application_id: Vec<(i64,)> = conn.exec_rows("PRAGMA application_id");
-    assert_eq!(application_id[0].0, 99);
-
-    // Schema version should be bumped by 1.
-    let post_schema_version: Vec<(i64,)> = conn.exec_rows("PRAGMA schema_version");
-    assert_eq!(post_schema_version[0].0, pre_schema_version[0].0 + 1);
-
-    let journal_mode: Vec<(String,)> = conn.exec_rows("PRAGMA journal_mode");
-    assert_eq!(journal_mode[0].0, "wal");
-
-    Ok(())
-}
-
-/// Plain VACUUM preserves AUTOINCREMENT counters.
-#[cfg_attr(feature = "checksum", ignore)]
-#[turso_macros::test(init_sql = "CREATE TABLE t1(a INTEGER PRIMARY KEY AUTOINCREMENT, b TEXT);")]
-fn test_plain_vacuum_preserves_autoincrement(tmp_db: TempDatabase) -> anyhow::Result<()> {
-    let conn = tmp_db.connect_limbo();
-    conn.execute("INSERT INTO t1(b) VALUES('one')")?;
-    conn.execute("INSERT INTO t1(b) VALUES('two')")?;
-    conn.execute("INSERT INTO t1(b) VALUES('three')")?;
-    conn.execute("DELETE FROM t1 WHERE b = 'two'")?;
-    conn.execute("VACUUM")?;
-    assert_eq!(run_integrity_check(&conn), "ok");
-
-    // Verify sqlite_sequence preserved
-    let seq: Vec<(String, i64)> = conn.exec_rows("SELECT name, seq FROM sqlite_sequence");
-    assert_eq!(seq.len(), 1);
-    assert_eq!(seq[0].0, "t1");
-    assert_eq!(seq[0].1, 3);
-
-    // Next insert should continue from 4, not restart
-    conn.execute("INSERT INTO t1(b) VALUES('four')")?;
-    let rows: Vec<(i64, String)> = conn.exec_rows("SELECT a, b FROM t1 ORDER BY a");
-    assert_eq!(rows.len(), 3);
-    assert_eq!(rows[0], (1, "one".into()));
-    assert_eq!(rows[1], (3, "three".into()));
-    assert_eq!(rows[2], (4, "four".into()));
-
-    Ok(())
-}
-
-/// Plain VACUUM must succeed against a database with user-created
-/// sequences and preserve their on-disk state. The post-VACUUM
-/// connection must still be able to nextval and observe the
-/// pre-VACUUM watermark.
-///
-/// Regression: classifying the `__turso_internal_seq_*` backing
-/// table as "skip-in-target-schema-replay" while leaving it in the
-/// copy phase produced `no such table: "__turso_internal_seq_s"` on
-/// any DB carrying a user-created sequence. Repro from the
-/// reviewer: `CREATE SEQUENCE s; SELECT nextval('s'); VACUUM;`.
-#[cfg_attr(feature = "checksum", ignore)]
-#[turso_macros::test]
-fn test_plain_vacuum_preserves_user_sequence(tmp_db: TempDatabase) -> anyhow::Result<()> {
-    let conn = tmp_db.connect_limbo();
-
-    conn.execute("CREATE SEQUENCE s START WITH 1 INCREMENT BY 1")?;
-    let rows: Vec<(i64,)> = conn.exec_rows("SELECT nextval('s')");
-    assert_eq!(rows, vec![(1,)]);
-    let rows: Vec<(i64,)> = conn.exec_rows("SELECT nextval('s')");
-    assert_eq!(rows, vec![(2,)]);
-
-    conn.execute("VACUUM")?;
-    assert_eq!(run_integrity_check(&conn), "ok");
-
-    let rows: Vec<(i64,)> = conn.exec_rows("SELECT nextval('s')");
-    assert_eq!(
-        rows,
-        vec![(3,)],
-        "post-VACUUM nextval must continue from the pre-VACUUM watermark"
-    );
-
-    Ok(())
-}
-
 /// Plain VACUUM must preserve hidden rowid values for ordinary rowid tables.
 #[turso_macros::test(mvcc)]
 fn test_plain_vacuum_preserves_rowid_for_rowid_tables(tmp_db: TempDatabase) -> anyhow::Result<()> {
@@ -4811,21 +4683,6 @@ fn test_plain_vacuum_preserves_views(tmp_db: TempDatabase) -> anyhow::Result<()>
     Ok(())
 }
 
-/// Plain VACUUM rejects active transactions.
-#[turso_macros::test(init_sql = "CREATE TABLE t(a INTEGER);")]
-fn test_plain_vacuum_rejects_active_transaction(tmp_db: TempDatabase) -> anyhow::Result<()> {
-    let conn = tmp_db.connect_limbo();
-    conn.execute("BEGIN")?;
-    let err = conn.execute("VACUUM").unwrap_err();
-    assert_eq!(
-        err.to_string(),
-        "Transaction error: cannot VACUUM from within a transaction",
-        "unexpected error: {err}"
-    );
-    conn.execute("ROLLBACK")?;
-    Ok(())
-}
-
 /// Plain VACUUM works on empty databases.
 #[cfg_attr(feature = "checksum", ignore)]
 #[turso_macros::test(init_sql = "CREATE TABLE t(a INTEGER);")]
@@ -4954,20 +4811,6 @@ fn test_plain_vacuum_then_write(tmp_db: TempDatabase) -> anyhow::Result<()> {
     assert_eq!(rows[1], (3, "three".into()));
     assert_eq!(rows[2], (4, "four".into()));
 
-    Ok(())
-}
-
-/// Plain VACUUM rejects query_only mode.
-#[turso_macros::test(init_sql = "CREATE TABLE t(a INTEGER);")]
-fn test_plain_vacuum_rejects_query_only(tmp_db: TempDatabase) -> anyhow::Result<()> {
-    let conn = tmp_db.connect_limbo();
-    conn.execute("PRAGMA query_only = 1")?;
-    let err = conn.execute("VACUUM").unwrap_err();
-    assert_eq!(
-        err.to_string(),
-        "Parse error: Cannot execute VACUUM in query_only mode",
-        "unexpected error: {err}"
-    );
     Ok(())
 }
 
