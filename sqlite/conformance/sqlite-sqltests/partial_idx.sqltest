@@ -1735,3 +1735,24 @@ test eqp-use-partial-idx-predicate-with-residual-predicate-for-covering-index-sc
 expect {
     1|0|0|SEARCH t USING COVERING INDEX idx (a=?)
 }
+
+# An outer join condition does not filter rows from its left table.
+@cross-check-integrity
+test outer-join-condition-does-not-enable-left-table-partial-index {
+    CREATE TABLE items(name TEXT, group_name TEXT);
+    INSERT INTO items VALUES ('one', 'keep'), ('two', 'keep');
+    CREATE INDEX only_missing ON items(name, group_name)
+        WHERE name = 'missing';
+    CREATE TABLE optional(name TEXT);
+
+    SELECT items.name
+    FROM items
+    LEFT JOIN optional
+      ON optional.name = items.name AND items.name = 'missing'
+    WHERE items.group_name = 'keep'
+    ORDER BY items.name;
+}
+expect {
+    one
+    two
+}

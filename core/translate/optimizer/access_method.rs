@@ -1198,10 +1198,13 @@ fn find_hash_join_keys(
 /// The cost model accounts for:
 /// - Build phase: Creating the hash table from the build side (one-time cost)
 /// - Probe phase: Looking up each probe row in the hash table (one scan of probe table)
+/// - Match phase: Visiting matching rows and scanning unmatched build rows
 /// - Memory pressure: Additional IO cost if the hash table spills to disk
 pub fn estimate_hash_join_cost(
     build_cardinality: f64,
     probe_cardinality: f64,
+    rows_visited: f64,
+    join_type: HashJoinType,
     mem_budget: usize,
     probe_multiplier: f64,
     params: &CostModelParams,
@@ -1218,6 +1221,12 @@ pub fn estimate_hash_join_cost(
     let probe_scan_cost = estimate_scan_cost(probe_cardinality, probe_multiplier, params);
     let probe_hash_cost =
         probe_cardinality * (params.hash_cpu_cost + params.hash_lookup_cost) * probe_multiplier;
+    let visit_cost = rows_visited * params.cpu_cost_per_row;
+    let unmatched_build_cost = if join_type.keeps_unmatched_build_rows() {
+        build_cardinality * params.cpu_cost_per_row
+    } else {
+        0.0
+    };
 
     // Spill cost: if hash table exceeds memory budget, we need to write/read partitions to disk.
     // Grace hash join writes partitions and reads them back, so it's 2x the page IO.
@@ -1231,7 +1240,14 @@ pub fn estimate_hash_join_cost(
         0.0
     };
 
-    Cost(build_cost + probe_scan_cost.0 + probe_hash_cost + spill_cost)
+    Cost(
+        build_cost
+            + probe_scan_cost.0
+            + probe_hash_cost
+            + visit_cost
+            + unmatched_build_cost
+            + spill_cost,
+    )
 }
 
 /// Try to create a hash join access method for joining two tables.
@@ -1253,18 +1269,20 @@ pub fn try_hash_join_access_method(
     subqueries: &[NonFromClauseSubquery],
     params: &CostModelParams,
 ) -> Result<Option<AccessMethod>> {
-    // Only works for B-tree tables
-    if !matches!(build_table.table, Table::BTree(_))
-        || !matches!(probe_table.table, Table::BTree(_))
-    {
+    let (Table::BTree(build_btree), Table::BTree(probe_btree)) =
+        (&build_table.table, &probe_table.table)
+    else {
+        return Ok(None);
+    };
+    if !build_btree.has_rowid || !probe_btree.has_rowid {
         return Ok(None);
     }
     // Avoid hash join on self-joins over the same underlying table for INNER /
     // LEFT joins: a nested-loop with index seek is usually preferred and avoids
     // double-buffering the table in the hash table. FULL OUTER has no
     // nested-loop form yet, so it must use hash join even for self-joins.
-    let probe_root_page = probe_table.table.btree().expect("table is BTree").root_page;
-    let build_root_page = build_table.table.btree().expect("table is BTree").root_page;
+    let probe_root_page = probe_btree.root_page;
+    let build_root_page = build_btree.root_page;
     let is_full_outer = probe_table
         .join_info
         .as_ref()
@@ -1486,6 +1504,8 @@ pub fn try_hash_join_access_method(
     let cost = estimate_hash_join_cost(
         build_cardinality,
         probe_cardinality,
+        build_cardinality * estimated_rows_per_outer_row * probe_multiplier,
+        hash_join_type,
         DEFAULT_MEM_BUDGET,
         probe_multiplier,
         params,
@@ -1516,21 +1536,18 @@ fn hash_keys_cover_unique_build_key(
     join_keys: &[HashJoinKey],
     where_clause: &[WhereTerm],
 ) -> bool {
-    let mut build_columns = SmallVec::<[usize; 4]>::new();
+    let mut join_key_indices = SmallVec::<[usize; 4]>::new();
     for join_key in join_keys {
         match join_key.get_build_expr(where_clause) {
             ast::Expr::Column {
                 table,
-                column,
                 is_rowid_alias,
                 ..
             } if *table == build_table.internal_id => {
                 if *is_rowid_alias {
                     return true;
                 }
-                if !build_columns.contains(column) {
-                    build_columns.push(*column);
-                }
+                join_key_indices.push(join_key.where_clause_idx);
             }
             ast::Expr::RowId { table, .. } if *table == build_table.internal_id => return true,
             _ => {}
@@ -1542,9 +1559,22 @@ fn hash_keys_cover_unique_build_key(
             index.unique
                 && index.where_clause.is_none()
                 && !index.columns.is_empty()
-                && index.columns.iter().all(|column| {
-                    column.expr.is_none() && build_columns.contains(&column.pos_in_table)
-                })
+                && index
+                    .columns
+                    .iter()
+                    .enumerate()
+                    .all(|(index_col_pos, column)| {
+                        column.expr.is_none()
+                            && candidate.refs.iter().any(|constraint_ref| {
+                                constraint_ref.index_col_pos == index_col_pos
+                                    && join_key_indices.contains(
+                                        &build_constraints.constraints
+                                            [constraint_ref.constraint_vec_pos]
+                                            .where_clause_pos
+                                            .0,
+                                    )
+                            })
+                    })
         })
     })
 }

@@ -1680,7 +1680,7 @@ pub(super) fn partial_index_predicate_terms(
         .expect("partial_index_predicate_terms requires a partial index");
     let can_use_query_term = |term: &WhereTerm| -> bool {
         let Some(join_info) = &table_reference.join_info else {
-            return true;
+            return term.from_outer_join.is_none();
         };
         if join_info.is_full_outer() {
             return false;

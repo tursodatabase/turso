@@ -85,13 +85,6 @@ pub struct CostModelParams {
     /// Estimated bytes per row for hash table spill estimation.
     pub hash_bytes_per_row: f64,
 
-    /// Selectivity threshold for hash join build-side materialization.
-    /// Below this threshold, materialization may be beneficial.
-    pub hash_materialize_selectivity_threshold: f64,
-
-    /// Stricter selectivity threshold for nested hash probe operations.
-    pub hash_nested_probe_selectivity_threshold: f64,
-
     // === Join Optimization ===
     /// Selectivity heuristic factor for closed ranges (e.g., `x > 5 AND x < 10`).
     /// Applied when both lower and upper bounds exist on an index column.
@@ -127,13 +120,11 @@ impl CostModelParams {
             // Sort costs
             sort_cpu_per_row: 0.002,
 
-            // Hash join specific costs and thresholds
+            // Hash join specific costs
             hash_cpu_cost: 0.001,
             hash_insert_cost: 0.002,
             hash_lookup_cost: 0.003,
             hash_bytes_per_row: 100.0,
-            hash_materialize_selectivity_threshold: 0.5,
-            hash_nested_probe_selectivity_threshold: 0.15,
 
             // Join optimization
             closed_range_selectivity_factor: 0.2,

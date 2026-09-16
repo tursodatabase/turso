@@ -864,6 +864,7 @@ fn join_lhs_and_rhs<'a>(
                         materialize_build_input,
                         use_bloom_filter,
                         join_keys,
+                        join_type,
                         ..
                     } = &mut hash_join_method.params
                     {
@@ -874,61 +875,30 @@ fn join_lhs_and_rhs<'a>(
                             &prior_hash_build_mask,
                         ) || build_table_is_prior_probe
                             || !build_table_is_last
-                            || build_read_is_in_seek;
-                        let estimated_filtered_rows = if build_read_is_in_seek {
-                            input_cardinality
-                        } else {
-                            (*build_base_rows)
-                                * build_self_selectivity
-                                * prior_constraint_selectivity
-                        };
-
-                        // Do not store a large build input.
-                        let materialization_too_large = needs_materialization
-                            && estimated_filtered_rows > MAX_MATERIALIZED_BUILD_ROWS;
-                        let can_materialize =
-                            build_has_indexable_prior_constraints(lhs_constraints, &prior_mask);
-                        let selectivity_threshold = if probe_multiplier > 1.0 {
-                            params.hash_nested_probe_selectivity_threshold
-                        } else {
-                            params.hash_materialize_selectivity_threshold
-                        };
-                        // When probe is nested under prior loops, require stricter selectivity
-                        // to justify materialization.
-                        let wants_materialization = needs_materialization
-                            || (build_access_method_uses_constraints
-                                && prior_constraint_selectivity < selectivity_threshold);
-
-                        let optional_materialization_too_large = !needs_materialization
-                            && wants_materialization
-                            && estimated_filtered_rows > MAX_MATERIALIZED_BUILD_ROWS;
-
-                        // Build eligibility: a plain scan is always safe; otherwise we need
-                        // materialization or existing constraints that make the scan selective.
-                        let build_is_eligible = build_am_is_plain_table_scan
-                            || needs_materialization
+                            || build_read_is_in_seek
                             || build_access_method_uses_constraints;
+                        let estimated_materialized_rows = input_cardinality;
+
+                        let materialization_too_large = needs_materialization
+                            && estimated_materialized_rows > MAX_MATERIALIZED_BUILD_ROWS;
+
+                        let build_is_eligible =
+                            build_am_is_plain_table_scan || needs_materialization;
 
                         hash_join_allowed = build_is_eligible
                             && (!needs_materialization || build_has_rowid)
-                            && !materialization_too_large;
+                            && (!materialization_too_large
+                                || *join_type == HashJoinType::FullOuter);
 
                         if hash_join_allowed {
-                            let should_materialize = if needs_materialization {
-                                build_has_rowid
-                            } else {
-                                wants_materialization
-                                    && build_has_rowid
-                                    && can_materialize
-                                    && !optional_materialization_too_large
-                            };
+                            let should_materialize = needs_materialization && build_has_rowid;
                             let hash_probe_multiplier = if should_materialize {
                                 1.0
                             } else {
                                 probe_multiplier
                             };
                             let effective_build_cardinality = if should_materialize {
-                                estimated_filtered_rows
+                                estimated_materialized_rows
                             } else {
                                 build_cardinality
                             };
@@ -958,6 +928,9 @@ fn join_lhs_and_rhs<'a>(
                                 hash_join_method.cost = estimate_hash_join_cost(
                                     effective_build_cardinality,
                                     probe_cardinality,
+                                    effective_build_cardinality
+                                        * hash_join_method.estimated_rows_per_outer_row,
+                                    *join_type,
                                     mem_budget,
                                     hash_probe_multiplier,
                                     params,
@@ -987,10 +960,9 @@ fn join_lhs_and_rhs<'a>(
                                 rhs_table = rhs_table_reference.table.get_name(),
                                 materialize_build_input = *materialize_build_input,
                                 needs_materialization,
-                                estimated_filtered_rows,
+                                estimated_materialized_rows,
                                 prior_constraint_selectivity,
                                 materialization_too_large,
-                                can_materialize,
                                 build_cardinality,
                                 effective_build_cardinality,
                                 probe_cardinality,
@@ -1226,19 +1198,6 @@ fn build_self_constraint_selectivity(
         return 1.0;
     }
     selectivity.clamp(0.0, 1.0)
-}
-
-/// Returns true if any prior constraints can be turned into an index lookup.
-fn build_has_indexable_prior_constraints(
-    build_constraints: &TableConstraints,
-    prior_mask: &TableMask,
-) -> bool {
-    build_constraints.candidates.iter().any(|candidate| {
-        candidate.refs.iter().any(|constraint_ref| {
-            let constraint = &build_constraints.constraints[constraint_ref.constraint_vec_pos];
-            constraint.usable && constraint.lhs_mask.intersects(prior_mask)
-        })
-    })
 }
 
 /// The result of [compute_best_join_order].
@@ -2495,11 +2454,20 @@ mod tests {
     #[test]
     fn hash_join_cost_includes_probe_scan() {
         let params = &DEFAULT_PARAMS;
-        let cost = estimate_hash_join_cost(100.0, 1_000.0, usize::MAX, 1.0, params);
+        let cost = estimate_hash_join_cost(
+            100.0,
+            1_000.0,
+            250.0,
+            HashJoinType::Inner,
+            usize::MAX,
+            1.0,
+            params,
+        );
         let expected = 100.0 * (params.hash_cpu_cost + params.hash_insert_cost)
             + 1_000.0 / params.rows_per_table_page
             + 1_000.0 * params.cpu_cost_per_row
-            + 1_000.0 * (params.hash_cpu_cost + params.hash_lookup_cost);
+            + 1_000.0 * (params.hash_cpu_cost + params.hash_lookup_cost)
+            + 250.0 * params.cpu_cost_per_row;
         assert!((cost.0 - expected).abs() < f64::EPSILON);
     }
 

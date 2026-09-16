@@ -852,3 +852,76 @@ test unique-composite-hash-key-uses-one-key-estimate {
 expect pattern {
     (?s)"detail":"HASH JOIN composite_hash_child AS child".*"rows_per_input":5
 }
+
+@skip-if sqlite "Turso reports hash join estimates in its JSON plan"
+@skip-if mvcc "MVCC does not reload sqlite_stat1 after this test changes it"
+test unique-hash-key-does-not-apply-to-a-different-collation {
+    CREATE TABLE collation_unique_build(key TEXT UNIQUE);
+    CREATE TABLE collation_unique_probe(key TEXT);
+    INSERT INTO collation_unique_build VALUES
+        ('aaa'), ('aaA'), ('aAa'), ('aAA'),
+        ('Aaa'), ('AaA'), ('AAa'), ('AAA');
+    INSERT INTO collation_unique_probe VALUES ('aaa');
+    ANALYZE;
+
+    EXPLAIN QUERY PLAN FORMAT=JSON
+    SELECT count(*)
+    FROM collation_unique_build
+    CROSS JOIN collation_unique_probe
+      ON collation_unique_probe.key COLLATE NOCASE = collation_unique_build.key;
+}
+expect pattern {
+    (?s)"detail":"HASH JOIN collation_unique_probe".*"rows_per_input":0.1
+}
+
+@skip-if sqlite "Turso reports hash join estimates in its JSON plan"
+test hash-join-cost-includes-rows-visited {
+    CREATE TABLE hash_cost_left(key INTEGER);
+    CREATE TABLE hash_cost_right(key INTEGER);
+
+    EXPLAIN QUERY PLAN FORMAT=JSON
+    SELECT count(*)
+    FROM hash_cost_left
+    JOIN hash_cost_right ON hash_cost_left.key = hash_cost_right.key;
+}
+expect pattern {
+    (?s)"detail":"HASH JOIN hash_cost_right".*"access_cost":300110000
+}
+
+@skip-if sqlite "Turso reports its selected plan in JSON"
+test hash-build-row-limit-counts-prefix-rows {
+    CREATE TABLE prefix_row_limit_outer(value INTEGER);
+    CREATE TABLE prefix_row_limit_build(value INTEGER, key INTEGER);
+    CREATE INDEX prefix_row_limit_build_value
+        ON prefix_row_limit_build(value);
+    CREATE TABLE prefix_row_limit_probe(key INTEGER);
+
+    EXPLAIN QUERY PLAN FORMAT=JSON
+    SELECT count(*)
+    FROM prefix_row_limit_outer AS outer_rows
+    CROSS JOIN prefix_row_limit_build AS build_rows
+      ON build_rows.value = outer_rows.value
+    CROSS JOIN prefix_row_limit_probe AS probe_rows
+      ON build_rows.key = probe_rows.key;
+}
+expect pattern {
+    "detail":"SEARCH probe_rows USING COVERING INDEX ephemeral_prefix_row_limit_probe_t3
+}
+
+@skip-if sqlite "Turso can materialize a hash build input"
+test materialized-hash-build-keeps-index-search {
+    CREATE TABLE selected_hash_build(id INTEGER PRIMARY KEY, key INTEGER, selected INTEGER);
+    CREATE INDEX selected_hash_build_selected
+        ON selected_hash_build(selected);
+    CREATE TABLE selected_hash_probe(key INTEGER);
+
+    EXPLAIN QUERY PLAN FORMAT=JSON
+    SELECT count(*)
+    FROM selected_hash_build AS build_rows
+    JOIN selected_hash_probe AS probe_rows
+      ON build_rows.key = probe_rows.key
+    WHERE build_rows.selected = 1;
+}
+expect pattern {
+    (?s)"detail":"MATERIALIZE hash build input for selected_hash_build AS build_rows".*"detail":"SEARCH build_rows USING INDEX selected_hash_build_selected.*"detail":"HASH JOIN selected_hash_probe AS probe_rows"
+}

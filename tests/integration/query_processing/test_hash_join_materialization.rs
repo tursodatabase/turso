@@ -261,6 +261,19 @@ fn hash_join_preserves_join_predicates_after_outer_join_conversion() {
     conn.execute("COMMIT").unwrap();
     sqlite_conn.execute("COMMIT", []).unwrap();
 
+    // This test covers the hash-join rewrite, so use estimates that select that path.
+    limbo_exec_rows(&conn, "ANALYZE");
+    limbo_exec_rows(&conn, "DELETE FROM sqlite_stat1");
+    limbo_exec_rows(
+        &conn,
+        "INSERT INTO sqlite_stat1(tbl, idx, stat) VALUES
+            ('t1', NULL, '3'),
+            ('t2', NULL, '3'),
+            ('t3', NULL, '3'),
+            ('t4', NULL, '3')",
+    );
+    limbo_exec_rows(&conn, "ANALYZE sqlite_schema");
+
     let query = "SELECT t1.id, t2.id, t3.id, sub_t4.a \
 FROM t1 \
 JOIN t2 ON t1.d = t2.d \

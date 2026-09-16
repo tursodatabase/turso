@@ -126,6 +126,7 @@ def test_multi_way_hash_joins(turso: TestTursoShell):
     turso.execute_dot("INSERT INTO chain_t2 VALUES ('a'), ('b'), ('c');")
     turso.execute_dot("INSERT INTO chain_t3 VALUES ('b'), ('c'), ('d');")
     turso.execute_dot("INSERT INTO chain_t4 VALUES ('c'), ('d');")
+    turso.execute_dot("ANALYZE;")
 
     turso.run_test_fn(
         "explain query plan SELECT * FROM chain_t1 JOIN chain_t2 ON chain_t1.a = chain_t2.a;",
