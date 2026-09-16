@@ -383,11 +383,12 @@ impl YieldPointMarker for BTreeWriteYieldPoint {
     }
 }
 
-struct ReadPayloadOverflow {
-    payload: crate::alloc::Vec<u8>,
+/// What an overflow read starts from: the local part of the payload, the
+/// first overflow page, and the size of the whole payload.
+struct OverflowRead {
+    payload: &'static [u8],
     next_page: u32,
-    remaining_to_read: usize,
-    page: PageRef,
+    payload_size: u64,
 }
 
 #[derive(Debug)]
@@ -889,9 +890,6 @@ pub struct BTreeCursor {
     /// Store whether the Cursor is in a valid state. Meaning if it is pointing to a valid cell index or not
     pub valid_state: CursorValidState,
     seek_state: CursorSeekState,
-    /// Separate state to read a record with overflow pages. This separation from `state` is necessary as
-    /// we can be in a function that relies on `state`, but also needs to process overflow pages
-    read_overflow_state: Option<ReadPayloadOverflow>,
     /// The async operations of the cursor and their suspended state.
     ops: CursorOps,
     /// The id of the rightmost page in the btree, if known. When the cursor
@@ -1196,6 +1194,12 @@ impl<Args, Out> Default for OpSlot<Args, Out> {
 }
 
 impl<Args, Out> OpSlot<Args, Out> {
+    /// True while an operation is suspended in this slot.
+    #[inline(always)]
+    fn is_active(&self) -> bool {
+        self.active
+    }
+
     /// Drops the suspended operation, if any.
     #[inline]
     fn cancel(&mut self) {
@@ -1245,11 +1249,72 @@ macro_rules! cursor_ops {
 }
 
 cursor_ops! {
+    overflow_read / run_overflow_read: OverflowRead => () = overflow_read,
     count / run_count: () => usize = count,
     rewind / run_rewind: () => () = rewind,
     seek_end / run_seek_end: () => () = seek_end,
     last / run_last: () => () = last,
     seek_to_last / run_seek_to_last: () => () = seek_to_last,
+}
+
+/// Reads the payload of a cell that continues on overflow pages into the
+/// reusable record.
+async fn overflow_read(co: &mut Co<BtreeStep>, read: OverflowRead) -> OpResult<()> {
+    let OverflowRead {
+        payload,
+        mut next_page,
+        payload_size,
+    } = read;
+    let mut remaining_to_read = payload_size
+        .checked_sub(payload.len() as u64)
+        .ok_or_else(|| {
+            LimboError::Corrupt("payload size is smaller than local payload bytes".to_string())
+        })? as usize;
+    let mut payload = crate::with_btree_allocation_site!(OverflowRead, payload.try_to_vec())?;
+    let (mut page, completion) = co.io(|ctx| ctx.cursor.read_page(next_page as i64)).await;
+    wait_for_read(co, completion).await;
+    loop {
+        turso_assert!(page.is_loaded(), "page should be loaded");
+        tracing::debug!(next_page, remaining_to_read, "reading overflow page");
+        // The first four bytes of each overflow page are a big-endian integer which is the page number of the next page in the chain, or zero for the final page in the chain.
+        let next = page.get_contents().read_u32_no_offset(0);
+        let usable_space = co.with(|ctx| ctx.cursor.pager.usable_space());
+        let to_read = remaining_to_read.min(usable_space - 4);
+        let need_next_page = remaining_to_read > to_read && next != 0;
+        let new_page = if need_next_page {
+            Some(co.io(|ctx| ctx.cursor.read_page(next as i64)).await)
+        } else {
+            None
+        };
+
+        let buf = page.get_contents().as_ptr();
+        crate::with_btree_allocation_site!(
+            OverflowRead,
+            payload.try_extend(buf[4..4 + to_read].iter().copied())
+        )?;
+        remaining_to_read -= to_read;
+
+        if let Some((new_page, completion)) = new_page {
+            page = new_page;
+            next_page = next;
+            wait_for_read(co, completion).await;
+            continue;
+        }
+        if remaining_to_read != 0 || next != 0 {
+            tracing::warn!(
+                chain_page = next_page,
+                next,
+                remaining = remaining_to_read,
+                "inconsistent overflow chain observed during payload read"
+            );
+            return Err(LimboError::Corrupt(
+                "inconsistent overflow chain observed during payload read".to_string(),
+            )
+            .into());
+        }
+        co.with(|ctx| ctx.cursor.finish_overflow_read(&payload))?;
+        return Ok(());
+    }
 }
 
 /// Counts the records of the btree: the `Count` opcode. Walks every page
@@ -1279,7 +1344,7 @@ async fn count(co: &mut Co<BtreeStep>, (): ()) -> OpResult<usize> {
 async fn rewind(co: &mut Co<BtreeStep>, (): ()) -> OpResult<()> {
     move_to_root(co).await;
     co.io(|ctx| ctx.cursor.get_next_record()).await;
-    co.with(|ctx| ctx.cursor.read_overflow_state = None);
+    co.with(|ctx| ctx.cursor.ops.overflow_read.cancel());
     Ok(())
 }
 
@@ -1302,7 +1367,7 @@ async fn last(co: &mut Co<BtreeStep>, (): ()) -> OpResult<()> {
     co.with(|ctx| {
         ctx.cursor.set_has_record(has_record);
         ctx.cursor.invalidate_record();
-        ctx.cursor.read_overflow_state = None;
+        ctx.cursor.ops.overflow_read.cancel();
     });
     Ok(())
 }
@@ -1313,7 +1378,7 @@ async fn seek_to_last(co: &mut Co<BtreeStep>, (): ()) -> OpResult<()> {
     co.with(|ctx| {
         ctx.cursor.invalidate_record();
         ctx.cursor.set_has_record(has_record);
-        ctx.cursor.read_overflow_state = None;
+        ctx.cursor.ops.overflow_read.cancel();
     });
     if !has_record {
         let is_empty = is_empty_table(co).await;
@@ -1389,6 +1454,22 @@ enum Rightmost {
 }
 
 impl BTreeCursor {
+    /// Puts the payload read from the overflow chain into the reusable
+    /// record.
+    fn finish_overflow_read(&mut self, payload: &[u8]) -> OpResult<()> {
+        let mut reuse_immutable = self.get_immutable_record_or_create()?;
+        reuse_immutable.as_mut().unwrap().invalidate();
+
+        crate::with_btree_allocation_site!(
+            RecordPayload,
+            reuse_immutable
+                .as_mut()
+                .unwrap()
+                .start_serialization(payload)
+        )?;
+        Ok(())
+    }
+
     /// Counts the cells of the page on top of the stack, then moves up to
     /// the first ancestor with a child left to visit and names that child.
     fn count_page(&mut self, count: &mut usize) -> OpResult<CountStep> {
@@ -1568,7 +1649,6 @@ impl BTreeCursor {
             context: None,
             valid_state,
             seek_state: CursorSeekState::Start,
-            read_overflow_state: None,
             ops: CursorOps::default(),
             rightmost_page_id: None,
             advance_state: AdvanceState::Start,
@@ -1832,128 +1912,11 @@ impl BTreeCursor {
         start_next_page: u32,
         payload_size: u64,
     ) -> IOResultOr<()> {
-        loop {
-            if self.read_overflow_state.is_none() {
-                let remaining_to_read =
-                    payload_size
-                        .checked_sub(payload.len() as u64)
-                        .ok_or_else(|| {
-                            LimboError::Corrupt(
-                                "payload size is smaller than local payload bytes".to_string(),
-                            )
-                        })? as usize;
-                // We must not populate `read_overflow_state` before the page
-                // is actually produced — otherwise an `IO(spill_c)` yield
-                // would leave `read_overflow_state` half-initialized on a
-                // page that doesn't exist yet, and re-entry would skip the
-                // `is_none()` branch entirely.
-                let (page, c) = return_if_io!(self.read_page(start_next_page as i64));
-                let payload =
-                    crate::with_btree_allocation_site!(OverflowRead, payload.try_to_vec())?;
-                self.read_overflow_state.replace(ReadPayloadOverflow {
-                    payload,
-                    next_page: start_next_page,
-                    remaining_to_read,
-                    page,
-                });
-                if let Some(c) = c {
-                    io_yield_one!(c);
-                }
-                continue;
-            }
-            // Compute `next` / `to_read` and fetch the next chain page (if
-            // any) BEFORE applying the loop body's non-idempotent mutations,
-            // so that a spill yield from `read_page(next)` leaves
-            // `read_overflow_state` untouched and is safe to re-enter.
-            let (next, to_read, need_next_page) = {
-                let state = self.read_overflow_state.as_ref().unwrap();
-                turso_assert!(state.page.is_loaded(), "page should be loaded");
-                tracing::debug!(
-                    next_page = state.next_page,
-                    remaining_to_read = state.remaining_to_read,
-                    "reading overflow page"
-                );
-                // The first four bytes of each overflow page are a big-endian integer which is the page number of the next page in the chain, or zero for the final page in the chain.
-                let next = state.page.get_contents().read_u32_no_offset(0);
-                let to_read = state.remaining_to_read.min(self.pager.usable_space() - 4);
-                (
-                    next,
-                    to_read,
-                    state.remaining_to_read > to_read && next != 0,
-                )
-            };
-            let new_page_and_c = if need_next_page {
-                Some(return_if_io!(self.read_page(next as i64)))
-            } else {
-                None
-            };
-
-            let ReadPayloadOverflow {
-                payload,
-                remaining_to_read,
-                next_page,
-                page,
-            } = self.read_overflow_state.as_mut().unwrap();
-            let buf = page.get_contents().as_ptr();
-            crate::with_btree_allocation_site!(
-                OverflowRead,
-                payload.try_extend(buf[4..4 + to_read].iter().copied())
-            )?;
-            *remaining_to_read -= to_read;
-
-            if let Some((new_page, c)) = new_page_and_c {
-                *page = new_page;
-                *next_page = next;
-                // Re-entrancy: the four mutations above (payload extend,
-                // remaining decrement, page swap, next_page swap) together
-                // advance the state to "current page consumed, positioned on
-                // new_page". Yielding on `c` here is safe because re-entry
-                // resumes one iteration forward — the loop top reads from
-                // the new page, not the old one — so none of these mutations
-                // re-fire against the page they were applied to.
-                if let Some(c) = c {
-                    io_yield_one!(c);
-                }
-                continue;
-            }
-            if *remaining_to_read != 0 || next != 0 {
-                let chain_page = *next_page;
-                let remaining = *remaining_to_read;
-                self.read_overflow_state.take();
-                tracing::warn!(
-                    chain_page,
-                    next,
-                    remaining,
-                    "inconsistent overflow chain observed during payload read"
-                );
-                return Err(LimboError::Corrupt(
-                    "inconsistent overflow chain observed during payload read".to_string(),
-                )
-                .into());
-            }
-            // Take the whole state before the fallible record allocations below,
-            // like the inconsistent-chain branch above: an error must not leave
-            // behind resumable state whose payload was already moved out, or a
-            // retry would silently complete with an empty record.
-            let payload_swap = self
-                .read_overflow_state
-                .take()
-                .expect("read_overflow_state was checked above")
-                .payload;
-
-            let mut reuse_immutable = self.get_immutable_record_or_create()?;
-            reuse_immutable.as_mut().unwrap().invalidate();
-
-            crate::with_btree_allocation_site!(
-                RecordPayload,
-                reuse_immutable
-                    .as_mut()
-                    .unwrap()
-                    .start_serialization(&payload_swap)
-            )?;
-
-            break Ok(IOResult::Done(()));
-        }
+        self.run_overflow_read(OverflowRead {
+            payload,
+            next_page: start_next_page,
+            payload_size,
+        })
     }
 
     /// Check if any ancestor pages still have cells to iterate.
@@ -6859,7 +6822,7 @@ impl CursorTrait for BTreeCursor {
                             let has_record = cell_idx >= 0 && cell_idx < cell_count as i32;
                             if has_record {
                                 self.set_has_record(true);
-                                self.read_overflow_state = None;
+                                self.ops.overflow_read.cancel();
                                 return Ok(IOResult::Done(()));
                             }
                         }
@@ -6869,7 +6832,7 @@ impl CursorTrait for BTreeCursor {
                 AdvanceState::Advance => {
                     return_if_io!(self.get_next_record());
                     self.advance_state = AdvanceState::Start;
-                    self.read_overflow_state = None;
+                    self.ops.overflow_read.cancel();
                     return Ok(IOResult::Done(()));
                 }
             }
@@ -6927,7 +6890,7 @@ impl CursorTrait for BTreeCursor {
                 AdvanceState::Advance => {
                     return_if_io!(self.get_prev_record());
                     self.advance_state = AdvanceState::Start;
-                    self.read_overflow_state = None;
+                    self.ops.overflow_read.cancel();
                     return Ok(IOResult::Done(()));
                 }
             }
@@ -6988,7 +6951,7 @@ impl CursorTrait for BTreeCursor {
         // Reset seek state
         self.seek_state = CursorSeekState::Start;
         self.valid_state = CursorValidState::Valid;
-        self.read_overflow_state = None;
+        self.ops.overflow_read.cancel();
         Ok(IOResult::Done(seek_result))
     }
 
@@ -7006,7 +6969,7 @@ impl CursorTrait for BTreeCursor {
         // Reset seek state
         self.seek_state = CursorSeekState::Start;
         self.valid_state = CursorValidState::Valid;
-        self.read_overflow_state = None;
+        self.ops.overflow_read.cancel();
         Ok(IOResult::Done(seek_result))
     }
 
@@ -7856,7 +7819,7 @@ impl BTreeCursor {
             || self.needs_restore()
             || self.skip_advance
             || !self.has_record
-            || self.read_overflow_state.is_some()
+            || self.ops.overflow_read.is_active()
             || self.iteration_pending_descent.is_some()
     }
 }
@@ -10772,7 +10735,7 @@ mod tests {
         }
 
         /// Regression test: the overflow-read epilogue empties the payload held
-        /// inside `read_overflow_state` before the fallible record allocations
+        /// inside the overflow read before the fallible record allocations
         /// run. On failure it must clear the state — same invariant the adjacent
         /// corrupt-chain branch upholds — otherwise a later call resumes against
         /// the emptied buffer and silently completes with an empty record.
@@ -10804,7 +10767,7 @@ mod tests {
 
             // Fail the epilogue's record allocation, which runs after the chain
             // has been fully read and the accumulated payload was already moved
-            // out of `read_overflow_state`.
+            // out of the overflow read.
             arm_fault(BTreeAllocationSite::RecordPayload);
             run_until_done(
                 || cursor.process_overflow_read(b"", 4, payload_size),
@@ -10814,7 +10777,7 @@ mod tests {
             disarm_fault();
 
             assert!(
-                cursor.read_overflow_state.is_none(),
+                !cursor.ops.overflow_read.is_active(),
                 "failed overflow read left resumable state behind"
             );
 
@@ -12703,7 +12666,7 @@ mod tests {
         )
         .expect_err("inconsistent overflow chain should fail with Corrupt");
         assert!(matches!(err, LimboError::Corrupt(_)));
-        assert!(cursor.read_overflow_state.is_none());
+        assert!(!cursor.ops.overflow_read.is_active());
         Ok(())
     }
 
