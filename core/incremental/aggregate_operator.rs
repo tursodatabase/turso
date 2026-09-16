@@ -1617,17 +1617,7 @@ async fn commit_delta(co: &mut Co<AggregateStep>, delta: Delta) -> Result<Delta,
     }
 
     if co.with(|ctx| ctx.operator.has_min_max()) {
-        let mut persist = MinMaxPersistState::new(min_max_deltas);
-        co.io(|ctx| {
-            let operator = &ctx.operator;
-            persist.persist_min_max(
-                operator.operator_id,
-                &operator.column_min_max,
-                ctx.cursors,
-                |group_key_str| operator.generate_group_hash(group_key_str),
-            )
-        })
-        .await;
+        persist_min_max(co, min_max_deltas).await?;
     }
 
     if co.with(|ctx| ctx.operator.has_distinct()) {
@@ -1642,6 +1632,55 @@ async fn commit_delta(co: &mut Co<AggregateStep>, delta: Delta) -> Result<Delta,
     }
 
     Ok(output_delta)
+}
+
+/// Stores every MIN/MAX value of the delta with its weight, so that a
+/// later recompute can read the values of a group from the index in
+/// order.
+async fn persist_min_max(
+    co: &mut Co<AggregateStep>,
+    min_max_deltas: MinMaxDeltas,
+) -> Result<(), Box<LimboError>> {
+    for (group_key_str, values) in &min_max_deltas {
+        for ((column_name, hashable_row), weight) in values {
+            let value = hashable_row.values[0].clone();
+            let (index_key, record_values) = co.with(|ctx| {
+                let operator = &ctx.operator;
+                let column_info = operator
+                    .column_min_max
+                    .get(column_name)
+                    .expect("Column should exist in column_min_max map");
+                let storage_id =
+                    generate_storage_id(operator.operator_id, column_info.index, AGG_TYPE_MINMAX);
+                let zset_hash = operator.generate_group_hash(group_key_str);
+                // The value is the element id, so the record needs no value column.
+                Ok::<_, LimboError>((
+                    vec![
+                        Value::from_i64(storage_id),
+                        zset_hash.to_value()?,
+                        value.clone(),
+                    ],
+                    vec![
+                        Value::from_i64(storage_id),
+                        zset_hash.to_value()?,
+                        value,
+                        Value::Null,
+                    ],
+                ))
+            })?;
+            let mut write_row = WriteRow::new();
+            co.io(|ctx| {
+                write_row.write_row(
+                    ctx.cursors,
+                    index_key.clone(),
+                    record_values.clone(),
+                    *weight,
+                )
+            })
+            .await;
+        }
+    }
+    Ok(())
 }
 
 fn new_eval_runner() -> AggregateEvalOp {
@@ -2021,32 +2060,6 @@ fn best_min_max(
     }
 }
 
-/// State machine for persisting Min/Max values to storage
-#[derive(Debug)]
-pub enum MinMaxPersistState {
-    Init {
-        min_max_deltas: MinMaxDeltas,
-        group_keys: Vec<String>,
-    },
-    ProcessGroup {
-        min_max_deltas: MinMaxDeltas,
-        group_keys: Vec<String>,
-        group_idx: usize,
-        value_idx: usize,
-    },
-    WriteValue {
-        min_max_deltas: MinMaxDeltas,
-        group_keys: Vec<String>,
-        group_idx: usize,
-        value_idx: usize,
-        value: Value,
-        column_name: usize,
-        weight: isize,
-        write_row: WriteRow,
-    },
-    Done,
-}
-
 /// The distinct values whose stored weights the eval of `delta` needs,
 /// by group and column. For plain DISTINCT the group itself is the value.
 /// DISTINCT aggregates only read values of groups that already exist.
@@ -2395,152 +2408,6 @@ impl DistinctPersistState {
                     };
                 }
                 DistinctPersistState::Done => {
-                    return Ok(IOResult::Done(()));
-                }
-            }
-        }
-    }
-}
-
-impl MinMaxPersistState {
-    pub fn new(min_max_deltas: MinMaxDeltas) -> Self {
-        let group_keys: Vec<String> = min_max_deltas.keys().cloned().collect();
-        Self::Init {
-            min_max_deltas,
-            group_keys,
-        }
-    }
-
-    pub fn persist_min_max(
-        &mut self,
-        operator_id: i64,
-        column_min_max: &HashMap<usize, AggColumnInfo>,
-        cursors: &mut DbspStateCursors,
-        generate_group_hash: impl Fn(&str) -> Hash128,
-    ) -> IOResultOr<()> {
-        loop {
-            match self {
-                MinMaxPersistState::Init {
-                    min_max_deltas,
-                    group_keys,
-                } => {
-                    let min_max_deltas = std::mem::take(min_max_deltas);
-                    let group_keys = std::mem::take(group_keys);
-                    *self = MinMaxPersistState::ProcessGroup {
-                        min_max_deltas,
-                        group_keys,
-                        group_idx: 0,
-                        value_idx: 0,
-                    };
-                }
-                MinMaxPersistState::ProcessGroup {
-                    min_max_deltas,
-                    group_keys,
-                    group_idx,
-                    value_idx,
-                } => {
-                    // Check if we're past all groups
-                    if *group_idx >= group_keys.len() {
-                        *self = MinMaxPersistState::Done;
-                        continue;
-                    }
-
-                    let group_key_str = &group_keys[*group_idx];
-                    let values = &min_max_deltas[group_key_str]; // This should always exist
-
-                    // Convert HashMap to Vec for indexed access
-                    let values_vec: Vec<_> = values.iter().collect();
-
-                    // Check if we have more values in current group
-                    if *value_idx >= values_vec.len() {
-                        *group_idx += 1;
-                        *value_idx = 0;
-                        // Continue to check if we're past all groups now
-                        continue;
-                    }
-
-                    // Process current value and extract what we need before taking ownership
-                    let ((column_name, hashable_row), weight) = values_vec[*value_idx];
-                    let column_name = *column_name;
-                    let value = hashable_row.values[0].clone(); // Extract the Value from HashableRow
-                    let weight = *weight;
-
-                    let min_max_deltas = std::mem::take(min_max_deltas);
-                    let group_keys = std::mem::take(group_keys);
-                    *self = MinMaxPersistState::WriteValue {
-                        min_max_deltas,
-                        group_keys,
-                        group_idx: *group_idx,
-                        value_idx: *value_idx,
-                        column_name,
-                        value,
-                        weight,
-                        write_row: WriteRow::new(),
-                    };
-                }
-                MinMaxPersistState::WriteValue {
-                    min_max_deltas,
-                    group_keys,
-                    group_idx,
-                    value_idx,
-                    value,
-                    column_name,
-                    weight,
-                    write_row,
-                } => {
-                    // Should have exited in the previous state
-                    assert!(*group_idx < group_keys.len());
-
-                    let group_key_str = &group_keys[*group_idx];
-
-                    // Get the column info from the pre-computed map
-                    let column_info = column_min_max
-                        .get(column_name)
-                        .expect("Column should exist in column_min_max map");
-                    let column_index = column_info.index;
-
-                    // Build the key components for MinMax storage using new encoding
-                    let storage_id =
-                        generate_storage_id(operator_id, column_index, AGG_TYPE_MINMAX);
-                    let zset_hash = generate_group_hash(group_key_str);
-
-                    // element_id is the actual value for Min/Max
-                    let element_id_val = value.clone();
-
-                    // Create index key
-                    let index_key = vec![
-                        Value::from_i64(storage_id),
-                        zset_hash.to_value()?,
-                        element_id_val.clone(),
-                    ];
-
-                    // Record values (operator_id, zset_hash, element_id, unused_placeholder)
-                    // For MIN/MAX, the element_id IS the value, so we use NULL for the 4th column
-                    let record_values = vec![
-                        Value::from_i64(storage_id),
-                        zset_hash.to_value()?,
-                        element_id_val.clone(),
-                        Value::Null, // Placeholder - not used for MIN/MAX
-                    ];
-
-                    return_if_io!(write_row.write_row(
-                        cursors,
-                        index_key.clone(),
-                        record_values,
-                        *weight
-                    ));
-
-                    // Move to next value
-                    let min_max_deltas = std::mem::take(min_max_deltas);
-                    let group_keys = std::mem::take(group_keys);
-                    *self = MinMaxPersistState::ProcessGroup {
-                        min_max_deltas,
-                        group_keys,
-                        group_idx: *group_idx,
-                        value_idx: *value_idx + 1,
-                    };
-                }
-                MinMaxPersistState::Done => {
                     return Ok(IOResult::Done(()));
                 }
             }
