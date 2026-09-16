@@ -1,5 +1,6 @@
 use crate::alloc::vec;
 use crate::alloc::*;
+use crate::coro::{with_handle, BoxedResumable, Co, Runner, StepContext, YieldSlot};
 use crate::turso_assert;
 use crate::types::IOResultOr;
 use crate::{
@@ -909,8 +910,9 @@ struct GraceState {
     partitions_to_process: Vec<usize>,
     /// Index into partitions_to_process.
     partition_list_idx: usize,
-    /// Current load state for the active grace partition.
-    load_state: GracePartitionLoadState,
+    /// True once the active grace partition and its first probe chunk are
+    /// loaded.
+    loaded: bool,
 }
 
 impl GraceState {
@@ -921,11 +923,41 @@ impl GraceState {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum GracePartitionLoadState {
-    NeedBuildLoad,
-    NeedProbeLoad,
-    Ready,
+/// Names [`HashCtx`] as the context type of the async hash table
+/// operations.
+struct HashStep;
+
+impl StepContext for HashStep {
+    type Error = Box<LimboError>;
+    type Ctx<'a> = HashCtx<'a>;
+}
+
+/// The context of one step of an async hash table operation. The async
+/// function gets it back on every step, so it never keeps the table or the
+/// metrics across a yield.
+struct HashCtx<'a> {
+    table: &'a mut HashTable,
+    metrics: Option<&'a mut HashJoinMetrics>,
+    io: Option<IOCompletions>,
+    err: Option<Box<LimboError>>,
+}
+
+impl YieldSlot<Box<LimboError>> for HashCtx<'_> {
+    fn park_io(&mut self, io: IOCompletions) {
+        self.io = Some(io);
+    }
+
+    fn take_io(&mut self) -> Option<IOCompletions> {
+        self.io.take()
+    }
+
+    fn park_err(&mut self, err: Box<LimboError>) {
+        self.err = Some(err);
+    }
+
+    fn take_err(&mut self) -> Option<Box<LimboError>> {
+        self.err.take()
+    }
 }
 
 /// HashTable is the build-side data structure used for hash joins and DISTINCT. It behaves like a
@@ -999,8 +1031,11 @@ pub struct HashTable {
     partition_count_override: Option<usize>,
     /// Probe-side spill state for grace hash join.
     probe_spill_state: Option<ProbeSpillState>,
-    /// Grace processing state machine.
+    /// Grace processing state.
     grace_state: Option<GraceState>,
+    /// The runner of `grace_load_current_partition`, boxed on first use
+    /// and reused.
+    grace_load_op: Option<BoxedResumable<HashStep, (), bool>>,
 }
 
 crate::assert::assert_send!(HashTable);
@@ -1093,6 +1128,7 @@ impl HashTable {
             partition_count_override: config.partition_count,
             probe_spill_state: None,
             grace_state: None,
+            grace_load_op: None,
         })
     }
 
@@ -2919,8 +2955,11 @@ impl HashTable {
             probe_entry_cursor: 0,
             partitions_to_process,
             partition_list_idx: 0,
-            load_state: GracePartitionLoadState::NeedBuildLoad,
+            loaded: false,
         });
+        if let Some(op) = self.grace_load_op.as_mut() {
+            op.cancel();
+        }
 
         if let Some(probe_state) = self.probe_spill_state.as_mut() {
             for partition in &mut probe_state.partitions {
@@ -2941,41 +2980,27 @@ impl HashTable {
     /// Returns true if loaded, false if partition list exhausted.
     pub fn grace_load_current_partition(
         &mut self,
-        mut metrics: Option<&mut HashJoinMetrics>,
+        metrics: Option<&mut HashJoinMetrics>,
     ) -> IOResultOr<bool> {
-        loop {
-            let grace = self.grace_state.as_ref().expect("grace state must exist");
-            if grace.partition_list_idx >= grace.partitions_to_process.len() {
-                return Ok(IOResult::Done(false));
-            }
-
-            let partition_idx = grace.partitions_to_process[grace.partition_list_idx];
-            match grace.load_state {
-                GracePartitionLoadState::NeedBuildLoad => {
-                    self.evict_all_loaded_partitions();
-                    return_if_io!(
-                        self.load_spilled_partition(partition_idx, metrics.as_deref_mut())
-                    );
-
-                    let grace = self.grace_state.as_mut().expect("grace state");
-                    grace.probe_entries.clear();
-                    grace.probe_entry_cursor = 0;
-                    grace.load_state = GracePartitionLoadState::NeedProbeLoad;
-                }
-                GracePartitionLoadState::NeedProbeLoad => {
-                    return_if_io!(self.grace_load_probe_entries(partition_idx));
-
-                    let grace = self.grace_state.as_mut().expect("grace state");
-                    grace.load_state = GracePartitionLoadState::Ready;
-                    if let Some(m) = metrics.as_mut() {
-                        m.grace_partitions_processed =
-                            m.grace_partitions_processed.saturating_add(1);
-                    }
-                    return Ok(IOResult::Done(true));
-                }
-                GracePartitionLoadState::Ready => return Ok(IOResult::Done(true)),
-            }
+        let grace = self.grace_state.as_ref().expect("grace state must exist");
+        if grace.partition_list_idx >= grace.partitions_to_process.len() {
+            return Ok(IOResult::Done(false));
         }
+        if grace.loaded {
+            return Ok(IOResult::Done(true));
+        }
+        let mut op = self.grace_load_op.take().unwrap_or_else(|| {
+            Runner::boxed(|co, args| with_handle(co, args, run_grace_load_partition))
+        });
+        let mut ctx = HashCtx {
+            table: self,
+            metrics,
+            io: None,
+            err: None,
+        };
+        let result = op.resume(&mut ctx, ());
+        self.grace_load_op = Some(op);
+        result
     }
 
     /// Advance to next probe entry. Returns keys+rowid or None when exhausted.
@@ -3038,7 +3063,11 @@ impl HashTable {
         grace.partition_list_idx += 1;
         grace.probe_entries.clear();
         grace.probe_entry_cursor = 0;
-        grace.load_state = GracePartitionLoadState::NeedBuildLoad;
+        grace.loaded = false;
+        if let Some(op) = self.grace_load_op.as_mut() {
+            op.cancel();
+        }
+        let grace = self.grace_state.as_ref().expect("grace state must exist");
         grace.partition_list_idx < grace.partitions_to_process.len()
     }
 
@@ -3276,6 +3305,39 @@ impl HashTable {
         self.probe_spill_state = None;
         self.grace_state = None;
     }
+}
+
+/// Loads the build partition at the current index of the grace state,
+/// then its first chunk of probe entries.
+async fn run_grace_load_partition(co: &mut Co<HashStep>, _: ()) -> Result<bool, Box<LimboError>> {
+    let partition_idx = co.with(|ctx| {
+        let grace = ctx
+            .table
+            .grace_state
+            .as_ref()
+            .expect("grace state must exist");
+        grace.partitions_to_process[grace.partition_list_idx]
+    });
+    co.with(|ctx| ctx.table.evict_all_loaded_partitions());
+    co.io(|ctx| {
+        ctx.table
+            .load_spilled_partition(partition_idx, ctx.metrics.as_deref_mut())
+    })
+    .await;
+    co.with(|ctx| {
+        let grace = ctx.table.grace_state.as_mut().expect("grace state");
+        grace.probe_entries.clear();
+        grace.probe_entry_cursor = 0;
+    });
+    co.io(|ctx| ctx.table.grace_load_probe_entries(partition_idx))
+        .await;
+    co.with(|ctx| {
+        ctx.table.grace_state.as_mut().expect("grace state").loaded = true;
+        if let Some(m) = ctx.metrics.as_mut() {
+            m.grace_partitions_processed = m.grace_partitions_processed.saturating_add(1);
+        }
+    });
+    Ok(true)
 }
 
 #[cfg(test)]
