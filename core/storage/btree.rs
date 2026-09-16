@@ -29,7 +29,7 @@ use crate::{
             FREELIST_TRUNK_OFFSET_NEXT_TRUNK_PTR, INTERIOR_PAGE_HEADER_SIZE_BYTES,
             LEAF_PAGE_HEADER_SIZE_BYTES, LEFT_CHILD_PTR_SIZE_BYTES,
         },
-        state_machines::{AdvanceState, MoveToState, RewindState, SeekEndState},
+        state_machines::{AdvanceState, MoveToState, SeekEndState},
     },
     translate::plan::IterationDirection,
     turso_assert,
@@ -898,8 +898,6 @@ pub struct BTreeCursor {
     /// is already on that page, a move to the rightmost record skips the
     /// seek.
     rightmost_page_id: Option<usize>,
-    /// State machine for [BTreeCursor::rewind]
-    rewind_state: RewindState,
     /// State machine for [BTreeCursor::next] and [BTreeCursor::prev]
     advance_state: AdvanceState,
     /// State machine for [BTreeCursor::seek_end]
@@ -1250,6 +1248,7 @@ macro_rules! cursor_ops {
 
 cursor_ops! {
     count / run_count: () => usize = count,
+    rewind / run_rewind: () => () = rewind,
     last / run_last: () => () = last,
     seek_to_last / run_seek_to_last: () => () = seek_to_last,
 }
@@ -1275,6 +1274,14 @@ async fn count(co: &mut Co<BtreeStep>, (): ()) -> OpResult<usize> {
     }
     move_to_root(co).await;
     Ok(count)
+}
+
+/// Moves the cursor to the first record: the `Rewind` opcode.
+async fn rewind(co: &mut Co<BtreeStep>, (): ()) -> OpResult<()> {
+    move_to_root(co).await;
+    co.io(|ctx| ctx.cursor.get_next_record()).await;
+    co.with(|ctx| ctx.cursor.read_overflow_state = None);
+    Ok(())
 }
 
 /// Moves the cursor to the last record: the `Last` opcode.
@@ -1535,7 +1542,6 @@ impl BTreeCursor {
             read_overflow_state: None,
             ops: CursorOps::default(),
             rightmost_page_id: None,
-            rewind_state: RewindState::Start,
             advance_state: AdvanceState::Start,
             seek_end_state: SeekEndState::Start,
             move_to_state: MoveToState::Start,
@@ -7566,23 +7572,7 @@ impl CursorTrait for BTreeCursor {
         }
         self.clear_saved_seek();
         self.skip_advance = false;
-        loop {
-            match self.rewind_state {
-                RewindState::Start => {
-                    let c = return_if_io!(self.move_to_root_nonblock());
-                    self.rewind_state = RewindState::NextRecord;
-                    if let Some(c) = c {
-                        io_yield_one!(c);
-                    }
-                }
-                RewindState::NextRecord => {
-                    return_if_io!(self.get_next_record());
-                    self.rewind_state = RewindState::Start;
-                    self.read_overflow_state = None;
-                    return Ok(IOResult::Done(()));
-                }
-            }
-        }
+        self.run_rewind(())
     }
 
     #[inline]
