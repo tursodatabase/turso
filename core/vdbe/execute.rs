@@ -2015,12 +2015,12 @@ fn op_column_deferred(
             program,
             state,
             insn,
+            err: None,
         },
         cursor_id,
     );
-    state
-        .active_op_state
-        .put_column_deferred(op, matches!(result, Ok(IOResult::IO(_))));
+    let active = op.is_active();
+    state.active_op_state.put_column_deferred(op, active);
     match result? {
         IOResult::Done(()) => {
             state.pc += 1;
@@ -2031,7 +2031,7 @@ fn op_column_deferred(
 }
 
 /// The async Column operation, boxed once per program state and reused.
-pub(crate) struct ColumnDeferredOp(BoxedResumable<VdbeStep, usize, (), Box<LimboError>>);
+pub(crate) struct ColumnDeferredOp(BoxedResumable<VdbeStep, usize, ()>);
 
 impl ColumnDeferredOp {
     pub(crate) fn new() -> Self {
@@ -2067,6 +2067,7 @@ impl std::fmt::Debug for ColumnDeferredOp {
 pub(crate) struct VdbeStep;
 
 impl StepContext for VdbeStep {
+    type Error = Box<LimboError>;
     type Ctx<'a> = VdbeCtx<'a>;
 }
 
@@ -2076,15 +2077,25 @@ pub(crate) struct VdbeCtx<'a> {
     program: &'a Program,
     state: &'a mut ProgramState,
     insn: &'a Insn,
+    /// The error of a step that failed, until `resume` picks it up.
+    err: Option<Box<LimboError>>,
 }
 
-impl YieldSlot for VdbeCtx<'_> {
+impl YieldSlot<Box<LimboError>> for VdbeCtx<'_> {
     fn park_io(&mut self, io: IOCompletions) {
         self.state.suspend_on_io(io);
     }
 
     fn take_io(&mut self) -> Option<IOCompletions> {
         self.state.io_completions.take()
+    }
+
+    fn park_err(&mut self, err: Box<LimboError>) {
+        self.err = Some(err);
+    }
+
+    fn take_err(&mut self) -> Option<Box<LimboError>> {
+        self.err.take()
     }
 }
 
@@ -2094,13 +2105,13 @@ async fn column_deferred(co: &mut Co<VdbeStep>, cursor_id: usize) -> Result<(), 
     if let Some(deferred) = co.with(|ctx| ctx.state.deferred_seeks[cursor_id].take()) {
         let rowid = co
             .io(|ctx| index_cursor_rowid(ctx.state, deferred.index_cursor_id))
-            .await?;
+            .await;
         let Some(rowid) = rowid else {
             co.with(|ctx| column_fetch_of(ctx.insn).write_null_regs(ctx.state));
             return Ok(());
         };
         co.io(|ctx| seek_table_row(ctx.state, deferred.table_cursor_id, rowid))
-            .await?;
+            .await;
         co.with(|ctx| {
             let metrics = &mut ctx.state.metrics;
             metrics.btree_seeks = metrics.btree_seeks.wrapping_add(1);
@@ -2110,7 +2121,8 @@ async fn column_deferred(co: &mut Co<VdbeStep>, cursor_id: usize) -> Result<(), 
         });
     }
     co.io(|ctx| fetch_columns(ctx.program, ctx.state, ctx.insn, cursor_id))
-        .await
+        .await;
+    Ok(())
 }
 
 #[inline(always)]
