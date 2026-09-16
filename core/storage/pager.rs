@@ -1348,16 +1348,6 @@ const fn auto_vacuum_header_fields(mode: AutoVacuumMode) -> (u32, u32) {
 
 #[derive(Debug, Clone)]
 #[cfg(feature = "autovacuum")]
-enum PtrMapGetState {
-    Start,
-    Deserialize {
-        ptrmap_page: PageRef,
-        offset_in_ptrmap_page: usize,
-    },
-}
-
-#[derive(Debug, Clone)]
-#[cfg(feature = "autovacuum")]
 enum PtrMapPutState {
     Start,
     Deserialize {
@@ -1688,8 +1678,6 @@ impl SpillYieldHook {
 
 #[cfg(feature = "autovacuum")]
 pub struct VacuumState {
-    /// State machine for [Pager::ptrmap_get]
-    ptrmap_get_state: PtrMapGetState,
     /// State machine for [Pager::ptrmap_put]
     ptrmap_put_state: PtrMapPutState,
     btree_create_vacuum_full_state: BtreeCreateVacuumFullState,
@@ -1910,6 +1898,8 @@ impl<C: StepContext, Args, Out> std::fmt::Debug for AsyncOp<C, Args, Out> {
 /// The runner slots of the async pager operations, one per operation.
 struct PagerOps {
     read_header_page: AsyncOp<PagerStep, (), PageRef>,
+    #[cfg(feature = "autovacuum")]
+    ptrmap_get: AsyncOp<PagerStep, u32, Option<PtrmapEntry>>,
 }
 
 impl PagerOps {
@@ -1917,6 +1907,10 @@ impl PagerOps {
         Self {
             read_header_page: AsyncOp::new(|| {
                 Runner::boxed(|co, args| with_handle(co, args, Pager::read_header_page_async))
+            }),
+            #[cfg(feature = "autovacuum")]
+            ptrmap_get: AsyncOp::new(|| {
+                Runner::boxed(|co, args| with_handle(co, args, Pager::ptrmap_get_async))
             }),
         }
     }
@@ -1993,7 +1987,6 @@ impl Pager {
             ops: PagerOps::new(),
             #[cfg(feature = "autovacuum")]
             vacuum_state: RwLock::new(VacuumState {
-                ptrmap_get_state: PtrMapGetState::Start,
                 ptrmap_put_state: PtrMapPutState::Start,
                 btree_create_vacuum_full_state: BtreeCreateVacuumFullState::Start,
             }),
@@ -2738,88 +2731,88 @@ impl Pager {
     /// Returns `Ok(None)` if the page is not supposed to have a ptrmap entry (e.g. header, or a ptrmap page itself).
     #[cfg(feature = "autovacuum")]
     pub fn ptrmap_get(&self, target_page_num: u32) -> IOResultOr<Option<PtrmapEntry>> {
-        loop {
-            let ptrmap_get_state = {
-                let vacuum_state = self.vacuum_state.read();
-                vacuum_state.ptrmap_get_state.clone()
-            };
-            match ptrmap_get_state {
-                PtrMapGetState::Start => {
-                    tracing::trace!("ptrmap_get(page_idx = {})", target_page_num);
-                    let configured_page_size =
-                        return_if_io!(self.with_header(|header| header.page_size)).get() as usize;
+        self.step_op(&self.ops.ptrmap_get, target_page_num)
+    }
 
-                    if target_page_num < FIRST_PTRMAP_PAGE_NO
-                        || is_ptrmap_page(target_page_num, configured_page_size)
-                    {
-                        return Ok(IOResult::Done(None));
-                    }
+    /// Reads the pointer map page of `target_page_num` and decodes its entry.
+    #[cfg(feature = "autovacuum")]
+    async fn ptrmap_get_async(
+        co: &mut Co<PagerStep>,
+        target_page_num: u32,
+    ) -> Result<Option<PtrmapEntry>, Box<LimboError>> {
+        tracing::trace!("ptrmap_get(page_idx = {})", target_page_num);
+        let configured_page_size = co
+            .io(|ctx| ctx.pager.with_header(|header| header.page_size))
+            .await
+            .get() as usize;
 
-                    let ptrmap_pg_no =
-                        get_ptrmap_page_no_for_db_page(target_page_num, configured_page_size);
-                    let offset_in_ptrmap_page = get_ptrmap_offset_in_page(
-                        target_page_num,
-                        ptrmap_pg_no,
-                        configured_page_size,
-                    )?;
-                    tracing::trace!(
-                        "ptrmap_get(page_idx = {}) = ptrmap_pg_no = {}",
-                        target_page_num,
-                        ptrmap_pg_no
-                    );
+        if target_page_num < FIRST_PTRMAP_PAGE_NO
+            || is_ptrmap_page(target_page_num, configured_page_size)
+        {
+            return Ok(None);
+        }
 
-                    // `return_if_io!` keeps `ptrmap_get_state` at `Start` on
-                    // spill so re-entry resumes via pending-read tracking.
-                    let (ptrmap_page, c) = return_if_io!(self.read_page(ptrmap_pg_no as i64));
-                    self.vacuum_state.write().ptrmap_get_state = PtrMapGetState::Deserialize {
-                        ptrmap_page,
-                        offset_in_ptrmap_page,
-                    };
-                    if let Some(c) = c {
-                        io_yield_one!(c);
-                    }
-                }
-                PtrMapGetState::Deserialize {
-                    ptrmap_page,
-                    offset_in_ptrmap_page,
-                } => {
-                    turso_assert!(ptrmap_page.is_loaded(), "ptrmap_page should be loaded");
-                    let page_content = ptrmap_page.get_contents();
-                    let ptrmap_pg_no = page_content.id();
+        let ptrmap_pg_no = get_ptrmap_page_no_for_db_page(target_page_num, configured_page_size);
+        let offset_in_ptrmap_page =
+            get_ptrmap_offset_in_page(target_page_num, ptrmap_pg_no, configured_page_size)?;
+        tracing::trace!(
+            "ptrmap_get(page_idx = {}) = ptrmap_pg_no = {}",
+            target_page_num,
+            ptrmap_pg_no
+        );
 
-                    let full_buffer_slice: &[u8] = page_content.as_ptr();
+        let (ptrmap_page, c) = co.io(|ctx| ctx.pager.read_page(ptrmap_pg_no as i64)).await;
+        if let Some(c) = c {
+            co.yield_io(IOCompletions(c)).await;
+        }
+        let entry = co
+            .io(|_| {
+                Self::ptrmap_entry_of(&ptrmap_page, offset_in_ptrmap_page, target_page_num)
+                    .map(IOResult::Done)
+            })
+            .await;
+        Ok(entry)
+    }
 
-                    // Ptrmap pages are not page 1, so their internal offset within their buffer should be 0.
-                    // The actual page data starts at page_content.offset() within the full_buffer_slice.
-                    if ptrmap_pg_no != 1 && page_content.offset() != 0 {
-                        return Err(LimboError::Corrupt(format!(
-                            "Ptrmap page {} has unexpected internal offset {}",
-                            ptrmap_pg_no,
-                            page_content.offset()
-                        ))
-                        .into());
-                    }
-                    let ptrmap_page_data_slice: &[u8] = &full_buffer_slice[page_content.offset()..];
-                    let actual_data_length = ptrmap_page_data_slice.len();
+    /// Decodes the entry of `target_page_num` from its loaded pointer map page.
+    #[cfg(feature = "autovacuum")]
+    fn ptrmap_entry_of(
+        ptrmap_page: &PageRef,
+        offset_in_ptrmap_page: usize,
+        target_page_num: u32,
+    ) -> Result<Option<PtrmapEntry>> {
+        turso_assert!(ptrmap_page.is_loaded(), "ptrmap_page should be loaded");
+        let page_content = ptrmap_page.get_contents();
+        let ptrmap_pg_no = page_content.id();
 
-                    // Check if the calculated offset for the entry is within the bounds of the actual page data length.
-                    if offset_in_ptrmap_page + PTRMAP_ENTRY_SIZE > actual_data_length {
-                        return Err(LimboError::InternalError(format!(
-                        "Ptrmap offset {offset_in_ptrmap_page} + entry size {PTRMAP_ENTRY_SIZE} out of bounds for page {ptrmap_pg_no} (actual data len {actual_data_length})"
-                    )).into());
-                    }
+        let full_buffer_slice: &[u8] = page_content.as_ptr();
 
-                    let entry_slice = &ptrmap_page_data_slice
-                        [offset_in_ptrmap_page..offset_in_ptrmap_page + PTRMAP_ENTRY_SIZE];
-                    self.vacuum_state.write().ptrmap_get_state = PtrMapGetState::Start;
-                    break match PtrmapEntry::deserialize(entry_slice) {
-                        Some(entry) => Ok(IOResult::Done(Some(entry))),
-                        None => Err(LimboError::Corrupt(format!(
-                            "Failed to deserialize ptrmap entry for page {target_page_num} from ptrmap page {ptrmap_pg_no}"
-                        )).into()),
-                    };
-                }
-            }
+        // Ptrmap pages are not page 1, so their internal offset within their buffer should be 0.
+        // The actual page data starts at page_content.offset() within the full_buffer_slice.
+        if ptrmap_pg_no != 1 && page_content.offset() != 0 {
+            return Err(LimboError::Corrupt(format!(
+                "Ptrmap page {} has unexpected internal offset {}",
+                ptrmap_pg_no,
+                page_content.offset()
+            )));
+        }
+        let ptrmap_page_data_slice: &[u8] = &full_buffer_slice[page_content.offset()..];
+        let actual_data_length = ptrmap_page_data_slice.len();
+
+        // Check if the calculated offset for the entry is within the bounds of the actual page data length.
+        if offset_in_ptrmap_page + PTRMAP_ENTRY_SIZE > actual_data_length {
+            return Err(LimboError::InternalError(format!(
+                "Ptrmap offset {offset_in_ptrmap_page} + entry size {PTRMAP_ENTRY_SIZE} out of bounds for page {ptrmap_pg_no} (actual data len {actual_data_length})"
+            )));
+        }
+
+        let entry_slice = &ptrmap_page_data_slice
+            [offset_in_ptrmap_page..offset_in_ptrmap_page + PTRMAP_ENTRY_SIZE];
+        match PtrmapEntry::deserialize(entry_slice) {
+            Some(entry) => Ok(Some(entry)),
+            None => Err(LimboError::Corrupt(format!(
+                "Failed to deserialize ptrmap entry for page {target_page_num} from ptrmap page {ptrmap_pg_no}"
+            ))),
         }
     }
 
@@ -6133,12 +6126,13 @@ impl Pager {
         #[cfg(feature = "autovacuum")]
         {
             let mut vacuum_state = self.vacuum_state.write();
-            vacuum_state.ptrmap_get_state = PtrMapGetState::Start;
             vacuum_state.ptrmap_put_state = PtrMapPutState::Start;
             vacuum_state.btree_create_vacuum_full_state = BtreeCreateVacuumFullState::Start;
         }
 
         self.ops.read_header_page.cancel();
+        #[cfg(feature = "autovacuum")]
+        self.ops.ptrmap_get.cancel();
     }
 
     pub fn with_header<T>(&self, f: impl Fn(&DatabaseHeader) -> T) -> IOResultOr<T> {
