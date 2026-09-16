@@ -100,6 +100,7 @@ fn open_database(
     db_path: &str,
     vfs: Option<&String>,
     readonly: bool,
+    enable_load_extension: bool,
 ) -> anyhow::Result<(Arc<dyn turso_core::IO>, Connection)> {
     let db_opts = DatabaseOpts::new()
         .with_views(true)
@@ -109,6 +110,11 @@ fn open_database(
         .with_autovacuum(true)
         .with_attach(true)
         .with_generated_columns(true);
+    let db_opts = if enable_load_extension {
+        db_opts.turso_cli()
+    } else {
+        db_opts
+    };
 
     let flags = if readonly {
         OpenFlags::default().union(OpenFlags::ReadOnly)
@@ -116,8 +122,7 @@ fn open_database(
         OpenFlags::default()
     };
 
-    let (io, db) =
-        turso_pg::open_database(db_path, vfs.map(|v| v.as_str()), flags, db_opts.turso_cli())?;
+    let (io, db) = turso_pg::open_database(db_path, vfs.map(|v| v.as_str()), flags, db_opts)?;
     let conn = Connection::new(db.connect()?);
     Ok((io, conn))
 }
@@ -1010,7 +1015,12 @@ fn main() -> anyhow::Result<()> {
         .as_ref()
         .map_or(":memory:".to_string(), |p| p.to_string_lossy().to_string());
 
-    let (io, conn) = open_database(&db_file, opts.vfs.as_ref(), opts.readonly)?;
+    let (io, conn) = open_database(
+        &db_file,
+        opts.vfs.as_ref(),
+        opts.readonly,
+        opts.server.is_none(),
+    )?;
 
     let interrupt_count = Arc::new(AtomicUsize::new(0));
     {
