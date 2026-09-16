@@ -4353,10 +4353,10 @@ pub struct MvStore<Clock: LogicalClock, A: ConcurrentAllocator = TursoAllocator>
     pub index_rows: SkipMap<MVTableId, IndexRowsMap<A>, BasicComparator, A>,
     /// Bumped whenever the key set of `index_rows` may change (every
     /// [`Self::insert_index_version`], which is the single funnel through which
-    /// new index keys are created). Forward-scan cursors snapshot this next to
-    /// their [`crate::mvcc::cursor::IndexShadowFinger`] and reset the finger on
-    /// a mismatch, since a key inserted at or behind an already-positioned
-    /// finger would otherwise be skipped (#7578).
+    /// new index keys are created). Forward-scan cursors snapshot this inside
+    /// [`crate::mvcc::cursor::IndexShadowScan`] and reseed on a mismatch, since
+    /// a key inserted at or behind an already-positioned scan would otherwise
+    /// be skipped (#7578).
     index_rows_epoch: AtomicU64,
     txs: SkipMap<TxID, Transaction<A>, BasicComparator, A>,
     /// Final state for removed transactions. Readers may still race with stale TxID
@@ -6021,8 +6021,8 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
     /// This is exactly the predicate used by the `RowKey::Record` branch of
     /// [`Self::query_btree_version_is_valid`], but it takes the version chain
     /// directly instead of looking it up by key. A forward index scan keeps a
-    /// skiplist finger co-positioned with the B-tree and calls this on the
-    /// chain the finger already points at, replacing one `index_rows.get()`
+    /// skiplist position co-advanced with the B-tree and calls this on the
+    /// chain that position already points at, replacing one `index_rows.get()`
     /// (O(log N)) per scanned row with an amortized-O(1) merge step.
     pub(crate) fn index_chain_invalidates_btree(
         &self,
@@ -8527,8 +8527,8 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         mut row_version: RowVersion,
     ) -> Result<(Arc<SortableIndexKey>, RowVersions<A>)> {
         // Publish the key-set mutation *before* the key becomes visible in the
-        // map: a concurrent shadow finger that races with this insert may then
-        // reset spuriously, but can never miss the new key (#7578).
+        // map: a concurrent shadow scan that races with this insert may then
+        // reseed spuriously, but can never miss the new key (#7578).
         self.bump_index_rows_epoch();
         let index = self.get_or_create_index_rows(index_id)?;
         let index = index.value();

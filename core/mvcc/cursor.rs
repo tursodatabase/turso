@@ -388,18 +388,35 @@ macro_rules! static_iterator_hack {
 
 pub(crate) use static_iterator_hack;
 
-/// Forward-scan finger over `index_rows`, co-advanced with the B-tree cursor so
-/// the per-row "is this B-tree row shadowed by MVCC?" check is an amortized-O(1)
+/// Forward scan over `index_rows`, co-advanced with the B-tree cursor so the
+/// per-row "is this B-tree row shadowed by MVCC?" check is an amortized-O(1)
 /// merge step instead of an `index_rows.get()` (O(log N)) per scanned row.
-/// Forward index cursors only; [`reset`](Self::reset) on any reposition, since
-/// the finger is monotonic.
+/// Forward index cursors only. Call [`reset`](Self::reset) on any reposition.
+/// The scan is monotonic.
+///
+/// Owns the [`MvStore::index_rows_epoch`] snapshot used to detect keys created
+/// mid-scan (#7578). A mismatch reseeds from the current B-tree key.
+pub(crate) struct IndexShadowScan<A: ConcurrentAllocator = TursoAllocator> {
+    state: IndexShadowScanState<A>,
+    epoch: u64,
+}
+
+impl<A: ConcurrentAllocator> Default for IndexShadowScan<A> {
+    fn default() -> Self {
+        Self {
+            state: IndexShadowScanState::default(),
+            epoch: 0,
+        }
+    }
+}
+
 #[derive(Default)]
-pub(crate) enum IndexShadowFinger<A: ConcurrentAllocator = TursoAllocator> {
+enum IndexShadowScanState<A: ConcurrentAllocator = TursoAllocator> {
     /// Not yet created; built lazily on the next shadow check.
     #[default]
     Uninitialized,
     /// Positioned at `key`, holding its version chain. The shadow bit is resolved
-    /// lazily (only when a B-tree row matches this key exactly)
+    /// lazily (only when a B-tree row matches this key exactly).
     Peeked {
         iter: MvccIterator<'static, Arc<SortableIndexKey>, A>,
         key: Arc<SortableIndexKey>,
@@ -409,30 +426,32 @@ pub(crate) enum IndexShadowFinger<A: ConcurrentAllocator = TursoAllocator> {
     Exhausted,
 }
 
-impl<A: ConcurrentAllocator> IndexShadowFinger<A> {
-    /// Reset so the next shadow check rebuilds the finger. Required on any B-tree
-    /// reposition (seek/rewind): a finger left ahead of the new position would
-    /// report a shadowed row as valid.
+impl<A: ConcurrentAllocator> IndexShadowScan<A> {
+    /// Drop the current position so the next shadow check reseeds. Required on
+    /// any B-tree reposition (seek/rewind). A scan left ahead of the new
+    /// position would report a shadowed row as valid.
     fn reset(&mut self) {
-        *self = Self::Uninitialized;
+        self.state = IndexShadowScanState::Uninitialized;
     }
 
     /// Advance `iter` to its next entry, cloning the key and version-chain `Arc`
     /// (both cheap) so no borrowed skiplist `Entry` is held afterward. The shadow
-    /// bit is deliberately not resolved here — see [`Self::Peeked`].
-    fn advance(mut iter: MvccIterator<'static, Arc<SortableIndexKey>, A>) -> Self {
+    /// bit is deliberately not resolved here. See [`IndexShadowScanState::Peeked`].
+    fn advance(
+        mut iter: MvccIterator<'static, Arc<SortableIndexKey>, A>,
+    ) -> IndexShadowScanState<A> {
         match iter.next() {
-            Some(entry) => Self::Peeked {
+            Some(entry) => IndexShadowScanState::Peeked {
                 key: entry.key().clone(),
                 versions: entry.value().clone(),
                 iter,
             },
-            None => Self::Exhausted,
+            None => IndexShadowScanState::Exhausted,
         }
     }
 
     /// Whether the B-tree row `key` is visible (not shadowed by an MVCC version),
-    /// served from the co-positioned finger. Forward equivalent of
+    /// served from this co-positioned scan. Forward equivalent of
     /// [`MvStore::query_btree_version_is_valid`] for index keys.
     pub(crate) fn btree_row_is_valid<Clock: LogicalClock>(
         &mut self,
@@ -441,14 +460,21 @@ impl<A: ConcurrentAllocator> IndexShadowFinger<A> {
         tx_id: u64,
         key: &Arc<SortableIndexKey>,
     ) -> bool {
-        if matches!(self, Self::Uninitialized) {
+        // Read the epoch before (re)seeding. If a key insert races past this
+        // load, the next shadow check observes the mismatch and reseeds.
+        let epoch = db.index_rows_epoch();
+        if self.epoch != epoch {
+            self.reset();
+            self.epoch = epoch;
+        }
+        if matches!(self.state, IndexShadowScanState::Uninitialized) {
             // Scoped so the skiplist guard drops before `step` re-borrows `db`.
             let iter = {
                 // Avoid allocating skiplist here with `try_get_or_insert_with`
                 let index_rows = db.index_rows.get(&table_id);
-                // Seed the finger at the first index key >= the B-tree key rather
-                // than at the start of `index_rows`, so a seek-initiated scan does
-                // not re-walk every preceding version on its first row check.
+                // Seed at the first index key >= the B-tree key rather than at
+                // the start of `index_rows`, so a seek-initiated scan does not
+                // re-walk every preceding version on its first row check.
                 let iter_box: Box<
                     dyn Iterator<Item = MvccEntry<'_, Arc<SortableIndexKey>, A>> + Send + Sync,
                 > = match index_rows {
@@ -462,18 +488,18 @@ impl<A: ConcurrentAllocator> IndexShadowFinger<A> {
                 };
                 static_iterator_hack!(iter_box, Arc<SortableIndexKey>, A)
             };
-            *self = Self::advance(iter);
+            self.state = Self::advance(iter);
         }
         loop {
-            match self {
+            match &self.state {
                 // No version at or after this key -> B-tree row is visible.
-                Self::Exhausted => return true,
-                Self::Uninitialized => unreachable!("created just above"),
-                Self::Peeked {
-                    key: finger_key,
+                IndexShadowScanState::Exhausted => return true,
+                IndexShadowScanState::Uninitialized => unreachable!("created just above"),
+                IndexShadowScanState::Peeked {
+                    key: scan_key,
                     versions,
                     ..
-                } => match finger_key.as_ref().cmp(key.as_ref()) {
+                } => match scan_key.as_ref().cmp(key.as_ref()) {
                     // No version exactly at this key -> visible.
                     std::cmp::Ordering::Greater => return true,
                     // Version present at this key -> resolve the shadow bit now,
@@ -481,15 +507,17 @@ impl<A: ConcurrentAllocator> IndexShadowFinger<A> {
                     std::cmp::Ordering::Equal => {
                         return !db.index_chain_invalidates_btree(versions, tx_id);
                     }
-                    // Finger behind the B-tree (a version-only key); catch up below.
+                    // Scan is behind the B-tree (a version-only key). Catch up below.
                     std::cmp::Ordering::Less => {}
                 },
             }
-            // Step the finger forward; only the `Less` arm above falls through here.
-            let Self::Peeked { iter, .. } = std::mem::replace(self, Self::Uninitialized) else {
+            // Step the scan forward. Only the `Less` arm above falls through here.
+            let IndexShadowScanState::Peeked { iter, .. } =
+                std::mem::replace(&mut self.state, IndexShadowScanState::Uninitialized)
+            else {
                 unreachable!("Less arm matched Peeked")
             };
-            *self = Self::advance(iter);
+            self.state = Self::advance(iter);
         }
     }
 }
@@ -524,18 +552,8 @@ pub struct MvccLazyCursor<Clock: LogicalClock + 'static, A: ConcurrentAllocator 
     btree_advance_state: Option<AdvanceBtreeState>,
     /// Dual-cursor peek state for proper iteration
     dual_peek: DualCursorPeek<A>,
-    /// Forward-scan finger over `index_rows`; see [`IndexShadowFinger`].
-    index_finger: IndexShadowFinger<A>,
-    /// [`MvStore::index_rows_epoch`] snapshot taken the last time
-    /// `index_finger` was consulted. New index keys can be created at or
-    /// behind an already-positioned finger while the scan's cursor is open
-    /// (e.g. a DELETE on the same connection inserts a tombstone key
-    /// mid-scan, #7578); versions appended to *existing* keys are fine
-    /// (chains are read live through their `Arc`), but a new key would be
-    /// silently skipped. On an epoch mismatch the finger is reset so it
-    /// reseeds at the current B-tree key instead of trusting its stale
-    /// position.
-    index_finger_epoch: u64,
+    /// Forward scan over `index_rows`; see [`IndexShadowScan`].
+    index_shadow_scan: IndexShadowScan<A>,
 }
 
 pub enum NextRowidResult {
@@ -601,29 +619,20 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> MvccLazyCursor<Clock
             count_state: None,
             btree_advance_state: None,
             dual_peek: DualCursorPeek::default(),
-            index_finger: IndexShadowFinger::default(),
-            index_finger_epoch: 0,
+            index_shadow_scan: IndexShadowScan::default(),
         })
     }
 
-    /// Forward-direction shadow check: finger fast-path for index cursors, the
-    /// authoritative per-row lookup for table cursors.
+    /// Forward-direction shadow check: `IndexShadowScan` fast-path for index
+    /// cursors, the authoritative per-row lookup for table cursors.
     fn btree_row_is_valid_forward(&mut self, key: &RowKey) -> bool {
         let RowKey::Record(rec) = key else {
             return self.query_btree_version_is_valid(key);
         };
-        // Read the epoch before the finger (re)seeds: if a key insert races
-        // past this load, the next shadow check observes the mismatch and
-        // resets. See `index_finger_epoch`.
-        let epoch = self.db.index_rows_epoch();
-        if self.index_finger_epoch != epoch {
-            self.index_finger.reset();
-            self.index_finger_epoch = epoch;
-        }
-        let valid = self
-            .index_finger
-            .btree_row_is_valid(&self.db, self.table_id, self.tx_id, rec);
-        // Debug-only cross-check: any finger divergence (e.g. a missed reset)
+        let valid =
+            self.index_shadow_scan
+                .btree_row_is_valid(&self.db, self.table_id, self.tx_id, rec);
+        // Debug-only cross-check: any scan divergence (e.g. a missed reset)
         // fails the test suite instead of shipping.
         #[cfg(debug_assertions)]
         debug_assert_eq!(
@@ -633,7 +642,7 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> MvccLazyCursor<Clock
                 &RowKey::Record(rec.clone()),
                 self.tx_id
             ),
-            "index finger diverged from query_btree_version_is_valid"
+            "index shadow scan diverged from query_btree_version_is_valid"
         );
         valid
     }
@@ -1124,8 +1133,8 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> MvccLazyCursor<Clock
     fn reset_dual_peek(&mut self) {
         self.dual_peek = DualCursorPeek::default();
         self.eq_seek_row = None;
-        // The forward finger is monotonic; a reposition invalidates it.
-        self.index_finger.reset();
+        // The forward scan is monotonic; a reposition invalidates it.
+        self.index_shadow_scan.reset();
     }
 
     /// Seek btree cursor and set btree_peek to the result.
