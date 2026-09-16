@@ -7,9 +7,10 @@ pub use crate::incremental::aggregate_operator::{
 };
 pub use crate::incremental::filter_operator::{FilterOperator, FilterPredicate};
 pub use crate::incremental::input_operator::InputOperator;
-pub use crate::incremental::join_operator::{JoinEvalState, JoinOperator, JoinType};
+pub use crate::incremental::join_operator::{JoinEvalOp, JoinOperator, JoinType};
 pub use crate::incremental::project_operator::{ProjectColumn, ProjectOperator};
 
+use crate::coro::{BoxedResumable, StepContext};
 use crate::incremental::dbsp::{Delta, DeltaPair};
 #[cfg(test)]
 use crate::numeric::Numeric;
@@ -17,8 +18,43 @@ use crate::schema::{Index, IndexColumn};
 use crate::storage::btree::BTreeCursor;
 use crate::sync::Arc;
 use crate::sync::Mutex;
-use crate::types::IOResultOr;
+use crate::types::{IOResult, IOResultOr};
 use std::fmt::Debug;
+
+/// The runner of one async operation of an operator, boxed once and reused
+/// for every run of that operation.
+pub struct OpRunner<C: StepContext, Args, Out>(BoxedResumable<C, Args, Out>);
+
+impl<C: StepContext, Args, Out> OpRunner<C, Args, Out> {
+    pub fn new(runner: BoxedResumable<C, Args, Out>) -> Self {
+        Self(runner)
+    }
+
+    /// Starts a new run with `args` if none is suspended, and resumes the
+    /// suspended one otherwise.
+    pub fn resume(&mut self, ctx: &mut C::Ctx<'_>, args: Args) -> Result<IOResult<Out>, C::Error> {
+        self.0.resume(ctx, args)
+    }
+
+    /// True while a run waits for I/O or for a failed step to run again.
+    pub fn is_active(&self) -> bool {
+        self.0.is_active()
+    }
+
+    pub fn cancel(&mut self) {
+        self.0.cancel();
+    }
+}
+
+impl<C: StepContext, Args, Out> Debug for OpRunner<C, Args, Out> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(if self.is_active() {
+            "OpRunner(active)"
+        } else {
+            "OpRunner(idle)"
+        })
+    }
+}
 
 /// Struct to hold both table and index cursors for DBSP state operations
 pub struct DbspStateCursors {
@@ -72,9 +108,12 @@ pub fn generate_storage_id(operator_id: i64, column_index: usize, op_type: u8) -
 #[derive(Debug)]
 pub enum EvalState {
     Uninitialized,
-    Init { deltas: DeltaPair },
+    Init {
+        deltas: DeltaPair,
+    },
     Aggregate(Box<AggregateEvalState>),
-    Join(Box<JoinEvalState>),
+    /// An eval of a join operator that waits for I/O.
+    Join(JoinEvalOp),
     Done,
 }
 

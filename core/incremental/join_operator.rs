@@ -1,9 +1,11 @@
 #![allow(dead_code)]
 
+use crate::coro::{with_handle, Co, Runner, StepContext, YieldSlot};
 use crate::incremental::dbsp::Hash128;
 use crate::incremental::dbsp::{Delta, DeltaPair, HashableRow};
 use crate::incremental::operator::{
     generate_storage_id, ComputationTracker, DbspStateCursors, EvalState, IncrementalOperator,
+    OpRunner,
 };
 use crate::incremental::persistence::WriteRow;
 use crate::numeric::Numeric;
@@ -11,8 +13,54 @@ use crate::storage::btree::CursorTrait;
 use crate::sync::Arc;
 use crate::sync::Mutex;
 use crate::types::IOResultOr;
-use crate::types::{IOResult, ImmutableRecord, ImmutableRecordRef, SeekKey, SeekOp, SeekResult};
-use crate::{return_and_restore_if_io, return_if_io, Result, Value};
+use crate::types::{
+    IOCompletions, IOResult, ImmutableRecord, ImmutableRecordRef, SeekKey, SeekOp, SeekResult,
+};
+use crate::{return_and_restore_if_io, return_if_io, LimboError, Result, Value};
+
+/// Names [`JoinCtx`] as the context type of the async join operations.
+pub struct JoinStep;
+
+impl StepContext for JoinStep {
+    type Error = Box<LimboError>;
+    type Ctx<'a> = JoinCtx<'a>;
+}
+
+/// The context of one step of a join operation: the operator, the state
+/// cursors of that step, and the slot for what suspends the step.
+pub struct JoinCtx<'a> {
+    operator: &'a mut JoinOperator,
+    cursors: &'a mut DbspStateCursors,
+    io: Option<IOCompletions>,
+    err: Option<Box<LimboError>>,
+}
+
+impl YieldSlot<Box<LimboError>> for JoinCtx<'_> {
+    fn park_io(&mut self, io: IOCompletions) {
+        self.io = Some(io);
+    }
+
+    fn take_io(&mut self) -> Option<IOCompletions> {
+        self.io.take()
+    }
+
+    fn park_err(&mut self, err: Box<LimboError>) {
+        self.err = Some(err);
+    }
+
+    fn take_err(&mut self) -> Option<Box<LimboError>> {
+        self.err.take()
+    }
+}
+
+/// The eval of a join operator as a step function.
+pub type JoinEvalOp = OpRunner<JoinStep, DeltaPair, Delta>;
+
+/// The runners of the join operations, boxed on first use and reused.
+#[derive(Debug, Default)]
+struct JoinOps {
+    eval: Option<JoinEvalOp>,
+}
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum JoinType {
@@ -141,189 +189,6 @@ fn read_next_join_row(
     Ok(IOResult::Done(None))
 }
 
-// Join-specific eval states
-#[derive(Debug)]
-pub enum JoinEvalState {
-    ProcessDeltaJoin {
-        deltas: DeltaPair,
-        output: Delta,
-    },
-    ProcessLeftJoin {
-        deltas: DeltaPair,
-        output: Delta,
-        current_idx: usize,
-        last_row_scanned: Option<Hash128>,
-    },
-    ProcessRightJoin {
-        deltas: DeltaPair,
-        output: Delta,
-        current_idx: usize,
-        last_row_scanned: Option<Hash128>,
-    },
-    Done {
-        output: Delta,
-    },
-}
-
-impl JoinEvalState {
-    fn combine_rows(
-        left_row: &HashableRow,
-        left_weight: i64,
-        right_row: &HashableRow,
-        right_weight: i64,
-        output: &mut Delta,
-    ) {
-        // Combine the rows
-        let mut combined_values = left_row.values.clone();
-        combined_values.extend(right_row.values.clone());
-        // Use hash of combined values as synthetic rowid
-        let temp_row = HashableRow::new(0, combined_values.clone());
-        let joined_rowid = temp_row.cached_hash().as_i64();
-        let joined_row = HashableRow::new(joined_rowid, combined_values);
-
-        // Add to output with combined weight
-        let combined_weight = left_weight * right_weight;
-        output.changes.push((joined_row, combined_weight as isize));
-    }
-
-    fn process_join_state(
-        &mut self,
-        cursors: &mut DbspStateCursors,
-        left_key_indices: &[usize],
-        right_key_indices: &[usize],
-        left_storage_id: i64,
-        right_storage_id: i64,
-    ) -> IOResultOr<Delta> {
-        loop {
-            match self {
-                JoinEvalState::ProcessDeltaJoin { deltas, output } => {
-                    // Move to ProcessLeftJoin
-                    *self = JoinEvalState::ProcessLeftJoin {
-                        deltas: std::mem::take(deltas),
-                        output: std::mem::take(output),
-                        current_idx: 0,
-                        last_row_scanned: None,
-                    };
-                }
-                JoinEvalState::ProcessLeftJoin {
-                    deltas,
-                    output,
-                    current_idx,
-                    last_row_scanned,
-                } => {
-                    if *current_idx >= deltas.left.changes.len() {
-                        *self = JoinEvalState::ProcessRightJoin {
-                            deltas: std::mem::take(deltas),
-                            output: std::mem::take(output),
-                            current_idx: 0,
-                            last_row_scanned: None,
-                        };
-                    } else {
-                        let (left_row, left_weight) = &deltas.left.changes[*current_idx];
-                        // Extract join key using provided indices
-                        let key_values: Vec<Value> = left_key_indices
-                            .iter()
-                            .map(|&idx| left_row.values.get(idx).cloned().unwrap_or(Value::Null))
-                            .collect();
-                        let left_key = HashableRow::new(0, key_values);
-
-                        let next_row = return_if_io!(read_next_join_row(
-                            right_storage_id,
-                            &left_key,
-                            *last_row_scanned,
-                            cursors
-                        ));
-                        match next_row {
-                            Some((element_hash, right_row, right_weight)) => {
-                                Self::combine_rows(
-                                    left_row,
-                                    (*left_weight) as i64,
-                                    &right_row,
-                                    right_weight as i64,
-                                    output,
-                                );
-                                // Continue scanning with this left row
-                                *self = JoinEvalState::ProcessLeftJoin {
-                                    deltas: std::mem::take(deltas),
-                                    output: std::mem::take(output),
-                                    current_idx: *current_idx,
-                                    last_row_scanned: Some(element_hash),
-                                };
-                            }
-                            None => {
-                                // No more matches for this left row, move to next
-                                *self = JoinEvalState::ProcessLeftJoin {
-                                    deltas: std::mem::take(deltas),
-                                    output: std::mem::take(output),
-                                    current_idx: *current_idx + 1,
-                                    last_row_scanned: None,
-                                };
-                            }
-                        }
-                    }
-                }
-                JoinEvalState::ProcessRightJoin {
-                    deltas,
-                    output,
-                    current_idx,
-                    last_row_scanned,
-                } => {
-                    if *current_idx >= deltas.right.changes.len() {
-                        *self = JoinEvalState::Done {
-                            output: std::mem::take(output),
-                        };
-                    } else {
-                        let (right_row, right_weight) = &deltas.right.changes[*current_idx];
-                        // Extract join key using provided indices
-                        let key_values: Vec<Value> = right_key_indices
-                            .iter()
-                            .map(|&idx| right_row.values.get(idx).cloned().unwrap_or(Value::Null))
-                            .collect();
-                        let right_key = HashableRow::new(0, key_values);
-
-                        let next_row = return_if_io!(read_next_join_row(
-                            left_storage_id,
-                            &right_key,
-                            *last_row_scanned,
-                            cursors
-                        ));
-                        match next_row {
-                            Some((element_hash, left_row, left_weight)) => {
-                                Self::combine_rows(
-                                    &left_row,
-                                    left_weight as i64,
-                                    right_row,
-                                    (*right_weight) as i64,
-                                    output,
-                                );
-                                // Continue scanning with this right row
-                                *self = JoinEvalState::ProcessRightJoin {
-                                    deltas: std::mem::take(deltas),
-                                    output: std::mem::take(output),
-                                    current_idx: *current_idx,
-                                    last_row_scanned: Some(element_hash),
-                                };
-                            }
-                            None => {
-                                // No more matches for this right row, move to next
-                                *self = JoinEvalState::ProcessRightJoin {
-                                    deltas: std::mem::take(deltas),
-                                    output: std::mem::take(output),
-                                    current_idx: *current_idx + 1,
-                                    last_row_scanned: None,
-                                };
-                            }
-                        }
-                    }
-                }
-                JoinEvalState::Done { output } => {
-                    return Ok(IOResult::Done(std::mem::take(output)));
-                }
-            }
-        }
-    }
-}
-
 #[derive(Debug)]
 enum JoinCommitState {
     Idle,
@@ -365,6 +230,7 @@ pub struct JoinOperator {
     tracker: Option<Arc<Mutex<ComputationTracker>>>,
 
     commit_state: JoinCommitState,
+    ops: JoinOps,
 }
 
 impl JoinOperator {
@@ -410,6 +276,7 @@ impl JoinOperator {
             right_columns,
             tracker: None,
             commit_state: JoinCommitState::Idle,
+            ops: JoinOps::default(),
         };
         Ok(result)
     }
@@ -459,90 +326,157 @@ impl JoinOperator {
         true
     }
 
-    fn process_join_state(
-        &mut self,
-        state: &mut EvalState,
-        cursors: &mut DbspStateCursors,
-    ) -> IOResultOr<Delta> {
-        // Get the join state out of the enum
-        match state {
-            EvalState::Join(js) => js.process_join_state(
-                cursors,
-                &self.left_key_indices,
-                &self.right_key_indices,
-                self.left_storage_id(),
-                self.right_storage_id(),
-            ),
-            _ => panic!("process_join_state called with non-join state"),
-        }
-    }
+    /// Joins the left delta with the right delta in memory: the part of the
+    /// join that needs no stored rows.
+    fn join_delta_with_delta(&self, deltas: &DeltaPair) -> Delta {
+        let mut output = Delta::new();
+        for (left_row, left_weight) in &deltas.left.changes {
+            let left_key = self.extract_join_key(&left_row.values, &self.left_key_indices);
 
-    fn eval_internal(
-        &mut self,
-        state: &mut EvalState,
-        cursors: &mut DbspStateCursors,
-    ) -> IOResultOr<Delta> {
-        loop {
-            let loop_state = std::mem::replace(state, EvalState::Uninitialized);
-            match loop_state {
-                EvalState::Uninitialized => {
-                    panic!("Cannot eval JoinOperator with Uninitialized state");
-                }
-                EvalState::Init { deltas } => {
-                    let mut output = Delta::new();
+            for (right_row, right_weight) in &deltas.right.changes {
+                let right_key = self.extract_join_key(&right_row.values, &self.right_key_indices);
 
-                    // Component 3: δR ⋈ δS (left delta join right delta)
-                    for (left_row, left_weight) in &deltas.left.changes {
-                        let left_key =
-                            self.extract_join_key(&left_row.values, &self.left_key_indices);
-
-                        for (right_row, right_weight) in &deltas.right.changes {
-                            let right_key =
-                                self.extract_join_key(&right_row.values, &self.right_key_indices);
-
-                            if Self::sql_keys_equal(&left_key, &right_key) {
-                                if let Some(tracker) = &self.tracker {
-                                    tracker.lock().record_join_lookup();
-                                }
-
-                                // Combine the rows
-                                let mut combined_values = left_row.values.clone();
-                                combined_values.extend(right_row.values.clone());
-
-                                // Create the joined row with a unique rowid
-                                // Use hash of the combined values to ensure uniqueness
-                                // Use hash of combined values as synthetic rowid
-                                let temp_row = HashableRow::new(0, combined_values.clone());
-                                let joined_rowid = temp_row.cached_hash().as_i64();
-                                let joined_row =
-                                    HashableRow::new(joined_rowid, combined_values.clone());
-
-                                // Add to output with combined weight
-                                let combined_weight = left_weight * right_weight;
-                                output.changes.push((joined_row, combined_weight));
-                            }
-                        }
+                if Self::sql_keys_equal(&left_key, &right_key) {
+                    if let Some(tracker) = &self.tracker {
+                        tracker.lock().record_join_lookup();
                     }
-
-                    *state = EvalState::Join(Box::new(JoinEvalState::ProcessDeltaJoin {
-                        deltas,
-                        output,
-                    }));
-                }
-                EvalState::Join(join_state) => {
-                    *state = EvalState::Join(join_state);
-                    let output = return_if_io!(self.process_join_state(state, cursors));
-                    return Ok(IOResult::Done(output));
-                }
-                EvalState::Done => {
-                    return Ok(IOResult::Done(Delta::new()));
-                }
-                EvalState::Aggregate(_) => {
-                    panic!("Aggregate state should not appear in join operator");
+                    combine_rows(
+                        left_row,
+                        *left_weight as i64,
+                        right_row,
+                        *right_weight as i64,
+                        &mut output,
+                    );
                 }
             }
         }
+        output
     }
+
+    /// Runs one step of the eval: starts a new eval from an `Init` state and
+    /// resumes a suspended one from a `Join` state. The runner lives in the
+    /// state while the eval waits for I/O, and in the operator otherwise.
+    fn step_eval(
+        &mut self,
+        state: &mut EvalState,
+        cursors: &mut DbspStateCursors,
+    ) -> IOResultOr<Delta> {
+        match state {
+            EvalState::Uninitialized => {
+                panic!("Cannot eval JoinOperator with Uninitialized state");
+            }
+            EvalState::Done => return Ok(IOResult::Done(Delta::new())),
+            EvalState::Aggregate(_) => {
+                panic!("Aggregate state should not appear in join operator");
+            }
+            EvalState::Init { .. } | EvalState::Join(_) => {}
+        }
+        let (mut op, deltas) = match std::mem::replace(state, EvalState::Uninitialized) {
+            EvalState::Init { deltas } => {
+                (self.ops.eval.take().unwrap_or_else(new_eval_runner), deltas)
+            }
+            EvalState::Join(op) => (op, DeltaPair::default()),
+            _ => unreachable!("checked above"),
+        };
+        let mut ctx = JoinCtx {
+            operator: self,
+            cursors,
+            io: None,
+            err: None,
+        };
+        let result = op.resume(&mut ctx, deltas);
+        if op.is_active() {
+            *state = EvalState::Join(op);
+        } else {
+            *state = EvalState::Done;
+            self.ops.eval = Some(op);
+        }
+        result
+    }
+}
+
+fn new_eval_runner() -> JoinEvalOp {
+    OpRunner::new(Runner::boxed(|co, args| with_handle(co, args, eval_deltas)))
+}
+
+/// Evaluates the join of a pair of deltas: the left delta against the right
+/// delta in memory, then each delta against the stored rows of the other
+/// side.
+async fn eval_deltas(co: &mut Co<JoinStep>, deltas: DeltaPair) -> Result<Delta, Box<LimboError>> {
+    let mut output = co.with(|ctx| ctx.operator.join_delta_with_delta(&deltas));
+    let (left_storage_id, right_storage_id) = co.with(|ctx| {
+        (
+            ctx.operator.left_storage_id(),
+            ctx.operator.right_storage_id(),
+        )
+    });
+
+    for (left_row, left_weight) in &deltas.left.changes {
+        let left_key = co.with(|ctx| {
+            ctx.operator
+                .extract_join_key(&left_row.values, &ctx.operator.left_key_indices)
+        });
+        let mut last_row_scanned = None;
+        while let Some((element_hash, right_row, right_weight)) = co
+            .io(|ctx| {
+                read_next_join_row(right_storage_id, &left_key, last_row_scanned, ctx.cursors)
+            })
+            .await
+        {
+            combine_rows(
+                left_row,
+                *left_weight as i64,
+                &right_row,
+                right_weight as i64,
+                &mut output,
+            );
+            last_row_scanned = Some(element_hash);
+        }
+    }
+
+    for (right_row, right_weight) in &deltas.right.changes {
+        let right_key = co.with(|ctx| {
+            ctx.operator
+                .extract_join_key(&right_row.values, &ctx.operator.right_key_indices)
+        });
+        let mut last_row_scanned = None;
+        while let Some((element_hash, left_row, left_weight)) = co
+            .io(|ctx| {
+                read_next_join_row(left_storage_id, &right_key, last_row_scanned, ctx.cursors)
+            })
+            .await
+        {
+            combine_rows(
+                &left_row,
+                left_weight as i64,
+                right_row,
+                *right_weight as i64,
+                &mut output,
+            );
+            last_row_scanned = Some(element_hash);
+        }
+    }
+
+    Ok(output)
+}
+
+/// Adds the row that joins `left_row` with `right_row` to the output. The
+/// rowid of the joined row is the hash of the combined values.
+fn combine_rows(
+    left_row: &HashableRow,
+    left_weight: i64,
+    right_row: &HashableRow,
+    right_weight: i64,
+    output: &mut Delta,
+) {
+    let mut combined_values = left_row.values.clone();
+    combined_values.extend(right_row.values.clone());
+    let temp_row = HashableRow::new(0, combined_values.clone());
+    let joined_rowid = temp_row.cached_hash().as_i64();
+    let joined_row = HashableRow::new(joined_rowid, combined_values);
+
+    let combined_weight = left_weight * right_weight;
+    output.changes.push((joined_row, combined_weight as isize));
 }
 
 fn deserialize_hashable_row(blob: &[u8]) -> Result<HashableRow> {
@@ -586,8 +520,7 @@ fn serialize_hashable_row(row: &HashableRow) -> Result<crate::ValueBlob> {
 
 impl IncrementalOperator for JoinOperator {
     fn eval(&mut self, state: &mut EvalState, cursors: &mut DbspStateCursors) -> IOResultOr<Delta> {
-        let delta = return_if_io!(self.eval_internal(state, cursors));
-        Ok(IOResult::Done(delta))
+        self.step_eval(state, cursors)
     }
 
     fn commit(&mut self, deltas: DeltaPair, cursors: &mut DbspStateCursors) -> IOResultOr<Delta> {
