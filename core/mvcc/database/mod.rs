@@ -5422,53 +5422,6 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         Ok(())
     }
 
-    /// Inserts a deletion record for a row that does not currently have any versions in the MV store.
-    /// This is used in cases where the BTree contains that record, but it is logically deleted.
-    pub fn insert_tombstone_to_table_or_index(
-        &self,
-        tx_id: TxID,
-        id: RowID,
-        row: Row,
-        maybe_index_id: Option<MVTableId>,
-    ) -> Result<()> {
-        let version_id = self.get_version_id();
-        let row_version = RowVersion {
-            id: version_id,
-            // Tombstones over B-tree-resident rows have no MVCC creator begin.
-            // They invalidate B-tree visibility via end timestamp only.
-            begin: crate::mvcc::database::PackedTs::pack(None),
-            end: crate::mvcc::database::PackedTs::pack(Some(TxTimestampOrID::TxID(tx_id))),
-            row: row.clone(),
-            btree_resident: true,
-            materialized_at: crate::mvcc::database::WalPos::ORIGIN,
-        };
-        let tx = self
-            .txs
-            .get(&tx_id)
-            .ok_or_else(|| LimboError::NoSuchTransactionID(tx_id.to_string()))?;
-        let tx = tx.value();
-        match maybe_index_id {
-            Some(index_id) => {
-                let RowKey::Record(sortable_key) = row.id.row_id else {
-                    panic!("Index writes must be to a record");
-                };
-                let (canonical_key, row_versions) =
-                    self.insert_index_version(index_id, sortable_key, row_version)?;
-                tx.insert_to_write_set(
-                    RowID::new(id.table_id, RowKey::Record(canonical_key.clone())),
-                    row_versions,
-                );
-                tx.record_created_index_version((index_id, canonical_key), version_id);
-            }
-            None => {
-                let row_versions = self.insert_version(id.clone(), row_version)?;
-                tx.record_created_table_version(id.clone(), version_id);
-                tx.insert_to_write_set(id, row_versions);
-            }
-        }
-        Ok(())
-    }
-
     /// Inserts a row that was read from the B-tree (not in MvStore).
     /// This is used when updating a row that exists in B-tree but hasn't been
     /// modified in MVCC yet. The btree_resident flag helps the checkpoint logic
@@ -5565,7 +5518,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         maybe_index_id: Option<MVTableId>,
     ) -> Result<bool> {
         tracing::trace!("update(tx_id={}, row.id={:?})", tx_id, row.id);
-        if !self.delete_from_table_or_index(tx_id, row.id.clone(), maybe_index_id)? {
+        if !self.delete_from_table_or_index(tx_id, row.id.clone(), maybe_index_id, None)? {
             return Ok(false);
         }
         self.insert_to_table_or_index(tx_id, row, maybe_index_id)?;
@@ -5586,7 +5539,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         maybe_index_id: Option<MVTableId>,
     ) -> Result<()> {
         tracing::trace!("upsert(tx_id={}, row.id={:?})", tx_id, row.id);
-        self.delete_from_table_or_index(tx_id, row.id.clone(), maybe_index_id)?;
+        self.delete_from_table_or_index(tx_id, row.id.clone(), maybe_index_id, None)?;
         self.insert_to_table_or_index(tx_id, row, maybe_index_id)?;
         Ok(())
     }
@@ -5606,7 +5559,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
     /// Returns `true` if the row was successfully deleted, and `false` otherwise.
     ///
     pub fn delete(&self, tx_id: TxID, id: RowID) -> Result<bool> {
-        self.delete_from_table_or_index(tx_id, id, None)
+        self.delete_from_table_or_index(tx_id, id, None, None)
     }
 
     /// Same as delete() but can delete from a table or an index, indicated by the `maybe_index_id` argument.
@@ -5615,8 +5568,15 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         tx_id: TxID,
         id: RowID,
         maybe_index_id: Option<MVTableId>,
+        btree_record: Option<&ImmutableRecord>,
     ) -> Result<bool> {
         tracing::trace!("delete(tx_id={}, id={:?})", tx_id, id);
+        let tx = self
+            .txs
+            .get(&tx_id)
+            .ok_or_else(|| LimboError::NoSuchTransactionID(tx_id.to_string()))?;
+        let tx = tx.value();
+        turso_assert_eq!(tx.state, TransactionState::Active);
         match maybe_index_id {
             Some(index_id) => {
                 let rows = self.get_or_create_index_rows(index_id)?;
@@ -5624,17 +5584,22 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                 let RowKey::Record(sortable_key) = id.row_id.clone() else {
                     panic!("Index deletes must have a record row_id");
                 };
-                if let Some(ref row_versions_entry) = rows.get(&sortable_key) {
+                loop {
+                    let row_versions_entry = if let Some(entry) = rows.get(&sortable_key) {
+                        entry
+                    } else if btree_record.is_some() {
+                        self.get_or_create_index_key_entry(rows, sortable_key.clone())?
+                    } else {
+                        return Ok(false);
+                    };
                     // Get the Arc key from the map entry for savepoint tracking
                     let arc_key = row_versions_entry.key().clone();
                     let row_versions = row_versions_entry.value().clone();
-                    for rv in row_versions.write().iter_mut().rev() {
-                        let tx = self
-                            .txs
-                            .get(&tx_id)
-                            .ok_or_else(|| LimboError::NoSuchTransactionID(tx_id.to_string()))?;
-                        let tx = tx.value();
-                        turso_assert_eq!(tx.state, TransactionState::Active);
+                    let mut locked_row_versions = row_versions.write();
+                    if !self.index_versions_still_mapped(rows, &arc_key, &row_versions) {
+                        continue;
+                    }
+                    for rv in locked_row_versions.iter_mut().rev() {
                         // A transaction cannot delete a version that it cannot see.
                         // B-tree deletion markers are not visible versions, but their
                         // end fields can still indicate a write-write conflict.
@@ -5649,61 +5614,96 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                         }
 
                         let version_id = rv.id;
-                        rv.set_end(Some(TxTimestampOrID::TxID(tx.tx_id)));
-                        let tx = self
-                            .txs
-                            .get(&tx_id)
-                            .ok_or_else(|| LimboError::NoSuchTransactionID(tx_id.to_string()))?;
-                        let tx = tx.value();
-                        tx.insert_to_write_set(id, row_versions.clone());
+                        rv.set_end(Some(TxTimestampOrID::TxID(tx_id)));
+                        drop(locked_row_versions);
+                        tx.insert_to_write_set(id, row_versions);
                         tx.record_deleted_index_version((index_id, arc_key), version_id);
                         return Ok(true);
                     }
+                    let Some(record) = btree_record else {
+                        return Ok(false);
+                    };
+                    let id = RowID::new(id.table_id, RowKey::Record(arc_key.clone()));
+                    let row = Row::new_index_row(id.clone(), record.column_count());
+                    let version_id = self.insert_tombstone(tx_id, row, &mut locked_row_versions)?;
+                    drop(locked_row_versions);
+                    tx.insert_to_write_set(id, row_versions);
+                    tx.record_created_index_version((index_id, arc_key), version_id);
+                    return Ok(true);
                 }
-                Ok(false)
             }
-            None => {
-                let row_versions_opt = self.rows.get(&id);
-                if let Some(ref row_versions_entry) = row_versions_opt {
-                    let row_versions = row_versions_entry.value().clone();
-                    let mut locked_row_versions = row_versions.write();
-                    for rv in locked_row_versions.iter_mut().rev() {
-                        let tx = self
-                            .txs
-                            .get(&tx_id)
-                            .ok_or_else(|| LimboError::NoSuchTransactionID(tx_id.to_string()))?;
-                        let tx = tx.value();
-                        turso_assert_eq!(tx.state, TransactionState::Active);
-                        // A transaction cannot delete a version that it cannot see.
-                        // B-tree deletion markers are not visible versions, but their
-                        // end fields can still indicate a write-write conflict.
-                        let visible = rv.is_visible_to(tx, &self.txs, &self.finalized_tx_states);
-                        if (visible || rv.begin().is_none())
-                            && is_write_write_conflict(&self.txs, &self.finalized_tx_states, tx, rv)
-                        {
-                            return Err(LimboError::WriteWriteConflict);
-                        }
-                        if !visible {
-                            continue;
-                        }
-
-                        let version_id = rv.id;
-                        rv.set_end(Some(TxTimestampOrID::TxID(tx.tx_id)));
-                        drop(locked_row_versions);
-                        drop(row_versions_opt);
-                        let tx = self
-                            .txs
-                            .get(&tx_id)
-                            .ok_or_else(|| LimboError::NoSuchTransactionID(tx_id.to_string()))?;
-                        let tx = tx.value();
-                        tx.insert_to_write_set(id.clone(), row_versions.clone());
-                        tx.record_deleted_table_version(id.clone(), version_id);
-                        return Ok(true);
+            None => loop {
+                let row_versions = if let Some(entry) = self.rows.get(&id) {
+                    entry.value().clone()
+                } else if btree_record.is_some() {
+                    self.get_or_create_table_row_versions(id.clone())?
+                } else {
+                    return Ok(false);
+                };
+                let mut locked_row_versions = row_versions.write();
+                if !self.table_versions_still_mapped(&id, &row_versions) {
+                    continue;
+                }
+                for rv in locked_row_versions.iter_mut().rev() {
+                    // A transaction cannot delete a version that it cannot see.
+                    // B-tree deletion markers are not visible versions, but their
+                    // end fields can still indicate a write-write conflict.
+                    let visible = rv.is_visible_to(tx, &self.txs, &self.finalized_tx_states);
+                    if (visible || rv.begin().is_none())
+                        && is_write_write_conflict(&self.txs, &self.finalized_tx_states, tx, rv)
+                    {
+                        return Err(LimboError::WriteWriteConflict);
                     }
+                    if !visible {
+                        continue;
+                    }
+
+                    let version_id = rv.id;
+                    rv.set_end(Some(TxTimestampOrID::TxID(tx_id)));
+                    drop(locked_row_versions);
+                    tx.insert_to_write_set(id.clone(), row_versions);
+                    tx.record_deleted_table_version(id, version_id);
+                    return Ok(true);
                 }
-                Ok(false)
-            }
+                let Some(record) = btree_record else {
+                    return Ok(false);
+                };
+                let row = crate::with_mv_store_allocation_site!(
+                    RowPayload,
+                    Row::new_table_row_in(
+                        id.clone(),
+                        record.get_payload(),
+                        record.column_count(),
+                        self.allocator(),
+                    )
+                )?;
+                let version_id = self.insert_tombstone(tx_id, row, &mut locked_row_versions)?;
+                drop(locked_row_versions);
+                tx.record_created_table_version(id.clone(), version_id);
+                tx.insert_to_write_set(id, row_versions);
+                return Ok(true);
+            },
         }
+    }
+
+    fn insert_tombstone(
+        &self,
+        tx_id: TxID,
+        row: Row,
+        versions: &mut RowVersionChain<A>,
+    ) -> Result<u64, TryReserveError> {
+        let version_id = self.get_version_id();
+        // Tombstones over B-tree-resident rows have no MVCC creator begin.
+        // They invalidate B-tree visibility via end timestamp only.
+        let version = RowVersion::new(
+            version_id,
+            None,
+            Some(TxTimestampOrID::TxID(tx_id)),
+            row,
+            true,
+        );
+        self.insert_version_raw(versions, version)?;
+        Ok(version_id)
     }
 
     /// Retrieves a row from the table with the given `id`.
@@ -8490,10 +8490,6 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         key: Arc<SortableIndexKey>,
         mut row_version: RowVersion,
     ) -> Result<(Arc<SortableIndexKey>, RowVersions<A>)> {
-        // Publish the key-set mutation *before* the key becomes visible in the
-        // map: a concurrent shadow finger that races with this insert may then
-        // reset spuriously, but can never miss the new key (#7578).
-        self.bump_index_rows_epoch();
         let index = self.get_or_create_index_rows(index_id)?;
         let index = index.value();
         // Same drain-retry as `insert_version`.
@@ -8542,6 +8538,10 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         index: &'a IndexRowsMap<A>,
         key: Arc<SortableIndexKey>,
     ) -> Result<IndexRowEntry<'a, A>, TryReserveError> {
+        // Publish the key-set mutation *before* the key becomes visible in the
+        // map: a concurrent shadow finger that races with this insert may then
+        // reset spuriously, but can never miss the new key (#7578).
+        self.bump_index_rows_epoch();
         let alloc = self.alloc.clone();
         let entry = index.try_get_or_insert_with(key, move || {
             Arc::new(RwLock::new(<RowVersionChain<A> as TursoVecInExt<
