@@ -5454,6 +5454,7 @@ expect {
     44|integer|44|text|44|text
 }
 
+@cross-check-integrity
 test gencol_issue6161_strict_any_gencol_via_alter {
     CREATE TABLE al(id INTEGER PRIMARY KEY, a TEXT) STRICT;
     INSERT INTO al VALUES(1,'42');
@@ -5496,4 +5497,56 @@ test gencol_issue7060_multiple_generated_clauses_rejected {
 }
 expect error {
     error in generated column "c"
+}
+
+test gencol_issue6161_any_affinity_strict_and_non_strict {
+    CREATE TABLE s(id INTEGER PRIMARY KEY, a ANY, g aNy AS(a), kind TEXT AS(typeof(g))) STRICT;
+    INSERT INTO s(id,a) VALUES(1,'00042'),(2,42),(3,42.5),(4,x'3432'),(5,NULL),(6,'abc');
+    SELECT id,quote(g),typeof(g),kind FROM s ORDER BY id;
+    CREATE TABLE t(id INTEGER PRIMARY KEY, a BLOB, g aNy AS(a), kind TEXT AS(typeof(g)));
+    INSERT INTO t(id,a) SELECT id,a FROM s;
+    SELECT id,quote(g),typeof(g),kind FROM t ORDER BY id;
+}
+expect {
+    1|'00042'|text|text
+    2|42|integer|integer
+    3|42.5|real|real
+    4|X'3432'|blob|blob
+    5|NULL|null|null
+    6|'abc'|text|text
+    1|42|integer|integer
+    2|42|integer|integer
+    3|42.5|real|real
+    4|X'3432'|blob|blob
+    5|NULL|null|null
+    6|'abc'|text|text
+}
+
+@cross-check-integrity
+test gencol_issue6161_strict_any_index_all_write_paths {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, a ANY, g ANY AS(a)) STRICT;
+    INSERT INTO t(id,a) VALUES(1,'00042'),(2,42),(3,42.5),(4,x'3432'),(5,NULL);
+    CREATE UNIQUE INDEX t_g ON t(g);
+    INSERT INTO t(id,a) VALUES(6,'42');
+    SELECT id,quote(g),typeof(g) FROM t INDEXED BY t_g WHERE g='00042';
+    SELECT id,quote(g),typeof(g) FROM t INDEXED BY t_g WHERE g=42;
+    SELECT id,quote(g),typeof(g) FROM t INDEXED BY t_g WHERE g='42';
+    UPDATE t SET a='00043' WHERE g='00042';
+    INSERT INTO t(id,a) VALUES(2,'00044') ON CONFLICT(id) DO UPDATE SET a=excluded.a;
+    DELETE FROM t WHERE g=x'3432';
+    SELECT id,quote(g),typeof(g) FROM t INDEXED BY t_g ORDER BY id;
+    SELECT count(*) FROM t INDEXED BY t_g WHERE g IN ('00042',42,x'3432');
+    PRAGMA integrity_check;
+}
+expect {
+    1|'00042'|text
+    2|42|integer
+    6|'42'|text
+    1|'00043'|text
+    2|'00044'|text
+    3|42.5|real
+    5|NULL|null
+    6|'42'|text
+    0
+    ok
 }

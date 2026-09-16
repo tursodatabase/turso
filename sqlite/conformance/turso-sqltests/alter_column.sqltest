@@ -874,6 +874,7 @@ expect {
     ok
 }
 
+@cross-check-integrity
 test alter-column-strict-any-gencol-affinity {
     CREATE TABLE t(id INTEGER PRIMARY KEY, a TEXT, c ANY) STRICT;
     ALTER TABLE t ALTER COLUMN c TO g ANY AS (a);
