@@ -16,7 +16,7 @@ use crate::types::IOResultOr;
 use crate::types::{
     IOCompletions, IOResult, ImmutableRecord, ImmutableRecordRef, SeekKey, SeekOp, SeekResult,
 };
-use crate::{return_and_restore_if_io, return_if_io, LimboError, Result, Value};
+use crate::{return_if_io, LimboError, Result, Value};
 
 /// Names [`JoinCtx`] as the context type of the async join operations.
 pub struct JoinStep;
@@ -56,10 +56,14 @@ impl YieldSlot<Box<LimboError>> for JoinCtx<'_> {
 /// The eval of a join operator as a step function.
 pub type JoinEvalOp = OpRunner<JoinStep, DeltaPair, Delta>;
 
+/// The commit of a join operator as a step function.
+type JoinCommitOp = OpRunner<JoinStep, DeltaPair, Delta>;
+
 /// The runners of the join operations, boxed on first use and reused.
 #[derive(Debug, Default)]
 struct JoinOps {
     eval: Option<JoinEvalOp>,
+    commit: Option<JoinCommitOp>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -189,27 +193,6 @@ fn read_next_join_row(
     Ok(IOResult::Done(None))
 }
 
-#[derive(Debug)]
-enum JoinCommitState {
-    Idle,
-    Eval {
-        eval_state: EvalState,
-    },
-    CommitLeftDelta {
-        deltas: DeltaPair,
-        output: Delta,
-        current_idx: usize,
-        write_row: WriteRow,
-    },
-    CommitRightDelta {
-        deltas: DeltaPair,
-        output: Delta,
-        current_idx: usize,
-        write_row: WriteRow,
-    },
-    Invalid,
-}
-
 /// Join operator - performs incremental join between two relations
 /// Implements the DBSP formula: δ(R ⋈ S) = (δR ⋈ S) ∪ (R ⋈ δS) ∪ (δR ⋈ δS)
 #[derive(Debug)]
@@ -229,7 +212,6 @@ pub struct JoinOperator {
     /// Tracker for computation statistics
     tracker: Option<Arc<Mutex<ComputationTracker>>>,
 
-    commit_state: JoinCommitState,
     ops: JoinOps,
 }
 
@@ -275,7 +257,6 @@ impl JoinOperator {
             left_columns,
             right_columns,
             tracker: None,
-            commit_state: JoinCommitState::Idle,
             ops: JoinOps::default(),
         };
         Ok(result)
@@ -460,6 +441,81 @@ async fn eval_deltas(co: &mut Co<JoinStep>, deltas: DeltaPair) -> Result<Delta, 
     Ok(output)
 }
 
+fn new_commit_runner() -> JoinCommitOp {
+    OpRunner::new(Runner::boxed(|co, args| {
+        with_handle(co, args, commit_deltas)
+    }))
+}
+
+/// Commits a pair of deltas: evaluates the join, then stores every row of
+/// both deltas with its weight so that later evals can join against it.
+async fn commit_deltas(co: &mut Co<JoinStep>, deltas: DeltaPair) -> Result<Delta, Box<LimboError>> {
+    let output = eval_deltas(co, deltas.clone()).await?;
+
+    for (row, weight) in &deltas.left.changes {
+        let (index_key, record_values) = co.with(|ctx| {
+            let operator = &ctx.operator;
+            let join_key = operator.extract_join_key(&row.values, &operator.left_key_indices);
+            stored_row(operator.left_storage_id(), &join_key, row)
+        })?;
+        let mut write_row = WriteRow::new();
+        co.io(|ctx| {
+            write_row.write_row(
+                ctx.cursors,
+                index_key.clone(),
+                record_values.clone(),
+                *weight,
+            )
+        })
+        .await;
+    }
+
+    for (row, weight) in &deltas.right.changes {
+        let (index_key, record_values) = co.with(|ctx| {
+            let operator = &ctx.operator;
+            let join_key = operator.extract_join_key(&row.values, &operator.right_key_indices);
+            stored_row(operator.right_storage_id(), &join_key, row)
+        })?;
+        let mut write_row = WriteRow::new();
+        co.io(|ctx| {
+            write_row.write_row(
+                ctx.cursors,
+                index_key.clone(),
+                record_values.clone(),
+                *weight,
+            )
+        })
+        .await;
+    }
+
+    Ok(output)
+}
+
+/// The index key and the record of one stored join row. The index key is
+/// (storage_id, hash of the join key, hash of the row), and the record adds
+/// the serialized row as a blob.
+fn stored_row(
+    storage_id: i64,
+    join_key: &HashableRow,
+    row: &HashableRow,
+) -> Result<(Vec<Value>, Vec<Value>)> {
+    let zset_hash = join_key.cached_hash();
+    let element_hash = row.cached_hash();
+    let index_key = vec![
+        Value::from_i64(storage_id),
+        zset_hash.to_value()?,
+        element_hash.to_value()?,
+    ];
+    let row_blob = serialize_hashable_row(row)?;
+    let record_values = vec![
+        Value::from_i64(storage_id),
+        zset_hash.to_value()?,
+        element_hash.to_value()?,
+        Value::Blob(row_blob),
+    ];
+    Ok((index_key, record_values))
+}
+
 /// Adds the row that joins `left_row` with `right_row` to the output. The
 /// rowid of the joined row is the hash of the combined values.
 fn combine_rows(
@@ -524,134 +580,16 @@ impl IncrementalOperator for JoinOperator {
     }
 
     fn commit(&mut self, deltas: DeltaPair, cursors: &mut DbspStateCursors) -> IOResultOr<Delta> {
-        loop {
-            let mut state = std::mem::replace(&mut self.commit_state, JoinCommitState::Invalid);
-            match &mut state {
-                JoinCommitState::Idle => {
-                    self.commit_state = JoinCommitState::Eval {
-                        eval_state: deltas.clone().into(),
-                    }
-                }
-                JoinCommitState::Eval { ref mut eval_state } => {
-                    let output = return_and_restore_if_io!(
-                        &mut self.commit_state,
-                        state,
-                        self.eval(eval_state, cursors)
-                    );
-                    self.commit_state = JoinCommitState::CommitLeftDelta {
-                        deltas: deltas.clone(),
-                        output,
-                        current_idx: 0,
-                        write_row: WriteRow::new(),
-                    };
-                }
-                JoinCommitState::CommitLeftDelta {
-                    deltas,
-                    output,
-                    current_idx,
-                    ref mut write_row,
-                } => {
-                    if *current_idx >= deltas.left.changes.len() {
-                        self.commit_state = JoinCommitState::CommitRightDelta {
-                            deltas: std::mem::take(deltas),
-                            output: std::mem::take(output),
-                            current_idx: 0,
-                            write_row: WriteRow::new(),
-                        };
-                        continue;
-                    }
-
-                    let (row, weight) = &deltas.left.changes[*current_idx];
-                    // Extract join key from the left row
-                    let join_key = self.extract_join_key(&row.values, &self.left_key_indices);
-
-                    // The index key: (storage_id, zset_id, element_id)
-                    // zset_id is the hash of the join key, element_id is hash of the row
-                    let storage_id = self.left_storage_id();
-                    let zset_hash = join_key.cached_hash();
-                    let element_hash = row.cached_hash();
-                    let index_key = vec![
-                        Value::from_i64(storage_id),
-                        zset_hash.to_value()?,
-                        element_hash.to_value()?,
-                    ];
-
-                    // The record values: we'll store the serialized row as a blob
-                    let row_blob = serialize_hashable_row(row)?;
-                    let record_values = vec![
-                        Value::from_i64(self.left_storage_id()),
-                        zset_hash.to_value()?,
-                        element_hash.to_value()?,
-                        Value::Blob(row_blob),
-                    ];
-
-                    // Use return_and_restore_if_io to handle I/O properly
-                    return_and_restore_if_io!(
-                        &mut self.commit_state,
-                        state,
-                        write_row.write_row(cursors, index_key, record_values, *weight)
-                    );
-
-                    self.commit_state = JoinCommitState::CommitLeftDelta {
-                        deltas: deltas.clone(),
-                        output: output.clone(),
-                        current_idx: *current_idx + 1,
-                        write_row: WriteRow::new(),
-                    };
-                }
-                JoinCommitState::CommitRightDelta {
-                    deltas,
-                    output,
-                    current_idx,
-                    ref mut write_row,
-                } => {
-                    if *current_idx >= deltas.right.changes.len() {
-                        // Reset to Idle state for next commit
-                        self.commit_state = JoinCommitState::Idle;
-                        return Ok(IOResult::Done(output.clone()));
-                    }
-
-                    let (row, weight) = &deltas.right.changes[*current_idx];
-                    // Extract join key from the right row
-                    let join_key = self.extract_join_key(&row.values, &self.right_key_indices);
-
-                    // The index key: (storage_id, zset_id, element_id)
-                    let zset_hash = join_key.cached_hash();
-                    let element_hash = row.cached_hash();
-                    let index_key = vec![
-                        Value::from_i64(self.right_storage_id()),
-                        zset_hash.to_value()?,
-                        element_hash.to_value()?,
-                    ];
-
-                    // The record values: we'll store the serialized row as a blob
-                    let row_blob = serialize_hashable_row(row)?;
-                    let record_values = vec![
-                        Value::from_i64(self.right_storage_id()),
-                        zset_hash.to_value()?,
-                        element_hash.to_value()?,
-                        Value::Blob(row_blob),
-                    ];
-
-                    // Use return_and_restore_if_io to handle I/O properly
-                    return_and_restore_if_io!(
-                        &mut self.commit_state,
-                        state,
-                        write_row.write_row(cursors, index_key, record_values, *weight)
-                    );
-
-                    self.commit_state = JoinCommitState::CommitRightDelta {
-                        deltas: std::mem::take(deltas),
-                        output: std::mem::take(output),
-                        current_idx: *current_idx + 1,
-                        write_row: WriteRow::new(),
-                    };
-                }
-                JoinCommitState::Invalid => {
-                    panic!("Invalid join commit state");
-                }
-            }
-        }
+        let mut op = self.ops.commit.take().unwrap_or_else(new_commit_runner);
+        let mut ctx = JoinCtx {
+            operator: self,
+            cursors,
+            io: None,
+            err: None,
+        };
+        let result = op.resume(&mut ctx, deltas);
+        self.ops.commit = Some(op);
+        result
     }
 
     fn set_tracker(&mut self, tracker: Arc<Mutex<ComputationTracker>>) {
