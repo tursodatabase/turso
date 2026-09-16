@@ -63,21 +63,11 @@ impl<A: ConcurrentAllocator> Debug for CursorPosition<A> {
 }
 
 #[derive(Debug, Clone, Copy)]
-enum ExistsState {
-    ExistsBtree,
-}
-
-#[derive(Debug, Clone, Copy)]
 enum CountState {
     Rewind,
     NextBtree { count: usize },
     CheckBtreeKey { count: usize },
 }
-#[derive(Debug, Clone)]
-enum MvccLazyCursorState {
-    Exists(ExistsState),
-}
-
 #[cfg(any(test, injected_yields))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, strum_macros::EnumCount)]
 #[repr(u8)]
@@ -514,6 +504,7 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> YieldSlot<Box<LimboE
 enum CursorArgs<'a> {
     None,
     Seek { key: SeekKey<'a> },
+    Exists { key: &'a Value },
 }
 
 impl<'a> CursorArgs<'a> {
@@ -521,7 +512,15 @@ impl<'a> CursorArgs<'a> {
     fn seek_key(&self) -> SeekKey<'a> {
         match self {
             CursorArgs::Seek { key } => key.clone(),
-            CursorArgs::None => unreachable!("this step has no seek key"),
+            _ => unreachable!("this step has no seek key"),
+        }
+    }
+
+    #[inline(always)]
+    fn exists_key(&self) -> &'a Value {
+        match self {
+            CursorArgs::Exists { key } => key,
+            _ => unreachable!("this step has no exists key"),
         }
     }
 }
@@ -533,6 +532,7 @@ struct CursorOps<Clock: LogicalClock + 'static, A: ConcurrentAllocator> {
     rewind: Option<CursorRunner<Clock, A, IterationDirection, ()>>,
     move_row: Option<CursorRunner<Clock, A, IterationDirection, ()>>,
     seek: Option<CursorRunner<Clock, A, SeekOp, SeekResult>>,
+    exists: Option<CursorRunner<Clock, A, (), bool>>,
 }
 
 impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> Default for CursorOps<Clock, A> {
@@ -541,6 +541,7 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> Default for CursorOp
             rewind: None,
             move_row: None,
             seek: None,
+            exists: None,
         }
     }
 }
@@ -564,6 +565,7 @@ enum CursorOp {
     Next,
     Prev,
     Seek,
+    Exists,
 }
 
 /// Runs one step of the async cursor operation `$op` whose runner lives in
@@ -621,7 +623,6 @@ pub struct MvccLazyCursor<Clock: LogicalClock + 'static, A: ConcurrentAllocator 
     btree_cursor: Box<dyn CursorTrait>,
     null_flag: bool,
     creating_new_rowid: bool,
-    state: Option<MvccLazyCursorState>,
     // we keep count_state separate to be able to call other public functions like rewind and next
     count_state: Option<CountState>,
     /// The runners of the async operations of this cursor.
@@ -693,7 +694,6 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> MvccLazyCursor<Clock
             btree_cursor,
             null_flag: false,
             creating_new_rowid: false,
-            state: None,
             count_state: None,
             ops: CursorOps::default(),
             active: None,
@@ -1018,6 +1018,108 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> MvccLazyCursor<Clock
     fn finish_move(&mut self, dir: IterationDirection) {
         self.refresh_current_position(dir);
         self.invalidate_record();
+    }
+
+    /// Looks for `key` in the MVCC store. `Some` is the answer when the
+    /// store alone can give it. `None` means the B-tree must be asked.
+    #[inline(always)]
+    fn begin_exists(&mut self, key: &Value) -> Option<bool> {
+        self.invalidate_record();
+        let int_key = match key {
+            Value::Numeric(crate::numeric::Numeric::Integer(i)) => *i,
+            _ => unreachable!("btree tables are indexed by integers!"),
+        };
+        let inclusive = true;
+
+        // Check MVCC first. This is a point existence probe, so it is
+        // eq-only: bound the skiplist walk to the single rowid instead of
+        // scanning forward over invisible concurrent rows.
+        let rowid = self.db.seek_rowid(
+            RowID {
+                table_id: self.table_id,
+                row_id: RowKey::Int(int_key),
+            },
+            inclusive,
+            true,
+            IterationDirection::Forwards,
+            self.tx_id,
+            &mut self.table_iterator,
+        );
+
+        let mvcc_exists = if let Some((rowid, _)) = &rowid {
+            let RowKey::Int(rowid) = rowid.row_id else {
+                panic!("Rowid is not an integer in mvcc table cursor");
+            };
+            rowid == int_key
+        } else {
+            false
+        };
+
+        tracing::trace!(
+            "MVCC exists check: mvcc_exists={mvcc_exists} find={int_key} got={rowid:?}"
+        );
+
+        if mvcc_exists {
+            self.dual_peek.mvcc_peek = CursorPeek::Row {
+                key: RowKey::Int(int_key),
+                versions: None,
+            };
+            self.current_pos = CursorPosition::Loaded {
+                row_id: RowID {
+                    table_id: self.table_id,
+                    row_id: RowKey::Int(int_key),
+                },
+                in_btree: false,
+                versions: None,
+            };
+            return Some(true);
+        }
+
+        if !self.is_btree_allocated() {
+            // No B-tree allocated, row doesn't exist
+            return Some(false);
+        }
+        // If the B-tree version is invalid (row is deleted or shadowed), don't check the B-tree
+        if !self.query_btree_version_is_valid(&RowKey::Int(int_key)) {
+            return Some(false);
+        }
+        None
+    }
+
+    /// Looks for `key` in the B-tree, and checks that MVCC does not shadow
+    /// the row it finds.
+    #[inline(always)]
+    fn exists_in_btree(&mut self, key: &Value) -> IOResultOr<bool> {
+        turso_assert!(
+            self.is_btree_allocated(),
+            "BTree should be allocated when we are in ExistsBtree state"
+        );
+        let found = return_if_io!(self.btree_cursor.exists(key));
+        if !found {
+            return Ok(IOResult::Done(false));
+        }
+        let int_key = match key {
+            Value::Numeric(crate::numeric::Numeric::Integer(i)) => *i,
+            _ => unreachable!("btree tables are indexed by integers!"),
+        };
+        let row_key = RowKey::Int(int_key);
+        if !self.query_btree_version_is_valid(&row_key) {
+            tracing::trace!("B-tree row {int_key} is shadowed by MVCC");
+            return Ok(IOResult::Done(false));
+        }
+        self.dual_peek.btree_peek = CursorPeek::Row {
+            key: row_key.clone(),
+            versions: None,
+        };
+        self.current_pos = CursorPosition::Loaded {
+            row_id: RowID {
+                table_id: self.table_id,
+                row_id: row_key,
+            },
+            in_btree: true,
+            versions: None,
+        };
+        Ok(IOResult::Done(true))
     }
 
     /// Resets the cursor and seeks the MVCC iterator to `seek_key`.
@@ -1780,129 +1882,14 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> CursorTrait
     }
 
     fn exists(&mut self, key: &Value) -> IOResultOr<bool> {
-        if self.state.is_none() {
-            self.invalidate_record();
-            let int_key = match key {
-                Value::Numeric(crate::numeric::Numeric::Integer(i)) => i,
-                _ => unreachable!("btree tables are indexed by integers!"),
-            };
-            let inclusive = true;
-
-            // Check MVCC first. This is a point existence probe, so it is
-            // eq-only: bound the skiplist walk to the single rowid instead of
-            // scanning forward over invisible concurrent rows.
-            let rowid = self.db.seek_rowid(
-                RowID {
-                    table_id: self.table_id,
-                    row_id: RowKey::Int(*int_key),
-                },
-                inclusive,
-                true,
-                IterationDirection::Forwards,
-                self.tx_id,
-                &mut self.table_iterator,
-            );
-
-            let mvcc_exists = if let Some((rowid, _)) = &rowid {
-                let RowKey::Int(rowid) = rowid.row_id else {
-                    panic!("Rowid is not an integer in mvcc table cursor");
-                };
-                rowid == *int_key
-            } else {
-                false
-            };
-
-            tracing::trace!(
-                "MVCC exists check: mvcc_exists={mvcc_exists} find={int_key} got={rowid:?}"
-            );
-
-            // If found in MVCC, update dual_peek and return true
-            if mvcc_exists {
-                self.dual_peek.mvcc_peek = CursorPeek::Row {
-                    key: RowKey::Int(*int_key),
-                    versions: None,
-                };
-                self.current_pos = CursorPosition::Loaded {
-                    row_id: RowID {
-                        table_id: self.table_id,
-                        row_id: RowKey::Int(*int_key),
-                    },
-                    in_btree: false,
-                    versions: None,
-                };
-                self.state = None;
-                return Ok(IOResult::Done(true));
-            }
-
-            // MVCC doesn't have it, but we need to check B-tree too
-            if self.is_btree_allocated() {
-                // Check if the B-tree version is valid (not shadowed/deleted by MVCC)
-                let btree_is_valid = self.query_btree_version_is_valid(&RowKey::Int(*int_key));
-
-                // If B-tree is invalid (row is deleted or shadowed), don't check B-tree
-                if !btree_is_valid {
-                    self.state = None;
-                    return Ok(IOResult::Done(false));
-                }
-                self.state
-                    .replace(MvccLazyCursorState::Exists(ExistsState::ExistsBtree));
-                inject_io_yield!(self, CursorYieldPoint::ExistsBtreeFallback);
-            } else {
-                // No B-tree allocated, row doesn't exist
-                self.state = None;
-                return Ok(IOResult::Done(false));
-            }
-        }
-
-        let Some(MvccLazyCursorState::Exists(ExistsState::ExistsBtree)) = self.state.clone() else {
-            panic!("Invalid state {:?}", self.state);
-        };
-        turso_assert!(
-            self.is_btree_allocated(),
-            "BTree should be allocated when we are in ExistsBtree state"
-        );
-
-        // Check if row exists in B-tree
-        let found = return_if_io!(self.btree_cursor.exists(key));
-
-        if found {
-            // Found in B-tree, but need to verify it's not shadowed by MVCC tombstone
-            let int_key = match key {
-                Value::Numeric(crate::numeric::Numeric::Integer(i)) => *i,
-                _ => unreachable!("btree tables are indexed by integers!"),
-            };
-            let row_key = RowKey::Int(int_key);
-
-            // Check if this B-tree row is shadowed (deleted/updated) in MVCC
-            let is_valid = self.query_btree_version_is_valid(&row_key);
-
-            if is_valid {
-                // B-tree row is visible (not shadowed), update dual_peek
-                self.dual_peek.btree_peek = CursorPeek::Row {
-                    key: row_key.clone(),
-                    versions: None,
-                };
-                self.current_pos = CursorPosition::Loaded {
-                    row_id: RowID {
-                        table_id: self.table_id,
-                        row_id: row_key,
-                    },
-                    in_btree: true,
-                    versions: None,
-                };
-                self.state = None;
-                Ok(IOResult::Done(true))
-            } else {
-                // B-tree row is shadowed by MVCC (tombstone or update), so it doesn't exist
-                tracing::trace!("B-tree row {int_key} is shadowed by MVCC");
-                self.state = None;
-                Ok(IOResult::Done(false))
-            }
-        } else {
-            // Not found in B-tree either
-            self.state = None;
-            Ok(IOResult::Done(false))
-        }
+        run_cursor_op!(
+            self,
+            CursorOp::Exists,
+            exists,
+            exists_row,
+            (),
+            CursorArgs::Exists { key }
+        )
     }
 
     fn clear_btree(&mut self) -> IOResultOr<Option<usize>> {
@@ -2110,6 +2097,29 @@ async fn rewind_cursor<Clock: LogicalClock + 'static, A: ConcurrentAllocator>(
     co.io(|ctx| ctx.cursor.finish_rewind(dir).map(IOResult::Done))
         .await;
     Ok(())
+}
+
+/// Says whether the table has a visible row with the integer key that the
+/// current step passes in its context. The MVCC store answers first. The
+/// B-tree is asked only when the store has no version for the key.
+async fn exists_row<Clock: LogicalClock + 'static, A: ConcurrentAllocator>(
+    co: &mut Co<MvCursorStep<Clock, A>>,
+    (): (),
+) -> Result<bool, Box<LimboError>> {
+    if let Some(found) = co.with(|ctx| {
+        let key = ctx.args.exists_key();
+        ctx.cursor.begin_exists(key)
+    }) {
+        return Ok(found);
+    }
+    inject_cursor_yield!(co, CursorYieldPoint::ExistsBtreeFallback);
+    let found = co
+        .io(|ctx| {
+            let key = ctx.args.exists_key();
+            ctx.cursor.exists_in_btree(key)
+        })
+        .await;
+    Ok(found)
 }
 
 /// Seeks to the seek key that the current step passes in its context: the
