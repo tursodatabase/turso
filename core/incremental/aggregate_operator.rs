@@ -1621,14 +1621,7 @@ async fn commit_delta(co: &mut Co<AggregateStep>, delta: Delta) -> Result<Delta,
     }
 
     if co.with(|ctx| ctx.operator.has_distinct()) {
-        let mut persist = DistinctPersistState::new(distinct_deltas);
-        co.io(|ctx| {
-            let operator = &ctx.operator;
-            persist.persist_distinct_values(operator.operator_id, ctx.cursors, |group_key_str| {
-                operator.generate_group_hash(group_key_str)
-            })
-        })
-        .await;
+        persist_distinct_values(co, distinct_deltas).await?;
     }
 
     Ok(output_delta)
@@ -1665,6 +1658,58 @@ async fn persist_min_max(
                         zset_hash.to_value()?,
                         value,
                         Value::Null,
+                    ],
+                ))
+            })?;
+            let mut write_row = WriteRow::new();
+            co.io(|ctx| {
+                write_row.write_row(
+                    ctx.cursors,
+                    index_key.clone(),
+                    record_values.clone(),
+                    *weight,
+                )
+            })
+            .await;
+        }
+    }
+    Ok(())
+}
+
+/// Stores every distinct value of the delta with its weight. The weight
+/// is stored as a minimal aggregate state blob, so that the record read
+/// can parse it.
+async fn persist_distinct_values(
+    co: &mut Co<AggregateStep>,
+    distinct_deltas: DistinctDeltas,
+) -> Result<(), Box<LimboError>> {
+    for (group_key, group_values) in &distinct_deltas {
+        for ((col_idx, hashable_row), weight) in group_values {
+            let value = hashable_row.values.first().ok_or_else(|| {
+                LimboError::InternalError("hashable_row should have at least one value".to_string())
+            })?;
+            let (index_key, record_values) = co.with(|ctx| {
+                let operator = &ctx.operator;
+                let storage_id =
+                    generate_storage_id(operator.operator_id, *col_idx, AGG_TYPE_DISTINCT);
+                let zset_hash = operator.generate_group_hash(group_key);
+                let element_id = hash_value(value, *col_idx);
+                let weight_state = AggregateState {
+                    count: *weight as i64,
+                    ..Default::default()
+                };
+                let weight_blob = weight_state.to_blob(&[], &[])?;
+                Ok::<_, LimboError>((
+                    vec![
+                        Value::from_i64(storage_id),
+                        zset_hash.to_value()?,
+                        element_id.to_value()?,
+                    ],
+                    vec![
+                        Value::from_i64(storage_id),
+                        zset_hash.to_value()?,
+                        element_id.to_value()?,
+                        Value::Blob(weight_blob),
                     ],
                 ))
             })?;
@@ -2229,188 +2274,4 @@ fn stored_weight(cursor: &mut BTreeCursor) -> IOResultOr<Option<i64>> {
         _ => 0,
     };
     Ok(IOResult::Done(Some(weight)))
-}
-
-/// State machine for persisting distinct values to BTree storage
-#[derive(Debug)]
-pub enum DistinctPersistState {
-    Init {
-        distinct_deltas: DistinctDeltas,
-        group_keys: Vec<String>,
-    },
-    ProcessGroup {
-        distinct_deltas: DistinctDeltas,
-        group_keys: Vec<String>,
-        group_idx: usize,
-        value_keys: Vec<(usize, HashableRow)>, // (col_idx, value) pairs for current group
-        value_idx: usize,
-    },
-    WriteValue {
-        distinct_deltas: DistinctDeltas,
-        group_keys: Vec<String>,
-        group_idx: usize,
-        value_keys: Vec<(usize, HashableRow)>,
-        value_idx: usize,
-        group_key: String,
-        col_idx: usize,
-        value: Value,
-        weight: isize,
-        write_row: WriteRow,
-    },
-    Done,
-}
-
-impl DistinctPersistState {
-    pub fn new(distinct_deltas: DistinctDeltas) -> Self {
-        let group_keys: Vec<String> = distinct_deltas.keys().cloned().collect();
-        Self::Init {
-            distinct_deltas,
-            group_keys,
-        }
-    }
-
-    pub fn persist_distinct_values(
-        &mut self,
-        operator_id: i64,
-        cursors: &mut DbspStateCursors,
-        generate_group_hash: impl Fn(&str) -> Hash128,
-    ) -> IOResultOr<()> {
-        loop {
-            match self {
-                DistinctPersistState::Init {
-                    distinct_deltas,
-                    group_keys,
-                } => {
-                    let distinct_deltas = std::mem::take(distinct_deltas);
-                    let group_keys = std::mem::take(group_keys);
-                    *self = DistinctPersistState::ProcessGroup {
-                        distinct_deltas,
-                        group_keys,
-                        group_idx: 0,
-                        value_keys: Vec::new(),
-                        value_idx: 0,
-                    };
-                }
-                DistinctPersistState::ProcessGroup {
-                    distinct_deltas,
-                    group_keys,
-                    group_idx,
-                    value_keys,
-                    value_idx,
-                } => {
-                    // Check if we're past all groups
-                    if *group_idx >= group_keys.len() {
-                        *self = DistinctPersistState::Done;
-                        continue;
-                    }
-
-                    // Check if we need to get value_keys for current group
-                    if value_keys.is_empty() && *group_idx < group_keys.len() {
-                        let group_key_str = &group_keys[*group_idx];
-                        if let Some(group_values) = distinct_deltas.get(group_key_str) {
-                            *value_keys = group_values.keys().cloned().collect();
-                        }
-                    }
-
-                    // Check if we have more values in current group
-                    if *value_idx >= value_keys.len() {
-                        *group_idx += 1;
-                        *value_idx = 0;
-                        value_keys.clear();
-                        continue;
-                    }
-
-                    // Process current value
-                    let group_key = group_keys[*group_idx].clone();
-                    let (col_idx, hashable_row) = value_keys[*value_idx].clone();
-                    let weight = distinct_deltas[&group_key][&(col_idx, hashable_row.clone())];
-                    // Extract the value from HashableRow (it's the first element in values vector)
-                    let value = hashable_row
-                        .values
-                        .first()
-                        .ok_or_else(|| {
-                            LimboError::InternalError(
-                                "hashable_row should have at least one value".to_string(),
-                            )
-                        })?
-                        .clone();
-
-                    let distinct_deltas = std::mem::take(distinct_deltas);
-                    let group_keys = std::mem::take(group_keys);
-                    let value_keys = std::mem::take(value_keys);
-                    *self = DistinctPersistState::WriteValue {
-                        distinct_deltas,
-                        group_keys,
-                        group_idx: *group_idx,
-                        value_keys,
-                        value_idx: *value_idx,
-                        group_key,
-                        col_idx,
-                        value,
-                        weight,
-                        write_row: WriteRow::new(),
-                    };
-                }
-                DistinctPersistState::WriteValue {
-                    distinct_deltas,
-                    group_keys,
-                    group_idx,
-                    value_keys,
-                    value_idx,
-                    group_key,
-                    col_idx,
-                    value,
-                    weight,
-                    write_row,
-                } => {
-                    // Build the key components for DISTINCT storage
-                    let storage_id = generate_storage_id(operator_id, *col_idx, AGG_TYPE_DISTINCT);
-                    let zset_hash = generate_group_hash(group_key);
-
-                    // For DISTINCT, element_id is a hash of the value
-                    let element_id = hash_value(value, *col_idx);
-
-                    // Create index key
-                    let index_key = vec![
-                        Value::from_i64(storage_id),
-                        zset_hash.to_value()?,
-                        element_id.to_value()?,
-                    ];
-
-                    // Record values (operator_id, zset_hash, element_id, weight_blob)
-                    // Store weight as a minimal AggregateState blob so ReadRecord can parse it
-                    let weight_state = AggregateState {
-                        count: *weight as i64,
-                        ..Default::default()
-                    };
-                    let weight_blob = weight_state.to_blob(&[], &[])?;
-
-                    let record_values = vec![
-                        Value::from_i64(storage_id),
-                        zset_hash.to_value()?,
-                        element_id.to_value()?,
-                        Value::Blob(weight_blob),
-                    ];
-
-                    // Write to BTree
-                    return_if_io!(write_row.write_row(cursors, index_key, record_values, *weight));
-
-                    // Move to next value
-                    let distinct_deltas = std::mem::take(distinct_deltas);
-                    let group_keys = std::mem::take(group_keys);
-                    let value_keys = std::mem::take(value_keys);
-                    *self = DistinctPersistState::ProcessGroup {
-                        distinct_deltas,
-                        group_keys,
-                        group_idx: *group_idx,
-                        value_keys,
-                        value_idx: *value_idx + 1,
-                    };
-                }
-                DistinctPersistState::Done => {
-                    return Ok(IOResult::Done(()));
-                }
-            }
-        }
-    }
 }
