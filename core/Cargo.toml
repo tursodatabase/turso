@@ -209,10 +209,6 @@ mimalloc = { workspace = true, default-features = false }
 divan.workspace = true
 
 
-[[example]]
-name = "callgrind_deferred_seek"
-required-features = ["io_memory_yield"]
-
 [[bench]]
 name = "benchmark"
 harness = false
