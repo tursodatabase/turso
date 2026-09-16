@@ -541,7 +541,6 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> Default for CursorOp
     }
 }
 
-/// The cursor operation that is suspended, if any. A cursor runs one
 /// What a move of the cursor still has to do after the MVCC peek advanced.
 enum MoveStep {
     /// The cursor is already past the last row in this direction.
@@ -552,6 +551,7 @@ enum MoveStep {
     PickPosition,
 }
 
+/// The cursor operation that is suspended, if any. A cursor runs one
 /// operation at a time: a call to another operation while one is suspended
 /// is a bug in the caller.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
