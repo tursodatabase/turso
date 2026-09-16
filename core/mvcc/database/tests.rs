@@ -1145,8 +1145,8 @@ fn mvcc_passive_begin_concurrent_after_backfill_does_not_busy() {
             CheckpointState::TruncateLogicalLog
             | CheckpointState::FsyncLogicalLog
             | CheckpointState::TruncateWal
-            | CheckpointState::GcTableRows { .. }
-            | CheckpointState::GcIndexRows { .. } => {
+            | CheckpointState::GcTableRows
+            | CheckpointState::GcIndexRows => {
                 reached_tail = true;
                 break;
             }

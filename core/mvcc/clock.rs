@@ -6,7 +6,7 @@ use crate::sync::Mutex;
 pub fn no_op(_: u64) {}
 
 /// Logical clock.
-pub trait LogicalClock: Send + Sync {
+pub trait LogicalClock: Send + Sync + 'static {
     /// Generates the next timestamp, calls `f` with it, then returns it.
     ///
     /// Implementations that guard concurrent commit protocols (e.g.

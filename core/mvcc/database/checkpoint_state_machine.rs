@@ -2,15 +2,15 @@ use crate::alloc::{
     ConcurrentAllocator, TryReserveError, TursoAllocator, TursoIteratorExt, TursoVecExt, Vec,
     ALLOC_ERR_MSG,
 };
+use crate::coro::{with_handle, BoxedResumable, Co, Runner, StepContext, YieldSlot};
 use crate::mvcc::clock::LogicalClock;
 use crate::mvcc::database::{
-    DeleteRowStateMachine, MVTableId, MvStore, Row, RowID, RowKey, RowVersion, SortableIndexKey,
-    TxTimestampOrID, WalPos, WriteRowStateMachine, MVCC_META_KEY_PERSISTENT_TX_TS_MAX,
-    MVCC_META_TABLE_NAME, SQLITE_SCHEMA_MVCC_TABLE_ID,
+    delete_row, write_row, MVTableId, MvStore, Row, RowID, RowKey, RowVersion, SortableIndexKey,
+    TxTimestampOrID, WalPos, MVCC_META_KEY_PERSISTENT_TX_TS_MAX, MVCC_META_TABLE_NAME,
+    SQLITE_SCHEMA_MVCC_TABLE_ID,
 };
 #[cfg(any(test, injected_yields))]
 use crate::mvcc::yield_hooks::{ProvidesYieldContext, YieldContext, YieldPointMarker};
-use crate::mvcc::yield_points::{inject_transition_failure, inject_transition_yield};
 use crate::schema::{Index, Schema};
 use crate::state_machine::{StateMachine, StateTransition, TransitionResult};
 use crate::storage::btree::{BTreeCursor, CursorTrait};
@@ -22,12 +22,13 @@ use crate::sync::Arc;
 use crate::sync::RwLock;
 use crate::types::IOResultOr;
 use crate::types::{IOCompletions, IOResult, ImmutableRecord, ImmutableRecordRef};
-use crate::{turso_assert, turso_assert_eq};
+use crate::{return_if_io, turso_assert, turso_assert_eq};
 use crate::{
     CheckpointResult, Completion, Connection, Database, IOExt, LimboError, Numeric, Pager, Result,
     SyncMode, TransactionState, Value, ValueRef,
 };
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
+use std::marker::PhantomData;
 use std::num::NonZeroU64;
 use std::ops::Bound;
 #[cfg(any(test, injected_yields))]
@@ -50,6 +51,8 @@ const SQLITE_SCHEMA_ROOT_PAGE: i64 = 1;
 /// Column count of a `sqlite_schema` record (type, name, tbl_name, rootpage, sql).
 const SQLITE_SCHEMA_COLUMN_COUNT: usize = 5;
 
+/// The phase the checkpoint is in. The async function sets it at every
+/// phase boundary, so tests and `is_finalized` can read the progress.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CheckpointState {
     PrepareCheckpoint,
@@ -58,26 +61,8 @@ pub enum CheckpointState {
     CollectTableRows,
     CollectIndexRows,
     BeginPagerTxn,
-    WriteRow {
-        write_set_index: usize,
-        requires_seek: bool,
-    },
-    WriteRowStateMachine {
-        write_set_index: usize,
-    },
-    DeleteRowStateMachine {
-        write_set_index: usize,
-    },
-    WriteIndexRow {
-        index_write_set_index: usize,
-        requires_seek: bool,
-    },
-    WriteIndexRowStateMachine {
-        index_write_set_index: usize,
-    },
-    DeleteIndexRowStateMachine {
-        index_write_set_index: usize,
-    },
+    WriteRow,
+    WriteIndexRow,
     /// Compact each non-CYCLE sequence backing table down to a single
     /// watermark row. CYCLE seqs are skipped — they manage wrap
     /// correctness via inline compaction in the nextval bytecode and
@@ -98,14 +83,8 @@ pub enum CheckpointState {
     FsyncLogicalLog,
     /// Truncate the WAL file after DB file and logical-log cleanup are safely durable.
     TruncateWal,
-    GcTableRows {
-        next_index: usize,
-        lwm: u64,
-    },
-    GcIndexRows {
-        next_index: usize,
-        lwm: u64,
-    },
+    GcTableRows,
+    GcIndexRows,
     Finalize,
 }
 
@@ -169,8 +148,10 @@ pub struct LockStates {
 /// Passive mode defers step 1 until publish and runs collection/write concurrently; the durable
 /// outcome (WAL backfill, log truncate, metadata) is the same.
 pub struct CheckpointStateMachine<Clock: LogicalClock, A: ConcurrentAllocator = TursoAllocator> {
-    /// The current state of the state machine
+    /// The phase the checkpoint is in.
     state: CheckpointState,
+    /// The runner of the checkpoint, boxed on the first step.
+    op: Option<CheckpointRunner<Clock, A>>,
     /// The states of the locks held by the state machine - these are tracked for error handling so that they are
     /// released if the state machine fails.
     lock_states: LockStates,
@@ -194,10 +175,6 @@ pub struct CheckpointStateMachine<Clock: LogicalClock, A: ConcurrentAllocator = 
     /// All committed versions to write to the B-tree.
     /// In the case of CREATE TABLE / DROP TABLE ops, contains a [SpecialWrite] to create/destroy the B-tree.
     write_set: Vec<(RowVersion, Option<SpecialWrite>)>,
-    /// State machine for writing rows to the B-tree
-    write_row_state_machine: Option<StateMachine<WriteRowStateMachine>>,
-    /// State machine for deleting rows from the B-tree
-    delete_row_state_machine: Option<StateMachine<DeleteRowStateMachine>>,
     /// Cursors for the B-trees
     cursors: HashMap<u64, Arc<RwLock<BTreeCursor>>>,
     /// Tables or indexes that were created in this checkpoint
@@ -800,6 +777,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
         let yield_instance_id = connection.next_yield_instance_id();
         Self {
             state: CheckpointState::PrepareCheckpoint,
+            op: None,
             lock_states: LockStates {
                 blocking_checkpoint_lock_held: false,
                 pager_read_tx: false,
@@ -816,8 +794,6 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
             yield_instance_id,
             checkpoint_lock,
             write_set: crate::alloc::vec![],
-            write_row_state_machine: None,
-            delete_row_state_machine: None,
             cursors: HashMap::default(),
             created_btrees: HashMap::default(),
             destroyed_tables: HashSet::default(),
@@ -1727,7 +1703,6 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
         self.mvstore
             .durable_txid_max
             .store(self.durable_txid_max_new, Ordering::SeqCst);
-        self.state = CheckpointState::CheckpointWal;
         self.lock_states.pager_read_tx = false;
         self.lock_states.pager_write_tx = false;
         let header = self.staged_checkpoint_header.take().ok_or_else(|| {
@@ -1788,7 +1763,10 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
         readers.min(*self.mvstore.backfill_floor.read())
     }
 
-    fn gc_checkpointed_table_versions(&mut self) -> Option<IOCompletions> {
+    /// Reclaims the versions of the table rows written in this checkpoint,
+    /// starting at `next_index`. Returns the index to continue from when
+    /// the pass stops early to let other work run.
+    fn gc_checkpointed_table_versions(&mut self, next_index: usize, lwm: u64) -> Option<usize> {
         // Keep empty SkipMap slots; Truncate Finalize `_and_slots` unlinks them later.
         let ckpt_max = self.durable_txid_max_new;
         // Includes pager/WAL-pinned readers not yet in `txs` (begin-tx publish window).
@@ -1797,9 +1775,6 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
         // (unchanged since CommitPagerTxn — single orchestrator).
         let materialized_frame = WalPos::from_pair(self.pager.wal_pos());
         let snapshot_ts = self.snapshot_ts;
-        let CheckpointState::GcTableRows { next_index, lwm } = self.state else {
-            unreachable!("gc_checkpointed_table_versions runs only in GcTableRows");
-        };
         let mut index = next_index;
         let mut processed = 0;
         let drop_current_if_in_btree = true;
@@ -1847,26 +1822,21 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
             }
         }
         if index < self.write_set.len() {
-            let CheckpointState::GcTableRows { next_index, .. } = &mut self.state else {
-                unreachable!("gc_checkpointed_table_versions runs only in GcTableRows");
-            };
-            *next_index = index;
-
-            Some(IOCompletions(Completion::new_yield()))
+            Some(index)
         } else {
             None
         }
     }
 
-    fn gc_checkpointed_index_versions(&mut self) -> Option<IOCompletions> {
+    /// Reclaims the versions of the index rows written in this checkpoint,
+    /// starting at `next_index`. Returns the index to continue from when
+    /// the pass stops early to let other work run.
+    fn gc_checkpointed_index_versions(&mut self, next_index: usize, lwm: u64) -> Option<usize> {
         // Same as table GC: keep empty SkipMap slots; Truncate Finalize unlinks later.
         let ckpt_max = self.durable_txid_max_new;
         let min_reader_mark = self.gc_floor_reader_mark();
         let materialized_frame = WalPos::from_pair(self.pager.wal_pos());
         let snapshot_ts = self.snapshot_ts;
-        let CheckpointState::GcIndexRows { next_index, lwm } = self.state else {
-            unreachable!("gc_checkpointed_index_versions runs only in GcIndexRows");
-        };
         let mut index = next_index;
         let mut processed = 0;
         let drop_current_if_in_btree = true;
@@ -1911,11 +1881,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
             }
         }
         if index < self.index_write_set.len() {
-            let CheckpointState::GcIndexRows { next_index, .. } = &mut self.state else {
-                unreachable!("gc_checkpointed_index_versions runs only in GcIndexRows");
-            };
-            *next_index = index;
-            Some(IOCompletions(Completion::new_yield()))
+            Some(index)
         } else {
             None
         }
@@ -1994,1073 +1960,871 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
         Ok(())
     }
 
-    fn step_inner(&mut self, _context: &()) -> Result<TransitionResult<CheckpointResult>> {
-        match &self.state {
-            CheckpointState::PrepareCheckpoint => {
-                let passive = self.mvstore.uses_passive_checkpoint();
-                if passive {
-                    // The passive checkpoint acquires the blocking lock only after
-                    // collection, so it needs an explicit single-orchestrator gate. The
-                    // blocking (flag-off) path takes the lock up front and gets that
-                    // invariant — plus Busy-on-contention — from the lock itself, so it
-                    // must NOT use this gate, which would turn a contended explicit
-                    // TRUNCATE into a silent no-op.
-                    if self
-                        .mvstore
-                        .checkpoint_in_progress
-                        .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-                        .is_err()
-                    {
-                        // Another checkpoint is already running: no-op (no work, no resources).
-                        self.state = CheckpointState::Finalize;
-                        return Ok(TransitionResult::Done(CheckpointResult::default()));
-                    }
-                    self.owns_checkpoint_in_progress = true;
-                }
+    /// Claims the single passive checkpoint slot. Returns false when another
+    /// checkpoint already runs, in which case this one does nothing.
+    fn claim_passive_checkpoint(&mut self) -> bool {
+        // The passive checkpoint acquires the blocking lock only after
+        // collection, so it needs an explicit single-orchestrator gate. The
+        // blocking (flag-off) path takes the lock up front and gets that
+        // invariant — plus Busy-on-contention — from the lock itself, so it
+        // must NOT use this gate, which would turn a contended explicit
+        // TRUNCATE into a silent no-op.
+        if self
+            .mvstore
+            .checkpoint_in_progress
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return false;
+        }
+        self.owns_checkpoint_in_progress = true;
+        self.snapshot_ts = self.mvstore.checkpoint_snapshot_ts();
+        // Checkpoint state machines can be created before they are run.
+        // Resample after serializing so already-durable index deletes are not replayed.
+        self.refresh_checkpoint_bounds();
+        true
+    }
 
-                if passive {
-                    self.snapshot_ts = self.mvstore.checkpoint_snapshot_ts();
-                    // Checkpoint state machines can be created before they are run.
-                    // Resample after serializing so already-durable index deletes are not replayed.
-                    self.refresh_checkpoint_bounds();
-                    self.state = CheckpointState::BuildLocalSchemaView;
-                } else {
-                    self.state = CheckpointState::AcquireLock;
-                }
-                Ok(TransitionResult::Continue)
+    fn acquire_lock(&mut self) -> Result<()> {
+        tracing::debug!("Acquiring blocking checkpoint lock");
+        if !self.lock_states.blocking_checkpoint_lock_held {
+            let locked = self.checkpoint_lock.write();
+            if !locked {
+                return Err(crate::LimboError::Busy);
             }
-            CheckpointState::AcquireLock => {
-                inject_transition_yield!(self, CheckpointYieldPoint::BeforeAcquireLock);
+            self.lock_states.blocking_checkpoint_lock_held = true;
+        }
 
-                tracing::debug!("Acquiring blocking checkpoint lock");
-                if !self.lock_states.blocking_checkpoint_lock_held {
-                    let locked = self.checkpoint_lock.write();
-                    if !locked {
-                        return Err(crate::LimboError::Busy);
-                    }
-                    self.lock_states.blocking_checkpoint_lock_held = true;
-                }
+        // Sample the snapshot only after the stop-the-world lock: no concurrent
+        // commits can land between snapshot_ts and collection on this path.
+        self.snapshot_ts = self.mvstore.checkpoint_snapshot_ts();
+        // Checkpoint state machines can be created before they are run.
+        // Resample after serializing with other checkpoints so already-durable
+        // index deletes are not replayed, and keep schema-derived index metadata
+        // aligned with the refreshed durable boundary.
+        self.refresh_checkpoint_bounds();
+        self.refresh_schema_metadata();
+        Ok(())
+    }
 
-                // Sample the snapshot only after the stop-the-world lock: no concurrent
-                // commits can land between snapshot_ts and collection on this path.
-                self.snapshot_ts = self.mvstore.checkpoint_snapshot_ts();
-                // Checkpoint state machines can be created before they are run.
-                // Resample after serializing with other checkpoints so already-durable
-                // index deletes are not replayed, and keep schema-derived index metadata
-                // aligned with the refreshed durable boundary.
-                self.refresh_checkpoint_bounds();
-                self.refresh_schema_metadata();
-                self.state = CheckpointState::CollectTableRows;
-                Ok(TransitionResult::Continue)
+    /// Runs one step of the local schema view build, and installs the
+    /// schema when the build is done.
+    fn build_local_schema_view_step(&mut self) -> IOResultOr<()> {
+        if self.build_local_schema_sm.is_none() {
+            let began = !self
+                .pager
+                .wal
+                .as_ref()
+                .is_some_and(|wal| wal.holds_read_lock());
+            if began {
+                self.pager.begin_read_tx()?;
             }
-            CheckpointState::BuildLocalSchemaView => {
-                if self.build_local_schema_sm.is_none() {
-                    let began = !self
-                        .pager
-                        .wal
-                        .as_ref()
-                        .is_some_and(|wal| wal.holds_read_lock());
-                    if began {
-                        self.pager.begin_read_tx()?;
-                    }
-                    self.build_local_schema_began_read_tx = began;
-                    let cursor = BTreeCursor::new_table(
-                        self.pager.clone(),
-                        SQLITE_SCHEMA_ROOT_PAGE,
-                        SQLITE_SCHEMA_COLUMN_COUNT,
-                    );
-                    self.build_local_schema_sm =
-                        Some(StateMachine::new(BuildLocalSchemaViewStateMachine::new(
-                            cursor,
-                            self.mvstore.clone(),
-                            self.connection.clone(),
-                            self.snapshot_ts,
-                        )));
-                }
-                let sm = self
-                    .build_local_schema_sm
-                    .as_mut()
-                    .expect("build_local_schema_sm just set");
-                match sm.step(&())? {
-                    IOResult::IO(io) => Ok(TransitionResult::Io(io)),
-                    IOResult::Done(schema) => {
-                        self.local_schema = Some(schema);
-                        let local = self
-                            .local_schema
-                            .as_ref()
-                            .expect("local_schema just set")
-                            .clone();
-                        // Key each index by the binding that owns its root page AT snapshot_ts —
-                        // the same id collect_index_rows uses (mvstore.index_rows is keyed by the
-                        // owning id). Resolving at the *current* owner (u64::MAX) instead would,
-                        // under concurrent page reuse, key a present index under a different (reused)
-                        // id, so WriteIndexRow would fail to find its Index struct and drop real
-                        // entries ("row N missing from index"). filter_map: an index whose root has
-                        // no binding covering the snapshot is not part of this snapshot.
-                        self.index_id_to_index = local
-                            .indexes
-                            .values()
-                            .flatten()
-                            .filter(|index| index.is_btree_backed())
-                            .filter_map(|index| {
-                                turso_assert!(
-                                    index.root_page != 0,
-                                    "index root_page must be non-zero"
-                                );
-                                self.mvstore
-                                    .try_get_table_id_from_root_page_at(
-                                        index.root_page,
-                                        self.snapshot_ts,
-                                    )
-                                    .map(|id| (id, index.clone()))
-                            })
-                            .collect();
-                        self.build_local_schema_sm = None;
-                        if self.build_local_schema_began_read_tx {
-                            self.pager.end_read_tx();
-                            self.build_local_schema_began_read_tx = false;
-                        }
-                        self.state = CheckpointState::CollectTableRows;
-                        Ok(TransitionResult::Continue)
-                    }
-                }
+            self.build_local_schema_began_read_tx = began;
+            let cursor = BTreeCursor::new_table(
+                self.pager.clone(),
+                SQLITE_SCHEMA_ROOT_PAGE,
+                SQLITE_SCHEMA_COLUMN_COUNT,
+            );
+            self.build_local_schema_sm =
+                Some(StateMachine::new(BuildLocalSchemaViewStateMachine::new(
+                    cursor,
+                    self.mvstore.clone(),
+                    self.connection.clone(),
+                    self.snapshot_ts,
+                )));
+        }
+        let sm = self
+            .build_local_schema_sm
+            .as_mut()
+            .expect("build_local_schema_sm just set");
+        let schema = return_if_io!(sm.step(&()));
+        self.build_local_schema_sm = None;
+        self.install_local_schema(schema);
+        Ok(IOResult::Done(()))
+    }
+
+    fn install_local_schema(&mut self, schema: Arc<Schema>) {
+        self.local_schema = Some(schema);
+        let local = self
+            .local_schema
+            .as_ref()
+            .expect("local_schema just set")
+            .clone();
+        // Key each index by the binding that owns its root page AT snapshot_ts —
+        // the same id collect_index_rows uses (mvstore.index_rows is keyed by the
+        // owning id). Resolving at the *current* owner (u64::MAX) instead would,
+        // under concurrent page reuse, key a present index under a different (reused)
+        // id, so WriteIndexRow would fail to find its Index struct and drop real
+        // entries ("row N missing from index"). filter_map: an index whose root has
+        // no binding covering the snapshot is not part of this snapshot.
+        self.index_id_to_index = local
+            .indexes
+            .values()
+            .flatten()
+            .filter(|index| index.is_btree_backed())
+            .filter_map(|index| {
+                turso_assert!(index.root_page != 0, "index root_page must be non-zero");
+                self.mvstore
+                    .try_get_table_id_from_root_page_at(index.root_page, self.snapshot_ts)
+                    .map(|id| (id, index.clone()))
+            })
+            .collect();
+        if self.build_local_schema_began_read_tx {
+            self.pager.end_read_tx();
+            self.build_local_schema_began_read_tx = false;
+        }
+    }
+
+    fn collect_table_rows_step(&mut self) -> IOResultOr<()> {
+        match self.collect_table_rows()? {
+            Some(io) => Ok(IOResult::IO(io)),
+            None => Ok(IOResult::Done(())),
+        }
+    }
+
+    fn collect_index_rows_step(&mut self) -> IOResultOr<()> {
+        match self.collect_index_rows()? {
+            Some(io) => Ok(IOResult::IO(io)),
+            None => Ok(IOResult::Done(())),
+        }
+    }
+
+    /// Fixes the durable boundary after collection and opens the checkpoint
+    /// in storage. Returns whether there are rows to write to the B-trees.
+    fn finish_collection(&mut self) -> Result<bool> {
+        let durable_old = self.durable_txid_max_old.map(u64::from).unwrap_or_default();
+        #[cfg(any(test, debug_assertions))]
+        {
+            let collected_max = self.max_collected_version_timestamp();
+            turso_assert!(
+                self.snapshot_ts >= collected_max,
+                "MVCC checkpoint collected version timestamp above snapshot",
+                { "collected_max": collected_max, "snapshot_ts": self.snapshot_ts }
+            );
+        }
+        self.durable_txid_max_new = durable_old.max(self.snapshot_ts);
+        self.maybe_stage_mvcc_metadata_write()?;
+
+        self.mvstore.storage.on_checkpoint_start()?;
+
+        Ok(!(self.write_set.is_empty() && self.index_write_set.is_empty()))
+    }
+
+    fn begin_pager_txn(&mut self) -> Result<()> {
+        tracing::debug!("Beginning pager transaction");
+        // Start a pager transaction to write committed versions to B-tree
+        let read_tx_active = self
+            .pager
+            .wal
+            .as_ref()
+            .is_some_and(|wal| wal.holds_read_lock());
+        if !read_tx_active {
+            self.pager.begin_read_tx()?;
+            self.lock_states.pager_read_tx = true;
+        }
+
+        self.pager
+            .io
+            .block(|| self.pager.begin_write_tx(WalAutoActions::all_enabled()))?;
+        if self.update_transaction_state {
+            self.connection.set_tx_state(TransactionState::Write {
+                schema_did_change: false,
+            }); // TODO: schema_did_change??
+        }
+        self.lock_states.pager_write_tx = true;
+        Ok(())
+    }
+
+    /// Prepares the write of the table row at `write_set_index`: creates or
+    /// destroys the B-tree of a schema row, and picks the cursor.
+    fn prepare_table_row_write(&mut self, write_set_index: usize) -> Result<RowWrite> {
+        if !self.has_more_rows(write_set_index) {
+            return Ok(RowWrite::Done);
+        }
+
+        let (num_columns, table_id, special_write, drop_ts) = {
+            let (row_version, special_write) = self
+                .get_current_row_version(write_set_index)
+                .ok_or_else(|| {
+                    LimboError::InternalError("row version not found in write set".to_string())
+                })?;
+            tracing::trace!("checkpointing row {row_version:?} ");
+            // Commit ts of the tombstone driving a destroy, so a dropped checkpointed
+            // object can be retired into `retired_rootpages` for readers still at an
+            // older snapshot (see the BTreeDestroy/BTreeDestroyIndex arms below).
+            let drop_ts = match row_version.end() {
+                Some(TxTimestampOrID::Timestamp(ts)) => Some(ts),
+                _ => None,
+            };
+            (
+                row_version.row.column_count,
+                row_version.row.id.table_id,
+                *special_write,
+                drop_ts,
+            )
+        };
+        tracing::debug!(
+            "WriteRow: num_columns={num_columns}, table_id={table_id:?}, special_write={special_write:?}"
+        );
+
+        // Handle CREATE TABLE / DROP TABLE / CREATE INDEX / DROP INDEX ops
+        if let Some(special_write) = special_write {
+            self.apply_special_write(special_write, drop_ts)?;
+        }
+
+        if self.destroyed_tables.contains(&table_id) {
+            // Don't write rows for tables that will be destroyed in this checkpoint.
+            return Ok(RowWrite::Skip);
+        }
+
+        let is_delete = self
+            .get_current_row_version(write_set_index)
+            .is_some_and(|(v, _)| v.end().is_some());
+        if is_delete && !self.table_exists_for_snapshot(table_id) {
+            return Ok(RowWrite::Skip);
+        }
+
+        let root_page = self.resolve_checkpoint_root(table_id).unwrap_or_else(|| {
+            panic!(
+                "Table ID does not have a root page: {table_id}, row_version: {:?}",
+                self.get_current_row_version(write_set_index)
+                    .expect("row version should exist")
+            )
+        });
+
+        tracing::debug!("WriteRow: resolved root page: root_page={root_page}");
+
+        // If a table was created, it now has a real root page allocated for it, but the 'root_page' field in the sqlite_schema record is still the table id.
+        // So we need to rewrite the row version to use the real root page.
+        match special_write {
+            Some(SpecialWrite::BTreeCreate {
+                table_id,
+                sqlite_schema_rowid,
+            }) => self.rewrite_created_root_page(write_set_index, table_id, sqlite_schema_rowid)?,
+            Some(SpecialWrite::BTreeCreateIndex {
+                index_id,
+                sqlite_schema_rowid,
+            }) => self.rewrite_created_root_page(write_set_index, index_id, sqlite_schema_rowid)?,
+            _ => {}
+        }
+
+        // Get or create cursor for this table
+        let cursor = if let Some(cursor) = self.cursors.get(&root_page) {
+            cursor.clone()
+        } else {
+            let cursor = BTreeCursor::new_table(self.pager.clone(), root_page as i64, num_columns);
+            let cursor = Arc::new(RwLock::new(cursor));
+            self.cursors.insert(root_page, cursor.clone());
+            cursor
+        };
+
+        let (row_version, _) = self
+            .get_current_row_version(write_set_index)
+            .ok_or_else(|| {
+                LimboError::InternalError("row version not found in write set".to_string())
+            })?;
+
+        if row_version.end().is_some() {
+            // This is a delete operation.
+            // Don't write the deletion record to the b-tree if the b-tree was just created; we can no-op in this case,
+            // since there is no existing row to delete.
+            if self
+                .created_btrees
+                .values()
+                .any(|(table_id, _)| *table_id == row_version.row.id.table_id)
+            {
+                return Ok(RowWrite::Skip);
             }
-            CheckpointState::CollectTableRows => {
-                if let Some(io) = self.collect_table_rows()? {
-                    return Ok(TransitionResult::Io(io));
-                }
-                tracing::debug!("Collected {} committed versions", self.write_set.len());
-                self.state = CheckpointState::CollectIndexRows;
-                inject_transition_yield!(self, CheckpointYieldPoint::AfterCollectTableRows);
-                Ok(TransitionResult::Continue)
-            }
-            CheckpointState::CollectIndexRows => {
-                if let Some(io) = self.collect_index_rows()? {
-                    return Ok(TransitionResult::Io(io));
-                }
-                tracing::debug!("Collected {} index row changes", self.index_write_set.len());
+            Ok(RowWrite::Delete {
+                rowid: row_version.row.id.clone(),
+                cursor,
+            })
+        } else {
+            Ok(RowWrite::Insert {
+                row: row_version.row.clone(),
+                cursor,
+            })
+        }
+    }
 
-                let passive = self.mvstore.uses_passive_checkpoint();
-                if passive {
-                    inject_transition_yield!(self, CheckpointYieldPoint::BeforeAcquireLock);
-                    // Passive path: collection AND the btree write phase run without the
-                    // blocking lock. The only serialized point is the brief publish window in
-                    // CommitPagerTxn.
-                }
-
-                let durable_old = self.durable_txid_max_old.map(u64::from).unwrap_or_default();
-                #[cfg(any(test, debug_assertions))]
-                {
-                    let collected_max = self.max_collected_version_timestamp();
-                    turso_assert!(
-                        self.snapshot_ts >= collected_max,
-                        "MVCC checkpoint collected version timestamp above snapshot",
-                        { "collected_max": collected_max, "snapshot_ts": self.snapshot_ts }
-                    );
-                }
-                self.durable_txid_max_new = durable_old.max(self.snapshot_ts);
-                self.maybe_stage_mvcc_metadata_write()?;
-
-                self.mvstore.storage.on_checkpoint_start()?;
-
-                if self.write_set.is_empty() && self.index_write_set.is_empty() {
-                    // Nothing to checkpoint, skip pager txn and go straight to WAL checkpoint.
-                    self.state = CheckpointState::CheckpointWal;
-                } else {
-                    self.state = CheckpointState::BeginPagerTxn;
-                }
-                Ok(TransitionResult::Continue)
-            }
-            CheckpointState::BeginPagerTxn => {
-                tracing::debug!("Beginning pager transaction");
-                // Start a pager transaction to write committed versions to B-tree
-                let read_tx_active = self
+    fn apply_special_write(
+        &mut self,
+        special_write: SpecialWrite,
+        drop_ts: Option<u64>,
+    ) -> Result<()> {
+        match special_write {
+            SpecialWrite::BTreeCreate { table_id, .. } => {
+                let created_root_page: u32 = self
                     .pager
-                    .wal
-                    .as_ref()
-                    .is_some_and(|wal| wal.holds_read_lock());
-                if !read_tx_active {
-                    self.pager.begin_read_tx()?;
-                    self.lock_states.pager_read_tx = true;
-                }
-
-                self.pager
                     .io
-                    .block(|| self.pager.begin_write_tx(WalAutoActions::all_enabled()))?;
-                if self.update_transaction_state {
-                    self.connection.set_tx_state(TransactionState::Write {
-                        schema_did_change: false,
-                    }); // TODO: schema_did_change??
-                }
-                self.lock_states.pager_write_tx = true;
-                self.state = CheckpointState::WriteRow {
-                    write_set_index: 0,
-                    requires_seek: true,
-                };
-                Ok(TransitionResult::Continue)
+                    .block(|| self.pager.btree_create(&CreateBTreeFlags::new_table()))?;
+                // STAGE the binding: the checkpoint must resolve table_id -> root while
+                // writing rows below, but the pages are not durable until
+                // CommitPagerTxn, so it stays physically invisible to readers
+                // (visible_from = u64::MAX) until the post-commit publish window.
+                // Undo-logged: reverted if the checkpoint fails before commit.
+                self.ckpt_rootmap_alloc(table_id, created_root_page as u64);
+                self.staged_roots.push(table_id);
             }
-
-            CheckpointState::WriteRow {
-                write_set_index,
-                requires_seek,
+            SpecialWrite::BTreeDestroy {
+                table_id,
+                root_page,
+                num_columns,
             } => {
-                let write_set_index = *write_set_index;
-                let requires_seek = *requires_seek;
-
-                if !self.has_more_rows(write_set_index) {
-                    // Done writing all table rows, now process index rows
-                    if self.index_write_set.is_empty() {
-                        // No index rows to write, compact sequence
-                        // backing tables, then commit.
-                        self.state = CheckpointState::CompactSequences;
-                    } else {
-                        // Start writing index rows
-                        self.state = CheckpointState::WriteIndexRow {
-                            index_write_set_index: 0,
-                            requires_seek: true,
-                        };
-                    }
-                    return Ok(TransitionResult::Continue);
-                }
-
-                let (num_columns, table_id, special_write, drop_ts) = {
-                    let (row_version, special_write) = self
-                        .get_current_row_version(write_set_index)
-                        .ok_or_else(|| {
-                            LimboError::InternalError(
-                                "row version not found in write set".to_string(),
-                            )
-                        })?;
-                    tracing::trace!("checkpointing row {row_version:?} ");
-                    // Commit ts of the tombstone driving a destroy, so a dropped checkpointed
-                    // object can be retired into `retired_rootpages` for readers still at an
-                    // older snapshot (see the BTreeDestroy/BTreeDestroyIndex arms below).
-                    let drop_ts = match row_version.end() {
-                        Some(TxTimestampOrID::Timestamp(ts)) => Some(ts),
-                        _ => None,
-                    };
-                    (
-                        row_version.row.column_count,
-                        row_version.row.id.table_id,
-                        *special_write,
-                        drop_ts,
-                    )
-                };
-                tracing::debug!(
-                    "WriteRow: num_columns={num_columns}, table_id={table_id:?}, special_write={special_write:?}"
+                let known_root_page = self
+                    .mvstore
+                    .current_root_page(&table_id)
+                    .expect("Table ID does not have a root page");
+                turso_assert_eq!(
+                    known_root_page,
+                    root_page,
+                    "checkpoint root page mismatch for BTreeDestroy",
+                    { "known_root_page": known_root_page, "schema_root_page": root_page }
                 );
-
-                // Handle CREATE TABLE / DROP TABLE / CREATE INDEX / DROP INDEX ops
-                if let Some(special_write) = special_write {
-                    match special_write {
-                        SpecialWrite::BTreeCreate { table_id, .. } => {
-                            let created_root_page: u32 = self.pager.io.block(|| {
-                                self.pager.btree_create(&CreateBTreeFlags::new_table())
-                            })?;
-                            // STAGE the binding: the checkpoint must resolve table_id -> root while
-                            // writing rows below, but the pages are not durable until
-                            // CommitPagerTxn, so it stays physically invisible to readers
-                            // (visible_from = u64::MAX) until the post-commit publish window.
-                            // Undo-logged: reverted if the checkpoint fails before commit.
-                            self.ckpt_rootmap_alloc(table_id, created_root_page as u64);
-                            self.staged_roots.push(table_id);
-                        }
-                        SpecialWrite::BTreeDestroy {
-                            table_id,
-                            root_page,
-                            num_columns,
-                        } => {
-                            let known_root_page = self
-                                .mvstore
-                                .current_root_page(&table_id)
-                                .expect("Table ID does not have a root page");
-                            turso_assert_eq!(
-                                known_root_page,
-                                root_page,
-                                "checkpoint root page mismatch for BTreeDestroy",
-                                { "known_root_page": known_root_page, "schema_root_page": root_page }
-                            );
-                            let cursor = if let Some(cursor) = self.cursors.get(&known_root_page) {
-                                cursor.clone()
-                            } else {
-                                let cursor = BTreeCursor::new_table(
-                                    self.pager.clone(),
-                                    known_root_page as i64,
-                                    num_columns,
-                                );
-                                let cursor = Arc::new(RwLock::new(cursor));
-                                self.cursors.insert(root_page, cursor.clone());
-                                cursor
-                            };
-                            self.pager.io.block(|| cursor.write().btree_destroy())?;
-                            // Evict stale cursor.
-                            self.cursors.remove(&root_page);
-                            self.destroyed_tables.insert(table_id);
-                            self.freed_root_pages.insert(root_page as i64);
-                            // Deferred destroy: retire the binding (set its `end` to the drop ts)
-                            // but keep it, so a transaction still scanning this table at an older
-                            // snapshot resolves the (read-mark-protected) root page. GC'd once
-                            // `lwm` passes the drop. Defensively remove if the drop ts is unknown.
-                            if let Some(drop_ts) = drop_ts {
-                                self.ckpt_rootmap_retire(table_id, drop_ts);
-                            } else {
-                                self.ckpt_rootmap_remove(table_id);
-                            }
-                        }
-                        SpecialWrite::BTreeCreateIndex { index_id, .. } => {
-                            let created_root_page: u32 = self.pager.io.block(|| {
-                                self.pager.btree_create(&CreateBTreeFlags::new_index())
-                            })?;
-                            // Staged (see BTreeCreate); published in the post-commit window.
-                            // Undo-logged: reverted if the checkpoint fails before commit.
-                            self.ckpt_rootmap_alloc(index_id, created_root_page as u64);
-                            self.staged_roots.push(index_id);
-                            // Index struct should already be stored in index_id_to_index from collect_committed_versions
-                            turso_assert!(
-                                self.index_id_to_index.contains_key(&index_id),
-                                "checkpoint index struct missing before BTreeCreateIndex",
-                                { "index_id": i64::from(index_id) }
-                            );
-                        }
-                        SpecialWrite::BTreeDestroyIndex {
-                            index_id,
-                            root_page,
-                            num_columns,
-                        } => {
-                            let known_root_page = self
-                                .mvstore
-                                .current_root_page(&index_id)
-                                .expect("Index ID does not have a root page");
-                            turso_assert_eq!(
-                                known_root_page,
-                                root_page,
-                                "checkpoint root page mismatch for BTreeDestroyIndex",
-                                { "known_root_page": known_root_page, "schema_root_page": root_page }
-                            );
-
-                            let cursor = if let Some(cursor) = self.cursors.get(&known_root_page) {
-                                cursor.clone()
-                            } else if let Some(index) = self.index_id_to_index.get(&index_id) {
-                                let cursor = BTreeCursor::new_index(
-                                    self.pager.clone(),
-                                    known_root_page as i64,
-                                    index.as_ref(),
-                                    num_columns,
-                                )?;
-                                let cursor = Arc::new(RwLock::new(cursor));
-                                self.cursors.insert(root_page, cursor.clone());
-                                cursor
-                            } else {
-                                // DROP INDEX destroy path: schema may no longer contain the index definition.
-                                // We only need a cursor to destroy pages so num_columns is not important.
-                                Arc::new(RwLock::new(BTreeCursor::new_table(
-                                    self.pager.clone(),
-                                    known_root_page as i64,
-                                    num_columns,
-                                )))
-                            };
-                            self.pager.io.block(|| cursor.write().btree_destroy())?;
-                            // Evict stale cursor.
-                            self.cursors.remove(&root_page);
-                            self.destroyed_indexes.insert(index_id);
-                            self.freed_root_pages.insert(root_page as i64);
-                            // Deferred destroy: retire the binding (set its `end`) but keep it so
-                            // a transaction still scanning this index at an older snapshot resolves
-                            // the (read-mark-protected) root page. GC'd once `lwm` passes the drop.
-                            if let Some(drop_ts) = drop_ts {
-                                self.ckpt_rootmap_retire(index_id, drop_ts);
-                            } else {
-                                self.ckpt_rootmap_remove(index_id);
-                            }
-                        }
-                    }
-                }
-
-                if self.destroyed_tables.contains(&table_id) {
-                    // Don't write rows for tables that will be destroyed in this checkpoint.
-                    self.state = CheckpointState::WriteRow {
-                        write_set_index: write_set_index + 1,
-                        requires_seek: true,
-                    };
-                    return Ok(TransitionResult::Continue);
-                }
-
-                let is_delete = self
-                    .get_current_row_version(write_set_index)
-                    .is_some_and(|(v, _)| v.end().is_some());
-                if is_delete && !self.table_exists_for_snapshot(table_id) {
-                    self.state = CheckpointState::WriteRow {
-                        write_set_index: write_set_index + 1,
-                        requires_seek: true,
-                    };
-                    return Ok(TransitionResult::Continue);
-                }
-
-                let root_page = self.resolve_checkpoint_root(table_id).unwrap_or_else(|| {
-                    panic!(
-                        "Table ID does not have a root page: {table_id}, row_version: {:?}",
-                        self.get_current_row_version(write_set_index)
-                            .expect("row version should exist")
-                    )
-                });
-
-                tracing::debug!("WriteRow: resolved root page: root_page={root_page}");
-
-                // If a table was created, it now has a real root page allocated for it, but the 'root_page' field in the sqlite_schema record is still the table id.
-                // So we need to rewrite the row version to use the real root page.
-                if let Some(SpecialWrite::BTreeCreate {
-                    table_id,
-                    sqlite_schema_rowid,
-                }) = special_write
-                {
-                    let root_page = self
-                        .resolve_checkpoint_root(table_id)
-                        .expect("Table ID does not have a root page");
-                    let row_version = {
-                        let alloc = self.mvstore.allocator();
-                        let (row_version, _) = self
-                            .get_current_row_version_mut(write_set_index)
-                            .ok_or_else(|| {
-                                LimboError::InternalError(
-                                    "row version not found in write set".to_string(),
-                                )
-                            })?;
-                        let record = ImmutableRecordRef::from_bin_record(row_version.row.payload());
-
-                        let mut values = record.get_values_owned()?;
-                        values[3] = Value::from_i64(root_page as i64);
-                        let record = ImmutableRecord::from_values(&values, values.len())?;
-                        // Btree creation has already happened by this point; an injected fault
-                        // while publishing the sqlite_schema root page can leave retry state with
-                        // a durable btree and a stale rootpage=0 schema row.
-                        // TODO: make this rewrite resumable before re-enabling fault injection.
-                        row_version.row.data = Some(crate::without_allocation_faults!(
-                            crate::alloc::try_arc_slice_from_slice_in(record.get_payload(), alloc)?
-                        ));
-                        row_version.clone()
-                    };
-                    self.created_btrees
-                        .insert(sqlite_schema_rowid, (table_id, row_version));
-                } else if let Some(SpecialWrite::BTreeCreateIndex {
-                    index_id,
-                    sqlite_schema_rowid,
-                }) = special_write
-                {
-                    // Same for index btrees.
-                    let root_page = self
-                        .resolve_checkpoint_root(index_id)
-                        .expect("Index ID does not have a root page");
-                    let row_version = {
-                        let alloc = self.mvstore.allocator();
-                        let (row_version, _) = self
-                            .get_current_row_version_mut(write_set_index)
-                            .ok_or_else(|| {
-                                LimboError::InternalError(
-                                    "row version not found in write set".to_string(),
-                                )
-                            })?;
-                        let record = ImmutableRecordRef::from_bin_record(row_version.row.payload());
-                        let mut values = record.get_values_owned()?;
-                        values[3] = Value::from_i64(root_page as i64);
-                        let record = ImmutableRecord::from_values(&values, values.len())?;
-                        // Btree creation has already happened by this point; an injected fault
-                        // while publishing the sqlite_schema root page can leave retry state with
-                        // a durable btree and a stale rootpage=0 schema row.
-                        // TODO: make this rewrite resumable before re-enabling fault injection.
-                        row_version.row.data = Some(crate::without_allocation_faults!(
-                            crate::alloc::try_arc_slice_from_slice_in(record.get_payload(), alloc)?
-                        ));
-                        row_version.clone()
-                    };
-
-                    self.created_btrees
-                        .insert(sqlite_schema_rowid, (index_id, row_version));
-                }
-
-                // Get or create cursor for this table
-                let cursor = if let Some(cursor) = self.cursors.get(&root_page) {
+                let cursor = if let Some(cursor) = self.cursors.get(&known_root_page) {
                     cursor.clone()
                 } else {
-                    let cursor =
-                        BTreeCursor::new_table(self.pager.clone(), root_page as i64, num_columns);
+                    let cursor = BTreeCursor::new_table(
+                        self.pager.clone(),
+                        known_root_page as i64,
+                        num_columns,
+                    );
                     let cursor = Arc::new(RwLock::new(cursor));
                     self.cursors.insert(root_page, cursor.clone());
                     cursor
                 };
-
-                let (row_version, _) =
-                    self.get_current_row_version(write_set_index)
-                        .ok_or_else(|| {
-                            LimboError::InternalError(
-                                "row version not found in write set".to_string(),
-                            )
-                        })?;
-
-                // Check if this is an insert or delete
-                if row_version.end().is_some() {
-                    // This is a delete operation.
-                    // Don't write the deletion record to the b-tree if the b-tree was just created; we can no-op in this case,
-                    // since there is no existing row to delete.
-                    if self
-                        .created_btrees
-                        .values()
-                        .any(|(table_id, _)| *table_id == row_version.row.id.table_id)
-                    {
-                        self.state = CheckpointState::WriteRow {
-                            write_set_index: write_set_index + 1,
-                            requires_seek: true,
-                        };
-                        return Ok(TransitionResult::Continue);
-                    }
-                    let state_machine = self
-                        .mvstore
-                        .delete_row_from_pager(row_version.row.id.clone(), cursor)?;
-                    self.delete_row_state_machine = Some(state_machine);
-                    self.state = CheckpointState::DeleteRowStateMachine { write_set_index };
+                self.pager.io.block(|| cursor.write().btree_destroy())?;
+                // Evict stale cursor.
+                self.cursors.remove(&root_page);
+                self.destroyed_tables.insert(table_id);
+                self.freed_root_pages.insert(root_page as i64);
+                // Deferred destroy: retire the binding (set its `end` to the drop ts)
+                // but keep it, so a transaction still scanning this table at an older
+                // snapshot resolves the (read-mark-protected) root page. GC'd once
+                // `lwm` passes the drop. Defensively remove if the drop ts is unknown.
+                if let Some(drop_ts) = drop_ts {
+                    self.ckpt_rootmap_retire(table_id, drop_ts);
                 } else {
-                    // This is an insert/update operation
-                    let state_machine =
-                        self.mvstore
-                            .write_row_to_pager(&row_version.row, cursor, requires_seek)?;
-                    self.write_row_state_machine = Some(state_machine);
-                    self.state = CheckpointState::WriteRowStateMachine { write_set_index };
-                }
-
-                Ok(TransitionResult::Continue)
-            }
-
-            CheckpointState::WriteRowStateMachine { write_set_index } => {
-                let write_set_index = *write_set_index;
-                let write_row_state_machine =
-                    self.write_row_state_machine.as_mut().ok_or_else(|| {
-                        LimboError::InternalError(
-                            "write_row_state_machine not initialized".to_string(),
-                        )
-                    })?;
-
-                match write_row_state_machine.step(&())? {
-                    IOResult::IO(io) => Ok(TransitionResult::Io(io)),
-                    IOResult::Done(_) => {
-                        self.record_written_table_row(write_set_index);
-                        let requires_seek = self.next_requires_seek_after_insert(write_set_index);
-                        self.state = CheckpointState::WriteRow {
-                            write_set_index: write_set_index + 1,
-                            requires_seek,
-                        };
-                        Ok(TransitionResult::Continue)
-                    }
+                    self.ckpt_rootmap_remove(table_id);
                 }
             }
-
-            CheckpointState::DeleteRowStateMachine { write_set_index } => {
-                let write_set_index = *write_set_index;
-                let delete_row_state_machine =
-                    self.delete_row_state_machine.as_mut().ok_or_else(|| {
-                        LimboError::InternalError(
-                            "delete_row_state_machine not initialized".to_string(),
-                        )
-                    })?;
-
-                match delete_row_state_machine.step(&())? {
-                    IOResult::IO(io) => Ok(TransitionResult::Io(io)),
-                    IOResult::Done(_) => {
-                        self.record_written_table_row(write_set_index);
-                        self.state = CheckpointState::WriteRow {
-                            write_set_index: write_set_index + 1,
-                            requires_seek: true,
-                        };
-                        Ok(TransitionResult::Continue)
-                    }
-                }
+            SpecialWrite::BTreeCreateIndex { index_id, .. } => {
+                let created_root_page: u32 = self
+                    .pager
+                    .io
+                    .block(|| self.pager.btree_create(&CreateBTreeFlags::new_index()))?;
+                // Staged (see BTreeCreate); published in the post-commit window.
+                // Undo-logged: reverted if the checkpoint fails before commit.
+                self.ckpt_rootmap_alloc(index_id, created_root_page as u64);
+                self.staged_roots.push(index_id);
+                // Index struct should already be stored in index_id_to_index from collect_committed_versions
+                turso_assert!(
+                    self.index_id_to_index.contains_key(&index_id),
+                    "checkpoint index struct missing before BTreeCreateIndex",
+                    { "index_id": i64::from(index_id) }
+                );
             }
-
-            CheckpointState::WriteIndexRow {
-                index_write_set_index,
-                requires_seek,
+            SpecialWrite::BTreeDestroyIndex {
+                index_id,
+                root_page,
+                num_columns,
             } => {
-                let index_write_set_index = *index_write_set_index;
-                let requires_seek = *requires_seek;
+                let known_root_page = self
+                    .mvstore
+                    .current_root_page(&index_id)
+                    .expect("Index ID does not have a root page");
+                turso_assert_eq!(
+                    known_root_page,
+                    root_page,
+                    "checkpoint root page mismatch for BTreeDestroyIndex",
+                    { "known_root_page": known_root_page, "schema_root_page": root_page }
+                );
 
-                if index_write_set_index >= self.index_write_set.len() {
-                    // Done writing all index rows, compact sequence
-                    // backing tables, then commit.
-                    self.state = CheckpointState::CompactSequences;
-                    return Ok(TransitionResult::Continue);
-                }
-
-                let (index_id, row_version, is_delete) =
-                    &self.index_write_set[index_write_set_index];
-
-                // Skip destroyed indexes
-                if self.destroyed_indexes.contains(index_id) {
-                    self.state = CheckpointState::WriteIndexRow {
-                        index_write_set_index: index_write_set_index + 1,
-                        requires_seek: true,
-                    };
-                    return Ok(TransitionResult::Continue);
-                }
-
-                // The index is absent from the snapshot schema (index_id_to_index is built from
-                // local_schema at snapshot_ts). That means the index does not exist at the
-                // checkpoint snapshot — it was dropped — so its whole btree is (or will be)
-                // destroyed wholesale. DROP does not tombstone each in-memory index-entry
-                // version, so collect_index_rows still picks them up as live inserts/tombstones;
-                // materializing them into the (possibly reused) root page would corrupt. Skip
-                // every entry for a snapshot-absent index, mirroring the destroyed_indexes skip.
-                let Some(index) = self.index_id_to_index.get(index_id) else {
-                    self.state = CheckpointState::WriteIndexRow {
-                        index_write_set_index: index_write_set_index + 1,
-                        requires_seek: true,
-                    };
-                    return Ok(TransitionResult::Continue);
-                };
-
-                if *is_delete && !self.table_exists_for_snapshot(*index_id) {
-                    self.state = CheckpointState::WriteIndexRow {
-                        index_write_set_index: index_write_set_index + 1,
-                        requires_seek: true,
-                    };
-                    return Ok(TransitionResult::Continue);
-                }
-
-                // Get root page for this index
-                let root_page = self
-                    .resolve_checkpoint_root(*index_id)
-                    .unwrap_or_else(|| panic!("Index ID {index_id} does not have a root page"));
-
-                // Get or create cursor for this index
-                let cursor = if let Some(cursor) = self.cursors.get(&root_page) {
+                let cursor = if let Some(cursor) = self.cursors.get(&known_root_page) {
                     cursor.clone()
-                } else {
+                } else if let Some(index) = self.index_id_to_index.get(&index_id) {
                     let cursor = BTreeCursor::new_index(
                         self.pager.clone(),
-                        root_page as i64,
+                        known_root_page as i64,
                         index.as_ref(),
-                        index.columns.len(),
+                        num_columns,
                     )?;
                     let cursor = Arc::new(RwLock::new(cursor));
                     self.cursors.insert(root_page, cursor.clone());
                     cursor
+                } else {
+                    // DROP INDEX destroy path: schema may no longer contain the index definition.
+                    // We only need a cursor to destroy pages so num_columns is not important.
+                    Arc::new(RwLock::new(BTreeCursor::new_table(
+                        self.pager.clone(),
+                        known_root_page as i64,
+                        num_columns,
+                    )))
                 };
-
-                // Check if this is an insert or delete
-                if *is_delete {
-                    // This is a delete operation. Don't write the deletion record to the b-tree if the b-tree was just created; we can no-op in this case,
-                    // since there is no existing row to delete.
-                    if self
-                        .created_btrees
-                        .values()
-                        .any(|(table_id, _)| *table_id == row_version.row.id.table_id)
-                    {
-                        self.state = CheckpointState::WriteIndexRow {
-                            index_write_set_index: index_write_set_index + 1,
-                            requires_seek: true,
-                        };
-                        return Ok(TransitionResult::Continue);
-                    }
-                    let state_machine = self
-                        .mvstore
-                        .delete_row_from_pager(row_version.row.id.clone(), cursor)?;
-                    self.delete_row_state_machine = Some(state_machine);
-                    self.state = CheckpointState::DeleteIndexRowStateMachine {
-                        index_write_set_index,
-                    };
+                self.pager.io.block(|| cursor.write().btree_destroy())?;
+                // Evict stale cursor.
+                self.cursors.remove(&root_page);
+                self.destroyed_indexes.insert(index_id);
+                self.freed_root_pages.insert(root_page as i64);
+                // Deferred destroy: retire the binding (set its `end`) but keep it so
+                // a transaction still scanning this index at an older snapshot resolves
+                // the (read-mark-protected) root page. GC'd once `lwm` passes the drop.
+                if let Some(drop_ts) = drop_ts {
+                    self.ckpt_rootmap_retire(index_id, drop_ts);
                 } else {
-                    // This is an insert/update operation
-                    let state_machine =
-                        self.mvstore
-                            .write_row_to_pager(&row_version.row, cursor, requires_seek)?;
-                    self.write_row_state_machine = Some(state_machine);
-                    self.state = CheckpointState::WriteIndexRowStateMachine {
-                        index_write_set_index,
-                    };
+                    self.ckpt_rootmap_remove(index_id);
                 }
-
-                Ok(TransitionResult::Continue)
-            }
-
-            CheckpointState::WriteIndexRowStateMachine {
-                index_write_set_index,
-            } => {
-                let index_write_set_index = *index_write_set_index;
-                let write_row_state_machine =
-                    self.write_row_state_machine.as_mut().ok_or_else(|| {
-                        LimboError::InternalError(
-                            "write_row_state_machine not initialized".to_string(),
-                        )
-                    })?;
-
-                match write_row_state_machine.step(&())? {
-                    IOResult::IO(io) => Ok(TransitionResult::Io(io)),
-                    IOResult::Done(_) => {
-                        self.written_index_slots.insert(index_write_set_index);
-                        self.state = CheckpointState::WriteIndexRow {
-                            index_write_set_index: index_write_set_index + 1,
-                            requires_seek: true,
-                        };
-                        Ok(TransitionResult::Continue)
-                    }
-                }
-            }
-
-            CheckpointState::DeleteIndexRowStateMachine {
-                index_write_set_index,
-            } => {
-                let index_write_set_index = *index_write_set_index;
-                let delete_row_state_machine =
-                    self.delete_row_state_machine.as_mut().ok_or_else(|| {
-                        LimboError::InternalError(
-                            "delete_row_state_machine not initialized".to_string(),
-                        )
-                    })?;
-
-                match delete_row_state_machine.step(&())? {
-                    IOResult::IO(io) => Ok(TransitionResult::Io(io)),
-                    IOResult::Done(_) => {
-                        self.written_index_slots.insert(index_write_set_index);
-                        self.state = CheckpointState::WriteIndexRow {
-                            index_write_set_index: index_write_set_index + 1,
-                            requires_seek: true,
-                        };
-                        Ok(TransitionResult::Continue)
-                    }
-                }
-            }
-
-            CheckpointState::CompactSequences => {
-                if self.seq_compact.is_none() {
-                    let pending = self.pending_sequence_compactions()?;
-                    if pending.is_empty() {
-                        self.state = CheckpointState::CommitPagerTxn;
-                        return Ok(TransitionResult::Continue);
-                    }
-                    self.seq_compact = Some(SeqCompactDriver {
-                        pending,
-                        current_idx: 0,
-                        cursor: None,
-                        phase: SeqCompactPhase::SeekWatermark,
-                        watermark_key: None,
-                        pending_delete_rowid: None,
-                        pager: self.pager.clone(),
-                        mvstore: self.mvstore.clone(),
-                        passive: matches!(self.mode, CheckpointMode::Passive { .. }),
-                        compacted: crate::alloc::vec![],
-                    });
-                }
-                let driver = self.seq_compact.as_mut().expect("seq_compact set above");
-                match driver.step()? {
-                    IOResult::IO(io) => Ok(TransitionResult::Io(io)),
-                    IOResult::Done(()) => {
-                        // Passive recorded its deletes instead of applying them; carry them to the
-                        // clock-ordered publish window. Blocking applied them directly (empty).
-                        let driver = self.seq_compact.take().expect("seq_compact set above");
-                        self.pending_seq_deletes = driver.compacted;
-                        self.state = CheckpointState::CommitPagerTxn;
-                        Ok(TransitionResult::Continue)
-                    }
-                }
-            }
-            CheckpointState::CommitPagerTxn => {
-                inject_transition_yield!(self, CheckpointYieldPoint::BeforePagerCommit);
-                let passive = matches!(self.mode, CheckpointMode::Passive { .. });
-                let passive_auto_publish_retry = passive && !self.update_transaction_state;
-                // Passive: btree commit and publish run off the RW lock (drain bit only).
-                let lock_before_commit = !passive;
-                if lock_before_commit && !self.lock_states.blocking_checkpoint_lock_held {
-                    if !self.checkpoint_lock.write() {
-                        return Err(crate::LimboError::Busy);
-                    }
-                    self.lock_states.blocking_checkpoint_lock_held = true;
-                }
-                if !self.pager_commit_done {
-                    if !self.header_staged_for_commit {
-                        let mut checkpoint_header =
-                            *self.mvstore.global_header.read().as_ref().ok_or_else(|| {
-                                LimboError::InternalError(
-                                    "global_header not initialized during checkpoint".to_string(),
-                                )
-                            })?;
-                        checkpoint_header.schema_cookie =
-                            self.database.schema.lock().schema_version.into();
-                        let staged_header = self.pager.io.block(|| {
-                            self.pager.with_header_mut(|header| {
-                                // Keep pager-maintained fields (for example database_size/change_counter)
-                                // intact, and apply only MVCC header mutations that are authored via
-                                // SetCookie/PRAGMA paths.
-                                header.schema_cookie = checkpoint_header.schema_cookie;
-                                header.user_version = checkpoint_header.user_version;
-                                header.application_id = checkpoint_header.application_id;
-                                header.vacuum_mode_largest_root_page =
-                                    checkpoint_header.vacuum_mode_largest_root_page;
-                                header.incremental_vacuum_enabled =
-                                    checkpoint_header.incremental_vacuum_enabled;
-                                *header
-                            })
-                        })?;
-                        self.staged_checkpoint_header = Some(staged_header);
-                        self.header_staged_for_commit = true;
-                    }
-                    // On commit_tx failure the `?` rolls back the pager txn; durable_txid_max and
-                    // the log offset stay put, so a retry re-stages from the previous boundary.
-                    tracing::debug!("Committing pager transaction");
-                    match self.pager.commit_tx(
-                        &self.connection,
-                        self.sync_mode,
-                        self.update_transaction_state,
-                    )? {
-                        IOResult::Done(_) => {
-                            self.pager_commit_done = true;
-                        }
-                        IOResult::IO(io) => return Ok(TransitionResult::Io(io)),
-                    }
-                }
-                inject_transition_yield!(self, CheckpointYieldPoint::BeforePublishWindow);
-                if passive {
-                    if !self.mvstore.try_begin_passive_publish_window() {
-                        if passive_auto_publish_retry {
-                            tracing::debug!(
-                                "passive checkpoint publish contended; yielding for retry"
-                            );
-                            return Ok(TransitionResult::Io(
-                                IOCompletions(Completion::new_yield()),
-                            ));
-                        }
-                        return Err(crate::LimboError::Busy);
-                    }
-                    let materialized_at = WalPos::from_pair(self.pager.wal_pos());
-                    self.apply_passive_publish_window_ordered(materialized_at)?;
-                } else if !self.lock_states.blocking_checkpoint_lock_held {
-                    if !self.checkpoint_lock.write() {
-                        return Err(crate::LimboError::Busy);
-                    }
-                    self.lock_states.blocking_checkpoint_lock_held = true;
-                    let materialized_at = WalPos::from_pair(self.pager.wal_pos());
-                    // Blocking holds the lock: SeqCompact applied its deletes+purge directly under
-                    // the contract, so there are no recorded passive deletes to publish (None).
-                    self.apply_checkpoint_publish_window(materialized_at, None)?;
-                } else {
-                    let materialized_at = WalPos::from_pair(self.pager.wal_pos());
-                    self.apply_checkpoint_publish_window(materialized_at, None)?;
-                }
-                inject_transition_failure!(
-                    self,
-                    CheckpointYieldPoint::AfterDurableBoundaryAdvanced
-                );
-                inject_transition_yield!(self, CheckpointYieldPoint::AfterDurableBoundaryAdvanced);
-                Ok(TransitionResult::Continue)
-            }
-
-            CheckpointState::TruncateLogicalLog => {
-                tracing::debug!("Truncating logical log file");
-                let c = self.truncate_logical_log()?;
-                self.state = CheckpointState::FsyncLogicalLog;
-                // if Completion Completed without errors we can continue
-                if c.succeeded() {
-                    if self.mode.should_restart_log() {
-                        turso_assert!(
-                            self.mvstore.storage.logical_log_offset() == 0,
-                            "TRUNCATE checkpoint must reset logical log offset to 0"
-                        );
-                        turso_assert!(
-                            self.mvstore
-                                .get_logical_log_file()
-                                .size()
-                                .expect("logical log file size should be readable after truncate")
-                                == 0,
-                            "TRUNCATE checkpoint must zero the logical log file"
-                        );
-                    }
-                    Ok(TransitionResult::Continue)
-                } else {
-                    Ok(TransitionResult::Io(IOCompletions(c)))
-                }
-            }
-
-            CheckpointState::FsyncLogicalLog => {
-                // Skip fsync when synchronous mode is off
-                if self.sync_mode == SyncMode::Off {
-                    tracing::debug!("Skipping fsync of logical log file (synchronous=off)");
-                    self.state = CheckpointState::TruncateWal;
-                    return Ok(TransitionResult::Continue);
-                }
-                tracing::debug!("Fsyncing logical log file");
-                let c = self.fsync_logical_log()?;
-                self.state = CheckpointState::TruncateWal;
-                // if Completion Completed without errors we can continue
-                if c.succeeded() {
-                    Ok(TransitionResult::Continue)
-                } else {
-                    Ok(TransitionResult::Io(IOCompletions(c)))
-                }
-            }
-
-            CheckpointState::CheckpointWal => {
-                tracing::debug!("Performing checkpoint on WAL");
-                match self.checkpoint_wal() {
-                    Ok(IOResult::Done(result)) => {
-                        self.checkpoint_result = Some(result);
-                        self.state = CheckpointState::SyncDbFile;
-                        Ok(TransitionResult::Continue)
-                    }
-                    Ok(IOResult::IO(io)) => Ok(TransitionResult::Io(io)),
-                    // Busy under a DbFile reader: finish without publishing nbackfills.
-                    Err(err)
-                        if matches!(*err, crate::LimboError::Busy)
-                            && matches!(self.mode, CheckpointMode::Passive { .. }) =>
-                    {
-                        tracing::debug!(
-                            "Passive WAL checkpoint Busy under pinned DbFile reader; continuing without backfill"
-                        );
-                        let (max_frame, nbackfills) = self
-                            .pager
-                            .wal
-                            .as_ref()
-                            .map(|wal| (wal.get_max_frame_in_wal(), wal.backfill_frame()))
-                            .unwrap_or((0, 0));
-                        self.checkpoint_result =
-                            Some(CheckpointResult::new(max_frame, nbackfills, 0));
-                        self.state = CheckpointState::TruncateLogicalLog;
-                        Ok(TransitionResult::Continue)
-                    }
-                    Err(e) => Err(*e),
-                }
-            }
-
-            CheckpointState::SyncDbFile => {
-                // Fsync DB before WAL truncate / publish_backfill (pager PublishBackfill order).
-                // Crash after truncate but before fsync would lose checkpointed data.
-                if self.sync_mode == SyncMode::Off {
-                    tracing::debug!("Skipping fsync of database file (synchronous=off)");
-                    self.publish_wal_backfill_if_needed();
-                    self.state = CheckpointState::TruncateLogicalLog;
-                    return Ok(TransitionResult::Continue);
-                }
-
-                let checkpoint_result = self
-                    .checkpoint_result
-                    .as_mut()
-                    .expect("checkpoint_result should be set");
-
-                // Only sync if we actually backfilled any frames
-                if checkpoint_result.wal_checkpoint_backfilled == 0 {
-                    self.state = CheckpointState::TruncateLogicalLog;
-                    return Ok(TransitionResult::Continue);
-                }
-
-                // Check if we already sent the sync
-                if checkpoint_result.db_sync_sent {
-                    self.publish_wal_backfill_if_needed();
-                    self.state = CheckpointState::TruncateLogicalLog;
-                    return Ok(TransitionResult::Continue);
-                }
-
-                tracing::debug!("Fsyncing database file before WAL truncation");
-                let c = self
-                    .pager
-                    .db_file
-                    .sync(Completion::new_sync(|_| {}), self.pager.get_sync_type())?;
-                checkpoint_result.db_sync_sent = true;
-                Ok(TransitionResult::Io(IOCompletions(c)))
-            }
-
-            CheckpointState::TruncateWal => {
-                if self.mode.should_restart_log() {
-                    // Truncate/Restart renumbers WAL frames — only safe stop-the-world. Acquire
-                    // the lock if the blocking path didn't already. Passive never restarts the
-                    // log, so it skips this branch and stays lock-free.
-                    if !self.lock_states.blocking_checkpoint_lock_held {
-                        if !self.checkpoint_lock.write() {
-                            return Err(crate::LimboError::Busy);
-                        }
-                        self.lock_states.blocking_checkpoint_lock_held = true;
-                    }
-                    // Zero the WAL file explicitly: MVCC calls wal.checkpoint() directly,
-                    // bypassing the pager's TruncateWalFile. Resumable on IO until Done.
-                    let Some(wal) = &self.pager.wal else {
-                        panic!("No WAL to truncate");
-                    };
-                    let checkpoint_result = self
-                        .checkpoint_result
-                        .as_mut()
-                        .expect("checkpoint_result should be set");
-                    if let IOResult::IO(io) =
-                        wal.truncate_wal(checkpoint_result, self.pager.get_sync_type())?
-                    {
-                        return Ok(TransitionResult::Io(io));
-                    }
-                }
-                // Passive leaves the WAL non-empty; the logical log is already truncated, so
-                // recovery sees NoLog + committed WAL — the normal passive steady state.
-                // Scope to THIS checkpoint's own staged work: a no-op (nothing-to-write) pass
-                // staged nothing, and a real publish drains both. A global schema scan would
-                // false-trip on owned-negative leftovers from an earlier checkpoint that mapped
-                // a root positive but couldn't patch the (not-yet-adopted) live schema — benign,
-                // since cursors resolve negative->positive via table_id_to_rootpage.
-                turso_assert!(
-                    self.created_btrees.is_empty() && self.staged_roots.is_empty(),
-                    "checkpoint finalized with un-published staged schema roots"
-                );
-                self.mvstore
-                    .durable_txid_max
-                    .store(self.durable_txid_max_new, Ordering::SeqCst);
-                // Publish the WAL backfill boundary as the passive checkpoint GC floor: a version
-                // materialized at or below it is durable in the DB file, hence reachable by
-                // every snapshot. Un-backfilled ones stay retained for low-frame readers.
-                let (seq, _) = self.pager.wal_pos();
-                let backfill =
-                    WalPos::from_pair((seq, self.pager.wal_backfill_frame().unwrap_or(0)));
-                *self.mvstore.backfill_floor.write() = backfill;
-                let lwm = self.mvstore.sample_gc_lwm();
-                // Reclaim retired root-page bindings no transaction can still see (end <= lwm).
-                self.mvstore.gc_rootpage_entries(lwm);
-                self.state = CheckpointState::GcTableRows { next_index: 0, lwm };
-                Ok(TransitionResult::Continue)
-            }
-
-            CheckpointState::GcTableRows { .. } => {
-                if let Some(io) = self.gc_checkpointed_table_versions() {
-                    return Ok(TransitionResult::Io(io));
-                }
-                let CheckpointState::GcTableRows { lwm, .. } = self.state else {
-                    unreachable!("state is GcTableRows here");
-                };
-                self.state = CheckpointState::GcIndexRows { next_index: 0, lwm };
-                Ok(TransitionResult::Continue)
-            }
-
-            CheckpointState::GcIndexRows { .. } => {
-                if let Some(io) = self.gc_checkpointed_index_versions() {
-                    return Ok(TransitionResult::Io(io));
-                }
-                self.state = CheckpointState::Finalize;
-                Ok(TransitionResult::Continue)
-            }
-
-            CheckpointState::Finalize => {
-                if self.lock_states.blocking_checkpoint_lock_held {
-                    // Truncate: under the blocking lock, drop last SkipMap copies and empty slots.
-                    // That lock waits out open MVCC txs, so no old reader can see a later rewrite.
-                    self.mvstore.drop_unused_row_versions_and_slots();
-                } else {
-                    // Passive: drop superseded history and empty slots. Rule 3 also
-                    // drops last currents when idle (`lwm == MAX`); with open
-                    // snapshots those stay in the SkipMap. Use the pager reader
-                    // mark so we don't GC versions a brand-new reader still needs
-                    // before its MVCC tx is registered.
-                    self.mvstore
-                        .drop_unused_row_versions_unlink_empty_at(self.gc_floor_reader_mark());
-                }
-                // Locks stay held until `step()` runs `on_checkpoint_end`, then
-                // `release_checkpoint_locks_if_needed`.
-                self.finalize(&())?;
-                Ok(TransitionResult::Done(
-                    self.checkpoint_result.take().ok_or_else(|| {
-                        LimboError::InternalError("checkpoint_result not set".to_string())
-                    })?,
-                ))
             }
         }
+        Ok(())
     }
+
+    /// Rewrites the root page in the sqlite_schema row of a B-tree that
+    /// this checkpoint created, and remembers the row for publication.
+    fn rewrite_created_root_page(
+        &mut self,
+        write_set_index: usize,
+        table_id: MVTableId,
+        sqlite_schema_rowid: i64,
+    ) -> Result<()> {
+        let root_page = self
+            .resolve_checkpoint_root(table_id)
+            .expect("Table ID does not have a root page");
+        let row_version = {
+            let alloc = self.mvstore.allocator();
+            let (row_version, _) = self
+                .get_current_row_version_mut(write_set_index)
+                .ok_or_else(|| {
+                    LimboError::InternalError("row version not found in write set".to_string())
+                })?;
+            let record = ImmutableRecordRef::from_bin_record(row_version.row.payload());
+
+            let mut values = record.get_values_owned()?;
+            values[3] = Value::from_i64(root_page as i64);
+            let record = ImmutableRecord::from_values(&values, values.len())?;
+            // Btree creation has already happened by this point; an injected fault
+            // while publishing the sqlite_schema root page can leave retry state with
+            // a durable btree and a stale rootpage=0 schema row.
+            // TODO: make this rewrite resumable before re-enabling fault injection.
+            row_version.row.data = Some(crate::without_allocation_faults!(
+                crate::alloc::try_arc_slice_from_slice_in(record.get_payload(), alloc)?
+            ));
+            row_version.clone()
+        };
+        self.created_btrees
+            .insert(sqlite_schema_rowid, (table_id, row_version));
+        Ok(())
+    }
+
+    /// Prepares the write of the index row at `index_write_set_index`:
+    /// skips rows of dropped indexes and picks the cursor.
+    fn prepare_index_row_write(&mut self, index_write_set_index: usize) -> Result<RowWrite> {
+        if index_write_set_index >= self.index_write_set.len() {
+            return Ok(RowWrite::Done);
+        }
+
+        let (index_id, row_version, is_delete) = &self.index_write_set[index_write_set_index];
+
+        // Skip destroyed indexes
+        if self.destroyed_indexes.contains(index_id) {
+            return Ok(RowWrite::Skip);
+        }
+
+        // The index is absent from the snapshot schema (index_id_to_index is built from
+        // local_schema at snapshot_ts). That means the index does not exist at the
+        // checkpoint snapshot — it was dropped — so its whole btree is (or will be)
+        // destroyed wholesale. DROP does not tombstone each in-memory index-entry
+        // version, so collect_index_rows still picks them up as live inserts/tombstones;
+        // materializing them into the (possibly reused) root page would corrupt. Skip
+        // every entry for a snapshot-absent index, mirroring the destroyed_indexes skip.
+        let Some(index) = self.index_id_to_index.get(index_id) else {
+            return Ok(RowWrite::Skip);
+        };
+
+        if *is_delete && !self.table_exists_for_snapshot(*index_id) {
+            return Ok(RowWrite::Skip);
+        }
+
+        // Get root page for this index
+        let root_page = self
+            .resolve_checkpoint_root(*index_id)
+            .unwrap_or_else(|| panic!("Index ID {index_id} does not have a root page"));
+
+        // Get or create cursor for this index
+        let cursor = if let Some(cursor) = self.cursors.get(&root_page) {
+            cursor.clone()
+        } else {
+            let cursor = BTreeCursor::new_index(
+                self.pager.clone(),
+                root_page as i64,
+                index.as_ref(),
+                index.columns.len(),
+            )?;
+            let cursor = Arc::new(RwLock::new(cursor));
+            self.cursors.insert(root_page, cursor.clone());
+            cursor
+        };
+
+        if *is_delete {
+            // This is a delete operation. Don't write the deletion record to the b-tree if the b-tree was just created; we can no-op in this case,
+            // since there is no existing row to delete.
+            if self
+                .created_btrees
+                .values()
+                .any(|(table_id, _)| *table_id == row_version.row.id.table_id)
+            {
+                return Ok(RowWrite::Skip);
+            }
+            Ok(RowWrite::Delete {
+                rowid: row_version.row.id.clone(),
+                cursor,
+            })
+        } else {
+            Ok(RowWrite::Insert {
+                row: row_version.row.clone(),
+                cursor,
+            })
+        }
+    }
+
+    /// Runs one step of the sequence compaction. Returns true when there was
+    /// nothing to compact.
+    fn compact_sequences_step(&mut self) -> IOResultOr<()> {
+        if self.seq_compact.is_none() {
+            let pending = self.pending_sequence_compactions()?;
+            if pending.is_empty() {
+                return Ok(IOResult::Done(()));
+            }
+            self.seq_compact = Some(SeqCompactDriver {
+                pending,
+                current_idx: 0,
+                cursor: None,
+                phase: SeqCompactPhase::SeekWatermark,
+                watermark_key: None,
+                pending_delete_rowid: None,
+                pager: self.pager.clone(),
+                mvstore: self.mvstore.clone(),
+                passive: matches!(self.mode, CheckpointMode::Passive { .. }),
+                compacted: crate::alloc::vec![],
+            });
+        }
+        let driver = self.seq_compact.as_mut().expect("seq_compact set above");
+        return_if_io!(driver.step());
+        // Passive recorded its deletes instead of applying them; carry them to the
+        // clock-ordered publish window. Blocking applied them directly (empty).
+        let driver = self.seq_compact.take().expect("seq_compact set above");
+        self.pending_seq_deletes = driver.compacted;
+        Ok(IOResult::Done(()))
+    }
+
+    fn lock_before_pager_commit(&mut self) -> Result<()> {
+        let passive = matches!(self.mode, CheckpointMode::Passive { .. });
+        // Passive: btree commit and publish run off the RW lock (drain bit only).
+        let lock_before_commit = !passive;
+        if lock_before_commit && !self.lock_states.blocking_checkpoint_lock_held {
+            if !self.checkpoint_lock.write() {
+                return Err(crate::LimboError::Busy);
+            }
+            self.lock_states.blocking_checkpoint_lock_held = true;
+        }
+        Ok(())
+    }
+
+    /// Stages the header into page 1, then commits the pager transaction.
+    /// A retry after an I/O yield resumes the commit without restaging.
+    fn commit_pager_txn_step(&mut self) -> IOResultOr<()> {
+        if self.pager_commit_done {
+            return Ok(IOResult::Done(()));
+        }
+        if !self.header_staged_for_commit {
+            let mut checkpoint_header =
+                *self.mvstore.global_header.read().as_ref().ok_or_else(|| {
+                    LimboError::InternalError(
+                        "global_header not initialized during checkpoint".to_string(),
+                    )
+                })?;
+            checkpoint_header.schema_cookie = self.database.schema.lock().schema_version.into();
+            let staged_header = self.pager.io.block(|| {
+                self.pager.with_header_mut(|header| {
+                    // Keep pager-maintained fields (for example database_size/change_counter)
+                    // intact, and apply only MVCC header mutations that are authored via
+                    // SetCookie/PRAGMA paths.
+                    header.schema_cookie = checkpoint_header.schema_cookie;
+                    header.user_version = checkpoint_header.user_version;
+                    header.application_id = checkpoint_header.application_id;
+                    header.vacuum_mode_largest_root_page =
+                        checkpoint_header.vacuum_mode_largest_root_page;
+                    header.incremental_vacuum_enabled =
+                        checkpoint_header.incremental_vacuum_enabled;
+                    *header
+                })
+            })?;
+            self.staged_checkpoint_header = Some(staged_header);
+            self.header_staged_for_commit = true;
+        }
+        // On commit_tx failure the `?` rolls back the pager txn; durable_txid_max and
+        // the log offset stay put, so a retry re-stages from the previous boundary.
+        tracing::debug!("Committing pager transaction");
+        return_if_io!(self.pager.commit_tx(
+            &self.connection,
+            self.sync_mode,
+            self.update_transaction_state,
+        ));
+        self.pager_commit_done = true;
+        Ok(IOResult::Done(()))
+    }
+
+    /// Publishes the committed pages to readers. A passive auto-checkpoint
+    /// yields and retries when the publish window is busy.
+    fn publish_step(&mut self) -> IOResultOr<()> {
+        let passive = matches!(self.mode, CheckpointMode::Passive { .. });
+        let passive_auto_publish_retry = passive && !self.update_transaction_state;
+        if passive {
+            if !self.mvstore.try_begin_passive_publish_window() {
+                if passive_auto_publish_retry {
+                    tracing::debug!("passive checkpoint publish contended; yielding for retry");
+                    return Ok(IOResult::IO(IOCompletions(Completion::new_yield())));
+                }
+                return Err(crate::LimboError::Busy.into());
+            }
+            let materialized_at = WalPos::from_pair(self.pager.wal_pos());
+            self.apply_passive_publish_window_ordered(materialized_at)?;
+        } else if !self.lock_states.blocking_checkpoint_lock_held {
+            if !self.checkpoint_lock.write() {
+                return Err(crate::LimboError::Busy.into());
+            }
+            self.lock_states.blocking_checkpoint_lock_held = true;
+            let materialized_at = WalPos::from_pair(self.pager.wal_pos());
+            // Blocking holds the lock: SeqCompact applied its deletes+purge directly under
+            // the contract, so there are no recorded passive deletes to publish (None).
+            self.apply_checkpoint_publish_window(materialized_at, None)?;
+        } else {
+            let materialized_at = WalPos::from_pair(self.pager.wal_pos());
+            self.apply_checkpoint_publish_window(materialized_at, None)?;
+        }
+        Ok(IOResult::Done(()))
+    }
+
+    /// Checkpoints the WAL into the database file. Returns whether the DB
+    /// file must be synced before the logical log is truncated.
+    fn checkpoint_wal_step(&mut self) -> IOResultOr<bool> {
+        tracing::debug!("Performing checkpoint on WAL");
+        match self.checkpoint_wal() {
+            Ok(IOResult::Done(result)) => {
+                self.checkpoint_result = Some(result);
+                Ok(IOResult::Done(true))
+            }
+            Ok(IOResult::IO(io)) => Ok(IOResult::IO(io)),
+            // Busy under a DbFile reader: finish without publishing nbackfills.
+            Err(err)
+                if matches!(*err, crate::LimboError::Busy)
+                    && matches!(self.mode, CheckpointMode::Passive { .. }) =>
+            {
+                tracing::debug!(
+                    "Passive WAL checkpoint Busy under pinned DbFile reader; continuing without backfill"
+                );
+                let (max_frame, nbackfills) = self
+                    .pager
+                    .wal
+                    .as_ref()
+                    .map(|wal| (wal.get_max_frame_in_wal(), wal.backfill_frame()))
+                    .unwrap_or((0, 0));
+                self.checkpoint_result = Some(CheckpointResult::new(max_frame, nbackfills, 0));
+                Ok(IOResult::Done(false))
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Syncs the database file after a backfill. Issues the sync once and
+    /// yields on it; a retry after the yield only publishes the backfill.
+    fn sync_db_file_step(&mut self) -> IOResultOr<()> {
+        // Fsync DB before WAL truncate / publish_backfill (pager PublishBackfill order).
+        // Crash after truncate but before fsync would lose checkpointed data.
+        if self.sync_mode == SyncMode::Off {
+            tracing::debug!("Skipping fsync of database file (synchronous=off)");
+            self.publish_wal_backfill_if_needed();
+            return Ok(IOResult::Done(()));
+        }
+
+        let checkpoint_result = self
+            .checkpoint_result
+            .as_mut()
+            .expect("checkpoint_result should be set");
+
+        // Only sync if we actually backfilled any frames
+        if checkpoint_result.wal_checkpoint_backfilled == 0 {
+            return Ok(IOResult::Done(()));
+        }
+
+        // Check if we already sent the sync
+        if checkpoint_result.db_sync_sent {
+            self.publish_wal_backfill_if_needed();
+            return Ok(IOResult::Done(()));
+        }
+
+        tracing::debug!("Fsyncing database file before WAL truncation");
+        let c = self
+            .pager
+            .db_file
+            .sync(Completion::new_sync(|_| {}), self.pager.get_sync_type())?;
+        checkpoint_result.db_sync_sent = true;
+        Ok(IOResult::IO(IOCompletions(c)))
+    }
+
+    fn truncate_logical_log_step(&mut self) -> Result<Completion> {
+        tracing::debug!("Truncating logical log file");
+        let c = self.truncate_logical_log()?;
+        self.state = CheckpointState::FsyncLogicalLog;
+        Ok(c)
+    }
+
+    fn check_logical_log_truncated(&self) {
+        if self.mode.should_restart_log() {
+            turso_assert!(
+                self.mvstore.storage.logical_log_offset() == 0,
+                "TRUNCATE checkpoint must reset logical log offset to 0"
+            );
+            turso_assert!(
+                self.mvstore
+                    .get_logical_log_file()
+                    .size()
+                    .expect("logical log file size should be readable after truncate")
+                    == 0,
+                "TRUNCATE checkpoint must zero the logical log file"
+            );
+        }
+    }
+
+    /// Issues the fsync of the logical log. `None` when the sync mode skips it.
+    fn fsync_logical_log_step(&mut self) -> Result<Option<Completion>> {
+        if self.sync_mode == SyncMode::Off {
+            tracing::debug!("Skipping fsync of logical log file (synchronous=off)");
+            self.state = CheckpointState::TruncateWal;
+            return Ok(None);
+        }
+        tracing::debug!("Fsyncing logical log file");
+        let c = self.fsync_logical_log()?;
+        self.state = CheckpointState::TruncateWal;
+        Ok(Some(c))
+    }
+
+    /// Truncates the WAL when the mode restarts the log, then publishes the
+    /// durable boundary. Returns the low water mark for the GC passes.
+    fn truncate_wal_step(&mut self) -> IOResultOr<u64> {
+        if self.mode.should_restart_log() {
+            // Truncate/Restart renumbers WAL frames — only safe stop-the-world. Acquire
+            // the lock if the blocking path didn't already. Passive never restarts the
+            // log, so it skips this branch and stays lock-free.
+            if !self.lock_states.blocking_checkpoint_lock_held {
+                if !self.checkpoint_lock.write() {
+                    return Err(crate::LimboError::Busy.into());
+                }
+                self.lock_states.blocking_checkpoint_lock_held = true;
+            }
+            // Zero the WAL file explicitly: MVCC calls wal.checkpoint() directly,
+            // bypassing the pager's TruncateWalFile. Resumable on IO until Done.
+            let Some(wal) = &self.pager.wal else {
+                panic!("No WAL to truncate");
+            };
+            let checkpoint_result = self
+                .checkpoint_result
+                .as_mut()
+                .expect("checkpoint_result should be set");
+            return_if_io!(wal.truncate_wal(checkpoint_result, self.pager.get_sync_type()));
+        }
+        // Passive leaves the WAL non-empty; the logical log is already truncated, so
+        // recovery sees NoLog + committed WAL — the normal passive steady state.
+        // Scope to THIS checkpoint's own staged work: a no-op (nothing-to-write) pass
+        // staged nothing, and a real publish drains both. A global schema scan would
+        // false-trip on owned-negative leftovers from an earlier checkpoint that mapped
+        // a root positive but couldn't patch the (not-yet-adopted) live schema — benign,
+        // since cursors resolve negative->positive via table_id_to_rootpage.
+        turso_assert!(
+            self.created_btrees.is_empty() && self.staged_roots.is_empty(),
+            "checkpoint finalized with un-published staged schema roots"
+        );
+        self.mvstore
+            .durable_txid_max
+            .store(self.durable_txid_max_new, Ordering::SeqCst);
+        // Publish the WAL backfill boundary as the passive checkpoint GC floor: a version
+        // materialized at or below it is durable in the DB file, hence reachable by
+        // every snapshot. Un-backfilled ones stay retained for low-frame readers.
+        let (seq, _) = self.pager.wal_pos();
+        let backfill = WalPos::from_pair((seq, self.pager.wal_backfill_frame().unwrap_or(0)));
+        *self.mvstore.backfill_floor.write() = backfill;
+        let lwm = self.mvstore.sample_gc_lwm();
+        // Reclaim retired root-page bindings no transaction can still see (end <= lwm).
+        self.mvstore.gc_rootpage_entries(lwm);
+        Ok(IOResult::Done(lwm))
+    }
+
+    /// Drops the row versions that no reader needs, and takes the result.
+    fn finish_checkpoint(&mut self) -> Result<CheckpointResult> {
+        if self.lock_states.blocking_checkpoint_lock_held {
+            // Truncate: under the blocking lock, drop last SkipMap copies and empty slots.
+            // That lock waits out open MVCC txs, so no old reader can see a later rewrite.
+            self.mvstore.drop_unused_row_versions_and_slots();
+        } else {
+            // Passive: drop superseded history and empty slots. Rule 3 also
+            // drops last currents when idle (`lwm == MAX`); with open
+            // snapshots those stay in the SkipMap. Use the pager reader
+            // mark so we don't GC versions a brand-new reader still needs
+            // before its MVCC tx is registered.
+            self.mvstore
+                .drop_unused_row_versions_unlink_empty_at(self.gc_floor_reader_mark());
+        }
+        // Locks stay held until `step()` runs `on_checkpoint_end`, then
+        // `release_checkpoint_locks_if_needed`.
+        self.checkpoint_result
+            .take()
+            .ok_or_else(|| LimboError::InternalError("checkpoint_result not set".to_string()))
+    }
+
+    /// The completion of an injected yield at `point`, when the yield
+    /// injector of the connection asks for one.
+    #[cfg(any(test, injected_yields))]
+    fn injected_yield(&self, point: CheckpointYieldPoint) -> Option<IOCompletions> {
+        let yield_context = self.yield_context();
+        match crate::mvcc::yield_hooks::maybe_inject_transition_yield::<(), _>(
+            yield_context.injector.as_ref(),
+            yield_context.instance_id,
+            yield_context.selection_key,
+            point,
+        ) {
+            Some(TransitionResult::Io(io)) => Some(io),
+            _ => None,
+        }
+    }
+
+    /// The error of an injected failure at `point`, when the failure
+    /// injector of the connection asks for one.
+    #[cfg(any(test, injected_yields))]
+    fn injected_failure(&self, point: CheckpointYieldPoint) -> Option<LimboError> {
+        let yield_context = self.yield_context();
+        crate::mvcc::yield_hooks::maybe_inject_transition_failure(
+            yield_context.failure_injector.as_ref(),
+            yield_context.instance_id,
+            yield_context.selection_key,
+            point,
+        )
+    }
+}
+
+/// What the checkpoint does with one row of a write set.
+enum RowWrite {
+    /// No row is left.
+    Done,
+    /// The row needs no write in this checkpoint.
+    Skip,
+    Delete {
+        rowid: RowID,
+        cursor: Arc<RwLock<BTreeCursor>>,
+    },
+    Insert {
+        row: Row,
+        cursor: Arc<RwLock<BTreeCursor>>,
+    },
 }
 
 impl<Clock: LogicalClock, A: ConcurrentAllocator> StateTransition
@@ -3069,23 +2833,37 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> StateTransition
     type Context = ();
     type SMResult = CheckpointResult;
 
+    /// Runs the checkpoint until the next phase boundary (`Continue`), the
+    /// next I/O yield, or the end.
     fn step(&mut self, _context: &Self::Context) -> Result<TransitionResult<Self::SMResult>> {
-        let res = self.step_inner(&());
-        match res {
-            Err(ref err) => {
+        let mut op = self.op.take().unwrap_or_else(|| {
+            Runner::boxed(|co, ()| with_handle(co, (), async |co, ()| run_checkpoint(co).await))
+        });
+        let mut ctx = CheckpointCtx {
+            sm: self,
+            io: None,
+            err: None,
+            phase_boundary: false,
+        };
+        let result = op.resume(&mut ctx, ());
+        let phase_boundary = ctx.phase_boundary;
+        self.op = Some(op);
+        match result {
+            Err(err) => {
                 tracing::debug!("Error in checkpoint state machine: {err}");
                 // cleanup already calls on_checkpoint_end + unlock
-                self.cleanup_after_external_io_error(err.clone())?;
-                res
+                self.cleanup_after_external_io_error((*err).clone())?;
+                Err(*err)
             }
-            Ok(TransitionResult::Done(ref result)) => {
+            Ok(IOResult::Done(result)) => {
                 // End hook before unlock so storage cannot race the next writer/checkpoint.
-                let end = self.mvstore.storage.on_checkpoint_end(Ok(result));
+                let end = self.mvstore.storage.on_checkpoint_end(Ok(&result));
                 self.release_checkpoint_locks_if_needed();
                 end?;
-                res
+                Ok(TransitionResult::Done(result))
             }
-            Ok(result) => Ok(result),
+            Ok(IOResult::IO(_)) if phase_boundary => Ok(TransitionResult::Continue),
+            Ok(IOResult::IO(io)) => Ok(TransitionResult::Io(io)),
         }
     }
 
@@ -3096,6 +2874,278 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> StateTransition
     fn is_finalized(&self) -> bool {
         matches!(self.state, CheckpointState::Finalize)
     }
+}
+
+/// Names [`CheckpointCtx`] as the context type of the checkpoint operation.
+struct CheckpointStep<Clock, A>(PhantomData<fn() -> (Clock, A)>);
+
+impl<Clock: LogicalClock, A: ConcurrentAllocator> StepContext for CheckpointStep<Clock, A> {
+    type Error = Box<LimboError>;
+    type Ctx<'a> = CheckpointCtx<'a, Clock, A>;
+}
+
+/// The context of one step of the checkpoint. The async function gets it
+/// back on every step, so it never keeps a reference across a yield.
+struct CheckpointCtx<'a, Clock: LogicalClock, A: ConcurrentAllocator> {
+    sm: &'a mut CheckpointStateMachine<Clock, A>,
+    io: Option<IOCompletions>,
+    err: Option<Box<LimboError>>,
+    /// Set when the yield of this step marks a phase boundary, not an I/O.
+    phase_boundary: bool,
+}
+
+impl<Clock: LogicalClock, A: ConcurrentAllocator> YieldSlot<Box<LimboError>>
+    for CheckpointCtx<'_, Clock, A>
+{
+    fn park_io(&mut self, io: IOCompletions) {
+        self.io = Some(io);
+    }
+
+    fn take_io(&mut self) -> Option<IOCompletions> {
+        self.io.take()
+    }
+
+    fn park_err(&mut self, err: Box<LimboError>) {
+        self.err = Some(err);
+    }
+
+    fn take_err(&mut self) -> Option<Box<LimboError>> {
+        self.err.take()
+    }
+}
+
+type CheckpointRunner<Clock, A> = BoxedResumable<CheckpointStep<Clock, A>, (), CheckpointResult>;
+
+/// Yields to the caller when the yield injector of the connection asks for
+/// a yield at `point`.
+macro_rules! inject_checkpoint_yield {
+    ($co:expr, $point:expr) => {{
+        #[cfg(any(test, injected_yields))]
+        if let Some(io) = $co.with(|ctx| ctx.sm.injected_yield($point)) {
+            $co.yield_io(io).await;
+        }
+    }};
+}
+
+/// Fails the checkpoint when the failure injector of the connection asks
+/// for a failure at `point`.
+macro_rules! inject_checkpoint_failure {
+    ($co:expr, $point:expr) => {{
+        #[cfg(any(test, injected_yields))]
+        if let Some(err) = $co.with(|ctx| ctx.sm.injected_failure($point)) {
+            return Err(err.into());
+        }
+    }};
+}
+
+/// Runs one checkpoint from start to end. Every phase sets the phase marker
+/// and yields once at its boundary, so a caller that steps the machine on
+/// its own sees one phase per step, as with the old state machine.
+async fn run_checkpoint<Clock: LogicalClock, A: ConcurrentAllocator>(
+    co: &mut Co<CheckpointStep<Clock, A>>,
+) -> Result<CheckpointResult, Box<LimboError>> {
+    let passive = co.with(|ctx| ctx.sm.mvstore.uses_passive_checkpoint());
+    if passive {
+        if !co.with(|ctx| ctx.sm.claim_passive_checkpoint()) {
+            // Another checkpoint is already running: no-op (no work, no resources).
+            co.with(|ctx| ctx.sm.state = CheckpointState::Finalize);
+            return Ok(CheckpointResult::default());
+        }
+        enter_phase(co, CheckpointState::BuildLocalSchemaView).await;
+        co.io(|ctx| ctx.sm.build_local_schema_view_step()).await;
+    } else {
+        enter_phase(co, CheckpointState::AcquireLock).await;
+        inject_checkpoint_yield!(co, CheckpointYieldPoint::BeforeAcquireLock);
+        co.io(|ctx| ctx.sm.acquire_lock().map(IOResult::Done)).await;
+    }
+
+    enter_phase(co, CheckpointState::CollectTableRows).await;
+    co.io(|ctx| ctx.sm.collect_table_rows_step()).await;
+    co.with(|ctx| {
+        tracing::debug!("Collected {} committed versions", ctx.sm.write_set.len());
+    });
+    enter_phase(co, CheckpointState::CollectIndexRows).await;
+    inject_checkpoint_yield!(co, CheckpointYieldPoint::AfterCollectTableRows);
+    co.io(|ctx| ctx.sm.collect_index_rows_step()).await;
+    co.with(|ctx| {
+        tracing::debug!(
+            "Collected {} index row changes",
+            ctx.sm.index_write_set.len()
+        );
+    });
+    if passive {
+        // Passive path: collection AND the btree write phase run without the
+        // blocking lock. The only serialized point is the brief publish window in
+        // CommitPagerTxn.
+        inject_checkpoint_yield!(co, CheckpointYieldPoint::BeforeAcquireLock);
+    }
+    let has_rows = co
+        .io(|ctx| ctx.sm.finish_collection().map(IOResult::Done))
+        .await;
+
+    if has_rows {
+        enter_phase(co, CheckpointState::BeginPagerTxn).await;
+        co.io(|ctx| ctx.sm.begin_pager_txn().map(IOResult::Done))
+            .await;
+        enter_phase(co, CheckpointState::WriteRow).await;
+        write_table_rows(co).await?;
+        if !co.with(|ctx| ctx.sm.index_write_set.is_empty()) {
+            enter_phase(co, CheckpointState::WriteIndexRow).await;
+            write_index_rows(co).await?;
+        }
+        enter_phase(co, CheckpointState::CompactSequences).await;
+        co.io(|ctx| ctx.sm.compact_sequences_step()).await;
+        enter_phase(co, CheckpointState::CommitPagerTxn).await;
+        commit_pager_txn(co).await?;
+    } else {
+        // Nothing to checkpoint, skip pager txn and go straight to WAL checkpoint.
+    }
+
+    enter_phase(co, CheckpointState::CheckpointWal).await;
+    let backfilled = co.io(|ctx| ctx.sm.checkpoint_wal_step()).await;
+    if backfilled {
+        enter_phase(co, CheckpointState::SyncDbFile).await;
+        co.io(|ctx| ctx.sm.sync_db_file_step()).await;
+    }
+
+    enter_phase(co, CheckpointState::TruncateLogicalLog).await;
+    let c = co
+        .io(|ctx| ctx.sm.truncate_logical_log_step().map(IOResult::Done))
+        .await;
+    if c.succeeded() {
+        co.with(|ctx| ctx.sm.check_logical_log_truncated());
+    } else {
+        co.yield_io(IOCompletions(c)).await;
+    }
+    phase_boundary(co).await;
+
+    if let Some(c) = co
+        .io(|ctx| ctx.sm.fsync_logical_log_step().map(IOResult::Done))
+        .await
+    {
+        if !c.succeeded() {
+            co.yield_io(IOCompletions(c)).await;
+        }
+    }
+    phase_boundary(co).await;
+
+    let lwm = co.io(|ctx| ctx.sm.truncate_wal_step()).await;
+
+    enter_phase(co, CheckpointState::GcTableRows).await;
+    let mut next_index = 0;
+    while let Some(next) = co.with(|ctx| ctx.sm.gc_checkpointed_table_versions(next_index, lwm)) {
+        next_index = next;
+        co.yield_io(IOCompletions(Completion::new_yield())).await;
+    }
+
+    enter_phase(co, CheckpointState::GcIndexRows).await;
+    let mut next_index = 0;
+    while let Some(next) = co.with(|ctx| ctx.sm.gc_checkpointed_index_versions(next_index, lwm)) {
+        next_index = next;
+        co.yield_io(IOCompletions(Completion::new_yield())).await;
+    }
+
+    enter_phase(co, CheckpointState::Finalize).await;
+    let result = co
+        .io(|ctx| ctx.sm.finish_checkpoint().map(IOResult::Done))
+        .await;
+    Ok(result)
+}
+
+/// Sets the phase marker and yields once so the caller sees the boundary.
+async fn enter_phase<Clock: LogicalClock, A: ConcurrentAllocator>(
+    co: &mut Co<CheckpointStep<Clock, A>>,
+    phase: CheckpointState,
+) {
+    co.with(|ctx| ctx.sm.state = phase);
+    phase_boundary(co).await;
+}
+
+/// Yields once with the phase boundary flag set. `step` turns this yield
+/// into `TransitionResult::Continue`.
+async fn phase_boundary<Clock: LogicalClock, A: ConcurrentAllocator>(
+    co: &mut Co<CheckpointStep<Clock, A>>,
+) {
+    co.with(|ctx| ctx.phase_boundary = true);
+    co.yield_io(IOCompletions(Completion::new_yield())).await;
+}
+
+/// Writes every table row of the write set to its B-tree.
+async fn write_table_rows<Clock: LogicalClock, A: ConcurrentAllocator>(
+    co: &mut Co<CheckpointStep<Clock, A>>,
+) -> Result<(), Box<LimboError>> {
+    let mut write_set_index = 0;
+    let mut requires_seek = true;
+    loop {
+        let write = co
+            .io(|ctx| {
+                ctx.sm
+                    .prepare_table_row_write(write_set_index)
+                    .map(IOResult::Done)
+            })
+            .await;
+        match write {
+            RowWrite::Done => return Ok(()),
+            RowWrite::Skip => requires_seek = true,
+            RowWrite::Delete { rowid, cursor } => {
+                delete_row(co, rowid, cursor).await?;
+                co.with(|ctx| ctx.sm.record_written_table_row(write_set_index));
+                requires_seek = true;
+            }
+            RowWrite::Insert { row, cursor } => {
+                write_row(co, row, cursor, requires_seek).await?;
+                requires_seek = co.with(|ctx| {
+                    ctx.sm.record_written_table_row(write_set_index);
+                    ctx.sm.next_requires_seek_after_insert(write_set_index)
+                });
+            }
+        }
+        write_set_index += 1;
+    }
+}
+
+/// Writes every index row of the index write set to its B-tree.
+async fn write_index_rows<Clock: LogicalClock, A: ConcurrentAllocator>(
+    co: &mut Co<CheckpointStep<Clock, A>>,
+) -> Result<(), Box<LimboError>> {
+    let mut index_write_set_index = 0;
+    loop {
+        let write = co
+            .io(|ctx| {
+                ctx.sm
+                    .prepare_index_row_write(index_write_set_index)
+                    .map(IOResult::Done)
+            })
+            .await;
+        match write {
+            RowWrite::Done => return Ok(()),
+            RowWrite::Skip => {}
+            RowWrite::Delete { rowid, cursor } => {
+                delete_row(co, rowid, cursor).await?;
+                co.with(|ctx| ctx.sm.written_index_slots.insert(index_write_set_index));
+            }
+            RowWrite::Insert { row, cursor } => {
+                write_row(co, row, cursor, true).await?;
+                co.with(|ctx| ctx.sm.written_index_slots.insert(index_write_set_index));
+            }
+        }
+        index_write_set_index += 1;
+    }
+}
+
+/// Commits the pager transaction and publishes the checkpointed pages.
+async fn commit_pager_txn<Clock: LogicalClock, A: ConcurrentAllocator>(
+    co: &mut Co<CheckpointStep<Clock, A>>,
+) -> Result<(), Box<LimboError>> {
+    inject_checkpoint_yield!(co, CheckpointYieldPoint::BeforePagerCommit);
+    co.io(|ctx| ctx.sm.lock_before_pager_commit().map(IOResult::Done))
+        .await;
+    co.io(|ctx| ctx.sm.commit_pager_txn_step()).await;
+    inject_checkpoint_yield!(co, CheckpointYieldPoint::BeforePublishWindow);
+    co.io(|ctx| ctx.sm.publish_step()).await;
+    inject_checkpoint_failure!(co, CheckpointYieldPoint::AfterDurableBoundaryAdvanced);
+    inject_checkpoint_yield!(co, CheckpointYieldPoint::AfterDurableBoundaryAdvanced);
+    Ok(())
 }
 
 /// Re-entrant state machine that builds a snapshot-consistent `Schema` for the
@@ -3731,18 +3781,18 @@ mod tests {
         // reached the stamp, and `gc_floor_reader_mark` is clamped by this floor,
         // so a fixture that jumps straight into the state must publish it too.
         *mvstore.backfill_floor.write() = WalPos::from_pair(checkpoint.pager.wal_pos());
-        checkpoint.state = CheckpointState::GcTableRows {
-            next_index: 0,
-            lwm: u64::MAX,
-        };
+        checkpoint.state = CheckpointState::GcTableRows;
 
-        let first = checkpoint.gc_checkpointed_table_versions();
+        let first = checkpoint.gc_checkpointed_table_versions(0, u64::MAX);
         assert!(
-            first.is_some_and(|io| io.is_explicit_yield()),
-            "GCing more than COLLECT_PREEMPTION_THRESHOLD rows must preempt with an explicit yield"
+            first.is_some(),
+            "GCing more than COLLECT_PREEMPTION_THRESHOLD rows must stop early and continue later"
         );
 
-        while checkpoint.gc_checkpointed_table_versions().is_some() {}
+        let mut next_index = first;
+        while let Some(index) = next_index {
+            next_index = checkpoint.gc_checkpointed_table_versions(index, u64::MAX);
+        }
         // Write-set GC clears version chains but leaves empty SkipMap slots;
         // Truncate Finalize `_and_slots` unlinks them.
         let slots = mvstore
@@ -3803,18 +3853,18 @@ mod tests {
         // See the table variant: publish the floor the real `GcIndexRows` entry
         // would have published, or Rule 3 keeps every stamped current.
         *mvstore.backfill_floor.write() = WalPos::from_pair(checkpoint.pager.wal_pos());
-        checkpoint.state = CheckpointState::GcIndexRows {
-            next_index: 0,
-            lwm: u64::MAX,
-        };
+        checkpoint.state = CheckpointState::GcIndexRows;
 
-        let first = checkpoint.gc_checkpointed_index_versions();
+        let first = checkpoint.gc_checkpointed_index_versions(0, u64::MAX);
         assert!(
-            first.is_some_and(|io| io.is_explicit_yield()),
-            "GCing more than COLLECT_PREEMPTION_THRESHOLD index rows must preempt with an explicit yield"
+            first.is_some(),
+            "GCing more than COLLECT_PREEMPTION_THRESHOLD index rows must stop early and continue later"
         );
 
-        while checkpoint.gc_checkpointed_index_versions().is_some() {}
+        let mut next_index = first;
+        while let Some(index) = next_index {
+            next_index = checkpoint.gc_checkpointed_index_versions(index, u64::MAX);
+        }
         // Write-set GC clears version chains but leaves empty SkipMap slots;
         // Truncate Finalize `_and_slots` unlinks them.
         let inner = mvstore
