@@ -888,6 +888,21 @@ pub fn emit_upsert(
                 target_pc: ctx.loop_labels.row_done,
             });
 
+            if let Some(before) = before_start {
+                for (i, column) in table.columns().iter().enumerate() {
+                    emit_table_column(
+                        program,
+                        ctx.cursor_id,
+                        table_ref_id,
+                        table_references,
+                        column,
+                        i,
+                        layout.to_register(before, i),
+                        resolver,
+                    )?;
+                }
+            }
+
             let has_relevant_after_triggers = has_triggers_including_temp(
                 resolver,
                 upsert_database_id,
