@@ -162,7 +162,7 @@ use super::{
     },
     CommitState,
 };
-use crate::sync::{Mutex, RwLock};
+use crate::sync::Mutex;
 use turso_parser::ast::{self, ForeignKeyClause, Name, QualifiedName, ResolveType};
 use turso_parser::parser::Parser;
 
@@ -2054,6 +2054,7 @@ async_ops! {
     ColumnDeferred => column_deferred: column_deferred,
     RowIdDeferred => row_id_deferred: row_id_deferred,
     Destroy => destroy: destroy,
+    ClearBtree => clear_btree: clear_btree,
 }
 
 /// Runs one step of the async opcode `op`: starts it when none is suspended
@@ -14084,15 +14085,6 @@ pub fn op_index_method_query(
     Ok(InsnFunctionStepResult::Step)
 }
 
-/// State carried across asynchronous steps while clearing an existing b-tree.
-pub enum OpClearBtreeState {
-    CreateCursor,
-    ClearBtree {
-        pager: Arc<Pager>,
-        cursor: Arc<RwLock<BTreeCursor>>,
-    },
-}
-
 pub fn op_destroy(
     program: &Program,
     state: &mut ProgramState,
@@ -14147,65 +14139,37 @@ pub fn op_clear_btree(
     insn: &Insn,
     pager: &Arc<Pager>,
 ) -> InsnResult {
-    match op_clear_btree_inner(program, state, insn, pager) {
-        Ok(result) => Ok(result),
-        Err(err) => {
-            if !matches!(*err, LimboError::Busy | LimboError::BusySnapshot) {
-                state.active_op_state.clear();
-            }
-            Err(err)
-        }
-    }
-}
-
-fn op_clear_btree_inner(
-    program: &Program,
-    state: &mut ProgramState,
-    insn: &Insn,
-    pager: &Arc<Pager>,
-) -> InsnResult {
-    load_insn!(ClearBtree { db, root }, insn);
-
-    let mv_store = program.connection.mv_store_for_db(*db);
-    if mv_store.is_some() {
+    load_insn!(ClearBtree { db, .. }, insn);
+    if program.connection.mv_store_for_db(*db).is_some() {
         return Err(LimboError::InternalError(
             "ClearBtree is not supported in MVCC mode".to_string(),
         )
         .into());
     }
+    step_async_op(program, state, insn, pager, AsyncOp::ClearBtree)
+}
 
-    let clear_pager = if *db != MAIN_DB_ID {
-        program.get_pager_from_database_index(db)?
-    } else {
-        pager.clone()
-    };
-
-    loop {
-        match state.active_op_state.clear_btree() {
-            OpClearBtreeState::CreateCursor => {
-                let cursor = BTreeCursor::new(clear_pager.clone(), *root, 0);
-                *state.active_op_state.clear_btree() = OpClearBtreeState::ClearBtree {
-                    pager: clear_pager.clone(),
-                    cursor: Arc::new(RwLock::new(cursor)),
-                };
-            }
-            OpClearBtreeState::ClearBtree { pager, cursor } => {
-                let cleared = cursor.write().clear_btree();
-                return_if_io!(state, cleared);
-                for other_cursor_opt in state.cursors.iter_mut().flatten() {
-                    if let Cursor::BTree(_) | Cursor::Dyn(_) = other_cursor_opt {
-                        let btree_cursor = other_cursor_opt.as_btree_mut();
-                        if Arc::ptr_eq(&btree_cursor.get_pager(), pager) {
-                            btree_cursor.invalidate_btree_cache();
-                        }
-                    }
+/// Deletes every cell of the b-tree at the root of the instruction, then
+/// invalidates the cached pages of the other cursors on the same pager.
+async fn clear_btree(co: &mut Co<VdbeStep>) -> Result<(), Box<LimboError>> {
+    let (root, pager) = co.with(|ctx| {
+        load_insn!(ClearBtree { db, root }, ctx.insn);
+        pager_for_db(ctx.program, ctx.pager, *db).map(|pager| (*root, pager))
+    })?;
+    let mut cursor = BTreeCursor::new(pager.clone(), root, 0);
+    co.io(|_| cursor.clear_btree()).await;
+    co.with(|ctx| {
+        for other_cursor in ctx.state.cursors.iter_mut().flatten() {
+            if let Cursor::BTree(_) | Cursor::Dyn(_) = other_cursor {
+                let btree_cursor = other_cursor.as_btree_mut();
+                if Arc::ptr_eq(&btree_cursor.get_pager(), &pager) {
+                    btree_cursor.invalidate_btree_cache();
                 }
-                state.active_op_state.clear();
-                state.pc += 1;
-                return Ok(InsnFunctionStepResult::Step);
             }
         }
-    }
+        ctx.state.pc += 1;
+    });
+    Ok(())
 }
 
 pub fn op_reset_sorter(
