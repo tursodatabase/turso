@@ -1107,6 +1107,109 @@ fn mvcc_passive_checkpoint_publishes_backfill_and_reclaims_versions() {
     );
 }
 
+/// After Passive WAL backfill + DB fsync, `BEGIN CONCURRENT` on another
+/// connection must not Busy. Publishing `nbackfills == max_frame` while
+/// exclusive `read_locks[0]` is still held forces every new begin onto slot 0.
+#[test]
+fn mvcc_passive_begin_concurrent_after_backfill_does_not_busy() {
+    let db = MvccTestDbNoConn::new_with_random_db_passive();
+    let mv = db.get_mvcc_store();
+    let conn = db.connect();
+    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, data TEXT NOT NULL)")
+        .unwrap();
+    conn.execute("PRAGMA mvcc_checkpoint_threshold = -1")
+        .unwrap();
+    conn.execute("BEGIN CONCURRENT").unwrap();
+    for i in 0..50 {
+        conn.execute(format!("INSERT INTO t VALUES ({i}, 'seed')"))
+            .unwrap();
+    }
+    conn.execute("COMMIT").unwrap();
+
+    let pager = conn.pager.load().clone();
+    let mut checkpoint_sm = CheckpointStateMachine::new(
+        pager.clone(),
+        mv,
+        conn.clone(),
+        true,
+        conn.get_sync_mode(),
+        crate::MAIN_DB_ID,
+        CheckpointMode::Passive {
+            upper_bound_inclusive: None,
+        },
+    );
+
+    let mut reached_tail = false;
+    for _ in 0..50_000 {
+        match checkpoint_sm.state_for_test() {
+            CheckpointState::TruncateLogicalLog
+            | CheckpointState::FsyncLogicalLog
+            | CheckpointState::TruncateWal
+            | CheckpointState::GcTableRows { .. }
+            | CheckpointState::GcIndexRows { .. } => {
+                reached_tail = true;
+                break;
+            }
+            _ => {}
+        }
+        match checkpoint_sm.step(&()).unwrap() {
+            TransitionResult::Io(io) => io.wait(pager.io.as_ref()).unwrap(),
+            TransitionResult::Continue => {}
+            TransitionResult::Done(_) => {
+                panic!("checkpoint finished before the post-backfill tail")
+            }
+        }
+    }
+    assert!(
+        reached_tail,
+        "passive checkpoint must reach the post-backfill tail with frames to backfill"
+    );
+
+    {
+        let database = db.get_db();
+        let shared = database.shared_wal.read();
+        let max_frame = shared.metadata.max_frame.load(Ordering::SeqCst);
+        let nbackfills = shared.metadata.nbackfills.load(Ordering::SeqCst);
+        assert!(
+            max_frame > 0,
+            "setup must leave WAL frames to backfill, max_frame={max_frame}"
+        );
+        if max_frame == nbackfills {
+            let slot0_shared = shared.runtime.read_locks[0].read();
+            if slot0_shared {
+                shared.runtime.read_locks[0].unlock();
+            }
+            assert!(
+                slot0_shared,
+                "nbackfills==max_frame ({max_frame}) must not overlap exclusive read_locks[0]"
+            );
+        }
+    }
+
+    let writer = db.connect();
+    writer.execute("BEGIN CONCURRENT").expect(
+        "BEGIN CONCURRENT must succeed after Passive backfill while the checkpointer still runs",
+    );
+    writer
+        .execute("INSERT INTO t VALUES (1000, 'during')")
+        .unwrap();
+    writer.execute("COMMIT").unwrap();
+
+    loop {
+        match checkpoint_sm.step(&()).unwrap() {
+            TransitionResult::Io(io) => io.wait(pager.io.as_ref()).unwrap(),
+            TransitionResult::Continue => {}
+            TransitionResult::Done(_) => break,
+        }
+    }
+
+    let wal_bf = pager.wal_backfill_frame().unwrap_or(0);
+    assert!(
+        wal_bf > 0,
+        "passive checkpoint must still publish nbackfills, got {wal_bf}"
+    );
+}
+
 /// Snapshot isolation after Passive Finalize reclaims a materialized current
 /// version: a reader whose snapshot predates a later write must still see the
 /// pre-write value. Idle-only Rule 3 (`lwm == MAX`) is what keeps a positioned
@@ -22020,6 +22123,105 @@ fn commit_validation_reports_conflict_for_evicted_tombstone_writer() {
         commit_tx(db.mvcc_store.clone(), &conn2, tx2),
         Err(LimboError::WriteWriteConflict)
     ));
+}
+
+struct ResumeCheckpointAtSeekStartInjector {
+    checkpoint: Mutex<Option<crate::Statement>>,
+    io: Arc<dyn IO>,
+    fired: AtomicBool,
+}
+
+impl ResumeCheckpointAtSeekStartInjector {
+    fn new(checkpoint: crate::Statement, io: Arc<dyn IO>) -> Arc<Self> {
+        Arc::new(Self {
+            checkpoint: Mutex::new(Some(checkpoint)),
+            io,
+            fired: AtomicBool::new(false),
+        })
+    }
+
+    fn fired(&self) -> bool {
+        self.fired.load(Ordering::Acquire)
+    }
+}
+
+impl std::fmt::Debug for ResumeCheckpointAtSeekStartInjector {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ResumeCheckpointAtSeekStartInjector")
+            .field("fired", &self.fired())
+            .finish_non_exhaustive()
+    }
+}
+
+impl YieldInjector for ResumeCheckpointAtSeekStartInjector {
+    fn should_yield(&self, _instance_id: u64, _selection_key: u64, point: YieldPoint) -> bool {
+        if point != CursorYieldPoint::SeekStart.point() {
+            return false;
+        }
+        if self.fired.swap(true, Ordering::AcqRel) {
+            return false;
+        }
+        let mut checkpoint = self
+            .checkpoint
+            .lock()
+            .take()
+            .expect("parked checkpoint statement");
+        step_until_done(&mut checkpoint, &self.io, "checkpoint publish during seek");
+        false
+    }
+}
+
+#[test]
+fn issue_8467_seek_after_checkpoint_publish_does_not_read_negative_root() {
+    let db = MvccTestDbNoConn::new_with_random_db_passive();
+    let setup = db.connect();
+    setup
+        .execute("CREATE TABLE t(id INTEGER PRIMARY KEY)")
+        .unwrap();
+    setup.execute("INSERT INTO t VALUES (1)").unwrap();
+    setup
+        .execute("PRAGMA mvcc_checkpoint_threshold = -1")
+        .unwrap();
+
+    let ckpt_conn = db.connect();
+    ckpt_conn
+        .execute("PRAGMA mvcc_checkpoint_threshold = 0")
+        .unwrap();
+    let park = FixedYieldInjector::new([CheckpointYieldPoint::BeforePublishWindow.point()]);
+    ckpt_conn.set_yield_injector(Some(park.clone()));
+    let mut delayed = ckpt_conn.prepare("INSERT INTO t VALUES (2)").unwrap();
+    let io = ckpt_conn.pager.load().io.clone();
+    let mut parked = false;
+    for _ in 0..200_000 {
+        match delayed.step().unwrap() {
+            crate::StepResult::Yield | crate::StepResult::IO => {
+                if park.is_empty() {
+                    parked = true;
+                    break;
+                }
+                io.step().unwrap();
+            }
+            crate::StepResult::Done => break,
+            other => panic!("unexpected checkpoint step: {other:?}"),
+        }
+    }
+    ckpt_conn.set_yield_injector(None);
+    assert!(
+        parked,
+        "auto-checkpoint should park after pager commit and before publishing roots"
+    );
+
+    let reader = db.connect();
+    let resume = ResumeCheckpointAtSeekStartInjector::new(delayed, io);
+    reader.set_yield_injector(Some(resume.clone()));
+    let rows = get_rows(&reader, "SELECT id FROM t WHERE id = 1");
+    reader.set_yield_injector(None);
+    assert!(
+        resume.fired(),
+        "SELECT seek should run after OpenRead so checkpoint can publish first"
+    );
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0][0].as_int().unwrap(), 1);
 }
 
 #[path = "group_commit_tests.rs"]

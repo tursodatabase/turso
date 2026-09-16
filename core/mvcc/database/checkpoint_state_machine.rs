@@ -117,6 +117,7 @@ pub(crate) enum CheckpointYieldPoint {
     AfterDurableBoundaryAdvanced,
     AfterCollectTableRows,
     BeforePagerCommit,
+    BeforePublishWindow,
 }
 
 #[cfg(any(test, injected_yields))]
@@ -1491,23 +1492,32 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
     }
 
     /// Publish `nbackfills` after Passive backfill + DB sync. Skip Truncate/Restart.
-    /// Leaves the checkpoint guard held until Finalize (same as the pager).
+    /// Drop exclusive `read_locks[0]` first so `BEGIN CONCURRENT` is not forced
+    /// onto slot 0 while the checkpointer still holds it.
     fn publish_wal_backfill_if_needed(&mut self) {
         if self.mode.should_restart_log() {
             return;
         }
-        let Some(result) = self.checkpoint_result.as_ref() else {
-            return;
+        let (max_frame, backfilled) = {
+            let Some(result) = self.checkpoint_result.as_ref() else {
+                return;
+            };
+            if result.wal_checkpoint_backfilled == 0 {
+                return;
+            }
+            (
+                result.wal_total_backfilled,
+                result.wal_checkpoint_backfilled,
+            )
         };
-        if result.wal_checkpoint_backfilled == 0 {
-            return;
+        if let Some(result) = self.checkpoint_result.as_mut() {
+            result.release_guard();
         }
-        let max_frame = result.wal_total_backfilled;
         turso_assert!(self.pager.wal.is_some(), "No WAL to publish backfill");
         let wal = self.pager.wal.as_ref().unwrap();
         tracing::debug!(
             max_frame,
-            backfilled = result.wal_checkpoint_backfilled,
+            backfilled,
             "publishing WAL backfill after MVCC checkpoint"
         );
         wal.publish_backfill(max_frame);
@@ -2804,6 +2814,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
                         IOResult::IO(io) => return Ok(TransitionResult::Io(io)),
                     }
                 }
+                inject_transition_yield!(self, CheckpointYieldPoint::BeforePublishWindow);
                 if passive {
                     if !self.mvstore.try_begin_passive_publish_window() {
                         if passive_auto_publish_retry {

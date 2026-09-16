@@ -809,7 +809,7 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> MvccLazyCursor<Clock
         self.current_pos.clone()
     }
 
-    fn is_btree_allocated(&self) -> bool {
+    fn is_btree_allocated(&mut self) -> bool {
         // Dual gate (logical base-validity AND physical visibility): a PASSIVE checkpoint may
         // materialize this object's btree during collection. This cursor may read it only if the binding
         // covers our snapshot AND its pages were already durable when we pinned our read mark
@@ -818,8 +818,19 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> MvccLazyCursor<Clock
         // the page its read mark can't see. See `MvStore::is_btree_readable_at`.
         let begin_ts = self.db.read_snapshot_ts(self.tx_id);
         let read_mark = self.db.read_tx_mark(self.tx_id);
-        self.db
+        if !self
+            .db
             .is_btree_readable_at(&self.table_id, begin_ts, read_mark)
+        {
+            return false;
+        }
+        if self.btree_cursor.root_page() < 0 {
+            let Some(root) = self.db.current_root_page(&self.table_id) else {
+                return false;
+            };
+            self.btree_cursor.set_root_page(root as i64);
+        }
+        true
     }
 
     fn query_btree_version_is_valid(&self, key: &RowKey) -> bool {

@@ -798,6 +798,7 @@ pub trait CursorTrait: Any + Send + Sync {
     fn count(&mut self) -> IOResultOr<usize>;
     fn is_empty(&self) -> bool;
     fn root_page(&self) -> i64;
+    fn set_root_page(&mut self, _root_page: i64) {}
     /// Move cursor at the start.
     fn rewind(&mut self) -> IOResultOr<()>;
     /// Check if cursor is poiting at a valid entry with a record.
@@ -7454,6 +7455,10 @@ impl CursorTrait for BTreeCursor {
     #[inline]
     fn root_page(&self) -> i64 {
         self.root_page
+    }
+
+    fn set_root_page(&mut self, root_page: i64) {
+        self.root_page = root_page;
     }
 
     #[cfg_attr(debug_assertions, instrument(skip_all, level = Level::DEBUG))]
