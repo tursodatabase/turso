@@ -2,6 +2,7 @@ use crate::alloc::{
     ConcurrentAllocator, DynAllocator, DynVec, TryReserveError, TursoAllocator,
     TursoTryWithCapacityExt, TursoVecInExt, ALLOC_ERR_MSG,
 };
+use crate::coro::{with_handle, BoxedResumable, Co, Runner, StepContext, YieldSlot};
 use crate::mvcc::clock::LogicalClock;
 use crate::mvcc::cursor::{static_iterator_hack, MvccIterator};
 #[cfg(any(test, injected_yields))]
@@ -34,6 +35,7 @@ use crate::types::ImmutableRecord;
 use crate::types::ImmutableRecordRef;
 use crate::types::IndexInfo;
 use crate::types::SeekResult;
+use crate::types::{SeekKey, SeekOp};
 use crate::Completion;
 use crate::File;
 use crate::IOExt;
@@ -1552,18 +1554,6 @@ pub struct RewriteLiveVersionsCtx {
 /// while keeping a CREATE INDEX on a 2M-row table responsive.
 const MVCC_COMMIT_BATCH_SIZE: usize = 1024;
 
-#[derive(Debug)]
-pub enum WriteRowState {
-    Initial,
-    Seek,
-    /// After seek returns TryAdvance for an index key stored in an interior node,
-    /// advance the cursor to that interior cell so insert overwrites it.
-    Advance,
-    Insert,
-    /// Move to the next record in order to leave the cursor in the next position, this is used for inserting multiple rows for optimizations.
-    Next,
-}
-
 #[cfg(any(test, injected_yields))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, strum_macros::EnumCount)]
 #[repr(u8)]
@@ -1681,13 +1671,46 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> Drop for CommitStateMachine<Cl
     }
 }
 
+/// Names [`RowOpCtx`] as the context type of the row write and row delete
+/// operations when a caller drives them on their own through
+/// [`StateMachine`]. The checkpoint awaits the async functions directly.
+pub struct RowOpStep;
+
+impl StepContext for RowOpStep {
+    type Error = Box<LimboError>;
+    type Ctx<'a> = RowOpCtx;
+}
+
+/// The context of one step of a row operation driven on its own. The
+/// operation owns everything it needs, so the context only parks the yield.
+pub struct RowOpCtx {
+    io: Option<IOCompletions>,
+    err: Option<Box<LimboError>>,
+}
+
+impl YieldSlot<Box<LimboError>> for RowOpCtx {
+    fn park_io(&mut self, io: IOCompletions) {
+        self.io = Some(io);
+    }
+
+    fn take_io(&mut self) -> Option<IOCompletions> {
+        self.io.take()
+    }
+
+    fn park_err(&mut self, err: Box<LimboError>) {
+        self.err = Some(err);
+    }
+
+    fn take_err(&mut self) -> Option<Box<LimboError>> {
+        self.err.take()
+    }
+}
+
+/// Writes one row into a B-tree. Drives [`write_row`] as a step function
+/// for callers that hold it in a [`StateMachine`].
 pub struct WriteRowStateMachine {
-    state: WriteRowState,
+    op: BoxedResumable<RowOpStep, (), ()>,
     is_finalized: bool,
-    row: Row,
-    record: Option<ImmutableRecord>,
-    cursor: Arc<RwLock<BTreeCursor>>,
-    requires_seek: bool,
 }
 
 #[derive(Debug)]
@@ -3010,12 +3033,14 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CommitStateMachine<Clock, A> {
 impl WriteRowStateMachine {
     fn new(row: Row, cursor: Arc<RwLock<BTreeCursor>>, requires_seek: bool) -> Self {
         Self {
-            state: WriteRowState::Initial,
+            op: Runner::boxed(move |co, ()| {
+                let row = row.clone();
+                let cursor = cursor.clone();
+                with_handle(co, (), async move |co, ()| {
+                    write_row(co, row, cursor, requires_seek).await
+                })
+            }),
             is_finalized: false,
-            row,
-            record: None,
-            cursor,
-            requires_seek,
         }
     }
 }
@@ -3758,120 +3783,18 @@ impl StateTransition for WriteRowStateMachine {
     type Context = ();
     type SMResult = ();
 
-    #[tracing::instrument(fields(state = ?self.state), skip(self, _context), level = Level::DEBUG)]
     fn step(&mut self, _context: &Self::Context) -> Result<TransitionResult<Self::SMResult>> {
-        use crate::types::{IOResult, SeekKey, SeekOp};
-
-        match self.state {
-            WriteRowState::Initial => {
-                // Create the record and key
-                self.record = if self.row.is_index_row() {
-                    None
-                } else {
-                    let row_data = self.row.data.as_ref().expect("table rows should have data");
-                    let mut record = ImmutableRecord::new(row_data.len())?;
-                    record.start_serialization(row_data)?;
-                    Some(record)
-                };
-                // `requires_seek == false` is a write_set-level *candidate* for the
-                // sequential-write optimization (this row's key is exactly previous
-                // row's key + 1, so the cursor — left on the previous row and advanced
-                // by WriteRowState::Next — is usually already at the insert position).
-                // It is only sound if the cursor is still PAST the start of its leaf:
-                // if the previous row was the last cell of its leaf, next() crossed
-                // into the following leaf (cell 0), and this row may belong on the
-                // other side of the parent divider. Dividers keep their key when the
-                // checkpoint deletes their row, so the divider can
-                // be >= this row's key, meaning the row MUST go into the left leaf
-                // even though the cursor is in the right one. Writing it at the
-                // cursor would keep the leaf locally sorted but break the interior
-                // ordering invariant, making the row invisible to point lookups
-                // ("Rowid N out of order" under sqlite3 integrity_check). Fall back
-                // to a real seek, which resolves the divider comparison correctly.
-                //
-                // The other sound position is the end of the rightmost leaf: when
-                // the previous row was the last row of the table, next() ran off
-                // the end and left the cursor one past it, with no divider to the
-                // right. Every append-only workload sits here for every row, so
-                // without this case each row would seek from the root.
-                let positioned_for_next_key = {
-                    let cursor = self.cursor.read();
-                    cursor.is_positioned_past_page_start() || cursor.is_at_end_of_rightmost_leaf()
-                };
-                if self.requires_seek || !positioned_for_next_key {
-                    self.state = WriteRowState::Seek;
-                } else {
-                    self.state = WriteRowState::Insert;
-                }
-                Ok(TransitionResult::Continue)
-            }
-            WriteRowState::Seek => {
-                // Position the cursor by seeking to the row position
-                let seek_key = match &self.row.id.row_id {
-                    RowKey::Int(row_id) => SeekKey::TableRowId(*row_id),
-                    RowKey::Record(record) => SeekKey::IndexKey(record.key.reborrow()),
-                };
-
-                match self
-                    .cursor
-                    .write()
-                    .seek(seek_key, SeekOp::GE { eq_only: true })?
-                {
-                    IOResult::Done(seek_result) => {
-                        if self.row.is_index_row() && matches!(seek_result, SeekResult::TryAdvance)
-                        {
-                            self.state = WriteRowState::Advance;
-                            return Ok(TransitionResult::Continue);
-                        }
-                    }
-                    IOResult::IO(io) => {
-                        return Ok(TransitionResult::Io(io));
-                    }
-                }
-                turso_assert_eq!(self.cursor.write().valid_state, CursorValidState::Valid);
-                self.state = WriteRowState::Insert;
-                Ok(TransitionResult::Continue)
-            }
-            WriteRowState::Advance => {
-                match self.cursor.write().next()? {
-                    IOResult::Done(_) => {}
-                    IOResult::IO(io) => {
-                        return Ok(TransitionResult::Io(io));
-                    }
-                }
-                turso_assert!(
-                    self.cursor.read().has_record(),
-                    "MVCC checkpoint index insert did not land on the matched interior record"
-                );
-                self.state = WriteRowState::Insert;
-                Ok(TransitionResult::Continue)
-            }
-            WriteRowState::Insert => {
-                // Insert the record into the B-tree
-                let key = match &self.row.id.row_id {
-                    RowKey::Int(row_id) => BTreeKey::new_table_rowid(*row_id, self.record.as_ref()),
-                    RowKey::Record(record) => BTreeKey::new_index_key(record.key.reborrow()),
-                };
-
-                match self.cursor.write().insert(&key)? {
-                    IOResult::Done(()) => {}
-                    IOResult::IO(io) => {
-                        return Ok(TransitionResult::Io(io));
-                    }
-                }
-                self.state = WriteRowState::Next;
-                Ok(TransitionResult::Continue)
-            }
-            WriteRowState::Next => {
-                match self.cursor.write().next()? {
-                    IOResult::Done(_) => {}
-                    IOResult::IO(io) => {
-                        return Ok(TransitionResult::Io(io));
-                    }
-                }
+        let mut ctx = RowOpCtx {
+            io: None,
+            err: None,
+        };
+        match self.op.resume(&mut ctx, ()) {
+            Ok(IOResult::Done(())) => {
                 self.finalize(&())?;
                 Ok(TransitionResult::Done(()))
             }
+            Ok(IOResult::IO(io)) => Ok(TransitionResult::Io(io)),
+            Err(err) => Err(*err),
         }
     }
 
@@ -3882,6 +3805,97 @@ impl StateTransition for WriteRowStateMachine {
 
     fn is_finalized(&self) -> bool {
         self.is_finalized
+    }
+}
+
+/// Writes `row` into the B-tree under `cursor` and leaves the cursor on the
+/// row after it, so the next sequential write can skip its seek.
+pub(crate) async fn write_row<C>(
+    co: &mut Co<C>,
+    row: Row,
+    cursor: Arc<RwLock<BTreeCursor>>,
+    requires_seek: bool,
+) -> Result<(), Box<LimboError>>
+where
+    C: StepContext<Error = Box<LimboError>>,
+{
+    let record = co.io(|_| table_row_record(&row).map(IOResult::Done)).await;
+    // `requires_seek == false` is a write_set-level *candidate* for the
+    // sequential-write optimization (this row's key is exactly previous
+    // row's key + 1, so the cursor — left on the previous row and advanced
+    // by the final `next` of the previous write — is usually already at the
+    // insert position). It is only sound if the cursor is still PAST the
+    // start of its leaf: if the previous row was the last cell of its leaf,
+    // next() crossed into the following leaf (cell 0), and this row may
+    // belong on the other side of the parent divider. Dividers keep their
+    // key when the checkpoint deletes their row, so the divider can be >=
+    // this row's key, meaning the row MUST go into the left leaf even
+    // though the cursor is in the right one. Writing it at the cursor would
+    // keep the leaf locally sorted but break the interior ordering
+    // invariant, making the row invisible to point lookups ("Rowid N out
+    // of order" under sqlite3 integrity_check). Fall back to a real seek,
+    // which resolves the divider comparison correctly.
+    //
+    // The other sound position is the end of the rightmost leaf: when the
+    // previous row was the last row of the table, next() ran off the end
+    // and left the cursor one past it, with no divider to the right. Every
+    // append-only workload sits here for every row, so without this case
+    // each row would seek from the root.
+    let positioned_for_next_key = {
+        let cursor = cursor.read();
+        cursor.is_positioned_past_page_start() || cursor.is_at_end_of_rightmost_leaf()
+    };
+    if requires_seek || !positioned_for_next_key {
+        let seek_result = co
+            .io(|_| {
+                cursor
+                    .write()
+                    .seek(row_seek_key(&row), SeekOp::GE { eq_only: true })
+            })
+            .await;
+        if row.is_index_row() && matches!(seek_result, SeekResult::TryAdvance) {
+            // After seek returns TryAdvance for an index key stored in an
+            // interior node, advance the cursor to that interior cell so
+            // insert overwrites it.
+            co.io(|_| cursor.write().next()).await;
+            turso_assert!(
+                cursor.read().has_record(),
+                "MVCC checkpoint index insert did not land on the matched interior record"
+            );
+        } else {
+            turso_assert_eq!(cursor.write().valid_state, CursorValidState::Valid);
+        }
+    }
+    co.io(|_| {
+        let key = match &row.id.row_id {
+            RowKey::Int(row_id) => BTreeKey::new_table_rowid(*row_id, record.as_ref()),
+            RowKey::Record(record) => BTreeKey::new_index_key(record.key.reborrow()),
+        };
+        cursor.write().insert(&key)
+    })
+    .await;
+    co.io(|_| cursor.write().next()).await;
+    Ok(())
+}
+
+/// The record of a table row, or `None` for an index row, whose key is
+/// the whole record.
+#[inline(always)]
+fn table_row_record(row: &Row) -> Result<Option<ImmutableRecord>> {
+    if row.is_index_row() {
+        return Ok(None);
+    }
+    let row_data = row.data.as_ref().expect("table rows should have data");
+    let mut record = ImmutableRecord::new(row_data.len())?;
+    record.start_serialization(row_data)?;
+    Ok(Some(record))
+}
+
+#[inline(always)]
+fn row_seek_key(row: &Row) -> SeekKey<'_> {
+    match &row.id.row_id {
+        RowKey::Int(row_id) => SeekKey::TableRowId(*row_id),
+        RowKey::Record(record) => SeekKey::IndexKey(record.key.reborrow()),
     }
 }
 
