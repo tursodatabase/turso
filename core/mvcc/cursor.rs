@@ -68,13 +68,6 @@ enum ExistsState {
 }
 
 #[derive(Debug, Clone, Copy)]
-enum PrevState {
-    AdvanceUnitialized,
-    CheckNeedsAdvance,
-    Advance,
-}
-
-#[derive(Debug, Clone, Copy)]
 enum SeekBtreeState {
     /// Seeking in btree (MVCC seek already done)
     SeekBtree,
@@ -100,7 +93,6 @@ enum CountState {
 }
 #[derive(Debug, Clone)]
 enum MvccLazyCursorState {
-    Prev(PrevState),
     Exists(ExistsState),
     Seek(SeekState, IterationDirection),
 }
@@ -571,6 +563,7 @@ enum MoveStep {
 enum CursorOp {
     Rewind,
     Next,
+    Prev,
 }
 
 /// Runs one step of the async cursor operation `$op` whose runner lives in
@@ -960,11 +953,6 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> MvccLazyCursor<Clock
     /// Advance btree cursor forward from current position (cursor already positioned by seek)
     fn advance_btree_forward_from_current(&mut self) -> IOResultOr<()> {
         self.drive_advance_btree(IterationDirection::Forwards, false)
-    }
-
-    /// Advance btree cursor backward and set btree peek to the first valid row key (skipping rows shadowed by MVCC)
-    fn advance_btree_backward(&mut self) -> IOResultOr<()> {
-        self.drive_advance_btree(IterationDirection::Backwards, true)
     }
 
     /// Advance btree cursor backward from current position (cursor already positioned by seek)
@@ -1422,90 +1410,13 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> CursorTrait
     ///
     /// Uses dual-cursor approach: only advances the cursor that was just consumed.
     fn prev(&mut self) -> IOResultOr<()> {
-        if self.state.is_none() {
-            // If End and peek not initialized, initialize via last()
-            let current_pos = self.get_current_pos();
-            if matches!(current_pos, CursorPosition::End) {
-                let uninitialized = self.dual_peek.both_uninitialized();
-                if uninitialized {
-                    self.state
-                        .replace(MvccLazyCursorState::Prev(PrevState::AdvanceUnitialized));
-                    return_if_io!(self.last());
-                } else {
-                    self.state
-                        .replace(MvccLazyCursorState::Prev(PrevState::CheckNeedsAdvance));
-                }
-            } else {
-                self.state
-                    .replace(MvccLazyCursorState::Prev(PrevState::CheckNeedsAdvance));
-            }
-        }
-
-        if matches!(
-            self.state.as_ref().expect("prev state is not initialized"),
-            MvccLazyCursorState::Prev(PrevState::AdvanceUnitialized)
-        ) {
-            return_if_io!(self.last());
-            self.state
-                .replace(MvccLazyCursorState::Prev(PrevState::CheckNeedsAdvance));
-        }
-
-        if matches!(
-            self.state.as_ref().expect("prev state is not initialized"),
-            MvccLazyCursorState::Prev(PrevState::CheckNeedsAdvance)
-        ) {
-            // Determine which cursor(s) need to be advanced based on current position
-            let current_pos = self.get_current_pos();
-            let (need_advance_mvcc, need_advance_btree) = match &current_pos {
-                CursorPosition::End => {
-                    // First call after last() - peek values should already be populated
-                    (false, false)
-                }
-                CursorPosition::Loaded {
-                    row_id, in_btree, ..
-                } => {
-                    // Sorted-merge: if the other peek still holds the same key
-                    // (GC made fallthrough valid under a live MVCC peek), advance
-                    // both so we do not emit K twice.
-                    let other_same_key = if *in_btree {
-                        self.dual_peek.mvcc_peek.get_row_key() == Some(&row_id.row_id)
-                    } else {
-                        self.dual_peek.btree_peek.get_row_key() == Some(&row_id.row_id)
-                    };
-                    if *in_btree {
-                        (other_same_key, true)
-                    } else {
-                        (true, other_same_key)
-                    }
-                }
-                CursorPosition::BeforeFirst => {
-                    self.state = None;
-                    return Ok(IOResult::Done(()));
-                }
-            };
-
-            // Advance cursors as needed and update peek state
-            if need_advance_mvcc && !self.dual_peek.mvcc_exhausted() {
-                self.advance_mvcc_iterator();
-            }
-            if need_advance_btree && !self.dual_peek.btree_exhausted() {
-                self.state
-                    .replace(MvccLazyCursorState::Prev(PrevState::Advance));
-                inject_io_yield!(self, CursorYieldPoint::PrevBtreeAdvance);
-            }
-        }
-
-        if matches!(
-            self.state.as_ref().expect("prev state is not initialized"),
-            MvccLazyCursorState::Prev(PrevState::Advance)
-        ) {
-            return_if_io!(self.advance_btree_backward());
-        }
-        self.refresh_current_position(IterationDirection::Backwards);
-        self.invalidate_record();
-        self.state = None;
-
-        Ok(IOResult::Done(()))
+        run_cursor_op!(
+            self,
+            CursorOp::Prev,
+            move_row,
+            move_cursor,
+            IterationDirection::Backwards
+        )
     }
 
     fn rowid(&mut self) -> IOResultOr<Option<i64>> {
