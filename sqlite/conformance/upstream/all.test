@@ -325,7 +325,7 @@ set test_files {
   join                 fail
   join2                fail
   join3                fail
-  join4                fail
+  join4                pass
   join5                fail
   join6                pass
   join7                fail

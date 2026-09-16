@@ -220,6 +220,41 @@ expect {
 }
 
 @cross-check-integrity
+test hash-join-offset-continues-with-the-next-match {
+    CREATE TABLE offset_hash_left(id INTEGER PRIMARY KEY, key INTEGER);
+    CREATE TABLE offset_hash_right(id INTEGER PRIMARY KEY, key INTEGER);
+    INSERT INTO offset_hash_left SELECT value, value % 20 FROM generate_series(1, 200);
+    INSERT INTO offset_hash_right SELECT value, value % 20 FROM generate_series(1, 220);
+    SELECT count(*) FROM (
+        SELECT offset_hash_left.id, offset_hash_right.id
+        FROM offset_hash_left
+        JOIN offset_hash_right ON offset_hash_left.key = offset_hash_right.key
+        LIMIT 50 OFFSET 500
+    );
+}
+expect {
+    50
+}
+
+@cross-check-integrity
+test hash-left-join-offset-skips-unmatched-rows {
+    CREATE TABLE offset_unmatched_left(x INTEGER);
+    CREATE TABLE offset_unmatched_right(x INTEGER);
+    INSERT INTO offset_unmatched_left
+        VALUES (1), (2), (3), (4), (5), (6), (7), (8), (9), (10);
+    SELECT count(*) FROM (
+        SELECT offset_unmatched_left.x, offset_unmatched_right.x
+        FROM offset_unmatched_left
+        LEFT JOIN offset_unmatched_right
+            ON offset_unmatched_right.x = offset_unmatched_left.x
+        LIMIT 1 OFFSET 1
+    );
+}
+expect {
+    1
+}
+
+@cross-check-integrity
 test inner-join-using-null {
     create table t(a, b);
     create table s(a, b);
@@ -668,6 +703,27 @@ expect {
     3|3|3
 }
 
+# Keep the selected build rows and their values when an IN seek feeds a hash join.
+@cross-check-integrity
+test hash-build-keeps-in-seek-rows-and-values {
+    CREATE TABLE requested(id INTEGER PRIMARY KEY, limit_value INTEGER);
+    CREATE TABLE allowed(id INTEGER PRIMARY KEY);
+    CREATE TABLE events(requested_id INTEGER, amount INTEGER, active INTEGER);
+    INSERT INTO requested VALUES (1, 10), (2, 20), (3, 30);
+    INSERT INTO allowed VALUES (1), (3);
+    INSERT INTO events VALUES (1, 4, 1), (1, 7, 0), (2, 8, 1), (3, 5, 1), (3, 6, 1);
+    SELECT requested.id, requested.limit_value, coalesce(sum(events.amount), 0)
+    FROM requested
+    LEFT JOIN events ON events.requested_id = requested.id AND events.active = 1
+    WHERE requested.id IN (SELECT id FROM allowed)
+    GROUP BY requested.id
+    ORDER BY requested.id;
+}
+expect {
+    1|10|4
+    3|30|11
+}
+
 # The second hash join builds a3 after an earlier hash join reads a2. The a2
 # table is no longer in the main join order, but a2.b still filters the a3 rows
 # used by the second hash join. Keep that filter when a4 has no matching row.
@@ -748,4 +804,124 @@ test join-3-4-2 {
 }
 expect error {
     cannot join using column d - column not present in both tables
+}
+
+@skip-if sqlite "Turso can replace the reversed primary-key lookup with a hash join"
+test indexed-build-hashes-an-unfiltered-large-probe {
+    CREATE TABLE indexed_hash_parent(id INTEGER PRIMARY KEY, selected INTEGER);
+    CREATE TABLE indexed_hash_child(parent_id INTEGER, payload INTEGER);
+    ANALYZE;
+    DELETE FROM sqlite_stat1;
+    INSERT INTO sqlite_stat1(tbl, idx, stat) VALUES
+        ('indexed_hash_parent', NULL, '200000'),
+        ('indexed_hash_child', NULL, '6000000');
+    ANALYZE sqlite_schema;
+
+    EXPLAIN QUERY PLAN
+    SELECT count(*)
+    FROM indexed_hash_parent AS parent
+    JOIN indexed_hash_child AS child ON child.parent_id = parent.id
+    WHERE parent.selected = 1;
+}
+expect pattern {
+    (?s)HASH JOIN indexed_hash_child AS child.*SCAN indexed_hash_parent AS parent
+}
+
+@skip-if sqlite "Turso reports hash join estimates in its JSON plan"
+@skip-if mvcc "MVCC does not reload sqlite_stat1 after this test changes it"
+test unique-composite-hash-key-uses-one-key-estimate {
+    CREATE TABLE composite_hash_parent(first INTEGER, second INTEGER, selected INTEGER);
+    CREATE UNIQUE INDEX composite_hash_parent_key
+        ON composite_hash_parent(first, second);
+    CREATE TABLE composite_hash_child(first INTEGER, second INTEGER);
+    ANALYZE;
+    DELETE FROM sqlite_stat1;
+    INSERT INTO sqlite_stat1(tbl, idx, stat) VALUES
+        ('composite_hash_parent', NULL, '1000'),
+        ('composite_hash_parent', 'composite_hash_parent_key', '1000 10 1'),
+        ('composite_hash_child', NULL, '5000');
+    ANALYZE sqlite_schema;
+
+    EXPLAIN QUERY PLAN FORMAT=JSON
+    SELECT count(*)
+    FROM composite_hash_parent AS parent
+    JOIN composite_hash_child AS child
+      ON child.first = parent.first AND child.second = parent.second
+    WHERE parent.selected = 1;
+}
+expect pattern {
+    (?s)"detail":"HASH JOIN composite_hash_child AS child".*"rows_per_input":5
+}
+
+@skip-if sqlite "Turso reports hash join estimates in its JSON plan"
+@skip-if mvcc "MVCC does not reload sqlite_stat1 after this test changes it"
+test unique-hash-key-does-not-apply-to-a-different-collation {
+    CREATE TABLE collation_unique_build(key TEXT UNIQUE);
+    CREATE TABLE collation_unique_probe(key TEXT);
+    INSERT INTO collation_unique_build VALUES
+        ('aaa'), ('aaA'), ('aAa'), ('aAA'),
+        ('Aaa'), ('AaA'), ('AAa'), ('AAA');
+    INSERT INTO collation_unique_probe VALUES ('aaa');
+    ANALYZE;
+
+    EXPLAIN QUERY PLAN FORMAT=JSON
+    SELECT count(*)
+    FROM collation_unique_build
+    CROSS JOIN collation_unique_probe
+      ON collation_unique_probe.key COLLATE NOCASE = collation_unique_build.key;
+}
+expect pattern {
+    (?s)"detail":"HASH JOIN collation_unique_probe".*"rows_per_input":0.1
+}
+
+@skip-if sqlite "Turso reports hash join estimates in its JSON plan"
+test hash-join-cost-includes-rows-visited {
+    CREATE TABLE hash_cost_left(key INTEGER);
+    CREATE TABLE hash_cost_right(key INTEGER);
+
+    EXPLAIN QUERY PLAN FORMAT=JSON
+    SELECT count(*)
+    FROM hash_cost_left
+    JOIN hash_cost_right ON hash_cost_left.key = hash_cost_right.key;
+}
+expect pattern {
+    (?s)"detail":"HASH JOIN hash_cost_right".*"access_cost":300110000
+}
+
+@skip-if sqlite "Turso reports its selected plan in JSON"
+test hash-build-row-limit-counts-prefix-rows {
+    CREATE TABLE prefix_row_limit_outer(value INTEGER);
+    CREATE TABLE prefix_row_limit_build(value INTEGER, key INTEGER);
+    CREATE INDEX prefix_row_limit_build_value
+        ON prefix_row_limit_build(value);
+    CREATE TABLE prefix_row_limit_probe(key INTEGER);
+
+    EXPLAIN QUERY PLAN FORMAT=JSON
+    SELECT count(*)
+    FROM prefix_row_limit_outer AS outer_rows
+    CROSS JOIN prefix_row_limit_build AS build_rows
+      ON build_rows.value = outer_rows.value
+    CROSS JOIN prefix_row_limit_probe AS probe_rows
+      ON build_rows.key = probe_rows.key;
+}
+expect pattern {
+    "detail":"SEARCH probe_rows USING COVERING INDEX ephemeral_prefix_row_limit_probe_t3
+}
+
+@skip-if sqlite "Turso can materialize a hash build input"
+test materialized-hash-build-keeps-index-search {
+    CREATE TABLE selected_hash_build(id INTEGER PRIMARY KEY, key INTEGER, selected INTEGER);
+    CREATE INDEX selected_hash_build_selected
+        ON selected_hash_build(selected);
+    CREATE TABLE selected_hash_probe(key INTEGER);
+
+    EXPLAIN QUERY PLAN FORMAT=JSON
+    SELECT count(*)
+    FROM selected_hash_build AS build_rows
+    JOIN selected_hash_probe AS probe_rows
+      ON build_rows.key = probe_rows.key
+    WHERE build_rows.selected = 1;
+}
+expect pattern {
+    (?s)"detail":"MATERIALIZE hash build input for selected_hash_build AS build_rows".*"detail":"SEARCH build_rows USING INDEX selected_hash_build_selected.*"detail":"HASH JOIN selected_hash_probe AS probe_rows"
 }

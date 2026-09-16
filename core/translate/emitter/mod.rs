@@ -974,6 +974,8 @@ pub(crate) struct HashLabels {
     pub check_outer: Option<BranchOffset>,
     /// Entry label for the inner-loop subroutine.
     pub inner_loop_gosub: Option<BranchOffset>,
+    /// Return label for the inner-loop subroutine.
+    pub inner_loop_return: Option<BranchOffset>,
     /// Label that skips past the subroutine body (resolved after Return).
     pub inner_loop_skip: Option<BranchOffset>,
     /// Label for the grace loop's own HashNext (resolved during grace loop emission).
@@ -987,6 +989,7 @@ impl HashLabels {
             next,
             check_outer: None,
             inner_loop_gosub: None,
+            inner_loop_return: None,
             inner_loop_skip: None,
             grace_hash_next: None,
         }

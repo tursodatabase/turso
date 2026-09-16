@@ -4,7 +4,7 @@ use crate::translate::expr::comparison_affinity;
 use crate::{
     schema::{Column, Index, Schema},
     translate::{
-        collate::{get_collseq_from_expr, CollationSeq},
+        collate::{get_collseq_from_expr, resolve_comparison_collseq, CollationSeq},
         expr::{
             as_binary_components, get_expr_affinity, truth_test_rhs, unwrap_parens, walk_expr,
             walk_expr_mut, WalkControl,
@@ -1183,12 +1183,31 @@ pub fn constraints_from_where_clause(
                 .table_col_pos
                 .and_then(|pos| table_reference.table.columns().get(pos));
             let column_collation = constrained_column.map(|c| c.collation());
-            let constraining_expr = constraint.get_constraining_expr_ref(where_clause);
-            // Index seek keys must use the same collation as the constrained column.
-            match (
-                get_collseq_from_expr(constraining_expr, table_references)?,
-                column_collation,
-            ) {
+            // Index seek keys compare with the index's collation, so the seek is
+            // only valid when the comparison itself uses that collation. The
+            // comparison collation follows the left operand, so a plain BINARY
+            // column on the left disqualifies an index on a NOCASE column even
+            // though neither side declares a collation explicitly.
+            let comparison_collation = if constraint.constraining_expr.is_some() {
+                get_collseq_from_expr(
+                    constraint.get_constraining_expr_ref(where_clause),
+                    table_references,
+                )?
+            } else {
+                let term_expr = &where_clause[constraint.where_clause_pos.0].expr;
+                match as_binary_components(term_expr)? {
+                    Some((lhs, op, rhs))
+                        if op.as_ast_operator().is_some_and(|op| op.is_comparison()) =>
+                    {
+                        Some(resolve_comparison_collseq(lhs, rhs, table_references)?)
+                    }
+                    _ => get_collseq_from_expr(
+                        constraint.get_constraining_expr_ref(where_clause),
+                        table_references,
+                    )?,
+                }
+            };
+            match (comparison_collation, column_collation) {
                 (Some(collation), Some(column_collation)) if collation != column_collation => {
                     constraint.usable = false;
                     continue;
@@ -1661,7 +1680,7 @@ pub(super) fn partial_index_predicate_terms(
         .expect("partial_index_predicate_terms requires a partial index");
     let can_use_query_term = |term: &WhereTerm| -> bool {
         let Some(join_info) = &table_reference.join_info else {
-            return true;
+            return term.from_outer_join.is_none();
         };
         if join_info.is_full_outer() {
             return false;

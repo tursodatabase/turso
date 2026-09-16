@@ -117,7 +117,11 @@ pub fn rows_per_leaf_page_for_index(
 /// * `base_row_count` - Total rows in the table
 /// * `num_scans` - Number of times we scan the table (e.g., from outer loop in nested loop join)
 /// * `params` - Cost model parameters
-fn estimate_scan_cost(base_row_count: f64, num_scans: f64, params: &CostModelParams) -> Cost {
+pub(super) fn estimate_scan_cost(
+    base_row_count: f64,
+    num_scans: f64,
+    params: &CostModelParams,
+) -> Cost {
     let table_pages = (base_row_count / params.rows_per_table_page).max(1.0);
 
     // First scan reads all pages; subsequent scans benefit from caching
@@ -247,6 +251,28 @@ pub(crate) fn is_unique_point_lookup(
         .take_while(|cref| cref.eq.as_ref().is_some_and(|eq| !eq.null_matching))
         .count();
     index_info.unique && eq_count >= index_info.column_count
+}
+
+/// Return true when an index access uses its complete unique key.
+pub(crate) fn index_access_is_unique_point_lookup(
+    index: Option<&Index>,
+    usable_constraint_refs: &[RangeConstraintRef],
+) -> bool {
+    let index_info = match index {
+        Some(index) => IndexInfo {
+            unique: index.unique,
+            column_count: index.columns.len(),
+            covering: false,
+            rows_per_leaf_page: 0.0,
+        },
+        None => IndexInfo {
+            unique: true,
+            column_count: 1,
+            covering: false,
+            rows_per_leaf_page: 0.0,
+        },
+    };
+    is_unique_point_lookup(index_info, usable_constraint_refs)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]

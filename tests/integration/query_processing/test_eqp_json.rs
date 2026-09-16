@@ -163,7 +163,7 @@ fn unavailable_duplicate_does_not_stop_a_compound_lookup(
     let plan = explain_query_plan(
         &conn,
         "SELECT *
-         FROM first CROSS JOIN middle CROSS JOIN last
+         FROM first CROSS JOIN middle INDEXED BY middle_xy CROSS JOIN last
          WHERE middle.x = first.a
            AND middle.x = last.z
            AND middle.y = first.b",

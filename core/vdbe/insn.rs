@@ -1972,7 +1972,10 @@ pub enum Insn {
         key_start_reg: u32,
         num_keys: u32,
         dest_reg: u32,
+        /// Jump here when the probe has no matching build row.
         target_pc: BranchOffset,
+        /// Jump here when the probe row is stored for grace processing.
+        deferred_target_pc: BranchOffset,
         /// Starting register to write payload columns from hash entry.
         payload_dest_reg: Option<u32>,
         /// Number of payload columns expected
