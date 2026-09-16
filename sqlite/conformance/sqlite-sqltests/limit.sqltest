@@ -108,3 +108,18 @@ test limit-compound-non-integer-datatype-mismatch {
 expect error {
     datatype mismatch
 }
+
+test limit-compound-subquery-comma-form {
+    SELECT 1 UNION SELECT 2 LIMIT (SELECT 1), (SELECT 1);
+}
+expect {
+    2
+}
+
+test limit-compound-subquery-negative-no-limit {
+    SELECT 1 UNION SELECT 2 ORDER BY 1 LIMIT (SELECT -1);
+}
+expect {
+    1
+    2
+}
