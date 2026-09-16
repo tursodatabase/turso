@@ -642,7 +642,12 @@ pub fn translate_insert(
 
     program.preassign_label_to_next_insn(ctx.key_labels.key_ready_for_check);
 
-    if ctx.table.is_strict {
+    //TODO building the type-check table is expensive, we should cache it somehow.
+    let storage_type_check_table = ctx
+        .table
+        .is_strict
+        .then(|| BTreeTable::type_check_table_ref(ctx.table, resolver.schema()));
+    if let Some(table_reference) = &storage_type_check_table {
         // Pre-encode TypeCheck: validate input types match the custom type's
         // declared value type BEFORE encoding. This catches type mismatches
         // (e.g. TEXT into an INTEGER-based custom type) that would otherwise
@@ -667,7 +672,7 @@ pub fn translate_insert(
             start_reg: insertion.first_col_register(),
             count: insertion.num_non_virtual_cols,
             check_generated: false,
-            table_reference: BTreeTable::type_check_table_ref(ctx.table, resolver.schema()),
+            table_reference: Arc::clone(table_reference),
         });
     }
     // Non-STRICT tables: Affinity was already emitted earlier (before BEFORE triggers).
@@ -800,19 +805,12 @@ pub fn translate_insert(
             &btree_table,
         )?;
 
-        // SQLite enforces the declared type of virtual generated columns in
-        // STRICT tables starting with 3.51. Turso's pinned compatibility target
-        // (3.50.4, see core/dialect/sqlite.rs) predates that, but we treat the
-        // newer behavior as the correct one: accepting the row silently stores a
-        // value the schema forbids. The conformance tests expecting this error
-        // pass against sqlite3 3.51.1 and are skipped only for the older pinned
-        // oracle. The same applies to the UPDATE and upsert paths.
-        if ctx.table.is_strict {
+        if let Some(table_reference) = storage_type_check_table {
             program.emit_insn(Insn::TypeCheck {
                 start_reg: insertion.first_col_register(),
                 count: ctx.table.columns().len(),
                 check_generated: true,
-                table_reference: BTreeTable::type_check_table_ref(ctx.table, resolver.schema()),
+                table_reference,
             });
         }
 
