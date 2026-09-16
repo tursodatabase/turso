@@ -8,6 +8,14 @@
 //! caller as `IOResult::IO`. The next `resume` call continues the function
 //! after the yield.
 //!
+//! A step that fails does not end the operation. [`Co::io`] parks the error
+//! in the context and returns `Pending`, `resume` returns the error, and the
+//! next `resume` call runs the same step again. This is the same as a
+//! hand-written state machine that returns an error without a state change:
+//! the caller decides whether to retry the step or to [`Resumable::cancel`]
+//! the operation. Only an error that the async function returns itself ends
+//! the operation.
+//!
 //! The future outlives every step, so it cannot borrow the context. The
 //! runner stores a pointer to the context in a slot that it shares with the
 //! handle, and only for the duration of one poll. The slot is the only place
@@ -30,13 +38,18 @@ use crate::types::{IOCompletions, IOResult};
 /// Names the context type of a step for every step lifetime. The future
 /// names its context through this trait, so it does not carry a lifetime.
 pub trait StepContext {
-    type Ctx<'a>: YieldSlot;
+    /// The error type of the operations that run on this context.
+    type Error;
+    type Ctx<'a>: YieldSlot<Self::Error>;
 }
 
-/// Where a step parks the completion of a yield until `resume` picks it up.
-pub trait YieldSlot {
+/// Where a step parks what suspends it until `resume` picks it up: the
+/// completion of an I/O yield, or the error of a step that failed.
+pub trait YieldSlot<E> {
     fn park_io(&mut self, io: IOCompletions);
     fn take_io(&mut self) -> Option<IOCompletions>;
+    fn park_err(&mut self, err: E);
+    fn take_err(&mut self) -> Option<E>;
 }
 
 /// The handle an async function uses to reach its context and to yield.
@@ -68,11 +81,14 @@ impl<C: StepContext> Co<C> {
     }
 
     /// Calls `f` until it returns `Done`. Each `IO` result is yielded to the
-    /// caller of `resume`, and `f` runs again after the I/O completes.
+    /// caller of `resume`, and `f` runs again after the I/O completes. An
+    /// error is also yielded to the caller of `resume`, and `f` runs again
+    /// on the next resume.
     #[inline(always)]
     pub fn io<T, E, F>(&mut self, f: F) -> Io<'_, C, F>
     where
         F: for<'a> FnMut(&mut C::Ctx<'a>) -> Result<IOResult<T>, E>,
+        E: Into<C::Error>,
     {
         Io { co: self, f }
     }
@@ -102,19 +118,23 @@ impl<C, F, T, E> Future for Io<'_, C, F>
 where
     C: StepContext,
     F: for<'a> FnMut(&mut C::Ctx<'a>) -> Result<IOResult<T>, E>,
+    E: Into<C::Error>,
 {
-    type Output = Result<T, E>;
+    type Output = T;
 
     #[inline(always)]
     fn poll(mut self: Pin<&mut Self>, _: &mut Context<'_>) -> Poll<Self::Output> {
         let Io { co, f } = &mut *self;
         co.with(|ctx| match f(ctx) {
-            Ok(IOResult::Done(value)) => Poll::Ready(Ok(value)),
+            Ok(IOResult::Done(value)) => Poll::Ready(value),
             Ok(IOResult::IO(io)) => {
                 ctx.park_io(io);
                 Poll::Pending
             }
-            Err(error) => Poll::Ready(Err(error)),
+            Err(error) => {
+                ctx.park_err(error.into());
+                Poll::Pending
+            }
         })
     }
 }
@@ -144,17 +164,19 @@ impl<C: StepContext> Future for YieldIo<'_, C> {
 }
 
 /// A boxed [`Runner`] behind the [`Resumable`] trait.
-pub type BoxedResumable<C, Args, Out, E> = Box<dyn Resumable<C, Args, Out, E> + Send + Sync>;
+pub type BoxedResumable<C, Args, Out> = Box<dyn Resumable<C, Args, Out> + Send + Sync>;
 
 /// A step function built from an async function.
-pub trait Resumable<C: StepContext, Args, Out, E> {
-    /// True between the first `resume` and the one that returns `Done` or an
-    /// error.
+pub trait Resumable<C: StepContext, Args, Out> {
+    /// True between the first `resume` and the one that returns `Done`, or
+    /// the error that ends the operation.
     fn is_active(&self) -> bool;
 
     /// Starts a new operation with `args` if none is active, then runs it
-    /// until it yields for I/O or finishes. `args` is ignored on a resume.
-    fn resume(&mut self, ctx: &mut C::Ctx<'_>, args: Args) -> Result<IOResult<Out>, E>;
+    /// until it yields for I/O, fails a step, or finishes. `args` is ignored
+    /// on a resume. After a failed step the operation stays active, and the
+    /// next call runs that step again.
+    fn resume(&mut self, ctx: &mut C::Ctx<'_>, args: Args) -> Result<IOResult<Out>, C::Error>;
 
     /// Drops the future of an active operation.
     fn cancel(&mut self);
@@ -177,10 +199,10 @@ pub struct Runner<C, F, M> {
 impl<C, F, M> Runner<C, F, M> {
     /// Boxes a new runner behind the `Resumable` trait. `make` builds the
     /// future of one operation, usually through [`with_handle`].
-    pub fn boxed<Args, Out, E>(make: M) -> BoxedResumable<C, Args, Out, E>
+    pub fn boxed<Args, Out>(make: M) -> BoxedResumable<C, Args, Out>
     where
         C: StepContext,
-        F: Future<Output = (Co<C>, Result<Out, E>)>,
+        F: Future<Output = (Co<C>, Result<Out, C::Error>)>,
         M: Fn(Co<C>, Args) -> F,
         Self: Send + Sync + 'static,
     {
@@ -194,10 +216,10 @@ impl<C, F, M> Runner<C, F, M> {
     }
 }
 
-impl<C, Args, Out, E, F, M> Resumable<C, Args, Out, E> for Runner<C, F, M>
+impl<C, Args, Out, F, M> Resumable<C, Args, Out> for Runner<C, F, M>
 where
     C: StepContext,
-    F: Future<Output = (Co<C>, Result<Out, E>)>,
+    F: Future<Output = (Co<C>, Result<Out, C::Error>)>,
     M: Fn(Co<C>, Args) -> F,
 {
     #[inline(always)]
@@ -205,7 +227,7 @@ where
         self.active
     }
 
-    fn resume(&mut self, ctx: &mut C::Ctx<'_>, args: Args) -> Result<IOResult<Out>, E> {
+    fn resume(&mut self, ctx: &mut C::Ctx<'_>, args: Args) -> Result<IOResult<Out>, C::Error> {
         if !self.active {
             let co = self.co.take().unwrap_or_else(|| Co {
                 ctx: Arc::clone(&self.ctx),
@@ -230,9 +252,12 @@ where
                 result.map(IOResult::Done)
             }
             Poll::Pending => {
+                if let Some(err) = ctx.take_err() {
+                    return Err(err);
+                }
                 let io = ctx
                     .take_io()
-                    .expect("future returned Pending without an I/O yield");
+                    .expect("future returned Pending without an I/O yield or a step error");
                 Ok(IOResult::IO(io))
             }
         }
@@ -248,13 +273,14 @@ where
 /// Runs `body` with the handle borrowed, then gives the handle back to the
 /// runner. A borrowed handle cannot leave `body`, and the runner reuses it
 /// for the next operation.
-pub async fn with_handle<C, Args, Out, E, B>(
+pub async fn with_handle<C, Args, Out, B>(
     mut co: Co<C>,
     args: Args,
     body: B,
-) -> (Co<C>, Result<Out, E>)
+) -> (Co<C>, Result<Out, C::Error>)
 where
-    B: AsyncFnOnce(&mut Co<C>, Args) -> Result<Out, E>,
+    C: StepContext,
+    B: AsyncFnOnce(&mut Co<C>, Args) -> Result<Out, C::Error>,
 {
     let result = body(&mut co, args).await;
     (co, result)
@@ -269,21 +295,27 @@ mod tests {
     struct Counting;
 
     impl StepContext for Counting {
+        type Error = &'static str;
         type Ctx<'a> = Counter;
     }
 
     struct Counter {
         steps: usize,
         io: Option<IOCompletions>,
+        err: Option<&'static str>,
     }
 
     impl Counter {
         fn new(steps: usize) -> Self {
-            Self { steps, io: None }
+            Self {
+                steps,
+                io: None,
+                err: None,
+            }
         }
     }
 
-    impl YieldSlot for Counter {
+    impl YieldSlot<&'static str> for Counter {
         fn park_io(&mut self, io: IOCompletions) {
             assert!(self.io.is_none(), "a step parks at most one completion");
             self.io = Some(io);
@@ -292,13 +324,22 @@ mod tests {
         fn take_io(&mut self) -> Option<IOCompletions> {
             self.io.take()
         }
+
+        fn park_err(&mut self, err: &'static str) {
+            assert!(self.err.is_none(), "a step parks at most one error");
+            self.err = Some(err);
+        }
+
+        fn take_err(&mut self) -> Option<&'static str> {
+            self.err.take()
+        }
     }
 
     fn completion() -> IOCompletions {
         IOCompletions(Completion::new(CompletionType::Yield))
     }
 
-    async fn count_to(co: &mut Co<Counting>, target: usize) -> Result<usize, ()> {
+    async fn count_to(co: &mut Co<Counting>, target: usize) -> Result<usize, &'static str> {
         let mut yields = 0;
         while co.with(|counter| counter.steps) < target {
             co.with(|counter| counter.steps += 1);
@@ -308,10 +349,26 @@ mod tests {
         Ok(yields)
     }
 
-    async fn fail_after_one_yield(co: &mut Co<Counting>, _: usize) -> Result<usize, ()> {
+    async fn fail_after_one_yield(co: &mut Co<Counting>, _: usize) -> Result<usize, &'static str> {
         co.yield_io(completion()).await;
         co.with(|counter| counter.steps += 1);
-        Err(())
+        Err("the function failed")
+    }
+
+    /// The step fails until the counter reaches `target`, and counts one
+    /// step per call.
+    async fn step_until(co: &mut Co<Counting>, target: usize) -> Result<usize, &'static str> {
+        let reached = co
+            .io(|counter: &mut Counter| {
+                counter.steps += 1;
+                if counter.steps < target {
+                    Err("not yet")
+                } else {
+                    Ok(IOResult::Done(counter.steps))
+                }
+            })
+            .await;
+        Ok(reached)
     }
 
     #[test]
@@ -356,16 +413,36 @@ mod tests {
     }
 
     #[test]
-    fn error_ends_the_operation() {
+    fn error_of_the_function_ends_the_operation() {
         let mut runner = Runner::boxed(|co, args| with_handle(co, args, fail_after_one_yield));
         let mut counter = Counter::new(0);
         assert!(matches!(
             runner.resume(&mut counter, 0),
             Ok(IOResult::IO(_))
         ));
-        assert!(matches!(runner.resume(&mut counter, 0), Err(())));
+        assert!(matches!(
+            runner.resume(&mut counter, 0),
+            Err("the function failed")
+        ));
         assert!(!runner.is_active());
         assert_eq!(counter.steps, 1);
+    }
+
+    #[test]
+    fn error_of_a_step_suspends_the_operation_and_the_step_runs_again() {
+        let mut runner = Runner::boxed(|co, args| with_handle(co, args, step_until));
+        let mut counter = Counter::new(0);
+        assert!(matches!(runner.resume(&mut counter, 3), Err("not yet")));
+        assert!(runner.is_active());
+        assert!(matches!(runner.resume(&mut counter, 3), Err("not yet")));
+        assert!(runner.is_active());
+        assert!(matches!(
+            runner.resume(&mut counter, 3),
+            Ok(IOResult::Done(3))
+        ));
+        assert!(!runner.is_active());
+        assert_eq!(counter.steps, 3);
+        assert!(counter.err.is_none());
     }
 
     #[test]
@@ -384,9 +461,23 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn cancel_drops_an_operation_suspended_by_a_failed_step() {
+        let mut runner = Runner::boxed(|co, args| with_handle(co, args, step_until));
+        let mut counter = Counter::new(0);
+        assert!(matches!(runner.resume(&mut counter, 3), Err("not yet")));
+        runner.cancel();
+        assert!(!runner.is_active());
+        assert!(matches!(
+            runner.resume(&mut counter, 2),
+            Ok(IOResult::Done(2))
+        ));
+    }
+
     struct Borrowing;
 
     impl StepContext for Borrowing {
+        type Error = &'static str;
         type Ctx<'a> = Borrowed<'a>;
     }
 
@@ -394,9 +485,10 @@ mod tests {
     struct Borrowed<'a> {
         steps: &'a mut usize,
         io: &'a mut Option<IOCompletions>,
+        err: Option<&'static str>,
     }
 
-    impl YieldSlot for Borrowed<'_> {
+    impl YieldSlot<&'static str> for Borrowed<'_> {
         fn park_io(&mut self, io: IOCompletions) {
             *self.io = Some(io);
         }
@@ -404,9 +496,17 @@ mod tests {
         fn take_io(&mut self) -> Option<IOCompletions> {
             self.io.take()
         }
+
+        fn park_err(&mut self, err: &'static str) {
+            self.err = Some(err);
+        }
+
+        fn take_err(&mut self) -> Option<&'static str> {
+            self.err.take()
+        }
     }
 
-    async fn count_borrowed(co: &mut Co<Borrowing>, target: usize) -> Result<usize, ()> {
+    async fn count_borrowed(co: &mut Co<Borrowing>, target: usize) -> Result<usize, &'static str> {
         let mut yields = 0;
         while co.with(|ctx| *ctx.steps) < target {
             co.with(|ctx| *ctx.steps += 1);
@@ -426,7 +526,8 @@ mod tests {
             runner.resume(
                 &mut Borrowed {
                     steps: &mut first,
-                    io: &mut io
+                    io: &mut io,
+                    err: None,
                 },
                 2
             ),
@@ -437,7 +538,8 @@ mod tests {
             runner.resume(
                 &mut Borrowed {
                     steps: &mut second,
-                    io: &mut io
+                    io: &mut io,
+                    err: None,
                 },
                 2
             ),
@@ -448,7 +550,8 @@ mod tests {
             runner.resume(
                 &mut Borrowed {
                     steps: &mut second,
-                    io: &mut io
+                    io: &mut io,
+                    err: None,
                 },
                 2
             ),

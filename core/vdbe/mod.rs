@@ -55,10 +55,10 @@ use crate::{
     types::{IOCompletions, IOResult},
     vdbe::{
         execute::{
-            OpAttachState, OpClearBtreeState, OpDeleteState, OpDeleteSubState, OpDestroyState,
+            AsyncOp, AsyncOpSlots, OpAttachState, OpDeleteState, OpDeleteSubState,
             OpIdxInsertState, OpInitCdcVersionState, OpInsertState, OpInsertSubState,
             OpJournalModeState, OpNewRowidState, OpNoConflictState, OpParseSchemaState,
-            OpProgramState, OpRowIdState, OpSeekState, OpTransactionState, VacuumIntoOpContext,
+            OpProgramState, OpSeekState, OpTransactionState, VacuumIntoOpContext,
         },
         hash_table::HashTable,
         metrics::StatementMetrics,
@@ -82,10 +82,7 @@ use crate::{
 };
 use branches::{mark_unlikely, unlikely};
 use builder::{CursorKey, QueryMode};
-use execute::{
-    InsnFunction, InsnFunctionStepResult, OpIdxDeleteState, OpIntegrityCheckState,
-    OpOpenEphemeralState,
-};
+use execute::{InsnFunction, InsnFunctionStepResult, OpIntegrityCheckState, OpOpenEphemeralState};
 use turso_parser::ast::{EqpFormat, ResolveType};
 
 use crate::io::TempFile;
@@ -605,10 +602,7 @@ pub struct OpHashProbeState {
 #[repr(u8)]
 enum ActiveOpState {
     None,
-    ClearBtree(OpClearBtreeState),
     Delete(OpDeleteState),
-    Destroy(OpDestroyState),
-    IdxDelete(OpIdxDeleteState),
     IntegrityCheck(OpIntegrityCheckState),
     OpenEphemeral(OpOpenEphemeralState),
     Program(OpProgramState),
@@ -616,8 +610,9 @@ enum ActiveOpState {
     IdxInsert(OpIdxInsertState),
     Insert(OpInsertState),
     NoConflict(OpNoConflictState),
-    ColumnDeferred,
-    RowId(OpRowIdState),
+    /// An async opcode is suspended. Its future lives in the slot of
+    /// [`AsyncOpSlots`] for this opcode.
+    Async(AsyncOp),
     Transaction(OpTransactionState),
     Attach(OpAttachState),
     JournalMode(OpJournalModeState),
@@ -631,10 +626,7 @@ impl std::fmt::Debug for ActiveOpState {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let name = match self {
             ActiveOpState::None => "None",
-            ActiveOpState::ClearBtree(_) => "ClearBtree",
             ActiveOpState::Delete(_) => "Delete",
-            ActiveOpState::Destroy(_) => "Destroy",
-            ActiveOpState::IdxDelete(_) => "IdxDelete",
             ActiveOpState::IntegrityCheck(_) => "IntegrityCheck",
             ActiveOpState::OpenEphemeral(_) => "OpenEphemeral",
             ActiveOpState::Program(_) => "Program",
@@ -642,8 +634,7 @@ impl std::fmt::Debug for ActiveOpState {
             ActiveOpState::IdxInsert(_) => "IdxInsert",
             ActiveOpState::Insert(_) => "Insert",
             ActiveOpState::NoConflict(_) => "NoConflict",
-            ActiveOpState::ColumnDeferred => "ColumnDeferred",
-            ActiveOpState::RowId(_) => "RowId",
+            ActiveOpState::Async(op) => return write!(f, "{op:?}"),
             ActiveOpState::Transaction(_) => "Transaction",
             ActiveOpState::Attach(_) => "Attach",
             ActiveOpState::JournalMode(_) => "JournalMode",
@@ -659,7 +650,7 @@ impl std::fmt::Debug for ActiveOpState {
 #[derive(Debug, Default)]
 struct ActiveOpStateSlot {
     state: ActiveOpState,
-    column_deferred: Option<execute::ColumnDeferredOp>,
+    async_ops: AsyncOpSlots,
 }
 
 macro_rules! active_state_accessor {
@@ -695,9 +686,9 @@ impl ActiveOpStateSlot {
     fn clear(&mut self) {
         match self.state {
             ActiveOpState::None => {}
-            ActiveOpState::ColumnDeferred => {
-                if let Some(op) = &mut self.column_deferred {
-                    op.cancel();
+            ActiveOpState::Async(op) => {
+                if let Some(runner) = self.async_ops.slot(op) {
+                    runner.cancel();
                 }
                 self.state = ActiveOpState::None;
             }
@@ -705,33 +696,37 @@ impl ActiveOpStateSlot {
         }
     }
 
-    /// Takes the async Column operation out of the slot for one step. The
-    /// first call allocates it; later calls reuse it.
-    fn take_column_deferred(&mut self) -> execute::ColumnDeferredOp {
+    /// Takes the runner of the async opcode `op` out of its slot for one
+    /// step. The first step in this program state allocates it; later steps
+    /// reuse it.
+    fn take_async(&mut self, op: AsyncOp) -> execute::VdbeOp {
         assert!(
-            matches!(
-                self.state,
-                ActiveOpState::None | ActiveOpState::ColumnDeferred
-            ),
-            "active opcode state mismatch: expected ColumnDeferred, got {:?}",
+            match self.state {
+                ActiveOpState::None => true,
+                ActiveOpState::Async(active) => active == op,
+                _ => false,
+            },
+            "active opcode state mismatch: expected {op:?}, got {:?}",
             self.state
         );
-        self.column_deferred
+        self.async_ops
+            .slot(op)
             .take()
-            .unwrap_or_else(execute::ColumnDeferredOp::new)
+            .unwrap_or_else(|| op.new_runner())
     }
 
-    /// Puts the async Column operation back after a step. `active` is true
-    /// when the step yielded for I/O, so the next Column resumes it.
-    fn put_column_deferred(&mut self, op: execute::ColumnDeferredOp, active: bool) {
-        debug_assert!(self.column_deferred.is_none());
-        std::mem::forget(self.column_deferred.replace(op));
+    /// Puts the runner of `op` back after a step. `active` is true when the
+    /// step suspended, so the next step of the same opcode resumes it.
+    fn put_async(&mut self, op: AsyncOp, runner: execute::VdbeOp, active: bool) {
+        let slot = self.async_ops.slot(op);
+        debug_assert!(slot.is_none());
+        std::mem::forget(slot.replace(runner));
         let state = if active {
-            ActiveOpState::ColumnDeferred
+            ActiveOpState::Async(op)
         } else {
             ActiveOpState::None
         };
-        // The old state is None or ColumnDeferred; neither owns anything.
+        // The old state is None or Async; neither owns anything.
         std::mem::forget(std::mem::replace(&mut self.state, state));
     }
 
@@ -756,24 +751,6 @@ impl ActiveOpStateSlot {
             sub_state: OpDeleteSubState::MaybeCaptureRecord,
             deleted_record: None,
         }
-    );
-    active_state_accessor!(
-        clear_btree,
-        ClearBtree,
-        OpClearBtreeState,
-        OpClearBtreeState::CreateCursor
-    );
-    active_state_accessor!(
-        destroy,
-        Destroy,
-        OpDestroyState,
-        OpDestroyState::CreateCursor
-    );
-    active_state_accessor!(
-        idx_delete,
-        IdxDelete,
-        OpIdxDeleteState,
-        OpIdxDeleteState::Seeking
     );
     active_state_accessor!(
         integrity_check,
@@ -812,7 +789,6 @@ impl ActiveOpStateSlot {
         OpNoConflictState,
         OpNoConflictState::Start
     );
-    active_state_accessor!(row_id, RowId, OpRowIdState, OpRowIdState::Start);
     active_state_accessor!(
         transaction,
         Transaction,
@@ -4156,12 +4132,40 @@ mod tests {
         let mut state = ProgramState::new(1, 0);
 
         assert!(matches!(state.active_op_state.state, ActiveOpState::None));
-        assert!(matches!(
-            state.active_op_state.row_id(),
-            OpRowIdState::Start
-        ));
+        let runner = state.active_op_state.take_async(AsyncOp::RowIdDeferred);
+        state
+            .active_op_state
+            .put_async(AsyncOp::RowIdDeferred, runner, false);
+        assert!(matches!(state.active_op_state.state, ActiveOpState::None));
         state.active_op_state.clear();
         assert!(state.active_op_state.parse_schema().is_none());
+    }
+
+    #[test]
+    fn async_opcode_slot_keeps_a_suspended_runner_until_clear() {
+        let mut state = ProgramState::new(1, 0);
+
+        let runner = state.active_op_state.take_async(AsyncOp::RowIdDeferred);
+        state
+            .active_op_state
+            .put_async(AsyncOp::RowIdDeferred, runner, true);
+        assert!(matches!(
+            state.active_op_state.state,
+            ActiveOpState::Async(AsyncOp::RowIdDeferred)
+        ));
+        assert!(!state.active_op_state.is_idle());
+
+        let panic = catch_unwind(AssertUnwindSafe(|| {
+            let _ = state.active_op_state.take_async(AsyncOp::ColumnDeferred);
+        }));
+        assert!(
+            panic.is_err(),
+            "mismatched async opcode resume should panic"
+        );
+
+        state.active_op_state.clear();
+        assert!(state.active_op_state.is_idle());
+        let _ = state.active_op_state.take_async(AsyncOp::ColumnDeferred);
     }
 
     #[test]
@@ -4187,7 +4191,7 @@ mod tests {
     #[test]
     fn active_opcode_helpers_reject_mismatched_resumes() {
         let mut state = ProgramState::new(1, 0);
-        *state.active_op_state.row_id() = OpRowIdState::GetRowid;
+        *state.active_op_state.no_conflict() = OpNoConflictState::Start;
 
         let panic = catch_unwind(AssertUnwindSafe(|| {
             let _ = state.active_op_state.parse_schema();

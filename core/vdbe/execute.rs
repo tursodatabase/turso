@@ -162,7 +162,7 @@ use super::{
     },
     CommitState,
 };
-use crate::sync::{Mutex, RwLock};
+use crate::sync::Mutex;
 use turso_parser::ast::{self, ForeignKeyClause, Name, QualifiedName, ResolveType};
 use turso_parser::parser::Parser;
 
@@ -1902,7 +1902,7 @@ pub fn op_column(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    _pager: &Arc<Pager>,
+    pager: &Arc<Pager>,
 ) -> InsnResult {
     load_insn!(
         Column {
@@ -1920,7 +1920,7 @@ pub fn op_column(
         }
         return Ok(result);
     }
-    op_column_deferred(program, state, insn, *cursor_id)
+    op_column_deferred(program, state, insn, pager)
 }
 
 // Not in test builds: inline(always) makes fn-item coercions produce
@@ -1931,7 +1931,7 @@ pub fn op_column_range(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    _pager: &Arc<Pager>,
+    pager: &Arc<Pager>,
 ) -> InsnResult {
     load_insn!(
         ColumnRange {
@@ -1950,7 +1950,7 @@ pub fn op_column_range(
         }
         return Ok(result);
     }
-    op_column_deferred(program, state, insn, *cursor_id)
+    op_column_deferred(program, state, insn, pager)
 }
 
 /// What a Column-family instruction fetches once the cursor is positioned.
@@ -2007,58 +2007,100 @@ fn op_column_deferred(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    cursor_id: usize,
+    pager: &Arc<Pager>,
 ) -> InsnResult {
-    let mut op = state.active_op_state.take_column_deferred();
-    let result = op.resume(
-        VdbeCtx {
-            program,
-            state,
-            insn,
-        },
-        cursor_id,
-    );
-    state
-        .active_op_state
-        .put_column_deferred(op, matches!(result, Ok(IOResult::IO(_))));
-    match result? {
-        IOResult::Done(()) => {
-            state.pc += 1;
-            Ok(InsnFunctionStepResult::Step)
+    step_async_op(program, state, insn, pager, AsyncOp::ColumnDeferred)
+}
+
+/// The opcodes that run as async functions, with the async function of
+/// each. Every one has a slot in the program state that keeps its boxed
+/// future between steps and reuses it for the next operation.
+macro_rules! async_ops {
+    ($($op:ident => $slot:ident: $body:path,)+) => {
+        #[repr(u8)]
+        #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+        pub(crate) enum AsyncOp {
+            $($op,)+
         }
+
+        impl AsyncOp {
+            /// Boxes the runner of this opcode. Runs once per program state
+            /// and opcode, on the first step.
+            pub(super) fn new_runner(self) -> VdbeOp {
+                match self {
+                    $(AsyncOp::$op => VdbeOp(Runner::boxed(|co, ()| {
+                        with_handle(co, (), async |co, ()| $body(co).await)
+                    })),)+
+                }
+            }
+        }
+
+        #[derive(Debug, Default)]
+        pub(crate) struct AsyncOpSlots {
+            $($slot: Option<VdbeOp>,)+
+        }
+
+        impl AsyncOpSlots {
+            pub(super) fn slot(&mut self, op: AsyncOp) -> &mut Option<VdbeOp> {
+                match op {
+                    $(AsyncOp::$op => &mut self.$slot,)+
+                }
+            }
+        }
+    };
+}
+
+async_ops! {
+    ColumnDeferred => column_deferred: column_deferred,
+    RowIdDeferred => row_id_deferred: row_id_deferred,
+    Destroy => destroy: destroy,
+    ClearBtree => clear_btree: clear_btree,
+    IdxDelete => idx_delete: idx_delete,
+}
+
+/// Runs one step of the async opcode `op`: starts it when none is suspended
+/// and resumes it otherwise. The async function sets the program counter
+/// before it finishes, so a finished step only reports `Step`.
+#[inline(always)]
+pub(crate) fn step_async_op(
+    program: &Program,
+    state: &mut ProgramState,
+    insn: &Insn,
+    pager: &Arc<Pager>,
+    op: AsyncOp,
+) -> InsnResult {
+    let mut runner = state.active_op_state.take_async(op);
+    let mut ctx = VdbeCtx {
+        program,
+        state,
+        insn,
+        pager,
+        err: None,
+    };
+    let result = runner.0.resume(&mut ctx, ());
+    let active = runner.0.is_active();
+    state.active_op_state.put_async(op, runner, active);
+    match result? {
+        IOResult::Done(()) => Ok(InsnFunctionStepResult::Step),
         IOResult::IO(io) => Ok(state.suspend_on_io(io)),
     }
 }
 
-/// The async Column operation, boxed once per program state and reused.
-pub(crate) struct ColumnDeferredOp(BoxedResumable<VdbeStep, usize, (), Box<LimboError>>);
+/// The runner of one async opcode, boxed once per program state and reused.
+pub(crate) struct VdbeOp(BoxedResumable<VdbeStep, (), ()>);
 
-impl ColumnDeferredOp {
-    pub(crate) fn new() -> Self {
-        Self(Runner::boxed(|co, cursor_id| {
-            with_handle(co, cursor_id, column_deferred)
-        }))
-    }
-
-    fn is_active(&self) -> bool {
-        self.0.is_active()
-    }
-
-    fn resume(&mut self, mut ctx: VdbeCtx<'_>, cursor_id: usize) -> IOResultOr<()> {
-        self.0.resume(&mut ctx, cursor_id)
-    }
-
+impl VdbeOp {
     pub(crate) fn cancel(&mut self) {
         self.0.cancel();
     }
 }
 
-impl std::fmt::Debug for ColumnDeferredOp {
+impl std::fmt::Debug for VdbeOp {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(if self.is_active() {
-            "ColumnDeferredOp(active)"
+        f.write_str(if self.0.is_active() {
+            "VdbeOp(active)"
         } else {
-            "ColumnDeferredOp(idle)"
+            "VdbeOp(idle)"
         })
     }
 }
@@ -2067,6 +2109,7 @@ impl std::fmt::Debug for ColumnDeferredOp {
 pub(crate) struct VdbeStep;
 
 impl StepContext for VdbeStep {
+    type Error = Box<LimboError>;
     type Ctx<'a> = VdbeCtx<'a>;
 }
 
@@ -2076,9 +2119,14 @@ pub(crate) struct VdbeCtx<'a> {
     program: &'a Program,
     state: &'a mut ProgramState,
     insn: &'a Insn,
+    /// The main pager of the connection, as the dispatch loop passes it to
+    /// every opcode.
+    pager: &'a Arc<Pager>,
+    /// The error of a step that failed, until `resume` picks it up.
+    err: Option<Box<LimboError>>,
 }
 
-impl YieldSlot for VdbeCtx<'_> {
+impl YieldSlot<Box<LimboError>> for VdbeCtx<'_> {
     fn park_io(&mut self, io: IOCompletions) {
         self.state.suspend_on_io(io);
     }
@@ -2086,21 +2134,33 @@ impl YieldSlot for VdbeCtx<'_> {
     fn take_io(&mut self) -> Option<IOCompletions> {
         self.state.io_completions.take()
     }
+
+    fn park_err(&mut self, err: Box<LimboError>) {
+        self.err = Some(err);
+    }
+
+    fn take_err(&mut self) -> Option<Box<LimboError>> {
+        self.err.take()
+    }
 }
 
 /// Column when a deferred seek is pending or the fetch was suspended for IO:
 /// reads the rowid from the index cursor, seeks the table cursor, fetches.
-async fn column_deferred(co: &mut Co<VdbeStep>, cursor_id: usize) -> Result<(), Box<LimboError>> {
+async fn column_deferred(co: &mut Co<VdbeStep>) -> Result<(), Box<LimboError>> {
+    let cursor_id = co.with(|ctx| column_cursor_of(ctx.insn));
     if let Some(deferred) = co.with(|ctx| ctx.state.deferred_seeks[cursor_id].take()) {
         let rowid = co
             .io(|ctx| index_cursor_rowid(ctx.state, deferred.index_cursor_id))
-            .await?;
+            .await;
         let Some(rowid) = rowid else {
-            co.with(|ctx| column_fetch_of(ctx.insn).write_null_regs(ctx.state));
+            co.with(|ctx| {
+                column_fetch_of(ctx.insn).write_null_regs(ctx.state);
+                ctx.state.pc += 1;
+            });
             return Ok(());
         };
         co.io(|ctx| seek_table_row(ctx.state, deferred.table_cursor_id, rowid))
-            .await?;
+            .await;
         co.with(|ctx| {
             let metrics = &mut ctx.state.metrics;
             metrics.btree_seeks = metrics.btree_seeks.wrapping_add(1);
@@ -2110,7 +2170,8 @@ async fn column_deferred(co: &mut Co<VdbeStep>, cursor_id: usize) -> Result<(), 
         });
     }
     co.io(|ctx| fetch_columns(ctx.program, ctx.state, ctx.insn, cursor_id))
-        .await
+        .await;
+    Ok(())
 }
 
 #[inline(always)]
@@ -2137,8 +2198,9 @@ fn seek_table_row(
     }
 }
 
-/// Runs the fetch of a Column-family instruction. A fetch parks its
-/// completion in the program state, so this takes it out again for the yield.
+/// Runs the fetch of a Column-family instruction and moves to the next
+/// instruction when it is done. A fetch parks its completion in the program
+/// state, so this takes it out again for the yield.
 #[inline(always)]
 fn fetch_columns(
     program: &Program,
@@ -2147,14 +2209,19 @@ fn fetch_columns(
     cursor_id: usize,
 ) -> IOResultOr<()> {
     match column_fetch_of(insn).fetch(program, state, cursor_id)? {
-        InsnFunctionStepResult::IO => {
-            let io = state
-                .io_completions
-                .take()
-                .expect("an IO step parks a completion");
-            Ok(IOResult::IO(io))
+        InsnFunctionStepResult::IO => Ok(IOResult::IO(state.take_suspended_io())),
+        _ => {
+            state.pc += 1;
+            Ok(IOResult::Done(()))
         }
-        _ => Ok(IOResult::Done(())),
+    }
+}
+
+#[inline(always)]
+fn column_cursor_of(insn: &Insn) -> usize {
+    match insn {
+        Insn::Column { cursor_id, .. } | Insn::ColumnRange { cursor_id, .. } => *cursor_id,
+        _ => unreachable!("column_deferred runs only for Column and ColumnRange"),
     }
 }
 
@@ -6125,29 +6192,15 @@ pub fn op_row_data(
     Ok(InsnFunctionStepResult::Step)
 }
 
-#[derive(Debug, Clone, Copy)]
-pub enum OpRowIdState {
-    Start,
-    Record {
-        index_cursor_id: usize,
-        table_cursor_id: usize,
-    },
-    Seek {
-        rowid: i64,
-        table_cursor_id: usize,
-    },
-    GetRowid,
-}
-
 // Not in test builds: inline(always) makes fn-item coercions produce
 // per-site copies in debug, breaking test_make_sure_correct_insn_table's
 // pointer-identity check.
 #[cfg_attr(not(test), inline(always))]
 pub fn op_row_id(
-    _program: &Program,
+    program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    _pager: &Arc<Pager>,
+    pager: &Arc<Pager>,
 ) -> InsnResult {
     load_insn!(RowId { cursor_id, dest }, insn);
     // Fast path: no deferred seek pending and no suspended state machine, so
@@ -6160,86 +6213,66 @@ pub fn op_row_id(
         }
         return Ok(result);
     }
-    op_row_id_deferred(state, *cursor_id, *dest)
+    step_async_op(program, state, insn, pager, AsyncOp::RowIdDeferred)
 }
 
 /// RowId when a deferred seek is pending or the read was suspended for IO
-/// inside the seek: drives the op-state machine to completion.
-#[inline(never)]
-fn op_row_id_deferred(state: &mut ProgramState, cursor_id: usize, dest: usize) -> InsnResult {
-    loop {
-        match *state.active_op_state.row_id() {
-            OpRowIdState::Start => {
-                if let Some(deferred) = state.deferred_seeks[cursor_id].take() {
-                    *state.active_op_state.row_id() = OpRowIdState::Record {
-                        index_cursor_id: deferred.index_cursor_id,
-                        table_cursor_id: deferred.table_cursor_id,
-                    };
-                } else {
-                    *state.active_op_state.row_id() = OpRowIdState::GetRowid;
-                }
-            }
-            OpRowIdState::Record {
-                index_cursor_id,
-                table_cursor_id,
-            } => {
-                let rowid = {
-                    let index_cursor = state.get_cursor(index_cursor_id);
-                    match index_cursor {
-                        Cursor::BTree(_) | Cursor::Dyn(_) => {
-                            let index_cursor = index_cursor.as_btree_mut();
-                            let record = return_if_io!(state, index_cursor.record());
-                            let record =
-                                record.as_ref().expect("index cursor should have a record");
-                            let rowid = record
-                                .last_value()
-                                .expect("record should have a last value");
-                            match rowid {
-                                Ok(ValueRef::Numeric(Numeric::Integer(rowid))) => rowid,
-                                _ => unreachable!(),
-                            }
-                        }
-                        Cursor::IndexMethod(index_cursor) => {
-                            return_if_io!(state, index_cursor.query_rowid())
-                                .expect("index cursor should have a rowid")
-                        }
-                        _ => panic!("unexpected cursor type"),
-                    }
-                };
-                *state.active_op_state.row_id() = OpRowIdState::Seek {
-                    rowid,
-                    table_cursor_id,
-                }
-            }
-            OpRowIdState::Seek {
-                rowid,
-                table_cursor_id,
-            } => {
-                {
-                    let table_cursor = state.get_cursor(table_cursor_id);
-                    let table_cursor = table_cursor.as_btree_mut();
-                    return_if_io!(
-                        state,
-                        table_cursor.seek(SeekKey::TableRowId(rowid), SeekOp::GE { eq_only: true })
-                    );
-                }
-                *state.active_op_state.row_id() = OpRowIdState::GetRowid;
-            }
-            OpRowIdState::GetRowid => {
-                let result = op_row_id_read(state, cursor_id, dest)?;
-                if !matches!(result, InsnFunctionStepResult::Step) {
-                    // IO yield: the slot stays at GetRowid so the resume
-                    // re-enters this arm.
-                    return Ok(result);
-                }
-                break;
+/// inside the seek: reads the rowid from the record of the index cursor,
+/// seeks the table cursor, reads the rowid.
+async fn row_id_deferred(co: &mut Co<VdbeStep>) -> Result<(), Box<LimboError>> {
+    let (cursor_id, dest) = co.with(|ctx| {
+        load_insn!(RowId { cursor_id, dest }, ctx.insn);
+        (*cursor_id, *dest)
+    });
+    if let Some(deferred) = co.with(|ctx| ctx.state.deferred_seeks[cursor_id].take()) {
+        let rowid = co
+            .io(|ctx| index_record_rowid(ctx.state, deferred.index_cursor_id))
+            .await;
+        co.io(|ctx| seek_table_row(ctx.state, deferred.table_cursor_id, rowid))
+            .await;
+    }
+    co.io(|ctx| read_row_id(ctx.state, cursor_id, dest)).await;
+    Ok(())
+}
+
+/// The rowid at the end of the record the index cursor is on.
+#[inline(always)]
+fn index_record_rowid(state: &mut ProgramState, index_cursor_id: usize) -> IOResultOr<i64> {
+    let index_cursor = state.get_cursor(index_cursor_id);
+    match index_cursor {
+        Cursor::BTree(_) | Cursor::Dyn(_) => {
+            let record = match index_cursor.as_btree_mut().record()? {
+                IOResult::Done(record) => record,
+                IOResult::IO(io) => return Ok(IOResult::IO(io)),
+            };
+            let record = record.as_ref().expect("index cursor should have a record");
+            let rowid = record
+                .last_value()
+                .expect("record should have a last value");
+            match rowid {
+                Ok(ValueRef::Numeric(Numeric::Integer(rowid))) => Ok(IOResult::Done(rowid)),
+                _ => unreachable!(),
             }
         }
+        Cursor::IndexMethod(index_cursor) => Ok(index_cursor
+            .query_rowid()?
+            .map(|rowid| rowid.expect("index cursor should have a rowid"))),
+        _ => panic!("unexpected cursor type"),
     }
+}
 
-    state.active_op_state.clear();
-    state.pc += 1;
-    Ok(InsnFunctionStepResult::Step)
+/// Reads the rowid into the register and moves to the next instruction. The
+/// read parks its completion in the program state, so this takes it out
+/// again for the yield.
+#[inline(always)]
+fn read_row_id(state: &mut ProgramState, cursor_id: usize, dest: usize) -> IOResultOr<()> {
+    match op_row_id_read(state, cursor_id, dest)? {
+        InsnFunctionStepResult::IO => Ok(IOResult::IO(state.take_suspended_io())),
+        _ => {
+            state.pc += 1;
+            Ok(IOResult::Done(()))
+        }
+    }
 }
 
 /// Reads the rowid of the cursor's current position into a register.
@@ -6895,6 +6928,34 @@ pub fn seek_internal(
         state.seek_state = OpSeekState::Start;
     }
     result
+}
+
+/// Runs one step of a seek for an async opcode: `true` when the cursor is on
+/// a matching record.
+#[allow(clippy::too_many_arguments)]
+#[inline(always)]
+fn seek_step(
+    program: &Program,
+    state: &mut ProgramState,
+    pager: &Arc<Pager>,
+    record_source: RecordSource,
+    cursor_id: usize,
+    is_index: bool,
+    op: SeekOp,
+) -> IOResultOr<bool> {
+    match seek_internal(
+        program,
+        state,
+        pager,
+        record_source,
+        cursor_id,
+        is_index,
+        op,
+    )? {
+        SeekInternalResult::Found => Ok(IOResult::Done(true)),
+        SeekInternalResult::NotFound => Ok(IOResult::Done(false)),
+        SeekInternalResult::IO(io) => Ok(IOResult::IO(io)),
+    }
 }
 
 /// Returns the tie-breaker ordering for SQLite index comparison opcodes.
@@ -12865,12 +12926,6 @@ pub fn op_delete(
     Ok(InsnFunctionStepResult::Step)
 }
 
-#[derive(Debug)]
-pub enum OpIdxDeleteState {
-    Seeking,
-    Verifying,
-    Deleting,
-}
 pub fn op_idx_delete(
     program: &Program,
     state: &mut ProgramState,
@@ -12882,7 +12937,7 @@ pub fn op_idx_delete(
             cursor_id,
             start_reg,
             num_regs,
-            raise_error_if_no_matching_entry,
+            ..
         },
         insn
     );
@@ -12897,90 +12952,101 @@ pub fn op_idx_delete(
         return Ok(InsnFunctionStepResult::Step);
     }
 
-    loop {
-        #[cfg(debug_assertions)]
-        tracing::debug!(
-            "op_idx_delete(cursor_id={}, start_reg={}, num_regs={}, rootpage={}, state={:?})",
-            cursor_id,
-            start_reg,
-            num_regs,
-            state.get_cursor(*cursor_id).as_btree_mut().root_page(),
-            state.active_op_state.idx_delete()
+    step_async_op(program, state, insn, pager, AsyncOp::IdxDelete)
+}
+
+/// Deletes the index entry that matches the key in the registers: seeks to
+/// it, reads its rowid, deletes the cell.
+async fn idx_delete(co: &mut Co<VdbeStep>) -> Result<(), Box<LimboError>> {
+    let (cursor_id, start_reg, num_regs, raise_error_if_no_matching_entry) = co.with(|ctx| {
+        load_insn!(
+            IdxDelete {
+                cursor_id,
+                start_reg,
+                num_regs,
+                raise_error_if_no_matching_entry,
+            },
+            ctx.insn
         );
-        match state.active_op_state.idx_delete() {
-            OpIdxDeleteState::Seeking => {
-                let found = match seek_internal(
-                    program,
-                    state,
-                    pager,
-                    RecordSource::Unpacked {
-                        start_reg: *start_reg,
-                        num_regs: *num_regs,
-                    },
-                    *cursor_id,
-                    true,
-                    SeekOp::GE { eq_only: true },
-                ) {
-                    Ok(SeekInternalResult::Found) => true,
-                    Ok(SeekInternalResult::NotFound) => false,
-                    Ok(SeekInternalResult::IO(io)) => return Ok(state.suspend_on_io(io)),
-                    Err(e) => return Err(e.into()),
-                };
+        (
+            *cursor_id,
+            *start_reg,
+            *num_regs,
+            *raise_error_if_no_matching_entry,
+        )
+    });
+    let record_source = RecordSource::Unpacked {
+        start_reg,
+        num_regs,
+    };
 
-                if !found {
-                    // If we didn't find it because a txn we depended on was aborted, then it means it isn't really corrupt, we simply
-                    // might have found some garbage data because other tx trashed all row versions we depended on (basically it sets begin: None, end: None).
-                    if program.connection.mvcc_tx_should_abort() {
-                        return Err(LimboError::CommitDependencyAborted.into());
-                    }
-                    // If P5 is not zero, then raise an SQLITE_CORRUPT_INDEX error if no matching index entry is found
-                    // Also, do not raise this (self-correcting and non-critical) error if in writable_schema mode.
-
-                    if *raise_error_if_no_matching_entry {
-                        let reg_values = (*start_reg..*start_reg + *num_regs)
-                            .map(|i| &state.registers[i])
-                            .collect::<Vec<_>>();
-                        return Err(LimboError::Corrupt(format!(
-                            "IdxDelete: no matching index entry found for key {reg_values:?} while seeking"
-                        )).into());
-                    }
-                    state.pc += 1;
-                    state.active_op_state.clear();
-                    return Ok(InsnFunctionStepResult::Step);
-                }
-                *state.active_op_state.idx_delete() = OpIdxDeleteState::Verifying;
+    let found = co
+        .io(|ctx| {
+            seek_step(
+                ctx.program,
+                ctx.state,
+                ctx.pager,
+                record_source,
+                cursor_id,
+                true,
+                SeekOp::GE { eq_only: true },
+            )
+        })
+        .await;
+    if !found {
+        return co.with(|ctx| {
+            // If we didn't find it because a txn we depended on was aborted, then it means it isn't really corrupt, we simply
+            // might have found some garbage data because other tx trashed all row versions we depended on (basically it sets begin: None, end: None).
+            if ctx.program.connection.mvcc_tx_should_abort() {
+                return Err(LimboError::CommitDependencyAborted.into());
             }
-            OpIdxDeleteState::Verifying => {
-                let rowid = {
-                    let cursor = state.get_cursor(*cursor_id);
-                    let cursor = cursor.as_btree_mut();
-                    return_if_io!(state, cursor.rowid())
-                };
-
-                if rowid.is_none() && *raise_error_if_no_matching_entry {
-                    let reg_values = (*start_reg..*start_reg + *num_regs)
-                        .map(|i| &state.registers[i])
-                        .collect::<Vec<_>>();
-                    return Err(LimboError::Corrupt(format!(
-                        "IdxDelete: no matching index entry found for key while verifying: {reg_values:?}"
-                    )).into());
-                }
-                *state.active_op_state.idx_delete() = OpIdxDeleteState::Deleting;
+            // If P5 is not zero, then raise an SQLITE_CORRUPT_INDEX error if no matching index entry is found
+            // Also, do not raise this (self-correcting and non-critical) error if in writable_schema mode.
+            if raise_error_if_no_matching_entry {
+                return Err(corrupt_missing_index_entry(
+                    ctx.state, start_reg, num_regs, "seeking",
+                ));
             }
-            OpIdxDeleteState::Deleting => {
-                {
-                    let cursor = state.get_cursor(*cursor_id);
-                    let cursor = cursor.as_btree_mut();
-                    return_if_io!(state, cursor.delete());
-                }
-                // Increment metrics for index write (delete is a write operation)
-                state.record_rows_written(1);
-                state.pc += 1;
-                state.active_op_state.clear();
-                return Ok(InsnFunctionStepResult::Step);
-            }
-        }
+            ctx.state.pc += 1;
+            Ok(())
+        });
     }
+
+    let rowid = co
+        .io(|ctx| ctx.state.get_cursor(cursor_id).as_btree_mut().rowid())
+        .await;
+    if rowid.is_none() && raise_error_if_no_matching_entry {
+        return Err(
+            co.with(|ctx| corrupt_missing_index_entry(ctx.state, start_reg, num_regs, "verifying"))
+        );
+    }
+
+    co.io(|ctx| ctx.state.get_cursor(cursor_id).as_btree_mut().delete())
+        .await;
+    co.with(|ctx| {
+        // Increment metrics for index write (delete is a write operation)
+        ctx.state.record_rows_written(1);
+        ctx.state.pc += 1;
+    });
+    Ok(())
+}
+
+/// The error an IdxDelete raises when the index has no entry for the key in
+/// the registers.
+#[inline(never)]
+fn corrupt_missing_index_entry(
+    state: &ProgramState,
+    start_reg: usize,
+    num_regs: usize,
+    while_doing: &str,
+) -> Box<LimboError> {
+    let reg_values = (start_reg..start_reg + num_regs)
+        .map(|i| &state.registers[i])
+        .collect::<Vec<_>>();
+    LimboError::Corrupt(format!(
+        "IdxDelete: no matching index entry found for key {reg_values:?} while {while_doing}"
+    ))
+    .into()
 }
 
 #[derive(Debug, PartialEq, Copy, Clone)]
@@ -14053,68 +14119,46 @@ pub fn op_index_method_query(
     Ok(InsnFunctionStepResult::Step)
 }
 
-pub enum OpDestroyState {
-    CreateCursor,
-    DestroyBtree(Arc<RwLock<BTreeCursor>>),
-}
-
-/// State carried across asynchronous steps while clearing an existing b-tree.
-pub enum OpClearBtreeState {
-    CreateCursor,
-    ClearBtree {
-        pager: Arc<Pager>,
-        cursor: Arc<RwLock<BTreeCursor>>,
-    },
-}
-
 pub fn op_destroy(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
     pager: &Arc<Pager>,
 ) -> InsnResult {
-    load_insn!(
-        Destroy {
-            db,
-            root,
-            former_root_reg,
-            is_temp: _,
-        },
-        insn
-    );
+    load_insn!(Destroy { db, .. }, insn);
     let mv_store = program.connection.mv_store_for_db(*db);
     if mv_store.is_some() {
         // MVCC only does pager operations in checkpoint
         state.pc += 1;
         return Ok(InsnFunctionStepResult::Step);
     }
+    step_async_op(program, state, insn, pager, AsyncOp::Destroy)
+}
 
-    let destroy_pager = if *db != MAIN_DB_ID {
-        program.get_pager_from_database_index(db)?
-    } else {
-        pager.clone()
-    };
-
-    loop {
-        match state.active_op_state.destroy() {
-            OpDestroyState::CreateCursor => {
-                // Destroy doesn't do anything meaningful with the table/index distinction so we can just use a
-                // table btree cursor for both.
-                let cursor = BTreeCursor::new(destroy_pager.clone(), *root, 0);
-                *state.active_op_state.destroy() =
-                    OpDestroyState::DestroyBtree(Arc::new(RwLock::new(cursor)));
-            }
-            OpDestroyState::DestroyBtree(ref mut cursor) => {
-                let destroyed = cursor.write().btree_destroy();
-                let maybe_former_root_page = return_if_io!(state, destroyed);
-                state.registers[*former_root_reg]
-                    .set_int(maybe_former_root_page.unwrap_or(0) as i64);
-                state.active_op_state.clear();
-                state.pc += 1;
-                return Ok(InsnFunctionStepResult::Step);
-            }
-        }
-    }
+/// Destroys the b-tree at the root of the instruction and writes the root
+/// page that moved into its place, or 0, to the register.
+async fn destroy(co: &mut Co<VdbeStep>) -> Result<(), Box<LimboError>> {
+    let (root, former_root_reg, pager) = co.with(|ctx| {
+        load_insn!(
+            Destroy {
+                db,
+                root,
+                former_root_reg,
+                is_temp: _,
+            },
+            ctx.insn
+        );
+        pager_for_db(ctx.program, ctx.pager, *db).map(|pager| (*root, *former_root_reg, pager))
+    })?;
+    // Destroy doesn't do anything meaningful with the table/index distinction so we can just use a
+    // table btree cursor for both.
+    let mut cursor = BTreeCursor::new(pager, root, 0);
+    let former_root_page = co.io(|_| cursor.btree_destroy()).await;
+    co.with(|ctx| {
+        ctx.state.registers[former_root_reg].set_int(former_root_page.unwrap_or(0) as i64);
+        ctx.state.pc += 1;
+    });
+    Ok(())
 }
 
 /// Executes `ClearBtree` by deleting all cells from a persistent b-tree root.
@@ -14129,65 +14173,37 @@ pub fn op_clear_btree(
     insn: &Insn,
     pager: &Arc<Pager>,
 ) -> InsnResult {
-    match op_clear_btree_inner(program, state, insn, pager) {
-        Ok(result) => Ok(result),
-        Err(err) => {
-            if !matches!(*err, LimboError::Busy | LimboError::BusySnapshot) {
-                state.active_op_state.clear();
-            }
-            Err(err)
-        }
-    }
-}
-
-fn op_clear_btree_inner(
-    program: &Program,
-    state: &mut ProgramState,
-    insn: &Insn,
-    pager: &Arc<Pager>,
-) -> InsnResult {
-    load_insn!(ClearBtree { db, root }, insn);
-
-    let mv_store = program.connection.mv_store_for_db(*db);
-    if mv_store.is_some() {
+    load_insn!(ClearBtree { db, .. }, insn);
+    if program.connection.mv_store_for_db(*db).is_some() {
         return Err(LimboError::InternalError(
             "ClearBtree is not supported in MVCC mode".to_string(),
         )
         .into());
     }
+    step_async_op(program, state, insn, pager, AsyncOp::ClearBtree)
+}
 
-    let clear_pager = if *db != MAIN_DB_ID {
-        program.get_pager_from_database_index(db)?
-    } else {
-        pager.clone()
-    };
-
-    loop {
-        match state.active_op_state.clear_btree() {
-            OpClearBtreeState::CreateCursor => {
-                let cursor = BTreeCursor::new(clear_pager.clone(), *root, 0);
-                *state.active_op_state.clear_btree() = OpClearBtreeState::ClearBtree {
-                    pager: clear_pager.clone(),
-                    cursor: Arc::new(RwLock::new(cursor)),
-                };
-            }
-            OpClearBtreeState::ClearBtree { pager, cursor } => {
-                let cleared = cursor.write().clear_btree();
-                return_if_io!(state, cleared);
-                for other_cursor_opt in state.cursors.iter_mut().flatten() {
-                    if let Cursor::BTree(_) | Cursor::Dyn(_) = other_cursor_opt {
-                        let btree_cursor = other_cursor_opt.as_btree_mut();
-                        if Arc::ptr_eq(&btree_cursor.get_pager(), pager) {
-                            btree_cursor.invalidate_btree_cache();
-                        }
-                    }
+/// Deletes every cell of the b-tree at the root of the instruction, then
+/// invalidates the cached pages of the other cursors on the same pager.
+async fn clear_btree(co: &mut Co<VdbeStep>) -> Result<(), Box<LimboError>> {
+    let (root, pager) = co.with(|ctx| {
+        load_insn!(ClearBtree { db, root }, ctx.insn);
+        pager_for_db(ctx.program, ctx.pager, *db).map(|pager| (*root, pager))
+    })?;
+    let mut cursor = BTreeCursor::new(pager.clone(), root, 0);
+    co.io(|_| cursor.clear_btree()).await;
+    co.with(|ctx| {
+        for other_cursor in ctx.state.cursors.iter_mut().flatten() {
+            if let Cursor::BTree(_) | Cursor::Dyn(_) = other_cursor {
+                let btree_cursor = other_cursor.as_btree_mut();
+                if Arc::ptr_eq(&btree_cursor.get_pager(), &pager) {
+                    btree_cursor.invalidate_btree_cache();
                 }
-                state.active_op_state.clear();
-                state.pc += 1;
-                return Ok(InsnFunctionStepResult::Step);
             }
         }
-    }
+        ctx.state.pc += 1;
+    });
+    Ok(())
 }
 
 pub fn op_reset_sorter(
