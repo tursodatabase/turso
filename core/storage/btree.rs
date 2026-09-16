@@ -14,7 +14,6 @@ use crate::alloc::{TursoFromIterator, TursoSliceExt, TursoVecExt};
 use crate::coro::{with_handle, BoxedResumable, Co, Runner, StepContext, YieldSlot};
 #[cfg(any(test, injected_yields))]
 use crate::mvcc::yield_hooks::{ProvidesYieldContext, YieldContext, YieldPointMarker};
-use crate::mvcc::yield_points::inject_io_yield;
 use crate::{
     io::CompletionGroup,
     io_yield_one,
@@ -336,33 +335,6 @@ impl Default for BalanceState {
     }
 }
 
-/// State machine of a write operation.
-/// May involve balancing due to overflow.
-#[derive(Debug)]
-enum WriteState {
-    Start,
-    /// Overwrite an existing cell.
-    /// In addition to deleting the old cell and writing a new one,
-    /// we may also need to clear the old cell's overflow pages
-    /// and add them to the freelist.
-    Overwrite {
-        page: PageRef,
-        cell_idx: usize,
-        // This is an Option although it's not optional; we `take` it as owned for [BTreeCursor::overwrite_cell]
-        // to work around the borrow checker, and then insert it back if overwriting returns IO.
-        state: Option<OverwriteCellState>,
-    },
-    /// Insert a new cell. This path is taken when inserting a new row.
-    Insert {
-        page: PageRef,
-        cell_idx: usize,
-        new_payload: crate::alloc::Vec<u8>,
-        fill_cell_payload_state: FillCellPayloadState,
-    },
-    Balancing,
-    Finish,
-}
-
 #[cfg(any(test, injected_yields))]
 #[derive(Debug, Clone, Copy)]
 #[repr(u8)]
@@ -496,8 +468,6 @@ unsafe impl Sync for BalanceInfo {}
 /// was suspended due to IO.
 enum CursorState {
     None,
-    /// The cursor is in a write operation.
-    Write(WriteState),
     Destroy(DestroyInfo),
     Delete(DeleteState),
 }
@@ -523,7 +493,6 @@ impl Debug for CursorState {
             Self::Delete(..) => write!(f, "Delete"),
             Self::Destroy(..) => write!(f, "Destroy"),
             Self::None => write!(f, "None"),
-            Self::Write(..) => write!(f, "Write"),
         }
     }
 }
@@ -1149,6 +1118,8 @@ enum BtreeArgs<'a> {
     Seek(SeekKey<'a>),
     /// The registers that hold the key of a seek on an index.
     SeekUnpacked(&'a [Register]),
+    /// The key and record of an insert.
+    Insert(&'a BTreeKey<'a>),
 }
 
 /// The values of a seek key, held on the stack up to
@@ -1162,6 +1133,14 @@ impl BtreeArgs<'_> {
         match self {
             BtreeArgs::Seek(SeekKey::TableRowId(rowid)) => Some(*rowid),
             _ => None,
+        }
+    }
+
+    /// The key of an insert.
+    fn insert_key(&self) -> &BTreeKey<'_> {
+        match self {
+            BtreeArgs::Insert(key) => key,
+            _ => unreachable!("an insert needs its key"),
         }
     }
 
@@ -1253,6 +1232,7 @@ macro_rules! cursor_ops {
 }
 
 cursor_ops! {
+    insert_page / run_insert_page: () => () = insert_page,
     seek / run_seek: SeekOp => SeekResult = seek,
     next / run_next: () => () = next,
     prev / run_prev: () => () = prev,
@@ -1264,6 +1244,94 @@ cursor_ops! {
     seek_end / run_seek_end: () => () = seek_end,
     last / run_last: () => () = last,
     seek_to_last / run_seek_to_last: () => () = seek_to_last,
+}
+
+/// Writes the record of the key in the step context at the cursor
+/// position: a new cell, or the new payload of the cell the cursor is on.
+/// Balances the btree when the page overflows or underflows, then puts
+/// the cursor back on the key.
+async fn insert_page(co: &mut Co<BtreeStep>, (): ()) -> OpResult<()> {
+    let usable_space = co.with(|ctx| ctx.cursor.usable_space());
+    match co
+        .io(|ctx| ctx.cursor.insert_start(ctx.args.insert_key()))
+        .await
+    {
+        WritePlan::Overwrite { page, cell_idx } => {
+            let mut state = OverwriteCellState::AllocatePayload;
+            co.io(|ctx| {
+                let record = ctx
+                    .args
+                    .insert_key()
+                    .get_record()
+                    .expect("expected record present on insert");
+                ctx.cursor
+                    .overwrite_cell(&page, cell_idx, &record, &mut state)
+            })
+            .await;
+            let overflows = !page.get_contents().overflow_cells.is_empty();
+            let underflows = !overflows && {
+                let free_space = compute_free_space(page.get_contents(), usable_space)?;
+                free_space * 3 > usable_space * 2
+            };
+            if overflows || underflows {
+                co.with(|ctx| {
+                    turso_assert!(matches!(ctx.cursor.balance_state.sub_state, BalanceSubState::Start), "no balancing operation should be in progress during overwrite", { "sub_state": ctx.cursor.balance_state.sub_state });
+                    // If we balance, we must save the cursor position and seek to it later.
+                    ctx.cursor
+                        .save_context(CursorContext::seek_eq_only(ctx.args.insert_key()));
+                });
+                co.io(|ctx| ctx.cursor.balance(None)).await;
+            }
+        }
+        WritePlan::Insert {
+            page,
+            cell_idx,
+            mut payload,
+        } => {
+            let mut fill_cell_payload_state = FillCellPayloadState::Start;
+            co.io(|ctx| {
+                let key = ctx.args.insert_key();
+                let record = key.get_record().expect("expected record present on insert");
+                fill_cell_payload(
+                    &PinGuard::new(page.clone()),
+                    key.maybe_rowid(),
+                    &mut payload,
+                    cell_idx,
+                    &record,
+                    usable_space,
+                    &ctx.cursor.pager,
+                    &mut fill_cell_payload_state,
+                )
+            })
+            .await;
+            let overflows = co.with(|ctx| {
+                ctx.cursor
+                    .insert_cell(&page, cell_idx, payload, usable_space)
+            })?;
+            if overflows {
+                co.with(|ctx| {
+                    turso_assert!(matches!(ctx.cursor.balance_state.sub_state, BalanceSubState::Start), "no balancing operation should be in progress during insert", { "sub_state": ctx.cursor.balance_state.sub_state });
+                    // If we balance, we must save the cursor position and seek to it later.
+                    ctx.cursor
+                        .save_context(CursorContext::seek_eq_only(ctx.args.insert_key()));
+                });
+                #[cfg(any(test, injected_yields))]
+                if let Some(io) = co.with(|ctx| {
+                    ctx.cursor.injected_io_yield(
+                        BTreeWriteYieldPoint::AfterInsertOverflowCellBeforeBalance,
+                    )
+                }) {
+                    co.yield_io(io).await;
+                }
+                co.io(|ctx| ctx.cursor.balance(None)).await;
+            }
+        }
+    }
+    // if there was a balance triggered, the cursor position is invalid.
+    // it's probably not the greatest idea in the world to do this eagerly here,
+    // but at least it works.
+    co.io(|ctx| ctx.cursor.restore_context()).await;
+    Ok(())
 }
 
 /// Moves the cursor to the record that matches the seek key and seek
@@ -1572,6 +1640,19 @@ async fn wait_for_read(co: &mut Co<BtreeStep>, completion: Option<Completion>) {
     if let Some(completion) = completion {
         co.yield_io(IOCompletions(completion)).await;
     }
+}
+
+/// What a write does on the page under the cursor.
+enum WritePlan {
+    /// Overwrite the cell the cursor is on with the new payload.
+    Overwrite { page: PageRef, cell_idx: usize },
+    /// Put a new cell at the cursor position. The payload buffer is the
+    /// reusable one of the cursor, taken for this write.
+    Insert {
+        page: PageRef,
+        cell_idx: usize,
+        payload: crate::alloc::Vec<u8>,
+    },
 }
 
 /// One page of the descent of a seek.
@@ -2983,234 +3064,128 @@ impl BTreeCursor {
         }
     }
 
-    /// Insert a record into the btree.
-    /// If the insert operation overflows the page, it will be split and the btree will be balanced.
+    /// The first step of a write: finds the cell of the key on the page
+    /// under the cursor. A cell with the same key gets overwritten. Else a
+    /// new cell goes in at the cursor position, with the reusable payload
+    /// buffer of the cursor.
     #[cfg_attr(debug_assertions, instrument(skip_all, level = Level::DEBUG))]
-    fn insert_into_page(&mut self, bkey: &BTreeKey) -> IOResultOr<()> {
+    fn insert_start(&mut self, bkey: &BTreeKey) -> IOResultOr<WritePlan> {
         let record = bkey
             .get_record()
             .expect("expected record present on insert");
-        if let CursorState::None = &self.state {
-            std::mem::forget(std::mem::replace(
-                &mut self.state,
-                CursorState::Write(WriteState::Start),
-            ));
-        }
         let usable_space = self.usable_space();
-        let ret = loop {
-            let CursorState::Write(write_state) = &mut self.state else {
-                panic!("expected write state");
-            };
-            match write_state {
-                WriteState::Start => {
-                    let page = self.stack.top();
+        let page = self.stack.top();
 
-                    // get page and find cell
-                    let cell_idx = {
-                        self.pager.add_dirty(&page)?;
-                        self.stack.current_cell_index()
-                    };
-                    if cell_idx == -1 {
-                        // This might be a brand new table and the cursor hasn't moved yet. Let's advance it to the first slot.
-                        self.stack.set_cell_index(0);
-                    }
-                    let cell_idx = self.stack.current_cell_index() as usize;
-                    tracing::debug!(cell_idx);
-
-                    // if the cell index is less than the total cells, check: if its an existing
-                    // rowid, we are going to update / overwrite the cell
-                    if cell_idx < page.get_contents().cell_count() {
-                        let cell = page.get_contents().cell_get(cell_idx, usable_space)?;
-                        match cell {
-                            BTreeCell::TableLeafCell(tbl_leaf) => {
-                                if tbl_leaf.rowid == bkey.to_rowid() {
-                                    tracing::debug!("TableLeafCell: found exact match with cell_idx={cell_idx}, overwriting");
-                                    self.has_record = true;
-                                    *write_state = WriteState::Overwrite {
-                                        page,
-                                        cell_idx,
-                                        state: Some(OverwriteCellState::AllocatePayload),
-                                    };
-                                    continue;
-                                }
-                            }
-                            BTreeCell::IndexLeafCell(..) | BTreeCell::IndexInteriorCell(..) => {
-                                return_if_io!(self.record());
-                                let cmp = compare_immutable_iter(
-                                    record.iter()?,
-                                    self.get_immutable_record()
-                                        .as_ref()
-                                        .unwrap()
-                                        .iter()?,
-                                        &self.index_info.as_ref().unwrap().key_info,
-                                )?;
-                                if cmp == Ordering::Equal {
-                                    tracing::debug!("IndexLeafCell: found exact match with cell_idx={cell_idx}, overwriting");
-                                    self.set_has_record(true);
-                                    let CursorState::Write(write_state) = &mut self.state else {
-                                        panic!("expected write state");
-                                    };
-                                    *write_state = WriteState::Overwrite {
-                                        page,
-                                        cell_idx,
-                                        state: Some(OverwriteCellState::AllocatePayload),
-                                    };
-                                    continue;
-                                } else {
-                                    turso_assert!(
-                                        !matches!(cell, BTreeCell::IndexInteriorCell(..)),
-                                         "we should not be inserting a new index interior cell. the only valid operation on an index interior cell is an overwrite!"
-                                    );
-                                }
-                            }
-                            other => panic!("unexpected cell type, expected TableLeaf or IndexLeaf, found: {other:?}"),
-                        }
-                    }
-
-                    let CursorState::Write(write_state) = &mut self.state else {
-                        panic!("expected write state");
-                    };
-                    // Reuse the cell payload buffer to avoid allocations
-                    let mut payload = take_vec(&mut self.reusable_cell_payload);
-                    payload.clear();
-                    // Reserve capacity if needed (typical cell is small)
-                    // child pointer (4) + payload size varint (up to 9) + rowid varint (up to 9)
-                    const MAX_CELL_HEADER: usize = 22;
-                    let needed_capacity = record.get_payload().len() + MAX_CELL_HEADER;
-                    if payload.capacity() < needed_capacity {
-                        crate::with_btree_allocation_site!(
-                            CellPayload,
-                            payload.try_reserve(needed_capacity - payload.capacity())
-                        )?;
-                    }
-                    // The current state (`WriteState::Start`) has no allocations, so
-                    // we std::mem::forget it to save on drop glue
-                    std::mem::forget(std::mem::replace(
-                        write_state,
-                        WriteState::Insert {
-                            page,
-                            cell_idx,
-                            new_payload: payload,
-                            fill_cell_payload_state: FillCellPayloadState::Start,
-                        },
-                    ));
-                    continue;
-                }
-                WriteState::Insert {
-                    page,
-                    cell_idx,
-                    new_payload,
-                    ref mut fill_cell_payload_state,
-                } => {
-                    return_if_io!(fill_cell_payload(
-                        &PinGuard::new(page.clone()),
-                        bkey.maybe_rowid(),
-                        new_payload,
-                        *cell_idx,
-                        &record,
-                        usable_space,
-                        &self.pager,
-                        fill_cell_payload_state,
-                    ));
-
-                    {
-                        let contents = page.get_contents();
-                        tracing::debug!(name: "overflow", cell_count = contents.cell_count());
-
-                        insert_into_cell(
-                            contents,
-                            new_payload.as_slice(),
-                            *cell_idx,
-                            usable_space,
-                        )?;
-                    };
-                    self.stack.set_cell_index(*cell_idx as i32);
-                    let overflows = !page.get_contents().overflow_cells.is_empty();
-
-                    // Recover the reusable buffer before transitioning state
-                    let recovered_payload = take_vec(new_payload);
-                    self.reusable_cell_payload = recovered_payload;
-
-                    if overflows {
-                        *write_state = WriteState::Balancing;
-                        turso_assert!(matches!(self.balance_state.sub_state, BalanceSubState::Start), "no balancing operation should be in progress during insert", { "state": self.state, "sub_state": self.balance_state.sub_state });
-                        // If we balance, we must save the cursor position and seek to it later.
-                        self.save_context(CursorContext::seek_eq_only(bkey));
-                        inject_io_yield!(
-                            self,
-                            BTreeWriteYieldPoint::AfterInsertOverflowCellBeforeBalance
-                        );
-                    } else {
-                        *write_state = WriteState::Finish;
-                    }
-                    continue;
-                }
-                WriteState::Overwrite {
-                    page,
-                    cell_idx,
-                    ref mut state,
-                } => {
-                    turso_assert!(page.is_loaded(), "page is not loaded", { "page_id": page.get().id() });
-                    let page = page.clone();
-
-                    // Currently it's necessary to .take() here to prevent double-borrow of `self` in `overwrite_cell`.
-                    // We insert the state back if overwriting returns IO.
-                    let mut state = state.take().expect("state should be present");
-                    let cell_idx = *cell_idx;
-                    if let IOResult::IO(io) =
-                        self.overwrite_cell(&page, cell_idx, &record, &mut state)?
-                    {
-                        let CursorState::Write(write_state) = &mut self.state else {
-                            panic!("expected write state");
-                        };
-                        *write_state = WriteState::Overwrite {
-                            page,
-                            cell_idx,
-                            state: Some(state),
-                        };
-                        return Ok(IOResult::IO(io));
-                    }
-                    let overflows = !page.get_contents().overflow_cells.is_empty();
-                    let underflows = !overflows && {
-                        let free_space = compute_free_space(page.get_contents(), usable_space)?;
-                        free_space * 3 > usable_space * 2
-                    };
-                    let CursorState::Write(write_state) = &mut self.state else {
-                        panic!("expected write state");
-                    };
-                    if overflows || underflows {
-                        *write_state = WriteState::Balancing;
-                        turso_assert!(matches!(self.balance_state.sub_state, BalanceSubState::Start), "no balancing operation should be in progress during overwrite", { "state": self.state, "sub_state": self.balance_state.sub_state });
-                        // If we balance, we must save the cursor position and seek to it later.
-                        self.save_context(CursorContext::seek_eq_only(bkey));
-                    } else {
-                        *write_state = WriteState::Finish;
-                    }
-                    continue;
-                }
-                WriteState::Balancing => {
-                    return_if_io!(self.balance(None));
-                    let CursorState::Write(write_state) = &mut self.state else {
-                        panic!("expected write state");
-                    };
-                    *write_state = WriteState::Finish;
-                }
-                WriteState::Finish => {
-                    break Ok(IOResult::Done(()));
-                }
-            };
+        // get page and find cell
+        let cell_idx = {
+            self.pager.add_dirty(&page)?;
+            self.stack.current_cell_index()
         };
-        if matches!(self.state, CursorState::Write(WriteState::Finish)) {
-            // if there was a balance triggered, the cursor position is invalid.
-            // it's probably not the greatest idea in the world to do this eagerly here,
-            // but at least it works.
-            return_if_io!(self.restore_context());
-            // WriteState::Finish owns nothing: std::mem::forget it to skip the drop glue
-            std::mem::forget(std::mem::replace(&mut self.state, CursorState::None));
-        } else {
-            self.state = CursorState::None;
+        if cell_idx == -1 {
+            // This might be a brand new table and the cursor hasn't moved yet. Let's advance it to the first slot.
+            self.stack.set_cell_index(0);
         }
-        ret
+        let cell_idx = self.stack.current_cell_index() as usize;
+        tracing::debug!(cell_idx);
+
+        // if the cell index is less than the total cells, check: if its an existing
+        // rowid, we are going to update / overwrite the cell
+        if cell_idx < page.get_contents().cell_count() {
+            let cell = page.get_contents().cell_get(cell_idx, usable_space)?;
+            match cell {
+                BTreeCell::TableLeafCell(tbl_leaf) => {
+                    if tbl_leaf.rowid == bkey.to_rowid() {
+                        tracing::debug!(
+                            "TableLeafCell: found exact match with cell_idx={cell_idx}, overwriting"
+                        );
+                        self.has_record = true;
+                        return Ok(IOResult::Done(WritePlan::Overwrite { page, cell_idx }));
+                    }
+                }
+                BTreeCell::IndexLeafCell(..) | BTreeCell::IndexInteriorCell(..) => {
+                    return_if_io!(self.record());
+                    let cmp = compare_immutable_iter(
+                        record.iter()?,
+                        self.get_immutable_record().as_ref().unwrap().iter()?,
+                        &self.index_info.as_ref().unwrap().key_info,
+                    )?;
+                    if cmp == Ordering::Equal {
+                        tracing::debug!(
+                            "IndexLeafCell: found exact match with cell_idx={cell_idx}, overwriting"
+                        );
+                        self.set_has_record(true);
+                        return Ok(IOResult::Done(WritePlan::Overwrite { page, cell_idx }));
+                    } else {
+                        turso_assert!(
+                            !matches!(cell, BTreeCell::IndexInteriorCell(..)),
+                            "we should not be inserting a new index interior cell. the only valid operation on an index interior cell is an overwrite!"
+                        );
+                    }
+                }
+                other => panic!(
+                    "unexpected cell type, expected TableLeaf or IndexLeaf, found: {other:?}"
+                ),
+            }
+        }
+
+        // Reuse the cell payload buffer to avoid allocations
+        let mut payload = take_vec(&mut self.reusable_cell_payload);
+        payload.clear();
+        // Reserve capacity if needed (typical cell is small)
+        // child pointer (4) + payload size varint (up to 9) + rowid varint (up to 9)
+        const MAX_CELL_HEADER: usize = 22;
+        let needed_capacity = record.get_payload().len() + MAX_CELL_HEADER;
+        if payload.capacity() < needed_capacity {
+            crate::with_btree_allocation_site!(
+                CellPayload,
+                payload.try_reserve(needed_capacity - payload.capacity())
+            )?;
+        }
+        Ok(IOResult::Done(WritePlan::Insert {
+            page,
+            cell_idx,
+            payload,
+        }))
+    }
+
+    /// Puts the filled cell payload into the page at the cursor position
+    /// and gives the payload buffer back to the cursor. True if the page
+    /// overflows.
+    fn insert_cell(
+        &mut self,
+        page: &PageRef,
+        cell_idx: usize,
+        mut payload: crate::alloc::Vec<u8>,
+        usable_space: usize,
+    ) -> OpResult<bool> {
+        {
+            let contents = page.get_contents();
+            tracing::debug!(name: "overflow", cell_count = contents.cell_count());
+
+            insert_into_cell(contents, payload.as_slice(), cell_idx, usable_space)?;
+        };
+        self.stack.set_cell_index(cell_idx as i32);
+        let overflows = !page.get_contents().overflow_cells.is_empty();
+
+        // Recover the reusable buffer
+        self.reusable_cell_payload = take_vec(&mut payload);
+        Ok(overflows)
+    }
+
+    /// The I/O yield a test asked for at this point of a write, if any.
+    #[cfg(any(test, injected_yields))]
+    fn injected_io_yield(&self, point: BTreeWriteYieldPoint) -> Option<IOCompletions> {
+        use crate::mvcc::yield_hooks::ProvidesYieldContext;
+        let yield_context = self.yield_context();
+        match crate::mvcc::yield_hooks::maybe_inject_io_yield::<(), _>(
+            yield_context.injector.as_ref(),
+            yield_context.instance_id,
+            yield_context.selection_key,
+            point,
+        ) {
+            Some(IOResult::IO(io)) => Some(io),
+            _ => None,
+        }
     }
 
     /// Balance a leaf page.
@@ -5706,7 +5681,7 @@ impl BTreeCursor {
     fn blob_position_is_live(&self) -> bool {
         self.valid_state == CursorValidState::Valid
             && self.has_record
-            && matches!(self.state, CursorState::None)
+            && !self.has_pending_write()
             && self.stack.current_page >= 0
     }
 
@@ -6247,7 +6222,13 @@ impl BTreeCursor {
     }
 
     pub fn is_write_in_progress(&self) -> bool {
-        matches!(self.state, CursorState::Write(_))
+        self.ops.insert_page.is_active()
+    }
+
+    /// True while an insert, a delete, or a destroy is suspended in the
+    /// cursor.
+    fn has_pending_write(&self) -> bool {
+        self.ops.insert_page.is_active() || !matches!(self.state, CursorState::None)
     }
 
     /// True iff the cursor sits on a valid record that is NOT the first cell of
@@ -6323,7 +6304,7 @@ impl BTreeCursor {
     /// to expire exactly when their own row is hit (sqlite3's
     /// invalidateIncrblobCursors, btree.c:672).
     fn drive_pending_peer_save(&mut self, written_rowid: Option<i64>) -> IOResultOr<()> {
-        if self.pending_peer_save.is_none() && matches!(self.state, CursorState::None) {
+        if self.pending_peer_save.is_none() && !self.has_pending_write() {
             // BTCF_Multiple fast path (sqlite3 btree.c:9348).
             if !self.has_peers.load(crate::sync::atomic::Ordering::Relaxed) {
                 return Ok(IOResult::Done(()));
@@ -6473,7 +6454,7 @@ impl BTreeCursor {
         // Overflow cells are page-local scratch for the cursor's in-flight balance.
         // If the cursor is abandoned after queueing them, cached pages may outlive
         // the cursor and must not carry that scratch into later writes.
-        if matches!(self.state, CursorState::None)
+        if !self.has_pending_write()
             && matches!(self.balance_state.sub_state, BalanceSubState::Start)
         {
             turso_assert!(
@@ -6487,22 +6468,6 @@ impl BTreeCursor {
 
         for page in self.stack.stack.iter().flatten() {
             page.get().overflow_cells.clear();
-        }
-
-        // Insert/overwrite can stage overflow cells before balance_info is populated.
-        // If the cursor is dropped in that window, this page handle is the only owner
-        // of that transient state.
-        match &self.state {
-            CursorState::Write(WriteState::Insert { page, .. })
-            | CursorState::Write(WriteState::Overwrite { page, .. }) => {
-                page.get().overflow_cells.clear();
-            }
-            CursorState::Write(WriteState::Start)
-            | CursorState::Write(WriteState::Balancing)
-            | CursorState::Write(WriteState::Finish)
-            | CursorState::Destroy(_)
-            | CursorState::Delete(_)
-            | CursorState::None => {}
         }
 
         if let Some(balance_info) = &self.balance_state.balance_info {
@@ -6790,7 +6755,7 @@ impl CursorTrait for BTreeCursor {
         self.noted_payload = NotedPayload::NONE;
         // saveAllCursors at the head of sqlite3BtreeInsert (btree.c:9348).
         return_if_io!(self.drive_pending_peer_save(key.maybe_rowid()));
-        return_if_io!(self.insert_into_page(key));
+        return_if_io!(self.run_insert_page(BtreeArgs::Insert(key), ()));
         self.invalidate_count_cache();
         if key.maybe_rowid().is_some() {
             self.set_has_record(true);
@@ -7227,7 +7192,7 @@ impl CursorTrait for BTreeCursor {
         // to be freed; peers must drop their page stacks rather than save
         // positions that wouldn't outlive the clear (cf. sqlite3BtreeClearTable,
         // btree.c:10194).
-        if matches!(self.state, CursorState::None) {
+        if !self.has_pending_write() {
             self.pager.invalidate_peer_cursors(self);
             self.invalidate_count_cache();
             // Every page in this btree is about to be freed, so our own cached
@@ -7247,7 +7212,7 @@ impl CursorTrait for BTreeCursor {
     #[cfg_attr(debug_assertions, instrument(skip(self), level = Level::DEBUG))]
     fn btree_destroy(&mut self) -> IOResultOr<Option<usize>> {
         // See clear_btree for the state==None gate rationale.
-        if matches!(self.state, CursorState::None) {
+        if !self.has_pending_write() {
             self.pager.invalidate_peer_cursors(self);
         }
         self.destroy_btree_contents(false)
@@ -7401,7 +7366,7 @@ impl CursorTrait for BTreeCursor {
         // A peer mid-Insert/Delete may not yet have reached its own
         // save_context-at-balance point, so we can't claim it's saved. Fall
         // back to invalidation; the peer will re-navigate on next use.
-        if !matches!(self.state, CursorState::None) {
+        if self.has_pending_write() {
             return Ok(IOResult::Done(SavePositionResult::MustInvalidate));
         }
         if self.stack.current_page < 0
