@@ -1543,6 +1543,18 @@ fn emit_update_insns<'a>(
     let update_affects_virtual_columns = affected_columns.count() > updated_column_indices.count();
     let has_returning = returning.as_ref().is_some_and(|r| !r.is_empty());
     if let Table::BTree(ref btree) = target_table.table {
+        if btree.is_strict {
+            program.emit_insn(Insn::TypeCheck {
+                start_reg: start,
+                count: layout.num_non_virtual_cols(),
+                check_generated: false,
+                table_reference: BTreeTable::input_type_check_table_ref(
+                    btree,
+                    t_ctx.resolver.schema(),
+                    Some(&updated_column_indices),
+                )?,
+            });
+        }
         let has_check_constraints = !btree.check_constraints.is_empty();
         let cols = btree.columns();
         let virtual_col_names: HashSet<String> = cols
@@ -1567,18 +1579,16 @@ fn emit_update_insns<'a>(
                 .is_some_and(expr_references_virtual)
         });
 
-        if update_affects_virtual_columns
+        if btree.is_strict
+            || update_affects_virtual_columns
             || has_before_triggers
             || has_after_triggers
             || has_returning
             || has_check_constraints
             || index_references_virtual_column
         {
-            let columns = target_table.table.columns();
-
-            //TODO don't emit all virtual columns
             let dml_ctx =
-                DmlColumnContext::layout(columns, start, effective_rowid_reg, layout.clone());
+                DmlColumnContext::layout(cols, start, effective_rowid_reg, layout.clone());
             compute_virtual_columns(
                 program,
                 &btree.columns_topo_sort()?,
@@ -1673,39 +1683,6 @@ fn emit_update_insns<'a>(
     // This ensures that if a constraint fails, indexes remain consistent.
     if let Some(btree_table) = target_table.table.btree() {
         if btree_table.is_strict {
-            let set_col_indices: ColumnMask = set_clauses
-                .iter()
-                .map(|set_clause| set_clause.column_index)
-                .try_collect()?;
-
-            // Pre-encode TypeCheck: validate SET column input types.
-            // Non-SET columns hold encoded values from disk, so skip them (ANY).
-            program.emit_insn(Insn::TypeCheck {
-                start_reg: start,
-                count: layout.num_non_virtual_cols(),
-                check_generated: false,
-                table_reference: BTreeTable::input_type_check_table_ref(
-                    &btree_table,
-                    t_ctx.resolver.schema(),
-                    Some(&set_col_indices),
-                )?,
-            });
-
-            // Generated expressions must see base values after STRICT affinity coercion.
-            let dml_ctx = DmlColumnContext::layout(
-                btree_table.columns(),
-                start,
-                effective_rowid_reg,
-                layout.clone(),
-            );
-            compute_virtual_columns(
-                program,
-                &btree_table.columns_topo_sort()?,
-                &dml_ctx,
-                &t_ctx.resolver,
-                &btree_table,
-            )?;
-
             // Encode only SET clause columns. Non-SET columns were read from disk
             // and are already encoded; re-encoding them would corrupt data.
             crate::translate::expr::emit_custom_type_encode_columns(
@@ -1713,7 +1690,7 @@ fn emit_update_insns<'a>(
                 &t_ctx.resolver,
                 btree_table.columns(),
                 start,
-                Some(&set_col_indices),
+                Some(&updated_column_indices),
                 table_name,
                 &layout,
             )?;

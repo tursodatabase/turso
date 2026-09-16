@@ -5572,6 +5572,35 @@ expect {
     2|45|1
 }
 
+setup strict_update_generated_columns {
+    CREATE TABLE t(a INTEGER, b INTEGER AS(a + 1), c INTEGER, CHECK(b > 0)) STRICT;
+    INSERT INTO t VALUES(1, 0);
+}
+
+@skip-if mvcc "mvcc has different root pages"
+@setup strict_update_generated_columns
+snapshot strict_update_reuses_generated_columns_for_checks {
+    UPDATE t SET c = '42';
+}
+
+@setup strict_update_generated_columns
+test strict_update_generated_columns_values {
+    UPDATE t SET c = '42';
+    SELECT a, b, c FROM t;
+}
+expect {
+    1|2|42
+}
+
+test gencol_strict_update_checks_input_before_primary_key_conflict {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, a INT, b INT AS(a + 1)) STRICT;
+    INSERT INTO t VALUES(1, 1), (2, 2);
+    UPDATE OR IGNORE t SET id=2, a='bad' WHERE id=1;
+}
+expect error {
+    cannot store TEXT value in INT column t.a
+}
+
 test gencol_issue6161_strict_compute_after_replace_default {
     CREATE TABLE t(a TEXT NOT NULL ON CONFLICT REPLACE DEFAULT '42', b INT AS(a)) STRICT;
     INSERT INTO t VALUES(NULL);
