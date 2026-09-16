@@ -29,7 +29,6 @@ use crate::{
             FREELIST_TRUNK_OFFSET_NEXT_TRUNK_PTR, INTERIOR_PAGE_HEADER_SIZE_BYTES,
             LEAF_PAGE_HEADER_SIZE_BYTES, LEFT_CHILD_PTR_SIZE_BYTES,
         },
-        state_machines::MoveToState,
     },
     translate::plan::IterationDirection,
     turso_assert,
@@ -628,24 +627,6 @@ pub struct LeafPageBinarySearchState {
     target_cell_when_not_found: i32,
 }
 
-#[derive(Debug)]
-/// State used for seeking
-pub enum CursorSeekState {
-    Start,
-    MovingBetweenPages {
-        eq_seen: bool,
-    },
-    InteriorPageBinarySearch {
-        state: InteriorPageBinarySearchState,
-    },
-    FoundLeaf {
-        eq_seen: bool,
-    },
-    LeafPageBinarySearch {
-        state: LeafPageBinarySearchState,
-    },
-}
-
 /// Outcome of [`CursorTrait::try_save_position_for_external_balance`]. Mirrors
 /// the two paths SQLite's saveCursorPosition takes (btree.c:756) — succeed and
 /// have the caller skip invalidation, or fall through to clearing the cached
@@ -889,15 +870,12 @@ pub struct BTreeCursor {
     context: Option<CursorContext>,
     /// Store whether the Cursor is in a valid state. Meaning if it is pointing to a valid cell index or not
     pub valid_state: CursorValidState,
-    seek_state: CursorSeekState,
     /// The async operations of the cursor and their suspended state.
     ops: CursorOps,
     /// The id of the rightmost page in the btree, if known. When the cursor
     /// is already on that page, a move to the rightmost record skips the
     /// seek.
     rightmost_page_id: Option<usize>,
-    /// State machine for [BTreeCursor::move_to]
-    move_to_state: MoveToState,
     /// Whether the next call to [BTreeCursor::next()] should be a no-op.
     /// This is currently only used after a delete operation causes a rebalancing.
     /// Advancing is only skipped if the cursor is currently pointing to a valid record
@@ -1131,9 +1109,11 @@ impl StepContext for BtreeStep {
 
 /// The context of one step of an async cursor operation. The async function
 /// gets it back on every step, so it never keeps a reference to the cursor
-/// across a yield.
+/// or to the arguments across a yield.
 struct BtreeCtx<'a> {
     cursor: &'a mut BTreeCursor,
+    /// The arguments the caller borrows and passes again on every step.
+    args: BtreeArgs<'a>,
     /// The completion of a step that yielded, until `resume` picks it up.
     io: Option<IOCompletions>,
     /// The error of a step that failed, until `resume` picks it up.
@@ -1157,6 +1137,46 @@ impl YieldSlot<Box<LimboError>> for BtreeCtx<'_> {
 
     fn take_err(&mut self) -> Option<Box<LimboError>> {
         self.err.take()
+    }
+}
+
+/// Arguments that a caller borrows and passes again on every step of an
+/// operation. The future never keeps them: it reads them from the context
+/// of the current step.
+enum BtreeArgs<'a> {
+    None,
+    /// The key of a seek.
+    Seek(SeekKey<'a>),
+    /// The registers that hold the key of a seek on an index.
+    SeekUnpacked(&'a [Register]),
+}
+
+/// The values of a seek key, held on the stack up to
+/// [`STACK_ALLOC_KEY_VALS_MAX`] values.
+type KeyValues<'a> = SmallVec<[ValueRef<'a>; STACK_ALLOC_KEY_VALS_MAX]>;
+
+impl BtreeArgs<'_> {
+    /// The rowid of a seek on a table btree, or None for a seek on an
+    /// index.
+    fn table_rowid(&self) -> Option<i64> {
+        match self {
+            BtreeArgs::Seek(SeekKey::TableRowId(rowid)) => Some(*rowid),
+            _ => None,
+        }
+    }
+
+    /// The values of the key of a seek on an index.
+    fn index_key_values(&self) -> Result<KeyValues<'_>> {
+        match self {
+            BtreeArgs::Seek(SeekKey::IndexKey(index_key)) => {
+                Ok(KeyValues::from_vec(index_key.get_values()?))
+            }
+            BtreeArgs::SeekUnpacked(registers) => Ok(registers
+                .iter()
+                .map(|register| register.get_value().as_value_ref())
+                .collect()),
+            _ => unreachable!("a seek on an index needs an index key"),
+        }
     }
 }
 
@@ -1207,12 +1227,13 @@ macro_rules! cursor_ops {
         impl BTreeCursor {
             $(
             #[inline]
-            fn $run(&mut self, start: $args) -> IOResultOr<$out> {
+            fn $run(&mut self, args: BtreeArgs<'_>, start: $args) -> IOResultOr<$out> {
                 let mut runner = self.ops.$slot.runner.take().unwrap_or_else(|| {
                     Runner::boxed(|co, start| with_handle(co, start, $body))
                 });
                 let mut ctx = BtreeCtx {
                     cursor: self,
+                    args,
                     io: None,
                     err: None,
                 };
@@ -1232,6 +1253,7 @@ macro_rules! cursor_ops {
 }
 
 cursor_ops! {
+    seek / run_seek: SeekOp => SeekResult = seek,
     next / run_next: () => () = next,
     prev / run_prev: () => () = prev,
     next_record / run_next_record: () => bool = next_record,
@@ -1242,6 +1264,73 @@ cursor_ops! {
     seek_end / run_seek_end: () => () = seek_end,
     last / run_last: () => () = last,
     seek_to_last / run_seek_to_last: () => () = seek_to_last,
+}
+
+/// Moves the cursor to the record that matches the seek key and seek
+/// operation: the key is in the step context. A point query seeks one
+/// record (SELECT * FROM table WHERE col = 10), a range query seeks the
+/// first record past the key (SELECT * FROM table WHERE col > 10).
+async fn seek(co: &mut Co<BtreeStep>, op: SeekOp) -> OpResult<SeekResult> {
+    move_to_root(co).await;
+    match co.with(|ctx| ctx.args.table_rowid()) {
+        Some(rowid) => seek_table(co, rowid, op).await,
+        None => seek_index(co, op).await,
+    }
+}
+
+/// Seeks a rowid in a table btree. Table interior cells hold a rowid and a
+/// left child, and the page a rightmost child: every row with a rowid up
+/// to the cell's rowid is in the left child, every larger row in the child
+/// of the next cell or in the rightmost child. So a descent picks the
+/// child by rowid on every interior page until it is on a leaf, and a
+/// binary search of the leaf finds the row.
+async fn seek_table(co: &mut Co<BtreeStep>, rowid: i64, op: SeekOp) -> OpResult<SeekResult> {
+    loop {
+        match co
+            .io(|ctx| ctx.cursor.tablebtree_descend_step(rowid, op))
+            .await
+        {
+            Descent::Leaf => break,
+            Descent::Read(completion) => wait_for_read(co, completion).await,
+        }
+    }
+    co.with(|ctx| ctx.cursor.tablebtree_seek_leaf(rowid, op))
+}
+
+/// Seeks a key in an index btree: a descent by key to the leaf, then a
+/// binary search of the leaf. Index cells hold a record, which can
+/// continue on overflow pages, so a compare can yield: the position of
+/// the search on the page stays in the future.
+async fn seek_index(co: &mut Co<BtreeStep>, op: SeekOp) -> OpResult<SeekResult> {
+    let mut descent = IndexDescent {
+        search: None,
+        eq_seen: false,
+    };
+    loop {
+        let step = co
+            .io(|ctx| {
+                let key_values = ctx.args.index_key_values()?;
+                let record_comparer = ctx.cursor.index_record_comparer(&key_values);
+                ctx.cursor
+                    .indexbtree_descend(&key_values, record_comparer, op, &mut descent)
+            })
+            .await;
+        match step {
+            Descent::Leaf => break,
+            Descent::Read(completion) => wait_for_read(co, completion).await,
+        }
+    }
+    let eq_seen = descent.eq_seen;
+    let mut search = None;
+    let result = co
+        .io(|ctx| {
+            let key_values = ctx.args.index_key_values()?;
+            let record_comparer = ctx.cursor.index_record_comparer(&key_values);
+            ctx.cursor
+                .indexbtree_seek_leaf(&key_values, record_comparer, op, eq_seen, &mut search)
+        })
+        .await;
+    Ok(result)
 }
 
 /// Moves the cursor to the next record: the `Next` opcode when the next
@@ -1483,6 +1572,23 @@ async fn wait_for_read(co: &mut Co<BtreeStep>, completion: Option<Completion>) {
     if let Some(completion) = completion {
         co.yield_io(IOCompletions(completion)).await;
     }
+}
+
+/// One page of the descent of a seek.
+enum Descent {
+    /// The cursor is on the leaf.
+    Leaf,
+    /// The cursor moved into a child page, whose disk read completes with
+    /// this completion when it needs one.
+    Read(Option<Completion>),
+}
+
+/// Where the descent of a seek on an index is on the page on top of the
+/// stack: the binary search of the page, once it started, and whether a
+/// compare on the way down found the key.
+struct IndexDescent {
+    search: Option<InteriorPageBinarySearchState>,
+    eq_seen: bool,
 }
 
 /// One page of a move to the next record.
@@ -1932,10 +2038,8 @@ impl BTreeCursor {
             counted: None,
             context: None,
             valid_state,
-            seek_state: CursorSeekState::Start,
             ops: CursorOps::default(),
             rightmost_page_id: None,
-            move_to_state: MoveToState::Start,
             skip_advance: false,
             reusable_cell_payload: crate::alloc::vec![],
             blob_cache: BlobCellCache::default(),
@@ -2043,7 +2147,7 @@ impl BTreeCursor {
     /// Used in backwards iteration.
     #[cfg_attr(debug_assertions, instrument(skip(self), level = Level::DEBUG, name = "prev"))]
     pub fn get_prev_record(&mut self) -> IOResultOr<()> {
-        let has_record = return_if_io!(self.run_prev_record(()));
+        let has_record = return_if_io!(self.run_prev_record(BtreeArgs::None, ()));
         self.invalidate_record();
         self.set_has_record(has_record);
         Ok(IOResult::Done(()))
@@ -2059,11 +2163,14 @@ impl BTreeCursor {
         start_next_page: u32,
         payload_size: u64,
     ) -> IOResultOr<()> {
-        self.run_overflow_read(OverflowRead {
-            payload,
-            next_page: start_next_page,
-            payload_size,
-        })
+        self.run_overflow_read(
+            BtreeArgs::None,
+            OverflowRead {
+                payload,
+                next_page: start_next_page,
+                payload_size,
+            },
+        )
     }
 
     /// Check if any ancestor pages still have cells to iterate.
@@ -2084,32 +2191,11 @@ impl BTreeCursor {
             // https://github.com/tursodatabase/turso/issues/2924
             false
         } else {
-            return_if_io!(self.run_next_record(()))
+            return_if_io!(self.run_next_record(BtreeArgs::None, ()))
         };
         self.invalidate_record();
         self.set_has_record(has_record);
         Ok(IOResult::Done(()))
-    }
-
-    /// Move the cursor to the record that matches the seek key and seek operation.
-    /// This may be used to seek to a specific record in a point query (e.g. SELECT * FROM table WHERE col = 10)
-    /// or e.g. find the first record greater than the seek key in a range query (e.g. SELECT * FROM table WHERE col > 10).
-    /// We don't include the rowid in the comparison and that's why the last value from the record is not included.
-    fn do_seek(&mut self, key: SeekKey<'_>, op: SeekOp) -> IOResultOr<SeekResult> {
-        let ret = return_if_io!(match &key {
-            SeekKey::TableRowId(rowid) => self.tablebtree_seek(*rowid, op),
-            SeekKey::IndexKey(index_key) => {
-                self.indexbtree_seek(index_key, op)
-            }
-        });
-        self.valid_state = CursorValidState::Valid;
-        Ok(IOResult::Done(ret))
-    }
-
-    fn do_seek_unpacked(&mut self, registers: &[Register], op: SeekOp) -> IOResultOr<SeekResult> {
-        let ret = return_if_io!(self.indexbtree_seek_unpacked(registers, op));
-        self.valid_state = CursorValidState::Valid;
-        Ok(IOResult::Done(ret))
     }
 
     /// Pop the stack and mark that we are going upwards in the B-tree.
@@ -2147,7 +2233,7 @@ impl BTreeCursor {
 
     /// Non-blocking variant of [`BTreeCursor::move_to_root`].
     ///
-    /// Re-entrancy: `seek_state`, `going_upwards`, `stack.clear()` and
+    /// Re-entrancy: `going_upwards`, `stack.clear()` and
     /// `stack.push(root)` are all idempotent across re-entry — clearing an
     /// already-cleared stack and pushing the same root yields the same state.
     /// The disk-read completion (if any) is returned as the `Done` payload for
@@ -2155,7 +2241,6 @@ impl BTreeCursor {
     /// `move_to_root`.
     #[cfg_attr(debug_assertions, instrument(skip_all, level = Level::DEBUG))]
     fn move_to_root_nonblock(&mut self) -> IOResultOr<Option<Completion>> {
-        self.seek_state = CursorSeekState::Start;
         self.going_upwards = false;
         tracing::trace!(root_page = self.root_page);
         // The stack still holds the pinned root page from the last descent
@@ -2172,88 +2257,39 @@ impl BTreeCursor {
         Ok(IOResult::Done(c))
     }
 
-    /// Specialized version of move_to() for table btrees.
+    /// One interior page of the descent of a seek on a table btree: picks
+    /// the child by rowid and moves into it. On a leaf, does nothing.
     #[cfg_attr(debug_assertions, instrument(skip(self), level = Level::DEBUG))]
-    fn tablebtree_move_to(&mut self, rowid: i64, seek_op: SeekOp) -> IOResultOr<()> {
-        loop {
-            let (old_top_idx, is_leaf, cell_count) = {
-                let page = self.stack.top_ref();
-                let contents = page.get_contents();
-                (
-                    self.stack.current(),
-                    contents.is_leaf(),
-                    contents.cell_count(),
-                )
-            };
+    fn tablebtree_descend_step(&mut self, rowid: i64, seek_op: SeekOp) -> IOResultOr<Descent> {
+        let (old_top_idx, is_leaf, cell_count) = {
+            let page = self.stack.top_ref();
+            let contents = page.get_contents();
+            (
+                self.stack.current(),
+                contents.is_leaf(),
+                contents.cell_count(),
+            )
+        };
 
-            if is_leaf {
-                self.seek_state = CursorSeekState::FoundLeaf { eq_seen: false };
-                return Ok(IOResult::Done(()));
-            }
-
-            if matches!(
-                self.seek_state,
-                CursorSeekState::Start | CursorSeekState::MovingBetweenPages { .. }
-            ) {
-                let eq_seen = match &self.seek_state {
-                    CursorSeekState::MovingBetweenPages { eq_seen } => *eq_seen,
-                    _ => false,
-                };
-                let min_cell_idx = 0;
-                let max_cell_idx = cell_count as isize - 1;
-                let nearest_matching_cell = None;
-
-                self.seek_state = CursorSeekState::InteriorPageBinarySearch {
-                    state: InteriorPageBinarySearchState {
-                        min_cell_idx,
-                        max_cell_idx,
-                        nearest_matching_cell,
-                        eq_seen,
-                    },
-                };
-            }
-
-            let CursorSeekState::InteriorPageBinarySearch { state } = &self.seek_state else {
-                unreachable!("we must be in an interior binary search state");
-            };
-
-            let mut state = *state;
-
-            let control =
-                self.tablebtree_move_inner(rowid, seek_op, old_top_idx, cell_count, &mut state)?;
-            // Persist state if inner function didn't change seek_state to something else (e.g., MovingBetweenPages)
-            if matches!(
-                self.seek_state,
-                CursorSeekState::InteriorPageBinarySearch { .. }
-            ) {
-                self.seek_state = CursorSeekState::InteriorPageBinarySearch { state };
-            }
-            match control {
-                ControlFlow::Continue(_) => {}
-                ControlFlow::Break(result) => {
-                    return Ok(result);
-                }
-            }
+        if is_leaf {
+            return Ok(IOResult::Done(Descent::Leaf));
         }
-    }
 
-    fn tablebtree_move_inner(
-        &mut self,
-        rowid: i64,
-        seek_op: SeekOp,
-        old_top_idx: usize,
-        cell_count: usize,
-        state: &mut InteriorPageBinarySearchState,
-    ) -> Result<ControlFlow<IOResult<()>>> {
         // The compares need no I/O, so narrow the range on this page in one
-        // go. The caller persists the state once afterwards, before the child
-        // page read below, which is the only step here that can yield.
+        // go. The child page read below is the only step here that can
+        // yield, and a retry runs the compares again.
+        let mut state = InteriorPageBinarySearchState {
+            min_cell_idx: 0,
+            max_cell_idx: cell_count as isize - 1,
+            nearest_matching_cell: None,
+            eq_seen: false,
+        };
         {
             let contents = self.stack.get_page_contents_at_level(old_top_idx).unwrap();
             if matches!(seek_op, SeekOp::GE { .. } | SeekOp::LE { .. }) {
-                tablebtree_search_interior::<true>(contents, rowid, seek_op, state)?;
+                tablebtree_search_interior::<true>(contents, rowid, seek_op, &mut state)?;
             } else {
-                tablebtree_search_interior::<false>(contents, rowid, seek_op, state)?;
+                tablebtree_search_interior::<false>(contents, rowid, seek_op, &mut state)?;
             }
 
             #[inline]
@@ -2297,26 +2333,12 @@ impl BTreeCursor {
                 .get_page_contents_at_level(old_top_idx)
                 .unwrap()
                 .cell_interior_read_left_child_page(nearest_matching_cell)?;
-            // On `IO(spill_c)` we keep `seek_state` at
-            // `InteriorPageBinarySearch` (the caller persists `state` to
-            // it after we return), so re-entry retries this same step
-            // with no double-push and no cell-index drift.
-            match self.read_page(left_child_page as i64)? {
-                IOResult::Done((mem_page, c)) => {
-                    self.stack.set_cell_index(nearest_matching_cell as i32);
-                    self.stack.push(mem_page);
-                    self.seek_state = CursorSeekState::MovingBetweenPages {
-                        eq_seen: state.eq_seen,
-                    };
-                    if let Some(c) = c {
-                        return Ok(ControlFlow::Break(IOResult::IO(IOCompletions(c))));
-                    }
-                    return Ok(ControlFlow::Continue(()));
-                }
-                IOResult::IO(IOCompletions(spill_c)) => {
-                    return Ok(ControlFlow::Break(IOResult::IO(IOCompletions(spill_c))));
-                }
-            }
+            // On `IO(spill_c)` the stack is unchanged, so a retry pushes
+            // the child once and the cell index does not drift.
+            let (mem_page, c) = return_if_io!(self.read_page(left_child_page as i64));
+            self.stack.set_cell_index(nearest_matching_cell as i32);
+            self.stack.push(mem_page);
+            return Ok(IOResult::Done(Descent::Read(c)));
         }
         match self
             .stack
@@ -2324,87 +2346,41 @@ impl BTreeCursor {
             .unwrap()
             .rightmost_pointer()?
         {
-            Some(right_most_pointer) => match self.read_page(right_most_pointer as i64)? {
-                IOResult::Done((mem_page, c)) => {
-                    self.stack.set_cell_index(cell_count as i32 + 1);
-                    self.stack.push(mem_page);
-                    self.seek_state = CursorSeekState::MovingBetweenPages {
-                        eq_seen: state.eq_seen,
-                    };
-                    if let Some(c) = c {
-                        return Ok(ControlFlow::Break(IOResult::IO(IOCompletions(c))));
-                    }
-                    Ok(ControlFlow::Continue(()))
-                }
-                IOResult::IO(IOCompletions(spill_c)) => {
-                    Ok(ControlFlow::Break(IOResult::IO(IOCompletions(spill_c))))
-                }
-            },
+            Some(right_most_pointer) => {
+                let (mem_page, c) = return_if_io!(self.read_page(right_most_pointer as i64));
+                self.stack.set_cell_index(cell_count as i32 + 1);
+                self.stack.push(mem_page);
+                Ok(IOResult::Done(Descent::Read(c)))
+            }
             None => {
                 unreachable!("we shall not go back up! The only way is down the slope");
             }
         }
     }
 
-    /// Specialized version of move_to() for index btrees.
-    #[cfg_attr(debug_assertions, instrument(skip(self, index_key), level = Level::DEBUG))]
-    fn indexbtree_move_to(
-        &mut self,
-        index_key: &ImmutableRecordRef<'_>,
-        cmp: SeekOp,
-    ) -> IOResultOr<()> {
-        let key_values = index_key.get_values()?;
-        let record_comparer = {
-            let index_info = self
-                .index_info
-                .as_ref()
-                .expect("indexbtree_move_to: index_info required");
-            find_compare(key_values.iter().peekable(), index_info)
-        };
-        self.indexbtree_move_to_internal(cmp, record_comparer, &key_values)
-    }
-
-    /// Move cursor to position using registers directly, avoiding record serialization.
-    /// See `seek_unpacked` for rationale.
-    #[instrument(skip(self, registers), level = Level::DEBUG)]
-    fn indexbtree_move_to_unpacked(
-        &mut self,
-        registers: &[Register],
-        cmp: SeekOp,
-    ) -> IOResultOr<()> {
-        if matches!(
-            self.seek_state,
-            CursorSeekState::LeafPageBinarySearch { .. } | CursorSeekState::FoundLeaf { .. }
-        ) {
-            self.seek_state = CursorSeekState::Start;
-        }
-
-        if matches!(self.seek_state, CursorSeekState::Start) {
-            if let Some(c) = return_if_io!(self.move_to_root_nonblock()) {
-                return Ok(IOResult::IO(IOCompletions(c)));
-            }
-        }
-
+    /// The comparer for the key values of a seek on this index.
+    fn index_record_comparer(&self, key_values: &[ValueRef<'_>]) -> RecordCompare {
         let index_info = self
             .index_info
             .as_ref()
-            .expect("indexbtree_move_to_unpacked: index_info required");
-
-        let key_values: SmallVec<[ValueRef<'_>; STACK_ALLOC_KEY_VALS_MAX]> = registers
-            .iter()
-            .map(|r| r.get_value().as_value_ref())
-            .collect();
+            .expect("a seek on an index needs index_info");
         let record_comparer = find_compare(key_values.iter().peekable(), index_info);
-        self.indexbtree_move_to_internal(cmp, record_comparer, &key_values)
+        tracing::debug!("Using record comparison strategy: {:?}", record_comparer);
+        record_comparer
     }
 
-    fn indexbtree_move_to_internal(
+    /// The descent of a seek on an index btree: picks the child by key on
+    /// every interior page and moves into it, until it is on a leaf or a
+    /// child needs a disk read. A compare that reads an overflow chain can
+    /// yield: the search then continues on the same cell when the step
+    /// runs again.
+    fn indexbtree_descend(
         &mut self,
-        cmp: SeekOp,
-        record_comparer: RecordCompare,
         key_values: &[ValueRef<'_>],
-    ) -> IOResultOr<()> {
-        tracing::debug!("Using record comparison strategy: {:?}", record_comparer);
+        record_comparer: RecordCompare,
+        cmp: SeekOp,
+        descent: &mut IndexDescent,
+    ) -> IOResultOr<Descent> {
         let tie_breaker = get_tie_breaker_from_seek_op(cmp);
 
         loop {
@@ -2419,72 +2395,50 @@ impl BTreeCursor {
             };
 
             if is_leaf {
-                let eq_seen = match &self.seek_state {
-                    CursorSeekState::MovingBetweenPages { eq_seen } => *eq_seen,
-                    _ => false,
-                };
-                self.seek_state = CursorSeekState::FoundLeaf { eq_seen };
-                return Ok(IOResult::Done(()));
+                return Ok(IOResult::Done(Descent::Leaf));
             }
 
-            if matches!(
-                self.seek_state,
-                CursorSeekState::Start | CursorSeekState::MovingBetweenPages { .. }
-            ) {
-                let eq_seen = match &self.seek_state {
-                    CursorSeekState::MovingBetweenPages { eq_seen } => *eq_seen,
-                    _ => false,
-                };
-                let min_cell_idx = 0;
-                let max_cell_idx = cell_count as isize - 1;
-                let nearest_matching_cell = None;
+            let eq_seen = descent.eq_seen;
+            let state = descent
+                .search
+                .get_or_insert_with(|| InteriorPageBinarySearchState {
+                    min_cell_idx: 0,
+                    max_cell_idx: cell_count as isize - 1,
+                    nearest_matching_cell: None,
+                    eq_seen,
+                });
 
-                self.seek_state = CursorSeekState::InteriorPageBinarySearch {
-                    state: InteriorPageBinarySearchState {
-                        min_cell_idx,
-                        max_cell_idx,
-                        nearest_matching_cell,
-                        eq_seen,
-                    },
-                };
-            }
-
-            let CursorSeekState::InteriorPageBinarySearch { state } = &self.seek_state else {
-                unreachable!(
-                    "we must be in an interior binary search state, got {:?}",
-                    self.seek_state
-                );
-            };
-
-            let mut state = *state;
-
-            let control = self.indexbtree_move_to_inner(
+            let control = self.indexbtree_descend_page(
                 cmp,
                 old_top_idx,
                 cell_count,
                 record_comparer,
                 key_values,
                 tie_breaker,
-                &mut state,
+                state,
             )?;
-            // Persist state if inner function didn't change seek_state to something else (e.g., MovingBetweenPages)
-            if matches!(
-                self.seek_state,
-                CursorSeekState::InteriorPageBinarySearch { .. }
-            ) {
-                self.seek_state = CursorSeekState::InteriorPageBinarySearch { state };
-            }
             match control {
-                ControlFlow::Continue(_) => {}
-                ControlFlow::Break(result) => {
-                    return Ok(result);
+                ControlFlow::Continue(()) => {
+                    descent.eq_seen = state.eq_seen;
+                    descent.search = None;
+                }
+                ControlFlow::Break(IOResult::IO(io)) => return Ok(IOResult::IO(io)),
+                ControlFlow::Break(IOResult::Done(c)) => {
+                    descent.eq_seen = state.eq_seen;
+                    descent.search = None;
+                    return Ok(IOResult::Done(Descent::Read(c)));
                 }
             }
         }
     }
 
+    /// One interior page of the descent of a seek on an index: continues the
+    /// binary search of the page, then moves into the child it picked.
+    /// Continue means the child was in the page cache and the descent goes
+    /// on. Break means a step yielded, or the child needs the disk read of
+    /// the completion.
     #[expect(clippy::too_many_arguments)]
-    fn indexbtree_move_to_inner(
+    fn indexbtree_descend_page(
         &mut self,
         cmp: SeekOp,
         old_top_idx: usize,
@@ -2493,12 +2447,11 @@ impl BTreeCursor {
         key_values: &[ValueRef<'_>],
         tie_breaker: Ordering,
         state: &mut InteriorPageBinarySearchState,
-    ) -> Result<ControlFlow<IOResult<()>>> {
+    ) -> Result<ControlFlow<IOResult<Option<Completion>>>> {
         let iter_dir = cmp.iteration_direction();
         // Compare cells until the range is exhausted: only an overflow key
         // read can yield here, and it returns before the range changes, so
-        // re-entry retries the same cell. The caller persists the state once
-        // per call instead of once per compare.
+        // re-entry retries the same cell.
         let payload_limits = self.payload_limits;
         while state.min_cell_idx <= state.max_cell_idx {
             let cur_cell_idx = (state.min_cell_idx + state.max_cell_idx) >> 1; // rustc generates extra insns for (min+max)/2 due to them being isize. we know min&max are >=0 here.
@@ -2512,8 +2465,8 @@ impl BTreeCursor {
 
             let cell_payload: &[u8] = if let Some(next_page) = first_overflow_page {
                 let res = self.process_overflow_read(payload, next_page, payload_size)?;
-                if res.is_io() {
-                    return Ok(ControlFlow::Break(res));
+                if let IOResult::IO(io) = res {
+                    return Ok(ControlFlow::Break(IOResult::IO(io)));
                 }
                 self.get_immutable_record()
                     .expect("the overflow read filled the reusable record")
@@ -2593,18 +2546,15 @@ impl BTreeCursor {
                 .rightmost_pointer()?
             {
                 Some(right_most_pointer) => {
-                    // On `IO(spill_c)` keep seek_state at the binary
-                    // search so re-entry retries this same step. None
-                    // of the cursor mutations have happened yet.
+                    // On `IO(spill_c)` the search state stays with the
+                    // descent, so a retry runs this same step. None of the
+                    // cursor mutations have happened yet.
                     match self.read_page(right_most_pointer as i64)? {
                         IOResult::Done((mem_page, c)) => {
                             self.stack.set_cell_index(cell_count as i32 + 1);
                             self.stack.push(mem_page);
-                            self.seek_state = CursorSeekState::MovingBetweenPages {
-                                eq_seen: state.eq_seen,
-                            };
                             if let Some(c) = c {
-                                return Ok(ControlFlow::Break(IOResult::IO(IOCompletions(c))));
+                                return Ok(ControlFlow::Break(IOResult::Done(Some(c))));
                             }
                             return Ok(ControlFlow::Continue(()));
                         }
@@ -2650,11 +2600,8 @@ impl BTreeCursor {
                     self.stack.retreat();
                 }
                 self.stack.push(mem_page);
-                self.seek_state = CursorSeekState::MovingBetweenPages {
-                    eq_seen: state.eq_seen,
-                };
                 if let Some(c) = c {
-                    return Ok(ControlFlow::Break(IOResult::IO(IOCompletions(c))));
+                    return Ok(ControlFlow::Break(IOResult::Done(Some(c))));
                 }
             }
             IOResult::IO(IOCompletions(spill_c)) => {
@@ -2664,75 +2611,43 @@ impl BTreeCursor {
         Ok(ControlFlow::Continue(()))
     }
 
-    /// Specialized version of do_seek() for table btrees that uses binary search instead
-    /// of iterating cells in order.
+    /// The binary search of the leaf that a seek on a table btree descended
+    /// to.
     #[cfg_attr(debug_assertions, instrument(skip_all, level = Level::DEBUG))]
-    fn tablebtree_seek(&mut self, rowid: i64, seek_op: SeekOp) -> IOResultOr<SeekResult> {
-        if matches!(
-            self.seek_state,
-            CursorSeekState::Start
-                | CursorSeekState::MovingBetweenPages { .. }
-                | CursorSeekState::InteriorPageBinarySearch { .. }
-        ) {
-            // No need for another move_to_root. Move_to already moves to root
-            return_if_io!(self.move_to(SeekKey::TableRowId(rowid), seek_op));
-            let page = self.stack.top_ref();
-            let contents = page.get_contents();
-            turso_assert!(
-                contents.is_leaf(),
-                "tablebtree_seek() called on non-leaf page"
-            );
+    fn tablebtree_seek_leaf(&mut self, rowid: i64, seek_op: SeekOp) -> OpResult<SeekResult> {
+        let page = self.stack.top_ref();
+        let contents = page.get_contents();
+        turso_assert!(
+            contents.is_leaf(),
+            "tablebtree_seek() called on non-leaf page"
+        );
 
-            let cell_count = contents.cell_count();
-            if cell_count == 0 {
-                self.stack.set_cell_index(0);
-                return Ok(IOResult::Done(SeekResult::NotFound));
-            }
-            let min_cell_idx = 0;
-            let max_cell_idx = cell_count as isize - 1;
-
-            // If iter dir is forwards, we want the first cell that matches;
-            // If iter dir is backwards, we want the last cell that matches.
-            let nearest_matching_cell = None;
-
-            self.seek_state = CursorSeekState::LeafPageBinarySearch {
-                state: LeafPageBinarySearchState {
-                    min_cell_idx,
-                    max_cell_idx,
-                    nearest_matching_cell,
-                    eq_seen: false, // not relevant for table btrees
-                    target_cell_when_not_found: match seek_op.iteration_direction() {
-                        IterationDirection::Forwards => cell_count as i32,
-                        IterationDirection::Backwards => -1,
-                    },
-                },
-            };
+        let cell_count = contents.cell_count();
+        if cell_count == 0 {
+            self.stack.set_cell_index(0);
+            return Ok(SeekResult::NotFound);
         }
+        let min_cell_idx = 0;
+        let max_cell_idx = cell_count as isize - 1;
 
-        let CursorSeekState::LeafPageBinarySearch { state } = &self.seek_state else {
-            unreachable!("we must be in a leaf binary search state");
+        // If iter dir is forwards, we want the first cell that matches;
+        // If iter dir is backwards, we want the last cell that matches.
+        let nearest_matching_cell = None;
+
+        let mut state = LeafPageBinarySearchState {
+            min_cell_idx,
+            max_cell_idx,
+            nearest_matching_cell,
+            eq_seen: false, // not relevant for table btrees
+            target_cell_when_not_found: match seek_op.iteration_direction() {
+                IterationDirection::Forwards => cell_count as i32,
+                IterationDirection::Backwards => -1,
+            },
         };
 
         let page = self.stack.top_ref().clone();
         let contents = page.get_contents();
-        let mut state = *state;
-
-        loop {
-            let control = self.tablebtree_seek_inner(rowid, seek_op, contents, &mut state)?;
-            // Persist state after each iteration since inner function modifies it
-            if matches!(
-                self.seek_state,
-                CursorSeekState::LeafPageBinarySearch { .. }
-            ) {
-                self.seek_state = CursorSeekState::LeafPageBinarySearch { state };
-            }
-            match control {
-                ControlFlow::Continue(_) => {}
-                ControlFlow::Break(res) => {
-                    return Ok(res);
-                }
-            }
-        }
+        self.tablebtree_seek_inner(rowid, seek_op, contents, &mut state)
     }
 
     fn tablebtree_seek_inner(
@@ -2741,7 +2656,7 @@ impl BTreeCursor {
         seek_op: SeekOp,
         contents: &mut PageContent,
         state: &mut LeafPageBinarySearchState,
-    ) -> Result<ControlFlow<IOResult<SeekResult>>> {
+    ) -> OpResult<SeekResult> {
         if matches!(seek_op, SeekOp::GE { eq_only: true }) {
             return tablebtree_seek_impl::<true>(self, rowid, seek_op, contents, state);
         } else {
@@ -2755,7 +2670,7 @@ impl BTreeCursor {
             seek_op: SeekOp,
             contents: &mut PageContent,
             state: &mut LeafPageBinarySearchState,
-        ) -> Result<ControlFlow<IOResult<SeekResult>>> {
+        ) -> OpResult<SeekResult> {
             let seek_op = if EXACT_FORWARD {
                 SeekOp::GE { eq_only: true }
             } else {
@@ -2763,7 +2678,7 @@ impl BTreeCursor {
             };
             let iter_dir = seek_op.iteration_direction();
             // The compares need no I/O, so narrow the range on this leaf in one
-            // go; the caller persists the state once afterwards.
+            // go.
             let mut min = state.min_cell_idx;
             let mut max = state.max_cell_idx;
             while min <= max {
@@ -2791,7 +2706,7 @@ impl BTreeCursor {
                     state.max_cell_idx = max;
                     cursor.stack.set_cell_index(cur_cell_idx as i32);
                     cursor.set_has_record(true);
-                    return Ok(ControlFlow::Break(IOResult::Done(SeekResult::Found)));
+                    return Ok(SeekResult::Found);
                 }
 
                 if found {
@@ -2838,14 +2753,14 @@ impl BTreeCursor {
                 if let Some(nearest_matching_cell) = state.nearest_matching_cell {
                     cursor.stack.set_cell_index(nearest_matching_cell as i32);
                     cursor.set_has_record(true);
-                    return Ok(ControlFlow::Break(IOResult::Done(SeekResult::Found)));
+                    return Ok(SeekResult::Found);
                 }
             }
             // if !eq_only - matching entry can exist in neighbour leaf page
             // this can happen if key in the interiour page was deleted - but divider kept untouched
             // in such case BTree can navigate to the leaf which no longer has matching key for seek_op
             // in this case, caller must advance cursor if necessary
-            Ok(ControlFlow::Break(IOResult::Done(if seek_op.eq_only() {
+            Ok(if seek_op.eq_only() {
                 let has_record = target_cell_when_not_found >= 0
                     && target_cell_when_not_found < contents.cell_count() as i32;
                 cursor.has_record = has_record;
@@ -2855,84 +2770,23 @@ impl BTreeCursor {
                 // set cursor to the position where which would hold the op-boundary if it were present
                 cursor.stack.set_cell_index(target_cell_when_not_found);
                 SeekResult::TryAdvance
-            })))
+            })
         }
     }
 
+    /// The binary search of the leaf that a seek on an index descended to.
+    /// A compare that reads an overflow chain can yield: the search then
+    /// continues on the same cell when the step runs again.
     #[cfg_attr(debug_assertions, instrument(skip_all, level = Level::DEBUG))]
-    fn indexbtree_seek(
+    fn indexbtree_seek_leaf(
         &mut self,
-        key: &ImmutableRecordRef<'_>,
-        seek_op: SeekOp,
-    ) -> IOResultOr<SeekResult> {
-        let key_values = key.get_values()?;
-        let record_comparer = {
-            let index_info = self
-                .index_info
-                .as_ref()
-                .expect("indexbtree_seek: index_info required");
-            find_compare(key_values.iter().peekable(), index_info)
-        };
-
-        tracing::debug!(
-            "Using record comparison strategy for seek: {:?}",
-            record_comparer
-        );
-
-        self.indexbtree_seek_internal(seek_op, record_comparer, &key_values)
-    }
-
-    /// Seek using registers directly, avoiding record serialization overhead.
-    /// See `seek_unpacked` trait method for rationale.
-    #[instrument(skip_all, level = Level::DEBUG)]
-    fn indexbtree_seek_unpacked(
-        &mut self,
-        registers: &[Register],
-        seek_op: SeekOp,
-    ) -> IOResultOr<SeekResult> {
-        let index_info = self
-            .index_info
-            .as_ref()
-            .expect("indexbtree_seek_unpacked: index_info required");
-
-        // SmallVec stores up to MAX_STACK_KEY_VALUES on the stack, spilling to heap only if exceeded
-        let key_values: SmallVec<[ValueRef<'_>; STACK_ALLOC_KEY_VALS_MAX]> = registers
-            .iter()
-            .map(|r| r.get_value().as_value_ref())
-            .collect();
-        let record_comparer = find_compare(key_values.iter().peekable(), index_info);
-        tracing::debug!(
-            "Using record comparison strategy for seek: {:?}",
-            record_comparer
-        );
-        self.indexbtree_seek_internal(seek_op, record_comparer, &key_values)
-    }
-
-    fn indexbtree_seek_internal(
-        &mut self,
-        seek_op: SeekOp,
-        record_comparer: RecordCompare,
         key_values: &[ValueRef<'_>],
+        record_comparer: RecordCompare,
+        seek_op: SeekOp,
+        eq_seen: bool,
+        search: &mut Option<LeafPageBinarySearchState>,
     ) -> IOResultOr<SeekResult> {
-        if matches!(
-            self.seek_state,
-            CursorSeekState::Start
-                | CursorSeekState::MovingBetweenPages { .. }
-                | CursorSeekState::InteriorPageBinarySearch { .. }
-        ) {
-            if matches!(self.seek_state, CursorSeekState::Start) {
-                if let Some(c) = return_if_io!(self.move_to_root_nonblock()) {
-                    return Ok(IOResult::IO(IOCompletions(c)));
-                }
-            }
-            return_if_io!(self.indexbtree_move_to_internal(seek_op, record_comparer, key_values));
-            let CursorSeekState::FoundLeaf { eq_seen } = &self.seek_state else {
-                unreachable!(
-                    "We must still be in FoundLeaf state after indexbtree_move_to_internal, got: {:?}",
-                    self.seek_state
-                );
-            };
-            let eq_seen = *eq_seen;
+        if search.is_none() {
             let page = self.stack.top_ref();
 
             let contents = page.get_contents();
@@ -2948,44 +2802,22 @@ impl BTreeCursor {
             // If iter dir is backwards, we want the last cell that matches.
             let nearest_matching_cell = None;
 
-            self.seek_state = CursorSeekState::LeafPageBinarySearch {
-                state: LeafPageBinarySearchState {
-                    min_cell_idx: min,
-                    max_cell_idx: max,
-                    nearest_matching_cell,
-                    eq_seen,
-                    target_cell_when_not_found: match seek_op.iteration_direction() {
-                        IterationDirection::Forwards => cell_count as i32,
-                        IterationDirection::Backwards => -1,
-                    },
+            *search = Some(LeafPageBinarySearchState {
+                min_cell_idx: min,
+                max_cell_idx: max,
+                nearest_matching_cell,
+                eq_seen,
+                target_cell_when_not_found: match seek_op.iteration_direction() {
+                    IterationDirection::Forwards => cell_count as i32,
+                    IterationDirection::Backwards => -1,
                 },
-            };
+            });
         }
-
-        let CursorSeekState::LeafPageBinarySearch { state } = &self.seek_state else {
-            unreachable!(
-                "we must be in a leaf binary search state, got: {:?}",
-                self.seek_state
-            );
-        };
+        let state = search.as_mut().expect("the search state was set above");
 
         let old_top_idx = self.stack.current();
 
-        let mut state = *state;
-
-        let result = self.indexbtree_seek_inner(
-            seek_op,
-            old_top_idx,
-            key_values,
-            record_comparer,
-            &mut state,
-        )?;
-        // The search state goes back to the cursor once per call, not once
-        // per compare, as for the interior pages: only an overflow key read
-        // yields, and it returns before the range changes, so re-entry
-        // retries the same cell.
-        self.seek_state = CursorSeekState::LeafPageBinarySearch { state };
-        Ok(result)
+        self.indexbtree_seek_inner(seek_op, old_top_idx, key_values, record_comparer, state)
     }
 
     fn indexbtree_seek_inner(
@@ -3148,67 +2980,6 @@ impl BTreeCursor {
                 SeekOp::LT => cmp.is_lt(),
             };
             Ok((cmp, found))
-        }
-    }
-
-    #[cfg_attr(debug_assertions, instrument(skip_all, level = Level::DEBUG))]
-    pub fn move_to(&mut self, key: SeekKey<'_>, cmp: SeekOp) -> IOResultOr<()> {
-        tracing::trace!(?key, ?cmp);
-        // For a table with N rows, we can find any row by row id in O(log(N)) time by starting at the root page and following the B-tree pointers.
-        // B-trees consist of interior pages and leaf pages. Interior pages contain pointers to other pages, while leaf pages contain the actual row data.
-        //
-        // Conceptually, each Interior Cell in a interior page has a rowid and a left child node, and the page itself has a right-most child node.
-        // Example: consider an interior page that contains cells C1(rowid=10), C2(rowid=20), C3(rowid=30).
-        // - All rows with rowids <= 10 are in the left child node of C1.
-        // - All rows with rowids > 10 and <= 20 are in the left child node of C2.
-        // - All rows with rowids > 20 and <= 30 are in the left child node of C3.
-        // - All rows with rowids > 30 are in the right-most child node of the page.
-        //
-        // There will generally be multiple levels of interior pages before we reach a leaf page,
-        // so we need to follow the interior page pointers until we reach the leaf page that contains the row we are looking for (if it exists).
-        //
-        // Here's a high-level overview of the algorithm:
-        // 1. Since we start at the root page, its cells are all interior cells.
-        // 2. We scan the interior cells until we find a cell whose rowid is greater than or equal to the rowid we are looking for.
-        // 3. Follow the left child pointer of the cell we found in step 2.
-        //    a. In case none of the cells in the page have a rowid greater than or equal to the rowid we are looking for,
-        //       we follow the right-most child pointer of the page instead (since all rows with rowids greater than the rowid we are looking for are in the right-most child node).
-        // 4. We are now at a new page. If it's another interior page, we repeat the process from step 2. If it's a leaf page, we continue to step 5.
-        // 5. We scan the leaf cells in the leaf page until we find the cell whose rowid is equal to the rowid we are looking for.
-        //    This cell contains the actual data we are looking for.
-        // 6. If we find the cell, we return the record. Otherwise, we return an empty result.
-
-        // If we are at the beginning/end of seek state, start a new move from the root.
-        if matches!(
-            self.seek_state,
-            // these are stages that happen at the leaf page, so we can consider that the previous seek finished and we can start a new one.
-            CursorSeekState::LeafPageBinarySearch { .. } | CursorSeekState::FoundLeaf { .. }
-        ) {
-            self.seek_state = CursorSeekState::Start;
-        }
-        loop {
-            match self.move_to_state {
-                MoveToState::Start => {
-                    if matches!(self.seek_state, CursorSeekState::Start) {
-                        let c = return_if_io!(self.move_to_root_nonblock());
-                        self.move_to_state = MoveToState::MoveToPage;
-                        if let Some(c) = c {
-                            io_yield_one!(c);
-                        }
-                    } else {
-                        self.move_to_state = MoveToState::MoveToPage;
-                    }
-                }
-                MoveToState::MoveToPage => {
-                    let ret = match &key {
-                        SeekKey::TableRowId(rowid_key) => self.tablebtree_move_to(*rowid_key, cmp),
-                        SeekKey::IndexKey(index_key) => self.indexbtree_move_to(index_key, cmp),
-                    };
-                    return_if_io!(ret);
-                    self.move_to_state = MoveToState::Start;
-                    return Ok(IOResult::Done(()));
-                }
-            }
         }
     }
 
@@ -6814,7 +6585,7 @@ impl CursorTrait for BTreeCursor {
         if self.valid_state == CursorValidState::Invalid {
             return Ok(IOResult::Done(()));
         }
-        self.run_next(())
+        self.run_next(BtreeArgs::None, ())
     }
 
     #[inline(always)]
@@ -6854,12 +6625,12 @@ impl CursorTrait for BTreeCursor {
             return Ok(IOResult::Done(()));
         }
         self.clear_saved_seek();
-        self.run_last(())
+        self.run_last(BtreeArgs::None, ())
     }
 
     #[cfg_attr(debug_assertions, instrument(skip_all, level = Level::DEBUG))]
     fn prev(&mut self) -> IOResultOr<()> {
-        self.run_prev(())
+        self.run_prev(BtreeArgs::None, ())
     }
 
     #[cfg_attr(debug_assertions, instrument(skip(self), level = Level::DEBUG))]
@@ -6911,10 +6682,8 @@ impl CursorTrait for BTreeCursor {
         // because it might have been set to false by an unmatched left-join row during the previous iteration
         // on the outer loop.
         self.set_null_flag(false);
-        let seek_result = return_if_io!(self.do_seek(key, op));
+        let seek_result = return_if_io!(self.run_seek(BtreeArgs::Seek(key), op));
         self.invalidate_record();
-        // Reset seek state
-        self.seek_state = CursorSeekState::Start;
         self.valid_state = CursorValidState::Valid;
         self.ops.overflow_read.cancel();
         Ok(IOResult::Done(seek_result))
@@ -6929,10 +6698,8 @@ impl CursorTrait for BTreeCursor {
         // because it might have been set to false by an unmatched left-join row during the previous iteration
         // on the outer loop.
         self.set_null_flag(false);
-        let seek_result = return_if_io!(self.do_seek_unpacked(registers, op));
+        let seek_result = return_if_io!(self.run_seek(BtreeArgs::SeekUnpacked(registers), op));
         self.invalidate_record();
-        // Reset seek state
-        self.seek_state = CursorSeekState::Start;
         self.valid_state = CursorValidState::Valid;
         self.ops.overflow_read.cancel();
         Ok(IOResult::Done(seek_result))
@@ -7501,7 +7268,7 @@ impl CursorTrait for BTreeCursor {
             }
             return Ok(IOResult::Done(count));
         }
-        let count = return_if_io!(self.run_count(()));
+        let count = return_if_io!(self.run_count(BtreeArgs::None, ()));
         self.counted = Some(count);
         Ok(IOResult::Done(count))
     }
@@ -7528,7 +7295,7 @@ impl CursorTrait for BTreeCursor {
         }
         self.clear_saved_seek();
         self.skip_advance = false;
-        self.run_rewind(())
+        self.run_rewind(BtreeArgs::None, ())
     }
 
     #[inline]
@@ -7712,7 +7479,7 @@ impl CursorTrait for BTreeCursor {
         if self.valid_state == CursorValidState::Invalid {
             return Ok(IOResult::Done(()));
         }
-        self.run_seek_end(())
+        self.run_seek_end(BtreeArgs::None, ())
     }
 
     #[cfg_attr(debug_assertions, instrument(skip_all, level = Level::DEBUG))]
@@ -7721,7 +7488,7 @@ impl CursorTrait for BTreeCursor {
         // position. We need the current largest rowid, not that old
         // position. Otherwise rowid() restores the old position.
         self.clear_saved_seek();
-        self.run_seek_to_last(())
+        self.run_seek_to_last(BtreeArgs::None, ())
     }
 }
 
