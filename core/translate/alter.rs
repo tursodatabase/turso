@@ -1900,8 +1900,8 @@ pub fn translate_alter_table(
                         // serial type and SQLite's `PRAGMA integrity_check` reports the
                         // file as corrupt (e.g. "NUMERIC value in <table>.<col>" when
                         // changing NUMERIC -> TEXT). See issue #3706.
-                        let affinity_changed = old_column.affinity_with_strict(btree.is_strict)
-                            != replacement_column.affinity_with_strict(btree.is_strict);
+                        let affinity_changed =
+                            old_column.affinity() != replacement_column.affinity();
                         let rewrites_physical_layout =
                             becomes_generated || virtuality_changed || affinity_changed;
                         (
@@ -2637,7 +2637,7 @@ fn non_virtual_affinity_str(table: &BTreeTable) -> String {
         .columns()
         .iter()
         .filter(|col| !col.is_virtual_generated())
-        .map(|col| col.affinity_with_strict(table.is_strict).aff_mask())
+        .map(|col| col.affinity().aff_mask())
         .collect()
 }
 

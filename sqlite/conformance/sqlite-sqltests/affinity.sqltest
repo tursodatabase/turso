@@ -576,6 +576,33 @@ expect {
 }
 
 @cross-check-integrity
+test affinity-any-strict-index-comparisons {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, c ANY) STRICT;
+    INSERT INTO t VALUES (1, '000123'), (2, 123), (3, '123');
+    SELECT id FROM t WHERE c = 123 ORDER BY id;
+    SELECT id FROM t WHERE c = '123' ORDER BY id;
+    CREATE UNIQUE INDEX t_c ON t(c);
+    SELECT id FROM t INDEXED BY t_c WHERE c = 123 ORDER BY id;
+    SELECT id FROM t INDEXED BY t_c WHERE c = '123' ORDER BY id;
+    SELECT id FROM t INDEXED BY t_c WHERE c = '000123' ORDER BY id;
+    UPDATE t SET c = '1.5' WHERE id = 1;
+    INSERT INTO t VALUES (2, '000456') ON CONFLICT(id) DO UPDATE SET c = excluded.c;
+    SELECT id, c, typeof(c) FROM t ORDER BY id;
+    PRAGMA integrity_check;
+}
+expect {
+    2
+    3
+    2
+    3
+    1
+    1|1.5|text
+    2|000456|text
+    3|123|text
+    ok
+}
+
+@cross-check-integrity
 test cast-text-to-numeric-integral-float {
     SELECT CAST('3.0' AS NUMERIC), typeof(CAST('3.0' AS NUMERIC));
     SELECT CAST('3.5' AS NUMERIC), typeof(CAST('3.5' AS NUMERIC));

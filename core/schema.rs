@@ -5289,14 +5289,6 @@ impl Column {
             .unwrap_or_else(|| Affinity::affinity(&self.ty_str))
     }
 
-    pub fn affinity_with_strict(&self, is_strict: bool) -> Affinity {
-        if is_strict && self.ty_str.eq_ignore_ascii_case("ANY") {
-            Affinity::Blob
-        } else {
-            self.affinity()
-        }
-    }
-
     pub fn new_default_text(
         name: Option<String>,
         ty_str: String,

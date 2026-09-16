@@ -210,9 +210,8 @@ impl Constraint {
 
     /// Whether this constraint can drive an index seek on its target column.
     /// Composes the `usable`/`table_col_pos` gates with the affinity check
-    /// against the column at `table_col_pos` in `columns` (set `is_strict`
-    /// only for STRICT tables; subqueries pass `false`).
-    pub fn can_drive_index_seek(&self, columns: &[Column], is_strict: bool) -> bool {
+    /// against the column at `table_col_pos` in `columns`.
+    pub fn can_drive_index_seek(&self, columns: &[Column]) -> bool {
         if !self.usable {
             return false;
         }
@@ -222,7 +221,7 @@ impl Constraint {
         let col = columns.get(pos).unwrap_or_else(|| {
             unreachable!("constraint table_col_pos {pos} out of bounds for {columns:?}")
         });
-        self.satisfies_index_affinity(col.affinity_with_strict(is_strict))
+        self.satisfies_index_affinity(col.affinity())
     }
 }
 
@@ -295,11 +294,10 @@ pub(super) fn automatic_index_terms(
     constraints: &TableConstraints,
 ) -> SmallVec<[ConstraintRef; 4]> {
     let columns = table.columns();
-    let is_strict = table.table.is_strict();
     let usable_constraints: SmallVec<[&Constraint; 4]> = constraints
         .constraints
         .iter()
-        .filter(|term| term.can_drive_index_seek(columns, is_strict))
+        .filter(|term| term.can_drive_index_seek(columns))
         .collect();
     let index_columns = ordered_ephemeral_key_columns(&usable_constraints);
 
@@ -307,7 +305,7 @@ pub(super) fn automatic_index_terms(
         .constraints
         .iter()
         .enumerate()
-        .filter(|(_, term)| term.can_drive_index_seek(columns, is_strict))
+        .filter(|(_, term)| term.can_drive_index_seek(columns))
         .filter_map(|(term_index, term)| {
             let table_col_pos = term.table_col_pos?;
             Some(ConstraintRef {
@@ -1258,8 +1256,7 @@ pub fn constraints_from_where_clause(
                         {
                             continue;
                         }
-                        let idx_col_aff = constrained_column
-                            .affinity_with_strict(table_reference.table.is_strict());
+                        let idx_col_aff = constrained_column.affinity();
                         if !constraint.satisfies_index_affinity(idx_col_aff) {
                             continue;
                         }

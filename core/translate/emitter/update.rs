@@ -1589,11 +1589,6 @@ fn emit_update_insns<'a>(
         }
     }
 
-    let target_is_strict = target_table
-        .table
-        .btree()
-        .is_some_and(|btree| btree.is_strict);
-
     // Non-REPLACE PK constraint check. Must run BEFORE the index preflight so that
     // PK ABORT/FAIL/ROLLBACK fires before an index IGNORE can silently skip the row.
     // SQLite checks PK constraints before index constraints in the UPDATE path.
@@ -1900,7 +1895,7 @@ fn emit_update_insns<'a>(
                     Affinity::Blob.aff_mask()
                 } else {
                     target_table.table.columns()[ic.pos_in_table]
-                        .affinity_with_strict(target_is_strict)
+                        .affinity()
                         .aff_mask()
                 }
             })
@@ -2270,7 +2265,6 @@ fn emit_update_insns<'a>(
                 target_table.table.columns().iter(),
                 start,
                 record_reg,
-                table.is_strict,
             );
 
             if not_exists_check_required {
@@ -2307,7 +2301,6 @@ fn emit_update_insns<'a>(
                     target_table.table.columns(),
                     target_table_cursor_id,
                     cdc_rowid_before_reg.expect("cdc_rowid_before_reg must be set"),
-                    table.is_strict,
                 ))
             } else {
                 None

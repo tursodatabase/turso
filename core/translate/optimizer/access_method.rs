@@ -583,7 +583,7 @@ pub(super) fn choose_best_in_seek_candidate(
                 if table_collation != index_collation {
                     continue;
                 }
-                let idx_aff = constrained_column.affinity_with_strict(rhs_table.table.is_strict());
+                let idx_aff = constrained_column.affinity();
                 if !constraint.satisfies_index_affinity(idx_aff) {
                     continue;
                 }
@@ -1625,7 +1625,7 @@ fn find_best_access_method_for_subquery(
                         | ast::Operator::Less
                         | ast::Operator::LessEquals
                 )
-            ) && c.can_drive_index_seek(&subquery.columns, false)
+            ) && c.can_drive_index_seek(&subquery.columns)
         })
         .collect();
 
