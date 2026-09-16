@@ -1,4 +1,5 @@
 use crate::assert::assert_send_sync;
+use crate::coro::{with_handle, BoxedResumable, Co, Runner, StepContext, YieldSlot};
 #[cfg(target_vendor = "apple")]
 use crate::io::AtomicFileSyncType;
 use crate::io::FileSyncType;
@@ -1365,15 +1366,6 @@ enum PtrMapPutState {
     },
 }
 
-#[derive(Debug, Clone)]
-enum HeaderRefState {
-    Start,
-    CreateHeader {
-        page: PageRef,
-        completion: Option<Completion>,
-    },
-}
-
 #[cfg(feature = "autovacuum")]
 #[derive(Debug, Clone, Copy)]
 enum BtreeCreateVacuumFullState {
@@ -1563,7 +1555,8 @@ pub struct Pager {
     cacheflush_state: RwLock<CacheFlushState>,
     /// Maximum number of pages allowed in the database. Default is 1073741823 (SQLite default).
     max_page_count: AtomicU32,
-    header_ref_state: RwLock<HeaderRefState>,
+    /// The runner slots of the async pager operations.
+    ops: PagerOps,
     #[cfg(feature = "autovacuum")]
     vacuum_state: RwLock<VacuumState>,
     pub(crate) io_ctx: RwLock<IOContext>,
@@ -1819,6 +1812,133 @@ pub struct CollectingState {
     pub completions: Vec<Completion>,
 }
 
+/// Names [`PagerCtx`] as the context type of the async pager operations.
+pub(crate) struct PagerStep;
+
+impl StepContext for PagerStep {
+    type Error = Box<LimboError>;
+    type Ctx<'a> = PagerCtx<'a>;
+}
+
+/// The context of one step of an async pager operation. The async function
+/// gets it back on every step, so it never keeps a reference across a yield.
+pub(crate) struct PagerCtx<'a> {
+    pager: &'a Pager,
+    /// The completion of a yield, until `resume` picks it up.
+    io: Option<IOCompletions>,
+    /// The error of a step that failed, until `resume` picks it up.
+    err: Option<Box<LimboError>>,
+}
+
+impl YieldSlot<Box<LimboError>> for PagerCtx<'_> {
+    fn park_io(&mut self, io: IOCompletions) {
+        turso_debug_assert!(self.io.is_none(), "a step parks at most one completion");
+        self.io = Some(io);
+    }
+
+    fn take_io(&mut self) -> Option<IOCompletions> {
+        self.io.take()
+    }
+
+    fn park_err(&mut self, err: Box<LimboError>) {
+        turso_debug_assert!(self.err.is_none(), "a step parks at most one error");
+        self.err = Some(err);
+    }
+
+    fn take_err(&mut self) -> Option<Box<LimboError>> {
+        self.err.take()
+    }
+}
+
+/// The slot of one async operation on a shared owner. The runner is boxed on
+/// the first step and reused for every operation after that. A step takes
+/// the runner out of the slot, so the step context can borrow the owner, and
+/// puts it back when the step returns.
+pub(crate) struct AsyncOp<C: StepContext, Args, Out> {
+    runner: Mutex<Option<BoxedResumable<C, Args, Out>>>,
+    make: fn() -> BoxedResumable<C, Args, Out>,
+    /// Whether an operation is suspended, as of the last step.
+    active: AtomicBool,
+}
+
+impl<C: StepContext, Args, Out> AsyncOp<C, Args, Out> {
+    pub(crate) fn new(make: fn() -> BoxedResumable<C, Args, Out>) -> Self {
+        Self {
+            runner: Mutex::new(None),
+            make,
+            active: AtomicBool::new(false),
+        }
+    }
+
+    /// Starts the operation with `args` when none is suspended, and resumes
+    /// the suspended one otherwise.
+    #[inline(always)]
+    pub(crate) fn step(&self, ctx: &mut C::Ctx<'_>, args: Args) -> Result<IOResult<Out>, C::Error> {
+        let mut runner = self.runner.lock().take().unwrap_or_else(self.make);
+        let result = runner.resume(ctx, args);
+        self.active.store(runner.is_active(), Ordering::Release);
+        *self.runner.lock() = Some(runner);
+        result
+    }
+
+    /// True while an operation is suspended: it yielded for I/O or a step of
+    /// it failed, and no step has finished or cancelled it since.
+    #[inline(always)]
+    pub(crate) fn is_active(&self) -> bool {
+        self.active.load(Ordering::Acquire)
+    }
+
+    /// Drops the suspended operation, if any.
+    pub(crate) fn cancel(&self) {
+        if let Some(runner) = self.runner.lock().as_mut() {
+            runner.cancel();
+        }
+        self.active.store(false, Ordering::Release);
+    }
+}
+
+impl<C: StepContext, Args, Out> std::fmt::Debug for AsyncOp<C, Args, Out> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(if self.is_active() {
+            "AsyncOp(active)"
+        } else {
+            "AsyncOp(idle)"
+        })
+    }
+}
+
+/// The runner slots of the async pager operations, one per operation.
+struct PagerOps {
+    read_header_page: AsyncOp<PagerStep, (), PageRef>,
+}
+
+impl PagerOps {
+    fn new() -> Self {
+        Self {
+            read_header_page: AsyncOp::new(|| {
+                Runner::boxed(|co, args| with_handle(co, args, Pager::read_header_page_async))
+            }),
+        }
+    }
+}
+
+impl Pager {
+    /// Runs one step of the async pager operation in `op`.
+    #[inline(always)]
+    fn step_op<Args, Out>(
+        &self,
+        op: &AsyncOp<PagerStep, Args, Out>,
+        args: Args,
+    ) -> IOResultOr<Out> {
+        let mut ctx = PagerCtx {
+            pager: self,
+            io: None,
+            err: None,
+        };
+        op.step(&mut ctx, args)
+    }
+}
+
 impl Pager {
     pub fn new(
         db_file: Arc<dyn DatabaseStorage>,
@@ -1870,7 +1990,7 @@ impl Pager {
             cacheflush_state: RwLock::new(CacheFlushState::default()),
             allocate_page_state: RwLock::new(AllocatePageState::Start),
             max_page_count: AtomicU32::new(DEFAULT_MAX_PAGE_COUNT),
-            header_ref_state: RwLock::new(HeaderRefState::Start),
+            ops: PagerOps::new(),
             #[cfg(feature = "autovacuum")]
             vacuum_state: RwLock::new(VacuumState {
                 ptrmap_get_state: PtrMapGetState::Start,
@@ -2039,49 +2159,37 @@ impl Pager {
         self.init_page_1.clone()
     }
 
-    /// Read page 1 (the database header page) using the header_ref_state state machine.
+    /// Read page 1 (the database header page).
     /// Used by HeaderRef and HeaderRefMut to avoid duplicating the page-loading logic.
     fn read_header_page(&self) -> IOResultOr<PageRef> {
-        loop {
-            let state = self.header_ref_state.read().clone();
-            tracing::trace!("read_header_page - {:?}", state);
-            match state {
-                HeaderRefState::Start => {
-                    // If db is not initialized, return the in-memory page
-                    if let Some(page1) = self.init_page_1.load_full() {
-                        return Ok(IOResult::Done(page1));
-                    }
+        if let Some(page1) = self.init_page_1.load_full() {
+            return Ok(IOResult::Done(page1));
+        }
+        self.step_op(&self.ops.read_header_page, ())
+    }
 
-                    // On spill `return_if_io!` propagates IO up unchanged so
-                    // re-entry resumes here via the pager's `pending_reads`
-                    // memoization (no duplicate disk read).
-                    let (page, c) = return_if_io!(self.read_page(DatabaseHeader::PAGE_ID as i64));
-                    *self.header_ref_state.write() = HeaderRefState::CreateHeader {
-                        page,
-                        completion: c.clone(),
-                    };
-                    if let Some(c) = c {
-                        io_yield_one!(c);
-                    }
-                }
-                HeaderRefState::CreateHeader { page, completion } => {
-                    // Check if the read failed (e.g., due to checksum/decryption error)
-                    if let Some(ref c) = completion {
-                        if let Some(err) = c.get_error() {
-                            *self.header_ref_state.write() = HeaderRefState::Start;
-                            return Err(err.into());
-                        }
-                    }
-                    turso_assert!(page.is_loaded(), "page should be loaded");
-                    turso_assert!(
-                        page.get().id() == DatabaseHeader::PAGE_ID,
-                        "incorrect header page id"
-                    );
-                    *self.header_ref_state.write() = HeaderRefState::Start;
-                    return Ok(IOResult::Done(page));
-                }
+    /// Reads page 1 from the page cache or the disk and waits for the read.
+    /// A spill yield inside `read_page` runs the same step again, and the
+    /// pager finds the read in flight in `pending_reads`.
+    async fn read_header_page_async(
+        co: &mut Co<PagerStep>,
+        (): (),
+    ) -> Result<PageRef, Box<LimboError>> {
+        let (page, completion) = co
+            .io(|ctx| ctx.pager.read_page(DatabaseHeader::PAGE_ID as i64))
+            .await;
+        if let Some(completion) = completion {
+            co.yield_io(IOCompletions(completion.clone())).await;
+            if let Some(err) = completion.get_error() {
+                return Err(err.into());
             }
         }
+        turso_assert!(page.is_loaded(), "page should be loaded");
+        turso_assert!(
+            page.get().id() == DatabaseHeader::PAGE_ID,
+            "incorrect header page id"
+        );
+        Ok(page)
     }
 
     /// Set whether cache spilling is enabled.
@@ -6030,7 +6138,7 @@ impl Pager {
             vacuum_state.btree_create_vacuum_full_state = BtreeCreateVacuumFullState::Start;
         }
 
-        *self.header_ref_state.write() = HeaderRefState::Start;
+        self.ops.read_header_page.cancel();
     }
 
     pub fn with_header<T>(&self, f: impl Fn(&DatabaseHeader) -> T) -> IOResultOr<T> {
