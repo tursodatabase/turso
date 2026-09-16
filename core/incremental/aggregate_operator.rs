@@ -1,10 +1,12 @@
 // Aggregate operator for DBSP-style incremental computation
 
+use crate::coro::{with_handle, Co, Runner, StepContext, YieldSlot};
 use crate::function::{AggFunc, Func};
 use crate::incremental::dbsp::Hash128;
 use crate::incremental::dbsp::{Delta, DeltaPair, HashableRow};
 use crate::incremental::operator::{
     generate_storage_id, ComputationTracker, DbspStateCursors, EvalState, IncrementalOperator,
+    OpRunner,
 };
 use crate::incremental::persistence::{ReadRecord, WriteRow};
 use crate::numeric::Numeric;
@@ -14,9 +16,10 @@ use crate::sync::Mutex;
 use crate::translate::plan::ColumnMask;
 use crate::types::IOResultOr;
 use crate::types::{
-    IOResult, ImmutableRecord, ImmutableRecordRef, SeekKey, SeekOp, SeekResult, ValueRef,
+    IOCompletions, IOResult, ImmutableRecord, ImmutableRecordRef, SeekKey, SeekOp, SeekResult,
+    ValueRef,
 };
-use crate::{return_and_restore_if_io, return_if_io, LimboError, Result, Value};
+use crate::{return_if_io, LimboError, Result, Value};
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 use std::collections::BTreeMap;
 use std::fmt::{self, Display};
@@ -360,35 +363,49 @@ pub enum TransitionType {
     Removed, // Value removed from distinct set
 }
 
-#[derive(Debug)]
-enum AggregateCommitState {
-    Idle,
-    Eval {
-        eval_state: EvalState,
-    },
-    PersistDelta {
-        delta: Delta,
-        computed_states: ComputedStates,
-        old_states: HashMap<String, i64>, // Track old counts for plain DISTINCT
-        current_idx: usize,
-        write_row: WriteRow,
-        min_max_deltas: MinMaxDeltas,
-        distinct_deltas: DistinctDeltas,
-        input_delta: Delta, // Keep original input delta for distinct processing
-    },
-    PersistMinMax {
-        delta: Delta,
-        min_max_persist_state: MinMaxPersistState,
-        distinct_deltas: DistinctDeltas,
-    },
-    PersistDistinctValues {
-        delta: Delta,
-        distinct_persist_state: DistinctPersistState,
-    },
-    Done {
-        delta: Delta,
-    },
-    Invalid,
+/// Names [`AggregateCtx`] as the context type of the async aggregate
+/// operations.
+pub struct AggregateStep;
+
+impl StepContext for AggregateStep {
+    type Error = Box<LimboError>;
+    type Ctx<'a> = AggregateCtx<'a>;
+}
+
+/// The context of one step of an aggregate operation: the operator, the
+/// state cursors of that step, and the slot for what suspends the step.
+pub struct AggregateCtx<'a> {
+    operator: &'a mut AggregateOperator,
+    cursors: &'a mut DbspStateCursors,
+    io: Option<IOCompletions>,
+    err: Option<Box<LimboError>>,
+}
+
+impl YieldSlot<Box<LimboError>> for AggregateCtx<'_> {
+    fn park_io(&mut self, io: IOCompletions) {
+        self.io = Some(io);
+    }
+
+    fn take_io(&mut self) -> Option<IOCompletions> {
+        self.io.take()
+    }
+
+    fn park_err(&mut self, err: Box<LimboError>) {
+        self.err = Some(err);
+    }
+
+    fn take_err(&mut self) -> Option<Box<LimboError>> {
+        self.err.take()
+    }
+}
+
+/// The commit of an aggregate operator as a step function.
+type AggregateCommitOp = OpRunner<AggregateStep, Delta, Delta>;
+
+/// The runners of the aggregate operations, boxed on first use and reused.
+#[derive(Debug, Default)]
+struct AggregateOps {
+    commit: Option<AggregateCommitOp>,
 }
 
 // Aggregate-specific eval states
@@ -452,8 +469,7 @@ pub struct AggregateOperator {
     pub distinct_columns: ColumnMask,
     tracker: Option<Arc<Mutex<ComputationTracker>>>,
 
-    // State machine for commit operation
-    commit_state: AggregateCommitState,
+    ops: AggregateOps,
 
     // SELECT DISTINCT x,y,z.... with no aggregations.
     is_distinct_only: bool,
@@ -1434,7 +1450,7 @@ impl AggregateOperator {
             column_min_max,
             distinct_columns,
             tracker: None,
-            commit_state: AggregateCommitState::Idle,
+            ops: AggregateOps::default(),
             is_distinct_only,
         })
     }
@@ -1722,6 +1738,37 @@ impl AggregateOperator {
         min_max_deltas
     }
 
+    /// The index key, the record and the weight of the stored state of one
+    /// group. The weight is -1 when the group is gone, and 1 otherwise.
+    fn stored_group(
+        &self,
+        group_key_str: &str,
+        group_key: &[Value],
+        agg_state: &AggregateState,
+    ) -> Result<(Vec<Value>, Vec<Value>, isize)> {
+        let operator_storage_id = generate_storage_id(self.operator_id, 0, AGG_TYPE_REGULAR);
+        let zset_hash = self.generate_group_hash(group_key_str);
+        let element_id = Hash128::new(0, 0);
+        let weight = if agg_state.count == 0 { -1 } else { 1 };
+        let state_blob = agg_state.to_blob(&self.aggregates, group_key)?;
+
+        let operator_id_val = Value::from_i64(operator_storage_id);
+        let zset_hash_val = zset_hash.to_value()?;
+        let element_id_val = element_id.to_value()?;
+        let index_key = vec![
+            operator_id_val.clone(),
+            zset_hash_val.clone(),
+            element_id_val.clone(),
+        ];
+        let record_values = vec![
+            operator_id_val,
+            zset_hash_val,
+            element_id_val,
+            Value::Blob(state_blob),
+        ];
+        Ok((index_key, record_values, weight))
+    }
+
     pub fn set_tracker(&mut self, tracker: Arc<Mutex<ComputationTracker>>) {
         self.tracker = Some(tracker);
     }
@@ -1787,225 +1834,94 @@ impl IncrementalOperator for AggregateOperator {
             "AggregateOperator expects right delta to be empty in commit"
         );
         let delta = std::mem::take(&mut deltas.left);
-        loop {
-            // Note: because we std::mem::replace here (without it, the borrow checker goes nuts,
-            // because we call self.eval_interval, which requires a mutable borrow), we have to
-            // restore the state if we return I/O. So we can't use return_if_io!
-            let mut state =
-                std::mem::replace(&mut self.commit_state, AggregateCommitState::Invalid);
-            match &mut state {
-                AggregateCommitState::Invalid => {
-                    panic!("Reached invalid state! State was replaced, and not replaced back");
-                }
-                AggregateCommitState::Idle => {
-                    let eval_state = EvalState::from_delta(delta.clone());
-                    self.commit_state = AggregateCommitState::Eval { eval_state };
-                }
-                AggregateCommitState::Eval { ref mut eval_state } => {
-                    // Clone the delta for MIN/MAX processing before eval consumes it
-                    // We need to get the delta from the eval_state if it's still in Init
-                    let input_delta = match eval_state {
-                        EvalState::Init { deltas } => deltas.left.clone(),
-                        _ => Delta::new(), // Empty delta if already processed
-                    };
-
-                    // Extract MIN/MAX and DISTINCT deltas before any I/O operations
-                    let min_max_deltas = self.extract_min_max_deltas(&input_delta);
-                    // For plain DISTINCT, we need to extract deltas too
-                    let distinct_deltas = if self.has_distinct() || self.is_distinct_only {
-                        self.extract_distinct_deltas(&input_delta)
-                    } else {
-                        HashMap::default()
-                    };
-
-                    // Get old counts before eval modifies the states
-                    // We need to extract this from the eval_state before it's consumed
-                    let old_states = HashMap::default(); // TODO: Extract from eval_state
-
-                    let (output_delta, computed_states) = return_and_restore_if_io!(
-                        &mut self.commit_state,
-                        state,
-                        self.eval_internal(eval_state, cursors)
-                    );
-
-                    self.commit_state = AggregateCommitState::PersistDelta {
-                        delta: output_delta,
-                        computed_states,
-                        old_states,
-                        current_idx: 0,
-                        write_row: WriteRow::new(),
-                        min_max_deltas,  // Store for later use
-                        distinct_deltas, // Store for distinct processing
-                        input_delta,     // Store original input
-                    };
-                }
-                AggregateCommitState::PersistDelta {
-                    delta,
-                    computed_states,
-                    old_states,
-                    current_idx,
-                    write_row,
-                    min_max_deltas,
-                    distinct_deltas,
-                    input_delta,
-                } => {
-                    let states_vec: Vec<_> = computed_states.iter().collect();
-
-                    if *current_idx >= states_vec.len() {
-                        // Use the min_max_deltas we extracted earlier from the input delta
-                        self.commit_state = AggregateCommitState::PersistMinMax {
-                            delta: delta.clone(),
-                            min_max_persist_state: MinMaxPersistState::new(min_max_deltas.clone()),
-                            distinct_deltas: distinct_deltas.clone(),
-                        };
-                    } else {
-                        let (group_key_str, (group_key, agg_state)) = states_vec[*current_idx];
-
-                        // Skip aggregate state persistence for plain DISTINCT
-                        // Plain DISTINCT only uses the distinct value weights, not aggregate state
-                        if self.is_distinct_only {
-                            // Skip to next - distinct values are handled in PersistDistinctValues
-                            // We still need to transition states properly
-                            let next_idx = *current_idx + 1;
-                            if next_idx >= states_vec.len() {
-                                // Done with all groups, move to PersistMinMax
-                                self.commit_state = AggregateCommitState::PersistMinMax {
-                                    delta: std::mem::take(delta),
-                                    min_max_persist_state: MinMaxPersistState::new(std::mem::take(
-                                        min_max_deltas,
-                                    )),
-                                    distinct_deltas: std::mem::take(distinct_deltas),
-                                };
-                            } else {
-                                // Move to next group
-                                self.commit_state = AggregateCommitState::PersistDelta {
-                                    delta: std::mem::take(delta),
-                                    computed_states: std::mem::take(computed_states),
-                                    old_states: std::mem::take(old_states),
-                                    current_idx: next_idx,
-                                    write_row: WriteRow::new(),
-                                    min_max_deltas: std::mem::take(min_max_deltas),
-                                    distinct_deltas: std::mem::take(distinct_deltas),
-                                    input_delta: std::mem::take(input_delta),
-                                };
-                            }
-                            continue;
-                        }
-
-                        // Build the key components for regular aggregates
-                        let operator_storage_id =
-                            generate_storage_id(self.operator_id, 0, AGG_TYPE_REGULAR);
-                        let zset_hash = self.generate_group_hash(group_key_str);
-                        let element_id = Hash128::new(0, 0); // Always zeros for regular aggregates
-
-                        // Determine weight: 1 if exists, -1 if deleted
-                        let weight = if agg_state.count == 0 { -1 } else { 1 };
-
-                        // Serialize the aggregate state (only for regular aggregates, not plain DISTINCT)
-                        let state_blob = agg_state.to_blob(&self.aggregates, group_key)?;
-                        let blob_value = Value::Blob(state_blob);
-
-                        // Build the aggregate storage format: [operator_id, zset_hash, element_id, value, weight]
-                        let operator_id_val = Value::from_i64(operator_storage_id);
-                        let zset_hash_val = zset_hash.to_value()?;
-                        let element_id_val = element_id.to_value()?;
-                        let blob_val = blob_value.clone();
-
-                        // Create index key - the first 3 columns of our primary key
-                        let index_key = vec![
-                            operator_id_val.clone(),
-                            zset_hash_val.clone(),
-                            element_id_val.clone(),
-                        ];
-
-                        // Record values (without weight)
-                        let record_values =
-                            vec![operator_id_val, zset_hash_val, element_id_val, blob_val];
-
-                        return_and_restore_if_io!(
-                            &mut self.commit_state,
-                            state,
-                            write_row.write_row(cursors, index_key, record_values, weight)
-                        );
-
-                        let delta = std::mem::take(delta);
-                        let computed_states = std::mem::take(computed_states);
-                        let min_max_deltas = std::mem::take(min_max_deltas);
-                        let distinct_deltas = std::mem::take(distinct_deltas);
-                        let input_delta = std::mem::take(input_delta);
-
-                        self.commit_state = AggregateCommitState::PersistDelta {
-                            delta,
-                            computed_states,
-                            old_states: std::mem::take(old_states),
-                            current_idx: *current_idx + 1,
-                            write_row: WriteRow::new(), // Reset for next write
-                            min_max_deltas,
-                            distinct_deltas,
-                            input_delta,
-                        };
-                    }
-                }
-                AggregateCommitState::PersistMinMax {
-                    delta,
-                    min_max_persist_state,
-                    distinct_deltas,
-                } => {
-                    if self.has_min_max() {
-                        return_and_restore_if_io!(
-                            &mut self.commit_state,
-                            state,
-                            min_max_persist_state.persist_min_max(
-                                self.operator_id,
-                                &self.column_min_max,
-                                cursors,
-                                |group_key_str| self.generate_group_hash(group_key_str)
-                            )
-                        );
-                    }
-
-                    // Transition to PersistDistinctValues
-                    let delta = std::mem::take(delta);
-                    let distinct_deltas = std::mem::take(distinct_deltas);
-                    let distinct_persist_state = DistinctPersistState::new(distinct_deltas);
-                    self.commit_state = AggregateCommitState::PersistDistinctValues {
-                        delta,
-                        distinct_persist_state,
-                    };
-                }
-                AggregateCommitState::PersistDistinctValues {
-                    delta,
-                    distinct_persist_state,
-                } => {
-                    if self.has_distinct() {
-                        // Use the state machine to persist distinct values to BTree
-                        return_and_restore_if_io!(
-                            &mut self.commit_state,
-                            state,
-                            distinct_persist_state.persist_distinct_values(
-                                self.operator_id,
-                                cursors,
-                                |group_key_str| self.generate_group_hash(group_key_str)
-                            )
-                        );
-                    }
-
-                    // Transition to Done
-                    let delta = std::mem::take(delta);
-                    self.commit_state = AggregateCommitState::Done { delta };
-                }
-                AggregateCommitState::Done { delta } => {
-                    self.commit_state = AggregateCommitState::Idle;
-                    let delta = std::mem::take(delta);
-                    return Ok(IOResult::Done(delta));
-                }
-            }
-        }
+        let mut op = self.ops.commit.take().unwrap_or_else(new_commit_runner);
+        let mut ctx = AggregateCtx {
+            operator: self,
+            cursors,
+            io: None,
+            err: None,
+        };
+        let result = op.resume(&mut ctx, delta);
+        self.ops.commit = Some(op);
+        result
     }
 
     fn set_tracker(&mut self, tracker: Arc<Mutex<ComputationTracker>>) {
         self.tracker = Some(tracker);
     }
+}
+
+fn new_commit_runner() -> AggregateCommitOp {
+    OpRunner::new(Runner::boxed(|co, args| {
+        with_handle(co, args, commit_delta)
+    }))
+}
+
+/// Commits a delta: evaluates it, then stores the new state of every
+/// group, the MIN/MAX values, and the distinct values.
+async fn commit_delta(co: &mut Co<AggregateStep>, delta: Delta) -> Result<Delta, Box<LimboError>> {
+    let (min_max_deltas, distinct_deltas) = co.with(|ctx| {
+        let operator = &ctx.operator;
+        let min_max_deltas = operator.extract_min_max_deltas(&delta);
+        let distinct_deltas = if operator.has_distinct() || operator.is_distinct_only {
+            operator.extract_distinct_deltas(&delta)
+        } else {
+            HashMap::default()
+        };
+        (min_max_deltas, distinct_deltas)
+    });
+
+    let mut eval_state = EvalState::from_delta(delta);
+    let (output_delta, computed_states) = co
+        .io(|ctx| ctx.operator.eval_internal(&mut eval_state, ctx.cursors))
+        .await;
+
+    // Plain DISTINCT has no aggregate state: only the distinct values are stored.
+    if !co.with(|ctx| ctx.operator.is_distinct_only) {
+        for (group_key_str, (group_key, agg_state)) in &computed_states {
+            let (index_key, record_values, weight) = co.with(|ctx| {
+                ctx.operator
+                    .stored_group(group_key_str, group_key, agg_state)
+            })?;
+            let mut write_row = WriteRow::new();
+            co.io(|ctx| {
+                write_row.write_row(
+                    ctx.cursors,
+                    index_key.clone(),
+                    record_values.clone(),
+                    weight,
+                )
+            })
+            .await;
+        }
+    }
+
+    if co.with(|ctx| ctx.operator.has_min_max()) {
+        let mut persist = MinMaxPersistState::new(min_max_deltas);
+        co.io(|ctx| {
+            let operator = &ctx.operator;
+            persist.persist_min_max(
+                operator.operator_id,
+                &operator.column_min_max,
+                ctx.cursors,
+                |group_key_str| operator.generate_group_hash(group_key_str),
+            )
+        })
+        .await;
+    }
+
+    if co.with(|ctx| ctx.operator.has_distinct()) {
+        let mut persist = DistinctPersistState::new(distinct_deltas);
+        co.io(|ctx| {
+            let operator = &ctx.operator;
+            persist.persist_distinct_values(operator.operator_id, ctx.cursors, |group_key_str| {
+                operator.generate_group_hash(group_key_str)
+            })
+        })
+        .await;
+    }
+
+    Ok(output_delta)
 }
 
 /// State machine for recomputing MIN/MAX values after deletion
