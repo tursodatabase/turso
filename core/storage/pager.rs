@@ -1508,8 +1508,6 @@ pub struct Pager {
     init_lock: Arc<Mutex<()>>,
     /// The state of the current allocate page operation.
     allocate_page_state: RwLock<AllocatePageState>,
-    /// The state of the current allocate page1 operation.
-    allocate_page1_state: RwLock<AllocatePage1State>,
     /// Cache page_size and reserved_space at Pager init and reuse for subsequent
     /// `usable_space` calls. TODO: Invalidate reserved_space when we add the functionality
     /// to change it.
@@ -1677,20 +1675,6 @@ enum AllocatePageState {
     AllocateNewPage {
         current_db_size: u32,
     },
-}
-
-#[derive(Clone)]
-enum AllocatePage1State {
-    Start,
-    Writing {
-        page: PageRef,
-    },
-    /// Fsyncing the freshly written page 1 to the main database file, so a
-    /// WAL can never exist next to an empty (0-byte on disk) database file.
-    Syncing {
-        page: PageRef,
-    },
-    Done,
 }
 
 #[derive(Debug, Clone)]
@@ -1877,6 +1861,7 @@ struct PagerOps {
     ptrmap_put: AsyncOp<PagerStep, (u32, PtrmapType, u32), ()>,
     #[cfg(feature = "autovacuum")]
     btree_create_vacuum_full: AsyncOp<PagerStep, PageType, u32>,
+    allocate_page1: AsyncOp<PagerStep, (), PageRef>,
 }
 
 impl PagerOps {
@@ -1898,6 +1883,9 @@ impl PagerOps {
                 Runner::boxed(|co, args| {
                     with_handle(co, args, Pager::btree_create_vacuum_full_async)
                 })
+            }),
+            allocate_page1: AsyncOp::new(|| {
+                Runner::boxed(|co, args| with_handle(co, args, Pager::allocate_page1_async))
             }),
         }
     }
@@ -1930,11 +1918,6 @@ impl Pager {
         init_lock: Arc<Mutex<()>>,
         init_page_1: Arc<ArcSwapOption<Page>>,
     ) -> Result<Self> {
-        let allocate_page1_state = if init_page_1.load().is_some() {
-            RwLock::new(AllocatePage1State::Start)
-        } else {
-            RwLock::new(AllocatePage1State::Done)
-        };
         Ok(Self {
             db_file,
             wal,
@@ -1962,7 +1945,6 @@ impl Pager {
             buffer_pool,
             auto_vacuum_mode: AtomicU8::new(AutoVacuumMode::None.into()),
             init_lock,
-            allocate_page1_state,
             page_size: AtomicU32::new(0), // 0 means not set
             reserved_space: AtomicU16::new(RESERVED_SPACE_NOT_SET),
             schema_cookie: AtomicU64::new(Self::SCHEMA_COOKIE_NOT_SET),
@@ -5653,99 +5635,109 @@ impl Pager {
 
     #[instrument(skip_all, level = Level::DEBUG)]
     pub fn allocate_page1(&self) -> IOResultOr<PageRef> {
-        let state = self.allocate_page1_state.read().clone();
-        match state {
-            AllocatePage1State::Start => {
-                turso_assert!(!self.db_initialized());
-                tracing::trace!("allocate_page1(Start)");
+        self.step_op(&self.ops.allocate_page1, ())
+    }
 
-                let IOResult::Done(mut default_header) = self.with_header(|header| *header)? else {
-                    panic!("DB should not be initialized and should not do any IO");
-                };
-
-                turso_assert_eq!(default_header.database_size.get(), 0);
-                default_header.database_size = 1.into();
-
-                // Use cached reserved_space if set (e.g., by sync engine before page allocation),
-                // otherwise fall back to IOContext's encryption/checksum requirements.
-                let reserved_space_bytes = self.get_reserved_space().unwrap_or_else(|| {
-                    let io_ctx = self.io_ctx.read();
-                    io_ctx.get_reserved_space_bytes()
-                });
-                default_header.reserved_space = reserved_space_bytes;
-                self.set_reserved_space(reserved_space_bytes);
-
-                if let Some(size) = self.get_page_size() {
-                    default_header.page_size = size;
-                }
-
-                tracing::debug!(
-                    "allocate_page1(Start) page_size = {:?}, reserved_space = {}",
-                    default_header.page_size,
-                    default_header.reserved_space
-                );
-
-                self.buffer_pool
-                    .finalize_with_page_size(default_header.page_size.get() as usize)?;
-                let page = allocate_new_page(1, &self.buffer_pool);
-
-                let contents = page.get_contents();
-                contents.write_database_header(&default_header);
-
-                let page1 = page;
-                // Create the sqlite_schema table, for this we just need to create the btree page
-                // for the first page of the database which is basically like any other btree page
-                // but with a 100 byte offset, so we just init the page so that sqlite understands
-                // this is a correct page.
-                btree_init_page(
-                    &page1,
-                    PageType::TableLeaf,
-                    DatabaseHeader::SIZE,
-                    (default_header.page_size.get() - default_header.reserved_space as u32)
-                        as usize,
-                );
-                let c = begin_write_btree_page(self, &page1, None)?;
-
-                // Pin page1 to prevent eviction while stored in state machine
-                page1.pin();
-                *self.allocate_page1_state.write() = AllocatePage1State::Writing { page: page1 };
-                io_yield_one!(c);
-            }
-            AllocatePage1State::Writing { page } => {
-                turso_assert!(page.is_loaded(), "page should be loaded");
-                tracing::trace!("allocate_page1(Writing done)");
-                if self.wal.is_some() {
-                    // Fsync page 1 to the main database file before any commit
-                    // can fsync frames into the WAL. This keeps the invariant
-                    // "a WAL exists ⇒ the database file has at least one page"
-                    // that SQLite guarantees (`PRAGMA journal_mode=WAL` on a
-                    // fresh database commits page 1 through a rollback journal
-                    // first). SQLite relies on it: `pagerOpenWalIfPresent()`
-                    // deletes any WAL found next to a zero-page database, so a
-                    // pre-first-checkpoint crash image with a 0-byte main file
-                    // would lose all its committed data if SQLite opened it.
-                    let c = sqlite3_ondisk::begin_sync(
-                        self.db_file.as_ref(),
-                        self.syncing.clone(),
-                        self.get_sync_type(),
-                    )?;
-                    *self.allocate_page1_state.write() = AllocatePage1State::Syncing { page };
-                    io_yield_one!(c);
-                }
-                self.finish_allocate_page1(page)
-            }
-            AllocatePage1State::Syncing { page } => {
-                tracing::trace!("allocate_page1(Syncing done)");
-                self.finish_allocate_page1(page)
-            }
-            AllocatePage1State::Done => unreachable!("cannot try to allocate page 1 again"),
+    /// Writes the first page of a new database to the database file, syncs
+    /// the file when there is a WAL, and publishes the page in the cache.
+    async fn allocate_page1_async(
+        co: &mut Co<PagerStep>,
+        (): (),
+    ) -> Result<PageRef, Box<LimboError>> {
+        let (page1, c) = co.with(|ctx| ctx.pager.write_new_page1())?;
+        co.yield_io(IOCompletions(c)).await;
+        turso_assert!(page1.is_loaded(), "page should be loaded");
+        tracing::trace!("allocate_page1(Writing done)");
+        if co.with(|ctx| ctx.pager.wal.is_some()) {
+            // Fsync page 1 to the main database file before any commit
+            // can fsync frames into the WAL. This keeps the invariant
+            // "a WAL exists ⇒ the database file has at least one page"
+            // that SQLite guarantees (`PRAGMA journal_mode=WAL` on a
+            // fresh database commits page 1 through a rollback journal
+            // first). SQLite relies on it: `pagerOpenWalIfPresent()`
+            // deletes any WAL found next to a zero-page database, so a
+            // pre-first-checkpoint crash image with a 0-byte main file
+            // would lose all its committed data if SQLite opened it.
+            let c = co
+                .io(|ctx| {
+                    sqlite3_ondisk::begin_sync(
+                        ctx.pager.db_file.as_ref(),
+                        ctx.pager.syncing.clone(),
+                        ctx.pager.get_sync_type(),
+                    )
+                    .map(IOResult::Done)
+                })
+                .await;
+            co.yield_io(IOCompletions(c)).await;
+            tracing::trace!("allocate_page1(Syncing done)");
         }
+        co.io(|ctx| ctx.pager.finish_allocate_page1(&page1).map(IOResult::Done))
+            .await;
+        Ok(page1)
+    }
+
+    /// Builds page 1 of a new database from the default header and starts
+    /// its write to the database file. The page stays pinned until
+    /// [Pager::finish_allocate_page1] publishes it.
+    fn write_new_page1(&self) -> Result<(PageRef, Completion)> {
+        turso_assert!(!self.db_initialized());
+        tracing::trace!("allocate_page1(Start)");
+
+        let IOResult::Done(mut default_header) = self.with_header(|header| *header)? else {
+            panic!("DB should not be initialized and should not do any IO");
+        };
+
+        turso_assert_eq!(default_header.database_size.get(), 0);
+        default_header.database_size = 1.into();
+
+        // Use cached reserved_space if set (e.g., by sync engine before page allocation),
+        // otherwise fall back to IOContext's encryption/checksum requirements.
+        let reserved_space_bytes = self.get_reserved_space().unwrap_or_else(|| {
+            let io_ctx = self.io_ctx.read();
+            io_ctx.get_reserved_space_bytes()
+        });
+        default_header.reserved_space = reserved_space_bytes;
+        self.set_reserved_space(reserved_space_bytes);
+
+        if let Some(size) = self.get_page_size() {
+            default_header.page_size = size;
+        }
+
+        tracing::debug!(
+            "allocate_page1(Start) page_size = {:?}, reserved_space = {}",
+            default_header.page_size,
+            default_header.reserved_space
+        );
+
+        self.buffer_pool
+            .finalize_with_page_size(default_header.page_size.get() as usize)?;
+        let page = allocate_new_page(1, &self.buffer_pool);
+
+        let contents = page.get_contents();
+        contents.write_database_header(&default_header);
+
+        let page1 = page;
+        // Create the sqlite_schema table, for this we just need to create the btree page
+        // for the first page of the database which is basically like any other btree page
+        // but with a 100 byte offset, so we just init the page so that sqlite understands
+        // this is a correct page.
+        btree_init_page(
+            &page1,
+            PageType::TableLeaf,
+            DatabaseHeader::SIZE,
+            (default_header.page_size.get() - default_header.reserved_space as u32) as usize,
+        );
+        let c = begin_write_btree_page(self, &page1, None)?;
+
+        // Pin page1 to prevent eviction while stored in state machine
+        page1.pin();
+        Ok((page1, c))
     }
 
     /// Final step of [Pager::allocate_page1]: page 1 is written (and, for
     /// WAL-backed databases, fsync'd) to the main database file; publish it
     /// in the page cache and mark the database initialized.
-    fn finish_allocate_page1(&self, page: PageRef) -> IOResultOr<PageRef> {
+    fn finish_allocate_page1(&self, page: &PageRef) -> Result<()> {
         let page_key = PageCacheKey::new(page.get().id());
         let mut cache = self.page_cache.write();
         cache.insert(page_key, page.clone()).map_err(|e| {
@@ -5754,15 +5746,11 @@ impl Pager {
         // After we wrote the header page, we may now set this None, to signify we initialized
         self.init_page_1.store(None);
         page.unpin();
-        *self.allocate_page1_state.write() = AllocatePage1State::Done;
-        Ok(IOResult::Done(page))
+        Ok(())
     }
 
     pub fn allocating_page1(&self) -> bool {
-        matches!(
-            *self.allocate_page1_state.read(),
-            AllocatePage1State::Writing { .. } | AllocatePage1State::Syncing { .. }
-        )
+        self.ops.allocate_page1.is_active()
     }
 
     /// Tries to reuse a page from the freelist if available.
