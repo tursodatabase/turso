@@ -55,11 +55,10 @@ use crate::{
     types::{IOCompletions, IOResult},
     vdbe::{
         execute::{
-            OpAttachState, OpClearBtreeState, OpColumnState, OpDeleteState, OpDeleteSubState,
-            OpDestroyState, OpIdxInsertState, OpInitCdcVersionState, OpInsertState,
-            OpInsertSubState, OpJournalModeState, OpNewRowidState, OpNoConflictState,
-            OpParseSchemaState, OpProgramState, OpRowIdState, OpSeekState, OpTransactionState,
-            VacuumIntoOpContext,
+            OpAttachState, OpClearBtreeState, OpDeleteState, OpDeleteSubState, OpDestroyState,
+            OpIdxInsertState, OpInitCdcVersionState, OpInsertState, OpInsertSubState,
+            OpJournalModeState, OpNewRowidState, OpNoConflictState, OpParseSchemaState,
+            OpProgramState, OpRowIdState, OpSeekState, OpTransactionState, VacuumIntoOpContext,
         },
         hash_table::HashTable,
         metrics::StatementMetrics,
@@ -617,7 +616,7 @@ enum ActiveOpState {
     IdxInsert(OpIdxInsertState),
     Insert(OpInsertState),
     NoConflict(OpNoConflictState),
-    Column(OpColumnState),
+    ColumnDeferred,
     RowId(OpRowIdState),
     Transaction(OpTransactionState),
     Attach(OpAttachState),
@@ -643,7 +642,7 @@ impl std::fmt::Debug for ActiveOpState {
             ActiveOpState::IdxInsert(_) => "IdxInsert",
             ActiveOpState::Insert(_) => "Insert",
             ActiveOpState::NoConflict(_) => "NoConflict",
-            ActiveOpState::Column(_) => "Column",
+            ActiveOpState::ColumnDeferred => "ColumnDeferred",
             ActiveOpState::RowId(_) => "RowId",
             ActiveOpState::Transaction(_) => "Transaction",
             ActiveOpState::Attach(_) => "Attach",
@@ -660,6 +659,7 @@ impl std::fmt::Debug for ActiveOpState {
 #[derive(Debug, Default)]
 struct ActiveOpStateSlot {
     state: ActiveOpState,
+    column_deferred: Option<execute::ColumnDeferredOp>,
 }
 
 macro_rules! active_state_accessor {
@@ -693,9 +693,46 @@ impl Default for ActiveOpState {
 
 impl ActiveOpStateSlot {
     fn clear(&mut self) {
-        if !matches!(self.state, ActiveOpState::None) {
-            self.state = ActiveOpState::None;
+        match self.state {
+            ActiveOpState::None => {}
+            ActiveOpState::ColumnDeferred => {
+                if let Some(op) = &mut self.column_deferred {
+                    op.cancel();
+                }
+                self.state = ActiveOpState::None;
+            }
+            _ => self.state = ActiveOpState::None,
         }
+    }
+
+    /// Takes the async Column operation out of the slot for one step. The
+    /// first call allocates it; later calls reuse it.
+    fn take_column_deferred(&mut self) -> execute::ColumnDeferredOp {
+        assert!(
+            matches!(
+                self.state,
+                ActiveOpState::None | ActiveOpState::ColumnDeferred
+            ),
+            "active opcode state mismatch: expected ColumnDeferred, got {:?}",
+            self.state
+        );
+        self.column_deferred
+            .take()
+            .unwrap_or_else(execute::ColumnDeferredOp::new)
+    }
+
+    /// Puts the async Column operation back after a step. `active` is true
+    /// when the step yielded for I/O, so the next Column resumes it.
+    fn put_column_deferred(&mut self, op: execute::ColumnDeferredOp, active: bool) {
+        debug_assert!(self.column_deferred.is_none());
+        std::mem::forget(self.column_deferred.replace(op));
+        let state = if active {
+            ActiveOpState::ColumnDeferred
+        } else {
+            ActiveOpState::None
+        };
+        // The old state is None or ColumnDeferred; neither owns anything.
+        std::mem::forget(std::mem::replace(&mut self.state, state));
     }
 
     /// True when no multi-step opcode is suspended. Hot opcodes use this to
@@ -775,7 +812,6 @@ impl ActiveOpStateSlot {
         OpNoConflictState,
         OpNoConflictState::Start
     );
-    active_state_accessor!(column, Column, OpColumnState, OpColumnState::Start);
     active_state_accessor!(row_id, RowId, OpRowIdState, OpRowIdState::Start);
     active_state_accessor!(
         transaction,
@@ -4121,8 +4157,8 @@ mod tests {
 
         assert!(matches!(state.active_op_state.state, ActiveOpState::None));
         assert!(matches!(
-            state.active_op_state.column(),
-            OpColumnState::Start
+            state.active_op_state.row_id(),
+            OpRowIdState::Start
         ));
         state.active_op_state.clear();
         assert!(state.active_op_state.parse_schema().is_none());
@@ -4151,7 +4187,7 @@ mod tests {
     #[test]
     fn active_opcode_helpers_reject_mismatched_resumes() {
         let mut state = ProgramState::new(1, 0);
-        *state.active_op_state.column() = OpColumnState::GetColumn;
+        *state.active_op_state.row_id() = OpRowIdState::GetRowid;
 
         let panic = catch_unwind(AssertUnwindSafe(|| {
             let _ = state.active_op_state.parse_schema();

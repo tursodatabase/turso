@@ -48,6 +48,7 @@ pub(crate) mod sync;
 pub(crate) mod thread;
 
 mod assert;
+pub(crate) mod coro;
 mod connection;
 mod database;
 pub mod dialect;

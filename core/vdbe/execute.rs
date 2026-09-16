@@ -95,6 +95,7 @@ use branches::{mark_unlikely, unlikely};
 use either::Either;
 use smallvec::SmallVec;
 use std::any::Any;
+use std::ptr::NonNull;
 use std::str::FromStr;
 use std::{
     borrow::BorrowMut,
@@ -102,6 +103,8 @@ use std::{
     sync::{atomic::Ordering, Arc},
 };
 use turso_macros::{match_ignore_ascii_case, turso_debug_assert};
+
+use crate::coro::{BoxedResumable, Co, Runner};
 
 use crate::pseudo::PseudoCursor;
 
@@ -1896,20 +1899,6 @@ pub fn op_last(
     Ok(InsnFunctionStepResult::Step)
 }
 
-#[derive(Debug, Clone, Copy)]
-pub enum OpColumnState {
-    Start,
-    Rowid {
-        index_cursor_id: usize,
-        table_cursor_id: usize,
-    },
-    Seek {
-        rowid: i64,
-        table_cursor_id: usize,
-    },
-    GetColumn,
-}
-
 pub fn op_column(
     program: &Program,
     state: &mut ProgramState,
@@ -1932,16 +1921,7 @@ pub fn op_column(
         }
         return Ok(result);
     }
-    op_column_deferred(
-        program,
-        state,
-        *cursor_id,
-        ColumnFetch::Single {
-            column: *column,
-            dest: *dest,
-            default,
-        },
-    )
+    op_column_deferred(program, state, insn, *cursor_id)
 }
 
 // Not in test builds: inline(always) makes fn-item coercions produce
@@ -1971,16 +1951,7 @@ pub fn op_column_range(
         }
         return Ok(result);
     }
-    op_column_deferred(
-        program,
-        state,
-        *cursor_id,
-        ColumnFetch::Range {
-            start_column: *start_column,
-            dest: *dest,
-            defaults,
-        },
-    )
+    op_column_deferred(program, state, insn, *cursor_id)
 }
 
 /// What a Column-family instruction fetches once the cursor is positioned.
@@ -2036,92 +2007,195 @@ impl ColumnFetch<'_> {
 fn op_column_deferred(
     program: &Program,
     state: &mut ProgramState,
+    insn: &Insn,
     cursor_id: usize,
-    fetch: ColumnFetch<'_>,
 ) -> InsnResult {
-    'outer: loop {
-        match *state.active_op_state.column() {
-            OpColumnState::Start => {
-                if let Some(deferred) = state.deferred_seeks[cursor_id].take() {
-                    *state.active_op_state.column() = OpColumnState::Rowid {
-                        index_cursor_id: deferred.index_cursor_id,
-                        table_cursor_id: deferred.table_cursor_id,
-                    };
-                } else {
-                    *state.active_op_state.column() = OpColumnState::GetColumn;
-                }
-            }
-            OpColumnState::Rowid {
-                index_cursor_id,
-                table_cursor_id,
-            } => {
-                let Some(rowid) = ({
-                    let index_cursor = state.get_cursor(index_cursor_id);
-                    match index_cursor {
-                        Cursor::BTree(cursor) => return_if_io!(state, cursor.rowid()),
-                        Cursor::Dyn(cursor) => return_if_io!(state, cursor.rowid()),
-                        Cursor::IndexMethod(cursor) => return_if_io!(state, cursor.query_rowid()),
-                        _ => panic!("unexpected cursor type"),
-                    }
-                }) else {
-                    fetch.write_null_regs(state);
-                    break 'outer;
-                };
-                *state.active_op_state.column() = OpColumnState::Seek {
-                    rowid,
-                    table_cursor_id,
-                };
-            }
-            OpColumnState::Seek {
-                rowid,
-                table_cursor_id,
-            } => {
-                {
-                    let table_cursor = state.get_cursor(table_cursor_id);
-                    // MaterializedView cursors shouldn't go through deferred seek logic
-                    // but if we somehow get here, handle it appropriately
-                    match table_cursor {
-                        Cursor::MaterializedView(mv_cursor) => {
-                            // Seek to the rowid in the materialized view
-                            return_if_io!(
-                                state,
-                                mv_cursor
-                                    .seek(SeekKey::TableRowId(rowid), SeekOp::GE { eq_only: true })
-                            );
-                        }
-                        _ => {
-                            // Regular btree cursor
-                            let table_cursor = table_cursor.as_btree_mut();
-                            return_if_io!(
-                                state,
-                                table_cursor
-                                    .seek(SeekKey::TableRowId(rowid), SeekOp::GE { eq_only: true })
-                            );
-                        }
-                    }
-                }
-                state.metrics.btree_seeks = state.metrics.btree_seeks.wrapping_add(1);
-                state.metrics.btree_table_seeks = state.metrics.btree_table_seeks.wrapping_add(1);
-                state.metrics.btree_deferred_seeks =
-                    state.metrics.btree_deferred_seeks.wrapping_add(1);
-                state.metrics.search_count = state.metrics.search_count.wrapping_add(1);
-                *state.active_op_state.column() = OpColumnState::GetColumn;
-            }
-            OpColumnState::GetColumn => {
-                let result = fetch.fetch(program, state, cursor_id)?;
-                if !matches!(result, InsnFunctionStepResult::Step) {
-                    // IO yield: the slot stays at GetColumn so the resume
-                    // re-enters this arm.
-                    return Ok(result);
-                }
-                break 'outer;
-            }
+    let mut op = state.active_op_state.take_column_deferred();
+    // SAFETY: the context is consumed by this step, and the references
+    // outlive the call.
+    let result = op.resume(unsafe { VdbeCtx::new(program, state, insn) }, cursor_id);
+    state
+        .active_op_state
+        .put_column_deferred(op, matches!(result, Ok(IOResult::IO(_))));
+    match result? {
+        IOResult::Done(()) => {
+            state.pc += 1;
+            Ok(InsnFunctionStepResult::Step)
+        }
+        IOResult::IO(io) => Ok(state.suspend_on_io(io)),
+    }
+}
+
+/// The async Column operation, boxed once per program state and reused.
+pub(crate) struct ColumnDeferredOp(BoxedResumable<VdbeCtx, usize, (), Box<LimboError>>);
+
+impl ColumnDeferredOp {
+    pub(crate) fn new() -> Self {
+        Self(Runner::boxed(column_deferred))
+    }
+
+    fn is_active(&self) -> bool {
+        self.0.is_active()
+    }
+
+    fn resume(&mut self, mut ctx: VdbeCtx, cursor_id: usize) -> IOResultOr<()> {
+        self.0.as_mut().resume(&mut ctx, cursor_id)
+    }
+
+    pub(crate) fn cancel(&mut self) {
+        self.0.as_mut().cancel();
+    }
+}
+
+impl std::fmt::Debug for ColumnDeferredOp {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(if self.is_active() {
+            "ColumnDeferredOp(active)"
+        } else {
+            "ColumnDeferredOp(idle)"
+        })
+    }
+}
+
+/// The context of one step of an async VDBE operation. The async function
+/// gets it back on every step, so it never keeps a reference across a yield.
+pub(crate) struct VdbeCtx {
+    program: NonNull<Program>,
+    state: NonNull<ProgramState>,
+    insn: NonNull<Insn>,
+}
+
+impl VdbeCtx {
+    /// # Safety
+    ///
+    /// The caller must not use `program`, `state`, or `insn` until it has
+    /// dropped the context.
+    unsafe fn new(program: &Program, state: &mut ProgramState, insn: &Insn) -> Self {
+        Self {
+            program: NonNull::from(program),
+            state: NonNull::from(state),
+            insn: NonNull::from(insn),
         }
     }
 
-    state.active_op_state.clear();
-    state.pc += 1;
-    Ok(InsnFunctionStepResult::Step)
+    fn state(&mut self) -> &mut ProgramState {
+        // SAFETY: see `new`.
+        unsafe { self.state.as_mut() }
+    }
+
+    fn parts(&mut self) -> (&Program, &mut ProgramState, &Insn) {
+        // SAFETY: see `new`.
+        unsafe {
+            (
+                self.program.as_ref(),
+                self.state.as_mut(),
+                self.insn.as_ref(),
+            )
+        }
+    }
+}
+
+/// Column when a deferred seek is pending or the fetch was suspended for IO:
+/// reads the rowid from the index cursor, seeks the table cursor, fetches.
+async fn column_deferred(mut co: Co<VdbeCtx>, cursor_id: usize) -> Result<(), Box<LimboError>> {
+    if let Some(deferred) = co.with(|ctx| ctx.state().deferred_seeks[cursor_id].take()) {
+        let rowid = co
+            .io(|ctx| index_cursor_rowid(ctx.state(), deferred.index_cursor_id))
+            .await?;
+        let Some(rowid) = rowid else {
+            co.with(|ctx| {
+                let (_, state, insn) = ctx.parts();
+                column_fetch_of(insn).write_null_regs(state);
+            });
+            return Ok(());
+        };
+        co.io(|ctx| seek_table_row(ctx.state(), deferred.table_cursor_id, rowid))
+            .await?;
+        co.with(|ctx| {
+            let metrics = &mut ctx.state().metrics;
+            metrics.btree_seeks = metrics.btree_seeks.wrapping_add(1);
+            metrics.btree_table_seeks = metrics.btree_table_seeks.wrapping_add(1);
+            metrics.btree_deferred_seeks = metrics.btree_deferred_seeks.wrapping_add(1);
+            metrics.search_count = metrics.search_count.wrapping_add(1);
+        });
+    }
+    co.io(|ctx| {
+        let (program, state, insn) = ctx.parts();
+        fetch_columns(program, state, insn, cursor_id)
+    })
+    .await
+}
+
+#[inline(always)]
+fn index_cursor_rowid(state: &mut ProgramState, index_cursor_id: usize) -> IOResultOr<Option<i64>> {
+    match state.get_cursor(index_cursor_id) {
+        Cursor::BTree(cursor) => cursor.rowid(),
+        Cursor::Dyn(cursor) => cursor.rowid(),
+        Cursor::IndexMethod(cursor) => cursor.query_rowid(),
+        _ => panic!("unexpected cursor type"),
+    }
+}
+
+#[inline(always)]
+fn seek_table_row(
+    state: &mut ProgramState,
+    table_cursor_id: usize,
+    rowid: i64,
+) -> IOResultOr<SeekResult> {
+    let key = SeekKey::TableRowId(rowid);
+    let op = SeekOp::GE { eq_only: true };
+    match state.get_cursor(table_cursor_id) {
+        Cursor::MaterializedView(cursor) => cursor.seek(key, op),
+        cursor => cursor.as_btree_mut().seek(key, op),
+    }
+}
+
+/// Runs the fetch of a Column-family instruction. A fetch parks its
+/// completion in the program state, so this takes it out again for the yield.
+#[inline(always)]
+fn fetch_columns(
+    program: &Program,
+    state: &mut ProgramState,
+    insn: &Insn,
+    cursor_id: usize,
+) -> IOResultOr<()> {
+    match column_fetch_of(insn).fetch(program, state, cursor_id)? {
+        InsnFunctionStepResult::IO => {
+            let io = state
+                .io_completions
+                .take()
+                .expect("an IO step parks a completion");
+            Ok(IOResult::IO(io))
+        }
+        _ => Ok(IOResult::Done(())),
+    }
+}
+
+#[inline(always)]
+fn column_fetch_of(insn: &Insn) -> ColumnFetch<'_> {
+    match insn {
+        Insn::Column {
+            column,
+            dest,
+            default,
+            ..
+        } => ColumnFetch::Single {
+            column: *column,
+            dest: *dest,
+            default,
+        },
+        Insn::ColumnRange {
+            start_column,
+            dest,
+            defaults,
+            ..
+        } => ColumnFetch::Range {
+            start_column: *start_column,
+            dest: *dest,
+            defaults,
+        },
+        _ => unreachable!("column_deferred runs only for Column and ColumnRange"),
+    }
 }
 
 /// Fetches one column of the cursor's current row into a register.
