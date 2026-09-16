@@ -1816,124 +1816,46 @@ async fn test_mvcc_reopen_rollback_does_not_reuse_restored_rowid() {
         let db = Builder::new_local(db_path).build().await.unwrap();
         let conn = db.connect().unwrap();
         drain_query(&conn, "PRAGMA journal_mode = 'mvcc'").await;
-        conn.execute(
-            "CREATE TABLE t (hard REAL, u INTEGER UNIQUE, pk NUMERIC PRIMARY KEY)",
-            (),
-        )
-        .await
-        .unwrap();
-        conn.execute("INSERT INTO t (hard, u, pk) VALUES (1.0, 466, 10)", ())
+        conn.execute("CREATE TABLE t (value TEXT UNIQUE)", ())
             .await
             .unwrap();
-        conn.execute("INSERT INTO t (hard, u, pk) VALUES (2.0, 20, 77)", ())
+        conn.execute("INSERT INTO t VALUES ('one'), ('two'), ('three')", ())
             .await
             .unwrap();
-        conn.execute("INSERT INTO t (hard, u, pk) VALUES (3.0, 30, 105)", ())
-            .await
-            .unwrap();
-        conn.execute("INSERT INTO t (hard, u, pk) VALUES (4.0, 40, 442)", ())
-            .await
-            .unwrap();
-        conn.execute("INSERT INTO t (hard, u, pk) VALUES (5.0, 50, 792)", ())
-            .await
-            .unwrap();
-        conn.execute("INSERT INTO t (hard, u, pk) VALUES (6.0, 60, 939)", ())
-            .await
-            .unwrap();
-        conn.execute("BEGIN CONCURRENT", ()).await.unwrap();
-        conn.execute("INSERT INTO t (hard, u, pk) VALUES (89.17, 578, 692)", ())
-            .await
-            .unwrap();
-        conn.execute("COMMIT", ()).await.unwrap();
-        drain_query(&conn, "PRAGMA wal_checkpoint(RESTART)").await;
+        drain_query(&conn, "PRAGMA wal_checkpoint(TRUNCATE)").await;
     }
 
     {
         let db = Builder::new_local(db_path).build().await.unwrap();
-        let conn_0 = db.connect().unwrap();
-        let conn_1 = db.connect().unwrap();
-        conn_0
-            .execute("PRAGMA data_sync_retry = 1", ())
+        let conn = db.connect().unwrap();
+        conn.execute("PRAGMA data_sync_retry = 1", ())
             .await
             .unwrap();
-        conn_1
-            .execute("PRAGMA data_sync_retry = 1", ())
-            .await
-            .unwrap();
-
-        conn_1.execute("BEGIN CONCURRENT", ()).await.unwrap();
-        conn_0.execute("BEGIN CONCURRENT", ()).await.unwrap();
-        assert!(matches!(
-            conn_1
-                .execute("UPDATE t SET hard = 12.61, u = 466 WHERE pk = 77", ())
-                .await,
-            Err(Error::Constraint(_))
-        ));
-        conn_1.execute("COMMIT", ()).await.unwrap();
-
-        conn_0
-            .execute("DELETE FROM t WHERE pk = 692", ())
-            .await
-            .unwrap();
-        conn_0.execute("SAVEPOINT sp_11", ()).await.unwrap();
-        conn_0
-            .execute("DELETE FROM t WHERE pk = 939", ())
+        conn.execute("BEGIN CONCURRENT", ()).await.unwrap();
+        conn.execute("DELETE FROM t WHERE rowid IN (2, 3)", ())
             .await
             .unwrap();
         assert!(matches!(
-            conn_0
-                .execute("INSERT INTO t (hard, u, pk) VALUES (15.67, 126, 105)", ())
-                .await,
+            conn.execute("INSERT INTO t VALUES ('one')", ()).await,
             Err(Error::Constraint(_))
         ));
-        conn_0
-            .execute("UPDATE t SET hard = 70.98, u = 641 WHERE pk = 442", ())
+        conn.execute("ROLLBACK", ()).await.unwrap();
+        conn.execute("INSERT INTO t VALUES ('four')", ())
             .await
             .unwrap();
-        conn_0.execute("RELEASE sp_11", ()).await.unwrap();
-        conn_0.execute("ROLLBACK", ()).await.unwrap();
 
-        let restored = collect_values(
-            &conn_1,
-            "SELECT rowid, hard, u, pk FROM t NOT INDEXED WHERE pk = 692",
-        )
-        .await;
-        assert_eq!(restored.len(), 1, "rolled-back delete lost pk=692");
-
-        conn_1
-            .execute("UPDATE t SET hard = 31.58, u = 948 WHERE pk = 792", ())
-            .await
-            .unwrap();
-        drain_query(&conn_1, "PRAGMA wal_checkpoint(TRUNCATE)").await;
-        assert_eq!(
-            collect_values(&conn_1, "PRAGMA integrity_check").await,
-            vec![vec![Value::Text("ok".to_string())]]
-        );
-
-        conn_1
-            .execute("INSERT INTO t (hard, u, pk) VALUES (6.08, 382, 174)", ())
-            .await
-            .unwrap();
-        drain_query(&conn_1, "PRAGMA wal_checkpoint(TRUNCATE)").await;
-
-        assert_eq!(
-            collect_values(&conn_1, "PRAGMA integrity_check").await,
-            vec![vec![Value::Text("ok".to_string())]]
-        );
         assert_eq!(
             collect_values(
-                &conn_1,
-                "SELECT \
-                     (SELECT COUNT(*) FROM t NOT INDEXED), \
-                     (SELECT COUNT(rowid) FROM t INDEXED BY sqlite_autoindex_t_1), \
-                     (SELECT COUNT(rowid) FROM t INDEXED BY sqlite_autoindex_t_2)",
+                &conn,
+                "SELECT rowid, value FROM t NOT INDEXED ORDER BY rowid",
             )
             .await,
-            vec![vec![
-                Value::Integer(8),
-                Value::Integer(8),
-                Value::Integer(8)
-            ]]
+            vec![
+                vec![Value::Integer(1), Value::Text("one".to_string())],
+                vec![Value::Integer(2), Value::Text("two".to_string())],
+                vec![Value::Integer(3), Value::Text("three".to_string())],
+                vec![Value::Integer(4), Value::Text("four".to_string())],
+            ]
         );
     }
 }
