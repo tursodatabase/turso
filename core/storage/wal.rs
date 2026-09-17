@@ -528,6 +528,20 @@ trait WalCoordination: Debug + Send + Sync {
     /// Enumerate the latest visible frame per page in the requested frame range.
     fn iter_latest_frames(&self, min_frame: u64, max_frame: u64) -> Vec<(u64, u64)>;
 
+    fn try_find_frame(
+        &self,
+        page_id: u64,
+        min_frame: u64,
+        max_frame: u64,
+        frame_watermark: Option<u64>,
+    ) -> Result<Option<u64>> {
+        Ok(self.find_frame(page_id, min_frame, max_frame, frame_watermark))
+    }
+
+    fn try_iter_latest_frames(&self, min_frame: u64, max_frame: u64) -> Result<Vec<(u64, u64)>> {
+        Ok(self.iter_latest_frames(min_frame, max_frame))
+    }
+
     /// Read the current checkpoint epoch used to tag cached WAL pages.
     fn checkpoint_epoch(&self) -> u32;
 
@@ -2028,6 +2042,29 @@ impl WalCoordination for ShmWalCoordination {
             return self.fallback.iter_latest_frames(min_frame, max_frame);
         }
         self.authority.iter_latest_frames(min_frame, max_frame)
+    }
+
+    fn try_find_frame(
+        &self,
+        page_id: u64,
+        min_frame: u64,
+        max_frame: u64,
+        frame_watermark: Option<u64>,
+    ) -> Result<Option<u64>> {
+        if self.authority.frame_index_overflowed() {
+            return self
+                .fallback
+                .try_find_frame(page_id, min_frame, max_frame, frame_watermark);
+        }
+        self.authority
+            .try_find_frame(page_id, min_frame, max_frame, frame_watermark)
+    }
+
+    fn try_iter_latest_frames(&self, min_frame: u64, max_frame: u64) -> Result<Vec<(u64, u64)>> {
+        if self.authority.frame_index_overflowed() {
+            return self.fallback.try_iter_latest_frames(min_frame, max_frame);
+        }
+        self.authority.try_iter_latest_frames(min_frame, max_frame)
     }
 
     fn checkpoint_epoch(&self) -> u32 {
@@ -3655,9 +3692,9 @@ impl Wal for WalFile {
             min_frame,
             max_frame
         );
-        let frame = self
-            .coordination
-            .find_frame(page_id, min_frame, max_frame, frame_watermark);
+        let frame =
+            self.coordination
+                .try_find_frame(page_id, min_frame, max_frame, frame_watermark)?;
         if let Some(frame) = frame {
             tracing::debug!(
                 "find_frame(page_id={}, frame_watermark={:?}): found frame={}",
@@ -4979,7 +5016,7 @@ impl WalFile {
                     );
                     let mut to_checkpoint = self
                         .coordination
-                        .iter_latest_frames(oc_min_frame, oc_max_frame);
+                        .try_iter_latest_frames(oc_min_frame, oc_max_frame)?;
                     // sort by frame_id for read locality
                     to_checkpoint.sort_unstable_by(|a, b| (a.1, a.0).cmp(&(b.1, b.0)));
                     // Every frame we are about to backfill must be durable in
@@ -5785,9 +5822,7 @@ impl WalFileShared {
             return sqlite3_ondisk::build_shared_wal(&file, io);
         }
         if snapshot.max_frame > snapshot.nbackfills
-            && authority
-                .iter_latest_frames(0, snapshot.max_frame)
-                .is_empty()
+            && !authority.has_visible_frame(snapshot.max_frame)?
         {
             tracing::debug!(
                 max_frame = snapshot.max_frame,
