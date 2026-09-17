@@ -7160,23 +7160,26 @@ fn apply_kbn_step(acc: &mut Value, r: f64, state: &mut SumAggState) {
     // When t is infinite, the KBN correction computes inf - inf = NaN,
     // which is meaningless. Skip compensation in that case.
     if t.is_finite() {
-        let correction = if s.abs() > r.abs() {
-            (s - t) + r
-        } else {
-            (r - t) + s
-        };
-        state.r_err += correction;
+        state.r_err += kbn_correction(s, r, t);
     }
     *acc = Value::from_f64(t);
 }
+
+fn kbn_correction(s: f64, r: f64, t: f64) -> f64 {
+    if s.abs() > r.abs() {
+        (s - t) + r
+    } else {
+        (r - t) + s
+    }
+}
+
+const KBN_EXACT_INTEGER_LIMIT: u64 = 1 << 52;
 
 // Add a (possibly large) integer to the running float sum. An integer big
 // enough to lose precision as a single f64 is split into a high and a low
 // part, each added separately, so no bits are dropped.
 fn apply_kbn_step_int(acc: &mut Value, i: i64, state: &mut SumAggState) {
-    const THRESHOLD: i64 = 4503599627370496; // 2^52
-
-    if i <= -THRESHOLD || i >= THRESHOLD {
+    if i.unsigned_abs() >= KBN_EXACT_INTEGER_LIMIT {
         let i_sm = i % 16384;
         let i_big = i - i_sm;
 
@@ -7193,9 +7196,7 @@ fn apply_kbn_step_int(acc: &mut Value, i: i64, state: &mut SumAggState) {
 /// a low part (the running error term) and lose no bits. Mirrors
 /// SQLite's `kahanBabuskaNeumaierInit` (func.c).
 fn kbn_init_from_int(acc: &mut Value, i: i64, state: &mut SumAggState) {
-    const THRESHOLD: i64 = 4503599627370496; // 2^52
-
-    if i <= -THRESHOLD || i >= THRESHOLD {
+    if i.unsigned_abs() >= KBN_EXACT_INTEGER_LIMIT {
         let i_sm = i % 16384;
         *acc = Value::from_f64((i - i_sm) as f64);
         state.r_err = i_sm as f64;
@@ -8853,32 +8854,110 @@ pub fn op_agg_step(
     _pager: &Arc<Pager>,
 ) -> InsnResult {
     load_insn!(AggStep { data }, insn);
-    // Fast paths for the common integer cases of sum and min/max over
-    // an initialized accumulator. The slow path keeps every other function
-    // and value type, the first-row initialization and the error cases.
+    // Fast paths for the common numeric cases of count, sum, avg and min/max
+    // over an initialized accumulator. The slow path keeps every other
+    // function and value type, the first-row initialization and the error
+    // cases.
     if let AccumulatorFunc::Agg(agg) = &data.func {
         match agg {
             AggFunc::Sum | AggFunc::Total => {
-                if let Register::Value(Value::Numeric(Numeric::Integer(arg))) =
-                    state.registers[data.col]
-                {
+                if let Register::Value(Value::Numeric(arg)) = state.registers[data.col] {
                     if let Register::Aggregate(AggContext::Builtin(payload)) =
                         &mut state.registers[data.acc_reg]
                     {
-                        // Integer total so far, no float seen (payload[2] is the
-                        // approx flag), and neither the total nor the row count
-                        // overflows: the same result as the generic step.
-                        if let [Value::Numeric(Numeric::Integer(acc)), _, Value::Numeric(Numeric::Integer(0)), _, Value::Numeric(Numeric::Integer(count)), ..] =
+                        // payload[2] is the approx flag and payload[3] the overflow flag.
+                        match (arg, payload.as_mut_slice()) {
+                            (
+                                Numeric::Integer(arg),
+                                [Value::Numeric(Numeric::Integer(acc)), _, Value::Numeric(Numeric::Integer(0)), _, Value::Numeric(Numeric::Integer(count)), ..],
+                            ) => {
+                                if let (Some(sum), Some(rows)) =
+                                    (acc.checked_add(arg), count.checked_add(1))
+                                {
+                                    *acc = sum;
+                                    *count = rows;
+                                    state.pc += 1;
+                                    return Ok(InsnFunctionStepResult::Step);
+                                }
+                            }
+                            (
+                                Numeric::Float(arg),
+                                [Value::Numeric(Numeric::Float(acc)), Value::Numeric(Numeric::Float(r_err)), Value::Numeric(Numeric::Integer(1)), Value::Numeric(Numeric::Integer(ovrfl)), Value::Numeric(Numeric::Integer(count)), ..],
+                            ) => {
+                                if let (Some((sum, err)), Some(rows)) = (
+                                    kbn_step_finite(*acc, *r_err, f64::from(arg)),
+                                    count.checked_add(1),
+                                ) {
+                                    *acc = sum;
+                                    *r_err = err;
+                                    *ovrfl = 0;
+                                    *count = rows;
+                                    state.pc += 1;
+                                    return Ok(InsnFunctionStepResult::Step);
+                                }
+                            }
+                            (
+                                Numeric::Integer(arg),
+                                [Value::Numeric(Numeric::Float(acc)), Value::Numeric(Numeric::Float(r_err)), _, _, Value::Numeric(Numeric::Integer(count)), ..],
+                            ) if arg.unsigned_abs() < KBN_EXACT_INTEGER_LIMIT => {
+                                if let (Some((sum, err)), Some(rows)) = (
+                                    kbn_step_finite(*acc, *r_err, arg as f64),
+                                    count.checked_add(1),
+                                ) {
+                                    *acc = sum;
+                                    *r_err = err;
+                                    *count = rows;
+                                    state.pc += 1;
+                                    return Ok(InsnFunctionStepResult::Step);
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+            }
+            AggFunc::Avg => {
+                if let Register::Value(Value::Numeric(arg)) = state.registers[data.col] {
+                    let arg = match arg {
+                        Numeric::Float(f) => Some(f64::from(f)),
+                        Numeric::Integer(i) if i.unsigned_abs() < KBN_EXACT_INTEGER_LIMIT => {
+                            Some(i as f64)
+                        }
+                        Numeric::Integer(_) => None,
+                    };
+                    if let (Some(arg), Register::Aggregate(AggContext::Builtin(payload))) =
+                        (arg, &mut state.registers[data.acc_reg])
+                    {
+                        if let [Value::Numeric(Numeric::Float(acc)), Value::Numeric(Numeric::Float(r_err)), Value::Numeric(Numeric::Integer(count)), ..] =
                             payload.as_mut_slice()
                         {
-                            if let (Some(sum), Some(rows)) =
-                                (acc.checked_add(arg), count.checked_add(1))
+                            if let (Some((sum, err)), Some(rows)) =
+                                (kbn_step_finite(*acc, *r_err, arg), count.checked_add(1))
                             {
                                 *acc = sum;
+                                *r_err = err;
                                 *count = rows;
                                 state.pc += 1;
                                 return Ok(InsnFunctionStepResult::Step);
                             }
+                        }
+                    }
+                }
+            }
+            AggFunc::Count | AggFunc::Count0 => {
+                let counts = matches!(agg, AggFunc::Count0)
+                    || matches!(
+                        state.registers[data.col],
+                        Register::Value(Value::Numeric(_))
+                    );
+                if let (true, Register::Aggregate(AggContext::Builtin(payload))) =
+                    (counts, &mut state.registers[data.acc_reg])
+                {
+                    if let [Value::Numeric(Numeric::Integer(count))] = payload.as_mut_slice() {
+                        if let Some(rows) = count.checked_add(1) {
+                            *count = rows;
+                            state.pc += 1;
+                            return Ok(InsnFunctionStepResult::Step);
                         }
                     }
                 }
@@ -9096,6 +9175,19 @@ fn op_agg_step_slow(program: &Program, state: &mut ProgramState, data: &AggStepD
 
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
+}
+
+/// Adds `value` to a float total and its error term like [apply_kbn_step], or
+/// returns `None` when the result is not finite and the generic step must run.
+#[inline]
+fn kbn_step_finite(sum: NonNan, r_err: NonNan, value: f64) -> Option<(NonNan, NonNan)> {
+    let s = f64::from(sum);
+    let t = s + value;
+    if !t.is_finite() {
+        return None;
+    }
+    let err = f64::from(r_err) + kbn_correction(s, value, t);
+    Some((NonNan::new(t)?, NonNan::new(err)?))
 }
 
 pub fn op_agg_final(
