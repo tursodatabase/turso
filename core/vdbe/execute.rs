@@ -486,8 +486,8 @@ pub fn op_add(
     _pager: &Arc<Pager>,
 ) -> InsnResult {
     load_insn!(Add { lhs, rhs, dest }, insn);
-    if let Some(result) = integer_operands(state, *lhs, *rhs).and_then(|(l, r)| l.checked_add(r)) {
-        state.registers[*dest].set_int(result);
+    if let Some(result) = numeric_operands(state, *lhs, *rhs).and_then(|(l, r)| l.checked_add(r)) {
+        state.registers[*dest].set_numeric(result);
         state.pc += 1;
         return Ok(InsnFunctionStepResult::Step);
     }
@@ -501,8 +501,8 @@ pub fn op_subtract(
     _pager: &Arc<Pager>,
 ) -> InsnResult {
     load_insn!(Subtract { lhs, rhs, dest }, insn);
-    if let Some(result) = integer_operands(state, *lhs, *rhs).and_then(|(l, r)| l.checked_sub(r)) {
-        state.registers[*dest].set_int(result);
+    if let Some(result) = numeric_operands(state, *lhs, *rhs).and_then(|(l, r)| l.checked_sub(r)) {
+        state.registers[*dest].set_numeric(result);
         state.pc += 1;
         return Ok(InsnFunctionStepResult::Step);
     }
@@ -516,16 +516,16 @@ pub fn op_multiply(
     _pager: &Arc<Pager>,
 ) -> InsnResult {
     load_insn!(Multiply { lhs, rhs, dest }, insn);
-    if let Some(result) = integer_operands(state, *lhs, *rhs).and_then(|(l, r)| l.checked_mul(r)) {
-        state.registers[*dest].set_int(result);
+    if let Some(result) = numeric_operands(state, *lhs, *rhs).and_then(|(l, r)| l.checked_mul(r)) {
+        state.registers[*dest].set_numeric(result);
         state.pc += 1;
         return Ok(InsnFunctionStepResult::Step);
     }
     op_arithmetic_slow(state, *lhs, *rhs, *dest, Value::exec_multiply)
 }
 
-/// Add, Subtract and Multiply for every operand pair that is not two
-/// integers without overflow: affinity conversions, floats and NULLs.
+/// Arithmetic for every operand pair the fast path of the opcode does not
+/// cover: affinity conversions, NULLs and results that are not a number.
 #[inline(never)]
 fn op_arithmetic_slow(
     state: &mut ProgramState,
@@ -540,6 +540,16 @@ fn op_arithmetic_slow(
     ));
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
+}
+
+/// The two operands of an arithmetic opcode when both are numbers, the case
+/// that needs no affinity conversion.
+#[inline(always)]
+fn numeric_operands(state: &ProgramState, lhs: usize, rhs: usize) -> Option<(Numeric, Numeric)> {
+    match (&state.registers[lhs], &state.registers[rhs]) {
+        (Register::Value(Value::Numeric(l)), Register::Value(Value::Numeric(r))) => Some((*l, *r)),
+        _ => None,
+    }
 }
 
 /// The two operands of an arithmetic opcode when both are integers, the
