@@ -481,12 +481,9 @@ pub(crate) fn eqp_detail_for_table_op(
         }
         Operation::Search(search) => {
             let (kind, index, constraints, backwards) = match search {
-                Search::RowidEq { .. } => (
-                    EqpSearchKind::RowidEq,
-                    None,
-                    vec!["rowid=?".to_string()],
-                    false,
-                ),
+                Search::RowidEq { .. } => {
+                    return eqp_detail_for_rowid_search(table, join, subquery)
+                }
                 Search::Seek { index, seek_def } => (
                     EqpSearchKind::Seek,
                     index
@@ -557,6 +554,23 @@ pub(crate) fn eqp_detail_for_table_op(
             subquery,
             estimate: table.plan_estimate,
         },
+    }
+}
+
+pub(crate) fn eqp_detail_for_rowid_search(
+    table: &JoinedTable,
+    join: Option<EqpJoin>,
+    subquery: Option<EqpSubquery>,
+) -> EqpDetail {
+    EqpDetail::Search {
+        table: EqpTable::from_joined(table),
+        kind: EqpSearchKind::RowidEq,
+        index: None,
+        constraints: vec!["rowid=?".to_string()],
+        backwards: false,
+        join,
+        subquery,
+        estimate: table.plan_estimate,
     }
 }
 

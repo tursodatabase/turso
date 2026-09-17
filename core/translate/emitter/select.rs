@@ -404,9 +404,11 @@ pub(crate) fn emit_materialized_build_inputs(
             let build_read_is_in_seek =
                 matches!(build_table.op, Operation::Search(Search::InSeek { .. }));
 
-            if build_table_was_prior_probe || prefix_has_other_tables || build_read_is_in_seek {
-                // Keep prefix multiplicity and avoid one base-table seek for
-                // each match from an IN-driven read.
+            if build_table_was_prior_probe
+                || prefix_has_other_tables
+                || build_read_is_in_seek
+                || build_table.selected_index_stores_used_columns()
+            {
                 let payload_columns = collect_materialized_payload_columns(plan, &included_tables)?;
                 let key_exprs: Vec<Expr> = hash_join_op
                     .join_keys
@@ -523,6 +525,10 @@ pub(crate) fn emit_materialized_build_inputs(
                 prefix_tables: spec.prefix_tables.clone(),
             },
         );
+    }
+
+    for build_table_idx in build_inputs.keys() {
+        plan.table_references.joined_tables_mut()[*build_table_idx].clear_expression_index_usages();
     }
 
     // Drop any join-prefix tables already captured by key+payload materializations.
@@ -804,6 +810,14 @@ fn build_materialized_build_input_plan(
     // the materialization subplan does not try to use an access path that
     // requires tables outside the prefix. If it does, we fall back to a scan.
     let mut table_references = plan.table_references.clone();
+    if matches!(mode, MaterializedBuildInputMode::KeyPayload { .. }) {
+        for table_idx in included_tables.iter() {
+            let table = &mut table_references.joined_tables_mut()[table_idx];
+            if !table.selected_index_stores_used_columns() {
+                table.clear_expression_index_usages();
+            }
+        }
+    }
     for joined_table in table_references.joined_tables_mut().iter_mut() {
         if let Operation::HashJoin(hash_join_op) = &mut joined_table.op {
             if hash_join_op.build_table_idx == build_table_idx {

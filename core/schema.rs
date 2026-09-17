@@ -5982,7 +5982,7 @@ impl Index {
     pub fn column_table_pos_to_index_pos(&self, table_pos: usize) -> Option<usize> {
         self.columns
             .iter()
-            .position(|c| c.pos_in_table == table_pos)
+            .position(|c| c.pos_in_table == table_pos && c.expr.is_none())
     }
 
     /// Given an expression, return the position in the index if it matches an expression index column.
