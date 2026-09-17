@@ -150,6 +150,10 @@ pub(super) fn estimate_ephemeral_index_build_cost(
     Cost(row_count * comparisons_per_row * params.cpu_cost_per_seek)
 }
 
+pub(super) fn estimate_sort_cpu_cost(row_count: f64, params: &CostModelParams) -> Cost {
+    Cost(row_count * row_count.max(1.0).log2() * params.sort_cpu_per_row)
+}
+
 /// Estimate how many B-tree levels an index search reads.
 pub(super) fn estimate_btree_depth(row_count: f64, rows_per_page: f64) -> f64 {
     if row_count <= 1.0 {
