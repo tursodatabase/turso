@@ -1,0 +1,22 @@
+[package]
+name = "turso-workload-runner"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[lints]
+workspace = true
+
+[dependencies]
+turso.workspace = true
+rusqlite.workspace = true
+tokio = { workspace = true, features = ["rt", "time", "sync", "macros"] }
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
+thiserror.workspace = true
+clap = { workspace = true, features = ["derive"] }
+rand.workspace = true
+rand_chacha.workspace = true
+hdrhistogram = { version = "7.5", default-features = false }
+tempfile.workspace = true

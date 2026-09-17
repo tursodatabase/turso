@@ -46,6 +46,7 @@ members = [
     "perf/memory",
     "perf/memory/codspeed",
     "perf/query-batch",
+    "perf/workload-runner",
     "tools/dbhash",
     "sdk-kit",
     "sdk-kit-macros",
