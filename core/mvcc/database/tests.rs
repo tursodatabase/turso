@@ -20015,6 +20015,141 @@ fn test_dropped_commit_corrupts_subsequent_insert() {
     conn.execute("INSERT INTO t VALUES (2, 'second')").unwrap();
 }
 
+#[test]
+fn abandoned_committed_writer_notifies_dependents() {
+    for group_commit in [false, true] {
+        for (reset, n_rows) in [
+            (false, 1),
+            (true, 1),
+            (false, MVCC_COMMIT_BATCH_SIZE + 1),
+            (true, MVCC_COMMIT_BATCH_SIZE + 1),
+        ] {
+            let db = MvccTestDbNoConn::new();
+            let writer = db.connect();
+            let reader = db.connect();
+            writer
+                .execute(format!(
+                    "PRAGMA mvcc_group_commit = {}",
+                    if group_commit { "on" } else { "off" }
+                ))
+                .unwrap();
+            writer
+                .execute("CREATE TABLE t(id INTEGER PRIMARY KEY)")
+                .unwrap();
+            writer.execute("BEGIN CONCURRENT").unwrap();
+            let values = (1..=n_rows)
+                .map(|id| format!("({id})"))
+                .collect::<Vec<_>>()
+                .join(",");
+            writer
+                .execute(format!("INSERT INTO t VALUES {values}"))
+                .unwrap();
+            let store = db.db.as_ref().unwrap().get_mv_store().clone().unwrap();
+            let writer_id = writer.get_mv_tx_id().unwrap();
+            let prepared = FixedYieldInjector::new([CommitYieldPoint::LogRecordPrepared.point()]);
+            writer.set_yield_injector(Some(prepared.clone()));
+            let mut commit = writer.prepare("COMMIT").unwrap();
+            for _ in 0..100 {
+                assert!(matches!(
+                    commit.step().unwrap(),
+                    StepResult::Yield | StepResult::IO
+                ));
+                if prepared.is_empty() {
+                    break;
+                }
+            }
+            assert!(prepared.is_empty());
+            writer.set_yield_injector(None);
+            assert!(matches!(
+                store.txs.get(&writer_id).unwrap().value().state.load(),
+                TransactionState::Preparing(_)
+            ));
+
+            reader.execute("BEGIN CONCURRENT").unwrap();
+            assert_eq!(
+                get_rows(&reader, "SELECT count(*) FROM t")[0][0].as_int(),
+                Some(n_rows as i64)
+            );
+            let reader_id = reader.get_mv_tx_id().unwrap();
+            let reader_tx = store.txs.get(&reader_id).unwrap();
+            assert_eq!(
+                reader_tx.value().commit_dep_counter.load(Ordering::Acquire),
+                1
+            );
+            let mut reader_commit = reader.prepare("COMMIT").unwrap();
+            assert!(matches!(reader_commit.step().unwrap(), StepResult::Yield));
+
+            if n_rows == 1 {
+                writer.set_yield_injector(Some(FixedYieldInjector::new([
+                    CommitYieldPoint::LogicalLogOwned.point(),
+                ])));
+            }
+            for _ in 0..100 {
+                assert!(matches!(
+                    commit.step().unwrap(),
+                    StepResult::Yield | StepResult::IO
+                ));
+                if n_rows == 1
+                    && store
+                        .txs
+                        .get(&writer_id)
+                        .unwrap()
+                        .value()
+                        .log_appended
+                        .load(Ordering::Acquire)
+                    || matches!(
+                        store.txs.get(&writer_id).unwrap().value().state.load(),
+                        TransactionState::Committed(_)
+                    )
+                {
+                    break;
+                }
+            }
+            let writer_tx = store.txs.get(&writer_id).unwrap();
+            assert!(writer_tx.value().log_appended.load(Ordering::Acquire));
+            if n_rows == 1 {
+                writer.set_yield_injector(None);
+                assert!(matches!(
+                    writer_tx.value().state.load(),
+                    TransactionState::Preparing(_)
+                ));
+            } else {
+                assert!(matches!(
+                    writer_tx.value().state.load(),
+                    TransactionState::Committed(_)
+                ));
+            }
+            assert_eq!(
+                reader_tx.value().commit_dep_counter.load(Ordering::Acquire),
+                1
+            );
+            if reset {
+                commit.reset().unwrap();
+            }
+            drop(commit);
+
+            assert_eq!(
+                reader_tx.value().commit_dep_counter.load(Ordering::Acquire),
+                0
+            );
+            assert!(!reader_tx.value().abort_now.load(Ordering::Acquire));
+            assert!(store.txs.get(&writer_id).is_none());
+            assert!(writer.get_mv_tx_id().is_none());
+            assert!(matches!(reader_commit.step().unwrap(), StepResult::Done));
+            drop(reader_commit);
+            assert!(store.txs.get(&reader_id).is_none());
+            assert!(reader.get_mv_tx_id().is_none());
+            reader.execute("INSERT INTO t VALUES (0)").unwrap();
+            reader.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+            let rows = get_rows(&writer, "SELECT count(*), min(id), max(id) FROM t");
+            assert_eq!(rows[0][0].as_int(), Some(n_rows as i64 + 1));
+            assert_eq!(rows[0][1].as_int(), Some(0));
+            assert_eq!(rows[0][2].as_int(), Some(n_rows as i64));
+            assert!(store.txs.is_empty());
+        }
+    }
+}
+
 // https://github.com/tursodatabase/turso/issues/6755
 #[test]
 fn abandoned_exclusive_commit_should_not_block_subsequent_concurrent_writer() {
