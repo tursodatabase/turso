@@ -5,6 +5,7 @@ use codspeed_criterion_compat::{
 #[cfg(not(feature = "codspeed"))]
 use criterion::{black_box, criterion_group, criterion_main, Criterion, Throughput};
 
+use asserting::prelude::*;
 use std::time::Duration;
 
 const CALLS_PER_ITERATION: usize = 10_000;
@@ -42,11 +43,13 @@ fn bench_text_validate(criterion: &mut Criterion) {
     group.throughput(Throughput::Elements(CALLS_PER_ITERATION as u64));
 
     for case in cases() {
-        assert!(case.fixtures.len().is_power_of_two());
+        assert_that!(case.fixtures.len().is_power_of_two()).is_true();
         for fixture in &case.fixtures {
             let data = &fixture.bytes[fixture.offset..];
             let expected = std::str::from_utf8(data).is_ok();
-            assert_eq!(read_production(data), expected, "{}", case.name);
+            assert_that!(read_production(data))
+                .described_as(case.name.as_str())
+                .is_equal_to(expected);
         }
         group.bench_function(format!("{}/production", case.name), |b| {
             b.iter(|| text_validate_batch(&case.fixtures));

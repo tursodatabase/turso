@@ -3790,6 +3790,7 @@ mod tests {
     use super::*;
     use crate::alloc::vec;
     use crate::translate::collate::CollationSeq;
+    use asserting::prelude::*;
 
     #[test]
     fn is_ascii_checks_every_byte_of_every_length() {
@@ -3797,23 +3798,24 @@ mod tests {
             for offset in 0..64 {
                 let mut bytes = vec![b'a'; len + offset];
                 let ascii = &bytes[offset..];
-                assert!(is_ascii(ascii), "length {len}, offset {offset}");
-                assert_eq!(validate_utf8(ascii), std::str::from_utf8(ascii).ok());
+                assert_that!(is_ascii(ascii))
+                    .described_as(format!("length {len}, offset {offset}"))
+                    .is_true();
+                assert_that!(validate_utf8(ascii)).is_equal_to(std::str::from_utf8(ascii).ok());
                 for position in 0..len {
                     bytes[offset + position] = 0xc3;
                     let data = &bytes[offset..];
-                    assert!(
-                        !is_ascii(data),
-                        "length {len}, offset {offset}, byte {position}"
-                    );
-                    assert_eq!(validate_utf8(data), std::str::from_utf8(data).ok());
+                    assert_that!(is_ascii(data))
+                        .described_as(format!("length {len}, offset {offset}, byte {position}"))
+                        .is_false();
+                    assert_that!(validate_utf8(data)).is_equal_to(std::str::from_utf8(data).ok());
                     bytes[offset + position] = b'a';
                 }
             }
         }
         let text = "héllo wörld, ünïcödé";
-        assert!(!is_ascii(text.as_bytes()));
-        assert_eq!(validate_utf8(text.as_bytes()), Some(text));
+        assert_that!(is_ascii(text.as_bytes())).is_false();
+        assert_that!(validate_utf8(text.as_bytes())).is_equal_to(Some(text));
     }
 
     fn assert_integer_conversions<T>(in_range: &[(i64, T)], out_of_range: &[i64])

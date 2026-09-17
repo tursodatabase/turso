@@ -2301,6 +2301,7 @@ mod tests {
     use crate::Value;
 
     use super::*;
+    use asserting::prelude::*;
     use rstest::rstest;
 
     #[rstest]
@@ -2419,15 +2420,17 @@ mod tests {
         }
 
         for payload in payloads {
-            assert_eq!(
-                crate::types::is_ascii(&payload),
-                payload.iter().all(u8::is_ascii),
-                "payload {payload:?}"
-            );
+            assert_that!(crate::types::is_ascii(&payload))
+                .described_as(format!("payload {payload:?}"))
+                .is_equal_to(payload.iter().all(u8::is_ascii));
 
             let expected = std::str::from_utf8(&payload);
             match (read_text(&payload), expected) {
-                (Ok(got), Ok(want)) => assert_eq!(got, want, "payload {payload:?}"),
+                (Ok(got), Ok(want)) => {
+                    assert_that!(got)
+                        .described_as(format!("payload {payload:?}"))
+                        .is_equal_to(want);
+                }
                 (Err(LimboError::Corrupt(_)), Err(_)) => {}
                 (got, want) => panic!("payload {payload:?}: got {got:?}, std says {want:?}"),
             }
