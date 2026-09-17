@@ -60,8 +60,8 @@ use constraints::{
 };
 use cost::Cost;
 use join::{
-    compute_best_join_order_with_context, count_subquery_calls_for_plan, BestJoinOrderResult,
-    CorrelatedSubqueryEstimate, JoinN, JoinPlanningContext,
+    build_where_term_info, count_subquery_calls_for_plan, find_best_join_order,
+    BestJoinOrderResult, CorrelatedSubqueryEstimate, JoinN, JoinPlanner, JoinPlanningContext,
 };
 use lift_common_subexpressions::lift_common_subexpressions_from_binary_or_terms;
 use order::{
@@ -2508,27 +2508,28 @@ fn find_table_access_plan(
         &mut constraints_per_table,
     )?;
 
-    let planning_context = JoinPlanningContext {
-        maybe_order_target: maybe_order_target.as_ref(),
-        cost_limit,
-    };
-
-    let Some(best_join_order_result) = compute_best_join_order_with_context(
-        table_references.joined_tables(),
+    let where_terms = build_where_term_info(where_clause, table_references, subqueries)?;
+    let planner = JoinPlanner {
+        context: JoinPlanningContext {
+            maybe_order_target: maybe_order_target.as_ref(),
+            cost_limit,
+        },
+        joined_tables: table_references.joined_tables(),
         initial_input_cardinality,
-        planning_context,
-        &constraints_per_table,
-        &base_table_rows,
-        &mut access_methods_arena,
+        constraints: &constraints_per_table,
+        base_table_rows: &base_table_rows,
         where_clause,
+        where_terms: &where_terms,
         subqueries,
-        &index_method_candidates,
+        index_method_candidates: &index_method_candidates,
         params,
-        &schema.analyze_stats,
+        analyze_stats: &schema.analyze_stats,
         available_indexes,
         table_references,
         schema,
-    )?
+    };
+
+    let Some(best_join_order_result) = find_best_join_order(&planner, &mut access_methods_arena)?
     else {
         return Ok(None);
     };
