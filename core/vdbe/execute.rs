@@ -1077,6 +1077,20 @@ macro_rules! comparison_opcode {
                 };
                 return Ok(InsnFunctionStepResult::Step);
             }
+            if let (
+                Register::Value(lhs_value @ Value::Text(l)),
+                Register::Value(rhs_value @ Value::Text(r)),
+            ) = (&state.registers[*lhs], &state.registers[*rhs])
+            {
+                if texts_compare_as_bytes(lhs_value, rhs_value, *flags, *collation) {
+                    state.pc = if comparison_matches_order($op, l.as_str().cmp(r.as_str())) {
+                        target_pc
+                    } else {
+                        state.pc + 1
+                    };
+                    return Ok(InsnFunctionStepResult::Step);
+                }
+            }
             op_comparison_slow(
                 program,
                 state,
@@ -1098,8 +1112,27 @@ comparison_opcode!(op_le, Le, ComparisonOp::Le, |l: i64, r: i64| l <= r);
 comparison_opcode!(op_gt, Gt, ComparisonOp::Gt, |l: i64, r: i64| l > r);
 comparison_opcode!(op_ge, Ge, ComparisonOp::Ge, |l: i64, r: i64| l >= r);
 
-/// The comparison opcodes for every operand pair that is not two integers:
-/// NULLs, affinity conversions, text collations and array comparison.
+#[inline(always)]
+fn texts_compare_as_bytes(
+    lhs: &Value,
+    rhs: &Value,
+    flags: crate::vdbe::insn::CmpInsFlags,
+    collation: Option<CollationSeq>,
+) -> bool {
+    if !matches!(
+        collation,
+        None | Some(CollationSeq::Binary | CollationSeq::Unset)
+    ) {
+        return false;
+    }
+    !flags.get_affinity().is_numeric()
+        || (apply_numeric_affinity(lhs.as_value_ref(), false).is_none()
+            && apply_numeric_affinity(rhs.as_value_ref(), false).is_none())
+}
+
+/// The comparison opcodes for every operand pair that is not two integers or
+/// two texts compared by their bytes: NULLs, affinity conversions, text
+/// collations and array comparison.
 #[inline(never)]
 #[allow(clippy::too_many_arguments)]
 fn op_comparison_slow(
