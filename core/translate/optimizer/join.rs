@@ -1,12 +1,15 @@
 use crate::{alloc::TryReserveError, turso_assert_eq, turso_assert_greater_than};
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
+use std::cell::RefCell;
 
 use smallvec::SmallVec;
 
 use turso_parser::ast::{Operator, SubqueryType, TableInternalId};
 
 use super::{
-    access_method::{add_where_cost, find_best_access_method_for_join_order, AccessMethod},
+    access_method::{
+        add_where_cost, find_best_access_method_for_join_order, AccessMethod, BtreeCandidateMemo,
+    },
     constraints::{usable_constraints_for_lhs_mask, TableConstraints},
     cost_params::CostModelParams,
     order::OrderTarget,
@@ -49,15 +52,25 @@ pub(crate) struct JoinPlanningContext<'a> {
     pub maybe_order_target: Option<&'a OrderTarget>,
     /// Stop growing a join plan after it costs more than another query form.
     pub cost_limit: Option<Cost>,
+    /// The btree candidates for one table from one join prefix.
+    pub btree_candidate_memo: &'a BtreeCandidateMemo,
+    /// What the `WHERE` clause says about one table from one join prefix.
+    pub prefix_where_memo: &'a PrefixWhereMemo,
 }
 
 impl<'a> JoinPlanningContext<'a> {
     /// Convenience constructor used by the default planner entrypoints and tests.
     #[cfg_attr(not(test), allow(dead_code))]
-    fn default_with_order_target(maybe_order_target: Option<&'a OrderTarget>) -> Self {
+    fn default_with_order_target(
+        maybe_order_target: Option<&'a OrderTarget>,
+        btree_candidate_memo: &'a BtreeCandidateMemo,
+        prefix_where_memo: &'a PrefixWhereMemo,
+    ) -> Self {
         Self {
             maybe_order_target,
             cost_limit: None,
+            btree_candidate_memo,
+            prefix_where_memo,
         }
     }
 }
@@ -510,15 +523,27 @@ fn join_lhs_and_rhs<'a>(
         Some(lhs) => lhs.table_numbers().try_collect()?,
         None => TableMask::default(),
     };
-    let mut joined_mask = lhs_mask.try_clone()?;
-    joined_mask.set(rhs_table_number)?;
-    let ready_where = ready_where_work(
-        where_clause,
-        where_terms,
-        &joined_mask,
-        rhs_table_number,
-        rhs_table_reference.internal_id,
-    );
+    let PrefixWhereWork {
+        ready: ready_where,
+        ties_table_to_prefix,
+    } = planning_context
+        .prefix_where_memo
+        .get_or_compute(rhs_table_number, &lhs_mask, || {
+            let mut joined_mask = lhs_mask.try_clone()?;
+            joined_mask.set(rhs_table_number)?;
+            Ok(PrefixWhereWork {
+                ready: ready_where_work(
+                    where_clause,
+                    where_terms,
+                    &joined_mask,
+                    rhs_table_number,
+                    rhs_table_reference.internal_id,
+                ),
+                ties_table_to_prefix: where_terms.iter().any(|term| {
+                    term.table_mask.get(rhs_table_number) && term.table_mask.intersects(&lhs_mask)
+                }),
+            })
+        })?;
 
     let Some(method) = find_best_access_method_for_join_order(
         rhs_table_reference,
@@ -560,10 +585,7 @@ fn join_lhs_and_rhs<'a>(
         m
     };
 
-    let has_join_constraint = lhs.is_some()
-        && where_terms.iter().any(|term| {
-            term.table_mask.get(rhs_table_number) && term.table_mask.intersects(&lhs_mask)
-        });
+    let has_join_constraint = lhs.is_some() && ties_table_to_prefix;
     if lhs.is_some() && !has_join_constraint {
         let rhs_self_constraint_selectivity =
             build_self_constraint_selectivity(rhs_constraints, rhs_table_number);
@@ -1236,10 +1258,16 @@ pub fn compute_best_join_order<'a>(
     table_references: &TableReferences,
     schema: &Schema,
 ) -> Result<Option<BestJoinOrderResult>> {
+    let btree_candidate_memo = BtreeCandidateMemo::new(joined_tables.len());
+    let prefix_where_memo = PrefixWhereMemo::new(joined_tables.len());
     compute_best_join_order_with_context(
         joined_tables,
         initial_input_cardinality,
-        JoinPlanningContext::default_with_order_target(maybe_order_target),
+        JoinPlanningContext::default_with_order_target(
+            maybe_order_target,
+            &btree_candidate_memo,
+            &prefix_where_memo,
+        ),
         constraints,
         base_table_rows,
         access_methods_arena,
@@ -2351,6 +2379,64 @@ fn build_where_term_info(
         .collect()
 }
 
+/// What the `WHERE` clause says about one table reached from one join prefix.
+#[derive(Debug, Clone)]
+pub(crate) struct PrefixWhereWork {
+    /// The extra `WHERE` work that can run after this table, as
+    /// `(term index, extra steps)`.
+    ready: SmallVec<[(usize, usize); 4]>,
+    /// Whether a term joins this table to a table in the prefix. A table with
+    /// none can only be joined as a cross product.
+    ties_table_to_prefix: bool,
+}
+
+/// One slot per joined table, holding the result for the last join prefix
+/// asked about.
+///
+/// Both fields of [`PrefixWhereWork`] come from a walk over the whole `WHERE`
+/// clause, and both depend on the set of tables already joined, not on how
+/// many rows that set produces. The join order search tries several plans for
+/// the same set in front of the same next table, so it used to walk the clause
+/// again for each of them. The search finishes with one (table, prefix) pair
+/// before it moves to the next, so one slot per table catches every repeat.
+#[derive(Debug)]
+pub(crate) struct PrefixWhereMemo {
+    per_table: Vec<RefCell<Option<(TableMask, PrefixWhereWork)>>>,
+}
+
+impl PrefixWhereMemo {
+    /// One slot per entry of [`TableReferences::joined_tables`].
+    pub(crate) fn new(joined_table_count: usize) -> Self {
+        Self {
+            per_table: (0..joined_table_count)
+                .map(|_| RefCell::new(None))
+                .collect(),
+        }
+    }
+
+    /// The result for `table_idx` from `lhs_mask`. Runs `compute` only if the
+    /// slot holds a different prefix, or nothing yet.
+    ///
+    /// Returns an owned copy, so the caller can keep it while it asks about the
+    /// same table again.
+    fn get_or_compute(
+        &self,
+        table_idx: usize,
+        lhs_mask: &TableMask,
+        compute: impl FnOnce() -> Result<PrefixWhereWork>,
+    ) -> Result<PrefixWhereWork> {
+        let slot = &self.per_table[table_idx];
+        if let Some((prefix, work)) = slot.borrow().as_ref() {
+            if prefix == lhs_mask {
+                return Ok(work.clone());
+            }
+        }
+        let work = compute()?;
+        *slot.borrow_mut() = Some((lhs_mask.try_clone()?, work.clone()));
+        Ok(work)
+    }
+}
+
 /// Return the extra `WHERE` work that can run after this table.
 fn ready_where_work(
     where_clause: &[WhereTerm],
@@ -2457,6 +2543,46 @@ mod tests {
         vdbe::builder::TableRefIdCounter,
         MAIN_DB_ID,
     };
+
+    #[test]
+    fn where_clause_is_walked_once_per_join_prefix() -> Result<()> {
+        let memo = PrefixWhereMemo::new(2);
+        let walks = std::cell::Cell::new(0);
+        let walk = || {
+            walks.set(walks.get() + 1);
+            Ok(PrefixWhereWork {
+                ready: SmallVec::from_slice(&[(3, 1)]),
+                ties_table_to_prefix: true,
+            })
+        };
+
+        let mut prefix = TableMask::default();
+        prefix.set(1)?;
+        let mut longer_prefix = prefix.try_clone()?;
+        longer_prefix.set(2)?;
+
+        let work = memo.get_or_compute(0, &prefix, walk)?;
+        assert_eq!(work.ready.as_slice(), [(3, 1)]);
+        assert!(work.ties_table_to_prefix);
+        assert_eq!(walks.get(), 1);
+
+        // The same table from the same prefix again, as the search does once per
+        // plan it kept for that prefix.
+        memo.get_or_compute(0, &prefix, walk)?;
+        assert_eq!(walks.get(), 1);
+
+        // Another table is a separate question, even from the same prefix.
+        memo.get_or_compute(1, &prefix, walk)?;
+        assert_eq!(walks.get(), 2);
+        memo.get_or_compute(0, &prefix, walk)?;
+        assert_eq!(walks.get(), 2);
+
+        // So is the same table from a different prefix.
+        memo.get_or_compute(0, &longer_prefix, walk)?;
+        assert_eq!(walks.get(), 3);
+
+        Ok(())
+    }
 
     #[test]
     fn hash_join_cost_includes_probe_scan() {
