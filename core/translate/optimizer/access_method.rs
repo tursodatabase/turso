@@ -682,6 +682,19 @@ pub(super) fn choose_best_in_seek_candidate(
         ));
     };
 
+    // An InSeek needs an IN term to seek by. Most tables have none, and the
+    // join order search asks this for every (join prefix, table) pair, so
+    // return early in that case instead of costing every candidate.
+    let has_seekable_in_term = rhs_constraints.constraints.iter().any(|constraint| {
+        matches!(
+            constraint.operator,
+            ConstraintOperator::In { not: false, .. }
+        ) && lhs_mask.contains_all_set_bits_of(&constraint.lhs_mask)
+    });
+    if !has_seekable_in_term {
+        return Ok(None);
+    }
+
     let base = *base_row_count;
     let tree_depth = estimate_btree_depth(base, params.rows_per_table_page);
     let mut best_in_seek = None;
