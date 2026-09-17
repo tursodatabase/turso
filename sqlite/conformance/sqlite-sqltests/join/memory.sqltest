@@ -855,6 +855,41 @@ expect pattern {
     (?s)HASH JOIN suffix_hash_child AS child.*SCAN suffix_hash_parent AS parent
 }
 
+@skip-if sqlite "Turso compares correlated subqueries with grouped joins"
+@skip-if mvcc "MVCC does not reload sqlite_stat1 after this test changes it"
+test group-sort-cost-keeps-cheaper-correlated-seeks {
+    CREATE TABLE sort_cost_parent(id INTEGER PRIMARY KEY, selected INTEGER);
+    CREATE TABLE sort_cost_filter(id INTEGER PRIMARY KEY, selected INTEGER);
+    CREATE TABLE sort_cost_child(
+        parent_id INTEGER,
+        filter_id INTEGER,
+        value INTEGER,
+        PRIMARY KEY(parent_id, filter_id)
+    );
+    ANALYZE;
+    DELETE FROM sqlite_stat1;
+    INSERT INTO sqlite_stat1(tbl, idx, stat) VALUES
+        ('sort_cost_parent', NULL, '85000'),
+        ('sort_cost_filter', NULL, '100'),
+        ('sort_cost_child', NULL, '800000'),
+        ('sort_cost_child', 'sqlite_autoindex_sort_cost_child_1', '800000 4 1');
+    ANALYZE sqlite_schema;
+
+    EXPLAIN QUERY PLAN
+    SELECT parent.id
+    FROM sort_cost_parent AS parent
+    WHERE parent.selected = 1
+      AND 0 = (
+          SELECT min(child.value)
+          FROM sort_cost_child AS child
+          JOIN sort_cost_filter AS kept ON kept.id = child.filter_id
+          WHERE child.parent_id = parent.id AND kept.selected = 1
+      );
+}
+expect pattern {
+    (?s)CORRELATED SCALAR SUBQUERY.*SEARCH child USING INDEX sqlite_autoindex_sort_cost_child_1 \(parent_id=\?\)
+}
+
 @skip-if sqlite "Turso reports hash join estimates in its JSON plan"
 @skip-if mvcc "MVCC does not reload sqlite_stat1 after this test changes it"
 test unique-composite-hash-key-uses-one-key-estimate {

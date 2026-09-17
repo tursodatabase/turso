@@ -58,7 +58,7 @@ use constraints::{
     add_implied_column_equalities, can_use_partial_index, constraints_from_where_clause,
     partial_index, partial_index_predicate_terms, Constraint,
 };
-use cost::Cost;
+use cost::{estimate_scan_cost, Cost};
 use join::{
     compute_best_join_order_with_context, count_subquery_calls_for_plan, BestJoinOrderResult,
     CorrelatedSubqueryEstimate, JoinN, JoinPlanningContext,
@@ -989,6 +989,12 @@ fn optimize_select_plan_with_cache(
             (plan.estimated_cost, rewritten.estimated_cost),
             (Some(original_cost), Some(rewritten_cost)) if rewritten_cost <= original_cost
         );
+    tracing::debug!(
+        original_cost = plan.estimated_cost,
+        rewritten_cost = rewritten.estimated_cost,
+        use_rewritten,
+        "correlated-subquery form cost comparison"
+    );
     if use_rewritten {
         // Equal work is better without one subquery call per outer row.
         *plan = rewritten;
@@ -1089,7 +1095,9 @@ fn find_select_plan_form(
         plan.simple_aggregate = None;
     }
 
-    let table_cost = table_plan.as_ref().map(|table_plan| table_plan.join.cost);
+    let table_cost = table_plan.as_ref().map(|table_plan| {
+        table_plan.join.cost + required_group_sort_cost(plan, table_plan, params)
+    });
     let mut subquery_calls = table_plan
         .as_ref()
         .map(|table_plan| table_plan.subquery_calls.clone())
@@ -1173,6 +1181,28 @@ fn find_select_plan_form(
     }
 
     Ok(table_plan)
+}
+
+fn required_group_sort_cost(
+    plan: &SelectPlan,
+    table_plan: &TableAccessPlan,
+    params: &cost_params::CostModelParams,
+) -> Cost {
+    let sort_eliminated = table_plan.sort_eliminated
+        && table_plan.order_target.as_ref().is_some_and(|target| {
+            matches!(
+                &target.purpose,
+                OrderTargetPurpose::EliminatesSort(
+                    EliminatesSortBy::Group | EliminatesSortBy::GroupByAndOrder
+                )
+            )
+        });
+    if plan.group_by.as_ref().is_none_or(|group| group.sort_elided) || sort_eliminated {
+        return Cost(0.0);
+    }
+    let rows = table_plan.join.output_cardinality;
+    Cost(rows * rows.max(1.0).log2() * params.group_sort_cpu_per_row)
+        + estimate_scan_cost(rows, 1.0, params)
 }
 
 /// Write the winning table plan into one version of a query.

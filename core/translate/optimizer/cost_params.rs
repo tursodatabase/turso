@@ -71,6 +71,7 @@ pub struct CostModelParams {
     /// CPU cost per row for sorting (used in O(n log n) estimate).
     /// This is used when estimating the cost saved by using an ordered index.
     pub sort_cpu_per_row: f64,
+    pub group_sort_cpu_per_row: f64,
 
     // === Hash Join Cost ===
     /// CPU cost to compute hash of a row.
@@ -119,6 +120,7 @@ impl CostModelParams {
 
             // Sort costs
             sort_cpu_per_row: 0.002,
+            group_sort_cpu_per_row: 0.02,
 
             // Hash join specific costs
             hash_cpu_cost: 0.001,
@@ -248,6 +250,7 @@ impl CostModelParams {
             ("cpu_cost_per_where_step", self.cpu_cost_per_where_step),
             ("cpu_cost_per_seek", self.cpu_cost_per_seek),
             ("sort_cpu_per_row", self.sort_cpu_per_row),
+            ("group_sort_cpu_per_row", self.group_sort_cpu_per_row),
             ("hash_cpu_cost", self.hash_cpu_cost),
             ("hash_insert_cost", self.hash_insert_cost),
             ("hash_lookup_cost", self.hash_lookup_cost),

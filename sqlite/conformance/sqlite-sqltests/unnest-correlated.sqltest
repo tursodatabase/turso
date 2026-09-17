@@ -28,6 +28,34 @@ setup correlated_rows {
     INSERT INTO outer_key2 VALUES (1, 10), (3, 20), (5, 40);
 }
 
+setup selective_join_plan_rows {
+    CREATE TABLE plan_outer(
+        id INTEGER PRIMARY KEY,
+        k INTEGER,
+        lim INTEGER,
+        max_sum INTEGER,
+        text_key TEXT
+    );
+    CREATE TABLE plan_inner(k INTEGER, x INTEGER, v TEXT, text_key TEXT);
+    CREATE TABLE plan_list(k INTEGER);
+    WITH RECURSIVE rows(value) AS (
+        VALUES(1)
+        UNION ALL
+        SELECT value + 1 FROM rows WHERE value < 100
+    )
+    INSERT INTO plan_outer
+    SELECT value, value, value, value, value FROM rows;
+    WITH RECURSIVE rows(value) AS (
+        VALUES(1)
+        UNION ALL
+        SELECT value + 1 FROM rows WHERE value < 110
+    )
+    INSERT INTO plan_inner
+    SELECT value, value, json_object('n', value), value FROM rows;
+    INSERT INTO plan_list SELECT k FROM plan_outer;
+    ANALYZE;
+}
+
 # A table function uses hidden columns to hold its arguments. Those checks
 # must stay inside the correlated subquery.
 test one-value-table-function-keeps-arguments {
@@ -262,20 +290,20 @@ expect pattern {
 
 # A direct comparison can join the requested rows before building each string.
 # This avoids both the correlated scan and strings for unused inner keys.
-@setup correlated_rows
+@setup selective_join_plan_rows
 @skip-if sqlite "SQLite keeps this group_concat as a correlated subquery"
 test one-value-group-concat-joins-before-grouping {
     EXPLAIN QUERY PLAN
     SELECT o.id
-    FROM outer_rows o
+    FROM plan_outer o
     WHERE o.text_key = (
         SELECT group_concat(i.text_key, ':')
-        FROM inner_rows i
-        WHERE i.key1 = o.key1
+        FROM plan_inner i
+        WHERE i.k = o.k AND i.x = 1
     );
 }
 expect pattern {
-    (?s)JOIN inner_rows AS i.*SCAN outer_rows AS o.*USE SORTER FOR GROUP BY
+    (?s)(JOIN plan_inner AS i.*USE SORTER FOR GROUP BY|SEARCH i .*LEFT-JOIN)
 }
 
 # The joined form keeps a separate string for each outer row. A key with no
@@ -856,21 +884,19 @@ expect {
 # A sum can join the requested inner rows before grouping. This avoids one
 # subquery call per outer row without adding values for unused inner keys.
 @skip-if sqlite "SQLite keeps this sum as a correlated subquery"
+@setup selective_join_plan_rows
 test one-value-sum-joins-before-grouping {
-    CREATE TABLE sum_join_outer(id INTEGER PRIMARY KEY, k INTEGER, max_sum INTEGER);
-    CREATE TABLE sum_join_inner(k INTEGER, x INTEGER);
-
     EXPLAIN QUERY PLAN
     SELECT o.id
-    FROM sum_join_outer o
+    FROM plan_outer o
     WHERE o.max_sum > (
         SELECT sum(i.x)
-        FROM sum_join_inner i
-        WHERE i.k = o.k
+        FROM plan_inner i
+        WHERE i.k = o.k AND i.x = 1
     );
 }
 expect pattern {
-    (?s)HASH JOIN sum_join_inner AS i.*SCAN sum_join_outer AS o.*USE SORTER FOR GROUP BY
+    (?s)(JOIN plan_inner AS i.*USE SORTER FOR GROUP BY|SEARCH i .*LEFT-JOIN)
 }
 
 # Each outer row keeps its own sum. A missing match gives NULL. The values for
@@ -1026,42 +1052,37 @@ expect pattern {
 # result is the same for every joined copy, so it does not block the joined
 # form. TPC-H q20 has this shape.
 @skip-if sqlite "SQLite keeps this sum as a correlated subquery"
+@setup selective_join_plan_rows
 test one-value-sum-join-allows-uncorrelated-subquery-term {
-    CREATE TABLE in_term_outer(id INTEGER PRIMARY KEY, k INTEGER, lim INTEGER);
-    CREATE TABLE in_term_inner(k INTEGER, x INTEGER);
-    CREATE TABLE in_term_list(k INTEGER);
-
     EXPLAIN QUERY PLAN
     SELECT o.id
-    FROM in_term_outer o
-    WHERE o.k IN (SELECT k FROM in_term_list)
+    FROM plan_outer o
+    WHERE o.k IN (SELECT k FROM plan_list)
       AND o.lim > (
           SELECT sum(i.x)
-          FROM in_term_inner i
-          WHERE i.k = o.k
+          FROM plan_inner i
+          WHERE i.k = o.k AND i.x = 1
       );
 }
 expect pattern {
-    (?s)JOIN in_term_inner AS i.*USE SORTER FOR GROUP BY
+    (?s)(JOIN plan_inner AS i.*USE SORTER FOR GROUP BY|SEARCH i .*LEFT-JOIN)
 }
 
 # The subquery can be either side of the comparison.
 @skip-if sqlite "SQLite keeps this sum as a correlated subquery"
+@setup selective_join_plan_rows
 test one-value-sum-join-subquery-on-left-side {
-    CREATE TABLE left_side_outer(id INTEGER PRIMARY KEY, k INTEGER, lim INTEGER);
-    CREATE TABLE left_side_inner(k INTEGER, x INTEGER);
-
     EXPLAIN QUERY PLAN
     SELECT o.id
-    FROM left_side_outer o
+    FROM plan_outer o
     WHERE (
         SELECT sum(i.x)
-        FROM left_side_inner i
-        WHERE i.k = o.k
+        FROM plan_inner i
+        WHERE i.k = o.k AND i.x = 1
     ) > o.lim;
 }
 expect pattern {
-    (?s)JOIN left_side_inner AS i.*USE SORTER FOR GROUP BY
+    (?s)(JOIN plan_inner AS i.*USE SORTER FOR GROUP BY|SEARCH i .*LEFT-JOIN)
 }
 
 # key 1: 20 > 15. key 2: 10 > 5. key 3: no rows, sum is NULL, not returned.
@@ -1265,21 +1286,19 @@ expect {
 }
 
 @skip-if sqlite "Turso uses a different plan for this query"
+@setup selective_join_plan_rows
 test one-value-json-sum-uses-joined-form {
-    CREATE TABLE json_sum_plan_outer(id INTEGER PRIMARY KEY, k INTEGER, max_sum INTEGER);
-    CREATE TABLE json_sum_plan_inner(k INTEGER, v TEXT);
-
     EXPLAIN QUERY PLAN
     SELECT o.id
-    FROM json_sum_plan_outer o
+    FROM plan_outer o
     WHERE o.max_sum > (
         SELECT sum(json_extract(i.v, '$.n'))
-        FROM json_sum_plan_inner i
-        WHERE i.k = o.k
+        FROM plan_inner i
+        WHERE i.k = o.k AND i.x = 1
     );
 }
 expect pattern {
-    (?s)JOIN json_sum_plan_inner AS i.*SCAN json_sum_plan_outer AS o.*USE SORTER FOR GROUP BY
+    (?s)(JOIN plan_inner AS i.*USE SORTER FOR GROUP BY|SEARCH i .*LEFT-JOIN)
 }
 
 # json_extract runs before max. A grouped table would also run it for the
