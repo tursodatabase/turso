@@ -341,30 +341,36 @@ pub fn bind_and_rewrite_expr<'a>(
                         resolved = Some((joined_table.internal_id, candidate));
                     }
                     // --- Stage 2: fall back to enclosing scopes ---
-                    // Only attempted if no inner-scope table matched the identifier — an
-                    // inner alias of the same name shadows everything outside.
-                    //
-                    // We pick the *nearest* outer scope that contains a matching identifier
-                    // (smallest `scope_depth`) and search only refs at that depth. This lets
-                    // the same alias be reused at different nesting levels without triggering
-                    // spurious "ambiguous column" errors across unrelated scopes.
-                    //
-                    // `cte_definition_only` refs are excluded: those entries exist purely so
-                    // that a subquery's FROM clause can *look up* the CTE by name; once the
-                    // CTE is consumed into a FROM, column resolution must go through the
-                    // corresponding `joined_table`, not the definition-only ref.
-                    if !identifier_matched {
+                    // SQLite requires matching against both table name and column name before
+                    // stopping scope search. If the current scope did not produce a column match,
+                    // search enclosing scopes for the nearest scope (smallest `scope_depth`)
+                    // that contains the table and the requested column.
+                    if resolved.is_none() {
+                        if !identifier_matched {
+                            identifier_matched =
+                                referenced_tables.outer_query_refs().iter().any(|t| {
+                                    !t.cte_definition_only && t.identifier == normalized_table_name
+                                });
+                        }
                         let nearest_outer_scope = referenced_tables
                             .outer_query_refs()
                             .iter()
                             .filter(|t| {
-                                !t.cte_definition_only && t.identifier == normalized_table_name
+                                !t.cte_definition_only
+                                    && t.identifier == normalized_table_name
+                                    && matches!(
+                                        resolve_qualified_on_ref(
+                                            &t.table,
+                                            t.internal_id,
+                                            &normalized_id,
+                                        ),
+                                        Ok(Some(_))
+                                    )
                             })
                             .map(|t| t.scope_depth)
                             .min();
 
                         if let Some(scope_depth) = nearest_outer_scope {
-                            identifier_matched = true;
                             for outer_ref in
                                 referenced_tables.outer_query_refs().iter().filter(|t| {
                                     !t.cte_definition_only
