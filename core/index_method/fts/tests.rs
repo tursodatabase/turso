@@ -310,6 +310,18 @@ fn identities_of(segment: &LoadedSegment) -> Vec<DocumentIdentity> {
 }
 
 #[test]
+fn resetting_cursor_clears_registry_positions() {
+    let attachment = test_attachment();
+    let (segment, _) = build_and_load_segment(&attachment, &[(7, "first")]);
+    let mut cursor = FtsCursor::new(&attachment);
+    cursor.scan_positions.insert(segment.id(), 0);
+    cursor.scan_descriptors.push(segment.descriptor);
+    cursor.reset_to_init();
+    assert!(cursor.scan_descriptors.is_empty());
+    assert!(cursor.scan_positions.is_empty());
+}
+
+#[test]
 fn segment_load_reads_the_identities_the_build_wrote() {
     let attachment = test_attachment();
     let (segment, _) = build_and_load_segment(
