@@ -19,7 +19,7 @@ use crate::translate::optimizer::cost::{rows_per_leaf_page_for_index, RowCountEs
 use crate::translate::optimizer::cost_params::CostModelParams;
 use crate::translate::plan::{
     plan_has_outer_scope_dependency, BitSet, HashJoinKey, HashJoinType, NonFromClauseSubquery,
-    Plan, SetOperation, SubqueryState, TableReferences, WhereTerm,
+    Plan, SetOperation, SubqueryState, WhereTerm,
 };
 use crate::util::exprs_are_equivalent;
 use crate::vdbe::affinity::Affinity;
@@ -40,7 +40,7 @@ use super::{
         estimate_index_cost, estimate_rows_per_seek, estimate_scan_cost, AnalyzeCtx, Cost,
         IndexInfo,
     },
-    join::JoinPlanningContext,
+    join::JoinPlanner,
     multi_index::{
         consider_multi_index_intersection, consider_multi_index_union, MultiIndexBranchParams,
     },
@@ -715,61 +715,36 @@ fn replace_if_cheaper(
 }
 
 /// Return the best [AccessMethod] for a given join order.
-#[allow(clippy::too_many_arguments)]
 pub fn find_best_access_method_for_join_order(
-    rhs_table: &JoinedTable,
-    rhs_constraints: &TableConstraints,
+    planner: &JoinPlanner<'_>,
     lhs_mask: &TableMask,
     join_order: &[JoinOrderMember],
-    planning_context: JoinPlanningContext<'_>,
-    where_clause: &[WhereTerm],
     ready_where: &[(usize, usize)],
-    available_indexes: &AvailableIndexes,
-    table_references: &TableReferences,
-    subqueries: &[NonFromClauseSubquery],
-    schema: &Schema,
-    analyze_stats: &AnalyzeStats,
     input_cardinality: f64,
-    base_row_count: RowCountEstimate,
-    params: &CostModelParams,
 ) -> Result<Option<AccessMethod>> {
-    match &rhs_table.table {
+    let rhs_table_idx = join_order.last().unwrap().original_idx;
+    match &planner.joined_tables[rhs_table_idx].table {
         Table::BTree(_) => find_best_access_method_for_btree(
-            rhs_table,
-            rhs_constraints,
+            planner,
             lhs_mask,
             join_order,
-            planning_context.maybe_order_target,
-            where_clause,
             ready_where,
-            available_indexes,
-            table_references,
-            subqueries,
-            schema,
-            analyze_stats,
             input_cardinality,
-            base_row_count,
-            params,
         ),
         Table::Virtual(vtab) => find_best_access_method_for_vtab(
             vtab,
-            &rhs_constraints.constraints,
+            &planner.constraints[rhs_table_idx].constraints,
             join_order,
             input_cardinality,
-            base_row_count,
-            params,
+            planner.base_rows(rhs_table_idx),
+            planner.params,
         ),
         Table::FromClauseSubquery(subquery) => find_best_access_method_for_subquery(
-            rhs_table,
+            planner,
             subquery,
-            rhs_constraints,
             join_order,
-            planning_context,
             ready_where,
-            schema,
             input_cardinality,
-            base_row_count,
-            params,
         ),
         Table::RecursiveCteInput(_) => Ok(Some(AccessMethod {
             cost: estimate_cost_for_scan_or_seek(
@@ -779,7 +754,7 @@ pub fn find_best_access_method_for_join_order(
                 input_cardinality,
                 RowCountEstimate::HardcodedFallback(1.0),
                 false,
-                params,
+                planner.params,
                 None,
             ),
             estimated_rows_per_outer_row: 1.0,
@@ -789,33 +764,27 @@ pub fn find_best_access_method_for_join_order(
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 fn find_best_access_method_for_btree(
-    rhs_table: &JoinedTable,
-    rhs_constraints: &TableConstraints,
+    planner: &JoinPlanner<'_>,
     lhs_mask: &TableMask,
     join_order: &[JoinOrderMember],
-    maybe_order_target: Option<&OrderTarget>,
-    where_clause: &[WhereTerm],
     ready_where: &[(usize, usize)],
-    available_indexes: &AvailableIndexes,
-    table_references: &TableReferences,
-    subqueries: &[NonFromClauseSubquery],
-    schema: &Schema,
-    analyze_stats: &AnalyzeStats,
     input_cardinality: f64,
-    base_row_count: RowCountEstimate,
-    params: &CostModelParams,
 ) -> Result<Option<AccessMethod>> {
+    let params = planner.params;
+    let analyze_stats = planner.analyze_stats;
     let rhs_table_idx = join_order.last().unwrap().original_idx;
+    let rhs_table = &planner.joined_tables[rhs_table_idx];
+    let rhs_constraints = &planner.constraints[rhs_table_idx];
+    let base_row_count = planner.base_rows(rhs_table_idx);
     let best = choose_best_btree_candidate(
         rhs_table,
         rhs_constraints,
         lhs_mask,
         rhs_table_idx,
-        maybe_order_target,
-        schema,
-        available_indexes,
+        planner.context.maybe_order_target,
+        planner.schema,
+        planner.available_indexes,
         analyze_stats,
         input_cardinality,
         base_row_count,
@@ -867,7 +836,7 @@ fn find_best_access_method_for_btree(
             &mut consumed_where_terms,
             index,
             rhs_table,
-            where_clause,
+            planner.where_clause,
         )?;
     }
     let mut best_access_method = AccessMethod {
@@ -989,7 +958,7 @@ fn find_best_access_method_for_btree(
                         &mut in_seek_method.consumed_where_terms,
                         index,
                         rhs_table,
-                        where_clause,
+                        planner.where_clause,
                     )?;
                 }
             }
@@ -1005,11 +974,11 @@ fn find_best_access_method_for_btree(
 
         if let Some(multi_idx_method) = consider_multi_index_union(
             rhs_table,
-            where_clause,
-            available_indexes,
-            table_references,
-            subqueries,
-            schema,
+            planner.where_clause,
+            planner.available_indexes,
+            planner.table_references,
+            planner.subqueries,
+            planner.schema,
             input_cardinality,
             base_row_count,
             params,
@@ -1029,11 +998,11 @@ fn find_best_access_method_for_btree(
 
         if let Some(multi_idx_and_method) = consider_multi_index_intersection(
             rhs_table,
-            where_clause,
-            available_indexes,
-            table_references,
-            subqueries,
-            schema,
+            planner.where_clause,
+            planner.available_indexes,
+            planner.table_references,
+            planner.subqueries,
+            planner.schema,
             input_cardinality,
             base_row_count,
             params,
@@ -1633,21 +1602,20 @@ fn intrinsic_subquery_scan_direction(
 /// like a table-backed row source with a synthesized ephemeral probe index. When
 /// the latter is worthwhile, we materialize the subquery into an EphemeralTable
 /// and later build the probe index lazily in the main-loop open phase.
-#[expect(clippy::too_many_arguments)]
 fn find_best_access_method_for_subquery(
-    rhs_table: &JoinedTable,
+    planner: &JoinPlanner<'_>,
     subquery: &FromClauseSubquery,
-    rhs_constraints: &TableConstraints,
     join_order: &[JoinOrderMember],
-    planning_context: JoinPlanningContext<'_>,
     ready_where: &[(usize, usize)],
-    schema: &Schema,
     input_cardinality: f64,
-    base_row_count: RowCountEstimate,
-    params: &CostModelParams,
 ) -> Result<Option<AccessMethod>> {
     use super::constraints::ConstraintRef;
-    let maybe_order_target = planning_context.maybe_order_target;
+    let params = planner.params;
+    let maybe_order_target = planner.context.maybe_order_target;
+    let rhs_table_idx = join_order.last().unwrap().original_idx;
+    let rhs_table = &planner.joined_tables[rhs_table_idx];
+    let rhs_constraints = &planner.constraints[rhs_table_idx];
+    let base_row_count = planner.base_rows(rhs_table_idx);
 
     let coroutine_scan_cost = estimate_cost_for_scan_or_seek(
         None,
@@ -1744,7 +1712,7 @@ fn find_best_access_method_for_subquery(
             subquery,
             maybe_order_target,
             table_materialization_required,
-            schema,
+            planner.schema,
         ) {
             return Ok(Some(AccessMethod {
                 cost: scan_cost,
@@ -1836,7 +1804,7 @@ fn find_best_access_method_for_subquery(
             &ephemeral_index,
             &usable_constraint_refs,
             maybe_order_target,
-            schema,
+            planner.schema,
             base_row_count,
             params,
         );

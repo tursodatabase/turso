@@ -487,7 +487,7 @@ pub(crate) struct JoinPlanner<'a> {
 }
 
 impl JoinPlanner<'_> {
-    fn base_rows(&self, table_number: usize) -> RowCountEstimate {
+    pub(super) fn base_rows(&self, table_number: usize) -> RowCountEstimate {
         self.base_table_rows
             .get(table_number)
             .copied()
@@ -546,21 +546,11 @@ fn join_lhs_and_rhs(
     );
 
     let Some(method) = find_best_access_method_for_join_order(
-        rhs_table_reference,
-        rhs_constraints,
+        planner,
         &lhs_mask,
         join_order,
-        planner.context,
-        planner.where_clause,
         &ready_where,
-        planner.available_indexes,
-        planner.table_references,
-        planner.subqueries,
-        planner.schema,
-        planner.analyze_stats,
         input_cardinality,
-        rhs_base_rows,
-        params,
     )?
     else {
         return Ok(None);
