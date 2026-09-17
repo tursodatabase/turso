@@ -10,7 +10,9 @@ use crate::ast::{
 use crate::capabilities::Capabilities;
 use crate::context::Context;
 use crate::error::GenError;
-use crate::functions::{AGGREGATE_FUNCTIONS, FunctionCategory};
+use crate::functions::{
+    AGGREGATE_FUNCTIONS, FunctionCategory, aggregate_result_depends_on_input_order,
+};
 use crate::generate::expr::generate_condition;
 use crate::generate::expr::generate_expr;
 use crate::generate::literal::generate_literal;
@@ -598,6 +600,13 @@ fn generate_aggregate_call<C: Capabilities>(
     let allowed: Vec<_> = AGGREGATE_FUNCTIONS
         .iter()
         .filter(|f| f.category != FunctionCategory::Array)
+        .filter(|f| {
+            generator
+                .policy()
+                .function_config
+                .allow_order_dependent_aggregates
+                || !aggregate_result_depends_on_input_order(f.name)
+        })
         .collect();
     let func = ctx
         .choose(&allowed)
@@ -808,7 +817,14 @@ fn generate_select_columns<C: Capabilities>(
                 // (or in ORDER BY of the same SELECT). We don't recurse: the
                 // window function call itself is the projection.
                 let expr = if window_prob > 0.0 && ctx.gen_bool_with_prob(window_prob) {
-                    generate_window_function(ctx, select_config.window_frame_policy)?
+                    generate_window_function(
+                        ctx,
+                        select_config.window_frame_policy,
+                        generator
+                            .policy()
+                            .function_config
+                            .allow_order_dependent_aggregates,
+                    )?
                 } else {
                     let e = generate_expr(generator, ctx, 0)?;
                     // When restricting mixed aggregates and there is no GROUP BY,
@@ -878,16 +894,23 @@ enum WindowFnArity {
 fn generate_window_function(
     ctx: &mut Context,
     frame_policy: WindowFramePolicy,
+    allow_order_dependent_aggregates: bool,
 ) -> Result<Expr, GenError> {
     let with_explicit_frame =
         !matches!(frame_policy, WindowFramePolicy::CoercedOnly) && ctx.gen_bool();
-    let functions = if with_explicit_frame {
+    let functions: Vec<_> = if with_explicit_frame {
         AGGREGATE_WINDOW_FUNCS
+            .iter()
+            .filter(|(name, _)| {
+                allow_order_dependent_aggregates || !aggregate_result_depends_on_input_order(name)
+            })
+            .copied()
+            .collect()
     } else {
-        BUILTIN_WINDOW_FUNCS
+        BUILTIN_WINDOW_FUNCS.to_vec()
     };
     let (name, arity) = *ctx
-        .choose(functions)
+        .choose(&functions)
         .expect("window function sets are non-empty");
     let frame = with_explicit_frame.then(|| generate_window_frame(ctx, frame_policy));
 
@@ -1910,7 +1933,7 @@ fn generate_aggregate_filter<C: Capabilities>(
 mod tests {
     use super::*;
     use crate::Full;
-    use crate::policy::Policy;
+    use crate::policy::{FunctionConfig, Policy};
     use crate::schema::{ColumnDef, DataType, SchemaBuilder, Table};
 
     fn test_generator() -> SqlGen<Full> {
@@ -1926,6 +1949,58 @@ mod tests {
             .build();
 
         SqlGen::new(schema, Policy::default())
+    }
+
+    #[test]
+    fn aggregate_generation_can_exclude_results_that_depend_on_input_order() {
+        let policy = Policy::default()
+            .with_function_config(FunctionConfig::default().without_order_dependent_aggregates());
+        let generator: SqlGen<Full> = SqlGen::new(test_generator().schema().clone(), policy);
+        let table = generator.schema().tables[0].clone();
+
+        for seed in 0..100 {
+            let mut ctx = Context::new_with_seed(seed);
+            ctx.with_table_scope([(table.clone(), None)], |ctx| -> Result<(), GenError> {
+                let Expr::FunctionCall(call) = generate_aggregate_call(&generator, ctx)? else {
+                    unreachable!("aggregate generation must return a function call");
+                };
+                assert!(
+                    !aggregate_result_depends_on_input_order(&call.name),
+                    "seed {seed} generated {}",
+                    call.name
+                );
+                Ok(())
+            })
+            .unwrap();
+        }
+    }
+
+    #[test]
+    fn window_generation_can_exclude_results_that_depend_on_input_order() {
+        let generator = test_generator();
+        let table = generator.schema().tables[0].clone();
+        let mut generated_aggregate = false;
+
+        for seed in 0..100 {
+            let mut ctx = Context::new_with_seed(seed);
+            ctx.with_table_scope([(table.clone(), None)], |ctx| -> Result<(), GenError> {
+                let expr = generate_window_function(ctx, WindowFramePolicy::Rows, false)?;
+                if let Expr::WindowFunction(window) = expr
+                    && window.frame.is_some()
+                {
+                    generated_aggregate = true;
+                    assert!(
+                        !aggregate_result_depends_on_input_order(&window.name),
+                        "seed {seed} generated {}",
+                        window.name
+                    );
+                }
+                Ok(())
+            })
+            .unwrap();
+        }
+
+        assert!(generated_aggregate);
     }
 
     #[test]

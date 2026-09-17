@@ -205,7 +205,9 @@ impl SqlGenBackend {
         let mut policy = Policy::default()
             .with_stmt_weights(stmt_weights)
             .with_function_config(
-                sql_gen::FunctionConfig::deterministic().disable(&["LIKELY", "UNLIKELY"]),
+                sql_gen::FunctionConfig::deterministic()
+                    .disable(&["LIKELY", "UNLIKELY"])
+                    .without_order_dependent_aggregates(),
             );
         policy.select_config.require_order_by_with_limit = true;
         profile.configure_policy(&mut policy);
@@ -317,6 +319,12 @@ impl PropTestBackend {
             .expression
             .base
             .order_by_allow_integer_positions = false;
+        profile
+            .generation
+            .expression
+            .base
+            .function_profile
+            .allow_order_dependent_aggregates = false;
         if recursive_cte_focus {
             profile = profile.read_only();
             profile.generation.expression = profile.generation.expression.clone().simple();
@@ -469,6 +477,28 @@ mod tests {
         let sql_gen = SqlGenBackend::new(1);
         assert_eq!(sql_gen.policy.update_config.or_ignore_probability, 0.0);
         assert_eq!(sql_gen.policy.update_config.self_join_probability, 0.0);
+    }
+
+    #[test]
+    fn aggregates_that_depend_on_input_order_are_disabled() {
+        let sql_gen = SqlGenBackend::new(1);
+        assert!(
+            !sql_gen
+                .policy
+                .function_config
+                .allow_order_dependent_aggregates
+        );
+
+        let prop = PropTestBackend::new([1; 32], false);
+        assert!(
+            !prop
+                .profile
+                .generation
+                .expression
+                .base
+                .function_profile
+                .allow_order_dependent_aggregates
+        );
     }
 
     #[test]
