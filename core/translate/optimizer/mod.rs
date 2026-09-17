@@ -61,7 +61,7 @@ use constraints::{
 use cost::Cost;
 use join::{
     compute_best_join_order_with_context, count_subquery_calls_for_plan, BestJoinOrderResult,
-    CorrelatedSubqueryEstimate, JoinN, JoinPlanningContext,
+    CorrelatedSubqueryEstimate, JoinN, JoinPlanningContext, JoinPlanningInputs,
 };
 use lift_common_subexpressions::lift_common_subexpressions_from_binary_or_terms;
 use order::{
@@ -2514,20 +2514,22 @@ fn find_table_access_plan(
     };
 
     let Some(best_join_order_result) = compute_best_join_order_with_context(
-        table_references.joined_tables(),
-        initial_input_cardinality,
+        JoinPlanningInputs {
+            joined_tables: table_references.joined_tables(),
+            constraints: &constraints_per_table,
+            base_table_rows: &base_table_rows,
+            subqueries,
+            index_method_candidates: &index_method_candidates,
+            table_references,
+            available_indexes,
+            analyze_stats: &schema.analyze_stats,
+            schema,
+            params,
+            initial_input_cardinality,
+        },
         planning_context,
-        &constraints_per_table,
-        &base_table_rows,
         &mut access_methods_arena,
         where_clause,
-        subqueries,
-        &index_method_candidates,
-        params,
-        &schema.analyze_stats,
-        available_indexes,
-        table_references,
-        schema,
     )?
     else {
         return Ok(None);

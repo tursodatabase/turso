@@ -62,6 +62,43 @@ impl<'a> JoinPlanningContext<'a> {
     }
 }
 
+/// Everything the join planner reads about the query but never changes.
+///
+/// Every step of join enumeration needs most of these, so they travel together
+/// instead of as one parameter each.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct JoinPlanningInputs<'a> {
+    pub joined_tables: &'a [JoinedTable],
+    pub constraints: &'a [TableConstraints],
+    pub base_table_rows: &'a [RowCountEstimate],
+    pub subqueries: &'a [NonFromClauseSubquery],
+    pub index_method_candidates: &'a [IndexMethodCandidate],
+    pub table_references: &'a TableReferences,
+    pub available_indexes: &'a AvailableIndexes,
+    pub analyze_stats: &'a AnalyzeStats,
+    pub schema: &'a Schema,
+    pub params: &'a CostModelParams,
+    /// Rows that reach the first table of the join, e.g. one per outer query row.
+    pub initial_input_cardinality: f64,
+}
+
+impl<'a> JoinPlanningInputs<'a> {
+    fn table(&self, table_idx: usize) -> &'a JoinedTable {
+        &self.joined_tables[table_idx]
+    }
+
+    fn constraints_for(&self, table_idx: usize) -> &'a TableConstraints {
+        &self.constraints[table_idx]
+    }
+
+    fn base_rows(&self, table_idx: usize) -> RowCountEstimate {
+        self.base_table_rows
+            .get(table_idx)
+            .copied()
+            .unwrap_or_else(|| RowCountEstimate::hardcoded_fallback(self.params))
+    }
+}
+
 // Upper bound on rowids to materialize for a hash build input.
 // This is a safety limit, not a cost tuning parameter.
 const MAX_MATERIALIZED_BUILD_ROWS: f64 = 200_000.0;
@@ -474,38 +511,36 @@ impl JoinN {
 /// - Probe->build chaining is only allowed when the build input is materialized from the
 ///   join prefix; rebuilding from the full table would ignore prior join filters.
 #[allow(clippy::too_many_arguments)]
-fn join_lhs_and_rhs<'a>(
+fn join_lhs_and_rhs(
+    inputs: JoinPlanningInputs<'_>,
     lhs: Option<&JoinN>,
-    initial_input_cardinality: f64,
-    rhs_table_reference: &JoinedTable,
-    rhs_constraints: &'a TableConstraints,
-    all_constraints: &'a [TableConstraints],
-    base_table_rows: &[RowCountEstimate],
     join_order: &[JoinOrderMember],
     planning_context: JoinPlanningContext<'_>,
-    access_methods_arena: &'a mut Vec<AccessMethod>,
+    access_methods_arena: &mut Vec<AccessMethod>,
     cost_upper_bound: Cost,
-    joined_tables: &[JoinedTable],
     where_clause: &mut [WhereTerm],
     where_terms: &[WhereTermInfo],
-    subqueries: &[NonFromClauseSubquery],
-    index_method_candidates: &[IndexMethodCandidate],
-    params: &CostModelParams,
-    analyze_stats: &AnalyzeStats,
-    available_indexes: &AvailableIndexes,
-    table_references: &TableReferences,
-    schema: &Schema,
 ) -> Result<Option<JoinN>> {
+    let JoinPlanningInputs {
+        subqueries,
+        index_method_candidates,
+        table_references,
+        available_indexes,
+        analyze_stats,
+        schema,
+        params,
+        ..
+    } = inputs;
+
     // The input cardinality for this join is the output cardinality of the previous join.
     // For example, in a 2-way join, if the left table has 1000 rows, and the right table will return 2 rows for each of the left table's rows,
     // then the output cardinality of the join will be 2000.
-    let input_cardinality = lhs.map_or(initial_input_cardinality, |l| l.output_cardinality);
+    let input_cardinality = lhs.map_or(inputs.initial_input_cardinality, |l| l.output_cardinality);
 
     let rhs_table_number = join_order.last().unwrap().original_idx;
-    let rhs_base_rows = base_table_rows
-        .get(rhs_table_number)
-        .copied()
-        .unwrap_or_else(|| RowCountEstimate::hardcoded_fallback(params));
+    let rhs_table_reference = inputs.table(rhs_table_number);
+    let rhs_constraints = inputs.constraints_for(rhs_table_number);
+    let rhs_base_rows = inputs.base_rows(rhs_table_number);
     let lhs_mask = match lhs {
         Some(lhs) => lhs.table_numbers().try_collect()?,
         None => TableMask::default(),
@@ -584,7 +619,6 @@ fn join_lhs_and_rhs<'a>(
     // - The build table has no remaining constraints from prior tables that are
     //   not already consumed as hash-join keys in earlier hash joins.
     if let Some(lhs) = lhs {
-        let rhs_table_idx = join_order.last().unwrap().original_idx;
         let last_lhs_table_idx = join_order[join_order.len() - 2].original_idx;
         let lhs_table_numbers: TableMask = lhs.table_numbers().try_collect()?;
 
@@ -616,7 +650,7 @@ fn join_lhs_and_rhs<'a>(
                     build_table_idx, ..
                 } = &am.params
                 {
-                    *build_table_idx == rhs_table_idx
+                    *build_table_idx == rhs_table_number
                 } else {
                     false
                 }
@@ -627,7 +661,7 @@ fn join_lhs_and_rhs<'a>(
             if build_table_idx != last_lhs_table_idx {
                 continue;
             }
-            let build_table = &joined_tables[build_table_idx];
+            let build_table = inputs.table(build_table_idx);
             let build_has_rowid = build_table.btree().is_some_and(|btree| btree.has_rowid);
             let build_access_method = lhs
                 .data
@@ -647,11 +681,8 @@ fn join_lhs_and_rhs<'a>(
                 )
             });
 
-            let build_constraints = &all_constraints[build_table_idx];
-            let build_base_rows = base_table_rows
-                .get(build_table_idx)
-                .copied()
-                .unwrap_or_else(|| RowCountEstimate::hardcoded_fallback(params));
+            let build_constraints = inputs.constraints_for(build_table_idx);
+            let build_base_rows = inputs.base_rows(build_table_idx);
             let build_self_selectivity =
                 build_self_constraint_selectivity(build_constraints, build_table_idx);
             let build_cardinality = (*build_base_rows) * build_self_selectivity;
@@ -835,7 +866,7 @@ fn join_lhs_and_rhs<'a>(
                     build_table,
                     rhs_table_reference,
                     build_table_idx,
-                    rhs_table_idx,
+                    rhs_table_number,
                     lhs_constraints,
                     rhs_constraints,
                     where_clause,
@@ -1078,7 +1109,7 @@ fn join_lhs_and_rhs<'a>(
         rhs_constraints,
         &lhs_mask,
         rhs_self_mask,
-        &joined_tables[rhs_table_number],
+        rhs_table_reference,
         where_clause,
         params,
     );
@@ -1213,13 +1244,13 @@ pub struct BestJoinOrderResult {
 /// Returns the best [JoinN] if one exists, otherwise returns None.
 #[allow(clippy::too_many_arguments)]
 #[cfg_attr(not(test), allow(dead_code))]
-pub fn compute_best_join_order<'a>(
+pub fn compute_best_join_order(
     joined_tables: &[JoinedTable],
     initial_input_cardinality: f64,
     maybe_order_target: Option<&OrderTarget>,
-    constraints: &'a [TableConstraints],
+    constraints: &[TableConstraints],
     base_table_rows: &[RowCountEstimate],
-    access_methods_arena: &'a mut Vec<AccessMethod>,
+    access_methods_arena: &mut Vec<AccessMethod>,
     where_clause: &mut [WhereTerm],
     subqueries: &[NonFromClauseSubquery],
     index_method_candidates: &[IndexMethodCandidate],
@@ -1230,43 +1261,43 @@ pub fn compute_best_join_order<'a>(
     schema: &Schema,
 ) -> Result<Option<BestJoinOrderResult>> {
     compute_best_join_order_with_context(
-        joined_tables,
-        initial_input_cardinality,
+        JoinPlanningInputs {
+            joined_tables,
+            constraints,
+            base_table_rows,
+            subqueries,
+            index_method_candidates,
+            table_references,
+            available_indexes,
+            analyze_stats,
+            schema,
+            params,
+            initial_input_cardinality,
+        },
         JoinPlanningContext::default_with_order_target(maybe_order_target),
-        constraints,
-        base_table_rows,
         access_methods_arena,
         where_clause,
-        subqueries,
-        index_method_candidates,
-        params,
-        analyze_stats,
-        available_indexes,
-        table_references,
-        schema,
     )
 }
 
 /// Enumerate join orders while carrying a small amount of planner context that
 /// influences access-path scoring, such as an order target for sort elimination
 /// or simple MIN/MAX planning.
-#[expect(clippy::too_many_arguments)]
-pub(crate) fn compute_best_join_order_with_context<'a>(
-    joined_tables: &[JoinedTable],
-    initial_input_cardinality: f64,
+pub(crate) fn compute_best_join_order_with_context(
+    inputs: JoinPlanningInputs<'_>,
     planning_context: JoinPlanningContext<'_>,
-    constraints: &'a [TableConstraints],
-    base_table_rows: &[RowCountEstimate],
-    access_methods_arena: &'a mut Vec<AccessMethod>,
+    access_methods_arena: &mut Vec<AccessMethod>,
     where_clause: &mut [WhereTerm],
-    subqueries: &[NonFromClauseSubquery],
-    index_method_candidates: &[IndexMethodCandidate],
-    params: &CostModelParams,
-    analyze_stats: &AnalyzeStats,
-    available_indexes: &AvailableIndexes,
-    table_references: &TableReferences,
-    schema: &Schema,
 ) -> Result<Option<BestJoinOrderResult>> {
+    let JoinPlanningInputs {
+        joined_tables,
+        constraints,
+        subqueries,
+        table_references,
+        schema,
+        ..
+    } = inputs;
+
     // Skip work if we have no tables to consider.
     if joined_tables.is_empty() {
         return Ok(None);
@@ -1281,41 +1312,21 @@ pub(crate) fn compute_best_join_order_with_context<'a>(
     let where_terms = build_where_term_info(where_clause, table_references, subqueries)?;
     if num_tables > GREEDY_JOIN_THRESHOLD {
         return compute_greedy_join_order(
-            joined_tables,
-            initial_input_cardinality,
+            inputs,
             planning_context,
-            constraints,
-            base_table_rows,
             access_methods_arena,
             where_clause,
             &where_terms,
-            subqueries,
-            index_method_candidates,
-            params,
-            analyze_stats,
-            available_indexes,
-            table_references,
-            schema,
         );
     }
 
     // Compute naive left-to-right plan to use as pruning threshold
     let naive_plan = compute_naive_left_deep_plan(
-        joined_tables,
-        initial_input_cardinality,
+        inputs,
         planning_context,
-        base_table_rows,
         access_methods_arena,
-        constraints,
         where_clause,
         &where_terms,
-        subqueries,
-        index_method_candidates,
-        params,
-        analyze_stats,
-        available_indexes,
-        table_references,
-        schema,
     )?;
 
     // Keep track of both 1. the best plan overall (not considering sorting), and 2. the best ordered plan (which might not be the same).
@@ -1381,10 +1392,9 @@ pub(crate) fn compute_best_join_order_with_context<'a>(
 
     // Dynamic programming base case: calculate the best way to access each single table, as if
     // there were no other tables.
-    for i in 0..num_tables {
+    for (i, table_ref) in joined_tables.iter().enumerate() {
         let mut mask = TableMask::default();
         mask.set(i)?;
-        let table_ref = &joined_tables[i];
         join_order[0] = JoinOrderMember {
             table_id: table_ref.internal_id,
             original_idx: i,
@@ -1392,26 +1402,14 @@ pub(crate) fn compute_best_join_order_with_context<'a>(
         };
         turso_assert_eq!(join_order.len(), 1);
         let rel = join_lhs_and_rhs(
+            inputs,
             None,
-            initial_input_cardinality,
-            table_ref,
-            &constraints[i],
-            constraints,
-            base_table_rows,
             &join_order,
             planning_context,
             access_methods_arena,
             cost_upper_bound,
-            joined_tables,
             where_clause,
             &where_terms,
-            subqueries,
-            index_method_candidates,
-            params,
-            analyze_stats,
-            available_indexes,
-            table_references,
-            schema,
         )?;
         if let Some(rel) = rel {
             best_plan_memo.entry(mask).or_default().insert(i, rel);
@@ -1579,26 +1577,14 @@ pub(crate) fn compute_best_join_order_with_context<'a>(
                     // Calculate the best way to join LHS with RHS.
                     let arena_len = access_methods_arena.len();
                     let rel = join_lhs_and_rhs(
+                        inputs,
                         Some(lhs),
-                        initial_input_cardinality,
-                        &joined_tables[rhs_idx],
-                        &constraints[rhs_idx],
-                        constraints,
-                        base_table_rows,
                         &join_order,
                         planning_context,
                         access_methods_arena,
                         cost_upper_bound,
-                        joined_tables,
                         where_clause,
                         &where_terms,
-                        subqueries,
-                        index_method_candidates,
-                        params,
-                        analyze_stats,
-                        available_indexes,
-                        table_references,
-                        schema,
                     )?;
                     join_order.clear();
 
@@ -1795,23 +1781,22 @@ pub const GREEDY_JOIN_THRESHOLD: usize = 12;
 ///
 /// Respects outer join ordering constraints.
 #[allow(clippy::too_many_arguments)]
-fn compute_greedy_join_order<'a>(
-    joined_tables: &[JoinedTable],
-    initial_input_cardinality: f64,
+fn compute_greedy_join_order(
+    inputs: JoinPlanningInputs<'_>,
     planning_context: JoinPlanningContext<'_>,
-    constraints: &'a [TableConstraints],
-    base_table_rows: &[RowCountEstimate],
-    access_methods_arena: &'a mut Vec<AccessMethod>,
+    access_methods_arena: &mut Vec<AccessMethod>,
     where_clause: &mut [WhereTerm],
     where_terms: &[WhereTermInfo],
-    subqueries: &[NonFromClauseSubquery],
-    index_method_candidates: &[IndexMethodCandidate],
-    params: &CostModelParams,
-    analyze_stats: &AnalyzeStats,
-    available_indexes: &AvailableIndexes,
-    table_references: &TableReferences,
-    schema: &Schema,
 ) -> Result<Option<BestJoinOrderResult>> {
+    let JoinPlanningInputs {
+        joined_tables,
+        constraints,
+        base_table_rows,
+        analyze_stats,
+        params,
+        ..
+    } = inputs;
+
     let num_tables = joined_tables.len();
     if num_tables == 0 {
         return Ok(None);
@@ -1857,26 +1842,14 @@ fn compute_greedy_join_order<'a>(
     remaining.clear(first_idx);
 
     let mut current_plan: Option<JoinN> = join_lhs_and_rhs(
+        inputs,
         None,
-        initial_input_cardinality,
-        first_table,
-        &constraints[first_idx],
-        constraints,
-        base_table_rows,
         &join_order,
         planning_context,
         access_methods_arena,
         Cost(f64::MAX),
-        joined_tables,
         where_clause,
         where_terms,
-        subqueries,
-        index_method_candidates,
-        params,
-        analyze_stats,
-        available_indexes,
-        table_references,
-        schema,
     )?;
 
     if current_plan.is_none() {
@@ -1918,26 +1891,14 @@ fn compute_greedy_join_order<'a>(
             last.is_outer = table.join_info.as_ref().is_some_and(|ji| ji.is_outer());
 
             if let Some(plan) = join_lhs_and_rhs(
+                inputs,
                 current_plan.as_ref(),
-                initial_input_cardinality,
-                table,
-                &constraints[idx],
-                constraints,
-                base_table_rows,
                 &join_order,
                 planning_context,
                 access_methods_arena,
                 Cost(f64::MAX),
-                joined_tables,
                 where_clause,
                 where_terms,
-                subqueries,
-                index_method_candidates,
-                params,
-                analyze_stats,
-                available_indexes,
-                table_references,
-                schema,
             )? {
                 if best.as_ref().is_none_or(|(_, b)| plan.cost < b.cost) {
                     best = Some((idx, plan));
@@ -2232,23 +2193,14 @@ fn get_best_seek_score(
 /// in the SQL query. This is used as an upper bound for any other plans -- we can give up enumerating
 /// permutations if they exceed this cost during enumeration.
 #[allow(clippy::too_many_arguments)]
-fn compute_naive_left_deep_plan<'a>(
-    joined_tables: &[JoinedTable],
-    initial_input_cardinality: f64,
+fn compute_naive_left_deep_plan(
+    inputs: JoinPlanningInputs<'_>,
     planning_context: JoinPlanningContext<'_>,
-    base_table_rows: &[RowCountEstimate],
-    access_methods_arena: &'a mut Vec<AccessMethod>,
-    constraints: &'a [TableConstraints],
+    access_methods_arena: &mut Vec<AccessMethod>,
     where_clause: &mut [WhereTerm],
     where_terms: &[WhereTermInfo],
-    subqueries: &[NonFromClauseSubquery],
-    index_method_candidates: &[IndexMethodCandidate],
-    params: &CostModelParams,
-    analyze_stats: &AnalyzeStats,
-    available_indexes: &AvailableIndexes,
-    table_references: &TableReferences,
-    schema: &Schema,
 ) -> Result<Option<JoinN>> {
+    let joined_tables = inputs.joined_tables;
     let n = joined_tables.len();
     turso_assert_greater_than!(n, 0);
 
@@ -2264,26 +2216,14 @@ fn compute_naive_left_deep_plan<'a>(
 
     // Start with first table
     let mut best_plan = join_lhs_and_rhs(
+        inputs,
         None,
-        initial_input_cardinality,
-        &joined_tables[0],
-        &constraints[0],
-        constraints,
-        base_table_rows,
         &join_order[..1],
         planning_context,
         access_methods_arena,
         Cost(f64::MAX),
-        joined_tables,
         where_clause,
         where_terms,
-        subqueries,
-        index_method_candidates,
-        params,
-        analyze_stats,
-        available_indexes,
-        table_references,
-        schema,
     )?;
     if best_plan.is_none() {
         return Ok(None);
@@ -2292,26 +2232,14 @@ fn compute_naive_left_deep_plan<'a>(
     // Add remaining tables one at a time from left to right
     for i in 1..n {
         best_plan = join_lhs_and_rhs(
+            inputs,
             best_plan.as_ref(),
-            initial_input_cardinality,
-            &joined_tables[i],
-            &constraints[i],
-            constraints,
-            base_table_rows,
             &join_order[..=i],
             planning_context,
             access_methods_arena,
             Cost(f64::MAX),
-            joined_tables,
             where_clause,
             where_terms,
-            subqueries,
-            index_method_candidates,
-            params,
-            analyze_stats,
-            available_indexes,
-            table_references,
-            schema,
         )?;
         if best_plan.is_none() {
             return Ok(None);
