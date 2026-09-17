@@ -759,6 +759,74 @@ fn test_fts_insert_query(tmp_db: TempDatabase) {
 
 #[cfg(all(feature = "fts", not(target_family = "wasm")))]
 #[turso_macros::test]
+fn test_fts_query_input_types(tmp_db: TempDatabase) {
+    let conn = tmp_db.connect_limbo();
+    conn.execute("CREATE TABLE d(id INTEGER PRIMARY KEY, body TEXT)")
+        .unwrap();
+    conn.execute("CREATE INDEX fx ON d USING fts(body)")
+        .unwrap();
+    conn.execute("INSERT INTO d VALUES (1, '42'), (2, NULL), (3, '7.5')")
+        .unwrap();
+
+    for (query, expected) in [("NULL", vec![]), ("42", vec![1]), ("7.5", vec![3])] {
+        for suffix in ["", " LIMIT 10"] {
+            let sql = format!("SELECT id FROM d WHERE fts_match(body, {query}){suffix}");
+            let rows = limbo_exec_rows(&conn, &sql);
+            assert_that!(rows)
+                .named(&sql)
+                .column(0)
+                .contains_exactly(expected.iter().copied().map(Cell::from).collect::<Vec<_>>());
+        }
+    }
+}
+
+#[cfg(all(feature = "fts", not(target_family = "wasm")))]
+#[turso_macros::test]
+fn test_fts_bound_query_input_types(tmp_db: TempDatabase) {
+    let conn = tmp_db.connect_limbo();
+    conn.execute("CREATE TABLE d(id INTEGER PRIMARY KEY, body TEXT)")
+        .unwrap();
+    conn.execute("CREATE INDEX fx ON d USING fts(body)")
+        .unwrap();
+    conn.execute("INSERT INTO d VALUES (1, '42'), (2, NULL), (3, '7.5')")
+        .unwrap();
+
+    for sql in [
+        "SELECT id FROM d WHERE fts_match(body, ?1)",
+        "SELECT id FROM d WHERE fts_match(body, ?1) LIMIT 10",
+        "SELECT id, fts_score(body, ?1) AS score FROM d WHERE fts_match(body, ?1)",
+        "SELECT id, fts_score(body, ?1) AS score FROM d WHERE fts_match(body, ?1) LIMIT 10",
+        "SELECT id, fts_score(body, ?1) AS score FROM d WHERE fts_match(body, ?1) ORDER BY score DESC",
+        "SELECT id, fts_score(body, ?1) AS score FROM d WHERE fts_match(body, ?1) ORDER BY score DESC LIMIT 10",
+        "SELECT id, fts_score(body, ?1) AS score FROM d ORDER BY score DESC LIMIT 10",
+    ] {
+        let mut stmt = conn.prepare(sql).unwrap();
+        for (query, expected) in [
+            (Value::build_text("42"), vec![Value::from_i64(1)]),
+            (Value::Null, vec![]),
+            (Value::from_i64(42), vec![Value::from_i64(1)]),
+            (Value::from_f64(7.5), vec![Value::from_i64(3)]),
+            (Value::from_blob(b"42".to_vec()), vec![Value::from_i64(1)]),
+            (Value::Null, vec![]),
+        ] {
+            stmt.reset().unwrap();
+            stmt.bind_at(1.try_into().unwrap(), query.clone()).unwrap();
+            let mut ids = Vec::new();
+            stmt.run_with_row_callback(|row| {
+                ids.push(row.get_value(0).clone());
+                if row.len() > 1 {
+                    assert!(row.get_value(1).as_float() > 0.0);
+                }
+                Ok(())
+            })
+            .unwrap();
+            assert_eq!(ids, expected, "{sql}, query={query:?}");
+        }
+    }
+}
+
+#[cfg(all(feature = "fts", not(target_family = "wasm")))]
+#[turso_macros::test]
 fn test_fts_sql_queries(tmp_db: TempDatabase) {
     let _ = env_logger::try_init();
     let conn = tmp_db.connect_limbo();

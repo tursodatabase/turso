@@ -3006,12 +3006,6 @@ impl IndexMethodCursor for FtsCursor {
         };
         self.current_pattern = pattern_idx;
 
-        // values[1] = query string
-        let query_str = match &values[1] {
-            Register::Value(Value::Text(t)) => t.as_str().to_string(),
-            _ => return Err(LimboError::InternalError("FTS query must be text".into()).into()),
-        };
-
         // Determine the optional SQL LIMIT captured by the selected pattern.
         let limit_raw = match pattern_idx {
             // Patterns without LIMIT fetch every live document that matches.
@@ -3059,6 +3053,14 @@ impl IndexMethodCursor for FtsCursor {
             }
         };
 
+        self.current_hits.clear();
+        self.streaming_hits = None;
+        self.hit_pos = 0;
+        let query_str = match values[1].get_value() {
+            Value::Null => return Ok(IOResult::Done(false)),
+            query => query.to_string(),
+        };
+
         let parser = self
             .cached_parser
             .as_deref()
@@ -3102,9 +3104,6 @@ impl IndexMethodCursor for FtsCursor {
         // and prevents a huge SQL LIMIT from allocating beyond the largest
         // possible result set.
         let limit = bounded_query_limit(limit_raw, searcher.num_docs());
-        self.current_hits.clear();
-        self.streaming_hits = None;
-        self.hit_pos = 0;
         if limit == 0 {
             return Ok(IOResult::Done(false));
         }
