@@ -1,0 +1,74 @@
+# Setup that makes SQLite pick a skip-scan over the (group_id, parent_id) index.
+#
+# The join constrains only parent_id, the second column of child_key. SQLite can
+# still use that index: it steps through each distinct group_id and does one seek
+# per group. SQLite picks that plan only when two things are true.
+#
+#   1. sqlite_stat1 holds a row for the index, and the average number of rows per
+#      distinct group_id is 18 or more. Below 18 SQLite never considers the plan.
+#      18 is a SQLite tuning constant (LogEst 42 in whereLoopAddBtree).
+#   2. The skipping must cost less than a full scan of child. So group_id needs
+#      few distinct values, and parent must be small next to child.
+#
+# 50 parents and 1500 child rows split over 3 groups give the stat1 row
+# '1500 500 10'. SQLite 3.45 and 3.51 both then report:
+#
+#     |--SCAN parent
+#     `--SEARCH child USING INDEX child_key (ANY(group_id) AND parent_id=?)
+#
+# Turso has no skip-scan, so it picks a different plan. The rows must be equal.
+
+@database :memory:
+
+setup skip_scan_data {
+    CREATE TABLE parent(id INTEGER PRIMARY KEY);
+    CREATE TABLE child(group_id INTEGER, parent_id INTEGER, value TEXT);
+    CREATE INDEX child_key ON child(group_id, parent_id);
+
+    WITH RECURSIVE seq(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM seq WHERE n < 50)
+    INSERT INTO parent(id) SELECT n FROM seq;
+
+    WITH RECURSIVE
+        grp(g) AS (SELECT 0 UNION ALL SELECT g+1 FROM grp WHERE g < 2),
+        dup(k) AS (SELECT 1 UNION ALL SELECT k+1 FROM dup WHERE k < 10)
+    INSERT INTO child(group_id, parent_id, value)
+    SELECT g, parent.id, 'g' || g || 'p' || parent.id || 'n' || k
+    FROM grp, parent, dup;
+
+    ANALYZE;
+}
+
+# Without this stat1 row SQLite scans child and looks parent up by rowid.
+@setup skip_scan_data
+test stat1-row-that-makes-sqlite-skip-scan {
+    SELECT stat FROM sqlite_stat1 WHERE idx = 'child_key';
+}
+expect {
+    1500 500 10
+}
+
+@setup skip_scan_data
+test join-on-index-suffix-returns-every-child-row {
+    SELECT count(*), sum(parent.id), count(DISTINCT child.value)
+    FROM parent
+    JOIN child ON child.parent_id = parent.id;
+}
+expect {
+    1500|38250|1500
+}
+
+# A skip-scan must reach every group, not only the first one.
+@setup skip_scan_data
+test join-on-index-suffix-visits-every-group {
+    SELECT child.group_id, count(*), min(child.value), max(child.value)
+    FROM parent
+    JOIN child ON child.parent_id = parent.id
+    WHERE parent.id = 3
+    GROUP BY child.group_id
+    ORDER BY child.group_id;
+}
+expect {
+    0|10|g0p3n1|g0p3n9
+    1|10|g1p3n1|g1p3n9
+    2|10|g2p3n1|g2p3n9
+}
