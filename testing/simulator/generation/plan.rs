@@ -373,8 +373,9 @@ impl ArbitraryFrom<(&SimulatorEnv, &InteractionStats, usize)> for Interactions {
         );
 
         let queries = possible_queries(conn_ctx.tables());
-        let allow_checkpoints =
-            !env.profile.mvcc && !matches!(env.type_, SimulationType::Differential);
+        let allow_checkpoints = !env.profile.mvcc
+            && !matches!(env.type_, SimulationType::Differential)
+            && !env.conn_db_in_transaction(conn_index);
         let query_distr = QueryDistribution::new(queries, &remaining_, allow_checkpoints);
 
         #[expect(clippy::type_complexity)]
@@ -417,5 +418,69 @@ impl ArbitraryFrom<(&SimulatorEnv, &InteractionStats, usize)> for Interactions {
         };
 
         frequency(choices, rng)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::Parser;
+    use sql_generation::model::query::pragma::Pragma;
+
+    use crate::{
+        profiles::Profile,
+        runner::{
+            cli::SimulatorCLI,
+            env::{Paths, SimConnection},
+        },
+    };
+
+    #[test]
+    fn checkpoints_are_generated_only_outside_transactions() {
+        let dir = tempfile::tempdir().unwrap();
+        let cli = SimulatorCLI::parse_from(["limbo_sim", "--io-backend=memory"]);
+        let mut env = SimulatorEnv::new(
+            1,
+            &cli,
+            Paths::new(dir.path()),
+            SimulationType::Default,
+            &Profile::faultless(),
+        );
+        env.connect(0);
+        env.connect(1);
+        let SimConnection::LimboConnection(conn) = &env.connections[0] else {
+            unreachable!();
+        };
+        let conn = conn.clone();
+        let create = Create::arbitrary(&mut env.gen_rng(), &env.connection_context(0));
+        conn.execute(create.to_string()).unwrap();
+        env.committed_tables.push(create.table);
+
+        assert!(generated_checkpoints(&env, 0) > 0);
+        for begin in ["BEGIN", "SAVEPOINT sp"] {
+            conn.execute(begin).unwrap();
+            assert_eq!(generated_checkpoints(&env, 0), 0, "{begin}");
+            assert!(generated_checkpoints(&env, 1) > 0);
+            conn.execute("ROLLBACK").unwrap();
+            assert!(generated_checkpoints(&env, 0) > 0);
+        }
+    }
+
+    fn generated_checkpoints(env: &SimulatorEnv, conn_index: usize) -> usize {
+        let mut rng = env.gen_rng();
+        let stats = InteractionStats::default();
+        (0..1000)
+            .filter(|_| {
+                let interaction = Interactions::arbitrary_from(
+                    &mut rng,
+                    &env.connection_context(conn_index),
+                    (env, &stats, conn_index),
+                );
+                matches!(
+                    interaction.interactions,
+                    InteractionsType::Query(Query::Pragma(Pragma::WalCheckpoint { .. }))
+                )
+            })
+            .count()
     }
 }
