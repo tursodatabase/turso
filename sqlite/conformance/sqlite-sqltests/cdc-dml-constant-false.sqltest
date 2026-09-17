@@ -1,0 +1,188 @@
+@database :memory:
+@skip-file-if mvcc "CDC is not supported in MVCC mode"
+@skip-file-if sqlite "CDC is a turso-specific feature"
+
+# WHERE 0 skips the main loop's OpenWrite for the CDC cursor; the autocommit
+# COMMIT epilogue must not use it.
+
+test cdc-delete-where-false {
+    CREATE TABLE t(id INTEGER, val TEXT);
+    INSERT INTO t VALUES (1, 'a');
+    INSERT INTO t VALUES (2, 'b');
+    PRAGMA capture_data_changes_conn('full');
+    DELETE FROM t WHERE 0;
+    SELECT * FROM t ORDER BY id;
+}
+expect {
+    1|a
+    2|b
+}
+
+test cdc-delete-where-not-1 {
+    CREATE TABLE t2(id INTEGER);
+    INSERT INTO t2 VALUES (1);
+    PRAGMA capture_data_changes_conn('full');
+    DELETE FROM t2 WHERE NOT 1;
+    SELECT * FROM t2;
+}
+expect {
+    1
+}
+
+test cdc-delete-empty-table-where-false {
+    CREATE TABLE t3(id INTEGER);
+    PRAGMA capture_data_changes_conn('full');
+    DELETE FROM t3 WHERE 0;
+    SELECT count(*) FROM t3;
+}
+expect {
+    0
+}
+
+test cdc-update-where-false {
+    CREATE TABLE t4(id INTEGER, val TEXT);
+    INSERT INTO t4 VALUES (1, 'a');
+    INSERT INTO t4 VALUES (2, 'b');
+    PRAGMA capture_data_changes_conn('full');
+    UPDATE t4 SET val = 'x' WHERE 0;
+    SELECT * FROM t4 ORDER BY id;
+}
+expect {
+    1|a
+    2|b
+}
+
+test cdc-update-where-not-1 {
+    CREATE TABLE t5(id INTEGER, val TEXT);
+    INSERT INTO t5 VALUES (1, 'a');
+    PRAGMA capture_data_changes_conn('full');
+    UPDATE t5 SET val = 'x' WHERE NOT 1;
+    SELECT * FROM t5;
+}
+expect {
+    1|a
+}
+
+test cdc-update-empty-table-where-false {
+    CREATE TABLE t6(id INTEGER, val TEXT);
+    PRAGMA capture_data_changes_conn('full');
+    UPDATE t6 SET val = 'x' WHERE 0;
+    SELECT count(*) FROM t6;
+}
+expect {
+    0
+}
+
+# LIMIT 0 skips the loop at runtime, where the constant-false plan flag cannot see it.
+
+test cdc-delete-limit-zero {
+    CREATE TABLE t7(id INTEGER);
+    INSERT INTO t7 VALUES (1);
+    PRAGMA capture_data_changes_conn('full');
+    DELETE FROM t7 LIMIT 0;
+    SELECT count(*) FROM t7;
+}
+expect {
+    1
+}
+
+test cdc-update-limit-zero {
+    CREATE TABLE t8(id INTEGER, val TEXT);
+    INSERT INTO t8 VALUES (1, 'a');
+    PRAGMA capture_data_changes_conn('full');
+    UPDATE t8 SET val = 'x' LIMIT 0;
+    SELECT val FROM t8;
+}
+expect {
+    a
+}
+
+# A statement that captures nothing must leave turso_cdc empty - no rows, no COMMIT record.
+
+test cdc-table-empty-after-constant-false {
+    CREATE TABLE t9(id INTEGER);
+    INSERT INTO t9 VALUES (1);
+    PRAGMA capture_data_changes_conn('full');
+    DELETE FROM t9 WHERE 0;
+    DELETE FROM t9 WHERE NULL;
+    DELETE FROM t9 WHERE 1 = 2;
+    UPDATE t9 SET id = 5 WHERE 0;
+    DELETE FROM t9 LIMIT 0;
+    SELECT count(*) FROM turso_cdc;
+}
+expect {
+    0
+}
+
+test cdc-table-empty-after-no-match {
+    CREATE TABLE t10(id INTEGER);
+    INSERT INTO t10 VALUES (1);
+    PRAGMA capture_data_changes_conn('full');
+    DELETE FROM t10 WHERE id = 999;
+    UPDATE t10 SET id = 5 WHERE id = 999;
+    SELECT count(*) FROM turso_cdc;
+}
+expect {
+    0
+}
+
+# The connection must keep capturing correctly after a zero-change statement.
+
+test cdc-capture-still-works-after-constant-false {
+    CREATE TABLE t11(id INTEGER, val TEXT);
+    INSERT INTO t11 VALUES (1, 'a');
+    PRAGMA capture_data_changes_conn('full');
+    DELETE FROM t11 WHERE 0;
+    UPDATE t11 SET val = 'b' WHERE id = 1;
+    SELECT change_type, coalesce(table_name, '-') FROM turso_cdc ORDER BY change_id;
+}
+expect {
+    0|t11
+    2|-
+}
+
+# Trigger bodies must not add their own COMMIT record mid-statement.
+
+test cdc-trigger-body-single-commit {
+    CREATE TABLE src(x INTEGER);
+    CREATE TABLE dst(y INTEGER);
+    INSERT INTO dst VALUES (1);
+    CREATE TRIGGER tr AFTER INSERT ON src BEGIN DELETE FROM dst WHERE y = 1; END;
+    PRAGMA capture_data_changes_conn('full');
+    INSERT INTO src VALUES (1);
+    SELECT change_type, coalesce(table_name, '-') FROM turso_cdc ORDER BY change_id;
+}
+expect {
+    -1|dst
+    1|src
+    2|-
+}
+
+test cdc-trigger-body-constant-false {
+    CREATE TABLE src2(x INTEGER);
+    CREATE TABLE dst2(y INTEGER);
+    CREATE TRIGGER tr2 AFTER INSERT ON src2 BEGIN DELETE FROM dst2 WHERE 0; END;
+    PRAGMA capture_data_changes_conn('full');
+    INSERT INTO src2 VALUES (1);
+    SELECT change_type, coalesce(table_name, '-') FROM turso_cdc ORDER BY change_id;
+}
+expect {
+    1|src2
+    2|-
+}
+
+# FK actions, like triggers, must not emit their own COMMIT record.
+
+test cdc-fk-cascade-single-commit {
+    PRAGMA foreign_keys = ON;
+    CREATE TABLE p(id INTEGER PRIMARY KEY);
+    CREATE TABLE c(id INTEGER PRIMARY KEY, pid INTEGER REFERENCES p(id) ON DELETE CASCADE);
+    INSERT INTO p VALUES (1);
+    INSERT INTO c VALUES (10, 1);
+    PRAGMA capture_data_changes_conn('full');
+    DELETE FROM p WHERE id = 1;
+    SELECT count(*) FROM turso_cdc WHERE change_type = 2;
+}
+expect {
+    1
+}
