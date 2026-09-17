@@ -277,6 +277,32 @@ fn tombstoned_docs_are_invisible_at_the_reader_level() {
     assert!(cursor.live_postings_for_rowid(2).unwrap().is_empty());
 }
 
+#[test]
+fn rowid_lookup_uses_current_deletes_with_reordered_segments() {
+    let attachment = test_attachment();
+    let (first, _) = build_and_load_segment(&attachment, &[(7, "first"), (9, "other")]);
+    let (second, _) = build_and_load_segment(&attachment, &[(11, "other"), (7, "second")]);
+    let first_id = first.id();
+    let second_id = second.id();
+    let mut cursor = FtsCursor::new(&attachment);
+    cursor.segments = vec![first, second];
+    cursor.snapshot_loaded = true;
+    cursor.ensure_searcher().unwrap();
+    cursor.segments.reverse();
+    let hits: HashSet<_> = cursor
+        .live_postings_for_rowid(7)
+        .unwrap()
+        .into_iter()
+        .collect();
+    assert_eq!(hits, HashSet::from_iter([(first_id, 0), (second_id, 1)]));
+    cursor.segments[0].deleted.insert(1);
+    assert_eq!(
+        cursor.live_postings_for_rowid(7).unwrap(),
+        vec![(first_id, 0)]
+    );
+    assert!(cursor.live_postings_for_rowid(99).unwrap().is_empty());
+}
+
 fn identities_of(segment: &LoadedSegment) -> Vec<DocumentIdentity> {
     (0..segment.descriptor.max_doc)
         .map(|position| segment.data.identities.identity_of(position).unwrap())
