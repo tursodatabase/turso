@@ -83,12 +83,14 @@ connection, and two queries per transaction: WAL/one connection and MVCC/one,
 two, or four connections for all six query cases. Names encode `(mode,
 connections, transactions_per_connection, queries_per_transaction)`. Divan uses
 the same `FtsWorkload::prepare` and `run` methods with a no-op observer.
+The Divan/CodSpeed target uses Tokio's current-thread runtime for all connection
+counts. Transactions overlap, but query tasks execute on one thread. The dhat
+CLI retains its multi-thread runtime for parallel query measurements.
 Local builds without the `codspeed` feature install Divan's `AllocProfiler` over
 the system allocator. Run `cargo bench --profile bench-profile -p memory-benchmark-codspeed
 --features fts --bench fts_queries -- transactions --sample-count 3 --sample-size 1`
-for local allocation output. Divan counts only its measured threads, not Tokio
-worker threads: multi-connection allocation figures are incomplete. Use the dhat
-CLI for process-wide concurrent totals and peaks. `alloc` counts allocation calls;
+for local allocation output. All query tasks run on Divan's measured thread.
+Use the dhat CLI for process-wide parallel totals and peaks. `alloc` counts allocation calls;
 realloc growth is separate under `grow`. `max alloc` is peak live memory for the
 whole measured sequence, not per query.
 The existing Criterion memory profiles and their setup-inclusive metrics are unchanged.
