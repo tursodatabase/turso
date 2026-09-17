@@ -667,50 +667,65 @@ fn consider_in_seek_access_method(
     .transpose()
 }
 
-/// Add the cost of ready `WHERE` conditions.
-fn cost_with_where_work(
-    method: &AccessMethod,
-    ready_where: &[(usize, usize)],
-    input_cardinality: f64,
-    params: &CostModelParams,
-) -> Cost {
-    let used_steps: usize = ready_where
-        .iter()
-        .filter(|(term_idx, _)| method.consumed_where_terms.get(*term_idx))
-        .map(|(_, step_count)| step_count)
-        .sum();
-    let remaining_steps: usize = ready_where
-        .iter()
-        .filter(|(term_idx, _)| !method.consumed_where_terms.get(*term_idx))
-        .map(|(_, step_count)| step_count)
-        .sum();
-    let output_rows = input_cardinality * method.estimated_rows_per_outer_row;
-    let used_rows = input_cardinality.max(output_rows);
-    let work = used_rows * used_steps as f64 + output_rows * remaining_steps as f64;
-    method.cost + Cost(work * params.cpu_cost_per_where_step)
+/// The `WHERE` conditions that can already run at this point in the join order,
+/// and how many rows they see.
+#[derive(Debug, Clone, Copy)]
+pub(super) struct ReadyWhereWork<'a> {
+    /// Pairs of `WHERE` term index and the number of steps that term costs.
+    pub terms: &'a [(usize, usize)],
+    pub input_cardinality: f64,
+    pub params: &'a CostModelParams,
 }
 
-pub(super) fn add_where_cost(
-    method: &mut AccessMethod,
-    ready_where: &[(usize, usize)],
-    input_cardinality: f64,
-    params: &CostModelParams,
-) {
-    method.cost = cost_with_where_work(method, ready_where, input_cardinality, params);
+impl ReadyWhereWork<'_> {
+    /// The cost of an access method plus the ready `WHERE` conditions.
+    fn total_cost(&self, method: &AccessMethod) -> Cost {
+        let used_steps: usize = self
+            .terms
+            .iter()
+            .filter(|(term_idx, _)| method.consumed_where_terms.get(*term_idx))
+            .map(|(_, step_count)| step_count)
+            .sum();
+        let remaining_steps: usize = self
+            .terms
+            .iter()
+            .filter(|(term_idx, _)| !method.consumed_where_terms.get(*term_idx))
+            .map(|(_, step_count)| step_count)
+            .sum();
+        let output_rows = self.input_cardinality * method.estimated_rows_per_outer_row;
+        let used_rows = self.input_cardinality.max(output_rows);
+        let work = used_rows * used_steps as f64 + output_rows * remaining_steps as f64;
+        method.cost + Cost(work * self.params.cpu_cost_per_where_step)
+    }
+
+    pub(super) fn add_cost_to(&self, method: &mut AccessMethod) {
+        method.cost = self.total_cost(method);
+    }
 }
 
-fn replace_if_cheaper(
-    best_method: &mut AccessMethod,
-    best_cost: &mut Cost,
+/// The cheapest access method found so far for one table.
+struct BestAccessMethod<'a> {
     method: AccessMethod,
-    ready_where: &[(usize, usize)],
-    input_cardinality: f64,
-    params: &CostModelParams,
-) {
-    let cost = cost_with_where_work(&method, ready_where, input_cardinality, params);
-    if cost < *best_cost {
-        *best_method = method;
-        *best_cost = cost;
+    cost_with_where_work: Cost,
+    where_work: ReadyWhereWork<'a>,
+}
+
+impl<'a> BestAccessMethod<'a> {
+    fn new(method: AccessMethod, where_work: ReadyWhereWork<'a>) -> Self {
+        let cost_with_where_work = where_work.total_cost(&method);
+        Self {
+            method,
+            cost_with_where_work,
+            where_work,
+        }
+    }
+
+    fn replace_if_cheaper(&mut self, method: AccessMethod) {
+        let cost = self.where_work.total_cost(&method);
+        if cost < self.cost_with_where_work {
+            self.method = method;
+            self.cost_with_where_work = cost;
+        }
     }
 }
 
@@ -870,26 +885,32 @@ fn find_best_access_method_for_btree(
             where_clause,
         )?;
     }
-    let mut best_access_method = AccessMethod {
-        cost: best.cost,
-        estimated_rows_per_outer_row,
-        consumed_where_terms,
-        params: AccessMethodParams::BTreeTable {
-            iter_dir: best.iter_dir,
-            index: best.index,
-            build_index: false,
-            constraint_refs: best.constraint_refs.into_vec(),
-        },
+    let where_work = ReadyWhereWork {
+        terms: ready_where,
+        input_cardinality,
+        params,
     };
-    let mut best_cost_with_filters =
-        cost_with_where_work(&best_access_method, ready_where, input_cardinality, params);
+    let mut best_so_far = BestAccessMethod::new(
+        AccessMethod {
+            cost: best.cost,
+            estimated_rows_per_outer_row,
+            consumed_where_terms,
+            params: AccessMethodParams::BTreeTable {
+                iter_dir: best.iter_dir,
+                index: best.index,
+                build_index: false,
+                constraint_refs: best.constraint_refs.into_vec(),
+            },
+        },
+        where_work,
+    );
 
     let is_full_outer = rhs_table
         .join_info
         .as_ref()
         .is_some_and(|join_info| join_info.is_full_outer());
     let uses_full_table_scan = matches!(
-        &best_access_method.params,
+        &best_so_far.method.params,
         AccessMethodParams::BTreeTable {
             index: None,
             build_index: false,
@@ -959,14 +980,7 @@ fn find_best_access_method_for_btree(
                     constraint_refs: Vec::new(),
                 },
             };
-            replace_if_cheaper(
-                &mut best_access_method,
-                &mut best_cost_with_filters,
-                temporary_index,
-                ready_where,
-                input_cardinality,
-                params,
-            );
+            best_so_far.replace_if_cheaper(temporary_index);
         }
     }
 
@@ -980,7 +994,7 @@ fn find_best_access_method_for_btree(
             input_cardinality,
             base_row_count,
             params,
-            best_cost_with_filters,
+            best_so_far.cost_with_where_work,
         )? {
             let mut in_seek_method = in_seek_method;
             if let AccessMethodParams::InSeek { index, .. } = &in_seek_method.params {
@@ -993,14 +1007,7 @@ fn find_best_access_method_for_btree(
                     )?;
                 }
             }
-            replace_if_cheaper(
-                &mut best_access_method,
-                &mut best_cost_with_filters,
-                in_seek_method,
-                ready_where,
-                input_cardinality,
-                params,
-            );
+            best_so_far.replace_if_cheaper(in_seek_method);
         }
 
         if let Some(multi_idx_method) = consider_multi_index_union(
@@ -1013,18 +1020,11 @@ fn find_best_access_method_for_btree(
             input_cardinality,
             base_row_count,
             params,
-            best_cost_with_filters,
+            best_so_far.cost_with_where_work,
             lhs_mask,
             analyze_stats,
         )? {
-            replace_if_cheaper(
-                &mut best_access_method,
-                &mut best_cost_with_filters,
-                multi_idx_method,
-                ready_where,
-                input_cardinality,
-                params,
-            );
+            best_so_far.replace_if_cheaper(multi_idx_method);
         }
 
         if let Some(multi_idx_and_method) = consider_multi_index_intersection(
@@ -1037,22 +1037,15 @@ fn find_best_access_method_for_btree(
             input_cardinality,
             base_row_count,
             params,
-            best_cost_with_filters,
+            best_so_far.cost_with_where_work,
             lhs_mask,
             analyze_stats,
         )? {
-            replace_if_cheaper(
-                &mut best_access_method,
-                &mut best_cost_with_filters,
-                multi_idx_and_method,
-                ready_where,
-                input_cardinality,
-                params,
-            );
+            best_so_far.replace_if_cheaper(multi_idx_and_method);
         }
     }
 
-    Ok(Some(best_access_method))
+    Ok(Some(best_so_far.method))
 }
 
 fn find_best_access_method_for_vtab(
@@ -1898,8 +1891,13 @@ fn find_best_access_method_for_subquery(
             iter_dir,
         },
     };
-    let scan_cost = cost_with_where_work(&scan_method, ready_where, input_cardinality, params);
-    let index_cost = cost_with_where_work(&index_method, ready_where, input_cardinality, params);
+    let where_work = ReadyWhereWork {
+        terms: ready_where,
+        input_cardinality,
+        params,
+    };
+    let scan_cost = where_work.total_cost(&scan_method);
+    let index_cost = where_work.total_cost(&index_method);
 
     if index_cost >= scan_cost + order_satisfiability_bonus {
         Ok(Some(scan_method))

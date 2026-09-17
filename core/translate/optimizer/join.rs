@@ -6,7 +6,7 @@ use smallvec::SmallVec;
 use turso_parser::ast::{Operator, SubqueryType, TableInternalId};
 
 use super::{
-    access_method::{add_where_cost, find_best_access_method_for_join_order, AccessMethod},
+    access_method::{find_best_access_method_for_join_order, AccessMethod, ReadyWhereWork},
     constraints::{usable_constraints_for_lhs_mask, TableConstraints},
     cost_params::CostModelParams,
     order::OrderTarget,
@@ -554,6 +554,11 @@ fn join_lhs_and_rhs(
         rhs_table_number,
         rhs_table_reference.internal_id,
     );
+    let where_work = ReadyWhereWork {
+        terms: &ready_where,
+        input_cardinality,
+        params,
+    };
 
     let Some(method) = find_best_access_method_for_join_order(
         rhs_table_reference,
@@ -579,12 +584,7 @@ fn join_lhs_and_rhs(
     let lhs_cost = lhs.map_or(Cost(0.0), |l| l.cost);
     // If we have a previous table, consider hash join as an alternative
     let mut best_access_method = method;
-    add_where_cost(
-        &mut best_access_method,
-        &ready_where,
-        input_cardinality,
-        params,
-    );
+    where_work.add_cost_to(&mut best_access_method);
 
     // Reuse for hash cost and output cardinality computation
     // Self-constraints are conditions comparing columns within the same table
@@ -1006,12 +1006,7 @@ fn join_lhs_and_rhs(
                             );
                         }
                     }
-                    add_where_cost(
-                        &mut hash_join_method,
-                        &ready_where,
-                        input_cardinality,
-                        params,
-                    );
+                    where_work.add_cost_to(&mut hash_join_method);
                     // FULL OUTER requires hash join for the unmatched-build scan.
                     let is_full_outer = matches!(
                         &hash_join_method.params,
@@ -1055,7 +1050,7 @@ fn join_lhs_and_rhs(
                     where_covered: candidate.where_covered,
                 },
             };
-            add_where_cost(&mut index_method, &ready_where, input_cardinality, params);
+            where_work.add_cost_to(&mut index_method);
             if index_method.cost < best_access_method.cost {
                 best_access_method = index_method;
             }
