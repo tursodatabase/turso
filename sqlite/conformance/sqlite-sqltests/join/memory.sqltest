@@ -827,6 +827,34 @@ expect pattern {
     (?s)HASH JOIN indexed_hash_child AS child.*SCAN indexed_hash_parent AS parent
 }
 
+@skip-if sqlite "Turso can use a hash join when an index cannot seek by the join column"
+@skip-if mvcc "MVCC does not reload sqlite_stat1 after this test changes it"
+test index-suffix-does-not-prevent-hash-join {
+    CREATE TABLE suffix_hash_parent(id INTEGER PRIMARY KEY, selected INTEGER);
+    CREATE TABLE suffix_hash_child(
+        group_id INTEGER,
+        parent_id INTEGER,
+        payload INTEGER,
+        PRIMARY KEY(group_id, parent_id)
+    );
+    ANALYZE;
+    DELETE FROM sqlite_stat1;
+    INSERT INTO sqlite_stat1(tbl, idx, stat) VALUES
+        ('suffix_hash_parent', NULL, '1000'),
+        ('suffix_hash_child', NULL, '5000000'),
+        ('suffix_hash_child', 'sqlite_autoindex_suffix_hash_child_1', '5000000 5000 1');
+    ANALYZE sqlite_schema;
+
+    EXPLAIN QUERY PLAN
+    SELECT count(*)
+    FROM suffix_hash_parent AS parent
+    JOIN suffix_hash_child AS child ON child.parent_id = parent.id
+    WHERE parent.selected = 1;
+}
+expect pattern {
+    (?s)HASH JOIN suffix_hash_child AS child.*SCAN suffix_hash_parent AS parent
+}
+
 @skip-if sqlite "Turso reports hash join estimates in its JSON plan"
 @skip-if mvcc "MVCC does not reload sqlite_stat1 after this test changes it"
 test unique-composite-hash-key-uses-one-key-estimate {
