@@ -6,6 +6,7 @@ use std::{
 };
 
 use crate::skiplist::SkipMap;
+use crossbeam_epoch as epoch;
 use crossbeam_utils::thread;
 
 #[test]
@@ -276,8 +277,6 @@ fn ordered_iter() {
 
 #[test]
 fn range_inner_next_back_one_guard_covers_a_batch() {
-    use crossbeam_epoch as epoch;
-
     let map: SkipMap<i32, i32> = SkipMap::new();
     for i in 0..2048 {
         map.insert(i, i);
@@ -321,8 +320,6 @@ fn range_inner_next_back_one_guard_covers_a_batch() {
 
 #[test]
 fn range_inner_next_one_guard_covers_a_batch() {
-    use crossbeam_epoch as epoch;
-
     let map: SkipMap<i32, i32> = SkipMap::new();
     for i in 0..2048 {
         map.insert(i, i);

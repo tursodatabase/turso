@@ -3702,21 +3702,10 @@ mod tests {
             },
         );
 
-        // More than one chunk worth of committed rows so collection must preempt.
         let table_id = MVTableId::from(-2);
         let row_count = COLLECT_PREEMPTION_THRESHOLD + 10;
         for i in 0..row_count as i64 {
-            let version = committed_table_row_version(table_id, i);
-            let mut versions =
-                <crate::mvcc::database::RowVersionChain<crate::alloc::DynAllocator> as crate::alloc::TursoVecInExt<
-                    RowVersion,
-                    crate::alloc::DynAllocator,
-                >>::new_in(crate::alloc::DynAllocator::default());
-            versions.push(version);
-            mvstore.rows.insert(
-                RowID::new(table_id, RowKey::Int(i)),
-                Arc::new(RwLock::new(versions)),
-            );
+            insert_row_version(&mvstore, committed_table_row_version(table_id, i));
         }
 
         // The first chunk fills up before the scan finishes, so it must yield.
