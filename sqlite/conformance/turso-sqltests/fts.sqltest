@@ -3,6 +3,29 @@
 @skip-file-if mvcc "index methods not supported in mvcc mode"
 
 @backend cli
+test fts-ranked-limit-offset {
+    CREATE TABLE d(id INTEGER PRIMARY KEY, body TEXT);
+    CREATE INDEX fx ON d USING fts(body);
+    INSERT INTO d VALUES (1, 'x'), (2, 'x x'), (3, 'x x x'), (4, 'x x x x');
+    SELECT id FROM d WHERE fts_match(body, 'x') ORDER BY fts_score(body, 'x') DESC;
+    SELECT id FROM d WHERE fts_match(body, 'x') ORDER BY fts_score(body, 'x') DESC LIMIT 2 OFFSET 1;
+    SELECT id FROM d WHERE fts_match(body, 'x') ORDER BY fts_score(body, 'x') DESC LIMIT 2 OFFSET 3;
+    SELECT id FROM d WHERE fts_match(body, 'x') ORDER BY fts_score(body, 'x') DESC LIMIT 2 OFFSET 4;
+    SELECT id FROM d WHERE fts_match(body, 'x') ORDER BY fts_score(body, 'x') DESC LIMIT 2 OFFSET 0;
+}
+expect {
+    4
+    3
+    2
+    1
+    3
+    2
+    1
+    4
+    3
+}
+
+@backend cli
 test fts-delete-where-match {
     CREATE TABLE t (id INTEGER PRIMARY KEY, x TEXT);
     CREATE INDEX t_idx ON t USING fts (x);

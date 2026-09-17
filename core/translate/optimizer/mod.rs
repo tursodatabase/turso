@@ -374,6 +374,7 @@ fn try_match_index_method_pattern(
             let captured = try_capture_parameters(pattern_off, query_off)?;
             parameters.extend(captured);
         }
+        (None, Some(_)) if pattern_has_limit => return None,
         (None, Some(_)) | (None, None) => {}
     }
 
