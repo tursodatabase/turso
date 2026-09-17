@@ -15,6 +15,9 @@ up a linear axis that starts at zero. A bar is the median over the runs, and its
 whiskers reach the fastest and the slowest run; with a single CSV there
 are no whiskers. Under the bars sits a table with the median of every
 bar, one row per engine and one column per query, lined up with the bars.
+In every column the fastest median is in bold, as TPC-H result tables
+usually mark the winner; when the fastest medians round to the same
+number no cell is bold.
 A query an engine did not run (`NA` in the CSV) has no bar and `n/a` in
 its cell, so a gap is never mistaken for a fast run.
 
@@ -141,6 +144,7 @@ class Figure:
         # Headroom over the slowest run so the legend fits over the tallest bar.
         self.ymax = max(highs) * 1.15
         self.bar_width = GROUP_WIDTH / len(self.series)
+        self.fastest = fastest_cells(self.series, len(self.queries))
 
     def offset(self, index):
         """How far the bars of the engine at `index` sit from the query's centre."""
@@ -185,6 +189,10 @@ class Figure:
         for cell in table.get_celld().values():
             cell.set_linewidth(0.4)
             cell.set_edgecolor("black")
+        for row, s in enumerate(self.series, start=1):
+            for column, fastest in enumerate(self.fastest[row - 1]):
+                if fastest:
+                    table[row, column].get_text().set_fontweight("bold")
         ax.legend(loc="upper left", ncol=len(self.series), frameon=False,
                   handlelength=1.0, handletextpad=0.4, columnspacing=1.8)
         fig.savefig(output, bbox_inches="tight")
@@ -237,7 +245,9 @@ class Figure:
         `axis description cs`, whose x runs 0 to 1 across the axis, shifted
         down from the axis bottom by whole rows of `TABLE_ROW_HEIGHT`."""
         n = len(self.queries)
-        rows = [self.queries] + [[cell_text(t) for t in s.times] for s in self.series]
+        rows = [self.queries] + [[rf"\textbf{{{cell_text(t)}}}" if fastest else cell_text(t)
+                                  for t, fastest in zip(s.times, self.fastest[i])]
+                                 for i, s in enumerate(self.series)]
         labels = [""] + [s.label for s in self.series]
         out = [
             r"\begin{scope}[every node/.style={font=\tiny, scale=0.85, transform shape, inner sep=0pt},"
@@ -259,6 +269,22 @@ class Figure:
                            rf"axis description cs:0,0) {{{label}}};")
         out.append(r"\end{scope}")
         return out
+
+
+def fastest_cells(series, query_count):
+    """For every engine and query, whether the engine's median is the one
+    fastest median for the query as the table prints it. Comparing the
+    printed numbers means two medians that show up the same are a tie."""
+    fastest = [[False] * query_count for _ in series]
+    for q in range(query_count):
+        shown = [(float(cell_text(s.times[q])), i) for i, s in enumerate(series) if s.times[q] is not None]
+        if len(shown) < 2:
+            continue
+        best = min(t for t, _ in shown)
+        winners = [i for t, i in shown if t == best]
+        if len(winners) == 1:
+            fastest[winners[0]][q] = True
+    return fastest
 
 
 def cell_text(time):
