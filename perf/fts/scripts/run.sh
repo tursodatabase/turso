@@ -16,6 +16,10 @@ results=results.csv
 case "${FLAMEGRAPH:-0}" in
     0) ;;
     1)
+        if ! command -v inferno-flamegraph >/dev/null; then
+            echo 'Install the external renderer with: cargo install inferno --locked' >&2
+            exit 1
+        fi
         cargo_options=(--features flamegraph)
         set -- "$@" --flamegraph "$output/profiles"
         results=profiled-results.csv
@@ -32,10 +36,17 @@ esac
     printf '%q ' "$@"
     printf '\n'
     if command -v lscpu >/dev/null; then lscpu; fi
+    if [[ "${FLAMEGRAPH:-0}" == 1 ]]; then
+        printf 'flamegraph_renderer=%s\n' "$(command -v inferno-flamegraph)"
+    fi
 } > "$output/environment.txt"
 cargo run --manifest-path "$root/Cargo.toml" --profile "$profile" -p fts-benchmark "${cargo_options[@]}" -- "$@" \
     > "$output/$results" 2> "$output/bench.log"
 if [[ "${FLAMEGRAPH:-0}" == 0 ]]; then
     uv run "$root/perf/fts/plot/plot-fts.py" "$output/results.csv" \
         -o "$output/fts.png" -o "$output/fts.pdf" -o "$output/fts.svg"
+else
+    for folded in "$output"/profiles/*.folded; do
+        inferno-flamegraph < "$folded" > "${folded%.folded}.svg"
+    done
 fi

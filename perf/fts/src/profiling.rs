@@ -47,7 +47,6 @@ pub fn finish(profiler: Option<pprof::ProfilerGuard<'static>>, path: Option<&Pat
         writeln!(folded, "{stack} {count}")?;
     }
     folded.flush()?;
-    report.flamegraph(File::create_new(path.with_extension("svg"))?)?;
     eprintln!(
         "profile {}: {} CPU samples",
         path.display(),
@@ -61,7 +60,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn records_worker_cpu_and_preserves_sample_counts() -> Result<()> {
+    fn records_worker_cpu_without_rendering_svg() -> Result<()> {
         use std::time::{Duration, Instant};
 
         let directory = tempfile::tempdir()?;
@@ -87,12 +86,8 @@ mod tests {
             .map(|line| line.rsplit_once(' ').unwrap().1.parse::<usize>().unwrap())
             .sum();
         assert!(count > 0);
-        assert!(folded.contains("records_worker_cpu_and_preserves_sample_counts"));
-        let svg = std::fs::read_to_string(path.with_extension("svg"))?;
-        assert!(svg.contains("<svg"));
-        let total = svg.split("<title>all (").nth(1).unwrap();
-        let total = total.split(" samples,").next().unwrap().replace(',', "");
-        assert_eq!(total.parse::<usize>()?, count);
+        assert!(folded.contains("records_worker_cpu_without_rendering_svg"));
+        assert!(!path.with_extension("svg").exists());
         Ok(())
     }
 }

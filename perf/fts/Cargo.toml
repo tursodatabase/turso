@@ -11,8 +11,10 @@ flamegraph = ["dep:pprof"]
 anyhow.workspace = true
 clap = { workspace = true, features = ["derive"] }
 memory-benchmark = { path = "../memory", features = ["fts"] }
-pprof = { version = "0.14.0", features = ["flamegraph"], optional = true }
 rusqlite.workspace = true
 serde_json.workspace = true
 tempfile.workspace = true
 tokio = { workspace = true, features = ["full"] }
+
+[target.'cfg(any(target_os = "linux", target_os = "macos"))'.dependencies]
+pprof = { version = "0.15.0", optional = true }

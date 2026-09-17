@@ -8,7 +8,7 @@ use std::io::{Write, stdout};
 use std::time::Instant;
 
 mod latency;
-#[cfg(feature = "flamegraph")]
+#[cfg(all(feature = "flamegraph", any(target_os = "linux", target_os = "macos")))]
 mod profiling;
 mod sqlite;
 
@@ -42,7 +42,7 @@ struct Args {
         default_value = "rare,common,and,or,phrase,ranked"
     )]
     cases: Vec<QueryCase>,
-    #[cfg(feature = "flamegraph")]
+    #[cfg(all(feature = "flamegraph", any(target_os = "linux", target_os = "macos")))]
     #[arg(long)]
     flamegraph: Option<std::path::PathBuf>,
 }
@@ -106,11 +106,11 @@ async fn run(mut args: Args) -> Result<()> {
             (0, seconds)
         }
     };
-    #[cfg(feature = "flamegraph")]
+    #[cfg(all(feature = "flamegraph", any(target_os = "linux", target_os = "macos")))]
     let profiled = args.flamegraph.is_some();
-    #[cfg(not(feature = "flamegraph"))]
+    #[cfg(not(all(feature = "flamegraph", any(target_os = "linux", target_os = "macos"))))]
     let profiled = false;
-    #[cfg(feature = "flamegraph")]
+    #[cfg(all(feature = "flamegraph", any(target_os = "linux", target_os = "macos")))]
     if let Some(directory) = &args.flamegraph {
         std::fs::create_dir(directory)?;
     }
@@ -122,7 +122,7 @@ async fn run(mut args: Args) -> Result<()> {
     for repetition in 1..=args.runs {
         for &query in &args.cases {
             for &target in &args.targets {
-                #[cfg(feature = "flamegraph")]
+                #[cfg(all(feature = "flamegraph", any(target_os = "linux", target_os = "macos")))]
                 let profile_path = args.flamegraph.as_ref().map(|directory| {
                     directory.join(format!(
                         "{}-{}-{}-c{}-run{}-{}",
@@ -146,7 +146,10 @@ async fn run(mut args: Args) -> Result<()> {
                 let mut measured = match target {
                     Target::SqliteWal => {
                         let mut workload = sqlite::SqliteWorkload::prepare(config).await?;
-                        #[cfg(feature = "flamegraph")]
+                        #[cfg(all(
+                            feature = "flamegraph",
+                            any(target_os = "linux", target_os = "macos")
+                        ))]
                         let profiler = profiling::start(profiled)?;
                         let measured = match args.benchmark {
                             Benchmark::Search => latency::measure(
@@ -159,13 +162,19 @@ async fn run(mut args: Args) -> Result<()> {
                                     .await?
                             }
                         };
-                        #[cfg(feature = "flamegraph")]
+                        #[cfg(all(
+                            feature = "flamegraph",
+                            any(target_os = "linux", target_os = "macos")
+                        ))]
                         profiling::finish(profiler, profile_path.as_deref())?;
                         measured
                     }
                     Target::TursoWal | Target::TursoMvcc => {
                         let workload = FtsWorkload::prepare(config, &mut ()).await?;
-                        #[cfg(feature = "flamegraph")]
+                        #[cfg(all(
+                            feature = "flamegraph",
+                            any(target_os = "linux", target_os = "macos")
+                        ))]
                         let profiler = profiling::start(profiled)?;
                         let measured = match args.benchmark {
                             Benchmark::Search => latency::measure(
@@ -188,7 +197,10 @@ async fn run(mut args: Args) -> Result<()> {
                                 .await?
                             }
                         };
-                        #[cfg(feature = "flamegraph")]
+                        #[cfg(all(
+                            feature = "flamegraph",
+                            any(target_os = "linux", target_os = "macos")
+                        ))]
                         profiling::finish(profiler, profile_path.as_deref())?;
                         workload.finish(&mut ());
                         measured

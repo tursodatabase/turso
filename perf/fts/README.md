@@ -149,8 +149,18 @@ Allocation tracking changes scheduling and adds overhead; never use its elapsed 
 ## CPU flamegraphs
 
 Set `FLAMEGRAPH=1` to build with the optional `flamegraph` feature and collect CPU stack samples at 99 Hz.
-This uses the repository's `pprof` dependency on Linux or macOS, without `perf`, root access, or cache clearing.
+This uses `pprof` on Linux or macOS, without `perf`, root access, or cache clearing.
+FTS uses version 0.15 so Cargo does not combine its features with the older benchmark dependency that enables Inferno.
 The default build remains optimized `bench-profile` with debug information for function names.
+Install the external SVG renderer before running the script:
+
+```sh
+cargo install inferno --locked
+```
+
+The Rust binary writes folded stacks without linking Inferno.
+The script calls `inferno-flamegraph` after measurement and records its executable path.
+Inferno remains a separate developer tool because its CDDL license is not on the repository's dependency allowlist.
 Select the journal modes, query cases, and connection count you want to investigate:
 
 ```sh
@@ -168,6 +178,8 @@ Open the SVG in a browser; click a frame to zoom and use Search to find a functi
 Frame width shows the fraction of collected CPU samples containing that frame, not elapsed latency.
 The horizontal position is not a timeline.
 Use the folded counts for aggregate analysis, counting a function only once per stack for inclusive totals.
+Direct binary runs produce only `.folded` files.
+To render a saved profile separately, run `inferno-flamegraph < profile.folded > profile.svg`.
 
 Sampling starts after fixture creation, index building, reopening, and warm-up.
 It stops before fixture cleanup, result validation, and percentile calculation.
