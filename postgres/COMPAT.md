@@ -341,7 +341,7 @@ Upgrade is not supported.
 
 | Feature | Status | Notes |
 |---------|--------|-------|
-| COPY table FROM 'file' (text format) | ✅ Supported | DELIMITER, NULL string, HEADER, column lists, backslash escapes, `\.` end-of-data marker; atomic (rolls back on malformed rows) |
+| COPY table FROM 'file' (text format) | 🟡 Partial | Embedded and CLI connections: DELIMITER, NULL string, HEADER, column lists, backslash escapes, `\.` end-of-data marker; atomic (rolls back on malformed rows). The `tursopg --server` listener rejects filesystem `COPY FROM`. |
 | COPY from/to STDIN/STDOUT | ❌ Not supported | Rejected with an error; no wire-level COPY sub-protocol |
 | COPY FROM ... WHERE | ❌ Not supported | |
 | COPY ... ON_ERROR | ❌ Not supported | |
