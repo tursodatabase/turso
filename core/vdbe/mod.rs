@@ -458,6 +458,14 @@ impl Register {
         }
     }
 
+    #[inline(always)]
+    pub fn set_numeric(&mut self, val: Numeric) {
+        match val {
+            Numeric::Integer(i) => self.set_int(i),
+            Numeric::Float(f) => self.set_float(f),
+        }
+    }
+
     /// Set the value of the register to a Text,
     /// reusing Register::Value(Value::Text(_)) buffer if possible.
     #[inline]
