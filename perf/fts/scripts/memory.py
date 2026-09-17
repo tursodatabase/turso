@@ -2,9 +2,9 @@ import argparse
 import csv
 import json
 import os
-from pathlib import Path
 import platform
 import subprocess
+from pathlib import Path
 
 
 def main():
@@ -26,12 +26,7 @@ def main():
     root = Path(__file__).resolve().parents[3]
     args.output.mkdir()
     output = args.output.resolve()
-    metadata = dict(arguments=vars(args) | {"output": str(output)}, machine=platform.platform(),
-                    cpus=os.cpu_count(), allocator="dhat", scope="query-phase Rust allocations")
-    for name, command in (("rustc", ["rustc", "-Vv"]), ("revision", ["git", "rev-parse", "HEAD"]),
-                          ("worktree", ["git", "status", "--short"])):
-        metadata[name] = subprocess.check_output(command, cwd=root, text=True).strip()
-    (output / "environment.json").write_text(json.dumps(metadata, indent=2) + "\n")
+    write_environment(args, root, output)
     csv_paths = []
     for connections in args.connections:
         directory = output / f"c{connections}"
@@ -46,12 +41,37 @@ def main():
                     for mode in modes:
                         stem = directory / f"{mode}-{query}-run{run}"
                         print(f"Heap: c{connections} {mode} {query} run {run}", flush=True)
-                        command = ["cargo", "run", "--profile", args.profile, "-p", "memory-benchmark",
-                                   "--features", "fts", "--bin", "fts-memory", "--",
-                                   "--query", query, "--state", args.state, "--mode", mode,
-                                   "--documents", str(args.documents), "--connections", str(connections),
-                                   "--queries", str(args.queries), "--dhat-file", str(stem) + ".dhat.json"]
-                        with Path(str(stem) + ".json").open("w") as report_file, stem.with_suffix(".log").open("w") as log:
+                        command = [
+                            "cargo",
+                            "run",
+                            "--profile",
+                            args.profile,
+                            "-p",
+                            "memory-benchmark",
+                            "--features",
+                            "fts",
+                            "--bin",
+                            "fts-memory",
+                            "--",
+                            "--query",
+                            query,
+                            "--state",
+                            args.state,
+                            "--mode",
+                            mode,
+                            "--documents",
+                            str(args.documents),
+                            "--connections",
+                            str(connections),
+                            "--queries",
+                            str(args.queries),
+                            "--dhat-file",
+                            str(stem) + ".dhat.json",
+                        ]
+                        with (
+                            Path(str(stem) + ".json").open("w") as report_file,
+                            stem.with_suffix(".log").open("w") as log,
+                        ):
                             subprocess.run(command, cwd=root, stdout=report_file, stderr=log, check=True)
                         report = json.loads(Path(str(stem) + ".json").read_text())
                         row = measurement(report, args.queries, run, args.profile)
@@ -66,25 +86,60 @@ def main():
     subprocess.run(command, cwd=root, check=True)
 
 
+def write_environment(args, root, output):
+    metadata = dict(
+        arguments=vars(args) | {"output": str(output)},
+        machine=platform.platform(),
+        cpus=os.cpu_count(),
+        allocator="dhat",
+        scope="query-phase Rust allocations",
+    )
+    for name, command in (
+        ("rustc", ["rustc", "-Vv"]),
+        ("revision", ["git", "rev-parse", "HEAD"]),
+        ("worktree", ["git", "status", "--short"]),
+    ):
+        metadata[name] = subprocess.check_output(command, cwd=root, text=True).strip()
+    (output / "environment.json").write_text(json.dumps(metadata, indent=2) + "\n")
+
+
 def measurement(report, queries_per_connection, run, profile):
     if report["queries"] != queries_per_connection * report["connections"] or report["transactions"] != 0:
         raise ValueError("memory run did not complete the requested queries")
     documents = report["documents"]
     either = (documents + 1) // 2 + (documents + 2) // 3 - (documents + 5) // 6
-    expected = {"rare": (documents + 99) // 100, "common": documents, "and": (documents + 5) // 6,
-                "or": either, "phrase": (documents + 199) // 200, "ranked": min(10, either)}
+    expected = {
+        "rare": (documents + 99) // 100,
+        "common": documents,
+        "and": (documents + 5) // 6,
+        "or": either,
+        "phrase": (documents + 199) // 200,
+        "ranked": min(10, either),
+    }
     query = report["query"]
     if report["rows_per_query"] != expected[query]:
         raise ValueError("unexpected query result count")
     peak = report["peak_live_query_bytes"]
     if not 0 <= report["retained_query_bytes"] <= peak <= report["total_allocated_bytes"]:
         raise ValueError("inconsistent heap measurements")
-    return dict(benchmark="memory", engine="turso", mode=report["mode"], state=report["state"],
-                documents=documents, connections=report["connections"], queries=report["queries"], run=run,
-                query=query, requested_queries=queries_per_connection, min_seconds=0,
-                debug_assertions=str(profile == "dev").lower(), peak_heap_bytes=peak,
-                retained_heap_bytes=report["retained_query_bytes"],
-                total_allocated_bytes=report["total_allocated_bytes"], total_allocations=report["total_allocations"])
+    return dict(
+        benchmark="memory",
+        engine="turso",
+        mode=report["mode"],
+        state=report["state"],
+        documents=documents,
+        connections=report["connections"],
+        queries=report["queries"],
+        run=run,
+        query=query,
+        requested_queries=queries_per_connection,
+        min_seconds=0,
+        debug_assertions=str(profile == "dev").lower(),
+        peak_heap_bytes=peak,
+        retained_heap_bytes=report["retained_query_bytes"],
+        total_allocated_bytes=report["total_allocated_bytes"],
+        total_allocations=report["total_allocations"],
+    )
 
 
 if __name__ == "__main__":

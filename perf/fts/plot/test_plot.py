@@ -1,8 +1,8 @@
 import csv
 import importlib.util
-from pathlib import Path
 import tempfile
 import unittest
+from pathlib import Path
 
 spec = importlib.util.spec_from_file_location("plot_fts", Path(__file__).with_name("plot-fts.py"))
 plot_fts = importlib.util.module_from_spec(spec)
@@ -27,10 +27,27 @@ class PlotTests(unittest.TestCase):
             return plot_fts.read_runs(paths, percentile) if other is None else plot_fts.read_sweep(paths, percentile)
 
     def rows(self):
-        return [dict(engine="turso", mode="wal", state="warm", documents="103",
-                     connections="1", queries="4", benchmark="throughput", debug_assertions="true",
-                     requested_queries="0", min_seconds="0.001", p50_ms="", p95_ms="", p99_ms="",
-                     run="1", query=query, seconds="0.008") for query in plot_fts.QUERIES]
+        return [
+            dict(
+                engine="turso",
+                mode="wal",
+                state="warm",
+                documents="103",
+                connections="1",
+                queries="4",
+                benchmark="throughput",
+                debug_assertions="true",
+                requested_queries="0",
+                min_seconds="0.001",
+                p50_ms="",
+                p95_ms="",
+                p99_ms="",
+                run="1",
+                query=query,
+                seconds="0.008",
+            )
+            for query in plot_fts.QUERIES
+        ]
 
     def test_throughput_is_completed_queries_per_second(self):
         rows = self.rows() + [dict(row, run="2", queries="8", seconds="0.016") for row in self.rows()]
@@ -38,8 +55,10 @@ class PlotTests(unittest.TestCase):
         self.assertEqual(samples[("turso", "wal")]["rare"], [500.0, 500.0])
 
     def test_search_uses_individual_query_percentiles_not_wall_time_average(self):
-        rows = [dict(row, benchmark="search", requested_queries="4", min_seconds="0",
-                     p50_ms="1", p95_ms="5", p99_ms="6") for row in self.rows()]
+        rows = [
+            dict(row, benchmark="search", requested_queries="4", min_seconds="0", p50_ms="1", p95_ms="5", p99_ms="6")
+            for row in self.rows()
+        ]
         _, samples = self.read(rows)
         self.assertEqual(samples[("turso", "wal")]["rare"], [1.0])
         _, samples = self.read(rows, percentile="p95")
@@ -58,8 +77,10 @@ class PlotTests(unittest.TestCase):
                 self.read(self.rows(), [dict(row, **change) for row in four])
 
     def test_latency_sweep_uses_p99_individual_samples_at_each_connection_count(self):
-        one = [dict(row, benchmark="search", requested_queries="4", min_seconds="0",
-                    p50_ms="1", p95_ms="5", p99_ms="6") for row in self.rows()]
+        one = [
+            dict(row, benchmark="search", requested_queries="4", min_seconds="0", p50_ms="1", p95_ms="5", p99_ms="6")
+            for row in self.rows()
+        ]
         four = [dict(row, connections="4", p50_ms="2", p95_ms="8", p99_ms="11") for row in one]
         configuration, points = self.read(one, four, percentile="p99")
         self.assertEqual(configuration["percentile"], "p99")
@@ -72,8 +93,10 @@ class PlotTests(unittest.TestCase):
         rows = []
         for run, seconds in [("1", "0.004"), ("2", "0.020")]:
             for index, (engine, mode) in enumerate(plot_fts.SERIES, 1):
-                rows.extend(dict(row, run=run, engine=engine, mode=mode,
-                                 seconds=str(float(seconds) * index)) for row in self.rows())
+                rows.extend(
+                    dict(row, run=run, engine=engine, mode=mode, seconds=str(float(seconds) * index))
+                    for row in self.rows()
+                )
         _, samples = self.read(rows)
         self.assertEqual(samples[("sqlite", "wal")]["rare"], [1000.0, 200.0])
         self.assertEqual(samples[("turso", "wal")]["rare"], [500.0, 100.0])
@@ -109,8 +132,10 @@ class PlotTests(unittest.TestCase):
                 self.read(rows)
 
     def test_speedup_uses_ratio_of_medians_and_correct_direction(self):
-        points = {1: {("sqlite", "wal"): {"rare": [4, 8]}, ("turso", "wal"): {"rare": [2, 6]}},
-                  4: {("sqlite", "wal"): {"rare": [3]}, ("turso", "wal"): {"rare": [9]}}}
+        points = {
+            1: {("sqlite", "wal"): {"rare": [4, 8]}, ("turso", "wal"): {"rare": [2, 6]}},
+            4: {("sqlite", "wal"): {"rare": [3]}, ("turso", "wal"): {"rare": [9]}},
+        }
         medians, lows, highs = plot_fts.sweep_values(points, ("turso", "wal"), "rare", "search", True)
         self.assertEqual(list(medians), [1.5, 1 / 3])
         self.assertEqual(list(lows), [1, 1 / 3])
@@ -125,8 +150,10 @@ class PlotTests(unittest.TestCase):
             self.assertEqual(plot_fts.format_value(value), expected)
 
     def test_memory_plots_peak_bytes_as_mib_without_timing(self):
-        one = [dict(row, benchmark="memory", requested_queries="4", min_seconds="0",
-                    peak_heap_bytes="1572864") for row in self.rows()]
+        one = [
+            dict(row, benchmark="memory", requested_queries="4", min_seconds="0", peak_heap_bytes="1572864")
+            for row in self.rows()
+        ]
         for row in one:
             del row["seconds"]
         four = [dict(row, connections="4", queries="16", peak_heap_bytes="5242880") for row in one]
@@ -139,15 +166,30 @@ class PlotTests(unittest.TestCase):
             self.read([dict(row, queries="4") for row in four])
 
     def test_memory_summary_preserves_peak_not_total_or_per_query(self):
-        report = dict(query="common", documents=203, rows_per_query=203, mode="wal", state="warm",
-                      queries=6, connections=3, transactions=0, peak_live_query_bytes=8192,
-                      retained_query_bytes=4096, total_allocated_bytes=48000, total_allocations=700)
+        report = dict(
+            query="common",
+            documents=203,
+            rows_per_query=203,
+            mode="wal",
+            state="warm",
+            queries=6,
+            connections=3,
+            transactions=0,
+            peak_live_query_bytes=8192,
+            retained_query_bytes=4096,
+            total_allocated_bytes=48000,
+            total_allocations=700,
+        )
         row = fts_memory.measurement(report, 2, 1, "bench-profile")
         self.assertEqual(row["peak_heap_bytes"], 8192)
         self.assertEqual(row["queries"], 6)
         self.assertEqual(row["requested_queries"], 2)
-        for change in (dict(queries=2), dict(rows_per_query=202), dict(retained_query_bytes=8193),
-                       dict(total_allocated_bytes=8191)):
+        for change in (
+            dict(queries=2),
+            dict(rows_per_query=202),
+            dict(retained_query_bytes=8193),
+            dict(total_allocated_bytes=8191),
+        ):
             with self.assertRaises(ValueError):
                 fts_memory.measurement(report | change, 2, 1, "bench-profile")
 
