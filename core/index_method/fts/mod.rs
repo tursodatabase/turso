@@ -2321,15 +2321,16 @@ impl FtsCursor {
             .searcher
             .as_ref()
             .expect("searcher built by ensure_searcher");
+        let segments_by_id: HashMap<_, _> = self
+            .segments
+            .iter()
+            .map(|segment| (segment.id(), segment))
+            .collect();
         let term = Term::from_field_i64(self.rowid_field, rowid);
         let mut hits = Vec::new();
         for segment_reader in searcher.segment_readers() {
             let segment_id = segment_reader.segment_id();
-            let Some(segment) = self
-                .segments
-                .iter()
-                .find(|segment| segment.id() == segment_id)
-            else {
+            let Some(segment) = segments_by_id.get(&segment_id) else {
                 continue;
             };
             let inverted = segment_reader
