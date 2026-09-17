@@ -7427,37 +7427,28 @@ impl CursorTrait for BTreeCursor {
                             }
                         }
                     } else {
-                        // Move to child left page
-                        let cell = contents.cell_get(cell_idx, self.usable_space())?;
+                        // Move to child left page.
+                        // Avoid full cell decoding (transmute, varint parsing, record building)
+                        // by directly reading the 4-byte left child pointer.
+                        let left_child_page =
+                            contents.cell_interior_read_left_child_page(cell_idx)?;
 
-                        match cell {
-                            BTreeCell::TableInteriorCell(TableInteriorCell {
-                                left_child_page,
-                                ..
-                            })
-                            | BTreeCell::IndexInteriorCell(IndexInteriorCell {
-                                left_child_page,
-                                ..
-                            }) => {
-                                // Same re-entry handling as the rightmost
-                                // branch above.
-                                match self.pager.read_page(left_child_page as i64)? {
-                                    IOResult::Done((child, c)) => {
-                                        self.stack.advance();
-                                        self.stack.push(child);
-                                        if let Some(c) = c {
-                                            io_yield_one!(c);
-                                        }
-                                    }
-                                    IOResult::IO(IOCompletions(spill_c)) => {
-                                        self.count_state = CountState::Descend {
-                                            target: left_child_page as i64,
-                                        };
-                                        io_yield_one!(spill_c);
-                                    }
+                        // Same re-entry handling as the rightmost
+                        // branch above.
+                        match self.pager.read_page(left_child_page as i64)? {
+                            IOResult::Done((child, c)) => {
+                                self.stack.advance();
+                                self.stack.push(child);
+                                if let Some(c) = c {
+                                    io_yield_one!(c);
                                 }
                             }
-                            _ => unreachable!(),
+                            IOResult::IO(IOCompletions(spill_c)) => {
+                                self.count_state = CountState::Descend {
+                                    target: left_child_page as i64,
+                                };
+                                io_yield_one!(spill_c);
+                            }
                         }
                     }
                 }
@@ -13248,6 +13239,43 @@ mod tests {
         assert_eq!(
             count2, 5,
             "count after additional inserts should be 5, not stale 3"
+        );
+
+        Ok(())
+    }
+
+    /// Verify that count() correctly navigates multi-level B-trees with interior
+    /// pages and reads left-child pointers accurately.
+    #[test]
+    pub fn test_btree_count_multi_level_table() -> Result<()> {
+        let (pager, root_page, _, _) = empty_btree();
+        let num_columns = 1;
+        let mut cursor = BTreeCursor::new_table(pager.clone(), root_page, num_columns);
+
+        // Insert enough records with moderate payload to force multi-level B-tree splits
+        let n = 300;
+        for rowid in 1..=n {
+            let blob = crate::alloc::vec![0xAA; 60];
+            insert_record(&mut cursor, &pager, rowid, Value::Blob(blob))?;
+        }
+
+        // Verify root has split and is indeed an interior page
+        let (root, _) = pager.io.block(|| pager.read_page(root_page))?;
+        while root.is_locked() {
+            pager.io.step()?;
+        }
+        let root_type = root.get_contents().page_type()?;
+        assert!(
+            matches!(root_type, PageType::TableInterior),
+            "expected multi-level tree with TableInterior root, got {:?}",
+            root_type
+        );
+
+        // Count via cursor must accurately traverse interior pages and leaf pages
+        let count = run_until_done(|| cursor.count(), pager.deref())?;
+        assert_eq!(
+            count, n as usize,
+            "multi-level table count must equal the number of inserted records"
         );
 
         Ok(())
