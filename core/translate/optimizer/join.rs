@@ -6,7 +6,9 @@ use smallvec::SmallVec;
 use turso_parser::ast::{Operator, SubqueryType, TableInternalId};
 
 use super::{
-    access_method::{find_best_access_method_for_join_order, AccessMethod, ReadyWhereWork},
+    access_method::{
+        find_best_access_method_for_join_order, AccessMethod, ReadyWhereWork, TableAccessInputs,
+    },
     constraints::{usable_constraints_for_lhs_mask, TableConstraints},
     cost_params::CostModelParams,
     order::OrderTarget,
@@ -561,21 +563,23 @@ fn join_lhs_and_rhs(
     };
 
     let Some(method) = find_best_access_method_for_join_order(
-        rhs_table_reference,
-        rhs_constraints,
-        &lhs_mask,
-        join_order,
+        TableAccessInputs {
+            rhs_table: rhs_table_reference,
+            rhs_constraints,
+            lhs_mask: &lhs_mask,
+            join_order,
+            where_clause,
+            ready_where: &ready_where,
+            available_indexes,
+            table_references,
+            subqueries,
+            schema,
+            analyze_stats,
+            input_cardinality,
+            base_row_count: rhs_base_rows,
+            params,
+        },
         planning_context,
-        where_clause,
-        &ready_where,
-        available_indexes,
-        table_references,
-        subqueries,
-        schema,
-        analyze_stats,
-        input_cardinality,
-        rhs_base_rows,
-        params,
     )?
     else {
         return Ok(None);
@@ -1775,7 +1779,6 @@ pub const GREEDY_JOIN_THRESHOLD: usize = 12;
 /// 2. Greedily adding the remaining table with lowest marginal cost
 ///
 /// Respects outer join ordering constraints.
-#[allow(clippy::too_many_arguments)]
 fn compute_greedy_join_order(
     inputs: JoinPlanningInputs<'_>,
     planning_context: JoinPlanningContext<'_>,
@@ -2187,7 +2190,6 @@ fn get_best_seek_score(
 /// Specialized version of [compute_best_join_order] that just joins tables in the order they are given
 /// in the SQL query. This is used as an upper bound for any other plans -- we can give up enumerating
 /// permutations if they exceed this cost during enumeration.
-#[allow(clippy::too_many_arguments)]
 fn compute_naive_left_deep_plan(
     inputs: JoinPlanningInputs<'_>,
     planning_context: JoinPlanningContext<'_>,

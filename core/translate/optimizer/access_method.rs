@@ -703,6 +703,44 @@ impl ReadyWhereWork<'_> {
     }
 }
 
+/// What choosing the access path for one table on the right of a join reads.
+///
+/// The choice compares several candidate paths, each of which needs most of
+/// these, so they travel together instead of as one parameter each.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct TableAccessInputs<'a> {
+    pub rhs_table: &'a JoinedTable,
+    pub rhs_constraints: &'a TableConstraints,
+    pub lhs_mask: &'a TableMask,
+    pub join_order: &'a [JoinOrderMember],
+    pub where_clause: &'a [WhereTerm],
+    /// Pairs of `WHERE` term index and step count for the terms that can run
+    /// once this table is joined.
+    pub ready_where: &'a [(usize, usize)],
+    pub available_indexes: &'a AvailableIndexes,
+    pub table_references: &'a TableReferences,
+    pub subqueries: &'a [NonFromClauseSubquery],
+    pub schema: &'a Schema,
+    pub analyze_stats: &'a AnalyzeStats,
+    pub input_cardinality: f64,
+    pub base_row_count: RowCountEstimate,
+    pub params: &'a CostModelParams,
+}
+
+impl<'a> TableAccessInputs<'a> {
+    fn rhs_table_idx(&self) -> usize {
+        self.join_order.last().unwrap().original_idx
+    }
+
+    pub(super) fn where_work(&self) -> ReadyWhereWork<'a> {
+        ReadyWhereWork {
+            terms: self.ready_where,
+            input_cardinality: self.input_cardinality,
+            params: self.params,
+        }
+    }
+}
+
 /// The cheapest access method found so far for one table.
 struct BestAccessMethod<'a> {
     method: AccessMethod,
@@ -730,71 +768,34 @@ impl<'a> BestAccessMethod<'a> {
 }
 
 /// Return the best [AccessMethod] for a given join order.
-#[allow(clippy::too_many_arguments)]
 pub fn find_best_access_method_for_join_order(
-    rhs_table: &JoinedTable,
-    rhs_constraints: &TableConstraints,
-    lhs_mask: &TableMask,
-    join_order: &[JoinOrderMember],
+    access: TableAccessInputs<'_>,
     planning_context: JoinPlanningContext<'_>,
-    where_clause: &[WhereTerm],
-    ready_where: &[(usize, usize)],
-    available_indexes: &AvailableIndexes,
-    table_references: &TableReferences,
-    subqueries: &[NonFromClauseSubquery],
-    schema: &Schema,
-    analyze_stats: &AnalyzeStats,
-    input_cardinality: f64,
-    base_row_count: RowCountEstimate,
-    params: &CostModelParams,
 ) -> Result<Option<AccessMethod>> {
-    match &rhs_table.table {
-        Table::BTree(_) => find_best_access_method_for_btree(
-            rhs_table,
-            rhs_constraints,
-            lhs_mask,
-            join_order,
-            planning_context.maybe_order_target,
-            where_clause,
-            ready_where,
-            available_indexes,
-            table_references,
-            subqueries,
-            schema,
-            analyze_stats,
-            input_cardinality,
-            base_row_count,
-            params,
-        ),
+    match &access.rhs_table.table {
+        Table::BTree(_) => {
+            find_best_access_method_for_btree(access, planning_context.maybe_order_target)
+        }
         Table::Virtual(vtab) => find_best_access_method_for_vtab(
             vtab,
-            &rhs_constraints.constraints,
-            join_order,
-            input_cardinality,
-            base_row_count,
-            params,
+            &access.rhs_constraints.constraints,
+            access.join_order,
+            access.input_cardinality,
+            access.base_row_count,
+            access.params,
         ),
-        Table::FromClauseSubquery(subquery) => find_best_access_method_for_subquery(
-            rhs_table,
-            subquery,
-            rhs_constraints,
-            join_order,
-            planning_context,
-            ready_where,
-            schema,
-            input_cardinality,
-            base_row_count,
-            params,
-        ),
+        Table::FromClauseSubquery(subquery) => {
+            find_best_access_method_for_subquery(access, subquery, planning_context)
+        }
         Table::RecursiveCteInput(_) => Ok(Some(AccessMethod {
             cost: estimate_cost_for_scan_or_seek(
                 None,
                 &[],
                 &[],
-                input_cardinality,
+                access.input_cardinality,
                 RowCountEstimate::HardcodedFallback(1.0),
                 false,
-                params,
+                access.params,
                 None,
             ),
             estimated_rows_per_outer_row: 1.0,
@@ -804,25 +805,26 @@ pub fn find_best_access_method_for_join_order(
     }
 }
 
-#[allow(clippy::too_many_arguments)]
 fn find_best_access_method_for_btree(
-    rhs_table: &JoinedTable,
-    rhs_constraints: &TableConstraints,
-    lhs_mask: &TableMask,
-    join_order: &[JoinOrderMember],
+    access: TableAccessInputs<'_>,
     maybe_order_target: Option<&OrderTarget>,
-    where_clause: &[WhereTerm],
-    ready_where: &[(usize, usize)],
-    available_indexes: &AvailableIndexes,
-    table_references: &TableReferences,
-    subqueries: &[NonFromClauseSubquery],
-    schema: &Schema,
-    analyze_stats: &AnalyzeStats,
-    input_cardinality: f64,
-    base_row_count: RowCountEstimate,
-    params: &CostModelParams,
 ) -> Result<Option<AccessMethod>> {
-    let rhs_table_idx = join_order.last().unwrap().original_idx;
+    let TableAccessInputs {
+        rhs_table,
+        rhs_constraints,
+        lhs_mask,
+        where_clause,
+        available_indexes,
+        table_references,
+        subqueries,
+        schema,
+        analyze_stats,
+        input_cardinality,
+        base_row_count,
+        params,
+        ..
+    } = access;
+    let rhs_table_idx = access.rhs_table_idx();
     let best = choose_best_btree_candidate(
         rhs_table,
         rhs_constraints,
@@ -885,11 +887,6 @@ fn find_best_access_method_for_btree(
             where_clause,
         )?;
     }
-    let where_work = ReadyWhereWork {
-        terms: ready_where,
-        input_cardinality,
-        params,
-    };
     let mut best_so_far = BestAccessMethod::new(
         AccessMethod {
             cost: best.cost,
@@ -902,7 +899,7 @@ fn find_best_access_method_for_btree(
                 constraint_refs: best.constraint_refs.into_vec(),
             },
         },
-        where_work,
+        access.where_work(),
     );
 
     let is_full_outer = rhs_table
@@ -1626,20 +1623,22 @@ fn intrinsic_subquery_scan_direction(
 /// like a table-backed row source with a synthesized ephemeral probe index. When
 /// the latter is worthwhile, we materialize the subquery into an EphemeralTable
 /// and later build the probe index lazily in the main-loop open phase.
-#[expect(clippy::too_many_arguments)]
 fn find_best_access_method_for_subquery(
-    rhs_table: &JoinedTable,
+    access: TableAccessInputs<'_>,
     subquery: &FromClauseSubquery,
-    rhs_constraints: &TableConstraints,
-    join_order: &[JoinOrderMember],
     planning_context: JoinPlanningContext<'_>,
-    ready_where: &[(usize, usize)],
-    schema: &Schema,
-    input_cardinality: f64,
-    base_row_count: RowCountEstimate,
-    params: &CostModelParams,
 ) -> Result<Option<AccessMethod>> {
     use super::constraints::ConstraintRef;
+    let TableAccessInputs {
+        rhs_table,
+        rhs_constraints,
+        join_order,
+        schema,
+        input_cardinality,
+        base_row_count,
+        params,
+        ..
+    } = access;
     let maybe_order_target = planning_context.maybe_order_target;
 
     let coroutine_scan_cost = estimate_cost_for_scan_or_seek(
@@ -1891,11 +1890,7 @@ fn find_best_access_method_for_subquery(
             iter_dir,
         },
     };
-    let where_work = ReadyWhereWork {
-        terms: ready_where,
-        input_cardinality,
-        params,
-    };
+    let where_work = access.where_work();
     let scan_cost = where_work.total_cost(&scan_method);
     let index_cost = where_work.total_cost(&index_method);
 
