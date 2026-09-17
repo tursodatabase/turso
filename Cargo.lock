@@ -2251,6 +2251,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "fts-benchmark"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "clap",
+ "memory-benchmark",
+ "pprof 0.15.0",
+ "rusqlite",
+ "serde_json",
+ "tempfile",
+ "tokio",
+]
+
+[[package]]
 name = "funty"
 version = "2.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4567,6 +4581,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "pprof"
+version = "0.15.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "38a01da47675efa7673b032bf8efd8214f1917d89685e07e395ab125ea42b187"
+dependencies = [
+ "aligned-vec",
+ "backtrace",
+ "cfg-if",
+ "findshlibs",
+ "libc",
+ "log",
+ "nix 0.26.4",
+ "once_cell",
+ "smallvec",
+ "spin",
+ "symbolic-demangle",
+ "tempfile",
+ "thiserror 2.0.16",
+]
+
+[[package]]
 name = "ppv-lite86"
 version = "0.2.21"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6082,6 +6117,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d372029cb5195f9ab4e4b9aef550787dce78b124fcaee8d82519925defcd6f0d"
 
 [[package]]
+name = "spin"
+version = "0.10.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "023a211cb3138dbc438680b32560ad89f699977624c9f8dbb95a47d5b4c07dd3"
+dependencies = [
+ "lock_api",
+]
+
+[[package]]
 name = "spki"
 version = "0.7.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -7211,7 +7255,7 @@ dependencies = [
  "parking_lot",
  "pastey",
  "polling",
- "pprof",
+ "pprof 0.14.0",
  "quickcheck",
  "quickcheck_macros",
  "rand 0.9.4",
@@ -7303,7 +7347,7 @@ dependencies = [
  "fallible-iterator 0.3.0",
  "memchr",
  "miette",
- "pprof",
+ "pprof 0.14.0",
  "serde",
  "strum",
  "strum_macros",

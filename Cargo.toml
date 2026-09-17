@@ -41,6 +41,7 @@ members = [
     "testing/concurrent-simulator",
     "perf/throughput",
     "perf/latency",
+    "perf/fts",
     "perf/join-benchmark",
     "perf/encryption",
     "perf/memory",
