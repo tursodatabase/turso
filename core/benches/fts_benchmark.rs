@@ -600,20 +600,149 @@ fn bench_fts_large_merge_boundary(criterion: &mut Criterion) {
     group.finish();
 }
 
+#[turso_macros::codspeed_criterion_benchmark]
+fn bench_fts_fragmented_delete(criterion: &mut Criterion) {
+    let mut group = criterion.benchmark_group("FTS Fragmented Delete");
+    group.sample_size(10);
+    let ids = (0..512)
+        .step_by(16)
+        .map(|id| id.to_string())
+        .collect::<Vec<_>>()
+        .join(",");
+    let sql = format!("DELETE FROM docs WHERE id IN ({ids})");
+
+    for segment_count in [1, 32, 128, 512] {
+        let setup = || {
+            let (temp_dir, db, conn) = setup_fts_fragmented_db(segment_count);
+            let stmt = conn.query(&sql).unwrap().unwrap();
+            (temp_dir, db, conn, stmt)
+        };
+        {
+            let (_temp_dir, db, conn, mut stmt) = setup();
+            run_to_completion(&mut stmt, &db).unwrap();
+            let mut remaining = conn
+                .query("SELECT id FROM docs WHERE (title, body) MATCH 'common'")
+                .unwrap()
+                .unwrap();
+            assert_eq!(run_and_count_rows(&mut remaining, &db).unwrap(), 480);
+            let mut deleted = conn
+                .query(format!(
+                    "SELECT id FROM docs WHERE (title, body) MATCH 'common' AND id IN ({ids})"
+                ))
+                .unwrap()
+                .unwrap();
+            assert_eq!(run_and_count_rows(&mut deleted, &db).unwrap(), 0);
+        }
+        group.bench_function(BenchmarkId::new("delete_32_rows", segment_count), |b| {
+            b.iter_batched(
+                setup,
+                |(temp_dir, db, conn, mut stmt)| {
+                    run_to_completion(&mut stmt, &db).unwrap();
+                    (temp_dir, db, conn, stmt)
+                },
+                BatchSize::PerIteration,
+            );
+        });
+    }
+    group.finish();
+}
+
+#[turso_macros::codspeed_criterion_benchmark]
+fn bench_fts_fragmented_registry_scan(criterion: &mut Criterion) {
+    let mut group = criterion.benchmark_group("FTS Fragmented Registry Scan");
+    group.sample_size(20);
+
+    for segment_count in [1, 32, 128, 512] {
+        let (_temp_dir, db, conn) = setup_fts_fragmented_db(segment_count);
+        group.bench_function(BenchmarkId::new("no_match", segment_count), |b| {
+            b.iter_batched(
+                || {
+                    conn.query("SELECT id FROM docs WHERE (title, body) MATCH 'absent'")
+                        .unwrap()
+                        .unwrap()
+                },
+                |mut stmt| {
+                    assert_eq!(run_and_count_rows(&mut stmt, &db).unwrap(), 0);
+                    stmt
+                },
+                BatchSize::PerIteration,
+            );
+        });
+    }
+    group.finish();
+}
+
+fn setup_fts_fragmented_db(
+    segment_count: usize,
+) -> (TempDir, Arc<Database>, Arc<turso_core::Connection>) {
+    let temp_dir = tempfile::tempdir().unwrap();
+    let db = setup_fts_db(&temp_dir, 0);
+    let conn = db.connect().unwrap();
+    conn.execute("PRAGMA fts_merge_threshold = 0").unwrap();
+    let rows_per_segment = 512 / segment_count;
+    assert_eq!(512 % segment_count, 0);
+    assert!(rows_per_segment <= turso_core::index_method::fts::BATCH_COMMIT_SIZE);
+    for first_id in (0..512).step_by(rows_per_segment) {
+        let values = (first_id..first_id + rows_per_segment)
+            .map(|id| format!("({id}, 'document {id}', 'common content {id}')"))
+            .collect::<Vec<_>>()
+            .join(",");
+        conn.execute(format!("INSERT INTO docs VALUES {values}"))
+            .unwrap();
+    }
+    let mut warm = conn
+        .query("SELECT id FROM docs WHERE (title, body) MATCH 'common'")
+        .unwrap()
+        .unwrap();
+    assert_eq!(run_and_count_rows(&mut warm, &db).unwrap(), 512);
+    #[cfg(feature = "test_helper")]
+    {
+        conn.execute("BEGIN").unwrap();
+        conn.execute("SELECT count(*) FROM docs").unwrap();
+        let mut dumper = turso_core::index_method::fts::FtsBackingRowDumper::new(
+            &conn,
+            turso_core::MAIN_DB_ID,
+            "docs_fts",
+        )
+        .unwrap();
+        loop {
+            match dumper.step().unwrap() {
+                turso_core::IOResult::Done(()) => break,
+                turso_core::IOResult::IO(completions) => {
+                    while !completions.finished() {
+                        db.io.step().unwrap();
+                    }
+                }
+            }
+        }
+        assert_eq!(
+            dumper
+                .rows
+                .iter()
+                .filter(|(path, _, _, _)| path.starts_with("fts2/seg/"))
+                .count(),
+            segment_count
+        );
+        drop(dumper);
+        conn.execute("ROLLBACK").unwrap();
+    }
+    (temp_dir, db, conn)
+}
+
 #[cfg(not(feature = "codspeed"))]
 criterion_group! {
     name = fts_benches;
     config = Criterion::default()
         .with_profiler(PProfProfiler::new(100, Output::Flamegraph(None)))
         .sample_size(50);
-    targets = bench_fts_cold_query, bench_fts_warm_query, bench_fts_connection_pool_query, bench_fts_query_selectivity, bench_fts_insert_then_query, bench_fts_segment_churn_query, bench_fts_single_row_commit_churn, bench_fts_large_merge_boundary
+    targets = bench_fts_cold_query, bench_fts_warm_query, bench_fts_connection_pool_query, bench_fts_query_selectivity, bench_fts_insert_then_query, bench_fts_segment_churn_query, bench_fts_single_row_commit_churn, bench_fts_large_merge_boundary, bench_fts_fragmented_delete, bench_fts_fragmented_registry_scan
 }
 
 #[cfg(feature = "codspeed")]
 criterion_group! {
     name = fts_benches;
     config = Criterion::default().sample_size(50);
-    targets = bench_fts_cold_query, bench_fts_warm_query, bench_fts_connection_pool_query, bench_fts_query_selectivity, bench_fts_insert_then_query, bench_fts_segment_churn_query, bench_fts_single_row_commit_churn, bench_fts_large_merge_boundary
+    targets = bench_fts_cold_query, bench_fts_warm_query, bench_fts_connection_pool_query, bench_fts_query_selectivity, bench_fts_insert_then_query, bench_fts_segment_churn_query, bench_fts_single_row_commit_churn, bench_fts_large_merge_boundary, bench_fts_fragmented_delete, bench_fts_fragmented_registry_scan
 }
 
 criterion_main!(fts_benches);
