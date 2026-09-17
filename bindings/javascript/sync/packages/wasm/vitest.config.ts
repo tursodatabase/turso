@@ -1,4 +1,5 @@
 import { defineConfig } from 'vitest/config'
+import { playwright } from '@vitest/browser-playwright'
 
 const DEFAULT_LOCAL_SYNC_SERVER_URL = 'http://localhost:10001';
 const DEFAULT_LOCAL_MVCC_SYNC_SERVER_URL = 'http://localhost:10002';
@@ -21,7 +22,7 @@ export default defineConfig({
     globalSetup: './turso-server-setup.ts',
     browser: {
       enabled: true,
-      provider: 'playwright',
+      provider: playwright(),
       instances: [
         { browser: 'chromium' },
         { browser: 'firefox' }

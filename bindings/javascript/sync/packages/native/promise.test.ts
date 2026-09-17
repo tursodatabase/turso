@@ -55,7 +55,7 @@ test.skipIf(process.env.LOCAL_SYNC_SERVER)('partial sync concurrency', async ({ 
     expect(values).toEqual(new Array(16).fill([{ cnt: 2000 }]))
 })
 
-test.skipIf(process.env.LOCAL_SYNC_SERVER)('partial sync (prefix bootstrap strategy)', async ({ server }) => {
+test.skipIf(process.env.LOCAL_SYNC_SERVER)('partial sync (prefix bootstrap strategy)', { timeout: 300_000 }, async ({ server }) => {
     {
         const db = await connect({
             path: ':memory:',
@@ -93,7 +93,7 @@ test.skipIf(process.env.LOCAL_SYNC_SERVER)('partial sync (prefix bootstrap strat
 
     expect(await (await db.prepare("SELECT COUNT(*) as cnt FROM partial")).all()).toEqual([{ cnt: 2001 }]);
     expect((await db.stats()).networkReceivedBytes).toBeGreaterThanOrEqual(2000 * 1024);
-}, { timeout: 300_000 })
+})
 
 test.skipIf(process.env.LOCAL_SYNC_SERVER)('partial sync (prefix bootstrap strategy; large segment size)', async ({ server }) => {
     {
