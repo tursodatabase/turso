@@ -95,6 +95,8 @@ jobs:
         run: scripts/nightly-bench.sh run select_star_benchmark
       - name: Bench sql_functions
         run: scripts/nightly-bench.sh run sql_functions
+      - name: Bench string_expr_benchmark
+        run: scripts/nightly-bench.sh run string_expr_benchmark
       - name: Bench struct_union_benchmark
         run: scripts/nightly-bench.sh run struct_union_benchmark
       - name: Bench struct_union_profile
