@@ -27,7 +27,7 @@ use crate::{
         },
         insert::ROWID_COLUMN,
         optimizer::{
-            access_method::{AccessMethod, AccessMethodParams},
+            access_method::{AccessMethod, AccessMethodParams, BtreeCandidateMemo},
             constraints::{
                 ConstraintUseCandidate, RangeConstraintRef, SeekRangeConstraint, TableConstraints,
             },
@@ -61,7 +61,7 @@ use constraints::{
 use cost::Cost;
 use join::{
     compute_best_join_order_with_context, count_subquery_calls_for_plan, BestJoinOrderResult,
-    CorrelatedSubqueryEstimate, JoinN, JoinPlanningContext,
+    CorrelatedSubqueryEstimate, JoinN, JoinPlanningContext, PrefixWhereMemo,
 };
 use lift_common_subexpressions::lift_common_subexpressions_from_binary_or_terms;
 use order::{
@@ -2508,9 +2508,13 @@ fn find_table_access_plan(
         &mut constraints_per_table,
     )?;
 
+    let btree_candidate_memo = BtreeCandidateMemo::new(table_references.joined_tables().len());
+    let prefix_where_memo = PrefixWhereMemo::new(table_references.joined_tables().len());
     let planning_context = JoinPlanningContext {
         maybe_order_target: maybe_order_target.as_ref(),
         cost_limit,
+        btree_candidate_memo: &btree_candidate_memo,
+        prefix_where_memo: &prefix_where_memo,
     };
 
     let Some(best_join_order_result) = compute_best_join_order_with_context(
