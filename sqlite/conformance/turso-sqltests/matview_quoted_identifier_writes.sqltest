@@ -1,0 +1,204 @@
+@database :memory:
+@requires-file materialized_views ""
+@skip-file-if mvcc "materialized_views not supported with mvcc"
+
+# A write that spells the table name with quotes must maintain the
+# materialized view exactly like the unquoted spelling does.
+test matview-maintained-for-double-quoted-insert {
+    CREATE TABLE person(id INTEGER PRIMARY KEY, team TEXT);
+    CREATE MATERIALIZED VIEW team_size AS
+    SELECT team, COUNT(*) AS cnt FROM person GROUP BY team;
+    INSERT INTO person VALUES (1, 'red');
+    INSERT INTO "person" VALUES (2, 'red');
+    SELECT team, cnt FROM team_size ORDER BY team;
+}
+expect {
+    red|2
+}
+
+test matview-maintained-for-bracket-and-backtick-insert {
+    CREATE TABLE person(id INTEGER PRIMARY KEY, team TEXT);
+    CREATE MATERIALIZED VIEW team_size AS
+    SELECT team, COUNT(*) AS cnt FROM person GROUP BY team;
+    INSERT INTO [person] VALUES (1, 'red');
+    INSERT INTO `person` VALUES (2, 'red');
+    SELECT team, cnt FROM team_size ORDER BY team;
+}
+expect {
+    red|2
+}
+
+# Quoting does not make an identifier case-sensitive in SQLite, so a quoted
+# spelling in a different case still resolves to the same table.
+test matview-maintained-for-quoted-uppercase-insert {
+    CREATE TABLE person(id INTEGER PRIMARY KEY, team TEXT);
+    CREATE MATERIALIZED VIEW team_size AS
+    SELECT team, COUNT(*) AS cnt FROM person GROUP BY team;
+    INSERT INTO "PERSON" VALUES (1, 'red');
+    SELECT team, cnt FROM team_size ORDER BY team;
+}
+expect {
+    red|1
+}
+
+test matview-maintained-for-quoted-update {
+    CREATE TABLE person(id INTEGER PRIMARY KEY, team TEXT);
+    INSERT INTO person VALUES (1, 'red');
+    CREATE MATERIALIZED VIEW team_size AS
+    SELECT team, COUNT(*) AS cnt FROM person GROUP BY team;
+    UPDATE "person" SET team = 'blue' WHERE id = 1;
+    SELECT team, cnt FROM team_size ORDER BY team;
+}
+expect {
+    blue|1
+}
+
+test matview-maintained-for-quoted-delete {
+    CREATE TABLE person(id INTEGER PRIMARY KEY, team TEXT);
+    INSERT INTO person VALUES (1, 'red'), (2, 'red');
+    CREATE MATERIALIZED VIEW team_size AS
+    SELECT team, COUNT(*) AS cnt FROM person GROUP BY team;
+    DELETE FROM "person" WHERE id = 1;
+    SELECT team, cnt FROM team_size ORDER BY team;
+}
+expect {
+    red|1
+}
+
+# Quoted writes batched inside an explicit transaction must land in the view
+# when the transaction commits.
+test matview-maintained-for-quoted-writes-in-transaction {
+    CREATE TABLE person(id INTEGER PRIMARY KEY, team TEXT);
+    CREATE MATERIALIZED VIEW team_size AS
+    SELECT team, COUNT(*) AS cnt FROM person GROUP BY team;
+    BEGIN;
+    INSERT INTO "person" VALUES (1, 'red');
+    INSERT INTO "person" VALUES (2, 'blue');
+    UPDATE "person" SET team = 'red' WHERE id = 2;
+    COMMIT;
+    SELECT team, cnt FROM team_size ORDER BY team;
+}
+expect {
+    red|2
+}
+
+# INSERT ... SELECT and upsert reach the row-writing path differently from a
+# plain VALUES insert, so they get their own quoted-spelling coverage.
+test matview-maintained-for-quoted-insert-select-and-upsert {
+    CREATE TABLE person(id INTEGER PRIMARY KEY, team TEXT);
+    CREATE TABLE src(id INTEGER, team TEXT);
+    INSERT INTO src VALUES (1, 'red'), (2, 'red');
+    CREATE MATERIALIZED VIEW team_size AS
+    SELECT team, COUNT(*) AS cnt FROM person GROUP BY team;
+    INSERT INTO "person" SELECT id, team FROM src;
+    INSERT INTO "person" VALUES (1, 'blue') ON CONFLICT(id) DO UPDATE SET team = 'blue';
+    SELECT team, cnt FROM team_size ORDER BY team;
+}
+expect {
+    blue|1
+    red|1
+}
+
+# A table declared with mixed case is the same table however it is later
+# spelled, so view maintenance must key on one case-folded name everywhere.
+test matview-maintained-for-mixed-case-table-insert {
+    CREATE TABLE Person(id INTEGER PRIMARY KEY, team TEXT);
+    CREATE MATERIALIZED VIEW team_size AS
+    SELECT team, COUNT(*) AS cnt FROM Person GROUP BY team;
+    INSERT INTO Person VALUES (1, 'red');
+    INSERT INTO PERSON VALUES (2, 'red');
+    SELECT team, cnt FROM team_size ORDER BY team;
+}
+expect {
+    red|2
+}
+
+test matview-populated-from-existing-rows-of-mixed-case-table {
+    CREATE TABLE Person(id INTEGER PRIMARY KEY, team TEXT);
+    INSERT INTO Person VALUES (1, 'red'), (2, 'blue');
+    CREATE MATERIALIZED VIEW team_size AS
+    SELECT team, COUNT(*) AS cnt FROM Person GROUP BY team;
+    SELECT team, cnt FROM team_size ORDER BY team;
+}
+expect {
+    blue|1
+    red|1
+}
+
+test matview-maintained-for-mixed-case-table-delete {
+    CREATE TABLE Person(id INTEGER PRIMARY KEY, team TEXT);
+    INSERT INTO Person VALUES (1, 'red'), (2, 'red');
+    CREATE MATERIALIZED VIEW team_size AS
+    SELECT team, COUNT(*) AS cnt FROM Person GROUP BY team;
+    DELETE FROM Person WHERE id = 1;
+    SELECT team, cnt FROM team_size ORDER BY team;
+}
+expect {
+    red|1
+}
+
+test matview-maintained-for-quoted-lowercase-insert-into-mixed-case-table {
+    CREATE TABLE Person(id INTEGER PRIMARY KEY, team TEXT);
+    CREATE MATERIALIZED VIEW team_size AS
+    SELECT team, COUNT(*) AS cnt FROM Person GROUP BY team;
+    INSERT INTO "person" VALUES (1, 'red');
+    SELECT team, cnt FROM team_size ORDER BY team;
+}
+expect {
+    red|1
+}
+
+test matview-maintained-for-mixed-case-table-update {
+    CREATE TABLE Person(id INTEGER PRIMARY KEY, team TEXT);
+    INSERT INTO Person VALUES (1, 'red');
+    CREATE MATERIALIZED VIEW team_size AS
+    SELECT team, COUNT(*) AS cnt FROM Person GROUP BY team;
+    UPDATE Person SET team = 'blue' WHERE id = 1;
+    SELECT team, cnt FROM team_size ORDER BY team;
+}
+expect {
+    blue|1
+}
+
+# A qualified column reference in the view body names the table too, so it has
+# to resolve under any spelling.
+test matview-maintained-for-mixed-case-qualified-column-and-alias {
+    CREATE TABLE Person(id INTEGER PRIMARY KEY, team TEXT);
+    CREATE MATERIALIZED VIEW team_size AS
+    SELECT P.team, COUNT(*) AS cnt FROM person AS P GROUP BY P.team;
+    INSERT INTO Person VALUES (1, 'red');
+    INSERT INTO "PERSON" VALUES (2, 'red');
+    SELECT team, cnt FROM team_size ORDER BY team;
+}
+expect {
+    red|2
+}
+
+# Lowercase control: if this one goes red the change broke matviews outright
+# rather than only the case-folding.
+test matview-maintained-for-all-lowercase-table {
+    CREATE TABLE person(id INTEGER PRIMARY KEY, team TEXT);
+    CREATE MATERIALIZED VIEW team_size AS
+    SELECT team, COUNT(*) AS cnt FROM person GROUP BY team;
+    INSERT INTO person VALUES (1, 'red');
+    DELETE FROM person WHERE id = 1;
+    INSERT INTO person VALUES (2, 'blue');
+    SELECT team, cnt FROM team_size ORDER BY team;
+}
+expect {
+    blue|1
+}
+
+# An aliased UPDATE names its target through the alias, but the row write has
+# to reach view maintenance under the table's own name.
+test matview-maintained-for-aliased-update {
+    CREATE TABLE person(id INTEGER PRIMARY KEY, team TEXT);
+    INSERT INTO person VALUES (1, 'red');
+    CREATE MATERIALIZED VIEW team_size AS
+    SELECT team, COUNT(*) AS cnt FROM person GROUP BY team;
+    UPDATE person AS p SET team = 'blue' WHERE p.id = 1;
+    SELECT team, cnt FROM team_size ORDER BY team;
+}
+expect {
+    blue|1
+}
