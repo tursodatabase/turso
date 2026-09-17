@@ -2092,6 +2092,7 @@ pub struct FunctionConfig {
     pub function_weights: Vec<(&'static FunctionDef, u32)>,
     /// Whether to only use deterministic functions.
     pub deterministic_only: bool,
+    pub allow_order_dependent_aggregates: bool,
     /// Category weights for selecting function categories.
     pub category_weights: FunctionCategoryWeights,
 }
@@ -2112,6 +2113,7 @@ impl Default for FunctionConfig {
                 })
                 .collect(),
             deterministic_only: false,
+            allow_order_dependent_aggregates: true,
             category_weights: FunctionCategoryWeights::default(),
         }
     }
@@ -2133,6 +2135,7 @@ impl FunctionConfig {
                 })
                 .collect(),
             deterministic_only: false,
+            allow_order_dependent_aggregates: true,
             category_weights: FunctionCategoryWeights::default(),
         }
     }
@@ -2152,6 +2155,7 @@ impl FunctionConfig {
                 })
                 .collect(),
             deterministic_only: false,
+            allow_order_dependent_aggregates: true,
             category_weights: FunctionCategoryWeights::default(),
         }
     }
@@ -2173,8 +2177,14 @@ impl FunctionConfig {
                 })
                 .collect(),
             deterministic_only: true,
+            allow_order_dependent_aggregates: true,
             category_weights: FunctionCategoryWeights::default(),
         }
+    }
+
+    pub fn without_order_dependent_aggregates(mut self) -> Self {
+        self.allow_order_dependent_aggregates = false;
+        self
     }
 
     /// Disable specific functions by name (sets their weight to 0).
