@@ -293,8 +293,6 @@ fn combine_arithmetic_primitive(
 pub struct Statement {
     pub(crate) program: vdbe::Program,
     state: vdbe::ProgramState,
-    /// Runs the async instructions of this statement.
-    loop_runner: vdbe::execute::AsyncInsnRunner,
     pager: Arc<Pager>,
     /// indicates if the statement is a NORMAL/EXPLAIN/EXPLAIN QUERY PLAN
     query_mode: QueryMode,
@@ -393,7 +391,6 @@ impl Statement {
         Self {
             program,
             state,
-            loop_runner: vdbe::execute::AsyncInsnRunner::new(),
             pager,
             query_mode,
             busy: false,
@@ -573,12 +570,10 @@ impl Statement {
         }
         let res = match self.query_mode {
             QueryMode::Normal => {
-                match self.program.normal_step(
-                    &mut self.loop_runner,
-                    &mut self.state,
-                    &self.pager,
-                    waker,
-                ) {
+                match self
+                    .program
+                    .normal_step(&mut self.state, &self.pager, waker)
+                {
                     ProgramStep::Row => {
                         self.busy = true;
                         self.has_returned_row = true;
@@ -587,13 +582,9 @@ impl Statement {
                     step => step.into(),
                 }
             }
-            _ => self.program.step(
-                &mut self.loop_runner,
-                &mut self.state,
-                &self.pager,
-                self.query_mode,
-                waker,
-            ),
+            _ => self
+                .program
+                .step(&mut self.state, &self.pager, self.query_mode, waker),
         };
         self.finish_step(res, waker)
     }
@@ -685,13 +676,9 @@ impl Statement {
                 self.release_active_root_if_counted();
                 return Err(err);
             }
-            res = self.program.step(
-                &mut self.loop_runner,
-                &mut self.state,
-                &self.pager,
-                self.query_mode,
-                waker,
-            );
+            res = self
+                .program
+                .step(&mut self.state, &self.pager, self.query_mode, waker);
         }
 
         // Aggregate metrics when statement completes
@@ -784,13 +771,7 @@ impl Statement {
     #[inline]
     pub fn step_subprogram(&mut self) -> Result<StepResult> {
         self.program
-            .step(
-                &mut self.loop_runner,
-                &mut self.state,
-                &self.pager,
-                self.query_mode,
-                None,
-            )
+            .step(&mut self.state, &self.pager, self.query_mode, None)
             .map_err(|err| *err)
     }
 
@@ -1506,7 +1487,6 @@ impl Statement {
     /// fields so the subprogram can run again from the beginning.
     pub fn reset_for_subprogram_reuse(&mut self) {
         self.cleanup_orphaned_seq_inner_tx();
-        self.loop_runner.cancel();
         self.state.reset(None, None);
         self.state
             .n_change
@@ -1595,8 +1575,7 @@ impl Statement {
                             break;
                         }
                         Ok(vdbe::execute::InsnFunctionStepResult::Row)
-                        | Ok(vdbe::execute::InsnFunctionStepResult::Step)
-                        | Ok(vdbe::execute::InsnFunctionStepResult::Async) => {
+                        | Ok(vdbe::execute::InsnFunctionStepResult::Step) => {
                             capture_reset_error(
                                 &mut reset_error,
                                 LimboError::InternalError(
@@ -1675,7 +1654,6 @@ impl Statement {
             self.release_active_root_if_counted();
         }
         self.cleanup_orphaned_seq_inner_tx();
-        self.loop_runner.cancel();
         self.state.reset(max_registers, max_cursors);
         self.busy = false;
         self.busy_handler_state = None;

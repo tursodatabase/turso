@@ -418,11 +418,6 @@ impl CompiledExpression {
                         crate::vdbe::execute::InsnFunctionStepResult::Step => {
                             pc = state.pc as usize;
                         }
-                        crate::vdbe::execute::InsnFunctionStepResult::Async => {
-                            return Err(crate::LimboError::InternalError(
-                                "Expression evaluation reached an async instruction".to_string(),
-                            ));
-                        }
                     }
                 }
 
