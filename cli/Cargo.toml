@@ -81,6 +81,7 @@ tracing_release = ["turso_core/tracing_release"]
 mimalloc = ["dep:mimalloc"]
 fts = ["turso_core/fts"]
 mvcc_repl = []
+optimizer_params = ["turso_core/optimizer_params"]
 stacker = ["turso_core/stacker"]
 test_helper = ["turso_core/test_helper"]
 
