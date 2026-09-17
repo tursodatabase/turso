@@ -6,7 +6,7 @@ use rustc_hash::FxHashMap as HashMap;
 use turso_parser::ast::{self, SortOrder, SubqueryType, TableInternalId};
 
 use super::{
-    emitter::{Resolver, TranslateCtx},
+    emitter::{MaterializedBuildInputMode, Resolver, TranslateCtx},
     main_loop::LoopLabels,
     plan::{Aggregate, Operation, QueryDestination, Search, SelectPlan},
     planner::{resolve_window_and_aggregate_functions, TableMask},
@@ -23,7 +23,10 @@ use crate::{
             emit_materialized_build_inputs, emit_program_for_select,
             emit_program_for_select_with_resolver, emit_query,
         },
-        eqp::{eqp_detail_for_table_op, EqpDetail, EqpJoin, EqpSubquery, EqpSubqueryExec},
+        eqp::{
+            eqp_detail_for_table_op, EqpDetail, EqpJoin, EqpSearchKind, EqpSubquery,
+            EqpSubqueryExec, EqpTable,
+        },
         expr::{get_expr_affinity, unwrap_parens, walk_expr, walk_expr_mut, WalkControl},
         optimizer::optimize_select_plan,
         plan::{
@@ -1424,19 +1427,27 @@ pub fn emit_from_clause_subqueries(
     // OpenDup a CTE whose backing table has not been created yet.
     pre_materialize_multi_ref_ctes_in_tables(program, tables, t_ctx)?;
 
-    // Build the iteration order: join_order first (execution order), then any
-    // hash-join build tables that aren't already in the join order.
     let mut visit_order: Vec<usize> = join_order
         .iter()
         .map(|member| member.original_idx)
         .collect();
-    let visit_set: TableMask = visit_order.iter().copied().try_collect()?;
+    let mut visit_set: TableMask = visit_order.iter().copied().try_collect()?;
     for table in tables.joined_tables().iter() {
         if let Operation::HashJoin(hash_join_op) = &table.op {
             let build_idx = hash_join_op.build_table_idx;
-            if !visit_set.get(build_idx) {
-                visit_order.push(build_idx);
+            if visit_set.get(build_idx)
+                || matches!(
+                    t_ctx
+                        .materialized_build_inputs
+                        .get(&build_idx)
+                        .map(|input| &input.mode),
+                    Some(MaterializedBuildInputMode::KeyPayload { .. })
+                )
+            {
+                continue;
             }
+            visit_order.push(build_idx);
+            visit_set.set(build_idx)?;
         }
     }
 
@@ -1459,18 +1470,31 @@ pub fn emit_from_clause_subqueries(
             _ => None,
         };
         let eqp_subquery = eqp_subquery_info(program, table_reference, execution_mode.as_ref());
-        emit_explain!(
-            program,
-            true,
-            eqp_detail_for_table_op(
-                table_reference,
-                EqpJoin::from_join_info(
-                    table_reference.join_info.as_ref(),
-                    outer_table_set.get(table_index),
-                ),
-                eqp_subquery,
-            )
+        let eqp_join = EqpJoin::from_join_info(
+            table_reference.join_info.as_ref(),
+            outer_table_set.get(table_index),
         );
+        let eqp_detail = if matches!(
+            t_ctx
+                .materialized_build_inputs
+                .get(&table_index)
+                .map(|input| &input.mode),
+            Some(MaterializedBuildInputMode::RowidOnly)
+        ) {
+            EqpDetail::Search {
+                table: EqpTable::from_joined(table_reference),
+                kind: EqpSearchKind::RowidEq,
+                index: None,
+                constraints: vec!["rowid=?".to_string()],
+                backwards: false,
+                join: eqp_join,
+                subquery: eqp_subquery,
+                estimate: table_reference.plan_estimate,
+            }
+        } else {
+            eqp_detail_for_table_op(table_reference, eqp_join, eqp_subquery)
+        };
+        emit_explain!(program, true, eqp_detail);
 
         if let Table::FromClauseSubquery(from_clause_subquery) = &mut table_reference.table {
             let execution_mode =

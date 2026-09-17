@@ -614,32 +614,13 @@ impl<'a, 'plan> HashProbeSetupEmitter<'a, 'plan> {
     /// Ensure the build cursor exists and the hash table is ready for probing.
     fn prepare_build(&mut self) -> Result<PreparedProbeBuild> {
         let build_table = &self.table_references.joined_tables()[self.hash_join_op.build_table_idx];
-        let (build_cursor_id, _) = build_table.resolve_cursors(self.program, self.mode.clone())?;
-        let build_cursor_id = if let Some(cursor_id) = build_cursor_id {
-            cursor_id
-        } else {
-            let btree = build_table
-                .btree()
-                .expect("Hash join build table must be a BTree table");
-            let cursor_id = self.program.alloc_cursor_id_keyed_if_not_exists(
-                CursorKey::table(build_table.internal_id),
-                CursorType::BTreeTable(btree.clone()),
-            );
-            self.program.emit_insn(Insn::OpenRead {
-                cursor_id,
-                root_page: btree.root_page,
-                db: build_table.database_id,
-            });
-            cursor_id
-        };
-
         let hash_table_id: usize = build_table.internal_id.into();
         let btree = build_table
             .btree()
             .expect("Hash join build table must be a BTree table");
         let hash_build_cursor_id = self.program.alloc_cursor_id_keyed_if_not_exists(
             CursorKey::hash_build(build_table.internal_id),
-            CursorType::BTreeTable(btree),
+            CursorType::BTreeTable(btree.clone()),
         );
         let payload_info = match HashBuildPlanner::new(
             self.program,
@@ -656,6 +637,23 @@ impl<'a, 'plan> HashProbeSetupEmitter<'a, 'plan> {
             HashBuildPlan::Reuse(info) => Ok(info),
             HashBuildPlan::Build(prepared) => prepared.emit(),
         }?;
+        let (build_cursor_id, _) = build_table.resolve_cursors(self.program, self.mode.clone())?;
+        let build_cursor_id = if let Some(cursor_id) = build_cursor_id {
+            cursor_id
+        } else {
+            let cursor_id = self.program.alloc_cursor_id_keyed_if_not_exists(
+                CursorKey::table(build_table.internal_id),
+                CursorType::BTreeTable(btree.clone()),
+            );
+            if payload_info.allow_seek {
+                self.program.emit_insn(Insn::OpenRead {
+                    cursor_id,
+                    root_page: btree.root_page,
+                    db: build_table.database_id,
+                });
+            }
+            cursor_id
+        };
 
         Ok(PreparedProbeBuild {
             build_cursor_id,

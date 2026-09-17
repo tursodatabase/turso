@@ -404,9 +404,11 @@ pub(crate) fn emit_materialized_build_inputs(
             let build_read_is_in_seek =
                 matches!(build_table.op, Operation::Search(Search::InSeek { .. }));
 
-            if build_table_was_prior_probe || prefix_has_other_tables || build_read_is_in_seek {
-                // Keep prefix multiplicity and avoid one base-table seek for
-                // each match from an IN-driven read.
+            if build_table_was_prior_probe
+                || prefix_has_other_tables
+                || build_read_is_in_seek
+                || build_table.utilizes_covering_index()
+            {
                 let payload_columns = collect_materialized_payload_columns(plan, &included_tables)?;
                 let key_exprs: Vec<Expr> = hash_join_op
                     .join_keys

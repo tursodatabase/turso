@@ -112,15 +112,24 @@ impl InitLoop {
                 }
             );
         }
-        // Include hash-join build tables so their cursors are opened for hash build.
         let mut required_tables: TableMask = join_order
             .iter()
             .map(|member| member.original_idx)
             .try_collect()?;
         for table in tables.joined_tables().iter() {
-            if let Operation::HashJoin(hash_join_op) = &table.op {
-                required_tables.set(hash_join_op.build_table_idx)?;
+            let Operation::HashJoin(hash_join_op) = &table.op else {
+                continue;
+            };
+            if matches!(
+                t_ctx
+                    .materialized_build_inputs
+                    .get(&hash_join_op.build_table_idx)
+                    .map(|input| &input.mode),
+                Some(MaterializedBuildInputMode::KeyPayload { .. })
+            ) {
+                continue;
             }
+            required_tables.set(hash_join_op.build_table_idx)?;
         }
 
         for (table_index, table) in tables.joined_tables().iter().enumerate() {
