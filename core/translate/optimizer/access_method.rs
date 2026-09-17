@@ -1259,7 +1259,7 @@ pub fn try_hash_join_access_method(
     probe_table_idx: usize,
     build_constraints: &TableConstraints,
     probe_constraints: &TableConstraints,
-    where_clause: &mut [WhereTerm],
+    where_clause: &[WhereTerm],
     equal_terms: impl Iterator<Item = (usize, TableInternalId, TableInternalId)>,
     max_distinct_build_keys: f64,
     build_cardinality: f64,

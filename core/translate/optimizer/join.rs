@@ -486,7 +486,7 @@ fn join_lhs_and_rhs<'a>(
     access_methods_arena: &'a mut Vec<AccessMethod>,
     cost_upper_bound: Cost,
     joined_tables: &[JoinedTable],
-    where_clause: &mut [WhereTerm],
+    where_clause: &[WhereTerm],
     where_terms: &[WhereTermInfo],
     subqueries: &[NonFromClauseSubquery],
     index_method_candidates: &[IndexMethodCandidate],
@@ -1220,7 +1220,7 @@ pub fn compute_best_join_order<'a>(
     constraints: &'a [TableConstraints],
     base_table_rows: &[RowCountEstimate],
     access_methods_arena: &'a mut Vec<AccessMethod>,
-    where_clause: &mut [WhereTerm],
+    where_clause: &[WhereTerm],
     subqueries: &[NonFromClauseSubquery],
     index_method_candidates: &[IndexMethodCandidate],
     params: &CostModelParams,
@@ -1258,7 +1258,7 @@ pub(crate) fn compute_best_join_order_with_context<'a>(
     constraints: &'a [TableConstraints],
     base_table_rows: &[RowCountEstimate],
     access_methods_arena: &'a mut Vec<AccessMethod>,
-    where_clause: &mut [WhereTerm],
+    where_clause: &[WhereTerm],
     subqueries: &[NonFromClauseSubquery],
     index_method_candidates: &[IndexMethodCandidate],
     params: &CostModelParams,
@@ -1802,7 +1802,7 @@ fn compute_greedy_join_order<'a>(
     constraints: &'a [TableConstraints],
     base_table_rows: &[RowCountEstimate],
     access_methods_arena: &'a mut Vec<AccessMethod>,
-    where_clause: &mut [WhereTerm],
+    where_clause: &[WhereTerm],
     where_terms: &[WhereTermInfo],
     subqueries: &[NonFromClauseSubquery],
     index_method_candidates: &[IndexMethodCandidate],
@@ -2239,7 +2239,7 @@ fn compute_naive_left_deep_plan<'a>(
     base_table_rows: &[RowCountEstimate],
     access_methods_arena: &'a mut Vec<AccessMethod>,
     constraints: &'a [TableConstraints],
-    where_clause: &mut [WhereTerm],
+    where_clause: &[WhereTerm],
     where_terms: &[WhereTermInfo],
     subqueries: &[NonFromClauseSubquery],
     index_method_candidates: &[IndexMethodCandidate],
@@ -2490,7 +2490,7 @@ mod tests {
         )];
         let table_references = TableReferences::new(joined_tables, vec![]);
         let available_indexes = AvailableIndexes::default();
-        let mut where_clause = vec![WhereTerm::from(where_expr)];
+        let where_clause = vec![WhereTerm::from(where_expr)];
         let constraints = constraints_from_where_clause(
             &where_clause,
             &table_references,
@@ -2510,7 +2510,7 @@ mod tests {
             &constraints,
             &base_rows,
             &mut access_methods,
-            &mut where_clause,
+            &where_clause,
             &[],
             &[],
             &DEFAULT_PARAMS,
@@ -2663,7 +2663,7 @@ mod tests {
                 )
             })
             .collect::<Vec<_>>();
-        let mut where_clause = vec![
+        let where_clause = vec![
             _create_binary_expr(
                 _create_column_expr(joined_tables[0].internal_id, 0, false),
                 Operator::Equals,
@@ -2696,7 +2696,7 @@ mod tests {
             &constraints,
             &base_table_rows,
             &mut access_methods,
-            &mut where_clause,
+            &where_clause,
             &[],
             &[],
             &DEFAULT_PARAMS,
@@ -2939,7 +2939,7 @@ mod tests {
     fn test_compute_best_join_order_empty() {
         let table_references = TableReferences::new(vec![], vec![]);
         let available_indexes = AvailableIndexes::default();
-        let mut where_clause = vec![];
+        let where_clause = vec![];
 
         let mut access_methods_arena = Vec::new();
         let table_constraints = constraints_from_where_clause(
@@ -2961,7 +2961,7 @@ mod tests {
             &table_constraints,
             &base_table_rows,
             &mut access_methods_arena,
-            &mut where_clause,
+            &where_clause,
             &[],
             &[],
             &DEFAULT_PARAMS,
@@ -2982,7 +2982,7 @@ mod tests {
         let joined_tables = vec![_create_table_reference(t1, None, table_id_counter.next())];
         let table_references = TableReferences::new(joined_tables, vec![]);
         let available_indexes = AvailableIndexes::default();
-        let mut where_clause = vec![];
+        let where_clause = vec![];
 
         let mut access_methods_arena = Vec::new();
         let table_constraints = constraints_from_where_clause(
@@ -3006,7 +3006,7 @@ mod tests {
             &table_constraints,
             &base_table_rows,
             &mut access_methods_arena,
-            &mut where_clause,
+            &where_clause,
             &[],
             &[],
             &DEFAULT_PARAMS,
@@ -3031,7 +3031,7 @@ mod tests {
         let mut table_id_counter = TableRefIdCounter::new();
         let joined_tables = vec![_create_table_reference(t1, None, table_id_counter.next())];
 
-        let mut where_clause = vec![_create_binary_expr(
+        let where_clause = vec![_create_binary_expr(
             _create_column_expr(joined_tables[0].internal_id, 0, true), // table 0, column 0 (rowid)
             ast::Operator::Equals,
             _create_numeric_literal("42"),
@@ -3061,7 +3061,7 @@ mod tests {
             &table_constraints,
             &base_table_rows,
             &mut access_methods_arena,
-            &mut where_clause,
+            &where_clause,
             &[],
             &[],
             &DEFAULT_PARAMS,
@@ -3097,7 +3097,7 @@ mod tests {
         let mut table_id_counter = TableRefIdCounter::new();
         let joined_tables = vec![_create_table_reference(t1, None, table_id_counter.next())];
 
-        let mut where_clause = vec![_create_binary_expr(
+        let where_clause = vec![_create_binary_expr(
             _create_column_expr(joined_tables[0].internal_id, 0, false), // table 0, column 0 (id)
             ast::Operator::Equals,
             _create_numeric_literal("42"),
@@ -3144,7 +3144,7 @@ mod tests {
             &table_constraints,
             &base_table_rows,
             &mut access_methods_arena,
-            &mut where_clause,
+            &where_clause,
             &[],
             &[],
             &DEFAULT_PARAMS,
@@ -3212,7 +3212,7 @@ mod tests {
 
         // SELECT * FROM table1 JOIN table2 WHERE table1.id = table2.id
         // expecting table2 to be chosen first due to the index on table1.id
-        let mut where_clause = vec![_create_binary_expr(
+        let where_clause = vec![_create_binary_expr(
             _create_column_expr(joined_tables[TABLE1].internal_id, 0, false), // table1.id
             ast::Operator::Equals,
             _create_column_expr(joined_tables[TABLE2].internal_id, 0, false), // table2.id
@@ -3239,7 +3239,7 @@ mod tests {
             &table_constraints,
             &base_table_rows,
             &mut access_methods_arena,
-            &mut where_clause,
+            &where_clause,
             &[],
             &[],
             &DEFAULT_PARAMS,
@@ -3382,7 +3382,7 @@ mod tests {
         // expecting customers to be chosen first due to the index on customers.id and it having a selective filter (=42)
         // then orders to be chosen next due to the index on orders.customer_id
         // then order_items to be chosen last due to the index on order_items.order_id
-        let mut where_clause = vec![
+        let where_clause = vec![
             // orders.customer_id = customers.id
             _create_binary_expr(
                 _create_column_expr(joined_tables[TABLE_NO_ORDERS].internal_id, 1, false), // orders.customer_id
@@ -3424,7 +3424,7 @@ mod tests {
             &table_constraints,
             &base_table_rows,
             &mut access_methods_arena,
-            &mut where_clause,
+            &where_clause,
             &[],
             &[],
             &DEFAULT_PARAMS,
@@ -3516,7 +3516,7 @@ mod tests {
             ),
         ];
 
-        let mut where_clause = vec![
+        let where_clause = vec![
             // t2.foo = 42 (equality filter, more selective)
             _create_binary_expr(
                 _create_column_expr(joined_tables[1].internal_id, 1, false), // table 1, column 1 (foo)
@@ -3553,7 +3553,7 @@ mod tests {
             &table_constraints,
             &base_table_rows,
             &mut access_methods_arena,
-            &mut where_clause,
+            &where_clause,
             &[],
             &[],
             &DEFAULT_PARAMS,
@@ -3694,7 +3694,7 @@ mod tests {
             &table_constraints,
             &base_table_rows,
             &mut access_methods_arena,
-            &mut where_clause,
+            &where_clause,
             &[],
             &[],
             &DEFAULT_PARAMS,
@@ -3797,7 +3797,7 @@ mod tests {
             &table_constraints,
             &base_table_rows,
             &mut access_methods_arena,
-            &mut where_clause,
+            &where_clause,
             &[],
             &[],
             &DEFAULT_PARAMS,
@@ -3891,7 +3891,7 @@ mod tests {
         available_indexes.insert_for_table_name(&joined_tables, "t1", VecDeque::from([index]));
 
         // Create where clause that only references second column
-        let mut where_clause = vec![WhereTerm {
+        let where_clause = vec![WhereTerm {
             expr: Expr::Binary(
                 Box::new(Expr::Column {
                     database: None,
@@ -3927,7 +3927,7 @@ mod tests {
             &table_constraints,
             &base_table_rows,
             &mut access_methods_arena,
-            &mut where_clause,
+            &where_clause,
             &[],
             &[],
             &DEFAULT_PARAMS,
@@ -3988,7 +3988,7 @@ mod tests {
         available_indexes.insert_for_table_name(&joined_tables, "t1", VecDeque::from([index]));
 
         // Create where clause that references first and third columns
-        let mut where_clause = vec![
+        let where_clause = vec![
             WhereTerm {
                 expr: Expr::Binary(
                     Box::new(Expr::Column {
@@ -4040,7 +4040,7 @@ mod tests {
             &table_constraints,
             &base_table_rows,
             &mut access_methods_arena,
-            &mut where_clause,
+            &where_clause,
             &[],
             &[],
             &DEFAULT_PARAMS,
@@ -4102,7 +4102,7 @@ mod tests {
         available_indexes.insert_for_table_name(&joined_tables, "t1", VecDeque::from([index]));
 
         // Create where clause: c1 = 5 AND c2 > 10 AND c3 = 7
-        let mut where_clause = vec![
+        let where_clause = vec![
             WhereTerm {
                 expr: Expr::Binary(
                     Box::new(Expr::Column {
@@ -4168,7 +4168,7 @@ mod tests {
             &table_constraints,
             &base_table_rows,
             &mut access_methods_arena,
-            &mut where_clause,
+            &where_clause,
             &[],
             &[],
             &DEFAULT_PARAMS,
@@ -4415,7 +4415,7 @@ mod tests {
         available_indexes.insert_for_table_name(&joined_tables, "t2", VecDeque::from([index_t2_a]));
 
         // WHERE t1.a = t2.a
-        let mut where_clause = vec![_create_binary_expr(
+        let where_clause = vec![_create_binary_expr(
             _create_column_expr(joined_tables[TABLE1].internal_id, 0, false), // t1.a
             ast::Operator::Equals,
             _create_column_expr(joined_tables[TABLE2].internal_id, 0, false), // t2.a
@@ -4442,7 +4442,7 @@ mod tests {
             &table_constraints,
             &base_table_rows,
             &mut access_methods_arena,
-            &mut where_clause,
+            &where_clause,
             &[],
             &[],
             &DEFAULT_PARAMS,
@@ -4540,7 +4540,7 @@ mod tests {
             1,
             &constraints[0],
             &constraints[1],
-            &mut where_clause,
+            &where_clause,
             std::iter::once((
                 0,
                 table_references.joined_tables()[0].internal_id,
