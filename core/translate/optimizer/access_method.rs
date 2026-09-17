@@ -1,12 +1,13 @@
 use crate::sync::Arc;
 use rustc_hash::FxHashMap as HashMap;
 use smallvec::SmallVec;
+use std::cell::{Ref, RefCell};
 use std::iter;
 
 use turso_ext::{ConstraintInfo, ConstraintUsage, ResultCode};
 use turso_parser::ast::{self, SortOrder, TableInternalId};
 
-use crate::alloc::{TursoIteratorExt, TursoTryWithCapacityExt, TursoVecExt};
+use crate::alloc::{TryClone, TursoIteratorExt, TursoTryWithCapacityExt, TursoVecExt};
 use crate::schema::Schema;
 use crate::stats::AnalyzeStats;
 use crate::translate::expr::{as_binary_components, comparison_affinity, walk_expr, WalkControl};
@@ -189,6 +190,95 @@ pub(super) enum BranchReadMode {
     FullRow,
 }
 
+/// Everything about one btree candidate that does not depend on how many rows
+/// the join prefix produces: which constraints the seek can use, what the index
+/// looks like, whether the path emits rows in the order the query wants, and
+/// how much the residual `WHERE` terms cut its output. Only the cost depends on
+/// the row count, so only [`estimate_cost_for_scan_or_seek`] runs per join order.
+#[derive(Debug)]
+struct AnalyzedBtreeCandidate {
+    /// Position in [`TableConstraints::candidates`].
+    candidate_pos: usize,
+    usable_constraint_refs: SmallVec<[RangeConstraintRef; 2]>,
+    index_info: IndexInfo,
+    iter_dir: IterationDirection,
+    is_index_ordered: bool,
+    order_satisfiability_bonus: Cost,
+    base_row_count: RowCountEstimate,
+    /// Residual filter output adjustment (mirrors SQLite's `whereLoopOutputAdjust`).
+    adjusted_output: f64,
+}
+
+/// Every btree candidate for one table reached from one join prefix.
+#[derive(Debug, Default)]
+pub(super) struct AnalyzedBtreeCandidates {
+    /// Whether a table scan is still a candidate (no `INDEXED BY` removed it).
+    has_rowid_candidate: bool,
+    candidates: Vec<AnalyzedBtreeCandidate>,
+}
+
+/// One slot per joined table, holding the candidates for the last join prefix
+/// asked about.
+///
+/// The join order search keeps several plans per table subset, one per
+/// possible last table, and tries each of them in front of the same next
+/// table. Those tries differ only in how many rows the prefix produces, which
+/// [`analyze_btree_candidates`] does not read. The search finishes with one
+/// (table, prefix) pair before it moves to the next, so one slot per table
+/// catches every repeat without hashing.
+///
+/// Like the search itself, the memo assumes the `WHERE` clause and the
+/// constraints do not change while it is in use.
+#[derive(Debug)]
+pub(crate) struct BtreeCandidateMemo {
+    per_table: Vec<RefCell<Option<(TableMask, AnalyzedBtreeCandidates)>>>,
+}
+
+impl BtreeCandidateMemo {
+    /// One slot per entry of [`TableReferences::joined_tables`].
+    pub(crate) fn new(joined_table_count: usize) -> Self {
+        Self {
+            per_table: (0..joined_table_count)
+                .map(|_| RefCell::new(None))
+                .collect(),
+        }
+    }
+
+    /// The candidates for reaching `table_idx` from `lhs_mask`. Runs `analyze`
+    /// only if the slot holds a different prefix, or nothing yet.
+    ///
+    /// The returned borrow must be dropped before the same table is asked about
+    /// again, or the next call panics.
+    fn get_or_analyze(
+        &self,
+        table_idx: usize,
+        lhs_mask: &TableMask,
+        analyze: impl FnOnce(&mut AnalyzedBtreeCandidates) -> Result<()>,
+    ) -> Result<Ref<'_, AnalyzedBtreeCandidates>> {
+        let slot = &self.per_table[table_idx];
+        let holds_this_prefix = slot
+            .borrow()
+            .as_ref()
+            .is_some_and(|(prefix, _)| prefix == lhs_mask);
+        if !holds_this_prefix {
+            // Reuse the slot's buffer, and leave the slot empty if the analysis
+            // fails so that a partial result is never read back.
+            let mut analyzed = slot.borrow_mut().take().map_or_else(
+                AnalyzedBtreeCandidates::default,
+                |(_, mut analyzed)| {
+                    analyzed.candidates.clear();
+                    analyzed
+                },
+            );
+            analyze(&mut analyzed)?;
+            *slot.borrow_mut() = Some((lhs_mask.try_clone()?, analyzed));
+        }
+        Ok(Ref::map(slot.borrow(), |slot| {
+            &slot.as_ref().expect("the slot was filled above").1
+        }))
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 /// Choose the best ordinary btree lookup candidate for one table under the
 /// current join-order prefix.
@@ -205,41 +295,55 @@ pub(super) fn choose_best_btree_candidate(
     base_row_count: RowCountEstimate,
     params: &CostModelParams,
 ) -> Result<Option<ChosenBtreeCandidate>> {
-    // Seed the baseline with a table scan only if a rowid candidate exists
-    // (i.e. no INDEXED BY has removed it). Otherwise start at infinite cost
-    // so the forced index candidate always wins.
-    let has_rowid_candidate = rhs_constraints.candidates.iter().any(|c| c.index.is_none());
-    let mut best_cost = if has_rowid_candidate {
-        estimate_cost_for_scan_or_seek(
-            None,
-            &[],
-            &[],
-            input_cardinality,
-            base_row_count,
-            false,
-            params,
-            None,
-        )
-    } else {
-        Cost(f64::MAX)
-    };
-    let mut best_choice = ChosenBtreeCandidate {
-        iter_dir: IterationDirection::Forwards,
-        index: None,
-        constraint_refs: SmallVec::new(),
+    let mut analyzed = AnalyzedBtreeCandidates::default();
+    analyze_btree_candidates(
+        rhs_table,
+        rhs_constraints,
+        lhs_mask,
+        rhs_table_idx,
+        maybe_order_target,
+        schema,
+        available_indexes,
         base_row_count,
-        cost: best_cost,
-    };
-    let mut best_adjusted_output = f64::MAX;
-    let mut best_is_ordered = false;
+        params,
+        &mut analyzed,
+    )?;
+    Ok(Some(cheapest_btree_candidate(
+        &analyzed,
+        rhs_table,
+        rhs_constraints,
+        analyze_stats,
+        input_cardinality,
+        base_row_count,
+        params,
+    )))
+}
+
+/// Work out every btree candidate for `rhs_table` once the tables in `lhs_mask`
+/// are joined, without costing any of them.
+#[allow(clippy::too_many_arguments)]
+fn analyze_btree_candidates(
+    rhs_table: &JoinedTable,
+    rhs_constraints: &TableConstraints,
+    lhs_mask: &TableMask,
+    rhs_table_idx: usize,
+    maybe_order_target: Option<&OrderTarget>,
+    schema: &Schema,
+    available_indexes: &AvailableIndexes,
+    base_row_count: RowCountEstimate,
+    params: &CostModelParams,
+    out: &mut AnalyzedBtreeCandidates,
+) -> Result<()> {
+    // A table scan is a candidate only if a rowid candidate exists (i.e. no
+    // INDEXED BY has removed it).
+    out.has_rowid_candidate = rhs_constraints.candidates.iter().any(|c| c.index.is_none());
+    out.candidates.reserve(rhs_constraints.candidates.len());
 
     // Build a mask for the rhs table itself.
     let mut rhs_table_mask = TableMask::default();
     rhs_table_mask.set(rhs_table_idx)?;
 
-    // Estimate cost for each candidate index (including the rowid index) and
-    // keep the best candidate.
-    for candidate in rhs_constraints.candidates.iter() {
+    for (candidate_pos, candidate) in rhs_constraints.candidates.iter().enumerate() {
         let usable_constraint_refs = usable_constraints_for_lhs_mask(
             &rhs_constraints.constraints,
             &candidate.refs,
@@ -320,11 +424,6 @@ pub(super) fn choose_best_btree_candidate(
                 (IterationDirection::Forwards, false, Cost(0.0))
             };
 
-        let analyze_ctx = AnalyzeCtx {
-            rhs_table,
-            index: candidate.index.as_ref(),
-            stats: analyze_stats,
-        };
         // For partial indexes, the index physically contains only the rows whose
         // values pass the index's WHERE clause. Discount the row count estimate
         // accordingly so the cost model recognizes the partial index as cheaper
@@ -347,17 +446,6 @@ pub(super) fn choose_best_btree_candidate(
             }
             None => base_row_count,
         };
-        let cost = estimate_cost_for_scan_or_seek(
-            Some(index_info),
-            &rhs_constraints.constraints,
-            &usable_constraint_refs,
-            input_cardinality,
-            candidate_base_row_count,
-            is_index_ordered,
-            params,
-            Some(&analyze_ctx),
-        );
-
         // Residual filter output adjustment (mirrors SQLite's whereLoopOutputAdjust).
         //
         // When two indexes have the same seek cost, the one whose seek
@@ -431,31 +519,105 @@ pub(super) fn choose_best_btree_candidate(
         // Adjusted output: lower means the loop delivers fewer rows downstream.
         let adjusted_output = residual_selectivity;
 
+        out.candidates.push(AnalyzedBtreeCandidate {
+            candidate_pos,
+            usable_constraint_refs,
+            index_info,
+            iter_dir,
+            is_index_ordered,
+            order_satisfiability_bonus,
+            base_row_count: candidate_base_row_count,
+            adjusted_output,
+        });
+    }
+
+    Ok(())
+}
+
+/// Pick the cheapest of `analyzed` for a join prefix that produces
+/// `input_cardinality` rows.
+fn cheapest_btree_candidate(
+    analyzed: &AnalyzedBtreeCandidates,
+    rhs_table: &JoinedTable,
+    rhs_constraints: &TableConstraints,
+    analyze_stats: &AnalyzeStats,
+    input_cardinality: f64,
+    base_row_count: RowCountEstimate,
+    params: &CostModelParams,
+) -> ChosenBtreeCandidate {
+    // Seed the baseline with a table scan only if a rowid candidate exists.
+    // Otherwise start at infinite cost so the forced index candidate always wins.
+    let mut best_cost = if analyzed.has_rowid_candidate {
+        estimate_cost_for_scan_or_seek(
+            None,
+            &[],
+            &[],
+            input_cardinality,
+            base_row_count,
+            false,
+            params,
+            None,
+        )
+    } else {
+        Cost(f64::MAX)
+    };
+    let mut best_choice = ChosenBtreeCandidate {
+        iter_dir: IterationDirection::Forwards,
+        index: None,
+        constraint_refs: SmallVec::new(),
+        base_row_count,
+        cost: best_cost,
+    };
+    let mut best_adjusted_output = f64::MAX;
+    let mut best_is_ordered = false;
+
+    for candidate in analyzed.candidates.iter() {
+        let index = rhs_constraints.candidates[candidate.candidate_pos]
+            .index
+            .as_ref();
+        let analyze_ctx = AnalyzeCtx {
+            rhs_table,
+            index,
+            stats: analyze_stats,
+        };
+        let cost = estimate_cost_for_scan_or_seek(
+            Some(candidate.index_info),
+            &rhs_constraints.constraints,
+            &candidate.usable_constraint_refs,
+            input_cardinality,
+            candidate.base_row_count,
+            candidate.is_index_ordered,
+            params,
+            Some(&analyze_ctx),
+        );
+
         // Only apply the order bonus when this candidate satisfies order but
         // the current best does not. When both satisfy order, switching saves
         // no additional sort cost.
-        let effective_bonus = if is_index_ordered && !best_is_ordered {
-            order_satisfiability_bonus
+        let effective_bonus = if candidate.is_index_ordered && !best_is_ordered {
+            candidate.order_satisfiability_bonus
         } else {
             Cost(0.0)
         };
         let adjusted_best = best_cost + effective_bonus;
         let costs_equal = (cost.0 - adjusted_best.0).abs() < 1e-9;
-        if cost < adjusted_best || (costs_equal && adjusted_output < best_adjusted_output - 1e-12) {
+        if cost < adjusted_best
+            || (costs_equal && candidate.adjusted_output < best_adjusted_output - 1e-12)
+        {
             best_cost = cost;
-            best_adjusted_output = adjusted_output;
-            best_is_ordered = is_index_ordered;
+            best_adjusted_output = candidate.adjusted_output;
+            best_is_ordered = candidate.is_index_ordered;
             best_choice = ChosenBtreeCandidate {
-                iter_dir,
-                index: candidate.index.clone(),
-                constraint_refs: usable_constraint_refs,
-                base_row_count: candidate_base_row_count,
+                iter_dir: candidate.iter_dir,
+                index: index.cloned(),
+                constraint_refs: candidate.usable_constraint_refs.clone(),
+                base_row_count: candidate.base_row_count,
                 cost,
             };
         }
     }
 
-    Ok(Some(best_choice))
+    best_choice
 }
 
 fn consumed_where_terms_from_constraint_refs(
@@ -519,6 +681,19 @@ pub(super) fn choose_best_in_seek_candidate(
             "consider_in_seek_access_method called on non-BTree table".into(),
         ));
     };
+
+    // An InSeek needs an IN term to seek by. Most tables have none, and the
+    // join order search asks this for every (join prefix, table) pair, so
+    // return early in that case instead of costing every candidate.
+    let has_seekable_in_term = rhs_constraints.constraints.iter().any(|constraint| {
+        matches!(
+            constraint.operator,
+            ConstraintOperator::In { not: false, .. }
+        ) && lhs_mask.contains_all_set_bits_of(&constraint.lhs_mask)
+    });
+    if !has_seekable_in_term {
+        return Ok(None);
+    }
 
     let base = *base_row_count;
     let tree_depth = estimate_btree_depth(base, params.rows_per_table_page);
@@ -739,7 +914,7 @@ pub fn find_best_access_method_for_join_order(
             rhs_constraints,
             lhs_mask,
             join_order,
-            planning_context.maybe_order_target,
+            planning_context,
             where_clause,
             ready_where,
             available_indexes,
@@ -795,7 +970,7 @@ fn find_best_access_method_for_btree(
     rhs_constraints: &TableConstraints,
     lhs_mask: &TableMask,
     join_order: &[JoinOrderMember],
-    maybe_order_target: Option<&OrderTarget>,
+    planning_context: JoinPlanningContext<'_>,
     where_clause: &[WhereTerm],
     ready_where: &[(usize, usize)],
     available_indexes: &AvailableIndexes,
@@ -808,20 +983,35 @@ fn find_best_access_method_for_btree(
     params: &CostModelParams,
 ) -> Result<Option<AccessMethod>> {
     let rhs_table_idx = join_order.last().unwrap().original_idx;
-    let best = choose_best_btree_candidate(
-        rhs_table,
-        rhs_constraints,
-        lhs_mask,
-        rhs_table_idx,
-        maybe_order_target,
-        schema,
-        available_indexes,
-        analyze_stats,
-        input_cardinality,
-        base_row_count,
-        params,
-    )?
-    .expect("btree candidate selection must always consider the rowid candidate");
+    let best = {
+        let analyzed = planning_context.btree_candidate_memo.get_or_analyze(
+            rhs_table_idx,
+            lhs_mask,
+            |analyzed| {
+                analyze_btree_candidates(
+                    rhs_table,
+                    rhs_constraints,
+                    lhs_mask,
+                    rhs_table_idx,
+                    planning_context.maybe_order_target,
+                    schema,
+                    available_indexes,
+                    base_row_count,
+                    params,
+                    analyzed,
+                )
+            },
+        )?;
+        cheapest_btree_candidate(
+            &analyzed,
+            rhs_table,
+            rhs_constraints,
+            analyze_stats,
+            input_cardinality,
+            base_row_count,
+            params,
+        )
+    };
 
     let access_base_row_count = best.base_row_count;
     let estimated_rows_per_outer_row = if best.constraint_refs.is_empty() {
@@ -2066,4 +2256,50 @@ fn materialized_subquery_order_properties(
         true,
         order_bonus,
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::cell::Cell;
+
+    #[test]
+    fn btree_candidates_are_analyzed_once_per_join_prefix() -> Result<()> {
+        let memo = BtreeCandidateMemo::new(2);
+        let analyses = Cell::new(0);
+        let analyze = |analyzed: &mut AnalyzedBtreeCandidates| {
+            analyses.set(analyses.get() + 1);
+            analyzed.has_rowid_candidate = true;
+            Ok(())
+        };
+
+        let mut prefix = TableMask::default();
+        prefix.set(1)?;
+        let mut longer_prefix = prefix.try_clone()?;
+        longer_prefix.set(2)?;
+
+        memo.get_or_analyze(0, &prefix, analyze)?;
+        assert_eq!(analyses.get(), 1);
+
+        // The same table from the same prefix again, as the search does once per
+        // plan it kept for that prefix.
+        memo.get_or_analyze(0, &prefix, analyze)?;
+        assert_eq!(analyses.get(), 1);
+
+        // Another table is a separate question, even from the same prefix.
+        memo.get_or_analyze(1, &prefix, analyze)?;
+        assert_eq!(analyses.get(), 2);
+        memo.get_or_analyze(0, &prefix, analyze)?;
+        assert_eq!(analyses.get(), 2);
+
+        // So is the same table from a different prefix.
+        memo.get_or_analyze(0, &longer_prefix, analyze)?;
+        assert_eq!(analyses.get(), 3);
+
+        // A slot holds only the last prefix asked about.
+        memo.get_or_analyze(0, &prefix, analyze)?;
+        assert_eq!(analyses.get(), 4);
+
+        Ok(())
+    }
 }
