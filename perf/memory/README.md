@@ -159,8 +159,8 @@ configuration under CodSpeed, and positional name filters did not isolate it
 from the smaller Divan cases. Keep `fts-stress` for explicit local investigations;
 the dhat command above remains available for process-wide memory measurements.
 The `fts-queries` CI shard runs the smaller cases, and the build job also runs
-the FTS workload and CLI tests. Local multi-connection Divan
-allocation counts remain incomplete; use dhat for all-thread totals.
+the FTS workload and CLI tests. The Divan target runs all query tasks on one
+thread; use the dhat CLI for parallel query measurements.
 
 ## Consume explicit workload phases
 
@@ -222,11 +222,10 @@ cargo bench --profile bench-profile -p memory-benchmark-codspeed \
 Divan's `alloc` row counts allocation calls; realloc growth is reported separately
 under `grow`. Add their bytes for growth-inclusive allocation pressure. `max alloc`
 is Divan's peak live bytes/count on the measured thread. These values cover a whole
-benchmark sequence, not one query. Divan does not collect allocations on Tokio worker
-threads: its figures for two/four connections are incomplete. Use `fts-memory`
-with the same configuration for process-wide concurrent heap metrics. Do not
-compare partial local Divan numbers with CodSpeed's memory instrument as though
-they have the same scope. Single-connection queries run on the measured thread.
+benchmark sequence, not one query. The Divan/CodSpeed target uses Tokio's
+current-thread runtime for every connection count, so all query tasks run on the
+measured thread. Transactions still overlap, but queries do not run in parallel
+on worker threads. Use `fts-memory` for process-wide parallel query heap metrics.
 
 Each query case has six configurations, named `(state, documents, queries)`:
 first and warmed queries at 1000 and 10000 documents, plus 10-query and 100-query
