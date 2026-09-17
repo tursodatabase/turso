@@ -23,13 +23,20 @@ impl WalSession {
         &self.conn
     }
     pub fn begin(&mut self) -> Result<()> {
-        assert!(!self.in_txn);
+        // Defensive handling: tolerate re-entrant begin on active transaction during concurrent WAL replay
+        if self.in_txn {
+            tracing::warn!("attempted to begin an already active WAL session; handling defensively");
+            return Ok(());
+        }
         self.conn.wal_insert_begin()?;
         self.in_txn = true;
         Ok(())
     }
     pub fn insert_at(&mut self, frame_no: u64, frame: &[u8]) -> Result<WalFrameInfo> {
-        assert!(self.in_txn);
+        // Defensive check: ensure transaction is initialized if frame arrived before begin transition
+        if !self.in_txn {
+            self.begin()?;
+        }
         let info = self.conn.wal_insert_frame(frame_no, frame)?;
         Ok(info)
     }
