@@ -37,8 +37,8 @@ use super::{
     },
     cost::{
         estimate_btree_depth, estimate_cost_for_scan_or_seek, estimate_ephemeral_index_build_cost,
-        estimate_index_cost, estimate_rows_per_seek, estimate_scan_cost, AnalyzeCtx, Cost,
-        IndexInfo,
+        estimate_index_cost, estimate_rows_per_seek, estimate_scan_cost, estimate_sort_cpu_cost,
+        AnalyzeCtx, Cost, IndexInfo,
     },
     join::JoinPlanningContext,
     multi_index::{
@@ -301,9 +301,7 @@ pub(super) fn choose_best_btree_candidate(
 
                 let satisfies_order = all_same_direction || all_opposite_direction;
                 if satisfies_order {
-                    // Bonus = estimated sort cost saved. Sorting is O(n log n).
-                    let n = *base_row_count;
-                    let sort_cost_saved = Cost(n * (n.max(1.0).log2()) * params.sort_cpu_per_row);
+                    let sort_cost_saved = estimate_sort_cpu_cost(*base_row_count, params);
                     (
                         if all_same_direction {
                             IterationDirection::Forwards
@@ -2073,10 +2071,7 @@ fn materialized_subquery_order_properties(
         return (IterationDirection::Forwards, false, Cost(0.0));
     }
 
-    // Reuse the same rough sorter cost model as ordinary ORDER BY planning:
-    // if this index yields the needed order, we avoid an O(n log n) sort.
-    let n = *base_row_count;
-    let order_bonus = Cost(n * n.max(1.0).log2() * params.sort_cpu_per_row);
+    let order_bonus = estimate_sort_cpu_cost(*base_row_count, params);
     (
         if all_same_direction {
             IterationDirection::Forwards
