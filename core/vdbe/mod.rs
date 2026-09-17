@@ -232,12 +232,14 @@ impl From<ProgramStep> for Result<StepResult, Box<LimboError>> {
     }
 }
 
-/// What the dispatch loop returned to `normal_step`.
-pub(crate) enum Exit {
-    /// The statement paused or finished with this result.
+/// What the dispatch loop does after an async instruction ran for one step.
+enum AfterAsync {
+    /// The statement pauses or finishes with this result.
     Step(ProgramStep),
-    /// The instruction at `pc` continues as an async operation.
-    Async(execute::AsyncOp),
+    /// The instruction finished; the loop goes on with the next one.
+    NextInsn,
+    /// The loop checks the parked I/O or the staged error before it goes on.
+    Recheck,
 }
 
 /// Why an async instruction paused.
@@ -2278,34 +2280,18 @@ impl Program {
         state.execution_state = ProgramExecutionState::Running;
         let enable_tracing = tracing::enabled!(tracing::Level::TRACE);
         let vdbe_trace = self.connection.get_vdbe_trace();
-        let result = loop {
-            if state.io_completions.is_some() {
-                if let Some(result) = self.finish_pending_io(state, pager, waker) {
-                    break result;
-                }
-            }
-            let polled = if runner.is_active() {
-                runner.resume(&mut execute::VdbeCtx::new(self, state, waker))
-            } else {
-                match self.dispatch(state, pager, waker, enable_tracing, vdbe_trace) {
-                    Exit::Step(result) => break result,
-                    Exit::Async(op) => {
-                        runner.start(&mut execute::VdbeCtx::new(self, state, waker), op)
-                    }
-                }
-            };
-            match polled {
-                Poll::Ready(result) => match self.finish_async_insn(state, pager, result) {
-                    Some(result) => break result,
-                    None => continue,
-                },
-                Poll::Pending => match state.take_suspend_reason() {
-                    Suspend::IO => break ProgramStep::IO,
-                    Suspend::Yield => break ProgramStep::Yield,
-                    Suspend::Retry => continue,
-                    Suspend::None => unreachable!("an async instruction paused without a reason"),
-                },
-            }
+        let result = if enable_tracing || vdbe_trace {
+            dispatch_loop_traced(
+                self,
+                runner,
+                state,
+                pager,
+                waker,
+                enable_tracing,
+                vdbe_trace,
+            )
+        } else {
+            dispatch_loop::<false>(self, runner, state, pager, waker, false, false)
         };
         match &result {
             ProgramStep::Row => {}
@@ -2320,66 +2306,39 @@ impl Program {
             }
             _ => {}
         }
-        result
-    }
-
-    /// Books the instruction that an async operation finished, or fails
-    /// the step with the error of the operation. `None` means the loop
-    /// goes on with the next instruction.
-    fn finish_async_insn(
-        &self,
-        state: &mut ProgramState,
-        pager: &Arc<Pager>,
-        result: Result<(), Box<LimboError>>,
-    ) -> Option<ProgramStep> {
-        match result {
-            Ok(()) => {
-                state.pc += 1;
-                state.metrics.insn_executed = state.metrics.insn_executed.wrapping_add(1);
-                None
-            }
-            Err(err) => self.fail_step(state, pager, *err),
-        }
-    }
-
-    /// Runs instructions until the statement pauses, finishes, or reaches
-    /// an instruction that continues as an async operation.
-    #[inline(always)]
-    fn dispatch(
-        &self,
-        state: &mut ProgramState,
-        pager: &Arc<Pager>,
-        waker: Option<&Waker>,
-        enable_tracing: bool,
-        vdbe_trace: bool,
-    ) -> Exit {
-        return if enable_tracing || vdbe_trace {
-            dispatch_loop_traced(self, state, pager, waker, enable_tracing, vdbe_trace)
-        } else {
-            dispatch_loop::<false>(self, state, pager, waker, false, false)
-        };
+        return result;
 
         #[inline(never)]
         fn dispatch_loop_traced(
             program: &Program,
+            runner: &mut execute::AsyncInsnRunner,
             state: &mut ProgramState,
             pager: &Arc<Pager>,
             waker: Option<&Waker>,
             enable_tracing: bool,
             vdbe_trace: bool,
-        ) -> Exit {
-            dispatch_loop::<true>(program, state, pager, waker, enable_tracing, vdbe_trace)
+        ) -> ProgramStep {
+            dispatch_loop::<true>(
+                program,
+                runner,
+                state,
+                pager,
+                waker,
+                enable_tracing,
+                vdbe_trace,
+            )
         }
 
         #[inline(always)]
         fn dispatch_loop<const TRACE: bool>(
             program: &Program,
+            runner: &mut execute::AsyncInsnRunner,
             state: &mut ProgramState,
             pager: &Arc<Pager>,
             waker: Option<&Waker>,
             enable_tracing: bool,
             vdbe_trace: bool,
-        ) -> Exit {
+        ) -> ProgramStep {
             // Reborrow the instruction list once: reloading it through `program`
             // every iteration defeats LLVM's hoisting because the opcode call
             // below is opaque to it.
@@ -2394,20 +2353,27 @@ impl Program {
             'io_check: loop {
                 if state.io_completions.is_some() {
                     if let Some(result) = program.finish_pending_io(state, pager, waker) {
-                        return Exit::Step(result);
+                        return result;
                     }
                 }
                 if state.pending_fail_prepare_error.is_some() {
                     match program.prepare_pending_fail(state, pager, waker) {
-                        Some(result) => return Exit::Step(result),
+                        Some(result) => return result,
                         None => continue 'io_check,
+                    }
+                }
+                if runner.is_active() {
+                    match program.continue_async_insn(runner, state, pager, waker) {
+                        AfterAsync::Step(result) => return result,
+                        AfterAsync::NextInsn => {}
+                        AfterAsync::Recheck => continue 'io_check,
                     }
                 }
                 loop {
                     state.check_countdown = state.check_countdown.wrapping_sub(1);
                     if state.check_countdown == 0 {
                         if let Some(result) = program.periodic_checks(state, pager) {
-                            return Exit::Step(result);
+                            return result;
                         }
                     }
 
@@ -2436,7 +2402,7 @@ impl Program {
                                 Ok(InsnFunctionStepResult::Row) => {
                                     state.metrics.insn_executed =
                                         state.metrics.insn_executed.wrapping_add(1);
-                                    return Exit::Step(ProgramStep::Row);
+                                    return ProgramStep::Row;
                                 }
                                 other => other,
                             }
@@ -2473,13 +2439,17 @@ impl Program {
                     if let Ok(InsnFunctionStepResult::Row) = result {
                         // Instruction completed (ResultRow already incremented PC)
                         state.metrics.insn_executed = state.metrics.insn_executed.wrapping_add(1);
-                        return Exit::Step(ProgramStep::Row);
+                        return ProgramStep::Row;
                     }
                     if let Ok(InsnFunctionStepResult::Async) = result {
-                        return Exit::Async(execute::AsyncOp::of(insn));
+                        match program.start_async_insn(runner, state, pager, waker, insn) {
+                            AfterAsync::Step(result) => return result,
+                            AfterAsync::NextInsn => continue,
+                            AfterAsync::Recheck => continue 'io_check,
+                        }
                     }
                     match dispatch_cold(program, state, pager, waker, result) {
-                        Some(exit) => return exit,
+                        Some(result) => return result,
                         None => continue 'io_check,
                     }
                 }
@@ -2492,28 +2462,86 @@ impl Program {
                 pager: &Arc<Pager>,
                 waker: Option<&Waker>,
                 result: execute::InsnResult,
-            ) -> Option<Exit> {
+            ) -> Option<ProgramStep> {
                 match result {
                     Ok(InsnFunctionStepResult::Done) => {
                         // Instruction completed execution
                         state.metrics.insn_executed = state.metrics.insn_executed.wrapping_add(1);
                         state.auto_txn_cleanup = TxnCleanup::None;
-                        Some(Exit::Step(ProgramStep::Done))
+                        Some(ProgramStep::Done)
                     }
                     Ok(InsnFunctionStepResult::IO) => {
                         let io = state.take_suspended_io();
-                        program.park_on_io(state, io, waker).map(Exit::Step)
+                        program.park_on_io(state, io, waker)
                     }
-                    Err(boxed_err) => program.fail_step(state, pager, *boxed_err).map(Exit::Step),
+                    Err(boxed_err) => program.fail_step(state, pager, *boxed_err),
                     Ok(InsnFunctionStepResult::Step)
                     | Ok(InsnFunctionStepResult::Row)
                     | Ok(InsnFunctionStepResult::Async) => {
                         unreachable!(
-                            "the dispatch loop settles steps, rows and async operations itself"
+                            "the dispatch loop settles steps, rows and async instructions itself"
                         )
                     }
                 }
             }
+        }
+    }
+
+    /// Starts the async operation of the instruction at `pc` and runs it
+    /// until it pauses or finishes.
+    #[inline(always)]
+    fn start_async_insn(
+        &self,
+        runner: &mut execute::AsyncInsnRunner,
+        state: &mut ProgramState,
+        pager: &Arc<Pager>,
+        waker: Option<&Waker>,
+        insn: &Insn,
+    ) -> AfterAsync {
+        let op = execute::AsyncOp::of(insn);
+        let polled = runner.start(&mut execute::VdbeCtx::new(self, state, waker), op);
+        self.after_async(state, pager, polled)
+    }
+
+    /// Continues the paused async instruction until it pauses again or
+    /// finishes.
+    #[inline(always)]
+    fn continue_async_insn(
+        &self,
+        runner: &mut execute::AsyncInsnRunner,
+        state: &mut ProgramState,
+        pager: &Arc<Pager>,
+        waker: Option<&Waker>,
+    ) -> AfterAsync {
+        let polled = runner.resume(&mut execute::VdbeCtx::new(self, state, waker));
+        self.after_async(state, pager, polled)
+    }
+
+    /// Books a finished async instruction, fails the step with its error, or
+    /// reads why it paused.
+    #[inline(always)]
+    fn after_async(
+        &self,
+        state: &mut ProgramState,
+        pager: &Arc<Pager>,
+        polled: Poll<Result<(), Box<LimboError>>>,
+    ) -> AfterAsync {
+        match polled {
+            Poll::Ready(Ok(())) => {
+                state.pc += 1;
+                state.metrics.insn_executed = state.metrics.insn_executed.wrapping_add(1);
+                AfterAsync::NextInsn
+            }
+            Poll::Ready(Err(err)) => match self.fail_step(state, pager, *err) {
+                Some(result) => AfterAsync::Step(result),
+                None => AfterAsync::Recheck,
+            },
+            Poll::Pending => match state.take_suspend_reason() {
+                Suspend::IO => AfterAsync::Step(ProgramStep::IO),
+                Suspend::Yield => AfterAsync::Step(ProgramStep::Yield),
+                Suspend::Retry => AfterAsync::Recheck,
+                Suspend::None => unreachable!("an async instruction paused without a reason"),
+            },
         }
     }
 

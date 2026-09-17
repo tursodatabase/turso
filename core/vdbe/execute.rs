@@ -2089,11 +2089,15 @@ impl YieldSlot for VdbeCtx<'_> {
     }
 }
 
-/// Runs one async instruction to completion.
-async fn run_async_insn(mut co: Co<VdbeStep>, op: AsyncOp) -> Result<(), Box<LimboError>> {
-    match op {
+/// Runs one async instruction to completion and gives the handle back.
+async fn run_async_insn(
+    mut co: Co<VdbeStep>,
+    op: AsyncOp,
+) -> (Co<VdbeStep>, Result<(), Box<LimboError>>) {
+    let result = match op {
         AsyncOp::ColumnDeferred { cursor_id } => op_column_deferred(&mut co, cursor_id).await,
-    }
+    };
+    (co, result)
 }
 
 /// An instruction that continues as an async operation, with the arguments
@@ -2104,6 +2108,7 @@ pub(crate) enum AsyncOp {
 }
 
 impl AsyncOp {
+    #[inline(always)]
     pub(crate) fn of(insn: &Insn) -> Self {
         match insn {
             Insn::Column { cursor_id, .. } | Insn::ColumnRange { cursor_id, .. } => {
