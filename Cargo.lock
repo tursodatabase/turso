@@ -7171,6 +7171,7 @@ dependencies = [
  "antithesis_sdk",
  "arc-swap",
  "aristo",
+ "asserting",
  "bigdecimal",
  "bitflags 2.9.4",
  "branches",

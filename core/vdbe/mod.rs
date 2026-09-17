@@ -4055,12 +4055,7 @@ fn decode_serial_type_into_register(
                 return Err(LimboError::Corrupt("Invalid Text value".into()));
             }
             let text_data = &data[..content_size];
-            let Some(text_str) = crate::types::validate_utf8(text_data) else {
-                mark_unlikely();
-                return Err(LimboError::Corrupt(
-                    "TEXT value contains invalid UTF-8".into(),
-                ));
-            };
+            let text_str = crate::storage::sqlite3_ondisk::read_text(text_data)?;
             match dest {
                 Register::Value(Value::Text(existing_text)) => {
                     existing_text.do_extend(&text_str)?;

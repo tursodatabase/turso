@@ -1129,10 +1129,7 @@ pub fn read_value<'a>(buf: &'a [u8], serial_type: SerialType) -> Result<(ValueRe
                     content_size
                 ))
             })?;
-            let val = crate::types::validate_utf8(data).ok_or_else(|| {
-                mark_unlikely();
-                LimboError::Corrupt("TEXT value contains invalid UTF-8".into())
-            })?;
+            let val = read_text(data)?;
             Ok((
                 ValueRef::Text(TextRef::new(val, TextSubtype::Text)),
                 content_size,
@@ -1259,10 +1256,7 @@ pub fn read_value_serial_type<'a>(
                         content_size
                     ))
                 })?;
-                let val = crate::types::validate_utf8(data).ok_or_else(|| {
-                    mark_unlikely();
-                    LimboError::Corrupt("TEXT value contains invalid UTF-8".into())
-                })?;
+                let val = read_text(data)?;
                 Ok((
                     ValueRef::Text(TextRef::new(val, TextSubtype::Text)),
                     content_size,
@@ -1275,6 +1269,14 @@ pub fn read_value_serial_type<'a>(
             crate::bail_corrupt_error!("Invalid serial type for integer")
         }
     }
+}
+
+#[inline(always)]
+pub fn read_text(payload: &[u8]) -> Result<&str> {
+    crate::types::validate_utf8(payload).ok_or_else(|| {
+        mark_unlikely();
+        LimboError::Corrupt("TEXT value contains invalid UTF-8".into())
+    })
 }
 
 #[inline(always)]
@@ -2299,6 +2301,7 @@ mod tests {
     use crate::Value;
 
     use super::*;
+    use asserting::prelude::*;
     use rstest::rstest;
 
     #[rstest]
@@ -2387,6 +2390,51 @@ mod tests {
             result.0.to_owned().expect(crate::alloc::ALLOC_ERR_MSG),
             expected
         );
+    }
+
+    #[test]
+    fn read_text_agrees_with_the_standard_library() {
+        let mut payloads: Vec<Vec<u8>> = Vec::new();
+        for len in 0..=528usize {
+            payloads.push(vec![b'a'; len]);
+        }
+        for len in 1..=528usize {
+            for at in 0..len {
+                for tail in [&[0xC3u8, 0xA9][..], &[0xFF][..], &[0x80][..]] {
+                    let mut payload = vec![b'a'; len];
+                    payload.splice(at..at + 1, tail.iter().copied());
+                    payloads.push(payload);
+                }
+            }
+        }
+        for broken in [
+            &[0xE2u8, 0x82][..],
+            &[0xC0, 0xAF][..],
+            &[0xED, 0xA0, 0x80][..],
+        ] {
+            for pad in [0usize, 508, 518] {
+                let mut payload = vec![b'a'; pad];
+                payload.extend_from_slice(broken);
+                payloads.push(payload);
+            }
+        }
+
+        for payload in payloads {
+            assert_that!(crate::types::is_ascii(&payload))
+                .described_as(format!("payload {payload:?}"))
+                .is_equal_to(payload.iter().all(u8::is_ascii));
+
+            let expected = std::str::from_utf8(&payload);
+            match (read_text(&payload), expected) {
+                (Ok(got), Ok(want)) => {
+                    assert_that!(got)
+                        .described_as(format!("payload {payload:?}"))
+                        .is_equal_to(want);
+                }
+                (Err(LimboError::Corrupt(_)), Err(_)) => {}
+                (got, want) => panic!("payload {payload:?}: got {got:?}, std says {want:?}"),
+            }
+        }
     }
 
     #[test]
