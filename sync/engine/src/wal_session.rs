@@ -33,7 +33,9 @@ impl WalSession {
     }
     #[inline(always)]
     pub fn insert_at(&mut self, frame_no: u64, frame: &[u8]) -> Result<WalFrameInfo> {
-        debug_assert!(self.in_txn, "WAL transaction must be active");
+        if !self.in_txn {
+            self.begin()?;
+        }
         let info = self.conn.wal_insert_frame(frame_no, frame)?;
         Ok(info)
     }
