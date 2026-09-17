@@ -1269,110 +1269,10 @@ pub fn try_hash_join_access_method(
     subqueries: &[NonFromClauseSubquery],
     params: &CostModelParams,
 ) -> Result<Option<AccessMethod>> {
-    let (Table::BTree(build_btree), Table::BTree(probe_btree)) =
-        (&build_table.table, &probe_table.table)
-    else {
-        return Ok(None);
-    };
-    if !build_btree.has_rowid || !probe_btree.has_rowid {
-        return Ok(None);
-    }
-    // Avoid hash join on self-joins over the same underlying table for INNER /
-    // LEFT joins: a nested-loop with index seek is usually preferred and avoids
-    // double-buffering the table in the hash table. FULL OUTER has no
-    // nested-loop form yet, so it must use hash join even for self-joins.
-    let probe_root_page = probe_btree.root_page;
-    let build_root_page = build_btree.root_page;
-    let is_full_outer = probe_table
-        .join_info
-        .as_ref()
-        .is_some_and(|ji| ji.is_full_outer());
-    if build_root_page == probe_root_page && !is_full_outer {
-        return Ok(None);
-    }
-    // Explicit INDEXED BY / NOT INDEXED directives must be honored. A hash join
-    // bypasses the normal access-path selection for the build/probe pair, so it
-    // would ignore the user's requested scan shape.
-    if build_table.indexed.is_some() || probe_table.indexed.is_some() {
-        return Ok(None);
-    }
-    // A left anti hash join emits unmatched build rows after the probe scan.
-    // Semi joins still use a nested loop because they can stop at one match.
-    if probe_table
-        .join_info
-        .as_ref()
-        .is_some_and(|ji| ji.is_semi())
-        || build_table
-            .join_info
-            .as_ref()
-            .is_some_and(|ji| ji.is_semi_or_anti())
-    {
-        return Ok(None);
-    }
-    // Determine join type from the probe table's join_info.
-    let hash_join_type = if probe_table
-        .join_info
-        .as_ref()
-        .is_some_and(|ji| ji.is_anti())
-    {
-        HashJoinType::LeftAnti
-    } else if probe_table
-        .join_info
-        .as_ref()
-        .is_some_and(|ji| ji.is_full_outer())
-    {
-        HashJoinType::FullOuter
-    } else if probe_table
-        .join_info
-        .as_ref()
-        .is_some_and(|ji| ji.is_outer())
-    {
-        HashJoinType::LeftOuter
-    } else {
-        HashJoinType::Inner
-    };
+    let hash_join_type = hash_join_type(probe_table);
 
-    // Can't build from a NullRow'd table — the hash table would hold real data
-    // even when the cursor is in NullRow mode.
-    if build_table
-        .join_info
-        .as_ref()
-        .is_some_and(|ji| ji.is_outer())
-    {
+    if should_not_use_hash_join(build_table, probe_table, subqueries, hash_join_type) {
         return Ok(None);
-    }
-
-    // Skip hash join on USING/NATURAL joins.
-    if build_table
-        .join_info
-        .as_ref()
-        .is_some_and(|ji| !ji.using.is_empty())
-        || probe_table
-            .join_info
-            .as_ref()
-            .is_some_and(|ji| !ji.using.is_empty())
-    {
-        return Ok(None);
-    }
-
-    // Avoid hash joins when there are correlated subqueries that reference the joined tables.
-    for subquery in subqueries {
-        if !subquery.correlated {
-            continue;
-        }
-        // Check if the subquery references the build or probe table
-        if let SubqueryState::Unevaluated { plan } = &subquery.state {
-            if let Some(plan) = plan.as_ref() {
-                let outer_ref_ids = plan.used_outer_query_ref_ids();
-                for outer_ref_id in &outer_ref_ids {
-                    if *outer_ref_id == build_table.internal_id
-                        || *outer_ref_id == probe_table.internal_id
-                    {
-                        return Ok(None);
-                    }
-                }
-            }
-        }
     }
 
     let join_keys = find_hash_join_keys(
@@ -1513,6 +1413,119 @@ pub fn try_hash_join_access_method(
             join_type: hash_join_type,
         },
     }))
+}
+
+/// Returns true if we should definitely not use a hash join.
+///
+/// Jump to the end of the function to see the list of conditions we check.
+fn should_not_use_hash_join(
+    build_table: &JoinedTable,
+    probe_table: &JoinedTable,
+    subqueries: &[NonFromClauseSubquery],
+    join_type: HashJoinType,
+) -> bool {
+    let (Table::BTree(build_btree), Table::BTree(probe_btree)) =
+        (&build_table.table, &probe_table.table)
+    else {
+        return true;
+    };
+    let both_sides_have_rowid = || -> bool { build_btree.has_rowid && probe_btree.has_rowid };
+    let not_full_outer_join_and_both_tables_are_the_same_table = || -> bool {
+        // Avoid hash join on self-joins over the same underlying table for INNER /
+        // LEFT joins: a nested-loop with index seek is usually preferred and avoids
+        // double-buffering the table in the hash table. FULL OUTER has no
+        // nested-loop form yet, so it must use hash join even for self-joins.
+        let probe_root_page = probe_btree.root_page;
+        let build_root_page = build_btree.root_page;
+        build_root_page == probe_root_page && !matches!(join_type, HashJoinType::FullOuter)
+    };
+    let has_indexed_by_directives = || -> bool {
+        // Explicit INDEXED BY / NOT INDEXED directives must be honored. A hash join
+        // bypasses the normal access-path selection for the build/probe pair, so it
+        // would ignore the user's requested scan shape.
+        build_table.indexed.is_some() || probe_table.indexed.is_some()
+    };
+    let any_side_is_semi_or_build_side_is_anti = || -> bool {
+        // A left anti hash join emits unmatched build rows after the probe scan.
+        // Semi joins still use a nested loop because they can stop at one match.
+        probe_table
+            .join_info
+            .as_ref()
+            .is_some_and(|ji| ji.is_semi())
+            || build_table
+                .join_info
+                .as_ref()
+                .is_some_and(|ji| ji.is_semi_or_anti())
+    };
+    let build_table_is_null_row = || -> bool {
+        // Can't build from a NullRow'd table — the hash table would hold real data
+        // even when the cursor is in NullRow mode.
+        build_table
+            .join_info
+            .as_ref()
+            .is_some_and(|ji| ji.is_outer())
+    };
+    let is_using_or_natural_join = || -> bool {
+        build_table
+            .join_info
+            .as_ref()
+            .is_some_and(|ji| !ji.using.is_empty())
+            || probe_table
+                .join_info
+                .as_ref()
+                .is_some_and(|ji| !ji.using.is_empty())
+    };
+    let some_correlated_subqueries_reference_the_joined_tables = || -> bool {
+        subqueries
+            .iter()
+            .filter(|s| s.correlated)
+            .filter_map(|s| {
+                if let SubqueryState::Unevaluated { plan } = &s.state {
+                    Some(plan)
+                } else {
+                    None
+                }
+            })
+            .flatten()
+            .flat_map(|plan| plan.used_outer_query_ref_ids())
+            .any(|table_internal_id| {
+                table_internal_id == build_table.internal_id
+                    || table_internal_id == probe_table.internal_id
+            })
+    };
+
+    // we should not use a hash join if...
+    !both_sides_have_rowid()
+        || not_full_outer_join_and_both_tables_are_the_same_table()
+        || has_indexed_by_directives()
+        || any_side_is_semi_or_build_side_is_anti()
+        || build_table_is_null_row()
+        || is_using_or_natural_join()
+        || some_correlated_subqueries_reference_the_joined_tables()
+}
+
+fn hash_join_type(probe_table: &JoinedTable) -> HashJoinType {
+    if probe_table
+        .join_info
+        .as_ref()
+        .is_some_and(|ji| ji.is_anti())
+    {
+        HashJoinType::LeftAnti
+    } else if probe_table
+        .join_info
+        .as_ref()
+        .is_some_and(|ji| ji.is_full_outer())
+    {
+        HashJoinType::FullOuter
+    } else if probe_table
+        .join_info
+        .as_ref()
+        .is_some_and(|ji| ji.is_outer())
+    {
+        HashJoinType::LeftOuter
+    } else {
+        HashJoinType::Inner
+    }
 }
 
 fn probe_index_can_seek_join_key(
