@@ -234,9 +234,8 @@ where
     C: StepContext,
     F: Future<Output = (Co<C>, Out)>,
 {
-    /// Polls the future once with `ctx` in the slot. Out of line, so the
-    /// poll of the future is compiled into one function.
-    #[inline(never)]
+    /// Polls the future once with `ctx` in the slot.
+    #[inline(always)]
     fn poll_once(&mut self, ctx: &mut C::Ctx<'_>) -> Poll<Out> {
         let future = self
             .future
