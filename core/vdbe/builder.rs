@@ -624,7 +624,8 @@ impl ProgramBuilderOpts {
 macro_rules! emit_explain {
     ($builder:expr, $push:expr, $detail:expr) => {
         if let $crate::QueryMode::ExplainQueryPlan { .. } = $builder.get_query_mode() {
-            $builder.emit_explain_should_not_be_called_directly($push, $detail);
+            let detail = $detail;
+            $builder.emit_explain_should_not_be_called_directly($push, detail);
         }
     };
 }
