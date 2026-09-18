@@ -345,7 +345,7 @@ def score_from_cache(evaluator, queries, params, baseline_times):
 def cmd_grid(args, queries, evaluator):
     """Measure every combination of a handful of round values per parameter.
 
-    The searches agree on which way a parameter should move but not on how far,
+    The searches agree on which way to move a parameter but not on how far,
     and each one lands on a value with eight digits that no measurement can
     support. This step takes the directions they agree on, offers a few round
     values along each, and measures every combination. What it picks is a set

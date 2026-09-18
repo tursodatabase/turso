@@ -11,9 +11,14 @@ the next parameter set to try.
 
 ## What the procedure changes
 
-Only the values in `CostModelParams::new()` change. No cost formula changes, and
-no plan-selection code changes. A parameter that the benchmarks cannot move
-keeps its old value.
+The procedure changes values in `CostModelParams::new()`. A parameter that the
+benchmarks cannot move keeps its old value, and no plan-selection code changes.
+
+It changed one formula, once, and only because the measurements forced it: two
+uses of `cpu_cost_per_seek` wanted opposite values, so the second use got a
+constant of its own. Step 7b tells that story. Read a parameter that two
+benchmarks pull in opposite directions as a sign that it stands for two things,
+not as a number to compromise on.
 
 ## Requirements
 
@@ -55,6 +60,12 @@ file, and `import_clickbench.py` imports it with the bundled schema:
 python perf/optimizer-tuning/gen_clickbench_data.py --rows 1000000
 python perf/optimizer-tuning/import_clickbench.py
 ```
+
+The numbers in this document come from the generated rows, because the machine
+that ran them could not reach `datasets.clickhouse.com`. `CounterID = 62` covers
+9.15 percent of the generated rows and the primary-key index drives queries 37
+to 43, as it does on the real ones. Run the benchmark again on the real rows
+before you rely on a ClickBench number here.
 
 Both query sets run as the benchmarks ship them. Neither database gets `ANALYZE`,
 because that is the state a new database is in, and it is the state in which the
@@ -206,7 +217,7 @@ plans hold, and then puts back any parameter that still ends within `--snap` of
 its default.
 
 Reading the result of all this was the useful part, not the parameter set it
-produced. Three searches disagreed on how far each parameter should move but
+produced. Three searches disagreed on how far to move each parameter but
 agreed on which way: `rows_per_table_fallback` down, `rows_per_table_page` up,
 `cpu_cost_per_row` up, `cpu_cost_per_seek` up, `sel_range` down.
 
@@ -300,10 +311,13 @@ query and keeps the fastest of five runs of each, so a machine that gets slower
 during the run slows both sides by the same amount.
 
 `callgrind.py` counts the instructions each query runs. The count does not move
-with machine load, so it shows a change that timing noise would hide. Callgrind
-runs the binary about 70 times slower, so a full pass takes about two hours.
-Give each parallel callgrind job its own copy of the database, because of the
-file lock.
+with machine load, so it shows a change that timing noise would hide, and two
+jobs can share a machine without disturbing each other. Callgrind runs the
+binary about 70 times slower, so one pass over both benchmarks takes about two
+hours of processor time. Split it with `--only` and a list of query keys, give
+each job its own copy of the database because of the file lock, and balance the
+lists by the wall times from `compare.py`. Splitting by position leaves one job
+running long after the others stop.
 
 Both measurements use one binary and change only `TURSO_OPTIMIZER_PARAMS`, so
 nothing but the parameters differs between the two sides.
@@ -366,7 +380,7 @@ that run.
 - Every query is timed with the database already in the page cache of the
   operating system. Both benchmark databases together are smaller than the
   memory of the machine, so a repeated query reads no disk. A plan that reads
-  the same pages again and again therefore looks better here than it would on a
+  the same pages again and again thus looks better here than it would on a
   database larger than memory, and the tuned value reflects that.
 - The result is tuned for two analytic workloads on a database without
   `ANALYZE`. A write-heavy or small-table workload is not represented.
@@ -381,7 +395,7 @@ that run.
 - What it is compensating for is visible in `estimate_index_cost`. A repeated
   scan of an inner table gets the `cache_reuse_factor` discount, and a repeated
   seek into one does not: `seek_cost` is `input_cardinality * tree_depth` page
-  reads however many times the same small table is read. So the model
+  reads no matter how many times the same small table is read. So the model
   over-prices the nested loop that TPC-H query 11 wants, and the only lever the
   parameters give is to over-price its competitor by the same amount. Giving
   repeated seeks the same cache discount as repeated scans would price both
