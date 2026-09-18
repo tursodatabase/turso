@@ -268,10 +268,12 @@ impl<TBytes: AsRef<[u8]> + Send + Sync + 'static> TursoDatabaseSync<TBytes> {
             logical_mvcc_pull: sync_config.logical_mvcc_pull,
         };
         let is_memory = db_config.path == ":memory:";
-        let db_io: Option<Arc<dyn IO>> = if is_memory {
+        // A caller-provided IO always wins, like TursoDatabase::open_vfs_io
+        let db_io: Option<Arc<dyn IO>> = if let Some(io) = &db_config.io {
+            Some(io.clone())
+        } else if is_memory {
             Some(Arc::new(MemoryIO::new()))
         } else {
-            // persitent IO initialized later in order to read metadata first and decide if we need partial DB IO
             None
         };
         let sync_engine_io_queue = SyncEngineIoStats::new(SyncEngineIoQueue::new());
