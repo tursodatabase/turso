@@ -8,12 +8,14 @@ use crate::mvcc::database::{
     TxTimestampOrID, WalPos, WriteRowStateMachine, MVCC_META_KEY_PERSISTENT_TX_TS_MAX,
     MVCC_META_TABLE_NAME, SQLITE_SCHEMA_MVCC_TABLE_ID,
 };
+use crate::mvcc::database::{IndexRowsEntry, RowVersions};
 #[cfg(any(test, injected_yields))]
 use crate::mvcc::yield_hooks::{ProvidesYieldContext, YieldContext, YieldPointMarker};
 use crate::mvcc::yield_points::{inject_transition_failure, inject_transition_yield};
 use crate::schema::{Index, Schema};
 use crate::skiplist::base::RefEntry;
-use crate::skiplist::SkiplistAllocator;
+use crate::skiplist::comparator::{BasicComparator, Comparator};
+use crate::skiplist::{SkipMap, SkiplistAllocator};
 use crate::state_machine::{StateMachine, StateTransition, TransitionResult};
 use crate::storage::btree::{BTreeCursor, CursorTrait};
 use crate::storage::pager::CreateBTreeFlags;
@@ -126,6 +128,9 @@ pub enum CheckpointState {
         next_index: usize,
         lwm: u64,
     },
+    /// Drop dirty keys whose chains hold nothing newer than this checkpoint's
+    /// snapshot. Runs after publish so a failed checkpoint keeps every key.
+    PruneDirtyKeys,
     Finalize,
 }
 
@@ -135,6 +140,7 @@ pub enum CheckpointState {
 pub(crate) enum CheckpointYieldPoint {
     BeforeAcquireLock,
     AfterDurableBoundaryAdvanced,
+    BeforeCollectTableRows,
     AfterCollectTableRows,
     BeforePagerCommit,
     BeforePublishWindow,
@@ -262,6 +268,14 @@ pub struct CheckpointStateMachine<Clock: LogicalClock, A: ConcurrentAllocator = 
     collect_table_phase: CollectTablePhase,
     collect_index_tableid_cursor: Option<MVTableId>,
     collect_index_key_cursor: Option<Arc<SortableIndexKey>>,
+    collect_dirty_index_cursor: Option<RowID>,
+    /// `Some` when this checkpoint walks every row instead of the dirty keys.
+    /// Holds the store's full-scan generation so success can clear it.
+    full_scan_generation: Option<NonZeroU64>,
+    /// Dirty keys visited by collect whose stamp is at or below `snapshot_ts`,
+    /// with that stamp. Prune removes them after publish.
+    prune_candidates: Vec<(RowID, u64)>,
+    prune_cursor: usize,
     /// Async driver for `CheckpointState::CompactSequences`. Lazily set
     /// on first entry to that state; cleared when the driver completes.
     seq_compact: Option<SeqCompactDriver<Clock, A>>,
@@ -860,6 +874,10 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
             collect_table_phase: CollectTablePhase::Schema,
             collect_index_tableid_cursor: None,
             collect_index_key_cursor: None,
+            collect_dirty_index_cursor: None,
+            full_scan_generation: None,
+            prune_candidates: crate::alloc::vec![],
+            prune_cursor: 0,
             seq_compact: None,
             pending_seq_deletes: crate::alloc::vec![],
             // Set in PrepareCheckpoint once the collection snapshot is taken; until
@@ -1161,173 +1179,13 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
     fn collect_table_rows(&mut self) -> Result<Option<IOCompletions>> {
         let mut processed = 0;
         loop {
-            let bounds = self.collect_table_bounds();
-            let guard = epoch::pin();
-            let mut range = self.mvstore.rows.range(bounds);
-            while let Some(pinned) = range.inner.next(&guard) {
-                let entry = CollectEntry::new(pinned, &guard);
-                let key = entry.key();
-                tracing::trace!("collecting {key:?}");
-                self.collect_table_cursor = Some(key.clone());
-                if self.destroyed_tables.contains(&key.table_id) {
-                    // We won't checkpoint rows for tables that will be destroyed in this checkpoint.
-                    // There's two forms of destroyed table:
-                    // 1. A non-checkpointed table that was created in the logical log and then destroyed. We don't need to do anything about this table in the pager/btree layer.
-                    // 2. A checkpointed table that was destroyed in the logical log. We need to destroy the btree in the pager/btree layer.
-                    tracing::trace!("skipping {key:?}");
-                    continue;
-                }
-
-                let row_versions = entry.value().read();
-
-                for version in self.maybe_get_checkpointable_versions(&row_versions, key.table_id) {
-                    let is_delete = version.end().is_some();
-
-                    let mut special_write = None;
-                    // Set to true for schema deletes of never-checkpointed tables/indexes.
-                    // These don't need to be written to the B-tree, we just need to track them.
-                    let mut skip_write = false;
-
-                    if let Some(schema_identity) = sqlite_schema_btree_identity(&version) {
-                        let root_page = schema_identity.root_page;
-                        match schema_identity.kind {
-                            SqliteSchemaBtreeKind::Index => {
-                                // This is an index schema change
-                                if is_delete {
-                                    // DROP INDEX
-                                    if root_page < 0 {
-                                        // Index was never checkpointed - derive index_id directly from root_page.
-                                        // No BTreeDestroyIndex needed since there's no physical B-tree.
-                                        let index_id = MVTableId(root_page);
-                                        self.destroyed_indexes.insert(index_id);
-                                        // Defer the removal to the publish window. Pushing to the
-                                        // staged op list borrows only that field, so it is allowed
-                                        // inside the `self.mvstore.rows` iteration.
-                                        self.pending_rootmap_ops
-                                            .push(RootMapOp::Remove { id: index_id });
-                                        skip_write = true;
-                                    } else if let Some(index_id) =
-                                        self.resolve_dropped_binding(root_page as u64, &version)
-                                    {
-                                        // DROP INDEX - index was checkpointed. Resolve the dropped
-                                        // index from the binding that owned this root at the drop ts.
-                                        self.destroyed_indexes.insert(index_id);
-
-                                        // DROP INDEX during checkpoint: schema may no longer contain the index definition.
-                                        // Fixes DROP INDEX during checkpoint when the schema cache no longer
-                                        // contains the index metadata; we only need a cursor to destroy pages so num_columns is not important.
-                                        let num_columns = self
-                                            .index_id_to_index
-                                            .get(&index_id)
-                                            .map(|index| index.columns.len())
-                                            .unwrap_or(0);
-
-                                        special_write = Some(SpecialWrite::BTreeDestroyIndex {
-                                            index_id,
-                                            root_page: root_page as u64,
-                                            num_columns,
-                                        });
-                                    } else {
-                                        // No binding owned this root at the drop ts: the index was
-                                        // already destroyed by an earlier checkpoint and this
-                                        // schema-delete lingered in the store. Nothing to destroy.
-                                        skip_write = true;
-                                    }
-                                } else if root_page < 0 {
-                                    // CREATE INDEX (root page is negative so the index has not been checkpointed yet).
-                                    let index_id = MVTableId::from(root_page);
-                                    let sqlite_schema_rowid =
-                                        version.row.id.row_id.to_int_or_panic();
-                                    special_write = Some(SpecialWrite::BTreeCreateIndex {
-                                        index_id,
-                                        sqlite_schema_rowid,
-                                    });
-                                } else {
-                                    // Index schema row update (e.g. ALTER TABLE RENAME COLUMN propagates
-                                    // to index SQL). No B-tree creation needed; the row itself is written
-                                    // to sqlite_schema below. See: test_checkpoint_allows_index_schema_update_after_rename_column.
-                                }
-                            }
-                            SqliteSchemaBtreeKind::Table => {
-                                // This is a table schema change (existing logic)
-                                tracing::trace!(
-                                "table schema change with root page {root_page}, is_delete={is_delete}"
-                            );
-                                if is_delete {
-                                    if root_page < 0 {
-                                        // Table was never checkpointed - derive table_id directly from root_page.
-                                        // No BTreeDestroy needed since there's no physical B-tree.
-                                        let table_id = MVTableId::from(root_page);
-                                        self.destroyed_tables.insert(table_id);
-                                        // Defer the removal to the publish window (push borrows only
-                                        // the staged-op field, allowed inside the rows iteration).
-                                        self.pending_rootmap_ops
-                                            .push(RootMapOp::Remove { id: table_id });
-                                        skip_write = true;
-                                    } else if let Some(table_id) =
-                                        self.resolve_dropped_binding(root_page as u64, &version)
-                                    {
-                                        // Table was checkpointed - resolve from the binding that owned
-                                        // this root at the drop ts (snapshot-consistent under reuse).
-                                        self.destroyed_tables.insert(table_id);
-
-                                        // Destroy the B-tree in the pager during checkpoint
-                                        special_write = Some(SpecialWrite::BTreeDestroy {
-                                            table_id,
-                                            root_page: root_page as u64,
-                                            num_columns: version.row.column_count,
-                                        });
-                                    }
-                                } else if root_page < 0 {
-                                    // CREATE TABLE (root page is negative so the table has not been checkpointed yet).
-                                    let table_id = MVTableId::from(root_page);
-                                    let sqlite_schema_rowid =
-                                        version.row.id.row_id.to_int_or_panic();
-                                    special_write = Some(SpecialWrite::BTreeCreate {
-                                        table_id,
-                                        sqlite_schema_rowid,
-                                    });
-                                } else {
-                                    // ALTER TABLE. No "special write is needed"; we'll just update the row in sqlite_schema.
-                                }
-                            }
-                        }
-                    } else if is_delete
-                        && version.row.id.table_id == SQLITE_SCHEMA_MVCC_TABLE_ID
-                        && !version.btree_resident
-                    {
-                        // Schema row without a B-tree identity (e.g. sequence, trigger, view).
-                        // If it was never checkpointed to the B-tree, skip the delete — there
-                        // is nothing to remove from the pager.
-                        let begin_ts = match &version.begin() {
-                            Some(TxTimestampOrID::Timestamp(ts)) => Some(*ts),
-                            _ => None,
-                        };
-                        let was_checkpointed =
-                            self.durable_txid_max_old.is_some_and(|txid_max_old| {
-                                begin_ts.is_some_and(|b| b <= u64::from(txid_max_old))
-                            });
-                        if !was_checkpointed {
-                            skip_write = true;
-                        }
-                    } else if key.table_id != SQLITE_SCHEMA_MVCC_TABLE_ID
-                        && is_delete
-                        && !self.table_exists_for_snapshot(key.table_id)
-                    {
-                        // B-tree was destroyed in a prior checkpoint; late tombstones are logical-only.
-                        skip_write = true;
-                    }
-                    if !skip_write {
-                        tracing::trace!("adding to write_set {:?}", (&version, &special_write));
-                        with_mvcc_checkpoint_allocation_site!(CheckpointWriteSet, {
-                            self.write_set.try_push((version, special_write))?;
-                        });
-                    }
-                }
-                processed += 1;
-                if processed >= COLLECT_PREEMPTION_THRESHOLD {
-                    return Ok(Some(IOCompletions(Completion::new_yield())));
-                }
+            let must_yield = if self.full_scan_generation.is_some() {
+                self.collect_table_rows_from_store(&mut processed)?
+            } else {
+                self.collect_table_rows_from_dirty_keys(&mut processed)?
+            };
+            if must_yield {
+                return Ok(Some(IOCompletions(Completion::new_yield())));
             }
             if self.collect_table_phase == CollectTablePhase::Schema {
                 self.collect_table_phase = CollectTablePhase::User;
@@ -1335,6 +1193,10 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
                 continue;
             }
             break;
+        }
+        #[cfg(debug_assertions)]
+        if self.full_scan_generation.is_none() {
+            self.debug_assert_checkpointable_table_keys_are_dirty();
         }
         self.write_set.sort_by_key(|version| {
             (
@@ -1345,6 +1207,212 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
             )
         });
         Ok(None)
+    }
+
+    /// Returns true when the batch budget ran out and the caller must yield.
+    fn collect_table_rows_from_store(&mut self, processed: &mut usize) -> Result<bool> {
+        let bounds = self.collect_table_bounds();
+        let mvstore = self.mvstore.clone();
+        let guard = epoch::pin();
+        let mut range = mvstore.rows.range(bounds);
+        while let Some(pinned) = range.inner.next(&guard) {
+            let entry = CollectEntry::new(pinned, &guard);
+            let key = entry.key();
+            tracing::trace!("collecting {key:?}");
+            self.collect_table_cursor = Some(key.clone());
+            if self.destroyed_tables.contains(&key.table_id) {
+                // We won't checkpoint rows for tables that will be destroyed in this checkpoint.
+                // There's two forms of destroyed table:
+                // 1. A non-checkpointed table that was created in the logical log and then destroyed. We don't need to do anything about this table in the pager/btree layer.
+                // 2. A checkpointed table that was destroyed in the logical log. We need to destroy the btree in the pager/btree layer.
+                tracing::trace!("skipping {key:?}");
+                continue;
+            }
+            let row_versions = entry.value().read();
+            self.collect_table_row_versions(key, &row_versions)?;
+            *processed += 1;
+            if *processed >= COLLECT_PREEMPTION_THRESHOLD {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    /// Reads each chain from the store at visit time. GC can unlink a chain and
+    /// a later write can create a fresh one, so the dirty map holds no chains.
+    fn collect_table_rows_from_dirty_keys(&mut self, processed: &mut usize) -> Result<bool> {
+        let bounds = self.collect_table_bounds();
+        let mvstore = self.mvstore.clone();
+        let guard = epoch::pin();
+        let mut range = mvstore.checkpoint_dirty_table_keys.range(bounds);
+        let mut rows = LockstepCursor::new(&mvstore.rows, &guard);
+        while let Some(pinned) = range.inner.next(&guard) {
+            let entry = CollectEntry::new(pinned, &guard);
+            let key = entry.key();
+            tracing::trace!("collecting dirty {key:?}");
+            self.collect_table_cursor = Some(key.clone());
+            *processed += 1;
+            self.record_prune_candidate(key, entry.value().load(Ordering::Acquire))?;
+            if !self.destroyed_tables.contains(&key.table_id) {
+                if let Some(chain) = rows.advance_to(key) {
+                    let row_versions = chain.read();
+                    self.collect_table_row_versions(key, &row_versions)?;
+                }
+            }
+            if *processed >= COLLECT_PREEMPTION_THRESHOLD {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    fn collect_table_row_versions(
+        &mut self,
+        key: &RowID,
+        row_versions: &[RowVersion],
+    ) -> Result<()> {
+        for version in self.maybe_get_checkpointable_versions(row_versions, key.table_id) {
+            let is_delete = version.end().is_some();
+
+            let mut special_write = None;
+            // Set to true for schema deletes of never-checkpointed tables/indexes.
+            // These don't need to be written to the B-tree, we just need to track them.
+            let mut skip_write = false;
+
+            if let Some(schema_identity) = sqlite_schema_btree_identity(&version) {
+                let root_page = schema_identity.root_page;
+                match schema_identity.kind {
+                    SqliteSchemaBtreeKind::Index => {
+                        // This is an index schema change
+                        if is_delete {
+                            // DROP INDEX
+                            if root_page < 0 {
+                                // Index was never checkpointed - derive index_id directly from root_page.
+                                // No BTreeDestroyIndex needed since there's no physical B-tree.
+                                let index_id = MVTableId(root_page);
+                                self.destroyed_indexes.insert(index_id);
+                                // Defer the removal to the publish window. Pushing to the
+                                // staged op list borrows only that field, so it is allowed
+                                // inside the `self.mvstore.rows` iteration.
+                                self.pending_rootmap_ops
+                                    .push(RootMapOp::Remove { id: index_id });
+                                skip_write = true;
+                            } else if let Some(index_id) =
+                                self.resolve_dropped_binding(root_page as u64, &version)
+                            {
+                                // DROP INDEX - index was checkpointed. Resolve the dropped
+                                // index from the binding that owned this root at the drop ts.
+                                self.destroyed_indexes.insert(index_id);
+
+                                // DROP INDEX during checkpoint: schema may no longer contain the index definition.
+                                // Fixes DROP INDEX during checkpoint when the schema cache no longer
+                                // contains the index metadata; we only need a cursor to destroy pages so num_columns is not important.
+                                let num_columns = self
+                                    .index_id_to_index
+                                    .get(&index_id)
+                                    .map(|index| index.columns.len())
+                                    .unwrap_or(0);
+
+                                special_write = Some(SpecialWrite::BTreeDestroyIndex {
+                                    index_id,
+                                    root_page: root_page as u64,
+                                    num_columns,
+                                });
+                            } else {
+                                // No binding owned this root at the drop ts: the index was
+                                // already destroyed by an earlier checkpoint and this
+                                // schema-delete lingered in the store. Nothing to destroy.
+                                skip_write = true;
+                            }
+                        } else if root_page < 0 {
+                            // CREATE INDEX (root page is negative so the index has not been checkpointed yet).
+                            let index_id = MVTableId::from(root_page);
+                            let sqlite_schema_rowid = version.row.id.row_id.to_int_or_panic();
+                            special_write = Some(SpecialWrite::BTreeCreateIndex {
+                                index_id,
+                                sqlite_schema_rowid,
+                            });
+                        } else {
+                            // Index schema row update (e.g. ALTER TABLE RENAME COLUMN propagates
+                            // to index SQL). No B-tree creation needed; the row itself is written
+                            // to sqlite_schema below. See: test_checkpoint_allows_index_schema_update_after_rename_column.
+                        }
+                    }
+                    SqliteSchemaBtreeKind::Table => {
+                        // This is a table schema change (existing logic)
+                        tracing::trace!(
+                            "table schema change with root page {root_page}, is_delete={is_delete}"
+                        );
+                        if is_delete {
+                            if root_page < 0 {
+                                // Table was never checkpointed - derive table_id directly from root_page.
+                                // No BTreeDestroy needed since there's no physical B-tree.
+                                let table_id = MVTableId::from(root_page);
+                                self.destroyed_tables.insert(table_id);
+                                // Defer the removal to the publish window (push borrows only
+                                // the staged-op field, allowed inside the rows iteration).
+                                self.pending_rootmap_ops
+                                    .push(RootMapOp::Remove { id: table_id });
+                                skip_write = true;
+                            } else if let Some(table_id) =
+                                self.resolve_dropped_binding(root_page as u64, &version)
+                            {
+                                // Table was checkpointed - resolve from the binding that owned
+                                // this root at the drop ts (snapshot-consistent under reuse).
+                                self.destroyed_tables.insert(table_id);
+
+                                // Destroy the B-tree in the pager during checkpoint
+                                special_write = Some(SpecialWrite::BTreeDestroy {
+                                    table_id,
+                                    root_page: root_page as u64,
+                                    num_columns: version.row.column_count,
+                                });
+                            }
+                        } else if root_page < 0 {
+                            // CREATE TABLE (root page is negative so the table has not been checkpointed yet).
+                            let table_id = MVTableId::from(root_page);
+                            let sqlite_schema_rowid = version.row.id.row_id.to_int_or_panic();
+                            special_write = Some(SpecialWrite::BTreeCreate {
+                                table_id,
+                                sqlite_schema_rowid,
+                            });
+                        } else {
+                            // ALTER TABLE. No "special write is needed"; we'll just update the row in sqlite_schema.
+                        }
+                    }
+                }
+            } else if is_delete
+                && version.row.id.table_id == SQLITE_SCHEMA_MVCC_TABLE_ID
+                && !version.btree_resident
+            {
+                // Schema row without a B-tree identity (e.g. sequence, trigger, view).
+                // If it was never checkpointed to the B-tree, skip the delete — there
+                // is nothing to remove from the pager.
+                let begin_ts = match &version.begin() {
+                    Some(TxTimestampOrID::Timestamp(ts)) => Some(*ts),
+                    _ => None,
+                };
+                let was_checkpointed = self.durable_txid_max_old.is_some_and(|txid_max_old| {
+                    begin_ts.is_some_and(|b| b <= u64::from(txid_max_old))
+                });
+                if !was_checkpointed {
+                    skip_write = true;
+                }
+            } else if key.table_id != SQLITE_SCHEMA_MVCC_TABLE_ID
+                && is_delete
+                && !self.table_exists_for_snapshot(key.table_id)
+            {
+                // B-tree was destroyed in a prior checkpoint; late tombstones are logical-only.
+                skip_write = true;
+            }
+            if !skip_write {
+                tracing::trace!("adding to write_set {:?}", (&version, &special_write));
+                with_mvcc_checkpoint_allocation_site!(CheckpointWriteSet, {
+                    self.write_set.try_push((version, special_write))?;
+                });
+            }
+        }
+        Ok(())
     }
 
     fn collect_table_bounds(&self) -> (Bound<RowID>, Bound<RowID>) {
@@ -1371,6 +1439,22 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
     ///    * The row is not a delete (we inserted or changed an existing row), OR
     ///    * The row is a delete AND it exists in the database file already.
     fn collect_index_rows(&mut self) -> Result<Option<IOCompletions>> {
+        let must_yield = if self.full_scan_generation.is_some() {
+            self.collect_index_rows_from_store()?
+        } else {
+            self.collect_index_rows_from_dirty_keys()?
+        };
+        if must_yield {
+            return Ok(Some(IOCompletions(Completion::new_yield())));
+        }
+        #[cfg(debug_assertions)]
+        if self.full_scan_generation.is_none() {
+            self.debug_assert_checkpointable_index_keys_are_dirty();
+        }
+        Ok(None)
+    }
+
+    fn collect_index_rows_from_store(&mut self) -> Result<bool> {
         let outer_bounds: (Bound<MVTableId>, Bound<MVTableId>) =
             match self.collect_index_tableid_cursor {
                 None => (Bound::Unbounded, Bound::Unbounded),
@@ -1380,8 +1464,9 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
                 Some(last) => (Bound::Included(last), Bound::Unbounded),
             };
         let mut processed = 0;
+        let mvstore = self.mvstore.clone();
         let guard = epoch::pin();
-        let mut outer_range = self.mvstore.index_rows.range(outer_bounds);
+        let mut outer_range = mvstore.index_rows.range(outer_bounds);
         while let Some(pinned) = outer_range.inner.next(&guard) {
             let outer = CollectEntry::new(pinned, &guard);
             let index_id = *outer.key();
@@ -1405,29 +1490,173 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
                 let versions = entry.value().read();
                 self.collect_index_tableid_cursor = Some(index_id);
                 self.collect_index_key_cursor = Some(entry.key().clone());
-
-                for version in self.maybe_get_checkpointable_versions(&versions, index_id) {
-                    let is_delete = version.end().is_some();
-                    if is_delete && !self.table_exists_for_snapshot(index_id) {
-                        continue;
-                    }
-
-                    // Only write the row to the B-tree if it is not a delete, or if it is a delete and it exists in
-                    // the database file.
-                    with_mvcc_checkpoint_allocation_site!(CheckpointIndexWriteSet, {
-                        self.index_write_set
-                            .try_push((index_id, version, is_delete))?;
-                    });
-                }
+                self.collect_index_row_versions(index_id, &versions)?;
                 processed += 1;
                 if processed >= COLLECT_PREEMPTION_THRESHOLD {
-                    return Ok(Some(IOCompletions(Completion::new_yield())));
+                    return Ok(true);
                 }
             }
             self.collect_index_tableid_cursor = Some(index_id);
             self.collect_index_key_cursor = None;
         }
-        Ok(None)
+        Ok(false)
+    }
+
+    fn collect_index_rows_from_dirty_keys(&mut self) -> Result<bool> {
+        let bounds: (Bound<RowID>, Bound<RowID>) = match &self.collect_dirty_index_cursor {
+            None => (Bound::Unbounded, Bound::Unbounded),
+            Some(last) => (Bound::Excluded(last.clone()), Bound::Unbounded),
+        };
+        let mut processed = 0;
+        let mvstore = self.mvstore.clone();
+        let guard = epoch::pin();
+        let mut range = mvstore.checkpoint_dirty_index_keys.range(bounds);
+        let mut current_index: Option<(
+            MVTableId,
+            IndexRowsEntry<'_, A>,
+            IndexKeyCursor<'_, '_, A>,
+        )> = None;
+        while let Some(pinned) = range.inner.next(&guard) {
+            let entry = CollectEntry::new(pinned, &guard);
+            let key = entry.key();
+            self.collect_dirty_index_cursor = Some(key.clone());
+            processed += 1;
+            self.record_prune_candidate(key, entry.value().load(Ordering::Acquire))?;
+            let index_id = key.table_id;
+            if !self.destroyed_indexes.contains(&index_id) {
+                let RowKey::Record(index_key) = &key.row_id else {
+                    unreachable!("dirty index keys always carry a Record key");
+                };
+                if current_index
+                    .as_ref()
+                    .is_none_or(|(id, _, _)| *id != index_id)
+                {
+                    current_index = mvstore.index_rows.get(&index_id).map(|index| {
+                        let keys = LockstepCursor::new(index.value(), &guard);
+                        (index_id, index, keys)
+                    });
+                }
+                if let Some((_, _, keys)) = current_index.as_mut() {
+                    if let Some(chain) = keys.advance_to(index_key) {
+                        let versions = chain.read();
+                        self.collect_index_row_versions(index_id, &versions)?;
+                    }
+                }
+            }
+            if processed >= COLLECT_PREEMPTION_THRESHOLD {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    fn collect_index_row_versions(
+        &mut self,
+        index_id: MVTableId,
+        versions: &[RowVersion],
+    ) -> Result<()> {
+        for version in self.maybe_get_checkpointable_versions(versions, index_id) {
+            let is_delete = version.end().is_some();
+            if is_delete && !self.table_exists_for_snapshot(index_id) {
+                continue;
+            }
+
+            // Only write the row to the B-tree if it is not a delete, or if it is a delete and it exists in
+            // the database file.
+            with_mvcc_checkpoint_allocation_site!(CheckpointIndexWriteSet, {
+                self.index_write_set
+                    .try_push((index_id, version, is_delete))?;
+            });
+        }
+        Ok(())
+    }
+
+    /// A stamp at or below the snapshot means every commit that marked the
+    /// key committed at or before the snapshot, so this checkpoint collected
+    /// all of its versions and prune can remove the key.
+    fn record_prune_candidate(&mut self, key: &RowID, stamp: u64) -> Result<()> {
+        if stamp <= self.snapshot_ts {
+            self.prune_candidates.try_push((key.clone(), stamp))?;
+        }
+        Ok(())
+    }
+
+    /// Removes up to `COLLECT_PREEMPTION_THRESHOLD` prune candidates from the
+    /// dirty maps. Returns a yield when candidates remain.
+    fn prune_dirty_keys(&mut self) -> Option<IOCompletions> {
+        let mvstore = self.mvstore.clone();
+        let end = self.prune_candidates.len().min(
+            self.prune_cursor
+                .saturating_add(COLLECT_PREEMPTION_THRESHOLD),
+        );
+        for (key, stamp) in &self.prune_candidates[self.prune_cursor..end] {
+            let Some(latest) = mvstore.unmark_checkpoint_dirty_key(key) else {
+                continue;
+            };
+            // A commit marked the key after collect visited it. Its versions
+            // are not in this checkpoint, so the key stays dirty.
+            if latest != *stamp && mvstore.mark_checkpoint_dirty_key(key, latest).is_err() {
+                mvstore.require_checkpoint_full_scan();
+            }
+        }
+        self.prune_cursor = end;
+        if end < self.prune_candidates.len() {
+            return Some(IOCompletions(Completion::new_yield()));
+        }
+        None
+    }
+
+    /// Every row a full scan would collect must be a dirty key. Otherwise a
+    /// dirty-key collect skips it and log truncation loses the row.
+    #[cfg(debug_assertions)]
+    fn debug_assert_checkpointable_table_keys_are_dirty(&self) {
+        if self.mvstore.checkpoint_full_scan_generation().is_some() {
+            return;
+        }
+        for entry in self.mvstore.rows.iter() {
+            let key = entry.key();
+            if self.destroyed_tables.contains(&key.table_id) {
+                continue;
+            }
+            let versions = entry.value().read();
+            if self
+                .maybe_get_checkpointable_versions(&versions, key.table_id)
+                .is_empty()
+            {
+                continue;
+            }
+            debug_assert!(
+                self.mvstore.checkpoint_dirty_table_keys.contains_key(key),
+                "checkpointable row {key:?} is missing from the dirty keys"
+            );
+        }
+    }
+
+    #[cfg(debug_assertions)]
+    fn debug_assert_checkpointable_index_keys_are_dirty(&self) {
+        if self.mvstore.checkpoint_full_scan_generation().is_some() {
+            return;
+        }
+        for index in self.mvstore.index_rows.iter() {
+            let index_id = *index.key();
+            if self.destroyed_indexes.contains(&index_id) {
+                continue;
+            }
+            for entry in index.value().iter() {
+                let versions = entry.value().read();
+                if self
+                    .maybe_get_checkpointable_versions(&versions, index_id)
+                    .is_empty()
+                {
+                    continue;
+                }
+                let key = RowID::new(index_id, RowKey::Record(entry.key().clone()));
+                debug_assert!(
+                    self.mvstore.checkpoint_dirty_index_keys.contains_key(&key),
+                    "checkpointable index row {key:?} is missing from the dirty keys"
+                );
+            }
+        }
     }
 
     #[cfg(any(test, debug_assertions))]
@@ -2068,6 +2297,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
 
                 if passive {
                     self.snapshot_ts = self.mvstore.checkpoint_snapshot_ts();
+                    self.full_scan_generation = self.mvstore.checkpoint_full_scan_generation();
                     // Checkpoint state machines can be created before they are run.
                     // Resample after serializing so already-durable index deletes are not replayed.
                     self.refresh_checkpoint_bounds();
@@ -2092,6 +2322,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
                 // Sample the snapshot only after the stop-the-world lock: no concurrent
                 // commits can land between snapshot_ts and collection on this path.
                 self.snapshot_ts = self.mvstore.checkpoint_snapshot_ts();
+                self.full_scan_generation = self.mvstore.checkpoint_full_scan_generation();
                 // Checkpoint state machines can be created before they are run.
                 // Resample after serializing with other checkpoints so already-durable
                 // index deletes are not replayed, and keep schema-derived index metadata
@@ -2174,6 +2405,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
                 }
             }
             CheckpointState::CollectTableRows => {
+                inject_transition_yield!(self, CheckpointYieldPoint::BeforeCollectTableRows);
                 if let Some(io) = self.collect_table_rows()? {
                     return Ok(TransitionResult::Io(io));
                 }
@@ -3080,6 +3312,17 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
                 if let Some(io) = self.gc_checkpointed_index_versions() {
                     return Ok(TransitionResult::Io(io));
                 }
+                self.state = CheckpointState::PruneDirtyKeys;
+                Ok(TransitionResult::Continue)
+            }
+
+            CheckpointState::PruneDirtyKeys => {
+                if let Some(io) = self.prune_dirty_keys() {
+                    return Ok(TransitionResult::Io(io));
+                }
+                if let Some(generation) = self.full_scan_generation {
+                    self.mvstore.clear_checkpoint_full_scan(generation);
+                }
                 self.state = CheckpointState::Finalize;
                 Ok(TransitionResult::Continue)
             }
@@ -3141,6 +3384,70 @@ impl<K, V, C, A: SkiplistAllocator> Drop for CollectEntry<'_, '_, K, V, C, A> {
         if let Some(entry) = self.entry.take() {
             entry.release(self.guard);
         }
+    }
+}
+
+impl<'a, 'g, K, V, C: Comparator<K>, A: SkiplistAllocator> CollectEntry<'a, 'g, K, V, C, A> {
+    fn next(&self) -> Option<Self> {
+        self.entry
+            .as_ref()
+            .expect("collect entry still held")
+            .next(self.guard)
+            .map(|entry| Self::new(entry, self.guard))
+    }
+}
+
+type IndexKeyCursor<'a, 'g, A> = LockstepCursor<'a, 'g, Arc<SortableIndexKey>, RowVersions<A>, A>;
+
+/// A pinned position in a SkipMap that moves forward through keys given in
+/// ascending order. It steps node by node while the next key is near and
+/// seeks when it is far, so a dense run of dirty keys costs a sequential
+/// walk instead of one search per key.
+struct LockstepCursor<'a, 'g, K, V, A: SkiplistAllocator> {
+    map: &'a SkipMap<K, V, BasicComparator, A>,
+    current: Option<CollectEntry<'a, 'g, K, V, BasicComparator, A>>,
+    guard: &'g epoch::Guard,
+}
+
+impl<'a, 'g, K: Ord + Clone, V, A: SkiplistAllocator> LockstepCursor<'a, 'g, K, V, A> {
+    const NEAR_STEPS: usize = 8;
+
+    fn new(map: &'a SkipMap<K, V, BasicComparator, A>, guard: &'g epoch::Guard) -> Self {
+        Self {
+            map,
+            current: None,
+            guard,
+        }
+    }
+
+    /// Returns the value stored at `key`, or None when the map has no such key.
+    fn advance_to(&mut self, key: &K) -> Option<&'a V> {
+        let mut steps = 0;
+        loop {
+            let Some(current) = self.current.as_ref() else {
+                break;
+            };
+            match current.key().cmp(key) {
+                std::cmp::Ordering::Equal => return Some(current.value()),
+                std::cmp::Ordering::Greater => return None,
+                std::cmp::Ordering::Less if steps < Self::NEAR_STEPS => {
+                    let next = current.next();
+                    self.current = next;
+                    steps += 1;
+                }
+                std::cmp::Ordering::Less => break,
+            }
+        }
+        self.current = self
+            .map
+            .range((Bound::Included(key.clone()), Bound::Unbounded))
+            .inner
+            .next(self.guard)
+            .map(|entry| CollectEntry::new(entry, self.guard));
+        self.current
+            .as_ref()
+            .filter(|current| current.key() == key)
+            .map(|current| current.value())
     }
 }
 
@@ -3568,9 +3875,7 @@ mod tests {
         let (_, tombstone_version) =
             index_row_version(index_id, "blue_river_906", 75, 2, None, Some(10), true);
 
-        mvstore
-            .insert_index_version(index_id, garbage_key, garbage_version)
-            .unwrap();
+        insert_dirty_index_version(&mvstore, index_id, garbage_key, garbage_version);
         let entry = mvstore
             .index_rows
             .get(&index_id)
@@ -3581,9 +3886,7 @@ mod tests {
             .expect("key bucket should exist after first insert")
             .key()
             .clone();
-        mvstore
-            .insert_index_version(index_id, tombstone_key, tombstone_version)
-            .unwrap();
+        insert_dirty_index_version(&mvstore, index_id, tombstone_key, tombstone_version);
 
         while checkpoint.collect_index_rows().unwrap().is_some() {}
 
@@ -3733,8 +4036,58 @@ mod tests {
                 RowVersion,
                 crate::alloc::DynAllocator,
             >>::new_in(crate::alloc::DynAllocator::default());
+        let stamp = version_stamp(&version);
+        versions.push(version);
+        mvstore
+            .rows
+            .insert(key.clone(), Arc::new(RwLock::new(versions)));
+        mvstore.mark_checkpoint_dirty_key(&key, stamp).unwrap();
+    }
+
+    /// The largest timestamp on the version, 0 when it has none.
+    fn version_stamp(version: &RowVersion) -> u64 {
+        [version.begin(), version.end()]
+            .into_iter()
+            .filter_map(|stamp| match stamp {
+                Some(TxTimestampOrID::Timestamp(ts)) => Some(ts),
+                _ => None,
+            })
+            .max()
+            .unwrap_or(0)
+    }
+
+    /// Inserts a chain that no commit marked, like a row that is already in the DB file.
+    fn insert_clean_row_version(
+        mvstore: &crate::sync::Arc<
+            MvStore<crate::mvcc::clock::MvccClock, crate::alloc::DynAllocator>,
+        >,
+        version: RowVersion,
+    ) {
+        let key = version.row.id.clone();
+        let mut versions =
+            <crate::mvcc::database::RowVersionChain<crate::alloc::DynAllocator> as crate::alloc::TursoVecInExt<
+                RowVersion,
+                crate::alloc::DynAllocator,
+            >>::new_in(crate::alloc::DynAllocator::default());
         versions.push(version);
         mvstore.rows.insert(key, Arc::new(RwLock::new(versions)));
+    }
+
+    fn insert_dirty_index_version(
+        mvstore: &crate::sync::Arc<
+            MvStore<crate::mvcc::clock::MvccClock, crate::alloc::DynAllocator>,
+        >,
+        index_id: MVTableId,
+        key: Arc<SortableIndexKey>,
+        version: RowVersion,
+    ) {
+        let stamp = version_stamp(&version);
+        let (key, _) = mvstore
+            .insert_index_version(index_id, key, version)
+            .unwrap();
+        mvstore
+            .mark_checkpoint_dirty_key(&RowID::new(index_id, RowKey::Record(key)), stamp)
+            .unwrap();
     }
 
     #[test]
@@ -3872,9 +4225,7 @@ mod tests {
         let row_count = COLLECT_PREEMPTION_THRESHOLD + 10;
         for i in 0..row_count as i64 {
             let (key, version) = index_row_version(index_id, "k", i, 1, Some(5), None, false);
-            mvstore
-                .insert_index_version(index_id, key, version)
-                .unwrap();
+            insert_dirty_index_version(&mvstore, index_id, key, version);
         }
 
         let first = checkpoint.collect_index_rows().unwrap();
@@ -3990,9 +4341,7 @@ mod tests {
         let row_count = COLLECT_PREEMPTION_THRESHOLD + 10;
         for i in 0..row_count as i64 {
             let (key, version) = index_row_version(index_id, "k", i, 1, Some(5), None, false);
-            mvstore
-                .insert_index_version(index_id, key, version.clone())
-                .unwrap();
+            insert_dirty_index_version(&mvstore, index_id, key, version.clone());
             checkpoint.index_write_set.push((index_id, version, false));
             checkpoint.written_index_slots.insert(i as usize);
         }
@@ -4037,5 +4386,223 @@ mod tests {
             .get(&index_id)
             .map_or(0, |entry| entry.value().len());
         assert_eq!(remaining, 0);
+    }
+
+    fn dirty_table_key(
+        mvstore: &crate::sync::Arc<
+            MvStore<crate::mvcc::clock::MvccClock, crate::alloc::DynAllocator>,
+        >,
+        table_id: MVTableId,
+        rowid: i64,
+    ) -> bool {
+        mvstore
+            .checkpoint_dirty_table_keys
+            .contains_key(&RowID::new(table_id, RowKey::Int(rowid)))
+    }
+
+    #[test]
+    fn collect_table_rows_visits_only_dirty_keys() {
+        let mut checkpoint = checkpoint_for_collect_tests();
+        let mvstore = checkpoint.mvstore.clone();
+        let table_id = MVTableId::from(-2);
+        for rowid in 1..=10 {
+            insert_clean_row_version(
+                &mvstore,
+                table_row_version(table_id, rowid, 1, Some(1), None, false),
+            );
+        }
+        insert_row_version(&mvstore, committed_table_row_version(table_id, 5));
+
+        while checkpoint.collect_table_rows().unwrap().is_some() {}
+
+        assert_eq!(checkpoint.write_set.len(), 1);
+        assert_eq!(checkpoint.write_set[0].0.row.id.row_id, RowKey::Int(5));
+        assert_eq!(
+            checkpoint.collect_table_cursor,
+            Some(RowID::new(table_id, RowKey::Int(5))),
+            "the dirty walk must stop at the last dirty key, not the last row"
+        );
+    }
+
+    #[test]
+    fn collect_table_rows_full_scan_visits_every_row() {
+        let mut checkpoint = checkpoint_for_collect_tests();
+        checkpoint.full_scan_generation = NonZeroU64::new(1);
+        let mvstore = checkpoint.mvstore.clone();
+        let table_id = MVTableId::from(-2);
+        for rowid in 1..=10 {
+            insert_clean_row_version(
+                &mvstore,
+                table_row_version(table_id, rowid, 1, Some(1), None, false),
+            );
+        }
+        insert_clean_row_version(&mvstore, committed_table_row_version(table_id, 5));
+
+        while checkpoint.collect_table_rows().unwrap().is_some() {}
+
+        assert_eq!(checkpoint.write_set.len(), 1);
+        assert_eq!(
+            checkpoint.collect_table_cursor,
+            Some(RowID::new(table_id, RowKey::Int(10)))
+        );
+    }
+
+    #[test]
+    fn collect_table_rows_tolerates_dirty_key_without_chain() {
+        let mut checkpoint = checkpoint_for_collect_tests();
+        let mvstore = checkpoint.mvstore.clone();
+        let table_id = MVTableId::from(-2);
+        mvstore
+            .mark_checkpoint_dirty_key(&RowID::new(table_id, RowKey::Int(7)), 5)
+            .unwrap();
+        checkpoint.snapshot_ts = 10;
+
+        while checkpoint.collect_table_rows().unwrap().is_some() {}
+        assert!(checkpoint.write_set.is_empty());
+
+        assert!(checkpoint.prune_dirty_keys().is_none());
+        assert!(!dirty_table_key(&mvstore, table_id, 7));
+    }
+
+    #[test]
+    fn prune_dirty_keys_keeps_key_marked_again_after_collect() {
+        let mut checkpoint = checkpoint_for_collect_tests();
+        let mvstore = checkpoint.mvstore.clone();
+        let table_id = MVTableId::from(-2);
+        let key = RowID::new(table_id, RowKey::Int(7));
+        mvstore.mark_checkpoint_dirty_key(&key, 5).unwrap();
+        checkpoint.snapshot_ts = 10;
+
+        while checkpoint.collect_table_rows().unwrap().is_some() {}
+        mvstore.mark_checkpoint_dirty_key(&key, 50).unwrap();
+
+        assert!(checkpoint.prune_dirty_keys().is_none());
+        let entry = mvstore
+            .checkpoint_dirty_table_keys
+            .get(&key)
+            .expect("a key marked after collect must stay dirty");
+        assert_eq!(entry.value().load(Ordering::Acquire), 50);
+    }
+
+    #[test]
+    fn collect_index_rows_visits_only_dirty_keys() {
+        let mut checkpoint = checkpoint_for_collect_tests();
+        let mvstore = checkpoint.mvstore.clone();
+        let index_id = MVTableId::from(-7);
+        let (clean_key, clean_version) =
+            index_row_version(index_id, "k", 1, 1, Some(1), None, false);
+        mvstore
+            .insert_index_version(index_id, clean_key, clean_version)
+            .unwrap();
+        let (dirty_key, dirty_version) =
+            index_row_version(index_id, "k", 2, 1, Some(5), None, false);
+        insert_dirty_index_version(&mvstore, index_id, dirty_key, dirty_version);
+
+        while checkpoint.collect_index_rows().unwrap().is_some() {}
+
+        assert_eq!(checkpoint.index_write_set.len(), 1);
+        assert_eq!(checkpoint.index_write_set[0].1.id, 1);
+        assert!(checkpoint.collect_dirty_index_cursor.is_some());
+        assert!(checkpoint.collect_index_key_cursor.is_none());
+    }
+
+    #[test]
+    fn prune_dirty_keys_keeps_keys_with_versions_past_the_snapshot() {
+        let mut checkpoint = checkpoint_for_collect_tests();
+        let mvstore = checkpoint.mvstore.clone();
+        let table_id = MVTableId::from(-2);
+        insert_row_version(&mvstore, committed_table_row_version(table_id, 1));
+        insert_row_version(
+            &mvstore,
+            table_row_version(table_id, 2, 1, Some(50), None, false),
+        );
+        insert_row_version(
+            &mvstore,
+            table_row_version(table_id, 3, 1, Some(5), Some(50), false),
+        );
+        let index_id = MVTableId::from(-7);
+        let (old_key, old_version) = index_row_version(index_id, "k", 1, 1, Some(5), None, false);
+        insert_dirty_index_version(&mvstore, index_id, old_key, old_version);
+        let (new_key, new_version) = index_row_version(index_id, "k", 2, 1, Some(50), None, false);
+        insert_dirty_index_version(&mvstore, index_id, new_key, new_version);
+        checkpoint.snapshot_ts = 10;
+        while checkpoint.collect_table_rows().unwrap().is_some() {}
+        while checkpoint.collect_index_rows().unwrap().is_some() {}
+
+        assert!(checkpoint.prune_dirty_keys().is_none());
+
+        assert!(!dirty_table_key(&mvstore, table_id, 1));
+        assert!(dirty_table_key(&mvstore, table_id, 2));
+        assert!(dirty_table_key(&mvstore, table_id, 3));
+        let remaining: Vec<_> = mvstore
+            .checkpoint_dirty_index_keys
+            .iter()
+            .map(|entry| entry.key().clone())
+            .collect();
+        assert_eq!(
+            remaining.len(),
+            1,
+            "only the index key with a newer version stays: {remaining:?}"
+        );
+        let index = mvstore.index_rows.get(&index_id).unwrap();
+        let RowKey::Record(remaining_key) = &remaining[0].row_id else {
+            panic!("index dirty keys carry Record keys");
+        };
+        let chain = index.value().get(remaining_key).unwrap();
+        assert_eq!(
+            chain.value().read()[0].begin(),
+            Some(TxTimestampOrID::Timestamp(50))
+        );
+    }
+
+    #[test]
+    fn prune_dirty_keys_preempts_on_large_map() {
+        let mut checkpoint = checkpoint_for_collect_tests();
+        let mvstore = checkpoint.mvstore.clone();
+        let table_id = MVTableId::from(-2);
+        let row_count = COLLECT_PREEMPTION_THRESHOLD + 10;
+        for rowid in 0..row_count as i64 {
+            insert_row_version(&mvstore, committed_table_row_version(table_id, rowid));
+        }
+        checkpoint.snapshot_ts = 10;
+        while checkpoint.collect_table_rows().unwrap().is_some() {}
+        while checkpoint.collect_index_rows().unwrap().is_some() {}
+
+        let first = checkpoint.prune_dirty_keys();
+        assert!(
+            first.is_some_and(|io| io.is_explicit_yield()),
+            "pruning more than COLLECT_PREEMPTION_THRESHOLD keys must preempt with an explicit yield"
+        );
+        while checkpoint.prune_dirty_keys().is_some() {}
+        assert!(mvstore.checkpoint_dirty_table_keys.is_empty());
+    }
+
+    #[test]
+    fn dirty_walk_finds_near_and_far_keys_and_skips_missing_chains() {
+        let mut checkpoint = checkpoint_for_collect_tests();
+        let mvstore = checkpoint.mvstore.clone();
+        let table_id = MVTableId::from(-2);
+        for rowid in 1..=200 {
+            insert_clean_row_version(
+                &mvstore,
+                table_row_version(table_id, rowid, 1, Some(1), None, false),
+            );
+        }
+        for rowid in [1, 2, 3, 150, 200] {
+            insert_row_version(&mvstore, committed_table_row_version(table_id, rowid));
+        }
+        mvstore
+            .mark_checkpoint_dirty_key(&RowID::new(table_id, RowKey::Int(60)), 5)
+            .unwrap();
+        mvstore.rows.remove(&RowID::new(table_id, RowKey::Int(60)));
+
+        while checkpoint.collect_table_rows().unwrap().is_some() {}
+
+        let collected: Vec<i64> = checkpoint
+            .write_set
+            .iter()
+            .map(|(version, _)| version.row.id.row_id.to_int_or_panic())
+            .collect();
+        assert_eq!(collected, vec![1, 2, 3, 150, 200]);
     }
 }
