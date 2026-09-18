@@ -508,6 +508,8 @@ pub(super) fn choose_best_in_seek_candidate(
     rhs_table: &JoinedTable,
     rhs_constraints: &TableConstraints,
     lhs_mask: &TableMask,
+    where_clause: &[WhereTerm],
+    table_references: &TableReferences,
     input_cardinality: f64,
     base_row_count: RowCountEstimate,
     params: &CostModelParams,
@@ -524,6 +526,7 @@ pub(super) fn choose_best_in_seek_candidate(
     let tree_depth = estimate_btree_depth(base, params.rows_per_table_page);
     let mut best_in_seek = None;
     let mut best_in_seek_cost = best_cost;
+    let may_null_extend = table_references.outer_join_may_null_extend(rhs_table.internal_id);
 
     for candidate in rhs_constraints.candidates.iter() {
         let first_col_pos = candidate
@@ -560,6 +563,16 @@ pub(super) fn choose_best_in_seek_candidate(
                 continue;
             };
             if not || !lhs_mask.contains_all_set_bits_of(&constraint.lhs_mask) {
+                continue;
+            }
+
+            // If an outer join can null-extend this table, a WHERE-clause IN
+            // term must stay a plain filter so it also runs on the
+            // null-extended rows; driving the seek from it would skip them
+            // (#8753). ON-clause terms only define what a match is, so they
+            // can still drive the seek.
+            let term = &where_clause[constraint.where_clause_pos.0];
+            if may_null_extend && term.from_outer_join != Some(rhs_table.internal_id) {
                 continue;
             }
 
@@ -633,10 +646,13 @@ pub(super) fn choose_best_in_seek_candidate(
     Ok(best_in_seek)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn consider_in_seek_access_method(
     rhs_table: &JoinedTable,
     rhs_constraints: &TableConstraints,
     lhs_mask: &TableMask,
+    where_clause: &[WhereTerm],
+    table_references: &TableReferences,
     input_cardinality: f64,
     base_row_count: RowCountEstimate,
     params: &CostModelParams,
@@ -646,6 +662,8 @@ fn consider_in_seek_access_method(
         rhs_table,
         rhs_constraints,
         lhs_mask,
+        where_clause,
+        table_references,
         input_cardinality,
         base_row_count,
         params,
@@ -977,6 +995,8 @@ fn find_best_access_method_for_btree(
             rhs_table,
             rhs_constraints,
             lhs_mask,
+            where_clause,
+            table_references,
             input_cardinality,
             base_row_count,
             params,
