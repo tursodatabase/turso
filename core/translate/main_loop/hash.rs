@@ -187,12 +187,6 @@ impl<'a, 'plan> HashBuildPlanner<'a, 'plan> {
             key_affinities: key_affinities.clone(),
             use_bloom_filter,
             materialized_input_cursor: materialized_cursor_id,
-            materialized_mode: materialized_input.as_ref().map(|input| match input.mode {
-                MaterializedBuildInputMode::RowidOnly => MaterializedBuildInputModeTag::RowidOnly,
-                MaterializedBuildInputMode::KeyPayload { .. } => {
-                    MaterializedBuildInputModeTag::Payload
-                }
-            }),
         };
 
         if self
