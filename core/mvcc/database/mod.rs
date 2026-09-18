@@ -3622,15 +3622,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> StateTransition for CommitStat
                 // commit dependencies listed in its CommitDepSet. If it committed, it
                 // decrements the target transaction's CommitDepCounter."
                 // IOW since this txn committed, let's signal waiting transactions.
-                let dependents = std::mem::take(&mut *tx_unlocked.commit_dep_set.lock());
-                for dep_tx_id in dependents {
-                    if let Some(dep_tx_entry) = mvcc_store.txs.get(&dep_tx_id) {
-                        dep_tx_entry
-                            .value()
-                            .commit_dep_counter
-                            .fetch_sub(1, Ordering::AcqRel);
-                    }
-                }
+                mvcc_store.notify_committed_dependents(tx_unlocked);
 
                 let appended_to_log = self.wrote_logical_log;
                 mvcc_store.unlock_commit_lock_if_held(tx_unlocked);
@@ -7100,6 +7092,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                 // removed TxID (https://github.com/tursodatabase/turso/issues/7477).
                 self.rewrite_live_versions_for_committed_tx(tx_id, end_ts);
                 if let Some(tx) = self.txs.get(&tx_id) {
+                    self.notify_committed_dependents(tx.value());
                     self.unlock_commit_lock_if_held(tx.value());
                 }
                 if self.is_exclusive_tx(&tx_id) {
@@ -7116,6 +7109,18 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                 if self.is_exclusive_tx(&tx_id) {
                     self.release_exclusive_tx(&tx_id);
                 }
+            }
+        }
+    }
+
+    fn notify_committed_dependents(&self, tx: &Transaction<A>) {
+        let dependents = std::mem::take(&mut *tx.commit_dep_set.lock());
+        for dep_tx_id in dependents {
+            if let Some(dep_tx_entry) = self.txs.get(&dep_tx_id) {
+                dep_tx_entry
+                    .value()
+                    .commit_dep_counter
+                    .fetch_sub(1, Ordering::AcqRel);
             }
         }
     }
