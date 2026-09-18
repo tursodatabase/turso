@@ -1,0 +1,62 @@
+{
+  "analyze_tool": "python3 sqlite3 module, SQLite 3.45.1 (the shell harness installs 3.50.4; Turso reads only sqlite_stat1)",
+  "branch": "claude/affectionate-faraday-o7mmvh",
+  "build": {
+    "production_comparison_features": "none (ordinary release build)",
+    "profile": "release",
+    "search_binary_features": "turso_core/optimizer_params (join-benchmark: optimizer_params)"
+  },
+  "database_sha256": "be2a81a548d930ae8c7a9eb427c44f73e2a753d53ffb16bb2a13f89ec8eb8bc8",
+  "database_source": "https://github.com/lovasoa/TPCH-sqlite/releases/download/v1.0/TPC-H.db",
+  "databases": {
+    "analyzed": {
+      "bytes": 1252868096,
+      "path": "/tmp/claude-0/-home-user-turso/db7c7c47-b399-56da-a5bc-1e6705721b26/scratchpad/data/tpch-analyzed.db",
+      "sha256_head_64mib": "52dc37011854800b10eb4253bdfc7c9c263d6ec01a284560b3e16eb64b5ce29b"
+    },
+    "nostats": {
+      "bytes": 1252864000,
+      "path": "/tmp/claude-0/-home-user-turso/db7c7c47-b399-56da-a5bc-1e6705721b26/scratchpad/data/tpch-nostats.db",
+      "sha256_head_64mib": "bb31af14d20360af7b7b133dc818d5ad2b5021d236c585eeed85c60b3538fb1e"
+    }
+  },
+  "hardware": {
+    "cores": 4,
+    "cpu": "Intel(R) Xeon(R) Processor @ 2.80GHz",
+    "kernel": "Linux 6.18.44-fc-v33",
+    "memory_gib": 15,
+    "os": "Ubuntu 24.04.4 LTS",
+    "storage": "single virtual disk, /dev/vda"
+  },
+  "io_backend": {
+    "search_and_validation": "PlatformIO (UnixIO syscalls), warm page cache",
+    "target_regime": "io_uring, page cache dropped before every query"
+  },
+  "repository_commit": "ae6e1561de1e2a331eff3ba94a1cfc78c9f7989c",
+  "search_binary_sha256": "a11889beee39e648b6f25772dfc823ac64e6bd288b01f4e7bb2fc2292d20d95f",
+  "seeds": {
+    "combined_search": 3,
+    "cost_only_search": 1,
+    "heuristics_search": 2,
+    "local_refinement": [
+      4,
+      5
+    ],
+    "plan_sweeps": [
+      21,
+      22,
+      23
+    ],
+    "stability_probes": [
+      31,
+      41,
+      51
+    ]
+  },
+  "toolchain": {
+    "cargo": "cargo 1.88.0 (873a06493 2025-05-10)",
+    "python": "3.11.15",
+    "rustc": "rustc 1.88.0 (6b00bc388 2025-06-23)"
+  },
+  "working_tree_clean_at_start": true
+}

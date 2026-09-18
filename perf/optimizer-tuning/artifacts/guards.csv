@@ -1,0 +1,11 @@
+guard,defaults_rows_read,proposed_rows_read,work_ratio,defaults_ms,proposed_ms
+composite_range_analyzed,133,133,1.0,0.1196,0.0712
+correlated_exists_no_stats,200,200,1.0,0.1273,0.1246
+indexed_lookup_no_stats,1000,1000,1.0,0.218,0.2178
+or_two_indexes_no_stats,800,800,1.0,0.3045,0.2981
+range_join_analyzed,231,231,1.0,0.0931,0.0918
+range_join_no_stats,231,231,1.0,0.0911,0.0927
+range_on_index_analyzed,1999,1999,1.0,0.402,0.4025
+range_on_index_no_stats,1999,1999,1.0,0.4123,0.4037
+sort_elimination_range_no_stats,49,49,1.0,0.0054,0.0077
+two_index_equalities,2000,2000,1.0,0.2824,0.2958

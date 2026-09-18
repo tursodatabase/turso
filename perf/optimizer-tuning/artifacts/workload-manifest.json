@@ -1,0 +1,211 @@
+{
+  "queries": [
+    {
+      "bytes": 540,
+      "directives": [],
+      "file": "1.sql",
+      "query": "1",
+      "sha256": "c5f94aa7fd7b2a8f6bfde21156418f47aa8df1659425151b357ad16b0ece498e",
+      "writable": false
+    },
+    {
+      "bytes": 671,
+      "directives": [],
+      "file": "2.sql",
+      "query": "2",
+      "sha256": "6c607878cfff623bdd2524a14f671261832af3063059ed6b9552489e551e5548",
+      "writable": false
+    },
+    {
+      "bytes": 390,
+      "directives": [],
+      "file": "3.sql",
+      "query": "3",
+      "sha256": "e081492a6a911716647d91a4e8641d23b68b39b9499c8f3dd0c39e4382dea8cb",
+      "writable": false
+    },
+    {
+      "bytes": 365,
+      "directives": [],
+      "file": "4.sql",
+      "query": "4",
+      "sha256": "0a458a176b1fdb15651656a18983282d92416d678f8f546a72559e39ec1d8e6a",
+      "writable": false
+    },
+    {
+      "bytes": 501,
+      "directives": [],
+      "file": "5.sql",
+      "query": "5",
+      "sha256": "6dc9995d7df9ebf5e98e94f92d1973f552a7ee120f544ae72798bc8eecfdfa33",
+      "writable": false
+    },
+    {
+      "bytes": 264,
+      "directives": [],
+      "file": "6.sql",
+      "query": "6",
+      "sha256": "476ce255f19940823ff01a450fa01f6be79e07035698a7c44247f542c34fad97",
+      "writable": false
+    },
+    {
+      "bytes": 823,
+      "directives": [],
+      "file": "7.sql",
+      "query": "7",
+      "sha256": "9b955bf5b318a3a4f1cc54c4c506236e98058427fe615dca75776d9762c843d5",
+      "writable": false
+    },
+    {
+      "bytes": 817,
+      "directives": [],
+      "file": "8.sql",
+      "query": "8",
+      "sha256": "2b3a134536e4675722dcf28c3a059862355c3e5439c42f32309bce6347197574",
+      "writable": false
+    },
+    {
+      "bytes": 628,
+      "directives": [],
+      "file": "9.sql",
+      "query": "9",
+      "sha256": "1c69733972192367164ab928436cecbdfaecdcc282badfe2bc3314599d2f9fb1",
+      "writable": false
+    },
+    {
+      "bytes": 532,
+      "directives": [],
+      "file": "10.sql",
+      "query": "10",
+      "sha256": "31f31f12a65a71e4496ccee3868bf125eb7c1d1a1f11daa9150fed9fd285f2e1",
+      "writable": false
+    },
+    {
+      "bytes": 486,
+      "directives": [],
+      "file": "11.sql",
+      "query": "11",
+      "sha256": "8a3874418fbd5f10a6ac21733e420eeb355fb5c7fb2dc381404fe197fada5c1a",
+      "writable": false
+    },
+    {
+      "bytes": 593,
+      "directives": [],
+      "file": "12.sql",
+      "query": "12",
+      "sha256": "fe343e35178e9aecfb00ba794f8acadc0da2e3a211be1d352d8886e1933a0ef5",
+      "writable": false
+    },
+    {
+      "bytes": 318,
+      "directives": [],
+      "file": "13.sql",
+      "query": "13",
+      "sha256": "e8b2a950791de4d31a05686c63c284bc717e4e184ce6ac0b190a3edabc631e44",
+      "writable": false
+    },
+    {
+      "bytes": 360,
+      "directives": [],
+      "file": "14.sql",
+      "query": "14",
+      "sha256": "ac7f5dafff2692c9fffe89fc919b0cd6df5995e61902e9a0cbaaff878c49cf35",
+      "writable": false
+    },
+    {
+      "bytes": 524,
+      "directives": [],
+      "file": "15.sql",
+      "query": "15",
+      "sha256": "3220c8ba54a6820068906ea2847ed937ff09548fed5569391a7b65624d254386",
+      "writable": true
+    },
+    {
+      "bytes": 457,
+      "directives": [],
+      "file": "16.sql",
+      "query": "16",
+      "sha256": "ea8abee389ae80ba3e9e5684d04902317de0b9a15ceda1ae5f53f79607b29847",
+      "writable": false
+    },
+    {
+      "bytes": 319,
+      "directives": [
+        "-- SQLITE_SKIP: this query takes more than 30 seconds"
+      ],
+      "file": "17.sql",
+      "query": "17",
+      "sha256": "f5185cd0d2c7bf0bfbdde7cf7c3c9f60ac7616d6fed577ff57794077ff23cf7f",
+      "writable": false
+    },
+    {
+      "bytes": 431,
+      "directives": [],
+      "file": "18.sql",
+      "query": "18",
+      "sha256": "2e56da9ca9b86b438466b5e0531618ede779b85c601546862633c8f469a9422b",
+      "writable": false
+    },
+    {
+      "bytes": 941,
+      "directives": [],
+      "file": "19.sql",
+      "query": "19",
+      "sha256": "0a9b608e45be27321f386baf973dd5eb38ff330e6bb910e63b95308e450cba0e",
+      "writable": false
+    },
+    {
+      "bytes": 705,
+      "directives": [
+        "-- SQLITE_SKIP: SQLite is not able to decorrelate 'ps_availqty > ...' so it runs forever. Only run this on Turso."
+      ],
+      "file": "20.sql",
+      "query": "20",
+      "sha256": "424e10cc7484b4b93dd153995d5e12a19827088ea03f8955de6c9c3df4db1c8e",
+      "writable": false
+    },
+    {
+      "bytes": 637,
+      "directives": [],
+      "file": "21.sql",
+      "query": "21",
+      "sha256": "4f7fa7618c4fae1fc0f6e926ef8eb86fb5ec1d3afe7c7ffcce6cb9a20a528a76",
+      "writable": false
+    },
+    {
+      "bytes": 695,
+      "directives": [
+        "-- SQLITE_SKIP: SQLite doesn't unnest correlated NOT EXISTS, so it's slow here (multiple minutes)."
+      ],
+      "file": "22.sql",
+      "query": "22",
+      "sha256": "7625145c130bb7c280bf38aacd85f6ee0bee6a9dfbe310aa41ecce58e2026446",
+      "writable": false
+    }
+  ],
+  "query_dir": "/home/user/turso/perf/tpc-h/queries",
+  "runnable": [
+    "1",
+    "2",
+    "3",
+    "4",
+    "5",
+    "6",
+    "7",
+    "8",
+    "9",
+    "10",
+    "11",
+    "12",
+    "13",
+    "14",
+    "15",
+    "16",
+    "17",
+    "18",
+    "19",
+    "20",
+    "21",
+    "22"
+  ]
+}
