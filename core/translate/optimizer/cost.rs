@@ -167,9 +167,9 @@ pub(super) fn estimate_btree_depth(row_count: f64, rows_per_page: f64) -> f64 {
 ///
 /// # Arguments
 /// * `base_row_count` - Total rows in the table (for estimating tree depth and page counts)
-/// * `tree_depth` - B-tree depth (number of pages to traverse per seek)
+/// * `tree_depth` - Number of B-tree pages read by the first search
 /// * `index_info` - Index properties (covering, unique, etc.)
-/// * `num_seeks` - Number of B-tree traversals (typically = outer cardinality for joins)
+/// * `input_cardinality` - Number of searches, usually one per outer row
 /// * `rows_per_seek` - Expected rows returned per seek (1 for point lookup, more for range)
 /// * `params` - Cost model parameters
 pub fn estimate_index_cost(
@@ -184,7 +184,6 @@ pub fn estimate_index_cost(
     // the entire index, not seeking to specific positions.
     let is_full_scan = (rows_per_seek - base_row_count).abs() < 1.0;
 
-    // Cost of B-tree traversals: each seek traverses tree_depth pages.
     let seek_cost = if is_full_scan {
         // Full scan: one seek to start, then sequential reads.
         // When re-scanned (nested loop inner), first scan is cold, rest are cached.
@@ -193,8 +192,15 @@ pub fn estimate_index_cost(
         } else {
             tree_depth + (input_cardinality - 1.0) * tree_depth * params.cache_reuse_factor
         }
-    } else {
+    } else if input_cardinality <= 1.0 {
         input_cardinality * tree_depth
+    } else {
+        let cached_root_page_discount = 1.0 - params.cache_reuse_factor;
+        let leaf_page_costed_below = if rows_per_seek > 1.0 { 1.0 } else { 0.0 };
+        let repeated_tree_search_cost =
+            (tree_depth - cached_root_page_discount - leaf_page_costed_below)
+                .max(params.cache_reuse_factor);
+        tree_depth + (input_cardinality - 1.0) * repeated_tree_search_cost
     };
 
     let index_leaf_pages_count = (rows_per_seek / index_info.rows_per_leaf_page).max(1.0);
@@ -501,5 +507,52 @@ pub fn estimate_cost_for_scan_or_seek(
         Cost(base_cost.0 * 2.0)
     } else {
         base_cost
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::translate::optimizer::cost_params::DEFAULT_PARAMS;
+
+    fn covering_index() -> IndexInfo {
+        IndexInfo {
+            unique: false,
+            column_count: 2,
+            covering: true,
+            rows_per_leaf_page: 100.0,
+        }
+    }
+
+    #[test]
+    fn repeated_point_seeks_keep_non_root_page_costs() {
+        let cost =
+            estimate_index_cost(100_000.0, 4.0, covering_index(), 10.0, 1.0, &DEFAULT_PARAMS);
+        let repeated_tree_search_cost = 3.0 + DEFAULT_PARAMS.cache_reuse_factor;
+        let expected_tree_search_cost = 4.0 + 9.0 * repeated_tree_search_cost;
+        let expected_cpu_cost =
+            10.0 * DEFAULT_PARAMS.cpu_cost_per_seek + 10.0 * DEFAULT_PARAMS.cpu_cost_per_row;
+        let expected = expected_tree_search_cost + expected_cpu_cost - DEFAULT_PARAMS.index_bonus;
+        assert!((cost.0 - expected).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn repeated_range_seeks_reuse_cached_root_and_leaf_pages() {
+        let cost = estimate_index_cost(
+            100_000.0,
+            4.0,
+            covering_index(),
+            10.0,
+            100.0,
+            &DEFAULT_PARAMS,
+        );
+        let repeated_tree_search_cost = 2.0 + DEFAULT_PARAMS.cache_reuse_factor;
+        let expected_tree_search_cost = 4.0 + 9.0 * repeated_tree_search_cost;
+        let expected_leaf_cost = 1.0 + 9.0 * DEFAULT_PARAMS.cache_reuse_factor;
+        let expected_cpu_cost =
+            10.0 * DEFAULT_PARAMS.cpu_cost_per_seek + 1_000.0 * DEFAULT_PARAMS.cpu_cost_per_row;
+        let expected = expected_tree_search_cost + expected_leaf_cost + expected_cpu_cost
+            - DEFAULT_PARAMS.index_bonus;
+        assert!((cost.0 - expected).abs() < f64::EPSILON);
     }
 }
