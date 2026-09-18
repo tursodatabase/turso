@@ -28,7 +28,7 @@ SPACE = {
     "cpu_cost_per_row": (0.003, 0.0001, 0.1, "log"),
     "cpu_cost_per_where_step": (0.003, 0.0001, 0.1, "log"),
     "cpu_cost_per_seek": (0.01, 0.0001, 0.5, "log"),
-    "ephemeral_index_build_cost": (0.01, 0.0001, 2.0, "log"),
+    "ephemeral_index_build_cost": (0.43, 0.0001, 2.0, "log"),
     "index_bonus": (0.5, 0.0, 20.0, "linear"),
     "sort_cpu_per_row": (0.002, 0.0001, 0.1, "log"),
     "hash_cpu_cost": (0.001, 0.00001, 0.05, "log"),

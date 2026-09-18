@@ -94,11 +94,19 @@ all. Late in the search most proposals are free.
 run against a database at a time. The harness stops with an error rather than
 record a locked run as a slow plan.
 
-The harness reads the time the CLI reports for a statement with `.timer on`, so
-process start-up is not part of a measurement. It uses the default syscall
-backend, not the `io_uring` backend that `perf/tpc-h/run.sh` selects. Both sides
-of every comparison use the same backend, and the choice does not change which
-plan the optimizer picks.
+The harness reads the `Execution:` time the CLI reports for a statement with
+`.timer on`, so process start-up is not part of a measurement. That number is
+not wall time: `next_row` in `cli/app.rs` stops the execution timer while the
+statement waits on I/O, and the CLI reports I/O on a line of its own. On these
+two databases the difference is nothing, because both fit in the page cache of
+the machine and the CLI prints `I/O: No samples available` for every query, with
+`Execution:` equal to the `total:` line. On a database larger than memory the
+two would part, and the harness would then be measuring the wrong thing for an
+I/O cost model. Read the seconds in this document as execution time.
+
+The harness uses the default syscall backend, not the `io_uring` backend that
+`perf/tpc-h/run.sh` selects. Both sides of every comparison use the same
+backend, and the choice does not change which plan the optimizer picks.
 
 ## Step 3: find the parameters the workload can move
 
@@ -370,18 +378,37 @@ Both columns cover the same queries. ClickBench query 29 is left out of both,
 because `REGEXP_REPLACE` is not available and the query fails to parse on either
 side.
 
-## Files
+## Was the learned model worth it here?
 
-| File | Purpose |
-| --- | --- |
-| `bench.py` | Reads the two query sets, hashes plans, measures runtimes. |
-| `space.py` | The range and scale of each parameter. |
-| `tune.py` | The screen, the search, the shortlist, the grid, the shrink and the rounding. |
-| `apply_params.py` | Writes a parameter set into `CostModelParams::new()`. |
-| `compare.py` | Before and after wall time, interleaved. |
-| `callgrind.py` | Before and after instruction counts. |
-| `gen_clickbench_data.py` | A stand-in ClickBench dataset, for when the real one cannot be downloaded. |
-| `import_clickbench.py` | Imports `hits.csv` without the sqlite3 shell. |
+No. An independent review of this experiment counted the cost, and the honest
+answer is that the search did not find the value that ships.
+
+- The parameter that ships did not exist while the searches ran.
+  `ephemeral_index_build_cost` was added to `space.py` after both searches
+  finished, so neither search could ever have proposed it.
+- The effect is one threshold in one dimension. In the 108-point grid that found
+  it, the total takes four values, one per setting of
+  `ephemeral_index_build_cost`, and the other three parameters never improve on
+  their defaults. 104 of the 108 points are redundant. A four-point sweep finds
+  the same answer.
+- The model rounds proposed 440 parameter sets between the two searches and
+  found 14 plans the Sobol points had not already found. The 64 Sobol points of
+  the first search found 87 of the 92 plans it ever saw. Most of the search was
+  quasi-random sampling, and the model added little to it.
+- By the score the search minimizes, the shipped change is worse than what the
+  search found: 0.9728 against 0.9646 and 0.9505. Its own answers were thrown
+  away, for the reasons in step 6.
+
+What did the work was the cheap part. `screen` sweeps one parameter at a time
+and takes seven minutes, and it already named `cpu_cost_per_seek` as one of four
+parameters that move TPC-H query 11. From there a four-point sweep and two
+bisections reach 0.43 in about two minutes of measurement, against ninety
+minutes for the searches.
+
+Use the search where the screen shows many parameters moving many queries, and
+where the interactions between them matter. For a workload where 16 of 64
+queries can change plan at all, and where the answer is one threshold, sweep the
+parameters the screen names and skip the model.
 
 ## Limits of this procedure
 
@@ -413,3 +440,16 @@ side.
   needs. A later change to a cost formula can move either edge past it.
 - The score is a geometric mean over queries. It accepts a small loss on many
   queries in exchange for a large gain on a few.
+
+## Files
+
+| File | Purpose |
+| --- | --- |
+| `bench.py` | Reads the two query sets, hashes plans, measures runtimes. |
+| `space.py` | The range and scale of each parameter. |
+| `tune.py` | The screen, the search, the shortlist, the grid, the shrink and the rounding. |
+| `apply_params.py` | Writes a parameter set into `CostModelParams::new()`. |
+| `compare.py` | Before and after wall time, interleaved. |
+| `callgrind.py` | Before and after instruction counts. |
+| `gen_clickbench_data.py` | A stand-in ClickBench dataset, for when the real one cannot be downloaded. |
+| `import_clickbench.py` | Imports `hits.csv` without the sqlite3 shell. |
