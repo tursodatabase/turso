@@ -704,7 +704,8 @@ fn fts_write_errors_do_not_infer_out_of_memory_from_the_message() {
 #[cfg(nightly)]
 mod allocation_failures {
     use super::*;
-    use crate::alloc::{AllocError, ApiAllocator, DatabaseAllocators, Global, Layout};
+    use crate::alloc::{AllocError, ApiAllocator, Global, Layout};
+    use crate::DatabaseAllocators;
     use std::io::{ErrorKind, Write};
     use std::ptr::NonNull;
     use std::sync::atomic::AtomicIsize;
