@@ -494,6 +494,7 @@ struct SearcherCacheEntry {
     index: Index,
     reader: IndexReader,
     parser: Arc<tantivy::query::QueryParser>,
+    rowid_readers: Arc<[Column<i64>]>,
 }
 
 #[derive(Default)]
@@ -503,19 +504,11 @@ struct SearcherCache {
 }
 
 impl SearcherCache {
-    fn get(
-        &mut self,
-        key: &SearcherKey,
-    ) -> Option<(Index, IndexReader, Arc<tantivy::query::QueryParser>)> {
+    fn get(&mut self, key: &SearcherKey) -> Option<&SearcherCacheEntry> {
         let position = self.entries.iter().position(|entry| &entry.key == key)?;
         let entry = self.entries.remove(position);
-        let checkout = (
-            entry.index.clone(),
-            entry.reader.clone(),
-            Arc::clone(&entry.parser),
-        );
         self.entries.push(entry);
-        Some(checkout)
+        self.entries.last()
     }
 
     fn put(&mut self, entry: SearcherCacheEntry) {
@@ -1059,6 +1052,7 @@ pub struct FtsCursor {
     reader: Option<IndexReader>,
     searcher: Option<Searcher>,
     cached_parser: Option<Arc<tantivy::query::QueryParser>>,
+    rowid_readers: Arc<[Column<i64>]>,
 
     // Write buffers.
     doc_buffer: Vec<BufferedDoc>,
@@ -1133,6 +1127,7 @@ impl FtsCursor {
             reader: None,
             searcher: None,
             cached_parser: None,
+            rowid_readers: Arc::default(),
             doc_buffer: Vec::new(),
             pending_tombstone_rows: Vec::new(),
             publish: None,
@@ -1270,15 +1265,16 @@ impl FtsCursor {
             .stats
             .read_cache_lookups
             .fetch_add(1, Ordering::Relaxed);
-        if let Some((index, reader, parser)) = self.shared.searchers.lock().get(&key) {
+        if let Some(entry) = self.shared.searchers.lock().get(&key) {
             self.shared
                 .stats
                 .read_cache_hits
                 .fetch_add(1, Ordering::Relaxed);
-            self.searcher = Some(reader.searcher());
-            self.index = Some(index);
-            self.reader = Some(reader);
-            self.cached_parser = Some(parser);
+            self.searcher = Some(entry.reader.searcher());
+            self.index = Some(entry.index.clone());
+            self.reader = Some(entry.reader.clone());
+            self.cached_parser = Some(Arc::clone(&entry.parser));
+            self.rowid_readers = Arc::clone(&entry.rowid_readers);
             return Ok(());
         }
         self.shared
@@ -1320,18 +1316,31 @@ impl FtsCursor {
             .try_into()
             .map_err(|e: tantivy::TantivyError| LimboError::InternalError(e.to_string()))?;
         let parser = self.build_query_parser(&index);
+        let searcher = reader.searcher();
+        let rowid_readers: Arc<[Column<i64>]> = searcher
+            .segment_readers()
+            .iter()
+            .map(|segment| {
+                segment
+                    .fast_fields()
+                    .i64(ROWID_FIELD)
+                    .map_err(|e| LimboError::InternalError(format!("FTS fast field error: {e}")))
+            })
+            .collect::<Result<_>>()?;
         if publish_to_cache {
             self.shared.searchers.lock().put(SearcherCacheEntry {
                 key,
                 index: index.clone(),
                 reader: IndexReader::clone(&reader),
                 parser: Arc::clone(&parser),
+                rowid_readers: Arc::clone(&rowid_readers),
             });
         }
-        self.searcher = Some(reader.searcher());
+        self.searcher = Some(searcher);
         self.index = Some(index);
         self.reader = Some(reader);
         self.cached_parser = Some(parser);
+        self.rowid_readers = rowid_readers;
         Ok(())
     }
 
@@ -1351,6 +1360,7 @@ impl FtsCursor {
         self.reader = None;
         self.searcher = None;
         self.cached_parser = None;
+        self.rowid_readers = Arc::default();
     }
 
     /// Make sure `self.searcher` reflects the current in-memory segment set.
@@ -3127,17 +3137,13 @@ impl IndexMethodCursor for FtsCursor {
                 .weight(scoring)
                 .map_err(|e| LimboError::InternalError(format!("FTS query weight error: {e}")))?;
             let mut segments = Vec::with_capacity(searcher.segment_readers().len());
-            for segment_reader in searcher.segment_readers() {
+            for (segment_ord, segment_reader) in searcher.segment_readers().iter().enumerate() {
                 let scorer = weight
                     .scorer(segment_reader, 1.0)
                     .map_err(|e| LimboError::InternalError(format!("FTS scorer error: {e}")))?;
-                let rowids = segment_reader
-                    .fast_fields()
-                    .i64(ROWID_FIELD)
-                    .map_err(|e| LimboError::InternalError(format!("FTS fast field error: {e}")))?;
                 segments.push(FtsStreamingSegment {
                     scorer,
-                    rowids,
+                    rowids: self.rowid_readers[segment_ord].clone(),
                     alive: segment_reader.alive_bitset().cloned(),
                 });
             }
@@ -3165,10 +3171,7 @@ impl IndexMethodCursor for FtsCursor {
                 let mut scorer = weight
                     .scorer(segment_reader, 1.0)
                     .map_err(|e| LimboError::InternalError(format!("FTS scorer error: {e}")))?;
-                let rowids = segment_reader
-                    .fast_fields()
-                    .i64(ROWID_FIELD)
-                    .map_err(|e| LimboError::InternalError(format!("FTS fast field error: {e}")))?;
+                let rowids = &self.rowid_readers[segment_ord];
                 let alive = segment_reader.alive_bitset();
                 loop {
                     let doc_id = scorer.doc();
@@ -3215,11 +3218,7 @@ impl IndexMethodCursor for FtsCursor {
         // Process each segment's results with a single fast field reader.
         // Fast fields provide columnar O(1) access to rowids without loading full documents.
         for (segment_ord, hits) in by_segment {
-            let segment_reader = searcher.segment_reader(segment_ord);
-            let rowid_reader = segment_reader
-                .fast_fields()
-                .i64(ROWID_FIELD)
-                .map_err(|e| LimboError::InternalError(format!("FTS fast field error: {e}")))?;
+            let rowid_reader = &self.rowid_readers[segment_ord as usize];
 
             for (score, doc_addr) in hits {
                 let rowid = rowid_reader.first(doc_addr.doc_id).ok_or_else(|| {
