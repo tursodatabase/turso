@@ -17,6 +17,7 @@
 //! the same FTS index concurrently. In WAL mode the same format runs with
 //! degenerate concurrency: the pager write lock serializes writers.
 
+use crate::alloc::DynAllocator;
 use crate::sync::{Arc, Weak};
 use crate::types::IOResultOr;
 use crate::{
@@ -1011,6 +1012,7 @@ impl FtsHitStream {
 /// chunk rows through the ordinary (MVCC-aware) backing cursor. Insert-only
 /// statements never load the existing index at all.
 pub struct FtsCursor {
+    allocator: DynAllocator,
     schema: Schema,
     rowid_field: Field,
     identity_hi_field: Field,
@@ -1105,6 +1107,7 @@ impl FtsCursor {
             })
             .collect();
         Self {
+            allocator: DynAllocator::default(),
             schema: attachment.schema.clone(),
             rowid_field: attachment.rowid_field,
             identity_hi_field: attachment.identity_hi_field,
@@ -1961,7 +1964,7 @@ impl FtsCursor {
     /// `.managed.json`, no lock file, no merge. Returns `None` when the
     /// buffer produced no documents.
     fn build_segment(&mut self) -> Result<(Option<LoadedSegment>, Vec<PendingRow>)> {
-        let build_dir = BuildDirectory::default();
+        let build_dir = BuildDirectory::new(self.allocator.clone());
         // `Index::create` writes the initial meta.json into the build
         // directory's in-memory slot; it never reaches the B-tree.
         let index = Index::create(
@@ -2140,7 +2143,7 @@ impl FtsCursor {
             .filter(|meta| candidate_ids.contains(&meta.id()))
             .map(|meta| index.segment(meta.clone()))
             .collect();
-        let build_dir = BuildDirectory::default();
+        let build_dir = BuildDirectory::new(self.allocator.clone());
         let live_total: u64 = self
             .segments
             .iter()
@@ -2780,6 +2783,7 @@ impl IndexMethodCursor for FtsCursor {
     fn create(&mut self, context: &IndexMethodContext) -> IOResultOr<()> {
         let conn = context.connection()?;
         let database_id = context.database().id;
+        self.allocator = conn.get_source_database(database_id).allocators.fts.clone();
         self.database_id = Some(database_id);
         self.connection = Some(Arc::downgrade(&conn));
         if self.is_publishing() {
@@ -2813,6 +2817,7 @@ impl IndexMethodCursor for FtsCursor {
     fn destroy(&mut self, context: &IndexMethodContext) -> IOResultOr<()> {
         let conn = context.connection()?;
         let database_id = context.database().id;
+        self.allocator = conn.get_source_database(database_id).allocators.fts.clone();
         self.database_id = Some(database_id);
         self.connection = Some(Arc::downgrade(&conn));
         if let Some(op) = self.pending_store_op.as_mut() {
@@ -2857,6 +2862,7 @@ impl IndexMethodCursor for FtsCursor {
     fn open_read(&mut self, context: &IndexMethodContext) -> IOResultOr<()> {
         let conn = context.connection()?;
         let database_id = context.database().id;
+        self.allocator = conn.get_source_database(database_id).allocators.fts.clone();
         self.database_id = Some(database_id);
         self.connection = Some(Arc::downgrade(&conn));
         if matches!(self.state, FtsState::Ready) {
@@ -2872,6 +2878,7 @@ impl IndexMethodCursor for FtsCursor {
     fn open_write(&mut self, context: &IndexMethodContext) -> IOResultOr<()> {
         let conn = context.connection()?;
         let database_id = context.database().id;
+        self.allocator = conn.get_source_database(database_id).allocators.fts.clone();
         self.database_id = Some(database_id);
         self.connection = Some(Arc::downgrade(&conn));
         self.opening_for_write = true;
@@ -3456,6 +3463,7 @@ impl IndexMethodCursor for FtsCursor {
     fn optimize(&mut self, context: &IndexMethodContext) -> IOResultOr<()> {
         let conn = context.connection()?;
         let database_id = context.database().id;
+        self.allocator = conn.get_source_database(database_id).allocators.fts.clone();
         self.database_id = Some(database_id);
         self.connection = Some(Arc::downgrade(&conn));
 
