@@ -34,7 +34,7 @@ fn field_weights_reject_non_finite_and_non_positive_values() {
         let result = FtsIndexAttachment::new(IndexMethodConfiguration {
             table_name: "w".to_string(),
             index_name: "wx".to_string(),
-            columns: vec![IndexColumn::new("title", 0), IndexColumn::new("body", 1)],
+            columns: crate::alloc::vec![IndexColumn::new("title", 0), IndexColumn::new("body", 1)],
             parameters: FxHashMap::from_iter([(
                 "weights".to_string(),
                 Value::from_text(format!("title={weight},body=1")),
@@ -74,7 +74,7 @@ fn test_attachment() -> FtsIndexAttachment {
     FtsIndexAttachment::new(IndexMethodConfiguration {
         table_name: "docs".to_string(),
         index_name: "docs_fts".to_string(),
-        columns: vec![IndexColumn::new("title", 1), IndexColumn::new("body", 2)],
+        columns: crate::alloc::vec![IndexColumn::new("title", 1), IndexColumn::new("body", 2)],
         parameters: FxHashMap::<String, Value>::default(),
     })
     .unwrap()
@@ -95,7 +95,7 @@ fn estimate_cost(pattern_idx: i64, limit: Option<Expr>) -> IndexMethodCostEstima
     let attachment = FtsIndexAttachment::new(IndexMethodConfiguration {
         table_name: "docs".to_string(),
         index_name: "docs_fts".to_string(),
-        columns: vec![IndexColumn::new("body", 1)],
+        columns: crate::alloc::vec![IndexColumn::new("body", 1)],
         parameters: FxHashMap::<String, Value>::default(),
     })
     .unwrap();
