@@ -7147,6 +7147,7 @@ dependencies = [
  "clap",
  "serde_json",
  "turso_core",
+ "turso_parser",
 ]
 
 [[package]]

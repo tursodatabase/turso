@@ -17,8 +17,12 @@ workspace = true
 name = "turso-join-benchmark"
 path = "main.rs"
 
+[features]
+optimizer_params = ["turso_core/optimizer_params"]
+
 [dependencies]
 anyhow = { workspace = true }
 clap = { workspace = true, features = ["derive"] }
 serde_json = { workspace = true }
 turso_core = { workspace = true }
+turso_parser = { workspace = true }

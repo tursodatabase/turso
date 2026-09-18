@@ -82,7 +82,7 @@ use turso_parser::ast::{self, Expr, SortOrder, SubqueryType, TableInternalId, Tr
 pub(crate) mod access_method;
 pub(crate) mod constraints;
 pub(crate) mod cost;
-mod cost_params;
+pub(crate) mod cost_params;
 pub(crate) mod join;
 pub(crate) mod lift_common_subexpressions;
 pub(crate) mod multi_index;
