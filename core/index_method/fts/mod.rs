@@ -1047,6 +1047,7 @@ pub struct FtsCursor {
 
     // Scratch for the open/scan machine.
     scan_descriptors: Vec<SegmentDescriptor>,
+    scan_positions: HashMap<SegmentId, usize>,
     /// Identities of every visible tombstone row.
     scan_tombs: HashSet<DocumentIdentity>,
     scan_data: HashMap<SegmentId, Arc<SegmentData>>,
@@ -1126,6 +1127,7 @@ impl FtsCursor {
             segments: Vec::new(),
             snapshot_loaded: false,
             scan_descriptors: Vec::new(),
+            scan_positions: HashMap::default(),
             scan_tombs: HashSet::default(),
             scan_data: HashMap::default(),
             probe_only: false,
@@ -1387,6 +1389,7 @@ impl FtsCursor {
                 FtsState::Init => {
                     self.open_cursor(&conn, database_id)?;
                     self.scan_descriptors.clear();
+                    self.scan_positions.clear();
                     self.scan_tombs.clear();
                     self.scan_data.clear();
                     self.state = FtsState::SeekControl;
@@ -1574,24 +1577,19 @@ impl FtsCursor {
                     // Duplicate segment ids in one searcher trip a
                     // SearcherGeneration assert inside Tantivy; dedupe the
                     // registry scan defensively.
-                    if self
-                        .scan_descriptors
-                        .iter()
-                        .all(|existing| existing.segment_id != segment_id)
-                    {
-                        self.scan_descriptors.push(descriptor);
-                    } else {
-                        let existing = self
-                            .scan_descriptors
-                            .iter()
-                            .find(|existing| existing.segment_id == segment_id);
+                    if let Some(&position) = self.scan_positions.get(&segment_id) {
+                        let existing = &self.scan_descriptors[position];
                         tracing::error!(
                             segment = %segment_id.uuid_string(),
-                            identical = existing == Some(&descriptor),
+                            identical = existing == &descriptor,
                             existing = ?existing,
                             duplicate = ?descriptor,
                             "duplicate FTS registry row; keeping the first"
                         );
+                    } else {
+                        self.scan_positions
+                            .insert(segment_id, self.scan_descriptors.len());
+                        self.scan_descriptors.push(descriptor);
                     }
                     *advance_pending = true;
                 }
@@ -1734,6 +1732,7 @@ impl FtsCursor {
                     if !self.snapshot_loaded {
                         // Adopt the scan results as the visible set.
                         let descriptors = std::mem::take(&mut self.scan_descriptors);
+                        self.scan_positions.clear();
                         let tombs = std::mem::take(&mut self.scan_tombs);
                         let mut data_by_id = std::mem::take(&mut self.scan_data);
                         let mut applied_tombstones = 0usize;
@@ -2405,6 +2404,7 @@ impl FtsCursor {
         self.segments.clear();
         self.snapshot_loaded = false;
         self.scan_descriptors.clear();
+        self.scan_positions.clear();
         self.scan_tombs.clear();
         self.scan_data.clear();
         self.control = None;
