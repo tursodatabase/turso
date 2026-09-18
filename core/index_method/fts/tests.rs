@@ -691,6 +691,16 @@ fn query_hits(cursor: &mut FtsCursor, pattern: i64, query: &str, limit: i64) -> 
     hits
 }
 
+#[test]
+fn fts_write_errors_do_not_infer_out_of_memory_from_the_message() {
+    let directory = BuildDirectory::default();
+    let other = std::io::Error::other("memory allocation failed");
+    assert!(matches!(
+        directory.write_error(other.into(), "FTS build"),
+        LimboError::InternalError(message) if message == "FTS build: An IO error occurred: 'memory allocation failed'"
+    ));
+}
+
 #[cfg(nightly)]
 mod allocation_failures {
     use super::*;
@@ -702,7 +712,11 @@ mod allocation_failures {
 
     #[test]
     fn atomic_write_failure_preserves_previous_metadata() {
-        let allocator = FailingAllocator::default();
+        let allocator = FailingAllocator {
+            #[cfg(feature = "allocation_metric")]
+            expected_site: Some(crate::alloc::FtsAllocationSite::AtomicMetadata.into()),
+            ..Default::default()
+        };
         let directory = BuildDirectory::new(DynAllocator::new(allocator.clone()));
         let path = std::path::Path::new("meta.json");
 
@@ -729,7 +743,11 @@ mod allocation_failures {
 
     #[test]
     fn capture_growth_failure_preserves_bytes_and_does_not_publish() {
-        let allocator = FailingAllocator::default();
+        let allocator = FailingAllocator {
+            #[cfg(feature = "allocation_metric")]
+            expected_site: Some(crate::alloc::FtsAllocationSite::CaptureBuffer.into()),
+            ..Default::default()
+        };
         let directory = BuildDirectory::new(DynAllocator::new(allocator.clone()));
         let path = std::path::Path::new("segment.idx");
         let mut writer = directory.open_write(path).unwrap();
@@ -787,7 +805,10 @@ mod allocation_failures {
                         -1,
                         "{sql}, mvcc={mvcc}, fail_at={fail_at}"
                     );
-                    assert!(result.is_err(), "{sql}, mvcc={mvcc}, fail_at={fail_at}");
+                    assert!(
+                        matches!(result, Err(LimboError::OutOfMemory)),
+                        "{sql}, mvcc={mvcc}, fail_at={fail_at}: {result:?}"
+                    );
 
                     let expected = if merge { vec![7, 19] } else { vec![7] };
                     assert_fts_rows(&conn, &expected);
@@ -839,6 +860,8 @@ mod allocation_failures {
     struct FailingAllocator {
         remaining: Arc<AtomicIsize>,
         allocations: Arc<AtomicUsize>,
+        #[cfg(feature = "allocation_metric")]
+        expected_site: Option<crate::alloc::AllocationSite>,
     }
 
     impl Default for FailingAllocator {
@@ -846,6 +869,8 @@ mod allocation_failures {
             Self {
                 remaining: Arc::new(AtomicIsize::new(-1)),
                 allocations: Arc::new(AtomicUsize::new(0)),
+                #[cfg(feature = "allocation_metric")]
+                expected_site: None,
             }
         }
     }
@@ -859,6 +884,10 @@ mod allocation_failures {
 
     unsafe impl ApiAllocator for FailingAllocator {
         fn allocate(&self, layout: Layout) -> std::result::Result<NonNull<[u8]>, AllocError> {
+            #[cfg(feature = "allocation_metric")]
+            if let Some(expected) = self.expected_site {
+                assert_eq!(crate::alloc::current_allocation_site(), Some(expected));
+            }
             self.allocations.fetch_add(1, Ordering::Relaxed);
             let previous =
                 self.remaining
