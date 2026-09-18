@@ -594,3 +594,99 @@ fn segment_byte_cache_keeps_newest_and_respects_budget() {
     assert!(cache.get(&b).is_none());
     assert!(cache.get(&c).is_none());
 }
+
+#[test]
+fn query_rowid_readers_follow_cached_searcher_order_and_snapshot() {
+    let attachment = test_attachment();
+    let (first, _) = build_and_load_segment(
+        &attachment,
+        &[(91, "alpha alpha"), (-7, "alpha beta gamma")],
+    );
+    let (second, _) =
+        build_and_load_segment(&attachment, &[(400, "beta alpha"), (13, "beta delta")]);
+    let mut original = FtsCursor::new(&attachment);
+    original.segments = vec![first.clone(), second.clone()];
+    original.ensure_searcher().unwrap();
+
+    let mut cached = FtsCursor::new(&attachment);
+    cached.segments = vec![second, first];
+    cached.ensure_searcher().unwrap();
+    assert!(Arc::ptr_eq(&original.rowid_readers, &cached.rowid_readers));
+
+    for cursor in [&mut original, &mut cached] {
+        for pattern in [FTS_PATTERN_MATCH, FTS_PATTERN_COMBINED] {
+            let mut hits = query_hits(cursor, pattern, "alpha", -1);
+            hits.sort_by_key(|hit| hit.0);
+            assert_eq!(
+                hits.iter().map(|hit| hit.0).collect::<Vec<_>>(),
+                [-7, 91, 400]
+            );
+            if pattern == FTS_PATTERN_COMBINED {
+                assert!(hits.iter().all(|hit| hit.1 != Value::from_f64(0.0)));
+            }
+        }
+        for query in ["\"alpha beta\"", "alpha AND gamma"] {
+            assert_eq!(
+                query_hits(cursor, FTS_PATTERN_MATCH, query, -1),
+                vec![(-7, Value::from_i64(1))]
+            );
+        }
+        assert!(query_hits(cursor, FTS_PATTERN_MATCH_LIMIT, "alpha", 0).is_empty());
+        assert_eq!(
+            query_hits(cursor, FTS_PATTERN_MATCH_LIMIT, "alpha", 1).len(),
+            1
+        );
+    }
+
+    let ranked = query_hits(&mut original, FTS_PATTERN_COMBINED_ORDERED, "alpha", -1);
+    assert_eq!(
+        ranked.iter().map(|hit| hit.0).collect::<Vec<_>>(),
+        [91, 400, -7]
+    );
+    assert_eq!(
+        query_hits(&mut cached, FTS_PATTERN_COMBINED_ORDERED_LIMIT, "alpha", 2),
+        ranked[..2]
+    );
+
+    cached.segments[1].deleted.insert(0);
+    cached.invalidate_snapshot_view();
+    assert!(cached.rowid_readers.is_empty());
+    let deleted = query_hits(&mut cached, FTS_PATTERN_COMBINED_ORDERED_LIMIT, "alpha", 1);
+    assert_eq!(deleted[0].0, 400);
+    assert!(!Arc::ptr_eq(&original.rowid_readers, &cached.rowid_readers));
+    assert_eq!(
+        query_hits(&mut original, FTS_PATTERN_COMBINED_ORDERED, "alpha", -1),
+        ranked
+    );
+
+    let (replacement, _) = build_and_load_segment(&attachment, &[(999, "alpha")]);
+    cached.segments = vec![replacement];
+    cached.invalidate_snapshot_view();
+    cached.build_snapshot_view(false).unwrap();
+    assert_eq!(
+        query_hits(&mut cached, FTS_PATTERN_MATCH, "alpha", -1),
+        vec![(999, Value::from_i64(1))]
+    );
+}
+
+fn query_hits(cursor: &mut FtsCursor, pattern: i64, query: &str, limit: i64) -> Vec<(i64, Value)> {
+    let values = [
+        Register::Value(Value::from_i64(pattern)),
+        Register::Value(Value::from_text(query.to_owned())),
+        Register::Value(Value::from_i64(limit)),
+    ];
+    let mut hits = Vec::new();
+    let mut next = cursor.query_start(&values).unwrap();
+    while let IOResult::Done(true) = next {
+        let IOResult::Done(Some(rowid)) = cursor.query_rowid().unwrap() else {
+            panic!("query must have a rowid");
+        };
+        let IOResult::Done(score) = cursor.query_column(0).unwrap() else {
+            panic!("query column must not yield");
+        };
+        hits.push((rowid, score));
+        next = cursor.query_next().unwrap();
+    }
+    assert!(matches!(next, IOResult::Done(false)));
+    hits
+}
