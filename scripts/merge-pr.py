@@ -149,16 +149,39 @@ def strip_pr_template_from_body(body: str, template_path=".github/pull_request_t
 def wrap_text(text, width=72):
     lines = text.split("\n")
     wrapped_lines = []
+    paragraph = []
     in_code_block = False
     for line in lines:
         if line.strip().startswith("```"):
+            wrapped_lines.extend(wrap_paragraph(paragraph, width))
+            paragraph = []
             in_code_block = not in_code_block
             wrapped_lines.append(line)
         elif in_code_block:
             wrapped_lines.append(line)
+        elif line.strip() == "":
+            wrapped_lines.extend(wrap_paragraph(paragraph, width))
+            paragraph = []
+            wrapped_lines.append("")
         else:
-            wrapped_lines.extend(textwrap.wrap(line, width=width))
+            paragraph.append(line)
+    wrapped_lines.extend(wrap_paragraph(paragraph, width))
     return "\n".join(wrapped_lines)
+
+
+def wrap_paragraph(lines, width):
+    if not lines:
+        return []
+    if any(is_markdown_block_line(line) for line in lines):
+        wrapped = []
+        for line in lines:
+            wrapped.extend(textwrap.wrap(line, width=width) or [line])
+        return wrapped
+    return textwrap.wrap(" ".join(line.strip() for line in lines), width=width)
+
+
+def is_markdown_block_line(line):
+    return re.match(r"^(\s+|[-*+] |\d+[.)] |#|>|\|)", line) is not None
 
 
 def check_pr_status(pr_number):
