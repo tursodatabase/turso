@@ -37,10 +37,7 @@ use crate::{
     types::SeekOp,
     vdbe::{
         affinity::{self, Affinity},
-        builder::{
-            CursorKey, CursorType, HashBuildSignature, MaterializedBuildInputModeTag,
-            ProgramBuilder,
-        },
+        builder::{CursorKey, CursorType, HashBuildSignature, ProgramBuilder},
         insn::{to_u32, CmpInsFlags, HashBuildData, IdxInsertFlags, Insn},
         BranchOffset, CursorID,
     },
