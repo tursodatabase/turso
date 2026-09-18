@@ -35,6 +35,11 @@ use tantivy::directory::{
 };
 use tantivy::HasLen;
 
+#[cfg(not(nightly))]
+use crate::alloc::TursoVecInExt;
+use crate::alloc::{
+    try_arc_slice_from_slice_in, ArcSlice, DynAllocator, DynVec, TursoFromIterator,
+};
 use crate::sync::Arc;
 
 const TANTIVY_META_FILE: &str = "meta.json";
@@ -195,16 +200,24 @@ struct BuildDirectoryInner {
     files: HashMap<PathBuf, Arc<[u8]>>,
     /// Atomic writes (`meta.json`, `.managed.json`): absorbed here so
     /// whole-index manifests never reach the B-tree.
-    atomic: HashMap<PathBuf, Vec<u8>>,
+    atomic: HashMap<PathBuf, ArcSlice<u8>>,
 }
 
 /// Private in-memory write buffer for building one immutable segment.
 #[derive(Clone, Default)]
 pub(super) struct BuildDirectory {
     inner: Arc<RwLock<BuildDirectoryInner>>,
+    allocator: DynAllocator,
 }
 
 impl BuildDirectory {
+    pub fn new(allocator: DynAllocator) -> Self {
+        Self {
+            inner: Arc::new(RwLock::new(BuildDirectoryInner::default())),
+            allocator,
+        }
+    }
+
     /// The captured segment files (everything written through `open_write`).
     /// Atomic slots (`meta.json`, `.managed.json`) are excluded by
     /// construction.
@@ -226,13 +239,15 @@ impl std::fmt::Debug for BuildDirectory {
 /// Captures one file written through [`BuildDirectory::open_write`].
 struct CaptureWriter {
     path: PathBuf,
-    buffer: Vec<u8>,
+    buffer: DynVec<u8>,
     inner: Arc<RwLock<BuildDirectoryInner>>,
 }
 
 impl Write for CaptureWriter {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        self.buffer.extend_from_slice(buf);
+        self.buffer
+            .try_extend(buf.iter().copied())
+            .map_err(|error| std::io::Error::new(std::io::ErrorKind::OutOfMemory, error))?;
         Ok(buf.len())
     }
 
@@ -258,11 +273,9 @@ impl Drop for CaptureWriter {
 
 impl TerminatingWrite for CaptureWriter {
     fn terminate_ref(&mut self, _: tantivy::directory::AntiCallToken) -> std::io::Result<()> {
-        let data = std::mem::take(&mut self.buffer);
-        self.inner
-            .write()
-            .files
-            .insert(self.path.clone(), Arc::from(data));
+        let data = Arc::from(self.buffer.as_slice());
+        self.inner.write().files.insert(self.path.clone(), data);
+        self.buffer.clear();
         Ok(())
     }
 }
@@ -287,16 +300,15 @@ impl Directory for BuildDirectory {
 
     fn atomic_read(&self, path: &Path) -> std::result::Result<Vec<u8>, OpenReadError> {
         match self.inner.read().atomic.get(path) {
-            Some(data) => Ok(data.clone()),
+            Some(data) => Ok(data.to_vec()),
             None => Err(OpenReadError::FileDoesNotExist(path.to_path_buf())),
         }
     }
 
     fn atomic_write(&self, path: &Path, data: &[u8]) -> std::io::Result<()> {
-        self.inner
-            .write()
-            .atomic
-            .insert(path.to_path_buf(), data.to_vec());
+        let data = try_arc_slice_from_slice_in(data, self.allocator.clone())
+            .map_err(|error| std::io::Error::new(std::io::ErrorKind::OutOfMemory, error))?;
+        self.inner.write().atomic.insert(path.to_path_buf(), data);
         Ok(())
     }
 
@@ -312,7 +324,7 @@ impl Directory for BuildDirectory {
         }
         let writer: Box<dyn TerminatingWrite + Send + Sync> = Box::new(CaptureWriter {
             path: path.to_path_buf(),
-            buffer: Vec::new(),
+            buffer: DynVec::new_in(self.allocator.clone()),
             inner: Arc::clone(&self.inner),
         });
         Ok(BufWriter::new(writer))
