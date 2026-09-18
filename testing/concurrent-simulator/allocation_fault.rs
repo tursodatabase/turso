@@ -3,9 +3,9 @@ use std::ptr::NonNull;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use turso_core::alloc::{
-    AllocError, AllocationSite, ApiAllocator, BTreeAllocationSite, Global, Layout,
-    MvStoreAllocationSite, MvccCheckpointAllocationSite, SchemaAllocationSite, SetAllocatorError,
-    TursoAllocBackend, ValueBlobAllocationSite, VectorAllocationSite,
+    AllocError, AllocationSite, ApiAllocator, BTreeAllocationSite, FtsAllocationSite, Global,
+    Layout, MvStoreAllocationSite, MvccCheckpointAllocationSite, SchemaAllocationSite,
+    SetAllocatorError, TursoAllocBackend, ValueBlobAllocationSite, VectorAllocationSite,
 };
 
 #[derive(Debug, Clone, Copy)]
@@ -201,6 +201,10 @@ fn allocation_hash(
 fn allocation_site_id(site: AllocationSite) -> u64 {
     match site {
         AllocationSite::NoFaultInjection => 0,
+        AllocationSite::Fts(site) => match site {
+            FtsAllocationSite::CaptureBuffer => 37,
+            FtsAllocationSite::AtomicMetadata => 38,
+        },
         AllocationSite::BTree(site) => match site {
             BTreeAllocationSite::CellPayload => 29,
             BTreeAllocationSite::OverflowRead => 30,
@@ -372,6 +376,35 @@ mod tests {
             assert!(INJECTOR.allocate(layout).is_err(), "site {site:?}");
             assert_eq!(INJECTOR.injected_faults(), index as u64 + 1);
         }
+    }
+
+    #[test]
+    fn fts_allocation_sites_are_fault_injectable() {
+        static INJECTOR: SimulatorAllocationFaultInjector = SimulatorAllocationFaultInjector {
+            enabled: AtomicBool::new(true),
+            seed: AtomicU64::new(17),
+            threshold: AtomicU64::new(u64::MAX),
+            injected_faults: AtomicU64::new(0),
+        };
+
+        let _context = INJECTOR.enter_context(AllocationFaultContext {
+            step: 10,
+            fiber_idx: 11,
+            execution_id: 12,
+        });
+        let layout = Layout::from_size_align(16, 8).unwrap();
+        for (site, id) in [
+            (FtsAllocationSite::CaptureBuffer, 37),
+            (FtsAllocationSite::AtomicMetadata, 38),
+        ] {
+            assert_eq!(allocation_site_id(site.into()), id);
+            let _site = turso_core::alloc::enter_allocation_site(site);
+            assert!(INJECTOR.allocate(layout).is_err(), "{site:?}");
+            let _disabled =
+                turso_core::alloc::enter_allocation_site(AllocationSite::NoFaultInjection);
+            assert!(!INJECTOR.should_fail(layout));
+        }
+        assert_eq!(INJECTOR.injected_faults(), 2);
     }
 
     #[test]
