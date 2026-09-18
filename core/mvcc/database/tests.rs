@@ -22409,5 +22409,52 @@ fn dropping_passive_checkpoint_after_pager_commit_does_not_release_write_lock_tw
     assert_eq!(ids, vec![1, 2, 3]);
 }
 
+#[test]
+fn reset_passive_auto_checkpoint_after_pager_commit() {
+    let db = MvccTestDbNoConn::new_with_random_db_passive();
+    let conn = db.connect();
+    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY)")
+        .unwrap();
+    conn.execute("INSERT INTO t VALUES (1)").unwrap();
+    conn.execute("PRAGMA mvcc_checkpoint_threshold = 0")
+        .unwrap();
+
+    let injector = FixedYieldInjector::new([CheckpointYieldPoint::BeforePublishWindow.point()]);
+    conn.set_yield_injector(Some(injector.clone()));
+    let mut stmt = conn.prepare("INSERT INTO t VALUES (2)").unwrap();
+    for _ in 0..10_000 {
+        match stmt.step().unwrap() {
+            crate::StepResult::Yield if injector.is_empty() => break,
+            crate::StepResult::IO => stmt.get_pager().io.step().unwrap(),
+            crate::StepResult::Yield => {}
+            other => panic!("auto-checkpoint completed before publish yield: {other:?}"),
+        }
+    }
+    assert!(
+        injector.is_empty(),
+        "checkpoint did not reach publish window"
+    );
+    conn.set_yield_injector(None);
+    assert!(!conn.pager.load().wal.as_ref().unwrap().holds_write_lock());
+
+    stmt.reset().unwrap();
+
+    assert_eq!(
+        get_rows(&conn, "SELECT id FROM t ORDER BY id"),
+        vec![vec![Value::from_i64(1)], vec![Value::from_i64(2)]]
+    );
+    let other = db.connect();
+    other.execute("INSERT INTO t VALUES (3)").unwrap();
+    other.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+    assert_eq!(
+        get_rows(&other, "SELECT id FROM t ORDER BY id"),
+        vec![
+            vec![Value::from_i64(1)],
+            vec![Value::from_i64(2)],
+            vec![Value::from_i64(3)]
+        ]
+    );
+}
+
 #[path = "group_commit_tests.rs"]
 mod group_commit_tests;

@@ -1728,8 +1728,6 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
             .durable_txid_max
             .store(self.durable_txid_max_new, Ordering::SeqCst);
         self.state = CheckpointState::CheckpointWal;
-        self.lock_states.pager_read_tx = false;
-        self.lock_states.pager_write_tx = false;
         let header = self.staged_checkpoint_header.take().ok_or_else(|| {
             LimboError::InternalError(
                 "checkpoint header was not staged before pager commit".to_string(),
