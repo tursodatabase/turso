@@ -352,15 +352,23 @@ SEARCH supplier USING INTEGER PRIMARY KEY (rowid=?)
 SEARCH nation USING INTEGER PRIMARY KEY (rowid=?)
 ```
 
-| Query | Before | After | Change |
-| --- | ---: | ---: | ---: |
-| TPC-H 11 | 5.65 s | 0.95 s | -83% |
-| TPC-H 17 | 6.01 s | 5.72 s | -5% |
+| Query | Time before | Time after | Instructions before | Instructions after |
+| --- | ---: | ---: | ---: | ---: |
+| TPC-H 11 | 5.65 s | 0.95 s (-83%) | 30.97 G | 6.28 G (-80%) |
+| TPC-H 17 | 6.01 s | 5.72 s (-5%) | 33.86 G | 31.77 G (-6%) |
 
-No other query moved by more than 3 percent, which is the noise of this
-machine, and no ClickBench query changed plan. TPC-H went from 68.71 s to
-63.72 s over its 22 queries, and ClickBench from 32.34 s to 32.33 s over the 42
-that run.
+Those are the only two queries whose instruction count moves by more than one
+percent. Every other query stays within 0.01 percent, so the rest of the timing
+differences are the noise of the machine, not the change.
+
+| Benchmark | Time before | Time after | Change | Instructions before | Instructions after | Change |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| TPC-H (22 queries) | 68.71 s | 63.72 s | -7.3% | 403.4 G | 376.6 G | -6.6% |
+| ClickBench (42 queries) | 32.34 s | 32.33 s | -0.0% | 214.5 G | 214.5 G | +0.0% |
+
+Both columns cover the same queries. ClickBench query 29 is left out of both,
+because `REGEXP_REPLACE` is not available and the query fails to parse on either
+side.
 
 ## Files
 
