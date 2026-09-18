@@ -3154,14 +3154,13 @@ impl Pager {
         self.schema_cookie.store(value, Ordering::SeqCst);
     }
 
-    /// Get the schema cookie, using the cached value if available to avoid reading page 1.
     pub fn get_schema_cookie(&self) -> IOResultOr<u32> {
-        // Try to use cached value first
-        if let Some(cookie) = self.get_schema_cookie_cached() {
-            return Ok(IOResult::Done(cookie));
-        }
-        // If not cached, read from header and cache it
-        self.with_header(|header| header.schema_cookie.get())
+        self.with_header(|header| {
+            if self.db_initialized() {
+                self.set_reserved_space(header.reserved_space);
+            }
+            header.schema_cookie.get()
+        })
     }
 
     /// This connection's frozen WAL position `(checkpoint_seq, max_frame)` — the read mark for a
@@ -4787,9 +4786,12 @@ impl Pager {
             );
         }
         if header.page_number == 1 {
-            let db_size = self
-                .io
-                .block(|| self.with_header(|header| header.database_size))?;
+            let db_size = self.io.block(|| {
+                self.with_header(|header| {
+                    self.set_reserved_space(header.reserved_space);
+                    header.database_size
+                })
+            })?;
             tracing::debug!("truncate page_cache as first page was written: {}", db_size);
             let mut page_cache = self.page_cache.write();
             page_cache.truncate(db_size.get() as usize).map_err(|e| {
