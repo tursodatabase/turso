@@ -690,3 +690,189 @@ fn query_hits(cursor: &mut FtsCursor, pattern: i64, query: &str, limit: i64) -> 
     assert!(matches!(next, IOResult::Done(false)));
     hits
 }
+
+#[cfg(nightly)]
+mod allocation_failures {
+    use super::*;
+    use crate::alloc::{AllocError, ApiAllocator, DatabaseAllocators, Global, Layout};
+    use std::io::{ErrorKind, Write};
+    use std::ptr::NonNull;
+    use std::sync::atomic::AtomicIsize;
+    use tantivy::directory::{Directory, TerminatingWrite};
+
+    #[test]
+    fn atomic_write_failure_preserves_previous_metadata() {
+        let allocator = FailingAllocator::default();
+        let directory = BuildDirectory::new(DynAllocator::new(allocator.clone()));
+        let path = std::path::Path::new("meta.json");
+
+        allocator.fail_after(0);
+        assert_eq!(
+            directory.atomic_write(path, b"first").unwrap_err().kind(),
+            ErrorKind::OutOfMemory
+        );
+        assert!(!directory.exists(path).unwrap());
+        directory.atomic_write(path, b"first").unwrap();
+
+        allocator.fail_after(0);
+        assert_eq!(
+            directory
+                .atomic_write(path, b"replacement")
+                .unwrap_err()
+                .kind(),
+            ErrorKind::OutOfMemory
+        );
+        assert_eq!(directory.atomic_read(path).unwrap(), b"first");
+        directory.atomic_write(path, b"replacement").unwrap();
+        assert_eq!(directory.atomic_read(path).unwrap(), b"replacement");
+    }
+
+    #[test]
+    fn capture_growth_failure_preserves_bytes_and_does_not_publish() {
+        let allocator = FailingAllocator::default();
+        let directory = BuildDirectory::new(DynAllocator::new(allocator.clone()));
+        let path = std::path::Path::new("segment.idx");
+        let mut writer = directory.open_write(path).unwrap();
+        writer.get_mut().write_all(b"prefix").unwrap();
+
+        allocator.fail_after(0);
+        let suffix = [37; 16_384];
+        assert_eq!(
+            writer.get_mut().write_all(&suffix).unwrap_err().kind(),
+            ErrorKind::OutOfMemory
+        );
+        assert!(!directory.exists(path).unwrap());
+        writer.get_mut().write_all(b"suffix").unwrap();
+        writer.terminate().unwrap();
+        assert_eq!(&*directory.captured_files()[path], b"prefixsuffix");
+
+        let abandoned = std::path::Path::new("abandoned.idx");
+        let mut writer = directory.open_write(abandoned).unwrap();
+        writer.get_mut().write_all(b"partial").unwrap();
+        allocator.fail_after(0);
+        assert!(writer.get_mut().write_all(&suffix).is_err());
+        drop(writer);
+        assert!(!directory.exists(abandoned).unwrap());
+    }
+
+    #[test]
+    fn failed_fts_allocations_roll_back_statements_and_allow_retry() {
+        for merge in [false, true] {
+            for mvcc in [false, true] {
+                let (conn, allocator) = database_with_failing_fts_allocator(mvcc);
+                if merge {
+                    conn.execute("INSERT INTO docs VALUES (19, 'hello world')")
+                        .unwrap();
+                }
+                let sql = if merge {
+                    "OPTIMIZE INDEX docs_fts"
+                } else {
+                    "INSERT INTO docs VALUES (19, 'hello world')"
+                };
+                allocator.allocations.store(0, Ordering::Relaxed);
+                conn.execute(sql).unwrap();
+                let allocation_count = allocator.allocations.load(Ordering::Relaxed);
+                assert!(allocation_count > 0);
+
+                for fail_at in 0..allocation_count {
+                    let (conn, allocator) = database_with_failing_fts_allocator(mvcc);
+                    if merge {
+                        conn.execute("INSERT INTO docs VALUES (19, 'hello world')")
+                            .unwrap();
+                    }
+                    allocator.fail_after(fail_at);
+                    let result = conn.execute(sql);
+                    assert_eq!(
+                        allocator.remaining.load(Ordering::Relaxed),
+                        -1,
+                        "{sql}, mvcc={mvcc}, fail_at={fail_at}"
+                    );
+                    assert!(result.is_err(), "{sql}, mvcc={mvcc}, fail_at={fail_at}");
+
+                    let expected = if merge { vec![7, 19] } else { vec![7] };
+                    assert_fts_rows(&conn, &expected);
+                    conn.execute(sql).unwrap();
+                    assert_fts_rows(&conn, &[7, 19]);
+                }
+            }
+        }
+    }
+
+    fn database_with_failing_fts_allocator(mvcc: bool) -> (Arc<Connection>, FailingAllocator) {
+        let allocator = FailingAllocator::default();
+        let db = crate::Database::open(
+            Arc::new(crate::MemoryIO::new()),
+            ":memory:",
+            crate::OpenOptions::new(Arc::new(crate::SqliteDialect))
+                .db_opts(crate::DatabaseOpts::default().with_index_method(true))
+                .allocators(DatabaseAllocators {
+                    fts: DynAllocator::new(allocator.clone()),
+                    ..Default::default()
+                }),
+        )
+        .unwrap();
+        let conn = db.connect().unwrap();
+        if mvcc {
+            conn.execute("PRAGMA journal_mode = 'mvcc'").unwrap();
+        }
+        conn.execute("CREATE TABLE docs(id INTEGER PRIMARY KEY, body TEXT)")
+            .unwrap();
+        conn.execute("CREATE INDEX docs_fts ON docs USING fts(body)")
+            .unwrap();
+        conn.execute("INSERT INTO docs VALUES (7, 'hello turso')")
+            .unwrap();
+        (conn, allocator)
+    }
+
+    fn assert_fts_rows(conn: &Arc<Connection>, ids: &[i64]) {
+        let expected: Vec<Vec<Value>> = ids.iter().map(|id| vec![Value::from_i64(*id)]).collect();
+        for sql in [
+            "SELECT id FROM docs ORDER BY id",
+            "SELECT id FROM docs WHERE fts_match(body, 'hello') ORDER BY id",
+        ] {
+            let rows = conn.prepare(sql).unwrap().run_collect_rows().unwrap();
+            assert_eq!(rows, expected, "{sql}");
+        }
+    }
+
+    #[derive(Clone)]
+    struct FailingAllocator {
+        remaining: Arc<AtomicIsize>,
+        allocations: Arc<AtomicUsize>,
+    }
+
+    impl Default for FailingAllocator {
+        fn default() -> Self {
+            Self {
+                remaining: Arc::new(AtomicIsize::new(-1)),
+                allocations: Arc::new(AtomicUsize::new(0)),
+            }
+        }
+    }
+
+    impl FailingAllocator {
+        fn fail_after(&self, allocations: usize) {
+            self.remaining
+                .store(allocations.try_into().unwrap(), Ordering::Relaxed);
+        }
+    }
+
+    unsafe impl ApiAllocator for FailingAllocator {
+        fn allocate(&self, layout: Layout) -> std::result::Result<NonNull<[u8]>, AllocError> {
+            self.allocations.fetch_add(1, Ordering::Relaxed);
+            let previous =
+                self.remaining
+                    .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |remaining| {
+                        (remaining >= 0).then(|| remaining - 1)
+                    });
+            if previous == Ok(0) {
+                return Err(AllocError);
+            }
+            Global.allocate(layout)
+        }
+
+        unsafe fn deallocate(&self, ptr: NonNull<u8>, layout: Layout) {
+            unsafe { Global.deallocate(ptr, layout) }
+        }
+    }
+}
