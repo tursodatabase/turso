@@ -25,6 +25,8 @@ jobs:
     # stops running benchmarks before that, so that the results so far still
     # get uploaded.
     timeout-minutes: 92
+    env:
+      DISABLE_RUSQLITE_BENCHMARK: 1
     steps:
       - uses: actions/checkout@v4
       - uses: useblacksmith/setup-node@v5
