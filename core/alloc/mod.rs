@@ -80,12 +80,6 @@ pub struct TursoAllocator;
 
 pub type Allocator = TursoAllocator;
 
-#[derive(Clone, Debug, Default)]
-pub struct DatabaseAllocators<A: ConcurrentAllocator = DynAllocator> {
-    pub mv_store: A,
-    pub fts: DynAllocator,
-}
-
 #[derive(Clone)]
 pub struct DynAllocator {
     inner: Arc<dyn ApiAllocator + Send + Sync>,
