@@ -3154,18 +3154,13 @@ impl Pager {
         self.schema_cookie.store(value, Ordering::SeqCst);
     }
 
-    /// Get the schema cookie, using the cached value if available to avoid reading page 1.
     pub fn get_schema_cookie(&self) -> IOResultOr<u32> {
-        if self.db_initialized() {
-            self.reserved_space
-                .store(RESERVED_SPACE_NOT_SET, Ordering::SeqCst);
-        }
-        // Try to use cached value first
-        if let Some(cookie) = self.get_schema_cookie_cached() {
-            return Ok(IOResult::Done(cookie));
-        }
-        // If not cached, read from header and cache it
-        self.with_header(|header| header.schema_cookie.get())
+        self.with_header(|header| {
+            if self.db_initialized() {
+                self.set_reserved_space(header.reserved_space);
+            }
+            header.schema_cookie.get()
+        })
     }
 
     /// This connection's frozen WAL position `(checkpoint_seq, max_frame)` — the read mark for a
