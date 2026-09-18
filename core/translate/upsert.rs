@@ -733,18 +733,14 @@ pub fn emit_upsert(
 
     // Recompute virtual columns for the new row after SET clauses have modified base columns.
     // This must happen before CHECK constraints, triggers, and index updates.
-    if ctx.table.has_virtual_columns {
-        let rowid_reg = new_rowid_reg.unwrap_or(ctx.conflict_rowid_reg);
-        let dml_ctx =
-            DmlColumnContext::layout(ctx.table.columns(), new_start, rowid_reg, layout.clone());
-        compute_virtual_columns(
-            program,
-            &ctx.table.columns_topo_sort()?,
-            &dml_ctx,
-            resolver,
-            ctx.table,
-        )?;
-    }
+    compute_new_row_virtual_columns(
+        program,
+        ctx,
+        new_start,
+        new_rowid_reg.unwrap_or(ctx.conflict_rowid_reg),
+        &layout,
+        resolver,
+    )?;
 
     if let Some(bt) = table.btree() {
         if bt.is_strict {
@@ -888,6 +884,9 @@ pub fn emit_upsert(
                 target_pc: ctx.loop_labels.row_done,
             });
 
+            // The triggers may also have changed this row, so re-read it:
+            // index deletion must use the row as it is on disk now, or the
+            // trigger's index entries are left behind (#8744).
             if let Some(before) = before_start {
                 for (i, column) in table.columns().iter().enumerate() {
                     emit_table_column(
@@ -902,6 +901,34 @@ pub fn emit_upsert(
                     )?;
                 }
             }
+
+            // Same for the NEW image: like SQLite, columns not in the SET list
+            // must keep the values the triggers wrote, while SET columns keep
+            // their values computed from the pre-trigger row. Virtual columns
+            // are recomputed from the refreshed base columns.
+            for (i, column) in table.columns().iter().enumerate() {
+                if updated_positions.get(i) || column.is_virtual_generated() {
+                    continue;
+                }
+                emit_table_column(
+                    program,
+                    ctx.cursor_id,
+                    table_ref_id,
+                    table_references,
+                    column,
+                    i,
+                    layout.to_register(new_start, i),
+                    resolver,
+                )?;
+            }
+            compute_new_row_virtual_columns(
+                program,
+                ctx,
+                new_start,
+                new_rowid_reg.unwrap_or(ctx.conflict_rowid_reg),
+                &layout,
+                resolver,
+            )?;
 
             let has_relevant_after_triggers = has_triggers_including_temp(
                 resolver,
@@ -1517,16 +1544,14 @@ pub fn emit_upsert(
     }
 
     // Compute virtual columns for RETURNING (if any virtual columns exist)
-    if !returning.is_empty() && ctx.table.has_virtual_columns() {
-        let rowid_reg = new_rowid_reg.unwrap_or(ctx.conflict_rowid_reg);
-        let dml_ctx =
-            DmlColumnContext::layout(ctx.table.columns(), new_start, rowid_reg, layout.clone());
-        compute_virtual_columns(
+    if !returning.is_empty() {
+        compute_new_row_virtual_columns(
             program,
-            &ctx.table.columns_topo_sort()?,
-            &dml_ctx,
+            ctx,
+            new_start,
+            new_rowid_reg.unwrap_or(ctx.conflict_rowid_reg),
+            &layout,
             resolver,
-            ctx.table,
         )?;
     }
 
@@ -1548,6 +1573,28 @@ pub fn emit_upsert(
         target_pc: ctx.loop_labels.row_done,
     });
     Ok(())
+}
+
+fn compute_new_row_virtual_columns(
+    program: &mut ProgramBuilder,
+    ctx: &InsertEmitCtx,
+    new_start: usize,
+    rowid_reg: usize,
+    layout: &ColumnLayout,
+    resolver: &Resolver,
+) -> crate::Result<()> {
+    if !ctx.table.has_virtual_columns {
+        return Ok(());
+    }
+    let dml_ctx =
+        DmlColumnContext::layout(ctx.table.columns(), new_start, rowid_reg, layout.clone());
+    compute_virtual_columns(
+        program,
+        &ctx.table.columns_topo_sort()?,
+        &dml_ctx,
+        resolver,
+        ctx.table,
+    )
 }
 
 /// Normalize the `SET` clause into `(column_index, Expr)` pairs using table layout.
