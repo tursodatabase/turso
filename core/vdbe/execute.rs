@@ -19144,7 +19144,7 @@ fn op_journal_mode_inner(
                         program.connection.db.open_flags,
                         program.connection.db.durable_storage.clone(),
                         enc_ctx,
-                        program.connection.db.mv_store_allocator.clone(),
+                        program.connection.db.allocators.mv_store.clone(),
                         program
                             .connection
                             .db
