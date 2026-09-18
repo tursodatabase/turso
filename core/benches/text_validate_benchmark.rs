@@ -60,21 +60,15 @@ fn bench_text_validate(criterion: &mut Criterion) {
 
 fn cases() -> Vec<Case> {
     let mut cases = Vec::new();
-    for len in CALLGRIND_SIZES.iter().copied().chain([2048, 4096]) {
+    for len in [1, 16, 64, 512, 4096] {
         cases.push(fixed_case("ascii", Content::Ascii, len));
     }
-    for len in [8, 15, 16, 17, 32, 64, 128, 256, 512, 513, 1024] {
-        cases.push(fixed_case("unicode_first", Content::UnicodeFirst, len));
-        cases.push(fixed_case("unicode_last", Content::UnicodeLast, len));
-    }
-    for len in [16, 64, 512] {
-        cases.push(fixed_case("unicode_dense", Content::UnicodeDense, len));
-    }
-    for len in [7, 8, 16, 32, 64, 128, 256, 512, 513, 1024] {
-        cases.push(fixed_case("invalid_first", Content::InvalidFirst, len));
-        cases.push(fixed_case("invalid_last", Content::InvalidLast, len));
-        cases.push(fixed_case("truncated", Content::Truncated, len));
-    }
+    cases.push(fixed_case("unicode_first", Content::UnicodeFirst, 64));
+    cases.push(fixed_case("unicode_last", Content::UnicodeLast, 64));
+    cases.push(fixed_case("unicode_dense", Content::UnicodeDense, 64));
+    cases.push(fixed_case("invalid_first", Content::InvalidFirst, 64));
+    cases.push(fixed_case("invalid_last", Content::InvalidLast, 64));
+    cases.push(fixed_case("truncated", Content::Truncated, 64));
     cases.push(mixed_case("ascii", 0));
     cases.push(mixed_case("unicode", 1));
     cases.push(mixed_case("ascii_unicode", 5));
