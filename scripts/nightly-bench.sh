@@ -27,6 +27,11 @@
 # Only Criterion takes --noplot, so `run` asks each bench binary whether its
 # harness offers the flag rather than assuming.
 #
+# The Nyrkiö runner kills the job after 92 minutes, before the step that uploads
+# the results to Nyrkiö. `build` sets a deadline, and `run` stops a benchmark
+# that is still running at the deadline and skips benchmarks after it, so the
+# upload step always gets to run with whatever results there are.
+#
 # `check` keeps the step list in the workflow file in sync with the bench
 # targets cargo actually builds: a new bench with no step fails the job.
 set -euo pipefail
@@ -36,6 +41,9 @@ target_dir=${CARGO_TARGET_DIR:-target}
 # The bench job runs on a fresh checkout with no cargo cache, so the target
 # directory the bookkeeping files below are written to does not exist yet.
 mkdir -p "$target_dir"
+
+budget_minutes=${NIGHTLY_BENCH_BUDGET_MINUTES:-85}
+deadline_file="$target_dir/nightly-bench-deadline"
 
 # Same target list as `make bench-exclude-tpc-h`.
 bench_targets() {
@@ -59,6 +67,7 @@ bench_executable() {
 
 case "${1:-}" in
 build)
+    echo $(($(date +%s) + budget_minutes * 60)) > "$deadline_file"
     args=()
     while read -r name; do
         args+=(--bench "$name")
@@ -85,6 +94,11 @@ run)
         echo "error: cargo built no bench binary named $name; run '$0 build' first." >&2
         exit 1
     fi
+    remaining=$(($(cat "$deadline_file") - $(date +%s)))
+    if [ "$remaining" -le 0 ]; then
+        echo "error: skipping $name because the ${budget_minutes}-minute benchmark budget is used up." >&2
+        exit 1
+    fi
     harness_args=()
     if "$exe" --help 2>&1 | grep -q -- --noplot; then
         harness_args=(-- --noplot)
@@ -95,9 +109,14 @@ run)
     echo "free -m before $name:"
     free -m
     ulimit -v "$cap_kb"
-    cargo bench --bench "$name" --features bench "${harness_args[@]}" 2>&1 | tee -a output.txt
+    status=0
+    timeout --kill-after=30 "$remaining" cargo bench --bench "$name" --features bench "${harness_args[@]}" 2>&1 | tee -a output.txt || status=$?
     echo "free -m after $name:"
     free -m
+    if [ "$status" -eq 124 ]; then
+        echo "error: stopped $name because the ${budget_minutes}-minute benchmark budget ran out." >&2
+    fi
+    exit "$status"
     ;;
 *)
     echo "usage: $0 build | check <workflow-file> | run <bench-name>" >&2
