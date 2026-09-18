@@ -4,6 +4,11 @@
 /// cost estimation. They can be tuned to improve plan selection for specific
 /// workloads (e.g., TPC-H).
 ///
+/// `ephemeral_index_build_cost` comes from measurements of the bundled TPC-H
+/// and ClickBench queries, not from judgement. See
+/// `perf/optimizer-tuning/README.md` for the procedure and for what the
+/// measurements do and do not cover.
+///
 /// # JSON Loading (requires `optimizer_params` feature)
 ///
 /// When the `optimizer_params` feature is enabled, parameters can be loaded
@@ -64,6 +69,12 @@ pub struct CostModelParams {
     /// CPU cost per index seek (key comparisons).
     pub cpu_cost_per_seek: f64,
 
+    /// CPU cost of one key comparison while an in-memory index is built.
+    /// Separate from `cpu_cost_per_seek`: building an index pays this for
+    /// every row times the depth of the part already built, while a seek into
+    /// an index that exists pays `cpu_cost_per_seek` one time.
+    pub ephemeral_index_build_cost: f64,
+
     /// Bonus subtracted from cost when using an index (encourages index usage).
     pub index_bonus: f64,
 
@@ -115,6 +126,7 @@ impl CostModelParams {
             cpu_cost_per_row: 0.003,
             cpu_cost_per_where_step: 0.003,
             cpu_cost_per_seek: 0.01,
+            ephemeral_index_build_cost: 0.43,
             index_bonus: 0.5,
 
             // Sort costs
@@ -247,6 +259,10 @@ impl CostModelParams {
             ("cpu_cost_per_row", self.cpu_cost_per_row),
             ("cpu_cost_per_where_step", self.cpu_cost_per_where_step),
             ("cpu_cost_per_seek", self.cpu_cost_per_seek),
+            (
+                "ephemeral_index_build_cost",
+                self.ephemeral_index_build_cost,
+            ),
             ("sort_cpu_per_row", self.sort_cpu_per_row),
             ("hash_cpu_cost", self.hash_cpu_cost),
             ("hash_insert_cost", self.hash_insert_cost),

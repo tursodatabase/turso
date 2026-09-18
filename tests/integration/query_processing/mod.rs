@@ -1,5 +1,6 @@
 mod test_alter_table_reopen;
 mod test_btree;
+mod test_cost_model_defaults;
 mod test_ddl;
 mod test_eqp_json;
 mod test_hash_join_materialization;

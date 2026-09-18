@@ -166,20 +166,125 @@ Each parameter is searched on the scale it acts on. A multiplier such as
 matters as much as a step from 0.1 to 0.2. `space.py` holds the range and the
 scale of each parameter.
 
-## Step 6: cut the result down to few digits
+Run the search more than one time, with a different `--seed` each time, and keep
+the best result. The plan cache is written to disk and read back, so a second
+search pays for a plan only when it finds one the first search did not. The
+first search here took 24 minutes and measured 92 plans; the second reused that
+cache and evaluated six parameter sets in 14 seconds.
+
+## Step 6: read what the search actually learned
 
 ```bash
-python perf/optimizer-tuning/tune.py polish --params best-params.json --out tuned.json
+python perf/optimizer-tuning/tune.py shortlist \
+    --history history.json,history2.json --max-regression 1.05 --out picked.json
+python perf/optimizer-tuning/tune.py shrink --params picked.json --out shrunk.json
+python perf/optimizer-tuning/tune.py shrink --params shrunk.json --out shrunk2.json
+python perf/optimizer-tuning/tune.py polish --params shrunk2.json --out polished.json
 ```
 
-The search reports eight digits, which claims a precision that 64 timed queries
-cannot support. The score only moves when a plan flips, so a rounded value is as
-good as the searched one while every query still compiles to the same bytecode.
-`polish` rounds each changed parameter to three significant digits, checks the
-plans, and keeps more digits only for a parameter that needs them.
-`apply_params.py` then writes the result into `CostModelParams::new()`.
+The number the search minimizes is not the whole of what matters, and the
+parameter set it reports is not shippable as it stands. Three steps read more
+out of the same measurements.
 
-## Step 7: measure the result
+`shortlist` scores every parameter set either search tried, out of the plan
+cache, for the cost of one EXPLAIN pass each and no new measurement. It then
+applies two rules the search does not know about. Drop any set that makes one
+query more than `--max-regression` times slower. Of the sets within
+`--tolerance` of the lowest total runtime, take the one that moves the
+parameters least. The last rule matters: runtime only says which side of a plan
+flip a value is on, so very different parameter sets reach the same runtime and
+the search has no reason to prefer the moderate one.
+
+`shrink` moves each parameter back toward its default as far as the plans allow,
+largest change first, with a binary search on the distance. Two parameter sets
+that compile every query to the same bytecode run at the same speed, so this
+costs nothing. The step is greedy, so run it until it stops moving. Here it put
+five of the twelve parameters back on their defaults exactly.
+
+`polish` rounds what is left to three significant digits, again only while the
+plans hold, and then puts back any parameter that still ends within `--snap` of
+its default.
+
+Reading the result of all this was the useful part, not the parameter set it
+produced. Three searches disagreed on how far each parameter should move but
+agreed on which way: `rows_per_table_fallback` down, `rows_per_table_page` up,
+`cpu_cost_per_row` up, `cpu_cost_per_seek` up, `sel_range` down.
+
+The parameter set itself was not shippable. The last `polish` left two
+parameters differing from their defaults by less than one percent, which means
+they were winning an exact cost tie rather than stating anything about
+databases. Putting them back cost 4 seconds of the 6 the set had won, and made
+TPC-H query 16 2.5 times slower. A result that depends on a value in its fifth
+digit is tuned to these 64 queries and to nothing else.
+
+## Step 7: turn the directions into round numbers
+
+```bash
+python perf/optimizer-tuning/tune.py grid --values values.json --max-regression 1.10
+```
+
+`--values` names a JSON file that offers a few round values for each parameter
+the searches agreed on, `{"parameter": [value, ...]}`. `grid` measures every
+combination and picks by three rules: no query more than `--max-regression`
+times slower, within `--tolerance` of the lowest total runtime, and, of those,
+the fewest parameters changed.
+
+This is the step that produced the values in the change. Every value is a round
+number, each of which a reader can weigh against what the parameter is supposed
+to mean, and the measurement behind it is the same measurement the search used.
+
+A first grid of 324 combinations found almost nothing, because it held
+`index_bonus` and `closed_range_selectivity_factor` at their defaults and
+stopped `rows_per_table_page` at 200. Give the grid the full range the search
+used, or it cannot reach what the search found.
+
+`apply_params.py` writes the result into `CostModelParams::new()`.
+
+## Step 7b: when no value of a parameter is right, split the parameter
+
+The round-number grid gave four changes and 98.1 s, and that set broke
+`test_fts_join_order_optimization`: a five-row table reached by its primary key
+turned into a scan repeated for every outer row. The cause was
+`cpu_cost_per_seek`, which the grid had raised from 0.01 to 0.3. Bisecting both
+sides showed two windows that do not overlap. The test needs 0.25 or less.
+TPC-H query 11 needs 0.28 or more.
+
+The reason is that one constant priced two different things. A seek into an
+index that exists pays it one time, in `estimate_index_cost`. Building an
+in-memory index pays it for every row, times the depth of the part already
+built, in `estimate_ephemeral_index_build_cost`. Query 11 is decided by the
+second, and the FTS test by the first, so no single value can be right for both.
+
+The change adds `ephemeral_index_build_cost` for the second use. A parameter
+that two benchmarks push in opposite directions is worth reading as a sign that
+it stands for two things.
+
+## Step 7c: measure the grid again after the split
+
+With the two uses apart, the grid ran again over `rows_per_table_fallback`,
+`rows_per_table_page`, `cpu_cost_per_row` and the new
+`ephemeral_index_build_cost`. It found that one change carries the whole gain:
+
+```bash
+python perf/optimizer-tuning/tune.py grid --values values3.json --max-regression 1.05
+```
+
+`ephemeral_index_build_cost` 0.01 to 0.5, and the other three parameters back on
+their old values. The four-parameter set from step 7 and this one-parameter set
+reach the same runtime, so the rule that takes the fewest changes takes this one.
+The three parameters the first grid moved were paying for a mispriced index
+build, which is now priced directly.
+
+The grid offered 0.5, and 0.5 turned out to break a second test:
+`two-identical-averages-use-one-grouped-table` in
+`sqlite-sqltests/unnest-correlated.sqltest`, which reads two copies of the same
+correlated average out of one grouped table. Bisecting both cases gives a window
+rather than a point. TPC-H query 11 takes the fast plan from about 0.402 up, and
+the grouped table holds to about 0.452. The change ships 0.43, the middle of
+that window. Every benchmark query compiles to the same bytecode anywhere in it,
+so the measurements above hold for the whole window.
+
+## Step 8: measure the result
 
 Wall time moves with whatever else the machine is doing, so the final numbers
 come from two measurements.
@@ -203,13 +308,53 @@ file lock.
 Both measurements use one binary and change only `TURSO_OPTIMIZER_PARAMS`, so
 nothing but the parameters differs between the two sides.
 
+## What the measurements said
+
+One constant changed, and one was added:
+
+| Parameter | Before | After | What it says |
+| --- | ---: | ---: | --- |
+| `ephemeral_index_build_cost` | (shared `cpu_cost_per_seek`, 0.01) | 0.43 | What one key comparison costs while an in-memory index is built, against one page read. |
+
+Everything else keeps its old value, `cpu_cost_per_seek` included.
+
+Almost all of the gain is one query. TPC-H query 11 joins `partsupp`,
+`supplier` and `nation` with no index on the join columns. The old number
+priced a copy of `partsupp` into an in-memory index below three primary-key
+seeks per row, so the optimizer built that copy twice, once for the query and
+once for its subquery:
+
+```
+HASH JOIN supplier
+SEARCH partsupp USING COVERING INDEX ephemeral_partsupp_t1 (PS_SUPPKEY=?)
+SCAN nation
+```
+
+The new number prices the copy above the seeks:
+
+```
+SCAN partsupp USING INDEX sqlite_autoindex_partsupp_1
+SEARCH supplier USING INTEGER PRIMARY KEY (rowid=?)
+SEARCH nation USING INTEGER PRIMARY KEY (rowid=?)
+```
+
+| Query | Before | After | Change |
+| --- | ---: | ---: | ---: |
+| TPC-H 11 | 5.65 s | 0.95 s | -83% |
+| TPC-H 17 | 6.01 s | 5.72 s | -5% |
+
+No other query moved by more than 3 percent, which is the noise of this
+machine, and no ClickBench query changed plan. TPC-H went from 68.71 s to
+63.72 s over its 22 queries, and ClickBench from 32.34 s to 32.33 s over the 42
+that run.
+
 ## Files
 
 | File | Purpose |
 | --- | --- |
 | `bench.py` | Reads the two query sets, hashes plans, measures runtimes. |
 | `space.py` | The range and scale of each parameter. |
-| `tune.py` | The screen, the model-based search, and the rounding step. |
+| `tune.py` | The screen, the search, the shortlist, the grid, the shrink and the rounding. |
 | `apply_params.py` | Writes a parameter set into `CostModelParams::new()`. |
 | `compare.py` | Before and after wall time, interleaved. |
 | `callgrind.py` | Before and after instruction counts. |
@@ -218,6 +363,11 @@ nothing but the parameters differs between the two sides.
 
 ## Limits of this procedure
 
+- Every query is timed with the database already in the page cache of the
+  operating system. Both benchmark databases together are smaller than the
+  memory of the machine, so a repeated query reads no disk. A plan that reads
+  the same pages again and again therefore looks better here than it would on a
+  database larger than memory, and the tuned value reflects that.
 - The result is tuned for two analytic workloads on a database without
   `ANALYZE`. A write-heavy or small-table workload is not represented.
 - Both databases index only their primary keys. A schema with many secondary
@@ -225,6 +375,19 @@ nothing but the parameters differs between the two sides.
   harder than this workload does.
 - The search optimizes measured runtime. It does not prove that a cost formula
   is right; a parameter can be pushed away from its physical meaning to
-  compensate for a formula that is wrong.
+  compensate for a formula that is wrong. 0.43 is one such value. Against a
+  `cpu_cost_per_row` of 0.003, it says one key comparison during an index build
+  costs 140 rows of work, which nothing about the code supports.
+- What it is compensating for is visible in `estimate_index_cost`. A repeated
+  scan of an inner table gets the `cache_reuse_factor` discount, and a repeated
+  seek into one does not: `seek_cost` is `input_cardinality * tree_depth` page
+  reads however many times the same small table is read. So the model
+  over-prices the nested loop that TPC-H query 11 wants, and the only lever the
+  parameters give is to over-price its competitor by the same amount. Giving
+  repeated seeks the same cache discount as repeated scans would price both
+  directly, and is the change worth making next.
+- The value sits in a window about 12 percent wide, between the plan flip that
+  TPC-H query 11 needs and the one that `two-identical-averages-use-one-grouped-table`
+  needs. A later change to a cost formula can move either edge past it.
 - The score is a geometric mean over queries. It accepts a small loss on many
   queries in exchange for a large gain on a few.

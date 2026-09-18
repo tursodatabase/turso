@@ -26,6 +26,6 @@ info:
   database: ':memory:'
 ---
 QUERY PLAN
-|--SCAN categories AS c
-`--SEARCH cs USING INDEX ephemeral_subquery_t2 (category_id=? AND product_count>?)
-   `--SCAN products USING INDEX idx_products_category
+|--SCAN category_stats AS cs
+|  `--SCAN products USING INDEX idx_products_category
+`--SEARCH c USING INTEGER PRIMARY KEY (rowid=?)

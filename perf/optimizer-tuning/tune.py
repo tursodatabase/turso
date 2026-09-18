@@ -16,11 +16,15 @@ Two facts make the search cheap:
 Commands:
     screen    Report which parameters can change a plan at all.
     search    Run the model-based search.
+    shortlist Re-read every parameter set the search tried, and pick one.
+    grid      Measure every combination of a few round values per parameter.
+    shrink    Move a parameter set back toward the defaults, plans unchanged.
     polish    Round a parameter set while every plan stays the same.
     evaluate  Measure one parameter file and print per-query times.
 """
 
 import argparse
+import itertools
 import json
 import math
 import os
@@ -41,7 +45,18 @@ TIMEOUT_PENALTY = 8.0
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("command", choices=["screen", "search", "polish", "evaluate"])
+    parser.add_argument(
+        "command",
+        choices=[
+            "screen",
+            "search",
+            "shortlist",
+            "grid",
+            "shrink",
+            "polish",
+            "evaluate",
+        ],
+    )
     parser.add_argument("--binary", default=bench.DEFAULT_BINARY)
     parser.add_argument("--suites", default="tpch,clickbench")
     parser.add_argument("--cache", default="/tmp/turso-tune-cache.json")
@@ -62,6 +77,13 @@ def main():
     parser.add_argument("--screen-out", default="/tmp/turso-screen.json")
     parser.add_argument("--history-out", default="/tmp/turso-history.json")
     parser.add_argument("--digits", type=int, default=3)
+    parser.add_argument("--snap", type=float, default=0.1)
+    parser.add_argument("--shrink-steps", type=int, default=14)
+    parser.add_argument("--history", default="/tmp/turso-history.json")
+    parser.add_argument("--shortlist-size", type=int, default=20)
+    parser.add_argument("--max-regression", type=float, default=1.25)
+    parser.add_argument("--tolerance", type=float, default=0.02)
+    parser.add_argument("--values", default=None)
     parser.add_argument("--out", default="/tmp/turso-best-params.json")
     args = parser.parse_args()
 
@@ -72,6 +94,9 @@ def main():
     commands = {
         "screen": cmd_screen,
         "search": cmd_search,
+        "shortlist": cmd_shortlist,
+        "grid": cmd_grid,
+        "shrink": cmd_shrink,
         "polish": cmd_polish,
         "evaluate": cmd_evaluate,
     }
@@ -215,6 +240,233 @@ def cmd_search(args, queries, evaluator):
     print(f"wrote {args.out}")
 
 
+def cmd_shortlist(args, queries, evaluator):
+    """Score every parameter set the search tried, and pick one by two rules.
+
+    The search minimizes one number, so it accepts a large loss on one query
+    when other queries gain more. That trade is not always the one to ship. The
+    plan cache holds a time for every plan already measured, so each parameter
+    set in the history can be scored again for the cost of one EXPLAIN pass,
+    with no new measurement.
+
+    Three rules pick the winner, in order. Drop every parameter set where one
+    query is more than `--max-regression` times slower than it is with the
+    current defaults. Of what is left, keep the sets within `--tolerance` of
+    the lowest total runtime. Of those, take the one that moves the parameters
+    least, measured as the distance from the defaults in the unit cube.
+
+    The last rule matters as much as the first two. Runtime only tells the
+    search which side of a plan flip a value is on, so several very different
+    parameter sets reach the same runtime, and the search has no reason to
+    prefer the moderate one. This rule states that preference.
+    """
+    baseline_times, _ = evaluator.times(space.DEFAULTS)
+    default_point = np.array(space.to_unit(space.DEFAULTS))
+    rows = []
+    seen = set()
+    for path in args.history.split(","):
+        history = json.load(open(path))
+        active_index = [space.NAMES.index(name) for name in history["active"]]
+        for partial in history["history_x"]:
+            point = default_point.copy()
+            point[active_index] = partial
+            params = space.from_unit(point)
+            key = json.dumps(params, sort_keys=True)
+            if key in seen:
+                continue
+            seen.add(key)
+            rows.append(score_from_cache(evaluator, queries, params, baseline_times))
+    rows = [row for row in rows if row is not None]
+    rows.sort(key=lambda row: row["total_ms"])
+
+    print(f"{'total':>10s} {'score':>7s} {'worst':>7s}  parameters")
+    for row in rows[: args.shortlist_size]:
+        marker = " " if row["worst_ratio"] <= args.max_regression else "x"
+        print(
+            f"{row['total_ms']/1000:9.1f}s {row['score']:7.4f} "
+            f"{row['worst_ratio']:6.2f}x {marker} {row['worst_query']}"
+        )
+    allowed = [row for row in rows if row["worst_ratio"] <= args.max_regression]
+    if not allowed:
+        sys.exit(f"no parameter set keeps every query under {args.max_regression}x")
+    limit = allowed[0]["total_ms"] * (1.0 + args.tolerance)
+    as_good = [row for row in allowed if row["total_ms"] <= limit]
+    for row in as_good:
+        row["distance"] = float(
+            np.linalg.norm(
+                np.array(space.to_unit(row["params"])) - np.array(space.to_unit(space.DEFAULTS))
+            )
+        )
+    picked = min(as_good, key=lambda row: row["distance"])
+    json.dump(picked["params"], open(args.out, "w"), indent=2, sort_keys=True)
+    print(
+        f"\n{len(as_good)} of {len(allowed)} sets are within {args.tolerance:.0%} of "
+        f"{allowed[0]['total_ms']/1000:.1f} s and change no query more than "
+        f"{args.max_regression:.2f}x"
+    )
+    print(
+        f"picked total {picked['total_ms']/1000:.1f} s, worst query "
+        f"{picked['worst_query']} at {picked['worst_ratio']:.2f}x, "
+        f"distance from the defaults {picked['distance']:.3f}"
+    )
+    print(f"wrote {args.out}")
+
+
+def score_from_cache(evaluator, queries, params, baseline_times):
+    """Return the runtime of one parameter set, out of already-measured plans."""
+    signature = evaluator.signature(params)
+    times = {}
+    for query in queries:
+        cache_key = f"{query.key}|{signature[query.key]}"
+        if cache_key not in evaluator.plan_times:
+            return None
+        times[query.key] = evaluator.plan_times[cache_key]
+    worst_ratio, worst_query = 0.0, None
+    total = 0.0
+    for key, base in baseline_times.items():
+        if base is None:
+            continue
+        measured = times.get(key)
+        ratio = TIMEOUT_PENALTY if measured is None else (measured + NOISE_FLOOR_MS) / (
+            base + NOISE_FLOOR_MS
+        )
+        total += base * TIMEOUT_PENALTY if measured is None else measured
+        if ratio > worst_ratio:
+            worst_ratio, worst_query = ratio, key
+    return {
+        "params": params,
+        "score": objective(times, baseline_times),
+        "total_ms": total,
+        "worst_ratio": worst_ratio,
+        "worst_query": worst_query,
+    }
+
+
+def cmd_grid(args, queries, evaluator):
+    """Measure every combination of a handful of round values per parameter.
+
+    The searches agree on which way a parameter should move but not on how far,
+    and each one lands on a value with eight digits that no measurement can
+    support. This step takes the directions they agree on, offers a few round
+    values along each, and measures every combination. What it picks is a set
+    of round numbers, each of which a reader can weigh against what the
+    parameter is supposed to mean.
+
+    `--values` names a JSON file, `{"parameter": [value, ...]}`. Every
+    parameter it leaves out keeps its default.
+    """
+    choices = json.load(open(args.values))
+    baseline_times, _ = evaluator.times(space.DEFAULTS)
+    names = list(choices)
+    rows = []
+    for number, combination in enumerate(itertools.product(*(choices[n] for n in names)), 1):
+        params = space.repair({**space.DEFAULTS, **dict(zip(names, combination))})
+        signature = evaluator.signature(params)
+        times = {
+            q.key: evaluator.query_time(q, signature[q.key], params) for q in queries
+        }
+        evaluator.save()
+        total = sum(
+            baseline_times[key] * TIMEOUT_PENALTY if value is None else value
+            for key, value in times.items()
+            if baseline_times.get(key) is not None
+        )
+        worst_ratio, worst_query = 0.0, None
+        for key, base in baseline_times.items():
+            if base is None:
+                continue
+            measured = times.get(key)
+            ratio = TIMEOUT_PENALTY if measured is None else (measured + NOISE_FLOOR_MS) / (
+                base + NOISE_FLOOR_MS
+            )
+            if ratio > worst_ratio:
+                worst_ratio, worst_query = ratio, key
+        rows.append(
+            {
+                "params": params,
+                "total_ms": total,
+                "score": objective(times, baseline_times),
+                "worst_ratio": worst_ratio,
+                "worst_query": worst_query,
+                "changed": sum(
+                    1 for n in names if params[n] != space.DEFAULTS[n]
+                ),
+            }
+        )
+        print(
+            f"[{number:4d}] total {total/1000:6.1f}s worst {worst_ratio:5.2f}x "
+            f"{' '.join(f'{n}={params[n]:g}' for n in names)}",
+            flush=True,
+        )
+
+    rows.sort(key=lambda row: (row["total_ms"], row["changed"]))
+    allowed = [row for row in rows if row["worst_ratio"] <= args.max_regression]
+    if not allowed:
+        sys.exit(f"no combination keeps every query under {args.max_regression}x")
+    limit = allowed[0]["total_ms"] * (1.0 + args.tolerance)
+    as_good = [row for row in allowed if row["total_ms"] <= limit]
+    picked = min(as_good, key=lambda row: row["changed"])
+    print(
+        f"\nbaseline {sum(v for v in baseline_times.values() if v is not None)/1000:.1f} s; "
+        f"{len(as_good)} combinations within {args.tolerance:.0%} of "
+        f"{allowed[0]['total_ms']/1000:.1f} s"
+    )
+    print(
+        f"picked total {picked['total_ms']/1000:.1f} s, {picked['changed']} parameters "
+        f"changed, worst query {picked['worst_query']} at {picked['worst_ratio']:.2f}x"
+    )
+    json.dump(picked["params"], open(args.out, "w"), indent=2, sort_keys=True)
+    print(f"wrote {args.out}")
+
+
+def cmd_shrink(args, queries, evaluator):
+    """Move every parameter back toward its default, plans unchanged.
+
+    The search reads runtime, and runtime only tells it which side of a plan
+    flip a value is on. It has no reason to stop once it is past the flip, so
+    it often reports a value at the edge of its range. Such a value is tuned to
+    16 queries and says nothing true about a database in general.
+
+    Two parameter sets that compile every query to the same bytecode run at the
+    same speed. So each parameter moves back toward its default as far as the
+    plans allow, largest change first. What is left is the smallest change to
+    the shipped constants that buys the whole measured gain.
+    """
+    searched = space.repair({**space.DEFAULTS, **json.load(open(args.params))})
+    target = evaluator.signature(searched)
+    default_point = np.array(space.to_unit(space.DEFAULTS))
+    searched_point = np.array(space.to_unit(searched))
+
+    order = np.argsort(-np.abs(searched_point - default_point))
+    point = searched_point.copy()
+    for index in order:
+        if abs(searched_point[index] - default_point[index]) < 1e-9:
+            continue
+        low, high = 0.0, 1.0
+        for _ in range(args.shrink_steps):
+            middle = (low + high) / 2
+            trial = point.copy()
+            trial[index] = default_point[index] + middle * (
+                searched_point[index] - default_point[index]
+            )
+            if evaluator.signature(space.from_unit(trial)) == target:
+                high = middle
+            else:
+                low = middle
+        point[index] = default_point[index] + high * (
+            searched_point[index] - default_point[index]
+        )
+        name = space.NAMES[index]
+        kept = space.from_unit(point)[name]
+        print(f"{name:34s} {searched[name]:14.6g} -> {kept:14.6g} ({high:.0%} of the move)")
+
+    shrunk = space.from_unit(point)
+    if evaluator.signature(shrunk) != target:
+        sys.exit("the shrunk parameter set does not give the same plans")
+    json.dump(shrunk, open(args.out, "w"), indent=2, sort_keys=True)
+    print(f"\nwrote {args.out}")
+
+
 def cmd_polish(args, queries, evaluator):
     """Cut a searched parameter set down to few digits, plan by plan.
 
@@ -240,7 +492,23 @@ def cmd_polish(args, queries, evaluator):
             print(f"{name:34s} {searched[name]} (no shorter value keeps the plans)")
     if evaluator.signature(space.repair(polished)) != target:
         sys.exit("the rounded parameter set does not give the same plans")
-    json.dump(space.repair(polished), open(args.out, "w"), indent=2, sort_keys=True)
+
+    # A parameter that ends within --snap of its default is winning a cost tie,
+    # not stating a fact about databases. Put it back and report what moves.
+    snapped = dict(polished)
+    for name in space.NAMES:
+        default = space.DEFAULTS[name]
+        if polished[name] != default and abs(polished[name] - default) <= args.snap * abs(default):
+            print(f"{name:34s} {polished[name]} -> {default} (within {args.snap:.0%} of the default)")
+            snapped[name] = default
+    snapped = space.repair(snapped)
+    moved = [
+        key for key, value in evaluator.signature(snapped).items() if value != target[key]
+    ]
+    if moved:
+        print(f"\nputting those back changes the plan of: {', '.join(moved)}")
+
+    json.dump(snapped, open(args.out, "w"), indent=2, sort_keys=True)
     print(f"\nwrote {args.out}")
 
 
@@ -318,13 +586,21 @@ class Evaluator:
         return measured
 
     def save(self):
+        """Write the cache through a temporary file.
+
+        The cache holds hours of measurement. Writing it in place loses all of
+        it when the process stops during the write, so write a new file and
+        rename it over the old one, which cannot leave a half-written cache.
+        """
         if not self.cache_path:
             return
-        with open(self.cache_path, "w") as handle:
+        temporary = f"{self.cache_path}.new"
+        with open(temporary, "w") as handle:
             json.dump(
                 {"plan_times": self.plan_times, "signature_cost": self.signature_cost},
                 handle,
             )
+        os.replace(temporary, self.cache_path)
 
 
 def objective(times, baseline):

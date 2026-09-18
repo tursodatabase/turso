@@ -21,7 +21,11 @@ INSTRUCTIONS = re.compile(r"I\s+refs:\s+([0-9,]+)")
 
 
 def count_instructions(binary, query, params_path, out_dir):
-    out_file = os.path.join(out_dir, f"callgrind.{query.suite}.{query.name}.out")
+    # The name holds the process id, so parallel jobs that share a work
+    # directory cannot remove each other's file.
+    out_file = os.path.join(
+        out_dir, f"callgrind.{os.getpid()}.{query.suite}.{query.name}.out"
+    )
     env = dict(os.environ)
     env["RUST_LOG"] = "off"
     if params_path is None:

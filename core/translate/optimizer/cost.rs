@@ -147,7 +147,7 @@ pub(super) fn estimate_ephemeral_index_build_cost(
     params: &CostModelParams,
 ) -> Cost {
     let comparisons_per_row = row_count.max(2.0).log2();
-    Cost(row_count * comparisons_per_row * params.cpu_cost_per_seek)
+    Cost(row_count * comparisons_per_row * params.ephemeral_index_build_cost)
 }
 
 /// Estimate how many B-tree levels an index search reads.

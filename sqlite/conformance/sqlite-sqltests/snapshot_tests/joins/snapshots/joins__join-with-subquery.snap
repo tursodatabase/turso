@@ -33,7 +33,7 @@ info:
   database: ':memory:'
 ---
 QUERY PLAN
-|--SCAN customers AS c
-|--SEARCH recent_orders USING INDEX ephemeral_subquery_t3 (customer_id=?)
+|--SCAN recent_orders
 |  `--SCAN orders USING INDEX idx_orders_customer_id
+|--SEARCH c USING INTEGER PRIMARY KEY (rowid=?)
 `--USE SORTER FOR ORDER BY
