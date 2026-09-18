@@ -9,7 +9,7 @@ use std::{
     os::raw::c_void,
     sync::{
         atomic::{AtomicUsize, Ordering as AtomicOrdering},
-        Arc,
+        Arc, Mutex,
     },
 };
 use turso_core::{Connection, LimboError, StepResult};
@@ -813,6 +813,129 @@ fn managed_aggregate_errors_leave_connection_usable(tmp_db: TempDatabase) -> any
         counters.aggregate_inits.load(AtomicOrdering::SeqCst),
         counters.aggregate_drops.load(AtomicOrdering::SeqCst)
     );
+    Ok(())
+}
+
+/// States the window test's aggregate handed out, with `true` while the state
+/// is still alive. Never removed, so a destroy of an already destroyed state is
+/// counted instead of corrupting memory the way a real extension would.
+static WINDOW_STATES: Mutex<Vec<(usize, bool)>> = Mutex::new(Vec::new());
+static WINDOW_STATE_USES_AFTER_DESTROY: AtomicUsize = AtomicUsize::new(0);
+static WINDOW_STATE_REPEATED_DESTROYS: AtomicUsize = AtomicUsize::new(0);
+
+fn window_state_sum(aggregate_context: *mut AggCtx) -> &'static mut i64 {
+    let states = WINDOW_STATES.lock().unwrap();
+    if !states
+        .iter()
+        .any(|(state, alive)| *state == aggregate_context as usize && *alive)
+    {
+        WINDOW_STATE_USES_AFTER_DESTROY.fetch_add(1, AtomicOrdering::SeqCst);
+    }
+    drop(states);
+    unsafe { &mut *((*aggregate_context).state as *mut i64) }
+}
+
+unsafe extern "C" fn window_sum_init(_context: usize) -> *mut AggCtx {
+    let sum = Box::into_raw(Box::new(0i64));
+    let aggregate_context = Box::into_raw(Box::new(AggCtx {
+        state: sum as *mut c_void,
+    }));
+    WINDOW_STATES
+        .lock()
+        .unwrap()
+        .push((aggregate_context as usize, true));
+    aggregate_context
+}
+
+unsafe extern "C" fn window_sum_step(
+    _context: usize,
+    aggregate_context: *mut AggCtx,
+    argc: i32,
+    argv: *const ExtValue,
+) -> ExtValue {
+    let sum = window_state_sum(aggregate_context);
+    if argc > 0 && !argv.is_null() {
+        let args = unsafe { std::slice::from_raw_parts(argv, argc as usize) };
+        *sum += args
+            .first()
+            .and_then(ExtValue::to_integer)
+            .unwrap_or_default();
+    }
+    ExtValue::null()
+}
+
+unsafe extern "C" fn window_sum_final(_context: usize, aggregate_context: *mut AggCtx) -> ExtValue {
+    ExtValue::from_integer(*window_state_sum(aggregate_context))
+}
+
+unsafe extern "C" fn destroy_window_sum_state(aggregate_context: usize) {
+    let mut states = WINDOW_STATES.lock().unwrap();
+    match states
+        .iter_mut()
+        .find(|(state, _)| *state == aggregate_context)
+    {
+        Some((_, alive @ true)) => *alive = false,
+        _ => {
+            WINDOW_STATE_REPEATED_DESTROYS.fetch_add(1, AtomicOrdering::SeqCst);
+        }
+    }
+}
+
+/// A window frame asks the aggregate for a result on every row and keeps
+/// stepping the same accumulator afterwards, so reading that result must not
+/// destroy the extension's state.
+#[turso_macros::test]
+#[serial]
+fn managed_aggregate_in_a_window_frame_destroys_each_state_once(
+    tmp_db: TempDatabase,
+) -> anyhow::Result<()> {
+    WINDOW_STATES.lock().unwrap().clear();
+    WINDOW_STATE_USES_AFTER_DESTROY.store(0, AtomicOrdering::SeqCst);
+    WINDOW_STATE_REPEATED_DESTROYS.store(0, AtomicOrdering::SeqCst);
+    let conn = tmp_db.connect_limbo();
+
+    register_context_aggregate(
+        &conn,
+        "window_sum",
+        1,
+        0,
+        window_sum_init,
+        window_sum_step,
+        window_sum_final,
+        None,
+        Some(destroy_window_sum_state),
+        None,
+    )?;
+    conn.execute("CREATE TABLE items(id INTEGER PRIMARY KEY, category TEXT, value INTEGER)")?;
+    conn.execute("INSERT INTO items VALUES (1, 'a', 1), (2, 'a', 2), (3, 'b', 4), (4, 'b', 8)")?;
+
+    let running: Vec<(i64, i64)> =
+        conn.exec_rows("SELECT id, window_sum(value) OVER (ORDER BY id) FROM items");
+    assert_eq!(running, vec![(1, 1), (2, 3), (3, 7), (4, 15)]);
+    assert_eq!(WINDOW_STATES.lock().unwrap().len(), 1);
+
+    let per_partition: Vec<(i64, i64)> = conn.exec_rows(
+        "SELECT id, window_sum(value) OVER (PARTITION BY category ORDER BY id) FROM items",
+    );
+    assert_eq!(per_partition, vec![(1, 1), (2, 3), (3, 4), (4, 12)]);
+    assert_eq!(WINDOW_STATES.lock().unwrap().len(), 3);
+
+    assert_eq!(
+        WINDOW_STATE_USES_AFTER_DESTROY.load(AtomicOrdering::SeqCst),
+        0
+    );
+    assert_eq!(
+        WINDOW_STATE_REPEATED_DESTROYS.load(AtomicOrdering::SeqCst),
+        0
+    );
+    drop(conn);
+    let destroyed = WINDOW_STATES
+        .lock()
+        .unwrap()
+        .iter()
+        .filter(|(_, alive)| !*alive)
+        .count();
+    assert_eq!(destroyed, 3);
     Ok(())
 }
 
