@@ -498,6 +498,8 @@ fn parse_edn_read(slice: &str) -> Option<(String, bool, &str)> {
         return Some((key.to_string(), true, rest));
     }
     Some((key.to_string(), false, rest))
+}
+
 /// Regression test for the production panic
 /// "transaction should exist in txs map"
 /// (https://github.com/tursodatabase/turso-server/issues/2972).

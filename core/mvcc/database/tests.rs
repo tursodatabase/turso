@@ -22276,6 +22276,7 @@ fn dropping_passive_checkpoint_after_pager_commit_does_not_release_write_lock_tw
 
 #[path = "group_commit_tests.rs"]
 mod group_commit_tests;
+
 /// Regression tests for https://github.com/tursodatabase/turso-server/issues/2972:
 /// production panic "transaction should exist in txs map".
 ///
