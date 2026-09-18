@@ -1,4 +1,5 @@
 use super::*;
+use crate::DatabaseAllocators;
 use std::{
     ptr::NonNull,
     sync::{
@@ -51,6 +52,7 @@ impl Iterator for UnderreportedLowerBound {
     }
 }
 
+#[derive(Clone)]
 struct CountingAlloc {
     allocations: StdArc<AtomicUsize>,
     deallocations: StdArc<AtomicUsize>,
@@ -68,6 +70,30 @@ unsafe impl ApiAllocator for CountingAlloc {
             <Global as ApiAllocator>::deallocate(&Global, ptr, layout);
         }
     }
+}
+
+#[test]
+fn database_allocators_preserve_distinct_concrete_types() {
+    let allocations = StdArc::new(AtomicUsize::new(0));
+    let deallocations = StdArc::new(AtomicUsize::new(0));
+    let allocators: DatabaseAllocators<Global, CountingAlloc> = DatabaseAllocators {
+        mv_store: Global,
+        fts: CountingAlloc {
+            allocations: allocations.clone(),
+            deallocations: deallocations.clone(),
+        },
+    };
+    let cloned = allocators.clone();
+    let layout = Layout::new::<u64>();
+    let mv_block = cloned.mv_store.allocate(layout).unwrap();
+    assert_eq!(allocations.load(Ordering::Relaxed), 0);
+    let fts_block = cloned.fts.allocate(layout).unwrap();
+    assert_eq!(allocations.load(Ordering::Relaxed), 1);
+    unsafe {
+        allocators.mv_store.deallocate(mv_block.cast(), layout);
+        allocators.fts.deallocate(fts_block.cast(), layout);
+    }
+    assert_eq!(deallocations.load(Ordering::Relaxed), 1);
 }
 
 #[test]

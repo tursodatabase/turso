@@ -193,6 +193,15 @@ impl EncryptionOpts {
     }
 }
 
+#[derive(Clone, Debug, Default)]
+pub struct DatabaseAllocators<
+    M: alloc::ConcurrentAllocator = alloc::DynAllocator,
+    F: alloc::ConcurrentAllocator = alloc::DynAllocator,
+> {
+    pub mv_store: M,
+    pub fts: F,
+}
+
 /// Options for opening a [`Database`].
 ///
 /// Mirrors the `std::fs::OpenOptions` idiom: configure, then open.
@@ -218,7 +227,7 @@ pub struct OpenOptions {
     encryption: Option<EncryptionOpts>,
     page_codec: Option<Arc<dyn PageCodec>>,
     durable_storage: Option<Arc<dyn crate::mvcc::persistent_storage::DurableStorage>>,
-    allocators: alloc::DatabaseAllocators,
+    allocators: DatabaseAllocators,
     /// SQL dialect the database is opened with. The dialect is fixed at open
     /// time and shared by every user of the registered instance; a registry
     /// hit with a different dialect is an error.
@@ -237,7 +246,7 @@ impl OpenOptions {
             encryption: None,
             page_codec: None,
             durable_storage: None,
-            allocators: alloc::DatabaseAllocators::default(),
+            allocators: DatabaseAllocators::default(),
             dialect,
         }
     }
@@ -283,7 +292,7 @@ impl OpenOptions {
         self
     }
 
-    pub fn allocators(mut self, allocators: alloc::DatabaseAllocators) -> Self {
+    pub fn allocators(mut self, allocators: DatabaseAllocators) -> Self {
         self.allocators = allocators;
         self
     }
@@ -548,9 +557,12 @@ pub fn clear_database_registry() {
 ///
 /// Do that `Database` object is cached and can be long lived. DO NOT store anything sensitive like
 /// encryption key here.
-pub struct Database<A: alloc::ConcurrentAllocator = alloc::DynAllocator> {
+pub struct Database<
+    A: alloc::ConcurrentAllocator = alloc::DynAllocator,
+    F: alloc::ConcurrentAllocator = alloc::DynAllocator,
+> {
     pub(crate) mv_store: ArcSwapOption<mvcc::MvStore<mvcc::MvccClock, A>>,
-    pub(crate) allocators: alloc::DatabaseAllocators<A>,
+    pub(crate) allocators: DatabaseAllocators<A, F>,
     pub(crate) schema: Arc<Mutex<Arc<Schema>>>,
     pub db_file: Arc<dyn DatabaseStorage>,
     pub path: String,
@@ -666,7 +678,7 @@ impl Database {
         io: &Arc<dyn IO>,
         db_file: Arc<dyn DatabaseStorage>,
         encryption_opts: Option<EncryptionOpts>,
-        allocators: alloc::DatabaseAllocators,
+        allocators: DatabaseAllocators,
         page_codec_id: Option<PageCodecId>,
         dialect: Arc<dyn Dialect>,
     ) -> Result<Self> {
@@ -1373,7 +1385,7 @@ impl Database {
         encryption_opts: Option<EncryptionOpts>,
         durable_storage: Option<Arc<dyn crate::mvcc::persistent_storage::DurableStorage>>,
         page_codec: Option<Arc<dyn PageCodec>>,
-        allocators: alloc::DatabaseAllocators,
+        allocators: DatabaseAllocators,
         dialect: Arc<dyn Dialect>,
     ) -> IOResultOr<Arc<Database>> {
         Self::validate_external_page_codec_options(opts, page_codec.is_some())?;
@@ -1415,7 +1427,7 @@ impl Database {
         encryption_opts: Option<EncryptionOpts>,
         durable_storage: Option<Arc<dyn crate::mvcc::persistent_storage::DurableStorage>>,
         page_codec: Option<Arc<dyn PageCodec>>,
-        allocators: alloc::DatabaseAllocators,
+        allocators: DatabaseAllocators,
         dialect: Arc<dyn Dialect>,
     ) -> IOResultOr<Arc<Database>> {
         loop {
