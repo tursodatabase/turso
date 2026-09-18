@@ -950,6 +950,51 @@ expect error {
     cannot store REAL value in INTEGER column t.b
 }
 
+# https://github.com/tursodatabase/turso/issues/8763
+@cross-check-integrity
+test nonstrict-alter-add-column-default-blob-from-text {
+    CREATE TABLE t(a INTEGER);
+    INSERT INTO t VALUES (1);
+    ALTER TABLE t ADD COLUMN b BLOB DEFAULT '';
+    SELECT quote(b), typeof(b) FROM t;
+}
+expect {
+    ''|text
+}
+
+@cross-check-integrity
+test nonstrict-alter-add-column-default-integer-fractional {
+    CREATE TABLE t(a INTEGER);
+    INSERT INTO t VALUES (1);
+    ALTER TABLE t ADD COLUMN b INTEGER DEFAULT 3.7;
+    SELECT b, typeof(b) FROM t;
+}
+expect {
+    3.7|real
+}
+
+@cross-check-integrity
+test nonstrict-alter-add-column-default-text-from-blob {
+    CREATE TABLE t(a INTEGER);
+    INSERT INTO t VALUES (1);
+    ALTER TABLE t ADD COLUMN b TEXT DEFAULT X'CAFE';
+    SELECT quote(b), typeof(b) FROM t;
+}
+expect {
+    X'CAFE'|blob
+}
+
+@cross-check-integrity
+test nonstrict-alter-add-column-default-real-nonnumeric {
+    CREATE TABLE t(a INTEGER);
+    INSERT INTO t VALUES (1);
+    ALTER TABLE t ADD COLUMN b REAL DEFAULT 'abc';
+    SELECT quote(b), typeof(b) FROM t;
+}
+expect {
+    'abc'|text
+}
+
 @cross-check-integrity
 test alter-add-column-invalid-collation {
     CREATE TABLE t(c1 INTEGER);
