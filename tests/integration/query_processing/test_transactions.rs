@@ -2240,4 +2240,3 @@ fn test_concurrent_autoincrement_no_database_busy(tmp_db: TempDatabase) {
         "Two autoincrement inserts got the same rowid"
     );
 }
-
