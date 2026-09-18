@@ -34,11 +34,19 @@ info:
   database: ':memory:'
 ---
 QUERY PLAN
-|--SCAN orders
+|--MATERIALIZE hash build input for nation
+|  |--HASH JOIN nation
+|  |--SCAN supplier
+|  `--SCAN region
+|--MATERIALIZE hash build input for supplier
+|  |--HASH JOIN supplier
+|  |--HASH JOIN nation
+|  `--SCAN region
+|--HASH JOIN lineitem
+|--SEARCH orders USING INTEGER PRIMARY KEY (rowid=?)
 |--SEARCH customer USING INTEGER PRIMARY KEY (rowid=?)
-|--SEARCH nation USING INTEGER PRIMARY KEY (rowid=?)
-|--SEARCH region USING INTEGER PRIMARY KEY (rowid=?)
-|--SEARCH lineitem USING INDEX sqlite_autoindex_lineitem_1 (l_orderkey=?)
-|--SEARCH supplier USING INTEGER PRIMARY KEY (rowid=?)
+|--HASH JOIN supplier
+|--HASH JOIN nation
+|--SCAN region
 |--USE SORTER FOR GROUP BY
 `--USE SORTER FOR ORDER BY

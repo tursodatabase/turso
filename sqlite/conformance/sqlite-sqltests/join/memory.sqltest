@@ -871,7 +871,7 @@ test unique-hash-key-does-not-apply-to-a-different-collation {
       ON collation_unique_probe.key COLLATE NOCASE = collation_unique_build.key;
 }
 expect pattern {
-    (?s)"detail":"HASH JOIN collation_unique_probe".*"rows_per_input":0.1
+    (?s)"detail":"HASH JOIN collation_unique_probe".*"rows_per_input":0.04
 }
 
 @skip-if sqlite "Turso reports hash join estimates in its JSON plan"
@@ -885,7 +885,7 @@ test hash-join-cost-includes-rows-visited {
     JOIN hash_cost_right ON hash_cost_left.key = hash_cost_right.key;
 }
 expect pattern {
-    (?s)"detail":"HASH JOIN hash_cost_right".*"access_cost":300110000
+    (?s)"detail":"HASH JOIN hash_cost_right".*"access_cost":120110000
 }
 
 @skip-if sqlite "Turso reports its selected plan in JSON"

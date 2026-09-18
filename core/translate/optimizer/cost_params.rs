@@ -102,7 +102,7 @@ impl CostModelParams {
             rows_per_table_page: 50.0,
 
             // Selectivity fallbacks
-            sel_eq_unindexed: 0.1,
+            sel_eq_unindexed: 0.04,
             sel_eq_indexed: 0.001,
             sel_range: 0.4,
             sel_is_null: 0.1,
