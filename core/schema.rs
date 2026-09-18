@@ -3389,7 +3389,7 @@ impl BTreeTable {
                 col.override_affinity(Affinity::Blob);
             } else if let Ok(Some(resolved)) = schema.resolve_type(&col.ty_str, table.is_strict) {
                 col.ty_str = resolved.primitive.to_uppercase();
-                col.override_affinity(Affinity::None);
+                col.override_affinity(Affinity::affinity(&resolved.primitive));
             }
         }
         Arc::new(modified)
@@ -3425,8 +3425,14 @@ impl BTreeTable {
                 // so accept ANY here; the encoder handles conversion.
                 col.ty_str = "ANY".to_string();
                 col.override_affinity(Affinity::Blob);
-            } else if let Some(type_def) = schema.get_type_def(&col.ty_str, table.is_strict) {
-                col.ty_str = type_def.value_input_type().to_uppercase();
+            } else if let Ok(Some(resolved)) = schema.resolve_type(&col.ty_str, table.is_strict) {
+                let input_type = if Affinity::affinity(&resolved.primitive) == Affinity::Blob {
+                    "ANY"
+                } else {
+                    resolved.leaf().value_input_type()
+                };
+                col.ty_str = input_type.to_uppercase();
+                col.override_affinity(Affinity::affinity(input_type));
             }
         }
         Ok(Arc::new(modified))
