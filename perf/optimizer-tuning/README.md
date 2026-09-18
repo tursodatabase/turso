@@ -362,21 +362,28 @@ SEARCH nation USING INTEGER PRIMARY KEY (rowid=?)
 
 | Query | Time before | Time after | Instructions before | Instructions after |
 | --- | ---: | ---: | ---: | ---: |
-| TPC-H 11 | 5.65 s | 0.95 s (-83%) | 30.97 G | 6.28 G (-80%) |
-| TPC-H 17 | 6.01 s | 5.72 s (-5%) | 33.86 G | 31.77 G (-6%) |
+| TPC-H 11 | 5.75 s | 0.95 s (-83%) | 30.97 G | 6.28 G (-80%) |
+| TPC-H 17 | 6.02 s | 5.84 s (-3%) | 33.86 G | 31.77 G (-6%) |
 
 Those are the only two queries whose instruction count moves by more than one
-percent. Every other query stays within 0.01 percent, so the rest of the timing
-differences are the noise of the machine, not the change.
+percent. Every other query stays within 0.01 percent.
 
 | Benchmark | Time before | Time after | Change | Instructions before | Instructions after | Change |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| TPC-H (22 queries) | 68.71 s | 63.72 s | -7.3% | 403.4 G | 376.6 G | -6.6% |
-| ClickBench (42 queries) | 32.34 s | 32.33 s | -0.0% | 214.5 G | 214.5 G | +0.0% |
+| TPC-H (22 queries) | 70.36 s | 65.45 s | -7.0% | 403.4 G | 376.6 G | -6.6% |
+| ClickBench (42 queries) | 33.41 s | 33.46 s | +0.1% | 214.5 G | 214.5 G | +0.0% |
 
-Both columns cover the same queries. ClickBench query 29 is left out of both,
-because `REGEXP_REPLACE` is not available and the query fails to parse on either
-side.
+Both columns cover the same queries, and both sides ran at the values that
+ship. ClickBench query 29 is left out of both, because `REGEXP_REPLACE` is not
+available and the query fails to parse on either side.
+
+Read the TPC-H row as one query, not as a broad gain. Query 11 alone is 4.81 s
+of the 4.91 s. **Without query 11, TPC-H moves from 64.60 s to 64.51 s, which is
+-0.15 percent.** Over the other 63 queries, 28 are faster and 35 are slower, and
+the geometric mean of the ratio is 1.0007. There is no effect on any query but
+11 and 17 that this machine can measure. The instruction counts say the same
+thing, and they do not move with machine load, so they are the stronger
+evidence: two queries change and 62 do not.
 
 ## Was the learned model worth it here?
 
