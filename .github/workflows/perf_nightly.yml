@@ -21,10 +21,12 @@ env:
 jobs:
   bench:
     runs-on: nyrkio_perf_server_4cpu_ubuntu2404
-    # Compiling the benchmarks takes ~16 minutes on this 4-CPU runner and the
-    # benchmarks themselves ~90 minutes (mvcc_recovery_benchmark alone is ~20
-    # minutes: 15 bench functions with a 60 s measurement window each).
-    timeout-minutes: 150
+    # Nyrkiö runners kill a job after 92 minutes. scripts/nightly-bench.sh
+    # stops running benchmarks before that, so that the results so far still
+    # get uploaded.
+    timeout-minutes: 92
+    env:
+      DISABLE_RUSQLITE_BENCHMARK: 1
     steps:
       - uses: actions/checkout@v4
       - uses: useblacksmith/setup-node@v5
@@ -56,58 +58,85 @@ jobs:
       - name: Build benchmarks
         run: scripts/nightly-bench.sh build
       - name: Check every benchmark has a step
+        if: ${{ !cancelled() }}
         run: scripts/nightly-bench.sh check .github/workflows/perf_nightly.yml
       - name: Bench alloc_collections
+        if: ${{ !cancelled() }}
         run: scripts/nightly-bench.sh run alloc_collections
       - name: Bench benchmark
+        if: ${{ !cancelled() }}
         run: scripts/nightly-bench.sh run benchmark
       - name: Bench count_benchmark
+        if: ${{ !cancelled() }}
         run: scripts/nightly-bench.sh run count_benchmark
       - name: Bench create_index_benchmark
+        if: ${{ !cancelled() }}
         run: scripts/nightly-bench.sh run create_index_benchmark
       - name: Bench fts_benchmark
+        if: ${{ !cancelled() }}
         run: scripts/nightly-bench.sh run fts_benchmark
       - name: Bench fts_comparison_benchmark
+        if: ${{ !cancelled() }}
         run: scripts/nightly-bench.sh run fts_comparison_benchmark
       - name: Bench graph_queries_benchmark
+        if: ${{ !cancelled() }}
         run: scripts/nightly-bench.sh run graph_queries_benchmark
       - name: Bench hash_spill_benchmark
+        if: ${{ !cancelled() }}
         run: scripts/nightly-bench.sh run hash_spill_benchmark
       - name: Bench json_benchmark
+        if: ${{ !cancelled() }}
         run: scripts/nightly-bench.sh run json_benchmark
       - name: Bench logical_log_serialization
+        if: ${{ !cancelled() }}
         run: scripts/nightly-bench.sh run logical_log_serialization
       - name: Bench mvcc_benchmark
+        if: ${{ !cancelled() }}
         run: scripts/nightly-bench.sh run mvcc_benchmark
       - name: Bench mvcc_recovery_benchmark
+        if: ${{ !cancelled() }}
         run: scripts/nightly-bench.sh run mvcc_recovery_benchmark
       - name: Bench parser_benchmark
+        if: ${{ !cancelled() }}
         run: scripts/nightly-bench.sh run parser_benchmark
       - name: Bench prepare_benchmark
+        if: ${{ !cancelled() }}
         run: scripts/nightly-bench.sh run prepare_benchmark
       - name: Bench prepare_params_benchmark
+        if: ${{ !cancelled() }}
         run: scripts/nightly-bench.sh run prepare_params_benchmark
       - name: Bench record_recycling
+        if: ${{ !cancelled() }}
         run: scripts/nightly-bench.sh run record_recycling
       - name: Bench scan_loop_benchmark
+        if: ${{ !cancelled() }}
         run: scripts/nightly-bench.sh run scan_loop_benchmark
       - name: Bench select_star_benchmark
+        if: ${{ !cancelled() }}
         run: scripts/nightly-bench.sh run select_star_benchmark
       - name: Bench sql_functions
+        if: ${{ !cancelled() }}
         run: scripts/nightly-bench.sh run sql_functions
       - name: Bench string_expr_benchmark
+        if: ${{ !cancelled() }}
         run: scripts/nightly-bench.sh run string_expr_benchmark
       - name: Bench struct_union_benchmark
+        if: ${{ !cancelled() }}
         run: scripts/nightly-bench.sh run struct_union_benchmark
       - name: Bench struct_union_profile
+        if: ${{ !cancelled() }}
         run: scripts/nightly-bench.sh run struct_union_profile
       - name: Bench text_validate_benchmark
+        if: ${{ !cancelled() }}
         run: scripts/nightly-bench.sh run text_validate_benchmark
       - name: Bench triggers
+        if: ${{ !cancelled() }}
         run: scripts/nightly-bench.sh run triggers
       - name: Bench write_perf_benchmark
+        if: ${{ !cancelled() }}
         run: scripts/nightly-bench.sh run write_perf_benchmark
       - name: Analyze benchmark result with Nyrkiö
+        if: ${{ !cancelled() }}
         uses: nyrkio/change-detection@f1e26bea1b51177e5d4fe3f83dbc807410c4bc1d
         with:
           name: nightly/turso

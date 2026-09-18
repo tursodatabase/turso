@@ -3,8 +3,6 @@
 
 use std::hint::black_box;
 use std::sync::Arc;
-#[cfg(not(feature = "codspeed"))]
-use std::time::Duration;
 use turso_core::SqliteDialect;
 
 #[cfg(not(feature = "codspeed"))]
@@ -170,7 +168,7 @@ fn bench_recovery(c: &mut Criterion) {
 criterion_group! {
     name = benches;
     config = Criterion::default()
-        .measurement_time(Duration::from_secs(60))
+        .sample_size(10)
         .with_profiler(PProfProfiler::new(100, Output::Flamegraph(None)));
     targets = bench_recovery
 }
