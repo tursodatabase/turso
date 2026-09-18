@@ -96,21 +96,21 @@ pub(crate) struct AvailableIndexes {
 
 impl AvailableIndexes {
     fn for_table_references(resolver: &Resolver, table_references: &TableReferences) -> Self {
-        let mut available_indexes = Self::default();
-        for table_ref in table_references.joined_tables() {
-            if !matches!(table_ref.table, Table::BTree(_) | Table::Virtual(_)) {
-                continue;
-            }
-            let indexes = resolver.with_schema(table_ref.database_id, |schema| {
-                schema.indexes.get(table_ref.table.get_name()).cloned()
-            });
-            if let Some(indexes) = indexes {
-                available_indexes
-                    .indexes_by_table_id
-                    .insert(table_ref.internal_id, indexes);
-            }
+        let indexes_by_table_id: HashMap<TableInternalId, VecDeque<Arc<Index>>> = table_references
+            .joined_tables()
+            .iter()
+            .filter(|jt| matches!(jt.table, Table::BTree(_))) // only b-tree tables can have indexes
+            .filter_map(|jt| {
+                let indexes = resolver.with_schema(jt.database_id, |schema| {
+                    schema.indexes.get(jt.table.get_name()).cloned()
+                })?;
+                Some((jt.internal_id, indexes))
+            })
+            .collect();
+
+        Self {
+            indexes_by_table_id,
         }
-        available_indexes
     }
 
     pub(crate) fn indexes_for_table(
