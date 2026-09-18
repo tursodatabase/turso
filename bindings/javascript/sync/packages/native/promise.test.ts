@@ -800,29 +800,21 @@ test('concurrent-updates', { timeout: process.platform === 'win32' ? 120_000 : u
         url: server.dbUrl(),
     });
     await db1.exec("PRAGMA busy_timeout=100");
-    async function pull(db: Database) {
-        try {
-            await db.pull();
-        } catch (e) {
-            console.error('pull error', e);
-        } finally {
-            console.error('pull ok');
-            setTimeout(async () => await pull(db), 0);
-        }
-    }
-    async function push(db: Database) {
-        try {
-            await db.push();
-        } catch (e) {
-            console.error('push error', e);
-        } finally {
-            console.error('push ok');
-            setTimeout(async () => await push(db), 0);
+    let stopped = false;
+    async function syncUntilStopped(name: string, sync: () => Promise<unknown>) {
+        while (!stopped) {
+            try {
+                await sync();
+                console.error(`${name} ok`);
+            } catch (e) {
+                console.error(`${name} error`, e);
+            }
+            await new Promise(resolve => setTimeout(resolve, 0));
         }
     }
 
-    setTimeout(async () => await pull(db1), 0)
-    setTimeout(async () => await push(db1), 0)
+    const pullLoop = syncUntilStopped('pull', () => db1.pull());
+    const pushLoop = syncUntilStopped('push', () => db1.push());
     for (let i = 0; i < 1000; i++) {
         try {
             await Promise.all([
@@ -835,6 +827,9 @@ test('concurrent-updates', { timeout: process.platform === 'win32' ? 120_000 : u
         }
         await new Promise(resolve => setTimeout(resolve, 1));
     }
+    stopped = true;
+    await Promise.all([pullLoop, pushLoop]);
+    await db1.close();
 })
 
 test('corruption-bug-1', async ({ server }) => {
