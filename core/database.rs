@@ -218,7 +218,7 @@ pub struct OpenOptions {
     encryption: Option<EncryptionOpts>,
     page_codec: Option<Arc<dyn PageCodec>>,
     durable_storage: Option<Arc<dyn crate::mvcc::persistent_storage::DurableStorage>>,
-    allocator: alloc::DynAllocator,
+    allocators: alloc::DatabaseAllocators,
     /// SQL dialect the database is opened with. The dialect is fixed at open
     /// time and shared by every user of the registered instance; a registry
     /// hit with a different dialect is an error.
@@ -237,7 +237,7 @@ impl OpenOptions {
             encryption: None,
             page_codec: None,
             durable_storage: None,
-            allocator: alloc::DynAllocator::default(),
+            allocators: alloc::DatabaseAllocators::default(),
             dialect,
         }
     }
@@ -283,8 +283,8 @@ impl OpenOptions {
         self
     }
 
-    pub fn allocator(mut self, allocator: alloc::DynAllocator) -> Self {
-        self.allocator = allocator;
+    pub fn allocators(mut self, allocators: alloc::DatabaseAllocators) -> Self {
+        self.allocators = allocators;
         self
     }
 }
@@ -550,7 +550,7 @@ pub fn clear_database_registry() {
 /// encryption key here.
 pub struct Database<A: alloc::ConcurrentAllocator = alloc::DynAllocator> {
     pub(crate) mv_store: ArcSwapOption<mvcc::MvStore<mvcc::MvccClock, A>>,
-    pub(crate) mv_store_allocator: A,
+    pub(crate) allocators: alloc::DatabaseAllocators<A>,
     pub(crate) schema: Arc<Mutex<Arc<Schema>>>,
     pub db_file: Arc<dyn DatabaseStorage>,
     pub path: String,
@@ -666,7 +666,7 @@ impl Database {
         io: &Arc<dyn IO>,
         db_file: Arc<dyn DatabaseStorage>,
         encryption_opts: Option<EncryptionOpts>,
-        mv_store_allocator: alloc::DynAllocator,
+        allocators: alloc::DatabaseAllocators,
         page_codec_id: Option<PageCodecId>,
         dialect: Arc<dyn Dialect>,
     ) -> Result<Self> {
@@ -703,7 +703,7 @@ impl Database {
 
         let db = Database {
             mv_store,
-            mv_store_allocator,
+            allocators,
             path,
             wal_path,
             schema: Arc::new(Mutex::new(Arc::new({
@@ -1276,7 +1276,7 @@ impl Database {
             options.encryption.clone(),
             options.durable_storage.clone(),
             options.page_codec.clone(),
-            options.allocator.clone(),
+            options.allocators.clone(),
             options.dialect.clone(),
         );
 
@@ -1353,7 +1353,7 @@ impl Database {
             options.encryption.clone(),
             options.durable_storage.clone(),
             options.page_codec.clone(),
-            options.allocator.clone(),
+            options.allocators.clone(),
             options.dialect.clone(),
         )
     }
@@ -1373,7 +1373,7 @@ impl Database {
         encryption_opts: Option<EncryptionOpts>,
         durable_storage: Option<Arc<dyn crate::mvcc::persistent_storage::DurableStorage>>,
         page_codec: Option<Arc<dyn PageCodec>>,
-        allocator: alloc::DynAllocator,
+        allocators: alloc::DatabaseAllocators,
         dialect: Arc<dyn Dialect>,
     ) -> IOResultOr<Arc<Database>> {
         Self::validate_external_page_codec_options(opts, page_codec.is_some())?;
@@ -1394,7 +1394,7 @@ impl Database {
             encryption_opts,
             durable_storage,
             page_codec,
-            allocator,
+            allocators,
             dialect,
         );
         if result.is_err() {
@@ -1415,7 +1415,7 @@ impl Database {
         encryption_opts: Option<EncryptionOpts>,
         durable_storage: Option<Arc<dyn crate::mvcc::persistent_storage::DurableStorage>>,
         page_codec: Option<Arc<dyn PageCodec>>,
-        allocator: alloc::DynAllocator,
+        allocators: alloc::DatabaseAllocators,
         dialect: Arc<dyn Dialect>,
     ) -> IOResultOr<Arc<Database>> {
         loop {
@@ -1442,7 +1442,7 @@ impl Database {
                         &io,
                         db_file.clone(),
                         encryption_opts.clone(),
-                        allocator.clone(),
+                        allocators.clone(),
                         page_codec.as_deref().map(PageCodec::codec_id),
                         dialect.clone(),
                     )?;
@@ -2216,7 +2216,7 @@ impl Database {
                             self.open_flags,
                             self.durable_storage.clone(),
                             enc_ctx,
-                            self.mv_store_allocator.clone(),
+                            self.allocators.mv_store.clone(),
                             self.experimental_mvcc_passive_checkpoint_enabled(),
                         )?;
                         self.mv_store.store(Some(mv_store));
@@ -2297,7 +2297,7 @@ impl Database {
                 self.open_flags,
                 self.durable_storage.clone(),
                 None,
-                self.mv_store_allocator.clone(),
+                self.allocators.mv_store.clone(),
                 self.experimental_mvcc_passive_checkpoint_enabled(),
             )?;
             self.mv_store.store(Some(mv_store.clone()));

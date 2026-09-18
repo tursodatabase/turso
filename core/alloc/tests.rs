@@ -90,6 +90,7 @@ fn dyn_allocator_delegates_skiplist_allocations() {
 fn database_open_with_allocator_uses_allocator_for_mvstore_skiplist() {
     let allocations = StdArc::new(AtomicUsize::new(0));
     let deallocations = StdArc::new(AtomicUsize::new(0));
+    let fts_allocations = StdArc::new(AtomicUsize::new(0));
     let alloc = DynAllocator::new(CountingAlloc {
         allocations: allocations.clone(),
         deallocations,
@@ -108,7 +109,13 @@ fn database_open_with_allocator_uses_allocator_for_mvstore_skiplist() {
         "open-with-allocator.db",
         crate::OpenOptions::new(StdArc::new(crate::SqliteDialect))
             .storage(db_file)
-            .allocator(alloc),
+            .allocators(DatabaseAllocators {
+                mv_store: alloc,
+                fts: DynAllocator::new(CountingAlloc {
+                    allocations: fts_allocations.clone(),
+                    deallocations: StdArc::new(AtomicUsize::new(0)),
+                }),
+            }),
     )
     .unwrap();
     let conn = db.connect().unwrap();
@@ -118,6 +125,7 @@ fn database_open_with_allocator_uses_allocator_for_mvstore_skiplist() {
 
     assert!(db.get_mv_store().is_some());
     assert!(allocations.load(Ordering::Relaxed) > 0);
+    assert_eq!(fts_allocations.load(Ordering::Relaxed), 0);
 }
 
 #[cfg(nightly)]
