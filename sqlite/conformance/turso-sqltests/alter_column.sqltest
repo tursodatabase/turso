@@ -886,6 +886,8 @@ test alter-column-strict-any-gencol-affinity {
 expect {
     text
     ok
+}
+
 # Adding NOT NULL through ALTER COLUMN must scan the existing rows first, the same way
 # ADD COLUMN and the virtual generated column path already do. Without the scan the
 # schema advertises NOT NULL while a NULL row stays in the table, and everything that
@@ -902,11 +904,15 @@ expect error {
 
 test alter-column-notnull-checks-the-targeted-column-only {
     CREATE TABLE t (a, c);
-    INSERT INTO t VALUES (1, NULL), (2, 3);
+    INSERT INTO t VALUES (NULL, 1), (2, 3);
     ALTER TABLE t ALTER COLUMN c TO d NOT NULL;
+    SELECT sql FROM sqlite_schema WHERE name = 't';
+    SELECT a IS NULL, d FROM t ORDER BY rowid;
 }
-expect error {
-    NOT NULL constraint failed: t.d
+expect {
+    CREATE TABLE t (a, d NOT NULL)
+    1|1
+    0|3
 }
 
 test alter-column-notnull-accepts-when-column-has-no-nulls {
