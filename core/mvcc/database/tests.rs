@@ -22224,5 +22224,55 @@ fn issue_8467_seek_after_checkpoint_publish_does_not_read_negative_root() {
     assert_eq!(rows[0][0].as_int().unwrap(), 1);
 }
 
+#[test]
+fn dropping_passive_checkpoint_after_pager_commit_does_not_release_write_lock_twice() {
+    let db = MvccTestDbNoConn::new_with_random_db_passive();
+    let setup = db.connect();
+    setup
+        .execute("CREATE TABLE t(id INTEGER PRIMARY KEY)")
+        .unwrap();
+    setup.execute("INSERT INTO t VALUES (1)").unwrap();
+    setup
+        .execute("PRAGMA mvcc_checkpoint_threshold = -1")
+        .unwrap();
+
+    let ckpt_conn = db.connect();
+    ckpt_conn
+        .execute("PRAGMA mvcc_checkpoint_threshold = 0")
+        .unwrap();
+    let park = FixedYieldInjector::new([CheckpointYieldPoint::BeforePublishWindow.point()]);
+    ckpt_conn.set_yield_injector(Some(park.clone()));
+    let mut delayed = ckpt_conn.prepare("INSERT INTO t VALUES (2)").unwrap();
+    let io = ckpt_conn.pager.load().io.clone();
+    let mut parked = false;
+    for _ in 0..200_000 {
+        match delayed.step().unwrap() {
+            crate::StepResult::Yield | crate::StepResult::IO => {
+                if park.is_empty() {
+                    parked = true;
+                    break;
+                }
+                io.step().unwrap();
+            }
+            crate::StepResult::Done => break,
+            other => panic!("unexpected checkpoint step: {other:?}"),
+        }
+    }
+    ckpt_conn.set_yield_injector(None);
+    assert!(
+        parked,
+        "auto-checkpoint should park after pager commit and before publishing roots"
+    );
+
+    drop(delayed);
+
+    let writer = db.connect();
+    writer.execute("INSERT INTO t VALUES (3)").unwrap();
+    writer.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+    let rows = get_rows(&writer, "SELECT id FROM t ORDER BY id");
+    let ids: Vec<i64> = rows.iter().map(|row| row[0].as_int().unwrap()).collect();
+    assert_eq!(ids, vec![1, 2, 3]);
+}
+
 #[path = "group_commit_tests.rs"]
 mod group_commit_tests;

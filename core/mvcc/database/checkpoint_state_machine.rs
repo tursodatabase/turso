@@ -2810,6 +2810,8 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
                     )? {
                         IOResult::Done(_) => {
                             self.pager_commit_done = true;
+                            self.lock_states.pager_read_tx = false;
+                            self.lock_states.pager_write_tx = false;
                         }
                         IOResult::IO(io) => return Ok(TransitionResult::Io(io)),
                     }
