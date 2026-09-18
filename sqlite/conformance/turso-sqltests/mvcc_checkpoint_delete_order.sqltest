@@ -1,6 +1,6 @@
 @database :memory:
 
-test mvcc-checkpoint-before-delete-then-verify-same-session {
+test mvcc-checkpoint-before-delete {
     PRAGMA journal_mode = 'mvcc';
     CREATE TABLE t (x);
     INSERT INTO t SELECT value FROM generate_series(1, 3);
@@ -16,7 +16,7 @@ expect {
     3
 }
 
-test mvcc-delete-then-checkpoint-then-verify-same-session {
+test mvcc-delete-then-checkpoint {
     PRAGMA journal_mode = 'mvcc';
     CREATE TABLE t (x);
     INSERT INTO t SELECT value FROM generate_series(1, 3);
@@ -32,7 +32,7 @@ expect {
     3
 }
 
-test mvcc-checkpoint-delete-checkpoint-then-verify-same-session {
+test mvcc-checkpoint-delete-checkpoint {
     PRAGMA journal_mode = 'mvcc';
     CREATE TABLE t (x);
     INSERT INTO t SELECT value FROM generate_series(1, 3);
