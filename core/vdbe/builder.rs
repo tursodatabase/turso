@@ -467,12 +467,6 @@ impl ProgramBuilderFlags {
     }
 }
 
-#[derive(Debug, Clone, Copy, Eq, PartialEq)]
-pub enum MaterializedBuildInputModeTag {
-    RowidOnly,
-    Payload,
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 /// Signature of a hash build to allow reuse when inputs are unchanged.
 /// TODO: this is very heavy... we might consider hashing instead of storing full data.
@@ -487,8 +481,6 @@ pub struct HashBuildSignature {
     pub use_bloom_filter: bool,
     /// Rowid input cursor when the build side is materialized.
     pub materialized_input_cursor: Option<CursorID>,
-    /// RowidOnly vs KeyPayload
-    pub materialized_mode: Option<MaterializedBuildInputModeTag>,
 }
 
 /// Information about a materialized CTE, used for sharing data across multiple references.
