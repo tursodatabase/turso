@@ -228,3 +228,185 @@ expect {
     3|c
     4|d
 }
+
+test mvcc-autoincrement-multiple-tables-sqlite-sequence {
+    PRAGMA journal_mode = 'mvcc';
+    CREATE TABLE a (id INTEGER PRIMARY KEY AUTOINCREMENT, v TEXT);
+    CREATE TABLE b (id INTEGER PRIMARY KEY AUTOINCREMENT, v TEXT);
+    INSERT INTO a(v) VALUES ('a1'),('a2'),('a3');
+    INSERT INTO b(v) VALUES ('b1'),('b2'),('b3'),('b4'),('b5'),('b6'),('b7');
+    PRAGMA wal_checkpoint(TRUNCATE);
+    SELECT name, seq FROM sqlite_sequence ORDER BY name;
+}
+expect {
+    mvcc
+    0|0|0
+    a|3
+    b|7
+}
+
+test mvcc-autoincrement-stress-multipage {
+    PRAGMA journal_mode = 'mvcc';
+    CREATE TABLE stress_00(id INTEGER PRIMARY KEY AUTOINCREMENT, v TEXT);
+    CREATE TABLE stress_01(id INTEGER PRIMARY KEY AUTOINCREMENT, v TEXT);
+    CREATE TABLE stress_02(id INTEGER PRIMARY KEY AUTOINCREMENT, v TEXT);
+    CREATE TABLE stress_03(id INTEGER PRIMARY KEY AUTOINCREMENT, v TEXT);
+    CREATE TABLE stress_04(id INTEGER PRIMARY KEY AUTOINCREMENT, v TEXT);
+    CREATE TABLE stress_05(id INTEGER PRIMARY KEY AUTOINCREMENT, v TEXT);
+    CREATE TABLE stress_06(id INTEGER PRIMARY KEY AUTOINCREMENT, v TEXT);
+    CREATE TABLE stress_07(id INTEGER PRIMARY KEY AUTOINCREMENT, v TEXT);
+    CREATE TABLE stress_08(id INTEGER PRIMARY KEY AUTOINCREMENT, v TEXT);
+    CREATE TABLE stress_09(id INTEGER PRIMARY KEY AUTOINCREMENT, v TEXT);
+    CREATE TABLE stress_10(id INTEGER PRIMARY KEY AUTOINCREMENT, v TEXT);
+    CREATE TABLE stress_11(id INTEGER PRIMARY KEY AUTOINCREMENT, v TEXT);
+    CREATE TABLE stress_12(id INTEGER PRIMARY KEY AUTOINCREMENT, v TEXT);
+    CREATE TABLE stress_13(id INTEGER PRIMARY KEY AUTOINCREMENT, v TEXT);
+    CREATE TABLE stress_14(id INTEGER PRIMARY KEY AUTOINCREMENT, v TEXT);
+    CREATE TABLE stress_15(id INTEGER PRIMARY KEY AUTOINCREMENT, v TEXT);
+    CREATE TABLE stress_16(id INTEGER PRIMARY KEY AUTOINCREMENT, v TEXT);
+    CREATE TABLE stress_17(id INTEGER PRIMARY KEY AUTOINCREMENT, v TEXT);
+    CREATE TABLE stress_18(id INTEGER PRIMARY KEY AUTOINCREMENT, v TEXT);
+    CREATE TABLE stress_19(id INTEGER PRIMARY KEY AUTOINCREMENT, v TEXT);
+    INSERT INTO stress_00(v) VALUES ('r0'),('r1'),('r2'),('r3'),('r4'),('r5'),('r6'),('r7'),('r8'),('r9'),('r10'),('r11'),('r12'),('r13'),('r14'),('r15'),('r16'),('r17'),('r18'),('r19'),('r20'),('r21'),('r22'),('r23'),('r24'),('r25'),('r26'),('r27'),('r28'),('r29'),('r30'),('r31'),('r32'),('r33'),('r34'),('r35'),('r36'),('r37'),('r38'),('r39'),('r40'),('r41'),('r42'),('r43'),('r44'),('r45'),('r46'),('r47'),('r48'),('r49');
+    INSERT INTO stress_01(v) VALUES ('r0'),('r1'),('r2'),('r3'),('r4'),('r5'),('r6'),('r7'),('r8'),('r9'),('r10'),('r11'),('r12'),('r13'),('r14'),('r15'),('r16'),('r17'),('r18'),('r19'),('r20'),('r21'),('r22'),('r23'),('r24'),('r25'),('r26'),('r27'),('r28'),('r29'),('r30'),('r31'),('r32'),('r33'),('r34'),('r35'),('r36'),('r37'),('r38'),('r39'),('r40'),('r41'),('r42'),('r43'),('r44'),('r45'),('r46'),('r47'),('r48'),('r49');
+    INSERT INTO stress_02(v) VALUES ('r0'),('r1'),('r2'),('r3'),('r4'),('r5'),('r6'),('r7'),('r8'),('r9'),('r10'),('r11'),('r12'),('r13'),('r14'),('r15'),('r16'),('r17'),('r18'),('r19'),('r20'),('r21'),('r22'),('r23'),('r24'),('r25'),('r26'),('r27'),('r28'),('r29'),('r30'),('r31'),('r32'),('r33'),('r34'),('r35'),('r36'),('r37'),('r38'),('r39'),('r40'),('r41'),('r42'),('r43'),('r44'),('r45'),('r46'),('r47'),('r48'),('r49');
+    INSERT INTO stress_03(v) VALUES ('r0'),('r1'),('r2'),('r3'),('r4'),('r5'),('r6'),('r7'),('r8'),('r9'),('r10'),('r11'),('r12'),('r13'),('r14'),('r15'),('r16'),('r17'),('r18'),('r19'),('r20'),('r21'),('r22'),('r23'),('r24'),('r25'),('r26'),('r27'),('r28'),('r29'),('r30'),('r31'),('r32'),('r33'),('r34'),('r35'),('r36'),('r37'),('r38'),('r39'),('r40'),('r41'),('r42'),('r43'),('r44'),('r45'),('r46'),('r47'),('r48'),('r49');
+    INSERT INTO stress_04(v) VALUES ('r0'),('r1'),('r2'),('r3'),('r4'),('r5'),('r6'),('r7'),('r8'),('r9'),('r10'),('r11'),('r12'),('r13'),('r14'),('r15'),('r16'),('r17'),('r18'),('r19'),('r20'),('r21'),('r22'),('r23'),('r24'),('r25'),('r26'),('r27'),('r28'),('r29'),('r30'),('r31'),('r32'),('r33'),('r34'),('r35'),('r36'),('r37'),('r38'),('r39'),('r40'),('r41'),('r42'),('r43'),('r44'),('r45'),('r46'),('r47'),('r48'),('r49');
+    INSERT INTO stress_05(v) VALUES ('r0'),('r1'),('r2'),('r3'),('r4'),('r5'),('r6'),('r7'),('r8'),('r9'),('r10'),('r11'),('r12'),('r13'),('r14'),('r15'),('r16'),('r17'),('r18'),('r19'),('r20'),('r21'),('r22'),('r23'),('r24'),('r25'),('r26'),('r27'),('r28'),('r29'),('r30'),('r31'),('r32'),('r33'),('r34'),('r35'),('r36'),('r37'),('r38'),('r39'),('r40'),('r41'),('r42'),('r43'),('r44'),('r45'),('r46'),('r47'),('r48'),('r49');
+    INSERT INTO stress_06(v) VALUES ('r0'),('r1'),('r2'),('r3'),('r4'),('r5'),('r6'),('r7'),('r8'),('r9'),('r10'),('r11'),('r12'),('r13'),('r14'),('r15'),('r16'),('r17'),('r18'),('r19'),('r20'),('r21'),('r22'),('r23'),('r24'),('r25'),('r26'),('r27'),('r28'),('r29'),('r30'),('r31'),('r32'),('r33'),('r34'),('r35'),('r36'),('r37'),('r38'),('r39'),('r40'),('r41'),('r42'),('r43'),('r44'),('r45'),('r46'),('r47'),('r48'),('r49');
+    INSERT INTO stress_07(v) VALUES ('r0'),('r1'),('r2'),('r3'),('r4'),('r5'),('r6'),('r7'),('r8'),('r9'),('r10'),('r11'),('r12'),('r13'),('r14'),('r15'),('r16'),('r17'),('r18'),('r19'),('r20'),('r21'),('r22'),('r23'),('r24'),('r25'),('r26'),('r27'),('r28'),('r29'),('r30'),('r31'),('r32'),('r33'),('r34'),('r35'),('r36'),('r37'),('r38'),('r39'),('r40'),('r41'),('r42'),('r43'),('r44'),('r45'),('r46'),('r47'),('r48'),('r49');
+    INSERT INTO stress_08(v) VALUES ('r0'),('r1'),('r2'),('r3'),('r4'),('r5'),('r6'),('r7'),('r8'),('r9'),('r10'),('r11'),('r12'),('r13'),('r14'),('r15'),('r16'),('r17'),('r18'),('r19'),('r20'),('r21'),('r22'),('r23'),('r24'),('r25'),('r26'),('r27'),('r28'),('r29'),('r30'),('r31'),('r32'),('r33'),('r34'),('r35'),('r36'),('r37'),('r38'),('r39'),('r40'),('r41'),('r42'),('r43'),('r44'),('r45'),('r46'),('r47'),('r48'),('r49');
+    INSERT INTO stress_09(v) VALUES ('r0'),('r1'),('r2'),('r3'),('r4'),('r5'),('r6'),('r7'),('r8'),('r9'),('r10'),('r11'),('r12'),('r13'),('r14'),('r15'),('r16'),('r17'),('r18'),('r19'),('r20'),('r21'),('r22'),('r23'),('r24'),('r25'),('r26'),('r27'),('r28'),('r29'),('r30'),('r31'),('r32'),('r33'),('r34'),('r35'),('r36'),('r37'),('r38'),('r39'),('r40'),('r41'),('r42'),('r43'),('r44'),('r45'),('r46'),('r47'),('r48'),('r49');
+    INSERT INTO stress_10(v) VALUES ('r0'),('r1'),('r2'),('r3'),('r4'),('r5'),('r6'),('r7'),('r8'),('r9'),('r10'),('r11'),('r12'),('r13'),('r14'),('r15'),('r16'),('r17'),('r18'),('r19'),('r20'),('r21'),('r22'),('r23'),('r24'),('r25'),('r26'),('r27'),('r28'),('r29'),('r30'),('r31'),('r32'),('r33'),('r34'),('r35'),('r36'),('r37'),('r38'),('r39'),('r40'),('r41'),('r42'),('r43'),('r44'),('r45'),('r46'),('r47'),('r48'),('r49');
+    INSERT INTO stress_11(v) VALUES ('r0'),('r1'),('r2'),('r3'),('r4'),('r5'),('r6'),('r7'),('r8'),('r9'),('r10'),('r11'),('r12'),('r13'),('r14'),('r15'),('r16'),('r17'),('r18'),('r19'),('r20'),('r21'),('r22'),('r23'),('r24'),('r25'),('r26'),('r27'),('r28'),('r29'),('r30'),('r31'),('r32'),('r33'),('r34'),('r35'),('r36'),('r37'),('r38'),('r39'),('r40'),('r41'),('r42'),('r43'),('r44'),('r45'),('r46'),('r47'),('r48'),('r49');
+    INSERT INTO stress_12(v) VALUES ('r0'),('r1'),('r2'),('r3'),('r4'),('r5'),('r6'),('r7'),('r8'),('r9'),('r10'),('r11'),('r12'),('r13'),('r14'),('r15'),('r16'),('r17'),('r18'),('r19'),('r20'),('r21'),('r22'),('r23'),('r24'),('r25'),('r26'),('r27'),('r28'),('r29'),('r30'),('r31'),('r32'),('r33'),('r34'),('r35'),('r36'),('r37'),('r38'),('r39'),('r40'),('r41'),('r42'),('r43'),('r44'),('r45'),('r46'),('r47'),('r48'),('r49');
+    INSERT INTO stress_13(v) VALUES ('r0'),('r1'),('r2'),('r3'),('r4'),('r5'),('r6'),('r7'),('r8'),('r9'),('r10'),('r11'),('r12'),('r13'),('r14'),('r15'),('r16'),('r17'),('r18'),('r19'),('r20'),('r21'),('r22'),('r23'),('r24'),('r25'),('r26'),('r27'),('r28'),('r29'),('r30'),('r31'),('r32'),('r33'),('r34'),('r35'),('r36'),('r37'),('r38'),('r39'),('r40'),('r41'),('r42'),('r43'),('r44'),('r45'),('r46'),('r47'),('r48'),('r49');
+    INSERT INTO stress_14(v) VALUES ('r0'),('r1'),('r2'),('r3'),('r4'),('r5'),('r6'),('r7'),('r8'),('r9'),('r10'),('r11'),('r12'),('r13'),('r14'),('r15'),('r16'),('r17'),('r18'),('r19'),('r20'),('r21'),('r22'),('r23'),('r24'),('r25'),('r26'),('r27'),('r28'),('r29'),('r30'),('r31'),('r32'),('r33'),('r34'),('r35'),('r36'),('r37'),('r38'),('r39'),('r40'),('r41'),('r42'),('r43'),('r44'),('r45'),('r46'),('r47'),('r48'),('r49');
+    INSERT INTO stress_15(v) VALUES ('r0'),('r1'),('r2'),('r3'),('r4'),('r5'),('r6'),('r7'),('r8'),('r9'),('r10'),('r11'),('r12'),('r13'),('r14'),('r15'),('r16'),('r17'),('r18'),('r19'),('r20'),('r21'),('r22'),('r23'),('r24'),('r25'),('r26'),('r27'),('r28'),('r29'),('r30'),('r31'),('r32'),('r33'),('r34'),('r35'),('r36'),('r37'),('r38'),('r39'),('r40'),('r41'),('r42'),('r43'),('r44'),('r45'),('r46'),('r47'),('r48'),('r49');
+    INSERT INTO stress_16(v) VALUES ('r0'),('r1'),('r2'),('r3'),('r4'),('r5'),('r6'),('r7'),('r8'),('r9'),('r10'),('r11'),('r12'),('r13'),('r14'),('r15'),('r16'),('r17'),('r18'),('r19'),('r20'),('r21'),('r22'),('r23'),('r24'),('r25'),('r26'),('r27'),('r28'),('r29'),('r30'),('r31'),('r32'),('r33'),('r34'),('r35'),('r36'),('r37'),('r38'),('r39'),('r40'),('r41'),('r42'),('r43'),('r44'),('r45'),('r46'),('r47'),('r48'),('r49');
+    INSERT INTO stress_17(v) VALUES ('r0'),('r1'),('r2'),('r3'),('r4'),('r5'),('r6'),('r7'),('r8'),('r9'),('r10'),('r11'),('r12'),('r13'),('r14'),('r15'),('r16'),('r17'),('r18'),('r19'),('r20'),('r21'),('r22'),('r23'),('r24'),('r25'),('r26'),('r27'),('r28'),('r29'),('r30'),('r31'),('r32'),('r33'),('r34'),('r35'),('r36'),('r37'),('r38'),('r39'),('r40'),('r41'),('r42'),('r43'),('r44'),('r45'),('r46'),('r47'),('r48'),('r49');
+    INSERT INTO stress_18(v) VALUES ('r0'),('r1'),('r2'),('r3'),('r4'),('r5'),('r6'),('r7'),('r8'),('r9'),('r10'),('r11'),('r12'),('r13'),('r14'),('r15'),('r16'),('r17'),('r18'),('r19'),('r20'),('r21'),('r22'),('r23'),('r24'),('r25'),('r26'),('r27'),('r28'),('r29'),('r30'),('r31'),('r32'),('r33'),('r34'),('r35'),('r36'),('r37'),('r38'),('r39'),('r40'),('r41'),('r42'),('r43'),('r44'),('r45'),('r46'),('r47'),('r48'),('r49');
+    INSERT INTO stress_19(v) VALUES ('r0'),('r1'),('r2'),('r3'),('r4'),('r5'),('r6'),('r7'),('r8'),('r9'),('r10'),('r11'),('r12'),('r13'),('r14'),('r15'),('r16'),('r17'),('r18'),('r19'),('r20'),('r21'),('r22'),('r23'),('r24'),('r25'),('r26'),('r27'),('r28'),('r29'),('r30'),('r31'),('r32'),('r33'),('r34'),('r35'),('r36'),('r37'),('r38'),('r39'),('r40'),('r41'),('r42'),('r43'),('r44'),('r45'),('r46'),('r47'),('r48'),('r49');
+    PRAGMA wal_checkpoint(TRUNCATE);
+    SELECT name, seq FROM sqlite_sequence ORDER BY name;
+}
+expect {
+    mvcc
+    0|0|0
+    stress_00|50
+    stress_01|50
+    stress_02|50
+    stress_03|50
+    stress_04|50
+    stress_05|50
+    stress_06|50
+    stress_07|50
+    stress_08|50
+    stress_09|50
+    stress_10|50
+    stress_11|50
+    stress_12|50
+    stress_13|50
+    stress_14|50
+    stress_15|50
+    stress_16|50
+    stress_17|50
+    stress_18|50
+    stress_19|50
+}
+
+test mvcc-user-sequence-backing-table-compacted-after-commit {
+    PRAGMA journal_mode = 'mvcc';
+    CREATE SEQUENCE compact_seq START 1 INCREMENT 1;
+    SELECT nextval('compact_seq');
+    SELECT nextval('compact_seq');
+    SELECT nextval('compact_seq');
+    SELECT nextval('compact_seq');
+    SELECT nextval('compact_seq');
+    PRAGMA wal_checkpoint(TRUNCATE);
+    SELECT COUNT(*) FROM "__turso_internal_seq_compact_seq";
+    SELECT value FROM "__turso_internal_seq_compact_seq";
+}
+expect {
+    mvcc
+    1
+    2
+    3
+    4
+    5
+    0|0|0
+    1
+    5
+}
+
+test mvcc-autoincrement-backing-table-compacted-after-commit {
+    PRAGMA journal_mode = 'mvcc';
+    CREATE TABLE compacted(id INTEGER PRIMARY KEY AUTOINCREMENT, v TEXT);
+    INSERT INTO compacted(v) VALUES ('row1');
+    INSERT INTO compacted(v) VALUES ('row2');
+    INSERT INTO compacted(v) VALUES ('row3');
+    INSERT INTO compacted(v) VALUES ('row4');
+    INSERT INTO compacted(v) VALUES ('row5');
+    PRAGMA wal_checkpoint(TRUNCATE);
+    SELECT COUNT(*) FROM "__turso_internal_seq___turso_internal_autoincrement_compacted";
+}
+expect {
+    mvcc
+    0|0|0
+    1
+}
+
+test mvcc-autoincrement-rollback-does-not-pollute-sqlite-sequence {
+    PRAGMA journal_mode = 'mvcc';
+    CREATE TABLE rollback_t(id INTEGER PRIMARY KEY AUTOINCREMENT, v TEXT);
+    INSERT INTO rollback_t(v) VALUES ('committed1');
+    INSERT INTO rollback_t(v) VALUES ('committed2');
+    INSERT INTO rollback_t(v) VALUES ('committed3');
+    BEGIN;
+    INSERT INTO rollback_t(v) VALUES ('rolledback1');
+    INSERT INTO rollback_t(v) VALUES ('rolledback2');
+    INSERT INTO rollback_t(v) VALUES ('rolledback3');
+    INSERT INTO rollback_t(v) VALUES ('rolledback4');
+    INSERT INTO rollback_t(v) VALUES ('rolledback5');
+    ROLLBACK;
+    PRAGMA wal_checkpoint(TRUNCATE);
+    SELECT name, seq FROM sqlite_sequence WHERE name = 'rollback_t';
+    INSERT INTO rollback_t(v) VALUES ('after_rollback');
+    SELECT id FROM rollback_t WHERE v = 'after_rollback';
+}
+expect {
+    mvcc
+    0|0|0
+    rollback_t|3
+    4
+}
+
+test mvcc-user-sequence-rollback-does-not-pollute-watermark {
+    PRAGMA journal_mode = 'mvcc';
+    CREATE SEQUENCE rb_seq START 1 INCREMENT 1;
+    SELECT nextval('rb_seq');
+    SELECT nextval('rb_seq');
+    SELECT nextval('rb_seq');
+    BEGIN;
+    SELECT nextval('rb_seq');
+    SELECT nextval('rb_seq');
+    SELECT nextval('rb_seq');
+    SELECT nextval('rb_seq');
+    SELECT nextval('rb_seq');
+    ROLLBACK;
+    PRAGMA wal_checkpoint(TRUNCATE);
+    SELECT value FROM "__turso_internal_seq_rb_seq";
+}
+expect {
+    mvcc
+    1
+    2
+    3
+    4
+    5
+    6
+    7
+    8
+    0|0|0
+    3
+}
