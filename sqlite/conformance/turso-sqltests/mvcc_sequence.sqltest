@@ -245,7 +245,7 @@ expect {
     b|7
 }
 
-test mvcc-autoincrement-stress-multipage {
+test mvcc-autoincrement-checkpoint-compaction-many-tables {
     PRAGMA journal_mode = 'mvcc';
     CREATE TABLE stress_00(id INTEGER PRIMARY KEY AUTOINCREMENT, v TEXT);
     CREATE TABLE stress_01(id INTEGER PRIMARY KEY AUTOINCREMENT, v TEXT);
