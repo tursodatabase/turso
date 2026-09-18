@@ -997,21 +997,6 @@ pub fn constraints_from_where_clause(
             // - InList has Vec<Expr> as RHS, SubqueryResult has a different structure entirely
             // - They don't fit the binary expression abstraction without a more complex return type
 
-            // A WHERE-clause IN term must not drive the loop of a table an outer
-            // join can null-extend (a term from that join's own ON clause may).
-            // The seek path leaves such a term unconsumed so it is re-checked on
-            // the null-extended row, but an IN term cannot be re-checked that
-            // way: `InSeek` iterates the IN-subquery's ephemeral cursor, and
-            // evaluating the term again probes that same cursor (`Found`,
-            // `Rewind`) in the middle of the iteration. So it is not a
-            // constraint here at all; the table is scanned and the term is a
-            // plain filter, which the null-extended row then fails.
-            if term.from_outer_join.is_none()
-                && table_references.outer_join_may_null_extend(table_reference.internal_id)
-            {
-                continue;
-            }
-
             // Handle IN list: col IN (val1, val2, ...)
             if let ast::Expr::InList { lhs, not, rhs } = &term.expr {
                 let estimated_values = rhs.len() as f64;

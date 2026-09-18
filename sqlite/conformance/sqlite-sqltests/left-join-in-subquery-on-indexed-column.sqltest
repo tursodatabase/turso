@@ -1,13 +1,11 @@
 @database :memory:
 
-# A WHERE-clause `IN (SELECT ...)` on the right table of a LEFT JOIN must
-# filter the join's RESULT, including its null-extended rows. When that
-# column is indexed the planner used to drive the right table's loop from the
-# IN list (an InSeek), which filtered the join instead: a left row with no
-# match still came back, null-extended, and the term was never checked
-# against it. Without the index the term was applied correctly. The join key
-# is INTEGER on the left and TEXT on the right so the ON term itself cannot
-# become the seek; only the IN term is a candidate.
+# WHERE u.k IN (SELECT ...) on the right table of a LEFT JOIN must also
+# filter the null-extended rows. With an index on u.k the planner used to
+# drive u's loop from the IN values (InSeek), so a left row with no match
+# still came back null-extended, never checked against the IN term (#8753).
+# The join key is INTEGER on one side and TEXT on the other so the ON term
+# cannot become the seek; only the IN term is a candidate.
 
 setup tables {
     CREATE TABLE t(id INTEGER PRIMARY KEY);
@@ -60,8 +58,8 @@ expect {
 
 @setup tables
 test left-join-in-subquery-in-the-on-clause-still-seeks {
-    -- An IN term from the join's own ON clause defines what counts as a
-    -- match, so it may still drive the seek; both left rows come back.
+    -- ON-clause terms define what a match is, so this IN term may still
+    -- drive the seek; both left rows come back.
     SELECT t.id, u.k FROM t LEFT JOIN u ON t.id = u.k AND u.k IN (SELECT k FROM v)
     ORDER BY t.id;
 }
