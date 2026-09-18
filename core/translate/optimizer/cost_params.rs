@@ -51,8 +51,10 @@ pub struct CostModelParams {
     pub in_subquery_rows: f64,
 
     // === Scan/Seek Cost Weights ===
-    /// Discount factor for repeated scans (cache benefit).
-    /// Range: [0, 1). Higher = more cache benefit assumed.
+    /// Share of a repeated scan's page IO that is still charged.
+    /// Range: [0, 1). Higher = less cache benefit assumed, so repeated scans
+    /// cost more. `estimate_scan_cost` multiplies by this value, it does not
+    /// divide by it.
     pub cache_reuse_factor: f64,
 
     /// CPU cost per row processed (relative to page IO = 1.0).
@@ -197,6 +199,41 @@ impl CostModelParams {
     /// Returns an error message if any parameter is invalid.
     #[cfg(feature = "optimizer_params")]
     pub fn validate(&self) -> Result<(), String> {
+        // A number too large for f64 parses as infinity, and every cost below
+        // would then be infinite, so no plan could be told from another.
+        let all_params = [
+            ("rows_per_table_fallback", self.rows_per_table_fallback),
+            ("rows_per_table_page", self.rows_per_table_page),
+            ("sel_eq_unindexed", self.sel_eq_unindexed),
+            ("sel_eq_indexed", self.sel_eq_indexed),
+            ("sel_range", self.sel_range),
+            ("sel_is_null", self.sel_is_null),
+            ("sel_is_not_null", self.sel_is_not_null),
+            ("sel_like", self.sel_like),
+            ("sel_not_like", self.sel_not_like),
+            ("sel_other", self.sel_other),
+            ("in_subquery_rows", self.in_subquery_rows),
+            ("cache_reuse_factor", self.cache_reuse_factor),
+            ("cpu_cost_per_row", self.cpu_cost_per_row),
+            ("cpu_cost_per_where_step", self.cpu_cost_per_where_step),
+            ("cpu_cost_per_seek", self.cpu_cost_per_seek),
+            ("index_bonus", self.index_bonus),
+            ("sort_cpu_per_row", self.sort_cpu_per_row),
+            ("hash_cpu_cost", self.hash_cpu_cost),
+            ("hash_insert_cost", self.hash_insert_cost),
+            ("hash_lookup_cost", self.hash_lookup_cost),
+            ("hash_bytes_per_row", self.hash_bytes_per_row),
+            (
+                "closed_range_selectivity_factor",
+                self.closed_range_selectivity_factor,
+            ),
+        ];
+        for (name, val) in all_params {
+            if !val.is_finite() {
+                return Err(format!("{name} must be finite, got {val}"));
+            }
+        }
+
         // Selectivity must be in (0, 1]
         let selectivity_params = [
             ("sel_eq_unindexed", self.sel_eq_unindexed),
@@ -227,8 +264,14 @@ impl CostModelParams {
         if self.rows_per_table_fallback <= 0.0 {
             return Err("rows_per_table_fallback must be positive".into());
         }
-        if self.rows_per_table_page <= 0.0 {
-            return Err("rows_per_table_page must be positive".into());
+        // `estimate_btree_depth` divides by the natural logarithm of this
+        // value. The logarithm is 0 at 1.0, which makes the depth infinite,
+        // and negative below 1.0, which makes the depth negative.
+        if self.rows_per_table_page <= 1.0 {
+            return Err(format!(
+                "rows_per_table_page must be more than 1, got {}",
+                self.rows_per_table_page
+            ));
         }
         if self.in_subquery_rows <= 0.0 {
             return Err("in_subquery_rows must be positive".into());
@@ -299,6 +342,38 @@ mod tests {
         let params = CostModelParams {
             sel_eq_indexed: 0.5,
             sel_eq_unindexed: 0.1,
+            ..Default::default()
+        };
+        assert!(params.validate().is_err());
+    }
+
+    #[test]
+    fn rows_per_table_page_of_one_or_less_is_rejected() {
+        // estimate_btree_depth divides by rows_per_table_page.ln().
+        for bad in [1.0, 0.5, 0.0] {
+            let params = CostModelParams {
+                rows_per_table_page: bad,
+                ..Default::default()
+            };
+            assert!(params.validate().is_err(), "{bad} should be rejected");
+        }
+        let params = CostModelParams {
+            rows_per_table_page: 1.5,
+            ..Default::default()
+        };
+        assert!(params.validate().is_ok());
+    }
+
+    #[test]
+    fn a_value_that_is_not_finite_is_rejected() {
+        let params = CostModelParams {
+            cpu_cost_per_row: f64::INFINITY,
+            ..Default::default()
+        };
+        assert!(params.validate().is_err());
+
+        let params = CostModelParams {
+            index_bonus: f64::NAN,
             ..Default::default()
         };
         assert!(params.validate().is_err());
