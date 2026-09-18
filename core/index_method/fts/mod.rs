@@ -370,9 +370,9 @@ fn parse_field_weights(weights_str: &str, columns: &[IndexColumn]) -> Result<Has
                 "invalid weight value '{weight_str}' for column '{col_name}'. Expected a number (e.g., 2.0)",
             ))
         })?;
-        if weight <= 0.0 {
+        if !weight.is_finite() || weight <= 0.0 {
             return Err(LimboError::ParseError(format!(
-                "weight for column '{col_name}' must be positive, got {weight}",
+                "weight for column '{col_name}' must be finite and positive, got {weight}",
             )));
         }
 

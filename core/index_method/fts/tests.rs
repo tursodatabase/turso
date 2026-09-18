@@ -10,6 +10,66 @@ use rustc_hash::FxHashMap;
 use std::num::NonZeroU32;
 use turso_parser::ast::{Expr, Literal, UnaryOperator, Variable};
 
+#[test]
+fn field_weights_reject_non_finite_and_non_positive_values() {
+    let mut accepted = Vec::new();
+    for weight in [
+        "NaN",
+        "nan",
+        "+NaN",
+        "-NaN",
+        "inf",
+        "+inf",
+        "-inf",
+        "Infinity",
+        "+INFINITY",
+        "-infinity",
+        "1e39",
+        "-1e39",
+        "0",
+        "-0",
+        "-1",
+        "1e-46",
+    ] {
+        let result = FtsIndexAttachment::new(IndexMethodConfiguration {
+            table_name: "w".to_string(),
+            index_name: "wx".to_string(),
+            columns: vec![IndexColumn::new("title", 0), IndexColumn::new("body", 1)],
+            parameters: FxHashMap::from_iter([(
+                "weights".to_string(),
+                Value::from_text(format!("title={weight},body=1")),
+            )]),
+        });
+        match result {
+            Ok(_) => accepted.push(weight),
+            Err(error) => assert!(
+                matches!(error, LimboError::ParseError(_)),
+                "{weight}: {error}"
+            ),
+        }
+    }
+    assert!(
+        accepted.is_empty(),
+        "accepted invalid weights: {accepted:?}"
+    );
+}
+
+#[test]
+fn field_weights_accept_finite_positive_boundaries() {
+    let columns = [IndexColumn::new("title", 0), IndexColumn::new("body", 1)];
+    for (input, expected) in [
+        ("1e-45", f32::from_bits(1)),
+        ("1.17549435e-38", f32::MIN_POSITIVE),
+        ("0.5", 0.5),
+        ("+1", 1.0),
+        ("3.4028235e38", f32::MAX),
+    ] {
+        let weights = parse_field_weights(&format!("title={input},body=2"), &columns).unwrap();
+        assert_eq!(weights["title"], expected, "{input}");
+        assert_eq!(weights["body"], 2.0);
+    }
+}
+
 fn test_attachment() -> FtsIndexAttachment {
     FtsIndexAttachment::new(IndexMethodConfiguration {
         table_name: "docs".to_string(),
