@@ -13,7 +13,8 @@ description = "Turso Rust API"
 workspace = true
 
 [features]
-default = ["mimalloc", "fts"]
+# mimalloc is opt-in: it installs a #[global_allocator] (one per binary; downstream decides).
+default = ["fts"]
 mimalloc = ["dep:mimalloc"]
 pure-rust-crypto = ["turso_sdk_kit/pure-rust-crypto", "turso_sync_sdk_kit/pure-rust-crypto"]
 fts = ["turso_sdk_kit/fts"]
