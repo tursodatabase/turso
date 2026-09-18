@@ -62,6 +62,13 @@ pub struct DatabaseSyncEngineOpts {
     /// databases opened internally by the engine.
     pub db_opts: turso_core::DatabaseOpts,
     pub partial_sync_opts: Option<PartialSyncOpts>,
+    /// CDC mode for the engine's change tape (see the `capture_data_changes`
+    /// pragma): `None` = "full", today's default. Embedders that never push
+    /// through the engine (e.g. they replicate rows out-of-band and only pull)
+    /// can pass `Some("off")` so their writes — and the engine's own
+    /// bookkeeping, like the post-pull high-water mark — skip capture
+    /// entirely; every tape read already tolerates the absent CDC table.
+    pub cdc_mode: Option<String>,
     /// Base64-encoded encryption key for the Turso Cloud database
     pub remote_encryption_key: Option<String>,
     /// When set, [`push_changes_to_remote`] sends the local change set to the
@@ -1224,7 +1231,7 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
 
         let tape_opts = DatabaseTapeOpts {
             cdc_table: None,
-            cdc_mode: Some("full".to_string()),
+            cdc_mode: Some(opts.cdc_mode.clone().unwrap_or_else(|| "full".to_string())),
             disable_auto_checkpoint: true,
         };
         tracing::info!("initialize database tape connection: path={}", main_db_path);
@@ -3771,6 +3778,7 @@ mod tests {
             reserved_bytes: 0,
             db_opts: turso_core::DatabaseOpts::default(),
             partial_sync_opts: None::<PartialSyncOpts>,
+            cdc_mode: None,
             remote_encryption_key: None,
             push_operations_threshold: None,
             pull_bytes_threshold: None,
