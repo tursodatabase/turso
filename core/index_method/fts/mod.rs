@@ -437,27 +437,78 @@ struct FtsRuntimeStats {
 #[derive(Debug, Default)]
 struct SegmentByteCache {
     /// Least recently used first.
-    entries: Vec<(SegmentId, Arc<SegmentData>)>,
+    entries: Vec<SegmentCacheEntry>,
+}
+
+#[derive(Debug)]
+struct SegmentCacheEntry {
+    id: SegmentId,
+    data: Arc<SegmentData>,
+    descriptor: Option<(Box<[u8]>, Arc<SegmentDescriptor>)>,
 }
 
 impl SegmentByteCache {
     fn total_bytes(&self) -> usize {
-        self.entries.iter().fold(0usize, |total, (_, data)| {
-            total.saturating_add(data.total_bytes)
+        self.entries.iter().fold(0usize, |total, entry| {
+            let descriptor_bytes = entry.descriptor.as_ref().map_or(0, |(bytes, descriptor)| {
+                bytes.len()
+                    + std::mem::size_of::<SegmentDescriptor>()
+                    + descriptor.files.capacity() * std::mem::size_of::<SegmentFileEntry>()
+                    + descriptor
+                        .files
+                        .iter()
+                        .map(|file| file.name.capacity())
+                        .sum::<usize>()
+            });
+            total
+                .saturating_add(entry.data.total_bytes)
+                .saturating_add(descriptor_bytes)
         })
     }
 
     fn get(&mut self, id: &SegmentId) -> Option<Arc<SegmentData>> {
-        let position = self.entries.iter().position(|(entry, _)| entry == id)?;
+        let position = self.entries.iter().position(|entry| &entry.id == id)?;
         let entry = self.entries.remove(position);
-        let data = Arc::clone(&entry.1);
+        let data = Arc::clone(&entry.data);
         self.entries.push(entry);
         Some(data)
     }
 
+    fn decode_descriptor(
+        &mut self,
+        id: SegmentId,
+        bytes: &[u8],
+        budget: usize,
+    ) -> Result<Arc<SegmentDescriptor>> {
+        let position = self.entries.iter().position(|entry| entry.id == id);
+        if let Some(position) = position {
+            if let Some((validated, descriptor)) = &self.entries[position].descriptor {
+                if validated.as_ref() == bytes {
+                    return Ok(Arc::clone(descriptor));
+                }
+            }
+        }
+        let descriptor = Arc::new(SegmentDescriptor::decode(id, bytes)?);
+        if let Some(position) = position {
+            let mut entry = self.entries.remove(position);
+            entry.descriptor = Some((bytes.into(), Arc::clone(&descriptor)));
+            self.entries.push(entry);
+            self.evict(budget);
+        }
+        Ok(descriptor)
+    }
+
     fn put(&mut self, id: SegmentId, data: Arc<SegmentData>, budget: usize) {
-        self.entries.retain(|(entry, _)| *entry != id);
-        self.entries.push((id, data));
+        self.entries.retain(|entry| entry.id != id);
+        self.entries.push(SegmentCacheEntry {
+            id,
+            data,
+            descriptor: None,
+        });
+        self.evict(budget);
+    }
+
+    fn evict(&mut self, budget: usize) {
         // Always keep the newest entry; evict older ones to fit the budget.
         while self.entries.len() > 1 && self.total_bytes() > budget {
             self.entries.remove(0);
@@ -465,7 +516,7 @@ impl SegmentByteCache {
     }
 
     fn remove(&mut self, id: &SegmentId) {
-        self.entries.retain(|(entry, _)| entry != id);
+        self.entries.retain(|entry| &entry.id != id);
     }
 }
 
@@ -1039,7 +1090,7 @@ pub struct FtsCursor {
     snapshot_loaded: bool,
 
     // Scratch for the open/scan machine.
-    scan_descriptors: Vec<SegmentDescriptor>,
+    scan_descriptors: Vec<Arc<SegmentDescriptor>>,
     /// Identities of every visible tombstone row.
     scan_tombs: HashSet<DocumentIdentity>,
     scan_data: HashMap<SegmentId, Arc<SegmentData>>,
@@ -1443,7 +1494,7 @@ impl FtsCursor {
                         self.state = FtsState::ProbeFormat { rewound: false };
                         continue;
                     }
-                    self.control = Some(match FtsControl::decode(&bytes)? {
+                    self.control = Some(match FtsControl::decode(bytes)? {
                         ControlRecord::Current(control) => control,
                         ControlRecord::OtherVersion(format_version) => {
                             return Err(self.unsupported_format_error(format_version).into());
@@ -1580,7 +1631,11 @@ impl FtsCursor {
                         continue;
                     };
                     let segment_id = parse_segment_id(uuid)?;
-                    let descriptor = SegmentDescriptor::decode(segment_id, &bytes)?;
+                    let descriptor = self.shared.segment_bytes.lock().decode_descriptor(
+                        segment_id,
+                        bytes,
+                        fts_max_retained_cache_bytes(),
+                    )?;
                     // Duplicate segment ids in one searcher trip a
                     // SearcherGeneration assert inside Tantivy; dedupe the
                     // registry scan defensively.
@@ -1702,7 +1757,7 @@ impl FtsCursor {
                                 if chunks
                                     .entry(file_ord)
                                     .or_default()
-                                    .insert(chunk_no, bytes)
+                                    .insert(chunk_no, bytes.to_vec())
                                     .is_some()
                                 {
                                     return Err(LimboError::Corrupt(format!(
@@ -2673,7 +2728,7 @@ fn segment_rows_from_files(
         bytes: descriptor.encode()?,
     });
     let segment = LoadedSegment::new(
-        descriptor,
+        Arc::new(descriptor),
         Arc::new(SegmentData::new(data_files, identities)),
         BTreeSet::new(),
     );
@@ -2758,7 +2813,8 @@ impl FtsBackingRowDumper {
             let hash = bytes.iter().fold(0xcbf2_9ce4_8422_2325u64, |hash, byte| {
                 (hash ^ u64::from(*byte)).wrapping_mul(0x100_0000_01b3)
             });
-            self.rows.push((path, chunk_no, bytes.len(), hash));
+            self.rows
+                .push((path.to_owned(), chunk_no, bytes.len(), hash));
             self.advance_pending = true;
         }
     }
