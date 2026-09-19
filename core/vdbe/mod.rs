@@ -4010,7 +4010,7 @@ fn skip_serial_types(header: &mut &[u8], data: &mut &[u8], n: usize) -> Result<(
             break;
         }
         let serial_type = read_serial_type(header)?;
-        data_sum += get_serial_type_size(serial_type)?;
+        data_sum += get_serial_type_size(serial_type);
     }
     if data_sum > data.len() {
         return Err(LimboError::Corrupt(

@@ -1183,7 +1183,7 @@ fn blob_locate_column_in_header(
         }
         let (serial, n) = crate::storage::sqlite3_ondisk::read_varint(&header[hpos..])?;
         hpos += n;
-        let size = crate::types::get_serial_type_size(serial)?;
+        let size = crate::types::get_serial_type_size(serial);
         let end = body
             .checked_add(size)
             .ok_or_else(|| LimboError::Corrupt("record body offsets overflow usize".to_string()))?;

@@ -2132,13 +2132,7 @@ impl<'a> Iterator for ValueIterator<'a> {
             if header.is_empty() {
                 break serial_type;
             }
-            data_offset += match get_serial_type_size(serial_type) {
-                Ok(size) => size,
-                Err(e) => {
-                    mark_unlikely();
-                    return Some(Err(e));
-                }
-            };
+            data_offset += get_serial_type_size(serial_type);
         };
 
         let data = self.data_section.get();
@@ -2177,13 +2171,7 @@ impl<'a> Iterator for ValueIterator<'a> {
             };
             header = &header[bytes_read..];
 
-            data_sum += match get_serial_type_size(serial_type) {
-                Ok(size) => size,
-                Err(e) => {
-                    mark_unlikely();
-                    return Some(Err(e));
-                }
-            };
+            data_sum += get_serial_type_size(serial_type);
         }
 
         if unlikely(data_sum > data.len()) {
@@ -3219,31 +3207,18 @@ impl SerialType {
     }
 }
 
+/// Byte count of the data a serial type occupies in the record body.
+///
+/// Matches `sqlite3VdbeSerialTypeLen`: the reserved serial types 10 and 11
+/// take no bytes, so skipping past one is not an error. Reading one still is,
+/// in `decode_serial_type_into_register`.
 #[inline(always)]
-pub fn get_serial_type_size(serial: u64) -> Result<usize> {
-    match serial {
-        0 | 8 | 9 => Ok(0),
-        1 => Ok(1),
-        2 => Ok(2),
-        3 => Ok(3),
-        4 => Ok(4),
-        5 => Ok(6),
-        6 | 7 => Ok(8),
-        n if n >= 12 => match n % 2 {
-            0 => Ok(((n - 12) / 2) as usize), // Blob
-            1 => Ok(((n - 13) / 2) as usize), // Text
-            _ => {
-                mark_unlikely();
-                unreachable!();
-            }
-        },
-        _ => {
-            mark_unlikely();
-            Err(LimboError::Corrupt(format!(
-                "Invalid serial type: {serial}"
-            )))
-        }
+pub fn get_serial_type_size(serial: u64) -> usize {
+    const SIZES: [u8; 12] = [0, 1, 2, 3, 4, 6, 8, 8, 0, 0, 0, 0];
+    if serial < 12 {
+        return SIZES[serial as usize] as usize;
     }
+    ((serial - 12) / 2) as usize
 }
 
 impl<T: AsValueRef> From<T> for SerialType {
