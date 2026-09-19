@@ -1172,6 +1172,7 @@ impl BTreeCursor {
         Self::new_with_index_info(pager, root_page, num_columns, None)
     }
 
+    #[inline(always)]
     fn new_with_index_info(
         pager: Arc<Pager>,
         root_page: i64,
@@ -1238,17 +1239,23 @@ impl BTreeCursor {
         self.yield_instance_id = connection.next_yield_instance_id();
     }
 
+    #[inline(always)]
     pub fn new_table(pager: Arc<Pager>, root_page: i64, num_columns: usize) -> Self {
         Self::new(pager, root_page, num_columns)
     }
 
     /// Moves the cursor to the heap, into an allocation retired by an earlier
     /// cursor on the same pager when the pool has one.
+    #[inline(always)]
     pub fn into_boxed(self) -> Box<Self> {
-        match self.pager.take_cursor_allocation() {
-            Some(allocation) => Box::write(allocation, self),
-            None => Box::new(self),
-        }
+        // One destination for the write: with a `Box::new` in the other arm
+        // the cursor is built on the stack first and then copied, and the
+        // cursor is a kilobyte of mostly zeroed page stack.
+        let allocation = match self.pager.take_cursor_allocation() {
+            Some(allocation) => allocation,
+            None => Box::new_uninit(),
+        };
+        Box::write(allocation, self)
     }
 
     pub fn new_without_rowid_table(
