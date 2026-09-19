@@ -359,6 +359,85 @@ fn bench_fts_query_selectivity(criterion: &mut Criterion) {
     group.finish();
 }
 
+#[turso_macros::codspeed_criterion_benchmark]
+fn bench_fts_count(criterion: &mut Criterion) {
+    let mut group = criterion.benchmark_group("FTS Count");
+    let row_count = 100_003;
+    let temp_dir = tempfile::tempdir().unwrap();
+    let db = setup_fts_db(&temp_dir, row_count);
+    let conn = db.connect().unwrap();
+
+    for deleted in [false, true] {
+        if deleted {
+            conn.execute("DELETE FROM docs WHERE id % 10 = 0").unwrap();
+        }
+        let state = if deleted { "deleted" } else { "clean" };
+        let live_ids = (0..row_count).filter(|id| !deleted || id % 10 != 0);
+        let queries = [
+            ("common", "document", "*", live_ids.clone().count()),
+            ("rare", "997", "*", 1),
+            ("absent", "absent", "*", 0),
+            (
+                "dense_and",
+                "document AND database",
+                "*",
+                live_ids.clone().filter(|id| id % 7 == 0).count(),
+            ),
+            (
+                "dense_or",
+                "database OR systems",
+                "*",
+                live_ids
+                    .clone()
+                    .filter(|id| id % 7 == 0 || id % 5 == 0)
+                    .count(),
+            ),
+            ("common_count_id", "document", "id", live_ids.count()),
+        ];
+        for (name, query, column, expected) in queries {
+            let sql =
+                format!("SELECT count({column}) FROM docs WHERE fts_match(title, body, '{query}')");
+            let mut stmt = conn.prepare(&sql).unwrap();
+            assert_fts_count(&mut stmt, &db, expected);
+            group.bench_function(
+                BenchmarkId::new("prepared", format!("{state}/{name}")),
+                |b| {
+                    b.iter(|| {
+                        stmt.reset().unwrap();
+                        assert_fts_count(&mut stmt, &db, expected);
+                    });
+                },
+            );
+            group.bench_function(
+                BenchmarkId::new("prepare", format!("{state}/{name}")),
+                |b| {
+                    b.iter(|| {
+                        let mut stmt = conn.prepare(&sql).unwrap();
+                        assert_fts_count(&mut stmt, &db, expected);
+                    });
+                },
+            );
+        }
+    }
+    group.finish();
+}
+
+fn assert_fts_count(stmt: &mut turso_core::Statement, db: &Database, expected: usize) {
+    let mut rows = 0;
+    loop {
+        match stmt.step().unwrap() {
+            StepResult::Row => {
+                assert_eq!(stmt.row().unwrap().get::<i64>(0).unwrap(), expected as i64);
+                rows += 1;
+            }
+            StepResult::Done => break,
+            StepResult::IO | StepResult::Yield | StepResult::Sleep { .. } => db.io.step().unwrap(),
+            other => panic!("Unexpected step result: {other:?}"),
+        }
+    }
+    assert_eq!(rows, 1);
+}
+
 /// Benchmark: Insert + query lifecycle
 ///
 /// Measures the cost of inserting new rows, committing, and then querying.
@@ -735,14 +814,14 @@ criterion_group! {
     config = Criterion::default()
         .with_profiler(PProfProfiler::new(100, Output::Flamegraph(None)))
         .sample_size(50);
-    targets = bench_fts_cold_query, bench_fts_warm_query, bench_fts_connection_pool_query, bench_fts_query_selectivity, bench_fts_insert_then_query, bench_fts_segment_churn_query, bench_fts_single_row_commit_churn, bench_fts_large_merge_boundary, bench_fts_fragmented_delete, bench_fts_fragmented_registry_scan
+    targets = bench_fts_cold_query, bench_fts_warm_query, bench_fts_connection_pool_query, bench_fts_query_selectivity, bench_fts_count, bench_fts_insert_then_query, bench_fts_segment_churn_query, bench_fts_single_row_commit_churn, bench_fts_large_merge_boundary, bench_fts_fragmented_delete, bench_fts_fragmented_registry_scan
 }
 
 #[cfg(feature = "codspeed")]
 criterion_group! {
     name = fts_benches;
     config = Criterion::default().sample_size(50);
-    targets = bench_fts_cold_query, bench_fts_warm_query, bench_fts_connection_pool_query, bench_fts_query_selectivity, bench_fts_insert_then_query, bench_fts_segment_churn_query, bench_fts_single_row_commit_churn, bench_fts_large_merge_boundary, bench_fts_fragmented_delete, bench_fts_fragmented_registry_scan
+    targets = bench_fts_cold_query, bench_fts_warm_query, bench_fts_connection_pool_query, bench_fts_query_selectivity, bench_fts_count, bench_fts_insert_then_query, bench_fts_segment_churn_query, bench_fts_single_row_commit_churn, bench_fts_large_merge_boundary, bench_fts_fragmented_delete, bench_fts_fragmented_registry_scan
 }
 
 criterion_main!(fts_benches);
