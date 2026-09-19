@@ -921,6 +921,15 @@ pub struct ProgramState {
     check_interval: u64,
     /// Whether the dispatch loop must trace, read once per execution.
     pub(crate) trace_flags: TraceFlags,
+    /// Dispatch loop iterations whose instruction did not complete, because it
+    /// asked for I/O or failed. The instruction runs again when its I/O
+    /// finishes, so `metrics.vm_steps` counts it twice and the number of
+    /// instructions executed is `vm_steps - incomplete_steps`. Counted here so
+    /// the loop updates one counter per instruction instead of two.
+    incomplete_steps: u64,
+    /// `vm_steps - incomplete_steps` when SQLITE_STMTSTATUS_VM_STEP was last
+    /// reset to zero.
+    insn_executed_reset_at: u64,
     pub io_completions: Option<IOCompletions>,
     pub pc: InsnReference,
     pub(crate) cursors: Vec<Option<Cursor>>,
@@ -1093,6 +1102,8 @@ impl ProgramState {
             check_countdown: 1,
             check_interval: MAX_CHECK_INTERVAL,
             trace_flags: TraceFlags::default(),
+            incomplete_steps: 0,
+            insn_executed_reset_at: 0,
             io_completions: None,
             pc: 0,
             cursors,
@@ -1467,19 +1478,22 @@ impl ProgramState {
     /// Runs `f` on the metrics of this statement including its active and
     /// cached subprograms, without copying them when there is no subprogram.
     pub(crate) fn with_metrics<R>(&self, f: impl FnOnce(&StatementMetrics) -> R) -> R {
-        let has_subprograms = matches!(
-            self.active_op_state.program_ref(),
-            Some(OpProgramState::Step { .. })
-        ) || !self.subprogram_stmt_cache.is_empty();
-        if has_subprograms {
-            f(&self.metrics())
-        } else {
-            f(&self.metrics)
-        }
+        f(&self.metrics())
+    }
+
+    /// Instructions that ran to completion. The dispatch loop counts its
+    /// iterations in `metrics.vm_steps` and the ones that did not complete in
+    /// `incomplete_steps`, so this is their difference.
+    fn insn_executed(&self) -> u64 {
+        self.metrics
+            .vm_steps
+            .wrapping_sub(self.incomplete_steps)
+            .wrapping_sub(self.insn_executed_reset_at)
     }
 
     pub(crate) fn metrics(&self) -> StatementMetrics {
         let mut metrics = self.metrics.clone();
+        metrics.insn_executed = self.insn_executed();
         if let Some(OpProgramState::Step { statement, .. }) = self.active_op_state.program_ref() {
             metrics.merge(&statement.metrics());
         }
@@ -1491,6 +1505,8 @@ impl ProgramState {
 
     pub(crate) fn reset_metrics(&mut self) {
         self.metrics.reset();
+        self.incomplete_steps = 0;
+        self.insn_executed_reset_at = 0;
         if let Some(OpProgramState::Step { statement, .. }) = self.active_op_state.program_mut() {
             statement.reset_metrics();
         }
@@ -1505,7 +1521,10 @@ impl ProgramState {
                 self.metrics.fullscan_steps = 0
             }
             crate::statement::StatementStatusCounter::Sort => self.metrics.sort_operations = 0,
-            crate::statement::StatementStatusCounter::VmStep => self.metrics.insn_executed = 0,
+            crate::statement::StatementStatusCounter::VmStep => {
+                self.insn_executed_reset_at =
+                    self.metrics.vm_steps.wrapping_sub(self.incomplete_steps)
+            }
             crate::statement::StatementStatusCounter::Reprepare => self.metrics.reprepares = 0,
             crate::statement::StatementStatusCounter::RowsRead => self.metrics.rows_read = 0,
             crate::statement::StatementStatusCounter::RowsWritten => self.metrics.rows_written = 0,
@@ -2412,13 +2431,9 @@ impl Program {
                         ($op:path) => {
                             match $op(program, state, insn, pager) {
                                 Ok(InsnFunctionStepResult::Step) => {
-                                    state.metrics.insn_executed =
-                                        state.metrics.insn_executed.wrapping_add(1);
                                     continue;
                                 }
                                 Ok(InsnFunctionStepResult::Row) => {
-                                    state.metrics.insn_executed =
-                                        state.metrics.insn_executed.wrapping_add(1);
                                     return ProgramStep::Row;
                                 }
                                 other => other,
@@ -2450,12 +2465,10 @@ impl Program {
                     // each; the rest settles out of line.
                     if let Ok(InsnFunctionStepResult::Step) = result {
                         // Instruction completed, moving to next
-                        state.metrics.insn_executed = state.metrics.insn_executed.wrapping_add(1);
                         continue;
                     }
                     if let Ok(InsnFunctionStepResult::Row) = result {
                         // Instruction completed (ResultRow already incremented PC)
-                        state.metrics.insn_executed = state.metrics.insn_executed.wrapping_add(1);
                         return ProgramStep::Row;
                     }
                     match dispatch_cold(program, state, pager, waker, result) {
@@ -2476,15 +2489,18 @@ impl Program {
                 match result {
                     Ok(InsnFunctionStepResult::Done) => {
                         // Instruction completed execution
-                        state.metrics.insn_executed = state.metrics.insn_executed.wrapping_add(1);
                         state.auto_txn_cleanup = TxnCleanup::None;
                         Some(ProgramStep::Done)
                     }
                     Ok(InsnFunctionStepResult::IO) => {
+                        state.incomplete_steps = state.incomplete_steps.wrapping_add(1);
                         let io = state.take_suspended_io();
                         program.park_on_io(state, io, waker)
                     }
-                    Err(boxed_err) => program.fail_step(state, pager, *boxed_err),
+                    Err(boxed_err) => {
+                        state.incomplete_steps = state.incomplete_steps.wrapping_add(1);
+                        program.fail_step(state, pager, *boxed_err)
+                    }
                     Ok(InsnFunctionStepResult::Step) | Ok(InsnFunctionStepResult::Row) => {
                         unreachable!("the dispatch loop settles steps and rows itself")
                     }
