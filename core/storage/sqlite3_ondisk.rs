@@ -412,6 +412,8 @@ impl Default for DatabaseHeader {
 
 pub const WAL_HEADER_SIZE: usize = 32;
 pub const WAL_FRAME_HEADER_SIZE: usize = 24;
+/// A subjournal record is the page id followed by the whole page.
+pub const SUBJOURNAL_RECORD_HEADER_SIZE: usize = 4;
 // magic is a single number represented as WAL_MAGIC_LE but the big endian
 // counterpart is just the same number with LSB set to 1.
 pub const WAL_MAGIC_LE: u32 = 0x377f0682;

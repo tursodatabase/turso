@@ -1,6 +1,6 @@
 use crate::alloc::DynBoxedSlice;
 use crate::storage::buffer_pool::ArenaBuffer;
-use crate::storage::sqlite3_ondisk::WAL_FRAME_HEADER_SIZE;
+use crate::storage::sqlite3_ondisk::{SUBJOURNAL_RECORD_HEADER_SIZE, WAL_FRAME_HEADER_SIZE};
 use crate::sync::Arc;
 use crate::turso_assert;
 use crate::{BufferPool, Result};
@@ -885,6 +885,11 @@ pub(crate) struct TempBufferCache {
     page_buffers: Vec<BufferData>,
     /// Cache of buffers of size `self.page_size` + WAL_FRAME_HEADER_SIZE.
     wal_frame_buffers: Vec<BufferData>,
+    /// Cache of buffers of size `self.page_size` + SUBJOURNAL_RECORD_HEADER_SIZE.
+    /// The buffer pool cannot serve this size, because its arena slots are one
+    /// page wide, so without this cache every page a statement subjournals
+    /// allocates a zeroed page, overwrites all of it and frees it again.
+    subjournal_buffers: Vec<BufferData>,
     /// Maximum number of buffers that will live in each cache.
     max_cached: usize,
 }
@@ -897,6 +902,7 @@ impl TempBufferCache {
             page_size: BufferPool::DEFAULT_PAGE_SIZE,
             page_buffers: Vec::with_capacity(8),
             wal_frame_buffers: Vec::with_capacity(8),
+            subjournal_buffers: Vec::with_capacity(8),
             max_cached: Self::DEFAULT_MAX_CACHE_SIZE,
         }
     }
@@ -906,6 +912,7 @@ impl TempBufferCache {
     pub fn reinit_cache(&mut self, page_size: usize) {
         self.page_buffers.clear();
         self.wal_frame_buffers.clear();
+        self.subjournal_buffers.clear();
         self.page_size = page_size;
     }
 
@@ -913,6 +920,9 @@ impl TempBufferCache {
         match size {
             sz if sz == self.page_size => self.page_buffers.pop(),
             sz if sz == (self.page_size + WAL_FRAME_HEADER_SIZE) => self.wal_frame_buffers.pop(),
+            sz if sz == (self.page_size + SUBJOURNAL_RECORD_HEADER_SIZE) => {
+                self.subjournal_buffers.pop()
+            }
             _ => None,
         }
     }
@@ -922,6 +932,7 @@ impl TempBufferCache {
         let cache = match len {
             n if n.eq(&sz) => &mut self.page_buffers,
             n if n.eq(&(sz + WAL_FRAME_HEADER_SIZE)) => &mut self.wal_frame_buffers,
+            n if n.eq(&(sz + SUBJOURNAL_RECORD_HEADER_SIZE)) => &mut self.subjournal_buffers,
             _ => return,
         };
         if self.max_cached > cache.len() {

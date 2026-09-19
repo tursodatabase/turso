@@ -52,7 +52,7 @@ use super::sqlite3_ondisk::read_varint;
 use super::sqlite3_ondisk::{
     begin_write_btree_page, read_btree_cell, read_u32, BTreeCell, FREELIST_LEAF_PTR_SIZE,
     FREELIST_TRUNK_OFFSET_FIRST_LEAF_PTR, FREELIST_TRUNK_OFFSET_LEAF_COUNT,
-    FREELIST_TRUNK_OFFSET_NEXT_TRUNK_PTR,
+    FREELIST_TRUNK_OFFSET_NEXT_TRUNK_PTR, SUBJOURNAL_RECORD_HEADER_SIZE,
 };
 use super::wal::{CheckpointMode, WalAutoActions};
 use crate::storage::encryption::{CipherMode, EncryptionContext, EncryptionKey};
@@ -2256,7 +2256,9 @@ impl Pager {
         let buffer = {
             let page_id = page.get().id() as u32;
             let contents = page.get_contents();
-            let buffer = self.buffer_pool.allocate(page_size + 4);
+            let buffer = self
+                .buffer_pool
+                .allocate(page_size + SUBJOURNAL_RECORD_HEADER_SIZE);
             let contents_buffer = contents.as_ptr();
             turso_assert!(
                 contents_buffer.len() == page_size,
