@@ -2317,13 +2317,6 @@ impl Program {
         flags
     }
 
-    /// `read_trace_flags` for the executions that do not pass through
-    /// `Statement::prepare_step`, which reads them itself.
-    #[inline(never)]
-    fn read_trace_flags_out_of_line(&self) -> u8 {
-        self.read_trace_flags()
-    }
-
     /// Step in [QueryMode::Normal]
     #[inline(always)]
     pub(crate) fn normal_step(
@@ -2334,12 +2327,12 @@ impl Program {
     ) -> ProgramStep {
         // Read once per execution rather than once per row: both reads are
         // several instructions and a statement that returns many rows calls
-        // this function once for each of them. Root statements read them in
-        // `Statement::prepare_step`; this covers subprograms, which do not go
-        // through it.
-        if state.trace_flags == TRACE_FLAGS_UNREAD {
-            state.trace_flags = self.read_trace_flags_out_of_line();
-        }
+        // this function once for each of them. Every path into here goes
+        // through `Statement::read_trace_flags_if_unread` first.
+        turso_debug_assert!(
+            state.trace_flags != TRACE_FLAGS_UNREAD,
+            "the dispatch loop was entered before the tracing settings were read"
+        );
         state.execution_state = ProgramExecutionState::Running;
         let trace_flags = state.trace_flags;
         let result = if trace_flags != 0 {

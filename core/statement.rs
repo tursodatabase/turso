@@ -643,9 +643,7 @@ impl Statement {
             }
         }
 
-        if self.state.trace_flags == crate::vdbe::TRACE_FLAGS_UNREAD {
-            self.state.trace_flags = self.program.read_trace_flags();
-        }
+        self.read_trace_flags_if_unread();
 
         self.arm_query_timeout_if_needed();
 
@@ -665,6 +663,16 @@ impl Statement {
         }
         self.needs_prepare_step = false;
         Ok(None)
+    }
+
+    /// Reads the tracing settings into the state unless an earlier step of
+    /// this execution already did. Every path into the interpreter passes
+    /// here first, so the dispatch loop can take the flags as read.
+    #[inline]
+    fn read_trace_flags_if_unread(&mut self) {
+        if self.state.trace_flags == crate::vdbe::TRACE_FLAGS_UNREAD {
+            self.state.trace_flags = self.program.read_trace_flags();
+        }
     }
 
     /// Everything [`Self::_step`] does after the interpreter returned something
@@ -699,6 +707,7 @@ impl Statement {
                 self.release_active_root_if_counted();
                 return Err(err);
             }
+            self.read_trace_flags_if_unread();
             res = self
                 .program
                 .step(&mut self.state, &self.pager, self.query_mode, waker);
@@ -794,6 +803,7 @@ impl Statement {
     /// The parent statement handles all of those concerns.
     #[inline]
     pub fn step_subprogram(&mut self) -> Result<StepResult> {
+        self.read_trace_flags_if_unread();
         self.program
             .step(&mut self.state, &self.pager, self.query_mode, None)
             .map_err(|err| *err)
