@@ -4155,6 +4155,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> StateTransition
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::alloc::TursoIteratorExt;
     use crate::alloc::vec;
     use crate::mvcc::database::tests::MvccTestDbNoConn;
     use crate::mvcc::database::SortableIndexKey;
@@ -4546,8 +4547,10 @@ mod tests {
             .table_gc_keys
             .iter()
             .map(|(key, _)| key.row_id.to_int_or_panic())
-            .collect();
-        assert_eq!(collected, (0..row_count as i64).collect::<Vec<_>>());
+            .try_collect()
+            .unwrap();
+        let expected: Vec<i64> = (0..row_count as i64).try_collect().unwrap();
+        assert_eq!(collected, expected);
     }
 
     fn insert_row_version(
@@ -5227,7 +5230,8 @@ mod tests {
             .checkpoint_dirty_index_keys
             .iter()
             .map(|entry| entry.key().clone())
-            .collect();
+            .try_collect()
+            .unwrap();
         assert_eq!(
             remaining.len(),
             1,
@@ -5291,7 +5295,8 @@ mod tests {
             .table_gc_keys
             .iter()
             .map(|(key, _)| key.row_id.to_int_or_panic())
-            .collect();
+            .try_collect()
+            .unwrap();
         assert_eq!(collected, vec![1, 2, 3, 150, 200]);
     }
 
