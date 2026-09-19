@@ -1354,6 +1354,12 @@ pub fn read_varint(buf: &[u8]) -> Result<(u64, usize)> {
         [b0, b1, ..] if *b1 < 0x80 => {
             return Ok(((((*b0 & 0x7f) as u64) << 7) | *b1 as u64, 2));
         }
+        [b0, b1, b2, ..] if *b2 < 0x80 => {
+            return Ok((
+                (((*b0 & 0x7f) as u64) << 14) | (((*b1 & 0x7f) as u64) << 7) | *b2 as u64,
+                3,
+            ));
+        }
         _ => {}
     }
     let mut v: u64 = 0;
@@ -2687,6 +2693,15 @@ mod tests {
         let mut buf = [0u8; 9];
         let written = write_varint(&mut buf, value);
         varint_len(value) == written
+    }
+
+    #[quickcheck_macros::quickcheck]
+    fn read_varint_reads_back_what_write_varint_wrote(value: u64) -> bool {
+        let mut buf = [0u8; 9];
+        let written = write_varint(&mut buf, value);
+        read_varint(&buf[..written])
+            .map(|(read, len)| read == value && len == written)
+            .unwrap_or(false)
     }
 
     #[quickcheck_macros::quickcheck]
