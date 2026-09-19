@@ -4183,11 +4183,11 @@ mod tests {
     fn text_decode_into_a_reused_register_keeps_every_length() {
         let mut destination = Register::Value(Value::Null);
         // Grow the buffer first so later values take the reuse path.
-        let long: Vec<u8> = (0..40u8).map(|i| b'a' + i % 26).collect();
+        let long: Vec<u8> = (0..80usize).map(|i| b'a' + (i % 26) as u8).collect();
         decode_one_text(&one_text_record(&long), &mut destination).unwrap();
-        assert_eq!(register_text(&destination).len(), 40);
+        assert_eq!(register_text(&destination).len(), 80);
 
-        for len in 0..=40usize {
+        for len in 0..=80usize {
             let value: Vec<u8> = (0..len).map(|i| b'A' + (i % 26) as u8).collect();
             decode_one_text(&one_text_record(&value), &mut destination).unwrap();
             assert_eq!(
@@ -4201,9 +4201,18 @@ mod tests {
     #[test]
     fn text_decode_into_a_reused_register_keeps_multibyte_utf8() {
         let mut destination = Register::Value(Value::Null);
-        decode_one_text(&one_text_record(b"aaaaaaaaaaaaaaaa"), &mut destination).unwrap();
+        let long: Vec<u8> = (0..80usize).map(|i| b'a' + (i % 26) as u8).collect();
+        decode_one_text(&one_text_record(&long), &mut destination).unwrap();
 
-        for value in ["é", "héllo", "日本語", "\u{1F600}", "aé", "ααααααααα"] {
+        for value in [
+            "é",
+            "héllo",
+            "日本語",
+            "\u{1F600}",
+            "aé",
+            "ααααααααα",
+            "ααααααααααααααααααααααααααααααααααα",
+        ] {
             decode_one_text(&one_text_record(value.as_bytes()), &mut destination).unwrap();
             assert_eq!(register_text(&destination), value);
         }
@@ -4223,19 +4232,23 @@ mod tests {
     #[test]
     fn text_decode_rejects_invalid_utf8_and_leaves_the_register_usable() {
         let mut destination = Register::Value(Value::Null);
-        decode_one_text(&one_text_record(b"aaaaaaaa"), &mut destination).unwrap();
+        let long: Vec<u8> = (0..80usize).map(|i| b'a' + (i % 26) as u8).collect();
+        decode_one_text(&one_text_record(&long), &mut destination).unwrap();
 
-        let result = decode_one_text(&one_text_record(&[0xff, 0xfe]), &mut destination);
-        assert!(
-            matches!(
-                result,
-                Err(LimboError::Corrupt(ref message))
-                    if message == "TEXT value contains invalid UTF-8"
-            ),
-            "unexpected result: {result:?}"
-        );
-        // The register must still hold a valid string, and take new values.
-        let _ = register_text(&destination);
+        let short_invalid = [0xff, 0xfe];
+        let long_invalid = [0xff; 20];
+        for invalid in [&short_invalid[..], &long_invalid[..]] {
+            let result = decode_one_text(&one_text_record(invalid), &mut destination);
+            assert!(
+                matches!(
+                    result,
+                    Err(LimboError::Corrupt(ref message))
+                        if message == "TEXT value contains invalid UTF-8"
+                ),
+                "unexpected result: {result:?}"
+            );
+            let _ = register_text(&destination);
+        }
         decode_one_text(&one_text_record(b"ok"), &mut destination).unwrap();
         assert_eq!(register_text(&destination), "ok");
     }
