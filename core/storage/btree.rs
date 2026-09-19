@@ -8866,11 +8866,19 @@ impl PageStack {
         )
     }
 
-    /// Current page pointer being used
+    /// Current page pointer being used. An empty stack holds -1, which the
+    /// unsigned cast turns into an index far past the end, so one compare
+    /// covers both "no page on the stack" and "index past the end" and the
+    /// reads below it need no second bounds check.
     #[inline(always)]
     fn current(&self) -> usize {
-        turso_assert_greater_than_or_equal!(self.current_page, 0);
-        self.current_page as usize
+        let current = self.current_page as u32 as usize;
+        turso_assert_less_than!(
+            current,
+            self.stack.len(),
+            "the page stack has no current page"
+        );
+        current
     }
 
     /// Cell index of the current page
