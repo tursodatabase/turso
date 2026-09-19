@@ -815,7 +815,17 @@ pub fn op_null(
 ) -> InsnResult {
     match insn {
         Insn::Null { dest, dest_end } | Insn::BeginSubrtn { dest, dest_end } => {
-            let dest_end = dest_end.unwrap_or(*dest);
+            // One register is the case a row build takes, and an inclusive
+            // range costs a counter that cannot overflow, its own bounds test
+            // and a stack frame to hold them.
+            let Some(dest_end) = *dest_end else {
+                state.registers[*dest].set_null();
+                if !state.rowsets.is_empty() {
+                    state.rowsets.remove(dest);
+                }
+                state.pc += 1;
+                return Ok(InsnFunctionStepResult::Step);
+            };
             for i in *dest..=dest_end {
                 state.registers[i].set_null();
             }
