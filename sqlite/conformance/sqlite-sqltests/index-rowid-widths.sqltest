@@ -1,0 +1,64 @@
+@database :memory:
+
+# An index record keeps its rowid as its last value, and IdxRowid reads that
+# value off the end of the record without decoding the columns before it.
+# A rowid is written in the smallest integer type that holds it, and the two
+# smallest types store no bytes at all, so these cover every width a rowid
+# can have. The long key gives the record a data section far longer than its
+# header, which a wrong offset would read from.
+
+setup widths {
+    CREATE TABLE t(v TEXT);
+    CREATE INDEX t_v ON t(v);
+    INSERT INTO t(rowid, v) VALUES
+        (0, 'a'),
+        (1, 'b'),
+        (127, 'c'),
+        (32767, 'd'),
+        (8388607, 'e'),
+        (2147483647, 'f'),
+        (140737488355327, 'g'),
+        (9223372036854775807, 'h'),
+        (-9223372036854775808, 'i');
+}
+
+@setup widths
+test index-scan-reads-a-rowid-of-every-integer-width {
+    SELECT v, rowid FROM t WHERE v > '' ORDER BY v;
+}
+expect {
+    a|0
+    b|1
+    c|127
+    d|32767
+    e|8388607
+    f|2147483647
+    g|140737488355327
+    h|9223372036854775807
+    i|-9223372036854775808
+}
+
+@setup widths
+test index-point-lookup-reads-the-rowid {
+    SELECT rowid FROM t WHERE v = 'g';
+}
+expect {
+    140737488355327
+}
+
+setup long_key {
+    CREATE TABLE u(v TEXT);
+    CREATE INDEX u_v ON u(v);
+    INSERT INTO u(rowid, v) VALUES
+        (4294967296, replace(hex(zeroblob(80)), '0', 'a')),
+        (-4294967296, replace(hex(zeroblob(80)), '0', 'b'));
+}
+
+@setup long_key
+test index-scan-reads-the-rowid-after-a-long-key {
+    SELECT length(v), rowid FROM u WHERE v > '' ORDER BY v;
+}
+expect {
+    160|4294967296
+    160|-4294967296
+}

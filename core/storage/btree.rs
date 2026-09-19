@@ -21,9 +21,9 @@ use crate::{
     storage::{
         pager::{BtreePageAllocMode, Pager},
         sqlite3_ondisk::{
-            payload_overflows, read_u32, read_varint, write_varint, BTreeCell, DatabaseHeader,
-            PageContent, PageSize, PageType, TableInteriorCell, CELL_PTR_SIZE_BYTES,
-            FREELIST_LEAF_PTR_SIZE, FREELIST_TRUNK_HEADER_SIZE,
+            payload_overflows, read_index_rowid, read_u32, read_varint, write_varint, BTreeCell,
+            DatabaseHeader, PageContent, PageSize, PageType, TableInteriorCell,
+            CELL_PTR_SIZE_BYTES, FREELIST_LEAF_PTR_SIZE, FREELIST_TRUNK_HEADER_SIZE,
             FREELIST_TRUNK_OFFSET_FIRST_LEAF_PTR, FREELIST_TRUNK_OFFSET_LEAF_COUNT,
             FREELIST_TRUNK_OFFSET_NEXT_TRUNK_PTR, INTERIOR_PAGE_HEADER_SIZE_BYTES,
             LEAF_PAGE_HEADER_SIZE_BYTES, LEFT_CHILD_PTR_SIZE_BYTES,
@@ -6780,8 +6780,8 @@ impl CursorTrait for BTreeCursor {
             cursor.rowid()
         }
 
-        /// The rowid an index key carries is its last value. Reading it
-        /// from the cell's bytes leaves the record where it is; asking for
+        /// An index key's last value is its rowid. Reading it from the
+        /// cell's bytes leaves the record where it is; asking for
         /// the record instead copies the whole key off the page first, and
         /// an index scan asks once per row.
         #[inline(never)]
@@ -6792,6 +6792,9 @@ impl CursorTrait for BTreeCursor {
             let Some(payload) = return_if_io!(cursor.record_payload()) else {
                 return Ok(IOResult::Done(None));
             };
+            if let Some(rowid) = read_index_rowid(payload) {
+                return Ok(IOResult::Done(Some(rowid)));
+            }
             let rowid = match crate::types::ValueIterator::new(payload)?.last() {
                 Some(Ok(ValueRef::Numeric(Numeric::Integer(rowid)))) => rowid,
                 _ => unreachable!(

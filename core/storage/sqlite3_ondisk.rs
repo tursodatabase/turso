@@ -1279,6 +1279,56 @@ pub fn read_text(payload: &[u8]) -> Result<&str> {
     })
 }
 
+/// The rowid an index record keeps as its last value, read without walking
+/// the record.
+///
+/// An index record ends with its rowid, and an integer serial type is one
+/// byte, so the last byte of the header is the rowid's serial type whenever
+/// the byte before it ends a varint. The value sits at the end of the data,
+/// so its offset follows from the payload length alone and none of the
+/// earlier serial types or values have to be decoded. Returns `None` when
+/// the record does not have that shape, which leaves the caller to walk it.
+#[inline]
+pub fn read_index_rowid(payload: &[u8]) -> Option<i64> {
+    let (header_size, _) = read_varint(payload).ok()?;
+    let header = payload.get(..header_size as usize)?;
+    let data = &payload[header.len()..];
+    let [.., before_last_type, last_type] = header else {
+        return None;
+    };
+    if *before_last_type >= 0x80 {
+        return None;
+    }
+    let rowid = match *last_type {
+        1 => *data.last()? as i8 as i64,
+        2 => i16::from_be_bytes(*data.last_chunk()?) as i64,
+        3 => {
+            let [high, mid, low] = *data.last_chunk()?;
+            i32::from_be_bytes([sign_fill(high), high, mid, low]) as i64
+        }
+        4 => i32::from_be_bytes(*data.last_chunk()?) as i64,
+        5 => {
+            let [high, b, c, d, e, low] = *data.last_chunk()?;
+            let fill = sign_fill(high);
+            i64::from_be_bytes([fill, fill, high, b, c, d, e, low])
+        }
+        6 => i64::from_be_bytes(*data.last_chunk()?),
+        8 => 0,
+        9 => 1,
+        _ => return None,
+    };
+    Some(rowid)
+}
+
+#[inline(always)]
+fn sign_fill(high_byte: u8) -> u8 {
+    if high_byte <= 0x7f {
+        0x00
+    } else {
+        0xff
+    }
+}
+
 #[inline(always)]
 pub fn read_integer(buf: &[u8], serial_type: u8) -> Result<i64> {
     match serial_type {
@@ -2711,5 +2761,24 @@ mod tests {
             (Err(_), Err(_)) => true,
             _ => false,
         }
+    }
+
+    #[quickcheck_macros::quickcheck]
+    fn read_index_rowid_gives_the_integer_the_record_ends_with(
+        leading_texts: Vec<String>,
+        leading_ints: Vec<i64>,
+        rowid: i64,
+    ) -> bool {
+        let mut values: Vec<Value> = leading_texts.into_iter().map(Value::build_text).collect();
+        values.extend(leading_ints.into_iter().map(Value::from_i64));
+        values.push(Value::from_i64(rowid));
+        let record = crate::types::ImmutableRecord::from_values(&values, values.len()).unwrap();
+        read_index_rowid(record.get_payload()) == Some(rowid)
+    }
+
+    #[quickcheck_macros::quickcheck]
+    fn read_index_rowid_stays_inside_whatever_bytes_it_is_given(bytes: Vec<u8>) -> bool {
+        read_index_rowid(&bytes);
+        true
     }
 }
