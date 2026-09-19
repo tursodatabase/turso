@@ -1210,6 +1210,7 @@ dependencies = [
  "asserting",
  "ctor 0.5.0",
  "env_logger",
+ "limbo_csv",
  "log",
  "rand 0.9.4",
  "rand_chacha 0.9.0",

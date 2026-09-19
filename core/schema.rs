@@ -715,6 +715,13 @@ pub enum SchemaObjectType {
     Index,
 }
 
+#[derive(Debug, Clone)]
+pub struct BrokenTableEntry {
+    pub root_page: i64,
+    pub index_root_pages: Vec<i64>,
+    pub index_names: Vec<String>,
+}
+
 #[derive(Debug)]
 pub struct Schema {
     pub tables: HashMap<String, Arc<Table>>,
@@ -751,6 +758,7 @@ pub struct Schema {
     /// The rows are tolerated at load time so the database stays usable;
     /// tracking the names lets DROP VIEW remove them.
     pub broken_views: HashSet<String>,
+    pub broken_tables: HashMap<String, BrokenTableEntry>,
 
     /// Root pages of tables/indexes that have been dropped but not yet checkpointed.
     /// In MVCC mode, when a table is dropped, the btree pages are not freed until checkpoint.
@@ -901,6 +909,7 @@ impl Schema {
             table_to_materialized_views,
             incompatible_views,
             broken_views: HashSet::default(),
+            broken_tables: HashMap::default(),
             dropped_root_pages: HashSet::default(),
             type_registry,
             generated_columns_enabled: false,
@@ -1092,7 +1101,13 @@ impl Schema {
         !self
             .indexes
             .iter()
-            .any(|idx| idx.1.iter().any(|i| i.name == name))
+            .any(|idx| idx.1.iter().any(|i| i.name.eq_ignore_ascii_case(name)))
+            && !self.broken_tables.values().any(|table| {
+                table
+                    .index_names
+                    .iter()
+                    .any(|index| index.eq_ignore_ascii_case(name))
+            })
     }
 
     pub fn add_materialized_view(&mut self, view: IncrementalView, table: Arc<Table>, sql: String) {
@@ -1358,6 +1373,17 @@ impl Schema {
     pub fn get_table(&self, name: &str) -> Option<Arc<Table>> {
         let name = self.normalize_table_lookup_name(name);
         self.tables.get(&name).cloned()
+    }
+
+    pub fn check_broken_table(&self, name: &str) -> Result<()> {
+        let name = normalize_ident(name);
+        if self.broken_tables.contains_key(&name) {
+            // Once PRAGMA writable_schema exists (#9006), this message should
+            // include the ready-to-run repair statement instead of only
+            // offering the drop.
+            crate::bail_parse_error!("table '{name}' could not be loaded: its SQL in sqlite_schema does not parse (possibly written by a different version of Turso). Use DROP TABLE to remove it.");
+        }
+        Ok(())
     }
 
     #[cfg(feature = "conn_raw_api")]
@@ -1757,6 +1783,16 @@ impl Schema {
         mvcc_enabled: bool,
     ) -> Result<()> {
         for unparsed_sql_from_index in from_sql_indexes {
+            if let Some(table) = self
+                .broken_tables
+                .get_mut(&normalize_ident(&unparsed_sql_from_index.table_name))
+            {
+                table.record_index(
+                    &unparsed_sql_from_index.name,
+                    unparsed_sql_from_index.root_page,
+                );
+                continue;
+            }
             let table = self
                 .get_btree_table(&unparsed_sql_from_index.table_name)
                 .ok_or_else(|| {
@@ -1777,6 +1813,15 @@ impl Schema {
         }
 
         for automatic_index in automatic_indices {
+            if let Some(table) = self
+                .broken_tables
+                .get_mut(&normalize_ident(&automatic_index.0))
+            {
+                for (name, root) in automatic_index.1 {
+                    table.record_index(&name, root);
+                }
+                continue;
+            }
             // Autoindexes must be parsed in definition order.
             // The SQL statement parser enforces that the column definitions come first, and compounds are defined after that,
             // e.g. CREATE TABLE t (a, b, UNIQUE(a, b)), and you can't do something like CREATE TABLE t (a, b, UNIQUE(a, b), c);
@@ -2111,7 +2156,22 @@ impl Schema {
                     };
                     self.add_virtual_table(vtab)?;
                 } else {
-                    let table = dialect.parse_table_sql(sql, root_page)?;
+                    let table = match dialect.parse_table_sql(sql, root_page) {
+                        Ok(table) => table,
+                        Err(err @ (LimboError::ParseError(_) | LimboError::LexerError(_))) => {
+                            tracing::warn!("table '{name}' could not be loaded: {err}. Use DROP TABLE to remove it.");
+                            self.broken_tables.insert(
+                                normalize_ident(name),
+                                BrokenTableEntry {
+                                    root_page,
+                                    index_root_pages: vec![],
+                                    index_names: vec![],
+                                },
+                            );
+                            return Ok(());
+                        }
+                        Err(err) => return Err(err),
+                    };
 
                     if table.has_virtual_columns && !self.generated_columns_enabled {
                         return Err(LimboError::ParseError(format!(
@@ -2193,6 +2253,7 @@ impl Schema {
                 match maybe_sql {
                     Some(sql) => {
                         from_sql_indexes.push(UnparsedFromSqlIndex {
+                            name: name.to_string(),
                             table_name: table_name.to_string(),
                             root_page,
                             sql: sql.to_string(),
@@ -2407,6 +2468,21 @@ impl Schema {
     /// Unlike `resolved_fks_referencing`, this requires every non-rowid parent key
     /// to be backed by a non-partial UNIQUE index on exactly those columns.
     pub fn resolved_fks_for_child(&self, child_table: &str) -> crate::Result<Vec<ResolvedFkRef>> {
+        self.resolve_child_fks(child_table, false)
+    }
+
+    pub(crate) fn resolved_fks_for_child_delete(
+        &self,
+        child_table: &str,
+    ) -> crate::Result<Vec<ResolvedFkRef>> {
+        self.resolve_child_fks(child_table, true)
+    }
+
+    fn resolve_child_fks(
+        &self,
+        child_table: &str,
+        deleting: bool,
+    ) -> crate::Result<Vec<ResolvedFkRef>> {
         let child_name = normalize_ident(child_table);
         let child = self
             .get_btree_table(&child_name)
@@ -2415,6 +2491,9 @@ impl Schema {
         let mut out = Vec::try_with_capacity_ext(child.foreign_keys.len())?;
         for fk in &child.foreign_keys {
             let parent_name = normalize_ident(&fk.parent_table);
+            if deleting && !fk.deferred && self.broken_tables.contains_key(&parent_name) {
+                continue;
+            }
             let parent_tbl = self
                 .get_btree_table(&parent_name)
                 .ok_or_else(|| fk_mismatch_err(&child.name, &parent_name))?;
@@ -2556,7 +2635,11 @@ impl Schema {
             .is_some_and(|t| !t.foreign_keys.is_empty())
     }
 
-    fn check_object_name_conflict(&self, name: &str, creating: SchemaObjectType) -> Result<()> {
+    pub(crate) fn check_object_name_conflict(
+        &self,
+        name: &str,
+        creating: SchemaObjectType,
+    ) -> Result<()> {
         if let Some(existing) = self.get_object_type(name) {
             // Match SQLite's message shapes: indexes and tables/views live in
             // different namespaces, so a cross-namespace clash names the other
@@ -2594,7 +2677,9 @@ impl Schema {
     pub fn get_object_type(&self, name: &str) -> Option<SchemaObjectType> {
         let normalized_name = self.normalize_table_lookup_name(name);
 
-        if self.tables.contains_key(&normalized_name) {
+        if self.tables.contains_key(&normalized_name)
+            || self.broken_tables.contains_key(&normalized_name)
+        {
             return Some(SchemaObjectType::Table);
         }
 
@@ -2602,13 +2687,35 @@ impl Schema {
             return Some(SchemaObjectType::View);
         }
 
-        for index_list in self.indexes.values() {
-            if index_list.iter().any(|i| i.name.eq_ignore_ascii_case(name)) {
-                return Some(SchemaObjectType::Index);
-            }
+        if !self.is_unique_idx_name(name) {
+            return Some(SchemaObjectType::Index);
         }
 
         None
+    }
+}
+
+impl BrokenTableEntry {
+    fn record_index(&mut self, name: &str, root: i64) {
+        let name = normalize_ident(name);
+        if !self.index_names.contains(&name) {
+            self.index_names.push(name);
+        }
+        if root != 0 && !self.index_root_pages.contains(&root) {
+            self.index_root_pages.push(root);
+        }
+    }
+}
+
+impl TryClone for BrokenTableEntry {
+    type Error = TryReserveError;
+
+    fn try_clone(&self) -> Result<Self, Self::Error> {
+        Ok(Self {
+            root_page: self.root_page,
+            index_root_pages: self.index_root_pages.try_clone()?,
+            index_names: self.index_names.try_clone()?,
+        })
     }
 }
 
@@ -2830,6 +2937,7 @@ impl TryClone for Schema {
             table_to_materialized_views: self.table_to_materialized_views.try_clone()?,
             incompatible_views,
             broken_views: self.broken_views.try_clone()?,
+            broken_tables: self.broken_tables.try_clone()?,
             dropped_root_pages: self.dropped_root_pages.try_clone()?,
             type_registry: self.type_registry.try_clone()?,
             generated_columns_enabled: self.generated_columns_enabled,
