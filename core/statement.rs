@@ -17,7 +17,7 @@ use crate::{
     schema::Trigger,
     stats::refresh_analyze_stats,
     translate::{self, display::PlanContext, emitter::TransactionMode, plan::BitSet},
-    turso_assert,
+    turso_assert, turso_debug_assert,
     vdbe::{
         self,
         explain::{
@@ -336,6 +336,11 @@ pub struct Statement {
     /// True once this root statement has started executing and incremented
     /// `Connection::n_active_root_statements`.
     counted_as_active_root: bool,
+    /// True while [`Self::prepare_step`] has nothing left to do for this
+    /// execution: the root statement is counted and no busy wait is pending.
+    /// `_step` used to ask that question with three tests on three fields on
+    /// every step, for work that happens once per execution.
+    steps_are_prepared: bool,
     /// True for the parked statement backing an incremental blob handle.
     /// Counted separately in `Connection::n_active_blob_statements` so
     /// explicit checkpoints can subtract it — an open blob handle must not
@@ -423,6 +428,7 @@ impl Statement {
             tail_offset,
             origin,
             counted_as_active_root: false,
+            steps_are_prepared: false,
             is_blob_handle: false,
             nested_guard_active,
         }
@@ -575,6 +581,7 @@ impl Statement {
                 self.program.connection.clear_interrupt_if_idle();
             }
             self.counted_as_active_root = false;
+            self.steps_are_prepared = false;
         }
     }
 
@@ -589,15 +596,23 @@ impl Statement {
     /// callee-saved register held for the length of the dispatch loop and in a
     /// store rather than a register. `step` converts at the public boundary.
     fn _step(&mut self, waker: Option<&Waker>) -> StepOutcome {
-        if matches!(self.state.execution_state, ProgramExecutionState::Init)
-            || !self.counted_as_active_root
-            || self.busy_handler_state.is_some()
-        {
+        turso_debug_assert!(
+            !self.steps_are_prepared
+                || (self.counted_as_active_root
+                    && self.busy_handler_state.is_none()
+                    && !matches!(self.state.execution_state, ProgramExecutionState::Init)),
+            "a statement that skips prepare_step must be counted, idle and started"
+        );
+        if !self.steps_are_prepared {
             match self.prepare_step(waker) {
                 Ok(Some(result)) => return self.outcome_of(Ok(result)),
                 Ok(None) => {}
                 Err(err) => return StepOutcome::Error(err.into()),
             }
+            // Everything above happens once per execution. The three fields
+            // that can undo it clear this flag where they change.
+            self.steps_are_prepared =
+                self.counted_as_active_root && self.busy_handler_state.is_none();
         }
         let res = match self.query_mode {
             QueryMode::Normal => {
@@ -777,6 +792,7 @@ impl Statement {
             let handler = self.program.connection.get_busy_handler();
 
             // Initialize or get existing busy handler state
+            self.steps_are_prepared = false;
             let busy_state = self
                 .busy_handler_state
                 .get_or_insert_with(|| BusyHandlerState::new(now));
@@ -1563,6 +1579,7 @@ impl Statement {
             .n_change
             .store(0, std::sync::atomic::Ordering::Release);
         self.busy = false;
+        self.steps_are_prepared = false;
         self.has_returned_row = false;
     }
 
@@ -1727,6 +1744,7 @@ impl Statement {
         self.cleanup_orphaned_seq_inner_tx();
         self.state.reset(max_registers, max_cursors);
         self.busy = false;
+        self.steps_are_prepared = false;
         self.busy_handler_state = None;
         self.query_timeout_override = None;
         self.has_returned_row = false;
