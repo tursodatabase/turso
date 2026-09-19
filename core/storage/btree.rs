@@ -3261,7 +3261,7 @@ impl BTreeCursor {
                     ref mut fill_cell_payload_state,
                 } => {
                     return_if_io!(fill_cell_payload(
-                        &PinGuard::new(page.clone()),
+                        &page,
                         bkey.maybe_rowid(),
                         new_payload,
                         *cell_idx,
@@ -6332,7 +6332,7 @@ impl BTreeCursor {
                 } => {
                     {
                         return_if_io!(fill_cell_payload(
-                            &PinGuard::new(page.clone()),
+                            page,
                             *rowid,
                             new_payload,
                             cell_idx,
@@ -10509,8 +10509,12 @@ pub enum CopyDataState {
 /// This function needs a separate [FillCellPayloadState] because allocating overflow pages
 /// may require I/O.
 #[allow(clippy::too_many_arguments)]
+/// `page` must stay pinned for the whole call, including across the IO this
+/// yields for an overflow chain. Both callers in the engine pass the page the
+/// cursor sits on, which the page stack pins; the debug assert states the rule
+/// and every test in every suite checks it.
 fn fill_cell_payload(
-    page: &PinGuard,
+    page: &PageRef,
     int_key: Option<i64>,
     cell_payload: &mut crate::alloc::Vec<u8>,
     cell_idx: usize,
@@ -10519,6 +10523,10 @@ fn fill_cell_payload(
     pager: &Pager,
     fill_cell_payload_state: &mut FillCellPayloadState,
 ) -> IOResultOr<()> {
+    debug_assert!(
+        page.is_pinned(),
+        "fill_cell_payload needs a pinned page, so the pager cannot take its buffer away"
+    );
     let overflow_page_pointer_size = 4;
     let overflow_page_data_size = usable_space - overflow_page_pointer_size;
     let result = loop {
