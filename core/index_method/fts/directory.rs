@@ -24,7 +24,7 @@
 
 use rustc_hash::FxHashMap as HashMap;
 use std::io::{BufWriter, Write};
-use std::ops::Range;
+use std::ops::{Deref, Range};
 use std::path::{Path, PathBuf};
 
 use parking_lot::RwLock;
@@ -33,7 +33,6 @@ use tantivy::directory::{
     Directory, DirectoryLock, FileHandle, Lock, OwnedBytes, TerminatingWrite, WatchCallback,
     WatchHandle,
 };
-use tantivy::HasLen;
 
 #[cfg(not(nightly))]
 use crate::alloc::TursoVecInExt;
@@ -46,8 +45,9 @@ const TANTIVY_META_FILE: &str = "meta.json";
 const TANTIVY_MANAGED_FILE: &str = ".managed.json";
 
 /// In-memory file handle over resident bytes.
+#[derive(Clone)]
 pub(super) struct InMemoryFileHandle {
-    data: Arc<[u8]>,
+    data: ArcSlice<u8>,
 }
 
 impl std::fmt::Debug for InMemoryFileHandle {
@@ -55,12 +55,6 @@ impl std::fmt::Debug for InMemoryFileHandle {
         f.debug_struct("InMemoryFileHandle")
             .field("len", &self.data.len())
             .finish()
-    }
-}
-
-impl HasLen for InMemoryFileHandle {
-    fn len(&self) -> usize {
-        self.data.len()
     }
 }
 
@@ -75,9 +69,19 @@ impl FileHandle for InMemoryFileHandle {
         if range.start >= range.end {
             return Ok(OwnedBytes::empty());
         }
-        Ok(OwnedBytes::new(Arc::clone(&self.data)).slice(range))
+        Ok(OwnedBytes::new(self.clone()).slice(range))
     }
 }
+
+impl Deref for InMemoryFileHandle {
+    type Target = [u8];
+
+    fn deref(&self) -> &[u8] {
+        &self.data
+    }
+}
+
+unsafe impl stable_deref_trait::StableDeref for InMemoryFileHandle {}
 
 /// A no-op directory lock: immediately satisfied, releases nothing.
 struct NoopLockGuard;
@@ -94,19 +98,24 @@ fn noop_lock() -> DirectoryLock {
 /// from the visible registry rows; no stored file ever carries that name.
 #[derive(Clone)]
 pub(super) struct SnapshotDirectory {
-    files: Arc<HashMap<PathBuf, Arc<[u8]>>>,
-    meta_json: Arc<[u8]>,
+    files: Arc<HashMap<PathBuf, ArcSlice<u8>>>,
+    meta_json: ArcSlice<u8>,
 }
 
 impl SnapshotDirectory {
-    pub fn new(files: HashMap<PathBuf, Arc<[u8]>>, meta_json: Vec<u8>) -> Self {
-        Self {
+    #[turso_macros::allocation_site(crate::alloc::FtsAllocationSite::SnapshotMetadata)]
+    pub fn new(
+        files: HashMap<PathBuf, ArcSlice<u8>>,
+        meta_json: &[u8],
+        allocator: DynAllocator,
+    ) -> crate::Result<Self> {
+        Ok(Self {
             files: Arc::new(files),
-            meta_json: Arc::from(meta_json),
-        }
+            meta_json: try_arc_slice_from_slice_in(meta_json, allocator)?,
+        })
     }
 
-    fn lookup(&self, path: &Path) -> Option<Arc<[u8]>> {
+    fn lookup(&self, path: &Path) -> Option<ArcSlice<u8>> {
         if path == Path::new(TANTIVY_META_FILE) {
             return Some(Arc::clone(&self.meta_json));
         }
@@ -197,7 +206,7 @@ impl Directory for SnapshotDirectory {
 #[derive(Debug, Default)]
 struct BuildDirectoryInner {
     /// Segment files captured on terminate, footer included.
-    files: HashMap<PathBuf, Arc<[u8]>>,
+    files: HashMap<PathBuf, ArcSlice<u8>>,
     /// Atomic writes (`meta.json`, `.managed.json`): absorbed here so
     /// whole-index manifests never reach the B-tree.
     atomic: HashMap<PathBuf, ArcSlice<u8>>,
@@ -224,7 +233,7 @@ impl BuildDirectory {
     /// The captured segment files (everything written through `open_write`).
     /// Atomic slots (`meta.json`, `.managed.json`) are excluded by
     /// construction.
-    pub fn captured_files(&self) -> HashMap<PathBuf, Arc<[u8]>> {
+    pub fn captured_files(&self) -> HashMap<PathBuf, ArcSlice<u8>> {
         self.inner.read().files.clone()
     }
 
@@ -251,6 +260,7 @@ impl std::fmt::Debug for BuildDirectory {
 struct CaptureWriter {
     path: PathBuf,
     buffer: DynVec<u8>,
+    allocator: DynAllocator,
     inner: Arc<RwLock<BuildDirectoryInner>>,
 }
 
@@ -287,8 +297,13 @@ impl Drop for CaptureWriter {
 }
 
 impl TerminatingWrite for CaptureWriter {
+    #[turso_macros::allocation_site(crate::alloc::FtsAllocationSite::CapturedFile)]
     fn terminate_ref(&mut self, _: tantivy::directory::AntiCallToken) -> std::io::Result<()> {
-        let data = Arc::from(self.buffer.as_slice());
+        let data = try_arc_slice_from_slice_in(self.buffer.as_slice(), self.allocator.clone())
+            .map_err(|error| {
+                self.inner.write().allocation_failed = true;
+                std::io::Error::new(std::io::ErrorKind::OutOfMemory, error)
+            })?;
         self.inner.write().files.insert(self.path.clone(), data);
         self.buffer.clear();
         Ok(())
@@ -343,6 +358,7 @@ impl Directory for BuildDirectory {
         let writer: Box<dyn TerminatingWrite + Send + Sync> = Box::new(CaptureWriter {
             path: path.to_path_buf(),
             buffer: DynVec::new_in(self.allocator.clone()),
+            allocator: self.allocator.clone(),
             inner: Arc::clone(&self.inner),
         });
         Ok(BufWriter::new(writer))

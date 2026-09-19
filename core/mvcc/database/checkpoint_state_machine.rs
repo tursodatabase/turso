@@ -2466,6 +2466,8 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
                         .expect("Table ID does not have a root page");
                     let row_version = {
                         let alloc = self.mvstore.allocator();
+                        #[cfg(nightly)]
+                        let alloc = crate::alloc::DynAllocator::new(alloc);
                         let (row_version, _) = self
                             .get_current_row_version_mut(write_set_index)
                             .ok_or_else(|| {
@@ -2500,6 +2502,8 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
                         .expect("Index ID does not have a root page");
                     let row_version = {
                         let alloc = self.mvstore.allocator();
+                        #[cfg(nightly)]
+                        let alloc = crate::alloc::DynAllocator::new(alloc);
                         let (row_version, _) = self
                             .get_current_row_version_mut(write_set_index)
                             .ok_or_else(|| {

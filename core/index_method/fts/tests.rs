@@ -162,7 +162,7 @@ fn chunk_assembly_rejects_stray_chunk_numbers_without_panicking() {
     chunks.insert(0, vec![1, 2, 3]);
     chunks.insert(1, vec![4, 5]);
     assert_eq!(
-        &*assemble_chunks(path, chunks.clone()).unwrap(),
+        &*assemble_chunks(path, chunks.clone(), DynAllocator::default()).unwrap(),
         &[1, 2, 3, 4, 5]
     );
 
@@ -171,7 +171,7 @@ fn chunk_assembly_rejects_stray_chunk_numbers_without_panicking() {
     // bytes or trip an assert.
     chunks.insert(-1, vec![9]);
     assert!(matches!(
-        assemble_chunks(path, chunks.clone()),
+        assemble_chunks(path, chunks.clone(), DynAllocator::default()),
         Err(LimboError::Corrupt(_))
     ));
 
@@ -179,7 +179,7 @@ fn chunk_assembly_rejects_stray_chunk_numbers_without_panicking() {
     chunks.remove(&-1);
     chunks.remove(&0);
     assert!(matches!(
-        assemble_chunks(path, chunks),
+        assemble_chunks(path, chunks, DynAllocator::default()),
         Err(LimboError::Corrupt(_))
     ));
 }
@@ -257,7 +257,7 @@ fn merged_segment_files_can_be_rekeyed_to_a_minted_id() {
     let minted = SegmentId::from_uuid_string("0123456789abcdef0123456789abcdef").unwrap();
     assert_ne!(segment.id(), minted);
 
-    let files: HashMap<PathBuf, Arc<[u8]>> = segment
+    let files: HashMap<PathBuf, ArcSlice<u8>> = segment
         .data
         .files
         .iter()
@@ -298,7 +298,10 @@ fn merged_segment_files_can_be_rekeyed_to_a_minted_id() {
     // A file that is not named after the source segment is a bug, not
     // something to rename silently.
     let mut stray = files;
-    stray.insert(PathBuf::from("meta.json"), Arc::from(Vec::new()));
+    stray.insert(
+        PathBuf::from("meta.json"),
+        try_arc_slice_from_slice_in(&[], DynAllocator::default()).unwrap(),
+    );
     assert!(matches!(
         rename_segment_files(stray, &segment.id(), &minted),
         Err(LimboError::InternalError(_))
@@ -388,7 +391,7 @@ fn segment_load_reads_the_identities_the_build_wrote() {
 
     // A segment loaded from storage reads its identities from the fast
     // field. A merged segment and every cache miss do the same.
-    let files: HashMap<PathBuf, Arc<[u8]>> = segment
+    let files: HashMap<PathBuf, ArcSlice<u8>> = segment
         .data
         .files
         .iter()
@@ -401,6 +404,7 @@ fn segment_load_reads_the_identities_the_build_wrote() {
         segment.id(),
         segment.descriptor.max_doc,
         files,
+        DynAllocator::default(),
     )
     .unwrap();
     assert_eq!(read_back, segment.data.identities);
@@ -461,6 +465,7 @@ fn segment_load_rejects_the_old_identity_field() {
         id,
         1,
         directory.captured_files(),
+        DynAllocator::default(),
     )
     .unwrap_err();
     assert!(matches!(&error, LimboError::Corrupt(_)));
@@ -574,7 +579,10 @@ fn segment_byte_cache_keeps_newest_and_respects_budget() {
     let mut cache = SegmentByteCache::default();
     let make_data = |bytes: usize| {
         let mut files = HashMap::default();
-        files.insert("f".to_string(), Arc::<[u8]>::from(vec![0u8; bytes]));
+        files.insert(
+            "f".to_string(),
+            try_arc_slice_from_slice_in(&vec![0u8; bytes], DynAllocator::default()).unwrap(),
+        );
         Arc::new(SegmentData::new(files, SegmentIdentities::new(Vec::new())))
     };
     let a = SegmentId::generate_random();
@@ -712,10 +720,200 @@ mod allocation_failures {
     use tantivy::directory::{Directory, TerminatingWrite};
 
     #[test]
+    fn segment_load_allocation_failures_allow_retry() {
+        let attachment = test_attachment();
+        let (segment, _) = build_and_load_segment(&attachment, &[(7, "hello"), (19, "world")]);
+        let chunks: HashMap<_, _> = segment
+            .descriptor
+            .files
+            .iter()
+            .enumerate()
+            .map(|(ordinal, entry)| {
+                let chunks: HashMap<_, _> = segment.data.files[&entry.name]
+                    .chunks(DEFAULT_CHUNK_SIZE)
+                    .enumerate()
+                    .map(|(number, bytes)| (number as i64, bytes.to_vec()))
+                    .collect();
+                (ordinal as u32, chunks)
+            })
+            .collect();
+        let allocator = FailingAllocator::default();
+        let load = || {
+            let files = assemble_segment_files(
+                &segment.descriptor,
+                chunks.clone(),
+                DynAllocator::new(allocator.clone()),
+            )?;
+            segment_data_from_files(
+                &attachment.shared,
+                &attachment.schema,
+                segment.id(),
+                segment.descriptor.max_doc,
+                files,
+                DynAllocator::new(allocator.clone()),
+            )
+        };
+        let loaded = load().unwrap();
+        assert_eq!(loaded.identities, segment.data.identities);
+        let count = allocator.allocations.load(Ordering::Relaxed);
+        assert!(count > 0);
+        for fail_at in 0..count {
+            allocator.fail_after(fail_at);
+            assert!(
+                matches!(load(), Err(LimboError::OutOfMemory)),
+                "fail_at={fail_at}"
+            );
+            assert_eq!(allocator.remaining.load(Ordering::Relaxed), -1);
+            let loaded = load().unwrap();
+            assert_eq!(loaded.identities, segment.data.identities);
+            for (name, bytes) in &segment.data.files {
+                assert_eq!(&*loaded.files[name], &**bytes);
+            }
+        }
+    }
+
+    #[test]
+    fn snapshot_deletion_failure_allows_retry() {
+        let attachment = test_attachment();
+        let (mut segment, _) =
+            build_and_load_segment(&attachment, &[(7, "hello turso"), (19, "hello world")]);
+        segment.deleted.insert(0);
+        let allocator = FailingAllocator::default();
+        let mut cursor = FtsCursor::new(&attachment);
+        cursor.allocator = DynAllocator::new(allocator.clone());
+        cursor.segments = vec![segment];
+        allocator.fail_after(0);
+        assert!(matches!(
+            cursor.build_snapshot_view(false),
+            Err(LimboError::OutOfMemory)
+        ));
+        assert!(cursor.searcher.is_none());
+        cursor.build_snapshot_view(false).unwrap();
+        let searcher = cursor.searcher.as_ref().unwrap();
+        let (query, _) = cursor
+            .cached_parser
+            .as_ref()
+            .unwrap()
+            .parse_query_lenient("hello");
+        assert_eq!(
+            searcher.search(&query, &tantivy::collector::Count).unwrap(),
+            1
+        );
+    }
+
+    #[test]
+    fn snapshot_reader_shares_bytes_until_last_owner_drops() {
+        let allocator = FailingAllocator::default();
+        let data =
+            try_arc_slice_from_slice_in(b"abcdefgh", DynAllocator::new(allocator.clone())).unwrap();
+        let pointer = data[2..].as_ptr();
+        let path = PathBuf::from("segment.idx");
+        let directory = SnapshotDirectory::new(
+            [(path.clone(), data.clone())].into_iter().collect(),
+            b"metadata",
+            DynAllocator::default(),
+        )
+        .unwrap();
+        let handle = directory.get_file_handle(&path).unwrap();
+        let bytes = handle.read_bytes(2..7).unwrap();
+        assert_eq!(bytes.as_ptr(), pointer);
+        drop(data);
+        drop(directory);
+        drop(handle);
+        assert_eq!(&*bytes, b"cdefg");
+        assert_eq!(allocator.deallocations.load(Ordering::Relaxed), 0);
+        let clone = bytes.clone();
+        drop(bytes);
+        assert_eq!(allocator.deallocations.load(Ordering::Relaxed), 0);
+        drop(clone);
+        assert_eq!(allocator.deallocations.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn chunk_assembly_reports_both_allocation_failures() {
+        let allocator = FailingAllocator {
+            #[cfg(feature = "allocation_metric")]
+            expected_sites: &[crate::alloc::AllocationSite::Fts(
+                crate::alloc::FtsAllocationSite::SegmentAssembly,
+            )],
+            ..Default::default()
+        };
+        let chunks: HashMap<_, _> = [(1, b"defgh".to_vec()), (0, b"abc".to_vec())]
+            .into_iter()
+            .collect();
+        let path = std::path::Path::new("segment.idx");
+        for fail_at in 0..2 {
+            allocator.fail_after(fail_at);
+            assert!(matches!(
+                assemble_chunks(path, chunks.clone(), DynAllocator::new(allocator.clone())),
+                Err(LimboError::OutOfMemory)
+            ));
+            assert_eq!(allocator.remaining.load(Ordering::Relaxed), -1);
+        }
+        assert_eq!(
+            &*assemble_chunks(path, chunks, DynAllocator::new(allocator)).unwrap(),
+            b"abcdefgh"
+        );
+    }
+
+    #[test]
+    fn snapshot_metadata_allocation_failure_allows_retry() {
+        let allocator = FailingAllocator {
+            #[cfg(feature = "allocation_metric")]
+            expected_sites: &[crate::alloc::AllocationSite::Fts(
+                crate::alloc::FtsAllocationSite::SnapshotMetadata,
+            )],
+            ..Default::default()
+        };
+        allocator.fail_after(0);
+        assert!(matches!(
+            SnapshotDirectory::new(
+                HashMap::default(),
+                b"metadata",
+                DynAllocator::new(allocator.clone())
+            ),
+            Err(LimboError::OutOfMemory)
+        ));
+        let directory = SnapshotDirectory::new(
+            HashMap::default(),
+            b"metadata",
+            DynAllocator::new(allocator),
+        )
+        .unwrap();
+        assert_eq!(
+            directory
+                .atomic_read(std::path::Path::new("meta.json"))
+                .unwrap(),
+            b"metadata"
+        );
+    }
+
+    #[test]
+    fn capture_termination_failure_does_not_publish() {
+        let allocator = FailingAllocator::default();
+        let directory = BuildDirectory::new(DynAllocator::new(allocator.clone()));
+        let path = std::path::Path::new("segment.idx");
+        let mut writer = directory.open_write(path).unwrap();
+        writer.get_mut().write_all(b"contents").unwrap();
+        allocator.fail_after(0);
+        assert_eq!(
+            writer.terminate().unwrap_err().kind(),
+            ErrorKind::OutOfMemory
+        );
+        assert!(!directory.exists(path).unwrap());
+        let mut writer = directory.open_write(path).unwrap();
+        writer.write_all(b"replacement").unwrap();
+        writer.terminate().unwrap();
+        assert_eq!(&*directory.captured_files()[path], b"replacement");
+    }
+
+    #[test]
     fn atomic_write_failure_preserves_previous_metadata() {
         let allocator = FailingAllocator {
             #[cfg(feature = "allocation_metric")]
-            expected_site: Some(crate::alloc::FtsAllocationSite::AtomicMetadata.into()),
+            expected_sites: &[crate::alloc::AllocationSite::Fts(
+                crate::alloc::FtsAllocationSite::AtomicMetadata,
+            )],
             ..Default::default()
         };
         let directory = BuildDirectory::new(DynAllocator::new(allocator.clone()));
@@ -746,7 +944,10 @@ mod allocation_failures {
     fn capture_growth_failure_preserves_bytes_and_does_not_publish() {
         let allocator = FailingAllocator {
             #[cfg(feature = "allocation_metric")]
-            expected_site: Some(crate::alloc::FtsAllocationSite::CaptureBuffer.into()),
+            expected_sites: &[
+                crate::alloc::AllocationSite::Fts(crate::alloc::FtsAllocationSite::CaptureBuffer),
+                crate::alloc::AllocationSite::Fts(crate::alloc::FtsAllocationSite::CapturedFile),
+            ],
             ..Default::default()
         };
         let directory = BuildDirectory::new(DynAllocator::new(allocator.clone()));
@@ -861,8 +1062,9 @@ mod allocation_failures {
     struct FailingAllocator {
         remaining: Arc<AtomicIsize>,
         allocations: Arc<AtomicUsize>,
+        deallocations: Arc<AtomicUsize>,
         #[cfg(feature = "allocation_metric")]
-        expected_site: Option<crate::alloc::AllocationSite>,
+        expected_sites: &'static [crate::alloc::AllocationSite],
     }
 
     impl Default for FailingAllocator {
@@ -870,8 +1072,9 @@ mod allocation_failures {
             Self {
                 remaining: Arc::new(AtomicIsize::new(-1)),
                 allocations: Arc::new(AtomicUsize::new(0)),
+                deallocations: Arc::new(AtomicUsize::new(0)),
                 #[cfg(feature = "allocation_metric")]
-                expected_site: None,
+                expected_sites: &[],
             }
         }
     }
@@ -886,8 +1089,10 @@ mod allocation_failures {
     unsafe impl ApiAllocator for FailingAllocator {
         fn allocate(&self, layout: Layout) -> std::result::Result<NonNull<[u8]>, AllocError> {
             #[cfg(feature = "allocation_metric")]
-            if let Some(expected) = self.expected_site {
-                assert_eq!(crate::alloc::current_allocation_site(), Some(expected));
+            if !self.expected_sites.is_empty() {
+                assert!(self
+                    .expected_sites
+                    .contains(&crate::alloc::current_allocation_site().unwrap()));
             }
             self.allocations.fetch_add(1, Ordering::Relaxed);
             let previous =
@@ -902,6 +1107,7 @@ mod allocation_failures {
         }
 
         unsafe fn deallocate(&self, ptr: NonNull<u8>, layout: Layout) {
+            self.deallocations.fetch_add(1, Ordering::Relaxed);
             unsafe { Global.deallocate(ptr, layout) }
         }
     }

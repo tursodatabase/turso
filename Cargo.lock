@@ -7276,6 +7276,7 @@ dependencies = [
  "simsimd",
  "smallvec",
  "sorted-vec",
+ "stable_deref_trait",
  "stacker",
  "strum",
  "strum_macros",

@@ -38,6 +38,7 @@ use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 use std::collections::BTreeSet;
 use tantivy::{index::SegmentId, schema::Schema, Index, IndexMeta, IndexSettings};
 
+use crate::alloc::ArcSlice;
 use crate::sync::Arc;
 use crate::{LimboError, Result};
 
@@ -371,13 +372,13 @@ impl SegmentIdentities {
 /// identity.
 #[derive(Debug)]
 pub(super) struct SegmentData {
-    pub files: HashMap<String, Arc<[u8]>>,
+    pub files: HashMap<String, ArcSlice<u8>>,
     pub identities: SegmentIdentities,
     pub total_bytes: usize,
 }
 
 impl SegmentData {
-    pub fn new(files: HashMap<String, Arc<[u8]>>, identities: SegmentIdentities) -> Self {
+    pub fn new(files: HashMap<String, ArcSlice<u8>>, identities: SegmentIdentities) -> Self {
         let total_bytes =
             files.values().map(|data| data.len()).sum::<usize>() + identities.resident_bytes();
         Self {

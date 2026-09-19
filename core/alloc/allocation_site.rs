@@ -16,6 +16,10 @@ pub enum AllocationSite {
 pub enum FtsAllocationSite {
     CaptureBuffer,
     AtomicMetadata,
+    CapturedFile,
+    SnapshotMetadata,
+    SnapshotDeletion,
+    SegmentAssembly,
 }
 
 impl From<FtsAllocationSite> for AllocationSite {
@@ -183,6 +187,16 @@ macro_rules! with_btree_allocation_site {
         #[cfg(feature = "allocation_metric")]
         let _turso_allocation_site_guard =
             $crate::alloc::enter_allocation_site($crate::alloc::BTreeAllocationSite::$site);
+        $expr
+    }};
+}
+
+#[macro_export]
+macro_rules! with_fts_allocation_site {
+    ($site:ident, $expr:expr) => {{
+        #[cfg(feature = "allocation_metric")]
+        let _turso_allocation_site_guard =
+            $crate::alloc::enter_allocation_site($crate::alloc::FtsAllocationSite::$site);
         $expr
     }};
 }

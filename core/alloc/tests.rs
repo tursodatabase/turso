@@ -112,6 +112,28 @@ fn dyn_allocator_delegates_skiplist_allocations() {
     assert!(allocations.load(Ordering::Relaxed) > 0);
 }
 
+#[cfg(nightly)]
+#[test]
+fn arc_slice_preserves_concrete_allocator_until_last_clone_drops() {
+    let allocations = StdArc::new(AtomicUsize::new(0));
+    let deallocations = StdArc::new(AtomicUsize::new(0));
+    let data: ArcSlice<u8, CountingAlloc> = try_arc_slice_from_slice_in(
+        b"allocator",
+        CountingAlloc {
+            allocations: allocations.clone(),
+            deallocations: deallocations.clone(),
+        },
+    )
+    .unwrap();
+    assert_eq!(allocations.load(Ordering::Relaxed), 1);
+    let clone = data.clone();
+    drop(data);
+    assert_eq!(&*clone, b"allocator");
+    assert_eq!(deallocations.load(Ordering::Relaxed), 0);
+    drop(clone);
+    assert_eq!(deallocations.load(Ordering::Relaxed), 1);
+}
+
 #[test]
 fn database_open_with_allocator_uses_allocator_for_mvstore_skiplist() {
     let allocations = StdArc::new(AtomicUsize::new(0));
@@ -187,15 +209,9 @@ fn database_fts_build_and_merge_use_only_the_fts_allocator() {
         "INSERT INTO docs VALUES (19, 'hello world')",
         "OPTIMIZE INDEX docs_fts",
     ] {
-        allocations.store(0, Ordering::Relaxed);
-        deallocations.store(0, Ordering::Relaxed);
+        let before = allocations.load(Ordering::Relaxed);
         conn.execute(sql).unwrap();
-        assert!(allocations.load(Ordering::Relaxed) > 0, "{sql}");
-        assert_eq!(
-            allocations.load(Ordering::Relaxed),
-            deallocations.load(Ordering::Relaxed),
-            "{sql}"
-        );
+        assert!(allocations.load(Ordering::Relaxed) > before, "{sql}");
         assert_eq!(mv_allocations.load(Ordering::Relaxed), 0, "{sql}");
     }
     let rows = conn
@@ -209,6 +225,12 @@ fn database_fts_build_and_merge_use_only_the_fts_allocator() {
             std::vec![crate::Value::from_i64(7)],
             std::vec![crate::Value::from_i64(19)]
         ]
+    );
+    drop(conn);
+    drop(db);
+    assert_eq!(
+        allocations.load(Ordering::Relaxed),
+        deallocations.load(Ordering::Relaxed)
     );
 }
 

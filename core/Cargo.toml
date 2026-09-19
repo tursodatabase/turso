@@ -56,7 +56,7 @@ cli_only = []
 test_helper = []
 bench = []
 nanosecond-bench = ["bench"]
-fts = ["dep:tantivy", "dep:serde_json", "dep:crc32fast"]
+fts = ["dep:tantivy", "dep:serde_json", "dep:crc32fast", "dep:stable_deref_trait"]
 codspeed = ["bench"]
 optimizer_params = ["serde", "dep:serde_json"]
 stacker = ["dep:stacker"]
@@ -99,6 +99,7 @@ turso_ext = { workspace = true, features = ["core_only"] }
 cfg_block = "0.1.1"
 fallible-iterator = { workspace = true }
 allocator-api2 = { workspace = true }
+stable_deref_trait = { version = "1.2.0", optional = true }
 hex = { workspace = true }
 icu_collator = "2.2.0"
 icu_locale = "2.2.0"

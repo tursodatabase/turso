@@ -8,6 +8,11 @@ Please visit our GitHub for more information:
 Dependencies
 ============
 
+This project depends on stable_deref_trait, distributed by Robert Grosse:
+
+* License: licenses/core/stable-deref-trait-mit-license.md (MIT License)
+* Homepage: https://github.com/storyyeller/stable_deref_trait
+
 This product depends on Error Prone, distributed by the Error Prone project:
 
 * License: licenses/bindings/java/assertj-license.md (Apache License v2.0)

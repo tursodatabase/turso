@@ -9,7 +9,6 @@ pub fn try_arc_slice_from_slice<T: Clone>(slice: &[T]) -> Result<ArcSlice<T>, Tr
 pub fn try_arc_slice_from_slice_in<T: Clone, A: ConcurrentAllocator>(
     slice: &[T],
     alloc: A,
-) -> Result<ArcSlice<T>, TryReserveError> {
-    std::sync::Arc::<[T], DynAllocator>::try_clone_from_ref_in(slice, DynAllocator::new(alloc))
-        .map_err(|_| TryReserveError)
+) -> Result<ArcSlice<T, A>, TryReserveError> {
+    std::sync::Arc::<[T], A>::try_clone_from_ref_in(slice, alloc).map_err(|_| TryReserveError)
 }
