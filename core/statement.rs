@@ -559,7 +559,13 @@ impl Statement {
     /// matters on the first call, the last call, a busy wait or an error is
     /// gated behind cheap flag tests and kept out of line. A row in the middle
     /// of a scan runs only the interpreter call and the result-row bookkeeping.
-    fn _step(&mut self, waker: Option<&Waker>) -> Result<StepResult> {
+    /// The error is boxed so the whole return value is register-sized. Left
+    /// unboxed, `Result<StepResult, LimboError>` is 40 bytes and comes back
+    /// through a memory return slot, which a scan pays for on every row: the
+    /// slot pointer takes a callee-saved register for the length of the
+    /// dispatch loop and the outcome is written to memory rather than returned
+    /// in registers. `step` unboxes at the public boundary.
+    fn _step(&mut self, waker: Option<&Waker>) -> std::result::Result<StepResult, Box<LimboError>> {
         if matches!(self.state.execution_state, ProgramExecutionState::Init)
             || !self.counted_as_active_root
             || self.busy_handler_state.is_some()
@@ -655,7 +661,7 @@ impl Statement {
         &mut self,
         mut res: std::result::Result<StepResult, Box<LimboError>>,
         waker: Option<&Waker>,
-    ) -> Result<StepResult> {
+    ) -> std::result::Result<StepResult, Box<LimboError>> {
         const MAX_SCHEMA_RETRY: usize = 50;
         for attempt in 0..MAX_SCHEMA_RETRY {
             // Only reprepare if we still need to update schema
@@ -678,7 +684,7 @@ impl Statement {
             tracing::debug!("reprepare: attempt={}", attempt);
             if let Err(err) = self.reprepare() {
                 self.release_active_root_if_counted();
-                return Err(err);
+                return Err(err.into());
             }
             res = self
                 .program
@@ -754,19 +760,19 @@ impl Statement {
             self.cleanup_orphaned_seq_inner_tx();
         }
 
-        // The interpreter chain carries a boxed error to keep per-row returns
-        // register-sized; unbox once at the public boundary.
-        res.map_err(|err| *err)
+        res
     }
 
     #[inline]
     pub fn step(&mut self) -> Result<StepResult> {
-        self._step(None)
+        // The interpreter chain carries a boxed error to keep per-row returns
+        // register-sized; unbox once here, at the public boundary.
+        self._step(None).map_err(|err| *err)
     }
 
     #[inline]
     pub fn step_with_waker(&mut self, waker: &Waker) -> Result<StepResult> {
-        self._step(Some(waker))
+        self._step(Some(waker)).map_err(|err| *err)
     }
 
     /// Fast step for trigger/FK subprograms: skips reprepare checks, timeout
