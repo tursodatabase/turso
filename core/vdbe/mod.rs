@@ -935,6 +935,11 @@ pub struct ProgramState {
     /// `vm_steps - incomplete_steps` when SQLITE_STMTSTATUS_VM_STEP was last
     /// reset to zero.
     insn_executed_reset_at: u64,
+    /// `btree_next + btree_prev` when SQLITE_STMTSTATUS_ROWS_READ was last
+    /// reset to zero. Next and Prev record the row they read in those two
+    /// counters alone, so `rows_read` adds them back and takes off what the
+    /// caller has already been shown.
+    rows_read_reset_at: u64,
     pub io_completions: Option<IOCompletions>,
     pub pc: InsnReference,
     pub(crate) cursors: Vec<Option<Cursor>>,
@@ -1110,6 +1115,7 @@ impl ProgramState {
             trace_flags: TraceFlags::default(),
             incomplete_steps: 0,
             insn_executed_reset_at: 0,
+            rows_read_reset_at: 0,
             io_completions: None,
             pc: 0,
             cursors,
@@ -1510,10 +1516,26 @@ impl ProgramState {
             .wrapping_sub(self.insn_executed_reset_at)
     }
 
+    /// Rows handed over by a cursor advance. Every successful Next and Prev
+    /// reads exactly one row and counts as one search, so both of those
+    /// totals are built from these two counters instead of their own.
+    #[inline]
+    fn advances(&self) -> u64 {
+        self.metrics
+            .btree_next
+            .wrapping_add(self.metrics.btree_prev)
+    }
+
     pub(crate) fn metrics(&self) -> StatementMetrics {
         let mut metrics = self.metrics.clone();
         metrics.vm_steps = self.vm_steps();
         metrics.insn_executed = self.insn_executed();
+        let advances = self.advances();
+        metrics.rows_read = metrics
+            .rows_read
+            .wrapping_add(advances)
+            .wrapping_sub(self.rows_read_reset_at);
+        metrics.search_count = metrics.search_count.wrapping_add(advances as i64);
         if let Some(OpProgramState::Step { statement, .. }) = self.active_op_state.program_ref() {
             metrics.merge(&statement.metrics());
         }
@@ -1527,6 +1549,7 @@ impl ProgramState {
         self.metrics.reset();
         self.incomplete_steps = 0;
         self.insn_executed_reset_at = 0;
+        self.rows_read_reset_at = 0;
         self.check_countdown_start = self.check_countdown;
         if let Some(OpProgramState::Step { statement, .. }) = self.active_op_state.program_mut() {
             statement.reset_metrics();
@@ -1546,7 +1569,10 @@ impl ProgramState {
                 self.insn_executed_reset_at = self.vm_steps().wrapping_sub(self.incomplete_steps)
             }
             crate::statement::StatementStatusCounter::Reprepare => self.metrics.reprepares = 0,
-            crate::statement::StatementStatusCounter::RowsRead => self.metrics.rows_read = 0,
+            crate::statement::StatementStatusCounter::RowsRead => {
+                self.metrics.rows_read = 0;
+                self.rows_read_reset_at = self.advances();
+            }
             crate::statement::StatementStatusCounter::RowsWritten => self.metrics.rows_written = 0,
         }
         if let Some(OpProgramState::Step { statement, .. }) = self.active_op_state.program_mut() {

@@ -3621,10 +3621,9 @@ pub fn op_next(
         }
     };
     if !is_empty {
-        // Increment metrics for row read
-        state.record_rows_read(1);
+        // The row read and the search are both read back out of btree_next,
+        // so the row path keeps one counter for the three of them.
         state.metrics.btree_next = state.metrics.btree_next.wrapping_add(1);
-        state.metrics.search_count = state.metrics.search_count.wrapping_add(1);
         // Only steps codegen marked as part of a full table scan count as
         // fullscan steps, matching SQLITE_STMTSTATUS_FULLSCAN_STEP.
         // Added as 0 or 1 so neither counter costs a branch per row.
@@ -3680,10 +3679,9 @@ pub fn op_prev(
         }
     };
     if !is_empty {
-        // Increment metrics for row read
-        state.record_rows_read(1);
+        // As in op_next: the row read and the search come back out of
+        // btree_prev instead of counters of their own.
         state.metrics.btree_prev = state.metrics.btree_prev.wrapping_add(1);
-        state.metrics.search_count = state.metrics.search_count.wrapping_add(1);
         // Only steps codegen marked as part of a full table scan count as
         // fullscan steps, matching SQLITE_STMTSTATUS_FULLSCAN_STEP.
         // Added as 0 or 1 so neither counter costs a branch per row.
