@@ -2261,20 +2261,31 @@ impl Program {
         } else {
             dispatch_loop::<false>(self, state, pager, waker, false, false)
         };
-        match &result {
-            ProgramStep::Row => {}
-            ProgramStep::Done => {
-                state.execution_state = ProgramExecutionState::Done;
-            }
-            ProgramStep::Interrupt => {
-                state.execution_state = ProgramExecutionState::Interrupted;
-            }
-            ProgramStep::Error(_) => {
-                state.execution_state = ProgramExecutionState::Failed;
-            }
-            _ => {}
+        // Row is returned as a fresh constant, not as the value the loop
+        // produced. The loop merges its returns, so reading Row out of that
+        // merge point hands the caller a phi, and the caller's match over
+        // ProgramStep then compiles to a jump table that runs on every row.
+        if matches!(result, ProgramStep::Row) {
+            return ProgramStep::Row;
         }
+        record_terminal_state(state, &result);
         return result;
+
+        #[inline(never)]
+        fn record_terminal_state(state: &mut ProgramState, result: &ProgramStep) {
+            match result {
+                ProgramStep::Done => {
+                    state.execution_state = ProgramExecutionState::Done;
+                }
+                ProgramStep::Interrupt => {
+                    state.execution_state = ProgramExecutionState::Interrupted;
+                }
+                ProgramStep::Error(_) => {
+                    state.execution_state = ProgramExecutionState::Failed;
+                }
+                ProgramStep::Row | ProgramStep::IO | ProgramStep::Busy | ProgramStep::Yield => {}
+            }
+        }
 
         #[inline(never)]
         fn dispatch_loop_traced(
