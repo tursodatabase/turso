@@ -940,7 +940,13 @@ pub struct BTreeCursor {
     /// Maintain count of the number of records in the btree. Used for the `Count` opcode
     count: usize,
     /// Stores the cursor context before rebalancing so that a seek can be done later
-    context: Option<CursorContext>,
+    /// Boxed so that `needs_restore` is a null-pointer test. Held inline, the
+    /// Option takes its niche from a value near `isize::MAX`, and x86 cannot
+    /// compare a 64-bit immediate against memory, so the test cost a `movabs`
+    /// and a `lea` before the compare. Reading a column asks this for every
+    /// row; a context is saved only when the tree is about to change under the
+    /// cursor.
+    context: Option<Box<CursorContext>>,
     /// Store whether the Cursor is in a valid state. Meaning if it is pointing to a valid cell index or not
     pub valid_state: CursorValidState,
     seek_state: CursorSeekState,
@@ -6440,7 +6446,7 @@ impl BTreeCursor {
     // Save cursor context, to be restored later
     pub fn save_context(&mut self, cursor_context: CursorContext) {
         self.valid_state = CursorValidState::RequireSeek;
-        self.context = Some(cursor_context);
+        self.context = Some(Box::new(cursor_context));
         self.noted_payload = NotedPayload::NONE;
         // The tree is about to change under this cursor (that is the only reason a
         // position ever gets saved), so cached payload offsets and overflow page
