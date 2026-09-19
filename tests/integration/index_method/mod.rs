@@ -827,6 +827,107 @@ fn test_fts_bound_query_input_types(tmp_db: TempDatabase) {
 
 #[cfg(all(feature = "fts", not(target_family = "wasm")))]
 #[turso_macros::test]
+fn test_fts_match_requires_index_at_prepare(tmp_db: TempDatabase) {
+    let conn = tmp_db.connect_limbo();
+    conn.execute("CREATE TABLE docs(id INTEGER PRIMARY KEY, body TEXT, title TEXT)")
+        .unwrap();
+    for sql in [
+        "SELECT fts_match('database', 'database AND sql')",
+        "SELECT * FROM docs WHERE fts_match(body, 'database')",
+        "SELECT fts_match(body, 'database') FROM docs",
+        "DELETE FROM docs WHERE fts_match(body, 'database')",
+        "UPDATE docs SET title = 'new' WHERE fts_match(body, 'database')",
+    ] {
+        let error = conn.prepare(sql).err().expect(sql);
+        assert_eq!(
+            error.to_string(),
+            "Parse error: fts_match requires an FTS index in the query plan"
+        );
+    }
+    conn.execute("CREATE INDEX docs_fts ON docs USING fts(body)")
+        .unwrap();
+    for sql in [
+        "SELECT * FROM docs WHERE fts_match(body, 'database')",
+        "SELECT * FROM docs WHERE fts_match(body, ?1)",
+        "DELETE FROM docs WHERE fts_match(body, 'database')",
+        "UPDATE docs SET title = 'new' WHERE fts_match(body, 'database')",
+        "SELECT fts_highlight('database', '<b>', '</b>', 'database')",
+        "SELECT fts_score('database', 'database')",
+    ] {
+        assert!(conn.prepare(sql).is_ok(), "prepare must accept: {sql}");
+    }
+    for sql in [
+        "SELECT * FROM docs WHERE fts_match(title, 'database')",
+        "SELECT * FROM docs NOT INDEXED WHERE fts_match(body, 'database')",
+        "SELECT fts_match(body, 'database') FROM docs",
+        "SELECT * FROM docs WHERE fts_match(body, 'database') OR fts_match(body, 'sql')",
+    ] {
+        let error = conn.prepare(sql).err().expect(sql);
+        assert_eq!(
+            error.to_string(),
+            "Parse error: fts_match requires an FTS index in the query plan"
+        );
+    }
+}
+
+#[cfg(all(feature = "fts", not(target_family = "wasm")))]
+#[turso_macros::test]
+fn test_fts_indexed_query_language(tmp_db: TempDatabase) {
+    let conn = tmp_db.connect_limbo();
+    conn.execute("CREATE TABLE docs(id INTEGER PRIMARY KEY, body TEXT)")
+        .unwrap();
+    conn.execute("CREATE INDEX docs_fts ON docs USING fts(body)")
+        .unwrap();
+    let cases = [
+        ("database", "database AND sql", false),
+        ("database sql", "database AND sql", true),
+        ("nosql", "database NOT nosql", false),
+        ("database nosql", "database NOT nosql", false),
+        ("database", "database NOT nosql", true),
+        ("full x text search", "\"full text search\"", false),
+        ("full text search", "\"full text search\"", true),
+        ("search text full", "\"full text search\"", false),
+        ("database", "(database OR sql) AND search", false),
+        ("sql search", "(database OR sql) AND search", true),
+        ("sql", "database sql", true),
+        ("DATABASE", "database", true),
+        ("irrelevant", "database OR sql", false),
+        ("database", "", false),
+        ("", "database", false),
+        ("database", "*", true),
+        ("database", "database^2", true),
+        (
+            "abcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyz",
+            "abcdefghijklmnopqrstuvwxyzabcdefghijklmnopqrstuvwxyz",
+            false,
+        ),
+    ];
+    for (text, query, expected) in cases {
+        conn.execute("DELETE FROM docs").unwrap();
+        conn.execute(format!("INSERT INTO docs VALUES(1, '{text}')"))
+            .unwrap();
+        let expected = vec![vec![rusqlite::types::Value::Integer(i64::from(expected))]];
+        assert_eq!(
+            limbo_exec_rows(
+                &conn,
+                &format!("SELECT count(*) FROM docs WHERE fts_match(body, '{query}')")
+            ),
+            expected,
+            "indexed: {text:?}, {query:?}"
+        );
+    }
+    for query in ["(", "unknown:database"] {
+        assert!(limbo_exec_rows_fallible(
+            &tmp_db,
+            &conn,
+            &format!("SELECT count(*) FROM docs WHERE fts_match(body, '{query}')")
+        )
+        .is_err());
+    }
+}
+
+#[cfg(all(feature = "fts", not(target_family = "wasm")))]
+#[turso_macros::test]
 fn test_fts_sql_queries(tmp_db: TempDatabase) {
     let _ = env_logger::try_init();
     let conn = tmp_db.connect_limbo();
@@ -4118,7 +4219,7 @@ fn fts_tiny_retained_cache_budget_only_affects_performance() {
     assert_eq!(
         limbo_exec_rows(
             &conn_a,
-            "SELECT id FROM docs WHERE fts_match(body, 'bravo') OR fts_match(body, 'charlie') ORDER BY id"
+            "SELECT id FROM docs WHERE fts_match(body, 'bravo OR charlie') ORDER BY id"
         ),
         vec![
             vec![rusqlite::types::Value::Integer(2)],
