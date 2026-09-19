@@ -833,6 +833,10 @@ impl IndexMethodAttachment for FtsIndexAttachment {
     fn init(&self) -> Result<Box<dyn IndexMethodCursor>> {
         Ok(Box::new(FtsCursor::new(self)))
     }
+
+    fn supports_query_count(&self, pattern_idx: usize) -> bool {
+        matches!(pattern_idx as i64, FTS_PATTERN_MATCH | FTS_PATTERN_COMBINED)
+    }
 }
 
 /// Pattern indices for FTS queries
@@ -3066,48 +3070,13 @@ impl IndexMethodCursor for FtsCursor {
         self.current_hits.clear();
         self.streaming_hits = None;
         self.hit_pos = 0;
-        let query_str = match values[1].get_value() {
-            Value::Null => return Ok(IOResult::Done(false)),
-            query => query.to_string(),
-        };
-
         let parser = self
             .cached_parser
             .as_deref()
             .expect("parser built with the searcher");
-
-        // Bound the query string before it reaches Tantivy's recursive
-        // parser: a few KiB of nested parentheses would otherwise burn
-        // minutes of CPU or overflow the stack (an abort no catch_unwind
-        // contains). `parse_query_lenient` uses the non-backtracking parse
-        // path, so nesting inside these bounds stays linear.
-        if query_str.len() > FTS_MAX_QUERY_BYTES {
-            return Err(LimboError::InternalError(format!(
-                "FTS query is too long ({} bytes; the limit is {FTS_MAX_QUERY_BYTES})",
-                query_str.len()
-            ))
-            .into());
-        }
-        let mut depth = 0usize;
-        for byte in query_str.bytes() {
-            match byte {
-                b'(' => {
-                    depth += 1;
-                    if depth > FTS_MAX_QUERY_NESTING {
-                        return Err(LimboError::InternalError(format!(
-                            "FTS query nests deeper than {FTS_MAX_QUERY_NESTING} parentheses"
-                        ))
-                        .into());
-                    }
-                }
-                b')' => depth = depth.saturating_sub(1),
-                _ => {}
-            }
-        }
-        let (query, parse_errors) = parser.parse_query_lenient(&query_str);
-        if let Some(error) = parse_errors.first() {
-            return Err(LimboError::InternalError(format!("FTS parse error: {error:?}")).into());
-        }
+        let Some(query) = parse_search_query(parser, values[1].get_value())? else {
+            return Ok(IOResult::Done(false));
+        };
 
         // TopDocs keeps a heap proportional to its limit. Cap that heap at the
         // number of live documents: this preserves unlimited-query semantics
@@ -3232,6 +3201,27 @@ impl IndexMethodCursor for FtsCursor {
             .sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
 
         Ok(IOResult::Done(!self.current_hits.is_empty()))
+    }
+
+    fn query_count(&mut self, values: &[Register]) -> IOResultOr<i64> {
+        assert_eq!(values.len(), 2);
+        assert!(matches!(
+            values[0].get_value(),
+            Value::Numeric(crate::numeric::Numeric::Integer(
+                FTS_PATTERN_MATCH | FTS_PATTERN_COMBINED
+            ))
+        ));
+        self.ensure_searcher()?;
+        let parser = self.cached_parser.as_deref().expect("searcher initialized");
+        let Some(query) = parse_search_query(parser, values[1].get_value())? else {
+            return Ok(IOResult::Done(0));
+        };
+        let count = query
+            .count(self.searcher.as_ref().expect("searcher initialized"))
+            .map_err(|error| LimboError::InternalError(format!("FTS count error: {error}")))?;
+        Ok(IOResult::Done(
+            i64::try_from(count).map_err(|_| LimboError::IntegerOverflow)?,
+        ))
     }
 
     /// Advances to the next query result. Returns true if more results exist.
@@ -3664,6 +3654,44 @@ impl IndexMethodCursor for FtsCursor {
             merge_segments_skipped: Some(stats.merge_segments_skipped.load(Ordering::Relaxed)),
         }))
     }
+}
+
+fn parse_search_query(
+    parser: &tantivy::query::QueryParser,
+    value: &Value,
+) -> Result<Option<Box<dyn Query>>> {
+    let query_str = match value {
+        Value::Null => return Ok(None),
+        query => query.to_string(),
+    };
+    if query_str.len() > FTS_MAX_QUERY_BYTES {
+        return Err(LimboError::InternalError(format!(
+            "FTS query is too long ({} bytes; the limit is {FTS_MAX_QUERY_BYTES})",
+            query_str.len()
+        )));
+    }
+    let mut depth = 0usize;
+    for byte in query_str.bytes() {
+        match byte {
+            b'(' => {
+                depth += 1;
+                if depth > FTS_MAX_QUERY_NESTING {
+                    return Err(LimboError::InternalError(format!(
+                        "FTS query nests deeper than {FTS_MAX_QUERY_NESTING} parentheses"
+                    )));
+                }
+            }
+            b')' => depth = depth.saturating_sub(1),
+            _ => {}
+        }
+    }
+    let (query, parse_errors) = parser.parse_query_lenient(&query_str);
+    if let Some(error) = parse_errors.first() {
+        return Err(LimboError::InternalError(format!(
+            "FTS parse error: {error:?}"
+        )));
+    }
+    Ok(Some(query))
 }
 
 #[cfg(test)]

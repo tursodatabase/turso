@@ -1774,17 +1774,46 @@ pub fn emit_simple_count(
 
     // Count opcode only works on BTree cursors. Materialized view trigger
     // queries may have pseudo cursors — fall back to normal aggregation.
-    if !program.cursor_is_btree(cursor_id) {
+    let table = plan.joined_tables().first().unwrap();
+    let index_method = match &table.op {
+        Operation::IndexMethodQuery(query) => Some(query),
+        _ => None,
+    };
+    if index_method.is_none() && !program.cursor_is_btree(cursor_id) {
         return Ok(false);
     }
 
     let target_reg = program.alloc_register();
 
-    program.emit_insn(Insn::Count {
-        cursor_id,
-        target_reg,
-        exact: true,
-    });
+    if let Some(query) = index_method {
+        let start_reg = program.alloc_registers(query.arguments.len() + 1);
+        program.emit_int(query.pattern_idx as i64, start_reg);
+        for (i, argument) in query.arguments.iter().enumerate() {
+            crate::translate::expr::translate_expr(
+                program,
+                Some(&plan.table_references),
+                argument,
+                start_reg + 1 + i,
+                &t_ctx.resolver,
+            )?;
+        }
+        let after_count = program.allocate_label();
+        program.emit_insn(Insn::IndexMethodQuery {
+            db: table.database_id,
+            cursor_id,
+            start_reg,
+            count_reg: query.arguments.len() + 1,
+            pc_if_empty: after_count,
+            count_target: Some(target_reg),
+        });
+        program.preassign_label_to_next_insn(after_count);
+    } else {
+        program.emit_insn(Insn::Count {
+            cursor_id,
+            target_reg,
+            exact: true,
+        });
+    }
 
     program.emit_insn(Insn::Close { cursor_id });
 
