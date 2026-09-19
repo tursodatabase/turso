@@ -224,8 +224,8 @@ unsafe fn copy_nonoverlapping_inline(src: *const u8, dst: *mut u8, len: usize) {
 /// Copies `src` to `dst` and returns every copied byte OR-ed together, so
 /// one pass both moves the value and tells whether it is pure ASCII.
 ///
-/// Each length uses two loads and two stores that overlap in the middle, or
-/// for one to three bytes the offsets 0, `len / 2` and `len - 1`.
+/// Two loads and two stores that overlap in the middle cover lengths of 4
+/// to 15; one to three bytes use the offsets 0, `len / 2` and `len - 1`.
 ///
 /// # Safety
 ///
@@ -260,6 +260,33 @@ unsafe fn copy_short_and_fold(src: *const u8, dst: *mut u8, len: usize) -> u64 {
     }
 }
 
+/// [`copy_short_and_fold`] for a longer value: a word loop whose last word
+/// overlaps what the loop already moved.
+///
+/// # Safety
+///
+/// `src` and `dst` must be valid for `len` bytes, must not overlap, and
+/// `len` must be at least 8.
+#[inline(always)]
+unsafe fn copy_long_and_fold(src: *const u8, dst: *mut u8, len: usize) -> u64 {
+    unsafe {
+        let mut folded = 0u64;
+        let mut offset = 0;
+        while offset + 8 <= len {
+            let word = src.add(offset).cast::<u64>().read_unaligned();
+            dst.add(offset).cast::<u64>().write_unaligned(word);
+            folded |= word;
+            offset += 8;
+        }
+        if offset < len {
+            let word = src.add(len - 8).cast::<u64>().read_unaligned();
+            dst.add(len - 8).cast::<u64>().write_unaligned(word);
+            folded |= word;
+        }
+        folded
+    }
+}
+
 impl Text {
     /// Replaces the contents with `bytes` read from a record payload.
     ///
@@ -271,36 +298,59 @@ impl Text {
     pub(crate) fn copy_from_record_bytes(&mut self, bytes: &[u8]) -> Result<()> {
         /// Up to this length two overlapping machine words cover the value.
         const SHORT_LIMIT: usize = 16;
-        const HIGH_BITS: u64 = 0x8080_8080_8080_8080;
+        /// Above this length the platform copy routine and a SIMD UTF-8
+        /// check beat a word loop that does both.
+        const FUSED_LIMIT: usize = 64;
         let len = bytes.len();
         if len < SHORT_LIMIT {
-            if let Cow::Owned(string) = &mut self.value {
-                if string.capacity() >= len {
-                    // SAFETY: the length goes to zero before the copy and back
-                    // to `len` only after the bytes are known to be ASCII, so
-                    // the string never holds contents that are not UTF-8. The
-                    // capacity test above makes `len` bytes of the buffer
-                    // writable, and a record payload never overlaps it.
-                    let folded = unsafe {
-                        let buffer = string.as_mut_vec();
-                        buffer.set_len(0);
-                        copy_short_and_fold(bytes.as_ptr(), buffer.as_mut_ptr(), len)
-                    };
-                    if folded & HIGH_BITS == 0 {
-                        // SAFETY: every byte is ASCII, so the buffer holds
-                        // valid UTF-8 of this length.
-                        unsafe { string.as_mut_vec().set_len(len) };
-                        self.subtype = TextSubtype::Text;
-                        return Ok(());
-                    }
-                }
+            if self.fill_from_ascii_bytes::<false>(bytes) {
+                return Ok(());
             }
+        } else if len <= FUSED_LIMIT && self.fill_from_ascii_bytes::<true>(bytes) {
+            return Ok(());
         }
         let text = validate_utf8(bytes).ok_or_else(|| {
             mark_unlikely();
             LimboError::Corrupt("TEXT value contains invalid UTF-8".into())
         })?;
         self.do_extend(&text)
+    }
+
+    /// Copies `bytes` into the owned buffer and answers whether they were
+    /// pure ASCII. A false answer leaves the text empty for the caller to
+    /// fill by the general path.
+    #[inline(always)]
+    fn fill_from_ascii_bytes<const LONG: bool>(&mut self, bytes: &[u8]) -> bool {
+        const HIGH_BITS: u64 = 0x8080_8080_8080_8080;
+        let len = bytes.len();
+        let Cow::Owned(string) = &mut self.value else {
+            return false;
+        };
+        if string.capacity() < len {
+            return false;
+        }
+        // SAFETY: the length goes to zero before the copy and back to `len`
+        // only after the bytes are known to be ASCII, so the string never
+        // holds contents that are not UTF-8. The capacity test above makes
+        // `len` bytes of the buffer writable, and a record payload never
+        // overlaps it.
+        let folded = unsafe {
+            let buffer = string.as_mut_vec();
+            buffer.set_len(0);
+            if LONG {
+                copy_long_and_fold(bytes.as_ptr(), buffer.as_mut_ptr(), len)
+            } else {
+                copy_short_and_fold(bytes.as_ptr(), buffer.as_mut_ptr(), len)
+            }
+        };
+        if folded & HIGH_BITS != 0 {
+            return false;
+        }
+        // SAFETY: every byte is ASCII, so the buffer holds valid UTF-8 of
+        // this length.
+        unsafe { string.as_mut_vec().set_len(len) };
+        self.subtype = TextSubtype::Text;
+        true
     }
 }
 

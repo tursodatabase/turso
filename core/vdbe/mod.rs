@@ -4187,12 +4187,14 @@ mod tests {
     #[test]
     fn text_decode_into_a_reused_register_keeps_every_length() {
         let mut destination = Register::Value(Value::Null);
-        // Grow the buffer first so later values take the reuse path.
-        let long: Vec<u8> = (0..40u8).map(|i| b'a' + i % 26).collect();
+        // Grow the buffer first so later values take the reuse path. The
+        // range covers the two-word copy, the word loop and the lengths
+        // above both of them.
+        let long: Vec<u8> = (0..80usize).map(|i| b'a' + (i % 26) as u8).collect();
         decode_one_text(&one_text_record(&long), &mut destination).unwrap();
-        assert_eq!(register_text(&destination).len(), 40);
+        assert_eq!(register_text(&destination).len(), 80);
 
-        for len in 0..=40usize {
+        for len in 0..=80usize {
             let value: Vec<u8> = (0..len).map(|i| b'A' + (i % 26) as u8).collect();
             decode_one_text(&one_text_record(&value), &mut destination).unwrap();
             assert_eq!(
@@ -4208,7 +4210,15 @@ mod tests {
         let mut destination = Register::Value(Value::Null);
         decode_one_text(&one_text_record(b"aaaaaaaaaaaaaaaa"), &mut destination).unwrap();
 
-        for value in ["é", "héllo", "日本語", "\u{1F600}", "aé", "ααααααααα"] {
+        for value in [
+            "é",
+            "héllo",
+            "日本語",
+            "\u{1F600}",
+            "aé",
+            "ααααααααα",
+            "ααααααααααααααααααααααααααααααααααα",
+        ] {
             decode_one_text(&one_text_record(value.as_bytes()), &mut destination).unwrap();
             assert_eq!(register_text(&destination), value);
         }
@@ -4229,10 +4239,10 @@ mod tests {
     #[test]
     fn blob_decode_into_a_reused_register_keeps_every_length() {
         let mut destination = Register::Value(Value::Null);
-        let long: Vec<u8> = (0..40u8).collect();
-        decode_one_text(&one_value_record(12 + 2 * 40, &long), &mut destination).unwrap();
+        let long: Vec<u8> = (0..80u8).collect();
+        decode_one_text(&one_value_record(12 + 2 * 80, &long), &mut destination).unwrap();
 
-        for len in 0..=40usize {
+        for len in 0..=80usize {
             let value: Vec<u8> = (0..len as u8).map(|i| i.wrapping_mul(7)).collect();
             decode_one_text(
                 &one_value_record(12 + 2 * len as u64, &value),
