@@ -1474,7 +1474,11 @@ impl ProgramState {
     /// whether the statement yields to the caller.
     #[inline]
     pub(crate) fn suspend_on_io(&mut self, io: IOCompletions) -> InsnFunctionStepResult {
-        turso_debug_assert!(
+        // Checked in release builds as well: it tells the compiler the slot
+        // is empty, so the store below needs no drop of what was there, and
+        // the drop's address arithmetic stops being hoisted into the top of
+        // every step call.
+        turso_assert!(
             self.io_completions.is_none(),
             "an instruction reported IO while a completion was already parked"
         );
