@@ -162,8 +162,12 @@ jobs:
             bash -c "${{ matrix.settings.build }}"
       - name: Build
         run: ${{ matrix.settings.build }}
-        if: ${{ !matrix.settings.docker }}
+        if: ${{ !matrix.settings.docker && runner.os != 'Windows' }}
         shell: bash
+      - name: Build (Windows)
+        run: ${{ matrix.settings.build }}
+        if: runner.os == 'Windows'
+        shell: pwsh
       # The release profile keeps debug info, which on Linux is embedded in the
       # .node file itself (~80% of its size). macOS and Windows keep debug info
       # in separate files, so only Linux needs stripping.
