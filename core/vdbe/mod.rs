@@ -673,7 +673,18 @@ struct ActiveOpStateSlot {
 macro_rules! active_state_accessor {
     ($name:ident, $variant:ident, $ty:ty, $init:expr) => {
         fn $name(&mut self) -> &mut $ty {
-            if matches!(self.state, ActiveOpState::None) {
+            // Test for the wanted variant, not for None. Both ways out of
+            // the test then hold that variant, so the match below folds
+            // away; testing for None leaves the match a second branch, and
+            // an opcode that loops over its own state pays it every turn.
+            if !matches!(self.state, ActiveOpState::$variant(_)) {
+                if !matches!(self.state, ActiveOpState::None) {
+                    unreachable!(
+                        "active opcode state mismatch: expected {} or None, got {:?}",
+                        stringify!($variant),
+                        self.state
+                    );
+                }
                 // None owns nothing, so skip the drop glue of the enum that
                 // a plain assignment would run on the old value.
                 std::mem::forget(std::mem::replace(
@@ -4224,6 +4235,37 @@ mod tests {
         let returned = result.unwrap_err();
         assert_eq!(std::ptr::from_ref(returned.as_ref()), original);
         assert!(matches!(*returned, LimboError::InternalError(ref msg) if msg == "test error"));
+    }
+
+    #[test]
+    fn an_active_opcode_state_is_built_once_and_then_handed_back() {
+        use crate::vdbe::execute::OpRowIdState;
+        let mut slot = ActiveOpStateSlot::default();
+        assert!(slot.is_idle());
+        assert!(matches!(slot.row_id(), OpRowIdState::Start));
+        assert!(!slot.is_idle());
+        *slot.row_id() = OpRowIdState::Seek {
+            rowid: 7,
+            table_cursor_id: 3,
+        };
+        assert!(matches!(
+            slot.row_id(),
+            OpRowIdState::Seek {
+                rowid: 7,
+                table_cursor_id: 3
+            }
+        ));
+        slot.clear();
+        assert!(slot.is_idle());
+        assert!(matches!(slot.row_id(), OpRowIdState::Start));
+    }
+
+    #[test]
+    #[should_panic(expected = "active opcode state mismatch")]
+    fn an_active_opcode_state_of_another_opcode_is_never_overwritten() {
+        let mut slot = ActiveOpStateSlot::default();
+        slot.row_id();
+        slot.column();
     }
 
     #[test]
