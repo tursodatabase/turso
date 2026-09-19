@@ -13907,7 +13907,7 @@ pub fn op_open_write(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    _pager: &Arc<Pager>,
+    pager: &Arc<Pager>,
 ) -> InsnResult {
     load_insn!(
         OpenWrite {
@@ -13921,8 +13921,8 @@ pub fn op_open_write(
     if program.connection.is_readonly(*db) {
         return Err(LimboError::ReadOnly.into());
     }
-    let pager = program.get_pager_from_database_index(db)?;
-    let mv_store = program.connection.mv_store_for_db(*db);
+    let pager = pager_for_db(program, pager, *db)?;
+    let mv_store = mv_store_for_db(program, state, *db);
 
     if let (_, CursorType::IndexMethod(module)) = &program.cursor_ref[*cursor_id] {
         if mv_store.is_some() {
@@ -13997,26 +13997,23 @@ pub fn op_open_write(
         let maybe_promote_to_mvcc_cursor = |btree_cursor: Box<BTreeCursor>,
                                             mv_cursor_type: MvccCursorType|
          -> Result<OpenedBTree> {
-            if let Some(tx_id) = program.connection.get_mv_tx_id_for_db(*db) {
-                let mv_store = mv_store
-                    .as_ref()
-                    .expect("mv_store should be Some when MVCC transaction is active")
-                    .clone();
-                Ok(OpenedBTree::Mvcc(Box::new(MvCursor::new(
-                    mv_store,
-                    &program.connection,
-                    tx_id,
-                    root_page,
-                    mv_cursor_type,
-                    btree_cursor,
-                )?)))
-            } else if mv_store.is_some() {
-                Err(LimboError::InternalError(
+            // Without an MvStore there is no MVCC transaction to look up.
+            let Some(mv_store) = mv_store.as_ref() else {
+                return Ok(OpenedBTree::Plain(btree_cursor));
+            };
+            let Some(tx_id) = program.connection.get_mv_tx_id_for_db(*db) else {
+                return Err(LimboError::InternalError(
                     "OpenWrite requires an active MVCC transaction".to_string(),
-                ))
-            } else {
-                Ok(OpenedBTree::Plain(btree_cursor))
-            }
+                ));
+            };
+            Ok(OpenedBTree::Mvcc(Box::new(MvCursor::new(
+                mv_store.clone(),
+                &program.connection,
+                tx_id,
+                root_page,
+                mv_cursor_type,
+                btree_cursor,
+            )?)))
         };
         if let Some(index) = maybe_index {
             let num_columns = index.columns.len();
