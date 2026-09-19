@@ -7869,7 +7869,11 @@ impl BTreeCursor {
         }
         let contents = self.stack.top_ref().get_contents();
         let cell_idx = self.stack.current_cell_index();
-        cell_idx >= 0 && contents.is_leaf() && cell_idx as usize + 1 < contents.cell_count()
+        if cell_idx < 0 {
+            return false;
+        }
+        let (is_leaf, cell_count) = contents.is_leaf_and_cell_count();
+        is_leaf && cell_idx as usize + 1 < cell_count
     }
 
     /// True when the cursor sits on the last cell of the rightmost leaf and

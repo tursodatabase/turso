@@ -829,6 +829,22 @@ impl PageInner {
         self.read_u8(BTREE_PAGE_TYPE) > PageType::TableInterior as u8
     }
 
+    /// Whether this is a leaf page, and how many cells it holds, read with one
+    /// bounds test. The b-tree header keeps the page type at +0 and the cell
+    /// count at +3, so both come out of the same five-byte window. Read one at
+    /// a time they cost two bounds tests, on the path a scan takes for every
+    /// row.
+    #[inline(always)]
+    pub fn is_leaf_and_cell_count(&self) -> (bool, usize) {
+        let buf = self.as_ptr();
+        let header = self.offset();
+        let window = &buf[header..header + BTREE_CELL_COUNT + 2];
+        (
+            window[BTREE_PAGE_TYPE] > PageType::TableInterior as u8,
+            u16::from_be_bytes([window[BTREE_CELL_COUNT], window[BTREE_CELL_COUNT + 1]]) as usize,
+        )
+    }
+
     /// True for table pages (interior or leaf). A corrupt page type byte
     /// answers false; the record reader reports it when it parses the cell.
     #[inline(always)]
