@@ -257,6 +257,12 @@ The query string passed to `fts_match`/`fts_score` supports Tantivy's QueryParse
 | Column filter | `title:database` | Match "database" only in title field |
 | Boosting | `title:database^2 body:database` | Boost title matches |
 
+`fts_match` requires an FTS index in the selected query plan.
+If no suitable index is used, statement preparation fails with `fts_match requires an FTS index in the query plan`.
+This includes calls on literal strings, searches on unindexed columns, and queries that disable index use with `NOT INDEXED`.
+Creating an FTS index is not enough if the query cannot use it.
+`fts_highlight` still supports standalone calls.
+
 This syntax can be improved on in the future, and maybe eventually we can support some fancy elasticsearch/paradeDB syntax.
 
 ### DML Operations
