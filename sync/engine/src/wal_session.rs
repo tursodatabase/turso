@@ -22,14 +22,20 @@ impl WalSession {
     pub fn conn(&self) -> &Arc<turso_core::Connection> {
         &self.conn
     }
+    #[inline(always)]
     pub fn begin(&mut self) -> Result<()> {
-        assert!(!self.in_txn);
+        if self.in_txn {
+            return Ok(());
+        }
         self.conn.wal_insert_begin()?;
         self.in_txn = true;
         Ok(())
     }
+    #[inline(always)]
     pub fn insert_at(&mut self, frame_no: u64, frame: &[u8]) -> Result<WalFrameInfo> {
-        assert!(self.in_txn);
+        if !self.in_txn {
+            self.begin()?;
+        }
         let info = self.conn.wal_insert_frame(frame_no, frame)?;
         Ok(info)
     }
