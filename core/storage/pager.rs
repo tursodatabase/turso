@@ -143,6 +143,12 @@ mod page_inner {
         /// The WAL frame number this page was loaded from (0 if loaded from main DB file)
         /// This tracks which version of the page we have in memory
         pub wal_tag: AtomicU64,
+        /// Which epoch of which pager's dirty set holds this page id, or 0 for
+        /// none. See [`Pager::add_dirty`]: a page that is already in the set is
+        /// recognised from this stamp instead of searching the set again, which
+        /// costs a write lock and a roaring-bitmap insert on every row a
+        /// statement writes.
+        pub dirty_set_epoch: AtomicU64,
         /// The actual page data buffer. None if not loaded.
         buffer: Option<Arc<Buffer>>,
         /// Start and length of the bytes of `buffer`, kept next to it so a page
@@ -182,6 +188,7 @@ mod page_inner {
                 header_offset: Self::header_offset_of(id),
                 pin_count: AtomicUsize::new(0),
                 wal_tag: AtomicU64::new(TAG_UNSET),
+                dirty_set_epoch: AtomicU64::new(0),
                 buffer: None,
                 data_ptr: std::ptr::null_mut(),
                 data_len: 0,
@@ -912,6 +919,14 @@ pub struct Page {
     pub inner: UnsafeCell<PageInner>,
 }
 
+/// A value no pager and no epoch of a pager has used before. Sharing one
+/// counter across the process means a page stamped by one pager can never look
+/// like a member of another pager's dirty set.
+fn next_dirty_set_epoch() -> u64 {
+    static NEXT: AtomicU64 = AtomicU64::new(1);
+    NEXT.fetch_add(1, Ordering::Relaxed)
+}
+
 // SAFETY: Page is thread-safe because we use atomic page flags to serialize
 // concurrent modifications.
 unsafe impl Send for Page {}
@@ -969,6 +984,17 @@ impl Page {
     #[inline]
     pub fn clear_locked(&self) {
         self.get().flags.fetch_and(!PAGE_LOCKED, Ordering::Release);
+    }
+
+    /// See [`PageInner::dirty_set_epoch`].
+    #[inline]
+    pub fn dirty_set_epoch(&self) -> u64 {
+        self.get().dirty_set_epoch.load(Ordering::Acquire)
+    }
+
+    #[inline]
+    pub fn set_dirty_set_epoch(&self, epoch: u64) {
+        self.get().dirty_set_epoch.store(epoch, Ordering::Release);
     }
 
     #[inline]
@@ -1548,7 +1574,19 @@ pub struct Pager {
     #[cfg(test)]
     spill_yield: SpillYieldHook,
     /// Dirty pages as a bitmap, naturally sorted by page number.
+    /// The pages this pager must write out. Anything that takes ids out of this
+    /// set must take a fresh `dirty_set_epoch`, or a page stamped with the old
+    /// one is never written again; the debug assert in [`Pager::add_dirty`]
+    /// catches a missed one the first time such a page is written.
     dirty_pages: Arc<RwLock<RoaringBitmap>>,
+    /// The epoch the current contents of `dirty_pages` belong to. Every page
+    /// that goes into the set is stamped with it, so a page that is already
+    /// there is recognised without taking the lock. Anything that takes ids out
+    /// of the set takes a fresh epoch, which makes every stamp stale, so a page
+    /// can never be kept out of the set by an old stamp. Epochs come from a
+    /// counter shared by the whole process, so no two pagers, and no two epochs
+    /// of one pager, ever share a value.
+    dirty_set_epoch: AtomicU64,
     subjournal: RwLock<Option<Subjournal>>,
     savepoints: Arc<RwLock<Vec<Savepoint>>>,
     commit_info: RwLock<CommitInfo>,
@@ -1859,6 +1897,7 @@ impl Pager {
             #[cfg(test)]
             spill_yield: SpillYieldHook::new(),
             dirty_pages: Arc::new(RwLock::new(RoaringBitmap::new())),
+            dirty_set_epoch: AtomicU64::new(next_dirty_set_epoch()),
             subjournal: RwLock::new(None),
             savepoints: Arc::new(RwLock::new(Vec::new())),
             commit_info: RwLock::new(CommitInfo {
@@ -2528,6 +2567,9 @@ impl Pager {
                 }
             }
             dirty_pages.remove_range((db_size + 1)..);
+            // Ids left the set, so the epoch every page carries is stale.
+            self.dirty_set_epoch
+                .store(next_dirty_set_epoch(), Ordering::Release);
             cache.truncate(db_size as usize)?;
         }
 
@@ -2633,7 +2675,7 @@ impl Pager {
             };
             // Clear dirty pages since this is pre-initialization setup, not a real write transaction.
             // with_header_mut marks page 1 dirty as a side effect, but no transaction is active.
-            self.dirty_pages.write().clear();
+            self.clear_dirty_pages();
         }
 
         self.set_auto_vacuum_mode(mode);
@@ -3062,7 +3104,7 @@ impl Pager {
         self.page_size.store(size.get(), Ordering::SeqCst);
         // Clear dirty pages since this is pre-initialization setup, not a real write transaction.
         // Rebuilding init_page_1 must not leak any stale 4 KiB page-1 image into the first write.
-        self.dirty_pages.write().clear();
+        self.clear_dirty_pages();
 
         // Encryption can be configured before a fresh database chooses its page
         // size, so keep the IO context aligned with the pager before the first
@@ -3097,7 +3139,7 @@ impl Pager {
         };
         // Clear dirty pages since this is pre-initialization setup, not a real write transaction.
         // with_header_mut marks page 1 dirty as a side effect, but no transaction is active.
-        self.dirty_pages.write().clear();
+        self.clear_dirty_pages();
         Ok(())
     }
 
@@ -3489,7 +3531,7 @@ impl Pager {
                 .expect("clear_savepoints should not fail for attached DB");
             // Clear dirty pages and page cache before releasing the write lock
             self.clear_page_cache(true);
-            self.dirty_pages.write().clear();
+            self.clear_dirty_pages();
             self.reset_internal_states();
             self.set_schema_cookie(None);
             wal.rollback(None);
@@ -3809,6 +3851,18 @@ impl Pager {
         .unwrap()
     }
 
+    /// Empties the dirty set and takes a fresh epoch, so that every page the old
+    /// epoch stamped goes back into the set the next time it is written. Both
+    /// happen under the set's write lock, and a pager never clears its dirty set
+    /// while a write through it is in flight: the clearing paths all run on the
+    /// thread that holds the WAL write lock, or before any transaction.
+    fn clear_dirty_pages(&self) {
+        let mut dirty_pages = self.dirty_pages.write();
+        dirty_pages.clear();
+        self.dirty_set_epoch
+            .store(next_dirty_set_epoch(), Ordering::Release);
+    }
+
     pub fn add_dirty(&self, page: &Page) -> Result<()> {
         turso_assert!(
             page.is_loaded(),
@@ -3816,8 +3870,20 @@ impl Pager {
             { "page_id": page.get().id() }
         );
         self.subjournal_page_if_required(page)?;
-        let mut dirty_pages = self.dirty_pages.write();
-        dirty_pages.insert(page.get().id() as u32);
+        // A page stamped with the set's current epoch is already in the set, so
+        // there is nothing to do. Asking the set itself costs a write lock and a
+        // search of a roaring bitmap on every row a statement writes.
+        let epoch = self.dirty_set_epoch.load(Ordering::Acquire);
+        let stamped = page.dirty_set_epoch() == epoch;
+        turso_debug_assert!(
+            !stamped || self.dirty_pages.read().contains(page.get().id() as u32),
+            "a page stamped with the current epoch must be in the pager's dirty set",
+            { "page_id": page.get().id() }
+        );
+        if !stamped {
+            self.dirty_pages.write().insert(page.get().id() as u32);
+            page.set_dirty_set_epoch(epoch);
+        }
         // Notify cache before marking dirty (page was evictable, now it won't be)
         // Only notify if page wasn't already dirty, or if it was spilled
         // State before set_dirty():
@@ -4701,7 +4767,7 @@ impl Pager {
                     wal.commit_prepared_frames(&commit_info.prepared_frames);
                     wal.finalize_committed_pages(&commit_info.prepared_frames);
                     wal.finish_append_frames_commit()?;
-                    self.dirty_pages.write().clear();
+                    self.clear_dirty_pages();
                     commit_info.prepared_frames.clear();
 
                     let need_checkpoint = allowed_auto_actions.contains(WalAutoActions::Checkpoint)
@@ -4826,6 +4892,9 @@ impl Pager {
                 }
             }
             dirty_pages.clear();
+            // Ids left the set, so the epoch every page carries is stale.
+            self.dirty_set_epoch
+                .store(next_dirty_set_epoch(), Ordering::Release);
         }
         Ok(WalFrameInfo {
             page_no: header.page_number,
@@ -5367,7 +5436,7 @@ impl Pager {
             .expect("Failed to clear page cache");
         if clear_dirty {
             drop(dirty_pages);
-            self.dirty_pages.write().clear();
+            self.clear_dirty_pages();
         }
     }
 
@@ -6009,7 +6078,7 @@ impl Pager {
             // Even in the case of a write transaction, clearing the entire page cache is overkill,
             // since we only need to clear the dirty pages that were modified by the write transaction.
             self.clear_page_cache(clear_dirty);
-            self.dirty_pages.write().clear();
+            self.clear_dirty_pages();
         } else {
             turso_assert!(
                 self.dirty_pages.read().is_empty(),
