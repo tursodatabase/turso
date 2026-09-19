@@ -1390,6 +1390,25 @@ pub fn read_varint(buf: &[u8]) -> Result<(u64, usize)> {
     }
 }
 
+/// Reads a varint at the front of `buf` and returns it together with the
+/// bytes after it.
+///
+/// The caller would otherwise re-slice `buf` by the length this returns, and
+/// pay a bounds check to do it. Cutting the tail off inside the reader, where
+/// the slice pattern already proves the length, costs nothing.
+#[inline(always)]
+pub fn split_varint(buf: &[u8]) -> Result<(u64, &[u8])> {
+    match buf {
+        [b0, rest @ ..] if *b0 < 0x80 => return Ok((*b0 as u64, rest)),
+        [b0, b1, rest @ ..] if *b1 < 0x80 => {
+            return Ok(((((*b0 & 0x7f) as u64) << 7) | *b1 as u64, rest));
+        }
+        _ => {}
+    }
+    let (value, len) = read_varint(buf)?;
+    Ok((value, &buf[len..]))
+}
+
 #[inline(always)]
 /// Reads a varint from the buffer, returning None if more data is needed.
 pub fn read_varint_partial(buf: &[u8]) -> Result<Option<(u64, usize)>> {
