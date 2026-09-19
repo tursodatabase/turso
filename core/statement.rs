@@ -600,8 +600,9 @@ impl Statement {
             !self.steps_are_prepared
                 || (self.counted_as_active_root
                     && self.busy_handler_state.is_none()
+                    && matches!(self.query_mode, QueryMode::Normal)
                     && !matches!(self.state.execution_state, ProgramExecutionState::Init)),
-            "a statement that skips prepare_step must be counted, idle and started"
+            "a statement that skips prepare_step must be normal, counted, idle and started"
         );
         if !self.steps_are_prepared {
             match self.prepare_step(waker) {
@@ -609,29 +610,38 @@ impl Statement {
                 Ok(None) => {}
                 Err(err) => return StepOutcome::Error(err.into()),
             }
+            if !matches!(self.query_mode, QueryMode::Normal) {
+                return self.step_explain(waker);
+            }
             // Everything above happens once per execution. The three fields
             // that can undo it clear this flag where they change.
             self.steps_are_prepared =
                 self.counted_as_active_root && self.busy_handler_state.is_none();
         }
-        let res = match self.query_mode {
-            QueryMode::Normal => {
-                match self
-                    .program
-                    .normal_step(&mut self.state, &self.pager, waker)
-                {
-                    ProgramStep::Row => {
-                        self.busy = true;
-                        self.has_returned_row = true;
-                        return StepOutcome::Row;
-                    }
-                    step => step.into(),
-                }
+        match self
+            .program
+            .normal_step(&mut self.state, &self.pager, waker)
+        {
+            ProgramStep::Row => {
+                self.busy = true;
+                self.has_returned_row = true;
+                StepOutcome::Row
             }
-            _ => self
-                .program
-                .step(&mut self.state, &self.pager, self.query_mode, waker),
-        };
+            step => {
+                let res = self.finish_step(step.into(), waker);
+                self.outcome_of(res)
+            }
+        }
+    }
+
+    /// A step of EXPLAIN or EXPLAIN QUERY PLAN. Out of line, and behind the
+    /// flag that says the statement is ready to run, so a row of a plain query
+    /// does not ask which mode it is in.
+    #[inline(never)]
+    fn step_explain(&mut self, waker: Option<&Waker>) -> StepOutcome {
+        let res = self
+            .program
+            .step(&mut self.state, &self.pager, self.query_mode, waker);
         let res = self.finish_step(res, waker);
         self.outcome_of(res)
     }
