@@ -871,11 +871,34 @@ pub struct SequenceInnerTxState {
 }
 
 /// Whether this statement's instructions are traced, read once when the
-/// statement starts.
+/// statement starts. The two answers share one byte so that the interpreter
+/// reads and tests them with one load and one compare on every entry.
 #[derive(Clone, Copy, Default)]
-pub(crate) struct TraceSwitches {
-    tracing: bool,
-    vdbe_trace: bool,
+pub(crate) struct TraceSwitches(u8);
+
+impl TraceSwitches {
+    const TRACING: u8 = 1;
+    const VDBE_TRACE: u8 = 2;
+
+    #[inline(always)]
+    fn new(tracing: bool, vdbe_trace: bool) -> Self {
+        Self(tracing as u8 | ((vdbe_trace as u8) << 1))
+    }
+
+    #[inline(always)]
+    fn any(self) -> bool {
+        self.0 != 0
+    }
+
+    #[inline(always)]
+    fn tracing(self) -> bool {
+        self.0 & Self::TRACING != 0
+    }
+
+    #[inline(always)]
+    fn vdbe_trace(self) -> bool {
+        self.0 & Self::VDBE_TRACE != 0
+    }
 }
 
 pub struct ProgramState {
@@ -2313,10 +2336,10 @@ impl Program {
     /// all; the traced loop's own `trace!` calls test the subscriber.
     #[inline(never)]
     fn start_execution(&self, state: &mut ProgramState) {
-        state.trace_switches = TraceSwitches {
-            tracing: tracing::level_filters::LevelFilter::current() >= tracing::Level::TRACE,
-            vdbe_trace: self.connection.get_vdbe_trace(),
-        };
+        state.trace_switches = TraceSwitches::new(
+            tracing::level_filters::LevelFilter::current() >= tracing::Level::TRACE,
+            self.connection.get_vdbe_trace(),
+        );
         state.execution_state = ProgramExecutionState::Running;
     }
 
@@ -2334,12 +2357,16 @@ impl Program {
         if !matches!(state.execution_state, ProgramExecutionState::Running) {
             self.start_execution(state);
         }
-        let TraceSwitches {
-            tracing: enable_tracing,
-            vdbe_trace,
-        } = state.trace_switches;
-        let result = if enable_tracing || vdbe_trace {
-            dispatch_loop_traced(self, state, pager, waker, enable_tracing, vdbe_trace)
+        let switches = state.trace_switches;
+        let result = if unlikely(switches.any()) {
+            dispatch_loop_traced(
+                self,
+                state,
+                pager,
+                waker,
+                switches.tracing(),
+                switches.vdbe_trace(),
+            )
         } else {
             dispatch_loop::<false>(self, state, pager, waker, false, false)
         };
@@ -4195,6 +4222,19 @@ mod tests {
         let returned = result.unwrap_err();
         assert_eq!(std::ptr::from_ref(returned.as_ref()), original);
         assert!(matches!(*returned, LimboError::InternalError(ref msg) if msg == "test error"));
+    }
+
+    #[test]
+    fn trace_switches_hold_both_answers_in_one_byte() {
+        for tracing in [false, true] {
+            for vdbe_trace in [false, true] {
+                let switches = TraceSwitches::new(tracing, vdbe_trace);
+                assert_eq!(switches.tracing(), tracing);
+                assert_eq!(switches.vdbe_trace(), vdbe_trace);
+                assert_eq!(switches.any(), tracing || vdbe_trace);
+            }
+        }
+        assert!(!TraceSwitches::default().any());
     }
 
     #[test]
