@@ -263,3 +263,59 @@ fn test_alter_table_add_column_preserves_collation_on_reopen() {
         conn.close().unwrap();
     }
 }
+
+/// ADD COLUMN must only apply the STRICT DEFAULT type check to STRICT tables.
+/// On an ordinary table the declared type is just an affinity, so SQLite
+/// accepts any constant default; the check used to run there too, and only
+/// once the table held a row, so the same migration passed while empty.
+/// See https://github.com/tursodatabase/turso/issues/8763
+#[test]
+fn test_alter_add_column_default_type_check_is_strict_only() {
+    let tmp_db = TempDatabase::new_empty();
+    let conn = tmp_db.connect_limbo();
+
+    conn.execute("CREATE TABLE t(a INTEGER)").unwrap();
+    conn.execute("INSERT INTO t VALUES(1)").unwrap();
+
+    // A BLOB default on a non-STRICT table that already holds a row.
+    conn.execute("ALTER TABLE t ADD COLUMN b BLOB DEFAULT ''")
+        .unwrap();
+    let rows: Vec<(String,)> = conn.exec_rows("SELECT quote(b) FROM t");
+    assert_eq!(rows, vec![("''".to_string(),)]);
+
+    // INT, REAL and TEXT reach the same check, so it is not about BLOB.
+    conn.execute("ALTER TABLE t ADD COLUMN c INTEGER DEFAULT 3.7")
+        .unwrap();
+    let rows: Vec<(f64,)> = conn.exec_rows("SELECT c FROM t");
+    assert_eq!(rows, vec![(3.7,)]);
+
+    conn.execute("ALTER TABLE t ADD COLUMN d TEXT DEFAULT 5")
+        .unwrap();
+    let rows: Vec<(String,)> = conn.exec_rows("SELECT quote(d) FROM t");
+    assert_eq!(rows, vec![("'5'".to_string(),)]);
+}
+
+/// The same check must still reject a mistyped default on a STRICT table,
+/// whether or not the table holds a row.
+#[test]
+fn test_alter_add_column_default_type_check_still_guards_strict_tables() {
+    let tmp_db = TempDatabase::new_empty();
+    let conn = tmp_db.connect_limbo();
+
+    conn.execute("CREATE TABLE v(a INTEGER) STRICT").unwrap();
+    conn.execute("INSERT INTO v VALUES(1)").unwrap();
+
+    let err = conn
+        .execute("ALTER TABLE v ADD COLUMN b BLOB DEFAULT ''")
+        .expect_err("STRICT table must reject a mistyped DEFAULT");
+    assert!(
+        err.to_string().contains("type mismatch on DEFAULT"),
+        "unexpected error: {err}"
+    );
+
+    // A default of the declared type is still accepted.
+    conn.execute("ALTER TABLE v ADD COLUMN c TEXT DEFAULT 'x'")
+        .unwrap();
+    let rows: Vec<(String,)> = conn.exec_rows("SELECT c FROM v");
+    assert_eq!(rows, vec![("x".to_string(),)]);
+}
