@@ -3229,14 +3229,10 @@ pub fn get_serial_type_size(serial: u64) -> Result<usize> {
         4 => Ok(4),
         5 => Ok(6),
         6 | 7 => Ok(8),
-        n if n >= 12 => match n % 2 {
-            0 => Ok(((n - 12) / 2) as usize), // Blob
-            1 => Ok(((n - 13) / 2) as usize), // Text
-            _ => {
-                mark_unlikely();
-                unreachable!();
-            }
-        },
+        // Blob is even and Text is odd, and both leave the same size after
+        // integer division: 12 and 13 both hold nothing, 14 and 15 both hold
+        // one byte. One subtraction covers the pair.
+        n if n >= 12 => Ok(((n - 12) / 2) as usize),
         _ => {
             mark_unlikely();
             Err(LimboError::Corrupt(format!(
@@ -3791,6 +3787,35 @@ mod tests {
     use crate::alloc::vec;
     use crate::translate::collate::CollationSeq;
     use asserting::prelude::*;
+
+    #[test]
+    fn serial_type_size_matches_the_length_the_kind_carries() {
+        for serial in 0u64..=64 {
+            let expected = match serial {
+                0 | 8 | 9 => Some(0),
+                1..=4 => Some(serial as usize),
+                5 => Some(6),
+                6 | 7 => Some(8),
+                10 | 11 => None,
+                n if n % 2 == 0 => Some((n as usize - 12) / 2),
+                n => Some((n as usize - 13) / 2),
+            };
+            match expected {
+                Some(size) => {
+                    assert_that!(get_serial_type_size(serial).unwrap())
+                        .described_as(format!("serial type {serial}"))
+                        .is_equal_to(size);
+                }
+                None => {
+                    assert_that!(get_serial_type_size(serial).is_err())
+                        .described_as(format!("serial type {serial}"))
+                        .is_true();
+                }
+            }
+        }
+        assert_that!(get_serial_type_size(u64::MAX - 1).unwrap())
+            .is_equal_to((u64::MAX as usize - 1 - 12) / 2);
+    }
 
     #[test]
     fn is_ascii_checks_every_byte_of_every_length() {
