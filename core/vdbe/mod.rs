@@ -673,7 +673,18 @@ struct ActiveOpStateSlot {
 macro_rules! active_state_accessor {
     ($name:ident, $variant:ident, $ty:ty, $init:expr) => {
         fn $name(&mut self) -> &mut $ty {
-            if matches!(self.state, ActiveOpState::None) {
+            // Test for the wanted variant, not for None. Both ways out of
+            // the test then hold that variant, so the match below folds
+            // away; testing for None leaves the match a second branch, and
+            // an opcode that loops over its own state pays it every turn.
+            if !matches!(self.state, ActiveOpState::$variant(_)) {
+                if !matches!(self.state, ActiveOpState::None) {
+                    unreachable!(
+                        "active opcode state mismatch: expected {} or None, got {:?}",
+                        stringify!($variant),
+                        self.state
+                    );
+                }
                 // None owns nothing, so skip the drop glue of the enum that
                 // a plain assignment would run on the old value.
                 std::mem::forget(std::mem::replace(
@@ -870,6 +881,37 @@ pub struct SequenceInnerTxState {
     )>,
 }
 
+/// Whether this statement's instructions are traced, read once when the
+/// statement starts. The two answers share one byte so that the interpreter
+/// reads and tests them with one load and one compare on every entry.
+#[derive(Clone, Copy, Default)]
+pub(crate) struct TraceSwitches(u8);
+
+impl TraceSwitches {
+    const TRACING: u8 = 1;
+    const VDBE_TRACE: u8 = 2;
+
+    #[inline(always)]
+    fn new(tracing: bool, vdbe_trace: bool) -> Self {
+        Self(tracing as u8 | ((vdbe_trace as u8) << 1))
+    }
+
+    #[inline(always)]
+    fn any(self) -> bool {
+        self.0 != 0
+    }
+
+    #[inline(always)]
+    fn tracing(self) -> bool {
+        self.0 & Self::TRACING != 0
+    }
+
+    #[inline(always)]
+    fn vdbe_trace(self) -> bool {
+        self.0 & Self::VDBE_TRACE != 0
+    }
+}
+
 pub struct ProgramState {
     /// Instructions left before the next interrupt/progress check of
     /// normal_step; reloaded with `check_interval` each time it reaches zero.
@@ -877,6 +919,13 @@ pub struct ProgramState {
     /// The interval the countdown was last reloaded with, re-derived from
     /// the progress handler's interval each time the check runs.
     check_interval: u64,
+    /// `check_countdown` when `metrics.vm_steps` was last brought up to
+    /// date. The dispatch loop counts its iterations in the countdown it
+    /// already decrements, so it does not also write a step counter.
+    countdown_at_vm_steps: u64,
+    /// Dispatched instructions that did not finish, because they suspended
+    /// for I/O or failed, plus whatever a status reset discounted.
+    insn_not_completed: u64,
     pub io_completions: Option<IOCompletions>,
     pub pc: InsnReference,
     pub(crate) cursors: Vec<Option<Cursor>>,
@@ -910,6 +959,7 @@ pub struct ProgramState {
     /// Indicate whether an [Insn::Once] instruction at a given program counter position has already been executed, well, once.
     once: SmallVec<[u32; 4]>,
     pub execution_state: ProgramExecutionState,
+    trace_switches: TraceSwitches,
     /// Per-execution statement deadline derived from the connection query timeout.
     /// `None` means no timeout.
     pub query_deadline: Option<crate::MonotonicInstant>,
@@ -1048,6 +1098,8 @@ impl ProgramState {
         Self {
             check_countdown: 1,
             check_interval: MAX_CHECK_INTERVAL,
+            countdown_at_vm_steps: 1,
+            insn_not_completed: 0,
             io_completions: None,
             pc: 0,
             cursors,
@@ -1066,6 +1118,7 @@ impl ProgramState {
             ended_coroutine: vec![],
             once: SmallVec::<[u32; 4]>::new(),
             execution_state: ProgramExecutionState::Init,
+            trace_switches: TraceSwitches::default(),
             query_deadline: None,
             explicit_checkpoint_guard: None,
             parameters: Vec::new(),
@@ -1378,6 +1431,41 @@ impl ProgramState {
         cache.load()
     }
 
+    /// VM steps including the dispatch-loop iterations the countdown has
+    /// taken since `metrics.vm_steps` was last brought up to date.
+    #[inline]
+    pub(crate) fn vm_steps_now(&self) -> u64 {
+        self.metrics.vm_steps.wrapping_add(
+            self.countdown_at_vm_steps
+                .wrapping_sub(self.check_countdown),
+        )
+    }
+
+    /// Instructions that ran to completion.
+    #[inline]
+    pub(crate) fn insn_executed_now(&self) -> u64 {
+        self.metrics
+            .insn_executed
+            .wrapping_add(self.vm_steps_now())
+            .wrapping_sub(self.insn_not_completed)
+    }
+
+    /// Folds the iterations the countdown has taken into `metrics.vm_steps`.
+    #[inline]
+    pub(crate) fn settle_vm_steps(&mut self) {
+        self.metrics.vm_steps = self.vm_steps_now();
+        self.countdown_at_vm_steps = self.check_countdown;
+    }
+
+    /// Writes both derived counters into `metrics`, so a reader can take the
+    /// struct as it stands. Running it twice gives the same answer.
+    #[inline]
+    pub(crate) fn settle_metrics(&mut self) {
+        self.settle_vm_steps();
+        self.metrics.insn_executed = self.insn_executed_now();
+        self.insn_not_completed = self.metrics.vm_steps;
+    }
+
     #[inline]
     pub fn record_rows_read(&mut self, count: u64) {
         self.metrics.rows_read = self.metrics.rows_read.wrapping_add(count);
@@ -1421,7 +1509,8 @@ impl ProgramState {
 
     /// Runs `f` on the metrics of this statement including its active and
     /// cached subprograms, without copying them when there is no subprogram.
-    pub(crate) fn with_metrics<R>(&self, f: impl FnOnce(&StatementMetrics) -> R) -> R {
+    pub(crate) fn with_metrics<R>(&mut self, f: impl FnOnce(&StatementMetrics) -> R) -> R {
+        self.settle_metrics();
         let has_subprograms = matches!(
             self.active_op_state.program_ref(),
             Some(OpProgramState::Step { .. })
@@ -1435,6 +1524,8 @@ impl ProgramState {
 
     pub(crate) fn metrics(&self) -> StatementMetrics {
         let mut metrics = self.metrics.clone();
+        metrics.vm_steps = self.vm_steps_now();
+        metrics.insn_executed = self.insn_executed_now();
         if let Some(OpProgramState::Step { statement, .. }) = self.active_op_state.program_ref() {
             metrics.merge(&statement.metrics());
         }
@@ -1446,6 +1537,8 @@ impl ProgramState {
 
     pub(crate) fn reset_metrics(&mut self) {
         self.metrics.reset();
+        self.countdown_at_vm_steps = self.check_countdown;
+        self.insn_not_completed = 0;
         if let Some(OpProgramState::Step { statement, .. }) = self.active_op_state.program_mut() {
             statement.reset_metrics();
         }
@@ -1460,7 +1553,10 @@ impl ProgramState {
                 self.metrics.fullscan_steps = 0
             }
             crate::statement::StatementStatusCounter::Sort => self.metrics.sort_operations = 0,
-            crate::statement::StatementStatusCounter::VmStep => self.metrics.insn_executed = 0,
+            crate::statement::StatementStatusCounter::VmStep => {
+                self.metrics.insn_executed = 0;
+                self.insn_not_completed = self.vm_steps_now();
+            }
             crate::statement::StatementStatusCounter::Reprepare => self.metrics.reprepares = 0,
             crate::statement::StatementStatusCounter::RowsRead => self.metrics.rows_read = 0,
             crate::statement::StatementStatusCounter::RowsWritten => self.metrics.rows_written = 0,
@@ -1981,6 +2077,9 @@ impl Program {
         waker: Option<&Waker>,
     ) -> Result<StepResult, Box<LimboError>> {
         if let QueryMode::Normal = query_mode {
+            if !matches!(state.execution_state, ProgramExecutionState::Running) {
+                self.start_execution(state);
+            }
             return self.normal_step(state, pager, waker).into();
         }
         state.execution_state = ProgramExecutionState::Running;
@@ -2245,6 +2344,19 @@ impl Program {
         state.pre_op_registers = Some(state.registers.clone());
     }
 
+    /// Marks the statement running and reads the trace switches once.
+    ///
+    /// The level filter answers whether a TRACE span could be recorded at
+    /// all; the traced loop's own `trace!` calls test the subscriber.
+    #[inline(never)]
+    pub(crate) fn start_execution(&self, state: &mut ProgramState) {
+        state.trace_switches = TraceSwitches::new(
+            tracing::level_filters::LevelFilter::current() >= tracing::Level::TRACE,
+            self.connection.get_vdbe_trace(),
+        );
+        state.execution_state = ProgramExecutionState::Running;
+    }
+
     /// Step in [QueryMode::Normal]
     #[inline(always)]
     pub(crate) fn normal_step(
@@ -2253,26 +2365,44 @@ impl Program {
         pager: &Arc<Pager>,
         waker: Option<&Waker>,
     ) -> ProgramStep {
-        state.execution_state = ProgramExecutionState::Running;
-        let enable_tracing = tracing::enabled!(tracing::Level::TRACE);
-        let vdbe_trace = self.connection.get_vdbe_trace();
-        let result = if enable_tracing || vdbe_trace {
-            dispatch_loop_traced(self, state, pager, waker, enable_tracing, vdbe_trace)
+        // The program is already running: `Statement::enter_step` and
+        // `Program::step` start it, and a statement that returns rows comes
+        // through here once per row and would pay the test on each one.
+        debug_assert!(
+            matches!(state.execution_state, ProgramExecutionState::Running),
+            "the interpreter was entered before the program was started"
+        );
+        let switches = state.trace_switches;
+        let result = if unlikely(switches.any()) {
+            dispatch_loop_traced(
+                self,
+                state,
+                pager,
+                waker,
+                switches.tracing(),
+                switches.vdbe_trace(),
+            )
         } else {
             dispatch_loop::<false>(self, state, pager, waker, false, false)
         };
-        match &result {
-            ProgramStep::Row => {}
-            ProgramStep::Done => {
-                state.execution_state = ProgramExecutionState::Done;
+        // A statement that returns rows comes through here once per row, so
+        // the row is tested first and the rest of the match is skipped. Left
+        // as one match, LLVM copies a five instruction jump table to each of
+        // the fifteen places the interpreter returns from, and every row pays
+        // an indirect jump through it.
+        if unlikely(!matches!(result, ProgramStep::Row)) {
+            match &result {
+                ProgramStep::Done => {
+                    state.execution_state = ProgramExecutionState::Done;
+                }
+                ProgramStep::Interrupt => {
+                    state.execution_state = ProgramExecutionState::Interrupted;
+                }
+                ProgramStep::Error(_) => {
+                    state.execution_state = ProgramExecutionState::Failed;
+                }
+                _ => {}
             }
-            ProgramStep::Interrupt => {
-                state.execution_state = ProgramExecutionState::Interrupted;
-            }
-            ProgramStep::Error(_) => {
-                state.execution_state = ProgramExecutionState::Failed;
-            }
-            _ => {}
         }
         return result;
 
@@ -2333,9 +2463,6 @@ impl Program {
                         program.trace_step(state, insn, enable_tracing, vdbe_trace);
                     }
 
-                    // Always increment VM steps for every loop iteration
-                    state.metrics.vm_steps = state.metrics.vm_steps.wrapping_add(1);
-
                     // The opcodes that run once per row of a scan are matched here
                     // so LLVM inlines them into the loop, and each one tests its
                     // own result right after its body, where the result is a
@@ -2345,16 +2472,8 @@ impl Program {
                     macro_rules! step_inline {
                         ($op:path) => {
                             match $op(program, state, insn, pager) {
-                                Ok(InsnFunctionStepResult::Step) => {
-                                    state.metrics.insn_executed =
-                                        state.metrics.insn_executed.wrapping_add(1);
-                                    continue;
-                                }
-                                Ok(InsnFunctionStepResult::Row) => {
-                                    state.metrics.insn_executed =
-                                        state.metrics.insn_executed.wrapping_add(1);
-                                    return ProgramStep::Row;
-                                }
+                                Ok(InsnFunctionStepResult::Step) => continue,
+                                Ok(InsnFunctionStepResult::Row) => return ProgramStep::Row,
                                 other => other,
                             }
                         };
@@ -2384,12 +2503,10 @@ impl Program {
                     // each; the rest settles out of line.
                     if let Ok(InsnFunctionStepResult::Step) = result {
                         // Instruction completed, moving to next
-                        state.metrics.insn_executed = state.metrics.insn_executed.wrapping_add(1);
                         continue;
                     }
                     if let Ok(InsnFunctionStepResult::Row) = result {
                         // Instruction completed (ResultRow already incremented PC)
-                        state.metrics.insn_executed = state.metrics.insn_executed.wrapping_add(1);
                         return ProgramStep::Row;
                     }
                     match dispatch_cold(program, state, pager, waker, result) {
@@ -2409,16 +2526,18 @@ impl Program {
             ) -> Option<ProgramStep> {
                 match result {
                     Ok(InsnFunctionStepResult::Done) => {
-                        // Instruction completed execution
-                        state.metrics.insn_executed = state.metrics.insn_executed.wrapping_add(1);
                         state.auto_txn_cleanup = TxnCleanup::None;
                         Some(ProgramStep::Done)
                     }
                     Ok(InsnFunctionStepResult::IO) => {
+                        state.insn_not_completed = state.insn_not_completed.wrapping_add(1);
                         let io = state.take_suspended_io();
                         program.park_on_io(state, io, waker)
                     }
-                    Err(boxed_err) => program.fail_step(state, pager, *boxed_err),
+                    Err(boxed_err) => {
+                        state.insn_not_completed = state.insn_not_completed.wrapping_add(1);
+                        program.fail_step(state, pager, *boxed_err)
+                    }
                     Ok(InsnFunctionStepResult::Step) | Ok(InsnFunctionStepResult::Row) => {
                         unreachable!("the dispatch loop settles steps and rows itself")
                     }
@@ -2531,6 +2650,7 @@ impl Program {
 
     #[inline(never)]
     fn periodic_checks(&self, state: &mut ProgramState, pager: &Arc<Pager>) -> Option<ProgramStep> {
+        state.settle_vm_steps();
         let progress_ops = self.connection.progress_ops();
         state.check_interval = if progress_ops == 0 || progress_ops >= MAX_CHECK_INTERVAL {
             MAX_CHECK_INTERVAL
@@ -2538,6 +2658,7 @@ impl Program {
             progress_ops
         };
         state.check_countdown = state.check_interval;
+        state.countdown_at_vm_steps = state.check_interval;
         if self.connection.is_closed() {
             return Some(ProgramStep::Error(self.closed_during_step(pager)));
         }
@@ -3878,18 +3999,20 @@ impl<'a> ValueIteratorExt for crate::types::ValueIterator<'a> {
         let mut header = self.header_section_ref();
         let mut data = self.data_section_ref();
         skip_serial_types(&mut header, &mut data, skip)?;
-        let mut decoded = 0;
-        for dest in dests.iter_mut() {
-            if header.is_empty() {
+        // The count comes from what the iterator has left, so the loop does
+        // not keep a counter in a register it does not have to spare.
+        let wanted = dests.len();
+        let mut rest = dests.iter_mut();
+        while !header.is_empty() {
+            let Some(dest) = rest.next() else {
                 break;
-            }
+            };
             let serial_type = read_serial_type(&mut header)?;
             decode_serial_type_into_register(serial_type, &mut data, dest)?;
-            decoded += 1;
         }
         self.set_header_section(header);
         self.set_data_section(data);
-        Ok(decoded)
+        Ok(wanted - rest.len())
     }
 }
 
@@ -3918,11 +4041,41 @@ fn skip_serial_types(header: &mut &[u8], data: &mut &[u8], n: usize) -> Result<(
 }
 
 /// Reads the serial type at the front of `header` and moves past it.
+///
+/// Almost every serial type is one byte, and moving past a known one byte
+/// costs two instructions where moving past a variable count costs a
+/// compare, a branch and two adds.
 #[inline(always)]
 fn read_serial_type(header: &mut &[u8]) -> Result<u64> {
-    let (serial_type, bytes_read) = read_varint(header)?;
-    *header = &header[bytes_read..];
+    let bytes = *header;
+    if let Some((first, rest)) = bytes.split_first() {
+        if *first < 0x80 {
+            *header = rest;
+            return Ok(u64::from(*first));
+        }
+    }
+    let (serial_type, bytes_read) = read_varint(bytes)?;
+    *header = &bytes[bytes_read..];
     Ok(serial_type)
+}
+
+/// Puts a TEXT value in a register that does not hold text yet.
+#[cold]
+#[inline(never)]
+fn start_text_register(dest: &mut Register, text_data: &[u8]) -> Result<()> {
+    use crate::types::Text;
+    let text_str = crate::storage::sqlite3_ondisk::read_text(text_data)?;
+    dest.set_text(Text::new(text_str.to_string()))
+}
+
+/// Puts a BLOB value in a register that does not hold a blob yet.
+#[cold]
+#[inline(never)]
+fn start_blob_register(dest: &mut Register, blob_data: &[u8]) -> Result<()> {
+    crate::with_value_blob_allocation_site!(RecordDecode, {
+        let blob = crate::types::value_blob_from_slice(blob_data)?;
+        dest.set_blob(blob)
+    })
 }
 
 /// Decodes the value of `serial_type` at the front of `data` into `dest`
@@ -3933,7 +4086,40 @@ fn decode_serial_type_into_register(
     data: &mut &[u8],
     dest: &mut Register,
 ) -> Result<()> {
-    use crate::types::{Extendable, Text};
+    use crate::types::Extendable;
+    // A record of user data is mostly TEXT and BLOB, and both share the
+    // content size and the bounds check.
+    if serial_type >= 12 {
+        let content_size = ((serial_type - 12) >> 1) as usize;
+        if unlikely(data.len() < content_size) {
+            mark_unlikely();
+            return Err(LimboError::Corrupt(if serial_type & 1 == 1 {
+                "Invalid Text value".into()
+            } else {
+                "Invalid Blob value".into()
+            }));
+        }
+        let content = &data[..content_size];
+        *data = &data[content_size..];
+        if serial_type & 1 == 1 {
+            match dest {
+                Register::Value(Value::Text(existing_text)) => {
+                    existing_text.copy_from_record_bytes(content)?;
+                }
+                _ => start_text_register(dest, content)?,
+            }
+            return Ok(());
+        }
+        return crate::with_value_blob_allocation_site!(RecordDecode, {
+            match dest {
+                Register::Value(Value::Blob(existing_blob)) => {
+                    existing_blob.do_extend(&content)?;
+                }
+                _ => start_blob_register(dest, content)?,
+            }
+            Ok(())
+        });
+    }
     match serial_type {
         // NULL
         0 => {
@@ -4030,42 +4216,6 @@ fn decode_serial_type_into_register(
                 "Reserved serial type: {serial_type}"
             )));
         }
-        // BLOB (n >= 12 && n & 1 == 0)
-        n if n >= 12 && n & 1 == 0 => crate::with_value_blob_allocation_site!(RecordDecode, {
-            let content_size = ((n - 12) / 2) as usize;
-            if unlikely(data.len() < content_size) {
-                return Err(LimboError::Corrupt("Invalid Blob value".into()));
-            }
-            let blob_data = &data[..content_size];
-            match dest {
-                Register::Value(Value::Blob(existing_blob)) => {
-                    existing_blob.do_extend(&blob_data)?;
-                }
-                _ => {
-                    let blob = crate::types::value_blob_from_slice(blob_data)?;
-                    dest.set_blob(blob)?;
-                }
-            }
-            *data = &data[content_size..];
-        }),
-        // TEXT (n >= 13 && n & 1 == 1)
-        n if n >= 13 && n & 1 == 1 => {
-            let content_size = ((n - 13) / 2) as usize;
-            if unlikely(data.len() < content_size) {
-                return Err(LimboError::Corrupt("Invalid Text value".into()));
-            }
-            let text_data = &data[..content_size];
-            let text_str = crate::storage::sqlite3_ondisk::read_text(text_data)?;
-            match dest {
-                Register::Value(Value::Text(existing_text)) => {
-                    existing_text.do_extend(&text_str)?;
-                }
-                _ => {
-                    dest.set_text(Text::new(text_str.to_string()))?;
-                }
-            }
-            *data = &data[content_size..];
-        }
         _ => {
             mark_unlikely();
             return Err(LimboError::Corrupt(format!(
@@ -4092,6 +4242,50 @@ mod tests {
     }
 
     #[test]
+    fn an_active_opcode_state_is_built_once_and_then_handed_back() {
+        use crate::vdbe::execute::OpRowIdState;
+        let mut slot = ActiveOpStateSlot::default();
+        assert!(slot.is_idle());
+        assert!(matches!(slot.row_id(), OpRowIdState::Start));
+        assert!(!slot.is_idle());
+        *slot.row_id() = OpRowIdState::Seek {
+            rowid: 7,
+            table_cursor_id: 3,
+        };
+        assert!(matches!(
+            slot.row_id(),
+            OpRowIdState::Seek {
+                rowid: 7,
+                table_cursor_id: 3
+            }
+        ));
+        slot.clear();
+        assert!(slot.is_idle());
+        assert!(matches!(slot.row_id(), OpRowIdState::Start));
+    }
+
+    #[test]
+    #[should_panic(expected = "active opcode state mismatch")]
+    fn an_active_opcode_state_of_another_opcode_is_never_overwritten() {
+        let mut slot = ActiveOpStateSlot::default();
+        slot.row_id();
+        slot.column();
+    }
+
+    #[test]
+    fn trace_switches_hold_both_answers_in_one_byte() {
+        for tracing in [false, true] {
+            for vdbe_trace in [false, true] {
+                let switches = TraceSwitches::new(tracing, vdbe_trace);
+                assert_eq!(switches.tracing(), tracing);
+                assert_eq!(switches.vdbe_trace(), vdbe_trace);
+                assert_eq!(switches.any(), tracing || vdbe_trace);
+            }
+        }
+        assert!(!TraceSwitches::default().any());
+    }
+
+    #[test]
     fn normal_step_preserves_execution_state_with_and_without_tracing() {
         for trace in [false, true] {
             let io = Arc::new(crate::MemoryIO::new());
@@ -4104,6 +4298,8 @@ mod tests {
             assert!(matches!(stmt.step().unwrap(), StepResult::Row));
             assert_eq!(stmt.execution_state(), ProgramExecutionState::Running);
             assert!(matches!(stmt.step().unwrap(), StepResult::Row));
+            assert!(matches!(stmt.step().unwrap(), StepResult::Done));
+            assert_eq!(stmt.execution_state(), ProgramExecutionState::Done);
             assert!(matches!(stmt.step().unwrap(), StepResult::Done));
             assert_eq!(stmt.execution_state(), ProgramExecutionState::Done);
 
@@ -4119,6 +4315,70 @@ mod tests {
     }
 
     #[test]
+    fn instruction_counters_hold_when_they_are_derived() {
+        use crate::statement::StatementStatusCounter;
+
+        let io = Arc::new(crate::MemoryIO::new());
+        let db =
+            crate::Database::open_file(io, ":memory:", Arc::new(crate::SqliteDialect)).unwrap();
+        let conn = db.connect().unwrap();
+        conn.execute("CREATE TABLE t(x)").unwrap();
+        conn.execute("INSERT INTO t VALUES (1),(2),(3)").unwrap();
+
+        let mut stmt = conn.prepare("SELECT x FROM t").unwrap();
+        stmt.run_ignore_rows().unwrap();
+        let after_one = stmt.metrics();
+        assert!(after_one.insn_executed > 0);
+        assert!(after_one.vm_steps >= after_one.insn_executed);
+
+        // A second run of the same program doubles the count of completed
+        // instructions, whatever I/O the first run had to wait for.
+        stmt.reset().unwrap();
+        stmt.run_ignore_rows().unwrap();
+        assert_eq!(stmt.metrics().insn_executed, after_one.insn_executed * 2);
+        assert_eq!(
+            stmt.stmt_status(StatementStatusCounter::VmStep),
+            after_one.insn_executed * 2
+        );
+
+        // Resetting the status counter zeroes it, and it counts again.
+        stmt.reset().unwrap();
+        stmt.reset_stmt_status(StatementStatusCounter::VmStep);
+        assert_eq!(stmt.stmt_status(StatementStatusCounter::VmStep), 0);
+        stmt.run_ignore_rows().unwrap();
+        assert_eq!(
+            stmt.stmt_status(StatementStatusCounter::VmStep),
+            after_one.insn_executed
+        );
+
+        stmt.reset_metrics();
+        assert_eq!(stmt.metrics().vm_steps, 0);
+        assert_eq!(stmt.metrics().insn_executed, 0);
+    }
+
+    #[test]
+    fn instruction_counters_hold_across_a_progress_check() {
+        use crate::statement::StatementStatusCounter;
+
+        let io = Arc::new(crate::MemoryIO::new());
+        let db =
+            crate::Database::open_file(io, ":memory:", Arc::new(crate::SqliteDialect)).unwrap();
+        let conn = db.connect().unwrap();
+        // A handler that never interrupts still reloads the countdown every
+        // few instructions, which is where the derived step count settles.
+        conn.set_progress_handler(4, Some(Box::new(|| false)));
+        let mut stmt = conn
+            .prepare("WITH RECURSIVE t(x) AS (VALUES(1) UNION ALL SELECT x+1 FROM t WHERE x<200) SELECT sum(x) FROM t")
+            .unwrap();
+        stmt.run_ignore_rows().unwrap();
+        let first = stmt.stmt_status(StatementStatusCounter::VmStep);
+        assert!(first > 200);
+        stmt.reset().unwrap();
+        stmt.run_ignore_rows().unwrap();
+        assert_eq!(stmt.stmt_status(StatementStatusCounter::VmStep), first * 2);
+    }
+
+    #[test]
     fn active_opcode_helpers_initialize_defaults() {
         let mut state = ProgramState::new(1, 0);
 
@@ -4129,6 +4389,208 @@ mod tests {
         ));
         state.active_op_state.clear();
         assert!(state.active_op_state.parse_schema().is_none());
+    }
+
+    /// Builds a record payload holding one TEXT value of `value`.
+    fn one_text_record(value: &[u8]) -> Vec<u8> {
+        use crate::storage::sqlite3_ondisk::write_varint_to_vec;
+        let mut header_body = Vec::new();
+        write_varint_to_vec(13 + 2 * value.len() as u64, &mut header_body);
+        let mut payload = Vec::new();
+        write_varint_to_vec(header_body.len() as u64 + 1, &mut payload);
+        payload.extend_from_slice(&header_body);
+        payload.extend_from_slice(value);
+        payload
+    }
+
+    fn three_value_record() -> Vec<u8> {
+        use crate::storage::sqlite3_ondisk::write_varint_to_vec;
+        let mut header_body = Vec::new();
+        write_varint_to_vec(1, &mut header_body);
+        write_varint_to_vec(1, &mut header_body);
+        write_varint_to_vec(1, &mut header_body);
+        let mut payload = Vec::new();
+        write_varint_to_vec(header_body.len() as u64 + 1, &mut payload);
+        payload.extend_from_slice(&header_body);
+        payload.extend_from_slice(&[7u8, 8, 9]);
+        payload
+    }
+
+    #[test]
+    fn a_record_shorter_than_the_registers_reports_what_it_filled() {
+        let payload = three_value_record();
+        for skip in 0..=3usize {
+            for room in 0..=5usize {
+                let mut registers = vec![Register::Value(Value::Null); room];
+                let mut iterator = crate::types::ValueIterator::new(&payload).unwrap();
+                let filled = iterator
+                    .decode_into_registers_after(skip, &mut registers)
+                    .unwrap();
+                assert_eq!(filled, room.min(3 - skip.min(3)), "skip={skip} room={room}");
+                for (index, register) in registers.iter().take(filled).enumerate() {
+                    let expected = 7 + (skip + index) as i64;
+                    assert!(
+                        matches!(register, Register::Value(Value::Numeric(Numeric::Integer(v))) if *v == expected),
+                        "skip={skip} room={room} index={index} got {register:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    fn decode_one_text(payload: &[u8], destination: &mut Register) -> Result<()> {
+        let mut iterator = crate::types::ValueIterator::new(payload)?;
+        iterator
+            .nth_into_register(0, destination)
+            .expect("record contains one value")
+    }
+
+    fn register_text(destination: &Register) -> &str {
+        match destination {
+            Register::Value(Value::Text(text)) => text.as_str(),
+            other => panic!("expected text, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn text_decode_into_a_reused_register_keeps_every_length() {
+        let mut destination = Register::Value(Value::Null);
+        // Grow the buffer first so later values take the reuse path. The
+        // range covers the two-word copy, the word loop and the lengths
+        // above both of them.
+        let long: Vec<u8> = (0..80usize).map(|i| b'a' + (i % 26) as u8).collect();
+        decode_one_text(&one_text_record(&long), &mut destination).unwrap();
+        assert_eq!(register_text(&destination).len(), 80);
+
+        for len in 0..=80usize {
+            let value: Vec<u8> = (0..len).map(|i| b'A' + (i % 26) as u8).collect();
+            decode_one_text(&one_text_record(&value), &mut destination).unwrap();
+            assert_eq!(
+                register_text(&destination).as_bytes(),
+                value.as_slice(),
+                "length {len}"
+            );
+        }
+    }
+
+    #[test]
+    fn text_decode_into_a_reused_register_keeps_multibyte_utf8() {
+        let mut destination = Register::Value(Value::Null);
+        decode_one_text(&one_text_record(b"aaaaaaaaaaaaaaaa"), &mut destination).unwrap();
+
+        for value in [
+            "é",
+            "héllo",
+            "日本語",
+            "\u{1F600}",
+            "aé",
+            "ααααααααα",
+            "ααααααααααααααααααααααααααααααααααα",
+        ] {
+            decode_one_text(&one_text_record(value.as_bytes()), &mut destination).unwrap();
+            assert_eq!(register_text(&destination), value);
+        }
+    }
+
+    /// Builds a record payload holding one value of `serial_type`.
+    fn one_value_record(serial_type: u64, value: &[u8]) -> Vec<u8> {
+        use crate::storage::sqlite3_ondisk::write_varint_to_vec;
+        let mut header_body = Vec::new();
+        write_varint_to_vec(serial_type, &mut header_body);
+        let mut payload = Vec::new();
+        write_varint_to_vec(header_body.len() as u64 + 1, &mut payload);
+        payload.extend_from_slice(&header_body);
+        payload.extend_from_slice(value);
+        payload
+    }
+
+    #[test]
+    fn blob_decode_into_a_reused_register_keeps_every_length() {
+        let mut destination = Register::Value(Value::Null);
+        let long: Vec<u8> = (0..80u8).collect();
+        decode_one_text(&one_value_record(12 + 2 * 80, &long), &mut destination).unwrap();
+
+        for len in 0..=80usize {
+            let value: Vec<u8> = (0..len as u8).map(|i| i.wrapping_mul(7)).collect();
+            decode_one_text(
+                &one_value_record(12 + 2 * len as u64, &value),
+                &mut destination,
+            )
+            .unwrap();
+            match &destination {
+                Register::Value(Value::Blob(blob)) => {
+                    assert_eq!(blob.as_slice(), value.as_slice(), "length {len}")
+                }
+                other => panic!("expected blob, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn text_decode_reads_a_serial_type_that_needs_two_varint_bytes() {
+        let mut destination = Register::Value(Value::Null);
+        // 200 bytes of text gives serial type 413, which is two varint bytes.
+        let value: Vec<u8> = (0..200usize).map(|i| b'a' + (i % 26) as u8).collect();
+        decode_one_text(&one_text_record(&value), &mut destination).unwrap();
+        assert_eq!(register_text(&destination).as_bytes(), value.as_slice());
+
+        // And the register takes a one-byte serial type afterwards.
+        decode_one_text(&one_text_record(b"short"), &mut destination).unwrap();
+        assert_eq!(register_text(&destination), "short");
+    }
+
+    #[test]
+    fn record_decode_rejects_reserved_serial_types() {
+        for serial_type in [10u64, 11] {
+            let mut destination = Register::Value(Value::Null);
+            let result = decode_one_text(&one_value_record(serial_type, &[]), &mut destination);
+            assert!(
+                matches!(
+                    result,
+                    Err(LimboError::Corrupt(ref message))
+                        if message == &format!("Reserved serial type: {serial_type}")
+                ),
+                "unexpected result for {serial_type}: {result:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn record_decode_rejects_a_value_longer_than_the_data_section() {
+        for (serial_type, message) in [
+            (13 + 2 * 5, "Invalid Text value"),
+            (12 + 2 * 5, "Invalid Blob value"),
+        ] {
+            let mut destination = Register::Value(Value::Null);
+            let result = decode_one_text(&one_value_record(serial_type, b"ab"), &mut destination);
+            assert!(
+                matches!(
+                    result,
+                    Err(LimboError::Corrupt(ref actual)) if actual == message
+                ),
+                "unexpected result for {serial_type}: {result:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn text_decode_rejects_invalid_utf8_and_leaves_the_register_usable() {
+        let mut destination = Register::Value(Value::Null);
+        decode_one_text(&one_text_record(b"aaaaaaaa"), &mut destination).unwrap();
+
+        let result = decode_one_text(&one_text_record(&[0xff, 0xfe]), &mut destination);
+        assert!(
+            matches!(
+                result,
+                Err(LimboError::Corrupt(ref message))
+                    if message == "TEXT value contains invalid UTF-8"
+            ),
+            "unexpected result: {result:?}"
+        );
+        // The register must still hold a valid string, and take new values.
+        let _ = register_text(&destination);
+        decode_one_text(&one_text_record(b"ok"), &mut destination).unwrap();
+        assert_eq!(register_text(&destination), "ok");
     }
 
     #[test]
