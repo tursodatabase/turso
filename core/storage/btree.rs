@@ -6475,10 +6475,19 @@ impl BTreeCursor {
     /// peer-deleted cursor is still recoverable via Rewind/Seek, whereas our
     /// Invalid is reserved for cursors that can never be repositioned.
     #[cfg_attr(debug_assertions, instrument(skip_all, level = Level::DEBUG))]
+    /// The test stays inline and the work goes out of line, because most calls
+    /// have nothing to restore and would otherwise pay a call, a prologue and
+    /// an epilogue to learn that. A backwards scan asks this for every row.
+    #[inline(always)]
     fn restore_context(&mut self) -> IOResultOr<()> {
         if !self.needs_restore() {
             return Ok(IOResult::Done(()));
         }
+        self.restore_saved_position()
+    }
+
+    #[inline(never)]
+    fn restore_saved_position(&mut self) -> IOResultOr<()> {
         if let CursorValidState::RequireAdvance(direction) = self.valid_state {
             return_if_io!(match direction {
                 // Avoid calling next()/prev() directly because they immediately call restore_context()
