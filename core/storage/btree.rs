@@ -6793,10 +6793,25 @@ impl CursorTrait for BTreeCursor {
             cursor.rowid()
         }
 
+        /// The rowid an index key carries is its last value. Reading it
+        /// from the cell's bytes leaves the record where it is; asking for
+        /// the record instead copies the whole key off the page first, and
+        /// an index scan asks once per row.
         #[inline(never)]
         fn index_rowid(cursor: &mut BTreeCursor) -> IOResultOr<Option<i64>> {
-            let _ = return_if_io!(cursor.record());
-            Ok(IOResult::Done(cursor.get_index_rowid_from_record()))
+            if !cursor.has_rowid() {
+                return Ok(IOResult::Done(None));
+            }
+            let Some(payload) = return_if_io!(cursor.record_payload()) else {
+                return Ok(IOResult::Done(None));
+            };
+            let rowid = match crate::types::ValueIterator::new(payload)?.last() {
+                Some(Ok(ValueRef::Numeric(Numeric::Integer(rowid)))) => rowid,
+                _ => unreachable!(
+                    "index where has_rowid() is true should have an integer rowid as the last value"
+                ),
+            };
+            Ok(IOResult::Done(Some(rowid)))
         }
     }
 
