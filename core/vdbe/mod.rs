@@ -2482,6 +2482,12 @@ impl Program {
                         Insn::Multiply { .. } => step_inline!(execute::op_multiply),
                         Insn::Divide { .. } => step_inline!(execute::op_divide),
                         Insn::Remainder { .. } => step_inline!(execute::op_remainder),
+                        Insn::Variable { .. } => step_inline!(execute::op_variable),
+                        Insn::NotNull { .. } => step_inline!(execute::op_not_null),
+                        Insn::SoftNull { .. } => step_inline!(execute::op_soft_null),
+                        Insn::HaltIfNull { .. } => step_inline!(execute::op_halt_if_null),
+                        Insn::MustBeInt { .. } => step_inline!(execute::op_must_be_int),
+                        Insn::Affinity { .. } => step_inline!(execute::op_affinity),
                         _ => insn.to_function()(program, state, insn, pager),
                     };
                     // The two outcomes of every row are tested here, one compare
