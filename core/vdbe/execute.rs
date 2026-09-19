@@ -12655,8 +12655,12 @@ pub fn op_insert(
                                 unreachable!("Cannot insert an aggregate value.")
                             }
                         };
-                        let existing_record = return_if_io!(state, cursor.record());
-                        if existing_record.is_some_and(|r| r == record.as_ref()) {
+                        // The payload bytes, not the record: `record` copies
+                        // the cell into the cursor's reusable record before the
+                        // comparison, and comparing two records goes through a
+                        // Value and a ValueRef to reach the same bytes.
+                        let existing_payload = return_if_io!(state, cursor.record_payload());
+                        if existing_payload.is_some_and(|p| p == record.as_ref().get_payload()) {
                             state.active_op_state.insert().is_noop_update = true;
                         }
                     }
