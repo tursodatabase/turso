@@ -2477,6 +2477,11 @@ impl Program {
                         Insn::Gosub { .. } => step_inline!(execute::op_gosub),
                         Insn::Return { .. } => step_inline!(execute::op_return),
                         Insn::Integer { .. } => step_inline!(execute::op_integer),
+                        Insn::Add { .. } => step_inline!(execute::op_add),
+                        Insn::Subtract { .. } => step_inline!(execute::op_subtract),
+                        Insn::Multiply { .. } => step_inline!(execute::op_multiply),
+                        Insn::Divide { .. } => step_inline!(execute::op_divide),
+                        Insn::Remainder { .. } => step_inline!(execute::op_remainder),
                         _ => insn.to_function()(program, state, insn, pager),
                     };
                     // The two outcomes of every row are tested here, one compare
