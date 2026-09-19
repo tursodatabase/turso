@@ -147,8 +147,11 @@ mod page_inner {
         buffer: Option<Arc<Buffer>>,
         /// Start and length of the bytes of `buffer`, kept next to it so a page
         /// read does not go through the `Option`, the `Arc` and the `Buffer`
-        /// variant on every access. Null and 0 while `buffer` is `None`.
-        data_ptr: *mut u8,
+        /// variant on every access. Dangling with a length of 0 while `buffer`
+        /// is `None`, so that building the slice needs no test: an unloaded
+        /// page hands out an empty slice and every read of it is caught by the
+        /// slice bounds check.
+        data_ptr: std::ptr::NonNull<u8>,
         data_len: usize,
         /// Overflow cells during btree operations
         pub overflow_cells: crate::alloc::Vec<OverflowCell>,
@@ -183,7 +186,7 @@ mod page_inner {
                 pin_count: AtomicUsize::new(0),
                 wal_tag: AtomicU64::new(TAG_UNSET),
                 buffer: None,
-                data_ptr: std::ptr::null_mut(),
+                data_ptr: std::ptr::NonNull::dangling(),
                 data_len: 0,
                 overflow_cells: crate::alloc::vec![],
             }
@@ -197,14 +200,15 @@ mod page_inner {
 
         /// Installs the page data buffer.
         pub fn set_buffer(&mut self, buffer: Arc<Buffer>) {
-            self.data_ptr = buffer.as_mut_ptr();
+            self.data_ptr = std::ptr::NonNull::new(buffer.as_mut_ptr())
+                .expect("a page buffer is never at address zero");
             self.data_len = buffer.len();
             self.buffer = Some(buffer);
         }
 
         /// Removes the page data buffer, leaving the page unloaded.
         pub fn take_buffer(&mut self) -> Option<Arc<Buffer>> {
-            self.data_ptr = std::ptr::null_mut();
+            self.data_ptr = std::ptr::NonNull::dangling();
             self.data_len = 0;
             self.buffer.take()
         }
@@ -213,13 +217,13 @@ mod page_inner {
         #[inline(always)]
         #[allow(clippy::mut_from_ref)]
         pub fn as_ptr(&self) -> &mut [u8] {
-            turso_assert!(!self.data_ptr.is_null(), "buffer not loaded");
             // SAFETY: `data_ptr`/`data_len` describe the bytes of the `Arc<Buffer>`
             // held in `self.buffer`, which stays alive and does not move while it is
-            // installed. Handing out `&mut [u8]` from `&self` mirrors
+            // installed, and `data_ptr` is dangling with `data_len` 0 while there is
+            // no buffer. Handing out `&mut [u8]` from `&self` mirrors
             // `Buffer::as_mut_slice`; the page byte range is mutated only under the
             // pager's own exclusion rules, as before.
-            unsafe { std::slice::from_raw_parts_mut(self.data_ptr, self.data_len) }
+            unsafe { std::slice::from_raw_parts_mut(self.data_ptr.as_ptr(), self.data_len) }
         }
 
         /// The position where page content starts. It's 100 for page 1 (database file header is 100 bytes),
