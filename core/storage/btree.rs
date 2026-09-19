@@ -73,10 +73,14 @@ const STACK_ALLOC_KEY_VALS_MAX: usize = 16;
 
 /// Appends `value` to a cell payload as a varint.
 ///
+/// Inline, because the error type makes `Result<()>` 48 bytes and a call would
+/// answer through a memory return slot twice for every cell written.
+///
 /// The one- and two-byte cases write their bytes straight in. They cover every
 /// payload size a page can hold and every rowid below 16,384, and going the long
 /// way round costs a zeroed nine-byte array, a call to `write_varint` and a
 /// slice copy for one or two bytes.
+#[inline(always)]
 fn write_varint_to_vec(value: u64, payload: &mut crate::alloc::Vec<u8>) -> Result<()> {
     if value <= 0x7f {
         crate::with_btree_allocation_site!(CellPayload, payload.try_push(value as u8))?;
