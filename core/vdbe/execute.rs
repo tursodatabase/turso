@@ -479,6 +479,7 @@ pub fn op_init(
     Ok(InsnFunctionStepResult::Step)
 }
 
+#[inline(always)]
 pub fn op_add(
     _program: &Program,
     state: &mut ProgramState,
@@ -494,6 +495,7 @@ pub fn op_add(
     op_add_not_two_integers(state, *lhs, *rhs, *dest)
 }
 
+#[inline(always)]
 pub fn op_subtract(
     _program: &Program,
     state: &mut ProgramState,
@@ -509,6 +511,7 @@ pub fn op_subtract(
     op_subtract_not_two_integers(state, *lhs, *rhs, *dest)
 }
 
+#[inline(always)]
 pub fn op_multiply(
     _program: &Program,
     state: &mut ProgramState,
@@ -625,6 +628,7 @@ fn integer_operands(state: &ProgramState, lhs: usize, rhs: usize) -> Option<(i64
     }
 }
 
+#[inline(always)]
 pub fn op_divide(
     _program: &Program,
     state: &mut ProgramState,
@@ -664,6 +668,7 @@ pub fn op_drop_index(
     Ok(InsnFunctionStepResult::Step)
 }
 
+#[inline(always)]
 pub fn op_remainder(
     _program: &Program,
     state: &mut ProgramState,
