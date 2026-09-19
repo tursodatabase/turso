@@ -120,11 +120,17 @@ pub struct AllocationSiteGuard {
 }
 
 impl Drop for AllocationSiteGuard {
+    #[inline(always)]
     fn drop(&mut self) {
         CURRENT_ALLOCATION_SITE.with(|slot| slot.set(self.previous));
     }
 }
 
+/// Every record built and every sorter key written passes through here, from
+/// several codegen units. Without the attribute the compiler leaves it as a
+/// call from all but its own unit, and then the thread-local read and the
+/// closure around it stay as written.
+#[inline(always)]
 pub fn enter_allocation_site(site: impl Into<AllocationSite>) -> AllocationSiteGuard {
     let site = site.into();
     let previous = CURRENT_ALLOCATION_SITE.with(|slot| {
@@ -140,6 +146,7 @@ pub fn enter_allocation_site(site: impl Into<AllocationSite>) -> AllocationSiteG
     AllocationSiteGuard { previous }
 }
 
+#[inline(always)]
 pub fn current_allocation_site() -> Option<AllocationSite> {
     CURRENT_ALLOCATION_SITE.with(Cell::get)
 }
