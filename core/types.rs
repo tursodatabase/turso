@@ -1333,6 +1333,10 @@ mod immutable_record {
         }
     }
 
+    /// Enough zeroes for the records that fit in one store of each half of a
+    /// 32-byte register.
+    pub(crate) const ZEROED_PREFIX: [u8; 32] = [0; 32];
+
     /// [`write_varint`] with the one-byte case inline.
     #[inline(always)]
     fn write_short_varint(out: &mut [u8], value: u64) -> usize {
@@ -1821,8 +1825,16 @@ mod immutable_record {
 
             let header_size = Record::calc_header_size(size_header);
             let total_size = header_size + size_values;
-            buf.try_reserve_exact(total_size)?;
-            buf.resize(total_size, 0);
+            buf.try_reserve_exact(total_size.max(ZEROED_PREFIX.len()))?;
+            // A constant-length extend is an inlined store of the whole array.
+            // Sizing the buffer with a variable length instead costs a call into
+            // libc's memset, whose fixed overhead dwarfs a row's worth of bytes.
+            if total_size <= ZEROED_PREFIX.len() {
+                buf.extend_from_slice(&ZEROED_PREFIX);
+                buf.truncate(total_size);
+            } else {
+                buf.resize(total_size, 0);
+            }
 
             // Writing pass: each serial type goes into the header and each
             // value after it, the varints straight into their place.
@@ -4983,6 +4995,27 @@ mod tests {
             assert_eq!(
                 cnt, num_values,
                 "column_count should be {num_values}, not {cnt}"
+            );
+        }
+    }
+
+    #[test]
+    fn record_round_trips_across_the_inline_zero_boundary() {
+        // The record buffer is zeroed with one constant-length store while the
+        // record fits in ZEROED_PREFIX and with a sized fill above it, so the
+        // two paths meet at its length.
+        for text_len in 0..=(immutable_record::ZEROED_PREFIX.len() + 4) {
+            let values = vec![
+                Value::from_i64(-1),
+                Value::build_text("x".repeat(text_len)),
+                Value::from_f64(0.5),
+            ];
+            let record = ImmutableRecord::from_values(&values, values.len()).unwrap();
+            assert_eq!(record.column_count(), 3, "text_len={text_len}");
+            assert_eq!(
+                record.get_values_owned().unwrap(),
+                values,
+                "text_len={text_len}"
             );
         }
     }
