@@ -1066,6 +1066,13 @@ pub struct ProgramState {
     /// the statement subtransactionwill roll back.
     fk_immediate_violations_during_stmt: AtomicIsize,
     uses_subjournal: bool,
+    /// Whether the connection's schema holds any materialized view, read the
+    /// first time an `Insert` asks and kept for the rest of the execution.
+    /// `Insert` asks for every row it writes whether the table it writes has a
+    /// dependent view, and asking takes the connection's schema lock — two
+    /// locked instructions per row for an answer that no statement holding a
+    /// write transaction can see change.
+    schema_has_materialized_views: Option<bool>,
     /// Whether this statement is an active write inside an explicit transaction.
     pub(crate) is_active_write: bool,
     /// Whether begin_statement was called (savepoint + FK bookkeeping active).
@@ -1158,6 +1165,7 @@ impl ProgramState {
             hash_tables: HashMap::default(),
             ephemeral_temp_files: HashMap::default(),
             uses_subjournal: false,
+            schema_has_materialized_views: None,
             is_active_write: false,
             has_stmt_transaction: false,
             attached_savepoint_pagers: Vec::new(),
@@ -1321,6 +1329,7 @@ impl ProgramState {
             self.ephemeral_temp_files.clear();
         }
         self.uses_subjournal = false;
+        self.schema_has_materialized_views = None;
         self.is_active_write = false;
         self.has_stmt_transaction = false;
         self.distinct_key_values.clear();

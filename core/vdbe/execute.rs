@@ -12521,7 +12521,19 @@ pub fn op_insert(
     loop {
         match state.active_op_state.insert().sub_state {
             OpInsertSubState::MaybeCaptureRecord => {
-                let has_dependent_views = {
+                // Whether the schema holds any materialized view at all is read
+                // once per execution. Without that, every row written takes the
+                // connection's schema lock — two locked instructions — to reach
+                // an empty map.
+                let any_materialized_views = match state.schema_has_materialized_views {
+                    Some(any) => any,
+                    None => {
+                        let any = program.connection.schema.read().has_materialized_views();
+                        state.schema_has_materialized_views = Some(any);
+                        any
+                    }
+                };
+                let has_dependent_views = any_materialized_views && {
                     let schema = program.connection.schema.read();
                     !schema
                         .get_dependent_materialized_views(table_name)
