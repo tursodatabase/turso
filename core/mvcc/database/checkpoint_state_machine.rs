@@ -897,20 +897,21 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
         self.pending_rootmap_ops.clear();
         self.pending_alloc_roots.clear();
 
-        if self.lock_states.pager_write_tx {
+        if self.lock_states.pager_write_tx && !self.pager_commit_done {
             self.pager.rollback_tx(self.connection.as_ref());
             if self.update_transaction_state {
                 self.connection.set_tx_state(TransactionState::None);
             }
             self.lock_states.pager_write_tx = false;
             self.lock_states.pager_read_tx = false;
-        } else if self.lock_states.pager_read_tx {
+        } else if self.lock_states.pager_read_tx && !self.pager_commit_done {
             self.pager.end_read_tx();
             if self.update_transaction_state {
                 self.connection.set_tx_state(TransactionState::None);
             }
             self.lock_states.pager_read_tx = false;
         }
+
 
         // MVCC checkpointing drives WAL checkpoint directly; on errors we must
         // explicitly reset both pager and WAL checkpoint states.
@@ -2810,11 +2811,13 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
                     )? {
                         IOResult::Done(_) => {
                             self.pager_commit_done = true;
-                            self.lock_states.pager_read_tx = false;
                             self.lock_states.pager_write_tx = false;
+                            self.lock_states.pager_read_tx = false;
                         }
+
                         IOResult::IO(io) => return Ok(TransitionResult::Io(io)),
                     }
+
                 }
                 inject_transition_yield!(self, CheckpointYieldPoint::BeforePublishWindow);
                 if passive {
