@@ -18583,17 +18583,18 @@ pub fn op_hash_grace_advance_partition(
 fn apply_affinity_char(target: &mut Register, affinity: Affinity) -> bool {
     // handle the common cases that don't require a conversion inline
     if let Register::Value(value) = target {
+        // Stated as what each affinity has to convert, which is one or two
+        // storage classes, rather than as the three it accepts. Null and blob
+        // are converted by no affinity, so they fall out of every test.
         let settled = match affinity {
             Affinity::Blob | Affinity::None => true,
-            Affinity::Text => matches!(value, Value::Text(_) | Value::Null | Value::Blob(_)),
-            Affinity::Integer | Affinity::Numeric => matches!(
-                value,
-                Value::Numeric(Numeric::Integer(_)) | Value::Null | Value::Blob(_)
-            ),
-            Affinity::Real => matches!(
-                value,
-                Value::Numeric(Numeric::Float(_)) | Value::Null | Value::Blob(_)
-            ),
+            Affinity::Text => !matches!(value, Value::Numeric(_)),
+            Affinity::Integer | Affinity::Numeric => {
+                !matches!(value, Value::Text(_) | Value::Numeric(Numeric::Float(_)))
+            }
+            Affinity::Real => {
+                !matches!(value, Value::Text(_) | Value::Numeric(Numeric::Integer(_)))
+            }
         };
         if settled {
             return true;
@@ -20276,6 +20277,48 @@ mod tests {
         let version_integer = 3046001;
         let expected = "3.46.1";
         assert_eq!(execute_turso_version(version_integer), expected);
+    }
+
+    #[test]
+    fn the_affinity_fast_path_agrees_with_the_conversion_it_skips() {
+        // The fast path answers "no conversion needed" from the storage class
+        // alone. Every case it answers for has to match what the conversion
+        // would have done, so run both over one value of each storage class.
+        let values = || {
+            [
+                Value::Null,
+                Value::from_i64(0),
+                Value::from_i64(42),
+                Value::from_f64(1.5),
+                Value::from_f64(2.0),
+                Value::build_text("5"),
+                Value::build_text("2.5"),
+                Value::build_text("abc"),
+                Value::build_text(""),
+                Value::Blob(vec![1u8, 2, 3]),
+            ]
+        };
+        for affinity in [
+            Affinity::Blob,
+            Affinity::Text,
+            Affinity::Numeric,
+            Affinity::Integer,
+            Affinity::Real,
+            Affinity::None,
+        ] {
+            for (fast_value, slow_value) in values().into_iter().zip(values()) {
+                let mut fast = Register::Value(fast_value);
+                let mut slow = Register::Value(slow_value);
+                let fast_converted = apply_affinity_char(&mut fast, affinity);
+                let slow_converted = apply_affinity_char_slow(&mut slow, affinity);
+                assert_eq!(
+                    (fast.get_value(), fast_converted),
+                    (slow.get_value(), slow_converted),
+                    "affinity {affinity:?} on {:?}",
+                    slow.get_value()
+                );
+            }
+        }
     }
 
     #[test]
