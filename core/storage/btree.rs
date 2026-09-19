@@ -5465,6 +5465,13 @@ impl BTreeCursor {
     /// fields are never read here and reading a cell in full to reach this one
     /// costs about a hundred instructions.
     fn clear_overflow_pages(&mut self, first_overflow_page: Option<u32>) -> IOResultOr<()> {
+        // A cell without overflow pages, reached with the machine idle, walks
+        // `Start` -> `Done` -> `Start` and returns with nothing changed. Saying
+        // so here costs two compares instead of two turns of the loop, each of
+        // which clones a state that holds a page reference.
+        if first_overflow_page.is_none() && matches!(self.overflow_state, OverflowState::Start) {
+            return Ok(IOResult::Done(()));
+        }
         // `database_size` is invariant for the duration of this invocation, so
         // read the page-1 header at most once and reuse it for every overflow
         // page validation below instead of re-reading it per `ReadNext`.
