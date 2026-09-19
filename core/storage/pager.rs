@@ -833,6 +833,20 @@ impl PageInner {
         self.read_u8(BTREE_PAGE_TYPE) > PageType::TableInterior as u8
     }
 
+    /// The leaf flag and the cell count together. A scan asks for both once
+    /// per row and each accessor on its own rebuilds the buffer slice, re-adds
+    /// the page header offset and bounds-checks its own byte.
+    #[inline(always)]
+    pub fn leaf_and_cell_count(&self) -> (bool, usize) {
+        let buf = self.as_ptr();
+        let base = self.offset();
+        let header = &buf[base..base + BTREE_CELL_COUNT + 2];
+        (
+            header[BTREE_PAGE_TYPE] > PageType::TableInterior as u8,
+            u16::from_be_bytes([header[BTREE_CELL_COUNT], header[BTREE_CELL_COUNT + 1]]) as usize,
+        )
+    }
+
     /// True for table pages (interior or leaf). A corrupt page type byte
     /// answers false; the record reader reports it when it parses the cell.
     #[inline(always)]
