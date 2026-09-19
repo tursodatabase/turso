@@ -935,6 +935,12 @@ pub struct BTreeCursor {
     /// wherever the reusable record is invalidated and before every write
     /// through the cursor, because it holds an offset into the page.
     noted_payload: NotedPayload,
+    /// True while `reusable_immutable_record` holds the payload of the cell the
+    /// cursor sits on. It mirrors `!record.is_invalidated()`, which every step
+    /// of a scan used to read: an `Option<ImmutableRecord>` encodes `None` as a
+    /// sentinel near `isize::MAX`, and x86 cannot compare a 64-bit immediate
+    /// against memory, so the test cost a `movabs` and a second register.
+    record_is_current: bool,
     /// Information about the index key structure (sort order, collation, etc)
     pub index_info: Option<Arc<IndexInfo>>,
     /// Maintain count of the number of records in the btree. Used for the `Count` opcode
@@ -1264,6 +1270,7 @@ impl BTreeCursor {
             },
             reusable_immutable_record: None,
             noted_payload: NotedPayload::NONE,
+            record_is_current: false,
             index_info,
             count: 0,
             context: None,
@@ -1682,6 +1689,7 @@ impl BTreeCursor {
                     .unwrap()
                     .start_serialization(&payload_swap)
             )?;
+            self.record_is_current = true;
 
             break Ok(IOResult::Done(()));
         }
@@ -6869,11 +6877,16 @@ impl CursorTrait for BTreeCursor {
         if !self.has_record() {
             return Ok(IOResult::Done(None));
         }
-        let invalidated = self
-            .reusable_immutable_record
-            .as_ref()
-            .is_none_or(|record| record.is_invalidated());
-        if !invalidated {
+        turso_debug_assert!(
+            self.record_is_current
+                == self
+                    .reusable_immutable_record
+                    .as_ref()
+                    .is_some_and(|record| !record.is_invalidated()),
+            "record_is_current must mirror the state of the record buffer",
+            { "record_is_current": self.record_is_current }
+        );
+        if self.record_is_current {
             return Ok(IOResult::Done(self.reusable_immutable_record.as_ref()));
         }
 
@@ -6890,6 +6903,7 @@ impl CursorTrait for BTreeCursor {
                 .expect("record was allocated above");
             record.invalidate();
             crate::with_btree_allocation_site!(RecordPayload, record.start_serialization(payload))?;
+            self.record_is_current = true;
         };
 
         Ok(IOResult::Done(self.reusable_immutable_record.as_ref()))
@@ -7611,6 +7625,12 @@ impl CursorTrait for BTreeCursor {
     #[inline]
     fn invalidate_record(&mut self) {
         self.noted_payload = NotedPayload::NONE;
+        self.record_is_current = false;
+        // Emptying the buffer is what used to mark the record stale. Kept in
+        // debug builds so the assert in `record` can still compare the flag
+        // against it, and so a stale read gives the same empty record it
+        // always did instead of the bytes of an older row.
+        #[cfg(debug_assertions)]
         if let Some(record) = self.reusable_immutable_record.as_mut() {
             record.invalidate();
         }

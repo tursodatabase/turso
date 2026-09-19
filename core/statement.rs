@@ -623,10 +623,7 @@ impl Statement {
 
     /// Turns a step result into a [StepOutcome], keeping a sleep delay in
     /// `pending_sleep` so the outcome stays two machine words.
-    fn outcome_of(
-        &mut self,
-        res: std::result::Result<StepResult, Box<LimboError>>,
-    ) -> StepOutcome {
+    fn outcome_of(&mut self, res: std::result::Result<StepResult, Box<LimboError>>) -> StepOutcome {
         match res {
             Ok(StepResult::Done) => StepOutcome::Done,
             Ok(StepResult::IO) => StepOutcome::IO,
