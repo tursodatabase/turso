@@ -1260,12 +1260,15 @@ impl BTreeCursor {
         Self::new(pager, root_page, num_columns)
     }
 
-    /// Moves the cursor to the heap, into an allocation retired by an earlier
-    /// cursor on the same pager when the pool has one.
-    pub fn into_boxed(self) -> Box<Self> {
-        match self.pager.take_cursor_allocation() {
-            Some(allocation) => Box::write(allocation, self),
-            None => Box::new(self),
+    /// Builds a cursor on the heap, in an allocation retired by an earlier
+    /// cursor on the same pager when the pool has one. `make` runs with the
+    /// allocation already in hand so the compiler can build the cursor
+    /// there: a `BTreeCursor` is over a kilobyte, and building it on the
+    /// stack first costs more to copy than the allocation saves.
+    pub fn boxed(pager: &Arc<Pager>, make: impl FnOnce() -> Self) -> Box<Self> {
+        match pager.take_cursor_allocation() {
+            Some(allocation) => Box::write(allocation, make()),
+            None => Box::new(make()),
         }
     }
 
@@ -1314,7 +1317,9 @@ impl BTreeCursor {
         num_columns: usize,
     ) -> Result<Box<Self>> {
         let index_info = Arc::new(IndexInfo::new_from_index(index)?);
-        Ok(Self::new_with_index_info(pager, root_page, num_columns, Some(index_info)).into_boxed())
+        Ok(Self::boxed(&pager.clone(), || {
+            Self::new_with_index_info(pager, root_page, num_columns, Some(index_info))
+        }))
     }
 
     /// Resets the cached count state so the next `count()` call re-traverses the

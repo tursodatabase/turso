@@ -1432,12 +1432,13 @@ pub fn op_open_read(
             // This is a materialized view with storage
             // Create btree cursor for reading the persistent data
 
-            let btree_cursor = BTreeCursor::new_table(
-                pager.clone(),
-                maybe_transform_root_page_to_positive(mv_store.as_ref(), *root_page),
-                num_columns,
-            )
-            .into_boxed();
+            let btree_cursor = BTreeCursor::boxed(&pager, || {
+                BTreeCursor::new_table(
+                    pager.clone(),
+                    maybe_transform_root_page_to_positive(mv_store.as_ref(), *root_page),
+                    num_columns,
+                )
+            });
             let cursor = maybe_promote_to_mvcc_cursor(btree_cursor, MvccCursorType::Table)?;
 
             // Get the view name and look up or create its transaction state
@@ -1469,20 +1470,22 @@ pub fn op_open_read(
                 .into());
             }
             let btree_cursor: Box<BTreeCursor> = if table.has_rowid {
-                BTreeCursor::new_table(
-                    pager,
-                    maybe_transform_root_page_to_positive(mv_store.as_ref(), *root_page),
-                    num_columns,
-                )
-                .into_boxed()
+                BTreeCursor::boxed(&pager.clone(), || {
+                    BTreeCursor::new_table(
+                        pager,
+                        maybe_transform_root_page_to_positive(mv_store.as_ref(), *root_page),
+                        num_columns,
+                    )
+                })
             } else {
-                BTreeCursor::new_without_rowid_table(
-                    pager,
-                    maybe_transform_root_page_to_positive(mv_store.as_ref(), *root_page),
-                    table.as_ref(),
-                    num_columns,
-                )
-                .into_boxed()
+                BTreeCursor::boxed(&pager.clone(), || {
+                    BTreeCursor::new_without_rowid_table(
+                        pager,
+                        maybe_transform_root_page_to_positive(mv_store.as_ref(), *root_page),
+                        table.as_ref(),
+                        num_columns,
+                    )
+                })
             };
             let cursor = maybe_promote_to_mvcc_cursor(btree_cursor, MvccCursorType::Table)?;
             cursors
