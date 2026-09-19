@@ -2236,6 +2236,79 @@ expect {
     11|
 }
 
+@cross-check-integrity
+test fk-cascade-delete-matches-with-parent-collation {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE p(k TEXT PRIMARY KEY);
+    CREATE TABLE c(id INTEGER PRIMARY KEY, k TEXT COLLATE NOCASE REFERENCES p(k) ON DELETE CASCADE);
+    INSERT INTO p VALUES('A'),('a');
+    INSERT INTO c VALUES(1,'A'),(2,'a');
+    DELETE FROM p WHERE k='A';
+    SELECT id, k FROM c ORDER BY id;
+}
+expect {
+    2|a
+}
+
+@cross-check-integrity
+test fk-cascade-update-matches-with-parent-collation {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE p(k TEXT PRIMARY KEY);
+    CREATE TABLE c(id INTEGER PRIMARY KEY, k TEXT COLLATE NOCASE REFERENCES p(k) ON UPDATE CASCADE);
+    INSERT INTO p VALUES('A'),('a');
+    INSERT INTO c VALUES(1,'A'),(2,'a');
+    UPDATE p SET k='z' WHERE k='A';
+    SELECT id, k FROM c ORDER BY id;
+}
+expect {
+    1|z
+    2|a
+}
+
+@cross-check-integrity
+test fk-set-null-matches-with-parent-collation {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE p(k TEXT PRIMARY KEY);
+    CREATE TABLE c(id INTEGER PRIMARY KEY, k TEXT COLLATE NOCASE REFERENCES p(k) ON DELETE SET NULL);
+    INSERT INTO p VALUES('A'),('a');
+    INSERT INTO c VALUES(1,'A'),(2,'a');
+    DELETE FROM p WHERE k='A';
+    SELECT id, k FROM c ORDER BY id;
+}
+expect {
+    1|
+    2|a
+}
+
+@cross-check-integrity
+test fk-set-default-matches-with-parent-collation {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE p(k TEXT PRIMARY KEY);
+    CREATE TABLE c(id INTEGER PRIMARY KEY, k TEXT COLLATE NOCASE DEFAULT 'd' REFERENCES p(k) ON DELETE SET DEFAULT);
+    INSERT INTO p VALUES('A'),('a'),('d');
+    INSERT INTO c VALUES(1,'A'),(2,'a');
+    DELETE FROM p WHERE k='A';
+    SELECT id, k FROM c ORDER BY id;
+}
+expect {
+    1|d
+    2|a
+}
+
+@cross-check-integrity
+test fk-cascade-delete-matches-with-nocase-parent-collation {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE p(k TEXT COLLATE NOCASE PRIMARY KEY);
+    CREATE TABLE c(id INTEGER PRIMARY KEY, k TEXT REFERENCES p(k) ON DELETE CASCADE);
+    INSERT INTO p VALUES('A');
+    INSERT INTO c VALUES(1,'A'),(2,'a');
+    DELETE FROM p;
+    SELECT count(*) FROM c;
+}
+expect {
+    0
+}
+
 # ON DELETE CASCADE - recursive cascade (A->B->C)
 @cross-check-integrity
 test fk-cascade-delete-recursive {

@@ -1597,13 +1597,15 @@ struct FkSubprogramContext {
     old_param_start: usize,
     /// Map from column index to parameter index (1-indexed) for NEW key values (UPDATE only)
     new_param_start: Option<usize>,
+    old_key_collations: Vec<Option<CollationSeq>>,
 }
 
 impl FkSubprogramContext {
-    fn new(num_cols: usize, has_new: bool) -> Self {
+    fn new(num_cols: usize, has_new: bool, old_key_collations: Vec<Option<CollationSeq>>) -> Self {
         Self {
             old_param_start: 1,
             new_param_start: if has_new { Some(num_cols + 1) } else { None },
+            old_key_collations,
         }
     }
 
@@ -1918,15 +1920,20 @@ fn build_fk_match_where_clause(child_cols: &[String], ctx: &FkSubprogramContext)
 
     for (i, col) in child_cols.iter().enumerate() {
         let param_idx = ctx.old_param_index(i);
+        let param = Expr::Variable(ast::Variable::indexed(
+            u32::try_from(param_idx.get())
+                .ok()
+                .and_then(std::num::NonZeroU32::new)
+                .expect("fk parameter index must fit into NonZeroU32"),
+        ));
+        let param = match ctx.old_key_collations.get(i).copied().flatten() {
+            Some(collation) => Expr::Collate(Box::new(param), Name::exact(collation.name())),
+            None => param,
+        };
         let cond = Expr::Binary(
             Box::new(Expr::Id(Name::from_string(col))),
             ast::Operator::Equals,
-            Box::new(Expr::Variable(ast::Variable::indexed(
-                u32::try_from(param_idx.get())
-                    .ok()
-                    .and_then(std::num::NonZeroU32::new)
-                    .expect("fk parameter index must fit into NonZeroU32"),
-            ))),
+            Box::new(param),
         );
         conditions.push(cond);
     }
@@ -1940,6 +1947,30 @@ fn build_fk_match_where_clause(child_cols: &[String], ctx: &FkSubprogramContext)
             .reduce(|acc, cond| Expr::Binary(Box::new(acc), ast::Operator::And, Box::new(cond)))
             .expect("at least one condition")
     }
+}
+
+fn parent_key_collations(
+    resolver: &Resolver,
+    fk_ref: &ResolvedFkRef,
+    database_id: usize,
+) -> Result<Vec<Option<CollationSeq>>> {
+    if fk_ref.parent_uses_rowid {
+        return Ok(vec![None; fk_ref.parent_pos.len()]);
+    }
+    let parent_bt = resolver
+        .with_schema(database_id, |s| s.get_btree_table(&fk_ref.fk.parent_table))
+        .ok_or_else(|| LimboError::InternalError("parent not btree".into()))?;
+    fk_ref
+        .parent_pos
+        .iter()
+        .map(|&pos| {
+            parent_bt
+                .columns()
+                .get(pos)
+                .map(|col| Some(col.collation()))
+                .ok_or_else(|| LimboError::InternalError(format!("parent col {pos} missing")))
+        })
+        .collect()
 }
 
 /// Compile and emit an FK CASCADE DELETE action as a sub-program.
@@ -1958,7 +1989,11 @@ fn fire_fk_cascade_delete(
         None
     };
     let child_cols = &fk_ref.fk.child_columns;
-    let subprog_ctx = FkSubprogramContext::new(child_cols.len(), false);
+    let subprog_ctx = FkSubprogramContext::new(
+        child_cols.len(),
+        false,
+        parent_key_collations(resolver, fk_ref, database_id)?,
+    );
     let stmt = generate_cascade_delete_stmt(
         &fk_ref.child_table.name,
         child_cols,
@@ -1992,7 +2027,11 @@ fn fire_fk_set_null(
         None
     };
     let child_cols = &fk_ref.fk.child_columns;
-    let subprog_ctx = FkSubprogramContext::new(child_cols.len(), false);
+    let subprog_ctx = FkSubprogramContext::new(
+        child_cols.len(),
+        false,
+        parent_key_collations(resolver, fk_ref, database_id)?,
+    );
     let stmt = generate_set_null_stmt(
         &fk_ref.child_table.name,
         child_cols,
@@ -2026,7 +2065,11 @@ fn fire_fk_set_default(
         None
     };
     let child_cols = &fk_ref.fk.child_columns;
-    let subprog_ctx = FkSubprogramContext::new(child_cols.len(), false);
+    let subprog_ctx = FkSubprogramContext::new(
+        child_cols.len(),
+        false,
+        parent_key_collations(resolver, fk_ref, database_id)?,
+    );
     let stmt = generate_set_default_stmt(
         &fk_ref.child_table,
         child_cols,
@@ -2061,7 +2104,11 @@ fn fire_fk_cascade_update(
     };
     let child_cols = &fk_ref.fk.child_columns;
     // CASCADE UPDATE needs new params for the SET clause
-    let subprog_ctx = FkSubprogramContext::new(child_cols.len(), true);
+    let subprog_ctx = FkSubprogramContext::new(
+        child_cols.len(),
+        true,
+        parent_key_collations(resolver, fk_ref, database_id)?,
+    );
     let stmt = generate_cascade_update_stmt(
         &fk_ref.child_table.name,
         child_cols,
