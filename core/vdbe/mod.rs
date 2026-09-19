@@ -2343,18 +2343,24 @@ impl Program {
         } else {
             dispatch_loop::<false>(self, state, pager, waker, false, false)
         };
-        match &result {
-            ProgramStep::Row => {}
-            ProgramStep::Done => {
-                state.execution_state = ProgramExecutionState::Done;
+        // A statement that returns rows comes through here once per row, so
+        // the row is tested first and the rest of the match is skipped. Left
+        // as one match, LLVM copies a five instruction jump table to each of
+        // the fifteen places the interpreter returns from, and every row pays
+        // an indirect jump through it.
+        if unlikely(!matches!(result, ProgramStep::Row)) {
+            match &result {
+                ProgramStep::Done => {
+                    state.execution_state = ProgramExecutionState::Done;
+                }
+                ProgramStep::Interrupt => {
+                    state.execution_state = ProgramExecutionState::Interrupted;
+                }
+                ProgramStep::Error(_) => {
+                    state.execution_state = ProgramExecutionState::Failed;
+                }
+                _ => {}
             }
-            ProgramStep::Interrupt => {
-                state.execution_state = ProgramExecutionState::Interrupted;
-            }
-            ProgramStep::Error(_) => {
-                state.execution_state = ProgramExecutionState::Failed;
-            }
-            _ => {}
         }
         return result;
 
@@ -4204,6 +4210,8 @@ mod tests {
             assert!(matches!(stmt.step().unwrap(), StepResult::Row));
             assert_eq!(stmt.execution_state(), ProgramExecutionState::Running);
             assert!(matches!(stmt.step().unwrap(), StepResult::Row));
+            assert!(matches!(stmt.step().unwrap(), StepResult::Done));
+            assert_eq!(stmt.execution_state(), ProgramExecutionState::Done);
             assert!(matches!(stmt.step().unwrap(), StepResult::Done));
             assert_eq!(stmt.execution_state(), ProgramExecutionState::Done);
 
