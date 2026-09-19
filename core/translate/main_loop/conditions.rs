@@ -123,19 +123,16 @@ pub(super) fn hash_build_prefilter_where_terms(
     let Operation::HashJoin(hash_join_op) = &table.op else {
         return Ok(Vec::new());
     };
-    let use_materialized_keys = matches!(
-        t_ctx
-            .materialized_build_inputs
-            .get(&hash_join_op.build_table_idx)
-            .map(|input| &input.mode),
-        Some(MaterializedBuildInputMode::KeyPayload { .. })
-    );
+    let uses_materialized_keys_and_payload = t_ctx
+        .materialized_build_inputs
+        .get(&hash_join_op.build_table_idx)
+        .is_some_and(|input| !input.requires_build_table());
     super::hash::build_prefilter_where_terms(
         predicates,
         table_references,
         subqueries,
         hash_join_op,
-        use_materialized_keys,
+        uses_materialized_keys_and_payload,
     )
 }
 
