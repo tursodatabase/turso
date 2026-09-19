@@ -48,12 +48,12 @@ use super::btree::{
     btree_init_page, payload_overflow_threshold_max, payload_overflow_threshold_min, PayloadLimits,
 };
 use super::page_cache::{CacheError, CacheResizeResult, PageCache, PageCacheKey, SpillResult};
-use super::sqlite3_ondisk::read_varint;
 use super::sqlite3_ondisk::{
     begin_write_btree_page, read_btree_cell, read_u32, BTreeCell, FREELIST_LEAF_PTR_SIZE,
     FREELIST_TRUNK_OFFSET_FIRST_LEAF_PTR, FREELIST_TRUNK_OFFSET_LEAF_COUNT,
     FREELIST_TRUNK_OFFSET_NEXT_TRUNK_PTR,
 };
+use super::sqlite3_ondisk::{read_varint, read_varint_len};
 use super::wal::{CheckpointMode, WalAutoActions};
 use crate::storage::encryption::{CipherMode, EncryptionContext, EncryptionKey};
 
@@ -551,8 +551,7 @@ impl PageInner {
         let (size, len) = read_varint(buf.get(cell_offset..)?).ok()?;
         let mut start = cell_offset + len;
         if is_table {
-            let (_, rowid_len) = read_varint(buf.get(start..)?).ok()?;
-            start += rowid_len;
+            start += read_varint_len(buf.get(start..)?).ok()?;
         }
         let max_local = if is_table {
             limits.max_local_table

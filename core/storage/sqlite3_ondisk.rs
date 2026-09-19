@@ -1390,6 +1390,25 @@ pub fn read_varint(buf: &[u8]) -> Result<(u64, usize)> {
     }
 }
 
+/// The number of bytes the varint at the front of `buf` takes. A caller that
+/// only has to step over a varint pays for none of the shifting and masking
+/// that builds its value; the three lengths written out here cover every
+/// rowid below two million, and anything longer goes through the reader.
+#[inline(always)]
+pub fn read_varint_len(buf: &[u8]) -> Result<usize> {
+    match buf {
+        [b0, ..] if *b0 < 0x80 => Ok(1),
+        [_, b1, ..] if *b1 < 0x80 => Ok(2),
+        [_, _, b2, ..] if *b2 < 0x80 => Ok(3),
+        _ => read_varint_len_long(buf),
+    }
+}
+
+#[inline(never)]
+fn read_varint_len_long(buf: &[u8]) -> Result<usize> {
+    read_varint(buf).map(|(_, len)| len)
+}
+
 /// Reads a varint at the front of `buf` and returns it together with the
 /// bytes after it.
 ///
@@ -2668,5 +2687,14 @@ mod tests {
         let mut buf = [0u8; 9];
         let written = write_varint(&mut buf, value);
         varint_len(value) == written
+    }
+
+    #[quickcheck_macros::quickcheck]
+    fn read_varint_len_matches_read_varint(bytes: Vec<u8>) -> bool {
+        match (read_varint_len(&bytes), read_varint(&bytes)) {
+            (Ok(len), Ok((_, expected))) => len == expected,
+            (Err(_), Err(_)) => true,
+            _ => false,
+        }
     }
 }
