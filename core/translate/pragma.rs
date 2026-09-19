@@ -1127,7 +1127,7 @@ fn query_pragma(
                             let seqno = index.columns.len();
                             program.emit_int(seqno as i64, base_reg);
                             program.emit_int(-1, base_reg + 1);
-                            program.emit_string8(String::new(), base_reg + 2);
+                            program.emit_null(base_reg + 2, None);
                             program.emit_int(0, base_reg + 3);
                             program.emit_string8("BINARY".to_string(), base_reg + 4);
                             program.emit_int(0, base_reg + 5); // not a key column
