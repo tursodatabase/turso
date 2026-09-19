@@ -11,6 +11,7 @@ use turso_whopper::{
     StepResult, Whopper, WhopperOpts,
     chaotic_btree::BtreeRebalanceProfile,
     chaotic_elle::{ChaoticElleProfile, ChaoticWorkloadProfile, ElleModelKind},
+    chaotic_fts::{FtsRollbackProfile, FtsRollbackProperty},
     properties::*,
     workloads::*,
 };
@@ -31,9 +32,11 @@ struct Args {
     #[command(subcommand)]
     subcommand: Option<SubCmd>,
 
-    /// Simulation mode (fast, chaos, schema-clone-faults, btree-rebalance/btree-rekey, recovery-heavy, ragnarök/ragnarok)
+    /// Simulation mode (fast, fts-mvcc, fts-mvcc-rollback, chaos, schema-clone-faults, btree-rebalance/btree-rekey, recovery-heavy, ragnarök/ragnarok)
     #[arg(long, default_value = "fast")]
     mode: String,
+    #[arg(long, help = "Check FTS matching without ranking (FTS modes only)")]
+    fts_match_only: bool,
     /// Max connections
     #[arg(long, default_value_t = 4)]
     max_connections: usize,
@@ -156,13 +159,15 @@ fn main() -> anyhow::Result<()> {
             rng.next_u64()
         });
 
-    if args.enable_experimental_mvcc_passive_checkpoint && !args.enable_mvcc {
+    validate_fts_args(&args)?;
+    let enable_mvcc = args.enable_mvcc || is_fts_mode(&args.mode);
+    if args.enable_experimental_mvcc_passive_checkpoint && !enable_mvcc {
         return Err(anyhow::anyhow!(
             "--enable-experimental-mvcc-passive-checkpoint requires --enable-mvcc"
         ));
     }
 
-    if args.mvcc_checkpoint_threshold.is_some() && !args.enable_mvcc {
+    if args.mvcc_checkpoint_threshold.is_some() && !enable_mvcc {
         return Err(anyhow::anyhow!(
             "--mvcc-checkpoint-threshold requires --enable-mvcc"
         ));
@@ -345,6 +350,27 @@ fn run_inprocess(args: &Args, seed: u64) -> anyhow::Result<()> {
     }
     prop_result?;
 
+    if whopper.stats.fts_checks > 0 {
+        println!(
+            "\n{} FTS oracle checks completed ({} phrase checks)",
+            whopper.stats.fts_checks, whopper.stats.fts_phrase_checks
+        );
+    }
+
+    if is_fts_mode(&args.mode) {
+        let stats = &whopper.stats;
+        println!(
+            "FTS: {} successful OPTIMIZE statements, {} row checks, {} completed rollback scenarios; {} ROLLBACK TO, {} RELEASE, {} COMMIT, {} ROLLBACK",
+            stats.fts_optimizes,
+            stats.fts_row_checks,
+            stats.fts_rollback_scenarios,
+            stats.savepoint_rollbacks,
+            stats.savepoint_releases,
+            stats.commits,
+            stats.rollbacks
+        );
+    }
+
     let allocation_faults = whopper.allocation_fault_count();
     if allocation_faults > 0 {
         println!("\n{allocation_faults} allocation faults injected");
@@ -359,6 +385,13 @@ fn run_inprocess(args: &Args, seed: u64) -> anyhow::Result<()> {
 
     if args.elle.is_some() {
         println!("\nElle history exported to: {}", args.elle_output);
+    }
+
+    if args.mode == "fts-mvcc-rollback" {
+        anyhow::ensure!(
+            whopper.stats.fts_rollback_scenarios > 0,
+            "no FTS rollback scenario completed"
+        );
     }
 
     Ok(())
@@ -451,6 +484,25 @@ fn build_workloads_and_properties(args: &Args) -> BuildArtifacts {
         let p: Vec<Box<dyn Property>> = vec![Box::new(IntegrityCheckProperty)];
 
         (w, p, vec![], vec![])
+    } else if is_fts_mode(&args.mode) {
+        let mut properties: PropertyList = vec![
+            Box::new(IntegrityCheckProperty),
+            Box::new(FtsSelfDifferentialProperty),
+        ];
+        let mut chaotic: ChaosProfiles = vec![];
+        let mut workloads = fts_sim_workloads(!args.fts_match_only);
+        if args.mode == "fts-mvcc-rollback" {
+            workloads.clear();
+            properties.push(Box::new(FtsRollbackProperty));
+            chaotic.push((
+                1.0,
+                "fts-rollback",
+                Box::new(FtsRollbackProfile {
+                    check_ranking: !args.fts_match_only,
+                }),
+            ));
+        }
+        (workloads, properties, fts_sim_schema(), chaotic)
     } else {
         let allow_passive_checkpoint =
             !args.enable_mvcc || args.enable_experimental_mvcc_passive_checkpoint;
@@ -482,7 +534,13 @@ fn build_workloads_and_properties(args: &Args) -> BuildArtifacts {
             (12, Box::new(FtsInsertWorkload)),
             (8, Box::new(FtsUpdateWorkload)),
             (6, Box::new(FtsDeleteWorkload)),
-            (10, Box::new(FtsMatchWorkload)),
+            (
+                10,
+                Box::new(FtsMatchWorkload {
+                    check_ranking: false,
+                    phrases: false,
+                }),
+            ),
             (2, Box::new(FtsOptimizeWorkload)),
             (30, Box::new(BeginWorkload)),
             (10, Box::new(CommitWorkload)),
@@ -509,8 +567,9 @@ type ChaosProfiles = Vec<(f64, &'static str, Box<dyn ChaoticWorkloadProfile>)>;
 type BuildArtifacts = (WorkerWorkloads, PropertyList, TableSchemas, ChaosProfiles);
 
 fn build_inprocess_opts(args: &Args, seed: u64) -> anyhow::Result<WhopperOpts> {
+    validate_fts_args(args)?;
     let mut base_opts = match args.mode.as_str() {
-        "fast" => WhopperOpts::fast(),
+        "fast" | "fts-mvcc" | "fts-mvcc-rollback" => WhopperOpts::fast(),
         "chaos" => WhopperOpts::chaos(),
         "schema-clone-faults" => WhopperOpts::schema_clone_faults(),
         "btree-rebalance" | "btree-rekey" => WhopperOpts::btree_rebalance(),
@@ -533,7 +592,9 @@ fn build_inprocess_opts(args: &Args, seed: u64) -> anyhow::Result<WhopperOpts> {
         .with_seed(seed)
         .with_max_connections(args.max_connections)
         .with_keep_files(args.keep)
-        .with_enable_mvcc(args.enable_mvcc || is_schema_clone_fault_mode(&args.mode))
+        .with_enable_mvcc(
+            args.enable_mvcc || is_fts_mode(&args.mode) || is_schema_clone_fault_mode(&args.mode),
+        )
         .with_experimental_mvcc_passive_checkpoint(args.enable_experimental_mvcc_passive_checkpoint)
         .with_mvcc_checkpoint_threshold(args.mvcc_checkpoint_threshold)
         .with_enable_encryption(args.enable_encryption)
@@ -550,8 +611,24 @@ fn build_inprocess_opts(args: &Args, seed: u64) -> anyhow::Result<WhopperOpts> {
     Ok(opts)
 }
 
+fn validate_fts_args(args: &Args) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        !args.fts_match_only || is_fts_mode(&args.mode),
+        "--fts-match-only requires an FTS mode"
+    );
+    anyhow::ensure!(
+        !is_fts_mode(&args.mode) || (!args.multiprocess && args.elle.is_none()),
+        "FTS modes require in-process FTS workloads; do not combine them with --multiprocess or --elle"
+    );
+    Ok(())
+}
+
 fn is_btree_rebalance_mode(mode: &str) -> bool {
     matches!(mode, "btree-rebalance" | "btree-rekey")
+}
+
+fn is_fts_mode(mode: &str) -> bool {
+    matches!(mode, "fts-mvcc" | "fts-mvcc-rollback")
 }
 
 fn is_schema_clone_fault_mode(mode: &str) -> bool {
@@ -610,4 +687,38 @@ fn init_logger() {
                 .unwrap_or_else(|_| EnvFilter::new("info,tantivy=warn")),
         )
         .try_init();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fts_mode_enables_mvcc_and_keeps_ranking_enabled_by_default() {
+        for mode in ["fts-mvcc", "fts-mvcc-rollback"] {
+            let args = Args::parse_from(["whopper", "--mode", mode]);
+            let opts = build_inprocess_opts(&args, 3957).unwrap();
+            assert!(opts.enable_mvcc);
+            assert!(!args.fts_match_only);
+            assert_eq!(opts.elle_tables, fts_sim_schema());
+            assert_eq!(opts.workloads.is_empty(), mode == "fts-mvcc-rollback");
+            assert_eq!(
+                opts.chaotic_profiles.len(),
+                usize::from(mode == "fts-mvcc-rollback")
+            );
+        }
+    }
+
+    #[test]
+    fn fts_mode_rejects_options_that_replace_its_workload() {
+        for mode in ["fts-mvcc", "fts-mvcc-rollback"] {
+            for extra in [vec!["--multiprocess"], vec!["--elle", "list-append"]] {
+                let mut argv = vec!["whopper", "--mode", mode];
+                argv.extend(extra);
+                assert!(build_inprocess_opts(&Args::parse_from(argv), 3957).is_err());
+            }
+        }
+        let args = Args::parse_from(["whopper", "--fts-match-only"]);
+        assert!(build_inprocess_opts(&args, 3957).is_err());
+    }
 }
