@@ -392,7 +392,7 @@ impl SegmentData {
 /// tombstoned doc ids visible at (or created by) this transaction.
 #[derive(Debug, Clone)]
 pub(super) struct LoadedSegment {
-    pub descriptor: SegmentDescriptor,
+    pub descriptor: Arc<SegmentDescriptor>,
     pub data: Arc<SegmentData>,
     /// Doc ids whose postings are dead at this snapshot. Ordered so cache
     /// identity comparisons and bitset builds are deterministic.
@@ -401,7 +401,7 @@ pub(super) struct LoadedSegment {
 
 impl LoadedSegment {
     pub fn new(
-        descriptor: SegmentDescriptor,
+        descriptor: Arc<SegmentDescriptor>,
         data: Arc<SegmentData>,
         deleted: BTreeSet<u32>,
     ) -> Self {
