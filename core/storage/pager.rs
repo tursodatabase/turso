@@ -1615,6 +1615,11 @@ pub struct Pager {
     /// of one pager, ever share a value.
     dirty_set_epoch: AtomicU64,
     subjournal: RwLock<Option<Subjournal>>,
+    /// True once `subjournal` holds a file. It never goes back to false, so a
+    /// false read means no subjournal, without taking the lock that guards it.
+    /// Set after the file is stored, and read with the matching ordering, so a
+    /// true read sees the file too.
+    subjournal_is_open: AtomicBool,
     savepoints: Arc<RwLock<Vec<Savepoint>>>,
     commit_info: RwLock<CommitInfo>,
     checkpoint_state: RwLock<CheckpointState>,
@@ -1926,6 +1931,7 @@ impl Pager {
             dirty_pages: Arc::new(RwLock::new(RoaringBitmap::new())),
             dirty_set_epoch: AtomicU64::new(next_dirty_set_epoch()),
             subjournal: RwLock::new(None),
+            subjournal_is_open: AtomicBool::new(false),
             savepoints: Arc::new(RwLock::new(Vec::new())),
             commit_info: RwLock::new(CommitInfo {
                 group: None,
@@ -2180,7 +2186,7 @@ impl Pager {
     ///
     /// Currently uses MemoryIO, but should eventually be backed by temporary on-disk files.
     pub fn open_subjournal(&self) -> Result<()> {
-        if self.subjournal.read().is_some() {
+        if self.subjournal_is_open.load(Ordering::Acquire) {
             return Ok(());
         }
         use crate::MemoryIO;
@@ -2189,6 +2195,7 @@ impl Pager {
         let file = db_file_io.open_file("subjournal", OpenFlags::Create, false)?;
         let db_file = Subjournal::new(file);
         *self.subjournal.write() = Some(db_file);
+        self.subjournal_is_open.store(true, Ordering::Release);
         Ok(())
     }
 
@@ -2199,7 +2206,11 @@ impl Pager {
     /// A buffer of length page_size + 4 bytes is allocated and the page id
     /// is written to the beginning of the buffer. The rest of the buffer is filled with the page contents.
     pub fn subjournal_page_if_required(&self, page: &Page) -> Result<()> {
-        if self.subjournal.read().is_none() {
+        if !self.subjournal_is_open.load(Ordering::Acquire) {
+            turso_debug_assert!(
+                self.subjournal.read().is_none(),
+                "the subjournal flag says closed while a subjournal is open"
+            );
             return Ok(());
         }
         let write_offset = {
