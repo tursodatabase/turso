@@ -1390,6 +1390,46 @@ pub fn read_varint(buf: &[u8]) -> Result<(u64, usize)> {
     }
 }
 
+/// Bytes the varint at the front of `buf` occupies, for the callers that only
+/// need to step over it. A varint ends at the first byte whose high bit is
+/// clear, or after nine bytes. `None` means the buffer ends first.
+///
+/// `read_varint` works out the value as well, and a caller that throws the
+/// value away still pays for keeping it: on a table leaf cell the rowid varint
+/// cost two stack stores per row that nothing read back.
+#[inline(always)]
+pub fn read_varint_len(buf: &[u8]) -> Option<usize> {
+    match buf {
+        [b0, ..] if *b0 < 0x80 => return Some(1),
+        [_, b1, ..] if *b1 < 0x80 => return Some(2),
+        _ => {}
+    }
+    for i in 2..8 {
+        if buf.get(i)? & 0x80 == 0 {
+            return Some(i + 1);
+        }
+    }
+    nine_byte_varint_len(buf)
+}
+
+/// The tail of [`read_varint_len`]: eight bytes in a row have had their high
+/// bit set, so the varint is the maximum nine bytes long, if it is valid.
+///
+/// `read_varint` rejects a nine-byte varint whose value fits in fewer bits,
+/// which is the same as saying that the top eight bits of the first eight
+/// groups of seven are all zero. Those bits are the low seven of the first byte
+/// and the seventh of the second, so the rule needs no accumulator. Out of line
+/// so that testing it does not keep those two bytes live through the loop
+/// above, which costs two instructions per row on a b-tree scan.
+#[inline(never)]
+fn nine_byte_varint_len(buf: &[u8]) -> Option<usize> {
+    let (b0, b1) = (buf.first()?, buf.get(1)?);
+    if buf.len() < 9 || (b0 & 0x7f == 0 && b1 & 0x40 == 0) {
+        return None;
+    }
+    Some(9)
+}
+
 #[inline(always)]
 /// Reads a varint from the buffer, returning None if more data is needed.
 pub fn read_varint_partial(buf: &[u8]) -> Result<Option<(u64, usize)>> {
@@ -2526,6 +2566,41 @@ mod tests {
     #[case(&[0x80; 9])] // bits set without end
     fn test_read_varint_malformed_inputs(#[case] buf: &[u8]) {
         assert!(read_varint(buf).is_err());
+    }
+
+    /// `read_varint_len` exists only to skip a varint faster than reading it,
+    /// so it must accept and reject exactly what `read_varint` does.
+    #[test]
+    fn read_varint_len_agrees_with_read_varint() {
+        let mut checked = 0;
+        for width in 0..=10usize {
+            for pattern in [0x00u8, 0x01, 0x7f, 0x80, 0x81, 0xff] {
+                for last in [0x00u8, 0x01, 0x40, 0x7f, 0x80, 0xff] {
+                    let mut buf = vec![pattern; width];
+                    if let Some(byte) = buf.last_mut() {
+                        *byte = last;
+                    }
+                    let expected = read_varint(&buf).ok().map(|(_, len)| len);
+                    assert_eq!(read_varint_len(&buf), expected, "disagreed on {buf:02x?}");
+                    checked += 1;
+                }
+            }
+        }
+        // Every nine-byte varint whose value needs the ninth byte, and every
+        // one whose value does not, so the rule on the first two bytes is
+        // covered in both directions.
+        for b0 in [0x80u8, 0x81, 0xc0, 0xff] {
+            for b1 in [0x80u8, 0xc0, 0xbf, 0xff] {
+                let mut buf = vec![0x80u8; 9];
+                buf[0] = b0;
+                buf[1] = b1;
+                buf[8] = 0x2a;
+                let expected = read_varint(&buf).ok().map(|(_, len)| len);
+                assert_eq!(read_varint_len(&buf), expected, "disagreed on {buf:02x?}");
+                checked += 1;
+            }
+        }
+        assert!(checked > 300, "the table got smaller than it looks");
     }
 
     #[test]

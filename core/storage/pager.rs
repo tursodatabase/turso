@@ -547,8 +547,7 @@ impl PageInner {
         let (size, len) = read_varint(buf.get(cell_offset..)?).ok()?;
         let mut start = cell_offset + len;
         if is_table {
-            let (_, rowid_len) = read_varint(buf.get(start..)?).ok()?;
-            start += rowid_len;
+            start += crate::storage::sqlite3_ondisk::read_varint_len(buf.get(start..)?)?;
         }
         let max_local = if is_table {
             limits.max_local_table
