@@ -621,10 +621,14 @@ impl Statement {
                 .step(&mut self.state, &self.pager, self.query_mode, waker);
             return self.finish_step(res, waker).map(Some);
         }
-        // The query mode is normal and the interpreter the caller runs next
-        // marks the program running. A statement that is not a root one
-        // never takes the root count, so its gate is open on every step and
-        // it keeps the long way in.
+        // Start the program here, where it costs nothing, rather than on
+        // every entry to the interpreter.
+        if !matches!(self.state.execution_state, ProgramExecutionState::Running) {
+            self.program.start_execution(&mut self.state);
+        }
+        // The query mode is normal. A statement that is not a root one never
+        // takes the root count, so its gate is open on every step and it
+        // keeps the long way in.
         self.on_fast_step_path = self.counted_as_active_root && self.busy_handler_state.is_none();
         Ok(None)
     }

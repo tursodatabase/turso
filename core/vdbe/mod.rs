@@ -2077,6 +2077,9 @@ impl Program {
         waker: Option<&Waker>,
     ) -> Result<StepResult, Box<LimboError>> {
         if let QueryMode::Normal = query_mode {
+            if !matches!(state.execution_state, ProgramExecutionState::Running) {
+                self.start_execution(state);
+            }
             return self.normal_step(state, pager, waker).into();
         }
         state.execution_state = ProgramExecutionState::Running;
@@ -2346,7 +2349,7 @@ impl Program {
     /// The level filter answers whether a TRACE span could be recorded at
     /// all; the traced loop's own `trace!` calls test the subscriber.
     #[inline(never)]
-    fn start_execution(&self, state: &mut ProgramState) {
+    pub(crate) fn start_execution(&self, state: &mut ProgramState) {
         state.trace_switches = TraceSwitches::new(
             tracing::level_filters::LevelFilter::current() >= tracing::Level::TRACE,
             self.connection.get_vdbe_trace(),
@@ -2362,12 +2365,13 @@ impl Program {
         pager: &Arc<Pager>,
         waker: Option<&Waker>,
     ) -> ProgramStep {
-        // Reading the two trace switches costs an atomic load and a level
-        // filter compare. A statement that returns rows comes through here
-        // once per row, so the answer is read when the statement starts.
-        if !matches!(state.execution_state, ProgramExecutionState::Running) {
-            self.start_execution(state);
-        }
+        // The program is already running: `Statement::enter_step` and
+        // `Program::step` start it, and a statement that returns rows comes
+        // through here once per row and would pay the test on each one.
+        debug_assert!(
+            matches!(state.execution_state, ProgramExecutionState::Running),
+            "the interpreter was entered before the program was started"
+        );
         let switches = state.trace_switches;
         let result = if unlikely(switches.any()) {
             dispatch_loop_traced(
