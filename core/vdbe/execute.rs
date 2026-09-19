@@ -1087,32 +1087,54 @@ macro_rules! comparison_opcode {
                 };
                 return Ok(InsnFunctionStepResult::Step);
             }
-            if let (
-                Register::Value(lhs_value @ Value::Text(l)),
-                Register::Value(rhs_value @ Value::Text(r)),
-            ) = (&state.registers[*lhs], &state.registers[*rhs])
-            {
-                if texts_compare_as_bytes(lhs_value, rhs_value, *flags, *collation) {
-                    state.pc = if comparison_matches_order($op, l.as_str().cmp(r.as_str())) {
-                        target_pc
-                    } else {
-                        state.pc + 1
-                    };
-                    return Ok(InsnFunctionStepResult::Step);
-                }
-            }
-            op_comparison_slow(
-                program,
-                state,
-                *lhs,
-                *rhs,
-                target_pc,
-                *flags,
-                collation.unwrap_or_default(),
-                $op,
+            op_comparison_not_two_integers(
+                program, state, *lhs, *rhs, target_pc, *flags, *collation, $op,
             )
         }
     };
+}
+
+/// The comparison opcodes for every operand pair other than two integers.
+/// Out of line: the dispatch loop inlines all six comparison opcodes, so
+/// every byte of them is a byte of the loop's own frame and register
+/// pressure, and only the integer pair is common enough to earn a place
+/// there.
+#[inline(never)]
+#[allow(clippy::too_many_arguments)]
+fn op_comparison_not_two_integers(
+    program: &Program,
+    state: &mut ProgramState,
+    lhs: usize,
+    rhs: usize,
+    target_pc: crate::vdbe::InsnReference,
+    flags: crate::vdbe::insn::CmpInsFlags,
+    collation: Option<CollationSeq>,
+    op: ComparisonOp,
+) -> InsnResult {
+    if let (
+        Register::Value(lhs_value @ Value::Text(l)),
+        Register::Value(rhs_value @ Value::Text(r)),
+    ) = (&state.registers[lhs], &state.registers[rhs])
+    {
+        if texts_compare_as_bytes(lhs_value, rhs_value, flags, collation) {
+            state.pc = if comparison_matches_order(op, l.as_str().cmp(r.as_str())) {
+                target_pc
+            } else {
+                state.pc + 1
+            };
+            return Ok(InsnFunctionStepResult::Step);
+        }
+    }
+    op_comparison_slow(
+        program,
+        state,
+        lhs,
+        rhs,
+        target_pc,
+        flags,
+        collation.unwrap_or_default(),
+        op,
+    )
 }
 
 comparison_opcode!(op_eq, Eq, ComparisonOp::Eq, |l: i64, r: i64| l == r);
