@@ -2061,9 +2061,13 @@ pub fn translate_expr(
                     }
                 },
                 #[cfg(all(feature = "fts", not(target_family = "wasm")))]
+                Func::Fts(crate::function::FtsFunc::Match) => {
+                    crate::bail_parse_error!("fts_match requires an FTS index in the query plan");
+                }
+                #[cfg(all(feature = "fts", not(target_family = "wasm")))]
                 Func::Fts(_) => {
-                    // FTS functions are handled via index method pattern matching.
-                    // If we reach here, no index matched, so translate as a regular function call.
+                    // Only fts_score and fts_highlight support scalar calls.
+                    // Unresolved fts_match calls are rejected above.
                     translate_function(
                         program,
                         args,

@@ -288,43 +288,6 @@ pub fn fts_highlight(text: &str, query: &str, before_tag: &str, after_tag: &str)
     })
 }
 
-/// Check if text matches a query by testing for any common terms.
-///
-/// Standalone function that can be used without an FTS index.
-/// It tokenizes both the query and text using Tantivy's default tokenizer,
-/// and returns true if any query terms appear in the text.
-pub fn fts_match(text: &str, query: &str) -> bool {
-    if text.is_empty() || query.is_empty() {
-        return false;
-    }
-
-    FTS_TOKENIZER.with(|tokenizer| {
-        let mut tokenizer = tokenizer.borrow_mut();
-
-        // Extract query terms (lowercased)
-        let query_terms: HashSet<String> = {
-            let mut terms = HashSet::default();
-            let mut query_stream = tokenizer.token_stream(query);
-            while let Some(token) = query_stream.next() {
-                terms.insert(token.text.to_string());
-            }
-            terms
-        };
-        if query_terms.is_empty() {
-            return false;
-        }
-
-        // Tokenize the text and check if any query terms appear
-        let mut text_stream = tokenizer.token_stream(text);
-        while let Some(token) = text_stream.next() {
-            if query_terms.contains(&token.text) {
-                return true;
-            }
-        }
-        false
-    })
-}
-
 /// Parse field weights from a string like "body=2.0,title=1.0"
 /// Returns a HashMap mapping column names to tantivy 'boost factors'
 fn parse_field_weights(weights_str: &str, columns: &[IndexColumn]) -> Result<HashMap<String, f32>> {
