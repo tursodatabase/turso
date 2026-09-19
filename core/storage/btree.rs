@@ -896,6 +896,17 @@ impl AdvanceFlags {
     fn state_machines_are_idle(self) -> bool {
         self.bits() & !Self::NULL_ROW_BYTE == Self::READY & !Self::NULL_ROW_BYTE
     }
+
+    /// The two bytes that say a read of the current row gives a value: not a
+    /// NULL row, and a record under the cursor.
+    const ON_A_ROW: u32 = u32::from_ne_bytes([0, 1, 0, 0]);
+
+    /// True when a read of the row under the cursor gives its value rather
+    /// than NULL. One 16-bit compare instead of two byte tests.
+    #[inline(always)]
+    fn on_a_row(self) -> bool {
+        self.bits() & 0x0000_ffff == Self::ON_A_ROW
+    }
 }
 
 pub struct BTreeCursor {
@@ -6797,26 +6808,21 @@ impl CursorTrait for BTreeCursor {
         if self.needs_restore() {
             return rowid_general(self);
         }
-        if self.get_null_flag() {
+        if !self.flags.on_a_row() {
             return Ok(IOResult::Done(None));
         }
-        return if self.has_record() {
-            let page = self.stack.top_ref();
-            let contents = page.get_contents();
-            if contents.is_table() {
-                let cell_idx = self.stack.current_cell_index();
-                let cell = contents.cell_table_leaf_read_header(cell_idx as usize)?;
-                self.noted_payload = NotedPayload {
-                    start: cell.payload_start as u32,
-                    size: u32::try_from(cell.payload_size).unwrap_or(0),
-                };
-                Ok(IOResult::Done(Some(cell.rowid)))
-            } else {
-                index_rowid(self)
-            }
-        } else {
-            Ok(IOResult::Done(None))
+        let page = self.stack.top_ref();
+        let contents = page.get_contents();
+        if !contents.is_table() {
+            return index_rowid(self);
+        }
+        let cell_idx = self.stack.current_cell_index();
+        let cell = contents.cell_table_leaf_read_header(cell_idx as usize)?;
+        self.noted_payload = NotedPayload {
+            start: cell.payload_start as u32,
+            size: u32::try_from(cell.payload_size).unwrap_or(0),
         };
+        return Ok(IOResult::Done(Some(cell.rowid)));
 
         #[inline(never)]
         fn rowid_general(cursor: &mut BTreeCursor) -> IOResultOr<Option<i64>> {
