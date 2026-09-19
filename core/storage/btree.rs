@@ -946,7 +946,12 @@ pub struct BTreeCursor {
     seek_state: CursorSeekState,
     /// Separate state to read a record with overflow pages. This separation from `state` is necessary as
     /// we can be in a function that relies on `state`, but also needs to process overflow pages
-    read_overflow_state: Option<ReadPayloadOverflow>,
+    /// Boxed so that `is_some` is a null-pointer test. Held inline, the Option
+    /// takes its niche from the payload Vec's capacity, a value near
+    /// `isize::MAX`, so the test needed a `movabs` and an `add` before the
+    /// compare. A scan asks this question for every row; an overflow read
+    /// starts rarely and already allocates its payload.
+    read_overflow_state: Option<Box<ReadPayloadOverflow>>,
     /// State machine for [BTreeCursor::is_empty_table]
     is_empty_table_state: EmptyTableState,
     /// State machine for [BTreeCursor::move_to_rightmost] and, optionally, the id of the rightmost page in the btree.
@@ -1569,12 +1574,13 @@ impl BTreeCursor {
                 let (page, c) = return_if_io!(self.read_page(start_next_page as i64));
                 let payload =
                     crate::with_btree_allocation_site!(OverflowRead, payload.try_to_vec())?;
-                self.read_overflow_state.replace(ReadPayloadOverflow {
-                    payload,
-                    next_page: start_next_page,
-                    remaining_to_read,
-                    page,
-                });
+                self.read_overflow_state
+                    .replace(Box::new(ReadPayloadOverflow {
+                        payload,
+                        next_page: start_next_page,
+                        remaining_to_read,
+                        page,
+                    }));
                 if let Some(c) = c {
                     io_yield_one!(c);
                 }
@@ -1612,7 +1618,7 @@ impl BTreeCursor {
                 remaining_to_read,
                 next_page,
                 page,
-            } = self.read_overflow_state.as_mut().unwrap();
+            } = &mut **self.read_overflow_state.as_mut().unwrap();
             let buf = page.get_contents().as_ptr();
             crate::with_btree_allocation_site!(
                 OverflowRead,
