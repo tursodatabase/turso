@@ -3918,10 +3918,21 @@ fn skip_serial_types(header: &mut &[u8], data: &mut &[u8], n: usize) -> Result<(
 }
 
 /// Reads the serial type at the front of `header` and moves past it.
+///
+/// Almost every serial type is one byte, and moving past a known one byte
+/// costs two instructions where moving past a variable count costs a
+/// compare, a branch and two adds.
 #[inline(always)]
 fn read_serial_type(header: &mut &[u8]) -> Result<u64> {
-    let (serial_type, bytes_read) = read_varint(header)?;
-    *header = &header[bytes_read..];
+    let bytes = *header;
+    if let Some((first, rest)) = bytes.split_first() {
+        if *first < 0x80 {
+            *header = rest;
+            return Ok(u64::from(*first));
+        }
+    }
+    let (serial_type, bytes_read) = read_varint(bytes)?;
+    *header = &bytes[bytes_read..];
     Ok(serial_type)
 }
 
@@ -4235,6 +4246,19 @@ mod tests {
                 other => panic!("expected blob, got {other:?}"),
             }
         }
+    }
+
+    #[test]
+    fn text_decode_reads_a_serial_type_that_needs_two_varint_bytes() {
+        let mut destination = Register::Value(Value::Null);
+        // 200 bytes of text gives serial type 413, which is two varint bytes.
+        let value: Vec<u8> = (0..200usize).map(|i| b'a' + (i % 26) as u8).collect();
+        decode_one_text(&one_text_record(&value), &mut destination).unwrap();
+        assert_eq!(register_text(&destination).as_bytes(), value.as_slice());
+
+        // And the register takes a one-byte serial type afterwards.
+        decode_one_text(&one_text_record(b"short"), &mut destination).unwrap();
+        assert_eq!(register_text(&destination), "short");
     }
 
     #[test]
