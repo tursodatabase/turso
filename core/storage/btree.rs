@@ -1298,6 +1298,7 @@ impl BTreeCursor {
             overflow_state: OverflowState::Start,
             stack: PageStack {
                 current_page: -1,
+                leaf_cell_count: 0,
                 node_states: [BTreeNodeState::default(); BTCURSOR_MAX_DEPTH + 1],
                 stack: std::mem::ManuallyDrop::new([const { None }; BTCURSOR_MAX_DEPTH + 1]),
             },
@@ -1887,6 +1888,29 @@ impl BTreeCursor {
         self.invalidate_record();
         self.set_has_record(has_record);
         Ok(IOResult::Done(()))
+    }
+
+    /// Compare the noted cell count with the page it came from. Every test in
+    /// every suite runs this, so a write that changes a page's cell count
+    /// without forgetting the note shows up as a failure rather than as a
+    /// scan that stops early.
+    #[inline(always)]
+    fn assert_noted_leaf_cell_count(&self, noted_cells: usize) {
+        #[cfg(debug_assertions)]
+        {
+            let contents = self.stack.top_ref().get_contents();
+            assert!(
+                contents.is_leaf(),
+                "noted a cell count for a page that is not a leaf"
+            );
+            assert_eq!(
+                contents.cell_count(),
+                noted_cells,
+                "noted cell count is not the cell count of the page under the cursor"
+            );
+        }
+        #[cfg(not(debug_assertions))]
+        let _ = noted_cells;
     }
 
     /// Move the cursor to the record that matches the seek key and seek operation.
@@ -6523,6 +6547,7 @@ impl BTreeCursor {
         self.valid_state = CursorValidState::RequireSeek;
         self.context = Some(Box::new(cursor_context));
         self.noted_payload = NotedPayload::NONE;
+        self.stack.forget_leaf_cell_count();
         // The tree is about to change under this cursor (that is the only reason a
         // position ever gets saved), so cached payload offsets and overflow page
         // numbers must not survive: blob I/O through them would touch relocated or
@@ -7018,6 +7043,7 @@ impl CursorTrait for BTreeCursor {
     fn insert(&mut self, key: &BTreeKey) -> IOResultOr<()> {
         tracing::debug!(valid_state = ?self.valid_state, cursor_state = ?self.state, is_write_in_progress = self.is_write_in_progress());
         self.noted_payload = NotedPayload::NONE;
+        self.stack.forget_leaf_cell_count();
         // saveAllCursors at the head of sqlite3BtreeInsert (btree.c:9348).
         return_if_io!(self.drive_pending_peer_save(key.maybe_rowid()));
         return_if_io!(self.insert_into_page(key));
@@ -7043,6 +7069,7 @@ impl CursorTrait for BTreeCursor {
     /// 10. Finish -> Delete operation is done. Return CursorResult(Ok())
     fn delete(&mut self) -> IOResultOr<()> {
         self.noted_payload = NotedPayload::NONE;
+        self.stack.forget_leaf_cell_count();
         if let CursorState::None = &self.state {
             // saveAllCursors at the head of sqlite3BtreeDelete (btree.c:9841). The
             // cursor is positioned on the row being deleted, so its rowid tells peer
@@ -7718,6 +7745,7 @@ impl CursorTrait for BTreeCursor {
         self.stack.clear();
         self.flags.has_record = false;
         self.noted_payload = NotedPayload::NONE;
+        self.stack.forget_leaf_cell_count();
         self.move_to_right_state.1 = None;
         self.invalidate_count_cache();
         self.blob_cache.reset();
@@ -7956,26 +7984,40 @@ impl BTreeCursor {
     /// iteration target; advancing would skip a row), an abandoned
     /// overflow read, and an in-flight spill descent.
     #[inline(always)]
-    fn can_advance_within_leaf(&self) -> bool {
+    fn can_advance_within_leaf(&mut self) -> bool {
         self.flags.state_machines_are_idle() && self.next_cell_is_on_this_leaf()
     }
 
     /// Everything `can_advance_within_leaf` asks except the four flags: no
     /// resumable work pending, and a next cell on this same leaf page.
     #[inline(always)]
-    fn next_cell_is_on_this_leaf(&self) -> bool {
+    fn next_cell_is_on_this_leaf(&mut self) -> bool {
         if !matches!(self.valid_state, CursorValidState::Valid)
             || self.read_overflow_state.is_some()
             || self.iteration_pending_descent.is_some()
         {
             return false;
         }
-        let contents = self.stack.top_ref().get_contents();
         let cell_idx = self.stack.current_cell_index();
         if cell_idx < 0 {
             return false;
         }
-        let (is_leaf, cell_count) = contents.is_leaf_and_cell_count();
+        // The noted count answers this without reading the page. Off the page
+        // it costs a null test on the page buffer, a bounds test for the
+        // five-byte header window and a byte swap, for a number that cannot
+        // change while the cursor holds the page and writes nothing to it.
+        let noted_cells = self.stack.current_leaf_cell_count() as usize;
+        if noted_cells != 0 {
+            self.assert_noted_leaf_cell_count(noted_cells);
+            return cell_idx as usize + 1 < noted_cells;
+        }
+        let (is_leaf, cell_count) = {
+            let contents = self.stack.top_ref().get_contents();
+            contents.is_leaf_and_cell_count()
+        };
+        if is_leaf {
+            self.stack.note_leaf_cell_count(cell_count);
+        }
         is_leaf && cell_idx as usize + 1 < cell_count
     }
 
@@ -8828,6 +8870,13 @@ struct PageStack {
     ///  If node_states[current_page] = -1, it indicates that the current iteration has reached the start of the current_page
     ///  If node_states[current_page] = `cell_count`, it means that the current iteration has reached the end of the current_page
     node_states: [BTreeNodeState; BTCURSOR_MAX_DEPTH + 1],
+    /// Cells on the leaf `current_page` points at, or 0 when the page is not a
+    /// leaf, holds no cells, or has not been read. `next` asks for this number
+    /// on every row of a scan, and reading it off the page costs a null test
+    /// on the page buffer, a bounds test for the five-byte header window and a
+    /// byte swap. 0 stands for "ask the page", so a path that forgets to keep
+    /// this up to date can only cost a reader those instructions again.
+    leaf_cell_count: u16,
 }
 
 impl PageStack {
@@ -8868,6 +8917,7 @@ impl PageStack {
             cell_idx: starting_cell_idx,
             cell_count: None, // we don't know the cell count yet, so we set it to None. any code pushing a child page onto the stack MUST set the parent page's cell_count.
         };
+        self.leaf_cell_count = 0;
     }
 
     /// Populate the parent page's cell count.
@@ -8924,6 +8974,7 @@ impl PageStack {
         self.node_states[current] = BTreeNodeState::default();
         self.stack[current] = None;
         self.current_page -= 1;
+        self.leaf_cell_count = 0;
     }
 
     /// Get the top page on the stack.
@@ -8965,6 +9016,33 @@ impl PageStack {
     fn current_cell_index(&self) -> i32 {
         let current = self.current();
         self.node_states[current].cell_idx
+    }
+
+    /// Cells on the leaf the cursor sits on, or 0 when that is not known.
+    ///
+    /// 0 also covers a page that is not a leaf and a leaf with no cells, so a
+    /// reader that gets 0 has to read the page. That is the same work it did
+    /// before this number was noted, so a cursor that forgets to note it stays
+    /// correct and only pays for the page read.
+    #[inline(always)]
+    fn current_leaf_cell_count(&self) -> u16 {
+        self.leaf_cell_count
+    }
+
+    /// Note how many cells the leaf under the cursor holds. The count comes
+    /// from a two-byte field of the page header, so it always fits.
+    #[inline(always)]
+    fn note_leaf_cell_count(&mut self, cell_count: usize) {
+        debug_assert!(cell_count <= u16::MAX as usize);
+        self.leaf_cell_count = cell_count as u16;
+    }
+
+    /// Forget the noted cell count of the page under the cursor. Every write
+    /// that can change how many cells that page holds calls this, including on
+    /// a cursor that holds no page at all.
+    #[inline(always)]
+    fn forget_leaf_cell_count(&mut self) {
+        self.leaf_cell_count = 0;
     }
 
     /// Check if the current cell index is less than 0.
@@ -9072,6 +9150,7 @@ impl PageStack {
             cell_idx: -1,
             cell_count: None,
         };
+        self.leaf_cell_count = 0;
         self.current_page = 0;
     }
 }
