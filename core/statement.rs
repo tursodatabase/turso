@@ -593,6 +593,10 @@ impl Statement {
     /// hand back to the caller when the statement must not run yet.
     #[inline(never)]
     fn prepare_step(&mut self, waker: Option<&Waker>) -> Result<Option<StepResult>> {
+        // Every execution starts in ProgramExecutionState::Init, which is one
+        // of the conditions that brings _step here, so this runs once per
+        // execution and the dispatch loop never reads the switches itself.
+        self.state.trace_flags = crate::vdbe::TraceFlags::read(&self.program.connection);
         if !self.counted_as_active_root && matches!(self.origin, StatementOrigin::Root) {
             self.program.connection.start_root_statement()?;
             self.counted_as_active_root = true;

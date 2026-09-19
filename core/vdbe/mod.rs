@@ -111,6 +111,48 @@ use tracing::{instrument, Level};
 
 const MAX_CHECK_INTERVAL: u64 = 256;
 
+/// Whether the dispatch loop must print each instruction it runs.
+///
+/// Both switches are global to the process or to the connection, and reading
+/// them costs an atomic load, a six-way match and a walk through the
+/// connection: eight instructions. A scan pays that on every row, because
+/// each row leaves the dispatch loop and re-enters it. They are read once per
+/// execution instead, off the hot path, and the dispatch loop tests the
+/// stored byte.
+#[derive(Clone, Copy, Default)]
+pub(crate) struct TraceFlags(u8);
+
+impl TraceFlags {
+    const TRACING: u8 = 1;
+    const VDBE: u8 = 2;
+
+    pub(crate) fn read(connection: &Connection) -> Self {
+        let mut bits = 0;
+        if tracing::enabled!(tracing::Level::TRACE) {
+            bits |= Self::TRACING;
+        }
+        if connection.get_vdbe_trace() {
+            bits |= Self::VDBE;
+        }
+        Self(bits)
+    }
+
+    #[inline(always)]
+    fn any(self) -> bool {
+        self.0 != 0
+    }
+
+    #[inline(always)]
+    fn tracing_enabled(self) -> bool {
+        self.0 & Self::TRACING != 0
+    }
+
+    #[inline(always)]
+    fn vdbe_trace(self) -> bool {
+        self.0 & Self::VDBE != 0
+    }
+}
+
 type MvccCommitStateMachine = CommitStateMachine<MvccClock, DynAllocator>;
 
 /// State machine for committing view deltas with I/O handling
@@ -877,6 +919,8 @@ pub struct ProgramState {
     /// The interval the countdown was last reloaded with, re-derived from
     /// the progress handler's interval each time the check runs.
     check_interval: u64,
+    /// Whether the dispatch loop must trace, read once per execution.
+    pub(crate) trace_flags: TraceFlags,
     pub io_completions: Option<IOCompletions>,
     pub pc: InsnReference,
     pub(crate) cursors: Vec<Option<Cursor>>,
@@ -1048,6 +1092,7 @@ impl ProgramState {
         Self {
             check_countdown: 1,
             check_interval: MAX_CHECK_INTERVAL,
+            trace_flags: TraceFlags::default(),
             io_completions: None,
             pc: 0,
             cursors,
@@ -1981,6 +2026,10 @@ impl Program {
         waker: Option<&Waker>,
     ) -> Result<StepResult, Box<LimboError>> {
         if let QueryMode::Normal = query_mode {
+            // Subprograms reach the dispatch loop through here rather than
+            // through Statement::prepare_step, so this is where they read the
+            // trace switches.
+            state.trace_flags = TraceFlags::read(&self.connection);
             return self.normal_step(state, pager, waker).into();
         }
         state.execution_state = ProgramExecutionState::Running;
@@ -2254,10 +2303,16 @@ impl Program {
         waker: Option<&Waker>,
     ) -> ProgramStep {
         state.execution_state = ProgramExecutionState::Running;
-        let enable_tracing = tracing::enabled!(tracing::Level::TRACE);
-        let vdbe_trace = self.connection.get_vdbe_trace();
-        let result = if enable_tracing || vdbe_trace {
-            dispatch_loop_traced(self, state, pager, waker, enable_tracing, vdbe_trace)
+        let trace_flags = state.trace_flags;
+        let result = if trace_flags.any() {
+            dispatch_loop_traced(
+                self,
+                state,
+                pager,
+                waker,
+                trace_flags.tracing_enabled(),
+                trace_flags.vdbe_trace(),
+            )
         } else {
             dispatch_loop::<false>(self, state, pager, waker, false, false)
         };
