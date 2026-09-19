@@ -1990,7 +1990,7 @@ pub fn op_column(
         },
         insn
     );
-    if state.active_op_state.is_idle() && state.deferred_seeks[*cursor_id].is_none() {
+    if state.active_op_state.is_idle() && state.no_deferred_seeks() {
         let result = op_column_fetch(program, state, *cursor_id, *column, *dest, default)?;
         if matches!(result, InsnFunctionStepResult::Step) {
             state.pc += 1;
@@ -2028,7 +2028,7 @@ pub fn op_column_range(
         },
         insn
     );
-    if state.active_op_state.is_idle() && state.deferred_seeks[*cursor_id].is_none() {
+    if state.active_op_state.is_idle() && state.no_deferred_seeks() {
         let result =
             op_column_range_fetch(program, state, *cursor_id, *start_column, *dest, defaults)?;
         if matches!(result, InsnFunctionStepResult::Step) {
@@ -2107,7 +2107,7 @@ fn op_column_deferred(
     'outer: loop {
         match *state.active_op_state.column() {
             OpColumnState::Start => {
-                if let Some(deferred) = state.deferred_seeks[cursor_id].take() {
+                if let Some(deferred) = state.take_deferred_seek(cursor_id) {
                     *state.active_op_state.column() = OpColumnState::Rowid {
                         index_cursor_id: deferred.index_cursor_id,
                         table_cursor_id: deferred.table_cursor_id,
@@ -6170,7 +6170,7 @@ pub fn op_row_id(
     // Fast path: no deferred seek pending and no suspended state machine, so
     // the op-state slot (enum write + drop on clear) is bypassed. On an IO
     // yield nothing is persisted and this path simply re-executes.
-    if state.active_op_state.is_idle() && state.deferred_seeks[*cursor_id].is_none() {
+    if state.active_op_state.is_idle() && state.no_deferred_seeks() {
         let result = op_row_id_read(state, *cursor_id, *dest)?;
         if matches!(result, InsnFunctionStepResult::Step) {
             state.pc += 1;
@@ -6187,7 +6187,7 @@ fn op_row_id_deferred(state: &mut ProgramState, cursor_id: usize, dest: usize) -
     loop {
         match *state.active_op_state.row_id() {
             OpRowIdState::Start => {
-                if let Some(deferred) = state.deferred_seeks[cursor_id].take() {
+                if let Some(deferred) = state.take_deferred_seek(cursor_id) {
                     *state.active_op_state.row_id() = OpRowIdState::Record {
                         index_cursor_id: deferred.index_cursor_id,
                         table_cursor_id: deferred.table_cursor_id,
@@ -6440,10 +6440,13 @@ pub fn op_deferred_seek(
         },
         insn
     );
-    state.deferred_seeks[*table_cursor_id] = Some(DeferredSeekState {
-        index_cursor_id: *index_cursor_id,
-        table_cursor_id: *table_cursor_id,
-    });
+    state.set_deferred_seek(
+        *table_cursor_id,
+        DeferredSeekState {
+            index_cursor_id: *index_cursor_id,
+            table_cursor_id: *table_cursor_id,
+        },
+    );
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
 }
@@ -13996,13 +13999,7 @@ pub fn op_copy(
 /// survives, the first Column/RowId read in the write loop can jump back to the
 /// collection-phase index cursor and read the wrong row.
 fn invalidate_deferred_seeks_for_cursor(state: &mut ProgramState, cursor_id: usize) {
-    for deferred_seek in &mut state.deferred_seeks {
-        if let Some(ds) = deferred_seek {
-            if ds.index_cursor_id == cursor_id || ds.table_cursor_id == cursor_id {
-                *deferred_seek = None;
-            }
-        }
-    }
+    state.clear_deferred_seeks_naming(cursor_id);
 }
 
 pub fn op_create_btree(
@@ -15135,9 +15132,7 @@ pub fn op_close(
         .get_mut(*cursor_id)
         .expect("cursor_id should be valid")
         .take();
-    if let Some(deferred_seek) = state.deferred_seeks.get_mut(*cursor_id) {
-        deferred_seek.take();
-    }
+    state.take_deferred_seek(*cursor_id);
     state.ephemeral_temp_files.remove(cursor_id);
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)

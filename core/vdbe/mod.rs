@@ -913,6 +913,10 @@ pub struct ProgramState {
     pub(crate) result_row: Option<Row>,
     last_compare: Option<std::cmp::Ordering>,
     deferred_seeks: Vec<Option<DeferredSeekState>>,
+    /// How many slots of `deferred_seeks` hold a seek. Column and RowId test
+    /// this instead of indexing the slot vector, which costs a bounds check
+    /// and a 24-byte stride on a path they walk once per row.
+    deferred_seeks_pending: usize,
     /// Indicate whether a coroutine has ended for a given yield register.
     /// If an element is present, it means the coroutine with the given register number has ended.
     ended_coroutine: Vec<u32>,
@@ -1073,6 +1077,7 @@ impl ProgramState {
             result_row: None,
             last_compare: None,
             deferred_seeks: vec![None; max_cursors],
+            deferred_seeks_pending: 0,
             ended_coroutine: vec![],
             once: SmallVec::<[u32; 4]>::new(),
             execution_state: ProgramExecutionState::Init,
@@ -1164,6 +1169,49 @@ impl ProgramState {
         self.parameters.clear();
     }
 
+    /// True while no cursor has a deferred seek waiting.
+    #[inline(always)]
+    pub(crate) fn no_deferred_seeks(&self) -> bool {
+        turso_debug_assert!(
+            (self.deferred_seeks_pending == 0) == self.deferred_seeks.iter().all(Option::is_none),
+            "deferred_seeks_pending drifted from the slots it counts"
+        );
+        self.deferred_seeks_pending == 0
+    }
+
+    pub(crate) fn set_deferred_seek(&mut self, cursor_id: usize, seek: DeferredSeekState) {
+        if self.deferred_seeks[cursor_id].replace(seek).is_none() {
+            self.deferred_seeks_pending += 1;
+        }
+    }
+
+    pub(crate) fn take_deferred_seek(&mut self, cursor_id: usize) -> Option<DeferredSeekState> {
+        let taken = self
+            .deferred_seeks
+            .get_mut(cursor_id)
+            .and_then(Option::take);
+        if taken.is_some() {
+            self.deferred_seeks_pending -= 1;
+        }
+        taken
+    }
+
+    /// Drops every deferred seek that names `cursor_id` on either side.
+    pub(crate) fn clear_deferred_seeks_naming(&mut self, cursor_id: usize) {
+        for slot in &mut self.deferred_seeks {
+            let Some(seek) = slot else { continue };
+            if seek.index_cursor_id == cursor_id || seek.table_cursor_id == cursor_id {
+                *slot = None;
+                self.deferred_seeks_pending -= 1;
+            }
+        }
+    }
+
+    pub(crate) fn clear_deferred_seeks(&mut self) {
+        self.deferred_seeks.iter_mut().for_each(|s| *s = None);
+        self.deferred_seeks_pending = 0;
+    }
+
     pub fn get_parameter(&self, index: NonZero<usize>) -> Value {
         let i = index.get() - 1;
         self.parameters.get(i).cloned().unwrap_or(Value::Null)
@@ -1222,7 +1270,7 @@ impl ProgramState {
             }
         }
         self.last_compare = None;
-        self.deferred_seeks.iter_mut().for_each(|s| *s = None);
+        self.clear_deferred_seeks();
         self.ended_coroutine.clear();
         self.once.clear();
         self.execution_state = ProgramExecutionState::Init;
