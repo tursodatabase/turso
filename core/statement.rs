@@ -594,7 +594,7 @@ impl Statement {
             || self.busy_handler_state.is_some()
         {
             match self.prepare_step(waker) {
-                Ok(Some(result)) => return self.into_outcome(Ok(result)),
+                Ok(Some(result)) => return self.outcome_of(Ok(result)),
                 Ok(None) => {}
                 Err(err) => return StepOutcome::Error(err.into()),
             }
@@ -618,12 +618,12 @@ impl Statement {
                 .step(&mut self.state, &self.pager, self.query_mode, waker),
         };
         let res = self.finish_step(res, waker);
-        self.into_outcome(res)
+        self.outcome_of(res)
     }
 
-    /// Moves a step result into a [StepOutcome], parking a sleep delay in
+    /// Turns a step result into a [StepOutcome], keeping a sleep delay in
     /// `pending_sleep` so the outcome stays two machine words.
-    fn into_outcome(
+    fn outcome_of(
         &mut self,
         res: std::result::Result<StepResult, Box<LimboError>>,
     ) -> StepOutcome {
@@ -642,7 +642,7 @@ impl Statement {
         }
     }
 
-    fn from_outcome(&self, outcome: StepOutcome) -> Result<StepResult> {
+    fn step_result_of(&self, outcome: StepOutcome) -> Result<StepResult> {
         match outcome {
             StepOutcome::Done => Ok(StepResult::Done),
             StepOutcome::IO => Ok(StepResult::IO),
@@ -830,13 +830,13 @@ impl Statement {
         // The interpreter chain carries a register-sized outcome and a boxed
         // error; both widen to the public shape once here.
         let outcome = self._step(None);
-        self.from_outcome(outcome)
+        self.step_result_of(outcome)
     }
 
     #[inline]
     pub fn step_with_waker(&mut self, waker: &Waker) -> Result<StepResult> {
         let outcome = self._step(Some(waker));
-        self.from_outcome(outcome)
+        self.step_result_of(outcome)
     }
 
     /// Fast step for trigger/FK subprograms: skips reprepare checks, timeout
