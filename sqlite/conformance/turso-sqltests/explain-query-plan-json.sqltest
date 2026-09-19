@@ -93,6 +93,24 @@ expect {
 }
 
 @setup schema
+test an-exists-subquery-does-not-take-a-subquery-number {
+    EXPLAIN QUERY PLAN
+    SELECT EXISTS (SELECT 1 FROM orders),
+           (SELECT max(age) FROM users),
+           name
+    FROM users
+    WHERE age IN (SELECT age FROM users WHERE city_id = 3);
+}
+expect {
+    1|0|0|LIST SUBQUERY 1
+    4|1|0|SCAN users
+    16|0|0|SCAN orders USING COVERING INDEX idx_orders_user
+    25|0|0|SCALAR SUBQUERY 2
+    29|25|0|SCAN users USING COVERING INDEX idx_users_age
+    43|0|0|SEARCH users USING INDEX idx_users_age (age=?)
+}
+
+@setup schema
 test an-or-over-two-indexes-lists-both-branches {
     EXPLAIN QUERY PLAN FORMAT=JSON
     SELECT *

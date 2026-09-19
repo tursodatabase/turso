@@ -442,7 +442,6 @@ pub(crate) fn emit_materialized_build_inputs(
 
     // Now we emit each of the materialization subplans into an ephemeral table.
     for spec in materializations.iter() {
-        let build_table = &plan.table_references.joined_tables()[spec.build_table_idx];
         let internal_id = program.table_reference_counter.next();
         let columns = match &spec.mode {
             MaterializedBuildInputMode::RowidOnly => {
@@ -481,14 +480,13 @@ pub(crate) fn emit_materialized_build_inputs(
         )?;
 
         // Make the materialization plan show up as a subtree in EXPLAIN QUERY PLAN output.
-        emit_explain!(
-            program,
-            true,
+        emit_explain!(program, true, {
+            let build_table = &plan.table_references.joined_tables()[spec.build_table_idx];
             crate::translate::eqp::EqpDetail::HashBuild {
                 table: crate::translate::eqp::EqpTable::from_joined(build_table),
                 estimate: build_table.plan_estimate,
             }
-        );
+        });
         program.emit_insn(Insn::OpenEphemeral {
             cursor_id,
             is_table: true,

@@ -217,16 +217,14 @@ pub fn emit_program_for_delete(
         // Normal DELETE path without RowSet
 
         // Emit EXPLAIN QUERY PLAN annotation
-        let table_ref = plan
-            .table_references
-            .joined_tables()
-            .first()
-            .expect("DELETE always has one joined table");
-        emit_explain!(
-            program,
-            true,
+        emit_explain!(program, true, {
+            let table_ref = plan
+                .table_references
+                .joined_tables()
+                .first()
+                .expect("DELETE always has one joined table");
             eqp_detail_for_table_op(table_ref, None, None)
-        );
+        });
 
         // Set up main query execution loop
         OpenLoop::emit(
