@@ -843,6 +843,61 @@ pub trait CursorTrait: Any + Send + Sync {
     // --- end: BTreeCursor specific functions ----
 }
 
+/// The four one-byte cursor flags that decide whether `next` can advance to the
+/// next cell of the same leaf page.
+///
+/// They sit in one `#[repr(C)]` word so the test reads them with a single
+/// four-byte compare. As separate fields they were four one-byte compares and
+/// four branches, on a path a scan runs for every row.
+#[derive(Debug, Clone, Copy)]
+#[repr(C)]
+struct AdvanceFlags {
+    /// The cursor sits on a NULL row placed by `NullRow`; every read yields
+    /// NULL and `next` does not advance.
+    null_flag: bool,
+    /// The cursor points at an existing cell that has a record.
+    has_record: bool,
+    /// The next call to `next` must not advance. Set after a delete rebalanced
+    /// the tree and the restore already landed on the iteration target.
+    skip_advance: bool,
+    /// State machine for `next` and `prev`.
+    advance_state: AdvanceState,
+}
+
+impl AdvanceFlags {
+    /// The one pattern that lets `next` advance inside the leaf: not a NULL
+    /// row, a record under the cursor, no suppressed advance, and no advance
+    /// already in progress.
+    const READY: u32 = u32::from_ne_bytes([0, 1, 0, AdvanceState::Start as u8]);
+    /// Where the NULL-row byte sits, so the callers that test only the three
+    /// state-machine flags can leave it out.
+    const NULL_ROW_BYTE: u32 = u32::from_ne_bytes([0xff, 0, 0, 0]);
+
+    #[inline(always)]
+    fn bits(self) -> u32 {
+        // Read as one word. Assembled from four byte loads, LLVM keeps them
+        // apart and the test costs six instructions instead of two.
+        //
+        // SAFETY: `#[repr(C)]` over three bools and one fieldless
+        // `#[repr(u8)]` enum is four initialized bytes with no padding, so
+        // every bit pattern of `Self` is a valid `[u8; 4]`.
+        u32::from_ne_bytes(unsafe { std::mem::transmute::<Self, [u8; 4]>(self) })
+    }
+
+    /// True when `next` may advance inside the leaf, as far as these flags say.
+    #[inline(always)]
+    fn ready_to_advance(self) -> bool {
+        self.bits() == Self::READY
+    }
+
+    /// `ready_to_advance` without the NULL-row flag, which the callers that
+    /// handle a NULL row themselves have already tested.
+    #[inline(always)]
+    fn state_machines_are_idle(self) -> bool {
+        self.bits() & !Self::NULL_ROW_BYTE == Self::READY & !Self::NULL_ROW_BYTE
+    }
+}
+
 pub struct BTreeCursor {
     /// The pager that is used to read and write to the database file.
     pub pager: Arc<Pager>,
@@ -855,9 +910,8 @@ pub struct BTreeCursor {
     payload_limits: PayloadLimits,
     /// Page id of the root page used to go back up fast.
     root_page: i64,
-    /// Rowid and record are stored before being consumed.
-    pub has_record: bool,
-    null_flag: bool,
+    /// The four one-byte flags the within-leaf advance depends on.
+    flags: AdvanceFlags,
     /// Index internal pages are consumed on the way up, so we store going upwards flag in case
     /// we just moved to a parent page and the parent page is an internal index page which requires
     /// to be consumed.
@@ -902,19 +956,12 @@ pub struct BTreeCursor {
     seek_to_last_state: SeekToLastState,
     /// State machine for [BTreeCursor::rewind]
     rewind_state: RewindState,
-    /// State machine for [BTreeCursor::next] and [BTreeCursor::prev]
-    advance_state: AdvanceState,
     /// State machine for [BTreeCursor::count]
     count_state: CountState,
     /// State machine for [BTreeCursor::seek_end]
     seek_end_state: SeekEndState,
     /// State machine for [BTreeCursor::move_to]
     move_to_state: MoveToState,
-    /// Whether the next call to [BTreeCursor::next()] should be a no-op.
-    /// This is currently only used after a delete operation causes a rebalancing.
-    /// Advancing is only skipped if the cursor is currently pointing to a valid record
-    /// when next() is called.
-    pub skip_advance: bool,
     /// Reusable buffer for cell payloads during insert/update operations.
     /// This avoids allocating a new Vec for each write operation.
     reusable_cell_payload: crate::alloc::Vec<u8>,
@@ -1189,8 +1236,12 @@ impl BTreeCursor {
             root_page,
             usable_space_cached: usable_space,
             payload_limits: PayloadLimits::new(usable_space),
-            has_record: false,
-            null_flag: false,
+            flags: AdvanceFlags {
+                null_flag: false,
+                has_record: false,
+                skip_advance: false,
+                advance_state: AdvanceState::Start,
+            },
             going_upwards: false,
             state: CursorState::None,
             balance_state: BalanceState::default(),
@@ -1212,11 +1263,9 @@ impl BTreeCursor {
             move_to_right_state: (MoveToRightState::Start, None),
             seek_to_last_state: SeekToLastState::Start,
             rewind_state: RewindState::Start,
-            advance_state: AdvanceState::Start,
             count_state: CountState::Start,
             seek_end_state: SeekEndState::Start,
             move_to_state: MoveToState::Start,
-            skip_advance: false,
             reusable_cell_payload: crate::alloc::vec![],
             blob_cache: BlobCellCache::default(),
             blob_pinned_rowid: None,
@@ -2484,7 +2533,7 @@ impl BTreeCursor {
     fn prepare_current_table_leaf_seek(&mut self, rowid: i64, seek_op: SeekOp) -> Result<()> {
         if !matches!(seek_op, SeekOp::GE { eq_only: true })
             || self.valid_state != CursorValidState::Valid
-            || !self.has_record
+            || !self.flags.has_record
             || !matches!(self.move_to_state, MoveToState::Start)
             || self.stack.current_page < 0
         {
@@ -2645,7 +2694,7 @@ impl BTreeCursor {
             Ok(ControlFlow::Break(IOResult::Done(if seek_op.eq_only() {
                 let has_record = target_cell_when_not_found >= 0
                     && target_cell_when_not_found < contents.cell_count() as i32;
-                cursor.has_record = has_record;
+                cursor.flags.has_record = has_record;
                 cursor.stack.set_cell_index(target_cell_when_not_found);
                 SeekResult::NotFound
             } else {
@@ -2848,7 +2897,7 @@ impl BTreeCursor {
                                 .get_page_contents_at_level(old_top_idx)
                                 .unwrap()
                                 .cell_count() as i32;
-                    self.has_record = has_record;
+                    self.flags.has_record = has_record;
 
                     // Similar logic as in tablebtree_seek(), but for indexes.
                     // The difference is that since index keys are not necessarily unique, we need to TryAdvance
@@ -3051,7 +3100,7 @@ impl BTreeCursor {
                             BTreeCell::TableLeafCell(tbl_leaf) => {
                                 if tbl_leaf.rowid == bkey.to_rowid() {
                                     tracing::debug!("TableLeafCell: found exact match with cell_idx={cell_idx}, overwriting");
-                                    self.has_record = true;
+                                    self.flags.has_record = true;
                                     *write_state = WriteState::Overwrite {
                                         page,
                                         cell_idx,
@@ -5731,7 +5780,7 @@ impl BTreeCursor {
     /// through some other operation's state machine.
     fn blob_position_is_live(&self) -> bool {
         self.valid_state == CursorValidState::Valid
-            && self.has_record
+            && self.flags.has_record
             && matches!(self.state, CursorState::None)
             && self.stack.current_page >= 0
     }
@@ -6318,7 +6367,7 @@ impl BTreeCursor {
     /// stacks, mid-operation states). Callers that use `None` must treat it as
     /// "unknown row" and act conservatively.
     fn current_table_leaf_rowid(&self) -> Option<i64> {
-        if self.valid_state != CursorValidState::Valid || !self.has_record {
+        if self.valid_state != CursorValidState::Valid || !self.flags.has_record {
             return None;
         }
         if self.stack.current_page < 0
@@ -6455,7 +6504,7 @@ impl BTreeCursor {
                         // via skip_advance so the next next() returns the
                         // landed cell instead of advancing past it — mirrors
                         // SQLite's CURSOR_SKIPNEXT (btree.c:915).
-                        self.skip_advance = true;
+                        self.flags.skip_advance = true;
                         self.valid_state = CursorValidState::Valid;
                         Ok(IOResult::Done(()))
                     }
@@ -6612,7 +6661,7 @@ impl CursorTrait for BTreeCursor {
             return Ok(IOResult::Done(()));
         }
         loop {
-            match self.advance_state {
+            match self.flags.advance_state {
                 AdvanceState::Start => {
                     return_if_io!(self.restore_context());
                     // Set by DeleteState::RestoreContextAfterBalancing and by
@@ -6620,8 +6669,8 @@ impl CursorTrait for BTreeCursor {
                     // the right iteration target, so return it without
                     // advancing. If the landed cell has no record (past
                     // EOF), fall through to Advance.
-                    if self.skip_advance {
-                        self.skip_advance = false;
+                    if self.flags.skip_advance {
+                        self.flags.skip_advance = false;
                         if self.stack.current_page >= 0 {
                             let mem_page = self.stack.top_ref();
                             let contents = mem_page.get_contents();
@@ -6635,11 +6684,11 @@ impl CursorTrait for BTreeCursor {
                             }
                         }
                     }
-                    self.advance_state = AdvanceState::Advance;
+                    self.flags.advance_state = AdvanceState::Advance;
                 }
                 AdvanceState::Advance => {
                     return_if_io!(self.get_next_record());
-                    self.advance_state = AdvanceState::Start;
+                    self.flags.advance_state = AdvanceState::Start;
                     self.read_overflow_state = None;
                     return Ok(IOResult::Done(()));
                 }
@@ -6649,31 +6698,35 @@ impl CursorTrait for BTreeCursor {
 
     #[inline(always)]
     fn next_row(&mut self) -> CursorStep {
-        if self.null_flag {
-            self.null_flag = false;
-            return CursorStep::Empty;
-        }
-        if self.can_advance_within_leaf() {
+        // One four-byte compare covers the NULL-row flag together with the
+        // three state-machine flags, so the row path tests them once. Every
+        // other case falls through to the general path below, which handles a
+        // NULL row itself.
+        if self.flags.ready_to_advance() && self.next_cell_is_on_this_leaf() {
             self.stack.advance();
             self.invalidate_record();
             return CursorStep::Row;
         }
+        if self.flags.null_flag {
+            self.flags.null_flag = false;
+            return CursorStep::Empty;
+        }
         match self.next() {
             Ok(IOResult::IO(io)) => CursorStep::IO(io),
             Err(err) => CursorStep::Error(err),
-            Ok(IOResult::Done(())) => CursorStep::at_row(self.has_record),
+            Ok(IOResult::Done(())) => CursorStep::at_row(self.flags.has_record),
         }
     }
 
     fn prev_row(&mut self) -> CursorStep {
-        if self.null_flag {
-            self.null_flag = false;
+        if self.flags.null_flag {
+            self.flags.null_flag = false;
             return CursorStep::Empty;
         }
         match self.prev() {
             Ok(IOResult::IO(io)) => CursorStep::IO(io),
             Err(err) => CursorStep::Error(err),
-            Ok(IOResult::Done(())) => CursorStep::at_row(self.has_record),
+            Ok(IOResult::Done(())) => CursorStep::at_row(self.flags.has_record),
         }
     }
 
@@ -6694,14 +6747,14 @@ impl CursorTrait for BTreeCursor {
     #[cfg_attr(debug_assertions, instrument(skip_all, level = Level::DEBUG))]
     fn prev(&mut self) -> IOResultOr<()> {
         loop {
-            match self.advance_state {
+            match self.flags.advance_state {
                 AdvanceState::Start => {
                     return_if_io!(self.restore_context());
-                    self.advance_state = AdvanceState::Advance;
+                    self.flags.advance_state = AdvanceState::Advance;
                 }
                 AdvanceState::Advance => {
                     return_if_io!(self.get_prev_record());
-                    self.advance_state = AdvanceState::Start;
+                    self.flags.advance_state = AdvanceState::Start;
                     self.read_overflow_state = None;
                     return Ok(IOResult::Done(()));
                 }
@@ -6751,7 +6804,7 @@ impl CursorTrait for BTreeCursor {
 
     #[cfg_attr(debug_assertions, instrument(skip(self, key), level = Level::DEBUG))]
     fn seek(&mut self, key: SeekKey<'_>, op: SeekOp) -> IOResultOr<SeekResult> {
-        self.skip_advance = false;
+        self.flags.skip_advance = false;
         // Empty trace to capture the span information
         tracing::trace!("");
         // We need to clear the null flag for the table cursor before seeking,
@@ -6769,7 +6822,7 @@ impl CursorTrait for BTreeCursor {
 
     #[cfg_attr(debug_assertions, instrument(skip(self, registers), level = Level::DEBUG))]
     fn seek_unpacked(&mut self, registers: &[Register], op: SeekOp) -> IOResultOr<SeekResult> {
-        self.skip_advance = false;
+        self.flags.skip_advance = false;
         // Empty trace to capture the span information
         tracing::trace!("");
         // We need to clear the null flag for the table cursor before seeking,
@@ -6826,7 +6879,7 @@ impl CursorTrait for BTreeCursor {
         if self.needs_restore() {
             return restore_record_payload(self);
         }
-        if self.null_flag || !self.has_record() {
+        if self.flags.null_flag || !self.has_record() {
             return Ok(IOResult::Done(None));
         }
         let noted = self.noted_payload;
@@ -7261,7 +7314,7 @@ impl CursorTrait for BTreeCursor {
                     // This means that the cursor is now pointing to the next key after K.
                     // We need to make the next call to BTreeCursor::next() a no-op so that we don't skip over
                     // a row when deleting rows in a loop.
-                    self.skip_advance = true;
+                    self.flags.skip_advance = true;
                     self.state = CursorState::None;
                     return Ok(IOResult::Done(()));
                 }
@@ -7274,12 +7327,12 @@ impl CursorTrait for BTreeCursor {
     /// for each left-side row. In order to achieve this, we set the null flag on the right-side table cursor
     /// so that it returns NULL for all columns until cleared.
     fn set_null_flag(&mut self, flag: bool) {
-        self.null_flag = flag;
+        self.flags.null_flag = flag;
     }
 
     #[inline(always)]
     fn get_null_flag(&self) -> bool {
-        self.null_flag
+        self.flags.null_flag
     }
 
     #[cfg_attr(debug_assertions, instrument(skip_all, level = Level::DEBUG))]
@@ -7487,7 +7540,7 @@ impl CursorTrait for BTreeCursor {
 
     #[inline]
     fn is_empty(&self) -> bool {
-        !self.has_record
+        !self.flags.has_record
     }
 
     #[inline]
@@ -7506,7 +7559,7 @@ impl CursorTrait for BTreeCursor {
             return Ok(IOResult::Done(()));
         }
         self.clear_saved_seek();
-        self.skip_advance = false;
+        self.flags.skip_advance = false;
         loop {
             match self.rewind_state {
                 RewindState::Start => {
@@ -7549,7 +7602,7 @@ impl CursorTrait for BTreeCursor {
 
     #[inline]
     fn get_skip_advance(&self) -> bool {
-        self.skip_advance
+        self.flags.skip_advance
     }
 
     /// Drop the page stack and auxiliary caches so the cursor will re-navigate
@@ -7560,7 +7613,7 @@ impl CursorTrait for BTreeCursor {
     /// next; next/prev land on `current_page == -1` and return Done(false).
     fn invalidate_btree_cache(&mut self) {
         self.stack.clear();
-        self.has_record = false;
+        self.flags.has_record = false;
         self.noted_payload = NotedPayload::NONE;
         self.move_to_right_state.1 = None;
         self.invalidate_count_cache();
@@ -7690,12 +7743,12 @@ impl CursorTrait for BTreeCursor {
 
     #[inline]
     fn has_record(&self) -> bool {
-        self.has_record
+        self.flags.has_record
     }
 
     #[inline]
     fn set_has_record(&mut self, has_record: bool) {
-        self.has_record = has_record
+        self.flags.has_record = has_record
     }
 
     #[inline]
@@ -7801,7 +7854,17 @@ impl BTreeCursor {
     /// overflow read, and an in-flight spill descent.
     #[inline(always)]
     fn can_advance_within_leaf(&self) -> bool {
-        if self.has_pending_advance_state() {
+        self.flags.state_machines_are_idle() && self.next_cell_is_on_this_leaf()
+    }
+
+    /// Everything `can_advance_within_leaf` asks except the four flags: no
+    /// resumable work pending, and a next cell on this same leaf page.
+    #[inline(always)]
+    fn next_cell_is_on_this_leaf(&self) -> bool {
+        if !matches!(self.valid_state, CursorValidState::Valid)
+            || self.read_overflow_state.is_some()
+            || self.iteration_pending_descent.is_some()
+        {
             return false;
         }
         let contents = self.stack.top_ref().get_contents();
@@ -7828,11 +7891,9 @@ impl BTreeCursor {
 
     #[inline(always)]
     fn has_pending_advance_state(&self) -> bool {
-        !matches!(self.advance_state, AdvanceState::Start)
+        !self.flags.state_machines_are_idle()
             || !matches!(self.valid_state, CursorValidState::Valid)
             || self.needs_restore()
-            || self.skip_advance
-            || !self.has_record
             || self.read_overflow_state.is_some()
             || self.iteration_pending_descent.is_some()
     }
@@ -11109,7 +11170,7 @@ mod tests {
     fn assert_btree_empty(cursor: &mut BTreeCursor, pager: &Pager) -> Result<()> {
         let _c = cursor.move_to_root()?;
         run_until_done(|| cursor.next(), pager)?;
-        let empty = !cursor.has_record;
+        let empty = !cursor.flags.has_record;
         assert!(empty, "expected B-tree to be empty");
         Ok(())
     }
@@ -11482,7 +11543,7 @@ mod tests {
         assert!(matches!(result, IOResult::Done(_)));
         let result = cursor.next()?;
         assert!(matches!(result, IOResult::Done(_)));
-        assert!(!cursor.has_record);
+        assert!(!cursor.flags.has_record);
         let result = cursor.record()?;
         assert!(matches!(result, IOResult::Done(record) if record.is_none()));
         Ok(())
@@ -11968,7 +12029,7 @@ mod tests {
             let mut count = 0;
             while {
                 run_until_done(|| cursor.next(), pager.deref()).unwrap();
-                cursor.has_record
+                cursor.flags.has_record
             } {
                 count += 1;
             }
@@ -15333,7 +15394,7 @@ mod tests {
         );
 
         let mut rows = 0;
-        while cursor.has_record {
+        while cursor.flags.has_record {
             rows += 1;
             run_until_done(|| cursor.next(), pager.deref()).unwrap();
         }
@@ -15349,7 +15410,7 @@ mod tests {
 
         run_until_done(|| cursor.rewind(), pager.deref()).unwrap();
         let mut rowids = crate::alloc::vec![];
-        while cursor.has_record {
+        while cursor.flags.has_record {
             let rowid = run_until_done(|| cursor.rowid(), pager.deref())
                 .unwrap()
                 .unwrap();
