@@ -412,7 +412,7 @@ impl Register {
     /// which is faster than always creating a new one.
     pub fn set_int(&mut self, val: i64) {
         // One test of the numeric tag, not one per numeric kind: writing the
-        // tag back over an integer that already carries it costs a store,
+        // tag back over an integer that already has it costs a store,
         // while telling the two apart costs a load, a compare and a branch.
         match self {
             Register::Value(Value::Numeric(numeric)) => {
@@ -2375,7 +2375,7 @@ impl Program {
         };
         // A row leaves the execution running, which it already is. Returning
         // it as a fresh constant, before the match that reads the other
-        // outcomes apart, lets the caller's own match on it settle at compile
+        // outcomes apart, lets the caller's own match on it resolve at compile
         // time: this runs once for every row a statement returns.
         if matches!(result, ProgramStep::Row) {
             return ProgramStep::Row;

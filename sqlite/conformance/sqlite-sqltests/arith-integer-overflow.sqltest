@@ -3,8 +3,8 @@
 # The Add, Subtract and Multiply opcodes work on two integers directly and
 # send every other operand pair somewhere else: floats, values that are not
 # numbers, and an integer pair whose result does not fit in an integer. The
-# last one is the boundary these pin -- an overflowing pair must come back
-# as a real, and a pair that only looks close to the edge must not.
+# last one is the boundary these tests cover: an overflowing pair must come
+# back as a real, and a pair that only looks close to the edge must not.
 
 setup edges {
     CREATE TABLE t(a, b);

@@ -7918,7 +7918,7 @@ impl BTreeCursor {
 
     /// Works out what the advance gate stands for. `needs_restore` is left
     /// out: it only holds when `valid_state` is not `Valid`, which the line
-    /// above it already answers.
+    /// above it already tests.
     #[inline]
     fn compute_advance_blocked(&self) -> bool {
         !matches!(self.advance_state, AdvanceState::Start)
