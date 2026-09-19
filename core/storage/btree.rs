@@ -3144,50 +3144,56 @@ impl BTreeCursor {
                     // if the cell index is less than the total cells, check: if its an existing
                     // rowid, we are going to update / overwrite the cell
                     if cell_idx < page.get_contents().cell_count() {
-                        let cell = page.get_contents().cell_get(cell_idx, usable_space)?;
-                        match cell {
-                            BTreeCell::TableLeafCell(tbl_leaf) => {
-                                if tbl_leaf.rowid == bkey.to_rowid() {
-                                    tracing::debug!("TableLeafCell: found exact match with cell_idx={cell_idx}, overwriting");
-                                    self.flags.has_record = true;
-                                    *write_state = WriteState::Overwrite {
-                                        page,
-                                        cell_idx,
-                                        state: Some(OverwriteCellState::AllocatePayload),
-                                    };
-                                    continue;
-                                }
+                        // On a table page only the rowid decides whether this is
+                        // an overwrite, and the two varints at the front of the
+                        // cell hold it. Reading the cell in full also builds a
+                        // payload slice and a `BTreeCell` that nothing here looks
+                        // at, for about a hundred instructions more per row.
+                        if matches!(page.get_contents().page_type()?, PageType::TableLeaf) {
+                            let header =
+                                page.get_contents().cell_table_leaf_read_header(cell_idx)?;
+                            if header.rowid == bkey.to_rowid() {
+                                tracing::debug!("TableLeafCell: found exact match with cell_idx={cell_idx}, overwriting");
+                                self.flags.has_record = true;
+                                *write_state = WriteState::Overwrite {
+                                    page,
+                                    cell_idx,
+                                    state: Some(OverwriteCellState::AllocatePayload),
+                                };
+                                continue;
                             }
-                            BTreeCell::IndexLeafCell(..) | BTreeCell::IndexInteriorCell(..) => {
-                                return_if_io!(self.record());
-                                let cmp = compare_immutable_iter(
-                                    record.iter()?,
-                                    self.get_immutable_record()
-                                        .as_ref()
-                                        .unwrap()
-                                        .iter()?,
-                                        &self.index_info.as_ref().unwrap().key_info,
-                                )?;
-                                if cmp == Ordering::Equal {
-                                    tracing::debug!("IndexLeafCell: found exact match with cell_idx={cell_idx}, overwriting");
-                                    self.set_has_record(true);
-                                    let CursorState::Write(write_state) = &mut self.state else {
-                                        panic!("expected write state");
-                                    };
-                                    *write_state = WriteState::Overwrite {
-                                        page,
-                                        cell_idx,
-                                        state: Some(OverwriteCellState::AllocatePayload),
-                                    };
-                                    continue;
-                                } else {
-                                    turso_assert!(
-                                        !matches!(cell, BTreeCell::IndexInteriorCell(..)),
-                                         "we should not be inserting a new index interior cell. the only valid operation on an index interior cell is an overwrite!"
-                                    );
-                                }
+                        } else {
+                            let cell = page.get_contents().cell_get(cell_idx, usable_space)?;
+                            turso_assert!(
+                                matches!(
+                                    cell,
+                                    BTreeCell::IndexLeafCell(..) | BTreeCell::IndexInteriorCell(..)
+                                ),
+                                "unexpected cell type, expected TableLeaf or IndexLeaf"
+                            );
+                            return_if_io!(self.record());
+                            let cmp = compare_immutable_iter(
+                                record.iter()?,
+                                self.get_immutable_record().as_ref().unwrap().iter()?,
+                                &self.index_info.as_ref().unwrap().key_info,
+                            )?;
+                            if cmp == Ordering::Equal {
+                                tracing::debug!("IndexLeafCell: found exact match with cell_idx={cell_idx}, overwriting");
+                                self.set_has_record(true);
+                                let CursorState::Write(write_state) = &mut self.state else {
+                                    panic!("expected write state");
+                                };
+                                *write_state = WriteState::Overwrite {
+                                    page,
+                                    cell_idx,
+                                    state: Some(OverwriteCellState::AllocatePayload),
+                                };
+                                continue;
                             }
-                            other => panic!("unexpected cell type, expected TableLeaf or IndexLeaf, found: {other:?}"),
+                            turso_assert!(
+                                !matches!(cell, BTreeCell::IndexInteriorCell(..)),
+                                "we should not be inserting a new index interior cell. the only valid operation on an index interior cell is an overwrite!"
+                            );
                         }
                     }
 
