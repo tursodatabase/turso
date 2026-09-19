@@ -14060,21 +14060,25 @@ pub fn op_open_write(
             let btree_cursor: Box<BTreeCursor> = match cursor_type {
                 CursorType::BTreeTable(table_rc) if !table_rc.has_rowid => {
                     btree_cursor_with_yield_context(
-                        Box::new(BTreeCursor::new_without_rowid_table(
-                            pager,
-                            maybe_transform_root_page_to_positive(mv_store.as_ref(), root_page),
-                            table_rc.as_ref(),
-                            num_columns,
-                        )),
+                        BTreeCursor::boxed(&pager, || {
+                            BTreeCursor::new_without_rowid_table(
+                                pager.clone(),
+                                maybe_transform_root_page_to_positive(mv_store.as_ref(), root_page),
+                                table_rc.as_ref(),
+                                num_columns,
+                            )
+                        }),
                         &program.connection,
                     )
                 }
                 _ => btree_cursor_with_yield_context(
-                    Box::new(BTreeCursor::new_table(
-                        pager,
-                        maybe_transform_root_page_to_positive(mv_store.as_ref(), root_page),
-                        num_columns,
-                    )),
+                    BTreeCursor::boxed(&pager, || {
+                        BTreeCursor::new_table(
+                            pager.clone(),
+                            maybe_transform_root_page_to_positive(mv_store.as_ref(), root_page),
+                            num_columns,
+                        )
+                    }),
                     &program.connection,
                 ),
             };
