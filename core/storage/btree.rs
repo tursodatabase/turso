@@ -1307,19 +1307,6 @@ impl BTreeCursor {
         self.count = 0;
     }
 
-    pub fn get_index_rowid_from_record(&self) -> Option<i64> {
-        if !self.has_rowid() {
-            return None;
-        }
-        let rowid = match self.get_immutable_record().as_ref().unwrap().last_value() {
-            Some(Ok(ValueRef::Numeric(Numeric::Integer(rowid)))) => rowid,
-            _ => unreachable!(
-                "index where has_rowid() is true should have an integer rowid as the last value"
-            ),
-        };
-        Some(rowid)
-    }
-
     /// Check if the table is empty.
     /// This is done by checking if the root page has no cells.
     #[cfg_attr(debug_assertions, instrument(skip_all, level = Level::DEBUG))]

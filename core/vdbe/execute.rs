@@ -6958,10 +6958,10 @@ pub fn op_idx_ge(
         let cursor = cursor.as_btree_mut();
         let index_info = cursor.get_index_info().clone();
 
-        let pc = if let Some(idx_record) = return_if_io!(state, cursor.record()) {
+        let pc = if let Some(idx_payload) = return_if_io!(state, cursor.record_payload()) {
             let tie_breaker = get_tie_breaker_from_idx_comp_op(insn);
             let ord = compare_record(
-                idx_record.get_payload(),
+                idx_payload,
                 registers_to_ref_values(&state.registers[*start_reg..*start_reg + *num_regs]),
                 &index_info,
                 tie_breaker,
@@ -7024,10 +7024,10 @@ pub fn op_idx_le(
         let cursor = cursor.as_btree_mut();
         let index_info = cursor.get_index_info().clone();
 
-        let pc = if let Some(idx_record) = return_if_io!(state, cursor.record()) {
+        let pc = if let Some(idx_payload) = return_if_io!(state, cursor.record_payload()) {
             let tie_breaker = get_tie_breaker_from_idx_comp_op(insn);
             let ord = compare_record(
-                idx_record.get_payload(),
+                idx_payload,
                 registers_to_ref_values(&state.registers[*start_reg..*start_reg + *num_regs]),
                 &index_info,
                 tie_breaker,
@@ -7074,10 +7074,10 @@ pub fn op_idx_gt(
         let cursor = cursor.as_btree_mut();
         let index_info = cursor.get_index_info().clone();
 
-        let pc = if let Some(idx_record) = return_if_io!(state, cursor.record()) {
+        let pc = if let Some(idx_payload) = return_if_io!(state, cursor.record_payload()) {
             let tie_breaker = get_tie_breaker_from_idx_comp_op(insn);
             let ord = compare_record(
-                idx_record.get_payload(),
+                idx_payload,
                 registers_to_ref_values(&state.registers[*start_reg..*start_reg + *num_regs]),
                 &index_info,
                 tie_breaker,
@@ -7124,10 +7124,10 @@ pub fn op_idx_lt(
         let cursor = cursor.as_btree_mut();
         let index_info = cursor.get_index_info().clone();
 
-        let pc = if let Some(idx_record) = return_if_io!(state, cursor.record()) {
+        let pc = if let Some(idx_payload) = return_if_io!(state, cursor.record_payload()) {
             let tie_breaker = get_tie_breaker_from_idx_comp_op(insn);
             let ord = compare_record(
-                idx_record.get_payload(),
+                idx_payload,
                 registers_to_ref_values(&state.registers[*start_reg..*start_reg + *num_regs]),
                 &index_info,
                 tie_breaker,
