@@ -411,12 +411,12 @@ impl Register {
     /// reusing the existing Register::Value(Value::Numeric(Numeric::Integer(_))) if possible,
     /// which is faster than always creating a new one.
     pub fn set_int(&mut self, val: i64) {
+        // One test of the numeric tag, not one per numeric kind: writing the
+        // tag back over an integer that already carries it costs a store,
+        // while telling the two apart costs a load, a compare and a branch.
         match self {
-            Register::Value(Value::Numeric(Numeric::Integer(existing))) => {
-                *existing = val;
-            }
-            Register::Value(Value::Numeric(float)) => {
-                *float = Numeric::Integer(val);
+            Register::Value(Value::Numeric(numeric)) => {
+                *numeric = Numeric::Integer(val);
             }
             _ => set_int_over_other(self, val),
         };
