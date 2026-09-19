@@ -532,7 +532,10 @@ impl Register {
 /// after stepping again, row will be invalidated to be sure it doesn't point to somewhere unexpected.
 #[derive(Debug)]
 pub struct Row {
-    values: *const Register,
+    /// Non-null so that `Option<Row>` fits in the two words the pointer and
+    /// the count already take: the dispatch loop clears the slot once per
+    /// step and `ResultRow` fills it once per row.
+    values: std::ptr::NonNull<Register>,
     count: usize,
 }
 
@@ -2168,7 +2171,7 @@ impl Program {
         state.registers[6].set_int(p5);
         state.registers[7].set_value(Value::from_text(comment));
         state.result_row = Some(Row {
-            values: &state.registers[0] as *const Register,
+            values: std::ptr::NonNull::from(&state.registers[0]),
             count: EXPLAIN_COLUMNS.len(),
         });
         state.pc += 1;
@@ -2217,7 +2220,7 @@ impl Program {
             state.registers[2].set_int(0);
             state.registers[3].set_value(Value::from_text(detail.to_string()));
             state.result_row = Some(Row {
-                values: &state.registers[0] as *const Register,
+                values: std::ptr::NonNull::from(&state.registers[0]),
                 count: EXPLAIN_QUERY_PLAN_COLUMNS.len(),
             });
             state.pc += 1;
@@ -2256,7 +2259,7 @@ impl Program {
             self,
         )));
         state.result_row = Some(Row {
-            values: &state.registers[0] as *const Register,
+            values: std::ptr::NonNull::from(&state.registers[0]),
             count: EXPLAIN_QUERY_PLAN_JSON_COLUMNS.len(),
         });
         state.pc = 1;
@@ -2396,7 +2399,7 @@ impl Program {
             // Invalidate the previous result row once per step call: rows are only
             // handed out between step calls, and ResultRow returns immediately
             // after setting a fresh one.
-            let _ = state.result_row.take();
+            state.result_row = None;
             // The outer loop runs once per step call and is re-entered only when an
             // instruction completed its IO inline; the inner loop dispatches
             // instructions without re-inspecting the completion slot every time.
@@ -3888,12 +3891,9 @@ impl<'a> FromValueRow<'a> for &'a Value {
 
 impl Row {
     pub fn get<'a, T: FromValueRow<'a> + 'a>(&'a self, idx: usize) -> Result<T> {
-        let value = unsafe {
-            self.values
-                .add(idx)
-                .as_ref()
-                .expect("row value pointer should be valid")
-        };
+        // SAFETY: the row names `count` registers from `values`, which stay
+        // in place and alive until the next step of the statement.
+        let value = unsafe { self.values.add(idx).as_ref() };
         let value = match value {
             Register::Value(value) => value,
             _ => unreachable!("a row should be formed of values only"),
@@ -3902,12 +3902,8 @@ impl Row {
     }
 
     pub fn get_value(&self, idx: usize) -> &Value {
-        let value = unsafe {
-            self.values
-                .add(idx)
-                .as_ref()
-                .expect("row value pointer should be valid")
-        };
+        // SAFETY: as in `get`.
+        let value = unsafe { self.values.add(idx).as_ref() };
         match value {
             Register::Value(value) => value,
             _ => unreachable!("a row should be formed of values only"),
@@ -3915,7 +3911,7 @@ impl Row {
     }
 
     pub fn get_values(&self) -> impl Iterator<Item = &Value> {
-        let values = unsafe { std::slice::from_raw_parts(self.values, self.count) };
+        let values = unsafe { std::slice::from_raw_parts(self.values.as_ptr(), self.count) };
         // This should be ownedvalues
         // TODO: add check for this
         values.iter().map(|v| v.get_value())
@@ -4460,7 +4456,7 @@ mod shuttle_tests {
 
                 // Create a result_row pointing to registers
                 state.result_row = Some(Row {
-                    values: &state.registers[0] as *const Register,
+                    values: std::ptr::NonNull::from(&state.registers[0]),
                     count: 3,
                 });
 
@@ -4503,7 +4499,7 @@ mod shuttle_tests {
 
                 // Create result_row
                 state.result_row = Some(Row {
-                    values: &state.registers[0] as *const Register,
+                    values: std::ptr::NonNull::from(&state.registers[0]),
                     count: 2,
                 });
 
@@ -4554,7 +4550,7 @@ mod shuttle_tests {
                 }
 
                 state.result_row = Some(Row {
-                    values: &state.registers[0] as *const Register,
+                    values: std::ptr::NonNull::from(&state.registers[0]),
                     count: 5,
                 });
 
@@ -4594,7 +4590,7 @@ mod shuttle_tests {
 
                 state.registers[0].set_int(100);
                 state.result_row = Some(Row {
-                    values: &state.registers[0] as *const Register,
+                    values: std::ptr::NonNull::from(&state.registers[0]),
                     count: 1,
                 });
 
@@ -4625,19 +4621,19 @@ mod shuttle_tests {
 
                 state.registers[0].set_int(1);
                 state.result_row = Some(Row {
-                    values: &state.registers[0] as *const Register,
+                    values: std::ptr::NonNull::from(&state.registers[0]),
                     count: 1,
                 });
 
                 // Invalidate row (simulating what normal_step does)
-                let _ = state.result_row.take();
+                state.result_row = None;
 
                 // Now safe to modify registers
                 state.registers[0].set_int(999);
 
                 // Create new row pointing to modified registers
                 state.result_row = Some(Row {
-                    values: &state.registers[0] as *const Register,
+                    values: std::ptr::NonNull::from(&state.registers[0]),
                     count: 1,
                 });
 
@@ -4759,7 +4755,7 @@ mod shuttle_tests {
                 state.registers[2].set_int(30);
 
                 state.result_row = Some(Row {
-                    values: &state.registers[0] as *const Register,
+                    values: std::ptr::NonNull::from(&state.registers[0]),
                     count: 3,
                 });
 
@@ -4805,7 +4801,7 @@ mod shuttle_tests {
                 }
 
                 state.result_row = Some(Row {
-                    values: &state.registers[0] as *const Register,
+                    values: std::ptr::NonNull::from(&state.registers[0]),
                     count: 20,
                 });
 

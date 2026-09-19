@@ -3592,7 +3592,7 @@ pub fn op_result_row(
 ) -> InsnResult {
     load_insn!(ResultRow { start_reg, count }, insn);
     let row = Row {
-        values: &state.registers[*start_reg] as *const Register,
+        values: std::ptr::NonNull::from(&state.registers[*start_reg]),
         count: *count,
     };
     state.result_row = Some(row);
