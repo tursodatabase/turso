@@ -870,10 +870,19 @@ pub struct SequenceInnerTxState {
     )>,
 }
 
+/// `tracing` is on at TRACE level, so every opcode gets a span.
+const TRACE_FLAG_SPANS: u8 = 1;
+/// `PRAGMA vdbe_trace` is on, so every opcode prints itself and its registers.
+const TRACE_FLAG_VDBE: u8 = 2;
+/// No execution has read the tracing settings into `ProgramState` yet.
+pub(crate) const TRACE_FLAGS_UNREAD: u8 = u8::MAX;
+
 pub struct ProgramState {
     /// Instructions left before the next interrupt/progress check of
     /// normal_step; reloaded with `check_interval` each time it reaches zero.
     check_countdown: u64,
+    /// `TRACE_FLAG_*` bits, read once at the start of each execution.
+    pub(crate) trace_flags: u8,
     /// The interval the countdown was last reloaded with, re-derived from
     /// the progress handler's interval each time the check runs.
     check_interval: u64,
@@ -1047,6 +1056,7 @@ impl ProgramState {
         let registers = vec![Register::Value(Value::Null); max_registers].into_boxed_slice();
         Self {
             check_countdown: 1,
+            trace_flags: TRACE_FLAGS_UNREAD,
             check_interval: MAX_CHECK_INTERVAL,
             io_completions: None,
             pc: 0,
@@ -1216,6 +1226,7 @@ impl ProgramState {
         self.ended_coroutine.clear();
         self.once.clear();
         self.execution_state = ProgramExecutionState::Init;
+        self.trace_flags = TRACE_FLAGS_UNREAD;
         self.query_deadline = None;
         self.explicit_checkpoint_guard = None;
         #[cfg(feature = "json")]
@@ -2245,6 +2256,26 @@ impl Program {
         state.pre_op_registers = Some(state.registers.clone());
     }
 
+    /// Reads the tracing level and the connection's `vdbe_trace` flag, which
+    /// together pick the dispatch loop the statement runs in.
+    pub(crate) fn read_trace_flags(&self) -> u8 {
+        let mut flags = 0;
+        if tracing::enabled!(tracing::Level::TRACE) {
+            flags |= TRACE_FLAG_SPANS;
+        }
+        if self.connection.get_vdbe_trace() {
+            flags |= TRACE_FLAG_VDBE;
+        }
+        flags
+    }
+
+    /// `read_trace_flags` for the executions that do not pass through
+    /// `Statement::prepare_step`, which reads them itself.
+    #[inline(never)]
+    fn read_trace_flags_out_of_line(&self) -> u8 {
+        self.read_trace_flags()
+    }
+
     /// Step in [QueryMode::Normal]
     #[inline(always)]
     pub(crate) fn normal_step(
@@ -2253,11 +2284,25 @@ impl Program {
         pager: &Arc<Pager>,
         waker: Option<&Waker>,
     ) -> ProgramStep {
+        // Read once per execution rather than once per row: both reads are
+        // several instructions and a statement that returns many rows calls
+        // this function once for each of them. Root statements read them in
+        // `Statement::prepare_step`; this covers subprograms, which do not go
+        // through it.
+        if state.trace_flags == TRACE_FLAGS_UNREAD {
+            state.trace_flags = self.read_trace_flags_out_of_line();
+        }
         state.execution_state = ProgramExecutionState::Running;
-        let enable_tracing = tracing::enabled!(tracing::Level::TRACE);
-        let vdbe_trace = self.connection.get_vdbe_trace();
-        let result = if enable_tracing || vdbe_trace {
-            dispatch_loop_traced(self, state, pager, waker, enable_tracing, vdbe_trace)
+        let trace_flags = state.trace_flags;
+        let result = if trace_flags != 0 {
+            dispatch_loop_traced(
+                self,
+                state,
+                pager,
+                waker,
+                trace_flags & TRACE_FLAG_SPANS != 0,
+                trace_flags & TRACE_FLAG_VDBE != 0,
+            )
         } else {
             dispatch_loop::<false>(self, state, pager, waker, false, false)
         };

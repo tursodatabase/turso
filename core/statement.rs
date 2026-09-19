@@ -625,6 +625,10 @@ impl Statement {
             }
         }
 
+        if self.state.trace_flags == crate::vdbe::TRACE_FLAGS_UNREAD {
+            self.state.trace_flags = self.program.read_trace_flags();
+        }
+
         self.arm_query_timeout_if_needed();
 
         // If we're waiting for a busy handler timeout, check if we can proceed
