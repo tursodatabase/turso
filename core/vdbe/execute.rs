@@ -18404,6 +18404,9 @@ pub fn op_hash_scan_unmatched(
     };
 
     hash_table.begin_unmatched_scan();
+    // The scan can park a completion in the state, which the dispatch loop
+    // only looks at when this is set.
+    state.pending_entry_work = true;
     advance_unmatched_scan(
         hash_table,
         &mut state.registers,
@@ -18438,6 +18441,7 @@ pub fn op_hash_next_unmatched(
         LimboError::InternalError(format!("Hash table not found with ID: {hash_table_id}"))
     })?;
 
+    state.pending_entry_work = true;
     advance_unmatched_scan(
         hash_table,
         &mut state.registers,

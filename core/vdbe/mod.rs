@@ -528,6 +528,16 @@ impl Register {
     }
 }
 
+/// What the dispatch loop does about the work parked for it.
+enum ParkedWork {
+    /// Nothing is left: run the next instruction.
+    Ready,
+    /// The loop starts over.
+    Restart,
+    /// The step ends here.
+    Return(ProgramStep),
+}
+
 /// A row is a the list of registers that hold the values for a filtered row. This row is a pointer, therefore
 /// after stepping again, row will be invalidated to be sure it doesn't point to somewhere unexpected.
 #[derive(Debug)]
@@ -890,6 +900,13 @@ pub struct ProgramState {
     /// the progress handler's interval each time the check runs.
     check_interval: u64,
     pub io_completions: Option<IOCompletions>,
+    /// Set whenever a completion or a trigger's pending FAIL error is parked
+    /// for the dispatch loop to look at before it runs the next instruction.
+    /// Only the loop clears it, and only after it finds both slots empty, so
+    /// a stale `true` costs one extra look and a stale `false` cannot happen.
+    /// Reading one byte here is what keeps two `Option` tests off the top of
+    /// every step call.
+    pending_entry_work: bool,
     pub pc: InsnReference,
     pub(crate) cursors: Vec<Option<Cursor>>,
     /// Immutable execution/storage context captured when each index-method
@@ -1066,6 +1083,7 @@ impl ProgramState {
             trace_flags: TRACE_FLAGS_UNREAD,
             check_interval: MAX_CHECK_INTERVAL,
             io_completions: None,
+            pending_entry_work: true,
             pc: 0,
             cursors,
             index_method_contexts: vec![None; max_cursors],
@@ -1461,6 +1479,7 @@ impl ProgramState {
             "an instruction reported IO while a completion was already parked"
         );
         self.io_completions = Some(io);
+        self.pending_entry_work = true;
         InsnFunctionStepResult::IO
     }
 
@@ -2404,17 +2423,17 @@ impl Program {
             // instruction completed its IO inline; the inner loop dispatches
             // instructions without re-inspecting the completion slot every time.
             'io_check: loop {
-                if state.io_completions.is_some() {
-                    if let Some(result) = program.finish_pending_io(state, pager, waker) {
-                        return result;
+                if state.pending_entry_work {
+                    match program.finish_parked_entry_work(state, pager, waker) {
+                        ParkedWork::Ready => {}
+                        ParkedWork::Restart => continue 'io_check,
+                        ParkedWork::Return(result) => return result,
                     }
                 }
-                if state.pending_fail_prepare_error.is_some() {
-                    match program.prepare_pending_fail(state, pager, waker) {
-                        Some(result) => return result,
-                        None => continue 'io_check,
-                    }
-                }
+                turso_debug_assert!(
+                    state.io_completions.is_none() && state.pending_fail_prepare_error.is_none(),
+                    "the dispatch loop ran an instruction with work parked for it"
+                );
                 loop {
                     state.check_countdown = state.check_countdown.wrapping_sub(1);
                     if state.check_countdown == 0 {
@@ -2578,6 +2597,32 @@ impl Program {
         None
     }
 
+    /// Deals with whatever `pending_entry_work` stands for, before the
+    /// dispatch loop runs its next instruction. Out of line so the loop's
+    /// entry costs one byte-sized test.
+    #[cold]
+    #[inline(never)]
+    fn finish_parked_entry_work(
+        &self,
+        state: &mut ProgramState,
+        pager: &Arc<Pager>,
+        waker: Option<&Waker>,
+    ) -> ParkedWork {
+        if state.io_completions.is_some() {
+            if let Some(result) = self.finish_pending_io(state, pager, waker) {
+                return ParkedWork::Return(result);
+            }
+        }
+        if state.pending_fail_prepare_error.is_some() {
+            return match self.prepare_pending_fail(state, pager, waker) {
+                Some(result) => ParkedWork::Return(result),
+                None => ParkedWork::Restart,
+            };
+        }
+        state.pending_entry_work = false;
+        ParkedWork::Ready
+    }
+
     /// A trigger returned FAIL before the parent program reached Halt. FAIL
     /// keeps changes made by earlier rows, so their index-method writes must
     /// finish before abort() releases the statement savepoint and commits
@@ -2604,6 +2649,7 @@ impl Program {
             }
             Ok(IOResult::IO(io)) => {
                 state.pending_fail_prepare_error = Some(fail_error);
+                state.pending_entry_work = true;
                 io.set_waker(waker);
                 if io.is_explicit_yield() {
                     return Some(ProgramStep::Yield);
@@ -2733,6 +2779,7 @@ impl Program {
         }
         let finished = io.finished();
         state.io_completions = Some(io);
+        state.pending_entry_work = true;
         if !finished {
             return Some(ProgramStep::IO);
         }
@@ -2766,6 +2813,7 @@ impl Program {
                 || matches!(err, LimboError::Raise(ResolveType::Fail, _)) =>
             {
                 state.pending_fail_prepare_error = Some(err);
+                state.pending_entry_work = true;
                 None
             }
             err => {
