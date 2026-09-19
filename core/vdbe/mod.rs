@@ -3953,6 +3953,39 @@ fn decode_serial_type_into_register(
     dest: &mut Register,
 ) -> Result<()> {
     use crate::types::Extendable;
+    // A record of user data is mostly TEXT and BLOB, and both share the
+    // content size and the bounds check.
+    if serial_type >= 12 {
+        let content_size = ((serial_type - 12) >> 1) as usize;
+        if unlikely(data.len() < content_size) {
+            mark_unlikely();
+            return Err(LimboError::Corrupt(if serial_type & 1 == 1 {
+                "Invalid Text value".into()
+            } else {
+                "Invalid Blob value".into()
+            }));
+        }
+        let content = &data[..content_size];
+        *data = &data[content_size..];
+        if serial_type & 1 == 1 {
+            match dest {
+                Register::Value(Value::Text(existing_text)) => {
+                    existing_text.copy_from_record_bytes(content)?;
+                }
+                _ => start_text_register(dest, content)?,
+            }
+            return Ok(());
+        }
+        return crate::with_value_blob_allocation_site!(RecordDecode, {
+            match dest {
+                Register::Value(Value::Blob(existing_blob)) => {
+                    existing_blob.do_extend(&content)?;
+                }
+                _ => start_blob_register(dest, content)?,
+            }
+            Ok(())
+        });
+    }
     match serial_type {
         // NULL
         0 => {
@@ -4048,36 +4081,6 @@ fn decode_serial_type_into_register(
             return Err(LimboError::Corrupt(format!(
                 "Reserved serial type: {serial_type}"
             )));
-        }
-        // BLOB (n >= 12 && n & 1 == 0)
-        n if n >= 12 && n & 1 == 0 => crate::with_value_blob_allocation_site!(RecordDecode, {
-            let content_size = ((n - 12) / 2) as usize;
-            if unlikely(data.len() < content_size) {
-                return Err(LimboError::Corrupt("Invalid Blob value".into()));
-            }
-            let blob_data = &data[..content_size];
-            match dest {
-                Register::Value(Value::Blob(existing_blob)) => {
-                    existing_blob.do_extend(&blob_data)?;
-                }
-                _ => start_blob_register(dest, blob_data)?,
-            }
-            *data = &data[content_size..];
-        }),
-        // TEXT (n >= 13 && n & 1 == 1)
-        n if n >= 13 && n & 1 == 1 => {
-            let content_size = ((n - 13) / 2) as usize;
-            if unlikely(data.len() < content_size) {
-                return Err(LimboError::Corrupt("Invalid Text value".into()));
-            }
-            let text_data = &data[..content_size];
-            match dest {
-                Register::Value(Value::Text(existing_text)) => {
-                    existing_text.copy_from_record_bytes(text_data)?;
-                }
-                _ => start_text_register(dest, text_data)?,
-            }
-            *data = &data[content_size..];
         }
         _ => {
             mark_unlikely();
@@ -4197,6 +4200,74 @@ mod tests {
         for value in ["é", "héllo", "日本語", "\u{1F600}", "aé", "ααααααααα"] {
             decode_one_text(&one_text_record(value.as_bytes()), &mut destination).unwrap();
             assert_eq!(register_text(&destination), value);
+        }
+    }
+
+    /// Builds a record payload holding one value of `serial_type`.
+    fn one_value_record(serial_type: u64, value: &[u8]) -> Vec<u8> {
+        use crate::storage::sqlite3_ondisk::write_varint_to_vec;
+        let mut header_body = Vec::new();
+        write_varint_to_vec(serial_type, &mut header_body);
+        let mut payload = Vec::new();
+        write_varint_to_vec(header_body.len() as u64 + 1, &mut payload);
+        payload.extend_from_slice(&header_body);
+        payload.extend_from_slice(value);
+        payload
+    }
+
+    #[test]
+    fn blob_decode_into_a_reused_register_keeps_every_length() {
+        let mut destination = Register::Value(Value::Null);
+        let long: Vec<u8> = (0..40u8).collect();
+        decode_one_text(&one_value_record(12 + 2 * 40, &long), &mut destination).unwrap();
+
+        for len in 0..=40usize {
+            let value: Vec<u8> = (0..len as u8).map(|i| i.wrapping_mul(7)).collect();
+            decode_one_text(
+                &one_value_record(12 + 2 * len as u64, &value),
+                &mut destination,
+            )
+            .unwrap();
+            match &destination {
+                Register::Value(Value::Blob(blob)) => {
+                    assert_eq!(blob.as_slice(), value.as_slice(), "length {len}")
+                }
+                other => panic!("expected blob, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn record_decode_rejects_reserved_serial_types() {
+        for serial_type in [10u64, 11] {
+            let mut destination = Register::Value(Value::Null);
+            let result = decode_one_text(&one_value_record(serial_type, &[]), &mut destination);
+            assert!(
+                matches!(
+                    result,
+                    Err(LimboError::Corrupt(ref message))
+                        if message == &format!("Reserved serial type: {serial_type}")
+                ),
+                "unexpected result for {serial_type}: {result:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn record_decode_rejects_a_value_longer_than_the_data_section() {
+        for (serial_type, message) in [
+            (13 + 2 * 5, "Invalid Text value"),
+            (12 + 2 * 5, "Invalid Blob value"),
+        ] {
+            let mut destination = Register::Value(Value::Null);
+            let result = decode_one_text(&one_value_record(serial_type, b"ab"), &mut destination);
+            assert!(
+                matches!(
+                    result,
+                    Err(LimboError::Corrupt(ref actual)) if actual == message
+                ),
+                "unexpected result for {serial_type}: {result:?}"
+            );
         }
     }
 
