@@ -1410,6 +1410,7 @@ fn ensure_index_method_context(
         &attachment.definition(),
     )?);
     state.index_method_contexts[cursor_id] = Some(Arc::clone(&context));
+    state.has_index_method_context = true;
     Ok(context)
 }
 
@@ -4203,6 +4204,10 @@ pub(crate) fn index_method_on_transaction_committed_all(
     state: &mut ProgramState,
     connection: &Connection,
 ) {
+    if !has_index_method_work(state) {
+        connection.index_methods_on_transaction_committed();
+        return;
+    }
     tracing::trace!(
         open_cursors = state
             .cursors
@@ -4213,10 +4218,6 @@ pub(crate) fn index_method_on_transaction_committed_all(
         subprograms = state.subprogram_stmt_cache.len(),
         "publishing committed index-method state"
     );
-    if !has_index_method_work(state) {
-        connection.index_methods_on_transaction_committed();
-        return;
-    }
     for (cursor_id, cursor_opt) in state.cursors.iter_mut().enumerate() {
         let Some(Cursor::IndexMethod(cursor)) = cursor_opt else {
             continue;
@@ -4302,12 +4303,17 @@ fn register_index_method_transactions(
 /// every statement has none, and every halt calls the hooks.
 #[inline]
 fn has_index_method_work(state: &ProgramState) -> bool {
-    !state.closed_index_method_cursors.is_empty()
+    turso_debug_assert!(
+        state.has_index_method_context
+            || !state
+                .cursors
+                .iter()
+                .any(|cursor| matches!(cursor, Some(Cursor::IndexMethod(_)))),
+        "an index-method cursor was installed without a context"
+    );
+    state.has_index_method_context
+        || !state.closed_index_method_cursors.is_empty()
         || !state.subprogram_stmt_cache.is_empty()
-        || state
-            .cursors
-            .iter()
-            .any(|cursor| matches!(cursor, Some(Cursor::IndexMethod(_))))
 }
 
 /// Rollback all virtual tables that are part of the current transaction.

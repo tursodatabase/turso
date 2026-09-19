@@ -921,6 +921,11 @@ pub struct ProgramState {
         Box<dyn crate::index_method::IndexMethodCursor>,
         std::sync::Arc<crate::index_method::IndexMethodContext>,
     )>,
+    /// Whether this execution built a context for an index-method cursor.
+    /// Every index-method cursor is installed right after its context, so a
+    /// false here means the statement has no such cursor and the commit
+    /// hooks have nothing to visit.
+    pub(crate) has_index_method_context: bool,
     /// Resumption coordinates for statement-level index-method finalization.
     pub(crate) index_method_finalize_cursor: usize,
     pub(crate) index_method_finalize_subprogram_keys: Option<Vec<usize>>,
@@ -1087,6 +1092,7 @@ impl ProgramState {
             pc: 0,
             cursors,
             index_method_contexts: vec![None; max_cursors],
+            has_index_method_context: false,
             closed_index_method_cursors: Vec::new(),
             index_method_finalize_cursor: 0,
             index_method_finalize_subprogram_keys: None,
@@ -1280,6 +1286,7 @@ impl ProgramState {
                 cursor.close(&context);
             }
         }
+        self.has_index_method_context = false;
         self.index_method_finalize_cursor = 0;
         self.index_method_finalize_subprogram_keys = None;
         self.index_method_finalize_subprogram = 0;
