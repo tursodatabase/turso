@@ -1333,6 +1333,10 @@ mod immutable_record {
         }
     }
 
+    /// Enough zeroes for the records that fit in one store of each half of a
+    /// 32-byte register.
+    pub(crate) const ZEROED_PREFIX: [u8; 32] = [0; 32];
+
     /// [`write_varint`] with the one-byte case inline.
     #[inline(always)]
     fn write_short_varint(out: &mut [u8], value: u64) -> usize {
@@ -1821,8 +1825,16 @@ mod immutable_record {
 
             let header_size = Record::calc_header_size(size_header);
             let total_size = header_size + size_values;
-            buf.try_reserve_exact(total_size)?;
-            buf.resize(total_size, 0);
+            buf.try_reserve_exact(total_size.max(ZEROED_PREFIX.len()))?;
+            // A constant-length extend is an inlined store of the whole array.
+            // Sizing the buffer with a variable length instead costs a call into
+            // libc's memset, whose fixed overhead dwarfs a row's worth of bytes.
+            if total_size <= ZEROED_PREFIX.len() {
+                buf.extend_from_slice(&ZEROED_PREFIX);
+                buf.truncate(total_size);
+            } else {
+                buf.resize(total_size, 0);
+            }
 
             // Writing pass: each serial type goes into the header and each
             // value after it, the varints straight into their place.
@@ -2132,13 +2144,7 @@ impl<'a> Iterator for ValueIterator<'a> {
             if header.is_empty() {
                 break serial_type;
             }
-            data_offset += match get_serial_type_size(serial_type) {
-                Ok(size) => size,
-                Err(e) => {
-                    mark_unlikely();
-                    return Some(Err(e));
-                }
-            };
+            data_offset += get_serial_type_size(serial_type);
         };
 
         let data = self.data_section.get();
@@ -2177,13 +2183,7 @@ impl<'a> Iterator for ValueIterator<'a> {
             };
             header = &header[bytes_read..];
 
-            data_sum += match get_serial_type_size(serial_type) {
-                Ok(size) => size,
-                Err(e) => {
-                    mark_unlikely();
-                    return Some(Err(e));
-                }
-            };
+            data_sum += get_serial_type_size(serial_type);
         }
 
         if unlikely(data_sum > data.len()) {
@@ -3219,31 +3219,18 @@ impl SerialType {
     }
 }
 
+/// Byte count of the data a serial type occupies in the record body.
+///
+/// Matches `sqlite3VdbeSerialTypeLen`: the reserved serial types 10 and 11
+/// take no bytes, so skipping past one is not an error. Reading one still is,
+/// in `decode_serial_type_into_register`.
 #[inline(always)]
-pub fn get_serial_type_size(serial: u64) -> Result<usize> {
-    match serial {
-        0 | 8 | 9 => Ok(0),
-        1 => Ok(1),
-        2 => Ok(2),
-        3 => Ok(3),
-        4 => Ok(4),
-        5 => Ok(6),
-        6 | 7 => Ok(8),
-        n if n >= 12 => match n % 2 {
-            0 => Ok(((n - 12) / 2) as usize), // Blob
-            1 => Ok(((n - 13) / 2) as usize), // Text
-            _ => {
-                mark_unlikely();
-                unreachable!();
-            }
-        },
-        _ => {
-            mark_unlikely();
-            Err(LimboError::Corrupt(format!(
-                "Invalid serial type: {serial}"
-            )))
-        }
+pub fn get_serial_type_size(serial: u64) -> usize {
+    const SIZES: [u8; 12] = [0, 1, 2, 3, 4, 6, 8, 8, 0, 0, 0, 0];
+    if serial < 12 {
+        return SIZES[serial as usize] as usize;
     }
+    ((serial - 12) / 2) as usize
 }
 
 impl<T: AsValueRef> From<T> for SerialType {
@@ -5008,6 +4995,27 @@ mod tests {
             assert_eq!(
                 cnt, num_values,
                 "column_count should be {num_values}, not {cnt}"
+            );
+        }
+    }
+
+    #[test]
+    fn record_round_trips_across_the_inline_zero_boundary() {
+        // The record buffer is zeroed with one constant-length store while the
+        // record fits in ZEROED_PREFIX and with a sized fill above it, so the
+        // two paths meet at its length.
+        for text_len in 0..=(immutable_record::ZEROED_PREFIX.len() + 4) {
+            let values = vec![
+                Value::from_i64(-1),
+                Value::build_text("x".repeat(text_len)),
+                Value::from_f64(0.5),
+            ];
+            let record = ImmutableRecord::from_values(&values, values.len()).unwrap();
+            assert_eq!(record.column_count(), 3, "text_len={text_len}");
+            assert_eq!(
+                record.get_values_owned().unwrap(),
+                values,
+                "text_len={text_len}"
             );
         }
     }

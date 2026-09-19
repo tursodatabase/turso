@@ -815,7 +815,17 @@ pub fn op_null(
 ) -> InsnResult {
     match insn {
         Insn::Null { dest, dest_end } | Insn::BeginSubrtn { dest, dest_end } => {
-            let dest_end = dest_end.unwrap_or(*dest);
+            // One register is the case a row build takes, and an inclusive
+            // range costs a counter that cannot overflow, its own bounds test
+            // and a stack frame to hold them.
+            let Some(dest_end) = *dest_end else {
+                state.registers[*dest].set_null();
+                if !state.rowsets.is_empty() {
+                    state.rowsets.remove(dest);
+                }
+                state.pc += 1;
+                return Ok(InsnFunctionStepResult::Step);
+            };
             for i in *dest..=dest_end {
                 state.registers[i].set_null();
             }
@@ -1953,6 +1963,10 @@ pub enum OpColumnState {
     GetColumn,
 }
 
+// Not in test builds: inline(always) makes fn-item coercions produce
+// per-site copies in debug, breaking test_make_sure_correct_insn_table's
+// pointer-identity check.
+#[cfg_attr(not(test), inline(always))]
 pub fn op_column(
     program: &Program,
     state: &mut ProgramState,
@@ -2009,8 +2023,13 @@ pub fn op_column_range(
     if state.active_op_state.is_idle() && state.deferred_seeks[*cursor_id].is_none() {
         let result =
             op_column_range_fetch(program, state, *cursor_id, *start_column, *dest, defaults)?;
+        // Step is returned as a fresh constant, not as the value the fetch
+        // produced. The fetch merges its returns, so passing that value on
+        // hands the dispatch loop a phi, and the loop then cannot fold its own
+        // test of the result away.
         if matches!(result, InsnFunctionStepResult::Step) {
             state.pc += 1;
+            return Ok(InsnFunctionStepResult::Step);
         }
         return Ok(result);
     }
@@ -3372,7 +3391,7 @@ pub fn op_make_record(
         }
         let registers = &mut state.registers[start_reg..start_reg + count];
         for (register, &affinity_code) in registers.iter_mut().zip(affinity_str.as_bytes()) {
-            apply_affinity_char(register, Affinity::from_char_code(affinity_code));
+            apply_affinity_code(register, affinity_code);
         }
     }
 
@@ -3612,10 +3631,9 @@ pub fn op_next(
         }
     };
     if !is_empty {
-        // Increment metrics for row read
-        state.record_rows_read(1);
+        // The row read and the search are both read back out of btree_next,
+        // so the row path keeps one counter for the three of them.
         state.metrics.btree_next = state.metrics.btree_next.wrapping_add(1);
-        state.metrics.search_count = state.metrics.search_count.wrapping_add(1);
         // Only steps codegen marked as part of a full table scan count as
         // fullscan steps, matching SQLITE_STMTSTATUS_FULLSCAN_STEP.
         // Added as 0 or 1 so neither counter costs a branch per row.
@@ -3671,10 +3689,9 @@ pub fn op_prev(
         }
     };
     if !is_empty {
-        // Increment metrics for row read
-        state.record_rows_read(1);
+        // As in op_next: the row read and the search come back out of
+        // btree_prev instead of counters of their own.
         state.metrics.btree_prev = state.metrics.btree_prev.wrapping_add(1);
-        state.metrics.search_count = state.metrics.search_count.wrapping_add(1);
         // Only steps codegen marked as part of a full table scan count as
         // fullscan steps, matching SQLITE_STMTSTATUS_FULLSCAN_STEP.
         // Added as 0 or 1 so neither counter costs a branch per row.
@@ -6152,6 +6169,7 @@ pub fn op_row_id(
         let result = op_row_id_read(state, *cursor_id, *dest)?;
         if matches!(result, InsnFunctionStepResult::Step) {
             state.pc += 1;
+            return Ok(InsnFunctionStepResult::Step);
         }
         return Ok(result);
     }
@@ -12503,7 +12521,19 @@ pub fn op_insert(
     loop {
         match state.active_op_state.insert().sub_state {
             OpInsertSubState::MaybeCaptureRecord => {
-                let has_dependent_views = {
+                // Whether the schema holds any materialized view at all is read
+                // once per execution. Without that, every row written takes the
+                // connection's schema lock — two locked instructions — to reach
+                // an empty map.
+                let any_materialized_views = match state.schema_has_materialized_views {
+                    Some(any) => any,
+                    None => {
+                        let any = program.connection.schema.read().has_materialized_views();
+                        state.schema_has_materialized_views = Some(any);
+                        any
+                    }
+                };
+                let has_dependent_views = any_materialized_views && {
                     let schema = program.connection.schema.read();
                     !schema
                         .get_dependent_materialized_views(table_name)
@@ -12647,8 +12677,12 @@ pub fn op_insert(
                                 unreachable!("Cannot insert an aggregate value.")
                             }
                         };
-                        let existing_record = return_if_io!(state, cursor.record());
-                        if existing_record.is_some_and(|r| r == record.as_ref()) {
+                        // The payload bytes, not the record: `record` copies
+                        // the cell into the cursor's reusable record before the
+                        // comparison, and comparing two records goes through a
+                        // Value and a ValueRef to reach the same bytes.
+                        let existing_payload = return_if_io!(state, cursor.record_payload());
+                        if existing_payload.is_some_and(|p| p == record.as_ref().get_payload()) {
                             state.active_op_state.insert().is_noop_update = true;
                         }
                     }
@@ -16541,7 +16575,7 @@ pub fn op_affinity(
 
     let registers = &mut state.registers[*start_reg..*start_reg + count.get()];
     for (register, &affinity_code) in registers.iter_mut().zip(affinities.as_bytes()) {
-        apply_affinity_char(register, Affinity::from_char_code(affinity_code));
+        apply_affinity_code(register, affinity_code);
     }
 
     state.pc += 1;
@@ -18567,27 +18601,78 @@ pub fn op_hash_grace_advance_partition(
     Ok(InsnFunctionStepResult::Step)
 }
 
+/// One bit per storage class, so an affinity can name the classes it converts
+/// and a value can name the one class it is in.
+const CLASS_NULL: u8 = 1 << 0;
+const CLASS_INTEGER: u8 = 1 << 1;
+const CLASS_FLOAT: u8 = 1 << 2;
+const CLASS_TEXT: u8 = 1 << 3;
+const CLASS_BLOB: u8 = 1 << 4;
+
+/// The storage classes an affinity has to convert. Stated as what it converts
+/// rather than as the classes it accepts, so a value whose class is absent is
+/// already settled — which is every value of almost every row, because the
+/// values come out of columns that already have the affinity.
+const fn classes_an_affinity_converts(affinity: Affinity) -> u8 {
+    match affinity {
+        Affinity::Blob | Affinity::None => 0,
+        Affinity::Text => CLASS_INTEGER | CLASS_FLOAT,
+        Affinity::Integer | Affinity::Numeric => CLASS_TEXT | CLASS_FLOAT,
+        Affinity::Real => CLASS_TEXT | CLASS_INTEGER,
+    }
+}
+
+/// The same answer indexed by the affinity character an instruction carries.
+///
+/// `Affinity` and `MakeRecord` hold their affinities as characters, and
+/// turning one into an `Affinity` cost five instructions per register. The
+/// match on the result then compiled to a jump table, so every register of
+/// every row took an indirect branch to reach a test of one discriminant.
+/// Every character that is not an affinity means blob affinity, which
+/// converts nothing, so the table covers all 256 of them and needs no test.
+static CLASSES_A_CHARACTER_CONVERTS: [u8; 256] = {
+    let mut table = [0u8; 256];
+    let mut code = 0usize;
+    while code < 256 {
+        table[code] = classes_an_affinity_converts(Affinity::from_char_code(code as u8));
+        code += 1;
+    }
+    table
+};
+
+/// The one storage class a value is in.
+#[inline(always)]
+fn storage_class(value: &Value) -> u8 {
+    match value {
+        Value::Null => CLASS_NULL,
+        Value::Numeric(Numeric::Integer(_)) => CLASS_INTEGER,
+        Value::Numeric(Numeric::Float(_)) => CLASS_FLOAT,
+        Value::Text(_) => CLASS_TEXT,
+        Value::Blob(_) => CLASS_BLOB,
+    }
+}
+
 #[inline(always)]
 fn apply_affinity_char(target: &mut Register, affinity: Affinity) -> bool {
     // handle the common cases that don't require a conversion inline
     if let Register::Value(value) = target {
-        let settled = match affinity {
-            Affinity::Blob | Affinity::None => true,
-            Affinity::Text => matches!(value, Value::Text(_) | Value::Null | Value::Blob(_)),
-            Affinity::Integer | Affinity::Numeric => matches!(
-                value,
-                Value::Numeric(Numeric::Integer(_)) | Value::Null | Value::Blob(_)
-            ),
-            Affinity::Real => matches!(
-                value,
-                Value::Numeric(Numeric::Float(_)) | Value::Null | Value::Blob(_)
-            ),
-        };
-        if settled {
+        if classes_an_affinity_converts(affinity) & storage_class(value) == 0 {
             return true;
         }
     }
     apply_affinity_char_slow(target, affinity)
+}
+
+/// [`apply_affinity_char`] for the two opcodes that hold their affinities as
+/// characters, reaching the same rule without building an `Affinity` first.
+#[inline(always)]
+fn apply_affinity_code(target: &mut Register, affinity_code: u8) -> bool {
+    if let Register::Value(value) = target {
+        if CLASSES_A_CHARACTER_CONVERTS[affinity_code as usize] & storage_class(value) == 0 {
+            return true;
+        }
+    }
+    apply_affinity_char_slow(target, Affinity::from_char_code(affinity_code))
 }
 
 #[inline(never)]
@@ -20264,6 +20349,48 @@ mod tests {
         let version_integer = 3046001;
         let expected = "3.46.1";
         assert_eq!(execute_turso_version(version_integer), expected);
+    }
+
+    #[test]
+    fn the_affinity_fast_path_agrees_with_the_conversion_it_skips() {
+        // The fast path answers "no conversion needed" from the storage class
+        // alone. Every case it answers for has to match what the conversion
+        // would have done, so run both over one value of each storage class.
+        let values = || {
+            [
+                Value::Null,
+                Value::from_i64(0),
+                Value::from_i64(42),
+                Value::from_f64(1.5),
+                Value::from_f64(2.0),
+                Value::build_text("5"),
+                Value::build_text("2.5"),
+                Value::build_text("abc"),
+                Value::build_text(""),
+                Value::Blob(vec![1u8, 2, 3]),
+            ]
+        };
+        for affinity in [
+            Affinity::Blob,
+            Affinity::Text,
+            Affinity::Numeric,
+            Affinity::Integer,
+            Affinity::Real,
+            Affinity::None,
+        ] {
+            for (fast_value, slow_value) in values().into_iter().zip(values()) {
+                let mut fast = Register::Value(fast_value);
+                let mut slow = Register::Value(slow_value);
+                let fast_converted = apply_affinity_char(&mut fast, affinity);
+                let slow_converted = apply_affinity_char_slow(&mut slow, affinity);
+                assert_eq!(
+                    (fast.get_value(), fast_converted),
+                    (slow.get_value(), slow_converted),
+                    "affinity {affinity:?} on {:?}",
+                    slow.get_value()
+                );
+            }
+        }
     }
 
     #[test]

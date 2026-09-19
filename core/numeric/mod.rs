@@ -100,47 +100,64 @@ impl Numeric {
         }
     }
 
-    #[inline]
+    /// The value as a float, for the arithmetic that an `i64` cannot hold.
+    #[inline(always)]
+    fn as_float(self) -> NonNan {
+        match self {
+            Numeric::Integer(i) => i.into(),
+            Numeric::Float(f) => f,
+        }
+    }
+
+    #[inline(always)]
     pub fn checked_add(self, rhs: Self) -> Option<Self> {
-        match (self, rhs) {
-            (Numeric::Integer(lhs), Numeric::Integer(rhs)) => match lhs.checked_add(rhs) {
-                None => Numeric::Float(lhs.into()).checked_add(Numeric::Float(rhs.into())),
-                Some(i) => Some(Numeric::Integer(i)),
-            },
-            (Numeric::Float(lhs), Numeric::Float(rhs)) => (lhs + rhs).map(Numeric::Float),
-            (f @ Numeric::Float(_), Numeric::Integer(i))
-            | (Numeric::Integer(i), f @ Numeric::Float(_)) => {
-                f.checked_add(Numeric::Float(i.into()))
+        if let (Numeric::Integer(lhs), Numeric::Integer(rhs)) = (self, rhs) {
+            if let Some(sum) = lhs.checked_add(rhs) {
+                return Some(Numeric::Integer(sum));
             }
         }
+        Self::add_as_floats(self, rhs)
     }
 
-    #[inline]
+    /// Addition with a float on either side, or of two integers whose sum
+    /// overflows. Out of line so that `checked_add` is not recursive and
+    /// inlines into the arithmetic opcodes: called, it takes both operands
+    /// through memory and answers through a memory return slot.
+    #[inline(never)]
+    fn add_as_floats(lhs: Self, rhs: Self) -> Option<Self> {
+        (lhs.as_float() + rhs.as_float()).map(Numeric::Float)
+    }
+
+    #[inline(always)]
     pub fn checked_sub(self, rhs: Self) -> Option<Self> {
-        match (self, rhs) {
-            (Numeric::Float(lhs), Numeric::Float(rhs)) => (lhs - rhs).map(Numeric::Float),
-            (Numeric::Integer(lhs), Numeric::Integer(rhs)) => match lhs.checked_sub(rhs) {
-                None => Numeric::Float(lhs.into()).checked_sub(Numeric::Float(rhs.into())),
-                Some(i) => Some(Numeric::Integer(i)),
-            },
-            (f @ Numeric::Float(_), Numeric::Integer(i)) => f.checked_sub(Numeric::Float(i.into())),
-            (Numeric::Integer(i), f @ Numeric::Float(_)) => Numeric::Float(i.into()).checked_sub(f),
-        }
-    }
-
-    #[inline]
-    pub fn checked_mul(self, rhs: Self) -> Option<Self> {
-        match (self, rhs) {
-            (Numeric::Float(lhs), Numeric::Float(rhs)) => (lhs * rhs).map(Numeric::Float),
-            (Numeric::Integer(lhs), Numeric::Integer(rhs)) => match lhs.checked_mul(rhs) {
-                None => Numeric::Float(lhs.into()).checked_mul(Numeric::Float(rhs.into())),
-                Some(i) => Some(Numeric::Integer(i)),
-            },
-            (f @ Numeric::Float(_), Numeric::Integer(i))
-            | (Numeric::Integer(i), f @ Numeric::Float(_)) => {
-                f.checked_mul(Numeric::Float(i.into()))
+        if let (Numeric::Integer(lhs), Numeric::Integer(rhs)) = (self, rhs) {
+            if let Some(difference) = lhs.checked_sub(rhs) {
+                return Some(Numeric::Integer(difference));
             }
         }
+        Self::sub_as_floats(self, rhs)
+    }
+
+    /// See [`Self::add_as_floats`].
+    #[inline(never)]
+    fn sub_as_floats(lhs: Self, rhs: Self) -> Option<Self> {
+        (lhs.as_float() - rhs.as_float()).map(Numeric::Float)
+    }
+
+    #[inline(always)]
+    pub fn checked_mul(self, rhs: Self) -> Option<Self> {
+        if let (Numeric::Integer(lhs), Numeric::Integer(rhs)) = (self, rhs) {
+            if let Some(product) = lhs.checked_mul(rhs) {
+                return Some(Numeric::Integer(product));
+            }
+        }
+        Self::mul_as_floats(self, rhs)
+    }
+
+    /// See [`Self::add_as_floats`].
+    #[inline(never)]
+    fn mul_as_floats(lhs: Self, rhs: Self) -> Option<Self> {
+        (lhs.as_float() * rhs.as_float()).map(Numeric::Float)
     }
 
     #[inline]

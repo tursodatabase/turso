@@ -1193,6 +1193,12 @@ impl Schema {
     }
 
     /// Get all materialized views that depend on a given table
+    /// Whether any table has a materialized view over it. False for almost
+    /// every schema, and then no table can have a dependent view.
+    pub fn has_materialized_views(&self) -> bool {
+        !self.table_to_materialized_views.is_empty()
+    }
+
     pub fn get_dependent_materialized_views(&self, table_name: &str) -> Vec<String> {
         if self.table_to_materialized_views.is_empty() {
             return vec![];

@@ -17,7 +17,7 @@ use crate::{
     schema::Trigger,
     stats::refresh_analyze_stats,
     translate::{self, display::PlanContext, emitter::TransactionMode, plan::BitSet},
-    turso_assert,
+    turso_assert, turso_debug_assert,
     vdbe::{
         self,
         explain::{
@@ -290,6 +290,24 @@ fn combine_arithmetic_primitive(
     }
 }
 
+/// What one step of a statement produced, as the interpreter chain carries it.
+///
+/// Same size as `Result<StepResult, Box<LimboError>>` but a different shape: a
+/// tag beside a pointer, which comes back from a call in two registers. The
+/// Result comes back through a memory return slot, and a scan pays for that on
+/// every row. The delay a `Sleep` asks for lives in `Statement::pending_sleep`,
+/// because holding it here would make the outcome three words.
+enum StepOutcome {
+    Done,
+    IO,
+    Row,
+    Interrupt,
+    Busy,
+    Yield,
+    Sleep,
+    Error(Box<LimboError>),
+}
+
 pub struct Statement {
     pub(crate) program: vdbe::Program,
     state: vdbe::ProgramState,
@@ -307,6 +325,10 @@ pub struct Statement {
     query_timeout_override: Option<Option<Duration>>,
     /// True once [Self::step] has returned a [Row].
     has_returned_row: bool,
+    /// The delay a `StepOutcome::Sleep` asks for. Kept here rather than in the
+    /// outcome so that the outcome stays two machine words and comes back from
+    /// `_step` in registers.
+    pending_sleep: std::time::Duration,
     /// Byte offset in the original SQL string where this statement ends.
     /// Used by sqlite3_prepare_v2 to set the *pzTail output parameter.
     tail_offset: usize,
@@ -314,6 +336,11 @@ pub struct Statement {
     /// True once this root statement has started executing and incremented
     /// `Connection::n_active_root_statements`.
     counted_as_active_root: bool,
+    /// True while [`Self::prepare_step`] has nothing left to do for this
+    /// execution: the root statement is counted and no busy wait is pending.
+    /// `_step` used to ask that question with three tests on three fields on
+    /// every step, for work that happens once per execution.
+    steps_are_prepared: bool,
     /// True for the parked statement backing an incremental blob handle.
     /// Counted separately in `Connection::n_active_blob_statements` so
     /// explicit checkpoints can subtract it — an open blob handle must not
@@ -397,9 +424,11 @@ impl Statement {
             busy_handler_state: None,
             query_timeout_override: None,
             has_returned_row: false,
+            pending_sleep: std::time::Duration::ZERO,
             tail_offset,
             origin,
             counted_as_active_root: false,
+            steps_are_prepared: false,
             is_blob_handle: false,
             nested_guard_active,
         }
@@ -552,6 +581,7 @@ impl Statement {
                 self.program.connection.clear_interrupt_if_idle();
             }
             self.counted_as_active_root = false;
+            self.steps_are_prepared = false;
         }
     }
 
@@ -559,40 +589,104 @@ impl Statement {
     /// matters on the first call, the last call, a busy wait or an error is
     /// gated behind cheap flag tests and kept out of line. A row in the middle
     /// of a scan runs only the interpreter call and the result-row bookkeeping.
-    fn _step(&mut self, waker: Option<&Waker>) -> Result<StepResult> {
-        if matches!(self.state.execution_state, ProgramExecutionState::Init)
-            || !self.counted_as_active_root
-            || self.busy_handler_state.is_some()
+    /// Answers a [StepOutcome] rather than a `Result<StepResult, ..>` because
+    /// the two have the same size but not the same shape: a tag beside a
+    /// pointer comes back in two registers, while the Result comes back through
+    /// a memory return slot. A scan pays for that slot on every row, in a
+    /// callee-saved register held for the length of the dispatch loop and in a
+    /// store rather than a register. `step` converts at the public boundary.
+    fn _step(&mut self, waker: Option<&Waker>) -> StepOutcome {
+        turso_debug_assert!(
+            !self.steps_are_prepared
+                || (self.counted_as_active_root
+                    && self.busy_handler_state.is_none()
+                    && matches!(self.query_mode, QueryMode::Normal)
+                    && !matches!(self.state.execution_state, ProgramExecutionState::Init)),
+            "a statement that skips prepare_step must be normal, counted, idle and started"
+        );
+        if !self.steps_are_prepared {
+            match self.prepare_step(waker) {
+                Ok(Some(result)) => return self.outcome_of(Ok(result)),
+                Ok(None) => {}
+                Err(err) => return StepOutcome::Error(err.into()),
+            }
+            if !matches!(self.query_mode, QueryMode::Normal) {
+                return self.step_explain(waker);
+            }
+            // Everything above happens once per execution. The three fields
+            // that can undo it clear this flag where they change.
+            self.steps_are_prepared =
+                self.counted_as_active_root && self.busy_handler_state.is_none();
+        }
+        match self
+            .program
+            .normal_step(&mut self.state, &self.pager, waker)
         {
-            if let Some(result) = self.prepare_step(waker)? {
-                return Ok(result);
+            ProgramStep::Row => {
+                self.busy = true;
+                self.has_returned_row = true;
+                StepOutcome::Row
+            }
+            step => {
+                let res = self.finish_step(step.into(), waker);
+                self.outcome_of(res)
             }
         }
-        let res = match self.query_mode {
-            QueryMode::Normal => {
-                match self
-                    .program
-                    .normal_step(&mut self.state, &self.pager, waker)
-                {
-                    ProgramStep::Row => {
-                        self.busy = true;
-                        self.has_returned_row = true;
-                        return Ok(StepResult::Row);
-                    }
-                    step => step.into(),
-                }
+    }
+
+    /// A step of EXPLAIN or EXPLAIN QUERY PLAN. Out of line, and behind the
+    /// flag that says the statement is ready to run, so a row of a plain query
+    /// does not ask which mode it is in.
+    #[inline(never)]
+    fn step_explain(&mut self, waker: Option<&Waker>) -> StepOutcome {
+        let res = self
+            .program
+            .step(&mut self.state, &self.pager, self.query_mode, waker);
+        let res = self.finish_step(res, waker);
+        self.outcome_of(res)
+    }
+
+    /// Turns a step result into a [StepOutcome], keeping a sleep delay in
+    /// `pending_sleep` so the outcome stays two machine words.
+    fn outcome_of(&mut self, res: std::result::Result<StepResult, Box<LimboError>>) -> StepOutcome {
+        match res {
+            Ok(StepResult::Done) => StepOutcome::Done,
+            Ok(StepResult::IO) => StepOutcome::IO,
+            Ok(StepResult::Row) => StepOutcome::Row,
+            Ok(StepResult::Interrupt) => StepOutcome::Interrupt,
+            Ok(StepResult::Busy) => StepOutcome::Busy,
+            Ok(StepResult::Yield) => StepOutcome::Yield,
+            Ok(StepResult::Sleep { duration }) => {
+                self.pending_sleep = duration;
+                StepOutcome::Sleep
             }
-            _ => self
-                .program
-                .step(&mut self.state, &self.pager, self.query_mode, waker),
-        };
-        self.finish_step(res, waker)
+            Err(err) => StepOutcome::Error(err),
+        }
+    }
+
+    fn step_result_of(&self, outcome: StepOutcome) -> Result<StepResult> {
+        match outcome {
+            StepOutcome::Done => Ok(StepResult::Done),
+            StepOutcome::IO => Ok(StepResult::IO),
+            StepOutcome::Row => Ok(StepResult::Row),
+            StepOutcome::Interrupt => Ok(StepResult::Interrupt),
+            StepOutcome::Busy => Ok(StepResult::Busy),
+            StepOutcome::Yield => Ok(StepResult::Yield),
+            StepOutcome::Sleep => Ok(StepResult::Sleep {
+                duration: self.pending_sleep,
+            }),
+            StepOutcome::Error(err) => Err(*err),
+        }
     }
 
     /// First-call and busy-wait work of [`Self::_step`]. Returns the result to
     /// hand back to the caller when the statement must not run yet.
     #[inline(never)]
     fn prepare_step(&mut self, waker: Option<&Waker>) -> Result<Option<StepResult>> {
+        // Every execution starts in ProgramExecutionState::Init, which is one
+        // of the conditions that brings _step here, so this runs once per
+        // execution and the dispatch loop never reads the switches itself.
+        self.state.trace_flags = crate::vdbe::TraceFlags::read(&self.program.connection);
         if !self.counted_as_active_root && matches!(self.origin, StatementOrigin::Root) {
             self.program.connection.start_root_statement()?;
             self.counted_as_active_root = true;
@@ -651,7 +745,7 @@ impl Statement {
         &mut self,
         mut res: std::result::Result<StepResult, Box<LimboError>>,
         waker: Option<&Waker>,
-    ) -> Result<StepResult> {
+    ) -> std::result::Result<StepResult, Box<LimboError>> {
         const MAX_SCHEMA_RETRY: usize = 50;
         for attempt in 0..MAX_SCHEMA_RETRY {
             // Only reprepare if we still need to update schema
@@ -674,7 +768,7 @@ impl Statement {
             tracing::debug!("reprepare: attempt={}", attempt);
             if let Err(err) = self.reprepare() {
                 self.release_active_root_if_counted();
-                return Err(err);
+                return Err(err.into());
             }
             res = self
                 .program
@@ -708,6 +802,7 @@ impl Statement {
             let handler = self.program.connection.get_busy_handler();
 
             // Initialize or get existing busy handler state
+            self.steps_are_prepared = false;
             let busy_state = self
                 .busy_handler_state
                 .get_or_insert_with(|| BusyHandlerState::new(now));
@@ -750,19 +845,21 @@ impl Statement {
             self.cleanup_orphaned_seq_inner_tx();
         }
 
-        // The interpreter chain carries a boxed error to keep per-row returns
-        // register-sized; unbox once at the public boundary.
-        res.map_err(|err| *err)
+        res
     }
 
     #[inline]
     pub fn step(&mut self) -> Result<StepResult> {
-        self._step(None)
+        // The interpreter chain carries a register-sized outcome and a boxed
+        // error; both widen to the public shape once here.
+        let outcome = self._step(None);
+        self.step_result_of(outcome)
     }
 
     #[inline]
     pub fn step_with_waker(&mut self, waker: &Waker) -> Result<StepResult> {
-        self._step(Some(waker))
+        let outcome = self._step(Some(waker));
+        self.step_result_of(outcome)
     }
 
     /// Fast step for trigger/FK subprograms: skips reprepare checks, timeout
@@ -1492,6 +1589,7 @@ impl Statement {
             .n_change
             .store(0, std::sync::atomic::Ordering::Release);
         self.busy = false;
+        self.steps_are_prepared = false;
         self.has_returned_row = false;
     }
 
@@ -1656,6 +1754,7 @@ impl Statement {
         self.cleanup_orphaned_seq_inner_tx();
         self.state.reset(max_registers, max_cursors);
         self.busy = false;
+        self.steps_are_prepared = false;
         self.busy_handler_state = None;
         self.query_timeout_override = None;
         self.has_returned_row = false;
