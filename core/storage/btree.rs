@@ -7867,7 +7867,7 @@ impl BTreeCursor {
         }
         let (page, cell_idx) = self.stack.top_and_cell_index();
         let (is_leaf, cell_count) = page.get_contents().leaf_and_cell_count();
-        cell_idx >= 0 && is_leaf && cell_idx as usize + 1 < cell_count
+        is_leaf && next_cell_index(cell_idx) < cell_count
     }
 
     /// True when the cursor sits on the last cell of the rightmost leaf and
@@ -7881,9 +7881,8 @@ impl BTreeCursor {
         }
         let (page, cell_idx) = self.stack.top_and_cell_index();
         let (is_leaf, cell_count) = page.get_contents().leaf_and_cell_count();
-        cell_idx >= 0
-            && is_leaf
-            && cell_idx as usize + 1 == cell_count
+        is_leaf
+            && next_cell_index(cell_idx) == cell_count
             && !self.ancestor_pages_have_more_children()
     }
 
@@ -8733,6 +8732,15 @@ impl CoverageChecker {
 /// Stack of pages representing the tree traversal order.
 /// current_page represents the current page being used in the tree and current_page - 1 would be
 /// the parent. Using current_page + 1 or higher is undefined behaviour.
+/// The cell the cursor would move to. A cursor before the first cell holds
+/// -1, which the unsigned cast turns into a number no page's cell count can
+/// reach, so one compare covers both "before the first cell" and "past the
+/// last one".
+#[inline(always)]
+fn next_cell_index(cell_idx: i32) -> usize {
+    cell_idx as u32 as usize + 1
+}
+
 struct PageStack {
     /// Pointer to the current page being consumed
     current_page: i32,
