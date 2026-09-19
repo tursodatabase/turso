@@ -17,7 +17,7 @@ use crate::{
     schema::Trigger,
     stats::refresh_analyze_stats,
     translate::{self, display::PlanContext, emitter::TransactionMode, plan::BitSet},
-    turso_assert,
+    turso_assert, turso_debug_assert,
     vdbe::{
         self,
         explain::{
@@ -314,6 +314,14 @@ pub struct Statement {
     /// True once this root statement has started executing and incremented
     /// `Connection::n_active_root_statements`.
     counted_as_active_root: bool,
+    /// True while [`Self::prepare_step`] still has work to do before the next
+    /// step: the execution has not started, a root statement is not counted as
+    /// active yet, or a busy handler is waiting out a delay. Summarizing the
+    /// three tests in one flag keeps the step path to a single byte test, and
+    /// it stops a statement that is not a root -- a subprogram or an internal
+    /// helper, which is never counted -- from re-entering `prepare_step` on
+    /// every one of its steps.
+    needs_prepare_step: bool,
     /// True for the parked statement backing an incremental blob handle.
     /// Counted separately in `Connection::n_active_blob_statements` so
     /// explicit checkpoints can subtract it — an open blob handle must not
@@ -400,6 +408,7 @@ impl Statement {
             tail_offset,
             origin,
             counted_as_active_root: false,
+            needs_prepare_step: true,
             is_blob_handle: false,
             nested_guard_active,
         }
@@ -552,6 +561,7 @@ impl Statement {
                 self.program.connection.clear_interrupt_if_idle();
             }
             self.counted_as_active_root = false;
+            self.needs_prepare_step = true;
         }
     }
 
@@ -560,10 +570,18 @@ impl Statement {
     /// gated behind cheap flag tests and kept out of line. A row in the middle
     /// of a scan runs only the interpreter call and the result-row bookkeeping.
     fn _step(&mut self, waker: Option<&Waker>) -> Result<StepResult> {
-        if matches!(self.state.execution_state, ProgramExecutionState::Init)
-            || !self.counted_as_active_root
-            || self.busy_handler_state.is_some()
-        {
+        // The flag may stand when nothing is left to prepare -- an extra
+        // `prepare_step` only re-tests what it already settled -- but it must
+        // never be down while any of the three still needs work.
+        turso_debug_assert!(
+            self.needs_prepare_step
+                || !(matches!(self.state.execution_state, ProgramExecutionState::Init)
+                    || (!self.counted_as_active_root
+                        && matches!(self.origin, StatementOrigin::Root))
+                    || self.busy_handler_state.is_some()),
+            "needs_prepare_step is down while prepare_step still has work"
+        );
+        if self.needs_prepare_step {
             if let Some(result) = self.prepare_step(waker)? {
                 return Ok(result);
             }
@@ -645,6 +663,7 @@ impl Statement {
                 }));
             }
         }
+        self.needs_prepare_step = false;
         Ok(None)
     }
 
@@ -715,6 +734,7 @@ impl Statement {
             let busy_state = self
                 .busy_handler_state
                 .get_or_insert_with(|| BusyHandlerState::new(now));
+            self.needs_prepare_step = true;
 
             // Invoke the busy handler to determine if we should retry
             if busy_state.invoke(&handler, now) {
@@ -1492,6 +1512,7 @@ impl Statement {
     pub fn reset_for_subprogram_reuse(&mut self) {
         self.cleanup_orphaned_seq_inner_tx();
         self.state.reset(None, None);
+        self.needs_prepare_step = true;
         self.state
             .n_change
             .store(0, std::sync::atomic::Ordering::Release);
@@ -1659,6 +1680,7 @@ impl Statement {
         }
         self.cleanup_orphaned_seq_inner_tx();
         self.state.reset(max_registers, max_cursors);
+        self.needs_prepare_step = true;
         self.busy = false;
         self.busy_handler_state = None;
         self.query_timeout_override = None;
