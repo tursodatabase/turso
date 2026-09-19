@@ -2019,10 +2019,9 @@ impl<'a> ValueIterator<'a> {
         let (header_size, header_varint_len) = read_varint(payload)?;
         let header_size = header_size as usize;
 
-        if header_size > payload.len()
-            || header_varint_len > payload.len()
-            || header_varint_len > header_size
-        {
+        // The second test makes the first one cover the varint as well:
+        // it ends inside the header, and the header ends inside the payload.
+        if header_size > payload.len() || header_varint_len > header_size {
             return Err(LimboError::Corrupt(
                 "Payload too small for indicated header size".into(),
             ));
@@ -3787,6 +3786,20 @@ mod tests {
     use crate::alloc::vec;
     use crate::translate::collate::CollationSeq;
     use asserting::prelude::*;
+
+    #[test]
+    fn value_iterator_rejects_a_header_that_does_not_fit_its_payload() {
+        assert_that!(ValueIterator::new(&[]).is_err()).is_true();
+        assert_that!(ValueIterator::new(&[2]).is_err()).is_true();
+        assert_that!(ValueIterator::new(&[9, 1]).is_err()).is_true();
+        assert_that!(ValueIterator::new(&[0, 1, 0]).is_err()).is_true();
+        assert_that!(ValueIterator::new(&[129, 0, 1, 0]).is_err()).is_true();
+        assert_that!(ValueIterator::new(&[1, 1, 0]).unwrap().next().is_none()).is_true();
+        let mut iterator = ValueIterator::new(&[2, 1, 7]).unwrap();
+        let value = iterator.next().unwrap().unwrap();
+        assert_that!(matches!(value, ValueRef::Numeric(Numeric::Integer(7)))).is_true();
+        assert_that!(iterator.next().is_none()).is_true();
+    }
 
     #[test]
     fn serial_type_size_matches_the_length_the_kind_carries() {
