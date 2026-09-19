@@ -4011,8 +4011,8 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> StateTransition
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::alloc::TursoIteratorExt;
     use crate::alloc::vec;
+    use crate::alloc::TursoIteratorExt;
     use crate::mvcc::database::tests::MvccTestDbNoConn;
     use crate::mvcc::database::SortableIndexKey;
     use crate::translate::collate::CollationSeq;
