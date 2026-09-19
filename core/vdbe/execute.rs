@@ -486,12 +486,12 @@ pub fn op_add(
     _pager: &Arc<Pager>,
 ) -> InsnResult {
     load_insn!(Add { lhs, rhs, dest }, insn);
-    if let Some(result) = numeric_operands(state, *lhs, *rhs).and_then(|(l, r)| l.checked_add(r)) {
-        state.registers[*dest].set_numeric(result);
+    if let Some(result) = integer_operands(state, *lhs, *rhs).and_then(|(l, r)| l.checked_add(r)) {
+        state.registers[*dest].set_int(result);
         state.pc += 1;
         return Ok(InsnFunctionStepResult::Step);
     }
-    op_arithmetic_slow(state, *lhs, *rhs, *dest, Value::exec_add)
+    op_add_not_two_integers(state, *lhs, *rhs, *dest)
 }
 
 pub fn op_subtract(
@@ -501,12 +501,12 @@ pub fn op_subtract(
     _pager: &Arc<Pager>,
 ) -> InsnResult {
     load_insn!(Subtract { lhs, rhs, dest }, insn);
-    if let Some(result) = numeric_operands(state, *lhs, *rhs).and_then(|(l, r)| l.checked_sub(r)) {
-        state.registers[*dest].set_numeric(result);
+    if let Some(result) = integer_operands(state, *lhs, *rhs).and_then(|(l, r)| l.checked_sub(r)) {
+        state.registers[*dest].set_int(result);
         state.pc += 1;
         return Ok(InsnFunctionStepResult::Step);
     }
-    op_arithmetic_slow(state, *lhs, *rhs, *dest, Value::exec_subtract)
+    op_subtract_not_two_integers(state, *lhs, *rhs, *dest)
 }
 
 pub fn op_multiply(
@@ -516,12 +516,72 @@ pub fn op_multiply(
     _pager: &Arc<Pager>,
 ) -> InsnResult {
     load_insn!(Multiply { lhs, rhs, dest }, insn);
-    if let Some(result) = numeric_operands(state, *lhs, *rhs).and_then(|(l, r)| l.checked_mul(r)) {
-        state.registers[*dest].set_numeric(result);
+    if let Some(result) = integer_operands(state, *lhs, *rhs).and_then(|(l, r)| l.checked_mul(r)) {
+        state.registers[*dest].set_int(result);
         state.pc += 1;
         return Ok(InsnFunctionStepResult::Step);
     }
-    op_arithmetic_slow(state, *lhs, *rhs, *dest, Value::exec_multiply)
+    op_multiply_not_two_integers(state, *lhs, *rhs, *dest)
+}
+
+/// Addition of everything the opcode's integer pair does not cover: floats, an
+/// integer pair that overflows into one, and operands that are not numbers.
+/// Out of line because `Numeric::checked_add` calls itself on an integer overflow,
+/// which stops the compiler inlining it; inlined here it put both operands
+/// of every row through memory and a call.
+#[inline(never)]
+fn op_add_not_two_integers(
+    state: &mut ProgramState,
+    lhs: usize,
+    rhs: usize,
+    dest: usize,
+) -> InsnResult {
+    if let Some(result) = numeric_operands(state, lhs, rhs).and_then(|(l, r)| l.checked_add(r)) {
+        state.registers[dest].set_numeric(result);
+        state.pc += 1;
+        return Ok(InsnFunctionStepResult::Step);
+    }
+    op_arithmetic_slow(state, lhs, rhs, dest, Value::exec_add)
+}
+
+/// Subtraction of everything the opcode's integer pair does not cover: floats, an
+/// integer pair that overflows into one, and operands that are not numbers.
+/// Out of line because `Numeric::checked_sub` calls itself on an integer overflow,
+/// which stops the compiler inlining it; inlined here it put both operands
+/// of every row through memory and a call.
+#[inline(never)]
+fn op_subtract_not_two_integers(
+    state: &mut ProgramState,
+    lhs: usize,
+    rhs: usize,
+    dest: usize,
+) -> InsnResult {
+    if let Some(result) = numeric_operands(state, lhs, rhs).and_then(|(l, r)| l.checked_sub(r)) {
+        state.registers[dest].set_numeric(result);
+        state.pc += 1;
+        return Ok(InsnFunctionStepResult::Step);
+    }
+    op_arithmetic_slow(state, lhs, rhs, dest, Value::exec_subtract)
+}
+
+/// Multiplication of everything the opcode's integer pair does not cover: floats, an
+/// integer pair that overflows into one, and operands that are not numbers.
+/// Out of line because `Numeric::checked_mul` calls itself on an integer overflow,
+/// which stops the compiler inlining it; inlined here it put both operands
+/// of every row through memory and a call.
+#[inline(never)]
+fn op_multiply_not_two_integers(
+    state: &mut ProgramState,
+    lhs: usize,
+    rhs: usize,
+    dest: usize,
+) -> InsnResult {
+    if let Some(result) = numeric_operands(state, lhs, rhs).and_then(|(l, r)| l.checked_mul(r)) {
+        state.registers[dest].set_numeric(result);
+        state.pc += 1;
+        return Ok(InsnFunctionStepResult::Step);
+    }
+    op_arithmetic_slow(state, lhs, rhs, dest, Value::exec_multiply)
 }
 
 /// Arithmetic for every operand pair the fast path of the opcode does not
