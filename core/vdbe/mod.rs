@@ -870,6 +870,14 @@ pub struct SequenceInnerTxState {
     )>,
 }
 
+/// Whether this statement's instructions are traced, read once when the
+/// statement starts.
+#[derive(Clone, Copy, Default)]
+pub(crate) struct TraceSwitches {
+    tracing: bool,
+    vdbe_trace: bool,
+}
+
 pub struct ProgramState {
     /// Instructions left before the next interrupt/progress check of
     /// normal_step; reloaded with `check_interval` each time it reaches zero.
@@ -917,6 +925,7 @@ pub struct ProgramState {
     /// Indicate whether an [Insn::Once] instruction at a given program counter position has already been executed, well, once.
     once: SmallVec<[u32; 4]>,
     pub execution_state: ProgramExecutionState,
+    trace_switches: TraceSwitches,
     /// Per-execution statement deadline derived from the connection query timeout.
     /// `None` means no timeout.
     pub query_deadline: Option<crate::MonotonicInstant>,
@@ -1075,6 +1084,7 @@ impl ProgramState {
             ended_coroutine: vec![],
             once: SmallVec::<[u32; 4]>::new(),
             execution_state: ProgramExecutionState::Init,
+            trace_switches: TraceSwitches::default(),
             query_deadline: None,
             explicit_checkpoint_guard: None,
             parameters: Vec::new(),
@@ -2297,6 +2307,19 @@ impl Program {
         state.pre_op_registers = Some(state.registers.clone());
     }
 
+    /// Marks the statement running and reads the trace switches once.
+    ///
+    /// The level filter answers whether a TRACE span could be recorded at
+    /// all; the traced loop's own `trace!` calls test the subscriber.
+    #[inline(never)]
+    fn start_execution(&self, state: &mut ProgramState) {
+        state.trace_switches = TraceSwitches {
+            tracing: tracing::level_filters::LevelFilter::current() >= tracing::Level::TRACE,
+            vdbe_trace: self.connection.get_vdbe_trace(),
+        };
+        state.execution_state = ProgramExecutionState::Running;
+    }
+
     /// Step in [QueryMode::Normal]
     #[inline(always)]
     pub(crate) fn normal_step(
@@ -2305,9 +2328,16 @@ impl Program {
         pager: &Arc<Pager>,
         waker: Option<&Waker>,
     ) -> ProgramStep {
-        state.execution_state = ProgramExecutionState::Running;
-        let enable_tracing = tracing::enabled!(tracing::Level::TRACE);
-        let vdbe_trace = self.connection.get_vdbe_trace();
+        // Reading the two trace switches costs an atomic load and a level
+        // filter compare. A statement that returns rows comes through here
+        // once per row, so the answer is read when the statement starts.
+        if !matches!(state.execution_state, ProgramExecutionState::Running) {
+            self.start_execution(state);
+        }
+        let TraceSwitches {
+            tracing: enable_tracing,
+            vdbe_trace,
+        } = state.trace_switches;
         let result = if enable_tracing || vdbe_trace {
             dispatch_loop_traced(self, state, pager, waker, enable_tracing, vdbe_trace)
         } else {
