@@ -1441,7 +1441,19 @@ impl Statement {
     /// (so subsequent `commit_dep_counter` walks may wait on it forever)
     /// and the connection's mv_tx points to a dead tx, breaking the
     /// next statement that runs on the connection.
+    #[inline]
     fn cleanup_orphaned_seq_inner_tx(&mut self) {
+        // Statements that never wrapped a sequence in an inner transaction,
+        // which is almost all of them, stop here without a call.
+        if self.state.sequence_inner_tx_pending.is_none() {
+            return;
+        }
+        self.rollback_orphaned_seq_inner_tx();
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn rollback_orphaned_seq_inner_tx(&mut self) {
         let Some(pending) = self.state.sequence_inner_tx_pending.take() else {
             return;
         };
