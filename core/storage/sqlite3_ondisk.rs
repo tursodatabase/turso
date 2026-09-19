@@ -807,6 +807,20 @@ pub enum BTreeCell {
     IndexLeafCell(IndexLeafCell),
 }
 
+impl BTreeCell {
+    /// The first of the cell's overflow pages, or `None` when its payload fits
+    /// on the page. An interior table cell carries a child pointer and a rowid
+    /// and never overflows.
+    pub fn first_overflow_page(&self) -> Option<u32> {
+        match self {
+            BTreeCell::TableLeafCell(cell) => cell.first_overflow_page,
+            BTreeCell::IndexLeafCell(cell) => cell.first_overflow_page,
+            BTreeCell::IndexInteriorCell(cell) => cell.first_overflow_page,
+            BTreeCell::TableInteriorCell(_) => None,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct TableInteriorCell {
     pub left_child_page: u32,
