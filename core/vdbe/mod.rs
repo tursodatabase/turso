@@ -2306,8 +2306,14 @@ impl Program {
         } else {
             dispatch_loop::<false>(self, state, pager, waker, false, false)
         };
+        // A row leaves the execution running, which it already is. Returning
+        // it as a fresh constant, before the match that reads the other
+        // outcomes apart, lets the caller's own match on it settle at compile
+        // time: this runs once for every row a statement returns.
+        if matches!(result, ProgramStep::Row) {
+            return ProgramStep::Row;
+        }
         match &result {
-            ProgramStep::Row => {}
             ProgramStep::Done => {
                 state.execution_state = ProgramExecutionState::Done;
             }
