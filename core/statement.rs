@@ -290,6 +290,24 @@ fn combine_arithmetic_primitive(
     }
 }
 
+/// What one step of a statement produced, as the interpreter chain carries it.
+///
+/// Same size as `Result<StepResult, Box<LimboError>>` but a different shape: a
+/// tag beside a pointer, which comes back from a call in two registers. The
+/// Result comes back through a memory return slot, and a scan pays for that on
+/// every row. The delay a `Sleep` asks for lives in `Statement::pending_sleep`,
+/// because holding it here would make the outcome three words.
+enum StepOutcome {
+    Done,
+    IO,
+    Row,
+    Interrupt,
+    Busy,
+    Yield,
+    Sleep,
+    Error(Box<LimboError>),
+}
+
 pub struct Statement {
     pub(crate) program: vdbe::Program,
     state: vdbe::ProgramState,
@@ -307,6 +325,10 @@ pub struct Statement {
     query_timeout_override: Option<Option<Duration>>,
     /// True once [Self::step] has returned a [Row].
     has_returned_row: bool,
+    /// The delay a `StepOutcome::Sleep` asks for. Kept here rather than in the
+    /// outcome so that the outcome stays two machine words and comes back from
+    /// `_step` in registers.
+    pending_sleep: std::time::Duration,
     /// Byte offset in the original SQL string where this statement ends.
     /// Used by sqlite3_prepare_v2 to set the *pzTail output parameter.
     tail_offset: usize,
@@ -397,6 +419,7 @@ impl Statement {
             busy_handler_state: None,
             query_timeout_override: None,
             has_returned_row: false,
+            pending_sleep: std::time::Duration::ZERO,
             tail_offset,
             origin,
             counted_as_active_root: false,
@@ -559,19 +582,21 @@ impl Statement {
     /// matters on the first call, the last call, a busy wait or an error is
     /// gated behind cheap flag tests and kept out of line. A row in the middle
     /// of a scan runs only the interpreter call and the result-row bookkeeping.
-    /// The error is boxed so the whole return value is register-sized. Left
-    /// unboxed, `Result<StepResult, LimboError>` is 40 bytes and comes back
-    /// through a memory return slot, which a scan pays for on every row: the
-    /// slot pointer takes a callee-saved register for the length of the
-    /// dispatch loop and the outcome is written to memory rather than returned
-    /// in registers. `step` unboxes at the public boundary.
-    fn _step(&mut self, waker: Option<&Waker>) -> std::result::Result<StepResult, Box<LimboError>> {
+    /// Answers a [StepOutcome] rather than a `Result<StepResult, ..>` because
+    /// the two have the same size but not the same shape: a tag beside a
+    /// pointer comes back in two registers, while the Result comes back through
+    /// a memory return slot. A scan pays for that slot on every row, in a
+    /// callee-saved register held for the length of the dispatch loop and in a
+    /// store rather than a register. `step` converts at the public boundary.
+    fn _step(&mut self, waker: Option<&Waker>) -> StepOutcome {
         if matches!(self.state.execution_state, ProgramExecutionState::Init)
             || !self.counted_as_active_root
             || self.busy_handler_state.is_some()
         {
-            if let Some(result) = self.prepare_step(waker)? {
-                return Ok(result);
+            match self.prepare_step(waker) {
+                Ok(Some(result)) => return self.into_outcome(Ok(result)),
+                Ok(None) => {}
+                Err(err) => return StepOutcome::Error(err.into()),
             }
         }
         let res = match self.query_mode {
@@ -583,7 +608,7 @@ impl Statement {
                     ProgramStep::Row => {
                         self.busy = true;
                         self.has_returned_row = true;
-                        return Ok(StepResult::Row);
+                        return StepOutcome::Row;
                     }
                     step => step.into(),
                 }
@@ -592,7 +617,44 @@ impl Statement {
                 .program
                 .step(&mut self.state, &self.pager, self.query_mode, waker),
         };
-        self.finish_step(res, waker)
+        let res = self.finish_step(res, waker);
+        self.into_outcome(res)
+    }
+
+    /// Moves a step result into a [StepOutcome], parking a sleep delay in
+    /// `pending_sleep` so the outcome stays two machine words.
+    fn into_outcome(
+        &mut self,
+        res: std::result::Result<StepResult, Box<LimboError>>,
+    ) -> StepOutcome {
+        match res {
+            Ok(StepResult::Done) => StepOutcome::Done,
+            Ok(StepResult::IO) => StepOutcome::IO,
+            Ok(StepResult::Row) => StepOutcome::Row,
+            Ok(StepResult::Interrupt) => StepOutcome::Interrupt,
+            Ok(StepResult::Busy) => StepOutcome::Busy,
+            Ok(StepResult::Yield) => StepOutcome::Yield,
+            Ok(StepResult::Sleep { duration }) => {
+                self.pending_sleep = duration;
+                StepOutcome::Sleep
+            }
+            Err(err) => StepOutcome::Error(err),
+        }
+    }
+
+    fn from_outcome(&self, outcome: StepOutcome) -> Result<StepResult> {
+        match outcome {
+            StepOutcome::Done => Ok(StepResult::Done),
+            StepOutcome::IO => Ok(StepResult::IO),
+            StepOutcome::Row => Ok(StepResult::Row),
+            StepOutcome::Interrupt => Ok(StepResult::Interrupt),
+            StepOutcome::Busy => Ok(StepResult::Busy),
+            StepOutcome::Yield => Ok(StepResult::Yield),
+            StepOutcome::Sleep => Ok(StepResult::Sleep {
+                duration: self.pending_sleep,
+            }),
+            StepOutcome::Error(err) => Err(*err),
+        }
     }
 
     /// First-call and busy-wait work of [`Self::_step`]. Returns the result to
@@ -765,14 +827,16 @@ impl Statement {
 
     #[inline]
     pub fn step(&mut self) -> Result<StepResult> {
-        // The interpreter chain carries a boxed error to keep per-row returns
-        // register-sized; unbox once here, at the public boundary.
-        self._step(None).map_err(|err| *err)
+        // The interpreter chain carries a register-sized outcome and a boxed
+        // error; both widen to the public shape once here.
+        let outcome = self._step(None);
+        self.from_outcome(outcome)
     }
 
     #[inline]
     pub fn step_with_waker(&mut self, waker: &Waker) -> Result<StepResult> {
-        self._step(Some(waker)).map_err(|err| *err)
+        let outcome = self._step(Some(waker));
+        self.from_outcome(outcome)
     }
 
     /// Fast step for trigger/FK subprograms: skips reprepare checks, timeout
