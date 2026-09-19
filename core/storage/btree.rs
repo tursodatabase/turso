@@ -8844,7 +8844,16 @@ impl PageStack {
     /// Current page pointer being used
     #[inline(always)]
     fn current(&self) -> usize {
-        turso_assert_greater_than_or_equal!(self.current_page, 0);
+        // Both ends in one test, which LLVM turns into a single unsigned
+        // compare. It also proves the index is inside `stack` and
+        // `node_states`, so the array reads that follow drop their own bounds
+        // tests. Checked separately, the lower bound and each array index were
+        // a compare and a branch each, on a path a scan takes for every row.
+        turso_assert!(
+            (0..=BTCURSOR_MAX_DEPTH as i32).contains(&self.current_page),
+            "page stack index out of range",
+            { "current_page": self.current_page }
+        );
         self.current_page as usize
     }
 
