@@ -121,7 +121,7 @@ impl Affinity {
         }
     }
 
-    pub fn from_char(char: char) -> Self {
+    pub const fn from_char(char: char) -> Self {
         match char {
             SQLITE_AFF_INTEGER => Affinity::Integer,
             SQLITE_AFF_TEXT => Affinity::Text,
@@ -136,7 +136,7 @@ impl Affinity {
         self.aff_mask() as u8
     }
 
-    pub fn from_char_code(code: u8) -> Self {
+    pub const fn from_char_code(code: u8) -> Self {
         Self::from_char(code as char)
     }
 
