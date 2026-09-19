@@ -3984,18 +3984,20 @@ impl<'a> ValueIteratorExt for crate::types::ValueIterator<'a> {
         let mut header = self.header_section_ref();
         let mut data = self.data_section_ref();
         skip_serial_types(&mut header, &mut data, skip)?;
-        let mut decoded = 0;
-        for dest in dests.iter_mut() {
-            if header.is_empty() {
+        // The count comes from what the iterator has left, so the loop does
+        // not keep a counter in a register it does not have to spare.
+        let wanted = dests.len();
+        let mut rest = dests.iter_mut();
+        while !header.is_empty() {
+            let Some(dest) = rest.next() else {
                 break;
-            }
+            };
             let serial_type = read_serial_type(&mut header)?;
             decode_serial_type_into_register(serial_type, &mut data, dest)?;
-            decoded += 1;
         }
         self.set_header_section(header);
         self.set_data_section(data);
-        Ok(decoded)
+        Ok(wanted - rest.len())
     }
 }
 
@@ -4353,6 +4355,41 @@ mod tests {
         payload.extend_from_slice(&header_body);
         payload.extend_from_slice(value);
         payload
+    }
+
+    fn three_value_record() -> Vec<u8> {
+        use crate::storage::sqlite3_ondisk::write_varint_to_vec;
+        let mut header_body = Vec::new();
+        write_varint_to_vec(1, &mut header_body);
+        write_varint_to_vec(1, &mut header_body);
+        write_varint_to_vec(1, &mut header_body);
+        let mut payload = Vec::new();
+        write_varint_to_vec(header_body.len() as u64 + 1, &mut payload);
+        payload.extend_from_slice(&header_body);
+        payload.extend_from_slice(&[7u8, 8, 9]);
+        payload
+    }
+
+    #[test]
+    fn a_record_shorter_than_the_registers_reports_what_it_filled() {
+        let payload = three_value_record();
+        for skip in 0..=3usize {
+            for room in 0..=5usize {
+                let mut registers = vec![Register::Value(Value::Null); room];
+                let mut iterator = crate::types::ValueIterator::new(&payload).unwrap();
+                let filled = iterator
+                    .decode_into_registers_after(skip, &mut registers)
+                    .unwrap();
+                assert_eq!(filled, room.min(3 - skip.min(3)), "skip={skip} room={room}");
+                for (index, register) in registers.iter().take(filled).enumerate() {
+                    let expected = 7 + (skip + index) as i64;
+                    assert!(
+                        matches!(register, Register::Value(Value::Numeric(Numeric::Integer(v))) if *v == expected),
+                        "skip={skip} room={room} index={index} got {register:?}"
+                    );
+                }
+            }
+        }
     }
 
     fn decode_one_text(payload: &[u8], destination: &mut Register) -> Result<()> {
