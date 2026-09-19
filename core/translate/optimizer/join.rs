@@ -838,6 +838,7 @@ fn join_lhs_and_rhs<'a>(
                     rhs_table_idx,
                     lhs_constraints,
                     rhs_constraints,
+                    &lhs_mask,
                     where_clause,
                     where_terms.iter().enumerate().filter_map(|(index, term)| {
                         let (left, right, owner) = term.equal_tables?;
@@ -4533,6 +4534,7 @@ mod tests {
             &DEFAULT_PARAMS,
         )
         .unwrap();
+        let joined_before_probe_mask: TableMask = [0].into_iter().try_collect().unwrap();
         let method = try_hash_join_access_method(
             &table_references.joined_tables()[0],
             &table_references.joined_tables()[1],
@@ -4540,6 +4542,7 @@ mod tests {
             1,
             &constraints[0],
             &constraints[1],
+            &joined_before_probe_mask,
             &mut where_clause,
             std::iter::once((
                 0,
