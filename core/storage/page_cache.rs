@@ -405,7 +405,11 @@ impl PageCache {
         }
     }
 
-    #[inline]
+    /// Inlined into its caller: a hit is a hash lookup and a refcount bump,
+    /// and returning `Result<Option<PageRef>>` out of line costs a stack slot
+    /// for the 40-byte error plus a frame, both of which are more than the
+    /// body.
+    #[inline(always)]
     pub fn get(&mut self, key: &PageCacheKey) -> crate::Result<Option<PageRef>> {
         let Some(&entry_ptr) = self.map.get(key) else {
             return Ok(None);

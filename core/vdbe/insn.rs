@@ -379,7 +379,9 @@ pub struct HashDistinctData {
     pub target_pc: BranchOffset,
 }
 
-// The opcodes the dispatch loop matches directly come first.
+// The opcodes the dispatch loop matches directly come first, and in the
+// order it matches them: the switch it compiles to covers one dense range,
+// so every other opcode leaves it on a single compare.
 #[repr(u8)]
 #[derive(Description, Debug, Clone, EnumDiscriminants)]
 #[strum_discriminants(vis(pub(crate)))]
@@ -532,6 +534,69 @@ pub enum Insn {
         value: i64,
         dest: usize,
     },
+    /// Add two registers and store the result in a third register.
+    Add {
+        lhs: usize,
+        rhs: usize,
+        dest: usize,
+    },
+    /// Subtract rhs from lhs and store in dest
+    Subtract {
+        lhs: usize,
+        rhs: usize,
+        dest: usize,
+    },
+    /// Multiply two registers and store the result in a third register.
+    Multiply {
+        lhs: usize,
+        rhs: usize,
+        dest: usize,
+    },
+    /// Divide lhs by rhs and store the result in a third register.
+    Divide {
+        lhs: usize,
+        rhs: usize,
+        dest: usize,
+    },
+    /// Divide lhs by rhs and place the remainder in dest register.
+    Remainder {
+        lhs: usize,
+        rhs: usize,
+        dest: usize,
+    },
+
+    /// Get parameter variable.
+    Variable {
+        index: NonZero<usize>,
+        dest: usize,
+    },
+    /// If the given register is not NULL, jump to the given PC.
+    NotNull {
+        reg: usize,
+        target_pc: BranchOffset,
+    },
+
+    SoftNull {
+        reg: usize,
+    },
+
+    /// Halt the program if P3 is null.
+    HaltIfNull {
+        target_reg: usize,   // P3
+        description: String, // p4
+        err_code: usize,     // p1
+    },
+
+    MustBeInt {
+        reg: usize,
+        target_pc: Option<BranchOffset>,
+    },
+    /// Apply affinities to a range of registers. Affinities must have the same size of count
+    Affinity {
+        start_reg: usize,
+        count: NonZeroUsize,
+        affinities: String,
+    },
 
     /// Initialize the program state and jump to the given PC.
     Init {
@@ -552,24 +617,6 @@ pub enum Insn {
     NullRow {
         cursor_id: CursorID,
     },
-    /// Add two registers and store the result in a third register.
-    Add {
-        lhs: usize,
-        rhs: usize,
-        dest: usize,
-    },
-    /// Subtract rhs from lhs and store in dest
-    Subtract {
-        lhs: usize,
-        rhs: usize,
-        dest: usize,
-    },
-    /// Multiply two registers and store the result in a third register.
-    Multiply {
-        lhs: usize,
-        rhs: usize,
-        dest: usize,
-    },
     /// Updates the value of register dest_reg to the maximum of its current
     /// value and the value in src_reg.
     ///
@@ -579,12 +626,6 @@ pub enum Insn {
     MemMax {
         dest_reg: usize, // P1
         src_reg: usize,  // P2
-    },
-    /// Divide lhs by rhs and store the result in a third register.
-    Divide {
-        lhs: usize,
-        rhs: usize,
-        dest: usize,
     },
     /// Compare two vectors of registers in reg(P1)..reg(P1+P3-1) (call this vector "A") and in reg(P2)..reg(P2+P3-1) ("B"). Save the result of the comparison for use by the next Jump instruct.
     Compare {
@@ -616,12 +657,6 @@ pub enum Insn {
         checkpoint_mode: CheckpointMode, // P2 checkpoint mode
         dest: usize,                     // P3 checkpoint result
     },
-    /// Divide lhs by rhs and place the remainder in dest register.
-    Remainder {
-        lhs: usize,
-        rhs: usize,
-        dest: usize,
-    },
     /// Jump to the instruction at address P1, P2, or P3 depending on whether in the most recent Compare instruction the P1 vector was less than, equal to, or greater than the P2 vector, respectively.
     Jump {
         target_pc_lt: BranchOffset,
@@ -639,11 +674,6 @@ pub enum Insn {
         reg: usize,
         target_pc: BranchOffset,
         decrement_by: usize,
-    },
-    /// If the given register is not NULL, jump to the given PC.
-    NotNull {
-        reg: usize,
-        target_pc: BranchOffset,
     },
     /// Compute a hash on num_keys registers starting with r[key_reg]. Check to see if that hash
     /// is found in the bloom filter associated with the cursor/hash_table. If it is not present
@@ -986,13 +1016,6 @@ pub enum Insn {
         /// If set, read the error description from this register instead of
         /// the static `description` field (used by RAISE with expression messages).
         description_reg: Option<usize>,
-    },
-
-    /// Halt the program if P3 is null.
-    HaltIfNull {
-        target_reg: usize,   // P3
-        description: String, // p4
-        err_code: usize,     // p1
     },
 
     /// Start a transaction.
@@ -1377,15 +1400,6 @@ pub enum Insn {
         prev_largest_reg: usize, // P3 Previous largest rowid in the table (Not used for now)
     },
 
-    MustBeInt {
-        reg: usize,
-        target_pc: Option<BranchOffset>,
-    },
-
-    SoftNull {
-        reg: usize,
-    },
-
     /// If P4==0 then register P3 holds a blob constructed by [MakeRecord](https://sqlite.org/opcode.html#MakeRecord).
     /// If P4>0 then register P3 is the first of P4 registers that form an unpacked record.
     ///
@@ -1708,12 +1722,6 @@ pub enum Insn {
         register: usize, // P1: target register
         value: i64,      // P2: immediate value to add
     },
-
-    /// Get parameter variable.
-    Variable {
-        index: NonZero<usize>,
-        dest: usize,
-    },
     /// If either register is null put null else put 0
     ZeroOrNull {
         /// Source register (P1).
@@ -1837,12 +1845,6 @@ pub enum Insn {
         target_pc: BranchOffset,
         record_reg: usize,
         num_regs: usize,
-    },
-    /// Apply affinities to a range of registers. Affinities must have the same size of count
-    Affinity {
-        start_reg: usize,
-        count: NonZeroUsize,
-        affinities: String,
     },
 
     /// Store the number of entries (an integer value) in the table or index opened by cursor P1 in register P2.

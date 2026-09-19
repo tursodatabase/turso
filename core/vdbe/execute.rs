@@ -479,6 +479,7 @@ pub fn op_init(
     Ok(InsnFunctionStepResult::Step)
 }
 
+#[inline(always)]
 pub fn op_add(
     _program: &Program,
     state: &mut ProgramState,
@@ -486,14 +487,15 @@ pub fn op_add(
     _pager: &Arc<Pager>,
 ) -> InsnResult {
     load_insn!(Add { lhs, rhs, dest }, insn);
-    if let Some(result) = numeric_operands(state, *lhs, *rhs).and_then(|(l, r)| l.checked_add(r)) {
-        state.registers[*dest].set_numeric(result);
+    if let Some(result) = integer_operands(state, *lhs, *rhs).and_then(|(l, r)| l.checked_add(r)) {
+        state.registers[*dest].set_int(result);
         state.pc += 1;
         return Ok(InsnFunctionStepResult::Step);
     }
-    op_arithmetic_slow(state, *lhs, *rhs, *dest, Value::exec_add)
+    op_add_not_two_integers(state, *lhs, *rhs, *dest)
 }
 
+#[inline(always)]
 pub fn op_subtract(
     _program: &Program,
     state: &mut ProgramState,
@@ -501,14 +503,15 @@ pub fn op_subtract(
     _pager: &Arc<Pager>,
 ) -> InsnResult {
     load_insn!(Subtract { lhs, rhs, dest }, insn);
-    if let Some(result) = numeric_operands(state, *lhs, *rhs).and_then(|(l, r)| l.checked_sub(r)) {
-        state.registers[*dest].set_numeric(result);
+    if let Some(result) = integer_operands(state, *lhs, *rhs).and_then(|(l, r)| l.checked_sub(r)) {
+        state.registers[*dest].set_int(result);
         state.pc += 1;
         return Ok(InsnFunctionStepResult::Step);
     }
-    op_arithmetic_slow(state, *lhs, *rhs, *dest, Value::exec_subtract)
+    op_subtract_not_two_integers(state, *lhs, *rhs, *dest)
 }
 
+#[inline(always)]
 pub fn op_multiply(
     _program: &Program,
     state: &mut ProgramState,
@@ -516,12 +519,72 @@ pub fn op_multiply(
     _pager: &Arc<Pager>,
 ) -> InsnResult {
     load_insn!(Multiply { lhs, rhs, dest }, insn);
-    if let Some(result) = numeric_operands(state, *lhs, *rhs).and_then(|(l, r)| l.checked_mul(r)) {
-        state.registers[*dest].set_numeric(result);
+    if let Some(result) = integer_operands(state, *lhs, *rhs).and_then(|(l, r)| l.checked_mul(r)) {
+        state.registers[*dest].set_int(result);
         state.pc += 1;
         return Ok(InsnFunctionStepResult::Step);
     }
-    op_arithmetic_slow(state, *lhs, *rhs, *dest, Value::exec_multiply)
+    op_multiply_not_two_integers(state, *lhs, *rhs, *dest)
+}
+
+/// Addition of everything the opcode's integer pair does not cover: floats, an
+/// integer pair that overflows into one, and operands that are not numbers.
+/// Out of line because `Numeric::checked_add` calls itself on an integer overflow,
+/// which stops the compiler inlining it; inlined here it put both operands
+/// of every row through memory and a call.
+#[inline(never)]
+fn op_add_not_two_integers(
+    state: &mut ProgramState,
+    lhs: usize,
+    rhs: usize,
+    dest: usize,
+) -> InsnResult {
+    if let Some(result) = numeric_operands(state, lhs, rhs).and_then(|(l, r)| l.checked_add(r)) {
+        state.registers[dest].set_numeric(result);
+        state.pc += 1;
+        return Ok(InsnFunctionStepResult::Step);
+    }
+    op_arithmetic_slow(state, lhs, rhs, dest, Value::exec_add)
+}
+
+/// Subtraction of everything the opcode's integer pair does not cover: floats, an
+/// integer pair that overflows into one, and operands that are not numbers.
+/// Out of line because `Numeric::checked_sub` calls itself on an integer overflow,
+/// which stops the compiler inlining it; inlined here it put both operands
+/// of every row through memory and a call.
+#[inline(never)]
+fn op_subtract_not_two_integers(
+    state: &mut ProgramState,
+    lhs: usize,
+    rhs: usize,
+    dest: usize,
+) -> InsnResult {
+    if let Some(result) = numeric_operands(state, lhs, rhs).and_then(|(l, r)| l.checked_sub(r)) {
+        state.registers[dest].set_numeric(result);
+        state.pc += 1;
+        return Ok(InsnFunctionStepResult::Step);
+    }
+    op_arithmetic_slow(state, lhs, rhs, dest, Value::exec_subtract)
+}
+
+/// Multiplication of everything the opcode's integer pair does not cover: floats, an
+/// integer pair that overflows into one, and operands that are not numbers.
+/// Out of line because `Numeric::checked_mul` calls itself on an integer overflow,
+/// which stops the compiler inlining it; inlined here it put both operands
+/// of every row through memory and a call.
+#[inline(never)]
+fn op_multiply_not_two_integers(
+    state: &mut ProgramState,
+    lhs: usize,
+    rhs: usize,
+    dest: usize,
+) -> InsnResult {
+    if let Some(result) = numeric_operands(state, lhs, rhs).and_then(|(l, r)| l.checked_mul(r)) {
+        state.registers[dest].set_numeric(result);
+        state.pc += 1;
+        return Ok(InsnFunctionStepResult::Step);
+    }
+    op_arithmetic_slow(state, lhs, rhs, dest, Value::exec_multiply)
 }
 
 /// Arithmetic for every operand pair the fast path of the opcode does not
@@ -565,6 +628,7 @@ fn integer_operands(state: &ProgramState, lhs: usize, rhs: usize) -> Option<(i64
     }
 }
 
+#[inline(always)]
 pub fn op_divide(
     _program: &Program,
     state: &mut ProgramState,
@@ -604,6 +668,7 @@ pub fn op_drop_index(
     Ok(InsnFunctionStepResult::Step)
 }
 
+#[inline(always)]
 pub fn op_remainder(
     _program: &Program,
     state: &mut ProgramState,
@@ -1087,32 +1152,54 @@ macro_rules! comparison_opcode {
                 };
                 return Ok(InsnFunctionStepResult::Step);
             }
-            if let (
-                Register::Value(lhs_value @ Value::Text(l)),
-                Register::Value(rhs_value @ Value::Text(r)),
-            ) = (&state.registers[*lhs], &state.registers[*rhs])
-            {
-                if texts_compare_as_bytes(lhs_value, rhs_value, *flags, *collation) {
-                    state.pc = if comparison_matches_order($op, l.as_str().cmp(r.as_str())) {
-                        target_pc
-                    } else {
-                        state.pc + 1
-                    };
-                    return Ok(InsnFunctionStepResult::Step);
-                }
-            }
-            op_comparison_slow(
-                program,
-                state,
-                *lhs,
-                *rhs,
-                target_pc,
-                *flags,
-                collation.unwrap_or_default(),
-                $op,
+            op_comparison_not_two_integers(
+                program, state, *lhs, *rhs, target_pc, *flags, *collation, $op,
             )
         }
     };
+}
+
+/// The comparison opcodes for every operand pair other than two integers.
+/// Out of line: the dispatch loop inlines all six comparison opcodes, so
+/// every byte of them is a byte of the loop's own frame and register
+/// pressure, and only the integer pair is common enough to earn a place
+/// there.
+#[inline(never)]
+#[allow(clippy::too_many_arguments)]
+fn op_comparison_not_two_integers(
+    program: &Program,
+    state: &mut ProgramState,
+    lhs: usize,
+    rhs: usize,
+    target_pc: crate::vdbe::InsnReference,
+    flags: crate::vdbe::insn::CmpInsFlags,
+    collation: Option<CollationSeq>,
+    op: ComparisonOp,
+) -> InsnResult {
+    if let (
+        Register::Value(lhs_value @ Value::Text(l)),
+        Register::Value(rhs_value @ Value::Text(r)),
+    ) = (&state.registers[lhs], &state.registers[rhs])
+    {
+        if texts_compare_as_bytes(lhs_value, rhs_value, flags, collation) {
+            state.pc = if comparison_matches_order(op, l.as_str().cmp(r.as_str())) {
+                target_pc
+            } else {
+                state.pc + 1
+            };
+            return Ok(InsnFunctionStepResult::Step);
+        }
+    }
+    op_comparison_slow(
+        program,
+        state,
+        lhs,
+        rhs,
+        target_pc,
+        flags,
+        collation.unwrap_or_default(),
+        op,
+    )
 }
 
 comparison_opcode!(op_eq, Eq, ComparisonOp::Eq, |l: i64, r: i64| l == r);
@@ -1410,12 +1497,13 @@ pub fn op_open_read(
             // This is a materialized view with storage
             // Create btree cursor for reading the persistent data
 
-            let btree_cursor = BTreeCursor::new_table(
-                pager.clone(),
-                maybe_transform_root_page_to_positive(mv_store.as_ref(), *root_page),
-                num_columns,
-            )
-            .into_boxed();
+            let btree_cursor = BTreeCursor::boxed(&pager, || {
+                BTreeCursor::new_table(
+                    pager.clone(),
+                    maybe_transform_root_page_to_positive(mv_store.as_ref(), *root_page),
+                    num_columns,
+                )
+            });
             let cursor = maybe_promote_to_mvcc_cursor(btree_cursor, MvccCursorType::Table)?;
 
             // Get the view name and look up or create its transaction state
@@ -1447,20 +1535,22 @@ pub fn op_open_read(
                 .into());
             }
             let btree_cursor: Box<BTreeCursor> = if table.has_rowid {
-                BTreeCursor::new_table(
-                    pager,
-                    maybe_transform_root_page_to_positive(mv_store.as_ref(), *root_page),
-                    num_columns,
-                )
-                .into_boxed()
+                BTreeCursor::boxed(&pager.clone(), || {
+                    BTreeCursor::new_table(
+                        pager,
+                        maybe_transform_root_page_to_positive(mv_store.as_ref(), *root_page),
+                        num_columns,
+                    )
+                })
             } else {
-                BTreeCursor::new_without_rowid_table(
-                    pager,
-                    maybe_transform_root_page_to_positive(mv_store.as_ref(), *root_page),
-                    table.as_ref(),
-                    num_columns,
-                )
-                .into_boxed()
+                BTreeCursor::boxed(&pager.clone(), || {
+                    BTreeCursor::new_without_rowid_table(
+                        pager,
+                        maybe_transform_root_page_to_positive(mv_store.as_ref(), *root_page),
+                        table.as_ref(),
+                        num_columns,
+                    )
+                })
             };
             let cursor = maybe_promote_to_mvcc_cursor(btree_cursor, MvccCursorType::Table)?;
             cursors
@@ -1968,7 +2058,7 @@ pub fn op_column(
         },
         insn
     );
-    if state.active_op_state.is_idle() && state.deferred_seeks[*cursor_id].is_none() {
+    if state.active_op_state.is_idle() && state.no_deferred_seeks() {
         let result = op_column_fetch(program, state, *cursor_id, *column, *dest, default)?;
         if matches!(result, InsnFunctionStepResult::Step) {
             state.pc += 1;
@@ -2006,7 +2096,7 @@ pub fn op_column_range(
         },
         insn
     );
-    if state.active_op_state.is_idle() && state.deferred_seeks[*cursor_id].is_none() {
+    if state.active_op_state.is_idle() && state.no_deferred_seeks() {
         let result =
             op_column_range_fetch(program, state, *cursor_id, *start_column, *dest, defaults)?;
         if matches!(result, InsnFunctionStepResult::Step) {
@@ -2085,7 +2175,7 @@ fn op_column_deferred(
     'outer: loop {
         match *state.active_op_state.column() {
             OpColumnState::Start => {
-                if let Some(deferred) = state.deferred_seeks[cursor_id].take() {
+                if let Some(deferred) = state.take_deferred_seek(cursor_id) {
                     *state.active_op_state.column() = OpColumnState::Rowid {
                         index_cursor_id: deferred.index_cursor_id,
                         table_cursor_id: deferred.table_cursor_id,
@@ -3570,7 +3660,7 @@ pub fn op_result_row(
 ) -> InsnResult {
     load_insn!(ResultRow { start_reg, count }, insn);
     let row = Row {
-        values: &state.registers[*start_reg] as *const Register,
+        values: std::ptr::NonNull::from(&state.registers[*start_reg]),
         count: *count,
     };
     state.result_row = Some(row);
@@ -6148,7 +6238,7 @@ pub fn op_row_id(
     // Fast path: no deferred seek pending and no suspended state machine, so
     // the op-state slot (enum write + drop on clear) is bypassed. On an IO
     // yield nothing is persisted and this path simply re-executes.
-    if state.active_op_state.is_idle() && state.deferred_seeks[*cursor_id].is_none() {
+    if state.active_op_state.is_idle() && state.no_deferred_seeks() {
         let result = op_row_id_read(state, *cursor_id, *dest)?;
         if matches!(result, InsnFunctionStepResult::Step) {
             state.pc += 1;
@@ -6165,7 +6255,7 @@ fn op_row_id_deferred(state: &mut ProgramState, cursor_id: usize, dest: usize) -
     loop {
         match *state.active_op_state.row_id() {
             OpRowIdState::Start => {
-                if let Some(deferred) = state.deferred_seeks[cursor_id].take() {
+                if let Some(deferred) = state.take_deferred_seek(cursor_id) {
                     *state.active_op_state.row_id() = OpRowIdState::Record {
                         index_cursor_id: deferred.index_cursor_id,
                         table_cursor_id: deferred.table_cursor_id,
@@ -6418,10 +6508,13 @@ pub fn op_deferred_seek(
         },
         insn
     );
-    state.deferred_seeks[*table_cursor_id] = Some(DeferredSeekState {
-        index_cursor_id: *index_cursor_id,
-        table_cursor_id: *table_cursor_id,
-    });
+    state.set_deferred_seek(
+        *table_cursor_id,
+        DeferredSeekState {
+            index_cursor_id: *index_cursor_id,
+            table_cursor_id: *table_cursor_id,
+        },
+    );
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
 }
@@ -6958,10 +7051,10 @@ pub fn op_idx_ge(
         let cursor = cursor.as_btree_mut();
         let index_info = cursor.get_index_info().clone();
 
-        let pc = if let Some(idx_record) = return_if_io!(state, cursor.record()) {
+        let pc = if let Some(idx_payload) = return_if_io!(state, cursor.record_payload()) {
             let tie_breaker = get_tie_breaker_from_idx_comp_op(insn);
             let ord = compare_record(
-                idx_record.get_payload(),
+                idx_payload,
                 registers_to_ref_values(&state.registers[*start_reg..*start_reg + *num_regs]),
                 &index_info,
                 tie_breaker,
@@ -7024,10 +7117,10 @@ pub fn op_idx_le(
         let cursor = cursor.as_btree_mut();
         let index_info = cursor.get_index_info().clone();
 
-        let pc = if let Some(idx_record) = return_if_io!(state, cursor.record()) {
+        let pc = if let Some(idx_payload) = return_if_io!(state, cursor.record_payload()) {
             let tie_breaker = get_tie_breaker_from_idx_comp_op(insn);
             let ord = compare_record(
-                idx_record.get_payload(),
+                idx_payload,
                 registers_to_ref_values(&state.registers[*start_reg..*start_reg + *num_regs]),
                 &index_info,
                 tie_breaker,
@@ -7074,10 +7167,10 @@ pub fn op_idx_gt(
         let cursor = cursor.as_btree_mut();
         let index_info = cursor.get_index_info().clone();
 
-        let pc = if let Some(idx_record) = return_if_io!(state, cursor.record()) {
+        let pc = if let Some(idx_payload) = return_if_io!(state, cursor.record_payload()) {
             let tie_breaker = get_tie_breaker_from_idx_comp_op(insn);
             let ord = compare_record(
-                idx_record.get_payload(),
+                idx_payload,
                 registers_to_ref_values(&state.registers[*start_reg..*start_reg + *num_regs]),
                 &index_info,
                 tie_breaker,
@@ -7124,10 +7217,10 @@ pub fn op_idx_lt(
         let cursor = cursor.as_btree_mut();
         let index_info = cursor.get_index_info().clone();
 
-        let pc = if let Some(idx_record) = return_if_io!(state, cursor.record()) {
+        let pc = if let Some(idx_payload) = return_if_io!(state, cursor.record_payload()) {
             let tie_breaker = get_tie_breaker_from_idx_comp_op(insn);
             let ord = compare_record(
-                idx_record.get_payload(),
+                idx_payload,
                 registers_to_ref_values(&state.registers[*start_reg..*start_reg + *num_regs]),
                 &index_info,
                 tie_breaker,
@@ -9803,299 +9896,9 @@ pub fn op_function(
 
     match &func.func {
         #[cfg(feature = "json")]
-        crate::function::Func::Json(json_func) => match json_func {
-            JsonFunc::Json => {
-                let json_value = &state.registers[*start_reg];
-                let json_str = get_json(json_value.get_value(), None);
-                match json_str {
-                    Ok(json) => state.registers[*dest].set_value(json),
-                    Err(e) => return Err(e.into()),
-                }
-            }
-
-            JsonFunc::Jsonb => {
-                let json_value = &state.registers[*start_reg];
-                let json_blob = jsonb(json_value.get_value(), &state.json_cache);
-                match json_blob {
-                    Ok(json) => state.registers[*dest].set_value(json),
-                    Err(e) => return Err(e.into()),
-                }
-            }
-
-            JsonFunc::JsonArray
-            | JsonFunc::JsonObject
-            | JsonFunc::JsonbArray
-            | JsonFunc::JsonbObject => {
-                let reg_values =
-                    registers_to_ref_values(&state.registers[*start_reg..*start_reg + arg_count]);
-
-                let json_func = match json_func {
-                    JsonFunc::JsonArray => json_array,
-                    JsonFunc::JsonObject => json_object,
-                    JsonFunc::JsonbArray => jsonb_array,
-                    JsonFunc::JsonbObject => jsonb_object,
-                    _ => unreachable!(),
-                };
-                let json_result = json_func(reg_values);
-
-                match json_result {
-                    Ok(json) => state.registers[*dest].set_value(json),
-                    Err(e) => return Err(e.into()),
-                }
-            }
-            JsonFunc::JsonExtract => {
-                let result = match arg_count {
-                    0 => Ok(Value::Null),
-                    _ => {
-                        let val = &state.registers[*start_reg];
-                        let reg_values = registers_to_ref_values(
-                            &state.registers[*start_reg + 1..*start_reg + arg_count],
-                        );
-
-                        json_extract(val.get_value(), reg_values, &state.json_cache)
-                    }
-                };
-
-                match result {
-                    Ok(json) => state.registers[*dest].set_value(json),
-                    Err(e) => return Err(e.into()),
-                }
-            }
-            JsonFunc::JsonbExtract => {
-                let result = match arg_count {
-                    0 => Ok(Value::Null),
-                    _ => {
-                        let val = &state.registers[*start_reg];
-                        let reg_values = registers_to_ref_values(
-                            &state.registers[*start_reg + 1..*start_reg + arg_count],
-                        );
-
-                        jsonb_extract(val.get_value(), reg_values, &state.json_cache)
-                    }
-                };
-
-                match result {
-                    Ok(json) => state.registers[*dest].set_value(json),
-                    Err(e) => return Err(e.into()),
-                }
-            }
-
-            JsonFunc::JsonArrowExtract | JsonFunc::JsonArrowShiftExtract => {
-                assert_eq!(arg_count, 2);
-                let json = &state.registers[*start_reg];
-                let path = &state.registers[*start_reg + 1];
-                let json_func = match json_func {
-                    JsonFunc::JsonArrowExtract => json_arrow_extract,
-                    JsonFunc::JsonArrowShiftExtract => json_arrow_shift_extract,
-                    _ => unreachable!(),
-                };
-                let json_str = json_func(json.get_value(), path.get_value(), &state.json_cache);
-                match json_str {
-                    Ok(json) => state.registers[*dest].set_value(json),
-                    Err(e) => return Err(e.into()),
-                }
-            }
-            JsonFunc::JsonArrayLength | JsonFunc::JsonType => {
-                let json_value = &state.registers[*start_reg];
-                let path_value = if arg_count > 1 {
-                    Some(&state.registers[*start_reg + 1])
-                } else {
-                    None
-                };
-                let func_result = match json_func {
-                    JsonFunc::JsonArrayLength => json_array_length(
-                        json_value.get_value(),
-                        path_value.map(|x| x.get_value()),
-                        &state.json_cache,
-                    ),
-                    JsonFunc::JsonType => {
-                        json_type(json_value.get_value(), path_value.map(|x| x.get_value()))
-                    }
-                    _ => unreachable!(),
-                };
-
-                match func_result {
-                    Ok(result) => state.registers[*dest].set_value(result),
-                    Err(e) => return Err(e.into()),
-                }
-            }
-            JsonFunc::JsonErrorPosition => {
-                let json_value = &state.registers[*start_reg];
-                match json_error_position(json_value.get_value()) {
-                    Ok(pos) => state.registers[*dest].set_value(pos),
-                    Err(e) => return Err(e.into()),
-                }
-            }
-            JsonFunc::JsonValid => {
-                let json_value = &state.registers[*start_reg];
-                // json_valid(X) is defined as json_valid(X, 1).
-                let default_flags = Value::from_i64(json::JSON_VALID_FLAG_TEXT_STRICT);
-                let flags_value = if arg_count > 1 {
-                    state.registers[*start_reg + 1].get_value()
-                } else {
-                    &default_flags
-                };
-                state.registers[*dest]
-                    .set_value(is_json_valid(json_value.get_value(), flags_value)?);
-            }
-            JsonFunc::JsonPatch => {
-                assert_eq!(arg_count, 2);
-                assert!(*start_reg + 1 < state.registers.len());
-                let target = &state.registers[*start_reg];
-                let patch = &state.registers[*start_reg + 1];
-                state.registers[*dest].set_value(json_patch(
-                    target.get_value(),
-                    patch.get_value(),
-                    &state.json_cache,
-                )?);
-            }
-            JsonFunc::JsonbPatch => {
-                assert_eq!(arg_count, 2);
-                assert!(*start_reg + 1 < state.registers.len());
-                let target = &state.registers[*start_reg];
-                let patch = &state.registers[*start_reg + 1];
-                state.registers[*dest].set_value(jsonb_patch(
-                    target.get_value(),
-                    patch.get_value(),
-                    &state.json_cache,
-                )?);
-            }
-            JsonFunc::JsonRemove => {
-                if let Ok(json) = json_remove(
-                    registers_to_ref_values(&state.registers[*start_reg..*start_reg + arg_count]),
-                    &state.json_cache,
-                ) {
-                    state.registers[*dest].set_value(json);
-                } else {
-                    state.registers[*dest].set_null();
-                }
-            }
-            JsonFunc::JsonbRemove => {
-                if let Ok(json) = jsonb_remove(
-                    registers_to_ref_values(&state.registers[*start_reg..*start_reg + arg_count]),
-                    &state.json_cache,
-                ) {
-                    state.registers[*dest].set_value(json);
-                } else {
-                    state.registers[*dest].set_null();
-                }
-            }
-            JsonFunc::JsonReplace => {
-                if arg_count % 2 == 0 {
-                    bail_constraint_error!("json_replace() needs an odd number of arguments")
-                }
-                if let Ok(json) = json_replace(
-                    registers_to_ref_values(&state.registers[*start_reg..*start_reg + arg_count]),
-                    &state.json_cache,
-                ) {
-                    state.registers[*dest].set_value(json);
-                } else {
-                    state.registers[*dest].set_null();
-                }
-            }
-            JsonFunc::JsonbReplace => {
-                if arg_count % 2 == 0 {
-                    bail_constraint_error!("json_replace() needs an odd number of arguments")
-                }
-                if let Ok(json) = jsonb_replace(
-                    registers_to_ref_values(&state.registers[*start_reg..*start_reg + arg_count]),
-                    &state.json_cache,
-                ) {
-                    state.registers[*dest].set_value(json);
-                } else {
-                    state.registers[*dest].set_null();
-                }
-            }
-            JsonFunc::JsonInsert => {
-                if arg_count % 2 == 0 {
-                    bail_constraint_error!("json_insert() needs an odd number of arguments")
-                }
-                if let Ok(json) = json_insert(
-                    registers_to_ref_values(&state.registers[*start_reg..*start_reg + arg_count]),
-                    &state.json_cache,
-                ) {
-                    state.registers[*dest].set_value(json);
-                } else {
-                    state.registers[*dest].set_null();
-                }
-            }
-            JsonFunc::JsonbInsert => {
-                if arg_count % 2 == 0 {
-                    bail_constraint_error!("json_insert() needs an odd number of arguments")
-                }
-                if let Ok(json) = jsonb_insert(
-                    registers_to_ref_values(&state.registers[*start_reg..*start_reg + arg_count]),
-                    &state.json_cache,
-                ) {
-                    state.registers[*dest].set_value(json);
-                } else {
-                    state.registers[*dest].set_null();
-                }
-            }
-            JsonFunc::JsonPretty => {
-                let json_value = &state.registers[*start_reg];
-                let indent = if arg_count > 1 {
-                    Some(&state.registers[*start_reg + 1])
-                } else {
-                    None
-                };
-
-                // Blob should be converted to Ascii in a lossy way
-                // However, Rust strings uses utf-8
-                // so the behavior at the moment is slightly different
-                // To the way blobs are parsed here in SQLite.
-                let indent = match indent {
-                    Some(value) => match value.get_value() {
-                        Value::Text(text) => text.as_str(),
-                        Value::Numeric(Numeric::Integer(val)) => &val.to_string(),
-                        Value::Numeric(Numeric::Float(val)) => &f64::from(*val).to_string(),
-                        Value::Blob(val) => &String::from_utf8_lossy(val),
-                        _ => "    ",
-                    },
-                    // If the second argument is omitted or is NULL, then indentation is four spaces per level
-                    None => "    ",
-                };
-
-                let json_str = get_json(json_value.get_value(), Some(indent))?;
-                state.registers[*dest].set_value(json_str);
-            }
-            JsonFunc::JsonSet => {
-                if arg_count % 2 == 0 {
-                    bail_constraint_error!("json_set() needs an odd number of arguments")
-                }
-                let reg_values =
-                    registers_to_ref_values(&state.registers[*start_reg..*start_reg + arg_count]);
-
-                let json_result = json_set(reg_values, &state.json_cache);
-
-                match json_result {
-                    Ok(json) => state.registers[*dest].set_value(json),
-                    Err(e) => return Err(e.into()),
-                }
-            }
-            JsonFunc::JsonbSet => {
-                if arg_count % 2 == 0 {
-                    bail_constraint_error!("json_set() needs an odd number of arguments")
-                }
-                let reg_values =
-                    registers_to_ref_values(&state.registers[*start_reg..*start_reg + arg_count]);
-
-                let json_result = jsonb_set(reg_values, &state.json_cache);
-
-                match json_result {
-                    Ok(json) => state.registers[*dest].set_value(json),
-                    Err(e) => return Err(e.into()),
-                }
-            }
-            JsonFunc::JsonQuote => {
-                let json_value = &state.registers[*start_reg];
-
-                match json_quote(json_value.get_value()) {
-                    Ok(result) => state.registers[*dest].set_value(result),
-                    Err(e) => return Err(e.into()),
-                }
-            }
-        },
+        crate::function::Func::Json(json_func) => {
+            op_function_json(state, json_func, *start_reg, *dest, arg_count)?;
+        }
         crate::function::Func::Scalar(scalar_func) => match scalar_func {
             ScalarFunc::Array | ScalarFunc::ArrayElement | ScalarFunc::ArraySetElement => {
                 unreachable!("desugared to dedicated instructions, not Function")
@@ -11382,154 +11185,14 @@ pub fn op_function(
             }
         },
         crate::function::Func::Vector(vector_func) => {
-            let args = &state.registers[*start_reg..*start_reg + arg_count];
-            match vector_func {
-                VectorFunc::Vector => {
-                    let result = vector32(args)?;
-                    state.registers[*dest].set_value(result);
-                }
-                VectorFunc::Vector32 => {
-                    let result = vector32(args)?;
-                    state.registers[*dest].set_value(result);
-                }
-                VectorFunc::Vector32Sparse => {
-                    let result = vector32_sparse(args)?;
-                    state.registers[*dest].set_value(result);
-                }
-                VectorFunc::Vector64 => {
-                    let result = vector64(args)?;
-                    state.registers[*dest].set_value(result);
-                }
-                VectorFunc::Vector8 => {
-                    let result = vector8(args)?;
-                    state.registers[*dest].set_value(result);
-                }
-                VectorFunc::Vector1Bit => {
-                    let result = vector1bit(args)?;
-                    state.registers[*dest].set_value(result);
-                }
-                VectorFunc::VectorExtract => {
-                    let result = vector_extract(args)?;
-                    state.registers[*dest].set_value(result);
-                }
-                VectorFunc::VectorDistanceCos => {
-                    let result = vector_distance_cos(args)?;
-                    state.registers[*dest].set_value(result);
-                }
-                VectorFunc::VectorDistanceDot => {
-                    let result = vector_distance_dot(args)?;
-                    state.registers[*dest].set_value(result);
-                }
-                VectorFunc::VectorDistanceL2 => {
-                    let result = vector_distance_l2(args)?;
-                    state.registers[*dest].set_value(result);
-                }
-                VectorFunc::VectorDistanceJaccard => {
-                    let result = vector_distance_jaccard(args)?;
-                    state.registers[*dest].set_value(result);
-                }
-                VectorFunc::VectorConcat => {
-                    let result = vector_concat(args)?;
-                    state.registers[*dest].set_value(result);
-                }
-                VectorFunc::VectorSlice => {
-                    let result = vector_slice(args)?;
-                    state.registers[*dest].set_value(result)
-                }
-            }
+            op_function_vector(state, vector_func, *start_reg, *dest, arg_count)?;
         }
-        crate::function::Func::External(f) => match f.func {
-            ExtFunc::Scalar {
-                context,
-                callback,
-                context_destructor,
-                value_destructor,
-                ..
-            } => {
-                let mut ext_values = Vec::with_capacity(arg_count);
-                if arg_count != 0 {
-                    let register_slice = &state.registers[*start_reg..*start_reg + arg_count];
-                    for ov in register_slice.iter() {
-                        ext_values.push(ov.get_value().to_ffi());
-                    }
-                }
-                let argv_ptr = if ext_values.is_empty() {
-                    std::ptr::null()
-                } else {
-                    ext_values.as_ptr()
-                };
-                let mut result = unsafe {
-                    callback(
-                        context,
-                        arg_count as i32,
-                        argv_ptr,
-                        context_destructor,
-                        value_destructor,
-                    )
-                };
-                let value = Value::from_ffi_ref(&result);
-                if let Some(value_destructor) = value_destructor {
-                    unsafe { value_destructor(&mut result) };
-                } else {
-                    unsafe { result.__free_internal_type() };
-                }
-                for ext_value in ext_values {
-                    unsafe { ext_value.__free_internal_type() };
-                }
-                state.registers[*dest].set_value(value?);
-            }
-            _ => unreachable!("aggregate called in scalar context"),
-        },
-        crate::function::Func::Math(math_func) => match math_func.arity() {
-            MathFuncArity::Nullary => match math_func {
-                MathFunc::Pi => {
-                    state.registers[*dest].set_float(
-                        NonNan::new(std::f64::consts::PI).expect("PI is a valid NonNan"),
-                    );
-                }
-                _ => {
-                    unreachable!("Unexpected mathematical Nullary function {:?}", math_func);
-                }
-            },
-
-            MathFuncArity::Unary => {
-                let reg_value = &state.registers[*start_reg];
-                let result = reg_value.get_value().exec_math_unary(math_func);
-                state.registers[*dest].set_value(result);
-            }
-
-            MathFuncArity::Binary => {
-                let lhs = &state.registers[*start_reg];
-                let rhs = &state.registers[*start_reg + 1];
-                let result = lhs.get_value().exec_math_binary(rhs.get_value(), math_func);
-                state.registers[*dest].set_value(result);
-            }
-
-            MathFuncArity::UnaryOrBinary => match math_func {
-                MathFunc::Log => {
-                    let result = match arg_count {
-                        1 => {
-                            let arg = &state.registers[*start_reg];
-                            arg.get_value().exec_math_log(None)
-                        }
-                        2 => {
-                            let base = &state.registers[*start_reg];
-                            let arg = &state.registers[*start_reg + 1];
-                            arg.get_value().exec_math_log(Some(base.get_value()))
-                        }
-                        _ => unreachable!(
-                            "{:?} function with unexpected number of arguments",
-                            math_func
-                        ),
-                    };
-                    state.registers[*dest].set_value(result);
-                }
-                _ => unreachable!(
-                    "Unexpected mathematical UnaryOrBinary function {:?}",
-                    math_func
-                ),
-            },
-        },
+        crate::function::Func::External(f) => {
+            op_function_external(state, f, *start_reg, *dest, arg_count)?;
+        }
+        crate::function::Func::Math(math_func) => {
+            op_function_math(state, math_func, *start_reg, *dest, arg_count)?;
+        }
         crate::function::Func::Dialect(name) => {
             let args: Vec<Value> = state.registers[*start_reg..*start_reg + arg_count]
                 .iter()
@@ -11543,719 +11206,11 @@ pub fn op_function(
             state.registers[*dest].set_value(result);
         }
         crate::function::Func::AlterTable(alter_func) => {
-            let r#type = &state.registers[*start_reg].get_value().clone();
-            let Value::Text(entry_type) = r#type else {
-                panic!("sqlite_schema.type should be TEXT")
-            };
-
-            let Value::Text(name) = &state.registers[*start_reg + 1].get_value() else {
-                panic!("sqlite_schema.name should be TEXT")
-            };
-            let name = name.to_string();
-
-            let Value::Text(tbl_name) = &state.registers[*start_reg + 2].get_value() else {
-                panic!("sqlite_schema.tbl_name should be TEXT")
-            };
-            let tbl_name = tbl_name.to_string();
-
-            let Value::Numeric(Numeric::Integer(root_page)) =
-                &state.registers[*start_reg + 3].get_value().clone()
-            else {
-                panic!("sqlite_schema.root_page should be INTEGER")
-            };
-
-            let sql = &state.registers[*start_reg + 4].get_value().clone();
-
-            let (new_name, new_tbl_name, new_sql) = match alter_func {
-                AlterTableFunc::RenameTable => {
-                    let rename_from = {
-                        match &state.registers[*start_reg + 5].get_value() {
-                            Value::Text(rename_from) => normalize_ident(rename_from.as_str()),
-                            _ => panic!("rename_from parameter should be TEXT"),
-                        }
-                    };
-
-                    let original_rename_to = {
-                        match &state.registers[*start_reg + 6].get_value() {
-                            Value::Text(rename_to) => rename_to,
-                            _ => panic!("rename_to parameter should be TEXT"),
-                        }
-                    };
-                    let rename_to = normalize_ident(original_rename_to.as_str());
-
-                    let new_name = if let Some(column) =
-                        &name.strip_prefix(&format!("sqlite_autoindex_{rename_from}_"))
-                    {
-                        format!("sqlite_autoindex_{rename_to}_{column}")
-                    } else if name == rename_from {
-                        rename_to.clone()
-                    } else {
-                        name
-                    };
-
-                    let new_tbl_name = if tbl_name == rename_from {
-                        rename_to.clone()
-                    } else {
-                        tbl_name
-                    };
-
-                    let new_sql = 'sql: {
-                        let Value::Text(sql) = sql else {
-                            break 'sql None;
-                        };
-
-                        let cmd = parse_schema_sql_for_alter(
-                            program.connection.dialect().as_ref(),
-                            entry_type.as_str(),
-                            *root_page,
-                            sql.as_str(),
-                        )?;
-                        let Some(ast::Cmd::Stmt(stmt)) = cmd else {
-                            return Err(LimboError::InternalError(
-                                "Unexpected command during ALTER TABLE RENAME processing"
-                                    .to_string(),
-                            )
-                            .into());
-                        };
-
-                        match stmt {
-                            ast::Stmt::CreateIndex {
-                                tbl_name,
-                                unique,
-                                if_not_exists,
-                                idx_name,
-                                columns,
-                                where_clause,
-                                using,
-                                with_clause,
-                            } => {
-                                let table_name = normalize_ident(tbl_name.as_str());
-
-                                if rename_from != table_name {
-                                    break 'sql None;
-                                }
-
-                                Some(
-                                    ast::Stmt::CreateIndex {
-                                        tbl_name: ast::Name::exact(original_rename_to.to_string()),
-                                        unique,
-                                        if_not_exists,
-                                        idx_name,
-                                        columns,
-                                        where_clause,
-                                        using,
-                                        with_clause,
-                                    }
-                                    .to_string(),
-                                )
-                            }
-                            ast::Stmt::CreateTable {
-                                tbl_name,
-                                temporary,
-                                if_not_exists,
-                                body,
-                            } => {
-                                let this_table = normalize_ident(tbl_name.name.as_str());
-
-                                let ast::CreateTableBody::ColumnsAndConstraints {
-                                    mut columns,
-                                    mut constraints,
-                                    options,
-                                } = body
-                                else {
-                                    return Err(LimboError::InternalError(
-                                        "CREATE TABLE AS SELECT schemas cannot be altered"
-                                            .to_string(),
-                                    )
-                                    .into());
-                                };
-
-                                let mut any_change = false;
-
-                                // Rewrite FK targets in both paths
-                                for c in &mut constraints {
-                                    if let ast::TableConstraint::ForeignKey { clause, .. } =
-                                        &mut c.constraint
-                                    {
-                                        any_change |= rewrite_fk_parent_table_if_needed(
-                                            clause,
-                                            &rename_from,
-                                            original_rename_to.as_str(),
-                                        );
-                                    }
-                                }
-                                for col in &mut columns {
-                                    any_change |= rewrite_inline_col_fk_target_if_needed(
-                                        col,
-                                        &rename_from,
-                                        original_rename_to.as_str(),
-                                    );
-                                }
-
-                                // Rewrite table-qualified refs in CHECK constraints
-                                // (e.g. t1.a > 0 → t2.a > 0)
-                                if this_table == rename_from {
-                                    for c in &mut constraints {
-                                        if let ast::TableConstraint::Check {
-                                            ref mut expr,
-                                            ref mut source,
-                                        } = c.constraint
-                                        {
-                                            rewrite_check_expr_table_refs(
-                                                expr,
-                                                &rename_from,
-                                                &rename_to,
-                                            );
-                                            // The captured source text no longer
-                                            // matches the rewritten expression.
-                                            *source = None;
-                                        }
-                                    }
-                                    for col in &mut columns {
-                                        for cc in &mut col.constraints {
-                                            if let ast::ColumnConstraint::Check {
-                                                ref mut expr,
-                                                ref mut source,
-                                            } = cc.constraint
-                                            {
-                                                rewrite_check_expr_table_refs(
-                                                    expr,
-                                                    &rename_from,
-                                                    &rename_to,
-                                                );
-                                                *source = None;
-                                            }
-                                        }
-                                    }
-                                }
-
-                                if this_table == rename_from {
-                                    // Rebuild with new table identifier so SQL persists the new name.
-                                    let new_stmt = ast::Stmt::CreateTable {
-                                        tbl_name: ast::QualifiedName {
-                                            db_name: None,
-                                            name: ast::Name::exact(original_rename_to.to_string()),
-                                            alias: None,
-                                        },
-                                        temporary,
-                                        if_not_exists,
-                                        body: ast::CreateTableBody::ColumnsAndConstraints {
-                                            columns,
-                                            constraints,
-                                            options,
-                                        },
-                                    };
-                                    Some(
-                                        program
-                                            .connection
-                                            .dialect()
-                                            .format_rewritten_table_sql(&new_stmt)?,
-                                    )
-                                } else {
-                                    // Other tables: only emit if we actually changed their FK targets.
-                                    if !any_change {
-                                        break 'sql None;
-                                    }
-                                    let new_stmt = ast::Stmt::CreateTable {
-                                        tbl_name,
-                                        temporary,
-                                        if_not_exists,
-                                        body: ast::CreateTableBody::ColumnsAndConstraints {
-                                            columns,
-                                            constraints,
-                                            options,
-                                        },
-                                    };
-                                    Some(
-                                        program
-                                            .connection
-                                            .dialect()
-                                            .format_rewritten_table_sql(&new_stmt)?,
-                                    )
-                                }
-                            }
-                            ast::Stmt::CreateVirtualTable(ast::CreateVirtualTable {
-                                tbl_name,
-                                if_not_exists,
-                                module_name,
-                                args,
-                            }) => {
-                                let this_table = normalize_ident(tbl_name.name.as_str());
-                                if this_table != rename_from {
-                                    None
-                                } else {
-                                    let new_stmt =
-                                        ast::Stmt::CreateVirtualTable(ast::CreateVirtualTable {
-                                            tbl_name: ast::QualifiedName {
-                                                db_name: tbl_name.db_name,
-                                                name: ast::Name::exact(
-                                                    original_rename_to.to_string(),
-                                                ),
-                                                alias: None,
-                                            },
-                                            if_not_exists,
-                                            module_name,
-                                            args,
-                                        });
-                                    Some(new_stmt.to_string())
-                                }
-                            }
-                            ast::Stmt::CreateTrigger {
-                                temporary,
-                                if_not_exists,
-                                trigger_name,
-                                time,
-                                event,
-                                tbl_name: trigger_tbl_name,
-                                for_each_row,
-                                mut when_clause,
-                                mut commands,
-                            } => {
-                                let trigger_tbl = normalize_ident(trigger_tbl_name.name.as_str());
-
-                                // Rewrite ON table name if it matches the renamed table
-                                let new_trigger_tbl_name = if trigger_tbl == rename_from {
-                                    ast::QualifiedName {
-                                        db_name: trigger_tbl_name.db_name,
-                                        name: ast::Name::exact(original_rename_to.to_string()),
-                                        alias: None,
-                                    }
-                                } else {
-                                    trigger_tbl_name
-                                };
-
-                                // Rewrite WHEN clause qualified refs
-                                if let Some(ref mut when) = when_clause {
-                                    rewrite_check_expr_table_refs(
-                                        when,
-                                        &rename_from,
-                                        original_rename_to.as_str(),
-                                    );
-                                }
-
-                                // Rewrite table references in trigger body commands
-                                for cmd in &mut commands {
-                                    rewrite_trigger_cmd_table_refs(
-                                        cmd,
-                                        &rename_from,
-                                        original_rename_to.as_str(),
-                                    );
-                                }
-
-                                Some(
-                                    ast::Stmt::CreateTrigger {
-                                        temporary,
-                                        if_not_exists,
-                                        trigger_name,
-                                        time,
-                                        event,
-                                        tbl_name: new_trigger_tbl_name,
-                                        for_each_row,
-                                        when_clause,
-                                        commands,
-                                    }
-                                    .to_string(),
-                                )
-                            }
-                            _ => None,
-                        }
-                    };
-
-                    (new_name, new_tbl_name, new_sql)
-                }
-                AlterTableFunc::AlterColumn | AlterTableFunc::RenameColumn => {
-                    let table = {
-                        match &state.registers[*start_reg + 5].get_value() {
-                            Value::Text(rename_to) => normalize_ident(rename_to.as_str()),
-                            _ => panic!("table parameter should be TEXT"),
-                        }
-                    };
-
-                    let original_rename_from = {
-                        match &state.registers[*start_reg + 6].get_value() {
-                            Value::Text(rename_from) => rename_from,
-                            _ => panic!("rename_from parameter should be TEXT"),
-                        }
-                    };
-                    let rename_from = normalize_ident(original_rename_from.as_str());
-
-                    let column_def = {
-                        match &state.registers[*start_reg + 7].get_value() {
-                            Value::Text(column_def) => column_def.as_str(),
-                            _ => panic!("rename_to parameter should be TEXT"),
-                        }
-                    };
-
-                    let column_def =
-                        Parser::new(column_def.as_bytes()).parse_column_definition(true)?;
-
-                    let _rename_to = normalize_ident(column_def.col_name.as_str());
-
-                    let new_sql = 'sql: {
-                        let Value::Text(sql) = sql else {
-                            break 'sql None;
-                        };
-
-                        let cmd = parse_schema_sql_for_alter(
-                            program.connection.dialect().as_ref(),
-                            entry_type.as_str(),
-                            *root_page,
-                            sql.as_str(),
-                        )?;
-                        let Some(ast::Cmd::Stmt(stmt)) = cmd else {
-                            return Err(LimboError::InternalError(
-                                "Unexpected command during ALTER TABLE RENAME COLUMN processing"
-                                    .to_string(),
-                            )
-                            .into());
-                        };
-
-                        match stmt {
-                            ast::Stmt::CreateIndex {
-                                tbl_name,
-                                mut columns,
-                                unique,
-                                if_not_exists,
-                                idx_name,
-                                mut where_clause,
-                                using,
-                                with_clause,
-                            } => {
-                                if table != normalize_ident(tbl_name.as_str()) {
-                                    break 'sql None;
-                                }
-
-                                for column in &mut columns {
-                                    rename_identifiers(
-                                        column.expr.as_mut(),
-                                        &rename_from,
-                                        column_def.col_name.as_str(),
-                                    );
-                                }
-
-                                if let Some(ref mut wc) = where_clause {
-                                    rename_identifiers(
-                                        wc,
-                                        &rename_from,
-                                        column_def.col_name.as_str(),
-                                    );
-                                }
-
-                                Some(
-                                    ast::Stmt::CreateIndex {
-                                        tbl_name,
-                                        columns,
-                                        unique,
-                                        if_not_exists,
-                                        idx_name,
-                                        where_clause,
-                                        using,
-                                        with_clause,
-                                    }
-                                    .to_string(),
-                                )
-                            }
-                            ast::Stmt::CreateTable {
-                                tbl_name,
-                                body,
-                                temporary,
-                                if_not_exists,
-                            } => {
-                                let ast::CreateTableBody::ColumnsAndConstraints {
-                                    mut columns,
-                                    mut constraints,
-                                    options,
-                                } = body
-                                else {
-                                    return Err(LimboError::InternalError(
-                                        "CREATE TABLE AS SELECT schemas cannot be altered"
-                                            .to_string(),
-                                    )
-                                    .into());
-                                };
-
-                                let normalized_tbl_name = normalize_ident(tbl_name.name.as_str());
-
-                                if normalized_tbl_name == table {
-                                    // This is the table being altered - update its column
-                                    let Some(column) = columns.iter_mut().find(|column| {
-                                        normalize_ident(column.col_name.as_str()) == rename_from
-                                    }) else {
-                                        // MVCC/temp-schema rewrite can reach an already-updated
-                                        // CREATE TABLE SQL image for the target table. Treat that
-                                        // as idempotent and keep the existing SQL text.
-                                        break 'sql None;
-                                    };
-
-                                    match alter_func {
-                                        AlterTableFunc::AlterColumn => *column = column_def.clone(),
-                                        AlterTableFunc::RenameColumn => {
-                                            column.col_name = column_def.col_name.clone()
-                                        }
-                                        _ => unreachable!(),
-                                    }
-
-                                    // Update table-level constraints (PRIMARY KEY, UNIQUE, FOREIGN KEY)
-                                    for constraint in &mut constraints {
-                                        match &mut constraint.constraint {
-                                            ast::TableConstraint::PrimaryKey {
-                                                columns: pk_cols,
-                                                ..
-                                            } => {
-                                                for col in pk_cols {
-                                                    rename_identifiers(
-                                                        col.expr.as_mut(),
-                                                        &rename_from,
-                                                        column_def.col_name.as_str(),
-                                                    );
-                                                }
-                                            }
-                                            ast::TableConstraint::Unique {
-                                                columns: uniq_cols,
-                                                ..
-                                            } => {
-                                                for col in uniq_cols {
-                                                    rename_identifiers(
-                                                        col.expr.as_mut(),
-                                                        &rename_from,
-                                                        column_def.col_name.as_str(),
-                                                    );
-                                                }
-                                            }
-                                            ast::TableConstraint::ForeignKey {
-                                                columns: child_cols,
-                                                clause,
-                                                ..
-                                            } => {
-                                                // Update child columns in this table's FK definitions
-                                                for child_col in child_cols {
-                                                    if normalize_ident(child_col.col_name.as_str())
-                                                        == rename_from
-                                                    {
-                                                        child_col.col_name = Name::exact(
-                                                            column_def.col_name.as_str().to_owned(),
-                                                        );
-                                                    }
-                                                }
-                                                rewrite_fk_parent_cols_if_self_ref(
-                                                    clause,
-                                                    &normalized_tbl_name,
-                                                    &rename_from,
-                                                    column_def.col_name.as_str(),
-                                                );
-                                            }
-                                            ast::TableConstraint::Check {
-                                                ref mut expr,
-                                                ref mut source,
-                                            } => {
-                                                rename_identifiers(
-                                                    expr,
-                                                    &rename_from,
-                                                    column_def.col_name.as_str(),
-                                                );
-                                                *source = None;
-                                            }
-                                        }
-                                    }
-
-                                    for col in &mut columns {
-                                        rewrite_column_references_if_needed(
-                                            col,
-                                            &normalized_tbl_name,
-                                            &rename_from,
-                                            column_def.col_name.as_str(),
-                                        )?;
-                                    }
-                                } else {
-                                    // This is a different table, check if it has FKs referencing the renamed column
-                                    let mut fk_updated = false;
-
-                                    for constraint in &mut constraints {
-                                        if let ast::TableConstraint::ForeignKey {
-                                            columns: _,
-                                            clause:
-                                                ForeignKeyClause {
-                                                    tbl_name,
-                                                    columns: parent_cols,
-                                                    ..
-                                                },
-                                            ..
-                                        } = &mut constraint.constraint
-                                        {
-                                            // Check if this FK references the table being altered
-                                            if normalize_ident(tbl_name.as_str()) == table {
-                                                // Update parent column references if they match the renamed column
-                                                for parent_col in parent_cols {
-                                                    if normalize_ident(parent_col.col_name.as_str())
-                                                        == rename_from
-                                                    {
-                                                        parent_col.col_name = Name::exact(
-                                                            column_def.col_name.as_str().to_owned(),
-                                                        );
-                                                        fk_updated = true;
-                                                    }
-                                                }
-                                            }
-                                        }
-                                    }
-                                    for col in &mut columns {
-                                        let _before = fk_updated;
-                                        let mut local_col = col.clone();
-                                        rewrite_column_level_fk_parent_columns_if_needed(
-                                            &mut local_col,
-                                            &table,
-                                            &rename_from,
-                                            column_def.col_name.as_str(),
-                                        );
-                                        if local_col != *col {
-                                            *col = local_col;
-                                            fk_updated = true;
-                                        }
-                                    }
-
-                                    // Only return updated SQL if we actually changed something
-                                    if !fk_updated {
-                                        break 'sql None;
-                                    }
-                                }
-                                let new_stmt = ast::Stmt::CreateTable {
-                                    tbl_name,
-                                    body: ast::CreateTableBody::ColumnsAndConstraints {
-                                        columns,
-                                        constraints,
-                                        options,
-                                    },
-                                    temporary,
-                                    if_not_exists,
-                                };
-                                Some(
-                                    program
-                                        .connection
-                                        .dialect()
-                                        .format_rewritten_table_sql(&new_stmt)?,
-                                )
-                            }
-                            // Trigger SQL is rewritten by separate UPDATE statements
-                            // generated by alter.rs (via rewrite_trigger_sql_for_column_rename),
-                            // so we skip triggers here to avoid redundant work.
-                            _ => None,
-                        }
-                    };
-
-                    (name, tbl_name, new_sql)
-                }
-            };
-
-            state.registers[*dest].set_value(r#type.clone());
-            state.registers[*dest + 1].set_text(Text::from(new_name))?;
-            state.registers[*dest + 2].set_text(Text::from(new_tbl_name))?;
-            state.registers[*dest + 3].set_int(*root_page);
-
-            if let Some(new_sql) = new_sql {
-                state.registers[*dest + 4].set_text(Text::from(new_sql))?;
-            } else {
-                state.registers[*dest + 4].set_value(sql.clone());
-            }
+            op_function_alter_table(program, state, alter_func, *start_reg, *dest)?;
         }
         #[cfg(all(feature = "fts", not(target_family = "wasm")))]
         crate::function::Func::Fts(fts_func) => {
-            // FTS functions are typically handled via index method pattern matching.
-            // If we reach here, just return a fallback since no FTS index matched.
-            use crate::function::FtsFunc;
-            match fts_func {
-                FtsFunc::Score => {
-                    // Without an FTS index match, return 0.0 as a default score
-                    state.registers[*dest]
-                        .set_float(NonNan::new(0.0).expect("0.0 is a valid NonNan"));
-                }
-                FtsFunc::Match => {
-                    // fts_match(col1, col2, ..., query): returns 1 if any column matches query
-                    // Minimum: fts_match(text, query) = 2 args
-                    if arg_count < 2 {
-                        return Err(LimboError::InvalidArgument(
-                            "fts_match requires at least 2 arguments: text, query".to_string(),
-                        )
-                        .into());
-                    }
-
-                    // Last arg is the query, first N-1 args are text columns
-                    let num_text_cols = arg_count - 1;
-                    let query = state.registers[*start_reg + num_text_cols].get_value();
-
-                    if matches!(query, Value::Null) {
-                        state.registers[*dest].set_int(0);
-                    } else {
-                        let query_str = query.to_string();
-
-                        // Concatenate all text columns with space separator
-                        let est_len = 16;
-                        let mut combined_text = String::with_capacity(num_text_cols * est_len);
-                        for i in 0..num_text_cols {
-                            let text = state.registers[*start_reg + i].get_value();
-                            if !matches!(text, Value::Null) {
-                                if !combined_text.is_empty() {
-                                    combined_text.push(' ');
-                                }
-                                combined_text.push_str(&text.to_string());
-                            }
-                        }
-
-                        let matches =
-                            crate::index_method::fts::fts_match(&combined_text, &query_str);
-                        state.registers[*dest].set_int(matches.into());
-                    }
-                }
-                FtsFunc::Highlight => {
-                    // fts_highlight(col1, col2, ..., before_tag, after_tag, query)
-                    // Variable number of text columns, followed by before_tag, after_tag, query
-                    // Minimum: fts_highlight(text, before_tag, after_tag, query) = 4 args
-                    if arg_count < 4 {
-                        return Err(LimboError::InvalidArgument(
-                            "fts_highlight requires at least 4 arguments: text, before_tag, after_tag, query"
-                                .to_string(),
-                        ).into());
-                    }
-
-                    // Last 3 args are: before_tag, after_tag, query
-                    // First N-3 args are text columns
-                    let num_text_cols = arg_count - 3;
-                    let before_tag = state.registers[*start_reg + num_text_cols].get_value();
-                    let after_tag = state.registers[*start_reg + num_text_cols + 1].get_value();
-                    let query = state.registers[*start_reg + num_text_cols + 2].get_value();
-
-                    // Handle NULL values in tags or query
-                    if matches!(query, Value::Null)
-                        || matches!(before_tag, Value::Null)
-                        || matches!(after_tag, Value::Null)
-                    {
-                        state.registers[*dest].set_null();
-                    } else {
-                        let query_str = query.to_string();
-                        let before_str = before_tag.to_string();
-                        let after_str = after_tag.to_string();
-
-                        // Concatenate all text columns with space separator
-                        let mut combined_text = String::new();
-                        for i in 0..num_text_cols {
-                            let text = state.registers[*start_reg + i].get_value();
-                            if !matches!(text, Value::Null) {
-                                if !combined_text.is_empty() {
-                                    combined_text.push(' ');
-                                }
-                                combined_text.push_str(&text.to_string());
-                            }
-                        }
-
-                        let highlighted = crate::index_method::fts::fts_highlight(
-                            &combined_text,
-                            &query_str,
-                            &before_str,
-                            &after_str,
-                        );
-                        state.registers[*dest].set_text(Text::new(highlighted))?;
-                    }
-                }
-            }
+            op_function_fts(state, fts_func, *start_reg, *dest, arg_count)?;
         }
         crate::function::Func::Agg(_) => {
             unreachable!("Aggregate functions should not be handled here")
@@ -12266,6 +11221,1216 @@ pub fn op_function(
     }
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
+}
+
+/// The full-text search functions.
+#[cfg(all(feature = "fts", not(target_family = "wasm")))]
+#[inline(never)]
+fn op_function_fts(
+    state: &mut ProgramState,
+    fts_func: &crate::function::FtsFunc,
+    start_reg: usize,
+    dest: usize,
+    arg_count: usize,
+) -> Result<(), Box<LimboError>> {
+    {
+        // FTS functions are typically handled via index method pattern matching.
+        // If we reach here, just return a fallback since no FTS index matched.
+        use crate::function::FtsFunc;
+        match fts_func {
+            FtsFunc::Score => {
+                // Without an FTS index match, return 0.0 as a default score
+                state.registers[dest].set_float(NonNan::new(0.0).expect("0.0 is a valid NonNan"));
+            }
+            FtsFunc::Match => {
+                // fts_match(col1, col2, ..., query): returns 1 if any column matches query
+                // Minimum: fts_match(text, query) = 2 args
+                if arg_count < 2 {
+                    return Err(LimboError::InvalidArgument(
+                        "fts_match requires at least 2 arguments: text, query".to_string(),
+                    )
+                    .into());
+                }
+
+                // Last arg is the query, first N-1 args are text columns
+                let num_text_cols = arg_count - 1;
+                let query = state.registers[start_reg + num_text_cols].get_value();
+
+                if matches!(query, Value::Null) {
+                    state.registers[dest].set_int(0);
+                } else {
+                    let query_str = query.to_string();
+
+                    // Concatenate all text columns with space separator
+                    let est_len = 16;
+                    let mut combined_text = String::with_capacity(num_text_cols * est_len);
+                    for i in 0..num_text_cols {
+                        let text = state.registers[start_reg + i].get_value();
+                        if !matches!(text, Value::Null) {
+                            if !combined_text.is_empty() {
+                                combined_text.push(' ');
+                            }
+                            combined_text.push_str(&text.to_string());
+                        }
+                    }
+
+                    let matches = crate::index_method::fts::fts_match(&combined_text, &query_str);
+                    state.registers[dest].set_int(matches.into());
+                }
+            }
+            FtsFunc::Highlight => {
+                // fts_highlight(col1, col2, ..., before_tag, after_tag, query)
+                // Variable number of text columns, followed by before_tag, after_tag, query
+                // Minimum: fts_highlight(text, before_tag, after_tag, query) = 4 args
+                if arg_count < 4 {
+                    return Err(LimboError::InvalidArgument(
+                            "fts_highlight requires at least 4 arguments: text, before_tag, after_tag, query"
+                                .to_string(),
+                        ).into());
+                }
+
+                // Last 3 args are: before_tag, after_tag, query
+                // First N-3 args are text columns
+                let num_text_cols = arg_count - 3;
+                let before_tag = state.registers[start_reg + num_text_cols].get_value();
+                let after_tag = state.registers[start_reg + num_text_cols + 1].get_value();
+                let query = state.registers[start_reg + num_text_cols + 2].get_value();
+
+                // Handle NULL values in tags or query
+                if matches!(query, Value::Null)
+                    || matches!(before_tag, Value::Null)
+                    || matches!(after_tag, Value::Null)
+                {
+                    state.registers[dest].set_null();
+                } else {
+                    let query_str = query.to_string();
+                    let before_str = before_tag.to_string();
+                    let after_str = after_tag.to_string();
+
+                    // Concatenate all text columns with space separator
+                    let mut combined_text = String::new();
+                    for i in 0..num_text_cols {
+                        let text = state.registers[start_reg + i].get_value();
+                        if !matches!(text, Value::Null) {
+                            if !combined_text.is_empty() {
+                                combined_text.push(' ');
+                            }
+                            combined_text.push_str(&text.to_string());
+                        }
+                    }
+
+                    let highlighted = crate::index_method::fts::fts_highlight(
+                        &combined_text,
+                        &query_str,
+                        &before_str,
+                        &after_str,
+                    );
+                    state.registers[dest].set_text(Text::new(highlighted))?;
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The floating-point math functions.
+#[inline(never)]
+fn op_function_math(
+    state: &mut ProgramState,
+    math_func: &MathFunc,
+    start_reg: usize,
+    dest: usize,
+    arg_count: usize,
+) -> Result<(), Box<LimboError>> {
+    match math_func.arity() {
+        MathFuncArity::Nullary => match math_func {
+            MathFunc::Pi => {
+                state.registers[dest]
+                    .set_float(NonNan::new(std::f64::consts::PI).expect("PI is a valid NonNan"));
+            }
+            _ => {
+                unreachable!("Unexpected mathematical Nullary function {:?}", math_func);
+            }
+        },
+
+        MathFuncArity::Unary => {
+            let reg_value = &state.registers[start_reg];
+            let result = reg_value.get_value().exec_math_unary(math_func);
+            state.registers[dest].set_value(result);
+        }
+
+        MathFuncArity::Binary => {
+            let lhs = &state.registers[start_reg];
+            let rhs = &state.registers[start_reg + 1];
+            let result = lhs.get_value().exec_math_binary(rhs.get_value(), math_func);
+            state.registers[dest].set_value(result);
+        }
+
+        MathFuncArity::UnaryOrBinary => match math_func {
+            MathFunc::Log => {
+                let result = match arg_count {
+                    1 => {
+                        let arg = &state.registers[start_reg];
+                        arg.get_value().exec_math_log(None)
+                    }
+                    2 => {
+                        let base = &state.registers[start_reg];
+                        let arg = &state.registers[start_reg + 1];
+                        arg.get_value().exec_math_log(Some(base.get_value()))
+                    }
+                    _ => unreachable!(
+                        "{:?} function with unexpected number of arguments",
+                        math_func
+                    ),
+                };
+                state.registers[dest].set_value(result);
+            }
+            _ => unreachable!(
+                "Unexpected mathematical UnaryOrBinary function {:?}",
+                math_func
+            ),
+        },
+    }
+    Ok(())
+}
+
+/// The functions an extension registers.
+#[inline(never)]
+fn op_function_external(
+    state: &mut ProgramState,
+    f: &Arc<crate::function::ExternalFunc>,
+    start_reg: usize,
+    dest: usize,
+    arg_count: usize,
+) -> Result<(), Box<LimboError>> {
+    match f.func {
+        ExtFunc::Scalar {
+            context,
+            callback,
+            context_destructor,
+            value_destructor,
+            ..
+        } => {
+            let mut ext_values = Vec::with_capacity(arg_count);
+            if arg_count != 0 {
+                let register_slice = &state.registers[start_reg..start_reg + arg_count];
+                for ov in register_slice.iter() {
+                    ext_values.push(ov.get_value().to_ffi());
+                }
+            }
+            let argv_ptr = if ext_values.is_empty() {
+                std::ptr::null()
+            } else {
+                ext_values.as_ptr()
+            };
+            let mut result = unsafe {
+                callback(
+                    context,
+                    arg_count as i32,
+                    argv_ptr,
+                    context_destructor,
+                    value_destructor,
+                )
+            };
+            let value = Value::from_ffi_ref(&result);
+            if let Some(value_destructor) = value_destructor {
+                unsafe { value_destructor(&mut result) };
+            } else {
+                unsafe { result.__free_internal_type() };
+            }
+            for ext_value in ext_values {
+                unsafe { ext_value.__free_internal_type() };
+            }
+            state.registers[dest].set_value(value?);
+        }
+        _ => unreachable!("aggregate called in scalar context"),
+    }
+    Ok(())
+}
+
+/// The vector functions.
+#[inline(never)]
+fn op_function_vector(
+    state: &mut ProgramState,
+    vector_func: &VectorFunc,
+    start_reg: usize,
+    dest: usize,
+    arg_count: usize,
+) -> Result<(), Box<LimboError>> {
+    {
+        let args = &state.registers[start_reg..start_reg + arg_count];
+        match vector_func {
+            VectorFunc::Vector => {
+                let result = vector32(args)?;
+                state.registers[dest].set_value(result);
+            }
+            VectorFunc::Vector32 => {
+                let result = vector32(args)?;
+                state.registers[dest].set_value(result);
+            }
+            VectorFunc::Vector32Sparse => {
+                let result = vector32_sparse(args)?;
+                state.registers[dest].set_value(result);
+            }
+            VectorFunc::Vector64 => {
+                let result = vector64(args)?;
+                state.registers[dest].set_value(result);
+            }
+            VectorFunc::Vector8 => {
+                let result = vector8(args)?;
+                state.registers[dest].set_value(result);
+            }
+            VectorFunc::Vector1Bit => {
+                let result = vector1bit(args)?;
+                state.registers[dest].set_value(result);
+            }
+            VectorFunc::VectorExtract => {
+                let result = vector_extract(args)?;
+                state.registers[dest].set_value(result);
+            }
+            VectorFunc::VectorDistanceCos => {
+                let result = vector_distance_cos(args)?;
+                state.registers[dest].set_value(result);
+            }
+            VectorFunc::VectorDistanceDot => {
+                let result = vector_distance_dot(args)?;
+                state.registers[dest].set_value(result);
+            }
+            VectorFunc::VectorDistanceL2 => {
+                let result = vector_distance_l2(args)?;
+                state.registers[dest].set_value(result);
+            }
+            VectorFunc::VectorDistanceJaccard => {
+                let result = vector_distance_jaccard(args)?;
+                state.registers[dest].set_value(result);
+            }
+            VectorFunc::VectorConcat => {
+                let result = vector_concat(args)?;
+                state.registers[dest].set_value(result);
+            }
+            VectorFunc::VectorSlice => {
+                let result = vector_slice(args)?;
+                state.registers[dest].set_value(result)
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The JSON functions. Out of line: three hundred lines of per-function
+/// work that every other scalar function would otherwise pay a frame for.
+#[cfg(feature = "json")]
+#[inline(never)]
+fn op_function_json(
+    state: &mut ProgramState,
+    json_func: &JsonFunc,
+    start_reg: usize,
+    dest: usize,
+    arg_count: usize,
+) -> Result<(), Box<LimboError>> {
+    match json_func {
+        JsonFunc::Json => {
+            let json_value = &state.registers[start_reg];
+            let json_str = get_json(json_value.get_value(), None);
+            match json_str {
+                Ok(json) => state.registers[dest].set_value(json),
+                Err(e) => return Err(e.into()),
+            }
+        }
+
+        JsonFunc::Jsonb => {
+            let json_value = &state.registers[start_reg];
+            let json_blob = jsonb(json_value.get_value(), &state.json_cache);
+            match json_blob {
+                Ok(json) => state.registers[dest].set_value(json),
+                Err(e) => return Err(e.into()),
+            }
+        }
+
+        JsonFunc::JsonArray
+        | JsonFunc::JsonObject
+        | JsonFunc::JsonbArray
+        | JsonFunc::JsonbObject => {
+            let reg_values =
+                registers_to_ref_values(&state.registers[start_reg..start_reg + arg_count]);
+
+            let json_func = match json_func {
+                JsonFunc::JsonArray => json_array,
+                JsonFunc::JsonObject => json_object,
+                JsonFunc::JsonbArray => jsonb_array,
+                JsonFunc::JsonbObject => jsonb_object,
+                _ => unreachable!(),
+            };
+            let json_result = json_func(reg_values);
+
+            match json_result {
+                Ok(json) => state.registers[dest].set_value(json),
+                Err(e) => return Err(e.into()),
+            }
+        }
+        JsonFunc::JsonExtract => {
+            let result = match arg_count {
+                0 => Ok(Value::Null),
+                _ => {
+                    let val = &state.registers[start_reg];
+                    let reg_values = registers_to_ref_values(
+                        &state.registers[start_reg + 1..start_reg + arg_count],
+                    );
+
+                    json_extract(val.get_value(), reg_values, &state.json_cache)
+                }
+            };
+
+            match result {
+                Ok(json) => state.registers[dest].set_value(json),
+                Err(e) => return Err(e.into()),
+            }
+        }
+        JsonFunc::JsonbExtract => {
+            let result = match arg_count {
+                0 => Ok(Value::Null),
+                _ => {
+                    let val = &state.registers[start_reg];
+                    let reg_values = registers_to_ref_values(
+                        &state.registers[start_reg + 1..start_reg + arg_count],
+                    );
+
+                    jsonb_extract(val.get_value(), reg_values, &state.json_cache)
+                }
+            };
+
+            match result {
+                Ok(json) => state.registers[dest].set_value(json),
+                Err(e) => return Err(e.into()),
+            }
+        }
+
+        JsonFunc::JsonArrowExtract | JsonFunc::JsonArrowShiftExtract => {
+            assert_eq!(arg_count, 2);
+            let json = &state.registers[start_reg];
+            let path = &state.registers[start_reg + 1];
+            let json_func = match json_func {
+                JsonFunc::JsonArrowExtract => json_arrow_extract,
+                JsonFunc::JsonArrowShiftExtract => json_arrow_shift_extract,
+                _ => unreachable!(),
+            };
+            let json_str = json_func(json.get_value(), path.get_value(), &state.json_cache);
+            match json_str {
+                Ok(json) => state.registers[dest].set_value(json),
+                Err(e) => return Err(e.into()),
+            }
+        }
+        JsonFunc::JsonArrayLength | JsonFunc::JsonType => {
+            let json_value = &state.registers[start_reg];
+            let path_value = if arg_count > 1 {
+                Some(&state.registers[start_reg + 1])
+            } else {
+                None
+            };
+            let func_result = match json_func {
+                JsonFunc::JsonArrayLength => json_array_length(
+                    json_value.get_value(),
+                    path_value.map(|x| x.get_value()),
+                    &state.json_cache,
+                ),
+                JsonFunc::JsonType => {
+                    json_type(json_value.get_value(), path_value.map(|x| x.get_value()))
+                }
+                _ => unreachable!(),
+            };
+
+            match func_result {
+                Ok(result) => state.registers[dest].set_value(result),
+                Err(e) => return Err(e.into()),
+            }
+        }
+        JsonFunc::JsonErrorPosition => {
+            let json_value = &state.registers[start_reg];
+            match json_error_position(json_value.get_value()) {
+                Ok(pos) => state.registers[dest].set_value(pos),
+                Err(e) => return Err(e.into()),
+            }
+        }
+        JsonFunc::JsonValid => {
+            let json_value = &state.registers[start_reg];
+            // json_valid(X) is defined as json_valid(X, 1).
+            let default_flags = Value::from_i64(json::JSON_VALID_FLAG_TEXT_STRICT);
+            let flags_value = if arg_count > 1 {
+                state.registers[start_reg + 1].get_value()
+            } else {
+                &default_flags
+            };
+            state.registers[dest].set_value(is_json_valid(json_value.get_value(), flags_value)?);
+        }
+        JsonFunc::JsonPatch => {
+            assert_eq!(arg_count, 2);
+            assert!(start_reg + 1 < state.registers.len());
+            let target = &state.registers[start_reg];
+            let patch = &state.registers[start_reg + 1];
+            state.registers[dest].set_value(json_patch(
+                target.get_value(),
+                patch.get_value(),
+                &state.json_cache,
+            )?);
+        }
+        JsonFunc::JsonbPatch => {
+            assert_eq!(arg_count, 2);
+            assert!(start_reg + 1 < state.registers.len());
+            let target = &state.registers[start_reg];
+            let patch = &state.registers[start_reg + 1];
+            state.registers[dest].set_value(jsonb_patch(
+                target.get_value(),
+                patch.get_value(),
+                &state.json_cache,
+            )?);
+        }
+        JsonFunc::JsonRemove => {
+            if let Ok(json) = json_remove(
+                registers_to_ref_values(&state.registers[start_reg..start_reg + arg_count]),
+                &state.json_cache,
+            ) {
+                state.registers[dest].set_value(json);
+            } else {
+                state.registers[dest].set_null();
+            }
+        }
+        JsonFunc::JsonbRemove => {
+            if let Ok(json) = jsonb_remove(
+                registers_to_ref_values(&state.registers[start_reg..start_reg + arg_count]),
+                &state.json_cache,
+            ) {
+                state.registers[dest].set_value(json);
+            } else {
+                state.registers[dest].set_null();
+            }
+        }
+        JsonFunc::JsonReplace => {
+            if arg_count % 2 == 0 {
+                bail_constraint_error!("json_replace() needs an odd number of arguments")
+            }
+            if let Ok(json) = json_replace(
+                registers_to_ref_values(&state.registers[start_reg..start_reg + arg_count]),
+                &state.json_cache,
+            ) {
+                state.registers[dest].set_value(json);
+            } else {
+                state.registers[dest].set_null();
+            }
+        }
+        JsonFunc::JsonbReplace => {
+            if arg_count % 2 == 0 {
+                bail_constraint_error!("json_replace() needs an odd number of arguments")
+            }
+            if let Ok(json) = jsonb_replace(
+                registers_to_ref_values(&state.registers[start_reg..start_reg + arg_count]),
+                &state.json_cache,
+            ) {
+                state.registers[dest].set_value(json);
+            } else {
+                state.registers[dest].set_null();
+            }
+        }
+        JsonFunc::JsonInsert => {
+            if arg_count % 2 == 0 {
+                bail_constraint_error!("json_insert() needs an odd number of arguments")
+            }
+            if let Ok(json) = json_insert(
+                registers_to_ref_values(&state.registers[start_reg..start_reg + arg_count]),
+                &state.json_cache,
+            ) {
+                state.registers[dest].set_value(json);
+            } else {
+                state.registers[dest].set_null();
+            }
+        }
+        JsonFunc::JsonbInsert => {
+            if arg_count % 2 == 0 {
+                bail_constraint_error!("json_insert() needs an odd number of arguments")
+            }
+            if let Ok(json) = jsonb_insert(
+                registers_to_ref_values(&state.registers[start_reg..start_reg + arg_count]),
+                &state.json_cache,
+            ) {
+                state.registers[dest].set_value(json);
+            } else {
+                state.registers[dest].set_null();
+            }
+        }
+        JsonFunc::JsonPretty => {
+            let json_value = &state.registers[start_reg];
+            let indent = if arg_count > 1 {
+                Some(&state.registers[start_reg + 1])
+            } else {
+                None
+            };
+
+            // Blob should be converted to Ascii in a lossy way
+            // However, Rust strings uses utf-8
+            // so the behavior at the moment is slightly different
+            // To the way blobs are parsed here in SQLite.
+            let indent = match indent {
+                Some(value) => match value.get_value() {
+                    Value::Text(text) => text.as_str(),
+                    Value::Numeric(Numeric::Integer(val)) => &val.to_string(),
+                    Value::Numeric(Numeric::Float(val)) => &f64::from(*val).to_string(),
+                    Value::Blob(val) => &String::from_utf8_lossy(val),
+                    _ => "    ",
+                },
+                // If the second argument is omitted or is NULL, then indentation is four spaces per level
+                None => "    ",
+            };
+
+            let json_str = get_json(json_value.get_value(), Some(indent))?;
+            state.registers[dest].set_value(json_str);
+        }
+        JsonFunc::JsonSet => {
+            if arg_count % 2 == 0 {
+                bail_constraint_error!("json_set() needs an odd number of arguments")
+            }
+            let reg_values =
+                registers_to_ref_values(&state.registers[start_reg..start_reg + arg_count]);
+
+            let json_result = json_set(reg_values, &state.json_cache);
+
+            match json_result {
+                Ok(json) => state.registers[dest].set_value(json),
+                Err(e) => return Err(e.into()),
+            }
+        }
+        JsonFunc::JsonbSet => {
+            if arg_count % 2 == 0 {
+                bail_constraint_error!("json_set() needs an odd number of arguments")
+            }
+            let reg_values =
+                registers_to_ref_values(&state.registers[start_reg..start_reg + arg_count]);
+
+            let json_result = jsonb_set(reg_values, &state.json_cache);
+
+            match json_result {
+                Ok(json) => state.registers[dest].set_value(json),
+                Err(e) => return Err(e.into()),
+            }
+        }
+        JsonFunc::JsonQuote => {
+            let json_value = &state.registers[start_reg];
+
+            match json_quote(json_value.get_value()) {
+                Ok(result) => state.registers[dest].set_value(result),
+                Err(e) => return Err(e.into()),
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The ALTER TABLE helper functions, which rewrite stored schema SQL.
+/// Out of line: they are six hundred lines of one-per-DDL-statement work
+/// inside `op_function`, whose frame every scalar function call pays for.
+#[inline(never)]
+fn op_function_alter_table(
+    program: &Program,
+    state: &mut ProgramState,
+    alter_func: &crate::function::AlterTableFunc,
+    start_reg: usize,
+    dest: usize,
+) -> Result<(), Box<LimboError>> {
+    let r#type = &state.registers[start_reg].get_value().clone();
+    let Value::Text(entry_type) = r#type else {
+        panic!("sqlite_schema.type should be TEXT")
+    };
+
+    let Value::Text(name) = &state.registers[start_reg + 1].get_value() else {
+        panic!("sqlite_schema.name should be TEXT")
+    };
+    let name = name.to_string();
+
+    let Value::Text(tbl_name) = &state.registers[start_reg + 2].get_value() else {
+        panic!("sqlite_schema.tbl_name should be TEXT")
+    };
+    let tbl_name = tbl_name.to_string();
+
+    let Value::Numeric(Numeric::Integer(root_page)) =
+        &state.registers[start_reg + 3].get_value().clone()
+    else {
+        panic!("sqlite_schema.root_page should be INTEGER")
+    };
+
+    let sql = &state.registers[start_reg + 4].get_value().clone();
+
+    let (new_name, new_tbl_name, new_sql) = match alter_func {
+        AlterTableFunc::RenameTable => {
+            let rename_from = {
+                match &state.registers[start_reg + 5].get_value() {
+                    Value::Text(rename_from) => normalize_ident(rename_from.as_str()),
+                    _ => panic!("rename_from parameter should be TEXT"),
+                }
+            };
+
+            let original_rename_to = {
+                match &state.registers[start_reg + 6].get_value() {
+                    Value::Text(rename_to) => rename_to,
+                    _ => panic!("rename_to parameter should be TEXT"),
+                }
+            };
+            let rename_to = normalize_ident(original_rename_to.as_str());
+
+            let new_name = if let Some(column) =
+                &name.strip_prefix(&format!("sqlite_autoindex_{rename_from}_"))
+            {
+                format!("sqlite_autoindex_{rename_to}_{column}")
+            } else if name == rename_from {
+                rename_to.clone()
+            } else {
+                name
+            };
+
+            let new_tbl_name = if tbl_name == rename_from {
+                rename_to.clone()
+            } else {
+                tbl_name
+            };
+
+            let new_sql = 'sql: {
+                let Value::Text(sql) = sql else {
+                    break 'sql None;
+                };
+
+                let cmd = parse_schema_sql_for_alter(
+                    program.connection.dialect().as_ref(),
+                    entry_type.as_str(),
+                    *root_page,
+                    sql.as_str(),
+                )?;
+                let Some(ast::Cmd::Stmt(stmt)) = cmd else {
+                    return Err(LimboError::InternalError(
+                        "Unexpected command during ALTER TABLE RENAME processing".to_string(),
+                    )
+                    .into());
+                };
+
+                match stmt {
+                    ast::Stmt::CreateIndex {
+                        tbl_name,
+                        unique,
+                        if_not_exists,
+                        idx_name,
+                        columns,
+                        where_clause,
+                        using,
+                        with_clause,
+                    } => {
+                        let table_name = normalize_ident(tbl_name.as_str());
+
+                        if rename_from != table_name {
+                            break 'sql None;
+                        }
+
+                        Some(
+                            ast::Stmt::CreateIndex {
+                                tbl_name: ast::Name::exact(original_rename_to.to_string()),
+                                unique,
+                                if_not_exists,
+                                idx_name,
+                                columns,
+                                where_clause,
+                                using,
+                                with_clause,
+                            }
+                            .to_string(),
+                        )
+                    }
+                    ast::Stmt::CreateTable {
+                        tbl_name,
+                        temporary,
+                        if_not_exists,
+                        body,
+                    } => {
+                        let this_table = normalize_ident(tbl_name.name.as_str());
+
+                        let ast::CreateTableBody::ColumnsAndConstraints {
+                            mut columns,
+                            mut constraints,
+                            options,
+                        } = body
+                        else {
+                            return Err(LimboError::InternalError(
+                                "CREATE TABLE AS SELECT schemas cannot be altered".to_string(),
+                            )
+                            .into());
+                        };
+
+                        let mut any_change = false;
+
+                        // Rewrite FK targets in both paths
+                        for c in &mut constraints {
+                            if let ast::TableConstraint::ForeignKey { clause, .. } =
+                                &mut c.constraint
+                            {
+                                any_change |= rewrite_fk_parent_table_if_needed(
+                                    clause,
+                                    &rename_from,
+                                    original_rename_to.as_str(),
+                                );
+                            }
+                        }
+                        for col in &mut columns {
+                            any_change |= rewrite_inline_col_fk_target_if_needed(
+                                col,
+                                &rename_from,
+                                original_rename_to.as_str(),
+                            );
+                        }
+
+                        // Rewrite table-qualified refs in CHECK constraints
+                        // (e.g. t1.a > 0 → t2.a > 0)
+                        if this_table == rename_from {
+                            for c in &mut constraints {
+                                if let ast::TableConstraint::Check {
+                                    ref mut expr,
+                                    ref mut source,
+                                } = c.constraint
+                                {
+                                    rewrite_check_expr_table_refs(expr, &rename_from, &rename_to);
+                                    // The captured source text no longer
+                                    // matches the rewritten expression.
+                                    *source = None;
+                                }
+                            }
+                            for col in &mut columns {
+                                for cc in &mut col.constraints {
+                                    if let ast::ColumnConstraint::Check {
+                                        ref mut expr,
+                                        ref mut source,
+                                    } = cc.constraint
+                                    {
+                                        rewrite_check_expr_table_refs(
+                                            expr,
+                                            &rename_from,
+                                            &rename_to,
+                                        );
+                                        *source = None;
+                                    }
+                                }
+                            }
+                        }
+
+                        if this_table == rename_from {
+                            // Rebuild with new table identifier so SQL persists the new name.
+                            let new_stmt = ast::Stmt::CreateTable {
+                                tbl_name: ast::QualifiedName {
+                                    db_name: None,
+                                    name: ast::Name::exact(original_rename_to.to_string()),
+                                    alias: None,
+                                },
+                                temporary,
+                                if_not_exists,
+                                body: ast::CreateTableBody::ColumnsAndConstraints {
+                                    columns,
+                                    constraints,
+                                    options,
+                                },
+                            };
+                            Some(
+                                program
+                                    .connection
+                                    .dialect()
+                                    .format_rewritten_table_sql(&new_stmt)?,
+                            )
+                        } else {
+                            // Other tables: only emit if we actually changed their FK targets.
+                            if !any_change {
+                                break 'sql None;
+                            }
+                            let new_stmt = ast::Stmt::CreateTable {
+                                tbl_name,
+                                temporary,
+                                if_not_exists,
+                                body: ast::CreateTableBody::ColumnsAndConstraints {
+                                    columns,
+                                    constraints,
+                                    options,
+                                },
+                            };
+                            Some(
+                                program
+                                    .connection
+                                    .dialect()
+                                    .format_rewritten_table_sql(&new_stmt)?,
+                            )
+                        }
+                    }
+                    ast::Stmt::CreateVirtualTable(ast::CreateVirtualTable {
+                        tbl_name,
+                        if_not_exists,
+                        module_name,
+                        args,
+                    }) => {
+                        let this_table = normalize_ident(tbl_name.name.as_str());
+                        if this_table != rename_from {
+                            None
+                        } else {
+                            let new_stmt = ast::Stmt::CreateVirtualTable(ast::CreateVirtualTable {
+                                tbl_name: ast::QualifiedName {
+                                    db_name: tbl_name.db_name,
+                                    name: ast::Name::exact(original_rename_to.to_string()),
+                                    alias: None,
+                                },
+                                if_not_exists,
+                                module_name,
+                                args,
+                            });
+                            Some(new_stmt.to_string())
+                        }
+                    }
+                    ast::Stmt::CreateTrigger {
+                        temporary,
+                        if_not_exists,
+                        trigger_name,
+                        time,
+                        event,
+                        tbl_name: trigger_tbl_name,
+                        for_each_row,
+                        mut when_clause,
+                        mut commands,
+                    } => {
+                        let trigger_tbl = normalize_ident(trigger_tbl_name.name.as_str());
+
+                        // Rewrite ON table name if it matches the renamed table
+                        let new_trigger_tbl_name = if trigger_tbl == rename_from {
+                            ast::QualifiedName {
+                                db_name: trigger_tbl_name.db_name,
+                                name: ast::Name::exact(original_rename_to.to_string()),
+                                alias: None,
+                            }
+                        } else {
+                            trigger_tbl_name
+                        };
+
+                        // Rewrite WHEN clause qualified refs
+                        if let Some(ref mut when) = when_clause {
+                            rewrite_check_expr_table_refs(
+                                when,
+                                &rename_from,
+                                original_rename_to.as_str(),
+                            );
+                        }
+
+                        // Rewrite table references in trigger body commands
+                        for cmd in &mut commands {
+                            rewrite_trigger_cmd_table_refs(
+                                cmd,
+                                &rename_from,
+                                original_rename_to.as_str(),
+                            );
+                        }
+
+                        Some(
+                            ast::Stmt::CreateTrigger {
+                                temporary,
+                                if_not_exists,
+                                trigger_name,
+                                time,
+                                event,
+                                tbl_name: new_trigger_tbl_name,
+                                for_each_row,
+                                when_clause,
+                                commands,
+                            }
+                            .to_string(),
+                        )
+                    }
+                    _ => None,
+                }
+            };
+
+            (new_name, new_tbl_name, new_sql)
+        }
+        AlterTableFunc::AlterColumn | AlterTableFunc::RenameColumn => {
+            let table = {
+                match &state.registers[start_reg + 5].get_value() {
+                    Value::Text(rename_to) => normalize_ident(rename_to.as_str()),
+                    _ => panic!("table parameter should be TEXT"),
+                }
+            };
+
+            let original_rename_from = {
+                match &state.registers[start_reg + 6].get_value() {
+                    Value::Text(rename_from) => rename_from,
+                    _ => panic!("rename_from parameter should be TEXT"),
+                }
+            };
+            let rename_from = normalize_ident(original_rename_from.as_str());
+
+            let column_def = {
+                match &state.registers[start_reg + 7].get_value() {
+                    Value::Text(column_def) => column_def.as_str(),
+                    _ => panic!("rename_to parameter should be TEXT"),
+                }
+            };
+
+            let column_def = Parser::new(column_def.as_bytes()).parse_column_definition(true)?;
+
+            let _rename_to = normalize_ident(column_def.col_name.as_str());
+
+            let new_sql = 'sql: {
+                let Value::Text(sql) = sql else {
+                    break 'sql None;
+                };
+
+                let cmd = parse_schema_sql_for_alter(
+                    program.connection.dialect().as_ref(),
+                    entry_type.as_str(),
+                    *root_page,
+                    sql.as_str(),
+                )?;
+                let Some(ast::Cmd::Stmt(stmt)) = cmd else {
+                    return Err(LimboError::InternalError(
+                        "Unexpected command during ALTER TABLE RENAME COLUMN processing"
+                            .to_string(),
+                    )
+                    .into());
+                };
+
+                match stmt {
+                    ast::Stmt::CreateIndex {
+                        tbl_name,
+                        mut columns,
+                        unique,
+                        if_not_exists,
+                        idx_name,
+                        mut where_clause,
+                        using,
+                        with_clause,
+                    } => {
+                        if table != normalize_ident(tbl_name.as_str()) {
+                            break 'sql None;
+                        }
+
+                        for column in &mut columns {
+                            rename_identifiers(
+                                column.expr.as_mut(),
+                                &rename_from,
+                                column_def.col_name.as_str(),
+                            );
+                        }
+
+                        if let Some(ref mut wc) = where_clause {
+                            rename_identifiers(wc, &rename_from, column_def.col_name.as_str());
+                        }
+
+                        Some(
+                            ast::Stmt::CreateIndex {
+                                tbl_name,
+                                columns,
+                                unique,
+                                if_not_exists,
+                                idx_name,
+                                where_clause,
+                                using,
+                                with_clause,
+                            }
+                            .to_string(),
+                        )
+                    }
+                    ast::Stmt::CreateTable {
+                        tbl_name,
+                        body,
+                        temporary,
+                        if_not_exists,
+                    } => {
+                        let ast::CreateTableBody::ColumnsAndConstraints {
+                            mut columns,
+                            mut constraints,
+                            options,
+                        } = body
+                        else {
+                            return Err(LimboError::InternalError(
+                                "CREATE TABLE AS SELECT schemas cannot be altered".to_string(),
+                            )
+                            .into());
+                        };
+
+                        let normalized_tbl_name = normalize_ident(tbl_name.name.as_str());
+
+                        if normalized_tbl_name == table {
+                            // This is the table being altered - update its column
+                            let Some(column) = columns.iter_mut().find(|column| {
+                                normalize_ident(column.col_name.as_str()) == rename_from
+                            }) else {
+                                // MVCC/temp-schema rewrite can reach an already-updated
+                                // CREATE TABLE SQL image for the target table. Treat that
+                                // as idempotent and keep the existing SQL text.
+                                break 'sql None;
+                            };
+
+                            match alter_func {
+                                AlterTableFunc::AlterColumn => *column = column_def.clone(),
+                                AlterTableFunc::RenameColumn => {
+                                    column.col_name = column_def.col_name.clone()
+                                }
+                                _ => unreachable!(),
+                            }
+
+                            // Update table-level constraints (PRIMARY KEY, UNIQUE, FOREIGN KEY)
+                            for constraint in &mut constraints {
+                                match &mut constraint.constraint {
+                                    ast::TableConstraint::PrimaryKey {
+                                        columns: pk_cols, ..
+                                    } => {
+                                        for col in pk_cols {
+                                            rename_identifiers(
+                                                col.expr.as_mut(),
+                                                &rename_from,
+                                                column_def.col_name.as_str(),
+                                            );
+                                        }
+                                    }
+                                    ast::TableConstraint::Unique {
+                                        columns: uniq_cols, ..
+                                    } => {
+                                        for col in uniq_cols {
+                                            rename_identifiers(
+                                                col.expr.as_mut(),
+                                                &rename_from,
+                                                column_def.col_name.as_str(),
+                                            );
+                                        }
+                                    }
+                                    ast::TableConstraint::ForeignKey {
+                                        columns: child_cols,
+                                        clause,
+                                        ..
+                                    } => {
+                                        // Update child columns in this table's FK definitions
+                                        for child_col in child_cols {
+                                            if normalize_ident(child_col.col_name.as_str())
+                                                == rename_from
+                                            {
+                                                child_col.col_name = Name::exact(
+                                                    column_def.col_name.as_str().to_owned(),
+                                                );
+                                            }
+                                        }
+                                        rewrite_fk_parent_cols_if_self_ref(
+                                            clause,
+                                            &normalized_tbl_name,
+                                            &rename_from,
+                                            column_def.col_name.as_str(),
+                                        );
+                                    }
+                                    ast::TableConstraint::Check {
+                                        ref mut expr,
+                                        ref mut source,
+                                    } => {
+                                        rename_identifiers(
+                                            expr,
+                                            &rename_from,
+                                            column_def.col_name.as_str(),
+                                        );
+                                        *source = None;
+                                    }
+                                }
+                            }
+
+                            for col in &mut columns {
+                                rewrite_column_references_if_needed(
+                                    col,
+                                    &normalized_tbl_name,
+                                    &rename_from,
+                                    column_def.col_name.as_str(),
+                                )?;
+                            }
+                        } else {
+                            // This is a different table, check if it has FKs referencing the renamed column
+                            let mut fk_updated = false;
+
+                            for constraint in &mut constraints {
+                                if let ast::TableConstraint::ForeignKey {
+                                    columns: _,
+                                    clause:
+                                        ForeignKeyClause {
+                                            tbl_name,
+                                            columns: parent_cols,
+                                            ..
+                                        },
+                                    ..
+                                } = &mut constraint.constraint
+                                {
+                                    // Check if this FK references the table being altered
+                                    if normalize_ident(tbl_name.as_str()) == table {
+                                        // Update parent column references if they match the renamed column
+                                        for parent_col in parent_cols {
+                                            if normalize_ident(parent_col.col_name.as_str())
+                                                == rename_from
+                                            {
+                                                parent_col.col_name = Name::exact(
+                                                    column_def.col_name.as_str().to_owned(),
+                                                );
+                                                fk_updated = true;
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            for col in &mut columns {
+                                let _before = fk_updated;
+                                let mut local_col = col.clone();
+                                rewrite_column_level_fk_parent_columns_if_needed(
+                                    &mut local_col,
+                                    &table,
+                                    &rename_from,
+                                    column_def.col_name.as_str(),
+                                );
+                                if local_col != *col {
+                                    *col = local_col;
+                                    fk_updated = true;
+                                }
+                            }
+
+                            // Only return updated SQL if we actually changed something
+                            if !fk_updated {
+                                break 'sql None;
+                            }
+                        }
+                        let new_stmt = ast::Stmt::CreateTable {
+                            tbl_name,
+                            body: ast::CreateTableBody::ColumnsAndConstraints {
+                                columns,
+                                constraints,
+                                options,
+                            },
+                            temporary,
+                            if_not_exists,
+                        };
+                        Some(
+                            program
+                                .connection
+                                .dialect()
+                                .format_rewritten_table_sql(&new_stmt)?,
+                        )
+                    }
+                    // Trigger SQL is rewritten by separate UPDATE statements
+                    // generated by alter.rs (via rewrite_trigger_sql_for_column_rename),
+                    // so we skip triggers here to avoid redundant work.
+                    _ => None,
+                }
+            };
+
+            (name, tbl_name, new_sql)
+        }
+    };
+
+    state.registers[dest].set_value(r#type.clone());
+    state.registers[dest + 1].set_text(Text::from(new_name))?;
+    state.registers[dest + 2].set_text(Text::from(new_tbl_name))?;
+    state.registers[dest + 3].set_int(*root_page);
+
+    if let Some(new_sql) = new_sql {
+        state.registers[dest + 4].set_text(Text::from(new_sql))?;
+    } else {
+        state.registers[dest + 4].set_value(sql.clone());
+    }
+    Ok(())
 }
 
 pub(crate) type OpAttachState = crate::connection::AttachDatabaseState;
@@ -13974,13 +14139,7 @@ pub fn op_copy(
 /// survives, the first Column/RowId read in the write loop can jump back to the
 /// collection-phase index cursor and read the wrong row.
 fn invalidate_deferred_seeks_for_cursor(state: &mut ProgramState, cursor_id: usize) {
-    for deferred_seek in &mut state.deferred_seeks {
-        if let Some(ds) = deferred_seek {
-            if ds.index_cursor_id == cursor_id || ds.table_cursor_id == cursor_id {
-                *deferred_seek = None;
-            }
-        }
-    }
+    state.clear_deferred_seeks_naming(cursor_id);
 }
 
 pub fn op_create_btree(
@@ -15113,9 +15272,7 @@ pub fn op_close(
         .get_mut(*cursor_id)
         .expect("cursor_id should be valid")
         .take();
-    if let Some(deferred_seek) = state.deferred_seeks.get_mut(*cursor_id) {
-        deferred_seek.take();
-    }
+    state.take_deferred_seek(*cursor_id);
     state.ephemeral_temp_files.remove(cursor_id);
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
@@ -18312,6 +18469,9 @@ pub fn op_hash_scan_unmatched(
     };
 
     hash_table.begin_unmatched_scan();
+    // The scan can park a completion in the state, which the dispatch loop
+    // only looks at when this is set.
+    state.pending_entry_work = true;
     advance_unmatched_scan(
         hash_table,
         &mut state.registers,
@@ -18346,6 +18506,7 @@ pub fn op_hash_next_unmatched(
         LimboError::InternalError(format!("Hash table not found with ID: {hash_table_id}"))
     })?;
 
+    state.pending_entry_work = true;
     advance_unmatched_scan(
         hash_table,
         &mut state.registers,
