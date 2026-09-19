@@ -783,7 +783,7 @@ fn join_lhs_and_rhs<'a>(
                 build_access_method.map(|method| &method.params),
                 Some(AccessMethodParams::InSeek { .. })
             );
-            let build_read_is_unique_point_lookup = build_access_method.is_some_and(|method| {
+            let build_read_is_unique_seek = build_access_method.is_some_and(|method| {
                 matches!(
                     &method.params,
                     AccessMethodParams::BTreeTable {
@@ -794,10 +794,9 @@ fn join_lhs_and_rhs<'a>(
                     } if index_access_is_unique_point_lookup(index.as_deref(), constraint_refs)
                 )
             });
-            // A joined prefix can reach the same unique row more than once.
-            // Do not assume that it has more distinct keys than prefix rows.
-            let max_distinct_build_keys = if lhs.data.len() > 1 && build_read_is_unique_point_lookup
-            {
+            // Rows from earlier tables can contain the same key many times.
+            // Therefore, the number of distinct build keys cannot exceed either input.
+            let max_distinct_build_keys = if lhs.data.len() > 1 && build_read_is_unique_seek {
                 input_cardinality.min(*build_base_rows)
             } else {
                 *build_base_rows
@@ -822,6 +821,7 @@ fn join_lhs_and_rhs<'a>(
                 rhs_has_selective_seek,
                 rhs_builds_index,
                 hash_can_replace_build_index,
+                build_read_is_unique_seek,
                 probe_table_is_prior_build,
                 build_table_is_prior_probe,
                 chaining_across_outer,
