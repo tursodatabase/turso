@@ -838,7 +838,7 @@ fn test_fts_match_requires_index_at_prepare(tmp_db: TempDatabase) {
         "DELETE FROM docs WHERE fts_match(body, 'database')",
         "UPDATE docs SET title = 'new' WHERE fts_match(body, 'database')",
     ] {
-        let error = conn.prepare(sql).err().expect(sql);
+        let error = conn.prepare(sql).expect_err(sql);
         assert_eq!(
             error.to_string(),
             "Parse error: fts_match requires an FTS index in the query plan"
@@ -862,7 +862,7 @@ fn test_fts_match_requires_index_at_prepare(tmp_db: TempDatabase) {
         "SELECT fts_match(body, 'database') FROM docs",
         "SELECT * FROM docs WHERE fts_match(body, 'database') OR fts_match(body, 'sql')",
     ] {
-        let error = conn.prepare(sql).err().expect(sql);
+        let error = conn.prepare(sql).expect_err(sql);
         assert_eq!(
             error.to_string(),
             "Parse error: fts_match requires an FTS index in the query plan"
