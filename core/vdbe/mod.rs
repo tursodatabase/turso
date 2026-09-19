@@ -919,6 +919,11 @@ pub struct ProgramState {
     /// The interval the countdown was last reloaded with, re-derived from
     /// the progress handler's interval each time the check runs.
     check_interval: u64,
+    /// What `check_countdown` was last set to. The dispatch loop decrements
+    /// the countdown once per instruction, so their difference is the number
+    /// of instructions run since the last check, and `metrics.vm_steps` does
+    /// not have to be counted alongside it.
+    check_countdown_start: u64,
     /// Whether the dispatch loop must trace, read once per execution.
     pub(crate) trace_flags: TraceFlags,
     /// Dispatch loop iterations whose instruction did not complete, because it
@@ -1101,6 +1106,7 @@ impl ProgramState {
         Self {
             check_countdown: 1,
             check_interval: MAX_CHECK_INTERVAL,
+            check_countdown_start: 1,
             trace_flags: TraceFlags::default(),
             incomplete_steps: 0,
             insn_executed_reset_at: 0,
@@ -1481,18 +1487,32 @@ impl ProgramState {
         f(&self.metrics())
     }
 
+    /// Instructions run since `check_countdown` was last reloaded, and so not
+    /// yet added to `metrics.vm_steps`.
+    #[inline]
+    fn steps_since_check(&self) -> u64 {
+        self.check_countdown_start
+            .wrapping_sub(self.check_countdown)
+    }
+
+    /// Dispatch loop iterations.
+    #[inline]
+    fn vm_steps(&self) -> u64 {
+        self.metrics.vm_steps.wrapping_add(self.steps_since_check())
+    }
+
     /// Instructions that ran to completion. The dispatch loop counts its
-    /// iterations in `metrics.vm_steps` and the ones that did not complete in
-    /// `incomplete_steps`, so this is their difference.
+    /// iterations and the ones that did not complete in `incomplete_steps`, so
+    /// this is their difference.
     fn insn_executed(&self) -> u64 {
-        self.metrics
-            .vm_steps
+        self.vm_steps()
             .wrapping_sub(self.incomplete_steps)
             .wrapping_sub(self.insn_executed_reset_at)
     }
 
     pub(crate) fn metrics(&self) -> StatementMetrics {
         let mut metrics = self.metrics.clone();
+        metrics.vm_steps = self.vm_steps();
         metrics.insn_executed = self.insn_executed();
         if let Some(OpProgramState::Step { statement, .. }) = self.active_op_state.program_ref() {
             metrics.merge(&statement.metrics());
@@ -1507,6 +1527,7 @@ impl ProgramState {
         self.metrics.reset();
         self.incomplete_steps = 0;
         self.insn_executed_reset_at = 0;
+        self.check_countdown_start = self.check_countdown;
         if let Some(OpProgramState::Step { statement, .. }) = self.active_op_state.program_mut() {
             statement.reset_metrics();
         }
@@ -1522,8 +1543,7 @@ impl ProgramState {
             }
             crate::statement::StatementStatusCounter::Sort => self.metrics.sort_operations = 0,
             crate::statement::StatementStatusCounter::VmStep => {
-                self.insn_executed_reset_at =
-                    self.metrics.vm_steps.wrapping_sub(self.incomplete_steps)
+                self.insn_executed_reset_at = self.vm_steps().wrapping_sub(self.incomplete_steps)
             }
             crate::statement::StatementStatusCounter::Reprepare => self.metrics.reprepares = 0,
             crate::statement::StatementStatusCounter::RowsRead => self.metrics.rows_read = 0,
@@ -2028,7 +2048,7 @@ impl Program {
             .is_some_and(|deadline| io.current_time_monotonic() >= deadline);
         let progress_interrupt = self
             .connection
-            .should_interrupt_for_progress(prev_steps, state.metrics.vm_steps);
+            .should_interrupt_for_progress(prev_steps, state.vm_steps());
         if connection_interrupt || hit_query_deadline || progress_interrupt {
             state.interrupt();
         }
@@ -2104,7 +2124,7 @@ impl Program {
         if self.maybe_request_interrupt(
             state,
             pager.io.as_ref(),
-            state.metrics.vm_steps.saturating_sub(1),
+            state.vm_steps().saturating_sub(1),
         ) {
             return Ok(StepResult::Interrupt);
         }
@@ -2203,7 +2223,7 @@ impl Program {
             if self.maybe_request_interrupt(
                 state,
                 pager.io.as_ref(),
-                state.metrics.vm_steps.saturating_sub(1),
+                state.vm_steps().saturating_sub(1),
             ) {
                 return Ok(StepResult::Interrupt);
             }
@@ -2253,7 +2273,7 @@ impl Program {
         if self.maybe_request_interrupt(
             state,
             pager.io.as_ref(),
-            state.metrics.vm_steps.saturating_sub(1),
+            state.vm_steps().saturating_sub(1),
         ) {
             return Ok(StepResult::Interrupt);
         }
@@ -2417,9 +2437,6 @@ impl Program {
                     if TRACE {
                         program.trace_step(state, insn, enable_tracing, vdbe_trace);
                     }
-
-                    // Always increment VM steps for every loop iteration
-                    state.metrics.vm_steps = state.metrics.vm_steps.wrapping_add(1);
 
                     // The opcodes that run once per row of a scan are matched here
                     // so LLVM inlines them into the loop, and each one tests its
@@ -2619,7 +2636,12 @@ impl Program {
         } else {
             progress_ops
         };
+        state.metrics.vm_steps = state
+            .metrics
+            .vm_steps
+            .wrapping_add(state.steps_since_check());
         state.check_countdown = state.check_interval;
+        state.check_countdown_start = state.check_interval;
         if self.connection.is_closed() {
             return Some(ProgramStep::Error(self.closed_during_step(pager)));
         }
@@ -2642,7 +2664,7 @@ impl Program {
         state: &mut ProgramState,
         pager: &Arc<Pager>,
     ) -> Option<ProgramStep> {
-        let prev_steps = state.metrics.vm_steps.saturating_sub(state.check_interval);
+        let prev_steps = state.vm_steps().saturating_sub(state.check_interval);
         if self.maybe_request_interrupt(state, pager.io.as_ref(), prev_steps) {
             return self.interrupted_during_step(state, pager);
         }
