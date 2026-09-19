@@ -877,6 +877,13 @@ pub struct ProgramState {
     /// The interval the countdown was last reloaded with, re-derived from
     /// the progress handler's interval each time the check runs.
     check_interval: u64,
+    /// `check_countdown` when `metrics.vm_steps` was last brought up to
+    /// date. The dispatch loop counts its iterations in the countdown it
+    /// already decrements, so it does not also write a step counter.
+    countdown_at_vm_steps: u64,
+    /// Dispatched instructions that did not finish, because they suspended
+    /// for I/O or failed, plus whatever a status reset discounted.
+    insn_not_completed: u64,
     pub io_completions: Option<IOCompletions>,
     pub pc: InsnReference,
     pub(crate) cursors: Vec<Option<Cursor>>,
@@ -1048,6 +1055,8 @@ impl ProgramState {
         Self {
             check_countdown: 1,
             check_interval: MAX_CHECK_INTERVAL,
+            countdown_at_vm_steps: 1,
+            insn_not_completed: 0,
             io_completions: None,
             pc: 0,
             cursors,
@@ -1378,6 +1387,41 @@ impl ProgramState {
         cache.load()
     }
 
+    /// VM steps including the dispatch-loop iterations the countdown has
+    /// taken since `metrics.vm_steps` was last brought up to date.
+    #[inline]
+    pub(crate) fn vm_steps_now(&self) -> u64 {
+        self.metrics.vm_steps.wrapping_add(
+            self.countdown_at_vm_steps
+                .wrapping_sub(self.check_countdown),
+        )
+    }
+
+    /// Instructions that ran to completion.
+    #[inline]
+    pub(crate) fn insn_executed_now(&self) -> u64 {
+        self.metrics
+            .insn_executed
+            .wrapping_add(self.vm_steps_now())
+            .wrapping_sub(self.insn_not_completed)
+    }
+
+    /// Folds the iterations the countdown has taken into `metrics.vm_steps`.
+    #[inline]
+    pub(crate) fn settle_vm_steps(&mut self) {
+        self.metrics.vm_steps = self.vm_steps_now();
+        self.countdown_at_vm_steps = self.check_countdown;
+    }
+
+    /// Writes both derived counters into `metrics`, so a reader can take the
+    /// struct as it stands. Running it twice gives the same answer.
+    #[inline]
+    pub(crate) fn settle_metrics(&mut self) {
+        self.settle_vm_steps();
+        self.metrics.insn_executed = self.insn_executed_now();
+        self.insn_not_completed = self.metrics.vm_steps;
+    }
+
     #[inline]
     pub fn record_rows_read(&mut self, count: u64) {
         self.metrics.rows_read = self.metrics.rows_read.wrapping_add(count);
@@ -1421,7 +1465,8 @@ impl ProgramState {
 
     /// Runs `f` on the metrics of this statement including its active and
     /// cached subprograms, without copying them when there is no subprogram.
-    pub(crate) fn with_metrics<R>(&self, f: impl FnOnce(&StatementMetrics) -> R) -> R {
+    pub(crate) fn with_metrics<R>(&mut self, f: impl FnOnce(&StatementMetrics) -> R) -> R {
+        self.settle_metrics();
         let has_subprograms = matches!(
             self.active_op_state.program_ref(),
             Some(OpProgramState::Step { .. })
@@ -1435,6 +1480,8 @@ impl ProgramState {
 
     pub(crate) fn metrics(&self) -> StatementMetrics {
         let mut metrics = self.metrics.clone();
+        metrics.vm_steps = self.vm_steps_now();
+        metrics.insn_executed = self.insn_executed_now();
         if let Some(OpProgramState::Step { statement, .. }) = self.active_op_state.program_ref() {
             metrics.merge(&statement.metrics());
         }
@@ -1446,6 +1493,8 @@ impl ProgramState {
 
     pub(crate) fn reset_metrics(&mut self) {
         self.metrics.reset();
+        self.countdown_at_vm_steps = self.check_countdown;
+        self.insn_not_completed = 0;
         if let Some(OpProgramState::Step { statement, .. }) = self.active_op_state.program_mut() {
             statement.reset_metrics();
         }
@@ -1460,7 +1509,10 @@ impl ProgramState {
                 self.metrics.fullscan_steps = 0
             }
             crate::statement::StatementStatusCounter::Sort => self.metrics.sort_operations = 0,
-            crate::statement::StatementStatusCounter::VmStep => self.metrics.insn_executed = 0,
+            crate::statement::StatementStatusCounter::VmStep => {
+                self.metrics.insn_executed = 0;
+                self.insn_not_completed = self.vm_steps_now();
+            }
             crate::statement::StatementStatusCounter::Reprepare => self.metrics.reprepares = 0,
             crate::statement::StatementStatusCounter::RowsRead => self.metrics.rows_read = 0,
             crate::statement::StatementStatusCounter::RowsWritten => self.metrics.rows_written = 0,
@@ -2333,9 +2385,6 @@ impl Program {
                         program.trace_step(state, insn, enable_tracing, vdbe_trace);
                     }
 
-                    // Always increment VM steps for every loop iteration
-                    state.metrics.vm_steps = state.metrics.vm_steps.wrapping_add(1);
-
                     // The opcodes that run once per row of a scan are matched here
                     // so LLVM inlines them into the loop, and each one tests its
                     // own result right after its body, where the result is a
@@ -2345,16 +2394,8 @@ impl Program {
                     macro_rules! step_inline {
                         ($op:path) => {
                             match $op(program, state, insn, pager) {
-                                Ok(InsnFunctionStepResult::Step) => {
-                                    state.metrics.insn_executed =
-                                        state.metrics.insn_executed.wrapping_add(1);
-                                    continue;
-                                }
-                                Ok(InsnFunctionStepResult::Row) => {
-                                    state.metrics.insn_executed =
-                                        state.metrics.insn_executed.wrapping_add(1);
-                                    return ProgramStep::Row;
-                                }
+                                Ok(InsnFunctionStepResult::Step) => continue,
+                                Ok(InsnFunctionStepResult::Row) => return ProgramStep::Row,
                                 other => other,
                             }
                         };
@@ -2384,12 +2425,10 @@ impl Program {
                     // each; the rest settles out of line.
                     if let Ok(InsnFunctionStepResult::Step) = result {
                         // Instruction completed, moving to next
-                        state.metrics.insn_executed = state.metrics.insn_executed.wrapping_add(1);
                         continue;
                     }
                     if let Ok(InsnFunctionStepResult::Row) = result {
                         // Instruction completed (ResultRow already incremented PC)
-                        state.metrics.insn_executed = state.metrics.insn_executed.wrapping_add(1);
                         return ProgramStep::Row;
                     }
                     match dispatch_cold(program, state, pager, waker, result) {
@@ -2409,16 +2448,18 @@ impl Program {
             ) -> Option<ProgramStep> {
                 match result {
                     Ok(InsnFunctionStepResult::Done) => {
-                        // Instruction completed execution
-                        state.metrics.insn_executed = state.metrics.insn_executed.wrapping_add(1);
                         state.auto_txn_cleanup = TxnCleanup::None;
                         Some(ProgramStep::Done)
                     }
                     Ok(InsnFunctionStepResult::IO) => {
+                        state.insn_not_completed = state.insn_not_completed.wrapping_add(1);
                         let io = state.take_suspended_io();
                         program.park_on_io(state, io, waker)
                     }
-                    Err(boxed_err) => program.fail_step(state, pager, *boxed_err),
+                    Err(boxed_err) => {
+                        state.insn_not_completed = state.insn_not_completed.wrapping_add(1);
+                        program.fail_step(state, pager, *boxed_err)
+                    }
                     Ok(InsnFunctionStepResult::Step) | Ok(InsnFunctionStepResult::Row) => {
                         unreachable!("the dispatch loop settles steps and rows itself")
                     }
@@ -2531,6 +2572,7 @@ impl Program {
 
     #[inline(never)]
     fn periodic_checks(&self, state: &mut ProgramState, pager: &Arc<Pager>) -> Option<ProgramStep> {
+        state.settle_vm_steps();
         let progress_ops = self.connection.progress_ops();
         state.check_interval = if progress_ops == 0 || progress_ops >= MAX_CHECK_INTERVAL {
             MAX_CHECK_INTERVAL
@@ -2538,6 +2580,7 @@ impl Program {
             progress_ops
         };
         state.check_countdown = state.check_interval;
+        state.countdown_at_vm_steps = state.check_interval;
         if self.connection.is_closed() {
             return Some(ProgramStep::Error(self.closed_during_step(pager)));
         }
@@ -4143,6 +4186,70 @@ mod tests {
             assert!(matches!(stmt.step().unwrap(), StepResult::Interrupt));
             assert_eq!(stmt.execution_state(), ProgramExecutionState::Interrupted);
         }
+    }
+
+    #[test]
+    fn instruction_counters_hold_when_they_are_derived() {
+        use crate::statement::StatementStatusCounter;
+
+        let io = Arc::new(crate::MemoryIO::new());
+        let db =
+            crate::Database::open_file(io, ":memory:", Arc::new(crate::SqliteDialect)).unwrap();
+        let conn = db.connect().unwrap();
+        conn.execute("CREATE TABLE t(x)").unwrap();
+        conn.execute("INSERT INTO t VALUES (1),(2),(3)").unwrap();
+
+        let mut stmt = conn.prepare("SELECT x FROM t").unwrap();
+        stmt.run_ignore_rows().unwrap();
+        let after_one = stmt.metrics();
+        assert!(after_one.insn_executed > 0);
+        assert!(after_one.vm_steps >= after_one.insn_executed);
+
+        // A second run of the same program doubles the count of completed
+        // instructions, whatever I/O the first run had to wait for.
+        stmt.reset().unwrap();
+        stmt.run_ignore_rows().unwrap();
+        assert_eq!(stmt.metrics().insn_executed, after_one.insn_executed * 2);
+        assert_eq!(
+            stmt.stmt_status(StatementStatusCounter::VmStep),
+            after_one.insn_executed * 2
+        );
+
+        // Resetting the status counter zeroes it, and it counts again.
+        stmt.reset().unwrap();
+        stmt.reset_stmt_status(StatementStatusCounter::VmStep);
+        assert_eq!(stmt.stmt_status(StatementStatusCounter::VmStep), 0);
+        stmt.run_ignore_rows().unwrap();
+        assert_eq!(
+            stmt.stmt_status(StatementStatusCounter::VmStep),
+            after_one.insn_executed
+        );
+
+        stmt.reset_metrics();
+        assert_eq!(stmt.metrics().vm_steps, 0);
+        assert_eq!(stmt.metrics().insn_executed, 0);
+    }
+
+    #[test]
+    fn instruction_counters_hold_across_a_progress_check() {
+        use crate::statement::StatementStatusCounter;
+
+        let io = Arc::new(crate::MemoryIO::new());
+        let db =
+            crate::Database::open_file(io, ":memory:", Arc::new(crate::SqliteDialect)).unwrap();
+        let conn = db.connect().unwrap();
+        // A handler that never interrupts still reloads the countdown every
+        // few instructions, which is where the derived step count settles.
+        conn.set_progress_handler(4, Some(Box::new(|| false)));
+        let mut stmt = conn
+            .prepare("WITH RECURSIVE t(x) AS (VALUES(1) UNION ALL SELECT x+1 FROM t WHERE x<200) SELECT sum(x) FROM t")
+            .unwrap();
+        stmt.run_ignore_rows().unwrap();
+        let first = stmt.stmt_status(StatementStatusCounter::VmStep);
+        assert!(first > 200);
+        stmt.reset().unwrap();
+        stmt.run_ignore_rows().unwrap();
+        assert_eq!(stmt.stmt_status(StatementStatusCounter::VmStep), first * 2);
     }
 
     #[test]
