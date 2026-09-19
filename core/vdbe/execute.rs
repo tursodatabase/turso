@@ -1953,6 +1953,10 @@ pub enum OpColumnState {
     GetColumn,
 }
 
+// Not in test builds: inline(always) makes fn-item coercions produce
+// per-site copies in debug, breaking test_make_sure_correct_insn_table's
+// pointer-identity check.
+#[cfg_attr(not(test), inline(always))]
 pub fn op_column(
     program: &Program,
     state: &mut ProgramState,
