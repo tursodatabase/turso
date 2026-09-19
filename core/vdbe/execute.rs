@@ -2009,8 +2009,13 @@ pub fn op_column_range(
     if state.active_op_state.is_idle() && state.deferred_seeks[*cursor_id].is_none() {
         let result =
             op_column_range_fetch(program, state, *cursor_id, *start_column, *dest, defaults)?;
+        // Step is returned as a fresh constant, not as the value the fetch
+        // produced. The fetch merges its returns, so passing that value on
+        // hands the dispatch loop a phi, and the loop then cannot fold its own
+        // test of the result away.
         if matches!(result, InsnFunctionStepResult::Step) {
             state.pc += 1;
+            return Ok(InsnFunctionStepResult::Step);
         }
         return Ok(result);
     }
@@ -6152,6 +6157,7 @@ pub fn op_row_id(
         let result = op_row_id_read(state, *cursor_id, *dest)?;
         if matches!(result, InsnFunctionStepResult::Step) {
             state.pc += 1;
+            return Ok(InsnFunctionStepResult::Step);
         }
         return Ok(result);
     }
