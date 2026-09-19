@@ -3922,7 +3922,14 @@ fn skip_serial_types(header: &mut &[u8], data: &mut &[u8], n: usize) -> Result<(
 /// Reads the serial type at the front of `header` and moves past it.
 #[inline(always)]
 fn read_serial_type(header: &mut &[u8]) -> Result<u64> {
-    let (serial_type, rest) = split_varint(header)?;
+    let bytes = *header;
+    if let Some((first, rest)) = bytes.split_first() {
+        if *first < 0x80 {
+            *header = rest;
+            return Ok(u64::from(*first));
+        }
+    }
+    let (serial_type, rest) = split_varint(bytes)?;
     *header = rest;
     Ok(serial_type)
 }
@@ -4200,6 +4207,17 @@ mod tests {
             decode_one_text(&one_text_record(value.as_bytes()), &mut destination).unwrap();
             assert_eq!(register_text(&destination), value);
         }
+    }
+
+    #[test]
+    fn text_decode_reads_a_serial_type_that_needs_two_varint_bytes() {
+        let mut destination = Register::Value(Value::Null);
+        let value: Vec<u8> = (0..200usize).map(|i| b'a' + (i % 26) as u8).collect();
+        decode_one_text(&one_text_record(&value), &mut destination).unwrap();
+        assert_eq!(register_text(&destination).as_bytes(), value.as_slice());
+
+        decode_one_text(&one_text_record(b"short"), &mut destination).unwrap();
+        assert_eq!(register_text(&destination), "short");
     }
 
     #[test]
