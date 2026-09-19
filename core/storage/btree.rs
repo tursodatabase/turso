@@ -6435,9 +6435,13 @@ impl BTreeCursor {
         self.advance_gate = AdvanceGate::Unknown;
     }
 
+    /// The valid state comes first because it is one byte to test, while the
+    /// saved context is an Option whose empty value takes two instructions to
+    /// even name. A cursor in the middle of a scan is valid, so this stops at
+    /// the byte.
     #[inline]
     fn needs_restore(&self) -> bool {
-        self.context.is_some() && !matches!(self.valid_state, CursorValidState::Valid)
+        !matches!(self.valid_state, CursorValidState::Valid) && self.context.is_some()
     }
 
     /// If context is defined, restore it and set it None on success. Parallels
