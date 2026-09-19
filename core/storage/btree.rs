@@ -6241,14 +6241,26 @@ impl BTreeCursor {
             turso_assert!(page.is_loaded(), "page is not loaded", { "page_id": page.get().id() });
             match state {
                 OverwriteCellState::AllocatePayload => {
-                    let serial_types_len = record.column_count();
+                    // A cell holds a size varint, a rowid varint, at most a
+                    // left-child pointer, and as much of the record as fits on
+                    // the page; the rest goes to overflow pages. Asking the
+                    // record for its column count instead walked its whole
+                    // header for a number that is not a byte count, so the
+                    // reserve was far too small and cost 47 instructions per
+                    // row.
+                    const CELL_HEADER_MAX: usize = 4 + 9 + 9;
+                    let needed = record
+                        .get_payload()
+                        .len()
+                        .min(self.usable_space())
+                        .saturating_add(CELL_HEADER_MAX);
                     // Reuse the cell payload buffer to avoid allocations
                     let mut new_payload = take_vec(&mut self.reusable_cell_payload);
                     new_payload.clear();
-                    if new_payload.capacity() < serial_types_len {
+                    if new_payload.capacity() < needed {
                         crate::with_btree_allocation_site!(
                             CellPayload,
-                            new_payload.try_reserve(serial_types_len - new_payload.capacity())
+                            new_payload.try_reserve(needed - new_payload.capacity())
                         )?;
                     }
                     let rowid = return_if_io!(self.rowid());
