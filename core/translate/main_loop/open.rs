@@ -515,6 +515,7 @@ impl OpenLoop {
                         start_reg,
                         count_reg: query.arguments.len() + 1,
                         pc_if_empty: loop_end,
+                        count_target: None,
                     });
                     program.preassign_label_to_next_insn(loop_start);
                     if let Some(table_cursor_id) = table_cursor_id {

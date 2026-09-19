@@ -65,6 +65,10 @@ pub struct IndexMethodConfiguration {
 pub trait IndexMethodAttachment: std::fmt::Debug + Send + Sync {
     fn definition<'a>(&'a self) -> IndexMethodDefinition<'a>;
     fn init(&self) -> Result<Box<dyn IndexMethodCursor>>;
+
+    fn supports_query_count(&self, _pattern_idx: usize) -> bool {
+        false
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -579,6 +583,10 @@ pub trait IndexMethodCursor: Send {
     ///
     /// Returns false if query will produce no rows (similar to VFilter/Rewind op codes)
     fn query_start(&mut self, values: &[Register]) -> IOResultOr<bool>;
+
+    fn query_count(&mut self, _values: &[Register]) -> IOResultOr<i64> {
+        Err(LimboError::InternalError("index method does not support query counts".into()).into())
+    }
 
     /// Moves cursor to the next response row
     /// Returns false if query exhausted all rows

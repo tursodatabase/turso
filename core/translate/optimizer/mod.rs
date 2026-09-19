@@ -829,8 +829,24 @@ fn detect_simple_aggregate(plan: &SelectPlan) -> Option<SimpleAggregate> {
         && plan.where_clause.is_empty()
         && plan.offset.is_none();
 
+    let is_index_method_count = plan.table_references.outer_query_refs().is_empty()
+        && plan.non_from_clause_subqueries.is_empty()
+        && plan.window.is_none()
+        && plan.limit.is_none()
+        && plan.offset.is_none()
+        && plan.order_by.is_empty()
+        && matches!(plan.distinctness, super::plan::Distinctness::NonDistinct)
+        && plan.where_clause.len() == 1
+        && plan.where_clause[0].consumed
+        && matches!(&table_ref.op, Operation::IndexMethodQuery(query)
+            if query.arguments.iter().all(|arg| matches!(arg, Expr::Literal(_) | Expr::Variable(_)))
+                && query.index.index_method.as_ref().is_some_and(|attachment|
+                    attachment.supports_query_count(query.pattern_idx)));
+
     match agg.func {
-        AggFunc::Count0 if is_unfiltered_btree_count => Some(SimpleAggregate::Count),
+        AggFunc::Count0 if is_unfiltered_btree_count || is_index_method_count => {
+            Some(SimpleAggregate::Count)
+        }
         AggFunc::Count
             if is_unfiltered_btree_count
                 && matches!(agg.distinctness, super::plan::Distinctness::NonDistinct)
@@ -1081,6 +1097,10 @@ fn find_select_plan_form(
         plan.input_cardinality_hint.unwrap_or(1.0),
         cost_limit,
     )?;
+
+    if plan.simple_aggregate.is_none() {
+        plan.simple_aggregate = detect_simple_aggregate(plan);
+    }
 
     if matches!(plan.simple_aggregate, Some(SimpleAggregate::MinMax(_)))
         && !table_plan

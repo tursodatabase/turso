@@ -1792,14 +1792,14 @@ pub fn insn_to_row(
                 0,
                 "".to_string()
             ),
-            Insn::IndexMethodQuery { db, cursor_id, start_reg, .. } => (
+            Insn::IndexMethodQuery { db, cursor_id, start_reg, count_target, .. } => (
                 "IndexMethodQuery",
                 *db as i64,
                 *cursor_id as i64,
                 *start_reg as i64,
                 Value::build_text(""),
                 0,
-                "".to_string()
+                count_target.map_or_else(String::new, |reg| format!("count into r[{reg}]"))
             ),
             Insn::ClearBtree { db, root } => (
                 "ClearBtree",
