@@ -6704,14 +6704,14 @@ impl CursorTrait for BTreeCursor {
 
     #[inline(always)]
     fn next_row(&mut self) -> CursorStep {
-        if self.null_flag {
-            self.null_flag = false;
-            return CursorStep::Empty;
-        }
         if self.can_advance_within_leaf() {
             self.stack.advance();
             self.invalidate_record();
             return CursorStep::Row;
+        }
+        if self.null_flag {
+            self.null_flag = false;
+            return CursorStep::Empty;
         }
         match self.next() {
             Ok(IOResult::IO(io)) => CursorStep::IO(io),
@@ -7374,6 +7374,9 @@ impl CursorTrait for BTreeCursor {
     /// for each left-side row. In order to achieve this, we set the null flag on the right-side table cursor
     /// so that it returns NULL for all columns until cleared.
     fn set_null_flag(&mut self, flag: bool) {
+        if flag {
+            self.advance_gate = AdvanceGate::Unknown;
+        }
         self.null_flag = flag;
     }
 
@@ -7903,7 +7906,8 @@ impl BTreeCursor {
     /// its state machine. Every pending flag routes to the full path,
     /// which owns its handling: `skip_advance` (restore landed on the
     /// iteration target; advancing would skip a row), an abandoned
-    /// overflow read, and an in-flight spill descent.
+    /// overflow read, an in-flight spill descent, and a null row, whose
+    /// next step is to stop rather than to move.
     #[inline(always)]
     fn can_advance_within_leaf(&mut self) -> bool {
         if self.has_pending_advance_state() {
@@ -7962,6 +7966,7 @@ impl BTreeCursor {
     fn compute_advance_blocked(&self) -> bool {
         !matches!(self.advance_state, AdvanceState::Start)
             || !matches!(self.valid_state, CursorValidState::Valid)
+            || self.null_flag
             || self.skip_advance
             || !self.has_record
             || self.read_overflow_state.is_some()
@@ -11663,6 +11668,22 @@ mod tests {
         let result = cursor.record()?;
         assert!(matches!(result, IOResult::Done(record) if record.is_none()));
         Ok(())
+    }
+
+    #[test]
+    fn null_row_stops_a_cursor_whose_advance_gate_reads_open() {
+        let (pager, root_page, _db, _conn) = empty_btree();
+        let mut cursor = BTreeCursor::new_table(pager.clone(), root_page, 1);
+        for rowid in 1..=4 {
+            insert_record(&mut cursor, &pager, rowid, Value::from_i64(rowid)).unwrap();
+        }
+        run_until_done(|| cursor.rewind(), &pager).unwrap();
+        assert!(matches!(cursor.next_row(), CursorStep::Row));
+        assert_eq!(cursor.advance_gate, AdvanceGate::Open);
+
+        cursor.set_null_flag(true);
+        assert!(matches!(cursor.next_row(), CursorStep::Empty));
+        assert_eq!(run_until_done(|| cursor.rowid(), &pager).unwrap(), Some(2));
     }
 
     #[test]
