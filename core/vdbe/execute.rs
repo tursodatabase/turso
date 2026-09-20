@@ -10205,7 +10205,7 @@ pub fn op_function(
                 } else {
                     let pattern_cow = match pattern_value {
                         Value::Text(s) => std::borrow::Cow::Borrowed(s.as_str()),
-                        v => match v.exec_cast("TEXT")? {
+                        v => match v.exec_cast_to(Affinity::Text)? {
                             Value::Text(s) => std::borrow::Cow::Owned(s.to_string()),
                             _ => unreachable!("Cast to TEXT should yield Text"),
                         },
@@ -10213,7 +10213,7 @@ pub fn op_function(
 
                     let match_cow = match match_value {
                         Value::Text(s) => std::borrow::Cow::Borrowed(s.as_str()),
-                        v => match v.exec_cast("TEXT")? {
+                        v => match v.exec_cast_to(Affinity::Text)? {
                             Value::Text(s) => std::borrow::Cow::Owned(s.to_string()),
                             _ => unreachable!("Cast to TEXT should yield Text"),
                         },
@@ -10260,7 +10260,7 @@ pub fn op_function(
                             _ => {
                                 let escape_cow = match escape_value {
                                     Value::Text(s) => std::borrow::Cow::Borrowed(s.as_str()),
-                                    v => match v.exec_cast("TEXT")? {
+                                    v => match v.exec_cast_to(Affinity::Text)? {
                                         Value::Text(s) => std::borrow::Cow::Owned(s.to_string()),
                                         _ => unreachable!("Cast to TEXT should yield Text"),
                                     },
@@ -12329,14 +12329,14 @@ fn exec_like_converted(
 ) -> Result<bool> {
     let pattern_cow = match pattern_value {
         Value::Text(s) => std::borrow::Cow::Borrowed(s.as_str()),
-        v => match v.exec_cast("TEXT")? {
+        v => match v.exec_cast_to(Affinity::Text)? {
             Value::Text(s) => std::borrow::Cow::Owned(s.to_string()),
             _ => unreachable!("Cast to TEXT should yield Text"),
         },
     };
     let match_cow = match match_value {
         Value::Text(s) => std::borrow::Cow::Borrowed(s.as_str()),
-        v => match v.exec_cast("TEXT")? {
+        v => match v.exec_cast_to(Affinity::Text)? {
             Value::Text(s) => std::borrow::Cow::Owned(s.to_string()),
             _ => unreachable!("Cast to TEXT should yield Text"),
         },
@@ -16910,7 +16910,7 @@ pub fn op_cast(
     let value = state.registers[*reg].get_value().clone();
     let result = match affinity {
         Affinity::Blob | Affinity::None => value.exec_cast("BLOB"),
-        Affinity::Text => value.exec_cast("TEXT"),
+        Affinity::Text => value.exec_cast_to(Affinity::Text),
         Affinity::Numeric => value.exec_cast("NUMERIC"),
         Affinity::Integer => value.exec_cast("INTEGER"),
         Affinity::Real => value.exec_cast("REAL"),

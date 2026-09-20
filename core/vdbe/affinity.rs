@@ -837,4 +837,12 @@ mod tests {
 
         assert_eq!(Affinity::from_repr(0), None);
     }
+
+    /// The scalar functions pass these affinities to `Value::exec_cast_to`
+    /// where they used to pass the type names beside them to `exec_cast`.
+    #[test]
+    fn the_type_names_the_scalar_functions_cast_to_keep_their_affinities() {
+        assert_eq!(Affinity::affinity("INT"), Affinity::Integer);
+        assert_eq!(Affinity::affinity("TEXT"), Affinity::Text);
+    }
 }
