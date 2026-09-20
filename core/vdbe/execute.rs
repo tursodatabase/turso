@@ -4200,14 +4200,19 @@ pub(crate) fn index_method_abort_statement_all(state: &mut ProgramState) {
 }
 
 /// Publish safe in-memory state after a durable autocommit outcome.
+#[inline]
 pub(crate) fn index_method_on_transaction_committed_all(
     state: &mut ProgramState,
     connection: &Connection,
 ) {
-    if !has_index_method_work(state) {
-        connection.index_methods_on_transaction_committed();
-        return;
+    if has_index_method_work(state) {
+        publish_committed_index_method_state(state);
     }
+    connection.index_methods_on_transaction_committed();
+}
+
+#[inline(never)]
+fn publish_committed_index_method_state(state: &mut ProgramState) {
     tracing::trace!(
         open_cursors = state
             .cursors
@@ -4239,7 +4244,6 @@ pub(crate) fn index_method_on_transaction_committed_all(
     for statement in state.subprogram_stmt_cache.values_mut() {
         statement.commit_index_methods();
     }
-    connection.index_methods_on_transaction_committed();
 }
 
 /// Transfer the final prepared cursor for every attachment touched by this

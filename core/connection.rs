@@ -5201,7 +5201,16 @@ impl Connection {
         entries
     }
 
+    #[inline]
     pub(crate) fn index_methods_on_transaction_committed(&self) {
+        if !self.has_index_method_tx_cursors.load(Ordering::Acquire) {
+            return;
+        }
+        self.publish_index_method_transaction_cursors();
+    }
+
+    #[inline(never)]
+    fn publish_index_method_transaction_cursors(&self) {
         let entries = self.take_index_method_transaction_cursors();
         tracing::trace!(
             attachments = entries.len(),
