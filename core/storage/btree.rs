@@ -3213,11 +3213,18 @@ impl BTreeCursor {
                             if header.rowid == bkey.to_rowid() {
                                 tracing::debug!("TableLeafCell: found exact match with cell_idx={cell_idx}, overwriting");
                                 self.flags.has_record = true;
-                                *write_state = WriteState::Overwrite {
-                                    page,
-                                    cell_idx,
-                                    state: Some(OverwriteCellState::AllocatePayload),
-                                };
+                                // `WriteState::Start` owns nothing, so forget
+                                // it rather than run the enum's drop glue over
+                                // it, the same way the insert transition below
+                                // already does.
+                                std::mem::forget(std::mem::replace(
+                                    write_state,
+                                    WriteState::Overwrite {
+                                        page,
+                                        cell_idx,
+                                        state: Some(OverwriteCellState::AllocatePayload),
+                                    },
+                                ));
                                 continue;
                             }
                         } else {
@@ -3241,11 +3248,18 @@ impl BTreeCursor {
                                 let CursorState::Write(write_state) = &mut self.state else {
                                     panic!("expected write state");
                                 };
-                                *write_state = WriteState::Overwrite {
-                                    page,
-                                    cell_idx,
-                                    state: Some(OverwriteCellState::AllocatePayload),
-                                };
+                                // `WriteState::Start` owns nothing, so forget
+                                // it rather than run the enum's drop glue over
+                                // it, the same way the insert transition below
+                                // already does.
+                                std::mem::forget(std::mem::replace(
+                                    write_state,
+                                    WriteState::Overwrite {
+                                        page,
+                                        cell_idx,
+                                        state: Some(OverwriteCellState::AllocatePayload),
+                                    },
+                                ));
                                 continue;
                             }
                             turso_assert!(
