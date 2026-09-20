@@ -48,12 +48,12 @@ use super::btree::{
     btree_init_page, payload_overflow_threshold_max, payload_overflow_threshold_min, PayloadLimits,
 };
 use super::page_cache::{CacheError, CacheResizeResult, PageCache, PageCacheKey, SpillResult};
-use super::sqlite3_ondisk::read_varint;
 use super::sqlite3_ondisk::{
     begin_write_btree_page, read_btree_cell, read_u32, BTreeCell, FREELIST_LEAF_PTR_SIZE,
     FREELIST_TRUNK_OFFSET_FIRST_LEAF_PTR, FREELIST_TRUNK_OFFSET_LEAF_COUNT,
     FREELIST_TRUNK_OFFSET_NEXT_TRUNK_PTR, SUBJOURNAL_RECORD_HEADER_SIZE,
 };
+use super::sqlite3_ondisk::{read_varint, read_varint_advance};
 use super::wal::{CheckpointMode, WalAutoActions};
 use crate::storage::encryption::{CipherMode, EncryptionContext, EncryptionKey};
 
@@ -611,24 +611,22 @@ impl PageInner {
     pub fn cell_table_leaf_read_header(&self, idx: usize) -> crate::Result<TableLeafCellHeader> {
         turso_debug_assert!(matches!(self.page_type(), Ok(PageType::TableLeaf)));
         let buf = self.as_ptr();
-        let cell_pointer_array_start = LEAF_PAGE_HEADER_SIZE_BYTES;
-        let cell_pointer = cell_pointer_array_start + (idx * CELL_PTR_SIZE_BYTES);
+        let pointer_slot =
+            self.offset() + LEAF_PAGE_HEADER_SIZE_BYTES + (idx * CELL_PTR_SIZE_BYTES);
         // Bound-check the array entry: `idx` is the untrusted on-disk cell count.
         crate::assert_or_bail_corrupt!(
-            self.offset() + cell_pointer + CELL_PTR_SIZE_BYTES <= buf.len(),
+            pointer_slot + CELL_PTR_SIZE_BYTES <= buf.len(),
             "cell pointer array index {} out of bounds for page size {}",
             idx,
             buf.len()
         );
-        let cell_pointer = self.read_u16(cell_pointer) as usize;
-        let mut pos = cell_pointer;
-        let (payload_size, nr) = read_varint(crate::slice_in_bounds_or_corrupt!(buf, pos..))?;
-        pos += nr;
-        let (rowid, nr) = read_varint(crate::slice_in_bounds_or_corrupt!(buf, pos..))?;
-        pos += nr;
+        let cell_start = u16::from_be_bytes([buf[pointer_slot], buf[pointer_slot + 1]]) as usize;
+        let mut cell = crate::slice_in_bounds_or_corrupt!(buf, cell_start..);
+        let payload_size = read_varint_advance(&mut cell)?;
+        let rowid = read_varint_advance(&mut cell)?;
         Ok(TableLeafCellHeader {
             rowid: rowid as i64,
-            payload_start: pos,
+            payload_start: buf.len() - cell.len(),
             payload_size,
         })
     }

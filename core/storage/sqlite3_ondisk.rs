@@ -1361,6 +1361,30 @@ pub fn read_integer(buf: &[u8], serial_type: u8) -> Result<i64> {
     }
 }
 
+/// Reads the varint at the front of `buf` and moves `buf` past it.
+///
+/// The one- and two-byte forms take the rest of the buffer straight out of the
+/// slice pattern. [`read_varint`] hands back a length instead, and stepping a
+/// slice by a length the compiler cannot bound costs a check at every call.
+#[inline(always)]
+pub fn read_varint_advance(buf: &mut &[u8]) -> Result<u64> {
+    if let [first, rest @ ..] = *buf {
+        if *first < 0x80 {
+            *buf = rest;
+            return Ok(*first as u64);
+        }
+        if let [second, rest @ ..] = rest {
+            if *second < 0x80 {
+                *buf = rest;
+                return Ok((((*first & 0x7f) as u64) << 7) | *second as u64);
+            }
+        }
+    }
+    let (value, length) = read_varint(buf)?;
+    *buf = &buf[length..];
+    Ok(value)
+}
+
 /// Reads varint integer from the buffer.
 /// This function is similar to `sqlite3GetVarint32`
 #[inline(always)]
@@ -2582,6 +2606,41 @@ mod tests {
     #[case(&[0x80; 9])] // bits set without end
     fn test_read_varint_malformed_inputs(#[case] buf: &[u8]) {
         assert!(read_varint(buf).is_err());
+    }
+
+    /// `read_varint_advance` has its own decoder for the one- and two-byte
+    /// forms, so it must read the same value and step the same distance as
+    /// `read_varint` on every input.
+    #[test]
+    fn read_varint_advance_agrees_with_read_varint() {
+        let mut checked = 0;
+        for width in 0..=10usize {
+            for pattern in [0x00u8, 0x01, 0x7f, 0x80, 0x81, 0xff] {
+                for last in [0x00u8, 0x01, 0x40, 0x7f, 0x80, 0xff] {
+                    let mut buf = vec![pattern; width];
+                    if let Some(byte) = buf.last_mut() {
+                        *byte = last;
+                    }
+                    let mut rest: &[u8] = &buf;
+                    match read_varint(&buf) {
+                        Ok((value, length)) => {
+                            assert_eq!(
+                                read_varint_advance(&mut rest).unwrap(),
+                                value,
+                                "disagreed on {buf:02x?}"
+                            );
+                            assert_eq!(rest, &buf[length..], "stepped wrong on {buf:02x?}");
+                        }
+                        Err(_) => assert!(
+                            read_varint_advance(&mut rest).is_err(),
+                            "accepted {buf:02x?}"
+                        ),
+                    }
+                    checked += 1;
+                }
+            }
+        }
+        assert_eq!(checked, 11 * 6 * 6);
     }
 
     /// `read_varint_len` exists only to skip a varint faster than reading it,

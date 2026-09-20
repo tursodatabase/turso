@@ -90,7 +90,6 @@ use execute::{
 use turso_parser::ast::{EqpFormat, ResolveType};
 
 use crate::io::TempFile;
-use crate::storage::sqlite3_ondisk::read_varint;
 use crate::vdbe::bloom_filter::BloomFilter;
 use crate::vdbe::rowset::RowSet;
 use explain::{
@@ -4112,9 +4111,7 @@ fn skip_serial_types(header: &mut &[u8], data: &mut &[u8], n: usize) -> Result<(
 /// Reads the serial type at the front of `header` and moves past it.
 #[inline(always)]
 fn read_serial_type(header: &mut &[u8]) -> Result<u64> {
-    let (serial_type, bytes_read) = read_varint(header)?;
-    *header = &header[bytes_read..];
-    Ok(serial_type)
+    crate::storage::sqlite3_ondisk::read_varint_advance(header)
 }
 
 /// Decodes the value of `serial_type` at the front of `data` into `dest`
