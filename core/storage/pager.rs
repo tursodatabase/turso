@@ -1524,6 +1524,67 @@ impl Savepoint {
 /// The pager interface implements the persistence layer by providing access
 /// to pages of the database file, including caching, concurrency control, and
 /// transaction management.
+/// The pages a write transaction has changed, naturally sorted by page
+/// number, and the page `add` put in last.
+///
+/// A write transaction writes the same page many times in a row — a
+/// 10,000-row UPDATE marks about 150 distinct pages 25,000 times — and the
+/// bitmap insert is the same work on every one of those after the first.
+/// The bitmap is private, so the only three ways to change the set all keep
+/// `last_added` true: it names a page the set holds, or no page at all.
+struct DirtyPages {
+    pages: RoaringBitmap,
+    last_added: Option<u32>,
+}
+
+impl DirtyPages {
+    fn new() -> Self {
+        Self {
+            pages: RoaringBitmap::new(),
+            last_added: None,
+        }
+    }
+
+    fn add(&mut self, page_id: u32) {
+        if self.last_added == Some(page_id) {
+            turso_debug_assert!(
+                self.pages.contains(page_id),
+                "the page added last is not in the dirty set"
+            );
+            return;
+        }
+        self.pages.insert(page_id);
+        self.last_added = Some(page_id);
+    }
+
+    fn clear(&mut self) {
+        self.pages.clear();
+        self.last_added = None;
+    }
+
+    fn remove_from(&mut self, first_page_id: u32) {
+        self.pages.remove_range(first_page_id..);
+        self.last_added = None;
+    }
+
+    #[cfg(test)]
+    fn contains(&self, page_id: u32) -> bool {
+        self.pages.contains(page_id)
+    }
+
+    fn is_empty(&self) -> bool {
+        self.pages.is_empty()
+    }
+
+    fn len(&self) -> u64 {
+        self.pages.len()
+    }
+
+    fn iter(&self) -> roaring::bitmap::Iter<'_> {
+        self.pages.iter()
+    }
+}
+
 pub struct Pager {
     /// Source of the database pages.
     pub db_file: Arc<dyn DatabaseStorage>,
@@ -1550,7 +1611,7 @@ pub struct Pager {
     #[cfg(test)]
     spill_yield: SpillYieldHook,
     /// Dirty pages as a bitmap, naturally sorted by page number.
-    dirty_pages: Arc<RwLock<RoaringBitmap>>,
+    dirty_pages: Arc<RwLock<DirtyPages>>,
     subjournal: RwLock<Option<Subjournal>>,
     /// True once `subjournal` holds a file. It is set under the same write
     /// lock that installs it and never cleared, so a write that reads false
@@ -1865,7 +1926,7 @@ impl Pager {
             has_pending_reads: AtomicBool::new(false),
             #[cfg(test)]
             spill_yield: SpillYieldHook::new(),
-            dirty_pages: Arc::new(RwLock::new(RoaringBitmap::new())),
+            dirty_pages: Arc::new(RwLock::new(DirtyPages::new())),
             subjournal: RwLock::new(None),
             has_subjournal: AtomicBool::new(false),
             savepoints: Arc::new(RwLock::new(Vec::new())),
@@ -2519,7 +2580,7 @@ impl Pager {
             // eviction cannot drop uncommitted changes that predate the
             // rolled-back savepoint/statement.
             page.set_dirty();
-            dirty_pages.insert(page_id);
+            dirty_pages.add(page_id);
             self.force_upsert_page_in_cache(page_id as usize, page)?;
         }
 
@@ -2541,7 +2602,7 @@ impl Pager {
                     page.try_unpin();
                 }
             }
-            dirty_pages.remove_range((db_size + 1)..);
+            dirty_pages.remove_from(db_size + 1);
             cache.truncate(db_size as usize)?;
         }
 
@@ -3831,7 +3892,7 @@ impl Pager {
         );
         self.subjournal_page_if_required(page)?;
         let mut dirty_pages = self.dirty_pages.write();
-        dirty_pages.insert(page.get().id() as u32);
+        dirty_pages.add(page.get().id() as u32);
         // Notify cache before marking dirty (page was evictable, now it won't be)
         // Only notify if page wasn't already dirty, or if it was spilled
         // State before set_dirty():
@@ -6457,8 +6518,44 @@ mod tests {
     use crate::util::IOExt;
     use arc_swap::ArcSwapOption;
 
-    use super::{default_page1, CacheFlushState, CollectingState, Page, PageRef, Pager};
+    use super::{
+        default_page1, CacheFlushState, CollectingState, DirtyPages, Page, PageRef, Pager,
+    };
     use crate::{Buffer, Completion, CompletionError, LimboError};
+
+    #[test]
+    fn clearing_the_dirty_set_takes_its_last_page_again() {
+        let mut dirty = DirtyPages::new();
+        dirty.add(7);
+        dirty.add(7);
+        assert!(dirty.contains(7));
+
+        dirty.clear();
+        assert!(!dirty.contains(7));
+        dirty.add(7);
+        assert!(
+            dirty.contains(7),
+            "clearing the set has to forget the page added last, or the next \
+             write to that page never reaches the commit"
+        );
+    }
+
+    #[test]
+    fn removing_the_tail_of_the_dirty_set_takes_its_last_page_again() {
+        let mut dirty = DirtyPages::new();
+        dirty.add(3);
+        dirty.add(9);
+
+        dirty.remove_from(5);
+        assert!(dirty.contains(3));
+        assert!(!dirty.contains(9));
+        dirty.add(9);
+        assert!(
+            dirty.contains(9),
+            "removing the tail has to forget the page added last, or the next \
+             write to that page never reaches the commit"
+        );
+    }
 
     #[test]
     fn page_id_changes_keep_header_access_at_the_correct_offset() {
