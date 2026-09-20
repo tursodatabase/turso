@@ -1682,6 +1682,12 @@ pub struct Pager {
     /// Set after the file is stored, and read with the matching ordering, so a
     /// true read sees the file too.
     subjournal_is_open: AtomicBool,
+    /// A page the current savepoint stack needs no subjournal record for, or 0
+    /// for none. A statement writes many rows to one page, and asking the stack
+    /// again for each of them takes its read lock: two locked read-modify-writes
+    /// per row written, to reach an answer that cannot have changed. Every
+    /// change to the stack clears this, so a remembered page is never stale.
+    subjournal_needs_no_record_for_page: AtomicU32,
     savepoints: Arc<RwLock<Vec<Savepoint>>>,
     commit_info: RwLock<CommitInfo>,
     checkpoint_state: RwLock<CheckpointState>,
@@ -1994,6 +2000,7 @@ impl Pager {
             dirty_set_epoch: AtomicU64::new(next_dirty_set_epoch()),
             subjournal: RwLock::new(None),
             subjournal_is_open: AtomicBool::new(false),
+            subjournal_needs_no_record_for_page: AtomicU32::new(0),
             savepoints: Arc::new(RwLock::new(Vec::new())),
             commit_info: RwLock::new(CommitInfo {
                 group: None,
@@ -2275,6 +2282,21 @@ impl Pager {
             );
             return Ok(());
         }
+        let page_id_u32 = page.get().id() as u32;
+        if self
+            .subjournal_needs_no_record_for_page
+            .load(Ordering::Acquire)
+            == page_id_u32
+        {
+            turso_debug_assert!(
+                self.savepoints.read().last().is_some_and(|savepoint| {
+                    page_id_u32 > savepoint.db_size.load(Ordering::Acquire)
+                        || savepoint.has_dirty_page(page_id_u32)
+                }),
+                "page {page_id_u32} was remembered as needing no subjournal record, but the current savepoint wants one"
+            );
+            return Ok(());
+        }
         let write_offset = {
             let savepoints = self.savepoints.read();
             let Some(cur_savepoint) = savepoints.last() else {
@@ -2284,11 +2306,15 @@ impl Pager {
             // New pages (allocated during this statement) can be "rolled back" by simply
             // truncating back to the original db_size. This matches SQLite's subjRequiresPage()
             // which checks: p->nOrig >= pgno.
-            let page_id_u32 = page.get().id() as u32;
+            // Both answers hold until the savepoint stack changes: a page
+            // beyond the size the savepoint opened at stays beyond it, and a
+            // savepoint's set of subjournalled pages only grows.
             if page_id_u32 > cur_savepoint.db_size.load(Ordering::Acquire) {
+                self.remember_page_needs_no_subjournal_record(page_id_u32);
                 return Ok(());
             }
             if cur_savepoint.has_dirty_page(page_id_u32) {
+                self.remember_page_needs_no_subjournal_record(page_id_u32);
                 return Ok(());
             }
             cur_savepoint.write_offset.load(Ordering::SeqCst)
@@ -2347,6 +2373,20 @@ impl Pager {
         Ok(())
     }
 
+    fn remember_page_needs_no_subjournal_record(&self, page_id: u32) {
+        self.subjournal_needs_no_record_for_page
+            .store(page_id, Ordering::Release);
+    }
+
+    /// Take the savepoint stack for writing. Every change to the stack goes
+    /// through here, so the page remembered as needing no subjournal record
+    /// cannot outlive the stack it was remembered under.
+    fn savepoints_write(&self) -> crate::sync::RwLockWriteGuard<'_, Vec<Savepoint>> {
+        self.subjournal_needs_no_record_for_page
+            .store(0, Ordering::Release);
+        self.savepoints.write()
+    }
+
     /// try to "acquire" ownership on the subjournal of the connection-scoped pager
     /// if another statement owns the subjournal - return Busy error and let the caller retry attempt later
     pub fn try_use_subjournal(&self) -> Result<()> {
@@ -2378,7 +2418,7 @@ impl Pager {
 
     /// Release i.e. commit the current savepoint. This basically just means removing it.
     pub fn release_savepoint(&self) -> Result<()> {
-        let mut savepoints = self.savepoints.write();
+        let mut savepoints = self.savepoints_write();
         if !matches!(
             savepoints.last().map(|savepoint| &savepoint.kind),
             Some(SavepointKind::Statement)
@@ -2422,7 +2462,7 @@ impl Pager {
 
     /// Releases the newest matching named savepoint and all nested savepoints opened after it.
     pub fn release_named_savepoint(&self, name: &str) -> Result<SavepointResult> {
-        let mut savepoints = self.savepoints.write();
+        let mut savepoints = self.savepoints_write();
         let Some(target_idx) = savepoints.iter().rposition(|savepoint| {
             matches!(
                 savepoint.kind,
@@ -2474,7 +2514,7 @@ impl Pager {
     }
 
     pub fn clear_savepoints(&self) -> Result<()> {
-        *self.savepoints.write() = Vec::new();
+        *self.savepoints_write() = Vec::new();
         let subjournal = self.subjournal.read();
         let Some(subjournal) = subjournal.as_ref() else {
             return Ok(());
@@ -2487,7 +2527,7 @@ impl Pager {
     /// Rollback to the newest savepoint. This basically just means reading the subjournal from the start offset
     /// of the savepoint to the end of the subjournal and restoring the page images to the page cache.
     pub fn rollback_to_newest_savepoint(&self) -> Result<bool> {
-        let mut savepoints = self.savepoints.write();
+        let mut savepoints = self.savepoints_write();
         if !matches!(
             savepoints.last().map(|savepoint| &savepoint.kind),
             Some(SavepointKind::Statement)
@@ -2537,7 +2577,7 @@ impl Pager {
 
         self.rollback_to_snapshot(&target.1, target.2)?;
 
-        let mut savepoints = self.savepoints.write();
+        let mut savepoints = self.savepoints_write();
         let deferred_fk_violations = target.1.deferred_fk_violations;
         savepoints.truncate(target.0);
         if let Some(parent) = savepoints.last() {
@@ -2576,7 +2616,7 @@ impl Pager {
             wal_pos,
             deferred_fk_violations,
         );
-        self.savepoints.write().push(savepoint);
+        self.savepoints_write().push(savepoint);
         Ok(())
     }
 
