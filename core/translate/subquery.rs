@@ -1440,13 +1440,6 @@ pub fn emit_from_clause_subqueries(
         }
     }
 
-    // Build lookup from table index to is_outer for LEFT-JOIN annotations
-    let outer_table_set: TableMask = join_order
-        .iter()
-        .filter(|m| m.is_outer)
-        .map(|m| m.original_idx)
-        .try_collect()?;
-
     for table_index in visit_order {
         let table_reference = &mut tables.joined_tables_mut()[table_index];
         let execution_mode = match &table_reference.table {
@@ -1458,19 +1451,16 @@ pub fn emit_from_clause_subqueries(
             }
             _ => None,
         };
-        let eqp_subquery = eqp_subquery_info(program, table_reference, execution_mode.as_ref());
-        emit_explain!(
-            program,
-            true,
+        emit_explain!(program, true, {
+            let in_outer_join_order = join_order
+                .iter()
+                .any(|member| member.original_idx == table_index && member.is_outer);
             eqp_detail_for_table_op(
                 table_reference,
-                EqpJoin::from_join_info(
-                    table_reference.join_info.as_ref(),
-                    outer_table_set.get(table_index),
-                ),
-                eqp_subquery,
+                EqpJoin::from_join_info(table_reference.join_info.as_ref(), in_outer_join_order),
+                eqp_subquery_info(program, table_reference, execution_mode.as_ref()),
             )
-        );
+        });
 
         if let Table::FromClauseSubquery(from_clause_subquery) = &mut table_reference.table {
             let execution_mode =
@@ -1917,7 +1907,6 @@ pub fn emit_non_from_clause_subquery(
     preserve_outer_expr_cache: bool,
 ) -> Result<()> {
     program.nested(|program| {
-        let subquery_id = program.next_subquery_eqp_id();
         match query_type {
             SubqueryType::Exists { .. } => {
                 // EXISTS subqueries don't get a separate EQP annotation in SQLite;
@@ -1928,7 +1917,7 @@ pub fn emit_non_from_clause_subquery(
                     program,
                     true,
                     EqpDetail::ListSubquery {
-                        id: subquery_id,
+                        id: program.next_subquery_eqp_id(),
                         correlated: is_correlated,
                     }
                 );
@@ -1938,7 +1927,7 @@ pub fn emit_non_from_clause_subquery(
                     program,
                     true,
                     EqpDetail::ScalarSubquery {
-                        id: subquery_id,
+                        id: program.next_subquery_eqp_id(),
                         correlated: is_correlated,
                     }
                 );
