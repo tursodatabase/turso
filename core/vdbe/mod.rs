@@ -1346,12 +1346,12 @@ impl ProgramState {
     }
 
     pub(crate) fn record_statement_change(&self) {
-        self.n_change.fetch_add(1, Ordering::SeqCst);
-        self.n_total_change.fetch_add(1, Ordering::SeqCst);
+        bump_change_count(&self.n_change);
+        bump_change_count(&self.n_total_change);
     }
 
     pub(crate) fn record_total_change(&self) {
-        self.n_total_change.fetch_add(1, Ordering::SeqCst);
+        bump_change_count(&self.n_total_change);
     }
 
     /// Whether this statement may finish the implicit autocommit transaction
@@ -3836,6 +3836,17 @@ impl Deref for Program {
     fn deref(&self) -> &PreparedProgram {
         &self.prepared
     }
+}
+
+/// Add one to a row-change count.
+///
+/// The count is atomic so that another thread can read it while the statement
+/// that owns it runs, not so that two threads can raise it: one thread steps a
+/// statement at a time. A load and a store are enough, where `fetch_add` was a
+/// locked read-modify-write for every row a statement changed.
+#[inline(always)]
+fn bump_change_count(count: &AtomicI64) {
+    count.store(count.load(Ordering::Relaxed) + 1, Ordering::Relaxed);
 }
 
 /// Split a register slice into an immutable ref and a mutable ref at two distinct indices.
