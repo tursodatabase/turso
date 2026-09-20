@@ -214,6 +214,51 @@ pub fn expr_references_any_subquery(expr: &ast::Expr) -> bool {
     found
 }
 
+/// Whether an expression reaches a row of the enclosing query through a subquery.
+///
+/// [`expr_references_outer_query`] stops at a subquery boundary, so an
+/// enclosing-query column wrapped in one is invisible to it. A subquery that
+/// cannot be resolved here, or whose plan has already been consumed without a
+/// cached reference list, counts as reaching the enclosing query, so an
+/// unreadable subquery is never read as safe.
+///
+/// Blind spot: this answers only for the expression it is handed. A caller that
+/// checks some filters and not others still falls through to allow on the ones
+/// it skipped.
+pub fn expr_reads_outer_query_through_subquery(
+    expr: &ast::Expr,
+    subqueries: &[crate::translate::plan::NonFromClauseSubquery],
+    table_references: &TableReferences,
+) -> bool {
+    use crate::translate::plan::SubqueryState;
+    let mut reads_outer_query = false;
+    let _ = walk_expr(expr, &mut |expr: &ast::Expr| -> Result<WalkControl> {
+        let ast::Expr::SubqueryResult { subquery_id, .. } = expr else {
+            return Ok(WalkControl::Continue);
+        };
+        let subquery = subqueries
+            .iter()
+            .find(|subquery| subquery.internal_id == *subquery_id);
+        let outer_ref_ids = match subquery.map(|subquery| &subquery.state) {
+            Some(SubqueryState::Unevaluated { plan: Some(plan) }) => {
+                plan.used_outer_query_ref_ids()
+            }
+            Some(SubqueryState::Evaluated { outer_ref_ids, .. }) => outer_ref_ids.clone(),
+            _ => {
+                reads_outer_query = true;
+                return Ok(WalkControl::Continue);
+            }
+        };
+        reads_outer_query |= outer_ref_ids.iter().any(|table_id| {
+            table_references
+                .find_outer_query_ref_by_internal_id(*table_id)
+                .is_some()
+        });
+        Ok(WalkControl::Continue)
+    });
+    reads_outer_query
+}
+
 pub fn expr_references_outer_query(expr: &ast::Expr, table_references: &TableReferences) -> bool {
     let mut has_outer_ref = false;
     walk_expr(expr, &mut |expr: &ast::Expr| -> Result<WalkControl> {

@@ -2,7 +2,7 @@ use super::*;
 use crate::alloc::{TryClone, TursoIteratorExt};
 use crate::schema::GeneratedType;
 use crate::translate::emitter::HashLabels;
-use crate::translate::expr::comparison_affinity;
+use crate::translate::expr::{comparison_affinity, expr_reads_outer_query_through_subquery};
 use crate::translate::plan::ColumnUsedMask;
 use crate::vdbe::builder::SelfTableContext;
 
@@ -533,7 +533,14 @@ pub(super) fn build_prefilter_where_terms(
         {
             continue;
         }
-        if expr_references_outer_query(&cond.expr, table_references) {
+        // A term that reads the enclosing query is a different term on every row of
+        // it, and the hash table is filled once, so applying it here would keep the
+        // first enclosing row's rows for all of them. `expr_references_outer_query`
+        // stops at a subquery boundary, so a correlated `IN (SELECT ...)` has to be
+        // asked for separately.
+        if expr_references_outer_query(&cond.expr, table_references)
+            || expr_reads_outer_query_through_subquery(&cond.expr, subqueries, table_references)
+        {
             continue;
         }
         term_indices.push(cond_idx);

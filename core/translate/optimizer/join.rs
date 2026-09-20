@@ -18,7 +18,10 @@ use crate::{
     schema::Schema,
     stats::AnalyzeStats,
     translate::{
-        expr::{expr_references_outer_query, expr_references_subquery_id, walk_expr, WalkControl},
+        expr::{
+            expr_reads_outer_query_through_subquery, expr_references_outer_query,
+            expr_references_subquery_id,
+        },
         optimizer::{
             access_method::{
                 estimate_hash_join_cost, tables_in_equal_test, try_hash_join_access_method,
@@ -461,43 +464,6 @@ impl JoinN {
             .iter()
             .map(|(_, access_method_index)| *access_method_index)
     }
-}
-
-/// Whether a filter reaches a row of the enclosing query through a subquery.
-///
-/// The plain column walker stops at a subquery boundary, so an enclosing-query
-/// column wrapped in one is invisible to it. A subquery this planner cannot
-/// resolve, or one whose plan is already gone, counts as reaching the enclosing
-/// query, so the check never falls through to allow.
-fn expr_reads_outer_query_through_subquery(
-    expr: &turso_parser::ast::Expr,
-    subqueries: &[NonFromClauseSubquery],
-    table_references: &TableReferences,
-) -> bool {
-    let mut reads_outer_query = false;
-    let _ = walk_expr(
-        expr,
-        &mut |expr: &turso_parser::ast::Expr| -> Result<WalkControl> {
-            let turso_parser::ast::Expr::SubqueryResult { subquery_id, .. } = expr else {
-                return Ok(WalkControl::Continue);
-            };
-            let Some(SubqueryState::Unevaluated { plan: Some(plan) }) = subqueries
-                .iter()
-                .find(|subquery| subquery.internal_id == *subquery_id)
-                .map(|subquery| &subquery.state)
-            else {
-                reads_outer_query = true;
-                return Ok(WalkControl::Continue);
-            };
-            reads_outer_query |= plan.used_outer_query_ref_ids().iter().any(|table_id| {
-                table_references
-                    .find_outer_query_ref_by_internal_id(*table_id)
-                    .is_some()
-            });
-            Ok(WalkControl::Continue)
-        },
-    );
-    reads_outer_query
 }
 
 /// Join n-1 tables with the n'th table.

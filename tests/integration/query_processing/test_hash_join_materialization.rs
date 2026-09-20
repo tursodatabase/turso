@@ -569,3 +569,103 @@ fn hash_join_declined_when_an_outer_column_is_wrapped_in_a_subquery_or_an_in_lis
         );
     }
 }
+
+/// The opcodes of the loop that fills the first hash table in a plan.
+///
+/// The slice runs from the `Rewind` that opens the build cursor through the
+/// `HashBuild` itself, so it is exactly the work done once per statement and
+/// reused for every later row of the enclosing query.
+fn hash_build_loop_opcodes(
+    conn: &std::sync::Arc<turso_core::Connection>,
+    sql: &str,
+) -> Vec<String> {
+    let rows = limbo_exec_rows(conn, &format!("EXPLAIN {sql}"));
+    let opcode = |i: usize| rows[i].get(1).and_then(value_as_text).unwrap_or("");
+    let cursor = |i: usize| rows[i].get(2).and_then(value_as_i64).unwrap_or(-1);
+    let Some(build) = (0..rows.len()).find(|i| opcode(*i) == "HashBuild") else {
+        return Vec::new();
+    };
+    let start = (0..=build)
+        .rev()
+        .find(|i| opcode(*i) == "Rewind" && cursor(*i) == cursor(build))
+        .unwrap_or(build);
+    (start..=build).map(|i| opcode(i).to_string()).collect()
+}
+
+#[test]
+fn hash_build_does_not_apply_a_filter_that_reads_the_enclosing_query() {
+    let _ = env_logger::try_init();
+    let tmp_db = TempDatabase::new_empty();
+    let conn = tmp_db.connect_limbo();
+
+    // The reported schema, with no index on any of the joined tables.
+    for stmt in [
+        "CREATE TABLE t(id INTEGER PRIMARY KEY, n INTEGER DEFAULT 0)",
+        "CREATE TABLE u(cid INTEGER, k TEXT)",
+        "CREATE TABLE v(k TEXT, a INTEGER)",
+        "CREATE TABLE w(a INTEGER)",
+        "INSERT INTO t(id) VALUES(1),(2),(3),(4)",
+        "INSERT INTO u VALUES(1,'a'),(1,'a'),(2,'b'),(3,'a')",
+        "INSERT INTO v VALUES('a',1),('b',1)",
+        "INSERT INTO w VALUES(1)",
+    ] {
+        limbo_exec_rows(&conn, stmt);
+    }
+
+    let joined = "SELECT count(*) FROM u JOIN v ON v.k=u.k JOIN w ON w.a=v.a WHERE";
+    // `NotFound` and `Found` are how an IN subquery probes its ephemeral index.
+    let probes_an_in_subquery =
+        |ops: &[String]| ops.iter().any(|op| op == "NotFound" || op == "Found");
+
+    // An IN subquery that reads no row of the enclosing query is one token away from
+    // the ones below and gives the same answer on every pass, so it must keep its
+    // place in the build loop. Without this, a build loop that simply stopped hash
+    // joining, or stopped filtering anything at all, would read as a pass below.
+    let uncorrelated = format!("UPDATE t SET n = ({joined} u.cid IN (SELECT id FROM t))");
+    assert!(
+        probes_an_in_subquery(&hash_build_loop_opcodes(&conn, &uncorrelated)),
+        "an IN subquery that reads no enclosing row should still be applied while the hash table is filled"
+    );
+
+    // Counts read from /usr/bin/sqlite3 3.51.0 on this schema and these rows.
+    let cases: [(&str, [i64; 4]); 4] = [
+        ("u.cid IN (SELECT t.id)", [2, 1, 1, 0]),
+        ("u.cid NOT IN (SELECT t.id)", [2, 3, 3, 4]),
+        ("u.cid IN ((SELECT t.id))", [2, 1, 1, 0]),
+        ("u.cid IN (SELECT t.id UNION SELECT t.id+1)", [3, 2, 1, 0]),
+    ];
+    for (filter, counts) in cases {
+        let update = format!("UPDATE t SET n = ({joined} {filter})");
+        assert!(
+            !probes_an_in_subquery(&hash_build_loop_opcodes(&conn, &update)),
+            "this filter is a different filter on every row of the enclosing query, so the hash build must not apply it: {filter}"
+        );
+        limbo_exec_rows(&conn, "UPDATE t SET n = 0");
+        limbo_exec_rows(&conn, &update);
+        let expected: Vec<Vec<Value>> = counts
+            .iter()
+            .enumerate()
+            .map(|(i, n)| vec![Value::Integer(i as i64 + 1), Value::Integer(*n)])
+            .collect();
+        assert_eq!(
+            limbo_exec_rows(&conn, "SELECT id, n FROM t ORDER BY id"),
+            expected,
+            "every row must get its own count: {filter}"
+        );
+    }
+
+    // The same predicate driving a DELETE.
+    limbo_exec_rows(
+        &conn,
+        &format!("DELETE FROM t WHERE ({joined} u.cid IN (SELECT t.id)) = 0"),
+    );
+    assert_eq!(
+        limbo_exec_rows(&conn, "SELECT id FROM t ORDER BY id"),
+        vec![
+            vec![Value::Integer(1)],
+            vec![Value::Integer(2)],
+            vec![Value::Integer(3)],
+        ],
+        "a DELETE on the same predicate must remove only the row with no match"
+    );
+}
