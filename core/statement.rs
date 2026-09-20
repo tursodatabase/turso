@@ -570,9 +570,9 @@ impl Statement {
     /// gated behind cheap flag tests and kept out of line. A row in the middle
     /// of a scan runs only the interpreter call and the result-row bookkeeping.
     fn _step(&mut self, waker: Option<&Waker>) -> Result<StepResult> {
-        // The flag may stand when nothing is left to prepare -- an extra
-        // `prepare_step` only re-tests what it already settled -- but it must
-        // never be down while any of the three still needs work.
+        // The flag may be true when nothing is left to prepare -- an extra
+        // `prepare_step` only re-tests work that is already done -- but it
+        // must never be false while any of the three still needs work.
         turso_debug_assert!(
             self.needs_prepare_step
                 || !(matches!(self.state.execution_state, ProgramExecutionState::Init)

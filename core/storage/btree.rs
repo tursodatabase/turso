@@ -1260,7 +1260,7 @@ impl BTreeCursor {
         Self::new(pager, root_page, num_columns)
     }
 
-    /// Builds a cursor on the heap, in an allocation retired by an earlier
+    /// Builds a cursor on the heap, in an allocation freed by an earlier
     /// cursor on the same pager when the pool has one. `make` runs with the
     /// allocation already in hand so the compiler can build the cursor
     /// there: a `BTreeCursor` is over a kilobyte, and building it on the

@@ -1905,7 +1905,7 @@ impl Pager {
         })
     }
 
-    /// An allocation retired by an earlier b-tree cursor on this pager, if any.
+    /// An allocation freed by an earlier b-tree cursor on this pager, if any.
     pub(crate) fn take_cursor_allocation(
         &self,
     ) -> Option<Box<std::mem::MaybeUninit<crate::storage::btree::BTreeCursor>>> {
