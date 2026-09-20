@@ -824,10 +824,16 @@ impl Connection {
     /// On successful commit, snapshot the current `temp_db.db.schema`
     /// into `committed_temp_schema` so a future full-txn rollback can
     /// restore it. No-op if no temp DDL ran in this transaction.
+    #[inline]
     pub(crate) fn commit_temp_schema(&self) {
         if !self.temp.schema_did_change.load(Ordering::Acquire) {
             return;
         }
+        self.commit_changed_temp_schema();
+    }
+
+    #[inline(never)]
+    fn commit_changed_temp_schema(&self) {
         // `schema_did_change` is only ever set by
         // `mark_temp_schema_did_change`, which asserts temp is
         // initialized. If it's somehow clear here we have a logic

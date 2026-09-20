@@ -1475,10 +1475,21 @@ impl Statement {
     /// (so subsequent `commit_dep_counter` walks may wait on it forever)
     /// and the connection's mv_tx points to a dead tx, breaking the
     /// next statement that runs on the connection.
+    #[inline]
     fn cleanup_orphaned_seq_inner_tx(&mut self) {
-        let Some(pending) = self.state.sequence_inner_tx_pending.take() else {
+        if self.state.sequence_inner_tx_pending.is_none() {
             return;
-        };
+        }
+        self.roll_back_orphaned_seq_inner_tx();
+    }
+
+    #[inline(never)]
+    fn roll_back_orphaned_seq_inner_tx(&mut self) {
+        let pending = self
+            .state
+            .sequence_inner_tx_pending
+            .take()
+            .expect("cleanup_orphaned_seq_inner_tx tested that one is pending");
         let conn = self.program.connection.clone();
         let Some(mv_store) = conn.mv_store_for_db(pending.db) else {
             return;

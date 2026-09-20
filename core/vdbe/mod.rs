@@ -1651,7 +1651,21 @@ impl ProgramState {
     /// savepoint management and FK violation counter restoration are independent
     /// concerns: pager savepoints may be skipped (e.g. autocommit optimization)
     /// while FK bookkeeping still needs cleanup.
+    #[inline]
     pub fn end_statement(
+        &mut self,
+        connection: &Connection,
+        pager: &Arc<Pager>,
+        end_statement: EndStatement,
+    ) -> Result<()> {
+        if !self.is_active_write && !self.has_stmt_transaction {
+            return Ok(());
+        }
+        self.end_statement_cold(connection, pager, end_statement)
+    }
+
+    #[inline(never)]
+    fn end_statement_cold(
         &mut self,
         connection: &Connection,
         pager: &Arc<Pager>,
