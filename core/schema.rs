@@ -2506,17 +2506,26 @@ impl Schema {
         let parent_unique_index = if parent_uses_rowid {
             None
         } else {
+            // When the FK names the parent columns explicitly, sqlite3FkLocateIndex only
+            // accepts a parent index whose every column uses that column's default
+            // collation; an index built on another collating sequence is unusable and the
+            // FK is reported as a mismatch. FK enforcement compares parent key values with
+            // the parent *column's* collation, so an index on a different collation would
+            // answer a lookup the action then cannot reproduce, leaving orphaned children.
+            // A reference that names no parent columns resolves to the parent's PRIMARY KEY
+            // by identity, which sqlite does not collation-check.
+            let check_index_collation = !fk.parent_columns.is_empty();
             let found = self
                 .get_indices(&parent_tbl.name)
                 .find(|idx| {
                     idx.unique
                         && idx.where_clause.is_none()
                         && idx.columns.len() == parent_cols.len()
-                        && idx
-                            .columns
-                            .iter()
-                            .zip(parent_cols.iter())
-                            .all(|(ic, pc)| ic.name.eq_ignore_ascii_case(pc))
+                        && idx.columns.iter().zip(parent_cols.iter()).all(|(ic, pc)| {
+                            ic.name.eq_ignore_ascii_case(pc)
+                                && (!check_index_collation
+                                    || index_column_has_default_collation(ic, parent_tbl))
+                        })
                 })
                 .cloned();
             if require_unique && found.is_none() {
@@ -5072,6 +5081,18 @@ fn fk_mismatch_err(child: &str, parent: &str) -> crate::LimboError {
     crate::LimboError::ForeignKeyConstraint(format!(
         "foreign key mismatch - \"{child}\" referencing \"{parent}\""
     ))
+}
+
+/// True when `ic` indexes a real column of `table` with that column's own
+/// collating sequence. `IndexColumn::collation` is already
+/// `explicit COLLATE on the index term`.or(`column's declared collation`), so
+/// `None` means BINARY. Expression index columns have no table column and never
+/// qualify, matching sqlite's refusal to key a foreign key off one.
+fn index_column_has_default_collation(ic: &IndexColumn, table: &BTreeTable) -> bool {
+    table
+        .columns
+        .get(ic.pos_in_table)
+        .is_some_and(|col| ic.collation.unwrap_or(CollationSeq::Binary) == col.collation())
 }
 
 impl ForeignKey {

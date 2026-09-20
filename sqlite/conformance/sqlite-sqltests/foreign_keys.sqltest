@@ -2309,6 +2309,127 @@ expect {
     0
 }
 
+# A parent key backed by a UNIQUE index whose collation is not the parent column's
+# own collation is not a usable foreign key: sqlite3FkLocateIndex skips such an index
+# and the FK is reported as a mismatch.
+@cross-check-integrity
+test fk-parent-index-collation-differs-from-column-rejected {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE p(k TEXT);
+    CREATE UNIQUE INDEX pi ON p(k COLLATE NOCASE);
+    CREATE TABLE c(id INTEGER PRIMARY KEY, k TEXT COLLATE NOCASE REFERENCES p(k) ON DELETE CASCADE);
+    INSERT INTO p VALUES('A');
+    INSERT INTO c VALUES(1,'A');
+}
+expect error {
+}
+
+@cross-check-integrity
+test fk-parent-index-binary-on-nocase-column-rejected {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE p(k TEXT COLLATE NOCASE);
+    CREATE UNIQUE INDEX pi ON p(k COLLATE BINARY);
+    CREATE TABLE c(id INTEGER PRIMARY KEY, k TEXT REFERENCES p(k) ON DELETE CASCADE);
+    INSERT INTO p VALUES('A');
+    INSERT INTO c VALUES(1,'A');
+}
+expect error {
+}
+
+@cross-check-integrity
+test fk-parent-pk-index-collation-named-columns-rejected {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE p(k TEXT, PRIMARY KEY(k COLLATE NOCASE));
+    CREATE TABLE c(id INTEGER PRIMARY KEY, k TEXT REFERENCES p(k) ON DELETE CASCADE);
+    INSERT INTO p VALUES('A');
+    INSERT INTO c VALUES(1,'A');
+}
+expect error {
+}
+
+# The same schema on the parent side: the cascade must not run and must not orphan
+# the children that were loaded while foreign_keys was off.
+@cross-check-integrity
+test fk-parent-index-collation-differs-cascade-delete-rejected {
+    PRAGMA foreign_keys=OFF;
+    CREATE TABLE p(k TEXT);
+    CREATE UNIQUE INDEX pi ON p(k COLLATE NOCASE);
+    CREATE TABLE c(id INTEGER PRIMARY KEY, k TEXT COLLATE NOCASE REFERENCES p(k) ON DELETE CASCADE);
+    INSERT INTO p VALUES('A');
+    INSERT INTO c VALUES(1,'A'),(2,'a');
+    PRAGMA foreign_keys=ON;
+    DELETE FROM p;
+}
+expect error {
+}
+
+# A reference that names no parent columns resolves to the PRIMARY KEY by identity,
+# and sqlite does not collation-check it.
+@cross-check-integrity
+test fk-parent-implicit-pk-ref-with-collated-pk-ok {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE p(k TEXT, PRIMARY KEY(k COLLATE NOCASE));
+    CREATE TABLE c(id INTEGER PRIMARY KEY, k TEXT REFERENCES p ON DELETE CASCADE);
+    INSERT INTO p VALUES('A');
+    INSERT INTO c VALUES(1,'A');
+    DELETE FROM p;
+    SELECT count(*) FROM c;
+}
+expect {
+    0
+}
+
+# An index term with no COLLATE inherits the column's collation, so this one is usable.
+@cross-check-integrity
+test fk-parent-index-inherits-column-collation-ok {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE p(k TEXT COLLATE NOCASE);
+    CREATE UNIQUE INDEX pi ON p(k);
+    CREATE TABLE c(id INTEGER PRIMARY KEY, k TEXT REFERENCES p(k) ON DELETE CASCADE);
+    INSERT INTO p VALUES('A');
+    INSERT INTO c VALUES(1,'a');
+    DELETE FROM p;
+    SELECT count(*) FROM c;
+}
+expect {
+    0
+}
+
+# An unusable index does not condemn the foreign key when another unique index on the
+# same column is usable. Both creation orders, so that whichever index the schema
+# hands back first, one of these two cases has the unusable one first.
+@cross-check-integrity
+test fk-parent-unusable-index-first-still-usable {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE p(k TEXT);
+    CREATE UNIQUE INDEX pbad ON p(k COLLATE NOCASE);
+    CREATE UNIQUE INDEX pgood ON p(k);
+    CREATE TABLE c(id INTEGER PRIMARY KEY, k TEXT REFERENCES p(k) ON DELETE CASCADE);
+    INSERT INTO p VALUES('A');
+    INSERT INTO c VALUES(1,'A');
+    DELETE FROM p;
+    SELECT count(*) FROM c;
+}
+expect {
+    0
+}
+
+@cross-check-integrity
+test fk-parent-unusable-index-second-still-usable {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE p(k TEXT);
+    CREATE UNIQUE INDEX pgood ON p(k);
+    CREATE UNIQUE INDEX pbad ON p(k COLLATE NOCASE);
+    CREATE TABLE c(id INTEGER PRIMARY KEY, k TEXT REFERENCES p(k) ON DELETE CASCADE);
+    INSERT INTO p VALUES('A');
+    INSERT INTO c VALUES(1,'A');
+    DELETE FROM p;
+    SELECT count(*) FROM c;
+}
+expect {
+    0
+}
+
 # ON DELETE CASCADE - recursive cascade (A->B->C)
 @cross-check-integrity
 test fk-cascade-delete-recursive {
