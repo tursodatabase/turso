@@ -2761,21 +2761,30 @@ impl Connection {
     }
 
     /// Check if a specific attached database is read only or not, by its index
+    #[inline]
     pub fn is_readonly(&self, index: usize) -> bool {
-        match index {
-            crate::MAIN_DB_ID => self.db.is_readonly(),
-            crate::TEMP_DB_ID => self
+        if index == crate::MAIN_DB_ID {
+            return self.db.is_readonly();
+        }
+        self.is_readonly_secondary(index)
+    }
+
+    /// The temp and attached databases, each of which goes through a lock to
+    /// reach its [Database]. Kept out of line so the main database, which
+    /// every statement asks about, stays one atomic read at the call site.
+    #[inline(never)]
+    fn is_readonly_secondary(&self, index: usize) -> bool {
+        if index == crate::TEMP_DB_ID {
+            return self
                 .temp
                 .database
                 .read()
                 .as_ref()
-                .is_some_and(|temp_db| temp_db.db.is_readonly()),
-            _ => {
-                let db = self.attached_databases.read().get_database_by_index(index);
-                db.expect("Should never have called this without being sure the database exists")
-                    .is_readonly()
-            }
+                .is_some_and(|temp_db| temp_db.db.is_readonly());
         }
+        let db = self.attached_databases.read().get_database_by_index(index);
+        db.expect("Should never have called this without being sure the database exists")
+            .is_readonly()
     }
 
     /// Reset the page size for the current connection.
@@ -4924,6 +4933,7 @@ impl Connection {
         self.transaction_state.set(state);
     }
 
+    #[inline]
     pub(crate) fn get_tx_state(&self) -> TransactionState {
         self.transaction_state.get()
     }
