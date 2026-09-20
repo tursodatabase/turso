@@ -454,11 +454,11 @@ impl Register {
     /// which is faster than always creating a new one.
     pub fn set_int(&mut self, val: i64) {
         match self {
-            Register::Value(Value::Numeric(Numeric::Integer(existing))) => {
-                *existing = val;
-            }
-            Register::Value(Value::Numeric(float)) => {
-                *float = Numeric::Integer(val);
+            // One test for both numeric kinds. Split in two, a register that
+            // already holds an integer wrote eight bytes instead of sixteen but
+            // paid a second discriminant test for it, on every row of a scan.
+            Register::Value(Value::Numeric(number)) => {
+                *number = Numeric::Integer(val);
             }
             _ => set_int_over_other(self, val),
         };
