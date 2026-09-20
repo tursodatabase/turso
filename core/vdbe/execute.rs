@@ -1888,6 +1888,10 @@ pub fn op_vbegin(
         .expect("VBegin on non ext-virtual table cursor");
     let mut states = program.connection.vtab_txn_states.write();
     if states.insert(vtab_id) {
+        program
+            .connection
+            .has_vtab_txn_states
+            .store(true, Ordering::Release);
         // Only begin a new transaction if one is not already active for this virtual table module
         let vtabs = &program.connection.syms.read().vtabs;
         let vtab = vtabs
@@ -4080,10 +4084,20 @@ pub fn halt(
 
 /// Call xCommit on all virtual tables that participated in the current transaction.
 pub(crate) fn vtab_commit_all(conn: &Connection) -> crate::Result<()> {
-    let mut set = conn.vtab_txn_states.write();
-    if set.is_empty() {
+    if !conn.has_vtab_txn_states.load(Ordering::Acquire) {
+        turso_debug_assert!(
+            conn.vtab_txn_states.read().is_empty(),
+            "a virtual table transaction was started without setting the flag"
+        );
         return Ok(());
     }
+    commit_started_vtab_transactions(conn)
+}
+
+#[inline(never)]
+fn commit_started_vtab_transactions(conn: &Connection) -> crate::Result<()> {
+    let mut set = conn.vtab_txn_states.write();
+    conn.has_vtab_txn_states.store(false, Ordering::Release);
     let reg = &conn.syms.read().vtabs;
     for id in set.drain() {
         let vtab = reg
@@ -4322,10 +4336,20 @@ fn has_index_method_work(state: &ProgramState) -> bool {
 
 /// Rollback all virtual tables that are part of the current transaction.
 fn vtab_rollback_all(conn: &Connection) -> crate::Result<()> {
-    let mut set = conn.vtab_txn_states.write();
-    if set.is_empty() {
+    if !conn.has_vtab_txn_states.load(Ordering::Acquire) {
+        turso_debug_assert!(
+            conn.vtab_txn_states.read().is_empty(),
+            "a virtual table transaction was started without setting the flag"
+        );
         return Ok(());
     }
+    roll_back_started_vtab_transactions(conn)
+}
+
+#[inline(never)]
+fn roll_back_started_vtab_transactions(conn: &Connection) -> crate::Result<()> {
+    let mut set = conn.vtab_txn_states.write();
+    conn.has_vtab_txn_states.store(false, Ordering::Release);
     let reg = &conn.syms.read().vtabs;
     for id in set.drain() {
         let vtab = reg

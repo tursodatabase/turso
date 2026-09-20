@@ -545,6 +545,10 @@ pub struct Connection {
     pub(super) check_constraints_pragma: AtomicBool,
     /// Track when each virtual table instance is currently in transaction.
     pub(crate) vtab_txn_states: RwLock<HashSet<u64>>,
+    /// True while `vtab_txn_states` may be non-empty. Lets every commit and
+    /// rollback skip the lock when no virtual table was ever touched -- the
+    /// overwhelmingly common case.
+    pub(crate) has_vtab_txn_states: crate::sync::atomic::AtomicBool,
     /// One prepared cursor per index-method attachment touched by the active
     /// database transaction. Statement reset transfers cursors here so the
     /// eventual transaction outcome is delivered exactly once per attachment.
