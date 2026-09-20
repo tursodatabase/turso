@@ -6538,7 +6538,23 @@ impl BTreeCursor {
     /// written (`None` when unknown); peers backing incremental blob handles use it
     /// to expire exactly when their own row is hit (sqlite3's
     /// invalidateIncrblobCursors, btree.c:672).
+    /// The three tests that say there is nothing to do stay inline, so a write
+    /// with no peer cursor on the same root pays them and no call. Out of line
+    /// it cost a stack frame for every row written.
+    #[inline]
     fn drive_pending_peer_save(&mut self, written_rowid: Option<i64>) -> IOResultOr<()> {
+        if self.pending_peer_save.is_none()
+            && matches!(self.state, CursorState::None)
+            // BTCF_Multiple fast path (sqlite3 btree.c:9348).
+            && !self.has_peers.load(crate::sync::atomic::Ordering::Relaxed)
+        {
+            return Ok(IOResult::Done(()));
+        }
+        self.drive_pending_peer_save_slow(written_rowid)
+    }
+
+    #[inline(never)]
+    fn drive_pending_peer_save_slow(&mut self, written_rowid: Option<i64>) -> IOResultOr<()> {
         if self.pending_peer_save.is_none() && matches!(self.state, CursorState::None) {
             // BTCF_Multiple fast path (sqlite3 btree.c:9348).
             if !self.has_peers.load(crate::sync::atomic::Ordering::Relaxed) {
