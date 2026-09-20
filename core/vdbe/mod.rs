@@ -750,6 +750,28 @@ macro_rules! active_state_accessor {
     };
 }
 
+impl ActiveOpState {
+    /// True when the state holds nothing to free, so [`ActiveOpStateSlot::clear`]
+    /// can forget it instead of running the drop glue of the enum: a switch over
+    /// every variant, which cost 27 instructions for every row an insert wrote
+    /// and freed nothing.
+    ///
+    /// Every field is named rather than skipped with `..`, so a field added to
+    /// one of these states has to be answered for here.
+    fn owns_nothing(&self) -> bool {
+        match self {
+            ActiveOpState::None => true,
+            ActiveOpState::Insert(OpInsertState {
+                sub_state: _,
+                has_dependent_views: _,
+                is_noop_update: _,
+                old_record,
+            }) => old_record.is_none(),
+            _ => false,
+        }
+    }
+}
+
 impl Default for ActiveOpState {
     fn default() -> Self {
         Self::None
@@ -758,9 +780,14 @@ impl Default for ActiveOpState {
 
 impl ActiveOpStateSlot {
     fn clear(&mut self) {
-        if !matches!(self.state, ActiveOpState::None) {
-            self.state = ActiveOpState::None;
+        if matches!(self.state, ActiveOpState::None) {
+            return;
         }
+        if self.state.owns_nothing() {
+            std::mem::forget(std::mem::replace(&mut self.state, ActiveOpState::None));
+            return;
+        }
+        self.state = ActiveOpState::None;
     }
 
     /// True when no multi-step opcode is suspended. Hot opcodes use this to
