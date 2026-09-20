@@ -10636,6 +10636,24 @@ fn shift_pointers_left(page: &mut PageContent, cell_idx: usize) {
 }
 
 #[cfg(test)]
+mod next_cell_index_tests {
+    use super::next_cell_index;
+
+    /// The two callers compare the result against a page's cell count, so a
+    /// cursor sitting before the first cell has to land somewhere no cell
+    /// count can reach. Widening through u32 is what puts it there; widening
+    /// straight to usize would wrap -1 back to 0 and make an empty page look
+    /// like it has a next cell.
+    #[test]
+    fn a_cursor_before_the_first_cell_lands_past_every_cell_count() {
+        assert_eq!(next_cell_index(0), 1);
+        assert_eq!(next_cell_index(1), 2);
+        assert_eq!(next_cell_index(i32::MAX), i32::MAX as usize + 1);
+        assert!(next_cell_index(-1) > u32::MAX as usize);
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use crate::SqliteDialect;
     use rand::{rng, Rng};
