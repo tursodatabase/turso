@@ -14032,29 +14032,30 @@ pub fn op_copy(
         if src == dst {
             return Ok(());
         }
+        // A number and NULL need no allocation, so the source comes out by
+        // value and the destination is written after it. Holding both registers
+        // at once instead costs a second bounds test of each index and a test
+        // that they are distinct, which the test above already answered.
+        if let Some(value) = heapless_value(&registers[src]) {
+            match &mut registers[dst] {
+                Register::Value(dst @ (Value::Null | Value::Numeric(_))) => *dst = value,
+                dst => *dst = Register::Value(value),
+            }
+            return Ok(());
+        }
         let [src, dst] = registers
             .get_disjoint_mut([src, dst])
             .expect("Copy source and destination registers are distinct");
-        if !try_copy_heapless_value(dst, src) {
-            dst.try_clone_from(src)?;
-        }
+        dst.try_clone_from(src)?;
         Ok(())
     }
 
     #[inline]
-    fn try_copy_heapless_value(dst: &mut Register, src: &Register) -> bool {
-        match (dst, src) {
-            (
-                Register::Value(dst @ (Value::Null | Value::Numeric(_))),
-                Register::Value(src @ (Value::Null | Value::Numeric(_))),
-            ) => {
-                *dst = match src {
-                    Value::Numeric(n) => Value::Numeric(*n),
-                    _ => Value::Null,
-                };
-                true
-            }
-            _ => false,
+    fn heapless_value(src: &Register) -> Option<Value> {
+        match src {
+            Register::Value(Value::Numeric(n)) => Some(Value::Numeric(*n)),
+            Register::Value(Value::Null) => Some(Value::Null),
+            _ => None,
         }
     }
 
