@@ -1215,7 +1215,52 @@ impl ProgramBuilder {
             self.emit_column_maybe_fused(cursor_id, column, dest, default);
             return;
         }
+        let mut insn = insn;
+        self.drop_the_affinity_the_previous_insn_applied(&mut insn);
         self.insns.push((insn, self.insns.len()));
+    }
+
+    /// A `MakeRecord` that follows an `Affinity` over the same registers with
+    /// the same affinities would convert those registers a second time.
+    /// Converting twice changes nothing the second time, which is why
+    /// `translate::insert` converts before triggers run rather than per
+    /// trigger, so drop the string and let the `Affinity` alone do the work.
+    ///
+    /// A label that targets the `MakeRecord` keeps the string: a jump to it
+    /// does not run the `Affinity` before it.
+    fn drop_the_affinity_the_previous_insn_applied(&self, insn: &mut Insn) {
+        let Insn::MakeRecord {
+            start_reg,
+            count,
+            affinity_str,
+            ..
+        } = insn
+        else {
+            return;
+        };
+        let Some(applied) = affinity_str.as_deref() else {
+            return;
+        };
+        if self.label_targets_next_insn() {
+            return;
+        }
+        let Some((
+            Insn::Affinity {
+                start_reg: prev_start,
+                count: prev_count,
+                affinities,
+            },
+            _,
+        )) = self.insns.last()
+        else {
+            return;
+        };
+        if u32::try_from(*prev_start) == Ok(*start_reg)
+            && u32::try_from(prev_count.get()) == Ok(*count)
+            && affinities.as_str() == applied
+        {
+            *affinity_str = None;
+        }
     }
 
     /// Emits a `Column` or `ColumnRange` opcode, fusing it into an immediately preceding `Column`
@@ -2376,5 +2421,80 @@ impl CursorTypeExt for CursorType {
                 | CursorType::Pseudo(_)
                 | CursorType::Sorter
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn builder() -> ProgramBuilder {
+        ProgramBuilder::new(QueryMode::Normal, None, ProgramBuilderOpts::new(1, 8, 4))
+    }
+
+    fn affinity(start_reg: usize, count: usize, affinities: &str) -> Insn {
+        Insn::Affinity {
+            start_reg,
+            count: NonZeroUsize::new(count).unwrap(),
+            affinities: affinities.to_string(),
+        }
+    }
+
+    fn make_record(start_reg: u32, count: u32, affinities: &str) -> Insn {
+        Insn::MakeRecord {
+            start_reg,
+            count,
+            dest_reg: start_reg + count,
+            index_name: None,
+            affinity_str: Some(affinities.to_string()),
+        }
+    }
+
+    fn affinity_of_last_insn(program: &ProgramBuilder) -> Option<String> {
+        match &program.insns.last().expect("an instruction was emitted").0 {
+            Insn::MakeRecord { affinity_str, .. } => affinity_str.clone(),
+            other => panic!("expected MakeRecord, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn make_record_drops_the_affinity_the_insn_before_it_applied() {
+        let mut program = builder();
+        program.emit_insn(affinity(2, 3, "DBD"));
+        program.emit_insn(make_record(2, 3, "DBD"));
+        assert_eq!(affinity_of_last_insn(&program), None);
+    }
+
+    #[test]
+    fn make_record_keeps_an_affinity_over_other_registers() {
+        let mut program = builder();
+        program.emit_insn(affinity(7, 3, "DBD"));
+        program.emit_insn(make_record(2, 3, "DBD"));
+        assert_eq!(affinity_of_last_insn(&program), Some("DBD".to_string()));
+    }
+
+    #[test]
+    fn make_record_keeps_an_affinity_over_a_shorter_range() {
+        let mut program = builder();
+        program.emit_insn(affinity(2, 2, "DB"));
+        program.emit_insn(make_record(2, 3, "DBD"));
+        assert_eq!(affinity_of_last_insn(&program), Some("DBD".to_string()));
+    }
+
+    #[test]
+    fn make_record_keeps_its_affinity_when_a_label_targets_it() {
+        let mut program = builder();
+        program.emit_insn(affinity(2, 3, "DBD"));
+        let label = program.allocate_label();
+        program.preassign_label_to_next_insn(label);
+        program.emit_insn(make_record(2, 3, "DBD"));
+        assert_eq!(affinity_of_last_insn(&program), Some("DBD".to_string()));
+    }
+
+    #[test]
+    fn make_record_keeps_its_affinity_when_no_insn_comes_before_it() {
+        let mut program = builder();
+        program.emit_insn(make_record(2, 3, "DBD"));
+        assert_eq!(affinity_of_last_insn(&program), Some("DBD".to_string()));
     }
 }
