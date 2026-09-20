@@ -3076,51 +3076,56 @@ impl BTreeCursor {
                     // if the cell index is less than the total cells, check: if its an existing
                     // rowid, we are going to update / overwrite the cell
                     if cell_idx < page.get_contents().cell_count() {
-                        let cell = page.get_contents().cell_get(cell_idx, usable_space)?;
-                        match cell {
-                            BTreeCell::TableLeafCell(tbl_leaf) => {
-                                if tbl_leaf.rowid == bkey.to_rowid() {
-                                    tracing::debug!("TableLeafCell: found exact match with cell_idx={cell_idx}, overwriting");
-                                    self.has_record = true;
-                                    self.advance_gate = AdvanceGate::Unknown;
-                                    *write_state = WriteState::Overwrite {
-                                        page,
-                                        cell_idx,
-                                        state: Some(OverwriteCellState::AllocatePayload),
-                                    };
-                                    continue;
-                                }
+                        // Only the rowid decides whether this insert overwrites
+                        // the cell, and reading it stops after two varints,
+                        // where a whole cell parse also measures the payload
+                        // and looks for its overflow page.
+                        if matches!(page.get_contents().page_type()?, PageType::TableLeaf) {
+                            let existing_rowid =
+                                page.get_contents().cell_table_leaf_read_rowid(cell_idx)?;
+                            if existing_rowid == bkey.to_rowid() {
+                                tracing::debug!("TableLeafCell: found exact match with cell_idx={cell_idx}, overwriting");
+                                self.has_record = true;
+                                self.advance_gate = AdvanceGate::Unknown;
+                                *write_state = WriteState::Overwrite {
+                                    page,
+                                    cell_idx,
+                                    state: Some(OverwriteCellState::AllocatePayload),
+                                };
+                                continue;
                             }
-                            BTreeCell::IndexLeafCell(..) | BTreeCell::IndexInteriorCell(..) => {
-                                return_if_io!(self.record());
-                                let cmp = compare_immutable_iter(
-                                    record.iter()?,
-                                    self.get_immutable_record()
-                                        .as_ref()
-                                        .unwrap()
-                                        .iter()?,
+                        } else {
+                            let cell = page.get_contents().cell_get(cell_idx, usable_space)?;
+                            match cell {
+                                BTreeCell::IndexLeafCell(..) | BTreeCell::IndexInteriorCell(..) => {
+                                    return_if_io!(self.record());
+                                    let cmp = compare_immutable_iter(
+                                        record.iter()?,
+                                        self.get_immutable_record().as_ref().unwrap().iter()?,
                                         &self.index_info.as_ref().unwrap().key_info,
-                                )?;
-                                if cmp == Ordering::Equal {
-                                    tracing::debug!("IndexLeafCell: found exact match with cell_idx={cell_idx}, overwriting");
-                                    self.set_has_record(true);
-                                    let CursorState::Write(write_state) = &mut self.state else {
-                                        panic!("expected write state");
-                                    };
-                                    *write_state = WriteState::Overwrite {
-                                        page,
-                                        cell_idx,
-                                        state: Some(OverwriteCellState::AllocatePayload),
-                                    };
-                                    continue;
-                                } else {
-                                    turso_assert!(
-                                        !matches!(cell, BTreeCell::IndexInteriorCell(..)),
-                                         "we should not be inserting a new index interior cell. the only valid operation on an index interior cell is an overwrite!"
-                                    );
+                                    )?;
+                                    if cmp == Ordering::Equal {
+                                        tracing::debug!("IndexLeafCell: found exact match with cell_idx={cell_idx}, overwriting");
+                                        self.set_has_record(true);
+                                        let CursorState::Write(write_state) = &mut self.state
+                                        else {
+                                            panic!("expected write state");
+                                        };
+                                        *write_state = WriteState::Overwrite {
+                                            page,
+                                            cell_idx,
+                                            state: Some(OverwriteCellState::AllocatePayload),
+                                        };
+                                        continue;
+                                    } else {
+                                        turso_assert!(
+                                            !matches!(cell, BTreeCell::IndexInteriorCell(..)),
+                                            "we should not be inserting a new index interior cell. the only valid operation on an index interior cell is an overwrite!"
+                                        );
+                                    }
                                 }
+                                other => panic!("unexpected cell type, expected TableLeaf or IndexLeaf, found: {other:?}"),
                             }
-                            other => panic!("unexpected cell type, expected TableLeaf or IndexLeaf, found: {other:?}"),
                         }
                     }
 
@@ -14427,6 +14432,41 @@ mod tests {
                 cell_idx_cloned += 1;
             }
         }
+    }
+
+    #[test]
+    fn reading_only_the_rowid_gives_what_parsing_the_whole_cell_gives() {
+        let (pager, _, _, _) = empty_btree();
+        let usable_space = pager.usable_space();
+        let page = run_until_done(|| pager.allocate_page(), &pager).unwrap();
+        btree_init_page(&page, PageType::TableLeaf, 0, usable_space);
+
+        // The first payload is longer than a table leaf cell holds, so it
+        // runs onto an overflow page; the rest stay on this one.
+        let sizes = [5000u16, 900, 120, 7, 1, 0];
+        for (rowid, size) in sizes.iter().enumerate() {
+            insert_cell(rowid as u64, *size, page.clone(), pager.clone());
+        }
+
+        let contents = page.get_contents();
+        assert_eq!(contents.cell_count(), sizes.len());
+        let mut overflowing = 0;
+        for cell_idx in 0..contents.cell_count() {
+            let BTreeCell::TableLeafCell(cell) = contents.cell_get(cell_idx, usable_space).unwrap()
+            else {
+                panic!("a table leaf page holds only table leaf cells");
+            };
+            overflowing += usize::from(cell.first_overflow_page.is_some());
+            assert_eq!(
+                contents.cell_table_leaf_read_rowid(cell_idx).unwrap(),
+                cell.rowid,
+                "cell {cell_idx}"
+            );
+        }
+        assert_eq!(
+            overflowing, 1,
+            "the long payload must reach an overflow page"
+        );
     }
 
     fn insert_cell(cell_idx: u64, size: u16, page: PageRef, pager: Arc<Pager>) {
