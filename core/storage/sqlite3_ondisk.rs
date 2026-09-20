@@ -109,21 +109,12 @@ impl PageSize {
 
     /// Interpret a user-provided u32 as either a valid page size or None.
     pub const fn new(size: u32) -> Option<Self> {
-        if size < PageSize::MIN || size > PageSize::MAX {
-            return None;
-        }
-
-        // Page size must be a power of two.
-        if size.count_ones() != 1 {
-            return None;
-        }
-
-        if size == PageSize::MAX {
+        match size {
+            512 | 1024 | 2048 | 4096 | 8192 | 16384 | 32768 => Some(Self(U16BE::new(size as u16))),
             // Internally, the value 1 represents 65536, since the on-disk value of the page size in the DB header is 2 bytes.
-            return Some(Self(U16BE::new(1)));
+            PageSize::MAX => Some(Self(U16BE::new(1))),
+            _ => None,
         }
-
-        Some(Self(U16BE::new(size as u16)))
     }
 
     /// Interpret a u16 on disk (DB file header) as either a valid page size or
@@ -2397,6 +2388,25 @@ mod tests {
     use super::*;
     use asserting::prelude::*;
     use rstest::rstest;
+
+    #[rstest]
+    #[case(0, None)]
+    #[case(1, None)]
+    #[case(511, None)]
+    #[case(512, Some(512))]
+    #[case(513, None)]
+    #[case(4096, Some(4096))]
+    #[case(6144, None)]
+    #[case(32768, Some(32768))]
+    #[case(65536, Some(65536))]
+    #[case(65537, None)]
+    #[case(u32::MAX, None)]
+    fn page_size_accepts_only_a_power_of_two_in_range(
+        #[case] size: u32,
+        #[case] expected: Option<u32>,
+    ) {
+        assert_eq!(PageSize::new(size).map(PageSize::get), expected);
+    }
 
     #[rstest]
     #[case(PageType::TableLeaf, 4096, 0, None)]
