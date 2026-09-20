@@ -830,7 +830,11 @@ impl Buffer {
 
 crate::thread::thread_local! {
     /// thread local cache to re-use temporary buffers to prevent churn when pool overflows
-    pub static TEMP_BUFFER_CACHE: RefCell<TempBufferCache> = RefCell::new(TempBufferCache::new());
+    ///
+    /// Built in a `const` block so that reaching it is one address computation.
+    /// Without one, every access first tests whether the slot has been built.
+    pub static TEMP_BUFFER_CACHE: RefCell<TempBufferCache> =
+        const { RefCell::new(TempBufferCache::new()) };
 }
 
 #[cfg(test)]
@@ -897,12 +901,15 @@ pub(crate) struct TempBufferCache {
 impl TempBufferCache {
     const DEFAULT_MAX_CACHE_SIZE: usize = 256;
 
-    fn new() -> Self {
+    /// `const` so the thread local holding one needs no test of whether it has
+    /// been built. The three lists start empty rather than with room for eight,
+    /// which costs one growth each on a thread that overflows the pool.
+    const fn new() -> Self {
         Self {
             page_size: BufferPool::DEFAULT_PAGE_SIZE,
-            page_buffers: Vec::with_capacity(8),
-            wal_frame_buffers: Vec::with_capacity(8),
-            subjournal_buffers: Vec::with_capacity(8),
+            page_buffers: Vec::new(),
+            wal_frame_buffers: Vec::new(),
+            subjournal_buffers: Vec::new(),
             max_cached: Self::DEFAULT_MAX_CACHE_SIZE,
         }
     }
