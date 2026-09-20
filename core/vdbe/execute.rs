@@ -1615,6 +1615,7 @@ pub fn op_vopen(
         .get_mut(*cursor_id)
         .unwrap_or_else(|| panic!("cursor id {} out of bounds", *cursor_id))
         .replace(Cursor::Virtual(cursor));
+    state.has_virtual_cursor = true;
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
 }

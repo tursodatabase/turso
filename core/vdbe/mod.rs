@@ -926,6 +926,10 @@ pub struct ProgramState {
     /// false here means the statement has no such cursor and the commit
     /// hooks have nothing to visit.
     pub(crate) has_index_method_context: bool,
+    /// Whether this execution opened a virtual-table cursor. Only VOpen
+    /// installs one, and it sets this at the same time, so a false here
+    /// means the statement-end cleanups have no cursor slot to visit.
+    pub(crate) has_virtual_cursor: bool,
     /// Resumption coordinates for statement-level index-method finalization.
     pub(crate) index_method_finalize_cursor: usize,
     pub(crate) index_method_finalize_subprogram_keys: Option<Vec<usize>>,
@@ -1093,6 +1097,7 @@ impl ProgramState {
             cursors,
             index_method_contexts: vec![None; max_cursors],
             has_index_method_context: false,
+            has_virtual_cursor: false,
             closed_index_method_cursors: Vec::new(),
             index_method_finalize_cursor: 0,
             index_method_finalize_subprogram_keys: None,
@@ -1290,6 +1295,7 @@ impl ProgramState {
             }
         }
         self.has_index_method_context = false;
+        self.has_virtual_cursor = false;
         self.index_method_finalize_cursor = 0;
         self.index_method_finalize_subprogram_keys = None;
         self.index_method_finalize_subprogram = 0;
@@ -1589,6 +1595,16 @@ impl ProgramState {
     /// nested, skips ending its implicit read transaction, and subsequent
     /// writes on the connection never auto-commit (issue #7466).
     pub(crate) fn close_virtual_table_cursors(&mut self) {
+        if !self.has_virtual_cursor {
+            crate::turso_debug_assert!(
+                !self
+                    .cursors
+                    .iter()
+                    .any(|slot| matches!(slot, Some(Cursor::Virtual(_)))),
+                "a virtual-table cursor is open while the flag reads false"
+            );
+            return;
+        }
         for slot in self.cursors.iter_mut() {
             if matches!(slot, Some(Cursor::Virtual(_))) {
                 *slot = None;
