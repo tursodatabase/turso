@@ -804,6 +804,19 @@ pub struct TableInteriorCell {
     pub rowid: i64,
 }
 
+impl BTreeCell {
+    /// The first page of this cell's overflow chain, or None when the whole
+    /// payload sits on the page. A table interior cell holds no payload.
+    pub fn first_overflow_page(&self) -> Option<u32> {
+        match self {
+            BTreeCell::TableInteriorCell(_) => None,
+            BTreeCell::TableLeafCell(cell) => cell.first_overflow_page,
+            BTreeCell::IndexInteriorCell(cell) => cell.first_overflow_page,
+            BTreeCell::IndexLeafCell(cell) => cell.first_overflow_page,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct TableLeafCell {
     pub rowid: i64,

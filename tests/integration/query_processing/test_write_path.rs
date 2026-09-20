@@ -60,6 +60,36 @@ fn test_simple_overflow_page(tmp_db: TempDatabase) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// The rows a table leaf cell cannot hold keep the rest of their payload on
+/// overflow pages. Writing a shorter row over one of them has to put those
+/// pages back on the freelist, or the file grows on every such update.
+#[turso_macros::test(init_sql = "CREATE TABLE t (id INTEGER PRIMARY KEY, b BLOB);")]
+fn overwriting_a_long_row_frees_the_overflow_pages_it_had(
+    tmp_db: TempDatabase,
+) -> anyhow::Result<()> {
+    let conn = tmp_db.connect_limbo();
+    conn.execute("INSERT INTO t VALUES (1, zeroblob(40000))")?;
+    let before = freelist_count(&conn);
+    conn.execute("UPDATE t SET b = x'00'")?;
+    let after = freelist_count(&conn);
+    assert!(
+        after > before,
+        "the old row's overflow pages stayed off the freelist: {before} -> {after}"
+    );
+    rusqlite_integrity_check(&tmp_db.path)?;
+    Ok(())
+}
+
+fn freelist_count(conn: &Arc<Connection>) -> i64 {
+    match limbo_exec_rows(conn, "PRAGMA freelist_count").as_slice() {
+        [row] => match row.as_slice() {
+            [rusqlite::types::Value::Integer(count)] => *count,
+            other => panic!("unexpected freelist_count row: {other:?}"),
+        },
+        other => panic!("unexpected freelist_count result: {other:?}"),
+    }
+}
+
 #[turso_macros::test(mvcc, init_sql = "CREATE TABLE test (x INTEGER PRIMARY KEY, t TEXT);")]
 fn test_sequential_overflow_page(tmp_db: TempDatabase) -> anyhow::Result<()> {
     let _ = env_logger::try_init();

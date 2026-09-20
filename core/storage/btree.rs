@@ -5386,11 +5386,12 @@ impl BTreeCursor {
         self.usable_space_cached
     }
 
-    /// Clear the overflow pages linked to a specific page provided by the leaf cell
+    /// Free the overflow chain that starts at `first_overflow_page`, when a
+    /// cell has one.
     /// Uses a state machine to keep track of it's operations so that traversal can be
     /// resumed from last point after IO interruption
     #[cfg_attr(debug_assertions, instrument(skip_all, level = Level::DEBUG))]
-    fn clear_overflow_pages(&mut self, cell: &BTreeCell) -> IOResultOr<()> {
+    fn clear_overflow_pages(&mut self, first_overflow_page: Option<u32>) -> IOResultOr<()> {
         // `database_size` is invariant for the duration of this invocation, so
         // read the page-1 header at most once and reuse it for every overflow
         // page validation below instead of re-reading it per `ReadNext`.
@@ -5398,15 +5399,6 @@ impl BTreeCursor {
         loop {
             match self.overflow_state.clone() {
                 OverflowState::Start => {
-                    let first_overflow_page = match cell {
-                        BTreeCell::TableLeafCell(leaf_cell) => leaf_cell.first_overflow_page,
-                        BTreeCell::IndexLeafCell(leaf_cell) => leaf_cell.first_overflow_page,
-                        BTreeCell::IndexInteriorCell(interior_cell) => {
-                            interior_cell.first_overflow_page
-                        }
-                        BTreeCell::TableInteriorCell(_) => return Ok(IOResult::Done(())), // No overflow pages
-                    };
-
                     if let Some(next_page) = first_overflow_page {
                         let database_size =
                             return_if_io!(self.overflow_database_size(&mut database_size));
@@ -5667,7 +5659,7 @@ impl BTreeCursor {
                     }
                 }
                 DestroyState::ClearOverflowPages { cell } => {
-                    return_if_io!(self.clear_overflow_pages(&cell));
+                    return_if_io!(self.clear_overflow_pages(cell.first_overflow_page()));
                     match cell {
                         //  For an index interior cell, clear the left child page now that overflow pages have been cleared
                         BTreeCell::IndexInteriorCell(index_int_cell) => {
@@ -6256,9 +6248,15 @@ impl BTreeCursor {
                     old_offset,
                     old_local_size,
                 } => {
+                    // Only the overflow chain of the old cell is still
+                    // wanted here, and reading it stops at the payload's
+                    // first bytes, where a whole cell parse also builds a
+                    // BTreeCell the rest of this arm never reads.
+                    let (_, _, first_overflow_page) = page
+                        .get_contents()
+                        .cell_read_payload_ptr(cell_idx, self.payload_limits)?;
+                    return_if_io!(self.clear_overflow_pages(first_overflow_page));
                     let contents = page.get_contents();
-                    let cell = contents.cell_get(cell_idx, self.usable_space())?;
-                    return_if_io!(self.clear_overflow_pages(&cell));
 
                     // if it all fits in local space and old_local_size is enough, do an in-place overwrite
                     if new_payload.len() == *old_local_size {
@@ -7111,8 +7109,8 @@ impl CursorTrait for BTreeCursor {
                 }
 
                 DeleteState::ClearOverflowPages { cell, .. } => {
-                    let cell = cell.clone();
-                    return_if_io!(self.clear_overflow_pages(&cell));
+                    let first_overflow_page = cell.first_overflow_page();
+                    return_if_io!(self.clear_overflow_pages(first_overflow_page));
 
                     let CursorState::Delete(DeleteState::ClearOverflowPages {
                         cell_idx,
@@ -12915,7 +12913,9 @@ mod tests {
             .block(|| pager.with_header(|header| header.freelist_pages))?
             .get();
         // Clear overflow pages
-        pager.io.block(|| cursor.clear_overflow_pages(&leaf_cell))?;
+        pager
+            .io
+            .block(|| cursor.clear_overflow_pages(leaf_cell.first_overflow_page()))?;
         let (freelist_pages, freelist_trunk_page) = pager
             .io
             .block(|| {
@@ -13106,7 +13106,9 @@ mod tests {
             .get() as usize;
 
         // Try to clear non-existent overflow pages
-        pager.io.block(|| cursor.clear_overflow_pages(&leaf_cell))?;
+        pager
+            .io
+            .block(|| cursor.clear_overflow_pages(leaf_cell.first_overflow_page()))?;
         let (freelist_pages, freelist_trunk_page) = pager.io.block(|| {
             pager.with_header(|header| {
                 (
