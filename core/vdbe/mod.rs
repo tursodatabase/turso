@@ -1239,6 +1239,7 @@ impl ProgramState {
         self.deferred_seeks_pending = 0;
     }
 
+    #[inline]
     pub fn get_parameter(&self, index: NonZero<usize>) -> Value {
         let i = index.get() - 1;
         self.parameters.get(i).cloned().unwrap_or(Value::Null)
