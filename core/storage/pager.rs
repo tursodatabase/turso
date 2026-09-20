@@ -3995,8 +3995,15 @@ impl Pager {
         if !page.is_dirty() || page.is_spilled() {
             let key = PageCacheKey::new(page.get().id());
             self.page_cache.write().notify_page_dirty(key);
+            page.set_dirty();
+        } else {
+            // set_dirty changes the flag word exactly when the page is spilled
+            // or not yet dirty, which is the test above. Past it, its two
+            // read-modify-writes clear a bit that is clear and set a bit that
+            // is set, and each one is a locked instruction. The WAL tag still
+            // has to go, because the page is about to change again.
+            page.clear_wal_tag();
         }
-        page.set_dirty();
         Ok(())
     }
 
