@@ -1292,6 +1292,11 @@ impl OuterQueryReference {
         self.table.columns()
     }
 
+    pub fn is_cte_name_in_scope(&self) -> bool {
+        (self.cte_id.is_some() || matches!(self.table, Table::RecursiveCteInput(_)))
+            && self.identifier == self.table.get_name()
+    }
+
     /// Marks a column as used; used means that the column is referenced in the query.
     pub fn mark_column_used(&mut self, column_index: usize) -> Result<()> {
         self.col_used_mask.set(column_index)?;
@@ -1569,6 +1574,15 @@ impl TableReferences {
         self.outer_query_refs
             .iter()
             .find(|t| t.identifier == identifier)
+    }
+
+    pub fn find_cte_outer_query_ref_by_identifier(
+        &self,
+        identifier: &str,
+    ) -> Option<&OuterQueryReference> {
+        self.outer_query_refs
+            .iter()
+            .find(|t| t.identifier == identifier && t.is_cte_name_in_scope())
     }
 
     /// Marks the pre-planned [OuterQueryReference] with the given identifier as
