@@ -371,7 +371,12 @@ enum WriteState {
     /// we may also need to clear the old cell's overflow pages
     /// and add them to the freelist.
     Overwrite {
-        page: PageRef,
+        // An Option although it is not optional, for the same reason `state` is
+        // one: `overwrite_cell` wants the cursor as well as the page, so the arm
+        // takes the page as owned and puts it back if overwriting returns IO.
+        // Cloning the page's Arc for that borrow cost two locked
+        // read-modify-writes per row overwritten.
+        page: Option<PageRef>,
         cell_idx: usize,
         // This is an Option although it's not optional; we `take` it as owned for [BTreeCursor::overwrite_cell]
         // to work around the borrow checker, and then insert it back if overwriting returns IO.
@@ -3220,7 +3225,7 @@ impl BTreeCursor {
                                 std::mem::forget(std::mem::replace(
                                     write_state,
                                     WriteState::Overwrite {
-                                        page,
+                                        page: Some(page),
                                         cell_idx,
                                         state: Some(OverwriteCellState::AllocatePayload),
                                     },
@@ -3255,7 +3260,7 @@ impl BTreeCursor {
                                 std::mem::forget(std::mem::replace(
                                     write_state,
                                     WriteState::Overwrite {
-                                        page,
+                                        page: Some(page),
                                         cell_idx,
                                         state: Some(OverwriteCellState::AllocatePayload),
                                     },
@@ -3352,11 +3357,11 @@ impl BTreeCursor {
                     cell_idx,
                     ref mut state,
                 } => {
+                    // Both the page and the overwrite state come out as owned
+                    // values to prevent a double borrow of `self` in
+                    // `overwrite_cell`. Both go back if overwriting returns IO.
+                    let page = page.take().expect("page should be present");
                     turso_assert!(page.is_loaded(), "page is not loaded", { "page_id": page.get().id() });
-                    let page = page.clone();
-
-                    // Currently it's necessary to .take() here to prevent double-borrow of `self` in `overwrite_cell`.
-                    // We insert the state back if overwriting returns IO.
                     let mut state = state.take().expect("state should be present");
                     let cell_idx = *cell_idx;
                     if let IOResult::IO(io) =
@@ -3366,7 +3371,7 @@ impl BTreeCursor {
                             panic!("expected write state");
                         };
                         *write_state = WriteState::Overwrite {
-                            page,
+                            page: Some(page),
                             cell_idx,
                             state: Some(state),
                         };
@@ -6749,9 +6754,13 @@ impl BTreeCursor {
         // If the cursor is dropped in that window, this page handle is the only owner
         // of that transient state.
         match &self.state {
-            CursorState::Write(WriteState::Insert { page, .. })
-            | CursorState::Write(WriteState::Overwrite { page, .. }) => {
+            CursorState::Write(WriteState::Insert { page, .. }) => {
                 page.get().overflow_cells.clear();
+            }
+            CursorState::Write(WriteState::Overwrite { page, .. }) => {
+                if let Some(page) = page {
+                    page.get().overflow_cells.clear();
+                }
             }
             CursorState::Write(WriteState::Start)
             | CursorState::Write(WriteState::Balancing)
