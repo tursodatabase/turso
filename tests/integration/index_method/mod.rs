@@ -3965,6 +3965,64 @@ fn fts_savepoint_rollback_discards_statement_documents() {
 
 #[cfg(all(feature = "fts", not(target_family = "wasm")))]
 #[test]
+fn fts_mvcc_reused_rowid_survives_savepoint_rollback_and_merge() {
+    let tmp_db = TempDatabase::builder()
+        .with_opts(turso_core::DatabaseOpts::new().with_index_method(true))
+        .with_mvcc(true)
+        .build();
+    let writer = tmp_db.connect_limbo();
+    let reader = tmp_db.connect_limbo();
+    writer
+        .execute("CREATE TABLE docs(id INTEGER PRIMARY KEY, body TEXT)")
+        .unwrap();
+    writer
+        .execute("CREATE INDEX docs_fts ON docs USING fts(body)")
+        .unwrap();
+    for (id, text) in [(-2, "other"), (7, "original"), (19, "other")] {
+        writer
+            .execute(format!("INSERT INTO docs VALUES ({id}, '{text}')"))
+            .unwrap();
+    }
+    reader.execute("BEGIN").unwrap();
+    assert_eq!(fts_ids(&reader, "original"), [7]);
+
+    writer.execute("BEGIN CONCURRENT").unwrap();
+    writer.execute("SAVEPOINT before_reuse").unwrap();
+    writer.execute("DELETE FROM docs WHERE id = 7").unwrap();
+    writer
+        .execute("INSERT INTO docs VALUES (7, 'discarded')")
+        .unwrap();
+    assert_eq!(fts_ids(&writer, "discarded"), [7]);
+    assert!(fts_ids(&writer, "original").is_empty());
+    writer.execute("ROLLBACK TO before_reuse").unwrap();
+    assert_eq!(fts_ids(&writer, "original"), [7]);
+    assert!(fts_ids(&writer, "discarded").is_empty());
+
+    writer.execute("DELETE FROM docs WHERE id = 7").unwrap();
+    writer
+        .execute("INSERT INTO docs VALUES (7, 'replacement')")
+        .unwrap();
+    writer.execute("COMMIT").unwrap();
+    writer.execute("OPTIMIZE INDEX docs_fts").unwrap();
+    assert_eq!(fts_ids(&writer, "replacement"), [7]);
+    assert!(fts_ids(&writer, "original").is_empty());
+    assert_eq!(fts_ids(&reader, "original"), [7]);
+    assert!(fts_ids(&reader, "replacement").is_empty());
+    reader.execute("COMMIT").unwrap();
+    assert_eq!(fts_ids(&reader, "replacement"), [7]);
+
+    writer.execute("BEGIN CONCURRENT").unwrap();
+    writer.execute("DELETE FROM docs WHERE id = 7").unwrap();
+    assert!(fts_ids(&writer, "replacement").is_empty());
+    writer.execute("ROLLBACK").unwrap();
+    assert_eq!(fts_ids(&writer, "replacement"), [7]);
+    writer.execute("DELETE FROM docs WHERE id = 7").unwrap();
+    assert!(fts_ids(&writer, "replacement").is_empty());
+    assert_eq!(fts_ids(&writer, "other"), [-2, 19]);
+}
+
+#[cfg(all(feature = "fts", not(target_family = "wasm")))]
+#[test]
 fn fts_mvcc_rolled_back_concurrent_writer_leaves_no_trace() {
     let tmp_db = TempDatabase::builder()
         .with_opts(turso_core::DatabaseOpts::new().with_index_method(true))
