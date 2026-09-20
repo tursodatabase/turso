@@ -77,6 +77,9 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: llvm-tools-preview
+      - name: Setup MSVC
+        if: runner.os == 'Windows'
+        uses: "./.github/shared/setup-msvc"
       - name: Setup mold linker
         if: runner.os == 'Linux'
         uses: "./.github/shared/setup-mold"
@@ -574,6 +577,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+      - name: Setup MSVC
+        uses: "./.github/shared/setup-msvc"
       - uses: Swatinem/rust-cache@v2
         with:
           prefix-key: "v1-rust"

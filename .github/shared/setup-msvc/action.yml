@@ -1,0 +1,55 @@
+name: "Setup MSVC"
+description: "Puts the MSVC compiler and linker on PATH so bare cl.exe calls and CC=cl.exe work"
+
+inputs:
+  arch:
+    description: "Architecture argument passed to vcvarsall.bat"
+    required: false
+    default: "x64"
+
+runs:
+  using: "composite"
+  steps:
+    - name: Load the MSVC environment
+      shell: pwsh
+      run: |
+        $ErrorActionPreference = "Stop"
+
+        $vswhere = Join-Path ${env:ProgramFiles(x86)} "Microsoft Visual Studio\Installer\vswhere.exe"
+        if (!(Test-Path $vswhere)) {
+          throw "vswhere.exe not found at $vswhere"
+        }
+
+        $vcvarsall = & $vswhere -latest -products * -find "VC\Auxiliary\Build\vcvarsall.bat" | Select-Object -First 1
+        if (!$vcvarsall) {
+          throw "no Visual Studio installation with the C++ build tools"
+        }
+
+        $settings = & $env:ComSpec /c "call `"$vcvarsall`" ${{ inputs.arch }} >nul && set"
+        if ($LASTEXITCODE -ne 0) {
+          throw "vcvarsall.bat ${{ inputs.arch }} failed with exit code $LASTEXITCODE"
+        }
+
+        $currentPath = $env:PATH.Split(';')
+        foreach ($setting in $settings) {
+          $separator = $setting.IndexOf('=')
+          if ($separator -lt 1) {
+            continue
+          }
+          $name = $setting.Substring(0, $separator)
+          $value = $setting.Substring($separator + 1)
+          if ($name -eq 'PATH') {
+            $added = @($value.Split(';') | Where-Object { $_ -and $currentPath -notcontains $_ })
+            if ($added.Count -gt 0) {
+              Add-Content -Path $env:GITHUB_PATH -Value $added
+            }
+          } elseif ($name -in @('INCLUDE', 'LIB', 'LIBPATH')) {
+            Add-Content -Path $env:GITHUB_ENV -Value "$name=$value"
+          }
+        }
+
+    - name: Check that the MSVC compiler is reachable
+      shell: pwsh
+      run: |
+        $ErrorActionPreference = "Stop"
+        Write-Output (Get-Command cl.exe).Source
