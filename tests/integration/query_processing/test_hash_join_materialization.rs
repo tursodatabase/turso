@@ -450,3 +450,122 @@ WHERE build_side.name = 'keep' ORDER BY probe_side.v";
     ];
     assert_eq!(rows, expected);
 }
+
+#[test]
+fn hash_join_declined_when_the_build_input_is_filtered_by_the_outer_query() {
+    let _ = env_logger::try_init();
+    let tmp_db = TempDatabase::new_empty();
+    let sqlite_conn = rusqlite::Connection::open_in_memory().unwrap();
+    let conn = tmp_db.connect_limbo();
+
+    let setup = [
+        "CREATE TABLE t(id INTEGER PRIMARY KEY, n INTEGER DEFAULT 0)",
+        "CREATE TABLE u(cid INTEGER, k TEXT)",
+        "CREATE TABLE v(k TEXT, a INTEGER)",
+        "CREATE TABLE w(a INTEGER)",
+        "CREATE INDEX iu ON u(cid)",
+        "INSERT INTO t(id) VALUES(1),(2),(3),(4)",
+        "INSERT INTO u VALUES(1,'a'),(1,'a'),(2,'b'),(3,'a')",
+        "INSERT INTO v VALUES('a',1),('b',1)",
+        "INSERT INTO w VALUES(1)",
+    ];
+    for stmt in &setup {
+        limbo_exec_rows(&conn, stmt);
+        sqlite_conn.execute(stmt, []).unwrap();
+    }
+
+    let update_set = "UPDATE t SET n = (SELECT count(*) FROM u JOIN v ON v.k=u.k JOIN w ON w.a=v.a WHERE u.cid=t.id)";
+    limbo_exec_rows(&conn, update_set);
+    sqlite_conn.execute(update_set, []).unwrap();
+
+    let read_back = "SELECT id, n FROM t ORDER BY id";
+    assert_eq!(
+        sqlite_exec_rows(&sqlite_conn, read_back),
+        limbo_exec_rows(&conn, read_back),
+        "UPDATE ... SET with a correlated subquery over a joined build side"
+    );
+
+    for stmt in [
+        "UPDATE t SET n = 0",
+        "UPDATE t SET n = 9 WHERE (SELECT count(*) FROM u JOIN v ON v.k=u.k JOIN w ON w.a=v.a WHERE u.cid=t.id) = 0",
+    ] {
+        limbo_exec_rows(&conn, stmt);
+        sqlite_conn.execute(stmt, []).unwrap();
+    }
+
+    assert_eq!(
+        sqlite_exec_rows(&sqlite_conn, read_back),
+        limbo_exec_rows(&conn, read_back),
+        "UPDATE ... WHERE with a correlated subquery over a joined build side"
+    );
+
+    let update_set_reversed = "UPDATE t SET n = (SELECT count(*) FROM u JOIN v ON v.k=u.k JOIN w ON w.a=v.a WHERE t.id=u.cid)";
+    limbo_exec_rows(&conn, update_set_reversed);
+    sqlite_conn.execute(update_set_reversed, []).unwrap();
+
+    assert_eq!(
+        sqlite_exec_rows(&sqlite_conn, read_back),
+        limbo_exec_rows(&conn, read_back),
+        "the same correlated comparison written with the outer column first"
+    );
+}
+
+#[test]
+fn hash_join_declined_when_an_outer_column_is_wrapped_in_a_subquery_or_an_in_list() {
+    let _ = env_logger::try_init();
+    let tmp_db = TempDatabase::new_empty();
+    let conn = tmp_db.connect_limbo();
+
+    for stmt in [
+        "CREATE TABLE t(id INTEGER PRIMARY KEY, n INTEGER DEFAULT 0)",
+        "CREATE TABLE u(cid INTEGER, k TEXT)",
+        "CREATE TABLE v(k TEXT, a INTEGER)",
+        "CREATE TABLE w(a INTEGER)",
+        "CREATE INDEX iu ON u(cid)",
+        "INSERT INTO t(id) VALUES(1),(2),(3),(4)",
+        "INSERT INTO u VALUES(1,'a'),(1,'a'),(2,'b'),(3,'a')",
+        "INSERT INTO v VALUES('a',1),('b',1)",
+        "INSERT INTO w VALUES(1)",
+    ] {
+        limbo_exec_rows(&conn, stmt);
+    }
+
+    let hash_build_count = |sql: &str| {
+        limbo_exec_rows(&conn, &format!("EXPLAIN {sql}"))
+            .iter()
+            .filter(|row| row.get(1).and_then(value_as_text) == Some("HashBuild"))
+            .count()
+    };
+
+    let joined = "SELECT count(*) FROM u JOIN v ON v.k=u.k JOIN w ON w.a=v.a WHERE";
+    // The same shape with a filter the outer query cannot change still hash joins,
+    // so a zero below reports the filter and not this query shape.
+    assert!(
+        hash_build_count(&format!("UPDATE t SET n = ({joined} u.cid=1)")) > 0,
+        "a build side filtered by a constant should still hash join"
+    );
+
+    let correlated_filters = ["u.cid=t.id", "u.cid=(SELECT t.id)", "u.cid IN (t.id)"];
+    // Counts read from /usr/bin/sqlite3 3.51.0 on this schema and these rows.
+    let expected: Vec<Vec<Value>> = vec![
+        vec![Value::Integer(1), Value::Integer(2)],
+        vec![Value::Integer(2), Value::Integer(1)],
+        vec![Value::Integer(3), Value::Integer(1)],
+        vec![Value::Integer(4), Value::Integer(0)],
+    ];
+    for filter in correlated_filters {
+        let update = format!("UPDATE t SET n = ({joined} {filter})");
+        assert_eq!(
+            hash_build_count(&update),
+            0,
+            "a build input filtered by the outer query must not be hash joined: {filter}"
+        );
+        limbo_exec_rows(&conn, "UPDATE t SET n = 0");
+        limbo_exec_rows(&conn, &update);
+        assert_eq!(
+            limbo_exec_rows(&conn, "SELECT id, n FROM t ORDER BY id"),
+            expected,
+            "every row must get its own count: {filter}"
+        );
+    }
+}

@@ -218,7 +218,7 @@ pub fn expr_references_outer_query(expr: &ast::Expr, table_references: &TableRef
     let mut has_outer_ref = false;
     walk_expr(expr, &mut |expr: &ast::Expr| -> Result<WalkControl> {
         if let ast::Expr::Column { table, .. } | ast::Expr::RowId { table, .. } = expr {
-            has_outer_ref = table_references
+            has_outer_ref |= table_references
                 .find_outer_query_ref_by_internal_id(*table)
                 .is_some();
         }

@@ -18,7 +18,7 @@ use crate::{
     schema::Schema,
     stats::AnalyzeStats,
     translate::{
-        expr::expr_references_subquery_id,
+        expr::{expr_references_outer_query, expr_references_subquery_id, walk_expr, WalkControl},
         optimizer::{
             access_method::{
                 estimate_hash_join_cost, tables_in_equal_test, try_hash_join_access_method,
@@ -463,6 +463,43 @@ impl JoinN {
     }
 }
 
+/// Whether a filter reaches a row of the enclosing query through a subquery.
+///
+/// The plain column walker stops at a subquery boundary, so an enclosing-query
+/// column wrapped in one is invisible to it. A subquery this planner cannot
+/// resolve, or one whose plan is already gone, counts as reaching the enclosing
+/// query, so the check never falls through to allow.
+fn expr_reads_outer_query_through_subquery(
+    expr: &turso_parser::ast::Expr,
+    subqueries: &[NonFromClauseSubquery],
+    table_references: &TableReferences,
+) -> bool {
+    let mut reads_outer_query = false;
+    let _ = walk_expr(
+        expr,
+        &mut |expr: &turso_parser::ast::Expr| -> Result<WalkControl> {
+            let turso_parser::ast::Expr::SubqueryResult { subquery_id, .. } = expr else {
+                return Ok(WalkControl::Continue);
+            };
+            let Some(SubqueryState::Unevaluated { plan: Some(plan) }) = subqueries
+                .iter()
+                .find(|subquery| subquery.internal_id == *subquery_id)
+                .map(|subquery| &subquery.state)
+            else {
+                reads_outer_query = true;
+                return Ok(WalkControl::Continue);
+            };
+            reads_outer_query |= plan.used_outer_query_ref_ids().iter().any(|table_id| {
+                table_references
+                    .find_outer_query_ref_by_internal_id(*table_id)
+                    .is_some()
+            });
+            Ok(WalkControl::Continue)
+        },
+    );
+    reads_outer_query
+}
+
 /// Join n-1 tables with the n'th table.
 /// Returns None if the plan is worse than the provided cost upper bound or if no valid access method is found.
 ///
@@ -807,13 +844,32 @@ fn join_lhs_and_rhs<'a>(
 
             let build_table_is_last = build_table_idx == last_lhs_table_idx;
 
+            // The hash build input is filled once and reused for every row of the enclosing
+            // query, so no table in it may be filtered by that query: the build would hold
+            // the first outer row's rows for all of them.
+            let build_input_reads_outer_query = lhs.data.iter().any(|(lhs_table_idx, _)| {
+                all_constraints[*lhs_table_idx]
+                    .constraints
+                    .iter()
+                    .any(|constraint| {
+                        let term = &where_clause[constraint.where_clause_pos.0];
+                        expr_references_outer_query(&term.expr, table_references)
+                            || expr_reads_outer_query_through_subquery(
+                                &term.expr,
+                                subqueries,
+                                table_references,
+                            )
+                    })
+            });
+
             // Eligibility gate: prefer nested-loop when uses a selective probe seek.
             // Probe->build chaining is only allowed when the
             // build input is materialized from the join prefix.
             let allow_hash_join = !rhs_has_selective_seek
                 && !probe_table_is_prior_build
                 && (!build_has_prior_constraints || build_has_rowid)
-                && !chaining_across_outer;
+                && !chaining_across_outer
+                && !build_input_reads_outer_query;
 
             tracing::debug!(
                 lhs_table = build_table.table.get_name(),
