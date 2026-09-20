@@ -1437,6 +1437,9 @@ struct SavepointSnapshot {
     deferred_fk_violations: isize,
 }
 
+/// Page numbers start at one, so zero names no page.
+const NO_PAGE: u32 = 0;
+
 struct Savepoint {
     kind: SavepointKind,
     /// Start offset of this savepoint in the subjournal.
@@ -1445,6 +1448,11 @@ struct Savepoint {
     write_offset: AtomicU64,
     /// Bitmap of page numbers that are dirty in the savepoint.
     page_bitmap: RwLock<RoaringBitmap>,
+    /// The page `add_dirty_page` put in the bitmap last, or `NO_PAGE`. The
+    /// bitmap only grows while the savepoint is open, so a page that matches
+    /// is still in it and the lock has nothing to add. A write transaction
+    /// writes the same page many times in a row.
+    last_dirty_page: AtomicU32,
     /// Database size at the start of the savepoint.
     /// If the database grows during the savepoint and a rollback to the savepoint is performed,
     /// the pages exceeding the database size at the start of the savepoint will be ignored.
@@ -1472,6 +1480,7 @@ impl Savepoint {
             start_offset: AtomicU64::new(subjournal_offset),
             write_offset: AtomicU64::new(subjournal_offset),
             page_bitmap: RwLock::new(RoaringBitmap::new()),
+            last_dirty_page: AtomicU32::new(NO_PAGE),
             db_size: AtomicU32::new(db_size),
             wal_pos: RwLock::new(wal_pos),
             deferred_fk_violations: AtomicIsize::new(deferred_fk_violations),
@@ -1479,10 +1488,19 @@ impl Savepoint {
     }
 
     pub fn add_dirty_page(&self, page_num: u32) {
+        turso_debug_assert!(page_num != NO_PAGE, "page numbers start at one");
         self.page_bitmap.write().insert(page_num);
+        self.last_dirty_page.store(page_num, Ordering::Release);
     }
 
     pub fn has_dirty_page(&self, page_num: u32) -> bool {
+        if self.last_dirty_page.load(Ordering::Acquire) == page_num {
+            turso_debug_assert!(
+                self.page_bitmap.read().contains(page_num),
+                "the page the savepoint took last is not in its bitmap"
+            );
+            return true;
+        }
         self.page_bitmap.read().contains(page_num)
     }
 
@@ -1514,6 +1532,7 @@ impl Savepoint {
             start_offset: AtomicU64::new(snapshot.start_offset),
             write_offset: AtomicU64::new(snapshot.start_offset),
             page_bitmap: RwLock::new(RoaringBitmap::new()),
+            last_dirty_page: AtomicU32::new(NO_PAGE),
             db_size: AtomicU32::new(snapshot.db_size),
             wal_pos: RwLock::new(snapshot.wal_pos),
             deferred_fk_violations: AtomicIsize::new(snapshot.deferred_fk_violations),
@@ -6522,6 +6541,23 @@ mod tests {
         default_page1, CacheFlushState, CollectingState, DirtyPages, Page, PageRef, Pager,
     };
     use crate::{Buffer, Completion, CompletionError, LimboError};
+
+    #[test]
+    fn a_savepoint_holds_every_page_it_took() {
+        let savepoint = super::Savepoint::new(super::SavepointKind::Statement, 0, 100, None, 0);
+        assert!(!savepoint.has_dirty_page(7));
+
+        savepoint.add_dirty_page(7);
+        assert!(savepoint.has_dirty_page(7));
+        assert!(!savepoint.has_dirty_page(8), "only page 7 was taken");
+
+        savepoint.add_dirty_page(8);
+        assert!(
+            savepoint.has_dirty_page(7),
+            "a page the savepoint took stays taken once another follows it"
+        );
+        assert!(savepoint.has_dirty_page(8));
+    }
 
     #[test]
     fn clearing_the_dirty_set_takes_its_last_page_again() {
