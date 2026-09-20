@@ -3394,9 +3394,13 @@ impl BTreeCursor {
                     turso_assert!(page.is_loaded(), "page is not loaded", { "page_id": page.get().id() });
                     let mut state = state.take().expect("state should be present");
                     let cell_idx = *cell_idx;
-                    if let IOResult::IO(io) =
-                        self.overwrite_cell(&page, cell_idx, record_payload, &mut state)?
-                    {
+                    if let IOResult::IO(io) = self.overwrite_cell(
+                        &page,
+                        cell_idx,
+                        record_payload,
+                        bkey.maybe_rowid(),
+                        &mut state,
+                    )? {
                         let CursorState::Write(write_state) = &mut self.state else {
                             panic!("expected write state");
                         };
@@ -6368,6 +6372,7 @@ impl BTreeCursor {
         page: &PageRef,
         cell_idx: usize,
         record_payload: &[u8],
+        rowid: Option<i64>,
         state: &mut OverwriteCellState,
     ) -> IOResultOr<()> {
         loop {
@@ -6395,7 +6400,19 @@ impl BTreeCursor {
                             new_payload.try_reserve(needed - new_payload.capacity())
                         )?;
                     }
-                    let rowid = return_if_io!(self.rowid());
+                    // The rowid comes from the key being written.
+                    // `insert_into_page` takes this path for a table leaf only
+                    // after reading the cell's own rowid and finding it equal,
+                    // so asking the cursor for it here read the cell header a
+                    // second time.
+                    turso_debug_assert!(
+                        !matches!(page.get_contents().page_type(), Ok(PageType::TableLeaf))
+                            || page
+                                .get_contents()
+                                .cell_table_leaf_read_header(cell_idx)
+                                .is_ok_and(|header| Some(header.rowid) == rowid),
+                        "an overwritten table leaf cell keeps the rowid it had"
+                    );
                     *state = OverwriteCellState::FillPayload {
                         new_payload,
                         rowid,
