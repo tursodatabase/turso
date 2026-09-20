@@ -55,9 +55,10 @@ jobs:
 
       - name: Install SQLite
         if: runner.os == 'Windows'
+        shell: pwsh
         run: |
           echo "VCPKG_ROOT=$env:VCPKG_INSTALLATION_ROOT" >> $env:GITHUB_ENV
-          vcpkg install sqlite3:x64-windows-static-md
+          & "$env:VCPKG_INSTALLATION_ROOT\vcpkg.exe" install sqlite3:x64-windows-static-md
 
       - name: Build Turso C bindings
         run: cargo build -p turso_sqlite3 --features capi --locked

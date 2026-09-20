@@ -105,9 +105,10 @@ jobs:
           python-version: "3.10"
       - name: Install SQLite (Windows)
         if: runner.os == 'Windows'
+        shell: pwsh
         run: |
           echo "VCPKG_ROOT=$env:VCPKG_INSTALLATION_ROOT" >> $env:GITHUB_ENV
-          vcpkg install sqlite3:x64-windows-static-md
+          & "$env:VCPKG_INSTALLATION_ROOT\vcpkg.exe" install sqlite3:x64-windows-static-md
       - name: Build
         run: cargo build --verbose --locked --all-features
       - name: Test (nextest with coverage)
