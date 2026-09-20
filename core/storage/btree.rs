@@ -6898,6 +6898,18 @@ impl CursorTrait for BTreeCursor {
                 let start = noted.start as usize;
                 let contents = self.stack.top_ref().get_contents();
                 if let Some(payload) = contents.payload_on_page(start, size) {
+                    turso_debug_assert!(
+                        contents
+                            .cell_read_payload_at(
+                                self.stack.current_cell_index() as usize,
+                                self.payload_limits,
+                            )
+                            .is_ok_and(|(fresh, fresh_start, _, overflow)| overflow.is_none()
+                                && fresh_start == start
+                                && fresh.len() == size),
+                        "the noted payload does not describe the cell under the cursor",
+                        { "start": start, "size": size }
+                    );
                     return Ok(IOResult::Done(Some(payload)));
                 }
             }
