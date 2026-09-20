@@ -642,6 +642,14 @@ pub struct InteriorPageBinarySearchState {
     eq_seen: bool,
 }
 
+/// Where a table leaf search says the cursor lands, and what it finds there.
+/// `has_record` is None where the search leaves the flag alone.
+struct LeafSearchOutcome {
+    cell_index: i32,
+    has_record: Option<bool>,
+    result: SeekResult,
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct LeafPageBinarySearchState {
     min_cell_idx: isize,
@@ -2600,26 +2608,24 @@ impl BTreeCursor {
             unreachable!("we must be in a leaf binary search state");
         };
 
-        let page = self.stack.top_ref().clone();
-        let contents = page.get_contents();
-        let mut state = *state;
-
-        loop {
-            let control = self.tablebtree_seek_inner(rowid, seek_op, contents, &mut state)?;
-            // Persist state after each iteration since inner function modifies it
-            if matches!(
-                self.seek_state,
-                CursorSeekState::LeafPageBinarySearch { .. }
-            ) {
-                self.seek_state = CursorSeekState::LeafPageBinarySearch { state };
-            }
-            match control {
-                ControlFlow::Continue(_) => {}
-                ControlFlow::Break(res) => {
-                    return Ok(res);
-                }
-            }
+        let mut search = *state;
+        // The search reads the leaf and says where the cursor lands; moving the
+        // cursor happens here, after the borrow of the page ends. Handing the
+        // search a cursor as well meant cloning the page's Arc to break the
+        // borrow, which is two locked read-modify-writes per seek: one to take
+        // the reference and one to drop it.
+        let outcome = Self::tablebtree_leaf_search(
+            rowid,
+            seek_op,
+            self.stack.top_ref().get_contents(),
+            &mut search,
+        )?;
+        self.seek_state = CursorSeekState::LeafPageBinarySearch { state: search };
+        self.stack.set_cell_index(outcome.cell_index);
+        if let Some(has_record) = outcome.has_record {
+            self.flags.has_record = has_record;
         }
+        Ok(IOResult::Done(outcome.result))
     }
 
     /// Use the loaded table leaf when it can answer an exact rowid lookup.
@@ -2705,27 +2711,28 @@ impl BTreeCursor {
         };
     }
 
-    fn tablebtree_seek_inner(
-        &mut self,
+    /// Narrow the search range on the leaf a table seek has reached, and say
+    /// where the cursor lands and what it finds there. Reading the leaf needs
+    /// no cursor, so the caller keeps its own borrow out of this.
+    fn tablebtree_leaf_search(
         rowid: i64,
         seek_op: SeekOp,
-        contents: &mut PageContent,
+        contents: &PageContent,
         state: &mut LeafPageBinarySearchState,
-    ) -> Result<ControlFlow<IOResult<SeekResult>>> {
+    ) -> Result<LeafSearchOutcome> {
         if matches!(seek_op, SeekOp::GE { eq_only: true }) {
-            return tablebtree_seek_impl::<true>(self, rowid, seek_op, contents, state);
+            return leaf_search::<true>(rowid, seek_op, contents, state);
         } else {
-            return tablebtree_seek_impl::<false>(self, rowid, seek_op, contents, state);
+            return leaf_search::<false>(rowid, seek_op, contents, state);
         }
 
         #[inline]
-        fn tablebtree_seek_impl<const EXACT_FORWARD: bool>(
-            cursor: &mut BTreeCursor,
+        fn leaf_search<const EXACT_FORWARD: bool>(
             rowid: i64,
             seek_op: SeekOp,
-            contents: &mut PageContent,
+            contents: &PageContent,
             state: &mut LeafPageBinarySearchState,
-        ) -> Result<ControlFlow<IOResult<SeekResult>>> {
+        ) -> Result<LeafSearchOutcome> {
             let seek_op = if EXACT_FORWARD {
                 SeekOp::GE { eq_only: true }
             } else {
@@ -2759,9 +2766,11 @@ impl BTreeCursor {
                 if found && seek_op.eq_only() {
                     state.min_cell_idx = min;
                     state.max_cell_idx = max;
-                    cursor.stack.set_cell_index(cur_cell_idx as i32);
-                    cursor.set_has_record(true);
-                    return Ok(ControlFlow::Break(IOResult::Done(SeekResult::Found)));
+                    return Ok(LeafSearchOutcome {
+                        cell_index: cur_cell_idx as i32,
+                        has_record: Some(true),
+                        result: SeekResult::Found,
+                    });
                 }
 
                 if found {
@@ -2806,26 +2815,34 @@ impl BTreeCursor {
             let target_cell_when_not_found = state.target_cell_when_not_found;
             if !EXACT_FORWARD {
                 if let Some(nearest_matching_cell) = state.nearest_matching_cell {
-                    cursor.stack.set_cell_index(nearest_matching_cell as i32);
-                    cursor.set_has_record(true);
-                    return Ok(ControlFlow::Break(IOResult::Done(SeekResult::Found)));
+                    return Ok(LeafSearchOutcome {
+                        cell_index: nearest_matching_cell as i32,
+                        has_record: Some(true),
+                        result: SeekResult::Found,
+                    });
                 }
             }
             // if !eq_only - matching entry can exist in neighbour leaf page
             // this can happen if key in the interiour page was deleted - but divider kept untouched
             // in such case BTree can navigate to the leaf which no longer has matching key for seek_op
             // in this case, caller must advance cursor if necessary
-            Ok(ControlFlow::Break(IOResult::Done(if seek_op.eq_only() {
-                let has_record = target_cell_when_not_found >= 0
-                    && target_cell_when_not_found < contents.cell_count() as i32;
-                cursor.flags.has_record = has_record;
-                cursor.stack.set_cell_index(target_cell_when_not_found);
-                SeekResult::NotFound
+            Ok(if seek_op.eq_only() {
+                LeafSearchOutcome {
+                    cell_index: target_cell_when_not_found,
+                    has_record: Some(
+                        target_cell_when_not_found >= 0
+                            && target_cell_when_not_found < contents.cell_count() as i32,
+                    ),
+                    result: SeekResult::NotFound,
+                }
             } else {
-                // set cursor to the position where which would hold the op-boundary if it were present
-                cursor.stack.set_cell_index(target_cell_when_not_found);
-                SeekResult::TryAdvance
-            })))
+                // the cursor lands where the op-boundary would be if it were present
+                LeafSearchOutcome {
+                    cell_index: target_cell_when_not_found,
+                    has_record: None,
+                    result: SeekResult::TryAdvance,
+                }
+            })
         }
     }
 
