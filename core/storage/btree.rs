@@ -865,7 +865,10 @@ pub struct BTreeCursor {
     /// Information maintained across execution attempts when an operation yields due to I/O.
     state: CursorState,
     /// State machine for balancing.
-    balance_state: BalanceState,
+    /// State of the balance machine, built the first time a write needs
+    /// it. It is 320 of the cursor's bytes and a cursor that only reads
+    /// never touches it, so it is not part of every cursor.
+    balance_state: Option<Box<BalanceState>>,
     /// Information maintained while freeing overflow pages. Maintained separately from cursor state since
     /// any method could require freeing overflow pages
     overflow_state: OverflowState,
@@ -1210,7 +1213,7 @@ impl BTreeCursor {
             null_flag: false,
             going_upwards: false,
             state: CursorState::None,
-            balance_state: BalanceState::default(),
+            balance_state: None,
             overflow_state: OverflowState::Start,
             stack: PageStack {
                 current_page: -1,
@@ -3184,7 +3187,7 @@ impl BTreeCursor {
 
                     if overflows {
                         *write_state = WriteState::Balancing;
-                        turso_assert!(matches!(self.balance_state.sub_state, BalanceSubState::Start), "no balancing operation should be in progress during insert", { "state": self.state, "sub_state": self.balance_state.sub_state });
+                        turso_assert!(self.is_not_balancing(), "no balancing operation should be in progress during insert", { "state": self.state, "balance_state": self.balance_state });
                         // If we balance, we must save the cursor position and seek to it later.
                         self.save_context(CursorContext::seek_eq_only(bkey));
                         inject_io_yield!(
@@ -3231,7 +3234,7 @@ impl BTreeCursor {
                     };
                     if overflows || underflows {
                         *write_state = WriteState::Balancing;
-                        turso_assert!(matches!(self.balance_state.sub_state, BalanceSubState::Start), "no balancing operation should be in progress during overwrite", { "state": self.state, "sub_state": self.balance_state.sub_state });
+                        turso_assert!(self.is_not_balancing(), "no balancing operation should be in progress during overwrite", { "state": self.state, "balance_state": self.balance_state });
                         // If we balance, we must save the cursor position and seek to it later.
                         self.save_context(CursorContext::seek_eq_only(bkey));
                     } else {
@@ -3283,7 +3286,7 @@ impl BTreeCursor {
                 sub_state,
                 balance_info,
                 ..
-            } = &mut self.balance_state;
+            } = &mut **self.balance_state.get_or_insert_default();
             match sub_state {
                 BalanceSubState::Start => {
                     turso_assert!(
@@ -3329,7 +3332,8 @@ impl BTreeCursor {
                 BalanceSubState::BalanceRoot => {
                     return_if_io!(self.balance_root());
 
-                    let BalanceState { sub_state, .. } = &mut self.balance_state;
+                    let BalanceState { sub_state, .. } =
+                        &mut **self.balance_state.get_or_insert_default();
                     *sub_state = BalanceSubState::Decide;
                 }
                 BalanceSubState::Decide => {
@@ -3371,7 +3375,8 @@ impl BTreeCursor {
                         }
                     }
 
-                    let BalanceState { sub_state, .. } = &mut self.balance_state;
+                    let BalanceState { sub_state, .. } =
+                        &mut **self.balance_state.get_or_insert_default();
                     if do_quick {
                         *sub_state = BalanceSubState::Quick;
                     } else {
@@ -3472,7 +3477,7 @@ impl BTreeCursor {
         // Continue balance from the parent page (inserting the new divider cell may have overflowed the parent)
         self.stack.pop();
 
-        let BalanceState { sub_state, .. } = &mut self.balance_state;
+        let BalanceState { sub_state, .. } = &mut **self.balance_state.get_or_insert_default();
         *sub_state = BalanceSubState::Start;
         Ok(IOResult::Done(()))
     }
@@ -3488,7 +3493,7 @@ impl BTreeCursor {
                 reusable_divider_buffers,
                 reusable_cell_payloads,
                 sibling_load_group,
-            } = &mut self.balance_state;
+            } = &mut **self.balance_state.get_or_insert_default();
             tracing::debug!(?sub_state);
 
             match sub_state {
@@ -6529,15 +6534,23 @@ impl ProvidesYieldContext for BTreeCursor {
 }
 
 impl BTreeCursor {
+    /// True while no balance is part-way through. A cursor that has never
+    /// balanced has no balance state at all, which says the same thing.
+    fn is_not_balancing(&self) -> bool {
+        self.balance_state
+            .as_ref()
+            .is_none_or(|state| matches!(state.sub_state, BalanceSubState::Start))
+    }
+
     fn clear_transient_overflow_cells(&mut self) {
         // Overflow cells are page-local scratch for the cursor's in-flight balance.
         // If the cursor is abandoned after queueing them, cached pages may outlive
         // the cursor and must not carry that scratch into later writes.
-        if matches!(self.state, CursorState::None)
-            && matches!(self.balance_state.sub_state, BalanceSubState::Start)
-        {
+        if matches!(self.state, CursorState::None) && self.is_not_balancing() {
             turso_assert!(
-                self.balance_state.balance_info.is_none(),
+                self.balance_state
+                    .as_ref()
+                    .is_none_or(|state| state.balance_info.is_none()),
                 "idle cursor has balance info"
             );
             // No write or balance operation is in progress, so this cursor has no
@@ -6565,7 +6578,11 @@ impl BTreeCursor {
             | CursorState::None => {}
         }
 
-        if let Some(balance_info) = &self.balance_state.balance_info {
+        let Some(balance_state) = &self.balance_state else {
+            return;
+        };
+
+        if let Some(balance_info) = &balance_state.balance_info {
             for page in balance_info.pages_to_balance.iter().flatten() {
                 page.get().overflow_cells.clear();
             }
@@ -6574,7 +6591,7 @@ impl BTreeCursor {
         // Newly allocated/reused sibling pages are tracked only by BalanceContext until
         // non-root balancing finishes. If the cursor is dropped before then, clear any
         // overflow scratch from those pages explicitly.
-        match &self.balance_state.sub_state {
+        match &balance_state.sub_state {
             BalanceSubState::NonRootDoBalancingAllocate {
                 context: Some(context),
                 ..
@@ -7285,7 +7302,14 @@ impl CursorTrait for BTreeCursor {
                             }
                         }
                         let balance_both = leaf_underflows && interior_overflows_or_underflows;
-                        turso_assert!(matches!(self.balance_state.sub_state, BalanceSubState::Start), "no balancing operation should be in progress during delete", { "sub_state": self.balance_state.sub_state });
+                        turso_assert!(
+                            self.balance_state.as_ref().is_none_or(|state| matches!(
+                                state.sub_state,
+                                BalanceSubState::Start
+                            )),
+                            "no balancing operation should be in progress during delete",
+                            { "balance_state": self.balance_state }
+                        );
                         let post_balancing_seek_key = post_balancing_seek_key
                             .take()
                             .expect("post_balancing_seek_key should be Some");
