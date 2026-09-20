@@ -2503,41 +2503,102 @@ impl Schema {
                 })
         };
 
+        // sqlite3FkLocateIndex walks the parent's indexes and takes the first that is
+        // UNIQUE, non-partial and as wide as the foreign key. When the FK names the
+        // parent columns, that index must also index exactly that set of column names,
+        // in any order (its inner `j` loop), each with that column's own collating
+        // sequence; an index on another collating sequence is skipped and the search
+        // continues, so the FK is a mismatch only once no index at all qualifies.
+        // A reference that names no parent columns resolves to the parent's PRIMARY KEY
+        // by identity, which sqlite does not collation-check.
+        //
+        // Every probe emitted for this FK builds the parent key in `parent_cols` order,
+        // so when the chosen index lists those columns in another order the resolved
+        // columns and positions are rotated into the index's order. That keeps the
+        // parent key a key for the index it is looked up in, which is what sqlite's
+        // `aiCol` mapping does.
+        let mut parent_cols: Vec<String> = parent_cols.into_vec();
+        let mut child_columns: Vec<String> = fk.child_columns.to_vec();
+        let check_index_collation = !fk.parent_columns.is_empty();
         let parent_unique_index = if parent_uses_rowid {
             None
         } else {
-            // When the FK names the parent columns explicitly, sqlite3FkLocateIndex only
-            // accepts a parent index whose every column uses that column's default
-            // collation; an index built on another collating sequence is unusable and the
-            // FK is reported as a mismatch. FK enforcement compares parent key values with
-            // the parent *column's* collation, so an index on a different collation would
-            // answer a lookup the action then cannot reproduce, leaving orphaned children.
-            // A reference that names no parent columns resolves to the parent's PRIMARY KEY
-            // by identity, which sqlite does not collation-check.
-            let check_index_collation = !fk.parent_columns.is_empty();
-            let found = self
-                .get_indices(&parent_tbl.name)
-                .find(|idx| {
-                    idx.unique
-                        && idx.where_clause.is_none()
-                        && idx.columns.len() == parent_cols.len()
-                        && idx.columns.iter().zip(parent_cols.iter()).all(|(ic, pc)| {
-                            ic.name.eq_ignore_ascii_case(pc)
-                                && (!check_index_collation
-                                    || index_column_has_default_collation(ic, parent_tbl))
-                        })
-                })
-                .cloned();
-            if require_unique && found.is_none() {
-                return Err(fk_mismatch_err(&child.name, &parent_tbl.name));
+            let mut found: Option<(Arc<Index>, Vec<usize>)> = None;
+            for idx in self.get_indices(&parent_tbl.name) {
+                if !idx.unique
+                    || idx.where_clause.is_some()
+                    || idx.columns.len() != parent_cols.len()
+                {
+                    continue;
+                }
+                if !check_index_collation {
+                    // The implicit primary-key reference: matched in declaration order
+                    // and not collation-checked, exactly as before.
+                    if idx
+                        .columns
+                        .iter()
+                        .zip(parent_cols.iter())
+                        .all(|(ic, pc)| ic.name.eq_ignore_ascii_case(pc))
+                    {
+                        found = Some((Arc::clone(idx), (0..parent_cols.len()).collect()));
+                        break;
+                    }
+                    continue;
+                }
+                if !idx
+                    .columns
+                    .iter()
+                    .all(|ic| index_column_has_default_collation(ic, parent_tbl))
+                {
+                    continue;
+                }
+                // Map each indexed column onto the FK pair that names it. A column may
+                // be claimed once, so this is a permutation of the FK's own order.
+                let mut order: Vec<usize> = Vec::try_with_capacity_ext(idx.columns.len())?;
+                let mut claimed = vec![false; parent_cols.len()];
+                for ic in idx.columns.iter() {
+                    let Some(j) = parent_cols
+                        .iter()
+                        .enumerate()
+                        .position(|(j, pc)| !claimed[j] && ic.name.eq_ignore_ascii_case(pc))
+                    else {
+                        break;
+                    };
+                    claimed[j] = true;
+                    order
+                        .push_within_capacity(j)
+                        .expect("index order vector was preallocated to idx.columns.len()");
+                }
+                if order.len() == idx.columns.len() {
+                    found = Some((Arc::clone(idx), order));
+                    break;
+                }
             }
-            found
+            match found {
+                None => {
+                    if require_unique {
+                        return Err(fk_mismatch_err(&child.name, &parent_tbl.name));
+                    }
+                    None
+                }
+                Some((idx, order)) => {
+                    if order.iter().enumerate().any(|(i, &j)| i != j) {
+                        parent_cols = order.iter().map(|&j| parent_cols[j].clone()).collect();
+                        child_columns = order.iter().map(|&j| child_columns[j].clone()).collect();
+                        child_pos = order.iter().map(|&j| child_pos[j]).collect();
+                        parent_pos = order.iter().map(|&j| parent_pos[j]).collect();
+                    }
+                    Some(idx)
+                }
+            }
         };
+        let parent_cols: Box<[String]> = parent_cols.into_boxed_slice();
 
         fk.validate()?;
         Ok(ResolvedFkRef {
             child_table: Arc::clone(child),
             fk: Arc::clone(fk),
+            child_columns: child_columns.into_boxed_slice(),
             parent_cols,
             child_pos: child_pos.into_boxed_slice(),
             parent_pos: parent_pos.into_boxed_slice(),
@@ -5083,11 +5144,12 @@ fn fk_mismatch_err(child: &str, parent: &str) -> crate::LimboError {
     ))
 }
 
-/// True when `ic` indexes a real column of `table` with that column's own
-/// collating sequence. `IndexColumn::collation` is already
+/// True when `ic` indexes a column of `table` with that column's own collating
+/// sequence. `IndexColumn::collation` is already
 /// `explicit COLLATE on the index term`.or(`column's declared collation`), so
-/// `None` means BINARY. Expression index columns have no table column and never
-/// qualify, matching sqlite's refusal to key a foreign key off one.
+/// `None` means BINARY. An expression index is kept out of a foreign key by the
+/// column-name match, not by this test; sqlite refuses one too, measured on
+/// 3.51.0 with `CREATE UNIQUE INDEX pe ON p(a||'x')`.
 fn index_column_has_default_collation(ic: &IndexColumn, table: &BTreeTable) -> bool {
     table
         .columns
@@ -5121,6 +5183,13 @@ pub struct ResolvedFkRef {
     /// The FK as declared on the child table.
     pub fk: Arc<ForeignKey>,
 
+    /// Child columns of the FK, in the same order as `parent_cols`, `child_pos`
+    /// and `parent_pos`, and as the columns of `parent_unique_index`. That is
+    /// `fk.child_columns` unless the parent index lists the key's columns in a
+    /// different order, in which case all four are rotated into the index's
+    /// order so that every probe built from them is a key for that index.
+    /// `fk.child_columns` keeps declaration order for PRAGMA reporting.
+    pub child_columns: Box<[String]>,
     /// Resolved parent columns: either `fk.parent_columns` or, when that is
     /// empty, the parent table's PRIMARY KEY columns. Always non-empty.
     pub parent_cols: Box<[String]>,

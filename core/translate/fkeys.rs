@@ -906,7 +906,7 @@ fn emit_fk_parent_key_probe(
     resolver: &Resolver,
 ) -> Result<()> {
     let child_tbl = &fk_ref.child_table;
-    let child_cols = &fk_ref.fk.child_columns;
+    let child_cols = &fk_ref.child_columns;
     let is_deferred = fk_ref.fk.deferred;
     let is_restrict = matches!(fk_ref.fk.on_update, RefAct::Restrict);
     let skip_probe = program.allocate_label();
@@ -1114,12 +1114,12 @@ pub fn emit_fk_child_update_counters(
             continue;
         }
 
-        let ncols = fk_ref.fk.child_columns.len();
+        let ncols = fk_ref.child_columns.len();
 
         // Pass 1: OLD tuple handling only for deferred FKs
         if fk_ref.fk.deferred {
             if let Some((dml_ctx, fk_col_positions, null_skip)) =
-                load_old_fk_values(program, &fk_ref.fk.child_columns)?
+                load_old_fk_values(program, &fk_ref.child_columns)?
             {
                 if fk_ref.parent_uses_rowid {
                     // Parent key is rowid: probe parent table by rowid
@@ -1205,7 +1205,7 @@ pub fn emit_fk_child_update_counters(
             .child_table
             .name
             .eq_ignore_ascii_case(&fk_ref.fk.parent_table);
-        for cname in &fk_ref.fk.child_columns {
+        for cname in &fk_ref.child_columns {
             let (i, col) = child_tbl.get_column(cname).unwrap();
             let src = if col.is_rowid_alias() {
                 new_rowid_reg
@@ -1265,7 +1265,7 @@ pub fn emit_fk_child_update_counters(
             let pcur = open_read_table(program, &parent_tbl, database_id);
 
             // Take the first child column value from NEW image
-            let (i_child, col_child) = child_tbl.get_column(&fk_ref.fk.child_columns[0]).unwrap();
+            let (i_child, col_child) = child_tbl.get_column(&fk_ref.child_columns[0]).unwrap();
             let val_reg = if col_child.is_rowid_alias() {
                 new_rowid_reg
             } else {
@@ -1324,7 +1324,7 @@ pub fn emit_fk_child_update_counters(
             // Build NEW probe (in FK child column order, aligns with parent index columns)
             let probe = {
                 let start = program.alloc_registers(ncols);
-                for (k, cname) in fk_ref.fk.child_columns.iter().enumerate() {
+                for (k, cname) in fk_ref.child_columns.iter().enumerate() {
                     let (i, col) = child_tbl.get_column(cname).unwrap();
                     program.emit_insn(Insn::Copy {
                         src_reg: if col.is_rowid_alias() {
@@ -1409,7 +1409,7 @@ fn emit_fk_delete_parent_existence_check_single(
     let skip_check = program.allocate_label();
     emit_skip_if_any_null(program, parent_key_start, ncols, skip_check);
 
-    let child_cols = &fk_ref.fk.child_columns;
+    let child_cols = &fk_ref.child_columns;
     let child_idx = if !is_self_ref {
         let indices: Vec<_> = resolver.with_schema(database_id, |s| {
             s.get_indices(&fk_ref.child_table.name).cloned().collect()
@@ -1988,7 +1988,7 @@ fn fire_fk_cascade_delete(
     } else {
         None
     };
-    let child_cols = &fk_ref.fk.child_columns;
+    let child_cols = &fk_ref.child_columns;
     let subprog_ctx = FkSubprogramContext::new(
         child_cols.len(),
         false,
@@ -2026,7 +2026,7 @@ fn fire_fk_set_null(
     } else {
         None
     };
-    let child_cols = &fk_ref.fk.child_columns;
+    let child_cols = &fk_ref.child_columns;
     let subprog_ctx = FkSubprogramContext::new(
         child_cols.len(),
         false,
@@ -2064,7 +2064,7 @@ fn fire_fk_set_default(
     } else {
         None
     };
-    let child_cols = &fk_ref.fk.child_columns;
+    let child_cols = &fk_ref.child_columns;
     let subprog_ctx = FkSubprogramContext::new(
         child_cols.len(),
         false,
@@ -2102,7 +2102,7 @@ fn fire_fk_cascade_update(
     } else {
         None
     };
-    let child_cols = &fk_ref.fk.child_columns;
+    let child_cols = &fk_ref.child_columns;
     // CASCADE UPDATE needs new params for the SET clause
     let subprog_ctx = FkSubprogramContext::new(
         child_cols.len(),
@@ -2585,7 +2585,7 @@ pub fn emit_fk_drop_table_check(
     // For RESTRICT/NO ACTION FKs, scan child table for matching rows and count violations
     for fk_ref in &check_fk_refs {
         let child_tbl = &fk_ref.child_table;
-        let child_cols = &fk_ref.fk.child_columns;
+        let child_cols = &fk_ref.child_columns;
 
         // Determine which parent columns are referenced
         let parent_cols: &[String] = &fk_ref.parent_cols;

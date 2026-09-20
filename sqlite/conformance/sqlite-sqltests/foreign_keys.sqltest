@@ -2430,6 +2430,98 @@ expect {
     0
 }
 
+# sqlite3FkLocateIndex matches a candidate index against the named parent columns as an
+# unordered set of names, and an index whose collation is not the column's own is skipped
+# rather than fatal. So a composite key whose only same-order index is collated and whose
+# usable index lists the columns the other way round is still a foreign key: sqlite accepts
+# it and enforces it with the columns' own collations. Rejecting it fails every statement
+# on the child, a DELETE that touches no parent included.
+@cross-check-integrity
+test fk-parent-collated-index-in-key-order-with-usable-index-elsewhere {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE p(a TEXT, b TEXT);
+    CREATE UNIQUE INDEX pbad ON p(a COLLATE NOCASE, b);
+    CREATE UNIQUE INDEX pgood ON p(b, a);
+    CREATE TABLE c(id INTEGER PRIMARY KEY, a TEXT, b TEXT,
+                   FOREIGN KEY(a,b) REFERENCES p(a,b) ON DELETE CASCADE);
+    INSERT INTO p VALUES('A','B');
+    INSERT INTO c VALUES(1,'A','B');
+    DELETE FROM c;
+    INSERT INTO c VALUES(2,'A','B');
+    DELETE FROM p;
+    SELECT (SELECT count(*) FROM p), (SELECT count(*) FROM c);
+}
+expect {
+    0|0
+}
+
+# The parent key is matched against an index by name, not by position, so an index that
+# lists the key's columns the other way round enforces it.
+@cross-check-integrity
+test fk-parent-unique-index-lists-key-columns-in-another-order {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE p(a TEXT, b TEXT);
+    CREATE UNIQUE INDEX pgood ON p(b, a);
+    CREATE TABLE c(id INTEGER PRIMARY KEY, a TEXT, b TEXT,
+                   FOREIGN KEY(a,b) REFERENCES p(a,b) ON DELETE CASCADE);
+    INSERT INTO p VALUES('A','B');
+    INSERT INTO c VALUES(1,'A','B');
+    DELETE FROM c;
+    INSERT INTO c VALUES(2,'A','B');
+    DELETE FROM p;
+    SELECT (SELECT count(*) FROM p), (SELECT count(*) FROM c);
+}
+expect {
+    0|0
+}
+
+# ...and the columns keep their own meaning while it does: the child pair that would
+# only match after swapping the two values has no parent.
+@cross-check-integrity
+test fk-parent-out-of-order-index-does-not-swap-the-columns {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE p(a TEXT, b TEXT);
+    CREATE UNIQUE INDEX pgood ON p(b, a);
+    CREATE TABLE c(id INTEGER PRIMARY KEY, a TEXT, b TEXT,
+                   FOREIGN KEY(a,b) REFERENCES p(a,b) ON DELETE CASCADE);
+    INSERT INTO p VALUES('A','B');
+    INSERT INTO c VALUES(1,'B','A');
+}
+expect error {
+}
+
+# The same composite shape with no usable index at all: every candidate is collated on
+# something other than the column, so the foreign key really is a mismatch.
+@cross-check-integrity
+test fk-parent-every-candidate-index-collated-rejected {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE p(a TEXT, b TEXT);
+    CREATE UNIQUE INDEX pbad1 ON p(a COLLATE NOCASE, b);
+    CREATE UNIQUE INDEX pbad2 ON p(b COLLATE NOCASE, a);
+    CREATE TABLE c(id INTEGER PRIMARY KEY, a TEXT, b TEXT,
+                   FOREIGN KEY(a,b) REFERENCES p(a,b) ON DELETE CASCADE);
+    INSERT INTO p VALUES('A','B');
+    INSERT INTO c VALUES(1,'A','B');
+}
+expect error {
+}
+
+# An uncollated unique index of the right width on some other column does not make the
+# collated one usable: the index has to name the parent key's own columns.
+@cross-check-integrity
+test fk-parent-uncollated-index-on-other-columns-does-not-rescue {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE p(a TEXT, b TEXT, zz TEXT);
+    CREATE UNIQUE INDEX pbad ON p(a COLLATE NOCASE, b);
+    CREATE UNIQUE INDEX pother ON p(a, zz);
+    CREATE TABLE c(id INTEGER PRIMARY KEY, a TEXT, b TEXT,
+                   FOREIGN KEY(a,b) REFERENCES p(a,b) ON DELETE CASCADE);
+    INSERT INTO p VALUES('A','B','Z');
+    INSERT INTO c VALUES(1,'A','B');
+}
+expect error {
+}
+
 # ON DELETE CASCADE - recursive cascade (A->B->C)
 @cross-check-integrity
 test fk-cascade-delete-recursive {
