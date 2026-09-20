@@ -2755,6 +2755,39 @@ mod tests {
     }
 
     #[quickcheck_macros::quickcheck]
+    fn split_varint_matches_read_varint(bytes: Vec<u8>) -> bool {
+        match (split_varint(&bytes), read_varint(&bytes)) {
+            (Ok((split_value, rest)), Ok((value, len))) => {
+                split_value == value && rest == &bytes[len..]
+            }
+            (Err(_), Err(_)) => true,
+            _ => false,
+        }
+    }
+
+    /// The reader writes out the one- and two-byte cases and sends the rest
+    /// through `read_varint`, so the tail has to come out right at all nine
+    /// lengths, not just the two that random bytes reach often.
+    #[test]
+    fn split_varint_cuts_the_tail_at_every_varint_length() {
+        let mut seen_lengths = std::collections::HashSet::new();
+        for bits in 0..64 {
+            let value = 1u64 << bits;
+            let mut buf = [0u8; 12];
+            let written = write_varint(&mut buf, value);
+            seen_lengths.insert(written);
+            buf[written..written + 3].copy_from_slice(b"abc");
+            let (read, rest) = split_varint(&buf[..written + 3]).unwrap();
+            assert_eq!(read, value, "value at {written} bytes");
+            assert_eq!(rest, b"abc", "tail at {written} bytes");
+        }
+        assert_eq!(
+            seen_lengths,
+            (1..=9).collect::<std::collections::HashSet<_>>()
+        );
+    }
+
+    #[quickcheck_macros::quickcheck]
     fn read_varint_len_matches_read_varint(bytes: Vec<u8>) -> bool {
         match (read_varint_len(&bytes), read_varint(&bytes)) {
             (Ok(len), Ok((_, expected))) => len == expected,
