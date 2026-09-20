@@ -1498,9 +1498,9 @@ pub fn op_open_read(
             // This is a materialized view with storage
             // Create btree cursor for reading the persistent data
 
-            let btree_cursor = BTreeCursor::boxed(&pager, || {
+            let btree_cursor = BTreeCursor::boxed(pager.clone(), |pager| {
                 BTreeCursor::new_table(
-                    pager.clone(),
+                    pager,
                     maybe_transform_root_page_to_positive(mv_store.as_ref(), *root_page),
                     num_columns,
                 )
@@ -1536,7 +1536,7 @@ pub fn op_open_read(
                 .into());
             }
             let btree_cursor: Box<BTreeCursor> = if table.has_rowid {
-                BTreeCursor::boxed(&pager.clone(), || {
+                BTreeCursor::boxed(pager, |pager| {
                     BTreeCursor::new_table(
                         pager,
                         maybe_transform_root_page_to_positive(mv_store.as_ref(), *root_page),
@@ -1544,7 +1544,7 @@ pub fn op_open_read(
                     )
                 })
             } else {
-                BTreeCursor::boxed(&pager.clone(), || {
+                BTreeCursor::boxed(pager, |pager| {
                     BTreeCursor::new_without_rowid_table(
                         pager,
                         maybe_transform_root_page_to_positive(mv_store.as_ref(), *root_page),
@@ -14085,9 +14085,9 @@ pub fn op_open_write(
             let btree_cursor: Box<BTreeCursor> = match cursor_type {
                 CursorType::BTreeTable(table_rc) if !table_rc.has_rowid => {
                     btree_cursor_with_yield_context(
-                        BTreeCursor::boxed(&pager, || {
+                        BTreeCursor::boxed(pager, |pager| {
                             BTreeCursor::new_without_rowid_table(
-                                pager.clone(),
+                                pager,
                                 maybe_transform_root_page_to_positive(mv_store.as_ref(), root_page),
                                 table_rc.as_ref(),
                                 num_columns,
@@ -14097,9 +14097,9 @@ pub fn op_open_write(
                     )
                 }
                 _ => btree_cursor_with_yield_context(
-                    BTreeCursor::boxed(&pager, || {
+                    BTreeCursor::boxed(pager, |pager| {
                         BTreeCursor::new_table(
-                            pager.clone(),
+                            pager,
                             maybe_transform_root_page_to_positive(mv_store.as_ref(), root_page),
                             num_columns,
                         )

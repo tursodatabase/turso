@@ -1264,11 +1264,14 @@ impl BTreeCursor {
     /// cursor on the same pager when the pool has one. `make` runs with the
     /// allocation already in hand so the compiler can build the cursor
     /// there: a `BTreeCursor` is over a kilobyte, and building it on the
-    /// stack first costs more to copy than the allocation saves.
-    pub fn boxed(pager: &Arc<Pager>, make: impl FnOnce() -> Self) -> Box<Self> {
+    /// stack first costs more to copy than the allocation saves. It is given
+    /// the pager back, so a caller whose own reference ends up in the cursor
+    /// passes it straight through instead of holding a second one to find
+    /// the allocation with.
+    pub fn boxed(pager: Arc<Pager>, make: impl FnOnce(Arc<Pager>) -> Self) -> Box<Self> {
         match pager.take_cursor_allocation() {
-            Some(allocation) => Box::write(allocation, make()),
-            None => Box::new(make()),
+            Some(allocation) => Box::write(allocation, make(pager)),
+            None => Box::new(make(pager)),
         }
     }
 
@@ -1317,7 +1320,7 @@ impl BTreeCursor {
         num_columns: usize,
     ) -> Result<Box<Self>> {
         let index_info = Arc::new(IndexInfo::new_from_index(index)?);
-        Ok(Self::boxed(&pager.clone(), || {
+        Ok(Self::boxed(pager, |pager| {
             Self::new_with_index_info(pager, root_page, num_columns, Some(index_info))
         }))
     }
