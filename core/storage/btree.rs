@@ -2607,6 +2607,10 @@ impl BTreeCursor {
 
     /// Use the loaded table leaf when it can answer an exact rowid lookup.
     /// This avoids a new search from the root.
+    ///
+    /// Out of line: it runs once per seek, and inlined it costs the seek's own
+    /// register allocation more than the call.
+    #[inline(never)]
     fn prepare_current_table_leaf_seek(&mut self, rowid: i64, seek_op: SeekOp) -> Result<()> {
         if !matches!(seek_op, SeekOp::GE { eq_only: true })
             || self.valid_state != CursorValidState::Valid
@@ -2630,9 +2634,19 @@ impl BTreeCursor {
                 } else {
                     let first_rowid = contents.cell_table_leaf_read_rowid(0)?;
                     let last_rowid = contents.cell_table_leaf_read_rowid(cell_count - 1)?;
-                    (first_rowid..=last_rowid)
-                        .contains(&rowid)
-                        .then_some(cell_count)
+                    if (first_rowid..=last_rowid).contains(&rowid) {
+                        Some(cell_count)
+                    } else if rowid > last_rowid && !self.ancestor_pages_have_more_children() {
+                        // Nothing in the tree lies to the right of this leaf, so
+                        // a rowid past its last cell is in no page at all. The
+                        // search below finds nothing and lands after the last
+                        // cell, which is where the row goes. This is the
+                        // question an append asks for every row it inserts, and
+                        // the same test already decides where a scan ends.
+                        Some(cell_count)
+                    } else {
+                        None
+                    }
                 }
             }
         }) else {
