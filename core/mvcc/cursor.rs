@@ -2258,10 +2258,10 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> CursorTrait
         todo!()
     }
 
-    fn get_index_info(&self) -> &Arc<crate::types::IndexInfo> {
+    fn index_info(&self) -> Option<&Arc<crate::types::IndexInfo>> {
         match &self.mv_cursor_type {
-            MvccCursorType::Index(index_info) => index_info,
-            MvccCursorType::Table => panic!("get_index_info called on table cursor"),
+            MvccCursorType::Index(index_info) => Some(index_info),
+            MvccCursorType::Table => None,
         }
     }
 
