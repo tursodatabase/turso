@@ -436,6 +436,39 @@ impl PageInner {
         self.read_u8(BTREE_FRAGMENTED_BYTES_COUNT)
     }
 
+    /// The four free-space fields of a b-tree page header, plus the size of the
+    /// header itself, read with one bounds test. All of them live in the first
+    /// eight bytes of the header, so one window covers them. Read one at a
+    /// time, each accessor re-reads the page's buffer pointer, tests it for
+    /// null and bounds-tests its own byte range.
+    #[inline(always)]
+    pub fn btree_free_space_fields(&self) -> BtreeFreeSpaceFields {
+        let buf = self.as_ptr();
+        let header = self.offset();
+        let window = &buf[header..header + LEAF_PAGE_HEADER_SIZE_BYTES];
+        let is_interior = window[BTREE_PAGE_TYPE] <= PageType::TableInterior as u8;
+        let cell_content_area = u16::from_be_bytes([
+            window[BTREE_CELL_CONTENT_AREA],
+            window[BTREE_CELL_CONTENT_AREA + 1],
+        ]);
+        BtreeFreeSpaceFields {
+            header_size: (!is_interior as usize) * LEAF_PAGE_HEADER_SIZE_BYTES
+                + (is_interior as usize) * INTERIOR_PAGE_HEADER_SIZE_BYTES,
+            cell_count: u16::from_be_bytes([window[BTREE_CELL_COUNT], window[BTREE_CELL_COUNT + 1]])
+                as usize,
+            first_freeblock: u16::from_be_bytes([
+                window[BTREE_FIRST_FREEBLOCK],
+                window[BTREE_FIRST_FREEBLOCK + 1],
+            ]),
+            cell_content_area: if cell_content_area == 0 {
+                PageSize::MAX
+            } else {
+                cell_content_area as u32
+            },
+            num_frag_free_bytes: window[BTREE_FRAGMENTED_BYTES_COUNT],
+        }
+    }
+
     #[inline]
     pub fn rightmost_pointer(&self) -> crate::Result<Option<u32>> {
         match self.page_type()? {
@@ -912,6 +945,15 @@ impl PageInner {
 }
 
 /// Type alias for backward compatibility - PageContent is now PageInner
+/// What [`PageInner::btree_free_space_fields`] reads out of one header window.
+pub struct BtreeFreeSpaceFields {
+    pub header_size: usize,
+    pub cell_count: usize,
+    pub first_freeblock: u16,
+    pub cell_content_area: u32,
+    pub num_frag_free_bytes: u8,
+}
+
 pub type PageContent = PageInner;
 
 /// WAL tag not set

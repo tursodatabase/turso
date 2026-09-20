@@ -10370,24 +10370,25 @@ fn compute_free_space(page: &PageContent, usable_space: usize) -> Result<usize> 
     // Usable space, not the same as free space, simply means:
     // space that is not reserved for extensions by sqlite. Usually reserved_space is 0.
 
-    let first_cell = page.offset() + page.header_size() + (2 * page.cell_count());
+    let header = page.btree_free_space_fields();
+    let first_cell = page.offset() + header.header_size + (2 * header.cell_count);
     if unlikely(first_cell > usable_space) {
         return_corrupt!(
             "compute_free_space: first_cell beyond usable space: first_cell={first_cell} usable_space={usable_space}"
         );
     }
 
-    let cell_content_area_start = page.cell_content_area() as usize;
+    let cell_content_area_start = header.cell_content_area as usize;
     if unlikely(cell_content_area_start > usable_space) {
         return_corrupt!(
             "compute_free_space: cell content area beyond usable space: cell_content_area_start={cell_content_area_start} usable_space={usable_space}"
         );
     }
 
-    let mut free_space_bytes = cell_content_area_start + page.num_frag_free_bytes() as usize;
+    let mut free_space_bytes = cell_content_area_start + header.num_frag_free_bytes as usize;
 
     // #3 is computed by iterating over the freeblocks linked list
-    let mut cur_freeblock_ptr = page.first_freeblock() as usize;
+    let mut cur_freeblock_ptr = header.first_freeblock as usize;
     if cur_freeblock_ptr > 0 {
         if unlikely(cur_freeblock_ptr < cell_content_area_start) {
             return_corrupt!(
