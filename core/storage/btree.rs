@@ -3202,8 +3202,10 @@ impl BTreeCursor {
     /// Insert a record into the btree.
     /// If the insert operation overflows the page, it will be split and the btree will be balanced.
     #[cfg_attr(debug_assertions, instrument(skip_all, level = Level::DEBUG))]
-    fn insert_into_page(&mut self, bkey: &BTreeKey) -> IOResultOr<()> {
-        let record_payload = bkey.payload();
+    /// The payload comes in rather than being read from `bkey`, because three
+    /// of the write states need it: read here, the compiler re-reads it out of
+    /// the key on every turn of the state machine rather than holding it.
+    fn insert_into_page(&mut self, bkey: &BTreeKey, record_payload: &[u8]) -> IOResultOr<()> {
         if let CursorState::None = &self.state {
             std::mem::forget(std::mem::replace(
                 &mut self.state,
@@ -7176,7 +7178,8 @@ impl CursorTrait for BTreeCursor {
         self.stack.forget_leaf_cell_count();
         // saveAllCursors at the head of sqlite3BtreeInsert (btree.c:9348).
         return_if_io!(self.drive_pending_peer_save(key.maybe_rowid()));
-        return_if_io!(self.insert_into_page(key));
+        let record_payload = key.payload();
+        return_if_io!(self.insert_into_page(key, record_payload));
         self.invalidate_count_cache();
         if key.maybe_rowid().is_some() {
             self.set_has_record(true);
