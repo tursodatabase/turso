@@ -14003,6 +14003,11 @@ pub fn op_open_write(
          -> Result<OpenedBTree> {
             // Without an MvStore there is no MVCC transaction to look up.
             let Some(mv_store) = mv_store.as_ref() else {
+                turso_debug_assert!(
+                    program.connection.get_mv_tx_id_for_db(*db).is_none(),
+                    "a database with no MvStore cannot hold an MVCC transaction",
+                    { "db": *db }
+                );
                 return Ok(OpenedBTree::Plain(btree_cursor));
             };
             let Some(tx_id) = program.connection.get_mv_tx_id_for_db(*db) else {
