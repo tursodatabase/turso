@@ -222,6 +222,10 @@ pub fn expr_references_any_subquery(expr: &ast::Expr) -> bool {
 /// cached reference list, counts as reaching the enclosing query, so an
 /// unreadable subquery is never read as safe.
 ///
+/// The shared walker treats an un-lowered `Exists`, `Subquery` or `InSelect` as
+/// a leaf, so this counts those as reaching the enclosing query rather than
+/// reading a node it cannot see inside as safe.
+///
 /// Blind spot: this answers only for the expression it is handed. A caller that
 /// checks some filters and not others still falls through to allow on the ones
 /// it skipped.
@@ -233,6 +237,13 @@ pub fn expr_reads_outer_query_through_subquery(
     use crate::translate::plan::SubqueryState;
     let mut reads_outer_query = false;
     let _ = walk_expr(expr, &mut |expr: &ast::Expr| -> Result<WalkControl> {
+        if matches!(
+            expr,
+            ast::Expr::Exists(_) | ast::Expr::Subquery(_) | ast::Expr::InSelect { .. }
+        ) {
+            reads_outer_query = true;
+            return Ok(WalkControl::Continue);
+        }
         let ast::Expr::SubqueryResult { subquery_id, .. } = expr else {
             return Ok(WalkControl::Continue);
         };
