@@ -1552,6 +1552,11 @@ pub struct Pager {
     /// Dirty pages as a bitmap, naturally sorted by page number.
     dirty_pages: Arc<RwLock<RoaringBitmap>>,
     subjournal: RwLock<Option<Subjournal>>,
+    /// True once `subjournal` holds a file. It is set under the same write
+    /// lock that installs it and never cleared, so a write that reads false
+    /// can skip the lock: every page write asks whether it has to keep a
+    /// before-image.
+    has_subjournal: AtomicBool,
     savepoints: Arc<RwLock<Vec<Savepoint>>>,
     commit_info: RwLock<CommitInfo>,
     checkpoint_state: RwLock<CheckpointState>,
@@ -1862,6 +1867,7 @@ impl Pager {
             spill_yield: SpillYieldHook::new(),
             dirty_pages: Arc::new(RwLock::new(RoaringBitmap::new())),
             subjournal: RwLock::new(None),
+            has_subjournal: AtomicBool::new(false),
             savepoints: Arc::new(RwLock::new(Vec::new())),
             commit_info: RwLock::new(CommitInfo {
                 group: None,
@@ -2124,7 +2130,9 @@ impl Pager {
         let db_file_io = Arc::new(MemoryIO::new());
         let file = db_file_io.open_file("subjournal", OpenFlags::Create, false)?;
         let db_file = Subjournal::new(file);
-        *self.subjournal.write() = Some(db_file);
+        let mut subjournal = self.subjournal.write();
+        *subjournal = Some(db_file);
+        self.has_subjournal.store(true, Ordering::Release);
         Ok(())
     }
 
@@ -2135,7 +2143,11 @@ impl Pager {
     /// A buffer of length page_size + 4 bytes is allocated and the page id
     /// is written to the beginning of the buffer. The rest of the buffer is filled with the page contents.
     pub fn subjournal_page_if_required(&self, page: &Page) -> Result<()> {
-        if self.subjournal.read().is_none() {
+        if !self.has_subjournal.load(Ordering::Acquire) {
+            turso_debug_assert!(
+                self.subjournal.read().is_none(),
+                "the subjournal flag reads false while a subjournal is open"
+            );
             return Ok(());
         }
         let write_offset = {
