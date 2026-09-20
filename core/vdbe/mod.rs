@@ -4109,8 +4109,19 @@ fn skip_serial_types(header: &mut &[u8], data: &mut &[u8], n: usize) -> Result<(
 }
 
 /// Reads the serial type at the front of `header` and moves past it.
+///
+/// Every serial type up to a 58-byte string is one byte, so that case is
+/// decoded here rather than in [`read_varint_advance`]: reached through the
+/// general reader, the two-byte case it also handles costs
+/// `op_column_range_fetch` two instructions for every column of every row.
 #[inline(always)]
 fn read_serial_type(header: &mut &[u8]) -> Result<u64> {
+    if let [first, rest @ ..] = *header {
+        if *first < 0x80 {
+            *header = rest;
+            return Ok(*first as u64);
+        }
+    }
     crate::storage::sqlite3_ondisk::read_varint_advance(header)
 }
 
