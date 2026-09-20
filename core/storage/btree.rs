@@ -2576,7 +2576,7 @@ impl BTreeCursor {
                 self.stack.set_cell_index(0);
                 return Ok(IOResult::Done(SeekResult::NotFound));
             }
-            self.start_table_leaf_search(cell_count, seek_op);
+            self.start_table_leaf_search(0, cell_count, seek_op);
         }
 
         let CursorSeekState::LeafPageBinarySearch { state } = &self.seek_state else {
@@ -2621,7 +2621,7 @@ impl BTreeCursor {
             return Ok(());
         }
 
-        let Some(cell_count) = ({
+        let Some((first_cell_to_compare, cell_count)) = ({
             let page = self.stack.top_ref();
             turso_debug_assert!(page.is_loaded(), "the current table leaf must be loaded");
             let contents = page.get_contents();
@@ -2632,18 +2632,29 @@ impl BTreeCursor {
                 if cell_count == 0 {
                     None
                 } else {
-                    let first_rowid = contents.cell_table_leaf_read_rowid(0)?;
                     let last_rowid = contents.cell_table_leaf_read_rowid(cell_count - 1)?;
-                    if (first_rowid..=last_rowid).contains(&rowid) {
-                        Some(cell_count)
-                    } else if rowid > last_rowid && !self.ancestor_pages_have_more_children() {
-                        // Nothing in the tree lies to the right of this leaf, so
-                        // a rowid past its last cell is in no page at all. The
-                        // search below finds nothing and lands after the last
-                        // cell, which is where the row goes. This is the
-                        // question an append asks for every row it inserts, and
-                        // the same test already decides where a scan ends.
-                        Some(cell_count)
+                    if rowid > last_rowid {
+                        if self.ancestor_pages_have_more_children() {
+                            None
+                        } else {
+                            // Nothing in the tree lies to the right of this
+                            // leaf, so a rowid past its last cell is in no page
+                            // at all. It belongs after the last cell, and no
+                            // comparison on this leaf can say otherwise, so the
+                            // search starts with nothing left to compare. This
+                            // is the question an append asks for every row it
+                            // inserts, and the same test already decides where
+                            // a scan ends.
+                            turso_debug_assert!(
+                                (0..cell_count).all(|i| contents
+                                    .cell_table_leaf_read_rowid(i)
+                                    .is_ok_and(|cell_rowid| cell_rowid < rowid)),
+                                "a rowid past the last cell must be past every cell"
+                            );
+                            Some((cell_count, cell_count))
+                        }
+                    } else if rowid >= contents.cell_table_leaf_read_rowid(0)? {
+                        Some((0, cell_count))
                     } else {
                         None
                     }
@@ -2653,14 +2664,19 @@ impl BTreeCursor {
             return Ok(());
         };
 
-        self.start_table_leaf_search(cell_count, seek_op);
+        self.start_table_leaf_search(first_cell_to_compare, cell_count, seek_op);
         Ok(())
     }
 
-    fn start_table_leaf_search(&mut self, cell_count: usize, seek_op: SeekOp) {
+    fn start_table_leaf_search(
+        &mut self,
+        first_cell_to_compare: usize,
+        cell_count: usize,
+        seek_op: SeekOp,
+    ) {
         self.seek_state = CursorSeekState::LeafPageBinarySearch {
             state: LeafPageBinarySearchState {
-                min_cell_idx: 0,
+                min_cell_idx: first_cell_to_compare as isize,
                 max_cell_idx: cell_count as isize - 1,
                 nearest_matching_cell: None,
                 eq_seen: false,
