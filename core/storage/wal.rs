@@ -3369,10 +3369,9 @@ impl WalFile {
             "cannot start a new read tx without ending an existing one",
             { "lock_value": self.max_frame_read_lock_index.load(Ordering::Acquire), "expected": NO_LOCK_HELD }
         );
-        turso_assert!(
-            self.vacuum_lock_guard.read().is_none(),
-            "VACUUM lock guard already held"
-        );
+        // That no guard is installed yet is checked by install_vacuum_lock_guard
+        // below, under the write lock it takes anyway. Reading the slot here as
+        // well takes a second lock on the path every statement walks.
 
         // Before we can start the txn, we must first take read lock on the vacuum. If we cannot,
         // then vacuum is already in progress. Once we acquire a read lock, this would prevent
