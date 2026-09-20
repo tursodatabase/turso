@@ -6194,14 +6194,18 @@ impl BTreeCursor {
             turso_assert!(page.is_loaded(), "page is not loaded", { "page_id": page.get().id() });
             match state {
                 OverwriteCellState::AllocatePayload => {
-                    let serial_types_len = record.column_count();
-                    // Reuse the cell payload buffer to avoid allocations
+                    // Reuse the cell payload buffer to avoid allocations. The
+                    // cell holds the record's payload after two varints, so
+                    // the payload's length is what to have room for. Reading
+                    // it costs nothing, where counting the record's columns
+                    // walked every serial type in it.
+                    let payload_len = record.get_payload().len();
                     let mut new_payload = take_vec(&mut self.reusable_cell_payload);
                     new_payload.clear();
-                    if new_payload.capacity() < serial_types_len {
+                    if new_payload.capacity() < payload_len {
                         crate::with_btree_allocation_site!(
                             CellPayload,
-                            new_payload.try_reserve(serial_types_len - new_payload.capacity())
+                            new_payload.try_reserve(payload_len - new_payload.capacity())
                         )?;
                     }
                     let rowid = return_if_io!(self.rowid());
