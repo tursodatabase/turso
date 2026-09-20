@@ -3419,13 +3419,28 @@ impl BTreeCursor {
                     let CursorState::Write(write_state) = &mut self.state else {
                         panic!("expected write state");
                     };
+                    // The page and the overwrite state came out of the state as
+                    // owned values above, so what is left of it owns nothing:
+                    // forget it rather than run the drop glue of the enum, the
+                    // way the transition into it already does.
+                    turso_debug_assert!(
+                        matches!(
+                            write_state,
+                            WriteState::Overwrite {
+                                page: None,
+                                state: None,
+                                ..
+                            }
+                        ),
+                        "the overwrite state is left behind with its page and state taken"
+                    );
                     if overflows || underflows {
-                        *write_state = WriteState::Balancing;
+                        std::mem::forget(std::mem::replace(write_state, WriteState::Balancing));
                         turso_assert!(matches!(self.balance_state.sub_state, BalanceSubState::Start), "no balancing operation should be in progress during overwrite", { "state": self.state, "sub_state": self.balance_state.sub_state });
                         // If we balance, we must save the cursor position and seek to it later.
                         self.save_context(CursorContext::seek_eq_only(bkey));
                     } else {
-                        *write_state = WriteState::Finish;
+                        std::mem::forget(std::mem::replace(write_state, WriteState::Finish));
                     }
                     continue;
                 }
