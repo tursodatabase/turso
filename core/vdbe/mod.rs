@@ -715,7 +715,13 @@ struct ActiveOpStateSlot {
 macro_rules! active_state_accessor {
     ($name:ident, $variant:ident, $ty:ty, $init:expr) => {
         fn $name(&mut self) -> &mut $ty {
-            if matches!(self.state, ActiveOpState::None) {
+            // The slot already holds the variant on every call but the first of
+            // an opcode's run, so that is the question this path asks. The
+            // extraction below then needs no second test of the tag.
+            if !matches!(self.state, ActiveOpState::$variant(_)) {
+                if !matches!(self.state, ActiveOpState::None) {
+                    owned_by_another_opcode(&self.state);
+                }
                 // None owns nothing, so skip the drop glue of the enum that
                 // a plain assignment would run on the old value.
                 std::mem::forget(std::mem::replace(
@@ -723,13 +729,22 @@ macro_rules! active_state_accessor {
                     ActiveOpState::$variant($init),
                 ));
             }
-            match &mut self.state {
+            return match &mut self.state {
                 ActiveOpState::$variant(state) => state,
-                state => unreachable!(
+                _ => unreachable!(),
+            };
+
+            // The report names the state it found, which formats the whole
+            // enum. Inlined at every caller, that formatting grew the opcodes
+            // it sits in far enough to spill their hot values.
+            #[cold]
+            #[inline(never)]
+            fn owned_by_another_opcode(state: &ActiveOpState) -> ! {
+                unreachable!(
                     "active opcode state mismatch: expected {}, got {:?}",
                     stringify!($variant),
                     state
-                ),
+                )
             }
         }
     };
