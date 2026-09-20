@@ -482,6 +482,18 @@ impl<'a> BTreeKey<'a> {
         }
     }
 
+    /// The bytes of the record this key carries. A write needs only these, and
+    /// reaching them through [`Self::get_record`] costs the reference's own
+    /// enum, an Option around it and a test of that Option for every row.
+    pub fn payload(&self) -> &[u8] {
+        match self {
+            BTreeKey::TableRowId((_, record)) => record
+                .expect("expected record present on insert")
+                .get_payload(),
+            BTreeKey::IndexKey(record) => record.get_payload(),
+        }
+    }
+
     /// Get the rowid, if present. Index will never be present.
     pub fn maybe_rowid(&self) -> Option<i64> {
         match self {
@@ -3174,9 +3186,7 @@ impl BTreeCursor {
     /// If the insert operation overflows the page, it will be split and the btree will be balanced.
     #[cfg_attr(debug_assertions, instrument(skip_all, level = Level::DEBUG))]
     fn insert_into_page(&mut self, bkey: &BTreeKey) -> IOResultOr<()> {
-        let record = bkey
-            .get_record()
-            .expect("expected record present on insert");
+        let record_payload = bkey.payload();
         if let CursorState::None = &self.state {
             std::mem::forget(std::mem::replace(
                 &mut self.state,
@@ -3242,6 +3252,9 @@ impl BTreeCursor {
                                 "unexpected cell type, expected TableLeaf or IndexLeaf"
                             );
                             return_if_io!(self.record());
+                            let record = bkey
+                                .get_record()
+                                .expect("expected record present on insert");
                             let cmp = compare_immutable_iter(
                                 record.iter()?,
                                 self.get_immutable_record().as_ref().unwrap().iter()?,
@@ -3283,7 +3296,7 @@ impl BTreeCursor {
                     // Reserve capacity if needed (typical cell is small)
                     // child pointer (4) + payload size varint (up to 9) + rowid varint (up to 9)
                     const MAX_CELL_HEADER: usize = 22;
-                    let needed_capacity = record.get_payload().len() + MAX_CELL_HEADER;
+                    let needed_capacity = record_payload.len() + MAX_CELL_HEADER;
                     if payload.capacity() < needed_capacity {
                         crate::with_btree_allocation_site!(
                             CellPayload,
@@ -3314,7 +3327,7 @@ impl BTreeCursor {
                         bkey.maybe_rowid(),
                         new_payload,
                         *cell_idx,
-                        &record,
+                        &record_payload,
                         usable_space,
                         &self.pager,
                         fill_cell_payload_state,
@@ -3365,7 +3378,7 @@ impl BTreeCursor {
                     let mut state = state.take().expect("state should be present");
                     let cell_idx = *cell_idx;
                     if let IOResult::IO(io) =
-                        self.overwrite_cell(&page, cell_idx, &record, &mut state)?
+                        self.overwrite_cell(&page, cell_idx, record_payload, &mut state)?
                     {
                         let CursorState::Write(write_state) = &mut self.state else {
                             panic!("expected write state");
@@ -6337,7 +6350,7 @@ impl BTreeCursor {
         &mut self,
         page: &PageRef,
         cell_idx: usize,
-        record: &ImmutableRecordRef<'_>,
+        record_payload: &[u8],
         state: &mut OverwriteCellState,
     ) -> IOResultOr<()> {
         loop {
@@ -6352,8 +6365,7 @@ impl BTreeCursor {
                     // reserve was far too small and cost 47 instructions per
                     // row.
                     const CELL_HEADER_MAX: usize = 4 + 9 + 9;
-                    let needed = record
-                        .get_payload()
+                    let needed = record_payload
                         .len()
                         .min(self.usable_space())
                         .saturating_add(CELL_HEADER_MAX);
@@ -6385,7 +6397,7 @@ impl BTreeCursor {
                             *rowid,
                             new_payload,
                             cell_idx,
-                            record,
+                            &record_payload,
                             self.usable_space(),
                             &self.pager,
                             fill_cell_payload_state,
