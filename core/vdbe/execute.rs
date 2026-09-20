@@ -3425,7 +3425,9 @@ pub fn op_make_record(
         }
     }
 
-    if dest_reg >= start_reg && dest_reg - start_reg < count {
+    // One unsigned compare for both ends: below start_reg the subtraction wraps
+    // to a value no column count can reach.
+    if dest_reg.wrapping_sub(start_reg) < count {
         return Err(LimboError::InternalError(format!(
             "MakeRecord: destination register {dest_reg} overlaps its source range {start_reg}..{}",
             start_reg + count
