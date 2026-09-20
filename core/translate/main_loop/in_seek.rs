@@ -15,10 +15,18 @@ pub(super) fn open_in_seek_source_cursor(
 ) -> Result<CursorID> {
     match source {
         InSeekSource::LiteralList { values, affinity } => {
-            let label_once_end = program.allocate_label();
-            program.emit_insn(Insn::Once {
-                target_pc_when_reentered: label_once_end,
-            });
+            // A list value that reads a row or a subquery result is a different value on
+            // every pass through the enclosing loops, so its ephemeral has to be refilled
+            // each time. Only a list that cannot change may be filled once.
+            let label_once_end = if in_list_is_loop_invariant(values) {
+                let label = program.allocate_label();
+                program.emit_insn(Insn::Once {
+                    target_pc_when_reentered: label,
+                });
+                Some(label)
+            } else {
+                None
+            };
             let collation = index
                 .as_ref()
                 .and_then(|idx| idx.columns.first())
@@ -75,9 +83,29 @@ pub(super) fn open_in_seek_source_cursor(
                     flags: IdxInsertFlags::new().no_op_duplicate(),
                 });
             }
-            program.preassign_label_to_next_insn(label_once_end);
+            if let Some(label) = label_once_end {
+                program.preassign_label_to_next_insn(label);
+            }
             Ok(eph_cursor)
         }
         InSeekSource::Subquery { cursor_id } => Ok(*cursor_id),
     }
+}
+
+/// Whether every value in an IN list keeps the same value for the whole query.
+fn in_list_is_loop_invariant(values: &[Expr]) -> bool {
+    values.iter().all(|value| {
+        let mut invariant = true;
+        let _ = walk_expr(value, &mut |expr: &Expr| -> Result<WalkControl> {
+            if matches!(
+                expr,
+                Expr::Column { .. } | Expr::RowId { .. } | Expr::SubqueryResult { .. }
+            ) {
+                invariant = false;
+                return Ok(WalkControl::SkipChildren);
+            }
+            Ok(WalkControl::Continue)
+        });
+        invariant
+    })
 }
