@@ -13588,7 +13588,7 @@ fn coerce_register_to_integer(state: &mut ProgramState, reg: usize) -> bool {
     ) {
         return true;
     }
-    return convert_register_to_integer(state, reg);
+    convert_register_to_integer(state, reg)
 }
 
 #[inline(never)]

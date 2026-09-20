@@ -3340,7 +3340,7 @@ impl BTreeCursor {
                     ref mut fill_cell_payload_state,
                 } => {
                     return_if_io!(fill_cell_payload(
-                        &page,
+                        page,
                         bkey.maybe_rowid(),
                         new_payload,
                         *cell_idx,
