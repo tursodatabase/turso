@@ -14012,18 +14012,33 @@ pub fn op_copy(
         },
         insn
     );
-    for i in 0..=*extra_amount {
-        let (src, dst) = (*src_reg + i, *dst_reg + i);
-        if src == dst {
-            continue;
+    if *extra_amount == 0 {
+        // One register is what a row build copies, and a range of one costs a
+        // counter that cannot overflow, its own exhausted flag, two more
+        // compares and a reload of the source register number from the stack.
+        copy_one_register(&mut state.registers, *src_reg, *dst_reg)?;
+    } else {
+        for i in 0..=*extra_amount {
+            copy_one_register(&mut state.registers, *src_reg + i, *dst_reg + i)?;
         }
-        let [src, dst] = state
-            .registers
+    }
+
+    #[inline]
+    fn copy_one_register(
+        registers: &mut [Register],
+        src: usize,
+        dst: usize,
+    ) -> Result<(), Box<LimboError>> {
+        if src == dst {
+            return Ok(());
+        }
+        let [src, dst] = registers
             .get_disjoint_mut([src, dst])
             .expect("Copy source and destination registers are distinct");
         if !try_copy_heapless_value(dst, src) {
             dst.try_clone_from(src)?;
         }
+        Ok(())
     }
 
     #[inline]
