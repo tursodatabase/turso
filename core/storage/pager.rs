@@ -990,10 +990,13 @@ pub struct Page {
 
 /// A value no pager and no epoch of a pager has used before. Sharing one
 /// counter across the process means a page stamped by one pager can never look
-/// like a member of another pager's dirty set.
+/// like a member of another pager's dirty set. The counter hands out names and
+/// orders nothing, so it stays on the standard atomic even under shuttle, whose
+/// atomics remember which task last wrote them and would keep that memory from
+/// one test execution to the next.
 fn next_dirty_set_epoch() -> u64 {
-    static NEXT: AtomicU64 = AtomicU64::new(1);
-    NEXT.fetch_add(1, Ordering::Relaxed)
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
 }
 
 // SAFETY: Page is thread-safe because we use atomic page flags to serialize
