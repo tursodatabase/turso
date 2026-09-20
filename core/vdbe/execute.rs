@@ -13578,7 +13578,21 @@ fn new_rowid_inner(
     }
 }
 
+#[inline]
 fn coerce_register_to_integer(state: &mut ProgramState, reg: usize) -> bool {
+    // A register that already holds an integer is the case every row of an
+    // insert takes, and answering it here costs a tag test instead of a call.
+    if matches!(
+        state.registers[reg].get_value(),
+        Value::Numeric(Numeric::Integer(_))
+    ) {
+        return true;
+    }
+    return convert_register_to_integer(state, reg);
+}
+
+#[inline(never)]
+fn convert_register_to_integer(state: &mut ProgramState, reg: usize) -> bool {
     let converted = match state.registers[reg].get_value() {
         Value::Numeric(Numeric::Integer(_)) => return true,
         Value::Numeric(Numeric::Float(f)) => cast_real_to_integer(f64::from(*f)).ok(),
