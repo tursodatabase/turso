@@ -4733,7 +4733,7 @@ pub fn op_transaction_inner(
     loop {
         match *state.active_op_state.transaction() {
             OpTransactionState::Start => {
-                let conn = program.connection.clone();
+                let conn = &program.connection;
                 let mut started_secondary_tx = false;
                 if write && conn.is_readonly(*db) {
                     return Err(LimboError::ReadOnly.into());
@@ -4878,13 +4878,8 @@ pub fn op_transaction_inner(
                                     return Ok(state.suspend_on_io(io));
                                 }
                             }
-                            match begin_fresh_mvcc_tx(
-                                mv_store,
-                                &pager,
-                                &effective_mode,
-                                &conn,
-                                None,
-                            ) {
+                            match begin_fresh_mvcc_tx(mv_store, &pager, &effective_mode, conn, None)
+                            {
                                 Ok(tx_id) => {
                                     conn.set_mv_tx_for_db(*db, Some((tx_id, effective_mode)));
                                     started_secondary_tx = true;
@@ -4907,7 +4902,7 @@ pub fn op_transaction_inner(
                                     &pager,
                                     tx_mode,
                                     Some(tx_id),
-                                    &conn,
+                                    conn,
                                     None,
                                     CheckpointReadLockState::NotHeld,
                                 )?;
@@ -4988,7 +4983,7 @@ pub fn op_transaction_inner(
                                 mv_store,
                                 &pager,
                                 tx_mode,
-                                &conn,
+                                conn,
                                 expected_schema_generation,
                             ) {
                                 Ok(tx_id) => {
@@ -5024,7 +5019,7 @@ pub fn op_transaction_inner(
                                     &pager,
                                     &actual_tx_mode,
                                     Some(tx_id),
-                                    &conn,
+                                    conn,
                                     None,
                                     CheckpointReadLockState::NotHeld,
                                 ) {

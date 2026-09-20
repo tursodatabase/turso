@@ -3042,7 +3042,7 @@ impl Program {
         program_state: &mut ProgramState,
         rollback: bool,
     ) -> IOResultOr<()> {
-        let connection = self.connection.clone();
+        let connection = &self.connection;
         let auto_commit = connection.auto_commit.load(Ordering::SeqCst);
         let tx_state = connection.get_tx_state();
         tracing::debug!(
@@ -3064,16 +3064,16 @@ impl Program {
                 ),
                 "invalid state for write commit step: {tx_state:?}"
             );
-            self.step_end_write_txn(&pager, &connection, program_state, rollback)
+            self.step_end_write_txn(&pager, connection, program_state, rollback)
         } else if matches!(program_state.commit_state, CommitState::CommittingAttached) {
             // Re-entry after IO yield from attached pager commit.
-            match self.end_attached_write_txns(&connection, rollback)? {
+            match self.end_attached_write_txns(connection, rollback)? {
                 IOResult::Done(_) => {
                     program_state.commit_state = CommitState::Ready;
                     if pager.holds_read_lock() {
                         pager.end_read_tx();
                     }
-                    self.end_attached_read_txns(&connection);
+                    self.end_attached_read_txns(connection);
                     Ok(IOResult::Done(()))
                 }
                 IOResult::IO(io) => Ok(IOResult::IO(io)),
@@ -3081,7 +3081,7 @@ impl Program {
         } else if auto_commit {
             match tx_state {
                 TransactionState::Write { .. } => {
-                    self.step_end_write_txn(&pager, &connection, program_state, rollback)
+                    self.step_end_write_txn(&pager, connection, program_state, rollback)
                 }
                 TransactionState::Read => {
                     connection.set_tx_state(TransactionState::None);
@@ -3089,7 +3089,7 @@ impl Program {
                     // independently of the main connection's transaction state.
                     // (e.g., UPDATE aux0.t SET ... only needs Read on main DB
                     // but holds a write lock on the attached pager.)
-                    match self.end_attached_write_txns(&connection, rollback)? {
+                    match self.end_attached_write_txns(connection, rollback)? {
                         IOResult::Done(_) => {}
                         IOResult::IO(io) => {
                             program_state.commit_state = CommitState::CommittingAttached;
@@ -3097,18 +3097,18 @@ impl Program {
                         }
                     }
                     pager.end_read_tx();
-                    self.end_attached_read_txns(&connection);
+                    self.end_attached_read_txns(connection);
                     Ok(IOResult::Done(()))
                 }
                 TransactionState::None => {
-                    match self.end_attached_write_txns(&connection, rollback)? {
+                    match self.end_attached_write_txns(connection, rollback)? {
                         IOResult::Done(_) => {}
                         IOResult::IO(io) => {
                             program_state.commit_state = CommitState::CommittingAttached;
                             return Ok(IOResult::IO(io));
                         }
                     }
-                    self.end_attached_read_txns(&connection);
+                    self.end_attached_read_txns(connection);
                     Ok(IOResult::Done(()))
                 }
                 TransactionState::PendingUpgrade { .. } => {
@@ -3139,7 +3139,7 @@ impl Program {
         mv_store: &Arc<MvStore>,
         rollback: bool,
     ) -> IOResultOr<()> {
-        let conn = self.connection.clone();
+        let conn = &self.connection;
         let auto_commit = conn.auto_commit.load(Ordering::SeqCst);
         if !auto_commit {
             return Ok(IOResult::Done(()));
@@ -3148,7 +3148,7 @@ impl Program {
         // Phase 1: Commit main DB MVCC transaction
         if matches!(program_state.commit_state, CommitState::Ready) {
             if let Some(tx_id) = conn.get_mv_tx_id() {
-                let state_machine = mv_store.commit_tx(tx_id, &conn, crate::MAIN_DB_ID)?;
+                let state_machine = mv_store.commit_tx(tx_id, conn, crate::MAIN_DB_ID)?;
                 program_state.commit_state = CommitState::CommittingMvcc { state_machine };
             }
             // If no main MVCC tx, commit_state stays Ready and we fall
@@ -3217,7 +3217,7 @@ impl Program {
                 conn.set_mv_tx_for_db(db_id, None);
                 continue;
             };
-            let mut state_machine = match attached_mv_store.commit_tx(tx_id, &conn, db_id) {
+            let mut state_machine = match attached_mv_store.commit_tx(tx_id, conn, db_id) {
                 Ok(sm) => sm,
                 Err(e) => {
                     tracing::error!(
@@ -3257,24 +3257,24 @@ impl Program {
         // DBs may use WAL mode and need their dirty pages committed via the WAL path.
         if matches!(program_state.commit_state, CommitState::CommittingAttached) {
             // Re-entry after IO yield from attached WAL pager commit.
-            match self.end_attached_write_txns(&conn, rollback)? {
+            match self.end_attached_write_txns(conn, rollback)? {
                 IOResult::Done(_) => {
                     program_state.commit_state = CommitState::Ready;
-                    self.end_attached_read_txns(&conn);
+                    self.end_attached_read_txns(conn);
                     return Ok(IOResult::Done(()));
                 }
                 IOResult::IO(io) => return Ok(IOResult::IO(io)),
             }
         }
 
-        match self.end_attached_write_txns(&conn, rollback)? {
+        match self.end_attached_write_txns(conn, rollback)? {
             IOResult::Done(_) => {}
             IOResult::IO(io) => {
                 program_state.commit_state = CommitState::CommittingAttached;
                 return Ok(IOResult::IO(io));
             }
         }
-        self.end_attached_read_txns(&conn);
+        self.end_attached_read_txns(conn);
 
         program_state.commit_state = CommitState::Ready;
         Ok(IOResult::Done(()))
