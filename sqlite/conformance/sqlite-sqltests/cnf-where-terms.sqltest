@@ -1,0 +1,98 @@
+@database :memory:
+
+# The planner breaks a predicate into the conjuncts of its conjunctive normal
+# form, so that it can test each conjunct as early as possible and can use each
+# conjunct as an index constraint on its own.
+#
+# The rewrite must not change which rows a query returns. SQL three-valued
+# logic makes that easy to get wrong, because a conjunct can be NULL as well as
+# true or false. Every case below runs against SQLite too and must agree with
+# it, so the rows are the ones SQLite returns and not the ones a person worked
+# out by hand.
+
+setup t {
+    CREATE TABLE t(a, b, c);
+    INSERT INTO t VALUES (1, 2, 3), (1, NULL, 3), (NULL, 2, 3), (5, 6, 7),
+                         (NULL, NULL, NULL), (1, 2, 9), (3, 2, 3), (1, 6, 7);
+}
+
+setup joined {
+    CREATE TABLE g(id);
+    CREATE TABLE h(id, v, w);
+    INSERT INTO g VALUES (1), (2), (3);
+    INSERT INTO h VALUES (1, 5, 0), (2, 6, 9), (4, 5, 0);
+}
+
+setup partial_index {
+    CREATE TABLE p(k, v);
+    CREATE INDEX p_idx ON p(k) WHERE v = 1 OR v = 2;
+    INSERT INTO p VALUES (1, 1), (2, 2), (3, 3), (4, 1), (5, NULL);
+}
+
+# Each predicate below takes a different path through the rewrite: OR that
+# distributes over AND, NOT that moves down to the leaves, a branch that both
+# sides of an OR share, a conjunct that another conjunct already makes true,
+# and the cases where nothing may be copied or the predicate makes too many
+# conjuncts and is kept whole.
+
+@setup t
+@var predicate {
+    a = 1 OR (b = 2 AND c = 3)
+  | (a = 1 AND b = 2) OR (c = 7 AND a = 5)
+  | NOT (a = 1 OR b = 2)
+  | NOT (NOT (a = 1 AND c = 3))
+  | NOT ((a = 1 OR b = 6) AND (c = 3 OR c = 7))
+  | NOT (a = 1 OR (b = 2 AND c = 3))
+  | (a = 1 AND b = 2) OR (a = 1 AND c = 3)
+  | a = 1 OR (a = 1 AND c = 3)
+  | (a = 1 AND b = 2) OR abs(c) = 7
+  | (a = 1 AND b = 2) OR c IN (SELECT 7)
+  | b = 2 OR (a BETWEEN 1 AND 5)
+  | c = 3 AND (a NOT BETWEEN 1 AND 2)
+  | (a = 1 AND b = 2) OR (a = 3 AND b = 2) OR (a = 5 AND b = 6) OR (a = 1 AND c = 9) OR (a = 1 AND c = 7)
+}
+matrix cnf-predicate-returns-the-same-rows {
+    SELECT rowid, a, b, c FROM t WHERE $predicate ORDER BY rowid;
+}
+
+# A LEFT JOIN keeps its unmatched rows unless a WHERE conjunct is never true
+# for a null-extended row. New conjuncts must not change that test, and an ON
+# clause is broken the same way a WHERE clause is.
+
+@setup joined
+@var where_clause {
+    h.v IS NULL OR (h.v = 5 AND h.w = 0)
+  | (h.v = 5 AND h.w = 0) OR (h.v = 6 AND h.w = 9)
+  | NOT (h.v = 5 AND h.w = 0)
+  | g.id = 1 OR (h.v = 6 AND h.w = 9)
+}
+matrix cnf-left-join-where-clause {
+    SELECT g.id, ifnull(h.v, -1), ifnull(h.w, -1) FROM g LEFT JOIN h ON g.id = h.id
+    WHERE $where_clause ORDER BY g.id;
+}
+
+@setup joined
+@var on_clause {
+    (g.id = h.id AND h.v = 5) OR (g.id = h.id AND h.w = 0)
+  | g.id = h.id AND (h.v = 5 OR h.w = 9)
+  | (g.id = h.id AND h.v = 5) OR (g.id = h.id AND h.v = 6)
+  | NOT (g.id <> h.id OR h.v IS NULL)
+}
+matrix cnf-left-join-on-clause {
+    SELECT g.id, ifnull(h.v, -1) FROM g LEFT JOIN h ON $on_clause ORDER BY g.id, h.v;
+}
+
+# A partial index may be used only when the query proves every conjunct of the
+# index WHERE clause. Both the index WHERE clause and the query WHERE clause go
+# through the same rewrite, so an OR in the index WHERE clause must still match.
+
+@setup partial_index
+@var index_predicate {
+    (v = 1 OR v = 2) AND k > 1
+  | (v = 1 OR v = 2) AND (k = 2 OR k = 4)
+  | v = 1 OR v = 2
+  | (k > 1 AND v = 1) OR (k > 1 AND v = 2)
+}
+matrix cnf-partial-index-with-an-or-in-its-where-clause {
+    SELECT k, ifnull(v, -1) FROM p WHERE $index_predicate ORDER BY k;
+}

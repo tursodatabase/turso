@@ -2212,29 +2212,22 @@ pub fn parse_where(
         }
         // BETWEEN in WHERE is rewritten to binary terms here so each side can be
         // considered independently by constraint extraction and range planning.
-        // Re-break any ANDs that were created so they become separate WhereTerms for
-        // constraint extraction.
+        // That rewrite creates new ANDs and ORs, so break each term again to put
+        // the new shape back into conjunctive normal form.
         let mut i = start_idx;
         while i < out_where_clause.len() {
-            if matches!(
-                &out_where_clause[i].expr,
-                Expr::Binary(_, ast::Operator::And, _)
-            ) {
-                let term = out_where_clause.remove(i);
-                let mut new_terms: Vec<WhereTerm> = Vec::new();
-                break_predicate_at_and_boundaries(&term.expr, &mut new_terms);
-                // Preserve from_outer_join from the original term
-                for new_term in new_terms.iter_mut() {
-                    new_term.from_outer_join = term.from_outer_join;
-                }
-                let count = new_terms.len();
-                for (j, new_term) in new_terms.into_iter().enumerate() {
-                    out_where_clause.insert(i + j, new_term);
-                }
-                i += count;
-            } else {
-                i += 1;
+            let term = out_where_clause.remove(i);
+            let mut new_terms: Vec<WhereTerm> = Vec::new();
+            break_predicate_at_and_boundaries(&term.expr, &mut new_terms);
+            // Preserve from_outer_join from the original term
+            for new_term in new_terms.iter_mut() {
+                new_term.from_outer_join = term.from_outer_join;
             }
+            let count = new_terms.len();
+            for (j, new_term) in new_terms.into_iter().enumerate() {
+                out_where_clause.insert(i + j, new_term);
+            }
+            i += count;
         }
         Ok(())
     } else {
@@ -2774,23 +2767,201 @@ fn vtab_predicate_table_id(expr: &Expr) -> Option<TableInternalId> {
         _ => None,
     }
 }
+
+/// The most conjuncts one predicate is broken into. Every `OR` that has to be
+/// distributed multiplies the count, so a deeply nested predicate is kept
+/// whole once it grows past this.
+const MAX_CNF_CONJUNCTS: usize = 16;
+
+/// Break a predicate into the conjuncts of its conjunctive normal form: a list
+/// of expressions whose `AND` has the same value as the predicate.
+///
+/// This is the standard CNF algorithm. First move every `NOT` down to the
+/// leaves with De Morgan's laws and double negation removal. Then distribute
+/// `OR` over `AND`, because `p OR (q AND r)` has the same value as
+/// `(p OR q) AND (p OR r)`. SQL has no implication or equivalence operator, so
+/// the first step of the standard algorithm has nothing to rewrite here.
+///
+/// The rewrite keeps the value of the predicate for NULL inputs too, because
+/// SQL three-valued logic obeys De Morgan's laws and lets `AND` and `OR`
+/// distribute over each other.
+///
+/// More conjuncts give the planner more to work with. It tests each conjunct
+/// in the first loop that reads all the columns of that conjunct, and it can
+/// turn each conjunct into an index constraint on its own. The planner must
+/// read both tables before it can test `t1.x = 5 OR (t1.y = 6 AND t2.z = 7)`,
+/// but it can test the CNF conjunct `t1.x = 5 OR t1.y = 6` while it reads
+/// `t1`.
 pub fn break_predicate_at_and_boundaries<T: From<Expr>>(
     predicate: &Expr,
     out_predicates: &mut Vec<T>,
 ) {
-    // Unwrap single-element parenthesized expressions recursively: ((expr)) -> expr.
-    // This is semantically equivalent since single-element Parenthesized is purely
-    // syntactic grouping. Multi-element Parenthesized (row values like (x, y)) are
-    // left as-is by unwrap_parens.
+    let mut conjuncts = cnf_conjuncts(predicate, false);
+    remove_implied_conjuncts(&mut conjuncts);
+    out_predicates.extend(conjuncts.into_iter().map(T::from));
+}
+
+/// `negated` is true when an odd number of `NOT` operators stand above
+/// `predicate`. Passing the flag down does the work of De Morgan's laws and of
+/// double negation removal without building the negated tree first: a negated
+/// `AND` behaves like an `OR`, and a negated `OR` behaves like an `AND`.
+fn cnf_conjuncts(predicate: &Expr, negated: bool) -> Vec<Expr> {
     let predicate = unwrap_parens(predicate).unwrap_or(predicate);
     match predicate {
-        Expr::Binary(left, ast::Operator::And, right) => {
-            break_predicate_at_and_boundaries(left, out_predicates);
-            break_predicate_at_and_boundaries(right, out_predicates);
+        Expr::Unary(ast::UnaryOperator::Not, operand) => cnf_conjuncts(operand, !negated),
+        Expr::Binary(left, op, right) if matches!(op, ast::Operator::And | ast::Operator::Or) => {
+            let left_conjuncts = cnf_conjuncts(left, negated);
+            let right_conjuncts = cnf_conjuncts(right, negated);
+            let acts_as_and = matches!(op, ast::Operator::And) != negated;
+            if acts_as_and {
+                let mut conjuncts = left_conjuncts;
+                conjuncts.extend(right_conjuncts);
+                conjuncts
+            } else {
+                distribute_or_over_and(left_conjuncts, right_conjuncts)
+                    .unwrap_or_else(|| vec![negate_if(predicate.clone(), negated)])
+            }
         }
-        _ => {
-            out_predicates.push(predicate.clone().into());
+        _ => vec![negate_if(predicate.clone(), negated)],
+    }
+}
+
+/// Build the conjuncts of an `OR` from the conjuncts of its two sides: every
+/// conjunct of the left side goes into an `OR` with every conjunct of the
+/// right side.
+///
+/// Returns `None` when the result would have more than [`MAX_CNF_CONJUNCTS`]
+/// conjuncts, or when it would need a copy of an expression that is not safe
+/// to copy. The caller then keeps the `OR` whole.
+fn distribute_or_over_and(left: Vec<Expr>, right: Vec<Expr>) -> Option<Vec<Expr>> {
+    let conjunct_count = left.len().checked_mul(right.len())?;
+    if conjunct_count > MAX_CNF_CONJUNCTS {
+        return None;
+    }
+    let needs_copies = conjunct_count > 1;
+    if needs_copies && !left.iter().chain(right.iter()).all(is_safe_to_copy) {
+        return None;
+    }
+    let mut conjuncts = Vec::with_capacity(conjunct_count);
+    for left_conjunct in left.iter() {
+        for right_conjunct in right.iter() {
+            conjuncts.push(if exprs_are_equivalent(left_conjunct, right_conjunct) {
+                left_conjunct.clone()
+            } else {
+                Expr::Binary(
+                    Box::new(left_conjunct.clone()),
+                    ast::Operator::Or,
+                    Box::new(right_conjunct.clone()),
+                )
+            });
         }
+    }
+    Some(conjuncts)
+}
+
+/// Whether a second copy of this expression has the same value as the first
+/// copy and does not repeat expensive work.
+fn is_safe_to_copy(expr: &Expr) -> bool {
+    let mut safe = true;
+    let _ = walk_expr(expr, &mut |node: &Expr| -> Result<WalkControl> {
+        if !can_copy_node(node) {
+            safe = false;
+            return Ok(WalkControl::SkipChildren);
+        }
+        Ok(WalkControl::Continue)
+    });
+    safe
+}
+
+/// A copy of a subquery runs the whole subquery a second time. A copy of a
+/// function call can have a different value, because this rewrite runs before
+/// name resolution and cannot tell `random()` from `lower()`. A copy of RAISE
+/// can abort the statement a second time.
+fn can_copy_node(node: &Expr) -> bool {
+    match node {
+        Expr::Between { .. }
+        | Expr::Binary(..)
+        | Expr::Case { .. }
+        | Expr::Cast { .. }
+        | Expr::Collate(..)
+        | Expr::Column { .. }
+        | Expr::DoublyQualified(..)
+        | Expr::FieldAccess { .. }
+        | Expr::Id(_)
+        | Expr::InList { .. }
+        | Expr::IsNull(_)
+        | Expr::Like { .. }
+        | Expr::Literal(_)
+        | Expr::Name(_)
+        | Expr::NotNull(_)
+        | Expr::Parenthesized(_)
+        | Expr::Qualified(..)
+        | Expr::Register(_)
+        | Expr::RowId { .. }
+        | Expr::Unary(..)
+        | Expr::Variable(_) => true,
+        Expr::Array { .. }
+        | Expr::Default
+        | Expr::Exists(_)
+        | Expr::FunctionCall { .. }
+        | Expr::FunctionCallStar { .. }
+        | Expr::InSelect { .. }
+        | Expr::InTable { .. }
+        | Expr::Raise(..)
+        | Expr::Subquery(_)
+        | Expr::SubqueryResult { .. }
+        | Expr::Subscript { .. } => false,
+    }
+}
+
+fn negate_if(expr: Expr, negated: bool) -> Expr {
+    if negated {
+        Expr::Unary(ast::UnaryOperator::Not, Box::new(expr))
+    } else {
+        expr
+    }
+}
+
+/// Remove every conjunct that another conjunct already makes true.
+/// Distribution creates these: `(a AND b) OR (a AND c)` becomes
+/// `a AND (a OR c) AND (b OR a) AND (b OR c)`, where the middle two conjuncts
+/// are true whenever `a` is true. What is left is `a AND (b OR c)`.
+///
+/// Removal keeps the value of the conjunction, NULL included. When `d` is one
+/// branch of the `OR` `c`, `d AND c` has the same value as `d`: `c` is true
+/// whenever `d` is true, and `d AND c` is not true whenever `d` is not true.
+///
+/// This compares every pair of conjuncts, so it does nothing for a long list.
+/// A long list comes from a long chain of `AND`s, which distribution never
+/// touched and which therefore has nothing to remove.
+fn remove_implied_conjuncts(conjuncts: &mut Vec<Expr>) {
+    if conjuncts.len() < 2 || conjuncts.len() > MAX_CNF_CONJUNCTS {
+        return;
+    }
+    let mut kept: Vec<Expr> = Vec::with_capacity(conjuncts.len());
+    for conjunct in conjuncts.drain(..) {
+        if kept.iter().any(|other| makes_true(other, &conjunct)) {
+            continue;
+        }
+        kept.retain(|other| !makes_true(&conjunct, other));
+        kept.push(conjunct);
+    }
+    *conjuncts = kept;
+}
+
+/// Whether `conjunct` being true makes `other` true. This finds only the case
+/// that distribution creates: `other` is an `OR` that has `conjunct` as one of
+/// its branches.
+fn makes_true(conjunct: &Expr, other: &Expr) -> bool {
+    let other = unwrap_parens(other).unwrap_or(other);
+    if exprs_are_equivalent(conjunct, other) {
+        return true;
+    }
+    match other {
+        Expr::Binary(left, ast::Operator::Or, right) => {
+            makes_true(conjunct, left) || makes_true(conjunct, right)
+        }
+        _ => false,
     }
 }
 
@@ -2841,4 +3012,167 @@ pub fn parse_limit(
         )?;
     }
     Ok((Some(limit.expr), limit.offset))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use turso_parser::parser::Parser;
+
+    fn parse_predicate(sql: &str) -> Expr {
+        let statement = format!("SELECT 1 FROM t WHERE {sql}");
+        let cmd = Parser::new(statement.as_bytes())
+            .next_cmd()
+            .expect("test predicate should parse")
+            .expect("test predicate should contain a statement");
+        let ast::Cmd::Stmt(ast::Stmt::Select(select)) = cmd else {
+            panic!("expected a SELECT statement");
+        };
+        let ast::OneSelect::Select { where_clause, .. } = select.body.select else {
+            panic!("expected a simple SELECT");
+        };
+        *where_clause.expect("expected a WHERE clause")
+    }
+
+    #[track_caller]
+    fn assert_conjuncts(predicate: &str, expected: &[&str]) {
+        let mut conjuncts: Vec<Expr> = Vec::new();
+        break_predicate_at_and_boundaries(&parse_predicate(predicate), &mut conjuncts);
+        let expected: Vec<Expr> = expected.iter().copied().map(parse_predicate).collect();
+        assert_eq!(
+            conjuncts.len(),
+            expected.len(),
+            "{predicate} gave {conjuncts:#?}"
+        );
+        for (conjunct, expected) in conjuncts.iter().zip(expected.iter()) {
+            assert!(
+                exprs_are_equivalent(conjunct, expected),
+                "{predicate} gave {conjunct:#?}, expected {expected:#?}"
+            );
+        }
+    }
+
+    #[test]
+    fn and_chain_becomes_one_conjunct_per_operand() {
+        assert_conjuncts("a = 1 AND b = 2 AND c = 3", &["a = 1", "b = 2", "c = 3"]);
+    }
+
+    #[test]
+    fn a_predicate_without_and_stays_whole() {
+        assert_conjuncts("a = 1 OR b = 2", &["a = 1 OR b = 2"]);
+        assert_conjuncts("a = 1", &["a = 1"]);
+    }
+
+    #[test]
+    fn or_distributes_over_and() {
+        assert_conjuncts(
+            "x = 5 OR (y = 6 AND z = 7)",
+            &["x = 5 OR y = 6", "x = 5 OR z = 7"],
+        );
+    }
+
+    #[test]
+    fn both_sides_of_an_or_distribute() {
+        assert_conjuncts(
+            "(a = 1 AND b = 2) OR (c = 3 AND d = 4)",
+            &[
+                "a = 1 OR c = 3",
+                "a = 1 OR d = 4",
+                "b = 2 OR c = 3",
+                "b = 2 OR d = 4",
+            ],
+        );
+    }
+
+    #[test]
+    fn not_moves_through_or_with_de_morgans_law() {
+        assert_conjuncts("NOT (a = 1 OR b = 2)", &["NOT (a = 1)", "NOT (b = 2)"]);
+    }
+
+    #[test]
+    fn two_nots_cancel_each_other() {
+        assert_conjuncts("NOT (NOT (a = 1 AND b = 2))", &["a = 1", "b = 2"]);
+    }
+
+    #[test]
+    fn a_negated_and_of_ors_distributes() {
+        assert_conjuncts(
+            "NOT ((a = 1 OR b = 2) AND (c = 3 OR d = 4))",
+            &[
+                "NOT (a = 1) OR NOT (c = 3)",
+                "NOT (a = 1) OR NOT (d = 4)",
+                "NOT (b = 2) OR NOT (c = 3)",
+                "NOT (b = 2) OR NOT (d = 4)",
+            ],
+        );
+    }
+
+    #[test]
+    fn a_branch_shared_by_both_sides_of_an_or_becomes_its_own_conjunct() {
+        assert_conjuncts(
+            "(a = 1 AND b = 2) OR (a = 1 AND c = 3)",
+            &["a = 1", "b = 2 OR c = 3"],
+        );
+    }
+
+    #[test]
+    fn a_two_sided_join_predicate_exposes_the_branch_both_sides_share() {
+        assert_conjuncts(
+            "(e.fromId = 'uuid' AND e.toId = n.id AND e.label = 'requires') \
+             OR (e.toId = 'uuid' AND e.fromId = n.id AND e.label = 'requires')",
+            &[
+                "e.fromId = 'uuid' OR e.toId = 'uuid'",
+                "e.fromId = 'uuid' OR e.fromId = n.id",
+                "e.toId = n.id OR e.toId = 'uuid'",
+                "e.toId = n.id OR e.fromId = n.id",
+                "e.label = 'requires'",
+            ],
+        );
+    }
+
+    #[test]
+    fn a_conjunct_that_another_conjunct_makes_true_is_removed() {
+        assert_conjuncts("x = 5 OR (x = 5 AND z = 7)", &["x = 5"]);
+    }
+
+    #[test]
+    fn an_or_of_two_equal_branches_loses_the_copy() {
+        assert_conjuncts("a = 1 OR a = 1", &["a = 1"]);
+    }
+
+    #[test]
+    fn a_function_call_is_never_copied() {
+        assert_conjuncts(
+            "(a = 1 AND b = 2) OR random() > 0",
+            &["(a = 1 AND b = 2) OR random() > 0"],
+        );
+    }
+
+    #[test]
+    fn a_subquery_is_never_copied() {
+        assert_conjuncts(
+            "(a = 1 AND b = 2) OR c IN (SELECT x FROM u)",
+            &["(a = 1 AND b = 2) OR c IN (SELECT x FROM u)"],
+        );
+    }
+
+    #[test]
+    fn a_predicate_that_makes_too_many_conjuncts_stays_whole() {
+        let predicate = "(a = 1 AND b = 2) OR (c = 3 AND d = 4) OR (e = 5 AND f = 6) \
+             OR (g = 7 AND h = 8) OR (i = 9 AND j = 10)";
+        assert_conjuncts(predicate, &[predicate]);
+    }
+
+    #[test]
+    fn distribution_stops_one_step_before_the_limit_is_passed() {
+        let mut conjuncts: Vec<Expr> = Vec::new();
+        break_predicate_at_and_boundaries(
+            &parse_predicate(
+                "(a = 1 AND b = 2) OR (c = 3 AND d = 4) OR (e = 5 AND f = 6) \
+                 OR (g = 7 AND h = 8)",
+            ),
+            &mut conjuncts,
+        );
+        assert_eq!(conjuncts.len(), MAX_CNF_CONJUNCTS);
+    }
 }
