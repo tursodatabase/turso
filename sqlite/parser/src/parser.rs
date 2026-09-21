@@ -4789,6 +4789,7 @@ impl<'a> Parser<'a> {
         Ok(Stmt::Delete {
             with,
             tbl_name,
+            using: None,
             indexed,
             where_clause,
             returning,
@@ -12666,6 +12667,7 @@ mod tests {
                 b"DELETE FROM foo".as_slice(),
                 vec![Cmd::Stmt(Stmt::Delete {
                     with: None,
+                    using: None,
                     tbl_name: QualifiedName {
                         db_name: None,
                         name: Name::exact("foo".to_owned()),
@@ -12679,6 +12681,7 @@ mod tests {
             (
                 b"WITH test AS (SELECT 1) DELETE FROM foo NOT INDEXED WHERE 1 RETURNING bar".as_slice(),
                 vec![Cmd::Stmt(Stmt::Delete {
+                    using: None,
                     with: Some(With {
                         recursive: false,
                         ctes: vec![

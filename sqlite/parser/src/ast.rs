@@ -221,6 +221,7 @@ pub enum Stmt {
         with: Option<With>,
         /// `FROM` table name
         tbl_name: QualifiedName,
+        using: Option<FromClause>,
         /// `INDEXED`
         indexed: Option<Indexed>,
         /// `WHERE` clause

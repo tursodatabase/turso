@@ -22,7 +22,7 @@ use crate::{
         main_loop::{CloseLoop, InitLoop, OpenLoop},
         plan::{
             DeletePlan, EvalAt, JoinOrderMember, JoinedTable, NonFromClauseSubquery, Operation,
-            ResultSetColumn, Search, TableReferences,
+            QueryDestination, ResultSetColumn, Search, TableReferences,
         },
         subquery::{emit_non_from_clause_subqueries_for_eval_at, emit_non_from_clause_subquery},
         trigger_exec::{fire_trigger, TriggerContext},
@@ -119,20 +119,32 @@ pub fn emit_program_for_delete(
         &mut plan.non_from_clause_subqueries,
     )?;
 
-    // If there's a rowset_plan, materialize rowids into a RowSet first and then iterate the RowSet
-    // to delete the rows.
+    // If there's a rowset_plan, materialize rowids into a RowSet or temporary table first
+    // and then iterate over it to delete the rows.
     if let Some(rowset_plan) = plan.rowset_plan.take() {
+        let using_cursor = match &rowset_plan.query_destination {
+            QueryDestination::EphemeralTable { cursor_id, .. } => Some(*cursor_id),
+            QueryDestination::RowSet { .. } => None,
+            _ => unreachable!("DELETE rows must use a rowset or an ephemeral table"),
+        };
         let rowset_reg = plan
             .rowset_reg
             .expect("rowset_reg must be Some if rowset_plan is Some");
 
-        // Initialize the RowSet register with NULL (RowSet will be created on first RowSetAdd)
-        program.emit_insn(Insn::Null {
-            dest: rowset_reg,
-            dest_end: None,
-        });
+        if let Some(cursor_id) = using_cursor {
+            program.emit_insn(Insn::OpenEphemeral {
+                cursor_id,
+                is_table: true,
+            });
+        } else {
+            // Initialize the RowSet register with NULL (RowSet will be created on first RowSetAdd)
+            program.emit_insn(Insn::Null {
+                dest: rowset_reg,
+                dest_end: None,
+            });
+        }
 
-        // Execute the rowset SELECT plan to populate the rowset.
+        // Execute the rowset SELECT plan to populate the RowSet or temporary table.
         program.nested(|program| emit_program_for_select(program, resolver, rowset_plan))?;
 
         // Close the read cursor(s) opened by the rowset plan before opening for writing
@@ -170,7 +182,7 @@ pub fn emit_program_for_delete(
             }
         }
 
-        // Now iterate over the RowSet and delete each rowid
+        // Now iterate over the RowSet or temporary table and delete each rowid
         let rowset_loop_start = program.allocate_label();
         let rowset_loop_end = program.allocate_label();
         let rowid_reg = program.alloc_register();
@@ -183,15 +195,51 @@ pub fn emit_program_for_delete(
             });
         }
 
+        if let Some(cursor_id) = using_cursor {
+            program.emit_insn(Insn::Rewind {
+                cursor_id,
+                pc_if_empty: rowset_loop_end,
+            });
+        }
         program.preassign_label_to_next_insn(rowset_loop_start);
 
-        // Read next rowid from RowSet
-        // Note: rowset_loop_end will be resolved later when we assign it
-        program.emit_insn(Insn::RowSetRead {
-            rowset_reg,
-            pc_if_empty: rowset_loop_end,
-            dest_reg: rowid_reg,
-        });
+        if let Some(cursor_id) = using_cursor {
+            program.emit_insn(Insn::RowId {
+                cursor_id,
+                dest: rowid_reg,
+            });
+            t_ctx.resolver.enable_expr_to_reg_cache();
+            for (column, (database_id, expr)) in plan.using_columns.iter().enumerate() {
+                let reg = program.alloc_register();
+                program.emit_insn(Insn::Column {
+                    cursor_id,
+                    column,
+                    dest: reg,
+                    default: None,
+                });
+                let mut qualified_expr = expr.clone();
+                let turso_parser::ast::Expr::Column { database, .. } = &mut qualified_expr else {
+                    unreachable!("USING values must be columns");
+                };
+                *database = Some(*database_id);
+                for cached_expr in [expr.clone(), qualified_expr] {
+                    t_ctx.resolver.cache_scalar_expr_reg(
+                        std::borrow::Cow::Owned(cached_expr),
+                        reg,
+                        false,
+                        &plan.table_references,
+                    )?;
+                }
+            }
+        } else {
+            // Read next rowid from RowSet
+            // Note: rowset_loop_end will be resolved later when we assign it
+            program.emit_insn(Insn::RowSetRead {
+                rowset_reg,
+                pc_if_empty: rowset_loop_end,
+                dest_reg: rowid_reg,
+            });
+        }
 
         emit_delete_insns_when_triggers_present(
             connection,
@@ -207,9 +255,18 @@ pub fn emit_program_for_delete(
         )?;
 
         // Continue loop
-        program.emit_insn(Insn::Goto {
-            target_pc: rowset_loop_start,
-        });
+        if let Some(cursor_id) = using_cursor {
+            program.emit_insn(Insn::Next {
+                cursor_id,
+                pc_if_next: rowset_loop_start,
+                fullscan: false,
+                is_index: false,
+            });
+        } else {
+            program.emit_insn(Insn::Goto {
+                target_pc: rowset_loop_start,
+            });
+        }
 
         // Assign the end label here, after all loop body code
         program.preassign_label_to_next_insn(rowset_loop_end);

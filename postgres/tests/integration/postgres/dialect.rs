@@ -2957,6 +2957,73 @@ fn test_postgres_delete_with_alias(db: TempDatabase) {
 }
 
 #[turso_macros::test(mvcc)]
+fn test_postgres_delete_using_finishes_before_returning(db: TempDatabase) {
+    let conn = db.connect_postgres();
+    conn.execute("CREATE TABLE target (id integer PRIMARY KEY)")
+        .unwrap();
+    conn.execute("CREATE TABLE source (target_id int, label text)")
+        .unwrap();
+    conn.execute("INSERT INTO target VALUES (1), (2), (3)")
+        .unwrap();
+    conn.execute("INSERT INTO source VALUES (1, 'a'), (2, 'b'), (2, 'b'), (3, 'c')")
+        .unwrap();
+
+    let mut rows = conn
+        .query("DELETE FROM target AS t USING source AS s WHERE t.id = s.target_id RETURNING t.id, s.label")
+        .unwrap()
+        .unwrap();
+    assert!(matches!(rows.step().unwrap(), StepResult::Row));
+    drop(rows);
+
+    let mut rows = conn.query("SELECT count(*) FROM target").unwrap().unwrap();
+    assert!(matches!(rows.step().unwrap(), StepResult::Row));
+    assert_eq!(rows.row().unwrap().get_value(0).to_string(), "0");
+    assert!(matches!(rows.step().unwrap(), StepResult::Done));
+}
+
+#[turso_macros::test(mvcc)]
+fn test_postgres_delete_using_materializes_returned_columns(db: TempDatabase) {
+    use turso_core::vdbe::insn::Insn;
+
+    let conn = db.connect_postgres();
+    conn.execute("CREATE TABLE target (id int)").unwrap();
+    conn.execute("CREATE TABLE source (match_id int, unused text, kept text, also_unused text)")
+        .unwrap();
+
+    let cases: &[(&str, &[u32])] = &[
+        ("t.id", &[]),
+        ("(SELECT t.id)", &[]),
+        ("s.kept", &[1]),
+        ("s.kept, s.kept", &[1]),
+        ("(SELECT s.kept)", &[1]),
+        ("(SELECT s.kept WHERE s.match_id = t.id)", &[2]),
+        ("s.*", &[4]),
+        ("*", &[4]),
+    ];
+    for (returning, expected_widths) in cases {
+        let statement = conn
+            .prepare(format!(
+                "DELETE FROM target AS t USING source AS s \
+                 WHERE t.id = 1 AND s.match_id = 1 RETURNING {returning}"
+            ))
+            .unwrap();
+        let record_widths = statement
+            .get_program()
+            .prepared()
+            .insns
+            .iter()
+            .filter_map(|(insn, _)| match insn {
+                Insn::MakeRecord {
+                    count, index_name, ..
+                } if index_name.as_deref() == Some("delete_using") => Some(*count),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(record_widths, *expected_widths, "RETURNING {returning}");
+    }
+}
+
+#[turso_macros::test(mvcc)]
 fn test_postgres_update_with_alias(db: TempDatabase) {
     let conn = db.connect_postgres();
 

@@ -483,6 +483,7 @@ impl ToTokens for Stmt {
             Self::Delete {
                 with,
                 tbl_name,
+                using,
                 indexed,
                 where_clause,
                 returning,
@@ -493,6 +494,10 @@ impl ToTokens for Stmt {
                 s.append(TK_DELETE, None)?;
                 s.append(TK_FROM, None)?;
                 tbl_name.to_tokens(s, context)?;
+                if let Some(using) = using {
+                    s.append(TK_USING, None)?;
+                    using.to_tokens(s, context)?;
+                }
                 if let Some(indexed) = indexed {
                     indexed.to_tokens(s, context)?;
                 }

@@ -1014,6 +1014,7 @@ impl PostgreSQLTranslator {
         Ok(ast::Stmt::Delete {
             with: None,
             tbl_name,
+            using: None,
             indexed: None,
             where_clause: None,
             returning: vec![],
@@ -1438,10 +1439,16 @@ impl PostgreSQLTranslator {
 
         let returning = self.translate_returning(&delete.returning_list)?;
         let with = self.translate_with_clause(&delete.with_clause)?;
+        let using = if delete.using_clause.is_empty() {
+            None
+        } else {
+            Some(self.translate_from_items(&delete.using_clause)?)
+        };
 
         Ok(ast::Stmt::Delete {
             with,
             tbl_name,
+            using,
             indexed: None,
             where_clause,
             returning,

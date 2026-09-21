@@ -849,6 +849,7 @@ impl SelectPlan {
 pub enum DmlSafetyReason {
     /// UPDATE ... FROM computes writes from the materialized result of the FROM clause.
     UpdateFrom,
+    DeleteUsing,
     /// Triggers exist, so we lock in target rows before writing.
     Trigger,
     /// WHERE has a subquery, so we lock in target rows before writing.
@@ -904,6 +905,7 @@ pub struct DeletePlan {
     pub rowset_plan: Option<SelectPlan>,
     /// Register ID for the RowSet (if rowset_plan is Some)
     pub rowset_reg: Option<usize>,
+    pub using_columns: Vec<(usize, ast::Expr)>,
     /// Subqueries that appear in the WHERE clause (for non-rowset path)
     pub non_from_clause_subqueries: Vec<NonFromClauseSubquery>,
     /// Whether this DELETE plan uses the safer pre-materialization path, and why.
