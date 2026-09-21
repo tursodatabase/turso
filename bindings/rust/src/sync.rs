@@ -1344,6 +1344,121 @@ mod tests {
         Ok(result)
     }
 
+    #[test]
+    pub fn test_sync_every_operation_started_during_push_fails_fast() {
+        let _ = tracing_subscriber::fmt::try_init();
+        let server_runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let server = server_runtime.block_on(async {
+            let server = TursoServer::new().await.unwrap();
+            server.db_sql("CREATE TABLE t(x)").await.unwrap();
+            server
+        });
+        let db_url = server.db_url().to_string();
+
+        run_with_deadline(1, Duration::from_secs(30), || async move {
+            let db = crate::sync::Builder::new_remote(":memory:")
+                .with_remote_url(db_url)
+                .build()
+                .await
+                .unwrap();
+
+            let push = db.sync.push_changes();
+            assert!(matches!(
+                push.resume().unwrap(),
+                turso_sdk_kit::rsapi::TursoStatusCode::Io
+            ));
+
+            for (name, op) in [
+                ("checkpoint", db.sync.checkpoint()),
+                ("wait_changes", db.sync.wait_changes()),
+                ("push_changes", db.sync.push_changes()),
+                ("connect", db.sync.connect()),
+                ("stats", db.sync.stats()),
+            ] {
+                let error = op.resume().err().unwrap_or_else(|| {
+                    panic!("{name} started while a push was in progress");
+                });
+                assert!(
+                    error
+                        .to_string()
+                        .contains("another sync operation is in progress"),
+                    "{name} failed with an unexpected error: {error}"
+                );
+            }
+
+            super::drive_operation(push, db.io.clone()).await.unwrap();
+            super::drive_operation_result(db.sync.connect(), db.io.clone())
+                .await
+                .unwrap();
+            super::drive_operation_result(db.sync.stats(), db.io.clone())
+                .await
+                .unwrap();
+            db.push().await.unwrap();
+        });
+    }
+
+    #[test]
+    pub fn test_sync_dropping_a_started_operation_releases_the_gate() {
+        let _ = tracing_subscriber::fmt::try_init();
+        let server_runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let server = server_runtime.block_on(async {
+            let server = TursoServer::new().await.unwrap();
+            server.db_sql("CREATE TABLE t(x)").await.unwrap();
+            server
+        });
+        let db_url = server.db_url().to_string();
+
+        run_with_deadline(1, Duration::from_secs(30), || async move {
+            let db = crate::sync::Builder::new_remote(":memory:")
+                .with_remote_url(db_url)
+                .build()
+                .await
+                .unwrap();
+
+            for op in [
+                db.sync.push_changes(),
+                db.sync.wait_changes(),
+                db.sync.checkpoint(),
+            ] {
+                let _ = op.resume();
+                drop(op);
+                db.push().await.unwrap();
+            }
+        });
+    }
+
+    fn run_with_deadline<F, Fut>(worker_threads: usize, deadline: Duration, test: F)
+    where
+        F: FnOnce() -> Fut + Send + 'static,
+        Fut: std::future::Future<Output = ()>,
+    {
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_multi_thread()
+                .worker_threads(worker_threads)
+                .enable_all()
+                .build()
+                .unwrap();
+            runtime.block_on(test());
+            let _ = done_tx.send(());
+        });
+        match done_rx.recv_timeout(deadline) {
+            Ok(()) => {}
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                panic!("sync operations deadlocked: test did not finish within {deadline:?}")
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                panic!("test panicked on its runtime thread")
+            }
+        }
+    }
+
     #[tokio::test]
     pub async fn test_sync_bootstrap() {
         let _ = tracing_subscriber::fmt::try_init();
@@ -2555,5 +2670,117 @@ mod tests {
             tokens.len(),
             "tokens must be unique per request: {tokens:?}"
         );
+    }
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    pub async fn test_sync_connect_and_stats_never_run_inside_apply_or_checkpoint() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::sync::{Arc, Mutex};
+
+        let _ = tracing_subscriber::fmt::try_init();
+        let dir = TempDir::new().unwrap();
+        let server = TursoServer::new().await.unwrap();
+        server.db_sql("CREATE TABLE t(x BLOB)").await.unwrap();
+        let db = crate::sync::Builder::new_remote(dir.path().join("local.db").to_str().unwrap())
+            .with_remote_url(server.db_url())
+            .build()
+            .await
+            .unwrap();
+        db.pull().await.unwrap();
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let errors = Arc::new(Mutex::new(Vec::<String>::new()));
+        let prober = tokio::spawn({
+            let db = db.clone();
+            let stop = stop.clone();
+            let errors = errors.clone();
+            async move {
+                while !stop.load(Ordering::Relaxed) {
+                    let connect =
+                        super::drive_operation_result(db.sync.connect(), db.io.clone()).await;
+                    record_error(&errors, "connect", connect);
+                    let stats = super::drive_operation_result(db.sync.stats(), db.io.clone()).await;
+                    record_error(&errors, "stats", stats);
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                }
+            }
+        });
+
+        let rounds = 4;
+        let rows_per_round = 1500;
+        for _ in 0..rounds {
+            server
+                .db_sql(&format!(
+                    "WITH RECURSIVE c(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM c WHERE i < {rows_per_round}) \
+                     INSERT INTO t SELECT randomblob(1000) FROM c"
+                ))
+                .await
+                .unwrap();
+            record_error(&errors, "pull", retry_while_refused(|| db.pull()).await);
+            record_error(
+                &errors,
+                "checkpoint",
+                retry_while_refused(|| db.checkpoint()).await,
+            );
+        }
+        stop.store(true, Ordering::Relaxed);
+        prober.await.unwrap();
+
+        db.pull().await.unwrap();
+        let conn = db.connect().await.unwrap();
+        let mut rows = conn.query("SELECT count(*) FROM t", ()).await.unwrap();
+        let row = rows.next().await.unwrap().unwrap();
+        assert_eq!(
+            row.get_value(0).unwrap(),
+            Value::Integer(rounds * rows_per_round)
+        );
+
+        let errors = errors.lock().unwrap();
+        assert!(errors.is_empty(), "{}", summarize_errors(&errors));
+    }
+
+    fn record_error<T>(
+        errors: &std::sync::Mutex<Vec<String>>,
+        operation: &str,
+        result: crate::Result<T>,
+    ) {
+        if let Err(error) = result {
+            if !refused_because_another_operation_runs(&error) {
+                errors.lock().unwrap().push(format!("{operation}: {error}"));
+            }
+        }
+    }
+
+    async fn retry_while_refused<T, F, Fut>(mut operation: F) -> crate::Result<T>
+    where
+        F: FnMut() -> Fut,
+        Fut: std::future::Future<Output = crate::Result<T>>,
+    {
+        for _ in 0..10_000 {
+            match operation().await {
+                Err(error) if refused_because_another_operation_runs(&error) => {
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                }
+                result => return result,
+            }
+        }
+        panic!("operation was refused for 10 seconds");
+    }
+
+    fn refused_because_another_operation_runs(error: &crate::Error) -> bool {
+        error
+            .to_string()
+            .contains("another sync operation is in progress")
+    }
+
+    fn summarize_errors(errors: &[String]) -> String {
+        let mut counts = std::collections::BTreeMap::<&str, usize>::new();
+        for error in errors {
+            *counts.entry(error).or_default() += 1;
+        }
+        counts
+            .iter()
+            .map(|(error, count)| format!("{count} x {error}"))
+            .collect::<Vec<_>>()
+            .join("\n")
     }
 }
