@@ -935,6 +935,12 @@ pub struct MaterializedBuildInput {
     pub prefix_tables: TableMask,
 }
 
+impl MaterializedBuildInput {
+    pub(crate) fn requires_build_table(&self) -> bool {
+        matches!(self.mode, MaterializedBuildInputMode::RowidOnly)
+    }
+}
+
 impl LimitCtx {
     pub fn new(program: &mut ProgramBuilder) -> Self {
         Self {
@@ -999,8 +1005,7 @@ pub struct HashCtx {
     /// These references may point at multiple tables when a build input was
     /// materialized from a join prefix.
     pub payload_columns: Vec<MaterializedColumnRef>,
-    /// Build table cursor (for NullRow in outer joins).
-    pub build_cursor_id: Option<CursorID>,
+    pub build_table_cursor_id: Option<CursorID>,
     pub join_type: HashJoinType,
     /// Gosub register for the inner-loop subroutine wrapping subsequent tables.
     /// Outer hash joins wrap inner loops so unmatched-row paths can re-enter via Gosub.

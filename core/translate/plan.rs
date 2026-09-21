@@ -2931,20 +2931,12 @@ impl JoinedTable {
                 // rowid is always implicitly covered by the index
                 continue;
             }
-            let covered_by_index = index
-                .columns
-                .iter()
-                .filter(|c| c.pos_in_table == required_col)
-                .any(|c| {
-                    // SQLite doesn't consider fulfill covering indexes with virtual columns,
-                    // see `recomputeColumnsNotIndexed` in `build.c`. We might be able to improve this
-                    // in the future, but for now we do this to ensure correctness.
-                    !btree
-                        .columns()
-                        .get(c.pos_in_table)
-                        .expect("column should be in table")
-                        .is_virtual_generated()
-                });
+            let covered_by_index = index.column_table_pos_to_index_pos(required_col).is_some()
+                && !btree
+                    .columns()
+                    .get(required_col)
+                    .expect("column should be in table")
+                    .is_virtual_generated();
             if !covered_by_index {
                 return false;
             }
@@ -2959,6 +2951,19 @@ impl JoinedTable {
             return false;
         };
         self.index_is_covering(index.as_ref())
+    }
+
+    pub fn selected_index_stores_used_columns(&self) -> bool {
+        let (Some(index), Table::BTree(btree)) = (self.op.index(), &self.table) else {
+            return false;
+        };
+        if index.index_method.is_some() {
+            return false;
+        }
+        if self.col_used_mask.is_empty() {
+            return index.where_clause.is_none();
+        }
+        Self::index_covers_columns(index.as_ref(), btree, &self.col_used_mask)
     }
 
     pub fn column_is_used(&self, index: usize) -> bool {
