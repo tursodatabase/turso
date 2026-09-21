@@ -271,11 +271,6 @@ harness = false
 required-features = ["fts"]
 
 [[bench]]
-name = "fts_searcher_cache"
-harness = false
-required-features = ["fts", "test_helper"]
-
-[[bench]]
 name = "fts_comparison_benchmark"
 harness = false
 required-features = ["fts"]
