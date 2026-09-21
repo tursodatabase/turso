@@ -690,3 +690,118 @@ fn query_hits(cursor: &mut FtsCursor, pattern: i64, query: &str, limit: i64) -> 
     assert!(matches!(next, IOResult::Done(false)));
     hits
 }
+
+#[test]
+fn row_fields_borrow_the_record_payload() {
+    use crate::types::{ImmutableRecord, TextRef, TextSubtype, ValueRef};
+
+    let record = ImmutableRecord::from_values(
+        [
+            ValueRef::Text(TextRef::new("fts2/seg/abc", TextSubtype::Text)),
+            ValueRef::Numeric(crate::numeric::Numeric::Integer(7)),
+            ValueRef::Blob(&[3, 1, 4, 1, 5]),
+        ],
+        3,
+    )
+    .unwrap();
+    let (path, chunk, bytes) = row_fields(&record).unwrap();
+    assert_eq!(path, "fts2/seg/abc");
+    assert_eq!(chunk, 7);
+    assert_eq!(bytes, &[3, 1, 4, 1, 5]);
+    let ValueRef::Text(stored_path) = record.get_value_opt(0).unwrap() else {
+        panic!("expected text");
+    };
+    let ValueRef::Blob(stored_bytes) = record.get_value_opt(2).unwrap() else {
+        panic!("expected blob");
+    };
+    assert_eq!(path.as_ptr(), stored_path.value.as_ptr());
+    assert_eq!(bytes.as_ptr(), stored_bytes.as_ptr());
+}
+
+#[test]
+fn cached_descriptor_requires_exact_bytes_and_segment_id() {
+    let mut cache = SegmentByteCache::default();
+    let id = SegmentId::generate_random();
+    let other_id = SegmentId::generate_random();
+    let mut descriptor = SegmentDescriptor {
+        segment_id: id,
+        max_doc: 7,
+        files: vec![SegmentFileEntry {
+            name: "x.term".to_owned(),
+            size: 31,
+            num_chunks: 1,
+        }],
+    };
+    let bytes = descriptor.encode().unwrap();
+    let uncached = cache.decode_descriptor(id, &bytes, usize::MAX).unwrap();
+    assert!(cache.entries.is_empty());
+    let data = Arc::new(SegmentData::new(
+        HashMap::default(),
+        SegmentIdentities::new(Vec::new()),
+    ));
+    cache.put(id, data, usize::MAX);
+    let first = cache.decode_descriptor(id, &bytes, usize::MAX).unwrap();
+    let second = cache.decode_descriptor(id, &bytes, usize::MAX).unwrap();
+    assert!(!Arc::ptr_eq(&uncached, &first));
+    assert!(Arc::ptr_eq(&first, &second));
+    let other = cache
+        .decode_descriptor(other_id, &bytes, usize::MAX)
+        .unwrap();
+    assert_eq!(other.segment_id, other_id);
+    assert!(!Arc::ptr_eq(&first, &other));
+
+    for position in [0, 8, bytes.len() - 1] {
+        let mut corrupted = bytes.clone();
+        corrupted[position] ^= 1;
+        assert!(matches!(
+            cache.decode_descriptor(id, &corrupted, usize::MAX),
+            Err(LimboError::Corrupt(_))
+        ));
+    }
+    let mut invalid_magic = bytes[..bytes.len() - 8].to_vec();
+    invalid_magic[0] ^= 1;
+    assert!(matches!(
+        cache.decode_descriptor(id, &format::append_checksum(invalid_magic), usize::MAX),
+        Err(LimboError::Corrupt(_))
+    ));
+    descriptor.max_doc = 19;
+    let changed = cache
+        .decode_descriptor(id, &descriptor.encode().unwrap(), usize::MAX)
+        .unwrap();
+    assert_eq!(changed.max_doc, 19);
+    assert_eq!(first.max_doc, 7);
+    assert!(!Arc::ptr_eq(&first, &changed));
+    let original = cache.decode_descriptor(id, &bytes, usize::MAX).unwrap();
+    assert_eq!(original.max_doc, 7);
+}
+
+#[test]
+fn cached_descriptor_is_counted_and_removed_with_segment_bytes() {
+    let mut cache = SegmentByteCache::default();
+    let a = SegmentId::generate_random();
+    let b = SegmentId::generate_random();
+    let data = Arc::new(SegmentData::new(
+        HashMap::from_iter([("f".to_owned(), Arc::<[u8]>::from(vec![0; 100]))]),
+        SegmentIdentities::new(Vec::new()),
+    ));
+    cache.put(a, Arc::clone(&data), 200);
+    cache.put(b, Arc::clone(&data), 200);
+    assert_eq!(cache.total_bytes(), 200);
+    let bytes = SegmentDescriptor {
+        segment_id: b,
+        max_doc: 3,
+        files: Vec::new(),
+    }
+    .encode()
+    .unwrap();
+    let descriptor = cache.decode_descriptor(b, &bytes, 200).unwrap();
+    assert!(cache.get(&a).is_none());
+    assert!(cache.get(&b).is_some());
+    assert!(cache.total_bytes() > 100);
+    assert!(cache.total_bytes() <= 200);
+    cache.remove(&b);
+    assert_eq!(cache.total_bytes(), 0);
+    cache.put(b, data, 200);
+    let reloaded = cache.decode_descriptor(b, &bytes, 200).unwrap();
+    assert!(!Arc::ptr_eq(&descriptor, &reloaded));
+}

@@ -5003,6 +5003,65 @@ fn fts_mvcc_long_reader_sees_frozen_segments_across_commits_and_merge() {
     );
 }
 
+#[cfg(all(feature = "fts", not(target_family = "wasm")))]
+#[test]
+fn fts_mvcc_warm_metadata_preserves_visibility_after_rollback_merge_and_rebuild() {
+    let tmp_db = TempDatabase::builder()
+        .with_opts(turso_core::DatabaseOpts::new().with_index_method(true))
+        .with_mvcc(true)
+        .build();
+    let writer = tmp_db.connect_limbo();
+    let reader = tmp_db.connect_limbo();
+    writer
+        .execute("CREATE TABLE docs(id INTEGER PRIMARY KEY, body TEXT)")
+        .unwrap();
+    writer
+        .execute("INSERT INTO docs VALUES (2, 'stable alpha'), (7, 'stable beta')")
+        .unwrap();
+    writer
+        .execute("CREATE INDEX docs_fts ON docs USING fts(body)")
+        .unwrap();
+    let check = |conn: &Arc<turso_core::Connection>, expected: &[i64]| {
+        for _ in 0..3 {
+            assert_eq!(fts_ids(conn, "stable"), expected);
+        }
+    };
+    reader.execute("BEGIN CONCURRENT").unwrap();
+    check(&reader, &[2, 7]);
+    writer.execute("BEGIN CONCURRENT").unwrap();
+    writer.execute("DELETE FROM docs WHERE id = 2").unwrap();
+    writer
+        .execute("INSERT INTO docs VALUES (19, 'stable gamma')")
+        .unwrap();
+    check(&writer, &[7, 19]);
+    check(&reader, &[2, 7]);
+    writer.execute("ROLLBACK").unwrap();
+    check(&writer, &[2, 7]);
+    check(&reader, &[2, 7]);
+
+    writer.execute("DELETE FROM docs WHERE id = 7").unwrap();
+    writer
+        .execute("INSERT INTO docs VALUES (31, 'stable delta')")
+        .unwrap();
+    check(&writer, &[2, 31]);
+    check(&reader, &[2, 7]);
+    writer.execute("OPTIMIZE INDEX docs_fts").unwrap();
+    check(&writer, &[2, 31]);
+    check(&reader, &[2, 7]);
+    reader.execute("COMMIT").unwrap();
+    check(&reader, &[2, 31]);
+
+    writer.execute("DROP INDEX docs_fts").unwrap();
+    writer
+        .execute("UPDATE docs SET body = 'changed' WHERE id = 2")
+        .unwrap();
+    writer
+        .execute("CREATE INDEX docs_fts ON docs USING fts(body)")
+        .unwrap();
+    check(&writer, &[31]);
+    check(&reader, &[31]);
+}
+
 /// Repro of the CLI smoke-test failure: SELECT between UPDATE and DELETE,
 /// then the same query after DELETE resurrects the updated row's old
 /// posting.

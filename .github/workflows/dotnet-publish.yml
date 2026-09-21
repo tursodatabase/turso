@@ -199,8 +199,25 @@ jobs:
           IPHONEOS_DEPLOYMENT_TARGET: ${{ matrix.ios-deployment-target }}
         run: make ${{ matrix.make-target }} RUST_RELEASE_OPT='--profile release-official' RUST_PROFILE_DIR='release-official'
 
+      - name: Build rust native library (Windows x64)
+        if: matrix.target == 'x86_64-pc-windows-msvc'
+        shell: pwsh
+        run: |
+          $vswhere = Join-Path ${env:ProgramFiles(x86)} "Microsoft Visual Studio\Installer\vswhere.exe"
+          if (!(Test-Path $vswhere)) {
+            throw "vswhere.exe not found"
+          }
+          $vcvars = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -find "VC\Auxiliary\Build\vcvarsall.bat" | Select-Object -First 1
+          if (!$vcvars) {
+            throw "Visual Studio x64 build tools not found"
+          }
+          & $env:ComSpec /c "call `"$vcvars`" x64 >nul && make ${{ matrix.make-target }} RUST_RELEASE_OPT=`"--profile release-official`" RUST_PROFILE_DIR=release-official"
+          if ($LASTEXITCODE -ne 0) {
+            exit $LASTEXITCODE
+          }
+
       - name: Build rust native library
-        if: ${{ !contains(matrix.target, 'unknown-linux-gnu') && !contains(matrix.target, 'apple-darwin') && !contains(matrix.target, 'apple-ios') }}
+        if: ${{ !contains(matrix.target, 'unknown-linux-gnu') && !contains(matrix.target, 'apple-darwin') && !contains(matrix.target, 'apple-ios') && matrix.target != 'x86_64-pc-windows-msvc' }}
         run: make ${{ matrix.make-target }} RUST_RELEASE_OPT='--profile release-official' RUST_PROFILE_DIR='release-official'
 
       - name: Collect Windows static native dependencies
