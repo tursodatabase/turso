@@ -299,7 +299,7 @@ expect {
 @cross-check-integrity
 test alter-table-add-drop-column-preserves-type-size {
     CREATE TABLE t (a VARCHAR(10));
-    ALTER TABLE t ADD COLUMN b DECIMAL(10,2);
+    ALTER TABLE t ADD COLUMN b DECIMAL(10, 2);
     SELECT sql FROM sqlite_schema;
     ALTER TABLE t DROP COLUMN a;
     SELECT sql FROM sqlite_schema;
