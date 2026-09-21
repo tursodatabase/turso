@@ -2774,6 +2774,43 @@ fn vtab_predicate_table_id(expr: &Expr) -> Option<TableInternalId> {
         _ => None,
     }
 }
+/// Maximum number of clauses that [break_predicate_at_and_boundaries] lets a
+/// predicate expand into while it distributes ORs over ANDs.
+const MAX_CNF_CLAUSES: usize = 16;
+
+/// Maximum number of literals that one clause can hold. A chain of ORs gives
+/// one clause with one literal per branch, and each merge step searches that
+/// clause for a literal it already holds.
+const MAX_CNF_CLAUSE_LITERALS: usize = 64;
+
+/// The literals of one OR clause. The clause is true if any literal is true.
+type Clause = Vec<Expr>;
+
+/// Breaks a predicate into the conditions that must all be true, after it
+/// converts the predicate to conjunctive normal form (an AND of ORs).
+///
+/// The optimizer reads index constraints from one condition at a time, so a
+/// condition below a NOT or an OR cannot drive an index seek. CNF moves such
+/// conditions to the top level. Two steps of the algorithm apply to a SQL
+/// predicate:
+///
+/// 1. Negation normal form: move each NOT inwards with De Morgan's laws, thus
+///    `NOT (P OR Q)` becomes `NOT P AND NOT Q` and `NOT (P AND Q)` becomes
+///    `NOT P OR NOT Q`. Replace `NOT NOT P` with `P`. A negated comparison
+///    keeps its operands and gets the opposite operator, thus `NOT (a > 5)`
+///    becomes `a <= 5`.
+/// 2. Distribution: replace `P OR (Q AND R)` with `(P OR Q) AND (P OR R)`.
+///
+/// The steps for implications, quantifiers and Skolem functions do not apply.
+/// SQL has no implication operator, and a predicate has no quantified
+/// variables.
+///
+/// Distribution can give an exponential number of clauses. The transformation
+/// that prevents this (Tseitin) keeps satisfiability but not equivalence, so a
+/// WHERE clause cannot use it, because a WHERE clause must keep the same rows.
+/// This function stops instead: if the expansion goes past [MAX_CNF_CLAUSES],
+/// or if the clauses are more work than the predicate they replace, the
+/// predicate stays one condition.
 pub fn break_predicate_at_and_boundaries<T: From<Expr>>(
     predicate: &Expr,
     out_predicates: &mut Vec<T>,
@@ -2788,10 +2825,259 @@ pub fn break_predicate_at_and_boundaries<T: From<Expr>>(
             break_predicate_at_and_boundaries(left, out_predicates);
             break_predicate_at_and_boundaries(right, out_predicates);
         }
+        Expr::Unary(ast::UnaryOperator::Not, operand) => match negate_predicate(operand) {
+            Some(negated) => break_predicate_at_and_boundaries(&negated, out_predicates),
+            None => out_predicates.push(predicate.clone().into()),
+        },
+        Expr::Binary(_, ast::Operator::Or, _) => match conjuncts_of_disjunction(predicate) {
+            Some(conjuncts) => out_predicates.extend(conjuncts.into_iter().map(T::from)),
+            None => out_predicates.push(predicate.clone().into()),
+        },
         _ => {
             out_predicates.push(predicate.clone().into());
         }
     }
+}
+
+/// Returns the predicate with one NOT pushed into it, or `None` when the NOT
+/// has to stay where it is.
+///
+/// A row value comparison keeps its NOT: the optimizer never builds index
+/// constraints from one, so the rewrite would only add risk.
+fn negate_predicate(predicate: &Expr) -> Option<Expr> {
+    let predicate = unwrap_parens(predicate).unwrap_or(predicate);
+    match predicate {
+        Expr::Binary(left, ast::Operator::And, right) => Some(Expr::Binary(
+            Box::new(negated_or_kept_below_not(left)),
+            ast::Operator::Or,
+            Box::new(negated_or_kept_below_not(right)),
+        )),
+        Expr::Binary(left, ast::Operator::Or, right) => Some(Expr::Binary(
+            Box::new(negated_or_kept_below_not(left)),
+            ast::Operator::And,
+            Box::new(negated_or_kept_below_not(right)),
+        )),
+        Expr::Unary(ast::UnaryOperator::Not, operand) => Some(operand.as_ref().clone()),
+        Expr::Binary(left, operator, right) => {
+            let negated_operator = negated_comparison_operator(*operator)?;
+            let is_row_value = |expr: &Expr| expr_vector_size(expr).is_ok_and(|size| size > 1);
+            if is_row_value(left) || is_row_value(right) {
+                return None;
+            }
+            Some(Expr::Binary(left.clone(), negated_operator, right.clone()))
+        }
+        Expr::IsNull(operand) => Some(Expr::NotNull(operand.clone())),
+        Expr::NotNull(operand) => Some(Expr::IsNull(operand.clone())),
+        Expr::Between {
+            lhs,
+            not,
+            start,
+            end,
+        } => Some(Expr::Between {
+            lhs: lhs.clone(),
+            not: !not,
+            start: start.clone(),
+            end: end.clone(),
+        }),
+        Expr::Like {
+            lhs,
+            not,
+            op,
+            rhs,
+            escape,
+        } => Some(Expr::Like {
+            lhs: lhs.clone(),
+            not: !not,
+            op: *op,
+            rhs: rhs.clone(),
+            escape: escape.clone(),
+        }),
+        Expr::InList { lhs, not, rhs } => Some(Expr::InList {
+            lhs: lhs.clone(),
+            not: !not,
+            rhs: rhs.clone(),
+        }),
+        Expr::InSelect { lhs, not, rhs } => Some(Expr::InSelect {
+            lhs: lhs.clone(),
+            not: !not,
+            rhs: rhs.clone(),
+        }),
+        Expr::InTable {
+            lhs,
+            not,
+            rhs,
+            args,
+        } => Some(Expr::InTable {
+            lhs: lhs.clone(),
+            not: !not,
+            rhs: rhs.clone(),
+            args: args.clone(),
+        }),
+        _ => None,
+    }
+}
+
+fn negated_or_kept_below_not(predicate: &Expr) -> Expr {
+    negate_predicate(predicate)
+        .unwrap_or_else(|| Expr::Unary(ast::UnaryOperator::Not, Box::new(predicate.clone())))
+}
+
+/// Comparisons are true exactly when the negated comparison is false, and both
+/// give NULL for the same operands, so the NOT can be dropped. The code
+/// generator negates conditions with the same table of operators.
+fn negated_comparison_operator(operator: ast::Operator) -> Option<ast::Operator> {
+    match operator {
+        ast::Operator::Equals => Some(ast::Operator::NotEquals),
+        ast::Operator::NotEquals => Some(ast::Operator::Equals),
+        ast::Operator::Less => Some(ast::Operator::GreaterEquals),
+        ast::Operator::LessEquals => Some(ast::Operator::Greater),
+        ast::Operator::Greater => Some(ast::Operator::LessEquals),
+        ast::Operator::GreaterEquals => Some(ast::Operator::Less),
+        ast::Operator::Is => Some(ast::Operator::IsNot),
+        ast::Operator::IsNot => Some(ast::Operator::Is),
+        _ => None,
+    }
+}
+
+/// Returns the conditions of a disjunction in conjunctive normal form, or
+/// `None` when the clauses have more literals than the disjunction they
+/// replace.
+///
+/// Distribution repeats operands: `(a AND b) OR (c AND d)` has four literals
+/// and gives four clauses of two literals. The planner can scan one index per
+/// OR branch, so such a predicate keeps its shape and keeps that plan. A
+/// predicate that shrinks, such as `(a AND b) OR (a AND c)`, becomes the
+/// conditions `a` and `b OR c`.
+fn conjuncts_of_disjunction(predicate: &Expr) -> Option<Vec<Expr>> {
+    let clauses = remove_subsumed_clauses(cnf_clauses(predicate)?);
+    let literals_in_clauses: usize = clauses.iter().map(Clause::len).sum();
+    if literals_in_clauses > literal_count(predicate) {
+        return None;
+    }
+    Some(clauses.into_iter().map(disjunction_of_literals).collect())
+}
+
+/// Converts a predicate to the list of CNF clauses, or returns `None` when the
+/// conversion is not permitted.
+fn cnf_clauses(predicate: &Expr) -> Option<Vec<Clause>> {
+    let predicate = unwrap_parens(predicate).unwrap_or(predicate);
+    match predicate {
+        Expr::Binary(left, ast::Operator::And, right) => {
+            let mut clauses = cnf_clauses(left)?;
+            clauses.extend(cnf_clauses(right)?);
+            (clauses.len() <= MAX_CNF_CLAUSES).then_some(clauses)
+        }
+        Expr::Binary(left, ast::Operator::Or, right) => {
+            let left_clauses = cnf_clauses(left)?;
+            let right_clauses = cnf_clauses(right)?;
+            if left_clauses.len() * right_clauses.len() > MAX_CNF_CLAUSES {
+                return None;
+            }
+            let widest = |clauses: &[Clause]| clauses.iter().map(Clause::len).max().unwrap_or(0);
+            if widest(&left_clauses) + widest(&right_clauses) > MAX_CNF_CLAUSE_LITERALS {
+                return None;
+            }
+            if left_clauses.len() > 1 || right_clauses.len() > 1 {
+                let can_repeat = |clauses: &[Clause]| {
+                    clauses
+                        .iter()
+                        .all(|clause| clause.iter().all(expr_can_run_more_than_once))
+                };
+                if !can_repeat(&left_clauses) || !can_repeat(&right_clauses) {
+                    return None;
+                }
+            }
+            let mut clauses = Vec::with_capacity(left_clauses.len() * right_clauses.len());
+            for left_clause in left_clauses.iter() {
+                for right_clause in right_clauses.iter() {
+                    let mut merged = left_clause.clone();
+                    for literal in right_clause.iter() {
+                        if !merged
+                            .iter()
+                            .any(|present| exprs_are_equivalent(present, literal))
+                        {
+                            merged.push(literal.clone());
+                        }
+                    }
+                    clauses.push(merged);
+                }
+            }
+            Some(clauses)
+        }
+        Expr::Unary(ast::UnaryOperator::Not, operand) => match negate_predicate(operand) {
+            Some(negated) => cnf_clauses(&negated),
+            None => Some(vec![vec![predicate.clone()]]),
+        },
+        _ => Some(vec![vec![predicate.clone()]]),
+    }
+}
+
+/// Distribution makes copies of an operand, so the operand must give the same
+/// answer each time it runs. A function call can be user defined or can give a
+/// different value on each call, and each copy of a subquery can cost a scan.
+fn expr_can_run_more_than_once(expr: &Expr) -> bool {
+    let mut can_repeat = true;
+    walk_expr(expr, &mut |expr: &Expr| -> Result<WalkControl> {
+        if matches!(
+            expr,
+            Expr::FunctionCall { .. }
+                | Expr::FunctionCallStar { .. }
+                | Expr::Subquery(..)
+                | Expr::Exists(..)
+                | Expr::InSelect { .. }
+                | Expr::InTable { .. }
+                | Expr::SubqueryResult { .. }
+                | Expr::Raise(..)
+        ) {
+            can_repeat = false;
+            return Ok(WalkControl::SkipChildren);
+        }
+        Ok(WalkControl::Continue)
+    })
+    .expect("walking an expression cannot fail");
+    can_repeat
+}
+
+/// Drops every clause that another clause already covers, because
+/// `A AND (A OR B)` is true exactly when `A` is true.
+fn remove_subsumed_clauses(clauses: Vec<Clause>) -> Vec<Clause> {
+    let covers = |covering: &Clause, covered: &Clause| {
+        covering.iter().all(|literal| {
+            covered
+                .iter()
+                .any(|other| exprs_are_equivalent(literal, other))
+        })
+    };
+    let mut kept: Vec<Clause> = Vec::with_capacity(clauses.len());
+    for clause in clauses {
+        if kept.iter().any(|other| covers(other, &clause)) {
+            continue;
+        }
+        kept.retain(|other| !covers(&clause, other));
+        kept.push(clause);
+    }
+    kept
+}
+
+fn literal_count(predicate: &Expr) -> usize {
+    let predicate = unwrap_parens(predicate).unwrap_or(predicate);
+    match predicate {
+        Expr::Binary(left, ast::Operator::And | ast::Operator::Or, right) => {
+            literal_count(left) + literal_count(right)
+        }
+        Expr::Unary(ast::UnaryOperator::Not, operand) => literal_count(operand),
+        _ => 1,
+    }
+}
+
+fn disjunction_of_literals(literals: Clause) -> Expr {
+    let mut literals = literals.into_iter();
+    let first = literals
+        .next()
+        .expect("a CNF clause always has at least one literal");
+    literals.fold(first, |disjunction, literal| {
+        Expr::Binary(Box::new(disjunction), ast::Operator::Or, Box::new(literal))
+    })
 }
 
 pub fn parse_row_id<F>(
@@ -2841,4 +3127,139 @@ pub fn parse_limit(
         )?;
     }
     Ok((Some(limit.expr), limit.offset))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use turso_parser::parser::Parser;
+
+    fn conditions_of(predicate: &str) -> Vec<String> {
+        let sql = format!("SELECT * FROM t WHERE {predicate}");
+        let cmd = Parser::new(sql.as_bytes())
+            .next_cmd()
+            .expect("test predicate should parse")
+            .expect("test SQL should contain a statement");
+        let ast::Cmd::Stmt(ast::Stmt::Select(select)) = cmd else {
+            panic!("expected a SELECT statement");
+        };
+        let ast::OneSelect::Select { where_clause, .. } = select.body.select else {
+            panic!("expected a simple SELECT");
+        };
+        let where_clause = where_clause.expect("expected a WHERE clause");
+        let mut conditions: Vec<Expr> = Vec::new();
+        break_predicate_at_and_boundaries(&where_clause, &mut conditions);
+        conditions
+            .iter()
+            .map(|condition| condition.to_string())
+            .collect()
+    }
+
+    #[test]
+    fn and_gives_one_condition_per_operand() {
+        assert_eq!(conditions_of("a = 1 AND b = 2"), ["a = 1", "b = 2"]);
+    }
+
+    #[test]
+    fn not_over_or_gives_two_conditions() {
+        assert_eq!(conditions_of("NOT (a > 5 OR b > 5)"), ["a <= 5", "b <= 5"]);
+    }
+
+    #[test]
+    fn not_over_and_stays_one_condition() {
+        assert_eq!(conditions_of("NOT (a = 1 AND b = 2)"), ["a != 1 OR b != 2"]);
+    }
+
+    #[test]
+    fn two_nots_cancel() {
+        assert_eq!(conditions_of("NOT (NOT (a = 1))"), ["a = 1"]);
+    }
+
+    #[test]
+    fn not_over_null_test_and_in_list() {
+        assert_eq!(
+            conditions_of("NOT (a IS NULL OR b IN (1, 2))"),
+            ["a IS NOT NULL", "b NOT IN (1, 2)"]
+        );
+    }
+
+    #[test]
+    fn condition_shared_by_all_or_branches_becomes_its_own_condition() {
+        assert_eq!(
+            conditions_of("(a = 1 AND x = 10) OR (a = 1 AND y = 20)"),
+            ["a = 1", "x = 10 OR y = 20"]
+        );
+    }
+
+    #[test]
+    fn shared_condition_is_found_below_a_not() {
+        assert_eq!(
+            conditions_of("NOT ((a <> 1 OR x <> 10) AND (a <> 1 OR y <> 20))"),
+            ["a = 1", "x = 10 OR y = 20"]
+        );
+    }
+
+    #[test]
+    fn or_branches_without_a_shared_condition_stay_one_condition() {
+        assert_eq!(
+            conditions_of("(a = 1 AND b = 2) OR (c = 3 AND d = 4)"),
+            ["(a = 1 AND b = 2) OR (c = 3 AND d = 4)"]
+        );
+    }
+
+    #[test]
+    fn a_shared_condition_stays_in_place_when_the_clauses_would_grow() {
+        let predicate = "(f = 1 AND t = 2 AND label = 3) OR (t = 4 AND f = 5 AND label = 3)";
+        assert_eq!(conditions_of(predicate).len(), 1);
+    }
+
+    #[test]
+    fn nested_or_parentheses_are_flattened() {
+        assert_eq!(
+            conditions_of("a = 1 OR (b = 2 OR c = 3)"),
+            ["a = 1 OR b = 2 OR c = 3"]
+        );
+    }
+
+    #[test]
+    fn a_function_call_is_never_repeated() {
+        assert_eq!(
+            conditions_of("(length(a) = 1 AND x = 10) OR (length(a) = 1 AND y = 20)"),
+            ["(length (a) = 1 AND x = 10) OR (length (a) = 1 AND y = 20)"]
+        );
+    }
+
+    #[test]
+    fn a_subquery_is_never_repeated() {
+        assert_eq!(
+            conditions_of(
+                "(a IN (SELECT id FROM s) AND x = 10) OR (a IN (SELECT id FROM s) AND y = 20)"
+            ),
+            ["(a IN (SELECT id FROM s) AND x = 10) OR (a IN (SELECT id FROM s) AND y = 20)"]
+        );
+    }
+
+    #[test]
+    fn a_row_value_comparison_keeps_its_not() {
+        assert_eq!(
+            conditions_of("NOT ((a, b) = (1, 2))"),
+            ["NOT ((a, b) = (1, 2))"]
+        );
+    }
+
+    #[test]
+    fn a_long_chain_of_ors_stays_one_condition() {
+        let predicate = (0..70)
+            .map(|value| format!("a = {value}"))
+            .collect::<Vec<_>>()
+            .join(" OR ");
+        assert_eq!(conditions_of(&predicate).len(), 1);
+    }
+
+    #[test]
+    fn expansion_past_the_clause_limit_stays_one_condition() {
+        let predicate = "(a1 = 1 AND b1 = 1) OR (a2 = 2 AND b2 = 2) OR (a3 = 3 AND b3 = 3) \
+                         OR (a4 = 4 AND b4 = 4) OR (a5 = 5 AND b5 = 5)";
+        assert_eq!(conditions_of(predicate).len(), 1);
+    }
 }
