@@ -1277,6 +1277,7 @@ pub fn try_hash_join_access_method(
     probe_table_idx: usize,
     build_constraints: &TableConstraints,
     probe_constraints: &TableConstraints,
+    joined_before_probe_mask: &TableMask,
     where_clause: &mut [WhereTerm],
     equal_terms: impl Iterator<Item = (usize, TableInternalId, TableInternalId)>,
     max_distinct_build_keys: f64,
@@ -1421,42 +1422,23 @@ pub fn try_hash_join_access_method(
         return Ok(None);
     }
 
-    // Prefer a nested loop when the probe table has an index on the join columns.
-    // A full outer join needs a hash join to emit unmatched build rows.
     if hash_join_type != HashJoinType::FullOuter {
         for join_key in &join_keys {
             let probe_expr = join_key.get_probe_expr(where_clause);
-            let probe_is_simple_column =
-                expr_is_simple_column_from_table(probe_expr, probe_table.internal_id);
+            if expr_is_simple_column_from_table(probe_expr, probe_table.internal_id)
+                && probe_index_can_seek_join_key(
+                    probe_constraints,
+                    join_key,
+                    joined_before_probe_mask,
+                    probe_table_idx,
+                )
+            {
+                return Ok(None);
+            }
+
             let build_expr = join_key.get_build_expr(where_clause);
             let build_is_simple_column =
                 expr_is_simple_column_from_table(build_expr, build_table.internal_id);
-            // Check probe table constraints for index on join column, only when the probe side
-            // references the probe table alone and is a simple column/rowid reference.
-            if probe_is_simple_column {
-                if let Some(constraint) = probe_constraints
-                    .constraints
-                    .iter()
-                    .find(|c| c.where_clause_pos.0 == join_key.where_clause_idx)
-                {
-                    if let Some(col_pos) = constraint.table_col_pos {
-                        // Check if the join column is a rowid alias directly from the table schema
-                        if let Some(column) = probe_table.columns().get(col_pos) {
-                            if column.is_rowid_alias() {
-                                return Ok(None);
-                            }
-                        }
-                        // Also check regular indexes
-                        for candidate in &probe_constraints.candidates {
-                            if let Some(index) = &candidate.index {
-                                if index.column_table_pos_to_index_pos(col_pos).is_some() {
-                                    return Ok(None);
-                                }
-                            }
-                        }
-                    }
-                }
-            }
 
             if build_is_simple_column && !hash_can_replace_build_index {
                 if let Some(constraint) = build_constraints
@@ -1545,6 +1527,37 @@ pub fn try_hash_join_access_method(
             join_type: hash_join_type,
         },
     }))
+}
+
+fn probe_index_can_seek_join_key(
+    probe_constraints: &TableConstraints,
+    join_key: &HashJoinKey,
+    joined_before_probe_mask: &TableMask,
+    probe_table_idx: usize,
+) -> bool {
+    let Some(join_constraint_idx) = probe_constraints
+        .constraints
+        .iter()
+        .position(|constraint| constraint.where_clause_pos.0 == join_key.where_clause_idx)
+    else {
+        return false;
+    };
+
+    probe_constraints.candidates.iter().any(|candidate| {
+        usable_constraints_for_lhs_mask(
+            &probe_constraints.constraints,
+            &candidate.refs,
+            joined_before_probe_mask,
+            probe_table_idx,
+        )
+        .iter()
+        .any(|constraint_ref| {
+            constraint_ref
+                .eq
+                .as_ref()
+                .is_some_and(|equality| equality.constraint_pos == join_constraint_idx)
+        })
+    })
 }
 
 /// Return true when the hash keys contain one complete unique key from the build table.
