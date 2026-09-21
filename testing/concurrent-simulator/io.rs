@@ -63,15 +63,14 @@ impl SimulatorIO {
     /// that suffix and sorted by it.
     pub fn db_file_bytes(&self) -> Vec<(String, Vec<u8>)> {
         let files = self.files.lock().unwrap();
-        let sizes = self.file_sizes.lock().unwrap();
         let mut out: Vec<(String, Vec<u8>)> = files
             .iter()
             .filter_map(|(path, file)| {
                 let suffix = [".db", "-wal", "-log"]
                     .into_iter()
                     .find(|suffix| path.ends_with(suffix))?;
-                let actual_size = sizes.get(path).copied().unwrap_or(0) as usize;
                 let mmap = file.mmap.lock().unwrap();
+                let actual_size = *file.size.lock().unwrap();
                 Some((suffix.to_string(), mmap[..actual_size].to_vec()))
             })
             .collect();
@@ -83,13 +82,10 @@ impl SimulatorIO {
     /// Only copies the actual file content, not the full mmap size.
     pub fn dump_files(&self, out_dir: &std::path::Path) -> anyhow::Result<()> {
         let files = self.files.lock().unwrap();
-        let sizes = self.file_sizes.lock().unwrap();
 
         for (path, file) in files.iter() {
             // Only dump database-related files
             if path.ends_with(".db") || path.ends_with("-wal") || path.ends_with("-log") {
-                let actual_size = sizes.get(path).copied().unwrap_or(0) as usize;
-
                 // Extract just the filename from the path
                 let filename = std::path::Path::new(path)
                     .file_name()
@@ -98,6 +94,7 @@ impl SimulatorIO {
 
                 let dest_path = out_dir.join(&filename);
                 let mmap = file.mmap.lock().unwrap();
+                let actual_size = *file.size.lock().unwrap();
                 std::fs::write(&dest_path, &mmap[..actual_size])?;
                 println!(
                     "Dumped {} ({} bytes) to {}",
@@ -477,5 +474,57 @@ impl File for SimulatorFile {
 
     fn size(&self) -> Result<u64> {
         Ok(*self.size.lock().unwrap() as u64)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use rand::SeedableRng;
+
+    use super::*;
+
+    #[test]
+    fn snapshots_and_dumps_preserve_files_opened_with_noncanonical_paths() {
+        let directory = tempfile::tempdir().unwrap();
+        let output = tempfile::tempdir().unwrap();
+        let io = SimulatorIO::new(
+            false,
+            ChaCha8Rng::seed_from_u64(1),
+            IOFaultConfig::default(),
+        );
+        let expected = vec![
+            ("-log".to_string(), vec![7, 8, 9]),
+            ("-wal".to_string(), vec![4, 5]),
+            (".db".to_string(), vec![1, 2, 3, 4]),
+        ];
+        for (suffix, bytes) in &expected {
+            let name = if suffix == ".db" {
+                "snapshot.db".to_string()
+            } else {
+                format!("snapshot.db{suffix}")
+            };
+            let path = directory.path().join(".").join(name);
+            let path = path.to_str().unwrap();
+            let file = io.open_file(path, OpenFlags::default(), false).unwrap();
+            assert_ne!(canonical_key(path), path);
+            let buffer = Arc::new(turso_core::Buffer::new_temporary(bytes.len()));
+            buffer.as_mut_slice().copy_from_slice(bytes);
+            let completion = file
+                .pwrite(0, buffer, Completion::new_write(|_| {}))
+                .unwrap();
+            io.step().unwrap();
+            assert!(completion.succeeded());
+        }
+
+        assert_eq!(io.db_file_bytes(), expected);
+        io.dump_files(output.path()).unwrap();
+        for (suffix, bytes) in expected {
+            let name = if suffix == ".db" {
+                "snapshot.db".to_string()
+            } else {
+                format!("snapshot.db{suffix}")
+            };
+            assert_eq!(std::fs::read(output.path().join(name)).unwrap(), bytes);
+        }
     }
 }
