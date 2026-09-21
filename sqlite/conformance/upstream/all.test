@@ -249,7 +249,7 @@ set test_files {
   filter2              pass
   fkey1                fail
   fkey2                fail
-  fkey3                fail
+  fkey3                pass
   fkey4                fail
   fkey5                fail
   fkey6                fail
