@@ -66,6 +66,12 @@ pub struct Opts {
     )]
     pub busy_timeout: u64,
 
+    #[clap(
+        long,
+        help = "Skip the integrity checks that run during and after the workload"
+    )]
+    pub skip_integrity_check: bool,
+
     /// Random seed for reproducibility
     #[clap(long, help = "Random seed for reproducibility")]
     pub seed: Option<u64>,
