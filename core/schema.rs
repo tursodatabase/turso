@@ -2517,8 +2517,8 @@ impl Schema {
         // columns and positions are rotated into the index's order. That keeps the
         // parent key a key for the index it is looked up in, which is what sqlite's
         // `aiCol` mapping does.
-        let mut parent_cols: Vec<String> = parent_cols.into_vec();
-        let mut child_columns: Vec<String> = fk.child_columns.to_vec();
+        let mut parent_cols: Vec<String> = parent_cols.try_to_vec()?;
+        let mut child_columns: Vec<String> = fk.child_columns.try_to_vec()?;
         let check_index_collation = !fk.parent_columns.is_empty();
         let parent_unique_index = if parent_uses_rowid {
             None
@@ -2540,7 +2540,7 @@ impl Schema {
                         .zip(parent_cols.iter())
                         .all(|(ic, pc)| ic.name.eq_ignore_ascii_case(pc))
                     {
-                        found = Some((Arc::clone(idx), (0..parent_cols.len()).collect()));
+                        found = Some((Arc::clone(idx), (0..parent_cols.len()).try_collect()?));
                         break;
                     }
                     continue;
@@ -2583,16 +2583,22 @@ impl Schema {
                 }
                 Some((idx, order)) => {
                     if order.iter().enumerate().any(|(i, &j)| i != j) {
-                        parent_cols = order.iter().map(|&j| parent_cols[j].clone()).collect();
-                        child_columns = order.iter().map(|&j| child_columns[j].clone()).collect();
-                        child_pos = order.iter().map(|&j| child_pos[j]).collect();
-                        parent_pos = order.iter().map(|&j| parent_pos[j]).collect();
+                        parent_cols = order
+                            .iter()
+                            .map(|&j| parent_cols[j].clone())
+                            .try_collect()?;
+                        child_columns = order
+                            .iter()
+                            .map(|&j| child_columns[j].clone())
+                            .try_collect()?;
+                        child_pos = order.iter().map(|&j| child_pos[j]).try_collect()?;
+                        parent_pos = order.iter().map(|&j| parent_pos[j]).try_collect()?;
                     }
                     Some(idx)
                 }
             }
         };
-        let parent_cols: Box<[String]> = parent_cols.into_boxed_slice();
+        let parent_cols: BoxedSlice<String> = parent_cols.into_boxed_slice();
 
         fk.validate()?;
         Ok(ResolvedFkRef {
@@ -5189,10 +5195,10 @@ pub struct ResolvedFkRef {
     /// different order, in which case all four are rotated into the index's
     /// order so that every probe built from them is a key for that index.
     /// `fk.child_columns` keeps declaration order for PRAGMA reporting.
-    pub child_columns: Box<[String]>,
+    pub child_columns: BoxedSlice<String>,
     /// Resolved parent columns: either `fk.parent_columns` or, when that is
     /// empty, the parent table's PRIMARY KEY columns. Always non-empty.
-    pub parent_cols: Box<[String]>,
+    pub parent_cols: BoxedSlice<String>,
     /// Column positions in the child/parent tables (pos_in_table)
     pub child_pos: BoxedSlice<usize>,
     pub parent_pos: BoxedSlice<usize>,
