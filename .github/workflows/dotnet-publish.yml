@@ -112,7 +112,7 @@ jobs:
           artifact-name: native-win-arm64
 
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 30
+    timeout-minutes: 60
     permissions:
       contents: read
       id-token: write  # required for Azure OIDC login (code signing on Windows)
