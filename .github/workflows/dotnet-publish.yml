@@ -132,6 +132,10 @@ jobs:
       - name: Add target
         run: rustup target add ${{ matrix.target }}
 
+      - name: Setup MSVC
+        if: matrix.target == 'x86_64-pc-windows-msvc'
+        uses: "./.github/shared/setup-msvc"
+
       - name: Rust cache
         uses: Swatinem/rust-cache@v2
         with:

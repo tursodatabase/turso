@@ -52,6 +52,10 @@ jobs:
       - name: Setup Rust toolchain
         uses: dtolnay/rust-toolchain@stable
 
+      - name: Setup MSVC
+        if: runner.os == 'Windows'
+        uses: "./.github/shared/setup-msvc"
+
       - name: Setup mold linker
         if: runner.os == 'Linux'
         uses: rui314/setup-mold@v1
