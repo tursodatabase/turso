@@ -224,7 +224,6 @@ public partial class SqliteConnection : DbConnection
                     }
                 }
 
-                FreeNativeFunctionContexts();
                 _managedConnection.Close();
             }
             finally
@@ -242,7 +241,6 @@ public partial class SqliteConnection : DbConnection
         var originalState = State;
         _database.Dispose();
         _database = null;
-        FreeNativeFunctionContexts();
         _dataSource = null;
         _readOnly = false;
         _recursiveTriggers = false;
@@ -544,7 +542,6 @@ public partial class SqliteConnection : DbConnection
                 var originalState = State;
                 try
                 {
-                    FreeNativeFunctionContexts();
                     _managedConnection.Dispose();
                 }
                 catch (Exception exception) when (failure is not null)
@@ -603,7 +600,6 @@ public partial class SqliteConnection : DbConnection
             var originalState = State;
             try
             {
-                FreeNativeFunctionContexts();
                 await ManagedConnection.DisposeAsync().ConfigureAwait(false);
             }
             catch (Exception exception) when (failure is not null)
@@ -907,7 +903,6 @@ public partial class SqliteConnection : DbConnection
     {
         _database?.Dispose();
         _database = null;
-        FreeNativeFunctionContexts();
         _dataSource = null;
         _readOnly = false;
         _sharedMemoryPath = null;
