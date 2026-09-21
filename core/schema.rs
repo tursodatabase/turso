@@ -3580,6 +3580,16 @@ impl BTreeTable {
             if !column.ty_str.is_empty() {
                 sql.push(' ');
                 sql.push_str(&column.ty_str);
+                if !column.ty_params.is_empty() {
+                    sql.push('(');
+                    for (i, param) in column.ty_params.iter().enumerate() {
+                        if i > 0 {
+                            sql.push_str(", ");
+                        }
+                        sql.push_str(&param.to_string());
+                    }
+                    sql.push(')');
+                }
                 if column.is_array() {
                     sql.push_str("[]");
                 }
