@@ -2344,3 +2344,78 @@ fn interrupt_during_fail_staging_keeps_fail_outcome() {
         "the kept row's FTS document must survive the interrupt request"
     );
 }
+
+static KEEPALIVE_CONTEXT_DESTROYED: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+unsafe extern "C" fn keepalive_destroy_context(_context: usize) {
+    KEEPALIVE_CONTEXT_DESTROYED.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+}
+
+unsafe extern "C" fn keepalive_init(_context: usize) -> *mut turso_ext::AggCtx {
+    unreachable!("the test never steps the statement")
+}
+
+unsafe extern "C" fn keepalive_step(
+    _context: usize,
+    _ctx: *mut turso_ext::AggCtx,
+    _argc: i32,
+    _argv: *const turso_ext::Value,
+) -> turso_ext::Value {
+    unreachable!("the test never steps the statement")
+}
+
+unsafe extern "C" fn keepalive_finalize(
+    _context: usize,
+    _ctx: *mut turso_ext::AggCtx,
+) -> turso_ext::Value {
+    unreachable!("the test never steps the statement")
+}
+
+fn register_keepalive_aggregate(conn: &Arc<Connection>) {
+    conn.syms.write().functions.insert(
+        "keepalive_agg".to_string(),
+        Arc::new(crate::function::ExternalFunc::new_aggregate(
+            "keepalive_agg".to_string(),
+            1,
+            0,
+            (keepalive_init, keepalive_step, keepalive_finalize),
+            Some(keepalive_destroy_context),
+            None,
+            None,
+        )),
+    );
+    conn.bump_prepare_context_generation();
+}
+
+#[test]
+fn external_aggregate_context_lives_while_a_prepared_statement_uses_it() {
+    let io = Arc::new(MemoryIO::new());
+    let db = Database::open_file_with_flags(
+        io,
+        ":memory:external-aggregate-context-lifetime",
+        OpenFlags::default(),
+        DatabaseOpts::new(),
+        None,
+        Arc::new(SqliteDialect),
+    )
+    .unwrap();
+    let conn = db.connect().unwrap();
+    conn.execute("CREATE TABLE t(x)").unwrap();
+
+    register_keepalive_aggregate(&conn);
+    let stmt = conn.prepare("SELECT keepalive_agg(x) FROM t").unwrap();
+    register_keepalive_aggregate(&conn);
+    assert_eq!(
+        KEEPALIVE_CONTEXT_DESTROYED.load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "the replaced registration is still used by the prepared statement"
+    );
+
+    drop(stmt);
+    assert_eq!(
+        KEEPALIVE_CONTEXT_DESTROYED.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "dropping the last statement releases the replaced registration"
+    );
+}
