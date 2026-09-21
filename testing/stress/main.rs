@@ -2,6 +2,7 @@ use rand::Rng;
 mod checkpoint;
 mod conn;
 mod counter;
+mod fts;
 mod logging;
 mod opts;
 mod progress;
@@ -581,13 +582,19 @@ async fn async_main(opts: Opts) -> Result<(), Box<dyn std::error::Error + Send +
 
     // Generate schema upfront on main thread with seed
     let mut main_rng = ThreadRng::new(global_seed);
-    let schema = if let Some(ref db_ref) = opts.db_ref {
+    let schema = if opts.fts {
+        ArbitrarySchema { tables: vec![] }
+    } else if let Some(ref db_ref) = opts.db_ref {
         load_schema(db_ref)?
     } else {
         gen_schema(&mut main_rng, opts.tables)
     };
 
-    let ddl_statements = schema.to_sql();
+    let ddl_statements = if opts.fts {
+        fts::schema(opts.tables.unwrap_or(1))
+    } else {
+        schema.to_sql()
+    };
     let schema = Arc::new(schema);
 
     let mut stop = false;
@@ -621,6 +628,7 @@ async fn async_main(opts: Opts) -> Result<(), Box<dyn std::error::Error + Send +
         db_file.clone(),
         sql_logger.clone(),
         vfs_option.clone(),
+        opts.fts,
     )));
 
     let mut stress_counter = StressCounter::new(opts.nr_threads, opts.nr_iterations);
@@ -726,10 +734,20 @@ async fn async_main(opts: Opts) -> Result<(), Box<dyn std::error::Error + Send +
                         let _ = conn.execute(tx_stmt, ()).await;
                     }
 
-                    let sql = generate_random_statement(&mut rng, &schema_for_task);
-
-                    if let Err(turso::Error::Corrupt(e)) = conn.execute(&sql, ()).await {
-                        turso_macros::turso_assert_unreachable!("corrupt error executing query", { "thread": thread, "error": e, "sql": sql });
+                    if opts.fts {
+                        fts::run(
+                            &conn,
+                            &mut rng,
+                            opts.tables.unwrap_or(1),
+                            &sql_logger,
+                            &thread,
+                        )
+                        .await?;
+                    } else {
+                        let sql = generate_random_statement(&mut rng, &schema_for_task);
+                        if let Err(turso::Error::Corrupt(e)) = conn.execute(&sql, ()).await {
+                            turso_macros::turso_assert_unreachable!("corrupt error executing query", { "thread": thread, "error": e, "sql": sql });
+                        }
                     }
 
                     // When inside a transaction, 30% chance to exercise savepoints.
@@ -744,9 +762,22 @@ async fn async_main(opts: Opts) -> Result<(), Box<dyn std::error::Error + Send +
                         // Execute 1-3 DML statements inside the savepoint.
                         let sp_stmts = rng.random_range(1..4) as usize;
                         for _ in 0..sp_stmts {
-                            let sp_sql = generate_random_statement(&mut rng, &schema_for_task);
-                            if let Err(turso::Error::Corrupt(e)) = conn.execute(&sp_sql, ()).await {
-                                turso_macros::turso_assert_unreachable!("corrupt error in savepoint", { "thread": thread, "error": e, "sql": sp_sql });
+                            if opts.fts {
+                                fts::run(
+                                    &conn,
+                                    &mut rng,
+                                    opts.tables.unwrap_or(1),
+                                    &sql_logger,
+                                    &thread,
+                                )
+                                .await?;
+                            } else {
+                                let sp_sql = generate_random_statement(&mut rng, &schema_for_task);
+                                if let Err(turso::Error::Corrupt(e)) =
+                                    conn.execute(&sp_sql, ()).await
+                                {
+                                    turso_macros::turso_assert_unreachable!("corrupt error in savepoint", { "thread": thread, "error": e, "sql": sp_sql });
+                                }
                             }
                         }
 
@@ -862,9 +893,36 @@ async fn async_main(opts: Opts) -> Result<(), Box<dyn std::error::Error + Send +
 
     println!("Database file: {db_file}");
 
+    if opts.fts && !stop {
+        let thread = ThreadId::new(usize::MAX);
+        let conn = StressDb::connect(&db, thread.clone(), opts.busy_timeout).await?;
+        for table in 0..opts.tables.unwrap_or(1) {
+            for token in fts::TOKENS {
+                fts::check(&conn, table, token, &sql_logger, &thread).await?;
+            }
+        }
+        if !opts.skip_integrity_check {
+            println!("Running Turso integrity check (FTS schema is not SQLite-compatible)");
+            let mut rows = conn.query("PRAGMA integrity_check", ()).await?;
+            let row = rows
+                .next()
+                .await?
+                .expect("integrity check must return a row");
+            assert_eq!(
+                row.get::<String>(0)?,
+                "ok",
+                "FTS database integrity check failed"
+            );
+            assert!(
+                rows.next().await?.is_none(),
+                "integrity check returned extra rows"
+            );
+        }
+    }
+
     // Switch back to WAL mode before SQLite integrity check if we were in MVCC mode.
     // SQLite/rusqlite doesn't understand MVCC journal mode.
-    if opts.tx_mode == TxMode::Concurrent {
+    if opts.tx_mode == TxMode::Concurrent && !opts.fts {
         let mut builder = Builder::new_local(&db_file);
         if let Some(ref vfs) = vfs_option {
             builder = builder.with_io(vfs.clone());
@@ -876,7 +934,7 @@ async fn async_main(opts: Opts) -> Result<(), Box<dyn std::error::Error + Send +
     }
 
     #[cfg(not(miri))]
-    if !opts.skip_integrity_check {
+    if !opts.skip_integrity_check && !opts.fts {
         println!("Running SQLite Integrity check");
         sqlite_integrity_check(std::path::Path::new(&db_file))?;
     }
