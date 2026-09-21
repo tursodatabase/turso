@@ -146,6 +146,8 @@ typedef struct
 } turso_sync_database_config_t;
 
 /// opaque pointer to the TursoDatabaseSync instance
+/// SAFETY: at most one sync operation (connect, stats, checkpoint, push_changes, wait_changes, apply_changes)
+/// may be in progress on a database at a time; one started while another is running fails at its first resume
 typedef struct turso_sync_database turso_sync_database_t;
 
 /// opaque pointer to the TursoAsyncOperation instance
@@ -238,8 +240,8 @@ turso_status_code_t turso_sync_database_wait_changes(
     const char **error_opt_out);
 
 /** Apply remote changes locally
- * SAFETY: caller must guarantee that no other methods are executing concurrently (push/wait/checkpoint)
- * otherwise, operation will return MISUSE error
+ * SAFETY: no other sync operation (connect/stats/checkpoint/push/wait) may be in progress on this database;
+ * an operation started while another is running fails at its first resume
  *
  * the method CONSUMES turso_sync_changes_t instance and caller no longer owns it after the call
  * So, the changes MUST NOT be explicitly deallocated after the method call (either successful or not)
