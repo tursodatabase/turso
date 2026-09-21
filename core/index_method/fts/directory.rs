@@ -79,7 +79,7 @@ impl Deref for InMemoryFileHandle {
     }
 }
 
-unsafe impl stable_deref_trait::StableDeref for InMemoryFileHandle {}
+unsafe impl tantivy_common::StableDeref for InMemoryFileHandle {}
 
 /// A no-op directory lock: immediately satisfied, releases nothing.
 struct NoopLockGuard;

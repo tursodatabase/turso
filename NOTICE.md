@@ -8,10 +8,10 @@ Please visit our GitHub for more information:
 Dependencies
 ============
 
-This project depends on stable_deref_trait, distributed by Robert Grosse:
+This project depends on tantivy-common, distributed by the Tantivy project authors:
 
-* License: licenses/core/stable-deref-trait-mit-license.md (MIT License)
-* Homepage: https://github.com/storyyeller/stable_deref_trait
+* License: licenses/core/tantivy-common-mit-license.md (MIT License)
+* Homepage: https://github.com/quickwit-oss/tantivy
 
 This product depends on Error Prone, distributed by the Error Prone project:
 
