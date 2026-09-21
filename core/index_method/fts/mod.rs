@@ -496,6 +496,7 @@ struct SearcherCacheEntry {
     reader: IndexReader,
     parser: Arc<tantivy::query::QueryParser>,
     rowid_readers: Arc<[Column<i64>]>,
+    segment_data: HashMap<SegmentId, Arc<SegmentData>>,
 }
 
 #[derive(Default)]
@@ -1337,6 +1338,11 @@ impl FtsCursor {
                 reader: IndexReader::clone(&reader),
                 parser: Arc::clone(&parser),
                 rowid_readers: Arc::clone(&rowid_readers),
+                segment_data: self
+                    .segments
+                    .iter()
+                    .map(|segment| (segment.id(), Arc::clone(&segment.data)))
+                    .collect(),
             });
         }
         self.searcher = Some(searcher);
@@ -1807,7 +1813,16 @@ impl FtsCursor {
         let mut queue = Vec::new();
         let mut cache = self.shared.segment_bytes.lock();
         for (idx, descriptor) in self.scan_descriptors.iter().enumerate() {
-            match cache.get(&descriptor.segment_id) {
+            let data = cache.get(&descriptor.segment_id).or_else(|| {
+                self.shared
+                    .searchers
+                    .lock()
+                    .entries
+                    .iter()
+                    .rev()
+                    .find_map(|entry| entry.segment_data.get(&descriptor.segment_id).cloned())
+            });
+            match data {
                 Some(data) => {
                     self.scan_data.insert(descriptor.segment_id, data);
                 }
