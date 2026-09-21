@@ -780,7 +780,8 @@ async fn async_main(opts: Opts) -> Result<(), Box<dyn std::error::Error + Send +
                     }
 
                     const INTEGRITY_CHECK_INTERVAL: usize = 100;
-                    if interaction_idx % INTEGRITY_CHECK_INTERVAL == 0 {
+                    if !opts.skip_integrity_check && interaction_idx % INTEGRITY_CHECK_INTERVAL == 0
+                    {
                         let mut res = conn.query("PRAGMA integrity_check", ()).await.unwrap();
                         match res.next().await {
                             Ok(Some(row))
@@ -875,7 +876,7 @@ async fn async_main(opts: Opts) -> Result<(), Box<dyn std::error::Error + Send +
     }
 
     #[cfg(not(miri))]
-    {
+    if !opts.skip_integrity_check {
         println!("Running SQLite Integrity check");
         sqlite_integrity_check(std::path::Path::new(&db_file))?;
     }
