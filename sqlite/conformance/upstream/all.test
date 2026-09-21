@@ -411,7 +411,7 @@ set test_files {
   notify3              fail
   notnull              fail
   notnull2             fail
-  null                 fail
+  null                 pass
   nulls1               fail
   numcast              fail
   numindex1            pass
