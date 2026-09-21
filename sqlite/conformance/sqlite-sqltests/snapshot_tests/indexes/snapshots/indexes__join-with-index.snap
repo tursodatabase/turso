@@ -16,5 +16,7 @@ info:
   database: ':memory:'
 ---
 QUERY PLAN
-|--SCAN inventory AS i USING COVERING INDEX idx_inventory_covering
-`--SEARCH o USING INTEGER PRIMARY KEY (rowid=?)
+|--MATERIALIZE hash build input for orders AS o
+|  `--SEARCH o USING COVERING INDEX idx_orders_customer_date (customer_id=?)
+|--HASH JOIN inventory AS i
+`--SEARCH o USING COVERING INDEX idx_orders_customer_date (customer_id=?)

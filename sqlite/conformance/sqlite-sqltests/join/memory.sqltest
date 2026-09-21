@@ -862,6 +862,195 @@ expect pattern {
     (?s)CORRELATED SCALAR SUBQUERY.*SEARCH child USING INDEX sqlite_autoindex_sort_cost_child_1 \(parent_id=\?\)
 }
 
+@skip-if sqlite "Turso can use a hash join when an index cannot seek by the join column"
+@skip-if mvcc "MVCC does not reload sqlite_stat1 after this test changes it"
+test index-suffix-does-not-prevent-hash-join {
+    CREATE TABLE suffix_hash_parent(id INTEGER PRIMARY KEY, selected INTEGER);
+    CREATE TABLE suffix_hash_child(
+        group_id INTEGER,
+        parent_id INTEGER,
+        payload INTEGER,
+        PRIMARY KEY(group_id, parent_id)
+    );
+    ANALYZE;
+    DELETE FROM sqlite_stat1;
+    INSERT INTO sqlite_stat1(tbl, idx, stat) VALUES
+        ('suffix_hash_parent', NULL, '1000'),
+        ('suffix_hash_child', NULL, '5000000'),
+        ('suffix_hash_child', 'sqlite_autoindex_suffix_hash_child_1', '5000000 5000 1');
+    ANALYZE sqlite_schema;
+
+    EXPLAIN QUERY PLAN
+    SELECT count(*)
+    FROM suffix_hash_parent AS parent
+    JOIN suffix_hash_child AS child ON child.parent_id = parent.id
+    WHERE parent.selected = 1;
+}
+expect pattern {
+    (?s)HASH JOIN suffix_hash_child AS child.*SCAN suffix_hash_parent AS parent
+}
+
+@skip-if mvcc "MVCC does not reload sqlite_stat1 after this test changes it"
+test index-suffix-join-keeps-null-and-duplicate-rows {
+    CREATE TABLE suffix_result_parent(id INTEGER PRIMARY KEY, selected INTEGER);
+    CREATE TABLE suffix_result_child(
+        group_id INTEGER,
+        parent_id INTEGER,
+        payload INTEGER,
+        PRIMARY KEY(group_id, parent_id)
+    );
+    INSERT INTO suffix_result_parent VALUES (1, 1), (2, 1), (3, 0), (4, 1);
+    INSERT INTO suffix_result_child VALUES
+        (10, 1, 7), (20, 1, 8), (30, 2, 9), (40, NULL, 10), (NULL, 1, 11);
+    ANALYZE;
+    DELETE FROM sqlite_stat1;
+    INSERT INTO sqlite_stat1(tbl, idx, stat) VALUES
+        ('suffix_result_parent', NULL, '1000'),
+        ('suffix_result_child', NULL, '5000000'),
+        ('suffix_result_child', 'sqlite_autoindex_suffix_result_child_1', '5000000 5000 1');
+    ANALYZE sqlite_schema;
+
+    SELECT parent.id, child.group_id, child.payload
+    FROM suffix_result_parent AS parent
+    LEFT JOIN suffix_result_child AS child ON child.parent_id = parent.id
+    WHERE parent.selected = 1
+    ORDER BY parent.id, child.group_id, child.payload;
+}
+expect {
+    1||11
+    1|10|7
+    1|20|8
+    2|30|9
+    4||
+}
+
+@skip-if sqlite "Turso can use a hash join when the current join prefix cannot seek an index"
+@skip-if mvcc "MVCC does not reload sqlite_stat1 after this test changes it"
+test future-table-cannot-make-index-usable {
+    CREATE TABLE future_index_parent(id INTEGER PRIMARY KEY, selected INTEGER);
+    CREATE TABLE future_index_group(id INTEGER PRIMARY KEY);
+    CREATE TABLE future_index_child(
+        group_id INTEGER,
+        parent_id INTEGER,
+        PRIMARY KEY(group_id, parent_id)
+    );
+    ANALYZE;
+    DELETE FROM sqlite_stat1;
+    INSERT INTO sqlite_stat1(tbl, idx, stat) VALUES
+        ('future_index_parent', NULL, '1000'),
+        ('future_index_group', NULL, '1000000'),
+        ('future_index_child', NULL, '5000000'),
+        ('future_index_child', 'sqlite_autoindex_future_index_child_1', '5000000 5000 1');
+    ANALYZE sqlite_schema;
+
+    EXPLAIN QUERY PLAN
+    SELECT count(*)
+    FROM future_index_parent AS parent
+    CROSS JOIN future_index_child AS child ON child.parent_id = parent.id
+    CROSS JOIN future_index_group AS group_table ON child.group_id = group_table.id
+    WHERE parent.selected = 1;
+}
+expect pattern {
+    (?s)HASH JOIN future_index_child AS child.*SEARCH group_table USING INTEGER PRIMARY KEY.*SCAN future_index_parent AS parent
+}
+
+@skip-if mvcc "MVCC does not reload sqlite_stat1 after this test changes it"
+test future-table-index-does-not-change-join-results {
+    CREATE TABLE future_result_parent(id INTEGER PRIMARY KEY, selected INTEGER);
+    CREATE TABLE future_result_group(id INTEGER PRIMARY KEY);
+    CREATE TABLE future_result_child(
+        group_id INTEGER,
+        parent_id INTEGER,
+        PRIMARY KEY(group_id, parent_id)
+    );
+    INSERT INTO future_result_parent VALUES (1, 1), (2, 1), (3, 0);
+    INSERT INTO future_result_group VALUES (10), (30);
+    INSERT INTO future_result_child VALUES
+        (10, 1), (20, 1), (10, 2), (30, 2), (NULL, 1);
+    ANALYZE;
+    DELETE FROM sqlite_stat1;
+    INSERT INTO sqlite_stat1(tbl, idx, stat) VALUES
+        ('future_result_parent', NULL, '1000'),
+        ('future_result_group', NULL, '1000000'),
+        ('future_result_child', NULL, '5000000'),
+        ('future_result_child', 'sqlite_autoindex_future_result_child_1', '5000000 5000 1');
+    ANALYZE sqlite_schema;
+
+    SELECT parent.id, child.group_id, group_table.id
+    FROM future_result_parent AS parent
+    CROSS JOIN future_result_child AS child ON child.parent_id = parent.id
+    CROSS JOIN future_result_group AS group_table ON child.group_id = group_table.id
+    WHERE parent.selected = 1
+    ORDER BY parent.id, child.group_id, group_table.id;
+}
+expect {
+    1|10|10
+    2|10|10
+    2|30|30
+}
+
+setup hash-index-prefix-rows {
+    CREATE TABLE prefix_parent(id INTEGER PRIMARY KEY, selected INTEGER);
+    CREATE TABLE prefix_child(group_id INTEGER, parent_id INTEGER, payload INTEGER,
+        PRIMARY KEY(group_id, parent_id));
+    CREATE INDEX prefix_child_positive
+        ON prefix_child(group_id, parent_id) WHERE payload > 0;
+    INSERT INTO prefix_parent VALUES (1, 1), (2, 1), (3, 1), (4, 0);
+    INSERT INTO prefix_child VALUES
+        (10, 1, -1), (20, 1, 9), (30, 2, 8), (40, 3, -5), (50, NULL, 6);
+    ANALYZE;
+    DELETE FROM sqlite_stat1;
+    INSERT INTO sqlite_stat1(tbl, idx, stat) VALUES
+        ('prefix_parent', NULL, '1000'),
+        ('prefix_child', NULL, '5000000'),
+        ('prefix_child', 'sqlite_autoindex_prefix_child_1', '5000000 5000 1'),
+        ('prefix_child', 'prefix_child_positive', '5000000 5000 1');
+    ANALYZE sqlite_schema;
+}
+
+@setup hash-index-prefix-rows
+@skip-if sqlite "SQLite does not have a hash join plan"
+@skip-if mvcc "MVCC does not reload sqlite_stat1 after this setup changes it"
+test range-prefix-still-allows-hash-join {
+    EXPLAIN QUERY PLAN
+    SELECT parent.id, child.group_id, child.payload
+    FROM prefix_parent AS parent
+    LEFT JOIN prefix_child AS child
+      ON child.parent_id = parent.id AND child.group_id > 15 AND child.payload >= 8
+    WHERE parent.selected = 1;
+}
+expect pattern {
+    HASH JOIN prefix_child AS child
+}
+
+@setup hash-index-prefix-rows
+@skip-if sqlite "SQLite does not have a hash join plan"
+@skip-if mvcc "MVCC does not reload sqlite_stat1 after this setup changes it"
+test equality-prefix-keeps-index-search {
+    EXPLAIN QUERY PLAN
+    SELECT count(*)
+    FROM prefix_parent AS parent
+    LEFT JOIN prefix_child AS child
+      ON child.parent_id = parent.id AND child.group_id = 10
+    WHERE parent.selected = 1;
+}
+expect pattern {
+    SEARCH child USING COVERING INDEX sqlite_autoindex_prefix_child_1 \(group_id=\? AND parent_id=\?\)
+}
+
+@setup hash-index-prefix-rows
+@skip-if mvcc "MVCC does not reload sqlite_stat1 after this setup changes it"
+@var join_type { JOIN | LEFT JOIN }
+@var first_column { child.group_id > 15 | child.group_id IN (10, 20) | child.group_id = 10 | child.payload > 0 }
+matrix index-prefix-join-results {
+    SELECT parent.id, child.group_id, child.payload
+    FROM prefix_parent AS parent
+    $join_type prefix_child AS child
+      ON child.parent_id = parent.id AND $first_column
+    WHERE parent.selected = 1
+    ORDER BY parent.id, child.group_id, child.payload;
+}
+
 @skip-if sqlite "Turso reports hash join estimates in its JSON plan"
 @skip-if mvcc "MVCC does not reload sqlite_stat1 after this test changes it"
 test unique-composite-hash-key-uses-one-key-estimate {
