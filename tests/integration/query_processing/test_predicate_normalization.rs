@@ -1,6 +1,7 @@
 use crate::assertions::AssertQueryPlan;
 use crate::common::{limbo_exec_rows, TempDatabase};
 use asserting::prelude::*;
+use turso_core::Value;
 
 /// The planner converts a predicate to conjunctive normal form before it
 /// splits the predicate into conditions. A condition below a NOT or below an
@@ -200,4 +201,24 @@ fn a_condition_below_a_not_seeks_the_table_of_a_left_join() {
         &format!("{query} ORDER BY u.id, t.id")
     ))
     .is_equal_to(vec![row![1, 1], row![2, 4]]);
+}
+
+/// Distribution makes copies of a literal, and a copy can hold a bound
+/// parameter. Each copy keeps the index that the parser gave it, so the
+/// statement still has one parameter slot.
+#[test]
+fn a_bound_parameter_in_two_or_branches_keeps_one_slot() -> anyhow::Result<()> {
+    let conn = database();
+    let mut statement = conn
+        .prepare("SELECT id FROM t WHERE (a = ?1 AND x = 10) OR (a = ?1 AND y = 20) ORDER BY id")?;
+    assert_that!(statement.parameters_count()).is_equal_to(1);
+
+    statement.bind_at(1.try_into()?, Value::from_i64(1))?;
+    let mut ids = Vec::new();
+    statement.run_with_row_callback(|row| {
+        ids.push(row.get::<&Value>(0).unwrap().clone());
+        Ok(())
+    })?;
+    assert_that!(ids).is_equal_to(vec![Value::from_i64(1), Value::from_i64(2)]);
+    Ok(())
 }
