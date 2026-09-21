@@ -83,6 +83,7 @@ pub enum ExtFunc {
         callback: ScalarFunction,
         context_destructor: Option<ContextDestructor>,
         value_destructor: Option<ValueDestructor>,
+        context_owner: Arc<ExternalContext>,
     },
     Aggregate {
         context: usize,
@@ -93,7 +94,31 @@ pub enum ExtFunc {
         context_destructor: Option<ContextDestructor>,
         aggregate_destructor: Option<ContextDestructor>,
         value_destructor: Option<ValueDestructor>,
+        context_owner: Arc<ExternalContext>,
     },
+}
+
+#[derive(Debug)]
+pub struct ExternalContext {
+    context: usize,
+    destructor: Option<ContextDestructor>,
+}
+
+impl ExternalContext {
+    fn new(context: usize, destructor: Option<ContextDestructor>) -> Arc<Self> {
+        Arc::new(Self {
+            context,
+            destructor,
+        })
+    }
+}
+
+impl Drop for ExternalContext {
+    fn drop(&mut self) {
+        if let Some(destructor) = self.destructor {
+            unsafe { destructor(self.context) };
+        }
+    }
 }
 
 impl ExtFunc {
@@ -122,8 +147,10 @@ impl ExtFunc {
                 init,
                 step,
                 finalize,
+                context_destructor,
                 aggregate_destructor,
                 value_destructor,
+                context_owner,
                 ..
             } => Self::Aggregate {
                 context: *context,
@@ -131,9 +158,10 @@ impl ExtFunc {
                 init: *init,
                 step: *step,
                 finalize: *finalize,
-                context_destructor: None,
+                context_destructor: *context_destructor,
                 aggregate_destructor: *aggregate_destructor,
                 value_destructor: *value_destructor,
+                context_owner: context_owner.clone(),
             },
             _ => self.clone(),
         }
@@ -159,6 +187,7 @@ impl ExternalFunc {
                 callback,
                 context_destructor,
                 value_destructor,
+                context_owner: ExternalContext::new(context, context_destructor),
             },
         }
     }
@@ -183,25 +212,8 @@ impl ExternalFunc {
                 context_destructor,
                 aggregate_destructor,
                 value_destructor,
+                context_owner: ExternalContext::new(context, context_destructor),
             },
-        }
-    }
-}
-
-impl Drop for ExternalFunc {
-    fn drop(&mut self) {
-        match self.func {
-            ExtFunc::Scalar {
-                context,
-                context_destructor: Some(context_destructor),
-                ..
-            }
-            | ExtFunc::Aggregate {
-                context,
-                context_destructor: Some(context_destructor),
-                ..
-            } => unsafe { context_destructor(context) },
-            _ => {}
         }
     }
 }
