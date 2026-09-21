@@ -227,6 +227,10 @@ name = "mvcc_recovery_benchmark"
 harness = false
 
 [[bench]]
+name = "checkpoint_n_rows"
+harness = false
+
+[[bench]]
 name = "logical_log_serialization"
 harness = false
 required-features = ["bench"]
