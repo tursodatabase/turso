@@ -410,20 +410,28 @@ impl Builder {
         Ok(Database {
             sync,
             io: io_worker,
+            operation_lock: Arc::new(tokio::sync::Mutex::new(())),
         })
     }
 }
 
-// Synced Database handle.
+/// Synced database handle.
+///
+/// Sync operations on one database run one at a time: a call made while
+/// another is in progress waits its turn. `pull` holds that turn for the
+/// whole wait, so with a long-poll timeout a queued operation can wait up
+/// to that timeout.
 #[derive(Clone)]
 pub struct Database {
     sync: Arc<turso_sync_sdk_kit::rsapi::TursoDatabaseSync<Bytes>>,
     io: Arc<IoWorker>,
+    operation_lock: Arc<tokio::sync::Mutex<()>>,
 }
 
 impl Database {
     // Push local changes to the remote.
     pub async fn push(&self) -> Result<()> {
+        let _operation = self.operation_lock.lock().await;
         let op = self.sync.push_changes();
         drive_operation(op, self.io.clone()).await?;
         Ok(())
@@ -431,6 +439,7 @@ impl Database {
 
     // Pull remote changes; returns true if any changes were applied.
     pub async fn pull(&self) -> Result<bool> {
+        let _operation = self.operation_lock.lock().await;
         // First, wait for changes...
         let op = self.sync.wait_changes();
         let result = drive_operation_result(op, self.io.clone()).await?;
@@ -456,8 +465,10 @@ impl Database {
     // Force WAL checkpoint for the main database.
     pub async fn checkpoint(&self) -> Result<()> {
         for attempt in 0..CHECKPOINT_BUSY_MAX_ATTEMPTS {
-            let op = self.sync.checkpoint();
-            let result = drive_operation(op, self.io.clone()).await;
+            let result = {
+                let _operation = self.operation_lock.lock().await;
+                drive_operation(self.sync.checkpoint(), self.io.clone()).await
+            };
             match result {
                 Ok(()) => return Ok(()),
                 Err(error)
@@ -473,6 +484,7 @@ impl Database {
 
     // Retrieve sync statistics for the database.
     pub async fn stats(&self) -> Result<DatabaseSyncStats> {
+        let _operation = self.operation_lock.lock().await;
         let op = self.sync.stats();
         let result = drive_operation_result(op, self.io.clone()).await?;
         match result {
@@ -487,6 +499,7 @@ impl Database {
 
     // Create a SQL connection to the synced database.
     pub async fn connect(&self) -> Result<Connection> {
+        let _operation = self.operation_lock.lock().await;
         let op = self.sync.connect();
         let result = drive_operation_result(op, self.io.clone()).await?;
         match result {
@@ -1342,6 +1355,54 @@ mod tests {
             result.push(row.values.into_iter().map(|x| x.into()).collect());
         }
         Ok(result)
+    }
+
+    #[test]
+    pub fn test_sync_concurrent_operations_do_not_deadlock() {
+        let _ = tracing_subscriber::fmt::try_init();
+        let server_runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let server = server_runtime.block_on(async {
+            let server = TursoServer::new().await.unwrap();
+            server.db_sql("CREATE TABLE t(x)").await.unwrap();
+            server
+        });
+        let db_url = server.db_url().to_string();
+
+        run_with_deadline(2, Duration::from_secs(30), || async move {
+            let db = crate::sync::Builder::new_remote(":memory:")
+                .with_remote_url(db_url)
+                .build()
+                .await
+                .unwrap();
+            let conn = db.connect().await.unwrap();
+            conn.execute("INSERT INTO t VALUES (1), (2), (3)", ())
+                .await
+                .unwrap();
+
+            let mut tasks = Vec::new();
+            for i in 0..16 {
+                let db = db.clone();
+                tasks.push(tokio::spawn(async move {
+                    match i % 4 {
+                        0 => db.push().await,
+                        1 => db.pull().await.map(|_| ()),
+                        2 => db.connect().await.map(|_| ()),
+                        _ => db.stats().await.map(|_| ()),
+                    }
+                }));
+            }
+            for task in tasks {
+                task.await.unwrap().unwrap();
+            }
+        });
+
+        let rows = server_runtime
+            .block_on(server.db_sql("SELECT count(*) FROM t"))
+            .unwrap();
+        assert_eq!(rows, vec![vec![Value::Text("3".to_string())]]);
     }
 
     #[test]
