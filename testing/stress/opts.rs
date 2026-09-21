@@ -25,6 +25,7 @@ impl fmt::Display for TxMode {
 #[derive(Parser, Clone)]
 #[command(name = "turso_stress")]
 #[command(author, version, about, long_about = None)]
+#[command(args_override_self = true)]
 pub struct Opts {
     #[clap(long, conflicts_with = "db_ref", help = "Run the FTS workload")]
     pub fts: bool,

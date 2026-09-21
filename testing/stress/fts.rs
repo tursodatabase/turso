@@ -112,6 +112,50 @@ mod tests {
         assert!(Opts::try_parse_from(["turso_stress", "--fts", "--db-ref", "ref.db"]).is_err());
     }
 
+    #[test]
+    fn caller_options_override_singleton_defaults() {
+        for (threads, iterations) in [("--nr-threads", "--nr-iterations"), ("-t", "-i")] {
+            let opts = Opts::try_parse_from([
+                "turso_stress",
+                "--fts",
+                "--nr-threads",
+                "2",
+                "--nr-iterations",
+                "10000",
+                "--tx-mode",
+                "concurrent",
+                threads,
+                "3",
+                iterations,
+                "7",
+                "--tx-mode",
+                "sqlite",
+                "--tables",
+                "2",
+                "--busy-timeout",
+                "123",
+                "--seed",
+                "42",
+                "--db-file",
+                "/tmp/fts test.db",
+                "--vfs",
+                "syscall",
+                "--skip-integrity-check",
+            ])
+            .unwrap();
+            assert!(opts.fts);
+            assert_eq!(opts.nr_threads, 3);
+            assert_eq!(opts.nr_iterations, 7);
+            assert_eq!(opts.tx_mode, crate::opts::TxMode::SQLite);
+            assert_eq!(opts.tables, Some(2));
+            assert_eq!(opts.busy_timeout, 123);
+            assert_eq!(opts.seed, Some(42));
+            assert_eq!(opts.db_file.as_deref(), Some("/tmp/fts test.db"));
+            assert_eq!(opts.vfs.as_deref(), Some("syscall"));
+            assert!(opts.skip_integrity_check);
+        }
+    }
+
     #[tokio::test]
     async fn writes_rollback_optimize_and_reopen() {
         let dir = tempfile::tempdir().unwrap();
