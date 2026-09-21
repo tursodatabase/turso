@@ -123,13 +123,6 @@ jobs:
         cargo run -p turso_stress --locked --
         --fts --tx-mode ${{ matrix.tx-mode }}
         --nr-threads 2 --nr-iterations 10000
-        --db-file "${{ runner.temp }}/fts-stress.db"
-    - name: Upload failed FTS database and logs
-      if: failure()
-      uses: actions/upload-artifact@v4
-      with:
-        name: fts-stress-${{ matrix.mode }}
-        path: ${{ runner.temp }}/fts-stress.db*
 
   shuttle-stress-test:
     runs-on: blacksmith-4vcpu-ubuntu-2404
