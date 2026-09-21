@@ -2997,14 +2997,19 @@ fn test_postgres_delete_using_materializes_returned_columns(db: TempDatabase) {
         ("s.kept, s.kept", &[1]),
         ("(SELECT s.kept)", &[1]),
         ("(SELECT s.kept WHERE s.match_id = t.id)", &[2]),
+        ("s.rowid", &[1]),
+        ("s.rowid, s.rowid", &[1]),
+        ("(SELECT s.rowid)", &[1]),
+        ("(SELECT (SELECT s.rowid))", &[1]),
+        ("(SELECT s.kept WHERE s.rowid = 2)", &[2]),
         ("s.*", &[4]),
-        ("*", &[4]),
+        ("*", &[8]),
     ];
     for (returning, expected_widths) in cases {
         let statement = conn
             .prepare(format!(
-                "DELETE FROM target AS t USING source AS s \
-                 WHERE t.id = 1 AND s.match_id = 1 RETURNING {returning}"
+                "DELETE FROM target AS t USING source AS s, source AS unused_source \
+                 WHERE t.id = 1 AND s.match_id = 1 AND s.rowid > 0 RETURNING {returning}"
             ))
             .unwrap();
         let record_widths = statement
@@ -3020,6 +3025,46 @@ fn test_postgres_delete_using_materializes_returned_columns(db: TempDatabase) {
             })
             .collect::<Vec<_>>();
         assert_eq!(record_widths, *expected_widths, "RETURNING {returning}");
+    }
+}
+
+#[turso_macros::test(mvcc)]
+fn test_postgres_delete_using_returning_source_rowid(db: TempDatabase) {
+    let conn = db.connect_postgres();
+    conn.execute("CREATE TABLE target (id int)").unwrap();
+    conn.execute("CREATE TABLE source (target_id int)").unwrap();
+    conn.execute("INSERT INTO source VALUES (0), (42), (43)")
+        .unwrap();
+
+    let cases = [
+        ("s.rowid", ["2", "3"]),
+        ("(SELECT s.rowid)", ["2", "3"]),
+        ("(SELECT (SELECT s.rowid))", ["2", "3"]),
+        ("(SELECT (SELECT s.target_id))", ["42", "43"]),
+        ("(SELECT id FROM (SELECT s.rowid AS id UNION ALL SELECT 99) AS r LIMIT 1)", ["2", "3"]),
+        ("(WITH r AS (SELECT s.rowid AS id) SELECT id FROM r)", ["2", "3"]),
+        ("(WITH RECURSIVE r(id) AS (SELECT s.rowid UNION ALL SELECT id + 1 FROM r WHERE id < 3) SELECT max(id) FROM r)", ["3", "3"]),
+        ("(SELECT s.target_id WHERE s.rowid > 0)", ["42", "43"]),
+        ("coalesce(missing.rowid, -1)", ["-1", "-1"]),
+        ("coalesce((SELECT missing.rowid), -1)", ["-1", "-1"]),
+    ];
+    for (returning, expected) in cases {
+        conn.execute("INSERT INTO target VALUES (42), (43)")
+            .unwrap();
+        let mut rows = conn
+            .query(format!(
+                "DELETE FROM target AS t \
+                 USING source AS s LEFT JOIN source AS missing ON missing.target_id = -1 \
+                 WHERE t.id = s.target_id RETURNING {returning}"
+            ))
+            .unwrap_or_else(|error| panic!("{returning}: {error}"))
+            .unwrap();
+        let mut actual = Vec::new();
+        while let StepResult::Row = rows.step().unwrap() {
+            actual.push(rows.row().unwrap().get_value(0).to_string());
+        }
+        actual.sort();
+        assert_eq!(actual, expected, "{returning}");
     }
 }
 

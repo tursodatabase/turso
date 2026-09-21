@@ -197,6 +197,21 @@ expect {
     1
 }
 
+test table-delete-using-returning-nested-source-subqueries {
+    CREATE TABLE target (id int);
+    CREATE TABLE source (id int, label text);
+    INSERT INTO target VALUES (1), (2);
+    INSERT INTO source VALUES (1, 'one'), (2, 'two');
+    DELETE FROM target USING source AS s WHERE target.id = s.id
+        RETURNING (SELECT (SELECT s.label)),
+            (WITH r AS (SELECT s.label AS label) SELECT label FROM r),
+            (SELECT label FROM (SELECT s.label AS label UNION ALL SELECT 'unused') AS r LIMIT 1);
+}
+expect unordered {
+    one|one|one
+    two|two|two
+}
+
 test table-delete-using-returning-selected-source-columns {
     CREATE TABLE target (id int);
     CREATE TABLE first_source (id int, unused text, label text);
@@ -441,17 +456,6 @@ expect error {
     ambiguous
 }
 
-test table-delete-using-returning-source-rowid {
-    CREATE TABLE target (id int);
-    CREATE TABLE source (id int);
-    INSERT INTO target VALUES (1);
-    INSERT INTO source VALUES (1);
-    DELETE FROM target USING source AS s WHERE target.id = s.id RETURNING s.rowid;
-}
-expect error {
-    rowid
-}
-
 test table-delete-using-returning-source-rowid-column {
     CREATE TABLE target (id int);
     CREATE TABLE source (id int, rowid int);
@@ -462,18 +466,6 @@ test table-delete-using-returning-source-rowid-column {
 }
 expect {
     42|42
-}
-
-test table-delete-using-returning-source-rowid-subquery {
-    CREATE TABLE target (id int);
-    CREATE TABLE source (id int);
-    INSERT INTO target VALUES (1);
-    INSERT INTO source VALUES (1);
-    DELETE FROM target USING source AS s WHERE target.id = s.id
-        RETURNING (SELECT (SELECT s.rowid));
-}
-expect error {
-    rowid
 }
 
 test table-delete-using-ambiguous-column {

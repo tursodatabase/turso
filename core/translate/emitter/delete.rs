@@ -209,7 +209,7 @@ pub fn emit_program_for_delete(
                 dest: rowid_reg,
             });
             t_ctx.resolver.enable_expr_to_reg_cache();
-            for (column, (database_id, expr)) in plan.using_columns.iter().enumerate() {
+            for (column, expr) in plan.using_values.iter().enumerate() {
                 let reg = program.alloc_register();
                 program.emit_insn(Insn::Column {
                     cursor_id,
@@ -217,19 +217,12 @@ pub fn emit_program_for_delete(
                     dest: reg,
                     default: None,
                 });
-                let mut qualified_expr = expr.clone();
-                let turso_parser::ast::Expr::Column { database, .. } = &mut qualified_expr else {
-                    unreachable!("USING values must be columns");
-                };
-                *database = Some(*database_id);
-                for cached_expr in [expr.clone(), qualified_expr] {
-                    t_ctx.resolver.cache_scalar_expr_reg(
-                        std::borrow::Cow::Owned(cached_expr),
-                        reg,
-                        false,
-                        &plan.table_references,
-                    )?;
-                }
+                t_ctx.resolver.cache_scalar_expr_reg(
+                    std::borrow::Cow::Owned(expr.clone()),
+                    reg,
+                    false,
+                    &plan.table_references,
+                )?;
             }
         } else {
             // Read next rowid from RowSet

@@ -5,8 +5,8 @@ use crate::translate::expr::{process_returning_clause, walk_expr, WalkControl};
 use crate::translate::optimizer::optimize_plan;
 use crate::translate::plan::{
     select_star, ColumnMask, DeletePlan, DmlSafety, DmlSafetyReason, EphemeralRowidMode,
-    IterationDirection, JoinInfo, JoinOrderMember, JoinType, Operation, OuterQueryReference, Plan,
-    QueryDestination, ResultSetColumn, Scan, SelectPlan, SubqueryState,
+    IterationDirection, JoinInfo, JoinOrderMember, JoinType, NonFromClauseSubquery, Operation,
+    OuterQueryReference, Plan, QueryDestination, ResultSetColumn, Scan, SelectPlan,
 };
 use crate::translate::planner::{
     append_vtab_predicates_to_where_clause, parse_from, parse_where, plan_ctes_as_outer_refs,
@@ -221,6 +221,7 @@ pub fn prepare_delete_plan(
         internal_id: program.table_reference_counter.next(),
         join_info: None,
         col_used_mask: ColumnUsedMask::default(),
+        rowid_referenced: false,
         column_use_counts: Vec::new(),
         expression_index_usages: Vec::new(),
         database_id,
@@ -316,7 +317,12 @@ pub fn prepare_delete_plan(
         .joined_tables_mut()
         .iter_mut()
         .skip(1)
-        .map(|table| std::mem::take(&mut table.col_used_mask))
+        .map(|table| {
+            (
+                std::mem::take(&mut table.col_used_mask),
+                std::mem::take(&mut table.rowid_referenced),
+            )
+        })
         .collect::<Vec<_>>();
 
     // Plan subqueries in RETURNING expressions before processing
@@ -332,43 +338,34 @@ pub fn prepare_delete_plan(
     )?;
 
     let result_columns = if has_using {
-        for subquery in &non_from_clause_subqueries {
-            let SubqueryState::Unevaluated { plan: Some(plan) } = &subquery.state else {
-                unreachable!("RETURNING subqueries must have unevaluated plans");
-            };
-            if delete_using_subquery_reads_source_rowid(
-                plan,
-                &table_references.joined_tables()[1..],
-            ) {
-                crate::bail_parse_error!(
-                    "RETURNING cannot reference an implicit rowid from a USING table"
-                );
-            }
-        }
         process_delete_using_returning(&mut returning, &mut table_references, resolver)?
     } else {
         process_returning_clause(&mut returning, &mut table_references, resolver)?
     };
 
-    let mut using_columns = vec![];
-    for (table, read_mask) in table_references
+    let mut using_values = vec![];
+    for (table, (read_mask, rowid_referenced)) in table_references
         .joined_tables_mut()
         .iter_mut()
         .skip(1)
         .zip(using_read_masks)
     {
         for column in table.col_used_mask.iter() {
-            using_columns.push((
-                table.database_id,
-                Expr::Column {
-                    database: None,
-                    table: table.internal_id,
-                    column,
-                    is_rowid_alias: table.columns()[column].is_rowid_alias(),
-                },
-            ));
+            using_values.push(Expr::Column {
+                database: None,
+                table: table.internal_id,
+                column,
+                is_rowid_alias: table.columns()[column].is_rowid_alias(),
+            });
+        }
+        if table.rowid_referenced {
+            using_values.push(Expr::RowId {
+                database: None,
+                table: table.internal_id,
+            });
         }
         table.col_used_mask.union_with(&read_mask)?;
+        table.rowid_referenced |= rowid_referenced;
     }
 
     // Check if there are DELETE triggers. If so, we need to materialize the write set into a RowSet first.
@@ -409,16 +406,15 @@ pub fn prepare_delete_plan(
         indexes,
         rowset_plan: None,
         rowset_reg: None,
-        using_columns,
+        using_values,
         non_from_clause_subqueries,
         safety,
     };
 
-    if delete_plan.safety.requires_stable_write_set() {
-        ensure_delete_uses_rowset(program, &mut delete_plan);
-    }
     if has_using {
         prepare_delete_using_rows(program, &mut delete_plan, using_subqueries);
+    } else if delete_plan.safety.requires_stable_write_set() {
+        ensure_delete_uses_rowset(program, &mut delete_plan);
     }
 
     Ok(Plan::Delete(Box::new(delete_plan)))
@@ -484,124 +480,28 @@ fn process_delete_using_returning(
             table_references.mark_column_used(*table, *column);
         }
     }
-    for column in &result_columns {
-        walk_expr(&column.expr, &mut |expr| {
-            if let Expr::RowId { table, .. } = expr {
-                if table_references.joined_tables()[1..]
-                    .iter()
-                    .any(|source| source.internal_id == *table)
-                {
-                    crate::bail_parse_error!(
-                        "RETURNING cannot reference an implicit rowid from a USING table"
-                    );
-                }
-            }
-            Ok(WalkControl::Continue)
-        })?;
-    }
     Ok(result_columns)
-}
-
-fn delete_using_subquery_reads_source_rowid(plan: &Plan, sources: &[JoinedTable]) -> bool {
-    let select_reads_source_rowid = |plan: &SelectPlan| {
-        plan.table_references
-            .outer_query_refs()
-            .iter()
-            .any(|outer| {
-                outer.rowid_referenced
-                    && sources
-                        .iter()
-                        .any(|source| source.internal_id == outer.internal_id)
-            })
-            || plan.non_from_clause_subqueries.iter().any(|subquery| {
-                let SubqueryState::Unevaluated { plan: Some(plan) } = &subquery.state else {
-                    unreachable!("RETURNING subqueries must have unevaluated plans");
-                };
-                delete_using_subquery_reads_source_rowid(plan, sources)
-            })
-            || plan
-                .table_references
-                .joined_tables()
-                .iter()
-                .any(|table| match &table.table {
-                    Table::FromClauseSubquery(subquery) => {
-                        delete_using_subquery_reads_source_rowid(&subquery.plan, sources)
-                    }
-                    Table::BTree(_) | Table::Virtual(_) | Table::RecursiveCteInput(_) => false,
-                })
-    };
-    match plan {
-        Plan::Select(plan) => select_reads_source_rowid(plan),
-        Plan::CompoundSelect {
-            left, right_most, ..
-        } => {
-            left.iter().any(|(plan, _)| select_reads_source_rowid(plan))
-                || select_reads_source_rowid(right_most)
-        }
-        Plan::RecursiveCte(plan) => {
-            delete_using_subquery_reads_source_rowid(&plan.initial_query, sources)
-                || delete_using_subquery_reads_source_rowid(&plan.recursive_query, sources)
-        }
-        Plan::Delete(_) | Plan::Update(_) => {
-            unreachable!("RETURNING subqueries must be SELECT plans")
-        }
-    }
 }
 
 fn prepare_delete_using_rows(
     program: &mut ProgramBuilder,
     plan: &mut DeletePlan,
-    using_subqueries: Vec<super::plan::NonFromClauseSubquery>,
+    using_subqueries: Vec<NonFromClauseSubquery>,
 ) {
-    let rowset_plan = plan.rowset_plan.as_mut().expect("USING requires a rowset");
-    let mut target = rowset_plan.table_references.joined_tables_mut().remove(0);
-    if !plan.using_columns.is_empty() {
-        let scratch_table = Arc::new(BTreeTable::new(
-            0,
-            "delete_using".to_string(),
-            crate::alloc::vec![],
-            crate::alloc::vec![],
-            BTreeCharacteristics::HAS_ROWID,
-            crate::alloc::vec![],
-            crate::alloc::vec![],
-            crate::alloc::vec![],
-            None,
-        ));
-        let cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(scratch_table.clone()));
-        rowset_plan.query_destination = QueryDestination::EphemeralTable {
-            cursor_id,
-            table: scratch_table,
-            rowid_mode: EphemeralRowidMode::FromResultColumns,
-        };
-        let rowid = rowset_plan.result_columns.pop().expect("DELETE rowid");
-        rowset_plan
-            .result_columns
-            .extend(plan.using_columns.iter().map(|(_, expr)| ResultSetColumn {
-                expr: expr.clone(),
-                alias: None,
-                implicit_column_name: None,
-                contains_aggregates: false,
-            }));
-        rowset_plan.result_columns.push(rowid);
-    }
+    let mut table_references = plan.table_references.clone();
+    let mut target = table_references.joined_tables_mut().remove(0);
     target.join_info = Some(JoinInfo {
         join_type: JoinType::Inner,
         using: vec![],
         no_reorder: false,
     });
-    rowset_plan.table_references.add_joined_table(target);
-    rowset_plan.join_order = rowset_plan
-        .table_references
-        .joined_tables()
-        .iter()
-        .enumerate()
-        .map(|(i, table)| JoinOrderMember {
-            table_id: table.internal_id,
-            original_idx: i,
-            is_outer: table.join_info.as_ref().is_some_and(JoinInfo::is_outer),
-        })
-        .collect();
-    rowset_plan.non_from_clause_subqueries = using_subqueries;
+    table_references.add_joined_table(target);
+    plan.rowset_plan = Some(build_delete_rowset_plan(
+        program,
+        plan,
+        table_references,
+        using_subqueries,
+    ));
     let using_tables = plan.table_references.joined_tables_mut().split_off(1);
     for table in using_tables {
         plan.table_references
@@ -615,7 +515,7 @@ fn prepare_delete_using_rows(
                 cte_explicit_columns: vec![],
                 cte_id: None,
                 cte_definition_only: false,
-                rowid_referenced: false,
+                rowid_referenced: table.rowid_referenced,
                 scope_depth: 0,
             });
     }
@@ -740,6 +640,20 @@ fn ensure_delete_uses_rowset(program: &mut ProgramBuilder, plan: &mut DeletePlan
         return;
     }
 
+    plan.rowset_plan = Some(build_delete_rowset_plan(
+        program,
+        plan,
+        plan.table_references.clone(),
+        vec![],
+    ));
+}
+
+fn build_delete_rowset_plan(
+    program: &mut ProgramBuilder,
+    plan: &mut DeletePlan,
+    table_references: TableReferences,
+    non_from_clause_subqueries: Vec<NonFromClauseSubquery>,
+) -> SelectPlan {
     let rowid_internal_id = plan
         .table_references
         .joined_tables()
@@ -752,46 +666,74 @@ fn ensure_delete_uses_rowset(program: &mut ProgramBuilder, plan: &mut DeletePlan
         reg
     });
 
-    let rowset_plan = SelectPlan {
-        table_references: plan.table_references.clone(),
-        result_columns: vec![ResultSetColumn {
-            expr: Expr::RowId {
-                database: None,
-                table: rowid_internal_id,
-            },
+    let query_destination = if plan.using_values.is_empty() {
+        QueryDestination::RowSet { rowset_reg }
+    } else {
+        let scratch_table = Arc::new(BTreeTable::new(
+            0,
+            "delete_using".to_string(),
+            crate::alloc::vec![],
+            crate::alloc::vec![],
+            BTreeCharacteristics::HAS_ROWID,
+            crate::alloc::vec![],
+            crate::alloc::vec![],
+            crate::alloc::vec![],
+            None,
+        ));
+        let cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(scratch_table.clone()));
+        QueryDestination::EphemeralTable {
+            cursor_id,
+            table: scratch_table,
+            rowid_mode: EphemeralRowidMode::FromResultColumns,
+        }
+    };
+    let result_columns = plan
+        .using_values
+        .iter()
+        .cloned()
+        .chain(std::iter::once(Expr::RowId {
+            database: None,
+            table: rowid_internal_id,
+        }))
+        .map(|expr| ResultSetColumn {
+            expr,
             alias: None,
             implicit_column_name: None,
             contains_aggregates: false,
-        }],
+        })
+        .collect();
+    let join_order = table_references
+        .joined_tables()
+        .iter()
+        .enumerate()
+        .map(|(i, table)| JoinOrderMember {
+            table_id: table.internal_id,
+            original_idx: i,
+            is_outer: table.join_info.as_ref().is_some_and(JoinInfo::is_outer),
+        })
+        .collect();
+
+    SelectPlan {
+        table_references,
+        result_columns,
         where_clause: std::mem::take(&mut plan.where_clause),
         group_by: None,
         order_by: vec![],
         aggregates: vec![],
         limit: None,
-        query_destination: QueryDestination::RowSet { rowset_reg },
-        join_order: plan
-            .table_references
-            .joined_tables()
-            .iter()
-            .enumerate()
-            .map(|(i, t)| JoinOrderMember {
-                table_id: t.internal_id,
-                original_idx: i,
-                is_outer: false,
-            })
-            .collect(),
+        query_destination,
+        join_order,
         offset: None,
         contains_constant_false_condition: false,
         distinctness: super::plan::Distinctness::NonDistinct,
         values: vec![],
         window: None,
         // WHERE subqueries should already be planned into this SelectPlan when needed.
-        non_from_clause_subqueries: vec![],
+        non_from_clause_subqueries,
         input_cardinality_hint: None,
         estimated_output_rows: None,
         estimated_cost: None,
         simple_aggregate: None,
         phantom_params: vec![],
-    };
-    plan.rowset_plan = Some(rowset_plan);
+    }
 }

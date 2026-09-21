@@ -905,7 +905,7 @@ pub struct DeletePlan {
     pub rowset_plan: Option<SelectPlan>,
     /// Register ID for the RowSet (if rowset_plan is Some)
     pub rowset_reg: Option<usize>,
-    pub using_columns: Vec<(usize, ast::Expr)>,
+    pub using_values: Vec<ast::Expr>,
     /// Subqueries that appear in the WHERE clause (for non-rowset path)
     pub non_from_clause_subqueries: Vec<NonFromClauseSubquery>,
     /// Whether this DELETE plan uses the safer pre-materialization path, and why.
@@ -1188,6 +1188,7 @@ pub struct JoinedTable {
     /// Bitmask of columns that are referenced in the query.
     /// Used to decide whether a covering index can be used.
     pub col_used_mask: ColumnUsedMask,
+    pub rowid_referenced: bool,
     /// Count of how many times each column is referenced.
     ///
     /// Expression indexes can satisfy a column requirement if the column is
@@ -1645,11 +1646,13 @@ impl TableReferences {
     /// Marks the rowid of a table as referenced. This is tracked separately
     /// from column usage because rowid is not a real column.
     pub fn mark_rowid_referenced(&mut self, internal_id: TableInternalId) {
-        if let Some(outer_query_ref) = self.find_outer_query_ref_by_internal_id_mut(internal_id) {
+        if let Some(joined_table) = self.find_joined_table_by_internal_id_mut(internal_id) {
+            joined_table.rowid_referenced = true;
+        } else if let Some(outer_query_ref) =
+            self.find_outer_query_ref_by_internal_id_mut(internal_id)
+        {
             outer_query_ref.rowid_referenced = true;
         }
-        // For joined tables, rowid references don't need special tracking
-        // since correlated subquery detection only looks at outer_query_refs.
     }
 
     pub fn contains_table(&self, table: &Table) -> bool {
@@ -2581,6 +2584,7 @@ impl JoinedTable {
             internal_id,
             join_info,
             col_used_mask: ColumnUsedMask::default(),
+            rowid_referenced: false,
             column_use_counts: Vec::new(),
             expression_index_usages: Vec::new(),
             database_id: MAIN_DB_ID,
@@ -2628,6 +2632,7 @@ impl JoinedTable {
             internal_id,
             join_info,
             col_used_mask: ColumnUsedMask::default(),
+            rowid_referenced: false,
             column_use_counts: Vec::new(),
             expression_index_usages: Vec::new(),
             database_id: MAIN_DB_ID,
@@ -2661,6 +2666,7 @@ impl JoinedTable {
             internal_id,
             join_info: None,
             col_used_mask: ColumnUsedMask::default(),
+            rowid_referenced: false,
             column_use_counts: Vec::new(),
             expression_index_usages: Vec::new(),
             database_id: MAIN_DB_ID,

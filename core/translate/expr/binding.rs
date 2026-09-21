@@ -566,7 +566,7 @@ pub fn bind_and_rewrite_expr<'a>(
 
                                 if let Some(tbl_id) = matching_tbl {
                                     *expr = Expr::Column {
-                                        database: Some(database_id),
+                                        database: None,
                                         table: tbl_id,
                                         column: col_idx,
                                         is_rowid_alias,
