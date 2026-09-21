@@ -36,9 +36,7 @@ use tantivy::directory::{
 
 #[cfg(not(nightly))]
 use crate::alloc::TursoVecInExt;
-use crate::alloc::{
-    try_arc_slice_from_slice_in, ArcSlice, DynAllocator, DynVec, TursoFromIterator,
-};
+use crate::alloc::{DynAllocator, DynVec, SharedBytes, TryReserveError, TursoFromIterator};
 use crate::sync::Arc;
 
 const TANTIVY_META_FILE: &str = "meta.json";
@@ -47,7 +45,7 @@ const TANTIVY_MANAGED_FILE: &str = ".managed.json";
 /// In-memory file handle over resident bytes.
 #[derive(Clone)]
 pub(super) struct InMemoryFileHandle {
-    data: ArcSlice<u8>,
+    data: SharedBytes,
 }
 
 impl std::fmt::Debug for InMemoryFileHandle {
@@ -98,28 +96,28 @@ fn noop_lock() -> DirectoryLock {
 /// from the visible registry rows; no stored file ever carries that name.
 #[derive(Clone)]
 pub(super) struct SnapshotDirectory {
-    files: Arc<HashMap<PathBuf, ArcSlice<u8>>>,
-    meta_json: ArcSlice<u8>,
+    files: Arc<HashMap<PathBuf, SharedBytes>>,
+    meta_json: SharedBytes,
 }
 
 impl SnapshotDirectory {
     #[turso_macros::allocation_site(crate::alloc::FtsAllocationSite::SnapshotMetadata)]
     pub fn new(
-        files: HashMap<PathBuf, ArcSlice<u8>>,
+        files: HashMap<PathBuf, SharedBytes>,
         meta_json: &[u8],
         allocator: DynAllocator,
     ) -> crate::Result<Self> {
         Ok(Self {
             files: Arc::new(files),
-            meta_json: try_arc_slice_from_slice_in(meta_json, allocator)?,
+            meta_json: SharedBytes::try_from_slice_in(meta_json, allocator)?,
         })
     }
 
-    fn lookup(&self, path: &Path) -> Option<ArcSlice<u8>> {
+    fn lookup(&self, path: &Path) -> Option<SharedBytes> {
         if path == Path::new(TANTIVY_META_FILE) {
-            return Some(Arc::clone(&self.meta_json));
+            return Some(self.meta_json.clone());
         }
-        self.files.get(path).map(Arc::clone)
+        self.files.get(path).cloned()
     }
 }
 
@@ -206,10 +204,10 @@ impl Directory for SnapshotDirectory {
 #[derive(Debug, Default)]
 struct BuildDirectoryInner {
     /// Segment files captured on terminate, footer included.
-    files: HashMap<PathBuf, ArcSlice<u8>>,
+    files: HashMap<PathBuf, SharedBytes>,
     /// Atomic writes (`meta.json`, `.managed.json`): absorbed here so
     /// whole-index manifests never reach the B-tree.
-    atomic: HashMap<PathBuf, ArcSlice<u8>>,
+    atomic: HashMap<PathBuf, SharedBytes>,
     // Tantivy can convert typed I/O errors into strings. Remember allocation
     // failures so write_error can still return OutOfMemory for this build.
     allocation_failed: bool,
@@ -233,7 +231,7 @@ impl BuildDirectory {
     /// The captured segment files (everything written through `open_write`).
     /// Atomic slots (`meta.json`, `.managed.json`) are excluded by
     /// construction.
-    pub fn captured_files(&self) -> HashMap<PathBuf, ArcSlice<u8>> {
+    pub fn captured_files(&self) -> HashMap<PathBuf, SharedBytes> {
         self.inner.read().files.clone()
     }
 
@@ -269,10 +267,7 @@ impl Write for CaptureWriter {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
         self.buffer
             .try_extend(buf.iter().copied())
-            .map_err(|error| {
-                self.inner.write().allocation_failed = true;
-                std::io::Error::new(std::io::ErrorKind::OutOfMemory, error)
-            })?;
+            .map_err(|error| self.inner.write().allocation_error(error))?;
         Ok(buf.len())
     }
 
@@ -299,13 +294,10 @@ impl Drop for CaptureWriter {
 impl TerminatingWrite for CaptureWriter {
     #[turso_macros::allocation_site(crate::alloc::FtsAllocationSite::CapturedFile)]
     fn terminate_ref(&mut self, _: tantivy::directory::AntiCallToken) -> std::io::Result<()> {
-        let data = try_arc_slice_from_slice_in(self.buffer.as_slice(), self.allocator.clone())
-            .map_err(|error| {
-                self.inner.write().allocation_failed = true;
-                std::io::Error::new(std::io::ErrorKind::OutOfMemory, error)
-            })?;
+        let buffer = std::mem::replace(&mut self.buffer, DynVec::new_in(self.allocator.clone()));
+        let data = SharedBytes::try_from_vec(buffer)
+            .map_err(|error| self.inner.write().allocation_error(error))?;
         self.inner.write().files.insert(self.path.clone(), data);
-        self.buffer.clear();
         Ok(())
     }
 }
@@ -316,9 +308,7 @@ impl Directory for BuildDirectory {
         path: &Path,
     ) -> std::result::Result<Arc<dyn FileHandle>, OpenReadError> {
         match self.inner.read().files.get(path) {
-            Some(data) => Ok(Arc::new(InMemoryFileHandle {
-                data: Arc::clone(data),
-            })),
+            Some(data) => Ok(Arc::new(InMemoryFileHandle { data: data.clone() })),
             None => Err(OpenReadError::FileDoesNotExist(path.to_path_buf())),
         }
     }
@@ -337,10 +327,8 @@ impl Directory for BuildDirectory {
 
     #[turso_macros::allocation_site(crate::alloc::FtsAllocationSite::AtomicMetadata)]
     fn atomic_write(&self, path: &Path, data: &[u8]) -> std::io::Result<()> {
-        let data = try_arc_slice_from_slice_in(data, self.allocator.clone()).map_err(|error| {
-            self.inner.write().allocation_failed = true;
-            std::io::Error::new(std::io::ErrorKind::OutOfMemory, error)
-        })?;
+        let data = SharedBytes::try_from_slice_in(data, self.allocator.clone())
+            .map_err(|error| self.inner.write().allocation_error(error))?;
         self.inner.write().atomic.insert(path.to_path_buf(), data);
         Ok(())
     }
@@ -379,5 +367,12 @@ impl Directory for BuildDirectory {
 
     fn watch(&self, _cb: WatchCallback) -> std::result::Result<WatchHandle, tantivy::TantivyError> {
         Ok(WatchHandle::empty())
+    }
+}
+
+impl BuildDirectoryInner {
+    fn allocation_error(&mut self, error: TryReserveError) -> std::io::Error {
+        self.allocation_failed = true;
+        std::io::Error::new(std::io::ErrorKind::OutOfMemory, error)
     }
 }

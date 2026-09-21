@@ -135,6 +135,47 @@ fn arc_slice_preserves_concrete_allocator_until_last_clone_drops() {
 }
 
 #[test]
+fn shared_bytes_preserve_contents_and_share_clones() {
+    for contents in [b"".as_slice(), b"shared bytes".as_slice()] {
+        let mut buffer: DynVec<u8> = TursoVecInExt::new_in(DynAllocator::default());
+        buffer.try_extend(contents.iter().copied()).unwrap();
+        let shared = SharedBytes::try_from_vec(buffer).unwrap();
+        assert_eq!(&*shared, contents);
+        let clone = shared.clone();
+        assert_eq!(clone.as_ptr(), shared.as_ptr());
+        drop(shared);
+        assert_eq!(&*clone, contents);
+    }
+}
+
+#[cfg(nightly)]
+#[test]
+fn shared_bytes_preserve_buffer_and_allocator_until_last_clone_drops() {
+    let allocations = StdArc::new(AtomicUsize::new(0));
+    let deallocations = StdArc::new(AtomicUsize::new(0));
+    let mut buffer = std::vec::Vec::try_with_capacity_in(
+        32,
+        CountingAlloc {
+            allocations: allocations.clone(),
+            deallocations: deallocations.clone(),
+        },
+    )
+    .unwrap();
+    buffer.extend_from_slice(b"abc");
+    let pointer = buffer.as_ptr();
+    let shared: SharedBytes<CountingAlloc> = SharedBytes::try_from_vec(buffer).unwrap();
+    assert_eq!(shared.as_ptr(), pointer);
+    assert_eq!(shared.capacity(), 32);
+    assert_eq!(allocations.load(Ordering::Relaxed), 2);
+    let clone = shared.clone();
+    drop(shared);
+    assert_eq!(&*clone, b"abc");
+    assert_eq!(deallocations.load(Ordering::Relaxed), 0);
+    drop(clone);
+    assert_eq!(deallocations.load(Ordering::Relaxed), 2);
+}
+
+#[test]
 fn database_open_with_allocator_uses_allocator_for_mvstore_skiplist() {
     let allocations = StdArc::new(AtomicUsize::new(0));
     let deallocations = StdArc::new(AtomicUsize::new(0));

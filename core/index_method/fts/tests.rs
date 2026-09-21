@@ -257,11 +257,11 @@ fn merged_segment_files_can_be_rekeyed_to_a_minted_id() {
     let minted = SegmentId::from_uuid_string("0123456789abcdef0123456789abcdef").unwrap();
     assert_ne!(segment.id(), minted);
 
-    let files: HashMap<PathBuf, ArcSlice<u8>> = segment
+    let files: HashMap<PathBuf, SharedBytes> = segment
         .data
         .files
         .iter()
-        .map(|(name, bytes)| (PathBuf::from(name), Arc::clone(bytes)))
+        .map(|(name, bytes)| (PathBuf::from(name), bytes.clone()))
         .collect();
     let renamed = rename_segment_files(files.clone(), &segment.id(), &minted).unwrap();
     assert_eq!(renamed.len(), files.len());
@@ -300,7 +300,7 @@ fn merged_segment_files_can_be_rekeyed_to_a_minted_id() {
     let mut stray = files;
     stray.insert(
         PathBuf::from("meta.json"),
-        try_arc_slice_from_slice_in(&[], DynAllocator::default()).unwrap(),
+        SharedBytes::try_from_slice_in(&[], DynAllocator::default()).unwrap(),
     );
     assert!(matches!(
         rename_segment_files(stray, &segment.id(), &minted),
@@ -391,11 +391,11 @@ fn segment_load_reads_the_identities_the_build_wrote() {
 
     // A segment loaded from storage reads its identities from the fast
     // field. A merged segment and every cache miss do the same.
-    let files: HashMap<PathBuf, ArcSlice<u8>> = segment
+    let files: HashMap<PathBuf, SharedBytes> = segment
         .data
         .files
         .iter()
-        .map(|(name, bytes)| (PathBuf::from(name), Arc::clone(bytes)))
+        .map(|(name, bytes)| (PathBuf::from(name), bytes.clone()))
         .collect();
     let scratch = attachment.shared.scratch_index(&attachment.schema).unwrap();
     let read_back = read_segment_identities(
@@ -581,7 +581,7 @@ fn segment_byte_cache_keeps_newest_and_respects_budget() {
         let mut files = HashMap::default();
         files.insert(
             "f".to_string(),
-            try_arc_slice_from_slice_in(&vec![0u8; bytes], DynAllocator::default()).unwrap(),
+            SharedBytes::try_from_slice_in(&vec![0u8; bytes], DynAllocator::default()).unwrap(),
         );
         Arc::new(SegmentData::new(files, SegmentIdentities::new(Vec::new())))
     };
@@ -720,6 +720,28 @@ mod allocation_failures {
     use tantivy::directory::{Directory, TerminatingWrite};
 
     #[test]
+    fn shared_bytes_arc_failure_releases_buffer() {
+        let allocator = FailingAllocator::default();
+        let mut buffer =
+            DynVec::try_with_capacity_in(32, DynAllocator::new(allocator.clone())).unwrap();
+        buffer.try_extend(b"contents".iter().copied()).unwrap();
+        allocator.fail_after(0);
+        assert!(SharedBytes::try_from_vec(buffer).is_err());
+        assert_eq!(allocator.remaining.load(Ordering::Relaxed), -1);
+        assert_eq!(allocator.deallocations.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn segment_byte_cache_counts_retained_capacity() {
+        let mut buffer = DynVec::try_with_capacity_in(128, DynAllocator::default()).unwrap();
+        buffer.try_extend(b"abc".iter().copied()).unwrap();
+        let shared = SharedBytes::try_from_vec(buffer).unwrap();
+        let files = [("f".to_string(), shared)].into_iter().collect();
+        let data = SegmentData::new(files, SegmentIdentities::new(Vec::new()));
+        assert_eq!(data.total_bytes, 128);
+    }
+
+    #[test]
     fn segment_load_allocation_failures_allow_retry() {
         let attachment = test_attachment();
         let (segment, _) = build_and_load_segment(&attachment, &[(7, "hello"), (19, "world")]);
@@ -805,7 +827,8 @@ mod allocation_failures {
     fn snapshot_reader_shares_bytes_until_last_owner_drops() {
         let allocator = FailingAllocator::default();
         let data =
-            try_arc_slice_from_slice_in(b"abcdefgh", DynAllocator::new(allocator.clone())).unwrap();
+            SharedBytes::try_from_slice_in(b"abcdefgh", DynAllocator::new(allocator.clone()))
+                .unwrap();
         let pointer = data[2..].as_ptr();
         let path = PathBuf::from("segment.idx");
         let directory = SnapshotDirectory::new(
@@ -826,7 +849,7 @@ mod allocation_failures {
         drop(bytes);
         assert_eq!(allocator.deallocations.load(Ordering::Relaxed), 0);
         drop(clone);
-        assert_eq!(allocator.deallocations.load(Ordering::Relaxed), 1);
+        assert_eq!(allocator.deallocations.load(Ordering::Relaxed), 2);
     }
 
     #[test]
