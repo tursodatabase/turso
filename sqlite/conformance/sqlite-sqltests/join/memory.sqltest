@@ -112,7 +112,6 @@ setup expression-index-prefix-stats {
 
 @setup indexed-hash-build-rows
 @setup expression-index-prefix-stats
-@skip-if mvcc "MVCC does not reload sqlite_stat1 after this setup changes it"
 test expression-index-after-earlier-join-keeps-source-column {
     SELECT customers.id, orders.id, lower(orders.order_date), inventory.quantity
     FROM expression_build_customers AS customers
@@ -132,7 +131,6 @@ expect {
 @setup indexed-hash-build-rows
 @setup expression-index-prefix-stats
 @skip-if sqlite "SQLite does not have a hash join plan"
-@skip-if mvcc "MVCC does not reload sqlite_stat1 after this setup changes it"
 test expression-index-after-earlier-join-reads-source-table {
     EXPLAIN QUERY PLAN
     SELECT customers.id, orders.id, lower(orders.order_date), inventory.quantity
@@ -974,7 +972,6 @@ expect pattern {
 }
 
 @skip-if sqlite "Turso compares correlated subqueries with grouped joins"
-@skip-if mvcc "MVCC does not reload sqlite_stat1 after this test changes it"
 test group-sort-cost-keeps-cheaper-correlated-seeks {
     CREATE TABLE sort_cost_parent(id INTEGER PRIMARY KEY, selected INTEGER);
     CREATE TABLE sort_cost_filter(id INTEGER PRIMARY KEY, selected INTEGER);
@@ -1009,7 +1006,6 @@ expect pattern {
 }
 
 @skip-if sqlite "Turso can use a hash join when an index cannot seek by the join column"
-@skip-if mvcc "MVCC does not reload sqlite_stat1 after this test changes it"
 test index-suffix-does-not-prevent-hash-join {
     CREATE TABLE suffix_hash_parent(id INTEGER PRIMARY KEY, selected INTEGER);
     CREATE TABLE suffix_hash_child(
@@ -1036,7 +1032,6 @@ expect pattern {
     (?s)HASH JOIN suffix_hash_child AS child.*SCAN suffix_hash_parent AS parent
 }
 
-@skip-if mvcc "MVCC does not reload sqlite_stat1 after this test changes it"
 test index-suffix-join-keeps-null-and-duplicate-rows {
     CREATE TABLE suffix_result_parent(id INTEGER PRIMARY KEY, selected INTEGER);
     CREATE TABLE suffix_result_child(
@@ -1071,7 +1066,6 @@ expect {
 }
 
 @skip-if sqlite "Turso can use a hash join when the current join prefix cannot seek an index"
-@skip-if mvcc "MVCC does not reload sqlite_stat1 after this test changes it"
 test future-table-cannot-make-index-usable {
     CREATE TABLE future_index_parent(id INTEGER PRIMARY KEY, selected INTEGER);
     CREATE TABLE future_index_group(id INTEGER PRIMARY KEY);
@@ -1100,7 +1094,6 @@ expect pattern {
     (?s)HASH JOIN future_index_child AS child.*SEARCH group_table USING INTEGER PRIMARY KEY.*SCAN future_index_parent AS parent
 }
 
-@skip-if mvcc "MVCC does not reload sqlite_stat1 after this test changes it"
 test future-table-index-does-not-change-join-results {
     CREATE TABLE future_result_parent(id INTEGER PRIMARY KEY, selected INTEGER);
     CREATE TABLE future_result_group(id INTEGER PRIMARY KEY);
@@ -1156,7 +1149,6 @@ setup hash-index-prefix-rows {
 
 @setup hash-index-prefix-rows
 @skip-if sqlite "SQLite does not have a hash join plan"
-@skip-if mvcc "MVCC does not reload sqlite_stat1 after this setup changes it"
 test range-prefix-still-allows-hash-join {
     EXPLAIN QUERY PLAN
     SELECT parent.id, child.group_id, child.payload
@@ -1171,7 +1163,6 @@ expect pattern {
 
 @setup hash-index-prefix-rows
 @skip-if sqlite "SQLite does not have a hash join plan"
-@skip-if mvcc "MVCC does not reload sqlite_stat1 after this setup changes it"
 test equality-prefix-keeps-index-search {
     EXPLAIN QUERY PLAN
     SELECT count(*)
@@ -1185,7 +1176,6 @@ expect pattern {
 }
 
 @setup hash-index-prefix-rows
-@skip-if mvcc "MVCC does not reload sqlite_stat1 after this setup changes it"
 @var join_type { JOIN | LEFT JOIN }
 @var first_column { child.group_id > 15 | child.group_id IN (10, 20) | child.group_id = 10 | child.payload > 0 }
 matrix index-prefix-join-results {
@@ -1198,7 +1188,6 @@ matrix index-prefix-join-results {
 }
 
 @skip-if sqlite "Turso reports hash join estimates in its JSON plan"
-@skip-if mvcc "MVCC does not reload sqlite_stat1 after this test changes it"
 test unique-composite-hash-key-uses-one-key-estimate {
     CREATE TABLE composite_hash_parent(first INTEGER, second INTEGER, selected INTEGER);
     CREATE UNIQUE INDEX composite_hash_parent_key
@@ -1224,7 +1213,6 @@ expect pattern {
 }
 
 @skip-if sqlite "Turso reports hash join estimates in its JSON plan"
-@skip-if mvcc "MVCC does not reload sqlite_stat1 after this test changes it"
 test unique-hash-key-does-not-apply-to-a-different-collation {
     CREATE TABLE collation_unique_build(key TEXT UNIQUE);
     CREATE TABLE collation_unique_probe(key TEXT);
@@ -1298,7 +1286,6 @@ expect pattern {
 }
 
 @skip-if sqlite "Turso uses its own join cost model"
-@skip-if mvcc "MVCC does not reload sqlite_stat1 after this test changes it"
 test partial-stats-hash-join-uses-known-unique-key-count {
     CREATE TABLE a(id INTEGER PRIMARY KEY, b_id INTEGER, chosen INTEGER);
     CREATE TABLE b(id INTEGER PRIMARY KEY, c_key INTEGER);

@@ -122,9 +122,7 @@ pub fn refresh_analyze_stats(conn: &Arc<Connection>) {
 
     let mv_tx = conn.get_mv_tx();
     if let Ok(stats) = gather_sqlite_stat1(conn, &schema_snapshot, mv_tx) {
-        if let Err(e) = conn.with_schema_mut(|schema| {
-            schema.analyze_stats = stats;
-        }) {
+        if let Err(e) = install_analyze_stats(conn, stats) {
             tracing::warn!("Failed to refresh analyze stats: {e}");
         }
     }
@@ -183,9 +181,7 @@ pub fn refresh_analyze_stats_nonblock(
                     Ok(IOResult::IO(io)) => return Ok(IOResult::IO(io)),
                     Ok(IOResult::Done(())) => {
                         let stats = std::mem::take(stats);
-                        if let Err(e) = conn.with_schema_mut(|schema| {
-                            schema.analyze_stats = stats;
-                        }) {
+                        if let Err(e) = install_analyze_stats(conn, stats) {
                             tracing::warn!("Failed to refresh analyze stats: {e}");
                         }
                         *st = RefreshAnalyzeStatsState::Start;
@@ -200,6 +196,29 @@ pub fn refresh_analyze_stats_nonblock(
             }
         }
     }
+}
+
+/// Store freshly gathered stats in the connection's schema and, when the shared
+/// database schema is the same schema version, in the shared schema too.
+///
+/// In MVCC mode the commit that wrote `sqlite_stat1` publishes the connection's
+/// schema to the shared schema before the stats are gathered. If only the
+/// connection copy were updated, the two copies would differ while having the
+/// same version, and the next statement would adopt the shared copy and lose
+/// the new stats.
+///
+/// The connection schema lock is released before the shared schema lock is
+/// taken: other code paths lock them in the opposite order.
+fn install_analyze_stats(conn: &Arc<Connection>, stats: AnalyzeStats) -> Result<()> {
+    let schema_version = conn.with_schema_mut(|schema| {
+        schema.analyze_stats = stats.clone();
+        schema.schema_version
+    })?;
+    let mut shared = conn.db.schema.lock();
+    if shared.schema_version == schema_version {
+        Schema::try_make_mut(&mut shared)?.analyze_stats = stats;
+    }
+    Ok(())
 }
 
 /// Non-blocking row scan shared by [`refresh_analyze_stats_nonblock`]. Steps the

@@ -333,7 +333,6 @@ snapshot-eqp compound-or-benchmark-shape-eqp {
 # ANALYZE must not make a temporary type index win when it leaves the full
 # join condition to run for every matching pair.
 @skip-if sqlite "query plan explanation output is different in sqlite"
-@skip-if mvcc "MVCC does not reload sqlite_stat1 after this test changes it"
 @setup benchmark_shape_schema
 test compound-or-analyzed-benchmark-shape-eqp {
     ANALYZE;
@@ -378,7 +377,6 @@ expect {
 }
 
 @skip-if sqlite "Turso reports its row estimates in JSON"
-@skip-if mvcc "MVCC does not reload sqlite_stat1 after this test changes it"
 test derived-or-filter-skips-correlated-columns {
     CREATE TABLE correlated_values(x INTEGER, y INTEGER);
     ANALYZE;

@@ -292,7 +292,6 @@ expect pattern {
 # This avoids both the correlated scan and strings for unused inner keys.
 @setup selective_join_plan_rows
 @skip-if sqlite "SQLite keeps this group_concat as a correlated subquery"
-@skip-if mvcc "MVCC does not reload sqlite_stat1 after ANALYZE in this setup"
 test one-value-group-concat-joins-before-grouping {
     EXPLAIN QUERY PLAN
     SELECT o.id
@@ -885,7 +884,6 @@ expect {
 # A sum can join the requested inner rows before grouping. This avoids one
 # subquery call per outer row without adding values for unused inner keys.
 @skip-if sqlite "SQLite keeps this sum as a correlated subquery"
-@skip-if mvcc "MVCC does not reload sqlite_stat1 after ANALYZE in this setup"
 @setup selective_join_plan_rows
 test one-value-sum-joins-before-grouping {
     EXPLAIN QUERY PLAN
@@ -1054,7 +1052,6 @@ expect pattern {
 # result is the same for every joined copy, so it does not block the joined
 # form. TPC-H q20 has this shape.
 @skip-if sqlite "SQLite keeps this sum as a correlated subquery"
-@skip-if mvcc "MVCC does not reload sqlite_stat1 after ANALYZE in this setup"
 @setup selective_join_plan_rows
 test one-value-sum-join-allows-uncorrelated-subquery-term {
     EXPLAIN QUERY PLAN
@@ -1073,7 +1070,6 @@ expect pattern {
 
 # The subquery can be either side of the comparison.
 @skip-if sqlite "SQLite keeps this sum as a correlated subquery"
-@skip-if mvcc "MVCC does not reload sqlite_stat1 after ANALYZE in this setup"
 @setup selective_join_plan_rows
 test one-value-sum-join-subquery-on-left-side {
     EXPLAIN QUERY PLAN
@@ -1290,7 +1286,6 @@ expect {
 }
 
 @skip-if sqlite "Turso uses a different plan for this query"
-@skip-if mvcc "MVCC does not reload sqlite_stat1 after ANALYZE in this setup"
 @setup selective_join_plan_rows
 test one-value-json-sum-uses-joined-form {
     EXPLAIN QUERY PLAN
@@ -1440,7 +1435,6 @@ setup hash_anti_rows {
 # A large anti-join can scan its inner table once without a temporary index.
 @setup hash_anti_rows
 @skip-if sqlite "SQLite uses a different NOT EXISTS plan"
-@skip-if mvcc "MVCC does not reload sqlite_stat1 after this test changes it"
 test not-exists-can-use-hash-anti-join {
     EXPLAIN QUERY PLAN
     SELECT o.id
@@ -1623,7 +1617,6 @@ expect {
 # With table counts from ANALYZE, one outer row should use the saved inner
 # index. All outer rows should group the inner table once.
 @skip-if sqlite "query plan explanation output is different in sqlite"
-@skip-if mvcc "MVCC does not reload sqlite_stat1 after this test changes it"
 test indexed-average-uses-outer-row-count {
     CREATE TABLE one_indexed_avg_outer(id INTEGER PRIMARY KEY, k INTEGER, x REAL);
     CREATE TABLE many_indexed_avg_outer(id INTEGER PRIMARY KEY, k INTEGER, x REAL);
