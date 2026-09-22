@@ -90,7 +90,7 @@ jobs:
       - name: Install cargo-nextest
         uses: taiki-e/install-action@nextest
       - name: Install cargo-llvm-cov
-        if: runner.os == 'Linux'
+        if: runner.os == 'Linux' && github.event_name != 'pull_request'
         uses: taiki-e/install-action@cargo-llvm-cov
       # Blacksmith Windows images ship no LLVM; the all-features build pulls in
       # pg_query, whose bindgen needs libclang.dll.
@@ -112,7 +112,7 @@ jobs:
       - name: Build
         run: cargo build --verbose --locked --all-features
       - name: Test (nextest with coverage)
-        if: runner.os == 'Linux'
+        if: runner.os == 'Linux' && github.event_name != 'pull_request'
         env:
           RUST_LOG: ${{ runner.debug && 'turso_core::storage=trace' || '' }}
           LOCAL_SYNC_SERVER: "../../target/debug/tursodb"
@@ -124,7 +124,7 @@ jobs:
           echo "::endgroup::"
         timeout-minutes: 20
       - name: Test (nextest)
-        if: runner.os != 'Linux'
+        if: runner.os != 'Linux' || github.event_name == 'pull_request'
         env:
           RUST_LOG: ${{ runner.debug && 'turso_core::storage=trace' || '' }}
           LOCAL_SYNC_SERVER: "../../target/debug/tursodb"
@@ -144,7 +144,7 @@ jobs:
           LOCAL_SYNC_SERVER: "../../target/debug/tursodb"
         run: cargo test --workspace --all-features --doc --locked --exclude memory-benchmark
       - name: Upload coverage report
-        if: runner.os == 'Linux'
+        if: runner.os == 'Linux' && github.event_name != 'pull_request'
         uses: actions/upload-artifact@v4
         with:
           name: coverage-report
