@@ -8,6 +8,7 @@ mod test_is_seek;
 mod test_multi_index_scan;
 mod test_read_path;
 mod test_vacuum;
+mod test_vacuum_into_mvcc;
 mod test_write_path;
 
 mod encryption;
