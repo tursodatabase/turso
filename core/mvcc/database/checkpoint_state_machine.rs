@@ -155,10 +155,10 @@ pub enum CheckpointState {
 pub(crate) enum CheckpointYieldPoint {
     BeforeAcquireLock,
     AfterDurableBoundaryAdvanced,
-    BeforeCollectTableRows,
     AfterCollectTableRows,
     BeforePagerCommit,
     BeforePublishWindow,
+    BeforeCollectTableRows,
 }
 
 #[cfg(any(test, injected_yields))]
