@@ -55,11 +55,10 @@ use crate::{
     types::{IOCompletions, IOResult},
     vdbe::{
         execute::{
-            OpAttachState, OpClearBtreeState, OpColumnState, OpDeleteState, OpDeleteSubState,
-            OpDestroyState, OpIdxInsertState, OpInitCdcVersionState, OpInsertState,
-            OpInsertSubState, OpJournalModeState, OpNewRowidState, OpNoConflictState,
-            OpParseSchemaState, OpProgramState, OpRowIdState, OpSeekState, OpTransactionState,
-            VacuumIntoOpContext,
+            OpAttachState, OpClearBtreeState, OpDeleteState, OpDeleteSubState, OpDestroyState,
+            OpIdxInsertState, OpInitCdcVersionState, OpInsertState, OpInsertSubState,
+            OpJournalModeState, OpNewRowidState, OpNoConflictState, OpParseSchemaState,
+            OpProgramState, OpRowIdState, OpSeekState, OpTransactionState, VacuumIntoOpContext,
         },
         hash_table::HashTable,
         metrics::StatementMetrics,
@@ -625,7 +624,8 @@ enum ActiveOpState {
     IdxInsert(OpIdxInsertState),
     Insert(OpInsertState),
     NoConflict(OpNoConflictState),
-    Column(OpColumnState),
+    /// An async instruction is paused for I/O.
+    AsyncInsn,
     RowId(OpRowIdState),
     Transaction(OpTransactionState),
     Attach(OpAttachState),
@@ -651,7 +651,7 @@ impl std::fmt::Debug for ActiveOpState {
             ActiveOpState::IdxInsert(_) => "IdxInsert",
             ActiveOpState::Insert(_) => "Insert",
             ActiveOpState::NoConflict(_) => "NoConflict",
-            ActiveOpState::Column(_) => "Column",
+            ActiveOpState::AsyncInsn => "AsyncInsn",
             ActiveOpState::RowId(_) => "RowId",
             ActiveOpState::Transaction(_) => "Transaction",
             ActiveOpState::Attach(_) => "Attach",
@@ -668,6 +668,8 @@ impl std::fmt::Debug for ActiveOpState {
 #[derive(Debug, Default)]
 struct ActiveOpStateSlot {
     state: ActiveOpState,
+    /// Runs the async instructions, allocated on first use.
+    async_insn: Option<execute::AsyncInsnRunner>,
 }
 
 macro_rules! active_state_accessor {
@@ -701,9 +703,49 @@ impl Default for ActiveOpState {
 
 impl ActiveOpStateSlot {
     fn clear(&mut self) {
-        if !matches!(self.state, ActiveOpState::None) {
-            self.state = ActiveOpState::None;
+        match self.state {
+            ActiveOpState::None => {}
+            ActiveOpState::AsyncInsn => {
+                if let Some(runner) = &mut self.async_insn {
+                    runner.cancel();
+                }
+                self.state = ActiveOpState::None;
+            }
+            _ => self.state = ActiveOpState::None,
         }
+    }
+
+    /// Takes the runner of the async instructions out of the slot for one
+    /// step, with a flag that is true when an instruction is paused in it.
+    /// The first call allocates the runner; later calls reuse it.
+    fn take_async_insn(&mut self) -> (execute::AsyncInsnRunner, bool) {
+        let active = match self.state {
+            ActiveOpState::None => false,
+            ActiveOpState::AsyncInsn => true,
+            ref state => unreachable!(
+                "active opcode state mismatch: expected AsyncInsn, got {:?}",
+                state
+            ),
+        };
+        let runner = self
+            .async_insn
+            .take()
+            .unwrap_or_else(execute::AsyncInsnRunner::new);
+        (runner, active)
+    }
+
+    /// Puts the runner back after a step. `active` is true when the
+    /// instruction paused for I/O, so the next step resumes it.
+    fn put_async_insn(&mut self, runner: execute::AsyncInsnRunner, active: bool) {
+        debug_assert!(self.async_insn.is_none());
+        std::mem::forget(self.async_insn.replace(runner));
+        let state = if active {
+            ActiveOpState::AsyncInsn
+        } else {
+            ActiveOpState::None
+        };
+        // The old state is None or AsyncInsn; neither owns anything.
+        std::mem::forget(std::mem::replace(&mut self.state, state));
     }
 
     /// True when no multi-step opcode is suspended. Hot opcodes use this to
@@ -783,7 +825,6 @@ impl ActiveOpStateSlot {
         OpNoConflictState,
         OpNoConflictState::Start
     );
-    active_state_accessor!(column, Column, OpColumnState, OpColumnState::Start);
     active_state_accessor!(row_id, RowId, OpRowIdState, OpRowIdState::Start);
     active_state_accessor!(
         transaction,
@@ -4124,8 +4165,8 @@ mod tests {
 
         assert!(matches!(state.active_op_state.state, ActiveOpState::None));
         assert!(matches!(
-            state.active_op_state.column(),
-            OpColumnState::Start
+            state.active_op_state.row_id(),
+            OpRowIdState::Start
         ));
         state.active_op_state.clear();
         assert!(state.active_op_state.parse_schema().is_none());
@@ -4154,7 +4195,7 @@ mod tests {
     #[test]
     fn active_opcode_helpers_reject_mismatched_resumes() {
         let mut state = ProgramState::new(1, 0);
-        *state.active_op_state.column() = OpColumnState::GetColumn;
+        *state.active_op_state.row_id() = OpRowIdState::GetRowid;
 
         let panic = catch_unwind(AssertUnwindSafe(|| {
             let _ = state.active_op_state.parse_schema();
