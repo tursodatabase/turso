@@ -201,6 +201,8 @@ struct BuildDirectoryInner {
     /// Atomic writes (`meta.json`, `.managed.json`): absorbed here so
     /// whole-index manifests never reach the B-tree.
     atomic: HashMap<PathBuf, ArcSlice<u8>>,
+    // Tantivy can convert typed I/O errors into strings. Remember allocation
+    // failures so write_error can still return OutOfMemory for this build.
     allocation_failed: bool,
 }
 
