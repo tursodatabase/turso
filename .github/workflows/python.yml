@@ -23,18 +23,7 @@ env:
   CC_x86_64_pc_windows_msvc: cl.exe
 
 jobs:
-  configure-strategy:
-    runs-on: blacksmith-4vcpu-ubuntu-2404
-    timeout-minutes: 30
-    outputs:
-      python-versions: ${{ steps.gen-matrix.outputs.python-versions }}
-    steps:
-      - id: gen-matrix
-        run: |
-          echo "python-versions=[\"3.10\",\"3.14\"]" >> $GITHUB_OUTPUT
-
   test:
-    needs: configure-strategy
     timeout-minutes: 30
     strategy:
       matrix:
@@ -42,7 +31,7 @@ jobs:
           - blacksmith-4vcpu-ubuntu-2404
           - blacksmith-6vcpu-macos-latest
           - blacksmith-4vcpu-windows-2025
-        python-version: ${{ fromJson(needs.configure-strategy.outputs.python-versions) }}
+        python-version: ["3.10", "3.14"]
     runs-on: ${{ matrix.os }}
 
     steps:
@@ -68,7 +57,7 @@ jobs:
 
 
       - name: Build Rust (debug)
-        run: cargo build --verbose --locked
+        run: cargo build -p turso_cli --bin tursodb --locked
 
       - name: Set up Python ${{ matrix.python-version }}
         uses: useblacksmith/setup-python@v6
@@ -97,28 +86,28 @@ jobs:
         if: runner.os != 'Windows'
         env:
           LOCAL_SYNC_SERVER: "../../target/debug/tursodb"
-        run: uv run pytest tests/test_database_sync.py
+        run: uv run pytest tests/test_database_sync.py --durations=10
 
       - name: Run Pytest (sync, async driver)
         working-directory: ${{ env.working-directory }}
         if: runner.os != 'Windows'
         env:
           LOCAL_SYNC_SERVER: "../../target/debug/tursodb"
-        run: uv run pytest tests/test_database_sync_aio.py
+        run: uv run pytest tests/test_database_sync_aio.py --durations=10
 
       - name: Run Pytest (windows, sync)
         working-directory: ${{ env.working-directory }}
         if: runner.os == 'Windows'
         env:
           LOCAL_SYNC_SERVER: "..\\..\\target\\debug\\tursodb.exe"
-        run: uv run pytest tests/test_database_sync.py
+        run: uv run pytest tests/test_database_sync.py --durations=10
 
       - name: Run Pytest (windows, sync, async driver)
         working-directory: ${{ env.working-directory }}
         if: runner.os == 'Windows'
         env:
           LOCAL_SYNC_SERVER: "..\\..\\target\\debug\\tursodb.exe"
-        run: uv run pytest tests/test_database_sync_aio.py
+        run: uv run pytest tests/test_database_sync_aio.py --durations=10
 
   lint:
     runs-on: blacksmith-4vcpu-ubuntu-2404

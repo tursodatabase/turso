@@ -78,7 +78,8 @@ def test_checkpoint():
         conn.commit()
         for i in range(1024):
             conn.execute(f"INSERT INTO t VALUES ({i})")
-            conn.commit()
+            if i % 4 == 3:
+                conn.commit()
         stats1 = conn.stats()
         conn.checkpoint()
         stats2 = conn.stats()
