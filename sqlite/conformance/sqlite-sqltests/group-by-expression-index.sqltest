@@ -99,3 +99,51 @@ expect {
     NULL|7
     1|2
 }
+
+setup nested_aggregate_indexes {
+    CREATE TABLE sort_input(a INTEGER, b TEXT, c INTEGER, d INTEGER);
+    CREATE INDEX sort_input_idx ON sort_input(d, a, b->>'x', c);
+
+    CREATE TABLE ordered_input(a INTEGER, b TEXT, c INTEGER, d INTEGER);
+    CREATE INDEX ordered_input_idx ON ordered_input(a, d, b->>'x', c);
+}
+
+# The index stores b->>'x'. The aggregate must read that value from the index,
+# even when the expression is inside CASE and GROUP BY uses a sorter.
+@setup nested_aggregate_indexes
+snapshot group-by-aggregate-reads-nested-index-expression {
+    SELECT a, sum(CASE WHEN b->>'x'=1 THEN c END)
+      FROM sort_input
+     WHERE d BETWEEN 0 AND 10
+     GROUP BY a;
+}
+
+# The same expression must come from the index when GROUP BY needs no sorter.
+@setup nested_aggregate_indexes
+snapshot ordered-group-by-aggregate-reads-nested-index-expression {
+    SELECT a, sum(CASE WHEN b->>'x'=1 THEN c END)
+      FROM ordered_input
+     WHERE d BETWEEN 0 AND 10
+     GROUP BY a;
+}
+
+@cross-check-integrity
+test group-by-reads-direct-column-and-nested-index-expression {
+    CREATE TABLE mixed_input(a INTEGER, b TEXT, c INTEGER, d INTEGER);
+    CREATE INDEX mixed_input_idx ON mixed_input(d, a, b->>'x', c);
+    INSERT INTO mixed_input VALUES
+        (1, '{"x":1}', 12, 3),
+        (1, '{"x":2}', 4, 5),
+        (2, '{"x":1}', 22, 3);
+
+    SELECT a, b, coalesce(sum(CASE WHEN b->>'x'=1 THEN c END), -1)
+      FROM mixed_input INDEXED BY mixed_input_idx
+     WHERE d BETWEEN 0 AND 10
+     GROUP BY a, b
+     ORDER BY a, b;
+}
+expect {
+    1|{"x":1}|12
+    1|{"x":2}|-1
+    2|{"x":1}|22
+}
