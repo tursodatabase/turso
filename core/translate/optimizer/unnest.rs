@@ -98,10 +98,13 @@
 //!   `count` returns 0 and `sum` returns NULL. An extension aggregate may return
 //!   something else, and this code does not know which value to use.
 //!
-//! The code only moves direct `=` checks between an inner and outer column. Other
-//! forms stay as subqueries. `NOT IN` also stays as a subquery because NULL values
-//! can change its result. A one-value subquery stays as it is unless its result for
-//! an empty input is known.
+//! The `EXISTS`, `NOT EXISTS`, and direct positive `IN` rewrites can move
+//! comparisons between inner and outer expressions.
+//! They keep an inner `WHERE` expression in the subquery if it can fail.
+//! A join can skip a row that the subquery tests and hide an error.
+//! Aggregate rewrites only move direct `=` checks between inner and outer columns.
+//! `NOT IN` stays as a subquery because NULL values can change its result.
+//! A one-value subquery stays as it is unless its result for an empty input is known.
 //!
 //! References:
 //! - SQLite subquery results: https://sqlite.org/lang_expr.html#subquery_expressions
@@ -306,10 +309,6 @@ fn try_rewrite_in(
     if inner_plan.result_columns.len() != 1
         || expression_can_fail_on_input(&left)
         || expression_can_fail_on_input(&right)
-        || inner_plan
-            .where_clause
-            .iter()
-            .any(|term| expression_can_fail_on_input(&term.expr))
     {
         return Ok(false);
     }
@@ -1295,7 +1294,9 @@ fn can_rewrite_as_semi_join(plan: &SelectPlan, resolver: &Resolver<'_>) -> Resul
     }
 
     for term in &plan.where_clause {
-        if expr_contains_nondeterministic_scalar_function(&term.expr, resolver)? {
+        if expression_can_fail_on_input(&term.expr)
+            || expr_contains_nondeterministic_scalar_function(&term.expr, resolver)?
+        {
             return Ok(false);
         }
     }
@@ -1395,40 +1396,43 @@ fn can_move_join_term(
         return true;
     }
 
-    is_inner_outer_equal_check(expr, outer_table_ids, inner_table_ids)
+    is_inner_outer_comparison(expr, outer_table_ids, inner_table_ids)
 }
 
-/// One side of an `=` check may use inner tables and the other may use outer tables.
-fn is_inner_outer_equal_check(
+/// One side of a comparison may use inner tables and the other may use outer tables.
+fn is_inner_outer_comparison(
     expr: &Expr,
     outer_table_ids: &[TableInternalId],
     inner_table_ids: &[TableInternalId],
 ) -> bool {
-    if let Expr::Binary(left, ast::Operator::Equals, right) = expr {
-        let left_tables = collect_table_refs(left);
-        let right_tables = collect_table_refs(right);
-
-        let left_is_outer = left_tables
-            .iter()
-            .all(|table| outer_table_ids.contains(table))
-            && !left_tables.is_empty();
-        let left_is_inner = left_tables
-            .iter()
-            .all(|table| inner_table_ids.contains(table))
-            && !left_tables.is_empty();
-        let right_is_outer = right_tables
-            .iter()
-            .all(|table| outer_table_ids.contains(table))
-            && !right_tables.is_empty();
-        let right_is_inner = right_tables
-            .iter()
-            .all(|table| inner_table_ids.contains(table))
-            && !right_tables.is_empty();
-
-        (left_is_outer && right_is_inner) || (left_is_inner && right_is_outer)
-    } else {
-        false
+    let Expr::Binary(left, operator, right) = expr else {
+        return false;
+    };
+    if !operator.is_comparison() {
+        return false;
     }
+
+    let left_tables = collect_table_refs(left);
+    let right_tables = collect_table_refs(right);
+
+    let left_is_outer = left_tables
+        .iter()
+        .all(|table| outer_table_ids.contains(table))
+        && !left_tables.is_empty();
+    let left_is_inner = left_tables
+        .iter()
+        .all(|table| inner_table_ids.contains(table))
+        && !left_tables.is_empty();
+    let right_is_outer = right_tables
+        .iter()
+        .all(|table| outer_table_ids.contains(table))
+        && !right_tables.is_empty();
+    let right_is_inner = right_tables
+        .iter()
+        .all(|table| inner_table_ids.contains(table))
+        && !right_tables.is_empty();
+
+    (left_is_outer && right_is_inner) || (left_is_inner && right_is_outer)
 }
 
 /// Return each table used by an expression.
