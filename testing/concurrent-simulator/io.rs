@@ -1,5 +1,5 @@
 use memmap2::{MmapMut, MmapOptions};
-use rand::{Rng, RngCore};
+use rand::{Rng, RngExt};
 use rand_chacha::ChaCha8Rng;
 use std::collections::{HashMap, HashSet};
 use std::fs::{File as StdFile, OpenOptions};

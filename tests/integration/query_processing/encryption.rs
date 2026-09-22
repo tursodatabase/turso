@@ -2,7 +2,7 @@ use crate::common::{
     do_flush, run_query, run_query_on_row, ExecRows, TempDatabase, TempDatabaseBuilder,
 };
 use asserting::prelude::*;
-use rand::{rng, RngCore};
+use rand::{rng, Rng};
 use std::sync::Arc;
 use turso_core::SqliteDialect;
 use turso_core::{

@@ -1,6 +1,6 @@
 use std::sync::{Arc, Mutex};
 
-use rand::Rng;
+use rand::RngExt;
 use sql_generation::model::table::SimValue;
 use tracing::instrument;
 use turso_core::{Connection, LimboError, Result, Value};

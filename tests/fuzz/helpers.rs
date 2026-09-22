@@ -2,7 +2,7 @@ use core_tester::common::{
     limbo_exec_rows, maybe_setup_tracing, rng_from_time_or_env, sqlite_exec_rows, TempDatabase,
     TempDatabaseBuilder,
 };
-use rand::Rng;
+use rand::RngExt;
 use rand_chacha::ChaCha8Rng;
 use rusqlite::params;
 use std::sync::Arc;

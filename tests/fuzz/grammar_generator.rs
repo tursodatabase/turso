@@ -16,7 +16,7 @@
 /// we can randomly sample strings from this generator easily.
 use std::{cell::RefCell, collections::HashMap, ops::Range, rc::Rc};
 
-use rand::Rng;
+use rand::RngExt;
 use rand_chacha::ChaCha8Rng;
 
 #[derive(Clone, Debug)]

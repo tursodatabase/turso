@@ -1155,7 +1155,7 @@ mod tests {
     use crate::util::IOExt;
     use crate::PlatformIO;
     use rand_chacha::{
-        rand_core::{RngCore, SeedableRng},
+        rand_core::{Rng, SeedableRng},
         ChaCha8Rng,
     };
 
@@ -1508,7 +1508,7 @@ mod tests {
         }
     }
 
-    fn generate_value_types<R: RngCore>(rng: &mut R, num_values: usize) -> Vec<ValueType> {
+    fn generate_value_types<R: Rng>(rng: &mut R, num_values: usize) -> Vec<ValueType> {
         let mut value_types = <Vec<ValueType> as TursoVecExt<ValueType>>::with_capacity(num_values);
 
         for _ in 0..num_values {
@@ -1525,7 +1525,7 @@ mod tests {
         value_types
     }
 
-    fn generate_values<R: RngCore>(rng: &mut R, value_types: &[ValueType]) -> Vec<Value> {
+    fn generate_values<R: Rng>(rng: &mut R, value_types: &[ValueType]) -> Vec<Value> {
         let mut values = <Vec<Value> as TursoVecExt<Value>>::with_capacity(value_types.len());
         for value_type in value_types {
             let value = match value_type {

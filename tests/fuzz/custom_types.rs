@@ -17,7 +17,7 @@ mod tests {
     use core_tester::common::{
         limbo_exec_rows_fallible, maybe_setup_tracing, rng_from_time_or_env, TempDatabase,
     };
-    use rand::Rng;
+    use rand::RngExt;
     use rusqlite::types::Value;
     use std::collections::HashSet;
 
@@ -25,7 +25,7 @@ mod tests {
     const LABELS: [&str; 4] = ["alpha", "beta", "gamma", "delta"];
 
     /// Generate a random numeric(10,2) value as a string.
-    fn random_numeric(rng: &mut impl Rng) -> String {
+    fn random_numeric(rng: &mut impl RngExt) -> String {
         let val: f64 = rng.random_range(-9999999.99..=9999999.99);
         format!("{val:.2}")
     }
@@ -346,7 +346,7 @@ mod tests {
         fn repopulate_t4(
             db: &TempDatabase,
             conn: &std::sync::Arc<turso_core::Connection>,
-            rng: &mut impl Rng,
+            rng: &mut impl RngExt,
             t4_size: usize,
         ) {
             limbo_exec_rows_fallible(db, conn, "DELETE FROM t4").unwrap();

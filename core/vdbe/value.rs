@@ -1810,7 +1810,7 @@ mod tests {
     use crate::types::Value;
     use crate::vdbe::Register;
 
-    use rand::{Rng, RngCore};
+    use rand::{Rng, RngExt};
 
     fn blob(bytes: &[u8]) -> Value {
         Value::from_slice(bytes).expect(crate::alloc::ALLOC_ERR_MSG)

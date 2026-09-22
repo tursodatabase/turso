@@ -5,7 +5,7 @@
 //! That shape is meant to exercise page-number reassignment during
 //! `balance_non_root`, especially when a small page size makes splits frequent.
 
-use rand::Rng;
+use rand::RngExt;
 use rand_chacha::ChaCha8Rng;
 use std::sync::atomic::{AtomicI64, Ordering};
 use turso_core::LimboError;

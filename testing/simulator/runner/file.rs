@@ -4,7 +4,7 @@ use std::{
     sync::Arc,
 };
 
-use rand::Rng as _;
+use rand::RngExt as _;
 use rand_chacha::ChaCha8Rng;
 use tracing::{Level, instrument};
 use turso_core::{File, Result};

@@ -8,7 +8,7 @@ use crate::{
 pub struct LikeValue(pub SimValue);
 
 impl ArbitraryFromMaybe<&SimValue> for LikeValue {
-    fn arbitrary_from_maybe<R: rand::Rng + ?Sized, C: GenerationContext>(
+    fn arbitrary_from_maybe<R: rand::RngExt + ?Sized, C: GenerationContext>(
         rng: &mut R,
         _context: &C,
         value: &SimValue,

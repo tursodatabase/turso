@@ -26,7 +26,7 @@ pub(super) trait WeightedDistribution {
     type GenItem;
     fn items(&self) -> &[Self::Item];
     fn weights(&self) -> &WeightedIndex<u32>;
-    fn sample<R: rand::Rng + ?Sized, C: GenerationContext>(
+    fn sample<R: rand::RngExt + ?Sized, C: GenerationContext>(
         &self,
         rng: &mut R,
         context: &C,

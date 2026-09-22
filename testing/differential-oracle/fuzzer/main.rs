@@ -9,7 +9,7 @@ use std::path::PathBuf;
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 use differential_fuzzer::{Fuzzer, GeneratorKind, SimConfig, TreeMode, WeightProfile};
-use rand::RngCore;
+use rand::Rng;
 use serde::Serialize;
 
 /// SQLancer-style differential testing fuzzer for Turso.

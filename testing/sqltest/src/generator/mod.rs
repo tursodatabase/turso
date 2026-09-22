@@ -12,7 +12,7 @@ use fake::faker::address::en::{CityName, StateAbbr, StreetName, ZipCode};
 use fake::faker::internet::en::SafeEmail;
 use fake::faker::name::en::{FirstName, LastName};
 use fake::faker::phone_number::en::PhoneNumber;
-use rand::Rng;
+use rand::RngExt;
 use rand::SeedableRng;
 use rand_chacha::ChaCha8Rng;
 use std::path::{Path, PathBuf};
@@ -117,7 +117,7 @@ pub struct Product {
 }
 
 impl Product {
-    fn new(name: &str, rng: &mut impl Rng) -> Self {
+    fn new(name: &str, rng: &mut impl RngExt) -> Self {
         Self {
             name: name.to_string(),
             price: rng.random_range(1.0..=100.0),

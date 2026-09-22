@@ -1,6 +1,6 @@
 use anyhow::{Result, ensure};
 use clap::ValueEnum;
-use rand::{RngCore, SeedableRng, rngs::StdRng};
+use rand::{Rng, SeedableRng, rngs::StdRng};
 use serde::Serialize;
 use std::fmt::Write;
 use std::sync::Arc;

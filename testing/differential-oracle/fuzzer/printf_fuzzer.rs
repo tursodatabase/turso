@@ -12,7 +12,7 @@ use clap::{Parser, Subcommand};
 use differential_fuzzer::memory::MemorySimIO;
 use differential_fuzzer::oracle::{DifferentialOracle, QueryResult, Row};
 use differential_fuzzer::printf_gen::{EDGE_CASE_BATTERY, PrintfGenerator};
-use rand::RngCore;
+use rand::Rng;
 use rand::SeedableRng;
 use rand_chacha::ChaCha8Rng;
 use sql_gen_prop::SqlValue;

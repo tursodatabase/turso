@@ -5,7 +5,7 @@ use std::{
     sync::Arc,
 };
 
-use rand::{seq::SliceRandom, RngCore, SeedableRng};
+use rand::{seq::SliceRandom, Rng, SeedableRng};
 use rand_chacha::ChaCha8Rng;
 use turso_core::{Buffer, Completion, File, OpenFlags, PlatformIO, IO};
 use zerocopy::big_endian::{U16, U32, U64};

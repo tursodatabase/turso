@@ -5,7 +5,7 @@
 //! transactions worked on same rows, the later one receives a conflict
 //! error and must roll back and retry.
 
-use rand::Rng;
+use rand::RngExt;
 use tempfile::NamedTempFile;
 use turso::{Builder, Error};
 

@@ -3,7 +3,7 @@ mod savepoint_tests {
     use std::panic::AssertUnwindSafe;
 
     use rand::seq::IndexedRandom;
-    use rand::Rng;
+    use rand::RngExt;
     use rand_chacha::ChaCha8Rng;
     use rusqlite::params;
 

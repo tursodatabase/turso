@@ -944,7 +944,7 @@ mod tests {
     use crate::storage::pager::{Page, PageRef};
     use crate::sync::Arc;
     use rand_chacha::{
-        rand_core::{RngCore, SeedableRng},
+        rand_core::{Rng, SeedableRng},
         ChaCha8Rng,
     };
 

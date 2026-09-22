@@ -9,7 +9,7 @@ use turso_core::SqliteDialect;
 
 use bitmaps::Bitmap;
 use garde::Validate;
-use rand::{Rng, SeedableRng};
+use rand::{RngExt, SeedableRng};
 use rand_chacha::ChaCha8Rng;
 use sql_generation::generation::GenerationContext;
 use sql_generation::generation::generated_expr::rename_column_refs_in_expr;
@@ -1367,7 +1367,7 @@ impl SimulatorEnv {
             .collect()
     }
 
-    pub fn choose_conn(&self, rng: &mut impl Rng) -> usize {
+    pub fn choose_conn(&self, rng: &mut impl RngExt) -> usize {
         rng.random_range(0..self.connections.len())
     }
 

@@ -137,7 +137,7 @@ impl AtomicSlotBitmap {
 #[cfg(test)]
 pub mod tests {
     use super::*;
-    use rand::{rngs::StdRng, Rng, SeedableRng};
+    use rand::{rngs::StdRng, RngExt, SeedableRng};
 
     fn atomic_free_vec(ab: &AtomicSlotBitmap) -> Vec<bool> {
         (0..ab.n_slots).map(|i| ab.is_free(i)).collect()

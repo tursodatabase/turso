@@ -175,7 +175,7 @@ impl RowSet {
 mod tests {
     use super::*;
     use rand_chacha::{
-        rand_core::{RngCore, SeedableRng},
+        rand_core::{Rng, SeedableRng},
         ChaCha8Rng,
     };
 

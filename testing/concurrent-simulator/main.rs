@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use clap::{Parser, Subcommand, ValueEnum};
-use rand::{Rng, RngCore};
+use rand::{Rng, RngExt};
 use tracing_subscriber::{EnvFilter, layer::SubscriberExt, util::SubscriberInitExt};
 #[cfg(all(any(unix, target_os = "windows"), target_pointer_width = "64"))]
 use turso_whopper::multiprocess::{MultiprocessOpts, MultiprocessWhopper};

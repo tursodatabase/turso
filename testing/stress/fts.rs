@@ -1,4 +1,4 @@
-use rand::Rng;
+use rand::RngExt;
 use turso_stress::ThreadId;
 
 use crate::{conn::StressConn, sql_logging::SqlLogger, ThreadRng};

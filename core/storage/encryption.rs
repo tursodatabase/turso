@@ -1096,7 +1096,7 @@ mod tests {
     use crate::storage::sqlite3_ondisk::DatabaseHeader;
 
     use super::*;
-    use rand::Rng;
+    use rand::RngExt;
     const DEFAULT_ENCRYPTED_PAGE_SIZE: usize = 4096;
 
     macro_rules! test_cipher_wrapper {

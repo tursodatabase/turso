@@ -1,5 +1,5 @@
 use crate::common::{do_flush, run_query, run_query_on_row, TempDatabase};
-use rand::{rng, RngCore};
+use rand::{rng, Rng};
 use turso_core::Row;
 
 #[test]

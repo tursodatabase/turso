@@ -6,7 +6,7 @@ use crate::{
     },
 };
 use rand::{
-    Rng,
+    RngExt,
     distr::{Distribution, weighted::WeightedIndex},
     seq::IndexedRandom,
 };
@@ -23,7 +23,10 @@ use sql_generation::{
     },
 };
 
-fn random_create<R: rand::Rng + ?Sized>(rng: &mut R, conn_ctx: &impl GenerationContext) -> Query {
+fn random_create<R: rand::RngExt + ?Sized>(
+    rng: &mut R,
+    conn_ctx: &impl GenerationContext,
+) -> Query {
     let mut create = Create::arbitrary(rng, conn_ctx);
     while conn_ctx
         .tables()
@@ -35,7 +38,10 @@ fn random_create<R: rand::Rng + ?Sized>(rng: &mut R, conn_ctx: &impl GenerationC
     Query::Create(create)
 }
 
-fn random_select<R: rand::Rng + ?Sized>(rng: &mut R, conn_ctx: &impl GenerationContext) -> Query {
+fn random_select<R: rand::RngExt + ?Sized>(
+    rng: &mut R,
+    conn_ctx: &impl GenerationContext,
+) -> Query {
     if !conn_ctx.tables().is_empty() && rng.random_bool(0.7) {
         Query::Select(Select::arbitrary(rng, conn_ctx))
     } else {
@@ -44,27 +50,36 @@ fn random_select<R: rand::Rng + ?Sized>(rng: &mut R, conn_ctx: &impl GenerationC
     }
 }
 
-fn random_insert<R: rand::Rng + ?Sized>(rng: &mut R, conn_ctx: &impl GenerationContext) -> Query {
+fn random_insert<R: rand::RngExt + ?Sized>(
+    rng: &mut R,
+    conn_ctx: &impl GenerationContext,
+) -> Query {
     assert!(!conn_ctx.tables().is_empty());
     Query::Insert(Insert::arbitrary(rng, conn_ctx))
 }
 
-fn random_delete<R: rand::Rng + ?Sized>(rng: &mut R, conn_ctx: &impl GenerationContext) -> Query {
+fn random_delete<R: rand::RngExt + ?Sized>(
+    rng: &mut R,
+    conn_ctx: &impl GenerationContext,
+) -> Query {
     assert!(!conn_ctx.tables().is_empty());
     Query::Delete(Delete::arbitrary(rng, conn_ctx))
 }
 
-fn random_update<R: rand::Rng + ?Sized>(rng: &mut R, conn_ctx: &impl GenerationContext) -> Query {
+fn random_update<R: rand::RngExt + ?Sized>(
+    rng: &mut R,
+    conn_ctx: &impl GenerationContext,
+) -> Query {
     assert!(!conn_ctx.tables().is_empty());
     Query::Update(Update::arbitrary(rng, conn_ctx))
 }
 
-fn random_drop<R: rand::Rng + ?Sized>(rng: &mut R, conn_ctx: &impl GenerationContext) -> Query {
+fn random_drop<R: rand::RngExt + ?Sized>(rng: &mut R, conn_ctx: &impl GenerationContext) -> Query {
     assert!(!conn_ctx.tables().is_empty());
     Query::Drop(sql_generation::model::query::Drop::arbitrary(rng, conn_ctx))
 }
 
-fn random_create_index<R: rand::Rng + ?Sized>(
+fn random_create_index<R: rand::RngExt + ?Sized>(
     rng: &mut R,
     conn_ctx: &impl GenerationContext,
 ) -> Query {
@@ -86,7 +101,7 @@ fn random_create_index<R: rand::Rng + ?Sized>(
     Query::CreateIndex(create_index)
 }
 
-fn random_pragma<R: rand::Rng + ?Sized>(
+fn random_pragma<R: rand::RngExt + ?Sized>(
     rng: &mut R,
     conn_ctx: &impl GenerationContext,
     allow_checkpoints: bool,
@@ -124,7 +139,7 @@ fn random_pragma<R: rand::Rng + ?Sized>(
     Query::Pragma(Pragma::AutoVacuumMode(mode.clone()))
 }
 
-fn random_alter_table<R: rand::Rng + ?Sized>(
+fn random_alter_table<R: rand::RngExt + ?Sized>(
     rng: &mut R,
     conn_ctx: &impl GenerationContext,
 ) -> Query {
@@ -132,7 +147,7 @@ fn random_alter_table<R: rand::Rng + ?Sized>(
     Query::AlterTable(AlterTable::arbitrary(rng, conn_ctx))
 }
 
-fn random_drop_index<R: rand::Rng + ?Sized>(
+fn random_drop_index<R: rand::RngExt + ?Sized>(
     rng: &mut R,
     conn_ctx: &impl GenerationContext,
 ) -> Query {
@@ -145,7 +160,7 @@ fn random_drop_index<R: rand::Rng + ?Sized>(
     Query::DropIndex(DropIndex::arbitrary(rng, conn_ctx))
 }
 
-fn random_create_sequence<R: rand::Rng + ?Sized>(rng: &mut R) -> Query {
+fn random_create_sequence<R: rand::RngExt + ?Sized>(rng: &mut R) -> Query {
     let name = format!("seq_{}", rng.random_range(0..10000u32));
     let increment = *[1i64, 2, 5, 10, -1, -2, -5].choose(rng).unwrap();
     let cycle = rng.random_bool(0.1);
@@ -164,19 +179,19 @@ fn random_create_sequence<R: rand::Rng + ?Sized>(rng: &mut R) -> Query {
     })
 }
 
-fn random_nextval<R: rand::Rng + ?Sized>(rng: &mut R, sequence_names: &[String]) -> Query {
+fn random_nextval<R: rand::RngExt + ?Sized>(rng: &mut R, sequence_names: &[String]) -> Query {
     assert!(!sequence_names.is_empty());
     let name = sequence_names.choose(rng).unwrap().clone();
     Query::Nextval(Nextval { name })
 }
 
-fn random_drop_sequence<R: rand::Rng + ?Sized>(rng: &mut R, sequence_names: &[String]) -> Query {
+fn random_drop_sequence<R: rand::RngExt + ?Sized>(rng: &mut R, sequence_names: &[String]) -> Query {
     assert!(!sequence_names.is_empty());
     let name = sequence_names.choose(rng).unwrap().clone();
     Query::DropSequence(DropSequence { name })
 }
 
-fn random_setval<R: rand::Rng + ?Sized>(
+fn random_setval<R: rand::RngExt + ?Sized>(
     rng: &mut R,
     sequence_info: &[(String, i64, i64)],
 ) -> Query {
@@ -211,7 +226,7 @@ type QueryGenFunc<R, G> = fn(&mut R, &G) -> Query;
 impl QueryDiscriminants {
     fn gen_function<R, G>(&self) -> Option<QueryGenFunc<R, G>>
     where
-        R: rand::Rng + ?Sized,
+        R: rand::RngExt + ?Sized,
         G: GenerationContext,
     {
         match self {
@@ -327,7 +342,7 @@ impl WeightedDistribution for QueryDistribution {
         &self.weights
     }
 
-    fn sample<R: rand::Rng + ?Sized, C: GenerationContext>(
+    fn sample<R: rand::RngExt + ?Sized, C: GenerationContext>(
         &self,
         rng: &mut R,
         ctx: &C,
@@ -367,7 +382,7 @@ impl WeightedDistribution for QueryDistribution {
 }
 
 impl ArbitraryFrom<&QueryDistribution> for Query {
-    fn arbitrary_from<R: Rng + ?Sized, C: GenerationContext>(
+    fn arbitrary_from<R: RngExt + ?Sized, C: GenerationContext>(
         rng: &mut R,
         context: &C,
         query_distr: &QueryDistribution,

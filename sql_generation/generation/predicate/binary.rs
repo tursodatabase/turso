@@ -35,7 +35,7 @@ fn qualified_column_expr(table_name: &str, column_name: &str) -> Expr {
 
 impl Predicate {
     /// Produces a true [ast::Expr::Binary] [Predicate] that is true for the provided row in the given table
-    pub fn true_binary<R: rand::Rng + ?Sized, C: GenerationContext>(
+    pub fn true_binary<R: rand::RngExt + ?Sized, C: GenerationContext>(
         rng: &mut R,
         context: &C,
         t: &Table,
@@ -147,7 +147,7 @@ impl Predicate {
     }
 
     /// Produces an [ast::Expr::Binary] [Predicate] that is false for the provided row in the given table
-    pub fn false_binary<R: rand::Rng + ?Sized, C: GenerationContext>(
+    pub fn false_binary<R: rand::RngExt + ?Sized, C: GenerationContext>(
         rng: &mut R,
         context: &C,
         t: &Table,
@@ -237,7 +237,7 @@ impl Predicate {
 
 impl SimplePredicate {
     /// Generates a true [ast::Expr::Binary] [SimplePredicate] from a [TableContext] for a row in the table
-    pub fn true_binary<R: rand::Rng + ?Sized, C: GenerationContext, T: TableContext>(
+    pub fn true_binary<R: rand::RngExt + ?Sized, C: GenerationContext, T: TableContext>(
         rng: &mut R,
         context: &C,
         table: &T,
@@ -305,7 +305,7 @@ impl SimplePredicate {
     }
 
     /// Generates a false [ast::Expr::Binary] [SimplePredicate] from a [TableContext] for a row in the table
-    pub fn false_binary<R: rand::Rng + ?Sized, C: GenerationContext, T: TableContext>(
+    pub fn false_binary<R: rand::RngExt + ?Sized, C: GenerationContext, T: TableContext>(
         rng: &mut R,
         context: &C,
         table: &T,
@@ -368,7 +368,7 @@ impl CompoundPredicate {
     /// Decide if you want to create an AND or an OR
     ///
     /// Creates a Compound Predicate that is TRUE or FALSE for at least a single row
-    pub fn from_table_binary<R: rand::Rng + ?Sized, C: GenerationContext, T: TableContext>(
+    pub fn from_table_binary<R: rand::RngExt + ?Sized, C: GenerationContext, T: TableContext>(
         rng: &mut R,
         context: &C,
         table: &T,
@@ -468,7 +468,7 @@ impl CompoundPredicate {
 
 #[cfg(test)]
 mod tests {
-    use rand::{Rng as _, SeedableRng as _};
+    use rand::{RngExt as _, SeedableRng as _};
     use rand_chacha::ChaCha8Rng;
 
     use crate::{

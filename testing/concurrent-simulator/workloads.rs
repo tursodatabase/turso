@@ -1,6 +1,6 @@
 //! Workload definitions for the simulator.
 
-use rand::{Rng, seq::IndexedRandom};
+use rand::{RngExt, seq::IndexedRandom};
 use rand_chacha::ChaCha8Rng;
 use sql_generation::{
     generation::{Arbitrary, GenerationContext, Opts},
@@ -874,7 +874,7 @@ const FTS_SIM_MAX_ID: i64 = 400;
 fn fts_sim_body(rng: &mut ChaCha8Rng) -> String {
     let count = rng.random_range(1..=4);
     FTS_SIM_TOKENS
-        .choose_multiple(rng, count)
+        .sample(rng, count)
         .copied()
         .collect::<Vec<_>>()
         .join(" ")

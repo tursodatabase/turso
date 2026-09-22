@@ -8,7 +8,7 @@ use std::sync::{
 
 use indexmap::IndexMap;
 use parking_lot::Mutex;
-use rand::{Rng, RngCore, SeedableRng};
+use rand::{Rng, RngExt, SeedableRng};
 use rand_chacha::ChaCha8Rng;
 use turso_core::{
     Clock, Completion, CompletionError, IO, LimboError, MonotonicInstant, OpenFlags, Result,

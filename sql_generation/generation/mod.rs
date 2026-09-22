@@ -1,7 +1,7 @@
 use std::{iter::Sum, ops::SubAssign};
 
 use anarchist_readable_name_generator_lib::readable_name_custom;
-use rand::{distr::uniform::SampleUniform, Rng};
+use rand::{distr::uniform::SampleUniform, RngExt};
 
 pub mod expr;
 pub mod generated_expr;
@@ -21,7 +21,7 @@ type Choice<'a, R, T> = (usize, Box<dyn Fn(&mut R) -> Option<T> + 'a>);
 /// the possible values of the type, with a bias towards smaller values for
 /// practicality.
 pub trait Arbitrary {
-    fn arbitrary<R: Rng + ?Sized, C: GenerationContext>(rng: &mut R, context: &C) -> Self;
+    fn arbitrary<R: RngExt + ?Sized, C: GenerationContext>(rng: &mut R, context: &C) -> Self;
 }
 
 /// ArbitrarySized trait for generating random values of a specific size
@@ -31,7 +31,7 @@ pub trait Arbitrary {
 /// must fit in the given size. This is useful for generating values that are
 /// constrained by a specific size, such as integers or strings.
 pub trait ArbitrarySized {
-    fn arbitrary_sized<R: Rng + ?Sized, C: GenerationContext>(
+    fn arbitrary_sized<R: RngExt + ?Sized, C: GenerationContext>(
         rng: &mut R,
         context: &C,
         size: usize,
@@ -44,7 +44,7 @@ pub trait ArbitrarySized {
 /// such as generating an integer within an interval, or a value that fits in a table,
 /// or a predicate satisfying a given table row.
 pub trait ArbitraryFrom<T> {
-    fn arbitrary_from<R: Rng + ?Sized, C: GenerationContext>(
+    fn arbitrary_from<R: RngExt + ?Sized, C: GenerationContext>(
         rng: &mut R,
         context: &C,
         t: T,
@@ -60,7 +60,7 @@ pub trait ArbitraryFrom<T> {
 /// This is useful for generating values that are constrained by a specific size,
 /// such as integers or strings, while still being dependent on the given value.
 pub trait ArbitrarySizedFrom<T> {
-    fn arbitrary_sized_from<R: Rng + ?Sized, C: GenerationContext>(
+    fn arbitrary_sized_from<R: RngExt + ?Sized, C: GenerationContext>(
         rng: &mut R,
         context: &C,
         t: T,
@@ -70,7 +70,7 @@ pub trait ArbitrarySizedFrom<T> {
 
 /// ArbitraryFromMaybe trait for fallibally generating random values from a given value
 pub trait ArbitraryFromMaybe<T> {
-    fn arbitrary_from_maybe<R: Rng + ?Sized, C: GenerationContext>(
+    fn arbitrary_from_maybe<R: RngExt + ?Sized, C: GenerationContext>(
         rng: &mut R,
         context: &C,
         t: T,
@@ -88,7 +88,7 @@ pub trait ArbitraryFromMaybe<T> {
 //       should be enough for our purposes.
 pub fn frequency<
     T,
-    R: Rng + ?Sized,
+    R: RngExt + ?Sized,
     N: Sum + PartialOrd + Copy + Default + SampleUniform + SubAssign,
 >(
     choices: Vec<(N, ArbitraryFromFunc<R, T>)>,
@@ -108,7 +108,7 @@ pub fn frequency<
 }
 
 /// one_of is a helper function for composing different generators with equal probability of occurrence.
-pub fn one_of<T, R: Rng + ?Sized>(choices: Vec<ArbitraryFromFunc<R, T>>, rng: &mut R) -> T {
+pub fn one_of<T, R: RngExt + ?Sized>(choices: Vec<ArbitraryFromFunc<R, T>>, rng: &mut R) -> T {
     let index = rng.random_range(0..choices.len());
     choices[index](rng)
 }
@@ -116,7 +116,7 @@ pub fn one_of<T, R: Rng + ?Sized>(choices: Vec<ArbitraryFromFunc<R, T>>, rng: &m
 /// backtrack is a helper function for composing different "failable" generators.
 /// The function takes a list of functions that return an Option<T>, along with number of retries
 /// to make before giving up.
-pub fn backtrack<T, R: Rng + ?Sized>(mut choices: Vec<Choice<R, T>>, rng: &mut R) -> Option<T> {
+pub fn backtrack<T, R: RngExt + ?Sized>(mut choices: Vec<Choice<R, T>>, rng: &mut R) -> Option<T> {
     loop {
         // If there are no more choices left, we give up
         let choices_ = choices
@@ -142,20 +142,20 @@ pub fn backtrack<T, R: Rng + ?Sized>(mut choices: Vec<Choice<R, T>>, rng: &mut R
 }
 
 /// pick is a helper function for uniformly picking a random element from a slice
-pub fn pick<'a, T, R: Rng + ?Sized>(choices: &'a [T], rng: &mut R) -> &'a T {
+pub fn pick<'a, T, R: RngExt + ?Sized>(choices: &'a [T], rng: &mut R) -> &'a T {
     let index = rng.random_range(0..choices.len());
     &choices[index]
 }
 
 /// pick_index is typically used for picking an index from a slice to later refer to the element
 /// at that index.
-pub fn pick_index<R: Rng + ?Sized>(choices: usize, rng: &mut R) -> usize {
+pub fn pick_index<R: RngExt + ?Sized>(choices: usize, rng: &mut R) -> usize {
     rng.random_range(0..choices)
 }
 
 /// pick_n_unique is a helper function for uniformly picking N unique elements from a range.
 /// The elements themselves are usize, typically representing indices.
-pub fn pick_n_unique<R: Rng + ?Sized>(
+pub fn pick_n_unique<R: RngExt + ?Sized>(
     range: std::ops::Range<usize>,
     n: usize,
     rng: &mut R,
@@ -168,7 +168,7 @@ pub fn pick_n_unique<R: Rng + ?Sized>(
 
 /// gen_random_text uses `anarchist_readable_name_generator_lib` to generate random
 /// readable names for tables, columns, text values etc.
-pub fn gen_random_text<R: Rng + ?Sized>(rng: &mut R) -> String {
+pub fn gen_random_text<R: RngExt + ?Sized>(rng: &mut R) -> String {
     let big_text = rng.random_ratio(1, 1000);
     if big_text {
         // let max_size: u64 = 2 * 1024 * 1024 * 1024;
@@ -180,13 +180,32 @@ pub fn gen_random_text<R: Rng + ?Sized>(rng: &mut R) -> String {
         }
         name
     } else {
-        let name = readable_name_custom("_", rng);
-        name.replace("-", "_")
+        gen_readable_name(rng)
+    }
+}
+
+pub fn gen_readable_name<R: rand::Rng + ?Sized>(rng: &mut R) -> String {
+    readable_name_custom("_", Rand09Rng(rng)).replace("-", "_")
+}
+
+struct Rand09Rng<'a, R: ?Sized>(&'a mut R);
+
+impl<R: rand::Rng + ?Sized> rand_core_09::RngCore for Rand09Rng<'_, R> {
+    fn next_u32(&mut self) -> u32 {
+        self.0.next_u32()
+    }
+
+    fn next_u64(&mut self) -> u64 {
+        self.0.next_u64()
+    }
+
+    fn fill_bytes(&mut self, dst: &mut [u8]) {
+        self.0.fill_bytes(dst)
     }
 }
 
 //FIXME this can hang if count > items.len() or if there are duplicates
-pub fn pick_unique<'a, T: PartialEq, R: Rng + ?Sized>(
+pub fn pick_unique<'a, T: PartialEq, R: RngExt + ?Sized>(
     items: &'a [T],
     count: usize,
     rng: &mut R,

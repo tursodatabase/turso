@@ -15,6 +15,7 @@ serde = { workspace = true, features = ["derive"] }
 turso_core = { workspace = true, features = ["simulator"] }
 turso_parser = { workspace = true, features = ["serde", "simulator"] }
 rand = { workspace = true }
+rand_core_09 = { workspace = true }
 anarchist-readable-name-generator-lib = "0.2.0"
 itertools = { workspace = true }
 anyhow = { workspace = true }

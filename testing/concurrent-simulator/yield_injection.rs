@@ -1,4 +1,4 @@
-use rand::{Rng, SeedableRng, rngs::StdRng};
+use rand::{RngExt, SeedableRng, rngs::StdRng};
 use std::collections::HashMap;
 use std::sync::Mutex;
 use turso_core::mvcc::yield_points::{YieldInjector, YieldPoint};

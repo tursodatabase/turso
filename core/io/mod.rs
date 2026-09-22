@@ -6,7 +6,7 @@ use crate::turso_assert;
 use crate::{BufferPool, Result};
 use bitflags::bitflags;
 use cfg_block::cfg_block;
-use rand::{Rng, RngCore};
+use rand::{Rng, RngExt};
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::fmt;

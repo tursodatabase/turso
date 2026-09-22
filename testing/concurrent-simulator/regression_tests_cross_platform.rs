@@ -195,7 +195,7 @@ fn test_checkpoint_probe_rejects_checkpoints_while_statements_are_suspended() {
 /// panic fired around step 14700.
 #[test]
 fn test_dropped_failed_statement_keeps_suspended_sibling_commit_intact() {
-    use rand::Rng;
+    use rand::RngExt;
     use turso_whopper::chaotic_btree::BtreeRebalanceProfile;
     use turso_whopper::chaotic_elle::ChaoticWorkloadProfile;
     use turso_whopper::properties::{IntegrityCheckProperty, Property};
@@ -360,7 +360,7 @@ fn test_fts_workloads_use_the_index_and_replay_with_the_seed() {
 /// append 19 already committed. Elle reports G-single-item and incompatible-order.
 #[test]
 fn test_elle_passive_seed_keeps_committed_text_pk_on_unique_lookup() {
-    use rand::Rng;
+    use rand::RngExt;
     use std::sync::atomic::AtomicI64;
     use turso_whopper::chaotic_elle::{ChaoticElleProfile, ChaoticWorkloadProfile, ElleModelKind};
     use turso_whopper::properties::ElleHistoryRecorder;

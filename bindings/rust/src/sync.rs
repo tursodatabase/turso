@@ -976,7 +976,7 @@ impl IoWorker {
 #[cfg(test)]
 mod tests {
     use anyhow::{anyhow, Context, Result};
-    use rand::{distr::Alphanumeric, Rng};
+    use rand::{distr::Alphanumeric, RngExt};
     use reqwest::Client;
     use serde_json::json;
     use std::{

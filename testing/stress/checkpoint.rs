@@ -1,7 +1,7 @@
 //! WAL checkpoint action for the stress loop: pick a checkpoint mode and
 //! run PRAGMA wal_checkpoint, sanity-checking the result.
 
-use rand::Rng;
+use rand::RngExt;
 use turso::Value;
 use turso_stress::ThreadId;
 

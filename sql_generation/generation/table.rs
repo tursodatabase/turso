@@ -2,18 +2,18 @@ use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use indexmap::IndexSet;
-use rand::Rng;
+use rand::RngExt;
 use turso_parser::ast::{ColumnConstraint, GeneratedColumnType};
 
 use crate::generation::generated_expr::generate_column_expr_with_refs;
-use crate::generation::{pick, readable_name_custom, Arbitrary, GenerationContext};
+use crate::generation::{gen_readable_name, pick, Arbitrary, GenerationContext};
 use crate::model::table::{Column, ColumnType, Name, Table};
 
 static COUNTER: AtomicU64 = AtomicU64::new(0);
 
 impl Arbitrary for Name {
-    fn arbitrary<R: Rng + ?Sized, C: GenerationContext>(rng: &mut R, _c: &C) -> Self {
-        let base = readable_name_custom("_", rng).replace("-", "_");
+    fn arbitrary<R: RngExt + ?Sized, C: GenerationContext>(rng: &mut R, _c: &C) -> Self {
+        let base = gen_readable_name(rng);
         let id = COUNTER.fetch_add(1, Ordering::Relaxed);
         Name(format!("{base}_{id}"))
     }
@@ -21,7 +21,7 @@ impl Arbitrary for Name {
 
 impl Table {
     /// Generate a table with some predefined columns
-    pub fn arbitrary_with_columns<R: Rng + ?Sized, C: GenerationContext>(
+    pub fn arbitrary_with_columns<R: RngExt + ?Sized, C: GenerationContext>(
         rng: &mut R,
         context: &C,
         name: String,
@@ -125,7 +125,7 @@ fn can_reach(deps: &HashMap<usize, HashSet<usize>>, from: usize, to: usize) -> b
 }
 
 impl Arbitrary for Table {
-    fn arbitrary<R: Rng + ?Sized, C: GenerationContext>(rng: &mut R, context: &C) -> Self {
+    fn arbitrary<R: RngExt + ?Sized, C: GenerationContext>(rng: &mut R, context: &C) -> Self {
         let name = Name::arbitrary(rng, context).0;
 
         let rowid_alias = rng.random_bool(context.opts().table.rowid_alias_prob);
@@ -173,7 +173,7 @@ impl Arbitrary for Table {
 }
 
 impl Arbitrary for Column {
-    fn arbitrary<R: Rng + ?Sized, C: GenerationContext>(rng: &mut R, context: &C) -> Self {
+    fn arbitrary<R: RngExt + ?Sized, C: GenerationContext>(rng: &mut R, context: &C) -> Self {
         let name = Name::arbitrary(rng, context).0;
         let column_type = ColumnType::arbitrary(rng, context);
 
@@ -192,7 +192,7 @@ impl Arbitrary for Column {
 }
 
 impl Arbitrary for ColumnType {
-    fn arbitrary<R: Rng + ?Sized, C: GenerationContext>(rng: &mut R, _context: &C) -> Self {
+    fn arbitrary<R: RngExt + ?Sized, C: GenerationContext>(rng: &mut R, _context: &C) -> Self {
         pick(&[Self::Integer, Self::Float, Self::Text, Self::Blob], rng).to_owned()
     }
 }

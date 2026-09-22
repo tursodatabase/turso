@@ -5,7 +5,7 @@ mod tests {
     use core_tester::common::{limbo_exec_rows, TempDatabase};
     use rand::{
         seq::{IndexedRandom, IteratorRandom},
-        Rng,
+        RngExt,
     };
     use rand_chacha::ChaCha8Rng;
     use rusqlite::types::Value;
@@ -25,10 +25,7 @@ mod tests {
         }
 
         let count = rng.random_range(1..=4);
-        let mut tokens = TOKENS
-            .choose_multiple(rng, count)
-            .copied()
-            .collect::<Vec<_>>();
+        let mut tokens = TOKENS.sample(rng, count).copied().collect::<Vec<_>>();
         tokens.sort_unstable();
         Some(tokens.join(" "))
     }

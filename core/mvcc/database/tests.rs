@@ -32,7 +32,7 @@ use crate::{
 };
 use quickcheck::{Arbitrary, Gen};
 use quickcheck_macros::quickcheck;
-use rand::{Rng, SeedableRng};
+use rand::{RngExt, SeedableRng};
 use rand_chacha::ChaCha8Rng;
 use std::sync::Arc;
 

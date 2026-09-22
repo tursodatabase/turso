@@ -1,7 +1,7 @@
 #![cfg_attr(nightly, feature(allocator_api))]
 
 /// Whopper is a deterministic simulator for testing the Turso database.
-use rand::{Rng, RngCore, SeedableRng};
+use rand::{Rng, RngExt, SeedableRng};
 use rand_chacha::ChaCha8Rng;
 use sql_generation::{
     generation::Opts,

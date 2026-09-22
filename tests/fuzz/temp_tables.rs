@@ -7,7 +7,7 @@ mod temp_table_fuzz_tests {
         do_flush, limbo_exec_rows, limbo_exec_rows_fallible, sqlite_exec_rows, TempDatabase,
     };
     use rand::seq::IndexedRandom;
-    use rand::Rng;
+    use rand::RngExt;
     use rand_chacha::ChaCha8Rng;
     use rusqlite::types::Value;
 

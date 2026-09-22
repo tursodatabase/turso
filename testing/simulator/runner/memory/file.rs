@@ -6,7 +6,7 @@ use std::{
     },
 };
 
-use rand::{Rng as _, SeedableRng};
+use rand::{RngExt as _, SeedableRng};
 use rand_chacha::ChaCha8Rng;
 use tracing::{Level, instrument};
 use turso_core::{Completion, CompletionError, File, LimboError, Result};

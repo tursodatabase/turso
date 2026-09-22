@@ -1,6 +1,6 @@
 use crate::common::{do_flush, limbo_exec_rows_fallible, run_query, TempDatabase};
 use asserting::prelude::*;
-use rand::{rng, RngCore};
+use rand::{rng, Rng};
 use std::fs::OpenOptions;
 
 /// Test that truncating a database file results in a ShortRead error.

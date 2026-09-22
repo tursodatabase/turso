@@ -13,5 +13,5 @@ clap = { workspace = true, features = ["derive"] }
 tokio = { workspace = true, default-features = true, features = ["full"] }
 futures = { workspace = true }
 tracing-subscriber = { workspace = true }
-rand = { workspace = true, features = ["small_rng"] }
+rand = { workspace = true }
 hex = { workspace = true }

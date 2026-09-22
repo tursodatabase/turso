@@ -1,6 +1,6 @@
 use super::helpers;
 use core_tester::common::{limbo_exec_rows, try_limbo_exec_rows, TempDatabase};
-use rand::{Rng, SeedableRng};
+use rand::{RngExt, SeedableRng};
 use rand_chacha::ChaCha8Rng;
 use sql_generation::{
     generation::{Arbitrary, GenerationContext, Opts},

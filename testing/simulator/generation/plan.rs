@@ -30,7 +30,7 @@ use crate::{
 impl InteractionPlan {
     pub fn generator<'a>(
         &'a mut self,
-        rng: &'a mut impl rand::Rng,
+        rng: &'a mut impl rand::RngExt,
     ) -> impl InteractionPlanIterator {
         let interactions = self.interactions_list().to_vec();
         let iter = interactions.into_iter();
@@ -45,7 +45,7 @@ impl InteractionPlan {
     /// Appends a new [Interactions] and outputs the next set of [Interaction] to take
     pub fn generate_next_interaction(
         &mut self,
-        rng: &mut impl rand::Rng,
+        rng: &mut impl rand::RngExt,
         env: &mut SimulatorEnv,
     ) -> Option<Interactions> {
         // First interaction
@@ -146,14 +146,14 @@ impl InteractionPlan {
     }
 }
 
-pub struct PlanGenerator<'a, R: rand::Rng> {
+pub struct PlanGenerator<'a, R: rand::RngExt> {
     plan: &'a mut InteractionPlan,
     peek: Option<Interaction>,
     iter: <Vec<Interaction> as IntoIterator>::IntoIter,
     rng: &'a mut R,
 }
 
-impl<'a, R: rand::Rng> PlanGenerator<'a, R> {
+impl<'a, R: rand::RngExt> PlanGenerator<'a, R> {
     fn next_interaction(&mut self, env: &mut SimulatorEnv) -> Option<Interaction> {
         self.iter
             .next()
@@ -240,7 +240,7 @@ impl<'a, R: rand::Rng> PlanGenerator<'a, R> {
     }
 }
 
-impl<'a, R: rand::Rng> InteractionPlanIterator for PlanGenerator<'a, R> {
+impl<'a, R: rand::RngExt> InteractionPlanIterator for PlanGenerator<'a, R> {
     /// try to generate the next [Interactions] and store it
     fn next(&mut self, env: &mut SimulatorEnv) -> Option<Interaction> {
         let mvcc = self.plan.mvcc;
@@ -341,7 +341,7 @@ impl Interactions {
     }
 }
 
-fn random_fault<R: rand::Rng + ?Sized>(
+fn random_fault<R: rand::RngExt + ?Sized>(
     rng: &mut R,
     env: &SimulatorEnv,
     conn_index: usize,
@@ -358,7 +358,7 @@ fn random_fault<R: rand::Rng + ?Sized>(
 }
 
 impl ArbitraryFrom<(&SimulatorEnv, &InteractionStats, usize)> for Interactions {
-    fn arbitrary_from<R: rand::Rng + ?Sized, C: GenerationContext>(
+    fn arbitrary_from<R: rand::RngExt + ?Sized, C: GenerationContext>(
         rng: &mut R,
         conn_ctx: &C,
         (env, stats, conn_index): (&SimulatorEnv, &InteractionStats, usize),

@@ -20,7 +20,7 @@ use anyhow::{Context, Result};
 use clap::Parser;
 use parking_lot::Mutex;
 use rand::rngs::StdRng;
-use rand::{Rng, SeedableRng};
+use rand::{RngExt, SeedableRng};
 
 use differential_fuzzer::memory::MemorySimIO;
 use turso_core::{Database, SqliteDialect};

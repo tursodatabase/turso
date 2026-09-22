@@ -11,7 +11,7 @@
 mod cte_tests {
     use std::cmp::Ordering;
 
-    use rand::Rng;
+    use rand::RngExt;
     use rand_chacha::ChaCha8Rng;
     use rusqlite::{params, types::Value};
 

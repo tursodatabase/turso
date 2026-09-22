@@ -10518,9 +10518,9 @@ fn shift_pointers_left(page: &mut PageContent, cell_idx: usize) {
 #[cfg(test)]
 mod tests {
     use crate::SqliteDialect;
-    use rand::{rng, Rng};
+    use rand::{rng, RngExt};
     use rand_chacha::{
-        rand_core::{RngCore, SeedableRng},
+        rand_core::{Rng, SeedableRng},
         ChaCha8Rng,
     };
     use sorted_vec::SortedVec;

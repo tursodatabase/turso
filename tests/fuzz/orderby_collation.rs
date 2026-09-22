@@ -8,7 +8,7 @@
 mod tests {
     use crate::helpers;
     use core_tester::common::{limbo_exec_rows, sqlite_exec_rows, TempDatabase};
-    use rand::Rng;
+    use rand::RngExt;
     use rusqlite::types::Value;
 
     /// Collation sequences supported by SQLite/Limbo

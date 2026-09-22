@@ -3769,9 +3769,9 @@ mod tests {
     use std::sync::Once;
 
     use quickcheck_macros::quickcheck;
-    use rand::{random_range, rng, Rng};
+    use rand::{random_range, rng, RngExt};
     use rand_chacha::{
-        rand_core::{RngCore, SeedableRng},
+        rand_core::{Rng, SeedableRng},
         ChaCha8Rng,
     };
 

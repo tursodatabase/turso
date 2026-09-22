@@ -2,7 +2,7 @@
 
 use std::collections::HashSet;
 
-use rand::Rng;
+use rand::RngExt;
 use turso_parser::ast::{self, Expr, Name, Operator, UnaryOperator};
 
 use crate::model::table::{Column, ColumnType};
@@ -10,7 +10,7 @@ use crate::model::table::{Column, ColumnType};
 /// Generates a type-compatible expression for a generated column.
 ///
 /// Returns (expression, set of column indices referenced by the expression).
-pub fn generate_column_expr_with_refs<R: Rng + ?Sized>(
+pub fn generate_column_expr_with_refs<R: RngExt + ?Sized>(
     rng: &mut R,
     all_columns: &[Column],
     current_col_idx: usize,
@@ -29,7 +29,7 @@ pub fn generate_column_expr_with_refs<R: Rng + ?Sized>(
     (expr, refs)
 }
 
-fn generate_expr_inner<R: Rng + ?Sized>(
+fn generate_expr_inner<R: RngExt + ?Sized>(
     rng: &mut R,
     all_columns: &[Column],
     current_col_idx: usize,
@@ -159,7 +159,7 @@ fn types_compatible(source: &ColumnType, target: &ColumnType) -> bool {
 }
 
 /// Generate a type-appropriate literal.
-fn generate_literal<R: Rng + ?Sized>(rng: &mut R, target_type: &ColumnType) -> Expr {
+fn generate_literal<R: RngExt + ?Sized>(rng: &mut R, target_type: &ColumnType) -> Expr {
     match target_type {
         ColumnType::Integer => {
             // Use smaller integer values to avoid overflow in expressions
@@ -184,7 +184,7 @@ fn generate_literal<R: Rng + ?Sized>(rng: &mut R, target_type: &ColumnType) -> E
 }
 
 /// Pick an appropriate binary operator for the target type.
-fn pick_binary_op<R: Rng + ?Sized>(rng: &mut R, target_type: &ColumnType) -> Option<Operator> {
+fn pick_binary_op<R: RngExt + ?Sized>(rng: &mut R, target_type: &ColumnType) -> Option<Operator> {
     match target_type {
         ColumnType::Integer | ColumnType::Float => {
             let ops = [
@@ -207,7 +207,10 @@ fn pick_binary_op<R: Rng + ?Sized>(rng: &mut R, target_type: &ColumnType) -> Opt
 }
 
 /// Pick an appropriate unary operator for the target type (if any).
-fn pick_unary_op<R: Rng + ?Sized>(rng: &mut R, target_type: &ColumnType) -> Option<UnaryOperator> {
+fn pick_unary_op<R: RngExt + ?Sized>(
+    rng: &mut R,
+    target_type: &ColumnType,
+) -> Option<UnaryOperator> {
     match target_type {
         ColumnType::Integer | ColumnType::Float => {
             if rng.random_bool(0.5) {

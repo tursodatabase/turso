@@ -1,4 +1,4 @@
-use rand::Rng;
+use rand::RngExt;
 use turso_core::alloc::{TursoSliceExt, ALLOC_ERR_MSG};
 use turso_core::Value;
 
@@ -14,7 +14,7 @@ pub use cmp::{GTValue, LTValue};
 pub use pattern::LikeValue;
 
 impl ArbitraryFrom<&Table> for Vec<SimValue> {
-    fn arbitrary_from<R: Rng + ?Sized, C: GenerationContext>(
+    fn arbitrary_from<R: RngExt + ?Sized, C: GenerationContext>(
         rng: &mut R,
         context: &C,
         table: &Table,
@@ -29,7 +29,7 @@ impl ArbitraryFrom<&Table> for Vec<SimValue> {
 }
 
 impl ArbitraryFrom<&Vec<&SimValue>> for SimValue {
-    fn arbitrary_from<R: Rng + ?Sized, C: GenerationContext>(
+    fn arbitrary_from<R: RngExt + ?Sized, C: GenerationContext>(
         rng: &mut R,
         _context: &C,
         values: &Vec<&Self>,
@@ -43,7 +43,7 @@ impl ArbitraryFrom<&Vec<&SimValue>> for SimValue {
 }
 
 impl ArbitraryFrom<&ColumnType> for SimValue {
-    fn arbitrary_from<R: Rng + ?Sized, C: GenerationContext>(
+    fn arbitrary_from<R: RngExt + ?Sized, C: GenerationContext>(
         rng: &mut R,
         _context: &C,
         column_type: &ColumnType,
@@ -66,7 +66,7 @@ impl ArbitraryFrom<&ColumnType> for SimValue {
 }
 
 impl ArbitraryFrom<ColumnType> for SimValue {
-    fn arbitrary_from<R: Rng + ?Sized, C: GenerationContext>(
+    fn arbitrary_from<R: RngExt + ?Sized, C: GenerationContext>(
         rng: &mut R,
         context: &C,
         column_type: ColumnType,

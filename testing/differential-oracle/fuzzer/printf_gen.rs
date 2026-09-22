@@ -4,7 +4,7 @@
 //! between Turso and SQLite. Focuses on corner cases: type mismatches, missing
 //! arguments, extreme values, conflicting flags, and boundary precisions.
 
-use rand::Rng;
+use rand::RngExt;
 use rand_chacha::ChaCha8Rng;
 
 /// Specifier types that printf supports.

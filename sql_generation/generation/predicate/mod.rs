@@ -1,4 +1,4 @@
-use rand::{seq::SliceRandom as _, Rng};
+use rand::{seq::SliceRandom as _, RngExt};
 
 use crate::{
     generation::GenerationContext,
@@ -20,7 +20,7 @@ struct CompoundPredicate(Predicate);
 struct SimplePredicate(Predicate);
 
 impl<A: AsRef<[SimValue]>, T: TableContext> ArbitraryFrom<(&T, A, bool)> for SimplePredicate {
-    fn arbitrary_from<R: Rng + ?Sized, C: GenerationContext>(
+    fn arbitrary_from<R: RngExt + ?Sized, C: GenerationContext>(
         rng: &mut R,
         context: &C,
         (table, row, predicate_value): (&T, A, bool),
@@ -45,7 +45,7 @@ impl<A: AsRef<[SimValue]>, T: TableContext> ArbitraryFrom<(&T, A, bool)> for Sim
 }
 
 impl<T: TableContext> ArbitraryFrom<(&T, bool)> for CompoundPredicate {
-    fn arbitrary_from<R: Rng + ?Sized, C: GenerationContext>(
+    fn arbitrary_from<R: RngExt + ?Sized, C: GenerationContext>(
         rng: &mut R,
         context: &C,
         (table, predicate_value): (&T, bool),
@@ -55,7 +55,7 @@ impl<T: TableContext> ArbitraryFrom<(&T, bool)> for CompoundPredicate {
 }
 
 impl<T: TableContext> ArbitraryFrom<&T> for Predicate {
-    fn arbitrary_from<R: Rng + ?Sized, C: GenerationContext>(
+    fn arbitrary_from<R: RngExt + ?Sized, C: GenerationContext>(
         rng: &mut R,
         context: &C,
         table: &T,
@@ -66,7 +66,7 @@ impl<T: TableContext> ArbitraryFrom<&T> for Predicate {
 }
 
 impl<T: TableContext> ArbitraryFrom<(&T, bool)> for Predicate {
-    fn arbitrary_from<R: Rng + ?Sized, C: GenerationContext>(
+    fn arbitrary_from<R: RngExt + ?Sized, C: GenerationContext>(
         rng: &mut R,
         context: &C,
         (table, predicate_value): (&T, bool),
@@ -76,7 +76,7 @@ impl<T: TableContext> ArbitraryFrom<(&T, bool)> for Predicate {
 }
 
 impl ArbitraryFrom<(&Table, &Vec<SimValue>)> for Predicate {
-    fn arbitrary_from<R: Rng + ?Sized, C: GenerationContext>(
+    fn arbitrary_from<R: RngExt + ?Sized, C: GenerationContext>(
         rng: &mut R,
         context: &C,
         (t, row): (&Table, &Vec<SimValue>),
@@ -163,7 +163,7 @@ impl ArbitraryFrom<(&Table, &Vec<SimValue>)> for Predicate {
 
 #[cfg(test)]
 mod tests {
-    use rand::{Rng as _, SeedableRng as _};
+    use rand::{RngExt as _, SeedableRng as _};
     use rand_chacha::ChaCha8Rng;
 
     use crate::{

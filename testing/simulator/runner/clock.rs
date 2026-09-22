@@ -1,7 +1,7 @@
 use std::cell::RefCell;
 
 use chrono::{DateTime, Utc};
-use rand::Rng;
+use rand::RngExt;
 use rand_chacha::ChaCha8Rng;
 
 #[derive(Debug)]

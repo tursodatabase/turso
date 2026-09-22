@@ -1,4 +1,4 @@
-use rand::{rng, RngCore, SeedableRng};
+use rand::{rng, Rng, SeedableRng};
 use rand_chacha::ChaCha8Rng;
 use rusqlite::params;
 use std::path::{Path, PathBuf};
@@ -772,7 +772,7 @@ mod tests {
 
     #[test]
     fn test_unique_index_ordering() -> anyhow::Result<()> {
-        use rand::Rng;
+        use rand::RngExt;
 
         let db = TempDatabase::new_empty();
         let conn = db.connect_limbo();

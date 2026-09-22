@@ -1,4 +1,4 @@
-use rand::Rng;
+use rand::RngExt;
 mod checkpoint;
 mod conn;
 mod counter;

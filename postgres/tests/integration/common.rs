@@ -1,4 +1,4 @@
-use rand::{rng, RngCore};
+use rand::{rng, Rng};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use tempfile::TempDir;

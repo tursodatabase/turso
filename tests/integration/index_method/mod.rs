@@ -9,7 +9,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use core_tester::common::rng_from_time_or_env;
-use rand::{RngCore, SeedableRng};
+use rand::{Rng, SeedableRng};
 use rand_chacha::ChaCha8Rng;
 #[cfg(all(feature = "fts", not(target_family = "wasm")))]
 use turso_core::index_method::fts::FtsIndexMethod;

@@ -4,7 +4,7 @@ use core_tester::common::{
 };
 use rand::distr::weighted::WeightedIndex;
 use rand::distr::Distribution;
-use rand::Rng;
+use rand::RngExt;
 use std::sync::Arc;
 use tempfile::TempDir;
 

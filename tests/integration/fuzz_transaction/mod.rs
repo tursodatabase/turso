@@ -1,5 +1,5 @@
 use rand::seq::IndexedRandom;
-use rand::Rng;
+use rand::RngExt;
 use rand_chacha::ChaCha8Rng;
 use std::collections::BTreeMap;
 use turso::{Builder, Value};

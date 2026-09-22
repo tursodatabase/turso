@@ -8,7 +8,7 @@ use crate::{
 pub struct LTValue(pub SimValue);
 
 impl ArbitraryFrom<(&SimValue, ColumnType)> for LTValue {
-    fn arbitrary_from<R: rand::Rng + ?Sized, C: GenerationContext>(
+    fn arbitrary_from<R: rand::RngExt + ?Sized, C: GenerationContext>(
         rng: &mut R,
         _context: &C,
         (value, _col_type): (&SimValue, ColumnType),
@@ -62,7 +62,7 @@ impl ArbitraryFrom<(&SimValue, ColumnType)> for LTValue {
 pub struct GTValue(pub SimValue);
 
 impl ArbitraryFrom<(&SimValue, ColumnType)> for GTValue {
-    fn arbitrary_from<R: rand::Rng + ?Sized, C: GenerationContext>(
+    fn arbitrary_from<R: rand::RngExt + ?Sized, C: GenerationContext>(
         rng: &mut R,
         context: &C,
         (value, col_type): (&SimValue, ColumnType),
@@ -132,7 +132,7 @@ const UPPERCASE_Z: u32 = 'Z' as u32;
 const LOWERCASE_A: u32 = 'a' as u32;
 const LOWERCASE_Z: u32 = 'z' as u32;
 
-fn mutate_string<R: rand::Rng + ?Sized>(
+fn mutate_string<R: rand::RngExt + ?Sized>(
     t: &str,
     rng: &mut R,
     mutation_type: MutationType,

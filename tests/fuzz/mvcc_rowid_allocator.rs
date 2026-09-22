@@ -2,7 +2,7 @@
 mod mvcc_rowid_allocator_fuzz_tests {
     use crate::helpers;
     use core_tester::common::{limbo_exec_rows, sqlite_exec_rows, TempDatabase};
-    use rand::Rng;
+    use rand::RngExt;
     use rand_chacha::ChaCha8Rng;
     use rusqlite::{params, types::Value};
     use std::sync::Arc;

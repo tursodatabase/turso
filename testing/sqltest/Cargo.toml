@@ -49,7 +49,7 @@ itertools = { workspace = true }
 chumsky = "0.12.0"
 
 # Database generation
-fake = { version = "4.4", features = ["derive", "rand_core"] }
+fake = { version = "5.1", features = ["derive", "rand_core"] }
 rand = { workspace = true }
 rand_chacha = { workspace = true }
 

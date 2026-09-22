@@ -809,7 +809,7 @@ impl InteractionType {
         conn: &Arc<Connection>,
         env: &mut SimulatorEnv,
     ) -> ResultSet {
-        use rand::Rng;
+        use rand::RngExt;
         if let Self::FaultyQuery(query) = self {
             let query_str = query.to_string();
             let rows = conn.query(&query_str);

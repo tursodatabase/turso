@@ -1211,8 +1211,8 @@ dependencies = [
  "ctor 0.5.0",
  "env_logger",
  "log",
- "rand 0.9.4",
- "rand_chacha 0.9.0",
+ "rand 0.10.1",
+ "rand_chacha 0.10.0",
  "rusqlite",
  "serde_json",
  "serial_test",
@@ -1763,8 +1763,8 @@ dependencies = [
  "indexmap 2.11.1",
  "parking_lot",
  "proptest",
- "rand 0.9.4",
- "rand_chacha 0.9.0",
+ "rand 0.10.1",
+ "rand_chacha 0.10.0",
  "rusqlite",
  "serde",
  "serde_json",
@@ -1921,9 +1921,9 @@ checksum = "f678cf4a922c215c63e0de95eb1ff08a958a81d47e485cf9da1e27bf6305cfa5"
 
 [[package]]
 name = "dummy"
-version = "0.11.0"
+version = "0.12.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3bbcf21279103a67372982cb1156a2154a452451dff2b884cf897ccecce389e0"
+checksum = "6d2a69babd8861dbe09217678b4e8ee461869f9af8a57021e16479628dbd83bd"
 dependencies = [
  "darling",
  "proc-macro2",
@@ -1971,7 +1971,7 @@ dependencies = [
  "clap",
  "futures",
  "hex",
- "rand 0.9.4",
+ "rand 0.10.1",
  "tokio",
  "tracing-subscriber",
  "turso",
@@ -2059,15 +2059,15 @@ checksum = "a5d9305ccc6942a704f4335694ecd3de2ea531b114ac2d51f5f843750787a92f"
 
 [[package]]
 name = "fake"
-version = "4.4.0"
+version = "5.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f2b0902eb36fbab51c14eda1c186bda119fcff91e5e4e7fc2dd2077298197ce8"
+checksum = "ea6be833b323a56361118a747470a45a1bcd5c52a2ec9b1e40c83dafe687e453"
 dependencies = [
  "deunicode",
  "dummy",
  "either",
- "rand 0.9.4",
- "rand_core 0.9.3",
+ "rand 0.10.1",
+ "rand_core 0.10.1",
 ]
 
 [[package]]
@@ -3557,8 +3557,8 @@ dependencies = [
  "json5",
  "notify",
  "parking_lot",
- "rand 0.9.4",
- "rand_chacha 0.9.0",
+ "rand 0.10.1",
+ "rand_chacha 0.10.0",
  "regex",
  "regex-syntax 0.8.5",
  "rusqlite",
@@ -3796,7 +3796,7 @@ dependencies = [
  "clap",
  "dhat",
  "memory-stats",
- "rand 0.9.4",
+ "rand 0.10.1",
  "serde",
  "serde_json",
  "stacker",
@@ -5093,6 +5093,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "rand_chacha"
+version = "0.10.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "3e6af7f3e25ded52c41df4e0b1af2d047e45896c2f3281792ed68a1c243daedb"
+dependencies = [
+ "ppv-lite86",
+ "rand_core 0.10.1",
+]
+
+[[package]]
 name = "rand_core"
 version = "0.6.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6141,7 +6151,8 @@ version = "0.8.0-pre.12"
 dependencies = [
  "anarchist-readable-name-generator-lib",
  "proptest",
- "rand 0.9.4",
+ "rand 0.10.1",
+ "rand_core 0.9.3",
  "serde",
  "sql_gen_macros",
  "strum",
@@ -6176,8 +6187,9 @@ dependencies = [
  "hex",
  "indexmap 2.11.1",
  "itertools 0.14.0",
- "rand 0.9.4",
- "rand_chacha 0.9.0",
+ "rand 0.10.1",
+ "rand_chacha 0.10.0",
+ "rand_core 0.9.3",
  "schemars 1.0.4",
  "serde",
  "strum",
@@ -6204,8 +6216,8 @@ dependencies = [
  "num_cpus",
  "owo-colors 4.2.3",
  "pretty_assertions",
- "rand 0.9.4",
- "rand_chacha 0.9.0",
+ "rand 0.10.1",
+ "rand_chacha 0.10.0",
  "regex",
  "rusqlite",
  "serde",
@@ -7105,8 +7117,8 @@ dependencies = [
  "hyper-rustls",
  "hyper-util",
  "mimalloc",
- "rand 0.9.4",
- "rand_chacha 0.9.0",
+ "rand 0.10.1",
+ "rand_chacha 0.10.0",
  "reqwest",
  "serde_json",
  "tempfile",
@@ -7183,7 +7195,7 @@ dependencies = [
  "mimalloc",
  "nu-ansi-term",
  "prost 0.14.1",
- "rand 0.8.6",
+ "rand 0.10.1",
  "roaring",
  "rustyline",
  "schemars 0.8.22",
@@ -7258,8 +7270,8 @@ dependencies = [
  "pprof 0.14.0",
  "quickcheck",
  "quickcheck_macros",
- "rand 0.9.4",
- "rand_chacha 0.9.0",
+ "rand 0.10.1",
+ "rand_chacha 0.10.0",
  "rapidhash",
  "regex",
  "regex-syntax 0.8.5",
@@ -7419,8 +7431,8 @@ dependencies = [
  "ctor 0.5.0",
  "env_logger",
  "log",
- "rand 0.9.4",
- "rand_chacha 0.9.0",
+ "rand 0.10.1",
+ "rand_chacha 0.10.0",
  "rusqlite",
  "serial_test",
  "similar-asserts",
@@ -7528,7 +7540,7 @@ dependencies = [
  "clap",
  "hex",
  "indicatif",
- "rand 0.9.4",
+ "rand 0.10.1",
  "rusqlite",
  "serde_json",
  "shuttle",
@@ -7554,8 +7566,8 @@ dependencies = [
  "http",
  "libc",
  "prost 0.14.1",
- "rand 0.9.4",
- "rand_chacha 0.9.0",
+ "rand 0.10.1",
+ "rand_chacha 0.10.0",
  "roaring",
  "serde",
  "serde_json",
@@ -7609,8 +7621,8 @@ dependencies = [
  "clap",
  "hex",
  "memmap2",
- "rand 0.9.4",
- "rand_chacha 0.9.0",
+ "rand 0.10.1",
+ "rand_chacha 0.10.0",
  "serde",
  "serde_json",
  "sql_generation",

@@ -1,7 +1,7 @@
 //! Fuzz tests for the join optimizer's GOO (Greedy Operator Ordering) algorithm.
 
 use rand::seq::SliceRandom;
-use rand::Rng;
+use rand::RngExt;
 
 use super::helpers;
 use core_tester::common::{limbo_exec_rows, rng_from_time_or_env, TempDatabase};
@@ -35,7 +35,7 @@ fn generate_star_schema(num_dimensions: usize) -> (Vec<String>, String, Vec<Stri
 }
 
 /// Generate a star query with a random FROM clause order.
-fn generate_star_query_randomized<R: Rng>(
+fn generate_star_query_randomized<R: RngExt>(
     rng: &mut R,
     fact_table: &str,
     dimension_tables: &[String],

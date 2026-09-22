@@ -21,7 +21,7 @@ pub mod test_join_optimizer;
 #[cfg(test)]
 mod fuzz_tests {
     use rand::seq::{IndexedRandom, IteratorRandom, SliceRandom};
-    use rand::Rng;
+    use rand::RngExt;
     use rand_chacha::ChaCha8Rng;
     use rusqlite::{params, types::Value};
     use std::{collections::HashSet, io::Write};
@@ -386,7 +386,7 @@ mod fuzz_tests {
             let col_choices_weights = [10.0, 10.0, 10.0, 3.0];
             let num_cols_in_select = rng.random_range(1..=4);
             let mut select_cols = col_choices
-                .choose_multiple_weighted(&mut rng, num_cols_in_select, |s| {
+                .sample_weighted(&mut rng, num_cols_in_select, |s| {
                     let idx = col_choices.iter().position(|c| c == s).unwrap();
                     col_choices_weights[idx]
                 })
@@ -3678,7 +3678,7 @@ mod fuzz_tests {
                                 let mut set_list = Vec::new();
                                 let num_set = rng.random_range(1..=cols_list.len());
                                 let set_cols = cols_list
-                                    .choose_multiple(&mut rng, num_set)
+                                    .sample(&mut rng, num_set)
                                     .cloned()
                                     .collect::<Vec<_>>();
                                 for c in set_cols.iter() {
@@ -3810,7 +3810,7 @@ mod fuzz_tests {
             // Randomly pick a subset of columns to select from
             let num_cols_to_select = rng.random_range(1..=COLS.len());
             let cols_to_select = COLS
-                .choose_multiple(&mut rng, num_cols_to_select)
+                .sample(&mut rng, num_cols_to_select)
                 .map(|c| c.to_string())
                 .collect::<Vec<_>>();
 
@@ -3929,10 +3929,7 @@ mod fuzz_tests {
 
         for iter in 0..num_iters {
             let num_cols = rng.random_range(1..=COLS.len());
-            let cols = COLS
-                .choose_multiple(&mut rng, num_cols)
-                .cloned()
-                .collect::<Vec<_>>();
+            let cols = COLS.sample(&mut rng, num_cols).cloned().collect::<Vec<_>>();
             let select_list = cols.join(", ");
             let order_by = cols
                 .iter()
@@ -7439,7 +7436,7 @@ mod fuzz_tests {
     const COLLATIONS: [&str; 3] = ["BINARY", "NOCASE", "RTRIM"];
     const TYPES: [&str; 5] = ["INT", "TEXT", "REAL", "BLOB", "NUMERIC"];
 
-    fn random_on_conflict_clause<R: Rng>(rng: &mut R) -> &'static str {
+    fn random_on_conflict_clause<R: RngExt>(rng: &mut R) -> &'static str {
         if rng.random_bool(0.4) {
             match rng.random_range(0..5) {
                 0 => " ON CONFLICT ROLLBACK",
@@ -7454,7 +7451,7 @@ mod fuzz_tests {
         }
     }
 
-    fn random_collation<R: Rng>(rng: &mut R) -> Option<&'static str> {
+    fn random_collation<R: RngExt>(rng: &mut R) -> Option<&'static str> {
         if rng.random_bool(0.65) {
             Some(COLLATIONS[rng.random_range(0..COLLATIONS.len())])
         } else {
@@ -7462,7 +7459,7 @@ mod fuzz_tests {
         }
     }
 
-    fn random_type<R: Rng>(rng: &mut R) -> &'static str {
+    fn random_type<R: RngExt>(rng: &mut R) -> &'static str {
         TYPES[rng.random_range(0..TYPES.len())]
     }
 
@@ -7471,7 +7468,7 @@ mod fuzz_tests {
         format!("\"{}\"", s.replace('"', "\"\""))
     }
 
-    fn sql_value_string<R: Rng>(rng: &mut R) -> String {
+    fn sql_value_string<R: RngExt>(rng: &mut R) -> String {
         match rng.random_range(0..9) {
             0 => "NULL".to_string(),
             1 => rng.random_range(-1000..=1000).to_string(),
@@ -7502,7 +7499,7 @@ mod fuzz_tests {
         }
     }
 
-    fn build_create_table_sql<R: Rng>(rng: &mut R, tname: &str) -> FuzzTestTable {
+    fn build_create_table_sql<R: RngExt>(rng: &mut R, tname: &str) -> FuzzTestTable {
         // number of columns
         let mut num_cols = rng.random_range(1..=6);
         let mut columns = Vec::<FuzzTestColumn>::new();
@@ -7615,7 +7612,7 @@ mod fuzz_tests {
         )
     }
 
-    fn random_index_for_table<R: Rng>(
+    fn random_index_for_table<R: RngExt>(
         rng: &mut R,
         state: &mut FuzzTestDbState,
         tbl: &FuzzTestTable,
@@ -7679,7 +7676,7 @@ mod fuzz_tests {
         .replace("  ", " ")
     }
 
-    fn insert_random_rows_stmt<R: Rng>(
+    fn insert_random_rows_stmt<R: RngExt>(
         rng: &mut R,
         tbl: &FuzzTestTable,
         rows: usize,
@@ -7706,7 +7703,7 @@ mod fuzz_tests {
         stmts
     }
 
-    fn random_select_stmt<R: Rng>(rng: &mut R, tbl: &FuzzTestTable) -> String {
+    fn random_select_stmt<R: RngExt>(rng: &mut R, tbl: &FuzzTestTable) -> String {
         // select random subset of columns
         let mut col_indices: Vec<usize> = (0..tbl.columns.len()).collect();
         let select_count = rng.random_range(1..=tbl.columns.len());
@@ -7792,7 +7789,7 @@ mod fuzz_tests {
         Select,
     }
 
-    fn pick_action<R: Rng>(rng: &mut R, db_state: &FuzzTestDbState) -> Action {
+    fn pick_action<R: RngExt>(rng: &mut R, db_state: &FuzzTestDbState) -> Action {
         if db_state.tables.is_empty() {
             return Action::CreateTable;
         }

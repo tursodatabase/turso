@@ -2,7 +2,7 @@
 
 use anarchist_readable_name_generator_lib::readable_name_custom;
 use rand::rngs::StdRng;
-use rand::{Rng, SeedableRng};
+use rand::{RngExt, SeedableRng};
 
 use crate::schema::Table;
 use crate::trace::{Coverage, ExprKind, Origin, OriginPath, StmtKind};
@@ -373,7 +373,7 @@ impl Context {
     /// Uses the anarchist readable name generator to create human-readable
     /// names like "happy_elephant" or "swift_falcon".
     pub fn gen_readable_name(&mut self) -> String {
-        readable_name_custom("_", &mut self.rng).replace('-', "_")
+        readable_name_custom("_", Rand09Rng(&mut self.rng)).replace('-', "_")
     }
 
     /// Generate a unique name with the given prefix that doesn't exist in the provided set.
@@ -428,6 +428,22 @@ impl Context {
 impl Default for Context {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+struct Rand09Rng<'a, R: ?Sized>(&'a mut R);
+
+impl<R: rand::Rng + ?Sized> rand_core_09::RngCore for Rand09Rng<'_, R> {
+    fn next_u32(&mut self) -> u32 {
+        self.0.next_u32()
+    }
+
+    fn next_u64(&mut self) -> u64 {
+        self.0.next_u64()
+    }
+
+    fn fill_bytes(&mut self, dst: &mut [u8]) {
+        self.0.fill_bytes(dst)
     }
 }
 

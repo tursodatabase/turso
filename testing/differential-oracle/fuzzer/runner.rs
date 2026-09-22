@@ -18,7 +18,7 @@ use turso_core::SqliteDialect;
 use anyhow::{Context, Result, bail};
 use comfy_table::{Attribute, Cell, Color, ContentArrangement, Table};
 use parking_lot::Mutex;
-use rand::{RngCore, SeedableRng};
+use rand::{Rng, SeedableRng};
 use rand_chacha::ChaCha8Rng;
 use turso_core::Database;
 

@@ -47,7 +47,7 @@ type PropertyQueryGenFunc<'a, R, G> =
 impl Property {
     pub(super) fn get_extensional_query_gen_function<R, G>(&self) -> PropertyQueryGenFunc<R, G>
     where
-        R: rand::Rng + ?Sized,
+        R: rand::RngExt + ?Sized,
         G: GenerationContext,
     {
         match self {
@@ -1410,7 +1410,7 @@ impl Property {
     }
 }
 
-fn random_main_table_write<R: rand::Rng + ?Sized>(
+fn random_main_table_write<R: rand::RngExt + ?Sized>(
     rng: &mut R,
     ctx: &impl GenerationContext,
     write_kinds: &[QueryDiscriminants],
@@ -1436,7 +1436,7 @@ fn random_main_table_write<R: rand::Rng + ?Sized>(
     }
 }
 
-fn random_main_table_insert<R: rand::Rng + ?Sized>(
+fn random_main_table_insert<R: rand::RngExt + ?Sized>(
     rng: &mut R,
     ctx: &impl GenerationContext,
     table: &Table,
@@ -1492,7 +1492,7 @@ fn random_main_table_insert<R: rand::Rng + ?Sized>(
     }
 }
 
-fn random_main_table_update<R: rand::Rng + ?Sized>(
+fn random_main_table_update<R: rand::RngExt + ?Sized>(
     rng: &mut R,
     ctx: &impl GenerationContext,
     table: &Table,
@@ -1588,7 +1588,7 @@ fn random_main_table_update<R: rand::Rng + ?Sized>(
     })
 }
 
-fn random_main_table_delete<R: rand::Rng + ?Sized>(rng: &mut R, table: &Table) -> Query {
+fn random_main_table_delete<R: rand::RngExt + ?Sized>(rng: &mut R, table: &Table) -> Query {
     Query::Delete(Delete {
         table: table.name.clone(),
         predicate: if rng.random_bool(0.5) {
@@ -1842,7 +1842,7 @@ fn assert_all_table_values(
     })
 }
 
-fn property_insert_values_select<R: rand::Rng + ?Sized>(
+fn property_insert_values_select<R: rand::RngExt + ?Sized>(
     rng: &mut R,
     _query_distr: &QueryDistribution,
     ctx: &impl GenerationContext,
@@ -1975,7 +1975,7 @@ fn property_insert_values_select<R: rand::Rng + ?Sized>(
     }
 }
 
-fn property_read_your_updates_back<R: rand::Rng + ?Sized>(
+fn property_read_your_updates_back<R: rand::RngExt + ?Sized>(
     rng: &mut R,
     _query_distr: &QueryDistribution,
     ctx: &impl GenerationContext,
@@ -2003,7 +2003,7 @@ fn property_read_your_updates_back<R: rand::Rng + ?Sized>(
     }
 }
 
-fn property_savepoint_rollback<R: rand::Rng + ?Sized>(
+fn property_savepoint_rollback<R: rand::RngExt + ?Sized>(
     rng: &mut R,
     query_distr: &QueryDistribution,
     ctx: &impl GenerationContext,
@@ -2036,7 +2036,7 @@ fn property_savepoint_rollback<R: rand::Rng + ?Sized>(
     }
 }
 
-fn property_table_has_expected_content<R: rand::Rng + ?Sized>(
+fn property_table_has_expected_content<R: rand::RngExt + ?Sized>(
     rng: &mut R,
     _query_distr: &QueryDistribution,
     ctx: &impl GenerationContext,
@@ -2050,7 +2050,7 @@ fn property_table_has_expected_content<R: rand::Rng + ?Sized>(
     }
 }
 
-fn property_all_tables_have_expected_content<R: rand::Rng + ?Sized>(
+fn property_all_tables_have_expected_content<R: rand::RngExt + ?Sized>(
     _rng: &mut R,
     _query_distr: &QueryDistribution,
     ctx: &impl GenerationContext,
@@ -2061,7 +2061,7 @@ fn property_all_tables_have_expected_content<R: rand::Rng + ?Sized>(
     }
 }
 
-fn property_select_limit<R: rand::Rng + ?Sized>(
+fn property_select_limit<R: rand::RngExt + ?Sized>(
     rng: &mut R,
     _query_distr: &QueryDistribution,
     ctx: &impl GenerationContext,
@@ -2081,7 +2081,7 @@ fn property_select_limit<R: rand::Rng + ?Sized>(
     Property::SelectLimit { select }
 }
 
-fn property_double_create_failure<R: rand::Rng + ?Sized>(
+fn property_double_create_failure<R: rand::RngExt + ?Sized>(
     rng: &mut R,
     _query_distr: &QueryDistribution,
     ctx: &impl GenerationContext,
@@ -2100,7 +2100,7 @@ fn property_double_create_failure<R: rand::Rng + ?Sized>(
     }
 }
 
-fn property_delete_select<R: rand::Rng + ?Sized>(
+fn property_delete_select<R: rand::RngExt + ?Sized>(
     rng: &mut R,
     _query_distr: &QueryDistribution,
     ctx: &impl GenerationContext,
@@ -2123,7 +2123,7 @@ fn property_delete_select<R: rand::Rng + ?Sized>(
     }
 }
 
-fn property_drop_select<R: rand::Rng + ?Sized>(
+fn property_drop_select<R: rand::RngExt + ?Sized>(
     rng: &mut R,
     _query_distr: &QueryDistribution,
     ctx: &impl GenerationContext,
@@ -2149,7 +2149,7 @@ fn property_drop_select<R: rand::Rng + ?Sized>(
     }
 }
 
-fn property_select_select_optimizer<R: rand::Rng + ?Sized>(
+fn property_select_select_optimizer<R: rand::RngExt + ?Sized>(
     rng: &mut R,
     _query_distr: &QueryDistribution,
     ctx: &impl GenerationContext,
@@ -2173,7 +2173,7 @@ fn property_select_select_optimizer<R: rand::Rng + ?Sized>(
     }
 }
 
-fn property_where_true_false_null<R: rand::Rng + ?Sized>(
+fn property_where_true_false_null<R: rand::RngExt + ?Sized>(
     rng: &mut R,
     _query_distr: &QueryDistribution,
     ctx: &impl GenerationContext,
@@ -2195,7 +2195,7 @@ fn property_where_true_false_null<R: rand::Rng + ?Sized>(
     }
 }
 
-fn property_union_all_preserves_cardinality<R: rand::Rng + ?Sized>(
+fn property_union_all_preserves_cardinality<R: rand::RngExt + ?Sized>(
     rng: &mut R,
     _query_distr: &QueryDistribution,
     ctx: &impl GenerationContext,
@@ -2223,7 +2223,7 @@ fn property_union_all_preserves_cardinality<R: rand::Rng + ?Sized>(
     }
 }
 
-fn property_fsync_no_wait<R: rand::Rng + ?Sized>(
+fn property_fsync_no_wait<R: rand::RngExt + ?Sized>(
     rng: &mut R,
     query_distr: &QueryDistribution,
     ctx: &impl GenerationContext,
@@ -2235,7 +2235,7 @@ fn property_fsync_no_wait<R: rand::Rng + ?Sized>(
     }
 }
 
-fn property_faulty_query<R: rand::Rng + ?Sized>(
+fn property_faulty_query<R: rand::RngExt + ?Sized>(
     rng: &mut R,
     query_distr: &QueryDistribution,
     ctx: &impl GenerationContext,
@@ -2246,7 +2246,7 @@ fn property_faulty_query<R: rand::Rng + ?Sized>(
     }
 }
 
-fn property_sequence_monotonicity<R: rand::Rng + ?Sized>(
+fn property_sequence_monotonicity<R: rand::RngExt + ?Sized>(
     rng: &mut R,
     _query_distr: &QueryDistribution,
     _ctx: &impl GenerationContext,
@@ -2309,7 +2309,7 @@ type PropertyGenFunc<R, G> = fn(&mut R, &QueryDistribution, &G, bool) -> Propert
 impl PropertyDiscriminants {
     fn gen_function<R, G>(&self) -> PropertyGenFunc<R, G>
     where
-        R: rand::Rng + ?Sized,
+        R: rand::RngExt + ?Sized,
         G: GenerationContext,
     {
         match self {
@@ -2551,7 +2551,7 @@ impl<'a> WeightedDistribution for PropertyDistribution<'a> {
         &self.weights
     }
 
-    fn sample<R: rand::Rng + ?Sized, C: GenerationContext>(
+    fn sample<R: rand::RngExt + ?Sized, C: GenerationContext>(
         &self,
         rng: &mut R,
         conn_ctx: &C,
@@ -2564,7 +2564,7 @@ impl<'a> WeightedDistribution for PropertyDistribution<'a> {
 }
 
 impl<'a> ArbitraryFrom<&PropertyDistribution<'a>> for Property {
-    fn arbitrary_from<R: rand::Rng + ?Sized, C: GenerationContext>(
+    fn arbitrary_from<R: rand::RngExt + ?Sized, C: GenerationContext>(
         rng: &mut R,
         conn_ctx: &C,
         property_distr: &PropertyDistribution<'a>,

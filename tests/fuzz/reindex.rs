@@ -3,7 +3,7 @@ mod reindex_fuzz_tests {
     use crate::helpers;
     use core_tester::common::TempDatabase;
     use rand::seq::IndexedRandom;
-    use rand::Rng;
+    use rand::RngExt;
     use rand_chacha::ChaCha8Rng;
     use rusqlite::params;
     use std::sync::Arc;

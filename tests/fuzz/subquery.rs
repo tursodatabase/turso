@@ -6,7 +6,7 @@
 
 #[cfg(test)]
 mod subquery_tests {
-    use rand::Rng;
+    use rand::RngExt;
     use rand_chacha::ChaCha8Rng;
 
     use crate::helpers;

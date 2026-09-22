@@ -8,7 +8,7 @@ use core_tester::common::TempDatabase;
 #[serial_test::file_serial]
 pub fn fuzz_pending_byte_database(db: TempDatabase) -> anyhow::Result<()> {
     use core_tester::common::rusqlite_integrity_check;
-    use rand::Rng;
+    use rand::RngExt;
 
     let (mut rng, _seed) = helpers::init_fuzz_test_tracing("fuzz_pending_byte_database");
 
