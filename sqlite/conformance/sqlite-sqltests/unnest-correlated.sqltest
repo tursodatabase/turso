@@ -1417,6 +1417,56 @@ expect {
     not exists|4
 }
 
+@setup correlated_rows
+@var polarity { EXISTS | NOT EXISTS }
+@var link { i.key1 = o.key1 | i.key1 IS o.key1 | i.key1 < o.key1 }
+@var comparison {
+    i.amount = o.amount | o.amount = i.amount
+    | i.amount <> o.amount | o.amount <> i.amount
+    | i.amount < o.amount | o.amount < i.amount
+    | i.amount <= o.amount | o.amount <= i.amount
+    | i.amount > o.amount | o.amount > i.amount
+    | i.amount >= o.amount | o.amount >= i.amount
+    | i.amount IS o.amount | o.amount IS i.amount
+    | i.amount IS NOT o.amount | o.amount IS NOT i.amount
+}
+matrix correlated-comparison-results {
+    SELECT o.id
+    FROM outer_rows AS o
+    WHERE $polarity (
+        SELECT 1 FROM inner_rows AS i
+        WHERE $link AND $comparison
+    )
+    ORDER BY o.id;
+}
+
+@setup correlated_rows
+@var join_type { LEFT | RIGHT }
+@var polarity { EXISTS | NOT EXISTS }
+@var comparison { i.amount < k.key2 | i.amount IS NOT k.key2 }
+matrix correlated-comparison-after-outer-join {
+    SELECT o.id, k.id
+    FROM outer_rows AS o $join_type JOIN outer_key2 AS k ON o.id = k.id
+    WHERE $polarity (
+        SELECT 1 FROM inner_rows AS i WHERE $comparison
+    )
+    ORDER BY o.id, k.id;
+}
+
+@setup correlated_rows
+@var polarity { EXISTS | NOT EXISTS }
+@var comparison { s.amount < i.amount | s.amount IS NOT i.amount }
+matrix correlated-comparison-after-full-join {
+    SELECT o.id, k.id, i.key1, i.amount
+    FROM outer_rows AS o
+    JOIN outer_key2 AS k ON o.id = k.id
+    FULL JOIN inner_rows AS i ON k.key2 = i.key2
+    WHERE $polarity (
+        SELECT 1 FROM outer_rows AS s WHERE $comparison
+    )
+    ORDER BY o.id, k.id, i.key1, i.amount;
+}
+
 # Both forms must use a join instead of a subquery call for each row.
 @setup correlated_rows
 @skip-if sqlite "query plan explanation output is different in sqlite"
