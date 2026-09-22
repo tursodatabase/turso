@@ -90,6 +90,25 @@ setup compound_branch_seek_schema {
     INSERT INTO item VALUES (6, 7, 'e');
 }
 
+setup or_join_rows {
+    CREATE TABLE or_left(id INTEGER PRIMARY KEY, x INTEGER, flag INTEGER);
+    CREATE INDEX or_left_x ON or_left(x);
+    INSERT INTO or_left VALUES
+        (1, 1, 1), (2, 1, 0), (3, 2, 1), (4, 2, 0), (5, NULL, 1), (6, 3, 1);
+
+    CREATE TABLE or_right(id INTEGER PRIMARY KEY, left_id INTEGER, y INTEGER);
+    CREATE INDEX or_right_y ON or_right(y);
+    INSERT INTO or_right VALUES
+        (1, 1, 2), (2, 1, 1), (3, 2, 2), (4, 3, 1),
+        (5, 3, 2), (6, 4, 1), (7, 5, NULL), (8, 999, 1);
+}
+
+setup implied_or_plan_schema {
+    CREATE TABLE a(x INTEGER, z INTEGER);
+    CREATE INDEX ax ON a(x);
+    CREATE TABLE b(y INTEGER);
+}
+
 # Basic: find entities connected to a specific node via 'knows' edges (bidirectional)
 @setup graph_schema
 test compound-or-basic {
@@ -342,6 +361,248 @@ expect {
     1|0|0|SEARCH e USING INDEX idx_edge_label (label=?)
     2|0|0|MULTI-INDEX OR n (sqlite_autoindex_node_1, sqlite_autoindex_node_1)
     4|0|0|USE HASH TABLE FOR DISTINCT
+}
+
+@skip-if sqlite "Turso summarizes multi-index branches on one plan row"
+test compound-or-keeps-correlated-index-columns-together {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, x INTEGER, y INTEGER, payload TEXT);
+    CREATE INDEX txy ON t(x, y);
+
+    EXPLAIN QUERY PLAN
+    SELECT *
+    FROM t
+    WHERE (x = 1 AND y = 10) OR (x = 2 AND y = 20);
+}
+expect {
+    1|0|0|MULTI-INDEX OR t (txy, txy)
+}
+
+@skip-if sqlite "Turso reports its row estimates in JSON"
+@skip-if mvcc "MVCC does not reload sqlite_stat1 after this test changes it"
+test derived-or-filter-skips-correlated-columns {
+    CREATE TABLE correlated_values(x INTEGER, y INTEGER);
+    ANALYZE;
+    DELETE FROM sqlite_stat1;
+    INSERT INTO sqlite_stat1(tbl, idx, stat)
+        VALUES ('correlated_values', NULL, '1000');
+    ANALYZE sqlite_schema;
+
+    EXPLAIN QUERY PLAN FORMAT=JSON
+    SELECT count(*)
+    FROM correlated_values
+    WHERE (x = 1 AND y = 1) OR (x = 2 AND y = 2);
+}
+expect pattern {
+    "rows_per_input":1000
+}
+
+@setup implied_or_plan_schema
+@skip-if sqlite "Turso uses one index search for the implied IN filter"
+test implied-or-filter-accepts-parenthesized-equalities {
+    EXPLAIN QUERY PLAN
+    SELECT * FROM a JOIN b ON 1 = 1
+    WHERE ((a.x = 1) AND b.y = 1)
+       OR ((a.x = 2) AND b.y = 2);
+}
+expect {
+    1|0|0|SCAN b
+    2|0|0|SEARCH a USING INDEX ax (x=?)
+}
+
+@setup implied_or_plan_schema
+@skip-if sqlite "Turso uses one index search for the implied IN filter"
+test implied-or-filter-accepts-negative-numbers {
+    EXPLAIN QUERY PLAN
+    SELECT * FROM a JOIN b ON 1 = 1
+    WHERE (a.x = -1 AND b.y = 1)
+       OR (a.x = -2 AND b.y = 2);
+}
+expect {
+    1|0|0|SCAN b
+    2|0|0|SEARCH a USING INDEX ax (x=?)
+}
+
+@setup implied_or_plan_schema
+@skip-if sqlite "Turso uses one index search for the implied IN filter"
+test implied-or-filter-uses-only-indexed-column {
+    EXPLAIN QUERY PLAN
+    SELECT * FROM a JOIN b ON 1 = 1
+    WHERE (a.x = 1 AND a.z = 10 AND b.y = 1)
+       OR (a.x = 2 AND a.z = 20 AND b.y = 2);
+}
+expect {
+    1|0|0|SCAN b
+    2|0|0|SEARCH a USING INDEX ax (x=?)
+}
+
+@skip-if sqlite "Turso summarizes multi-index branches on one plan row"
+test implied-or-filter-keeps-compound-index-searches {
+    CREATE TABLE a(x INTEGER, z INTEGER);
+    CREATE INDEX axz ON a(x, z);
+    CREATE TABLE b(y INTEGER);
+
+    EXPLAIN QUERY PLAN
+    SELECT * FROM a JOIN b ON 1 = 1
+    WHERE (a.x = 1 AND a.z = 10 AND b.y = 1)
+       OR (a.x = 2 AND a.z = 20 AND b.y = 2);
+}
+expect {
+    1|0|0|SCAN b
+    2|0|0|MULTI-INDEX OR a (axz, axz)
+}
+
+test implied-or-filter-keeps-negative-number-results {
+    CREATE TABLE a(id INTEGER PRIMARY KEY, x INTEGER);
+    CREATE INDEX ax ON a(x);
+    INSERT INTO a VALUES (1, -1), (2, -2), (3, 1), (4, NULL);
+    CREATE TABLE b(y INTEGER);
+    INSERT INTO b VALUES (1), (2);
+
+    SELECT a.id, b.y FROM a JOIN b ON 1 = 1
+    WHERE ((a.x) = (-1) AND b.y = 1)
+       OR ((a.x) = (-2) AND b.y = 2)
+    ORDER BY a.id, b.y;
+}
+expect {
+    1|1
+    2|2
+}
+
+test implied-or-filter-keeps-correlated-column-results {
+    CREATE TABLE a(id INTEGER PRIMARY KEY, x INTEGER, z INTEGER);
+    CREATE INDEX ax ON a(x);
+    INSERT INTO a VALUES (1, 1, 10), (2, 1, 20), (3, 2, 10), (4, 2, 20);
+    CREATE TABLE b(y INTEGER);
+    INSERT INTO b VALUES (1), (2);
+
+    SELECT a.id, b.y FROM a JOIN b ON 1 = 1
+    WHERE (a.x = 1 AND a.z = 10 AND b.y = 1)
+       OR (a.x = 2 AND a.z = 20 AND b.y = 2)
+    ORDER BY a.id, b.y;
+}
+expect {
+    1|1
+    4|2
+}
+
+@skip-if sqlite "Turso summarizes repeated IN searches on one plan row"
+test nested-or-branches-use-one-index-search {
+    CREATE TABLE t(x INTEGER);
+    CREATE INDEX tx ON t(x);
+
+    EXPLAIN QUERY PLAN
+    SELECT *
+    FROM t
+    WHERE x = 1 OR (x = 2 OR x = 3);
+}
+expect {
+    1|0|0|SEARCH t USING COVERING INDEX tx (x=?)
+}
+
+@skip-if sqlite "Turso summarizes repeated IN searches on one plan row"
+test nested-and-branches-use-one-index-search {
+    CREATE TABLE t(x INTEGER, y INTEGER, z INTEGER);
+    CREATE INDEX tx ON t(x);
+
+    EXPLAIN QUERY PLAN
+    SELECT *
+    FROM t
+    WHERE (y > 0 AND (x = 1 AND z > 0))
+       OR (y < 0 AND (x = 2 AND z < 0));
+}
+expect {
+    1|0|0|SEARCH t USING INDEX tx (x=?)
+}
+
+@setup or_join_rows
+@var join_type { JOIN | LEFT JOIN | FULL OUTER JOIN }
+@var filter {
+    (l.x = 1 AND r.y = 2) OR (l.x = 2 AND r.y = 1)
+    | (1 = l.x AND 2 = r.y) OR (2 = l.x AND 1 = r.y)
+    | (l.x = 1 AND r.y = 2) OR r.y = 1
+    | (l.x = 1 AND (r.y = 2 AND l.flag = 1)) OR (l.x = 2 AND (r.y = 1 AND l.flag = 1))
+}
+matrix inferred-or-filters-keep-join-results {
+    SELECT l.id, r.id, l.x, r.y
+    FROM or_left AS l $join_type or_right AS r ON l.id = r.left_id
+    WHERE $filter
+    ORDER BY l.id, r.id;
+}
+
+@setup or_join_rows
+test outer-join-or-condition-keeps-unmatched-left-rows {
+    SELECT l.id, r.id
+    FROM or_left AS l
+    LEFT JOIN or_right AS r
+      ON l.id = r.left_id
+     AND ((l.x = 1 AND r.y = 2) OR (l.x = 2 AND r.y = 1))
+    ORDER BY l.id, r.id;
+}
+expect {
+    1|1
+    2|3
+    3|4
+    4|6
+    5|
+    6|
+}
+
+@setup or_join_rows
+test inferred-or-filter-keeps-update-results {
+    UPDATE or_left SET flag = flag + 10 WHERE x = 1 OR x = 2;
+    SELECT id, flag FROM or_left ORDER BY id;
+}
+expect {
+    1|11
+    2|10
+    3|11
+    4|10
+    5|1
+    6|1
+}
+
+@setup or_join_rows
+test two-column-or-keeps-delete-results {
+    DELETE FROM or_left
+    WHERE (x = 1 AND flag = 0) OR (x = 2 AND flag = 1);
+    SELECT id FROM or_left ORDER BY id;
+}
+expect {
+    1
+    4
+    5
+    6
+}
+
+test inferred-or-filter-keeps-text-collation {
+    CREATE TABLE collated_values(id INTEGER PRIMARY KEY, value TEXT COLLATE NOCASE);
+    CREATE INDEX collated_value_index ON collated_values(value);
+    INSERT INTO collated_values VALUES
+        (1, 'abc'), (2, 'ABC'), (3, 'def'), (4, 'xyz'), (5, NULL);
+
+    SELECT id FROM collated_values
+    WHERE value = 'AbC' OR value = 'DeF'
+    ORDER BY id;
+}
+expect {
+    1
+    2
+    3
+}
+
+test inferred-or-filter-keeps-blob-and-integer-values {
+    CREATE TABLE mixed_values(id INTEGER PRIMARY KEY, value BLOB);
+    CREATE INDEX mixed_value_index ON mixed_values(value);
+    INSERT INTO mixed_values VALUES
+        (1, X'31'), (2, 1), (3, '1'), (4, X'32'), (5, NULL);
+
+    SELECT id FROM mixed_values
+    WHERE value = X'31' OR value = 1
+    ORDER BY id;
+}
+expect {
+    1
+    2
 }
 
 # Snapshot EQP: correlated subquery residuals should fall back to a regular scan
