@@ -9254,12 +9254,23 @@ pub fn op_agg_final(
     }
     let func = func.expect_agg();
 
+    if let Register::Aggregate(AggContext::External(_)) = &state.registers[acc_reg] {
+        let Register::Aggregate(agg) =
+            std::mem::replace(&mut state.registers[acc_reg], Register::Value(Value::Null))
+        else {
+            unreachable!("register was checked to hold an external aggregate");
+        };
+        let value = agg.compute_external()?;
+        state.registers[dest_reg].set_value(value);
+        state.pc += 1;
+        return Ok(InsnFunctionStepResult::Step);
+    }
+
     match &state.registers[acc_reg] {
         Register::Aggregate(agg) => {
             let value = match agg {
                 AggContext::External(_) => {
-                    // External aggregates use FFI finalization
-                    agg.compute_external()?
+                    unreachable!("external aggregates are finalized above")
                 }
                 AggContext::Builtin(payload) => match func {
                     AggFunc::Count | AggFunc::Count0 => {

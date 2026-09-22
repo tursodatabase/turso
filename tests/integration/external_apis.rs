@@ -963,3 +963,153 @@ fn custom_collations_cover_dotnet_create_collation_cases(
 
     Ok(())
 }
+
+static TRACKED_DOUBLE_DESTROYS: AtomicUsize = AtomicUsize::new(0);
+static TRACKED_CALLS_AFTER_DESTROY: AtomicUsize = AtomicUsize::new(0);
+
+struct TrackedState {
+    sum: i64,
+    destroyed: bool,
+}
+
+unsafe extern "C" fn tracked_init(_context: usize) -> *mut AggCtx {
+    let state = Box::into_raw(Box::new(TrackedState {
+        sum: 0,
+        destroyed: false,
+    }));
+    Box::into_raw(Box::new(AggCtx {
+        state: state as *mut c_void,
+    }))
+}
+
+unsafe fn tracked_state<'a>(aggregate_context: *mut AggCtx) -> &'a mut TrackedState {
+    let aggregate_context = unsafe { &mut *aggregate_context };
+    unsafe { &mut *(aggregate_context.state as *mut TrackedState) }
+}
+
+unsafe extern "C" fn tracked_step(
+    _context: usize,
+    aggregate_context: *mut AggCtx,
+    argc: i32,
+    argv: *const ExtValue,
+) -> ExtValue {
+    let state = unsafe { tracked_state(aggregate_context) };
+    if state.destroyed {
+        TRACKED_CALLS_AFTER_DESTROY.fetch_add(1, AtomicOrdering::SeqCst);
+        return ExtValue::error_with_message("step on destroyed state".to_string());
+    }
+    if argc > 0 && !argv.is_null() {
+        let args = unsafe { std::slice::from_raw_parts(argv, argc as usize) };
+        state.sum += args
+            .first()
+            .and_then(ExtValue::to_integer)
+            .unwrap_or_default();
+    }
+    ExtValue::null()
+}
+
+unsafe extern "C" fn tracked_final_fails(
+    _context: usize,
+    aggregate_context: *mut AggCtx,
+) -> ExtValue {
+    let state = unsafe { tracked_state(aggregate_context) };
+    if state.destroyed {
+        TRACKED_CALLS_AFTER_DESTROY.fetch_add(1, AtomicOrdering::SeqCst);
+    }
+    ExtValue::error_with_message("Final failed".to_string())
+}
+
+unsafe extern "C" fn tracked_destroy(aggregate_context: usize) {
+    let state = unsafe { tracked_state(aggregate_context as *mut AggCtx) };
+    if state.destroyed {
+        TRACKED_DOUBLE_DESTROYS.fetch_add(1, AtomicOrdering::SeqCst);
+        return;
+    }
+    state.destroyed = true;
+}
+
+fn step_until_error_or_done(stmt: &mut turso_core::Statement) -> Option<LimboError> {
+    loop {
+        match stmt.step() {
+            Ok(StepResult::IO) => stmt.get_pager().io.step().unwrap(),
+            Ok(StepResult::Row) => {}
+            Ok(StepResult::Done) => return None,
+            Ok(other) => panic!("unexpected step result {other:?}"),
+            Err(err) => return Some(err),
+        }
+    }
+}
+
+#[turso_macros::test]
+#[serial]
+fn external_aggregate_finalize_error_destroys_state_once(
+    tmp_db: TempDatabase,
+) -> anyhow::Result<()> {
+    TRACKED_DOUBLE_DESTROYS.store(0, AtomicOrdering::SeqCst);
+    TRACKED_CALLS_AFTER_DESTROY.store(0, AtomicOrdering::SeqCst);
+    let conn = tmp_db.connect_limbo();
+    register_context_aggregate(
+        &conn,
+        "final_fails",
+        1,
+        0,
+        tracked_init,
+        tracked_step,
+        tracked_final_fails,
+        None,
+        Some(tracked_destroy),
+        None,
+    )?;
+    conn.execute("CREATE TABLE data(value INTEGER)")?;
+    conn.execute("INSERT INTO data VALUES (1), (2)")?;
+
+    let mut stmt = conn.prepare("SELECT final_fails(value) FROM data")?;
+    let err = step_until_error_or_done(&mut stmt).expect("finalize error");
+    assert!(err.to_string().contains("Final failed"), "{err}");
+
+    for _ in 0..3 {
+        let err = step_until_error_or_done(&mut stmt).expect("finalize error on re-step");
+        assert!(err.to_string().contains("Final failed"), "{err}");
+    }
+
+    assert_eq!(TRACKED_DOUBLE_DESTROYS.load(AtomicOrdering::SeqCst), 0);
+    assert_eq!(TRACKED_CALLS_AFTER_DESTROY.load(AtomicOrdering::SeqCst), 0);
+    Ok(())
+}
+
+#[turso_macros::test]
+#[serial]
+fn external_aggregate_cannot_be_used_as_window_function(
+    tmp_db: TempDatabase,
+) -> anyhow::Result<()> {
+    let counters = Arc::new(CallbackCounters::default());
+    let conn = tmp_db.connect_limbo();
+    register_context_aggregate(
+        &conn,
+        "managed_sum",
+        1,
+        boxed_aggregate_context(counters.clone()),
+        managed_sum_init,
+        managed_sum_step,
+        managed_sum_final,
+        Some(drop_aggregate_context),
+        Some(drop_sum_state),
+        None,
+    )?;
+    conn.execute("CREATE TABLE data(id INTEGER PRIMARY KEY, value INTEGER)")?;
+    conn.execute("INSERT INTO data(value) VALUES (1), (2), (3)")?;
+
+    let err = conn
+        .prepare("SELECT managed_sum(value) OVER (ORDER BY id) FROM data")
+        .unwrap_err();
+    assert!(
+        err.to_string().contains(
+            "managed_sum() is an extension aggregate and cannot be used as a window function"
+        ),
+        "{err}"
+    );
+
+    let grouped: Vec<(i64,)> = conn.exec_rows("SELECT managed_sum(value) FROM data");
+    assert_eq!(grouped, vec![(6,)]);
+    Ok(())
+}
