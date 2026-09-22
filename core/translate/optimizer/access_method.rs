@@ -1308,10 +1308,17 @@ pub fn try_hash_join_access_method(
     hash_can_replace_build_index: bool,
     subqueries: &[NonFromClauseSubquery],
     params: &CostModelParams,
+    using_results_are_explicit: bool,
 ) -> Result<Option<AccessMethod>> {
     let hash_join_type = hash_join_type(probe_table);
 
-    if should_not_use_hash_join(build_table, probe_table, subqueries, hash_join_type) {
+    if should_not_use_hash_join(
+        build_table,
+        probe_table,
+        subqueries,
+        hash_join_type,
+        using_results_are_explicit,
+    ) {
         return Ok(None);
     }
 
@@ -1455,6 +1462,7 @@ fn should_not_use_hash_join(
     probe_table: &JoinedTable,
     subqueries: &[NonFromClauseSubquery],
     join_type: HashJoinType,
+    using_results_are_explicit: bool,
 ) -> bool {
     let (Table::BTree(build_btree), Table::BTree(probe_btree)) =
         (&build_table.table, &probe_table.table)
@@ -1498,14 +1506,17 @@ fn should_not_use_hash_join(
             .is_some_and(|ji| ji.is_outer())
     };
     let is_using_or_natural_join = || -> bool {
+        // A generated FULL JOIN computes its merged USING values in result columns.
+        // Other USING joins still need the normal output rules.
         build_table
             .join_info
             .as_ref()
             .is_some_and(|ji| !ji.using.is_empty())
-            || probe_table
-                .join_info
-                .as_ref()
-                .is_some_and(|ji| !ji.using.is_empty())
+            || ((!using_results_are_explicit || join_type != HashJoinType::FullOuter)
+                && probe_table
+                    .join_info
+                    .as_ref()
+                    .is_some_and(|ji| !ji.using.is_empty()))
     };
     let some_correlated_subqueries_reference_the_joined_tables = || -> bool {
         subqueries

@@ -786,6 +786,8 @@ pub struct SelectPlan {
     /// non-FROM subqueries may be re-optimized after their parent join order is
     /// known so their inner FROM-subqueries can cost repeated probes correctly.
     pub input_cardinality_hint: Option<f64>,
+    /// The result columns compute merged USING values, as in a parenthesized join.
+    pub using_results_are_explicit: bool,
     /// Estimated output rows from the optimizer's join order computation.
     /// Used to propagate cardinality estimates for CTE/subquery tables.
     pub estimated_output_rows: Option<f64>,

@@ -703,6 +703,13 @@ pub fn bind_and_rewrite_expr<'a>(
 ///
 /// A parenthesized join can keep several source columns with the same name.
 /// Hidden source copies do not take part in an unqualified lookup.
+pub(in crate::translate) fn find_unqualified_column(
+    table: &Table,
+    column_name: &str,
+) -> Result<Option<usize>> {
+    find_unqualified_column_with_rowid(table, column_name, true)
+}
+
 fn find_unqualified_column_with_rowid(
     table: &Table,
     column_name: &str,

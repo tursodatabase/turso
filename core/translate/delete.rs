@@ -462,6 +462,7 @@ fn ensure_delete_uses_rowset(program: &mut ProgramBuilder, plan: &mut DeletePlan
         // WHERE subqueries should already be planned into this SelectPlan when needed.
         non_from_clause_subqueries: vec![],
         input_cardinality_hint: None,
+        using_results_are_explicit: false,
         estimated_output_rows: None,
         estimated_cost: None,
         simple_aggregate: None,

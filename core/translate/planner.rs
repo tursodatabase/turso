@@ -3,7 +3,7 @@ use crate::{turso_assert, turso_assert_greater_than_or_equal};
 
 use super::plan::NamedWindowBound;
 use super::{
-    expr::{walk_expr, walk_expr_mut},
+    expr::{find_unqualified_column, walk_expr, walk_expr_mut},
     plan::{
         query_output_columns, Aggregate, ColumnMask, ColumnUsedMask, Distinctness, EvalAt,
         IterationDirection, JoinInfo, JoinOrderMember, JoinType as PlanJoinType, JoinedTable,
@@ -1757,20 +1757,29 @@ fn keep_parenthesized_join_columns(table: &mut JoinedTable) -> Result<()> {
     let mut join_columns = crate::alloc::vec![];
     let mut used_columns = Vec::new();
 
-    for (table_index, source_table) in source_tables.iter().enumerate() {
-        let next_using = source_tables
-            .get(table_index + 1)
-            .and_then(|next| next.join_info.as_ref())
-            .map(|join| join.using.as_slice())
-            .unwrap_or_default();
+    let right_join_swapped = plan.table_references.right_join_swapped();
+    let source_order: Vec<_> = if right_join_swapped {
+        source_tables.iter().enumerate().rev().collect()
+    } else {
+        source_tables.iter().enumerate().collect()
+    };
+    for (table_index, source_table) in source_order {
+        let next_using = if right_join_swapped {
+            (table_index == 1).then_some(source_table)
+        } else {
+            source_tables.get(table_index + 1)
+        }
+        .and_then(|next| next.join_info.as_ref())
+        .map(|join| join.using.as_slice())
+        .unwrap_or_default();
 
         // SQLite stores one canonical value before the source columns on both
         // sides of `USING`. Outer unqualified names find this value first.
         for using_name in next_using {
             let column_name = using_name.as_str();
-            let (expr, source_column) =
-                resolve_parenthesized_using_column(source_tables, table_index, column_name);
-            used_columns.push(source_column);
+            let (expr, source_columns) =
+                resolve_parenthesized_using_column(source_tables, table_index, column_name)?;
+            used_columns.extend(source_columns);
             result_columns.push(parenthesized_join_result_column(expr, column_name));
             join_columns.push(ParenthesizedJoinColumn {
                 source: ParenthesizedJoinColumnSource::Using {
@@ -1785,6 +1794,11 @@ fn keep_parenthesized_join_columns(table: &mut JoinedTable) -> Result<()> {
                 .join_info
                 .as_ref()
                 .is_some_and(|join| join.merges_column(column_name))
+                || (right_join_swapped
+                    && source_tables[1]
+                        .join_info
+                        .as_ref()
+                        .is_some_and(|join| join.merges_column(column_name)))
                 || next_using
                     .iter()
                     .any(|name| name.as_str().eq_ignore_ascii_case(column_name))
@@ -1858,6 +1872,7 @@ fn keep_parenthesized_join_columns(table: &mut JoinedTable) -> Result<()> {
     }
 
     plan.result_columns = result_columns;
+    plan.using_results_are_explicit = true;
     for (table_id, column_index) in used_columns {
         plan.table_references
             .mark_column_used(table_id, column_index);
@@ -1918,22 +1933,51 @@ fn resolve_parenthesized_using_column(
     tables: &[JoinedTable],
     last_table_index: usize,
     column_name: &str,
-) -> (Expr, (TableInternalId, usize)) {
-    for table in &tables[..=last_table_index] {
-        let Some((column_index, column)) = table.table.get_column_by_name(column_name) else {
+) -> Result<(Expr, Vec<(TableInternalId, usize)>)> {
+    let mut expr = None;
+    let mut used_columns = Vec::new();
+    for (table_index, table) in tables.iter().enumerate() {
+        let join_info = table.join_info.as_ref();
+        let merges_column = join_info.is_some_and(|join| join.merges_column(column_name));
+        let is_full_outer = join_info.is_some_and(JoinInfo::is_full_outer);
+        if expr.is_some() && merges_column && !is_full_outer {
+            continue;
+        }
+        let Some(column_index) = find_unqualified_column(&table.table, column_name)? else {
             continue;
         };
-        return (
-            Expr::Column {
-                database: None,
-                table: table.internal_id,
-                column: column_index,
-                is_rowid_alias: column.is_rowid_alias(),
+        if expr.is_some() && !merges_column {
+            crate::bail_parse_error!("ambiguous column name: {}", column_name);
+        }
+        if table_index > last_table_index + 1 {
+            continue;
+        }
+        let source = Expr::Column {
+            database: None,
+            table: table.internal_id,
+            column: column_index,
+            is_rowid_alias: table.columns()[column_index].is_rowid_alias(),
+        };
+        expr = Some(match expr.take() {
+            None => source,
+            Some(previous) => Expr::FunctionCall {
+                name: ast::Name::exact("coalesce".to_string()),
+                distinctness: None,
+                args: vec![Box::new(previous), Box::new(source)],
+                order_by: vec![],
+                within_group: vec![],
+                filter_over: ast::FunctionTail {
+                    filter_clause: None,
+                    over_clause: None,
+                },
             },
-            (table.internal_id, column_index),
-        );
+        });
+        used_columns.push((table.internal_id, column_index));
     }
-    unreachable!("USING already proved that the column exists");
+    Ok((
+        expr.expect("USING already proved that the column exists"),
+        used_columns,
+    ))
 }
 
 #[allow(clippy::too_many_arguments)]
