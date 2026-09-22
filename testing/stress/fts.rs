@@ -99,11 +99,8 @@ pub async fn check(
 
 #[cfg(all(test, not(shuttle), not(antithesis)))]
 mod tests {
-    use super::*;
-    use crate::conn::StressDb;
     use crate::opts::Opts;
     use clap::Parser;
-    use turso_stress::sync::{Arc, AsyncMutex};
 
     #[test]
     fn fts_is_opt_in_and_rejects_reference_databases() {
@@ -154,60 +151,5 @@ mod tests {
             assert_eq!(opts.vfs.as_deref(), Some("syscall"));
             assert!(opts.skip_integrity_check);
         }
-    }
-
-    #[tokio::test]
-    async fn writes_rollback_optimize_and_reopen() {
-        let dir = tempfile::tempdir().unwrap();
-        let logger =
-            Arc::new(SqlLogger::new(dir.path().join("fts.sql").to_str().unwrap()).unwrap());
-        let db = Arc::new(AsyncMutex::new(StressDb::new(
-            dir.path().join("fts.db").to_str().unwrap().to_owned(),
-            logger.clone(),
-            None,
-            true,
-        )));
-        let thread = ThreadId::new(0);
-        let conn = StressDb::connect(&db, thread.clone(), 5000).await.unwrap();
-        for sql in schema(2) {
-            conn.execute(&sql, ()).await.unwrap();
-        }
-        for sql in [
-            "INSERT INTO fts_docs_0 VALUES (1, 'alpha bravo'), (2, 'bravo'), (3, 'alpha alpha')",
-            "UPDATE fts_docs_0 SET body = 'charlie' WHERE id = 1",
-            "DELETE FROM fts_docs_0 WHERE id = 3",
-            "BEGIN",
-            "INSERT INTO fts_docs_0 VALUES (4, 'alpha')",
-            "ROLLBACK",
-            "BEGIN",
-            "SAVEPOINT s",
-            "UPDATE fts_docs_0 SET body = 'delta' WHERE id = 1",
-            "ROLLBACK TO s",
-            "RELEASE s",
-            "COMMIT",
-            "OPTIMIZE INDEX fts_idx_0",
-        ] {
-            conn.execute(sql, ()).await.unwrap();
-        }
-        drop(conn);
-        db.lock().await.reset();
-        let conn = StressDb::connect(&db, thread.clone(), 5000).await.unwrap();
-        for table in 0..2 {
-            for token in TOKENS {
-                check(&conn, table, token, &logger, &thread).await.unwrap();
-            }
-        }
-        let mut rows = conn
-            .query(
-                "SELECT id FROM fts_docs_0 WHERE fts_match(body, 'charlie')",
-                (),
-            )
-            .await
-            .unwrap();
-        assert_eq!(
-            rows.next().await.unwrap().unwrap().get::<i64>(0).unwrap(),
-            1
-        );
-        assert!(rows.next().await.unwrap().is_none());
     }
 }

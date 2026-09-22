@@ -904,37 +904,38 @@ async fn async_main(opts: Opts) -> Result<(), Box<dyn std::error::Error + Send +
         if !opts.skip_integrity_check {
             println!("Running Turso integrity check (FTS schema is not SQLite-compatible)");
             let mut rows = conn.query("PRAGMA integrity_check", ()).await?;
-            let row = rows
-                .next()
-                .await?
-                .expect("integrity check must return a row");
-            assert_eq!(
-                row.get::<String>(0)?,
-                "ok",
-                "FTS database integrity check failed"
+            let mut results = Vec::new();
+            while let Some(row) = rows.next().await? {
+                results.push(row.get::<String>(0)?);
+            }
+            turso_macros::turso_assert!(
+                !results.is_empty(),
+                "FTS integrity check returned no rows",
+                { "path": db_file, "results": results }
             );
-            assert!(
-                rows.next().await?.is_none(),
-                "integrity check returned extra rows"
+            turso_macros::turso_assert_eq!(
+                results.as_slice(),
+                ["ok"],
+                "FTS database integrity check failed",
+                { "path": db_file, "results": results }
             );
         }
-    }
-
-    // Switch back to WAL mode before SQLite integrity check if we were in MVCC mode.
-    // SQLite/rusqlite doesn't understand MVCC journal mode.
-    if opts.tx_mode == TxMode::Concurrent && !opts.fts {
-        let mut builder = Builder::new_local(&db_file);
-        if let Some(ref vfs) = vfs_option {
-            builder = builder.with_io(vfs.clone());
-        }
-        let db = builder.build().await?;
-        let conn = db.connect()?;
-        conn.pragma_update("journal_mode", "WAL").await?;
-        println!("Switched journal mode back to WAL for SQLite integrity check");
     }
 
     #[cfg(not(miri))]
     if !opts.skip_integrity_check && !opts.fts {
+        // Switch back to WAL mode before SQLite integrity check if we were in MVCC mode.
+        // SQLite/rusqlite doesn't understand MVCC journal mode.
+        if opts.tx_mode == TxMode::Concurrent {
+            let mut builder = Builder::new_local(&db_file);
+            if let Some(ref vfs) = vfs_option {
+                builder = builder.with_io(vfs.clone());
+            }
+            let db = builder.build().await?;
+            let conn = db.connect()?;
+            conn.pragma_update("journal_mode", "WAL").await?;
+            println!("Switched journal mode back to WAL for SQLite integrity check");
+        }
         println!("Running SQLite Integrity check");
         sqlite_integrity_check(std::path::Path::new(&db_file))?;
     }
