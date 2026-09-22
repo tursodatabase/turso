@@ -87,6 +87,98 @@ fn sqlite_schema_row_range_bounds() -> (Bound<RowID>, Bound<RowID>) {
     )
 }
 
+/// The first key of the table after `table_id`. None for sqlite_schema, which
+/// has the largest table id.
+fn next_table_start(table_id: MVTableId) -> Option<RowID> {
+    if table_id == SQLITE_SCHEMA_MVCC_TABLE_ID {
+        return None;
+    }
+    let next = MVTableId::from(i64::from(table_id) + 1);
+    Some(RowID::new(next, RowKey::Int(i64::MIN)))
+}
+
+/// Position of a forward walk over a map keyed by RowID. The walk covers one
+/// table at a time. When it enters a table, it reads the last key that the
+/// table has right then and never visits keys above it. Rows that commits
+/// append while the walk runs land above that key, so they cannot keep the
+/// walk from finishing. The table is done when `last_visited` reaches
+/// `table_end`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct TableWalkCursor {
+    last_visited: Option<RowID>,
+    table_end: Option<RowID>,
+}
+
+impl TableWalkCursor {
+    fn table_is_done(&self) -> bool {
+        self.last_visited.is_some() && self.last_visited == self.table_end
+    }
+}
+
+/// Walks `map` forward from `cursor` inside `bounds` and calls `visit` on each
+/// entry. Returns true when `visit` returns true, which means that the batch
+/// budget ran out and the caller must yield. Returns false when the walk
+/// reached the end of `bounds`.
+fn walk_table_keys<V, A: SkiplistAllocator>(
+    map: &SkipMap<RowID, V, BasicComparator, A>,
+    guard: &epoch::Guard,
+    cursor: &mut TableWalkCursor,
+    bounds: (Bound<RowID>, Bound<RowID>),
+    mut visit: impl FnMut(&RowID, &V) -> Result<bool>,
+) -> Result<bool> {
+    loop {
+        let lower = match &cursor.last_visited {
+            None => bounds.0.clone(),
+            Some(last) if cursor.table_is_done() => match next_table_start(last.table_id) {
+                Some(start) => Bound::Included(start),
+                None => return Ok(false),
+            },
+            Some(last) => Bound::Excluded(last.clone()),
+        };
+        if cursor.table_end.is_none() || cursor.table_is_done() {
+            let Some(table_end) =
+                last_key_of_first_table(map, guard, (lower.clone(), bounds.1.clone()))
+            else {
+                return Ok(false);
+            };
+            cursor.table_end = Some(table_end);
+        }
+        let table_end = cursor.table_end.clone().expect("set above");
+        let mut range = map.range((lower, Bound::Included(table_end.clone())));
+        while let Some(pinned) = range.inner.next(guard) {
+            let entry = CollectEntry::new(pinned, guard);
+            cursor.last_visited = Some(entry.key().clone());
+            if visit(entry.key(), entry.value())? {
+                return Ok(true);
+            }
+        }
+        cursor.last_visited = Some(table_end);
+    }
+}
+
+/// The last key of the table that owns the first key inside `bounds`. None
+/// when `bounds` holds no key.
+fn last_key_of_first_table<V, A: SkiplistAllocator>(
+    map: &SkipMap<RowID, V, BasicComparator, A>,
+    guard: &epoch::Guard,
+    bounds: (Bound<RowID>, Bound<RowID>),
+) -> Option<RowID> {
+    let first = CollectEntry::new(map.range(bounds).inner.next(guard)?, guard);
+    let table_bounds = (
+        Bound::Included(first.key().clone()),
+        match next_table_start(first.key().table_id) {
+            Some(start) => Bound::Excluded(start),
+            None => Bound::Unbounded,
+        },
+    );
+    let last = map
+        .range(table_bounds)
+        .inner
+        .next_back(guard)
+        .map(|last| CollectEntry::new(last, guard).key().clone());
+    Some(last.unwrap_or_else(|| first.key().clone()))
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CheckpointState {
     PrepareCheckpoint,
@@ -279,11 +371,14 @@ pub struct CheckpointStateMachine<Clock: LogicalClock, A: ConcurrentAllocator = 
     pending_rootmap_ops: Vec<RootMapOp>,
     /// Roots allocated this checkpoint; resolved until publish.
     pending_alloc_roots: std::collections::HashMap<MVTableId, u64>,
-    collect_table_cursor: Option<RowID>,
+    collect_table_cursor: TableWalkCursor,
     collect_table_phase: CollectTablePhase,
     collect_index_tableid_cursor: Option<MVTableId>,
     collect_index_key_cursor: Option<Arc<SortableIndexKey>>,
-    collect_dirty_index_cursor: Option<RowID>,
+    /// Last key of the index that the full scan is walking, taken when the
+    /// scan entered the index.
+    collect_index_key_end: Option<Arc<SortableIndexKey>>,
+    collect_dirty_index_cursor: TableWalkCursor,
     collect_index_phase: CollectIndexPhase,
     /// `Some` when this checkpoint walks every row instead of the dirty keys.
     /// Holds the store's full-scan generation so success can clear it.
@@ -886,11 +981,12 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
             pager_commit_done: false,
             pending_rootmap_ops: crate::alloc::vec![],
             pending_alloc_roots: std::collections::HashMap::new(),
-            collect_table_cursor: None,
+            collect_table_cursor: TableWalkCursor::default(),
             collect_table_phase: CollectTablePhase::Schema,
             collect_index_tableid_cursor: None,
             collect_index_key_cursor: None,
-            collect_dirty_index_cursor: None,
+            collect_index_key_end: None,
+            collect_dirty_index_cursor: TableWalkCursor::default(),
             collect_index_phase: CollectIndexPhase::Rows,
             full_scan_generation: None,
             prune_candidates: crate::alloc::vec![],
@@ -1215,7 +1311,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
             match next_phase {
                 Some(phase) => {
                     self.collect_table_phase = phase;
-                    self.collect_table_cursor = None;
+                    self.collect_table_cursor = TableWalkCursor::default();
                 }
                 None => break,
             }
@@ -1240,28 +1336,24 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
         let bounds = self.collect_table_bounds();
         let mvstore = self.mvstore.clone();
         let guard = epoch::pin();
-        let mut range = mvstore.rows.range(bounds);
-        while let Some(pinned) = range.inner.next(&guard) {
-            let entry = CollectEntry::new(pinned, &guard);
-            let key = entry.key();
+        let mut cursor = std::mem::take(&mut self.collect_table_cursor);
+        let result = walk_table_keys(&mvstore.rows, &guard, &mut cursor, bounds, |key, chain| {
             tracing::trace!("collecting {key:?}");
-            self.collect_table_cursor = Some(key.clone());
             if self.destroyed_tables.contains(&key.table_id) {
                 // We won't checkpoint rows for tables that will be destroyed in this checkpoint.
                 // There's two forms of destroyed table:
                 // 1. A non-checkpointed table that was created in the logical log and then destroyed. We don't need to do anything about this table in the pager/btree layer.
                 // 2. A checkpointed table that was destroyed in the logical log. We need to destroy the btree in the pager/btree layer.
                 tracing::trace!("skipping {key:?}");
-                continue;
+                return Ok(false);
             }
-            let row_versions = entry.value().read();
+            let row_versions = chain.read();
             self.collect_table_row_versions(key, &row_versions)?;
             *processed += 1;
-            if *processed >= COLLECT_PREEMPTION_THRESHOLD {
-                return Ok(true);
-            }
-        }
-        Ok(false)
+            Ok(*processed >= COLLECT_PREEMPTION_THRESHOLD)
+        });
+        self.collect_table_cursor = cursor;
+        result
     }
 
     /// Reads each chain from the store at visit time. GC can unlink a chain and
@@ -1270,26 +1362,28 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
         let bounds = self.collect_table_bounds();
         let mvstore = self.mvstore.clone();
         let guard = epoch::pin();
-        let mut range = mvstore.checkpoint_dirty_table_keys.range(bounds);
         let mut rows = LockstepCursor::new(&mvstore.rows, &guard);
-        while let Some(pinned) = range.inner.next(&guard) {
-            let entry = CollectEntry::new(pinned, &guard);
-            let key = entry.key();
-            tracing::trace!("collecting dirty {key:?}");
-            self.collect_table_cursor = Some(key.clone());
-            *processed += 1;
-            self.record_prune_candidate(key, entry.value().load(Ordering::Acquire))?;
-            if !self.destroyed_tables.contains(&key.table_id) {
-                if let Some(chain) = rows.advance_to(key) {
-                    let row_versions = chain.read();
-                    self.collect_table_row_versions(key, &row_versions)?;
+        let mut cursor = std::mem::take(&mut self.collect_table_cursor);
+        let result = walk_table_keys(
+            &mvstore.checkpoint_dirty_table_keys,
+            &guard,
+            &mut cursor,
+            bounds,
+            |key, stamp| {
+                tracing::trace!("collecting dirty {key:?}");
+                *processed += 1;
+                self.record_prune_candidate(key, stamp.load(Ordering::Acquire))?;
+                if !self.destroyed_tables.contains(&key.table_id) {
+                    if let Some(chain) = rows.advance_to(key) {
+                        let row_versions = chain.read();
+                        self.collect_table_row_versions(key, &row_versions)?;
+                    }
                 }
-            }
-            if *processed >= COLLECT_PREEMPTION_THRESHOLD {
-                return Ok(true);
-            }
-        }
-        Ok(false)
+                Ok(*processed >= COLLECT_PREEMPTION_THRESHOLD)
+            },
+        );
+        self.collect_table_cursor = cursor;
+        result
     }
 
     fn collect_table_row_versions(
@@ -1443,21 +1537,12 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
 
     fn collect_table_bounds(&self) -> (Bound<RowID>, Bound<RowID>) {
         match self.collect_table_phase {
-            CollectTablePhase::Schema => match &self.collect_table_cursor {
-                None => sqlite_schema_row_range_bounds(),
-                Some(last) => (Bound::Excluded(last.clone()), Bound::Unbounded),
-            },
-            CollectTablePhase::User => {
-                let schema_start = sqlite_schema_row_range_start();
-                match &self.collect_table_cursor {
-                    None => (Bound::Unbounded, Bound::Excluded(schema_start)),
-                    Some(last) => (Bound::Excluded(last.clone()), Bound::Excluded(schema_start)),
-                }
-            }
-            CollectTablePhase::DirtyStamps => match &self.collect_table_cursor {
-                None => (Bound::Unbounded, Bound::Unbounded),
-                Some(last) => (Bound::Excluded(last.clone()), Bound::Unbounded),
-            },
+            CollectTablePhase::Schema => sqlite_schema_row_range_bounds(),
+            CollectTablePhase::User => (
+                Bound::Unbounded,
+                Bound::Excluded(sqlite_schema_row_range_start()),
+            ),
+            CollectTablePhase::DirtyStamps => (Bound::Unbounded, Bound::Unbounded),
         }
     }
 
@@ -1466,36 +1551,33 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
     /// the batch budget ran out and the caller must yield.
     fn record_dirty_stamps(&mut self, map: DirtyMap, processed: &mut usize) -> Result<bool> {
         let mvstore = self.mvstore.clone();
-        let (dirty_keys, cursor) = match map {
+        let (dirty_keys, mut cursor) = match map {
             DirtyMap::Table => (
                 &mvstore.checkpoint_dirty_table_keys,
-                &mut self.collect_table_cursor,
+                std::mem::take(&mut self.collect_table_cursor),
             ),
             DirtyMap::Index => (
                 &mvstore.checkpoint_dirty_index_keys,
-                &mut self.collect_dirty_index_cursor,
+                std::mem::take(&mut self.collect_dirty_index_cursor),
             ),
         };
-        let bounds: (Bound<RowID>, Bound<RowID>) = match cursor {
-            None => (Bound::Unbounded, Bound::Unbounded),
-            Some(last) => (Bound::Excluded(last.clone()), Bound::Unbounded),
-        };
         let guard = epoch::pin();
-        let mut range = dirty_keys.range(bounds);
-        while let Some(pinned) = range.inner.next(&guard) {
-            let entry = CollectEntry::new(pinned, &guard);
-            let key = entry.key();
-            *cursor = Some(key.clone());
-            *processed += 1;
-            let stamp = entry.value().load(Ordering::Acquire);
-            if stamp <= self.snapshot_ts {
-                self.prune_candidates.try_push((key.clone(), stamp))?;
-            }
-            if *processed >= COLLECT_PREEMPTION_THRESHOLD {
-                return Ok(true);
-            }
+        let result = walk_table_keys(
+            dirty_keys,
+            &guard,
+            &mut cursor,
+            (Bound::Unbounded, Bound::Unbounded),
+            |key, stamp| {
+                *processed += 1;
+                self.record_prune_candidate(key, stamp.load(Ordering::Acquire))?;
+                Ok(*processed >= COLLECT_PREEMPTION_THRESHOLD)
+            },
+        );
+        match map {
+            DirtyMap::Table => self.collect_table_cursor = cursor,
+            DirtyMap::Index => self.collect_dirty_index_cursor = cursor,
         }
-        Ok(false)
+        result
     }
 
     /// Collect all committed index row versions that need to be written to the B-tree.
@@ -1551,16 +1633,28 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
 
             // Skip destroyed indexes - we won't checkpoint rows for indexes that will be destroyed
             if self.destroyed_indexes.contains(&index_id) {
-                self.collect_index_tableid_cursor = Some(index_id);
-                self.collect_index_key_cursor = None;
+                self.finish_index_scan(index_id);
                 continue;
             }
 
             let index_rows_map = outer.value();
+            // Keys that commits append while this scan runs sit above the last
+            // key the index had on entry. The scan stops there so it finishes.
+            let key_end = match (&self.collect_index_key_cursor, &self.collect_index_key_end) {
+                (Some(_), Some(end)) => end.clone(),
+                _ => match index_rows_map.back() {
+                    Some(last) => last.key().clone(),
+                    None => {
+                        self.finish_index_scan(index_id);
+                        continue;
+                    }
+                },
+            };
+            self.collect_index_key_end = Some(key_end.clone());
             let inner_bounds: (Bound<Arc<SortableIndexKey>>, Bound<Arc<SortableIndexKey>>) =
                 match self.collect_index_key_cursor.clone() {
-                    None => (Bound::Unbounded, Bound::Unbounded),
-                    Some(last) => (Bound::Excluded(last), Bound::Unbounded),
+                    None => (Bound::Unbounded, Bound::Included(key_end)),
+                    Some(last) => (Bound::Excluded(last), Bound::Included(key_end)),
                 };
             let mut inner_range = index_rows_map.range(inner_bounds);
             while let Some(pinned) = inner_range.inner.next(&guard) {
@@ -1574,58 +1668,61 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
                     return Ok(true);
                 }
             }
-            self.collect_index_tableid_cursor = Some(index_id);
-            self.collect_index_key_cursor = None;
+            self.finish_index_scan(index_id);
         }
         Ok(false)
     }
 
+    fn finish_index_scan(&mut self, index_id: MVTableId) {
+        self.collect_index_tableid_cursor = Some(index_id);
+        self.collect_index_key_cursor = None;
+        self.collect_index_key_end = None;
+    }
+
     fn collect_index_rows_from_dirty_keys(&mut self) -> Result<bool> {
-        let bounds: (Bound<RowID>, Bound<RowID>) = match &self.collect_dirty_index_cursor {
-            None => (Bound::Unbounded, Bound::Unbounded),
-            Some(last) => (Bound::Excluded(last.clone()), Bound::Unbounded),
-        };
         let mut processed = 0;
         let mvstore = self.mvstore.clone();
         let guard = epoch::pin();
-        let mut range = mvstore.checkpoint_dirty_index_keys.range(bounds);
         let mut current_index: Option<(
             MVTableId,
             IndexRowsEntry<'_, A>,
             IndexKeyCursor<'_, '_, A>,
         )> = None;
-        while let Some(pinned) = range.inner.next(&guard) {
-            let entry = CollectEntry::new(pinned, &guard);
-            let key = entry.key();
-            self.collect_dirty_index_cursor = Some(key.clone());
-            processed += 1;
-            self.record_prune_candidate(key, entry.value().load(Ordering::Acquire))?;
-            let index_id = key.table_id;
-            if !self.destroyed_indexes.contains(&index_id) {
-                let RowKey::Record(index_key) = &key.row_id else {
-                    unreachable!("dirty index keys always carry a Record key");
-                };
-                if current_index
-                    .as_ref()
-                    .is_none_or(|(id, _, _)| *id != index_id)
-                {
-                    current_index = mvstore.index_rows.get(&index_id).map(|index| {
-                        let keys = LockstepCursor::new(index.value(), &guard);
-                        (index_id, index, keys)
-                    });
-                }
-                if let Some((_, _, keys)) = current_index.as_mut() {
-                    if let Some(chain) = keys.advance_to(index_key) {
-                        let versions = chain.read();
-                        self.collect_index_row_versions(index_id, &versions)?;
+        let mut cursor = std::mem::take(&mut self.collect_dirty_index_cursor);
+        let result = walk_table_keys(
+            &mvstore.checkpoint_dirty_index_keys,
+            &guard,
+            &mut cursor,
+            (Bound::Unbounded, Bound::Unbounded),
+            |key, stamp| {
+                processed += 1;
+                self.record_prune_candidate(key, stamp.load(Ordering::Acquire))?;
+                let index_id = key.table_id;
+                if !self.destroyed_indexes.contains(&index_id) {
+                    let RowKey::Record(index_key) = &key.row_id else {
+                        unreachable!("dirty index keys always carry a Record key");
+                    };
+                    if current_index
+                        .as_ref()
+                        .is_none_or(|(id, _, _)| *id != index_id)
+                    {
+                        current_index = mvstore.index_rows.get(&index_id).map(|index| {
+                            let keys = LockstepCursor::new(index.value(), &guard);
+                            (index_id, index, keys)
+                        });
+                    }
+                    if let Some((_, _, keys)) = current_index.as_mut() {
+                        if let Some(chain) = keys.advance_to(index_key) {
+                            let versions = chain.read();
+                            self.collect_index_row_versions(index_id, &versions)?;
+                        }
                     }
                 }
-            }
-            if processed >= COLLECT_PREEMPTION_THRESHOLD {
-                return Ok(true);
-            }
-        }
-        Ok(false)
+                Ok(processed >= COLLECT_PREEMPTION_THRESHOLD)
+            },
+        );
+        self.collect_dirty_index_cursor = cursor;
+        result
     }
 
     fn collect_index_row_versions(
@@ -4227,6 +4324,7 @@ mod tests {
         assert_eq!(
             checkpoint
                 .collect_table_cursor
+                .last_visited
                 .as_ref()
                 .map(|key| key.table_id),
             Some(SQLITE_SCHEMA_MVCC_TABLE_ID)
@@ -4265,6 +4363,7 @@ mod tests {
         assert_eq!(
             checkpoint
                 .collect_table_cursor
+                .last_visited
                 .as_ref()
                 .map(|key| key.table_id),
             Some(table_id)
@@ -4495,11 +4594,6 @@ mod tests {
 
         assert_eq!(checkpoint.write_set.len(), 1);
         assert_eq!(checkpoint.write_set[0].0.row.id.row_id, RowKey::Int(5));
-        assert_eq!(
-            checkpoint.collect_table_cursor,
-            Some(RowID::new(table_id, RowKey::Int(5))),
-            "the dirty walk must stop at the last dirty key, not the last row"
-        );
     }
 
     #[test]
@@ -4581,8 +4675,117 @@ mod tests {
 
         assert_eq!(checkpoint.index_write_set.len(), 1);
         assert_eq!(checkpoint.index_write_set[0].1.id, 1);
-        assert!(checkpoint.collect_dirty_index_cursor.is_some());
+        assert!(checkpoint.collect_dirty_index_cursor.last_visited.is_some());
         assert!(checkpoint.collect_index_key_cursor.is_none());
+    }
+
+    /// Drives `collect` until it stops yielding. After every yield, `append`
+    /// commits rows that sit above the walk, like a writer that keeps
+    /// inserting while the checkpoint runs.
+    fn collect_while_rows_are_appended(
+        mut collect: impl FnMut() -> Result<Option<IOCompletions>>,
+        mut append: impl FnMut(),
+    ) {
+        let mut yields = 0;
+        while collect().unwrap().is_some() {
+            yields += 1;
+            assert!(
+                yields <= 4,
+                "collect kept scanning rows committed after its snapshot"
+            );
+            append();
+        }
+    }
+
+    fn append_table_rows(
+        mvstore: &crate::sync::Arc<
+            MvStore<crate::mvcc::clock::MvccClock, crate::alloc::DynAllocator>,
+        >,
+        table_id: MVTableId,
+        next_rowid: &mut i64,
+    ) {
+        for _ in 0..COLLECT_PREEMPTION_THRESHOLD {
+            insert_row_version(
+                mvstore,
+                table_row_version(table_id, *next_rowid, 1, Some(20), None, false),
+            );
+            *next_rowid += 1;
+        }
+    }
+
+    fn append_index_rows(
+        mvstore: &crate::sync::Arc<
+            MvStore<crate::mvcc::clock::MvccClock, crate::alloc::DynAllocator>,
+        >,
+        index_id: MVTableId,
+        next_rowid: &mut i64,
+    ) {
+        for _ in 0..COLLECT_PREEMPTION_THRESHOLD {
+            let (key, version) =
+                index_row_version(index_id, "k", *next_rowid, 1, Some(20), None, false);
+            insert_dirty_index_version(mvstore, index_id, key, version);
+            *next_rowid += 1;
+        }
+    }
+
+    #[test]
+    fn collect_table_rows_finishes_while_rows_are_appended() {
+        for full_scan in [false, true] {
+            let mut checkpoint = checkpoint_for_collect_tests();
+            checkpoint.snapshot_ts = 10;
+            checkpoint.full_scan_generation = full_scan.then(|| NonZeroU64::new(1).unwrap());
+            let mvstore = checkpoint.mvstore.clone();
+            let walked = MVTableId::from(-3);
+            let other = MVTableId::from(-2);
+            let row_count = COLLECT_PREEMPTION_THRESHOLD + 10;
+            for rowid in 0..row_count as i64 {
+                insert_row_version(&mvstore, committed_table_row_version(walked, rowid));
+            }
+            insert_row_version(&mvstore, committed_table_row_version(other, 1));
+
+            let mut next_rowid = row_count as i64;
+            collect_while_rows_are_appended(
+                || checkpoint.collect_table_rows(),
+                || append_table_rows(&mvstore, walked, &mut next_rowid),
+            );
+
+            assert_eq!(
+                checkpoint.write_set.len(),
+                row_count + 1,
+                "full_scan={full_scan}: every row committed before the snapshot is collected once"
+            );
+        }
+    }
+
+    #[test]
+    fn collect_index_rows_finishes_while_index_rows_are_appended() {
+        for full_scan in [false, true] {
+            let mut checkpoint = checkpoint_for_collect_tests();
+            checkpoint.snapshot_ts = 10;
+            checkpoint.full_scan_generation = full_scan.then(|| NonZeroU64::new(1).unwrap());
+            let mvstore = checkpoint.mvstore.clone();
+            let walked = MVTableId::from(-8);
+            let other = MVTableId::from(-7);
+            let row_count = COLLECT_PREEMPTION_THRESHOLD + 10;
+            for rowid in 0..row_count as i64 {
+                let (key, version) = index_row_version(walked, "k", rowid, 1, Some(5), None, false);
+                insert_dirty_index_version(&mvstore, walked, key, version);
+            }
+            let (key, version) = index_row_version(other, "k", 1, 1, Some(5), None, false);
+            insert_dirty_index_version(&mvstore, other, key, version);
+
+            let mut next_rowid = row_count as i64;
+            collect_while_rows_are_appended(
+                || checkpoint.collect_index_rows(),
+                || append_index_rows(&mvstore, walked, &mut next_rowid),
+            );
+
+            assert_eq!(
+                checkpoint.index_write_set.len(),
+                row_count + 1,
+                "full_scan={full_scan}: every index row committed before the snapshot is collected once"
+            );
+        }
     }
 
     #[test]
