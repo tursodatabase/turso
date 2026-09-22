@@ -819,6 +819,18 @@ pub fn blob_literal_hex(blob: &str) -> &str {
     &blob[2..blob.len() - 1]
 }
 
+/// Decodes the hex digits of a blob literal such as `X'0102'` into the bytes
+/// they stand for. The parser has already checked that the literal is valid hex.
+pub fn blob_literal_bytes(blob: &str) -> impl Iterator<Item = u8> + '_ {
+    blob_literal_hex(blob)
+        .as_bytes()
+        .chunks_exact(2)
+        .map(|pair| {
+            let hex_byte = std::str::from_utf8(pair).expect("parser validated hex string");
+            u8::from_str_radix(hex_byte, 16).expect("parser validated hex digit")
+        })
+}
+
 /// Textual comparison operator in an expression
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
