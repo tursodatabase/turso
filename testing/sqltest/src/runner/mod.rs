@@ -198,7 +198,7 @@ impl Runnable for SnapshotCase {
             };
         }
 
-        let actual_output = if self.eqp_only {
+        let mut actual_output = if self.eqp_only {
             format_eqp_snapshot_content(&eqp_result.rows)
         } else {
             let explain_result = results.get(1).expect("should have EXPLAIN result");
@@ -209,6 +209,14 @@ impl Runnable for SnapshotCase {
             }
             format_snapshot_content(&eqp_result.rows, &explain_result.rows)
         };
+
+        if self.sqlite_reference {
+            let reference = match format_sqlite_snapshot_reference(self, &results, options) {
+                Ok(reference) => reference,
+                Err(message) => return TestOutcome::Error { message },
+            };
+            actual_output.push_str(&reference);
+        }
 
         // Build snapshot info with metadata
         let db_location_str = options.db_config.location.to_string();
@@ -380,6 +388,62 @@ fn format_snapshot_content(eqp_rows: &[Vec<String>], explain_rows: &[Vec<String>
     output.push_str(&format_explain_output(explain_rows));
 
     output
+}
+
+fn format_sqlite_snapshot_reference(
+    snapshot: &SnapshotCase,
+    results: &[QueryResult],
+    options: &RunOptions,
+) -> Result<String, String> {
+    if options.db_config.location != DatabaseLocation::Memory {
+        return Err("@sqlite-reference requires @database :memory:".to_string());
+    }
+    let setups: Vec<String> = snapshot
+        .modifiers
+        .setups
+        .iter()
+        .map(|setup| options.setups[&setup.name].clone())
+        .collect();
+    let sqlite_rows = |sql: String| match run_oracle(&setups, &sql)? {
+        OracleOutcome::Rows(rows) => Ok(rows),
+        OracleOutcome::Error(error) => Err(format!("SQLite EXPLAIN failed: {error}")),
+    };
+    let sqlite_eqp = sqlite_rows(format!("EXPLAIN QUERY PLAN {}", snapshot.sql))?;
+    let mut reference = String::from("\n\nSQLITE REFERENCE\n");
+    if snapshot.eqp_only {
+        reference.push_str(&format_eqp_snapshot_content(&sqlite_eqp));
+        return Ok(reference);
+    }
+
+    let sqlite_explain = sqlite_rows(format!("EXPLAIN {}", snapshot.sql))?;
+    reference.push_str(&format_snapshot_content(&sqlite_eqp, &sqlite_explain));
+    let turso_explain = &results.get(1).expect("EXPLAIN already succeeded").rows;
+    let sqlite_opcodes = snapshot_opcode_names(&sqlite_explain)?;
+    let turso_opcodes = snapshot_opcode_names(turso_explain)?;
+    let diff = similar::TextDiff::from_lines(&sqlite_opcodes, &turso_opcodes)
+        .unified_diff()
+        .context_radius(1)
+        .header("sqlite opcodes", "turso opcodes")
+        .to_string();
+    reference.push_str("\n\nOPCODE DIFF\n");
+    if diff.is_empty() {
+        reference.push_str("same opcode order");
+    } else {
+        reference.push_str(diff.trim_end());
+    }
+    Ok(reference)
+}
+
+fn snapshot_opcode_names(rows: &[Vec<String>]) -> Result<String, String> {
+    let mut names = String::new();
+    for row in rows {
+        let opcode = row
+            .get(1)
+            .ok_or_else(|| "EXPLAIN returned a row without an opcode".to_string())?;
+        names.push_str(opcode);
+        names.push('\n');
+    }
+    Ok(names)
 }
 
 // ============================================================================
