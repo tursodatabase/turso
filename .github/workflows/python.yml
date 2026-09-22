@@ -30,7 +30,7 @@ jobs:
         os:
           - blacksmith-4vcpu-ubuntu-2404
           - blacksmith-6vcpu-macos-latest
-          - blacksmith-4vcpu-windows-2025
+          - blacksmith-8vcpu-windows-2025
         python-version: ["3.10", "3.14"]
     runs-on: ${{ matrix.os }}
 
