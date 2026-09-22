@@ -951,6 +951,71 @@ expect {
     NULL|NULL|NULL|7
 }
 
+@cross-check-integrity
+test inner-or-on-before-right-join-keeps-row-outside-implied-in-filters {
+    CREATE TABLE or_inner_left(k INTEGER);
+    CREATE TABLE or_inner_middle(k INTEGER);
+    CREATE TABLE or_inner_right(k INTEGER);
+    CREATE INDEX or_inner_left_k ON or_inner_left(k);
+    CREATE INDEX or_inner_middle_k ON or_inner_middle(k);
+    INSERT INTO or_inner_left VALUES(1);
+    INSERT INTO or_inner_middle VALUES(4);
+    INSERT INTO or_inner_right VALUES(9);
+
+    SELECT quote(or_inner_left.k), quote(or_inner_middle.k), or_inner_right.k
+      FROM or_inner_left
+      JOIN or_inner_middle
+        ON (or_inner_left.k=1 AND or_inner_middle.k=2)
+        OR (or_inner_left.k=2 AND or_inner_middle.k=3)
+      RIGHT JOIN or_inner_right ON true;
+}
+expect {
+    NULL|NULL|9
+}
+
+@cross-check-integrity
+test right-join-or-on-keeps-rows-outside-implied-in-filters {
+    CREATE TABLE or_right_left(k INTEGER);
+    CREATE TABLE or_right_right(k INTEGER);
+    CREATE INDEX or_right_left_k ON or_right_left(k);
+    CREATE INDEX or_right_right_k ON or_right_right(k);
+    INSERT INTO or_right_left VALUES(1);
+    INSERT INTO or_right_right VALUES(2),(3),(4);
+
+    SELECT quote(or_right_left.k), quote(or_right_right.k)
+      FROM or_right_left RIGHT JOIN or_right_right
+        ON (or_right_left.k=1 AND or_right_right.k=2)
+        OR (or_right_left.k=2 AND or_right_right.k=3)
+     ORDER BY or_right_right.k;
+}
+expect {
+    1|2
+    NULL|3
+    NULL|4
+}
+
+@cross-check-integrity
+test full-join-or-on-keeps-rows-outside-implied-in-filters {
+    CREATE TABLE or_full_left(k INTEGER);
+    CREATE TABLE or_full_right(k INTEGER);
+    CREATE INDEX or_full_left_k ON or_full_left(k);
+    CREATE INDEX or_full_right_k ON or_full_right(k);
+    INSERT INTO or_full_left VALUES(1),(5);
+    INSERT INTO or_full_right VALUES(2),(3),(4);
+
+    SELECT quote(or_full_left.k), quote(or_full_right.k)
+      FROM or_full_left FULL JOIN or_full_right
+        ON (or_full_left.k=1 AND or_full_right.k=2)
+        OR (or_full_left.k=2 AND or_full_right.k=3)
+     ORDER BY or_full_right.k NULLS FIRST, or_full_left.k;
+}
+expect {
+    5|NULL
+    1|2
+    NULL|3
+    NULL|4
+}
+
 # SQLite opens and filters the right-side virtual table again after the main
 # loop. The rowid set keeps both equal virtual rows as separate matches.
 test right-join-restarts-table-function-on-right {
