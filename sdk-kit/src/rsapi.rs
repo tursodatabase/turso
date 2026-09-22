@@ -928,9 +928,9 @@ impl TursoDatabase {
                     }
                 }
                 #[cfg(all(target_os = "linux", not(miri)))]
-                IoBackend::IoUring => Arc::new(turso_core::UringIO::new().map_err(|e| {
-                    TursoError::Error(format!("unable to create io_uring backend: {e}"))
-                })?),
+                IoBackend::IoUring => Arc::new(
+                    turso_core::UringIO::new().map_err(|e| TursoError::Error(e.to_string()))?,
+                ),
                 #[cfg(all(target_os = "windows", not(miri)))]
                 IoBackend::IOCP => Arc::new(turso_core::WindowsIOCP::new().map_err(|e| {
                     TursoError::Error(format!("unable to create win_iocp backend: {e}"))
