@@ -1925,6 +1925,16 @@ impl ShmWalCoordination {
         );
         Err(LimboError::Busy)
     }
+
+    /// A writer that was killed between appending frames and committing leaves
+    /// entries above the published `max_frame` in the shared frame index. The
+    /// caller holds the writer lock, so no transaction is in progress and every
+    /// such entry is garbage; drop them before this writer appends at
+    /// `max_frame + 1`.
+    fn discard_frames_left_by_dead_writer(&self) {
+        let committed_max_frame = self.authority.snapshot().max_frame;
+        self.authority.rollback_frames(committed_max_frame);
+    }
 }
 
 #[cfg(host_shared_wal)]
@@ -2139,6 +2149,7 @@ impl WalCoordination for ShmWalCoordination {
             self.authority.release_writer(self.owner);
             return false;
         }
+        self.discard_frames_left_by_dead_writer();
         true
     }
 
@@ -8090,6 +8101,78 @@ pub mod test {
             vec![(7, 2), (9, 4)]
         );
         assert!(shm_path.exists());
+    }
+
+    #[cfg(host_shared_wal)]
+    #[test]
+    fn test_shm_coordination_new_writer_discards_frames_left_by_dead_writer() {
+        let dir = tempfile::tempdir().unwrap();
+        let wal_path = dir.path().join("test-dead-writer.db-wal");
+        let shm_path = dir.path().join("test-dead-writer.db-tshm");
+        let io = shared_wal_test_io();
+        let file_a = io
+            .open_file(wal_path.to_str().unwrap(), crate::OpenFlags::Create, false)
+            .unwrap();
+        let file_b = io
+            .open_file(wal_path.to_str().unwrap(), crate::OpenFlags::Create, false)
+            .unwrap();
+        let shared_a = WalFileShared::new_shared(file_a).unwrap();
+        let shared_b = WalFileShared::new_shared(file_b).unwrap();
+        let snapshot = WalSnapshot {
+            max_frame: 3,
+            nbackfills: 0,
+            last_checksum: (31, 37),
+            checkpoint_seq: 5,
+            transaction_count: 9,
+        };
+        set_shared_snapshot(&shared_a, snapshot);
+        {
+            let shared = shared_a.write();
+            let mut header = shared.metadata.wal_header.lock();
+            header.page_size = 4096;
+            header.salt_1 = 17;
+            header.salt_2 = 23;
+            header.checksum_1 = snapshot.last_checksum.0;
+            header.checksum_2 = snapshot.last_checksum.1;
+        }
+
+        let (authority, coordination_a) = make_test_shm_coordination(&shared_a, &shm_path);
+        let (_authority_b, coordination_b) = make_test_shm_coordination(&shared_b, &shm_path);
+        coordination_a.cache_frame(7, 1);
+        coordination_a.cache_frame(9, 2);
+        coordination_a.cache_frame(7, 3);
+
+        assert!(coordination_a.try_begin_write_tx());
+        coordination_a.cache_frame(11, 4);
+        coordination_a.cache_frame(7, 5);
+        coordination_a.cache_frame(13, 6);
+        coordination_a.end_write_tx();
+        assert_eq!(
+            authority.iter_latest_frames(0, u64::MAX),
+            vec![(7, 5), (9, 2), (11, 4), (13, 6)]
+        );
+
+        assert!(coordination_b.try_begin_write_tx());
+        assert_eq!(
+            authority.iter_latest_frames(0, u64::MAX),
+            vec![(7, 3), (9, 2)]
+        );
+        coordination_b.cache_frame(15, 4);
+        coordination_b.publish_commit(WalCommitState {
+            max_frame: 4,
+            last_checksum: (55, 89),
+            transaction_count: 10,
+        });
+        coordination_b.end_write_tx();
+
+        assert_eq!(coordination_a.load_snapshot().max_frame, 4);
+        assert_eq!(coordination_a.find_frame(7, 0, 4, None), Some(3));
+        assert_eq!(coordination_a.find_frame(11, 0, 4, None), None);
+        assert_eq!(coordination_a.find_frame(15, 0, 4, None), Some(4));
+        assert_eq!(
+            authority.iter_latest_frames(0, 4),
+            vec![(7, 3), (9, 2), (15, 4)]
+        );
     }
 
     #[cfg(host_shared_wal)]
