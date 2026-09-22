@@ -49,6 +49,8 @@ pub(crate) struct JoinPlanningContext<'a> {
     pub maybe_order_target: Option<&'a OrderTarget>,
     /// Stop growing a join plan after it costs more than another query form.
     pub cost_limit: Option<Cost>,
+    /// The generated parenthesized query computes merged USING values in its result columns.
+    pub using_results_are_explicit: bool,
 }
 
 impl<'a> JoinPlanningContext<'a> {
@@ -58,6 +60,7 @@ impl<'a> JoinPlanningContext<'a> {
         Self {
             maybe_order_target,
             cost_limit: None,
+            using_results_are_explicit: false,
         }
     }
 }
@@ -854,6 +857,7 @@ fn join_lhs_and_rhs<'a>(
                     hash_can_replace_build_index,
                     subqueries,
                     params,
+                    planning_context.using_results_are_explicit,
                 )? {
                     let mut hash_join_method = hash_join_method;
                     let mut hash_join_allowed = true;
@@ -4556,6 +4560,7 @@ mod tests {
             true,
             &[],
             &DEFAULT_PARAMS,
+            false,
         )
         .unwrap()
         .unwrap();
