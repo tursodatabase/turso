@@ -419,16 +419,7 @@ pub(crate) fn literal_default_value(literal: &ast::Literal) -> Result<Value> {
     match literal {
         ast::Literal::Numeric(val) => parse_numeric_literal(val),
         ast::Literal::String(s) => Ok(Value::from_text(crate::translate::expr::sanitize_string(s))),
-        ast::Literal::Blob(s) => Ok(Value::Blob(
-            ast::blob_literal_hex(s)
-                .as_bytes()
-                .chunks_exact(2)
-                .map(|pair| {
-                    let hex_byte = std::str::from_utf8(pair).expect("parser validated hex string");
-                    u8::from_str_radix(hex_byte, 16).expect("parser validated hex digit")
-                })
-                .try_collect()?,
-        )),
+        ast::Literal::Blob(s) => Ok(Value::Blob(ast::blob_literal_bytes(s).try_collect()?)),
         ast::Literal::Null => Ok(Value::Null),
         ast::Literal::True => Ok(Value::from_i64(1)),
         ast::Literal::False => Ok(Value::from_i64(0)),

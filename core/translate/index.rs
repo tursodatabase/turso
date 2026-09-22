@@ -1184,18 +1184,9 @@ pub fn resolve_index_method_parameters(
                 },
                 ast::Literal::Null => crate::Value::Null,
                 ast::Literal::String(s) => crate::Value::Text(s.into()),
-                ast::Literal::Blob(b) => crate::Value::Blob(
-                    ast::blob_literal_hex(&b)
-                        .as_bytes()
-                        .chunks_exact(2)
-                        .map(|pair| {
-                            // We assume that sqlite3-parser has already validated that
-                            // the input is valid hex string, thus unwrap is safe.
-                            let hex_byte = std::str::from_utf8(pair).unwrap();
-                            u8::from_str_radix(hex_byte, 16).unwrap()
-                        })
-                        .try_collect()?,
-                ),
+                ast::Literal::Blob(b) => {
+                    crate::Value::Blob(ast::blob_literal_bytes(&b).try_collect()?)
+                }
                 _ => bail_parse_error!("parameters must be constant literals"),
             },
             _ => bail_parse_error!("parameters must be constant literals"),
