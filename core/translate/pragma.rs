@@ -245,6 +245,7 @@ pub fn translate_pragma(
 
     let database_id = resolver.resolve_database_id(name)?;
     let schema_was_explicit = name.db_name.is_some();
+    let query_only = connection.get_query_only();
 
     let mode = match body {
         None => query_pragma(
@@ -298,6 +299,9 @@ pub fn translate_pragma(
             program.begin_read_operation()?;
         }
         TransactionMode::Write => {
+            if query_only {
+                bail_parse_error!("Cannot execute write statement in query_only mode")
+            }
             let schema_cookie = resolver.with_schema(database_id, |s| s.schema_version);
             program.begin_write_on_database(database_id, schema_cookie)?;
             program.begin_write_operation()?;
@@ -474,7 +478,7 @@ fn update_pragma(
             });
             program.emit_result_row(result_reg, 1);
             program.add_pragma_result_column("max_page_count".into());
-            Ok(TransactionMode::Write)
+            Ok(TransactionMode::Read)
         }
         PragmaName::UserVersion => {
             let data = parse_signed_number(&value)?;
