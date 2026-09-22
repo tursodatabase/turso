@@ -10,6 +10,8 @@ pub enum LimboError {
     NotADB,
     #[error("Internal error: {0}")]
     InternalError(String),
+    #[error("{0}")]
+    IoBackendUnavailable(String),
     /// An error raised by emitted bytecode (`Insn::Halt` with SQLITE_ERROR),
     /// e.g. ALTER TABLE validation or window-function argument checks.
     /// Displayed bare, like sqlite3_errmsg. Kept distinct from `Constraint`
