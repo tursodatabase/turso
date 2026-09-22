@@ -1,7 +1,8 @@
+use branches::unlikely;
 use std::fmt;
 
 /// Hash join spill/probe metrics.
-#[derive(Debug, Default, Clone)]
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct HashJoinMetrics {
     // Spill metrics
     pub spill_bytes_written: u64,
@@ -25,6 +26,26 @@ pub struct HashJoinMetrics {
 }
 
 impl HashJoinMetrics {
+    /// True when no hash join recorded anything. Almost every statement
+    /// answers true, and then merging the twelve counters is 14 vector
+    /// loads, adds and stores that all add zero, plus two unsigned 64-bit
+    /// maxima that SSE2 has no instruction for.
+    fn is_zero(&self) -> bool {
+        (self.spill_bytes_written
+            | self.spill_chunks
+            | self.spill_max_chunks_per_partition
+            | self.spill_max_partition_bytes
+            | self.load_bytes_read
+            | self.probe_calls
+            | self.probe_spill_bytes_written
+            | self.probe_spill_chunks
+            | self.grace_partitions_processed
+            | self.grace_probe_rows_streamed
+            | self.grace_probe_rows_buffered
+            | self.grace_matches)
+            == 0
+    }
+
     pub fn merge(&mut self, other: &HashJoinMetrics) {
         self.spill_bytes_written = self
             .spill_bytes_written
@@ -131,7 +152,9 @@ impl StatementMetrics {
         self.btree_next = self.btree_next.wrapping_add(other.btree_next);
         self.btree_prev = self.btree_prev.wrapping_add(other.btree_prev);
         self.search_count = self.search_count.wrapping_add(other.search_count);
-        self.hash_join.merge(&other.hash_join);
+        if unlikely(!other.hash_join.is_zero()) {
+            self.hash_join.merge(&other.hash_join);
+        }
     }
 
     /// Reset all counters to zero
@@ -327,5 +350,60 @@ mod tests {
         assert_eq!(conn_metrics.total_statements, 2);
         assert_eq!(conn_metrics.aggregate.vm_steps, 175);
         assert_eq!(conn_metrics.aggregate.rows_read, 150);
+    }
+
+    fn filled_hash_join() -> HashJoinMetrics {
+        HashJoinMetrics {
+            spill_bytes_written: 1,
+            spill_chunks: 2,
+            spill_max_chunks_per_partition: 7,
+            spill_max_partition_bytes: 9,
+            load_bytes_read: 4,
+            probe_calls: 5,
+            probe_spill_bytes_written: 6,
+            probe_spill_chunks: 8,
+            grace_partitions_processed: 10,
+            grace_probe_rows_streamed: 11,
+            grace_probe_rows_buffered: 12,
+            grace_matches: 13,
+        }
+    }
+
+    #[test]
+    fn merge_adds_hash_join_counters_that_are_not_zero() {
+        let mut target = StatementMetrics::new();
+        let mut source = StatementMetrics::new();
+        source.rows_read = 3;
+        source.hash_join = filled_hash_join();
+
+        target.merge(&source);
+        target.merge(&source);
+
+        assert_eq!(target.rows_read, 6);
+        assert_eq!(target.hash_join.spill_bytes_written, 2);
+        assert_eq!(target.hash_join.grace_matches, 26);
+        assert_eq!(target.hash_join.spill_max_chunks_per_partition, 7);
+        assert_eq!(target.hash_join.spill_max_partition_bytes, 9);
+    }
+
+    #[test]
+    fn merge_of_zero_hash_join_counters_leaves_the_target_alone() {
+        let mut target = StatementMetrics::new();
+        target.hash_join = filled_hash_join();
+        let mut source = StatementMetrics::new();
+        source.rows_read = 1;
+
+        target.merge(&source);
+
+        assert_eq!(target.rows_read, 1);
+        assert_eq!(target.hash_join, filled_hash_join());
+    }
+
+    #[test]
+    fn a_hash_join_counter_of_one_is_not_zero() {
+        let mut metrics = HashJoinMetrics::default();
+        assert!(metrics.is_zero());
+        metrics.grace_matches = 1;
+        assert!(!metrics.is_zero());
     }
 }

@@ -7,6 +7,7 @@ use std::{
     time::Duration,
 };
 
+use branches::unlikely;
 use tracing::{instrument, Level};
 use turso_parser::ast::{fmt::ToTokens, Cmd};
 
@@ -314,6 +315,13 @@ pub struct Statement {
     /// True once this root statement has started executing and incremented
     /// `Connection::n_active_root_statements`.
     counted_as_active_root: bool,
+    /// True when [`Self::_step`] may go straight to the interpreter: the
+    /// program has started, the root count is taken, no busy wait is open and
+    /// the query mode is `Normal`. Reading four places costs nine
+    /// instructions on every row of every scan; reading this costs two.
+    /// Set where the four are known to hold, cleared by everything that can
+    /// break them.
+    on_fast_step_path: bool,
     /// True for the parked statement backing an incremental blob handle.
     /// Counted separately in `Connection::n_active_blob_statements` so
     /// explicit checkpoints can subtract it — an open blob handle must not
@@ -400,6 +408,7 @@ impl Statement {
             tail_offset,
             origin,
             counted_as_active_root: false,
+            on_fast_step_path: false,
             is_blob_handle: false,
             nested_guard_active,
         }
@@ -552,6 +561,7 @@ impl Statement {
                 self.program.connection.clear_interrupt_if_idle();
             }
             self.counted_as_active_root = false;
+            self.on_fast_step_path = false;
         }
     }
 
@@ -560,33 +570,67 @@ impl Statement {
     /// gated behind cheap flag tests and kept out of line. A row in the middle
     /// of a scan runs only the interpreter call and the result-row bookkeeping.
     fn _step(&mut self, waker: Option<&Waker>) -> Result<StepResult> {
+        debug_assert!(
+            !self.on_fast_step_path
+                || (!matches!(self.state.execution_state, ProgramExecutionState::Init)
+                    && self.counted_as_active_root
+                    && self.busy_handler_state.is_none()
+                    && matches!(self.query_mode, QueryMode::Normal)),
+            "the fast step path was kept over a change that breaks it: state={:?} counted={} busy={} mode={:?}",
+            self.state.execution_state,
+            self.counted_as_active_root,
+            self.busy_handler_state.is_some(),
+            self.query_mode,
+        );
+        if unlikely(!self.on_fast_step_path) {
+            if let Some(result) = self.enter_step(waker)? {
+                return Ok(result);
+            }
+        }
+        match self
+            .program
+            .normal_step(&mut self.state, &self.pager, waker)
+        {
+            ProgramStep::Row => {
+                self.busy = true;
+                self.has_returned_row = true;
+                Ok(StepResult::Row)
+            }
+            step => self.finish_step(step.into(), waker),
+        }
+    }
+
+    /// Everything a step needs before the interpreter can run: the first-call
+    /// work, the busy wait, and the whole of a statement that is not in
+    /// [`QueryMode::Normal`]. `None` means the caller runs the interpreter.
+    /// The interpreter itself stays out of here so that the build holds only
+    /// one copy of it.
+    #[inline(never)]
+    fn enter_step(&mut self, waker: Option<&Waker>) -> Result<Option<StepResult>> {
         if matches!(self.state.execution_state, ProgramExecutionState::Init)
             || !self.counted_as_active_root
             || self.busy_handler_state.is_some()
         {
             if let Some(result) = self.prepare_step(waker)? {
-                return Ok(result);
+                return Ok(Some(result));
             }
         }
-        let res = match self.query_mode {
-            QueryMode::Normal => {
-                match self
-                    .program
-                    .normal_step(&mut self.state, &self.pager, waker)
-                {
-                    ProgramStep::Row => {
-                        self.busy = true;
-                        self.has_returned_row = true;
-                        return Ok(StepResult::Row);
-                    }
-                    step => step.into(),
-                }
-            }
-            _ => self
+        if !matches!(self.query_mode, QueryMode::Normal) {
+            let res = self
                 .program
-                .step(&mut self.state, &self.pager, self.query_mode, waker),
-        };
-        self.finish_step(res, waker)
+                .step(&mut self.state, &self.pager, self.query_mode, waker);
+            return self.finish_step(res, waker).map(Some);
+        }
+        // Start the program here, where it costs nothing, rather than on
+        // every entry to the interpreter.
+        if !matches!(self.state.execution_state, ProgramExecutionState::Running) {
+            self.program.start_execution(&mut self.state);
+        }
+        // The query mode is normal. A statement that is not a root one never
+        // takes the root count, so its gate is open on every step and it
+        // keeps the long way in.
+        self.on_fast_step_path = self.counted_as_active_root && self.busy_handler_state.is_none();
+        Ok(None)
     }
 
     /// First-call and busy-wait work of [`Self::_step`]. Returns the result to
@@ -652,6 +696,7 @@ impl Statement {
         mut res: std::result::Result<StepResult, Box<LimboError>>,
         waker: Option<&Waker>,
     ) -> Result<StepResult> {
+        self.on_fast_step_path = false;
         const MAX_SCHEMA_RETRY: usize = 50;
         for attempt in 0..MAX_SCHEMA_RETRY {
             // Only reprepare if we still need to update schema
@@ -1441,7 +1486,19 @@ impl Statement {
     /// (so subsequent `commit_dep_counter` walks may wait on it forever)
     /// and the connection's mv_tx points to a dead tx, breaking the
     /// next statement that runs on the connection.
+    #[inline]
     fn cleanup_orphaned_seq_inner_tx(&mut self) {
+        // Statements that never wrapped a sequence in an inner transaction,
+        // which is almost all of them, stop here without a call.
+        if self.state.sequence_inner_tx_pending.is_none() {
+            return;
+        }
+        self.rollback_orphaned_seq_inner_tx();
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn rollback_orphaned_seq_inner_tx(&mut self) {
         let Some(pending) = self.state.sequence_inner_tx_pending.take() else {
             return;
         };
@@ -1512,6 +1569,7 @@ impl Statement {
             }
         }
 
+        self.on_fast_step_path = false;
         let mut reset_error: Option<LimboError> = None;
 
         let in_flight = self
@@ -1753,6 +1811,21 @@ mod tests {
             Arc::new(SqliteDialect),
         )?;
         db.connect()
+    }
+
+    #[test]
+    fn the_fast_step_path_opens_after_the_first_step_and_closes_again() {
+        let conn = open_test_connection().unwrap();
+        let mut stmt = conn.prepare("SELECT 1 UNION ALL SELECT 2").unwrap();
+        assert!(!stmt.on_fast_step_path);
+        assert!(matches!(stmt.step().unwrap(), StepResult::Row));
+        assert!(stmt.on_fast_step_path);
+        assert!(matches!(stmt.step().unwrap(), StepResult::Row));
+        assert!(stmt.on_fast_step_path);
+        assert!(matches!(stmt.step().unwrap(), StepResult::Done));
+        assert!(!stmt.on_fast_step_path);
+        stmt.reset().unwrap();
+        assert!(!stmt.on_fast_step_path);
     }
 
     #[test]
