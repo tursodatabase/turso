@@ -83,7 +83,7 @@ limbo/
 - **[Transaction Correctness](docs/agent-guides/transaction-correctness.md)** - WAL, checkpointing, concurrency
 - **[Storage Format](docs/agent-guides/storage-format.md)** - file format, B-trees, pages
 - **[Async I/O Model](docs/agent-guides/async-io-model.md)** - IOResult, state machines, re-entrancy
-- **[MVCC](docs/agent-guides/mvcc.md)** - experimental multi-version concurrency (WIP)
+- **[MVCC](docs/agent-guides/mvcc.md)** - multi-version concurrency, snapshot isolation, checkpointing
 
 ## Commit Messages
 
