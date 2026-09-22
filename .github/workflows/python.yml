@@ -95,19 +95,27 @@ jobs:
           LOCAL_SYNC_SERVER: "../../target/debug/tursodb"
         run: uv run pytest tests/test_database_sync_aio.py --durations=10
 
-      - name: Run Pytest (windows, sync)
+      - name: Run Pytest (windows, sync drivers)
         working-directory: ${{ env.working-directory }}
         if: runner.os == 'Windows'
+        shell: bash
         env:
           LOCAL_SYNC_SERVER: "..\\..\\target\\debug\\tursodb.exe"
-        run: uv run pytest tests/test_database_sync.py --durations=10
-
-      - name: Run Pytest (windows, sync, async driver)
-        working-directory: ${{ env.working-directory }}
-        if: runner.os == 'Windows'
-        env:
-          LOCAL_SYNC_SERVER: "..\\..\\target\\debug\\tursodb.exe"
-        run: uv run pytest tests/test_database_sync_aio.py --durations=10
+        run: |
+          set -euo pipefail
+          uv run --no-sync pytest tests/test_database_sync.py --durations=10 >sync.log 2>&1 &
+          sync_pid=$!
+          uv run --no-sync pytest tests/test_database_sync_aio.py --durations=10 >async.log 2>&1 &
+          async_pid=$!
+          sync_status=0
+          wait "$sync_pid" || sync_status=$?
+          async_status=0
+          wait "$async_pid" || async_status=$?
+          cat sync.log
+          cat async.log
+          if [ "$sync_status" -ne 0 ] || [ "$async_status" -ne 0 ]; then
+            exit 1
+          fi
 
   lint:
     runs-on: blacksmith-4vcpu-ubuntu-2404
@@ -124,9 +132,6 @@ jobs:
         uses: useblacksmith/setup-uv@v4
         with:
           enable-cache: true
-
-      - name: Install the project
-        run: uv sync --all-extras --dev --all-packages
 
       - name: Ruff lint
         run: uvx ruff@0.5.4 check
