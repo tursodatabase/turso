@@ -54,24 +54,6 @@ jobs:
             exit 1
           fi
 
-          if [ "$GITHUB_EVENT_NAME" = "pull_request" ]; then
-            selected=(
-              benchmark
-              fts_comparison_benchmark
-              json_benchmark
-              mvcc_benchmark
-              parser_benchmark
-              write_perf_benchmark
-            )
-            for benchmark in "${selected[@]}"; do
-              if [[ " ${benchmarks[*]} " != *" $benchmark "* ]]; then
-                echo "PR benchmark not found: $benchmark" >&2
-                exit 1
-              fi
-            done
-            benchmarks=("${selected[@]}")
-          fi
-
           printf 'Benchmark shards:\n'
           printf '  %s\n' "${benchmarks[@]}"
 
