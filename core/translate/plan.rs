@@ -1130,6 +1130,13 @@ pub struct JoinInfo {
 }
 
 impl JoinInfo {
+    /// Return true when `USING` or `NATURAL` merges this column.
+    pub fn merges_column(&self, column_name: &str) -> bool {
+        self.using
+            .iter()
+            .any(|name| name.as_str().eq_ignore_ascii_case(column_name))
+    }
+
     /// Whether this is an OUTER JOIN (LEFT OUTER or FULL OUTER).
     pub fn is_outer(&self) -> bool {
         matches!(self.join_type, JoinType::LeftOuter | JoinType::FullOuter)
@@ -2430,7 +2437,7 @@ impl Operation {
     }
 }
 
-fn query_output_columns(
+pub(super) fn query_output_columns(
     plan: &Plan,
     explicit_columns: Option<&[String]>,
 ) -> Result<alloc::Vec<Column>> {
@@ -2568,6 +2575,7 @@ impl JoinedTable {
             name: identifier.clone(),
             plan: Box::new(Plan::Select(Box::new(plan))),
             columns,
+            parenthesized_join_columns: None,
             result_columns_start_reg: None,
             materialized_cursor_id: None,
             cte: None,
@@ -2615,6 +2623,7 @@ impl JoinedTable {
             name: identifier.clone(),
             plan: Box::new(plan),
             columns,
+            parenthesized_join_columns: None,
             result_columns_start_reg: None,
             materialized_cursor_id: None,
             cte,
