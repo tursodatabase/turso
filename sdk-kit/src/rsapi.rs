@@ -3086,8 +3086,18 @@ mod tests {
         assert!(max_frame > 1200, "max_frame={max_frame}");
 
         exec(&conn, "PRAGMA wal_checkpoint(TRUNCATE)");
-        let (max_frame, _) = conn.wal_state().unwrap();
+        let (max_frame, seq_after) = conn.wal_state().unwrap();
         assert_eq!(max_frame, 0);
+        // The restart shows in the sequence number as soon as the checkpoint
+        // returns, so a replicator can tell a restarted WAL from a new one.
+        assert_ne!(seq_after, seq_before);
+        exec(&conn, "INSERT INTO t(v) VALUES (randomblob(2000))");
+        let (max_frame, seq) = conn.wal_state().unwrap();
+        assert!(max_frame > 0);
+        assert_eq!(
+            seq, seq_after,
+            "writes after a restart keep the sequence number"
+        );
     }
 
     #[test]
