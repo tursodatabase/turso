@@ -59,6 +59,21 @@ const SQLITE_SCHEMA_COLUMN_COUNT: usize = 5;
 enum CollectTablePhase {
     Schema,
     User,
+    /// Full scans only: walk the dirty table keys for their stamps so the
+    /// keys the scan covered can be pruned.
+    DirtyStamps,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CollectIndexPhase {
+    Rows,
+    DirtyStamps,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DirtyMap {
+    Table,
+    Index,
 }
 
 fn sqlite_schema_row_range_start() -> RowID {
@@ -269,6 +284,7 @@ pub struct CheckpointStateMachine<Clock: LogicalClock, A: ConcurrentAllocator = 
     collect_index_tableid_cursor: Option<MVTableId>,
     collect_index_key_cursor: Option<Arc<SortableIndexKey>>,
     collect_dirty_index_cursor: Option<RowID>,
+    collect_index_phase: CollectIndexPhase,
     /// `Some` when this checkpoint walks every row instead of the dirty keys.
     /// Holds the store's full-scan generation so success can clear it.
     full_scan_generation: Option<NonZeroU64>,
@@ -875,6 +891,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
             collect_index_tableid_cursor: None,
             collect_index_key_cursor: None,
             collect_dirty_index_cursor: None,
+            collect_index_phase: CollectIndexPhase::Rows,
             full_scan_generation: None,
             prune_candidates: crate::alloc::vec![],
             prune_cursor: 0,
@@ -1179,20 +1196,29 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
     fn collect_table_rows(&mut self) -> Result<Option<IOCompletions>> {
         let mut processed = 0;
         loop {
-            let must_yield = if self.full_scan_generation.is_some() {
-                self.collect_table_rows_from_store(&mut processed)?
-            } else {
-                self.collect_table_rows_from_dirty_keys(&mut processed)?
+            let full_scan = self.full_scan_generation.is_some();
+            let must_yield = match (full_scan, self.collect_table_phase) {
+                (true, CollectTablePhase::DirtyStamps) => {
+                    self.record_dirty_stamps(DirtyMap::Table, &mut processed)?
+                }
+                (true, _) => self.collect_table_rows_from_store(&mut processed)?,
+                (false, _) => self.collect_table_rows_from_dirty_keys(&mut processed)?,
             };
             if must_yield {
                 return Ok(Some(IOCompletions(Completion::new_yield())));
             }
-            if self.collect_table_phase == CollectTablePhase::Schema {
-                self.collect_table_phase = CollectTablePhase::User;
-                self.collect_table_cursor = None;
-                continue;
+            let next_phase = match self.collect_table_phase {
+                CollectTablePhase::Schema => Some(CollectTablePhase::User),
+                CollectTablePhase::User if full_scan => Some(CollectTablePhase::DirtyStamps),
+                CollectTablePhase::User | CollectTablePhase::DirtyStamps => None,
+            };
+            match next_phase {
+                Some(phase) => {
+                    self.collect_table_phase = phase;
+                    self.collect_table_cursor = None;
+                }
+                None => break,
             }
-            break;
         }
         #[cfg(debug_assertions)]
         if self.full_scan_generation.is_none() {
@@ -1428,7 +1454,48 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
                     Some(last) => (Bound::Excluded(last.clone()), Bound::Excluded(schema_start)),
                 }
             }
+            CollectTablePhase::DirtyStamps => match &self.collect_table_cursor {
+                None => (Bound::Unbounded, Bound::Unbounded),
+                Some(last) => (Bound::Excluded(last.clone()), Bound::Unbounded),
+            },
         }
+    }
+
+    /// After a full scan, every dirty key with a stamp at or below the
+    /// snapshot is covered by the scan, so it can be pruned. Returns true when
+    /// the batch budget ran out and the caller must yield.
+    fn record_dirty_stamps(&mut self, map: DirtyMap, processed: &mut usize) -> Result<bool> {
+        let mvstore = self.mvstore.clone();
+        let (dirty_keys, cursor) = match map {
+            DirtyMap::Table => (
+                &mvstore.checkpoint_dirty_table_keys,
+                &mut self.collect_table_cursor,
+            ),
+            DirtyMap::Index => (
+                &mvstore.checkpoint_dirty_index_keys,
+                &mut self.collect_dirty_index_cursor,
+            ),
+        };
+        let bounds: (Bound<RowID>, Bound<RowID>) = match cursor {
+            None => (Bound::Unbounded, Bound::Unbounded),
+            Some(last) => (Bound::Excluded(last.clone()), Bound::Unbounded),
+        };
+        let guard = epoch::pin();
+        let mut range = dirty_keys.range(bounds);
+        while let Some(pinned) = range.inner.next(&guard) {
+            let entry = CollectEntry::new(pinned, &guard);
+            let key = entry.key();
+            *cursor = Some(key.clone());
+            *processed += 1;
+            let stamp = entry.value().load(Ordering::Acquire);
+            if stamp <= self.snapshot_ts {
+                self.prune_candidates.try_push((key.clone(), stamp))?;
+            }
+            if *processed >= COLLECT_PREEMPTION_THRESHOLD {
+                return Ok(true);
+            }
+        }
+        Ok(false)
     }
 
     /// Collect all committed index row versions that need to be written to the B-tree.
@@ -1439,13 +1506,24 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
     ///    * The row is not a delete (we inserted or changed an existing row), OR
     ///    * The row is a delete AND it exists in the database file already.
     fn collect_index_rows(&mut self) -> Result<Option<IOCompletions>> {
-        let must_yield = if self.full_scan_generation.is_some() {
-            self.collect_index_rows_from_store()?
-        } else {
-            self.collect_index_rows_from_dirty_keys()?
-        };
-        if must_yield {
-            return Ok(Some(IOCompletions(Completion::new_yield())));
+        loop {
+            let full_scan = self.full_scan_generation.is_some();
+            let must_yield = match (full_scan, self.collect_index_phase) {
+                (true, CollectIndexPhase::Rows) => self.collect_index_rows_from_store()?,
+                (true, CollectIndexPhase::DirtyStamps) => {
+                    let mut processed = 0;
+                    self.record_dirty_stamps(DirtyMap::Index, &mut processed)?
+                }
+                (false, _) => self.collect_index_rows_from_dirty_keys()?,
+            };
+            if must_yield {
+                return Ok(Some(IOCompletions(Completion::new_yield())));
+            }
+            if full_scan && self.collect_index_phase == CollectIndexPhase::Rows {
+                self.collect_index_phase = CollectIndexPhase::DirtyStamps;
+                continue;
+            }
+            break;
         }
         #[cfg(debug_assertions)]
         if self.full_scan_generation.is_none() {
@@ -4440,11 +4518,12 @@ mod tests {
 
         while checkpoint.collect_table_rows().unwrap().is_some() {}
 
-        assert_eq!(checkpoint.write_set.len(), 1);
         assert_eq!(
-            checkpoint.collect_table_cursor,
-            Some(RowID::new(table_id, RowKey::Int(10)))
+            checkpoint.write_set.len(),
+            1,
+            "a full scan must find a checkpointable row that no commit marked"
         );
+        assert_eq!(checkpoint.write_set[0].0.row.id.row_id, RowKey::Int(5));
     }
 
     #[test]
@@ -4534,7 +4613,7 @@ mod tests {
         assert!(!dirty_table_key(&mvstore, table_id, 1));
         assert!(dirty_table_key(&mvstore, table_id, 2));
         assert!(dirty_table_key(&mvstore, table_id, 3));
-        let remaining: Vec<_> = mvstore
+        let remaining: std::vec::Vec<_> = mvstore
             .checkpoint_dirty_index_keys
             .iter()
             .map(|entry| entry.key().clone())
@@ -4598,11 +4677,36 @@ mod tests {
 
         while checkpoint.collect_table_rows().unwrap().is_some() {}
 
-        let collected: Vec<i64> = checkpoint
+        let collected: std::vec::Vec<i64> = checkpoint
             .write_set
             .iter()
             .map(|(version, _)| version.row.id.row_id.to_int_or_panic())
             .collect();
         assert_eq!(collected, vec![1, 2, 3, 150, 200]);
+    }
+
+    #[test]
+    fn full_scan_prunes_dirty_keys_it_covered() {
+        let mut checkpoint = checkpoint_for_collect_tests();
+        checkpoint.full_scan_generation = NonZeroU64::new(1);
+        checkpoint.snapshot_ts = 10;
+        let mvstore = checkpoint.mvstore.clone();
+        let table_id = MVTableId::from(-2);
+        insert_row_version(&mvstore, committed_table_row_version(table_id, 1));
+        insert_row_version(
+            &mvstore,
+            table_row_version(table_id, 2, 1, Some(50), None, false),
+        );
+        let index_id = MVTableId::from(-7);
+        let (key, version) = index_row_version(index_id, "k", 1, 1, Some(5), None, false);
+        insert_dirty_index_version(&mvstore, index_id, key, version);
+
+        while checkpoint.collect_table_rows().unwrap().is_some() {}
+        while checkpoint.collect_index_rows().unwrap().is_some() {}
+        assert!(checkpoint.prune_dirty_keys().is_none());
+
+        assert!(!dirty_table_key(&mvstore, table_id, 1));
+        assert!(dirty_table_key(&mvstore, table_id, 2));
+        assert!(mvstore.checkpoint_dirty_index_keys.is_empty());
     }
 }

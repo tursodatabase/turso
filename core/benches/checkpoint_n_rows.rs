@@ -1,6 +1,11 @@
 //! One `PRAGMA wal_checkpoint(PASSIVE)` after inserting N rows.
 //! Insert time is not measured. No helper racing writers.
 //!
+//! A second measurement opens a read snapshot, checkpoints N rows while the
+//! snapshot keeps their versions in the store, inserts DELTA more rows, and
+//! times the next checkpoint. That checkpoint only has DELTA rows to write,
+//! so its time shows how much the collect pass depends on N.
+//!
 //! ```text
 //! cargo bench -p turso_core --bench checkpoint_n_rows --profile bench-profile
 //! CHECKPOINT_N_ROWS_OUT=/path.csv cargo bench -p turso_core --bench checkpoint_n_rows --profile bench-profile
@@ -95,6 +100,51 @@ fn bench_checkpoint_passive_n_rows(criterion: &mut Criterion) {
         }
     }
 
+    let mut delta_out = out_path.as_ref().map(|path| {
+        let p = std::path::Path::new(path);
+        let delta_path = p.with_file_name(format!(
+            "{}-delta.csv",
+            p.file_stem().unwrap_or_default().to_string_lossy()
+        ));
+        let mut f = std::fs::File::create(delta_path).expect("delta csv");
+        writeln!(f, "n,delta,samples,p50_ms,p99_ms,min_ms,max_ms,mean_ms").unwrap();
+        f
+    });
+    eprintln!("n,delta,samples,p50_ms,p99_ms,min_ms,max_ms,mean_ms");
+    for n in row_counts() {
+        let (warmup, samples) = sample_plan(n);
+        let samples = samples.min(6);
+        let mut times_ns = Vec::with_capacity(samples);
+        for _ in 0..warmup {
+            one_delta_checkpoint_ns(n, DELTA_ROWS);
+        }
+        for i in 0..samples {
+            let ns = one_delta_checkpoint_ns(n, DELTA_ROWS);
+            eprintln!(
+                "n={n} delta={DELTA_ROWS} sample {i} {:.1}ms",
+                ns as f64 / 1e6
+            );
+            times_ns.push(ns);
+        }
+        times_ns.sort_unstable();
+        let p50 = nearest_rank_ms(&times_ns, 0.5);
+        let p99 = nearest_rank_ms(&times_ns, 0.99);
+        let min = times_ns[0] as f64 / 1e6;
+        let max = times_ns[times_ns.len() - 1] as f64 / 1e6;
+        let mean = times_ns.iter().sum::<u64>() as f64 / times_ns.len() as f64 / 1e6;
+        eprintln!(
+            "n={n},delta={DELTA_ROWS},{samples},{p50:.1},{p99:.1},{min:.1},{max:.1},{mean:.1}"
+        );
+        if let Some(f) = delta_out.as_mut() {
+            writeln!(
+                f,
+                "{n},{DELTA_ROWS},{samples},{p50:.3},{p99:.3},{min:.3},{max:.3},{mean:.3}"
+            )
+            .unwrap();
+            f.flush().unwrap();
+        }
+    }
+
     group.sample_size(10);
     group.warm_up_time(Duration::from_millis(100));
     group.measurement_time(Duration::from_secs(1));
@@ -103,6 +153,8 @@ fn bench_checkpoint_passive_n_rows(criterion: &mut Criterion) {
     });
     group.finish();
 }
+
+const DELTA_ROWS: usize = 10_000;
 
 fn row_counts() -> Vec<usize> {
     if cfg!(feature = "codspeed") {
@@ -140,6 +192,23 @@ fn one_checkpoint_ns(n: usize) -> u64 {
     black_box(ns)
 }
 
+/// Holds a read snapshot so the store keeps every version, checkpoints the N
+/// rows, inserts `delta` more rows, and times the checkpoint that writes them.
+fn one_delta_checkpoint_ns(n: usize, delta: usize) -> u64 {
+    let loaded = load_n_rows(n);
+    let reader = loaded.db.connect().unwrap();
+    exec(&reader, &loaded.db, "BEGIN CONCURRENT");
+    let seen = count_rows(&reader, &loaded.db);
+    assert_eq!(seen, n as i64, "reader snapshot must see the N rows");
+    exec(&loaded.conn, &loaded.db, "PRAGMA wal_checkpoint(PASSIVE)");
+    insert_rows(&loaded.conn, &loaded.db, n, n + delta);
+    let started = Instant::now();
+    exec(&loaded.conn, &loaded.db, "PRAGMA wal_checkpoint(PASSIVE)");
+    let ns = started.elapsed().as_nanos() as u64;
+    exec(&reader, &loaded.db, "COMMIT");
+    black_box(ns)
+}
+
 fn load_n_rows(n: usize) -> Loaded {
     let dir = tempfile::tempdir().unwrap();
     let db_path = dir.path().join("checkpoint_n_rows.db");
@@ -167,11 +236,23 @@ fn load_n_rows(n: usize) -> Loaded {
         &db,
         "CREATE TABLE t (id INTEGER PRIMARY KEY, v INTEGER)",
     );
-    exec(&conn, &db, "BEGIN CONCURRENT");
+    insert_rows(&conn, &db, 0, n);
+    let counted = count_rows(&conn, &db);
+    assert_eq!(counted, n as i64, "inserted row count must equal N");
+    Loaded {
+        db,
+        conn,
+        _dir: dir,
+    }
+}
+
+/// Inserts rows with ids in `from..to` in one transaction, 1000 rows per statement.
+fn insert_rows(conn: &Arc<Connection>, db: &Arc<Database>, from: usize, to: usize) {
+    exec(conn, db, "BEGIN CONCURRENT");
     let batch: usize = 1000;
-    let mut i = 0usize;
-    while i < n {
-        let end = (i + batch).min(n);
+    let mut i = from;
+    while i < to {
+        let end = (i + batch).min(to);
         let mut sql = String::with_capacity((end - i) * 24);
         sql.push_str("INSERT INTO t (id, v) VALUES ");
         for j in i..end {
@@ -180,17 +261,10 @@ fn load_n_rows(n: usize) -> Loaded {
             }
             sql.push_str(&format!("({j}, {j})"));
         }
-        exec(&conn, &db, &sql);
+        exec(conn, db, &sql);
         i = end;
     }
-    exec(&conn, &db, "COMMIT");
-    let counted = count_rows(&conn, &db);
-    assert_eq!(counted, n as i64, "inserted row count must equal N");
-    Loaded {
-        db,
-        conn,
-        _dir: dir,
-    }
+    exec(conn, db, "COMMIT");
 }
 
 fn count_rows(conn: &Arc<Connection>, db: &Arc<Database>) -> i64 {
