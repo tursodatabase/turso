@@ -5590,6 +5590,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                     let row = Row::new_index_row(id.clone(), record.column_count());
                     let version_id = self.insert_tombstone(tx_id, row, &mut locked_row_versions)?;
                     drop(locked_row_versions);
+                    self.bump_index_rows_epoch();
                     tx.insert_to_write_set(id, row_versions);
                     tx.record_created_index_version((index_id, arc_key), version_id);
                     return Ok(true);
@@ -8468,6 +8469,8 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
     /// Key-set mutation of `index_rows` (insert or empty-slot remove); see field docs.
     pub(crate) fn bump_index_rows_epoch(&self) {
         self.index_rows_epoch.fetch_add(1, Ordering::SeqCst);
+        #[cfg(shuttle)]
+        crate::thread::yield_now();
     }
 
     #[turso_macros::allocation_site(crate::alloc::MvStoreAllocationSite::IndexRowsEntry)]
