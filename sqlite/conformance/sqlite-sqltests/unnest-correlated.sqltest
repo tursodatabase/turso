@@ -28,6 +28,45 @@ setup correlated_rows {
     INSERT INTO outer_key2 VALUES (1, 10), (3, 20), (5, 40);
 }
 
+setup correlated_in_indexes {
+    CREATE INDEX inner_amount ON inner_rows(amount);
+    CREATE INDEX inner_key_amount ON inner_rows(key1, amount);
+    CREATE INDEX inner_text_nocase ON inner_rows(text_key COLLATE NOCASE);
+}
+
+setup correlated_comparison_many_rows {
+    CREATE TABLE many_outer(id INTEGER PRIMARY KEY, k INTEGER, v, text_key TEXT COLLATE NOCASE);
+    CREATE TABLE many_inner(k INTEGER, v, text_key TEXT COLLATE BINARY);
+    WITH RECURSIVE numbers(n) AS (
+        VALUES(1) UNION ALL SELECT n + 1 FROM numbers WHERE n < 45
+    )
+    INSERT INTO many_outer
+    SELECT n,
+           CASE WHEN n % 7 = 0 THEN NULL ELSE n % 5 END,
+           CASE WHEN n % 9 = 0 THEN NULL
+                WHEN n % 15 = 0 THEN x'0102'
+                WHEN n % 13 = 0 THEN CAST(n % 17 AS REAL)
+                WHEN n % 3 = 0 THEN CAST(n % 17 AS TEXT)
+                ELSE n % 17 END,
+           CASE WHEN n % 11 = 0 THEN NULL ELSE char(65 + n % 5) END
+    FROM numbers;
+    WITH RECURSIVE numbers(n) AS (
+        VALUES(1) UNION ALL SELECT n + 1 FROM numbers WHERE n < 50
+    )
+    INSERT INTO many_inner
+    SELECT CASE WHEN n % 8 = 0 THEN NULL ELSE n % 5 END,
+           CASE WHEN n % 10 = 0 THEN NULL
+                WHEN n % 15 = 0 THEN x'0102'
+                WHEN n % 13 = 0 THEN CAST(n % 17 AS REAL)
+                WHEN n % 4 = 0 THEN CAST(n % 17 AS TEXT)
+                ELSE n % 17 END,
+           CASE WHEN n % 12 = 0 THEN NULL ELSE char(65 + n % 5) END
+    FROM numbers;
+    CREATE INDEX many_inner_k_v ON many_inner(k, v);
+    CREATE INDEX many_inner_v ON many_inner(v);
+    ANALYZE;
+}
+
 setup selective_join_plan_rows {
     CREATE TABLE plan_outer(
         id INTEGER PRIMARY KEY,
@@ -609,6 +648,170 @@ test correlated-in-with-outer-aggregate {
 }
 expect {
     2
+}
+
+@setup correlated_rows
+@setup correlated_in_indexes
+@var left_value { o.amount | o.key1 | 10 | NULL }
+@var comparison {
+    i.amount = o.amount | o.amount = i.amount
+    | i.amount <> o.amount | o.amount <> i.amount
+    | i.amount < o.amount | o.amount < i.amount
+    | i.amount <= o.amount | o.amount <= i.amount
+    | i.amount > o.amount | o.amount > i.amount
+    | i.amount >= o.amount | o.amount >= i.amount
+    | i.amount IS o.amount | o.amount IS i.amount
+    | i.amount IS NOT o.amount | o.amount IS NOT i.amount
+}
+@var link { i.key1 = o.key1 | i.key1 IS o.key1 | i.key1 < o.key1 }
+matrix correlated-in-comparison-results {
+    SELECT o.id
+    FROM outer_rows AS o
+    WHERE $left_value IN (
+        SELECT i.amount FROM inner_rows AS i
+        WHERE $comparison AND $link
+    )
+    ORDER BY o.id;
+}
+
+@setup correlated_comparison_many_rows
+@var left_value { o.v | 5 | NULL }
+@var comparison {
+    i.v < o.v | o.v < i.v
+    | i.v <= o.v | o.v <= i.v
+    | i.v <> o.v | o.v <> i.v
+    | i.v IS o.v | i.v IS NOT o.v
+}
+@var link { i.k = o.k | i.k IS o.k | i.k < o.k }
+matrix correlated-in-comparison-many-rows {
+    SELECT o.id
+    FROM many_outer AS o
+    WHERE $left_value IN (
+        SELECT i.v FROM many_inner AS i WHERE $comparison AND $link
+    )
+    ORDER BY o.id;
+}
+
+@setup correlated_comparison_many_rows
+@var polarity { EXISTS | NOT EXISTS }
+@var comparison {
+    i.v < o.v | o.v < i.v
+    | i.v <= o.v | o.v <= i.v
+    | i.v <> o.v | o.v <> i.v
+    | i.v IS o.v | i.v IS NOT o.v
+}
+@var link { i.k = o.k | i.k IS o.k | i.k < o.k }
+matrix correlated-exists-comparison-many-rows {
+    SELECT o.id
+    FROM many_outer AS o
+    WHERE $polarity (
+        SELECT 1 FROM many_inner AS i WHERE $comparison AND $link
+    )
+    ORDER BY o.id;
+}
+
+@setup correlated_rows
+@setup correlated_in_indexes
+@var left_value { o.amount | 10 | NULL }
+@var comparison {
+    i.key1 < o.key1 | o.key1 < i.key1
+    | i.key1 <= o.key1 | o.key1 <= i.key1
+    | i.key1 <> o.key1 | o.key1 <> i.key1
+    | i.key1 IS o.key1 | i.key1 IS NOT o.key1
+}
+matrix correlated-in-with-only-one-comparison {
+    SELECT o.id
+    FROM outer_rows AS o
+    WHERE $left_value IN (
+        SELECT i.amount FROM inner_rows AS i WHERE $comparison
+    )
+    ORDER BY o.id;
+}
+
+@setup correlated_rows
+@setup correlated_in_indexes
+@var comparison {
+    i.text_key < o.text_key COLLATE NOCASE
+    | o.text_key COLLATE NOCASE < i.text_key
+    | i.text_key IS NOT o.text_key COLLATE NOCASE
+}
+matrix correlated-in-keeps-text-collation {
+    SELECT o.id
+    FROM outer_rows AS o
+    WHERE o.text_key COLLATE NOCASE IN (
+        SELECT i.text_key FROM inner_rows AS i WHERE $comparison
+    )
+    ORDER BY o.id;
+}
+
+@setup correlated_rows
+@var join_type { LEFT | RIGHT }
+@var comparison { i.amount < k.key2 | k.key2 < i.amount | i.amount IS NOT k.key2 }
+matrix correlated-in-after-outer-join {
+    SELECT o.id, k.id
+    FROM outer_rows AS o $join_type JOIN outer_key2 AS k ON o.id = k.id
+    WHERE k.key2 IN (
+        SELECT i.amount FROM inner_rows AS i WHERE $comparison
+    )
+    ORDER BY o.id, k.id;
+}
+
+@setup correlated_rows
+@var comparison { s.amount < i.amount | i.amount < s.amount | s.amount IS NOT i.amount }
+matrix correlated-in-after-full-join {
+    SELECT o.id, k.id, i.key1, i.amount
+    FROM outer_rows AS o
+    JOIN outer_key2 AS k ON o.id = k.id
+    FULL JOIN inner_rows AS i ON k.key2 = i.key2
+    WHERE i.amount IN (
+        SELECT s.amount FROM outer_rows AS s WHERE $comparison
+    )
+    ORDER BY o.id, k.id, i.key1, i.amount;
+}
+
+@setup correlated_rows
+@var operator { IN | NOT IN }
+@var comparison { i.amount < o.amount | o.amount < i.amount | i.amount IS NOT o.amount }
+@var or_term { | OR o.id = 4 }
+matrix correlated-in-with-not-in-and-or {
+    SELECT o.id
+    FROM outer_rows AS o
+    WHERE o.amount $operator (
+        SELECT i.amount FROM inner_rows AS i WHERE $comparison
+    ) $or_term
+    ORDER BY o.id;
+}
+
+@setup correlated_rows
+@setup correlated_in_indexes
+@skip-if sqlite "query plan explanation output is different in sqlite"
+test correlated-in-inequality-uses-indexed-semi-join {
+    EXPLAIN QUERY PLAN
+    SELECT o.id
+    FROM outer_rows AS o
+    WHERE o.amount IN (
+        SELECT i.amount FROM inner_rows AS i
+        WHERE i.key1 = o.key1 AND i.amount < o.amount
+    );
+}
+expect pattern {
+    (?s)SCAN outer_rows AS o.*SEARCH i USING COVERING INDEX inner_key_amount
+}
+
+@setup correlated_rows
+@setup correlated_in_indexes
+@skip-if sqlite "query plan explanation output is different in sqlite"
+test correlated-in-with-only-inequality-uses-indexed-semi-join {
+    EXPLAIN QUERY PLAN
+    SELECT o.id
+    FROM outer_rows AS o
+    WHERE o.amount IN (
+        SELECT i.amount FROM inner_rows AS i INDEXED BY inner_key_amount
+        WHERE i.key1 < o.key1
+    );
+}
+expect pattern {
+    (?s)SCAN outer_rows AS o.*SEARCH i USING COVERING INDEX inner_key_amount \(key1<\?\)
 }
 
 @setup correlated_rows
@@ -2110,6 +2313,37 @@ setup comparison_keys {
     INSERT INTO nocase_inner VALUES ('a', 10), ('A', 20);
 }
 
+setup comparison_key_indexes {
+    CREATE INDEX text_inner_key_amount ON text_inner(key1, amount);
+    CREATE INDEX binary_inner_key_amount ON binary_inner(key1, amount);
+    CREATE INDEX nocase_inner_key_amount ON nocase_inner(key1, amount);
+}
+
+@setup comparison_keys
+@setup comparison_key_indexes
+@var comparison { i.amount > o.id | o.id < i.amount | i.amount IS NOT o.id }
+matrix correlated-in-inequality-keeps-number-to-text-comparison {
+    SELECT o.id
+    FROM number_outer AS o
+    WHERE o.key1 IN (
+        SELECT i.key1 FROM text_inner AS i WHERE $comparison
+    )
+    ORDER BY o.id;
+}
+
+@setup comparison_keys
+@setup comparison_key_indexes
+@var inner_table { binary_inner | nocase_inner }
+@var comparison { i.amount > o.id | o.id < i.amount | i.amount IS NOT o.id }
+matrix correlated-in-inequality-keeps-text-order {
+    SELECT o.id
+    FROM nocase_outer AS o
+    WHERE o.key1 IN (
+        SELECT i.key1 FROM $inner_table AS i WHERE $comparison
+    )
+    ORDER BY o.id;
+}
+
 @setup comparison_keys
 test one-value-number-and-text-stay-correlated {
     SELECT o.id, (SELECT sum(i.amount) FROM text_inner i WHERE i.key1 = o.key1)
@@ -2187,6 +2421,123 @@ test correlated-in-keeps-errors-from-later-values {
 }
 expect error {
     .*malformed JSON.*
+}
+
+setup correlated_comparison_errors {
+    CREATE TABLE error_outer(id INTEGER, wanted INTEGER, limit_value INTEGER, text_value TEXT);
+    CREATE TABLE error_inner(value INTEGER, json_value TEXT);
+    INSERT INTO error_outer VALUES (1, 1, 10, '1'), (2, 1, 0, 'bad JSON');
+    INSERT INTO error_inner VALUES (1, '1'), (2, 'bad JSON');
+}
+
+@setup correlated_comparison_errors
+@var polarity { EXISTS | NOT EXISTS }
+@var comparison {
+    json_extract(i.json_value, '$') < o.limit_value
+    | o.limit_value > json_extract(i.json_value, '$')
+    | i.value < json_extract(o.text_value, '$')
+}
+@var other_term { | AND i.value = o.wanted }
+matrix correlated-exists-inequality-expression-errors {
+    SELECT o.id
+    FROM error_outer AS o
+    WHERE $polarity (
+        SELECT 1 FROM error_inner AS i WHERE $comparison $other_term
+    )
+    ORDER BY o.id;
+}
+
+@setup correlated_comparison_errors
+@var left_value { (SELECT json_extract(o.text_value, '$')) | (SELECT o.wanted) }
+@var comparison { i.value < o.limit_value | i.value >= o.limit_value }
+matrix correlated-in-with-left-subquery {
+    SELECT o.id
+    FROM error_outer AS o
+    WHERE $left_value IN (
+        SELECT i.value FROM error_inner AS i WHERE $comparison
+    )
+    ORDER BY o.id;
+}
+
+@setup correlated_comparison_errors
+@var comparison { i.value < o.limit_value | o.limit_value > i.value }
+matrix correlated-in-nested-result-error {
+    SELECT o.id
+    FROM error_outer AS o
+    WHERE o.wanted IN (
+        SELECT CASE WHEN i.value = 1 THEN 1
+                    ELSE (SELECT json_extract('bad JSON', '$')) END
+        FROM error_inner AS i
+        WHERE $comparison
+    )
+    ORDER BY o.id;
+}
+
+@setup correlated_comparison_errors
+test correlated-in-inequality-keeps-inner-filter-error {
+    SELECT o.id
+    FROM error_outer AS o
+    WHERE o.wanted IN (
+        SELECT i.value FROM error_inner AS i
+        WHERE json_extract(i.json_value, '$') < o.limit_value
+    );
+}
+expect error {
+    .*malformed JSON.*
+}
+
+@setup correlated_comparison_errors
+test correlated-in-inequality-keeps-result-error {
+    SELECT o.id
+    FROM error_outer AS o
+    WHERE o.wanted IN (
+        SELECT json_extract(i.json_value, '$') FROM error_inner AS i
+        WHERE i.value < o.limit_value
+    );
+}
+expect error {
+    .*malformed JSON.*
+}
+
+@setup correlated_comparison_errors
+test correlated-in-inequality-keeps-left-error {
+    SELECT o.id
+    FROM error_outer AS o
+    WHERE json_extract(o.text_value, '$') IN (
+        SELECT i.value FROM error_inner AS i
+        WHERE i.value < o.limit_value
+    );
+}
+expect error {
+    .*malformed JSON.*
+}
+
+@setup correlated_comparison_errors
+@skip-if sqlite "query plan explanation output is different in sqlite"
+test correlated-in-error-expressions-stay-subqueries {
+    EXPLAIN QUERY PLAN
+    SELECT o.id FROM error_outer AS o
+    WHERE o.wanted IN (
+        SELECT i.value FROM error_inner AS i
+        WHERE json_extract(i.json_value, '$') < o.limit_value
+    );
+
+    EXPLAIN QUERY PLAN
+    SELECT o.id FROM error_outer AS o
+    WHERE o.wanted IN (
+        SELECT json_extract(i.json_value, '$') FROM error_inner AS i
+        WHERE i.value < o.limit_value
+    );
+
+    EXPLAIN QUERY PLAN
+    SELECT o.id FROM error_outer AS o
+    WHERE json_extract(o.text_value, '$') IN (
+        SELECT i.value FROM error_inner AS i
+        WHERE i.value < o.limit_value
+    );
+}
+expect pattern {
+    (?s)CORRELATED LIST SUBQUERY.*CORRELATED LIST SUBQUERY.*CORRELATED LIST SUBQUERY
 }
 
 # These cases run every generated query against Turso and SQLite. The data has

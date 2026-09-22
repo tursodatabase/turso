@@ -98,8 +98,11 @@
 //!   `count` returns 0 and `sum` returns NULL. An extension aggregate may return
 //!   something else, and this code does not know which value to use.
 //!
-//! An `EXISTS` rewrite can move a direct comparison between inner and outer expressions.
-//! Other rewrites only move direct `=` checks between an inner and outer column.
+//! The `EXISTS`, `NOT EXISTS`, and direct positive `IN` rewrites can move
+//! comparisons between inner and outer expressions.
+//! They keep an inner `WHERE` expression in the subquery if it can fail.
+//! A join can skip a row that the subquery tests and hide an error.
+//! Aggregate rewrites only move direct `=` checks between inner and outer columns.
 //! `NOT IN` stays as a subquery because NULL values can change its result.
 //! A one-value subquery stays as it is unless its result for an empty input is known.
 //!
@@ -306,10 +309,6 @@ fn try_rewrite_in(
     if inner_plan.result_columns.len() != 1
         || expression_can_fail_on_input(&left)
         || expression_can_fail_on_input(&right)
-        || inner_plan
-            .where_clause
-            .iter()
-            .any(|term| expression_can_fail_on_input(&term.expr))
     {
         return Ok(false);
     }
@@ -1295,7 +1294,9 @@ fn can_rewrite_as_semi_join(plan: &SelectPlan, resolver: &Resolver<'_>) -> Resul
     }
 
     for term in &plan.where_clause {
-        if expr_contains_nondeterministic_scalar_function(&term.expr, resolver)? {
+        if expression_can_fail_on_input(&term.expr)
+            || expr_contains_nondeterministic_scalar_function(&term.expr, resolver)?
+        {
             return Ok(false);
         }
     }
