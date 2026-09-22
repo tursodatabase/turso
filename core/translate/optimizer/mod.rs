@@ -23,7 +23,8 @@ use crate::{
     },
     translate::{
         expr::{
-            expr_references_any_subquery, expr_references_outer_query, expression_can_fail_on_input,
+            expr_references_any_subquery, expr_references_outer_query,
+            expression_can_fail_on_input, walk_expr, WalkControl,
         },
         insert::ROWID_COLUMN,
         optimizer::{
@@ -2029,7 +2030,8 @@ fn optimize_table_access_with_custom_modules(
 }
 
 /// We do a single pass over projected, grouping, filtering, and ordering expressions to
-/// capture every expression that could be served directly from an expression index.
+/// capture every expression that could be served directly from an expression index,
+/// including parts of larger expressions such as `lower(a)` inside an aggregate argument.
 /// Example:
 ///   CREATE INDEX idx ON t(lower(a));
 ///   SELECT lower(a) FROM t WHERE lower(a) ORDER BY lower(a);
@@ -2046,29 +2048,37 @@ fn register_index_expression_usages_for_plan(
     )],
     group_by: Option<&GroupBy>,
     where_clause: &mut [WhereTerm],
-) {
+) -> Result<()> {
     table_references.reset_expression_index_usages();
 
+    let mut register = |expr: &ast::Expr| {
+        walk_expr(expr, &mut |part| {
+            table_references.register_expression_index_usage(part);
+            Ok(WalkControl::Continue)
+        })
+    };
+
     for rc in result_columns {
-        table_references.register_expression_index_usage(&rc.expr);
+        register(&rc.expr)?;
     }
     for (expr, _, _) in order_by {
-        table_references.register_expression_index_usage(expr);
+        register(expr)?;
     }
     for where_term in where_clause {
-        table_references.register_expression_index_usage(&where_term.expr);
+        register(&where_term.expr)?;
     }
 
     if let Some(group_by) = group_by {
         for expr in &group_by.exprs {
-            table_references.register_expression_index_usage(expr);
+            register(expr)?;
         }
         if let Some(having) = &group_by.having {
             for expr in having {
-                table_references.register_expression_index_usage(expr);
+                register(expr)?;
             }
         }
     }
+    Ok(())
 }
 
 /// Derive a base row-count estimate for a table, preferring ANALYZE stats.
@@ -2532,7 +2542,7 @@ fn find_table_access_plan(
             order_by.as_slice(),
             group_by.as_ref(),
             where_clause,
-        );
+        )?;
     }
 
     // For single-table queries, try to optimize with custom index methods directly.

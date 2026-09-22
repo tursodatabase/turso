@@ -873,7 +873,7 @@ setup left_join_grouped_expression_index_schema {
         ON grouped_expr_right(a,coalesce(b,7));
 }
 
-# The sorter computes coalesce(b,7) from the table column before GROUP BY.
+# The sorter stores the index value of coalesce(b,7) before GROUP BY.
 # For an unmatched LEFT JOIN row, b is NULL, so the sorter stores 7.
 @setup left_join_grouped_expression_index_schema
 snapshot left-join-group-by-keeps-expression-index-value {
