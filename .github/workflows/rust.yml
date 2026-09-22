@@ -90,7 +90,7 @@ jobs:
       - name: Install cargo-nextest
         uses: taiki-e/install-action@nextest
       - name: Install cargo-llvm-cov
-        if: runner.os == 'Linux'
+        if: runner.os == 'Linux' && github.event_name != 'pull_request'
         uses: taiki-e/install-action@cargo-llvm-cov
       # Blacksmith Windows images ship no LLVM; the all-features build pulls in
       # pg_query, whose bindgen needs libclang.dll.
@@ -112,7 +112,7 @@ jobs:
       - name: Build
         run: cargo build --verbose --locked --all-features
       - name: Test (nextest with coverage)
-        if: runner.os == 'Linux'
+        if: runner.os == 'Linux' && github.event_name != 'pull_request'
         env:
           RUST_LOG: ${{ runner.debug && 'turso_core::storage=trace' || '' }}
           LOCAL_SYNC_SERVER: "../../target/debug/tursodb"
@@ -124,7 +124,7 @@ jobs:
           echo "::endgroup::"
         timeout-minutes: 20
       - name: Test (nextest)
-        if: runner.os != 'Linux'
+        if: runner.os != 'Linux' || github.event_name == 'pull_request'
         env:
           RUST_LOG: ${{ runner.debug && 'turso_core::storage=trace' || '' }}
           LOCAL_SYNC_SERVER: "../../target/debug/tursodb"
@@ -144,7 +144,7 @@ jobs:
           LOCAL_SYNC_SERVER: "../../target/debug/tursodb"
         run: cargo test --workspace --all-features --doc --locked --exclude memory-benchmark
       - name: Upload coverage report
-        if: runner.os == 'Linux'
+        if: runner.os == 'Linux' && github.event_name != 'pull_request'
         uses: actions/upload-artifact@v4
         with:
           name: coverage-report
@@ -326,13 +326,25 @@ jobs:
         with:
           prefix-key: "v1-rust"
           cache-on-failure: true
-      # Run these with for loops (instead of --loop flag in sim) so that each iteration gets a separate seed -- this produces much easier-to-debug traces when there's a failure since we don't have to potentially
-      # run 10 iterations of the same seed to get to the failure
+      - name: Build simulator
+        run: cargo build -p limbo_sim --bin limbo_sim --locked
       - name: Simulator ${{ matrix.profile.name }}
+        env:
+          SIM_ARGS: ${{ matrix.profile.args }}
         run: |
-          for i in $(seq 1 ${{ matrix.profile.iterations }}); do
-            ./scripts/run-sim ${{ matrix.profile.args }} || exit 1
-          done
+          set -euo pipefail
+          seq 1 ${{ matrix.profile.iterations }} | xargs -P 4 -n 1 bash -c '
+            i="$1"
+            log="sim-run-$i.log"
+            read -r -a args <<< "$SIM_ARGS"
+            if ./target/debug/limbo_sim "${args[@]}" >"$log" 2>&1; then
+              echo "iteration $i ok: $(grep -m1 "^seed: " "$log")"
+            else
+              echo "iteration $i FAILED:"
+              cat "$log"
+              exit 255
+            fi
+          ' _
 
         # TODO: find out why this blows the stack so quickly every time..
         # e.g. https://github.com/tursodatabase/turso/actions/runs/22370904813/job/64749257476?pr=5588
@@ -497,7 +509,7 @@ jobs:
 
       - uses: "./.github/shared/install_sqlite"
       - name: Test
-        run: make test
+        run: make test-without-sqltest
 
   concurrent-simulator:
     name: "Concurrent simulator (${{ matrix.toolchain.label }}, ${{ matrix.profile.name }})"
