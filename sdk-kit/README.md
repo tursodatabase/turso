@@ -29,6 +29,17 @@ Codec rules:
 Language bindings can expose this generic surface by wrapping `turso_page_codec_v1_t`
 with binding-specific lifetime management for the callback context.
 
+## Raw WAL access
+
+`turso_connection_wal_*` functions give language bindings the WAL frame API the sync engine uses, so an application can replicate a database outside Turso Cloud, for example by shipping frames to object storage:
+
+- `turso_connection_wal_disable_auto_actions` stops the connection from checkpointing on its own, so frames stay in the WAL until the caller has copied them and runs `PRAGMA wal_checkpoint`;
+- `turso_connection_wal_state` reports the last frame number and the checkpoint sequence number, which changes when a checkpoint restarts the WAL;
+- `turso_connection_wal_get_frame` copies one frame (24-byte header plus page); a non-zero database size marks a commit frame;
+- `turso_connection_wal_insert_begin`, `_insert_frame`, and `_insert_end` append frames to another database's WAL.
+
+These functions work on databases in WAL journal mode; MVCC keeps recent changes in a separate log.
+
 ## Rust example
 
 ```rust
