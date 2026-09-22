@@ -95,6 +95,35 @@ jobs:
         RUST_BACKTRACE: 1
       run: RUSTFLAGS="--cfg shuttle" cargo run -p turso_stress --locked -- --nr-threads 3 --nr-iterations 300
 
+  fts-stress-test:
+    name: FTS stress (${{ matrix.mode }})
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - mode: wal
+            tx-mode: sqlite
+          - mode: mvcc
+            tx-mode: concurrent
+    steps:
+    - uses: actions/checkout@v4
+    - uses: dtolnay/rust-toolchain@stable
+    - name: Setup mold linker
+      uses: rui314/setup-mold@v1
+    - uses: Swatinem/rust-cache@v2
+      with:
+        prefix-key: "v1-rust"
+        cache-on-failure: true
+    - name: Run FTS stress test
+      env:
+        RUST_BACKTRACE: 1
+      run: >-
+        cargo run -p turso_stress --locked --
+        --fts --tx-mode ${{ matrix.tx-mode }}
+        --nr-threads 2 --nr-iterations 10000
+
   shuttle-stress-test:
     runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 30

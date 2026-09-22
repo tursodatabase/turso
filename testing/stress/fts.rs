@@ -1,0 +1,155 @@
+use rand::Rng;
+use turso_stress::ThreadId;
+
+use crate::{conn::StressConn, sql_logging::SqlLogger, ThreadRng};
+
+pub const TOKENS: &[&str] = &["alpha", "bravo", "charlie", "delta", "echo", "foxtrot"];
+
+pub fn schema(tables: usize) -> Vec<String> {
+    assert!(tables > 0, "FTS workload requires at least one table");
+    (0..tables)
+        .flat_map(|table| {
+            [
+                format!("CREATE TABLE IF NOT EXISTS fts_docs_{table}(id INTEGER PRIMARY KEY, body TEXT)"),
+                format!("CREATE INDEX IF NOT EXISTS fts_idx_{table} ON fts_docs_{table} USING fts(body)"),
+            ]
+        })
+        .collect()
+}
+
+pub async fn run(
+    conn: &StressConn,
+    rng: &mut ThreadRng,
+    tables: usize,
+    logger: &SqlLogger,
+    thread: &ThreadId,
+) -> turso::Result<()> {
+    let table = rng.random_range(0..tables);
+    let id = rng.random_range(0..400);
+    let result = match rng.random_range(0..5) {
+        0 => {
+            let body = body(rng);
+            conn.execute(
+                &format!("INSERT OR REPLACE INTO fts_docs_{table} VALUES ({id}, '{body}')"),
+                (),
+            )
+            .await
+            .map(|_| ())
+        }
+        1 => {
+            let body = body(rng);
+            conn.execute(
+                &format!("UPDATE fts_docs_{table} SET body = '{body}' WHERE id = {id}"),
+                (),
+            )
+            .await
+            .map(|_| ())
+        }
+        2 => conn
+            .execute(&format!("DELETE FROM fts_docs_{table} WHERE id = {id}"), ())
+            .await
+            .map(|_| ()),
+        3 => conn
+            .execute(&format!("OPTIMIZE INDEX fts_idx_{table}"), ())
+            .await
+            .map(|_| ()),
+        _ => check(conn, table, rng.choose::<&str>(TOKENS), logger, thread).await,
+    };
+    match result {
+        Ok(()) | Err(turso::Error::Busy(_) | turso::Error::BusySnapshot(_)) => Ok(()),
+        Err(e) => Err(e),
+    }
+}
+
+fn body(rng: &mut ThreadRng) -> String {
+    (0..rng.random_range(1..=8))
+        .map(|_| *rng.choose(TOKENS))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+pub async fn check(
+    conn: &StressConn,
+    table: usize,
+    token: &str,
+    logger: &SqlLogger,
+    thread: &ThreadId,
+) -> turso::Result<()> {
+    let sql = format!(
+        "WITH indexed AS (SELECT id FROM fts_docs_{table} WHERE fts_match(body, '{token}')),
+         scanned AS (SELECT id FROM fts_docs_{table} WHERE (' ' || body || ' ') LIKE '% {token} %')
+         SELECT (SELECT count(*) FROM (SELECT id FROM indexed EXCEPT SELECT id FROM scanned)),
+                (SELECT count(*) FROM (SELECT id FROM scanned EXCEPT SELECT id FROM indexed)),
+                (SELECT count(*) FROM sqlite_schema WHERE type = 'index' AND name = 'fts_idx_{table}')"
+    );
+    let result = async {
+        let mut rows = conn.query(&sql, ()).await?;
+        let row = rows.next().await?.expect("FTS check must return a row");
+        let extra = row.get::<i64>(0)?;
+        let missing = row.get::<i64>(1)?;
+        let indexes = row.get::<i64>(2)?;
+        turso_macros::turso_assert!(extra == 0 && missing == 0 && indexes == 1,
+            "FTS search disagrees with table scan or index is missing",
+            { "table": table, "token": token, "extra": extra, "missing": missing, "indexes": indexes });
+        Ok(())
+    }.await;
+    logger.log_result(thread, &sql, &result);
+    result
+}
+
+#[cfg(all(test, not(shuttle), not(antithesis)))]
+mod tests {
+    use crate::opts::Opts;
+    use clap::Parser;
+
+    #[test]
+    fn fts_is_opt_in_and_rejects_reference_databases() {
+        assert!(!Opts::try_parse_from(["turso_stress"]).unwrap().fts);
+        assert!(Opts::try_parse_from(["turso_stress", "--fts"]).unwrap().fts);
+        assert!(Opts::try_parse_from(["turso_stress", "--fts", "--db-ref", "ref.db"]).is_err());
+    }
+
+    #[test]
+    fn caller_options_override_singleton_defaults() {
+        for (threads, iterations) in [("--nr-threads", "--nr-iterations"), ("-t", "-i")] {
+            let opts = Opts::try_parse_from([
+                "turso_stress",
+                "--fts",
+                "--nr-threads",
+                "2",
+                "--nr-iterations",
+                "10000",
+                "--tx-mode",
+                "concurrent",
+                threads,
+                "3",
+                iterations,
+                "7",
+                "--tx-mode",
+                "sqlite",
+                "--tables",
+                "2",
+                "--busy-timeout",
+                "123",
+                "--seed",
+                "42",
+                "--db-file",
+                "/tmp/fts test.db",
+                "--vfs",
+                "syscall",
+                "--skip-integrity-check",
+            ])
+            .unwrap();
+            assert!(opts.fts);
+            assert_eq!(opts.nr_threads, 3);
+            assert_eq!(opts.nr_iterations, 7);
+            assert_eq!(opts.tx_mode, crate::opts::TxMode::SQLite);
+            assert_eq!(opts.tables, Some(2));
+            assert_eq!(opts.busy_timeout, 123);
+            assert_eq!(opts.seed, Some(42));
+            assert_eq!(opts.db_file.as_deref(), Some("/tmp/fts test.db"));
+            assert_eq!(opts.vfs.as_deref(), Some("syscall"));
+            assert!(opts.skip_integrity_check);
+        }
+    }
+}
