@@ -4057,7 +4057,6 @@ pub(crate) enum ParenthesizedJoinColumnSource {
 }
 
 impl ParenthesizedJoinColumnSource {
-    /// Return true when this source matches the requested table qualifier.
     pub(crate) fn matches_table(&self, database_id: Option<usize>, table_name: &str) -> bool {
         match self {
             Self::Using { .. } => false,
@@ -4076,7 +4075,6 @@ impl ParenthesizedJoinColumnSource {
         }
     }
 
-    /// Return true when this source matches the requested column name.
     pub(crate) fn matches_column_name(&self, column_name: &str) -> bool {
         match self {
             Self::Using {
@@ -4092,12 +4090,10 @@ impl ParenthesizedJoinColumnSource {
         }
     }
 
-    /// Return true for an implicit rowid entry.
     pub(crate) fn is_rowid(&self) -> bool {
         matches!(self, Self::RowId { .. })
     }
 
-    /// Return true for the value that represents a `USING` column.
     pub(crate) fn is_using(&self) -> bool {
         matches!(self, Self::Using { .. })
     }
