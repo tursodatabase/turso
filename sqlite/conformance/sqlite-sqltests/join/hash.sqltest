@@ -908,7 +908,6 @@ setup hash-join-matrix-rows {
 
 @setup hash-join-matrix-rows
 @skip-if sqlite "SQLite does not have a hash join plan"
-@skip-if mvcc "MVCC does not reload sqlite_stat1 after this setup changes it"
 test hash-join-result-matrix-uses-a-hash-join {
     EXPLAIN QUERY PLAN
     SELECT count(*)
@@ -922,7 +921,6 @@ expect pattern {
 
 @setup hash-join-matrix-rows
 @skip-if sqlite "SQLite does not have a hash join plan"
-@skip-if mvcc "MVCC does not reload sqlite_stat1 after this setup changes it"
 test hash-join-result-matrix-left-join-uses-a-hash-join {
     EXPLAIN QUERY PLAN
     SELECT count(*)
@@ -936,7 +934,6 @@ expect pattern {
 
 @setup hash-join-matrix-rows
 @skip-if sqlite "SQLite does not have a hash join plan"
-@skip-if mvcc "MVCC does not reload sqlite_stat1 after this setup changes it"
 test hash-join-result-matrix-full-join-uses-a-hash-join {
     EXPLAIN QUERY PLAN
     SELECT count(*)
