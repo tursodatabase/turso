@@ -1483,6 +1483,11 @@ pub enum CommitState<Clock: LogicalClock, A: ConcurrentAllocator = TursoAllocato
     FinishLogicalLogWrite {
         end_ts: u64,
     },
+    /// Advance the writer offset after extra durability work from
+    /// `on_log_write_complete` finishes.
+    OwnLogicalLogRecord {
+        end_ts: u64,
+    },
     SyncLogicalLog {
         end_ts: u64,
     },
@@ -1656,7 +1661,8 @@ pub struct CommitStateMachine<Clock: LogicalClock, A: ConcurrentAllocator = Turs
     commit_coordinator: Arc<CommitCoordinator>,
     header: Arc<RwLock<Option<DatabaseHeader>>>,
     pager: Arc<Pager>,
-    /// Bytes appended to the logical log for this commit; applied to writer offset as soon as the write succeeds.
+    /// Bytes from the in-flight logical-log write. Applied to the writer offset
+    /// only after `on_log_write_complete` succeeds.
     pending_log_append_bytes: Option<u64>,
     group_batch: Option<GroupBatch>,
     /// This state machine issued at least one `log_tx` (leader or exclusive).
@@ -1787,7 +1793,9 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CommitStateMachine<Clock, A> {
             } else if !owned
                 && matches!(
                     self.state,
-                    CommitState::WriteLogicalLog { .. } | CommitState::FinishLogicalLogWrite { .. }
+                    CommitState::WriteLogicalLog { .. }
+                        | CommitState::FinishLogicalLogWrite { .. }
+                        | CommitState::OwnLogicalLogRecord { .. }
                 )
             {
                 self.commit_coordinator.clear_issued();
@@ -3477,15 +3485,21 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> StateTransition for CommitStat
             CommitState::FinishLogicalLogWrite { end_ts } => {
                 let end_ts = *end_ts;
                 let c = mvcc_store.storage.on_log_write_complete()?;
+                self.state = CommitState::OwnLogicalLogRecord { end_ts };
+                if c.succeeded() {
+                    Ok(TransitionResult::Continue)
+                } else {
+                    Ok(TransitionResult::Io(IOCompletions(c)))
+                }
+            }
+            CommitState::OwnLogicalLogRecord { end_ts } => {
+                let end_ts = *end_ts;
                 let (ticket, owner_tx) = match self.group_batch.as_ref() {
                     Some(batch) => (Some(batch.writing.ticket), batch.writing.tx_id),
                     None => (None, self.tx_id),
                 };
                 let owned_self = self.own_logical_log_record(mvcc_store, ticket, owner_tx)?;
                 self.state = self.advance_group_or_sync(end_ts, mvcc_store.logical_log_allocator());
-                if !c.succeeded() {
-                    return Ok(TransitionResult::Io(IOCompletions(c)));
-                }
                 if owned_self {
                     inject_transition_yield!(self, CommitYieldPoint::LogicalLogOwned);
                 }
@@ -3578,7 +3592,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> StateTransition for CommitStat
                 return Ok(TransitionResult::Continue);
             }
             CommitState::CommitEnd { end_ts } => {
-                // The record is in the log and owned since FinishLogicalLogWrite.
+                // The record is in the log and owned since OwnLogicalLogRecord.
                 // Order of operations from here:
                 // 1. Mark transaction Committed
                 // 2. Rewrite live row versions from TxID to Timestamp (chunked
@@ -10860,6 +10874,10 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> Debug for CommitState<Clock, A
                 .finish(),
             Self::FinishLogicalLogWrite { end_ts } => f
                 .debug_struct("FinishLogicalLogWrite")
+                .field("end_ts", end_ts)
+                .finish(),
+            Self::OwnLogicalLogRecord { end_ts } => f
+                .debug_struct("OwnLogicalLogRecord")
                 .field("end_ts", end_ts)
                 .finish(),
             Self::SyncLogicalLog { end_ts } => f
