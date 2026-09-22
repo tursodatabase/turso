@@ -13,12 +13,15 @@ use criterion::{criterion_group, criterion_main, Criterion};
 use pprof::criterion::{Output, PProfProfiler};
 
 #[cfg(feature = "codspeed")]
-use codspeed_criterion_compat::{criterion_group, criterion_main, Criterion};
+use codspeed_criterion_compat::{criterion_group, criterion_main, BatchSize, Criterion};
 
+#[cfg(not(feature = "codspeed"))]
 use std::hint::black_box;
+#[cfg(not(feature = "codspeed"))]
 use std::io::Write;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+#[cfg(not(feature = "codspeed"))]
+use std::time::Instant;
 use tempfile::TempDir;
 use turso_core::{
     Connection, Database, DatabaseOpts, OpenFlags, PlatformIO, SqliteDialect, StepResult,
@@ -34,10 +37,23 @@ struct Loaded {
     _dir: TempDir,
 }
 
+#[cfg(feature = "codspeed")]
 #[turso_macros::codspeed_criterion_benchmark]
 fn bench_checkpoint_passive_n_rows(criterion: &mut Criterion) {
     let mut group = criterion.benchmark_group("checkpoint-passive-n-rows");
+    group.bench_function("10000", |b| {
+        b.iter_batched_ref(
+            || load_n_rows(10_000),
+            |loaded| exec(&loaded.conn, &loaded.db, "PRAGMA wal_checkpoint(PASSIVE)"),
+            BatchSize::PerIteration,
+        );
+    });
+    group.finish();
+}
 
+#[cfg(not(feature = "codspeed"))]
+#[turso_macros::codspeed_criterion_benchmark]
+fn bench_checkpoint_passive_n_rows(_criterion: &mut Criterion) {
     let out_path = std::env::var("CHECKPOINT_N_ROWS_OUT").ok();
     let mut out = out_path.as_ref().map(|path| {
         let mut f = std::fs::File::create(path).expect("CHECKPOINT_N_ROWS_OUT");
@@ -94,20 +110,10 @@ fn bench_checkpoint_passive_n_rows(criterion: &mut Criterion) {
             f.flush().unwrap();
         }
     }
-
-    group.sample_size(10);
-    group.warm_up_time(Duration::from_millis(100));
-    group.measurement_time(Duration::from_secs(1));
-    group.bench_function("report", |b| {
-        b.iter(|| black_box(1u8));
-    });
-    group.finish();
 }
 
+#[cfg(not(feature = "codspeed"))]
 fn row_counts() -> Vec<usize> {
-    if cfg!(feature = "codspeed") {
-        return vec![10_000];
-    }
     let mut n = vec![10_000, 50_000, 100_000, 250_000, 500_000, 1_000_000];
     if std::env::var_os("CHECKPOINT_N_ROWS_BENCH_LARGE").is_some() {
         n.push(2_000_000);
@@ -115,6 +121,7 @@ fn row_counts() -> Vec<usize> {
     n
 }
 
+#[cfg(not(feature = "codspeed"))]
 fn sample_plan(n: usize) -> (usize, usize) {
     match n {
         n if n <= 10_000 => (2, 20),
@@ -126,12 +133,14 @@ fn sample_plan(n: usize) -> (usize, usize) {
     }
 }
 
+#[cfg(not(feature = "codspeed"))]
 fn nearest_rank_ms(sorted_ns: &[u64], q: f64) -> f64 {
     assert!(!sorted_ns.is_empty());
     let idx = ((sorted_ns.len() as f64 - 1.0) * q).round() as usize;
     sorted_ns[idx] as f64 / 1e6
 }
 
+#[cfg(not(feature = "codspeed"))]
 fn one_checkpoint_ns(n: usize) -> u64 {
     let loaded = load_n_rows(n);
     let started = Instant::now();
