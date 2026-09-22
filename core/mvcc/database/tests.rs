@@ -510,7 +510,7 @@ fn mv_store_insert_allocation_failure_leaves_tx_state_untouched() {
     assert!(matches!(result, Err(LimboError::OutOfMemory)));
 
     assert!(store.rows.get(&row_id).is_none());
-    assert_eq!(allocator.max_rowid.load(Ordering::SeqCst), 0);
+    assert_eq!(allocator.max_rowid(), None);
 
     let tx = store.txs.get(&tx_id).unwrap();
     let tx = tx.value();
@@ -9665,7 +9665,6 @@ fn test_cursor_with_btree_and_mvcc_delete_after_checkpoint() {
 /// After INSERT (rowid 1), UPDATE rowid 1→2, and a second INSERT,
 /// the second insert must get rowid 3 (never reuse 1 or 2).
 #[test]
-#[ignore = "MVCC RowidAllocator does not yet track rowid changes from UPDATE"]
 fn test_skips_updated_rowid() {
     let db = MvccTestDbNoConn::new_with_random_db();
     let conn = db.connect();
@@ -19315,11 +19314,10 @@ fn test_delete_of_btree_row_conflicts_with_active_concurrent_delete() {
 }
 
 /// Regression for #6754: dropping a Statement that paused mid-IO inside
-/// op_new_rowid leaks the per-table RowidAllocator lock. With the Drop
-/// impl on MvccLazyCursor, end_new_rowid runs on cursor teardown so the
-/// next INSERT into the same table from any connection makes progress.
+/// op_new_rowid must not stop the next INSERT into the same table from any
+/// connection from making progress.
 #[test]
-fn rowid_allocator_lock_released_when_statement_dropped_at_seek_yield() {
+fn insert_makes_progress_after_statement_dropped_at_new_rowid_seek_yield() {
     use std::time::{Duration, Instant};
 
     let db = MvccTestDbNoConn::new_with_random_db();
@@ -19334,8 +19332,7 @@ fn rowid_allocator_lock_released_when_statement_dropped_at_seek_yield() {
     let victim = db.connect();
 
     // Force the seek that runs from inside op_new_rowid's SeekingToLast
-    // to yield IO at SeekStart. At that moment the rowid allocator lock
-    // is held.
+    // to yield IO at SeekStart.
     leaker.set_yield_injector(Some(FixedYieldInjector::new([
         CursorYieldPoint::SeekStart.point()
     ])));
@@ -19348,8 +19345,7 @@ fn rowid_allocator_lock_released_when_statement_dropped_at_seek_yield() {
         other => panic!("expected yield from injected seek_start; got {other:?}"),
     }
 
-    // Drop the statement without advancing past the yield. The Drop impl
-    // on MvccLazyCursor must release the rowid allocator lock.
+    // Drop the statement without advancing past the yield.
     drop(leak_stmt);
     leaker.set_yield_injector(None);
 
@@ -19361,7 +19357,7 @@ fn rowid_allocator_lock_released_when_statement_dropped_at_seek_yield() {
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
         if Instant::now() >= deadline {
-            panic!("victim INSERT did not complete within 5s — rowid allocator lock leaked");
+            panic!("victim INSERT did not complete within 5s");
         }
         match victim_stmt.step().unwrap() {
             crate::StepResult::Done => break,
@@ -20329,6 +20325,64 @@ fn test_concurrent_explicit_rowid_preserves_auto_rowid_watermark() {
     assert_eq!(indexed[0][0].as_int().unwrap(), 5);
     assert_eq!(indexed[0][1].to_string(), "A");
     assert_eq!(indexed[0][2].as_int().unwrap(), 999);
+}
+
+/// Deleting the row at the allocator watermark clears the watermark so the
+/// deleted rowid can be reused, like SQLite does. A transaction that still sees
+/// the deleted row must keep allocating above it, and the deleting transaction
+/// must not walk back into the rowid the other transaction picked.
+#[test]
+fn test_auto_rowid_stays_above_row_deleted_by_uncommitted_transaction() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let conn0 = db.connect();
+    let conn1 = db.connect();
+    let conn2 = db.connect();
+
+    conn0
+        .execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)")
+        .unwrap();
+    conn0
+        .execute("INSERT INTO t(id, v) VALUES (1000, 'old')")
+        .unwrap();
+
+    conn1.execute("BEGIN CONCURRENT").unwrap();
+    conn1.execute("DELETE FROM t WHERE id = 1000").unwrap();
+
+    conn2.execute("BEGIN CONCURRENT").unwrap();
+    conn2.execute("INSERT INTO t(v) VALUES ('B')").unwrap();
+    conn2.execute("COMMIT").unwrap();
+
+    conn1.execute("INSERT INTO t(v) VALUES ('A')").unwrap();
+    conn1
+        .execute("COMMIT")
+        .expect("delete plus auto rowid insert should not conflict with the other insert");
+
+    let rows = get_rows(&conn0, "SELECT id, v FROM t ORDER BY id");
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0][0].as_int().unwrap(), 1001);
+    assert_eq!(rows[0][1].to_string(), "B");
+    assert_eq!(rows[1][0].as_int().unwrap(), 1002);
+    assert_eq!(rows[1][1].to_string(), "A");
+}
+
+/// After the only high row is deleted and committed, automatic rowids continue
+/// from the largest row left in the table, matching SQLite.
+#[test]
+fn test_auto_rowid_reuses_rowid_of_committed_deleted_max_row() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let conn = db.connect();
+
+    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)")
+        .unwrap();
+    conn.execute("INSERT INTO t(id, v) VALUES (1, 'a'), (2, 'b'), (500, 'c')")
+        .unwrap();
+    conn.execute("DELETE FROM t WHERE id = 500").unwrap();
+    conn.execute("INSERT INTO t(v) VALUES ('d')").unwrap();
+
+    let rows = get_rows(&conn, "SELECT id, v FROM t ORDER BY id");
+    assert_eq!(rows.len(), 3);
+    assert_eq!(rows[2][0].as_int().unwrap(), 3);
+    assert_eq!(rows[2][1].to_string(), "d");
 }
 
 #[test]

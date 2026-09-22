@@ -3993,17 +3993,20 @@ pub(crate) const MVCC_META_TABLE_NAME: &str = "__turso_internal_mvcc_meta";
 /// are replayed.
 pub(crate) const MVCC_META_KEY_PERSISTENT_TX_TS_MAX: &str = "persistent_tx_ts_max";
 
+/// Keeps concurrent transactions from handing out the same automatic rowid.
+///
+/// A transaction picks its next rowid from the largest rowid it can see, like
+/// SQLite does. Rows inserted by other transactions that have not committed, or
+/// that committed after this transaction's snapshot, are invisible to that
+/// lookup, so every insert also raises this shared watermark and automatic
+/// allocation never goes below it. Deleting the row at the watermark clears it,
+/// so later allocations fall back to what the transaction can see and rowids of
+/// deleted rows are reused as in SQLite.
 #[derive(Debug)]
 pub struct RowidAllocator {
-    /// Exclusive lock serializing initialization (btree max read → store).
-    /// Only held during the first NewRowid for a table; after that, the
-    /// fast path is lock-free (atomic CAS on max_rowid).
-    lock: TursoRwLock,
-    /// Monotonically increasing counter. 0 = empty table (rowids start at 1).
-    /// Updated via atomic CAS — no RwLock needed on the fast path.
+    /// Largest rowid inserted since the watermark was last cleared, or
+    /// [`RowidAllocator::UNTRACKED`] when no row justifies a watermark.
     max_rowid: AtomicI64,
-    /// True after the first btree-max scan. Never reset to false.
-    initialized: AtomicBool,
 }
 
 /// Sub state machine for [`MvStore::bootstrap_nonblock`]. Carried by the
@@ -5425,6 +5428,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
             }
             None => {
                 let row_versions = self.insert_version(id.clone(), row_version)?;
+                self.lower_rowid_allocator_for_deleted_row(&id);
                 tx.record_created_table_version(id.clone(), version_id);
                 tx.insert_to_write_set(id, row_versions);
             }
@@ -5654,6 +5658,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                         rv.set_end(Some(TxTimestampOrID::TxID(tx.tx_id)));
                         drop(locked_row_versions);
                         drop(row_versions_opt);
+                        self.lower_rowid_allocator_for_deleted_row(&id);
                         let tx = self
                             .txs
                             .get(&tx_id)
@@ -7376,6 +7381,16 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         if let RowKey::Int(restored_rowid) = &rowid.row_id {
             self.get_rowid_allocator(&rowid.table_id)
                 .insert_row_id_maybe_update(*restored_rowid);
+        }
+    }
+
+    // SQLite reuses the rowid of a deleted row: the next automatic rowid is one past the
+    // largest row still in the table. Clearing the watermark when its row is deleted lets
+    // NewRowid fall back to the largest rowid the transaction can see.
+    fn lower_rowid_allocator_for_deleted_row(&self, rowid: &RowID) {
+        if let RowKey::Int(deleted_rowid) = &rowid.row_id {
+            self.get_rowid_allocator(&rowid.table_id)
+                .forget_deleted_row(*deleted_rowid);
         }
     }
 
@@ -9890,6 +9905,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                                 let mut versions = versions.write();
                                 self.insert_version_raw(&mut versions, row_version)?;
                             }
+                            self.lower_rowid_allocator_for_deleted_row(&rowid);
                             if rowid.table_id == SQLITE_SCHEMA_MVCC_TABLE_ID {
                                 let rowid_int = rowid.row_id.to_int_or_panic();
                                 let Some(record) = schema_rows.get(&rowid_int) else {
@@ -10180,13 +10196,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         }
         let mut map = self.table_id_to_last_rowid.write();
         map.entry(*table_id)
-            .or_insert_with(|| {
-                Arc::new(RowidAllocator {
-                    lock: TursoRwLock::new(),
-                    max_rowid: AtomicI64::new(0),
-                    initialized: AtomicBool::new(false),
-                })
-            })
+            .or_insert_with(|| Arc::new(RowidAllocator::new()))
             .clone()
     }
 
@@ -10289,30 +10299,47 @@ fn rollback_restores_rowid(tx_id: u64, rv: &RowVersion) -> bool {
 }
 
 impl RowidAllocator {
-    /// Lock-free rowid allocation via atomic CAS.
-    /// Returns None only when at i64::MAX (triggers random fallback).
-    /// Returns Some((new_rowid, prev_rowid)) where prev_rowid is None if table was empty.
-    pub fn get_next_rowid(&self) -> Option<(i64, Option<i64>)> {
+    const UNTRACKED: i64 = i64::MIN;
+
+    pub fn new() -> Self {
+        Self {
+            max_rowid: AtomicI64::new(Self::UNTRACKED),
+        }
+    }
+
+    /// Picks the rowid one past the larger of `largest_visible_rowid` and the
+    /// watermark, and raises the watermark to it.
+    /// Returns None only when that rowid would overflow (triggers random fallback).
+    /// Returns Some((new_rowid, prev_rowid)) where prev_rowid is None if neither
+    /// side knows of any row.
+    pub fn allocate_after(&self, largest_visible_rowid: Option<i64>) -> Option<(i64, Option<i64>)> {
         loop {
             let cur = self.max_rowid.load(Ordering::SeqCst);
-            if cur == i64::MAX {
-                tracing::trace!("get_next_rowid(max)");
-                return None;
-            }
-            let next = cur + 1;
+            let prev = match (Self::tracked(cur), largest_visible_rowid) {
+                (Some(watermark), Some(visible)) => Some(watermark.max(visible)),
+                (Some(watermark), None) => Some(watermark),
+                (None, visible) => visible,
+            };
+            let next = match prev {
+                Some(i64::MAX) => {
+                    tracing::trace!("allocate_after(max)");
+                    return None;
+                }
+                Some(prev) => prev + 1,
+                None => 1,
+            };
             if self
                 .max_rowid
                 .compare_exchange(cur, next, Ordering::SeqCst, Ordering::SeqCst)
                 .is_ok()
             {
-                let prev = if cur == 0 { None } else { Some(cur) };
-                tracing::trace!("get_next_rowid({next})");
+                tracing::trace!("allocate_after({largest_visible_rowid:?}) = {next}");
                 return Some((next, prev));
             }
         }
     }
 
-    /// Bump the counter to at least `rowid`. Used for user-specified rowids
+    /// Raise the watermark to at least `rowid`. Used for user-specified rowids
     /// (e.g. INSERT INTO t(rowid,...) VALUES(1000,...)).
     pub fn insert_row_id_maybe_update(&self, rowid: i64) {
         loop {
@@ -10330,34 +10357,30 @@ impl RowidAllocator {
         }
     }
 
-    pub fn is_uninitialized(&self) -> bool {
-        !self.initialized.load(Ordering::SeqCst)
+    /// Clear the watermark when the row it points at is deleted. Rows with
+    /// smaller rowids are found by the caller's own lookup, and the CAS keeps a
+    /// watermark that a concurrent insert already moved past `rowid`.
+    pub fn forget_deleted_row(&self, rowid: i64) {
+        let _ = self.max_rowid.compare_exchange(
+            rowid,
+            Self::UNTRACKED,
+            Ordering::SeqCst,
+            Ordering::SeqCst,
+        );
     }
 
-    /// Initialize from btree max. Called once per table, under lock.
-    pub fn initialize(&self, rowid: Option<i64>) {
-        tracing::trace!("initialize({rowid:?})");
-        let _ = self
-            .max_rowid
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |cur| {
-                let next = match rowid {
-                    // max_rowid starts at 0, but a B-tree whose largest rowid is
-                    // negative still needs to seed automatic allocation from that value.
-                    Some(rowid) if cur == 0 => rowid,
-                    Some(rowid) => cur.max(rowid),
-                    None => cur,
-                };
-                (next != cur).then_some(next)
-            });
-        self.initialized.store(true, Ordering::SeqCst);
+    pub fn max_rowid(&self) -> Option<i64> {
+        Self::tracked(self.max_rowid.load(Ordering::SeqCst))
     }
 
-    pub fn lock(&self) -> bool {
-        self.lock.write()
+    fn tracked(value: i64) -> Option<i64> {
+        (value != Self::UNTRACKED).then_some(value)
     }
+}
 
-    pub fn unlock(&self) {
-        self.lock.unlock()
+impl Default for RowidAllocator {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
