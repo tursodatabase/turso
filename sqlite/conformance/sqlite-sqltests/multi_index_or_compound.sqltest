@@ -319,6 +319,11 @@ snapshot-eqp compound-or-benchmark-shape-eqp {
 # selective than the label index: 3 rows plus 2 rows against 200. On a table
 # that matches these stats the multi-index OR plan runs the query about a third
 # faster than the label index plan, and both return the same rows.
+#
+# SQLite, PostgreSQL and MySQL all derive the same conjunct from this ON
+# clause. SQLite picks the same multi-index OR plan. PostgreSQL combines the
+# label index with a bitmap OR of the two identifier indexes. MySQL seeks the
+# label index and runs the conjunct as a filter.
 @skip-if sqlite "query plan explanation output is different in sqlite"
 @skip-if mvcc "MVCC does not reload sqlite_stat1 after this test changes it"
 @setup benchmark_shape_schema
