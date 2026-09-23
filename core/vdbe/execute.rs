@@ -815,7 +815,14 @@ pub fn op_null(
 ) -> InsnResult {
     match insn {
         Insn::Null { dest, dest_end } | Insn::BeginSubrtn { dest, dest_end } => {
-            let dest_end = dest_end.unwrap_or(*dest);
+            let Some(dest_end) = *dest_end else {
+                state.registers[*dest].set_null();
+                if !state.rowsets.is_empty() {
+                    state.rowsets.remove(dest);
+                }
+                state.pc += 1;
+                return Ok(InsnFunctionStepResult::Step);
+            };
             for i in *dest..=dest_end {
                 state.registers[i].set_null();
             }
@@ -1958,6 +1965,7 @@ pub enum OpColumnState {
     GetColumn,
 }
 
+#[cfg_attr(not(test), inline(always))]
 pub fn op_column(
     program: &Program,
     state: &mut ProgramState,
@@ -3381,7 +3389,7 @@ pub fn op_make_record(
         }
     }
 
-    if dest_reg >= start_reg && dest_reg - start_reg < count {
+    if dest_reg.wrapping_sub(start_reg) < count {
         return Err(LimboError::InternalError(format!(
             "MakeRecord: destination register {dest_reg} overlaps its source range {start_reg}..{}",
             start_reg + count
@@ -12655,8 +12663,8 @@ pub fn op_insert(
                                 unreachable!("Cannot insert an aggregate value.")
                             }
                         };
-                        let existing_record = return_if_io!(state, cursor.record());
-                        if existing_record.is_some_and(|r| r == record.as_ref()) {
+                        let existing_payload = return_if_io!(state, cursor.record_payload());
+                        if existing_payload.is_some_and(|p| p == record.as_ref().get_payload()) {
                             state.active_op_state.insert().is_noop_update = true;
                         }
                     }
@@ -13518,7 +13526,19 @@ fn new_rowid_inner(
     }
 }
 
+#[inline]
 fn coerce_register_to_integer(state: &mut ProgramState, reg: usize) -> bool {
+    if matches!(
+        state.registers[reg].get_value(),
+        Value::Numeric(Numeric::Integer(_))
+    ) {
+        return true;
+    }
+    convert_register_to_integer(state, reg)
+}
+
+#[inline(never)]
+fn convert_register_to_integer(state: &mut ProgramState, reg: usize) -> bool {
     let converted = match state.registers[reg].get_value() {
         Value::Numeric(Numeric::Integer(_)) => return true,
         Value::Numeric(Numeric::Float(f)) => cast_real_to_integer(f64::from(*f)).ok(),
@@ -13938,34 +13958,43 @@ pub fn op_copy(
         },
         insn
     );
-    for i in 0..=*extra_amount {
-        let (src, dst) = (*src_reg + i, *dst_reg + i);
-        if src == dst {
-            continue;
-        }
-        let [src, dst] = state
-            .registers
-            .get_disjoint_mut([src, dst])
-            .expect("Copy source and destination registers are distinct");
-        if !try_copy_heapless_value(dst, src) {
-            dst.try_clone_from(src)?;
+    if *extra_amount == 0 {
+        copy_one_register(&mut state.registers, *src_reg, *dst_reg)?;
+    } else {
+        for i in 0..=*extra_amount {
+            copy_one_register(&mut state.registers, *src_reg + i, *dst_reg + i)?;
         }
     }
 
     #[inline]
-    fn try_copy_heapless_value(dst: &mut Register, src: &Register) -> bool {
-        match (dst, src) {
-            (
-                Register::Value(dst @ (Value::Null | Value::Numeric(_))),
-                Register::Value(src @ (Value::Null | Value::Numeric(_))),
-            ) => {
-                *dst = match src {
-                    Value::Numeric(n) => Value::Numeric(*n),
-                    _ => Value::Null,
-                };
-                true
+    fn copy_one_register(
+        registers: &mut [Register],
+        src: usize,
+        dst: usize,
+    ) -> Result<(), Box<LimboError>> {
+        if src == dst {
+            return Ok(());
+        }
+        if let Some(value) = heapless_value(&registers[src]) {
+            match &mut registers[dst] {
+                Register::Value(dst @ (Value::Null | Value::Numeric(_))) => *dst = value,
+                dst => *dst = Register::Value(value),
             }
-            _ => false,
+            return Ok(());
+        }
+        let [src, dst] = registers
+            .get_disjoint_mut([src, dst])
+            .expect("Copy source and destination registers are distinct");
+        dst.try_clone_from(src)?;
+        Ok(())
+    }
+
+    #[inline]
+    fn heapless_value(src: &Register) -> Option<Value> {
+        match src {
+            Register::Value(Value::Numeric(n)) => Some(Value::Numeric(*n)),
+            Register::Value(Value::Null) => Some(Value::Null),
+            _ => None,
         }
     }
 
