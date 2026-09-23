@@ -1848,3 +1848,16 @@ test filter-numeric-group-concat {
 expect {
     Alice,Carol
 }
+
+@requires strict "uses STRICT tables"
+test upsert-returning-virtual-column-reads-decoded-custom-type {
+    CREATE TYPE cents BASE integer ENCODE value * 100 DECODE value / 100;
+    CREATE TABLE t(id INTEGER PRIMARY KEY, x cents, y INT, v INT AS (x + 1)) STRICT;
+    INSERT INTO t(id, x, y) VALUES (1, 7, 0);
+    INSERT INTO t(id, x, y) VALUES (1, 8, 0) ON CONFLICT(id) DO UPDATE SET y = 2 RETURNING x, v;
+    INSERT INTO t(id, x, y) VALUES (1, 8, 0) ON CONFLICT(id) DO UPDATE SET x = 9 RETURNING x, v;
+}
+expect {
+    7|8
+    9|10
+}
