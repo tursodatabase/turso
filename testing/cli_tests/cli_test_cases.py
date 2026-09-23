@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import os
+import signal
 import subprocess
 import time
 from pathlib import Path
@@ -543,6 +544,106 @@ def test_blob_bytes_are_printed_raw_in_list_mode():
     )
 
 
+RUNAWAY_READ = "WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM c) SELECT count(*) FROM c;"
+
+
+def test_ctrl_c_interrupts_a_running_read():
+    # A read-only statement outside a transaction holds only its own read transaction, so
+    # stopping it is safe and the shell returns to the prompt, as the sqlite3 shell does.
+    console.test("Running test: ctrl-c-interrupts-a-running-read")
+    returncode, output = send_ctrl_c_to_shell(
+        setup="", running=RUNAWAY_READ, after="SELECT 42;\n.quit\n"
+    )
+    assert returncode == 0, f"expected exit status 0, got {returncode}; output {output!r}"
+    assert b"42" in output, f"expected the shell to answer after the interrupt, got {output!r}"
+
+
+def test_ctrl_c_exits_the_shell_while_a_write_runs():
+    # A statement stopped part-way can leave the connection inconsistent, so Ctrl-C during a
+    # write exits instead of returning to the prompt. The status matches a SIGINT kill.
+    console.test("Running test: ctrl-c-exits-the-shell-while-a-write-runs")
+    returncode, output = send_ctrl_c_to_shell(
+        setup="CREATE TABLE t(x);",
+        running="INSERT INTO t WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM c) SELECT x FROM c;",
+        after="SELECT 42;\n.quit\n",
+    )
+    assert_exited_on_ctrl_c(returncode, output)
+
+
+def test_ctrl_c_exits_the_shell_while_a_read_runs_in_a_write_transaction():
+    console.test("Running test: ctrl-c-exits-the-shell-while-a-read-runs-in-a-write-transaction")
+    returncode, output = send_ctrl_c_to_shell(
+        setup="CREATE TABLE t(x);\nBEGIN;\nINSERT INTO t VALUES (1);",
+        running=RUNAWAY_READ,
+        after="SELECT 42;\n.quit\n",
+    )
+    assert_exited_on_ctrl_c(returncode, output)
+
+
+def assert_exited_on_ctrl_c(returncode, output):
+    assert returncode == 130, f"expected exit status 130, got {returncode}; output {output!r}"
+    assert b"Interrupted; exiting" in output, f"expected the exit message, got {output!r}"
+    assert b"42" not in output, f"the shell must not run input after the interrupt, got {output!r}"
+
+
+def test_ctrl_c_at_the_prompt_keeps_the_shell_running():
+    console.test("Running test: ctrl-c-at-the-prompt-keeps-the-shell-running")
+    returncode, output = send_ctrl_c_to_shell(setup="", running="", after="SELECT 42;\n.quit\n")
+    assert returncode == 0, f"expected exit status 0, got {returncode}; output {output!r}"
+    assert b"42" in output, f"expected the shell to answer after Ctrl-C at the prompt, got {output!r}"
+
+
+def send_ctrl_c_to_shell(setup, running, after):
+    """Runs `setup`, starts `running`, sends SIGINT while it runs, then sends `after`.
+
+    Returns the exit status and the combined stdout and stderr.
+    """
+    exec_name = os.environ.get("SQLITE_EXEC", "./scripts/limbo-sqlite3")
+    # SQLITE_EXEC may be the tursodb binary or the scripts/limbo-sqlite3 wrapper, which runs
+    # tursodb as a bash child. Signal the process group so SIGINT reaches tursodb either way,
+    # and so a runaway statement can be killed on the way out.
+    proc = subprocess.Popen(
+        [exec_name, ":memory:"],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        bufsize=0,
+        start_new_session=True,
+    )
+    pgid = os.getpgid(proc.pid)
+    output = b""
+    try:
+        proc.stdin.write(f"{setup}\nSELECT 'ctrl-c-marker'; {running}\n".encode())
+        proc.stdin.flush()
+        while True:
+            line = proc.stdout.readline()
+            assert line, f"the shell exited before running the statement; output {output!r}"
+            output += line
+            if b"ctrl-c-marker" in line:
+                break
+        # The marker is printed right before `running` starts.
+        time.sleep(0.5)
+        os.killpg(pgid, signal.SIGINT)
+        # The Ctrl-C handler runs on its own thread; let it act before more input arrives.
+        time.sleep(1.0)
+        try:
+            proc.stdin.write(after.encode())
+            proc.stdin.flush()
+        except BrokenPipeError:
+            pass
+        try:
+            rest, _ = proc.communicate(timeout=15)
+        except subprocess.TimeoutExpired as exc:
+            raise AssertionError(f"the shell did not react to SIGINT; output {output!r}") from exc
+        return proc.returncode, output + rest
+    finally:
+        try:
+            os.killpg(pgid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        proc.communicate()
+
+
 def main():
     console.info("Running all turso CLI tests...")
     test_read_command()
@@ -572,6 +673,10 @@ def main():
     test_tables_with_attached_db()
     test_dbtotxt()
     test_blob_bytes_are_printed_raw_in_list_mode()
+    test_ctrl_c_interrupts_a_running_read()
+    test_ctrl_c_exits_the_shell_while_a_write_runs()
+    test_ctrl_c_exits_the_shell_while_a_read_runs_in_a_write_transaction()
+    test_ctrl_c_at_the_prompt_keeps_the_shell_running()
     console.info("All tests have passed")
 
 

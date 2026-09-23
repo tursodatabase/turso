@@ -2378,8 +2378,14 @@ impl Insn {
     /// Returns true if this opcode cannot directly modify persistent database
     /// contents. This is used to compute PreparedProgram::readonly, mirroring
     /// SQLite's sqlite3_stmt_readonly() classification over compiled bytecode.
-    pub fn is_readonly(&self) -> bool {
+    /// Writes through a cursor for which `is_ephemeral` is true go to a temporary
+    /// table, which is not database contents.
+    pub fn is_readonly(&self, is_ephemeral: impl Fn(CursorID) -> bool) -> bool {
         match self {
+            Self::Insert { cursor, .. } => is_ephemeral(*cursor),
+            Self::Delete { cursor_id, .. } | Self::IdxDelete { cursor_id, .. } => {
+                is_ephemeral(*cursor_id)
+            }
             Self::Checkpoint { .. }
             | Self::VCreate { .. }
             | Self::VUpdate { .. }
@@ -2389,9 +2395,6 @@ impl Insn {
                 tx_mode: TransactionMode::Write | TransactionMode::Concurrent,
                 ..
             }
-            | Self::Insert { .. }
-            | Self::Delete { .. }
-            | Self::IdxDelete { .. }
             | Self::OpenWrite { .. }
             | Self::CreateBtree { .. }
             | Self::IndexMethodCreate { .. }
