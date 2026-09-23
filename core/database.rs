@@ -2858,6 +2858,8 @@ impl Database {
             session_role: crate::security::roles::RoleId::SUPERUSER,
             current_role: RwLock::new(crate::security::roles::RoleId::SUPERUSER),
             sequence_currvals: RwLock::new(HashMap::default()),
+            #[cfg(test)]
+            after_counting_root_statement: RwLock::new(None),
         });
         self.n_connections
             .fetch_add(1, crate::sync::atomic::Ordering::SeqCst);
