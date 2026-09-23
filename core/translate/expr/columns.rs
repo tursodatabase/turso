@@ -30,33 +30,6 @@ pub fn emit_table_column(
     )
 }
 
-/// Equivalent of [emit_table_column] for when registers are laid out for DML.
-#[allow(clippy::too_many_arguments)]
-pub fn emit_table_column_for_dml(
-    program: &mut ProgramBuilder,
-    cursor_id: CursorID,
-    dml_column_context: DmlColumnContext,
-    column: &Column,
-    column_index: usize,
-    target_register: usize,
-    resolver: &Resolver,
-    table: &Arc<BTreeTable>,
-) -> Result<()> {
-    do_emit_table_column(
-        program,
-        cursor_id,
-        &SelfTableContext::ForDML {
-            dml_ctx: dml_column_context,
-            table: Arc::clone(table),
-        },
-        None,
-        column,
-        column_index,
-        target_register,
-        resolver,
-    )
-}
-
 #[inline(always)]
 #[allow(clippy::too_many_arguments)]
 pub(super) fn do_emit_table_column(

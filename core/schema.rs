@@ -4009,6 +4009,19 @@ impl BTreeTable {
         }
         Ok(deps)
     }
+
+    pub(crate) fn columns_with_dependencies(
+        &self,
+        targets: impl IntoIterator<Item = usize>,
+    ) -> Result<ColumnMask> {
+        let graph = self.column_graph()?;
+        let mut columns = ColumnMask::default();
+        for j in targets {
+            columns.set(j)?;
+            columns.union_with(&graph.dependencies[j])?;
+        }
+        Ok(columns)
+    }
 }
 
 fn push_on_conflict_clause(sql: &mut String, conflict_clause: Option<ResolveType>) {
@@ -4036,6 +4049,11 @@ impl<'a> ColumnsTopologicalSort<'a> {
         self.topological_sort
             .iter()
             .map(|&idx| (idx, &self.columns[idx]))
+    }
+
+    pub fn retain_columns(mut self, columns: &ColumnMask) -> Self {
+        self.topological_sort.retain(|&idx| columns.get(idx));
+        self
     }
 }
 
@@ -7477,6 +7495,12 @@ mod tests {
         );
         assert_eq!(stored(&t.dependencies_of_columns([3])?), vec![0]);
         assert_eq!(stored(&t.dependencies_of_columns([1])?), vec![0]);
+        assert_eq!(
+            indices(&t.columns_with_dependencies([3])?),
+            vec![0, 1, 2, 3]
+        );
+        assert_eq!(indices(&t.columns_with_dependencies([1])?), vec![0, 1]);
+        assert_eq!(indices(&t.columns_with_dependencies([0])?), vec![0]);
         Ok(())
     }
 
