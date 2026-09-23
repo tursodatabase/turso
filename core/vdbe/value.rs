@@ -178,8 +178,9 @@ fn first_nul(bytes: &[u8]) -> Option<usize> {
     let mut base = 0;
     for word_bytes in words.by_ref() {
         let word = usize::from_ne_bytes(word_bytes.try_into().unwrap());
-        // A zero byte is the only one that borrows into its own high bit
-        // without having set that bit itself.
+        // Subtracting LOW_BITS sets the high bit of each zero byte.
+        // Masking with !word removes high bits set in the original word.
+        // HIGH_BITS keeps only high bits; any bit left means a byte was zero.
         if word.wrapping_sub(LOW_BITS) & !word & HIGH_BITS != 0 {
             return word_bytes.iter().position(|&b| b == 0).map(|i| base + i);
         }
