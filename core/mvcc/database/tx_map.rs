@@ -14,8 +14,10 @@ use super::TxID;
 
 const SHARDS: usize = 64;
 
+type Shard<V> = RwLock<Vec<(TxID, V)>>;
+
 pub struct TxMap<V> {
-    shards: Box<[CachePadded<RwLock<Vec<(TxID, V)>>>]>,
+    shards: Box<[CachePadded<Shard<V>>]>,
     /// Bit `i` is set while shard `i` holds entries. Only a writer that holds the lock
     /// of shard `i` changes bit `i`.
     occupied: AtomicU64,
@@ -137,7 +139,7 @@ impl<V: Clone> TxMap<V> {
         entries.into_iter()
     }
 
-    fn shard(&self, key: TxID) -> &RwLock<Vec<(TxID, V)>> {
+    fn shard(&self, key: TxID) -> &Shard<V> {
         &self.shards[Self::shard_index(key)]
     }
 
