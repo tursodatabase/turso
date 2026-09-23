@@ -545,6 +545,9 @@ pub struct MvccLazyCursor<Clock: LogicalClock + 'static, A: ConcurrentAllocator 
     /// Eq-only table seek copies the occupying payload under the version lock.
     /// Passive GC can empty the live chain before Column.
     eq_seek_row: Option<Row>,
+    /// Index metadata for the most recent index seek key, reused while seek
+    /// keys keep the same column count.
+    seek_key_index_info: Option<Arc<IndexInfo>>,
     btree_cursor: Box<dyn CursorTrait>,
     null_flag: bool,
     creating_new_rowid: bool,
@@ -615,6 +618,7 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> MvccLazyCursor<Clock
             table_id,
             reusable_immutable_record: None,
             eq_seek_row: None,
+            seek_key_index_info: None,
             btree_cursor,
             null_flag: false,
             creating_new_rowid: false,
@@ -1236,6 +1240,26 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> MvccLazyCursor<Clock
         }
         Ok(())
     }
+
+    fn seek_key_index_info(&mut self, column_count: usize) -> Result<Arc<IndexInfo>> {
+        if let Some(index_info) = &self.seek_key_index_info {
+            if index_info.num_cols == column_count {
+                return Ok(index_info.clone());
+            }
+        }
+        let MvccCursorType::Index(index_info) = &self.mv_cursor_type else {
+            panic!("SeekKey::IndexKey requires Index cursor type");
+        };
+        let seek_key_index_info = Arc::new(IndexInfo::new_in(
+            index_info.key_info.iter().cloned(),
+            index_info.has_rowid,
+            column_count,
+            index_info.is_unique,
+            self.db.allocator(),
+        )?);
+        self.seek_key_index_info = Some(seek_key_index_info.clone());
+        Ok(seek_key_index_info)
+    }
 }
 
 impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> Drop for MvccLazyCursor<Clock, A> {
@@ -1662,18 +1686,7 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> CursorTrait
                             }
                         }
                         SeekKey::IndexKey(index_key) => {
-                            let index_info = {
-                                let MvccCursorType::Index(index_info) = &self.mv_cursor_type else {
-                                    panic!("SeekKey::IndexKey requires Index cursor type");
-                                };
-                                Arc::new(IndexInfo::new_in(
-                                    index_info.key_info.iter().cloned(),
-                                    index_info.has_rowid,
-                                    index_key.column_count(),
-                                    index_info.is_unique,
-                                    self.db.allocator(),
-                                )?)
-                            };
+                            let index_info = self.seek_key_index_info(index_key.column_count())?;
                             let sortable_key = SortableIndexKey::new_from_payload_in(
                                 index_key,
                                 index_info,
@@ -1747,16 +1760,12 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> CursorTrait
                                     else {
                                         panic!("Index cursor expected");
                                     };
-                                    let key_info: Vec<_> = index_info
-                                        .key_info
-                                        .iter()
-                                        .take(index_key.column_count())
-                                        .cloned()
-                                        .collect();
                                     let cmp = compare_immutable(
                                         index_key.get_values()?,
                                         found_key.key.get_values()?,
-                                        &key_info,
+                                        &index_info.key_info[..index_key
+                                            .column_count()
+                                            .min(index_info.key_info.len())],
                                     );
                                     cmp.is_eq()
                                 }

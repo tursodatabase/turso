@@ -361,6 +361,26 @@ instructions per operation (-8.8%), below the pre-rebase 255,494.
 `scan_128_btree` did not change: its rows come from the B-tree, so this
 check does not run. The other workloads changed by less than 0.2%.
 
+## H17. Index seeks rebuild the seek key's index metadata — `fixed`
+
+**Where:** `index_read` made about 23 allocations per operation. Each index
+seek built a new `Arc<IndexInfo>` with a copy of every `KeyInfo`, only to set
+`num_cols` to the seek key's column count. An equality seek then collected
+another `Vec<KeyInfo>` to compare the found key with the seek key.
+
+**Fix:** The cursor keeps the last seek key's `IndexInfo` and reuses it while
+seek keys have the same column count; its other fields come from the
+cursor's own index. The equality check passes a slice of the index's
+`key_info`.
+
+**Callgrind, 200/2,200 iterations:**
+
+| Scenario | Before | After | Change |
+|---|---:|---:|---:|
+| `index_read` | 32,197 | 31,917 | -0.9% |
+| `index_read_btree` | 35,225 | 35,037 | -0.5% |
+| `delete_commit` | 68,021 | 67,669 | -0.5% |
+
 ## Final measured totals
 
 The branch was rebased after `origin/main` gained unrelated planner work and an
