@@ -5908,19 +5908,12 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
     pub(crate) fn advance_cursor_and_get_row_id_for_index(
         &self,
         mv_store_iterator: &mut Option<MvccIterator<'static, Arc<SortableIndexKey>, A>>,
-        tx_id: TxID,
-    ) -> Option<RowID> {
+        snapshot: MvccReadSnapshot,
+    ) -> Option<(RowID, RowVersions<A>)> {
         let mv_store_iterator = mv_store_iterator.as_mut().expect(
             "mv_store_iterator must be initialized when calling get_row_id_for_index_in_direction",
         );
-
-        let tx = self
-            .txs
-            .get(&tx_id)
-            .expect("transaction should exist in txs map");
-        let tx = tx.value();
-
-        self.find_next_visible_index_row(tx, mv_store_iterator)
+        self.find_next_visible_index_row(snapshot, mv_store_iterator)
     }
 
     /// Whether a SkipMap chain must still participate in MVCC merge/shadow for `tx`.
@@ -6134,27 +6127,32 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
 
     fn find_last_visible_index_version(
         &self,
-        tx: &Transaction<A>,
+        snapshot: MvccReadSnapshot,
         row: IndexRowEntry<'_, A>,
-    ) -> Option<RowID> {
-        let versions = row.value().read();
-        if versions.is_empty() {
-            return None;
-        }
-        versions
-            .iter()
-            .rev()
-            .find(|version| version.is_visible_to(tx, &self.txs, &self.finalized_tx_states))
-            .map(|version| version.row.id.clone())
+    ) -> Option<(RowID, RowVersions<A>)> {
+        let versions_arc = row.value();
+        let row_id = {
+            let versions = versions_arc.read();
+            self.find_visible_version(snapshot, &versions)
+                .expect("transaction should exist while its cursor is active")?
+                .row
+                .id
+                .clone()
+        };
+        Some((row_id, versions_arc.clone()))
     }
 
-    fn find_next_visible_index_row<'a, I>(&self, tx: &Transaction<A>, mut rows: I) -> Option<RowID>
+    fn find_next_visible_index_row<'a, I>(
+        &self,
+        snapshot: MvccReadSnapshot,
+        mut rows: I,
+    ) -> Option<(RowID, RowVersions<A>)>
     where
         I: Iterator<Item = IndexRowEntry<'a, A>>,
     {
         loop {
             let row = rows.next()?;
-            if let Some(visible_row) = self.find_last_visible_index_version(tx, row) {
+            if let Some(visible_row) = self.find_last_visible_index_version(snapshot, row) {
                 return Some(visible_row);
             }
         }
@@ -6240,16 +6238,16 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub fn seek_index(
+    pub(crate) fn seek_index(
         &self,
         index_id: MVTableId,
         start: SortableIndexKey,
         inclusive: bool,
         eq_only: bool,
         direction: IterationDirection,
-        tx_id: TxID,
+        snapshot: MvccReadSnapshot,
         index_iterator: &mut Option<MvccIterator<'static, Arc<SortableIndexKey>, A>>,
-    ) -> Result<Option<RowID>> {
+    ) -> Result<Option<(RowID, RowVersions<A>)>> {
         let index_rows = self.get_or_create_index_rows(index_id)?;
         let index_rows = index_rows.value();
         let range = if eq_only {
@@ -6289,13 +6287,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         let mv_store_iterator = index_iterator
             .as_mut()
             .expect("index_iterator was assigned above if it was None");
-
-        let tx = self
-            .txs
-            .get(&tx_id)
-            .expect("transaction should exist in txs map");
-        let tx = tx.value();
-        Ok(self.find_next_visible_index_row(tx, mv_store_iterator))
+        Ok(self.find_next_visible_index_row(snapshot, mv_store_iterator))
     }
 
     /// Begins an exclusive write transaction that prevents concurrent writes.
@@ -8777,10 +8769,10 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
             .txs
             .get(&tx_id)
             .expect("transaction should exist in txs map");
-        let tx = tx.value();
+        let snapshot = MvccReadSnapshot::from(tx.value());
         Ok(self
-            .find_next_visible_index_row(tx, iter)
-            .map(|row| row.row_id))
+            .find_next_visible_index_row(snapshot, iter)
+            .map(|(row, _versions)| row.row_id))
     }
 
     pub fn get_logical_log_file(&self) -> Arc<dyn File> {

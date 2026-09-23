@@ -304,7 +304,7 @@ enum CursorPeek<A: ConcurrentAllocator = TursoAllocator> {
     Row {
         key: RowKey,
         /// Resolved MVCC version chain, set when this peek came from the MVCC
-        /// table iterator. `None` for btree peeks and index peeks.
+        /// table or index iterator. `None` for btree peeks.
         versions: Option<RowVersions<A>>,
     },
     Exhausted,
@@ -865,11 +865,11 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> MvccLazyCursor<Clock
             },
             MvccCursorType::Index(_) => match self
                 .db
-                .advance_cursor_and_get_row_id_for_index(&mut self.index_iterator, self.tx_id)
+                .advance_cursor_and_get_row_id_for_index(&mut self.index_iterator, self.snapshot)
             {
-                Some(row_id) => CursorPeek::Row {
+                Some((row_id, versions)) => CursorPeek::Row {
                     key: row_id.row_id,
-                    versions: None,
+                    versions: Some(versions),
                 },
                 None => CursorPeek::Exhausted,
             },
@@ -1102,6 +1102,9 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> MvccLazyCursor<Clock
     fn position_from_peeks(&mut self, dir: IterationDirection) -> CursorPosition<A> {
         loop {
             let pos = self.dual_peek.cursor_position_from_next(self.table_id, dir);
+            if matches!(self.mv_cursor_type, MvccCursorType::Index(_)) {
+                return pos;
+            }
             let CursorPosition::Loaded {
                 row_id,
                 in_btree: false,
@@ -1711,16 +1714,16 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> CursorTrait
                                 inclusive,
                                 op.eq_only(),
                                 direction,
-                                self.tx_id,
+                                self.snapshot,
                                 &mut self.index_iterator,
                             )?;
 
                             // Set MVCC peek
                             {
-                                self.dual_peek.mvcc_peek = match &mvcc_rowid {
-                                    Some(rid) => CursorPeek::Row {
-                                        key: rid.row_id.clone(),
-                                        versions: None,
+                                self.dual_peek.mvcc_peek = match mvcc_rowid {
+                                    Some((rid, versions)) => CursorPeek::Row {
+                                        key: rid.row_id,
+                                        versions: Some(versions),
                                     },
                                     None => CursorPeek::Exhausted,
                                 };
