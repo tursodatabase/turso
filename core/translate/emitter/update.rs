@@ -5,7 +5,6 @@ use crate::schema::{Column, ColumnLayout, GeneratedType, Table};
 use crate::translate::insert::halt_desc_and_on_error;
 use crate::translate::plan::ColumnMask;
 use crate::translate::stmt_journal::any_effective_replace;
-use crate::vdbe::builder::SelfTableContext;
 use crate::{
     ast, emit_explain,
     error::{SQLITE_CONSTRAINT_NOTNULL, SQLITE_CONSTRAINT_PRIMARYKEY, SQLITE_CONSTRAINT_UNIQUE},
@@ -500,7 +499,6 @@ struct UpdateColumnCtx<'a> {
     target_table: &'a Arc<JoinedTable>,
     target_table_cursor_id: usize,
     start: usize,
-    rowid_reg: usize,
     updates_rowid: bool,
     rowid_set_clause_reg: Option<usize>,
     is_virtual_table: bool,
@@ -819,88 +817,68 @@ fn emit_update_column_values<'a>(
 
                     program.emit_null(target_reg, None);
                 } else {
-                    let self_table_context = match table_column.generated_type() {
-                        GeneratedType::Virtual { .. } => Some(SelfTableContext::ForDML {
-                            dml_ctx: DmlColumnContext::layout(
-                                column_ctx.target_table.table.columns(),
-                                column_ctx.start,
-                                column_ctx.rowid_reg,
-                                column_ctx.layout.clone(),
-                            ),
-                            table: column_ctx.target_table.table.require_btree()?,
-                        }),
-                        GeneratedType::NotGenerated => None,
-                    };
+                    // Save/restore target_union_type so union_value() resolves tags
+                    // against this column's union type. See ProgramBuilder::target_union_type.
+                    let union_td = t_ctx
+                        .resolver
+                        .schema
+                        .get_type_def_unchecked(&table_column.ty_str)
+                        .filter(|td| td.is_union())
+                        .cloned();
+                    let prev_union = program.target_union_type.take();
+                    program.target_union_type = union_td;
 
-                    t_ctx.resolver.with_self_table_context(
-                        program,
-                        self_table_context.as_ref(),
-                        |program, _| {
-                            // Save/restore target_union_type so union_value() resolves tags
-                            // against this column's union type. See ProgramBuilder::target_union_type.
-                            let union_td = t_ctx
+                    // Columns with custom type encode must not have their
+                    // SET expressions hoisted as constants. See the doc
+                    // comment on NoConstantOptReason::CustomTypeEncode.
+                    let has_custom_encode = {
+                        let ty = &table_column.ty_str;
+                        !ty.is_empty()
+                            && t_ctx
                                 .resolver
                                 .schema
-                                .get_type_def_unchecked(&table_column.ty_str)
-                                .filter(|td| td.is_union())
-                                .cloned();
-                            let prev_union = program.target_union_type.take();
-                            program.target_union_type = union_td;
-
-                            // Columns with custom type encode must not have their
-                            // SET expressions hoisted as constants. See the doc
-                            // comment on NoConstantOptReason::CustomTypeEncode.
-                            let has_custom_encode = {
-                                let ty = &table_column.ty_str;
-                                !ty.is_empty()
-                                    && t_ctx
-                                        .resolver
-                                        .schema
-                                        .get_type_def_unchecked(ty)
-                                        .is_some_and(|td| td.encode().is_some())
-                            };
-                            let translate_result = if has_custom_encode {
-                                translate_expr_no_constant_opt(
-                                    program,
-                                    Some(table_references),
-                                    expr,
-                                    target_reg,
-                                    &t_ctx.resolver,
-                                    NoConstantOptReason::CustomTypeEncode,
-                                )
-                            } else {
-                                translate_expr(
-                                    program,
-                                    Some(table_references),
-                                    expr,
-                                    target_reg,
-                                    &t_ctx.resolver,
-                                )
-                            };
-                            program.target_union_type = prev_union;
-                            translate_result?;
-                            if table_column.notnull() && !skip_notnull_checks {
-                                let notnull_conflict = if program.flags.has_statement_conflict() {
-                                    or_conflict
-                                } else {
-                                    table_column
-                                        .notnull_conflict_clause
-                                        .unwrap_or(ResolveType::Abort)
-                                };
-                                emit_notnull_constraint_check(
-                                    program,
-                                    table_references,
-                                    target_reg,
-                                    table_column,
-                                    column_ctx.table_name(),
-                                    notnull_conflict,
-                                    skip_row_label,
-                                    &t_ctx.resolver,
-                                )?;
-                            }
-                            Ok(())
-                        },
-                    )?;
+                                .get_type_def_unchecked(ty)
+                                .is_some_and(|td| td.encode().is_some())
+                    };
+                    let translate_result = if has_custom_encode {
+                        translate_expr_no_constant_opt(
+                            program,
+                            Some(table_references),
+                            expr,
+                            target_reg,
+                            &t_ctx.resolver,
+                            NoConstantOptReason::CustomTypeEncode,
+                        )
+                    } else {
+                        translate_expr(
+                            program,
+                            Some(table_references),
+                            expr,
+                            target_reg,
+                            &t_ctx.resolver,
+                        )
+                    };
+                    program.target_union_type = prev_union;
+                    translate_result?;
+                    if table_column.notnull() && !skip_notnull_checks {
+                        let notnull_conflict = if program.flags.has_statement_conflict() {
+                            or_conflict
+                        } else {
+                            table_column
+                                .notnull_conflict_clause
+                                .unwrap_or(ResolveType::Abort)
+                        };
+                        emit_notnull_constraint_check(
+                            program,
+                            table_references,
+                            target_reg,
+                            table_column,
+                            column_ctx.table_name(),
+                            notnull_conflict,
+                            skip_row_label,
+                            &t_ctx.resolver,
+                        )?;
+                    }
                 }
 
                 if let Some(cdc_updates_register) = column_ctx.cdc_updates_register {
@@ -1262,7 +1240,6 @@ fn emit_update_insns<'a>(
         target_table: &target_table,
         target_table_cursor_id,
         start,
-        rowid_reg: beg,
         updates_rowid,
         rowid_set_clause_reg,
         is_virtual_table,
