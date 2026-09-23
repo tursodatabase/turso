@@ -1,4 +1,4 @@
-use super::gencol::compute_virtual_columns;
+use super::gencol::{compute_virtual_columns, emit_row_from_cursor};
 use super::TranslateCtx;
 use crate::alloc::{TryClone, TursoIteratorExt};
 use crate::schema::{Column, ColumnLayout, GeneratedType, Table};
@@ -24,9 +24,9 @@ use crate::{
         eqp::eqp_detail_for_table_op,
         expr::{
             emit_dml_expr_index_value, emit_returning_results, emit_returning_scan_back,
-            emit_table_column, restore_returning_row_image_in_cache,
-            seed_returning_row_image_in_cache, translate_expr, translate_expr_no_constant_opt,
-            NoConstantOptReason, ReturningBufferCtx,
+            restore_returning_row_image_in_cache, seed_returning_row_image_in_cache,
+            translate_expr, translate_expr_no_constant_opt, NoConstantOptReason,
+            ReturningBufferCtx,
         },
         fkeys::{
             affected_parent_fks_for_update, emit_fk_child_update_counters,
@@ -1326,21 +1326,15 @@ fn emit_update_insns<'a>(
             // Only read OLD row values when triggers or FK cascades need them
             let columns = target_table.table.columns();
             let old_registers: Option<Vec<usize>> = if needs_old_registers {
-                let mut regs = Vec::with_capacity(col_len + 1);
-                for (i, column) in columns.iter().enumerate() {
-                    let reg = program.alloc_register();
-                    emit_table_column(
-                        program,
-                        target_table_cursor_id,
-                        internal_id,
-                        table_references,
-                        column,
-                        i,
-                        reg,
-                        &t_ctx.resolver,
-                    )?;
-                    regs.push(reg);
-                }
+                let first_reg = program.alloc_registers(col_len);
+                let mut regs: Vec<usize> = (first_reg..first_reg + col_len).collect();
+                emit_row_from_cursor(
+                    program,
+                    &btree_table,
+                    target_table_cursor_id,
+                    &regs,
+                    &t_ctx.resolver,
+                )?;
                 regs.push(beg);
                 Some(regs)
             } else {

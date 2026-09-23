@@ -5972,3 +5972,15 @@ expect {
     2|21
     ok
 }
+
+setup gencol_virtual_columns_delete_trigger {
+    CREATE TABLE t(a INTEGER, b INTEGER, c AS (a + b), d AS (c * 2));
+    CREATE TABLE log(x, y);
+    CREATE TRIGGER t_bd BEFORE DELETE ON t BEGIN INSERT INTO log VALUES (OLD.c, OLD.d); END;
+}
+
+@skip-if mvcc "mvcc has different root pages"
+@setup gencol_virtual_columns_delete_trigger
+snapshot gencol_delete_old_row_computes_virtual_columns_from_registers {
+    DELETE FROM t WHERE b = 3;
+}
