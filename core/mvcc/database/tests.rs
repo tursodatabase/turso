@@ -474,6 +474,24 @@ fn sortable_index_key_keeps_checked_collation_semantics() {
 }
 
 #[test]
+fn compare_bytes_matches_slice_order() {
+    let mut rng = ChaCha8Rng::seed_from_u64(0xb17e5);
+    for _ in 0..20_000 {
+        let shared_len = rng.random_range(0..20);
+        let shared: Vec<u8> = (0..shared_len).map(|_| rng.random_range(0..4u8)).collect();
+        let mut lhs = shared.clone();
+        let mut rhs = shared;
+        lhs.extend((0..rng.random_range(0..12)).map(|_| rng.random_range(0..4u8) * 85));
+        rhs.extend((0..rng.random_range(0..12)).map(|_| rng.random_range(0..4u8) * 85));
+        assert_eq!(
+            compare_bytes(&lhs, &rhs),
+            lhs.cmp(&rhs),
+            "{lhs:?} vs {rhs:?}"
+        );
+    }
+}
+
+#[test]
 fn sortable_index_key_order_matches_value_comparison() {
     use crate::translate::collate::CollationSeq;
     use turso_parser::ast::SortOrder;
