@@ -440,11 +440,14 @@ impl<A: ConcurrentAllocator> IndexShadowScan<A> {
         mut iter: MvccIterator<'static, Arc<SortableIndexKey>, A>,
     ) -> IndexShadowScanState<A> {
         match iter.next() {
-            Some(entry) => IndexShadowScanState::Peeked {
-                key: entry.key().clone(),
-                versions: entry.value().clone(),
-                iter,
-            },
+            Some(entry) => {
+                let (key, versions) = entry.into_key_value();
+                IndexShadowScanState::Peeked {
+                    key,
+                    versions,
+                    iter,
+                }
+            }
             None => IndexShadowScanState::Exhausted,
         }
     }

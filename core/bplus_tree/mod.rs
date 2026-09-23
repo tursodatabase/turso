@@ -1289,6 +1289,10 @@ impl<K: TreeKey, V: TreeValue, A: ConcurrentAllocator> Entry<'_, K, V, A> {
         self.value
     }
 
+    pub fn into_key_value(self) -> (K, V) {
+        (self.key, self.value)
+    }
+
     /// Removes this entry from the map, if the map still maps its key to its value.
     pub fn remove(&self) -> bool {
         self.map

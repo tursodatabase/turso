@@ -5634,10 +5634,9 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                 let RowKey::Record(sortable_key) = id.row_id.clone() else {
                     panic!("Index deletes must have a record row_id");
                 };
-                if let Some(ref row_versions_entry) = rows.get(&sortable_key) {
+                if let Some(row_versions_entry) = rows.get(&sortable_key) {
                     // Get the Arc key from the map entry for savepoint tracking
-                    let arc_key = row_versions_entry.key().clone();
-                    let row_versions = row_versions_entry.value().clone();
+                    let (arc_key, row_versions) = row_versions_entry.into_key_value();
                     for rv in row_versions.write().iter_mut().rev() {
                         let tx = self
                             .txs
@@ -5674,8 +5673,8 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
             }
             None => {
                 let row_versions_opt = self.rows.get(&id);
-                if let Some(ref row_versions_entry) = row_versions_opt {
-                    let row_versions = row_versions_entry.value().clone();
+                if let Some(row_versions_entry) = row_versions_opt {
+                    let row_versions = row_versions_entry.into_value();
                     let mut locked_row_versions = row_versions.write();
                     for rv in locked_row_versions.iter_mut().rev() {
                         let tx = self
@@ -5700,7 +5699,6 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                         let version_id = rv.id;
                         rv.set_end(Some(TxTimestampOrID::TxID(tx.tx_id)));
                         drop(locked_row_versions);
-                        drop(row_versions_opt);
                         let tx = self
                             .txs
                             .get(&tx_id)
@@ -5923,7 +5921,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
             }
 
             // We found a row, let's check if it's visible to the transaction.
-            if let Some((row_id, versions, _)) = self.find_last_visible_version(tx, &row, false) {
+            if let Some((row_id, versions, _)) = self.find_last_visible_version(tx, row, false) {
                 return Some((row_id, versions));
             }
             // If this row is not visible, continue to the next row
@@ -6119,12 +6117,11 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
     fn find_last_visible_version(
         &self,
         tx: &Transaction<A>,
-        row: &TableRowEntry<'_, A>,
+        row: TableRowEntry<'_, A>,
         take_payload: bool,
     ) -> Option<(RowID, RowVersions<A>, Option<Row>)> {
-        let versions_arc = row.value();
         let payload = {
-            let versions = versions_arc.read();
+            let versions = row.value().read();
             if self.btree_covers_chain_for_tx(tx, row.key().table_id, &versions) {
                 return None;
             }
@@ -6134,7 +6131,8 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                 .find(|version| version.is_visible_to(tx, &self.txs, &self.finalized_tx_states))?;
             take_payload.then(|| occupying.row.clone())
         };
-        Some((row.key().clone(), versions_arc.clone(), payload))
+        let (row_id, versions) = row.into_key_value();
+        Some((row_id, versions, payload))
     }
 
     fn find_last_visible_index_version(
@@ -6180,7 +6178,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
             if row.key().table_id != table_id {
                 return None;
             }
-            if let Some(visible_row) = self.find_last_visible_version(tx, &row, take_payload) {
+            if let Some(visible_row) = self.find_last_visible_version(tx, row, take_payload) {
                 return Some(visible_row);
             }
         }
@@ -8463,7 +8461,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                 A,
             >>::new_in(alloc)))
         })?;
-        Ok(versions.value().clone())
+        Ok(versions.into_value())
     }
 
     /// Gets an existing Arc<SortableIndexKey> from the index if the key exists,
@@ -8498,8 +8496,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
             let entry = self.get_or_create_index_key_entry(index, key.clone())?;
             // SkipMap may keep our Arc (miss) or a pre-existing one (hit); return that
             // canonical Arc so savepoint tracking and the map stay in sync.
-            let canonical_key = entry.key().clone();
-            let row_versions = entry.value().clone();
+            let (canonical_key, row_versions) = entry.into_key_value();
             let mut versions = row_versions.write();
             if !self.index_versions_still_mapped(index, canonical_key.as_ref(), &row_versions) {
                 continue;
@@ -8730,14 +8727,14 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                 tracing::trace!("get_last_table_rowid: reached end of table");
                 return None;
             }
-            if let Some(_visible_row) = self.find_last_visible_version(tx, &entry, false) {
+            if let Some(visible_row) = self.find_last_visible_version(tx, entry, false) {
                 tracing::trace!(
                     "get_last_table_rowid: found visible row: {:?}",
-                    _visible_row
+                    visible_row
                 );
                 // There is a visible version for this rowid, so we return it
-                return Some(RowKey::Int(match &entry.key().row_id {
-                    RowKey::Int(i) => *i,
+                return Some(RowKey::Int(match visible_row.0.row_id {
+                    RowKey::Int(i) => i,
                     _ => panic!("Expected RowKey::Int for table rowid"),
                 }));
             }
