@@ -150,6 +150,7 @@ impl<A: ConcurrentAllocator> RowVersionAllocator for A {
 pub type RowVersionChain<A = TursoAllocator> = <A as RowVersionAllocator>::RowVersionChain;
 pub type RowVersions<A = TursoAllocator> = Arc<RwLock<RowVersionChain<A>>>;
 type TableRowEntry<'a, A = TursoAllocator> = Entry<'a, RowID, RowVersions<A>, BasicComparator, A>;
+type TxEntry<'a, A = TursoAllocator> = Entry<'a, TxID, Transaction<A>, BasicComparator, A>;
 type IndexRowEntry<'a, A = TursoAllocator> =
     Entry<'a, Arc<SortableIndexKey>, RowVersions<A>, BasicComparator, A>;
 type IndexRowsEntry<'a, A = TursoAllocator> =
@@ -1652,6 +1653,11 @@ pub struct CommitStateMachine<Clock: LogicalClock, A: ConcurrentAllocator = Turs
     yield_instance_id: u64,
     did_commit_schema_change: bool,
     tx_id: TxID,
+    /// This transaction's entry in `mvcc_store.txs`, taken once in `new` so the
+    /// commit states read the transaction without searching the map. The
+    /// `'static` lifetime is not real; see the SAFETY comment in `new`. Keep
+    /// this field before `mvcc_store`, and never change it after `new`.
+    tx_entry: Option<TxEntry<'static, A>>,
     mvcc_store: Arc<MvStore<Clock, A>>,
     connection: Arc<Connection>,
     /// Database index this commit is for (`MAIN_DB_ID` or an attached-db id).
@@ -1748,6 +1754,23 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CommitStateMachine<Clock, A> {
                 schema_did_change: true
             }
         );
+        // SAFETY: only the lifetime changes. The entry really borrows
+        // `mvcc_store.txs`, and the compiler no longer checks that. It stays
+        // valid because:
+        // - `self.mvcc_store` keeps the store alive, and `tx_entry` is declared
+        //   before it, so it is dropped first. The order matters: dropping the
+        //   last reference to a node reads `txs` to free it. `txs` is private
+        //   and set only when the store is built, so it is never replaced.
+        // - The entry holds a reference count on the node, so `value()` stays
+        //   readable after the commit removes the transaction from `txs`.
+        // - `tx_entry` never changes after this point. `committing_tx` depends
+        //   on that, because its references are tied to the step's store
+        //   borrow, not to `self`. Dropping or replacing `tx_entry` while such
+        //   a reference is alive, or cloning the entry into something that
+        //   outlives `self`, is a use-after-free the compiler will not catch.
+        let tx_entry = mvcc_store.txs.get(&tx_id).map(|entry| unsafe {
+            std::mem::transmute::<TxEntry<'_, A>, TxEntry<'static, A>>(entry)
+        });
         Ok(Self {
             state,
             is_finalized: false,
@@ -1755,6 +1778,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CommitStateMachine<Clock, A> {
             yield_instance_id: connection.next_yield_instance_id(),
             did_commit_schema_change: schema_did_change_from_tx,
             tx_id,
+            tx_entry,
             mvcc_store,
             connection,
             db_id,
@@ -1767,6 +1791,20 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CommitStateMachine<Clock, A> {
             sync_mode,
             _phantom: PhantomData,
         })
+    }
+
+    /// The committing transaction, or `None` if it is not (or no longer) in
+    /// `txs`. The reference is tied to `mvcc_store`, not `self`, so a step can
+    /// assign `self.state` while holding it. That is sound only because
+    /// `tx_entry` never changes after `new`.
+    fn committing_tx<'m>(
+        &self,
+        _mvcc_store: &'m Arc<MvStore<Clock, A>>,
+    ) -> Option<&'m Transaction<A>> {
+        self.tx_entry
+            .as_ref()
+            .filter(|entry| !entry.is_removed())
+            .map(|entry| entry.value())
     }
 
     fn release_group_claim(&mut self) {
@@ -1897,7 +1935,11 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CommitStateMachine<Clock, A> {
                 batch.advanced_through = Some(ticket);
             }
         }
-        if let Some(tx) = mvcc_store.txs.get(&owner_tx) {
+        if owner_tx == self.tx_id {
+            if let Some(tx) = self.committing_tx(mvcc_store) {
+                tx.log_appended.store(true, Ordering::Release);
+            }
+        } else if let Some(tx) = mvcc_store.txs.get(&owner_tx) {
             tx.value().log_appended.store(true, Ordering::Release);
         }
         self.commit_coordinator.clear_issued();
@@ -2332,15 +2374,11 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CommitStateMachine<Clock, A> {
         }
 
         let tx_id = self.tx_id;
-        let tx_entry = mvcc_store.txs.get(&tx_id);
-        let tx = tx_entry
-            .as_ref()
-            .map(|entry| entry.value())
-            .ok_or_else(|| {
-                LimboError::NoSuchTransactionID(format!(
-                    "tx id {tx_id} not found in step_build_logical_record"
-                ))
-            })?;
+        let tx = self.committing_tx(mvcc_store).ok_or_else(|| {
+            LimboError::NoSuchTransactionID(format!(
+                "tx id {tx_id} not found in step_build_logical_record"
+            ))
+        })?;
         let write_set_len = tx.write_set.lock().entries.len();
         #[cfg(feature = "conn_raw_api")]
         let connection = Arc::clone(&self.connection);
@@ -2972,15 +3010,11 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CommitStateMachine<Clock, A> {
         mvcc_store: &Arc<MvStore<Clock, A>>,
     ) -> Result<TransitionResult<()>> {
         let tx_id = self.tx_id;
-        let tx_entry = mvcc_store.txs.get(&tx_id);
-        let tx = tx_entry
-            .as_ref()
-            .map(|entry| entry.value())
-            .ok_or_else(|| {
-                LimboError::NoSuchTransactionID(format!(
-                    "tx id {tx_id} not found in step_build_logical_record"
-                ))
-            })?;
+        let tx = self.committing_tx(mvcc_store).ok_or_else(|| {
+            LimboError::NoSuchTransactionID(format!(
+                "tx id {tx_id} not found in step_build_logical_record"
+            ))
+        })?;
         let write_set = tx.write_set.lock();
         let write_set_len = write_set.entries.len();
         let CommitState::RewriteLiveVersions(ctx) = &mut self.state else {
@@ -2988,12 +3022,8 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CommitStateMachine<Clock, A> {
         };
         let end_ts = ctx.end_ts;
         if ctx.cursor == 0 {
-            let tx_state = mvcc_store
-                .txs
-                .get(&tx_id)
-                .map(|entry| entry.value().state.load());
             turso_assert!(
-                matches!(tx_state, Some(TransactionState::Committed(ts)) if ts == end_ts),
+                matches!(tx.state.load(), TransactionState::Committed(ts) if ts == end_ts),
                 "RewriteLiveVersions requires a committed transaction state"
             );
         }
@@ -3042,13 +3072,9 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> StateTransition for CommitStat
         tracing::trace!("step(state={:?})", self.state);
         match &self.state {
             CommitState::Initial => {
-                // NOTICE: the first shadowed tx keeps the entry alive in the map
-                // for the duration of this whole function, which is important for correctness!
-                let tx = mvcc_store
-                    .txs
-                    .get(&self.tx_id)
+                let tx = self
+                    .committing_tx(mvcc_store)
                     .ok_or(LimboError::TxTerminated)?;
-                let tx = tx.value();
                 match tx.state.load() {
                     TransactionState::Terminated => {
                         return Err(LimboError::TxTerminated);
@@ -3273,11 +3299,9 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> StateTransition for CommitStat
             CommitState::Commit { end_ts } => {
                 // Check for rowid conflicts before committing (pure optimistic, first-committer-wins)
                 // Ref: Hekaton paper Section 3.2 - validation uses end_ts comparison
-                let tx = mvcc_store
-                    .txs
-                    .get(&self.tx_id)
+                let tx = self
+                    .committing_tx(mvcc_store)
                     .ok_or(LimboError::TxTerminated)?;
-                let tx = tx.value();
 
                 for (id, _chain) in tx.write_set.lock().iter() {
                     if id.row_id.is_int_key() {
@@ -3297,11 +3321,9 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> StateTransition for CommitStat
             }
             CommitState::WaitForDependencies { end_ts } => {
                 let end_ts = *end_ts;
-                let tx = mvcc_store
-                    .txs
-                    .get(&self.tx_id)
+                let tx = self
+                    .committing_tx(mvcc_store)
                     .ok_or(LimboError::TxTerminated)?;
-                let tx = tx.value();
 
                 // Eagarly check for abort_now
                 if tx.abort_now.load(Ordering::Acquire) {
@@ -3384,17 +3406,14 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> StateTransition for CommitStat
                 }
                 if !is_exclusive {
                     // logical log needs to be serialized.
-                    let tx = mvcc_store
-                        .txs
-                        .get(&self.tx_id)
+                    let tx = self
+                        .committing_tx(mvcc_store)
                         .ok_or_else(|| LimboError::NoSuchTransactionID(self.tx_id.to_string()))?;
                     let locked = self.commit_coordinator.pager_commit_lock.write();
                     if !locked {
                         return Ok(TransitionResult::Io(IOCompletions(Completion::new_yield())));
                     }
-                    tx.value()
-                        .pager_commit_lock_held
-                        .store(true, Ordering::Release);
+                    tx.pager_commit_lock_held.store(true, Ordering::Release);
                 }
                 let end_ts = *end_ts;
                 let log_record = match std::mem::replace(
@@ -3539,8 +3558,8 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> StateTransition for CommitStat
             CommitState::GroupPrefixSynced { end_ts, ticket } => {
                 self.commit_coordinator
                     .mark_durable(self.commit_coordinator.written_through());
-                if let Some(tx) = mvcc_store.txs.get(&self.tx_id) {
-                    mvcc_store.unlock_commit_lock_if_held(tx.value());
+                if let Some(tx) = self.committing_tx(mvcc_store) {
+                    mvcc_store.unlock_commit_lock_if_held(tx);
                 } else {
                     self.commit_coordinator.unlock_pager_commit_lock();
                 }
@@ -3551,11 +3570,9 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> StateTransition for CommitStat
                 Ok(TransitionResult::Continue)
             }
             CommitState::EndCommitLogicalLog { end_ts } => {
-                let tx = mvcc_store
-                    .txs
-                    .get(&self.tx_id)
+                let tx_unlocked = self
+                    .committing_tx(mvcc_store)
                     .ok_or_else(|| LimboError::NoSuchTransactionID(self.tx_id.to_string()))?;
-                let tx_unlocked = tx.value();
                 if self.group_batch.take().is_some() {
                     self.commit_coordinator
                         .mark_durable(self.commit_coordinator.written_through());
@@ -3604,11 +3621,9 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> StateTransition for CommitStat
                 // (1) must precede (2): rewriting before marking Committed would
                 // publish the transaction's effects to readers before its fate is
                 // decided, which breaks rollback of abandoned commits.
-                let tx = mvcc_store
-                    .txs
-                    .get(&self.tx_id)
+                let tx_unlocked = self
+                    .committing_tx(mvcc_store)
                     .ok_or_else(|| LimboError::NoSuchTransactionID(self.tx_id.to_string()))?;
-                let tx_unlocked = tx.value();
                 tx_unlocked
                     .state
                     .store(TransactionState::Committed(*end_ts));
@@ -3626,11 +3641,9 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> StateTransition for CommitStat
             // helper-dispatch reason as BuildLogRecord above.
             CommitState::RewriteLiveVersions(_) => self.step_rewrite_live_versions(mvcc_store),
             CommitState::FinalizeCommit { end_ts } => {
-                let tx = mvcc_store
-                    .txs
-                    .get(&self.tx_id)
+                let tx_unlocked = self
+                    .committing_tx(mvcc_store)
                     .ok_or_else(|| LimboError::NoSuchTransactionID(self.tx_id.to_string()))?;
-                let tx_unlocked = tx.value();
 
                 // Hekaton Section 3.3: "The transaction then processes all outgoing
                 // commit dependencies listed in its CommitDepSet. If it committed, it
