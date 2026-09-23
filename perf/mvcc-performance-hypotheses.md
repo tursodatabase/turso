@@ -565,6 +565,34 @@ The index comparisons per inserted row fell only from about 151 to 146, so
 most of them come from elsewhere. Maps whose keys compare cheaply pay a few
 instructions for the extra pointer check.
 
+## H24. Version inserts search the map again after finding the chain — `fixed`
+
+**Where:** Splitting index-key comparison cost by caller chain with
+`--separate-callers` showed about 2,600 instructions per inserted row in
+`SkipMap::get` after `try_get_or_insert_with`. `insert_index_version` and
+`insert_version` find or create the key's version chain, take its write lock,
+and then call `index_versions_still_mapped` or `table_versions_still_mapped`:
+a second search for the same key, to retry if GC removed the chain while the
+insert waited for the lock.
+
+**Fix:** Keep the entry that `try_get_or_insert_with` returned and check
+`Entry::is_removed()` after taking the lock. GC removes a chain's node only
+while holding that chain's write lock, the map keeps at most one live node
+per key, and a replacement chain always has a new `Arc`. So the entry is
+removed exactly when the old search would have found another chain or none.
+
+**Callgrind, 200/2,200 iterations:**
+
+| Scenario | Before | After | Change |
+|---|---:|---:|---:|
+| `batch_insert_commit` | 2,670,106 | 2,423,632 | -9.2% |
+| `insert_commit` | 98,073 | 90,548 | -7.7% |
+| `insert_rollback` | 71,145 | 65,720 | -7.6% |
+| `point_update_rollback` | 33,435 | 32,764 | -2.0% |
+| `point_update_commit` | 35,558 | 34,931 | -1.8% |
+
+The read workloads changed by less than 0.2%.
+
 ## Final measured totals
 
 The branch was rebased after `origin/main` gained unrelated planner work and an

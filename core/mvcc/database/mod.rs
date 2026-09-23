@@ -8492,9 +8492,10 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
     ) -> Result<RowVersions<A>, TryReserveError> {
         // Retry if GC unlinked this slot while we waited for the write lock.
         loop {
-            let row_versions = self.get_or_create_table_row_versions(id.clone())?;
+            let entry = self.get_or_create_table_row_entry(id.clone())?;
+            let row_versions = entry.value().clone();
             let mut versions = row_versions.write();
-            if !self.table_versions_still_mapped(&id, &row_versions) {
+            if entry.is_removed() {
                 continue;
             }
             self.insert_version_raw(&mut versions, row_version)?;
@@ -8503,38 +8504,25 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         }
     }
 
-    /// True if `arc` is still the mapped value for `id`.
-    fn table_versions_still_mapped(&self, id: &RowID, arc: &RowVersions<A>) -> bool {
-        self.rows
-            .get(id)
-            .is_some_and(|entry| Arc::ptr_eq(entry.value(), arc))
-    }
-
-    /// True if `arc` is still the mapped value for `key`.
-    fn index_versions_still_mapped(
-        &self,
-        index: &IndexRowsMap<A>,
-        key: &SortableIndexKey,
-        arc: &RowVersions<A>,
-    ) -> bool {
-        index
-            .get(key)
-            .is_some_and(|entry| Arc::ptr_eq(entry.value(), arc))
-    }
-
-    #[turso_macros::allocation_site(crate::alloc::MvStoreAllocationSite::TableRowsEntry)]
     fn get_or_create_table_row_versions(
         &self,
         id: RowID,
     ) -> Result<RowVersions<A>, TryReserveError> {
+        Ok(self.get_or_create_table_row_entry(id)?.value().clone())
+    }
+
+    #[turso_macros::allocation_site(crate::alloc::MvStoreAllocationSite::TableRowsEntry)]
+    fn get_or_create_table_row_entry(
+        &self,
+        id: RowID,
+    ) -> Result<TableRowEntry<'_, A>, TryReserveError> {
         let alloc = self.alloc.clone();
-        let versions = self.rows.try_get_or_insert_with(id, move || {
+        self.rows.try_get_or_insert_with(id, move || {
             Arc::new(RwLock::new(<RowVersionChain<A> as TursoVecInExt<
                 RowVersion,
                 A,
             >>::new_in(alloc)))
-        })?;
-        Ok(versions.value().clone())
+        })
     }
 
     /// Gets an existing Arc<SortableIndexKey> from the index if the key exists,
@@ -8572,7 +8560,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
             let canonical_key = entry.key().clone();
             let row_versions = entry.value().clone();
             let mut versions = row_versions.write();
-            if !self.index_versions_still_mapped(index, canonical_key.as_ref(), &row_versions) {
+            if entry.is_removed() {
                 continue;
             }
             row_version.row.id.row_id = RowKey::Record(canonical_key.clone());
@@ -8728,11 +8716,12 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
     /// Passive sequence compaction: record end-stamped deletes instead of inline B-tree purge.
     pub fn seqcompact_commit_delete(&self, rowid: RowID, num_cols: usize, end_ts: u64) {
         loop {
-            let Ok(row_versions) = self.get_or_create_table_row_versions(rowid.clone()) else {
+            let Ok(entry) = self.get_or_create_table_row_entry(rowid.clone()) else {
                 return;
             };
+            let row_versions = entry.value().clone();
             let mut versions = row_versions.write();
-            if !self.table_versions_still_mapped(&rowid, &row_versions) {
+            if entry.is_removed() {
                 continue;
             }
             // End-stamp the live committed version, if any — collection then
