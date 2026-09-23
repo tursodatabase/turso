@@ -3375,9 +3375,7 @@ impl Record {
 }
 
 pub enum Cursor {
-    /// A b-tree cursor, with the sort orders and collations of its key beside
-    /// it when it reads an index. The comparison opcodes need both at once,
-    /// and the cursor is borrowed for the whole time they hold its payload.
+    /// A b-tree cursor
     BTree(Box<BTreeCursor>, Option<Arc<IndexInfo>>),
     /// A cursor behind a trait object: currently, either the MVCC cursor or test doubles.
     /// TODO it wouldn't be too hard to get rid of `dyn CursorTrait` everywhere.
@@ -3446,9 +3444,6 @@ impl Cursor {
         }
     }
 
-    /// The cursor and its key's sort orders and collations, from one borrow.
-    /// The comparison opcodes read the index info while the payload they
-    /// compare still holds the cursor.
     pub fn as_index_cursor_mut(&mut self) -> (&mut dyn CursorTrait, &IndexInfo) {
         let (cursor, index_info) = match self {
             Self::BTree(cursor, index_info) => {

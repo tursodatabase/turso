@@ -804,9 +804,6 @@ pub trait CursorTrait: Any + Send + Sync {
     /// Check if cursor is poiting at a valid entry with a record.
     fn has_record(&self) -> bool;
     fn set_has_record(&mut self, has_record: bool);
-    /// The sort orders and collations of an index cursor's key, or None for a
-    /// table cursor. `Cursor` keeps a handle to the same value beside the
-    /// cursor so a comparison opcode can read it while the cursor is borrowed.
     fn index_info(&self) -> Option<&Arc<IndexInfo>>;
 
     fn seek_end(&mut self) -> IOResultOr<()>;

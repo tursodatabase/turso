@@ -1476,7 +1476,6 @@ pub fn op_open_read(
                 num_columns,
             )?;
             let index_info = match mv_store.as_ref() {
-                // MVCC keeps its own copy, in its own allocator.
                 Some(mv_store) => {
                     Arc::new(IndexInfo::new_from_index_in(index, mv_store.allocator())?)
                 }
