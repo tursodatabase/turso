@@ -537,6 +537,34 @@ per-commit box moved to another allocator size class, but this was not
 checked. Releasing the entry at the end of the commit instead of when the
 state machine drops did not change it.
 
+## H23. Skip-list searches compare the same node twice — `fixed`
+
+**Where:** A batch insert makes about 150 index-key comparisons per row, at
+about 250 instructions each. `SkipList::search_position` and
+`SkipList::search_bound` walk each level until a node's key ends the walk,
+then descend. The first node on the level below is often that same node, and
+its key was compared again.
+
+**Fix:** Remember the node that ended the walk on the level above and skip
+the comparison when the walk reaches it again. A node's key never changes and
+comparison is deterministic, so the result is the same. The check runs after
+the removed-node check, so unlinking behaves as before.
+
+**Callgrind, 200/2,200 iterations:**
+
+| Scenario | Before | After | Change |
+|---|---:|---:|---:|
+| `delete_commit` | 62,615 | 58,400 | -6.7% |
+| `index_read` | 29,353 | 28,937 | -1.4% |
+| `index_scan_128` | 192,864 | 191,054 | -0.9% |
+| `batch_insert_commit` | 2,687,662 | 2,670,106 | -0.7% |
+| `point_update_rollback` | 33,272 | 33,435 | +0.5% |
+| `point_read` | 14,676 | 14,728 | +0.4% |
+
+The index comparisons per inserted row fell only from about 151 to 146, so
+most of them come from elsewhere. Maps whose keys compare cheaply pay a few
+instructions for the extra pointer check.
+
 ## Final measured totals
 
 The branch was rebased after `origin/main` gained unrelated planner work and an
