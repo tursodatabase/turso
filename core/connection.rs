@@ -379,6 +379,9 @@ impl Drop for ExplicitCheckpointGuard {
     }
 }
 
+#[cfg(test)]
+pub(crate) type ConnectionTestHook = Arc<dyn Fn(&Connection) + Send + Sync>;
+
 /// Database connection handle.
 ///
 /// If you add a setting that affects SQL compilation or execution, call
@@ -483,6 +486,10 @@ pub struct Connection {
     pub(super) failure_injector: RwLock<Option<Arc<dyn FailureInjector>>>,
     #[cfg(any(test, injected_yields))]
     pub(super) yield_instance_id_counter: AtomicU64,
+    /// Runs inside `start_root_statement`, right after the new statement is
+    /// counted, so a test can act from within that window.
+    #[cfg(test)]
+    pub(crate) after_counting_root_statement: RwLock<Option<ConnectionTestHook>>,
 
     /// Per-connection view transaction states for uncommitted changes. This represents
     /// one entry per view that was touched in the transaction.
@@ -4886,7 +4893,17 @@ impl Connection {
             ));
         }
         self.n_active_root_statements.fetch_add(1, Ordering::SeqCst);
+        #[cfg(test)]
+        self.run_after_counting_root_statement();
         Ok(())
+    }
+
+    #[cfg(test)]
+    fn run_after_counting_root_statement(&self) {
+        let hook = self.after_counting_root_statement.read().clone();
+        if let Some(hook) = hook {
+            hook(self);
+        }
     }
 
     /// `from_statement` is true when the checkpoint runs inside a root
