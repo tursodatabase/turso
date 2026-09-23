@@ -1,7 +1,7 @@
 use crate::{alloc, turso_assert, turso_assert_eq, Result, Value, ValueRef};
 
 use crate::namespace::NamespaceId;
-use rustc_hash::FxHashMap as HashMap;
+use rustc_hash::{FxHashMap as HashMap, FxHashSet};
 use std::ops::Range;
 use tracing::{instrument, Level};
 use turso_parser::ast::{self, ResolveType, SortOrder, TableInternalId};
@@ -356,7 +356,6 @@ impl ProgramBuilderFlags {
     const ROLLBACK: u16 = 1 << 0;
     const IS_MULTI_WRITE: u16 = 1 << 1;
     const MAY_ABORT: u16 = 1 << 2;
-    const READONLY: u16 = 1 << 3;
     const IS_SUBPROGRAM: u16 = 1 << 4;
     const HAS_STATEMENT_CONFLICT: u16 = 1 << 5;
     const SUPPRESS_CUSTOM_TYPE_DECODE: u16 = 1 << 6;
@@ -368,7 +367,6 @@ impl ProgramBuilderFlags {
         let mut new = Self(0);
         new.set_is_multi_write(true);
         new.set_may_abort(true);
-        new.set_readonly(true);
         new.set_is_subprogram(is_subprogram);
         new.set_is_multi_write(true);
         new.set_may_abort(true);
@@ -422,18 +420,6 @@ impl ProgramBuilderFlags {
     #[inline]
     pub const fn set_may_abort(&mut self, v: bool) {
         self.set(Self::MAY_ABORT, v)
-    }
-
-    #[inline]
-    /// True until the builder emits an opcode that may directly modify persistent
-    /// database contents, mirroring sqlite3_stmt_readonly() classification over
-    /// compiled bytecode.
-    pub const fn readonly(self) -> bool {
-        self.get(Self::READONLY)
-    }
-    #[inline]
-    pub const fn set_readonly(&mut self, v: bool) {
-        self.set(Self::READONLY, v)
     }
 
     #[inline]
@@ -1303,8 +1289,6 @@ impl ProgramBuilder {
     pub fn emit_insn(&mut self, insn: Insn) {
         // This seemingly empty trace here is needed so that a function span is emmited with it
         tracing::trace!("");
-        self.flags
-            .set_readonly(self.flags.readonly() & insn.is_readonly());
         // Any function can raise at runtime; see Self::may_abort.
         if matches!(insn, Insn::Function { .. }) {
             self.emitted_function_call = true;
@@ -2490,6 +2474,7 @@ impl ProgramBuilder {
             && self.flags.is_multi_write()
             && self.may_abort();
 
+        let readonly = is_readonly(&self.insns);
         let prepared = PreparedProgram {
             max_registers: self.next_free_register,
             insns: self.insns,
@@ -2497,7 +2482,7 @@ impl ProgramBuilder {
             explain: self.explain,
             parameters: self.parameters,
             change_cnt_on,
-            readonly: self.flags.readonly(),
+            readonly,
             result_columns: self.result_columns,
             result_column_types: self.result_column_types,
             table_references: self.table_references,
@@ -2532,6 +2517,24 @@ impl ProgramBuilder {
         let prepared = self.build_prepared_program(prepare_context, change_cnt_on, sql)?;
         Ok(Program::from_prepared(Arc::new(prepared), connection))
     }
+}
+
+/// Mirrors sqlite3_stmt_readonly(): true when the program cannot directly modify database
+/// contents. Temporary tables the program opens for itself are not database contents.
+fn is_readonly(insns: &[(Insn, usize)]) -> bool {
+    let ephemeral_cursors: FxHashSet<CursorID> = insns
+        .iter()
+        .filter_map(|(insn, _)| match insn {
+            Insn::OpenEphemeral { cursor_id, .. } | Insn::OpenAutoindex { cursor_id } => {
+                Some(*cursor_id)
+            }
+            Insn::OpenDup { new_cursor_id, .. } => Some(*new_cursor_id),
+            _ => None,
+        })
+        .collect();
+    insns
+        .iter()
+        .all(|(insn, _)| insn.is_readonly(|cursor_id| ephemeral_cursors.contains(&cursor_id)))
 }
 
 pub(crate) trait CursorTypeExt {
