@@ -1665,19 +1665,20 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> CursorTrait
                                 rowid.clone(),
                                 inclusive,
                                 op.eq_only(),
+                                op.eq_only(),
                                 direction,
-                                self.tx_id,
+                                self.snapshot,
                                 &mut self.table_iterator,
                             );
 
                             // Set MVCC peek
                             {
                                 self.dual_peek.mvcc_peek = match mvcc_rowid {
-                                    Some((rid, payload)) => {
+                                    Some((rid, versions, payload)) => {
                                         self.eq_seek_row = payload;
                                         CursorPeek::Row {
                                             key: rid.row_id,
-                                            versions: None,
+                                            versions: Some(versions),
                                         }
                                     }
                                     None => CursorPeek::Exhausted,
@@ -1997,29 +1998,32 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> CursorTrait
                 },
                 inclusive,
                 true,
+                false,
                 IterationDirection::Forwards,
-                self.tx_id,
+                self.snapshot,
                 &mut self.table_iterator,
             );
 
-            let mvcc_exists = if let Some((rowid, _)) = &rowid {
-                let RowKey::Int(rowid) = rowid.row_id else {
-                    panic!("Rowid is not an integer in mvcc table cursor");
-                };
-                rowid == *int_key
-            } else {
-                false
+            let mvcc_versions = match rowid {
+                Some((rowid, versions, _)) => {
+                    let RowKey::Int(rowid) = rowid.row_id else {
+                        panic!("Rowid is not an integer in mvcc table cursor");
+                    };
+                    (rowid == *int_key).then_some(versions)
+                }
+                None => None,
             };
 
             tracing::trace!(
-                "MVCC exists check: mvcc_exists={mvcc_exists} find={int_key} got={rowid:?}"
+                "MVCC exists check: mvcc_exists={} find={int_key}",
+                mvcc_versions.is_some()
             );
 
             // If found in MVCC, update dual_peek and return true
-            if mvcc_exists {
+            if let Some(versions) = mvcc_versions {
                 self.dual_peek.mvcc_peek = CursorPeek::Row {
                     key: RowKey::Int(*int_key),
-                    versions: None,
+                    versions: Some(versions.clone()),
                 };
                 self.current_pos = CursorPosition::Loaded {
                     row_id: RowID {
@@ -2027,7 +2031,7 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> CursorTrait
                         row_id: RowKey::Int(*int_key),
                     },
                     in_btree: false,
-                    versions: None,
+                    versions: Some(versions),
                 };
                 self.state = None;
                 return Ok(IOResult::Done(true));

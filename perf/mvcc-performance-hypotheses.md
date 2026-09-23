@@ -420,6 +420,34 @@ same `Arc` to both cursors.
 
 The scan workloads did not change.
 
+## H19. Table point seeks look up the row they already found — `fixed`
+
+**Where:** Counting skip-map lookups per `point_update_commit` operation
+showed two in `read_from_table_or_index`, called by `current_row` after the
+seek. `seek_rowid` found the row's version chain and then returned only its
+row ID and a copy of its payload, so reading the row looked up the
+transaction and searched `rows` again. `seek_rowid` also looked up the
+transaction to build a snapshot the cursor already holds. The rowid
+uniqueness probe (`exists`) asked for the payload copy and then dropped it.
+
+**Fix:** `seek_rowid` takes the cursor's snapshot and returns the version
+chain, and the cursor position keeps it, as H15 does for index seeks. The
+payload copy stays as the fallback for a chain that passive GC empties before
+the row is read; the uniqueness probe no longer asks for it.
+
+**Callgrind, 200/2,200 iterations:**
+
+| Scenario | Before | After | Change |
+|---|---:|---:|---:|
+| `point_read` | 15,807 | 14,714 | -6.9% |
+| `index_read` | 30,351 | 29,290 | -3.5% |
+| `point_update_rollback` | 34,641 | 33,595 | -3.0% |
+| `point_update_commit` | 38,304 | 37,244 | -2.8% |
+| `delete_commit` | 65,225 | 64,008 | -1.9% |
+
+The checkpointed reads fell by 0.5%, the inserts by 0.2% to 0.3%, and the
+scans did not change.
+
 ## Final measured totals
 
 The branch was rebased after `origin/main` gained unrelated planner work and an

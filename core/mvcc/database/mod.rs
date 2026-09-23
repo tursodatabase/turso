@@ -6230,7 +6230,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
 
     fn find_next_visible_table_row<'a, I>(
         &self,
-        tx: &Transaction<A>,
+        snapshot: MvccReadSnapshot,
         mut rows: I,
         table_id: MVTableId,
         take_payload: bool,
@@ -6238,7 +6238,6 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
     where
         I: Iterator<Item = TableRowEntry<'a, A>>,
     {
-        let snapshot = MvccReadSnapshot::from(tx);
         loop {
             let row = rows.next()?;
             if row.key().table_id != table_id {
@@ -6251,15 +6250,17 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         }
     }
 
-    pub fn seek_rowid(
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn seek_rowid(
         &self,
         start: RowID,
         inclusive: bool,
         eq_only: bool,
+        take_payload: bool,
         direction: IterationDirection,
-        tx_id: TxID,
+        snapshot: MvccReadSnapshot,
         table_iterator: &mut Option<MvccIterator<'static, RowID, A>>,
-    ) -> Option<(RowID, Option<Row>)> {
+    ) -> Option<(RowID, RowVersions<A>, Option<Row>)> {
         let table_id = start.table_id;
         let iter_box = {
             let range = if eq_only {
@@ -6297,14 +6298,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
             .as_mut()
             .expect("table_iterator was assigned above if it was None");
 
-        let tx = self
-            .txs
-            .get(&tx_id)
-            .expect("transaction should exist in txs map");
-        let tx = tx.value();
-
-        self.find_next_visible_table_row(tx, mv_store_iterator, table_id, eq_only)
-            .map(|(row_id, _versions, payload)| (row_id, payload))
+        self.find_next_visible_table_row(snapshot, mv_store_iterator, table_id, take_payload)
     }
 
     #[allow(clippy::too_many_arguments)]
