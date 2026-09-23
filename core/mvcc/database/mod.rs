@@ -60,6 +60,7 @@ use std::ops::Bound;
 use strum::EnumCount;
 use tracing::instrument;
 use tracing::Level;
+use tx_map::TxMap;
 
 pub mod checkpoint_state_machine;
 #[cfg(not(nightly))]
@@ -69,6 +70,7 @@ pub use checkpoint_state_machine::{
 };
 
 mod group_commit;
+mod tx_map;
 pub(crate) use group_commit::{CommitCoordinator, GroupBatch, GroupWork};
 
 #[cfg(feature = "conn_raw_api")]
@@ -156,7 +158,6 @@ impl<A: ConcurrentAllocator> RowVersionAllocator for A {
 pub type RowVersionChain<A = TursoAllocator> = <A as RowVersionAllocator>::RowVersionChain;
 pub type RowVersions<A = TursoAllocator> = Arc<RwLock<RowVersionChain<A>>>;
 type TableRowEntry<'a, A = TursoAllocator> = TreeEntry<'a, RowID, RowVersions<A>, A>;
-type TxEntry<'a, A = TursoAllocator> = Entry<'a, TxID, Transaction<A>, BasicComparator, A>;
 type IndexRowEntry<'a, A = TursoAllocator> =
     TreeEntry<'a, Arc<SortableIndexKey>, RowVersions<A>, A>;
 type IndexRowsEntry<'a, A = TursoAllocator> =
@@ -1682,11 +1683,6 @@ pub struct CommitStateMachine<Clock: LogicalClock, A: ConcurrentAllocator = Turs
     yield_instance_id: u64,
     did_commit_schema_change: bool,
     tx_id: TxID,
-    /// This transaction's entry in `mvcc_store.txs`, taken once in `new` so the
-    /// commit states read the transaction without searching the map. The
-    /// `'static` lifetime is not real; see the SAFETY comment in `new`. Keep
-    /// this field before `mvcc_store`, and never change it after `new`.
-    tx_entry: Option<TxEntry<'static, A>>,
     mvcc_store: Arc<MvStore<Clock, A>>,
     connection: Arc<Connection>,
     /// Database index this commit is for (`MAIN_DB_ID` or an attached-db id).
@@ -1783,23 +1779,6 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CommitStateMachine<Clock, A> {
                 schema_did_change: true
             }
         );
-        // SAFETY: only the lifetime changes. The entry really borrows
-        // `mvcc_store.txs`, and the compiler no longer checks that. It stays
-        // valid because:
-        // - `self.mvcc_store` keeps the store alive, and `tx_entry` is declared
-        //   before it, so it is dropped first. The order matters: dropping the
-        //   last reference to a node reads `txs` to free it. `txs` is private
-        //   and set only when the store is built, so it is never replaced.
-        // - The entry holds a reference count on the node, so `value()` stays
-        //   readable after the commit removes the transaction from `txs`.
-        // - `tx_entry` never changes after this point. `committing_tx` depends
-        //   on that, because its references are tied to the step's store
-        //   borrow, not to `self`. Dropping or replacing `tx_entry` while such
-        //   a reference is alive, or cloning the entry into something that
-        //   outlives `self`, is a use-after-free the compiler will not catch.
-        let tx_entry = mvcc_store.txs.get(&tx_id).map(|entry| unsafe {
-            std::mem::transmute::<TxEntry<'_, A>, TxEntry<'static, A>>(entry)
-        });
         Ok(Self {
             state,
             is_finalized: false,
@@ -1807,7 +1786,6 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CommitStateMachine<Clock, A> {
             yield_instance_id: connection.next_yield_instance_id(),
             did_commit_schema_change: schema_did_change_from_tx,
             tx_id,
-            tx_entry,
             mvcc_store,
             connection,
             db_id,
@@ -1823,17 +1801,12 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CommitStateMachine<Clock, A> {
     }
 
     /// The committing transaction, or `None` if it is not (or no longer) in
-    /// `txs`. The reference is tied to `mvcc_store`, not `self`, so a step can
-    /// assign `self.state` while holding it. That is sound only because
-    /// `tx_entry` never changes after `new`.
-    fn committing_tx<'m>(
-        &self,
-        _mvcc_store: &'m Arc<MvStore<Clock, A>>,
-    ) -> Option<&'m Transaction<A>> {
-        self.tx_entry
-            .as_ref()
-            .filter(|entry| !entry.is_removed())
-            .map(|entry| entry.value())
+    /// `txs`.
+    fn committing_tx(&self, mvcc_store: &MvStore<Clock, A>) -> Option<Arc<Transaction<A>>> {
+        mvcc_store
+            .txs
+            .get(&self.tx_id)
+            .map(|entry| entry.into_value())
     }
 
     fn release_group_claim(&mut self) {
@@ -3346,7 +3319,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> StateTransition for CommitStat
                     if mvcc_store.is_exclusive_tx(&self.tx_id) {
                         mvcc_store.release_exclusive_tx(&self.tx_id);
                     }
-                    mvcc_store.unlock_commit_lock_if_held(tx);
+                    mvcc_store.unlock_commit_lock_if_held(&tx);
                     mvcc_store.finish_committed_tx(self.tx_id, &self.connection, self.db_id);
                     inject_transition_failure!(self, CommitYieldPoint::AfterRemoveTx);
                     self.finalize(mvcc_store)?;
@@ -3365,9 +3338,9 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> StateTransition for CommitStat
 
                 for (id, _chain) in tx.write_set.lock().iter() {
                     if id.row_id.is_int_key() {
-                        self.check_rowid_for_conflicts(id, *end_ts, tx, mvcc_store)?;
+                        self.check_rowid_for_conflicts(id, *end_ts, &tx, mvcc_store)?;
                     } else {
-                        self.check_index_for_conflicts(id, *end_ts, tx, mvcc_store)?;
+                        self.check_index_for_conflicts(id, *end_ts, &tx, mvcc_store)?;
                     }
                 }
 
@@ -3620,7 +3593,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> StateTransition for CommitStat
                 self.commit_coordinator
                     .mark_durable(self.commit_coordinator.written_through());
                 if let Some(tx) = self.committing_tx(mvcc_store) {
-                    mvcc_store.unlock_commit_lock_if_held(tx);
+                    mvcc_store.unlock_commit_lock_if_held(&tx);
                 } else {
                     self.commit_coordinator.unlock_pager_commit_lock();
                 }
@@ -3714,14 +3687,14 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> StateTransition for CommitStat
                 // commit dependencies listed in its CommitDepSet. If it committed, it
                 // decrements the target transaction's CommitDepCounter."
                 // IOW since this txn committed, let's signal waiting transactions.
-                mvcc_store.notify_committed_dependents(tx_unlocked);
+                mvcc_store.notify_committed_dependents(&tx_unlocked);
 
                 let appended_to_log = self.wrote_logical_log;
-                mvcc_store.unlock_commit_lock_if_held(tx_unlocked);
+                mvcc_store.unlock_commit_lock_if_held(&tx_unlocked);
 
                 inject_transition_yield!(self, CommitYieldPoint::BeforeGlobalHeaderUpdate);
 
-                mvcc_store.publish_committed_tx(tx_unlocked, *end_ts);
+                mvcc_store.publish_committed_tx(&tx_unlocked, *end_ts);
                 if self.did_commit_schema_change {
                     mvcc_store
                         .last_committed_schema_change_ts
@@ -4446,7 +4419,7 @@ pub struct MvStore<Clock: LogicalClock, A: ConcurrentAllocator = TursoAllocator>
     /// their next MVCC row again on a mismatch, like index cursors do with
     /// [`Self::index_rows_epoch`].
     table_rows_epoch: AtomicU64,
-    txs: SkipMap<TxID, Transaction<A>, BasicComparator, A>,
+    txs: TxMap<Arc<Transaction<A>>>,
     /// Final state for removed transactions. Readers may still race with stale TxID
     /// references in row versions after a transaction is removed from `txs`.
     finalized_tx_states: SkipMap<TxID, TransactionState, BasicComparator, A>,
@@ -4682,7 +4655,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
             index_rows: SkipMap::new_in(alloc.clone()),
             index_rows_epoch: AtomicU64::new(0),
             table_rows_epoch: AtomicU64::new(0),
-            txs: SkipMap::new_in(alloc.clone()),
+            txs: TxMap::new(),
             finalized_tx_states: SkipMap::new_in(alloc.clone()),
             checkpoint_dirty_table_keys: SkipMap::new_in(alloc.clone()),
             checkpoint_dirty_index_keys: SkipMap::new_in(alloc.clone()),
@@ -6578,14 +6551,14 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                     .expect("global_header initialized above");
                 self.txs.insert(
                     tx_id,
-                    Transaction::new(
+                    Arc::new(Transaction::new(
                         tx_id,
                         ts,
                         header,
                         read_mark,
                         schema_generation,
                         portable_logical_changes,
-                    ),
+                    )),
                 );
             });
             if schema_stale {
@@ -6827,14 +6800,14 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
             }
             self.txs.insert(
                 tx_id,
-                Transaction::new(
+                Arc::new(Transaction::new(
                     tx_id,
                     ts,
                     header,
                     read_mark,
                     schema_generation,
                     portable_logical_changes,
-                ),
+                )),
             );
         });
         if schema_stale || schema_change_unpublished {
@@ -6861,7 +6834,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
 
     #[turso_macros::allocation_site(crate::alloc::MvStoreAllocationSite::TxInsert)]
     fn insert_tx_entry(&self, tx_id: TxID, tx: Transaction<A>) -> Result<(), TryReserveError> {
-        self.txs.try_insert(tx_id, tx)?;
+        self.txs.insert(tx_id, Arc::new(tx));
         Ok(())
     }
 
@@ -9124,7 +9097,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                 return None;
             }
             if let Some(visible_row) =
-                self.find_last_visible_version(MvccReadSnapshot::from(tx), entry, false)
+                self.find_last_visible_version(MvccReadSnapshot::from(tx.as_ref()), entry, false)
             {
                 tracing::trace!("get_last_table_rowid: found visible row: {:?}", visible_row);
                 // There is a visible version for this rowid, so we return it
@@ -9170,7 +9143,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
             .txs
             .get(&tx_id)
             .expect("transaction should exist in txs map");
-        let snapshot = MvccReadSnapshot::from(tx.value());
+        let snapshot = MvccReadSnapshot::from(tx.value().as_ref());
         Ok(self
             .find_next_visible_index_row(snapshot, index_id, iter)
             .map(|(row, _versions)| row.row_id))
@@ -10923,7 +10896,7 @@ pub fn create_seek_range<K: Ord>(
 /// Ref: https://www.cs.cmu.edu/~15721-f24/papers/Hekaton.pdf , page 301,
 /// 2.6. Updating a Version.
 fn is_write_write_conflict<A: ConcurrentAllocator>(
-    txs: &SkipMap<TxID, Transaction<A>, BasicComparator, A>,
+    txs: &TxMap<Arc<Transaction<A>>>,
     finalized_tx_states: &SkipMap<TxID, TransactionState, BasicComparator, A>,
     tx: &Transaction<A>,
     rv: &RowVersion,
@@ -11066,7 +11039,7 @@ impl RowVersion {
     fn is_visible_to<A: ConcurrentAllocator>(
         &self,
         tx: &Transaction<A>,
-        txs: &SkipMap<TxID, Transaction<A>, BasicComparator, A>,
+        txs: &TxMap<Arc<Transaction<A>>>,
         finalized_tx_states: &SkipMap<TxID, TransactionState, BasicComparator, A>,
     ) -> bool {
         is_begin_visible(txs, finalized_tx_states, tx, self)
@@ -11106,7 +11079,7 @@ impl RowVersion {
     fn is_btree_invalidating_version<A: ConcurrentAllocator>(
         &self,
         tx: &Transaction<A>,
-        txs: &SkipMap<TxID, Transaction<A>, BasicComparator, A>,
+        txs: &TxMap<Arc<Transaction<A>>>,
         finalized_tx_states: &SkipMap<TxID, TransactionState, BasicComparator, A>,
     ) -> bool {
         // If the version is fully visible, it invalidates the B-tree
@@ -11168,7 +11141,7 @@ impl RowVersion {
 /// The lock on `commit_dep_set` serializes with the drain in commit/abort
 /// resolution, preventing the race where we push an entry after the drain.
 fn register_commit_dependency<A: ConcurrentAllocator>(
-    txs: &SkipMap<TxID, Transaction<A>, BasicComparator, A>,
+    txs: &TxMap<Arc<Transaction<A>>>,
     dependent_tx: &Transaction<A>,
     depended_on_tx_id: TxID,
 ) {
@@ -11226,7 +11199,7 @@ fn register_commit_dependency<A: ConcurrentAllocator>(
 }
 
 fn lookup_tx_state<A: ConcurrentAllocator>(
-    txs: &SkipMap<TxID, Transaction<A>, BasicComparator, A>,
+    txs: &TxMap<Arc<Transaction<A>>>,
     finalized_tx_states: &SkipMap<TxID, TransactionState, BasicComparator, A>,
     tx_id: TxID,
 ) -> Option<TransactionState> {
@@ -11253,7 +11226,7 @@ fn lookup_finalized_tx_state<A: ConcurrentAllocator>(
 }
 
 fn is_begin_visible<A: ConcurrentAllocator>(
-    txs: &SkipMap<TxID, Transaction<A>, BasicComparator, A>,
+    txs: &TxMap<Arc<Transaction<A>>>,
     finalized_tx_states: &SkipMap<TxID, TransactionState, BasicComparator, A>,
     tx: &Transaction<A>,
     rv: &RowVersion,
@@ -11344,7 +11317,7 @@ fn is_begin_visible<A: ConcurrentAllocator>(
 }
 
 fn is_end_visible<A: ConcurrentAllocator>(
-    txs: &SkipMap<TxID, Transaction<A>, BasicComparator, A>,
+    txs: &TxMap<Arc<Transaction<A>>>,
     finalized_tx_states: &SkipMap<TxID, TransactionState, BasicComparator, A>,
     current_tx: &Transaction<A>,
     row_version: &RowVersion,
