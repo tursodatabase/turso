@@ -50,11 +50,12 @@ def invViolations (n : Nat) (s : Sys) : List String :=
 def label (c : Nat) (pc : Pc) (ch : Choice) : String :=
   s!"tx {c} {repr ch} at {repr pc}"
 
-def successors (v : Variant) (n : Nat) (allowToggle : Bool) (s : Sys) :
+def successors (v : Variant) (n : Nat) (allowToggle errorsOnly : Bool) (s : Sys) :
     List (String × Sys) :=
   let threads := (txIds n).flatMap fun c =>
     [Choice.main, .alt, .fail, .drop].filterMap fun ch =>
-      (next v s c ch).map fun s' => (label c (s.tx c).pc ch, s')
+      if errorsOnly && ch == .drop && !(s.tx c).failed then none
+      else (next v s c ch).map fun s' => (label c (s.tx c).pc ch, s')
   if allowToggle then threads ++ [("toggle group commit", s.withEnabled (!s.enabled))]
   else threads
 
@@ -64,8 +65,8 @@ partial def trace (parents : Std.HashMap Key (Key × String)) (k : Key) (acc : L
   | some (p, l) => trace parents p (l :: acc)
   | none => acc
 
-def explore (v : Variant) (n : Nat) (allowToggle : Bool) (maxStates : Nat) (checkInv : Bool) :
-    IO Unit := do
+def explore (v : Variant) (n : Nat) (allowToggle : Bool) (maxStates : Nat)
+    (checkInv errorsOnly : Bool) : IO Unit := do
   let start := init
   let k0 := keyOf n start
   let mut parents : Std.HashMap Key (Key × String) := {}
@@ -79,7 +80,7 @@ def explore (v : Variant) (n : Nat) (allowToggle : Bool) (maxStates : Nat) (chec
     let mut nextFrontier : Array Sys := #[]
     for s in frontier do
       let ks := keyOf n s
-      for (l, s') in successors v n allowToggle s do
+      for (l, s') in successors v n allowToggle errorsOnly s do
         let k := keyOf n s'
         if !seen.contains k then
           seen := seen.insert k
@@ -97,7 +98,7 @@ def explore (v : Variant) (n : Nat) (allowToggle : Bool) (maxStates : Nat) (chec
               IO.println s!"  final group: {repr s'.g}"
     frontier := nextFrontier
     depth := depth + 1
-  IO.println s!"variant {repr v}, {n} transactions, toggle {allowToggle}: {count} states, depth {depth}, frontier {frontier.size}"
+  IO.println s!"variant {repr v}, {n} transactions, toggle {allowToggle}, errors only {errorsOnly}: {count} states, depth {depth}, frontier {frontier.size}"
   if found.isEmpty then IO.println "no violation found"
 
 def main (args : List String) : IO Unit := do
@@ -106,4 +107,4 @@ def main (args : List String) : IO Unit := do
   let toggle := args.contains "toggle"
   let maxStates := (args.find? (·.startsWith "max=")).bind (fun a => (a.drop 4).toNat?)
     |>.getD 5000000
-  explore v n toggle maxStates (args.contains "inv")
+  explore v n toggle maxStates (args.contains "inv") (args.contains "errorsonly")

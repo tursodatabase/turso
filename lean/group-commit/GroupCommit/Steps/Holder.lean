@@ -358,18 +358,18 @@ theorem holder_drop_pc {s : Sys} {c : Nat} {b : Batch} (hs : Inv s) (hl : s.lead
 /-- The statement of the leader is dropped. -/
 theorem step_holder_drop {s : Sys} {c : Nat} {b : Batch} (hs : Inv s)
     (hl : s.lead = some (c, b)) (hdp : (s.tx c).pc.dropPoint = true) :
-    Inv (s.set c { s.tx c with dropFrom := (s.tx c).pc, pc := .dR1 }) := by
+    Inv (s.set c { s.tx c with dropFrom := (s.tx c).pc, pc := .dR1, failed := false }) := by
   have hc := hs.status c
   have hlc := hs.log c
   have hlo := leadOf_of_lead hs hl
   have hp := holder_drop_pc hs hl hdp
-  have hwu : ({ s.tx c with dropFrom := (s.tx c).pc, pc := .dR1 } : TxRec).writingUnissued =
+  have hwu : ({ s.tx c with dropFrom := (s.tx c).pc, pc := .dR1, failed := false } : TxRec).writingUnissued =
       (s.tx c).writingUnissued := by
     rcases hp with h | h | h | h <;> simp [TxRec.writingUnissued, h]
-  have hiss : ({ s.tx c with dropFrom := (s.tx c).pc, pc := .dR1 } : TxRec).issuing =
+  have hiss : ({ s.tx c with dropFrom := (s.tx c).pc, pc := .dR1, failed := false } : TxRec).issuing =
       (s.tx c).issuing := by
     rcases hp with h | h | h | h <;> simp [TxRec.issuing, h]
-  have hsl : (({ s.tx c with dropFrom := (s.tx c).pc, pc := .dR1 } : TxRec).issuing ||
+  have hsl : (({ s.tx c with dropFrom := (s.tx c).pc, pc := .dR1, failed := false } : TxRec).issuing ||
       Pc.dR1 == .own2 || Pc.dR1 == .own3) =
       ((s.tx c).issuing || (s.tx c).pc == .own2 || (s.tx c).pc == .own3) := by
     rcases hp with h | h | h | h <;> simp [TxRec.issuing, h, Pc.beq_eq]

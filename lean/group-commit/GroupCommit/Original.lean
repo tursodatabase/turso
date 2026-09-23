@@ -6,6 +6,9 @@ import GroupCommit.Check
 Each theorem replays a trace that the explorer found for `Variant.original`, and shows
 that the last state breaks a safety property. The kernel runs the model to check each
 trace. Only transactions `0` and `1` take steps, so the other transactions stay idle.
+
+In the traces of the last two theorems, no caller drops a statement. A commit stops
+early only after an I/O error.
 -/
 
 namespace GroupCommit
@@ -95,5 +98,89 @@ theorem original_skips_notify :
     (by decide) (by decide)
   refine ⟨s, hs, 0, ?_⟩
   simpa [and_assoc] using hp
+
+/-- Reachable states of a system where only transactions `0, …, n - 1` take steps, and
+where a commit stops early only after an I/O error. No caller drops a statement. -/
+inductive ReachableErrorsOnly (v : Variant) (n : Nat) : Sys → Prop where
+  | init : ReachableErrorsOnly v n init
+  | step {s s' : Sys} {c : Nat} {ch : Choice} :
+      ReachableErrorsOnly v n s → c < n → (ch = .drop → (s.tx c).failed = true) →
+      next v s c ch = some s' → ReachableErrorsOnly v n s'
+
+/-- Run the thread steps of a list in order. The run stops at a drop of a thread that did
+not fail. -/
+def runErrorsOnly (v : Variant) : Sys → List (Nat × Choice) → Option Sys
+  | s, [] => some s
+  | s, (c, ch) :: rest =>
+    if ch = .drop ∧ (s.tx c).failed = false then none
+    else (next v s c ch).bind (runErrorsOnly v · rest)
+
+theorem runErrorsOnly_reachable {v : Variant} {n : Nat} :
+    ∀ {s s' : Sys} {l : List (Nat × Choice)}, ReachableErrorsOnly v n s →
+      (∀ p ∈ l, p.1 < n) → runErrorsOnly v s l = some s' → ReachableErrorsOnly v n s'
+  | s, s', [], hs, _, h => by simp [runErrorsOnly] at h; subst h; exact hs
+  | s, s', (c, ch) :: rest, hs, hl, h => by
+    simp only [runErrorsOnly] at h
+    by_cases hd : ch = .drop ∧ (s.tx c).failed = false
+    · simp [hd] at h
+    · simp only [hd, ↓reduceIte] at h
+      cases hn : next v s c ch with
+      | none => simp [hn] at h
+      | some s1 =>
+        simp only [hn, Option.bind_some] at h
+        refine runErrorsOnly_reachable
+          (ReachableErrorsOnly.step hs (hl (c, ch) (by simp)) ?_ hn)
+          (fun p hp => hl p (by simp [hp])) h
+        intro hch
+        cases hf : (s.tx c).failed
+        · exact absurd ⟨hch, hf⟩ hd
+        · rfl
+
+theorem reach_of_runErrorsOnly {v : Variant} {n : Nat} {l : List (Nat × Choice)}
+    {p : Sys → Bool} (hl : ∀ q ∈ l, q.1 < n) (h : (runErrorsOnly v init l).map p = some true) :
+    ∃ s, ReachableErrorsOnly v n s ∧ p s = true := by
+  cases hr : runErrorsOnly v init l with
+  | none => simp [hr] at h
+  | some s =>
+    simp only [hr, Option.map_some, Option.some.injEq] at h
+    exact ⟨s, runErrorsOnly_reachable ReachableErrorsOnly.init hl hr, h⟩
+
+/-- Bug B after one I/O error. The leader gets an error when it writes the record of
+transaction `0`. Its cleanup puts its own record back in the queue, and then rolls back
+its transaction. The next leader writes this record. -/
+def traceErrorRolledBack : List (Nat × Choice) :=
+  [(0, .main), (0, .main), (1, .main), (1, .main), (1, .alt), (1, .main), (1, .main),
+   (1, .main), (1, .main), (1, .main), (1, .fail), (1, .drop), (1, .main), (1, .main),
+   (1, .main), (1, .main), (0, .alt), (0, .main), (0, .alt), (1, .main), (1, .main),
+   (1, .main), (1, .main), (1, .main), (0, .main), (0, .main), (0, .main), (0, .main),
+   (0, .main), (0, .main), (0, .main)]
+
+/-- Bug D after two I/O errors. The second leader gets an error when it writes the record
+of the rolled-back transaction, and asks this transaction to retry. The retry hole stays
+with no owner. -/
+def traceErrorHole : List (Nat × Choice) :=
+  [(0, .main), (0, .main), (1, .main), (1, .main), (1, .alt), (1, .main), (1, .main),
+   (1, .main), (1, .main), (1, .main), (1, .fail), (1, .drop), (1, .main), (1, .main),
+   (1, .main), (1, .main), (0, .alt), (0, .main), (0, .alt), (1, .main), (1, .main),
+   (1, .main), (1, .main), (1, .main), (0, .main), (0, .main), (0, .main), (0, .main),
+   (0, .main), (0, .fail), (0, .drop), (0, .main), (0, .main), (0, .main), (0, .main)]
+
+theorem original_io_error_logs_rolled_back_tx :
+    ∃ s, ReachableErrorsOnly .original 2 s ∧ ∃ r ∈ s.log, (s.tx r.tx).rolledBack = true := by
+  obtain ⟨s, hs, hp⟩ := reach_of_runErrorsOnly (v := .original) (n := 2)
+    (l := traceErrorRolledBack) (p := fun s => s.log.any fun r => (s.tx r.tx).rolledBack)
+    (by decide) (by decide)
+  exact ⟨s, hs, by simpa using hp⟩
+
+theorem original_io_errors_leave_hole_without_owner :
+    ∃ s, ReachableErrorsOnly .original 2 s ∧
+      ∃ t ∈ s.g.retry, ∀ c < 2, ownsHole (s.tx c) t = false := by
+  obtain ⟨s, hs, hp⟩ := reach_of_runErrorsOnly (v := .original) (n := 2) (l := traceErrorHole)
+    (p := fun s => s.g.retry.any fun t => (List.range 2).all fun c => !ownsHole (s.tx c) t)
+    (by decide) (by decide)
+  refine ⟨s, hs, ?_⟩
+  simp only [List.any_eq_true, List.all_eq_true, List.mem_range, Bool.not_eq_eq_eq_not,
+    Bool.not_true] at hp
+  exact hp
 
 end GroupCommit

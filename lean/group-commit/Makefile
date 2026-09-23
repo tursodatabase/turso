@@ -9,6 +9,7 @@ check:
 explore:
 	$(LAKE) build explore
 	$(EXPLORE) original n=2 toggle
+	$(EXPLORE) original n=2 toggle errorsonly
 	$(EXPLORE) fixed n=2 toggle inv
 	$(EXPLORE) fixed n=3 inv max=20000000
 

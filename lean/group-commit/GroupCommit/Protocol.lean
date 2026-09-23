@@ -5,8 +5,9 @@ import GroupCommit.Coordinator
 
 This file models the group commit part of `CommitStateMachine` in
 `core/mvcc/database/mod.rs`, from `BeginCommitLogicalLog` to
-`FinalizeCommit`, and the cleanup that runs when a commit statement is
-dropped (`cleanup_unfinished_commit`).
+`FinalizeCommit`, and the cleanup that runs when a commit does not finish
+(`cleanup_unfinished_commit`): the statement is dropped, or a step returns an
+error.
 
 Each transaction has one committer thread. A thread does one atomic step at a
 time, and steps of different threads interleave in all orders. One atomic
@@ -237,7 +238,9 @@ end Sys
 
 /-- Which alternative a step takes. `main` is the usual result. `alt` is the
 other result of a check whose result the model does not fix. `fail` is an
-I/O error. `drop` starts the cleanup of a dropped statement. -/
+I/O error. `drop` starts the cleanup of a commit that did not finish: the
+statement was dropped, or a step returned an error. After `fail`, `drop` is the
+only next step of the thread. -/
 inductive Choice where
   | main
   | alt
@@ -461,7 +464,8 @@ def step (v : Variant) (s : Sys) (c : Nat) (ch : Choice) : Option Sys :=
 def next (v : Variant) (s : Sys) (c : Nat) (ch : Choice) : Option Sys :=
   let r := s.tx c
   if ch = .drop then
-    if r.pc.dropPoint then some (s.set c { r with dropFrom := r.pc, pc := .dR1 }) else none
+    if r.pc.dropPoint then some (s.set c { r with dropFrom := r.pc, pc := .dR1, failed := false })
+    else none
   else if r.failed then none
   else step v s c ch
 

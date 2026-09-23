@@ -439,17 +439,17 @@ theorem dropPoint_facts {p : Pc} (h : p.dropPoint = true) :
 /-- A statement is dropped: the cleanup starts. The thread does not hold the batch. -/
 theorem step_drop_nobatch {s : Sys} {c : Nat} (hs : Inv s) (hdp : (s.tx c).pc.dropPoint = true)
     (hnb : s.batchOf c = none) :
-    Inv (s.set c { s.tx c with dropFrom := (s.tx c).pc, pc := .dR1 }) := by
+    Inv (s.set c { s.tx c with dropFrom := (s.tx c).pc, pc := .dR1, failed := false }) := by
   have hc := status_of (c := c) hs
   obtain ⟨ha, hl, hd, hb, hwt, _, _⟩ := dropPoint_facts hdp
   have hnh := notHolder_of_batchOf hnb
   have hto : (s.tx c).ticket = (s.tx c).pc.ticket := by
     cases hp : (s.tx c).pc <;>
       simp_all [TxRec.ticket, Pc.dropPoint, Pc.waitTicket, Pc.beforeLeave, Pc.ticket]
-  have htn : ({ s.tx c with dropFrom := (s.tx c).pc, pc := .dR1 } : TxRec).ticket =
+  have htn : ({ s.tx c with dropFrom := (s.tx c).pc, pc := .dR1, failed := false } : TxRec).ticket =
       (s.tx c).pc.ticket := by
     simp [TxRec.ticket, Pc.waitTicket, Pc.beforeLeave]
-  have hobs : (s.tx c).obs = ({ s.tx c with dropFrom := (s.tx c).pc, pc := .dR1 } : TxRec).obs := by
+  have hobs : (s.tx c).obs = ({ s.tx c with dropFrom := (s.tx c).pc, pc := .dR1, failed := false } : TxRec).obs := by
     have e1 : ((s.tx c).pc == Pc.dLeave) = false := by simpa using hl
     have e3 : ((s.tx c).pc == Pc.dropped) = false := by simpa using hd
     simp only [TxRec.obs, hto, htn]
