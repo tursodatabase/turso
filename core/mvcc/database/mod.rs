@@ -205,13 +205,10 @@ impl SortableIndexKey {
         metadata: Arc<IndexInfo>,
         alloc: A,
     ) -> Result<Self, TryReserveError> {
-        #[cfg(nightly)]
-        let alloc = DynAllocator::new(alloc);
         Ok(Self {
-            key: ImmutableRecordRef::from_shared_record(crate::alloc::try_arc_slice_from_slice_in(
-                payload.as_ref(),
-                alloc,
-            )?),
+            key: ImmutableRecordRef::from_shared_record(
+                crate::alloc::try_dyn_arc_slice_from_slice_in(payload.as_ref(), alloc)?,
+            ),
             metadata,
         })
     }
@@ -380,11 +377,9 @@ impl Row {
         column_count: usize,
         alloc: A,
     ) -> Result<Self, TryReserveError> {
-        #[cfg(nightly)]
-        let alloc = DynAllocator::new(alloc);
         Ok(Self {
             id,
-            data: Some(crate::alloc::try_arc_slice_from_slice_in(data, alloc)?),
+            data: Some(crate::alloc::try_dyn_arc_slice_from_slice_in(data, alloc)?),
             column_count,
         })
     }

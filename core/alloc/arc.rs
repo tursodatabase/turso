@@ -6,4 +6,7 @@ mod imp;
 #[path = "arc/stable.rs"]
 mod imp;
 
-pub use imp::{try_arc_slice_from_slice, try_arc_slice_from_slice_in, ArcSlice, SharedBytes};
+pub use imp::{
+    try_arc_slice_from_slice, try_arc_slice_from_slice_in, try_dyn_arc_slice_from_slice_in,
+    ArcSlice, SharedBytes,
+};

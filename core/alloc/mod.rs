@@ -21,7 +21,10 @@ pub use allocation_site::{
 /// stable, `std::alloc::Allocator` on `--cfg nightly` builds.
 pub use api::ApiAllocator;
 pub use api::{AllocError, Global, Layout};
-pub use arc::{try_arc_slice_from_slice, try_arc_slice_from_slice_in, ArcSlice, SharedBytes};
+pub use arc::{
+    try_arc_slice_from_slice, try_arc_slice_from_slice_in, try_dyn_arc_slice_from_slice_in,
+    ArcSlice, SharedBytes,
+};
 pub use backend::{set_allocator, SetAllocatorError, TursoAllocBackend};
 pub(crate) use collections::impl_try_clone_via_clone;
 #[cfg(nightly)]

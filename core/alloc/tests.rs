@@ -112,6 +112,29 @@ fn dyn_allocator_delegates_skiplist_allocations() {
     assert!(allocations.load(Ordering::Relaxed) > 0);
 }
 
+#[test]
+fn dyn_arc_slice_uses_allocator_until_last_clone_drops() {
+    let allocations = StdArc::new(AtomicUsize::new(0));
+    let deallocations = StdArc::new(AtomicUsize::new(0));
+    let data: ArcSlice<u8> = try_dyn_arc_slice_from_slice_in(
+        b"allocator",
+        CountingAlloc {
+            allocations: allocations.clone(),
+            deallocations: deallocations.clone(),
+        },
+    )
+    .unwrap();
+    let expected_allocations = usize::from(cfg!(nightly));
+    assert_eq!(allocations.load(Ordering::Relaxed), expected_allocations);
+    let clone = data.clone();
+    assert_eq!(data.as_ptr(), clone.as_ptr());
+    drop(data);
+    assert_eq!(&*clone, b"allocator");
+    assert_eq!(deallocations.load(Ordering::Relaxed), 0);
+    drop(clone);
+    assert_eq!(deallocations.load(Ordering::Relaxed), expected_allocations);
+}
+
 #[cfg(nightly)]
 #[test]
 fn arc_slice_preserves_concrete_allocator_until_last_clone_drops() {

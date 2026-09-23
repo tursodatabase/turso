@@ -6,6 +6,13 @@ pub fn try_arc_slice_from_slice<T: Clone>(slice: &[T]) -> Result<ArcSlice<T>, Tr
     try_arc_slice_from_slice_in(slice, DynAllocator::default())
 }
 
+pub fn try_dyn_arc_slice_from_slice_in<T: Clone, A: ConcurrentAllocator>(
+    slice: &[T],
+    alloc: A,
+) -> Result<ArcSlice<T>, TryReserveError> {
+    try_arc_slice_from_slice_in(slice, DynAllocator::new(alloc))
+}
+
 pub fn try_arc_slice_from_slice_in<T: Clone, A: ConcurrentAllocator>(
     slice: &[T],
     alloc: A,

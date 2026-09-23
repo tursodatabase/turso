@@ -1,5 +1,7 @@
 use crate::alloc::TryReserveError;
 
+pub use try_arc_slice_from_slice_in as try_dyn_arc_slice_from_slice_in;
+
 pub type ArcSlice<T> = crate::sync::Arc<[T]>;
 
 pub fn try_arc_slice_from_slice<T: Clone>(slice: &[T]) -> Result<ArcSlice<T>, TryReserveError> {
