@@ -5721,8 +5721,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                         return Ok(false);
                     };
                     // Get the Arc key from the map entry for savepoint tracking
-                    let arc_key = row_versions_entry.key().clone();
-                    let row_versions = row_versions_entry.value().clone();
+                    let (arc_key, row_versions) = row_versions_entry.into_key_value();
                     let mut locked_row_versions = row_versions.write();
                     if !self.index_versions_still_mapped(rows, &arc_key, &row_versions) {
                         continue;
@@ -5770,7 +5769,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
             }
             None => loop {
                 let row_versions = if let Some(entry) = self.rows.get(&id) {
-                    entry.value().clone()
+                    entry.into_value()
                 } else if btree_record.is_some() {
                     self.get_or_create_table_row_versions(id.clone())?
                 } else {
@@ -6043,7 +6042,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
 
             // We found a row, let's check if it's visible to the transaction.
             if let Some((row_id, versions, _)) =
-                self.find_last_visible_version(snapshot, &row, false)
+                self.find_last_visible_version(snapshot, row, false)
             {
                 return Some((row_id, versions));
             }
@@ -6255,12 +6254,11 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
     fn find_last_visible_version(
         &self,
         snapshot: MvccReadSnapshot,
-        row: &TableRowEntry<'_, A>,
+        row: TableRowEntry<'_, A>,
         take_payload: bool,
     ) -> Option<(RowID, RowVersions<A>, Option<Row>)> {
-        let versions_arc = row.value();
         let payload = {
-            let versions = versions_arc.read();
+            let versions = row.value().read();
             if self.btree_covers_chain_for_snapshot(snapshot, row.key().table_id, &versions) {
                 return None;
             }
@@ -6269,7 +6267,8 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                 .expect("transaction should exist while its cursor is active")?;
             take_payload.then(|| occupying.row(row.key()))
         };
-        Some((row.key().clone(), versions_arc.clone(), payload))
+        let (row_id, versions) = row.into_key_value();
+        Some((row_id, versions, payload))
     }
 
     fn find_last_visible_index_version(
@@ -6321,8 +6320,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
             if row.key().table_id != table_id {
                 return None;
             }
-            if let Some(visible_row) = self.find_last_visible_version(snapshot, &row, take_payload)
-            {
+            if let Some(visible_row) = self.find_last_visible_version(snapshot, row, take_payload) {
                 return Some(visible_row);
             }
         }
@@ -8822,7 +8820,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                 A,
             >>::new_in(alloc)))
         })?;
-        Ok(versions.value().clone())
+        Ok(versions.into_value())
     }
 
     /// Gets an existing Arc<SortableIndexKey> from the index if the key exists,
@@ -8854,8 +8852,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
             let entry = self.get_or_create_index_key_entry(index, key.clone())?;
             // SkipMap may keep our Arc (miss) or a pre-existing one (hit); return that
             // canonical Arc so savepoint tracking and the map stay in sync.
-            let canonical_key = entry.key().clone();
-            let row_versions = entry.value().clone();
+            let (canonical_key, row_versions) = entry.into_key_value();
             let mut versions = row_versions.write();
             if !self.index_versions_still_mapped(index, canonical_key.as_ref(), &row_versions) {
                 continue;
@@ -9126,16 +9123,13 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                 tracing::trace!("get_last_table_rowid: reached end of table");
                 return None;
             }
-            if let Some(_visible_row) =
-                self.find_last_visible_version(MvccReadSnapshot::from(tx), &entry, false)
+            if let Some(visible_row) =
+                self.find_last_visible_version(MvccReadSnapshot::from(tx), entry, false)
             {
-                tracing::trace!(
-                    "get_last_table_rowid: found visible row: {:?}",
-                    _visible_row
-                );
+                tracing::trace!("get_last_table_rowid: found visible row: {:?}", visible_row);
                 // There is a visible version for this rowid, so we return it
-                return Some(RowKey::Int(match &entry.key().row_id {
-                    RowKey::Int(i) => *i,
+                return Some(RowKey::Int(match visible_row.0.row_id {
+                    RowKey::Int(i) => i,
                     _ => panic!("Expected RowKey::Int for table rowid"),
                 }));
             }
