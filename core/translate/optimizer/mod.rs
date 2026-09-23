@@ -234,6 +234,54 @@ struct IndexMethodPatternMatch {
     pattern_columns: Vec<ast::ResultColumn>,
 }
 
+pub(crate) fn plan_index_method_predicate<'a>(
+    term: &WhereTerm,
+    table_references: &'a TableReferences,
+    resolver: &Resolver,
+) -> Option<(&'a JoinedTable, IndexMethodQuery)> {
+    let available_indexes = AvailableIndexes::for_table_references(resolver, table_references);
+    for table in table_references.joined_tables() {
+        let Some(indexes) = available_indexes.indexes_for_table(table.internal_id) else {
+            continue;
+        };
+        for index in indexes {
+            let Some(module) = &index.index_method else {
+                continue;
+            };
+            if index.is_backing_btree_index() {
+                continue;
+            }
+            for (pattern_idx, pattern) in module.definition().patterns.iter().enumerate() {
+                let Some(matched) = try_match_index_method_pattern(
+                    pattern,
+                    table,
+                    std::slice::from_ref(term),
+                    &[],
+                    &None,
+                    &None,
+                    pattern_idx,
+                    true,
+                ) else {
+                    continue;
+                };
+                if matched.where_covered.is_none() {
+                    continue;
+                }
+                return Some((
+                    table,
+                    IndexMethodQuery {
+                        index: index.clone(),
+                        pattern_idx,
+                        arguments: sorted_arguments_from_parameters(&matched.parameters),
+                        covered_columns: HashMap::default(),
+                    },
+                ));
+            }
+        }
+    }
+    None
+}
+
 /// Try to match an index method pattern against a query's clauses.
 #[allow(clippy::too_many_arguments)]
 fn try_match_index_method_pattern(

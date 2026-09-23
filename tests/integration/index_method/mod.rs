@@ -3360,7 +3360,7 @@ fn fts_argument_dependencies_own_row(tmp_db: TempDatabase) {
             &conn,
             &format!("EXPLAIN QUERY PLAN SELECT id FROM d WHERE fts_match(body, {argument})"),
         );
-        assert_that!(plan).has_no_step_containing("INDEX METHOD");
+        assert_that!(plan).has_step_containing("QUERY INDEX METHOD fts");
     }
 }
 
@@ -3382,7 +3382,141 @@ fn fts_argument_dependencies_later_table(tmp_db: TempDatabase) {
         ]
     );
     let plan = limbo_exec_rows(&conn, &format!("EXPLAIN QUERY PLAN {query}"));
-    assert_that!(plan).has_no_step_containing("INDEX METHOD");
+    assert_that!(plan).has_step_containing("QUERY INDEX METHOD fts");
+}
+
+#[cfg(all(feature = "fts", not(target_family = "wasm")))]
+#[turso_macros::test(mvcc)]
+fn fts_argument_dependencies_indexed_predicate(tmp_db: TempDatabase) {
+    let conn = tmp_db.connect_limbo();
+    for sql in [
+        "CREATE TABLE d(id INTEGER PRIMARY KEY, body, term)",
+        "CREATE INDEX fx ON d USING fts(body)",
+        "CREATE INDEX source ON d(body, term)",
+        "INSERT INTO d VALUES
+         (1, 'database', 'sql'),
+         (2, 'sql', 'sql'),
+         (3, 'database sql', 'database NOT sql'),
+         (4, 'database', 'database NOT sql'),
+         (5, 'database sql', 'database AND sql'),
+         (6, 'nothing', 'database'),
+         (7, NULL, 'database'),
+         (8, 'database', NULL)",
+    ] {
+        conn.execute(sql).unwrap();
+    }
+    for source in ["d", "d INDEXED BY source"] {
+        let query = format!("SELECT id FROM {source} WHERE fts_match(body, term) ORDER BY id");
+        assert_eq!(
+            limbo_exec_rows(&conn, &query),
+            vec![row![2], row![4], row![5]]
+        );
+        assert_fts_indexed_predicate(&conn, &query);
+    }
+    let query = "SELECT id FROM d WHERE fts_match(body, (SELECT term)) ORDER BY id";
+    assert_eq!(
+        limbo_exec_rows(&conn, query),
+        vec![row![2], row![4], row![5]]
+    );
+    assert_fts_indexed_predicate(&conn, query);
+    let query = "SELECT id FROM d WHERE fts_match(body, term) ORDER BY id DESC LIMIT 1 OFFSET 1";
+    assert_eq!(limbo_exec_rows(&conn, query), vec![row![4]]);
+    assert_fts_indexed_predicate(&conn, query);
+    let query = "SELECT id FROM d WHERE id = 3 AND fts_match(body, term)";
+    assert!(limbo_exec_rows(&conn, query).is_empty());
+    assert_fts_indexed_predicate(&conn, query);
+
+    conn.execute("INSERT INTO d VALUES(9, 'database NOT sql', 'unused')")
+        .unwrap();
+    let query = "SELECT id FROM d WHERE id = 9 AND fts_match(body, body)";
+    assert!(limbo_exec_rows(&conn, query).is_empty());
+    assert_fts_indexed_predicate(&conn, query);
+
+    let query = "SELECT id FROM d WHERE fts_match(body, 'database')
+                 AND fts_match(body, term) ORDER BY id";
+    assert_eq!(limbo_exec_rows(&conn, query), vec![row![4], row![5]]);
+    assert_fts_indexed_predicate(&conn, query);
+
+    conn.execute("CREATE TABLE q(id)").unwrap();
+    conn.execute("INSERT INTO q VALUES(3), (4), (10)").unwrap();
+    let query = "SELECT q.id, d.id FROM q LEFT JOIN d
+                 ON d.id = q.id AND fts_match(d.body, d.term) ORDER BY q.id";
+    assert_eq!(
+        limbo_exec_rows(&conn, query),
+        vec![row![3, NULL], row![4, 4], row![10, NULL]]
+    );
+    assert_fts_indexed_predicate(&conn, query);
+
+    conn.execute("BEGIN").unwrap();
+    conn.execute("UPDATE d SET body = 'changed' WHERE fts_match(body, term)")
+        .unwrap();
+    assert_eq!(
+        limbo_exec_rows(&conn, "SELECT id FROM d WHERE body = 'changed' ORDER BY id"),
+        vec![row![2], row![4], row![5]]
+    );
+    conn.execute("ROLLBACK").unwrap();
+    conn.execute("BEGIN").unwrap();
+    conn.execute("DELETE FROM d WHERE fts_match(body, term)")
+        .unwrap();
+    assert_eq!(
+        limbo_exec_rows(&conn, "SELECT id FROM d ORDER BY id"),
+        vec![row![1], row![3], row![6], row![7], row![8], row![9]]
+    );
+    conn.execute("ROLLBACK").unwrap();
+}
+
+#[cfg(all(feature = "fts", not(target_family = "wasm")))]
+#[turso_macros::test]
+fn fts_argument_dependencies_hash_join(tmp_db: TempDatabase) {
+    let conn = tmp_db.connect_limbo();
+    for sql in [
+        "CREATE TABLE d(id INTEGER PRIMARY KEY, body, term)",
+        "CREATE INDEX fx ON d USING fts(body)",
+        "INSERT INTO d VALUES
+         (41, 'database sql', 'database NOT sql'),
+         (62, 'database', 'database NOT sql'),
+         (83, 'sql', 'sql')",
+        "CREATE TABLE q(term)",
+        "INSERT INTO q VALUES('database NOT sql'), ('missing')",
+    ] {
+        conn.execute(sql).unwrap();
+    }
+    for join in ["JOIN", "FULL JOIN"] {
+        let query = format!(
+            "SELECT d.body, q.term FROM d {join} q ON d.term = q.term
+                             WHERE fts_match(d.body, d.term) ORDER BY d.body"
+        );
+        let expected = if join == "JOIN" {
+            vec![row!["database", "database NOT sql"]]
+        } else {
+            vec![row!["database", "database NOT sql"], row!["sql", NULL]]
+        };
+        assert_eq!(limbo_exec_rows(&conn, &query), expected);
+        assert_that!(limbo_exec_rows(
+            &conn,
+            &format!("EXPLAIN QUERY PLAN {query}")
+        ))
+        .has_step_containing("HASH JOIN");
+        assert_fts_indexed_predicate(&conn, &query);
+    }
+}
+
+#[cfg(all(feature = "fts", not(target_family = "wasm")))]
+fn assert_fts_indexed_predicate(conn: &Arc<turso_core::Connection>, query: &str) {
+    let bytecode = limbo_exec_rows(conn, &format!("EXPLAIN {query}"));
+    assert!(
+        bytecode
+            .iter()
+            .any(|row| row[1] == rusqlite::types::Value::Text("IndexMethodQuery".into())),
+        "{bytecode:?}"
+    );
+    assert!(
+        !bytecode.iter().any(
+            |row| row[1] == rusqlite::types::Value::Text("Function".into())
+                && row[5] == rusqlite::types::Value::Text("fts_match".into())
+        ),
+        "{bytecode:?}"
+    );
 }
 
 #[cfg(all(feature = "fts", not(target_family = "wasm")))]

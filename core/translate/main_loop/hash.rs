@@ -328,23 +328,13 @@ impl<'a, 'plan> PreparedHashBuild<'a, 'plan> {
             config.uses_materialized_keys_and_payload,
         )? {
             let cond = &planner.predicates[cond_idx];
-            let jump_target_when_true = planner.program.allocate_label();
-            let condition_metadata = ConditionMetadata {
-                jump_if_condition_is_true: false,
-                jump_target_when_true,
-                jump_target_when_false: skip_to_next,
-                jump_target_when_null: skip_to_next,
-            };
-            translate_condition_expr(
+            super::conditions::emit_where_term(
                 planner.program,
                 planner.table_references,
-                &cond.expr,
-                condition_metadata,
+                cond,
+                skip_to_next,
                 &planner.t_ctx.resolver,
             )?;
-            planner
-                .program
-                .preassign_label_to_next_insn(jump_target_when_true);
         }
 
         if config.uses_materialized_keys_and_payload {
