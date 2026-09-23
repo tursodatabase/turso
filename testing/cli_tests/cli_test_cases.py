@@ -544,17 +544,37 @@ def test_blob_bytes_are_printed_raw_in_list_mode():
     )
 
 
-def test_ctrl_c_interrupts_a_running_query():
-    # A non-terminating query must be abandonable from the keyboard, the way it is in the
-    # sqlite3 shell. tursodb installs a SIGINT handler, which suppresses the default kill, so
-    # if that handler does not reach the running statement the shell becomes unrecoverable.
-    exec_name = os.environ.get("SQLITE_EXEC", "./scripts/limbo-sqlite3")
+RUNAWAY_READ = "WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM c) SELECT count(*) FROM c;"
 
-    console.test("Running test: ctrl-c-interrupts-a-running-query")
+
+def test_ctrl_c_exits_the_shell_while_a_statement_runs():
+    # A statement stopped part-way can leave the connection inconsistent, so Ctrl-C exits
+    # instead of returning to the prompt. The status matches a process killed by SIGINT.
+    console.test("Running test: ctrl-c-exits-the-shell-while-a-statement-runs")
+    returncode, output = send_ctrl_c_to_shell(
+        setup="", running=RUNAWAY_READ, after="SELECT 42;\n.quit\n"
+    )
+    assert returncode == 130, f"expected exit status 130, got {returncode}; output {output!r}"
+    assert b"Interrupted; exiting" in output, f"expected the exit message, got {output!r}"
+    assert b"42" not in output, f"the shell must not run input after the interrupt, got {output!r}"
+
+
+def test_ctrl_c_at_the_prompt_keeps_the_shell_running():
+    console.test("Running test: ctrl-c-at-the-prompt-keeps-the-shell-running")
+    returncode, output = send_ctrl_c_to_shell(setup="", running="", after="SELECT 42;\n.quit\n")
+    assert returncode == 0, f"expected exit status 0, got {returncode}; output {output!r}"
+    assert b"42" in output, f"expected the shell to answer after Ctrl-C at the prompt, got {output!r}"
+
+
+def send_ctrl_c_to_shell(setup, running, after):
+    """Runs `setup`, starts `running`, sends SIGINT while it runs, then sends `after`.
+
+    Returns the exit status and the combined stdout and stderr.
+    """
+    exec_name = os.environ.get("SQLITE_EXEC", "./scripts/limbo-sqlite3")
     # SQLITE_EXEC may be the tursodb binary or the scripts/limbo-sqlite3 wrapper, which runs
-    # tursodb as a bash child. Give the whole thing its own process group and signal the group,
-    # so the interrupt reaches tursodb under either invocation, and so a regression can be
-    # cleaned up wholesale instead of leaving the runaway query spinning.
+    # tursodb as a bash child. Signal the process group so SIGINT reaches tursodb either way,
+    # and so a runaway statement can be killed on the way out.
     proc = subprocess.Popen(
         [exec_name, ":memory:"],
         stdin=subprocess.PIPE,
@@ -564,32 +584,37 @@ def test_ctrl_c_interrupts_a_running_query():
         start_new_session=True,
     )
     pgid = os.getpgid(proc.pid)
+    output = b""
     try:
+        proc.stdin.write(f"{setup}\nSELECT 'ctrl-c-marker'; {running}\n".encode())
+        proc.stdin.flush()
+        while True:
+            line = proc.stdout.readline()
+            assert line, f"the shell exited before running the statement; output {output!r}"
+            output += line
+            if b"ctrl-c-marker" in line:
+                break
+        # The marker is printed right before `running` starts.
+        time.sleep(0.5)
+        os.killpg(pgid, signal.SIGINT)
+        # The Ctrl-C handler runs on its own thread; let it act before more input arrives.
+        time.sleep(1.0)
         try:
-            proc.stdin.write(
-                b"WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM c) SELECT count(*) FROM c;\n"
-            )
+            proc.stdin.write(after.encode())
             proc.stdin.flush()
-            # Let the statement get well inside the recursive fixed point before signalling.
-            time.sleep(1.0)
-            os.killpg(pgid, signal.SIGINT)
-
-            # The shell must be back at the prompt and able to run the next statement.
-            proc.stdin.write(b"SELECT 42;\n.quit\n")
-            proc.stdin.flush()
-            stdout, _ = proc.communicate(timeout=15)
-        except (subprocess.TimeoutExpired, BrokenPipeError) as exc:
-            raise AssertionError(
-                f"SIGINT did not interrupt the running query; the shell never returned to the prompt ({exc!r})"
-            ) from exc
+        except BrokenPipeError:
+            pass
+        try:
+            rest, _ = proc.communicate(timeout=15)
+        except subprocess.TimeoutExpired as exc:
+            raise AssertionError(f"the shell did not react to SIGINT; output {output!r}") from exc
+        return proc.returncode, output + rest
     finally:
-        # Nothing bounds the recursion, so on any failure the query is still burning a core.
         try:
             os.killpg(pgid, signal.SIGKILL)
         except ProcessLookupError:
             pass
         proc.communicate()
-    assert b"42" in stdout, f"expected the shell to answer after the interrupt, got {stdout!r}"
 
 
 def main():
@@ -621,7 +646,8 @@ def main():
     test_tables_with_attached_db()
     test_dbtotxt()
     test_blob_bytes_are_printed_raw_in_list_mode()
-    test_ctrl_c_interrupts_a_running_query()
+    test_ctrl_c_exits_the_shell_while_a_statement_runs()
+    test_ctrl_c_at_the_prompt_keeps_the_shell_running()
     console.info("All tests have passed")
 
 
