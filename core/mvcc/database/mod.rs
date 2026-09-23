@@ -6049,11 +6049,12 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         if self.checkpoint_in_progress.load(Ordering::Acquire) {
             return false;
         }
-        if !self.is_btree_readable_at(&table_id, snapshot.begin_ts, snapshot.read_mark) {
+        let ckpt_max = self.durable_txid_max.load(Ordering::SeqCst);
+        if self.chain_is_write_buffer_for(snapshot.begin_ts, versions, ckpt_max, snapshot.read_mark)
+        {
             return false;
         }
-        let ckpt_max = self.durable_txid_max.load(Ordering::SeqCst);
-        !self.chain_is_write_buffer_for(snapshot.begin_ts, versions, ckpt_max, snapshot.read_mark)
+        self.is_btree_readable_at(&table_id, snapshot.begin_ts, snapshot.read_mark)
     }
 
     /// Whether an already-resolved index version chain shadows (invalidates) the

@@ -448,6 +448,34 @@ the row is read; the uniqueness probe no longer asks for it.
 The checkpointed reads fell by 0.5%, the inserts by 0.2% to 0.3%, and the
 scans did not change.
 
+## H20. B-tree coverage checks look up the table binding first — `fixed`
+
+**Where:** After H16, `scan_128` still made 256 skip-map lookups per scan,
+all from `btree_covers_chain_for_snapshot`: two per row, one while advancing
+and one when positioning. The function looked up the table's root-page
+binding (`is_btree_readable_at`) before running `chain_is_write_buffer_for`,
+a check on the chain alone. For any row that no checkpoint has written, the
+chain check alone decides the answer.
+
+**Fix:** Run the chain check first and look up the binding only for a chain
+that a checkpoint may have written. Both checks only read state, and the
+result is the conjunction of the two. `durable_txid_max` is now loaded before
+the binding lookup. A stale value only makes the chain check keep the row in
+the version store, which is the result the function returns whenever it is
+unsure.
+
+**Callgrind, 200/2,200 iterations:**
+
+| Scenario | Before | After | Change |
+|---|---:|---:|---:|
+| `scan_128` | 247,469 | 218,496 | -11.7% |
+| `point_read` | 14,714 | 14,441 | -1.9% |
+| `point_update_rollback` | 33,595 | 33,260 | -1.0% |
+| `point_update_commit` | 37,244 | 36,934 | -0.8% |
+| `point_read_btree` | 16,089 | 16,134 | +0.3% |
+
+The other workloads changed by less than 0.5%.
+
 ## Final measured totals
 
 The branch was rebased after `origin/main` gained unrelated planner work and an
