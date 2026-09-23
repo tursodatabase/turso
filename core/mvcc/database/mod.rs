@@ -294,6 +294,90 @@ impl SortableIndexKey {
     }
 }
 
+/// The prefix of an index key comes from its first column. It keeps the order of
+/// [`crate::types::cmp_in_column`]: the type class (NULL, number, text, blob) in the top
+/// two bits, then a summary of the value, then the sort order and the NULL order.
+impl crate::bplus_tree::KeyPrefix for SortableIndexKey {
+    fn prefix(&self) -> Option<u64> {
+        if self.metadata.num_cols == 0 {
+            return None;
+        }
+        let key_info = self.metadata.key_info.first()?;
+        let value = self.key.iter().ok()?.next()?.ok()?;
+        index_value_prefix(&value, key_info)
+    }
+}
+
+/// `None` for a column with a type ordering, such as numeric: the type decides how
+/// every pair of values compares, so the type class tells nothing about the order.
+fn index_value_prefix(value: &ValueRef, key_info: &crate::types::KeyInfo) -> Option<u64> {
+    use crate::translate::collate::{CollationSeq, TextCollation};
+    use turso_parser::ast::{NullsOrder, SortOrder};
+    let CollationSeq::Text(collation) = key_info.collation else {
+        return None;
+    };
+    let (class, summary) = match value {
+        ValueRef::Null => {
+            return Some(match (key_info.nulls_order, key_info.sort_order) {
+                (Some(NullsOrder::First), _) | (None, SortOrder::Asc) => 0,
+                (Some(NullsOrder::Last), _) | (None, SortOrder::Desc) => u64::MAX,
+            });
+        }
+        ValueRef::Numeric(number) => (1, number_summary(number)),
+        ValueRef::Text(text) => {
+            let bytes = text.value.as_bytes();
+            let summary = match collation {
+                TextCollation::Binary => leading_bytes(bytes.iter().copied()),
+                TextCollation::NoCase => leading_bytes(
+                    bytes
+                        .iter()
+                        .take_while(|&&b| b != 0)
+                        .map(|b| b.to_ascii_lowercase()),
+                ),
+                // A custom collation calls the application's callback, which can
+                // order texts in any way.
+                TextCollation::Rtrim | TextCollation::Locale(_) | TextCollation::Custom(_) => 0,
+            };
+            (2, summary)
+        }
+        ValueRef::Blob(bytes) => (3, leading_bytes(bytes.iter().copied())),
+    };
+    let ascending = (class << 62) | summary;
+    Some(match key_info.sort_order {
+        SortOrder::Asc => ascending,
+        SortOrder::Desc => !ascending,
+    })
+}
+
+/// A 62-bit summary that keeps numeric order: the bits of the value as an f64, changed
+/// so that unsigned order is numeric order, without the two lowest bits. The f64 of an
+/// integer is the nearest f64, so a smaller summary still means a smaller number.
+fn number_summary(number: &crate::numeric::Numeric) -> u64 {
+    let value = match number {
+        crate::numeric::Numeric::Integer(i) => *i as f64,
+        crate::numeric::Numeric::Float(f) => f64::from(*f),
+    };
+    let value = if value == 0.0 { 0.0 } else { value };
+    let bits = value.to_bits();
+    let ordered = if bits >> 63 == 1 {
+        !bits
+    } else {
+        bits | (1 << 63)
+    };
+    ordered >> 2
+}
+
+/// The first 7 bytes, big-endian, padded with zeros: 56 bits.
+fn leading_bytes(bytes: impl Iterator<Item = u8>) -> u64 {
+    let mut summary = 0u64;
+    let mut taken = 0;
+    for b in bytes.take(7) {
+        summary = (summary << 8) | u64::from(b);
+        taken += 1;
+    }
+    summary << (8 * (7 - taken))
+}
+
 impl PartialEq for SortableIndexKey {
     fn eq(&self, other: &Self) -> bool {
         if self.key.get_payload() == other.key.get_payload() {
@@ -360,6 +444,8 @@ impl RowID {
         Self { table_id, row_id }
     }
 }
+
+impl crate::bplus_tree::KeyPrefix for RowID {}
 
 /// Node storage for a table row key. Table row keys are always integer rowids.
 #[derive(Default)]
