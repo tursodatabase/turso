@@ -48,12 +48,12 @@ use super::btree::{
     btree_init_page, payload_overflow_threshold_max, payload_overflow_threshold_min, PayloadLimits,
 };
 use super::page_cache::{CacheError, CacheResizeResult, PageCache, PageCacheKey, SpillResult};
-use super::sqlite3_ondisk::read_varint;
 use super::sqlite3_ondisk::{
     begin_write_btree_page, read_btree_cell, read_u32, BTreeCell, FREELIST_LEAF_PTR_SIZE,
     FREELIST_TRUNK_OFFSET_FIRST_LEAF_PTR, FREELIST_TRUNK_OFFSET_LEAF_COUNT,
-    FREELIST_TRUNK_OFFSET_NEXT_TRUNK_PTR,
+    FREELIST_TRUNK_OFFSET_NEXT_TRUNK_PTR, SUBJOURNAL_RECORD_HEADER_SIZE,
 };
+use super::sqlite3_ondisk::{read_varint, read_varint_advance};
 use super::wal::{CheckpointMode, WalAutoActions};
 use crate::storage::encryption::{CipherMode, EncryptionContext, EncryptionKey};
 
@@ -143,6 +143,12 @@ mod page_inner {
         /// The WAL frame number this page was loaded from (0 if loaded from main DB file)
         /// This tracks which version of the page we have in memory
         pub wal_tag: AtomicU64,
+        /// Which epoch of which pager's dirty set holds this page id, or 0 for
+        /// none. See [`Pager::add_dirty`]: a page that is already in the set is
+        /// recognised from this stamp instead of searching the set again, which
+        /// costs a write lock and a roaring-bitmap insert on every row a
+        /// statement writes.
+        pub dirty_set_epoch: AtomicU64,
         /// The actual page data buffer. None if not loaded.
         buffer: Option<Arc<Buffer>>,
         /// Start and length of the bytes of `buffer`, kept next to it so a page
@@ -182,6 +188,7 @@ mod page_inner {
                 header_offset: Self::header_offset_of(id),
                 pin_count: AtomicUsize::new(0),
                 wal_tag: AtomicU64::new(TAG_UNSET),
+                dirty_set_epoch: AtomicU64::new(0),
                 buffer: None,
                 data_ptr: std::ptr::null_mut(),
                 data_len: 0,
@@ -429,6 +436,39 @@ impl PageInner {
         self.read_u8(BTREE_FRAGMENTED_BYTES_COUNT)
     }
 
+    /// The four free-space fields of a b-tree page header, plus the size of the
+    /// header itself, read with one bounds test. All of them live in the first
+    /// eight bytes of the header, so one window covers them. Read one at a
+    /// time, each accessor re-reads the page's buffer pointer, tests it for
+    /// null and bounds-tests its own byte range.
+    #[inline(always)]
+    pub fn btree_free_space_fields(&self) -> BtreeFreeSpaceFields {
+        let buf = self.as_ptr();
+        let header = self.offset();
+        let window = &buf[header..header + LEAF_PAGE_HEADER_SIZE_BYTES];
+        let is_interior = window[BTREE_PAGE_TYPE] <= PageType::TableInterior as u8;
+        let cell_content_area = u16::from_be_bytes([
+            window[BTREE_CELL_CONTENT_AREA],
+            window[BTREE_CELL_CONTENT_AREA + 1],
+        ]);
+        BtreeFreeSpaceFields {
+            header_size: (!is_interior as usize) * LEAF_PAGE_HEADER_SIZE_BYTES
+                + (is_interior as usize) * INTERIOR_PAGE_HEADER_SIZE_BYTES,
+            cell_count: u16::from_be_bytes([window[BTREE_CELL_COUNT], window[BTREE_CELL_COUNT + 1]])
+                as usize,
+            first_freeblock: u16::from_be_bytes([
+                window[BTREE_FIRST_FREEBLOCK],
+                window[BTREE_FIRST_FREEBLOCK + 1],
+            ]),
+            cell_content_area: if cell_content_area == 0 {
+                PageSize::MAX
+            } else {
+                cell_content_area as u32
+            },
+            num_frag_free_bytes: window[BTREE_FRAGMENTED_BYTES_COUNT],
+        }
+    }
+
     #[inline]
     pub fn rightmost_pointer(&self) -> crate::Result<Option<u32>> {
         match self.page_type()? {
@@ -547,8 +587,7 @@ impl PageInner {
         let (size, len) = read_varint(buf.get(cell_offset..)?).ok()?;
         let mut start = cell_offset + len;
         if is_table {
-            let (_, rowid_len) = read_varint(buf.get(start..)?).ok()?;
-            start += rowid_len;
+            start += crate::storage::sqlite3_ondisk::read_varint_len(buf.get(start..)?)?;
         }
         let max_local = if is_table {
             limits.max_local_table
@@ -572,24 +611,22 @@ impl PageInner {
     pub fn cell_table_leaf_read_header(&self, idx: usize) -> crate::Result<TableLeafCellHeader> {
         turso_debug_assert!(matches!(self.page_type(), Ok(PageType::TableLeaf)));
         let buf = self.as_ptr();
-        let cell_pointer_array_start = LEAF_PAGE_HEADER_SIZE_BYTES;
-        let cell_pointer = cell_pointer_array_start + (idx * CELL_PTR_SIZE_BYTES);
+        let pointer_slot =
+            self.offset() + LEAF_PAGE_HEADER_SIZE_BYTES + (idx * CELL_PTR_SIZE_BYTES);
         // Bound-check the array entry: `idx` is the untrusted on-disk cell count.
         crate::assert_or_bail_corrupt!(
-            self.offset() + cell_pointer + CELL_PTR_SIZE_BYTES <= buf.len(),
+            pointer_slot + CELL_PTR_SIZE_BYTES <= buf.len(),
             "cell pointer array index {} out of bounds for page size {}",
             idx,
             buf.len()
         );
-        let cell_pointer = self.read_u16(cell_pointer) as usize;
-        let mut pos = cell_pointer;
-        let (payload_size, nr) = read_varint(crate::slice_in_bounds_or_corrupt!(buf, pos..))?;
-        pos += nr;
-        let (rowid, nr) = read_varint(crate::slice_in_bounds_or_corrupt!(buf, pos..))?;
-        pos += nr;
+        let cell_start = u16::from_be_bytes([buf[pointer_slot], buf[pointer_slot + 1]]) as usize;
+        let mut cell = crate::slice_in_bounds_or_corrupt!(buf, cell_start..);
+        let payload_size = read_varint_advance(&mut cell)?;
+        let rowid = read_varint_advance(&mut cell)?;
         Ok(TableLeafCellHeader {
             rowid: rowid as i64,
-            payload_start: pos,
+            payload_start: buf.len() - cell.len(),
             payload_size,
         })
     }
@@ -728,6 +765,21 @@ impl PageInner {
         idx: usize,
         usable_size: usize,
     ) -> crate::Result<(usize, usize)> {
+        let (start, len, _) = self.cell_get_raw_region_and_overflow(idx, usable_size)?;
+        Ok((start, len))
+    }
+
+    /// The region of cell `idx` together with the first of its overflow pages,
+    /// for the callers that need both. The region walk already works out whether
+    /// the payload overflows, and `payload_overflows` counts the four-byte
+    /// pointer in the local size, so the pointer is the last four bytes of the
+    /// cell. Reading the cell in full to reach it costs about a hundred
+    /// instructions more and throws every other field away.
+    pub fn cell_get_raw_region_and_overflow(
+        &self,
+        idx: usize,
+        usable_size: usize,
+    ) -> crate::Result<(usize, usize, Option<u32>)> {
         let page_type = self.page_type()?;
         let max_local = payload_overflow_threshold_max(page_type, usable_size);
         let min_local = payload_overflow_threshold_min(page_type, usable_size);
@@ -751,10 +803,11 @@ impl PageInner {
         max_local: usize,
         min_local: usize,
         page_type: PageType,
-    ) -> crate::Result<(usize, usize)> {
+    ) -> crate::Result<(usize, usize, Option<u32>)> {
         let buf = self.as_ptr();
         turso_assert_less_than!(idx, cell_count);
         let start = self.cell_get_raw_start_offset(idx);
+        let mut overflows = false;
         let len = match page_type {
             PageType::IndexInterior => {
                 let (len_payload, n_payload) =
@@ -765,6 +818,7 @@ impl PageInner {
                     min_local,
                     usable_size,
                 ) {
+                    overflows = true;
                     4 + local_size + n_payload
                 } else {
                     4 + len_payload as usize + n_payload
@@ -784,6 +838,7 @@ impl PageInner {
                     min_local,
                     usable_size,
                 ) {
+                    overflows = true;
                     local_size + n_payload
                 } else {
                     let mut size = len_payload as usize + n_payload;
@@ -804,6 +859,7 @@ impl PageInner {
                     min_local,
                     usable_size,
                 ) {
+                    overflows = true;
                     local_size + n_payload + n_rowid
                 } else {
                     let mut size = len_payload as usize + n_payload + n_rowid;
@@ -821,12 +877,36 @@ impl PageInner {
             start + len,
             buf.len()
         );
-        Ok((start, len))
+        let first_overflow_page = if overflows {
+            let at = start + len - 4;
+            Some(u32::from_be_bytes(
+                buf[at..at + 4].try_into().expect("four bytes"),
+            ))
+        } else {
+            None
+        };
+        Ok((start, len, first_overflow_page))
     }
 
     #[inline(always)]
     pub fn is_leaf(&self) -> bool {
         self.read_u8(BTREE_PAGE_TYPE) > PageType::TableInterior as u8
+    }
+
+    /// Whether this is a leaf page, and how many cells it holds, read with one
+    /// bounds test. The b-tree header keeps the page type at +0 and the cell
+    /// count at +3, so both come out of the same five-byte window. Read one at
+    /// a time they cost two bounds tests, on the path a scan takes for every
+    /// row.
+    #[inline(always)]
+    pub fn is_leaf_and_cell_count(&self) -> (bool, usize) {
+        let buf = self.as_ptr();
+        let header = self.offset();
+        let window = &buf[header..header + BTREE_CELL_COUNT + 2];
+        (
+            window[BTREE_PAGE_TYPE] > PageType::TableInterior as u8,
+            u16::from_be_bytes([window[BTREE_CELL_COUNT], window[BTREE_CELL_COUNT + 1]]) as usize,
+        )
     }
 
     /// True for table pages (interior or leaf). A corrupt page type byte
@@ -863,6 +943,15 @@ impl PageInner {
 }
 
 /// Type alias for backward compatibility - PageContent is now PageInner
+/// What [`PageInner::btree_free_space_fields`] reads out of one header window.
+pub struct BtreeFreeSpaceFields {
+    pub header_size: usize,
+    pub cell_count: usize,
+    pub first_freeblock: u16,
+    pub cell_content_area: u32,
+    pub num_frag_free_bytes: u8,
+}
+
 pub type PageContent = PageInner;
 
 /// WAL tag not set
@@ -895,6 +984,17 @@ pub fn unpack_tag_pair(tag: u64) -> (u64, u32) {
 #[derive(Debug)]
 pub struct Page {
     pub inner: UnsafeCell<PageInner>,
+}
+
+/// A value no pager and no epoch of a pager has used before. Sharing one
+/// counter across the process means a page stamped by one pager can never look
+/// like a member of another pager's dirty set. The counter hands out names and
+/// orders nothing, so it stays on the standard atomic even under shuttle, whose
+/// atomics remember which task last wrote them and would keep that memory from
+/// one test execution to the next.
+fn next_dirty_set_epoch() -> u64 {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
 }
 
 // SAFETY: Page is thread-safe because we use atomic page flags to serialize
@@ -954,6 +1054,17 @@ impl Page {
     #[inline]
     pub fn clear_locked(&self) {
         self.get().flags.fetch_and(!PAGE_LOCKED, Ordering::Release);
+    }
+
+    /// See [`PageInner::dirty_set_epoch`].
+    #[inline]
+    pub fn dirty_set_epoch(&self) -> u64 {
+        self.get().dirty_set_epoch.load(Ordering::Acquire)
+    }
+
+    #[inline]
+    pub fn set_dirty_set_epoch(&self, epoch: u64) {
+        self.get().dirty_set_epoch.store(epoch, Ordering::Release);
     }
 
     #[inline]
@@ -1428,6 +1539,12 @@ struct Savepoint {
     write_offset: AtomicU64,
     /// Bitmap of page numbers that are dirty in the savepoint.
     page_bitmap: RwLock<RoaringBitmap>,
+    /// The page number `has_dirty_page` last found in `page_bitmap`, or 0 for
+    /// none yet. A statement writes many rows to one page in a row, so this
+    /// answers most calls without the lock and the bitmap search behind it.
+    /// It only ever holds a number the bitmap already has, and the bitmap only
+    /// ever grows, so a hit here is never wrong.
+    page_bitmap_last_hit: AtomicU32,
     /// Database size at the start of the savepoint.
     /// If the database grows during the savepoint and a rollback to the savepoint is performed,
     /// the pages exceeding the database size at the start of the savepoint will be ignored.
@@ -1455,6 +1572,7 @@ impl Savepoint {
             start_offset: AtomicU64::new(subjournal_offset),
             write_offset: AtomicU64::new(subjournal_offset),
             page_bitmap: RwLock::new(RoaringBitmap::new()),
+            page_bitmap_last_hit: AtomicU32::new(0),
             db_size: AtomicU32::new(db_size),
             wal_pos: RwLock::new(wal_pos),
             deferred_fk_violations: AtomicIsize::new(deferred_fk_violations),
@@ -1463,10 +1581,22 @@ impl Savepoint {
 
     pub fn add_dirty_page(&self, page_num: u32) {
         self.page_bitmap.write().insert(page_num);
+        self.page_bitmap_last_hit.store(page_num, Ordering::Release);
     }
 
     pub fn has_dirty_page(&self, page_num: u32) -> bool {
-        self.page_bitmap.read().contains(page_num)
+        if page_num != 0 && self.page_bitmap_last_hit.load(Ordering::Acquire) == page_num {
+            turso_debug_assert!(
+                self.page_bitmap.read().contains(page_num),
+                "page {page_num} was remembered as dirty in this savepoint but is not in its set"
+            );
+            return true;
+        }
+        if !self.page_bitmap.read().contains(page_num) {
+            return false;
+        }
+        self.page_bitmap_last_hit.store(page_num, Ordering::Release);
+        true
     }
 
     fn start_offset(&self) -> u64 {
@@ -1497,6 +1627,7 @@ impl Savepoint {
             start_offset: AtomicU64::new(snapshot.start_offset),
             write_offset: AtomicU64::new(snapshot.start_offset),
             page_bitmap: RwLock::new(RoaringBitmap::new()),
+            page_bitmap_last_hit: AtomicU32::new(0),
             db_size: AtomicU32::new(snapshot.db_size),
             wal_pos: RwLock::new(snapshot.wal_pos),
             deferred_fk_violations: AtomicIsize::new(snapshot.deferred_fk_violations),
@@ -1533,8 +1664,31 @@ pub struct Pager {
     #[cfg(test)]
     spill_yield: SpillYieldHook,
     /// Dirty pages as a bitmap, naturally sorted by page number.
+    /// The pages this pager must write out. Anything that takes ids out of this
+    /// set must take a fresh `dirty_set_epoch`, or a page stamped with the old
+    /// one is never written again; the debug assert in [`Pager::add_dirty`]
+    /// catches a missed one the first time such a page is written.
     dirty_pages: Arc<RwLock<RoaringBitmap>>,
+    /// The epoch the current contents of `dirty_pages` belong to. Every page
+    /// that goes into the set is stamped with it, so a page that is already
+    /// there is recognised without taking the lock. Anything that takes ids out
+    /// of the set takes a fresh epoch, which makes every stamp stale, so a page
+    /// can never be kept out of the set by an old stamp. Epochs come from a
+    /// counter shared by the whole process, so no two pagers, and no two epochs
+    /// of one pager, ever share a value.
+    dirty_set_epoch: AtomicU64,
     subjournal: RwLock<Option<Subjournal>>,
+    /// True once `subjournal` holds a file. It never goes back to false, so a
+    /// false read means no subjournal, without taking the lock that guards it.
+    /// Set after the file is stored, and read with the matching ordering, so a
+    /// true read sees the file too.
+    subjournal_is_open: AtomicBool,
+    /// A page the current savepoint stack needs no subjournal record for, or 0
+    /// for none. A statement writes many rows to one page, and asking the stack
+    /// again for each of them takes its read lock: two locked read-modify-writes
+    /// per row written, to reach an answer that cannot have changed. Every
+    /// change to the stack clears this, so a remembered page is never stale.
+    subjournal_needs_no_record_for_page: AtomicU32,
     savepoints: Arc<RwLock<Vec<Savepoint>>>,
     commit_info: RwLock<CommitInfo>,
     checkpoint_state: RwLock<CheckpointState>,
@@ -1844,7 +1998,10 @@ impl Pager {
             #[cfg(test)]
             spill_yield: SpillYieldHook::new(),
             dirty_pages: Arc::new(RwLock::new(RoaringBitmap::new())),
+            dirty_set_epoch: AtomicU64::new(next_dirty_set_epoch()),
             subjournal: RwLock::new(None),
+            subjournal_is_open: AtomicBool::new(false),
+            subjournal_needs_no_record_for_page: AtomicU32::new(0),
             savepoints: Arc::new(RwLock::new(Vec::new())),
             commit_info: RwLock::new(CommitInfo {
                 group: None,
@@ -2099,7 +2256,7 @@ impl Pager {
     ///
     /// Currently uses MemoryIO, but should eventually be backed by temporary on-disk files.
     pub fn open_subjournal(&self) -> Result<()> {
-        if self.subjournal.read().is_some() {
+        if self.subjournal_is_open.load(Ordering::Acquire) {
             return Ok(());
         }
         use crate::MemoryIO;
@@ -2108,6 +2265,7 @@ impl Pager {
         let file = db_file_io.open_file("subjournal", OpenFlags::Create, false)?;
         let db_file = Subjournal::new(file);
         *self.subjournal.write() = Some(db_file);
+        self.subjournal_is_open.store(true, Ordering::Release);
         Ok(())
     }
 
@@ -2118,7 +2276,26 @@ impl Pager {
     /// A buffer of length page_size + 4 bytes is allocated and the page id
     /// is written to the beginning of the buffer. The rest of the buffer is filled with the page contents.
     pub fn subjournal_page_if_required(&self, page: &Page) -> Result<()> {
-        if self.subjournal.read().is_none() {
+        if !self.subjournal_is_open.load(Ordering::Acquire) {
+            turso_debug_assert!(
+                self.subjournal.read().is_none(),
+                "the subjournal flag says closed while a subjournal is open"
+            );
+            return Ok(());
+        }
+        let page_id_u32 = page.get().id() as u32;
+        if self
+            .subjournal_needs_no_record_for_page
+            .load(Ordering::Acquire)
+            == page_id_u32
+        {
+            turso_debug_assert!(
+                self.savepoints.read().last().is_some_and(|savepoint| {
+                    page_id_u32 > savepoint.db_size.load(Ordering::Acquire)
+                        || savepoint.has_dirty_page(page_id_u32)
+                }),
+                "page {page_id_u32} was remembered as needing no subjournal record, but the current savepoint wants one"
+            );
             return Ok(());
         }
         let write_offset = {
@@ -2130,11 +2307,15 @@ impl Pager {
             // New pages (allocated during this statement) can be "rolled back" by simply
             // truncating back to the original db_size. This matches SQLite's subjRequiresPage()
             // which checks: p->nOrig >= pgno.
-            let page_id_u32 = page.get().id() as u32;
+            // Both answers hold until the savepoint stack changes: a page
+            // beyond the size the savepoint opened at stays beyond it, and a
+            // savepoint's set of subjournalled pages only grows.
             if page_id_u32 > cur_savepoint.db_size.load(Ordering::Acquire) {
+                self.remember_page_needs_no_subjournal_record(page_id_u32);
                 return Ok(());
             }
             if cur_savepoint.has_dirty_page(page_id_u32) {
+                self.remember_page_needs_no_subjournal_record(page_id_u32);
                 return Ok(());
             }
             cur_savepoint.write_offset.load(Ordering::SeqCst)
@@ -2144,7 +2325,9 @@ impl Pager {
         let buffer = {
             let page_id = page.get().id() as u32;
             let contents = page.get_contents();
-            let buffer = self.buffer_pool.allocate(page_size + 4);
+            let buffer = self
+                .buffer_pool
+                .allocate(page_size + SUBJOURNAL_RECORD_HEADER_SIZE);
             let contents_buffer = contents.as_ptr();
             turso_assert!(
                 contents_buffer.len() == page_size,
@@ -2191,6 +2374,20 @@ impl Pager {
         Ok(())
     }
 
+    fn remember_page_needs_no_subjournal_record(&self, page_id: u32) {
+        self.subjournal_needs_no_record_for_page
+            .store(page_id, Ordering::Release);
+    }
+
+    /// Take the savepoint stack for writing. Every change to the stack goes
+    /// through here, so the page remembered as needing no subjournal record
+    /// cannot outlive the stack it was remembered under.
+    fn savepoints_write(&self) -> crate::sync::RwLockWriteGuard<'_, Vec<Savepoint>> {
+        self.subjournal_needs_no_record_for_page
+            .store(0, Ordering::Release);
+        self.savepoints.write()
+    }
+
     /// try to "acquire" ownership on the subjournal of the connection-scoped pager
     /// if another statement owns the subjournal - return Busy error and let the caller retry attempt later
     pub fn try_use_subjournal(&self) -> Result<()> {
@@ -2222,7 +2419,7 @@ impl Pager {
 
     /// Release i.e. commit the current savepoint. This basically just means removing it.
     pub fn release_savepoint(&self) -> Result<()> {
-        let mut savepoints = self.savepoints.write();
+        let mut savepoints = self.savepoints_write();
         if !matches!(
             savepoints.last().map(|savepoint| &savepoint.kind),
             Some(SavepointKind::Statement)
@@ -2266,7 +2463,7 @@ impl Pager {
 
     /// Releases the newest matching named savepoint and all nested savepoints opened after it.
     pub fn release_named_savepoint(&self, name: &str) -> Result<SavepointResult> {
-        let mut savepoints = self.savepoints.write();
+        let mut savepoints = self.savepoints_write();
         let Some(target_idx) = savepoints.iter().rposition(|savepoint| {
             matches!(
                 savepoint.kind,
@@ -2318,7 +2515,7 @@ impl Pager {
     }
 
     pub fn clear_savepoints(&self) -> Result<()> {
-        *self.savepoints.write() = Vec::new();
+        *self.savepoints_write() = Vec::new();
         let subjournal = self.subjournal.read();
         let Some(subjournal) = subjournal.as_ref() else {
             return Ok(());
@@ -2331,7 +2528,7 @@ impl Pager {
     /// Rollback to the newest savepoint. This basically just means reading the subjournal from the start offset
     /// of the savepoint to the end of the subjournal and restoring the page images to the page cache.
     pub fn rollback_to_newest_savepoint(&self) -> Result<bool> {
-        let mut savepoints = self.savepoints.write();
+        let mut savepoints = self.savepoints_write();
         if !matches!(
             savepoints.last().map(|savepoint| &savepoint.kind),
             Some(SavepointKind::Statement)
@@ -2381,7 +2578,7 @@ impl Pager {
 
         self.rollback_to_snapshot(&target.1, target.2)?;
 
-        let mut savepoints = self.savepoints.write();
+        let mut savepoints = self.savepoints_write();
         let deferred_fk_violations = target.1.deferred_fk_violations;
         savepoints.truncate(target.0);
         if let Some(parent) = savepoints.last() {
@@ -2420,7 +2617,7 @@ impl Pager {
             wal_pos,
             deferred_fk_violations,
         );
-        self.savepoints.write().push(savepoint);
+        self.savepoints_write().push(savepoint);
         Ok(())
     }
 
@@ -2513,6 +2710,9 @@ impl Pager {
                 }
             }
             dirty_pages.remove_range((db_size + 1)..);
+            // Ids left the set, so the epoch every page carries is stale.
+            self.dirty_set_epoch
+                .store(next_dirty_set_epoch(), Ordering::Release);
             cache.truncate(db_size as usize)?;
         }
 
@@ -2618,7 +2818,7 @@ impl Pager {
             };
             // Clear dirty pages since this is pre-initialization setup, not a real write transaction.
             // with_header_mut marks page 1 dirty as a side effect, but no transaction is active.
-            self.dirty_pages.write().clear();
+            self.clear_dirty_pages();
         }
 
         self.set_auto_vacuum_mode(mode);
@@ -3047,7 +3247,7 @@ impl Pager {
         self.page_size.store(size.get(), Ordering::SeqCst);
         // Clear dirty pages since this is pre-initialization setup, not a real write transaction.
         // Rebuilding init_page_1 must not leak any stale 4 KiB page-1 image into the first write.
-        self.dirty_pages.write().clear();
+        self.clear_dirty_pages();
 
         // Encryption can be configured before a fresh database chooses its page
         // size, so keep the IO context aligned with the pager before the first
@@ -3082,7 +3282,7 @@ impl Pager {
         };
         // Clear dirty pages since this is pre-initialization setup, not a real write transaction.
         // with_header_mut marks page 1 dirty as a side effect, but no transaction is active.
-        self.dirty_pages.write().clear();
+        self.clear_dirty_pages();
         Ok(())
     }
 
@@ -3473,7 +3673,7 @@ impl Pager {
                 .expect("clear_savepoints should not fail for attached DB");
             // Clear dirty pages and page cache before releasing the write lock
             self.clear_page_cache(true);
-            self.dirty_pages.write().clear();
+            self.clear_dirty_pages();
             self.reset_internal_states();
             self.set_schema_cookie(None);
             wal.rollback(None);
@@ -3793,6 +3993,18 @@ impl Pager {
         .unwrap()
     }
 
+    /// Empties the dirty set and takes a fresh epoch, so that every page the old
+    /// epoch stamped goes back into the set the next time it is written. Both
+    /// happen under the set's write lock, and a pager never clears its dirty set
+    /// while a write through it is in flight: the clearing paths all run on the
+    /// thread that holds the WAL write lock, or before any transaction.
+    fn clear_dirty_pages(&self) {
+        let mut dirty_pages = self.dirty_pages.write();
+        dirty_pages.clear();
+        self.dirty_set_epoch
+            .store(next_dirty_set_epoch(), Ordering::Release);
+    }
+
     pub fn add_dirty(&self, page: &Page) -> Result<()> {
         turso_assert!(
             page.is_loaded(),
@@ -3800,8 +4012,20 @@ impl Pager {
             { "page_id": page.get().id() }
         );
         self.subjournal_page_if_required(page)?;
-        let mut dirty_pages = self.dirty_pages.write();
-        dirty_pages.insert(page.get().id() as u32);
+        // A page stamped with the set's current epoch is already in the set, so
+        // there is nothing to do. Asking the set itself costs a write lock and a
+        // search of a roaring bitmap on every row a statement writes.
+        let epoch = self.dirty_set_epoch.load(Ordering::Acquire);
+        let stamped = page.dirty_set_epoch() == epoch;
+        turso_debug_assert!(
+            !stamped || self.dirty_pages.read().contains(page.get().id() as u32),
+            "a page stamped with the current epoch must be in the pager's dirty set",
+            { "page_id": page.get().id() }
+        );
+        if !stamped {
+            self.dirty_pages.write().insert(page.get().id() as u32);
+            page.set_dirty_set_epoch(epoch);
+        }
         // Notify cache before marking dirty (page was evictable, now it won't be)
         // Only notify if page wasn't already dirty, or if it was spilled
         // State before set_dirty():
@@ -3811,8 +4035,15 @@ impl Pager {
         if !page.is_dirty() || page.is_spilled() {
             let key = PageCacheKey::new(page.get().id());
             self.page_cache.write().notify_page_dirty(key);
+            page.set_dirty();
+        } else {
+            // set_dirty changes the flag word exactly when the page is spilled
+            // or not yet dirty, which is the test above. Past it, its two
+            // read-modify-writes clear a bit that is clear and set a bit that
+            // is set, and each one is a locked instruction. The WAL tag still
+            // has to go, because the page is about to change again.
+            page.clear_wal_tag();
         }
-        page.set_dirty();
         Ok(())
     }
 
@@ -4685,7 +4916,7 @@ impl Pager {
                     wal.commit_prepared_frames(&commit_info.prepared_frames);
                     wal.finalize_committed_pages(&commit_info.prepared_frames);
                     wal.finish_append_frames_commit()?;
-                    self.dirty_pages.write().clear();
+                    self.clear_dirty_pages();
                     commit_info.prepared_frames.clear();
 
                     let need_checkpoint = allowed_auto_actions.contains(WalAutoActions::Checkpoint)
@@ -4813,6 +5044,9 @@ impl Pager {
                 }
             }
             dirty_pages.clear();
+            // Ids left the set, so the epoch every page carries is stale.
+            self.dirty_set_epoch
+                .store(next_dirty_set_epoch(), Ordering::Release);
         }
         Ok(WalFrameInfo {
             page_no: header.page_number,
@@ -5354,7 +5588,7 @@ impl Pager {
             .expect("Failed to clear page cache");
         if clear_dirty {
             drop(dirty_pages);
-            self.dirty_pages.write().clear();
+            self.clear_dirty_pages();
         }
     }
 
@@ -5996,7 +6230,7 @@ impl Pager {
             // Even in the case of a write transaction, clearing the entire page cache is overkill,
             // since we only need to clear the dirty pages that were modified by the write transaction.
             self.clear_page_cache(clear_dirty);
-            self.dirty_pages.write().clear();
+            self.clear_dirty_pages();
         } else {
             turso_assert!(
                 self.dirty_pages.read().is_empty(),
@@ -6432,6 +6666,25 @@ mod tests {
 
     use super::{default_page1, CacheFlushState, CollectingState, Page, PageRef, Pager};
     use crate::{Buffer, Completion, CompletionError, LimboError};
+
+    #[test]
+    fn a_savepoint_reports_its_dirty_pages_whatever_order_they_are_asked_in() {
+        // `has_dirty_page` remembers the page it last found, so ask for pages
+        // that are in the set and pages that are not, in an order that keeps
+        // hitting and missing what it remembers.
+        let savepoint = super::Savepoint::new(super::SavepointKind::Statement, 0, 100, None, 0);
+        let dirty = [1u32, 2, 3, 7];
+        for page in dirty {
+            savepoint.add_dirty_page(page);
+        }
+        for page in [1u32, 1, 2, 4, 4, 2, 2, 7, 0, 0, 3, 9, 9, 1, 8, 8, 7] {
+            assert_eq!(
+                savepoint.has_dirty_page(page),
+                dirty.contains(&page),
+                "page {page}"
+            );
+        }
+    }
 
     #[test]
     fn page_id_changes_keep_header_access_at_the_correct_offset() {

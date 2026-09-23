@@ -412,6 +412,8 @@ impl Default for DatabaseHeader {
 
 pub const WAL_HEADER_SIZE: usize = 32;
 pub const WAL_FRAME_HEADER_SIZE: usize = 24;
+/// A subjournal record is the page id followed by the whole page.
+pub const SUBJOURNAL_RECORD_HEADER_SIZE: usize = 4;
 // magic is a single number represented as WAL_MAGIC_LE but the big endian
 // counterpart is just the same number with LSB set to 1.
 pub const WAL_MAGIC_LE: u32 = 0x377f0682;
@@ -805,6 +807,20 @@ pub enum BTreeCell {
     TableLeafCell(TableLeafCell),
     IndexInteriorCell(IndexInteriorCell),
     IndexLeafCell(IndexLeafCell),
+}
+
+impl BTreeCell {
+    /// The first of the cell's overflow pages, or `None` when its payload fits
+    /// on the page. An interior table cell carries a child pointer and a rowid
+    /// and never overflows.
+    pub fn first_overflow_page(&self) -> Option<u32> {
+        match self {
+            BTreeCell::TableLeafCell(cell) => cell.first_overflow_page,
+            BTreeCell::IndexLeafCell(cell) => cell.first_overflow_page,
+            BTreeCell::IndexInteriorCell(cell) => cell.first_overflow_page,
+            BTreeCell::TableInteriorCell(_) => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -1345,6 +1361,30 @@ pub fn read_integer(buf: &[u8], serial_type: u8) -> Result<i64> {
     }
 }
 
+/// Reads the varint at the front of `buf` and moves `buf` past it.
+///
+/// The one- and two-byte forms take the rest of the buffer straight out of the
+/// slice pattern. [`read_varint`] hands back a length instead, and stepping a
+/// slice by a length the compiler cannot bound costs a check at every call.
+#[inline(always)]
+pub fn read_varint_advance(buf: &mut &[u8]) -> Result<u64> {
+    if let [first, rest @ ..] = *buf {
+        if *first < 0x80 {
+            *buf = rest;
+            return Ok(*first as u64);
+        }
+        if let [second, rest @ ..] = rest {
+            if *second < 0x80 {
+                *buf = rest;
+                return Ok((((*first & 0x7f) as u64) << 7) | *second as u64);
+            }
+        }
+    }
+    let (value, length) = read_varint(buf)?;
+    *buf = &buf[length..];
+    Ok(value)
+}
+
 /// Reads varint integer from the buffer.
 /// This function is similar to `sqlite3GetVarint32`
 #[inline(always)]
@@ -1388,6 +1428,46 @@ pub fn read_varint(buf: &[u8]) -> Result<(u64, usize)> {
             bail_corrupt_error!("Invalid varint");
         }
     }
+}
+
+/// Bytes the varint at the front of `buf` occupies, for the callers that only
+/// need to step over it. A varint ends at the first byte whose high bit is
+/// clear, or after nine bytes. `None` means the buffer ends first.
+///
+/// `read_varint` works out the value as well, and a caller that throws the
+/// value away still pays for keeping it: on a table leaf cell the rowid varint
+/// cost two stack stores per row that nothing read back.
+#[inline(always)]
+pub fn read_varint_len(buf: &[u8]) -> Option<usize> {
+    match buf {
+        [b0, ..] if *b0 < 0x80 => return Some(1),
+        [_, b1, ..] if *b1 < 0x80 => return Some(2),
+        _ => {}
+    }
+    for i in 2..8 {
+        if buf.get(i)? & 0x80 == 0 {
+            return Some(i + 1);
+        }
+    }
+    nine_byte_varint_len(buf)
+}
+
+/// The tail of [`read_varint_len`]: eight bytes in a row have had their high
+/// bit set, so the varint is the maximum nine bytes long, if it is valid.
+///
+/// `read_varint` rejects a nine-byte varint whose value fits in fewer bits,
+/// which is the same as saying that the top eight bits of the first eight
+/// groups of seven are all zero. Those bits are the low seven of the first byte
+/// and the seventh of the second, so the rule needs no accumulator. Out of line
+/// so that testing it does not keep those two bytes live through the loop
+/// above, which costs two instructions per row on a b-tree scan.
+#[inline(never)]
+fn nine_byte_varint_len(buf: &[u8]) -> Option<usize> {
+    let (b0, b1) = (buf.first()?, buf.get(1)?);
+    if buf.len() < 9 || (b0 & 0x7f == 0 && b1 & 0x40 == 0) {
+        return None;
+    }
+    Some(9)
 }
 
 #[inline(always)]
@@ -2526,6 +2606,76 @@ mod tests {
     #[case(&[0x80; 9])] // bits set without end
     fn test_read_varint_malformed_inputs(#[case] buf: &[u8]) {
         assert!(read_varint(buf).is_err());
+    }
+
+    /// `read_varint_advance` has its own decoder for the one- and two-byte
+    /// forms, so it must read the same value and step the same distance as
+    /// `read_varint` on every input.
+    #[test]
+    fn read_varint_advance_agrees_with_read_varint() {
+        let mut checked = 0;
+        for width in 0..=10usize {
+            for pattern in [0x00u8, 0x01, 0x7f, 0x80, 0x81, 0xff] {
+                for last in [0x00u8, 0x01, 0x40, 0x7f, 0x80, 0xff] {
+                    let mut buf = vec![pattern; width];
+                    if let Some(byte) = buf.last_mut() {
+                        *byte = last;
+                    }
+                    let mut rest: &[u8] = &buf;
+                    match read_varint(&buf) {
+                        Ok((value, length)) => {
+                            assert_eq!(
+                                read_varint_advance(&mut rest).unwrap(),
+                                value,
+                                "disagreed on {buf:02x?}"
+                            );
+                            assert_eq!(rest, &buf[length..], "stepped wrong on {buf:02x?}");
+                        }
+                        Err(_) => assert!(
+                            read_varint_advance(&mut rest).is_err(),
+                            "accepted {buf:02x?}"
+                        ),
+                    }
+                    checked += 1;
+                }
+            }
+        }
+        assert_eq!(checked, 11 * 6 * 6);
+    }
+
+    /// `read_varint_len` exists only to skip a varint faster than reading it,
+    /// so it must accept and reject exactly what `read_varint` does.
+    #[test]
+    fn read_varint_len_agrees_with_read_varint() {
+        let mut checked = 0;
+        for width in 0..=10usize {
+            for pattern in [0x00u8, 0x01, 0x7f, 0x80, 0x81, 0xff] {
+                for last in [0x00u8, 0x01, 0x40, 0x7f, 0x80, 0xff] {
+                    let mut buf = vec![pattern; width];
+                    if let Some(byte) = buf.last_mut() {
+                        *byte = last;
+                    }
+                    let expected = read_varint(&buf).ok().map(|(_, len)| len);
+                    assert_eq!(read_varint_len(&buf), expected, "disagreed on {buf:02x?}");
+                    checked += 1;
+                }
+            }
+        }
+        // Every nine-byte varint whose value needs the ninth byte, and every
+        // one whose value does not, so the rule on the first two bytes is
+        // covered in both directions.
+        for b0 in [0x80u8, 0x81, 0xc0, 0xff] {
+            for b1 in [0x80u8, 0xc0, 0xbf, 0xff] {
+                let mut buf = vec![0x80u8; 9];
+                buf[0] = b0;
+                buf[1] = b1;
+                buf[8] = 0x2a;
+                let expected = read_varint(&buf).ok().map(|(_, len)| len);
+                assert_eq!(read_varint_len(&buf), expected, "disagreed on {buf:02x?}");
+                checked += 1;
+            }
+        }
+        assert!(checked > 300, "the table got smaller than it looks");
     }
 
     #[test]

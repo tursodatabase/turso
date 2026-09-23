@@ -90,7 +90,6 @@ use execute::{
 use turso_parser::ast::{EqpFormat, ResolveType};
 
 use crate::io::TempFile;
-use crate::storage::sqlite3_ondisk::read_varint;
 use crate::vdbe::bloom_filter::BloomFilter;
 use crate::vdbe::rowset::RowSet;
 use explain::{
@@ -110,6 +109,48 @@ use std::{
 use tracing::{instrument, Level};
 
 const MAX_CHECK_INTERVAL: u64 = 256;
+
+/// Whether the dispatch loop must print each instruction it runs.
+///
+/// Both switches are global to the process or to the connection, and reading
+/// them costs an atomic load, a six-way match and a walk through the
+/// connection: eight instructions. A scan pays that on every row, because
+/// each row leaves the dispatch loop and re-enters it. They are read once per
+/// execution instead, off the hot path, and the dispatch loop tests the
+/// stored byte.
+#[derive(Clone, Copy, Default)]
+pub(crate) struct TraceFlags(u8);
+
+impl TraceFlags {
+    const TRACING: u8 = 1;
+    const VDBE: u8 = 2;
+
+    pub(crate) fn read(connection: &Connection) -> Self {
+        let mut bits = 0;
+        if tracing::enabled!(tracing::Level::TRACE) {
+            bits |= Self::TRACING;
+        }
+        if connection.get_vdbe_trace() {
+            bits |= Self::VDBE;
+        }
+        Self(bits)
+    }
+
+    #[inline(always)]
+    fn any(self) -> bool {
+        self.0 != 0
+    }
+
+    #[inline(always)]
+    fn tracing_enabled(self) -> bool {
+        self.0 & Self::TRACING != 0
+    }
+
+    #[inline(always)]
+    fn vdbe_trace(self) -> bool {
+        self.0 & Self::VDBE != 0
+    }
+}
 
 type MvccCommitStateMachine = CommitStateMachine<MvccClock, DynAllocator>;
 
@@ -412,11 +453,11 @@ impl Register {
     /// which is faster than always creating a new one.
     pub fn set_int(&mut self, val: i64) {
         match self {
-            Register::Value(Value::Numeric(Numeric::Integer(existing))) => {
-                *existing = val;
-            }
-            Register::Value(Value::Numeric(float)) => {
-                *float = Numeric::Integer(val);
+            // One test for both numeric kinds. Split in two, a register that
+            // already holds an integer wrote eight bytes instead of sixteen but
+            // paid a second discriminant test for it, on every row of a scan.
+            Register::Value(Value::Numeric(number)) => {
+                *number = Numeric::Integer(val);
             }
             _ => set_int_over_other(self, val),
         };
@@ -673,7 +714,13 @@ struct ActiveOpStateSlot {
 macro_rules! active_state_accessor {
     ($name:ident, $variant:ident, $ty:ty, $init:expr) => {
         fn $name(&mut self) -> &mut $ty {
-            if matches!(self.state, ActiveOpState::None) {
+            // The slot already holds the variant on every call but the first of
+            // an opcode's run, so that is the question this path asks. The
+            // extraction below then needs no second test of the tag.
+            if !matches!(self.state, ActiveOpState::$variant(_)) {
+                if !matches!(self.state, ActiveOpState::None) {
+                    owned_by_another_opcode(&self.state);
+                }
                 // None owns nothing, so skip the drop glue of the enum that
                 // a plain assignment would run on the old value.
                 std::mem::forget(std::mem::replace(
@@ -681,16 +728,47 @@ macro_rules! active_state_accessor {
                     ActiveOpState::$variant($init),
                 ));
             }
-            match &mut self.state {
+            return match &mut self.state {
                 ActiveOpState::$variant(state) => state,
-                state => unreachable!(
+                _ => unreachable!(),
+            };
+
+            // The report names the state it found, which formats the whole
+            // enum. Inlined at every caller, that formatting grew the opcodes
+            // it sits in far enough to spill their hot values.
+            #[cold]
+            #[inline(never)]
+            fn owned_by_another_opcode(state: &ActiveOpState) -> ! {
+                unreachable!(
                     "active opcode state mismatch: expected {}, got {:?}",
                     stringify!($variant),
                     state
-                ),
+                )
             }
         }
     };
+}
+
+impl ActiveOpState {
+    /// True when the state holds nothing to free, so [`ActiveOpStateSlot::clear`]
+    /// can forget it instead of running the drop glue of the enum: a switch over
+    /// every variant, which cost 27 instructions for every row an insert wrote
+    /// and freed nothing.
+    ///
+    /// Every field is named rather than skipped with `..`, so a field added to
+    /// one of these states has to be answered for here.
+    fn owns_nothing(&self) -> bool {
+        match self {
+            ActiveOpState::None => true,
+            ActiveOpState::Insert(OpInsertState {
+                sub_state: _,
+                has_dependent_views: _,
+                is_noop_update: _,
+                old_record,
+            }) => old_record.is_none(),
+            _ => false,
+        }
+    }
 }
 
 impl Default for ActiveOpState {
@@ -701,9 +779,14 @@ impl Default for ActiveOpState {
 
 impl ActiveOpStateSlot {
     fn clear(&mut self) {
-        if !matches!(self.state, ActiveOpState::None) {
-            self.state = ActiveOpState::None;
+        if matches!(self.state, ActiveOpState::None) {
+            return;
         }
+        if self.state.owns_nothing() {
+            std::mem::forget(std::mem::replace(&mut self.state, ActiveOpState::None));
+            return;
+        }
+        self.state = ActiveOpState::None;
     }
 
     /// True when no multi-step opcode is suspended. Hot opcodes use this to
@@ -877,6 +960,27 @@ pub struct ProgramState {
     /// The interval the countdown was last reloaded with, re-derived from
     /// the progress handler's interval each time the check runs.
     check_interval: u64,
+    /// What `check_countdown` was last set to. The dispatch loop decrements
+    /// the countdown once per instruction, so their difference is the number
+    /// of instructions run since the last check, and `metrics.vm_steps` does
+    /// not have to be counted alongside it.
+    check_countdown_start: u64,
+    /// Whether the dispatch loop must trace, read once per execution.
+    pub(crate) trace_flags: TraceFlags,
+    /// Dispatch loop iterations whose instruction did not complete, because it
+    /// asked for I/O or failed. The instruction runs again when its I/O
+    /// finishes, so `metrics.vm_steps` counts it twice and the number of
+    /// instructions executed is `vm_steps - incomplete_steps`. Counted here so
+    /// the loop updates one counter per instruction instead of two.
+    incomplete_steps: u64,
+    /// `vm_steps - incomplete_steps` when SQLITE_STMTSTATUS_VM_STEP was last
+    /// reset to zero.
+    insn_executed_reset_at: u64,
+    /// `btree_next + btree_prev` when SQLITE_STMTSTATUS_ROWS_READ was last
+    /// reset to zero. Next and Prev record the row they read in those two
+    /// counters alone, so `rows_read` adds them back and takes off what the
+    /// caller has already been shown.
+    rows_read_reset_at: u64,
     pub io_completions: Option<IOCompletions>,
     pub pc: InsnReference,
     pub(crate) cursors: Vec<Option<Cursor>>,
@@ -1003,6 +1107,13 @@ pub struct ProgramState {
     /// the statement subtransactionwill roll back.
     fk_immediate_violations_during_stmt: AtomicIsize,
     uses_subjournal: bool,
+    /// Whether the connection's schema holds any materialized view, read the
+    /// first time an `Insert` asks and kept for the rest of the execution.
+    /// `Insert` asks for every row it writes whether the table it writes has a
+    /// dependent view, and asking takes the connection's schema lock — two
+    /// locked instructions per row for an answer that no statement holding a
+    /// write transaction can see change.
+    schema_has_materialized_views: Option<bool>,
     /// Whether this statement is an active write inside an explicit transaction.
     pub(crate) is_active_write: bool,
     /// Whether begin_statement was called (savepoint + FK bookkeeping active).
@@ -1048,6 +1159,11 @@ impl ProgramState {
         Self {
             check_countdown: 1,
             check_interval: MAX_CHECK_INTERVAL,
+            check_countdown_start: 1,
+            trace_flags: TraceFlags::default(),
+            incomplete_steps: 0,
+            insn_executed_reset_at: 0,
+            rows_read_reset_at: 0,
             io_completions: None,
             pc: 0,
             cursors,
@@ -1090,6 +1206,7 @@ impl ProgramState {
             hash_tables: HashMap::default(),
             ephemeral_temp_files: HashMap::default(),
             uses_subjournal: false,
+            schema_has_materialized_views: None,
             is_active_write: false,
             has_stmt_transaction: false,
             attached_savepoint_pagers: Vec::new(),
@@ -1253,6 +1370,7 @@ impl ProgramState {
             self.ephemeral_temp_files.clear();
         }
         self.uses_subjournal = false;
+        self.schema_has_materialized_views = None;
         self.is_active_write = false;
         self.has_stmt_transaction = false;
         self.distinct_key_values.clear();
@@ -1269,12 +1387,12 @@ impl ProgramState {
     }
 
     pub(crate) fn record_statement_change(&self) {
-        self.n_change.fetch_add(1, Ordering::SeqCst);
-        self.n_total_change.fetch_add(1, Ordering::SeqCst);
+        bump_change_count(&self.n_change);
+        bump_change_count(&self.n_total_change);
     }
 
     pub(crate) fn record_total_change(&self) {
-        self.n_total_change.fetch_add(1, Ordering::SeqCst);
+        bump_change_count(&self.n_total_change);
     }
 
     /// Whether this statement may finish the implicit autocommit transaction
@@ -1422,19 +1540,52 @@ impl ProgramState {
     /// Runs `f` on the metrics of this statement including its active and
     /// cached subprograms, without copying them when there is no subprogram.
     pub(crate) fn with_metrics<R>(&self, f: impl FnOnce(&StatementMetrics) -> R) -> R {
-        let has_subprograms = matches!(
-            self.active_op_state.program_ref(),
-            Some(OpProgramState::Step { .. })
-        ) || !self.subprogram_stmt_cache.is_empty();
-        if has_subprograms {
-            f(&self.metrics())
-        } else {
-            f(&self.metrics)
-        }
+        f(&self.metrics())
+    }
+
+    /// Instructions run since `check_countdown` was last reloaded, and so not
+    /// yet added to `metrics.vm_steps`.
+    #[inline]
+    fn steps_since_check(&self) -> u64 {
+        self.check_countdown_start
+            .wrapping_sub(self.check_countdown)
+    }
+
+    /// Dispatch loop iterations.
+    #[inline]
+    fn vm_steps(&self) -> u64 {
+        self.metrics.vm_steps.wrapping_add(self.steps_since_check())
+    }
+
+    /// Instructions that ran to completion. The dispatch loop counts its
+    /// iterations and the ones that did not complete in `incomplete_steps`, so
+    /// this is their difference.
+    fn insn_executed(&self) -> u64 {
+        self.vm_steps()
+            .wrapping_sub(self.incomplete_steps)
+            .wrapping_sub(self.insn_executed_reset_at)
+    }
+
+    /// Rows handed over by a cursor advance. Every successful Next and Prev
+    /// reads exactly one row and counts as one search, so both of those
+    /// totals are built from these two counters instead of their own.
+    #[inline]
+    fn advances(&self) -> u64 {
+        self.metrics
+            .btree_next
+            .wrapping_add(self.metrics.btree_prev)
     }
 
     pub(crate) fn metrics(&self) -> StatementMetrics {
         let mut metrics = self.metrics.clone();
+        metrics.vm_steps = self.vm_steps();
+        metrics.insn_executed = self.insn_executed();
+        let advances = self.advances();
+        metrics.rows_read = metrics
+            .rows_read
+            .wrapping_add(advances)
+            .wrapping_sub(self.rows_read_reset_at);
+        metrics.search_count = metrics.search_count.wrapping_add(advances as i64);
         if let Some(OpProgramState::Step { statement, .. }) = self.active_op_state.program_ref() {
             metrics.merge(&statement.metrics());
         }
@@ -1446,6 +1597,10 @@ impl ProgramState {
 
     pub(crate) fn reset_metrics(&mut self) {
         self.metrics.reset();
+        self.incomplete_steps = 0;
+        self.insn_executed_reset_at = 0;
+        self.rows_read_reset_at = 0;
+        self.check_countdown_start = self.check_countdown;
         if let Some(OpProgramState::Step { statement, .. }) = self.active_op_state.program_mut() {
             statement.reset_metrics();
         }
@@ -1460,9 +1615,14 @@ impl ProgramState {
                 self.metrics.fullscan_steps = 0
             }
             crate::statement::StatementStatusCounter::Sort => self.metrics.sort_operations = 0,
-            crate::statement::StatementStatusCounter::VmStep => self.metrics.insn_executed = 0,
+            crate::statement::StatementStatusCounter::VmStep => {
+                self.insn_executed_reset_at = self.vm_steps().wrapping_sub(self.incomplete_steps)
+            }
             crate::statement::StatementStatusCounter::Reprepare => self.metrics.reprepares = 0,
-            crate::statement::StatementStatusCounter::RowsRead => self.metrics.rows_read = 0,
+            crate::statement::StatementStatusCounter::RowsRead => {
+                self.metrics.rows_read = 0;
+                self.rows_read_reset_at = self.advances();
+            }
             crate::statement::StatementStatusCounter::RowsWritten => self.metrics.rows_written = 0,
         }
         if let Some(OpProgramState::Step { statement, .. }) = self.active_op_state.program_mut() {
@@ -1964,7 +2124,7 @@ impl Program {
             .is_some_and(|deadline| io.current_time_monotonic() >= deadline);
         let progress_interrupt = self
             .connection
-            .should_interrupt_for_progress(prev_steps, state.metrics.vm_steps);
+            .should_interrupt_for_progress(prev_steps, state.vm_steps());
         if connection_interrupt || hit_query_deadline || progress_interrupt {
             state.interrupt();
         }
@@ -1981,6 +2141,10 @@ impl Program {
         waker: Option<&Waker>,
     ) -> Result<StepResult, Box<LimboError>> {
         if let QueryMode::Normal = query_mode {
+            // Subprograms reach the dispatch loop through here rather than
+            // through Statement::prepare_step, so this is where they read the
+            // trace switches.
+            state.trace_flags = TraceFlags::read(&self.connection);
             return self.normal_step(state, pager, waker).into();
         }
         state.execution_state = ProgramExecutionState::Running;
@@ -2036,7 +2200,7 @@ impl Program {
         if self.maybe_request_interrupt(
             state,
             pager.io.as_ref(),
-            state.metrics.vm_steps.saturating_sub(1),
+            state.vm_steps().saturating_sub(1),
         ) {
             return Ok(StepResult::Interrupt);
         }
@@ -2135,7 +2299,7 @@ impl Program {
             if self.maybe_request_interrupt(
                 state,
                 pager.io.as_ref(),
-                state.metrics.vm_steps.saturating_sub(1),
+                state.vm_steps().saturating_sub(1),
             ) {
                 return Ok(StepResult::Interrupt);
             }
@@ -2185,7 +2349,7 @@ impl Program {
         if self.maybe_request_interrupt(
             state,
             pager.io.as_ref(),
-            state.metrics.vm_steps.saturating_sub(1),
+            state.vm_steps().saturating_sub(1),
         ) {
             return Ok(StepResult::Interrupt);
         }
@@ -2254,27 +2418,44 @@ impl Program {
         waker: Option<&Waker>,
     ) -> ProgramStep {
         state.execution_state = ProgramExecutionState::Running;
-        let enable_tracing = tracing::enabled!(tracing::Level::TRACE);
-        let vdbe_trace = self.connection.get_vdbe_trace();
-        let result = if enable_tracing || vdbe_trace {
-            dispatch_loop_traced(self, state, pager, waker, enable_tracing, vdbe_trace)
+        let trace_flags = state.trace_flags;
+        let result = if trace_flags.any() {
+            dispatch_loop_traced(
+                self,
+                state,
+                pager,
+                waker,
+                trace_flags.tracing_enabled(),
+                trace_flags.vdbe_trace(),
+            )
         } else {
             dispatch_loop::<false>(self, state, pager, waker, false, false)
         };
-        match &result {
-            ProgramStep::Row => {}
-            ProgramStep::Done => {
-                state.execution_state = ProgramExecutionState::Done;
-            }
-            ProgramStep::Interrupt => {
-                state.execution_state = ProgramExecutionState::Interrupted;
-            }
-            ProgramStep::Error(_) => {
-                state.execution_state = ProgramExecutionState::Failed;
-            }
-            _ => {}
+        // Row is returned as a fresh constant, not as the value the loop
+        // produced. The loop merges its returns, so reading Row out of that
+        // merge point hands the caller a phi, and the caller's match over
+        // ProgramStep then compiles to a jump table that runs on every row.
+        if matches!(result, ProgramStep::Row) {
+            return ProgramStep::Row;
         }
+        record_terminal_state(state, &result);
         return result;
+
+        #[inline(never)]
+        fn record_terminal_state(state: &mut ProgramState, result: &ProgramStep) {
+            match result {
+                ProgramStep::Done => {
+                    state.execution_state = ProgramExecutionState::Done;
+                }
+                ProgramStep::Interrupt => {
+                    state.execution_state = ProgramExecutionState::Interrupted;
+                }
+                ProgramStep::Error(_) => {
+                    state.execution_state = ProgramExecutionState::Failed;
+                }
+                ProgramStep::Row | ProgramStep::IO | ProgramStep::Busy | ProgramStep::Yield => {}
+            }
+        }
 
         #[inline(never)]
         fn dispatch_loop_traced(
@@ -2333,9 +2514,6 @@ impl Program {
                         program.trace_step(state, insn, enable_tracing, vdbe_trace);
                     }
 
-                    // Always increment VM steps for every loop iteration
-                    state.metrics.vm_steps = state.metrics.vm_steps.wrapping_add(1);
-
                     // The opcodes that run once per row of a scan are matched here
                     // so LLVM inlines them into the loop, and each one tests its
                     // own result right after its body, where the result is a
@@ -2346,13 +2524,9 @@ impl Program {
                         ($op:path) => {
                             match $op(program, state, insn, pager) {
                                 Ok(InsnFunctionStepResult::Step) => {
-                                    state.metrics.insn_executed =
-                                        state.metrics.insn_executed.wrapping_add(1);
                                     continue;
                                 }
                                 Ok(InsnFunctionStepResult::Row) => {
-                                    state.metrics.insn_executed =
-                                        state.metrics.insn_executed.wrapping_add(1);
                                     return ProgramStep::Row;
                                 }
                                 other => other,
@@ -2384,12 +2558,10 @@ impl Program {
                     // each; the rest settles out of line.
                     if let Ok(InsnFunctionStepResult::Step) = result {
                         // Instruction completed, moving to next
-                        state.metrics.insn_executed = state.metrics.insn_executed.wrapping_add(1);
                         continue;
                     }
                     if let Ok(InsnFunctionStepResult::Row) = result {
                         // Instruction completed (ResultRow already incremented PC)
-                        state.metrics.insn_executed = state.metrics.insn_executed.wrapping_add(1);
                         return ProgramStep::Row;
                     }
                     match dispatch_cold(program, state, pager, waker, result) {
@@ -2410,15 +2582,18 @@ impl Program {
                 match result {
                     Ok(InsnFunctionStepResult::Done) => {
                         // Instruction completed execution
-                        state.metrics.insn_executed = state.metrics.insn_executed.wrapping_add(1);
                         state.auto_txn_cleanup = TxnCleanup::None;
                         Some(ProgramStep::Done)
                     }
                     Ok(InsnFunctionStepResult::IO) => {
+                        state.incomplete_steps = state.incomplete_steps.wrapping_add(1);
                         let io = state.take_suspended_io();
                         program.park_on_io(state, io, waker)
                     }
-                    Err(boxed_err) => program.fail_step(state, pager, *boxed_err),
+                    Err(boxed_err) => {
+                        state.incomplete_steps = state.incomplete_steps.wrapping_add(1);
+                        program.fail_step(state, pager, *boxed_err)
+                    }
                     Ok(InsnFunctionStepResult::Step) | Ok(InsnFunctionStepResult::Row) => {
                         unreachable!("the dispatch loop settles steps and rows itself")
                     }
@@ -2537,7 +2712,12 @@ impl Program {
         } else {
             progress_ops
         };
+        state.metrics.vm_steps = state
+            .metrics
+            .vm_steps
+            .wrapping_add(state.steps_since_check());
         state.check_countdown = state.check_interval;
+        state.check_countdown_start = state.check_interval;
         if self.connection.is_closed() {
             return Some(ProgramStep::Error(self.closed_during_step(pager)));
         }
@@ -2560,7 +2740,7 @@ impl Program {
         state: &mut ProgramState,
         pager: &Arc<Pager>,
     ) -> Option<ProgramStep> {
-        let prev_steps = state.metrics.vm_steps.saturating_sub(state.check_interval);
+        let prev_steps = state.vm_steps().saturating_sub(state.check_interval);
         if self.maybe_request_interrupt(state, pager.io.as_ref(), prev_steps) {
             return self.interrupted_during_step(state, pager);
         }
@@ -3699,6 +3879,17 @@ impl Deref for Program {
     }
 }
 
+/// Add one to a row-change count.
+///
+/// The count is atomic so that another thread can read it while the statement
+/// that owns it runs, not so that two threads can raise it: one thread steps a
+/// statement at a time. A load and a store are enough, where `fetch_add` was a
+/// locked read-modify-write for every row a statement changed.
+#[inline(always)]
+fn bump_change_count(count: &AtomicI64) {
+    count.store(count.load(Ordering::Relaxed) + 1, Ordering::Relaxed);
+}
+
 /// Split a register slice into an immutable ref and a mutable ref at two distinct indices.
 pub(crate) fn split_registers(
     registers: &mut [Register],
@@ -3906,7 +4097,7 @@ fn skip_serial_types(header: &mut &[u8], data: &mut &[u8], n: usize) -> Result<(
             break;
         }
         let serial_type = read_serial_type(header)?;
-        data_sum += get_serial_type_size(serial_type)?;
+        data_sum += get_serial_type_size(serial_type);
     }
     if data_sum > data.len() {
         return Err(LimboError::Corrupt(
@@ -3918,11 +4109,20 @@ fn skip_serial_types(header: &mut &[u8], data: &mut &[u8], n: usize) -> Result<(
 }
 
 /// Reads the serial type at the front of `header` and moves past it.
+///
+/// Every serial type up to a 58-byte string is one byte, so that case is
+/// decoded here rather than in [`read_varint_advance`]: reached through the
+/// general reader, the two-byte case it also handles costs
+/// `op_column_range_fetch` two instructions for every column of every row.
 #[inline(always)]
 fn read_serial_type(header: &mut &[u8]) -> Result<u64> {
-    let (serial_type, bytes_read) = read_varint(header)?;
-    *header = &header[bytes_read..];
-    Ok(serial_type)
+    if let [first, rest @ ..] = *header {
+        if *first < 0x80 {
+            *header = rest;
+            return Ok(*first as u64);
+        }
+    }
+    crate::storage::sqlite3_ondisk::read_varint_advance(header)
 }
 
 /// Decodes the value of `serial_type` at the front of `data` into `dest`

@@ -24,7 +24,10 @@ pub enum RewindState {
     NextRecord,
 }
 
-#[derive(Debug, Clone, Copy)]
+/// `#[repr(u8)]` because [crate::storage::btree::AdvanceFlags] packs it into a
+/// byte beside three bools and compares all four at once.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
 pub enum AdvanceState {
     Start,
     Advance,

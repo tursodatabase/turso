@@ -121,7 +121,7 @@ impl Affinity {
         }
     }
 
-    pub fn from_char(char: char) -> Self {
+    pub const fn from_char(char: char) -> Self {
         match char {
             SQLITE_AFF_INTEGER => Affinity::Integer,
             SQLITE_AFF_TEXT => Affinity::Text,
@@ -136,7 +136,7 @@ impl Affinity {
         self.aff_mask() as u8
     }
 
-    pub fn from_char_code(code: u8) -> Self {
+    pub const fn from_char_code(code: u8) -> Self {
         Self::from_char(code as char)
     }
 
@@ -836,5 +836,13 @@ mod tests {
         }
 
         assert_eq!(Affinity::from_repr(0), None);
+    }
+
+    /// The scalar functions pass these affinities to `Value::exec_cast_to`
+    /// where they used to pass the type names beside them to `exec_cast`.
+    #[test]
+    fn the_type_names_the_scalar_functions_cast_to_keep_their_affinities() {
+        assert_eq!(Affinity::affinity("INT"), Affinity::Integer);
+        assert_eq!(Affinity::affinity("TEXT"), Affinity::Text);
     }
 }
