@@ -612,6 +612,7 @@ struct LeafSearchOutcome {
 enum CurrentTableLeafSeek {
     SearchFromRoot,
     SearchCurrentLeaf,
+    NotFoundAtEnd,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -2426,10 +2427,13 @@ impl BTreeCursor {
     #[cfg_attr(debug_assertions, instrument(skip_all, level = Level::DEBUG))]
     fn tablebtree_seek(&mut self, rowid: i64, seek_op: SeekOp) -> IOResultOr<SeekResult> {
         let search_tree = if matches!(self.seek_state, CursorSeekState::Start) {
-            matches!(
-                self.try_start_seek_on_current_table_leaf(rowid, seek_op)?,
-                CurrentTableLeafSeek::SearchFromRoot
-            )
+            match self.try_start_seek_on_current_table_leaf(rowid, seek_op)? {
+                CurrentTableLeafSeek::SearchFromRoot => true,
+                CurrentTableLeafSeek::SearchCurrentLeaf => false,
+                CurrentTableLeafSeek::NotFoundAtEnd => {
+                    return Ok(IOResult::Done(SeekResult::NotFound));
+                }
+            }
         } else {
             matches!(
                 self.seek_state,
@@ -2451,7 +2455,7 @@ impl BTreeCursor {
                 self.stack.set_cell_index(0);
                 return Ok(IOResult::Done(SeekResult::NotFound));
             }
-            self.start_table_leaf_search(0, cell_count, seek_op);
+            self.start_table_leaf_search(cell_count, seek_op);
         }
 
         let CursorSeekState::LeafPageBinarySearch { state } = &self.seek_state else {
@@ -2488,7 +2492,7 @@ impl BTreeCursor {
             return Ok(CurrentTableLeafSeek::SearchFromRoot);
         }
 
-        let (first_cell_to_compare, cell_count) = {
+        let (seek, cell_count) = {
             let page = self.stack.top_ref();
             turso_debug_assert!(page.is_loaded(), "the current table leaf must be loaded");
             let contents = page.get_contents();
@@ -2500,7 +2504,7 @@ impl BTreeCursor {
                 return Ok(CurrentTableLeafSeek::SearchFromRoot);
             }
             let last_rowid = contents.cell_table_leaf_read_rowid(cell_count - 1)?;
-            let first_cell_to_compare = if rowid > last_rowid {
+            let seek = if rowid > last_rowid {
                 if self.ancestor_pages_have_more_children() {
                     return Ok(CurrentTableLeafSeek::SearchFromRoot);
                 }
@@ -2510,28 +2514,33 @@ impl BTreeCursor {
                         .is_ok_and(|cell_rowid| cell_rowid < rowid)),
                     "a rowid past the last cell must be past every cell"
                 );
-                cell_count
+                CurrentTableLeafSeek::NotFoundAtEnd
             } else if rowid >= contents.cell_table_leaf_read_rowid(0)? {
-                0
+                CurrentTableLeafSeek::SearchCurrentLeaf
             } else {
                 return Ok(CurrentTableLeafSeek::SearchFromRoot);
             };
-            (first_cell_to_compare, cell_count)
+            (seek, cell_count)
         };
 
-        self.start_table_leaf_search(first_cell_to_compare, cell_count, seek_op);
-        Ok(CurrentTableLeafSeek::SearchCurrentLeaf)
+        match seek {
+            CurrentTableLeafSeek::SearchCurrentLeaf => {
+                self.start_table_leaf_search(cell_count, seek_op);
+                Ok(CurrentTableLeafSeek::SearchCurrentLeaf)
+            }
+            CurrentTableLeafSeek::NotFoundAtEnd => {
+                self.stack.set_cell_index(cell_count as i32);
+                self.has_record = false;
+                Ok(CurrentTableLeafSeek::NotFoundAtEnd)
+            }
+            CurrentTableLeafSeek::SearchFromRoot => unreachable!(),
+        }
     }
 
-    fn start_table_leaf_search(
-        &mut self,
-        first_cell_to_compare: usize,
-        cell_count: usize,
-        seek_op: SeekOp,
-    ) {
+    fn start_table_leaf_search(&mut self, cell_count: usize, seek_op: SeekOp) {
         self.seek_state = CursorSeekState::LeafPageBinarySearch {
             state: LeafPageBinarySearchState {
-                min_cell_idx: first_cell_to_compare as isize,
+                min_cell_idx: 0,
                 max_cell_idx: cell_count as isize - 1,
                 nearest_matching_cell: None,
                 eq_seen: false,
@@ -11500,6 +11509,30 @@ mod tests {
             IOResult::Done(SeekResult::Found)
         ));
         assert_eq!(cursor.stack.top_ref().get().id(), leaf_page);
+
+        cursor.seek_state = CursorSeekState::Start;
+        assert_eq!(
+            run_until_done(
+                || cursor.seek(SeekKey::TableRowId(800), SeekOp::GE { eq_only: true }),
+                &pager,
+            )
+            .unwrap(),
+            SeekResult::Found
+        );
+        let rightmost_page = cursor.stack.top_ref().get().id();
+        let cell_count = cursor.stack.top_ref().get_contents().cell_count();
+        assert_eq!(
+            run_until_done(
+                || cursor.seek(SeekKey::TableRowId(801), SeekOp::GE { eq_only: true }),
+                &pager,
+            )
+            .unwrap(),
+            SeekResult::NotFound
+        );
+        assert_eq!(cursor.stack.current_cell_index(), cell_count as i32);
+        assert!(!cursor.has_record);
+        assert!(matches!(cursor.seek_state, CursorSeekState::Start));
+        assert_eq!(cursor.stack.top_ref().get().id(), rightmost_page);
     }
 
     #[test]
