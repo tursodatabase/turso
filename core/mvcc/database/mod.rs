@@ -1483,9 +1483,9 @@ pub enum CommitState<Clock: LogicalClock, A: ConcurrentAllocator = TursoAllocato
     FinishLogicalLogWrite {
         end_ts: u64,
     },
-    /// Advance the writer offset after extra durability work from
+    /// Mark the record as written after extra durability work from
     /// `on_log_write_complete` finishes.
-    OwnLogicalLogRecord {
+    MarkLogRecordWritten {
         end_ts: u64,
     },
     SyncLogicalLog {
@@ -1589,10 +1589,10 @@ pub(crate) enum CommitYieldPoint {
     /// is cleared by the caller at vdbe/mod.rs. Used for failure injection
     /// to reproduce divergence between `mv_store.txs` and `connection.mv_tx_id`.
     AfterRemoveTx,
-    /// Fires after this transaction's logical-log record is owned (offset
+    /// Fires after this transaction's logical-log record is marked written (offset
     /// advanced, `log_appended` set), including the last record of a group
     /// batch, and before the covering fsync.
-    LogicalLogOwned,
+    LogRecordMarkedWritten,
     /// Fires after `log_tx` is issued for another transaction's record and
     /// before the offset is advanced. Dropping the waiter here must not
     /// roll back a write the leader still owns.
@@ -1774,7 +1774,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CommitStateMachine<Clock, A> {
             if let Some(advanced) = batch.advanced_through {
                 self.commit_coordinator.note_written(advanced);
             }
-            let owned = batch.advanced_through == Some(batch.writing.ticket);
+            let marked_written = batch.advanced_through == Some(batch.writing.ticket);
             let submitted = self.pending_log_append_bytes.is_some();
             let before_log_tx = !submitted
                 && matches!(
@@ -1790,12 +1790,12 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CommitStateMachine<Clock, A> {
                 }
                 self.commit_coordinator
                     .requeue(std::iter::once(batch.writing).chain(batch.rest));
-            } else if !owned
+            } else if !marked_written
                 && matches!(
                     self.state,
                     CommitState::WriteLogicalLog { .. }
                         | CommitState::FinishLogicalLogWrite { .. }
-                        | CommitState::OwnLogicalLogRecord { .. }
+                        | CommitState::MarkLogRecordWritten { .. }
                 )
             {
                 self.commit_coordinator.clear_issued();
@@ -1877,12 +1877,12 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CommitStateMachine<Clock, A> {
         true
     }
 
-    fn own_logical_log_record(
+    fn mark_log_record_written(
         &mut self,
         mvcc_store: &Arc<MvStore<Clock, A>>,
         ticket: Option<u64>,
         owner_tx: TxID,
-    ) -> Result<bool> {
+    ) -> Result<()> {
         let append_bytes = self.pending_log_append_bytes.take().ok_or_else(|| {
             LimboError::InternalError(
                 "logical log record completed without pending byte count".to_string(),
@@ -1905,7 +1905,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CommitStateMachine<Clock, A> {
             self.finish_abandoned_group_waiter(mvcc_store, owner_tx)?;
         }
         self.wrote_logical_log = true;
-        Ok(owner_tx == self.tx_id)
+        Ok(())
     }
 
     fn finish_abandoned_group_waiter(
@@ -3485,23 +3485,23 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> StateTransition for CommitStat
             CommitState::FinishLogicalLogWrite { end_ts } => {
                 let end_ts = *end_ts;
                 let c = mvcc_store.storage.on_log_write_complete()?;
-                self.state = CommitState::OwnLogicalLogRecord { end_ts };
+                self.state = CommitState::MarkLogRecordWritten { end_ts };
                 if c.succeeded() {
                     Ok(TransitionResult::Continue)
                 } else {
                     Ok(TransitionResult::Io(IOCompletions(c)))
                 }
             }
-            CommitState::OwnLogicalLogRecord { end_ts } => {
+            CommitState::MarkLogRecordWritten { end_ts } => {
                 let end_ts = *end_ts;
                 let (ticket, owner_tx) = match self.group_batch.as_ref() {
                     Some(batch) => (Some(batch.writing.ticket), batch.writing.tx_id),
                     None => (None, self.tx_id),
                 };
-                let owned_self = self.own_logical_log_record(mvcc_store, ticket, owner_tx)?;
+                self.mark_log_record_written(mvcc_store, ticket, owner_tx)?;
                 self.state = self.advance_group_or_sync(end_ts, mvcc_store.logical_log_allocator());
-                if owned_self {
-                    inject_transition_yield!(self, CommitYieldPoint::LogicalLogOwned);
+                if owner_tx == self.tx_id {
+                    inject_transition_yield!(self, CommitYieldPoint::LogRecordMarkedWritten);
                 }
                 Ok(TransitionResult::Continue)
             }
@@ -3592,7 +3592,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> StateTransition for CommitStat
                 return Ok(TransitionResult::Continue);
             }
             CommitState::CommitEnd { end_ts } => {
-                // The record is in the log and owned since OwnLogicalLogRecord.
+                // The record is in the log and marked written since MarkLogRecordWritten.
                 // Order of operations from here:
                 // 1. Mark transaction Committed
                 // 2. Rewrite live row versions from TxID to Timestamp (chunked
@@ -10876,8 +10876,8 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> Debug for CommitState<Clock, A
                 .debug_struct("FinishLogicalLogWrite")
                 .field("end_ts", end_ts)
                 .finish(),
-            Self::OwnLogicalLogRecord { end_ts } => f
-                .debug_struct("OwnLogicalLogRecord")
+            Self::MarkLogRecordWritten { end_ts } => f
+                .debug_struct("MarkLogRecordWritten")
                 .field("end_ts", end_ts)
                 .finish(),
             Self::SyncLogicalLog { end_ts } => f
