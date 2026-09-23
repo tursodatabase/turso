@@ -1901,7 +1901,7 @@ fn test_upsert_do_update_failure_preserves_indexes(tmp_db: TempDatabase) -> anyh
 
 #[turso_macros::test]
 #[ignore = "known bug #9293: the seek in restore_context clears skip_advance, so DELETE skips the next row"]
-fn test_delete_self_fk_set_null_deletes_every_row_on_one_page(
+fn test_delete_with_fk_update_write_back_deletes_every_row_on_one_page(
     tmp_db: TempDatabase,
 ) -> anyhow::Result<()> {
     let conn = tmp_db.connect_limbo();
@@ -1909,11 +1909,14 @@ fn test_delete_self_fk_set_null_deletes_every_row_on_one_page(
         &conn,
         &[
             "PRAGMA foreign_keys = ON",
-            "CREATE TABLE t(id INTEGER PRIMARY KEY, parent INTEGER REFERENCES t(id) ON DELETE SET NULL)",
-            "INSERT INTO t VALUES (1, NULL), (2, 1), (3, 2), (4, 3), (5, 4), (6, 5)",
-            "DELETE FROM t WHERE id > 1",
+            "CREATE TABLE t(id INTEGER PRIMARY KEY, cref INTEGER REFERENCES c(x) ON UPDATE SET NULL)",
+            "CREATE TABLE c(id INTEGER PRIMARY KEY, x INTEGER UNIQUE REFERENCES t(id) ON DELETE SET NULL)",
+            "INSERT INTO t VALUES (1, NULL), (2, NULL), (3, NULL), (4, NULL), (5, NULL), (6, NULL)",
+            "INSERT INTO c(x) VALUES (2), (3), (4), (5), (6)",
+            "INSERT INTO t VALUES (1002, 2), (1003, 3), (1004, 4), (1005, 5), (1006, 6)",
+            "DELETE FROM t WHERE id BETWEEN 2 AND 6",
         ],
-        "SELECT id FROM t ORDER BY id",
+        "SELECT id, cref FROM t ORDER BY id",
     )?;
     assert_eq!(turso, sqlite);
     Ok(())
@@ -1921,7 +1924,7 @@ fn test_delete_self_fk_set_null_deletes_every_row_on_one_page(
 
 #[turso_macros::test]
 #[ignore = "known bug #9294: a delete of cell 0 leaves the cursor at cell -1, a write by the FK action empties its stack, and DELETE stops"]
-fn test_delete_self_fk_set_null_continues_after_first_cell_of_page(
+fn test_delete_with_fk_update_write_back_continues_after_first_cell_of_page(
     tmp_db: TempDatabase,
 ) -> anyhow::Result<()> {
     let conn = tmp_db.connect_limbo();
@@ -1929,10 +1932,13 @@ fn test_delete_self_fk_set_null_continues_after_first_cell_of_page(
         &conn,
         &[
             "PRAGMA foreign_keys = ON",
-            "CREATE TABLE t(id INTEGER PRIMARY KEY, parent INTEGER REFERENCES t(id) ON DELETE SET NULL, pad TEXT)",
-            "WITH RECURSIVE s(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM s WHERE x < 12) \
-             INSERT INTO t SELECT x, CASE WHEN x > 1 THEN x - 1 END, printf('%.900c', 'x') FROM s",
-            "DELETE FROM t WHERE id > 4",
+            "CREATE TABLE t(id INTEGER PRIMARY KEY, cref INTEGER REFERENCES c(x) ON UPDATE SET NULL, pad TEXT)",
+            "CREATE TABLE c(id INTEGER PRIMARY KEY, x INTEGER UNIQUE REFERENCES t(id) ON DELETE SET NULL)",
+            "WITH RECURSIVE s(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM s WHERE n < 12) \
+             INSERT INTO t SELECT n, NULL, printf('%.900c', 'x') FROM s",
+            "INSERT INTO c(x) VALUES (5)",
+            "INSERT INTO t VALUES (1005, 5, NULL)",
+            "DELETE FROM t WHERE id BETWEEN 5 AND 12",
         ],
         "SELECT id FROM t ORDER BY id",
     )?;
