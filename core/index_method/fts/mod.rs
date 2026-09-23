@@ -1982,14 +1982,14 @@ impl FtsCursor {
             self.schema.clone(),
             IndexSettings::default(),
         )
-        .map_err(|e| LimboError::InternalError(format!("FTS build index: {e}")))?;
+        .map_err(|e| build_dir.write_error(e, "FTS build index"))?;
         // The segment writer pulls tokenizers off `segment.index()`, so the
         // build index needs the same registrations as the read side.
         self.register_tokenizers(&index);
         let segment_id = self.mint_segment_id();
         let segment = index.segment(index.new_segment_meta(segment_id, 0));
         let mut writer = SegmentWriter::for_segment(DEFAULT_MEMORY_BUDGET_BYTES, segment)
-            .map_err(|e| LimboError::InternalError(format!("FTS segment writer: {e}")))?;
+            .map_err(|e| build_dir.write_error(e, "FTS segment writer"))?;
         let identity_base = self.mint_identity_base();
         let mut added = 0u32;
         for buffered in self.doc_buffer.drain(..) {
@@ -2005,7 +2005,7 @@ impl FtsCursor {
                     opstamp: 0,
                     document,
                 })
-                .map_err(|e| LimboError::InternalError(format!("FTS add_document: {e}")))?;
+                .map_err(|e| build_dir.write_error(e, "FTS add_document"))?;
             added += 1;
         }
         let max_doc = writer.max_doc();
@@ -2018,7 +2018,7 @@ impl FtsCursor {
         }
         writer
             .finalize()
-            .map_err(|e| LimboError::InternalError(format!("FTS segment finalize: {e}")))?;
+            .map_err(|e| build_dir.write_error(e, "FTS segment finalize"))?;
         self.shared
             .stats
             .segment_builds
@@ -2167,7 +2167,7 @@ impl FtsCursor {
                 vec![None; input_segments.len()],
                 build_dir.clone(),
             )
-            .map_err(|e| LimboError::InternalError(format!("FTS merge failed: {e}")))?;
+            .map_err(|e| build_dir.write_error(e, "FTS merge failed"))?;
             let merged_metas = merged_index
                 .searchable_segment_metas()
                 .map_err(|e| LimboError::InternalError(format!("FTS merged metas: {e}")))?;

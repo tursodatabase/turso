@@ -201,6 +201,9 @@ struct BuildDirectoryInner {
     /// Atomic writes (`meta.json`, `.managed.json`): absorbed here so
     /// whole-index manifests never reach the B-tree.
     atomic: HashMap<PathBuf, ArcSlice<u8>>,
+    // Tantivy can convert typed I/O errors into strings. Remember allocation
+    // failures so write_error can still return OutOfMemory for this build.
+    allocation_failed: bool,
 }
 
 /// Private in-memory write buffer for building one immutable segment.
@@ -224,6 +227,14 @@ impl BuildDirectory {
     pub fn captured_files(&self) -> HashMap<PathBuf, Arc<[u8]>> {
         self.inner.read().files.clone()
     }
+
+    pub fn write_error(&self, error: tantivy::TantivyError, context: &str) -> crate::LimboError {
+        if self.inner.read().allocation_failed {
+            crate::LimboError::OutOfMemory
+        } else {
+            crate::LimboError::InternalError(format!("{context}: {error}"))
+        }
+    }
 }
 
 impl std::fmt::Debug for BuildDirectory {
@@ -244,10 +255,14 @@ struct CaptureWriter {
 }
 
 impl Write for CaptureWriter {
+    #[turso_macros::allocation_site(crate::alloc::FtsAllocationSite::CaptureBuffer)]
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
         self.buffer
             .try_extend(buf.iter().copied())
-            .map_err(|error| std::io::Error::new(std::io::ErrorKind::OutOfMemory, error))?;
+            .map_err(|error| {
+                self.inner.write().allocation_failed = true;
+                std::io::Error::new(std::io::ErrorKind::OutOfMemory, error)
+            })?;
         Ok(buf.len())
     }
 
@@ -305,9 +320,12 @@ impl Directory for BuildDirectory {
         }
     }
 
+    #[turso_macros::allocation_site(crate::alloc::FtsAllocationSite::AtomicMetadata)]
     fn atomic_write(&self, path: &Path, data: &[u8]) -> std::io::Result<()> {
-        let data = try_arc_slice_from_slice_in(data, self.allocator.clone())
-            .map_err(|error| std::io::Error::new(std::io::ErrorKind::OutOfMemory, error))?;
+        let data = try_arc_slice_from_slice_in(data, self.allocator.clone()).map_err(|error| {
+            self.inner.write().allocation_failed = true;
+            std::io::Error::new(std::io::ErrorKind::OutOfMemory, error)
+        })?;
         self.inner.write().atomic.insert(path.to_path_buf(), data);
         Ok(())
     }
