@@ -3376,10 +3376,10 @@ impl Record {
 
 pub enum Cursor {
     /// A b-tree cursor
-    BTree(Box<BTreeCursor>),
+    BTree(Box<BTreeCursor>, Option<Arc<IndexInfo>>),
     /// A cursor behind a trait object: currently, either the MVCC cursor or test doubles.
     /// TODO it wouldn't be too hard to get rid of `dyn CursorTrait` everywhere.
-    Dyn(Box<dyn CursorTrait>),
+    Dyn(Box<dyn CursorTrait>, Option<Arc<IndexInfo>>),
     IndexMethod(Box<dyn IndexMethodCursor>),
     Pseudo(Box<PseudoCursor>),
     Sorter(Box<Sorter>),
@@ -3409,12 +3409,14 @@ impl Cursor {
     pub fn new_btree(cursor: Box<BTreeCursor>) -> Self {
         // Matches sqlite3BtreeCursor adding to BtShared.pCursor (btree.c:4699).
         cursor.register_with_pager();
-        Self::BTree(cursor)
+        let index_info = cursor.index_info().cloned();
+        Self::BTree(cursor, index_info)
     }
 
     pub fn new_btree_dyn(cursor: Box<dyn CursorTrait>) -> Self {
         cursor.register_with_pager();
-        Self::Dyn(cursor)
+        let index_info = cursor.index_info().cloned();
+        Self::Dyn(cursor, index_info)
     }
 
     pub fn new_pseudo(cursor: PseudoCursor) -> Self {
@@ -3433,13 +3435,36 @@ impl Cursor {
 
     pub fn as_btree_mut(&mut self) -> &mut dyn CursorTrait {
         match self {
-            Self::BTree(cursor) => cursor.as_mut(),
-            Self::Dyn(cursor) => cursor.as_mut(),
+            Self::BTree(cursor, _) => cursor.as_mut(),
+            Self::Dyn(cursor, _) => cursor.as_mut(),
             _ => {
                 mark_unlikely();
                 panic!("Cursor is not a btree cursor");
             }
         }
+    }
+
+    pub fn as_index_cursor_mut(&mut self) -> (&mut dyn CursorTrait, &IndexInfo) {
+        let (cursor, index_info) = match self {
+            Self::BTree(cursor, index_info) => {
+                (cursor.as_mut() as &mut dyn CursorTrait, index_info)
+            }
+            Self::Dyn(cursor, index_info) => (cursor.as_mut(), index_info),
+            _ => {
+                mark_unlikely();
+                panic!("Cursor is not a btree cursor");
+            }
+        };
+        let index_info = index_info
+            .as_ref()
+            .expect("an index comparison needs a cursor opened on an index");
+        crate::turso_debug_assert!(
+            cursor
+                .index_info()
+                .is_some_and(|own| Arc::ptr_eq(own, index_info)),
+            "the cursor's index info is not the one stored beside it"
+        );
+        (cursor, index_info)
     }
 
     pub fn as_pseudo_mut(&mut self) -> &mut PseudoCursor {
@@ -3497,8 +3522,8 @@ impl Cursor {
     /// Move the cursor to a synthetic null row. See [Insn::NullRow]
     pub fn set_null_flag(&mut self, flag: bool) {
         match self {
-            Self::BTree(cursor) => cursor.set_null_flag(flag),
-            Self::Dyn(cursor) => cursor.set_null_flag(flag),
+            Self::BTree(cursor, ..) => cursor.set_null_flag(flag),
+            Self::Dyn(cursor, ..) => cursor.set_null_flag(flag),
             Self::Virtual(cursor) => cursor.set_null_flag(flag),
             // A pseudo cursor always decodes columns from its content
             // register. SQLite's OP_NullRow likewise leaves pseudo-cursor

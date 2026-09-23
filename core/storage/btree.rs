@@ -804,7 +804,7 @@ pub trait CursorTrait: Any + Send + Sync {
     /// Check if cursor is poiting at a valid entry with a record.
     fn has_record(&self) -> bool;
     fn set_has_record(&mut self, has_record: bool);
-    fn get_index_info(&self) -> &Arc<IndexInfo>;
+    fn index_info(&self) -> Option<&Arc<IndexInfo>>;
 
     fn seek_end(&mut self) -> IOResultOr<()>;
     fn seek_to_last(&mut self) -> IOResultOr<()>;
@@ -7697,8 +7697,8 @@ impl CursorTrait for BTreeCursor {
     }
 
     #[inline]
-    fn get_index_info(&self) -> &Arc<IndexInfo> {
-        self.index_info.as_ref().unwrap()
+    fn index_info(&self) -> Option<&Arc<IndexInfo>> {
+        self.index_info.as_ref()
     }
 
     fn seek_end(&mut self) -> IOResultOr<()> {

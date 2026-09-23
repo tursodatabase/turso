@@ -1475,11 +1475,16 @@ pub fn op_open_read(
                 index.as_ref(),
                 num_columns,
             )?;
-            let index_info = Arc::new(if let Some(mv_store) = mv_store.as_ref() {
-                IndexInfo::new_from_index_in(index, mv_store.allocator())?
-            } else {
-                IndexInfo::new_from_index(index)?
-            });
+            let index_info = match mv_store.as_ref() {
+                Some(mv_store) => {
+                    Arc::new(IndexInfo::new_from_index_in(index, mv_store.allocator())?)
+                }
+                None => btree_cursor
+                    .index_info
+                    .as_ref()
+                    .expect("a cursor opened on an index holds its key")
+                    .clone(),
+            };
             let cursor =
                 maybe_promote_to_mvcc_cursor(btree_cursor, MvccCursorType::Index(index_info))?;
             cursors
@@ -1887,7 +1892,7 @@ pub fn op_rewind(
     let is_empty = {
         let cursor = state.get_cursor(*cursor_id);
         match cursor {
-            Cursor::BTree(_) | Cursor::Dyn(_) => {
+            Cursor::BTree(..) | Cursor::Dyn(..) => {
                 let btree_cursor = cursor.as_btree_mut();
                 return_if_io!(state, btree_cursor.rewind());
                 btree_cursor.is_empty()
@@ -2101,8 +2106,8 @@ fn op_column_deferred(
                 let Some(rowid) = ({
                     let index_cursor = state.get_cursor(index_cursor_id);
                     match index_cursor {
-                        Cursor::BTree(cursor) => return_if_io!(state, cursor.rowid()),
-                        Cursor::Dyn(cursor) => return_if_io!(state, cursor.rowid()),
+                        Cursor::BTree(cursor, ..) => return_if_io!(state, cursor.rowid()),
+                        Cursor::Dyn(cursor, ..) => return_if_io!(state, cursor.rowid()),
                         Cursor::IndexMethod(cursor) => return_if_io!(state, cursor.query_rowid()),
                         _ => panic!("unexpected cursor type"),
                     }
@@ -2181,7 +2186,7 @@ fn op_column_fetch(
         .get_mut(cursor_id)
         .unwrap_or_else(|| panic!("cursor id {cursor_id} out of bounds"))
     {
-        Some(Cursor::BTree(cursor)) => cursor,
+        Some(Cursor::BTree(cursor, ..)) => cursor,
         Some(Cursor::Pseudo(pseudo)) => {
             let content_reg = pseudo.content_reg();
             return op_column_fetch_pseudo(state, content_reg, column, dest);
@@ -2388,7 +2393,7 @@ fn op_column_range_fetch(
     defaults: &[Option<Value>],
 ) -> InsnResult {
     let count = defaults.len();
-    let Some(Cursor::BTree(cursor)) = state
+    let Some(Cursor::BTree(cursor, ..)) = state
         .cursors
         .get_mut(cursor_id)
         .unwrap_or_else(|| panic!("cursor id {cursor_id} out of bounds"))
@@ -3435,8 +3440,8 @@ fn blob_btree_cursor<'a>(
     opcode: &str,
 ) -> Result<&'a mut dyn crate::storage::btree::CursorTrait> {
     match state.get_cursor(cursor) {
-        Cursor::BTree(btree) => Ok(btree.as_mut()),
-        Cursor::Dyn(btree) => Ok(btree.as_mut()),
+        Cursor::BTree(btree, ..) => Ok(btree.as_mut()),
+        Cursor::Dyn(btree, ..) => Ok(btree.as_mut()),
         _ => Err(LimboError::InternalError(format!(
             "{opcode} requires a b-tree cursor"
         ))),
@@ -3600,7 +3605,7 @@ pub fn op_next(
     let is_empty = {
         let cursor = state.get_cursor(*cursor_id);
         match cursor {
-            Cursor::BTree(btree_cursor) => match btree_cursor.next_row() {
+            Cursor::BTree(btree_cursor, ..) => match btree_cursor.next_row() {
                 CursorStep::Row => false,
                 CursorStep::Empty => true,
                 CursorStep::Error(err) => return Err(err),
@@ -3630,7 +3635,7 @@ pub fn op_next(
     #[inline(never)]
     fn next_row_of_other_cursor(cursor: &mut Cursor) -> IOResultOr<bool> {
         match cursor {
-            Cursor::Dyn(btree_cursor) => match btree_cursor.next_row() {
+            Cursor::Dyn(btree_cursor, ..) => match btree_cursor.next_row() {
                 CursorStep::Row => Ok(IOResult::Done(true)),
                 CursorStep::Empty => Ok(IOResult::Done(false)),
                 CursorStep::Error(err) => Err(err),
@@ -6181,7 +6186,7 @@ fn op_row_id_deferred(state: &mut ProgramState, cursor_id: usize, dest: usize) -
                 let rowid = {
                     let index_cursor = state.get_cursor(index_cursor_id);
                     match index_cursor {
-                        Cursor::BTree(_) | Cursor::Dyn(_) => {
+                        Cursor::BTree(..) | Cursor::Dyn(..) => {
                             let index_cursor = index_cursor.as_btree_mut();
                             let record = return_if_io!(state, index_cursor.record());
                             let record =
@@ -6245,8 +6250,8 @@ fn op_row_id_read(state: &mut ProgramState, cursor_id: usize, dest: usize) -> In
         .get_mut(cursor_id)
         .expect("cursor_id should be valid");
     let rowid = match cursor {
-        Some(Cursor::BTree(btree_cursor)) => return_if_io!(state, btree_cursor.rowid()),
-        Some(Cursor::Dyn(btree_cursor)) => return_if_io!(state, btree_cursor.rowid()),
+        Some(Cursor::BTree(btree_cursor, ..)) => return_if_io!(state, btree_cursor.rowid()),
+        Some(Cursor::Dyn(btree_cursor, ..)) => return_if_io!(state, btree_cursor.rowid()),
         _ => return_if_io!(state, row_id_of_other_cursor(cursor)),
     };
     match rowid {
@@ -6293,8 +6298,8 @@ pub fn op_idx_row_id(
         .expect("cursor should exist");
 
     let rowid = match cursor {
-        Cursor::BTree(cursor) => return_if_io!(state, cursor.rowid()),
-        Cursor::Dyn(cursor) => return_if_io!(state, cursor.rowid()),
+        Cursor::BTree(cursor, ..) => return_if_io!(state, cursor.rowid()),
+        Cursor::Dyn(cursor, ..) => return_if_io!(state, cursor.rowid()),
         Cursor::IndexMethod(cursor) => return_if_io!(state, cursor.query_rowid()),
         Cursor::NullRow => None,
         _ => panic!("unexpected cursor type"),
@@ -6354,7 +6359,7 @@ pub fn op_seek_rowid(
                     None => (target_pc.as_offset_int(), false),
                 }
             }
-            Cursor::BTree(_) | Cursor::Dyn(_) => {
+            Cursor::BTree(..) | Cursor::Dyn(..) => {
                 let btree_cursor = cursor.as_btree_mut();
                 let rowid = match state.registers[*src_reg].get_value() {
                     Value::Numeric(Numeric::Integer(rowid)) => Some(*rowid),
@@ -6954,16 +6959,14 @@ pub fn op_idx_ge(
     }
 
     let pc = {
-        let cursor = get_cursor!(state, *cursor_id);
-        let cursor = cursor.as_btree_mut();
-        let index_info = cursor.get_index_info().clone();
+        let (cursor, index_info) = get_cursor!(state, *cursor_id).as_index_cursor_mut();
 
         let pc = if let Some(idx_payload) = return_if_io!(state, cursor.record_payload()) {
             let tie_breaker = get_tie_breaker_from_idx_comp_op(insn);
             let ord = compare_record(
                 idx_payload,
                 registers_to_ref_values(&state.registers[*start_reg..*start_reg + *num_regs]),
-                &index_info,
+                index_info,
                 tie_breaker,
             )?;
 
@@ -7020,16 +7023,14 @@ pub fn op_idx_le(
     }
 
     let pc = {
-        let cursor = get_cursor!(state, *cursor_id);
-        let cursor = cursor.as_btree_mut();
-        let index_info = cursor.get_index_info().clone();
+        let (cursor, index_info) = get_cursor!(state, *cursor_id).as_index_cursor_mut();
 
         let pc = if let Some(idx_payload) = return_if_io!(state, cursor.record_payload()) {
             let tie_breaker = get_tie_breaker_from_idx_comp_op(insn);
             let ord = compare_record(
                 idx_payload,
                 registers_to_ref_values(&state.registers[*start_reg..*start_reg + *num_regs]),
-                &index_info,
+                index_info,
                 tie_breaker,
             )?;
 
@@ -7070,16 +7071,14 @@ pub fn op_idx_gt(
     }
 
     let pc = {
-        let cursor = get_cursor!(state, *cursor_id);
-        let cursor = cursor.as_btree_mut();
-        let index_info = cursor.get_index_info().clone();
+        let (cursor, index_info) = get_cursor!(state, *cursor_id).as_index_cursor_mut();
 
         let pc = if let Some(idx_payload) = return_if_io!(state, cursor.record_payload()) {
             let tie_breaker = get_tie_breaker_from_idx_comp_op(insn);
             let ord = compare_record(
                 idx_payload,
                 registers_to_ref_values(&state.registers[*start_reg..*start_reg + *num_regs]),
-                &index_info,
+                index_info,
                 tie_breaker,
             )?;
 
@@ -7120,16 +7119,14 @@ pub fn op_idx_lt(
     }
 
     let pc = {
-        let cursor = get_cursor!(state, *cursor_id);
-        let cursor = cursor.as_btree_mut();
-        let index_info = cursor.get_index_info().clone();
+        let (cursor, index_info) = get_cursor!(state, *cursor_id).as_index_cursor_mut();
 
         let pc = if let Some(idx_payload) = return_if_io!(state, cursor.record_payload()) {
             let tie_breaker = get_tie_breaker_from_idx_comp_op(insn);
             let ord = compare_record(
                 idx_payload,
                 registers_to_ref_values(&state.registers[*start_reg..*start_reg + *num_regs]),
-                &index_info,
+                index_info,
                 tie_breaker,
             )?;
 
@@ -13186,10 +13183,8 @@ pub fn op_idx_insert(
         }
         OpIdxInsertState::UniqueConstraintCheck => {
             let ignore_conflict = 'i: {
-                let cursor = get_cursor!(state, cursor_id);
-                let cursor = cursor.as_btree_mut();
+                let (cursor, index_info) = get_cursor!(state, cursor_id).as_index_cursor_mut();
                 let has_rowid = cursor.has_rowid();
-                let index_info = cursor.get_index_info().clone();
                 let record_opt = return_if_io!(state, cursor.record());
                 let Some(record) = record_opt.as_ref() else {
                     // Cursor not pointing at a record — table is empty or past last
@@ -13828,8 +13823,8 @@ pub fn op_open_write(
 
     // Reuse the existing cursor if the root_page matches (same table/index)
     let can_reuse_cursor = match cursors.get(*cursor_id) {
-        Some(Some(Cursor::BTree(btree_cursor))) => btree_cursor.root_page() == root_page,
-        Some(Some(Cursor::Dyn(btree_cursor))) => btree_cursor.root_page() == root_page,
+        Some(Some(Cursor::BTree(btree_cursor, ..))) => btree_cursor.root_page() == root_page,
+        Some(Some(Cursor::Dyn(btree_cursor, ..))) => btree_cursor.root_page() == root_page,
         _ => false,
     };
 
@@ -14273,7 +14268,7 @@ fn op_clear_btree_inner(
                 let cleared = cursor.write().clear_btree();
                 return_if_io!(state, cleared);
                 for other_cursor_opt in state.cursors.iter_mut().flatten() {
-                    if let Cursor::BTree(_) | Cursor::Dyn(_) = other_cursor_opt {
+                    if let Cursor::BTree(..) | Cursor::Dyn(..) = other_cursor_opt {
                         let btree_cursor = other_cursor_opt.as_btree_mut();
                         if Arc::ptr_eq(&btree_cursor.get_pager(), pager) {
                             btree_cursor.invalidate_btree_cache();
@@ -15692,8 +15687,8 @@ pub fn op_populate_materialized_views(
                 })?;
 
             let root_page = match cursor {
-                crate::types::Cursor::BTree(btree_cursor) => btree_cursor.root_page(),
-                crate::types::Cursor::Dyn(btree_cursor) => btree_cursor.root_page(),
+                crate::types::Cursor::BTree(btree_cursor, ..) => btree_cursor.root_page(),
+                crate::types::Cursor::Dyn(btree_cursor, ..) => btree_cursor.root_page(),
                 _ => {
                     return Err(LimboError::InternalError(
                         "Expected BTree cursor for materialized view".into(),
@@ -15728,7 +15723,7 @@ pub fn op_populate_materialized_views(
 
             // Extract the BTreeCursor
             let btree_cursor = match cursor {
-                crate::types::Cursor::BTree(_) | crate::types::Cursor::Dyn(_) => {
+                crate::types::Cursor::BTree(..) | crate::types::Cursor::Dyn(..) => {
                     cursor.as_btree_mut()
                 }
                 _ => {
@@ -17878,7 +17873,7 @@ pub fn op_hash_build(
     if op_state.rowid.is_none() {
         let cursor = state.get_cursor(data.cursor_id);
         let rowid_val = match cursor {
-            Cursor::BTree(_) | Cursor::Dyn(_) => {
+            Cursor::BTree(..) | Cursor::Dyn(..) => {
                 let btree_cursor = cursor.as_btree_mut();
                 let rowid_opt = match btree_cursor.rowid() {
                     Ok(IOResult::Done(v)) => v,
