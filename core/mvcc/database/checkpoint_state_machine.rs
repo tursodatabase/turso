@@ -2,6 +2,7 @@ use crate::alloc::{
     ConcurrentAllocator, TryReserveError, TursoAllocator, TursoIteratorExt, TursoVecExt, Vec,
     ALLOC_ERR_MSG,
 };
+use crate::bplus_tree::{BPlusTreeMap, Entry as TreeEntry, Range as TreeRange, TreeKey, TreeValue};
 use crate::mvcc::clock::LogicalClock;
 use crate::mvcc::database::{
     types_table_root_page, DeleteRowStateMachine, IndexRowsEntry, MVTableId, MvStore, RowID,
@@ -15,7 +16,7 @@ use crate::mvcc::yield_points::{inject_transition_failure, inject_transition_yie
 use crate::namespace::{mangle_name, NamespaceId};
 use crate::schema::{Index, Schema};
 use crate::skiplist::base::RefEntry;
-use crate::skiplist::comparator::{BasicComparator, Comparator};
+use crate::skiplist::comparator::BasicComparator;
 use crate::skiplist::{SkipMap, SkiplistAllocator};
 use crate::state_machine::{StateMachine, StateTransition, TransitionResult};
 use crate::storage::btree::{BTreeCursor, CursorTrait};
@@ -106,12 +107,11 @@ impl TableWalkCursor {
     }
 }
 
-fn walk_table_keys<V, A: SkiplistAllocator>(
-    map: &SkipMap<RowID, V, BasicComparator, A>,
-    guard: &epoch::Guard,
+fn walk_table_keys<M: RowIdMap>(
+    map: &M,
     cursor: &mut TableWalkCursor,
     bounds: (Bound<RowID>, Bound<RowID>),
-    mut visit: impl FnMut(&RowID, &V) -> Result<bool>,
+    mut visit: impl FnMut(&RowID, &M::Value) -> Result<bool>,
 ) -> Result<bool> {
     loop {
         let lower = match &cursor.last_visited {
@@ -123,45 +123,115 @@ fn walk_table_keys<V, A: SkiplistAllocator>(
             Some(last) => Bound::Excluded(last.clone()),
         };
         if cursor.table_end.is_none() || cursor.table_is_done() {
-            let Some(table_end) =
-                last_key_of_first_table(map, guard, (lower.clone(), bounds.1.clone()))
+            let Some(table_end) = last_key_of_first_table(map, (lower.clone(), bounds.1.clone()))
             else {
                 return Ok(false);
             };
             cursor.table_end = Some(table_end);
         }
         let table_end = cursor.table_end.clone().expect("set above");
-        let mut range = map.range((lower, Bound::Included(table_end.clone())));
-        while let Some(pinned) = range.inner.next(guard) {
-            let entry = CollectEntry::new(pinned, guard);
-            cursor.last_visited = Some(entry.key().clone());
-            if visit(entry.key(), entry.value())? {
-                return Ok(true);
-            }
+        let must_yield =
+            map.visit_range((lower, Bound::Included(table_end.clone())), |key, value| {
+                cursor.last_visited = Some(key.clone());
+                visit(key, value)
+            })?;
+        if must_yield {
+            return Ok(true);
         }
         cursor.last_visited = Some(table_end);
     }
 }
 
-fn last_key_of_first_table<V, A: SkiplistAllocator>(
-    map: &SkipMap<RowID, V, BasicComparator, A>,
-    guard: &epoch::Guard,
+fn last_key_of_first_table<M: RowIdMap>(
+    map: &M,
     bounds: (Bound<RowID>, Bound<RowID>),
 ) -> Option<RowID> {
-    let first = CollectEntry::new(map.range(bounds).inner.next(guard)?, guard);
+    let first = map.first_key(bounds)?;
     let table_bounds = (
-        Bound::Included(first.key().clone()),
-        match next_table_start(first.key().table_id) {
+        Bound::Included(first.clone()),
+        match next_table_start(first.table_id) {
             Some(start) => Bound::Excluded(start),
             None => Bound::Unbounded,
         },
     );
-    let last = map
-        .range(table_bounds)
-        .inner
-        .next_back(guard)
-        .map(|last| CollectEntry::new(last, guard).key().clone());
-    Some(last.unwrap_or_else(|| first.key().clone()))
+    Some(map.last_key(table_bounds).unwrap_or(first))
+}
+
+/// A map keyed by `RowID` that [`walk_table_keys`] can walk. The table rows are in a
+/// B+ tree and the checkpoint dirty keys are in skip lists.
+trait RowIdMap {
+    type Value;
+
+    /// Calls `visit` for each entry in `bounds`, in key order, until `visit` returns
+    /// true. Returns true if `visit` returned true.
+    fn visit_range(
+        &self,
+        bounds: (Bound<RowID>, Bound<RowID>),
+        visit: impl FnMut(&RowID, &Self::Value) -> Result<bool>,
+    ) -> Result<bool>;
+
+    fn first_key(&self, bounds: (Bound<RowID>, Bound<RowID>)) -> Option<RowID>;
+
+    fn last_key(&self, bounds: (Bound<RowID>, Bound<RowID>)) -> Option<RowID>;
+}
+
+impl<V: TreeValue, A: ConcurrentAllocator> RowIdMap for BPlusTreeMap<RowID, V, A> {
+    type Value = V;
+
+    fn visit_range(
+        &self,
+        bounds: (Bound<RowID>, Bound<RowID>),
+        mut visit: impl FnMut(&RowID, &V) -> Result<bool>,
+    ) -> Result<bool> {
+        for entry in self.range(bounds) {
+            if visit(entry.key(), entry.value())? {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    fn first_key(&self, bounds: (Bound<RowID>, Bound<RowID>)) -> Option<RowID> {
+        self.range(bounds).next().map(|entry| entry.key().clone())
+    }
+
+    fn last_key(&self, bounds: (Bound<RowID>, Bound<RowID>)) -> Option<RowID> {
+        self.range(bounds)
+            .next_back()
+            .map(|entry| entry.key().clone())
+    }
+}
+
+impl<V, A: SkiplistAllocator> RowIdMap for SkipMap<RowID, V, BasicComparator, A> {
+    type Value = V;
+
+    fn visit_range(
+        &self,
+        bounds: (Bound<RowID>, Bound<RowID>),
+        mut visit: impl FnMut(&RowID, &V) -> Result<bool>,
+    ) -> Result<bool> {
+        let guard = epoch::pin();
+        let mut range = self.range(bounds);
+        while let Some(pinned) = range.inner.next(&guard) {
+            let entry = CollectEntry::new(pinned, &guard);
+            if visit(entry.key(), entry.value())? {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    fn first_key(&self, bounds: (Bound<RowID>, Bound<RowID>)) -> Option<RowID> {
+        let guard = epoch::pin();
+        let first = CollectEntry::new(self.range(bounds).inner.next(&guard)?, &guard);
+        Some(first.key().clone())
+    }
+
+    fn last_key(&self, bounds: (Bound<RowID>, Bound<RowID>)) -> Option<RowID> {
+        let guard = epoch::pin();
+        let last = CollectEntry::new(self.range(bounds).inner.next_back(&guard)?, &guard);
+        Some(last.key().clone())
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1313,9 +1383,8 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
     fn collect_table_rows_from_store(&mut self, processed: &mut usize) -> Result<bool> {
         let bounds = self.collect_table_bounds();
         let mvstore = self.mvstore.clone();
-        let guard = epoch::pin();
         let mut cursor = std::mem::take(&mut self.collect_table_cursor);
-        let result = walk_table_keys(&mvstore.rows, &guard, &mut cursor, bounds, |key, chain| {
+        let result = walk_table_keys(&mvstore.rows, &mut cursor, bounds, |key, chain| {
             tracing::trace!("collecting {key:?}");
             let row_versions = chain.read();
             self.collect_table_row_versions(key, &row_versions)?;
@@ -1329,12 +1398,10 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
     fn collect_table_rows_from_dirty_keys(&mut self, processed: &mut usize) -> Result<bool> {
         let bounds = self.collect_table_bounds();
         let mvstore = self.mvstore.clone();
-        let guard = epoch::pin();
-        let mut rows = LockstepCursor::new(&mvstore.rows, &guard);
+        let mut rows = LockstepCursor::new(&mvstore.rows);
         let mut cursor = std::mem::take(&mut self.collect_table_cursor);
         let result = walk_table_keys(
             &mvstore.checkpoint_dirty_table_keys,
-            &guard,
             &mut cursor,
             bounds,
             |key, stamp| {
@@ -1539,10 +1606,8 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
                 std::mem::take(&mut self.collect_dirty_index_cursor),
             ),
         };
-        let guard = epoch::pin();
         let result = walk_table_keys(
             dirty_keys,
-            &guard,
             &mut cursor,
             (Bound::Unbounded, Bound::Unbounded),
             |key, stamp| {
@@ -1625,9 +1690,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
                     None => (Bound::Unbounded, Bound::Included(key_end)),
                     Some(last) => (Bound::Excluded(last), Bound::Included(key_end)),
                 };
-            let mut inner_range = index_rows_map.range(inner_bounds);
-            while let Some(pinned) = inner_range.inner.next(&guard) {
-                let entry = CollectEntry::new(pinned, &guard);
+            for entry in index_rows_map.range(inner_bounds) {
                 let versions = entry.value().read();
                 self.collect_index_tableid_cursor = Some(index_id);
                 self.collect_index_key_cursor = Some(entry.key().clone());
@@ -1651,16 +1714,11 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
     fn collect_index_rows_from_dirty_keys(&mut self) -> Result<bool> {
         let mut processed = 0;
         let mvstore = self.mvstore.clone();
-        let guard = epoch::pin();
-        let mut current_index: Option<(
-            MVTableId,
-            IndexRowsEntry<'_, A>,
-            IndexKeyCursor<'_, '_, A>,
-        )> = None;
+        let mut current_index: Option<(MVTableId, IndexRowsEntry<'_, A>, IndexKeyCursor<'_, A>)> =
+            None;
         let mut cursor = std::mem::take(&mut self.collect_dirty_index_cursor);
         let result = walk_table_keys(
             &mvstore.checkpoint_dirty_index_keys,
-            &guard,
             &mut cursor,
             (Bound::Unbounded, Bound::Unbounded),
             |key, stamp| {
@@ -1675,7 +1733,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
                     .is_none_or(|(id, _, _)| *id != index_id)
                 {
                     current_index = mvstore.index_rows.get(&index_id).map(|index| {
-                        let keys = LockstepCursor::new(index.value(), &guard);
+                        let keys = LockstepCursor::new(index.value());
                         (index_id, index, keys)
                     });
                 }
@@ -3588,58 +3646,48 @@ impl<K, V, C, A: SkiplistAllocator> Drop for CollectEntry<'_, '_, K, V, C, A> {
     }
 }
 
-impl<'a, 'g, K, V, C: Comparator<K>, A: SkiplistAllocator> CollectEntry<'a, 'g, K, V, C, A> {
-    fn next(&self) -> Option<Self> {
-        self.entry
-            .as_ref()
-            .expect("collect entry still held")
-            .next(self.guard)
-            .map(|entry| Self::new(entry, self.guard))
-    }
+type IndexKeyCursor<'a, A> = LockstepCursor<'a, Arc<SortableIndexKey>, RowVersions<A>, A>;
+
+/// Iterator over the entries of a B+ tree from a key to the end.
+type TreeRangeFrom<'a, K, V, A> = TreeRange<'a, K, (Bound<K>, Bound<K>), K, V, A>;
+
+/// Looks up keys of a B+ tree in ascending order. A key a few entries after the last
+/// one is reached by stepping the iterator, other keys by a new seek.
+struct LockstepCursor<'a, K: TreeKey, V: TreeValue, A: ConcurrentAllocator> {
+    map: &'a BPlusTreeMap<K, V, A>,
+    range: Option<TreeRangeFrom<'a, K, V, A>>,
+    current: Option<TreeEntry<'a, K, V, A>>,
 }
 
-type IndexKeyCursor<'a, 'g, A> = LockstepCursor<'a, 'g, Arc<SortableIndexKey>, RowVersions<A>, A>;
-
-struct LockstepCursor<'a, 'g, K, V, A: SkiplistAllocator> {
-    map: &'a SkipMap<K, V, BasicComparator, A>,
-    current: Option<CollectEntry<'a, 'g, K, V, BasicComparator, A>>,
-    guard: &'g epoch::Guard,
-}
-
-impl<'a, 'g, K: Ord + Clone, V, A: SkiplistAllocator> LockstepCursor<'a, 'g, K, V, A> {
+impl<'a, K: TreeKey, V: TreeValue, A: ConcurrentAllocator> LockstepCursor<'a, K, V, A> {
     const NEAR_STEPS: usize = 8;
 
-    fn new(map: &'a SkipMap<K, V, BasicComparator, A>, guard: &'g epoch::Guard) -> Self {
+    fn new(map: &'a BPlusTreeMap<K, V, A>) -> Self {
         Self {
             map,
+            range: None,
             current: None,
-            guard,
         }
     }
 
-    fn advance_to(&mut self, key: &K) -> Option<&'a V> {
+    fn advance_to(&mut self, key: &K) -> Option<&V> {
         let mut steps = 0;
-        loop {
-            let Some(current) = self.current.as_ref() else {
-                break;
-            };
+        while let Some(current) = self.current.as_ref() {
             match current.key().cmp(key) {
-                std::cmp::Ordering::Equal => return Some(current.value()),
+                std::cmp::Ordering::Equal => return self.current.as_ref().map(|c| c.value()),
                 std::cmp::Ordering::Greater => return None,
                 std::cmp::Ordering::Less if steps < Self::NEAR_STEPS => {
-                    let next = current.next();
-                    self.current = next;
+                    self.current = self.range.as_mut().and_then(Iterator::next);
                     steps += 1;
                 }
                 std::cmp::Ordering::Less => break,
             }
         }
-        self.current = self
+        let mut range = self
             .map
-            .range((Bound::Included(key.clone()), Bound::Unbounded))
-            .inner
-            .next(self.guard)
-            .map(|entry| CollectEntry::new(entry, self.guard));
+            .range((Bound::Included(key.clone()), Bound::Unbounded));
+        self.current = range.next();
+        self.range = Some(range);
         self.current
             .as_ref()
             .filter(|current| current.key() == key)
