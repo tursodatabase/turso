@@ -387,6 +387,51 @@ fn concurrent_writers_and_scanners_keep_order() {
 }
 
 #[test]
+fn a_split_before_the_leaf_read_does_not_hide_keys() {
+    let map = map_with_a_full_first_leaf();
+    split_the_first_leaf_before_the_next_child_version_read(&map);
+    assert_eq!(map.get(&IntKey(620)).map(|e| **e.value()), Some(620));
+
+    let map = map_with_a_full_first_leaf();
+    split_the_first_leaf_before_the_next_child_version_read(&map);
+    assert_eq!(map.remove(&IntKey(620)).map(|e| **e.value()), Some(620));
+
+    let map = map_with_a_full_first_leaf();
+    split_the_first_leaf_before_the_next_child_version_read(&map);
+    let last = map.range(..=IntKey(620)).next_back().map(|e| e.key().0);
+    assert_eq!(last, Some(620));
+}
+
+fn map_with_a_full_first_leaf() -> Arc<IntMap> {
+    let map = Arc::new(IntMap::new());
+    for i in 0..200 {
+        map.insert(IntKey(i * 10), Arc::new(i * 10));
+    }
+    map.insert(IntKey(5), Arc::new(5));
+    map
+}
+
+fn split_the_first_leaf_before_the_next_child_version_read(map: &Arc<IntMap>) {
+    let map = map.clone();
+    BEFORE_CHILD_VERSION_READ.with(|hook| {
+        *hook.borrow_mut() = Some(Box::new(move || {
+            map.insert(IntKey(15), Arc::new(15));
+        }));
+    });
+}
+
+thread_local! {
+    static BEFORE_CHILD_VERSION_READ: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+pub(super) fn before_child_version_read() {
+    if let Some(hook) = BEFORE_CHILD_VERSION_READ.with(|hook| hook.borrow_mut().take()) {
+        hook();
+    }
+}
+
+#[test]
 fn concurrent_disjoint_writers_end_with_their_keys() {
     let map = Arc::new(ArcMap::new());
     let threads = 4;
