@@ -147,8 +147,8 @@ mod page_inner {
         buffer: Option<Arc<Buffer>>,
         /// Start and length of the bytes of `buffer`, kept next to it so a page
         /// read does not go through the `Option`, the `Arc` and the `Buffer`
-        /// variant on every access. Null and 0 while `buffer` is `None`.
-        data_ptr: *mut u8,
+        /// variant on every access.
+        data_ptr: std::ptr::NonNull<u8>,
         data_len: usize,
         /// Overflow cells during btree operations
         pub overflow_cells: crate::alloc::Vec<OverflowCell>,
@@ -183,7 +183,7 @@ mod page_inner {
                 pin_count: AtomicUsize::new(0),
                 wal_tag: AtomicU64::new(TAG_UNSET),
                 buffer: None,
-                data_ptr: std::ptr::null_mut(),
+                data_ptr: std::ptr::NonNull::dangling(),
                 data_len: 0,
                 overflow_cells: crate::alloc::vec![],
             }
@@ -197,29 +197,34 @@ mod page_inner {
 
         /// Installs the page data buffer.
         pub fn set_buffer(&mut self, buffer: Arc<Buffer>) {
-            self.data_ptr = buffer.as_mut_ptr();
+            self.data_ptr = std::ptr::NonNull::new(buffer.as_mut_ptr())
+                .expect("a page buffer is never at address zero");
             self.data_len = buffer.len();
             self.buffer = Some(buffer);
         }
 
         /// Removes the page data buffer, leaving the page unloaded.
         pub fn take_buffer(&mut self) -> Option<Arc<Buffer>> {
-            self.data_ptr = std::ptr::null_mut();
+            self.data_ptr = std::ptr::NonNull::dangling();
             self.data_len = 0;
             self.buffer.take()
         }
 
-        /// Get the page buffer as a mutable slice. Panics if buffer not loaded.
+        /// Returns the page data as a mutable slice.
         #[inline(always)]
         #[allow(clippy::mut_from_ref)]
         pub fn as_ptr(&self) -> &mut [u8] {
-            turso_assert!(!self.data_ptr.is_null(), "buffer not loaded");
-            // SAFETY: `data_ptr`/`data_len` describe the bytes of the `Arc<Buffer>`
-            // held in `self.buffer`, which stays alive and does not move while it is
-            // installed. Handing out `&mut [u8]` from `&self` mirrors
-            // `Buffer::as_mut_slice`; the page byte range is mutated only under the
-            // pager's own exclusion rules, as before.
-            unsafe { std::slice::from_raw_parts_mut(self.data_ptr, self.data_len) }
+            // SAFETY: `set_buffer` caches the pointer and length from the same `Buffer`
+            // and stores its `Arc` in `buffer`, which keeps the allocation alive at a
+            // stable address. `unloaded` and `take_buffer` pair a dangling pointer with
+            // length zero, which is valid for an empty slice.
+            //
+            // The returned `&mut [u8]` must be exclusive: no other `&[u8]` or `&mut [u8]`
+            // into this buffer may be live while it exists. `Page::get` reaches
+            // `PageInner` through `UnsafeCell`. The locked flag marks I/O in flight, and
+            // the pin count prevents eviction; neither excludes another reader. Callers
+            // must enforce this exclusivity.
+            unsafe { std::slice::from_raw_parts_mut(self.data_ptr.as_ptr(), self.data_len) }
         }
 
         /// The position where page content starts. It's 100 for page 1 (database file header is 100 bytes),
@@ -875,6 +880,17 @@ impl PageInner {
     #[inline(always)]
     pub fn is_leaf(&self) -> bool {
         self.read_u8(BTREE_PAGE_TYPE) > PageType::TableInterior as u8
+    }
+
+    #[inline(always)]
+    pub fn leaf_and_cell_count(&self) -> (bool, usize) {
+        let buf = self.as_ptr();
+        let base = self.offset();
+        let header = &buf[base..base + BTREE_CELL_COUNT + 2];
+        (
+            header[BTREE_PAGE_TYPE] > PageType::TableInterior as u8,
+            u16::from_be_bytes([header[BTREE_CELL_COUNT], header[BTREE_CELL_COUNT + 1]]) as usize,
+        )
     }
 
     /// True for table pages (interior or leaf). A corrupt page type byte
@@ -6506,6 +6522,12 @@ mod tests {
             assert_eq!(unloaded.id(), id);
             assert_eq!(unloaded.offset(), offset);
         }
+    }
+
+    #[test]
+    fn unloaded_page_exposes_an_empty_data_slice() {
+        let page = super::PageInner::unloaded(1);
+        assert!(page.as_ptr().is_empty());
     }
 
     fn pager_with_cache_capacity(cache_capacity: usize, database_pages: u32) -> Arc<Pager> {
