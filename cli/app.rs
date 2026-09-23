@@ -27,8 +27,8 @@ use std::{
     mem::{forget, ManuallyDrop},
     path::PathBuf,
     sync::{
-        atomic::{AtomicUsize, Ordering},
-        Arc, Mutex,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+        Arc,
     },
     time::{Duration, Instant},
 };
@@ -140,9 +140,8 @@ pub struct Limbo {
     io: Arc<dyn turso_core::IO>,
     writer: Option<Box<dyn Write>>,
     conn: Arc<turso_core::Connection>,
-    /// The connection the Ctrl-C handler interrupts. Shared with the handler thread and
-    /// retargeted by `.open`, which replaces `conn`.
-    interrupt_target: Arc<Mutex<Arc<turso_core::Connection>>>,
+    /// True while input is being executed, as opposed to waiting at the prompt.
+    executing: Arc<AtomicBool>,
     pub interrupt_count: Arc<AtomicUsize>,
     input_buff: ManuallyDrop<String>,
     pub(crate) opts: Settings,
@@ -299,17 +298,19 @@ impl Limbo {
             conn._free_extension_ctx(ext_api);
         }
         let interrupt_count = Arc::new(AtomicUsize::new(0));
-        let interrupt_target = Arc::new(Mutex::new(conn.clone()));
+        let executing = Arc::new(AtomicBool::new(false));
         {
             let interrupt_count: Arc<AtomicUsize> = Arc::clone(&interrupt_count);
-            let interrupt_target = Arc::clone(&interrupt_target);
+            let executing = Arc::clone(&executing);
             ctrlc::set_handler(move || {
+                // A statement stopped part-way can leave the connection's in-memory state
+                // inconsistent, so exit like the default SIGINT and let the next open recover.
+                if executing.load(Ordering::SeqCst) {
+                    eprintln!("Interrupted; exiting because an interrupted statement can leave the connection inconsistent");
+                    std::process::exit(130);
+                }
                 // Increment the interrupt count on Ctrl-C
                 interrupt_count.fetch_add(1, Ordering::Release);
-                // Installing this handler suppresses the default SIGINT kill, so a statement
-                // that is already running can only be abandoned by asking the VDBE to stop.
-                // The request is a no-op when no statement is active, as in sqlite3_interrupt.
-                interrupt_target.lock().unwrap().interrupt();
             })
             .expect("Error setting Ctrl-C handler");
         }
@@ -322,7 +323,7 @@ impl Limbo {
             io,
             writer: Some(get_writer(&opts.output)),
             conn,
-            interrupt_target,
+            executing,
             interrupt_count,
             input_buff: ManuallyDrop::new(sql.unwrap_or_default()),
             read_state: ReadState::default(),
@@ -514,7 +515,6 @@ impl Limbo {
         };
         self.io = io;
         self.conn = db.connect()?;
-        *self.interrupt_target.lock().unwrap() = self.conn.clone();
         self.opts.db_file = path.to_string();
         Ok(())
     }
@@ -782,6 +782,7 @@ impl Limbo {
         let is_dot_command = value.starts_with('.');
         let is_complete = self.read_state.is_complete();
 
+        self.executing.store(true, Ordering::SeqCst);
         match (is_dot_command, is_complete) {
             (true, _) => {
                 let (owned_value, old_address) = take_usable_part(self);
@@ -805,6 +806,7 @@ impl Limbo {
                 self.set_multiline_prompt();
             }
         }
+        self.executing.store(false, Ordering::SeqCst);
     }
 
     pub fn handle_dot_command(&mut self, line: &str) {
