@@ -312,6 +312,36 @@ Only a commit that starts an automatic checkpoint allocates it.
 
 The rollback workloads do not build a commit state machine.
 
+## H15. Index cursors look up every row they already hold — `fixed`
+
+**Where:** The first `index_scan_128` run measured 960,910 instructions per
+operation, about 7,500 per row, against about 2,100 per row for `scan_128`.
+`read_from_table_or_index` called from `MvccLazyCursor::current_row` cost
+769,993 of them. The index iterator returned only the row ID, so the cursor
+position had no version chain. Reading each row then searched the skip list
+for its key from the top: about 30 key comparisons per row. The index advance
+also pinned the transaction map for every row to check visibility.
+
+**Fix:** Index advance and index seek return the version chain they found
+and check visibility against the cursor's snapshot, as table scans do since
+H3. `current_row` then reads the visible version directly. The table-only
+rule that lets a checkpointed B-tree row replace its chain
+(`chain_falls_through_for_tx`) still runs only for table cursors. Index
+chains keep their B-tree shadow check in `IndexShadowScan`.
+
+**Callgrind, 200/2,200 iterations:**
+
+| Scenario | Before | After | Change |
+|---|---:|---:|---:|
+| `index_scan_128` | 960,910 | 193,066 | -79.9% |
+| `index_read` | 38,544 | 32,197 | -16.5% |
+| `index_read_btree` | 35,307 | 35,225 | -0.2% |
+| `batch_insert_commit` | 2,725,306 | 2,714,368 | -0.4% |
+| `scan_128` | 270,609 | 271,522 | +0.3% |
+
+The `scan_128` increase is about seven instructions per row for the cursor
+type check. The other workloads changed by less than 0.1%.
+
 ## Final measured totals
 
 The branch was rebased after `origin/main` gained unrelated planner work and an
