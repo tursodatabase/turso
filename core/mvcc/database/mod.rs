@@ -1081,6 +1081,9 @@ struct WriteSet<A: RowVersionAllocator = TursoAllocator> {
     /// This is correct because instances of [RowVersions] are created once per [RowID] and then
     /// reused by cloning the [Arc]. It would be nice to encode this in the type system, but I'm
     /// not sure how.
+    ///
+    /// Empty while the write set is small enough to deduplicate by scanning `entries`;
+    /// otherwise it holds exactly the addresses of `entries`.
     seen: HashSet<usize>,
 }
 
@@ -1094,12 +1097,29 @@ impl<A: RowVersionAllocator> Default for WriteSet<A> {
 }
 
 impl<A: RowVersionAllocator> WriteSet<A> {
+    const MAX_ENTRIES_DEDUPLICATED_BY_SCAN: usize = 16;
+
     fn new() -> Self {
         Self::default()
     }
 
     /// Returns `true` if this `RowVersions` was not already contained in the write set.
     fn insert(&mut self, id: RowID, row_versions: RowVersions<A>) -> bool {
+        if self.seen.is_empty() && self.entries.len() < Self::MAX_ENTRIES_DEDUPLICATED_BY_SCAN {
+            if self
+                .entries
+                .iter()
+                .any(|(_, existing)| Arc::ptr_eq(existing, &row_versions))
+            {
+                return false;
+            }
+            self.entries.push((id, row_versions));
+            return true;
+        }
+        if self.seen.is_empty() {
+            self.seen
+                .extend(self.entries.iter().map(|(_, rv)| Arc::as_ptr(rv) as usize));
+        }
         let ptr = Arc::as_ptr(&row_versions) as usize;
         if self.seen.insert(ptr) {
             self.entries.push((id, row_versions));
