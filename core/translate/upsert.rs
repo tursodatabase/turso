@@ -4,7 +4,9 @@ use std::sync::Arc;
 
 use turso_parser::ast::{self, TriggerEvent, TriggerTime, Upsert};
 
-use super::emitter::gencol::{compute_virtual_columns, emit_row_from_cursor};
+use super::emitter::gencol::{
+    columns_needed_for_new_row, compute_virtual_columns, emit_row_from_cursor,
+};
 use crate::alloc::TursoIteratorExt;
 use crate::error::SQLITE_CONSTRAINT_PRIMARYKEY;
 use crate::schema::{BTreeTable, ColumnLayout, IndexColumn, EXPR_INDEX_SENTINEL, ROWID_SENTINEL};
@@ -740,6 +742,26 @@ pub fn emit_upsert(
         }
     }
 
+    let updated_positions: ColumnMask = set_pairs
+        .iter()
+        .map(|(col_idx, _)| *col_idx)
+        .try_collect()?;
+    let reads_whole_row = !returning.is_empty()
+        || has_triggers_including_temp(
+            resolver,
+            ctx.database_id,
+            TriggerEvent::Update,
+            Some(&updated_positions),
+            ctx.table,
+        );
+    let columns_to_compute = columns_needed_for_new_row(
+        ctx.table,
+        resolver,
+        ctx.database_id,
+        reads_whole_row,
+        connection.foreign_keys_enabled(),
+    )?;
+
     // Recompute virtual columns for the new row after SET clauses have modified base columns.
     // This must happen before CHECK constraints, triggers, and index updates.
     compute_new_row_virtual_columns(
@@ -750,6 +772,7 @@ pub fn emit_upsert(
         &layout,
         resolver,
         ColumnMask::default(),
+        &columns_to_compute,
     )?;
 
     if let Some(bt) = table.btree() {
@@ -799,10 +822,6 @@ pub fn emit_upsert(
 
     // Fire BEFORE UPDATE triggers
     let upsert_database_id = ctx.database_id;
-    let updated_positions: ColumnMask = set_pairs
-        .iter()
-        .map(|(col_idx, _)| *col_idx)
-        .try_collect()?;
     let table_btree = table.btree();
     let affected_parent_fks = match (connection.foreign_keys_enabled(), table_btree.as_deref()) {
         (true, Some(table)) => {
@@ -912,6 +931,7 @@ pub fn emit_upsert(
                 &layout,
                 resolver,
                 (0..num_cols).try_collect()?,
+                &columns_to_compute,
             )?;
 
             let has_relevant_after_triggers = has_triggers_including_temp(
@@ -1547,6 +1567,7 @@ pub fn emit_upsert(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn compute_new_row_virtual_columns(
     program: &mut ProgramBuilder,
     ctx: &InsertEmitCtx,
@@ -1555,6 +1576,7 @@ fn compute_new_row_virtual_columns(
     layout: &ColumnLayout,
     resolver: &Resolver,
     encoded_columns: ColumnMask,
+    columns_to_compute: &ColumnMask,
 ) -> crate::Result<()> {
     if !ctx.table.has_virtual_columns {
         return Ok(());
@@ -1564,7 +1586,9 @@ fn compute_new_row_virtual_columns(
             .with_encoded_columns(encoded_columns);
     compute_virtual_columns(
         program,
-        &ctx.table.columns_topo_sort()?,
+        &ctx.table
+            .columns_topo_sort()?
+            .retain_columns(columns_to_compute),
         &dml_ctx,
         resolver,
         ctx.table,

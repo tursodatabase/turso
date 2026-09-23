@@ -6115,3 +6115,37 @@ test gencol_update_fk_child_key_is_virtual_column {
 expect error {
     FOREIGN KEY constraint failed
 }
+
+setup gencol_one_indexed_virtual_column_with_key {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, a INTEGER, b INTEGER, c AS (a + b), d AS (c * 2), e AS (a * 3));
+    CREATE INDEX te ON t(e);
+}
+
+@skip-if mvcc "mvcc has different root pages"
+@setup gencol_one_indexed_virtual_column_with_key
+snapshot gencol_upsert_computes_only_read_virtual_columns {
+    INSERT INTO t(id, a, b) VALUES (1, 1, 2) ON CONFLICT(id) DO UPDATE SET a = 7;
+}
+
+test gencol_upsert_check_reads_virtual_column_through_another {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, a INTEGER, b INTEGER, c AS (a + b), d AS (c * 2) CHECK (d < 10), e AS (a * 100));
+    INSERT INTO t(id, a, b) VALUES (1, 1, 2);
+    INSERT INTO t(id, a, b) VALUES (1, 0, 0) ON CONFLICT(id) DO UPDATE SET a = 3;
+}
+expect error {
+    CHECK constraint failed: d < 10
+}
+
+@cross-check-integrity
+test gencol_upsert_index_key_reads_unchanged_virtual_column {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, a INTEGER, b INTEGER, v AS (b * 10), w AS (a * 3));
+    CREATE INDEX t_av ON t(a, v);
+    INSERT INTO t(id, a, b) VALUES (1, 1, 2);
+    INSERT INTO t(id, a, b) VALUES (1, 0, 0) ON CONFLICT(id) DO UPDATE SET a = 5;
+    SELECT a, v FROM t INDEXED BY t_av WHERE a = 5 AND v = 20;
+    PRAGMA integrity_check;
+}
+expect {
+    5|20
+    ok
+}

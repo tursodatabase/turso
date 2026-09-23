@@ -806,7 +806,7 @@ pub fn translate_insert(
                 None,
                 &btree_table,
             );
-        let columns_to_compute = columns_needed_by_insert(
+        let columns_to_compute = gencol::columns_needed_for_new_row(
             &btree_table,
             resolver,
             database_id,
@@ -1249,38 +1249,6 @@ pub fn translate_insert(
     program.result_columns = result_columns;
     program.table_references.extend(table_references);
     Ok(())
-}
-
-fn columns_needed_by_insert(
-    table: &BTreeTable,
-    resolver: &Resolver,
-    database_id: usize,
-    reads_whole_row: bool,
-    has_fks: bool,
-) -> Result<ColumnMask> {
-    let columns = table.columns();
-    if reads_whole_row || table.is_strict {
-        return Ok((0..columns.len()).try_collect()?);
-    }
-    let mut needed = ColumnMask::default();
-    for (idx, column) in columns.iter().enumerate() {
-        if column.notnull() {
-            needed.set(idx)?;
-        }
-    }
-    for check in &table.check_constraints {
-        needed.union_with(&schema::columns_referenced_by_expr(&check.expr, columns)?)?;
-    }
-    let indexes: Vec<Arc<Index>> = resolver.with_schema(database_id, |s| {
-        s.get_indices(table.name.as_str()).cloned().collect()
-    });
-    for index in &indexes {
-        needed.union_with(&gencol::columns_read_by_index(index, columns)?)?;
-    }
-    if has_fks {
-        needed.union_with(&gencol::foreign_key_columns(table, resolver, database_id)?)?;
-    }
-    table.columns_with_dependencies(needed.iter())
 }
 
 /// If the user provided an explicit rowid for this insert, we must validate that it is an Integer and non-null

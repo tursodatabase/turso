@@ -64,6 +64,38 @@ pub fn compute_virtual_columns(
     })
 }
 
+pub(crate) fn columns_needed_for_new_row(
+    table: &BTreeTable,
+    resolver: &Resolver,
+    database_id: usize,
+    reads_whole_row: bool,
+    reads_foreign_keys: bool,
+) -> Result<ColumnMask> {
+    let columns = table.columns();
+    if reads_whole_row || table.is_strict {
+        return Ok((0..columns.len()).try_collect()?);
+    }
+    let mut needed = ColumnMask::default();
+    for (idx, column) in columns.iter().enumerate() {
+        if column.notnull() {
+            needed.set(idx)?;
+        }
+    }
+    for check in &table.check_constraints {
+        needed.union_with(&columns_referenced_by_expr(&check.expr, columns)?)?;
+    }
+    let indexes: Vec<Arc<Index>> = resolver.with_schema(database_id, |s| {
+        s.get_indices(table.name.as_str()).cloned().collect()
+    });
+    for index in &indexes {
+        needed.union_with(&columns_read_by_index(index, columns)?)?;
+    }
+    if reads_foreign_keys {
+        needed.union_with(&foreign_key_columns(table, resolver, database_id)?)?;
+    }
+    table.columns_with_dependencies(needed.iter())
+}
+
 pub(crate) fn columns_read_by_index(index: &Index, columns: &[Column]) -> Result<ColumnMask> {
     let mut read = ColumnMask::default();
     for index_column in &index.columns {
