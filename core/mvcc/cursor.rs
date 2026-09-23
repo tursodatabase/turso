@@ -1115,7 +1115,7 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> MvccLazyCursor<Clock
             let falls_through = {
                 let chain = versions.read();
                 self.db
-                    .chain_falls_through_for_tx(self.tx_id, table_id, &chain)
+                    .btree_covers_chain_for_snapshot(self.snapshot, table_id, &chain)
             };
             if !falls_through {
                 return pos;

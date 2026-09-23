@@ -5974,7 +5974,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         self.btree_covers_chain_for_snapshot(MvccReadSnapshot::from(tx), table_id, versions)
     }
 
-    fn btree_covers_chain_for_snapshot(
+    pub(crate) fn btree_covers_chain_for_snapshot(
         &self,
         snapshot: MvccReadSnapshot,
         table_id: MVTableId,
@@ -5991,18 +5991,6 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         }
         let ckpt_max = self.durable_txid_max.load(Ordering::SeqCst);
         !self.chain_is_write_buffer_for(snapshot.begin_ts, versions, ckpt_max, snapshot.read_mark)
-    }
-
-    pub(crate) fn chain_falls_through_for_tx(
-        &self,
-        tx_id: TxID,
-        table_id: MVTableId,
-        versions: &[RowVersion],
-    ) -> bool {
-        let Some(tx) = self.txs.get(&tx_id) else {
-            return false;
-        };
-        self.btree_covers_chain_for_tx(tx.value(), table_id, versions)
     }
 
     /// Whether an already-resolved index version chain shadows (invalidates) the
