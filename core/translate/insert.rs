@@ -130,6 +130,12 @@ pub struct InsertEmitCtx<'a> {
     /// (idx name, root_page, idx cursor id)
     pub idx_cursors: Vec<(String, i64, usize)>,
 
+    /// Index cursors that a NoConflict probe positions on the inserted key.
+    /// Without REPLACE or UPSERT nothing moves them before the deferred
+    /// IdxInsert, which may then reuse the probe (SQLite's
+    /// OPFLAG_USESEEKRESULT).
+    pub no_conflict_probed_cursors: Vec<usize>,
+
     /// Context for if the insert values are materialized first
     /// into a temporary table
     pub temp_table_ctx: Option<TempTableCtx>,
@@ -202,6 +208,7 @@ impl<'a> InsertEmitCtx<'a> {
         Ok(Self {
             table,
             idx_cursors,
+            no_conflict_probed_cursors: Vec::new(),
             temp_table_ctx,
             on_conflict: on_conflict.unwrap_or(ResolveType::Abort),
             statement_on_conflict: on_conflict,
@@ -958,8 +965,16 @@ pub fn translate_insert(
     // constraints, so we can't skip the commit phase.
     let statement_replace = matches!(ctx.on_conflict, ResolveType::Replace);
     let skip_replace_indexes = has_ddl_replace && !statement_replace;
+    let reuse_no_conflict_seeks = !on_replace && !has_upsert;
     if has_upsert || !statement_replace {
-        emit_commit_phase(program, resolver, &insertion, &ctx, skip_replace_indexes)?;
+        emit_commit_phase(
+            program,
+            resolver,
+            &insertion,
+            &ctx,
+            skip_replace_indexes,
+            reuse_no_conflict_seeks,
+        )?;
     }
 
     resolver.register_affinities.clear();
@@ -1385,6 +1400,7 @@ fn emit_commit_phase(
     insertion: &Insertion,
     ctx: &InsertEmitCtx,
     skip_replace_indexes: bool,
+    reuse_no_conflict_seeks: bool,
 ) -> Result<()> {
     let indices: Vec<_> = resolver.with_schema(ctx.database_id, |s| {
         s.get_indices(ctx.table.name.as_str()).cloned().collect()
@@ -1435,12 +1451,14 @@ fn emit_commit_phase(
             index_name: Some(index.name.clone()),
             affinity_str: None,
         });
+        let use_seek =
+            reuse_no_conflict_seeks && ctx.no_conflict_probed_cursors.contains(&idx_cursor_id);
         program.emit_insn(Insn::IdxInsert {
             cursor_id: idx_cursor_id,
             record_reg,
             unpacked_start: Some(idx_start_reg),
             unpacked_count: Some((num_cols + 1) as u32),
-            flags: IdxInsertFlags::new().nchange(true),
+            flags: IdxInsertFlags::new().nchange(true).use_seek(use_seek),
         });
 
         if let Some(lbl) = commit_skip_label {
@@ -3176,6 +3194,9 @@ fn emit_unique_index_check(
             record_reg: idx_start_reg,
             num_regs: num_cols,
         });
+        if !preflight.on_replace && index.where_clause.is_none() {
+            ctx.no_conflict_probed_cursors.push(idx_cursor_id);
+        }
         if preflight.on_replace {
             // REPLACE: delete conflicting row immediately, then insert eagerly.
             program.emit_insn(Insn::IdxRowId {

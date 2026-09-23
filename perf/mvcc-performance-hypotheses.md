@@ -653,6 +653,70 @@ run through it too.
 
 No other workload changed.
 
+## H28. INSERT seeks each unique index twice — `fixed`
+
+**Where:** After H24 and H25, splitting index-key comparison cost by caller
+chain put about 4,700 instructions of comparison self cost per inserted row
+in `SkipList::lower_bound`: three range positionings per row. `EXPLAIN` of
+the benchmark INSERT shows `NoConflict` probing the unique index and then the
+deferred `IdxInsert` with flags `NCHANGE` only, so `op_idx_insert` seeks the
+same key again and repeats the unique check. SQLite's `IdxInsert` in the same
+plan carries `OPFLAG_USESEEKRESULT` (p5 = 16) and reuses the probe.
+`op_idx_insert` already implements this as `USE_SEEK`, but the INSERT
+translator never set it.
+
+**Fix:** The deferred `IdxInsert` sets `USE_SEEK` for a unique, non-partial
+index that the preflight probed with `NoConflict` on the same cursor, when the
+statement has no REPLACE (statement or constraint level) and no UPSERT. It is
+safe in both journal modes:
+
+- Per row, the code runs BEFORE triggers, then the `NoConflict` probes, then
+  the table `MakeRecord` and foreign-key child checks, then the deferred
+  `IdxInsert`s, then the table `Insert`, then AFTER triggers, CDC, and
+  RETURNING. Nothing between the probe and the index insert writes to the
+  index B-tree or moves its cursor. The foreign-key checks read through their
+  own cursors. A REPLACE deletes conflicting rows from every index, which
+  moves the cursor, so any REPLACE disables the flag. That is stricter than
+  SQLite, which also keeps it when the statement has no triggers.
+- A `NotFound` eq-only `GE` seek on an index B-tree leaves the cursor on the
+  leaf at the first cell greater than the probed prefix
+  (`target_cell_when_not_found`). An equal key in an interior cell returns
+  `TryAdvance`, and the probe then reports a conflict. With no entry sharing
+  the prefix, every cell orders the same way against the prefix and against
+  the full key (prefix plus rowid). So that cell is also where the full key
+  belongs, and `BTreeCursor::insert` inserts at the cursor's current cell.
+- The MVCC cursor inserts by key. It reads its position only to decide
+  whether the row is B-tree resident, which requires an existing entry
+  equal to the key, and a `NotFound` probe rules that out.
+- `NoConflict` compares only the unique prefix, so it is at least as strict as
+  the skipped check, which seeks the full key. Keys with NULLs still seek
+  (runtime check in `op_idx_insert`).
+
+`insert-unique-index-probe-position.sqltest` inserts scattered, long keys
+(single- and multi-column, with NULLs, duplicates, and same-table BEFORE and
+AFTER triggers that insert keys into the same leaf) and checks integrity, a
+point lookup for every key, and the index order. Moving the cursor to the
+first entry before a `USE_SEEK` insert makes all six insert tests fail.
+
+**Callgrind, 200/2,200 iterations:**
+
+| Scenario | Before | After | Change |
+|---|---:|---:|---:|
+| `batch_insert_commit` | 2,145,466 | 1,815,869 | -15.4% |
+| `insert_rollback` | 59,406 | 51,302 | -13.6% |
+| `insert_commit` | 82,040 | 72,171 | -12.0% |
+| `scan_128_btree` | 207,602 | 210,347 | +1.3% |
+| `delete_commit` | 57,965 | 58,392 | +0.7% |
+| `point_update_commit` | 33,835 | 34,083 | +0.7% |
+
+**Measurement noise:** The only source change is in INSERT translation, which
+the other workloads do not run in the measured loop. Their profiles show cost
+moving between inlined functions (`SkipList::search_bound` now appears on its
+own, while `try_pin_loop` fell by a similar amount). `bench-profile` builds with
+16 codegen units and no LTO, so a change in one module can change inlining
+elsewhere. Differences below about 1% in workloads a change does not touch are
+within this noise.
+
 ## Final measured totals
 
 The branch was rebased after `origin/main` gained unrelated planner work and an
