@@ -70,7 +70,10 @@ transaction has to be rolled back and retried by the application. Taking
 the lock up front puts the wait in the `begin` phase, where SQLite's busy
 handler waits it out, and it is what SQLite documents for applications
 with several writers. The busy timeout is 60 s with the default busy
-handler.
+handler. That handler polls for the lock instead of queueing for it, so
+with many writers one connection can keep losing the lock to the others
+until the timeout runs out. That transaction starts over, the restart
+counts towards its latency, and the summary reports how many happened.
 
 **Turso.** MVCC (`PRAGMA journal_mode = mvcc`), one connection per OS
 thread with its own tokio runtime, `BEGIN CONCURRENT` and the io_uring
