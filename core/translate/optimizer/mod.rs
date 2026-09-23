@@ -83,6 +83,7 @@ pub(crate) mod access_method;
 pub(crate) mod constraints;
 pub(crate) mod cost;
 mod cost_params;
+mod disjunctive_normal_form;
 pub(crate) mod join;
 pub(crate) mod lift_common_subexpressions;
 pub(crate) mod multi_index;
