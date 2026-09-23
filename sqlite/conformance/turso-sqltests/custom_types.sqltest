@@ -1886,3 +1886,23 @@ test update-virtual-column-reads-decoded-custom-type {
 expect {
     5|6
 }
+
+@requires strict "uses STRICT tables"
+test index-on-virtual-column-reads-decoded-custom-type {
+    CREATE TYPE cents BASE integer ENCODE value * 100 DECODE value / 100;
+    CREATE TABLE t(id INTEGER PRIMARY KEY, x cents, y INT, v INT AS (x + 1)) STRICT;
+    CREATE INDEX tv ON t(v);
+    INSERT INTO t(id, x, y) VALUES (1, 5, 0), (2, 6, 0);
+    UPDATE t SET y = 1 WHERE id = 1;
+    UPDATE t SET x = 7 WHERE id = 2;
+    INSERT INTO t(id, x, y) VALUES (1, 0, 0) ON CONFLICT(id) DO UPDATE SET x = 9;
+    SELECT id, v FROM t INDEXED BY tv ORDER BY v;
+    SELECT id FROM t WHERE v = 10;
+    PRAGMA integrity_check;
+}
+expect {
+    2|8
+    1|10
+    1
+    ok
+}
