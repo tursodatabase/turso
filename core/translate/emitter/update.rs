@@ -1,4 +1,6 @@
-use super::gencol::{compute_virtual_columns, emit_row_from_cursor};
+use super::gencol::{
+    columns_read_by_index, compute_virtual_columns, emit_row_from_cursor, foreign_key_columns,
+};
 use super::TranslateCtx;
 use crate::alloc::{TryClone, TursoIteratorExt};
 use crate::schema::{Column, ColumnLayout, GeneratedType, Table};
@@ -9,8 +11,8 @@ use crate::{
     ast, emit_explain,
     error::{SQLITE_CONSTRAINT_NOTNULL, SQLITE_CONSTRAINT_PRIMARYKEY, SQLITE_CONSTRAINT_UNIQUE},
     schema::{
-        collect_column_dependencies_of_expr, BTreeTable, CheckConstraint, Index,
-        EXPR_INDEX_SENTINEL, ROWID_SENTINEL,
+        columns_referenced_by_expr, BTreeTable, CheckConstraint, Index, EXPR_INDEX_SENTINEL,
+        ROWID_SENTINEL,
     },
     sync::Arc,
     translate::{
@@ -1507,8 +1509,13 @@ fn emit_update_insns<'a>(
             .insert(effective_rowid_reg, Affinity::Integer);
     }
 
-    let update_affects_virtual_columns = affected_columns.count() > updated_column_indices.count();
     let has_returning = returning.as_ref().is_some_and(|r| !r.is_empty());
+    let relevant_checks = match target_table.table.btree() {
+        Some(btree_table) => {
+            relevant_check_constraints(&btree_table, &affected_columns, updates_rowid)
+        }
+        None => Vec::new(),
+    };
     if let Table::BTree(ref btree) = target_table.table {
         if btree.is_strict {
             // pre-encode typecheck for updated columns
@@ -1523,57 +1530,41 @@ fn emit_update_insns<'a>(
                 )?,
             });
         }
-        let has_check_constraints = !btree.check_constraints.is_empty();
-        let cols = btree.columns();
-        let virtual_col_names: HashSet<String> = cols
-            .iter()
-            .filter(|c| c.is_virtual_generated())
-            .filter_map(|c| c.name.as_ref().map(|n| normalize_ident(n)))
-            .collect();
-        let expr_references_virtual = |expr: &ast::Expr| {
-            !virtual_col_names.is_empty()
-                && !collect_column_dependencies_of_expr(expr, cols).is_disjoint(&virtual_col_names)
+        let foreign_key_columns = if connection.foreign_keys_enabled() {
+            foreign_key_columns(btree, &t_ctx.resolver, update_database_id)?
+        } else {
+            ColumnMask::default()
         };
-        let index_references_virtual_column = indexes_to_update.iter().any(|idx| {
-            idx.columns.iter().any(|col| {
-                if col.pos_in_table != EXPR_INDEX_SENTINEL {
-                    cols[col.pos_in_table].is_virtual_generated()
-                } else {
-                    col.expr.as_deref().is_some_and(expr_references_virtual)
-                }
-            }) || idx
-                .where_clause
-                .as_deref()
-                .is_some_and(expr_references_virtual)
-        });
+        let columns_to_compute = columns_needed_by_update(
+            btree,
+            &affected_columns,
+            &relevant_checks,
+            indexes_to_update,
+            &foreign_key_columns,
+            cdc_updates_register.is_some(),
+            has_before_triggers || has_after_triggers || has_returning,
+        )?;
 
         // compute virtual columns pre-encoding, so that we can type-check them later
-        if btree.is_strict
-            || update_affects_virtual_columns
-            || has_before_triggers
-            || has_after_triggers
-            || has_returning
-            || has_check_constraints
-            || index_references_virtual_column
-        {
-            let dml_ctx =
-                DmlColumnContext::layout(cols, start, effective_rowid_reg, layout.clone())
-                    .with_encoded_columns(columns_read_from_table.try_clone()?);
-            compute_virtual_columns(
-                program,
-                &btree.columns_topo_sort()?,
-                &dml_ctx,
-                &t_ctx.resolver,
-                btree,
-            )?;
-            emit_not_null_and_cdc_for_affected_virtual_columns(
-                program,
-                table_references,
-                &column_ctx,
-                skip_row_label,
-                &t_ctx.resolver,
-            )?;
-        }
+        let dml_ctx =
+            DmlColumnContext::layout(btree.columns(), start, effective_rowid_reg, layout.clone())
+                .with_encoded_columns(columns_read_from_table.try_clone()?);
+        compute_virtual_columns(
+            program,
+            &btree
+                .columns_topo_sort()?
+                .retain_columns(&columns_to_compute),
+            &dml_ctx,
+            &t_ctx.resolver,
+            btree,
+        )?;
+        emit_not_null_and_cdc_for_affected_virtual_columns(
+            program,
+            table_references,
+            &column_ctx,
+            skip_row_label,
+            &t_ctx.resolver,
+        )?;
     }
 
     // Non-REPLACE PK constraint check. Must run BEFORE the index preflight so that
@@ -1684,34 +1675,7 @@ fn emit_update_insns<'a>(
             });
         }
 
-        if !btree_table.check_constraints.is_empty() {
-            // SQLite only evaluates CHECK constraints that reference at least one
-            // column in the SET clause. Build a set of updated column names to filter.
-            let mut updated_col_names: HashSet<String> = btree_table
-                .columns()
-                .iter()
-                .enumerate()
-                .filter(|(idx, _)| affected_columns.get(*idx))
-                .filter_map(|(_, col)| col.name.as_deref())
-                .map(normalize_ident)
-                .collect();
-
-            // If the rowid is being updated (either directly via ROWID_SENTINEL or
-            // through a rowid alias column), also include the rowid pseudo-column
-            // names so that CHECK(rowid > 0) etc. are properly triggered.
-            if updates_rowid {
-                for name in ROWID_STRS {
-                    updated_col_names.insert(name.to_string());
-                }
-            }
-
-            let relevant_checks: Vec<CheckConstraint> = btree_table
-                .check_constraints
-                .iter()
-                .filter(|cc| check_expr_references_columns(&cc.expr, &updated_col_names))
-                .cloned()
-                .collect();
-
+        if !relevant_checks.is_empty() {
             let check_constraint_tables =
                 TableReferences::new(vec![target_table.as_ref().clone()], vec![]);
             emit_check_constraints(
@@ -2629,4 +2593,68 @@ fn emit_not_null_and_cdc_for_affected_virtual_columns(
         }
     }
     Ok(())
+}
+
+fn relevant_check_constraints(
+    table: &BTreeTable,
+    affected_columns: &ColumnMask,
+    updates_rowid: bool,
+) -> Vec<CheckConstraint> {
+    if table.check_constraints.is_empty() {
+        return Vec::new();
+    }
+    // SQLite only evaluates CHECK constraints that reference at least one
+    // column in the SET clause. Build a set of updated column names to filter.
+    let mut updated_col_names: HashSet<String> = table
+        .columns()
+        .iter()
+        .enumerate()
+        .filter(|(idx, _)| affected_columns.get(*idx))
+        .filter_map(|(_, col)| col.name.as_deref())
+        .map(normalize_ident)
+        .collect();
+
+    // If the rowid is being updated (either directly via ROWID_SENTINEL or
+    // through a rowid alias column), also include the rowid pseudo-column
+    // names so that CHECK(rowid > 0) etc. are properly triggered.
+    if updates_rowid {
+        for name in ROWID_STRS {
+            updated_col_names.insert(name.to_string());
+        }
+    }
+
+    table
+        .check_constraints
+        .iter()
+        .filter(|cc| check_expr_references_columns(&cc.expr, &updated_col_names))
+        .cloned()
+        .collect()
+}
+
+fn columns_needed_by_update(
+    table: &BTreeTable,
+    affected_columns: &ColumnMask,
+    relevant_checks: &[CheckConstraint],
+    indexes_to_update: &[Arc<Index>],
+    foreign_key_columns: &ColumnMask,
+    records_changed_columns: bool,
+    reads_whole_row: bool,
+) -> Result<ColumnMask> {
+    let columns = table.columns();
+    if reads_whole_row || table.is_strict {
+        return Ok((0..columns.len()).try_collect()?);
+    }
+    let mut needed = foreign_key_columns.try_clone()?;
+    for (idx, column) in columns.iter().enumerate() {
+        if affected_columns.get(idx) && (column.notnull() || records_changed_columns) {
+            needed.set(idx)?;
+        }
+    }
+    for check in relevant_checks {
+        needed.union_with(&columns_referenced_by_expr(&check.expr, columns)?)?;
+    }
+    for index in indexes_to_update {
+        needed.union_with(&columns_read_by_index(index, columns)?)?;
+    }
+    table.columns_with_dependencies(needed.iter())
 }

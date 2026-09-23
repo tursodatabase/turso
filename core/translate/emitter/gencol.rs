@@ -82,3 +82,22 @@ pub(crate) fn columns_read_by_index(index: &Index, columns: &[Column]) -> Result
     }
     Ok(read)
 }
+
+pub(crate) fn foreign_key_columns(
+    table: &BTreeTable,
+    resolver: &Resolver,
+    database_id: usize,
+) -> Result<ColumnMask> {
+    let mut columns = ColumnMask::default();
+    for fk in resolver.with_schema(database_id, |s| s.resolved_fks_for_child(&table.name))? {
+        for &pos in fk.child_pos.iter() {
+            columns.set(pos)?;
+        }
+    }
+    for fk in resolver.with_schema(database_id, |s| s.resolved_fks_referencing(&table.name))? {
+        for &pos in fk.parent_pos.iter() {
+            columns.set(pos)?;
+        }
+    }
+    Ok(columns)
+}

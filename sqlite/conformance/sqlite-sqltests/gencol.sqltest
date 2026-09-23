@@ -6056,3 +6056,62 @@ test gencol_insert_fk_parent_key_is_virtual_column {
 expect {
     1
 }
+
+@skip-if mvcc "mvcc has different root pages"
+@setup gencol_one_indexed_virtual_column
+snapshot gencol_update_computes_only_read_virtual_columns {
+    UPDATE t SET a = 5;
+}
+
+@cross-check-integrity
+test gencol_update_index_key_reads_unchanged_virtual_column {
+    CREATE TABLE t(a INTEGER, b INTEGER, v AS (b * 10), w AS (a * 3));
+    CREATE INDEX t_av ON t(a, v);
+    INSERT INTO t(a, b) VALUES (1, 2);
+    UPDATE t SET a = 5;
+    SELECT a, v FROM t INDEXED BY t_av WHERE a = 5 AND v = 20;
+    PRAGMA integrity_check;
+}
+expect {
+    5|20
+    ok
+}
+
+test gencol_update_check_reads_unchanged_virtual_column {
+    CREATE TABLE t(a INTEGER, b INTEGER, v AS (b * 10), w AS (a * 3), CHECK (a < v));
+    INSERT INTO t(a, b) VALUES (1, 2);
+    UPDATE t SET a = 25;
+}
+expect error {
+    CHECK constraint failed: a < v
+}
+
+test gencol_update_check_reads_virtual_column_through_another {
+    CREATE TABLE t(a INTEGER, b INTEGER, c AS (a + b), d AS (c * 2) CHECK (d < 10), e AS (a * 100));
+    INSERT INTO t(a, b) VALUES (1, 2);
+    UPDATE t SET a = 3;
+}
+expect error {
+    CHECK constraint failed: d < 10
+}
+
+test gencol_update_not_null_reads_virtual_column_through_another {
+    CREATE TABLE t(a INTEGER, b INTEGER, c AS (a + b), d AS (c * 2) NOT NULL);
+    INSERT INTO t(a, b) VALUES (1, 1);
+    UPDATE t SET a = NULL;
+}
+expect error {
+    NOT NULL constraint failed: t.d
+}
+
+test gencol_update_fk_child_key_is_virtual_column {
+    PRAGMA foreign_keys = ON;
+    CREATE TABLE p(id INTEGER PRIMARY KEY);
+    CREATE TABLE ch(x INTEGER, v AS (x + 1) REFERENCES p(id), w AS (x * 7));
+    INSERT INTO p VALUES (2);
+    INSERT INTO ch(x) VALUES (1);
+    UPDATE ch SET x = 5;
+}
+expect error {
+    FOREIGN KEY constraint failed
+}

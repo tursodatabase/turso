@@ -1278,16 +1278,7 @@ fn columns_needed_by_insert(
         needed.union_with(&gencol::columns_read_by_index(index, columns)?)?;
     }
     if has_fks {
-        for fk in resolver.with_schema(database_id, |s| s.resolved_fks_for_child(&table.name))? {
-            for &pos in fk.child_pos.iter() {
-                needed.set(pos)?;
-            }
-        }
-        for fk in resolver.with_schema(database_id, |s| s.resolved_fks_referencing(&table.name))? {
-            for &pos in fk.parent_pos.iter() {
-                needed.set(pos)?;
-            }
-        }
+        needed.union_with(&gencol::foreign_key_columns(table, resolver, database_id)?)?;
     }
     table.columns_with_dependencies(needed.iter())
 }
