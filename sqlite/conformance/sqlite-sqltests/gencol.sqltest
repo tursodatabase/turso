@@ -5785,3 +5785,13 @@ expect {
     0
     ok
 }
+
+setup gencol_untyped_virtual_columns {
+    CREATE TABLE t(a INTEGER, b INTEGER, c AS (a + b), d AS (c * 2));
+}
+
+@skip-if mvcc "mvcc has different root pages"
+@setup gencol_untyped_virtual_columns
+snapshot gencol_select_untyped_virtual_columns {
+    SELECT c, d FROM t;
+}
