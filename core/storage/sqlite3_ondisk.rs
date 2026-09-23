@@ -109,21 +109,12 @@ impl PageSize {
 
     /// Interpret a user-provided u32 as either a valid page size or None.
     pub const fn new(size: u32) -> Option<Self> {
-        if size < PageSize::MIN || size > PageSize::MAX {
-            return None;
-        }
-
-        // Page size must be a power of two.
-        if size.count_ones() != 1 {
-            return None;
-        }
-
-        if size == PageSize::MAX {
+        match size {
+            512 | 1024 | 2048 | 4096 | 8192 | 16384 | 32768 => Some(Self(U16BE::new(size as u16))),
             // Internally, the value 1 represents 65536, since the on-disk value of the page size in the DB header is 2 bytes.
-            return Some(Self(U16BE::new(1)));
+            PageSize::MAX => Some(Self(U16BE::new(1))),
+            _ => None,
         }
-
-        Some(Self(U16BE::new(size as u16)))
     }
 
     /// Interpret a u16 on disk (DB file header) as either a valid page size or
@@ -1365,6 +1356,12 @@ pub fn read_varint(buf: &[u8]) -> Result<(u64, usize)> {
         [b0, b1, ..] if *b1 < 0x80 => {
             return Ok(((((*b0 & 0x7f) as u64) << 7) | *b1 as u64, 2));
         }
+        [b0, b1, b2, ..] if *b2 < 0x80 => {
+            return Ok((
+                (((*b0 & 0x7f) as u64) << 14) | (((*b1 & 0x7f) as u64) << 7) | *b2 as u64,
+                3,
+            ));
+        }
         _ => {}
     }
     let mut v: u64 = 0;
@@ -1399,6 +1396,19 @@ pub fn read_varint(buf: &[u8]) -> Result<(u64, usize)> {
             bail_corrupt_error!("Invalid varint");
         }
     }
+}
+
+#[inline(always)]
+pub(crate) fn split_varint(buf: &[u8]) -> Result<(u64, &[u8])> {
+    match buf {
+        [b0, rest @ ..] if *b0 < 0x80 => return Ok((*b0 as u64, rest)),
+        [b0, b1, rest @ ..] if *b1 < 0x80 => {
+            return Ok(((((*b0 & 0x7f) as u64) << 7) | *b1 as u64, rest));
+        }
+        _ => {}
+    }
+    let (value, len) = read_varint(buf)?;
+    Ok((value, &buf[len..]))
 }
 
 #[inline(always)]
@@ -2331,6 +2341,25 @@ mod tests {
     use rstest::rstest;
 
     #[rstest]
+    #[case(0, None)]
+    #[case(1, None)]
+    #[case(511, None)]
+    #[case(512, Some(512))]
+    #[case(513, None)]
+    #[case(4096, Some(4096))]
+    #[case(6144, None)]
+    #[case(32768, Some(32768))]
+    #[case(65536, Some(65536))]
+    #[case(65537, None)]
+    #[case(u32::MAX, None)]
+    fn page_size_accepts_only_a_power_of_two_in_range(
+        #[case] size: u32,
+        #[case] expected: Option<u32>,
+    ) {
+        assert_eq!(PageSize::new(size).map(PageSize::get), expected);
+    }
+
+    #[rstest]
     #[case(PageType::TableLeaf, 4096, 0, None)]
     #[case(PageType::TableLeaf, 4096, 4061, None)]
     #[case(PageType::TableLeaf, 4096, 4062, Some(493))]
@@ -2676,13 +2705,42 @@ mod tests {
         let written = write_varint(&mut buf, value);
         varint_len(value) == written
     }
+    #[quickcheck_macros::quickcheck]
+    fn read_varint_reads_back_what_write_varint_wrote(value: u64) -> bool {
+        let mut buf = [0u8; 9];
+        let written = write_varint(&mut buf, value);
+        read_varint(&buf[..written])
+            .map(|(read, len)| read == value && len == written)
+            .unwrap_or(false)
+    }
 
     #[quickcheck_macros::quickcheck]
-    fn read_varint_len_matches_read_varint(bytes: Vec<u8>) -> bool {
-        match (read_varint_len(&bytes), read_varint(&bytes)) {
-            (Ok(len), Ok((_, expected))) => len == expected,
+    fn split_varint_matches_read_varint(bytes: Vec<u8>) -> bool {
+        match (split_varint(&bytes), read_varint(&bytes)) {
+            (Ok((split_value, rest)), Ok((value, len))) => {
+                split_value == value && rest == &bytes[len..]
+            }
             (Err(_), Err(_)) => true,
             _ => false,
         }
+    }
+
+    #[test]
+    fn split_varint_cuts_the_tail_at_every_varint_length() {
+        let mut seen_lengths = std::collections::HashSet::new();
+        for bits in 0..64 {
+            let value = 1u64 << bits;
+            let mut buf = [0u8; 12];
+            let written = write_varint(&mut buf, value);
+            seen_lengths.insert(written);
+            buf[written..written + 3].copy_from_slice(b"abc");
+            let (read, rest) = split_varint(&buf[..written + 3]).unwrap();
+            assert_eq!(read, value, "value at {written} bytes");
+            assert_eq!(rest, b"abc", "tail at {written} bytes");
+        }
+        assert_eq!(
+            seen_lengths,
+            (1..=9).collect::<std::collections::HashSet<_>>()
+        );
     }
 }

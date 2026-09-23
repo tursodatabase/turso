@@ -7853,9 +7853,9 @@ impl BTreeCursor {
         if self.has_pending_advance_state() {
             return false;
         }
-        let contents = self.stack.top_ref().get_contents();
-        let cell_idx = self.stack.current_cell_index();
-        cell_idx >= 0 && contents.is_leaf() && cell_idx as usize + 1 < contents.cell_count()
+        let (page, cell_idx) = self.stack.top_and_cell_index();
+        let (is_leaf, cell_count) = page.get_contents().leaf_and_cell_count();
+        cell_idx >= 0 && is_leaf && cell_idx as usize + 1 < cell_count
     }
 
     /// True when the cursor sits on the last cell of the rightmost leaf and
@@ -7867,11 +7867,11 @@ impl BTreeCursor {
         if self.has_pending_advance_state() {
             return false;
         }
-        let contents = self.stack.top_ref().get_contents();
-        let cell_idx = self.stack.current_cell_index();
+        let (page, cell_idx) = self.stack.top_and_cell_index();
+        let (is_leaf, cell_count) = page.get_contents().leaf_and_cell_count();
         cell_idx >= 0
-            && contents.is_leaf()
-            && cell_idx as usize + 1 == contents.cell_count()
+            && is_leaf
+            && cell_idx as usize + 1 == cell_count
             && !self.ancestor_pages_have_more_children()
     }
 
@@ -8823,6 +8823,15 @@ impl PageStack {
     fn top_ref(&self) -> &PageRef {
         let current = self.current();
         self.stack[current].as_ref().unwrap()
+    }
+
+    #[inline(always)]
+    fn top_and_cell_index(&self) -> (&PageRef, i32) {
+        let current = self.current();
+        (
+            self.stack[current].as_ref().unwrap(),
+            self.node_states[current].cell_idx,
+        )
     }
 
     /// Current page pointer being used
