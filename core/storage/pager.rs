@@ -429,6 +429,34 @@ impl PageInner {
         self.read_u8(BTREE_FRAGMENTED_BYTES_COUNT)
     }
 
+    #[inline(always)]
+    pub fn btree_free_space_fields(&self) -> BtreeFreeSpaceFields {
+        let buf = self.as_ptr();
+        let header = self.offset();
+        let window = &buf[header..header + LEAF_PAGE_HEADER_SIZE_BYTES];
+        let is_interior = window[BTREE_PAGE_TYPE] <= PageType::TableInterior as u8;
+        let cell_content_area = u16::from_be_bytes([
+            window[BTREE_CELL_CONTENT_AREA],
+            window[BTREE_CELL_CONTENT_AREA + 1],
+        ]);
+        BtreeFreeSpaceFields {
+            header_size: (!is_interior as usize) * LEAF_PAGE_HEADER_SIZE_BYTES
+                + (is_interior as usize) * INTERIOR_PAGE_HEADER_SIZE_BYTES,
+            cell_count: u16::from_be_bytes([window[BTREE_CELL_COUNT], window[BTREE_CELL_COUNT + 1]])
+                as usize,
+            first_freeblock: u16::from_be_bytes([
+                window[BTREE_FIRST_FREEBLOCK],
+                window[BTREE_FIRST_FREEBLOCK + 1],
+            ]),
+            cell_content_area: if cell_content_area == 0 {
+                PageSize::MAX
+            } else {
+                cell_content_area as u32
+            },
+            num_frag_free_bytes: window[BTREE_FRAGMENTED_BYTES_COUNT],
+        }
+    }
+
     #[inline]
     pub fn rightmost_pointer(&self) -> crate::Result<Option<u32>> {
         match self.page_type()? {
@@ -727,6 +755,15 @@ impl PageInner {
         idx: usize,
         usable_size: usize,
     ) -> crate::Result<(usize, usize)> {
+        let (start, len, _) = self.cell_get_raw_region_and_overflow(idx, usable_size)?;
+        Ok((start, len))
+    }
+
+    pub fn cell_get_raw_region_and_overflow(
+        &self,
+        idx: usize,
+        usable_size: usize,
+    ) -> crate::Result<(usize, usize, Option<u32>)> {
         let page_type = self.page_type()?;
         let max_local = payload_overflow_threshold_max(page_type, usable_size);
         let min_local = payload_overflow_threshold_min(page_type, usable_size);
@@ -750,10 +787,11 @@ impl PageInner {
         max_local: usize,
         min_local: usize,
         page_type: PageType,
-    ) -> crate::Result<(usize, usize)> {
+    ) -> crate::Result<(usize, usize, Option<u32>)> {
         let buf = self.as_ptr();
         turso_assert_less_than!(idx, cell_count);
         let start = self.cell_get_raw_start_offset(idx);
+        let mut overflows = false;
         let len = match page_type {
             PageType::IndexInterior => {
                 let (len_payload, n_payload) =
@@ -764,6 +802,7 @@ impl PageInner {
                     min_local,
                     usable_size,
                 ) {
+                    overflows = true;
                     4 + local_size + n_payload
                 } else {
                     4 + len_payload as usize + n_payload
@@ -783,6 +822,7 @@ impl PageInner {
                     min_local,
                     usable_size,
                 ) {
+                    overflows = true;
                     local_size + n_payload
                 } else {
                     let mut size = len_payload as usize + n_payload;
@@ -803,6 +843,7 @@ impl PageInner {
                     min_local,
                     usable_size,
                 ) {
+                    overflows = true;
                     local_size + n_payload + n_rowid
                 } else {
                     let mut size = len_payload as usize + n_payload + n_rowid;
@@ -820,7 +861,15 @@ impl PageInner {
             start + len,
             buf.len()
         );
-        Ok((start, len))
+        let first_overflow_page = if overflows {
+            let at = start + len - 4;
+            Some(u32::from_be_bytes(
+                buf[at..at + 4].try_into().expect("four bytes"),
+            ))
+        } else {
+            None
+        };
+        Ok((start, len, first_overflow_page))
     }
 
     #[inline(always)]
@@ -859,6 +908,14 @@ impl PageInner {
         }
         println!("--------------");
     }
+}
+
+pub struct BtreeFreeSpaceFields {
+    pub header_size: usize,
+    pub cell_count: usize,
+    pub first_freeblock: u16,
+    pub cell_content_area: u32,
+    pub num_frag_free_bytes: u8,
 }
 
 /// Type alias for backward compatibility - PageContent is now PageInner
