@@ -119,3 +119,9 @@ db-file reader might still need the SkipMap copy.
 | `core/mvcc/database/mod.rs` | `sample_gc_lwm`, `gc_chain_now`, `gc_version_chain`, `stamp_chain_materialized`, incremental + Finalize sweeps |
 | `core/mvcc/database/checkpoint_state_machine.rs` | `written_*`, stamp sites, `gc_checkpointed_*`, `gc_floor_reader_mark` |
 | `core/mvcc/database/tests.rs` | Rule 2/3 unit tests, Passive transfer / unique-miss regressions |
+
+## Formal model
+
+`lean/mvcc-gc` has a Lean model of one row in Truncate mode. It proves that
+inline GC and the Truncate checkpoint do not change what a transaction reads.
+`lean/mvcc-gc/README.md` gives the theorems and the limits of the model.

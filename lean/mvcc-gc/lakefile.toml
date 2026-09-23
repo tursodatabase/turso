@@ -1,0 +1,10 @@
+name = "mvcc-gc"
+version = "0.1.0"
+defaultTargets = ["MvccGc", "search"]
+
+[[lean_lib]]
+name = "MvccGc"
+
+[[lean_exe]]
+name = "search"
+root = "Search"
