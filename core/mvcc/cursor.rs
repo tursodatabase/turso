@@ -5,7 +5,8 @@ use crate::types::IOResultOr;
 
 use crate::mvcc::clock::LogicalClock;
 use crate::mvcc::database::{
-    create_seek_range, MVTableId, MvStore, Row, RowID, RowKey, RowVersions, SortableIndexKey,
+    create_seek_range, IndexKeyPrefix, MVTableId, MvStore, Row, RowID, RowKey, RowVersions,
+    SortableIndexKey,
 };
 #[cfg(any(test, injected_yields))]
 use crate::mvcc::yield_hooks::{ProvidesYieldContext, YieldContext, YieldPointMarker};
@@ -1683,28 +1684,22 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> CursorTrait
                             }
                         }
                         SeekKey::IndexKey(index_key) => {
-                            let index_info = {
-                                let MvccCursorType::Index(index_info) = &self.mv_cursor_type else {
-                                    panic!("SeekKey::IndexKey requires Index cursor type");
-                                };
-                                Arc::new(IndexInfo::new_in(
-                                    index_info.key_info.iter().cloned(),
-                                    index_info.has_rowid,
-                                    index_key.column_count(),
-                                    index_info.is_unique,
-                                    self.db.allocator(),
-                                )?)
+                            let MvccCursorType::Index(index_info) = &self.mv_cursor_type else {
+                                panic!("SeekKey::IndexKey requires Index cursor type");
                             };
-                            let sortable_key = SortableIndexKey::new_from_payload_in(
-                                index_key,
-                                index_info,
-                                self.db.allocator(),
-                            )?;
+                            let prefix = IndexKeyPrefix {
+                                key: SortableIndexKey::new_from_payload_in(
+                                    index_key,
+                                    index_info.clone(),
+                                    self.db.allocator(),
+                                )?,
+                                num_cols: index_key.column_count(),
+                            };
 
                             // Seek in MVCC (synchronous)
                             let mvcc_rowid = self.db.seek_index(
                                 self.table_id,
-                                sortable_key.clone(),
+                                prefix,
                                 inclusive,
                                 op.eq_only(),
                                 direction,
