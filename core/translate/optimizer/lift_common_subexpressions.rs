@@ -31,7 +31,7 @@ pub(crate) fn rewrite_or_terms(
             continue;
         }
         let or_expr = where_clause[term_index].expr.clone();
-        let outer_join_table = where_clause[term_index].from_outer_join;
+        let term_origin = where_clause[term_index].origin;
 
         let or_branches = flatten_or_expr_owned(or_expr)?;
 
@@ -45,20 +45,18 @@ pub(crate) fn rewrite_or_terms(
             branch_parentheses.push(parenthesis_count);
         }
 
-        if outer_join_table.is_none() {
-            // Keep outer-join conditions attached to their join. A separate
-            // filter can remove the NULL row that the join must produce.
-            for expr in in_filters_implied_by_or_branches(&branch_terms, available_indexes) {
-                if !where_clause
-                    .iter()
-                    .any(|term| exprs_are_equivalent(&term.expr, &expr))
-                {
-                    where_clause.push(WhereTerm {
-                        expr,
-                        from_outer_join: None,
-                        consumed: false,
-                    });
-                }
+        for expr in in_filters_implied_by_or_branches(&branch_terms, available_indexes) {
+            if !where_clause
+                .iter()
+                .any(|term| exprs_are_equivalent(&term.expr, &expr))
+            {
+                where_clause.push(WhereTerm {
+                    expr,
+                    // Keep this filter in the ON clause so it cannot remove
+                    // unmatched rows after the join.
+                    origin: term_origin,
+                    consumed: false,
+                });
             }
         }
 
@@ -102,7 +100,7 @@ pub(crate) fn rewrite_or_terms(
         for common_term in common_terms {
             where_clause.push(WhereTerm {
                 expr: common_term,
-                from_outer_join: outer_join_table,
+                origin: term_origin,
                 consumed: false,
             });
         }
@@ -346,7 +344,7 @@ fn rebuild_or_expr_from_list(mut branches: Vec<Expr>) -> Expr {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::translate::plan::WhereTerm;
+    use crate::translate::plan::{JoinOrigin, WhereTerm, WhereTermOrigin};
     use turso_parser::ast::{self, Expr, Literal, Operator, TableInternalId};
 
     #[test]
@@ -415,7 +413,7 @@ mod tests {
 
         let mut where_clause = vec![WhereTerm {
             expr: or_expr,
-            from_outer_join: None,
+            origin: WhereTermOrigin::Where,
             consumed: false,
         }];
 
@@ -517,7 +515,7 @@ mod tests {
 
         let mut where_clause = vec![WhereTerm {
             expr: or_expr,
-            from_outer_join: None,
+            origin: WhereTermOrigin::Where,
             consumed: false,
         }];
 
@@ -584,7 +582,7 @@ mod tests {
 
         let mut where_clause = vec![WhereTerm {
             expr: or_expr.clone(),
-            from_outer_join: None,
+            origin: WhereTermOrigin::Where,
             consumed: false,
         }];
 
@@ -603,9 +601,6 @@ mod tests {
 
     #[test]
     fn moved_outer_join_terms_keep_their_source_join() -> Result<()> {
-        // Test case with from_outer_join flag set;
-        // it should be retained in the new WhereTerms, for outer join correctness.
-
         let a_expr = Expr::Binary(
             Box::new(Expr::Column {
                 database: None,
@@ -653,13 +648,12 @@ mod tests {
 
         let mut where_clause = vec![WhereTerm {
             expr: or_expr,
-            from_outer_join: Some(TableInternalId::default()), // Set from_outer_join
+            origin: WhereTermOrigin::Join(JoinOrigin::Outer(TableInternalId::default())),
             consumed: false,
         }];
 
         rewrite_or_terms(&mut where_clause, &AvailableIndexes::default())?;
 
-        // Should have 2 terms, both with from_outer_join set
         let nonconsumed_terms = where_clause
             .iter()
             .filter(|term| !term.consumed)
@@ -674,13 +668,13 @@ mod tests {
             )
         );
         assert_eq!(
-            nonconsumed_terms[0].from_outer_join,
-            Some(TableInternalId::default())
+            nonconsumed_terms[0].origin.join_origin(),
+            Some(JoinOrigin::Outer(TableInternalId::default()))
         );
         assert_eq!(nonconsumed_terms[1].expr, a_expr);
         assert_eq!(
-            nonconsumed_terms[1].from_outer_join,
-            Some(TableInternalId::default())
+            nonconsumed_terms[1].origin.join_origin(),
+            Some(JoinOrigin::Outer(TableInternalId::default()))
         );
 
         Ok(())
@@ -705,7 +699,7 @@ mod tests {
 
         let mut where_clause = vec![WhereTerm {
             expr: single_expr.clone(),
-            from_outer_join: None,
+            origin: WhereTermOrigin::Where,
             consumed: false,
         }];
 
@@ -754,7 +748,7 @@ mod tests {
 
         let mut where_clause = vec![WhereTerm {
             expr: or_expr,
-            from_outer_join: None,
+            origin: WhereTermOrigin::Where,
             consumed: false,
         }];
 
@@ -783,7 +777,7 @@ mod tests {
         );
         let mut where_clause = vec![WhereTerm {
             expr: or_expr.clone(),
-            from_outer_join: None,
+            origin: WhereTermOrigin::Where,
             consumed: false,
         }];
 
@@ -809,7 +803,7 @@ mod tests {
         );
         let mut where_clause = vec![WhereTerm {
             expr: or_expr.clone(),
-            from_outer_join: None,
+            origin: WhereTermOrigin::Where,
             consumed: false,
         }];
 
@@ -844,7 +838,7 @@ mod tests {
         );
         let mut where_clause = vec![WhereTerm {
             expr: or_expr,
-            from_outer_join: None,
+            origin: WhereTermOrigin::Where,
             consumed: false,
         }];
 
@@ -861,7 +855,7 @@ mod tests {
     }
 
     #[test]
-    fn outer_join_term_does_not_add_separate_in_filter() -> Result<()> {
+    fn outer_join_in_filter_keeps_join_origin() -> Result<()> {
         let or_expr = Expr::Binary(
             Box::new(column_equals_literal(0, "1")),
             Operator::Or,
@@ -869,13 +863,34 @@ mod tests {
         );
         let mut where_clause = vec![WhereTerm {
             expr: or_expr,
-            from_outer_join: Some(TableInternalId::default()),
+            origin: WhereTermOrigin::Join(JoinOrigin::Outer(TableInternalId::default())),
             consumed: false,
         }];
 
         rewrite_or_terms(&mut where_clause, &AvailableIndexes::default())?;
 
-        assert_eq!(where_clause.len(), 1);
+        assert_eq!(where_clause.len(), 2);
+        assert_eq!(where_clause[1].origin, where_clause[0].origin);
+        Ok(())
+    }
+
+    #[test]
+    fn inner_join_in_filter_keeps_join_origin() -> Result<()> {
+        let or_expr = Expr::Binary(
+            Box::new(column_equals_literal(0, "1")),
+            Operator::Or,
+            Box::new(column_equals_literal(0, "2")),
+        );
+        let mut where_clause = vec![WhereTerm {
+            expr: or_expr,
+            origin: WhereTermOrigin::Join(JoinOrigin::Inner(TableInternalId::default())),
+            consumed: false,
+        }];
+
+        rewrite_or_terms(&mut where_clause, &AvailableIndexes::default())?;
+
+        assert_eq!(where_clause.len(), 2);
+        assert_eq!(where_clause[1].origin, where_clause[0].origin);
         Ok(())
     }
 
@@ -898,7 +913,7 @@ mod tests {
         );
         let mut where_clause = vec![WhereTerm {
             expr: or_expr,
-            from_outer_join: None,
+            origin: WhereTermOrigin::Where,
             consumed: false,
         }];
 

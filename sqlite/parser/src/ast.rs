@@ -495,6 +495,11 @@ pub enum Expr {
         /// `FILTER`
         filter_over: FunctionTail,
     },
+    /// A generated USING column that can read from more than one source.
+    ///
+    /// The parser never creates this node. Name binding creates it to keep
+    /// SQLite's first-source affinity and collation rules separate from user `coalesce()`.
+    MergedColumn(Vec<Box<Expr>>),
     /// Identifier
     Id(Name),
     /// Column

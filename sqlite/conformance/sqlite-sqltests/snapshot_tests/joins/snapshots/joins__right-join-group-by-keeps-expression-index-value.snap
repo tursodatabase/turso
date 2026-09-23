@@ -1,0 +1,102 @@
+---
+source: joins.sqltest
+expression: |-
+  SELECT left_row.a, sum(left_row.a+left_row.b)
+        FROM grouped_expr_left AS left_row
+        RIGHT JOIN grouped_expr_right ON left_row.a=x
+       GROUP BY left_row.a
+       ORDER BY left_row.a;
+info:
+  statement_type: SELECT
+  tables:
+  - grouped_expr_left
+  - grouped_expr_right
+  - left_row.a
+  setup_blocks:
+  - right_join_grouped_expression_index_schema
+  database: ':memory:'
+---
+QUERY PLAN
+|--SCAN grouped_expr_left AS left_row USING INDEX grouped_expr_left_idx
+|--SCAN grouped_expr_right
+|--RIGHT-JOIN grouped_expr_right
+|  `--SCAN grouped_expr_right
+`--USE SORTER FOR GROUP BY
+
+BYTECODE
+addr  opcode                        p1  p2  p3  p4            p5  comment
+   0              Init               0  73   0                 0  Start at 73
+   1              Null               0   8   0                 0  r[8]=NULL
+   2              SorterOpen         0   2   0  k(1,B)         0  cursor=0
+   3              Integer            0   5   0                 0  r[5]=0; clear group by abort flag
+   4              Null               0   6   0                 0  r[6]=NULL; initialize group by comparison registers to NULL
+   5              Gosub             12  69   0                 0  ; go to clear accumulator subroutine
+   6              OpenRead           2   2   0  k(3,B,B)       0  table=grouped_expr_left, root=2, iDb=0
+   7              OpenRead           3   3   0  k(3,B,B)       0  index=grouped_expr_left_idx, root=3, iDb=0
+   8              OpenRead           5   4   0  k(3,B,B)       0  table=grouped_expr_right, root=4, iDb=0
+   9              Null               0  14   0                 0  r[14]=NULL
+  10              OpenEphemeral      4   0   0                 0  cursor=4 is_table=false
+  11              Rewind             3  33   0                 0  Rewind index grouped_expr_left_idx
+  12                DeferredSeek     3   2   0                 0
+  13                Rewind           5  31   0                 0  Rewind table grouped_expr_right
+  14                  Column         3   0  16                 0  r[16]=grouped_expr_left_idx.a
+  15                  Column         5   0  17                 0  r[17]=grouped_expr_right.x
+  16                  Ne            16  17  29  Binary         0  if r[16]!=r[17] goto 29
+  17                  RowId          5  13   0                 0  r[13]=grouped_expr_right.rowid
+  18                  Found          4  22  13                 0  if found goto 22
+  19                  MakeRecord    13   1  18                 0  r[18]=mkrec(r[13..13])
+  20                  IdxInsert      4  18  13                 0  key=r[18]
+  21                  FilterAdd      4  13   1                 0  bloom_filter_add(r[13..14])
+  22                  BeginSubrtn   14   0   0                 0  r[14]=NULL
+  23                  Column         3   0  10                 0  r[10]=grouped_expr_left_idx.a
+  24                  Column         3   0  19                 0  r[19]=grouped_expr_left_idx.a
+  25                  Column         2   1  20                 0  r[20]=grouped_expr_left.b
+  26                  Add           19  20  11                 0  r[11]=r[19]+r[20]
+  27                  MakeRecord    10   2   9                 0  r[9]=mkrec(r[10..11])
+  28                  SorterInsert   0   9   0  0              0  key=r[9]
+  29                Return          14   0   1                 0
+  30              Next               5  14   0                 1
+  31            Return              14   0   1                 0
+  32          Next                   3  12   0                 1
+  33          NullRow                2   0   0                 0  Set cursor 2 to a (pseudo) NULL row
+  34          NullRow                3   0   0                 0  Set cursor 3 to a (pseudo) NULL row
+  35          OpenRead               5   4   0  k(3,B,B)       0  table=grouped_expr_right, root=4, iDb=0
+  36          Rewind                 5  42   0                 0  Rewind table grouped_expr_right
+  37            RowId                5  13   0                 0  r[13]=grouped_expr_right.rowid
+  38            Filter               4  40  13                 1  if !bloom_filter(r[13..14]) goto 40
+  39            Found                4  41  13                 0  if found goto 41
+  40            Gosub               14  23   0                 0
+  41          Next                   5  37   0                 1
+  42          OpenPseudo             1   9   2                 0  2 columns in r[9]
+  43          SorterSort             0  58   0                 0
+  44            SorterData           0   9   1                 0  r[9]=data
+  45            Column               1   0  21                 0  r[21]=pseudo.column 0
+  46            Compare              6  21   1  k(1, Binary)   0  r[6..6]==r[21..21]
+  47            Jump                48  52  48                 0  ; start new group if comparison is not equal
+  48            Gosub                3  62   0                 0  ; check if ended group had data, and output if so
+  49            Move                21   6   1                 0  r[6..6]=r[21..21]
+  50            IfPos                5  72   0                 0  r[5]>0 -> r[5]-=0, goto 72; check abort flag
+  51            Gosub               12  69   0                 0  ; goto clear accumulator subroutine
+  52            Column               1   1  22                 0  r[22]=pseudo.column 1
+  53            AggStep              0  22   8  sum            0  accum=r[8] step(r[22])
+  54            If                   4  56   0                 0  if r[4] goto 56; don't emit group columns if continuing existing group
+  55            Column               1   0   7                 0  r[7]=pseudo.column 0
+  56            Integer              1   4   0                 0  r[4]=1; indicate data in accumulator
+  57          SorterNext             0  44   0                 0
+  58          Gosub                  3  62   0                 0  ; emit row for final group
+  59          Goto                   0  72   0                 0  ; group by finished
+  60          Integer                1   5   0                 0  r[5]=1
+  61        Return                   3   0   0                 0
+  62        IfPos                    4  64   0                 0  r[4]>0 -> r[4]-=0, goto 64; output group by row subroutine start
+  63      Return                     3   0   0                 0
+  64      AggFinal                   0   8   0  sum            0  accum=r[8]
+  65      Copy                       7   1   0                 0  r[1]=r[7]
+  66      Copy                       8   2   0                 0  r[2]=r[8]
+  67      ResultRow                  1   2   0                 0  output=r[1..2]
+  68    Return                       3   0   0                 0
+  69    Null                         0   7   8                 0  r[7..8]=NULL; clear accumulator subroutine start
+  70    Integer                      0   4   0                 0  r[4]=0
+  71  Return                        12   0   0                 0
+  72  Halt                           0   0   0                 0
+  73  Transaction                    0   1   3                 0  iDb=0 tx_mode=Read
+  74  Goto                           0   1   0                 0

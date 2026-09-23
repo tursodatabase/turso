@@ -1861,7 +1861,7 @@ matrix grouped-join-types-and-unmatched-rows {
      ORDER BY id, a.id, b.id, a.av, b.bv;
 }
 
-@var join_type { JOIN | LEFT JOIN | RIGHT JOIN }
+@var join_type { JOIN | LEFT JOIN | RIGHT JOIN | FULL JOIN }
 @var direct_id { 1 | 2 }
 matrix direct-star-with-a-later-using-join {
     SELECT same.*
@@ -1870,7 +1870,7 @@ matrix direct-star-with-a-later-using-join {
       USING(id);
 }
 
-@var join_type { JOIN | LEFT JOIN | RIGHT JOIN }
+@var join_type { JOIN | LEFT JOIN | RIGHT JOIN | FULL JOIN }
 @var direct_id { 1 | 2 }
 matrix grouped-star-with-a-later-using-join {
     SELECT same.*

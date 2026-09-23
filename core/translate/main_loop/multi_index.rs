@@ -63,10 +63,7 @@ fn emit_multi_index_or_residual_filters(
 
     if requires_table_cursor {
         if let Some(index_cursor_id) = index_cursor_id {
-            program.emit_insn(Insn::DeferredSeek {
-                index_cursor_id,
-                table_cursor_id,
-            });
+            program.emit_deferred_seek(index_cursor_id, table_cursor_id);
         }
     }
 

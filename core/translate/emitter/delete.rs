@@ -470,6 +470,7 @@ fn emit_delete_insns<'a>(
     let btree_table = unsafe { &*table_reference }.btree();
     let database_id = unsafe { (*table_reference).database_id };
     let main_table_cursor_id = program.resolve_cursor_id(&CursorKey::table(internal_id));
+    let iteration_index = unsafe { &*table_reference }.op.index();
     let has_returning = !result_columns.is_empty();
     let has_delete_triggers = if let Some(btree_table) = btree_table {
         has_triggers_including_temp(
@@ -485,6 +486,13 @@ fn emit_delete_insns<'a>(
 
     let cols_len = unsafe { &*table_reference }.columns().len();
     let (columns_start_reg, rowid_reg): (Option<usize>, usize) = {
+        // An index can supply all values without moving the table cursor.
+        // SQLite finishes the deferred move before it reads the row for deletion.
+        if iteration_index.is_some() {
+            program.emit_insn(Insn::FinishSeek {
+                cursor_id: main_table_cursor_id,
+            });
+        }
         // Get rowid for RETURNING
         let rowid_reg = program.alloc_register();
         program.emit_insn(Insn::RowId {
@@ -523,9 +531,6 @@ fn emit_delete_insns<'a>(
             (Some(columns_start_reg), rowid_reg)
         }
     };
-
-    // Get the index that is being used to iterate the deletion loop, if there is one.
-    let iteration_index = unsafe { &*table_reference }.op.index();
 
     // Capture iteration index key values BEFORE deleting the main table row,
     // since the main table cursor will be invalidated after deletion.

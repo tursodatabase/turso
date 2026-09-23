@@ -19,7 +19,7 @@ info:
 ---
 QUERY PLAN
 |--SCAN grouped_expr_left
-|--SEARCH grouped_expr_right USING INDEX grouped_expr_right_idx (a=?) LEFT-JOIN
+|--SEARCH grouped_expr_right USING COVERING INDEX grouped_expr_right_idx (a=?) LEFT-JOIN
 `--USE SORTER FOR GROUP BY
 
 BYTECODE
@@ -31,29 +31,29 @@ addr  opcode                    p1  p2  p3  p4            p5  comment
    4          Null               0   6   0                 0  r[6]=NULL; initialize group by comparison registers to NULL
    5          Gosub             12  57   0                 0  ; go to clear accumulator subroutine
    6          OpenRead           2   2   0  k(2,B)         0  table=grouped_expr_left, root=2, iDb=0
-   7          OpenRead           3   3   0  k(3,B,B)       0  table=grouped_expr_right, root=3, iDb=0
-   8          OpenRead           4   4   0  k(3,B,B)       0  index=grouped_expr_right_idx, root=4, iDb=0
-   9          Rewind             2  30   0                 0  Rewind table grouped_expr_left
-  10            Integer          0  13   0                 0  r[13]=0
-  11            Column           2   0  14                 0  r[14]=grouped_expr_left.x
-  12            IsNull          14  25   0                 0  if (r[14]==NULL) goto 25
-  13            Affinity        14   1   0                 0  r[14..15] = C
-  14            SeekGE           4  25  14                 0  key=[14..14]
-  15              IdxGT          4  25  14                 0  key=[14..14]
-  16              DeferredSeek   4   3   0                 0
-  17              Integer        1  13   0                 0  r[13]=1
-  18              Column         4   0  10                 0  r[10]=grouped_expr_right_idx.a
-  19              Column         3   1  11                 0  r[11]=grouped_expr_right.b
-  20              NotNull       11  22   0                 0  r[11]!=NULL -> goto 22
-  21              Integer        7  11   0                 0  r[11]=7
-  22              MakeRecord    10   2   9                 0  r[9]=mkrec(r[10..11])
-  23              SorterInsert   0   9   0  0              0  key=r[9]
-  24            Next             4  15   0                 0
-  25            IfPos           13  29   0                 0  r[13]>0 -> r[13]-=0, goto 29
-  26            NullRow          3   0   0                 0  Set cursor 3 to a (pseudo) NULL row
-  27            NullRow          4   0   0                 0  Set cursor 4 to a (pseudo) NULL row
-  28            Goto             0  17   0                 0
-  29          Next               2  10   0                 1
+   7          OpenRead           3   4   0  k(3,B,B)       0  index=grouped_expr_right_idx, root=4, iDb=0
+   8          Rewind             2  30   0                 0  Rewind table grouped_expr_left
+   9            Integer          0  13   0                 0  r[13]=0
+  10            Column           2   0  14                 0  r[14]=grouped_expr_left.x
+  11            IsNull          14  26   0                 0  if (r[14]==NULL) goto 26
+  12            Affinity        14   1   0                 0  r[14..15] = C
+  13            SeekGE           3  26  14                 0  key=[14..14]
+  14              IdxGT          3  26  14                 0  key=[14..14]
+  15              Integer        1  13   0                 0  r[13]=1
+  16              Column         3   0  10                 0  r[10]=grouped_expr_right_idx.a
+  17              IfNullRow      3  20  11                 0  if 3.nullRow then r[11]=NULL, goto 20
+  18              Column         3   1  11                 0  r[11]=grouped_expr_right_idx.coalesce (b, 7)
+  19              Goto           0  23   0                 0
+  20              Column         3   1  11                 0  r[11]=grouped_expr_right_idx.coalesce (b, 7)
+  21              NotNull       11  23   0                 0  r[11]!=NULL -> goto 23
+  22              Integer        7  11   0                 0  r[11]=7
+  23              MakeRecord    10   2   9                 0  r[9]=mkrec(r[10..11])
+  24              SorterInsert   0   9   0  0              0  key=r[9]
+  25            Next             3  14   0                 0
+  26            IfPos           13  29   0                 0  r[13]>0 -> r[13]-=0, goto 29
+  27            NullRow          3   0   0                 0  Set cursor 3 to a (pseudo) NULL row
+  28            Goto             0  15   0                 0
+  29          Next               2   9   0                 1
   30          OpenPseudo         1   9   2                 0  2 columns in r[9]
   31          SorterSort         0  46   0                 0
   32            SorterData       0   9   1                 0  r[9]=data

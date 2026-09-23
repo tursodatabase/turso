@@ -1,0 +1,71 @@
+---
+source: joins.sqltest
+expression: |-
+  SELECT later_view_right.id, later_view_value.value
+        FROM later_view_left
+        RIGHT JOIN later_view_right ON false
+        JOIN later_view_value ON true;
+info:
+  statement_type: SELECT
+  tables:
+  - later_view_left
+  - later_view_right
+  - later_view_value
+  setup_blocks:
+  - later_view_right_join_snapshot_schema
+  database: ':memory:'
+---
+QUERY PLAN
+|--SCAN later_view_left
+|--SCAN later_view_right
+|--SCAN later_view_value
+|  `--SCAN CONSTANT ROW
+`--RIGHT-JOIN later_view_right
+   `--SCAN later_view_right
+
+BYTECODE
+addr  opcode               p1  p2  p3  p4      p5  comment
+   0      Init              0  40   0           0  Start at 40
+   1      Once              7   0   0           0  goto 7
+   2      OpenEphemeral     0   1   0           0  cursor=0 is_table=true
+   3      Function          0   3   2  random   0  r[2]=func()
+   4      MakeRecord        2   1   4           0  r[4]=mkrec(r[2..2]); for
+   5      NewRowid          0   5   0           0  r[5]=rowid
+   6      Insert            0   4   5           4  intkey=r[5] data=r[4]
+   7      OpenRead          1   2   0  k(2,B)   0  table=later_view_left, root=2, iDb=0
+   8      OpenRead          3   3   0  k(2,B)   0  table=later_view_right, root=3, iDb=0
+   9      Null              0   9   0           0  r[9]=NULL
+  10      OpenEphemeral     2   0   0           0  cursor=2 is_table=false
+  11      Rewind            1  31   0           0  Rewind table later_view_left
+  12        Rewind          3  29   0           0  Rewind table later_view_right
+  13          IfNot        10  27   1           0  if !r[10] goto 27
+  14          RowId         3   8   0           0  r[8]=later_view_right.rowid
+  15          Found         2  19   8           0  if found goto 19
+  16          MakeRecord    8   1  11           0  r[11]=mkrec(r[8..8])
+  17          IdxInsert     2  11   8           0  key=r[11]
+  18          FilterAdd     2   8   1           0  bloom_filter_add(r[8..9])
+  19          BeginSubrtn   9   0   0           0  r[9]=NULL
+  20          Rewind        0  27   0           0  Rewind  ephemeral()
+  21            Column      0   0   1           0  r[1]=ephemeral().value
+  22            IfNot      12  26   1           0  if !r[12] goto 26
+  23            Column      3   0   6           0  r[6]=later_view_right.id
+  24            Copy        1   7   0           0  r[7]=r[1]
+  25            ResultRow   6   2   0           0  output=r[6..7]
+  26          Next          0  21   0           0
+  27        Return          9   0   1           0
+  28      Next              3  13   0           1
+  29    Return              9   0   1           0
+  30  Next                  1  12   0           1
+  31  NullRow               1   0   0           0  Set cursor 1 to a (pseudo) NULL row
+  32  OpenRead              3   3   0  k(2,B)   0  table=later_view_right, root=3, iDb=0
+  33  Rewind                3  39   0           0  Rewind table later_view_right
+  34    RowId               3   8   0           0  r[8]=later_view_right.rowid
+  35    Filter              2  37   8           1  if !bloom_filter(r[8..9]) goto 37
+  36    Found               2  38   8           0  if found goto 38
+  37    Gosub               9  20   0           0
+  38  Next                  3  34   0           1
+  39  Halt                  0   0   0           0
+  40  Transaction           0   1   3           0  iDb=0 tx_mode=Read
+  41  Integer               0  10   0           0  r[10]=0
+  42  Integer               1  12   0           0  r[12]=1
+  43  Goto                  0   1   0           0

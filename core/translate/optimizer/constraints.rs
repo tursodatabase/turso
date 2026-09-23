@@ -11,8 +11,8 @@ use crate::{
         },
         expression_index::normalize_expr_for_index_matching,
         plan::{
-            is_non_null_literal, JoinOrderMember, JoinedTable, NonFromClauseSubquery, Plan,
-            SubqueryState, TableReferences, WhereTerm,
+            is_non_null_literal, JoinOrderMember, JoinOrigin, JoinedTable, NonFromClauseSubquery,
+            Plan, SubqueryState, TableReferences, WhereTerm, WhereTermOrigin,
         },
         planner::{
             break_predicate_at_and_boundaries, rewrite_between_exprs, table_mask_from_expr,
@@ -78,6 +78,11 @@ pub struct Constraint {
     /// False for IN constraints (which use a separate multi-value seek path)
     /// and for collation mismatches.
     pub usable: bool,
+    /// Whether this term can constrain the table before an outer join adds NULL rows.
+    ///
+    /// For `a LEFT JOIN b ON true WHERE b.x IS NULL`, this is false.
+    /// The join must test `b.x IS NULL` after it creates the NULL row.
+    pub outer_join_compatible: bool,
     /// Whether this constraint references the implicit rowid (tables without an INTEGER PRIMARY KEY alias).
     /// When true and `table_col_pos` is None, this constraint targets the rowid pseudo-column.
     pub is_rowid: bool,
@@ -209,10 +214,8 @@ impl Constraint {
     }
 
     /// Whether this constraint can drive an index seek on its target column.
-    /// Composes the `usable`/`table_col_pos` gates with the affinity check
-    /// against the column at `table_col_pos` in `columns`.
     pub fn can_drive_index_seek(&self, columns: &[Column]) -> bool {
-        if !self.usable {
+        if !self.usable || !self.outer_join_compatible {
             return false;
         }
         let Some(pos) = self.table_col_pos else {
@@ -526,7 +529,7 @@ pub(super) fn add_implied_column_equalities(
 
     for term in where_clause
         .iter()
-        .filter(|term| term.from_outer_join.is_none())
+        .filter(|term| !term.origin.join_origin().is_some_and(JoinOrigin::is_outer))
     {
         let Some((left, operator, right)) = as_binary_components(&term.expr)? else {
             continue;
@@ -591,7 +594,7 @@ pub(super) fn add_implied_column_equalities(
                 ast::Operator::Equals,
                 Box::new(columns[member].expr.clone()),
             ),
-            from_outer_join: None,
+            origin: WhereTermOrigin::Where,
             // The inferred term can select an access path. The original
             // equalities still verify the result during execution.
             consumed: true,
@@ -712,6 +715,13 @@ pub fn constraints_from_where_clause(
                         // Skip IndexMethod-based indexes (FTS, vector, etc.) - they use
                         // pattern matching rather than btree index scans
                         .filter(|index| index.index_method.is_none())
+                        // A partial index can omit rows that a later RIGHT JOIN
+                        // or FULL JOIN must keep.
+                        .filter(|index| {
+                            index.where_clause.is_none()
+                                || !table_references
+                                    .is_left_of_right_or_full_join(table_reference.internal_id)
+                        })
                         .map(|index| ConstraintUseCandidate {
                             index: Some(index.clone()),
                             refs: Vec::new(),
@@ -730,13 +740,50 @@ pub fn constraints_from_where_clause(
         };
 
         for (i, term) in where_clause.iter().enumerate() {
-            // Constraints originating from a LEFT JOIN must always be evaluated in that join's RHS table's loop,
+            let join_origin = term.origin.join_origin();
+            // Constraints originating from an outer JOIN must always be evaluated in that join's RHS table's loop,
             // regardless of which tables the constraint references.
-            if let Some(outer_join_tbl) = term.from_outer_join {
+            if let Some(outer_join_tbl) = join_origin.and_then(JoinOrigin::outer_table) {
                 if outer_join_tbl != table_reference.internal_id {
                     continue;
                 }
             }
+
+            // A WHERE term must not constrain the loop of a table that an
+            // outer join can null-extend, with three exceptions below.
+            // Consuming the term into the access path filters that table's
+            // rows, which changes which rows of the other side count as
+            // unmatched. The join then emits NULL rows that never see the term.
+            //
+            // Exception 1: terms from that join's own ON clause define what
+            // counts as a match, so they are always fine.
+            // An ON term from a later join cannot constrain this table before
+            // an earlier outer join creates a NULL row for the table.
+            //
+            // Exception 2: on the right side of a plain LEFT JOIN, the
+            // engine re-checks consumed terms when it emits the NULL row.
+            // Any operator except `IS` stays usable there. Such terms are
+            // never true on a NULL row, so the re-check removes that row.
+            // `IS` can be true on a NULL row, so it is not safe there.
+            // A RIGHT JOIN or FULL JOIN reads unmatched right rows after
+            // the normal loops. This extra read can bypass a WHERE constraint.
+            //
+            // Exception 3: a table-function argument defines its source.
+            // It is not a post-join filter on that source.
+            let can_use_before_null_extension = |is_op: bool| {
+                term.origin.table_function_table() == Some(table_reference.internal_id)
+                    || join_origin
+                        .is_some_and(|origin| origin.right_table() == table_reference.internal_id)
+                    || if join_origin.is_some() || is_op {
+                        !table_references.outer_join_may_null_extend(table_reference.internal_id)
+                            && !table_references.right_or_full_join_blocks_where_constraint(
+                                table_reference.internal_id,
+                            )
+                    } else {
+                        !table_references
+                            .right_or_full_join_blocks_where_constraint(table_reference.internal_id)
+                    }
+            };
 
             // Try to extract as binary expression first
             if let Some((lhs, operator, rhs)) = as_binary_components(&term.expr)? {
@@ -757,33 +804,8 @@ pub fn constraints_from_where_clause(
                     .as_ast_operator()
                     .filter(|op| op.is_comparison())
                     .map(|_| comparison_affinity(lhs, rhs, Some(table_references), None));
-                // A WHERE term must not constrain the loop of a table that an
-                // outer join can null-extend, with two exceptions below.
-                // Consuming the term into the access path filters that table's
-                // rows, which changes which rows of the other side count as
-                // unmatched — and the join then emits null-extended rows the
-                // consumed term is never checked against.
-                //
-                // Exception 1: terms from that join's own ON clause define what
-                // counts as a match, so they are always fine.
-                //
-                // Exception 2: on the right side of a plain LEFT JOIN, the
-                // engine re-checks consumed terms when it emits the
-                // null-extended row, so any operator except `IS` stays usable
-                // there: such terms are never TRUE on a null-extended row, so
-                // the re-check removes the bogus rows. `IS` (e.g. `e.id IS
-                // NULL`) *is* TRUE on the null-extended row, so no re-check can
-                // repair it — it is unusable for every null-extendable table.
-                // A FULL JOIN synthesizes its extra rows by jumping past the
-                // scan with no re-check, so nothing is usable for any table a
-                // FULL JOIN can null-extend.
                 let is_op = matches!(operator.as_ast_operator(), Some(ast::Operator::Is));
-                let usable = term.from_outer_join == Some(table_reference.internal_id)
-                    || if is_op {
-                        !table_references.outer_join_may_null_extend(table_reference.internal_id)
-                    } else {
-                        !table_references.full_join_may_null_extend(table_reference.internal_id)
-                    };
+                let outer_join_compatible = can_use_before_null_extension(is_op);
                 // See [Constraint::null_matching]. The constraining value sits
                 // on the opposite side of the constrained column.
                 let null_matching = |constraining_expr: &ast::Expr| {
@@ -811,7 +833,8 @@ pub fn constraints_from_where_clause(
                                     params,
                                     false,
                                 ),
-                                usable,
+                                usable: true,
+                                outer_join_compatible,
                                 is_rowid: false,
                                 comparison_affinity: cmp_aff,
                                 null_matching: null_matching(rhs),
@@ -842,7 +865,8 @@ pub fn constraints_from_where_clause(
                                     params,
                                     true,
                                 ),
-                                usable,
+                                usable: true,
+                                outer_join_compatible,
                                 is_rowid: true,
                                 comparison_affinity: cmp_aff,
                                 null_matching: null_matching(rhs),
@@ -882,7 +906,8 @@ pub fn constraints_from_where_clause(
                             constraining_expr: None,
                             lhs_mask: table_mask_from_expr(rhs, table_references, subqueries)?,
                             selectivity,
-                            usable,
+                            usable: true,
+                            outer_join_compatible,
                             is_rowid: false,
                             comparison_affinity: cmp_aff,
                             null_matching: null_matching(rhs),
@@ -911,7 +936,8 @@ pub fn constraints_from_where_clause(
                                     params,
                                     false,
                                 ),
-                                usable,
+                                usable: true,
+                                outer_join_compatible,
                                 is_rowid: false,
                                 comparison_affinity: cmp_aff,
                                 null_matching: null_matching(lhs),
@@ -942,7 +968,8 @@ pub fn constraints_from_where_clause(
                                     params,
                                     true,
                                 ),
-                                usable,
+                                usable: true,
+                                outer_join_compatible,
                                 is_rowid: true,
                                 comparison_affinity: cmp_aff,
                                 null_matching: null_matching(lhs),
@@ -982,7 +1009,8 @@ pub fn constraints_from_where_clause(
                             constraining_expr: None,
                             lhs_mask: table_mask_from_expr(lhs, table_references, subqueries)?,
                             selectivity,
-                            usable,
+                            usable: true,
+                            outer_join_compatible,
                             is_rowid: false,
                             comparison_affinity: cmp_aff,
                             null_matching: null_matching(lhs),
@@ -1037,6 +1065,7 @@ pub fn constraints_from_where_clause(
                             lhs_mask: rhs_mask,
                             selectivity,
                             usable: false, // IN uses a separate seek path, not the range-seek model
+                            outer_join_compatible: can_use_before_null_extension(false),
                             is_rowid,
                             comparison_affinity: cmp_aff,
                             null_matching: false,
@@ -1055,6 +1084,7 @@ pub fn constraints_from_where_clause(
                             lhs_mask: rhs_mask,
                             selectivity,
                             usable: false,
+                            outer_join_compatible: can_use_before_null_extension(false),
                             is_rowid: true,
                             comparison_affinity: cmp_aff,
                             null_matching: false,
@@ -1134,6 +1164,7 @@ pub fn constraints_from_where_clause(
                                 lhs_mask: TableMask::default(), // non-correlated = no dependencies
                                 selectivity,
                                 usable: false, // IN uses a separate seek path (consider_in_list_seek)
+                                outer_join_compatible: can_use_before_null_extension(false),
                                 is_rowid,
                                 comparison_affinity: cmp_aff,
                                 null_matching: false,
@@ -1152,6 +1183,7 @@ pub fn constraints_from_where_clause(
                                 lhs_mask: TableMask::default(),
                                 selectivity,
                                 usable: false,
+                                outer_join_compatible: can_use_before_null_extension(false),
                                 is_rowid: true,
                                 comparison_affinity: cmp_aff,
                                 null_matching: false,
@@ -1173,7 +1205,7 @@ pub fn constraints_from_where_clause(
         // For each constraint we found, add a reference to it for each index that may be able to use it.
         for (i, constraint) in cs.constraints.iter_mut().enumerate() {
             // Skip constraints that don't participate in range-seek matching (IN, collation mismatches)
-            if !constraint.usable {
+            if !constraint.usable || !constraint.outer_join_compatible {
                 continue;
             }
 
@@ -1677,13 +1709,16 @@ pub(super) fn partial_index_predicate_terms(
         .expect("partial_index_predicate_terms requires a partial index");
     let can_use_query_term = |term: &WhereTerm| -> bool {
         let Some(join_info) = &table_reference.join_info else {
-            return term.from_outer_join.is_none();
+            return !term.origin.join_origin().is_some_and(JoinOrigin::is_outer);
         };
         if join_info.is_full_outer() {
             return false;
         }
         if join_info.is_outer() {
-            return term.from_outer_join == Some(table_reference.internal_id);
+            return term
+                .origin
+                .join_origin()
+                .is_some_and(|origin| origin == JoinOrigin::Outer(table_reference.internal_id));
         }
         true
     };
@@ -1971,6 +2006,11 @@ pub fn convert_to_vtab_constraint(
         .iter()
         .enumerate()
         .filter_map(|(i, constraint)| {
+            // SQLite does not show an outer-join-incompatible term to xBestIndex.
+            // The `usable` field in ConstraintInfo only reports input readiness.
+            if !constraint.outer_join_compatible {
+                return None;
+            }
             let table_col_pos = constraint.table_col_pos?;
             let other_side_refers_to_self = constraint.lhs_mask.get(table_idx);
             if other_side_refers_to_self {
@@ -2285,6 +2325,7 @@ pub(crate) fn analyze_binary_term_for_index(
         lhs_mask,
         selectivity,
         usable: true,
+        outer_join_compatible: true,
         is_rowid,
         comparison_affinity: Some(affinity),
         null_matching,
