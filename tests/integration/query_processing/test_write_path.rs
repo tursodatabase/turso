@@ -1900,7 +1900,7 @@ fn test_upsert_do_update_failure_preserves_indexes(tmp_db: TempDatabase) -> anyh
 }
 
 #[turso_macros::test]
-#[ignore = "known bug: the seek in restore_context clears skip_advance, so DELETE skips the next row"]
+#[ignore = "known bug #9293: the seek in restore_context clears skip_advance, so DELETE skips the next row"]
 fn test_delete_self_fk_set_null_deletes_every_row_on_one_page(
     tmp_db: TempDatabase,
 ) -> anyhow::Result<()> {
@@ -1920,7 +1920,7 @@ fn test_delete_self_fk_set_null_deletes_every_row_on_one_page(
 }
 
 #[turso_macros::test]
-#[ignore = "known bug: a delete of cell 0 leaves the cursor at cell -1, a write by the FK action empties its stack, and DELETE stops"]
+#[ignore = "known bug #9294: a delete of cell 0 leaves the cursor at cell -1, a write by the FK action empties its stack, and DELETE stops"]
 fn test_delete_self_fk_set_null_continues_after_first_cell_of_page(
     tmp_db: TempDatabase,
 ) -> anyhow::Result<()> {
@@ -1941,7 +1941,7 @@ fn test_delete_self_fk_set_null_continues_after_first_cell_of_page(
 }
 
 #[turso_macros::test]
-#[ignore = "known bug: restore_context seeks forward, so a backward index scan returns a leaf page twice"]
+#[ignore = "known bug #9295: restore_context seeks forward, so a backward index scan returns a leaf page twice"]
 fn test_backward_index_scan_does_not_repeat_rows_after_fk_cascade(
     tmp_db: TempDatabase,
 ) -> anyhow::Result<()> {
@@ -1984,7 +1984,7 @@ fn run_on_turso_and_sqlite(
 }
 
 #[turso_macros::test]
-#[ignore = "known bug: restore_context seeks forward, so a backward index scan returns a leaf page twice"]
+#[ignore = "known bug #9295: restore_context seeks forward, so a backward index scan returns a leaf page twice"]
 fn test_backward_index_scan_does_not_repeat_rows_after_insert_between_steps(
     tmp_db: TempDatabase,
 ) -> anyhow::Result<()> {
@@ -2008,7 +2008,7 @@ fn test_backward_index_scan_does_not_repeat_rows_after_insert_between_steps(
 }
 
 #[turso_macros::test]
-#[ignore = "known bug: after an auto-checkpoint, begin_read_tx clears the page cache and the cursors of the active statement"]
+#[ignore = "known bug #9296: after an auto-checkpoint, begin_read_tx clears the page cache and the cursors of the active statement"]
 fn test_forward_scan_returns_all_rows_after_auto_checkpoint_between_steps(
     tmp_db: TempDatabase,
 ) -> anyhow::Result<()> {
@@ -2030,7 +2030,7 @@ fn test_forward_scan_returns_all_rows_after_auto_checkpoint_between_steps(
 }
 
 #[turso_macros::test]
-#[ignore = "known bug: after an auto-checkpoint, begin_read_tx clears the cursors of the active statement, and prev() panics on the empty stack"]
+#[ignore = "known bug #9296: after an auto-checkpoint, begin_read_tx clears the cursors of the active statement, and prev() panics on the empty stack"]
 fn test_backward_scan_returns_all_rows_after_auto_checkpoint_between_steps(
     tmp_db: TempDatabase,
 ) -> anyhow::Result<()> {
