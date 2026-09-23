@@ -1,4 +1,7 @@
-use super::gencol::{compute_generated_columns, compute_virtual_columns, sets_custom_type_column};
+use super::gencol::{
+    compute_generated_columns, compute_virtual_columns, emit_row_from_cursor,
+    sets_custom_type_column,
+};
 use super::TranslateCtx;
 use crate::alloc::{TryClone, TursoIteratorExt};
 use crate::namespace::{NamespaceId, NamespaceRef};
@@ -1429,18 +1432,13 @@ fn emit_update_insns<'a>(
                 // read the OLD row as one register for each column, in declaration order.
                 let first_reg = program.alloc_registers(col_len);
                 let mut regs: Vec<usize> = (first_reg..first_reg + col_len).collect();
-                for (i, column) in columns.iter().enumerate() {
-                    emit_table_column(
-                        program,
-                        target_table_cursor_id,
-                        internal_id,
-                        table_references,
-                        column,
-                        i,
-                        regs[i],
-                        &t_ctx.resolver,
-                    )?;
-                }
+                emit_row_from_cursor(
+                    program,
+                    &btree_table,
+                    target_table_cursor_id,
+                    &regs,
+                    &t_ctx.resolver,
+                )?;
                 regs.push(beg);
                 Some(regs)
             } else {
