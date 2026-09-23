@@ -5895,3 +5895,39 @@ setup gencol_virtual_columns_upsert {
 snapshot gencol_upsert_computes_virtual_columns_once {
     INSERT INTO t(id, b) VALUES (1, 2) ON CONFLICT(id) DO UPDATE SET b = excluded.b + 1 RETURNING c, d;
 }
+
+test fk-gencol-parent-delete-key-reads-two-virtual-columns {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE p(a INTEGER, b INTEGER, c AS (a + 1), e AS (b + 100), k AS (c + e) UNIQUE);
+    CREATE TABLE ch(x REFERENCES p(k));
+    INSERT INTO p(a, b) VALUES (1, 2);
+    INSERT INTO ch VALUES (104);
+    DELETE FROM p;
+}
+expect error {
+    FOREIGN KEY constraint failed
+}
+
+test fk-gencol-parent-update-key-reads-two-virtual-columns {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE p(a INTEGER, b INTEGER, c AS (a + 1), e AS (b + 100), k AS (c + e) UNIQUE);
+    CREATE TABLE ch(x REFERENCES p(k));
+    INSERT INTO p(a, b) VALUES (1, 2);
+    INSERT INTO ch VALUES (104);
+    UPDATE p SET a = 5;
+}
+expect error {
+    FOREIGN KEY constraint failed
+}
+
+setup gencol_fk_parent_virtual_key {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE p(a INTEGER, b INTEGER, k AS (a + b) UNIQUE, z AS (a * 7));
+    CREATE TABLE c(x INTEGER REFERENCES p(k));
+}
+
+@skip-if mvcc "mvcc has different root pages"
+@setup gencol_fk_parent_virtual_key
+snapshot gencol_fk_parent_delete_computes_only_key_columns {
+    DELETE FROM p WHERE a = 1;
+}
