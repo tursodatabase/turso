@@ -23,7 +23,7 @@ pub async fn run(
     tables: usize,
     logger: &SqlLogger,
     thread: &ThreadId,
-) -> turso::Result<()> {
+) {
     let table = rng.random_range(0..tables);
     let id = rng.random_range(0..400);
     let result = match rng.random_range(0..5) {
@@ -55,9 +55,8 @@ pub async fn run(
             .map(|_| ()),
         _ => check(conn, table, rng.choose::<&str>(TOKENS), logger, thread).await,
     };
-    match result {
-        Ok(()) | Err(turso::Error::Busy(_) | turso::Error::BusySnapshot(_)) => Ok(()),
-        Err(e) => Err(e),
+    if let Err(turso::Error::Corrupt(e)) = result {
+        turso_macros::turso_assert_unreachable!("corrupt error in FTS workload", { "thread": thread, "table": table, "error": e });
     }
 }
 

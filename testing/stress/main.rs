@@ -742,7 +742,7 @@ async fn async_main(opts: Opts) -> Result<(), Box<dyn std::error::Error + Send +
                             &sql_logger,
                             &thread,
                         )
-                        .await?;
+                        .await;
                     } else {
                         let sql = generate_random_statement(&mut rng, &schema_for_task);
                         if let Err(turso::Error::Corrupt(e)) = conn.execute(&sql, ()).await {
@@ -770,7 +770,7 @@ async fn async_main(opts: Opts) -> Result<(), Box<dyn std::error::Error + Send +
                                     &sql_logger,
                                     &thread,
                                 )
-                                .await?;
+                                .await;
                             } else {
                                 let sp_sql = generate_random_statement(&mut rng, &schema_for_task);
                                 if let Err(turso::Error::Corrupt(e)) =
