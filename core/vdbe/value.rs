@@ -2886,6 +2886,19 @@ mod tests {
     }
 
     #[test]
+    fn first_nul_finds_each_position_across_word_boundaries() {
+        let len = 2 * std::mem::size_of::<usize>() + 3;
+        let mut bytes = vec![0x80; len];
+        assert_eq!(super::first_nul(&bytes), None);
+        for index in 0..len {
+            bytes[index] = 0;
+            assert_eq!(super::first_nul(&bytes), Some(index));
+            bytes[index] = 0x80;
+        }
+        assert_eq!(super::sqlite_text_prefix("é🙂\0tail"), "é🙂");
+    }
+
+    #[test]
     fn like_ascii_agrees_with_pattern_compare() {
         fn words(alphabet: &[u8], max_len: usize) -> Vec<Vec<u8>> {
             let mut all = vec![Vec::new()];
