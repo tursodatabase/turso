@@ -109,6 +109,29 @@ setup implied_or_plan_schema {
     CREATE TABLE b(y INTEGER);
 }
 
+setup nested_or_rows {
+    CREATE TABLE t1(a, b, c, d);
+    CREATE INDEX t1a ON t1(a);
+    CREATE INDEX t1b ON t1(b);
+    CREATE INDEX t1d ON t1(d);
+    INSERT INTO t1 VALUES
+        (1, 1, 3, 1),
+        (1, 2, 3, NULL),
+        (NULL, 2, 3, 4),
+        (2, 2, 1, 4),
+        (5, NULL, 3, 2),
+        (0, 0, 0, 0),
+        (NULL, NULL, NULL, NULL),
+        (1, NULL, 2, 4),
+        (3, 2, NULL, 3);
+
+    CREATE TABLE t2(a, b, c);
+    CREATE INDEX t2ab ON t2(a, b);
+    CREATE INDEX t2c ON t2(c);
+    INSERT INTO t2 VALUES
+        (1, 2, 0), (1, 3, 0), (1, 4, 0), (2, 2, 4), (NULL, 3, 4), (1, NULL, NULL);
+}
+
 # Basic: find entities connected to a specific node via 'knows' edges (bidirectional)
 @setup graph_schema
 test compound-or-basic {
@@ -643,4 +666,133 @@ snapshot-eqp compound-or-mixed-residual-eqp {
         OR
         (l.dst = 'n1' AND l.src = i.id AND ((i.type = 'entity' AND l.label = 'knows') OR l.id = 'e4'))
       );
+}
+
+# An OR term is converted to disjunctive normal form (an OR of ANDs) before it
+# is split into multi-index branches, so OR inside parentheses, OR inside AND,
+# and NOT over AND or OR can all give index branches.
+@setup nested_or_rows
+@skip-if sqlite "Turso summarizes multi-index branches on one plan row"
+test or-in-parentheses-uses-multi-index {
+    EXPLAIN QUERY PLAN
+    SELECT * FROM t1 WHERE (a = 1 OR b = 2) OR d = 3;
+}
+expect {
+    1|0|0|MULTI-INDEX OR t1 (t1a, t1b, t1d)
+}
+
+@setup nested_or_rows
+@skip-if sqlite "Turso summarizes multi-index branches on one plan row"
+test or-inside-and-uses-multi-index {
+    EXPLAIN QUERY PLAN
+    SELECT * FROM t1 WHERE ((a = 1 OR b = 2) AND c = 3) OR d = 4;
+}
+expect {
+    1|0|0|MULTI-INDEX OR t1 (t1a, t1b, t1d)
+}
+
+@setup nested_or_rows
+@skip-if sqlite "Turso summarizes multi-index branches on one plan row"
+test not-over-and-uses-multi-index {
+    EXPLAIN QUERY PLAN
+    SELECT * FROM t1 WHERE NOT (NOT a = 1 AND NOT b = 2);
+}
+expect {
+    1|0|0|MULTI-INDEX OR t1 (t1a, t1b)
+}
+
+@setup nested_or_rows
+@skip-if sqlite "Turso summarizes multi-index branches on one plan row"
+test double-not-over-or-uses-multi-index {
+    EXPLAIN QUERY PLAN
+    SELECT * FROM t1 WHERE NOT NOT (a = 1 OR b = 2);
+}
+expect {
+    1|0|0|MULTI-INDEX OR t1 (t1a, t1b)
+}
+
+@setup nested_or_rows
+@skip-if sqlite "Turso summarizes multi-index branches on one plan row"
+test not-between-inside-or-uses-multi-index {
+    EXPLAIN QUERY PLAN
+    SELECT * FROM t1 WHERE (a NOT BETWEEN 1 AND 2 AND c = 3) OR d = 4;
+}
+expect {
+    1|0|0|MULTI-INDEX OR t1 (t1a, t1a, t1d)
+}
+
+@setup nested_or_rows
+@skip-if sqlite "Turso summarizes multi-index branches on one plan row"
+test or-inside-and-seeks-each-value-in-compound-index {
+    EXPLAIN QUERY PLAN
+    SELECT * FROM t2 WHERE (a = 1 AND (b = 2 OR b = 3)) OR c = 4;
+}
+expect {
+    1|0|0|MULTI-INDEX OR t2 (t2ab, t2ab, t2c)
+}
+
+# Distributing a = 1 over (c = 2 OR c = 3) gives two branches that seek the
+# same index key, so the planner keeps the OR as a filter in one branch.
+@setup nested_or_rows
+@skip-if sqlite "Turso summarizes multi-index branches on one plan row"
+test or-that-no-index-can-use-stays-a-filter {
+    EXPLAIN QUERY PLAN
+    SELECT * FROM t1 WHERE (a = 1 AND (c = 2 OR c = 3)) OR d = 4;
+}
+expect {
+    1|0|0|MULTI-INDEX OR t1 (t1a, t1d)
+}
+
+@setup nested_or_rows
+@var filter {
+    (a = 1 OR b = 2) OR d = 3
+    | ((a = 1 OR b = 2) AND c = 3) OR d = 4
+    | NOT (NOT a = 1 AND NOT b = 2)
+    | NOT NOT (a = 1 OR b = 2)
+    | (a NOT BETWEEN 1 AND 2 AND c = 3) OR d = 4
+    | (a = 1 AND (c = 2 OR c = 3)) OR d = 4
+    | NOT (a IS NULL OR (b != 2 AND d != 4)) OR c = 0
+}
+matrix nested-or-keeps-results {
+    SELECT rowid FROM t1 WHERE $filter ORDER BY rowid;
+}
+
+@setup nested_or_rows
+test or-inside-and-keeps-compound-index-results {
+    SELECT rowid FROM t2 WHERE (a = 1 AND (b = 2 OR b = 3)) OR c = 4 ORDER BY rowid;
+}
+expect {
+    1
+    2
+    4
+    5
+}
+
+@setup nested_or_rows
+test or-inside-and-keeps-delete-results {
+    DELETE FROM t1 WHERE ((a = 1 OR b = 2) AND c = 3) OR d = 4;
+    SELECT rowid FROM t1 ORDER BY rowid;
+}
+expect {
+    5
+    6
+    7
+    9
+}
+
+@setup nested_or_rows
+test not-over-and-keeps-update-results {
+    UPDATE t1 SET c = 9 WHERE NOT (NOT a = 1 AND NOT b = 2);
+    SELECT rowid, c FROM t1 ORDER BY rowid;
+}
+expect {
+    1|9
+    2|9
+    3|9
+    4|9
+    5|3
+    6|0
+    7|
+    8|9
+    9|9
 }

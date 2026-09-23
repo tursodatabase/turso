@@ -24,6 +24,9 @@ use crate::translate::optimizer::cost::{
     where_expr_steps, AnalyzeCtx, Cost, IndexInfo, RowCountEstimate,
 };
 use crate::translate::optimizer::cost_params::CostModelParams;
+use crate::translate::optimizer::disjunctive_normal_form::{
+    disjunctive_normal_form, disjunctive_normal_form_without_distribution,
+};
 use crate::translate::optimizer::AvailableIndexes;
 use crate::translate::plan::{
     BitSet, InSeekSource, JoinedTable, NonFromClauseSubquery, SetOperation, TableReferences,
@@ -99,34 +102,6 @@ enum MultiIdxBranchAccess {
         source: InSeekSource,
         constraint_idx: usize,
     },
-}
-
-/// Flattens nested OR expressions into a list of disjuncts.
-///
-/// For example, `(a OR b) OR c` becomes `[a, b, c]`.
-fn flatten_or_expr(expr: &ast::Expr) -> Vec<&ast::Expr> {
-    match expr {
-        ast::Expr::Binary(lhs, ast::Operator::Or, rhs) => {
-            let mut result = flatten_or_expr(lhs);
-            result.extend(flatten_or_expr(rhs));
-            result
-        }
-        _ => vec![expr],
-    }
-}
-
-/// Flattens nested AND expressions into a list of conjuncts.
-///
-/// For example, `(a AND b) AND c` becomes `[a, b, c]`.
-fn flatten_and_expr(expr: &ast::Expr) -> Vec<&ast::Expr> {
-    match expr {
-        ast::Expr::Binary(lhs, ast::Operator::And, rhs) => {
-            let mut result = flatten_and_expr(lhs);
-            result.extend(flatten_and_expr(rhs));
-            result
-        }
-        _ => vec![expr],
-    }
 }
 
 /// Build temporary `WhereTerm`s from branch-local expressions and extract the
@@ -984,14 +959,16 @@ pub fn consider_multi_index_union(
             continue;
         }
 
-        let ast::Expr::Binary(_, ast::Operator::Or, _) = &term.expr else {
-            continue;
-        };
-
-        let disjuncts = flatten_or_expr(&term.expr);
-        if disjuncts.len() < 2 {
+        let with_distribution = disjunctive_normal_form(&term.expr);
+        if with_distribution.len() < 2 {
             continue;
         }
+        let without_distribution = disjunctive_normal_form_without_distribution(&term.expr);
+        let candidates = if with_distribution.len() > without_distribution.len() {
+            vec![without_distribution, with_distribution]
+        } else {
+            vec![with_distribution]
+        };
 
         let mut allowed_mask = lhs_mask.try_clone()?;
         let Some(rhs_idx) = table_references
@@ -1003,97 +980,104 @@ pub fn consider_multi_index_union(
         };
         allowed_mask.set(rhs_idx)?;
 
-        // Each disjunct is replanned with branch-local `TableConstraints`, so
-        // compound conjuncts can reuse the same compound-seek analysis as
-        // ordinary btree access.
-        let branches = disjuncts
-            .into_iter()
-            .map(|disjunct_expr| {
-                let Ok(disjunct_expr) = crate::translate::expr::unwrap_parens(disjunct_expr) else {
-                    return Ok(None);
-                };
-                let conjuncts = flatten_and_expr(disjunct_expr)
-                    .into_iter()
-                    .cloned()
-                    .collect::<Vec<_>>();
-                let Some((synthetic_where_terms, table_constraints)) =
-                    get_table_local_constraints_for_branch(
-                        &conjuncts,
-                        term.from_outer_join,
+        let mut best_union: Option<AccessMethod> = None;
+        for disjuncts in candidates {
+            if disjuncts.len() < 2 {
+                continue;
+            }
+            // Each disjunct is replanned with branch-local `TableConstraints`, so
+            // compound conjuncts can reuse the same compound-seek analysis as
+            // ordinary btree access.
+            let branches = disjuncts
+                .into_iter()
+                .map(|disjunct| {
+                    let conjuncts = disjunct
+                        .into_iter()
+                        .map(|literal| literal.to_expr())
+                        .collect::<Vec<_>>();
+                    let Some((synthetic_where_terms, table_constraints)) =
+                        get_table_local_constraints_for_branch(
+                            &conjuncts,
+                            term.from_outer_join,
+                            rhs_table,
+                            table_references,
+                            available_indexes,
+                            subqueries,
+                            schema,
+                            params,
+                        )
+                        .ok()
+                    else {
+                        return Ok(None);
+                    };
+                    let Some(mut chosen) = choose_multi_index_branch_access(
                         rhs_table,
-                        table_references,
-                        available_indexes,
-                        subqueries,
+                        &table_constraints,
+                        &synthetic_where_terms,
+                        lhs_mask,
+                        rhs_idx,
                         schema,
+                        available_indexes,
+                        table_references,
+                        base_row_count,
+                        analyze_stats,
                         params,
-                    )
-                    .ok()
-                else {
-                    return Ok(None);
-                };
-                let Some(mut chosen) = choose_multi_index_branch_access(
-                    rhs_table,
-                    &table_constraints,
-                    &synthetic_where_terms,
-                    lhs_mask,
-                    rhs_idx,
-                    schema,
-                    available_indexes,
-                    table_references,
-                    base_row_count,
-                    analyze_stats,
-                    params,
-                )?
-                else {
-                    return Ok(None);
-                };
-                // Partition residuals in a single pass: pre-filters reference
-                // only outer (lhs) tables and can short-circuit the branch
-                // before the index seek; post-filters reference the target
-                // table and are evaluated after the seek.
-                let Some(partitioned_pre_post) = partition_residual_multi_or_exprs(
-                    &synthetic_where_terms,
-                    &chosen.access,
-                    chosen.index.as_deref(),
-                    rhs_table,
-                    lhs_mask,
-                    table_references,
-                    subqueries,
-                )?
-                else {
-                    return Ok(None);
-                };
-                if !allowed_mask.contains_all_set_bits_of(&partitioned_pre_post.post_mask) {
-                    return Ok(None);
-                }
-                chosen.union_prepost_filters = Some(UnionBranchPrePostFilters {
-                    requires_table_cursor: partitioned_pre_post.post_mask.get(rhs_idx),
-                    pre_filter_exprs: partitioned_pre_post.pre_filter_exprs,
-                    post_filter_exprs: partitioned_pre_post.post_filter_exprs,
-                });
-                Ok(Some(chosen))
-            })
-            .collect::<Result<_>>()?;
+                    )?
+                    else {
+                        return Ok(None);
+                    };
+                    // Partition residuals in a single pass: pre-filters reference
+                    // only outer (lhs) tables and can short-circuit the branch
+                    // before the index seek; post-filters reference the target
+                    // table and are evaluated after the seek.
+                    let Some(partitioned_pre_post) = partition_residual_multi_or_exprs(
+                        &synthetic_where_terms,
+                        &chosen.access,
+                        chosen.index.as_deref(),
+                        rhs_table,
+                        lhs_mask,
+                        table_references,
+                        subqueries,
+                    )?
+                    else {
+                        return Ok(None);
+                    };
+                    if !allowed_mask.contains_all_set_bits_of(&partitioned_pre_post.post_mask) {
+                        return Ok(None);
+                    }
+                    chosen.union_prepost_filters = Some(UnionBranchPrePostFilters {
+                        requires_table_cursor: partitioned_pre_post.post_mask.get(rhs_idx),
+                        pre_filter_exprs: partitioned_pre_post.pre_filter_exprs,
+                        post_filter_exprs: partitioned_pre_post.post_filter_exprs,
+                    });
+                    Ok(Some(chosen))
+                })
+                .collect::<Result<_>>()?;
 
-        let Some(branches) = branches else {
-            continue;
-        };
+            let Some(branches) = branches else {
+                continue;
+            };
 
-        if let Some(access_method) = evaluate_multi_index_branches(
-            branches,
-            SetOperation::Union,
-            where_term_idx,
-            rhs_table,
-            table_references,
-            available_indexes,
-            subqueries,
-            schema,
-            base_row_count,
-            input_cardinality,
-            params,
-            best_cost,
-        )? {
-            return Ok(Some(access_method));
+            let cost_to_beat = best_union.as_ref().map_or(best_cost, |union| union.cost);
+            if let Some(union) = evaluate_multi_index_branches(
+                branches,
+                SetOperation::Union,
+                where_term_idx,
+                rhs_table,
+                table_references,
+                available_indexes,
+                subqueries,
+                schema,
+                base_row_count,
+                input_cardinality,
+                params,
+                cost_to_beat,
+            )? {
+                best_union = Some(union);
+            }
+        }
+        if best_union.is_some() {
+            return Ok(best_union);
         }
     }
 
