@@ -439,6 +439,25 @@ fn test_vector_sparse_ivf_mvcc_sql(tmp_db: TempDatabase) {
     );
 }
 
+#[turso_macros::test]
+fn vector_argument_dependencies_own_row(tmp_db: TempDatabase) {
+    let conn = tmp_db.connect_limbo();
+    for sql in [
+        "CREATE TABLE vectors(id INTEGER PRIMARY KEY, embedding, query)",
+        "CREATE INDEX vx ON vectors USING toy_vector_sparse_ivf(embedding)",
+        "INSERT INTO vectors VALUES
+         (1, vector32_sparse('[1,0,0]'), vector32_sparse('[0,1,0]')),
+         (2, vector32_sparse('[0,1,0]'), vector32_sparse('[0,1,0]')),
+         (3, vector32_sparse('[1,1,0]'), vector32_sparse('[1,0,0]'))",
+    ] {
+        conn.execute(sql).unwrap();
+    }
+    let query = "SELECT id FROM vectors ORDER BY vector_distance_jaccard(embedding, query) LIMIT 2";
+    assert_eq!(limbo_exec_rows(&conn, query), vec![row![2], row![3]]);
+    let plan = limbo_exec_rows(&conn, &format!("EXPLAIN QUERY PLAN {query}"));
+    assert_that!(plan).has_no_step_containing("INDEX METHOD");
+}
+
 // This differential harness disables automatic WAL actions on both databases.
 #[turso_macros::test]
 fn test_vector_sparse_ivf_fuzz(tmp_db: TempDatabase) {
@@ -3319,6 +3338,93 @@ fn test_fts_column_order_agnostic(tmp_db: TempDatabase) {
     assert_that!(rows_score_reversed)
         .named("fts_score rows for the reversed column order")
         .has_length(2);
+}
+
+#[cfg(all(feature = "fts", not(target_family = "wasm")))]
+#[turso_macros::test]
+fn fts_argument_dependencies_own_row(tmp_db: TempDatabase) {
+    let conn = fts_argument_dependencies_fixture(&tmp_db);
+    let direct = limbo_exec_rows(&conn, "SELECT id FROM d WHERE fts_match(body, body)");
+    let nested = limbo_exec_rows(
+        &conn,
+        "SELECT id FROM d WHERE fts_match(body, coalesce(body, 'database'))",
+    );
+    assert_eq!(
+        direct,
+        vec![row![1], row![2], row![3]],
+        "coalesce result: {nested:?}"
+    );
+    assert_eq!(nested, vec![row![1], row![2], row![3]]);
+    for argument in ["body", "coalesce(body, 'database')"] {
+        let plan = limbo_exec_rows(
+            &conn,
+            &format!("EXPLAIN QUERY PLAN SELECT id FROM d WHERE fts_match(body, {argument})"),
+        );
+        assert_that!(plan).has_no_step_containing("INDEX METHOD");
+    }
+}
+
+#[cfg(all(feature = "fts", not(target_family = "wasm")))]
+#[turso_macros::test]
+fn fts_argument_dependencies_later_table(tmp_db: TempDatabase) {
+    let conn = fts_argument_dependencies_fixture(&tmp_db);
+    let query = "SELECT q.rowid, d.id FROM d CROSS JOIN q
+                 WHERE fts_match(d.body, q.term) ORDER BY q.rowid, d.id";
+    assert_eq!(
+        limbo_exec_rows(&conn, query),
+        vec![
+            row![1, 1],
+            row![1, 3],
+            row![3, 2],
+            row![3, 3],
+            row![4, 1],
+            row![4, 3]
+        ]
+    );
+    let plan = limbo_exec_rows(&conn, &format!("EXPLAIN QUERY PLAN {query}"));
+    assert_that!(plan).has_no_step_containing("INDEX METHOD");
+}
+
+#[cfg(all(feature = "fts", not(target_family = "wasm")))]
+#[turso_macros::test]
+fn fts_argument_dependencies_outer_rows(tmp_db: TempDatabase) {
+    let conn = fts_argument_dependencies_fixture(&tmp_db);
+    for from in ["q CROSS JOIN d", "d JOIN q"] {
+        let query = format!(
+            "SELECT q.rowid, d.id FROM {from}
+                             WHERE fts_match(d.body, coalesce(q.term, 'missing'))
+                             ORDER BY q.rowid, d.id"
+        );
+        assert_eq!(
+            limbo_exec_rows(&conn, &query),
+            vec![
+                row![1, 1],
+                row![1, 3],
+                row![3, 2],
+                row![3, 3],
+                row![4, 1],
+                row![4, 3]
+            ],
+            "{from}"
+        );
+        let plan = limbo_exec_rows(&conn, &format!("EXPLAIN QUERY PLAN {query}"));
+        assert_that!(plan).has_table_access_order(["q", "fts"]);
+    }
+}
+
+#[cfg(all(feature = "fts", not(target_family = "wasm")))]
+fn fts_argument_dependencies_fixture(tmp_db: &TempDatabase) -> Arc<turso_core::Connection> {
+    let conn = tmp_db.connect_limbo();
+    for sql in [
+        "CREATE TABLE d(id INTEGER PRIMARY KEY, body)",
+        "CREATE INDEX fx ON d USING fts(body)",
+        "INSERT INTO d VALUES(1, 'database'), (2, 'sql'), (3, 'database sql')",
+        "CREATE TABLE q(term)",
+        "INSERT INTO q VALUES('database'), ('missing'), ('sql'), ('database')",
+    ] {
+        conn.execute(sql).unwrap();
+    }
+    conn
 }
 
 /// Test that FTS works with JOINS
