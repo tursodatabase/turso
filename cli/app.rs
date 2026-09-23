@@ -27,8 +27,8 @@ use std::{
     mem::{forget, ManuallyDrop},
     path::PathBuf,
     sync::{
-        atomic::{AtomicBool, AtomicUsize, Ordering},
-        Arc,
+        atomic::{AtomicUsize, Ordering},
+        Arc, Mutex,
     },
     time::{Duration, Instant},
 };
@@ -140,8 +140,7 @@ pub struct Limbo {
     io: Arc<dyn turso_core::IO>,
     writer: Option<Box<dyn Write>>,
     conn: Arc<turso_core::Connection>,
-    /// True while input is being executed, as opposed to waiting at the prompt.
-    executing: Arc<AtomicBool>,
+    ctrl_c: Arc<Mutex<CtrlC>>,
     pub interrupt_count: Arc<AtomicUsize>,
     input_buff: ManuallyDrop<String>,
     pub(crate) opts: Settings,
@@ -163,6 +162,17 @@ struct ParameterBinding {
 struct QueryStatistics {
     io_time_elapsed_samples: Vec<Duration>,
     execute_time_elapsed_samples: Vec<Duration>,
+}
+
+/// What Ctrl-C does, which depends on what the shell is doing when it arrives.
+enum CtrlC {
+    CountAtPrompt,
+    /// A statement stopped part-way can leave the connection's in-memory state inconsistent,
+    /// so exit like the default SIGINT and let the next open recover the database.
+    Exit,
+    /// A read-only statement in autocommit mode only holds its own read transaction, so
+    /// stopping it cannot leave written state behind.
+    Interrupt(Arc<turso_core::Connection>),
 }
 
 /// A lending iterator over query result rows with optional statistics tracking.
@@ -298,19 +308,19 @@ impl Limbo {
             conn._free_extension_ctx(ext_api);
         }
         let interrupt_count = Arc::new(AtomicUsize::new(0));
-        let executing = Arc::new(AtomicBool::new(false));
+        let ctrl_c = Arc::new(Mutex::new(CtrlC::CountAtPrompt));
         {
             let interrupt_count: Arc<AtomicUsize> = Arc::clone(&interrupt_count);
-            let executing = Arc::clone(&executing);
-            ctrlc::set_handler(move || {
-                // A statement stopped part-way can leave the connection's in-memory state
-                // inconsistent, so exit like the default SIGINT and let the next open recover.
-                if executing.load(Ordering::SeqCst) {
+            let ctrl_c = Arc::clone(&ctrl_c);
+            ctrlc::set_handler(move || match &*ctrl_c.lock().unwrap() {
+                CtrlC::CountAtPrompt => {
+                    interrupt_count.fetch_add(1, Ordering::Release);
+                }
+                CtrlC::Interrupt(conn) => conn.interrupt(),
+                CtrlC::Exit => {
                     eprintln!("Interrupted; exiting because an interrupted statement can leave the connection inconsistent");
                     std::process::exit(130);
                 }
-                // Increment the interrupt count on Ctrl-C
-                interrupt_count.fetch_add(1, Ordering::Release);
             })
             .expect("Error setting Ctrl-C handler");
         }
@@ -323,7 +333,7 @@ impl Limbo {
             io,
             writer: Some(get_writer(&opts.output)),
             conn,
-            executing,
+            ctrl_c,
             interrupt_count,
             input_buff: ManuallyDrop::new(sql.unwrap_or_default()),
             read_state: ReadState::default(),
@@ -596,11 +606,17 @@ impl Limbo {
                     output = Err(err);
                 }
             }
-            if self
-                .print_query_result(input, &mut output, stats.as_mut())
-                .is_err()
-                || self.had_query_error != had_error_before
-            {
+            if let Ok(Some(ref stmt)) = output {
+                if stmt.get_program().is_readonly()
+                    && conn.get_auto_commit()
+                    && !conn.is_in_write_tx()
+                {
+                    self.set_ctrl_c(CtrlC::Interrupt(conn.clone()));
+                }
+            }
+            let result = self.print_query_result(input, &mut output, stats.as_mut());
+            self.set_ctrl_c(CtrlC::Exit);
+            if result.is_err() || self.had_query_error != had_error_before {
                 self.had_query_error = true;
                 break;
             }
@@ -782,7 +798,7 @@ impl Limbo {
         let is_dot_command = value.starts_with('.');
         let is_complete = self.read_state.is_complete();
 
-        self.executing.store(true, Ordering::SeqCst);
+        self.set_ctrl_c(CtrlC::Exit);
         match (is_dot_command, is_complete) {
             (true, _) => {
                 let (owned_value, old_address) = take_usable_part(self);
@@ -806,7 +822,11 @@ impl Limbo {
                 self.set_multiline_prompt();
             }
         }
-        self.executing.store(false, Ordering::SeqCst);
+        self.set_ctrl_c(CtrlC::CountAtPrompt);
+    }
+
+    fn set_ctrl_c(&self, action: CtrlC) {
+        *self.ctrl_c.lock().unwrap() = action;
     }
 
     pub fn handle_dot_command(&mut self, line: &str) {
