@@ -476,6 +476,31 @@ unsure.
 
 The other workloads changed by less than 0.5%.
 
+## H21. B-tree rows pay two avoidable lookups each — `fixed`
+
+**Where:** `scan_128_btree` reads every row from the B-tree and made three
+skip-map lookups per row. `MvccLazyCursor::is_btree_allocated` looked up the
+table binding on every advance. `MvStore::query_btree_version_is_valid`
+looked up the transaction before looking for a version-store chain that
+could shadow the row, although it needs the transaction only when a chain
+exists. After a checkpoint, most rows have no chain.
+
+**Fix:** The cursor remembers that its B-tree is readable once the binding
+check passes. The cursor already relies on that: it resolves the physical
+root only once, and the merge with the version store cannot continue if the
+B-tree stops being readable during a scan. The shadow check looks up the
+transaction only after it finds a chain.
+
+**Callgrind, 200/2,200 iterations:**
+
+| Scenario | Before | After | Change |
+|---|---:|---:|---:|
+| `scan_128_btree` | 256,928 | 207,059 | -19.4% |
+| `point_read_btree` | 16,134 | 15,842 | -1.8% |
+| `index_read_btree` | 33,244 | 32,570 | -2.0% |
+
+The version-store workloads changed by less than 0.1%.
+
 ## Final measured totals
 
 The branch was rebased after `origin/main` gained unrelated planner work and an
