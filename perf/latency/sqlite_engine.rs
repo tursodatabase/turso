@@ -1,8 +1,8 @@
 use crate::{wait_until, Checkpoint, Config, Pacer, Run, Sample};
-use rusqlite::Connection;
+use rusqlite::{Connection, ErrorCode};
 use std::{
     sync::{
-        atomic::{AtomicBool, AtomicI64, Ordering},
+        atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering},
         Arc, Barrier,
     },
     thread,
@@ -16,6 +16,7 @@ pub fn run(config: &Config) -> Run {
 
     let ready = Arc::new(Barrier::new(config.connections + 1));
     let pacer = Arc::new(Pacer::new(config));
+    let restarts = Arc::new(AtomicU64::new(0));
     let mut handles = Vec::new();
 
     let stop = Arc::new(AtomicBool::new(false));
@@ -29,6 +30,7 @@ pub fn run(config: &Config) -> Run {
     for _ in 0..config.connections {
         let ready = Arc::clone(&ready);
         let pacer = Arc::clone(&pacer);
+        let restarts = Arc::clone(&restarts);
         let db_path = config.db_path.clone();
         let batch_size = config.batch_size;
         let timeout = config.timeout;
@@ -60,7 +62,19 @@ pub fn run(config: &Config) -> Run {
                 wait_until(arrival.scheduled);
                 let t0 = Instant::now();
 
-                begin_stmt.execute([]).unwrap();
+                let mut attempts = 0u32;
+                loop {
+                    attempts += 1;
+                    match begin_stmt.execute([]) {
+                        Ok(_) => break,
+                        Err(rusqlite::Error::SqliteFailure(e, _))
+                            if e.code == ErrorCode::DatabaseBusy =>
+                        {
+                            restarts.fetch_add(1, Ordering::Relaxed);
+                        }
+                        Err(e) => panic!("BEGIN IMMEDIATE failed: {e}"),
+                    }
+                }
                 let t1 = Instant::now();
 
                 for _ in 0..batch_size {
@@ -75,7 +89,7 @@ pub fn run(config: &Config) -> Run {
                 samples.push(Sample {
                     scheduled_ns: arrival.offset.as_nanos() as u64,
                     warmup: arrival.warmup,
-                    restarts: 0,
+                    restarts: attempts - 1,
                     queue_ns: t0.saturating_duration_since(arrival.scheduled).as_nanos() as u64,
                     begin_ns: (t1 - t0).as_nanos() as u64,
                     work_ns: (t2 - t1).as_nanos() as u64,
@@ -109,6 +123,11 @@ pub fn run(config: &Config) -> Run {
             took,
         })
         .collect();
+
+    eprintln!(
+        "[sqlite] {} transaction restarts",
+        restarts.load(Ordering::Relaxed)
+    );
 
     Run {
         per_thread,
