@@ -1337,7 +1337,6 @@ pub fn try_hash_join_access_method(
     hash_can_replace_build_index: bool,
     subqueries: &[NonFromClauseSubquery],
     params: &CostModelParams,
-    using_results_are_explicit: bool,
 ) -> Result<Option<AccessMethod>> {
     if probe_table
         .join_info
@@ -1405,17 +1404,15 @@ pub fn try_hash_join_access_method(
         return Ok(None);
     }
 
-    // A generated FULL JOIN computes its merged USING values in result columns.
-    // Other USING joins still need the normal output rules.
+    // USING joins need their merged output column, which the hash join does not produce.
     if build_table
         .join_info
         .as_ref()
         .is_some_and(|ji| !ji.using.is_empty())
-        || ((!using_results_are_explicit || !is_full_outer)
-            && probe_table
-                .join_info
-                .as_ref()
-                .is_some_and(|ji| !ji.using.is_empty()))
+        || probe_table
+            .join_info
+            .as_ref()
+            .is_some_and(|ji| !ji.using.is_empty())
     {
         return Ok(None);
     }

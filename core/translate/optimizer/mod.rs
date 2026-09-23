@@ -685,14 +685,14 @@ fn optimize_recursive_cte_query_with_cache(
     cache: &mut SubqueryPlanCache,
 ) -> Result<()> {
     match query {
-        Plan::Select(select) => optimize_select_plan_with_cache(select, resolver, cache, false),
+        Plan::Select(select) => optimize_select_plan_with_cache(select, resolver, cache),
         Plan::CompoundSelect {
             left, right_most, ..
         } => {
             for (select, _) in left {
-                optimize_select_plan_with_cache(select, resolver, cache, false)?;
+                optimize_select_plan_with_cache(select, resolver, cache)?;
             }
-            optimize_select_plan_with_cache(right_most, resolver, cache, false)
+            optimize_select_plan_with_cache(right_most, resolver, cache)
         }
         Plan::RecursiveCte(_) | Plan::Delete(_) | Plan::Update(_) => Err(
             LimboError::InternalError("recursive CTE query is not a SELECT".to_string()),
@@ -902,7 +902,7 @@ struct SubqueryPlanCache {
 #[turso_macros::trace_stack]
 pub fn optimize_select_plan(plan: &mut SelectPlan, resolver: &Resolver) -> Result<()> {
     let mut cache = SubqueryPlanCache::default();
-    optimize_select_plan_with_cache(plan, resolver, &mut cache, false)
+    optimize_select_plan_with_cache(plan, resolver, &mut cache)
 }
 
 /// Whether the unnested form can be emitted.
@@ -923,19 +923,18 @@ fn optimize_select_plan_with_cache(
     plan: &mut SelectPlan,
     resolver: &Resolver,
     cache: &mut SubqueryPlanCache,
-    using_results_are_explicit: bool,
 ) -> Result<()> {
     if !plan
         .non_from_clause_subqueries
         .iter()
         .any(|subquery| subquery.correlated)
     {
-        return optimize_select_plan_form(plan, resolver, cache, using_results_are_explicit);
+        return optimize_select_plan_form(plan, resolver, cache);
     }
 
     #[cfg(feature = "simulator")]
     if resolver.subquery_unnesting_mode() == crate::SubqueryUnnestingMode::Disabled {
-        return optimize_select_plan_form(plan, resolver, cache, using_results_are_explicit);
+        return optimize_select_plan_form(plan, resolver, cache);
     }
 
     // TODO: Let join search run a correlated subquery as soon as all columns
@@ -943,49 +942,30 @@ fn optimize_select_plan_with_cache(
     // join tables in one search. Until then, both forms need their own search.
     let mut rewritten = plan.clone();
     if !unnest::rewrite_correlated_subqueries(&mut rewritten, resolver)? {
-        return optimize_select_plan_form(plan, resolver, cache, using_results_are_explicit);
+        return optimize_select_plan_form(plan, resolver, cache);
     }
 
     #[cfg(feature = "simulator")]
     if resolver.subquery_unnesting_mode() == crate::SubqueryUnnestingMode::Forced {
-        let rewritten_table_plan = find_select_plan_form(
-            &mut rewritten,
-            resolver,
-            cache,
-            false,
-            None,
-            using_results_are_explicit,
-        )?;
+        let rewritten_table_plan =
+            find_select_plan_form(&mut rewritten, resolver, cache, false, None)?;
         if !rewritten_form_is_emittable(&rewritten) {
-            return optimize_select_plan_form(plan, resolver, cache, using_results_are_explicit);
+            return optimize_select_plan_form(plan, resolver, cache);
         }
         *plan = rewritten;
         apply_select_table_plan(plan, rewritten_table_plan, resolver)?;
         return Ok(());
     }
 
-    let original_table_plan = find_select_plan_form(
-        plan,
-        resolver,
-        cache,
-        true,
-        None,
-        using_results_are_explicit,
-    )?;
+    let original_table_plan = find_select_plan_form(plan, resolver, cache, true, None)?;
     // The query already returns no rows, so a cheaper form cannot be found.
     if plan.contains_constant_false_condition {
         apply_select_table_plan(plan, original_table_plan, resolver)?;
         return Ok(());
     }
     let cost_limit = plan.estimated_cost.map(Cost);
-    let rewritten_table_plan = find_select_plan_form(
-        &mut rewritten,
-        resolver,
-        cache,
-        false,
-        cost_limit,
-        using_results_are_explicit,
-    )?;
+    let rewritten_table_plan =
+        find_select_plan_form(&mut rewritten, resolver, cache, false, cost_limit)?;
     // A form that returns no rows costs nothing, so it would always win the
     // comparison below. Check that it can be emitted before comparing costs.
     let use_rewritten = rewritten_form_is_emittable(&rewritten)
@@ -1015,16 +995,8 @@ fn optimize_select_plan_form(
     plan: &mut SelectPlan,
     resolver: &Resolver,
     cache: &mut SubqueryPlanCache,
-    using_results_are_explicit: bool,
 ) -> Result<()> {
-    let table_plan = find_select_plan_form(
-        plan,
-        resolver,
-        cache,
-        false,
-        None,
-        using_results_are_explicit,
-    )?;
+    let table_plan = find_select_plan_form(plan, resolver, cache, false, None)?;
     apply_select_table_plan(plan, table_plan, resolver)
 }
 
@@ -1035,7 +1007,6 @@ fn find_select_plan_form(
     cache: &mut SubqueryPlanCache,
     save_subquery_plans: bool,
     cost_limit: Option<Cost>,
-    using_results_are_explicit: bool,
 ) -> Result<Option<TableAccessPlan>> {
     let schema = resolver.schema();
     #[cfg(feature = "optimizer_params")]
@@ -1105,7 +1076,6 @@ fn find_select_plan_form(
         &mut plan.offset,
         plan.input_cardinality_hint.unwrap_or(1.0),
         cost_limit,
-        using_results_are_explicit,
     )?;
 
     if matches!(plan.simple_aggregate, Some(SimpleAggregate::MinMax(_)))
@@ -1745,21 +1715,16 @@ fn optimize_subqueries(
                 continue;
             }
             // Use match to handle both SelectPlan and CompoundSelect variants
-            let using_results_are_explicit =
-                from_clause_subquery.parenthesized_join_columns.is_some();
             match from_clause_subquery.plan.as_mut() {
-                Plan::Select(select_plan) => optimize_select_plan_with_cache(
-                    select_plan,
-                    resolver,
-                    cache,
-                    using_results_are_explicit,
-                )?,
+                Plan::Select(select_plan) => {
+                    optimize_select_plan_with_cache(select_plan, resolver, cache)?
+                }
                 Plan::CompoundSelect {
                     left, right_most, ..
                 } => {
-                    optimize_select_plan_with_cache(right_most, resolver, cache, false)?;
+                    optimize_select_plan_with_cache(right_most, resolver, cache)?;
                     for (select_plan, _) in left {
-                        optimize_select_plan_with_cache(select_plan, resolver, cache, false)?;
+                        optimize_select_plan_with_cache(select_plan, resolver, cache)?;
                     }
                 }
                 Plan::RecursiveCte(recursive_cte) => {
@@ -1855,7 +1820,7 @@ fn optimize_plan_for_calls(
             return Ok(());
         }
         plan.input_cardinality_hint = Some(call_count);
-        optimize_select_plan_with_cache(plan, resolver, cache, false)
+        optimize_select_plan_with_cache(plan, resolver, cache)
     };
 
     match plan {
@@ -2408,7 +2373,6 @@ fn optimize_table_access(
         offset,
         initial_input_cardinality,
         None,
-        false,
     )?
     else {
         return Ok(None);
@@ -2445,7 +2409,6 @@ fn find_table_access_plan(
     offset: &mut Option<Box<Expr>>,
     initial_input_cardinality: f64,
     cost_limit: Option<Cost>,
-    using_results_are_explicit: bool,
 ) -> Result<Option<TableAccessPlan>> {
     // When optimizer_params feature is enabled, use lazily-loaded params (cached process-wide).
     // Otherwise, use the compile-time static for zero overhead.
@@ -2635,7 +2598,6 @@ fn find_table_access_plan(
     let planning_context = JoinPlanningContext {
         maybe_order_target: maybe_order_target.as_ref(),
         cost_limit,
-        using_results_are_explicit,
         allow_automatic_index: true,
     };
 
