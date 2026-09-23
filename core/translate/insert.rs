@@ -3551,7 +3551,11 @@ fn emit_index_column_value_for_insert(
     idx_col: &IndexColumn,
     dest_reg: usize,
 ) -> Result<()> {
-    if let Some(expr) = &idx_col.expr {
+    if let Some(expr) = idx_col
+        .expr
+        .as_ref()
+        .filter(|_| idx_col.pos_in_table == EXPR_INDEX_SENTINEL)
+    {
         let expr = expr.as_ref().clone();
         let columns: Vec<Column> = insertion
             .col_mappings
@@ -3578,14 +3582,6 @@ fn emit_index_column_value_for_insert(
             table,
             dest_reg,
         )?;
-        // For virtual generated column references, apply the column's
-        // declared affinity to the computed expression result.
-        if idx_col.pos_in_table != EXPR_INDEX_SENTINEL {
-            let column = &table.columns()[idx_col.pos_in_table];
-            if column.is_virtual_generated() {
-                program.emit_column_affinity(dest_reg, column.affinity());
-            }
-        }
     } else {
         let Some(cm) = insertion.get_col_mapping_by_name(&idx_col.name) else {
             return Err(LimboError::PlanningError(

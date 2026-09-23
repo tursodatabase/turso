@@ -1140,7 +1140,7 @@ pub fn emit_upsert(
             // NEW key (use NEW rowid if present)
             let ins = program.alloc_registers(k + 1);
             for (i, ic) in idx_meta.columns.iter().enumerate() {
-                if ic.expr.is_some() {
+                if ic.pos_in_table == EXPR_INDEX_SENTINEL {
                     emit_upsert_expr_index_value(
                         program,
                         resolver,
@@ -1262,7 +1262,7 @@ pub fn emit_upsert(
             // DELETE old key
             let del = program.alloc_registers(k + 1);
             for (i, ic) in pending.idx_meta.columns.iter().enumerate() {
-                if ic.expr.is_some() {
+                if ic.pos_in_table == EXPR_INDEX_SENTINEL {
                     emit_upsert_expr_index_value(
                         program,
                         resolver,
@@ -1688,7 +1688,10 @@ fn emit_upsert_expr_index_value(
     dest_reg: usize,
     layout: &ColumnLayout,
 ) -> crate::Result<()> {
-    let expr = idx_col.expr.as_ref().expect("caller checked is_some");
+    let expr = idx_col
+        .expr
+        .as_ref()
+        .expect("expression index column has an expression");
     let expr = expr.as_ref().clone();
     let columns = table.columns();
     let bt = table.require_btree()?;

@@ -25,7 +25,7 @@ use super::{
 use crate::alloc::{TryClone, TursoIteratorExt};
 use crate::instrument;
 use crate::schema::{
-    BTreeTable, CheckConstraint, Column, ColumnLayout, GeneratedType, IndexColumn, Schema, Table,
+    BTreeTable, CheckConstraint, Column, ColumnLayout, IndexColumn, Schema, Table,
     EXPR_INDEX_SENTINEL,
 };
 use crate::translate::fkeys::FkActionCompileStack;
@@ -2143,7 +2143,11 @@ fn emit_index_column_value_new_image(
     layout: &ColumnLayout,
     table: &Arc<BTreeTable>,
 ) -> Result<()> {
-    if let Some(expr) = &idx_col.expr {
+    if let Some(expr) = idx_col
+        .expr
+        .as_ref()
+        .filter(|_| idx_col.pos_in_table == EXPR_INDEX_SENTINEL)
+    {
         let expr = expr.as_ref().clone();
         let column_regs: Vec<usize> = columns
             .iter()
@@ -2169,34 +2173,16 @@ fn emit_index_column_value_new_image(
         let col_in_table = columns
             .get(idx_col.pos_in_table)
             .expect("column index out of bounds");
-        match col_in_table.generated_type() {
-            GeneratedType::Virtual { ref expr, .. } => {
-                gencol::emit_gencol_expr_from_registers(
-                    program,
-                    expr,
-                    dest_reg,
-                    columns_start_reg,
-                    columns,
-                    resolver,
-                    rowid_reg,
-                    layout,
-                    table,
-                )?;
-                program.emit_column_affinity(dest_reg, col_in_table.affinity());
-            }
-            GeneratedType::NotGenerated => {
-                let src_reg = if col_in_table.is_rowid_alias() {
-                    rowid_reg
-                } else {
-                    layout.to_register(columns_start_reg, idx_col.pos_in_table)
-                };
-                program.emit_insn(Insn::Copy {
-                    src_reg,
-                    dst_reg: dest_reg,
-                    extra_amount: 0,
-                });
-            }
-        }
+        let src_reg = if col_in_table.is_rowid_alias() {
+            rowid_reg
+        } else {
+            layout.to_register(columns_start_reg, idx_col.pos_in_table)
+        };
+        program.emit_insn(Insn::Copy {
+            src_reg,
+            dst_reg: dest_reg,
+            extra_amount: 0,
+        });
     }
     Ok(())
 }

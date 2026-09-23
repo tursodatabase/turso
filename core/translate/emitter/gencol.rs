@@ -1,9 +1,7 @@
-use crate::alloc::TursoIteratorExt;
-use crate::schema::{BTreeTable, ColumnLayout, ColumnsTopologicalSort, GeneratedType};
+use crate::schema::{BTreeTable, ColumnsTopologicalSort, GeneratedType};
 use crate::translate::expr::translate_expr;
 use crate::vdbe::builder::{DmlColumnContext, SelfTableContext};
 use crate::{Arc, Result};
-use turso_parser::ast;
 
 use super::{ProgramBuilder, Resolver};
 
@@ -31,30 +29,4 @@ pub fn compute_virtual_columns(
         }
         Ok(())
     })
-}
-
-/// Emit bytecode to compute a single virtual generated column expression.
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn emit_gencol_expr_from_registers(
-    program: &mut ProgramBuilder,
-    expr: &ast::Expr,
-    target_reg: usize,
-    registers_start: usize,
-    columns: &[crate::schema::Column],
-    resolver: &Resolver,
-    rowid_reg: usize,
-    layout: &ColumnLayout,
-    table: &Arc<BTreeTable>,
-) -> Result<()> {
-    let ctx = SelfTableContext::ForDML {
-        dml_ctx: DmlColumnContext::layout(columns, registers_start, rowid_reg, layout.clone())
-            .with_encoded_columns((0..columns.len()).try_collect()?),
-        table: Arc::clone(table),
-    };
-    resolver.with_self_table_context(program, Some(&ctx), |program, _| {
-        translate_expr(program, None, expr, target_reg, resolver)?;
-        Ok(())
-    })?;
-
-    Ok(())
 }

@@ -5931,3 +5931,44 @@ setup gencol_fk_parent_virtual_key {
 snapshot gencol_fk_parent_delete_computes_only_key_columns {
     DELETE FROM p WHERE a = 1;
 }
+
+setup gencol_indexed_virtual_columns {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, a INTEGER, b INTEGER, c AS (a + b), e AS (a * 3) UNIQUE);
+    CREATE INDEX tc ON t(c);
+}
+
+@skip-if mvcc "mvcc has different root pages"
+@setup gencol_indexed_virtual_columns
+snapshot gencol_insert_index_keys_copy_virtual_columns {
+    INSERT INTO t(id, a, b) VALUES (1, 1, 2);
+}
+
+@skip-if mvcc "mvcc has different root pages"
+@setup gencol_indexed_virtual_columns
+snapshot gencol_update_index_keys_copy_virtual_columns {
+    UPDATE t SET a = 5 WHERE id = 1;
+}
+
+@skip-if mvcc "mvcc has different root pages"
+@setup gencol_indexed_virtual_columns
+snapshot gencol_upsert_index_keys_copy_virtual_columns {
+    INSERT INTO t(id, a, b) VALUES (1, 1, 2) ON CONFLICT(id) DO UPDATE SET a = 7;
+}
+
+@cross-check-integrity
+test gencol_index_keys_match_virtual_columns_after_writes {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, a INTEGER, b INTEGER, c AS (a + b), e AS (a * 3) UNIQUE);
+    CREATE INDEX tc ON t(c);
+    INSERT INTO t(id, a, b) VALUES (1, 1, 2), (2, 2, 2);
+    UPDATE t SET a = 5 WHERE id = 1;
+    INSERT INTO t(id, a, b) VALUES (2, 0, 0) ON CONFLICT(id) DO UPDATE SET a = 7;
+    SELECT id, c FROM t INDEXED BY tc WHERE c > 0 ORDER BY c;
+    SELECT id, e FROM t WHERE e = 21;
+    PRAGMA integrity_check;
+}
+expect {
+    1|7
+    2|9
+    2|21
+    ok
+}

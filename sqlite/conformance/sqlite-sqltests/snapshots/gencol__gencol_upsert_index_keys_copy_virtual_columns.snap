@@ -1,0 +1,102 @@
+---
+source: gencol.sqltest
+expression: INSERT INTO t(id, a, b) VALUES (1, 1, 2) ON CONFLICT(id) DO UPDATE SET a = 7;
+info:
+  statement_type: INSERT
+  tables:
+  - conflict
+  - t
+  setup_blocks:
+  - gencol_indexed_virtual_columns
+  database: ':memory:'
+---
+QUERY PLAN
+
+
+BYTECODE
+addr  opcode         p1  p2  p3  p4      p5  comment
+   0  Init            0  80   0           0  Start at 80
+   1  OpenWrite       2   2   0           0  root=2; iDb=0
+   2  Integer         1   2   0           0  r[2]=1
+   3  SoftNull        3   0   0           0
+   4  Integer         1   4   0           0  r[4]=1
+   5  Integer         2   5   0           0  r[5]=2
+   6  OpenWrite       0   4   0           0  root=4; iDb=0
+   7  OpenWrite       1   3   0           0  root=3; iDb=0
+   8  Affinity        3   3   0           0  r[3..6] = D, D, D
+   9  NotNull         2  11   0           0  r[2]!=NULL -> goto 11
+  10  Goto            0  13   0           0
+  11  MustBeInt       2   0   0           0
+  12  Goto            0  14   0           0
+  13  NewRowid        2   2   0           0  r[2]=rowid
+  14  Copy            4   9   0           0  r[9]=r[4]
+  15  Multiply        9  10   7           0  r[7]=r[9]*r[10]
+  16  Copy            4  11   0           0  r[11]=r[4]
+  17  Copy            5  12   0           0  r[12]=r[5]
+  18  Add            11  12   6           0  r[6]=r[11]+r[12]
+  19  NotExists       2  22   2           0
+  20  Copy            2   1   0           0  r[1]=r[2]
+  21  Goto            0  40   0           0
+  22  Copy            6  13   0           0  r[13]=r[6]
+  23  Copy            2  14   0           0  r[14]=r[2]
+  24  Copy            7  15   0           0  r[15]=r[7]
+  25  Copy            2  16   0           0  r[16]=r[2]
+  26  Affinity       15   1   0           0  r[15..16] = A
+  27  NoConflict      1  29  15  1        0  key=r[15..15]
+  28  Halt         2067   0   0  t.e      0
+  29  MakeRecord      3   3   8           0  r[8]=mkrec(r[3..5])
+  30  Copy            6  17   0           0  r[17]=r[6]
+  31  Copy            2  18   0           0  r[18]=r[2]
+  32  MakeRecord     17   2  19           0  r[19]=mkrec(r[17..18]); for tc
+  33  IdxInsert       0  19  17           2  key=r[19]
+  34  Copy            7  20   0           0  r[20]=r[7]
+  35  Copy            2  21   0           0  r[21]=r[2]
+  36  MakeRecord     20   2  22           0  r[22]=mkrec(r[20..21]); for sqlite_autoindex_t_1
+  37  IdxInsert       1  22  20           2  key=r[22]
+  38  Insert          2   8   2  t        0  intkey=r[2] data=r[8]
+  39  Goto            0  78   0           0
+  40  SeekRowid       2   1  78           0  if (r[1]!=cursor 2 for table t.rowid) goto 78
+  41  RowId           2  23   0           0  r[23]=t.rowid
+  42  ColumnRange     2   1  24  2        0  r[24..25]=t.a..b
+  43  ColumnRange     2   1  28  2        0  r[28..29]=t.a..b
+  44  Add            28  29  26           0  r[26]=r[28]+r[29]
+  45  Column          2   1  30           0  r[30]=t.a
+  46  Multiply       30  31  27           0  r[27]=r[30]*r[31]
+  47  Copy           23  32   4           0  r[32]=r[23]
+  48  Copy           23  37   4           0  r[37]=r[23]
+  49  Integer         7  38   0           0  r[38]=7
+  50  Affinity       37   3   0           0  r[37..40] = D, D, D
+  51  Copy           38  42   0           0  r[42]=r[38]
+  52  Multiply       42  43  41           0  r[41]=r[42]*r[43]
+  53  Copy           38  44   0           0  r[44]=r[38]
+  54  Copy           39  45   0           0  r[45]=r[39]
+  55  Add            44  45  40           0  r[40]=r[44]+r[45]
+  56  Copy           40  46   0           0  r[46]=r[40]
+  57  Copy            1  47   0           0  r[47]=r[1]
+  58  MakeRecord     46   2  48           0  r[48]=mkrec(r[46..47]); for tc
+  59  Copy           41  49   0           0  r[49]=r[41]
+  60  Copy            1  50   0           0  r[50]=r[1]
+  61  MakeRecord     49   2  51           0  r[51]=mkrec(r[49..50]); for sqlite_autoindex_t_1
+  62  Affinity       49   1   0           0  r[49..50] = A
+  63  NoConflict      1  67  49  1        0  key=r[49..49]
+  64  IdxRowId        1  52   0           0  r[52]=cursor 1.rowid
+  65  Eq              1  52  67  Binary   0  if r[1]==r[52] goto 67
+  66  Halt         1555   0   0  t.e      0
+  67  Copy           35  53   0           0  r[53]=r[35]
+  68  Copy            1  54   0           0  r[54]=r[1]
+  69  IdxDelete       0  53   2           0
+  70  IdxInsert       0  48  46           2  key=r[48]
+  71  Copy           36  55   0           0  r[55]=r[36]
+  72  Copy            1  56   0           0  r[56]=r[1]
+  73  IdxDelete       1  55   2           0
+  74  IdxInsert       1  51  49           2  key=r[51]
+  75  MakeRecord     37   3  57           0  r[57]=mkrec(r[37..39])
+  76  Insert          2  57   1  t        8  intkey=r[1] data=r[57]
+  77  Goto            0  78   0           0
+  78  Goto            0  79   0           0
+  79  Halt            0   0   0           0
+  80  Transaction     0   2   2           0  iDb=0 tx_mode=Write
+  81  Integer         3  10   0           0  r[10]=3
+  82  Integer         3  31   0           0  r[31]=3
+  83  Integer         3  43   0           0  r[43]=3
+  84  Goto            0   1   0           0
