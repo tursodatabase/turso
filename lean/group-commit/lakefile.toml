@@ -1,0 +1,9 @@
+name = "group-commit"
+defaultTargets = ["GroupCommit"]
+
+[[lean_lib]]
+name = "GroupCommit"
+
+[[lean_exe]]
+name = "explore"
+root = "Explore"
