@@ -1898,3 +1898,186 @@ fn test_upsert_do_update_failure_preserves_indexes(tmp_db: TempDatabase) -> anyh
 
     Ok(())
 }
+
+#[turso_macros::test]
+#[ignore = "known bug: the seek in restore_context clears skip_advance, so DELETE skips the next row"]
+fn test_delete_self_fk_set_null_deletes_every_row_on_one_page(
+    tmp_db: TempDatabase,
+) -> anyhow::Result<()> {
+    let conn = tmp_db.connect_limbo();
+    let (turso, sqlite) = run_on_turso_and_sqlite(
+        &conn,
+        &[
+            "PRAGMA foreign_keys = ON",
+            "CREATE TABLE t(id INTEGER PRIMARY KEY, parent INTEGER REFERENCES t(id) ON DELETE SET NULL)",
+            "INSERT INTO t VALUES (1, NULL), (2, 1), (3, 2), (4, 3), (5, 4), (6, 5)",
+            "DELETE FROM t WHERE id > 1",
+        ],
+        "SELECT id FROM t ORDER BY id",
+    )?;
+    assert_eq!(turso, sqlite);
+    Ok(())
+}
+
+#[turso_macros::test]
+#[ignore = "known bug: a delete of cell 0 leaves the cursor at cell -1, a write by the FK action empties its stack, and DELETE stops"]
+fn test_delete_self_fk_set_null_continues_after_first_cell_of_page(
+    tmp_db: TempDatabase,
+) -> anyhow::Result<()> {
+    let conn = tmp_db.connect_limbo();
+    let (turso, sqlite) = run_on_turso_and_sqlite(
+        &conn,
+        &[
+            "PRAGMA foreign_keys = ON",
+            "CREATE TABLE t(id INTEGER PRIMARY KEY, parent INTEGER REFERENCES t(id) ON DELETE SET NULL, pad TEXT)",
+            "WITH RECURSIVE s(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM s WHERE x < 12) \
+             INSERT INTO t SELECT x, CASE WHEN x > 1 THEN x - 1 END, printf('%.900c', 'x') FROM s",
+            "DELETE FROM t WHERE id > 4",
+        ],
+        "SELECT id FROM t ORDER BY id",
+    )?;
+    assert_eq!(turso, sqlite);
+    Ok(())
+}
+
+#[turso_macros::test]
+#[ignore = "known bug: restore_context seeks forward, so a backward index scan returns a leaf page twice"]
+fn test_backward_index_scan_does_not_repeat_rows_after_fk_cascade(
+    tmp_db: TempDatabase,
+) -> anyhow::Result<()> {
+    let conn = tmp_db.connect_limbo();
+    let (turso, sqlite) = run_on_turso_and_sqlite(
+        &conn,
+        &[
+            "PRAGMA foreign_keys = ON",
+            "CREATE TABLE p(id INTEGER PRIMARY KEY, v INTEGER)",
+            "CREATE TABLE c(id INTEGER PRIMARY KEY, pid INTEGER REFERENCES p(id) ON DELETE CASCADE, b TEXT)",
+            "CREATE INDEX cb ON c(b)",
+            "WITH RECURSIVE s(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM s WHERE x < 20) \
+             INSERT INTO c(id, pid, b) SELECT x, NULL, printf('%02d', x) || printf('%.800c', '.') FROM s",
+            "INSERT INTO p(id, v) VALUES (-1, NULL)",
+            "INSERT INTO c(id, pid, b) VALUES (99, -1, 'zz')",
+            "INSERT OR REPLACE INTO p(id, v) SELECT CASE WHEN id = 10 THEN -1 END, id FROM c ORDER BY b DESC",
+        ],
+        "SELECT v FROM p WHERE id <> -1 ORDER BY id",
+    )?;
+    assert_eq!(turso, sqlite);
+    Ok(())
+}
+
+type QueryRows = Vec<Vec<rusqlite::types::Value>>;
+
+fn run_on_turso_and_sqlite(
+    conn: &Arc<turso_core::Connection>,
+    statements: &[&str],
+    query: &str,
+) -> anyhow::Result<(QueryRows, QueryRows)> {
+    let sqlite = rusqlite::Connection::open_in_memory()?;
+    for sql in statements {
+        conn.execute(sql)?;
+        sqlite.execute_batch(sql)?;
+    }
+    Ok((
+        limbo_exec_rows(conn, query),
+        common::sqlite_exec_rows(&sqlite, query),
+    ))
+}
+
+#[turso_macros::test]
+#[ignore = "known bug: restore_context seeks forward, so a backward index scan returns a leaf page twice"]
+fn test_backward_index_scan_does_not_repeat_rows_after_insert_between_steps(
+    tmp_db: TempDatabase,
+) -> anyhow::Result<()> {
+    let conn = tmp_db.connect_limbo();
+    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, b INTEGER)")?;
+    conn.execute("CREATE INDEX tb ON t(b)")?;
+    conn.execute(
+        "WITH RECURSIVE s(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM s WHERE x < 2000) \
+         INSERT INTO t(id, b) SELECT x, x FROM s",
+    )?;
+    let seen = scan_with_writes_between_steps(
+        &conn,
+        "SELECT b FROM t ORDER BY b DESC",
+        |b, count| {
+            (b % 97 == 0).then(|| format!("INSERT INTO t(b) VALUES ({})", 1_000_000 + count))
+        },
+        8000,
+    )?;
+    assert_eq!(seen, (1..=2000).rev().collect::<Vec<i64>>());
+    Ok(())
+}
+
+#[turso_macros::test]
+#[ignore = "known bug: after an auto-checkpoint, begin_read_tx clears the page cache and the cursors of the active statement"]
+fn test_forward_scan_returns_all_rows_after_auto_checkpoint_between_steps(
+    tmp_db: TempDatabase,
+) -> anyhow::Result<()> {
+    let conn = tmp_db.connect_limbo();
+    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY)")?;
+    conn.execute("CREATE TABLE other(id INTEGER PRIMARY KEY, v INTEGER)")?;
+    conn.execute(
+        "WITH RECURSIVE s(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM s WHERE x < 2000) \
+         INSERT INTO t(id) SELECT x FROM s",
+    )?;
+    let seen = scan_with_writes_between_steps(
+        &conn,
+        "SELECT id FROM t ORDER BY id",
+        |_, count| Some(format!("INSERT INTO other(v) VALUES ({count})")),
+        8000,
+    )?;
+    assert_eq!(seen, (1..=2000).collect::<Vec<i64>>());
+    Ok(())
+}
+
+#[turso_macros::test]
+#[ignore = "known bug: after an auto-checkpoint, begin_read_tx clears the cursors of the active statement, and prev() panics on the empty stack"]
+fn test_backward_scan_returns_all_rows_after_auto_checkpoint_between_steps(
+    tmp_db: TempDatabase,
+) -> anyhow::Result<()> {
+    let conn = tmp_db.connect_limbo();
+    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY)")?;
+    conn.execute("CREATE TABLE other(id INTEGER PRIMARY KEY, v INTEGER)")?;
+    conn.execute(
+        "WITH RECURSIVE s(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM s WHERE x < 2000) \
+         INSERT INTO t(id) SELECT x FROM s",
+    )?;
+    let seen = scan_with_writes_between_steps(
+        &conn,
+        "SELECT id FROM t ORDER BY id DESC",
+        |_, count| Some(format!("INSERT INTO other(v) VALUES ({count})")),
+        8000,
+    )?;
+    assert_eq!(seen, (1..=2000).rev().collect::<Vec<i64>>());
+    Ok(())
+}
+
+fn scan_with_writes_between_steps(
+    conn: &Arc<turso_core::Connection>,
+    scan: &str,
+    write_after_row: impl Fn(i64, usize) -> Option<String>,
+    max_rows: usize,
+) -> anyhow::Result<Vec<i64>> {
+    let mut stmt = conn.prepare(scan)?;
+    let mut seen = Vec::new();
+    while let Some(value) = step_one_integer(&mut stmt)? {
+        seen.push(value);
+        if seen.len() > max_rows {
+            break;
+        }
+        if let Some(write) = write_after_row(value, seen.len()) {
+            conn.execute(write)?;
+        }
+    }
+    Ok(seen)
+}
+
+fn step_one_integer(stmt: &mut Statement) -> anyhow::Result<Option<i64>> {
+    loop {
+        match stmt.step()? {
+            StepResult::Row => return Ok(Some(stmt.row().unwrap().get::<i64>(0)?)),
+            StepResult::Done => return Ok(None),
+            StepResult::IO | StepResult::Yield | StepResult::Sleep { .. } => stmt._io().step()?,
+            other => anyhow::bail!("unexpected step result {other:?}"),
+        }
+    }
+}
