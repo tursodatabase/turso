@@ -6739,6 +6739,83 @@ fn setup_lazy_db(initial_keys: &[i64]) -> (MvccTestDb, u64, MVTableId, i64) {
     (db, tx_id, table_id, btree_root_page)
 }
 
+/// Completes `exists(rowid)`. Second bool is whether ExistsBtreeFallback fired.
+fn probe_exists(db: &MvccTestDb, cursor: &mut crate::MvCursor, rowid: i64) -> (bool, bool) {
+    db.conn.set_yield_injector(Some(FixedYieldInjector::new([
+        CursorYieldPoint::ExistsBtreeFallback.point(),
+    ])));
+    let mut searched_btree = false;
+    let found = loop {
+        match cursor.exists(&Value::from_i64(rowid)).unwrap() {
+            IOResult::Done(found) => break found,
+            IOResult::IO(io) if io.is_explicit_yield() => searched_btree = true,
+            IOResult::IO(io) => io.wait(db.conn.db.io.as_ref()).unwrap(),
+        }
+    };
+    db.conn.set_yield_injector(None);
+    (found, searched_btree)
+}
+
+#[test]
+fn exists_skips_the_btree_for_a_rowid_above_the_allocator_max() {
+    let db = MvccTestDb::new();
+    db.conn
+        .execute("CREATE TABLE t(x INTEGER PRIMARY KEY, v TEXT)")
+        .unwrap();
+    db.conn
+        .execute("INSERT INTO t VALUES (1, 'a'), (2, 'b'), (5, 'c')")
+        .unwrap();
+    db.conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+    let root_page = get_rows(
+        &db.conn,
+        "SELECT rootpage FROM sqlite_schema WHERE name = 't'",
+    )[0][0]
+        .as_int()
+        .unwrap();
+    let table_id = db.mvcc_store.get_table_id_from_root_page(root_page);
+    let allocator = db.mvcc_store.get_rowid_allocator(&table_id);
+    assert_eq!(
+        allocator.max_rowid(),
+        None,
+        "inserts with explicit rowids never seed the allocator"
+    );
+
+    let tx_id = db
+        .mvcc_store
+        .begin_tx(db.conn.pager.load().clone())
+        .unwrap();
+    let mut cursor = MvccLazyCursor::new(
+        db.mvcc_store.clone(),
+        &db.conn,
+        tx_id,
+        root_page,
+        MvccCursorType::Table,
+        Box::new(BTreeCursor::new(
+            db.conn.pager.load().clone(),
+            root_page.abs(),
+            2,
+        )),
+    )
+    .unwrap();
+
+    // Seeds from btree max (5); 100 cannot be there, so no ExistsBtreeFallback.
+    assert_eq!(probe_exists(&db, &mut cursor, 100), (false, false));
+    assert_eq!(allocator.max_rowid(), Some(5));
+    assert_eq!(probe_exists(&db, &mut cursor, 3), (false, true));
+    assert!(probe_exists(&db, &mut cursor, 5).0);
+
+    let record =
+        ImmutableRecord::from_values(&[Value::Text(Text::new("d".to_string()))], 1).unwrap();
+    let row =
+        Row::new_table_row(RowID::new(table_id, RowKey::Int(100)), record.as_blob(), 1).unwrap();
+    db.mvcc_store.insert(tx_id, row).unwrap();
+    assert_eq!(probe_exists(&db, &mut cursor, 100), (true, false));
+    assert_eq!(probe_exists(&db, &mut cursor, 101), (false, false));
+
+    db.mvcc_store
+        .rollback_tx(tx_id, db.conn.pager.load().clone(), db.conn.as_ref(), 0);
+}
+
 #[test]
 fn test_mvcc_cursor_next_yields_with_injected_yield() {
     let db = MvccTestDb::new();
@@ -22677,3 +22754,49 @@ fn dropping_passive_checkpoint_after_pager_commit_does_not_release_write_lock_tw
 
 #[path = "group_commit_tests.rs"]
 mod group_commit_tests;
+
+/// Non-positive rowids must still search the B-tree: the allocator's 0
+/// sentinel is not a bound, so recovery can leave a committed rowid above
+/// a non-positive max.
+#[test]
+fn notexists_descends_the_btree_for_non_positive_rowids() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let db_path = db.path.as_ref().unwrap().clone();
+    let conn1 = db.connect();
+    conn1
+        .execute("CREATE TABLE t(x INTEGER PRIMARY KEY, v TEXT)")
+        .unwrap();
+    conn1.execute("INSERT INTO t VALUES (-5, 'a')").unwrap();
+    conn1.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+    conn1.execute("INSERT INTO t VALUES (-1, 'b')").unwrap();
+
+    {
+        let mut manager = DATABASE_MANAGER.lock();
+        manager.clear();
+    }
+
+    // Recovery replays uncheckpointed -1 into a fresh allocator (max 0 drops it).
+    let io = Arc::new(PlatformIO::new().unwrap());
+    let db2 = Database::open_file_with_flags(
+        io,
+        &db_path,
+        OpenFlags::default(),
+        DatabaseOpts::new(),
+        None,
+        Arc::new(SqliteDialect),
+    )
+    .unwrap();
+    let conn = db2.connect().unwrap();
+
+    // INSERT (-3) seeds from btree last (-5), below the replayed -1.
+    conn.execute("INSERT INTO t VALUES (-3, 'c')").unwrap();
+    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+
+    let res = conn.execute("INSERT INTO t VALUES (-1, 'dup')");
+    let rows = get_rows(&conn, "SELECT x, v FROM t ORDER BY x");
+    assert!(
+        res.is_err(),
+        "duplicate rowid -1 was accepted; table now reads {rows:?}"
+    );
+    assert_eq!(rows.len(), 3);
+}

@@ -10348,6 +10348,13 @@ impl RowidAllocator {
         !self.initialized.load(Ordering::SeqCst)
     }
 
+    /// Seeded max, or None until `initialize`. 0 is an empty table.
+    pub fn max_rowid(&self) -> Option<i64> {
+        self.initialized
+            .load(Ordering::SeqCst)
+            .then(|| self.max_rowid.load(Ordering::SeqCst))
+    }
+
     /// Initialize from btree max. Called once per table, under lock.
     pub fn initialize(&self, rowid: Option<i64>) {
         tracing::trace!("initialize({rowid:?})");
