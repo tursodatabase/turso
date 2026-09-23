@@ -22421,5 +22421,193 @@ fn dropping_passive_checkpoint_after_pager_commit_does_not_release_write_lock_tw
     assert_eq!(ids, vec![1, 2, 3]);
 }
 
+fn prefix_test_values() -> (Vec<crate::numeric::Numeric>, Vec<String>, Vec<Vec<u8>>) {
+    use crate::numeric::{nonnan::NonNan, Numeric};
+    let mut rng = ChaCha8Rng::seed_from_u64(7);
+    let two_53 = 1i64 << 53;
+    let mut numbers: Vec<Numeric> = [
+        0,
+        1,
+        -1,
+        i64::MIN,
+        i64::MAX,
+        two_53,
+        two_53 + 1,
+        two_53 + 2,
+        -two_53 - 1,
+        -two_53,
+    ]
+    .into_iter()
+    .map(Numeric::Integer)
+    .collect();
+    let floats = [
+        0.0,
+        -0.0,
+        0.5,
+        -0.5,
+        1.0,
+        -1.0,
+        1e300,
+        -1e300,
+        f64::MIN_POSITIVE,
+        5e-324,
+        two_53 as f64,
+        (two_53 + 2) as f64,
+        9.223372036854776e18,
+        -9.223372036854776e18,
+        f64::INFINITY,
+        f64::NEG_INFINITY,
+    ];
+    numbers.extend(
+        floats
+            .into_iter()
+            .map(|f| Numeric::Float(NonNan::new(f).expect("not NaN"))),
+    );
+    for _ in 0..40 {
+        numbers.push(Numeric::Integer(rng.random_range(-1000..1000)));
+        numbers.push(Numeric::Integer(rng.random::<i64>()));
+        numbers.push(Numeric::Float(
+            NonNan::new(rng.random_range(-1000.0..1000.0)).expect("not NaN"),
+        ));
+    }
+    let alphabet = ['a', 'b', 'A', 'B', 'z', 'Z', ' ', '\0', '~', 'é'];
+    let mut texts: Vec<String> = [
+        "", "a", "a ", "a\0", "a\0b", "a\0c", "abcdefg", "abcdefgh", "ABCDEFGz",
+    ]
+    .into_iter()
+    .map(String::from)
+    .collect();
+    for _ in 0..80 {
+        let len = rng.random_range(0..12);
+        texts.push(
+            (0..len)
+                .map(|_| alphabet[rng.random_range(0..alphabet.len())])
+                .collect(),
+        );
+    }
+    let mut blobs: Vec<Vec<u8>> = vec![
+        vec![],
+        vec![0],
+        vec![0, 0],
+        vec![0xff; 9],
+        vec![1; 7],
+        vec![1; 8],
+    ];
+    for _ in 0..40 {
+        let len = rng.random_range(0..12);
+        blobs.push(
+            (0..len)
+                .map(|_| [0u8, 1, 0x7f, 0x80, 0xfe, 0xff][rng.random_range(0..6)])
+                .collect(),
+        );
+    }
+    (numbers, texts, blobs)
+}
+
+fn prefix_test_key_infos() -> Vec<crate::types::KeyInfo> {
+    use crate::translate::collate::CollationSeq;
+    use turso_parser::ast::{NullsOrder, SortOrder};
+    let mut infos = Vec::new();
+    for sort_order in [SortOrder::Asc, SortOrder::Desc] {
+        for collation in [
+            CollationSeq::Unset,
+            CollationSeq::Binary,
+            CollationSeq::NoCase,
+            CollationSeq::Rtrim,
+            CollationSeq::Custom(0),
+        ] {
+            for nulls_order in [None, Some(NullsOrder::First), Some(NullsOrder::Last)] {
+                infos.push(crate::types::KeyInfo {
+                    sort_order,
+                    collation,
+                    nulls_order,
+                });
+            }
+        }
+    }
+    infos
+}
+
+#[test]
+fn index_value_prefix_keeps_the_order_of_cmp_in_column() {
+    use crate::types::{cmp_in_column, TextRef, TextSubtype};
+    let (numbers, texts, blobs) = prefix_test_values();
+    let mut values: Vec<ValueRef<'_>> = vec![ValueRef::Null];
+    values.extend(numbers.iter().map(|n| ValueRef::Numeric(*n)));
+    values.extend(
+        texts
+            .iter()
+            .map(|t| ValueRef::Text(TextRef::new(t, TextSubtype::Text))),
+    );
+    values.extend(blobs.iter().map(|b| ValueRef::Blob(b)));
+    let mut decided = 0u64;
+    for key_info in prefix_test_key_infos() {
+        let prefixes: Vec<u64> = values
+            .iter()
+            .map(|v| index_value_prefix(v, &key_info))
+            .collect();
+        for (a, pa) in values.iter().zip(&prefixes) {
+            for (b, pb) in values.iter().zip(&prefixes) {
+                if pa == pb {
+                    continue;
+                }
+                decided += 1;
+                let expected = if pa < pb {
+                    std::cmp::Ordering::Less
+                } else {
+                    std::cmp::Ordering::Greater
+                };
+                assert_eq!(
+                    cmp_in_column(a, b, &key_info),
+                    expected,
+                    "prefix order of {a:?} and {b:?} does not match {key_info:?}"
+                );
+            }
+        }
+    }
+    assert!(decided > 1_000_000, "the prefixes decide most pairs");
+}
+
+#[test]
+fn index_key_prefix_keeps_the_order_of_index_keys() {
+    use crate::bplus_tree::KeyPrefix;
+    let (numbers, texts, _) = prefix_test_values();
+    let mut rng = ChaCha8Rng::seed_from_u64(11);
+    for key_info in prefix_test_key_infos() {
+        let second = crate::types::KeyInfo {
+            sort_order: turso_parser::ast::SortOrder::Asc,
+            collation: crate::translate::collate::CollationSeq::Binary,
+            nulls_order: None,
+        };
+        let info = Arc::new(IndexInfo::new([key_info, second], true, 2, false).unwrap());
+        let keys: Vec<SortableIndexKey> = (0..150)
+            .map(|i| {
+                let first = match rng.random_range(0..3) {
+                    0 => Value::Null,
+                    1 => Value::from(numbers[rng.random_range(0..numbers.len())]),
+                    _ => Value::build_text(texts[rng.random_range(0..texts.len())].clone()),
+                };
+                let record = ImmutableRecord::from_values(&[first, Value::from_i64(i)], 2).unwrap();
+                SortableIndexKey::new_from_payload_in(
+                    record.as_blob(),
+                    info.clone(),
+                    TursoAllocator,
+                )
+                .unwrap()
+            })
+            .collect();
+        for a in &keys {
+            for b in &keys {
+                let (pa, pb) = (a.prefix().unwrap(), b.prefix().unwrap());
+                if pa < pb {
+                    assert_eq!(a.cmp(b), std::cmp::Ordering::Less);
+                } else if pa > pb {
+                    assert_eq!(a.cmp(b), std::cmp::Ordering::Greater);
+                }
+            }
+        }
+    }
+}
+
 #[path = "group_commit_tests.rs"]
 mod group_commit_tests;

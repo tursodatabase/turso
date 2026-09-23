@@ -7,6 +7,10 @@ use std::sync::Barrier;
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 struct IntKey(i64);
 
+impl KeyPrefix for IntKey {}
+
+impl KeyPrefix for i64 {}
+
 unsafe impl TreeKey for IntKey {
     type Slot = AtomicI64;
 
@@ -478,4 +482,58 @@ fn insert_replaces_and_get_or_insert_keeps() {
     assert_eq!(**map.insert(IntKey(1), Arc::new(30)).value(), 30);
     assert_eq!(map.get(&IntKey(1)).map(|e| **e.value()), Some(30));
     assert_eq!(map.len(), 1);
+}
+
+#[derive(Debug, PartialEq, Eq, PartialOrd, Ord)]
+struct CoarseKey(i64);
+
+impl KeyPrefix for CoarseKey {
+    fn prefix(&self) -> Option<u64> {
+        Some(((self.0 >> 4) as u64) ^ (1 << 63))
+    }
+}
+
+#[test]
+fn prefixes_with_many_ties_match_btreemap() {
+    let mut rng = rand::rngs::StdRng::seed_from_u64(21);
+    let map: BPlusTreeMap<Arc<CoarseKey>, Arc<i64>> = BPlusTreeMap::new();
+    let mut model = BTreeMap::new();
+    for _ in 0..60_000 {
+        let k = rng.random_range(-3000..3000i64);
+        match rng.random_range(0..4) {
+            0 | 1 => {
+                map.get_or_insert_with(Arc::new(CoarseKey(k)), || Arc::new(k));
+                model.insert(k, k);
+            }
+            2 => {
+                assert_eq!(
+                    map.remove(&CoarseKey(k)).is_some(),
+                    model.remove(&k).is_some()
+                );
+            }
+            _ => {
+                assert_eq!(
+                    map.get(&CoarseKey(k)).map(|e| **e.value()),
+                    model.get(&k).copied()
+                );
+                let lo = CoarseKey(k);
+                let hi = CoarseKey(k + rng.random_range(0..200));
+                let got: Vec<i64> = map
+                    .range::<CoarseKey, _>((Bound::Included(&lo), Bound::Included(&hi)))
+                    .map(|e| e.key().0)
+                    .collect();
+                let expected: Vec<i64> = model.range(lo.0..=hi.0).map(|(k, _)| *k).collect();
+                assert_eq!(got, expected);
+                let got: Vec<i64> = map
+                    .range::<CoarseKey, _>((Bound::Included(&lo), Bound::Excluded(&hi)))
+                    .rev()
+                    .map(|e| e.key().0)
+                    .collect();
+                let expected: Vec<i64> = model.range(lo.0..hi.0).rev().map(|(k, _)| *k).collect();
+                assert_eq!(got, expected);
+            }
+        }
+    }
+    let keys: Vec<i64> = map.iter().map(|e| e.key().0).collect();
+    assert_eq!(keys, model.keys().copied().collect::<Vec<_>>());
 }

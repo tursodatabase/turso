@@ -38,7 +38,7 @@ const INNER_CAPACITY: usize = 64;
 /// `write`, `move_from` and `take` on the same slot, so the slot must be made of atomics.
 /// A reader that races with a writer must get either some key that was in the slot, or
 /// `None`.
-pub unsafe trait TreeKey: Ord + Clone + Send + Sync + 'static {
+pub unsafe trait TreeKey: Ord + KeyPrefix + Clone + Send + Sync + 'static {
     type Slot: Send + Sync;
 
     /// True if a removed key can own memory that a racing reader still reads.
@@ -56,6 +56,29 @@ pub unsafe trait TreeKey: Ord + Clone + Send + Sync + 'static {
 
     /// Empties a slot whose key moved to another slot.
     fn clear(slot: &Self::Slot);
+
+    /// The [`KeyPrefix`] of the key in the slot, if the node stores one.
+    fn slot_prefix(_slot: &Self::Slot) -> Option<u64> {
+        None
+    }
+}
+
+/// A 64-bit summary of a key that keeps the order: if `a.prefix() < b.prefix()`, then
+/// `a < b`. Equal summaries say nothing about the order. Nodes store the summary next
+/// to each key, so a search reads a full key only when the summaries are equal.
+///
+/// This is the "partial key" idea of Bohannon, McIlroy and Rastogi, "Main-Memory Index
+/// Structures with Fixed-Size Partial Keys" (SIGMOD 2001).
+pub trait KeyPrefix {
+    fn prefix(&self) -> Option<u64> {
+        None
+    }
+}
+
+impl<T: KeyPrefix + ?Sized> KeyPrefix for Arc<T> {
+    fn prefix(&self) -> Option<u64> {
+        (**self).prefix()
+    }
 }
 
 /// Storage for one value in a leaf.
@@ -87,21 +110,45 @@ pub unsafe trait TreeValue: Clone + Send + Sync + 'static {
     fn prefetch(_slot: &Self::Slot) {}
 }
 
-unsafe impl<T: Ord + Send + Sync + 'static> TreeKey for Arc<T> {
-    type Slot = AtomicPtr<T>;
+/// Key slot for `Arc<T>`: the key pointer and its [`KeyPrefix`]. The low bit of the
+/// pointer is set when the prefix word holds a prefix.
+pub struct ArcKeySlot<T> {
+    prefix: AtomicU64,
+    ptr: AtomicPtr<T>,
+}
+
+const HAS_PREFIX: usize = 1;
+
+impl<T> ArcKeySlot<T> {
+    fn key_ptr(&self) -> *mut T {
+        self.ptr
+            .load(Ordering::Acquire)
+            .map_addr(|a| a & !HAS_PREFIX)
+    }
+}
+
+unsafe impl<T: Ord + KeyPrefix + Send + Sync + 'static> TreeKey for Arc<T> {
+    type Slot = ArcKeySlot<T>;
 
     const NEEDS_DEFERRED_DROP: bool = true;
 
     fn write(slot: &Self::Slot, key: Self) {
-        slot.store(Arc::into_raw(key).cast_mut(), Ordering::Release);
+        let prefix = key.prefix();
+        slot.prefix.store(prefix.unwrap_or(0), Ordering::Release);
+        let ptr = Arc::into_raw(key).cast_mut();
+        let ptr = ptr.map_addr(|a| a | usize::from(prefix.is_some()));
+        slot.ptr.store(ptr, Ordering::Release);
     }
 
     fn move_from(slot: &Self::Slot, from: &Self::Slot) {
-        slot.store(from.load(Ordering::Acquire), Ordering::Release);
+        slot.prefix
+            .store(from.prefix.load(Ordering::Acquire), Ordering::Release);
+        slot.ptr
+            .store(from.ptr.load(Ordering::Acquire), Ordering::Release);
     }
 
     fn read<R>(slot: &Self::Slot, f: impl FnOnce(&Self) -> R) -> Option<R> {
-        let ptr = slot.load(Ordering::Acquire);
+        let ptr = slot.key_ptr();
         if ptr.is_null() {
             return None;
         }
@@ -112,14 +159,22 @@ unsafe impl<T: Ord + Send + Sync + 'static> TreeKey for Arc<T> {
     }
 
     fn take(slot: &Self::Slot) -> Self {
-        let ptr = slot.swap(ptr::null_mut(), Ordering::AcqRel);
+        let ptr = slot
+            .ptr
+            .swap(ptr::null_mut(), Ordering::AcqRel)
+            .map_addr(|a| a & !HAS_PREFIX);
         assert!(!ptr.is_null(), "take from an empty key slot");
         // SAFETY: the slot owned one strong count. It moves to the returned Arc.
         unsafe { Arc::from_raw(ptr) }
     }
 
     fn clear(slot: &Self::Slot) {
-        slot.store(ptr::null_mut(), Ordering::Release);
+        slot.ptr.store(ptr::null_mut(), Ordering::Release);
+    }
+
+    fn slot_prefix(slot: &Self::Slot) -> Option<u64> {
+        let prefix = slot.prefix.load(Ordering::Acquire);
+        (slot.ptr.load(Ordering::Acquire).addr() & HAS_PREFIX != 0).then_some(prefix)
     }
 }
 
@@ -293,7 +348,16 @@ enum Target<'q, Q: ?Sized> {
     Before(&'q Q),
 }
 
-impl<Q: Ord + ?Sized> Target<'_, Q> {
+impl<Q: Ord + KeyPrefix + ?Sized> Target<'_, Q> {
+    fn prefix(&self) -> Option<u64> {
+        match self {
+            Target::First | Target::Last => None,
+            Target::AtOrAfter(q) | Target::After(q) | Target::UpTo(q) | Target::Before(q) => {
+                q.prefix()
+            }
+        }
+    }
+
     fn is_forward(&self) -> bool {
         matches!(
             self,
@@ -302,43 +366,70 @@ impl<Q: Ord + ?Sized> Target<'_, Q> {
     }
 
     /// Index of the child to go down to, from the separators `keys[..count]`.
-    fn child_index<K: TreeKey + Borrow<Q>>(&self, keys: &[K::Slot], count: usize) -> Option<usize> {
+    /// `prefix` is `self.prefix()`.
+    fn child_index<K: TreeKey + Borrow<Q>>(
+        &self,
+        keys: &[K::Slot],
+        count: usize,
+        prefix: Option<u64>,
+    ) -> Option<usize> {
         match self {
             Target::First => Some(0),
             Target::Last => Some(count),
             Target::AtOrAfter(q) | Target::UpTo(q) | Target::Before(q) => {
-                partition::<K>(keys, count, |k| k.borrow() < *q)
+                partition::<K>(keys, count, prefix, |k| k.borrow() < *q)
             }
-            Target::After(q) => partition::<K>(keys, count, |k| k.borrow() <= *q),
+            Target::After(q) => partition::<K>(keys, count, prefix, |k| k.borrow() <= *q),
         }
     }
 
     /// For a forward target, the index of the first match in `keys[..count]`, or `count`.
     /// For a backward target, one past the index of the last match, or `0`.
-    fn leaf_split<K: TreeKey + Borrow<Q>>(&self, keys: &[K::Slot], count: usize) -> Option<usize> {
+    /// `prefix` is `self.prefix()`.
+    fn leaf_split<K: TreeKey + Borrow<Q>>(
+        &self,
+        keys: &[K::Slot],
+        count: usize,
+        prefix: Option<u64>,
+    ) -> Option<usize> {
         match self {
             Target::First => Some(0),
             Target::Last => Some(count),
             Target::AtOrAfter(q) | Target::Before(q) => {
-                partition::<K>(keys, count, |k| k.borrow() < *q)
+                partition::<K>(keys, count, prefix, |k| k.borrow() < *q)
             }
-            Target::After(q) | Target::UpTo(q) => partition::<K>(keys, count, |k| k.borrow() <= *q),
+            Target::After(q) | Target::UpTo(q) => {
+                partition::<K>(keys, count, prefix, |k| k.borrow() <= *q)
+            }
         }
     }
 }
 
 /// Index of the first key in `keys[..count]` for which `is_left` is false. `None` means
 /// that a slot was empty, so the node changed under the reader.
+///
+/// `probe_prefix` is the [`KeyPrefix`] of the searched key. When the prefix of a slot
+/// differs from it, the order of the prefixes decides, and the key is not read. This is
+/// correct for both `k < q` and `k <= q`, because different prefixes mean `k != q`.
 fn partition<K: TreeKey>(
     keys: &[K::Slot],
     count: usize,
+    probe_prefix: Option<u64>,
     is_left: impl Fn(&K) -> bool,
 ) -> Option<usize> {
     let mut lo = 0;
     let mut hi = count;
     while lo < hi {
         let mid = (lo + hi) / 2;
-        if K::read(&keys[mid], &is_left)? {
+        let by_prefix = match (probe_prefix, K::slot_prefix(&keys[mid])) {
+            (Some(probe), Some(slot)) if slot != probe => Some(slot < probe),
+            _ => None,
+        };
+        let left = match by_prefix {
+            Some(left) => left,
+            None => K::read(&keys[mid], &is_left)?,
+        };
+        if left {
             lo = mid + 1;
         } else {
             hi = mid;
@@ -461,11 +552,12 @@ impl<K: TreeKey, V: TreeValue, A: ConcurrentAllocator> BPlusTreeMap<K, V, A> {
     pub fn get<Q>(&self, key: &Q) -> Option<Entry<'_, K, V, A>>
     where
         K: Borrow<Q>,
-        Q: Ord + ?Sized,
+        Q: Ord + KeyPrefix + ?Sized,
     {
         let _guard = epoch::pin();
+        let prefix = key.prefix();
         loop {
-            match self.try_get(key) {
+            match self.try_get(key, prefix) {
                 Ok(entry) => return entry,
                 Err(Restart) => continue,
             }
@@ -475,7 +567,7 @@ impl<K: TreeKey, V: TreeValue, A: ConcurrentAllocator> BPlusTreeMap<K, V, A> {
     pub fn contains_key<Q>(&self, key: &Q) -> bool
     where
         K: Borrow<Q>,
-        Q: Ord + ?Sized,
+        Q: Ord + KeyPrefix + ?Sized,
     {
         self.get(key).is_some()
     }
@@ -492,7 +584,7 @@ impl<K: TreeKey, V: TreeValue, A: ConcurrentAllocator> BPlusTreeMap<K, V, A> {
     pub fn lower_bound<Q>(&self, bound: Bound<&Q>) -> Option<Entry<'_, K, V, A>>
     where
         K: Borrow<Q>,
-        Q: Ord + ?Sized,
+        Q: Ord + KeyPrefix + ?Sized,
     {
         self.range::<Q, _>((bound, Bound::Unbounded)).next()
     }
@@ -501,7 +593,7 @@ impl<K: TreeKey, V: TreeValue, A: ConcurrentAllocator> BPlusTreeMap<K, V, A> {
     pub fn upper_bound<Q>(&self, bound: Bound<&Q>) -> Option<Entry<'_, K, V, A>>
     where
         K: Borrow<Q>,
-        Q: Ord + ?Sized,
+        Q: Ord + KeyPrefix + ?Sized,
     {
         self.range::<Q, _>((Bound::Unbounded, bound)).next_back()
     }
@@ -514,7 +606,7 @@ impl<K: TreeKey, V: TreeValue, A: ConcurrentAllocator> BPlusTreeMap<K, V, A> {
     where
         K: Borrow<Q>,
         R: RangeBounds<Q>,
-        Q: Ord + ?Sized,
+        Q: Ord + KeyPrefix + ?Sized,
     {
         Range {
             map: self,
@@ -530,7 +622,7 @@ impl<K: TreeKey, V: TreeValue, A: ConcurrentAllocator> BPlusTreeMap<K, V, A> {
     pub fn for_each_from<Q>(&self, start: Bound<&Q>, mut f: impl FnMut(&K, &V) -> bool)
     where
         K: Borrow<Q>,
-        Q: Ord + ?Sized,
+        Q: Ord + KeyPrefix + ?Sized,
     {
         let _guard = epoch::pin();
         let mut next = match start {
@@ -596,7 +688,7 @@ impl<K: TreeKey, V: TreeValue, A: ConcurrentAllocator> BPlusTreeMap<K, V, A> {
     pub fn remove<Q>(&self, key: &Q) -> Option<Entry<'_, K, V, A>>
     where
         K: Borrow<Q>,
-        Q: Ord + ?Sized,
+        Q: Ord + KeyPrefix + ?Sized,
     {
         self.remove_if(key, |_| true)
     }
@@ -608,19 +700,23 @@ impl<K: TreeKey, V: TreeValue, A: ConcurrentAllocator> BPlusTreeMap<K, V, A> {
         }
     }
 
-    fn try_get<Q>(&self, key: &Q) -> Result<Option<Entry<'_, K, V, A>>, Restart>
+    fn try_get<Q>(
+        &self,
+        key: &Q,
+        prefix: Option<u64>,
+    ) -> Result<Option<Entry<'_, K, V, A>>, Restart>
     where
         K: Borrow<Q>,
-        Q: Ord + ?Sized,
+        Q: Ord + KeyPrefix + ?Sized,
     {
         let target = Target::AtOrAfter(key);
-        let Some(visit) = self.find_leaf(&target)? else {
+        let Some(visit) = self.find_leaf(&target, prefix)? else {
             return Ok(None);
         };
         // SAFETY: nodes live as long as the tree.
         let leaf = unsafe { &*visit.leaf };
         let index = target
-            .leaf_split::<K>(&leaf.keys, visit.count)
+            .leaf_split::<K>(&leaf.keys, visit.count, prefix)
             .ok_or(Restart)?;
         let is_match = index < visit.count
             && K::read(&leaf.keys[index], |k| k.borrow() == key).ok_or(Restart)?;
@@ -651,10 +747,14 @@ impl<K: TreeKey, V: TreeValue, A: ConcurrentAllocator> BPlusTreeMap<K, V, A> {
     }
 
     /// Goes from the root to the leaf where `target` belongs. `None` means an empty tree.
-    fn find_leaf<Q>(&self, target: &Target<'_, Q>) -> Result<Option<LeafVisit<K, V>>, Restart>
+    fn find_leaf<Q>(
+        &self,
+        target: &Target<'_, Q>,
+        prefix: Option<u64>,
+    ) -> Result<Option<LeafVisit<K, V>>, Restart>
     where
         K: Borrow<Q>,
-        Q: Ord + ?Sized,
+        Q: Ord + KeyPrefix + ?Sized,
     {
         let root = self.root.load(Ordering::Acquire);
         if root.is_null() {
@@ -672,7 +772,9 @@ impl<K: TreeKey, V: TreeValue, A: ConcurrentAllocator> BPlusTreeMap<K, V, A> {
             // SAFETY: `is_leaf` is false, so the node is an `Inner`.
             let inner = unsafe { &*ptr::from_ref(node).cast::<Inner<K>>() };
             let count = node.count(INNER_CAPACITY);
-            let index = target.child_index::<K>(&inner.keys, count).ok_or(Restart)?;
+            let index = target
+                .child_index::<K>(&inner.keys, count, prefix)
+                .ok_or(Restart)?;
             let child = inner.children[index].load(Ordering::Acquire);
             node.check(version)?;
             if child.is_null() {
@@ -709,36 +811,44 @@ impl<K: TreeKey, V: TreeValue, A: ConcurrentAllocator> BPlusTreeMap<K, V, A> {
     fn seek<Q>(&self, target: Target<'_, Q>) -> Option<Position<K, V>>
     where
         K: Borrow<Q>,
-        Q: Ord + ?Sized,
+        Q: Ord + KeyPrefix + ?Sized,
     {
-        let mut fence: Option<K> = None;
+        let prefix = target.prefix();
+        let mut fence: Option<(K, Option<u64>)> = None;
         loop {
             let attempt = match (&fence, target.is_forward()) {
-                (None, _) => self.try_seek(&target),
-                (Some(f), true) => self.try_seek::<K>(&Target::After(f)),
-                (Some(f), false) => self.try_seek::<K>(&Target::UpTo(f)),
+                (None, _) => self.try_seek(&target, prefix),
+                (Some((f, p)), true) => self.try_seek::<K>(&Target::After(f), *p),
+                (Some((f, p)), false) => self.try_seek::<K>(&Target::UpTo(f), *p),
             };
             match attempt {
                 Ok(Seek::Found(pos)) => return Some(pos),
                 Ok(Seek::End) => return None,
-                Ok(Seek::Continue(key)) => fence = Some(key),
+                Ok(Seek::Continue(key)) => {
+                    let p = key.prefix();
+                    fence = Some((key, p));
+                }
                 Err(Restart) => continue,
             }
         }
     }
 
-    fn try_seek<Q>(&self, target: &Target<'_, Q>) -> Result<Seek<K, V>, Restart>
+    fn try_seek<Q>(
+        &self,
+        target: &Target<'_, Q>,
+        prefix: Option<u64>,
+    ) -> Result<Seek<K, V>, Restart>
     where
         K: Borrow<Q>,
-        Q: Ord + ?Sized,
+        Q: Ord + KeyPrefix + ?Sized,
     {
-        let Some(visit) = self.find_leaf(target)? else {
+        let Some(visit) = self.find_leaf(target, prefix)? else {
             return Ok(Seek::End);
         };
         // SAFETY: nodes live as long as the tree.
         let leaf = unsafe { &*visit.leaf };
         let split = target
-            .leaf_split::<K>(&leaf.keys, visit.count)
+            .leaf_split::<K>(&leaf.keys, visit.count, prefix)
             .ok_or(Restart)?;
         let (found, fence) = if target.is_forward() {
             ((split < visit.count).then_some(split), visit.high)
@@ -846,6 +956,7 @@ impl<K: TreeKey, V: TreeValue, A: ConcurrentAllocator> BPlusTreeMap<K, V, A> {
         let mut parent: Option<(&Header, u64)> = None;
         let mut rightmost = true;
         let target = Target::AtOrAfter(key);
+        let prefix = key.prefix();
         while !node.is_leaf {
             // SAFETY: `is_leaf` is false, so the node is an `Inner`.
             let inner = unsafe { &*ptr::from_ref(node).cast::<Inner<K>>() };
@@ -877,7 +988,9 @@ impl<K: TreeKey, V: TreeValue, A: ConcurrentAllocator> BPlusTreeMap<K, V, A> {
             if let Some((p, pv)) = parent {
                 p.check(pv)?;
             }
-            let index = target.child_index::<K>(&inner.keys, count).ok_or(Restart)?;
+            let index = target
+                .child_index::<K>(&inner.keys, count, prefix)
+                .ok_or(Restart)?;
             let child = inner.children[index].load(Ordering::Acquire);
             node.check(version)?;
             if child.is_null() {
@@ -892,7 +1005,9 @@ impl<K: TreeKey, V: TreeValue, A: ConcurrentAllocator> BPlusTreeMap<K, V, A> {
         // SAFETY: `is_leaf` is true.
         let leaf = unsafe { &*ptr::from_ref(node).cast::<Leaf<K, V>>() };
         let count = node.count(LEAF_CAPACITY);
-        let index = target.leaf_split::<K>(&leaf.keys, count).ok_or(Restart)?;
+        let index = target
+            .leaf_split::<K>(&leaf.keys, count, prefix)
+            .ok_or(Restart)?;
         let is_match = index < count && K::read(&leaf.keys[index], |k| k == key).ok_or(Restart)?;
         if is_match && !replace {
             let entry = self.entry_at(Position {
@@ -1117,11 +1232,12 @@ impl<K: TreeKey, V: TreeValue, A: ConcurrentAllocator> BPlusTreeMap<K, V, A> {
     ) -> Option<Entry<'_, K, V, A>>
     where
         K: Borrow<Q>,
-        Q: Ord + ?Sized,
+        Q: Ord + KeyPrefix + ?Sized,
     {
         let guard = epoch::pin();
+        let prefix = key.prefix();
         loop {
-            match self.try_remove_once(key, &matches, &guard) {
+            match self.try_remove_once(key, prefix, &matches, &guard) {
                 Ok(removed) => {
                     if removed.is_some() {
                         self.len.fetch_sub(1, Ordering::Relaxed);
@@ -1136,21 +1252,24 @@ impl<K: TreeKey, V: TreeValue, A: ConcurrentAllocator> BPlusTreeMap<K, V, A> {
     fn try_remove_once<Q>(
         &self,
         key: &Q,
+        prefix: Option<u64>,
         matches: &impl Fn(&V::Slot) -> bool,
         guard: &epoch::Guard,
     ) -> Result<Option<Entry<'_, K, V, A>>, Restart>
     where
         K: Borrow<Q>,
-        Q: Ord + ?Sized,
+        Q: Ord + KeyPrefix + ?Sized,
     {
         let target = Target::AtOrAfter(key);
-        let Some(visit) = self.find_leaf(&target)? else {
+        let Some(visit) = self.find_leaf(&target, prefix)? else {
             return Ok(None);
         };
         // SAFETY: nodes live as long as the tree.
         let leaf = unsafe { &*visit.leaf };
         let count = visit.count;
-        let index = target.leaf_split::<K>(&leaf.keys, count).ok_or(Restart)?;
+        let index = target
+            .leaf_split::<K>(&leaf.keys, count, prefix)
+            .ok_or(Restart)?;
         let is_match = index < count
             && K::read(&leaf.keys[index], |k| k.borrow() == key).ok_or(Restart)?
             && matches(&leaf.values[index]);
@@ -1441,7 +1560,7 @@ where
     V: TreeValue,
     A: ConcurrentAllocator,
     R: RangeBounds<Q>,
-    Q: Ord + ?Sized,
+    Q: Ord + KeyPrefix + ?Sized,
 {
     fn advance(&mut self, forward: bool) -> Option<Entry<'a, K, V, A>> {
         if let Some(entry) = self.next_from_batch(forward) {
@@ -1632,7 +1751,7 @@ where
     V: TreeValue,
     A: ConcurrentAllocator,
     R: RangeBounds<Q>,
-    Q: Ord + ?Sized,
+    Q: Ord + KeyPrefix + ?Sized,
 {
     type Item = Entry<'a, K, V, A>;
 
@@ -1647,7 +1766,7 @@ where
     V: TreeValue,
     A: ConcurrentAllocator,
     R: RangeBounds<Q>,
-    Q: Ord + ?Sized,
+    Q: Ord + KeyPrefix + ?Sized,
 {
     fn next_back(&mut self) -> Option<Self::Item> {
         self.advance(false)
