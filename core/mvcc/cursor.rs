@@ -1,5 +1,4 @@
 use crate::alloc::{ConcurrentAllocator, TryReserveError, TursoAllocator};
-use crate::skiplist::{comparator::BasicComparator, map::Entry};
 use crate::turso_assert;
 use crate::types::IOResultOr;
 
@@ -338,7 +337,7 @@ pub enum MvccCursorType {
 }
 
 pub(crate) type MvccEntry<'l, T, A = TursoAllocator> =
-    Entry<'l, T, RowVersions<A>, BasicComparator, A>;
+    crate::bplus_tree::Entry<'l, T, RowVersions<A>, A>;
 
 pub(crate) type MvccIterator<'l, T, A = TursoAllocator> =
     Box<dyn Iterator<Item = MvccEntry<'l, T, A>> + Send + Sync>;
@@ -441,11 +440,14 @@ impl<A: ConcurrentAllocator> IndexShadowScan<A> {
         mut iter: MvccIterator<'static, Arc<SortableIndexKey>, A>,
     ) -> IndexShadowScanState<A> {
         match iter.next() {
-            Some(entry) => IndexShadowScanState::Peeked {
-                key: entry.key().clone(),
-                versions: entry.value().clone(),
-                iter,
-            },
+            Some(entry) => {
+                let (key, versions) = entry.into_key_value();
+                IndexShadowScanState::Peeked {
+                    key,
+                    versions,
+                    iter,
+                }
+            }
             None => IndexShadowScanState::Exhausted,
         }
     }

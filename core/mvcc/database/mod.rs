@@ -2,6 +2,7 @@ use crate::alloc::{
     ConcurrentAllocator, DynAllocator, DynVec, TryReserveError, TursoAllocator,
     TursoTryWithCapacityExt, TursoVecInExt, ALLOC_ERR_MSG,
 };
+use crate::bplus_tree::{BPlusTreeMap, Entry as TreeEntry};
 use crate::mvcc::clock::LogicalClock;
 use crate::mvcc::cursor::{static_iterator_hack, MvccIterator};
 #[cfg(any(test, injected_yields))]
@@ -58,6 +59,7 @@ use std::ops::Bound;
 use strum::EnumCount;
 use tracing::instrument;
 use tracing::Level;
+use tx_map::TxMap;
 
 pub mod checkpoint_state_machine;
 pub use checkpoint_state_machine::{
@@ -65,6 +67,7 @@ pub use checkpoint_state_machine::{
 };
 
 mod group_commit;
+mod tx_map;
 pub(crate) use group_commit::{CommitCoordinator, GroupBatch, GroupWork};
 
 #[cfg(feature = "conn_raw_api")]
@@ -149,9 +152,9 @@ impl<A: ConcurrentAllocator> RowVersionAllocator for A {
 
 pub type RowVersionChain<A = TursoAllocator> = <A as RowVersionAllocator>::RowVersionChain;
 pub type RowVersions<A = TursoAllocator> = Arc<RwLock<RowVersionChain<A>>>;
-type TableRowEntry<'a, A = TursoAllocator> = Entry<'a, RowID, RowVersions<A>, BasicComparator, A>;
+type TableRowEntry<'a, A = TursoAllocator> = TreeEntry<'a, RowID, RowVersions<A>, A>;
 type IndexRowEntry<'a, A = TursoAllocator> =
-    Entry<'a, Arc<SortableIndexKey>, RowVersions<A>, BasicComparator, A>;
+    TreeEntry<'a, Arc<SortableIndexKey>, RowVersions<A>, A>;
 type IndexRowsEntry<'a, A = TursoAllocator> =
     Entry<'a, MVTableId, IndexRowsMap<A>, BasicComparator, A>;
 type TableRowIterator<'a, A = TursoAllocator> =
@@ -161,8 +164,7 @@ type IndexRowIterator<'a, A = TursoAllocator> =
 
 /// Per-index map of sortable keys to their version chains, stored as the
 /// values of [`MvStore::index_rows`].
-pub type IndexRowsMap<A = TursoAllocator> =
-    SkipMap<Arc<SortableIndexKey>, RowVersions<A>, BasicComparator, A>;
+pub type IndexRowsMap<A = TursoAllocator> = BPlusTreeMap<Arc<SortableIndexKey>, RowVersions<A>, A>;
 
 impl MVTableId {
     pub fn new(value: i64) -> Self {
@@ -287,6 +289,85 @@ impl SortableIndexKey {
     }
 }
 
+/// The prefix of an index key comes from its first column. It keeps the order of
+/// [`crate::types::cmp_in_column`]: the type class (NULL, number, text, blob) in the top
+/// two bits, then a summary of the value, then the sort order and the NULL order.
+impl crate::bplus_tree::KeyPrefix for SortableIndexKey {
+    fn prefix(&self) -> Option<u64> {
+        if self.metadata.num_cols == 0 {
+            return None;
+        }
+        let key_info = self.metadata.key_info.first()?;
+        let value = self.key.iter().ok()?.next()?.ok()?;
+        Some(index_value_prefix(&value, key_info))
+    }
+}
+
+fn index_value_prefix(value: &ValueRef, key_info: &crate::types::KeyInfo) -> u64 {
+    use crate::translate::collate::CollationSeq;
+    use turso_parser::ast::{NullsOrder, SortOrder};
+    let (class, summary) = match value {
+        ValueRef::Null => {
+            return match (key_info.nulls_order, key_info.sort_order) {
+                (Some(NullsOrder::First), _) | (None, SortOrder::Asc) => 0,
+                (Some(NullsOrder::Last), _) | (None, SortOrder::Desc) => u64::MAX,
+            };
+        }
+        ValueRef::Numeric(number) => (1, number_summary(number)),
+        ValueRef::Text(text) => {
+            let bytes = text.value.as_bytes();
+            let summary = match key_info.collation {
+                CollationSeq::Unset | CollationSeq::Binary | CollationSeq::Custom(_) => {
+                    leading_bytes(bytes.iter().copied())
+                }
+                CollationSeq::NoCase => leading_bytes(
+                    bytes
+                        .iter()
+                        .take_while(|&&b| b != 0)
+                        .map(|b| b.to_ascii_lowercase()),
+                ),
+                CollationSeq::Rtrim | CollationSeq::Locale(_) => 0,
+            };
+            (2, summary)
+        }
+        ValueRef::Blob(bytes) => (3, leading_bytes(bytes.iter().copied())),
+    };
+    let ascending = (class << 62) | summary;
+    match key_info.sort_order {
+        SortOrder::Asc => ascending,
+        SortOrder::Desc => !ascending,
+    }
+}
+
+/// A 62-bit summary that keeps numeric order: the bits of the value as an f64, changed
+/// so that unsigned order is numeric order, without the two lowest bits. The f64 of an
+/// integer is the nearest f64, so a smaller summary still means a smaller number.
+fn number_summary(number: &crate::numeric::Numeric) -> u64 {
+    let value = match number {
+        crate::numeric::Numeric::Integer(i) => *i as f64,
+        crate::numeric::Numeric::Float(f) => f64::from(*f),
+    };
+    let value = if value == 0.0 { 0.0 } else { value };
+    let bits = value.to_bits();
+    let ordered = if bits >> 63 == 1 {
+        !bits
+    } else {
+        bits | (1 << 63)
+    };
+    ordered >> 2
+}
+
+/// The first 7 bytes, big-endian, padded with zeros: 56 bits.
+fn leading_bytes(bytes: impl Iterator<Item = u8>) -> u64 {
+    let mut summary = 0u64;
+    let mut taken = 0;
+    for b in bytes.take(7) {
+        summary = (summary << 8) | u64::from(b);
+        taken += 1;
+    }
+    summary << (8 * (7 - taken))
+}
+
 impl PartialEq for SortableIndexKey {
     fn eq(&self, other: &Self) -> bool {
         if self.key.get_payload() == other.key.get_payload() {
@@ -352,6 +433,55 @@ impl RowID {
     pub fn new(table_id: MVTableId, row_id: RowKey) -> Self {
         Self { table_id, row_id }
     }
+}
+
+impl crate::bplus_tree::KeyPrefix for RowID {}
+
+/// Node storage for a table row key. Table row keys are always integer rowids.
+#[derive(Default)]
+pub struct RowIdSlot {
+    table_id: std::sync::atomic::AtomicI64,
+    row_id: std::sync::atomic::AtomicI64,
+}
+
+// SAFETY: both fields are atomics, zero is a valid value, and any mix of the two
+// fields is a valid `RowID` with an integer rowid.
+unsafe impl crate::bplus_tree::TreeKey for RowID {
+    type Slot = RowIdSlot;
+
+    const NEEDS_DEFERRED_DROP: bool = false;
+
+    fn write(slot: &Self::Slot, key: Self) {
+        let RowKey::Int(row_id) = key.row_id else {
+            panic!("table row keys are integer rowids");
+        };
+        slot.table_id.store(key.table_id.0, Ordering::Release);
+        slot.row_id.store(row_id, Ordering::Release);
+    }
+
+    fn move_from(slot: &Self::Slot, from: &Self::Slot) {
+        slot.table_id
+            .store(from.table_id.load(Ordering::Acquire), Ordering::Release);
+        slot.row_id
+            .store(from.row_id.load(Ordering::Acquire), Ordering::Release);
+    }
+
+    fn read<R>(slot: &Self::Slot, f: impl FnOnce(&Self) -> R) -> Option<R> {
+        let key = RowID {
+            table_id: MVTableId(slot.table_id.load(Ordering::Acquire)),
+            row_id: RowKey::Int(slot.row_id.load(Ordering::Acquire)),
+        };
+        Some(f(&key))
+    }
+
+    fn take(slot: &Self::Slot) -> Self {
+        RowID {
+            table_id: MVTableId(slot.table_id.load(Ordering::Acquire)),
+            row_id: RowKey::Int(slot.row_id.load(Ordering::Acquire)),
+        }
+    }
+
+    fn clear(_slot: &Self::Slot) {}
 }
 
 #[derive(Clone, Debug, PartialEq, PartialOrd)]
@@ -4320,7 +4450,7 @@ pub(crate) struct GcDebugSnapshot {
 /// A multi-version concurrency control database.
 #[derive(Debug)]
 pub struct MvStore<Clock: LogicalClock, A: ConcurrentAllocator = TursoAllocator> {
-    pub rows: SkipMap<RowID, RowVersions<A>, BasicComparator, A>,
+    pub rows: BPlusTreeMap<RowID, RowVersions<A>, A>,
     /// Table ID is an opaque identifier that is only meaningful to the MV store.
     /// Each checkpointed MVCC table corresponds to a single B-tree on the pager,
     /// which naturally has a root page.
@@ -4346,7 +4476,7 @@ pub struct MvStore<Clock: LogicalClock, A: ConcurrentAllocator = TursoAllocator>
     /// a key inserted at or behind an already-positioned scan would otherwise
     /// be skipped (#7578).
     index_rows_epoch: AtomicU64,
-    txs: SkipMap<TxID, Transaction<A>, BasicComparator, A>,
+    txs: TxMap<Arc<Transaction<A>>>,
     /// Final state for removed transactions. Readers may still race with stale TxID
     /// references in row versions after a transaction is removed from `txs`.
     finalized_tx_states: SkipMap<TxID, TransactionState, BasicComparator, A>,
@@ -4568,11 +4698,11 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         // table id 1 / root page 1 is always sqlite_schema.
         table_id_to_rootpage.try_insert(SQLITE_SCHEMA_MVCC_TABLE_ID, RootEntry::live(Some(1)))?;
         Ok(Self {
-            rows: SkipMap::new_in(alloc.clone()),
+            rows: BPlusTreeMap::new_in(alloc.clone()),
             table_id_to_rootpage,
             index_rows: SkipMap::new_in(alloc.clone()),
             index_rows_epoch: AtomicU64::new(0),
-            txs: SkipMap::new_in(alloc.clone()),
+            txs: TxMap::new(),
             finalized_tx_states: SkipMap::new_in(alloc.clone()),
             alloc,
             logical_log_alloc,
@@ -5601,10 +5731,9 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                 let RowKey::Record(sortable_key) = id.row_id.clone() else {
                     panic!("Index deletes must have a record row_id");
                 };
-                if let Some(ref row_versions_entry) = rows.get(&sortable_key) {
+                if let Some(row_versions_entry) = rows.get(&sortable_key) {
                     // Get the Arc key from the map entry for savepoint tracking
-                    let arc_key = row_versions_entry.key().clone();
-                    let row_versions = row_versions_entry.value().clone();
+                    let (arc_key, row_versions) = row_versions_entry.into_key_value();
                     for rv in row_versions.write().iter_mut().rev() {
                         let tx = self
                             .txs
@@ -5641,8 +5770,8 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
             }
             None => {
                 let row_versions_opt = self.rows.get(&id);
-                if let Some(ref row_versions_entry) = row_versions_opt {
-                    let row_versions = row_versions_entry.value().clone();
+                if let Some(row_versions_entry) = row_versions_opt {
+                    let row_versions = row_versions_entry.into_value();
                     let mut locked_row_versions = row_versions.write();
                     for rv in locked_row_versions.iter_mut().rev() {
                         let tx = self
@@ -5667,7 +5796,6 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                         let version_id = rv.id;
                         rv.set_end(Some(TxTimestampOrID::TxID(tx.tx_id)));
                         drop(locked_row_versions);
-                        drop(row_versions_opt);
                         let tx = self
                             .txs
                             .get(&tx_id)
@@ -5890,7 +6018,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
             }
 
             // We found a row, let's check if it's visible to the transaction.
-            if let Some((row_id, versions, _)) = self.find_last_visible_version(tx, &row, false) {
+            if let Some((row_id, versions, _)) = self.find_last_visible_version(tx, row, false) {
                 return Some((row_id, versions));
             }
             // If this row is not visible, continue to the next row
@@ -6086,12 +6214,11 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
     fn find_last_visible_version(
         &self,
         tx: &Transaction<A>,
-        row: &TableRowEntry<'_, A>,
+        row: TableRowEntry<'_, A>,
         take_payload: bool,
     ) -> Option<(RowID, RowVersions<A>, Option<Row>)> {
-        let versions_arc = row.value();
         let payload = {
-            let versions = versions_arc.read();
+            let versions = row.value().read();
             if self.btree_covers_chain_for_tx(tx, row.key().table_id, &versions) {
                 return None;
             }
@@ -6101,7 +6228,8 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                 .find(|version| version.is_visible_to(tx, &self.txs, &self.finalized_tx_states))?;
             take_payload.then(|| occupying.row.clone())
         };
-        Some((row.key().clone(), versions_arc.clone(), payload))
+        let (row_id, versions) = row.into_key_value();
+        Some((row_id, versions, payload))
     }
 
     fn find_last_visible_index_version(
@@ -6147,7 +6275,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
             if row.key().table_id != table_id {
                 return None;
             }
-            if let Some(visible_row) = self.find_last_visible_version(tx, &row, take_payload) {
+            if let Some(visible_row) = self.find_last_visible_version(tx, row, take_payload) {
                 return Some(visible_row);
             }
         }
@@ -6417,7 +6545,13 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                     .expect("global_header initialized above");
                 self.txs.insert(
                     tx_id,
-                    Transaction::new(tx_id, ts, header, read_mark, schema_generation),
+                    Arc::new(Transaction::new(
+                        tx_id,
+                        ts,
+                        header,
+                        read_mark,
+                        schema_generation,
+                    )),
                 );
             });
             if schema_stale {
@@ -6647,7 +6781,13 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                 .expect("global_header initialized above");
             self.txs.insert(
                 tx_id,
-                Transaction::new(tx_id, ts, header, read_mark, schema_generation),
+                Arc::new(Transaction::new(
+                    tx_id,
+                    ts,
+                    header,
+                    read_mark,
+                    schema_generation,
+                )),
             );
         });
         if schema_stale {
@@ -6671,7 +6811,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
 
     #[turso_macros::allocation_site(crate::alloc::MvStoreAllocationSite::TxInsert)]
     fn insert_tx_entry(&self, tx_id: TxID, tx: Transaction<A>) -> Result<(), TryReserveError> {
-        self.txs.try_insert(tx_id, tx)?;
+        self.txs.insert(tx_id, Arc::new(tx));
         Ok(())
     }
 
@@ -8430,7 +8570,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                 A,
             >>::new_in(alloc)))
         })?;
-        Ok(versions.value().clone())
+        Ok(versions.into_value())
     }
 
     /// Gets an existing Arc<SortableIndexKey> from the index if the key exists,
@@ -8465,8 +8605,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
             let entry = self.get_or_create_index_key_entry(index, key.clone())?;
             // SkipMap may keep our Arc (miss) or a pre-existing one (hit); return that
             // canonical Arc so savepoint tracking and the map stay in sync.
-            let canonical_key = entry.key().clone();
-            let row_versions = entry.value().clone();
+            let (canonical_key, row_versions) = entry.into_key_value();
             let mut versions = row_versions.write();
             if !self.index_versions_still_mapped(index, canonical_key.as_ref(), &row_versions) {
                 continue;
@@ -8496,7 +8635,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         let alloc = self.alloc.clone();
         let index = self
             .index_rows
-            .try_get_or_insert_with(index_id, move || SkipMap::new_in(alloc))?;
+            .try_get_or_insert_with(index_id, move || BPlusTreeMap::new_in(alloc))?;
         Ok(index)
     }
 
@@ -8697,14 +8836,11 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                 tracing::trace!("get_last_table_rowid: reached end of table");
                 return None;
             }
-            if let Some(_visible_row) = self.find_last_visible_version(tx, &entry, false) {
-                tracing::trace!(
-                    "get_last_table_rowid: found visible row: {:?}",
-                    _visible_row
-                );
+            if let Some(visible_row) = self.find_last_visible_version(tx, entry, false) {
+                tracing::trace!("get_last_table_rowid: found visible row: {:?}", visible_row);
                 // There is a visible version for this rowid, so we return it
-                return Some(RowKey::Int(match &entry.key().row_id {
-                    RowKey::Int(i) => *i,
+                return Some(RowKey::Int(match visible_row.0.row_id {
+                    RowKey::Int(i) => i,
                     _ => panic!("Expected RowKey::Int for table rowid"),
                 }));
             }
@@ -10399,7 +10535,7 @@ pub fn create_seek_range<K: Ord>(
 /// Ref: https://www.cs.cmu.edu/~15721-f24/papers/Hekaton.pdf , page 301,
 /// 2.6. Updating a Version.
 fn is_write_write_conflict<A: ConcurrentAllocator>(
-    txs: &SkipMap<TxID, Transaction<A>, BasicComparator, A>,
+    txs: &TxMap<Arc<Transaction<A>>>,
     finalized_tx_states: &SkipMap<TxID, TransactionState, BasicComparator, A>,
     tx: &Transaction<A>,
     rv: &RowVersion,
@@ -10518,7 +10654,7 @@ impl RowVersion {
     fn is_visible_to<A: ConcurrentAllocator>(
         &self,
         tx: &Transaction<A>,
-        txs: &SkipMap<TxID, Transaction<A>, BasicComparator, A>,
+        txs: &TxMap<Arc<Transaction<A>>>,
         finalized_tx_states: &SkipMap<TxID, TransactionState, BasicComparator, A>,
     ) -> bool {
         is_begin_visible(txs, finalized_tx_states, tx, self)
@@ -10536,7 +10672,7 @@ impl RowVersion {
     fn is_btree_invalidating_version<A: ConcurrentAllocator>(
         &self,
         tx: &Transaction<A>,
-        txs: &SkipMap<TxID, Transaction<A>, BasicComparator, A>,
+        txs: &TxMap<Arc<Transaction<A>>>,
         finalized_tx_states: &SkipMap<TxID, TransactionState, BasicComparator, A>,
     ) -> bool {
         // If the version is fully visible, it invalidates the B-tree
@@ -10598,7 +10734,7 @@ impl RowVersion {
 /// The lock on `commit_dep_set` serializes with the drain in commit/abort
 /// resolution, preventing the race where we push an entry after the drain.
 fn register_commit_dependency<A: ConcurrentAllocator>(
-    txs: &SkipMap<TxID, Transaction<A>, BasicComparator, A>,
+    txs: &TxMap<Arc<Transaction<A>>>,
     dependent_tx: &Transaction<A>,
     depended_on_tx_id: TxID,
 ) {
@@ -10656,7 +10792,7 @@ fn register_commit_dependency<A: ConcurrentAllocator>(
 }
 
 fn lookup_tx_state<A: ConcurrentAllocator>(
-    txs: &SkipMap<TxID, Transaction<A>, BasicComparator, A>,
+    txs: &TxMap<Arc<Transaction<A>>>,
     finalized_tx_states: &SkipMap<TxID, TransactionState, BasicComparator, A>,
     tx_id: TxID,
 ) -> Option<TransactionState> {
@@ -10683,7 +10819,7 @@ fn lookup_finalized_tx_state<A: ConcurrentAllocator>(
 }
 
 fn is_begin_visible<A: ConcurrentAllocator>(
-    txs: &SkipMap<TxID, Transaction<A>, BasicComparator, A>,
+    txs: &TxMap<Arc<Transaction<A>>>,
     finalized_tx_states: &SkipMap<TxID, TransactionState, BasicComparator, A>,
     tx: &Transaction<A>,
     rv: &RowVersion,
@@ -10774,7 +10910,7 @@ fn is_begin_visible<A: ConcurrentAllocator>(
 }
 
 fn is_end_visible<A: ConcurrentAllocator>(
-    txs: &SkipMap<TxID, Transaction<A>, BasicComparator, A>,
+    txs: &TxMap<Arc<Transaction<A>>>,
     finalized_tx_states: &SkipMap<TxID, TransactionState, BasicComparator, A>,
     current_tx: &Transaction<A>,
     row_version: &RowVersion,
