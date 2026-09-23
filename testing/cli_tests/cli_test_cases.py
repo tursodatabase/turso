@@ -547,13 +547,40 @@ def test_blob_bytes_are_printed_raw_in_list_mode():
 RUNAWAY_READ = "WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM c) SELECT count(*) FROM c;"
 
 
-def test_ctrl_c_exits_the_shell_while_a_statement_runs():
-    # A statement stopped part-way can leave the connection inconsistent, so Ctrl-C exits
-    # instead of returning to the prompt. The status matches a process killed by SIGINT.
-    console.test("Running test: ctrl-c-exits-the-shell-while-a-statement-runs")
+def test_ctrl_c_interrupts_a_running_read():
+    # A read-only statement outside a transaction holds only its own read transaction, so
+    # stopping it is safe and the shell returns to the prompt, as the sqlite3 shell does.
+    console.test("Running test: ctrl-c-interrupts-a-running-read")
     returncode, output = send_ctrl_c_to_shell(
         setup="", running=RUNAWAY_READ, after="SELECT 42;\n.quit\n"
     )
+    assert returncode == 0, f"expected exit status 0, got {returncode}; output {output!r}"
+    assert b"42" in output, f"expected the shell to answer after the interrupt, got {output!r}"
+
+
+def test_ctrl_c_exits_the_shell_while_a_write_runs():
+    # A statement stopped part-way can leave the connection inconsistent, so Ctrl-C during a
+    # write exits instead of returning to the prompt. The status matches a SIGINT kill.
+    console.test("Running test: ctrl-c-exits-the-shell-while-a-write-runs")
+    returncode, output = send_ctrl_c_to_shell(
+        setup="CREATE TABLE t(x);",
+        running="INSERT INTO t WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM c) SELECT x FROM c;",
+        after="SELECT 42;\n.quit\n",
+    )
+    assert_exited_on_ctrl_c(returncode, output)
+
+
+def test_ctrl_c_exits_the_shell_while_a_read_runs_in_a_write_transaction():
+    console.test("Running test: ctrl-c-exits-the-shell-while-a-read-runs-in-a-write-transaction")
+    returncode, output = send_ctrl_c_to_shell(
+        setup="CREATE TABLE t(x);\nBEGIN;\nINSERT INTO t VALUES (1);",
+        running=RUNAWAY_READ,
+        after="SELECT 42;\n.quit\n",
+    )
+    assert_exited_on_ctrl_c(returncode, output)
+
+
+def assert_exited_on_ctrl_c(returncode, output):
     assert returncode == 130, f"expected exit status 130, got {returncode}; output {output!r}"
     assert b"Interrupted; exiting" in output, f"expected the exit message, got {output!r}"
     assert b"42" not in output, f"the shell must not run input after the interrupt, got {output!r}"
@@ -646,7 +673,9 @@ def main():
     test_tables_with_attached_db()
     test_dbtotxt()
     test_blob_bytes_are_printed_raw_in_list_mode()
-    test_ctrl_c_exits_the_shell_while_a_statement_runs()
+    test_ctrl_c_interrupts_a_running_read()
+    test_ctrl_c_exits_the_shell_while_a_write_runs()
+    test_ctrl_c_exits_the_shell_while_a_read_runs_in_a_write_transaction()
     test_ctrl_c_at_the_prompt_keeps_the_shell_running()
     console.info("All tests have passed")
 
