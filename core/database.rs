@@ -2479,6 +2479,7 @@ impl Database {
             )),
             check_constraints_pragma: AtomicBool::new(false),
             vtab_txn_states: RwLock::new(HashSet::default()),
+            has_vtab_txn_states: crate::sync::atomic::AtomicBool::new(false),
             index_method_tx_cursors: crate::sync::Mutex::new(Vec::new()),
             has_index_method_tx_cursors: crate::sync::atomic::AtomicBool::new(false),
             named_savepoints: RwLock::new(Vec::new()),

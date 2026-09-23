@@ -48,12 +48,12 @@ use super::btree::{
     btree_init_page, payload_overflow_threshold_max, payload_overflow_threshold_min, PayloadLimits,
 };
 use super::page_cache::{CacheError, CacheResizeResult, PageCache, PageCacheKey, SpillResult};
-use super::sqlite3_ondisk::read_varint;
 use super::sqlite3_ondisk::{
     begin_write_btree_page, read_btree_cell, read_u32, BTreeCell, FREELIST_LEAF_PTR_SIZE,
     FREELIST_TRUNK_OFFSET_FIRST_LEAF_PTR, FREELIST_TRUNK_OFFSET_LEAF_COUNT,
     FREELIST_TRUNK_OFFSET_NEXT_TRUNK_PTR,
 };
+use super::sqlite3_ondisk::{read_varint, read_varint_len};
 use super::wal::{CheckpointMode, WalAutoActions};
 use crate::storage::encryption::{CipherMode, EncryptionContext, EncryptionKey};
 
@@ -147,8 +147,11 @@ mod page_inner {
         buffer: Option<Arc<Buffer>>,
         /// Start and length of the bytes of `buffer`, kept next to it so a page
         /// read does not go through the `Option`, the `Arc` and the `Buffer`
-        /// variant on every access. Null and 0 while `buffer` is `None`.
-        data_ptr: *mut u8,
+        /// variant on every access. Dangling with a length of 0 while `buffer`
+        /// is `None`, so that building the slice needs no test: an unloaded
+        /// page hands out an empty slice and every read of it is caught by the
+        /// slice bounds check.
+        data_ptr: std::ptr::NonNull<u8>,
         data_len: usize,
         /// Overflow cells during btree operations
         pub overflow_cells: crate::alloc::Vec<OverflowCell>,
@@ -183,7 +186,7 @@ mod page_inner {
                 pin_count: AtomicUsize::new(0),
                 wal_tag: AtomicU64::new(TAG_UNSET),
                 buffer: None,
-                data_ptr: std::ptr::null_mut(),
+                data_ptr: std::ptr::NonNull::dangling(),
                 data_len: 0,
                 overflow_cells: crate::alloc::vec![],
             }
@@ -197,14 +200,15 @@ mod page_inner {
 
         /// Installs the page data buffer.
         pub fn set_buffer(&mut self, buffer: Arc<Buffer>) {
-            self.data_ptr = buffer.as_mut_ptr();
+            self.data_ptr = std::ptr::NonNull::new(buffer.as_mut_ptr())
+                .expect("a page buffer is never at address zero");
             self.data_len = buffer.len();
             self.buffer = Some(buffer);
         }
 
         /// Removes the page data buffer, leaving the page unloaded.
         pub fn take_buffer(&mut self) -> Option<Arc<Buffer>> {
-            self.data_ptr = std::ptr::null_mut();
+            self.data_ptr = std::ptr::NonNull::dangling();
             self.data_len = 0;
             self.buffer.take()
         }
@@ -213,13 +217,13 @@ mod page_inner {
         #[inline(always)]
         #[allow(clippy::mut_from_ref)]
         pub fn as_ptr(&self) -> &mut [u8] {
-            turso_assert!(!self.data_ptr.is_null(), "buffer not loaded");
             // SAFETY: `data_ptr`/`data_len` describe the bytes of the `Arc<Buffer>`
             // held in `self.buffer`, which stays alive and does not move while it is
-            // installed. Handing out `&mut [u8]` from `&self` mirrors
+            // installed, and `data_ptr` is dangling with `data_len` 0 while there is
+            // no buffer. Handing out `&mut [u8]` from `&self` mirrors
             // `Buffer::as_mut_slice`; the page byte range is mutated only under the
             // pager's own exclusion rules, as before.
-            unsafe { std::slice::from_raw_parts_mut(self.data_ptr, self.data_len) }
+            unsafe { std::slice::from_raw_parts_mut(self.data_ptr.as_ptr(), self.data_len) }
         }
 
         /// The position where page content starts. It's 100 for page 1 (database file header is 100 bytes),
@@ -547,8 +551,7 @@ impl PageInner {
         let (size, len) = read_varint(buf.get(cell_offset..)?).ok()?;
         let mut start = cell_offset + len;
         if is_table {
-            let (_, rowid_len) = read_varint(buf.get(start..)?).ok()?;
-            start += rowid_len;
+            start += read_varint_len(buf.get(start..)?).ok()?;
         }
         let max_local = if is_table {
             limits.max_local_table
@@ -827,6 +830,20 @@ impl PageInner {
     #[inline(always)]
     pub fn is_leaf(&self) -> bool {
         self.read_u8(BTREE_PAGE_TYPE) > PageType::TableInterior as u8
+    }
+
+    /// The leaf flag and the cell count together. A scan asks for both once
+    /// per row and each accessor on its own rebuilds the buffer slice, re-adds
+    /// the page header offset and bounds-checks its own byte.
+    #[inline(always)]
+    pub fn leaf_and_cell_count(&self) -> (bool, usize) {
+        let buf = self.as_ptr();
+        let base = self.offset();
+        let header = &buf[base..base + BTREE_CELL_COUNT + 2];
+        (
+            header[BTREE_PAGE_TYPE] > PageType::TableInterior as u8,
+            u16::from_be_bytes([header[BTREE_CELL_COUNT], header[BTREE_CELL_COUNT + 1]]) as usize,
+        )
     }
 
     /// True for table pages (interior or leaf). A corrupt page type byte
@@ -1420,6 +1437,9 @@ struct SavepointSnapshot {
     deferred_fk_violations: isize,
 }
 
+/// Page numbers start at one, so zero names no page.
+const NO_PAGE: u32 = 0;
+
 struct Savepoint {
     kind: SavepointKind,
     /// Start offset of this savepoint in the subjournal.
@@ -1428,6 +1448,11 @@ struct Savepoint {
     write_offset: AtomicU64,
     /// Bitmap of page numbers that are dirty in the savepoint.
     page_bitmap: RwLock<RoaringBitmap>,
+    /// The page `add_dirty_page` put in the bitmap last, or `NO_PAGE`. The
+    /// bitmap only grows while the savepoint is open, so a page that matches
+    /// is still in it and the lock has nothing to add. A write transaction
+    /// writes the same page many times in a row.
+    last_dirty_page: AtomicU32,
     /// Database size at the start of the savepoint.
     /// If the database grows during the savepoint and a rollback to the savepoint is performed,
     /// the pages exceeding the database size at the start of the savepoint will be ignored.
@@ -1455,6 +1480,7 @@ impl Savepoint {
             start_offset: AtomicU64::new(subjournal_offset),
             write_offset: AtomicU64::new(subjournal_offset),
             page_bitmap: RwLock::new(RoaringBitmap::new()),
+            last_dirty_page: AtomicU32::new(NO_PAGE),
             db_size: AtomicU32::new(db_size),
             wal_pos: RwLock::new(wal_pos),
             deferred_fk_violations: AtomicIsize::new(deferred_fk_violations),
@@ -1462,10 +1488,19 @@ impl Savepoint {
     }
 
     pub fn add_dirty_page(&self, page_num: u32) {
+        turso_debug_assert!(page_num != NO_PAGE, "page numbers start at one");
         self.page_bitmap.write().insert(page_num);
+        self.last_dirty_page.store(page_num, Ordering::Release);
     }
 
     pub fn has_dirty_page(&self, page_num: u32) -> bool {
+        if self.last_dirty_page.load(Ordering::Acquire) == page_num {
+            turso_debug_assert!(
+                self.page_bitmap.read().contains(page_num),
+                "the page the savepoint took last is not in its bitmap"
+            );
+            return true;
+        }
         self.page_bitmap.read().contains(page_num)
     }
 
@@ -1497,6 +1532,7 @@ impl Savepoint {
             start_offset: AtomicU64::new(snapshot.start_offset),
             write_offset: AtomicU64::new(snapshot.start_offset),
             page_bitmap: RwLock::new(RoaringBitmap::new()),
+            last_dirty_page: AtomicU32::new(NO_PAGE),
             db_size: AtomicU32::new(snapshot.db_size),
             wal_pos: RwLock::new(snapshot.wal_pos),
             deferred_fk_violations: AtomicIsize::new(snapshot.deferred_fk_violations),
@@ -1507,6 +1543,67 @@ impl Savepoint {
 /// The pager interface implements the persistence layer by providing access
 /// to pages of the database file, including caching, concurrency control, and
 /// transaction management.
+/// The pages a write transaction has changed, naturally sorted by page
+/// number, and the page `add` put in last.
+///
+/// A write transaction writes the same page many times in a row — a
+/// 10,000-row UPDATE marks about 150 distinct pages 25,000 times — and the
+/// bitmap insert is the same work on every one of those after the first.
+/// The bitmap is private, so the only three ways to change the set all keep
+/// `last_added` true: it names a page the set holds, or no page at all.
+struct DirtyPages {
+    pages: RoaringBitmap,
+    last_added: Option<u32>,
+}
+
+impl DirtyPages {
+    fn new() -> Self {
+        Self {
+            pages: RoaringBitmap::new(),
+            last_added: None,
+        }
+    }
+
+    fn add(&mut self, page_id: u32) {
+        if self.last_added == Some(page_id) {
+            turso_debug_assert!(
+                self.pages.contains(page_id),
+                "the page added last is not in the dirty set"
+            );
+            return;
+        }
+        self.pages.insert(page_id);
+        self.last_added = Some(page_id);
+    }
+
+    fn clear(&mut self) {
+        self.pages.clear();
+        self.last_added = None;
+    }
+
+    fn remove_from(&mut self, first_page_id: u32) {
+        self.pages.remove_range(first_page_id..);
+        self.last_added = None;
+    }
+
+    #[cfg(test)]
+    fn contains(&self, page_id: u32) -> bool {
+        self.pages.contains(page_id)
+    }
+
+    fn is_empty(&self) -> bool {
+        self.pages.is_empty()
+    }
+
+    fn len(&self) -> u64 {
+        self.pages.len()
+    }
+
+    fn iter(&self) -> roaring::bitmap::Iter<'_> {
+        self.pages.iter()
+    }
+}
+
 pub struct Pager {
     /// Source of the database pages.
     pub db_file: Arc<dyn DatabaseStorage>,
@@ -1533,8 +1630,13 @@ pub struct Pager {
     #[cfg(test)]
     spill_yield: SpillYieldHook,
     /// Dirty pages as a bitmap, naturally sorted by page number.
-    dirty_pages: Arc<RwLock<RoaringBitmap>>,
+    dirty_pages: Arc<RwLock<DirtyPages>>,
     subjournal: RwLock<Option<Subjournal>>,
+    /// True once `subjournal` holds a file. It is set under the same write
+    /// lock that installs it and never cleared, so a write that reads false
+    /// can skip the lock: every page write asks whether it has to keep a
+    /// before-image.
+    has_subjournal: AtomicBool,
     savepoints: Arc<RwLock<Vec<Savepoint>>>,
     commit_info: RwLock<CommitInfo>,
     checkpoint_state: RwLock<CheckpointState>,
@@ -1843,8 +1945,9 @@ impl Pager {
             has_pending_reads: AtomicBool::new(false),
             #[cfg(test)]
             spill_yield: SpillYieldHook::new(),
-            dirty_pages: Arc::new(RwLock::new(RoaringBitmap::new())),
+            dirty_pages: Arc::new(RwLock::new(DirtyPages::new())),
             subjournal: RwLock::new(None),
+            has_subjournal: AtomicBool::new(false),
             savepoints: Arc::new(RwLock::new(Vec::new())),
             commit_info: RwLock::new(CommitInfo {
                 group: None,
@@ -1888,7 +1991,7 @@ impl Pager {
         })
     }
 
-    /// An allocation retired by an earlier b-tree cursor on this pager, if any.
+    /// An allocation freed by an earlier b-tree cursor on this pager, if any.
     pub(crate) fn take_cursor_allocation(
         &self,
     ) -> Option<Box<std::mem::MaybeUninit<crate::storage::btree::BTreeCursor>>> {
@@ -2107,7 +2210,9 @@ impl Pager {
         let db_file_io = Arc::new(MemoryIO::new());
         let file = db_file_io.open_file("subjournal", OpenFlags::Create, false)?;
         let db_file = Subjournal::new(file);
-        *self.subjournal.write() = Some(db_file);
+        let mut subjournal = self.subjournal.write();
+        *subjournal = Some(db_file);
+        self.has_subjournal.store(true, Ordering::Release);
         Ok(())
     }
 
@@ -2118,7 +2223,11 @@ impl Pager {
     /// A buffer of length page_size + 4 bytes is allocated and the page id
     /// is written to the beginning of the buffer. The rest of the buffer is filled with the page contents.
     pub fn subjournal_page_if_required(&self, page: &Page) -> Result<()> {
-        if self.subjournal.read().is_none() {
+        if !self.has_subjournal.load(Ordering::Acquire) {
+            turso_debug_assert!(
+                self.subjournal.read().is_none(),
+                "the subjournal flag reads false while a subjournal is open"
+            );
             return Ok(());
         }
         let write_offset = {
@@ -2490,7 +2599,7 @@ impl Pager {
             // eviction cannot drop uncommitted changes that predate the
             // rolled-back savepoint/statement.
             page.set_dirty();
-            dirty_pages.insert(page_id);
+            dirty_pages.add(page_id);
             self.force_upsert_page_in_cache(page_id as usize, page)?;
         }
 
@@ -2512,7 +2621,7 @@ impl Pager {
                     page.try_unpin();
                 }
             }
-            dirty_pages.remove_range((db_size + 1)..);
+            dirty_pages.remove_from(db_size + 1);
             cache.truncate(db_size as usize)?;
         }
 
@@ -3801,7 +3910,7 @@ impl Pager {
         );
         self.subjournal_page_if_required(page)?;
         let mut dirty_pages = self.dirty_pages.write();
-        dirty_pages.insert(page.get().id() as u32);
+        dirty_pages.add(page.get().id() as u32);
         // Notify cache before marking dirty (page was evictable, now it won't be)
         // Only notify if page wasn't already dirty, or if it was spilled
         // State before set_dirty():
@@ -6430,8 +6539,61 @@ mod tests {
     use crate::util::IOExt;
     use arc_swap::ArcSwapOption;
 
-    use super::{default_page1, CacheFlushState, CollectingState, Page, PageRef, Pager};
+    use super::{
+        default_page1, CacheFlushState, CollectingState, DirtyPages, Page, PageRef, Pager,
+    };
     use crate::{Buffer, Completion, CompletionError, LimboError};
+
+    #[test]
+    fn a_savepoint_holds_every_page_it_took() {
+        let savepoint = super::Savepoint::new(super::SavepointKind::Statement, 0, 100, None, 0);
+        assert!(!savepoint.has_dirty_page(7));
+
+        savepoint.add_dirty_page(7);
+        assert!(savepoint.has_dirty_page(7));
+        assert!(!savepoint.has_dirty_page(8), "only page 7 was taken");
+
+        savepoint.add_dirty_page(8);
+        assert!(
+            savepoint.has_dirty_page(7),
+            "a page the savepoint took stays taken once another follows it"
+        );
+        assert!(savepoint.has_dirty_page(8));
+    }
+
+    #[test]
+    fn clearing_the_dirty_set_takes_its_last_page_again() {
+        let mut dirty = DirtyPages::new();
+        dirty.add(7);
+        dirty.add(7);
+        assert!(dirty.contains(7));
+
+        dirty.clear();
+        assert!(!dirty.contains(7));
+        dirty.add(7);
+        assert!(
+            dirty.contains(7),
+            "clearing the set has to forget the page added last, or the next \
+             write to that page never reaches the commit"
+        );
+    }
+
+    #[test]
+    fn removing_the_tail_of_the_dirty_set_takes_its_last_page_again() {
+        let mut dirty = DirtyPages::new();
+        dirty.add(3);
+        dirty.add(9);
+
+        dirty.remove_from(5);
+        assert!(dirty.contains(3));
+        assert!(!dirty.contains(9));
+        dirty.add(9);
+        assert!(
+            dirty.contains(9),
+            "removing the tail has to forget the page added last, or the next \
+             write to that page never reaches the commit"
+        );
+    }
 
     #[test]
     fn page_id_changes_keep_header_access_at_the_correct_offset() {

@@ -545,6 +545,10 @@ pub struct Connection {
     pub(super) check_constraints_pragma: AtomicBool,
     /// Track when each virtual table instance is currently in transaction.
     pub(crate) vtab_txn_states: RwLock<HashSet<u64>>,
+    /// True while `vtab_txn_states` may be non-empty. Lets every commit and
+    /// rollback skip the lock when no virtual table was ever touched -- the
+    /// overwhelmingly common case.
+    pub(crate) has_vtab_txn_states: crate::sync::atomic::AtomicBool,
     /// One prepared cursor per index-method attachment touched by the active
     /// database transaction. Statement reset transfers cursors here so the
     /// eventual transaction outcome is delivered exactly once per attachment.
@@ -824,10 +828,16 @@ impl Connection {
     /// On successful commit, snapshot the current `temp_db.db.schema`
     /// into `committed_temp_schema` so a future full-txn rollback can
     /// restore it. No-op if no temp DDL ran in this transaction.
+    #[inline]
     pub(crate) fn commit_temp_schema(&self) {
         if !self.temp.schema_did_change.load(Ordering::Acquire) {
             return;
         }
+        self.commit_changed_temp_schema();
+    }
+
+    #[inline(never)]
+    fn commit_changed_temp_schema(&self) {
         // `schema_did_change` is only ever set by
         // `mark_temp_schema_did_change`, which asserts temp is
         // initialized. If it's somehow clear here we have a logic
@@ -2761,21 +2771,30 @@ impl Connection {
     }
 
     /// Check if a specific attached database is read only or not, by its index
+    #[inline]
     pub fn is_readonly(&self, index: usize) -> bool {
-        match index {
-            crate::MAIN_DB_ID => self.db.is_readonly(),
-            crate::TEMP_DB_ID => self
+        if index == crate::MAIN_DB_ID {
+            return self.db.is_readonly();
+        }
+        self.is_readonly_secondary(index)
+    }
+
+    /// The temp and attached databases, each of which goes through a lock to
+    /// reach its [Database]. Kept out of line so the main database, which
+    /// every statement asks about, stays one atomic read at the call site.
+    #[inline(never)]
+    fn is_readonly_secondary(&self, index: usize) -> bool {
+        if index == crate::TEMP_DB_ID {
+            return self
                 .temp
                 .database
                 .read()
                 .as_ref()
-                .is_some_and(|temp_db| temp_db.db.is_readonly()),
-            _ => {
-                let db = self.attached_databases.read().get_database_by_index(index);
-                db.expect("Should never have called this without being sure the database exists")
-                    .is_readonly()
-            }
+                .is_some_and(|temp_db| temp_db.db.is_readonly());
         }
+        let db = self.attached_databases.read().get_database_by_index(index);
+        db.expect("Should never have called this without being sure the database exists")
+            .is_readonly()
     }
 
     /// Reset the page size for the current connection.
@@ -4924,6 +4943,7 @@ impl Connection {
         self.transaction_state.set(state);
     }
 
+    #[inline]
     pub(crate) fn get_tx_state(&self) -> TransactionState {
         self.transaction_state.get()
     }
@@ -5185,7 +5205,16 @@ impl Connection {
         entries
     }
 
+    #[inline]
     pub(crate) fn index_methods_on_transaction_committed(&self) {
+        if !self.has_index_method_tx_cursors.load(Ordering::Acquire) {
+            return;
+        }
+        self.publish_index_method_transaction_cursors();
+    }
+
+    #[inline(never)]
+    fn publish_index_method_transaction_cursors(&self) {
         let entries = self.take_index_method_transaction_cursors();
         tracing::trace!(
             attachments = entries.len(),

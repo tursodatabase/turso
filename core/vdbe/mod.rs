@@ -90,7 +90,7 @@ use execute::{
 use turso_parser::ast::{EqpFormat, ResolveType};
 
 use crate::io::TempFile;
-use crate::storage::sqlite3_ondisk::read_varint;
+use crate::storage::sqlite3_ondisk::split_varint;
 use crate::vdbe::bloom_filter::BloomFilter;
 use crate::vdbe::rowset::RowSet;
 use explain::{
@@ -411,12 +411,12 @@ impl Register {
     /// reusing the existing Register::Value(Value::Numeric(Numeric::Integer(_))) if possible,
     /// which is faster than always creating a new one.
     pub fn set_int(&mut self, val: i64) {
+        // One test of the numeric tag, not one per numeric kind: writing the
+        // tag back over an integer that already has it costs a store,
+        // while telling the two apart costs a load, a compare and a branch.
         match self {
-            Register::Value(Value::Numeric(Numeric::Integer(existing))) => {
-                *existing = val;
-            }
-            Register::Value(Value::Numeric(float)) => {
-                *float = Numeric::Integer(val);
+            Register::Value(Value::Numeric(numeric)) => {
+                *numeric = Numeric::Integer(val);
             }
             _ => set_int_over_other(self, val),
         };
@@ -528,11 +528,24 @@ impl Register {
     }
 }
 
+/// What the dispatch loop does about the work parked for it.
+enum ParkedWork {
+    /// Nothing is left: run the next instruction.
+    Ready,
+    /// The loop starts over.
+    Restart,
+    /// The step ends here.
+    Return(ProgramStep),
+}
+
 /// A row is a the list of registers that hold the values for a filtered row. This row is a pointer, therefore
 /// after stepping again, row will be invalidated to be sure it doesn't point to somewhere unexpected.
 #[derive(Debug)]
 pub struct Row {
-    values: *const Register,
+    /// Non-null so that `Option<Row>` fits in the two words the pointer and
+    /// the count already take: the dispatch loop clears the slot once per
+    /// step and `ResultRow` fills it once per row.
+    values: std::ptr::NonNull<Register>,
     count: usize,
 }
 
@@ -870,14 +883,30 @@ pub struct SequenceInnerTxState {
     )>,
 }
 
+/// `tracing` is on at TRACE level, so every opcode gets a span.
+const TRACE_FLAG_SPANS: u8 = 1;
+/// `PRAGMA vdbe_trace` is on, so every opcode prints itself and its registers.
+const TRACE_FLAG_VDBE: u8 = 2;
+/// No execution has read the tracing settings into `ProgramState` yet.
+pub(crate) const TRACE_FLAGS_UNREAD: u8 = u8::MAX;
+
 pub struct ProgramState {
     /// Instructions left before the next interrupt/progress check of
     /// normal_step; reloaded with `check_interval` each time it reaches zero.
     check_countdown: u64,
+    /// `TRACE_FLAG_*` bits, read once at the start of each execution.
+    pub(crate) trace_flags: u8,
     /// The interval the countdown was last reloaded with, re-derived from
     /// the progress handler's interval each time the check runs.
     check_interval: u64,
     pub io_completions: Option<IOCompletions>,
+    /// Set whenever a completion or a trigger's pending FAIL error is parked
+    /// for the dispatch loop to look at before it runs the next instruction.
+    /// Only the loop clears it, and only after it finds both slots empty, so
+    /// a stale `true` costs one extra look and a stale `false` cannot happen.
+    /// Reading one byte here is what keeps two `Option` tests off the top of
+    /// every step call.
+    pending_entry_work: bool,
     pub pc: InsnReference,
     pub(crate) cursors: Vec<Option<Cursor>>,
     /// Immutable execution/storage context captured when each index-method
@@ -892,6 +921,15 @@ pub struct ProgramState {
         Box<dyn crate::index_method::IndexMethodCursor>,
         std::sync::Arc<crate::index_method::IndexMethodContext>,
     )>,
+    /// Whether this execution built a context for an index-method cursor.
+    /// Every index-method cursor is installed right after its context, so a
+    /// false here means the statement has no such cursor and the commit
+    /// hooks have nothing to visit.
+    pub(crate) has_index_method_context: bool,
+    /// Whether this execution opened a virtual-table cursor. Only VOpen
+    /// installs one, and it sets this at the same time, so a false here
+    /// means the statement-end cleanups have no cursor slot to visit.
+    pub(crate) has_virtual_cursor: bool,
     /// Resumption coordinates for statement-level index-method finalization.
     pub(crate) index_method_finalize_cursor: usize,
     pub(crate) index_method_finalize_subprogram_keys: Option<Vec<usize>>,
@@ -904,6 +942,10 @@ pub struct ProgramState {
     pub(crate) result_row: Option<Row>,
     last_compare: Option<std::cmp::Ordering>,
     deferred_seeks: Vec<Option<DeferredSeekState>>,
+    /// How many slots of `deferred_seeks` hold a seek. Column and RowId test
+    /// this instead of indexing the slot vector, which costs a bounds check
+    /// and a 24-byte stride on a path they walk once per row.
+    deferred_seeks_pending: usize,
     /// Indicate whether a coroutine has ended for a given yield register.
     /// If an element is present, it means the coroutine with the given register number has ended.
     ended_coroutine: Vec<u32>,
@@ -1047,11 +1089,15 @@ impl ProgramState {
         let registers = vec![Register::Value(Value::Null); max_registers].into_boxed_slice();
         Self {
             check_countdown: 1,
+            trace_flags: TRACE_FLAGS_UNREAD,
             check_interval: MAX_CHECK_INTERVAL,
             io_completions: None,
+            pending_entry_work: true,
             pc: 0,
             cursors,
             index_method_contexts: vec![None; max_cursors],
+            has_index_method_context: false,
+            has_virtual_cursor: false,
             closed_index_method_cursors: Vec::new(),
             index_method_finalize_cursor: 0,
             index_method_finalize_subprogram_keys: None,
@@ -1063,6 +1109,7 @@ impl ProgramState {
             result_row: None,
             last_compare: None,
             deferred_seeks: vec![None; max_cursors],
+            deferred_seeks_pending: 0,
             ended_coroutine: vec![],
             once: SmallVec::<[u32; 4]>::new(),
             execution_state: ProgramExecutionState::Init,
@@ -1154,6 +1201,50 @@ impl ProgramState {
         self.parameters.clear();
     }
 
+    /// True while no cursor has a deferred seek waiting.
+    #[inline(always)]
+    pub(crate) fn no_deferred_seeks(&self) -> bool {
+        turso_debug_assert!(
+            (self.deferred_seeks_pending == 0) == self.deferred_seeks.iter().all(Option::is_none),
+            "deferred_seeks_pending drifted from the slots it counts"
+        );
+        self.deferred_seeks_pending == 0
+    }
+
+    pub(crate) fn set_deferred_seek(&mut self, cursor_id: usize, seek: DeferredSeekState) {
+        if self.deferred_seeks[cursor_id].replace(seek).is_none() {
+            self.deferred_seeks_pending += 1;
+        }
+    }
+
+    pub(crate) fn take_deferred_seek(&mut self, cursor_id: usize) -> Option<DeferredSeekState> {
+        let taken = self
+            .deferred_seeks
+            .get_mut(cursor_id)
+            .and_then(Option::take);
+        if taken.is_some() {
+            self.deferred_seeks_pending -= 1;
+        }
+        taken
+    }
+
+    /// Drops every deferred seek that names `cursor_id` on either side.
+    pub(crate) fn clear_deferred_seeks_naming(&mut self, cursor_id: usize) {
+        for slot in &mut self.deferred_seeks {
+            let Some(seek) = slot else { continue };
+            if seek.index_cursor_id == cursor_id || seek.table_cursor_id == cursor_id {
+                *slot = None;
+                self.deferred_seeks_pending -= 1;
+            }
+        }
+    }
+
+    pub(crate) fn clear_deferred_seeks(&mut self) {
+        self.deferred_seeks.iter_mut().for_each(|s| *s = None);
+        self.deferred_seeks_pending = 0;
+    }
+
+    #[inline]
     pub fn get_parameter(&self, index: NonZero<usize>) -> Value {
         let i = index.get() - 1;
         self.parameters.get(i).cloned().unwrap_or(Value::Null)
@@ -1189,8 +1280,10 @@ impl ProgramState {
                 cursor.close(context);
             }
             match cursor.take() {
-                Some(Cursor::BTree(cursor)) => crate::storage::btree::CursorTrait::recycle(cursor),
-                Some(Cursor::Dyn(cursor)) => cursor.recycle(),
+                Some(Cursor::BTree(cursor, ..)) => {
+                    crate::storage::btree::CursorTrait::recycle(cursor)
+                }
+                Some(Cursor::Dyn(cursor, ..)) => cursor.recycle(),
                 _ => {}
             }
             *context = None;
@@ -1201,6 +1294,8 @@ impl ProgramState {
                 cursor.close(&context);
             }
         }
+        self.has_index_method_context = false;
+        self.has_virtual_cursor = false;
         self.index_method_finalize_cursor = 0;
         self.index_method_finalize_subprogram_keys = None;
         self.index_method_finalize_subprogram = 0;
@@ -1212,10 +1307,11 @@ impl ProgramState {
             }
         }
         self.last_compare = None;
-        self.deferred_seeks.iter_mut().for_each(|s| *s = None);
+        self.clear_deferred_seeks();
         self.ended_coroutine.clear();
         self.once.clear();
         self.execution_state = ProgramExecutionState::Init;
+        self.trace_flags = TRACE_FLAGS_UNREAD;
         self.query_deadline = None;
         self.explicit_checkpoint_guard = None;
         #[cfg(feature = "json")]
@@ -1394,11 +1490,16 @@ impl ProgramState {
     /// whether the statement yields to the caller.
     #[inline]
     pub(crate) fn suspend_on_io(&mut self, io: IOCompletions) -> InsnFunctionStepResult {
-        turso_debug_assert!(
+        // Checked in release builds as well: it tells the compiler the slot
+        // is empty, so the store below needs no drop of what was there, and
+        // the drop's address arithmetic stops being hoisted into the top of
+        // every step call.
+        turso_assert!(
             self.io_completions.is_none(),
             "an instruction reported IO while a completion was already parked"
         );
         self.io_completions = Some(io);
+        self.pending_entry_work = true;
         InsnFunctionStepResult::IO
     }
 
@@ -1494,6 +1595,16 @@ impl ProgramState {
     /// nested, skips ending its implicit read transaction, and subsequent
     /// writes on the connection never auto-commit (issue #7466).
     pub(crate) fn close_virtual_table_cursors(&mut self) {
+        if !self.has_virtual_cursor {
+            crate::turso_debug_assert!(
+                !self
+                    .cursors
+                    .iter()
+                    .any(|slot| matches!(slot, Some(Cursor::Virtual(_)))),
+                "a virtual-table cursor is open while the flag reads false"
+            );
+            return;
+        }
         for slot in self.cursors.iter_mut() {
             if matches!(slot, Some(Cursor::Virtual(_))) {
                 *slot = None;
@@ -1559,7 +1670,21 @@ impl ProgramState {
     /// savepoint management and FK violation counter restoration are independent
     /// concerns: pager savepoints may be skipped (e.g. autocommit optimization)
     /// while FK bookkeeping still needs cleanup.
+    #[inline]
     pub fn end_statement(
+        &mut self,
+        connection: &Connection,
+        pager: &Arc<Pager>,
+        end_statement: EndStatement,
+    ) -> Result<()> {
+        if !self.is_active_write && !self.has_stmt_transaction {
+            return Ok(());
+        }
+        self.end_statement_cold(connection, pager, end_statement)
+    }
+
+    #[inline(never)]
+    fn end_statement_cold(
         &mut self,
         connection: &Connection,
         pager: &Arc<Pager>,
@@ -2109,7 +2234,7 @@ impl Program {
         state.registers[6].set_int(p5);
         state.registers[7].set_value(Value::from_text(comment));
         state.result_row = Some(Row {
-            values: &state.registers[0] as *const Register,
+            values: std::ptr::NonNull::from(&state.registers[0]),
             count: EXPLAIN_COLUMNS.len(),
         });
         state.pc += 1;
@@ -2158,7 +2283,7 @@ impl Program {
             state.registers[2].set_int(0);
             state.registers[3].set_value(Value::from_text(detail.to_string()));
             state.result_row = Some(Row {
-                values: &state.registers[0] as *const Register,
+                values: std::ptr::NonNull::from(&state.registers[0]),
                 count: EXPLAIN_QUERY_PLAN_COLUMNS.len(),
             });
             state.pc += 1;
@@ -2197,7 +2322,7 @@ impl Program {
             self,
         )));
         state.result_row = Some(Row {
-            values: &state.registers[0] as *const Register,
+            values: std::ptr::NonNull::from(&state.registers[0]),
             count: EXPLAIN_QUERY_PLAN_JSON_COLUMNS.len(),
         });
         state.pc = 1;
@@ -2245,6 +2370,19 @@ impl Program {
         state.pre_op_registers = Some(state.registers.clone());
     }
 
+    /// Reads the tracing level and the connection's `vdbe_trace` flag, which
+    /// together pick the dispatch loop the statement runs in.
+    pub(crate) fn read_trace_flags(&self) -> u8 {
+        let mut flags = 0;
+        if tracing::enabled!(tracing::Level::TRACE) {
+            flags |= TRACE_FLAG_SPANS;
+        }
+        if self.connection.get_vdbe_trace() {
+            flags |= TRACE_FLAG_VDBE;
+        }
+        flags
+    }
+
     /// Step in [QueryMode::Normal]
     #[inline(always)]
     pub(crate) fn normal_step(
@@ -2253,16 +2391,36 @@ impl Program {
         pager: &Arc<Pager>,
         waker: Option<&Waker>,
     ) -> ProgramStep {
+        // Read once per execution rather than once per row: both reads are
+        // several instructions and a statement that returns many rows calls
+        // this function once for each of them. Every path into here goes
+        // through `Statement::read_trace_flags_if_unread` first.
+        turso_debug_assert!(
+            state.trace_flags != TRACE_FLAGS_UNREAD,
+            "the dispatch loop was entered before the tracing settings were read"
+        );
         state.execution_state = ProgramExecutionState::Running;
-        let enable_tracing = tracing::enabled!(tracing::Level::TRACE);
-        let vdbe_trace = self.connection.get_vdbe_trace();
-        let result = if enable_tracing || vdbe_trace {
-            dispatch_loop_traced(self, state, pager, waker, enable_tracing, vdbe_trace)
+        let trace_flags = state.trace_flags;
+        let result = if trace_flags != 0 {
+            dispatch_loop_traced(
+                self,
+                state,
+                pager,
+                waker,
+                trace_flags & TRACE_FLAG_SPANS != 0,
+                trace_flags & TRACE_FLAG_VDBE != 0,
+            )
         } else {
             dispatch_loop::<false>(self, state, pager, waker, false, false)
         };
+        // A row leaves the execution running, which it already is. Returning
+        // it as a fresh constant, before the match that reads the other
+        // outcomes apart, lets the caller's own match on it resolve at compile
+        // time: this runs once for every row a statement returns.
+        if matches!(result, ProgramStep::Row) {
+            return ProgramStep::Row;
+        }
         match &result {
-            ProgramStep::Row => {}
             ProgramStep::Done => {
                 state.execution_state = ProgramExecutionState::Done;
             }
@@ -2304,22 +2462,22 @@ impl Program {
             // Invalidate the previous result row once per step call: rows are only
             // handed out between step calls, and ResultRow returns immediately
             // after setting a fresh one.
-            let _ = state.result_row.take();
+            state.result_row = None;
             // The outer loop runs once per step call and is re-entered only when an
             // instruction completed its IO inline; the inner loop dispatches
             // instructions without re-inspecting the completion slot every time.
             'io_check: loop {
-                if state.io_completions.is_some() {
-                    if let Some(result) = program.finish_pending_io(state, pager, waker) {
-                        return result;
+                if state.pending_entry_work {
+                    match program.finish_parked_entry_work(state, pager, waker) {
+                        ParkedWork::Ready => {}
+                        ParkedWork::Restart => continue 'io_check,
+                        ParkedWork::Return(result) => return result,
                     }
                 }
-                if state.pending_fail_prepare_error.is_some() {
-                    match program.prepare_pending_fail(state, pager, waker) {
-                        Some(result) => return result,
-                        None => continue 'io_check,
-                    }
-                }
+                turso_debug_assert!(
+                    state.io_completions.is_none() && state.pending_fail_prepare_error.is_none(),
+                    "the dispatch loop ran an instruction with work parked for it"
+                );
                 loop {
                     state.check_countdown = state.check_countdown.wrapping_sub(1);
                     if state.check_countdown == 0 {
@@ -2378,6 +2536,17 @@ impl Program {
                         Insn::Gosub { .. } => step_inline!(execute::op_gosub),
                         Insn::Return { .. } => step_inline!(execute::op_return),
                         Insn::Integer { .. } => step_inline!(execute::op_integer),
+                        Insn::Add { .. } => step_inline!(execute::op_add),
+                        Insn::Subtract { .. } => step_inline!(execute::op_subtract),
+                        Insn::Multiply { .. } => step_inline!(execute::op_multiply),
+                        Insn::Divide { .. } => step_inline!(execute::op_divide),
+                        Insn::Remainder { .. } => step_inline!(execute::op_remainder),
+                        Insn::Variable { .. } => step_inline!(execute::op_variable),
+                        Insn::NotNull { .. } => step_inline!(execute::op_not_null),
+                        Insn::SoftNull { .. } => step_inline!(execute::op_soft_null),
+                        Insn::HaltIfNull { .. } => step_inline!(execute::op_halt_if_null),
+                        Insn::MustBeInt { .. } => step_inline!(execute::op_must_be_int),
+                        Insn::Affinity { .. } => step_inline!(execute::op_affinity),
                         _ => insn.to_function()(program, state, insn, pager),
                     };
                     // The two outcomes of every row are tested here, one compare
@@ -2472,6 +2641,32 @@ impl Program {
         None
     }
 
+    /// Deals with whatever `pending_entry_work` stands for, before the
+    /// dispatch loop runs its next instruction. Out of line so the loop's
+    /// entry costs one byte-sized test.
+    #[cold]
+    #[inline(never)]
+    fn finish_parked_entry_work(
+        &self,
+        state: &mut ProgramState,
+        pager: &Arc<Pager>,
+        waker: Option<&Waker>,
+    ) -> ParkedWork {
+        if state.io_completions.is_some() {
+            if let Some(result) = self.finish_pending_io(state, pager, waker) {
+                return ParkedWork::Return(result);
+            }
+        }
+        if state.pending_fail_prepare_error.is_some() {
+            return match self.prepare_pending_fail(state, pager, waker) {
+                Some(result) => ParkedWork::Return(result),
+                None => ParkedWork::Restart,
+            };
+        }
+        state.pending_entry_work = false;
+        ParkedWork::Ready
+    }
+
     /// A trigger returned FAIL before the parent program reached Halt. FAIL
     /// keeps changes made by earlier rows, so their index-method writes must
     /// finish before abort() releases the statement savepoint and commits
@@ -2498,6 +2693,7 @@ impl Program {
             }
             Ok(IOResult::IO(io)) => {
                 state.pending_fail_prepare_error = Some(fail_error);
+                state.pending_entry_work = true;
                 io.set_waker(waker);
                 if io.is_explicit_yield() {
                     return Some(ProgramStep::Yield);
@@ -2627,6 +2823,7 @@ impl Program {
         }
         let finished = io.finished();
         state.io_completions = Some(io);
+        state.pending_entry_work = true;
         if !finished {
             return Some(ProgramStep::IO);
         }
@@ -2660,6 +2857,7 @@ impl Program {
                 || matches!(err, LimboError::Raise(ResolveType::Fail, _)) =>
             {
                 state.pending_fail_prepare_error = Some(err);
+                state.pending_entry_work = true;
                 None
             }
             err => {
@@ -2863,7 +3061,7 @@ impl Program {
         program_state: &mut ProgramState,
         rollback: bool,
     ) -> IOResultOr<()> {
-        let connection = self.connection.clone();
+        let connection = &self.connection;
         let auto_commit = connection.auto_commit.load(Ordering::SeqCst);
         let tx_state = connection.get_tx_state();
         tracing::debug!(
@@ -2885,16 +3083,16 @@ impl Program {
                 ),
                 "invalid state for write commit step: {tx_state:?}"
             );
-            self.step_end_write_txn(&pager, &connection, program_state, rollback)
+            self.step_end_write_txn(&pager, connection, program_state, rollback)
         } else if matches!(program_state.commit_state, CommitState::CommittingAttached) {
             // Re-entry after IO yield from attached pager commit.
-            match self.end_attached_write_txns(&connection, rollback)? {
+            match self.end_attached_write_txns(connection, rollback)? {
                 IOResult::Done(_) => {
                     program_state.commit_state = CommitState::Ready;
                     if pager.holds_read_lock() {
                         pager.end_read_tx();
                     }
-                    self.end_attached_read_txns(&connection);
+                    self.end_attached_read_txns(connection);
                     Ok(IOResult::Done(()))
                 }
                 IOResult::IO(io) => Ok(IOResult::IO(io)),
@@ -2902,7 +3100,7 @@ impl Program {
         } else if auto_commit {
             match tx_state {
                 TransactionState::Write { .. } => {
-                    self.step_end_write_txn(&pager, &connection, program_state, rollback)
+                    self.step_end_write_txn(&pager, connection, program_state, rollback)
                 }
                 TransactionState::Read => {
                     connection.set_tx_state(TransactionState::None);
@@ -2910,7 +3108,7 @@ impl Program {
                     // independently of the main connection's transaction state.
                     // (e.g., UPDATE aux0.t SET ... only needs Read on main DB
                     // but holds a write lock on the attached pager.)
-                    match self.end_attached_write_txns(&connection, rollback)? {
+                    match self.end_attached_write_txns(connection, rollback)? {
                         IOResult::Done(_) => {}
                         IOResult::IO(io) => {
                             program_state.commit_state = CommitState::CommittingAttached;
@@ -2918,18 +3116,18 @@ impl Program {
                         }
                     }
                     pager.end_read_tx();
-                    self.end_attached_read_txns(&connection);
+                    self.end_attached_read_txns(connection);
                     Ok(IOResult::Done(()))
                 }
                 TransactionState::None => {
-                    match self.end_attached_write_txns(&connection, rollback)? {
+                    match self.end_attached_write_txns(connection, rollback)? {
                         IOResult::Done(_) => {}
                         IOResult::IO(io) => {
                             program_state.commit_state = CommitState::CommittingAttached;
                             return Ok(IOResult::IO(io));
                         }
                     }
-                    self.end_attached_read_txns(&connection);
+                    self.end_attached_read_txns(connection);
                     Ok(IOResult::Done(()))
                 }
                 TransactionState::PendingUpgrade { .. } => {
@@ -2960,7 +3158,7 @@ impl Program {
         mv_store: &Arc<MvStore>,
         rollback: bool,
     ) -> IOResultOr<()> {
-        let conn = self.connection.clone();
+        let conn = &self.connection;
         let auto_commit = conn.auto_commit.load(Ordering::SeqCst);
         if !auto_commit {
             return Ok(IOResult::Done(()));
@@ -2969,7 +3167,7 @@ impl Program {
         // Phase 1: Commit main DB MVCC transaction
         if matches!(program_state.commit_state, CommitState::Ready) {
             if let Some(tx_id) = conn.get_mv_tx_id() {
-                let state_machine = mv_store.commit_tx(tx_id, &conn, crate::MAIN_DB_ID)?;
+                let state_machine = mv_store.commit_tx(tx_id, conn, crate::MAIN_DB_ID)?;
                 program_state.commit_state = CommitState::CommittingMvcc { state_machine };
             }
             // If no main MVCC tx, commit_state stays Ready and we fall
@@ -3038,7 +3236,7 @@ impl Program {
                 conn.set_mv_tx_for_db(db_id, None);
                 continue;
             };
-            let mut state_machine = match attached_mv_store.commit_tx(tx_id, &conn, db_id) {
+            let mut state_machine = match attached_mv_store.commit_tx(tx_id, conn, db_id) {
                 Ok(sm) => sm,
                 Err(e) => {
                     tracing::error!(
@@ -3078,24 +3276,24 @@ impl Program {
         // DBs may use WAL mode and need their dirty pages committed via the WAL path.
         if matches!(program_state.commit_state, CommitState::CommittingAttached) {
             // Re-entry after IO yield from attached WAL pager commit.
-            match self.end_attached_write_txns(&conn, rollback)? {
+            match self.end_attached_write_txns(conn, rollback)? {
                 IOResult::Done(_) => {
                     program_state.commit_state = CommitState::Ready;
-                    self.end_attached_read_txns(&conn);
+                    self.end_attached_read_txns(conn);
                     return Ok(IOResult::Done(()));
                 }
                 IOResult::IO(io) => return Ok(IOResult::IO(io)),
             }
         }
 
-        match self.end_attached_write_txns(&conn, rollback)? {
+        match self.end_attached_write_txns(conn, rollback)? {
             IOResult::Done(_) => {}
             IOResult::IO(io) => {
                 program_state.commit_state = CommitState::CommittingAttached;
                 return Ok(IOResult::IO(io));
             }
         }
-        self.end_attached_read_txns(&conn);
+        self.end_attached_read_txns(conn);
 
         program_state.commit_state = CommitState::Ready;
         Ok(IOResult::Done(()))
@@ -3785,12 +3983,9 @@ impl<'a> FromValueRow<'a> for &'a Value {
 
 impl Row {
     pub fn get<'a, T: FromValueRow<'a> + 'a>(&'a self, idx: usize) -> Result<T> {
-        let value = unsafe {
-            self.values
-                .add(idx)
-                .as_ref()
-                .expect("row value pointer should be valid")
-        };
+        // SAFETY: the row names `count` registers from `values`, which stay
+        // in place and alive until the next step of the statement.
+        let value = unsafe { self.values.add(idx).as_ref() };
         let value = match value {
             Register::Value(value) => value,
             _ => unreachable!("a row should be formed of values only"),
@@ -3799,12 +3994,8 @@ impl Row {
     }
 
     pub fn get_value(&self, idx: usize) -> &Value {
-        let value = unsafe {
-            self.values
-                .add(idx)
-                .as_ref()
-                .expect("row value pointer should be valid")
-        };
+        // SAFETY: as in `get`.
+        let value = unsafe { self.values.add(idx).as_ref() };
         match value {
             Register::Value(value) => value,
             _ => unreachable!("a row should be formed of values only"),
@@ -3812,7 +4003,7 @@ impl Row {
     }
 
     pub fn get_values(&self) -> impl Iterator<Item = &Value> {
-        let values = unsafe { std::slice::from_raw_parts(self.values, self.count) };
+        let values = unsafe { std::slice::from_raw_parts(self.values.as_ptr(), self.count) };
         // This should be ownedvalues
         // TODO: add check for this
         values.iter().map(|v| v.get_value())
@@ -3920,8 +4111,8 @@ fn skip_serial_types(header: &mut &[u8], data: &mut &[u8], n: usize) -> Result<(
 /// Reads the serial type at the front of `header` and moves past it.
 #[inline(always)]
 fn read_serial_type(header: &mut &[u8]) -> Result<u64> {
-    let (serial_type, bytes_read) = read_varint(header)?;
-    *header = &header[bytes_read..];
+    let (serial_type, rest) = split_varint(header)?;
+    *header = rest;
     Ok(serial_type)
 }
 
@@ -4357,7 +4548,7 @@ mod shuttle_tests {
 
                 // Create a result_row pointing to registers
                 state.result_row = Some(Row {
-                    values: &state.registers[0] as *const Register,
+                    values: std::ptr::NonNull::from(&state.registers[0]),
                     count: 3,
                 });
 
@@ -4400,7 +4591,7 @@ mod shuttle_tests {
 
                 // Create result_row
                 state.result_row = Some(Row {
-                    values: &state.registers[0] as *const Register,
+                    values: std::ptr::NonNull::from(&state.registers[0]),
                     count: 2,
                 });
 
@@ -4451,7 +4642,7 @@ mod shuttle_tests {
                 }
 
                 state.result_row = Some(Row {
-                    values: &state.registers[0] as *const Register,
+                    values: std::ptr::NonNull::from(&state.registers[0]),
                     count: 5,
                 });
 
@@ -4491,7 +4682,7 @@ mod shuttle_tests {
 
                 state.registers[0].set_int(100);
                 state.result_row = Some(Row {
-                    values: &state.registers[0] as *const Register,
+                    values: std::ptr::NonNull::from(&state.registers[0]),
                     count: 1,
                 });
 
@@ -4522,19 +4713,19 @@ mod shuttle_tests {
 
                 state.registers[0].set_int(1);
                 state.result_row = Some(Row {
-                    values: &state.registers[0] as *const Register,
+                    values: std::ptr::NonNull::from(&state.registers[0]),
                     count: 1,
                 });
 
                 // Invalidate row (simulating what normal_step does)
-                let _ = state.result_row.take();
+                state.result_row = None;
 
                 // Now safe to modify registers
                 state.registers[0].set_int(999);
 
                 // Create new row pointing to modified registers
                 state.result_row = Some(Row {
-                    values: &state.registers[0] as *const Register,
+                    values: std::ptr::NonNull::from(&state.registers[0]),
                     count: 1,
                 });
 
@@ -4656,7 +4847,7 @@ mod shuttle_tests {
                 state.registers[2].set_int(30);
 
                 state.result_row = Some(Row {
-                    values: &state.registers[0] as *const Register,
+                    values: std::ptr::NonNull::from(&state.registers[0]),
                     count: 3,
                 });
 
@@ -4702,7 +4893,7 @@ mod shuttle_tests {
                 }
 
                 state.result_row = Some(Row {
-                    values: &state.registers[0] as *const Register,
+                    values: std::ptr::NonNull::from(&state.registers[0]),
                     count: 20,
                 });
 

@@ -1,0 +1,145 @@
+@database :memory:
+
+# The four index comparison opcodes (IdxGT, IdxGE, IdxLT, IdxLE) end a range
+# scan by comparing the key the cursor sits on against the bound in the
+# registers. They read the key where it lies on the page, so these cover the
+# shapes that a wrong offset or a wrong length would get wrong: every storage
+# class, equal keys that only the rowid separates, a key spread over more
+# than one column, and a key too long to stay on the page.
+
+setup classes {
+    CREATE TABLE t(v);
+    CREATE INDEX t_v ON t(v);
+    INSERT INTO t(rowid, v) VALUES
+        (1, NULL),
+        (2, -9223372036854775808),
+        (3, -1),
+        (4, 0),
+        (5, 1),
+        (6, 2.5),
+        (7, 9223372036854775807),
+        (8, ''),
+        (9, 'a'),
+        (10, 'a'),
+        (11, 'b'),
+        (12, x''),
+        (13, x'00'),
+        (14, x'ff');
+}
+
+@setup classes
+test index-range-ends-on-an-inclusive-upper-bound {
+    SELECT v FROM t WHERE v BETWEEN -1 AND 2.5 ORDER BY v;
+}
+expect {
+    -1
+    0
+    1
+    2.5
+}
+
+@setup classes
+test index-range-ends-on-an-exclusive-upper-bound {
+    SELECT v FROM t WHERE v >= -1 AND v < 2.5 ORDER BY v;
+}
+expect {
+    -1
+    0
+    1
+}
+
+@setup classes
+test index-range-walks-back-to-an-exclusive-lower-bound {
+    SELECT v FROM t WHERE v <= 1 AND v > -1 ORDER BY v DESC;
+}
+expect {
+    1
+    0
+}
+
+@setup classes
+test index-range-walks-back-to-an-inclusive-lower-bound {
+    SELECT v FROM t WHERE v <= 1 AND v >= -1 ORDER BY v DESC;
+}
+expect {
+    1
+    0
+    -1
+}
+
+@setup classes
+test index-range-separates-equal-text-keys-by-rowid {
+    SELECT v, rowid FROM t WHERE v >= 'a' AND v <= 'b' ORDER BY v, rowid;
+}
+expect {
+    a|9
+    a|10
+    b|11
+}
+
+@setup classes
+test index-range-over-blob-keys {
+    SELECT hex(v), rowid FROM t WHERE v >= x'' AND v <= x'ff' ORDER BY v, rowid;
+}
+expect {
+    |12
+    00|13
+    FF|14
+}
+
+@setup classes
+test index-range-takes-the-largest-and-smallest-integers {
+    SELECT v FROM t WHERE v > -9223372036854775808 AND v < 9223372036854775807 ORDER BY v;
+}
+expect {
+    -1
+    0
+    1
+    2.5
+}
+
+setup pairs {
+    CREATE TABLE m(a, b);
+    CREATE INDEX m_ab ON m(a, b);
+    INSERT INTO m(rowid, a, b) VALUES
+        (1, 1, 'x'),
+        (2, 1, 'y'),
+        (3, 1, 'z'),
+        (4, 2, 'x');
+}
+
+@setup pairs
+test index-range-compares-past-the-first-column {
+    SELECT a, b FROM m WHERE a = 1 AND b > 'x' ORDER BY a, b;
+}
+expect {
+    1|y
+    1|z
+}
+
+@setup pairs
+test index-range-stops-at-the-end-of-the-first-column {
+    SELECT a, b FROM m WHERE a = 1 AND b <= 'z' ORDER BY a DESC, b DESC;
+}
+expect {
+    1|z
+    1|y
+    1|x
+}
+
+setup overflow {
+    CREATE TABLE b(v TEXT);
+    CREATE INDEX b_v ON b(v);
+    INSERT INTO b(rowid, v) VALUES
+        (1, replace(hex(zeroblob(2000)), '0', 'p')),
+        (2, replace(hex(zeroblob(2000)), '0', 'q'));
+}
+
+@setup overflow
+test index-range-over-keys-too-long-for-one-page {
+    SELECT length(v), substr(v, 1, 1), rowid FROM b WHERE v > '' AND v < 'r' ORDER BY v;
+}
+expect {
+    4000|p|1
+    4000|q|2
+}

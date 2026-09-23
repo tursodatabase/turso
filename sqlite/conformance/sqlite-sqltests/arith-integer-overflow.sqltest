@@ -1,0 +1,74 @@
+@database :memory:
+
+# The Add, Subtract and Multiply opcodes work on two integers directly and
+# send every other operand pair somewhere else: floats, values that are not
+# numbers, and an integer pair whose result does not fit in an integer. The
+# last one is the boundary these tests cover: an overflowing pair must come
+# back as a real, and a pair that only looks close to the edge must not.
+
+setup edges {
+    CREATE TABLE t(a, b);
+    INSERT INTO t VALUES
+        (9223372036854775807, 1),
+        (-9223372036854775808, -1),
+        (9223372036854775807, -1),
+        (2, 3),
+        (2.5, 2),
+        (3, 1.5);
+}
+
+@setup edges
+test add-integer-pair-that-overflows-gives-a-real {
+    SELECT typeof(a + b), printf('%.6e', a + b) FROM t;
+}
+expect {
+    real|9.223372e+18
+    real|-9.223372e+18
+    integer|9.223372e+18
+    integer|5.000000e+00
+    real|4.500000e+00
+    real|4.500000e+00
+}
+
+@setup edges
+test subtract-integer-pair-that-overflows-gives-a-real {
+    SELECT typeof(a - b), printf('%.6e', a - b) FROM t;
+}
+expect {
+    integer|9.223372e+18
+    integer|-9.223372e+18
+    real|9.223372e+18
+    integer|-1.000000e+00
+    real|5.000000e-01
+    real|1.500000e+00
+}
+
+@setup edges
+test multiply-integer-pair-that-overflows-gives-a-real {
+    SELECT typeof(a * b), printf('%.6e', a * b) FROM t;
+}
+expect {
+    integer|9.223372e+18
+    real|9.223372e+18
+    integer|-9.223372e+18
+    integer|6.000000e+00
+    real|5.000000e+00
+    real|4.500000e+00
+}
+
+setup nulls {
+    CREATE TABLE u(a, b);
+    INSERT INTO u VALUES (1, NULL), (NULL, 1), (NULL, NULL), ('4', 2), (2, '4');
+}
+
+@setup nulls
+test arithmetic-on-a-null-or-a-text-operand {
+    SELECT typeof(a + b), a + b, typeof(a - b), a - b, typeof(a * b), a * b FROM u;
+}
+expect {
+    null||null||null|
+    null||null||null|
+    null||null||null|
+    integer|6|integer|2|integer|8
+    integer|6|integer|-2|integer|8
+}

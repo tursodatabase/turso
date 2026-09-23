@@ -2019,10 +2019,9 @@ impl<'a> ValueIterator<'a> {
         let (header_size, header_varint_len) = read_varint(payload)?;
         let header_size = header_size as usize;
 
-        if header_size > payload.len()
-            || header_varint_len > payload.len()
-            || header_varint_len > header_size
-        {
+        // The second test makes the first one cover the varint as well:
+        // it ends inside the header, and the header ends inside the payload.
+        if header_size > payload.len() || header_varint_len > header_size {
             return Err(LimboError::Corrupt(
                 "Payload too small for indicated header size".into(),
             ));
@@ -3229,14 +3228,10 @@ pub fn get_serial_type_size(serial: u64) -> Result<usize> {
         4 => Ok(4),
         5 => Ok(6),
         6 | 7 => Ok(8),
-        n if n >= 12 => match n % 2 {
-            0 => Ok(((n - 12) / 2) as usize), // Blob
-            1 => Ok(((n - 13) / 2) as usize), // Text
-            _ => {
-                mark_unlikely();
-                unreachable!();
-            }
-        },
+        // Blob is even and Text is odd, and both leave the same size after
+        // integer division: 12 and 13 both hold nothing, 14 and 15 both hold
+        // one byte. One subtraction covers the pair.
+        n if n >= 12 => Ok(((n - 12) / 2) as usize),
         _ => {
             mark_unlikely();
             Err(LimboError::Corrupt(format!(
@@ -3375,11 +3370,13 @@ impl Record {
 }
 
 pub enum Cursor {
-    /// A b-tree cursor
-    BTree(Box<BTreeCursor>),
+    /// A b-tree cursor, with the sort orders and collations of its key beside
+    /// it when it reads an index. The comparison opcodes need both at once,
+    /// and the cursor is borrowed for the whole time they hold its payload.
+    BTree(Box<BTreeCursor>, Option<Arc<IndexInfo>>),
     /// A cursor behind a trait object: currently, either the MVCC cursor or test doubles.
     /// TODO it wouldn't be too hard to get rid of `dyn CursorTrait` everywhere.
-    Dyn(Box<dyn CursorTrait>),
+    Dyn(Box<dyn CursorTrait>, Option<Arc<IndexInfo>>),
     IndexMethod(Box<dyn IndexMethodCursor>),
     Pseudo(Box<PseudoCursor>),
     Sorter(Box<Sorter>),
@@ -3409,12 +3406,14 @@ impl Cursor {
     pub fn new_btree(cursor: Box<BTreeCursor>) -> Self {
         // Matches sqlite3BtreeCursor adding to BtShared.pCursor (btree.c:4699).
         cursor.register_with_pager();
-        Self::BTree(cursor)
+        let index_info = cursor.index_info().cloned();
+        Self::BTree(cursor, index_info)
     }
 
     pub fn new_btree_dyn(cursor: Box<dyn CursorTrait>) -> Self {
         cursor.register_with_pager();
-        Self::Dyn(cursor)
+        let index_info = cursor.index_info().cloned();
+        Self::Dyn(cursor, index_info)
     }
 
     pub fn new_pseudo(cursor: PseudoCursor) -> Self {
@@ -3433,13 +3432,39 @@ impl Cursor {
 
     pub fn as_btree_mut(&mut self) -> &mut dyn CursorTrait {
         match self {
-            Self::BTree(cursor) => cursor.as_mut(),
-            Self::Dyn(cursor) => cursor.as_mut(),
+            Self::BTree(cursor, _) => cursor.as_mut(),
+            Self::Dyn(cursor, _) => cursor.as_mut(),
             _ => {
                 mark_unlikely();
                 panic!("Cursor is not a btree cursor");
             }
         }
+    }
+
+    /// The cursor and its key's sort orders and collations, from one borrow.
+    /// The comparison opcodes read the index info while the payload they
+    /// compare still holds the cursor.
+    pub fn as_index_cursor_mut(&mut self) -> (&mut dyn CursorTrait, &IndexInfo) {
+        let (cursor, index_info) = match self {
+            Self::BTree(cursor, index_info) => {
+                (cursor.as_mut() as &mut dyn CursorTrait, index_info)
+            }
+            Self::Dyn(cursor, index_info) => (cursor.as_mut(), index_info),
+            _ => {
+                mark_unlikely();
+                panic!("Cursor is not a btree cursor");
+            }
+        };
+        let index_info = index_info
+            .as_ref()
+            .expect("an index comparison needs a cursor opened on an index");
+        crate::turso_debug_assert!(
+            cursor
+                .index_info()
+                .is_some_and(|own| Arc::ptr_eq(own, index_info)),
+            "the cursor's index info is not the one stored beside it"
+        );
+        (cursor, index_info)
     }
 
     pub fn as_pseudo_mut(&mut self) -> &mut PseudoCursor {
@@ -3497,8 +3522,8 @@ impl Cursor {
     /// Move the cursor to a synthetic null row. See [Insn::NullRow]
     pub fn set_null_flag(&mut self, flag: bool) {
         match self {
-            Self::BTree(cursor) => cursor.set_null_flag(flag),
-            Self::Dyn(cursor) => cursor.set_null_flag(flag),
+            Self::BTree(cursor, ..) => cursor.set_null_flag(flag),
+            Self::Dyn(cursor, ..) => cursor.set_null_flag(flag),
             Self::Virtual(cursor) => cursor.set_null_flag(flag),
             // A pseudo cursor always decodes columns from its content
             // register. SQLite's OP_NullRow likewise leaves pseudo-cursor
@@ -3791,6 +3816,49 @@ mod tests {
     use crate::alloc::vec;
     use crate::translate::collate::CollationSeq;
     use asserting::prelude::*;
+
+    #[test]
+    fn value_iterator_rejects_a_header_that_does_not_fit_its_payload() {
+        assert_that!(ValueIterator::new(&[]).is_err()).is_true();
+        assert_that!(ValueIterator::new(&[2]).is_err()).is_true();
+        assert_that!(ValueIterator::new(&[9, 1]).is_err()).is_true();
+        assert_that!(ValueIterator::new(&[0, 1, 0]).is_err()).is_true();
+        assert_that!(ValueIterator::new(&[129, 0, 1, 0]).is_err()).is_true();
+        assert_that!(ValueIterator::new(&[1, 1, 0]).unwrap().next().is_none()).is_true();
+        let mut iterator = ValueIterator::new(&[2, 1, 7]).unwrap();
+        let value = iterator.next().unwrap().unwrap();
+        assert_that!(matches!(value, ValueRef::Numeric(Numeric::Integer(7)))).is_true();
+        assert_that!(iterator.next().is_none()).is_true();
+    }
+
+    #[test]
+    fn serial_type_size_matches_the_length_the_kind_carries() {
+        for serial in 0u64..=64 {
+            let expected = match serial {
+                0 | 8 | 9 => Some(0),
+                1..=4 => Some(serial as usize),
+                5 => Some(6),
+                6 | 7 => Some(8),
+                10 | 11 => None,
+                n if n % 2 == 0 => Some((n as usize - 12) / 2),
+                n => Some((n as usize - 13) / 2),
+            };
+            match expected {
+                Some(size) => {
+                    assert_that!(get_serial_type_size(serial).unwrap())
+                        .described_as(format!("serial type {serial}"))
+                        .is_equal_to(size);
+                }
+                None => {
+                    assert_that!(get_serial_type_size(serial).is_err())
+                        .described_as(format!("serial type {serial}"))
+                        .is_true();
+                }
+            }
+        }
+        assert_that!(get_serial_type_size(u64::MAX - 1).unwrap())
+            .is_equal_to((u64::MAX as usize - 1 - 12) / 2);
+    }
 
     #[test]
     fn is_ascii_checks_every_byte_of_every_length() {

@@ -109,21 +109,12 @@ impl PageSize {
 
     /// Interpret a user-provided u32 as either a valid page size or None.
     pub const fn new(size: u32) -> Option<Self> {
-        if size < PageSize::MIN || size > PageSize::MAX {
-            return None;
-        }
-
-        // Page size must be a power of two.
-        if size.count_ones() != 1 {
-            return None;
-        }
-
-        if size == PageSize::MAX {
+        match size {
+            512 | 1024 | 2048 | 4096 | 8192 | 16384 | 32768 => Some(Self(U16BE::new(size as u16))),
             // Internally, the value 1 represents 65536, since the on-disk value of the page size in the DB header is 2 bytes.
-            return Some(Self(U16BE::new(1)));
+            PageSize::MAX => Some(Self(U16BE::new(1))),
+            _ => None,
         }
-
-        Some(Self(U16BE::new(size as u16)))
     }
 
     /// Interpret a u16 on disk (DB file header) as either a valid page size or
@@ -813,6 +804,19 @@ pub struct TableInteriorCell {
     pub rowid: i64,
 }
 
+impl BTreeCell {
+    /// The first page of this cell's overflow chain, or None when the whole
+    /// payload sits on the page. A table interior cell holds no payload.
+    pub fn first_overflow_page(&self) -> Option<u32> {
+        match self {
+            BTreeCell::TableInteriorCell(_) => None,
+            BTreeCell::TableLeafCell(cell) => cell.first_overflow_page,
+            BTreeCell::IndexInteriorCell(cell) => cell.first_overflow_page,
+            BTreeCell::IndexLeafCell(cell) => cell.first_overflow_page,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct TableLeafCell {
     pub rowid: i64,
@@ -1279,6 +1283,56 @@ pub fn read_text(payload: &[u8]) -> Result<&str> {
     })
 }
 
+/// The rowid an index record keeps as its last value, read without walking
+/// the record.
+///
+/// An index record ends with its rowid, and an integer serial type is one
+/// byte, so the last byte of the header is the rowid's serial type whenever
+/// the byte before it ends a varint. The value sits at the end of the data,
+/// so its offset follows from the payload length alone and none of the
+/// earlier serial types or values have to be decoded. Returns `None` when
+/// the record does not have that shape, which leaves the caller to walk it.
+#[inline]
+pub fn read_index_rowid(payload: &[u8]) -> Option<i64> {
+    let (header_size, _) = read_varint(payload).ok()?;
+    let header = payload.get(..header_size as usize)?;
+    let data = &payload[header.len()..];
+    let [.., before_last_type, last_type] = header else {
+        return None;
+    };
+    if *before_last_type >= 0x80 {
+        return None;
+    }
+    let rowid = match *last_type {
+        1 => *data.last()? as i8 as i64,
+        2 => i16::from_be_bytes(*data.last_chunk()?) as i64,
+        3 => {
+            let [high, mid, low] = *data.last_chunk()?;
+            i32::from_be_bytes([sign_fill(high), high, mid, low]) as i64
+        }
+        4 => i32::from_be_bytes(*data.last_chunk()?) as i64,
+        5 => {
+            let [high, b, c, d, e, low] = *data.last_chunk()?;
+            let fill = sign_fill(high);
+            i64::from_be_bytes([fill, fill, high, b, c, d, e, low])
+        }
+        6 => i64::from_be_bytes(*data.last_chunk()?),
+        8 => 0,
+        9 => 1,
+        _ => return None,
+    };
+    Some(rowid)
+}
+
+#[inline(always)]
+fn sign_fill(high_byte: u8) -> u8 {
+    if high_byte <= 0x7f {
+        0x00
+    } else {
+        0xff
+    }
+}
+
 #[inline(always)]
 pub fn read_integer(buf: &[u8], serial_type: u8) -> Result<i64> {
     match serial_type {
@@ -1354,6 +1408,12 @@ pub fn read_varint(buf: &[u8]) -> Result<(u64, usize)> {
         [b0, b1, ..] if *b1 < 0x80 => {
             return Ok(((((*b0 & 0x7f) as u64) << 7) | *b1 as u64, 2));
         }
+        [b0, b1, b2, ..] if *b2 < 0x80 => {
+            return Ok((
+                (((*b0 & 0x7f) as u64) << 14) | (((*b1 & 0x7f) as u64) << 7) | *b2 as u64,
+                3,
+            ));
+        }
         _ => {}
     }
     let mut v: u64 = 0;
@@ -1388,6 +1448,44 @@ pub fn read_varint(buf: &[u8]) -> Result<(u64, usize)> {
             bail_corrupt_error!("Invalid varint");
         }
     }
+}
+
+/// The number of bytes the varint at the front of `buf` takes. A caller that
+/// only has to step over a varint pays for none of the shifting and masking
+/// that builds its value; the three lengths written out here cover every
+/// rowid below two million, and anything longer goes through the reader.
+#[inline(always)]
+pub fn read_varint_len(buf: &[u8]) -> Result<usize> {
+    match buf {
+        [b0, ..] if *b0 < 0x80 => Ok(1),
+        [_, b1, ..] if *b1 < 0x80 => Ok(2),
+        [_, _, b2, ..] if *b2 < 0x80 => Ok(3),
+        _ => read_varint_len_long(buf),
+    }
+}
+
+#[inline(never)]
+fn read_varint_len_long(buf: &[u8]) -> Result<usize> {
+    read_varint(buf).map(|(_, len)| len)
+}
+
+/// Reads a varint at the front of `buf` and returns it together with the
+/// bytes after it.
+///
+/// The caller would otherwise re-slice `buf` by the length this returns, and
+/// pay a bounds check to do it. Cutting the tail off inside the reader, where
+/// the slice pattern already proves the length, costs nothing.
+#[inline(always)]
+pub fn split_varint(buf: &[u8]) -> Result<(u64, &[u8])> {
+    match buf {
+        [b0, rest @ ..] if *b0 < 0x80 => return Ok((*b0 as u64, rest)),
+        [b0, b1, rest @ ..] if *b1 < 0x80 => {
+            return Ok(((((*b0 & 0x7f) as u64) << 7) | *b1 as u64, rest));
+        }
+        _ => {}
+    }
+    let (value, len) = read_varint(buf)?;
+    Ok((value, &buf[len..]))
 }
 
 #[inline(always)]
@@ -2305,6 +2403,25 @@ mod tests {
     use rstest::rstest;
 
     #[rstest]
+    #[case(0, None)]
+    #[case(1, None)]
+    #[case(511, None)]
+    #[case(512, Some(512))]
+    #[case(513, None)]
+    #[case(4096, Some(4096))]
+    #[case(6144, None)]
+    #[case(32768, Some(32768))]
+    #[case(65536, Some(65536))]
+    #[case(65537, None)]
+    #[case(u32::MAX, None)]
+    fn page_size_accepts_only_a_power_of_two_in_range(
+        #[case] size: u32,
+        #[case] expected: Option<u32>,
+    ) {
+        assert_eq!(PageSize::new(size).map(PageSize::get), expected);
+    }
+
+    #[rstest]
     #[case(PageType::TableLeaf, 4096, 0, None)]
     #[case(PageType::TableLeaf, 4096, 4061, None)]
     #[case(PageType::TableLeaf, 4096, 4062, Some(493))]
@@ -2649,5 +2766,75 @@ mod tests {
         let mut buf = [0u8; 9];
         let written = write_varint(&mut buf, value);
         varint_len(value) == written
+    }
+
+    #[quickcheck_macros::quickcheck]
+    fn read_varint_reads_back_what_write_varint_wrote(value: u64) -> bool {
+        let mut buf = [0u8; 9];
+        let written = write_varint(&mut buf, value);
+        read_varint(&buf[..written])
+            .map(|(read, len)| read == value && len == written)
+            .unwrap_or(false)
+    }
+
+    #[quickcheck_macros::quickcheck]
+    fn split_varint_matches_read_varint(bytes: Vec<u8>) -> bool {
+        match (split_varint(&bytes), read_varint(&bytes)) {
+            (Ok((split_value, rest)), Ok((value, len))) => {
+                split_value == value && rest == &bytes[len..]
+            }
+            (Err(_), Err(_)) => true,
+            _ => false,
+        }
+    }
+
+    /// The reader writes out the one- and two-byte cases and sends the rest
+    /// through `read_varint`, so the tail has to come out right at all nine
+    /// lengths, not just the two that random bytes reach often.
+    #[test]
+    fn split_varint_cuts_the_tail_at_every_varint_length() {
+        let mut seen_lengths = std::collections::HashSet::new();
+        for bits in 0..64 {
+            let value = 1u64 << bits;
+            let mut buf = [0u8; 12];
+            let written = write_varint(&mut buf, value);
+            seen_lengths.insert(written);
+            buf[written..written + 3].copy_from_slice(b"abc");
+            let (read, rest) = split_varint(&buf[..written + 3]).unwrap();
+            assert_eq!(read, value, "value at {written} bytes");
+            assert_eq!(rest, b"abc", "tail at {written} bytes");
+        }
+        assert_eq!(
+            seen_lengths,
+            (1..=9).collect::<std::collections::HashSet<_>>()
+        );
+    }
+
+    #[quickcheck_macros::quickcheck]
+    fn read_varint_len_matches_read_varint(bytes: Vec<u8>) -> bool {
+        match (read_varint_len(&bytes), read_varint(&bytes)) {
+            (Ok(len), Ok((_, expected))) => len == expected,
+            (Err(_), Err(_)) => true,
+            _ => false,
+        }
+    }
+
+    #[quickcheck_macros::quickcheck]
+    fn read_index_rowid_gives_the_integer_the_record_ends_with(
+        leading_texts: Vec<String>,
+        leading_ints: Vec<i64>,
+        rowid: i64,
+    ) -> bool {
+        let mut values: Vec<Value> = leading_texts.into_iter().map(Value::build_text).collect();
+        values.extend(leading_ints.into_iter().map(Value::from_i64));
+        values.push(Value::from_i64(rowid));
+        let record = crate::types::ImmutableRecord::from_values(&values, values.len()).unwrap();
+        read_index_rowid(record.get_payload()) == Some(rowid)
+    }
+
+    #[quickcheck_macros::quickcheck]
+    fn read_index_rowid_stays_inside_whatever_bytes_it_is_given(bytes: Vec<u8>) -> bool {
+        read_index_rowid(&bytes);
+        true
     }
 }

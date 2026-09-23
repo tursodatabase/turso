@@ -1968,8 +1968,8 @@ mod tests {
 
             fn set_has_record(&mut self, _has_record: bool) {}
 
-            fn get_index_info(&self) -> &Arc<IndexInfo> {
-                &self.index_info
+            fn index_info(&self) -> Option<&Arc<IndexInfo>> {
+                Some(&self.index_info)
             }
 
             fn seek_end(&mut self) -> IOResultOr<()> {
