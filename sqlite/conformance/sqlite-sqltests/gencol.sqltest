@@ -5807,3 +5807,29 @@ setup gencol_virtual_columns_after_insert_trigger {
 snapshot gencol_insert_after_trigger_reuses_virtual_columns {
     INSERT INTO t(a, b) VALUES (1, 2);
 }
+
+test gencol_after_update_trigger_new_virtual_column_uses_new_rowid {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, x INT, c AS (id * 10));
+    CREATE TABLE log(old_id, old_c, new_id, new_c);
+    CREATE TRIGGER t_au AFTER UPDATE ON t BEGIN
+        INSERT INTO log VALUES (OLD.id, OLD.c, NEW.id, NEW.c);
+    END;
+    INSERT INTO t(id, x) VALUES (1, 0);
+    UPDATE t SET id = 5 WHERE id = 1;
+    SELECT * FROM log;
+}
+expect {
+    1|10|5|50
+}
+
+setup gencol_virtual_columns_after_update_trigger {
+    CREATE TABLE t(a INTEGER, b INTEGER, c AS (a + b), d AS (c * 2));
+    CREATE TABLE log(x, y);
+    CREATE TRIGGER t_au AFTER UPDATE ON t BEGIN INSERT INTO log VALUES (NEW.d, OLD.d); END;
+}
+
+@skip-if mvcc "mvcc has different root pages"
+@setup gencol_virtual_columns_after_update_trigger
+snapshot gencol_update_after_trigger_reuses_virtual_columns {
+    UPDATE t SET a = 5;
+}

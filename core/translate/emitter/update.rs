@@ -2553,38 +2553,6 @@ fn emit_update_insns<'a>(
                     &btree_table,
                 );
                 if !relevant_triggers.is_empty() {
-                    let columns = target_table.table.columns();
-
-                    // Compute VIRTUAL columns for NEW values
-                    //TODO only emit required virtual columns
-                    let bt = target_table.table.btree().ok_or_else(|| {
-                        crate::LimboError::InternalError(
-                            "UPDATE on virtual table has no btree".into(),
-                        )
-                    })?;
-                    let new_ctx = DmlColumnContext::layout(columns, start, beg, layout.clone());
-                    compute_virtual_columns(
-                        program,
-                        &btree_table.columns_topo_sort()?,
-                        &new_ctx,
-                        &t_ctx.resolver,
-                        &bt,
-                    )?;
-
-                    // Compute VIRTUAL columns for OLD values if we have preserved OLD registers
-                    if let Some(ref old_regs) = preserved_old_registers {
-                        let pairs = columns.iter().zip(old_regs.iter().copied());
-                        //TODO only emit required virtual columns
-                        let old_ctx = DmlColumnContext::from_column_reg_mapping(pairs);
-                        compute_virtual_columns(
-                            program,
-                            &btree_table.columns_topo_sort()?,
-                            &old_ctx,
-                            &t_ctx.resolver,
-                            &bt,
-                        )?;
-                    }
-
                     // Build raw NEW registers. Values are encoded at this point;
                     // fire_trigger will decode them via decode_trigger_registers.
                     let new_registers_after: Vec<usize> = (0..col_len)
