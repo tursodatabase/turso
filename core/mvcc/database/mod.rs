@@ -9,6 +9,7 @@ use crate::mvcc::yield_hooks::{ProvidesYieldContext, YieldContext, YieldPointMar
 use crate::mvcc::yield_points::{inject_transition_failure, inject_transition_yield};
 use crate::schema::{Schema, Sequence, Table};
 use crate::skiplist::comparator::BasicComparator;
+use crate::skiplist::equivalent::{Comparable, Equivalent};
 use crate::skiplist::map::Entry;
 use crate::skiplist::SkipMap;
 use crate::state_machine::StateMachine;
@@ -231,10 +232,10 @@ impl SortableIndexKey {
     }
 
     fn compare(&self, other: &Self) -> Result<std::cmp::Ordering> {
-        // We sometimes need to compare a shorter key to a longer one,
-        // for example when seeking with an index key that is a prefix of the full key.
-        let num_cols = self.metadata.num_cols.min(other.metadata.num_cols);
+        self.compare_first_columns(other, self.metadata.num_cols.min(other.metadata.num_cols))
+    }
 
+    fn compare_first_columns(&self, other: &Self, num_cols: usize) -> Result<std::cmp::Ordering> {
         if num_cols > 0 {
             if let Some(cmp) = compare_leading_binary_text(
                 self.key.get_payload(),
@@ -449,6 +450,25 @@ impl PartialOrd for SortableIndexKey {
 impl Ord for SortableIndexKey {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
         self.compare(other).expect("Failed to compare IndexKeys")
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct IndexKeyPrefix {
+    pub key: SortableIndexKey,
+    pub num_cols: usize,
+}
+
+impl Equivalent<IndexKeyPrefix> for Arc<SortableIndexKey> {
+    fn equivalent(&self, prefix: &IndexKeyPrefix) -> bool {
+        Comparable::compare(self, prefix) == std::cmp::Ordering::Equal
+    }
+}
+
+impl Comparable<IndexKeyPrefix> for Arc<SortableIndexKey> {
+    fn compare(&self, prefix: &IndexKeyPrefix) -> std::cmp::Ordering {
+        self.compare_first_columns(&prefix.key, prefix.num_cols.min(self.metadata.num_cols))
+            .expect("Failed to compare IndexKeys")
     }
 }
 
@@ -2289,17 +2309,11 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CommitStateMachine<Clock, A> {
             return Ok(());
         }
 
-        // Create a prefix key over the indexed columns for range lookup.
-        // Due to SortableIndexKey's Ord using min(num_cols), this key compares Equal
-        // to all entries with the same indexed columns (regardless of rowid).
-        let prefix_key = {
-            let mut index_info = record.metadata.as_ref().clone();
-            index_info.num_cols = num_indexed_cols;
-            SortableIndexKey {
-                key: record.key.clone(),
-                metadata: Arc::new(index_info),
-                _validated_text: ValidatedIndexText,
-            }
+        // This prefix compares Equal to all entries with the same indexed columns
+        // (regardless of rowid).
+        let prefix_key = IndexKeyPrefix {
+            key: record.as_ref().clone(),
+            num_cols: num_indexed_cols,
         };
 
         let table_id = rowid.table_id;
@@ -2312,7 +2326,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CommitStateMachine<Clock, A> {
         // Use range to efficiently find all entries that match the prefix.
         // Since entries are ordered by Ord, all entries with the same indexed columns
         // are contiguous. We start from the prefix_key and stop when prefix no longer matches.
-        for entry in index_rows.range::<SortableIndexKey, _>(&prefix_key..) {
+        for entry in index_rows.range::<IndexKeyPrefix, _>(&prefix_key..) {
             let other_key = entry.key();
             // Check if prefix still matches - if not, we've passed all matching entries
             if !record.matches_prefix(other_key, num_indexed_cols)? {
@@ -6449,7 +6463,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
     pub(crate) fn seek_index(
         &self,
         index_id: MVTableId,
-        start: SortableIndexKey,
+        start: IndexKeyPrefix,
         inclusive: bool,
         eq_only: bool,
         direction: IterationDirection,
@@ -6465,8 +6479,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
             // stops at the matching cluster instead of scanning forward over every
             // invisible neighbor until it happens to find the next visible row.
             //
-            // `SortableIndexKey` ordering compares only the probe's columns (see
-            // `SortableIndexKey::compare`, which clamps to `min(num_cols)`), so
+            // An `IndexKeyPrefix` compares only its first `num_cols` columns, so
             // `start..=start` captures all entries sharing the probed prefix
             // regardless of their trailing rowid — exactly the set an eq-only seek
             // may match. Without this bound a single seek costs O(pending invisible
@@ -10644,7 +10657,7 @@ impl RowidAllocator {
     }
 }
 
-pub fn create_seek_range<K: Ord>(
+pub fn create_seek_range<K>(
     limit_boundary: Bound<K>,
     direction: IterationDirection,
 ) -> (Bound<K>, Bound<K>) {

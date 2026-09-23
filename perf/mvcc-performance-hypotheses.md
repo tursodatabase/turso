@@ -792,6 +792,40 @@ for 20,000 random pairs with lengths up to 31 and shared prefixes.
 
 Scenarios that compare no text keys changed by at most two instructions.
 
+## H31. Seeks and unique checks copy `IndexInfo` to shorten the column count — `fixed`
+
+**Where:** DHAT (`valgrind --tool=dhat`) shows about 36 allocations per row in
+`batch_insert_commit`. Four of them come from two places that build a copy of
+the index's `IndexInfo` only to change `num_cols`, an `Arc` and a `key_info`
+`Vec` each:
+
+- an index seek builds one for a seek key with fewer columns than the index. The
+  cursor kept it, but cursors last one statement, and every batch row is its
+  own statement.
+- the commit-time unique check clones one per inserted key, to compare only the
+  indexed columns and not the rowid.
+
+**Fix:** `IndexKeyPrefix` pairs a key with the number of leading columns to
+compare, like SQLite's `UnpackedRecord.nField` next to a shared `KeyInfo`. The
+skip list compares stored keys against it through `Comparable`, so both
+searches use the index's own `IndexInfo`. The order is the same as before: the
+number of columns compared is still the smaller of the two keys' counts.
+
+**Callgrind, 200/2,200 iterations:**
+
+| Scenario | Before | After | Change |
+|---|---:|---:|---:|
+| `batch_insert_commit` | 1,502,498 | 1,481,590 | -1.4% |
+| `insert_rollback` | 47,051 | 45,229 | -3.9% |
+| `index_read_btree` | 33,159 | 32,392 | -2.3% |
+| `delete_commit` | 51,423 | 50,332 | -2.1% |
+| `insert_commit` | 62,318 | 61,229 | -1.7% |
+| `index_read` | 26,445 | 26,012 | -1.6% |
+| `index_scan_128` | 191,434 | 189,214 | -1.2% |
+
+Scenarios without an index moved by less than 1.3% in both directions, within
+the usual spread between builds.
+
 ## Final measured totals
 
 The branch was rebased after `origin/main` gained unrelated planner work and an

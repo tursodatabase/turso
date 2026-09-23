@@ -5,8 +5,8 @@ use crate::types::IOResultOr;
 
 use crate::mvcc::clock::LogicalClock;
 use crate::mvcc::database::{
-    create_seek_range, MVTableId, MvStore, MvccReadSnapshot, Row, RowID, RowKey, RowVersions,
-    SortableIndexKey,
+    create_seek_range, IndexKeyPrefix, MVTableId, MvStore, MvccReadSnapshot, Row, RowID, RowKey,
+    RowVersions, SortableIndexKey,
 };
 #[cfg(any(test, injected_yields))]
 use crate::mvcc::yield_hooks::{ProvidesYieldContext, YieldContext, YieldPointMarker};
@@ -544,9 +544,6 @@ pub struct MvccLazyCursor<Clock: LogicalClock + 'static, A: ConcurrentAllocator 
     /// Eq-only table seek copies the occupying payload under the version lock.
     /// Passive GC can empty the live chain before Column.
     eq_seek_row: Option<Row>,
-    /// Index metadata for the most recent index seek key, reused while seek
-    /// keys keep the same column count.
-    seek_key_index_info: Option<Arc<IndexInfo>>,
     /// Set once the B-tree is readable at this cursor's snapshot. It stays
     /// readable for the cursor's lifetime.
     btree_readable: bool,
@@ -620,7 +617,6 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> MvccLazyCursor<Clock
             table_id,
             reusable_immutable_record: None,
             eq_seek_row: None,
-            seek_key_index_info: None,
             btree_readable: false,
             btree_cursor,
             null_flag: false,
@@ -1247,26 +1243,6 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> MvccLazyCursor<Clock
         }
         Ok(())
     }
-
-    fn seek_key_index_info(&mut self, column_count: usize) -> Result<Arc<IndexInfo>> {
-        if let Some(index_info) = &self.seek_key_index_info {
-            if index_info.num_cols == column_count {
-                return Ok(index_info.clone());
-            }
-        }
-        let MvccCursorType::Index(index_info) = &self.mv_cursor_type else {
-            panic!("SeekKey::IndexKey requires Index cursor type");
-        };
-        let seek_key_index_info = Arc::new(IndexInfo::new_in(
-            index_info.key_info.iter().cloned(),
-            index_info.has_rowid,
-            column_count,
-            index_info.is_unique,
-            self.db.allocator(),
-        )?);
-        self.seek_key_index_info = Some(seek_key_index_info.clone());
-        Ok(seek_key_index_info)
-    }
 }
 
 impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> Drop for MvccLazyCursor<Clock, A> {
@@ -1694,17 +1670,22 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> CursorTrait
                             }
                         }
                         SeekKey::IndexKey(index_key) => {
-                            let index_info = self.seek_key_index_info(index_key.column_count())?;
-                            let sortable_key = SortableIndexKey::new_from_payload_in(
-                                index_key,
-                                index_info,
-                                self.db.allocator(),
-                            )?;
+                            let MvccCursorType::Index(index_info) = &self.mv_cursor_type else {
+                                panic!("SeekKey::IndexKey requires Index cursor type");
+                            };
+                            let prefix = IndexKeyPrefix {
+                                key: SortableIndexKey::new_from_payload_in(
+                                    index_key,
+                                    index_info.clone(),
+                                    self.db.allocator(),
+                                )?,
+                                num_cols: index_key.column_count(),
+                            };
 
                             // Seek in MVCC (synchronous)
                             let mvcc_rowid = self.db.seek_index(
                                 self.table_id,
-                                sortable_key.clone(),
+                                prefix,
                                 inclusive,
                                 op.eq_only(),
                                 direction,
