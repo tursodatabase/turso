@@ -473,6 +473,97 @@ fn sortable_index_key_keeps_checked_collation_semantics() {
     assert!(invalid.is_err());
 }
 
+#[test]
+fn sortable_index_key_order_matches_value_comparison() {
+    use crate::translate::collate::CollationSeq;
+    use turso_parser::ast::SortOrder;
+
+    fn random_leading_value(rng: &mut ChaCha8Rng) -> Value {
+        match rng.random_range(0..10) {
+            0 => Value::Null,
+            1 => Value::from_i64(rng.random_range(-3..3)),
+            2 => Value::Blob(crate::alloc::vec![rng.random_range(0..3u8)]),
+            _ => {
+                let len = match rng.random_range(0..4) {
+                    0 => 0,
+                    1 => rng.random_range(55..70),
+                    _ => rng.random_range(1..6),
+                };
+                let text: String = (0..len)
+                    .map(|_| ['a', 'b', 'B', 'é'][rng.random_range(0..4)])
+                    .collect();
+                Value::Text(Text::new(text))
+            }
+        }
+    }
+
+    let mut rng = ChaCha8Rng::seed_from_u64(0x5eed);
+    for sort_order in [SortOrder::Asc, SortOrder::Desc] {
+        for collation in [CollationSeq::Binary, CollationSeq::NoCase] {
+            let key_info = [
+                crate::types::KeyInfo {
+                    sort_order,
+                    collation,
+                    nulls_order: None,
+                },
+                crate::types::KeyInfo {
+                    sort_order: SortOrder::Asc,
+                    collation: CollationSeq::Binary,
+                    nulls_order: None,
+                },
+            ];
+            let metadata = |num_cols: usize| {
+                Arc::new(IndexInfo::new(key_info.iter().cloned(), true, num_cols, false).unwrap())
+            };
+            let full = metadata(2);
+            let prefix = metadata(1);
+            for _ in 0..2000 {
+                let lhs_values = [
+                    random_leading_value(&mut rng),
+                    Value::from_i64(rng.random_range(0..3)),
+                ];
+                let rhs_values = [
+                    random_leading_value(&mut rng),
+                    Value::from_i64(rng.random_range(0..3)),
+                ];
+                let rhs_is_prefix = rng.random_range(0..4) == 0;
+                let rhs_cols = if rhs_is_prefix { 1 } else { 2 };
+                let lhs_record = ImmutableRecord::from_values(&lhs_values, 2).unwrap();
+                let rhs_record =
+                    ImmutableRecord::from_values(&rhs_values[..rhs_cols], rhs_cols).unwrap();
+                let lhs = SortableIndexKey::new_from_payload_in(
+                    &lhs_record,
+                    full.clone(),
+                    TursoAllocator,
+                )
+                .unwrap();
+                let rhs_metadata = if rhs_is_prefix {
+                    prefix.clone()
+                } else {
+                    full.clone()
+                };
+                let rhs = SortableIndexKey::new_from_payload_in(
+                    &rhs_record,
+                    rhs_metadata,
+                    TursoAllocator,
+                )
+                .unwrap();
+                let expected = compare_immutable(
+                    lhs_values[..rhs_cols].iter(),
+                    rhs_values[..rhs_cols].iter(),
+                    &key_info[..rhs_cols],
+                );
+                assert_eq!(
+                    lhs.cmp(&rhs),
+                    expected,
+                    "{lhs_values:?} vs {:?} ({sort_order:?}, {collation:?})",
+                    &rhs_values[..rhs_cols]
+                );
+            }
+        }
+    }
+}
+
 #[cfg(nightly)]
 #[test]
 fn row_payload_allocation_uses_passed_allocator() {
