@@ -5,6 +5,7 @@ pub mod expression_index;
 pub mod fts;
 pub mod grammar_generator;
 pub mod helpers;
+pub mod interrupt;
 pub mod join;
 pub mod journal_mode;
 pub mod mvcc_rowid_allocator;
