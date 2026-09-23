@@ -5795,3 +5795,15 @@ setup gencol_untyped_virtual_columns {
 snapshot gencol_select_untyped_virtual_columns {
     SELECT c, d FROM t;
 }
+
+setup gencol_virtual_columns_after_insert_trigger {
+    CREATE TABLE t(a INTEGER, b INTEGER, c AS (a + b), d AS (c * 2));
+    CREATE TABLE log(x, y);
+    CREATE TRIGGER t_ai AFTER INSERT ON t BEGIN INSERT INTO log VALUES (NEW.c, NEW.d); END;
+}
+
+@skip-if mvcc "mvcc has different root pages"
+@setup gencol_virtual_columns_after_insert_trigger
+snapshot gencol_insert_after_trigger_reuses_virtual_columns {
+    INSERT INTO t(a, b) VALUES (1, 2);
+}
