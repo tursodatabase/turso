@@ -113,6 +113,36 @@ impl WriteRow {
         record_values: Vec<Value>,
         weight: isize,
     ) -> IOResultOr<()> {
+        self.write(cursors, index_key, record_values, WeightUpdate::Add(weight))
+    }
+
+    /// Write a row that is either present with weight 1 or absent, whatever
+    /// weight it had before.
+    pub fn set_row(
+        &mut self,
+        cursors: &mut DbspStateCursors,
+        index_key: Vec<Value>,
+        record_values: Vec<Value>,
+        present: bool,
+    ) -> IOResultOr<()> {
+        self.write(
+            cursors,
+            index_key,
+            record_values,
+            WeightUpdate::Set(isize::from(present)),
+        )
+    }
+
+    fn write(
+        &mut self,
+        cursors: &mut DbspStateCursors,
+        index_key: Vec<Value>,
+        record_values: Vec<Value>,
+        update: WeightUpdate,
+    ) -> IOResultOr<()> {
+        let weight = match update {
+            WeightUpdate::Add(weight) | WeightUpdate::Set(weight) => weight,
+        };
         loop {
             match self {
                 WriteRow::GetRecord => {
@@ -127,9 +157,13 @@ impl WriteRow {
                     ));
 
                     if !matches!(res, SeekResult::Found) {
-                        // Row doesn't exist, we'll insert a new one
-                        *self = WriteRow::ComputeNewRowId {
-                            final_weight: weight,
+                        *self = match update {
+                            WeightUpdate::Set(0) => WriteRow::Done,
+                            WeightUpdate::Add(_) | WeightUpdate::Set(_) => {
+                                WriteRow::ComputeNewRowId {
+                                    final_weight: weight,
+                                }
+                            }
                         };
                     } else {
                         // Found in index, get the rowid it points to
@@ -179,7 +213,10 @@ impl WriteRow {
                             }
                         };
 
-                        let final_weight = existing_weight + weight;
+                        let final_weight = match update {
+                            WeightUpdate::Add(weight) => existing_weight + weight,
+                            WeightUpdate::Set(weight) => weight,
+                        };
                         if final_weight <= 0 {
                             // Store index_key for later deletion of index entry
                             *self = WriteRow::Delete { rowid }
@@ -300,6 +337,12 @@ impl WriteRow {
             }
         }
     }
+}
+
+#[derive(Debug, Clone, Copy)]
+enum WeightUpdate {
+    Add(isize),
+    Set(isize),
 }
 
 #[cfg(test)]
