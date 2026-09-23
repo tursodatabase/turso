@@ -5761,13 +5761,13 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                     // Get the Arc key from the map entry for savepoint tracking
                     let arc_key = row_versions_entry.key().clone();
                     let row_versions = row_versions_entry.value().clone();
+                    let tx_entry = self
+                        .txs
+                        .get(&tx_id)
+                        .ok_or_else(|| LimboError::NoSuchTransactionID(tx_id.to_string()))?;
+                    let tx = tx_entry.value();
+                    turso_assert_eq!(tx.state, TransactionState::Active);
                     for rv in row_versions.write().iter_mut().rev() {
-                        let tx = self
-                            .txs
-                            .get(&tx_id)
-                            .ok_or_else(|| LimboError::NoSuchTransactionID(tx_id.to_string()))?;
-                        let tx = tx.value();
-                        turso_assert_eq!(tx.state, TransactionState::Active);
                         // A transaction cannot delete a version that it cannot see.
                         // B-tree deletion markers are not visible versions, but their
                         // end fields can still indicate a write-write conflict.
@@ -5783,11 +5783,6 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
 
                         let version_id = rv.id;
                         rv.set_end(Some(TxTimestampOrID::TxID(tx.tx_id)));
-                        let tx = self
-                            .txs
-                            .get(&tx_id)
-                            .ok_or_else(|| LimboError::NoSuchTransactionID(tx_id.to_string()))?;
-                        let tx = tx.value();
                         tx.insert_to_write_set(id, row_versions.clone());
                         tx.record_deleted_index_version((index_id, arc_key), version_id);
                         return Ok(true);
@@ -5799,14 +5794,14 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                 let row_versions_opt = self.rows.get(&id);
                 if let Some(ref row_versions_entry) = row_versions_opt {
                     let row_versions = row_versions_entry.value().clone();
+                    let tx_entry = self
+                        .txs
+                        .get(&tx_id)
+                        .ok_or_else(|| LimboError::NoSuchTransactionID(tx_id.to_string()))?;
+                    let tx = tx_entry.value();
+                    turso_assert_eq!(tx.state, TransactionState::Active);
                     let mut locked_row_versions = row_versions.write();
                     for rv in locked_row_versions.iter_mut().rev() {
-                        let tx = self
-                            .txs
-                            .get(&tx_id)
-                            .ok_or_else(|| LimboError::NoSuchTransactionID(tx_id.to_string()))?;
-                        let tx = tx.value();
-                        turso_assert_eq!(tx.state, TransactionState::Active);
                         // A transaction cannot delete a version that it cannot see.
                         // B-tree deletion markers are not visible versions, but their
                         // end fields can still indicate a write-write conflict.
@@ -5823,12 +5818,6 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                         let version_id = rv.id;
                         rv.set_end(Some(TxTimestampOrID::TxID(tx.tx_id)));
                         drop(locked_row_versions);
-                        drop(row_versions_opt);
-                        let tx = self
-                            .txs
-                            .get(&tx_id)
-                            .ok_or_else(|| LimboError::NoSuchTransactionID(tx_id.to_string()))?;
-                        let tx = tx.value();
                         tx.insert_to_write_set(id.clone(), row_versions.clone());
                         tx.record_deleted_table_version(id.clone(), version_id);
                         return Ok(true);

@@ -627,6 +627,32 @@ Updates still search for the key as often as before, but no longer clone the
 visible row to find out that it exists. The read workloads changed by less
 than 0.2%.
 
+## H26. MVCC cursors allocate a new record buffer per statement — `rejected`
+
+Each MVCC cursor allocated a 1,024-byte record buffer the first time it
+returned a version-store row, and freed it with the cursor. Taking the buffer
+from the pager's record pool, which B-tree cursors already use, and returning
+it when the cursor drops changed every workload by -0.4% to +0.2%. The change
+was reverted.
+
+## H27. Deletes look up the transaction for every version — `fixed`
+
+**Where:** `delete_from_table_or_index` looked up the transaction for each
+version it examined, and once more after ending the visible version. Updates
+run through it too.
+
+**Fix:** Look the transaction up once after finding the chain.
+
+**Callgrind, 200/2,200 iterations:**
+
+| Scenario | Before | After | Change |
+|---|---:|---:|---:|
+| `delete_commit` | 58,381 | 57,965 | -0.7% |
+| `point_update_commit` | 34,042 | 33,835 | -0.6% |
+| `point_update_rollback` | 31,810 | 31,626 | -0.6% |
+
+No other workload changed.
+
 ## Final measured totals
 
 The branch was rebased after `origin/main` gained unrelated planner work and an
