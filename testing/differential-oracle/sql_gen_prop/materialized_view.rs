@@ -56,6 +56,8 @@ enum Shape {
     FilteredColumns,
     /// SELECT g, COUNT(*) FROM t GROUP BY g
     Aggregate,
+    /// SELECT g, COUNT(*) FROM t GROUP BY g, where g is any column that is not a BLOB
+    AggregateOnAnyColumn,
     /// SELECT t.a, u.b FROM t JOIN u ON t.a = u.b
     Join,
     /// SELECT t.a AS c0, ... FROM t UNION ALL SELECT u.b AS c0, ... FROM u
@@ -138,6 +140,7 @@ pub fn create_materialized_view(schema: &Schema) -> BoxedStrategy<CreateMaterial
         (1, Shape::Star),
         (2, Shape::FilteredColumns),
         (1, Shape::Aggregate),
+        (1, Shape::AggregateOnAnyColumn),
         (1, Shape::ComplexFilterSelfJoin),
     ];
     if sources.len() >= 2 {
@@ -242,10 +245,18 @@ fn select_for_shape(
             vec![ColumnDef::new("cnt", DataType::Integer)],
         ))
         .boxed(),
+        Shape::AggregateOnAnyColumn if !filterable.is_empty() => {
+            proptest::sample::select(filterable)
+                .prop_map(move |group| grouped_count(&name, &group))
+                .boxed()
+        }
         Shape::ComplexFilterSelfJoin if integer_columns >= 2 => (0..COMPLEX_PREDICATE_KINDS)
             .prop_map(move |kind| complex_filter_self_join(&source, kind))
             .boxed(),
-        Shape::Star | Shape::FilteredColumns | Shape::ComplexFilterSelfJoin => Just((
+        Shape::Star
+        | Shape::FilteredColumns
+        | Shape::ComplexFilterSelfJoin
+        | Shape::AggregateOnAnyColumn => Just((
             format!("SELECT * FROM {name}"),
             view_columns(&source.columns),
         ))
@@ -268,6 +279,20 @@ fn select_for_shape(
             .prop_map(move |other| union_all(&source, &other))
             .boxed(),
     }
+}
+
+/// A column other than the first one repeats its values more often, so a group
+/// loses all its rows and comes back.
+fn grouped_count(table: &str, group: &ColumnDef) -> (String, Vec<ColumnDef>) {
+    let g = &group.name;
+    let count = format!("{g}_cnt");
+    (
+        format!("SELECT {g}, COUNT(*) AS {count} FROM {table} GROUP BY {g}"),
+        vec![
+            ColumnDef::new(g.clone(), group.data_type),
+            ColumnDef::new(count, DataType::Integer),
+        ],
+    )
 }
 
 fn join(left: &Table, right: &Table) -> (String, Vec<ColumnDef>) {
@@ -554,6 +579,7 @@ mod tests {
         assert!(sqls.iter().any(|sql| sql.starts_with("SELECT * FROM")));
         assert!(sqls.iter().any(|sql| sql.contains(" WHERE ")));
         assert!(sqls.iter().any(|sql| sql.contains(" GROUP BY ")));
+        assert!(sqls.iter().any(|sql| sql.ends_with("GROUP BY team")));
         assert!(sqls.iter().any(|sql| sql.contains("FROM mv_users")));
         assert!(
             sqls.iter()
