@@ -570,8 +570,15 @@ mod manager {
         }
 
         #[cfg(any(test, feature = "simulator"))]
-        pub fn clear(&self) {
-            self.inner.lock().clear();
+        pub fn remove_path(&self, path: &str) {
+            let file_id = crate::io::get_file_id(path).expect("could not find file");
+            self.remove(&DatabaseKey::File(file_id));
+        }
+
+        #[cfg(any(test, feature = "simulator"))]
+        pub fn remove_path_with_io(&self, path: &str, io: &dyn crate::IO) {
+            let file_id = io.file_id(path).expect("could not find file");
+            self.remove(&DatabaseKey::File(file_id));
         }
 
         /// Panics if the registry contained an initialized database

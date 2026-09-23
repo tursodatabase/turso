@@ -29,7 +29,6 @@ use crate::counter::StressCounter;
 use crate::logging::Tracer;
 use crate::progress::ProgressBars;
 use crate::sql_logging::SqlLogger;
-use turso::core::DATABASE_MANAGER;
 use turso::{Builder, Value};
 use turso_stress::ThreadId;
 
@@ -622,12 +621,15 @@ async fn async_main(opts: Opts) -> Result<(), Box<dyn std::error::Error + Send +
     println!("tracing_log={tracing_log_path}");
     let _tracer = Tracer::new(&tracing_log_path)?;
 
-    let vfs_option = opts.vfs.clone();
+    let io = match &opts.vfs {
+        Some(vfs) => turso_core::Database::io_for_vfs(vfs)?,
+        None => turso_core::Database::io_for_path(&db_file)?,
+    };
 
     let db = Arc::new(Mutex::new(StressDb::new(
         db_file.clone(),
         sql_logger.clone(),
-        vfs_option.clone(),
+        io.clone(),
         opts.fts,
     )));
 
@@ -883,7 +885,6 @@ async fn async_main(opts: Opts) -> Result<(), Box<dyn std::error::Error + Send +
 
         // This is what triggers MVCC recovery
         db.lock().await.reset();
-        DATABASE_MANAGER.clear();
         batch_idx += 1;
     }
 
@@ -927,11 +928,10 @@ async fn async_main(opts: Opts) -> Result<(), Box<dyn std::error::Error + Send +
         // Switch back to WAL mode before SQLite integrity check if we were in MVCC mode.
         // SQLite/rusqlite doesn't understand MVCC journal mode.
         if opts.tx_mode == TxMode::Concurrent {
-            let mut builder = Builder::new_local(&db_file);
-            if let Some(ref vfs) = vfs_option {
-                builder = builder.with_io(vfs.clone());
-            }
-            let db = builder.build().await?;
+            let db = Builder::new_local(&db_file)
+                .with_io_impl(io.clone())
+                .build()
+                .await?;
             let conn = db.connect()?;
             conn.pragma_update("journal_mode", "WAL").await?;
             println!("Switched journal mode back to WAL for SQLite integrity check");
