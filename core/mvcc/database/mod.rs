@@ -1556,7 +1556,7 @@ pub enum CommitState<Clock: LogicalClock, A: ConcurrentAllocator = TursoAllocato
     Checkpoint {
         // TODO: if and when we transform this code to async we won't be needing this explicit state machine nor
         // the mutex
-        state_machine: Mutex<StateMachine<CheckpointStateMachine<Clock, A>>>,
+        state_machine: Box<Mutex<StateMachine<CheckpointStateMachine<Clock, A>>>>,
     },
     CommitEnd {
         end_ts: u64,
@@ -3751,7 +3751,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> StateTransition for CommitStat
                         self.db_id,
                         auto_checkpoint_mode,
                     ));
-                    let state_machine = Mutex::new(state_machine);
+                    let state_machine = Box::new(Mutex::new(state_machine));
                     self.state = CommitState::Checkpoint { state_machine };
                     return Ok(TransitionResult::Continue);
                 }

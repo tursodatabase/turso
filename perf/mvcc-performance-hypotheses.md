@@ -257,6 +257,55 @@ ns to 6,714 ns (-2.2%; -24.5% from the original matched run). The shorter
 `index_read` samples moved from 2,525 ns to 2,569 ns, within run-to-run noise;
 the branch remains 15.6% below the original 3,044 ns median.
 
+## Rebase onto `3d70e1409e`
+
+The branch was rebased onto `origin/main` at `3d70e1409e`. Main now reuses
+`BTreeCursor` allocations through a pool on the pager, and it lets an MVCC
+cursor that opened with a negative root switch to the published root after a
+checkpoint (#8467). The second change conflicts with the earlier H13 change
+(skip the `BTreeCursor` for version-store-only tables), which kept such a
+cursor version-store-only for its lifetime. H13 was dropped from the rebase.
+The pool already gives most of its point-read and index-read gain.
+
+Rebased baseline, 200/2,200 iterations:
+
+| Scenario | Instructions/operation |
+|---|---:|
+| `point_read` | 17,965 |
+| `index_read` | 40,568 |
+| `scan_128` | 272,470 |
+| `point_update_rollback` | 35,195 |
+| `insert_rollback` | 72,866 |
+| `point_update_commit` | 44,144 |
+| `insert_commit` | 106,520 |
+
+## H14. Every commit copies an inline checkpoint state machine — `fixed`
+
+**Where:** `memcpy` was the largest self-cost in `point_read` at 2,373
+instructions per operation. 1,421 of them came from `MvStore::commit_tx`,
+including for read-only autocommit statements. `CommitState::Checkpoint`
+stored the `CheckpointStateMachine` inline, so `CommitStateMachine` was 4,344
+bytes. `commit_tx` built it on the stack and copied it into its box, and state
+changes moved the full enum.
+
+**Fix:** Box the checkpoint state machine inside `CommitState::Checkpoint`.
+Only a commit that starts an automatic checkpoint allocates it.
+`CommitStateMachine` is now 352 bytes.
+
+**Callgrind, 200/2,200 iterations:**
+
+| Scenario | Before | After | Change |
+|---|---:|---:|---:|
+| `point_read` | 17,965 | 16,011 | -10.9% |
+| `index_read` | 40,568 | 38,544 | -5.0% |
+| `scan_128` | 272,470 | 270,609 | -0.7% |
+| `point_update_rollback` | 35,195 | 35,188 | 0.0% |
+| `insert_rollback` | 72,866 | 72,904 | +0.1% |
+| `point_update_commit` | 44,144 | 39,210 | -11.2% |
+| `insert_commit` | 106,520 | 101,355 | -4.8% |
+
+The rollback workloads do not build a commit state machine.
+
 ## Final measured totals
 
 The branch was rebased after `origin/main` gained unrelated planner work and an
