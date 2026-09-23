@@ -498,7 +498,7 @@ fn mv_store_insert_allocation_failure_leaves_tx_state_untouched() {
     let tx_id = 7;
     let tx = new_tx_in::<FailOnDemandAlloc>(tx_id, 1, TransactionState::Active);
     tx.begin_savepoint();
-    store.txs.try_insert(tx_id, tx).unwrap();
+    store.txs.try_insert(tx_id, Arc::new(tx)).unwrap();
 
     let table_id = MVTableId::from(-2);
     let row_id = RowID::new(table_id, RowKey::Int(42));
@@ -801,7 +801,11 @@ fn gc_keeps_sole_current_version_for_reader_that_began_after_lwm_sample() {
     let reader_id: TxID = 9_000_100;
     store.txs.insert(
         reader_id,
-        new_tx_in::<DynAllocator>(reader_id, 100, TransactionState::Active),
+        Arc::new(new_tx_in::<DynAllocator>(
+            reader_id,
+            100,
+            TransactionState::Active,
+        )),
     );
 
     let materialized_at = WalPos {
@@ -7453,15 +7457,15 @@ fn new_tx_in<A: super::RowVersionAllocator>(
 /// Why this matters: Concurrency bugs are correctness bugs: they create anomalies users can observe as wrong query results.
 #[test]
 fn test_snapshot_isolation_tx_visible1() {
-    let txs: SkipMap<TxID, Transaction> = SkipMap::from_iter([
-        (1, new_tx(1, 1, TransactionState::Committed(2))),
-        (2, new_tx(2, 2, TransactionState::Committed(5))),
-        (3, new_tx(3, 3, TransactionState::Aborted)),
-        (5, new_tx(5, 5, TransactionState::Preparing(8))),
-        (6, new_tx(6, 6, TransactionState::Committed(10))),
-        (7, new_tx(7, 7, TransactionState::Active)),
+    let txs: TxMap<Arc<Transaction>> = TxMap::from_iter([
+        (1, Arc::new(new_tx(1, 1, TransactionState::Committed(2)))),
+        (2, Arc::new(new_tx(2, 2, TransactionState::Committed(5)))),
+        (3, Arc::new(new_tx(3, 3, TransactionState::Aborted))),
+        (5, Arc::new(new_tx(5, 5, TransactionState::Preparing(8)))),
+        (6, Arc::new(new_tx(6, 6, TransactionState::Committed(10)))),
+        (7, Arc::new(new_tx(7, 7, TransactionState::Active))),
         // tx 8 with Preparing(3): current_tx (begin_ts=4) can speculatively read
-        (8, new_tx(8, 1, TransactionState::Preparing(3))),
+        (8, Arc::new(new_tx(8, 1, TransactionState::Preparing(3)))),
     ]);
     let finalized_tx_states: SkipMap<TxID, TransactionState> = SkipMap::new();
 
@@ -7564,7 +7568,7 @@ fn test_snapshot_isolation_tx_visible1() {
 
 #[test]
 fn test_visibility_uses_finalized_state_for_removed_committed_tx() {
-    let txs: SkipMap<TxID, Transaction> = SkipMap::new();
+    let txs: TxMap<Arc<Transaction>> = TxMap::new();
     let finalized_tx_states: SkipMap<TxID, TransactionState> =
         SkipMap::from_iter([(42, TransactionState::Committed(5))]);
     let reader = new_tx(7, 10, TransactionState::Active);
@@ -7651,8 +7655,8 @@ fn test_drop_unused_row_versions_prunes_unreferenced_finalized_tx_states() {
 /// and adds to CommitDepSet.
 #[test]
 fn test_commit_dependency_speculative_read() {
-    let txs: SkipMap<TxID, Transaction> =
-        SkipMap::from_iter([(1, new_tx(1, 1, TransactionState::Preparing(5)))]);
+    let txs: TxMap<Arc<Transaction>> =
+        TxMap::from_iter([(1, Arc::new(new_tx(1, 1, TransactionState::Preparing(5))))]);
     let finalized_tx_states: SkipMap<TxID, TransactionState> = SkipMap::new();
 
     // Reader with begin_ts=10 > end_ts=5 → speculative read → dependency
@@ -7685,8 +7689,8 @@ fn test_commit_dependency_speculative_read() {
 /// and decrements their CommitDepCounter.
 #[test]
 fn test_commit_dependency_cascade_abort() {
-    let txs: SkipMap<TxID, Transaction> =
-        SkipMap::from_iter([(1, new_tx(1, 1, TransactionState::Preparing(5)))]);
+    let txs: TxMap<Arc<Transaction>> =
+        TxMap::from_iter([(1, Arc::new(new_tx(1, 1, TransactionState::Preparing(5))))]);
     let finalized_tx_states: SkipMap<TxID, TransactionState> = SkipMap::new();
 
     let reader = new_tx(2, 10, TransactionState::Active);
@@ -7711,7 +7715,7 @@ fn test_commit_dependency_cascade_abort() {
     tx1.state.store(TransactionState::Aborted);
 
     // Add reader to txs so cascade can find it
-    txs.insert(2, reader);
+    txs.insert(2, Arc::new(reader));
 
     for dep_tx_id in tx1.commit_dep_set.lock().drain() {
         if let Some(dep_tx_entry) = txs.get(&dep_tx_id) {
@@ -7730,8 +7734,8 @@ fn test_commit_dependency_cascade_abort() {
 /// Test that registering a dependency on an already-committed tx is a no-op.
 #[test]
 fn test_commit_dependency_already_committed() {
-    let txs: SkipMap<TxID, Transaction> =
-        SkipMap::from_iter([(1, new_tx(1, 1, TransactionState::Committed(5)))]);
+    let txs: TxMap<Arc<Transaction>> =
+        TxMap::from_iter([(1, Arc::new(new_tx(1, 1, TransactionState::Committed(5))))]);
 
     let reader = new_tx(2, 10, TransactionState::Active);
 
@@ -7744,8 +7748,8 @@ fn test_commit_dependency_already_committed() {
 /// Test that registering a dependency on an already-aborted tx sets AbortNow.
 #[test]
 fn test_commit_dependency_already_aborted() {
-    let txs: SkipMap<TxID, Transaction> =
-        SkipMap::from_iter([(1, new_tx(1, 1, TransactionState::Aborted))]);
+    let txs: TxMap<Arc<Transaction>> =
+        TxMap::from_iter([(1, Arc::new(new_tx(1, 1, TransactionState::Aborted)))]);
 
     let reader = new_tx(2, 10, TransactionState::Active);
 
@@ -7758,9 +7762,9 @@ fn test_commit_dependency_already_aborted() {
 /// Test speculative ignore in is_end_visible registers dependency.
 #[test]
 fn test_commit_dependency_speculative_ignore() {
-    let txs: SkipMap<TxID, Transaction> = SkipMap::from_iter([
-        (1, new_tx(1, 1, TransactionState::Committed(2))),
-        (3, new_tx(3, 3, TransactionState::Preparing(5))),
+    let txs: TxMap<Arc<Transaction>> = TxMap::from_iter([
+        (1, Arc::new(new_tx(1, 1, TransactionState::Committed(2)))),
+        (3, Arc::new(new_tx(3, 3, TransactionState::Preparing(5)))),
     ]);
     let finalized_tx_states: SkipMap<TxID, TransactionState> = SkipMap::new();
 
@@ -7838,11 +7842,19 @@ fn test_index_shadow_scan_no_spurious_dep_on_stepped_over_key() {
     let writer_id: TxID = 9_000_050;
     store.txs.insert(
         writer_id,
-        new_tx_in::<crate::alloc::DynAllocator>(writer_id, 1, TransactionState::Preparing(40)),
+        Arc::new(new_tx_in::<crate::alloc::DynAllocator>(
+            writer_id,
+            1,
+            TransactionState::Preparing(40),
+        )),
     );
     store.txs.insert(
         reader_id,
-        new_tx_in::<crate::alloc::DynAllocator>(reader_id, 100, TransactionState::Active),
+        Arc::new(new_tx_in::<crate::alloc::DynAllocator>(
+            reader_id,
+            100,
+            TransactionState::Active,
+        )),
     );
 
     // MVCC-only tombstone at key 20: committed insert (begin Timestamp) deleted
@@ -7894,8 +7906,8 @@ fn test_index_shadow_scan_no_spurious_dep_on_stepped_over_key() {
 /// register one commit dependency (dedup).
 #[test]
 fn test_commit_dependency_multiple_reads_dedup() {
-    let txs: SkipMap<TxID, Transaction> =
-        SkipMap::from_iter([(1, new_tx(1, 1, TransactionState::Preparing(5)))]);
+    let txs: TxMap<Arc<Transaction>> =
+        TxMap::from_iter([(1, Arc::new(new_tx(1, 1, TransactionState::Preparing(5))))]);
     let finalized_tx_states: SkipMap<TxID, TransactionState> = SkipMap::new();
 
     let reader = new_tx(2, 10, TransactionState::Active);
@@ -8335,8 +8347,8 @@ fn test_commit_dep_threaded_readonly_abort_cascades() {
 /// a concurrent drain could fetch_sub(1) on a zero counter, wrapping to MAX.
 #[test]
 fn test_commit_dependency_counter_no_underflow() {
-    let txs: SkipMap<TxID, Transaction> =
-        SkipMap::from_iter([(1, new_tx(1, 1, TransactionState::Preparing(5)))]);
+    let txs: TxMap<Arc<Transaction>> =
+        TxMap::from_iter([(1, Arc::new(new_tx(1, 1, TransactionState::Preparing(5))))]);
     let reader = new_tx(2, 10, TransactionState::Active);
 
     // Register dependency: counter should go 0 → 1
@@ -8357,8 +8369,8 @@ fn test_commit_dependency_counter_no_underflow() {
 /// tx from txs, so register_commit_dependency saw None and assumed "committed."
 #[test]
 fn test_commit_dependency_terminated_tx_sets_abort() {
-    let txs: SkipMap<TxID, Transaction> =
-        SkipMap::from_iter([(1, new_tx(1, 1, TransactionState::Terminated))]);
+    let txs: TxMap<Arc<Transaction>> =
+        TxMap::from_iter([(1, Arc::new(new_tx(1, 1, TransactionState::Terminated)))]);
 
     let reader = new_tx(2, 10, TransactionState::Active);
     register_commit_dependency(&txs, &reader, 1);
@@ -8381,7 +8393,7 @@ fn test_commit_dependency_terminated_tx_sets_abort() {
 /// from the map (Issue #3 fix ensures this).
 #[test]
 fn test_commit_dependency_missing_tx_assumes_committed() {
-    let txs: SkipMap<TxID, Transaction> = SkipMap::new();
+    let txs: TxMap<Arc<Transaction>> = TxMap::new();
 
     let reader = new_tx(2, 10, TransactionState::Active);
     register_commit_dependency(&txs, &reader, 99);

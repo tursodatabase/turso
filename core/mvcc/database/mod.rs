@@ -59,6 +59,7 @@ use std::ops::Bound;
 use strum::EnumCount;
 use tracing::instrument;
 use tracing::Level;
+use tx_map::TxMap;
 
 pub mod checkpoint_state_machine;
 pub use checkpoint_state_machine::{
@@ -66,6 +67,7 @@ pub use checkpoint_state_machine::{
 };
 
 mod group_commit;
+mod tx_map;
 pub(crate) use group_commit::{CommitCoordinator, GroupBatch, GroupWork};
 
 #[cfg(feature = "conn_raw_api")]
@@ -4379,7 +4381,7 @@ pub struct MvStore<Clock: LogicalClock, A: ConcurrentAllocator = TursoAllocator>
     /// a key inserted at or behind an already-positioned scan would otherwise
     /// be skipped (#7578).
     index_rows_epoch: AtomicU64,
-    txs: SkipMap<TxID, Transaction<A>, BasicComparator, A>,
+    txs: TxMap<Arc<Transaction<A>>>,
     /// Final state for removed transactions. Readers may still race with stale TxID
     /// references in row versions after a transaction is removed from `txs`.
     finalized_tx_states: SkipMap<TxID, TransactionState, BasicComparator, A>,
@@ -4605,7 +4607,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
             table_id_to_rootpage,
             index_rows: SkipMap::new_in(alloc.clone()),
             index_rows_epoch: AtomicU64::new(0),
-            txs: SkipMap::new_in(alloc.clone()),
+            txs: TxMap::new(),
             finalized_tx_states: SkipMap::new_in(alloc.clone()),
             alloc,
             logical_log_alloc,
@@ -6448,7 +6450,13 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                     .expect("global_header initialized above");
                 self.txs.insert(
                     tx_id,
-                    Transaction::new(tx_id, ts, header, read_mark, schema_generation),
+                    Arc::new(Transaction::new(
+                        tx_id,
+                        ts,
+                        header,
+                        read_mark,
+                        schema_generation,
+                    )),
                 );
             });
             if schema_stale {
@@ -6678,7 +6686,13 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                 .expect("global_header initialized above");
             self.txs.insert(
                 tx_id,
-                Transaction::new(tx_id, ts, header, read_mark, schema_generation),
+                Arc::new(Transaction::new(
+                    tx_id,
+                    ts,
+                    header,
+                    read_mark,
+                    schema_generation,
+                )),
             );
         });
         if schema_stale {
@@ -6702,7 +6716,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
 
     #[turso_macros::allocation_site(crate::alloc::MvStoreAllocationSite::TxInsert)]
     fn insert_tx_entry(&self, tx_id: TxID, tx: Transaction<A>) -> Result<(), TryReserveError> {
-        self.txs.try_insert(tx_id, tx)?;
+        self.txs.insert(tx_id, Arc::new(tx));
         Ok(())
     }
 
@@ -8728,10 +8742,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                 return None;
             }
             if let Some(visible_row) = self.find_last_visible_version(tx, entry, false) {
-                tracing::trace!(
-                    "get_last_table_rowid: found visible row: {:?}",
-                    visible_row
-                );
+                tracing::trace!("get_last_table_rowid: found visible row: {:?}", visible_row);
                 // There is a visible version for this rowid, so we return it
                 return Some(RowKey::Int(match visible_row.0.row_id {
                     RowKey::Int(i) => i,
@@ -10429,7 +10440,7 @@ pub fn create_seek_range<K: Ord>(
 /// Ref: https://www.cs.cmu.edu/~15721-f24/papers/Hekaton.pdf , page 301,
 /// 2.6. Updating a Version.
 fn is_write_write_conflict<A: ConcurrentAllocator>(
-    txs: &SkipMap<TxID, Transaction<A>, BasicComparator, A>,
+    txs: &TxMap<Arc<Transaction<A>>>,
     finalized_tx_states: &SkipMap<TxID, TransactionState, BasicComparator, A>,
     tx: &Transaction<A>,
     rv: &RowVersion,
@@ -10548,7 +10559,7 @@ impl RowVersion {
     fn is_visible_to<A: ConcurrentAllocator>(
         &self,
         tx: &Transaction<A>,
-        txs: &SkipMap<TxID, Transaction<A>, BasicComparator, A>,
+        txs: &TxMap<Arc<Transaction<A>>>,
         finalized_tx_states: &SkipMap<TxID, TransactionState, BasicComparator, A>,
     ) -> bool {
         is_begin_visible(txs, finalized_tx_states, tx, self)
@@ -10566,7 +10577,7 @@ impl RowVersion {
     fn is_btree_invalidating_version<A: ConcurrentAllocator>(
         &self,
         tx: &Transaction<A>,
-        txs: &SkipMap<TxID, Transaction<A>, BasicComparator, A>,
+        txs: &TxMap<Arc<Transaction<A>>>,
         finalized_tx_states: &SkipMap<TxID, TransactionState, BasicComparator, A>,
     ) -> bool {
         // If the version is fully visible, it invalidates the B-tree
@@ -10628,7 +10639,7 @@ impl RowVersion {
 /// The lock on `commit_dep_set` serializes with the drain in commit/abort
 /// resolution, preventing the race where we push an entry after the drain.
 fn register_commit_dependency<A: ConcurrentAllocator>(
-    txs: &SkipMap<TxID, Transaction<A>, BasicComparator, A>,
+    txs: &TxMap<Arc<Transaction<A>>>,
     dependent_tx: &Transaction<A>,
     depended_on_tx_id: TxID,
 ) {
@@ -10686,7 +10697,7 @@ fn register_commit_dependency<A: ConcurrentAllocator>(
 }
 
 fn lookup_tx_state<A: ConcurrentAllocator>(
-    txs: &SkipMap<TxID, Transaction<A>, BasicComparator, A>,
+    txs: &TxMap<Arc<Transaction<A>>>,
     finalized_tx_states: &SkipMap<TxID, TransactionState, BasicComparator, A>,
     tx_id: TxID,
 ) -> Option<TransactionState> {
@@ -10713,7 +10724,7 @@ fn lookup_finalized_tx_state<A: ConcurrentAllocator>(
 }
 
 fn is_begin_visible<A: ConcurrentAllocator>(
-    txs: &SkipMap<TxID, Transaction<A>, BasicComparator, A>,
+    txs: &TxMap<Arc<Transaction<A>>>,
     finalized_tx_states: &SkipMap<TxID, TransactionState, BasicComparator, A>,
     tx: &Transaction<A>,
     rv: &RowVersion,
@@ -10804,7 +10815,7 @@ fn is_begin_visible<A: ConcurrentAllocator>(
 }
 
 fn is_end_visible<A: ConcurrentAllocator>(
-    txs: &SkipMap<TxID, Transaction<A>, BasicComparator, A>,
+    txs: &TxMap<Arc<Transaction<A>>>,
     finalized_tx_states: &SkipMap<TxID, TransactionState, BasicComparator, A>,
     current_tx: &Transaction<A>,
     row_version: &RowVersion,
