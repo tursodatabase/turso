@@ -159,17 +159,38 @@ impl From<SeekOp> for ComparisonOp {
 
 #[inline]
 fn sqlite_text_prefix(s: &str) -> &str {
-    // A short value is scanned byte by byte: the character searcher of
-    // `find` costs more to set up than the scan.
-    let nul = if s.len() <= 32 {
-        s.bytes().position(|b| b == 0)
-    } else {
-        s.find('\0')
-    };
-    match nul {
+    match first_nul(s.as_bytes()) {
+        // A NUL is ASCII, so the cut is always on a character boundary.
         Some(idx) => &s[..idx],
         None => s,
     }
+}
+
+/// The offset of the first NUL byte, a machine word at a time. LIKE and GLOB
+/// ask this of their pattern and their text on every row, and a byte-at-a-time
+/// scan of a short value costs more than the match that follows it.
+#[inline(always)]
+fn first_nul(bytes: &[u8]) -> Option<usize> {
+    const WORD_BYTES: usize = size_of::<usize>();
+    const LOW_BITS: usize = usize::from_ne_bytes([0x01; WORD_BYTES]);
+    const HIGH_BITS: usize = usize::from_ne_bytes([0x80; WORD_BYTES]);
+    let mut words = bytes.chunks_exact(WORD_BYTES);
+    let mut base = 0;
+    for word_bytes in words.by_ref() {
+        let word = usize::from_ne_bytes(word_bytes.try_into().unwrap());
+        // Subtracting LOW_BITS sets the high bit of each zero byte.
+        // Masking with !word removes high bits set in the original word.
+        // HIGH_BITS keeps only high bits; any bit left means a byte was zero.
+        if word.wrapping_sub(LOW_BITS) & !word & HIGH_BITS != 0 {
+            return word_bytes.iter().position(|&b| b == 0).map(|i| base + i);
+        }
+        base += WORD_BYTES;
+    }
+    words
+        .remainder()
+        .iter()
+        .position(|&b| b == 0)
+        .map(|i| base + i)
 }
 
 enum TrimType {
@@ -1572,7 +1593,9 @@ fn like_ascii(pattern: &[u8], text: &[u8]) -> bool {
                 backtrack = Some((p, t));
                 p += 1;
             }
-            Some(&c) if c == b'_' || c.eq_ignore_ascii_case(&text[t]) => {
+            // The equal-bytes test comes first: most pattern bytes match the
+            // text exactly, and folding both sides costs four times as much.
+            Some(&c) if c == text[t] || c == b'_' || c.eq_ignore_ascii_case(&text[t]) => {
                 p += 1;
                 t += 1;
             }
@@ -2861,6 +2884,19 @@ mod tests {
     fn test_like_with_escape_or_regexmeta_chars() {
         assert!(Value::exec_like(r#"\%A"#, r#"\A"#, None).unwrap());
         assert!(Value::exec_like("%a%a", "aaaa", None).unwrap());
+    }
+
+    #[test]
+    fn first_nul_finds_each_position_across_word_boundaries() {
+        let len = 2 * std::mem::size_of::<usize>() + 3;
+        let mut bytes = vec![0x80; len];
+        assert_eq!(super::first_nul(&bytes), None);
+        for index in 0..len {
+            bytes[index] = 0;
+            assert_eq!(super::first_nul(&bytes), Some(index));
+            bytes[index] = 0x80;
+        }
+        assert_eq!(super::sqlite_text_prefix("é🙂\0tail"), "é🙂");
     }
 
     #[test]
