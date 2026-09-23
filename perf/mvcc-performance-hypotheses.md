@@ -501,6 +501,42 @@ transaction only after it finds a chain.
 
 The version-store workloads changed by less than 0.1%.
 
+## H22. Every commit state looks up its own transaction — `fixed`
+
+**Where:** Counting skip-map lookups per `point_update_commit` operation
+showed 13 from `CommitStateMachine::step`. Each commit state (`Initial`,
+`Commit`, `WaitForDependencies`, `BeginCommitLogicalLog`, `BuildLogRecord`,
+`EndCommitLogicalLog`, `CommitEnd`, `RewriteLiveVersions`, `FinalizeCommit`,
+and the log owner update) searched `txs` for the committing transaction
+again, mostly to fail if it had been removed.
+
+**Fix:** The state machine takes the transaction's reference-counted
+skip-list entry when the commit starts and releases it when the commit
+finishes. Each state checks `Entry::is_removed()` where it previously checked
+for a missing map entry, and returns the same error. A removed node is never
+returned by `get`, and transaction IDs are never reused, so the check gives
+the same answer as the search. The entry's lifetime is extended to `'static`
+in the same way as `static_iterator_hack!`: the state machine owns the
+`Arc<MvStore>` whose map the entry borrows and drops the entry first.
+
+**Callgrind, 200/2,200 iterations:**
+
+| Scenario | Before | After | Change |
+|---|---:|---:|---:|
+| `point_update_commit` | 36,936 | 35,447 | -4.0% |
+| `delete_commit` | 63,758 | 62,615 | -1.8% |
+| `insert_commit` | 99,441 | 98,116 | -1.3% |
+| `point_read` | 14,443 | 14,676 | +1.6% |
+| `index_read` | 29,114 | 29,353 | +0.8% |
+
+**Unexplained:** Read-only statements do one lookup before and after the
+change, yet cost about 230 more instructions. The profile difference is in
+glibc's allocator slow path (`_int_malloc` +83, `unlink_chunk` +62), not in
+MVCC code. A likely cause is that the state machine grew by 16 bytes and its
+per-commit box moved to another allocator size class, but this was not
+checked. Releasing the entry at the end of the commit instead of when the
+state machine drops did not change it.
+
 ## Final measured totals
 
 The branch was rebased after `origin/main` gained unrelated planner work and an
