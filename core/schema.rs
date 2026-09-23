@@ -4144,6 +4144,39 @@ fn collect_column_dependencies_of_gencol(expr: &Expr, columns: &[Column], out: &
     });
 }
 
+pub(crate) fn columns_referenced_by_expr(expr: &Expr, columns: &[Column]) -> Result<ColumnMask> {
+    let mut referenced = ColumnMask::default();
+    let mut has_subquery = false;
+    walk_expr(expr, &mut |e| {
+        match e {
+            Expr::Column { table, column, .. } if table.is_self_table() => {
+                referenced.set(*column)?;
+            }
+            Expr::Id(name)
+            | Expr::Name(name)
+            | Expr::Qualified(_, name)
+            | Expr::DoublyQualified(_, _, name) => {
+                if let Some(idx) = find_column_index_by_name(columns, name.as_str()) {
+                    referenced.set(idx)?;
+                }
+            }
+            Expr::Subquery(_)
+            | Expr::Exists(_)
+            | Expr::InTable { .. }
+            | Expr::SubqueryResult { .. } => {
+                has_subquery = true;
+                return Ok(WalkControl::SkipChildren);
+            }
+            _ => {}
+        }
+        Ok(WalkControl::Continue)
+    })?;
+    if has_subquery {
+        return Ok((0..columns.len()).try_collect()?);
+    }
+    Ok(referenced)
+}
+
 fn find_column_index_by_name(columns: &[Column], col_name: &str) -> Option<usize> {
     columns.iter().enumerate().find_map(|(i, col)| {
         col.name

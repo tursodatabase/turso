@@ -5984,3 +5984,75 @@ setup gencol_virtual_columns_delete_trigger {
 snapshot gencol_delete_old_row_computes_virtual_columns_from_registers {
     DELETE FROM t WHERE b = 3;
 }
+
+setup gencol_one_indexed_virtual_column {
+    CREATE TABLE t(a INTEGER, b INTEGER, c AS (a + b), d AS (c * 2), e AS (a * 3));
+    CREATE INDEX te ON t(e);
+}
+
+@skip-if mvcc "mvcc has different root pages"
+@setup gencol_one_indexed_virtual_column
+snapshot gencol_insert_computes_only_read_virtual_columns {
+    INSERT INTO t(a, b) VALUES (1, 2);
+}
+
+test gencol_insert_check_reads_virtual_column_through_another {
+    CREATE TABLE t(a INTEGER, b INTEGER, c AS (a + b), d AS (c * 2) CHECK (d < 10), e AS (a * 100));
+    INSERT INTO t(a, b) VALUES (1, 2);
+    INSERT INTO t(a, b) VALUES (3, 4);
+}
+expect error {
+    CHECK constraint failed: d < 10
+}
+
+@cross-check-integrity
+@skip-if mvcc "Expression indexes are not supported with MVCC"
+test gencol_insert_expression_and_partial_indexes_read_virtual_columns {
+    CREATE TABLE t(a INTEGER, b INTEGER, c AS (a + b), d AS (c * 2), e AS (a * 100));
+    CREATE INDEX t_expr ON t(d + 1);
+    CREATE INDEX t_part ON t(a) WHERE d > 5;
+    INSERT INTO t(a, b) VALUES (1, 1), (2, 2), (3, 3);
+    SELECT a FROM t INDEXED BY t_expr WHERE d + 1 = 9;
+    SELECT a FROM t INDEXED BY t_part WHERE d > 5 ORDER BY a;
+    PRAGMA integrity_check;
+}
+expect {
+    2
+    2
+    3
+    ok
+}
+
+test gencol_insert_not_null_reads_virtual_column_through_another {
+    CREATE TABLE t(a INTEGER, b INTEGER, c AS (a + b), d AS (c * 2) NOT NULL);
+    INSERT INTO t(a, b) VALUES (1, NULL);
+}
+expect error {
+    NOT NULL constraint failed: t.d
+}
+
+test gencol_insert_fk_child_key_is_virtual_column {
+    PRAGMA foreign_keys = ON;
+    CREATE TABLE p(id INTEGER PRIMARY KEY);
+    CREATE TABLE ch(x INTEGER, v AS (x + 1) REFERENCES p(id), w AS (x * 7));
+    INSERT INTO p VALUES (2);
+    INSERT INTO ch(x) VALUES (1);
+    INSERT INTO ch(x) VALUES (5);
+}
+expect error {
+    FOREIGN KEY constraint failed
+}
+
+test gencol_insert_fk_parent_key_is_virtual_column {
+    PRAGMA foreign_keys = ON;
+    CREATE TABLE p(a INTEGER, b INTEGER, k AS (a + b) UNIQUE, z AS (a * 7));
+    CREATE TABLE ch(x REFERENCES p(k) DEFERRABLE INITIALLY DEFERRED);
+    BEGIN;
+    INSERT INTO ch VALUES (3);
+    INSERT INTO p(a, b) VALUES (1, 2);
+    COMMIT;
+    SELECT count(*) FROM ch;
+}
+expect {
+    1
+}

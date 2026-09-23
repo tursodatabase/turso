@@ -1,6 +1,10 @@
 use crate::alloc::TursoIteratorExt;
-use crate::schema::{BTreeTable, ColumnsTopologicalSort, GeneratedType};
+use crate::schema::{
+    columns_referenced_by_expr, BTreeTable, Column, ColumnsTopologicalSort, GeneratedType, Index,
+    EXPR_INDEX_SENTINEL,
+};
 use crate::translate::expr::translate_expr;
+use crate::translate::plan::ColumnMask;
 use crate::vdbe::builder::{DmlColumnContext, SelfTableContext};
 use crate::{Arc, Result};
 
@@ -58,4 +62,23 @@ pub fn compute_virtual_columns(
         }
         Ok(())
     })
+}
+
+pub(crate) fn columns_read_by_index(index: &Index, columns: &[Column]) -> Result<ColumnMask> {
+    let mut read = ColumnMask::default();
+    for index_column in &index.columns {
+        if index_column.pos_in_table == EXPR_INDEX_SENTINEL {
+            let expr = index_column
+                .expr
+                .as_ref()
+                .expect("expression index column has an expression");
+            read.union_with(&columns_referenced_by_expr(expr, columns)?)?;
+        } else {
+            read.set(index_column.pos_in_table)?;
+        }
+    }
+    if let Some(where_clause) = &index.where_clause {
+        read.union_with(&columns_referenced_by_expr(where_clause, columns)?)?;
+    }
+    Ok(read)
 }

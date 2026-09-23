@@ -796,11 +796,29 @@ pub fn translate_insert(
     emit_notnulls(program, &ctx, &insertion, resolver, false)?;
 
     if insertion.has_virtual_columns() {
-        //TODO only compute the necessary virtual columns for CHECK and NOT NULL evaluation
+        let reads_whole_row = !result_columns.is_empty()
+            || !returning_subqueries.is_empty()
+            || !upsert_actions.is_empty()
+            || has_triggers_including_temp(
+                resolver,
+                database_id,
+                TriggerEvent::Insert,
+                None,
+                &btree_table,
+            );
+        let columns_to_compute = columns_needed_by_insert(
+            &btree_table,
+            resolver,
+            database_id,
+            reads_whole_row,
+            has_fks,
+        )?;
         let encoded_columns: ColumnMask = (0..ctx.table.columns().len()).try_collect()?;
         compute_virtual_columns(
             program,
-            &ctx.table.columns_topo_sort()?,
+            &ctx.table
+                .columns_topo_sort()?
+                .retain_columns(&columns_to_compute),
             &dml_ctx.with_encoded_columns(encoded_columns),
             resolver,
             &btree_table,
@@ -1231,6 +1249,47 @@ pub fn translate_insert(
     program.result_columns = result_columns;
     program.table_references.extend(table_references);
     Ok(())
+}
+
+fn columns_needed_by_insert(
+    table: &BTreeTable,
+    resolver: &Resolver,
+    database_id: usize,
+    reads_whole_row: bool,
+    has_fks: bool,
+) -> Result<ColumnMask> {
+    let columns = table.columns();
+    if reads_whole_row || table.is_strict {
+        return Ok((0..columns.len()).try_collect()?);
+    }
+    let mut needed = ColumnMask::default();
+    for (idx, column) in columns.iter().enumerate() {
+        if column.notnull() {
+            needed.set(idx)?;
+        }
+    }
+    for check in &table.check_constraints {
+        needed.union_with(&schema::columns_referenced_by_expr(&check.expr, columns)?)?;
+    }
+    let indexes: Vec<Arc<Index>> = resolver.with_schema(database_id, |s| {
+        s.get_indices(table.name.as_str()).cloned().collect()
+    });
+    for index in &indexes {
+        needed.union_with(&gencol::columns_read_by_index(index, columns)?)?;
+    }
+    if has_fks {
+        for fk in resolver.with_schema(database_id, |s| s.resolved_fks_for_child(&table.name))? {
+            for &pos in fk.child_pos.iter() {
+                needed.set(pos)?;
+            }
+        }
+        for fk in resolver.with_schema(database_id, |s| s.resolved_fks_referencing(&table.name))? {
+            for &pos in fk.parent_pos.iter() {
+                needed.set(pos)?;
+            }
+        }
+    }
+    table.columns_with_dependencies(needed.iter())
 }
 
 /// If the user provided an explicit rowid for this insert, we must validate that it is an Integer and non-null
