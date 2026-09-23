@@ -85,9 +85,9 @@ impl<T: KeyPrefix + ?Sized> KeyPrefix for Arc<T> {
 ///
 /// # Safety
 ///
-/// Same rules as [`TreeKey`]. `clone_from_slot` runs while the caller is pinned by the
-/// epoch collector. Values that leave the tree are dropped only after the readers that
-/// were pinned at that time unpin.
+/// Same rules as [`TreeKey`]. `clone_from_slot` runs while the caller holds an
+/// [`epoch::Guard`]. Values that leave the tree are dropped only after every `Guard` that
+/// existed at that time is dropped.
 pub unsafe trait TreeValue: Clone + Send + Sync + 'static {
     type Slot: Send + Sync;
 
@@ -153,7 +153,7 @@ unsafe impl<T: Ord + KeyPrefix + Send + Sync + 'static> TreeKey for Arc<T> {
             return None;
         }
         // SAFETY: the pointer came from `Arc::into_raw`, and the key is alive: removed
-        // keys are dropped only after the readers that are pinned now unpin.
+        // keys are dropped only after the epoch `Guard`s that exist now are dropped.
         let key = ManuallyDrop::new(unsafe { Arc::from_raw(ptr) });
         Some(f(&key))
     }
@@ -1293,7 +1293,7 @@ impl<K: TreeKey, V: TreeValue, A: ConcurrentAllocator> BPlusTreeMap<K, V, A> {
             value: removed_value.clone(),
             map: self,
         };
-        retire(guard, removed_key, removed_value);
+        drop_after_readers(guard, removed_key, removed_value);
         Ok(Some(entry))
     }
 
@@ -1376,7 +1376,7 @@ impl<K: TreeKey, V: TreeValue, A: ConcurrentAllocator> Drop for BPlusTreeMap<K, 
     }
 }
 
-fn retire<K: TreeKey, V: TreeValue>(guard: &epoch::Guard, key: K, value: V) {
+fn drop_after_readers<K: TreeKey, V: TreeValue>(guard: &epoch::Guard, key: K, value: V) {
     if K::NEEDS_DEFERRED_DROP {
         // SAFETY: the key and the value are Send and 'static.
         unsafe { guard.defer_unchecked(move || drop((key, value))) };
@@ -1441,8 +1441,8 @@ impl<K: TreeKey + std::fmt::Debug, V: TreeValue + std::fmt::Debug, A: Concurrent
 
 const MAX_BATCH: usize = 16;
 
-/// Entries that a cursor copied from one leaf under one epoch pin. They stay valid
-/// while the leaf version is the same, so the next steps need no pin and no atomic
+/// Entries that a cursor copied from one leaf with one epoch `Guard`. They stay valid
+/// while the leaf version is the same, so the next steps need no `Guard` and no atomic
 /// read-modify-write.
 struct Batch<K: TreeKey, V: TreeValue> {
     entries: [std::mem::MaybeUninit<(K, V)>; MAX_BATCH],
@@ -1597,7 +1597,7 @@ where
                 self.finish(forward);
                 return None;
             };
-            let Ok((first, last)) = self.fill_batch(start, forward) else {
+            let Ok(first) = self.fill_batch(start, forward) else {
                 continue;
             };
             let side = if forward {
@@ -1607,7 +1607,7 @@ where
             };
             side.cursor = Cursor::At {
                 key: first.0.clone(),
-                pos: last,
+                pos: start,
             };
             side.batch_size = (side.batch_size * 4).min(MAX_BATCH);
             return self.accept(first, forward);
@@ -1645,13 +1645,8 @@ where
     }
 
     /// Copies the entry at `start` and up to `batch_size - 1` entries after it in the
-    /// same leaf. Returns the entry at `start` and `start`. The other copied entries go
-    /// to the batch.
-    fn fill_batch(
-        &mut self,
-        start: Position<K, V>,
-        forward: bool,
-    ) -> Result<((K, V), Position<K, V>), Restart> {
+    /// same leaf. Returns the entry at `start`. The other copied entries go to the batch.
+    fn fill_batch(&mut self, start: Position<K, V>, forward: bool) -> Result<(K, V), Restart> {
         // SAFETY: nodes live as long as the tree.
         let leaf = unsafe { &*start.leaf };
         let count = leaf.header.count(LEAF_CAPACITY);
@@ -1694,7 +1689,7 @@ where
         while let Some(entry) = copied.pop() {
             side.batch.push(entry);
         }
-        Ok((first, start))
+        Ok(first)
     }
 
     /// Checks the range bounds and the other end of the iterator, and returns the entry.
