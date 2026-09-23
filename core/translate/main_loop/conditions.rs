@@ -1,5 +1,7 @@
 use super::*;
-use crate::translate::subquery::emit_non_from_clause_subqueries_for_eval_at;
+use crate::translate::{
+    plan::IndexMethodQuery, subquery::emit_non_from_clause_subqueries_for_eval_at,
+};
 
 fn condition_references_subquery(expr: &Expr, subqueries: &[NonFromClauseSubquery]) -> bool {
     subqueries
@@ -102,10 +104,10 @@ pub(super) fn emit_where_term(
     next: BranchOffset,
     resolver: &Resolver,
 ) -> Result<()> {
-    let matched = program.allocate_label();
     let Some((table, query)) =
         crate::translate::optimizer::plan_index_method_predicate(term, table_references, resolver)
     else {
+        let matched = program.allocate_label();
         translate_condition_expr(
             program,
             table_references,
@@ -122,6 +124,18 @@ pub(super) fn emit_where_term(
         return Ok(());
     };
 
+    emit_index_method_predicate(program, table_references, table, &query, next, resolver)
+}
+
+fn emit_index_method_predicate(
+    program: &mut ProgramBuilder,
+    table_references: &TableReferences,
+    table: &JoinedTable,
+    query: &IndexMethodQuery,
+    next: BranchOffset,
+    resolver: &Resolver,
+) -> Result<()> {
+    let matched = program.allocate_label();
     emit_explain!(
         program,
         false,
