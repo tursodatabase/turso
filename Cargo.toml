@@ -47,6 +47,7 @@ members = [
     "perf/memory",
     "perf/memory/codspeed",
     "perf/query-batch",
+    "perf/mvcc-map-bench",
     "tools/dbhash",
     "sdk-kit",
     "sdk-kit-macros",

@@ -1,0 +1,21 @@
+[package]
+name = "mvcc-map-bench"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[[bin]]
+name = "mvcc-e2e"
+path = "src/bin/e2e.rs"
+
+[[bin]]
+name = "mvcc-micro"
+path = "src/bin/micro.rs"
+
+[dependencies]
+turso_core = { workspace = true }
+rand = { workspace = true }
+turso_parser = { workspace = true }
+parking_lot = { workspace = true }
+scc = "3.8.8"
+concurrent-map = "5.0.37"
