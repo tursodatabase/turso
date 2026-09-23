@@ -593,6 +593,40 @@ removed exactly when the old search would have found another chain or none.
 
 The read workloads changed by less than 0.2%.
 
+## H25. Cursor inserts read the row before inserting it — `fixed`
+
+**Where:** After H24, a batch insert still positioned three range iterators
+per row and made a separate lookup for each written key.
+`MvccLazyCursor::insert` called `read_from_table_or_index` to decide between
+insert and update. That looked up the transaction, searched the table or
+index map, and cloned the visible row if there was one. Then
+`insert_to_table_or_index` looked up the transaction and searched the map for
+the same key again. For a new key, the first search always found nothing.
+
+**Fix:** For rows that are not B-tree resident, the cursor calls
+`insert_unless_visible_to_table_or_index`. It finds or creates the key's
+version chain once, takes its write lock, and checks whether the transaction
+already sees a version, with the same test the read used: plain visibility
+for index keys, visibility of a chain the B-tree does not cover for table
+rows. If the transaction does see one, it inserts nothing and returns the row,
+and the cursor updates it as before. The check runs under the chain's write
+lock, so it is at least as strict as the earlier separate read. B-tree
+resident rows keep the old path.
+
+**Callgrind, 200/2,200 iterations:**
+
+| Scenario | Before | After | Change |
+|---|---:|---:|---:|
+| `batch_insert_commit` | 2,423,632 | 2,145,467 | -11.5% |
+| `insert_commit` | 90,548 | 82,040 | -9.4% |
+| `insert_rollback` | 65,720 | 59,406 | -9.6% |
+| `point_update_rollback` | 32,764 | 31,810 | -2.9% |
+| `point_update_commit` | 34,931 | 34,042 | -2.5% |
+
+Updates still search for the key as often as before, but no longer clone the
+visible row to find out that it exists. The read workloads changed by less
+than 0.2%.
+
 ## Final measured totals
 
 The branch was rebased after `origin/main` gained unrelated planner work and an
