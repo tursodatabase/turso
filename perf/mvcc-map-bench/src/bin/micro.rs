@@ -37,6 +37,7 @@ impl Key for RowID {
 }
 
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord)]
+#[repr(transparent)]
 struct IndexKey(Arc<SortableIndexKey>);
 
 fn index_info() -> Arc<IndexInfo> {
@@ -261,34 +262,44 @@ impl<K: Key> Map<K> for CMap<K> {
 
 // ---------------------------------------------------------------------------
 // B+ tree with optimistic lock coupling (turso_core::bplus_tree).
+impl turso_core::bplus_tree::KeyPrefix for IndexKey {
+    fn prefix(&self) -> Option<u64> {
+        turso_core::bplus_tree::KeyPrefix::prefix(&*self.0)
+    }
+}
+
+type ArcIndexKey = Arc<SortableIndexKey>;
+
 unsafe impl turso_core::bplus_tree::TreeKey for IndexKey {
-    type Slot = std::sync::atomic::AtomicPtr<SortableIndexKey>;
+    type Slot = <ArcIndexKey as turso_core::bplus_tree::TreeKey>::Slot;
 
     const NEEDS_DEFERRED_DROP: bool = true;
 
     fn write(slot: &Self::Slot, key: Self) {
-        <Arc<SortableIndexKey> as turso_core::bplus_tree::TreeKey>::write(slot, key.0)
+        <ArcIndexKey as turso_core::bplus_tree::TreeKey>::write(slot, key.0)
     }
 
     fn move_from(slot: &Self::Slot, from: &Self::Slot) {
-        <Arc<SortableIndexKey> as turso_core::bplus_tree::TreeKey>::move_from(slot, from)
+        <ArcIndexKey as turso_core::bplus_tree::TreeKey>::move_from(slot, from)
     }
 
     fn read<R>(slot: &Self::Slot, f: impl FnOnce(&Self) -> R) -> Option<R> {
-        let ptr = slot.load(Ordering::Acquire);
-        if ptr.is_null() {
-            return None;
-        }
-        let key = std::mem::ManuallyDrop::new(IndexKey(unsafe { Arc::from_raw(ptr) }));
-        Some(f(&key))
+        <ArcIndexKey as turso_core::bplus_tree::TreeKey>::read(slot, |key| {
+            // SAFETY: IndexKey is a repr(transparent) wrapper of the Arc.
+            f(unsafe { &*std::ptr::from_ref(key).cast::<IndexKey>() })
+        })
     }
 
     fn take(slot: &Self::Slot) -> Self {
-        IndexKey(<Arc<SortableIndexKey> as turso_core::bplus_tree::TreeKey>::take(slot))
+        IndexKey(<ArcIndexKey as turso_core::bplus_tree::TreeKey>::take(slot))
     }
 
     fn clear(slot: &Self::Slot) {
-        <Arc<SortableIndexKey> as turso_core::bplus_tree::TreeKey>::clear(slot)
+        <ArcIndexKey as turso_core::bplus_tree::TreeKey>::clear(slot)
+    }
+
+    fn slot_prefix(slot: &Self::Slot) -> Option<u64> {
+        <ArcIndexKey as turso_core::bplus_tree::TreeKey>::slot_prefix(slot)
     }
 }
 
