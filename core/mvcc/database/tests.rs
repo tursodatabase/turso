@@ -282,9 +282,47 @@ fn write_set_take_transfers_entries_without_cloning() {
     assert!(write_set.seen.is_empty());
     assert_eq!(transferred.entries.as_ptr(), entries_ptr);
     assert_eq!(transferred.entries.capacity(), entries_capacity);
-    assert_eq!(transferred.seen.len(), 1);
     assert_eq!(Arc::strong_count(&row_versions), strong_count);
     assert!(Arc::ptr_eq(&transferred.entries[0].1, &row_versions));
+}
+
+#[test]
+fn write_set_rejects_duplicate_chains_before_and_after_it_grows_large() {
+    let mut write_set = WriteSet::<TursoAllocator>::new();
+    let chains: Vec<(RowID, RowVersions<TursoAllocator>)> = (0..40)
+        .map(|rowid| {
+            (
+                RowID::new(MVTableId::from(-2), RowKey::Int(rowid)),
+                Arc::new(RwLock::new(crate::alloc::vec![])),
+            )
+        })
+        .collect();
+
+    for (count, (row_id, versions)) in chains.iter().enumerate() {
+        assert!(write_set.insert(row_id.clone(), versions.clone()));
+        for (earlier_row_id, earlier_versions) in &chains[..=count] {
+            assert!(!write_set.insert(earlier_row_id.clone(), earlier_versions.clone()));
+        }
+    }
+    assert_eq!(write_set.entries.len(), chains.len());
+
+    write_set.retain(|row_id, _| matches!(row_id.row_id, RowKey::Int(rowid) if rowid < 3));
+    assert_eq!(write_set.entries.len(), 3);
+    for (row_id, versions) in &chains[..3] {
+        assert!(!write_set.insert(row_id.clone(), versions.clone()));
+    }
+    for (row_id, versions) in &chains[3..] {
+        assert!(write_set.insert(row_id.clone(), versions.clone()));
+    }
+    assert_eq!(write_set.entries.len(), chains.len());
+
+    write_set.retain(|_, _| false);
+    assert!(write_set.is_empty());
+    for (row_id, versions) in &chains {
+        assert!(write_set.insert(row_id.clone(), versions.clone()));
+        assert!(!write_set.insert(row_id.clone(), versions.clone()));
+    }
+    assert_eq!(write_set.entries.len(), chains.len());
 }
 
 #[test]

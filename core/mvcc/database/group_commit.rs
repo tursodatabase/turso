@@ -292,6 +292,9 @@ impl CommitCoordinator {
 }
 
 fn take_parked_through(group: &mut GroupState, through: u64) -> Vec<Completion> {
+    if group.parked.is_empty() {
+        return Vec::new();
+    }
     let keep = group.parked.split_off(&through.saturating_add(1));
     std::mem::replace(&mut group.parked, keep)
         .into_values()

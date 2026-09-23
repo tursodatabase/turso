@@ -15,7 +15,7 @@ use crate::storage::btree::{BTreeCursor, BTreeKey, CursorTrait};
 use crate::sync::Arc;
 use crate::translate::plan::IterationDirection;
 use crate::types::{
-    compare_immutable, IOCompletions, IOResult, ImmutableRecord, IndexInfo, SeekKey, SeekOp,
+    compare_immutable_iter, IOCompletions, IOResult, ImmutableRecord, IndexInfo, SeekKey, SeekOp,
     SeekResult, Value,
 };
 use crate::vdbe::Register;
@@ -181,13 +181,12 @@ fn current_pos_matches_seek_key(
             let MvccCursorType::Index(index_info) = mv_cursor_type else {
                 return Ok(false);
             };
-            let key_info: Vec<_> = index_info
-                .key_info
-                .iter()
-                .take(target.column_count())
-                .cloned()
-                .collect();
-            compare_immutable(target.get_values()?, current.key.get_values()?, &key_info).is_eq()
+            compare_immutable_iter(
+                target.iter()?,
+                current.key.iter()?,
+                &index_info.key_info[..target.column_count().min(index_info.key_info.len())],
+            )?
+            .is_eq()
         }
         _ => false,
     })
@@ -1760,14 +1759,14 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> CursorTrait
                                     else {
                                         panic!("Index cursor expected");
                                     };
-                                    let cmp = compare_immutable(
-                                        index_key.get_values()?,
-                                        found_key.key.get_values()?,
+                                    compare_immutable_iter(
+                                        index_key.iter()?,
+                                        found_key.key.iter()?,
                                         &index_info.key_info[..index_key
                                             .column_count()
                                             .min(index_info.key_info.len())],
-                                    );
-                                    cmp.is_eq()
+                                    )?
+                                    .is_eq()
                                 }
                             };
                             if found {

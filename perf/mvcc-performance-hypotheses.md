@@ -381,6 +381,45 @@ cursor's own index. The equality check passes a slice of the index's
 | `index_read_btree` | 35,225 | 35,037 | -0.5% |
 | `delete_commit` | 68,021 | 67,669 | -0.5% |
 
+## H18. Per-statement allocations on MVCC write and seek paths — `fixed`
+
+**Where:** Counting allocation calls per operation by caller in
+`delete_commit` (about 36 per delete) found four sites that allocate on every
+statement without needing to:
+
+- Both equality checks on an index seek collected two `Vec<ValueRef>` to
+  compare the found key with the seek key.
+- `CommitCoordinator::unlock_pager_commit_lock` ran `BTreeMap::split_off` on
+  the parked-waiter map on every commit, which allocates even when the map is
+  empty.
+- The first write-set insert of every transaction allocated the `seen` hash
+  set, and every insert hashed a pointer, to deduplicate a few entries.
+- Opening an index cursor built its `IndexInfo` twice: once for the MVCC
+  cursor and once inside the B-tree cursor. Without MVCC, the first copy was
+  built and dropped.
+
+**Fix:** Compare seek keys with `compare_immutable_iter` from the record
+iterators. Return early when no commit is parked. Deduplicate write sets of
+fewer than 16 entries by scanning `entries` for the same `Arc`, and build
+`seen` only when the set grows past that. Build `IndexInfo` once and pass the
+same `Arc` to both cursors.
+
+**Callgrind, 200/2,200 iterations:**
+
+| Scenario | Before | After | Change |
+|---|---:|---:|---:|
+| `point_read` | 15,965 | 15,807 | -1.0% |
+| `index_read` | 31,917 | 30,351 | -4.9% |
+| `index_read_btree` | 35,037 | 33,417 | -4.6% |
+| `point_update_rollback` | 35,227 | 34,641 | -1.7% |
+| `insert_rollback` | 72,677 | 71,497 | -1.6% |
+| `point_update_commit` | 39,225 | 38,304 | -2.3% |
+| `insert_commit` | 101,153 | 99,625 | -1.5% |
+| `batch_insert_commit` | 2,720,656 | 2,693,810 | -1.0% |
+| `delete_commit` | 67,669 | 65,225 | -3.6% |
+
+The scan workloads did not change.
+
 ## Final measured totals
 
 The branch was rebased after `origin/main` gained unrelated planner work and an
