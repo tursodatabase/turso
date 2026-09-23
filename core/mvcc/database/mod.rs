@@ -235,6 +235,18 @@ impl SortableIndexKey {
         // for example when seeking with an index key that is a prefix of the full key.
         let num_cols = self.metadata.num_cols.min(other.metadata.num_cols);
 
+        if num_cols > 0 {
+            if let Some(cmp) = compare_leading_binary_text(
+                self.key.get_payload(),
+                other.key.get_payload(),
+                &self.metadata.key_info[0],
+            ) {
+                if cmp != std::cmp::Ordering::Equal || num_cols == 1 {
+                    return Ok(cmp);
+                }
+            }
+        }
+
         let mut lhs = self.key.iter()?;
         let mut rhs = other.key.iter()?;
 
@@ -340,6 +352,42 @@ fn compare_next_index_value(
 
 fn is_text_serial_type(serial_type: u64) -> bool {
     serial_type >= 13 && serial_type % 2 == 1
+}
+
+/// Orders two index records by their first column when both hold BINARY text
+/// whose header size and serial type fit in one varint byte. Returns `None`
+/// for any other shape, so the caller compares the general way.
+fn compare_leading_binary_text(
+    lhs: &[u8],
+    rhs: &[u8],
+    key_info: &crate::types::KeyInfo,
+) -> Option<std::cmp::Ordering> {
+    if !matches!(
+        key_info.collation,
+        CollationSeq::Unset | CollationSeq::Binary
+    ) {
+        return None;
+    }
+    let cmp = leading_text_column(lhs)?.cmp(leading_text_column(rhs)?);
+    Some(match key_info.sort_order {
+        SortOrder::Asc => cmp,
+        SortOrder::Desc => cmp.reverse(),
+    })
+}
+
+fn leading_text_column(record: &[u8]) -> Option<&[u8]> {
+    let [header_size, serial_type, ..] = *record else {
+        return None;
+    };
+    if !(2..0x80).contains(&header_size) || serial_type >= 0x80 {
+        return None;
+    }
+    if !is_text_serial_type(serial_type as u64) {
+        return None;
+    }
+    let start = header_size as usize;
+    let len = (serial_type as usize - 13) / 2;
+    record.get(start..start + len)
 }
 
 impl PartialEq for SortableIndexKey {

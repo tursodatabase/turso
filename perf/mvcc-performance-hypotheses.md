@@ -717,6 +717,54 @@ own, while `try_pin_loop` fell by a similar amount). `bench-profile` builds with
 elsewhere. Differences below about 1% in workloads a change does not touch are
 within this noise.
 
+## Rebase onto `fd41c07dc3`
+
+Main added index-cursor key-info reuse, B-tree cell write changes, and LIKE
+work. On the rebased branch every workload moved by at most about 1% from the
+H28 measurements; `rebased-fd41c07` is the baseline for the next entries.
+
+## H29. Index-key comparison decodes both records for the first column — `fixed`
+
+**Where:** After H28, index-key comparison was still the largest cost of an
+inserted row: about 11,000 of 56,700 instructions per row in
+`batch_insert_commit`, across `ValueIterator::next_serialized_value`,
+`SortableIndexKey::compare`, and `bcmp`. Each comparison costs about 250
+instructions: it builds two `ValueIterator`s and decodes each serial type
+through `next_serialized_value` before comparing bytes. For text keys most
+comparisons are decided by the first column. H12 tried peeking inside the
+iterator and was rejected because updates got slower.
+
+**Fix:** Before the general loop, `SortableIndexKey::compare` reads the first
+column of both records directly from the bytes when the header size and first
+serial type are one-byte varints, both values are text, and the column is
+BINARY. If those bytes differ, or the key has one column, that decides the
+order, with the column's sort order applied. Anything else, including an
+equal first column in a longer key, runs the general loop from the start, so
+that path is unchanged. The result is the same as `compare_next_index_value`,
+which also compares BINARY text bytes directly.
+
+`sortable_index_key_order_matches_value_comparison` compares the key order
+with `compare_immutable` over the decoded values for 8,000 random pairs:
+empty, short, and longer-than-57-byte text (two-byte serial type), non-ASCII
+text, NULL, integer, and blob leading values, ASC and DESC, BINARY and
+NOCASE, and one-column seek prefixes. Ignoring DESC in the new path makes it
+fail.
+
+**Callgrind, 200/2,200 iterations:**
+
+| Scenario | Before | After | Change |
+|---|---:|---:|---:|
+| `batch_insert_commit` | 1,815,205 | 1,517,552 | -16.4% |
+| `insert_commit` | 72,256 | 62,839 | -13.0% |
+| `delete_commit` | 58,238 | 52,093 | -10.6% |
+| `index_read` | 29,083 | 26,601 | -8.5% |
+| `insert_rollback` | 51,440 | 47,485 | -7.7% |
+| `scan_128_btree` | 207,622 | 210,446 | +1.4% |
+| `point_update_commit` | 33,964 | 34,210 | +0.7% |
+
+`scan_128_btree` compares no index keys and has moved between about 207,600
+and 210,400 across builds without a related change; see the note under H28.
+
 ## Final measured totals
 
 The branch was rebased after `origin/main` gained unrelated planner work and an
