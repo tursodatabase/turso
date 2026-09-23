@@ -1790,28 +1790,18 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CommitStateMachine<Clock, A> {
                     CommitState::WriteLogicalLog { .. } | CommitState::FinishLogicalLogWrite { .. }
                 )
             {
-                self.commit_coordinator.clear_issued();
-                let writer_is_another_tx = batch.writing.tx_id != self.tx_id;
-                if writer_is_another_tx {
-                    if self.commit_coordinator.take_abandoned(batch.writing.tx_id) {
-                        if self.mvcc_store.txs.get(&batch.writing.tx_id).is_some() {
-                            self.mvcc_store.rollback_tx_inner(
-                                batch.writing.tx_id,
-                                None,
-                                self.db_id,
-                            );
-                        }
-                    } else {
-                        self.commit_coordinator.request_retry(batch.writing.ticket);
-                    }
+                if batch.writing.tx_id == self.tx_id {
+                    self.commit_coordinator.clear_issued();
+                } else if self.commit_coordinator.release_issued(&batch.writing)
+                    && self.mvcc_store.txs.get(&batch.writing.tx_id).is_some()
+                {
+                    self.mvcc_store
+                        .rollback_tx_inner(batch.writing.tx_id, None, self.db_id);
                 }
                 self.commit_coordinator.requeue(batch.rest.into_iter());
             } else {
                 self.commit_coordinator.requeue(batch.rest.into_iter());
             }
-        }
-        if let CommitState::AwaitGroupCommit { ticket, .. } = self.state {
-            let _ = self.commit_coordinator.drop_pending(ticket);
         }
     }
 
@@ -1827,6 +1817,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CommitStateMachine<Clock, A> {
             if !matches!(self.state, CommitState::Checkpoint { .. }) {
                 self.mvcc_store.cleanup_dropped_commit(
                     self.tx_id,
+                    self.group_ticket(),
                     self.connection.as_ref(),
                     self.db_id,
                 );
@@ -1856,6 +1847,15 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CommitStateMachine<Clock, A> {
             "Connection should not still reference an MVCC tx after a successful commit",
             { "tx_id": tx_id, "db_id": db_id }
         );
+    }
+
+    fn group_ticket(&self) -> Option<u64> {
+        match self.state {
+            CommitState::AwaitGroupCommit { ticket, .. }
+            | CommitState::SyncGroupPrefix { ticket, .. }
+            | CommitState::GroupPrefixSynced { ticket, .. } => Some(ticket),
+            _ => None,
+        }
     }
 
     fn take_next_group_record(&mut self) -> bool {
@@ -1892,8 +1892,8 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CommitStateMachine<Clock, A> {
         if let Some(tx) = mvcc_store.txs.get(&owner_tx) {
             tx.value().log_appended.store(true, Ordering::Release);
         }
-        self.commit_coordinator.clear_issued();
-        if owner_tx != self.tx_id && self.commit_coordinator.take_abandoned(owner_tx) {
+        let abandoned = self.commit_coordinator.finish_issue(owner_tx);
+        if abandoned && owner_tx != self.tx_id {
             self.finish_abandoned_group_waiter(mvcc_store, owner_tx)?;
         }
         self.wrote_logical_log = true;
@@ -1920,6 +1920,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CommitStateMachine<Clock, A> {
         drop(tx);
         mvcc_store.rewrite_live_versions_for_committed_tx(owner_tx, end_ts);
         if let Some(tx) = mvcc_store.txs.get(&owner_tx) {
+            mvcc_store.notify_committed_dependents(tx.value());
             mvcc_store.unlock_commit_lock_if_held(tx.value());
         }
         crate::without_allocation_faults!(mvcc_store.remove_tx(owner_tx).expect(ALLOC_ERR_MSG));
@@ -3406,16 +3407,6 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> StateTransition for CommitStat
                 self.step_await_group_commit(mvcc_store, *end_ts, *ticket)
             }
             CommitState::UpgradeLogicalLogHeader { end_ts, log_record } => {
-                let skip_dropped = self
-                    .group_batch
-                    .as_ref()
-                    .is_some_and(|batch| mvcc_store.txs.get(&batch.writing.tx_id).is_none());
-                if skip_dropped {
-                    let end_ts = *end_ts;
-                    self.state =
-                        self.advance_group_or_sync(end_ts, mvcc_store.logical_log_allocator());
-                    return Ok(TransitionResult::Continue);
-                }
                 let header_c = mvcc_store.storage.upgrade_header_for_log_tx(log_record)?;
                 if let Some(c) = header_c {
                     if !c.succeeded() {
@@ -3448,17 +3439,13 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> StateTransition for CommitStat
                 if self
                     .group_batch
                     .as_ref()
-                    .is_some_and(|batch| mvcc_store.txs.get(&batch.writing.tx_id).is_none())
+                    .is_some_and(|batch| !self.commit_coordinator.try_issue(batch.writing.tx_id))
                 {
                     self.state =
                         self.advance_group_or_sync(end_ts, mvcc_store.logical_log_allocator());
                     return Ok(TransitionResult::Continue);
                 }
                 let (c, append_bytes) = mvcc_store.storage.log_tx(log_record, None)?;
-                if let Some(batch) = self.group_batch.as_ref() {
-                    self.commit_coordinator
-                        .note_write_issued(batch.writing.tx_id);
-                }
                 self.pending_log_append_bytes = Some(append_bytes);
                 if self
                     .group_batch
@@ -7062,7 +7049,19 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         crate::without_allocation_faults!(self.remove_tx(tx_id).expect(ALLOC_ERR_MSG));
     }
 
-    fn cleanup_dropped_commit(&self, tx_id: TxID, connection: &Connection, db_id: usize) {
+    fn cleanup_dropped_commit(
+        &self,
+        tx_id: TxID,
+        ticket: Option<u64>,
+        connection: &Connection,
+        db_id: usize,
+    ) {
+        if self.commit_coordinator.leave(tx_id, ticket) {
+            if connection.get_mv_tx_id_for_db(db_id) == Some(tx_id) {
+                connection.set_mv_tx_for_db(db_id, None);
+            }
+            return;
+        }
         let tx_state = self.txs.get(&tx_id).map(|tx| {
             let tx = tx.value();
             match tx.state.load() {
@@ -7075,12 +7074,6 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         });
         match tx_state {
             Some(TransactionState::Active | TransactionState::Preparing(_)) => {
-                if self.commit_coordinator.abandon_if_issued(tx_id) {
-                    if connection.get_mv_tx_id_for_db(db_id) == Some(tx_id) {
-                        connection.set_mv_tx_for_db(db_id, None);
-                    }
-                    return;
-                }
                 self.rollback_tx_inner(tx_id, Some(connection), db_id);
             }
             Some(TransactionState::Committed(end_ts)) => {

@@ -42,11 +42,17 @@ struct GroupState {
     /// Tickets whose in-flight `log_tx` was discarded before the offset was
     /// advanced. The waiter rebuilds its log record instead of hanging.
     retry: HashSet<u64>,
-    /// Tx currently inside `log_tx`, before the offset advanced.
+    /// Tx whose `log_tx` the leader issued, until the offset advanced or the
+    /// leader gave up the write.
     issued: Option<TxID>,
-    /// Waiters that dropped after `log_tx`. The leader finishes or rolls them
-    /// back. They must not roll back themselves.
+    /// Waiters that dropped after their `log_tx` was issued. The leader
+    /// finishes or rolls them back. They must not roll back themselves.
     abandoned: HashSet<TxID>,
+    /// Txs whose records the leader took and has not issued or put back.
+    taken: HashSet<TxID>,
+    /// Taken txs whose commit dropped before their `log_tx` was issued. The
+    /// leader skips their records.
+    withdrawn: HashSet<TxID>,
     /// Waiters asleep until the leader makes their ticket durable, asks
     /// them to retry, or releases the commit lock.
     parked: BTreeMap<u64, Completion>,
@@ -85,6 +91,8 @@ impl CommitCoordinator {
                 retry: HashSet::default(),
                 issued: None,
                 abandoned: HashSet::default(),
+                taken: HashSet::default(),
+                withdrawn: HashSet::default(),
                 parked: BTreeMap::new(),
             }),
             #[cfg(test)]
@@ -167,6 +175,8 @@ impl CommitCoordinator {
         match group.pending.pop_front() {
             Some(writing) => {
                 let rest = std::mem::take(&mut group.pending);
+                group.taken.insert(writing.tx_id);
+                group.taken.extend(rest.iter().map(|queued| queued.tx_id));
                 #[cfg(test)]
                 {
                     self.last_group_size
@@ -182,7 +192,10 @@ impl CommitCoordinator {
     pub(crate) fn requeue(&self, records: impl DoubleEndedIterator<Item = QueuedCommit>) {
         let mut group = self.group.lock();
         for entry in records.rev() {
-            group.pending.push_front(entry);
+            group.taken.remove(&entry.tx_id);
+            if !group.withdrawn.remove(&entry.tx_id) {
+                group.pending.push_front(entry);
+            }
         }
     }
 
@@ -213,66 +226,71 @@ impl CommitCoordinator {
         self.group.lock().written_through
     }
 
-    /// Removes `ticket` from the queue. Returns whether it was still waiting.
-    pub(crate) fn drop_pending(&self, ticket: u64) -> bool {
-        let mut group = self.group.lock();
-        group.retry.remove(&ticket);
-        group.parked.remove(&ticket);
-        if let Some(index) = group
-            .pending
-            .iter()
-            .position(|queued| queued.ticket == ticket)
-        {
-            group.pending.remove(index);
-            true
-        } else {
-            false
-        }
-    }
-
-    pub(crate) fn request_retry(&self, ticket: u64) {
-        let woken = {
-            let mut group = self.group.lock();
-            group.retry.insert(ticket);
-            if group.written_through >= ticket {
-                group.written_through = ticket.saturating_sub(1);
-            }
-            if group.durable_through >= ticket {
-                group.durable_through = ticket.saturating_sub(1);
-            }
-            group.parked.remove(&ticket)
-        };
-        wake(woken);
-    }
-
     pub(crate) fn take_retry(&self, ticket: u64) -> bool {
         self.group.lock().retry.remove(&ticket)
     }
 
-    pub(crate) fn note_write_issued(&self, tx_id: TxID) {
-        self.group.lock().issued = Some(tx_id);
+    /// Marks the write of `tx_id` as issued, unless its commit already left
+    /// the group. Returns whether the leader must write the record.
+    pub(crate) fn try_issue(&self, tx_id: TxID) -> bool {
+        let mut group = self.group.lock();
+        group.taken.remove(&tx_id);
+        if group.withdrawn.remove(&tx_id) {
+            return false;
+        }
+        group.issued = Some(tx_id);
+        true
+    }
+
+    /// Ends the issued write after the offset advanced. Returns whether its
+    /// waiter was abandoned, so the leader must finish it.
+    pub(crate) fn finish_issue(&self, tx_id: TxID) -> bool {
+        let mut group = self.group.lock();
+        group.issued = None;
+        group.abandoned.remove(&tx_id)
+    }
+
+    /// Gives up the issued write of another tx. Returns whether its waiter
+    /// was abandoned, so the leader must roll it back. Otherwise the waiter
+    /// must retry.
+    pub(crate) fn release_issued(&self, writing: &QueuedCommit) -> bool {
+        let woken = {
+            let mut group = self.group.lock();
+            group.issued = None;
+            if group.abandoned.remove(&writing.tx_id) {
+                return true;
+            }
+            request_retry(&mut group, writing.ticket)
+        };
+        wake(woken);
+        false
     }
 
     pub(crate) fn clear_issued(&self) {
         self.group.lock().issued = None;
     }
 
-    pub(crate) fn abandon_if_issued(&self, tx_id: TxID) -> bool {
+    /// Removes a dropped commit from the group. Returns whether its write is
+    /// issued, so it is abandoned to the leader and must not roll back.
+    pub(crate) fn leave(&self, tx_id: TxID, ticket: Option<u64>) -> bool {
         let mut group = self.group.lock();
         if group.issued == Some(tx_id) {
             group.abandoned.insert(tx_id);
-            true
-        } else {
-            false
+            return true;
         }
+        if let Some(ticket) = ticket {
+            group.retry.remove(&ticket);
+            group.parked.remove(&ticket);
+        }
+        group.pending.retain(|queued| queued.tx_id != tx_id);
+        if group.taken.remove(&tx_id) {
+            group.withdrawn.insert(tx_id);
+        }
+        false
     }
 
     pub(crate) fn is_abandoned(&self, tx_id: TxID) -> bool {
         self.group.lock().abandoned.contains(&tx_id)
-    }
-
-    pub(crate) fn take_abandoned(&self, tx_id: TxID) -> bool {
-        self.group.lock().abandoned.remove(&tx_id)
     }
 
     #[cfg(test)]
@@ -289,6 +307,17 @@ impl CommitCoordinator {
     pub(crate) fn park_calls(&self) -> usize {
         self.park_calls.load(Ordering::Relaxed)
     }
+}
+
+fn request_retry(group: &mut GroupState, ticket: u64) -> Option<Completion> {
+    group.retry.insert(ticket);
+    if group.written_through >= ticket {
+        group.written_through = ticket.saturating_sub(1);
+    }
+    if group.durable_through >= ticket {
+        group.durable_through = ticket.saturating_sub(1);
+    }
+    group.parked.remove(&ticket)
 }
 
 fn take_parked_through(group: &mut GroupState, through: u64) -> Vec<Completion> {

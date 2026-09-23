@@ -1,9 +1,21 @@
 use super::{get_rows, FixedYieldInjector, MvccTestDbNoConn};
-use crate::mvcc::database::{CommitCoordinator, CommitYieldPoint, GroupWork, LogRecord};
+use crate::io::{FileSyncType, PlatformIO, IO};
+use crate::mvcc::database::{
+    CommitCoordinator, CommitYieldPoint, GroupWork, LogRecord, RowVersion,
+};
+use crate::mvcc::persistent_storage::logical_log::{LogHeader, OnSerializationComplete};
+use crate::mvcc::persistent_storage::{DurableStorage, LogicalLogTruncateOutcome, Storage};
 use crate::mvcc::yield_hooks::YieldPointMarker;
+use crate::storage::encryption::EncryptionContext;
+use crate::storage::sqlite3_ondisk::DatabaseHeader;
 use crate::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-use crate::{Connection, Database, LimboError, StepResult, Value};
-use std::sync::{Arc, Barrier};
+use crate::sync::Mutex;
+use crate::{
+    Completion, Connection, Database, DatabaseOpts, LimboError, OpenFlags, SqliteDialect,
+    StepResult, Value,
+};
+use std::cell::RefCell;
+use std::sync::{Arc, Barrier, Weak};
 use std::time::{Duration, Instant};
 
 fn pragma_int(conn: &Arc<Connection>, query: &str) -> i64 {
@@ -279,17 +291,69 @@ fn requeued_records_go_back_in_ticket_order() {
 }
 
 #[test]
-fn drop_pending_only_removes_queued_records() {
+fn leaving_removes_a_queued_record_and_withdraws_a_taken_one() {
     let coordinator = CommitCoordinator::new();
 
     let queued = coordinator.enqueue(1, empty_record(10));
-    assert!(coordinator.drop_pending(queued));
-
-    let claimed = coordinator.enqueue(2, empty_record(20));
-    let _batch = coordinator.take_pending();
+    assert!(!coordinator.leave(1, Some(queued)));
     assert!(
-        !coordinator.drop_pending(claimed),
-        "a record the leader already took is not in the queue"
+        coordinator.take_pending().is_empty(),
+        "a queued record leaves the queue"
+    );
+
+    let taken = coordinator.enqueue(2, empty_record(20));
+    let GroupWork::Lead { writing, .. } = coordinator.take_work() else {
+        panic!("the leader takes the queued record");
+    };
+    assert!(!coordinator.leave(2, Some(taken)));
+    assert!(
+        !coordinator.try_issue(writing.tx_id),
+        "the leader skips a record whose commit left"
+    );
+}
+
+#[test]
+fn waiter_that_leaves_after_its_write_was_given_up_leaves_no_retry_hole() {
+    let coordinator = CommitCoordinator::new();
+    let ticket = coordinator.enqueue(1, empty_record(10));
+    let GroupWork::Lead { writing, .. } = coordinator.take_work() else {
+        panic!("the leader takes the queued record");
+    };
+    assert!(coordinator.try_issue(writing.tx_id));
+    assert!(
+        !coordinator.release_issued(&writing),
+        "the waiter did not leave, so it must retry"
+    );
+    assert!(!coordinator.leave(1, Some(ticket)));
+
+    coordinator.enqueue(2, empty_record(20));
+    assert!(
+        matches!(coordinator.take_work(), GroupWork::Lead { .. }),
+        "a retry hole without a waiter must not stop later batches"
+    );
+}
+
+#[test]
+fn waiter_that_leaves_while_its_write_is_issued_is_abandoned_to_the_leader() {
+    let coordinator = CommitCoordinator::new();
+    let ticket = coordinator.enqueue(1, empty_record(10));
+    let GroupWork::Lead { writing, .. } = coordinator.take_work() else {
+        panic!("the leader takes the queued record");
+    };
+    assert!(coordinator.try_issue(writing.tx_id));
+    assert!(
+        coordinator.leave(1, Some(ticket)),
+        "a waiter whose write is issued is abandoned to the leader"
+    );
+    assert!(
+        coordinator.release_issued(&writing),
+        "the leader rolls back the abandoned waiter"
+    );
+
+    coordinator.enqueue(2, empty_record(20));
+    assert!(
+        matches!(coordinator.take_work(), GroupWork::Lead { .. }),
+        "giving up an abandoned write leaves no retry hole"
     );
 }
 
@@ -336,13 +400,16 @@ fn failed_mid_batch_leader_does_not_cover_retry_hole() {
     let t4 = coordinator.enqueue(4, empty_record(40));
     assert_eq!((t2, t3, t4), (1, 2, 3));
 
-    let mut batch = coordinator.take_pending();
-    let _owned = batch.pop_front().unwrap();
-    let _retry = batch.pop_front().unwrap();
-    let later = batch.pop_front().unwrap();
-    coordinator.note_written(t2);
-    coordinator.request_retry(t3);
-    coordinator.requeue(std::iter::once(later));
+    let GroupWork::Lead { writing, mut rest } = coordinator.take_work() else {
+        panic!("the leader takes the queued records");
+    };
+    assert!(coordinator.try_issue(writing.tx_id));
+    coordinator.note_written(writing.ticket);
+    assert!(!coordinator.finish_issue(writing.tx_id));
+    let retried = rest.pop_front().unwrap();
+    assert!(coordinator.try_issue(retried.tx_id));
+    assert!(!coordinator.release_issued(&retried));
+    coordinator.requeue(rest.into_iter());
     coordinator.note_written(t4);
     coordinator.mark_durable(coordinator.written_through());
 
@@ -613,5 +680,349 @@ fn dropped_waiter_after_log_tx_still_commits() {
         get_rows(&reader, "SELECT pk FROM t ORDER BY pk"),
         vec![vec![Value::from_i64(1)], vec![Value::from_i64(2)]],
         "recovery must not replay an aborted waiter"
+    );
+}
+
+thread_local! {
+    static DROPPED_BY_STORAGE: RefCell<Option<crate::Statement>> = const { RefCell::new(None) };
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StorageCall {
+    UpgradeHeader,
+    LogTx,
+}
+
+#[derive(Debug)]
+struct DropStatementStorage {
+    inner: Arc<dyn DurableStorage>,
+    call: StorageCall,
+    countdown: Mutex<usize>,
+}
+
+impl DropStatementStorage {
+    fn drop_statement_on_call(&self, calls_until_drop: usize) {
+        *self.countdown.lock() = calls_until_drop;
+    }
+
+    fn on_call(&self, call: StorageCall) {
+        let drop_now = {
+            let mut countdown = self.countdown.lock();
+            if call == self.call && *countdown > 0 {
+                *countdown -= 1;
+                *countdown == 0
+            } else {
+                false
+            }
+        };
+        if drop_now {
+            DROPPED_BY_STORAGE.with(|slot| drop(slot.borrow_mut().take()));
+        }
+    }
+}
+
+impl DurableStorage for DropStatementStorage {
+    fn serialize_row_version(
+        &self,
+        log_record: &mut LogRecord,
+        row_version: &RowVersion,
+        portable_extension: Option<&[u8]>,
+    ) -> crate::Result<()> {
+        self.inner
+            .serialize_row_version(log_record, row_version, portable_extension)
+    }
+    fn serialize_database_header(
+        &self,
+        log_record: &mut LogRecord,
+        header: &DatabaseHeader,
+    ) -> crate::Result<()> {
+        self.inner.serialize_database_header(log_record, header)
+    }
+    fn log_tx(
+        &self,
+        m: LogRecord,
+        c: OnSerializationComplete<'_>,
+    ) -> crate::Result<(Completion, u64)> {
+        self.on_call(StorageCall::LogTx);
+        self.inner.log_tx(m, c)
+    }
+    fn upgrade_header_for_log_tx(&self, m: &LogRecord) -> crate::Result<Option<Completion>> {
+        self.on_call(StorageCall::UpgradeHeader);
+        self.inner.upgrade_header_for_log_tx(m)
+    }
+    fn sync(&self, t: FileSyncType) -> crate::Result<Completion> {
+        self.inner.sync(t)
+    }
+    fn update_header(&self) -> crate::Result<Completion> {
+        self.inner.update_header()
+    }
+    fn truncate(
+        &self,
+        checkpointed_through_ts: u64,
+    ) -> crate::Result<(Completion, LogicalLogTruncateOutcome)> {
+        self.inner.truncate(checkpointed_through_ts)
+    }
+    fn reset_to_fresh_header(&self) -> crate::Result<Completion> {
+        self.inner.reset_to_fresh_header()
+    }
+    fn get_logical_log_file(&self) -> Arc<dyn crate::File> {
+        self.inner.get_logical_log_file()
+    }
+    fn logical_log_offset(&self) -> u64 {
+        self.inner.logical_log_offset()
+    }
+    fn should_checkpoint(&self) -> bool {
+        self.inner.should_checkpoint()
+    }
+    fn set_checkpoint_threshold(&self, t: i64) {
+        self.inner.set_checkpoint_threshold(t)
+    }
+    fn checkpoint_threshold(&self) -> i64 {
+        self.inner.checkpoint_threshold()
+    }
+    fn advance_logical_log_offset_after_success(&self, b: u64) -> crate::Result<()> {
+        self.inner.advance_logical_log_offset_after_success(b)
+    }
+    fn discard_pending_log_write(&self) -> crate::Result<()> {
+        self.inner.discard_pending_log_write()
+    }
+    fn restore_logical_log_state_after_recovery(&self, o: u64, c: u32) {
+        self.inner.restore_logical_log_state_after_recovery(o, c)
+    }
+    fn set_header(&self, h: LogHeader) {
+        self.inner.set_header(h)
+    }
+    fn on_checkpoint_start(&self) -> crate::Result<()> {
+        self.inner.on_checkpoint_start()
+    }
+    fn on_checkpoint_end(&self, r: crate::Result<&crate::CheckpointResult>) -> crate::Result<()> {
+        self.inner.on_checkpoint_end(r)
+    }
+    fn encryption_ctx(&self) -> Option<EncryptionContext> {
+        self.inner.encryption_ctx()
+    }
+}
+
+fn open_mvcc_file(path: &str) -> Arc<Database> {
+    let io: Arc<dyn IO> = Arc::new(PlatformIO::new().unwrap());
+    Database::open_file_with_flags(
+        io,
+        path,
+        OpenFlags::default(),
+        DatabaseOpts::new(),
+        None,
+        Arc::new(SqliteDialect),
+    )
+    .unwrap()
+}
+
+fn open_with_drop_statement_storage(
+    path: &str,
+    call: StorageCall,
+) -> (Arc<Database>, Arc<DropStatementStorage>) {
+    let first_open = {
+        let db = open_mvcc_file(path);
+        let conn = db.connect().unwrap();
+        conn.execute("PRAGMA journal_mode = 'mvcc'").unwrap();
+        conn.close().unwrap();
+        Arc::downgrade(&db)
+    };
+    assert!(first_open.upgrade().is_none());
+    let io: Arc<dyn IO> = Arc::new(PlatformIO::new().unwrap());
+    let log_path = format!("{path}-log");
+    let log_file = io
+        .open_file(&log_path, OpenFlags::default(), false)
+        .unwrap();
+    let storage = Arc::new(DropStatementStorage {
+        inner: Arc::new(Storage::new(log_file, io.clone(), None)),
+        call,
+        countdown: Mutex::new(0),
+    });
+    let db = Database::open(
+        io,
+        path,
+        crate::OpenOptions::new(Arc::new(SqliteDialect))
+            .durable_storage(storage.clone() as Arc<dyn DurableStorage>),
+    )
+    .unwrap();
+    (db, storage)
+}
+
+fn rows_after_restart(path: &str, closed: Weak<Database>) -> Vec<Vec<Value>> {
+    assert!(
+        closed.upgrade().is_none(),
+        "the database must be closed before it is opened again"
+    );
+    let db = open_mvcc_file(path);
+    let conn = db.connect().unwrap();
+    get_rows(&conn, "SELECT pk FROM t ORDER BY pk")
+}
+
+fn waiter_dropped_while_leader_writes_it(call: StorageCall) {
+    let temp_dir = tempfile::TempDir::new().unwrap();
+    let path = temp_dir.path().join("test.db");
+    let path = path.to_str().unwrap();
+    let (db, storage) = open_with_drop_statement_storage(path, call);
+    let setup = db.connect().unwrap();
+    setup
+        .execute("CREATE TABLE t (pk INTEGER PRIMARY KEY, v INTEGER)")
+        .unwrap();
+    setup
+        .execute("PRAGMA mvcc_checkpoint_threshold = -1")
+        .unwrap();
+    setup.execute("PRAGMA mvcc_group_commit = yes").unwrap();
+
+    let conn_a = db.connect().unwrap();
+    let conn_b = db.connect().unwrap();
+    conn_a.execute("BEGIN CONCURRENT").unwrap();
+    conn_b.execute("BEGIN CONCURRENT").unwrap();
+    conn_a.execute("INSERT INTO t VALUES (1, 1)").unwrap();
+    conn_b.execute("INSERT INTO t VALUES (2, 1)").unwrap();
+
+    let store = db.get_mv_store().clone().unwrap();
+    let coordinator = &store.commit_coordinator;
+    assert!(coordinator.pager_commit_lock.write());
+    let mut commit_a = conn_a.prepare("COMMIT").unwrap();
+    let mut commit_b = conn_b.prepare("COMMIT").unwrap();
+    assert!(matches!(commit_a.step().unwrap(), StepResult::IO));
+    assert!(matches!(commit_b.step().unwrap(), StepResult::IO));
+    DROPPED_BY_STORAGE.with(|slot| *slot.borrow_mut() = Some(commit_b));
+    storage.drop_statement_on_call(2);
+    coordinator.unlock_pager_commit_lock();
+    step_until_done(&mut commit_a);
+    assert!(
+        DROPPED_BY_STORAGE.with(|slot| slot.borrow().is_none()),
+        "the waiter must be dropped while the leader writes its record"
+    );
+
+    let before_restart = get_rows(&setup, "SELECT pk FROM t ORDER BY pk");
+    let closed = Arc::downgrade(&db);
+    drop(commit_a);
+    drop((setup, conn_a, conn_b, store, db, storage));
+    assert_eq!(
+        rows_after_restart(path, closed),
+        before_restart,
+        "recovery must not change which commits happened"
+    );
+}
+
+#[test]
+fn waiter_dropped_while_its_log_write_is_issued_has_the_same_rows_after_restart() {
+    waiter_dropped_while_leader_writes_it(StorageCall::LogTx);
+}
+
+#[test]
+fn waiter_dropped_before_its_log_write_is_issued_has_the_same_rows_after_restart() {
+    waiter_dropped_while_leader_writes_it(StorageCall::UpgradeHeader);
+}
+
+#[test]
+fn abandoned_waiter_that_the_leader_commits_releases_its_dependents() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let setup = db.connect();
+    setup
+        .execute("CREATE TABLE t (pk INTEGER PRIMARY KEY, v INTEGER)")
+        .unwrap();
+    setup.execute("PRAGMA mvcc_group_commit = yes").unwrap();
+    setup.close().unwrap();
+
+    let conn_a = db.connect();
+    let conn_b = db.connect();
+    let reader = db.connect();
+    conn_a.execute("BEGIN CONCURRENT").unwrap();
+    conn_b.execute("BEGIN CONCURRENT").unwrap();
+    conn_a.execute("INSERT INTO t VALUES (1, 1)").unwrap();
+    conn_b.execute("INSERT INTO t VALUES (2, 1)").unwrap();
+    conn_a.set_yield_injector(Some(FixedYieldInjector::new([
+        CommitYieldPoint::LogRecordPrepared.point(),
+        CommitYieldPoint::LogicalLogWriteIssued.point(),
+    ])));
+    conn_b.set_yield_injector(Some(FixedYieldInjector::new([
+        CommitYieldPoint::LogRecordPrepared.point(),
+    ])));
+
+    let store = db.get_mvcc_store();
+    let coordinator = &store.commit_coordinator;
+    assert!(coordinator.pager_commit_lock.write());
+    let mut commit_a = conn_a.prepare("COMMIT").unwrap();
+    let mut commit_b = conn_b.prepare("COMMIT").unwrap();
+    assert!(matches!(
+        step_until_yield_or_done(&mut commit_a),
+        StepResult::Yield
+    ));
+    assert!(matches!(
+        step_until_yield_or_done(&mut commit_b),
+        StepResult::Yield
+    ));
+    assert!(matches!(commit_a.step().unwrap(), StepResult::IO));
+    assert!(matches!(commit_b.step().unwrap(), StepResult::IO));
+
+    reader.execute("BEGIN CONCURRENT").unwrap();
+    assert_eq!(
+        get_rows(&reader, "SELECT pk FROM t WHERE pk = 2"),
+        vec![vec![Value::from_i64(2)]],
+        "the reader reads the preparing waiter and depends on it"
+    );
+
+    coordinator.unlock_pager_commit_lock();
+    assert!(matches!(
+        step_until_yield_or_done(&mut commit_a),
+        StepResult::Yield
+    ));
+    drop(commit_b);
+    conn_a.set_yield_injector(None);
+    step_until_done(&mut commit_a);
+
+    let mut commit_reader = reader.prepare("COMMIT").unwrap();
+    step_until_done(&mut commit_reader);
+}
+
+#[test]
+fn dropped_leader_does_not_leave_its_own_record_in_the_queue() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let setup = db.connect();
+    setup
+        .execute("CREATE TABLE t (pk INTEGER PRIMARY KEY, v INTEGER)")
+        .unwrap();
+    setup.execute("PRAGMA mvcc_group_commit = yes").unwrap();
+    setup.close().unwrap();
+
+    let conn_a = db.connect();
+    let conn_b = db.connect();
+    conn_a.execute("BEGIN CONCURRENT").unwrap();
+    conn_b.execute("BEGIN CONCURRENT").unwrap();
+    conn_a.execute("INSERT INTO t VALUES (1, 1)").unwrap();
+    conn_b.execute("INSERT INTO t VALUES (2, 1)").unwrap();
+    let tx_a = conn_a.get_mv_tx_id().unwrap();
+    conn_a.set_yield_injector(Some(FixedYieldInjector::new([
+        CommitYieldPoint::LogicalLogWriteIssued.point(),
+    ])));
+
+    let store = db.get_mvcc_store();
+    let coordinator = &store.commit_coordinator;
+    assert!(coordinator.pager_commit_lock.write());
+    let mut commit_b = conn_b.prepare("COMMIT").unwrap();
+    let mut commit_a = conn_a.prepare("COMMIT").unwrap();
+    assert!(matches!(commit_b.step().unwrap(), StepResult::IO));
+    assert!(matches!(commit_a.step().unwrap(), StepResult::IO));
+    coordinator.unlock_pager_commit_lock();
+    assert!(
+        matches!(step_until_yield_or_done(&mut commit_a), StepResult::Yield),
+        "the leader yields after it issued the write of the waiter"
+    );
+    drop(commit_a);
+
+    let queued = coordinator.take_pending();
+    let queued_txs = queued.iter().map(|q| q.tx_id).collect::<Vec<_>>();
+    coordinator.requeue(queued.into_iter());
+    assert!(
+        !queued_txs.contains(&tx_a),
+        "the rolled-back leader still has a record in the queue: {queued_txs:?}"
+    );
+
+    step_until_done(&mut commit_b);
+    assert_eq!(
+        get_rows(&conn_b, "SELECT pk FROM t ORDER BY pk"),
+        vec![vec![Value::from_i64(2)]]
     );
 }
