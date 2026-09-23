@@ -12,7 +12,7 @@ use turso_core::Value;
 
 type Val = Arc<RwLock<Vec<u64>>>;
 
-const USAGE: &str = "usage: mvcc-micro <map> <keys:table|index> <workload> <preload> <threads> <ops_per_thread> [touch] [clone]
+const USAGE: &str = "usage: mvcc-micro <map> <keys:table|index|index_full|index_key_prefix> <workload> <preload> <threads> <ops_per_thread> [touch] [clone]
 maps: skiplist rwlock_btree scc_tree cmap olc_btree
 workloads: get scan100 cursor100 insert_rand insert_seq_shared mixed95 remove";
 
@@ -48,7 +48,7 @@ fn index_info() -> Arc<IndexInfo> {
             collation: Default::default(),
             nulls_order: None,
         };
-        Arc::new(IndexInfo::new(vec![key_info.clone(), key_info], true, 2, false).unwrap())
+        Arc::new(IndexInfo::new(vec![key_info, key_info], true, 2, false).unwrap())
     })
     .clone()
 }
@@ -70,6 +70,59 @@ impl Key for IndexKey {
             )
             .unwrap(),
         ))
+    }
+}
+
+#[derive(PartialEq, Eq, PartialOrd, Ord)]
+#[repr(transparent)]
+struct FullCompareIndexKey(SortableIndexKey);
+
+impl Key for Arc<FullCompareIndexKey> {
+    const CHEAP: bool = false;
+    fn make(i: u64) -> Self {
+        let key = Arc::into_raw(IndexKey::make(i).0);
+        // SAFETY: FullCompareIndexKey is a repr(transparent) wrapper of SortableIndexKey.
+        unsafe { Arc::from_raw(key.cast::<FullCompareIndexKey>()) }
+    }
+}
+
+#[derive(Clone)]
+struct PrefixedIndexKey {
+    prefix: Option<u64>,
+    key: Arc<SortableIndexKey>,
+}
+
+impl Ord for PrefixedIndexKey {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        match (self.prefix, other.prefix) {
+            (Some(a), Some(b)) if a != b => a.cmp(&b),
+            _ => self.key.cmp(&other.key),
+        }
+    }
+}
+
+impl PartialOrd for PrefixedIndexKey {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl PartialEq for PrefixedIndexKey {
+    fn eq(&self, other: &Self) -> bool {
+        self.cmp(other).is_eq()
+    }
+}
+
+impl Eq for PrefixedIndexKey {}
+
+impl Key for PrefixedIndexKey {
+    const CHEAP: bool = false;
+    fn make(i: u64) -> Self {
+        let key = IndexKey::make(i).0;
+        PrefixedIndexKey {
+            prefix: turso_core::bplus_tree::KeyPrefix::prefix(&*key),
+            key,
+        }
     }
 }
 
@@ -183,8 +236,8 @@ impl<K: Key> Map<K> for LockedBTree<K> {
 }
 
 // ---------------------------------------------------------------------------
-// scc::TreeIndex: B+ tree with lock-free reads. The cursor keeps its guard
-// between steps (an epoch pin, like the skiplist iterator).
+// scc::TreeIndex: B+ tree with lock-free reads. The scan keeps one `scc::Guard`
+// from its first step to its last step.
 struct SccTree<K: Key>(Arc<scc::TreeIndex<K, Val>>);
 
 impl<K: Key> Map<K> for SccTree<K> {
@@ -303,6 +356,56 @@ unsafe impl turso_core::bplus_tree::TreeKey for IndexKey {
     }
 }
 
+impl turso_core::bplus_tree::KeyPrefix for FullCompareIndexKey {}
+
+impl turso_core::bplus_tree::KeyPrefix for PrefixedIndexKey {
+    fn prefix(&self) -> Option<u64> {
+        self.prefix
+    }
+}
+
+unsafe impl turso_core::bplus_tree::TreeKey for PrefixedIndexKey {
+    type Slot = <ArcIndexKey as turso_core::bplus_tree::TreeKey>::Slot;
+
+    const NEEDS_DEFERRED_DROP: bool = true;
+
+    fn write(slot: &Self::Slot, key: Self) {
+        <ArcIndexKey as turso_core::bplus_tree::TreeKey>::write(slot, key.key)
+    }
+
+    fn move_from(slot: &Self::Slot, from: &Self::Slot) {
+        <ArcIndexKey as turso_core::bplus_tree::TreeKey>::move_from(slot, from)
+    }
+
+    fn read<R>(slot: &Self::Slot, f: impl FnOnce(&Self) -> R) -> Option<R> {
+        let prefix = Self::slot_prefix(slot);
+        <ArcIndexKey as turso_core::bplus_tree::TreeKey>::read(slot, |key| {
+            // SAFETY: the copy of the Arc is never dropped, so its strong count stays correct.
+            let key = std::mem::ManuallyDrop::new(PrefixedIndexKey {
+                prefix,
+                key: unsafe { std::ptr::read(key) },
+            });
+            f(&key)
+        })
+    }
+
+    fn take(slot: &Self::Slot) -> Self {
+        let prefix = Self::slot_prefix(slot);
+        PrefixedIndexKey {
+            prefix,
+            key: <ArcIndexKey as turso_core::bplus_tree::TreeKey>::take(slot),
+        }
+    }
+
+    fn clear(slot: &Self::Slot) {
+        <ArcIndexKey as turso_core::bplus_tree::TreeKey>::clear(slot)
+    }
+
+    fn slot_prefix(slot: &Self::Slot) -> Option<u64> {
+        <ArcIndexKey as turso_core::bplus_tree::TreeKey>::slot_prefix(slot)
+    }
+}
+
 trait TreeKeyBound: Key + turso_core::bplus_tree::TreeKey {}
 impl<K: Key + turso_core::bplus_tree::TreeKey> TreeKeyBound for K {}
 
@@ -380,6 +483,8 @@ fn main() {
     match args[2].as_str() {
         "table" => run::<RowID>(&args),
         "index" => run::<IndexKey>(&args),
+        "index_full" => run::<Arc<FullCompareIndexKey>>(&args),
+        "index_key_prefix" => run::<PrefixedIndexKey>(&args),
         other => panic!("unknown key type {other}"),
     }
 }
@@ -456,20 +561,20 @@ fn run<K: TreeKeyBound>(args: &[String]) {
                         sink += ops as usize;
                     }
                     "insert_seq_shared" => {
-                        for n in 0..ops as usize {
+                        for value in &fresh {
                             let i = next_seq.fetch_add(1, Ordering::Relaxed);
-                            map.insert(probe(&keys, i).into_owned(), fresh[n].clone());
+                            map.insert(probe(&keys, i).into_owned(), value.clone());
                         }
                         sink += ops as usize;
                     }
                     "mixed95" => {
                         let base = preload + t as u64 * ops;
                         let mut inserted = 0u64;
-                        for n in 0..ops as usize {
+                        for value in &fresh {
                             if rng.random_range(0..100) < 5 {
                                 let i = base + inserted;
                                 inserted += 1;
-                                map.insert(probe(&keys, i).into_owned(), fresh[n].clone());
+                                map.insert(probe(&keys, i).into_owned(), value.clone());
                             } else {
                                 let i = rng.random_range(0..preload);
                                 sink += map.get(&probe(&keys, i), clone) as usize;
