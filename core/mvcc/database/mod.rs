@@ -159,6 +159,15 @@ type TableRowIterator<'a, A = TursoAllocator> =
 type IndexRowIterator<'a, A = TursoAllocator> =
     Box<dyn Iterator<Item = IndexRowEntry<'a, A>> + Send + Sync + 'a>;
 
+/// Result of adding a version to a version chain with a visibility check.
+enum VersionInsert<T> {
+    /// The version was added to the chain.
+    Inserted(T),
+    /// The transaction can already see a version of this row, so nothing was
+    /// added. Holds the version that the caller asked to add.
+    AlreadyVisible(RowVersion),
+}
+
 /// Per-index map of sortable keys to their version chains, stored as the
 /// values of [`MvStore::index_rows`].
 pub type IndexRowsMap<A = TursoAllocator> =
@@ -5337,6 +5346,35 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         row: Row,
         maybe_index_id: Option<MVTableId>,
     ) -> Result<()> {
+        let not_inserted = self.insert_row_unless_visible(tx_id, row, maybe_index_id, false)?;
+        turso_assert!(
+            not_inserted.is_none(),
+            "an insert without a visibility check always inserts"
+        );
+        Ok(())
+    }
+
+    /// Inserts `row`, unless the transaction can already see a version of the
+    /// same row ID or index key. In that case nothing is inserted, and `row` (the
+    /// row that the caller passed in) is returned, so that the caller can update
+    /// the existing row with it. One search of the map finds the version chain
+    /// for both the check and the insert.
+    pub(crate) fn insert_unless_visible_to_table_or_index(
+        &self,
+        tx_id: TxID,
+        row: Row,
+        maybe_index_id: Option<MVTableId>,
+    ) -> Result<Option<Row>> {
+        self.insert_row_unless_visible(tx_id, row, maybe_index_id, true)
+    }
+
+    fn insert_row_unless_visible(
+        &self,
+        tx_id: TxID,
+        row: Row,
+        maybe_index_id: Option<MVTableId>,
+        check_visible: bool,
+    ) -> Result<Option<Row>> {
         tracing::trace!("insert(tx_id={}, row.id={:?})", tx_id, row.id);
         let tx = self
             .txs
@@ -5344,6 +5382,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
             .ok_or_else(|| LimboError::NoSuchTransactionID(tx_id.to_string()))?;
         let tx = tx.value();
         turso_assert_eq!(tx.state, TransactionState::Active);
+        let visible_to = check_visible.then_some(tx);
         let id = row.id.clone();
         match maybe_index_id {
             Some(index_id) => {
@@ -5364,8 +5403,17 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                 // Single SkipMap traversal: pass in a fresh Arc; the SkipMap
                 // returns the canonical Arc (ours on miss, an existing one
                 // on hit), which we hand to savepoint tracking.
-                let (canonical_key, row_versions) =
-                    self.insert_index_version(index_id, sortable_key, row_version)?;
+                let (canonical_key, row_versions) = match self.insert_index_version_unless_visible(
+                    index_id,
+                    sortable_key,
+                    row_version,
+                    visible_to,
+                )? {
+                    VersionInsert::Inserted(inserted) => inserted,
+                    VersionInsert::AlreadyVisible(row_version) => {
+                        return Ok(Some(row_version.row));
+                    }
+                };
                 tx.insert_to_write_set(
                     RowID::new(id.table_id, RowKey::Record(canonical_key.clone())),
                     row_versions,
@@ -5389,14 +5437,23 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                     btree_resident: false,
                     materialized_at: crate::mvcc::database::WalPos::ORIGIN,
                 };
-                let row_versions = self.insert_version(id.clone(), row_version)?;
+                let row_versions = match self.insert_version_unless_visible(
+                    id.clone(),
+                    row_version,
+                    visible_to,
+                )? {
+                    VersionInsert::Inserted(row_versions) => row_versions,
+                    VersionInsert::AlreadyVisible(row_version) => {
+                        return Ok(Some(row_version.row));
+                    }
+                };
                 let allocator = self.get_rowid_allocator(&id.table_id);
                 allocator.insert_row_id_maybe_update(id.row_id.to_int_or_panic());
                 tx.record_created_table_version(id.clone(), version_id);
                 tx.insert_to_write_set(id, row_versions);
             }
         }
-        Ok(())
+        Ok(None)
     }
 
     /// Inserts a deletion record for a row that does not currently have any versions in the MV store.
@@ -5726,11 +5783,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                 let row_versions_opt = rows.get(sortable_key);
                 if let Some(ref row_versions) = row_versions_opt {
                     let row_versions = row_versions.value().read();
-                    if let Some(rv) = row_versions
-                        .iter()
-                        .rev()
-                        .find(|rv| rv.is_visible_to(tx, &self.txs, &self.finalized_tx_states))
-                    {
+                    if let Some(rv) = self.newest_visible_version(tx, &row_versions) {
                         return Ok(Some(rv.row.clone()));
                     }
                 }
@@ -5739,8 +5792,8 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
             None => {
                 if let Some(row_versions) = self.rows.get(id) {
                     let row_versions = row_versions.value().read();
-                    if let Some(row) = self.skipmap_row_while_uncovered(tx, &row_versions) {
-                        return Ok(Some(row));
+                    if let Some(rv) = self.visible_table_version(tx, &row_versions) {
+                        return Ok(Some(rv.row.clone()));
                     }
                 }
                 Ok(None)
@@ -5748,12 +5801,29 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         }
     }
 
-    /// SkipMap payload for `tx` while B-tree fallthrough is not allowed.
-    fn skipmap_row_while_uncovered(
+    /// The newest version in `versions` that `tx` can see, if any. This is the
+    /// full check for an index key. A table row also needs the B-tree check in
+    /// `visible_table_version`.
+    fn newest_visible_version<'v>(
         &self,
         tx: &Transaction<A>,
-        versions: &[RowVersion],
-    ) -> Option<Row> {
+        versions: &'v [RowVersion],
+    ) -> Option<&'v RowVersion> {
+        versions
+            .iter()
+            .rev()
+            .find(|rv| rv.is_visible_to(tx, &self.txs, &self.finalized_tx_states))
+    }
+
+    /// The newest version of a table row that `tx` can see in the version
+    /// store, if any. Also `None` when a checkpoint has already written the row
+    /// to the B-tree and `tx` must read the row from there instead (see
+    /// `btree_covers_chain_for_tx`).
+    fn visible_table_version<'v>(
+        &self,
+        tx: &Transaction<A>,
+        versions: &'v [RowVersion],
+    ) -> Option<&'v RowVersion> {
         if versions.is_empty() {
             return None;
         }
@@ -5761,11 +5831,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         if self.btree_covers_chain_for_tx(tx, table_id, versions) {
             return None;
         }
-        versions
-            .iter()
-            .rev()
-            .find(|rv| rv.is_visible_to(tx, &self.txs, &self.finalized_tx_states))
-            .map(|rv| rv.row.clone())
+        self.newest_visible_version(tx, versions)
     }
 
     /// Like the table branch of [`read_from_table_or_index`], but reads from an
@@ -8386,6 +8452,25 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         id: RowID,
         row_version: RowVersion,
     ) -> Result<RowVersions<A>, TryReserveError> {
+        match self.insert_version_unless_visible(id, row_version, None)? {
+            VersionInsert::Inserted(row_versions) => Ok(row_versions),
+            VersionInsert::AlreadyVisible(_) => {
+                unreachable!("no visibility check was requested")
+            }
+        }
+    }
+
+    /// Like [`Self::insert_version`], with an optional check first. If
+    /// `visible_to` is given and that transaction can already see a version of
+    /// this row, nothing is inserted and `row_version` is returned unchanged in
+    /// `VersionInsert::AlreadyVisible`. The check and the insert happen under
+    /// the same write lock, so no other writer can change the chain between them.
+    fn insert_version_unless_visible(
+        &self,
+        id: RowID,
+        row_version: RowVersion,
+        visible_to: Option<&Transaction<A>>,
+    ) -> Result<VersionInsert<RowVersions<A>>, TryReserveError> {
         // GC removes a row's entry from `rows` when its version chain is empty.
         // If that happens while we wait for the write lock, the chain we lock is
         // no longer in the map, and a version added to it would be lost. GC
@@ -8399,9 +8484,14 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
             if entry.is_removed() {
                 continue;
             }
+            if let Some(tx) = visible_to {
+                if self.visible_table_version(tx, &versions).is_some() {
+                    return Ok(VersionInsert::AlreadyVisible(row_version));
+                }
+            }
             self.insert_version_raw(&mut versions, row_version)?;
             drop(versions);
-            return Ok(row_versions);
+            return Ok(VersionInsert::Inserted(row_versions));
         }
     }
 
@@ -8445,8 +8535,28 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         &self,
         index_id: MVTableId,
         key: Arc<SortableIndexKey>,
-        mut row_version: RowVersion,
+        row_version: RowVersion,
     ) -> Result<(Arc<SortableIndexKey>, RowVersions<A>)> {
+        match self.insert_index_version_unless_visible(index_id, key, row_version, None)? {
+            VersionInsert::Inserted(inserted) => Ok(inserted),
+            VersionInsert::AlreadyVisible(_) => {
+                unreachable!("no visibility check was requested")
+            }
+        }
+    }
+
+    /// Like [`Self::insert_index_version`], with an optional check first. If
+    /// `visible_to` is given and that transaction can already see a version of
+    /// this key, nothing is inserted and `row_version` is returned unchanged in
+    /// `VersionInsert::AlreadyVisible`. The check and the insert happen under
+    /// the same write lock, so no other writer can change the chain between them.
+    fn insert_index_version_unless_visible(
+        &self,
+        index_id: MVTableId,
+        key: Arc<SortableIndexKey>,
+        mut row_version: RowVersion,
+        visible_to: Option<&Transaction<A>>,
+    ) -> Result<VersionInsert<(Arc<SortableIndexKey>, RowVersions<A>)>> {
         // Publish the key-set mutation *before* the key becomes visible in the
         // map: a concurrent shadow scan that races with this insert may then
         // reseed spuriously, but can never miss the new key (#7578).
@@ -8454,7 +8564,8 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         let index = self.get_or_create_index_rows(index_id)?;
         let index = index.value();
         // If GC removed this key's entry while we waited for the write lock, look
-        // the key up again. `insert_version` explains why `is_removed()` is enough.
+        // the key up again. `insert_version_unless_visible` explains why
+        // `is_removed()` is enough.
         loop {
             let entry = self.get_or_create_index_key_entry(index, key.clone())?;
             // SkipMap may keep our Arc (miss) or a pre-existing one (hit); return that
@@ -8465,10 +8576,15 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
             if entry.is_removed() {
                 continue;
             }
+            if let Some(tx) = visible_to {
+                if self.newest_visible_version(tx, &versions).is_some() {
+                    return Ok(VersionInsert::AlreadyVisible(row_version));
+                }
+            }
             row_version.row.id.row_id = RowKey::Record(canonical_key.clone());
             self.insert_version_raw(&mut versions, row_version)?;
             drop(versions);
-            return Ok((canonical_key, row_versions));
+            return Ok(VersionInsert::Inserted((canonical_key, row_versions)));
         }
     }
 
@@ -8618,7 +8734,8 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
     /// Passive sequence compaction: record end-stamped deletes instead of inline B-tree purge.
     pub fn seqcompact_commit_delete(&self, rowid: RowID, num_cols: usize, end_ts: u64) {
         // If GC removed this row's entry while we waited for the write lock, look
-        // the row up again. `insert_version` explains why `is_removed()` is enough.
+        // the row up again. `insert_version_unless_visible` explains why
+        // `is_removed()` is enough.
         loop {
             let Ok(entry) = self.get_or_create_table_row_entry(rowid.clone()) else {
                 return;

@@ -1881,7 +1881,28 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> CursorTrait
             MvccCursorType::Table => None,
         };
         // FIXME: set btree to somewhere close to this rowid?
-        if self
+        if !was_btree_resident {
+            // Insert the row, or, if this transaction can already see a version
+            // of it, get the row back and update that version instead.
+            let row_to_update = self
+                .db
+                .insert_unless_visible_to_table_or_index(self.tx_id, row, maybe_index_id)
+                .inspect_err(|_| {
+                    self.current_pos = CursorPosition::BeforeFirst;
+                })?;
+            if let Some(row) = row_to_update {
+                let updated = self
+                    .db
+                    .update_to_table_or_index(self.tx_id, row, maybe_index_id)
+                    .inspect_err(|_| {
+                        self.current_pos = CursorPosition::BeforeFirst;
+                    })?;
+                turso_assert!(
+                    updated,
+                    "insert found a visible version but update could not supersede it"
+                );
+            }
+        } else if self
             .db
             .read_from_table_or_index(self.tx_id, &row.id, maybe_index_id)?
             .is_some()
@@ -1896,17 +1917,11 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> CursorTrait
                 updated,
                 "read found a visible version but update could not supersede it"
             );
-        } else if was_btree_resident {
+        } else {
             // The row exists in B-tree but not in MvStore - mark it as B-tree resident
             // so that checkpoint knows to write deletes to the B-tree file.
             self.db
                 .insert_btree_resident_to_table_or_index(self.tx_id, row, maybe_index_id)
-                .inspect_err(|_| {
-                    self.current_pos = CursorPosition::BeforeFirst;
-                })?;
-        } else {
-            self.db
-                .insert_to_table_or_index(self.tx_id, row, maybe_index_id)
                 .inspect_err(|_| {
                     self.current_pos = CursorPosition::BeforeFirst;
                 })?;
