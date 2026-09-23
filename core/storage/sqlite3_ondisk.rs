@@ -1390,10 +1390,6 @@ pub fn read_varint(buf: &[u8]) -> Result<(u64, usize)> {
     }
 }
 
-/// The number of bytes the varint at the front of `buf` takes. A caller that
-/// only has to step over a varint pays for none of the shifting and masking
-/// that builds its value; the three lengths written out here cover every
-/// rowid below two million, and anything longer goes through the reader.
 #[inline(always)]
 pub fn read_varint_len(buf: &[u8]) -> Result<usize> {
     match buf {
