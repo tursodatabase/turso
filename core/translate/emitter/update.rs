@@ -1153,6 +1153,9 @@ fn emit_update_insns<'a>(
         .iter()
         .map(|set_clause| set_clause.column_index)
         .try_collect()?;
+    let mut columns_read_from_table: ColumnMask =
+        (0..target_table.table.columns().len()).try_collect()?;
+    columns_read_from_table -= &updated_column_indices;
     let has_any_update_triggers = if let Some(btree_table) = target_table.table.btree() {
         has_triggers_including_temp(
             &t_ctx.resolver,
@@ -1377,7 +1380,8 @@ fn emit_update_insns<'a>(
                 //TODO only emit required virtual columns
                 if let Table::BTree(ref btree) = target_table.table {
                     let new_ctx =
-                        DmlColumnContext::layout(columns, start, new_rowid_reg, layout.clone());
+                        DmlColumnContext::layout(columns, start, new_rowid_reg, layout.clone())
+                            .with_encoded_columns(columns_read_from_table.try_clone()?);
                     compute_virtual_columns(
                         program,
                         &btree.columns_topo_sort()?,
@@ -1580,7 +1584,8 @@ fn emit_update_insns<'a>(
             || index_references_virtual_column
         {
             let dml_ctx =
-                DmlColumnContext::layout(cols, start, effective_rowid_reg, layout.clone());
+                DmlColumnContext::layout(cols, start, effective_rowid_reg, layout.clone())
+                    .with_encoded_columns(columns_read_from_table.try_clone()?);
             compute_virtual_columns(
                 program,
                 &btree.columns_topo_sort()?,
@@ -1816,7 +1821,7 @@ fn emit_update_insns<'a>(
                 .as_ref()
                 .clone();
             let columns = target_table.table.columns();
-            let mut column_regs: Vec<usize> = columns
+            let column_regs: Vec<usize> = columns
                 .iter()
                 .enumerate()
                 .map(|(i, col)| {
@@ -1834,7 +1839,7 @@ fn emit_update_insns<'a>(
                 &t_ctx.resolver,
                 new_where_expr,
                 columns,
-                &mut column_regs,
+                &column_regs,
                 &bt,
                 new_satisfied_reg,
             )?;

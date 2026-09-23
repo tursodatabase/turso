@@ -759,6 +759,7 @@ pub fn emit_upsert(
         new_rowid_reg.unwrap_or(ctx.conflict_rowid_reg),
         &layout,
         resolver,
+        ColumnMask::default(),
     )?;
 
     if let Some(bt) = table.btree() {
@@ -928,6 +929,7 @@ pub fn emit_upsert(
                 new_rowid_reg.unwrap_or(ctx.conflict_rowid_reg),
                 &layout,
                 resolver,
+                (0..num_cols).try_collect()?,
             )?;
 
             let has_relevant_after_triggers = has_triggers_including_temp(
@@ -1570,12 +1572,14 @@ fn compute_new_row_virtual_columns(
     rowid_reg: usize,
     layout: &ColumnLayout,
     resolver: &Resolver,
+    encoded_columns: ColumnMask,
 ) -> crate::Result<()> {
     if !ctx.table.has_virtual_columns {
         return Ok(());
     }
     let dml_ctx =
-        DmlColumnContext::layout(ctx.table.columns(), new_start, rowid_reg, layout.clone());
+        DmlColumnContext::layout(ctx.table.columns(), new_start, rowid_reg, layout.clone())
+            .with_encoded_columns(encoded_columns);
     compute_virtual_columns(
         program,
         &ctx.table.columns_topo_sort()?,
@@ -1647,7 +1651,7 @@ fn eval_partial_pred_for_row_image(
     let columns = table.columns();
     let bt = table.require_btree().ok()?;
 
-    let mut column_regs: Vec<usize> = columns
+    let column_regs: Vec<usize> = columns
         .iter()
         .enumerate()
         .map(|(i, col)| {
@@ -1665,7 +1669,7 @@ fn eval_partial_pred_for_row_image(
         resolver,
         expr,
         columns,
-        &mut column_regs,
+        &column_regs,
         &bt,
         r,
     )
@@ -1689,7 +1693,7 @@ fn emit_upsert_expr_index_value(
     let columns = table.columns();
     let bt = table.require_btree()?;
 
-    let mut column_regs: Vec<usize> = columns
+    let column_regs: Vec<usize> = columns
         .iter()
         .enumerate()
         .map(|(i, col)| {
@@ -1705,7 +1709,7 @@ fn emit_upsert_expr_index_value(
         resolver,
         expr,
         columns,
-        &mut column_regs,
+        &column_regs,
         &bt,
         dest_reg,
     )?;
