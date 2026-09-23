@@ -765,6 +765,33 @@ fail.
 `scan_128_btree` compares no index keys and has moved between about 207,600
 and 210,400 across builds without a related change; see the note under H28.
 
+## H30. Text key bytes are compared through a `memcmp` call — `fixed`
+
+**Where:** After H29, `bcmp` and the slice comparison around it cost about
+103,000 instructions per `batch_insert_commit` operation. Index keys are short,
+so most of that is the call and its setup, not the byte loop.
+
+**Fix:** `compare_bytes` compares eight bytes at a time as big-endian `u64`
+words, and compares keys shorter than eight bytes one byte at a time. The last
+word starts at `common - 8`, so it can overlap the previous word; those bytes
+already compared equal. A first version built on `chunks_exact` and `zip` removed
+the `memcmp` cost but added about 96,000 instructions of iterator code.
+
+`compare_bytes_matches_slice_order` checks the result against `<[u8]>::cmp`
+for 20,000 random pairs with lengths up to 31 and shared prefixes.
+
+**Callgrind, 200/2,200 iterations:**
+
+| Scenario | Before | After | Change |
+|---|---:|---:|---:|
+| `batch_insert_commit` | 1,517,552 | 1,502,498 | -1.0% |
+| `delete_commit` | 52,093 | 51,423 | -1.3% |
+| `insert_rollback` | 47,485 | 47,051 | -0.9% |
+| `insert_commit` | 62,839 | 62,318 | -0.8% |
+| `index_read` | 26,601 | 26,445 | -0.6% |
+
+Scenarios that compare no text keys changed by at most two instructions.
+
 ## Final measured totals
 
 The branch was rebased after `origin/main` gained unrelated planner work and an

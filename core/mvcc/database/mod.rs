@@ -338,7 +338,7 @@ fn compare_next_index_value(
             CollationSeq::Unset | CollationSeq::Binary
         )
     {
-        let cmp = lhs_data.cmp(rhs_data);
+        let cmp = compare_bytes(lhs_data, rhs_data);
         return Ok(match key_info.sort_order {
             SortOrder::Asc => cmp,
             SortOrder::Desc => cmp.reverse(),
@@ -368,7 +368,7 @@ fn compare_leading_binary_text(
     ) {
         return None;
     }
-    let cmp = leading_text_column(lhs)?.cmp(leading_text_column(rhs)?);
+    let cmp = compare_bytes(leading_text_column(lhs)?, leading_text_column(rhs)?);
     Some(match key_info.sort_order {
         SortOrder::Asc => cmp,
         SortOrder::Desc => cmp.reverse(),
@@ -388,6 +388,42 @@ fn leading_text_column(record: &[u8]) -> Option<&[u8]> {
     let start = header_size as usize;
     let len = (serial_type as usize - 13) / 2;
     record.get(start..start + len)
+}
+
+/// Lexicographic byte order, eight bytes at a time. Index keys are short, so
+/// this avoids a `memcmp` call per comparison. The last word may overlap the
+/// previous one; the overlapping bytes are already known to be equal.
+fn compare_bytes(lhs: &[u8], rhs: &[u8]) -> std::cmp::Ordering {
+    let common = lhs.len().min(rhs.len());
+    if common < 8 {
+        for i in 0..common {
+            if lhs[i] != rhs[i] {
+                return lhs[i].cmp(&rhs[i]);
+            }
+        }
+        return lhs.len().cmp(&rhs.len());
+    }
+    let mut start = 0;
+    loop {
+        let start_of_word = start.min(common - 8);
+        let lhs_word = word_at(lhs, start_of_word);
+        let rhs_word = word_at(rhs, start_of_word);
+        if lhs_word != rhs_word {
+            return lhs_word.cmp(&rhs_word);
+        }
+        if start_of_word + 8 == common {
+            return lhs.len().cmp(&rhs.len());
+        }
+        start += 8;
+    }
+}
+
+fn word_at(bytes: &[u8], start: usize) -> u64 {
+    u64::from_be_bytes(
+        bytes[start..start + 8]
+            .try_into()
+            .expect("slice has eight bytes"),
+    )
 }
 
 impl PartialEq for SortableIndexKey {
