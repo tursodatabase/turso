@@ -828,27 +828,59 @@ the usual spread between builds.
 
 ## Final measured totals
 
-The branch was rebased after `origin/main` gained unrelated planner work and an
-MVCC checkpoint append optimization. The final comparison reran all seven
-scenarios against the refreshed `origin/main` baseline at `869cb5dae`, with the
-same measurement-harness commits applied to both trees. The earlier hypothesis
-tables retain the measurements taken while each change was evaluated.
+The baseline is `origin/main` at `fd41c07dc`, with the same measurement-harness
+commits applied to both trees. The earlier hypothesis tables keep the
+measurements taken while each change was evaluated.
 
-| Scenario | Original | Final | Change |
+**Callgrind, instructions per operation, 200/2,200 iterations:**
+
+| Scenario | `origin/main` | Final | Change |
 |---|---:|---:|---:|
-| `point_read` | 19,880 | 19,532 | -1.8% |
-| `index_read` | 54,562 | 43,934 | -19.5% |
-| `scan_128` | 331,208 | 255,494 | -22.9% |
-| `point_update_rollback` | 508,834 | 38,744 | -92.4% |
-| `insert_rollback` | 345,221 | 78,381 | -77.3% |
-| `point_update_commit` | 46,530 | 45,945 | -1.3% |
-| `insert_commit` | 156,587 | 111,850 | -28.6% |
+| `point_read` | 18,546 | 14,893 | -19.7% |
+| `index_read` | 44,975 | 26,012 | -42.2% |
+| `scan_128` | 352,422 | 218,855 | -37.9% |
+| `point_read_btree` | 18,671 | 16,099 | -13.8% |
+| `index_read_btree` | 38,268 | 32,392 | -15.4% |
+| `scan_128_btree` | 321,597 | 207,628 | -35.4% |
+| `index_scan_128` | 1,172,182 | 189,214 | -83.9% |
+| `point_update_rollback` | 542,557 | 31,789 | -94.1% |
+| `insert_rollback` | 347,123 | 45,229 | -87.0% |
+| `point_update_commit` | 44,956 | 34,093 | -24.2% |
+| `insert_commit` | 120,209 | 61,229 | -49.1% |
+| `batch_insert_commit` | 3,160,953 | 1,481,590 | -53.1% |
+| `delete_commit` | 80,326 | 50,332 | -37.3% |
 
-The refreshed native wall-clock spot check used eleven fresh-process samples
-per tree and ran the baseline and branch sequentially:
+**Native wall clock, `scripts/mvcc-wallclock.sh`:** median of eleven
+fresh-process samples per tree on an Apple Silicon Mac. Each scenario ran on
+the baseline and then on the branch before the next scenario started.
 
 | Scenario | `origin/main` median | Final median | Change |
 |---|---:|---:|---:|
-| `scan_128` | 12,467 ns | 9,477 ns | -24.0% |
-| `point_update_rollback` | 47,787 ns | 3,118 ns | -93.5% |
-| `insert_commit` | 8,842 ns | 6,914 ns | -21.8% |
+| `point_read` | 997 ns | 795 ns | -20.3% |
+| `index_read` | 2,648 ns | 1,514 ns | -42.8% |
+| `scan_128` | 13,259 ns | 7,991 ns | -39.7% |
+| `point_update_rollback` | 48,829 ns | 2,526 ns | -94.8% |
+| `insert_rollback` | 33,938 ns | 3,561 ns | -89.5% |
+| `point_update_commit` | 3,006 ns | 2,348 ns | -21.9% |
+| `insert_commit` | 7,166 ns | 4,031 ns | -43.7% |
+| `batch_insert_commit` | 178,044 ns | 91,357 ns | -48.7% |
+| `delete_commit` | 5,235 ns | 3,409 ns | -34.9% |
+
+The wall-clock changes follow the instruction counts within a few points in
+every scenario.
+
+## Remaining allocation sites
+
+DHAT on `batch_insert_commit` after H31 shows about 32 allocations per inserted
+row. None of the rest can be removed with a local change:
+
+- two `IndexInfo` allocations per statement in `op_open_write`. A cache on the
+  compiled program would move them to the default allocator, but MVCC keys must
+  use the store's allocator (`DatabaseAllocators::mv_store`).
+- four cursor boxes per statement (`BTreeCursor` and `MvccLazyCursor` for the
+  table and the index), and one boxed skip-list iterator per seek.
+- the seek key record from `ImmutableRecord::from_registers`, copied again into
+  an `Arc` slice by `SortableIndexKey::new_from_payload_in`.
+- `op_string8` clones its literal into the register on every execution, where
+  SQLite points the register at the literal (`MEM_Static`).
+- the row, key, version, and skip-list node allocations that store the row.
