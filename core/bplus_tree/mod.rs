@@ -617,45 +617,6 @@ impl<K: TreeKey, V: TreeValue, A: ConcurrentAllocator> BPlusTreeMap<K, V, A> {
         }
     }
 
-    /// Calls `f` for each entry from `start`, in order, until `f` returns false. Holds
-    /// one epoch pin for the whole walk, so it is cheaper than an iterator for bulk work.
-    pub fn for_each_from<Q>(&self, start: Bound<&Q>, mut f: impl FnMut(&K, &V) -> bool)
-    where
-        K: Borrow<Q>,
-        Q: Ord + KeyPrefix + ?Sized,
-    {
-        let _guard = epoch::pin();
-        let mut next = match start {
-            Bound::Unbounded => self.seek::<Q>(Target::First),
-            Bound::Included(q) => self.seek(Target::AtOrAfter(q)),
-            Bound::Excluded(q) => self.seek(Target::After(q)),
-        };
-        while let Some(pos) = next {
-            // SAFETY: nodes live as long as the tree.
-            let leaf = unsafe { &*pos.leaf };
-            let Some(key) = K::read(&leaf.keys[pos.index], K::clone) else {
-                next = None;
-                continue;
-            };
-            let value_ptr = &leaf.values[pos.index];
-            let Some(value) = V::clone_from_slot(value_ptr) else {
-                next = self.seek::<K>(Target::After(&key));
-                continue;
-            };
-            if leaf.header.check(pos.version).is_err() {
-                next = self.seek::<K>(Target::AtOrAfter(&key));
-                continue;
-            }
-            if !f(&key, &value) {
-                return;
-            }
-            next = match self.step(pos, true) {
-                Some(p) => Some(p),
-                None => self.seek::<K>(Target::After(&key)),
-            };
-        }
-    }
-
     /// Inserts `value` for `key`. An existing value for `key` is replaced.
     pub fn insert(&self, key: K, value: V) -> Entry<'_, K, V, A> {
         self.try_insert(key, value)
@@ -794,9 +755,14 @@ impl<K: TreeKey, V: TreeValue, A: ConcurrentAllocator> BPlusTreeMap<K, V, A> {
                     index: index - 1,
                 });
             }
+            #[cfg(test)]
+            tests::before_child_version_read();
+            let parent = node;
+            let parent_version = version;
             // SAFETY: nodes live as long as the tree.
             node = unsafe { &*child };
             version = node.read_lock()?;
+            parent.check(parent_version)?;
         }
         Ok(Some(LeafVisit {
             leaf: ptr::from_ref(node).cast::<Leaf<K, V>>(),
