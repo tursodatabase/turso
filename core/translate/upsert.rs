@@ -728,6 +728,25 @@ pub fn emit_upsert(
                     None,
                 )?,
             });
+        } else {
+            // For non-STRICT tables, apply column affinity to the values.
+            // This must happen early so that both index records and the table record
+            // use the converted values.
+            let affinity = bt
+                .columns()
+                .iter()
+                .filter(|c| !c.is_virtual_generated())
+                .map(|c| c.affinity());
+
+            if affinity.clone().any(|a| a != Affinity::Blob) {
+                if let Ok(count) = NonZeroUsize::try_from(layout.num_non_virtual_cols()) {
+                    program.emit_insn(Insn::Affinity {
+                        start_reg: new_start,
+                        count,
+                        affinities: affinity.map(|a| a.aff_mask()).collect(),
+                    });
+                }
+            }
         }
     }
 
@@ -764,25 +783,6 @@ pub fn emit_upsert(
                 check_generated: true,
                 table_reference: BTreeTable::type_check_table_ref(&bt, resolver.schema()),
             });
-        } else {
-            // For non-STRICT tables, apply column affinity to the values.
-            // This must happen early so that both index records and the table record
-            // use the converted values.
-            let affinity = bt
-                .columns()
-                .iter()
-                .filter(|c| !c.is_virtual_generated())
-                .map(|c| c.affinity());
-
-            if affinity.clone().any(|a| a != Affinity::Blob) {
-                if let Ok(count) = NonZeroUsize::try_from(layout.num_non_virtual_cols()) {
-                    program.emit_insn(Insn::Affinity {
-                        start_reg: new_start,
-                        count,
-                        affinities: affinity.map(|a| a.aff_mask()).collect(),
-                    });
-                }
-            }
         }
 
         // Evaluate CHECK constraints on the new values
@@ -1541,18 +1541,6 @@ pub fn emit_upsert(
             }
             program.preassign_label_to_next_insn(after_trigger_done);
         }
-    }
-
-    // Compute virtual columns for RETURNING (if any virtual columns exist)
-    if !returning.is_empty() {
-        compute_new_row_virtual_columns(
-            program,
-            ctx,
-            new_start,
-            new_rowid_reg.unwrap_or(ctx.conflict_rowid_reg),
-            &layout,
-            resolver,
-        )?;
     }
 
     // RETURNING from NEW image + final rowid

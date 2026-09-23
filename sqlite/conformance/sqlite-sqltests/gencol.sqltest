@@ -5875,3 +5875,23 @@ setup gencol_virtual_columns_update {
 snapshot gencol_update_computes_virtual_columns_once {
     UPDATE t SET a = 5 WHERE b = 3;
 }
+
+test gencol_upsert_check_on_virtual_column_sees_column_affinity {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, b INTEGER, c AS (typeof(b)) CHECK (c = 'integer'));
+    INSERT INTO t(id, b) VALUES (1, 5);
+    INSERT INTO t(id, b) VALUES (1, 0) ON CONFLICT(id) DO UPDATE SET b = '6';
+    SELECT id, b, c FROM t;
+}
+expect {
+    1|6|integer
+}
+
+setup gencol_virtual_columns_upsert {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, b INTEGER, c AS (id + b), d AS (c * 2));
+}
+
+@skip-if mvcc "mvcc has different root pages"
+@setup gencol_virtual_columns_upsert
+snapshot gencol_upsert_computes_virtual_columns_once {
+    INSERT INTO t(id, b) VALUES (1, 2) ON CONFLICT(id) DO UPDATE SET b = excluded.b + 1 RETURNING c, d;
+}
