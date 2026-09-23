@@ -2,6 +2,7 @@ use crate::alloc::{
     ConcurrentAllocator, DynAllocator, DynVec, TryReserveError, TursoAllocator,
     TursoTryWithCapacityExt, TursoVecInExt, ALLOC_ERR_MSG,
 };
+use crate::bplus_tree::{BPlusTreeMap, Entry as TreeEntry};
 use crate::mvcc::clock::LogicalClock;
 use crate::mvcc::cursor::{static_iterator_hack, MvccIterator};
 #[cfg(any(test, injected_yields))]
@@ -149,9 +150,9 @@ impl<A: ConcurrentAllocator> RowVersionAllocator for A {
 
 pub type RowVersionChain<A = TursoAllocator> = <A as RowVersionAllocator>::RowVersionChain;
 pub type RowVersions<A = TursoAllocator> = Arc<RwLock<RowVersionChain<A>>>;
-type TableRowEntry<'a, A = TursoAllocator> = Entry<'a, RowID, RowVersions<A>, BasicComparator, A>;
+type TableRowEntry<'a, A = TursoAllocator> = TreeEntry<'a, RowID, RowVersions<A>, A>;
 type IndexRowEntry<'a, A = TursoAllocator> =
-    Entry<'a, Arc<SortableIndexKey>, RowVersions<A>, BasicComparator, A>;
+    TreeEntry<'a, Arc<SortableIndexKey>, RowVersions<A>, A>;
 type IndexRowsEntry<'a, A = TursoAllocator> =
     Entry<'a, MVTableId, IndexRowsMap<A>, BasicComparator, A>;
 type TableRowIterator<'a, A = TursoAllocator> =
@@ -161,8 +162,7 @@ type IndexRowIterator<'a, A = TursoAllocator> =
 
 /// Per-index map of sortable keys to their version chains, stored as the
 /// values of [`MvStore::index_rows`].
-pub type IndexRowsMap<A = TursoAllocator> =
-    SkipMap<Arc<SortableIndexKey>, RowVersions<A>, BasicComparator, A>;
+pub type IndexRowsMap<A = TursoAllocator> = BPlusTreeMap<Arc<SortableIndexKey>, RowVersions<A>, A>;
 
 impl MVTableId {
     pub fn new(value: i64) -> Self {
@@ -352,6 +352,53 @@ impl RowID {
     pub fn new(table_id: MVTableId, row_id: RowKey) -> Self {
         Self { table_id, row_id }
     }
+}
+
+/// Node storage for a table row key. Table row keys are always integer rowids.
+#[derive(Default)]
+pub struct RowIdSlot {
+    table_id: std::sync::atomic::AtomicI64,
+    row_id: std::sync::atomic::AtomicI64,
+}
+
+// SAFETY: both fields are atomics, zero is a valid value, and any mix of the two
+// fields is a valid `RowID` with an integer rowid.
+unsafe impl crate::bplus_tree::TreeKey for RowID {
+    type Slot = RowIdSlot;
+
+    const NEEDS_DEFERRED_DROP: bool = false;
+
+    fn write(slot: &Self::Slot, key: Self) {
+        let RowKey::Int(row_id) = key.row_id else {
+            panic!("table row keys are integer rowids");
+        };
+        slot.table_id.store(key.table_id.0, Ordering::Release);
+        slot.row_id.store(row_id, Ordering::Release);
+    }
+
+    fn move_from(slot: &Self::Slot, from: &Self::Slot) {
+        slot.table_id
+            .store(from.table_id.load(Ordering::Acquire), Ordering::Release);
+        slot.row_id
+            .store(from.row_id.load(Ordering::Acquire), Ordering::Release);
+    }
+
+    fn read<R>(slot: &Self::Slot, f: impl FnOnce(&Self) -> R) -> Option<R> {
+        let key = RowID {
+            table_id: MVTableId(slot.table_id.load(Ordering::Acquire)),
+            row_id: RowKey::Int(slot.row_id.load(Ordering::Acquire)),
+        };
+        Some(f(&key))
+    }
+
+    fn take(slot: &Self::Slot) -> Self {
+        RowID {
+            table_id: MVTableId(slot.table_id.load(Ordering::Acquire)),
+            row_id: RowKey::Int(slot.row_id.load(Ordering::Acquire)),
+        }
+    }
+
+    fn clear(_slot: &Self::Slot) {}
 }
 
 #[derive(Clone, Debug, PartialEq, PartialOrd)]
@@ -4306,7 +4353,7 @@ pub(crate) struct GcDebugSnapshot {
 /// A multi-version concurrency control database.
 #[derive(Debug)]
 pub struct MvStore<Clock: LogicalClock, A: ConcurrentAllocator = TursoAllocator> {
-    pub rows: SkipMap<RowID, RowVersions<A>, BasicComparator, A>,
+    pub rows: BPlusTreeMap<RowID, RowVersions<A>, A>,
     /// Table ID is an opaque identifier that is only meaningful to the MV store.
     /// Each checkpointed MVCC table corresponds to a single B-tree on the pager,
     /// which naturally has a root page.
@@ -4554,7 +4601,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         // table id 1 / root page 1 is always sqlite_schema.
         table_id_to_rootpage.try_insert(SQLITE_SCHEMA_MVCC_TABLE_ID, RootEntry::live(Some(1)))?;
         Ok(Self {
-            rows: SkipMap::new_in(alloc.clone()),
+            rows: BPlusTreeMap::new_in(alloc.clone()),
             table_id_to_rootpage,
             index_rows: SkipMap::new_in(alloc.clone()),
             index_rows_epoch: AtomicU64::new(0),
@@ -8482,7 +8529,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         let alloc = self.alloc.clone();
         let index = self
             .index_rows
-            .try_get_or_insert_with(index_id, move || SkipMap::new_in(alloc))?;
+            .try_get_or_insert_with(index_id, move || BPlusTreeMap::new_in(alloc))?;
         Ok(index)
     }
 

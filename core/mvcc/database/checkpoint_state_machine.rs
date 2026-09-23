@@ -1162,10 +1162,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
         let mut processed = 0;
         loop {
             let bounds = self.collect_table_bounds();
-            let guard = epoch::pin();
-            let mut range = self.mvstore.rows.range(bounds);
-            while let Some(pinned) = range.inner.next(&guard) {
-                let entry = CollectEntry::new(pinned, &guard);
+            for entry in self.mvstore.rows.range(bounds) {
                 let key = entry.key();
                 tracing::trace!("collecting {key:?}");
                 self.collect_table_cursor = Some(key.clone());
@@ -1399,9 +1396,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
                     None => (Bound::Unbounded, Bound::Unbounded),
                     Some(last) => (Bound::Excluded(last), Bound::Unbounded),
                 };
-            let mut inner_range = index_rows_map.range(inner_bounds);
-            while let Some(pinned) = inner_range.inner.next(&guard) {
-                let entry = CollectEntry::new(pinned, &guard);
+            for entry in index_rows_map.range(inner_bounds) {
                 let versions = entry.value().read();
                 self.collect_index_tableid_cursor = Some(index_id);
                 self.collect_index_key_cursor = Some(entry.key().clone());
