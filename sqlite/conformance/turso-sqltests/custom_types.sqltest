@@ -1906,3 +1906,23 @@ expect {
     1
     ok
 }
+
+@requires strict "uses STRICT tables"
+test old-row-virtual-column-reads-decoded-custom-type {
+    CREATE TYPE cents BASE integer ENCODE value * 100 DECODE value / 100;
+    CREATE TABLE t(id INTEGER PRIMARY KEY, x cents, v INT AS (x + 1)) STRICT;
+    CREATE TABLE log(msg);
+    CREATE TRIGGER t_bu BEFORE UPDATE ON t BEGIN INSERT INTO log VALUES ('update ' || OLD.v || ' ' || NEW.v); END;
+    CREATE TRIGGER t_bd BEFORE DELETE ON t BEGIN INSERT INTO log VALUES ('delete ' || OLD.v); END;
+    INSERT INTO t(id, x) VALUES (1, 5);
+    UPDATE t SET x = 7;
+    INSERT INTO t(id, x) VALUES (1, 0) ON CONFLICT(id) DO UPDATE SET x = 9;
+    DELETE FROM t RETURNING v;
+    SELECT msg FROM log;
+}
+expect {
+    10
+    update 6 8
+    update 8 10
+    delete 10
+}
