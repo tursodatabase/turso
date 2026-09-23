@@ -14,7 +14,8 @@ TARGET_VOLUME=turso-mvcc-icount-target
 REPORT_DIR="target/mvcc-icount-report"
 
 case "$SCENARIO" in
-    point_read|index_read|scan_128|point_update_rollback|insert_rollback|point_update_commit|insert_commit) ;;
+    point_read|index_read|scan_128|point_read_btree|index_read_btree|scan_128_btree|index_scan_128) ;;
+    point_update_rollback|insert_rollback|point_update_commit|insert_commit|batch_insert_commit|delete_commit) ;;
     *) echo "unknown scenario: $SCENARIO" >&2; exit 2 ;;
 esac
 case "$SMALL_ITERS:$LARGE_ITERS" in

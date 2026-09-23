@@ -21,6 +21,12 @@ are secondary checks.
 | `insert_rollback` | Table/index version creation and rollback cleanup |
 | `point_update_commit` | Update, conflict validation, logical log, and commit |
 | `insert_commit` | Basic prepared autocommit insert and commit |
+| `point_read_btree` | `point_read` after a checkpoint moves every row into the B-tree |
+| `index_read_btree` | `index_read` after a checkpoint |
+| `scan_128_btree` | `scan_128` after a checkpoint; cursor merge over B-tree rows |
+| `index_scan_128` | 128-row range scan over the secondary index |
+| `batch_insert_commit` | 32 inserts in one transaction, then commit |
+| `delete_commit` | Prepared autocommit delete by primary key |
 
 ## H1. Establish instruction baselines and measured hot functions — `fixed`
 

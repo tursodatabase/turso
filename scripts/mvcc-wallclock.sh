@@ -8,9 +8,10 @@ ITERATIONS="${2:-}"
 SAMPLES="${3:-9}"
 
 case "$SCENARIO" in
-    point_read|index_read) DEFAULT_ITERATIONS=20000 ;;
-    scan_128) DEFAULT_ITERATIONS=2000 ;;
-    point_update_rollback|insert_rollback|point_update_commit|insert_commit) DEFAULT_ITERATIONS=5000 ;;
+    point_read|index_read|point_read_btree|index_read_btree) DEFAULT_ITERATIONS=20000 ;;
+    scan_128|scan_128_btree|index_scan_128) DEFAULT_ITERATIONS=2000 ;;
+    point_update_rollback|insert_rollback|point_update_commit|insert_commit|delete_commit) DEFAULT_ITERATIONS=5000 ;;
+    batch_insert_commit) DEFAULT_ITERATIONS=200 ;;
     *) echo "unknown scenario: $SCENARIO" >&2; exit 2 ;;
 esac
 ITERATIONS="${ITERATIONS:-$DEFAULT_ITERATIONS}"
