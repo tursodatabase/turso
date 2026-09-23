@@ -6029,12 +6029,6 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         row_id: &RowKey,
         tx_id: TxID,
     ) -> bool {
-        let tx = self
-            .txs
-            .get(&tx_id)
-            .expect("transaction should exist in txs map");
-        let tx = tx.value();
-
         match row_id {
             RowKey::Int(_) => {
                 let row_id_full = RowID {
@@ -6046,16 +6040,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                     return true;
                 };
                 let versions = versions.value().read();
-                if self.btree_covers_chain_for_tx(tx, table_id, &versions) {
-                    return true;
-                }
-
-                // Check if any version invalidates the B-tree row
-                let btree_is_invalid = versions.iter().rev().any(|version| {
-                    version.is_btree_invalidating_version(tx, &self.txs, &self.finalized_tx_states)
-                });
-
-                !btree_is_invalid
+                self.chain_leaves_btree_row_valid(tx_id, table_id, &versions)
             }
             RowKey::Record(record) => {
                 // Dont allocate new SkipList here to avoid introducing concerns around error handling
@@ -6068,18 +6053,32 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                     return true;
                 };
                 let versions = versions.value().read();
-                if self.btree_covers_chain_for_tx(tx, table_id, &versions) {
-                    return true;
-                }
-
-                // Check if any version invalidates the B-tree row
-                let btree_is_invalid = versions.iter().rev().any(|version| {
-                    version.is_btree_invalidating_version(tx, &self.txs, &self.finalized_tx_states)
-                });
-
-                !btree_is_invalid
+                self.chain_leaves_btree_row_valid(tx_id, table_id, &versions)
             }
         }
+    }
+
+    fn chain_leaves_btree_row_valid(
+        &self,
+        tx_id: TxID,
+        table_id: MVTableId,
+        versions: &[RowVersion],
+    ) -> bool {
+        let tx = self
+            .txs
+            .get(&tx_id)
+            .expect("transaction should exist in txs map");
+        let tx = tx.value();
+        if self.btree_covers_chain_for_tx(tx, table_id, versions) {
+            return true;
+        }
+
+        // Check if any version invalidates the B-tree row
+        let btree_is_invalid = versions.iter().rev().any(|version| {
+            version.is_btree_invalidating_version(tx, &self.txs, &self.finalized_tx_states)
+        });
+
+        !btree_is_invalid
     }
 
     fn find_visible_version<'a>(

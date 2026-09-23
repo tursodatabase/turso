@@ -545,6 +545,9 @@ pub struct MvccLazyCursor<Clock: LogicalClock + 'static, A: ConcurrentAllocator 
     /// Eq-only table seek copies the occupying payload under the version lock.
     /// Passive GC can empty the live chain before Column.
     eq_seek_row: Option<Row>,
+    /// Set once the B-tree is readable at this cursor's snapshot. It stays
+    /// readable for the cursor's lifetime.
+    btree_readable: bool,
     btree_cursor: Box<dyn CursorTrait>,
     null_flag: bool,
     creating_new_rowid: bool,
@@ -615,6 +618,7 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> MvccLazyCursor<Clock
             table_id,
             reusable_immutable_record: None,
             eq_seek_row: None,
+            btree_readable: false,
             btree_cursor,
             null_flag: false,
             creating_new_rowid: false,
@@ -828,6 +832,9 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> MvccLazyCursor<Clock
         // (`visible_from <= observed_boundary`). A cursor that opened before checkpoint publish
         // materialization therefore stays version-store-only for its whole life and never seeks
         // the page its read mark can't see. See `MvStore::is_btree_readable_at`.
+        if self.btree_readable {
+            return true;
+        }
         if !self.db.is_btree_readable_at(
             &self.table_id,
             self.snapshot.begin_ts,
@@ -841,6 +848,7 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> MvccLazyCursor<Clock
             };
             self.btree_cursor.set_root_page(root as i64);
         }
+        self.btree_readable = true;
         true
     }
 
