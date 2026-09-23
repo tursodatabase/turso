@@ -1861,3 +1861,28 @@ expect {
     7|8
     9|10
 }
+
+@requires strict "uses STRICT tables"
+test insert-virtual-column-reads-decoded-custom-type {
+    CREATE TYPE cents BASE integer ENCODE value * 100 DECODE value / 100;
+    CREATE TABLE t(id INTEGER PRIMARY KEY, x cents, v INT AS (x + 1) CHECK (v < 100)) STRICT;
+    CREATE TABLE log(msg);
+    CREATE TRIGGER t_ai AFTER INSERT ON t BEGIN INSERT INTO log VALUES (NEW.v); END;
+    INSERT INTO t(id, x) VALUES (1, 50) RETURNING x, v;
+    SELECT msg FROM log;
+}
+expect {
+    50|51
+    51
+}
+
+@requires strict "uses STRICT tables"
+test update-virtual-column-reads-decoded-custom-type {
+    CREATE TYPE cents BASE integer ENCODE value * 100 DECODE value / 100;
+    CREATE TABLE t(id INTEGER PRIMARY KEY, x cents, y INT, v INT AS (x + 1)) STRICT;
+    INSERT INTO t(id, x, y) VALUES (1, 5, 0);
+    UPDATE t SET y = 1 RETURNING x, v;
+}
+expect {
+    5|6
+}

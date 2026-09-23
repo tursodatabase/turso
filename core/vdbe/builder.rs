@@ -12,7 +12,7 @@ use crate::{
     translate::{
         collate::CollationSeq,
         emitter::{MaterializedColumnRef, TransactionMode},
-        plan::{ResultSetColumn, TableReferences},
+        plan::{ColumnMask, ResultSetColumn, TableReferences},
     },
     Arc, CaptureDataChangesInfo, Connection, VirtualTable,
 };
@@ -138,6 +138,7 @@ enum DmlColumnRegisters {
 pub struct DmlColumnContext {
     registers: DmlColumnRegisters,
     rowid_alias_col: Option<usize>,
+    encoded_columns: ColumnMask,
 }
 
 impl DmlColumnContext {
@@ -156,6 +157,7 @@ impl DmlColumnContext {
                 layout,
             },
             rowid_alias_col,
+            encoded_columns: ColumnMask::default(),
         }
     }
 
@@ -171,7 +173,17 @@ impl DmlColumnContext {
         Self {
             registers: DmlColumnRegisters::Indexed { column_regs },
             rowid_alias_col,
+            encoded_columns: ColumnMask::default(),
         }
+    }
+
+    pub fn with_encoded_columns(mut self, encoded_columns: ColumnMask) -> Self {
+        self.encoded_columns = encoded_columns;
+        self
+    }
+
+    pub fn holds_encoded_value(&self, col_idx: usize) -> bool {
+        self.encoded_columns.get(col_idx)
     }
 
     pub fn to_column_reg(&self, col_idx: usize) -> usize {
