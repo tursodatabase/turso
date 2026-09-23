@@ -767,6 +767,15 @@ fn link_with_window(
     if distinctness.is_distinct() {
         crate::bail_parse_error!("DISTINCT is not supported for window functions");
     }
+    if let AccumulatorFunc::Agg(AggFunc::External(_)) = &func {
+        let name = match expr {
+            Expr::FunctionCall { name, .. } | Expr::FunctionCallStar { name, .. } => name.as_str(),
+            _ => "extension aggregate",
+        };
+        crate::bail_parse_error!(
+            "{name}() is an extension aggregate and cannot be used as a window function"
+        );
+    }
     // FILTER decides which input rows contribute to a running aggregate, so
     // it is only meaningful for aggregating window functions. Non-aggregate
     // ones (`row_number`/`lag`/`lead`) have nothing to filter.

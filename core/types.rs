@@ -984,8 +984,8 @@ impl TryClone for AggContext {
 }
 
 impl AggContext {
-    pub fn compute_external(&self) -> Result<Value> {
-        if let Self::External(ext_state) = self {
+    pub fn compute_external(self) -> Result<Value> {
+        if let Self::External(ext_state) = &self {
             let mut final_value =
                 unsafe { (ext_state.finalize_fn)(ext_state.context, ext_state.state) };
             let value = Value::from_ffi_ref(&final_value);
