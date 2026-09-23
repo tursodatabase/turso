@@ -5833,3 +5833,45 @@ setup gencol_virtual_columns_after_update_trigger {
 snapshot gencol_update_after_trigger_reuses_virtual_columns {
     UPDATE t SET a = 5;
 }
+
+test gencol_update_not_null_virtual_column_sees_column_affinity {
+    CREATE TABLE t(a INTEGER, c AS (nullif(typeof(a), 'text')) NOT NULL);
+    INSERT INTO t(a) VALUES (1);
+    UPDATE t SET a = '5';
+    SELECT a, c FROM t;
+}
+expect {
+    5|integer
+}
+
+test gencol_update_not_null_virtual_column_checked_after_before_trigger {
+    CREATE TABLE t(a INTEGER, c AS (nullif(a, 0)) NOT NULL);
+    CREATE TABLE log(x);
+    CREATE TRIGGER t_bu BEFORE UPDATE ON t BEGIN INSERT INTO log VALUES (NEW.a); END;
+    INSERT INTO t(a) VALUES (1);
+    UPDATE t SET a = 0;
+}
+expect error {
+    NOT NULL constraint failed: t.c
+}
+
+test gencol_update_not_null_ignore_virtual_column_skips_row {
+    CREATE TABLE t(a INTEGER, c AS (nullif(a, 0)) NOT NULL ON CONFLICT IGNORE);
+    INSERT INTO t(a) VALUES (1), (2);
+    UPDATE t SET a = a - 1;
+    SELECT a, c FROM t;
+}
+expect {
+    1|1
+    1|1
+}
+
+setup gencol_virtual_columns_update {
+    CREATE TABLE t(a INTEGER, b INTEGER, c AS (a + b), d AS (c * 2));
+}
+
+@skip-if mvcc "mvcc has different root pages"
+@setup gencol_virtual_columns_update
+snapshot gencol_update_computes_virtual_columns_once {
+    UPDATE t SET a = 5 WHERE b = 3;
+}
