@@ -29,7 +29,7 @@ use crate::counter::StressCounter;
 use crate::logging::Tracer;
 use crate::progress::ProgressBars;
 use crate::sql_logging::SqlLogger;
-use turso::core::clear_database_registry;
+use turso::core::DATABASE_MANAGER;
 use turso::{Builder, Value};
 use turso_stress::ThreadId;
 
@@ -883,7 +883,7 @@ async fn async_main(opts: Opts) -> Result<(), Box<dyn std::error::Error + Send +
 
         // This is what triggers MVCC recovery
         db.lock().await.reset();
-        clear_database_registry();
+        DATABASE_MANAGER.clear();
         batch_idx += 1;
     }
 

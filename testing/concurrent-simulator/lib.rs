@@ -1514,7 +1514,7 @@ impl Whopper {
         }
 
         // Without this, the Database object is never dropped and recovery never happens
-        turso_core::clear_database_registry();
+        turso_core::DATABASE_MANAGER.clear();
 
         // Reopen connections (creates new Database instance)
         self.open_connections()?;

@@ -42,10 +42,10 @@ use crate::{
             AtomicBool, AtomicI32, AtomicI64, AtomicIsize, AtomicU16, AtomicU64, AtomicU8,
             AtomicUsize, Ordering,
         },
-        Arc, LazyLock, Mutex, RwLock, Weak,
+        Arc, Mutex, RwLock,
     },
     turso_assert, turso_assert_greater_than_or_equal,
-    types::{self, IOCompletions},
+    types::IOCompletions,
     vdbe::metrics::ConnectionMetrics,
     AtomicSyncMode, AtomicTempStore, AtomicTransactionState, Buffer, BufferPool, CipherMode,
     Completion, CompletionError, Connection, DatabaseStorage, Dialect, EncryptionKey, IOResult,
@@ -502,19 +502,9 @@ impl OpenDbAsyncState {
 impl Drop for OpenDbAsyncState {
     fn drop(&mut self) {
         if let Some(registry_key) = self.registry_key.take() {
-            let mut registry = DATABASE_MANAGER.lock();
-            registry.remove(&registry_key);
+            DATABASE_MANAGER.remove(&registry_key);
         }
     }
-}
-
-/// Per-path entry in the database registry.
-pub(crate) enum RegistryEntry {
-    /// Another caller is currently opening this database. Callers that see
-    /// this should yield and retry later.
-    Opening,
-    /// The database has been opened and is (or was) live.
-    Ready(Weak<Database>),
 }
 
 /// The database manager ensures that there is a single, shared
@@ -542,16 +532,138 @@ pub(crate) enum DatabaseKey {
     SharedMemory(String),
 }
 
-#[allow(clippy::type_complexity)]
-pub(crate) static DATABASE_MANAGER: LazyLock<
-    Arc<parking_lot::Mutex<HashMap<DatabaseKey, RegistryEntry>>>,
-> = LazyLock::new(|| Arc::new(parking_lot::Mutex::new(HashMap::default())));
+mod manager {
+    use crate::alloc::HashMap;
+    use crate::database::manager::CachedDatabase::{Ready, TryAgainLater};
+    use crate::database::manager::RegistryEntry::Opening;
+    use crate::database::DatabaseKey;
+    use crate::sync::{Arc, LazyLock, Weak};
+    use crate::{CipherMode, Database, Dialect, EncryptionOpts, LimboError, PageCodec, Result};
+    use turso_macros::turso_assert;
 
-#[cfg(feature = "simulator")]
-pub fn clear_database_registry() {
-    DATABASE_MANAGER.lock().clear();
+    pub static DATABASE_MANAGER: DatabaseManager = DatabaseManager {
+        inner: LazyLock::new(|| Arc::new(parking_lot::Mutex::new(HashMap::default()))),
+    };
+
+    enum RegistryEntry {
+        Opening,
+        Ready(Weak<Database>),
+    }
+
+    pub enum CachedDatabase {
+        /// Another caller is currently opening this database. Callers that see
+        /// this should yield and retry later.
+        TryAgainLater,
+        /// The database has been opened and is (or was) live.
+        Ready(Arc<Database>),
+    }
+
+    type Cache = HashMap<DatabaseKey, RegistryEntry>;
+
+    pub struct DatabaseManager {
+        inner: LazyLock<Arc<parking_lot::Mutex<Cache>>>,
+    }
+
+    impl DatabaseManager {
+        pub(crate) fn remove(&self, key: &DatabaseKey) {
+            self.inner.lock().remove(key);
+        }
+
+        #[cfg(any(test, feature = "simulator"))]
+        pub fn clear(&self) {
+            self.inner.lock().clear();
+        }
+
+        /// Panics if the registry contained an initialized database
+        pub(crate) fn i_finished_initializing(&self, key: DatabaseKey, db: Weak<Database>) {
+            let mut inner = self.inner.lock();
+
+            let previous = inner.insert(key, RegistryEntry::Ready(db));
+
+            turso_assert!(
+                !matches!(previous, Some(RegistryEntry::Ready(_))),
+                "tried to override databased in shared registry"
+            )
+        }
+
+        /// Panics if the registry contained an initialized database
+        pub(crate) fn i_wont_be_able_to_initialize(&self, key: &DatabaseKey) {
+            let mut inner = self.inner.lock();
+
+            inner.remove(key);
+        }
+
+        /// Returns None if there was no database in the registry, and the caller is the first. In
+        /// this case, they should initialize the database and later call [Self::i_finished_initializing].
+        ///
+        /// Returns an error if the database is already open, but under a different dialect.
+        pub(crate) fn get_or_mark_initializing(
+            &self,
+            key: &DatabaseKey,
+            dialect: &dyn Dialect,
+            page_codec: Option<&dyn PageCodec>,
+            encryption_opts: Option<&EncryptionOpts>,
+        ) -> Result<Option<CachedDatabase>> {
+            let mut inner = self.inner.lock();
+
+            match inner.get(key) {
+                Some(RegistryEntry::Ready(existing)) => {
+                    if let Some(db) = existing.upgrade() {
+                        Self::check_registry_dialect(&db, dialect)?;
+                        db.validate_page_codec(page_codec)?;
+                        Self::validate_encryption(&db, encryption_opts)?;
+                        Ok(Some(Ready(db)))
+                    } else {
+                        Self::mark_initializing(&mut inner, key.clone());
+                        Ok(None)
+                    }
+                }
+                Some(Opening) => Ok(Some(TryAgainLater)),
+                None => {
+                    Self::mark_initializing(&mut inner, key.clone());
+                    Ok(None)
+                }
+            }
+        }
+
+        fn mark_initializing(cache: &mut Cache, key: DatabaseKey) {
+            let previous = cache.insert(key, Opening);
+            turso_assert!(
+                !matches!(previous, Some(RegistryEntry::Ready(_))),
+                "tried to mark an initialized entry as initializing"
+            );
+        }
+
+        /// Check that a registry hit was opened with the dialect the caller requested.
+        fn check_registry_dialect(db: &Database, requested: &dyn Dialect) -> Result<()> {
+            let requested_name = requested.name();
+            if db.dialect.name() != requested_name {
+                return Err(LimboError::InvalidArgument(format!(
+                    "database is already open with dialect '{}'; requested '{}'",
+                    db.dialect.name(),
+                    requested_name
+                )));
+            }
+            Ok(())
+        }
+
+        fn validate_encryption(
+            db: &Database,
+            encryption_opts: Option<&EncryptionOpts>,
+        ) -> Result<()> {
+            let db_is_encrypted = !matches!(db.encryption_cipher_mode.get(), CipherMode::None);
+            if db_is_encrypted && encryption_opts.is_none() {
+                Err(LimboError::InvalidArgument(
+                    "Database is encrypted but no encryption options provided".to_string(),
+                ))
+            } else {
+                Ok(())
+            }
+        }
+    }
 }
-
+use manager::CachedDatabase;
+pub use manager::DATABASE_MANAGER;
 /// The `Database` object contains per database file state that is shared
 /// between multiple connections.
 ///
@@ -784,27 +896,23 @@ impl Database {
     pub fn open_shared_memory(name: &str, dialect: Arc<dyn Dialect>) -> Result<Arc<Database>> {
         let key = DatabaseKey::SharedMemory(name.to_string());
 
+        if let Some(CachedDatabase::Ready(existing)) =
+            DATABASE_MANAGER.get_or_mark_initializing(&key, &*dialect, None, None)?
         {
-            let registry = DATABASE_MANAGER.lock();
-            if let Some(RegistryEntry::Ready(weak)) = registry.get(&key) {
-                if let Some(db) = weak.upgrade() {
-                    Self::check_registry_dialect(&db, dialect.as_ref())?;
-                    return Ok(db);
-                }
-            }
+            return Ok(existing);
         }
+
         // `:memory:` paths bypass DATABASE_MANAGER internally, so no deadlock.
         let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
         let db = Self::open_file(io, ":memory:", dialect.clone())?;
 
-        let mut registry = DATABASE_MANAGER.lock();
-        if let Some(RegistryEntry::Ready(weak)) = registry.get(&key) {
-            if let Some(existing) = weak.upgrade() {
-                Self::check_registry_dialect(&existing, dialect.as_ref())?;
-                return Ok(existing);
-            }
+        if let Some(CachedDatabase::Ready(existing)) =
+            DATABASE_MANAGER.get_or_mark_initializing(&key, &*dialect, None, None)?
+        {
+            return Ok(existing);
         }
-        registry.insert(key, RegistryEntry::Ready(Arc::downgrade(&db)));
+
+        DATABASE_MANAGER.i_finished_initializing(key, Arc::downgrade(&db));
         Ok(db)
     }
 
@@ -965,22 +1073,6 @@ impl Database {
         Ok(())
     }
 
-    /// Check that a registry hit was opened with the dialect the caller
-    /// requested. The dialect is fixed at open time and shared by every
-    /// user of the registered instance, so a mismatch is an error rather
-    /// than a silent share.
-    fn check_registry_dialect(db: &Database, requested: &dyn Dialect) -> Result<()> {
-        let requested_name = requested.name();
-        if db.dialect.name() != requested_name {
-            return Err(LimboError::InvalidArgument(format!(
-                "database is already open with dialect '{}'; requested '{}'",
-                db.dialect.name(),
-                requested_name
-            )));
-        }
-        Ok(())
-    }
-
     /// Look up a database in the process-wide registry by file identity.
     /// Returns the cached Database if found, with encryption validation.
     /// This avoids opening a file (and acquiring a file lock) when the
@@ -999,28 +1091,16 @@ impl Database {
             Err(_) => return Ok(None), // file doesn't exist yet
         };
         let key = DatabaseKey::File(file_id);
-        let registry = DATABASE_MANAGER.lock();
-        let db = match registry.get(&key) {
-            Some(RegistryEntry::Ready(weak)) => match weak.upgrade() {
-                Some(db) => db,
-                None => return Ok(None),
-            },
-            _ => return Ok(None),
-        };
 
-        // Validate encryption compatibility (key is not stored for security,
-        // so we can only check cipher mode)
-        let db_is_encrypted = !matches!(db.encryption_cipher_mode.get(), CipherMode::None);
-        if db_is_encrypted && encryption_opts.is_none() {
-            return Err(LimboError::InvalidArgument(
-                "Database is encrypted but no encryption options provided".to_string(),
-            ));
+        match DATABASE_MANAGER.get_or_mark_initializing(
+            &key,
+            dialect,
+            page_codec,
+            encryption_opts.as_ref(),
+        )? {
+            Some(CachedDatabase::Ready(db)) => Ok(Some(db)),
+            _ => Ok(None),
         }
-        db.validate_page_codec(page_codec)?;
-
-        Self::check_registry_dialect(&db, dialect)?;
-
-        Ok(Some(db))
     }
 
     fn validate_page_codec(&self, page_codec: Option<&dyn PageCodec>) -> Result<()> {
@@ -1231,43 +1311,25 @@ impl Database {
         // so, we bypass registry for all in memory dbs (i.e. db paths which starts with ":memory:")
         if matches!(state.phase, OpenDbAsyncPhase::Init) && !is_memory_like(path) {
             // Briefly lock the registry to check/reserve — never hold across I/O yields.
-            let mut registry = DATABASE_MANAGER.lock();
-
             // Look up by file identity (dev, ino). If file doesn't exist
             // yet (CREATE mode), skip lookup — no cached entry is possible.
             if let Ok(file_id) = io.file_id(path) {
                 let key = DatabaseKey::File(file_id);
-                match registry.get(&key) {
-                    Some(RegistryEntry::Ready(weak)) => {
-                        if let Some(db) = weak.upgrade() {
-                            tracing::debug!("took database {path:?} from the registry");
-
-                            let db_is_encrypted =
-                                !matches!(db.encryption_cipher_mode.get(), CipherMode::None);
-                            if db_is_encrypted && options.encryption.is_none() {
-                                return Err(LimboError::InvalidArgument(
-                                    "Database is encrypted but no encryption options provided"
-                                        .to_string(),
-                                )
-                                .into());
-                            }
-                            db.validate_page_codec(options.page_codec.as_deref())?;
-                            Self::check_registry_dialect(&db, options.dialect.as_ref())?;
-                            return Ok(IOResult::Done(db));
-                        }
-                        // Weak ref expired — treat as absent, fall through to insert Opening.
-                        registry.insert(key.clone(), RegistryEntry::Opening);
+                match DATABASE_MANAGER.get_or_mark_initializing(
+                    &key,
+                    &*options.dialect,
+                    None,
+                    options.encryption.as_ref(),
+                )? {
+                    Some(CachedDatabase::Ready(db)) => {
+                        tracing::debug!("took database {path:?} from the registry");
+                        return Ok(IOResult::Done(db));
                     }
-                    Some(RegistryEntry::Opening) => {
-                        // Another caller is already opening this path. Yield so the
-                        // event loop can make progress and we retry later.
-                        return Ok(IOResult::IO(types::IOCompletions(
-                            io::Completion::new_yield(),
-                        )));
+                    Some(CachedDatabase::TryAgainLater) => {
+                        return Ok(IOResult::IO(IOCompletions(Completion::new_yield())));
                     }
                     None => {
-                        // Not in registry — mark as Opening and proceed.
-                        registry.insert(key.clone(), RegistryEntry::Opening);
+                        // we are the initializer
                     }
                 }
                 state.registry_key = Some(key);
@@ -1296,15 +1358,13 @@ impl Database {
             Ok(IOResult::Done(db)) => {
                 // Register the opened database and remove the Opening sentinel.
                 if let Some(registry_key) = state.registry_key.take() {
-                    let mut registry = DATABASE_MANAGER.lock();
-                    registry.insert(registry_key, RegistryEntry::Ready(Arc::downgrade(db)));
+                    DATABASE_MANAGER.i_finished_initializing(registry_key, Arc::downgrade(db));
                 }
             }
             Err(_) => {
                 // On error, remove the Opening sentinel so other callers can proceed.
                 if let Some(registry_key) = state.registry_key.take() {
-                    let mut registry = DATABASE_MANAGER.lock();
-                    registry.remove(&registry_key);
+                    DATABASE_MANAGER.i_wont_be_able_to_initialize(&registry_key);
                 }
             }
             Ok(IOResult::IO(_)) => {}
@@ -1780,22 +1840,22 @@ impl Database {
                                         let decoded_page_size = header.page_size.get() as usize;
                                         if decoded_page_size != bootstrap_page_size {
                                             return Err(LimboError::InvalidArgument(format!(
-                                            "page codec bootstrap page size {bootstrap_page_size} does not match decoded page-1 size {decoded_page_size}"
-                                        )));
+                                                "page codec bootstrap page size {bootstrap_page_size} does not match decoded page-1 size {decoded_page_size}"
+                                            )));
                                         }
                                         if header.reserved_space != bootstrap_reserved_space {
                                             return Err(LimboError::InvalidArgument(format!(
-                                            "page codec bootstrap reserved space {bootstrap_reserved_space} does not match decoded page-1 reserved space {}",
-                                            header.reserved_space
-                                        )));
+                                                "page codec bootstrap reserved space {bootstrap_reserved_space} does not match decoded page-1 reserved space {}",
+                                                header.reserved_space
+                                            )));
                                         }
                                         let required_reserved_space =
                                             codec.required_reserved_bytes();
                                         if header.reserved_space != required_reserved_space {
                                             return Err(LimboError::InvalidArgument(format!(
-                                            "page codec requires exactly {required_reserved_space} reserved bytes, but decoded page 1 provides {}",
-                                            header.reserved_space
-                                        )));
+                                                "page codec requires exactly {required_reserved_space} reserved bytes, but decoded page 1 provides {}",
+                                                header.reserved_space
+                                            )));
                                         }
                                     }
                                 }

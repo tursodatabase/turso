@@ -415,7 +415,7 @@ fn wal_stale_publish_backfill_hides_committed_rows() {
             drop(a);
             drop(b);
             drop(db);
-            turso_core::clear_database_registry();
+            turso_core::DATABASE_MANAGER.clear();
 
             let db2 = Database::open_file(io, "publish-backfill-race.db", Arc::new(SqliteDialect))
                 .unwrap();
@@ -557,7 +557,7 @@ fn wal_stale_publish_backfill_can_point_table_at_restarted_index_root() {
         drop(a);
         drop(b);
         drop(db);
-        turso_core::clear_database_registry();
+        turso_core::DATABASE_MANAGER.clear();
 
         let db2 = Database::open_file(
             io,
