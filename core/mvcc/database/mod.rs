@@ -8386,11 +8386,17 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         id: RowID,
         row_version: RowVersion,
     ) -> Result<RowVersions<A>, TryReserveError> {
-        // Retry if GC unlinked this slot while we waited for the write lock.
+        // GC removes a row's entry from `rows` when its version chain is empty.
+        // If that happens while we wait for the write lock, the chain we lock is
+        // no longer in the map, and a version added to it would be lost. GC
+        // removes an entry only while it holds the chain's write lock, so once we
+        // hold that lock, `is_removed()` says whether it happened. If it did,
+        // look the row up again: the lookup finds or creates the current chain.
         loop {
-            let row_versions = self.get_or_create_table_row_versions(id.clone())?;
+            let entry = self.get_or_create_table_row_entry(id.clone())?;
+            let row_versions = entry.value().clone();
             let mut versions = row_versions.write();
-            if !self.table_versions_still_mapped(&id, &row_versions) {
+            if entry.is_removed() {
                 continue;
             }
             self.insert_version_raw(&mut versions, row_version)?;
@@ -8399,38 +8405,25 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         }
     }
 
-    /// True if `arc` is still the mapped value for `id`.
-    fn table_versions_still_mapped(&self, id: &RowID, arc: &RowVersions<A>) -> bool {
-        self.rows
-            .get(id)
-            .is_some_and(|entry| Arc::ptr_eq(entry.value(), arc))
-    }
-
-    /// True if `arc` is still the mapped value for `key`.
-    fn index_versions_still_mapped(
-        &self,
-        index: &IndexRowsMap<A>,
-        key: &SortableIndexKey,
-        arc: &RowVersions<A>,
-    ) -> bool {
-        index
-            .get(key)
-            .is_some_and(|entry| Arc::ptr_eq(entry.value(), arc))
-    }
-
-    #[turso_macros::allocation_site(crate::alloc::MvStoreAllocationSite::TableRowsEntry)]
     fn get_or_create_table_row_versions(
         &self,
         id: RowID,
     ) -> Result<RowVersions<A>, TryReserveError> {
+        Ok(self.get_or_create_table_row_entry(id)?.value().clone())
+    }
+
+    #[turso_macros::allocation_site(crate::alloc::MvStoreAllocationSite::TableRowsEntry)]
+    fn get_or_create_table_row_entry(
+        &self,
+        id: RowID,
+    ) -> Result<TableRowEntry<'_, A>, TryReserveError> {
         let alloc = self.alloc.clone();
-        let versions = self.rows.try_get_or_insert_with(id, move || {
+        self.rows.try_get_or_insert_with(id, move || {
             Arc::new(RwLock::new(<RowVersionChain<A> as TursoVecInExt<
                 RowVersion,
                 A,
             >>::new_in(alloc)))
-        })?;
-        Ok(versions.value().clone())
+        })
     }
 
     /// Gets an existing Arc<SortableIndexKey> from the index if the key exists,
@@ -8460,7 +8453,8 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         self.bump_index_rows_epoch();
         let index = self.get_or_create_index_rows(index_id)?;
         let index = index.value();
-        // Same drain-retry as `insert_version`.
+        // If GC removed this key's entry while we waited for the write lock, look
+        // the key up again. `insert_version` explains why `is_removed()` is enough.
         loop {
             let entry = self.get_or_create_index_key_entry(index, key.clone())?;
             // SkipMap may keep our Arc (miss) or a pre-existing one (hit); return that
@@ -8468,7 +8462,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
             let canonical_key = entry.key().clone();
             let row_versions = entry.value().clone();
             let mut versions = row_versions.write();
-            if !self.index_versions_still_mapped(index, canonical_key.as_ref(), &row_versions) {
+            if entry.is_removed() {
                 continue;
             }
             row_version.row.id.row_id = RowKey::Record(canonical_key.clone());
@@ -8623,12 +8617,15 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
 
     /// Passive sequence compaction: record end-stamped deletes instead of inline B-tree purge.
     pub fn seqcompact_commit_delete(&self, rowid: RowID, num_cols: usize, end_ts: u64) {
+        // If GC removed this row's entry while we waited for the write lock, look
+        // the row up again. `insert_version` explains why `is_removed()` is enough.
         loop {
-            let Ok(row_versions) = self.get_or_create_table_row_versions(rowid.clone()) else {
+            let Ok(entry) = self.get_or_create_table_row_entry(rowid.clone()) else {
                 return;
             };
+            let row_versions = entry.value().clone();
             let mut versions = row_versions.write();
-            if !self.table_versions_still_mapped(&rowid, &row_versions) {
+            if entry.is_removed() {
                 continue;
             }
             // End-stamp the live committed version, if any — collection then
