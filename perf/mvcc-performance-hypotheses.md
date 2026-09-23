@@ -342,6 +342,25 @@ chains keep their B-tree shadow check in `IndexShadowScan`.
 The `scan_128` increase is about seven instructions per row for the cursor
 type check. The other workloads changed by less than 0.1%.
 
+## H16. Table scans look up the transaction for every row again — `fixed`
+
+**Where:** After the rebase, `scan_128` rose from 255,494 to 272,470
+instructions per operation. Comparing the two profiles against the
+pre-rebase tip `974dae2fc0` showed about 20,000 more instructions per scan
+in skip-list pinning and a new per-row `SkipMap::get`. Main added a check to
+`position_from_peeks`: a checkpointed B-tree row may replace a version-store
+row. It looked up the transaction in the transaction map for every row to
+recover its begin timestamp and read mark. The cursor already holds both in
+its snapshot since H3, and they cannot change during the transaction.
+
+**Fix:** Pass the cursor's snapshot to `btree_covers_chain_for_snapshot` and
+remove the transaction lookup.
+
+**Callgrind, 200/2,200 iterations:** `scan_128` fell from 271,522 to 247,543
+instructions per operation (-8.8%), below the pre-rebase 255,494.
+`scan_128_btree` did not change: its rows come from the B-tree, so this
+check does not run. The other workloads changed by less than 0.2%.
+
 ## Final measured totals
 
 The branch was rebased after `origin/main` gained unrelated planner work and an
