@@ -19988,6 +19988,272 @@ fn busy_from_log_tx_does_not_block_subsequent_commit(group_commit: bool) {
     drive_to_done_or_timeout(&mut commit_b, 30); // this times out if pager_commit_lock or the group retry set is leaked
 }
 
+/// `on_log_write_complete` may return extra durability work (turso-server waits
+/// for S3). The logical-log offset must not advance until that completion
+/// finishes.
+#[test]
+fn logical_log_offset_advances_only_after_on_log_write_complete() {
+    use crate::io::FileSyncType;
+    use crate::mvcc;
+    use crate::mvcc::database::{LogRecord, RowVersion};
+    use crate::mvcc::persistent_storage::logical_log::{LogHeader, OnSerializationComplete};
+    use crate::mvcc::persistent_storage::DurableStorage;
+    use crate::storage::encryption::EncryptionContext;
+    use crate::storage::sqlite3_ondisk::DatabaseHeader;
+    use crate::{CheckpointResult, File, Result, IO};
+
+    #[derive(Debug)]
+    struct DeferredOnLogWriteCompleteStorage {
+        inner: Arc<dyn DurableStorage>,
+        arm: AtomicBool,
+        pending: Mutex<Option<Completion>>,
+        advances: AtomicU64,
+    }
+    impl DeferredOnLogWriteCompleteStorage {
+        fn new(inner: Arc<dyn DurableStorage>) -> Arc<Self> {
+            Arc::new(Self {
+                inner,
+                arm: AtomicBool::new(false),
+                pending: Mutex::new(None),
+                advances: AtomicU64::new(0),
+            })
+        }
+        fn arm(&self) {
+            self.arm.store(true, Ordering::Release);
+        }
+        fn take_pending(&self) -> Option<Completion> {
+            self.pending.lock().take()
+        }
+        fn advance_count(&self) -> u64 {
+            self.advances.load(Ordering::Acquire)
+        }
+    }
+    impl DurableStorage for DeferredOnLogWriteCompleteStorage {
+        fn serialize_row_version(
+            &self,
+            log_record: &mut LogRecord,
+            row_version: &RowVersion,
+            portable_extension: Option<&[u8]>,
+        ) -> Result<()> {
+            self.inner
+                .serialize_row_version(log_record, row_version, portable_extension)
+        }
+        fn serialize_database_header(
+            &self,
+            log_record: &mut LogRecord,
+            header: &DatabaseHeader,
+        ) -> Result<()> {
+            self.inner.serialize_database_header(log_record, header)
+        }
+        fn log_tx(
+            &self,
+            m: LogRecord,
+            c: OnSerializationComplete<'_>,
+        ) -> Result<(Completion, u64)> {
+            self.inner.log_tx(m, c)
+        }
+        fn upgrade_header_for_log_tx(&self, m: &LogRecord) -> Result<Option<Completion>> {
+            self.inner.upgrade_header_for_log_tx(m)
+        }
+        fn on_log_write_complete(&self) -> Result<Completion> {
+            if self.arm.swap(false, Ordering::AcqRel) {
+                let c = Completion::new_wait();
+                *self.pending.lock() = Some(c.clone());
+                return Ok(c);
+            }
+            self.inner.on_log_write_complete()
+        }
+        fn sync(&self, t: FileSyncType) -> Result<Completion> {
+            self.inner.sync(t)
+        }
+        fn update_header(&self) -> Result<Completion> {
+            self.inner.update_header()
+        }
+        fn truncate(
+            &self,
+            checkpointed_through_ts: u64,
+        ) -> Result<(
+            Completion,
+            crate::mvcc::persistent_storage::LogicalLogTruncateOutcome,
+        )> {
+            self.inner.truncate(checkpointed_through_ts)
+        }
+        fn reset_to_fresh_header(&self) -> Result<Completion> {
+            self.inner.reset_to_fresh_header()
+        }
+        fn get_logical_log_file(&self) -> Arc<dyn File> {
+            self.inner.get_logical_log_file()
+        }
+        fn logical_log_offset(&self) -> u64 {
+            self.inner.logical_log_offset()
+        }
+        fn should_checkpoint(&self) -> bool {
+            self.inner.should_checkpoint()
+        }
+        fn set_checkpoint_threshold(&self, t: i64) {
+            self.inner.set_checkpoint_threshold(t)
+        }
+        fn checkpoint_threshold(&self) -> i64 {
+            self.inner.checkpoint_threshold()
+        }
+        fn advance_logical_log_offset_after_success(&self, b: u64) -> Result<()> {
+            if self.pending.lock().as_ref().is_some_and(|c| !c.finished()) {
+                panic!("logical log offset advanced before on_log_write_complete finished");
+            }
+            self.advances.fetch_add(1, Ordering::AcqRel);
+            self.inner.advance_logical_log_offset_after_success(b)
+        }
+        fn discard_pending_log_write(&self) -> Result<()> {
+            self.inner.discard_pending_log_write()
+        }
+        fn restore_logical_log_state_after_recovery(&self, o: u64, c: u32) {
+            self.inner.restore_logical_log_state_after_recovery(o, c)
+        }
+        fn set_header(&self, h: LogHeader) {
+            self.inner.set_header(h)
+        }
+        fn on_checkpoint_start(&self) -> Result<()> {
+            self.inner.on_checkpoint_start()
+        }
+        fn on_checkpoint_end(&self, r: Result<&CheckpointResult>) -> Result<()> {
+            self.inner.on_checkpoint_end(r)
+        }
+        fn encryption_ctx(&self) -> Option<EncryptionContext> {
+            self.inner.encryption_ctx()
+        }
+    }
+
+    fn open_db(
+        storage: &Arc<DeferredOnLogWriteCompleteStorage>,
+        io: Arc<dyn IO>,
+        path: &str,
+    ) -> Arc<Database> {
+        Database::open(
+            io,
+            path,
+            crate::OpenOptions::new(Arc::new(SqliteDialect))
+                .durable_storage(storage.clone() as Arc<dyn DurableStorage>),
+        )
+        .unwrap()
+    }
+
+    fn drive_commit_until_wait(
+        stmt: &mut Statement,
+        storage: &DeferredOnLogWriteCompleteStorage,
+        io: &Arc<dyn IO>,
+    ) -> Completion {
+        for _ in 0..10_000 {
+            match stmt.step().unwrap() {
+                StepResult::Done => panic!("COMMIT finished before on_log_write_complete wait"),
+                StepResult::IO | StepResult::Yield => {
+                    if let Some(c) = storage.take_pending() {
+                        return c;
+                    }
+                    io.step().unwrap();
+                }
+                other => panic!("unexpected step: {other:?}"),
+            }
+        }
+        panic!("COMMIT never reached on_log_write_complete wait")
+    }
+
+    fn drive_commit_after_wait(stmt: &mut Statement, io: &Arc<dyn IO>) {
+        for _ in 0..10_000 {
+            match stmt.step().unwrap() {
+                StepResult::Done => return,
+                StepResult::IO | StepResult::Yield => io.step().unwrap(),
+                other => panic!("unexpected step: {other:?}"),
+            }
+        }
+        panic!("COMMIT never finished after on_log_write_complete")
+    }
+
+    let temp_dir = tempfile::TempDir::new().unwrap();
+    let path = temp_dir
+        .path()
+        .join(format!("test_{}.db", rand::random::<u64>()));
+    let path_str = path.to_str().unwrap().to_string();
+    {
+        let io: Arc<dyn IO> = Arc::new(PlatformIO::new().unwrap());
+        let db = Database::open_file_with_flags(
+            io,
+            &path_str,
+            OpenFlags::default(),
+            DatabaseOpts::new(),
+            None,
+            Arc::new(SqliteDialect),
+        )
+        .unwrap();
+        let conn = db.connect().unwrap();
+        conn.execute("PRAGMA journal_mode = 'mvcc'").unwrap();
+        conn.close().unwrap();
+        DATABASE_MANAGER.lock().clear();
+    }
+
+    let log_path = path.with_extension("db-log");
+    let io: Arc<dyn IO> = Arc::new(PlatformIO::new().unwrap());
+    let log_file = io
+        .open_file(log_path.to_str().unwrap(), OpenFlags::default(), false)
+        .unwrap();
+    let inner_storage: Arc<dyn DurableStorage> = Arc::new(mvcc::persistent_storage::Storage::new(
+        log_file,
+        io.clone(),
+        None,
+    ));
+    let storage = DeferredOnLogWriteCompleteStorage::new(inner_storage);
+    let db = open_db(&storage, io.clone(), &path_str);
+    let conn = db.connect().unwrap();
+    conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)")
+        .unwrap();
+
+    conn.execute("BEGIN CONCURRENT").unwrap();
+    conn.execute("INSERT INTO t VALUES (1, 'a')").unwrap();
+    let advances_before = storage.advance_count();
+    storage.arm();
+    let mut commit = conn.prepare("COMMIT").unwrap();
+    let wait = drive_commit_until_wait(&mut commit, &storage, &io);
+    assert_eq!(
+        storage.advance_count(),
+        advances_before,
+        "offset must not advance while on_log_write_complete is still pending"
+    );
+    wait.complete(0);
+    drive_commit_after_wait(&mut commit, &io);
+    drop(commit);
+    assert!(
+        storage.advance_count() > advances_before,
+        "offset must advance after on_log_write_complete finishes"
+    );
+    assert_eq!(
+        get_rows(&conn, "SELECT id FROM t"),
+        vec![vec![Value::from_i64(1)]]
+    );
+
+    conn.execute("BEGIN CONCURRENT").unwrap();
+    conn.execute("INSERT INTO t VALUES (2, 'b')").unwrap();
+    storage.arm();
+    let mut abandoned = conn.prepare("COMMIT").unwrap();
+    let _wait = drive_commit_until_wait(&mut abandoned, &storage, &io);
+    drop(abandoned);
+    assert_eq!(
+        get_rows(&conn, "SELECT id FROM t"),
+        vec![vec![Value::from_i64(1)]],
+        "dropping COMMIT while extra durability is pending must not publish the row"
+    );
+
+    conn.execute("BEGIN CONCURRENT").unwrap();
+    conn.execute("INSERT INTO t VALUES (2, 'b')").unwrap();
+    storage.arm();
+    let mut retry = conn.prepare("COMMIT").unwrap();
+    let wait = drive_commit_until_wait(&mut retry, &storage, &io);
+    wait.complete(0);
+    drive_commit_after_wait(&mut retry, &io);
+    assert_eq!(
+        get_rows(&conn, "SELECT id FROM t ORDER BY id"),
+        vec![vec![Value::from_i64(1)], vec![Value::from_i64(2)]]
+    );
+}
+
 // https://github.com/tursodatabase/turso/issues/6757
 #[test]
 fn test_dropped_commit_corrupts_subsequent_insert() {
