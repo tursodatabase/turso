@@ -4867,6 +4867,8 @@ impl Connection {
 
     /// Request interruption of currently running root statements on this connection.
     /// If no root statement is active, the request is ignored to match SQLite semantics.
+    /// A request that races with the last statement finishing is cleared by the next
+    /// statement, if it lands before that statement starts.
     pub fn interrupt(&self) {
         if self.n_active_root_statements.load(Ordering::SeqCst) > 0 {
             self.interrupt_requested.store(true, Ordering::SeqCst);
@@ -4892,6 +4894,8 @@ impl Connection {
                 "cannot start a statement while a checkpoint is active",
             ));
         }
+        // Before counting, as sqlite3Step does.
+        self.clear_interrupt_if_idle();
         self.n_active_root_statements.fetch_add(1, Ordering::SeqCst);
         #[cfg(test)]
         self.run_after_counting_root_statement();
