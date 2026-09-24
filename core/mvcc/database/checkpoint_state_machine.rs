@@ -1,34 +1,34 @@
 use crate::alloc::{
-    ConcurrentAllocator, TryReserveError, TursoAllocator, TursoIteratorExt, TursoVecExt, Vec,
-    ALLOC_ERR_MSG,
+    ALLOC_ERR_MSG, ConcurrentAllocator, TryReserveError, TursoAllocator, TursoIteratorExt,
+    TursoVecExt, Vec,
 };
 use crate::mvcc::clock::LogicalClock;
 use crate::mvcc::database::{
-    DeleteRowStateMachine, MVTableId, MvStore, Row, RowID, RowKey, RowVersion, SortableIndexKey,
-    TxTimestampOrID, WalPos, WriteRowStateMachine, MVCC_META_KEY_PERSISTENT_TX_TS_MAX,
-    MVCC_META_TABLE_NAME, SQLITE_SCHEMA_MVCC_TABLE_ID,
+    DeleteRowStateMachine, MVCC_META_KEY_PERSISTENT_TX_TS_MAX, MVCC_META_TABLE_NAME, MVTableId,
+    MvStore, Row, RowID, RowKey, RowVersion, SQLITE_SCHEMA_MVCC_TABLE_ID, SortableIndexKey,
+    TxTimestampOrID, WalPos, WriteRowStateMachine,
 };
 #[cfg(any(test, injected_yields))]
 use crate::mvcc::yield_hooks::{ProvidesYieldContext, YieldContext, YieldPointMarker};
 use crate::mvcc::yield_points::{inject_transition_failure, inject_transition_yield};
 use crate::schema::{Index, Schema};
-use crate::skiplist::base::RefEntry;
 use crate::skiplist::SkiplistAllocator;
+use crate::skiplist::base::RefEntry;
 use crate::state_machine::{StateMachine, StateTransition, TransitionResult};
 use crate::storage::btree::{BTreeCursor, CursorTrait};
 use crate::storage::pager::CreateBTreeFlags;
 use crate::storage::sqlite3_ondisk::DatabaseHeader;
 use crate::storage::wal::{CheckpointMode, TursoRwLock, WalAutoActions};
-use crate::sync::atomic::Ordering;
 use crate::sync::Arc;
 use crate::sync::RwLock;
+use crate::sync::atomic::Ordering;
 use crate::types::IOResultOr;
 use crate::types::{IOCompletions, IOResult, ImmutableRecord, ImmutableRecordRef};
-use crate::{turso_assert, turso_assert_eq};
 use crate::{
     CheckpointResult, Completion, Connection, Database, IOExt, LimboError, Numeric, Pager, Result,
     SyncMode, TransactionState, Value, ValueRef,
 };
+use crate::{turso_assert, turso_assert_eq};
 use crossbeam_epoch as epoch;
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 use std::num::NonZeroU64;
@@ -421,6 +421,22 @@ pub enum SpecialWrite {
         root_page: u64,
         num_columns: usize,
     },
+}
+
+enum TableVersionWrite {
+    Skip,
+    Write { special_write: Option<SpecialWrite> },
+}
+
+#[derive(Clone, Copy)]
+struct CreatedBtree {
+    object_id: MVTableId,
+    sqlite_schema_rowid: i64,
+}
+
+enum SpecialWriteResult {
+    NoSchemaRewrite,
+    Created(CreatedBtree),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1160,10 +1176,11 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
     ///      If the row didn't exist in the database file and was deleted, we can simply not write it.
     fn collect_table_rows(&mut self) -> Result<Option<IOCompletions>> {
         let mut processed = 0;
+        let mvstore = self.mvstore.clone();
         loop {
             let bounds = self.collect_table_bounds();
             let guard = epoch::pin();
-            let mut range = self.mvstore.rows.range(bounds);
+            let mut range = mvstore.rows.range(bounds);
             while let Some(pinned) = range.inner.next(&guard) {
                 let entry = CollectEntry::new(pinned, &guard);
                 let key = entry.key();
@@ -1181,147 +1198,14 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
                 let row_versions = entry.value().read();
 
                 for version in self.maybe_get_checkpointable_versions(&row_versions, key.table_id) {
-                    let is_delete = version.end().is_some();
-
-                    let mut special_write = None;
-                    // Set to true for schema deletes of never-checkpointed tables/indexes.
-                    // These don't need to be written to the B-tree, we just need to track them.
-                    let mut skip_write = false;
-
-                    if let Some(schema_identity) = sqlite_schema_btree_identity(&version) {
-                        let root_page = schema_identity.root_page;
-                        match schema_identity.kind {
-                            SqliteSchemaBtreeKind::Index => {
-                                // This is an index schema change
-                                if is_delete {
-                                    // DROP INDEX
-                                    if root_page < 0 {
-                                        // Index was never checkpointed - derive index_id directly from root_page.
-                                        // No BTreeDestroyIndex needed since there's no physical B-tree.
-                                        let index_id = MVTableId(root_page);
-                                        self.destroyed_indexes.insert(index_id);
-                                        // Defer the removal to the publish window. Pushing to the
-                                        // staged op list borrows only that field, so it is allowed
-                                        // inside the `self.mvstore.rows` iteration.
-                                        self.pending_rootmap_ops
-                                            .push(RootMapOp::Remove { id: index_id });
-                                        skip_write = true;
-                                    } else if let Some(index_id) =
-                                        self.resolve_dropped_binding(root_page as u64, &version)
-                                    {
-                                        // DROP INDEX - index was checkpointed. Resolve the dropped
-                                        // index from the binding that owned this root at the drop ts.
-                                        self.destroyed_indexes.insert(index_id);
-
-                                        // DROP INDEX during checkpoint: schema may no longer contain the index definition.
-                                        // Fixes DROP INDEX during checkpoint when the schema cache no longer
-                                        // contains the index metadata; we only need a cursor to destroy pages so num_columns is not important.
-                                        let num_columns = self
-                                            .index_id_to_index
-                                            .get(&index_id)
-                                            .map(|index| index.columns.len())
-                                            .unwrap_or(0);
-
-                                        special_write = Some(SpecialWrite::BTreeDestroyIndex {
-                                            index_id,
-                                            root_page: root_page as u64,
-                                            num_columns,
-                                        });
-                                    } else {
-                                        // No binding owned this root at the drop ts: the index was
-                                        // already destroyed by an earlier checkpoint and this
-                                        // schema-delete lingered in the store. Nothing to destroy.
-                                        skip_write = true;
-                                    }
-                                } else if root_page < 0 {
-                                    // CREATE INDEX (root page is negative so the index has not been checkpointed yet).
-                                    let index_id = MVTableId::from(root_page);
-                                    let sqlite_schema_rowid =
-                                        version.row.id.row_id.to_int_or_panic();
-                                    special_write = Some(SpecialWrite::BTreeCreateIndex {
-                                        index_id,
-                                        sqlite_schema_rowid,
-                                    });
-                                } else {
-                                    // Index schema row update (e.g. ALTER TABLE RENAME COLUMN propagates
-                                    // to index SQL). No B-tree creation needed; the row itself is written
-                                    // to sqlite_schema below. See: test_checkpoint_allows_index_schema_update_after_rename_column.
-                                }
-                            }
-                            SqliteSchemaBtreeKind::Table => {
-                                // This is a table schema change (existing logic)
-                                tracing::trace!(
-                                "table schema change with root page {root_page}, is_delete={is_delete}"
-                            );
-                                if is_delete {
-                                    if root_page < 0 {
-                                        // Table was never checkpointed - derive table_id directly from root_page.
-                                        // No BTreeDestroy needed since there's no physical B-tree.
-                                        let table_id = MVTableId::from(root_page);
-                                        self.destroyed_tables.insert(table_id);
-                                        // Defer the removal to the publish window (push borrows only
-                                        // the staged-op field, allowed inside the rows iteration).
-                                        self.pending_rootmap_ops
-                                            .push(RootMapOp::Remove { id: table_id });
-                                        skip_write = true;
-                                    } else if let Some(table_id) =
-                                        self.resolve_dropped_binding(root_page as u64, &version)
-                                    {
-                                        // Table was checkpointed - resolve from the binding that owned
-                                        // this root at the drop ts (snapshot-consistent under reuse).
-                                        self.destroyed_tables.insert(table_id);
-
-                                        // Destroy the B-tree in the pager during checkpoint
-                                        special_write = Some(SpecialWrite::BTreeDestroy {
-                                            table_id,
-                                            root_page: root_page as u64,
-                                            num_columns: version.row.column_count,
-                                        });
-                                    }
-                                } else if root_page < 0 {
-                                    // CREATE TABLE (root page is negative so the table has not been checkpointed yet).
-                                    let table_id = MVTableId::from(root_page);
-                                    let sqlite_schema_rowid =
-                                        version.row.id.row_id.to_int_or_panic();
-                                    special_write = Some(SpecialWrite::BTreeCreate {
-                                        table_id,
-                                        sqlite_schema_rowid,
-                                    });
-                                } else {
-                                    // ALTER TABLE. No "special write is needed"; we'll just update the row in sqlite_schema.
-                                }
-                            }
-                        }
-                    } else if is_delete
-                        && version.row.id.table_id == SQLITE_SCHEMA_MVCC_TABLE_ID
-                        && !version.btree_resident
-                    {
-                        // Schema row without a B-tree identity (e.g. sequence, trigger, view).
-                        // If it was never checkpointed to the B-tree, skip the delete — there
-                        // is nothing to remove from the pager.
-                        let begin_ts = match &version.begin() {
-                            Some(TxTimestampOrID::Timestamp(ts)) => Some(*ts),
-                            _ => None,
-                        };
-                        let was_checkpointed =
-                            self.durable_txid_max_old.is_some_and(|txid_max_old| {
-                                begin_ts.is_some_and(|b| b <= u64::from(txid_max_old))
+                    match self.classify_and_stage_table_version(&version) {
+                        TableVersionWrite::Skip => {}
+                        TableVersionWrite::Write { special_write } => {
+                            tracing::trace!("adding to write_set {:?}", (&version, &special_write));
+                            with_mvcc_checkpoint_allocation_site!(CheckpointWriteSet, {
+                                self.write_set.try_push((version, special_write))?;
                             });
-                        if !was_checkpointed {
-                            skip_write = true;
                         }
-                    } else if key.table_id != SQLITE_SCHEMA_MVCC_TABLE_ID
-                        && is_delete
-                        && !self.table_exists_for_snapshot(key.table_id)
-                    {
-                        // B-tree was destroyed in a prior checkpoint; late tombstones are logical-only.
-                        skip_write = true;
-                    }
-                    if !skip_write {
-                        tracing::trace!("adding to write_set {:?}", (&version, &special_write));
-                        with_mvcc_checkpoint_allocation_site!(CheckpointWriteSet, {
-                            self.write_set.try_push((version, special_write))?;
-                        });
                     }
                 }
                 processed += 1;
@@ -1345,6 +1229,155 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
             )
         });
         Ok(None)
+    }
+
+    fn classify_and_stage_table_version(&mut self, version: &RowVersion) -> TableVersionWrite {
+        let is_delete = version.end().is_some();
+        if let Some(schema_identity) = sqlite_schema_btree_identity(version) {
+            let root_page = schema_identity.root_page;
+            match schema_identity.kind {
+                SqliteSchemaBtreeKind::Index => {
+                    if is_delete {
+                        if root_page < 0 {
+                            // Index was never checkpointed - derive index_id directly from root_page.
+                            // No BTreeDestroyIndex needed since there's no physical B-tree.
+                            let index_id = MVTableId(root_page);
+                            self.destroyed_indexes.insert(index_id);
+                            // Defer the removal to the publish window. Pushing to the
+                            // staged op list borrows only that field, so it is allowed
+                            // inside the `self.mvstore.rows` iteration.
+                            self.pending_rootmap_ops
+                                .push(RootMapOp::Remove { id: index_id });
+                            return TableVersionWrite::Skip;
+                        }
+                        if let Some(index_id) =
+                            self.resolve_dropped_binding(root_page as u64, version)
+                        {
+                            // DROP INDEX - index was checkpointed. Resolve the dropped
+                            // index from the binding that owned this root at the drop ts.
+                            self.destroyed_indexes.insert(index_id);
+
+                            // DROP INDEX during checkpoint: schema may no longer contain the index definition.
+                            // Fixes DROP INDEX during checkpoint when the schema cache no longer
+                            // contains the index metadata; we only need a cursor to destroy pages so num_columns is not important.
+                            let num_columns = self
+                                .index_id_to_index
+                                .get(&index_id)
+                                .map(|index| index.columns.len())
+                                .unwrap_or(0);
+
+                            return TableVersionWrite::Write {
+                                special_write: Some(SpecialWrite::BTreeDestroyIndex {
+                                    index_id,
+                                    root_page: root_page as u64,
+                                    num_columns,
+                                }),
+                            };
+                        }
+                        // No binding owned this root at the drop ts: the index was
+                        // already destroyed by an earlier checkpoint and this
+                        // schema-delete lingered in the store. Nothing to destroy.
+                        return TableVersionWrite::Skip;
+                    }
+                    if root_page < 0 {
+                        // CREATE INDEX (root page is negative so the index has not been checkpointed yet).
+                        let index_id = MVTableId::from(root_page);
+                        let sqlite_schema_rowid = version.row.id.row_id.to_int_or_panic();
+                        return TableVersionWrite::Write {
+                            special_write: Some(SpecialWrite::BTreeCreateIndex {
+                                index_id,
+                                sqlite_schema_rowid,
+                            }),
+                        };
+                    }
+                    // Index schema row update (e.g. ALTER TABLE RENAME COLUMN propagates
+                    // to index SQL). No B-tree creation needed; the row itself is written
+                    // to sqlite_schema below. See: test_checkpoint_allows_index_schema_update_after_rename_column.
+                    return TableVersionWrite::Write {
+                        special_write: None,
+                    };
+                }
+                SqliteSchemaBtreeKind::Table => {
+                    tracing::trace!(
+                        "table schema change with root page {root_page}, is_delete={is_delete}"
+                    );
+                    if is_delete {
+                        if root_page < 0 {
+                            // Table was never checkpointed - derive table_id directly from root_page.
+                            // No BTreeDestroy needed since there's no physical B-tree.
+                            let table_id = MVTableId::from(root_page);
+                            self.destroyed_tables.insert(table_id);
+                            // Defer the removal to the publish window (push borrows only
+                            // the staged-op field, allowed inside the rows iteration).
+                            self.pending_rootmap_ops
+                                .push(RootMapOp::Remove { id: table_id });
+                            return TableVersionWrite::Skip;
+                        }
+                        if let Some(table_id) =
+                            self.resolve_dropped_binding(root_page as u64, version)
+                        {
+                            // Table was checkpointed - resolve from the binding that owned
+                            // this root at the drop ts (snapshot-consistent under reuse).
+                            self.destroyed_tables.insert(table_id);
+
+                            return TableVersionWrite::Write {
+                                special_write: Some(SpecialWrite::BTreeDestroy {
+                                    table_id,
+                                    root_page: root_page as u64,
+                                    num_columns: version.row.column_count,
+                                }),
+                            };
+                        }
+                        // Table drops with no binding still write the schema delete. Index drops skip.
+                        return TableVersionWrite::Write {
+                            special_write: None,
+                        };
+                    }
+                    if root_page < 0 {
+                        // CREATE TABLE (root page is negative so the table has not been checkpointed yet).
+                        let table_id = MVTableId::from(root_page);
+                        let sqlite_schema_rowid = version.row.id.row_id.to_int_or_panic();
+                        return TableVersionWrite::Write {
+                            special_write: Some(SpecialWrite::BTreeCreate {
+                                table_id,
+                                sqlite_schema_rowid,
+                            }),
+                        };
+                    }
+                    // ALTER TABLE. No "special write is needed"; we'll just update the row in sqlite_schema.
+                    return TableVersionWrite::Write {
+                        special_write: None,
+                    };
+                }
+            }
+        }
+        if is_delete
+            && version.row.id.table_id == SQLITE_SCHEMA_MVCC_TABLE_ID
+            && !version.btree_resident
+        {
+            // Schema row without a B-tree identity (e.g. sequence, trigger, view).
+            // If it was never checkpointed to the B-tree, skip the delete — there
+            // is nothing to remove from the pager.
+            let begin_ts = match &version.begin() {
+                Some(TxTimestampOrID::Timestamp(ts)) => Some(*ts),
+                _ => None,
+            };
+            let was_checkpointed = self
+                .durable_txid_max_old
+                .is_some_and(|txid_max_old| begin_ts.is_some_and(|b| b <= u64::from(txid_max_old)));
+            if !was_checkpointed {
+                return TableVersionWrite::Skip;
+            }
+        } else if version.row.id.table_id != SQLITE_SCHEMA_MVCC_TABLE_ID
+            && is_delete
+            && !self.table_exists_for_snapshot(version.row.id.table_id)
+        {
+            // B-tree was destroyed in a prior checkpoint; late tombstones are logical-only.
+            return TableVersionWrite::Skip;
+        }
+        TableVersionWrite::Write {
+            special_write: None,
+        }
     }
 
     fn collect_table_bounds(&self) -> (Bound<RowID>, Bound<RowID>) {
@@ -1784,9 +1817,10 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
             )
         })?;
         self.mvstore.global_header.write().replace(header);
-        crate::without_allocation_faults!(self
-            .publish_checkpointed_schema_roots()
-            .expect(crate::alloc::ALLOC_ERR_MSG));
+        crate::without_allocation_faults!(
+            self.publish_checkpointed_schema_roots()
+                .expect(crate::alloc::ALLOC_ERR_MSG)
+        );
         Ok(())
     }
 
@@ -2251,331 +2285,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
             CheckpointState::WriteRow {
                 write_set_index,
                 requires_seek,
-            } => {
-                let write_set_index = *write_set_index;
-                let requires_seek = *requires_seek;
-
-                if !self.has_more_rows(write_set_index) {
-                    // Done writing all table rows, now process index rows
-                    if self.index_write_set.is_empty() {
-                        // No index rows to write, compact sequence
-                        // backing tables, then commit.
-                        self.state = CheckpointState::CompactSequences;
-                    } else {
-                        // Start writing index rows
-                        self.state = CheckpointState::WriteIndexRow {
-                            index_write_set_index: 0,
-                            requires_seek: true,
-                        };
-                    }
-                    return Ok(TransitionResult::Continue);
-                }
-
-                let (num_columns, table_id, special_write, drop_ts) = {
-                    let (row_version, special_write) = self
-                        .get_current_row_version(write_set_index)
-                        .ok_or_else(|| {
-                            LimboError::InternalError(
-                                "row version not found in write set".to_string(),
-                            )
-                        })?;
-                    tracing::trace!("checkpointing row {row_version:?} ");
-                    // Commit ts of the tombstone driving a destroy, so a dropped checkpointed
-                    // object can be retired into `retired_rootpages` for readers still at an
-                    // older snapshot (see the BTreeDestroy/BTreeDestroyIndex arms below).
-                    let drop_ts = match row_version.end() {
-                        Some(TxTimestampOrID::Timestamp(ts)) => Some(ts),
-                        _ => None,
-                    };
-                    (
-                        row_version.row.column_count,
-                        row_version.row.id.table_id,
-                        *special_write,
-                        drop_ts,
-                    )
-                };
-                tracing::debug!(
-                    "WriteRow: num_columns={num_columns}, table_id={table_id:?}, special_write={special_write:?}"
-                );
-
-                // Handle CREATE TABLE / DROP TABLE / CREATE INDEX / DROP INDEX ops
-                if let Some(special_write) = special_write {
-                    match special_write {
-                        SpecialWrite::BTreeCreate { table_id, .. } => {
-                            let created_root_page: u32 = self.pager.io.block(|| {
-                                self.pager.btree_create(&CreateBTreeFlags::new_table())
-                            })?;
-                            // STAGE the binding: the checkpoint must resolve table_id -> root while
-                            // writing rows below, but the pages are not durable until
-                            // CommitPagerTxn, so it stays physically invisible to readers
-                            // (visible_from = u64::MAX) until the post-commit publish window.
-                            // Undo-logged: reverted if the checkpoint fails before commit.
-                            self.ckpt_rootmap_alloc(table_id, created_root_page as u64);
-                            self.staged_roots.push(table_id);
-                        }
-                        SpecialWrite::BTreeDestroy {
-                            table_id,
-                            root_page,
-                            num_columns,
-                        } => {
-                            let known_root_page = self
-                                .mvstore
-                                .current_root_page(&table_id)
-                                .expect("Table ID does not have a root page");
-                            turso_assert_eq!(
-                                known_root_page,
-                                root_page,
-                                "checkpoint root page mismatch for BTreeDestroy",
-                                { "known_root_page": known_root_page, "schema_root_page": root_page }
-                            );
-                            let cursor = if let Some(cursor) = self.cursors.get(&known_root_page) {
-                                cursor.clone()
-                            } else {
-                                let cursor = BTreeCursor::new_table(
-                                    self.pager.clone(),
-                                    known_root_page as i64,
-                                    num_columns,
-                                );
-                                let cursor = Arc::new(RwLock::new(cursor));
-                                self.cursors.insert(root_page, cursor.clone());
-                                cursor
-                            };
-                            self.pager.io.block(|| cursor.write().btree_destroy())?;
-                            // Evict stale cursor.
-                            self.cursors.remove(&root_page);
-                            self.destroyed_tables.insert(table_id);
-                            self.freed_root_pages.insert(root_page as i64);
-                            // Deferred destroy: retire the binding (set its `end` to the drop ts)
-                            // but keep it, so a transaction still scanning this table at an older
-                            // snapshot resolves the (read-mark-protected) root page. GC'd once
-                            // `lwm` passes the drop. Defensively remove if the drop ts is unknown.
-                            if let Some(drop_ts) = drop_ts {
-                                self.ckpt_rootmap_retire(table_id, drop_ts);
-                            } else {
-                                self.ckpt_rootmap_remove(table_id);
-                            }
-                        }
-                        SpecialWrite::BTreeCreateIndex { index_id, .. } => {
-                            let created_root_page: u32 = self.pager.io.block(|| {
-                                self.pager.btree_create(&CreateBTreeFlags::new_index())
-                            })?;
-                            // Staged (see BTreeCreate); published in the post-commit window.
-                            // Undo-logged: reverted if the checkpoint fails before commit.
-                            self.ckpt_rootmap_alloc(index_id, created_root_page as u64);
-                            self.staged_roots.push(index_id);
-                            // Index struct should already be stored in index_id_to_index from collect_committed_versions
-                            turso_assert!(
-                                self.index_id_to_index.contains_key(&index_id),
-                                "checkpoint index struct missing before BTreeCreateIndex",
-                                { "index_id": i64::from(index_id) }
-                            );
-                        }
-                        SpecialWrite::BTreeDestroyIndex {
-                            index_id,
-                            root_page,
-                            num_columns,
-                        } => {
-                            let known_root_page = self
-                                .mvstore
-                                .current_root_page(&index_id)
-                                .expect("Index ID does not have a root page");
-                            turso_assert_eq!(
-                                known_root_page,
-                                root_page,
-                                "checkpoint root page mismatch for BTreeDestroyIndex",
-                                { "known_root_page": known_root_page, "schema_root_page": root_page }
-                            );
-
-                            let cursor = if let Some(cursor) = self.cursors.get(&known_root_page) {
-                                cursor.clone()
-                            } else if let Some(index) = self.index_id_to_index.get(&index_id) {
-                                let cursor = BTreeCursor::new_index(
-                                    self.pager.clone(),
-                                    known_root_page as i64,
-                                    index.as_ref(),
-                                    num_columns,
-                                )?;
-                                let cursor = Arc::new(RwLock::new(cursor));
-                                self.cursors.insert(root_page, cursor.clone());
-                                cursor
-                            } else {
-                                // DROP INDEX destroy path: schema may no longer contain the index definition.
-                                // We only need a cursor to destroy pages so num_columns is not important.
-                                Arc::new(RwLock::new(BTreeCursor::new_table(
-                                    self.pager.clone(),
-                                    known_root_page as i64,
-                                    num_columns,
-                                )))
-                            };
-                            self.pager.io.block(|| cursor.write().btree_destroy())?;
-                            // Evict stale cursor.
-                            self.cursors.remove(&root_page);
-                            self.destroyed_indexes.insert(index_id);
-                            self.freed_root_pages.insert(root_page as i64);
-                            // Deferred destroy: retire the binding (set its `end`) but keep it so
-                            // a transaction still scanning this index at an older snapshot resolves
-                            // the (read-mark-protected) root page. GC'd once `lwm` passes the drop.
-                            if let Some(drop_ts) = drop_ts {
-                                self.ckpt_rootmap_retire(index_id, drop_ts);
-                            } else {
-                                self.ckpt_rootmap_remove(index_id);
-                            }
-                        }
-                    }
-                }
-
-                if self.destroyed_tables.contains(&table_id) {
-                    // Don't write rows for tables that will be destroyed in this checkpoint.
-                    self.state = CheckpointState::WriteRow {
-                        write_set_index: write_set_index + 1,
-                        requires_seek: true,
-                    };
-                    return Ok(TransitionResult::Continue);
-                }
-
-                let is_delete = self
-                    .get_current_row_version(write_set_index)
-                    .is_some_and(|(v, _)| v.end().is_some());
-                if is_delete && !self.table_exists_for_snapshot(table_id) {
-                    self.state = CheckpointState::WriteRow {
-                        write_set_index: write_set_index + 1,
-                        requires_seek: true,
-                    };
-                    return Ok(TransitionResult::Continue);
-                }
-
-                let root_page = self.resolve_checkpoint_root(table_id).unwrap_or_else(|| {
-                    panic!(
-                        "Table ID does not have a root page: {table_id}, row_version: {:?}",
-                        self.get_current_row_version(write_set_index)
-                            .expect("row version should exist")
-                    )
-                });
-
-                tracing::debug!("WriteRow: resolved root page: root_page={root_page}");
-
-                // If a table was created, it now has a real root page allocated for it, but the 'root_page' field in the sqlite_schema record is still the table id.
-                // So we need to rewrite the row version to use the real root page.
-                if let Some(SpecialWrite::BTreeCreate {
-                    table_id,
-                    sqlite_schema_rowid,
-                }) = special_write
-                {
-                    let root_page = self
-                        .resolve_checkpoint_root(table_id)
-                        .expect("Table ID does not have a root page");
-                    let row_version = {
-                        let alloc = self.mvstore.allocator();
-                        let (row_version, _) = self
-                            .get_current_row_version_mut(write_set_index)
-                            .ok_or_else(|| {
-                                LimboError::InternalError(
-                                    "row version not found in write set".to_string(),
-                                )
-                            })?;
-                        let record = ImmutableRecordRef::from_bin_record(row_version.row.payload());
-
-                        let mut values = record.get_values_owned()?;
-                        values[3] = Value::from_i64(root_page as i64);
-                        let record = ImmutableRecord::from_values(&values, values.len())?;
-                        // Btree creation has already happened by this point; an injected fault
-                        // while publishing the sqlite_schema root page can leave retry state with
-                        // a durable btree and a stale rootpage=0 schema row.
-                        // TODO: make this rewrite resumable before re-enabling fault injection.
-                        row_version.row.data = Some(crate::without_allocation_faults!(
-                            crate::alloc::try_arc_slice_from_slice_in(record.get_payload(), alloc)?
-                        ));
-                        row_version.clone()
-                    };
-                    self.created_btrees
-                        .insert(sqlite_schema_rowid, (table_id, row_version));
-                } else if let Some(SpecialWrite::BTreeCreateIndex {
-                    index_id,
-                    sqlite_schema_rowid,
-                }) = special_write
-                {
-                    // Same for index btrees.
-                    let root_page = self
-                        .resolve_checkpoint_root(index_id)
-                        .expect("Index ID does not have a root page");
-                    let row_version = {
-                        let alloc = self.mvstore.allocator();
-                        let (row_version, _) = self
-                            .get_current_row_version_mut(write_set_index)
-                            .ok_or_else(|| {
-                                LimboError::InternalError(
-                                    "row version not found in write set".to_string(),
-                                )
-                            })?;
-                        let record = ImmutableRecordRef::from_bin_record(row_version.row.payload());
-                        let mut values = record.get_values_owned()?;
-                        values[3] = Value::from_i64(root_page as i64);
-                        let record = ImmutableRecord::from_values(&values, values.len())?;
-                        // Btree creation has already happened by this point; an injected fault
-                        // while publishing the sqlite_schema root page can leave retry state with
-                        // a durable btree and a stale rootpage=0 schema row.
-                        // TODO: make this rewrite resumable before re-enabling fault injection.
-                        row_version.row.data = Some(crate::without_allocation_faults!(
-                            crate::alloc::try_arc_slice_from_slice_in(record.get_payload(), alloc)?
-                        ));
-                        row_version.clone()
-                    };
-
-                    self.created_btrees
-                        .insert(sqlite_schema_rowid, (index_id, row_version));
-                }
-
-                // Get or create cursor for this table
-                let cursor = if let Some(cursor) = self.cursors.get(&root_page) {
-                    cursor.clone()
-                } else {
-                    let cursor =
-                        BTreeCursor::new_table(self.pager.clone(), root_page as i64, num_columns);
-                    let cursor = Arc::new(RwLock::new(cursor));
-                    self.cursors.insert(root_page, cursor.clone());
-                    cursor
-                };
-
-                let (row_version, _) =
-                    self.get_current_row_version(write_set_index)
-                        .ok_or_else(|| {
-                            LimboError::InternalError(
-                                "row version not found in write set".to_string(),
-                            )
-                        })?;
-
-                // Check if this is an insert or delete
-                if row_version.end().is_some() {
-                    // This is a delete operation.
-                    // Don't write the deletion record to the b-tree if the b-tree was just created; we can no-op in this case,
-                    // since there is no existing row to delete.
-                    if self
-                        .created_btrees
-                        .values()
-                        .any(|(table_id, _)| *table_id == row_version.row.id.table_id)
-                    {
-                        self.state = CheckpointState::WriteRow {
-                            write_set_index: write_set_index + 1,
-                            requires_seek: true,
-                        };
-                        return Ok(TransitionResult::Continue);
-                    }
-                    let state_machine = self
-                        .mvstore
-                        .delete_row_from_pager(row_version.row.id.clone(), cursor)?;
-                    self.delete_row_state_machine = Some(state_machine);
-                    self.state = CheckpointState::DeleteRowStateMachine { write_set_index };
-                } else {
-                    // This is an insert/update operation
-                    let state_machine =
-                        self.mvstore
-                            .write_row_to_pager(&row_version.row, cursor, requires_seek)?;
-                    self.write_row_state_machine = Some(state_machine);
-                    self.state = CheckpointState::WriteRowStateMachine { write_set_index };
-                }
-
-                Ok(TransitionResult::Continue)
-            }
+            } => self.step_write_row(*write_set_index, *requires_seek),
 
             CheckpointState::WriteRowStateMachine { write_set_index } => {
                 let write_set_index = *write_set_index;
@@ -2625,107 +2335,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
             CheckpointState::WriteIndexRow {
                 index_write_set_index,
                 requires_seek,
-            } => {
-                let index_write_set_index = *index_write_set_index;
-                let requires_seek = *requires_seek;
-
-                if index_write_set_index >= self.index_write_set.len() {
-                    // Done writing all index rows, compact sequence
-                    // backing tables, then commit.
-                    self.state = CheckpointState::CompactSequences;
-                    return Ok(TransitionResult::Continue);
-                }
-
-                let (index_id, row_version, is_delete) =
-                    &self.index_write_set[index_write_set_index];
-
-                // Skip destroyed indexes
-                if self.destroyed_indexes.contains(index_id) {
-                    self.state = CheckpointState::WriteIndexRow {
-                        index_write_set_index: index_write_set_index + 1,
-                        requires_seek: true,
-                    };
-                    return Ok(TransitionResult::Continue);
-                }
-
-                // The index is absent from the snapshot schema (index_id_to_index is built from
-                // local_schema at snapshot_ts). That means the index does not exist at the
-                // checkpoint snapshot — it was dropped — so its whole btree is (or will be)
-                // destroyed wholesale. DROP does not tombstone each in-memory index-entry
-                // version, so collect_index_rows still picks them up as live inserts/tombstones;
-                // materializing them into the (possibly reused) root page would corrupt. Skip
-                // every entry for a snapshot-absent index, mirroring the destroyed_indexes skip.
-                let Some(index) = self.index_id_to_index.get(index_id) else {
-                    self.state = CheckpointState::WriteIndexRow {
-                        index_write_set_index: index_write_set_index + 1,
-                        requires_seek: true,
-                    };
-                    return Ok(TransitionResult::Continue);
-                };
-
-                if *is_delete && !self.table_exists_for_snapshot(*index_id) {
-                    self.state = CheckpointState::WriteIndexRow {
-                        index_write_set_index: index_write_set_index + 1,
-                        requires_seek: true,
-                    };
-                    return Ok(TransitionResult::Continue);
-                }
-
-                // Get root page for this index
-                let root_page = self
-                    .resolve_checkpoint_root(*index_id)
-                    .unwrap_or_else(|| panic!("Index ID {index_id} does not have a root page"));
-
-                // Get or create cursor for this index
-                let cursor = if let Some(cursor) = self.cursors.get(&root_page) {
-                    cursor.clone()
-                } else {
-                    let cursor = BTreeCursor::new_index(
-                        self.pager.clone(),
-                        root_page as i64,
-                        index.as_ref(),
-                        index.columns.len(),
-                    )?;
-                    let cursor = Arc::new(RwLock::new(cursor));
-                    self.cursors.insert(root_page, cursor.clone());
-                    cursor
-                };
-
-                // Check if this is an insert or delete
-                if *is_delete {
-                    // This is a delete operation. Don't write the deletion record to the b-tree if the b-tree was just created; we can no-op in this case,
-                    // since there is no existing row to delete.
-                    if self
-                        .created_btrees
-                        .values()
-                        .any(|(table_id, _)| *table_id == row_version.row.id.table_id)
-                    {
-                        self.state = CheckpointState::WriteIndexRow {
-                            index_write_set_index: index_write_set_index + 1,
-                            requires_seek: true,
-                        };
-                        return Ok(TransitionResult::Continue);
-                    }
-                    let state_machine = self
-                        .mvstore
-                        .delete_row_from_pager(row_version.row.id.clone(), cursor)?;
-                    self.delete_row_state_machine = Some(state_machine);
-                    self.state = CheckpointState::DeleteIndexRowStateMachine {
-                        index_write_set_index,
-                    };
-                } else {
-                    // This is an insert/update operation
-                    let state_machine =
-                        self.mvstore
-                            .write_row_to_pager(&row_version.row, cursor, requires_seek)?;
-                    self.write_row_state_machine = Some(state_machine);
-                    self.state = CheckpointState::WriteIndexRowStateMachine {
-                        index_write_set_index,
-                    };
-                }
-
-                Ok(TransitionResult::Continue)
-            }
+            } => self.step_write_index_row(*index_write_set_index, *requires_seek),
 
             CheckpointState::WriteIndexRowStateMachine {
                 index_write_set_index,
@@ -2808,97 +2418,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
                     }
                 }
             }
-            CheckpointState::CommitPagerTxn => {
-                inject_transition_yield!(self, CheckpointYieldPoint::BeforePagerCommit);
-                let passive = matches!(self.mode, CheckpointMode::Passive { .. });
-                let passive_auto_publish_retry = passive && !self.update_transaction_state;
-                // Passive: btree commit and publish run off the RW lock (drain bit only).
-                let lock_before_commit = !passive;
-                if lock_before_commit && !self.lock_states.blocking_checkpoint_lock_held {
-                    if !self.checkpoint_lock.write() {
-                        return Err(crate::LimboError::Busy);
-                    }
-                    self.lock_states.blocking_checkpoint_lock_held = true;
-                }
-                if !self.pager_commit_done {
-                    if !self.header_staged_for_commit {
-                        let mut checkpoint_header =
-                            *self.mvstore.global_header.read().as_ref().ok_or_else(|| {
-                                LimboError::InternalError(
-                                    "global_header not initialized during checkpoint".to_string(),
-                                )
-                            })?;
-                        checkpoint_header.schema_cookie =
-                            self.database.schema.lock().schema_version.into();
-                        let staged_header = self.pager.io.block(|| {
-                            self.pager.with_header_mut(|header| {
-                                // Keep pager-maintained fields (for example database_size/change_counter)
-                                // intact, and apply only MVCC header mutations that are authored via
-                                // SetCookie/PRAGMA paths.
-                                header.schema_cookie = checkpoint_header.schema_cookie;
-                                header.user_version = checkpoint_header.user_version;
-                                header.application_id = checkpoint_header.application_id;
-                                header.vacuum_mode_largest_root_page =
-                                    checkpoint_header.vacuum_mode_largest_root_page;
-                                header.incremental_vacuum_enabled =
-                                    checkpoint_header.incremental_vacuum_enabled;
-                                *header
-                            })
-                        })?;
-                        self.staged_checkpoint_header = Some(staged_header);
-                        self.header_staged_for_commit = true;
-                    }
-                    // On commit_tx failure the `?` rolls back the pager txn; durable_txid_max and
-                    // the log offset stay put, so a retry re-stages from the previous boundary.
-                    tracing::debug!("Committing pager transaction");
-                    match self.pager.commit_tx(
-                        &self.connection,
-                        self.sync_mode,
-                        self.update_transaction_state,
-                    )? {
-                        IOResult::Done(_) => {
-                            self.pager_commit_done = true;
-                            self.lock_states.pager_read_tx = false;
-                            self.lock_states.pager_write_tx = false;
-                        }
-                        IOResult::IO(io) => return Ok(TransitionResult::Io(io)),
-                    }
-                }
-                inject_transition_yield!(self, CheckpointYieldPoint::BeforePublishWindow);
-                if passive {
-                    if !self.mvstore.try_begin_passive_publish_window() {
-                        if passive_auto_publish_retry {
-                            tracing::debug!(
-                                "passive checkpoint publish contended; yielding for retry"
-                            );
-                            return Ok(TransitionResult::Io(
-                                IOCompletions(Completion::new_yield()),
-                            ));
-                        }
-                        return Err(crate::LimboError::Busy);
-                    }
-                    let materialized_at = WalPos::from_pair(self.pager.wal_pos());
-                    self.apply_passive_publish_window_ordered(materialized_at)?;
-                } else if !self.lock_states.blocking_checkpoint_lock_held {
-                    if !self.checkpoint_lock.write() {
-                        return Err(crate::LimboError::Busy);
-                    }
-                    self.lock_states.blocking_checkpoint_lock_held = true;
-                    let materialized_at = WalPos::from_pair(self.pager.wal_pos());
-                    // Blocking holds the lock: SeqCompact applied its deletes+purge directly under
-                    // the contract, so there are no recorded passive deletes to publish (None).
-                    self.apply_checkpoint_publish_window(materialized_at, None)?;
-                } else {
-                    let materialized_at = WalPos::from_pair(self.pager.wal_pos());
-                    self.apply_checkpoint_publish_window(materialized_at, None)?;
-                }
-                inject_transition_failure!(
-                    self,
-                    CheckpointYieldPoint::AfterDurableBoundaryAdvanced
-                );
-                inject_transition_yield!(self, CheckpointYieldPoint::AfterDurableBoundaryAdvanced);
-                Ok(TransitionResult::Continue)
-            }
+            CheckpointState::CommitPagerTxn => self.step_commit_pager_txn(),
 
             CheckpointState::TruncateLogicalLog => {
                 tracing::debug!("Truncating logical log file");
@@ -3110,6 +2630,506 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
                 ))
             }
         }
+    }
+
+    fn step_write_row(
+        &mut self,
+        write_set_index: usize,
+        requires_seek: bool,
+    ) -> Result<TransitionResult<CheckpointResult>> {
+        if !self.has_more_rows(write_set_index) {
+            // Done writing all table rows, now process index rows
+            if self.index_write_set.is_empty() {
+                // No index rows to write, compact sequence
+                // backing tables, then commit.
+                self.state = CheckpointState::CompactSequences;
+            } else {
+                // Start writing index rows
+                self.state = CheckpointState::WriteIndexRow {
+                    index_write_set_index: 0,
+                    requires_seek: true,
+                };
+            }
+            return Ok(TransitionResult::Continue);
+        }
+
+        let (num_columns, table_id, special_write, drop_ts) = {
+            let (row_version, special_write) = self
+                .get_current_row_version(write_set_index)
+                .ok_or_else(|| {
+                    LimboError::InternalError("row version not found in write set".to_string())
+                })?;
+            tracing::trace!("checkpointing row {row_version:?} ");
+            // Commit ts of the tombstone driving a destroy, so a dropped checkpointed
+            // object can be retired into `retired_rootpages` for readers still at an
+            // older snapshot (see the BTreeDestroy/BTreeDestroyIndex arms below).
+            let drop_ts = match row_version.end() {
+                Some(TxTimestampOrID::Timestamp(ts)) => Some(ts),
+                _ => None,
+            };
+            (
+                row_version.row.column_count,
+                row_version.row.id.table_id,
+                *special_write,
+                drop_ts,
+            )
+        };
+        tracing::debug!(
+            "WriteRow: num_columns={num_columns}, table_id={table_id:?}, special_write={special_write:?}"
+        );
+
+        let lifecycle = match special_write {
+            Some(op) => self.apply_special_write(op, drop_ts)?,
+            None => SpecialWriteResult::NoSchemaRewrite,
+        };
+
+        if self.destroyed_tables.contains(&table_id) {
+            // Don't write rows for tables that will be destroyed in this checkpoint.
+            self.state = CheckpointState::WriteRow {
+                write_set_index: write_set_index + 1,
+                requires_seek: true,
+            };
+            return Ok(TransitionResult::Continue);
+        }
+
+        let is_delete = self
+            .get_current_row_version(write_set_index)
+            .is_some_and(|(v, _)| v.end().is_some());
+        if is_delete && !self.table_exists_for_snapshot(table_id) {
+            self.state = CheckpointState::WriteRow {
+                write_set_index: write_set_index + 1,
+                requires_seek: true,
+            };
+            return Ok(TransitionResult::Continue);
+        }
+
+        let root_page = self.resolve_checkpoint_root(table_id).unwrap_or_else(|| {
+            panic!(
+                "Table ID does not have a root page: {table_id}, row_version: {:?}",
+                self.get_current_row_version(write_set_index)
+                    .expect("row version should exist")
+            )
+        });
+
+        tracing::debug!("WriteRow: resolved root page: root_page={root_page}");
+
+        if let SpecialWriteResult::Created(created) = lifecycle {
+            self.rewrite_created_schema_row(write_set_index, created)?;
+        }
+
+        // Get or create cursor for this table
+        let cursor = if let Some(cursor) = self.cursors.get(&root_page) {
+            cursor.clone()
+        } else {
+            let cursor = BTreeCursor::new_table(self.pager.clone(), root_page as i64, num_columns);
+            let cursor = Arc::new(RwLock::new(cursor));
+            self.cursors.insert(root_page, cursor.clone());
+            cursor
+        };
+
+        let (row_version, _) = self
+            .get_current_row_version(write_set_index)
+            .ok_or_else(|| {
+                LimboError::InternalError("row version not found in write set".to_string())
+            })?;
+
+        // Check if this is an insert or delete
+        if row_version.end().is_some() {
+            // This is a delete operation.
+            // Don't write the deletion record to the b-tree if the b-tree was just created; we can no-op in this case,
+            // since there is no existing row to delete.
+            if self
+                .created_btrees
+                .values()
+                .any(|(table_id, _)| *table_id == row_version.row.id.table_id)
+            {
+                self.state = CheckpointState::WriteRow {
+                    write_set_index: write_set_index + 1,
+                    requires_seek: true,
+                };
+                return Ok(TransitionResult::Continue);
+            }
+            let state_machine = self
+                .mvstore
+                .delete_row_from_pager(row_version.row.id.clone(), cursor)?;
+            self.delete_row_state_machine = Some(state_machine);
+            self.state = CheckpointState::DeleteRowStateMachine { write_set_index };
+        } else {
+            // This is an insert/update operation
+            let state_machine =
+                self.mvstore
+                    .write_row_to_pager(&row_version.row, cursor, requires_seek)?;
+            self.write_row_state_machine = Some(state_machine);
+            self.state = CheckpointState::WriteRowStateMachine { write_set_index };
+        }
+
+        Ok(TransitionResult::Continue)
+    }
+
+    fn step_write_index_row(
+        &mut self,
+        index_write_set_index: usize,
+        requires_seek: bool,
+    ) -> Result<TransitionResult<CheckpointResult>> {
+        if index_write_set_index >= self.index_write_set.len() {
+            // Done writing all index rows, compact sequence
+            // backing tables, then commit.
+            self.state = CheckpointState::CompactSequences;
+            return Ok(TransitionResult::Continue);
+        }
+
+        let (index_id, row_version, is_delete) = &self.index_write_set[index_write_set_index];
+
+        // Skip destroyed indexes
+        if self.destroyed_indexes.contains(index_id) {
+            self.state = CheckpointState::WriteIndexRow {
+                index_write_set_index: index_write_set_index + 1,
+                requires_seek: true,
+            };
+            return Ok(TransitionResult::Continue);
+        }
+
+        // The index is absent from the snapshot schema (index_id_to_index is built from
+        // local_schema at snapshot_ts). That means the index does not exist at the
+        // checkpoint snapshot — it was dropped — so its whole btree is (or will be)
+        // destroyed wholesale. DROP does not tombstone each in-memory index-entry
+        // version, so collect_index_rows still picks them up as live inserts/tombstones;
+        // materializing them into the (possibly reused) root page would corrupt. Skip
+        // every entry for a snapshot-absent index, mirroring the destroyed_indexes skip.
+        let Some(index) = self.index_id_to_index.get(index_id) else {
+            self.state = CheckpointState::WriteIndexRow {
+                index_write_set_index: index_write_set_index + 1,
+                requires_seek: true,
+            };
+            return Ok(TransitionResult::Continue);
+        };
+
+        if *is_delete && !self.table_exists_for_snapshot(*index_id) {
+            self.state = CheckpointState::WriteIndexRow {
+                index_write_set_index: index_write_set_index + 1,
+                requires_seek: true,
+            };
+            return Ok(TransitionResult::Continue);
+        }
+
+        // Get root page for this index
+        let root_page = self
+            .resolve_checkpoint_root(*index_id)
+            .unwrap_or_else(|| panic!("Index ID {index_id} does not have a root page"));
+
+        // Get or create cursor for this index
+        let cursor = if let Some(cursor) = self.cursors.get(&root_page) {
+            cursor.clone()
+        } else {
+            let cursor = BTreeCursor::new_index(
+                self.pager.clone(),
+                root_page as i64,
+                index.as_ref(),
+                index.columns.len(),
+            )?;
+            let cursor = Arc::new(RwLock::new(cursor));
+            self.cursors.insert(root_page, cursor.clone());
+            cursor
+        };
+
+        // Check if this is an insert or delete
+        if *is_delete {
+            // This is a delete operation. Don't write the deletion record to the b-tree if the b-tree was just created; we can no-op in this case,
+            // since there is no existing row to delete.
+            if self
+                .created_btrees
+                .values()
+                .any(|(table_id, _)| *table_id == row_version.row.id.table_id)
+            {
+                self.state = CheckpointState::WriteIndexRow {
+                    index_write_set_index: index_write_set_index + 1,
+                    requires_seek: true,
+                };
+                return Ok(TransitionResult::Continue);
+            }
+            let state_machine = self
+                .mvstore
+                .delete_row_from_pager(row_version.row.id.clone(), cursor)?;
+            self.delete_row_state_machine = Some(state_machine);
+            self.state = CheckpointState::DeleteIndexRowStateMachine {
+                index_write_set_index,
+            };
+        } else {
+            // This is an insert/update operation
+            let state_machine =
+                self.mvstore
+                    .write_row_to_pager(&row_version.row, cursor, requires_seek)?;
+            self.write_row_state_machine = Some(state_machine);
+            self.state = CheckpointState::WriteIndexRowStateMachine {
+                index_write_set_index,
+            };
+        }
+
+        Ok(TransitionResult::Continue)
+    }
+
+    fn step_commit_pager_txn(&mut self) -> Result<TransitionResult<CheckpointResult>> {
+        inject_transition_yield!(self, CheckpointYieldPoint::BeforePagerCommit);
+        let passive = matches!(self.mode, CheckpointMode::Passive { .. });
+        let passive_auto_publish_retry = passive && !self.update_transaction_state;
+        // Passive: btree commit and publish run off the RW lock (drain bit only).
+        let lock_before_commit = !passive;
+        if lock_before_commit && !self.lock_states.blocking_checkpoint_lock_held {
+            if !self.checkpoint_lock.write() {
+                return Err(crate::LimboError::Busy);
+            }
+            self.lock_states.blocking_checkpoint_lock_held = true;
+        }
+        if !self.pager_commit_done {
+            if !self.header_staged_for_commit {
+                let mut checkpoint_header =
+                    *self.mvstore.global_header.read().as_ref().ok_or_else(|| {
+                        LimboError::InternalError(
+                            "global_header not initialized during checkpoint".to_string(),
+                        )
+                    })?;
+                checkpoint_header.schema_cookie = self.database.schema.lock().schema_version.into();
+                let staged_header = self.pager.io.block(|| {
+                    self.pager.with_header_mut(|header| {
+                        // Keep pager-maintained fields (for example database_size/change_counter)
+                        // intact, and apply only MVCC header mutations that are authored via
+                        // SetCookie/PRAGMA paths.
+                        header.schema_cookie = checkpoint_header.schema_cookie;
+                        header.user_version = checkpoint_header.user_version;
+                        header.application_id = checkpoint_header.application_id;
+                        header.vacuum_mode_largest_root_page =
+                            checkpoint_header.vacuum_mode_largest_root_page;
+                        header.incremental_vacuum_enabled =
+                            checkpoint_header.incremental_vacuum_enabled;
+                        *header
+                    })
+                })?;
+                self.staged_checkpoint_header = Some(staged_header);
+                self.header_staged_for_commit = true;
+            }
+            // On commit_tx failure the `?` rolls back the pager txn; durable_txid_max and
+            // the log offset stay put, so a retry re-stages from the previous boundary.
+            tracing::debug!("Committing pager transaction");
+            match self.pager.commit_tx(
+                &self.connection,
+                self.sync_mode,
+                self.update_transaction_state,
+            )? {
+                IOResult::Done(_) => {
+                    self.pager_commit_done = true;
+                    self.lock_states.pager_read_tx = false;
+                    self.lock_states.pager_write_tx = false;
+                }
+                IOResult::IO(io) => return Ok(TransitionResult::Io(io)),
+            }
+        }
+        inject_transition_yield!(self, CheckpointYieldPoint::BeforePublishWindow);
+        if passive {
+            if !self.mvstore.try_begin_passive_publish_window() {
+                if passive_auto_publish_retry {
+                    tracing::debug!("passive checkpoint publish contended; yielding for retry");
+                    return Ok(TransitionResult::Io(IOCompletions(Completion::new_yield())));
+                }
+                return Err(crate::LimboError::Busy);
+            }
+            let materialized_at = WalPos::from_pair(self.pager.wal_pos());
+            self.apply_passive_publish_window_ordered(materialized_at)?;
+        } else if !self.lock_states.blocking_checkpoint_lock_held {
+            if !self.checkpoint_lock.write() {
+                return Err(crate::LimboError::Busy);
+            }
+            self.lock_states.blocking_checkpoint_lock_held = true;
+            let materialized_at = WalPos::from_pair(self.pager.wal_pos());
+            // Blocking holds the lock: SeqCompact applied its deletes+purge directly under
+            // the contract, so there are no recorded passive deletes to publish (None).
+            self.apply_checkpoint_publish_window(materialized_at, None)?;
+        } else {
+            let materialized_at = WalPos::from_pair(self.pager.wal_pos());
+            self.apply_checkpoint_publish_window(materialized_at, None)?;
+        }
+        inject_transition_failure!(self, CheckpointYieldPoint::AfterDurableBoundaryAdvanced);
+        inject_transition_yield!(self, CheckpointYieldPoint::AfterDurableBoundaryAdvanced);
+        Ok(TransitionResult::Continue)
+    }
+
+    fn apply_special_write(
+        &mut self,
+        special_write: SpecialWrite,
+        drop_ts: Option<u64>,
+    ) -> Result<SpecialWriteResult> {
+        match special_write {
+            SpecialWrite::BTreeCreate {
+                table_id,
+                sqlite_schema_rowid,
+            } => {
+                let created_root_page: u32 = self
+                    .pager
+                    .io
+                    .block(|| self.pager.btree_create(&CreateBTreeFlags::new_table()))?;
+                // STAGE the binding: the checkpoint must resolve table_id -> root while
+                // writing rows below, but the pages are not durable until
+                // CommitPagerTxn, so it stays physically invisible to readers
+                // (visible_from = u64::MAX) until the post-commit publish window.
+                // Undo-logged: reverted if the checkpoint fails before commit.
+                self.ckpt_rootmap_alloc(table_id, created_root_page as u64);
+                self.staged_roots.push(table_id);
+                Ok(SpecialWriteResult::Created(CreatedBtree {
+                    object_id: table_id,
+                    sqlite_schema_rowid,
+                }))
+            }
+            SpecialWrite::BTreeDestroy {
+                table_id,
+                root_page,
+                num_columns,
+            } => {
+                let known_root_page = self
+                    .mvstore
+                    .current_root_page(&table_id)
+                    .expect("Table ID does not have a root page");
+                turso_assert_eq!(
+                    known_root_page,
+                    root_page,
+                    "checkpoint root page mismatch for BTreeDestroy",
+                    { "known_root_page": known_root_page, "schema_root_page": root_page }
+                );
+                let cursor = if let Some(cursor) = self.cursors.get(&known_root_page) {
+                    cursor.clone()
+                } else {
+                    let cursor = BTreeCursor::new_table(
+                        self.pager.clone(),
+                        known_root_page as i64,
+                        num_columns,
+                    );
+                    let cursor = Arc::new(RwLock::new(cursor));
+                    self.cursors.insert(root_page, cursor.clone());
+                    cursor
+                };
+                self.pager.io.block(|| cursor.write().btree_destroy())?;
+                // Evict stale cursor.
+                self.cursors.remove(&root_page);
+                self.destroyed_tables.insert(table_id);
+                self.freed_root_pages.insert(root_page as i64);
+                // Deferred destroy: retire the binding (set its `end` to the drop ts)
+                // but keep it, so a transaction still scanning this table at an older
+                // snapshot resolves the (read-mark-protected) root page. GC'd once
+                // `lwm` passes the drop. Defensively remove if the drop ts is unknown.
+                if let Some(drop_ts) = drop_ts {
+                    self.ckpt_rootmap_retire(table_id, drop_ts);
+                } else {
+                    self.ckpt_rootmap_remove(table_id);
+                }
+                Ok(SpecialWriteResult::NoSchemaRewrite)
+            }
+            SpecialWrite::BTreeCreateIndex {
+                index_id,
+                sqlite_schema_rowid,
+            } => {
+                let created_root_page: u32 = self
+                    .pager
+                    .io
+                    .block(|| self.pager.btree_create(&CreateBTreeFlags::new_index()))?;
+                // Staged (see BTreeCreate); published in the post-commit window.
+                // Undo-logged: reverted if the checkpoint fails before commit.
+                self.ckpt_rootmap_alloc(index_id, created_root_page as u64);
+                self.staged_roots.push(index_id);
+                // Index struct should already be stored in index_id_to_index from collect_committed_versions
+                turso_assert!(
+                    self.index_id_to_index.contains_key(&index_id),
+                    "checkpoint index struct missing before BTreeCreateIndex",
+                    { "index_id": i64::from(index_id) }
+                );
+                Ok(SpecialWriteResult::Created(CreatedBtree {
+                    object_id: index_id,
+                    sqlite_schema_rowid,
+                }))
+            }
+            SpecialWrite::BTreeDestroyIndex {
+                index_id,
+                root_page,
+                num_columns,
+            } => {
+                let known_root_page = self
+                    .mvstore
+                    .current_root_page(&index_id)
+                    .expect("Index ID does not have a root page");
+                turso_assert_eq!(
+                    known_root_page,
+                    root_page,
+                    "checkpoint root page mismatch for BTreeDestroyIndex",
+                    { "known_root_page": known_root_page, "schema_root_page": root_page }
+                );
+
+                let cursor = if let Some(cursor) = self.cursors.get(&known_root_page) {
+                    cursor.clone()
+                } else if let Some(index) = self.index_id_to_index.get(&index_id) {
+                    let cursor = BTreeCursor::new_index(
+                        self.pager.clone(),
+                        known_root_page as i64,
+                        index.as_ref(),
+                        num_columns,
+                    )?;
+                    let cursor = Arc::new(RwLock::new(cursor));
+                    self.cursors.insert(root_page, cursor.clone());
+                    cursor
+                } else {
+                    // DROP INDEX destroy path: schema may no longer contain the index definition.
+                    // We only need a cursor to destroy pages so num_columns is not important.
+                    Arc::new(RwLock::new(BTreeCursor::new_table(
+                        self.pager.clone(),
+                        known_root_page as i64,
+                        num_columns,
+                    )))
+                };
+                self.pager.io.block(|| cursor.write().btree_destroy())?;
+                // Evict stale cursor.
+                self.cursors.remove(&root_page);
+                self.destroyed_indexes.insert(index_id);
+                self.freed_root_pages.insert(root_page as i64);
+                // Deferred destroy: retire the binding (set its `end`) but keep it so
+                // a transaction still scanning this index at an older snapshot resolves
+                // the (read-mark-protected) root page. GC'd once `lwm` passes the drop.
+                if let Some(drop_ts) = drop_ts {
+                    self.ckpt_rootmap_retire(index_id, drop_ts);
+                } else {
+                    self.ckpt_rootmap_remove(index_id);
+                }
+                Ok(SpecialWriteResult::NoSchemaRewrite)
+            }
+        }
+    }
+
+    fn rewrite_created_schema_row(
+        &mut self,
+        write_set_index: usize,
+        created: CreatedBtree,
+    ) -> Result<()> {
+        let root_page = self
+            .resolve_checkpoint_root(created.object_id)
+            .expect("created B-tree must have a root page");
+        let alloc = self.mvstore.allocator();
+        let (row_version, _) = self
+            .get_current_row_version_mut(write_set_index)
+            .ok_or_else(|| {
+                LimboError::InternalError("row version not found in write set".to_string())
+            })?;
+        let record = ImmutableRecordRef::from_bin_record(row_version.row.payload());
+        let mut values = record.get_values_owned()?;
+        values[3] = Value::from_i64(root_page as i64);
+        let record = ImmutableRecord::from_values(&values, values.len())?;
+        // Btree creation has already happened by this point; an injected fault
+        // while publishing the sqlite_schema root page can leave retry state with
+        // a durable btree and a stale rootpage=0 schema row.
+        // TODO: make this rewrite resumable before re-enabling fault injection.
+        row_version.row.data = Some(crate::without_allocation_faults!(
+            crate::alloc::try_arc_slice_from_slice_in(record.get_payload(), alloc)?
+        ));
+        let row_version = row_version.clone();
+        self.created_btrees.insert(
+            created.sqlite_schema_rowid,
+            (created.object_id, row_version),
+        );
+        Ok(())
     }
 }
 
@@ -3358,8 +3378,8 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> StateTransition
 mod tests {
     use super::*;
     use crate::alloc::vec;
-    use crate::mvcc::database::tests::MvccTestDbNoConn;
     use crate::mvcc::database::SortableIndexKey;
+    use crate::mvcc::database::tests::MvccTestDbNoConn;
     use crate::translate::collate::CollationSeq;
     use crate::types::{IndexInfo, KeyInfo};
     use turso_parser::ast::SortOrder;
@@ -3623,8 +3643,8 @@ mod tests {
         }
     }
 
-    fn checkpoint_for_collect_tests(
-    ) -> CheckpointStateMachine<crate::mvcc::clock::MvccClock, crate::alloc::DynAllocator> {
+    fn checkpoint_for_collect_tests()
+    -> CheckpointStateMachine<crate::mvcc::clock::MvccClock, crate::alloc::DynAllocator> {
         let db = MvccTestDbNoConn::new();
         let conn = db.connect();
         let mvstore = db.get_mvcc_store();
@@ -3772,6 +3792,106 @@ mod tests {
                 .iter()
                 .any(|(version, _)| version.row.id.table_id == kept),
             "rows of a table that was not dropped must still be collected"
+        );
+    }
+
+    #[test]
+    fn collect_table_rows_classifies_schema_create_drop_and_skip() {
+        let mut checkpoint = checkpoint_for_collect_tests();
+        let mvstore = checkpoint.mvstore.clone();
+        let created_table = MVTableId::from(-10);
+        let dropped_never_checkpointed = MVTableId::from(-13);
+
+        insert_row_version(
+            &mvstore,
+            sqlite_schema_row_version(10, "table", "created", "created", -10, Some(5), None),
+        );
+        insert_row_version(
+            &mvstore,
+            sqlite_schema_row_version(11, "index", "idx_created", "created", -11, Some(5), None),
+        );
+        insert_row_version(
+            &mvstore,
+            sqlite_schema_row_version(12, "table", "altered", "altered", 5, Some(5), None),
+        );
+        insert_row_version(
+            &mvstore,
+            sqlite_schema_row_version(13, "table", "gone", "gone", -13, Some(5), Some(6)),
+        );
+        insert_row_version(
+            &mvstore,
+            sqlite_schema_row_version(14, "index", "idx_gone", "gone", -14, Some(5), Some(6)),
+        );
+        insert_row_version(
+            &mvstore,
+            sqlite_schema_row_version(15, "table", "unbound", "unbound", 99, Some(5), Some(6)),
+        );
+        insert_row_version(
+            &mvstore,
+            sqlite_schema_row_version(16, "index", "idx_unbound", "unbound", 98, Some(5), Some(6)),
+        );
+        insert_row_version(
+            &mvstore,
+            sqlite_schema_row_version(17, "trigger", "trg", "created", 0, Some(5), Some(6)),
+        );
+        insert_row_version(&mvstore, committed_table_row_version(created_table, 1));
+        insert_row_version(
+            &mvstore,
+            committed_table_row_version(dropped_never_checkpointed, 1),
+        );
+
+        while checkpoint.collect_table_rows().unwrap().is_some() {}
+
+        let schema_writes: Vec<(i64, Option<SpecialWrite>)> = checkpoint
+            .write_set
+            .iter()
+            .filter(|(version, _)| version.row.id.table_id == SQLITE_SCHEMA_MVCC_TABLE_ID)
+            .map(|(version, special)| (version.row.id.row_id.to_int_or_panic(), *special))
+            .collect();
+
+        assert_eq!(
+            schema_writes,
+            vec![
+                (
+                    10,
+                    Some(SpecialWrite::BTreeCreate {
+                        table_id: MVTableId::from(-10),
+                        sqlite_schema_rowid: 10,
+                    })
+                ),
+                (
+                    11,
+                    Some(SpecialWrite::BTreeCreateIndex {
+                        index_id: MVTableId::from(-11),
+                        sqlite_schema_rowid: 11,
+                    })
+                ),
+                (12, None),
+                (15, None),
+            ],
+            "schema collect must emit create special writes, keep positive-root updates, write a table drop with no binding, and skip never-checkpointed drops plus index drops with no binding"
+        );
+        assert!(checkpoint.destroyed_tables.contains(&MVTableId::from(-13)));
+        assert!(checkpoint.destroyed_indexes.contains(&MVTableId::from(-14)));
+        assert!(!checkpoint.destroyed_indexes.contains(&MVTableId::from(-11)));
+        assert_eq!(
+            checkpoint.pending_rootmap_ops.len(),
+            2,
+            "only never-checkpointed drops stage a root-map remove"
+        );
+        assert!(
+            checkpoint
+                .write_set
+                .iter()
+                .any(|(version, _)| version.row.id.table_id == created_table),
+            "user rows of a created table must still be collected"
+        );
+        assert!(
+            checkpoint
+                .write_set
+                .iter()
+                .all(|(version, _)| version.row.id.table_id != dropped_never_checkpointed),
+            "user rows of a never-checkpointed dropped table must not enter write_set"
         );
     }
 
