@@ -162,7 +162,9 @@ fn chunk_assembly_rejects_stray_chunk_numbers_without_panicking() {
     chunks.insert(0, vec![1, 2, 3]);
     chunks.insert(1, vec![4, 5]);
     assert_eq!(
-        &*assemble_chunks(path, chunks.clone()).unwrap(),
+        assemble_chunks(path, chunks.clone(), &DynAllocator::default())
+            .unwrap()
+            .as_slice(),
         &[1, 2, 3, 4, 5]
     );
 
@@ -171,7 +173,7 @@ fn chunk_assembly_rejects_stray_chunk_numbers_without_panicking() {
     // bytes or trip an assert.
     chunks.insert(-1, vec![9]);
     assert!(matches!(
-        assemble_chunks(path, chunks.clone()),
+        assemble_chunks(path, chunks.clone(), &DynAllocator::default()),
         Err(LimboError::Corrupt(_))
     ));
 
@@ -179,9 +181,38 @@ fn chunk_assembly_rejects_stray_chunk_numbers_without_panicking() {
     chunks.remove(&-1);
     chunks.remove(&0);
     assert!(matches!(
-        assemble_chunks(path, chunks),
+        assemble_chunks(path, chunks, &DynAllocator::default()),
         Err(LimboError::Corrupt(_))
     ));
+}
+
+#[test]
+fn snapshot_directory_reads_shared_file_bytes_without_copying() {
+    use tantivy::directory::Directory;
+
+    let path = std::path::Path::new("segment.term");
+    let mut bytes = DynVec::new_in(DynAllocator::default());
+    bytes.try_extend([3, 5, 7, 11, 13]).unwrap();
+    let data = Arc::new(bytes);
+    let files = HashMap::from_iter([(path.to_path_buf(), Arc::clone(&data))]);
+    let directory = SnapshotDirectory::new(files, b"metadata".to_vec());
+    assert!(directory.exists(path).unwrap());
+    assert!(directory.exists(std::path::Path::new("meta.json")).unwrap());
+    assert!(!directory
+        .exists(std::path::Path::new("missing.term"))
+        .unwrap());
+    assert_eq!(directory.atomic_read(path).unwrap(), &[3, 5, 7, 11, 13]);
+    assert_eq!(
+        directory
+            .atomic_read(std::path::Path::new("meta.json"))
+            .unwrap(),
+        b"metadata"
+    );
+    let handle = directory.get_file_handle(path).unwrap();
+    let read = handle.read_bytes(1..4).unwrap();
+
+    assert_eq!(read.as_slice(), &[5, 7, 11]);
+    assert_eq!(read.as_slice().as_ptr(), data[1..].as_ptr());
 }
 
 #[test]
@@ -257,7 +288,7 @@ fn merged_segment_files_can_be_rekeyed_to_a_minted_id() {
     let minted = SegmentId::from_uuid_string("0123456789abcdef0123456789abcdef").unwrap();
     assert_ne!(segment.id(), minted);
 
-    let files: HashMap<PathBuf, Arc<[u8]>> = segment
+    let files: HashMap<PathBuf, FileBytes> = segment
         .data
         .files
         .iter()
@@ -298,7 +329,10 @@ fn merged_segment_files_can_be_rekeyed_to_a_minted_id() {
     // A file that is not named after the source segment is a bug, not
     // something to rename silently.
     let mut stray = files;
-    stray.insert(PathBuf::from("meta.json"), Arc::from(Vec::new()));
+    stray.insert(
+        PathBuf::from("meta.json"),
+        Arc::new(DynVec::new_in(DynAllocator::default())),
+    );
     assert!(matches!(
         rename_segment_files(stray, &segment.id(), &minted),
         Err(LimboError::InternalError(_))
@@ -388,7 +422,7 @@ fn segment_load_reads_the_identities_the_build_wrote() {
 
     // A segment loaded from storage reads its identities from the fast
     // field. A merged segment and every cache miss do the same.
-    let files: HashMap<PathBuf, Arc<[u8]>> = segment
+    let files: HashMap<PathBuf, FileBytes> = segment
         .data
         .files
         .iter()
@@ -574,7 +608,9 @@ fn segment_byte_cache_keeps_newest_and_respects_budget() {
     let mut cache = SegmentByteCache::default();
     let make_data = |bytes: usize| {
         let mut files = HashMap::default();
-        files.insert("f".to_string(), Arc::<[u8]>::from(vec![0u8; bytes]));
+        let mut data = DynVec::try_with_capacity_in(bytes, DynAllocator::default()).unwrap();
+        data.try_extend(std::iter::repeat_n(0u8, bytes)).unwrap();
+        files.insert("f".to_string(), Arc::new(data));
         Arc::new(SegmentData::new(files, SegmentIdentities::new(Vec::new())))
     };
     let a = SegmentId::generate_random();
@@ -593,6 +629,17 @@ fn segment_byte_cache_keeps_newest_and_respects_budget() {
     assert!(cache.get(&a).is_some());
     assert!(cache.get(&b).is_none());
     assert!(cache.get(&c).is_none());
+}
+
+#[test]
+fn segment_byte_cache_counts_spare_file_capacity() {
+    let mut bytes = DynVec::try_with_capacity_in(128, DynAllocator::default()).unwrap();
+    bytes.try_extend([1, 2]).unwrap();
+    let files = HashMap::from_iter([("f".to_string(), Arc::new(bytes))]);
+    let segment = SegmentData::new(files, SegmentIdentities::new(Vec::new()));
+
+    assert_eq!(segment.files["f"].len(), 2);
+    assert_eq!(segment.total_bytes, 128);
 }
 
 #[test]
@@ -763,7 +810,15 @@ mod allocation_failures {
         assert!(!directory.exists(path).unwrap());
         writer.get_mut().write_all(b"suffix").unwrap();
         writer.terminate().unwrap();
-        assert_eq!(&*directory.captured_files()[path], b"prefixsuffix");
+        let captured = directory.captured_files();
+        assert_eq!(captured[path].as_slice(), b"prefixsuffix");
+        let read = directory
+            .get_file_handle(path)
+            .unwrap()
+            .read_bytes(2..8)
+            .unwrap();
+        assert_eq!(read.as_slice(), b"efixsu");
+        assert_eq!(read.as_slice().as_ptr(), captured[path][2..].as_ptr());
 
         let abandoned = std::path::Path::new("abandoned.idx");
         let mut writer = directory.open_write(abandoned).unwrap();
@@ -772,6 +827,30 @@ mod allocation_failures {
         assert!(writer.get_mut().write_all(&suffix).is_err());
         drop(writer);
         assert!(!directory.exists(abandoned).unwrap());
+    }
+
+    #[test]
+    fn chunk_assembly_failure_returns_oom_and_retry_reads_the_same_bytes() {
+        let allocator = FailingAllocator {
+            #[cfg(feature = "allocation_metric")]
+            expected_site: Some(crate::alloc::FtsAllocationSite::AssembleBuffer.into()),
+            ..Default::default()
+        };
+        let path = std::path::Path::new("segment.term");
+        let chunks = HashMap::from_iter([(0, vec![1, 2, 3]), (1, vec![4, 5])]);
+        let dyn_allocator = DynAllocator::new(allocator.clone());
+
+        allocator.fail_after(0);
+        assert!(matches!(
+            assemble_chunks(path, chunks.clone(), &dyn_allocator),
+            Err(LimboError::OutOfMemory)
+        ));
+        assert_eq!(
+            assemble_chunks(path, chunks, &dyn_allocator)
+                .unwrap()
+                .as_slice(),
+            &[1, 2, 3, 4, 5]
+        );
     }
 
     #[test]

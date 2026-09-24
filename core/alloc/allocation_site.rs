@@ -16,6 +16,7 @@ pub enum AllocationSite {
 pub enum FtsAllocationSite {
     CaptureBuffer,
     AtomicMetadata,
+    AssembleBuffer,
 }
 
 impl From<FtsAllocationSite> for AllocationSite {

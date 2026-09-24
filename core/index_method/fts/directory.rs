@@ -24,7 +24,7 @@
 
 use rustc_hash::FxHashMap as HashMap;
 use std::io::{BufWriter, Write};
-use std::ops::Range;
+use std::ops::{Deref, Range};
 use std::path::{Path, PathBuf};
 
 use parking_lot::RwLock;
@@ -34,6 +34,7 @@ use tantivy::directory::{
     WatchHandle,
 };
 use tantivy::HasLen;
+use tantivy_common::StableDeref;
 
 #[cfg(not(nightly))]
 use crate::alloc::TursoVecInExt;
@@ -45,9 +46,25 @@ use crate::sync::Arc;
 const TANTIVY_META_FILE: &str = "meta.json";
 const TANTIVY_MANAGED_FILE: &str = ".managed.json";
 
+pub(super) type FileBytes = Arc<DynVec<u8>>;
+
+struct FileByteSlice(FileBytes);
+
+impl Deref for FileByteSlice {
+    type Target = [u8];
+
+    fn deref(&self) -> &[u8] {
+        self.0.as_slice()
+    }
+}
+
+// SAFETY: The vector cannot be mutated through its shared Arc, so its byte slice
+// remains at the same address while this holder exists, even if it is moved.
+unsafe impl StableDeref for FileByteSlice {}
+
 /// In-memory file handle over resident bytes.
 pub(super) struct InMemoryFileHandle {
-    data: Arc<[u8]>,
+    data: OwnedBytes,
 }
 
 impl std::fmt::Debug for InMemoryFileHandle {
@@ -75,7 +92,7 @@ impl FileHandle for InMemoryFileHandle {
         if range.start >= range.end {
             return Ok(OwnedBytes::empty());
         }
-        Ok(OwnedBytes::new(Arc::clone(&self.data)).slice(range))
+        Ok(self.data.slice(range))
     }
 }
 
@@ -94,23 +111,28 @@ fn noop_lock() -> DirectoryLock {
 /// from the visible registry rows; no stored file ever carries that name.
 #[derive(Clone)]
 pub(super) struct SnapshotDirectory {
-    files: Arc<HashMap<PathBuf, Arc<[u8]>>>,
+    files: Arc<HashMap<PathBuf, FileBytes>>,
     meta_json: Arc<[u8]>,
 }
 
+enum SnapshotFile<'a> {
+    Meta(&'a Arc<[u8]>),
+    Segment(&'a FileBytes),
+}
+
 impl SnapshotDirectory {
-    pub fn new(files: HashMap<PathBuf, Arc<[u8]>>, meta_json: Vec<u8>) -> Self {
+    pub fn new(files: HashMap<PathBuf, FileBytes>, meta_json: Vec<u8>) -> Self {
         Self {
             files: Arc::new(files),
             meta_json: Arc::from(meta_json),
         }
     }
 
-    fn lookup(&self, path: &Path) -> Option<Arc<[u8]>> {
+    fn lookup(&self, path: &Path) -> Option<SnapshotFile<'_>> {
         if path == Path::new(TANTIVY_META_FILE) {
-            return Some(Arc::clone(&self.meta_json));
+            return Some(SnapshotFile::Meta(&self.meta_json));
         }
-        self.files.get(path).map(Arc::clone)
+        self.files.get(path).map(SnapshotFile::Segment)
     }
 }
 
@@ -128,10 +150,12 @@ impl Directory for SnapshotDirectory {
         &self,
         path: &Path,
     ) -> std::result::Result<Arc<dyn FileHandle>, OpenReadError> {
-        match self.lookup(path) {
-            Some(data) => Ok(Arc::new(InMemoryFileHandle { data })),
-            None => Err(OpenReadError::FileDoesNotExist(path.to_path_buf())),
-        }
+        let data = match self.lookup(path) {
+            Some(SnapshotFile::Meta(data)) => OwnedBytes::new(Arc::clone(data)),
+            Some(SnapshotFile::Segment(data)) => OwnedBytes::new(FileByteSlice(Arc::clone(data))),
+            None => return Err(OpenReadError::FileDoesNotExist(path.to_path_buf())),
+        };
+        Ok(Arc::new(InMemoryFileHandle { data }))
     }
 
     fn exists(&self, path: &Path) -> std::result::Result<bool, OpenReadError> {
@@ -146,7 +170,8 @@ impl Directory for SnapshotDirectory {
             return Err(OpenReadError::FileDoesNotExist(path.to_path_buf()));
         }
         match self.lookup(path) {
-            Some(data) => Ok(data.to_vec()),
+            Some(SnapshotFile::Meta(data)) => Ok(data.to_vec()),
+            Some(SnapshotFile::Segment(data)) => Ok(data.as_slice().to_vec()),
             None => Err(OpenReadError::FileDoesNotExist(path.to_path_buf())),
         }
     }
@@ -197,7 +222,7 @@ impl Directory for SnapshotDirectory {
 #[derive(Debug, Default)]
 struct BuildDirectoryInner {
     /// Segment files captured on terminate, footer included.
-    files: HashMap<PathBuf, Arc<[u8]>>,
+    files: HashMap<PathBuf, FileBytes>,
     /// Atomic writes (`meta.json`, `.managed.json`): absorbed here so
     /// whole-index manifests never reach the B-tree.
     atomic: HashMap<PathBuf, ArcSlice<u8>>,
@@ -224,7 +249,7 @@ impl BuildDirectory {
     /// The captured segment files (everything written through `open_write`).
     /// Atomic slots (`meta.json`, `.managed.json`) are excluded by
     /// construction.
-    pub fn captured_files(&self) -> HashMap<PathBuf, Arc<[u8]>> {
+    pub fn captured_files(&self) -> HashMap<PathBuf, FileBytes> {
         self.inner.read().files.clone()
     }
 
@@ -251,6 +276,7 @@ impl std::fmt::Debug for BuildDirectory {
 struct CaptureWriter {
     path: PathBuf,
     buffer: DynVec<u8>,
+    allocator: DynAllocator,
     inner: Arc<RwLock<BuildDirectoryInner>>,
 }
 
@@ -288,9 +314,11 @@ impl Drop for CaptureWriter {
 
 impl TerminatingWrite for CaptureWriter {
     fn terminate_ref(&mut self, _: tantivy::directory::AntiCallToken) -> std::io::Result<()> {
-        let data = Arc::from(self.buffer.as_slice());
+        let data = Arc::new(std::mem::replace(
+            &mut self.buffer,
+            DynVec::new_in(self.allocator.clone()),
+        ));
         self.inner.write().files.insert(self.path.clone(), data);
-        self.buffer.clear();
         Ok(())
     }
 }
@@ -302,7 +330,7 @@ impl Directory for BuildDirectory {
     ) -> std::result::Result<Arc<dyn FileHandle>, OpenReadError> {
         match self.inner.read().files.get(path) {
             Some(data) => Ok(Arc::new(InMemoryFileHandle {
-                data: Arc::clone(data),
+                data: OwnedBytes::new(FileByteSlice(Arc::clone(data))),
             })),
             None => Err(OpenReadError::FileDoesNotExist(path.to_path_buf())),
         }
@@ -343,6 +371,7 @@ impl Directory for BuildDirectory {
         let writer: Box<dyn TerminatingWrite + Send + Sync> = Box::new(CaptureWriter {
             path: path.to_path_buf(),
             buffer: DynVec::new_in(self.allocator.clone()),
+            allocator: self.allocator.clone(),
             inner: Arc::clone(&self.inner),
         });
         Ok(BufWriter::new(writer))
@@ -363,5 +392,30 @@ impl Directory for BuildDirectory {
 
     fn watch(&self, _cb: WatchCallback) -> std::result::Result<WatchHandle, tantivy::TantivyError> {
         Ok(WatchHandle::empty())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn terminating_capture_keeps_the_written_buffer() {
+        let allocator = DynAllocator::default();
+        let inner = Arc::new(RwLock::new(BuildDirectoryInner::default()));
+        let path = PathBuf::from("segment.term");
+        let mut writer = CaptureWriter {
+            path: path.clone(),
+            buffer: DynVec::new_in(allocator.clone()),
+            allocator,
+            inner: Arc::clone(&inner),
+        };
+        writer.write_all(b"segment bytes").unwrap();
+        let written = writer.buffer.as_ptr();
+
+        writer.terminate().unwrap();
+        let captured = inner.read();
+        assert_eq!(captured.files[&path].as_slice(), b"segment bytes");
+        assert_eq!(captured.files[&path].as_ptr(), written);
     }
 }

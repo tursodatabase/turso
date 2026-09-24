@@ -17,7 +17,9 @@
 //! the same FTS index concurrently. In WAL mode the same format runs with
 //! degenerate concurrency: the pager write lock serializes writers.
 
-use crate::alloc::DynAllocator;
+#[cfg(not(nightly))]
+use crate::alloc::TursoVecInExt;
+use crate::alloc::{DynAllocator, DynVec, TursoFromIterator};
 use crate::sync::{Arc, Weak};
 use crate::types::IOResultOr;
 use crate::{
@@ -64,7 +66,7 @@ mod directory;
 mod format;
 mod rows;
 
-use directory::{BuildDirectory, SnapshotDirectory};
+use directory::{BuildDirectory, FileBytes, SnapshotDirectory};
 use format::{
     alive_bitset_bytes, document_tombstone_path, parse_document_identity, parse_segment_id,
     segment_chunk_path, segment_chunk_prefix, segment_registry_path, synthesize_meta_json,
@@ -1285,7 +1287,7 @@ impl FtsCursor {
             .read_cache_misses
             .fetch_add(1, Ordering::Relaxed);
 
-        let mut files: HashMap<PathBuf, Arc<[u8]>> = HashMap::default();
+        let mut files: HashMap<PathBuf, FileBytes> = HashMap::default();
         for segment in &self.segments {
             for (name, data) in &segment.data.files {
                 files.insert(PathBuf::from(name), Arc::clone(data));
@@ -1294,12 +1296,15 @@ impl FtsCursor {
                 // Serve the tombstone set as the segment's `.del` file so
                 // the alive filter is enforced at the SegmentReader level
                 // and every query path honors it.
+                let deleted = with_tantivy_footer(alive_bitset_bytes(
+                    segment.descriptor.max_doc,
+                    &segment.deleted,
+                ))?;
+                let mut bytes = DynVec::new_in(self.allocator.clone());
+                bytes.try_extend(deleted)?;
                 files.insert(
                     PathBuf::from(tombstone_del_file_name(&segment.id())),
-                    Arc::from(with_tantivy_footer(alive_bitset_bytes(
-                        segment.descriptor.max_doc,
-                        &segment.deleted,
-                    ))?),
+                    Arc::new(bytes),
                 );
             }
         }
@@ -1720,7 +1725,11 @@ impl FtsCursor {
                     }
                     if segment_done {
                         let descriptor = &self.scan_descriptors[descriptor_idx];
-                        let files = assemble_segment_files(descriptor, std::mem::take(chunks))?;
+                        let files = assemble_segment_files(
+                            descriptor,
+                            std::mem::take(chunks),
+                            &self.allocator,
+                        )?;
                         let data = Arc::new(segment_data_from_files(
                             &self.shared,
                             &self.schema,
@@ -2440,7 +2449,7 @@ fn segment_data_from_files(
     schema: &Schema,
     segment_id: SegmentId,
     max_doc: u32,
-    files: HashMap<String, Arc<[u8]>>,
+    files: HashMap<String, FileBytes>,
 ) -> Result<SegmentData> {
     let by_path = files
         .iter()
@@ -2465,7 +2474,7 @@ fn read_segment_identities(
     schema: &Schema,
     segment_id: SegmentId,
     max_doc: u32,
-    files: HashMap<PathBuf, Arc<[u8]>>,
+    files: HashMap<PathBuf, FileBytes>,
 ) -> Result<SegmentIdentities> {
     let spec = SegmentMetaSpec::new(segment_id, max_doc, 0);
     let meta_json = synthesize_meta_json(scratch, schema, &[spec])?;
@@ -2512,8 +2521,9 @@ fn read_segment_identities(
 fn assemble_segment_files(
     descriptor: &SegmentDescriptor,
     mut chunks: HashMap<u32, HashMap<i64, Vec<u8>>>,
-) -> Result<HashMap<String, Arc<[u8]>>> {
-    let mut files: HashMap<String, Arc<[u8]>> = HashMap::default();
+    allocator: &DynAllocator,
+) -> Result<HashMap<String, FileBytes>> {
+    let mut files: HashMap<String, FileBytes> = HashMap::default();
     for (file_ord, entry) in descriptor.files.iter().enumerate() {
         let file_ord = file_ord as u32;
         let chunk_map = chunks.remove(&file_ord).ok_or_else(|| {
@@ -2531,7 +2541,7 @@ fn assemble_segment_files(
                 entry.num_chunks
             )));
         }
-        let assembled = assemble_chunks(std::path::Path::new(&entry.name), chunk_map)?;
+        let assembled = assemble_chunks(std::path::Path::new(&entry.name), chunk_map, allocator)?;
         if assembled.len() as u64 != entry.size {
             return Err(LimboError::Corrupt(format!(
                 "FTS segment file {} has {} bytes but the descriptor records {}",
@@ -2552,12 +2562,12 @@ fn assemble_segment_files(
 }
 
 /// Concatenate one file's chunk rows (`chunk_no` → bytes) into whole bytes.
-///
-/// The chunks are written straight into the shared allocation: building a
-/// `Vec` first and converting it with `Arc::from` would copy every byte a
-/// second time and hold both copies at once. Each chunk is dropped as soon
-/// as it has been copied, so peak memory is the file plus one chunk.
-fn assemble_chunks(path: &std::path::Path, mut chunks: HashMap<i64, Vec<u8>>) -> Result<Arc<[u8]>> {
+#[turso_macros::allocation_site(crate::alloc::FtsAllocationSite::AssembleBuffer)]
+fn assemble_chunks(
+    path: &std::path::Path,
+    mut chunks: HashMap<i64, Vec<u8>>,
+    allocator: &DynAllocator,
+) -> Result<FileBytes> {
     let max_chunk =
         chunks.keys().max().copied().ok_or_else(|| {
             LimboError::Corrupt(format!("FTS file {} has no chunks", path.display()))
@@ -2568,10 +2578,12 @@ fn assemble_chunks(path: &std::path::Path, mut chunks: HashMap<i64, Vec<u8>>) ->
             path.display()
         )));
     }
-    let total: usize = chunks.values().map(Vec::len).sum();
-    let mut assembled = Arc::<[u8]>::new_uninit_slice(total);
-    let buffer = Arc::get_mut(&mut assembled).expect("a freshly allocated Arc is unique");
-    let mut offset = 0;
+    let total = chunks.values().try_fold(0usize, |total, chunk| {
+        total
+            .checked_add(chunk.len())
+            .ok_or(LimboError::OutOfMemory)
+    })?;
+    let mut assembled = DynVec::try_with_capacity_in(total, allocator.clone())?;
     for chunk_no in 0..=max_chunk {
         let data = chunks.remove(&chunk_no).ok_or_else(|| {
             LimboError::Corrupt(format!(
@@ -2580,10 +2592,7 @@ fn assemble_chunks(path: &std::path::Path, mut chunks: HashMap<i64, Vec<u8>>) ->
                 chunk_no
             ))
         })?;
-        for (slot, byte) in buffer[offset..offset + data.len()].iter_mut().zip(&data) {
-            slot.write(*byte);
-        }
-        offset += data.len();
+        assembled.try_extend(data)?;
     }
     if !chunks.is_empty() {
         // Keys outside `0..=max_chunk` (a negative chunk number next to
@@ -2595,14 +2604,10 @@ fn assemble_chunks(path: &std::path::Path, mut chunks: HashMap<i64, Vec<u8>>) ->
         )));
     }
     turso_assert!(
-        offset == total,
+        assembled.len() == total,
         "FTS chunk assembly must write exactly the bytes it counted"
     );
-    // SAFETY: `total` is the sum of every chunk's length and every chunk was
-    // consumed by the loop above exactly once, writing `total` bytes
-    // contiguously from offset 0 (asserted), so every byte of the slice is
-    // initialized.
-    Ok(unsafe { assembled.assume_init() })
+    Ok(Arc::new(assembled))
 }
 
 /// Turn a built segment's captured files into a `LoadedSegment` plus its
@@ -2611,10 +2616,10 @@ fn assemble_chunks(path: &std::path::Path, mut chunks: HashMap<i64, Vec<u8>>) ->
 /// names every component `<segment uuid>.<ext>`; the bytes never carry the
 /// id, so a rename is all a merged segment needs to take a minted id.
 fn rename_segment_files(
-    files: HashMap<PathBuf, Arc<[u8]>>,
+    files: HashMap<PathBuf, FileBytes>,
     from: &SegmentId,
     to: &SegmentId,
-) -> Result<HashMap<PathBuf, Arc<[u8]>>> {
+) -> Result<HashMap<PathBuf, FileBytes>> {
     let from = from.uuid_string();
     let to = to.uuid_string();
     files
@@ -2637,7 +2642,7 @@ fn rename_segment_files(
 fn segment_rows_from_files(
     segment_id: SegmentId,
     max_doc: u32,
-    captured: HashMap<PathBuf, Arc<[u8]>>,
+    captured: HashMap<PathBuf, FileBytes>,
     identities: SegmentIdentities,
 ) -> Result<(Option<LoadedSegment>, Vec<PendingRow>)> {
     let mut file_names: Vec<String> = captured
@@ -2648,7 +2653,7 @@ fn segment_rows_from_files(
     file_names.sort();
     let mut inserts = Vec::new();
     let mut entries = Vec::new();
-    let mut data_files: HashMap<String, Arc<[u8]>> = HashMap::default();
+    let mut data_files: HashMap<String, FileBytes> = HashMap::default();
     for (file_ord, name) in file_names.into_iter().enumerate() {
         let bytes = captured
             .get(std::path::Path::new(&name))
