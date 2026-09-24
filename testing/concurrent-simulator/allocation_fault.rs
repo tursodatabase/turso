@@ -204,6 +204,7 @@ fn allocation_site_id(site: AllocationSite) -> u64 {
         AllocationSite::Fts(site) => match site {
             FtsAllocationSite::CaptureBuffer => 37,
             FtsAllocationSite::AtomicMetadata => 38,
+            FtsAllocationSite::AssembleBuffer => 39,
         },
         AllocationSite::BTree(site) => match site {
             BTreeAllocationSite::CellPayload => 29,
@@ -396,6 +397,7 @@ mod tests {
         for (site, id) in [
             (FtsAllocationSite::CaptureBuffer, 37),
             (FtsAllocationSite::AtomicMetadata, 38),
+            (FtsAllocationSite::AssembleBuffer, 39),
         ] {
             assert_eq!(allocation_site_id(site.into()), id);
             let _site = turso_core::alloc::enter_allocation_site(site);
@@ -404,7 +406,7 @@ mod tests {
                 turso_core::alloc::enter_allocation_site(AllocationSite::NoFaultInjection);
             assert!(!INJECTOR.should_fail(layout));
         }
-        assert_eq!(INJECTOR.injected_faults(), 2);
+        assert_eq!(INJECTOR.injected_faults(), 3);
     }
 
     #[test]
