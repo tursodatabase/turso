@@ -2129,6 +2129,7 @@ pub fn translate_expr(
                         )
                     }
                 }
+                #[cfg(all(feature = "fts", not(target_family = "wasm")))]
                 Func::Fts(FtsFunc::Match) => {
                     crate::bail_parse_error!("{} requires an FTS index query", name.as_str())
                 }
