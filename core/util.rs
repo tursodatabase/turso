@@ -667,6 +667,13 @@ pub fn count_fts_column_args(expr: &Expr) -> usize {
 
 pub const FTS_FIELD_PARAMETER: i32 = i32::MAX;
 
+/// Match FTS function calls where column arguments can appear in any order.
+///
+/// FTS functions like `fts_match(col1, col2, 'query')` should match
+/// `fts_match(col2, col1, 'query')` as long as the same columns are used.
+///
+/// Semi-specific for FTS but cannot gate behind feature = "fts" so it must
+/// live in util.rs :/
 pub fn try_capture_parameters_column_agnostic(
     pattern: &Expr,         // pattern expression from index definition
     query: &Expr,           // the actual query expression
