@@ -3251,6 +3251,8 @@ impl IndexMethodCursor for FtsCursor {
 
     /// Returns the column value for the current result (score or match indicator).
     fn query_column(&mut self, idx: usize) -> IOResultOr<Value> {
+        // Column 0 is the score for score queries, or 1 (true) for match queries.
+        // Column 1 is the score for match queries.
         if idx != 0
             && !(idx == 1
                 && matches!(
