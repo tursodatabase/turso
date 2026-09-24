@@ -648,7 +648,7 @@ impl Fuzzer {
             }
         }
 
-        self.run_integrity_check(stats, executed_sql)?;
+        self.check_final_state(&matviews, stats, executed_sql)?;
 
         *coverage_out = generator.take_coverage();
 
@@ -1110,6 +1110,22 @@ impl Fuzzer {
             bail!("DROP VIEW failed: {sql}\n  Turso:  {turso:?}\n  SQLite: {sqlite:?}");
         }
         Ok(())
+    }
+
+    /// Compare the materialized views and check both databases for corruption.
+    /// A view mismatch does not skip the corruption check.
+    fn check_final_state(
+        &self,
+        matviews: &Matviews,
+        stats: &mut SimStats,
+        executed_sql: &mut Vec<String>,
+    ) -> Result<()> {
+        let views = self.verify_matviews(matviews, stats, executed_sql);
+        let integrity = self.run_integrity_check(stats, executed_sql);
+        match (views, integrity) {
+            (Err(views), Err(integrity)) => bail!("{views:#}\n{integrity:#}"),
+            (views, integrity) => views.and(integrity),
+        }
     }
 
     /// Run `PRAGMA integrity_check` on both databases and fail if either reports corruption.
@@ -1613,6 +1629,101 @@ mod tests {
         );
         assert_eq!(stats.repeats, 1);
         assert_eq!(stats.oracle_failures, 0);
+    }
+
+    fn make_view_v_stale_on_turso(fuzzer: &Fuzzer) {
+        fuzzer
+            .sqlite_conn
+            .execute("INSERT INTO t VALUES (9, 's')", [])
+            .unwrap();
+    }
+
+    #[test]
+    fn views_are_compared_after_a_commit_that_fails_on_both_engines_is_rolled_back() {
+        let fuzzer = matview_fuzzer();
+        let (mut stats, mut executed_sql) = (SimStats::default(), Vec::new());
+        let mut matviews = matview_over_t(&fuzzer, &mut executed_sql);
+        for sql in [
+            "PRAGMA foreign_keys = ON",
+            "CREATE TABLE p(id INTEGER PRIMARY KEY)",
+            "CREATE TABLE c(x INTEGER REFERENCES p(id) DEFERRABLE INITIALLY DEFERRED)",
+        ] {
+            fuzzer.execute_on_both(sql, &mut executed_sql);
+        }
+        let mut schema = fuzzer.introspect_and_verify_schemas().unwrap();
+        make_view_v_stale_on_turso(&fuzzer);
+        let batch = [GeneratedStatement {
+            mutates_data: false,
+            ..write("INSERT INTO c VALUES (5)")
+        }];
+
+        let err = fuzzer
+            .run_batch(
+                0,
+                &batch,
+                &mut schema,
+                &mut matviews,
+                &mut stats,
+                &mut executed_sql,
+            )
+            .unwrap_err();
+
+        assert!(
+            err.to_string().starts_with("Matview data mismatch in 'v'"),
+            "{err}"
+        );
+        assert!(
+            executed_sql
+                .iter()
+                .any(|s| s.starts_with("-- COMMIT failed on both"))
+        );
+        assert!(executed_sql.iter().any(|s| s == "ROLLBACK"));
+        assert!(fuzzer.sqlite_conn.is_autocommit());
+        assert!(fuzzer.turso_conn().get_auto_commit());
+    }
+
+    #[test]
+    fn views_are_compared_at_the_end_of_the_run() {
+        let fuzzer = matview_fuzzer();
+        let (mut stats, mut executed_sql) = (SimStats::default(), Vec::new());
+        let matviews = matview_over_t(&fuzzer, &mut executed_sql);
+        make_view_v_stale_on_turso(&fuzzer);
+
+        let err = fuzzer
+            .check_final_state(&matviews, &mut stats, &mut executed_sql)
+            .unwrap_err();
+
+        assert!(
+            err.to_string().starts_with("Matview data mismatch in 'v'"),
+            "{err}"
+        );
+        assert_eq!(stats.oracle_failures, 1);
+    }
+
+    #[test]
+    fn the_integrity_check_runs_after_a_view_mismatch_at_the_end_of_the_run() {
+        let fuzzer = matview_fuzzer();
+        let (mut stats, mut executed_sql) = (SimStats::default(), Vec::new());
+        let matviews = matview_over_t(&fuzzer, &mut executed_sql);
+        make_view_v_stale_on_turso(&fuzzer);
+        fuzzer
+            .sqlite_conn
+            .execute_batch(
+                "CREATE TABLE c(x INTEGER CHECK (x > 0));
+                 PRAGMA ignore_check_constraints = ON;
+                 INSERT INTO c VALUES (0);
+                 PRAGMA ignore_check_constraints = OFF;",
+            )
+            .unwrap();
+
+        let err = fuzzer
+            .check_final_state(&matviews, &mut stats, &mut executed_sql)
+            .unwrap_err()
+            .to_string();
+
+        assert!(err.starts_with("Matview data mismatch in 'v'"), "{err}");
+        assert!(err.contains("SQLite integrity check failed"), "{err}");
+        assert_eq!(stats.oracle_failures, 2);
     }
 
     #[test]
