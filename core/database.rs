@@ -449,6 +449,38 @@ impl Default for HeaderValidationState {
     }
 }
 
+/// How `Database::_connect` loads the connection's ANALYZE stats.
+///
+/// A new connection starts from a clone of the shared schema, which carries
+/// no `sqlite_stat1` contents until some connection has loaded them, and the
+/// planner uses those stats for its cost estimates. `_connect` therefore
+/// refreshes them. The refresh is a `SELECT` over `sqlite_stat1`, and that
+/// statement can have to wait: on page I/O, or on another transaction when
+/// it speculatively reads a version whose writer is still preparing. Two
+/// states exist because there are two kinds of caller for that wait:
+///
+/// - `Blocking`: the caller may block, so `_connect` runs the scan to
+///   completion right here by pumping `io.step()`. This is the public
+///   `connect` family for embedded users, where whatever the scan waits for
+///   can make progress on its own, and the internal open-time and MVCC
+///   bootstrap connections, for which the refresh is a no-op because the
+///   database is not initialized yet.
+/// - `Deferred`: the caller must not block, so `_connect` returns the bare
+///   connection and the caller drives the same scan through
+///   `refresh_analyze_stats_nonblock`, handing every wait to its own
+///   scheduler. This is `connect_async`, used by hosts such as turso-server
+///   that run every connection cooperatively on one thread: there an explicit
+///   yield from the scan is a request to run *other* connections, which
+///   `io.step()` can never satisfy, so `Blocking` would spin forever.
+///
+/// Stats loading is never skipped outright; `Deferred` only moves it to the
+/// caller.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum StatsRefresh {
+    Blocking,
+    Deferred,
+}
+
 /// Resumable state for [`Database::connect_async`]. Create one per
 /// connect and pass it to every call until `IOResult::Done`.
 #[derive(Default)]
@@ -1526,7 +1558,7 @@ impl Database {
                         Some(pager.clone()),
                         state.encryption_key.clone(),
                         page_codec.clone(),
-                        true,
+                        StatsRefresh::Blocking,
                     )?;
 
                     // Acquire schema lock and hold it through ReadingHeader and LoadingSchema phases
@@ -1668,7 +1700,7 @@ impl Database {
                                 Some(pager.clone()),
                                 state.encryption_key.clone(),
                                 page_codec.clone(),
-                                true,
+                                StatsRefresh::Blocking,
                             )?);
                         }
                         let conn = state.mvcc_bootstrap_conn.as_ref().expect("created above");
@@ -2331,7 +2363,8 @@ impl Database {
                 self.experimental_mvcc_passive_checkpoint_enabled(),
             )?;
             self.mv_store.store(Some(mv_store.clone()));
-            let mvcc_bootstrap_conn = self._connect(true, None, None, None, true)?;
+            let mvcc_bootstrap_conn =
+                self._connect(true, None, None, None, StatsRefresh::Blocking)?;
             match mv_store.bootstrap(mvcc_bootstrap_conn.clone()) {
                 Ok(()) => {}
                 Err(LimboError::SchemaUpdated) => {
@@ -2348,7 +2381,7 @@ impl Database {
 
     #[instrument(skip_all, level = Level::DEBUG)]
     pub fn connect(self: &Arc<Database>) -> Result<Arc<Connection>> {
-        self._connect(false, None, None, None, true)
+        self._connect(false, None, None, None, StatsRefresh::Blocking)
     }
 
     /// Connect with an encryption key.
@@ -2358,7 +2391,7 @@ impl Database {
         self: &Arc<Database>,
         encryption_key: Option<EncryptionKey>,
     ) -> Result<Arc<Connection>> {
-        self._connect(false, None, encryption_key, None, true)
+        self._connect(false, None, encryption_key, None, StatsRefresh::Blocking)
     }
 
     /// Connect with an external page codec.
@@ -2370,7 +2403,7 @@ impl Database {
         self: &Arc<Database>,
         page_codec: Arc<dyn PageCodec>,
     ) -> Result<Arc<Connection>> {
-        self._connect(false, None, None, Some(page_codec), true)
+        self._connect(false, None, None, Some(page_codec), StatsRefresh::Blocking)
     }
 
     /// Non-blocking [`Self::connect`].
@@ -2412,7 +2445,8 @@ impl Database {
         let conn = match &state.conn {
             Some(conn) => conn.clone(),
             None => {
-                let conn = self._connect(false, None, encryption_key, None, false)?;
+                let conn =
+                    self._connect(false, None, encryption_key, None, StatsRefresh::Deferred)?;
                 state.conn = Some(conn.clone());
                 conn
             }
@@ -2435,7 +2469,7 @@ impl Database {
         pager: Option<Arc<Pager>>,
         encryption_key: Option<EncryptionKey>,
         page_codec: Option<Arc<dyn PageCodec>>,
-        refresh_stats: bool,
+        stats: StatsRefresh,
     ) -> Result<Arc<Connection>> {
         if self.page_codec_id.is_some() && page_codec.is_none() {
             return Err(LimboError::InvalidArgument(
@@ -2469,7 +2503,7 @@ impl Database {
             encryption_key,
             default_cache_size,
         )?;
-        if refresh_stats {
+        if stats == StatsRefresh::Blocking {
             refresh_analyze_stats(&conn);
         }
         Ok(conn)
