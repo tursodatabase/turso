@@ -1005,6 +1005,9 @@ impl Fuzzer {
                 if !self.config.verbose {
                     tracing::error!("Failing SQL: {}", stmt.sql);
                 }
+                if let Err(e) = self.write_sql_file(executed_sql) {
+                    tracing::warn!("Failed to write test.sql: {e}");
+                }
                 let state_dump = self.dump_failure_state(schema, &stmt.sql);
                 self.shrink_and_write(&state_dump, executed_sql, &stmt.sql);
                 return Err(anyhow::anyhow!("Oracle failure: {reason}"));
