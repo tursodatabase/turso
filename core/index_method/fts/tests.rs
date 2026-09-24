@@ -895,6 +895,52 @@ mod allocation_failures {
     }
 
     #[test]
+    fn snapshot_tombstone_failure_returns_oom() {
+        let allocator = FailingAllocator {
+            #[cfg(feature = "allocation_metric")]
+            expected_site: Some(crate::alloc::FtsAllocationSite::SnapshotTombstone.into()),
+            ..Default::default()
+        };
+        let dyn_allocator = DynAllocator::new(allocator.clone());
+        let deleted = std::collections::BTreeSet::from([0, 64, 129]);
+
+        allocator.fail_after(0);
+        assert!(matches!(
+            alive_bitset_bytes(130, &deleted, &dyn_allocator),
+            Err(LimboError::OutOfMemory)
+        ));
+        let body = alive_bitset_bytes(130, &deleted, &dyn_allocator).unwrap();
+        allocator.fail_after(0);
+        assert!(matches!(
+            with_tantivy_footer(body),
+            Err(LimboError::OutOfMemory)
+        ));
+        let body = alive_bitset_bytes(130, &deleted, &dyn_allocator).unwrap();
+        let body_len = body.len();
+        let crc = crc32fast::hash(&body);
+        let bytes = with_tantivy_footer(body).unwrap();
+        let expected_body = [
+            130u32.to_le_bytes().as_slice(),
+            (u64::MAX - 1).to_le_bytes().as_slice(),
+            (u64::MAX - 1).to_le_bytes().as_slice(),
+            1u64.to_le_bytes().as_slice(),
+        ]
+        .concat();
+        assert_eq!(&bytes[..body_len], expected_body);
+        assert_eq!(&bytes[bytes.len() - 4..], &1337u32.to_le_bytes());
+        let footer_len =
+            u32::from_le_bytes(bytes[bytes.len() - 8..bytes.len() - 4].try_into().unwrap())
+                as usize;
+        let footer: serde_json::Value =
+            serde_json::from_slice(&bytes[body_len..body_len + footer_len]).unwrap();
+        assert_eq!(footer["crc"], crc);
+        assert_eq!(
+            footer["version"],
+            serde_json::to_value(tantivy::version()).unwrap()
+        );
+    }
+
+    #[test]
     fn failed_fts_allocations_roll_back_statements_and_allow_retry() {
         for merge in [false, true] {
             for mvcc in [false, true] {

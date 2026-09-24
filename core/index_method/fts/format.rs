@@ -477,11 +477,17 @@ impl SegmentMetaSpec {
 
 /// Serialize an alive bitset in Tantivy's `.del` format:
 /// `[u32 max_value LE][ceil(max_value/64) x u64 words LE]`, bit set = alive.
-pub(super) fn alive_bitset_bytes(max_doc: u32, deleted: &BTreeSet<u32>) -> Vec<u8> {
+#[turso_macros::allocation_site(crate::alloc::FtsAllocationSite::SnapshotTombstone)]
+pub(super) fn alive_bitset_bytes(
+    max_doc: u32,
+    deleted: &BTreeSet<u32>,
+    allocator: &DynAllocator,
+) -> Result<DynVec<u8>> {
     let words = (max_doc as usize).div_ceil(64);
-    let mut bytes = Vec::with_capacity(4 + words * 8);
-    bytes.extend_from_slice(&max_doc.to_le_bytes());
-    let mut word_buf = vec![u64::MAX; words];
+    let mut bytes = DynVec::try_with_capacity_in(4 + words * 8, allocator.clone())?;
+    bytes.try_extend(max_doc.to_le_bytes())?;
+    let mut word_buf = DynVec::try_with_capacity_in(words, allocator.clone())?;
+    word_buf.try_extend(std::iter::repeat_n(u64::MAX, words))?;
     // Clear bits at or beyond max_doc in the last word so num_alive_docs is
     // exact; every earlier word is fully below max_doc.
     let tail_bits = max_doc % 64;
@@ -496,9 +502,9 @@ pub(super) fn alive_bitset_bytes(max_doc: u32, deleted: &BTreeSet<u32>) -> Vec<u
         }
     }
     for word in word_buf {
-        bytes.extend_from_slice(&word.to_le_bytes());
+        bytes.try_extend(word.to_le_bytes())?;
     }
-    bytes
+    Ok(bytes)
 }
 
 #[cfg(test)]
@@ -506,9 +512,10 @@ pub(super) fn alive_bitset(
     max_doc: u32,
     deleted: &BTreeSet<u32>,
 ) -> tantivy::fastfield::AliveBitSet {
-    tantivy::fastfield::AliveBitSet::open(tantivy::directory::OwnedBytes::new(alive_bitset_bytes(
-        max_doc, deleted,
-    )))
+    let bytes = alive_bitset_bytes(max_doc, deleted, &DynAllocator::default()).unwrap();
+    tantivy::fastfield::AliveBitSet::open(tantivy::directory::OwnedBytes::new(
+        bytes.into_iter().collect::<Vec<_>>(),
+    ))
 }
 
 /// Build the `meta.json` bytes for a snapshot's visible segment set.
@@ -550,7 +557,7 @@ pub(super) fn synthesize_meta_json(
         opstamp: 0,
         payload: None,
     };
-    let mut bytes = MetadataWriter(DynVec::new_in(allocator.clone()));
+    let mut bytes = FallibleBytesWriter(DynVec::new_in(allocator.clone()));
     serde_json::to_writer(&mut bytes, &meta).map_err(|error| {
         if error.io_error_kind() == Some(std::io::ErrorKind::OutOfMemory) {
             LimboError::OutOfMemory
@@ -561,9 +568,9 @@ pub(super) fn synthesize_meta_json(
     Ok(bytes.0)
 }
 
-struct MetadataWriter(DynVec<u8>);
+struct FallibleBytesWriter(DynVec<u8>);
 
-impl Write for MetadataWriter {
+impl Write for FallibleBytesWriter {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
         self.0
             .try_extend(buf.iter().copied())
@@ -595,17 +602,24 @@ pub(super) fn tombstone_del_file_name(segment_id: &SegmentId) -> String {
 /// bytes derived from tombstone rows) need it added.
 const FOOTER_MAGIC_NUMBER: u32 = 1337;
 
-pub(super) fn with_tantivy_footer(mut body: Vec<u8>) -> Result<Vec<u8>> {
+#[turso_macros::allocation_site(crate::alloc::FtsAllocationSite::SnapshotTombstone)]
+pub(super) fn with_tantivy_footer(body: DynVec<u8>) -> Result<DynVec<u8>> {
     let crc = crc32fast::hash(&body);
     let footer = serde_json::json!({ "version": tantivy::version(), "crc": crc });
-    let payload = serde_json::to_vec(&footer)
-        .map_err(|e| LimboError::InternalError(format!("FTS footer synthesis failed: {e}")))?;
-    let payload_len = u32::try_from(payload.len())
+    let payload_start = body.len();
+    let mut bytes = FallibleBytesWriter(body);
+    serde_json::to_writer(&mut bytes, &footer).map_err(|error| {
+        if error.io_error_kind() == Some(std::io::ErrorKind::OutOfMemory) {
+            LimboError::OutOfMemory
+        } else {
+            LimboError::InternalError(format!("FTS footer synthesis failed: {error}"))
+        }
+    })?;
+    let payload_len = u32::try_from(bytes.0.len() - payload_start)
         .map_err(|_| LimboError::InternalError("FTS footer payload is too long".into()))?;
-    body.extend_from_slice(&payload);
-    body.extend_from_slice(&payload_len.to_le_bytes());
-    body.extend_from_slice(&FOOTER_MAGIC_NUMBER.to_le_bytes());
-    Ok(body)
+    bytes.0.try_extend(payload_len.to_le_bytes())?;
+    bytes.0.try_extend(FOOTER_MAGIC_NUMBER.to_le_bytes())?;
+    Ok(bytes.0)
 }
 
 #[cfg(test)]

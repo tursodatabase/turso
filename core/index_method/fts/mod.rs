@@ -1296,12 +1296,11 @@ impl FtsCursor {
                 // Serve the tombstone set as the segment's `.del` file so
                 // the alive filter is enforced at the SegmentReader level
                 // and every query path honors it.
-                let deleted = with_tantivy_footer(alive_bitset_bytes(
+                let bytes = with_tantivy_footer(alive_bitset_bytes(
                     segment.descriptor.max_doc,
                     &segment.deleted,
-                ))?;
-                let mut bytes = DynVec::new_in(self.allocator.clone());
-                bytes.try_extend(deleted)?;
+                    &self.allocator,
+                )?)?;
                 files.insert(
                     PathBuf::from(tombstone_del_file_name(&segment.id())),
                     Arc::new(bytes),
