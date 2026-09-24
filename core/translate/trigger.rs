@@ -492,19 +492,19 @@ pub fn translate_drop_trigger(
 ) -> Result<()> {
     let database_id = resolver.resolve_existing_trigger_database_id(trigger_name)?;
     let schema_cookie = resolver.with_schema(database_id, |s| s.schema_version);
-    program.begin_write_on_database(database_id, schema_cookie)?;
-    program.begin_write_operation()?;
     let normalized_trigger_name = normalize_ident(trigger_name.name.as_str());
 
-    // Check if trigger exists
     if resolver.with_schema(database_id, |s| {
         s.get_trigger(&normalized_trigger_name).is_none()
     }) {
         if if_exists {
+            program.begin_read_on_database(database_id, schema_cookie)?;
             return Ok(());
         }
         bail_parse_error!("no such trigger: {}", normalized_trigger_name);
     }
+    program.begin_write_on_database(database_id, schema_cookie)?;
+    program.begin_write_operation()?;
 
     let opts = ProgramBuilderOpts::new(1, 30, 1);
     program.extend(&opts);
