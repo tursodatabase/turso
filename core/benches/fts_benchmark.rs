@@ -434,13 +434,13 @@ fn bench_fts_segment_churn_query(criterion: &mut Criterion) {
         let temp_dir = tempfile::tempdir().unwrap();
         let db = setup_fts_churn_db(&temp_dir, commit_count);
         let conn = db.connect().unwrap();
-        let dense_sql = "SELECT fts_score(body, 'common') AS score, id \
+        let dense_sql = "SELECT fts_score(title, body, 'common') AS score, id \
                          FROM docs \
-                         WHERE fts_match(body, 'common') \
+                         WHERE fts_match(title, body, 'common') \
                          ORDER BY score DESC LIMIT 10";
-        let sparse_sql = "SELECT fts_score(body, 'needle') AS score, id \
+        let sparse_sql = "SELECT fts_score(title, body, 'needle') AS score, id \
                           FROM docs \
-                          WHERE fts_match(body, 'needle') \
+                          WHERE fts_match(title, body, 'needle') \
                           ORDER BY score DESC LIMIT 10";
 
         let mut stmt = conn.query(dense_sql).unwrap().unwrap();

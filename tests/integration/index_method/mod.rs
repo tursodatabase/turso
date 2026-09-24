@@ -1506,7 +1506,7 @@ fn test_fts_functions_require_selected_index(tmp_db: TempDatabase) {
         "SELECT fts_score(body, 'fox') FROM docs WHERE fts_match(body, 'quick')",
         "SELECT id FROM docs WHERE fts_match(body, 'quick') OR fts_match(body, 'fox')",
     ] {
-        let error = conn.prepare(sql).err().expect(sql);
+        let error = conn.prepare(sql).expect_err(sql);
         assert!(
             matches!(&error, turso_core::LimboError::ParseError(_)),
             "expected a parse error for {sql}, got {error}"
