@@ -112,27 +112,29 @@ fn noop_lock() -> DirectoryLock {
 #[derive(Clone)]
 pub(super) struct SnapshotDirectory {
     files: Arc<HashMap<PathBuf, FileBytes>>,
-    meta_json: Arc<[u8]>,
-}
-
-enum SnapshotFile<'a> {
-    Meta(&'a Arc<[u8]>),
-    Segment(&'a FileBytes),
+    meta_json: FileBytes,
 }
 
 impl SnapshotDirectory {
-    pub fn new(files: HashMap<PathBuf, FileBytes>, meta_json: Vec<u8>) -> Self {
-        Self {
+    #[turso_macros::allocation_site(crate::alloc::FtsAllocationSite::SnapshotMetadata)]
+    pub fn new(
+        files: HashMap<PathBuf, FileBytes>,
+        meta_json: Vec<u8>,
+        allocator: &DynAllocator,
+    ) -> crate::Result<Self> {
+        let mut bytes = DynVec::new_in(allocator.clone());
+        bytes.try_extend(meta_json)?;
+        Ok(Self {
             files: Arc::new(files),
-            meta_json: Arc::from(meta_json),
-        }
+            meta_json: Arc::new(bytes),
+        })
     }
 
-    fn lookup(&self, path: &Path) -> Option<SnapshotFile<'_>> {
+    fn lookup(&self, path: &Path) -> Option<&FileBytes> {
         if path == Path::new(TANTIVY_META_FILE) {
-            return Some(SnapshotFile::Meta(&self.meta_json));
+            return Some(&self.meta_json);
         }
-        self.files.get(path).map(SnapshotFile::Segment)
+        self.files.get(path)
     }
 }
 
@@ -151,8 +153,7 @@ impl Directory for SnapshotDirectory {
         path: &Path,
     ) -> std::result::Result<Arc<dyn FileHandle>, OpenReadError> {
         let data = match self.lookup(path) {
-            Some(SnapshotFile::Meta(data)) => OwnedBytes::new(Arc::clone(data)),
-            Some(SnapshotFile::Segment(data)) => OwnedBytes::new(FileByteSlice(Arc::clone(data))),
+            Some(data) => OwnedBytes::new(FileByteSlice(Arc::clone(data))),
             None => return Err(OpenReadError::FileDoesNotExist(path.to_path_buf())),
         };
         Ok(Arc::new(InMemoryFileHandle { data }))
@@ -170,8 +171,7 @@ impl Directory for SnapshotDirectory {
             return Err(OpenReadError::FileDoesNotExist(path.to_path_buf()));
         }
         match self.lookup(path) {
-            Some(SnapshotFile::Meta(data)) => Ok(data.to_vec()),
-            Some(SnapshotFile::Segment(data)) => Ok(data.as_slice().to_vec()),
+            Some(data) => Ok(data.as_slice().to_vec()),
             None => Err(OpenReadError::FileDoesNotExist(path.to_path_buf())),
         }
     }

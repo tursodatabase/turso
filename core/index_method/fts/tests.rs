@@ -195,7 +195,8 @@ fn snapshot_directory_reads_shared_file_bytes_without_copying() {
     bytes.try_extend([3, 5, 7, 11, 13]).unwrap();
     let data = Arc::new(bytes);
     let files = HashMap::from_iter([(path.to_path_buf(), Arc::clone(&data))]);
-    let directory = SnapshotDirectory::new(files, b"metadata".to_vec());
+    let directory =
+        SnapshotDirectory::new(files, b"metadata".to_vec(), &DynAllocator::default()).unwrap();
     assert!(directory.exists(path).unwrap());
     assert!(directory.exists(std::path::Path::new("meta.json")).unwrap());
     assert!(!directory
@@ -213,6 +214,18 @@ fn snapshot_directory_reads_shared_file_bytes_without_copying() {
 
     assert_eq!(read.as_slice(), &[5, 7, 11]);
     assert_eq!(read.as_slice().as_ptr(), data[1..].as_ptr());
+    let meta = directory
+        .get_file_handle(std::path::Path::new("meta.json"))
+        .unwrap()
+        .read_bytes(1..5)
+        .unwrap();
+    assert_eq!(meta.as_slice(), b"etad");
+    let other_meta = directory
+        .get_file_handle(std::path::Path::new("meta.json"))
+        .unwrap()
+        .read_bytes(1..5)
+        .unwrap();
+    assert_eq!(meta.as_slice().as_ptr(), other_meta.as_slice().as_ptr());
 }
 
 #[test]
@@ -435,6 +448,7 @@ fn segment_load_reads_the_identities_the_build_wrote() {
         segment.id(),
         segment.descriptor.max_doc,
         files,
+        &DynAllocator::default(),
     )
     .unwrap();
     assert_eq!(read_back, segment.data.identities);
@@ -495,6 +509,7 @@ fn segment_load_rejects_the_old_identity_field() {
         id,
         1,
         directory.captured_files(),
+        &DynAllocator::default(),
     )
     .unwrap_err();
     assert!(matches!(&error, LimboError::Corrupt(_)));
@@ -850,6 +865,30 @@ mod allocation_failures {
                 .unwrap()
                 .as_slice(),
             &[1, 2, 3, 4, 5]
+        );
+    }
+
+    #[test]
+    fn snapshot_metadata_failure_returns_oom() {
+        let allocator = FailingAllocator {
+            #[cfg(feature = "allocation_metric")]
+            expected_site: Some(crate::alloc::FtsAllocationSite::SnapshotMetadata.into()),
+            ..Default::default()
+        };
+        let dyn_allocator = DynAllocator::new(allocator.clone());
+        allocator.fail_after(0);
+        assert!(matches!(
+            SnapshotDirectory::new(HashMap::default(), b"metadata".to_vec(), &dyn_allocator),
+            Err(LimboError::OutOfMemory)
+        ));
+        let directory =
+            SnapshotDirectory::new(HashMap::default(), b"metadata".to_vec(), &dyn_allocator)
+                .unwrap();
+        assert_eq!(
+            directory
+                .atomic_read(std::path::Path::new("meta.json"))
+                .unwrap(),
+            b"metadata"
         );
     }
 

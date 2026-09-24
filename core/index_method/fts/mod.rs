@@ -1312,7 +1312,7 @@ impl FtsCursor {
         let specs: Vec<SegmentMetaSpec> =
             self.segments.iter().map(LoadedSegment::meta_spec).collect();
         let meta_json = synthesize_meta_json(&scratch, &self.schema, &specs)?;
-        let directory = SnapshotDirectory::new(files, meta_json);
+        let directory = SnapshotDirectory::new(files, meta_json, &self.allocator)?;
         let index = Index::open(directory)
             .map_err(|e| LimboError::InternalError(format!("FTS snapshot open: {e}")))?;
         self.register_tokenizers(&index);
@@ -1736,6 +1736,7 @@ impl FtsCursor {
                             descriptor.segment_id,
                             descriptor.max_doc,
                             files,
+                            &self.allocator,
                         )?);
                         self.shared
                             .stats
@@ -2198,6 +2199,7 @@ impl FtsCursor {
                 segment_id,
                 merged_meta.max_doc(),
                 captured.clone(),
+                &self.allocator,
             )?;
             let (segment, rows) =
                 segment_rows_from_files(segment_id, merged_meta.max_doc(), captured, identities)?;
@@ -2450,6 +2452,7 @@ fn segment_data_from_files(
     segment_id: SegmentId,
     max_doc: u32,
     files: HashMap<String, FileBytes>,
+    allocator: &DynAllocator,
 ) -> Result<SegmentData> {
     let by_path = files
         .iter()
@@ -2461,6 +2464,7 @@ fn segment_data_from_files(
         segment_id,
         max_doc,
         by_path,
+        allocator,
     )?;
     Ok(SegmentData::new(files, identities))
 }
@@ -2475,10 +2479,12 @@ fn read_segment_identities(
     segment_id: SegmentId,
     max_doc: u32,
     files: HashMap<PathBuf, FileBytes>,
+    allocator: &DynAllocator,
 ) -> Result<SegmentIdentities> {
     let spec = SegmentMetaSpec::new(segment_id, max_doc, 0);
     let meta_json = synthesize_meta_json(scratch, schema, &[spec])?;
-    let index = Index::open(SnapshotDirectory::new(files, meta_json))
+    let directory = SnapshotDirectory::new(files, meta_json, allocator)?;
+    let index = Index::open(directory)
         .map_err(|e| LimboError::InternalError(format!("FTS segment open: {e}")))?;
     let meta = index
         .searchable_segment_metas()
