@@ -211,6 +211,7 @@ pub const MAX_EXPR_DEPTH: usize = 100;
 /// - debug builds use an order of magnitude more stack per level, so a
 ///   smaller limit also keeps just-at-the-limit queries parseable in tests,
 ///   which run on default-size (2 MiB) spawned threads.
+///
 /// Real-world SQL essentially never nests queries more than a handful of
 /// levels deep.
 pub const MAX_QUERY_DEPTH: usize = 32;
@@ -5568,11 +5569,7 @@ mod tests {
         // with no bound and overflowed the stack (~900 parens on a release
         // build) before any error could be reported.
         for depth in [MAX_QUERY_DEPTH + 1, 1000, 100_000] {
-            let sql = format!(
-                "SELECT * FROM {}t{};",
-                "(".repeat(depth),
-                ")".repeat(depth)
-            );
+            let sql = format!("SELECT * FROM {}t{};", "(".repeat(depth), ")".repeat(depth));
             let mut p = Parser::new(sql.as_bytes());
             let err = p.next_cmd().unwrap_err().to_string();
             assert!(
@@ -5641,11 +5638,7 @@ mod tests {
                 "parenthesized FROM terms",
             ),
             (
-                format!(
-                    "{}SELECT 1{};",
-                    "SELECT * FROM (".repeat(8),
-                    ")".repeat(8)
-                ),
+                format!("{}SELECT 1{};", "SELECT * FROM (".repeat(8), ")".repeat(8)),
                 "nested FROM subqueries",
             ),
             (
