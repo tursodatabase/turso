@@ -468,10 +468,10 @@ impl Default for HeaderValidationState {
 /// - `Deferred`: the caller must not block, so `_connect` returns the bare
 ///   connection and the caller drives the same scan through
 ///   `refresh_analyze_stats_nonblock`, handing every wait to its own
-///   scheduler. This is `connect_async`, used by hosts such as turso-server
-///   that run every connection cooperatively on one thread: there an explicit
-///   yield from the scan is a request to run *other* connections, which
-///   `io.step()` can never satisfy, so `Blocking` would spin forever.
+///   scheduler. This is `connect_async`, for hosts that run every connection
+///   cooperatively on one thread: there an explicit yield from the scan is a
+///   request to run *other* connections, which `io.step()` can never satisfy,
+///   so `Blocking` would spin forever.
 ///
 /// Stats loading is never skipped outright; `Deferred` only moves it to the
 /// caller.
