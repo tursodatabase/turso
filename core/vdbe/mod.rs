@@ -2586,7 +2586,8 @@ impl Program {
         state: &mut ProgramState,
         pager: &Arc<Pager>,
     ) -> Option<ProgramStep> {
-        Some(match self.abort(pager, None, state, true) {
+        let err = state.is_active_write.then_some(LimboError::Interrupt);
+        Some(match self.abort(pager, err.as_ref(), state, true) {
             Ok(()) => ProgramStep::Interrupt,
             Err(err) => ProgramStep::Error(err.into()),
         })
@@ -3475,6 +3476,21 @@ impl Program {
                         );
                     }
                     self.rollback_current_txn(pager);
+                    self.connection.set_changes(0);
+                }
+                // Like SQLite, an interrupted write ends the whole transaction,
+                // also when a statement savepoint could undo just this statement.
+                Some(LimboError::Interrupt) if unfinished_writer => {
+                    if inside_explicit_transaction || must_rollback_tx_if_needed {
+                        if let Err(err) = self.rollback_pending_sequence_outer_tx(state) {
+                            capture_abort_error(
+                                &mut abort_error,
+                                err,
+                                "Failed to rollback saved outer transaction after interrupt",
+                            );
+                        }
+                        self.connection.rollback_manual_txn_cleanup(pager, true);
+                    }
                     self.connection.set_changes(0);
                 }
                 // Foreign key constraint errors: ON CONFLICT does NOT apply to FK violations.
