@@ -305,7 +305,11 @@ pub struct PropTestBackend {
 }
 
 impl PropTestBackend {
-    pub fn new(seed_bytes: [u8; 32], recursive_cte_focus: bool) -> Self {
+    pub fn new(
+        seed_bytes: [u8; 32],
+        recursive_cte_focus: bool,
+        weight_profile: WeightProfile,
+    ) -> Self {
         let test_runner = TestRunner::new_with_rng(
             proptest::test_runner::Config::default(),
             proptest::test_runner::TestRng::from_seed(
@@ -313,7 +317,9 @@ impl PropTestBackend {
                 &seed_bytes,
             ),
         );
-        let mut profile = sql_gen_prop::StatementProfile::default();
+        let w = weight_profile.stmt_weights();
+        tracing::info!("Statement weight profile {weight_profile:?}: {w:?}");
+        let mut profile = prop_statement_profile(&w);
         profile
             .generation
             .expression
@@ -342,6 +348,20 @@ impl PropTestBackend {
             recursive_cte_focus,
         }
     }
+}
+
+/// sql_gen_prop does not generate triggers, so the trigger weights are not mapped.
+fn prop_statement_profile(w: &sql_gen::StmtWeights) -> sql_gen_prop::StatementProfile {
+    sql_gen_prop::StatementProfile::default()
+        .with_select(w.select)
+        .with_insert(w.insert)
+        .with_update(w.update)
+        .with_delete(w.delete)
+        .with_create_table(w.create_table)
+        .with_drop_table(w.drop_table)
+        .with_alter_table(w.alter_table)
+        .with_create_index(w.create_index)
+        .with_drop_index(w.drop_index)
 }
 
 impl SqlGenerator for PropTestBackend {
@@ -489,7 +509,7 @@ mod tests {
                 .allow_order_dependent_aggregates
         );
 
-        let prop = PropTestBackend::new([1; 32], false);
+        let prop = PropTestBackend::new([1; 32], false, WeightProfile::default());
         assert!(
             !prop
                 .profile
@@ -583,5 +603,60 @@ mod tests {
             1.0
         );
         assert_eq!(joins.policy.select_config.join_config.max_joins, 3);
+    }
+
+    #[test]
+    fn prop_profile_takes_each_statement_weight_from_the_same_statement_kind() {
+        let w = sql_gen::StmtWeights {
+            select: 101,
+            insert: 102,
+            update: 103,
+            delete: 104,
+            create_table: 105,
+            drop_table: 106,
+            alter_table: 107,
+            create_index: 108,
+            drop_index: 109,
+            ..sql_gen::StmtWeights::default()
+        };
+        let p = prop_statement_profile(&w);
+        assert_eq!(
+            [
+                p.select.weight,
+                p.insert.weight,
+                p.update.weight,
+                p.delete.weight,
+                p.create_table.weight,
+                p.drop_table_weight,
+                p.alter_table.weight,
+                p.create_index.weight,
+                p.drop_index_weight,
+            ],
+            [101, 102, 103, 104, 105, 106, 107, 108, 109]
+        );
+    }
+
+    #[test]
+    fn prop_backend_takes_its_statement_weights_from_the_weight_profile() {
+        fn weights(p: &sql_gen_prop::StatementProfile) -> [u32; 9] {
+            [
+                p.select.weight,
+                p.insert.weight,
+                p.update.weight,
+                p.delete.weight,
+                p.create_table.weight,
+                p.drop_table_weight,
+                p.alter_table.weight,
+                p.create_index.weight,
+                p.drop_index_weight,
+            ]
+        }
+        let backend = PropTestBackend::new([1; 32], false, WeightProfile::Ddl);
+        let expected = weights(&prop_statement_profile(&WeightProfile::Ddl.stmt_weights()));
+        assert_ne!(
+            expected,
+            weights(&sql_gen_prop::StatementProfile::default())
+        );
+        assert_eq!(weights(&backend.profile), expected);
     }
 }
