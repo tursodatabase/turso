@@ -2061,17 +2061,76 @@ pub fn translate_expr(
                     }
                 },
                 #[cfg(all(feature = "fts", not(target_family = "wasm")))]
-                Func::Fts(_) => {
-                    // FTS functions are handled via index method pattern matching.
-                    // If we reach here, no index matched, so translate as a regular function call.
-                    translate_function(
-                        program,
-                        args,
-                        referenced_tables,
-                        resolver,
-                        target_register,
-                        func_ctx,
-                    )
+                Func::Fts(FtsFunc::Highlight | FtsFunc::Score) => {
+                    let suffix_len = if matches!(func_ctx.func, Func::Fts(FtsFunc::Score)) {
+                        1
+                    } else {
+                        3
+                    };
+                    let indexed_columns = args.len().checked_sub(suffix_len).filter(|&n| n > 0);
+                    let selected_index = indexed_columns.and_then(|n| {
+                        let ast::Expr::Column { table, .. } = args[0].as_ref() else {
+                            return None;
+                        };
+                        referenced_tables
+                            .and_then(|tables| tables.find_joined_table_by_internal_id(*table))
+                            .and_then(|table_ref| match &table_ref.op {
+                                Operation::IndexMethodQuery(query)
+                                    if query.index.index_method.as_ref().is_some_and(|method| {
+                                        method.definition().method_name
+                                            == crate::index_method::fts::FTS_INDEX_METHOD_NAME
+                                    }) && query.arguments.first().is_some_and(|indexed_query| {
+                                        exprs_are_equivalent(indexed_query, args.last().unwrap())
+                                    }) && (suffix_len != 1 || (n == query.index.columns.len()
+                                        && query.index.columns.iter().all(|indexed| {
+                                            args[..n].iter().any(|arg| {
+                                                matches!(arg.as_ref(), ast::Expr::Column { column, .. }
+                                                    if *column == indexed.pos_in_table)
+                                            })
+                                        })))
+                                        && args[..n].iter().all(|arg| {
+                                            matches!(arg.as_ref(), ast::Expr::Column { table, column, .. }
+                                                if *table == table_ref.internal_id && query.index.columns.iter().any(|indexed| indexed.pos_in_table == *column))
+                                    }) =>
+                                {
+                                    Some((*table, query))
+                                }
+                                _ => None,
+                            })
+                    });
+                    let Some((table, query)) = selected_index else {
+                        crate::bail_parse_error!(
+                            "{} requires columns and query from the selected FTS index",
+                            name.as_str()
+                        );
+                    };
+                    if suffix_len == 1 {
+                        let cursor_id = program
+                            .resolve_cursor_id(&CursorKey::index(table, query.index.clone()));
+                        let score_column = if matches!(
+                            query.pattern_idx as i64,
+                            crate::index_method::fts::FTS_PATTERN_MATCH_LIMIT
+                                | crate::index_method::fts::FTS_PATTERN_MATCH
+                        ) {
+                            1
+                        } else {
+                            0
+                        };
+                        program.emit_column_or_rowid(cursor_id, score_column, target_register);
+                        Ok(target_register)
+                    } else {
+                        translate_function(
+                            program,
+                            args,
+                            referenced_tables,
+                            resolver,
+                            target_register,
+                            func_ctx,
+                        )
+                    }
+                }
+                Func::Fts(FtsFunc::Match) => {
+                    crate::bail_parse_error!("{} requires an FTS index query", name.as_str())
                 }
                 Func::AlterTable(_) => unreachable!(),
             }
