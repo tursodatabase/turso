@@ -139,6 +139,9 @@ jobs:
           LOCAL_SYNC_SERVER_DIR: "1"
         run: cargo nextest run -p turso --all-features --locked --no-fail-fast -E 'test(/^sync::/)' --no-tests=fail --failure-output=final
         timeout-minutes: 20
+      - name: Memory leak check (repeated database open/workload/drop)
+        run: cargo nextest run -p core_tester --locked --no-fail-fast -E 'binary(leak_tests)' --failure-output=final
+        timeout-minutes: 10
       - name: Test doctests
         env:
           LOCAL_SYNC_SERVER: "../../target/debug/tursodb"
