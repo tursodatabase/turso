@@ -102,6 +102,12 @@ struct Args {
     /// supported with `--mvcc`. Default: 0.02 with `--matview`.
     #[arg(long)]
     reopen_probability: Option<f64>,
+
+    /// Probability that an INSERT, UPDATE or DELETE that passed the check
+    /// runs again unchanged, followed by the same checks. Default: 0.1 with
+    /// `--matview`, else 0.
+    #[arg(long)]
+    redundant_dml_probability: Option<f64>,
 }
 
 #[derive(Subcommand, Debug)]
@@ -145,6 +151,7 @@ struct ConfigRecord {
     large_batch_probability: Option<f64>,
     max_batch_size: usize,
     reopen_probability: Option<f64>,
+    redundant_dml_probability: Option<f64>,
 }
 
 /// Summary written to the JSON report file.
@@ -170,6 +177,7 @@ impl ConfigRecord {
             large_batch_probability: args.large_batch_probability,
             max_batch_size: args.max_batch_size,
             reopen_probability: args.reopen_probability,
+            redundant_dml_probability: args.redundant_dml_probability,
         }
     }
 }
@@ -330,6 +338,11 @@ fn run_single_inner(args: &Args) -> Result<differential_fuzzer::SimStats> {
         args.reopen_probability,
         reopen_default,
     )?;
+    let redundant_dml_probability = probability(
+        "redundant-dml-probability",
+        args.redundant_dml_probability,
+        0.1,
+    )?;
     let config = SimConfig {
         seed: args.seed,
         num_tables: args.num_tables,
@@ -353,6 +366,7 @@ fn run_single_inner(args: &Args) -> Result<differential_fuzzer::SimStats> {
         large_batch_probability,
         max_batch_size: args.max_batch_size,
         reopen_probability,
+        redundant_dml_probability,
     };
 
     tracing::info!("Starting differential_fuzzer with config: {:?}", config);
