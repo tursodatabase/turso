@@ -97,3 +97,20 @@ test cte-name-is-resolvable-in-a-subquery-when-its-use-is-aliased {
 expect {
     42
 }
+
+@setup schema
+test recursive-cte-alias-does-not-shadow-table-in-subquery {
+    WITH RECURSIVE seq(x) AS (
+        VALUES(1)
+        UNION ALL
+        SELECT u.x + (SELECT sum(a) FROM u)
+        FROM seq AS u
+        WHERE u.x < 5
+    )
+    SELECT x FROM seq ORDER BY x;
+}
+expect {
+    1
+    3
+    5
+}
