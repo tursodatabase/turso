@@ -48,15 +48,7 @@ Use if-statements only when both branches are expected paths.
 
 ## Comments
 
-**Do:**
-- Document WHY, not what
-- Document functions, structs, enums, variants
-- Focus on why something is necessary
-
-**Don't:**
-- Comments that repeat code
-- References to AI conversations ("This test should trigger the bug")
-- Temporal markers ("added", "existing code", "Phase 1")
+- Don't add code comments, except for rust `SAFETY` comments.
 
 ## Avoid Over-Engineering
 
@@ -79,3 +71,17 @@ When code involves index inserts, deletes, or conflict resolution, double-check 
 
 - Delete unused code completely
 - No backwards-compat hacks (renamed `_vars`, re-exports, `// removed` comments)
+
+## Single-use helpers
+
+If a helper function has no meaning outside of a single use case, move it inside the function that uses it:
+
+```rust
+fn do_something() {
+    
+    something_specific();
+
+    fn something_specific() {
+    }
+}
+```
