@@ -77,6 +77,11 @@ struct Args {
     /// default profile is allowed with `--recursive-cte-focus`.
     #[arg(long, default_value = "balanced", value_enum)]
     profile: WeightProfile,
+
+    /// Generate materialized views and compare them with plain SQLite views
+    /// after every write. Requires `--generator sql-gen-prop`.
+    #[arg(long)]
+    matview: bool,
 }
 
 #[derive(Subcommand, Debug)]
@@ -115,6 +120,7 @@ struct ConfigRecord {
     mvcc: bool,
     recursive_cte_focus: bool,
     profile: String,
+    matview: bool,
 }
 
 /// Summary written to the JSON report file.
@@ -135,6 +141,7 @@ impl ConfigRecord {
             mvcc: args.mvcc,
             recursive_cte_focus: args.recursive_cte_focus,
             profile: format!("{:?}", args.profile),
+            matview: args.matview,
         }
     }
 }
@@ -269,6 +276,9 @@ fn run_single_inner(args: &Args) -> Result<differential_fuzzer::SimStats> {
     if args.recursive_cte_focus && args.profile != WeightProfile::default() {
         anyhow::bail!("--recursive-cte-focus replaces the statement weights of --profile");
     }
+    if args.matview && !matches!(args.generator, GeneratorKind::SqlGenProp) {
+        anyhow::bail!("--matview requires --generator sql-gen-prop");
+    }
     let config = SimConfig {
         seed: args.seed,
         num_tables: args.num_tables,
@@ -287,6 +297,7 @@ fn run_single_inner(args: &Args) -> Result<differential_fuzzer::SimStats> {
         window_function_probability: args.window_function_probability.clamp(0.0, 1.0),
         recursive_cte_focus: args.recursive_cte_focus,
         weight_profile: args.profile,
+        matview: args.matview,
     };
 
     tracing::info!("Starting differential_fuzzer with config: {:?}", config);

@@ -15,6 +15,10 @@ use crate::drop_table::{DropTableStatement, drop_table_for_schema, drop_table_fo
 use crate::drop_trigger::{DropTriggerStatement, drop_trigger_for_schema};
 use crate::generator::SqlGeneratorKind;
 use crate::insert::{InsertStatement, insert_for_table};
+use crate::materialized_view::{
+    CreateMaterializedViewStatement, create_materialized_view, drop_materialized_view,
+    materialized_view_sources,
+};
 use crate::profile::StatementProfile;
 use crate::schema::{Schema, TableRef};
 use crate::select::{SelectStatement, select_for_table};
@@ -63,6 +67,10 @@ pub enum SqlStatement {
     CreateView(CreateViewStatement),
     DropView(DropViewStatement),
 
+    // DDL - Materialized views
+    CreateMaterializedView(CreateMaterializedViewStatement),
+    DropMaterializedView(DropViewStatement),
+
     // DDL - Triggers
     CreateTrigger(CreateTriggerStatement),
     DropTrigger(DropTriggerStatement),
@@ -95,6 +103,8 @@ impl fmt::Display for SqlStatement {
             SqlStatement::DropIndex(s) => write!(f, "{s}"),
             SqlStatement::CreateView(s) => write!(f, "{s}"),
             SqlStatement::DropView(s) => write!(f, "{s}"),
+            SqlStatement::CreateMaterializedView(s) => write!(f, "{s}"),
+            SqlStatement::DropMaterializedView(s) => write!(f, "{s}"),
             SqlStatement::CreateTrigger(s) => write!(f, "{s}"),
             SqlStatement::DropTrigger(s) => write!(f, "{s}"),
             SqlStatement::Begin(s) => write!(f, "{s}"),
@@ -135,6 +145,8 @@ impl StatementKind {
                 | StatementKind::DropIndex
                 | StatementKind::CreateView
                 | StatementKind::DropView
+                | StatementKind::CreateMaterializedView
+                | StatementKind::DropMaterializedView
                 | StatementKind::CreateTrigger
                 | StatementKind::DropTrigger
         )
@@ -190,6 +202,10 @@ impl SqlGeneratorKind for StatementKind {
             StatementKind::CreateView => !schema.tables.is_empty(),
             StatementKind::DropView => true, // Can always generate DROP VIEW IF EXISTS
 
+            // DDL - Materialized view operations
+            StatementKind::CreateMaterializedView => !materialized_view_sources(schema).is_empty(),
+            StatementKind::DropMaterializedView => !schema.materialized_views.is_empty(),
+
             // DDL - Trigger operations
             StatementKind::CreateTrigger => !schema.tables.is_empty(),
             StatementKind::DropTrigger => true, // Can always generate DROP TRIGGER IF EXISTS
@@ -226,6 +242,9 @@ impl SqlGeneratorKind for StatementKind {
             // DDL - View operations
             StatementKind::CreateView => false,
             StatementKind::DropView => false,
+
+            // DDL - Materialized view operations
+            StatementKind::CreateMaterializedView | StatementKind::DropMaterializedView => true,
 
             // DDL - Trigger operations
             StatementKind::CreateTrigger => false,
@@ -316,6 +335,14 @@ impl SqlGeneratorKind for StatementKind {
                 .boxed(),
             StatementKind::DropView => drop_view_for_schema(schema)
                 .prop_map(SqlStatement::DropView)
+                .boxed(),
+
+            // DDL - Materialized views
+            StatementKind::CreateMaterializedView => create_materialized_view(schema)
+                .prop_map(SqlStatement::CreateMaterializedView)
+                .boxed(),
+            StatementKind::DropMaterializedView => drop_materialized_view(schema)
+                .prop_map(SqlStatement::DropMaterializedView)
                 .boxed(),
 
             // DDL - Triggers
