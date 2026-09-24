@@ -171,7 +171,7 @@ impl Directory for SnapshotDirectory {
             return Err(OpenReadError::FileDoesNotExist(path.to_path_buf()));
         }
         match self.lookup(path) {
-            Some(data) => Ok(data.as_slice().to_vec()),
+            Some(data) => copy_for_atomic_read(data.as_slice(), path),
             None => Err(OpenReadError::FileDoesNotExist(path.to_path_buf())),
         }
     }
@@ -343,7 +343,7 @@ impl Directory for BuildDirectory {
 
     fn atomic_read(&self, path: &Path) -> std::result::Result<Vec<u8>, OpenReadError> {
         match self.inner.read().atomic.get(path) {
-            Some(data) => Ok(data.to_vec()),
+            Some(data) => copy_for_atomic_read(data, path),
             None => Err(OpenReadError::FileDoesNotExist(path.to_path_buf())),
         }
     }
@@ -393,6 +393,18 @@ impl Directory for BuildDirectory {
     fn watch(&self, _cb: WatchCallback) -> std::result::Result<WatchHandle, tantivy::TantivyError> {
         Ok(WatchHandle::empty())
     }
+}
+
+fn copy_for_atomic_read(data: &[u8], path: &Path) -> std::result::Result<Vec<u8>, OpenReadError> {
+    let mut bytes = Vec::new();
+    bytes.try_reserve_exact(data.len()).map_err(|error| {
+        OpenReadError::wrap_io_error(
+            std::io::Error::new(std::io::ErrorKind::OutOfMemory, error),
+            path.to_path_buf(),
+        )
+    })?;
+    bytes.extend_from_slice(data);
+    Ok(bytes)
 }
 
 #[cfg(test)]
