@@ -269,7 +269,7 @@ impl Text {
         };
         if let Some(is_ascii) = copied_ascii {
             if !is_ascii {
-                validate_utf8(bytes).ok_or_else(|| {
+                simdutf8::basic::from_utf8(bytes).ok().ok_or_else(|| {
                     mark_unlikely();
                     LimboError::Corrupt("TEXT value contains invalid UTF-8".into())
                 })?;
