@@ -251,15 +251,25 @@ pub fn validate_integrity_check_result(
             ) {
                 return Ok(());
             }
-            bail!("step {step}, fiber {fiber_id}: integrity_check failed with error: {error}");
+            let message = format!(
+                "step {step}, fiber {fiber_id}: integrity_check failed with error: {error}"
+            );
+            if matches!(error, LimboError::Corrupt(_)) {
+                return Err(IntegrityCheckFoundCorruption(message).into());
+            }
+            bail!(message);
         }
         Ok(rows) => {
             if rows.len() != 1 {
-                bail!(
+                let message = format!(
                     "step {step}, fiber {fiber_id}: integrity_check returned {} rows, expected 1: {:?}",
                     rows.len(),
                     rows
                 );
+                if rows.len() > 1 {
+                    return Err(IntegrityCheckFoundCorruption(message).into());
+                }
+                bail!(message);
             }
             let row = &rows[0];
             if row.len() != 1 {
@@ -272,6 +282,10 @@ pub fn validate_integrity_check_result(
                 Value::Text(text) if text.as_str() == "ok" => Ok(()),
                 // "Page N: never used" is informational in MVCC mode, not corruption
                 Value::Text(text) if is_integrity_check_informational(text.as_str()) => Ok(()),
+                other @ Value::Text(_) => Err(IntegrityCheckFoundCorruption(format!(
+                    "step {step}, fiber {fiber_id}: integrity_check returned {other:?}, expected \"ok\""
+                ))
+                .into()),
                 other => {
                     bail!(
                         "step {step}, fiber {fiber_id}: integrity_check returned {:?}, expected \"ok\"",
@@ -282,6 +296,18 @@ pub fn validate_integrity_check_result(
         }
     }
 }
+
+/// `PRAGMA integrity_check` reported damage in the database.
+#[derive(Debug)]
+pub struct IntegrityCheckFoundCorruption(pub String);
+
+impl std::fmt::Display for IntegrityCheckFoundCorruption {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for IntegrityCheckFoundCorruption {}
 
 /// Property that validates integrity check results.
 /// Integrity check must either return a busy error or a single row with "ok".
