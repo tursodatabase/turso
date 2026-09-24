@@ -221,16 +221,11 @@ unsafe fn copy_nonoverlapping_inline(src: *const u8, dst: *mut u8, len: usize) {
     }
 }
 
-/// Copies `src` to `dst` and returns every copied byte OR-ed together, so
-/// one pass both moves the value and tells whether it is pure ASCII.
-///
-/// Each length uses two loads and two stores that overlap in the middle, or
-/// for one to three bytes the offsets 0, `len / 2` and `len - 1`.
+/// Copies `src` to `dst` and returns every copied byte OR-ed together.
 ///
 /// # Safety
 ///
-/// `src` and `dst` must be valid for `len` bytes, must not overlap, and
-/// `len` must be less than 16.
+/// `src` and `dst` must be valid for `len` bytes, must not overlap, and `len` must be less than 16.
 #[inline(always)]
 unsafe fn copy_short_and_fold(src: *const u8, dst: *mut u8, len: usize) -> u64 {
     unsafe {
@@ -261,20 +256,14 @@ unsafe fn copy_short_and_fold(src: *const u8, dst: *mut u8, len: usize) -> u64 {
 }
 
 impl Text {
-    /// Replaces the contents with `bytes` read from a record payload.
-    ///
-    /// A short value goes straight into the buffer the register already owns,
-    /// and the words the copy loads also tell whether the value is pure
-    /// ASCII. Reading the value once this way replaces a UTF-8 check that
-    /// reads it and a copy that reads it again.
     #[inline(always)]
-    pub(crate) fn copy_from_record_bytes(&mut self, bytes: &[u8]) -> Result<()> {
-        /// Up to this length two overlapping machine words cover the value.
+    pub(crate) fn replace_with_bytes(&mut self, bytes: &[u8]) -> Result<()> {
+        /// Up to this length, two overlapping machine words cover the value.
         const SHORT_LIMIT: usize = 16;
         const HIGH_BITS: u64 = 0x8080_8080_8080_8080;
         let len = bytes.len();
         let copied_ascii = if len < SHORT_LIMIT {
-            self.fill_from_ascii_bytes(bytes, HIGH_BITS)
+            fill_short(self, bytes, HIGH_BITS)
         } else {
             None
         };
@@ -288,37 +277,45 @@ impl Text {
             let Cow::Owned(string) = &mut self.value else {
                 unreachable!("record bytes were copied into an owned string")
             };
-            // SAFETY: the copy wrote `len` bytes. They are ASCII or validation
-            // confirmed that the same source bytes are valid UTF-8.
+            // SAFETY: we now know that the `len` first bytes of the string are valid UTF-8.
             unsafe { string.as_mut_vec().set_len(len) };
             self.subtype = TextSubtype::Text;
-            return Ok(());
+        } else {
+            let text = validate_utf8(bytes).ok_or_else(|| {
+                mark_unlikely();
+                LimboError::Corrupt("TEXT value contains invalid UTF-8".into())
+            })?;
+            self.do_extend(&text)?;
         }
-        let text = validate_utf8(bytes).ok_or_else(|| {
-            mark_unlikely();
-            LimboError::Corrupt("TEXT value contains invalid UTF-8".into())
-        })?;
-        self.do_extend(&text)
-    }
+        return Ok(());
 
-    #[inline(always)]
-    fn fill_from_ascii_bytes(&mut self, bytes: &[u8], high_bits: u64) -> Option<bool> {
-        let len = bytes.len();
-        let Cow::Owned(string) = &mut self.value else {
-            return None;
-        };
-        if string.capacity() < len {
-            return None;
+        /// Returns `Some(val)` if it succeeds in copying `bytes` into `Self`, where `val` is whether
+        /// the first `len` bytes of `Self.value` are now ASCII.
+        ///
+        /// Note: this fills `self.value` with `bytes`, but since it doesn't guarantee that it's UTF-8,
+        /// it leaves the `self.value.len` at 0.
+        ///
+        /// SAFETY: `bytes.len < 16` must hold.
+        #[inline(always)]
+        fn fill_short(text: &mut Text, bytes: &[u8], high_bits: u64) -> Option<bool> {
+            let len = bytes.len();
+            let Cow::Owned(string) = &mut text.value else {
+                return None;
+            };
+            if string.capacity() < len {
+                return None;
+            }
+            // SAFETY: the String must remain valid UTF-8, and we don't know yet that what we're copying
+            // into it is valid UTF-8. So we set its length to 0 so that whatever happens, a caller
+            // doesn't end up with a String containing invalid UTF-8. Effectively we're only modifying
+            // the unused but allocated part of the String.
+            let folded = unsafe {
+                let buffer = string.as_mut_vec();
+                buffer.set_len(0);
+                copy_short_and_fold(bytes.as_ptr(), buffer.as_mut_ptr(), len)
+            };
+            Some(folded & high_bits == 0)
         }
-        // SAFETY: the length goes to zero before the copy. The capacity test
-        // makes `len` bytes writable, and record bytes do not overlap the
-        // register's owned string.
-        let folded = unsafe {
-            let buffer = string.as_mut_vec();
-            buffer.set_len(0);
-            copy_short_and_fold(bytes.as_ptr(), buffer.as_mut_ptr(), len)
-        };
-        Some(folded & high_bits == 0)
     }
 }
 

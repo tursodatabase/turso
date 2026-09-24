@@ -4075,7 +4075,7 @@ fn decode_serial_type_into_register(
             let text_data = &data[..content_size];
             match dest {
                 Register::Value(Value::Text(existing_text)) => {
-                    existing_text.copy_from_record_bytes(text_data)?;
+                    existing_text.replace_with_bytes(text_data)?;
                 }
                 _ => start_text_register(dest, text_data)?,
             }
