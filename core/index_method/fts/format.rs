@@ -558,17 +558,23 @@ pub(super) fn synthesize_meta_json(
         payload: None,
     };
     let mut bytes = FallibleBytesWriter(DynVec::new_in(allocator.clone()));
-    serde_json::to_writer(&mut bytes, &meta).map_err(|error| {
-        if error.io_error_kind() == Some(std::io::ErrorKind::OutOfMemory) {
-            LimboError::OutOfMemory
-        } else {
-            LimboError::InternalError(format!("FTS meta synthesis failed: {error}"))
-        }
-    })?;
+    bytes.write_json(&meta, "FTS meta synthesis failed")?;
     Ok(bytes.0)
 }
 
 struct FallibleBytesWriter(DynVec<u8>);
+
+impl FallibleBytesWriter {
+    fn write_json(&mut self, value: &impl serde::Serialize, context: &str) -> Result<()> {
+        serde_json::to_writer(&mut *self, value).map_err(|error| {
+            if error.io_error_kind() == Some(std::io::ErrorKind::OutOfMemory) {
+                LimboError::OutOfMemory
+            } else {
+                LimboError::InternalError(format!("{context}: {error}"))
+            }
+        })
+    }
+}
 
 impl Write for FallibleBytesWriter {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
@@ -608,13 +614,7 @@ pub(super) fn with_tantivy_footer(body: DynVec<u8>) -> Result<DynVec<u8>> {
     let footer = serde_json::json!({ "version": tantivy::version(), "crc": crc });
     let payload_start = body.len();
     let mut bytes = FallibleBytesWriter(body);
-    serde_json::to_writer(&mut bytes, &footer).map_err(|error| {
-        if error.io_error_kind() == Some(std::io::ErrorKind::OutOfMemory) {
-            LimboError::OutOfMemory
-        } else {
-            LimboError::InternalError(format!("FTS footer synthesis failed: {error}"))
-        }
-    })?;
+    bytes.write_json(&footer, "FTS footer synthesis failed")?;
     let payload_len = u32::try_from(bytes.0.len() - payload_start)
         .map_err(|_| LimboError::InternalError("FTS footer payload is too long".into()))?;
     bytes.0.try_extend(payload_len.to_le_bytes())?;
