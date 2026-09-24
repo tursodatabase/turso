@@ -1308,6 +1308,7 @@ pub fn try_hash_join_access_method(
     hash_can_replace_build_index: bool,
     subqueries: &[NonFromClauseSubquery],
     params: &CostModelParams,
+    using_results_are_explicit: bool,
 ) -> Result<Option<AccessMethod>> {
     let (Table::BTree(build_btree), Table::BTree(probe_btree)) =
         (&build_table.table, &probe_table.table)
@@ -1382,15 +1383,17 @@ pub fn try_hash_join_access_method(
         return Ok(None);
     }
 
-    // Skip hash join on USING/NATURAL joins.
+    // A generated FULL JOIN computes its merged USING values in result columns.
+    // Other USING joins still need the normal output rules.
     if build_table
         .join_info
         .as_ref()
         .is_some_and(|ji| !ji.using.is_empty())
-        || probe_table
-            .join_info
-            .as_ref()
-            .is_some_and(|ji| !ji.using.is_empty())
+        || ((!using_results_are_explicit || !is_full_outer)
+            && probe_table
+                .join_info
+                .as_ref()
+                .is_some_and(|ji| !ji.using.is_empty()))
     {
         return Ok(None);
     }
