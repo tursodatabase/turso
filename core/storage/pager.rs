@@ -3367,6 +3367,8 @@ impl Pager {
     /// commit dirty pages from current transaction in WAL mode if this is not nested statement (for nested statements, parent will do the commit)
     /// if update_transaction_state set to false, then [Connection::transaction_state] left unchanged
     /// if update_transaction_state set to true, then [Connection::transaction_state] reset to [TransactionState::None] in case when method completes without error
+    /// if other_statements_use_transaction set to true, the read transaction is kept for the other statements on the connection,
+    /// [Connection::transaction_state] is set to [TransactionState::Read] and the auto-checkpoint is skipped, like SQLite's btreeEndTransaction
     /// `sync_mode` belongs to this pager's database because attached databases
     /// can use a different synchronous mode from the connection's main database.
     #[instrument(skip_all, level = Level::DEBUG)]
@@ -3375,7 +3377,12 @@ impl Pager {
         connection: &Connection,
         sync_mode: SyncMode,
         update_transaction_state: bool,
+        other_statements_use_transaction: bool,
     ) -> IOResultOr<()> {
+        turso_assert!(
+            update_transaction_state || !other_statements_use_transaction,
+            "keeping the read transaction requires updating the transaction state"
+        );
         if connection.is_nested_stmt() {
             // Parent statement will handle the transaction commit.
             return Ok(IOResult::Done(()));
@@ -3421,8 +3428,12 @@ impl Pager {
                     return Ok(IOResult::Done(()));
                 }
                 _ => {
+                    let mut auto_actions = connection.wal_auto_actions();
+                    if other_statements_use_transaction {
+                        auto_actions.remove(WalAutoActions::Checkpoint);
+                    }
                     return_if_io!(self.commit_wal(
-                        connection.wal_auto_actions(),
+                        auto_actions,
                         sync_mode,
                         connection.get_data_sync_retry(),
                     ));
@@ -3433,13 +3444,20 @@ impl Pager {
                     };
 
                     wal.end_write_tx();
-                    wal.end_read_tx();
 
                     tracing::debug!("commit_tx: schema_did_change={schema_did_change}");
                     if schema_did_change {
                         let schema = connection.schema.read().clone();
                         connection.db.update_schema_if_newer(schema);
                     }
+
+                    if other_statements_use_transaction {
+                        connection.set_tx_state(TransactionState::Read);
+                        self.commit_wal_end();
+                        self.clear_savepoints()?;
+                        return Ok(IOResult::Done(()));
+                    }
+                    wal.end_read_tx();
 
                     if self.commit_info.read().state != CommitState::AutoCheckpoint {
                         complete_commit();

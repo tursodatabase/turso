@@ -533,6 +533,18 @@ impl Statement {
 
     fn release_active_root_if_counted(&mut self) {
         if self.counted_as_active_root {
+            if self.state.counted_as_active_txn_statement {
+                let previous = self
+                    .program
+                    .connection
+                    .n_active_txn_statements
+                    .fetch_sub(1, Ordering::SeqCst);
+                turso_assert!(
+                    previous > 0,
+                    "releasing a transaction statement while none are counted"
+                );
+                self.state.counted_as_active_txn_statement = false;
+            }
             // Blob count drops before the root count so a concurrent
             // checkpoint-guard read never sees fewer non-blob statements
             // than are really active (a stale-high read only causes a
@@ -623,6 +635,16 @@ impl Statement {
                     return Err(err);
                 }
             }
+        }
+        if self.counted_as_active_root
+            && self.program.uses_transaction
+            && !self.state.counted_as_active_txn_statement
+        {
+            self.program
+                .connection
+                .n_active_txn_statements
+                .fetch_add(1, Ordering::SeqCst);
+            self.state.counted_as_active_txn_statement = true;
         }
 
         self.arm_query_timeout_if_needed();

@@ -203,6 +203,14 @@ impl WalSnapshot {
     const fn min_frame(self) -> u64 {
         self.nbackfills + 1
     }
+
+    const fn has_same_page_contents_as(self, other: WalSnapshot) -> bool {
+        self.max_frame == other.max_frame
+            && self.last_checksum.0 == other.last_checksum.0
+            && self.last_checksum.1 == other.last_checksum.1
+            && self.checkpoint_seq == other.checkpoint_seq
+            && self.transaction_count == other.transaction_count
+    }
 }
 
 /// Which read-mark, if any, currently protects this connection's snapshot.
@@ -3416,7 +3424,8 @@ impl WalFile {
 
         // Check if database changed since this connection's last read transaction.
         // If it has, the connection will invalidate its page cache.
-        let db_changed = self.db_changed_against(shared_snapshot, self.connection_state());
+        let db_changed =
+            !shared_snapshot.has_same_page_contents_as(self.connection_state().snapshot);
 
         tracing::debug!("try_begin_read_tx: db_changed={}", db_changed);
 
