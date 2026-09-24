@@ -3599,13 +3599,16 @@ impl BTreeTable {
                 && (column.explicit_notnull() || !self.is_without_rowid_inline_pk(column))
             {
                 sql.push_str(" NOT NULL");
+                push_on_conflict_clause(&mut sql, column.notnull_conflict_clause);
             }
 
             if column.unique() {
                 sql.push_str(" UNIQUE");
+                push_on_conflict_clause(&mut sql, self.inline_unique_conflict_clause(column_name));
             }
             if needs_pk_inline && column.primary_key() {
                 sql.push_str(" PRIMARY KEY");
+                push_on_conflict_clause(&mut sql, self.primary_key_conflict_clause());
                 if self.has_autoincrement && column.is_rowid_alias() {
                     sql.push_str(" AUTOINCREMENT");
                 }
@@ -3666,6 +3669,7 @@ impl BTreeTable {
                 sql.push_str(&quote_ident(&col.0));
             }
             sql.push(')');
+            push_on_conflict_clause(&mut sql, self.primary_key_conflict_clause());
         }
 
         for fk in &self.foreign_keys {
@@ -3750,6 +3754,7 @@ impl BTreeTable {
                 sql.push_str(&quote_ident(&unique_column.name));
             }
             sql.push(')');
+            push_on_conflict_clause(&mut sql, unique_set.conflict_clause);
         }
 
         sql.push(')');
@@ -3767,6 +3772,28 @@ impl BTreeTable {
         }
 
         sql
+    }
+
+    fn inline_unique_conflict_clause(&self, column_name: &str) -> Option<ResolveType> {
+        let is_single_column_set = |unique_set: &&UniqueSet| {
+            unique_set.columns.len() == 1
+                && unique_set.columns[0].name.eq_ignore_ascii_case(column_name)
+        };
+        self.unique_sets
+            .iter()
+            .filter(is_single_column_set)
+            .find(|unique_set| !unique_set.is_primary_key)
+            .or_else(|| self.unique_sets.iter().find(is_single_column_set))
+            .and_then(|unique_set| unique_set.conflict_clause)
+    }
+
+    fn primary_key_conflict_clause(&self) -> Option<ResolveType> {
+        self.unique_sets
+            .iter()
+            .find(|unique_set| unique_set.is_primary_key)
+            .map_or(self.rowid_alias_conflict_clause, |unique_set| {
+                unique_set.conflict_clause
+            })
     }
 
     fn is_without_rowid_inline_pk(&self, column: &Column) -> bool {
@@ -3954,6 +3981,19 @@ impl BTreeTable {
         }
         Ok(deps)
     }
+}
+
+fn push_on_conflict_clause(sql: &mut String, conflict_clause: Option<ResolveType>) {
+    let Some(conflict_clause) = conflict_clause else {
+        return;
+    };
+    sql.push_str(match conflict_clause {
+        ResolveType::Rollback => " ON CONFLICT ROLLBACK",
+        ResolveType::Abort => " ON CONFLICT ABORT",
+        ResolveType::Fail => " ON CONFLICT FAIL",
+        ResolveType::Ignore => " ON CONFLICT IGNORE",
+        ResolveType::Replace => " ON CONFLICT REPLACE",
+    });
 }
 
 /// Topologically sorted generated columns, yielding `(column_index, &Column)`.
