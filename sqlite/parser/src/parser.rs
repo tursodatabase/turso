@@ -177,6 +177,9 @@ pub struct Parser<'a> {
     type_nesting_depth: u32,
     /// Current expression recursion depth of the parser, bounded by [`MAX_EXPR_DEPTH`]
     expr_nesting_depth: u32,
+    /// Current combined nesting depth of FROM-clause subqueries, parenthesized
+    /// FROM terms, and common table expressions, bounded by [`MAX_QUERY_DEPTH`]
+    query_nesting_depth: u32,
     /// Height of the most recently parsed expression (`1 + max(child heights)`,
     /// like SQLite's `Expr.nHeight`), bounded by [`MAX_EXPR_DEPTH`]
     last_expr_height: usize,
@@ -187,6 +190,30 @@ pub struct Parser<'a> {
 /// translator/optimizer uses larger stack frames per nesting level, so a
 /// 1000-deep tree still overflows a default 8 MiB thread stack in debug builds.
 pub const MAX_EXPR_DEPTH: usize = 100;
+
+/// Maximum combined nesting depth of FROM-clause subqueries, parenthesized
+/// FROM terms, and common table expressions, bounding the recursive-descent
+/// recursion through `parse_select`/`parse_from_clause`/
+/// `parse_common_table_expr`. Unlike expression nesting (see
+/// [`MAX_EXPR_DEPTH`]), this recursion previously had no bound at all, so a
+/// few hundred nested subqueries or CTEs (or ~900 nested FROM parens)
+/// overflowed the stack of a release binary before any error could be
+/// reported.
+///
+/// Kept as low as 32 for two reasons:
+/// - every accepted query must also survive the downstream recursive
+///   translator/optimizer, which spends far more stack per nesting level
+///   than the parser itself: measured on a 1 MiB main thread (the linked
+///   default on Windows), a release build already overflows there at ~50
+///   nested CTEs and ~80 nested FROM subqueries even though parsing alone
+///   survives several times deeper; 32 keeps a safety margin under those
+///   thresholds;
+/// - debug builds use an order of magnitude more stack per level, so a
+///   smaller limit also keeps just-at-the-limit queries parseable in tests,
+///   which run on default-size (2 MiB) spawned threads.
+/// Real-world SQL essentially never nests queries more than a handful of
+/// levels deep.
+pub const MAX_QUERY_DEPTH: usize = 32;
 
 impl<'a> Iterator for Parser<'a> {
     type Item = Result<Cmd>;
@@ -212,6 +239,7 @@ impl<'a> Parser<'a> {
             named_variables: HashMap::new(),
             type_nesting_depth: 0,
             expr_nesting_depth: 0,
+            query_nesting_depth: 0,
             last_expr_height: 0,
         }
     }
@@ -2633,7 +2661,22 @@ impl<'a> Parser<'a> {
         Ok(columns)
     }
 
+    /// Parse a common table expression, bounding the parser's recursion
+    /// through nested CTE bodies by [`MAX_QUERY_DEPTH`].
     fn parse_common_table_expr(&mut self) -> Result<CommonTableExpr> {
+        self.query_nesting_depth += 1;
+        if self.query_nesting_depth as usize > MAX_QUERY_DEPTH {
+            self.query_nesting_depth -= 1;
+            return Err(Error::ParseError(format!(
+                "Query is too deeply nested (maximum depth {MAX_QUERY_DEPTH})"
+            )));
+        }
+        let result = self.parse_common_table_expr_inner();
+        self.query_nesting_depth -= 1;
+        result
+    }
+
+    fn parse_common_table_expr_inner(&mut self) -> Result<CommonTableExpr> {
         let nm = self.parse_nm()?;
         let eid_list = self.parse_eid_list(false)?;
         eat_expect!(self, TK_AS);
@@ -3002,7 +3045,22 @@ impl<'a> Parser<'a> {
         Ok(result)
     }
 
+    /// Parse a FROM clause, bounding the parser's recursion through nested
+    /// subqueries and parenthesized FROM terms by [`MAX_QUERY_DEPTH`].
     fn parse_from_clause(&mut self) -> Result<FromClause> {
+        self.query_nesting_depth += 1;
+        if self.query_nesting_depth as usize > MAX_QUERY_DEPTH {
+            self.query_nesting_depth -= 1;
+            return Err(Error::ParseError(format!(
+                "Query is too deeply nested (maximum depth {MAX_QUERY_DEPTH})"
+            )));
+        }
+        let result = self.parse_from_clause_inner();
+        self.query_nesting_depth -= 1;
+        result
+    }
+
+    fn parse_from_clause_inner(&mut self) -> Result<FromClause> {
         let tok = peek_expect!(
             self,
             TK_ID,
@@ -5502,6 +5560,110 @@ mod tests {
 
         let mut p = Parser::new("SELECT ?250000".as_bytes());
         assert!(p.next_cmd().is_ok());
+    }
+
+    #[test]
+    fn test_deeply_nested_from_parens_rejected() {
+        // `SELECT * FROM ((((...(t)...))))` recursed through parse_from_clause
+        // with no bound and overflowed the stack (~900 parens on a release
+        // build) before any error could be reported.
+        for depth in [MAX_QUERY_DEPTH + 1, 1000, 100_000] {
+            let sql = format!(
+                "SELECT * FROM {}t{};",
+                "(".repeat(depth),
+                ")".repeat(depth)
+            );
+            let mut p = Parser::new(sql.as_bytes());
+            let err = p.next_cmd().unwrap_err().to_string();
+            assert!(
+                err.contains(&format!(
+                    "Query is too deeply nested (maximum depth {MAX_QUERY_DEPTH})"
+                )),
+                "unexpected error at depth {depth}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_deeply_nested_from_subqueries_rejected() {
+        // `SELECT * FROM (SELECT * FROM (...))` recursed through
+        // parse_select -> parse_from_clause with no bound and overflowed the
+        // stack (#4900).
+        for depth in [MAX_QUERY_DEPTH + 1, 1000, 100_000] {
+            let sql = format!(
+                "{}SELECT 1{};",
+                "SELECT * FROM (".repeat(depth),
+                ")".repeat(depth)
+            );
+            let mut p = Parser::new(sql.as_bytes());
+            let err = p.next_cmd().unwrap_err().to_string();
+            assert!(
+                err.contains(&format!(
+                    "Query is too deeply nested (maximum depth {MAX_QUERY_DEPTH})"
+                )),
+                "unexpected error at depth {depth}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_deeply_nested_ctes_rejected() {
+        // `WITH a AS (WITH a AS (...))` recursed through
+        // parse_common_table_expr -> parse_select -> parse_with with no bound
+        // and overflowed the stack (#8105).
+        for depth in [MAX_QUERY_DEPTH + 1, 1000, 100_000] {
+            let sql = format!(
+                "{}SELECT 1{};",
+                "WITH a AS (".repeat(depth),
+                ") SELECT * FROM a".repeat(depth)
+            );
+            let mut p = Parser::new(sql.as_bytes());
+            let err = p.next_cmd().unwrap_err().to_string();
+            assert!(
+                err.contains(&format!(
+                    "Query is too deeply nested (maximum depth {MAX_QUERY_DEPTH})"
+                )),
+                "unexpected error at depth {depth}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_nested_queries_within_limit_parse() {
+        // Legitimate nesting well below MAX_QUERY_DEPTH must still parse.
+        let cases = [
+            (
+                format!(
+                    "SELECT * FROM {}t{};",
+                    "(".repeat(MAX_QUERY_DEPTH - 1),
+                    ")".repeat(MAX_QUERY_DEPTH - 1)
+                ),
+                "parenthesized FROM terms",
+            ),
+            (
+                format!(
+                    "{}SELECT 1{};",
+                    "SELECT * FROM (".repeat(8),
+                    ")".repeat(8)
+                ),
+                "nested FROM subqueries",
+            ),
+            (
+                format!(
+                    "{}SELECT 1{};",
+                    "WITH a AS (".repeat(8),
+                    ") SELECT * FROM a".repeat(8)
+                ),
+                "nested CTEs",
+            ),
+        ];
+        for (sql, what) in cases {
+            let mut p = Parser::new(sql.as_bytes());
+            assert!(
+                p.next_cmd().is_ok(),
+                "failed to parse {what} within the nesting limit"
+            );
+        }
     }
 
     #[test]
