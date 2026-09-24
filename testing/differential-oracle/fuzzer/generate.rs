@@ -388,6 +388,12 @@ impl PropTestBackend {
             profile.create_table.extra.main_schema_only = true;
             // Turso refuses ALTER TABLE on a table that a materialized view reads.
             profile.alter_table.weight = 0;
+            profile.insert_or_replace_weight = profile.insert.weight / 5;
+            profile.upsert_weight = profile.insert.weight / 5;
+            profile.create_table.extra.shared_column_names = true;
+            // Repeated keys let a DELETE or UPDATE empty a group and let a
+            // replace hit an existing row.
+            profile.generation.value = profile.generation.value.narrow();
         }
         Self {
             test_runner,
@@ -463,6 +469,8 @@ impl SqlGenerator for PropTestBackend {
         let mutates_data = matches!(
             stmt_kind,
             sql_gen_prop::StatementKind::Insert
+                | sql_gen_prop::StatementKind::InsertOrReplace
+                | sql_gen_prop::StatementKind::Upsert
                 | sql_gen_prop::StatementKind::Update
                 | sql_gen_prop::StatementKind::Delete
         );
@@ -770,6 +778,17 @@ mod tests {
                 ),
             ),
             (
+                "CREATE TABLE notes(id INTEGER PRIMARY KEY, name TEXT, qty INTEGER)",
+                Table::new(
+                    "notes",
+                    vec![
+                        ColumnDef::new("id", DataType::Integer).primary_key(),
+                        ColumnDef::new("name", DataType::Text),
+                        ColumnDef::new("qty", DataType::Integer),
+                    ],
+                ),
+            ),
+            (
                 "CREATE TABLE blobs(b BLOB)",
                 Table::new("blobs", vec![ColumnDef::new("b", DataType::Blob)]),
             ),
@@ -791,6 +810,7 @@ mod tests {
 
         let mut matviews = Matviews::new();
         let mut runner = TestRunner::deterministic();
+        let (mut same_name_joins, mut self_joins) = (0, 0);
         for _ in 0..200 {
             let mut builder = SchemaBuilder::new();
             for (_, table) in &tables {
@@ -812,7 +832,10 @@ mod tests {
                     && !matches!(sqlite_result, QueryResult::Error(_)),
                 "{turso_sql}\n  Turso: {turso_result:?}\n  SQLite: {sqlite_result:?}"
             );
+            same_name_joins += usize::from(turso_sql.contains("_l, "));
+            self_joins += usize::from(turso_sql.contains(" AS sjk, "));
             matviews.insert(create.view_name, create.output_columns);
         }
+        assert!(same_name_joins > 0 && self_joins > 0);
     }
 }
