@@ -212,8 +212,8 @@ pub struct CheckpointStateMachine<Clock: LogicalClock, A: ConcurrentAllocator = 
     /// Lock used to block other transactions from running during the checkpoint
     checkpoint_lock: Arc<TursoRwLock>,
     /// All committed versions to write to the B-tree.
-    /// In the case of CREATE TABLE / DROP TABLE ops, contains a [SpecialWrite] to create/destroy the B-tree.
-    write_set: Vec<(RowVersion, Option<SpecialWrite>)>,
+    /// In the case of CREATE TABLE / DROP TABLE ops, contains a [SchemaOperation] to create/destroy the B-tree.
+    write_set: Vec<(RowVersion, Option<SchemaOperation>)>,
     /// State machine for writing rows to the B-tree
     write_row_state_machine: Option<StateMachine<WriteRowStateMachine>>,
     /// State machine for deleting rows from the B-tree
@@ -400,9 +400,8 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> ProvidesYieldContext
 }
 
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
-/// Special writes for CREATE TABLE / DROP TABLE / CREATE INDEX / DROP INDEX ops.
-/// These are used to create/destroy B-trees during pager ops.
-pub enum SpecialWrite {
+/// CREATE TABLE / DROP TABLE / CREATE INDEX / DROP INDEX ops that create or destroy a B-tree during checkpoint.
+pub enum SchemaOperation {
     BTreeCreate {
         table_id: MVTableId,
         sqlite_schema_rowid: i64,
@@ -425,7 +424,9 @@ pub enum SpecialWrite {
 
 enum TableVersionWrite {
     Skip,
-    Write { special_write: Option<SpecialWrite> },
+    Write {
+        schema_operation: Option<SchemaOperation>,
+    },
 }
 
 #[derive(Clone, Copy)]
@@ -434,7 +435,7 @@ struct CreatedBtree {
     sqlite_schema_rowid: i64,
 }
 
-enum SpecialWriteResult {
+enum SchemaOperationResult {
     NoSchemaRewrite,
     Created(CreatedBtree),
 }
@@ -1200,10 +1201,13 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
                 for version in self.maybe_get_checkpointable_versions(&row_versions, key.table_id) {
                     match self.classify_and_stage_table_version(&version) {
                         TableVersionWrite::Skip => {}
-                        TableVersionWrite::Write { special_write } => {
-                            tracing::trace!("adding to write_set {:?}", (&version, &special_write));
+                        TableVersionWrite::Write { schema_operation } => {
+                            tracing::trace!(
+                                "adding to write_set {:?}",
+                                (&version, &schema_operation)
+                            );
                             with_mvcc_checkpoint_allocation_site!(CheckpointWriteSet, {
-                                self.write_set.try_push((version, special_write))?;
+                                self.write_set.try_push((version, schema_operation))?;
                             });
                         }
                     }
@@ -1267,7 +1271,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
                                 .unwrap_or(0);
 
                             return TableVersionWrite::Write {
-                                special_write: Some(SpecialWrite::BTreeDestroyIndex {
+                                schema_operation: Some(SchemaOperation::BTreeDestroyIndex {
                                     index_id,
                                     root_page: root_page as u64,
                                     num_columns,
@@ -1284,7 +1288,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
                         let index_id = MVTableId::from(root_page);
                         let sqlite_schema_rowid = version.row.id.row_id.to_int_or_panic();
                         return TableVersionWrite::Write {
-                            special_write: Some(SpecialWrite::BTreeCreateIndex {
+                            schema_operation: Some(SchemaOperation::BTreeCreateIndex {
                                 index_id,
                                 sqlite_schema_rowid,
                             }),
@@ -1294,7 +1298,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
                     // to index SQL). No B-tree creation needed; the row itself is written
                     // to sqlite_schema below. See: test_checkpoint_allows_index_schema_update_after_rename_column.
                     return TableVersionWrite::Write {
-                        special_write: None,
+                        schema_operation: None,
                     };
                 }
                 SqliteSchemaBtreeKind::Table => {
@@ -1321,7 +1325,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
                             self.destroyed_tables.insert(table_id);
 
                             return TableVersionWrite::Write {
-                                special_write: Some(SpecialWrite::BTreeDestroy {
+                                schema_operation: Some(SchemaOperation::BTreeDestroy {
                                     table_id,
                                     root_page: root_page as u64,
                                     num_columns: version.row.column_count,
@@ -1330,7 +1334,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
                         }
                         // Table drops with no binding still write the schema delete. Index drops skip.
                         return TableVersionWrite::Write {
-                            special_write: None,
+                            schema_operation: None,
                         };
                     }
                     if root_page < 0 {
@@ -1338,15 +1342,15 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
                         let table_id = MVTableId::from(root_page);
                         let sqlite_schema_rowid = version.row.id.row_id.to_int_or_panic();
                         return TableVersionWrite::Write {
-                            special_write: Some(SpecialWrite::BTreeCreate {
+                            schema_operation: Some(SchemaOperation::BTreeCreate {
                                 table_id,
                                 sqlite_schema_rowid,
                             }),
                         };
                     }
-                    // ALTER TABLE. No "special write is needed"; we'll just update the row in sqlite_schema.
+                    // ALTER TABLE. No schema operation is needed. The sqlite_schema row is written as a normal update.
                     return TableVersionWrite::Write {
-                        special_write: None,
+                        schema_operation: None,
                     };
                 }
             }
@@ -1376,7 +1380,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
             return TableVersionWrite::Skip;
         }
         TableVersionWrite::Write {
-            special_write: None,
+            schema_operation: None,
         }
     }
 
@@ -1495,7 +1499,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
     fn get_current_row_version(
         &self,
         write_set_index: usize,
-    ) -> Option<&(RowVersion, Option<SpecialWrite>)> {
+    ) -> Option<&(RowVersion, Option<SchemaOperation>)> {
         self.write_set.get(write_set_index)
     }
 
@@ -1503,7 +1507,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
     fn get_current_row_version_mut(
         &mut self,
         write_set_index: usize,
-    ) -> Option<&mut (RowVersion, Option<SpecialWrite>)> {
+    ) -> Option<&mut (RowVersion, Option<SchemaOperation>)> {
         self.write_set.get_mut(write_set_index)
     }
 
@@ -1523,7 +1527,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
         if curr.0.row.id.table_id != next.0.row.id.table_id {
             return true;
         }
-        // If we have special write then seek
+        // If either row has a schema operation, seek.
         if curr.1.is_some() || next.1.is_some() {
             return true;
         }
@@ -2653,8 +2657,8 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
             return Ok(TransitionResult::Continue);
         }
 
-        let (num_columns, table_id, special_write, drop_ts) = {
-            let (row_version, special_write) = self
+        let (num_columns, table_id, schema_operation, drop_ts) = {
+            let (row_version, schema_operation) = self
                 .get_current_row_version(write_set_index)
                 .ok_or_else(|| {
                     LimboError::InternalError("row version not found in write set".to_string())
@@ -2670,17 +2674,17 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
             (
                 row_version.row.column_count,
                 row_version.row.id.table_id,
-                *special_write,
+                *schema_operation,
                 drop_ts,
             )
         };
         tracing::debug!(
-            "WriteRow: num_columns={num_columns}, table_id={table_id:?}, special_write={special_write:?}"
+            "WriteRow: num_columns={num_columns}, table_id={table_id:?}, schema_operation={schema_operation:?}"
         );
 
-        let lifecycle = match special_write {
-            Some(op) => self.apply_special_write(op, drop_ts)?,
-            None => SpecialWriteResult::NoSchemaRewrite,
+        let lifecycle = match schema_operation {
+            Some(op) => self.apply_schema_operation(op, drop_ts)?,
+            None => SchemaOperationResult::NoSchemaRewrite,
         };
 
         if self.destroyed_tables.contains(&table_id) {
@@ -2713,7 +2717,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
 
         tracing::debug!("WriteRow: resolved root page: root_page={root_page}");
 
-        if let SpecialWriteResult::Created(created) = lifecycle {
+        if let SchemaOperationResult::Created(created) = lifecycle {
             self.rewrite_created_schema_row(write_set_index, created)?;
         }
 
@@ -2952,13 +2956,13 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
         Ok(TransitionResult::Continue)
     }
 
-    fn apply_special_write(
+    fn apply_schema_operation(
         &mut self,
-        special_write: SpecialWrite,
+        schema_operation: SchemaOperation,
         drop_ts: Option<u64>,
-    ) -> Result<SpecialWriteResult> {
-        match special_write {
-            SpecialWrite::BTreeCreate {
+    ) -> Result<SchemaOperationResult> {
+        match schema_operation {
+            SchemaOperation::BTreeCreate {
                 table_id,
                 sqlite_schema_rowid,
             } => {
@@ -2973,12 +2977,12 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
                 // Undo-logged: reverted if the checkpoint fails before commit.
                 self.ckpt_rootmap_alloc(table_id, created_root_page as u64);
                 self.staged_roots.push(table_id);
-                Ok(SpecialWriteResult::Created(CreatedBtree {
+                Ok(SchemaOperationResult::Created(CreatedBtree {
                     object_id: table_id,
                     sqlite_schema_rowid,
                 }))
             }
-            SpecialWrite::BTreeDestroy {
+            SchemaOperation::BTreeDestroy {
                 table_id,
                 root_page,
                 num_columns,
@@ -3019,9 +3023,9 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
                 } else {
                     self.ckpt_rootmap_remove(table_id);
                 }
-                Ok(SpecialWriteResult::NoSchemaRewrite)
+                Ok(SchemaOperationResult::NoSchemaRewrite)
             }
-            SpecialWrite::BTreeCreateIndex {
+            SchemaOperation::BTreeCreateIndex {
                 index_id,
                 sqlite_schema_rowid,
             } => {
@@ -3039,12 +3043,12 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
                     "checkpoint index struct missing before BTreeCreateIndex",
                     { "index_id": i64::from(index_id) }
                 );
-                Ok(SpecialWriteResult::Created(CreatedBtree {
+                Ok(SchemaOperationResult::Created(CreatedBtree {
                     object_id: index_id,
                     sqlite_schema_rowid,
                 }))
             }
-            SpecialWrite::BTreeDestroyIndex {
+            SchemaOperation::BTreeDestroyIndex {
                 index_id,
                 root_page,
                 num_columns,
@@ -3094,7 +3098,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
                 } else {
                     self.ckpt_rootmap_remove(index_id);
                 }
-                Ok(SpecialWriteResult::NoSchemaRewrite)
+                Ok(SchemaOperationResult::NoSchemaRewrite)
             }
         }
     }
@@ -3842,7 +3846,7 @@ mod tests {
 
         while checkpoint.collect_table_rows().unwrap().is_some() {}
 
-        let schema_writes: Vec<(i64, Option<SpecialWrite>)> = checkpoint
+        let schema_writes: Vec<(i64, Option<SchemaOperation>)> = checkpoint
             .write_set
             .iter()
             .filter(|(version, _)| version.row.id.table_id == SQLITE_SCHEMA_MVCC_TABLE_ID)
@@ -3854,14 +3858,14 @@ mod tests {
             vec![
                 (
                     10,
-                    Some(SpecialWrite::BTreeCreate {
+                    Some(SchemaOperation::BTreeCreate {
                         table_id: MVTableId::from(-10),
                         sqlite_schema_rowid: 10,
                     })
                 ),
                 (
                     11,
-                    Some(SpecialWrite::BTreeCreateIndex {
+                    Some(SchemaOperation::BTreeCreateIndex {
                         index_id: MVTableId::from(-11),
                         sqlite_schema_rowid: 11,
                     })
@@ -3869,7 +3873,7 @@ mod tests {
                 (12, None),
                 (15, None),
             ],
-            "schema collect must emit create special writes, keep positive-root updates, write a table drop with no binding, and skip never-checkpointed drops plus index drops with no binding"
+            "schema collect must emit create schema operations, keep positive-root updates, write a table drop with no binding, and skip never-checkpointed drops plus index drops with no binding"
         );
         assert!(checkpoint.destroyed_tables.contains(&MVTableId::from(-13)));
         assert!(checkpoint.destroyed_indexes.contains(&MVTableId::from(-14)));

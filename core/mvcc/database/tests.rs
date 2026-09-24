@@ -3079,7 +3079,7 @@ fn test_blocking_truncate_zeros_log_when_commit_races_acquire_lock() {
 }
 
 /// What this test checks: Checkpoint accepts sqlite_schema index-row updates for already-checkpointed indexes
-/// (e.g. column rename), without requiring create/destroy special writes.
+/// (e.g. column rename), without requiring create/destroy schema operations.
 /// Why this matters: RENAME COLUMN on indexed tables rewrites sqlite_schema index SQL text while preserving rootpage.
 /// Treating that as an impossible state crashes checkpoint.
 #[test]
