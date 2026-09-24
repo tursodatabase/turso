@@ -1125,7 +1125,7 @@ mod tests {
     }
 
     #[test]
-    fn test_replay_upserts_existing_strict_integer_key_and_key_only_rows() {
+    fn test_replay_upserts_existing_integer_and_collated_text_keys() {
         let temp_file = NamedTempFile::new().unwrap();
         let io: Arc<dyn turso_core::IO> = Arc::new(turso_core::PlatformIO::new().unwrap());
         let db = turso_core::Database::open_file(
@@ -1145,9 +1145,15 @@ mod tests {
                     .unwrap();
                 conn.execute("CREATE TABLE marker (singleton INTEGER PRIMARY KEY) STRICT")
                     .unwrap();
+                conn.execute(
+                    "CREATE TABLE collated (key TEXT PRIMARY KEY COLLATE NOCASE, value TEXT)",
+                )
+                .unwrap();
                 conn.execute("INSERT INTO preference VALUES (1, 'local')")
                     .unwrap();
                 conn.execute("INSERT INTO marker VALUES (1)").unwrap();
+                conn.execute("INSERT INTO collated VALUES ('ABC', 'local')")
+                    .unwrap();
 
                 let mut session = db
                     .start_replay_session(
@@ -1192,6 +1198,24 @@ mod tests {
                     .await
                     .unwrap();
                 session
+                    .replay(
+                        &coro,
+                        DatabaseTapeOperation::RowChange(DatabaseTapeRowChange {
+                            change_id: 3,
+                            change_time: 1,
+                            table_name: "collated".to_string(),
+                            id: 1,
+                            change: DatabaseTapeRowChangeType::Insert {
+                                after: crate::alloc::vec![
+                                    turso_core::Value::build_text("abc"),
+                                    turso_core::Value::build_text("remote"),
+                                ],
+                            },
+                        }),
+                    )
+                    .await
+                    .unwrap();
+                session
                     .replay(&coro, DatabaseTapeOperation::Commit)
                     .await
                     .unwrap();
@@ -1210,10 +1234,15 @@ mod tests {
                     .unwrap()
                     .get_value(0)
                     .clone();
-                (rows, count)
+                let mut collated = conn.prepare("SELECT key, value FROM collated").unwrap();
+                let mut collated_rows = Vec::new();
+                while let Some(row) = run_stmt_once(&coro, &mut collated).await.unwrap() {
+                    collated_rows.push(row.get_values().cloned().collect::<Vec<_>>());
+                }
+                (rows, count, collated_rows)
             }
         });
-        let (rows, marker_count) = loop {
+        let (rows, marker_count, collated_rows) = loop {
             match gen.resume_with(Ok(())) {
                 genawaiter::GeneratorState::Yielded(..) => io.step().unwrap(),
                 genawaiter::GeneratorState::Complete(result) => break result,
@@ -1227,6 +1256,13 @@ mod tests {
             ]]
         );
         assert_eq!(marker_count, turso_core::Value::from_i64(1));
+        assert_eq!(
+            collated_rows,
+            vec![vec![
+                turso_core::Value::build_text("abc"),
+                turso_core::Value::build_text("remote"),
+            ]]
+        );
     }
 
     #[test]
@@ -3070,8 +3106,7 @@ mod tests {
                 }
 
                 // Verify: 'a' should be upserted then deleted, 'b' upserted.
-                // The pre-ALTER upsert for 'b' updates only y on conflict,
-                // which doesn't touch z, so the pre-existing z='z2' is preserved.
+                // The pre-ALTER upsert has no z value, so it preserves the existing z.
                 let mut rows = Vec::new();
                 let mut stmt = conn2.prepare("SELECT x, y, z FROM t ORDER BY x").unwrap();
                 while let Some(row) = run_stmt_once(&coro, &mut stmt).await.unwrap() {

@@ -539,8 +539,11 @@ impl DatabaseReplayGenerator {
                 pk_column_names.push(quote_ident(&record_columns[idx]));
             }
             let mut update_clauses = Vec::new();
+            // A rowid alias is identical on conflict; unlike collated keys, its
+            // stored value cannot differ from the incoming value. Reassigning
+            // it can also fail with datatype mismatch on STRICT tables.
             for (idx, name) in record_columns.iter().enumerate() {
-                if pk_column_indices.contains(&idx) {
+                if rowid_alias_pk_column_index == Some(idx) {
                     continue;
                 }
                 let name = quote_ident(name);
@@ -942,7 +945,7 @@ mod tests {
     }
 
     #[test]
-    fn test_upsert_updates_only_non_key_columns() {
+    fn test_upsert_skips_only_rowid_alias_assignment() {
         let cases = [
             (
                 "CREATE TABLE t (singleton INTEGER PRIMARY KEY, v TEXT NOT NULL) STRICT",
@@ -957,12 +960,17 @@ mod tests {
             (
                 "CREATE TABLE t (key BLOB PRIMARY KEY, v TEXT)",
                 2,
-                r#"INSERT INTO "t"("key", "v") VALUES (?,?) ON CONFLICT("key") DO UPDATE SET "v" = excluded."v""#,
+                r#"INSERT INTO "t"("key", "v") VALUES (?,?) ON CONFLICT("key") DO UPDATE SET "key" = excluded."key","v" = excluded."v""#,
             ),
             (
                 "CREATE TABLE t (a TEXT, v TEXT, b BLOB, PRIMARY KEY (b, a))",
                 3,
-                r#"INSERT INTO "t"("a", "v", "b") VALUES (?,?,?) ON CONFLICT("b","a") DO UPDATE SET "v" = excluded."v""#,
+                r#"INSERT INTO "t"("a", "v", "b") VALUES (?,?,?) ON CONFLICT("b","a") DO UPDATE SET "a" = excluded."a","v" = excluded."v","b" = excluded."b""#,
+            ),
+            (
+                "CREATE TABLE t (key TEXT PRIMARY KEY COLLATE NOCASE, v TEXT)",
+                2,
+                r#"INSERT INTO "t"("key", "v") VALUES (?,?) ON CONFLICT("key") DO UPDATE SET "key" = excluded."key","v" = excluded."v""#,
             ),
         ];
         for (ddl, columns, expected) in cases {
