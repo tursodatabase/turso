@@ -1002,10 +1002,16 @@ fn join_lhs_and_rhs<'a>(
 
     // Check if there's an index method candidate for this table (e.g., FTS)
     // and compare its cost against the current best access method.
-    if let Some(candidate) = index_method_candidates
+    'candidates: for candidate in index_method_candidates
         .iter()
-        .find(|c| c.table_idx == rhs_table_number)
+        .filter(|c| c.table_idx == rhs_table_number)
     {
+        for argument in &candidate.arguments {
+            let argument_tables = table_mask_from_expr(argument, table_references, subqueries)?;
+            if !lhs_mask.contains_all_set_bits_of(&argument_tables) {
+                continue 'candidates;
+            }
+        }
         if let Some(cost_estimate) = &candidate.cost_estimate {
             // FTS cost depends on whether it's the outer table (no LHS) or inner table
             let fts_cost = if lhs.is_none() {

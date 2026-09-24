@@ -1,5 +1,7 @@
 use super::*;
-use crate::translate::subquery::emit_non_from_clause_subqueries_for_eval_at;
+use crate::translate::{
+    plan::IndexMethodQuery, subquery::emit_non_from_clause_subqueries_for_eval_at,
+};
 
 fn condition_references_subquery(expr: &Expr, subqueries: &[NonFromClauseSubquery]) -> bool {
     subqueries
@@ -89,23 +91,133 @@ fn emit_conditions(
             }
         })
     {
-        let jump_target_when_true = program.allocate_label();
-        let condition_metadata = ConditionMetadata {
-            jump_if_condition_is_true: false,
-            jump_target_when_true,
-            jump_target_when_false: next,
-            jump_target_when_null: next,
-        };
+        emit_where_term(program, table_references, cond, next, &t_ctx.resolver)?;
+    }
+
+    Ok(())
+}
+
+pub(super) fn emit_where_term(
+    program: &mut ProgramBuilder,
+    table_references: &TableReferences,
+    term: &WhereTerm,
+    next: BranchOffset,
+    resolver: &Resolver,
+) -> Result<()> {
+    let Some((table, query)) =
+        crate::translate::optimizer::plan_index_method_predicate(term, table_references, resolver)
+    else {
+        let matched = program.allocate_label();
         translate_condition_expr(
             program,
             table_references,
-            &cond.expr,
-            condition_metadata,
-            &t_ctx.resolver,
+            &term.expr,
+            ConditionMetadata {
+                jump_if_condition_is_true: false,
+                jump_target_when_true: matched,
+                jump_target_when_false: next,
+                jump_target_when_null: next,
+            },
+            resolver,
         )?;
-        program.preassign_label_to_next_insn(jump_target_when_true);
-    }
+        program.preassign_label_to_next_insn(matched);
+        return Ok(());
+    };
 
+    emit_index_method_predicate(program, table_references, table, &query, next, resolver)
+}
+
+fn emit_index_method_predicate(
+    program: &mut ProgramBuilder,
+    table_references: &TableReferences,
+    table: &JoinedTable,
+    query: &IndexMethodQuery,
+    next: BranchOffset,
+    resolver: &Resolver,
+) -> Result<()> {
+    let matched = program.allocate_label();
+    emit_explain!(
+        program,
+        false,
+        crate::translate::eqp::EqpDetail::IndexMethod {
+            method: query
+                .index
+                .index_method
+                .as_ref()
+                .unwrap()
+                .definition()
+                .method_name
+                .to_string(),
+            estimate: None,
+        }
+    );
+    let cursor_id = program.alloc_cursor_index(None, &query.index)?;
+    let opened = program.allocate_label();
+    program.emit_insn(Insn::Once {
+        target_pc_when_reentered: opened,
+    });
+    program.emit_insn(Insn::OpenRead {
+        cursor_id,
+        root_page: query.index.root_page,
+        db: table.database_id,
+    });
+    program.preassign_label_to_next_insn(opened);
+
+    let rowid_reg = program.alloc_register();
+    translate_expr(
+        program,
+        Some(table_references),
+        &Expr::RowId {
+            database: None,
+            table: table.internal_id,
+        },
+        rowid_reg,
+        resolver,
+    )?;
+    program.emit_insn(Insn::IsNull {
+        reg: rowid_reg,
+        target_pc: next,
+    });
+    let start_reg = program.alloc_registers(query.arguments.len() + 1);
+    program.emit_int(query.pattern_idx as i64, start_reg);
+    for (i, argument) in query.arguments.iter().enumerate() {
+        translate_expr(
+            program,
+            Some(table_references),
+            argument,
+            start_reg + i + 1,
+            resolver,
+        )?;
+    }
+    program.emit_insn(Insn::IndexMethodQuery {
+        db: table.database_id,
+        cursor_id,
+        start_reg,
+        count_reg: query.arguments.len() + 1,
+        pc_if_empty: next,
+    });
+    let result_rowid = program.alloc_register();
+    let search_next = program.allocate_label();
+    program.preassign_label_to_next_insn(search_next);
+    program.emit_insn(Insn::IdxRowId {
+        cursor_id,
+        dest: result_rowid,
+    });
+    program.emit_insn(Insn::Eq {
+        lhs: rowid_reg,
+        rhs: result_rowid,
+        target_pc: matched,
+        flags: CmpInsFlags::default(),
+        collation: None,
+    });
+    program.emit_insn(Insn::Next {
+        cursor_id,
+        pc_if_next: search_next,
+        fullscan: false,
+        is_index: false,
+    });
+    program.emit_insn(Insn::Goto { target_pc: next });
+    program.preassign_label_to_next_insn(matched);
     Ok(())
 }
 

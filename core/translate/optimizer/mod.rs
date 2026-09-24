@@ -12,7 +12,7 @@ use crate::alloc::TursoIteratorExt;
 use crate::schema::GeneratedType;
 use crate::translate::expression_index::expression_index_column_usage;
 use crate::translate::plan::{BitSet, ColumnMask, MultiIndexBranchAccess};
-use crate::translate::planner::TableMask;
+use crate::translate::planner::{table_mask_from_expr, TableMask};
 use crate::{
     function::{AggFunc, Deterministic},
     index_method::{IndexMethodCostContext, IndexMethodCostEstimate},
@@ -232,6 +232,54 @@ struct IndexMethodPatternMatch {
     pattern_has_limit: bool,
     /// Pattern result columns (needed for covered columns calculation)
     pattern_columns: Vec<ast::ResultColumn>,
+}
+
+pub(crate) fn plan_index_method_predicate<'a>(
+    term: &WhereTerm,
+    table_references: &'a TableReferences,
+    resolver: &Resolver,
+) -> Option<(&'a JoinedTable, IndexMethodQuery)> {
+    let available_indexes = AvailableIndexes::for_table_references(resolver, table_references);
+    for table in table_references.joined_tables() {
+        let Some(indexes) = available_indexes.indexes_for_table(table.internal_id) else {
+            continue;
+        };
+        for index in indexes {
+            let Some(module) = &index.index_method else {
+                continue;
+            };
+            if index.is_backing_btree_index() {
+                continue;
+            }
+            for (pattern_idx, pattern) in module.definition().patterns.iter().enumerate() {
+                let Some(matched) = try_match_index_method_pattern(
+                    pattern,
+                    table,
+                    std::slice::from_ref(term),
+                    &[],
+                    &None,
+                    &None,
+                    pattern_idx,
+                    true,
+                ) else {
+                    continue;
+                };
+                if matched.where_covered.is_none() {
+                    continue;
+                }
+                return Some((
+                    table,
+                    IndexMethodQuery {
+                        index: index.clone(),
+                        pattern_idx,
+                        arguments: sorted_arguments_from_parameters(&matched.parameters),
+                        covered_columns: HashMap::default(),
+                    },
+                ));
+            }
+        }
+    }
+    None
 }
 
 /// Try to match an index method pattern against a query's clauses.
@@ -1846,6 +1894,7 @@ fn optimize_table_access_with_custom_modules(
     result_columns: &mut [ResultSetColumn],
     table_references: &mut TableReferences,
     available_indexes: &AvailableIndexes,
+    subqueries: &[NonFromClauseSubquery],
     where_query: &mut [WhereTerm],
     order_by: &mut Vec<(
         Box<ast::Expr>,
@@ -1856,7 +1905,7 @@ fn optimize_table_access_with_custom_modules(
     limit: &mut Option<Box<Expr>>,
     offset: &mut Option<Box<Expr>>,
 ) -> Result<bool> {
-    let tables = table_references.joined_tables_mut();
+    let tables = table_references.joined_tables();
     if tables.is_empty() {
         return Ok(false);
     }
@@ -1868,7 +1917,7 @@ fn optimize_table_access_with_custom_modules(
 
     // Only optimize the first table with custom index methods.
     // This allows FTS to be used as the driving table in joins.
-    let table = &mut tables[0];
+    let table = &tables[0];
     let Some(indexes) = available_indexes.indexes_for_table(table.internal_id) else {
         return Ok(false);
     };
@@ -1880,7 +1929,7 @@ fn optimize_table_access_with_custom_modules(
             continue;
         }
         let definition = module.definition();
-        for (pattern_idx, pattern) in definition.patterns.iter().enumerate() {
+        'patterns: for (pattern_idx, pattern) in definition.patterns.iter().enumerate() {
             let Some(pattern_match) = try_match_index_method_pattern(
                 pattern,
                 table,
@@ -1893,6 +1942,12 @@ fn optimize_table_access_with_custom_modules(
             ) else {
                 continue;
             };
+
+            for argument in pattern_match.parameters.values() {
+                if !table_mask_from_expr(argument, table_references, subqueries)?.is_empty() {
+                    continue 'patterns;
+                }
+            }
 
             // Mark WHERE clause as consumed
             if let Some(where_covered) = pattern_match.where_covered {
@@ -1949,12 +2004,13 @@ fn optimize_table_access_with_custom_modules(
             // Sort and collect arguments
             let arguments = sorted_arguments_from_parameters(&pattern_match.parameters);
 
-            table.op = Operation::IndexMethodQuery(IndexMethodQuery {
-                index: index.clone(),
-                pattern_idx: pattern_match.pattern_idx,
-                covered_columns,
-                arguments,
-            });
+            table_references.joined_tables_mut()[0].op =
+                Operation::IndexMethodQuery(IndexMethodQuery {
+                    index: index.clone(),
+                    pattern_idx: pattern_match.pattern_idx,
+                    covered_columns,
+                    arguments,
+                });
             return Ok(true);
         }
     }
@@ -2433,6 +2489,7 @@ fn find_table_access_plan(
             result_columns,
             table_references,
             available_indexes,
+            subqueries,
             where_clause,
             order_by,
             group_by,

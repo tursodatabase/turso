@@ -616,21 +616,13 @@ pub(super) fn emit_unmatched_row_conditions_and_loop<'a>(
         conditions.push(condition);
     }
     for cond in conditions {
-        let jump_target_when_true = program.allocate_label();
-        let condition_metadata = ConditionMetadata {
-            jump_if_condition_is_true: false,
-            jump_target_when_true,
-            jump_target_when_false: skip_label,
-            jump_target_when_null: skip_label,
-        };
-        translate_condition_expr(
+        super::conditions::emit_where_term(
             program,
             &plan.table_references,
-            &cond.expr,
-            condition_metadata,
+            cond,
+            skip_label,
             &t_ctx.resolver,
         )?;
-        program.preassign_label_to_next_insn(jump_target_when_true);
     }
 
     if let Some((reg, label)) = gosub {

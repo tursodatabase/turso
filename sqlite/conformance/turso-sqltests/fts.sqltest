@@ -1004,3 +1004,68 @@ test fts-create-index-batch-flush-returns-each-rowid-once {
 expect {
     20000|20000|20000
 }
+
+@backend cli
+test fts-row-dependent-index-query {
+    CREATE TABLE d(id INTEGER PRIMARY KEY, body);
+    CREATE INDEX fx ON d USING fts(body);
+    INSERT INTO d VALUES
+        (1, 'database'), (2, 'sql'), (3, 'database sql'), (4, 'database NOT sql');
+    SELECT id FROM d WHERE fts_match(body, body) ORDER BY id;
+    SELECT id FROM d WHERE fts_match(body, coalesce(body, 'database')) ORDER BY id;
+    CREATE INDEX source ON d(body);
+    SELECT id FROM d INDEXED BY source WHERE fts_match(body, body) ORDER BY id;
+    SELECT count(*) FROM d WHERE id = 4 AND fts_match(body, body);
+}
+expect {
+    1
+    2
+    3
+    1
+    2
+    3
+    1
+    2
+    3
+    0
+}
+
+@backend cli
+test fts-row-dependent-index-query-joins {
+    CREATE TABLE d(id INTEGER PRIMARY KEY, body);
+    CREATE INDEX fx ON d USING fts(body);
+    INSERT INTO d VALUES (1, 'database'), (2, 'sql'), (3, 'database sql');
+    CREATE TABLE q(id INTEGER PRIMARY KEY, term);
+    INSERT INTO q VALUES
+        (1, 'database'), (2, 'missing'), (3, 'sql'),
+        (4, 'database'), (5, 'database NOT sql');
+    SELECT q.id, d.id FROM d CROSS JOIN q
+        WHERE fts_match(d.body, q.term) ORDER BY q.id, d.id;
+    SELECT q.id, d.id FROM q CROSS JOIN d
+        WHERE fts_match(d.body, q.term) ORDER BY q.id, d.id;
+    SELECT q.id, d.id FROM d JOIN q
+        WHERE fts_match(d.body, coalesce(q.term, 'missing')) ORDER BY q.id, d.id;
+}
+expect {
+    1|1
+    1|3
+    3|2
+    3|3
+    4|1
+    4|3
+    5|1
+    1|1
+    1|3
+    3|2
+    3|3
+    4|1
+    4|3
+    5|1
+    1|1
+    1|3
+    3|2
+    3|3
+    4|1
+    4|3
+    5|1
+}
