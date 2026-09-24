@@ -674,6 +674,7 @@ fn query_hits(cursor: &mut FtsCursor, pattern: i64, query: &str, limit: i64) -> 
         Register::Value(Value::from_i64(pattern)),
         Register::Value(Value::from_text(query.to_owned())),
         Register::Value(Value::from_i64(limit)),
+        Register::Value(Value::from_text("0,1".to_owned())),
     ];
     let mut hits = Vec::new();
     let mut next = cursor.query_start(&values).unwrap();

@@ -3039,10 +3039,43 @@ impl IndexMethodCursor for FtsCursor {
             query => query.to_string(),
         };
 
-        let parser = self
-            .cached_parser
-            .as_deref()
-            .expect("parser built with the searcher");
+        let fields = match values.last().map(Register::get_value) {
+            Some(Value::Text(fields)) => fields.as_str(),
+            _ => {
+                return Err(LimboError::InternalError(
+                    "FTS query_start: missing indexed fields".into(),
+                )
+                .into())
+            }
+        };
+        let selected_fields = fields
+            .split(',')
+            .map(|field| {
+                field
+                    .parse::<usize>()
+                    .ok()
+                    .and_then(|i| self.default_fields.get(i).copied())
+                    .ok_or_else(|| {
+                        LimboError::InternalError("FTS query_start: invalid field".into())
+                    })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let parser = if selected_fields.len() == self.default_fields.len() {
+            Arc::clone(
+                self.cached_parser
+                    .as_ref()
+                    .expect("parser built with the searcher"),
+            )
+        } else {
+            let mut parser = tantivy::query::QueryParser::for_index(
+                self.index.as_ref().expect("index built with the searcher"),
+                selected_fields,
+            );
+            for &(field, boost) in &self.field_boosts {
+                parser.set_field_boost(field, boost);
+            }
+            Arc::new(parser)
+        };
 
         // Bound the query string before it reaches Tantivy's recursive
         // parser: a few KiB of nested parentheses would otherwise burn

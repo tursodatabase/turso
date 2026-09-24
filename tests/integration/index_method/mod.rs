@@ -731,6 +731,7 @@ fn test_fts_insert_query(tmp_db: TempDatabase) {
             Register::Value(Value::from_i64(0)), // pattern index
             Register::Value(Value::Text(turso_core::types::Text::from("Rust"))),
             Register::Value(Value::from_i64(10)), // limit
+            Register::Value(Value::Text(turso_core::types::Text::from("0,1"))),
         ];
         assert!(run(&tmp_db, || cursor.query_start(&values)).unwrap());
 
@@ -767,6 +768,7 @@ fn test_fts_insert_query(tmp_db: TempDatabase) {
             Register::Value(Value::from_i64(0)),
             Register::Value(Value::Text(turso_core::types::Text::from("Python"))),
             Register::Value(Value::from_i64(10)),
+            Register::Value(Value::Text(turso_core::types::Text::from("0,1"))),
         ];
         assert!(run(&tmp_db, || cursor.query_start(&values)).unwrap());
 
@@ -1539,6 +1541,78 @@ fn test_fts_score_uses_selected_match_index(tmp_db: TempDatabase) {
     assert!(
         first > &0.0 && second > first,
         "expected ranked scores: {rows:?}"
+    );
+}
+
+#[cfg(all(feature = "fts", not(target_family = "wasm")))]
+#[turso_macros::test]
+fn test_fts_query_restricts_matches_to_named_field(tmp_db: TempDatabase) {
+    let conn = tmp_db.connect_limbo();
+    conn.execute("CREATE TABLE docs(id INTEGER PRIMARY KEY, title TEXT, body TEXT)")
+        .unwrap();
+    conn.execute("CREATE INDEX docs_fts ON docs USING fts(title, body)")
+        .unwrap();
+    conn.execute("INSERT INTO docs VALUES (1, 'needle', 'haystack'), (2, 'haystack', 'needle')")
+        .unwrap();
+
+    let rows = limbo_exec_rows(
+        &conn,
+        "SELECT id, fts_score(body, 'needle') FROM docs \
+         WHERE fts_match(body, 'needle') ORDER BY id",
+    );
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0][0], rusqlite::types::Value::Integer(2));
+    assert!(matches!(rows[0][1], rusqlite::types::Value::Real(score) if score > 0.0));
+
+    let rows = limbo_exec_rows(&conn, "SELECT id FROM docs WHERE body MATCH 'needle'");
+    assert_eq!(rows, vec![vec![rusqlite::types::Value::Integer(2)]]);
+
+    let rows = limbo_exec_rows(
+        &conn,
+        "SELECT id, fts_score(body, 'needle') AS score FROM docs ORDER BY score DESC LIMIT 1",
+    );
+    assert_eq!(rows[0][0], rusqlite::types::Value::Integer(2));
+
+    let rows = limbo_exec_rows(
+        &conn,
+        "SELECT id FROM docs WHERE fts_match(title, 'needle')",
+    );
+    assert_eq!(rows, vec![vec![rusqlite::types::Value::Integer(1)]]);
+
+    let rows = limbo_exec_rows(
+        &conn,
+        "SELECT id FROM docs WHERE fts_match(title, body, 'needle') ORDER BY id",
+    );
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0][0], rusqlite::types::Value::Integer(1));
+    assert_eq!(rows[1][0], rusqlite::types::Value::Integer(2));
+
+    let error = limbo_exec_rows_fallible(
+        &tmp_db,
+        &conn,
+        "SELECT fts_score(title, body, 'needle') FROM docs WHERE fts_match(body, 'needle')",
+    )
+    .expect_err("score must use the same fields as the match predicate");
+    assert!(error.to_string().contains("selected FTS index"));
+
+    conn.execute("CREATE TABLE more(id INTEGER PRIMARY KEY, title TEXT, summary TEXT, body TEXT)")
+        .unwrap();
+    conn.execute("CREATE INDEX more_fts ON more USING fts(title, summary, body)")
+        .unwrap();
+    conn.execute(
+        "INSERT INTO more VALUES (1, 'needle', '', ''), (2, '', 'needle', ''), (3, '', '', 'needle')",
+    )
+    .unwrap();
+    let rows = limbo_exec_rows(
+        &conn,
+        "SELECT id FROM more WHERE fts_match(body, title, 'needle') ORDER BY id",
+    );
+    assert_eq!(
+        rows,
+        vec![
+            vec![rusqlite::types::Value::Integer(1)],
+            vec![rusqlite::types::Value::Integer(3)]
+        ]
     );
 }
 

@@ -2081,13 +2081,20 @@ pub fn translate_expr(
                                             == crate::index_method::fts::FTS_INDEX_METHOD_NAME
                                     }) && query.arguments.first().is_some_and(|indexed_query| {
                                         exprs_are_equivalent(indexed_query, args.last().unwrap())
-                                    }) && (suffix_len != 1 || (n == query.index.columns.len()
-                                        && query.index.columns.iter().all(|indexed| {
-                                            args[..n].iter().any(|arg| {
+                                    }) && (suffix_len != 1 || {
+                                        let fields = query.index.columns.iter().enumerate()
+                                            .filter(|(_, indexed)| args[..n].iter().any(|arg| {
                                                 matches!(arg.as_ref(), ast::Expr::Column { column, .. }
                                                     if *column == indexed.pos_in_table)
-                                            })
-                                        })))
+                                            }))
+                                            .map(|(i, _)| i.to_string())
+                                            .collect::<Vec<_>>()
+                                            .join(",");
+                                        n == fields.split(',').count()
+                                            && query.arguments.last() == Some(&ast::Expr::Literal(
+                                                ast::Literal::String(format!("'{fields}'"))
+                                            ))
+                                    })
                                         && args[..n].iter().all(|arg| {
                                             matches!(arg.as_ref(), ast::Expr::Column { table, column, .. }
                                                 if *table == table_ref.internal_id && query.index.columns.iter().any(|indexed| indexed.pos_in_table == *column))

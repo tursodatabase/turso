@@ -45,7 +45,7 @@ use crate::{
     types::SeekOp,
     util::{
         count_fts_column_args, exprs_are_equivalent, simple_bind_expr, try_capture_parameters,
-        try_capture_parameters_column_agnostic, try_substitute_parameters,
+        try_capture_parameters_column_agnostic, try_substitute_parameters, FTS_FIELD_PARAMETER,
     },
     vdbe::{
         affinity::Affinity,
@@ -442,6 +442,13 @@ fn try_match_index_method_pattern(
             let Some(captured) = captured else {
                 continue;
             };
+            if parameters
+                .get(&FTS_FIELD_PARAMETER)
+                .zip(captured.get(&FTS_FIELD_PARAMETER))
+                .is_some_and(|(left, right)| left != right)
+            {
+                continue;
+            }
             parameters.extend(captured);
             where_query_covered = Some(i);
             break;
@@ -484,6 +491,9 @@ fn build_covered_columns_mapping(
         let ast::ResultColumn::Expr(pattern_expr, _) = pattern_column else {
             continue;
         };
+        if !fts_score_uses_selected_fields(pattern_expr, parameters) {
+            continue;
+        }
         let Some(_substituted) = try_substitute_parameters(pattern_expr, parameters) else {
             continue;
         };
@@ -491,6 +501,21 @@ fn build_covered_columns_mapping(
         covered_column_id += 1;
     }
     covered_columns
+}
+
+fn fts_score_uses_selected_fields(expr: &ast::Expr, parameters: &HashMap<i32, ast::Expr>) -> bool {
+    let ast::Expr::FunctionCall { name, args, .. } = expr else {
+        return true;
+    };
+    if !name.as_str().eq_ignore_ascii_case("fts_score") {
+        return true;
+    }
+    let Some(ast::Expr::Literal(ast::Literal::String(fields))) =
+        parameters.get(&FTS_FIELD_PARAMETER)
+    else {
+        return false;
+    };
+    args.len() == fields.split(',').count() + 1
 }
 
 /// Sort parameters by key and extract just the expressions as a Vec.
@@ -1965,6 +1990,9 @@ fn optimize_table_access_with_custom_modules(
                 let ast::ResultColumn::Expr(pattern_expr, _) = pattern_column else {
                     continue;
                 };
+                if !fts_score_uses_selected_fields(pattern_expr, &pattern_match.parameters) {
+                    continue;
+                }
                 let Some(substituted) =
                     try_substitute_parameters(pattern_expr, &pattern_match.parameters)
                 else {
