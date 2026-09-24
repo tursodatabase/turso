@@ -221,6 +221,104 @@ unsafe fn copy_nonoverlapping_inline(src: *const u8, dst: *mut u8, len: usize) {
     }
 }
 
+/// Copies `src` to `dst` and returns every copied byte OR-ed together.
+///
+/// # Safety
+///
+/// `src` and `dst` must be valid for `len` bytes, must not overlap, and `len` must be less than 16.
+#[inline(always)]
+unsafe fn copy_short_and_fold(src: *const u8, dst: *mut u8, len: usize) -> u64 {
+    unsafe {
+        if len >= 8 {
+            let head = src.cast::<u64>().read_unaligned();
+            let tail = src.add(len - 8).cast::<u64>().read_unaligned();
+            dst.cast::<u64>().write_unaligned(head);
+            dst.add(len - 8).cast::<u64>().write_unaligned(tail);
+            head | tail
+        } else if len >= 4 {
+            let head = src.cast::<u32>().read_unaligned();
+            let tail = src.add(len - 4).cast::<u32>().read_unaligned();
+            dst.cast::<u32>().write_unaligned(head);
+            dst.add(len - 4).cast::<u32>().write_unaligned(tail);
+            u64::from(head | tail)
+        } else if len > 0 {
+            let head = *src;
+            let middle = *src.add(len / 2);
+            let tail = *src.add(len - 1);
+            *dst = head;
+            *dst.add(len / 2) = middle;
+            *dst.add(len - 1) = tail;
+            u64::from(head | middle | tail)
+        } else {
+            0
+        }
+    }
+}
+
+impl Text {
+    #[inline(always)]
+    pub(crate) fn replace_with_bytes(&mut self, bytes: &[u8]) -> Result<()> {
+        /// Up to this length, two overlapping machine words cover the value.
+        const SHORT_LIMIT: usize = 16;
+        const HIGH_BITS: u64 = 0x8080_8080_8080_8080;
+        let len = bytes.len();
+        let copied_ascii = if len < SHORT_LIMIT {
+            fill_short(self, bytes, HIGH_BITS)
+        } else {
+            None
+        };
+        if let Some(is_ascii) = copied_ascii {
+            if !is_ascii {
+                simdutf8::basic::from_utf8(bytes).ok().ok_or_else(|| {
+                    mark_unlikely();
+                    LimboError::Corrupt("TEXT value contains invalid UTF-8".into())
+                })?;
+            }
+            let Cow::Owned(string) = &mut self.value else {
+                unreachable!("record bytes were copied into an owned string")
+            };
+            // SAFETY: we now know that the `len` first bytes of the string are valid UTF-8.
+            unsafe { string.as_mut_vec().set_len(len) };
+            self.subtype = TextSubtype::Text;
+        } else {
+            let text = validate_utf8(bytes).ok_or_else(|| {
+                mark_unlikely();
+                LimboError::Corrupt("TEXT value contains invalid UTF-8".into())
+            })?;
+            self.do_extend(&text)?;
+        }
+        return Ok(());
+
+        /// Returns `Some(val)` if it succeeds in copying `bytes` into `Self`, where `val` is whether
+        /// the first `len` bytes of `Self.value` are now ASCII.
+        ///
+        /// Note: this fills `self.value` with `bytes`, but since it doesn't guarantee that it's UTF-8,
+        /// it leaves the `self.value.len` at 0.
+        ///
+        /// SAFETY: `bytes.len < 16` must hold.
+        #[inline(always)]
+        fn fill_short(text: &mut Text, bytes: &[u8], high_bits: u64) -> Option<bool> {
+            let len = bytes.len();
+            let Cow::Owned(string) = &mut text.value else {
+                return None;
+            };
+            if string.capacity() < len {
+                return None;
+            }
+            // SAFETY: the String must remain valid UTF-8, and we don't know yet that what we're copying
+            // into it is valid UTF-8. So we set its length to 0 so that whatever happens, a caller
+            // doesn't end up with a String containing invalid UTF-8. Effectively we're only modifying
+            // the unused but allocated part of the String.
+            let folded = unsafe {
+                let buffer = string.as_mut_vec();
+                buffer.set_len(0);
+                copy_short_and_fold(bytes.as_ptr(), buffer.as_mut_ptr(), len)
+            };
+            Some(folded & high_bits == 0)
+        }
+    }
+}
+
 impl<T: AnyText> Extendable<T> for Text {
     #[inline(always)]
     fn do_extend(&mut self, other: &T) -> Result<()> {
