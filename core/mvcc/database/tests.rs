@@ -21536,9 +21536,9 @@ fn test_checkpoint_seek_skip_divider_reinsert_loses_row() {
 /// Regression test for https://github.com/tursodatabase/turso/issues/7477.
 ///
 /// A large committed DELETE whose commit statement is dropped mid-flight
-/// (after `LogRecordPrepared`, before finishing tombstone TxID rewriting)
-/// must not leave tombstones pointing at the removed TxID; otherwise a
-/// later writer panics with
+/// (after its log record is owned, before finishing tombstone TxID
+/// rewriting) must not leave tombstones pointing at the removed TxID;
+/// otherwise a later writer panics with
 /// "check_version_conflicts: tombstone end TxID not found in txn map".
 #[test]
 fn mvcc_bug_repro_dropped_committed_delete_rewrites_all_tombstone_txids() {
@@ -21566,18 +21566,17 @@ fn mvcc_bug_repro_dropped_committed_delete_rewrites_all_tombstone_txids() {
     conn_a.execute("BEGIN CONCURRENT").unwrap();
     conn_a.execute("DELETE FROM t").unwrap();
 
-    let log_record_prepared =
-        FixedYieldInjector::new([CommitYieldPoint::LogRecordPrepared.point()]);
-    conn_a.set_yield_injector(Some(log_record_prepared.clone()));
+    let log_owned = FixedYieldInjector::new([CommitYieldPoint::LogicalLogOwned.point()]);
+    conn_a.set_yield_injector(Some(log_owned.clone()));
 
     let mut commit_a = conn_a.prepare("COMMIT").unwrap();
 
     for _ in 0..10_000 {
         match commit_a.step().unwrap() {
-            StepResult::IO | StepResult::Yield if log_record_prepared.is_empty() => break,
+            StepResult::IO | StepResult::Yield if log_owned.is_empty() => break,
             StepResult::IO | StepResult::Yield => {}
-            StepResult::Done => panic!("COMMIT completed before LogRecordPrepared yielded"),
-            other => panic!("unexpected COMMIT result before LogRecordPrepared: {other:?}"),
+            StepResult::Done => panic!("COMMIT completed before LogicalLogOwned yielded"),
+            other => panic!("unexpected COMMIT result before LogicalLogOwned: {other:?}"),
         }
     }
 
@@ -21586,7 +21585,7 @@ fn mvcc_bug_repro_dropped_committed_delete_rewrites_all_tombstone_txids() {
     match commit_a.step().unwrap() {
         StepResult::IO | StepResult::Yield => {}
         StepResult::Done => panic!("COMMIT completed before RewriteLiveVersions yielded"),
-        other => panic!("unexpected COMMIT result after LogRecordPrepared: {other:?}"),
+        other => panic!("unexpected COMMIT result after LogicalLogOwned: {other:?}"),
     }
 
     drop(commit_a);
@@ -22677,3 +22676,206 @@ fn dropping_passive_checkpoint_after_pager_commit_does_not_release_write_lock_tw
 
 #[path = "group_commit_tests.rs"]
 mod group_commit_tests;
+
+fn drive_statement_to_done(statement: &mut crate::Statement, pager_io: &Arc<dyn crate::IO>) {
+    use crate::StepResult;
+    for _ in 0..200_000 {
+        match statement.step().unwrap() {
+            StepResult::Done => return,
+            StepResult::IO | StepResult::Yield => pager_io.step().unwrap(),
+            other => panic!("unexpected checkpoint step: {other:?}"),
+        }
+    }
+    panic!("checkpoint did not complete");
+}
+
+/// A row committed between a passive checkpoint's snapshot and its collect
+/// must survive that checkpoint. Its dirty key sits in the map while the
+/// checkpoint walks it, but its version is past the snapshot, so the
+/// checkpoint must leave the key for the next checkpoint or log truncation
+/// loses the row.
+#[test]
+fn commit_between_checkpoint_snapshot_and_collection_survives_restart() {
+    use crate::StepResult;
+
+    let mut db = MvccTestDbNoConn::new_with_random_db_passive();
+    {
+        let setup = db.connect();
+        setup
+            .execute("PRAGMA mvcc_checkpoint_threshold = -1")
+            .unwrap();
+        setup
+            .execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)")
+            .unwrap();
+        setup
+            .execute("CREATE TABLE driver(id INTEGER PRIMARY KEY)")
+            .unwrap();
+        setup.execute("INSERT INTO t VALUES (1, 'before')").unwrap();
+        // The first checkpoint scans the whole store; later ones read only the dirty keys.
+        setup.execute("PRAGMA wal_checkpoint(PASSIVE)").unwrap();
+
+        let checkpoint_conn = db.connect();
+        checkpoint_conn
+            .execute("PRAGMA mvcc_checkpoint_threshold = 0")
+            .unwrap();
+        let injector =
+            FixedYieldInjector::new([CheckpointYieldPoint::BeforeCollectTableRows.point()]);
+        checkpoint_conn.set_yield_injector(Some(injector.clone()));
+        let mut checkpoint = checkpoint_conn
+            .prepare("INSERT INTO driver VALUES (1)")
+            .unwrap();
+        let pager_io = checkpoint_conn.pager.load().io.clone();
+
+        let mut parked = false;
+        for _ in 0..200_000 {
+            match checkpoint.step().unwrap() {
+                StepResult::IO | StepResult::Yield => {
+                    if injector.remaining_len() == 0 {
+                        parked = true;
+                        break;
+                    }
+                    pager_io.step().unwrap();
+                }
+                StepResult::Done => break,
+                other => panic!("unexpected checkpoint step: {other:?}"),
+            }
+        }
+        assert!(parked, "checkpoint must park before collecting table rows");
+
+        let writer = db.connect();
+        writer
+            .execute("INSERT INTO t VALUES (2, 'during')")
+            .unwrap();
+
+        drive_statement_to_done(&mut checkpoint, &pager_io);
+        checkpoint_conn.set_yield_injector(None);
+        drop(checkpoint);
+
+        writer.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+    }
+
+    db.restart();
+    let conn = db.connect();
+    let rows = get_rows(&conn, "SELECT id, v FROM t ORDER BY id");
+    assert_eq!(
+        rows.len(),
+        2,
+        "row committed between checkpoint snapshot and collection was lost: {rows:?}"
+    );
+}
+
+#[test]
+fn rolled_back_insert_leaves_no_dirty_key() {
+    let db = MvccTestDbNoConn::new_with_random_db_passive();
+    let conn = db.connect();
+    conn.execute("PRAGMA mvcc_checkpoint_threshold = -1")
+        .unwrap();
+    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)")
+        .unwrap();
+    conn.execute("PRAGMA wal_checkpoint(PASSIVE)").unwrap();
+    let mvstore = db.get_mvcc_store();
+    let before = mvstore.checkpoint_dirty_table_keys.len();
+
+    conn.execute("BEGIN").unwrap();
+    conn.execute("INSERT INTO t VALUES (1, 'rolled back')")
+        .unwrap();
+    conn.execute("ROLLBACK").unwrap();
+    assert_eq!(mvstore.checkpoint_dirty_table_keys.len(), before);
+
+    conn.execute("INSERT INTO t VALUES (2, 'committed')")
+        .unwrap();
+    assert_eq!(mvstore.checkpoint_dirty_table_keys.len(), before + 1);
+}
+
+/// Row ids are handed out at INSERT, so a slow transaction can hold a low id
+/// while faster ones commit and checkpoint higher ids. The dirty keys, not
+/// the highest checkpointed id, decide what the next checkpoint writes.
+#[test]
+fn late_commit_of_low_rowid_is_written_by_the_next_checkpoint() {
+    let mut db = MvccTestDbNoConn::new_with_random_db_passive();
+    {
+        let setup = db.connect();
+        setup
+            .execute("PRAGMA mvcc_checkpoint_threshold = -1")
+            .unwrap();
+        setup
+            .execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)")
+            .unwrap();
+        setup.execute("PRAGMA wal_checkpoint(PASSIVE)").unwrap();
+
+        let slow = db.connect();
+        slow.execute("BEGIN CONCURRENT").unwrap();
+        slow.execute("INSERT INTO t VALUES (100, 'slow')").unwrap();
+
+        let fast = db.connect();
+        fast.execute("INSERT INTO t VALUES (101, 'fast')").unwrap();
+        fast.execute("PRAGMA wal_checkpoint(PASSIVE)").unwrap();
+
+        slow.execute("COMMIT").unwrap();
+        fast.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+    }
+
+    db.restart();
+    let conn = db.connect();
+    let ids: Vec<i64> = get_rows(&conn, "SELECT id FROM t ORDER BY id")
+        .iter()
+        .map(|row| row[0].as_int().unwrap())
+        .collect();
+    assert_eq!(ids, vec![100, 101]);
+}
+
+#[test]
+fn index_row_updated_after_checkpoint_is_written_by_the_next_checkpoint() {
+    let mut db = MvccTestDbNoConn::new_with_random_db_passive();
+    {
+        let conn = db.connect();
+        conn.execute("PRAGMA mvcc_checkpoint_threshold = -1")
+            .unwrap();
+        conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)")
+            .unwrap();
+        conn.execute("CREATE INDEX t_v ON t(v)").unwrap();
+        conn.execute("INSERT INTO t VALUES (1, 'a')").unwrap();
+        conn.execute("PRAGMA wal_checkpoint(PASSIVE)").unwrap();
+        conn.execute("UPDATE t SET v = 'b' WHERE id = 1").unwrap();
+        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+    }
+
+    db.restart();
+    let conn = db.connect();
+    let by_new = get_rows(&conn, "SELECT id FROM t INDEXED BY t_v WHERE v = 'b'");
+    assert_eq!(
+        by_new.len(),
+        1,
+        "index entry for the updated value is missing"
+    );
+    let by_old = get_rows(&conn, "SELECT id FROM t INDEXED BY t_v WHERE v = 'a'");
+    assert!(by_old.is_empty(), "stale index entry survived: {by_old:?}");
+    let integrity = get_rows(&conn, "PRAGMA integrity_check");
+    assert_eq!(integrity[0][0].to_string(), "ok");
+}
+
+#[test]
+fn recovered_rows_are_written_by_the_first_checkpoint_after_restart() {
+    let mut db = MvccTestDbNoConn::new_with_random_db_passive();
+    {
+        let conn = db.connect();
+        conn.execute("PRAGMA mvcc_checkpoint_threshold = -1")
+            .unwrap();
+        conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)")
+            .unwrap();
+        conn.execute("INSERT INTO t VALUES (1, 'a')").unwrap();
+    }
+    db.restart();
+    {
+        let conn = db.connect();
+        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+    }
+    db.restart();
+    let conn = db.connect();
+    let rows = get_rows(&conn, "SELECT id, v FROM t");
+    assert_eq!(
+        rows.len(),
+        1,
+        "row replayed from the logical log was not checkpointed: {rows:?}"
+    );
+}

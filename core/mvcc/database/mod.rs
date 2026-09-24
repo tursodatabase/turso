@@ -1509,6 +1509,15 @@ pub enum CommitState<Clock: LogicalClock, A: ConcurrentAllocator = TursoAllocato
         // the mutex
         state_machine: Mutex<StateMachine<CheckpointStateMachine<Clock, A>>>,
     },
+    /// Record every write set key in the store's dirty-key maps, in chunks
+    /// of `MVCC_COMMIT_BATCH_SIZE`, before the record reaches the log. The
+    /// next checkpoint collects only those keys. Runs before the log append
+    /// so an allocation failure can still fail the commit.
+    MarkDirtyKeys {
+        end_ts: u64,
+        cursor: usize,
+        log_record: Option<LogRecord>,
+    },
     CommitEnd {
         end_ts: u64,
     },
@@ -2710,20 +2719,56 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CommitStateMachine<Clock, A> {
         self.populate_portable_changes(mvcc_store, &mut log_record)?;
         tracing::trace!("prepared_log_record(tx_id={})", self.tx_id);
 
+        self.state = CommitState::MarkDirtyKeys {
+            end_ts,
+            cursor: 0,
+            log_record: Some(log_record),
+        };
+        inject_transition_yield!(self, CommitYieldPoint::LogRecordPrepared);
+        Ok(TransitionResult::Continue)
+    }
+
+    fn step_mark_dirty_keys(
+        &mut self,
+        mvcc_store: &Arc<MvStore<Clock, A>>,
+    ) -> Result<TransitionResult<()>> {
+        let tx = mvcc_store
+            .txs
+            .get(&self.tx_id)
+            .ok_or_else(|| LimboError::NoSuchTransactionID(self.tx_id.to_string()))?;
+        let CommitState::MarkDirtyKeys {
+            end_ts,
+            cursor,
+            log_record,
+        } = &mut self.state
+        else {
+            unreachable!("step_mark_dirty_keys requires MarkDirtyKeys state")
+        };
+        let (next, total) = mvcc_store.mark_tx_write_set_dirty(
+            tx.value(),
+            *end_ts,
+            *cursor,
+            MVCC_COMMIT_BATCH_SIZE,
+        )?;
+        if next < total {
+            *cursor = next;
+            return Ok(TransitionResult::Io(IOCompletions(Completion::new_yield())));
+        }
+        let end_ts = *end_ts;
+        let log_record = log_record
+            .take()
+            .expect("MarkDirtyKeys owns the log record until it hands it on");
         if log_record.is_empty() {
             // Nothing to log. We still need to release the commit lock here
             // if this is an exclusive tx, mirroring the pre-chunk path
             // through WaitForDependencies.
             if mvcc_store.is_exclusive_tx(&self.tx_id) {
-                if let Some(tx_entry) = mvcc_store.txs.get(&self.tx_id) {
-                    mvcc_store.unlock_commit_lock_if_held(tx_entry.value());
-                }
+                mvcc_store.unlock_commit_lock_if_held(tx.value());
             }
             self.state = CommitState::CommitEnd { end_ts };
         } else {
             self.state = CommitState::BeginCommitLogicalLog { end_ts, log_record };
         }
-        inject_transition_yield!(self, CommitYieldPoint::LogRecordPrepared);
         Ok(TransitionResult::Continue)
     }
 
@@ -3369,6 +3414,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> StateTransition for CommitStat
             // the cursor / pass / log_record inside the variant, which
             // conflicts with the outer `&self.state` match borrow.
             CommitState::BuildLogRecord(_) => self.step_build_log_record(mvcc_store),
+            CommitState::MarkDirtyKeys { .. } => self.step_mark_dirty_keys(mvcc_store),
             CommitState::BeginCommitLogicalLog { end_ts, .. } => {
                 let is_exclusive = mvcc_store.is_exclusive_tx(&self.tx_id);
                 if !is_exclusive && self.commit_coordinator.group_commit_enabled() {
@@ -4395,6 +4441,16 @@ pub struct MvStore<Clock: LogicalClock, A: ConcurrentAllocator = TursoAllocator>
     /// contend on it; only one wins. Needed because the lock no longer guards the start
     /// of the checkpoint (it's acquired after the pager-write phase, not before).
     checkpoint_in_progress: AtomicBool,
+    /// Table row keys that a commit touched and no checkpoint has pruned yet.
+    /// Checkpoint collect visits only these keys instead of every row. The
+    /// value is the end timestamp of the last commit that marked the key.
+    pub checkpoint_dirty_table_keys: SkipMap<RowID, AtomicU64, BasicComparator, A>,
+    /// Same for index rows: `table_id` is the index id and `row_id` the index key.
+    pub checkpoint_dirty_index_keys: SkipMap<RowID, AtomicU64, BasicComparator, A>,
+    /// Non-zero while the dirty-key maps can be missing keys: a new or
+    /// recovered store, or a checkpoint that could not re-mark a key. The next
+    /// checkpoint scans every row and clears the generation it started with.
+    checkpoint_full_scan_generation: AtomicU64,
     /// The highest transaction ID that has been made durable in the WAL.
     /// Used to skip checkpointing transactions from mv store to WAL that have already been processed.
     durable_txid_max: AtomicU64,
@@ -4574,6 +4630,8 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
             index_rows_epoch: AtomicU64::new(0),
             txs: SkipMap::new_in(alloc.clone()),
             finalized_tx_states: SkipMap::new_in(alloc.clone()),
+            checkpoint_dirty_table_keys: SkipMap::new_in(alloc.clone()),
+            checkpoint_dirty_index_keys: SkipMap::new_in(alloc.clone()),
             alloc,
             logical_log_alloc,
             tx_ids: AtomicU64::new(1), // let's reserve transaction 0 for special purposes
@@ -4590,6 +4648,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
             checkpoint_publish_in_progress: AtomicBool::new(false),
             schema_generation: AtomicU64::new(0),
             checkpoint_in_progress: AtomicBool::new(false),
+            checkpoint_full_scan_generation: AtomicU64::new(1),
             durable_txid_max: AtomicU64::new(0),
             last_committed_schema_change_ts: AtomicU64::new(0),
             last_committed_tx_ts: AtomicU64::new(0),
@@ -4872,6 +4931,8 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         // reuse, corrupting `index_rows` lookups and SkipMap ordering.
         self.rows.clear();
         self.index_rows.clear();
+        self.checkpoint_dirty_table_keys.clear();
+        self.checkpoint_dirty_index_keys.clear();
         let root_pages = schema
             .tables
             .values()
@@ -7609,6 +7670,81 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         snapshot_ts
     }
 
+    /// Records `key` for the next checkpoint collect with the end timestamp
+    /// of the commit that touched it. Table and index keys live in separate
+    /// maps because collect walks them in separate phases.
+    pub(crate) fn mark_checkpoint_dirty_key(
+        &self,
+        key: &RowID,
+        stamp: u64,
+    ) -> Result<(), TryReserveError> {
+        let dirty_keys = self.checkpoint_dirty_keys_for(key);
+        loop {
+            let entry = dirty_keys.try_get_or_insert(key.clone(), AtomicU64::new(stamp))?;
+            entry.value().fetch_max(stamp, Ordering::AcqRel);
+            // A prune can remove the node between the insert and the store.
+            if !entry.is_removed() {
+                return Ok(());
+            }
+        }
+    }
+
+    /// Removes `key` from its dirty map and returns the stamp it held.
+    pub(crate) fn unmark_checkpoint_dirty_key(&self, key: &RowID) -> Option<u64> {
+        self.checkpoint_dirty_keys_for(key)
+            .remove(key)
+            .map(|entry| entry.value().load(Ordering::Acquire))
+    }
+
+    fn checkpoint_dirty_keys_for(
+        &self,
+        key: &RowID,
+    ) -> &SkipMap<RowID, AtomicU64, BasicComparator, A> {
+        match key.row_id {
+            RowKey::Int(_) => &self.checkpoint_dirty_table_keys,
+            RowKey::Record(_) => &self.checkpoint_dirty_index_keys,
+        }
+    }
+
+    /// Marks up to `limit` write set keys of `tx` starting at `from` with `stamp`.
+    /// Returns the next position and the write set length.
+    fn mark_tx_write_set_dirty(
+        &self,
+        tx: &Transaction<A>,
+        stamp: u64,
+        from: usize,
+        limit: usize,
+    ) -> Result<(usize, usize), TryReserveError> {
+        let write_set = tx.write_set.lock();
+        let total = write_set.entries.len();
+        let end = total.min(from.saturating_add(limit));
+        for (key, _) in &write_set.entries[from..end] {
+            self.mark_checkpoint_dirty_key(key, stamp)?;
+        }
+        Ok((end, total))
+    }
+
+    /// `Some` while the dirty-key maps can be missing keys. A checkpoint that
+    /// starts with `Some` scans every row and clears that generation on success.
+    pub(crate) fn checkpoint_full_scan_generation(&self) -> Option<std::num::NonZeroU64> {
+        std::num::NonZeroU64::new(self.checkpoint_full_scan_generation.load(Ordering::Acquire))
+    }
+
+    pub(crate) fn require_checkpoint_full_scan(&self) {
+        self.checkpoint_full_scan_generation
+            .fetch_add(1, Ordering::AcqRel);
+    }
+
+    /// Clears the full-scan request only if no request arrived after `generation` was read.
+    pub(crate) fn clear_checkpoint_full_scan(&self, generation: std::num::NonZeroU64) {
+        let _ = self.checkpoint_full_scan_generation.compare_exchange(
+            generation.get(),
+            0,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        );
+    }
+
     pub(crate) fn uses_passive_checkpoint(&self) -> bool {
         self.experimental_mvcc_passive_checkpoint
     }
@@ -8623,12 +8759,23 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
 
     /// Passive sequence compaction: record end-stamped deletes instead of inline B-tree purge.
     pub fn seqcompact_commit_delete(&self, rowid: RowID, num_cols: usize, end_ts: u64) {
+        if !self.seqcompact_stamp_delete(&rowid, num_cols, end_ts) {
+            return;
+        }
+        // No transaction write set records this delete, so the key is marked here.
+        if self.mark_checkpoint_dirty_key(&rowid, end_ts).is_err() {
+            self.require_checkpoint_full_scan();
+        }
+    }
+
+    /// Returns true when a version was end-stamped or a tombstone was added.
+    fn seqcompact_stamp_delete(&self, rowid: &RowID, num_cols: usize, end_ts: u64) -> bool {
         loop {
             let Ok(row_versions) = self.get_or_create_table_row_versions(rowid.clone()) else {
-                return;
+                return false;
             };
             let mut versions = row_versions.write();
-            if !self.table_versions_still_mapped(&rowid, &row_versions) {
+            if !self.table_versions_still_mapped(rowid, &row_versions) {
                 continue;
             }
             // End-stamp the live committed version, if any — collection then
@@ -8637,15 +8784,15 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                 matches!(rv.begin(), Some(TxTimestampOrID::Timestamp(_))) && rv.end().is_none()
             }) {
                 rv.set_end(Some(TxTimestampOrID::Timestamp(end_ts)));
-                return;
+                return true;
             }
             // Already tombstoned / no live version: nothing to delete again.
             if versions.iter().any(|rv| rv.end().is_some()) {
-                return;
+                return false;
             }
             // B-tree-only row: btree-resident tombstone so collection materializes the delete.
             let version_id = self.get_version_id();
-            let row = Row::new_table_row_in(rowid, &[], num_cols, self.alloc.clone())
+            let row = Row::new_table_row_in(rowid.clone(), &[], num_cols, self.alloc.clone())
                 .expect("empty tombstone row");
             let _ = self.insert_version_raw(
                 &mut versions,
@@ -8658,7 +8805,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                     materialized_at: WalPos::ORIGIN,
                 },
             );
-            return;
+            return true;
         }
     }
 
@@ -10852,6 +10999,16 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> Debug for CommitState<Clock, A
                 .field("end_ts", end_ts)
                 .finish(),
             Self::BuildLogRecord(ctx) => f.debug_tuple("BuildLogRecord").field(ctx).finish(),
+            Self::MarkDirtyKeys {
+                end_ts,
+                cursor,
+                log_record,
+            } => f
+                .debug_struct("MarkDirtyKeys")
+                .field("end_ts", end_ts)
+                .field("cursor", cursor)
+                .field("log_record", log_record)
+                .finish(),
             Self::BeginCommitLogicalLog { end_ts, log_record } => f
                 .debug_struct("BeginCommitLogicalLog")
                 .field("end_ts", end_ts)
