@@ -253,6 +253,8 @@ use crate::{
 use crate::storage::encryption::EncryptionContext;
 use crate::File;
 
+#[cfg(all(test, feature = "conn_raw_api"))]
+mod header_upgrade_failure_tests;
 mod serializer;
 use serializer::EncryptedPayload;
 #[cfg(feature = "conn_raw_api")]
@@ -593,6 +595,7 @@ pub struct LogicalLog {
     /// doesn't corrupt the chain.
     #[cfg_attr(feature = "aristo-instr", inspect(name = "pending_running_crc"))]
     pending_running_crc: Option<u32>,
+    pending_header_upgrade: Option<(LogHeader, Completion)>,
     encryption_ctx: Option<EncryptionContext>,
     /// Plaintext bytes per encrypted payload chunk. Production uses the fixed format constant;
     /// tests may override via `new_with_encrypted_payload_chunk_size_for_test`.
@@ -625,6 +628,7 @@ impl LogicalLog {
             header: None,
             running_crc: 0,
             pending_running_crc: None,
+            pending_header_upgrade: None,
             encryption_ctx,
             encrypted_payload_chunk_size,
             max_appended_commit_ts: 0,
@@ -651,11 +655,15 @@ impl LogicalLog {
 
     pub(crate) fn set_header(&mut self, header: LogHeader) {
         self.running_crc = derive_initial_crc(header.salt);
+        self.pending_header_upgrade = None;
         self.header = Some(header);
     }
 
     pub(crate) fn header(&self) -> Option<&LogHeader> {
-        self.header.as_ref()
+        match &self.pending_header_upgrade {
+            Some((header, c)) if c.succeeded() => Some(header),
+            _ => self.header.as_ref(),
+        }
     }
 
     pub(crate) fn encryption_ctx(&self) -> Option<&EncryptionContext> {
@@ -675,6 +683,7 @@ impl LogicalLog {
         advance_offset_immediately: bool,
         on_serialization_complete: OnSerializationComplete<'_>,
     ) -> Result<(Completion, u64)> {
+        self.publish_finished_header_upgrade()?;
         let op_count = tx.op_count;
         let commit_ts = tx.tx_timestamp;
         self.max_appended_commit_ts = self.max_appended_commit_ts.max(commit_ts);
@@ -914,20 +923,49 @@ impl LogicalLog {
             return Ok(None);
         }
 
-        let upgraded_header = {
-            let header = self.header.as_mut().ok_or_else(|| {
-                LimboError::InternalError(
-                    "Logical log header not initialized before portable upgrade".to_string(),
-                )
-            })?;
-            if header.version != LOG_VERSION_V2 {
-                return Ok(None);
+        if let Some((_, c)) = &self.pending_header_upgrade {
+            if !c.finished() {
+                return Ok(Some(c.clone()));
             }
-            header.version = LOG_VERSION;
-            header.clone()
-        };
+            if c.failed() {
+                self.pending_header_upgrade = None;
+            }
+        }
+        self.publish_finished_header_upgrade()?;
 
-        Ok(Some(self.write_header(upgraded_header, None)?))
+        let header = self.header.as_ref().ok_or_else(|| {
+            LimboError::InternalError(
+                "Logical log header not initialized before portable upgrade".to_string(),
+            )
+        })?;
+        if header.version != LOG_VERSION_V2 {
+            return Ok(None);
+        }
+        let mut upgraded_header = header.clone();
+        upgraded_header.version = LOG_VERSION;
+
+        let (upgraded_header, c) = self.write_header(upgraded_header, None)?;
+        self.pending_header_upgrade = Some((upgraded_header, c.clone()));
+        Ok(Some(c))
+    }
+
+    fn publish_finished_header_upgrade(&mut self) -> Result<()> {
+        let Some((_, c)) = &self.pending_header_upgrade else {
+            return Ok(());
+        };
+        if !c.finished() {
+            return Err(LimboError::InternalError(
+                "logical log header upgrade write is still in flight".to_string(),
+            ));
+        }
+        let (header, c) = self
+            .pending_header_upgrade
+            .take()
+            .expect("pending header upgrade checked above");
+        if c.succeeded() {
+            self.header = Some(header);
+        }
+        Ok(())
     }
 
     /// Writes a transaction to the log but does NOT advance the writer offset.
@@ -988,13 +1026,14 @@ impl LogicalLog {
     }
 
     #[aristo::intent("the in-memory log header is published only after the on-disk header pwrite has completed durably", id = "aristos:logical_log_header_publish_after_fsync", verify = "full")]
-    /// Writes the header. The write is added to `group`, when given,
-    /// before it is submitted.
+    /// Writes the header and returns it with its CRC filled in. The caller
+    /// decides when the returned header becomes the in-memory header. The
+    /// write is added to `group`, when given, before it is submitted.
     fn write_header(
-        &mut self,
+        &self,
         mut header: LogHeader,
         group: Option<&mut CompletionGroup>,
-    ) -> Result<Completion> {
+    ) -> Result<(LogHeader, Completion)> {
         let header_bytes = header.encode();
         header.hdr_crc32c = u32::from_le_bytes([
             header_bytes[LOG_HDR_CRC_START],
@@ -1002,7 +1041,6 @@ impl LogicalLog {
             header_bytes[LOG_HDR_CRC_START + 2],
             header_bytes[LOG_HDR_CRC_START + 3],
         ]);
-        self.header = Some(header);
 
         let buffer = Arc::new(Buffer::new(header_bytes.to_vec()));
         let c = Completion::new_write({
@@ -1020,18 +1058,23 @@ impl LogicalLog {
         if let Some(group) = group {
             group.add(&c);
         }
-        self.file.pwrite(0, buffer, c)
+        let c = self.file.pwrite(0, buffer, c)?;
+        Ok((header, c))
     }
 
     pub fn update_header(&mut self) -> Result<Completion> {
+        self.publish_finished_header_upgrade()?;
         let header = self.current_or_new_header()?;
-        self.write_header(header, None)
+        let (header, c) = self.write_header(header, None)?;
+        self.header = Some(header);
+        Ok(c)
     }
 
     #[aristo::intent("the running CRC of the log is reseeded only after the truncate operation has completed durably", id = "aristos:logical_log_truncate_crc_reseed_after_completion", verify = "full")]
     fn truncate_to_zero(&mut self) -> Result<Completion> {
         // Regenerate salt so stale frames (from before truncation) cannot validate
         // against the new CRC chain.
+        self.publish_finished_header_upgrade()?;
         let mut header = self.current_or_new_header()?;
         header.salt = self.io.generate_random_number() as u64;
         self.running_crc = derive_initial_crc(header.salt);
@@ -1076,14 +1119,15 @@ impl LogicalLog {
     pub fn reset_to_fresh_header(&mut self) -> Result<Completion> {
         // Regenerate salt so stale frames from before the reset cannot validate
         // against this new CRC chain.
+        self.publish_finished_header_upgrade()?;
         let mut header = self.current_or_new_header()?;
         header.salt = self.io.generate_random_number() as u64;
         self.running_crc = derive_initial_crc(header.salt);
         self.pending_running_crc = None;
-        self.header = Some(header.clone());
 
         let mut group = CompletionGroup::new(|_| {});
-        let _header_c = self.write_header(header, Some(&mut group))?;
+        let (header, _header_c) = self.write_header(header, Some(&mut group))?;
+        self.header = Some(header);
         let c = Completion::new_trunc(move |result| {
             if let Err(err) = result {
                 tracing::error!("logical_log_truncate failed: {}", err);
