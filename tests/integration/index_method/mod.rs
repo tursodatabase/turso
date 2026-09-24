@@ -1499,6 +1499,7 @@ fn test_fts_functions_require_selected_index(tmp_db: TempDatabase) {
         "SELECT 'quick fox' MATCH 'quick'",
         "SELECT fts_match(other, 'quick') FROM docs",
         "SELECT fts_score(body, 'quick') FROM docs WHERE id = 1",
+        "SELECT id FROM docs WHERE fts_match(body, 'quick') ORDER BY fts_score(body, 'fox') DESC LIMIT 1",
         "SELECT fts_match(body, 'fox') FROM docs WHERE fts_match(body, 'quick')",
         "SELECT fts_score(body, 'fox') FROM docs WHERE fts_match(body, 'quick')",
         "SELECT id FROM docs WHERE fts_match(body, 'quick') OR fts_match(body, 'fox')",

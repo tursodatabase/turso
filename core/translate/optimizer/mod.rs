@@ -15,7 +15,7 @@ use crate::translate::plan::{BitSet, ColumnMask, MultiIndexBranchAccess};
 use crate::translate::planner::{table_mask_from_expr, TableMask};
 use crate::{
     function::{AggFunc, Deterministic},
-    index_method::{IndexMethodCostContext, IndexMethodCostEstimate},
+    index_method::{IndexMethodAttachment, IndexMethodCostContext, IndexMethodCostEstimate},
     numeric::Numeric,
     schema::{
         BTreeCharacteristics, BTreeTable, ColDef, Column, Index, IndexColumn, Schema, Table, Type,
@@ -45,7 +45,7 @@ use crate::{
     types::SeekOp,
     util::{
         count_fts_column_args, exprs_are_equivalent, simple_bind_expr, try_capture_parameters,
-        try_capture_parameters_column_agnostic, try_substitute_parameters, FTS_FIELD_PARAMETER,
+        try_capture_parameters_column_agnostic,
     },
     vdbe::{
         affinity::Affinity,
@@ -442,11 +442,11 @@ fn try_match_index_method_pattern(
             let Some(captured) = captured else {
                 continue;
             };
-            if parameters
-                .get(&FTS_FIELD_PARAMETER)
-                .zip(captured.get(&FTS_FIELD_PARAMETER))
-                .is_some_and(|(left, right)| left != right)
-            {
+            if captured.iter().any(|(key, value)| {
+                parameters
+                    .get(key)
+                    .is_some_and(|previous| !exprs_are_equivalent(previous, value))
+            }) {
                 continue;
             }
             parameters.extend(captured);
@@ -482,6 +482,7 @@ fn try_match_index_method_pattern(
 /// Build covered columns mapping from pattern columns.
 /// Returns a HashMap mapping synthetic column IDs to pattern column IDs.
 fn build_covered_columns_mapping(
+    module: &dyn IndexMethodAttachment,
     pattern_columns: &[ast::ResultColumn],
     parameters: &HashMap<i32, ast::Expr>,
 ) -> HashMap<usize, usize> {
@@ -491,31 +492,13 @@ fn build_covered_columns_mapping(
         let ast::ResultColumn::Expr(pattern_expr, _) = pattern_column else {
             continue;
         };
-        if !fts_score_uses_selected_fields(pattern_expr, parameters) {
-            continue;
-        }
-        let Some(_substituted) = try_substitute_parameters(pattern_expr, parameters) else {
+        let Some(_substituted) = module.result_column(pattern_expr, parameters) else {
             continue;
         };
         covered_columns.insert(covered_column_id, pattern_column_id);
         covered_column_id += 1;
     }
     covered_columns
-}
-
-fn fts_score_uses_selected_fields(expr: &ast::Expr, parameters: &HashMap<i32, ast::Expr>) -> bool {
-    let ast::Expr::FunctionCall { name, args, .. } = expr else {
-        return true;
-    };
-    if !name.as_str().eq_ignore_ascii_case("fts_score") {
-        return true;
-    }
-    let Some(ast::Expr::Literal(ast::Literal::String(fields))) =
-        parameters.get(&FTS_FIELD_PARAMETER)
-    else {
-        return false;
-    };
-    args.len() == fields.split(',').count() + 1
 }
 
 /// Sort parameters by key and extract just the expressions as a Vec.
@@ -583,6 +566,7 @@ fn collect_index_method_candidates(
 
                 // Build covered columns mapping from pattern match
                 let covered_columns = build_covered_columns_mapping(
+                    module.as_ref(),
                     &pattern_match.pattern_columns,
                     &pattern_match.parameters,
                 );
@@ -1990,11 +1974,8 @@ fn optimize_table_access_with_custom_modules(
                 let ast::ResultColumn::Expr(pattern_expr, _) = pattern_column else {
                     continue;
                 };
-                if !fts_score_uses_selected_fields(pattern_expr, &pattern_match.parameters) {
-                    continue;
-                }
                 let Some(substituted) =
-                    try_substitute_parameters(pattern_expr, &pattern_match.parameters)
+                    module.result_column(pattern_expr, &pattern_match.parameters)
                 else {
                     continue;
                 };
