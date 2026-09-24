@@ -576,6 +576,7 @@ impl Fuzzer {
                 Box::new(PropTestBackend::new(
                     seed_bytes,
                     self.config.recursive_cte_focus,
+                    self.config.weight_profile,
                 ))
             }
         };
