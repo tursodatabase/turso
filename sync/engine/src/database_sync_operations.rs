@@ -5402,6 +5402,18 @@ mod tests {
                 origin_client_id: "client-a".to_string(),
                 ops: vec![logical_upsert_op("", 7, 2, "local-overwrite")],
             },
+            LogicalTxnData {
+                end_offset: 6,
+                commit_ts: 6,
+                origin_client_id: String::new(),
+                ops: vec![LogicalOp {
+                    record: record(&[
+                        turso_core::Value::from_i64(1),
+                        turso_core::Value::build_text("local"),
+                    ]),
+                    ..logical_upsert_op("preference", 0, 1, "")
+                }],
+            },
         ];
         std::fs::write(txns_temp.path(), encoded_logical_txns(&txns)).unwrap();
 
@@ -5425,6 +5437,15 @@ mod tests {
             let txns_file = txns_file.clone();
             move |coro| async move {
                 let coro: Coro<()> = coro.into();
+                let conn = db.connect(&coro).await.unwrap();
+                conn.execute("CREATE TABLE preference (singleton INTEGER PRIMARY KEY, value TEXT NOT NULL) STRICT")
+                    .unwrap();
+                conn.execute("INSERT INTO preference VALUES (1, 'local')")
+                    .unwrap();
+                assert!(super::max_local_change_id(&coro, &conn)
+                    .await
+                    .unwrap()
+                    .is_some());
                 let opts = DatabaseReplaySessionOpts {
                     use_implicit_rowid: true,
                 };
@@ -5445,16 +5466,27 @@ mod tests {
                     .await
                     .unwrap();
 
-                let conn = db.connect(&coro).await.unwrap();
                 let mut stmt = conn.prepare("SELECT rowid, x FROM items").unwrap();
                 let mut rows = Vec::new();
                 while let Some(row) = run_stmt_once(&coro, &mut stmt).await.unwrap() {
                     rows.push(row.get_values().cloned().collect::<Vec<_>>());
                 }
-                (stats.touched_rows, table_names_by_stable_id, rows)
+                let mut preference = conn
+                    .prepare("SELECT singleton, value FROM preference")
+                    .unwrap();
+                let mut preference_rows = Vec::new();
+                while let Some(row) = run_stmt_once(&coro, &mut preference).await.unwrap() {
+                    preference_rows.push(row.get_values().cloned().collect::<Vec<_>>());
+                }
+                (
+                    stats.touched_rows,
+                    table_names_by_stable_id,
+                    rows,
+                    preference_rows,
+                )
             }
         });
-        let (touched_rows, table_names_by_stable_id, rows) = loop {
+        let (touched_rows, table_names_by_stable_id, rows, preference_rows) = loop {
             match gen.resume_with(Ok(())) {
                 genawaiter::GeneratorState::Yielded(..) => io.step().unwrap(),
                 genawaiter::GeneratorState::Complete(result) => break result,
@@ -5465,11 +5497,19 @@ mod tests {
         assert!(!table_names_by_stable_id.contains_key(&99));
         assert!(touched_rows.contains(&("items".to_string(), 2)));
         assert!(!touched_rows.contains(&("items".to_string(), 1)));
+        assert!(touched_rows.contains(&("preference".to_string(), 1)));
         assert_eq!(
             rows,
             vec![vec![
                 turso_core::Value::from_i64(2),
                 turso_core::Value::Text(turso_core::types::Text::new("remote".to_string())),
+            ]]
+        );
+        assert_eq!(
+            preference_rows,
+            vec![vec![
+                turso_core::Value::from_i64(1),
+                turso_core::Value::build_text("local"),
             ]]
         );
     }

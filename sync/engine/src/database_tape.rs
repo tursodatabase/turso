@@ -1125,6 +1125,111 @@ mod tests {
     }
 
     #[test]
+    fn test_replay_upserts_existing_strict_integer_key_and_key_only_rows() {
+        let temp_file = NamedTempFile::new().unwrap();
+        let io: Arc<dyn turso_core::IO> = Arc::new(turso_core::PlatformIO::new().unwrap());
+        let db = turso_core::Database::open_file(
+            io.clone(),
+            temp_file.path().to_str().unwrap(),
+            Arc::new(SqliteDialect),
+        )
+        .unwrap();
+        let db = Arc::new(DatabaseTape::new(db));
+
+        let mut gen = genawaiter::sync::Gen::new({
+            let db = db.clone();
+            |coro| async move {
+                let coro: Coro<()> = coro.into();
+                let conn = db.connect(&coro).await.unwrap();
+                conn.execute("CREATE TABLE preference (singleton INTEGER PRIMARY KEY, value TEXT NOT NULL) STRICT")
+                    .unwrap();
+                conn.execute("CREATE TABLE marker (singleton INTEGER PRIMARY KEY) STRICT")
+                    .unwrap();
+                conn.execute("INSERT INTO preference VALUES (1, 'local')")
+                    .unwrap();
+                conn.execute("INSERT INTO marker VALUES (1)").unwrap();
+
+                let mut session = db
+                    .start_replay_session(
+                        &coro,
+                        DatabaseReplaySessionOpts {
+                            use_implicit_rowid: false,
+                        },
+                    )
+                    .await
+                    .unwrap();
+                session
+                    .replay(
+                        &coro,
+                        DatabaseTapeOperation::RowChange(DatabaseTapeRowChange {
+                            change_id: 1,
+                            change_time: 1,
+                            table_name: "preference".to_string(),
+                            id: 1,
+                            change: DatabaseTapeRowChangeType::Insert {
+                                after: crate::alloc::vec![
+                                    turso_core::Value::from_i64(1),
+                                    turso_core::Value::build_text("remote"),
+                                ],
+                            },
+                        }),
+                    )
+                    .await
+                    .unwrap();
+                session
+                    .replay(
+                        &coro,
+                        DatabaseTapeOperation::RowChange(DatabaseTapeRowChange {
+                            change_id: 2,
+                            change_time: 1,
+                            table_name: "marker".to_string(),
+                            id: 1,
+                            change: DatabaseTapeRowChangeType::Insert {
+                                after: crate::alloc::vec![turso_core::Value::from_i64(1)],
+                            },
+                        }),
+                    )
+                    .await
+                    .unwrap();
+                session
+                    .replay(&coro, DatabaseTapeOperation::Commit)
+                    .await
+                    .unwrap();
+
+                let mut stmt = conn
+                    .prepare("SELECT singleton, value FROM preference")
+                    .unwrap();
+                let mut rows = Vec::new();
+                while let Some(row) = run_stmt_once(&coro, &mut stmt).await.unwrap() {
+                    rows.push(row.get_values().cloned().collect::<Vec<_>>());
+                }
+                let mut marker = conn.prepare("SELECT count(*) FROM marker").unwrap();
+                let count = run_stmt_once(&coro, &mut marker)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .get_value(0)
+                    .clone();
+                (rows, count)
+            }
+        });
+        let (rows, marker_count) = loop {
+            match gen.resume_with(Ok(())) {
+                genawaiter::GeneratorState::Yielded(..) => io.step().unwrap(),
+                genawaiter::GeneratorState::Complete(result) => break result,
+            }
+        };
+        assert_eq!(
+            rows,
+            vec![vec![
+                turso_core::Value::from_i64(1),
+                turso_core::Value::build_text("remote"),
+            ]]
+        );
+        assert_eq!(marker_count, turso_core::Value::from_i64(1));
+    }
+
+    #[test]
     pub fn test_implicit_rowid_replay_prefers_explicit_primary_key() {
         let temp_file = NamedTempFile::new().unwrap();
         let db_path = temp_file.path().to_str().unwrap();
@@ -2965,7 +3070,7 @@ mod tests {
                 }
 
                 // Verify: 'a' should be upserted then deleted, 'b' upserted.
-                // The pre-ALTER upsert for 'b' uses ON CONFLICT(x) DO UPDATE SET x=.., y=..
+                // The pre-ALTER upsert for 'b' updates only y on conflict,
                 // which doesn't touch z, so the pre-existing z='z2' is preserved.
                 let mut rows = Vec::new();
                 let mut stmt = conn2.prepare("SELECT x, y, z FROM t ORDER BY x").unwrap();

@@ -539,15 +539,22 @@ impl DatabaseReplayGenerator {
                 pk_column_names.push(quote_ident(&record_columns[idx]));
             }
             let mut update_clauses = Vec::new();
-            for name in record_columns {
+            for (idx, name) in record_columns.iter().enumerate() {
+                if pk_column_indices.contains(&idx) {
+                    continue;
+                }
                 let name = quote_ident(name);
                 update_clauses.push(format!("{name} = excluded.{name}"));
             }
-            format!(
-                " ON CONFLICT({}) DO UPDATE SET {}",
-                pk_column_names.join(","),
-                update_clauses.join(",")
-            )
+            if update_clauses.is_empty() {
+                format!(" ON CONFLICT({}) DO NOTHING", pk_column_names.join(","))
+            } else {
+                format!(
+                    " ON CONFLICT({}) DO UPDATE SET {}",
+                    pk_column_names.join(","),
+                    update_clauses.join(",")
+                )
+            }
         } else {
             String::new()
         };
@@ -932,6 +939,36 @@ mod tests {
             r#"UPDATE "t" SET "b" = ? WHERE "c" IS ? AND "a" IS ?"#
         );
         assert_eq!(update.pk_column_indices, Some(vec![2, 0]));
+    }
+
+    #[test]
+    fn test_upsert_updates_only_non_key_columns() {
+        let cases = [
+            (
+                "CREATE TABLE t (singleton INTEGER PRIMARY KEY, v TEXT NOT NULL) STRICT",
+                2,
+                r#"INSERT INTO "t"("singleton", "v") VALUES (?,?) ON CONFLICT("singleton") DO UPDATE SET "v" = excluded."v""#,
+            ),
+            (
+                "CREATE TABLE t (singleton INTEGER PRIMARY KEY) STRICT",
+                1,
+                r#"INSERT INTO "t"("singleton") VALUES (?) ON CONFLICT("singleton") DO NOTHING"#,
+            ),
+            (
+                "CREATE TABLE t (key BLOB PRIMARY KEY, v TEXT)",
+                2,
+                r#"INSERT INTO "t"("key", "v") VALUES (?,?) ON CONFLICT("key") DO UPDATE SET "v" = excluded."v""#,
+            ),
+            (
+                "CREATE TABLE t (a TEXT, v TEXT, b BLOB, PRIMARY KEY (b, a))",
+                3,
+                r#"INSERT INTO "t"("a", "v", "b") VALUES (?,?,?) ON CONFLICT("b","a") DO UPDATE SET "v" = excluded."v""#,
+            ),
+        ];
+        for (ddl, columns, expected) in cases {
+            let info = replay_info_for(&[ddl], "t", QueryKind::Upsert(columns), false).unwrap();
+            assert_eq!(info.query, expected, "schema: {ddl}");
+        }
     }
 
     #[test]
