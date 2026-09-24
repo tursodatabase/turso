@@ -25,6 +25,28 @@ expect {
 2||
 }
 
+# The first LEFT JOIN can replace a declared NOT NULL value with NULL. The
+# second join must not start an index range with that synthetic NULL value.
+@cross-check-integrity
+test left-join-range-seek-stops-on-null-extended-key {
+    CREATE TABLE range_left(seed INTEGER);
+    INSERT INTO range_left VALUES(1);
+    CREATE TABLE range_middle(key INTEGER NOT NULL);
+    CREATE TABLE range_right(value INTEGER);
+    CREATE INDEX range_right_value ON range_right(value);
+    INSERT INTO range_right VALUES(1);
+
+    SELECT quote(range_left.seed), quote(range_middle.key),
+           quote(range_right.value)
+      FROM range_left
+      LEFT JOIN range_middle ON true
+      LEFT JOIN range_right INDEXED BY range_right_value
+        ON range_middle.key<=range_right.value;
+}
+expect {
+    1|NULL|NULL
+}
+
 setup left-join-null-index-bug-composite-index-schema {
     CREATE TABLE a(id INTEGER PRIMARY KEY);
     CREATE TABLE b(id INTEGER PRIMARY KEY, a_id INTEGER);
