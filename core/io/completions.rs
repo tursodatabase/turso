@@ -111,7 +111,7 @@ pub(super) struct CompletionInner {
     /// sets it before the completion is submitted, so by the time the
     /// completion finishes and its callback counts it into the group, the
     /// link is already there.
-    parent: OnceLock<Completion>,
+    parent: Mutex<Option<Completion>>,
     /// Keeps the write buffer alive for async I/O backends (io_uring, VFS)
     /// where pwrite returns before the kernel has consumed the buffer.
     write_buffer: OnceLock<Arc<Buffer>>,
@@ -121,7 +121,7 @@ impl fmt::Debug for CompletionInner {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("CompletionInner")
             .field("completion_type", &self.completion_type)
-            .field("parent", &self.parent.get().is_some())
+            .field("parent", &self.parent.lock().is_some())
             .finish()
     }
 }
@@ -178,10 +178,10 @@ impl CompletionGroup {
     pub fn add(&mut self, c: &Completion) {
         self.completions.push(c.clone());
         self.inner.outstanding.fetch_add(1, Ordering::SeqCst);
-        turso_assert!(
-            c.get_inner().parent.set(self.completion.clone()).is_ok(),
-            "completion can only be linked once"
-        );
+        let mut parent = c.get_inner().parent.lock();
+        turso_assert!(parent.is_none(), "completion can only be linked once");
+        *parent = Some(self.completion.clone());
+        drop(parent);
         turso_assert!(
             !c.finished(),
             "completion was added to a group after it finished"
@@ -280,7 +280,7 @@ impl CompletionInner {
             completion_type,
             result: OnceLock::new(),
             context: Context::new(),
-            parent: OnceLock::new(),
+            parent: Mutex::new(None),
             write_buffer: OnceLock::new(),
         }
     }
@@ -382,7 +382,8 @@ impl Completion {
     /// drains the CQ, the resubmitted chunks pile up and the task deadlocks.
     pub fn wake_progress(&self) {
         if let Some(inner) = &self.inner {
-            if let Some(group) = inner.parent.get() {
+            let group = inner.parent.lock().clone();
+            if let Some(group) = group {
                 group.wake();
             }
             inner.context.wake();
@@ -502,7 +503,8 @@ impl Completion {
         // Only the call that finished this completion counts it into its
         // group.
         if first {
-            if let Some(group) = inner.parent.get() {
+            let parent = inner.parent.lock().take();
+            if let Some(group) = parent {
                 group.group_one_done(inner.result.get().and_then(|e| *e));
             }
         }
