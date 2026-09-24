@@ -210,6 +210,8 @@ crate::thread::thread_local! {
 }
 
 /// Highlight matching terms in text by wrapping them with tags.
+///
+/// Standalone function that can be used without an FTS index.
 /// It tokenizes both the query and text using Tantivy's default tokenizer,
 /// finds matching terms, and wraps them with the specified tags.
 pub fn fts_highlight(text: &str, query: &str, before_tag: &str, after_tag: &str) -> String {
