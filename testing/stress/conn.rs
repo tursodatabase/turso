@@ -89,6 +89,13 @@ impl StressConn {
         result
     }
 
+    pub async fn rollback_if_open(&self) -> turso::Result<()> {
+        if !self.conn.is_autocommit()? {
+            self.execute("ROLLBACK", ()).await?;
+        }
+        Ok(())
+    }
+
     pub async fn pragma_update<V: std::fmt::Display>(
         &self,
         pragma_name: &str,
