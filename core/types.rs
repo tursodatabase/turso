@@ -225,11 +225,27 @@ unsafe fn copy_nonoverlapping_inline(src: *const u8, dst: *mut u8, len: usize) {
 ///
 /// # Safety
 ///
-/// `src` and `dst` must be valid for `len` bytes, must not overlap, and `len` must be less than 16.
+/// `src` and `dst` must be valid for `len` bytes and must not overlap.
 #[inline(always)]
-unsafe fn copy_short_and_fold(src: *const u8, dst: *mut u8, len: usize) -> u64 {
+unsafe fn copy_and_fold(src: *const u8, dst: *mut u8, len: usize) -> u64 {
     unsafe {
-        if len >= 8 {
+        if len >= 16 {
+            let mut byte_or = 0u64;
+            let mut offset = 0;
+            while offset + 8 <= len {
+                let word = src.add(offset).cast::<u64>().read_unaligned();
+                dst.add(offset).cast::<u64>().write_unaligned(word);
+                byte_or |= word;
+                offset += 8;
+            }
+            if offset < len {
+                let tail = len - 8;
+                let word = src.add(tail).cast::<u64>().read_unaligned();
+                dst.add(tail).cast::<u64>().write_unaligned(word);
+                byte_or |= word;
+            }
+            byte_or
+        } else if len >= 8 {
             let head = src.cast::<u64>().read_unaligned();
             let tail = src.add(len - 8).cast::<u64>().read_unaligned();
             dst.cast::<u64>().write_unaligned(head);
@@ -258,12 +274,11 @@ unsafe fn copy_short_and_fold(src: *const u8, dst: *mut u8, len: usize) -> u64 {
 impl Text {
     #[inline(always)]
     pub(crate) fn replace_with_bytes(&mut self, bytes: &[u8]) -> Result<()> {
-        /// Up to this length, two overlapping machine words cover the value.
-        const SHORT_LIMIT: usize = 16;
+        const FUSED_LIMIT: usize = 64;
         const HIGH_BITS: u64 = 0x8080_8080_8080_8080;
         let len = bytes.len();
-        let copied_ascii = if len < SHORT_LIMIT {
-            fill_short(self, bytes, HIGH_BITS)
+        let copied_ascii = if len <= FUSED_LIMIT {
+            fill_bytes(self, bytes, HIGH_BITS)
         } else {
             None
         };
@@ -289,15 +304,8 @@ impl Text {
         }
         return Ok(());
 
-        /// Returns `Some(val)` if it succeeds in copying `bytes` into `Self`, where `val` is whether
-        /// the first `len` bytes of `Self.value` are now ASCII.
-        ///
-        /// Note: this fills `self.value` with `bytes`, but since it doesn't guarantee that it's UTF-8,
-        /// it leaves the `self.value.len` at 0.
-        ///
-        /// SAFETY: `bytes.len < 16` must hold.
         #[inline(always)]
-        fn fill_short(text: &mut Text, bytes: &[u8], high_bits: u64) -> Option<bool> {
+        fn fill_bytes(text: &mut Text, bytes: &[u8], high_bits: u64) -> Option<bool> {
             let len = bytes.len();
             let Cow::Owned(string) = &mut text.value else {
                 return None;
@@ -305,14 +313,12 @@ impl Text {
             if string.capacity() < len {
                 return None;
             }
-            // SAFETY: the String must remain valid UTF-8, and we don't know yet that what we're copying
-            // into it is valid UTF-8. So we set its length to 0 so that whatever happens, a caller
-            // doesn't end up with a String containing invalid UTF-8. Effectively we're only modifying
-            // the unused but allocated part of the String.
+            // SAFETY: the capacity check gives `len` writable bytes, and record bytes do not overlap
+            // the buffer. Its zero length keeps invalid UTF-8 out of the String.
             let folded = unsafe {
                 let buffer = string.as_mut_vec();
                 buffer.set_len(0);
-                copy_short_and_fold(bytes.as_ptr(), buffer.as_mut_ptr(), len)
+                copy_and_fold(bytes.as_ptr(), buffer.as_mut_ptr(), len)
             };
             Some(folded & high_bits == 0)
         }
