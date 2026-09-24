@@ -3608,6 +3608,9 @@ impl BTreeTable {
             }
             if needs_pk_inline && column.primary_key() {
                 sql.push_str(" PRIMARY KEY");
+                if !column.is_rowid_alias() && self.primary_key_columns[0].1 == SortOrder::Desc {
+                    sql.push_str(" DESC");
+                }
                 push_on_conflict_clause(&mut sql, self.primary_key_conflict_clause());
                 if self.has_autoincrement && column.is_rowid_alias() {
                     sql.push_str(" AUTOINCREMENT");
@@ -3667,6 +3670,9 @@ impl BTreeTable {
                     sql.push_str(", ");
                 }
                 sql.push_str(&quote_ident(&col.0));
+                if col.1 == SortOrder::Desc {
+                    sql.push_str(" DESC");
+                }
             }
             sql.push(')');
             push_on_conflict_clause(&mut sql, self.primary_key_conflict_clause());
