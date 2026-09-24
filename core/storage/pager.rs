@@ -3375,6 +3375,7 @@ impl Pager {
         connection: &Connection,
         sync_mode: SyncMode,
         update_transaction_state: bool,
+        keep_read_tx: bool,
     ) -> IOResultOr<()> {
         if connection.is_nested_stmt() {
             // Parent statement will handle the transaction commit.
@@ -3386,9 +3387,14 @@ impl Pager {
             return Ok(IOResult::Done(()));
         };
 
+        let state_after_commit = if keep_read_tx {
+            TransactionState::Read
+        } else {
+            TransactionState::None
+        };
         let complete_commit = || {
             if update_transaction_state {
-                connection.set_tx_state(TransactionState::None);
+                connection.set_tx_state(state_after_commit);
             }
             self.commit_wal_end();
         };
@@ -3421,8 +3427,12 @@ impl Pager {
                     return Ok(IOResult::Done(()));
                 }
                 _ => {
+                    let mut auto_actions = connection.wal_auto_actions();
+                    if keep_read_tx {
+                        auto_actions.remove(WalAutoActions::Checkpoint);
+                    }
                     return_if_io!(self.commit_wal(
-                        connection.wal_auto_actions(),
+                        auto_actions,
                         sync_mode,
                         connection.get_data_sync_retry(),
                     ));
@@ -3433,7 +3443,9 @@ impl Pager {
                     };
 
                     wal.end_write_tx();
-                    wal.end_read_tx();
+                    if !keep_read_tx {
+                        wal.end_read_tx();
+                    }
 
                     tracing::debug!("commit_tx: schema_did_change={schema_did_change}");
                     if schema_did_change {

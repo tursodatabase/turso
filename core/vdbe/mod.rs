@@ -1005,6 +1005,12 @@ pub struct ProgramState {
     uses_subjournal: bool,
     /// Whether this statement is an active write inside an explicit transaction.
     pub(crate) is_active_write: bool,
+    pub(crate) is_active_reader: bool,
+    /// True for the parked statement backing an incremental blob handle.
+    /// Counted separately in `Connection::n_active_blob_statements` so
+    /// explicit checkpoints can subtract it — an open blob handle must not
+    /// block checkpointing for its whole lifetime.
+    pub(crate) is_blob_handle: bool,
     /// Whether begin_statement was called (savepoint + FK bookkeeping active).
     has_stmt_transaction: bool,
     pub n_change: AtomicI64,
@@ -1091,6 +1097,8 @@ impl ProgramState {
             ephemeral_temp_files: HashMap::default(),
             uses_subjournal: false,
             is_active_write: false,
+            is_active_reader: false,
+            is_blob_handle: false,
             has_stmt_transaction: false,
             attached_savepoint_pagers: Vec::new(),
             n_change: AtomicI64::new(0),
@@ -1335,23 +1343,26 @@ impl ProgramState {
             })
         };
         if connection.n_active_root_statements.load(Ordering::SeqCst) > i32::from(self_counted) {
-            // Readers can finish while sibling readers remain active, but a
-            // shared attached transaction may only be finished by the last
-            // active statement, like SQLite's btreeEndTransaction keeps the
+            // A statement can finish while its siblings don't read, but the
+            // transaction stays open while other readers remain and a shared
+            // attached transaction may only be finished by the last active
+            // statement, like SQLite's btreeEndTransaction keeps the
             // transaction open while db->nVdbeRead > 1.
-            return self.auto_txn_cleanup == TxnCleanup::RollbackTxn
+            return !connection.has_other_active_readers(self.is_active_reader)
+                && self.auto_txn_cleanup == TxnCleanup::RollbackTxn
                 && active_writers == 0
                 && !attached_txn_open();
         }
         // This is the last active statement: finish its own transaction, or
-        // an attached transaction a deferring sibling left behind — SQLite's
+        // a read or attached transaction a sibling left behind — SQLite's
         // vdbeCommit visits every database on halt, so leftovers are closed
         // even by a statement that never started a transaction itself.
         if active_writers != 0 {
             return false;
         }
         self.auto_txn_cleanup == TxnCleanup::RollbackTxn
-            || (connection.get_auto_commit() && attached_txn_open())
+            || (connection.get_auto_commit()
+                && (connection.get_tx_state() == TransactionState::Read || attached_txn_open()))
     }
 
     /// The MvStore this statement runs against: the same answer as
@@ -1677,6 +1688,17 @@ impl ProgramState {
         result
     }
 
+    pub(crate) fn end_reader(&mut self, connection: &Connection) {
+        if self.is_active_reader {
+            let previous = connection.n_active_readers.fetch_sub(1, Ordering::SeqCst);
+            turso_assert!(
+                previous >= 1,
+                "ending a reader with {previous} active reader(s)"
+            );
+            self.is_active_reader = false;
+        }
+    }
+
     /// Gets or creates a bloom filter for the given cursor ID.
     pub fn get_or_create_bloom_filter(&mut self, cursor_id: usize) -> &mut BloomFilter {
         self.bloom_filters.entry(cursor_id).or_default()
@@ -1858,6 +1880,7 @@ pub struct PreparedProgram {
     pub write_databases: BitSet,
     /// Set of attached database indices that need read transactions.
     pub read_databases: BitSet,
+    pub reads_main_db: bool,
 }
 
 #[derive(Clone)]
@@ -3111,6 +3134,7 @@ impl Program {
         program_state: &mut ProgramState,
         rollback: bool,
     ) -> IOResultOr<()> {
+        let is_active_reader = program_state.is_active_reader;
         let commit_state = &mut program_state.commit_state;
         if matches!(commit_state, CommitState::CommittingAttached) {
             // Resume committing attached pagers after IO yield.
@@ -3128,7 +3152,12 @@ impl Program {
             return Ok(IOResult::Done(()));
         }
         let txn_finish_result = if !rollback {
-            pager.commit_tx(connection, connection.get_sync_mode(), true)
+            pager.commit_tx(
+                connection,
+                connection.get_sync_mode(),
+                true,
+                connection.has_other_active_readers(is_active_reader),
+            )
         } else {
             pager.rollback_tx(connection);
             Ok(IOResult::Done(()))

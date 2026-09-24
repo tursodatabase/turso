@@ -314,11 +314,6 @@ pub struct Statement {
     /// True once this root statement has started executing and incremented
     /// `Connection::n_active_root_statements`.
     counted_as_active_root: bool,
-    /// True for the parked statement backing an incremental blob handle.
-    /// Counted separately in `Connection::n_active_blob_statements` so
-    /// explicit checkpoints can subtract it — an open blob handle must not
-    /// block checkpointing for its whole lifetime.
-    is_blob_handle: bool,
     /// True if this statement called `Connection::start_nested()` during
     /// construction and therefore must call `end_nested()` on drop.
     nested_guard_active: bool,
@@ -400,7 +395,6 @@ impl Statement {
             tail_offset,
             origin,
             counted_as_active_root: false,
-            is_blob_handle: false,
             nested_guard_active,
         }
     }
@@ -413,7 +407,7 @@ impl Statement {
             !self.counted_as_active_root,
             "blob handle marked after its statement started executing"
         );
-        self.is_blob_handle = true;
+        self.state.is_blob_handle = true;
     }
 
     pub fn tail_offset(&self) -> usize {
@@ -532,12 +526,13 @@ impl Statement {
     }
 
     fn release_active_root_if_counted(&mut self) {
+        self.state.end_reader(&self.program.connection);
         if self.counted_as_active_root {
             // Blob count drops before the root count so a concurrent
             // checkpoint-guard read never sees fewer non-blob statements
             // than are really active (a stale-high read only causes a
             // spurious StatementsInProgress, never a missed one).
-            if self.is_blob_handle {
+            if self.state.is_blob_handle {
                 self.program
                     .connection
                     .n_active_blob_statements
@@ -598,11 +593,17 @@ impl Statement {
             self.counted_as_active_root = true;
             // After the root count, so the checkpoint guard's subtraction
             // can only read stale-high (see release_active_root_if_counted).
-            if self.is_blob_handle {
+            if self.state.is_blob_handle {
                 self.program
                     .connection
                     .n_active_blob_statements
                     .fetch_add(1, Ordering::SeqCst);
+            } else if self.program.prepared.reads_main_db {
+                self.program
+                    .connection
+                    .n_active_readers
+                    .fetch_add(1, Ordering::SeqCst);
+                self.state.is_active_reader = true;
             }
         }
         if matches!(self.state.execution_state, ProgramExecutionState::Init)

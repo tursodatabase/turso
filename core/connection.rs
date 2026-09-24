@@ -526,6 +526,7 @@ pub struct Connection {
     /// This is currently only 0 or 1. We return Busy instead of allowing a
     /// second same-connection writer to start.
     pub(crate) n_active_writes: AtomicI32,
+    pub(crate) n_active_readers: AtomicI32,
     /// Number of active root statements currently executing on this connection.
     /// This is Turso's equivalent of SQLite's top-level active-VDBE count
     /// (`db->nVdbeActive`) for user statements, excluding internal helpers and
@@ -4887,6 +4888,10 @@ impl Connection {
         }
         self.n_active_root_statements.fetch_add(1, Ordering::SeqCst);
         Ok(())
+    }
+
+    pub(crate) fn has_other_active_readers(&self, self_is_reader: bool) -> bool {
+        self.n_active_readers.load(Ordering::SeqCst) > i32::from(self_is_reader)
     }
 
     /// `from_statement` is true when the checkpoint runs inside a root

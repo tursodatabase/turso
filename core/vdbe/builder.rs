@@ -2291,22 +2291,28 @@ impl ProgramBuilder {
         self.resolve_labels()?;
 
         // Fill in the is_index field on Next and Prev, now that we know all cursor types
+        let mut reads_main_db = false;
         for (insn, _) in self.insns.iter_mut() {
-            if let Insn::Next {
-                cursor_id,
-                is_index,
-                ..
-            }
-            | Insn::Prev {
-                cursor_id,
-                is_index,
-                ..
-            } = insn
-            {
-                *is_index = self
-                    .cursor_ref
-                    .get(*cursor_id)
-                    .is_some_and(|(_, cursor_type)| cursor_type.is_index());
+            match insn {
+                Insn::Next {
+                    cursor_id,
+                    is_index,
+                    ..
+                }
+                | Insn::Prev {
+                    cursor_id,
+                    is_index,
+                    ..
+                } => {
+                    *is_index = self
+                        .cursor_ref
+                        .get(*cursor_id)
+                        .is_some_and(|(_, cursor_type)| cursor_type.is_index());
+                }
+                Insn::Transaction { db, .. } if *db == crate::MAIN_DB_ID => {
+                    reads_main_db = true;
+                }
+                _ => {}
             }
         }
 
@@ -2346,6 +2352,7 @@ impl ProgramBuilder {
             prepare_context,
             write_databases: self.write_databases,
             read_databases: self.read_databases,
+            reads_main_db,
         };
         Ok(prepared)
     }
