@@ -1895,6 +1895,9 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CommitStateMachine<Clock, A> {
             self.commit_coordinator.note_written(ticket);
             if let Some(batch) = self.group_batch.as_mut() {
                 batch.advanced_through = Some(ticket);
+                if batch.writing.sync_mode == SyncMode::Full {
+                    self.commit_coordinator.note_full_sync_written(ticket);
+                }
             }
         }
         if let Some(tx) = mvcc_store.txs.get(&owner_tx) {
@@ -1932,6 +1935,10 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CommitStateMachine<Clock, A> {
         }
         crate::without_allocation_faults!(mvcc_store.remove_tx(owner_tx).expect(ALLOC_ERR_MSG));
         Ok(())
+    }
+
+    fn log_sync_required(&self) -> bool {
+        self.sync_mode == SyncMode::Full || self.commit_coordinator.needs_full_sync()
     }
 
     fn take_writing_log_record(&mut self, end_ts: u64, alloc: DynAllocator) -> LogRecord {
@@ -3378,7 +3385,9 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> StateTransition for CommitStat
                         CommitState::BeginCommitLogicalLog { log_record, .. } => log_record,
                         _ => unreachable!(),
                     };
-                    let ticket = self.commit_coordinator.enqueue(self.tx_id, log_record);
+                    let ticket =
+                        self.commit_coordinator
+                            .enqueue(self.tx_id, log_record, self.sync_mode);
                     self.state = CommitState::AwaitGroupCommit { end_ts, ticket };
                     return Ok(TransitionResult::Continue);
                 }
@@ -3507,9 +3516,9 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> StateTransition for CommitStat
             }
 
             CommitState::SyncLogicalLog { end_ts } => {
-                // Skip fsync when synchronous mode is not FULL.
+                // Skip fsync unless this transaction or a written group member uses FULL.
                 // NORMAL mode skips fsync on commit (but still fsyncs on checkpoint).
-                if self.sync_mode != SyncMode::Full {
+                if !self.log_sync_required() {
                     tracing::debug!("Skipping fsync of logical log (synchronous!=full)");
                     self.state = CommitState::EndCommitLogicalLog { end_ts: *end_ts };
                     return Ok(TransitionResult::Continue);
@@ -3524,7 +3533,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> StateTransition for CommitStat
             }
             CommitState::SyncGroupPrefix { end_ts, ticket } => {
                 let (end_ts, ticket) = (*end_ts, *ticket);
-                if self.sync_mode != SyncMode::Full {
+                if !self.log_sync_required() {
                     self.state = CommitState::GroupPrefixSynced { end_ts, ticket };
                     return Ok(TransitionResult::Continue);
                 }
