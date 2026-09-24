@@ -1496,14 +1496,9 @@ fn test_fts_functions_require_selected_index(tmp_db: TempDatabase) {
     for sql in [
         "SELECT fts_match('salt and pepper', 'quick AND fox')",
         "SELECT fts_score('quick fox', 'quick')",
-        "SELECT fts_highlight('quick fox', '<b>', '</b>', 'quick')",
         "SELECT 'quick fox' MATCH 'quick'",
         "SELECT fts_match(other, 'quick') FROM docs",
         "SELECT fts_score(body, 'quick') FROM docs WHERE id = 1",
-        "SELECT fts_highlight(body, '<b>', '</b>', 'quick') FROM docs WHERE id = 1",
-        "SELECT fts_highlight(other, '<b>', '</b>', 'quick') FROM docs WHERE fts_match(body, 'quick')",
-        "SELECT fts_highlight('quick fox', '<b>', '</b>', 'quick') FROM docs WHERE fts_match(body, 'quick')",
-        "SELECT fts_highlight(body, '<b>', '</b>', 'fox') FROM docs WHERE fts_match(body, 'quick')",
         "SELECT fts_match(body, 'fox') FROM docs WHERE fts_match(body, 'quick')",
         "SELECT fts_score(body, 'fox') FROM docs WHERE fts_match(body, 'quick')",
         "SELECT id FROM docs WHERE fts_match(body, 'quick') OR fts_match(body, 'fox')",
@@ -1515,6 +1510,35 @@ fn test_fts_functions_require_selected_index(tmp_db: TempDatabase) {
         );
         assert!(error.to_string().contains("FTS"), "{sql}: {error}");
     }
+}
+
+#[cfg(all(feature = "fts", not(target_family = "wasm")))]
+#[turso_macros::test]
+fn test_fts_highlight_without_selected_index(tmp_db: TempDatabase) {
+    let conn = tmp_db.connect_limbo();
+    conn.execute("CREATE TABLE docs(id INTEGER PRIMARY KEY, body TEXT)")
+        .unwrap();
+    conn.execute("INSERT INTO docs VALUES (1, 'haystack'), (2, 'a needle in the haystack')")
+        .unwrap();
+
+    assert_eq!(
+        limbo_exec_rows(
+            &conn,
+            "SELECT fts_highlight(body, '<b>', '</b>', 'needle') FROM docs WHERE id = 2"
+        ),
+        vec![vec![rusqlite::types::Value::Text(
+            "a <b>needle</b> in the haystack".to_string()
+        )]]
+    );
+    assert_eq!(
+        limbo_exec_rows(
+            &conn,
+            "SELECT fts_highlight('quick fox', '<b>', '</b>', 'fox')"
+        ),
+        vec![vec![rusqlite::types::Value::Text(
+            "quick <b>fox</b>".to_string()
+        )]]
+    );
 }
 
 #[cfg(all(feature = "fts", not(target_family = "wasm")))]

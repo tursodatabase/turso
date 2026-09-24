@@ -2061,13 +2061,17 @@ pub fn translate_expr(
                     }
                 },
                 #[cfg(all(feature = "fts", not(target_family = "wasm")))]
-                Func::Fts(FtsFunc::Highlight | FtsFunc::Score) => {
-                    let suffix_len = if matches!(func_ctx.func, Func::Fts(FtsFunc::Score)) {
-                        1
-                    } else {
-                        3
-                    };
-                    let indexed_columns = args.len().checked_sub(suffix_len).filter(|&n| n > 0);
+                Func::Fts(FtsFunc::Highlight) => translate_function(
+                    program,
+                    args,
+                    referenced_tables,
+                    resolver,
+                    target_register,
+                    func_ctx,
+                ),
+                #[cfg(all(feature = "fts", not(target_family = "wasm")))]
+                Func::Fts(FtsFunc::Score) => {
+                    let indexed_columns = args.len().checked_sub(1).filter(|&n| n > 0);
                     let selected_index = indexed_columns.and_then(|n| {
                         let ast::Expr::Column { table, .. } = args[0].as_ref() else {
                             return None;
@@ -2081,7 +2085,7 @@ pub fn translate_expr(
                                             == crate::index_method::fts::FTS_INDEX_METHOD_NAME
                                     }) && query.arguments.first().is_some_and(|indexed_query| {
                                         exprs_are_equivalent(indexed_query, args.last().unwrap())
-                                    }) && (suffix_len != 1 || {
+                                    }) && {
                                         let fields = query.index.columns.iter().enumerate()
                                             .filter(|(_, indexed)| args[..n].iter().any(|arg| {
                                                 matches!(arg.as_ref(), ast::Expr::Column { column, .. }
@@ -2094,7 +2098,7 @@ pub fn translate_expr(
                                             && query.arguments.last() == Some(&ast::Expr::Literal(
                                                 ast::Literal::String(format!("'{fields}'"))
                                             ))
-                                    })
+                                    }
                                         && args[..n].iter().all(|arg| {
                                             matches!(arg.as_ref(), ast::Expr::Column { table, column, .. }
                                                 if *table == table_ref.internal_id && query.index.columns.iter().any(|indexed| indexed.pos_in_table == *column))
@@ -2111,30 +2115,19 @@ pub fn translate_expr(
                             name.as_str()
                         );
                     };
-                    if suffix_len == 1 {
-                        let cursor_id = program
-                            .resolve_cursor_id(&CursorKey::index(table, query.index.clone()));
-                        let score_column = if matches!(
-                            query.pattern_idx as i64,
-                            crate::index_method::fts::FTS_PATTERN_MATCH_LIMIT
-                                | crate::index_method::fts::FTS_PATTERN_MATCH
-                        ) {
-                            1
-                        } else {
-                            0
-                        };
-                        program.emit_column_or_rowid(cursor_id, score_column, target_register);
-                        Ok(target_register)
+                    let cursor_id =
+                        program.resolve_cursor_id(&CursorKey::index(table, query.index.clone()));
+                    let score_column = if matches!(
+                        query.pattern_idx as i64,
+                        crate::index_method::fts::FTS_PATTERN_MATCH_LIMIT
+                            | crate::index_method::fts::FTS_PATTERN_MATCH
+                    ) {
+                        1
                     } else {
-                        translate_function(
-                            program,
-                            args,
-                            referenced_tables,
-                            resolver,
-                            target_register,
-                            func_ctx,
-                        )
-                    }
+                        0
+                    };
+                    program.emit_column_or_rowid(cursor_id, score_column, target_register);
+                    Ok(target_register)
                 }
                 #[cfg(all(feature = "fts", not(target_family = "wasm")))]
                 Func::Fts(FtsFunc::Match) => {
