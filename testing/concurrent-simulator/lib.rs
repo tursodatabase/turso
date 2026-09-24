@@ -31,6 +31,7 @@ pub mod chaotic_btree;
 pub mod chaotic_elle;
 pub mod elle;
 pub mod error_handling;
+pub mod fts;
 mod io;
 #[cfg(all(any(unix, target_os = "windows"), target_pointer_width = "64"))]
 pub mod multiprocess;
@@ -315,6 +316,7 @@ pub struct WhopperOpts {
     /// invalidate the connection's cursors and page cache, so allowing one
     /// would break the suspended statement.
     pub checkpoint_probe_probability: f64,
+    pub fts_profile: Option<fts::FtsProfile>,
 }
 
 /// Schema-generation bias
@@ -365,6 +367,7 @@ impl Default for WhopperOpts {
             reopen_probability: 0.0,
             allocation_fault_probability: 0.0,
             checkpoint_probe_probability: 0.01,
+            fts_profile: None,
         }
     }
 }
@@ -558,6 +561,13 @@ pub struct Stats {
     pub sequence_nextvals: usize,
     /// FTS self-differential checks that ran to completion
     pub fts_checks: usize,
+    pub fts_crash_checks: usize,
+    pub fts_abandoned_statements: usize,
+    pub fts_optimizes: usize,
+    pub fts_savepoint_rollbacks: usize,
+    pub fts_snapshot_reads: usize,
+    pub fts_commits: usize,
+    pub fts_checkpoints: usize,
     /// Same-connection checkpoint probes fired against suspended statements
     pub checkpoint_probes: usize,
 }
@@ -686,11 +696,23 @@ pub struct Whopper {
     allocation_fault_injector: Option<&'static SimulatorAllocationFaultInjector>,
     /// See [`WhopperOpts::checkpoint_probe_probability`].
     checkpoint_probe_probability: f64,
+    fts_profile: Option<fts::FtsProfile>,
 }
 
 impl Whopper {
     /// Create a new Whopper simulator with the given options.
     pub fn new(opts: WhopperOpts) -> anyhow::Result<Self> {
+        if opts.fts_profile.is_some() {
+            anyhow::ensure!(opts.enable_mvcc, "FTS profiles require MVCC");
+            anyhow::ensure!(
+                !opts.enable_encryption,
+                "FTS crash snapshots do not support encryption"
+            );
+            anyhow::ensure!(
+                opts.max_connections >= 2,
+                "FTS profiles require at least two connections"
+            );
+        }
         let seed = opts.seed.unwrap_or_else(|| {
             let mut rng = rand::rng();
             rng.next_u64()
@@ -850,6 +872,7 @@ impl Whopper {
             close_connections_gracefully: opts.close_connections_gracefully,
             allocation_fault_injector,
             checkpoint_probe_probability: opts.checkpoint_probe_probability,
+            fts_profile: opts.fts_profile,
         };
 
         whopper.open_connections()?;
@@ -877,9 +900,12 @@ impl Whopper {
             return Ok(StepResult::Ok);
         }
 
+        let _cache_budget =
+            fts::FtsCacheBudget::new(self.fts_profile == Some(fts::FtsProfile::Snapshots));
         let fiber_idx = self.current_step % self.context.fibers.len();
         self.perform_work(fiber_idx)?;
         self.io.step()?;
+        self.step_fts_faults(fiber_idx)?;
         self.current_step += 1;
 
         if file_size_soft_limit_exceeded(&self.wal_path, self.file_sizes.clone()) {
@@ -1104,6 +1130,9 @@ impl Whopper {
             }
 
             completed_op.finish_op(&mut ctx, &op_result);
+            if self.fts_profile.is_some() && op_result.is_ok() {
+                ctx.stats.record_fts_op(&completed_op);
+            }
 
             for property in &self.properties {
                 let mut property = property.lock().unwrap();
@@ -1316,6 +1345,9 @@ impl Whopper {
                 StepResult::WalSizeLimitExceeded => break,
             }
         }
+        if self.fts_profile.is_some() {
+            self.reopen()?;
+        }
         self.finalize_properties()?;
         Ok(())
     }
@@ -1394,7 +1426,11 @@ impl Whopper {
     /// for a statement that finished during reopen drain. Mirrors the
     /// finish-op block of `step()` so the property checker sees drained
     /// commits and rollbacks rather than silently losing them.
-    fn finalize_drained_statement(&mut self, fiber_idx: usize, op_result: OpResult) {
+    fn finalize_drained_statement(
+        &mut self,
+        fiber_idx: usize,
+        op_result: OpResult,
+    ) -> anyhow::Result<()> {
         let fiber = &mut self.context.fibers[fiber_idx];
         let completed_op = fiber.current_op.take();
         let exec_id = fiber.execution_id.take();
@@ -1416,10 +1452,10 @@ impl Whopper {
         );
 
         let Some(completed_op) = completed_op else {
-            return;
+            return Ok(());
         };
         let Some(exec_id) = exec_id else {
-            return;
+            return Ok(());
         };
 
         // Apply state-machine changes (the same call site as step()'s
@@ -1432,10 +1468,13 @@ impl Whopper {
             rng: &mut self.rng,
         };
         completed_op.finish_op(&mut ctx, &op_result);
+        if self.fts_profile.is_some() && op_result.is_ok() {
+            ctx.stats.record_fts_op(&completed_op);
+        }
 
         for property in &self.properties {
             let mut property = property.lock().unwrap();
-            if let Err(e) = property.finish_op(
+            property.finish_op(
                 self.current_step,
                 fiber_idx,
                 txn_id,
@@ -1443,10 +1482,13 @@ impl Whopper {
                 current_exec_id,
                 &completed_op,
                 &op_result,
-            ) {
-                error!("property failed during drain: {e}");
-            }
+            )?;
         }
+        let fiber = &mut self.context.fibers[fiber_idx];
+        if let Some(workload) = fiber.chaotic_workload.as_mut() {
+            workload.next(Some(fiber.last_chaotic_result.take().unwrap_or(op_result)));
+        }
+        Ok(())
     }
 
     /// Drain in-flight statements on all fibers. Used before reopen.
@@ -1480,7 +1522,7 @@ impl Whopper {
                 let Some(op_result) = self.step_drained_statement(fiber_idx) else {
                     continue;
                 };
-                self.finalize_drained_statement(fiber_idx, op_result);
+                self.finalize_drained_statement(fiber_idx, op_result)?;
             }
             self.io.step()?;
             drain_iterations += 1;
@@ -1540,6 +1582,7 @@ impl Whopper {
             "Database restarted with {} fibers",
             self.context.fibers.len()
         );
+        self.check_fts_after_reopen()?;
         Ok(())
     }
 

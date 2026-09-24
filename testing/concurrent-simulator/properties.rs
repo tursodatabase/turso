@@ -306,8 +306,8 @@ impl Property for IntegrityCheckProperty {
 }
 
 /// The FTS self-differential: `fts_match` and a base-table token scan run
-/// inside one statement (one snapshot), so their id sets must be equal —
-/// the operation's SQL reports the size of the symmetric difference, plus
+/// inside one statement (one snapshot), so their id multiplicities must be equal —
+/// the operation's SQL reports the total multiplicity difference, plus
 /// whether the FTS index still exists (without it `fts_match` silently
 /// falls back to a scalar scan and the comparison proves nothing).
 pub struct FtsSelfDifferentialProperty;
@@ -340,7 +340,7 @@ impl Property for FtsSelfDifferentialProperty {
         let Some(row) = rows.first() else {
             bail!("step {step} fiber {fiber_id}: the FTS differential returned no row");
         };
-        let symmetric_difference = row.first().and_then(Value::as_int);
+        let multiplicity_difference = row.first().and_then(Value::as_int);
         let index_present = row.get(1).and_then(Value::as_int);
         if index_present != Some(1) {
             bail!(
@@ -350,11 +350,11 @@ impl Property for FtsSelfDifferentialProperty {
                 crate::workloads::FTS_SIM_INDEX
             );
         }
-        if symmetric_difference != Some(0) {
+        if multiplicity_difference != Some(0) {
             bail!(
                 "step {step} fiber {fiber_id}: fts_match and the base-table scan disagree \
-                 for token {token:?}: symmetric difference {symmetric_difference:?} \
-                 (fts-only ids: {:?}, scan-only ids: {:?})",
+                 for token {token:?}: multiplicity difference {multiplicity_difference:?} \
+                 (fts counts above scan: {:?}, scan counts above fts: {:?})",
                 row.get(2),
                 row.get(3)
             );
@@ -2133,6 +2133,46 @@ impl Property for SequenceCorrectnessProperty {
 #[allow(clippy::items_after_test_module)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fts_differential_accepts_matching_multiplicities() {
+        let mut property = FtsSelfDifferentialProperty;
+        let op = Operation::FtsMatchDifferential {
+            token: "alpha".to_string(),
+        };
+        let result = Ok(vec![vec![
+            Value::from_i64(0),
+            Value::from_i64(1),
+            Value::Null,
+            Value::Null,
+        ]]);
+
+        property.finish_op(4, 2, None, 8, 9, &op, &result).unwrap();
+    }
+
+    #[test]
+    fn fts_differential_rejects_duplicate_match_rows() {
+        let mut property = FtsSelfDifferentialProperty;
+        let op = Operation::FtsMatchDifferential {
+            token: "alpha".to_string(),
+        };
+        let result = Ok(vec![vec![
+            Value::from_i64(1),
+            Value::from_i64(1),
+            Value::build_text("7:2/1"),
+            Value::Null,
+        ]]);
+
+        let error = property
+            .finish_op(4, 2, None, 8, 9, &op, &result)
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("multiplicity difference Some(1)")
+        );
+        assert!(error.to_string().contains("7:2/1"));
+    }
 
     fn test_output_path(label: &str) -> PathBuf {
         std::env::temp_dir().join(format!(
