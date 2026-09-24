@@ -1271,12 +1271,12 @@ impl ProgramState {
     }
 
     pub(crate) fn record_statement_change(&self) {
-        self.n_change.fetch_add(1, Ordering::SeqCst);
-        self.n_total_change.fetch_add(1, Ordering::SeqCst);
+        bump_change_count(&self.n_change);
+        bump_change_count(&self.n_total_change);
     }
 
     pub(crate) fn record_total_change(&self) {
-        self.n_total_change.fetch_add(1, Ordering::SeqCst);
+        bump_change_count(&self.n_total_change);
     }
 
     /// Whether this statement may finish the implicit autocommit transaction
@@ -3701,6 +3701,14 @@ impl Deref for Program {
     }
 }
 
+#[inline(always)]
+fn bump_change_count(count: &AtomicI64) {
+    count.store(
+        count.load(Ordering::Relaxed).wrapping_add(1),
+        Ordering::Relaxed,
+    );
+}
+
 /// Split a register slice into an immutable ref and a mutable ref at two distinct indices.
 pub(crate) fn split_registers(
     registers: &mut [Register],
@@ -4102,6 +4110,18 @@ fn decode_serial_type_into_register(
 mod tests {
     use super::*;
     use std::panic::{catch_unwind, AssertUnwindSafe};
+
+    #[test]
+    fn change_count_increment_matches_atomic_wraparound() {
+        let expected = AtomicI64::new(i64::MAX);
+        expected.fetch_add(1, Ordering::Relaxed);
+        let expected = expected.load(Ordering::Relaxed);
+
+        let actual = AtomicI64::new(i64::MAX);
+        bump_change_count(&actual);
+
+        assert_eq!(actual.load(Ordering::Relaxed), expected);
+    }
 
     #[test]
     fn program_step_conversion_preserves_error_allocation() {
