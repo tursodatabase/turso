@@ -1,0 +1,43 @@
+@database :temp:
+@skip-file-if sqlite "MVCC is not supported in SQLite"
+
+# Regression coverage for https://github.com/tursodatabase/turso/issues/9284:
+# a trigger or view row rewritten by ALTER TABLE RENAME after a checkpoint and
+# then dropped came back in sqlite_schema after the next checkpoint.
+
+test mvcc-dropped-trigger-stays-dropped-after-rename-and-checkpoint {
+    PRAGMA journal_mode='MVCC';
+    CREATE TABLE t1(id INTEGER PRIMARY KEY, a);
+    CREATE TABLE log(x);
+    CREATE TRIGGER tr AFTER INSERT ON t1 BEGIN INSERT INTO log VALUES(new.id); END;
+    PRAGMA wal_checkpoint(TRUNCATE);
+    ALTER TABLE t1 RENAME TO t2;
+    ALTER TABLE t2 RENAME TO t1;
+    DROP TRIGGER tr;
+    PRAGMA wal_checkpoint(TRUNCATE);
+    SELECT count(*) FROM sqlite_schema WHERE type='trigger';
+}
+expect {
+   mvcc
+   0|0|0
+   0|0|0
+   0
+}
+
+test mvcc-dropped-view-stays-dropped-after-rename-and-checkpoint {
+    PRAGMA journal_mode='MVCC';
+    CREATE TABLE t1(id INTEGER PRIMARY KEY, a);
+    CREATE VIEW v AS SELECT a FROM t1;
+    PRAGMA wal_checkpoint(TRUNCATE);
+    ALTER TABLE t1 RENAME TO t2;
+    ALTER TABLE t2 RENAME TO t1;
+    DROP VIEW v;
+    PRAGMA wal_checkpoint(TRUNCATE);
+    SELECT count(*) FROM sqlite_schema WHERE type='view';
+}
+expect {
+   mvcc
+   0|0|0
+   0|0|0
+   0
+}
