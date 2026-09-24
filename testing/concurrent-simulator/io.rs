@@ -14,13 +14,37 @@ use turso_core::{
 pub struct IOFaultConfig {
     /// Probability of a cosmic ray bit flip on write (0.0-1.0)
     pub cosmic_ray_probability: f64,
+    /// If false, cosmic rays use the random numbers of a flip but change no bit.
+    pub flip_cosmic_ray_bits: bool,
 }
 
 impl Default for IOFaultConfig {
     fn default() -> Self {
         Self {
             cosmic_ray_probability: 0.0,
+            flip_cosmic_ray_bits: true,
         }
+    }
+}
+
+/// A bit that a cosmic ray flipped in a file that was open at that time.
+#[derive(Debug, Clone)]
+pub struct CosmicRayFlip {
+    pub time_micros: u64,
+    pub path: String,
+    pub offset: usize,
+    pub bit: u32,
+    pub old_byte: u8,
+    pub new_byte: u8,
+}
+
+impl std::fmt::Display for CosmicRayFlip {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "time {}us, file {}, offset {}, bit {} (0x{:02x} -> 0x{:02x})",
+            self.time_micros, self.path, self.offset, self.bit, self.old_byte, self.new_byte
+        )
     }
 }
 
@@ -39,6 +63,7 @@ pub struct SimulatorIO {
     /// Simulated time in microseconds, incremented on each step
     time: AtomicU64,
     pending: PendingQueue,
+    cosmic_ray_flips: Mutex<Vec<CosmicRayFlip>>,
 }
 
 impl SimulatorIO {
@@ -52,7 +77,20 @@ impl SimulatorIO {
             fault_config,
             time: AtomicU64::new(0),
             pending: Arc::new(Mutex::new(Vec::new())),
+            cosmic_ray_flips: Mutex::new(Vec::new()),
         }
+    }
+
+    /// The cosmic-ray flips that hit `path`, oldest first.
+    pub fn cosmic_ray_flips_into(&self, path: &str) -> Vec<CosmicRayFlip> {
+        let key = canonical_key(path);
+        self.cosmic_ray_flips
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|flip| flip.path == key)
+            .cloned()
+            .collect()
     }
 
     pub fn file_sizes(&self) -> Arc<Mutex<HashMap<String, u64>>> {
@@ -207,6 +245,7 @@ impl IO for SimulatorIO {
                     let files = self.files.lock().unwrap();
                     files
                         .iter()
+                        .filter(|(_, file)| Arc::strong_count(file) > 1)
                         .map(|(path, file)| (path.clone(), file.clone()))
                         .collect()
                 };
@@ -217,7 +256,10 @@ impl IO for SimulatorIO {
 
                     // Get the actual file size (not the mmap size)
                     let file_size = *file.size.lock().unwrap();
-                    if file_size > 0 {
+                    if file_size > 0 && !self.fault_config.flip_cosmic_ray_bits {
+                        rng.random_range(0..file_size);
+                        rng.random_range(0..8u32);
+                    } else if file_size > 0 {
                         // Pick a random offset within the actual file size
                         let byte_offset = rng.random_range(0..file_size);
                         let bit_idx = rng.random_range(0..8);
@@ -229,6 +271,14 @@ impl IO for SimulatorIO {
                             "Cosmic ray! File: {} - Flipped bit {} at offset {} (0x{:02x} -> 0x{:02x})",
                             path, bit_idx, byte_offset, old_byte, mmap[byte_offset]
                         );
+                        self.cosmic_ray_flips.lock().unwrap().push(CosmicRayFlip {
+                            time_micros: self.time.load(Ordering::Relaxed),
+                            path: path.clone(),
+                            offset: byte_offset,
+                            bit: bit_idx,
+                            old_byte,
+                            new_byte: mmap[byte_offset],
+                        });
                     }
                 }
             }
