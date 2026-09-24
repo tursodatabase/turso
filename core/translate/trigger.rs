@@ -527,20 +527,20 @@ pub fn translate_drop_trigger(
     let namespace = resolver.resolve_existing_trigger(trigger_name)?;
     let database_id = namespace.database_id;
     let schema_cookie = resolver.with_schema(database_id, |s| s.schema_version);
-    program.begin_write_on_database(database_id, schema_cookie)?;
-    program.begin_write_operation()?;
     let normalized_trigger_name = normalize_ident(trigger_name.name.as_str());
 
-    // Check if trigger exists
     if resolver.with_schema(database_id, |s| {
         s.get_trigger(namespace.id, &normalized_trigger_name)
             .is_none()
     }) {
         if if_exists {
+            program.begin_read_on_database(database_id, schema_cookie)?;
             return Ok(());
         }
         bail_parse_error!("no such trigger: {}", normalized_trigger_name);
     }
+    program.begin_write_on_database(database_id, schema_cookie)?;
+    program.begin_write_operation()?;
 
     let opts = ProgramBuilderOpts::new(1, 30, 1);
     program.extend(&opts);
