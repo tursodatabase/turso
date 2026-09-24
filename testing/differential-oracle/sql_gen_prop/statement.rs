@@ -14,7 +14,9 @@ use crate::drop_index::DropIndexStatement;
 use crate::drop_table::{DropTableStatement, drop_table_for_schema, drop_table_for_table};
 use crate::drop_trigger::{DropTriggerStatement, drop_trigger_for_schema};
 use crate::generator::SqlGeneratorKind;
-use crate::insert::{InsertStatement, insert_for_table};
+use crate::insert::{
+    InsertStatement, insert_for_table, insert_or_replace_for_table, upsert_for_table,
+};
 use crate::materialized_view::{
     CreateMaterializedViewStatement, create_materialized_view, drop_materialized_view,
     materialized_view_sources,
@@ -50,6 +52,8 @@ pub enum SqlStatement {
     // DML
     Select(SelectStatement),
     Insert(InsertStatement),
+    InsertOrReplace(InsertStatement),
+    Upsert(InsertStatement),
     Update(UpdateStatement),
     Delete(DeleteStatement),
 
@@ -92,7 +96,9 @@ impl fmt::Display for SqlStatement {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             SqlStatement::Select(s) => write!(f, "{s}"),
-            SqlStatement::Insert(s) => write!(f, "{s}"),
+            SqlStatement::Insert(s)
+            | SqlStatement::InsertOrReplace(s)
+            | SqlStatement::Upsert(s) => write!(f, "{s}"),
             SqlStatement::Update(s) => write!(f, "{s}"),
             SqlStatement::Delete(s) => write!(f, "{s}"),
             SqlStatement::CreateTable(s) => write!(f, "{s}"),
@@ -158,6 +164,8 @@ impl StatementKind {
             self,
             StatementKind::Select
                 | StatementKind::Insert
+                | StatementKind::InsertOrReplace
+                | StatementKind::Upsert
                 | StatementKind::Update
                 | StatementKind::Delete
         )
@@ -188,6 +196,8 @@ impl SqlGeneratorKind for StatementKind {
             | StatementKind::Insert
             | StatementKind::Update
             | StatementKind::Delete => !schema.tables.is_empty(),
+            StatementKind::InsertOrReplace => schema.tables.iter().any(has_primary_key),
+            StatementKind::Upsert => schema.tables.iter().any(can_upsert),
 
             // DDL - Table operations
             StatementKind::CreateTable => true,
@@ -227,6 +237,8 @@ impl SqlGeneratorKind for StatementKind {
             // DML requires tables
             StatementKind::Select
             | StatementKind::Insert
+            | StatementKind::InsertOrReplace
+            | StatementKind::Upsert
             | StatementKind::Update
             | StatementKind::Delete => true,
 
@@ -285,6 +297,22 @@ impl SqlGeneratorKind for StatementKind {
                     .prop_map(SqlStatement::Insert)
                     .boxed()
             }),
+            StatementKind::InsertOrReplace => {
+                let tables = tables.iter().filter(|t| has_primary_key(t)).cloned();
+                table_dml(Rc::new(tables.collect()), schema, profile, |t, s, p| {
+                    insert_or_replace_for_table(t, s, p)
+                        .prop_map(SqlStatement::InsertOrReplace)
+                        .boxed()
+                })
+            }
+            StatementKind::Upsert => {
+                let tables = tables.iter().filter(|t| can_upsert(t)).cloned();
+                table_dml(Rc::new(tables.collect()), schema, profile, |t, s, p| {
+                    upsert_for_table(t, s, p)
+                        .prop_map(SqlStatement::Upsert)
+                        .boxed()
+                })
+            }
             StatementKind::Update => table_dml(tables, schema, profile, |t, s, p| {
                 update_for_table(t, s, p)
                     .prop_map(SqlStatement::Update)
@@ -377,6 +405,14 @@ impl SqlGeneratorKind for StatementKind {
                 .boxed(),
         }
     }
+}
+
+fn has_primary_key(table: &TableRef) -> bool {
+    table.columns.iter().any(|c| c.primary_key)
+}
+
+fn can_upsert(table: &TableRef) -> bool {
+    has_primary_key(table) && table.columns.iter().any(|c| !c.primary_key)
 }
 
 /// Helper to create a table-based DML strategy.

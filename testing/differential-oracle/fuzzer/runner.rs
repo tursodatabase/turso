@@ -214,6 +214,8 @@ pub struct SimConfig {
     pub max_batch_size: usize,
     /// Probability that a step closes and reopens the Turso database.
     pub reopen_probability: f64,
+    /// Probability that a write that passed the check runs again unchanged.
+    pub redundant_dml_probability: f64,
 }
 
 impl Default for SimConfig {
@@ -237,6 +239,7 @@ impl Default for SimConfig {
             large_batch_probability: 0.0,
             max_batch_size: 10,
             reopen_probability: 0.0,
+            redundant_dml_probability: 0.0,
         }
     }
 }
@@ -260,6 +263,8 @@ pub struct SimStats {
     pub batches: usize,
     /// Times the Turso database was closed and reopened.
     pub reopens: usize,
+    /// Writes that ran a second time.
+    pub repeats: usize,
 }
 
 impl SimStats {
@@ -348,6 +353,10 @@ impl SimStats {
         table.add_row(vec![
             Cell::new("Reopens").fg(Color::Blue),
             Cell::new(self.reopens).fg(Color::Blue),
+        ]);
+        table.add_row(vec![
+            Cell::new("Repeated writes").fg(Color::Blue),
+            Cell::new(self.repeats).fg(Color::Blue),
         ]);
 
         table
@@ -923,6 +932,26 @@ impl Fuzzer {
         stats: &mut SimStats,
         executed_sql: &mut Vec<String>,
     ) -> Result<()> {
+        let ran = self.check_statement(i, stmt, schema, matviews, stats, executed_sql)?;
+        if ran && stmt.mutates_data && self.roll(self.config.redundant_dml_probability) {
+            stats.repeats += 1;
+            executed_sql.push("-- REPEAT".to_string());
+            self.check_statement(i, stmt, schema, matviews, stats, executed_sql)?;
+        }
+        Ok(())
+    }
+
+    /// Run one statement on both engines and compare the outcome. Returns
+    /// false when the statement was skipped.
+    fn check_statement(
+        &self,
+        i: usize,
+        stmt: &GeneratedStatement,
+        schema: &mut sql_gen::Schema,
+        matviews: &mut Matviews,
+        stats: &mut SimStats,
+        executed_sql: &mut Vec<String>,
+    ) -> Result<bool> {
         // A generated expression can branch into several subqueries at
         // each level. This occasionally produces hundreds of kilobytes of
         // SQL. Preparing such a statement uses enough recursive calls to
@@ -937,7 +966,7 @@ impl Fuzzer {
             );
             push_warning_comments(executed_sql, i, &reason);
             tracing::debug!("Skipped generated statement {i}: {reason}");
-            return Ok(());
+            return Ok(false);
         }
 
         if self.config.verbose {
@@ -960,7 +989,7 @@ impl Fuzzer {
                 push_warning_comments(executed_sql, i, &reason);
                 executed_sql.push(format!("-- SKIPPED: {}", stmt.sql));
                 tracing::debug!("Skipped generated statement {i}: {reason}");
-                return Ok(());
+                return Ok(false);
             }
             OracleResult::Warning(reason) => {
                 stats.statements_executed += 1;
@@ -999,7 +1028,7 @@ impl Fuzzer {
         if stmt.mutates_data {
             self.verify_matviews(matviews, stats, executed_sql)?;
         }
-        Ok(())
+        Ok(true)
     }
 
     /// Compare every materialized view on Turso with the plain view on SQLite.
@@ -1352,6 +1381,7 @@ mod tests {
             large_batch_probability: 0.0,
             max_batch_size: 10,
             reopen_probability: 0.0,
+            redundant_dml_probability: 0.0,
         };
         let sim = Fuzzer::new(config);
         assert!(sim.is_ok());
@@ -1548,6 +1578,37 @@ mod tests {
             ]
         );
         assert_eq!(stats.batches, 1);
+        assert_eq!(stats.oracle_failures, 0);
+    }
+
+    #[test]
+    fn a_write_that_passes_runs_once_more_and_views_are_compared_after_it() {
+        let mut fuzzer = matview_fuzzer();
+        fuzzer.config.redundant_dml_probability = 1.0;
+        let (mut stats, mut executed_sql) = (SimStats::default(), Vec::new());
+        let mut matviews = matview_over_t(&fuzzer, &mut executed_sql);
+        let mut schema = fuzzer.introspect_and_verify_schemas().unwrap();
+
+        fuzzer
+            .run_statement(
+                0,
+                &write("INSERT OR REPLACE INTO t VALUES (7, 'r')"),
+                &mut schema,
+                &mut matviews,
+                &mut stats,
+                &mut executed_sql,
+            )
+            .unwrap();
+
+        assert_eq!(
+            &executed_sql[executed_sql.len() - 3..],
+            [
+                "INSERT OR REPLACE INTO t VALUES (7, 'r')",
+                "-- REPEAT",
+                "INSERT OR REPLACE INTO t VALUES (7, 'r')"
+            ]
+        );
+        assert_eq!(stats.repeats, 1);
         assert_eq!(stats.oracle_failures, 0);
     }
 

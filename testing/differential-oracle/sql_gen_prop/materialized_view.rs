@@ -62,6 +62,11 @@ enum Shape {
     UnionAll,
     /// Two joins of t and u on different columns of u, combined with UNION ALL
     UnionAllJoin,
+    /// SELECT t.c AS c_l, u.c AS c_r FROM t JOIN u ON t.k = u.k WHERE <complex predicate>,
+    /// where `c` is a column name of both t and u
+    ComplexFilterJoin,
+    /// SELECT a.k, a.c, b.c FROM t a JOIN t b ON a.r = b.k WHERE <complex predicate>
+    ComplexFilterSelfJoin,
 }
 
 /// Tables and materialized views that a materialized view can read.
@@ -133,12 +138,14 @@ pub fn create_materialized_view(schema: &Schema) -> BoxedStrategy<CreateMaterial
         (1, Shape::Star),
         (2, Shape::FilteredColumns),
         (1, Shape::Aggregate),
+        (1, Shape::ComplexFilterSelfJoin),
     ];
     if sources.len() >= 2 {
         shapes.extend([
             (1, Shape::Join),
             (1, Shape::UnionAll),
             (1, Shape::UnionAllJoin),
+            (1, Shape::ComplexFilterJoin),
         ]);
     }
     let shape = proptest::strategy::Union::new_weighted(
@@ -183,8 +190,18 @@ fn select_for_shape(
         .filter(|t| t.columns.len() >= 2)
         .cloned()
         .collect();
+    let same_name_others: Vec<TableRef> = others
+        .iter()
+        .filter(|t| same_name_columns(&source, t).is_some())
+        .cloned()
+        .collect();
     let name = source.name.clone();
     let filterable: Vec<ColumnDef> = source.filterable_columns().cloned().collect();
+    let integer_columns = source
+        .columns
+        .iter()
+        .filter(|c| c.data_type == DataType::Integer)
+        .count();
     match shape {
         Shape::FilteredColumns if source.columns.len() >= 2 && !filterable.is_empty() => {
             let projected = &source.columns[..source.columns.len().min(3)];
@@ -225,17 +242,28 @@ fn select_for_shape(
             vec![ColumnDef::new("cnt", DataType::Integer)],
         ))
         .boxed(),
-        Shape::Star | Shape::FilteredColumns => Just((
+        Shape::ComplexFilterSelfJoin if integer_columns >= 2 => (0..COMPLEX_PREDICATE_KINDS)
+            .prop_map(move |kind| complex_filter_self_join(&source, kind))
+            .boxed(),
+        Shape::Star | Shape::FilteredColumns | Shape::ComplexFilterSelfJoin => Just((
             format!("SELECT * FROM {name}"),
             view_columns(&source.columns),
         ))
         .boxed(),
+        Shape::ComplexFilterJoin if !same_name_others.is_empty() => (
+            proptest::sample::select(same_name_others),
+            0..COMPLEX_PREDICATE_KINDS,
+        )
+            .prop_map(move |(other, kind)| complex_filter_join(&source, &other, kind))
+            .boxed(),
         Shape::UnionAllJoin if !wide_others.is_empty() => proptest::sample::select(wide_others)
             .prop_map(move |other| union_all_join(&source, &other))
             .boxed(),
-        Shape::Join | Shape::UnionAllJoin => proptest::sample::select(others)
-            .prop_map(move |other| join(&source, &other))
-            .boxed(),
+        Shape::Join | Shape::UnionAllJoin | Shape::ComplexFilterJoin => {
+            proptest::sample::select(others)
+                .prop_map(move |other| join(&source, &other))
+                .boxed()
+        }
         Shape::UnionAll => proptest::sample::select(others)
             .prop_map(move |other| union_all(&source, &other))
             .boxed(),
@@ -306,6 +334,98 @@ fn union_all_join(left: &Table, right: &Table) -> (String, Vec<ColumnDef>) {
             ColumnDef::new("c1", right.columns[0].data_type),
         ],
     )
+}
+
+fn complex_filter_join(left: &Table, right: &Table, kind: u32) -> (String, Vec<ColumnDef>) {
+    let (ln, rn) = (&left.name, &right.name);
+    let (l, r) = same_name_columns(left, right)
+        .expect("the right table was chosen because it shares a column name with the left one");
+    let (lk, rk) = (&join_key(left).name, &join_key(right).name);
+    let c = &l.name;
+    let predicate = complex_predicate(&format!("{ln}.{lk}"), kind);
+    (
+        format!(
+            "SELECT {ln}.{c} AS {c}_l, {rn}.{c} AS {c}_r FROM {ln} JOIN {rn} \
+             ON {ln}.{lk} = {rn}.{rk} WHERE {predicate}"
+        ),
+        vec![
+            ColumnDef::new(format!("{c}_l"), l.data_type),
+            ColumnDef::new(format!("{c}_r"), r.data_type),
+        ],
+    )
+}
+
+/// A column name of both tables that is neither table's join key, so that the
+/// two projected columns hold different values.
+fn same_name_columns<'a>(
+    left: &'a Table,
+    right: &'a Table,
+) -> Option<(&'a ColumnDef, &'a ColumnDef)> {
+    let keys = [&join_key(left).name, &join_key(right).name];
+    left.columns
+        .iter()
+        .filter(|c| !keys.contains(&&c.name))
+        .find_map(|l| {
+            right
+                .columns
+                .iter()
+                .find(|r| r.name == l.name)
+                .map(|r| (l, r))
+        })
+}
+
+/// The primary key if there is one, because a key that is never NULL pairs up
+/// more rows in a join.
+fn join_key(table: &Table) -> &ColumnDef {
+    table
+        .columns
+        .iter()
+        .find(|c| c.primary_key)
+        .unwrap_or(&table.columns[0])
+}
+
+fn complex_filter_self_join(table: &Table, kind: u32) -> (String, Vec<ColumnDef>) {
+    let t = &table.name;
+    let mut integers = table
+        .columns
+        .iter()
+        .filter(|c| c.data_type == DataType::Integer);
+    let (k, r) = (
+        &integers.next().unwrap().name,
+        &integers.next().unwrap().name,
+    );
+    let projected = table
+        .columns
+        .iter()
+        .find(|c| &c.name != k && &c.name != r)
+        .unwrap_or(&table.columns[1]);
+    let (c, data_type) = (&projected.name, projected.data_type);
+    let predicate = complex_predicate(&format!("a.{k}"), kind);
+    (
+        format!(
+            "SELECT a.{k} AS sjk, a.{c} AS sja, b.{c} AS sjb FROM {t} a JOIN {t} b \
+             ON a.{r} = b.{k} WHERE {predicate}"
+        ),
+        vec![
+            ColumnDef::new("sjk", DataType::Integer),
+            ColumnDef::new("sja", data_type),
+            ColumnDef::new("sjb", data_type),
+        ],
+    )
+}
+
+const COMPLEX_PREDICATE_KINDS: u32 = 4;
+
+/// A predicate that is not a plain comparison of a column with a literal or
+/// another column. Turso compiles such a filter over a join through an extra
+/// projection, which must keep the table of every column.
+fn complex_predicate(column: &str, kind: u32) -> String {
+    match kind {
+        0 => format!("{column} BETWEEN 0 AND 999999999"),
+        1 => format!("{column} IN (0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15)"),
+        2 => format!("CAST({column} AS TEXT) IS NOT NULL"),
+        _ => format!("CAST({column} AS TEXT) NOT LIKE '%zzq%'"),
+    }
 }
 
 /// A view column keeps the name and type of its source column but none of its constraints.
@@ -380,6 +500,7 @@ mod tests {
                     ColumnDef::new("id", DataType::Integer).primary_key(),
                     ColumnDef::new("name", DataType::Text),
                     ColumnDef::new("team", DataType::Text),
+                    ColumnDef::new("manager_id", DataType::Integer),
                 ],
             ))
             .add_table(Table::new(
@@ -446,5 +567,12 @@ mod tests {
             sqls.iter()
                 .any(|sql| sql.contains("UNION ALL") && sql.contains(" JOIN "))
         );
+        assert!(sqls.iter().any(|sql| {
+            sql.contains("SELECT users.name AS name_l, mv_users.name AS name_r")
+                || sql.contains("SELECT mv_users.name AS name_l, users.name AS name_r")
+        }));
+        assert!(sqls.iter().any(|sql| sql.contains(
+            "SELECT a.id AS sjk, a.name AS sja, b.name AS sjb FROM users a JOIN users b ON a.manager_id = b.id"
+        )));
     }
 }

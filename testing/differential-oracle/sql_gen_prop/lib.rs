@@ -61,7 +61,7 @@ pub use function::{
     Arity, FunctionCategory, FunctionContext, FunctionDef, FunctionProfile, FunctionRegistry,
 };
 pub use generator::{SqlGeneratorKind, WeightedKindIteratorExt};
-pub use insert::InsertStatement;
+pub use insert::{InsertStatement, OnConflict};
 pub use materialized_view::CreateMaterializedViewStatement;
 pub use profile::{
     CreateIndexProfile, CreateTableProfile, CreateTriggerProfile, DeleteProfile,
@@ -77,7 +77,7 @@ pub use transaction::{
 };
 pub use update::UpdateStatement;
 pub use utility::{AnalyzeStatement, ReindexStatement, VacuumStatement};
-pub use value::SqlValue;
+pub use value::{NarrowValueProfile, SqlValue};
 pub use view::{CreateViewStatement, DropViewStatement};
 
 /// Strategies for generating SQL values and statements.
@@ -108,7 +108,7 @@ pub mod strategies {
     // DROP TABLE
     pub use crate::drop_table::{drop_table, drop_table_for_schema, drop_table_for_table};
     // INSERT
-    pub use crate::insert::insert_for_table;
+    pub use crate::insert::{insert_for_table, insert_or_replace_for_table, upsert_for_table};
     // SELECT
     pub use crate::select::select_for_table;
     // Statement union
