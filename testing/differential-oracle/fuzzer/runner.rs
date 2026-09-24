@@ -207,6 +207,13 @@ pub struct SimConfig {
     pub weight_profile: WeightProfile,
     /// Generate materialized views: Turso maintains them, SQLite runs them as plain views.
     pub matview: bool,
+    /// Probability that a non-DDL statement starts a BEGIN ... COMMIT batch.
+    pub batch_probability: f64,
+    /// Probability that a batch holds 50-300 statements instead of 2..=`max_batch_size`.
+    pub large_batch_probability: f64,
+    pub max_batch_size: usize,
+    /// Probability that a step closes and reopens the Turso database.
+    pub reopen_probability: f64,
 }
 
 impl Default for SimConfig {
@@ -226,6 +233,10 @@ impl Default for SimConfig {
             recursive_cte_focus: false,
             weight_profile: WeightProfile::default(),
             matview: false,
+            batch_probability: 0.0,
+            large_batch_probability: 0.0,
+            max_batch_size: 10,
+            reopen_probability: 0.0,
         }
     }
 }
@@ -245,6 +256,10 @@ pub struct SimStats {
     pub errors: usize,
     /// Correlated SELECTs checked with unnesting forced and disabled.
     pub unnesting_invariants_checked: usize,
+    /// BEGIN ... COMMIT batches run.
+    pub batches: usize,
+    /// Times the Turso database was closed and reopened.
+    pub reopens: usize,
 }
 
 impl SimStats {
@@ -326,6 +341,14 @@ impl SimStats {
             Cell::new("Unnesting invariants").fg(Color::Blue),
             Cell::new(self.unnesting_invariants_checked).fg(Color::Blue),
         ]);
+        table.add_row(vec![
+            Cell::new("Batches").fg(Color::Blue),
+            Cell::new(self.batches).fg(Color::Blue),
+        ]);
+        table.add_row(vec![
+            Cell::new("Reopens").fg(Color::Blue),
+            Cell::new(self.reopens).fg(Color::Blue),
+        ]);
 
         table
     }
@@ -340,16 +363,25 @@ impl SimStats {
 pub struct Fuzzer {
     config: SimConfig,
     rng: RefCell<ChaCha8Rng>,
-    turso_conn: Arc<turso_core::Connection>,
+    turso_conn: RefCell<Arc<turso_core::Connection>>,
     sqlite_conn: rusqlite::Connection,
-    #[expect(dead_code)]
-    turso_db: Arc<Database>,
+    turso_db: RefCell<Arc<Database>>,
     /// In-memory IO for the Turso database.
     io: Arc<MemorySimIO>,
     /// Directory to save run artifacts
     pub out_dir: PathBuf,
     /// Captures panic hook info (location + backtrace) for the last panic.
     panic_context: Arc<Mutex<Option<String>>>,
+    /// The SQL that the current step runs, reported when the step panics.
+    current_sql: RefCell<String>,
+}
+
+/// What one iteration of the run loop does.
+enum Step {
+    Single(Generated),
+    /// Non-DDL statements run inside BEGIN ... COMMIT.
+    Batch(Vec<GeneratedStatement>),
+    Reopen,
 }
 
 impl RefUnwindSafe for Fuzzer {}
@@ -359,28 +391,20 @@ impl Fuzzer {
     ///
     /// Uses `MemorySimIO` for deterministic in-memory storage.
     pub fn new(config: SimConfig) -> Result<Self> {
-        let out_dir: PathBuf = "simulator-output".into();
+        Self::with_out_dir(config, "simulator-output".into())
+    }
+
+    /// `out_dir` also names the Turso database, and all opens of one path in a
+    /// process share one Turso database.
+    fn with_out_dir(config: SimConfig, out_dir: PathBuf) -> Result<Self> {
         let rng = ChaCha8Rng::seed_from_u64(config.seed);
 
         if !out_dir.exists() {
             std::fs::create_dir_all(&out_dir)?;
         }
 
-        // Create Turso in-memory database using MemorySimIO
         let io = Arc::new(MemorySimIO::new(config.seed));
-        let opts = turso_core::DatabaseOpts::new()
-            .with_attach(true)
-            .with_views(config.matview);
-
-        let turso_db = Database::open_file_with_flags(
-            io.clone(),
-            out_dir.join("test.db").to_str().unwrap(),
-            turso_core::OpenFlags::default(),
-            opts,
-            None,
-            Arc::new(SqliteDialect),
-        )?;
-        let turso_conn = turso_db.connect()?;
+        let (turso_db, turso_conn) = open_turso(&io, &out_dir, &config)?;
 
         // Create SQLite in-memory database
         let sqlite_conn = if config.keep_files {
@@ -394,10 +418,6 @@ impl Fuzzer {
         }
         .context("Failed to open SQLite database")?;
 
-        // Attach an in-memory database on both connections
-        turso_conn
-            .execute("ATTACH ':memory:' AS aux")
-            .context("Failed to ATTACH on Turso")?;
         sqlite_conn
             .execute("ATTACH ':memory:' AS aux", [])
             .context("Failed to ATTACH on SQLite")?;
@@ -413,13 +433,18 @@ impl Fuzzer {
         Ok(Self {
             config,
             rng: RefCell::new(rng),
-            turso_conn,
+            turso_conn: RefCell::new(turso_conn),
             sqlite_conn,
-            turso_db,
+            turso_db: RefCell::new(turso_db),
             io,
             out_dir,
             panic_context: Arc::new(Mutex::new(None)),
+            current_sql: RefCell::new(String::new()),
         })
+    }
+
+    fn turso_conn(&self) -> Arc<turso_core::Connection> {
+        self.turso_conn.borrow().clone()
     }
 
     /// Persist the in-memory database files to disk.
@@ -439,7 +464,7 @@ impl Fuzzer {
     /// "the schema I run integrity checks against" could silently
     /// diverge when attached databases are present.
     pub fn get_schema(&self) -> Result<sql_gen::Schema> {
-        SchemaIntrospector::from_turso_with_attached(&self.turso_conn)
+        SchemaIntrospector::from_turso_with_attached(&self.turso_conn())
             .context("Failed to introspect Turso schema (with attached)")
     }
 
@@ -497,7 +522,7 @@ impl Fuzzer {
     /// state can be replayed as a small self-contained script. Returns the
     /// SQLite-side dump, which the shrinker uses as its replay baseline.
     fn dump_failure_state(&self, schema: &sql_gen::Schema, failing_sql: &str) -> String {
-        let turso_conn = self.turso_conn.clone();
+        let turso_conn = self.turso_conn();
         let turso_query = move |sql: &str, ncols: usize| turso_text_rows(&turso_conn, sql, ncols);
         let turso_dump = build_state_dump(schema, failing_sql, &turso_query);
         let sqlite_query =
@@ -592,29 +617,23 @@ impl Fuzzer {
 
         let mut schema = self.introspect_and_verify_schemas()?;
         let mut matviews = Matviews::new();
+        let mut pending = None;
 
         for i in 0..self.config.num_statements {
-            let generated = generator.generate(&schema, &matviews)?;
-            let step = self.catch_panic(AssertUnwindSafe(|| {
-                self.run_step(
-                    i,
-                    &generated,
-                    &mut schema,
-                    &mut matviews,
-                    stats,
-                    executed_sql,
-                )
+            let step = self.next_step(generator.as_mut(), &schema, &matviews, &mut pending)?;
+            let result = self.catch_panic(AssertUnwindSafe(|| {
+                self.run_step(i, &step, &mut schema, &mut matviews, stats, executed_sql)
             }));
-            match step {
+            match result {
                 Ok(result) => result?,
                 Err(panic) => {
-                    executed_sql.push(format!("-- PANIC: {}", generated.sql()));
+                    let sql = self.current_sql.borrow().clone();
+                    executed_sql.push(format!("-- PANIC: {sql}"));
                     stats.oracle_failures += 1;
                     tracing::error!("Panic at statement {i}: {panic}");
-                    tracing::error!("Panicking SQL: {}", generated.sql());
+                    tracing::error!("Panicking SQL: {sql}");
                     return Err(anyhow::anyhow!(
-                        "Panic during statement {i}: {panic}\n  SQL: {}",
-                        generated.sql()
+                        "Panic during statement {i}: {panic}\n  SQL: {sql}"
                     ));
                 }
             }
@@ -649,7 +668,201 @@ impl Fuzzer {
         })
     }
 
+    /// Generate the next step. A statement that ends a batch early is kept in
+    /// `pending` and becomes the next step.
+    fn next_step(
+        &self,
+        generator: &mut dyn SqlGenerator,
+        schema: &sql_gen::Schema,
+        matviews: &Matviews,
+        pending: &mut Option<Generated>,
+    ) -> Result<Step> {
+        if self.roll(self.config.reopen_probability) {
+            return Ok(Step::Reopen);
+        }
+        let first = match pending.take() {
+            Some(generated) => generated,
+            None => generator.generate(schema, matviews)?,
+        };
+        let Generated::Statement(first) = first else {
+            return Ok(Step::Single(first));
+        };
+        if first.is_ddl || !self.roll(self.config.batch_probability) {
+            return Ok(Step::Single(Generated::Statement(first)));
+        }
+        let size = if self.roll(self.config.large_batch_probability) {
+            50 + self.below(251)
+        } else {
+            2 + self.below(self.config.max_batch_size - 1)
+        };
+        let mut batch = vec![first];
+        while batch.len() < size {
+            match generator.generate(schema, matviews)? {
+                Generated::Statement(stmt) if !stmt.is_ddl => batch.push(stmt),
+                other => {
+                    *pending = Some(other);
+                    break;
+                }
+            }
+        }
+        Ok(Step::Batch(batch))
+    }
+
+    /// True with the given probability. Draws nothing when it is 0, so that
+    /// runs without batches or reopens use the same random numbers as before.
+    fn roll(&self, probability: f64) -> bool {
+        probability > 0.0
+            && (self.rng.borrow_mut().next_u64() as f64 / u64::MAX as f64) < probability
+    }
+
+    fn below(&self, n: usize) -> usize {
+        (self.rng.borrow_mut().next_u64() % n as u64) as usize
+    }
+
     fn run_step(
+        &self,
+        i: usize,
+        step: &Step,
+        schema: &mut sql_gen::Schema,
+        matviews: &mut Matviews,
+        stats: &mut SimStats,
+        executed_sql: &mut Vec<String>,
+    ) -> Result<()> {
+        match step {
+            Step::Single(generated) => {
+                *self.current_sql.borrow_mut() = generated.sql().to_string();
+                self.run_generated(i, generated, schema, matviews, stats, executed_sql)
+            }
+            Step::Batch(stmts) => self.run_batch(i, stmts, schema, matviews, stats, executed_sql),
+            Step::Reopen => self.reopen(schema, matviews, stats, executed_sql),
+        }
+    }
+
+    fn run_batch(
+        &self,
+        i: usize,
+        stmts: &[GeneratedStatement],
+        schema: &mut sql_gen::Schema,
+        matviews: &mut Matviews,
+        stats: &mut SimStats,
+        executed_sql: &mut Vec<String>,
+    ) -> Result<()> {
+        assert!(
+            self.sqlite_conn.is_autocommit(),
+            "a batch must start outside a transaction"
+        );
+        stats.batches += 1;
+        if self.config.verbose {
+            tracing::info!("Statement {i} [BATCH]: {} statements", stmts.len());
+        }
+        let (turso, sqlite) = self.execute_on_both("BEGIN", executed_sql);
+        if matches!(turso, QueryResult::Error(_)) || matches!(sqlite, QueryResult::Error(_)) {
+            stats.oracle_failures += 1;
+            bail!("BEGIN failed:\n  Turso: {turso:?}\n  SQLite: {sqlite:?}");
+        }
+        for stmt in stmts {
+            self.current_sql.borrow_mut().clone_from(&stmt.sql);
+            self.run_statement(i, stmt, schema, matviews, stats, executed_sql)?;
+        }
+        let (turso, sqlite) = self.execute_on_both("COMMIT", executed_sql);
+        match (&turso, &sqlite) {
+            (QueryResult::Error(turso_err), QueryResult::Error(_)) => {
+                executed_sql.push(format!("-- COMMIT failed on both: {turso_err}"));
+                let (turso, sqlite) = self.execute_on_both("ROLLBACK", executed_sql);
+                if matches!(turso, QueryResult::Error(_)) || matches!(sqlite, QueryResult::Error(_))
+                {
+                    stats.oracle_failures += 1;
+                    bail!(
+                        "ROLLBACK after a failed COMMIT failed:\n  Turso: {turso:?}\n  SQLite: {sqlite:?}"
+                    );
+                }
+            }
+            (QueryResult::Error(turso_err), _) => {
+                stats.oracle_failures += 1;
+                bail!("Turso COMMIT failed, SQLite succeeded: {turso_err}");
+            }
+            (_, QueryResult::Error(sqlite_err)) => {
+                stats.oracle_failures += 1;
+                bail!("SQLite COMMIT failed, Turso succeeded: {sqlite_err}");
+            }
+            _ => {}
+        }
+        self.verify_matviews(matviews, stats, executed_sql)
+    }
+
+    fn execute_on_both(
+        &self,
+        sql: &str,
+        executed_sql: &mut Vec<String>,
+    ) -> (QueryResult, QueryResult) {
+        *self.current_sql.borrow_mut() = sql.to_string();
+        executed_sql.push(sql.to_string());
+        (
+            DifferentialOracle::execute_turso(&self.turso_conn(), sql),
+            DifferentialOracle::execute_sqlite(&self.sqlite_conn, sql),
+        )
+    }
+
+    /// Close and reopen the Turso database on the same in-memory files, then
+    /// compare every table and materialized view with SQLite.
+    fn reopen(
+        &self,
+        schema: &mut sql_gen::Schema,
+        matviews: &Matviews,
+        stats: &mut SimStats,
+        executed_sql: &mut Vec<String>,
+    ) -> Result<()> {
+        assert!(
+            self.sqlite_conn.is_autocommit(),
+            "a reopen must happen outside a transaction"
+        );
+        assert!(
+            schema.tables.iter().all(|t| t.database.is_none()),
+            "a reopen loses tables outside the main database"
+        );
+        stats.reopens += 1;
+        *self.current_sql.borrow_mut() = "-- REOPEN".to_string();
+        executed_sql.push("-- REOPEN".to_string());
+        self.turso_conn().close()?;
+        let (turso_db, turso_conn) = match open_turso(&self.io, &self.out_dir, &self.config) {
+            Ok(opened) => opened,
+            Err(e) => {
+                stats.oracle_failures += 1;
+                return Err(e.context("Failed to reopen the Turso database"));
+            }
+        };
+        *self.turso_db.borrow_mut() = turso_db;
+        *self.turso_conn.borrow_mut() = turso_conn;
+        *schema = self
+            .introspect_and_verify_schemas()
+            .map_err(|e| anyhow::anyhow!("Schema mismatch after reopen: {e}"))?;
+        self.verify_tables(schema, stats, executed_sql)?;
+        self.verify_matviews(matviews, stats, executed_sql)
+    }
+
+    fn verify_tables(
+        &self,
+        schema: &sql_gen::Schema,
+        stats: &mut SimStats,
+        executed_sql: &mut Vec<String>,
+    ) -> Result<()> {
+        for table in &schema.tables {
+            let sql = format!("SELECT rowid, * FROM {} ORDER BY rowid", table.name);
+            let turso = DifferentialOracle::execute_turso(&self.turso_conn(), &sql);
+            let sqlite = DifferentialOracle::execute_sqlite(&self.sqlite_conn, &sql);
+            if turso != sqlite {
+                stats.oracle_failures += 1;
+                executed_sql.push(format!("-- TABLE VERIFY FAILED: {sql}"));
+                bail!(
+                    "Table mismatch after reopen in '{}':\n  Turso:  {turso:?}\n  SQLite: {sqlite:?}",
+                    table.name
+                );
+            }
+        }
+        Ok(())
+    }
+
+    fn run_generated(
         &self,
         i: usize,
         generated: &Generated,
@@ -673,7 +886,7 @@ impl Fuzzer {
                 }
                 executed_sql.push(turso_sql.clone());
                 executed_sql.push(format!("-- SQLITE: {sqlite_sql}"));
-                let turso = DifferentialOracle::execute_turso(&self.turso_conn, turso_sql);
+                let turso = DifferentialOracle::execute_turso(&self.turso_conn(), turso_sql);
                 let sqlite = DifferentialOracle::execute_sqlite(&self.sqlite_conn, sqlite_sql);
                 // The generator only emits views that both engines accept.
                 if matches!(turso, QueryResult::Error(_)) || matches!(sqlite, QueryResult::Error(_))
@@ -732,7 +945,7 @@ impl Fuzzer {
             tracing::info!("Statement {} [{}]: {}", i, stmt_type, stmt.sql);
         }
 
-        match check_differential(&self.turso_conn, &self.sqlite_conn, schema, stmt) {
+        match check_differential(&self.turso_conn(), &self.sqlite_conn, schema, stmt) {
             OracleResult::Pass => {
                 stats.statements_executed += 1;
                 executed_sql.push(stmt.sql.clone());
@@ -803,7 +1016,7 @@ impl Fuzzer {
                 .collect::<Vec<_>>()
                 .join(", ");
             let sql = format!("SELECT * FROM {name} ORDER BY {order_by}");
-            let turso = DifferentialOracle::execute_turso(&self.turso_conn, &sql);
+            let turso = DifferentialOracle::execute_turso(&self.turso_conn(), &sql);
             let sqlite = DifferentialOracle::execute_sqlite(&self.sqlite_conn, &sql);
             let failure = match (&turso, &sqlite) {
                 (QueryResult::Error(_), _) | (_, QueryResult::Error(_)) => Some("read error"),
@@ -856,7 +1069,7 @@ impl Fuzzer {
         stats: &mut SimStats,
         executed_sql: &mut Vec<String>,
     ) -> Result<()> {
-        let turso = DifferentialOracle::execute_turso(&self.turso_conn, sql);
+        let turso = DifferentialOracle::execute_turso(&self.turso_conn(), sql);
         let sqlite = DifferentialOracle::execute_sqlite(&self.sqlite_conn, sql);
         executed_sql.push(sql.to_string());
         if matches!(turso, QueryResult::Error(_)) || matches!(sqlite, QueryResult::Error(_)) {
@@ -882,7 +1095,7 @@ impl Fuzzer {
         let sql = "PRAGMA integrity_check";
         executed_sql.push(sql.to_string());
 
-        let turso_result = DifferentialOracle::execute_turso(&self.turso_conn, sql);
+        let turso_result = DifferentialOracle::execute_turso(&self.turso_conn(), sql);
         let sqlite_result = DifferentialOracle::execute_sqlite(&self.sqlite_conn, sql);
 
         let check_ok = |result: &QueryResult, db_name: &str| -> Result<()> {
@@ -929,7 +1142,7 @@ impl Fuzzer {
     /// Introspect schemas from both databases and verify they match.
     fn introspect_and_verify_schemas(&self) -> Result<sql_gen::Schema> {
         let (turso_schema, sqlite_schema) = (
-            SchemaIntrospector::from_turso_with_attached(&self.turso_conn)
+            SchemaIntrospector::from_turso_with_attached(&self.turso_conn())
                 .context("Failed to introspect Turso schema (with attached)")?,
             SchemaIntrospector::from_sqlite_with_attached(&self.sqlite_conn)
                 .context("Failed to introspect SQLite schema (with attached)")?,
@@ -1072,6 +1285,31 @@ impl Fuzzer {
     }
 }
 
+/// Open the Turso database file in `io` and attach an in-memory `aux` database,
+/// as SQLite has one.
+fn open_turso(
+    io: &Arc<MemorySimIO>,
+    out_dir: &std::path::Path,
+    config: &SimConfig,
+) -> Result<(Arc<Database>, Arc<turso_core::Connection>)> {
+    let opts = turso_core::DatabaseOpts::new()
+        .with_attach(true)
+        .with_views(config.matview);
+    let turso_db = Database::open_file_with_flags(
+        io.clone(),
+        out_dir.join("test.db").to_str().unwrap(),
+        turso_core::OpenFlags::default(),
+        opts,
+        None,
+        Arc::new(SqliteDialect),
+    )?;
+    let turso_conn = turso_db.connect()?;
+    turso_conn
+        .execute("ATTACH ':memory:' AS aux")
+        .context("Failed to ATTACH on Turso")?;
+    Ok((turso_db, turso_conn))
+}
+
 fn push_warning_comments(executed_sql: &mut Vec<String>, stmt_idx: usize, reason: &str) {
     for (line_idx, line) in reason.lines().enumerate() {
         executed_sql.push(format!(
@@ -1083,6 +1321,7 @@ fn push_warning_comments(executed_sql: &mut Vec<String>, stmt_idx: usize, reason
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     #[test]
     fn test_sim_config_default() {
         let config = SimConfig::default();
@@ -1109,9 +1348,252 @@ mod tests {
             recursive_cte_focus: false,
             weight_profile: WeightProfile::default(),
             matview: false,
+            batch_probability: 0.0,
+            large_batch_probability: 0.0,
+            max_batch_size: 10,
+            reopen_probability: 0.0,
         };
         let sim = Fuzzer::new(config);
         assert!(sim.is_ok());
+    }
+
+    fn matview_fuzzer() -> TestFuzzer {
+        static NEXT_OUT_DIR: AtomicUsize = AtomicUsize::new(0);
+        let out_dir = std::env::temp_dir().join(format!(
+            "differential-fuzzer-test-{}-{}",
+            std::process::id(),
+            NEXT_OUT_DIR.fetch_add(1, Ordering::Relaxed)
+        ));
+        let fuzzer = Fuzzer::with_out_dir(
+            SimConfig {
+                seed: 7,
+                generator: GeneratorKind::SqlGenProp,
+                matview: true,
+                ..SimConfig::default()
+            },
+            out_dir.clone(),
+        )
+        .unwrap();
+        TestFuzzer { fuzzer, out_dir }
+    }
+
+    struct TestFuzzer {
+        fuzzer: Fuzzer,
+        out_dir: PathBuf,
+    }
+
+    impl std::ops::Deref for TestFuzzer {
+        type Target = Fuzzer;
+
+        fn deref(&self) -> &Fuzzer {
+            &self.fuzzer
+        }
+    }
+
+    impl std::ops::DerefMut for TestFuzzer {
+        fn deref_mut(&mut self) -> &mut Fuzzer {
+            &mut self.fuzzer
+        }
+    }
+
+    impl Drop for TestFuzzer {
+        fn drop(&mut self) {
+            let removed = std::fs::remove_dir_all(&self.out_dir);
+            if !std::thread::panicking() {
+                removed.unwrap();
+            }
+        }
+    }
+
+    fn write(sql: &str) -> GeneratedStatement {
+        GeneratedStatement {
+            sql: sql.to_string(),
+            is_ddl: false,
+            mutates_data: true,
+            has_unordered_limit: false,
+            unordered_limit_reason: None,
+            check_unnesting_invariant: false,
+        }
+    }
+
+    fn matview_over_t(fuzzer: &Fuzzer, executed_sql: &mut Vec<String>) -> Matviews {
+        for sql in [
+            "CREATE TABLE t(a INTEGER, b TEXT)",
+            "INSERT INTO t VALUES (1, 'x'), (2, NULL)",
+        ] {
+            let (turso, sqlite) = fuzzer.execute_on_both(sql, executed_sql);
+            assert!(!matches!(turso, QueryResult::Error(_)), "{turso:?}");
+            assert!(!matches!(sqlite, QueryResult::Error(_)), "{sqlite:?}");
+        }
+        let select = "SELECT a, b FROM t WHERE a > 1";
+        fuzzer
+            .turso_conn()
+            .execute(format!("CREATE MATERIALIZED VIEW v AS {select}"))
+            .unwrap();
+        fuzzer
+            .sqlite_conn
+            .execute(&format!("CREATE VIEW v AS {select}"), [])
+            .unwrap();
+        Matviews::from([(
+            "v".to_string(),
+            vec![
+                sql_gen_prop::ColumnDef::new("a", sql_gen_prop::DataType::Integer),
+                sql_gen_prop::ColumnDef::new("b", sql_gen_prop::DataType::Text),
+            ],
+        )])
+    }
+
+    #[test]
+    fn reopen_keeps_tables_and_materialized_views_and_later_writes_use_the_new_connection() {
+        let fuzzer = matview_fuzzer();
+        let (mut stats, mut executed_sql) = (SimStats::default(), Vec::new());
+        let matviews = matview_over_t(&fuzzer, &mut executed_sql);
+        let mut schema = fuzzer.introspect_and_verify_schemas().unwrap();
+
+        fuzzer
+            .reopen(&mut schema, &matviews, &mut stats, &mut executed_sql)
+            .unwrap();
+        fuzzer.execute_on_both("INSERT INTO t VALUES (3, 'y')", &mut executed_sql);
+        fuzzer
+            .verify_tables(&schema, &mut stats, &mut executed_sql)
+            .unwrap();
+        fuzzer
+            .verify_matviews(&matviews, &mut stats, &mut executed_sql)
+            .unwrap();
+        assert_eq!(stats.reopens, 1);
+        assert_eq!(stats.oracle_failures, 0);
+
+        fuzzer
+            .sqlite_conn
+            .execute("INSERT INTO t VALUES (0, 'q')", [])
+            .unwrap();
+        let err = fuzzer
+            .verify_tables(&schema, &mut stats, &mut executed_sql)
+            .unwrap_err();
+        assert!(
+            err.to_string()
+                .starts_with("Table mismatch after reopen in 't'"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn a_materialized_view_that_fails_on_both_engines_is_a_failure() {
+        let fuzzer = matview_fuzzer();
+        let (mut stats, mut executed_sql) = (SimStats::default(), Vec::new());
+        let mut matviews = matview_over_t(&fuzzer, &mut executed_sql);
+        let mut schema = fuzzer.introspect_and_verify_schemas().unwrap();
+        let select = "SELECT t.NULL FROM t";
+        let create = Generated::CreateMatview {
+            turso_sql: format!("CREATE MATERIALIZED VIEW w AS {select}"),
+            sqlite_sql: format!("CREATE VIEW w AS {select}"),
+            name: "w".to_string(),
+            columns: vec![sql_gen_prop::ColumnDef::new(
+                "a",
+                sql_gen_prop::DataType::Integer,
+            )],
+        };
+
+        let err = fuzzer
+            .run_generated(
+                0,
+                &create,
+                &mut schema,
+                &mut matviews,
+                &mut stats,
+                &mut executed_sql,
+            )
+            .unwrap_err();
+
+        assert!(
+            err.to_string().contains("materialized view DDL failed"),
+            "{err}"
+        );
+        assert_eq!(stats.oracle_failures, 1);
+        assert!(!matviews.contains_key("w"));
+    }
+
+    #[test]
+    fn batch_runs_between_begin_and_commit_on_both_engines() {
+        let fuzzer = matview_fuzzer();
+        let (mut stats, mut executed_sql) = (SimStats::default(), Vec::new());
+        let mut matviews = matview_over_t(&fuzzer, &mut executed_sql);
+        let mut schema = fuzzer.introspect_and_verify_schemas().unwrap();
+        let batch = [
+            write("INSERT INTO t VALUES (5, 'z')"),
+            write("DELETE FROM t WHERE a = 2"),
+        ];
+
+        fuzzer
+            .run_batch(
+                0,
+                &batch,
+                &mut schema,
+                &mut matviews,
+                &mut stats,
+                &mut executed_sql,
+            )
+            .unwrap();
+
+        assert!(fuzzer.sqlite_conn.is_autocommit());
+        assert!(fuzzer.turso_conn().get_auto_commit());
+        let batch_sql = &executed_sql[executed_sql.len() - 4..];
+        assert_eq!(
+            batch_sql,
+            [
+                "BEGIN",
+                "INSERT INTO t VALUES (5, 'z')",
+                "DELETE FROM t WHERE a = 2",
+                "COMMIT"
+            ]
+        );
+        assert_eq!(stats.batches, 1);
+        assert_eq!(stats.oracle_failures, 0);
+    }
+
+    #[test]
+    fn a_probability_of_zero_draws_no_random_number() {
+        let fuzzer = matview_fuzzer();
+        let before = fuzzer.rng.borrow().get_word_pos();
+        assert!(!fuzzer.roll(0.0));
+        assert_eq!(fuzzer.rng.borrow().get_word_pos(), before);
+        assert!(fuzzer.roll(1.0));
+        assert_ne!(fuzzer.rng.borrow().get_word_pos(), before);
+    }
+
+    #[test]
+    fn test_sql_drops_a_materialized_view_whose_table_is_gone() {
+        let fuzzer = matview_fuzzer();
+        let (mut stats, mut executed_sql) = (SimStats::default(), Vec::new());
+        let mut matviews = matview_over_t(&fuzzer, &mut executed_sql);
+        let mut schema = fuzzer.introspect_and_verify_schemas().unwrap();
+        let drop_table = GeneratedStatement {
+            is_ddl: true,
+            mutates_data: false,
+            ..write("DROP TABLE t")
+        };
+
+        fuzzer
+            .run_statement(
+                0,
+                &drop_table,
+                &mut schema,
+                &mut matviews,
+                &mut stats,
+                &mut executed_sql,
+            )
+            .unwrap();
+
+        let replayed: Vec<&String> = executed_sql
+            .iter()
+            .filter(|s| !s.starts_with("--"))
+            .collect();
+        assert_eq!(
+            &replayed[replayed.len() - 2..],
+            ["DROP TABLE t", "DROP VIEW v"]
+        );
+        assert!(matviews.is_empty());
+        assert_eq!(stats.oracle_failures, 0);
     }
 
     #[test]
