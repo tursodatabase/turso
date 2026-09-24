@@ -56,13 +56,19 @@ enum Shape {
     FilteredColumns,
     /// SELECT g, COUNT(*) FROM t GROUP BY g
     Aggregate,
+    /// SELECT t.a, u.b FROM t JOIN u ON t.a = u.b
+    Join,
+    /// SELECT t.a AS c0, ... FROM t UNION ALL SELECT u.b AS c0, ... FROM u
+    UnionAll,
+    /// Two joins of t and u on different columns of u, combined with UNION ALL
+    UnionAllJoin,
 }
 
 /// Tables and materialized views that a materialized view can read.
 ///
 /// Turso refuses materialized views over `temp` or attached tables. Columns named
-/// by an expression (from `CREATE TABLE ... AS SELECT expr`) are left out
-/// because this module writes column names without quotes.
+/// by an expression or a keyword (from `CREATE TABLE ... AS SELECT expr`) are
+/// left out because this module writes column names without quotes.
 pub fn materialized_view_sources(schema: &Schema) -> Vec<TableRef> {
     schema
         .tables
@@ -82,6 +88,13 @@ fn is_plain_identifier(name: &str) -> bool {
         .next()
         .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
         && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+        && !is_keyword(name)
+}
+
+fn is_keyword(name: &str) -> bool {
+    SQLITE_KEYWORDS
+        .split_whitespace()
+        .any(|keyword| keyword.eq_ignore_ascii_case(name))
 }
 
 /// From https://sqlite.org/lang_keywords.html
@@ -116,30 +129,60 @@ pub fn create_materialized_view(schema: &Schema) -> BoxedStrategy<CreateMaterial
         .chain(SQLITE_KEYWORDS.split_whitespace().map(str::to_lowercase))
         .collect();
 
+    let mut shapes = vec![
+        (1, Shape::Star),
+        (2, Shape::FilteredColumns),
+        (1, Shape::Aggregate),
+    ];
+    if sources.len() >= 2 {
+        shapes.extend([
+            (1, Shape::Join),
+            (1, Shape::UnionAll),
+            (1, Shape::UnionAllJoin),
+        ]);
+    }
+    let shape = proptest::strategy::Union::new_weighted(
+        shapes
+            .into_iter()
+            .map(|(weight, shape)| (weight, Just(shape)))
+            .collect(),
+    );
+
     (
         any::<bool>(),
         identifier_excluding(existing_names),
-        proptest::sample::select(sources),
-        prop_oneof![
-            1 => Just(Shape::Star),
-            2 => Just(Shape::FilteredColumns),
-            1 => Just(Shape::Aggregate),
-        ],
+        0..sources.len(),
+        shape,
     )
-        .prop_flat_map(|(if_not_exists, view_name, source, shape)| {
-            select_for_shape(&source, shape).prop_map(move |(select_sql, output_columns)| {
-                CreateMaterializedViewStatement {
+        .prop_flat_map(move |(if_not_exists, view_name, index, shape)| {
+            let others: Vec<TableRef> = sources
+                .iter()
+                .enumerate()
+                .filter(|(i, _)| *i != index)
+                .map(|(_, t)| t.clone())
+                .collect();
+            select_for_shape(sources[index].clone(), others, shape).prop_map(
+                move |(select_sql, output_columns)| CreateMaterializedViewStatement {
                     if_not_exists,
                     view_name: view_name.clone(),
                     select_sql,
                     output_columns,
-                }
-            })
+                },
+            )
         })
         .boxed()
 }
 
-fn select_for_shape(source: &Table, shape: Shape) -> BoxedStrategy<(String, Vec<ColumnDef>)> {
+fn select_for_shape(
+    source: TableRef,
+    others: Vec<TableRef>,
+    shape: Shape,
+) -> BoxedStrategy<(String, Vec<ColumnDef>)> {
+    let wide_others: Vec<TableRef> = others
+        .iter()
+        .filter(|t| t.columns.len() >= 2)
+        .cloned()
+        .collect();
     let name = source.name.clone();
     let filterable: Vec<ColumnDef> = source.filterable_columns().cloned().collect();
     match shape {
@@ -187,7 +230,82 @@ fn select_for_shape(source: &Table, shape: Shape) -> BoxedStrategy<(String, Vec<
             view_columns(&source.columns),
         ))
         .boxed(),
+        Shape::UnionAllJoin if !wide_others.is_empty() => proptest::sample::select(wide_others)
+            .prop_map(move |other| union_all_join(&source, &other))
+            .boxed(),
+        Shape::Join | Shape::UnionAllJoin => proptest::sample::select(others)
+            .prop_map(move |other| join(&source, &other))
+            .boxed(),
+        Shape::UnionAll => proptest::sample::select(others)
+            .prop_map(move |other| union_all(&source, &other))
+            .boxed(),
     }
+}
+
+fn join(left: &Table, right: &Table) -> (String, Vec<ColumnDef>) {
+    let (l, r) = (&left.columns[0], &right.columns[0]);
+    let (ln, rn) = (&left.name, &right.name);
+    // Both result columns need distinct names, so that later views can read them.
+    let (right_projection, right_output) = if l.name == r.name {
+        let alias = format!("{rn}_{}", r.name);
+        (format!("{rn}.{} AS {alias}", r.name), alias)
+    } else {
+        (format!("{rn}.{}", r.name), r.name.clone())
+    };
+    (
+        format!(
+            "SELECT {ln}.{l}, {right_projection} FROM {ln} JOIN {rn} ON {ln}.{l} = {rn}.{r}",
+            l = l.name,
+            r = r.name
+        ),
+        vec![
+            ColumnDef::new(l.name.clone(), l.data_type),
+            ColumnDef::new(right_output, r.data_type),
+        ],
+    )
+}
+
+fn union_all(left: &Table, right: &Table) -> (String, Vec<ColumnDef>) {
+    let n = left.columns.len().min(right.columns.len()).min(3);
+    let projection = |table: &Table| {
+        table.columns[..n]
+            .iter()
+            .enumerate()
+            .map(|(i, c)| format!("{}.{} AS c{i}", table.name, c.name))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    (
+        format!(
+            "SELECT {} FROM {} UNION ALL SELECT {} FROM {}",
+            projection(left),
+            left.name,
+            projection(right),
+            right.name
+        ),
+        left.columns[..n]
+            .iter()
+            .enumerate()
+            .map(|(i, c)| ColumnDef::new(format!("c{i}"), c.data_type))
+            .collect(),
+    )
+}
+
+fn union_all_join(left: &Table, right: &Table) -> (String, Vec<ColumnDef>) {
+    let (ln, rn) = (&left.name, &right.name);
+    let l0 = &left.columns[0].name;
+    let (r0, r1) = (&right.columns[0].name, &right.columns[1].name);
+    (
+        format!(
+            "SELECT {ln}.{l0} AS c0, {rn}.{r0} AS c1 FROM {ln} JOIN {rn} ON {ln}.{l0} = {rn}.{r0} \
+             UNION ALL \
+             SELECT {ln}.{l0} AS c0, {rn}.{r1} AS c1 FROM {ln} JOIN {rn} ON {ln}.{l0} = {rn}.{r1}"
+        ),
+        vec![
+            ColumnDef::new("c0", left.columns[0].data_type),
+            ColumnDef::new("c1", right.columns[0].data_type),
+        ],
+    )
 }
 
 /// A view column keeps the name and type of its source column but none of its constraints.
@@ -268,6 +386,10 @@ mod tests {
                 "calc",
                 vec![ColumnDef::new("TYPEOF(x)", DataType::Text)],
             ))
+            .add_table(Table::new(
+                "nulls",
+                vec![ColumnDef::new("NULL", DataType::Text)],
+            ))
             .add_table(
                 Table::new("far", vec![ColumnDef::new("id", DataType::Integer)]).in_database("aux"),
             )
@@ -312,5 +434,17 @@ mod tests {
         assert!(sqls.iter().any(|sql| sql.contains(" WHERE ")));
         assert!(sqls.iter().any(|sql| sql.contains(" GROUP BY ")));
         assert!(sqls.iter().any(|sql| sql.contains("FROM mv_users")));
+        assert!(
+            sqls.iter()
+                .any(|sql| sql.contains(" JOIN ") && !sql.contains("UNION ALL"))
+        );
+        assert!(
+            sqls.iter()
+                .any(|sql| sql.contains("UNION ALL") && !sql.contains(" JOIN "))
+        );
+        assert!(
+            sqls.iter()
+                .any(|sql| sql.contains("UNION ALL") && sql.contains(" JOIN "))
+        );
     }
 }
