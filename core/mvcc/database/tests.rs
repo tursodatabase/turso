@@ -282,9 +282,47 @@ fn write_set_take_transfers_entries_without_cloning() {
     assert!(write_set.seen.is_empty());
     assert_eq!(transferred.entries.as_ptr(), entries_ptr);
     assert_eq!(transferred.entries.capacity(), entries_capacity);
-    assert_eq!(transferred.seen.len(), 1);
     assert_eq!(Arc::strong_count(&row_versions), strong_count);
     assert!(Arc::ptr_eq(&transferred.entries[0].1, &row_versions));
+}
+
+#[test]
+fn write_set_rejects_duplicate_chains_before_and_after_it_grows_large() {
+    let mut write_set = WriteSet::<TursoAllocator>::new();
+    let chains: Vec<(RowID, RowVersions<TursoAllocator>)> = (0..40)
+        .map(|rowid| {
+            (
+                RowID::new(MVTableId::from(-2), RowKey::Int(rowid)),
+                Arc::new(RwLock::new(crate::alloc::vec![])),
+            )
+        })
+        .collect();
+
+    for (count, (row_id, versions)) in chains.iter().enumerate() {
+        assert!(write_set.insert(row_id.clone(), versions.clone()));
+        for (earlier_row_id, earlier_versions) in &chains[..=count] {
+            assert!(!write_set.insert(earlier_row_id.clone(), earlier_versions.clone()));
+        }
+    }
+    assert_eq!(write_set.entries.len(), chains.len());
+
+    write_set.retain(|row_id, _| matches!(row_id.row_id, RowKey::Int(rowid) if rowid < 3));
+    assert_eq!(write_set.entries.len(), 3);
+    for (row_id, versions) in &chains[..3] {
+        assert!(!write_set.insert(row_id.clone(), versions.clone()));
+    }
+    for (row_id, versions) in &chains[3..] {
+        assert!(write_set.insert(row_id.clone(), versions.clone()));
+    }
+    assert_eq!(write_set.entries.len(), chains.len());
+
+    write_set.retain(|_, _| false);
+    assert!(write_set.is_empty());
+    for (row_id, versions) in &chains {
+        assert!(write_set.insert(row_id.clone(), versions.clone()));
+        assert!(!write_set.insert(row_id.clone(), versions.clone()));
+    }
+    assert_eq!(write_set.entries.len(), chains.len());
 }
 
 #[test]
@@ -303,50 +341,50 @@ fn rollback_only_reports_rowids_restored_by_a_delete() {
     let row_id = RowID::new(MVTableId::from(-2), RowKey::Int(666));
     let row = Row::new_table_row(row_id, &[], 0).unwrap();
 
-    let mut replacement = RowVersion::new(
+    let replacement = RowVersion::new(
         1,
         Some(TxTimestampOrID::TxID(tx_id)),
         None,
         row.clone(),
         true,
     );
-    assert!(!rollback_row_version(tx_id, &mut replacement));
+    assert!(!rollback_restores_rowid(tx_id, &replacement));
 
-    let mut deleted_existing_row = RowVersion::new(
+    let deleted_existing_row = RowVersion::new(
         2,
         Some(TxTimestampOrID::Timestamp(1)),
         Some(TxTimestampOrID::TxID(tx_id)),
         row.clone(),
         true,
     );
-    assert!(rollback_row_version(tx_id, &mut deleted_existing_row));
+    assert!(rollback_restores_rowid(tx_id, &deleted_existing_row));
 
-    let mut deleted_btree_row = RowVersion::new(
+    let deleted_btree_row = RowVersion::new(
         3,
         None,
         Some(TxTimestampOrID::TxID(tx_id)),
         row.clone(),
         true,
     );
-    assert!(rollback_row_version(tx_id, &mut deleted_btree_row));
+    assert!(rollback_restores_rowid(tx_id, &deleted_btree_row));
 
-    let mut deleted_replacement = RowVersion::new(
+    let deleted_replacement = RowVersion::new(
         4,
         Some(TxTimestampOrID::TxID(tx_id)),
         Some(TxTimestampOrID::TxID(tx_id)),
         row.clone(),
         true,
     );
-    assert!(rollback_row_version(tx_id, &mut deleted_replacement));
+    assert!(rollback_restores_rowid(tx_id, &deleted_replacement));
 
-    let mut inserted_then_deleted = RowVersion::new(
+    let inserted_then_deleted = RowVersion::new(
         5,
         Some(TxTimestampOrID::TxID(tx_id)),
         Some(TxTimestampOrID::TxID(tx_id)),
         row,
         false,
     );
-    assert!(!rollback_row_version(tx_id, &mut inserted_then_deleted));
+    assert!(!rollback_restores_rowid(tx_id, &inserted_then_deleted));
 }
 
 unsafe impl crate::alloc::ApiAllocator for FailOnDemandAlloc {
@@ -418,6 +456,170 @@ fn mv_store_skiplist_allocations_are_fallible() {
     assert!(store.rows.is_empty());
 }
 
+#[test]
+fn sortable_index_key_keeps_checked_collation_semantics() {
+    fn metadata(
+        sort_order: turso_parser::ast::SortOrder,
+        collation: crate::translate::collate::CollationSeq,
+    ) -> Arc<IndexInfo> {
+        Arc::new(
+            IndexInfo::new(
+                crate::alloc::vec![crate::types::KeyInfo {
+                    sort_order,
+                    collation,
+                    nulls_order: None,
+                }],
+                false,
+                1,
+                false,
+            )
+            .unwrap(),
+        )
+    }
+
+    fn text_key(value: &str, metadata: Arc<IndexInfo>) -> SortableIndexKey {
+        let record =
+            ImmutableRecord::from_values(&[Value::Text(Text::new(value.to_owned()))], 1).unwrap();
+        SortableIndexKey::new_from_payload_in(&record, metadata, TursoAllocator).unwrap()
+    }
+
+    let ascending = metadata(
+        turso_parser::ast::SortOrder::Asc,
+        crate::translate::collate::CollationSeq::Binary,
+    );
+    assert!(text_key("alpha", ascending.clone()) < text_key("beta", ascending.clone()));
+    assert!(text_key("z", ascending.clone()) < text_key("é", ascending.clone()));
+
+    let descending = metadata(
+        turso_parser::ast::SortOrder::Desc,
+        crate::translate::collate::CollationSeq::Binary,
+    );
+    assert!(text_key("alpha", descending.clone()) > text_key("beta", descending));
+
+    let nocase = metadata(
+        turso_parser::ast::SortOrder::Asc,
+        crate::translate::collate::CollationSeq::NoCase,
+    );
+    assert_eq!(
+        text_key("alpha", nocase.clone()).cmp(&text_key("ALPHA", nocase)),
+        std::cmp::Ordering::Equal
+    );
+
+    let invalid_utf8_record = [2, 15, 0xff];
+    let invalid =
+        SortableIndexKey::new_from_payload_in(invalid_utf8_record, ascending, TursoAllocator);
+    assert!(invalid.is_err());
+}
+
+#[test]
+fn compare_bytes_matches_slice_order() {
+    let mut rng = ChaCha8Rng::seed_from_u64(0xb17e5);
+    for _ in 0..20_000 {
+        let shared_len = rng.random_range(0..20);
+        let shared: Vec<u8> = (0..shared_len).map(|_| rng.random_range(0..4u8)).collect();
+        let mut lhs = shared.clone();
+        let mut rhs = shared;
+        lhs.extend((0..rng.random_range(0..12)).map(|_| rng.random_range(0..4u8) * 85));
+        rhs.extend((0..rng.random_range(0..12)).map(|_| rng.random_range(0..4u8) * 85));
+        assert_eq!(
+            compare_bytes(&lhs, &rhs),
+            lhs.cmp(&rhs),
+            "{lhs:?} vs {rhs:?}"
+        );
+    }
+}
+
+#[test]
+fn sortable_index_key_order_matches_value_comparison() {
+    use crate::translate::collate::CollationSeq;
+    use turso_parser::ast::SortOrder;
+
+    fn random_leading_value(rng: &mut ChaCha8Rng) -> Value {
+        match rng.random_range(0..10) {
+            0 => Value::Null,
+            1 => Value::from_i64(rng.random_range(-3..3)),
+            2 => Value::Blob(crate::alloc::vec![rng.random_range(0..3u8)]),
+            _ => {
+                let len = match rng.random_range(0..4) {
+                    0 => 0,
+                    1 => rng.random_range(55..70),
+                    _ => rng.random_range(1..6),
+                };
+                let text: String = (0..len)
+                    .map(|_| ['a', 'b', 'B', 'é'][rng.random_range(0..4)])
+                    .collect();
+                Value::Text(Text::new(text))
+            }
+        }
+    }
+
+    let mut rng = ChaCha8Rng::seed_from_u64(0x5eed);
+    for sort_order in [SortOrder::Asc, SortOrder::Desc] {
+        for collation in [CollationSeq::Binary, CollationSeq::NoCase] {
+            let key_info = [
+                crate::types::KeyInfo {
+                    sort_order,
+                    collation,
+                    nulls_order: None,
+                },
+                crate::types::KeyInfo {
+                    sort_order: SortOrder::Asc,
+                    collation: CollationSeq::Binary,
+                    nulls_order: None,
+                },
+            ];
+            let metadata = |num_cols: usize| {
+                Arc::new(IndexInfo::new(key_info.iter().cloned(), true, num_cols, false).unwrap())
+            };
+            let full = metadata(2);
+            let prefix = metadata(1);
+            for _ in 0..2000 {
+                let lhs_values = [
+                    random_leading_value(&mut rng),
+                    Value::from_i64(rng.random_range(0..3)),
+                ];
+                let rhs_values = [
+                    random_leading_value(&mut rng),
+                    Value::from_i64(rng.random_range(0..3)),
+                ];
+                let rhs_is_prefix = rng.random_range(0..4) == 0;
+                let rhs_cols = if rhs_is_prefix { 1 } else { 2 };
+                let lhs_record = ImmutableRecord::from_values(&lhs_values, 2).unwrap();
+                let rhs_record =
+                    ImmutableRecord::from_values(&rhs_values[..rhs_cols], rhs_cols).unwrap();
+                let lhs = SortableIndexKey::new_from_payload_in(
+                    &lhs_record,
+                    full.clone(),
+                    TursoAllocator,
+                )
+                .unwrap();
+                let rhs_metadata = if rhs_is_prefix {
+                    prefix.clone()
+                } else {
+                    full.clone()
+                };
+                let rhs = SortableIndexKey::new_from_payload_in(
+                    &rhs_record,
+                    rhs_metadata,
+                    TursoAllocator,
+                )
+                .unwrap();
+                let expected = compare_immutable(
+                    lhs_values[..rhs_cols].iter(),
+                    rhs_values[..rhs_cols].iter(),
+                    &key_info[..rhs_cols],
+                );
+                assert_eq!(
+                    lhs.cmp(&rhs),
+                    expected,
+                    "{lhs_values:?} vs {:?} ({sort_order:?}, {collation:?})",
+                    &rhs_values[..rhs_cols]
+                );
+            }
+        }
+    }
+}
+
 #[cfg(nightly)]
 #[test]
 fn row_payload_allocation_uses_passed_allocator() {
@@ -455,7 +657,7 @@ fn index_key_payload_allocation_uses_passed_allocator() {
 
     alloc.fail_allocations(true);
     let result = SortableIndexKey::new_from_payload_in(&record, index_info.clone(), alloc.clone());
-    assert!(matches!(result, Err(crate::alloc::TryReserveError)));
+    assert!(matches!(result, Err(LimboError::OutOfMemory)));
 
     alloc.fail_allocations(false);
     let key = SortableIndexKey::new_from_payload_in(record_ref, index_info, alloc).unwrap();
@@ -3955,6 +4157,49 @@ fn test_prepared_select_does_not_reprepare_after_data_only_checkpoint() {
     assert_eq!(rows[1][0].as_int().unwrap(), 2);
     assert_eq!(&rows[1][1].to_string(), "b");
     assert_eq!(stmt.stmt_status(StatementStatusCounter::Reprepare), 0);
+}
+
+#[test]
+fn main_only_rollback_does_not_invalidate_prepared_statements_when_temp_schema_is_unchanged() {
+    let io = Arc::new(MemoryIO::new());
+    let db = Database::open_file(io, ":memory:", Arc::new(SqliteDialect)).unwrap();
+    let conn = db.connect().unwrap();
+    conn.execute("PRAGMA journal_mode = 'mvcc'").unwrap();
+    conn.execute("PRAGMA mvcc_checkpoint_threshold = -1")
+        .unwrap();
+    conn.wal_auto_actions_disable();
+    conn.execute(
+        "CREATE TABLE t(id INTEGER PRIMARY KEY, value TEXT UNIQUE, payload TEXT NOT NULL)",
+    )
+    .unwrap();
+    conn.execute(
+        "WITH RECURSIVE generate(i) AS (\
+            VALUES(1) UNION ALL SELECT i + 1 FROM generate WHERE i < 2048\
+        ) \
+        INSERT INTO t \
+        SELECT i, printf('value-%05d', i), printf('payload-%05d', i) FROM generate",
+    )
+    .unwrap();
+    conn.ensure_temp_database().unwrap();
+
+    let mut begin = conn.prepare("BEGIN CONCURRENT").unwrap();
+    let mut insert = conn
+        .prepare("INSERT INTO t VALUES (3000000, 'value', 'payload')")
+        .unwrap();
+    let mut rollback = conn.prepare("ROLLBACK").unwrap();
+
+    for _ in 0..2 {
+        begin.run_collect_rows().unwrap();
+        begin.reset().unwrap();
+        insert.run_collect_rows().unwrap();
+        insert.reset().unwrap();
+        rollback.run_collect_rows().unwrap();
+        rollback.reset().unwrap();
+    }
+
+    assert_eq!(begin.stmt_status(StatementStatusCounter::Reprepare), 0);
+    assert_eq!(insert.stmt_status(StatementStatusCounter::Reprepare), 0);
+    assert_eq!(rollback.stmt_status(StatementStatusCounter::Reprepare), 0);
 }
 
 /// What this test checks: prepared index lookups recompile when checkpoint publishes an index root page.
@@ -11189,53 +11434,32 @@ fn test_gc_integration_insert_commit_gc() {
     assert!(!db.mvcc_store.rows.is_empty());
 }
 
-/// Garbage collection removes only versions that are provably unreachable and keeps versions still required for visibility and safety.
 #[test]
-/// Rolling back a transaction leaves aborted garbage (begin=None, end=None).
-/// GC reclaims the versions. The SkipMap entry stays (lazy removal to avoid
-/// TOCTOU with concurrent writers) but the version vec is empty.
-fn test_gc_integration_rollback_creates_aborted_garbage() {
+fn transaction_rollback_removes_created_versions_immediately() {
     let db = MvccTestDb::new();
+    let row_id = RowID::new((-2).into(), RowKey::Int(1));
 
-    let tx1 = db
-        .mvcc_store
-        .begin_tx(db.conn.pager.load().clone())
-        .unwrap();
-    let row = generate_simple_string_row((-2).into(), 1, "will_rollback");
-    db.mvcc_store.insert(tx1, row).unwrap();
-    db.mvcc_store.rollback_tx(
-        tx1,
-        db.conn.pager.load().clone(),
-        &db.conn,
-        crate::MAIN_DB_ID,
-    );
-
-    // Rollback should leave aborted garbage (begin=None, end=None).
-    let entry = db
-        .mvcc_store
-        .rows
-        .get(&RowID::new((-2).into(), RowKey::Int(1)));
-    assert!(entry.is_some());
-    {
-        let versions = entry.as_ref().unwrap().value().read();
-        assert_eq!(versions.len(), 1);
-        assert!(versions[0].begin().is_none());
-        assert!(versions[0].end().is_none());
+    for _ in 0..100 {
+        let tx = db
+            .mvcc_store
+            .begin_tx(db.conn.pager.load().clone())
+            .unwrap();
+        let row = generate_simple_string_row((-2).into(), 1, "will_rollback");
+        db.mvcc_store.insert(tx, row).unwrap();
+        db.mvcc_store.rollback_tx(
+            tx,
+            db.conn.pager.load().clone(),
+            &db.conn,
+            crate::MAIN_DB_ID,
+        );
     }
 
-    // GC should clean up the version. The SkipMap entry stays (lazy removal
-    // in background GC avoids TOCTOU), but the version vec should be empty.
+    let entry = db.mvcc_store.rows.get(&row_id);
+    assert!(entry.is_some());
+    assert!(entry.unwrap().value().read().is_empty());
+    assert_eq!(db.mvcc_store.live_version_count_approx(), 0);
     let dropped = db.mvcc_store.drop_unused_row_versions();
-    assert_eq!(dropped, 1);
-    let entry = db
-        .mvcc_store
-        .rows
-        .get(&RowID::new((-2).into(), RowKey::Int(1)));
-    assert!(entry.is_some(), "SkipMap entry stays (lazy removal)");
-    assert!(
-        entry.unwrap().value().read().is_empty(),
-        "but versions should be empty"
-    );
+    assert_eq!(dropped, 0);
 }
 
 /// GC trims chains with retain()/clear(), which keeps the Vec's allocation.
@@ -11338,9 +11562,11 @@ fn test_gc_with_slot_removal_drops_empty_skipmap_entries() {
         crate::MAIN_DB_ID,
     );
 
-    // Rollback leaves aborted garbage behind in the chain.
     let row_id = RowID::new((-2).into(), RowKey::Int(1));
-    assert!(db.mvcc_store.rows.get(&row_id).is_some());
+    let entry = db.mvcc_store.rows.get(&row_id).unwrap();
+    db.mvcc_store
+        .insert_version_raw(&mut entry.value().write(), make_rv(None, None))
+        .unwrap();
 
     // The slot-removing GC variant collects the garbage AND drops the slot.
     // No concurrent writers exist in this test, satisfying the caller contract.
@@ -11733,14 +11959,27 @@ fn test_gc_incremental_reclaims_index_chains_resumably() {
     conn.execute("CREATE INDEX idx_v ON t(v)").unwrap();
     conn.execute("INSERT INTO t VALUES (1, 'keep')").unwrap();
 
-    // Insert many indexed rows in one transaction, then roll back: each leaves
-    // aborted garbage in its own index chain.
+    // Insert many indexed rows in one transaction, then roll back. Rollback
+    // keeps the empty slots but removes their versions immediately.
     conn.execute("BEGIN").unwrap();
     for i in 100..200 {
         conn.execute(format!("INSERT INTO t VALUES ({i}, 'g{i}')"))
             .unwrap();
     }
     conn.execute("ROLLBACK").unwrap();
+
+    // Populate the empty slots with stale versions to exercise the GC cursor
+    // directly rather than relying on rollback to manufacture garbage.
+    for outer in db.mvcc_store.index_rows.iter() {
+        for inner in outer.value().iter() {
+            let mut versions = inner.value().write();
+            if versions.is_empty() {
+                db.mvcc_store
+                    .insert_version_raw(&mut versions, make_rv(None, None))
+                    .unwrap();
+            }
+        }
+    }
 
     let count_index_versions = || -> usize {
         db.mvcc_store
@@ -11888,7 +12127,8 @@ fn test_gc_incremental_lazy_leaves_empty_slots() {
     let mvcc_store = db.get_mvcc_store();
     let table_id: MVTableId = (-2).into();
 
-    // Aborted insert leaves aborted garbage (begin=None, end=None) behind.
+    // Rollback keeps an empty SkipMap slot. Add stale data to that slot so the
+    // incremental GC path is what empties the chain.
     let tx = mvcc_store.begin_tx(conn.pager.load().clone()).unwrap();
     mvcc_store
         .insert(tx, generate_simple_string_row(table_id, 1, "rollback"))
@@ -11896,7 +12136,10 @@ fn test_gc_incremental_lazy_leaves_empty_slots() {
     mvcc_store.rollback_tx(tx, conn.pager.load().clone(), &conn, crate::MAIN_DB_ID);
 
     let row_id = RowID::new(table_id, RowKey::Int(1));
-    assert!(mvcc_store.rows.get(&row_id).is_some());
+    let entry = mvcc_store.rows.get(&row_id).unwrap();
+    mvcc_store
+        .insert_version_raw(&mut entry.value().write(), make_rv(None, None))
+        .unwrap();
 
     // Drive incremental GC to completion.
     for _ in 0..4 {

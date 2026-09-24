@@ -965,6 +965,8 @@ where
                 // The predecessor node
                 let mut pred = self.head.as_tower();
 
+                let mut node_that_ended_level_above: *const Node<K, V> = ptr::null();
+
                 while level >= 1 {
                     level -= 1;
 
@@ -995,6 +997,10 @@ where
                             }
                         }
 
+                        if ptr::eq(c.ptr.as_ptr(), node_that_ended_level_above) {
+                            break;
+                        }
+
                         // If `curr` contains a key that is greater than (or equal) to `key`, we're
                         // done with this level.
                         //
@@ -1003,11 +1009,13 @@ where
                         // lower bound, we return the first node after the condition became true.
                         if upper_bound {
                             if !below_upper_bound(&self.comparator, &bound, &c.key) {
+                                node_that_ended_level_above = c.ptr.as_ptr();
                                 break;
                             }
                             result = Some(c);
                         } else if above_lower_bound(&self.comparator, &bound, &c.key) {
                             result = Some(c);
+                            node_that_ended_level_above = c.ptr.as_ptr();
                             break;
                         }
 
@@ -1054,6 +1062,8 @@ where
                 // The predecessor node
                 let mut pred = self.head.as_tower();
 
+                let mut node_that_ended_level_above: *const Node<K, V> = ptr::null();
+
                 while level >= 1 {
                     level -= 1;
 
@@ -1084,12 +1094,20 @@ where
                             }
                         }
 
+                        if ptr::eq(c.ptr.as_ptr(), node_that_ended_level_above) {
+                            break;
+                        }
+
                         // If `curr` contains a key that is greater than or equal to `key`, we're
                         // done with this level.
                         match self.comparator.compare(&c.key, key) {
-                            cmp::Ordering::Greater => break,
+                            cmp::Ordering::Greater => {
+                                node_that_ended_level_above = c.ptr.as_ptr();
+                                break;
+                            }
                             cmp::Ordering::Equal => {
                                 result.found = Some(c);
+                                node_that_ended_level_above = c.ptr.as_ptr();
                                 break;
                             }
                             cmp::Ordering::Less => {}
