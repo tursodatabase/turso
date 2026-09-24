@@ -116,18 +116,11 @@ pub(super) struct SnapshotDirectory {
 }
 
 impl SnapshotDirectory {
-    #[turso_macros::allocation_site(crate::alloc::FtsAllocationSite::SnapshotMetadata)]
-    pub fn new(
-        files: HashMap<PathBuf, FileBytes>,
-        meta_json: Vec<u8>,
-        allocator: &DynAllocator,
-    ) -> crate::Result<Self> {
-        let mut bytes = DynVec::new_in(allocator.clone());
-        bytes.try_extend(meta_json)?;
-        Ok(Self {
+    pub fn new(files: HashMap<PathBuf, FileBytes>, meta_json: DynVec<u8>) -> Self {
+        Self {
             files: Arc::new(files),
-            meta_json: Arc::new(bytes),
-        })
+            meta_json: Arc::new(meta_json),
+        }
     }
 
     fn lookup(&self, path: &Path) -> Option<&FileBytes> {

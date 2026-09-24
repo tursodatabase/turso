@@ -195,8 +195,9 @@ fn snapshot_directory_reads_shared_file_bytes_without_copying() {
     bytes.try_extend([3, 5, 7, 11, 13]).unwrap();
     let data = Arc::new(bytes);
     let files = HashMap::from_iter([(path.to_path_buf(), Arc::clone(&data))]);
-    let directory =
-        SnapshotDirectory::new(files, b"metadata".to_vec(), &DynAllocator::default()).unwrap();
+    let mut meta_json = DynVec::new_in(DynAllocator::default());
+    meta_json.try_extend(b"metadata".iter().copied()).unwrap();
+    let directory = SnapshotDirectory::new(files, meta_json);
     assert!(directory.exists(path).unwrap());
     assert!(directory.exists(std::path::Path::new("meta.json")).unwrap());
     assert!(!directory
@@ -876,20 +877,21 @@ mod allocation_failures {
             ..Default::default()
         };
         let dyn_allocator = DynAllocator::new(allocator.clone());
+        let attachment = test_attachment();
+        let scratch = attachment.shared.scratch_index(&attachment.schema).unwrap();
         allocator.fail_after(0);
         assert!(matches!(
-            SnapshotDirectory::new(HashMap::default(), b"metadata".to_vec(), &dyn_allocator),
+            synthesize_meta_json(&scratch, &attachment.schema, &[], &dyn_allocator),
             Err(LimboError::OutOfMemory)
         ));
-        let directory =
-            SnapshotDirectory::new(HashMap::default(), b"metadata".to_vec(), &dyn_allocator)
-                .unwrap();
-        assert_eq!(
-            directory
-                .atomic_read(std::path::Path::new("meta.json"))
-                .unwrap(),
-            b"metadata"
-        );
+        let meta_json =
+            synthesize_meta_json(&scratch, &attachment.schema, &[], &dyn_allocator).unwrap();
+        let directory = SnapshotDirectory::new(HashMap::default(), meta_json);
+        let bytes = directory
+            .atomic_read(std::path::Path::new("meta.json"))
+            .unwrap();
+        let parsed: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(parsed["segments"], serde_json::json!([]));
     }
 
     #[test]

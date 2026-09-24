@@ -1311,8 +1311,8 @@ impl FtsCursor {
         let scratch = self.shared.scratch_index(&self.schema)?;
         let specs: Vec<SegmentMetaSpec> =
             self.segments.iter().map(LoadedSegment::meta_spec).collect();
-        let meta_json = synthesize_meta_json(&scratch, &self.schema, &specs)?;
-        let directory = SnapshotDirectory::new(files, meta_json, &self.allocator)?;
+        let meta_json = synthesize_meta_json(&scratch, &self.schema, &specs, &self.allocator)?;
+        let directory = SnapshotDirectory::new(files, meta_json);
         let index = Index::open(directory)
             .map_err(|e| LimboError::InternalError(format!("FTS snapshot open: {e}")))?;
         self.register_tokenizers(&index);
@@ -2482,8 +2482,8 @@ fn read_segment_identities(
     allocator: &DynAllocator,
 ) -> Result<SegmentIdentities> {
     let spec = SegmentMetaSpec::new(segment_id, max_doc, 0);
-    let meta_json = synthesize_meta_json(scratch, schema, &[spec])?;
-    let directory = SnapshotDirectory::new(files, meta_json, allocator)?;
+    let meta_json = synthesize_meta_json(scratch, schema, &[spec], allocator)?;
+    let directory = SnapshotDirectory::new(files, meta_json);
     let index = Index::open(directory)
         .map_err(|e| LimboError::InternalError(format!("FTS segment open: {e}")))?;
     let meta = index

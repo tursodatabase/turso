@@ -36,9 +36,13 @@
 
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 use std::collections::BTreeSet;
+use std::io::Write;
 use tantivy::{index::SegmentId, schema::Schema, Index, IndexMeta, IndexSettings};
 
 use super::directory::FileBytes;
+#[cfg(not(nightly))]
+use crate::alloc::TursoVecInExt;
+use crate::alloc::{DynAllocator, DynVec, TursoFromIterator};
 use crate::sync::Arc;
 use crate::{LimboError, Result};
 
@@ -521,11 +525,13 @@ pub(super) fn alive_bitset(
 /// they were minted from). `IndexSettings` must be identical across every
 /// transaction or a mixed searcher could not read old segments; we pin the
 /// default everywhere.
+#[turso_macros::allocation_site(crate::alloc::FtsAllocationSite::SnapshotMetadata)]
 pub(super) fn synthesize_meta_json(
     scratch: &Index,
     schema: &Schema,
     segments: &[SegmentMetaSpec],
-) -> Result<Vec<u8>> {
+    allocator: &DynAllocator,
+) -> Result<DynVec<u8>> {
     let metas = segments
         .iter()
         .map(|segment| {
@@ -544,8 +550,30 @@ pub(super) fn synthesize_meta_json(
         opstamp: 0,
         payload: None,
     };
-    serde_json::to_vec(&meta)
-        .map_err(|e| LimboError::InternalError(format!("FTS meta synthesis failed: {e}")))
+    let mut bytes = MetadataWriter(DynVec::new_in(allocator.clone()));
+    serde_json::to_writer(&mut bytes, &meta).map_err(|error| {
+        if error.io_error_kind() == Some(std::io::ErrorKind::OutOfMemory) {
+            LimboError::OutOfMemory
+        } else {
+            LimboError::InternalError(format!("FTS meta synthesis failed: {error}"))
+        }
+    })?;
+    Ok(bytes.0)
+}
+
+struct MetadataWriter(DynVec<u8>);
+
+impl Write for MetadataWriter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0
+            .try_extend(buf.iter().copied())
+            .map_err(|error| std::io::Error::new(std::io::ErrorKind::OutOfMemory, error))?;
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
 }
 
 /// The synthesized `.del` file name for a segment
