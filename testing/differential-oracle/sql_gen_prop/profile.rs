@@ -179,6 +179,12 @@ pub struct StatementProfile {
     /// DROP VIEW weight (no extra profile needed).
     pub drop_view_weight: u32,
 
+    // DDL weights - Materialized views
+    /// CREATE MATERIALIZED VIEW weight.
+    pub create_materialized_view_weight: u32,
+    /// DROP VIEW weight for materialized views.
+    pub drop_materialized_view_weight: u32,
+
     // DDL weights - Triggers
     /// CREATE TRIGGER weight and optional operation-level weights.
     pub create_trigger: WeightedProfile<CreateTriggerProfile>,
@@ -220,6 +226,8 @@ impl Default for StatementProfile {
             drop_index_weight: 1,
             create_view_weight: 1,
             drop_view_weight: 1,
+            create_materialized_view_weight: 0,
+            drop_materialized_view_weight: 0,
             create_trigger: WeightedProfile::new(1),
             drop_trigger_weight: 1,
 
@@ -257,6 +265,8 @@ impl StatementProfile {
             drop_index_weight: 0,
             create_view_weight: 0,
             drop_view_weight: 0,
+            create_materialized_view_weight: 0,
+            drop_materialized_view_weight: 0,
             create_trigger: WeightedProfile::new(0),
             drop_trigger_weight: 0,
             begin_weight: 0,
@@ -569,6 +579,8 @@ impl StatementProfile {
             + self.drop_index_weight
             + self.create_view_weight
             + self.drop_view_weight
+            + self.create_materialized_view_weight
+            + self.drop_materialized_view_weight
             + self.create_trigger.weight
             + self.drop_trigger_weight
     }
@@ -627,6 +639,8 @@ impl StatementProfile {
             StatementKind::DropIndex => self.drop_index_weight,
             StatementKind::CreateView => self.create_view_weight,
             StatementKind::DropView => self.drop_view_weight,
+            StatementKind::CreateMaterializedView => self.create_materialized_view_weight,
+            StatementKind::DropMaterializedView => self.drop_materialized_view_weight,
             StatementKind::CreateTrigger => self.create_trigger.weight,
             StatementKind::DropTrigger => self.drop_trigger_weight,
             StatementKind::Begin => self.begin_weight,
