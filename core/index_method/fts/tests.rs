@@ -83,7 +83,7 @@ fn test_attachment() -> FtsIndexAttachment {
 #[test]
 fn indexed_text_is_not_duplicated_in_tantivy_document_store() {
     let attachment = test_attachment();
-    for (_, field) in attachment.text_fields {
+    for (_, field) in attachment.indexed_fields {
         assert!(
             !attachment.schema.get_field_entry(field).is_stored(),
             "FTS projections come from the base table, so storing indexed text duplicates data"
@@ -205,7 +205,7 @@ fn build_and_load_segment(
     for (rowid, text) in docs {
         let mut doc = TantivyDocument::default();
         doc.add_i64(attachment.rowid_field, *rowid);
-        doc.add_text(attachment.text_fields[0].1, *text);
+        doc.add_text(attachment.indexed_fields[0].1, *text);
         cursor_docs.push(BufferedDoc { rowid: *rowid, doc });
     }
     let mut cursor = FtsCursor::new(attachment);

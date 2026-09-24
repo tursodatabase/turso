@@ -49,7 +49,10 @@ use tantivy::{
     index::SegmentId,
     indexer::{AddOperation, SegmentWriter},
     query::{EnableScoring, Query, Scorer},
-    schema::{Field, IndexRecordOption, Schema},
+    schema::{
+        Field, FieldType, IndexRecordOption, JsonObjectOptions, OwnedValue, Schema,
+        TextFieldIndexing, TextOptions,
+    },
     tokenizer::{
         NgramTokenizer, RawTokenizer, SimpleTokenizer, TextAnalyzer, TokenStream,
         WhitespaceTokenizer,
@@ -588,8 +591,8 @@ pub struct FtsIndexAttachment {
     /// Tantivy fields for the document identity
     identity_hi_field: Field,
     identity_lo_field: Field,
-    /// Schema fields for each indexed text column
-    text_fields: Vec<(IndexColumn, Field)>,
+    /// Schema fields for each indexed column
+    indexed_fields: Vec<(IndexColumn, Field)>,
     /// Parsed query patterns for FTS queries
     patterns: Vec<Select>,
     /// Weights for each field in FTS scoring, from the WITH clause.
@@ -610,7 +613,14 @@ pub const SUPPORTED_TOKENIZERS: &[&str] = &[
 ];
 
 /// Supported keys in the WITH clause of an FTS index
-pub const SUPPORTED_WITH_KEYS: &[&str] = &["tokenizer", "weights", "min_gram", "max_gram"];
+pub const SUPPORTED_WITH_KEYS: &[&str] = &[
+    "tokenizer",
+    "weights",
+    "min_gram",
+    "max_gram",
+    "json_fields",
+    "json_tokenizer",
+];
 
 /// Ngram window used when `min_gram`/`max_gram` are not given.
 pub const DEFAULT_NGRAM_WINDOW: (usize, usize) = (2, 3);
@@ -674,6 +684,32 @@ impl FtsIndexAttachment {
             )));
         }
 
+        let json_columns = parse_json_fields(
+            parameters.get(UncasedStr::new("json_fields")).copied(),
+            &cfg.columns,
+        )?;
+        let json_tokenizer = match parameters.get(UncasedStr::new("json_tokenizer")) {
+            None => tokenizer_name.as_str(),
+            Some(Value::Text(value)) => {
+                if json_columns.is_empty() {
+                    return Err(LimboError::ParseError(
+                        "FTS json_tokenizer requires json_fields".into(),
+                    ));
+                }
+                value.as_str().trim_matches(|c| c == '\'' || c == '"')
+            }
+            Some(_) => {
+                return Err(LimboError::ParseError(
+                    "FTS json_tokenizer must be text".into(),
+                ))
+            }
+        };
+        if !SUPPORTED_TOKENIZERS.contains(&json_tokenizer) {
+            return Err(LimboError::ParseError(format!(
+                "unsupported FTS json_tokenizer '{json_tokenizer}'"
+            )));
+        }
+
         // Parse the ngram window: WITH (tokenizer = 'ngram', min_gram = 1, max_gram = 3)
         let parse_gram = |key: &str| -> Result<Option<usize>> {
             let Some(value) = parameters.get(UncasedStr::new(key)) else {
@@ -690,10 +726,14 @@ impl FtsIndexAttachment {
         };
         let min_gram = parse_gram("min_gram")?;
         let max_gram = parse_gram("max_gram")?;
-        if (min_gram.is_some() || max_gram.is_some()) && tokenizer_name != "ngram" {
-            return Err(LimboError::ParseError(format!(
-                "FTS WITH parameters 'min_gram' and 'max_gram' require tokenizer = 'ngram', got tokenizer = '{tokenizer_name}'"
-            )));
+        if (min_gram.is_some() || max_gram.is_some())
+            && tokenizer_name != "ngram"
+            && json_tokenizer != "ngram"
+        {
+            return Err(LimboError::ParseError(
+                "FTS min_gram and max_gram require tokenizer = 'ngram' or json_tokenizer = 'ngram'"
+                    .into(),
+            ));
         }
         let ngram_window = (
             min_gram.unwrap_or(DEFAULT_NGRAM_WINDOW.0),
@@ -735,15 +775,29 @@ impl FtsIndexAttachment {
         let identity_lo_field =
             schema_builder.add_u64_field(IDENTITY_LO_FIELD, tantivy::schema::FAST);
 
-        let mut text_fields = Vec::with_capacity(cfg.columns.len());
+        let mut indexed_fields = Vec::with_capacity(cfg.columns.len());
         for col in &cfg.columns {
-            let opts = tantivy::schema::TextOptions::default().set_indexing_options(
-                tantivy::schema::TextFieldIndexing::default()
-                    .set_tokenizer(&tokenizer_name)
-                    .set_index_option(tantivy::schema::IndexRecordOption::WithFreqsAndPositions),
-            );
-            let field = schema_builder.add_text_field(&col.name, opts);
-            text_fields.push((col.clone(), field));
+            let is_json = json_columns.contains(&col.name);
+            let tokenizer = if is_json {
+                json_tokenizer
+            } else {
+                &tokenizer_name
+            };
+            let indexing = TextFieldIndexing::default()
+                .set_tokenizer(tokenizer)
+                .set_index_option(IndexRecordOption::WithFreqsAndPositions);
+            let field = if is_json {
+                let options = JsonObjectOptions::default()
+                    .set_indexing_options(indexing)
+                    .set_fast(None);
+                schema_builder.add_json_field(&col.name, options)
+            } else {
+                schema_builder.add_text_field(
+                    &col.name,
+                    TextOptions::default().set_indexing_options(indexing),
+                )
+            };
+            indexed_fields.push((col.clone(), field));
         }
 
         let schema = schema_builder.build();
@@ -807,13 +861,43 @@ impl FtsIndexAttachment {
             rowid_field,
             identity_hi_field,
             identity_lo_field,
-            text_fields,
+            indexed_fields,
             patterns,
             field_weights,
             ngram_window,
             shared: Arc::new(FtsShared::default()),
         })
     }
+}
+
+fn parse_json_fields(value: Option<&Value>, columns: &[IndexColumn]) -> Result<HashSet<String>> {
+    let mut names = HashSet::default();
+    let Some(value) = value else {
+        return Ok(names);
+    };
+    let Value::Text(value) = value else {
+        return Err(LimboError::ParseError(
+            "FTS json_fields must be a comma-separated list of indexed columns".into(),
+        ));
+    };
+    let value = value.as_str().trim_matches(|c| c == '\'' || c == '"');
+    for name in value.split(',').map(str::trim) {
+        if name.is_empty() {
+            return Err(LimboError::ParseError(
+                "empty column name in FTS json_fields".into(),
+            ));
+        }
+        let column = columns
+            .iter()
+            .find(|col| col.name.eq_ignore_ascii_case(name))
+            .ok_or_else(|| LimboError::ParseError(format!("unknown FTS JSON column '{name}'")))?;
+        if !names.insert(column.name.clone()) {
+            return Err(LimboError::ParseError(format!(
+                "duplicate FTS JSON column '{name}'"
+            )));
+        }
+    }
+    Ok(names)
 }
 
 impl IndexMethodAttachment for FtsIndexAttachment {
@@ -1012,7 +1096,7 @@ pub struct FtsCursor {
     identity_lo_field: Field,
     /// (min_gram, max_gram) window for the ngram tokenizer
     ngram_window: (usize, usize),
-    text_fields: Vec<(IndexColumn, Field)>,
+    indexed_fields: Vec<(IndexColumn, Field)>,
     /// The user-visible index name, for error messages.
     index_name: String,
     store: FtsStore,
@@ -1089,9 +1173,9 @@ impl FtsCursor {
     /// Creates a new FTS cursor with the given configuration.
     fn new(attachment: &FtsIndexAttachment) -> Self {
         let store = FtsStore::new(&attachment.cfg.index_name);
-        let text_fields = attachment.text_fields.clone();
-        let default_fields: Vec<Field> = text_fields.iter().map(|(_, f)| *f).collect();
-        let field_boosts: Vec<(Field, f32)> = text_fields
+        let indexed_fields = attachment.indexed_fields.clone();
+        let default_fields: Vec<Field> = indexed_fields.iter().map(|(_, f)| *f).collect();
+        let field_boosts: Vec<(Field, f32)> = indexed_fields
             .iter()
             .filter_map(|(col, field)| {
                 attachment
@@ -1107,7 +1191,7 @@ impl FtsCursor {
             identity_hi_field: attachment.identity_hi_field,
             identity_lo_field: attachment.identity_lo_field,
             ngram_window: attachment.ngram_window,
-            text_fields,
+            indexed_fields,
             index_name: attachment.cfg.index_name.clone(),
             store,
             default_fields,
@@ -2907,7 +2991,7 @@ impl IndexMethodCursor for FtsCursor {
         result
     }
 
-    /// Buffers a document for the next segment build. Values are text
+    /// Buffers a document for the next segment build. Values are indexed
     /// columns followed by rowid.
     fn insert(&mut self, values: &[Register]) -> IOResultOr<()> {
         self.claim_writer_slot()?;
@@ -2927,7 +3011,14 @@ impl IndexMethodCursor for FtsCursor {
         let mut doc = TantivyDocument::default();
         doc.add_i64(self.rowid_field, rowid);
 
-        for ((_col, field), reg) in self.text_fields.iter().zip(&values[..values.len() - 1]) {
+        for ((col, field), reg) in self.indexed_fields.iter().zip(&values[..values.len() - 1]) {
+            if matches!(
+                self.schema.get_field_entry(*field).field_type(),
+                FieldType::JsonObject(_)
+            ) {
+                add_json_value(&mut doc, *field, &col.name, reg)?;
+                continue;
+            }
             match reg {
                 Register::Value(Value::Text(t)) => {
                     doc.add_text(*field, t.as_str());
@@ -3672,6 +3763,33 @@ impl IndexMethodCursor for FtsCursor {
             merge_segments_skipped: Some(stats.merge_segments_skipped.load(Ordering::Relaxed)),
         }))
     }
+}
+
+fn add_json_value(
+    doc: &mut TantivyDocument,
+    field: Field,
+    column: &str,
+    value: &Register,
+) -> Result<()> {
+    let text = match value {
+        Register::Value(Value::Null) => return Ok(()),
+        Register::Value(Value::Text(text)) => text.as_str(),
+        _ => {
+            return Err(LimboError::InvalidArgument(format!(
+                "FTS JSON column '{column}' requires JSON text or NULL"
+            )))
+        }
+    };
+    let object: Option<serde_json::Map<String, serde_json::Value>> = serde_json::from_str(text)
+        .map_err(|error| {
+            LimboError::InvalidArgument(format!(
+                "invalid JSON object in FTS column '{column}': {error}"
+            ))
+        })?;
+    if let Some(object) = object {
+        doc.add_field_value(field, &OwnedValue::from(object));
+    }
+    Ok(())
 }
 
 #[cfg(test)]
