@@ -71,7 +71,10 @@ struct Args {
 
     /// Named statement-weight mix to generate with. Each profile stresses a
     /// different part of the engine. A failing seed reproduces under the same
-    /// profile.
+    /// profile. With `--generator sql-gen-prop`, the trigger weights and the
+    /// SELECT settings of `correlated-subqueries` and `joins` do not apply,
+    /// and CREATE TABLE AS keeps its sql-gen-prop default weight. Only the
+    /// default profile is allowed with `--recursive-cte-focus`.
     #[arg(long, default_value = "balanced", value_enum)]
     profile: WeightProfile,
 }
@@ -262,6 +265,9 @@ fn fuzzer_main() -> Result<()> {
 fn run_single_inner(args: &Args) -> Result<differential_fuzzer::SimStats> {
     if args.recursive_cte_focus && !matches!(args.generator, GeneratorKind::SqlGenProp) {
         anyhow::bail!("--recursive-cte-focus requires --generator sql-gen-prop");
+    }
+    if args.recursive_cte_focus && args.profile != WeightProfile::default() {
+        anyhow::bail!("--recursive-cte-focus replaces the statement weights of --profile");
     }
     let config = SimConfig {
         seed: args.seed,
