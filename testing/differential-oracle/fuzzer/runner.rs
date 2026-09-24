@@ -10,7 +10,7 @@
 
 use std::cell::RefCell;
 use std::io::Write;
-use std::panic::RefUnwindSafe;
+use std::panic::{AssertUnwindSafe, RefUnwindSafe};
 use std::path::PathBuf;
 use std::sync::Arc;
 use turso_core::SqliteDialect;
@@ -22,7 +22,10 @@ use rand::{RngCore, SeedableRng};
 use rand_chacha::ChaCha8Rng;
 use turso_core::Database;
 
-use crate::generate::{GeneratorKind, PropTestBackend, SqlGenBackend, SqlGenerator, WeightProfile};
+use crate::generate::{
+    Generated, GeneratedStatement, GeneratorKind, Matviews, PropTestBackend, SqlGenBackend,
+    SqlGenerator, WeightProfile,
+};
 use crate::memory::{MemorySimIO, SimIO};
 use crate::oracle::{DifferentialOracle, OracleResult, QueryResult, check_differential};
 use crate::schema::SchemaIntrospector;
@@ -202,6 +205,8 @@ pub struct SimConfig {
     pub recursive_cte_focus: bool,
     /// Named statement-weight mix to generate with.
     pub weight_profile: WeightProfile,
+    /// Generate materialized views: Turso maintains them, SQLite runs them as plain views.
+    pub matview: bool,
 }
 
 impl Default for SimConfig {
@@ -220,6 +225,7 @@ impl Default for SimConfig {
             window_function_probability: 0.0,
             recursive_cte_focus: false,
             weight_profile: WeightProfile::default(),
+            matview: false,
         }
     }
 }
@@ -362,7 +368,9 @@ impl Fuzzer {
 
         // Create Turso in-memory database using MemorySimIO
         let io = Arc::new(MemorySimIO::new(config.seed));
-        let opts = turso_core::DatabaseOpts::new().with_attach(true);
+        let opts = turso_core::DatabaseOpts::new()
+            .with_attach(true)
+            .with_views(config.matview);
 
         let turso_db = Database::open_file_with_flags(
             io.clone(),
@@ -577,123 +585,38 @@ impl Fuzzer {
                     seed_bytes,
                     self.config.recursive_cte_focus,
                     self.config.weight_profile,
+                    self.config.matview,
                 ))
             }
         };
 
         let mut schema = self.introspect_and_verify_schemas()?;
+        let mut matviews = Matviews::new();
 
         for i in 0..self.config.num_statements {
-            let stmt = generator.generate(&schema)?;
-
-            // A generated expression can branch into several subqueries at
-            // each level. This occasionally produces hundreds of kilobytes of
-            // SQL. Preparing such a statement uses enough recursive calls to
-            // exhaust the process stack before either engine can return an
-            // error. These statements add little useful coverage, so skip
-            // them before passing them to either engine.
-            if generated_sql_is_too_large(&stmt.sql) {
-                stats.statements_skipped += 1;
-                let reason = format!(
-                    "Statement skipped because it is {} bytes; the limit is {MAX_GENERATED_SQL_BYTES} bytes",
-                    stmt.sql.len()
-                );
-                push_warning_comments(executed_sql, i, &reason);
-                tracing::debug!("Skipped generated statement {i}: {reason}");
-                continue;
-            }
-
-            if self.config.verbose {
-                let stmt_type = if stmt.is_ddl { "DDL" } else { "DML" };
-                tracing::info!("Statement {} [{}]: {}", i, stmt_type, stmt.sql);
-            }
-
-            // Execute on both databases and check oracle.
-            // catch_unwind so that a panic inside Turso still reports
-            // stats and the offending SQL instead of just a stack trace.
-            let ctx = Arc::clone(&self.panic_context);
-            let prev_hook = std::panic::take_hook();
-            std::panic::set_hook(Box::new(move |info| {
-                let bt = std::backtrace::Backtrace::force_capture();
-                *ctx.lock() = Some(format!("{info}\n{bt}"));
+            let generated = generator.generate(&schema, &matviews)?;
+            let step = self.catch_panic(AssertUnwindSafe(|| {
+                self.run_step(
+                    i,
+                    &generated,
+                    &mut schema,
+                    &mut matviews,
+                    stats,
+                    executed_sql,
+                )
             }));
-
-            let oracle_result = std::panic::catch_unwind(|| {
-                check_differential(&self.turso_conn, &self.sqlite_conn, &schema, &stmt)
-            });
-
-            std::panic::set_hook(prev_hook);
-
-            let oracle_result = match oracle_result {
-                Ok(result) => result,
+            match step {
+                Ok(result) => result?,
                 Err(panic) => {
-                    let msg = panic
-                        .downcast_ref::<&str>()
-                        .map(|s| s.to_string())
-                        .or_else(|| panic.downcast_ref::<String>().cloned())
-                        .unwrap_or_else(|| "Unknown panic".to_string());
-                    let context = self.panic_context.lock().take().unwrap_or_default();
-                    executed_sql.push(format!("-- PANIC: {}", stmt.sql));
+                    executed_sql.push(format!("-- PANIC: {}", generated.sql()));
                     stats.oracle_failures += 1;
-                    tracing::error!("Panic at statement {i}: {msg}");
-                    tracing::error!("Panicking SQL: {}", stmt.sql);
-                    tracing::error!("Backtrace:\n{context}");
+                    tracing::error!("Panic at statement {i}: {panic}");
+                    tracing::error!("Panicking SQL: {}", generated.sql());
                     return Err(anyhow::anyhow!(
-                        "Panic during statement {i}: {msg}\n  SQL: {}\n{context}",
-                        stmt.sql
+                        "Panic during statement {i}: {panic}\n  SQL: {}",
+                        generated.sql()
                     ));
                 }
-            };
-
-            match oracle_result {
-                OracleResult::Pass => {
-                    stats.statements_executed += 1;
-                    executed_sql.push(stmt.sql.clone());
-                }
-                OracleResult::PassWithUnnestingInvariant => {
-                    stats.statements_executed += 1;
-                    stats.unnesting_invariants_checked += 1;
-                    executed_sql.push(stmt.sql.clone());
-                }
-                OracleResult::Skipped(reason) => {
-                    stats.statements_skipped += 1;
-                    push_warning_comments(executed_sql, i, &reason);
-                    executed_sql.push(format!("-- SKIPPED: {}", stmt.sql));
-                    tracing::debug!("Skipped generated statement {i}: {reason}");
-                    continue;
-                }
-                OracleResult::Warning(reason) => {
-                    stats.statements_executed += 1;
-                    stats.warnings += 1;
-                    push_warning_comments(executed_sql, i, &reason);
-                    executed_sql.push(stmt.sql.clone());
-                    tracing::warn!("Oracle warning at statement {i}: {reason}");
-                }
-                OracleResult::Fail(reason) => {
-                    stats.oracle_failures += 1;
-                    executed_sql.push(format!("-- FAILED: {}", stmt.sql));
-                    tracing::error!("Oracle failure at statement {i}: {reason}");
-                    if !self.config.verbose {
-                        tracing::error!("Failing SQL: {}", stmt.sql);
-                    }
-                    let state_dump = self.dump_failure_state(&schema, &stmt.sql);
-                    self.shrink_and_write(&state_dump, executed_sql, &stmt.sql);
-                    return Err(anyhow::anyhow!("Oracle failure: {reason}"));
-                }
-            }
-
-            if stmt.is_ddl {
-                schema = self.introspect_and_verify_schemas().map_err(|e| {
-                    anyhow::anyhow!(
-                        "Schema mismatch after DDL statement {i} ({}): {e}",
-                        stmt.sql
-                    )
-                })?;
-                tracing::debug!(
-                    "Schema updated after DDL: {} tables, {} indexes",
-                    schema.tables.len(),
-                    schema.indexes.len()
-                );
             }
         }
 
@@ -701,6 +624,246 @@ impl Fuzzer {
 
         *coverage_out = generator.take_coverage();
 
+        Ok(())
+    }
+
+    /// Run `f`, turning a panic into its message and backtrace, so that the
+    /// caller can still record the statement and write `test.sql`.
+    fn catch_panic<T>(&self, f: impl FnOnce() -> T + std::panic::UnwindSafe) -> Result<T, String> {
+        let ctx = Arc::clone(&self.panic_context);
+        let prev_hook = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            let bt = std::backtrace::Backtrace::force_capture();
+            *ctx.lock() = Some(format!("{info}\n{bt}"));
+        }));
+        let result = std::panic::catch_unwind(f);
+        std::panic::set_hook(prev_hook);
+        result.map_err(|panic| {
+            let msg = panic
+                .downcast_ref::<&str>()
+                .map(|s| s.to_string())
+                .or_else(|| panic.downcast_ref::<String>().cloned())
+                .unwrap_or_else(|| "Unknown panic".to_string());
+            let context = self.panic_context.lock().take().unwrap_or_default();
+            format!("{msg}\n{context}")
+        })
+    }
+
+    fn run_step(
+        &self,
+        i: usize,
+        generated: &Generated,
+        schema: &mut sql_gen::Schema,
+        matviews: &mut Matviews,
+        stats: &mut SimStats,
+        executed_sql: &mut Vec<String>,
+    ) -> Result<()> {
+        match generated {
+            Generated::Statement(stmt) => {
+                self.run_statement(i, stmt, schema, matviews, stats, executed_sql)
+            }
+            Generated::CreateMatview {
+                turso_sql,
+                sqlite_sql,
+                name,
+                columns,
+            } => {
+                if self.config.verbose {
+                    tracing::info!("Statement {i} [MATVIEW]: {turso_sql}");
+                }
+                executed_sql.push(turso_sql.clone());
+                executed_sql.push(format!("-- SQLITE: {sqlite_sql}"));
+                let turso = DifferentialOracle::execute_turso(&self.turso_conn, turso_sql);
+                let sqlite = DifferentialOracle::execute_sqlite(&self.sqlite_conn, sqlite_sql);
+                // The generator only emits views that both engines accept.
+                if matches!(turso, QueryResult::Error(_)) || matches!(sqlite, QueryResult::Error(_))
+                {
+                    stats.oracle_failures += 1;
+                    executed_sql.push(format!("-- FAILED: {turso_sql}"));
+                    bail!(
+                        "Oracle failure at statement {i}: materialized view DDL failed.\n  Turso SQL: {turso_sql}\n  Turso: {turso:?}\n  SQLite SQL: {sqlite_sql}\n  SQLite: {sqlite:?}"
+                    );
+                }
+                stats.statements_executed += 1;
+                matviews.insert(name.clone(), columns.clone());
+                self.verify_matviews(matviews, stats, executed_sql)
+            }
+            Generated::DropMatview { sql, name } => {
+                if self.config.verbose {
+                    tracing::info!("Statement {i} [MATVIEW]: {sql}");
+                }
+                self.drop_view_on_both(sql, stats, executed_sql)?;
+                stats.statements_executed += 1;
+                matviews.remove(name);
+                self.drop_matviews_sqlite_cannot_read(matviews, stats, executed_sql)?;
+                self.verify_matviews(matviews, stats, executed_sql)
+            }
+        }
+    }
+
+    fn run_statement(
+        &self,
+        i: usize,
+        stmt: &GeneratedStatement,
+        schema: &mut sql_gen::Schema,
+        matviews: &mut Matviews,
+        stats: &mut SimStats,
+        executed_sql: &mut Vec<String>,
+    ) -> Result<()> {
+        // A generated expression can branch into several subqueries at
+        // each level. This occasionally produces hundreds of kilobytes of
+        // SQL. Preparing such a statement uses enough recursive calls to
+        // exhaust the process stack before either engine can return an
+        // error. These statements add little useful coverage, so skip
+        // them before passing them to either engine.
+        if generated_sql_is_too_large(&stmt.sql) {
+            stats.statements_skipped += 1;
+            let reason = format!(
+                "Statement skipped because it is {} bytes; the limit is {MAX_GENERATED_SQL_BYTES} bytes",
+                stmt.sql.len()
+            );
+            push_warning_comments(executed_sql, i, &reason);
+            tracing::debug!("Skipped generated statement {i}: {reason}");
+            return Ok(());
+        }
+
+        if self.config.verbose {
+            let stmt_type = if stmt.is_ddl { "DDL" } else { "DML" };
+            tracing::info!("Statement {} [{}]: {}", i, stmt_type, stmt.sql);
+        }
+
+        match check_differential(&self.turso_conn, &self.sqlite_conn, schema, stmt) {
+            OracleResult::Pass => {
+                stats.statements_executed += 1;
+                executed_sql.push(stmt.sql.clone());
+            }
+            OracleResult::PassWithUnnestingInvariant => {
+                stats.statements_executed += 1;
+                stats.unnesting_invariants_checked += 1;
+                executed_sql.push(stmt.sql.clone());
+            }
+            OracleResult::Skipped(reason) => {
+                stats.statements_skipped += 1;
+                push_warning_comments(executed_sql, i, &reason);
+                executed_sql.push(format!("-- SKIPPED: {}", stmt.sql));
+                tracing::debug!("Skipped generated statement {i}: {reason}");
+                return Ok(());
+            }
+            OracleResult::Warning(reason) => {
+                stats.statements_executed += 1;
+                stats.warnings += 1;
+                push_warning_comments(executed_sql, i, &reason);
+                executed_sql.push(stmt.sql.clone());
+                tracing::warn!("Oracle warning at statement {i}: {reason}");
+            }
+            OracleResult::Fail(reason) => {
+                stats.oracle_failures += 1;
+                executed_sql.push(format!("-- FAILED: {}", stmt.sql));
+                tracing::error!("Oracle failure at statement {i}: {reason}");
+                if !self.config.verbose {
+                    tracing::error!("Failing SQL: {}", stmt.sql);
+                }
+                let state_dump = self.dump_failure_state(schema, &stmt.sql);
+                self.shrink_and_write(&state_dump, executed_sql, &stmt.sql);
+                return Err(anyhow::anyhow!("Oracle failure: {reason}"));
+            }
+        }
+
+        if stmt.is_ddl {
+            self.drop_matviews_sqlite_cannot_read(matviews, stats, executed_sql)?;
+            *schema = self.introspect_and_verify_schemas().map_err(|e| {
+                anyhow::anyhow!(
+                    "Schema mismatch after DDL statement {i} ({}): {e}",
+                    stmt.sql
+                )
+            })?;
+            tracing::debug!(
+                "Schema updated after DDL: {} tables, {} indexes",
+                schema.tables.len(),
+                schema.indexes.len()
+            );
+        }
+        if stmt.mutates_data {
+            self.verify_matviews(matviews, stats, executed_sql)?;
+        }
+        Ok(())
+    }
+
+    /// Compare every materialized view on Turso with the plain view on SQLite.
+    fn verify_matviews(
+        &self,
+        matviews: &Matviews,
+        stats: &mut SimStats,
+        executed_sql: &mut Vec<String>,
+    ) -> Result<()> {
+        for (name, columns) in matviews {
+            assert!(!columns.is_empty(), "matview {name} has no columns");
+            let order_by = (1..=columns.len())
+                .map(|i| i.to_string())
+                .collect::<Vec<_>>()
+                .join(", ");
+            let sql = format!("SELECT * FROM {name} ORDER BY {order_by}");
+            let turso = DifferentialOracle::execute_turso(&self.turso_conn, &sql);
+            let sqlite = DifferentialOracle::execute_sqlite(&self.sqlite_conn, &sql);
+            let failure = match (&turso, &sqlite) {
+                (QueryResult::Error(_), _) | (_, QueryResult::Error(_)) => Some("read error"),
+                _ if turso != sqlite => Some("data mismatch"),
+                _ => None,
+            };
+            if let Some(failure) = failure {
+                stats.oracle_failures += 1;
+                executed_sql.push(format!("-- MATVIEW VERIFY FAILED: {sql}"));
+                bail!("Matview {failure} in '{name}':\n  Turso:  {turso:?}\n  SQLite: {sqlite:?}");
+            }
+        }
+        Ok(())
+    }
+
+    /// After a DDL statement, a plain view on SQLite stops working when a table
+    /// or view it reads is gone, while Turso keeps the materialized rows. Such
+    /// views can no longer be compared, so drop them on both engines.
+    fn drop_matviews_sqlite_cannot_read(
+        &self,
+        matviews: &mut Matviews,
+        stats: &mut SimStats,
+        executed_sql: &mut Vec<String>,
+    ) -> Result<()> {
+        let unreadable: Vec<String> = matviews
+            .keys()
+            .filter(|name| {
+                matches!(
+                    DifferentialOracle::execute_sqlite(
+                        &self.sqlite_conn,
+                        &format!("SELECT * FROM {name} LIMIT 0")
+                    ),
+                    QueryResult::Error(_)
+                )
+            })
+            .cloned()
+            .collect();
+        for name in unreadable {
+            let sql = format!("DROP VIEW {name}");
+            executed_sql.push(format!("-- SOURCE GONE: {name}"));
+            self.drop_view_on_both(&sql, stats, executed_sql)?;
+            matviews.remove(&name);
+        }
+        Ok(())
+    }
+
+    fn drop_view_on_both(
+        &self,
+        sql: &str,
+        stats: &mut SimStats,
+        executed_sql: &mut Vec<String>,
+    ) -> Result<()> {
+        let turso = DifferentialOracle::execute_turso(&self.turso_conn, sql);
+        let sqlite = DifferentialOracle::execute_sqlite(&self.sqlite_conn, sql);
+        executed_sql.push(sql.to_string());
+        if matches!(turso, QueryResult::Error(_)) || matches!(sqlite, QueryResult::Error(_)) {
+            stats.oracle_failures += 1;
+            executed_sql.push(format!("-- FAILED: {sql}"));
+            bail!("DROP VIEW failed: {sql}\n  Turso:  {turso:?}\n  SQLite: {sqlite:?}");
+        }
         Ok(())
     }
 
@@ -945,6 +1108,7 @@ mod tests {
             window_function_probability: 0.0,
             recursive_cte_focus: false,
             weight_profile: WeightProfile::default(),
+            matview: false,
         };
         let sim = Fuzzer::new(config);
         assert!(sim.is_ok());

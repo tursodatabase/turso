@@ -26,6 +26,7 @@ pub mod expression;
 pub mod function;
 pub mod generator;
 pub mod insert;
+pub mod materialized_view;
 pub mod profile;
 pub mod result;
 pub mod schema;
@@ -61,6 +62,7 @@ pub use function::{
 };
 pub use generator::{SqlGeneratorKind, WeightedKindIteratorExt};
 pub use insert::InsertStatement;
+pub use materialized_view::CreateMaterializedViewStatement;
 pub use profile::{
     CreateIndexProfile, CreateTableProfile, CreateTriggerProfile, DeleteProfile,
     ExtendedExpressionProfile, ExtendedFunctionProfile, GenerationProfile, InsertProfile,
@@ -128,6 +130,10 @@ pub mod strategies {
     };
     // Views
     pub use crate::view::{create_view, drop_view, drop_view_for_schema};
+    // Materialized views
+    pub use crate::materialized_view::{
+        create_materialized_view, drop_materialized_view, materialized_view_sources,
+    };
     // Triggers
     pub use crate::create_trigger::{
         create_trigger_for_schema, create_trigger_for_table, create_trigger_with_timing_event,

@@ -288,6 +288,8 @@ pub struct CreateTableProfile {
     pub primary_key: PrimaryKeyProfile,
     /// Profile for non-PK column generation.
     pub column: ColumnProfile,
+    /// Create tables in the main database only, never in `temp` or an attached database.
+    pub main_schema_only: bool,
 }
 
 impl Default for CreateTableProfile {
@@ -299,6 +301,7 @@ impl Default for CreateTableProfile {
             strict_probability: 20,
             primary_key: PrimaryKeyProfile::default(),
             column: ColumnProfile::default(),
+            main_schema_only: false,
         }
     }
 }
@@ -313,6 +316,7 @@ impl CreateTableProfile {
             strict_probability: self.strict_probability,
             primary_key: self.primary_key.integer_only(),
             column: self.column.minimal(),
+            main_schema_only: self.main_schema_only,
         }
     }
 
@@ -325,6 +329,7 @@ impl CreateTableProfile {
             strict_probability: self.strict_probability,
             primary_key: self.primary_key,
             column: self.column.high_constraints(),
+            main_schema_only: self.main_schema_only,
         }
     }
 
@@ -337,6 +342,7 @@ impl CreateTableProfile {
             strict_probability: self.strict_probability,
             primary_key: self.primary_key.integer_only(),
             column: self.column.full_constraints(),
+            main_schema_only: self.main_schema_only,
         }
     }
 
@@ -349,6 +355,7 @@ impl CreateTableProfile {
             strict_probability: self.strict_probability,
             primary_key: self.primary_key.none(),
             column: self.column,
+            main_schema_only: self.main_schema_only,
         }
     }
 
@@ -711,13 +718,16 @@ pub fn create_table(
     schema: &Schema,
     profile: &StatementProfile,
 ) -> BoxedStrategy<CreateTableStatement> {
-    let attached_databases = schema.attached_databases.clone();
-    let mut database_choices = vec![None, Some("temp".to_string())];
-    for db in attached_databases {
-        if db == "temp" {
-            continue;
+    let create_table_profile = profile.create_table_profile();
+    let mut database_choices = vec![None];
+    if !create_table_profile.main_schema_only {
+        database_choices.push(Some("temp".to_string()));
+        for db in &schema.attached_databases {
+            if db == "temp" {
+                continue;
+            }
+            database_choices.push(Some(db.clone()));
         }
-        database_choices.push(Some(db));
     }
     let target_databases: Vec<(Option<String>, std::collections::HashSet<String>)> =
         database_choices
@@ -728,8 +738,6 @@ pub fn create_table(
             })
             .collect();
 
-    // Extract profile values from the CreateTableProfile
-    let create_table_profile = profile.create_table_profile();
     let column_count_range = create_table_profile.column_count_range.clone();
     let column_profile = create_table_profile.column.clone();
     let pk_profile = create_table_profile.primary_key.clone();
