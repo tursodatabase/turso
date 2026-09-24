@@ -1200,10 +1200,24 @@ impl TursoConnection {
         self.connection.last_insert_rowid()
     }
 
+    /// Fail unless the database keeps its changes in the WAL. In MVCC mode
+    /// recent changes live in the logical log, so WAL frames alone would
+    /// describe an incomplete database.
+    fn require_wal_journal(&self) -> Result<(), TursoError> {
+        if self.connection.mvcc_enabled() {
+            return Err(TursoError::Misuse(
+                "raw WAL access needs WAL journal mode; this database uses MVCC, which keeps recent changes in its logical log".to_string(),
+            ));
+        }
+        Ok(())
+    }
+
     /// Stop this connection from checkpointing or restarting the WAL on its own,
     /// so the caller decides when frames leave the WAL.
-    pub fn wal_disable_auto_actions(&self) {
+    pub fn wal_disable_auto_actions(&self) -> Result<(), TursoError> {
+        self.require_wal_journal()?;
         self.connection.wal_auto_actions_disable();
+        Ok(())
     }
 
     /// Return the last frame number in the WAL and the checkpoint sequence number.
@@ -1211,6 +1225,7 @@ impl TursoConnection {
         if self.sync_operation_active() {
             return Err(sync_busy_error());
         }
+        self.require_wal_journal()?;
         let state = self.connection.wal_state()?;
         Ok((state.max_frame, state.checkpoint_seq_no))
     }
@@ -1221,6 +1236,7 @@ impl TursoConnection {
         if self.sync_operation_active() {
             return Err(sync_busy_error());
         }
+        self.require_wal_journal()?;
         let info = self.connection.wal_get_frame(frame_no, frame)?;
         Ok((info.page_no, info.db_size))
     }
@@ -1230,6 +1246,7 @@ impl TursoConnection {
         if self.sync_operation_active() {
             return Err(sync_busy_error());
         }
+        self.require_wal_journal()?;
         self.connection.wal_insert_begin()?;
         Ok(())
     }
@@ -1242,6 +1259,7 @@ impl TursoConnection {
                 frame.len()
             )));
         }
+        self.require_wal_journal()?;
         self.connection.wal_insert_frame(frame_no, frame)?;
         Ok(())
     }
@@ -3037,7 +3055,7 @@ mod tests {
         let tmp_dir = tempfile::TempDir::new().unwrap();
         let source_db = open_file_database(&tmp_dir.path().join("source.db"));
         let source = source_db.connect().unwrap();
-        source.wal_disable_auto_actions();
+        source.wal_disable_auto_actions().unwrap();
         exec(&source, "CREATE TABLE t(id INTEGER PRIMARY KEY, v BLOB)");
         exec(&source, "BEGIN");
         for _ in 0..200 {
@@ -3074,7 +3092,7 @@ mod tests {
         let tmp_dir = tempfile::TempDir::new().unwrap();
         let db = open_file_database(&tmp_dir.path().join("db.db"));
         let conn = db.connect().unwrap();
-        conn.wal_disable_auto_actions();
+        conn.wal_disable_auto_actions().unwrap();
         exec(&conn, "CREATE TABLE t(v BLOB)");
         let (_, seq_before) = conn.wal_state().unwrap();
         // Well past the default auto-checkpoint threshold of 1000 frames.
@@ -3105,7 +3123,7 @@ mod tests {
         let tmp_dir = tempfile::TempDir::new().unwrap();
         let db = open_file_database(&tmp_dir.path().join("db.db"));
         let conn = db.connect().unwrap();
-        conn.wal_disable_auto_actions();
+        conn.wal_disable_auto_actions().unwrap();
         exec(&conn, "CREATE TABLE t(x)");
         let frames = read_all_frames(&conn);
 
@@ -3140,5 +3158,34 @@ mod tests {
         );
         assert!(matches!(status, c::turso_status_code_t::TURSO_MISUSE));
         drop(unsafe { TursoConnection::arc_from_capi(conn) });
+    }
+
+    #[test]
+    pub fn wal_raw_api_refuses_mvcc_databases() {
+        let tmp_dir = tempfile::TempDir::new().unwrap();
+        let db = open_file_database(&tmp_dir.path().join("db.db"));
+        let conn = db.connect().unwrap();
+        exec(&conn, "PRAGMA journal_mode = 'mvcc'");
+        exec(&conn, "CREATE TABLE t(x)");
+        exec(&conn, "INSERT INTO t VALUES (1)");
+
+        let misuse = |result: Result<(), TursoError>, call: &str| match result {
+            Err(TursoError::Misuse(message)) => {
+                assert!(message.contains("MVCC"), "{call}: {message}")
+            }
+            other => panic!("{call} on an MVCC database = {other:?}, want Misuse"),
+        };
+        misuse(conn.wal_disable_auto_actions(), "wal_disable_auto_actions");
+        misuse(conn.wal_state().map(|_| ()), "wal_state");
+        misuse(
+            conn.wal_get_frame(1, &mut vec![0u8; TEST_FRAME_LEN])
+                .map(|_| ()),
+            "wal_get_frame",
+        );
+        misuse(conn.wal_insert_begin(), "wal_insert_begin");
+        misuse(
+            conn.wal_insert_frame(1, &vec![0u8; TEST_FRAME_LEN]),
+            "wal_insert_frame",
+        );
     }
 }

@@ -38,7 +38,7 @@ with binding-specific lifetime management for the callback context.
 - `turso_connection_wal_get_frame` copies one frame (24-byte header plus page); a non-zero database size marks a commit frame;
 - `turso_connection_wal_insert_begin`, `_insert_frame`, and `_insert_end` append frames to another database's WAL.
 
-These functions work on databases in WAL journal mode; MVCC keeps recent changes in a separate log.
+These functions work only on databases in WAL journal mode. In MVCC mode recent changes live in the logical log, so every function except `turso_connection_wal_insert_end` fails with `TURSO_MISUSE` rather than hand out an incomplete copy.
 
 ## Rust example
 

@@ -327,9 +327,11 @@ int64_t turso_connection_last_insert_rowid(const turso_connection_t *self);
  * Raw WAL access for external replication.
  *
  * These functions let a caller copy committed WAL frames out of a database and
- * apply them to another one, as the sync engine does internally. They work on
- * databases in WAL journal mode; MVCC keeps recent changes in a separate log.
- * A WAL frame is a 24-byte frame header followed by one page.
+ * apply them to another one, as the sync engine does internally. They work
+ * only on databases in WAL journal mode: in MVCC mode recent changes live in
+ * the logical log, so every function except turso_connection_wal_insert_end
+ * fails with TURSO_MISUSE there. A WAL frame is a 24-byte frame header
+ * followed by one page.
  */
 
 /** Stop this connection from checkpointing or restarting the WAL on its own,

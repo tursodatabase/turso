@@ -155,10 +155,10 @@ pub extern "C" fn turso_connection_wal_disable_auto_actions(
     error_opt_out: *mut *const std::ffi::c_char,
 ) -> c::turso_status_code_t {
     match unsafe { TursoConnection::ref_from_capi(connection) } {
-        Ok(connection) => {
-            connection.wal_disable_auto_actions();
-            c::turso_status_code_t::TURSO_OK
-        }
+        Ok(connection) => match connection.wal_disable_auto_actions() {
+            Ok(()) => c::turso_status_code_t::TURSO_OK,
+            Err(err) => unsafe { err.to_capi(error_opt_out) },
+        },
         Err(err) => unsafe { err.to_capi(error_opt_out) },
     }
 }
