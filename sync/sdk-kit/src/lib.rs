@@ -1,3 +1,4 @@
+#![deny(clippy::await_holding_lock)]
 pub mod capi;
 pub mod rsapi;
 pub mod sync_engine_io;
