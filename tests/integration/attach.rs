@@ -917,3 +917,172 @@ fn test_attached_write_txn_rolled_back_after_io_error() -> anyhow::Result<()> {
     );
     Ok(())
 }
+
+#[test]
+fn test_release_that_commits_survives_commit_io_yield() -> anyhow::Result<()> {
+    assert_release_scripts_match_sqlite(
+        "queued-release-commit",
+        JournalMode::Wal,
+        &[
+            "SAVEPOINT sp1",
+            "DELETE FROM t WHERE id = 4",
+            "INSERT OR REPLACE INTO aux.a(id, v) VALUES (4, NULL)",
+            "RELEASE SAVEPOINT sp1",
+        ],
+    )
+}
+
+#[test]
+fn test_release_that_commits_survives_mvcc_commit_io_yield() -> anyhow::Result<()> {
+    assert_release_scripts_match_sqlite(
+        "queued-release-commit-mvcc",
+        JournalMode::Mvcc,
+        &[
+            "SAVEPOINT sp1",
+            "DELETE FROM t WHERE id = 4",
+            "INSERT OR REPLACE INTO aux.a(id, v) VALUES (4, NULL)",
+            "RELEASE SAVEPOINT sp1",
+        ],
+    )
+}
+
+#[test]
+fn test_release_that_keeps_transaction_open_over_yielding_io_matches_sqlite() -> anyhow::Result<()>
+{
+    assert_release_scripts_match_sqlite(
+        "queued-release-nested",
+        JournalMode::Wal,
+        &[
+            "SAVEPOINT outer_sp",
+            "SAVEPOINT sp1",
+            "DELETE FROM t WHERE id = 4",
+            "INSERT INTO aux.a(id, v) VALUES (4, 40)",
+            "RELEASE SAVEPOINT sp1",
+            "RELEASE SAVEPOINT sp1",
+            "INSERT INTO aux.a(id, v) VALUES (5, 50)",
+            "COMMIT",
+            "BEGIN",
+            "SAVEPOINT sp2",
+            "INSERT INTO aux.a(id, v) VALUES (6, 60)",
+            "RELEASE SAVEPOINT sp2",
+            "COMMIT",
+        ],
+    )
+}
+
+#[test]
+fn test_rollback_to_over_yielding_io_matches_sqlite() -> anyhow::Result<()> {
+    assert_release_scripts_match_sqlite(
+        "queued-rollback-to",
+        JournalMode::Wal,
+        &[
+            "SAVEPOINT sp1",
+            "DELETE FROM t WHERE id = 4",
+            "INSERT INTO aux.a(id, v) VALUES (4, 40)",
+            "ROLLBACK TO SAVEPOINT sp1",
+            "INSERT INTO aux.a(id, v) VALUES (7, 70)",
+            "COMMIT",
+        ],
+    )
+}
+
+#[test]
+fn test_release_that_commits_clears_attached_savepoints_after_commit_io_yield() -> anyhow::Result<()>
+{
+    assert_release_scripts_match_sqlite(
+        "queued-release-stale-savepoint",
+        JournalMode::Wal,
+        &[
+            "SAVEPOINT sp1",
+            "INSERT INTO aux.a VALUES (1, 1)",
+            "RELEASE SAVEPOINT sp1",
+            "SAVEPOINT sp1",
+            "INSERT INTO aux.a VALUES (2, 2)",
+            "ROLLBACK TO SAVEPOINT sp1",
+            "INSERT INTO aux.a VALUES (3, 3)",
+            "RELEASE SAVEPOINT sp1",
+        ],
+    )
+}
+
+enum JournalMode {
+    Wal,
+    Mvcc,
+}
+
+fn assert_release_scripts_match_sqlite(
+    db_name: &str,
+    journal_mode: JournalMode,
+    script: &[&str],
+) -> anyhow::Result<()> {
+    use crate::queued_io::QueuedIo;
+
+    const SETUP: [&str; 3] = [
+        "CREATE TABLE t (id INTEGER PRIMARY KEY, v INT)",
+        "INSERT INTO t VALUES (3, 30), (4, 40)",
+        "CREATE TABLE aux.a (id INTEGER PRIMARY KEY, v INT)",
+    ];
+    const CHECKS: [&str; 2] = [
+        "SELECT id, v FROM t ORDER BY id",
+        "SELECT id, v FROM aux.a ORDER BY id",
+    ];
+
+    let io = Arc::new(QueuedIo::new());
+    let open = |path: String, opts: DatabaseOpts| {
+        Database::open_file_with_flags(
+            io.clone(),
+            &path,
+            OpenFlags::default(),
+            opts,
+            None,
+            Arc::new(SqliteDialect),
+        )
+    };
+    let aux_path = format!("{db_name}-aux.db");
+    if let JournalMode::Mvcc = journal_mode {
+        let aux_conn = open(aux_path.clone(), DatabaseOpts::new())?.connect()?;
+        aux_conn.pragma_update("journal_mode", "'mvcc'")?;
+        aux_conn.close()?;
+    }
+    let db = open(
+        format!("{db_name}.db"),
+        DatabaseOpts::new().with_attach(true),
+    )?;
+    let conn = db.connect()?;
+    if let JournalMode::Mvcc = journal_mode {
+        conn.pragma_update("journal_mode", "'mvcc'")?;
+    }
+    conn.execute(format!("ATTACH '{aux_path}' AS aux"))?;
+
+    let sqlite = RusqliteConnection::open_in_memory()?;
+    sqlite.execute("ATTACH ':memory:' AS aux", params![])?;
+
+    for sql in SETUP {
+        conn.execute(sql)?;
+        sqlite.execute(sql, params![])?;
+    }
+
+    for sql in script {
+        let turso_ok = conn.execute(sql).map_err(|e| e.to_string());
+        let sqlite_ok = sqlite
+            .execute(sql, params![])
+            .map(|_| ())
+            .map_err(|e| e.to_string());
+        assert_eq!(
+            turso_ok.is_ok(),
+            sqlite_ok.is_ok(),
+            "{sql}: turso {turso_ok:?}, sqlite {sqlite_ok:?}"
+        );
+    }
+
+    assert_eq!(conn.get_auto_commit(), sqlite.is_autocommit());
+    assert!(conn.get_auto_commit());
+    for sql in CHECKS {
+        assert_eq!(
+            limbo_exec_rows(&conn, sql),
+            sqlite_exec_rows(&sqlite, sql),
+            "{sql}"
+        );
+    }
+    Ok(())
+}
