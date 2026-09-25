@@ -4722,6 +4722,135 @@ fn fts_uncommitted_changes_are_connection_isolated() {
     );
 }
 
+#[cfg(all(feature = "fts", not(target_family = "wasm")))]
+#[test]
+fn fts_count_pushdown_eligibility() {
+    for mvcc in [false, true] {
+        let db = TempDatabase::builder()
+            .with_opts(turso_core::DatabaseOpts::new().with_index_method(true))
+            .with_mvcc(mvcc)
+            .build();
+        let conn = db.connect_limbo();
+        conn.execute("CREATE TABLE docs(id INTEGER PRIMARY KEY, body TEXT, tag INTEGER)")
+            .unwrap();
+        conn.execute("INSERT INTO docs VALUES (-9, 'alpha beta', NULL), (2, 'alpha', 7), (11, 'beta', 7), (40, 'alpha', 9), (51, 'beta', NULL), (60, NULL, 5)").unwrap();
+        conn.execute("CREATE INDEX docs_fts ON docs USING fts(body)")
+            .unwrap();
+        conn.execute("CREATE TABLE duplicates(id INTEGER)").unwrap();
+        conn.execute("INSERT INTO duplicates VALUES (2), (2), (40)")
+            .unwrap();
+        for (sql, expected, pushed) in [
+            ("SELECT count(*) FROM docs WHERE fts_match(body, 'alpha')", vec![3], true),
+            ("SELECT count(*) FROM docs WHERE fts_match(body, 'missing')", vec![0], true),
+            ("SELECT count(*) FROM docs WHERE fts_match(body, 'alpha AND beta')", vec![1], true),
+            ("SELECT count(*) FROM docs WHERE fts_match(body, 'alpha OR beta')", vec![5], true),
+            ("SELECT count(*) FROM docs WHERE fts_match(body, NULL)", vec![0], true),
+            ("SELECT count(*) FROM docs WHERE fts_match(body, 'alpha') ORDER BY count(*)", vec![3], true),
+            ("SELECT count(*) FROM docs WHERE fts_match(body, 'alpha') AND id > 0", vec![2], false),
+            ("SELECT count(tag) FROM docs WHERE fts_match(body, 'alpha')", vec![2], false),
+            ("SELECT count(DISTINCT tag) FROM docs WHERE fts_match(body, 'alpha OR beta')", vec![2], false),
+            ("SELECT DISTINCT count(*) FROM docs WHERE fts_match(body, 'alpha')", vec![3], false),
+            ("SELECT count(*) FROM docs WHERE fts_match(body, 'alpha') GROUP BY tag", vec![1, 1, 1], false),
+            ("SELECT count(*) FROM docs WHERE fts_match(body, 'alpha') HAVING count(*) > 3", vec![], false),
+            ("SELECT count(*) FROM docs WHERE fts_match(body, 'alpha') LIMIT 1 OFFSET 1", vec![], false),
+            ("SELECT count(*) FROM docs JOIN duplicates ON docs.id = duplicates.id WHERE fts_match(body, 'alpha')", vec![3], false),
+            ("SELECT count(*) FILTER (WHERE tag IS NOT NULL) FROM docs WHERE fts_match(body, 'alpha')", vec![2], false),
+            ("SELECT count(*) + 1 FROM docs WHERE fts_match(body, 'alpha')", vec![4], false),
+        ] {
+            let plan = limbo_exec_rows(&conn, &format!("EXPLAIN {sql}"));
+            let actual_pushdown = plan.iter().any(|row| matches!(&row[7], rusqlite::types::Value::Text(text) if text.starts_with("count into r[")));
+            assert_eq!(actual_pushdown, pushed, "{sql}; mvcc={mvcc}");
+            assert_eq!(limbo_exec_rows(&conn, sql), expected.into_iter().map(|n| vec![rusqlite::types::Value::Integer(n)]).collect::<Vec<_>>(), "{sql}; mvcc={mvcc}");
+        }
+        for suffix in ["LIMIT 0", "LIMIT 1", "LIMIT -1"] {
+            let plan = limbo_exec_rows(
+                &conn,
+                &format!(
+                    "EXPLAIN SELECT count(*) FROM docs WHERE fts_match(body, 'alpha') {suffix}"
+                ),
+            );
+            assert!(!plan.iter().any(|row| matches!(&row[7], rusqlite::types::Value::Text(text) if text.starts_with("count into r["))), "{suffix}; mvcc={mvcc}");
+        }
+        let mut stmt = conn
+            .prepare("SELECT count(*) FROM docs WHERE fts_match(body, ?1)")
+            .unwrap();
+        for (query, expected) in [
+            (Value::build_text("alpha"), 3),
+            (Value::Null, 0),
+            (Value::build_text("missing"), 0),
+            (Value::build_text("alpha OR beta"), 5),
+        ] {
+            stmt.reset().unwrap();
+            stmt.bind_at(1.try_into().unwrap(), query).unwrap();
+            let mut rows = Vec::new();
+            stmt.run_with_row_callback(|row| {
+                rows.push(row.get_value(0).clone());
+                Ok(())
+            })
+            .unwrap();
+            assert_eq!(rows, vec![Value::from_i64(expected)]);
+        }
+    }
+}
+
+#[cfg(all(feature = "fts", not(target_family = "wasm")))]
+#[test]
+fn fts_count_pushdown_snapshot_visibility() {
+    for mvcc in [false, true] {
+        let db = TempDatabase::builder()
+            .with_opts(turso_core::DatabaseOpts::new().with_index_method(true))
+            .with_mvcc(mvcc)
+            .build();
+        let writer = db.connect_limbo();
+        let reader = db.connect_limbo();
+        writer
+            .execute("CREATE TABLE docs(id INTEGER PRIMARY KEY, body TEXT)")
+            .unwrap();
+        writer
+            .execute("CREATE INDEX docs_fts ON docs USING fts(body)")
+            .unwrap();
+        writer
+            .execute("INSERT INTO docs VALUES (-9, 'alpha'), (3, 'alpha'), (17, 'beta')")
+            .unwrap();
+        let sql = "SELECT count(*) FROM docs WHERE fts_match(body, 'alpha')";
+        let check = |conn: &Arc<turso_core::Connection>, count| {
+            assert_eq!(
+                limbo_exec_rows(conn, sql),
+                vec![vec![rusqlite::types::Value::Integer(count)]],
+                "mvcc={mvcc}"
+            );
+        };
+        check(&writer, 2);
+        reader.execute("BEGIN").unwrap();
+        check(&reader, 2);
+        writer.execute("BEGIN").unwrap();
+        writer.execute("DELETE FROM docs WHERE id = -9").unwrap();
+        check(&writer, 1);
+        writer.execute("SAVEPOINT extra").unwrap();
+        writer
+            .execute("INSERT INTO docs VALUES (29, 'alpha'), (30, 'alpha')")
+            .unwrap();
+        check(&writer, 3);
+        check(&reader, 2);
+        writer.execute("ROLLBACK TO extra").unwrap();
+        check(&writer, 1);
+        writer.execute("ROLLBACK").unwrap();
+        check(&writer, 2);
+        writer
+            .execute("UPDATE docs SET body = NULL WHERE id = 3")
+            .unwrap();
+        check(&writer, 1);
+        check(&reader, 2);
+        reader.execute("COMMIT").unwrap();
+        check(&reader, 1);
+        writer.execute("OPTIMIZE INDEX docs_fts").unwrap();
+        check(&reader, 1);
+        writer.execute("DELETE FROM docs").unwrap();
+        check(&writer, 0);
+        check(&reader, 0);
+    }
+}
+
 /// The searcher cache is keyed by the visible segment set, so any number of
 /// connections reading the same committed index share one entry — the
 /// per-connection cache ceiling of the v1 design is gone — and the byte
