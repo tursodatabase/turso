@@ -542,32 +542,44 @@ fn get_collseq_parts_from_expr_with_symbols(
     symbol_table: Option<&SymbolTable>,
     resolver: Option<&Resolver>,
 ) -> Result<(Option<CollationSeq>, Option<CollationSeq>)> {
-    let mut maybe_column_collseq = None;
     let mut maybe_explicit_collseq = None;
 
     walk_expr(top_expr, &mut |expr: &Expr| -> Result<WalkControl> {
-        match expr {
-            Expr::Collate(_, seq) => {
-                // Only store the first (leftmost) COLLATE operator we find
-                if maybe_explicit_collseq.is_none() {
-                    maybe_explicit_collseq = Some(
-                        resolve_collation_name(seq.as_str(), symbol_table).unwrap_or_default(),
-                    );
-                }
-                // Skip children since we've found a COLLATE operator
-                return Ok(WalkControl::SkipChildren);
+        if let Expr::Collate(_, seq) = expr {
+            if maybe_explicit_collseq.is_none() {
+                maybe_explicit_collseq =
+                    Some(resolve_collation_name(seq.as_str(), symbol_table).unwrap_or_default());
             }
+            return Ok(WalkControl::SkipChildren);
+        }
+        Ok(WalkControl::Continue)
+    })?;
+    let maybe_column_collseq =
+        column_collseq_through_transparent_exprs(top_expr, referenced_tables, resolver)?;
+
+    Ok((maybe_explicit_collseq, maybe_column_collseq))
+}
+
+fn column_collseq_through_transparent_exprs(
+    top_expr: &Expr,
+    referenced_tables: &TableReferences,
+    resolver: Option<&Resolver>,
+) -> Result<Option<CollationSeq>> {
+    let mut expr = top_expr;
+    loop {
+        match expr {
+            Expr::Parenthesized(exprs) if !exprs.is_empty() => expr = exprs[0].as_ref(),
+            Expr::Unary(turso_parser::ast::UnaryOperator::Positive, sub_expr) => {
+                expr = sub_expr.as_ref()
+            }
+            Expr::Cast { expr: sub_expr, .. } => expr = sub_expr.as_ref(),
             Expr::Column { table, column, .. } if table.is_self_table() => {
-                if maybe_column_collseq.is_none() {
-                    maybe_column_collseq =
-                        resolver.and_then(|resolver| resolver.self_table_collation(Some(*column)));
-                }
+                return Ok(
+                    resolver.and_then(|resolver| resolver.self_table_collation(Some(*column)))
+                );
             }
             Expr::RowId { table, .. } if table.is_self_table() => {
-                if maybe_column_collseq.is_none() {
-                    maybe_column_collseq =
-                        resolver.and_then(|resolver| resolver.self_table_collation(None));
-                }
+                return Ok(resolver.and_then(|resolver| resolver.self_table_collation(None)));
             }
             Expr::Column { table, column, .. } => {
                 let (_, table_ref) = referenced_tables
@@ -576,30 +588,21 @@ fn get_collseq_parts_from_expr_with_symbols(
                 let column = table_ref
                     .get_column_at(*column)
                     .ok_or_else(|| crate::LimboError::ParseError("column not found".to_string()))?;
-                if maybe_column_collseq.is_none() {
-                    maybe_column_collseq = column.collation_opt();
-                }
-                return Ok(WalkControl::Continue);
+                return Ok(column.collation_opt());
             }
             Expr::RowId { table, .. } => {
                 let (_, table_ref) = referenced_tables
                     .find_table_by_internal_id(*table)
                     .ok_or_else(|| crate::LimboError::ParseError("table not found".to_string()))?;
-                if let Some(btree) = table_ref.btree() {
-                    if let Some((_, rowid_alias_col)) = btree.get_rowid_alias_column() {
-                        if maybe_column_collseq.is_none() {
-                            maybe_column_collseq = rowid_alias_col.collation_opt();
-                        }
-                    }
-                }
-                return Ok(WalkControl::Continue);
+                return Ok(table_ref.btree().and_then(|btree| {
+                    btree
+                        .get_rowid_alias_column()
+                        .and_then(|(_, col)| col.collation_opt())
+                }));
             }
-            _ => {}
+            _ => return Ok(None),
         }
-        Ok(WalkControl::Continue)
-    })?;
-
-    Ok((maybe_explicit_collseq, maybe_column_collseq))
+    }
 }
 
 #[cfg(test)]
@@ -779,12 +782,11 @@ mod tests {
     }
 
     #[test]
-    fn test_get_collseq_from_expr_column_plus_column_leftside_column_wins() {
+    fn test_get_collseq_from_expr_column_plus_column_has_no_collation() {
         let table_references = get_table_references_two_tables_single_column_with_collations(
             Some(CollationSeq::NoCase),
             Some(CollationSeq::Rtrim),
         );
-        // col1 + col2 -- col1's NOCASE collation wins since it's on the left side
         let lhs = Expr::Column {
             database: None,
             table: TableInternalId::from(1),
@@ -799,7 +801,7 @@ mod tests {
         };
         let expr = Expr::binary(lhs, Operator::Add, rhs);
         let collseq = get_collseq_from_expr(&expr, &table_references).unwrap();
-        assert_eq!(collseq, Some(CollationSeq::NoCase));
+        assert_eq!(collseq, None);
     }
 
     #[test]

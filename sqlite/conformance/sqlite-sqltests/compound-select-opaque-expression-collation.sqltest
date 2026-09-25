@@ -1,0 +1,61 @@
+@database :memory:
+
+# Regression test for https://github.com/tursodatabase/turso/issues/8374
+#
+# A string concatenation or scalar function call on a compound SELECT arm has
+# no collation, even when it wraps a COLLATE NOCASE column. Duplicate removal
+# for UNION, INTERSECT, and EXCEPT must then use BINARY.
+
+setup tables {
+    CREATE TABLE p(y TEXT COLLATE NOCASE);
+    CREATE TABLE q(y TEXT);
+    INSERT INTO p VALUES('A'),('b');
+    INSERT INTO q VALUES('a'),('B');
+}
+
+@setup tables
+test union-concat-uses-binary {
+    SELECT p.y || '' FROM p UNION SELECT q.y || '' FROM q ORDER BY 1;
+}
+expect {
+    A
+    B
+    a
+    b
+}
+
+@setup tables
+test intersect-concat-uses-binary {
+    SELECT count(*) FROM (SELECT p.y || '' FROM p INTERSECT SELECT q.y || '' FROM q);
+}
+expect {
+    0
+}
+
+@setup tables
+test except-concat-uses-binary {
+    SELECT p.y || '' FROM p EXCEPT SELECT q.y || '' FROM q ORDER BY 1;
+}
+expect {
+    A
+    b
+}
+
+@setup tables
+test union-function-call-uses-binary {
+    SELECT substr(p.y, 1) FROM p UNION SELECT q.y FROM q ORDER BY 1;
+}
+expect {
+    A
+    B
+    a
+    b
+}
+
+@setup tables
+test union-cast-keeps-column-collation {
+    SELECT count(*) FROM (SELECT CAST(p.y AS TEXT) FROM p UNION SELECT q.y FROM q);
+}
+expect {
+    2
+}
