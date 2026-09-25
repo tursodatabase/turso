@@ -36,12 +36,20 @@ CHECKPOINTER=${CHECKPOINTER:-1000}
 BATCH_SIZE=${BATCH_SIZE:-10}
 DURATION=${DURATION:-60}
 WARMUP=${WARMUP:-5}
+# off makes every Turso transaction write and sync the logical log on its
+# own instead of sharing a sync with the transactions committing next to it.
+GROUP_COMMIT=${GROUP_COMMIT:-on}
+case "$GROUP_COMMIT" in
+  on) GROUP_COMMIT_FLAG="" ;;
+  off) GROUP_COMMIT_FLAG="--no-group-commit" ;;
+  *) echo "GROUP_COMMIT must be on or off" >&2; exit 1 ;;
+esac
 
 mkdir -p "$OUT" "$DB_DIR"
 
 # Every run's summary goes to the terminal and to this log.
 LOG="$OUT/bench.log"
-echo "=== $(date) rate $RATE connections \"$CONNECTIONS\" repeats $REPEATS idle $IDLE arrivals $ARRIVALS seed $SEED db $DB_DIR" >> "$LOG"
+echo "=== $(date) rate $RATE connections \"$CONNECTIONS\" repeats $REPEATS idle $IDLE arrivals $ARRIVALS seed $SEED group commit $GROUP_COMMIT db $DB_DIR" >> "$LOG"
 
 MOUNT="$(df --output=target "$DB_DIR" | tail -1)"
 
@@ -58,7 +66,7 @@ for connections in $CONNECTIONS; do
       { "$BIN" --engine "$engine" --rate "$RATE" --connections "$connections" \
             --checkpointer "$CHECKPOINTER" --batch-size "$BATCH_SIZE" \
             --duration "$DURATION" --warmup "$WARMUP" --run "$run" \
-            --arrivals "$ARRIVALS" --seed "$SEED" --db-dir "$DB_DIR" --out-dir "$OUT"
+            --arrivals "$ARRIVALS" --seed "$SEED" --db-dir "$DB_DIR" --out-dir "$OUT" $GROUP_COMMIT_FLAG
         echo $? > "$status"; } 2>&1 | tee -a "$LOG" >&2
       [ "$(cat "$status")" = 0 ] || exit 1
     done
