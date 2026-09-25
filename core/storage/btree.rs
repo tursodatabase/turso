@@ -6471,11 +6471,13 @@ impl BTreeCursor {
             CursorContextKey::TableRowId(rowid) => SeekKey::TableRowId(rowid),
             CursorContextKey::IndexKeyRowId(ref record) => SeekKey::IndexKey(record.reborrow()),
         };
+        let skip_advance = self.skip_advance;
         let res = self.seek(seek_key, ctx.seek_op)?;
         match res {
             IOResult::Done(res) => {
                 match res {
                     SeekResult::Found => {
+                        self.skip_advance = skip_advance;
                         self.valid_state = CursorValidState::Valid;
                         Ok(IOResult::Done(()))
                     }
@@ -6500,6 +6502,7 @@ impl BTreeCursor {
                 }
             }
             IOResult::IO(io) => {
+                self.skip_advance = skip_advance;
                 self.context = Some(ctx);
                 Ok(IOResult::IO(io))
             }
@@ -6668,6 +6671,7 @@ impl CursorTrait for BTreeCursor {
                             let has_record = cell_idx >= 0 && cell_idx < cell_count as i32;
                             if has_record {
                                 self.set_has_record(true);
+                                self.invalidate_record();
                                 self.read_overflow_state = None;
                                 return Ok(IOResult::Done(()));
                             }
@@ -7282,9 +7286,12 @@ impl CursorTrait for BTreeCursor {
                             self.state =
                                 CursorState::Delete(DeleteState::PostInteriorNodeReplacement);
                         } else {
-                            // If we didn't replace an interior node, we are done,
-                            // except we need to retreat, so that the next call to BTreeCursor::next() lands at the next record (because we deleted the current one)
-                            self.stack.retreat();
+                            let cell_count = self.stack.top_ref().get_contents().cell_count();
+                            if (self.stack.current_cell_index() as usize) < cell_count {
+                                self.skip_advance = true;
+                            } else {
+                                self.stack.retreat();
+                            }
                             self.state = CursorState::None;
                             return Ok(IOResult::Done(()));
                         }
