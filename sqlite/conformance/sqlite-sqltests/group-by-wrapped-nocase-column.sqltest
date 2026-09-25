@@ -1,0 +1,62 @@
+@database :memory:
+
+# A GROUP BY or DISTINCT key that wraps a NOCASE column in an expression
+# (other than CAST or COLLATE) has no collation, so it must group with BINARY.
+
+setup nocase-table {
+    CREATE TABLE t(e TEXT COLLATE NOCASE, n TEXT);
+    INSERT INTO t VALUES('a','x'),('A','y');
+}
+
+@setup nocase-table
+test group-by-concat-uses-binary {
+    SELECT count(*) FROM t GROUP BY (e || '');
+}
+expect {
+    1
+    1
+}
+
+@setup nocase-table
+test group-by-trim-uses-binary {
+    SELECT count(*) FROM t GROUP BY trim(e);
+}
+expect {
+    1
+    1
+}
+
+@setup nocase-table
+test distinct-trim-uses-binary {
+    SELECT DISTINCT trim(e) FROM t ORDER BY 1 COLLATE BINARY;
+}
+expect {
+    A
+    a
+}
+
+@setup nocase-table
+test group-by-bare-column-uses-nocase {
+    SELECT count(*) FROM t GROUP BY e;
+}
+expect {
+    2
+}
+
+@setup nocase-table
+test group-by-cast-keeps-nocase {
+    SELECT count(*) FROM t GROUP BY CAST(e AS TEXT);
+}
+expect {
+    2
+}
+
+@setup nocase-table
+test dedup-delete-keeps-distinct-rows {
+    DELETE FROM t WHERE rowid NOT IN (SELECT min(rowid) FROM t GROUP BY trim(e));
+    SELECT e FROM t ORDER BY rowid;
+}
+expect {
+    a
+    A
+}
