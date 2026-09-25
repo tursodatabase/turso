@@ -844,6 +844,25 @@ impl Workload for AutoincDeleteWorkload {
 pub const FTS_SIM_TABLE: &str = "fts_docs";
 pub const FTS_SIM_INDEX: &str = "fts_docs_fts";
 
+pub fn fts_sim_workloads(check_ranking: bool) -> Vec<(u32, Box<dyn Workload>)> {
+    vec![
+        (20, Box::new(FtsInsertWorkload)),
+        (8, Box::new(FtsUpdateWorkload)),
+        (6, Box::new(FtsDeleteWorkload)),
+        (
+            12,
+            Box::new(FtsMatchWorkload {
+                check_ranking,
+                phrases: true,
+            }),
+        ),
+        (2, Box::new(FtsOptimizeWorkload)),
+        (10, Box::new(BeginWorkload)),
+        (8, Box::new(CommitWorkload)),
+        (3, Box::new(RollbackWorkload)),
+    ]
+}
+
 /// Bootstrap statements for the FTS table and its index.
 pub fn fts_sim_schema() -> Vec<(String, String)> {
     vec![
@@ -864,7 +883,7 @@ pub fn fts_sim_schema() -> Vec<(String, String)> {
 
 /// Small fixed vocabulary so the self-differential's padded-LIKE oracle is
 /// exact token matching, and so matches stay non-trivial.
-const FTS_SIM_TOKENS: &[&str] = &[
+pub(crate) const FTS_SIM_TOKENS: &[&str] = &[
     "alpha", "bravo", "charlie", "delta", "echo", "foxtrot", "golf", "hotel",
 ];
 
@@ -929,20 +948,28 @@ pub struct FtsOptimizeWorkload;
 
 impl Workload for FtsOptimizeWorkload {
     fn generate(&self, _ctx: &WorkloadContext, _rng: &mut ChaCha8Rng) -> Option<Operation> {
-        Some(Operation::Execute {
-            sql: format!("OPTIMIZE INDEX {FTS_SIM_INDEX}"),
-        })
+        Some(Operation::FtsOptimize)
     }
 }
 
 /// Run the FTS self-differential (see [`Operation::FtsMatchDifferential`]).
-pub struct FtsMatchWorkload;
+pub struct FtsMatchWorkload {
+    pub check_ranking: bool,
+    pub phrases: bool,
+}
 
 impl Workload for FtsMatchWorkload {
     fn generate(&self, _ctx: &WorkloadContext, rng: &mut ChaCha8Rng) -> Option<Operation> {
         let token = FTS_SIM_TOKENS.choose(rng).expect("vocabulary is not empty");
+        let token = if self.phrases && rng.random_bool(0.3) {
+            let next = FTS_SIM_TOKENS.choose(rng).expect("vocabulary is not empty");
+            format!("{token} {next}")
+        } else {
+            token.to_string()
+        };
         Some(Operation::FtsMatchDifferential {
-            token: token.to_string(),
+            token,
+            check_ranking: self.check_ranking,
         })
     }
 }
