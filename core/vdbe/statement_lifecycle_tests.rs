@@ -270,7 +270,7 @@ impl NoPumpInsideStepIo {
     }
 }
 
-#[cfg(feature = "fts")]
+#[cfg(any(feature = "fts", feature = "io_memory_yield"))]
 impl crate::Clock for NoPumpInsideStepIo {
     fn current_time_monotonic(&self) -> crate::MonotonicInstant {
         self.inner.current_time_monotonic()

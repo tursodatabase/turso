@@ -181,22 +181,27 @@ fn open_db_async_state_drop_clears_opening_registry_entry() {
     let key = DatabaseKey::SharedMemory(
         "open-db-async-state-drop-clears-opening-registry-entry".to_string(),
     );
-    {
-        let mut manager = DATABASE_MANAGER.lock();
-        manager.clear();
-        manager.insert(key.clone(), RegistryEntry::Opening);
-    }
+    assert!(DATABASE_MANAGER
+        .get_or_mark_initializing(&key, &SqliteDialect, None, None)
+        .unwrap()
+        .is_none());
+    assert!(DATABASE_MANAGER
+        .get_or_mark_initializing(&key, &SqliteDialect, None, None)
+        .unwrap()
+        .is_some());
 
     let mut state = OpenDbAsyncState::new();
     state.registry_key = Some(key.clone());
     drop(state);
 
-    let mut manager = DATABASE_MANAGER.lock();
     assert!(
-        !manager.contains_key(&key),
+        DATABASE_MANAGER
+            .get_or_mark_initializing(&key, &SqliteDialect, None, None)
+            .unwrap()
+            .is_none(),
         "dropping an incomplete async open must clear the Opening sentinel"
     );
-    manager.clear();
+    DATABASE_MANAGER.remove(&key);
 }
 
 fn flip_db_header_reserved_byte(path: &std::path::Path) {
@@ -614,9 +619,7 @@ fn database_open_rebuilds_from_disk_scan_when_exclusive_shm_snapshot_is_stale() 
 
     drop(conn_a);
     drop(db_a);
-    let mut manager = DATABASE_MANAGER.lock();
-    manager.clear();
-    drop(manager);
+    DATABASE_MANAGER.remove_path(db_path_str);
 
     let db_b = open_multiprocess_db(io, db_path_str).unwrap();
     assert!(
@@ -671,9 +674,7 @@ fn database_open_reuses_trusted_tshm_snapshot_without_disk_scan_when_no_backfill
 
     drop(conn);
     drop(db);
-    let mut manager = DATABASE_MANAGER.lock();
-    manager.clear();
-    drop(manager);
+    DATABASE_MANAGER.remove_path(db_path_str);
 
     let reopened = open_multiprocess_db(io, db_path_str).unwrap();
     assert!(
@@ -748,9 +749,7 @@ fn database_open_rebuilds_from_disk_scan_after_partial_checkpoint_without_backfi
 
     drop(conn);
     drop(db);
-    let mut manager = DATABASE_MANAGER.lock();
-    manager.clear();
-    drop(manager);
+    DATABASE_MANAGER.remove_path(db_path_str);
 
     let reopened = open_multiprocess_db(io, db_path_str).unwrap();
     let mut expected_snapshot = snapshot_before;
@@ -829,9 +828,7 @@ fn database_open_rebuilds_from_disk_scan_after_wal_append_invalidates_backfill_p
 
     drop(conn);
     drop(db);
-    let mut manager = DATABASE_MANAGER.lock();
-    manager.clear();
-    drop(manager);
+    DATABASE_MANAGER.remove_path(db_path_str);
 
     let reopened = open_multiprocess_db(io, db_path_str).unwrap();
     assert!(
@@ -894,9 +891,7 @@ fn database_open_rebuilds_from_disk_scan_after_db_header_mismatch_invalidates_ba
     drop(conn);
     drop(db);
     flip_db_header_reserved_byte(&db_path);
-    let mut manager = DATABASE_MANAGER.lock();
-    manager.clear();
-    drop(manager);
+    DATABASE_MANAGER.remove_path(db_path_str);
 
     let reopened = open_multiprocess_db(io, db_path_str).unwrap();
     let mut expected_snapshot = snapshot_before;
@@ -1852,9 +1847,7 @@ fn subprocess_readonly_disk_scan_child_reader_stays_in_shared_coordination() {
 
     drop(conn);
     drop(db);
-    let mut manager = DATABASE_MANAGER.lock();
-    manager.clear();
-    drop(manager);
+    DATABASE_MANAGER.remove_path(db_path_str);
 
     let current_exe = std::env::current_exe().unwrap();
     let mut child = Command::new(&current_exe)
@@ -1901,9 +1894,7 @@ fn subprocess_readonly_disk_scan_child_reader_stays_in_shared_coordination() {
 
     drop(reopened_conn);
     drop(reopened);
-    let mut manager = DATABASE_MANAGER.lock();
-    manager.clear();
-    drop(manager);
+    DATABASE_MANAGER.remove_path(db_path_str);
 
     let wal_len = std::fs::metadata(format!("{db_path_str}-wal"))
         .unwrap_or_else(|_| panic!("expected WAL file at {db_path_str}-wal"))
@@ -2029,9 +2020,7 @@ fn subprocess_database_truncate_checkpoint_reclaims_dead_child_reader_slot() {
 
     drop(conn);
     drop(db);
-    let mut manager = DATABASE_MANAGER.lock();
-    manager.clear();
-    drop(manager);
+    DATABASE_MANAGER.remove_path(db_path_str);
 
     let io: Arc<dyn IO> = multiprocess_test_io();
     let reopened = open_multiprocess_db(io, db_path_str).unwrap();
@@ -2109,9 +2098,7 @@ fn database_open_reopen_with_live_child_reader_does_not_clobber_authority() {
 
     drop(conn);
     drop(db);
-    let mut manager = DATABASE_MANAGER.lock();
-    manager.clear();
-    drop(manager);
+    DATABASE_MANAGER.remove_path(db_path_str);
 
     let reopened = open_multiprocess_db(io, db_path_str).unwrap();
     let reopened_authority = reopened.shared_wal_coordination().unwrap().unwrap();
@@ -2192,9 +2179,7 @@ fn database_open_rebuilds_from_disk_scan_when_shared_frame_index_overflowed() {
 
     drop(conn_a);
     drop(db_a);
-    let mut manager = DATABASE_MANAGER.lock();
-    manager.clear();
-    drop(manager);
+    DATABASE_MANAGER.remove_path(db_path_str);
 
     let db_b = open_multiprocess_db(io, db_path_str).unwrap();
     assert!(
