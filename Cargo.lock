@@ -1203,7 +1203,7 @@ checksum = "773648b94d0e5d620f64f280777445740e61fe701025087ec8b57f45c791888b"
 
 [[package]]
 name = "core_tester"
-version = "0.8.0-pre.12"
+version = "0.8.0-pre.13"
 dependencies = [
  "anyhow",
  "assert_cmd",
@@ -1756,7 +1756,7 @@ checksum = "56254986775e3233ffa9c4d7d3faaf6d36a2c09d30b20687e9f88bc8bafc16c8"
 
 [[package]]
 name = "differential-fuzzer"
-version = "0.8.0-pre.12"
+version = "0.8.0-pre.13"
 dependencies = [
  "anyhow",
  "clap",
@@ -3484,7 +3484,7 @@ dependencies = [
 
 [[package]]
 name = "limbo_completion"
-version = "0.8.0-pre.12"
+version = "0.8.0-pre.13"
 dependencies = [
  "mimalloc",
  "turso_ext",
@@ -3492,7 +3492,7 @@ dependencies = [
 
 [[package]]
 name = "limbo_crypto"
-version = "0.8.0-pre.12"
+version = "0.8.0-pre.13"
 dependencies = [
  "blake3",
  "data-encoding",
@@ -3505,7 +3505,7 @@ dependencies = [
 
 [[package]]
 name = "limbo_csv"
-version = "0.8.0-pre.12"
+version = "0.8.0-pre.13"
 dependencies = [
  "csv",
  "mimalloc",
@@ -3515,7 +3515,7 @@ dependencies = [
 
 [[package]]
 name = "limbo_fuzzy"
-version = "0.8.0-pre.12"
+version = "0.8.0-pre.13"
 dependencies = [
  "mimalloc",
  "turso_ext",
@@ -3523,7 +3523,7 @@ dependencies = [
 
 [[package]]
 name = "limbo_ipaddr"
-version = "0.8.0-pre.12"
+version = "0.8.0-pre.13"
 dependencies = [
  "ipnetwork",
  "mimalloc",
@@ -3532,7 +3532,7 @@ dependencies = [
 
 [[package]]
 name = "limbo_regexp"
-version = "0.8.0-pre.12"
+version = "0.8.0-pre.13"
 dependencies = [
  "mimalloc",
  "regex",
@@ -3541,7 +3541,7 @@ dependencies = [
 
 [[package]]
 name = "limbo_sim"
-version = "0.8.0-pre.12"
+version = "0.8.0-pre.13"
 dependencies = [
  "anyhow",
  "bitflags 2.9.4",
@@ -3580,7 +3580,7 @@ dependencies = [
 
 [[package]]
 name = "limbo_sqlite_test_ext"
-version = "0.8.0-pre.12"
+version = "0.8.0-pre.13"
 dependencies = [
  "cc",
 ]
@@ -4824,7 +4824,7 @@ dependencies = [
 
 [[package]]
 name = "py-turso"
-version = "0.8.0-pre.12"
+version = "0.8.0-pre.13"
 dependencies = [
  "anyhow",
  "pyo3",
@@ -6138,7 +6138,7 @@ dependencies = [
 
 [[package]]
 name = "sql_gen"
-version = "0.8.0-pre.12"
+version = "0.8.0-pre.13"
 dependencies = [
  "anarchist-readable-name-generator-lib",
  "proptest",
@@ -6159,7 +6159,7 @@ dependencies = [
 
 [[package]]
 name = "sql_gen_prop"
-version = "0.8.0-pre.12"
+version = "0.8.0-pre.13"
 dependencies = [
  "anarchist-readable-name-generator-lib",
  "proptest",
@@ -6169,7 +6169,7 @@ dependencies = [
 
 [[package]]
 name = "sql_generation"
-version = "0.8.0-pre.12"
+version = "0.8.0-pre.13"
 dependencies = [
  "anarchist-readable-name-generator-lib",
  "anyhow",
@@ -7097,7 +7097,7 @@ checksum = "e421abadd41a4225275504ea4d6566923418b7f05506fbc9c0fe86ba7396114b"
 
 [[package]]
 name = "turso"
-version = "0.8.0-pre.12"
+version = "0.8.0-pre.13"
 dependencies = [
  "anyhow",
  "bytes",
@@ -7122,7 +7122,7 @@ dependencies = [
 
 [[package]]
 name = "turso-dbhash"
-version = "0.8.0-pre.12"
+version = "0.8.0-pre.13"
 dependencies = [
  "clap",
  "hex",
@@ -7133,7 +7133,7 @@ dependencies = [
 
 [[package]]
 name = "turso-java"
-version = "0.8.0-pre.12"
+version = "0.8.0-pre.13"
 dependencies = [
  "jni",
  "thiserror 2.0.16",
@@ -7142,7 +7142,7 @@ dependencies = [
 
 [[package]]
 name = "turso-join-benchmark"
-version = "0.8.0-pre.12"
+version = "0.8.0-pre.13"
 dependencies = [
  "anyhow",
  "clap",
@@ -7152,7 +7152,7 @@ dependencies = [
 
 [[package]]
 name = "turso-txn-latency"
-version = "0.8.0-pre.12"
+version = "0.8.0-pre.13"
 dependencies = [
  "clap",
  "libc",
@@ -7163,7 +7163,7 @@ dependencies = [
 
 [[package]]
 name = "turso_cli"
-version = "0.8.0-pre.12"
+version = "0.8.0-pre.13"
 dependencies = [
  "anyhow",
  "bytes",
@@ -7207,7 +7207,7 @@ dependencies = [
 
 [[package]]
 name = "turso_core"
-version = "0.8.0-pre.12"
+version = "0.8.0-pre.13"
 dependencies = [
  "aegis",
  "aes",
@@ -7297,7 +7297,7 @@ dependencies = [
 
 [[package]]
 name = "turso_ext"
-version = "0.8.0-pre.12"
+version = "0.8.0-pre.13"
 dependencies = [
  "chrono",
  "getrandom 0.4.2",
@@ -7306,7 +7306,7 @@ dependencies = [
 
 [[package]]
 name = "turso_ext_tests"
-version = "0.8.0-pre.12"
+version = "0.8.0-pre.13"
 dependencies = [
  "env_logger",
  "lazy_static",
@@ -7317,7 +7317,7 @@ dependencies = [
 
 [[package]]
 name = "turso_macros"
-version = "0.8.0-pre.12"
+version = "0.8.0-pre.13"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -7326,7 +7326,7 @@ dependencies = [
 
 [[package]]
 name = "turso_node"
-version = "0.8.0-pre.12"
+version = "0.8.0-pre.13"
 dependencies = [
  "chrono",
  "napi",
@@ -7340,7 +7340,7 @@ dependencies = [
 
 [[package]]
 name = "turso_parser"
-version = "0.8.0-pre.12"
+version = "0.8.0-pre.13"
 dependencies = [
  "bitflags 2.9.4",
  "codspeed-criterion-compat",
@@ -7358,7 +7358,7 @@ dependencies = [
 
 [[package]]
 name = "turso_pg"
-version = "0.8.0-pre.12"
+version = "0.8.0-pre.13"
 dependencies = [
  "chrono",
  "parking_lot",
@@ -7372,14 +7372,14 @@ dependencies = [
 
 [[package]]
 name = "turso_pg_client"
-version = "0.8.0-pre.12"
+version = "0.8.0-pre.13"
 dependencies = [
  "thiserror 2.0.16",
 ]
 
 [[package]]
 name = "turso_pg_parser"
-version = "0.8.0-pre.12"
+version = "0.8.0-pre.13"
 dependencies = [
  "criterion",
  "miette",
@@ -7390,7 +7390,7 @@ dependencies = [
 
 [[package]]
 name = "turso_pg_regress"
-version = "0.8.0-pre.12"
+version = "0.8.0-pre.13"
 dependencies = [
  "anyhow",
  "clap",
@@ -7399,7 +7399,7 @@ dependencies = [
 
 [[package]]
 name = "turso_pg_server"
-version = "0.8.0-pre.12"
+version = "0.8.0-pre.13"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -7413,7 +7413,7 @@ dependencies = [
 
 [[package]]
 name = "turso_pg_tests"
-version = "0.8.0-pre.12"
+version = "0.8.0-pre.13"
 dependencies = [
  "anyhow",
  "assert_cmd",
@@ -7445,7 +7445,7 @@ dependencies = [
 
 [[package]]
 name = "turso_sdk_kit"
-version = "0.8.0-pre.12"
+version = "0.8.0-pre.13"
 dependencies = [
  "bindgen 0.69.5",
  "env_logger",
@@ -7461,7 +7461,7 @@ dependencies = [
 
 [[package]]
 name = "turso_sdk_kit_macros"
-version = "0.8.0-pre.12"
+version = "0.8.0-pre.13"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -7484,7 +7484,7 @@ dependencies = [
 
 [[package]]
 name = "turso_serverless_conformance"
-version = "0.8.0-pre.12"
+version = "0.8.0-pre.13"
 dependencies = [
  "base64",
  "reqwest",
@@ -7495,7 +7495,7 @@ dependencies = [
 
 [[package]]
 name = "turso_serverless_differential"
-version = "0.8.0-pre.12"
+version = "0.8.0-pre.13"
 dependencies = [
  "hegeltest",
  "serde_json",
@@ -7507,7 +7507,7 @@ dependencies = [
 
 [[package]]
 name = "turso_sqlite3"
-version = "0.8.0-pre.12"
+version = "0.8.0-pre.13"
 dependencies = [
  "cc",
  "env_logger",
@@ -7523,7 +7523,7 @@ dependencies = [
 
 [[package]]
 name = "turso_stress"
-version = "0.8.0-pre.12"
+version = "0.8.0-pre.13"
 dependencies = [
  "antithesis_sdk",
  "clap",
@@ -7544,7 +7544,7 @@ dependencies = [
 
 [[package]]
 name = "turso_sync_engine"
-version = "0.8.0-pre.12"
+version = "0.8.0-pre.13"
 dependencies = [
  "base64",
  "bytes",
@@ -7572,7 +7572,7 @@ dependencies = [
 
 [[package]]
 name = "turso_sync_js"
-version = "0.8.0-pre.12"
+version = "0.8.0-pre.13"
 dependencies = [
  "genawaiter",
  "napi",
@@ -7587,7 +7587,7 @@ dependencies = [
 
 [[package]]
 name = "turso_sync_sdk_kit"
-version = "0.8.0-pre.12"
+version = "0.8.0-pre.13"
 dependencies = [
  "bindgen 0.69.5",
  "env_logger",
@@ -7604,7 +7604,7 @@ dependencies = [
 
 [[package]]
 name = "turso_whopper"
-version = "0.8.0-pre.12"
+version = "0.8.0-pre.13"
 dependencies = [
  "anyhow",
  "clap",
@@ -7625,7 +7625,7 @@ dependencies = [
 
 [[package]]
 name = "tursopg"
-version = "0.8.0-pre.12"
+version = "0.8.0-pre.13"
 dependencies = [
  "anyhow",
  "cfg-if",
