@@ -83,6 +83,7 @@ pub(crate) mod access_method;
 pub(crate) mod constraints;
 pub(crate) mod cost;
 mod cost_params;
+mod flatten;
 pub(crate) mod join;
 pub(crate) mod lift_common_subexpressions;
 pub(crate) mod multi_index;
@@ -965,6 +966,7 @@ fn optimize_select_plan_with_cache(
     resolver: &Resolver,
     cache: &mut SubqueryPlanCache,
 ) -> Result<()> {
+    flatten::flatten_from_clause_subqueries(plan, resolver)?;
     if !plan
         .non_from_clause_subqueries
         .iter()
@@ -986,12 +988,7 @@ fn optimize_select_plan_with_cache(
         return optimize_select_plan_form(plan, resolver, cache);
     }
 
-    let has_full_join = plan.table_references.joined_tables().iter().any(|table| {
-        table
-            .join_info
-            .as_ref()
-            .is_some_and(JoinInfo::is_full_outer)
-    });
+    let has_full_join = plan.table_references.has_full_join();
     // The correlated form cannot run on every matched and unmatched FULL JOIN
     // row yet. A complete semi-join or anti-join rewrite can, so use it.
     let full_join_rewrite_is_complete = has_full_join
@@ -1638,6 +1635,7 @@ fn build_update_write_set_plan(
 
     let mut result_columns = update_from_set_result_columns;
     result_columns.push(ResultSetColumn {
+        subquery_column_name: None,
         expr: Expr::RowId {
             database: None,
             table: rowid_internal_id,
@@ -1745,6 +1743,7 @@ fn update_from_set_result_columns(set_clauses: &[UpdateSetClause]) -> Vec<Result
         .iter()
         .enumerate()
         .map(|(idx, set_clause)| ResultSetColumn {
+            subquery_column_name: None,
             expr: set_clause.expr.as_ref().clone(),
             alias: Some(update_from_scratch_col_name(idx)),
             implicit_column_name: None,

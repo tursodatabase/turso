@@ -61,12 +61,12 @@ expect {
 test a-from-clause-subquery-nests-its-body-under-its-own-scan {
     EXPLAIN QUERY PLAN FORMAT=JSON
     SELECT city_id, avg(age)
-    FROM (SELECT * FROM users WHERE age > 18)
+    FROM (SELECT * FROM users WHERE age > 18 LIMIT -1)
     GROUP BY city_id
     ORDER BY avg(age);
 }
 expect {
-    {"version":1,"sql":"EXPLAIN QUERY PLAN FORMAT=JSON\n    SELECT city_id, avg(age)\n    FROM (SELECT * FROM users WHERE age > 18)\n    GROUP BY city_id\n    ORDER BY avg(age);","result_columns":["city_id","avg(age)"],"nodes":[{"id":1,"parent":null,"detail":"SCAN (subquery-0)","op":{"type":"scan","table":"(subquery-0)","subquery":{"execution":"coroutine"},"source":"subquery","estimate":{"input_rows":1,"rows_per_input":400000,"output_rows":400000,"access_cost":22403.510000000002,"total_cost":22403.510000000002}}},{"id":3,"parent":1,"detail":"SEARCH users USING INDEX idx_users_age (age>?)","op":{"type":"search","table":"users","search_kind":"seek","index":{"name":"idx_users_age","covering":false,"ephemeral":false},"constraints":["age>?"],"estimate":{"input_rows":1,"rows_per_input":400000,"output_rows":400000,"access_cost":13203.51,"total_cost":13203.51}}},{"id":19,"parent":null,"detail":"USE SORTER FOR GROUP BY","op":{"type":"group_by","method":"sorter"}},{"id":61,"parent":null,"detail":"USE SORTER FOR ORDER BY","op":{"type":"order_by","method":"sorter"}}]}
+    {"version":1,"sql":"EXPLAIN QUERY PLAN FORMAT=JSON\n    SELECT city_id, avg(age)\n    FROM (SELECT * FROM users WHERE age > 18 LIMIT -1)\n    GROUP BY city_id\n    ORDER BY avg(age);","result_columns":["city_id","avg(age)"],"nodes":[{"id":1,"parent":null,"detail":"SCAN (subquery-0)","op":{"type":"scan","table":"(subquery-0)","subquery":{"execution":"coroutine"},"source":"subquery","estimate":{"input_rows":1,"rows_per_input":400000,"output_rows":400000,"access_cost":22403.510000000002,"total_cost":22403.510000000002}}},{"id":3,"parent":1,"detail":"SEARCH users USING INDEX idx_users_age (age>?)","op":{"type":"search","table":"users","search_kind":"seek","index":{"name":"idx_users_age","covering":false,"ephemeral":false},"constraints":["age>?"],"estimate":{"input_rows":1,"rows_per_input":400000,"output_rows":400000,"access_cost":13203.51,"total_cost":13203.51}}},{"id":22,"parent":null,"detail":"USE SORTER FOR GROUP BY","op":{"type":"group_by","method":"sorter"}},{"id":64,"parent":null,"detail":"USE SORTER FOR ORDER BY","op":{"type":"order_by","method":"sorter"}}]}
 }
 
 @setup schema

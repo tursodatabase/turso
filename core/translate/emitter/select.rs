@@ -924,6 +924,7 @@ fn build_materialized_build_input_plan(
     let build_internal_id = plan.table_references.joined_tables()[build_table_idx].internal_id;
     let result_columns = match mode {
         MaterializedBuildInputMode::RowidOnly => vec![ResultSetColumn {
+            subquery_column_name: None,
             expr: Expr::RowId {
                 database: None,
                 table: build_internal_id,
@@ -940,6 +941,7 @@ fn build_materialized_build_input_plan(
             let mut result_columns: Vec<ResultSetColumn> = Vec::new();
             for expr in key_exprs.iter() {
                 result_columns.push(ResultSetColumn {
+                    subquery_column_name: None,
                     expr: expr.clone(),
                     alias: None,
                     implicit_column_name: None,
@@ -964,6 +966,7 @@ fn build_materialized_build_input_plan(
                     },
                 };
                 result_columns.push(ResultSetColumn {
+                    subquery_column_name: None,
                     expr,
                     alias: None,
                     implicit_column_name: None,

@@ -2,9 +2,9 @@
 source: subquery-sort-elision.sqltest
 expression: |-
   WITH step1 AS (
-          SELECT x, y FROM t1 ORDER BY x
+          SELECT x, y FROM t1 ORDER BY x LIMIT -1
       ),
-      step2 AS (
+      step2 AS MATERIALIZED (
           SELECT x, y FROM step1
       )
       SELECT x, SUM(y) OVER (ORDER BY x) AS running
@@ -20,8 +20,8 @@ info:
   database: ':memory:'
 ---
 QUERY PLAN
+|--SCAN step1
+|  |--SCAN t1
+|  `--USE SORTER FOR ORDER BY
 `--SCAN window_subquery_0
    `--SCAN step2
-      `--SCAN step1
-         |--SCAN t1
-         `--USE SORTER FOR ORDER BY

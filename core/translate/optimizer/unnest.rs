@@ -150,12 +150,7 @@ pub fn rewrite_correlated_subqueries(
     plan: &mut SelectPlan,
     resolver: &Resolver<'_>,
 ) -> Result<bool> {
-    let has_full_join = plan.table_references.joined_tables().iter().any(|table| {
-        table
-            .join_info
-            .as_ref()
-            .is_some_and(JoinInfo::is_full_outer)
-    });
+    let has_full_join = plan.table_references.has_full_join();
     let mut changed = false;
     let mut subquery_index = 0;
     while subquery_index < plan.non_from_clause_subqueries.len() {
@@ -611,6 +606,7 @@ fn try_rewrite_single_value_aggregate(
 
     for (index, column) in group_columns.iter().enumerate() {
         inner_plan.result_columns.push(ResultSetColumn {
+            subquery_column_name: None,
             expr: column.clone(),
             alias: Some(format!("correlation_key_{index}")),
             implicit_column_name: None,
@@ -1210,44 +1206,8 @@ fn replace_subquery_value(
         Ok(WalkControl::Continue)
     };
 
-    for column in &mut plan.result_columns {
-        walk_expr_mut(&mut column.expr, &mut replace)?;
-    }
-    for term in &mut plan.where_clause {
-        walk_expr_mut(&mut term.expr, &mut replace)?;
-    }
-    if let Some(group) = &mut plan.group_by {
-        for expr in &mut group.exprs {
-            walk_expr_mut(expr, &mut replace)?;
-        }
-        if let Some(having) = &mut group.having {
-            for expr in having {
-                walk_expr_mut(expr, &mut replace)?;
-            }
-        }
-    }
-    for (expr, _, _) in &mut plan.order_by {
+    for expr in plan.exprs_mut() {
         walk_expr_mut(expr, &mut replace)?;
-    }
-    if let Some(limit) = &mut plan.limit {
-        walk_expr_mut(limit, &mut replace)?;
-    }
-    if let Some(offset) = &mut plan.offset {
-        walk_expr_mut(offset, &mut replace)?;
-    }
-    for row in &mut plan.values {
-        for expr in row {
-            walk_expr_mut(expr, &mut replace)?;
-        }
-    }
-    for aggregate in &mut plan.aggregates {
-        walk_expr_mut(&mut aggregate.original_expr, &mut replace)?;
-        for arg in &mut aggregate.args {
-            walk_expr_mut(arg, &mut replace)?;
-        }
-        if let Some(filter) = &mut aggregate.filter_expr {
-            walk_expr_mut(filter, &mut replace)?;
-        }
     }
     Ok(found)
 }

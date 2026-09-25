@@ -1,0 +1,326 @@
+@database :memory:
+
+setup schema {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, a, b, c TEXT COLLATE NOCASE);
+    CREATE INDEX ta ON t(a);
+    INSERT INTO t VALUES (1, 10, 100, 'x'), (2, 20, 200, 'Y'), (3, 30, NULL, 'z'), (4, NULL, 400, 'X');
+    CREATE TABLE u(id INTEGER PRIMARY KEY, tid INTEGER, v TEXT);
+    CREATE INDEX utid ON u(tid);
+    INSERT INTO u VALUES (1, 1, 'one'), (2, 1, 'uno'), (3, 3, 'three'), (4, 9, 'nine');
+    CREATE VIEW computed AS SELECT id, a, b * 2 AS b2, c FROM t;
+    CREATE VIEW joined AS SELECT t.id AS tid, t.a, u.v FROM t JOIN u ON u.tid = t.id;
+    CREATE VIEW filtered AS SELECT id, a FROM t WHERE a > 15;
+    CREATE VIEW ordered AS SELECT id, a FROM t ORDER BY a DESC;
+}
+
+@setup schema
+test view-point-lookup-returns-row {
+    SELECT * FROM computed WHERE id = 2;
+}
+expect {
+    2|20|400|Y
+}
+
+@setup schema
+test view-filter-on-computed-column {
+    SELECT id, b2 FROM computed WHERE b2 > 250 ORDER BY id;
+}
+expect {
+    2|400
+    4|800
+}
+
+@setup schema
+test aggregate-over-view {
+    SELECT count(*), sum(b2), max(a) FROM computed;
+}
+expect {
+    4|1400|30
+}
+
+@setup schema
+test join-view-filter {
+    SELECT * FROM joined WHERE tid = 1 ORDER BY v;
+}
+expect {
+    1|10|one
+    1|10|uno
+}
+
+@setup schema
+test left-join-view-keeps-unmatched-rows {
+    SELECT t.id, filtered.a FROM t LEFT JOIN filtered ON filtered.id = t.id ORDER BY t.id;
+}
+expect {
+    1|
+    2|20
+    3|30
+    4|
+}
+
+@setup schema
+test left-join-subquery-constant-column-is-null-without-match {
+    SELECT t.id, s.x FROM t LEFT JOIN (SELECT id, 5 AS x FROM t WHERE a > 15) s ON s.id = t.id ORDER BY t.id;
+}
+expect {
+    1|
+    2|5
+    3|5
+    4|
+}
+
+@setup schema
+test left-join-subquery-where-is-null {
+    SELECT t.id FROM t LEFT JOIN (SELECT id, a AS x FROM t WHERE a > 15) s ON s.id = t.id WHERE s.x IS NULL ORDER BY t.id;
+}
+expect {
+    1
+    4
+}
+
+@setup schema
+test ordered-view-keeps-order {
+    SELECT * FROM ordered;
+}
+expect {
+    3|30
+    2|20
+    1|10
+    4|
+}
+
+@setup schema
+test ordered-view-with-outer-order {
+    SELECT * FROM ordered ORDER BY id;
+}
+expect {
+    1|10
+    2|20
+    3|30
+    4|
+}
+
+@setup schema
+test ordered-view-feeds-group-concat-in-order {
+    SELECT group_concat(a) FROM ordered;
+}
+expect {
+    30,20,10
+}
+
+@setup schema
+test json-value-loses-subtype-through-subquery-column {
+    SELECT json_array(j), json_array(o) FROM (SELECT id, json('[1,2]') AS j, json_object('k', a) AS o FROM t) WHERE id = 1;
+}
+expect {
+    ["[1,2]"]|["{\"k\":10}"]
+}
+
+@setup schema
+test subquery-literal-column-keeps-binary-collation-on-left {
+    SELECT s.id FROM (SELECT id, 'x' AS lit FROM t) s JOIN t ON s.lit = t.c ORDER BY 1;
+}
+expect {
+    1
+    2
+    3
+    4
+}
+
+@setup schema
+test subquery-literal-column-keeps-binary-collation-on-right {
+    SELECT s.id, t.id FROM (SELECT id, 'x' AS lit FROM t) s JOIN t ON t.c = s.lit WHERE s.id = 1 ORDER BY 2;
+}
+expect {
+    1|1
+    1|4
+}
+
+@setup schema
+test subquery-collate-column-is-not-explicit {
+    SELECT id FROM (SELECT id, a COLLATE NOCASE AS an FROM t) WHERE an = '10' COLLATE BINARY;
+}
+expect {
+}
+
+@setup schema
+test subquery-column-names {
+    SELECT s.x, x, s.x + 0 FROM (SELECT a AS x FROM t) s WHERE x = 10;
+}
+expect {
+    10|10|10
+}
+
+@setup schema
+test nested-subqueries {
+    SELECT * FROM (SELECT * FROM (SELECT id, a + 1 AS a1 FROM t) WHERE a1 > 11) WHERE id < 4 ORDER BY id;
+}
+expect {
+    2|21
+    3|31
+}
+
+@setup schema
+test cte-read-twice {
+    WITH c AS (SELECT id, a FROM t) SELECT x.id, y.a FROM c x JOIN c y ON x.id = y.id ORDER BY 1;
+}
+expect {
+    1|10
+    2|20
+    3|30
+    4|
+}
+
+@setup schema
+test subquery-with-exists-in-outer-where {
+    SELECT * FROM (SELECT id, a FROM t) s WHERE EXISTS (SELECT 1 FROM u WHERE u.tid = s.id) ORDER BY id;
+}
+expect {
+    1|10
+    3|30
+}
+
+@setup schema
+test subquery-column-read-two-subqueries-deep {
+    SELECT s.id, s.a2 FROM (SELECT id, a * 2 AS a2 FROM t) s
+    WHERE EXISTS (SELECT 1 FROM u WHERE u.id IN (SELECT u2.id FROM u u2 WHERE u2.tid = s.id))
+    ORDER BY 1;
+}
+expect {
+    1|20
+    3|60
+}
+
+@setup schema
+test subquery-joined-with-using {
+    SELECT * FROM (SELECT id, a FROM t) s JOIN u USING (id) ORDER BY id;
+}
+expect {
+    1|10|1|one
+    2|20|1|uno
+    3|30|3|three
+    4||9|nine
+}
+
+@setup schema
+test ordered-subquery-in-union-all {
+    SELECT a FROM (SELECT a FROM t WHERE a IS NOT NULL ORDER BY a DESC) UNION ALL SELECT 99;
+}
+expect {
+    30
+    20
+    10
+    99
+}
+
+test ordered-subquery-in-union-all-with-limit-and-offset {
+    CREATE TABLE t1(a, b);
+    INSERT INTO t1 VALUES (1, 'a'), (2, 'b'), (3, 'c'), (4, 'd'), (5, 'e');
+    CREATE TABLE t2(x, y);
+    INSERT INTO t2 VALUES (8, 'y'), (9, 'z'), (6, 'w'), (7, 'x');
+    SELECT a, b FROM t1 UNION ALL SELECT * FROM (SELECT x, y FROM t2 ORDER BY y) LIMIT 3 OFFSET 6;
+}
+expect {
+    7|x
+    8|y
+    9|z
+}
+
+@setup schema
+test subquery-with-false-where {
+    SELECT * FROM (SELECT id, a FROM t WHERE 0) s;
+}
+expect {
+}
+
+@setup schema
+test subquery-numeric-column-compared-with-text {
+    SELECT typeof(x), x FROM (SELECT a + 0 AS x FROM t) WHERE x = '10';
+}
+expect {
+}
+
+@setup schema
+test subquery-true-column-is-a-value {
+    SELECT x IS TRUE, typeof(x) FROM (SELECT TRUE AS x FROM t) LIMIT 1;
+}
+expect {
+    1|integer
+}
+
+@setup schema
+test update-with-view-in-where {
+    UPDATE t SET b = b + 1 WHERE id IN (SELECT id FROM filtered);
+    SELECT id, b FROM t ORDER BY id;
+}
+expect {
+    1|100
+    2|201
+    3|
+    4|400
+}
+
+@setup schema
+@skip-if sqlite "query plan explanation output is different in sqlite"
+test plan-view-seeks-primary-key {
+    EXPLAIN QUERY PLAN SELECT * FROM computed WHERE id = 5;
+}
+expect {
+    1|0|0|SEARCH t USING INTEGER PRIMARY KEY (rowid=?)
+}
+
+@setup schema
+@skip-if sqlite "query plan explanation output is different in sqlite"
+test plan-view-seeks-index {
+    EXPLAIN QUERY PLAN SELECT id FROM computed WHERE a = 7;
+}
+expect {
+    1|0|0|SEARCH t USING COVERING INDEX ta (a=?)
+}
+
+@setup schema
+@skip-if sqlite "query plan explanation output is different in sqlite"
+test plan-cte-seeks-primary-key {
+    EXPLAIN QUERY PLAN WITH c AS (SELECT * FROM t) SELECT * FROM c WHERE id = 1;
+}
+expect {
+    1|0|0|SEARCH t USING INTEGER PRIMARY KEY (rowid=?)
+}
+
+@setup schema
+@skip-if sqlite "query plan explanation output is different in sqlite"
+test plan-join-view-seeks-both-tables {
+    EXPLAIN QUERY PLAN SELECT * FROM joined WHERE tid = 1;
+}
+expect {
+    1|0|0|SEARCH t USING INTEGER PRIMARY KEY (rowid=?)
+    2|0|0|SEARCH u USING INDEX utid (tid=?)
+}
+
+@setup schema
+@skip-if sqlite "query plan explanation output is different in sqlite"
+test plan-left-join-view-seeks-primary-key {
+    EXPLAIN QUERY PLAN SELECT t.id, filtered.a FROM t LEFT JOIN filtered ON filtered.id = t.id;
+}
+expect {
+    1|0|0|SCAN t
+    2|0|0|SEARCH t USING INTEGER PRIMARY KEY (rowid=?) LEFT-JOIN
+}
+
+@setup schema
+@skip-if sqlite "query plan explanation output is different in sqlite"
+test plan-materialized-cte-is-not-merged {
+    EXPLAIN QUERY PLAN WITH c AS MATERIALIZED (SELECT * FROM t) SELECT * FROM c WHERE id = 1;
+}
+expect pattern {
+    SCAN c
+}
+
+@setup schema
+@skip-if sqlite "query plan explanation output is different in sqlite"
+test plan-subquery-with-limit-is-not-merged {
+    EXPLAIN QUERY PLAN SELECT * FROM (SELECT * FROM t LIMIT 2) s WHERE id = 1;
+}
+expect pattern {
+    SCAN t
+}
