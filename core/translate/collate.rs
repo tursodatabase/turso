@@ -378,6 +378,18 @@ pub fn get_collseq_from_expr_with_symbols(
     Ok(explicit.or(column))
 }
 
+pub fn get_compound_arm_collseq(
+    expr: &Expr,
+    referenced_tables: &TableReferences,
+) -> Result<Option<CollationSeq>> {
+    let (explicit, _) =
+        get_collseq_parts_from_expr_with_symbols(expr, referenced_tables, None, None)?;
+    match explicit {
+        Some(collation) => Ok(Some(collation)),
+        None => comparison_operand_column_collseq(expr, referenced_tables),
+    }
+}
+
 pub fn resolve_comparison_collseq_with_resolver(
     lhs_expr: &Expr,
     rhs_expr: &Expr,
