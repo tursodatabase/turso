@@ -658,7 +658,7 @@ pub trait Wal: Debug + Send + Sync {
     /// Find the latest frame containing a page.
     ///
     /// optional frame_watermark parameter can be passed to force WAL to find frame not larger than watermark value
-    /// caller must guarantee, that frame_watermark must be greater than last checkpointed frame, otherwise method will panic
+    /// frame_watermark must be in range [last checkpointed frame, max_frame], otherwise method returns an error
     fn find_frame(&self, page_id: u64, frame_watermark: Option<u64>) -> Result<Option<u64>>;
 
     /// Read a frame from the WAL. The read is added to `group`, when
@@ -3625,21 +3625,23 @@ impl Wal for WalFile {
             "unexpected use of frame_watermark optional argument"
         );
 
-        turso_assert!(
-            frame_watermark.unwrap_or(0) <= self.max_frame.load(Ordering::Acquire),
-            "frame_watermark must be <= than current WAL max_frame value"
-        );
+        let max_frame = self.max_frame.load(Ordering::Acquire);
+        if frame_watermark.is_some_and(|watermark| watermark > max_frame) {
+            return Err(LimboError::InvalidArgument(format!(
+                "frame_watermark {frame_watermark:?} is larger than WAL max_frame {max_frame}"
+            )));
+        }
 
         // we can guarantee correctness of the method, only if frame_watermark is strictly after the current checkpointed prefix
         //
         // if it's not, than pages from WAL range [frame_watermark..nBackfill] are already in the DB file,
         // and in case if page first occurrence in WAL was after frame_watermark - we will be unable to read proper previous version of the page
         let nbackfills = self.load_coordination_snapshot().nbackfills;
-        turso_assert!(
-            frame_watermark.is_none() || frame_watermark.unwrap() >= nbackfills,
-            "frame_watermark must be >= than current WAL backfill amount",
-            { "frame_watermark": frame_watermark, "nbackfills": nbackfills }
-        );
+        if frame_watermark.is_some_and(|watermark| watermark < nbackfills) {
+            return Err(LimboError::InvalidArgument(format!(
+                "frame_watermark {frame_watermark:?} is smaller than WAL backfill amount {nbackfills}"
+            )));
+        }
 
         // A fully backfilled snapshot (max_frame < min_frame, that is
         // max_frame == nbackfills) has nothing visible in the WAL: read
