@@ -813,42 +813,34 @@ async fn async_main(opts: Opts) -> Result<(), Box<dyn std::error::Error + Send +
                     const INTEGRITY_CHECK_INTERVAL: usize = 100;
                     if !opts.skip_integrity_check && interaction_idx % INTEGRITY_CHECK_INTERVAL == 0
                     {
-                        let mut res = conn.query("PRAGMA integrity_check", ()).await.unwrap();
-                        match res.next().await {
-                            Ok(Some(row))
-                                if Value::Text("ok".into()) == row.get_value(0).unwrap() =>
-                            {
-                                sql_logger.log(&thread, "PRAGMA integrity_check", "OK");
+                        let sql = "PRAGMA integrity_check";
+                        let result: turso::Result<Vec<Value>> = async {
+                            let mut result_rows = conn.query(sql, ()).await?;
+                            let mut rows = Vec::new();
+                            while let Some(row) = result_rows.next().await? {
+                                rows.push(row.get_value(0)?);
                             }
-                            Ok(Some(row)) => {
-                                let mut rows = vec![row.get_value(0).unwrap()];
-                                while let Some(r) = res.next().await? {
-                                    rows.push(r.get_value(0).unwrap());
-                                }
-                                sql_logger.log(
-                                    &thread,
-                                    "PRAGMA integrity_check",
-                                    &format!("ERROR: {rows:?}"),
-                                );
-                                turso_macros::turso_assert_unreachable!("integrity check failed", { "thread": thread, "rows": rows });
+                            Ok(rows)
+                        }
+                        .await;
+                        match result {
+                            Ok(rows) if rows == [Value::Text("ok".into())] => {
+                                sql_logger.log(&thread, sql, "OK");
                             }
-                            Ok(None) => {
-                                sql_logger.log(&thread, "PRAGMA integrity_check", "ERROR: no rows");
+                            Ok(rows) if rows.is_empty() => {
+                                sql_logger.log(&thread, sql, "ERROR: no rows");
                                 turso_macros::turso_assert_unreachable!("integrity check returned no rows", { "thread": thread });
                             }
+                            Ok(rows) => {
+                                sql_logger.log(&thread, sql, &format!("ERROR: {rows:?}"));
+                                turso_macros::turso_assert_unreachable!("integrity check failed", { "thread": thread, "rows": rows });
+                            }
                             Err(turso::Error::Busy(_) | turso::Error::BusySnapshot(_)) => {
-                                sql_logger.log(
-                                    &thread,
-                                    "PRAGMA integrity_check",
-                                    "SKIPPED: database busy",
-                                );
+                                sql_logger.log(&thread, sql, "SKIPPED: database busy");
+                                conn.rollback_if_open().await?;
                             }
                             Err(e) => {
-                                sql_logger.log(
-                                    &thread,
-                                    "PRAGMA integrity_check",
-                                    &format!("ERROR: {e}"),
-                                );
+                                sql_logger.log(&thread, sql, &format!("ERROR: {e}"));
                                 turso_macros::turso_assert_unreachable!("Error performing integrity check", { "thread": thread, "error": e });
                             }
                         }
@@ -941,4 +933,42 @@ async fn async_main(opts: Opts) -> Result<(), Box<dyn std::error::Error + Send +
     }
 
     Ok(())
+}
+
+#[cfg(all(test, not(shuttle)))]
+mod rollback_tests {
+    use crate::conn::StressDb;
+    use crate::sql_logging::SqlLogger;
+    use turso::Value;
+    use turso_stress::sync::{Arc, AsyncMutex};
+    use turso_stress::ThreadId;
+
+    #[tokio::test]
+    async fn rollback_open_transaction_discards_uncommitted_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_file = dir.path().join("test.db");
+        let sql_log = dir.path().join("test.sql");
+        let logger = Arc::new(SqlLogger::new(sql_log.to_str().unwrap()).unwrap());
+        let db = Arc::new(AsyncMutex::new(StressDb::new(
+            db_file.to_str().unwrap().to_owned(),
+            logger,
+            None,
+            false,
+        )));
+        let conn = StressDb::connect(&db, ThreadId::new(0), 1000)
+            .await
+            .unwrap();
+        conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY)", ())
+            .await
+            .unwrap();
+        conn.rollback_if_open().await.unwrap();
+        conn.execute("BEGIN", ()).await.unwrap();
+        conn.execute("INSERT INTO t VALUES (1)", ()).await.unwrap();
+
+        conn.rollback_if_open().await.unwrap();
+
+        let mut rows = conn.query("SELECT count(*) FROM t", ()).await.unwrap();
+        let count = rows.next().await.unwrap().unwrap().get_value(0).unwrap();
+        assert_eq!(count, Value::Integer(0));
+    }
 }
