@@ -786,13 +786,19 @@ fn evaluate_multi_index_branches(
 /// also reject the null-extended row the join emits when nothing matched, and
 /// that row is produced by jumping straight past the scan — so consuming such
 /// a term silently drops it.
+///
+/// A term from an outer join's ON clause is unusable for every *other* table
+/// too: it belongs to that join's loop, so consuming it into an earlier
+/// table's scan drops the rows the join owes null-extended.
 fn multi_index_can_consume_term(
     table: &JoinedTable,
     term: &WhereTerm,
     table_references: &TableReferences,
 ) -> bool {
+    if let Some(outer_join_table) = term.from_outer_join {
+        return outer_join_table == table.internal_id;
+    }
     !table_references.outer_join_may_null_extend(table.internal_id)
-        || term.from_outer_join == Some(table.internal_id)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1607,6 +1613,111 @@ mod tests {
                 .any(|branch| branch.index.as_ref().map(|idx| idx.name.as_str())
                     == Some("idx_item_a")),
             "expected one secondary-index branch"
+        );
+    }
+
+    #[test]
+    fn test_multi_index_intersection_rejects_another_joins_on_terms() {
+        let item = create_btree_table(
+            "item",
+            vec![
+                create_column(&TestColumn {
+                    name: "id".to_string(),
+                    ty: Type::Integer,
+                    is_rowid_alias: true,
+                }),
+                create_column_of_type("a", Type::Integer),
+            ],
+        );
+        let side = create_btree_table("side", vec![create_column_of_type("sid", Type::Integer)]);
+
+        let mut table_id_counter = TableRefIdCounter::new();
+        let joined_tables = vec![
+            create_table_reference(item, None, table_id_counter.next()),
+            create_table_reference(
+                side,
+                Some(JoinInfo {
+                    join_type: JoinType::LeftOuter,
+                    using: vec![],
+                    no_reorder: false,
+                }),
+                table_id_counter.next(),
+            ),
+        ];
+        const ITEM: usize = 0;
+        const SIDE: usize = 1;
+        let item_id = joined_tables[ITEM].internal_id;
+        let side_id = joined_tables[SIDE].internal_id;
+
+        let mut available_indexes = AvailableIndexes::default();
+        available_indexes.insert_for_table_name(
+            &joined_tables,
+            "item",
+            VecDeque::from([Arc::new(Index {
+                name: "idx_item_a".to_string(),
+                table_name: "item".to_string(),
+                where_clause: None,
+                columns: crate::alloc::vec![IndexColumn::new("a", 1)],
+                unique: false,
+                ephemeral: false,
+                root_page: 2,
+                has_rowid: true,
+                index_method: None,
+                on_conflict: None,
+            })]),
+        );
+
+        let table_references = TableReferences::new(joined_tables, vec![]);
+        let base_row_count = RowCountEstimate::hardcoded_fallback(&DEFAULT_PARAMS);
+
+        let build_where_clause = |from_outer_join: Option<TableInternalId>| {
+            vec![
+                WhereTerm {
+                    expr: Expr::Binary(
+                        Box::new(create_column_expr(item_id, 0, true)),
+                        Operator::Greater,
+                        Box::new(create_numeric_literal("10")),
+                    ),
+                    from_outer_join,
+                    consumed: false,
+                },
+                WhereTerm {
+                    expr: Expr::Binary(
+                        Box::new(create_column_expr(item_id, 1, false)),
+                        Operator::Equals,
+                        Box::new(create_numeric_literal("7")),
+                    ),
+                    from_outer_join,
+                    consumed: false,
+                },
+            ]
+        };
+
+        let plan_intersection = |where_clause: &[WhereTerm]| {
+            consider_multi_index_intersection(
+                &table_references.joined_tables()[ITEM],
+                where_clause,
+                &available_indexes,
+                &table_references,
+                &[],
+                &empty_schema(),
+                1.0,
+                base_row_count,
+                &DEFAULT_PARAMS,
+                Cost(f64::INFINITY),
+                &TableMask::default(),
+                &AnalyzeStats::default(),
+            )
+            .unwrap()
+        };
+
+        assert!(
+            plan_intersection(&build_where_clause(None)).is_some(),
+            "plain WHERE terms on item should still be eligible for intersection"
+        );
+        assert!(
+            plan_intersection(&build_where_clause(Some(side_id))).is_none(),
+            "terms from the ON clause of the join with side belong to side's loop"
         );
     }
 
