@@ -25,7 +25,7 @@ use crate::{
     progress::ProgressHandler,
     return_if_io,
     schema::{self, Schema},
-    stats::refresh_analyze_stats,
+    stats::{refresh_analyze_stats, refresh_analyze_stats_nonblock, RefreshAnalyzeStatsState},
     storage::{
         self,
         checksum::CHECKSUM_REQUIRED_RESERVED_BYTES,
@@ -446,6 +446,54 @@ impl Default for HeaderValidationState {
         Self::Start {
             init: InitState::default(),
         }
+    }
+}
+
+/// How `Database::_connect` loads the connection's ANALYZE stats.
+///
+/// A new connection starts from a clone of the shared schema, which carries
+/// no `sqlite_stat1` contents until some connection has loaded them, and the
+/// planner uses those stats for its cost estimates. `_connect` therefore
+/// refreshes them. The refresh is a `SELECT` over `sqlite_stat1`, and that
+/// statement can have to wait: on page I/O, or on another transaction when
+/// it speculatively reads a version whose writer is still preparing. Two
+/// states exist because there are two kinds of caller for that wait:
+///
+/// - `Blocking`: the caller may block, so `_connect` runs the scan to
+///   completion right here by pumping `io.step()`. This is the public
+///   `connect` family for embedded users, where whatever the scan waits for
+///   can make progress on its own, and the internal open-time and MVCC
+///   bootstrap connections, for which the refresh is a no-op because the
+///   database is not initialized yet.
+/// - `Deferred`: the caller must not block, so `_connect` returns the bare
+///   connection and the caller drives the same scan through
+///   `refresh_analyze_stats_nonblock`, handing every wait to its own
+///   scheduler. This is `connect_async`, for hosts that run every connection
+///   cooperatively on one thread: there an explicit yield from the scan is a
+///   request to run *other* connections, which `io.step()` can never satisfy,
+///   so `Blocking` would spin forever.
+///
+/// Stats loading is never skipped outright; `Deferred` only moves it to the
+/// caller.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum StatsRefresh {
+    Blocking,
+    Deferred,
+}
+
+/// Resumable state for [`Database::connect_async`]. Create one per
+/// connect and pass it to every call until `IOResult::Done`.
+#[derive(Default)]
+pub struct ConnectAsyncState {
+    /// The connection, once created; handed out when the stats refresh ends.
+    conn: Option<Arc<Connection>>,
+    /// The in-flight `sqlite_stat1` scan.
+    refresh: RefreshAnalyzeStatsState,
+}
+
+impl ConnectAsyncState {
+    pub fn new() -> Self {
+        Self::default()
     }
 }
 
@@ -1510,6 +1558,7 @@ impl Database {
                         Some(pager.clone()),
                         state.encryption_key.clone(),
                         page_codec.clone(),
+                        StatsRefresh::Blocking,
                     )?;
 
                     // Acquire schema lock and hold it through ReadingHeader and LoadingSchema phases
@@ -1651,6 +1700,7 @@ impl Database {
                                 Some(pager.clone()),
                                 state.encryption_key.clone(),
                                 page_codec.clone(),
+                                StatsRefresh::Blocking,
                             )?);
                         }
                         let conn = state.mvcc_bootstrap_conn.as_ref().expect("created above");
@@ -2313,7 +2363,8 @@ impl Database {
                 self.experimental_mvcc_passive_checkpoint_enabled(),
             )?;
             self.mv_store.store(Some(mv_store.clone()));
-            let mvcc_bootstrap_conn = self._connect(true, None, None, None)?;
+            let mvcc_bootstrap_conn =
+                self._connect(true, None, None, None, StatsRefresh::Blocking)?;
             match mv_store.bootstrap(mvcc_bootstrap_conn.clone()) {
                 Ok(()) => {}
                 Err(LimboError::SchemaUpdated) => {
@@ -2330,7 +2381,7 @@ impl Database {
 
     #[instrument(skip_all, level = Level::DEBUG)]
     pub fn connect(self: &Arc<Database>) -> Result<Arc<Connection>> {
-        self._connect(false, None, None, None)
+        self._connect(false, None, None, None, StatsRefresh::Blocking)
     }
 
     /// Connect with an encryption key.
@@ -2340,7 +2391,7 @@ impl Database {
         self: &Arc<Database>,
         encryption_key: Option<EncryptionKey>,
     ) -> Result<Arc<Connection>> {
-        self._connect(false, None, encryption_key, None)
+        self._connect(false, None, encryption_key, None, StatsRefresh::Blocking)
     }
 
     /// Connect with an external page codec.
@@ -2352,7 +2403,63 @@ impl Database {
         self: &Arc<Database>,
         page_codec: Arc<dyn PageCodec>,
     ) -> Result<Arc<Connection>> {
-        self._connect(false, None, None, Some(page_codec))
+        self._connect(false, None, None, Some(page_codec), StatsRefresh::Blocking)
+    }
+
+    /// Non-blocking [`Self::connect`].
+    ///
+    /// Creating the connection itself never waits, but the connect-time
+    /// ANALYZE stats refresh runs a `SELECT` over `sqlite_stat1`, and that
+    /// statement can have to wait: on page I/O, or on another transaction
+    /// (a read that speculatively saw a version whose writer is still
+    /// preparing waits for that writer at its own commit). `connect` pumps
+    /// `io.step()` until the statement finishes, which is only correct when
+    /// the other transaction can make progress on its own. In a host that
+    /// schedules every connection cooperatively on one thread it cannot:
+    /// the wait is an explicit yield asking the host to run *other*
+    /// connections, and `io.step()` never does that, so `connect` spins.
+    ///
+    /// This variant hands every wait back to the caller as
+    /// `IOResult::IO(..)`. Drive it like `open_async`: on `IO`, run the host
+    /// scheduler if the completion is an explicit yield, wait for the
+    /// completion, then call again with the same `state`. The stats refresh
+    /// stays best-effort: a failure to prepare or scan `sqlite_stat1` is
+    /// logged and the connection is returned without stats.
+    pub fn connect_async(
+        self: &Arc<Database>,
+        state: &mut ConnectAsyncState,
+    ) -> IOResultOr<Arc<Connection>> {
+        self.connect_with_encryption_async(None, state)
+    }
+
+    /// Non-blocking [`Self::connect_with_encryption`]; see [`Self::connect_async`].
+    ///
+    /// `encryption_key` is consumed by the first call, which creates the
+    /// connection; later calls with the same `state` only resume the stats
+    /// refresh.
+    pub fn connect_with_encryption_async(
+        self: &Arc<Database>,
+        encryption_key: Option<EncryptionKey>,
+        state: &mut ConnectAsyncState,
+    ) -> IOResultOr<Arc<Connection>> {
+        let conn = match &state.conn {
+            Some(conn) => conn.clone(),
+            None => {
+                let conn =
+                    self._connect(false, None, encryption_key, None, StatsRefresh::Deferred)?;
+                state.conn = Some(conn.clone());
+                conn
+            }
+        };
+        match refresh_analyze_stats_nonblock(&conn, &mut state.refresh) {
+            Ok(IOResult::IO(io)) => return Ok(IOResult::IO(io)),
+            Ok(IOResult::Done(())) => {}
+            Err(err) => {
+                tracing::warn!("Failed to refresh analyze stats on connect: {err}");
+            }
+        }
+        *state = ConnectAsyncState::default();
+        Ok(IOResult::Done(conn))
     }
 
     #[instrument(skip_all, level = Level::DEBUG)]
@@ -2362,6 +2469,7 @@ impl Database {
         pager: Option<Arc<Pager>>,
         encryption_key: Option<EncryptionKey>,
         page_codec: Option<Arc<dyn PageCodec>>,
+        stats: StatsRefresh,
     ) -> Result<Arc<Connection>> {
         if self.page_codec_id.is_some() && page_codec.is_none() {
             return Err(LimboError::InvalidArgument(
@@ -2389,15 +2497,41 @@ impl Database {
             .unwrap_or_default()
             .get();
 
-        self._connect_with_pager_and_default_cache_size(
+        let conn = self.new_connection(
             is_mvcc_bootstrap_connection,
             pager,
             encryption_key,
             default_cache_size,
-        )
+        )?;
+        if stats == StatsRefresh::Blocking {
+            refresh_analyze_stats(&conn);
+        }
+        Ok(conn)
     }
 
+    /// Create a connection and run the blocking connect-time stats refresh.
+    /// Hosts that schedule connections cooperatively must use
+    /// [`Self::connect_async`] instead; see its docs.
     pub(crate) fn _connect_with_pager_and_default_cache_size(
+        self: &Arc<Database>,
+        is_mvcc_bootstrap_connection: bool,
+        pager: Arc<Pager>,
+        encryption_key: Option<EncryptionKey>,
+        default_cache_size: i32,
+    ) -> Result<Arc<Connection>> {
+        let conn = self.new_connection(
+            is_mvcc_bootstrap_connection,
+            pager,
+            encryption_key,
+            default_cache_size,
+        )?;
+        refresh_analyze_stats(&conn);
+        Ok(conn)
+    }
+
+    /// Build the `Connection` object. Does not touch the database: the
+    /// ANALYZE stats refresh is the caller's job, blocking or not.
+    fn new_connection(
         self: &Arc<Database>,
         is_mvcc_bootstrap_connection: bool,
         pager: Arc<Pager>,
@@ -2491,7 +2625,6 @@ impl Database {
         let builtin_syms = self.builtin_syms.read();
         // add built-in extensions symbols to the connection to prevent having to load each time
         conn.syms.write().extend(&builtin_syms);
-        refresh_analyze_stats(&conn);
         Ok(conn)
     }
 

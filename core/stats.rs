@@ -4,7 +4,6 @@ use rustc_hash::FxHashMap as HashMap;
 
 use crate::alloc::TursoVecExt;
 use crate::schema::Schema;
-use crate::translate::emitter::TransactionMode;
 use crate::types::IOResult;
 use crate::util::normalize_ident;
 use crate::{Connection, Result, Statement, TransactionState, Value};
@@ -89,41 +88,37 @@ impl AnalyzeStats {
     }
 }
 
-/// Read sqlite_stat1 contents into an AnalyzeStats map without mutating schema.
+/// Best-effort refresh of the connection's in-memory ANALYZE stats.
 ///
-/// Only regular B-tree tables and indexes are considered. Virtual and ephemeral
-/// tables are ignored.
-pub fn gather_sqlite_stat1(
-    conn: &Arc<Connection>,
-    schema: &Schema,
-    mv_tx: Option<(u64, TransactionMode)>,
-) -> Result<AnalyzeStats> {
-    let mut stats = AnalyzeStats::default();
-    let mut stmt = conn.prepare(STATS_QUERY)?;
-    stmt.set_mv_tx(mv_tx);
-    load_sqlite_stat1_from_stmt(stmt, schema, &mut stats)?;
-    Ok(stats)
-}
-
-/// Best-effort refresh analyze_stats on the connection's schema.
+/// Blocking form of [`refresh_analyze_stats_nonblock`]: the same state machine,
+/// driven to completion here by pumping IO. That is only correct when whatever
+/// the `sqlite_stat1` scan waits for can make progress without the caller's
+/// help (real I/O, or another thread). A host that schedules connections
+/// cooperatively on one thread must drive the non-blocking variant itself,
+/// because an explicit yield is a request to run *other* connections, which
+/// `io.step()` never does; see `Database::connect_async`.
 pub fn refresh_analyze_stats(conn: &Arc<Connection>) {
-    if !conn.is_db_initialized() || conn.is_nested_stmt() {
-        return;
-    }
-    if matches!(conn.get_tx_state(), TransactionState::Write { .. }) {
-        return;
-    }
-
-    // Need a snapshot of the current schema to validate tables/indexes.
-    let schema_snapshot = { conn.schema.read().clone() };
-    if schema_snapshot.get_btree_table(STATS_TABLE).is_none() {
-        return;
-    }
-
-    let mv_tx = conn.get_mv_tx();
-    if let Ok(stats) = gather_sqlite_stat1(conn, &schema_snapshot, mv_tx) {
-        if let Err(e) = install_analyze_stats(conn, stats) {
+    let io = conn.db.io.clone();
+    let mut state = RefreshAnalyzeStatsState::default();
+    loop {
+        let pending = match refresh_analyze_stats_nonblock(conn, &mut state) {
+            Ok(IOResult::Done(())) => return,
+            Ok(IOResult::IO(pending)) => pending,
+            Err(e) => {
+                tracing::warn!("Failed to refresh analyze stats: {e}");
+                return;
+            }
+        };
+        // An explicit yield carries nothing to wait for; give the IO one turn,
+        // as the blocking runner always did, and step the scan again.
+        let advanced = if pending.is_explicit_yield() {
+            io.step()
+        } else {
+            pending.wait(io.as_ref())
+        };
+        if let Err(e) = advanced {
             tracing::warn!("Failed to refresh analyze stats: {e}");
+            return;
         }
     }
 }
@@ -292,15 +287,6 @@ fn load_sqlite_stat1_row(
             table_stats.row_count = Some(total_rows);
         }
     }
-    Ok(())
-}
-
-fn load_sqlite_stat1_from_stmt(
-    mut stmt: Statement,
-    schema: &Schema,
-    stats: &mut AnalyzeStats,
-) -> Result<()> {
-    stmt.run_with_row_callback(|row| load_sqlite_stat1_row(row, schema, stats))?;
     Ok(())
 }
 

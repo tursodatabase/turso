@@ -22680,3 +22680,172 @@ mod group_commit_tests;
 
 #[path = "group_commit_sync_mode_tests.rs"]
 mod group_commit_sync_mode_tests;
+
+/// Drive a statement until it yields or finishes; IO is pumped, an explicit
+/// yield is handed back so the test can observe it.
+fn step_until_yield_or_done_pumping_io(
+    stmt: &mut crate::Statement,
+    io: &dyn IO,
+) -> crate::StepResult {
+    for _ in 0..100_000 {
+        match stmt.step().unwrap() {
+            crate::StepResult::IO => {
+                if let Some(pending) = stmt.take_io_completions() {
+                    pending.wait(io).unwrap();
+                }
+            }
+            other => return other,
+        }
+    }
+    panic!("statement kept returning IO")
+}
+
+/// Regression test for a host that schedules every connection cooperatively
+/// on one thread (turso-server). `Database::connect` runs the connect-time
+/// ANALYZE stats refresh through a blocking loop that pumps `io.step()`. When
+/// that refresh's `sqlite_stat1` scan speculatively read a version written by
+/// a transaction still in `Preparing`, its own end-of-statement commit waited
+/// for that writer with an explicit yield, and `io.step()` can never let the
+/// writer run, so `connect` spun forever. `connect_async` must hand that wait
+/// to the caller instead and finish once the writer commits.
+#[test]
+fn connect_async_yields_instead_of_spinning_on_preparing_commit_dependency() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let database = db.get_db();
+    let writer = db.connect();
+    writer
+        .execute("CREATE TABLE t1 (x INTEGER PRIMARY KEY, y)")
+        .unwrap();
+    writer
+        .execute("CREATE TABLE t2 (x INTEGER PRIMARY KEY, y)")
+        .unwrap();
+    writer
+        .execute("INSERT INTO t1 VALUES (1, 1), (2, 2)")
+        .unwrap();
+    writer
+        .execute("INSERT INTO t2 VALUES (1, 1), (2, 2)")
+        .unwrap();
+    // Populate sqlite_stat1 so the connect-time refresh has rows to scan.
+    writer.execute("ANALYZE").unwrap();
+
+    // Park a second ANALYZE inside its commit: its new sqlite_stat1 versions
+    // stay in `Preparing` until the statement is stepped again.
+    writer.set_yield_injector(Some(FixedYieldInjector::new([
+        CommitYieldPoint::LogicalLogOwned.point(),
+    ])));
+    let mut parked = writer.prepare("ANALYZE t2").unwrap();
+    assert!(
+        matches!(
+            step_until_yield_or_done_pumping_io(&mut parked, database.io.as_ref()),
+            crate::StepResult::Yield
+        ),
+        "ANALYZE t2 should park inside its commit"
+    );
+    writer.set_yield_injector(None);
+
+    // While the writer is parked, connect_async must keep handing the wait
+    // back instead of completing or spinning. (`connect()` never returns here.)
+    let mut state = crate::ConnectAsyncState::new();
+    let mut yielded = false;
+    for _ in 0..1_000 {
+        match database.connect_async(&mut state).unwrap() {
+            crate::IOResult::Done(_) => panic!(
+                "connect must not complete while the commit its stats scan depends on is parked"
+            ),
+            crate::IOResult::IO(io) => {
+                yielded |= io.is_explicit_yield();
+                io.wait(database.io.as_ref()).unwrap();
+            }
+        }
+    }
+    assert!(
+        yielded,
+        "the commit-dependency wait should surface as an explicit yield"
+    );
+
+    // Let the parked commit finish. The dependency resolves and the same
+    // connect state runs to completion with fresh stats.
+    loop {
+        match parked.step().unwrap() {
+            crate::StepResult::Done => break,
+            crate::StepResult::IO | crate::StepResult::Yield => {
+                if let Some(io) = parked.take_io_completions() {
+                    io.wait(database.io.as_ref()).unwrap();
+                }
+            }
+            other => panic!("unexpected step result finishing ANALYZE: {other:?}"),
+        }
+    }
+    let conn = loop {
+        match database.connect_async(&mut state).unwrap() {
+            crate::IOResult::Done(conn) => break conn,
+            crate::IOResult::IO(io) => io.wait(database.io.as_ref()).unwrap(),
+        }
+    };
+    let schema = conn.schema.read();
+    assert!(
+        schema.analyze_stats.table_stats("t1").is_some()
+            && schema.analyze_stats.table_stats("t2").is_some(),
+        "connect_async should load the committed ANALYZE stats: {:?}",
+        schema.analyze_stats
+    );
+}
+
+/// Abandoning a connect whose stats refresh is parked on another transaction
+/// must not block: the state drops its half-built connection and the nested
+/// `sqlite_stat1` statement, whose reset only rolls a read transaction back.
+#[test]
+fn dropping_connect_async_state_mid_wait_does_not_block() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let database = db.get_db();
+    let writer = db.connect();
+    writer
+        .execute("CREATE TABLE t1 (x INTEGER PRIMARY KEY, y)")
+        .unwrap();
+    writer
+        .execute("INSERT INTO t1 VALUES (1, 1), (2, 2)")
+        .unwrap();
+    writer.execute("ANALYZE").unwrap();
+
+    writer.set_yield_injector(Some(FixedYieldInjector::new([
+        CommitYieldPoint::LogicalLogOwned.point(),
+    ])));
+    let mut parked = writer.prepare("ANALYZE t1").unwrap();
+    assert!(matches!(
+        step_until_yield_or_done_pumping_io(&mut parked, database.io.as_ref()),
+        crate::StepResult::Yield
+    ));
+    writer.set_yield_injector(None);
+
+    let mut state = crate::ConnectAsyncState::new();
+    let mut yielded = false;
+    for _ in 0..100 {
+        match database.connect_async(&mut state).unwrap() {
+            crate::IOResult::Done(_) => panic!("connect must wait for the parked commit"),
+            crate::IOResult::IO(io) => {
+                yielded |= io.is_explicit_yield();
+                io.wait(database.io.as_ref()).unwrap();
+            }
+        }
+    }
+    assert!(yielded);
+    // The abandonment under test. If it blocked, this test would hang.
+    drop(state);
+
+    loop {
+        match parked.step().unwrap() {
+            crate::StepResult::Done => break,
+            crate::StepResult::IO | crate::StepResult::Yield => {
+                if let Some(io) = parked.take_io_completions() {
+                    io.wait(database.io.as_ref()).unwrap();
+                }
+            }
+            other => panic!("unexpected step result finishing ANALYZE: {other:?}"),
+        }
+    }
+    let conn = writer;
+    drop(conn);
+    // A fresh blocking connect works once nothing is parked.
+    let conn = db.connect();
+    assert!(conn.schema.read().analyze_stats.table_stats("t1").is_some());
+}
