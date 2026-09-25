@@ -63,3 +63,17 @@ test ceil-text-i64-max-stays-integer {
 expect {
     9223372036854775807|integer
 }
+
+test cast-real-exponent-limit {
+    SELECT CAST('.' || hex(zeroblob(350)) || '1e10000' AS REAL) = 9e999;
+}
+expect {
+    1
+}
+
+test cast-real-rounding-near-u64-max {
+    SELECT CAST('18446744073709551613E-298' AS REAL) = 1.8446744073709554e-279;
+}
+expect {
+    1
+}
