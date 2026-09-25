@@ -296,8 +296,8 @@ pub fn prepare_delete_plan(
 }
 
 /// Returns true if any FK referencing `table_name` (transitively, following CASCADE chains)
-/// has triggers on the child table side, which could write back to `table_name` and
-/// invalidate a live DELETE scan iterator.
+/// has triggers on the child table side, or leads back to `table_name` itself. Either can
+/// write back to `table_name` and invalidate a live DELETE scan iterator.
 fn table_has_fk_cascade_triggers(
     resolver: &crate::translate::emitter::Resolver,
     database_id: usize,
@@ -329,6 +329,9 @@ fn table_has_fk_cascade_triggers(
         for fk_ref in referencing_fks {
             if matches!(fk_ref.fk.on_delete, RefAct::NoAction | RefAct::Restrict) {
                 continue;
+            }
+            if fk_ref.child_table.name.eq_ignore_ascii_case(table_name) {
+                return Ok(true);
             }
             let child_name = fk_ref.child_table.name.as_str();
             let has_triggers = resolver.with_schema(database_id, |s| {
