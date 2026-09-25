@@ -14287,10 +14287,11 @@ fn op_clear_btree_inner(
     loop {
         match state.active_op_state.clear_btree() {
             OpClearBtreeState::CreateCursor => {
-                let cursor = BTreeCursor::new(clear_pager.clone(), *root, 0);
+                let cursor = Arc::new(RwLock::new(BTreeCursor::new(clear_pager.clone(), *root, 0)));
+                cursor.read().register_with_pager();
                 *state.active_op_state.clear_btree() = OpClearBtreeState::ClearBtree {
                     pager: clear_pager.clone(),
-                    cursor: Arc::new(RwLock::new(cursor)),
+                    cursor,
                 };
             }
             OpClearBtreeState::ClearBtree { pager, cursor } => {

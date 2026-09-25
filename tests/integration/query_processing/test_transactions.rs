@@ -310,6 +310,45 @@ fn test_delete_all_keeps_existing_reader_snapshots(tmp_db: TempDatabase) {
 }
 
 #[turso_macros::test]
+fn test_delete_all_while_same_connection_scans_table(tmp_db: TempDatabase) {
+    let conn = tmp_db.connect_limbo();
+    conn.execute("CREATE TABLE t1(a, b)").unwrap();
+    conn.execute("CREATE TABLE t2(c, d)").unwrap();
+    conn.execute("INSERT INTO t1 VALUES(1, 2)").unwrap();
+    conn.execute("INSERT INTO t2 VALUES(3, 4), (5, 6)").unwrap();
+
+    let mut scan = conn
+        .prepare("SELECT CASE WHEN c = 5 THEN b ELSE NULL END AS b, c, d FROM t1, t2")
+        .unwrap();
+    let mut rows = Vec::new();
+    loop {
+        match scan.step().unwrap() {
+            StepResult::Row => {
+                conn.execute("DELETE FROM t1").unwrap();
+                rows.push(
+                    scan.row()
+                        .unwrap()
+                        .get_values()
+                        .cloned()
+                        .collect::<Vec<_>>(),
+                );
+            }
+            StepResult::IO | StepResult::Yield => tmp_db.io.step().unwrap(),
+            StepResult::Done => break,
+            other => panic!("scan failed after whole-table DELETE: {other:?}"),
+        }
+    }
+
+    assert_eq!(
+        rows,
+        vec![
+            vec![Value::Null, Value::from_i64(3), Value::from_i64(4)],
+            vec![Value::Null, Value::from_i64(5), Value::from_i64(6)],
+        ]
+    );
+}
+
+#[turso_macros::test]
 /// A constraint error does not rollback the transaction, it rolls back the statement.
 fn test_constraint_error_aborts_only_stmt_not_entire_transaction(tmp_db: TempDatabase) {
     let conn = tmp_db.connect_limbo();
