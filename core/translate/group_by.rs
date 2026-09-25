@@ -756,12 +756,21 @@ pub fn group_by_process_single_group(
             let cache_len = t_ctx.resolver.expr_to_reg_cache.len();
             let cache_was_enabled = t_ctx.resolver.expr_to_reg_cache_enabled;
             for (i, leaf_expr) in t_ctx.agg_leaf_columns.drain(..).enumerate() {
-                t_ctx.resolver.cache_expr_reg(
-                    std::borrow::Cow::Owned(leaf_expr),
-                    leaf_regs + i,
-                    false,
-                    None,
-                );
+                if matches!(leaf_expr, ast::Expr::Column { .. }) {
+                    t_ctx.resolver.cache_scalar_expr_reg(
+                        std::borrow::Cow::Owned(leaf_expr),
+                        leaf_regs + i,
+                        false,
+                        &plan.table_references,
+                    )?;
+                } else {
+                    t_ctx.resolver.cache_expr_reg(
+                        std::borrow::Cow::Owned(leaf_expr),
+                        leaf_regs + i,
+                        false,
+                        None,
+                    );
+                }
             }
             t_ctx.resolver.enable_expr_to_reg_cache();
 
