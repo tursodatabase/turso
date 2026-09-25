@@ -30,6 +30,7 @@ mod storage;
 mod suspended_statement_checkpoint;
 mod trigger;
 mod unreliable_io;
+mod update_failure_in_tx_rollback;
 mod views;
 mod wal;
 
