@@ -375,16 +375,16 @@ fn step_until_yield_or_done(stmt: &mut crate::Statement) -> StepResult {
 }
 
 #[test]
-fn dropped_commit_after_log_record_is_owned_still_commits() {
-    dropped_after_own_still_commits(true);
+fn dropped_commit_after_log_record_is_written_still_commits() {
+    dropped_after_log_record_written_still_commits(true);
 }
 
 #[test]
-fn dropped_commit_after_log_record_is_owned_still_commits_without_group() {
-    dropped_after_own_still_commits(false);
+fn dropped_commit_after_log_record_is_written_still_commits_without_group() {
+    dropped_after_log_record_written_still_commits(false);
 }
 
-fn dropped_after_own_still_commits(group_commit: bool) {
+fn dropped_after_log_record_written_still_commits(group_commit: bool) {
     let db = MvccTestDbNoConn::new_with_random_db();
     let conn = db.connect();
     conn.execute("CREATE TABLE t (pk INTEGER PRIMARY KEY, v INTEGER)")
@@ -396,7 +396,7 @@ fn dropped_after_own_still_commits(group_commit: bool) {
     conn.execute("BEGIN CONCURRENT").unwrap();
     conn.execute("INSERT INTO t VALUES (1, 1)").unwrap();
     conn.set_yield_injector(Some(FixedYieldInjector::new([
-        CommitYieldPoint::LogicalLogOwned.point(),
+        CommitYieldPoint::LogRecordMarkedWritten.point(),
     ])));
 
     {

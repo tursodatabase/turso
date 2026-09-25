@@ -20347,7 +20347,7 @@ fn abandoned_committed_writer_notifies_dependents() {
 
             if n_rows == 1 {
                 writer.set_yield_injector(Some(FixedYieldInjector::new([
-                    CommitYieldPoint::LogicalLogOwned.point(),
+                    CommitYieldPoint::LogRecordMarkedWritten.point(),
                 ])));
             }
             for _ in 0..100 {
