@@ -39,10 +39,11 @@ fn validate_delete(
     }
     let table = match resolver.with_schema(database_id, |s| s.get_table(tbl_name)) {
         Some(table) => table,
-        None => crate::bail_parse_error!(
-            "no such table: {}",
-            crate::util::table_name_for_error(qualified_name)
-        ),
+        None => {
+            return Err(
+                resolver.with_schema(database_id, |s| s.table_not_found_error(qualified_name))
+            )
+        }
     };
     if program.trigger.is_some() && table.virtual_table().is_some() {
         crate::bail_parse_error!("unsafe use of virtual table \"{}\"", tbl_name);

@@ -29,6 +29,7 @@ mod stmt_readonly;
 mod storage;
 mod suspended_statement_checkpoint;
 mod trigger;
+mod unknown_vtab_module_schema;
 mod unreliable_io;
 mod views;
 mod wal;

@@ -752,6 +752,11 @@ pub struct Schema {
     /// tracking the names lets DROP VIEW remove them.
     pub broken_views: HashSet<String>,
 
+    /// Virtual tables in sqlite_schema whose module is not loaded, mapped
+    /// from table name to module name. The rest of the schema still loads;
+    /// statements that use these tables fail with "no such module".
+    pub vtabs_without_module: HashMap<String, String>,
+
     /// Root pages of tables/indexes that have been dropped but not yet checkpointed.
     /// In MVCC mode, when a table is dropped, the btree pages are not freed until checkpoint.
     /// integrity_check needs to know about these pages to avoid false positives about "page never used".
@@ -901,6 +906,7 @@ impl Schema {
             table_to_materialized_views,
             incompatible_views,
             broken_views: HashSet::default(),
+            vtabs_without_module: HashMap::default(),
             dropped_root_pages: HashSet::default(),
             type_registry,
             generated_columns_enabled: false,
@@ -1358,6 +1364,19 @@ impl Schema {
     pub fn get_table(&self, name: &str) -> Option<Arc<Table>> {
         let name = self.normalize_table_lookup_name(name);
         self.tables.get(&name).cloned()
+    }
+
+    /// Error for a table name that `get_table` did not find. A virtual table
+    /// whose module is not loaded reports the missing module, like SQLite.
+    pub fn table_not_found_error(&self, name: &ast::QualifiedName) -> LimboError {
+        let normalized_name = self.normalize_table_lookup_name(name.name.as_str());
+        match self.vtabs_without_module.get(&normalized_name) {
+            Some(module_name) => LimboError::ParseError(format!("no such module: {module_name}")),
+            None => LimboError::ParseError(format!(
+                "no such table: {}",
+                crate::util::table_name_for_error(name)
+            )),
+        }
     }
 
     #[cfg(feature = "conn_raw_api")]
@@ -2102,6 +2121,14 @@ impl Schema {
                         vtab.clone()
                     } else {
                         let mod_name = module_name_from_sql(sql)?;
+                        if !syms.vtab_modules.contains_key(mod_name) {
+                            tracing::warn!(
+                                "virtual table '{name}' uses module '{mod_name}', which is not loaded"
+                            );
+                            self.vtabs_without_module
+                                .insert(normalize_ident(name), mod_name.to_string());
+                            return Ok(());
+                        }
                         crate::VirtualTable::table(
                             Some(name),
                             mod_name,
@@ -2109,6 +2136,7 @@ impl Schema {
                             syms,
                         )?
                     };
+                    self.vtabs_without_module.remove(&normalize_ident(name));
                     self.add_virtual_table(vtab)?;
                 } else {
                     let table = dialect.parse_table_sql(sql, root_page)?;
@@ -2594,7 +2622,9 @@ impl Schema {
     pub fn get_object_type(&self, name: &str) -> Option<SchemaObjectType> {
         let normalized_name = self.normalize_table_lookup_name(name);
 
-        if self.tables.contains_key(&normalized_name) {
+        if self.tables.contains_key(&normalized_name)
+            || self.vtabs_without_module.contains_key(&normalized_name)
+        {
             return Some(SchemaObjectType::Table);
         }
 
@@ -2830,6 +2860,7 @@ impl TryClone for Schema {
             table_to_materialized_views: self.table_to_materialized_views.try_clone()?,
             incompatible_views,
             broken_views: self.broken_views.try_clone()?,
+            vtabs_without_module: self.vtabs_without_module.try_clone()?,
             dropped_root_pages: self.dropped_root_pages.try_clone()?,
             type_registry: self.type_registry.try_clone()?,
             generated_columns_enabled: self.generated_columns_enabled,
@@ -7246,9 +7277,6 @@ mod tests {
     fn test_schema_row_with_zero_root_page_takes_virtual_table_path() {
         let mut schema = Schema::new();
 
-        // Root page 0 must route to virtual-table handling; with no such
-        // module registered, that path fails module resolution instead of
-        // creating a B-tree table with an invalid root page.
         let result = schema.handle_schema_row(
             "table",
             "v1",
@@ -7264,8 +7292,12 @@ mod tests {
             &|_| None,
             &crate::dialect::SqliteDialect,
         );
-        assert!(result.is_err());
+        result.unwrap();
         assert!(schema.get_table("v1").is_none());
+        assert_eq!(
+            schema.vtabs_without_module.get("v1").map(String::as_str),
+            Some("nosuchmodule")
+        );
     }
 
     #[test]

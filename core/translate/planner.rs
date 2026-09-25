@@ -2035,10 +2035,9 @@ fn parse_table(
         );
     }
 
-    crate::bail_parse_error!(
-        "no such table: {}",
-        crate::util::table_name_for_error(qualified_name)
-    );
+    Err(resolver.with_schema(database_id, |schema| {
+        schema.table_not_found_error(qualified_name)
+    }))
 }
 
 fn transform_args_into_where_terms(
