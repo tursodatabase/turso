@@ -575,6 +575,7 @@ pub enum CursorContextKey {
 pub struct CursorContext {
     pub key: CursorContextKey,
     pub seek_op: SeekOp,
+    pub skip_advance: bool,
 }
 
 impl CursorContext {
@@ -591,6 +592,7 @@ impl CursorContext {
         Self {
             key,
             seek_op: SeekOp::GE { eq_only: true },
+            skip_advance: false,
         }
     }
 }
@@ -6476,6 +6478,7 @@ impl BTreeCursor {
             IOResult::Done(res) => {
                 match res {
                     SeekResult::Found => {
+                        self.skip_advance = ctx.skip_advance;
                         self.valid_state = CursorValidState::Valid;
                         Ok(IOResult::Done(()))
                     }
@@ -6995,6 +6998,7 @@ impl CursorTrait for BTreeCursor {
                                 ImmutableRecordRef::from_owned_record(record),
                             ),
                             seek_op: SeekOp::GE { eq_only: true },
+                            skip_advance: false,
                         }
                     } else {
                         let Some(rowid) = return_if_io!(self.rowid()) else {
@@ -7003,6 +7007,7 @@ impl CursorTrait for BTreeCursor {
                         CursorContext {
                             key: CursorContextKey::TableRowId(rowid),
                             seek_op: SeekOp::GE { eq_only: true },
+                            skip_advance: false,
                         }
                     };
 
@@ -7710,6 +7715,7 @@ impl CursorTrait for BTreeCursor {
             self.save_context(CursorContext {
                 key: CursorContextKey::TableRowId(rowid),
                 seek_op: SeekOp::GE { eq_only: true },
+                skip_advance: self.skip_advance,
             });
             return Ok(IOResult::Done(SavePositionResult::Saved));
         }
@@ -7733,6 +7739,7 @@ impl CursorTrait for BTreeCursor {
         self.save_context(CursorContext {
             key: CursorContextKey::IndexKeyRowId(ImmutableRecordRef::from_owned_record(cloned)),
             seek_op: SeekOp::GE { eq_only: true },
+            skip_advance: self.skip_advance,
         });
         Ok(IOResult::Done(SavePositionResult::Saved))
     }
