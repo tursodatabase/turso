@@ -5411,43 +5411,16 @@ pub fn op_auto_commit(
         insn
     );
 
+    if !matches!(state.commit_state, CommitState::Ready) {
+        return finish_auto_commit(program, state, pager, *rollback);
+    }
+
     // Main DB's MvStore drives the commit/rollback routing.  The attach-time
     // journal-mode compatibility check ensures all attached DBs match, so
     // checking the main DB is sufficient to choose the MVCC vs WAL path.
     let mv_store = program.connection.mv_store();
     let conn = program.connection.clone();
-    let fk_on = conn.foreign_keys_enabled();
     let had_autocommit = conn.auto_commit.load(Ordering::SeqCst); // true, not in tx
-
-    // Drive any multi-step commit/rollback that's already in progress.
-    // This handles main DB commits (Committing), attached DB commits
-    // (CommittingAttached), MVCC commits (CommittingMvcc), and attached
-    // MVCC commits (CommittingAttachedMvcc) that yielded on IO and need re-entry.
-    if !matches!(state.commit_state, CommitState::Ready) {
-        let res = program.commit_txn(pager.clone(), state, mv_store.as_ref(), *rollback);
-        let res = state.done_or_suspend(res);
-        // Only clear after a final, successful non-rollback COMMIT.
-        if fk_on
-            && !*rollback
-            && matches!(
-                res,
-                Ok(InsnFunctionStepResult::Step | InsnFunctionStepResult::Done)
-            )
-        {
-            conn.clear_deferred_foreign_key_violations();
-        }
-        if matches!(
-            res,
-            Ok(InsnFunctionStepResult::Step | InsnFunctionStepResult::Done)
-        ) {
-            if !*rollback {
-                conn.index_methods_on_transaction_committed();
-            }
-            conn.clear_tx_poison();
-            conn.clear_named_savepoints();
-        }
-        return res;
-    }
 
     if program.is_trigger_subprogram() {
         // Trigger subprograms never commit or rollback.
@@ -5599,10 +5572,22 @@ pub fn op_auto_commit(
     // an IO yield would then fail `valid_transition` with a torn-down
     // transaction.
 
-    let res = match program.commit_txn(pager.clone(), state, mv_store.as_ref(), *rollback)? {
-        IOResult::Done(_) => InsnFunctionStepResult::Done,
-        IOResult::IO(io) => return Ok(state.suspend_on_io(io)),
-    };
+    finish_auto_commit(program, state, pager, *rollback)
+}
+
+fn finish_auto_commit(
+    program: &Program,
+    state: &mut ProgramState,
+    pager: &Arc<Pager>,
+    rollback: bool,
+) -> InsnResult {
+    let conn = &program.connection;
+    let mv_store = conn.mv_store();
+    if let IOResult::IO(io) =
+        program.commit_txn(pager.clone(), state, mv_store.as_ref(), rollback)?
+    {
+        return Ok(state.suspend_on_io(io));
+    }
 
     if mv_store.is_none() {
         pager.clear_savepoints()?;
@@ -5621,19 +5606,19 @@ pub fn op_auto_commit(
     }
 
     // Clear deferred FK counters only after FINAL success of COMMIT/ROLLBACK.
-    if fk_on {
+    if conn.foreign_keys_enabled() {
         conn.clear_deferred_foreign_key_violations();
     }
 
     // Reset CDC transaction ID after successful COMMIT or ROLLBACK.
     conn.set_cdc_transaction_id(-1);
-    if matches!(tx_op, TxOp::Commit) {
+    if !rollback {
         conn.index_methods_on_transaction_committed();
     }
     conn.clear_tx_poison();
     conn.clear_named_savepoints();
 
-    Ok(res)
+    Ok(InsnFunctionStepResult::Done)
 }
 
 pub fn op_savepoint(
