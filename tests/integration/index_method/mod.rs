@@ -4167,6 +4167,70 @@ fn fts_mvcc_repeated_reads_reuse_the_cached_searcher() {
     );
 }
 
+#[cfg(all(feature = "fts", feature = "test_helper", not(target_family = "wasm")))]
+#[test]
+fn fts_cached_searcher_reuses_segments_evicted_from_byte_cache() {
+    use turso_core::index_method::fts::set_fts_retained_cache_bytes_for_test;
+
+    struct ResetCacheBudget;
+    impl Drop for ResetCacheBudget {
+        fn drop(&mut self) {
+            set_fts_retained_cache_bytes_for_test(None);
+        }
+    }
+    let _reset = ResetCacheBudget;
+    set_fts_retained_cache_bytes_for_test(Some(1));
+
+    for mvcc in [false, true] {
+        let tmp_db = TempDatabase::builder()
+            .with_opts(turso_core::DatabaseOpts::new().with_index_method(true))
+            .with_mvcc(mvcc)
+            .build();
+        let conn = tmp_db.connect_limbo();
+        conn.execute("CREATE TABLE docs(id INTEGER PRIMARY KEY, body TEXT)")
+            .unwrap();
+        conn.execute("CREATE INDEX docs_fts ON docs USING fts(body)")
+            .unwrap();
+        for id in [1, 3, 7] {
+            conn.execute(format!("INSERT INTO docs VALUES ({id}, 'cached document')"))
+                .unwrap();
+        }
+
+        let query = "SELECT id FROM docs WHERE body MATCH 'cached' ORDER BY id";
+        let expected = vec![
+            vec![rusqlite::types::Value::Integer(1)],
+            vec![rusqlite::types::Value::Integer(3)],
+            vec![rusqlite::types::Value::Integer(7)],
+        ];
+        conn.execute("BEGIN").unwrap();
+        assert_eq!(limbo_exec_rows(&conn, query), expected);
+        let before = fts_attachment_test_stats(&tmp_db, &conn, "docs", "docs_fts");
+        assert_eq!(before.segment_count, Some(3));
+        assert!(before.full_snapshot_loads.unwrap() > 0);
+        conn.execute("COMMIT").unwrap();
+
+        conn.execute("BEGIN").unwrap();
+        assert_eq!(limbo_exec_rows(&conn, query), expected);
+        let after = fts_attachment_test_stats(&tmp_db, &conn, "docs", "docs_fts");
+        conn.execute("COMMIT").unwrap();
+        assert_eq!(after.full_snapshot_loads, before.full_snapshot_loads);
+        assert!(after.read_cache_hits.unwrap() >= before.read_cache_hits.unwrap() + 2);
+
+        conn.execute("DELETE FROM docs WHERE id = 3").unwrap();
+        conn.execute("BEGIN").unwrap();
+        assert_eq!(
+            limbo_exec_rows(&conn, query),
+            vec![
+                vec![rusqlite::types::Value::Integer(1)],
+                vec![rusqlite::types::Value::Integer(7)],
+            ]
+        );
+        let after_delete = fts_attachment_test_stats(&tmp_db, &conn, "docs", "docs_fts");
+        conn.execute("COMMIT").unwrap();
+        assert_eq!(after_delete.full_snapshot_loads, after.full_snapshot_loads);
+    }
+}
+
 #[cfg(all(feature = "fts", not(target_family = "wasm")))]
 #[test]
 fn fts_savepoint_rollback_discards_statement_documents() {
