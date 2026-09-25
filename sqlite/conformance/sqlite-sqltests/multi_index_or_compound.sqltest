@@ -644,3 +644,53 @@ snapshot-eqp compound-or-mixed-residual-eqp {
         (l.dst = 'n1' AND l.src = i.id AND ((i.type = 'entity' AND l.label = 'knows') OR l.id = 'e4'))
       );
 }
+
+# Grouping parentheses inside a branch must not hide its constraints. The
+# planner rewrites BETWEEN into two comparisons in place, so a branch written
+# as ((a BETWEEN 2 AND 4) AND a != 3) reaches the multi-index planner as
+# ((a >= 2 AND a <= 4) AND a != 3); the inner group has to be flattened like
+# any other AND, or the branch has no seek and the whole plan is dropped.
+setup paren_branch_schema {
+    CREATE TABLE t2(a INTEGER PRIMARY KEY, b INT, c INT);
+    CREATE INDEX idx_t2_b ON t2(b);
+    CREATE INDEX idx_t2_c ON t2(c);
+
+    INSERT INTO t2 VALUES (1, 10, 100), (2, 20, 200), (3, 30, 300),
+                          (4, 40, 400), (5, 50, 500), (6, 60, 600);
+}
+
+@setup paren_branch_schema
+test compound-or-parenthesized-between-branch {
+    SELECT a FROM t2
+    WHERE b = 60 OR ((a BETWEEN 2 AND 4) AND a != 3)
+    ORDER BY a;
+}
+expect {
+    2
+    4
+    6
+}
+
+@setup paren_branch_schema
+snapshot-eqp compound-or-parenthesized-between-branch-eqp {
+    SELECT a FROM t2
+    WHERE b = 60 OR ((a BETWEEN 2 AND 4) AND a != 3);
+}
+
+@setup paren_branch_schema
+test compound-or-parenthesized-nested-or {
+    SELECT a FROM t2
+    WHERE b = 10 OR (c = 300 OR (b = 50))
+    ORDER BY a;
+}
+expect {
+    1
+    3
+    5
+}
+
+@setup paren_branch_schema
+snapshot-eqp compound-or-parenthesized-nested-or-eqp {
+    SELECT a FROM t2
+    WHERE b = 10 OR (c = 300 OR (b = 50));
+}
