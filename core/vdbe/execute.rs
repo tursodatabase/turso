@@ -12175,51 +12175,13 @@ pub fn op_function(
         }
         #[cfg(all(feature = "fts", not(target_family = "wasm")))]
         crate::function::Func::Fts(fts_func) => {
-            // FTS functions are typically handled via index method pattern matching.
-            // If we reach here, just return a fallback since no FTS index matched.
             use crate::function::FtsFunc;
             match fts_func {
-                FtsFunc::Score => {
-                    // Without an FTS index match, return 0.0 as a default score
-                    state.registers[*dest]
-                        .set_float(NonNan::new(0.0).expect("0.0 is a valid NonNan"));
-                }
-                FtsFunc::Match => {
-                    // fts_match(col1, col2, ..., query): returns 1 if any column matches query
-                    // Minimum: fts_match(text, query) = 2 args
-                    if arg_count < 2 {
-                        return Err(LimboError::InvalidArgument(
-                            "fts_match requires at least 2 arguments: text, query".to_string(),
-                        )
-                        .into());
-                    }
-
-                    // Last arg is the query, first N-1 args are text columns
-                    let num_text_cols = arg_count - 1;
-                    let query = state.registers[*start_reg + num_text_cols].get_value();
-
-                    if matches!(query, Value::Null) {
-                        state.registers[*dest].set_int(0);
-                    } else {
-                        let query_str = query.to_string();
-
-                        // Concatenate all text columns with space separator
-                        let est_len = 16;
-                        let mut combined_text = String::with_capacity(num_text_cols * est_len);
-                        for i in 0..num_text_cols {
-                            let text = state.registers[*start_reg + i].get_value();
-                            if !matches!(text, Value::Null) {
-                                if !combined_text.is_empty() {
-                                    combined_text.push(' ');
-                                }
-                                combined_text.push_str(&text.to_string());
-                            }
-                        }
-
-                        let matches =
-                            crate::index_method::fts::fts_match(&combined_text, &query_str);
-                        state.registers[*dest].set_int(matches.into());
-                    }
+                FtsFunc::Score | FtsFunc::Match => {
+                    return Err(LimboError::InternalError(
+                        "unplanned FTS function reached execution".to_string(),
+                    )
+                    .into());
                 }
                 FtsFunc::Highlight => {
                     // fts_highlight(col1, col2, ..., before_tag, after_tag, query)

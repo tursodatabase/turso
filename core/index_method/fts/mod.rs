@@ -57,7 +57,7 @@ use tantivy::{
     DocAddress, DocSet, Index, IndexReader, IndexSettings, Searcher, SegmentReader,
     TantivyDocument, Term, TERMINATED,
 };
-use turso_parser::ast::{Select, SortOrder};
+use turso_parser::ast::{self, Select, SortOrder};
 use uncased::UncasedStr;
 
 mod directory;
@@ -285,43 +285,6 @@ pub fn fts_highlight(text: &str, query: &str, before_tag: &str, after_tag: &str)
         }
 
         result
-    })
-}
-
-/// Check if text matches a query by testing for any common terms.
-///
-/// Standalone function that can be used without an FTS index.
-/// It tokenizes both the query and text using Tantivy's default tokenizer,
-/// and returns true if any query terms appear in the text.
-pub fn fts_match(text: &str, query: &str) -> bool {
-    if text.is_empty() || query.is_empty() {
-        return false;
-    }
-
-    FTS_TOKENIZER.with(|tokenizer| {
-        let mut tokenizer = tokenizer.borrow_mut();
-
-        // Extract query terms (lowercased)
-        let query_terms: HashSet<String> = {
-            let mut terms = HashSet::default();
-            let mut query_stream = tokenizer.token_stream(query);
-            while let Some(token) = query_stream.next() {
-                terms.insert(token.text.to_string());
-            }
-            terms
-        };
-        if query_terms.is_empty() {
-            return false;
-        }
-
-        // Tokenize the text and check if any query terms appear
-        let mut text_stream = tokenizer.token_stream(text);
-        while let Some(token) = text_stream.next() {
-            if query_terms.contains(&token.text) {
-                return true;
-            }
-        }
-        false
     })
 }
 
@@ -834,6 +797,32 @@ impl IndexMethodAttachment for FtsIndexAttachment {
     fn init(&self) -> Result<Box<dyn IndexMethodCursor>> {
         Ok(Box::new(FtsCursor::new(self)))
     }
+
+    fn result_column(
+        &self,
+        pattern: &ast::Expr,
+        parameters: &HashMap<i32, ast::Expr>,
+    ) -> Option<Box<ast::Expr>> {
+        let mut result = crate::util::try_substitute_parameters(pattern, parameters)?;
+        let ast::Expr::FunctionCall { name, args, .. } = result.as_mut() else {
+            return Some(result);
+        };
+        if !name.as_str().eq_ignore_ascii_case("fts_score") {
+            return Some(result);
+        }
+        let ast::Expr::Literal(ast::Literal::String(fields)) =
+            parameters.get(&crate::util::FTS_FIELD_PARAMETER)?
+        else {
+            return None;
+        };
+        let mut selected = Vec::new();
+        for field in fields.trim_matches('\'').split(',') {
+            selected.push(args.get(field.parse::<usize>().ok()?)?.clone());
+        }
+        selected.push(args.last()?.clone());
+        *args = selected;
+        Some(result)
+    }
 }
 
 /// Pattern indices for FTS queries
@@ -842,8 +831,8 @@ const FTS_PATTERN_COMBINED_ORDERED_LIMIT: i64 = 1;
 const FTS_PATTERN_COMBINED_ORDERED: i64 = 2;
 const FTS_PATTERN_COMBINED_LIMIT: i64 = 3;
 const FTS_PATTERN_COMBINED: i64 = 4;
-const FTS_PATTERN_MATCH_LIMIT: i64 = 5;
-const FTS_PATTERN_MATCH: i64 = 6;
+pub(crate) const FTS_PATTERN_MATCH_LIMIT: i64 = 5;
+pub(crate) const FTS_PATTERN_MATCH: i64 = 6;
 
 fn bounded_query_limit(limit: Option<i64>, live_docs: u64) -> usize {
     let live_docs = usize::try_from(live_docs).unwrap_or(usize::MAX);
@@ -3078,10 +3067,43 @@ impl IndexMethodCursor for FtsCursor {
             query => query.to_string(),
         };
 
-        let parser = self
-            .cached_parser
-            .as_deref()
-            .expect("parser built with the searcher");
+        let fields = match values.last().map(Register::get_value) {
+            Some(Value::Text(fields)) => fields.as_str(),
+            _ => {
+                return Err(LimboError::InternalError(
+                    "FTS query_start: missing indexed fields".into(),
+                )
+                .into())
+            }
+        };
+        let selected_fields = fields
+            .split(',')
+            .map(|field| {
+                field
+                    .parse::<usize>()
+                    .ok()
+                    .and_then(|i| self.default_fields.get(i).copied())
+                    .ok_or_else(|| {
+                        LimboError::InternalError("FTS query_start: invalid field".into())
+                    })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let parser = if selected_fields.len() == self.default_fields.len() {
+            Arc::clone(
+                self.cached_parser
+                    .as_ref()
+                    .expect("parser built with the searcher"),
+            )
+        } else {
+            let mut parser = tantivy::query::QueryParser::for_index(
+                self.index.as_ref().expect("index built with the searcher"),
+                selected_fields,
+            );
+            for &(field, boost) in &self.field_boosts {
+                parser.set_field_boost(field, boost);
+            }
+            Arc::new(parser)
+        };
 
         // Bound the query string before it reaches Tantivy's recursive
         // parser: a few KiB of nested parentheses would otherwise burn
@@ -3255,9 +3277,16 @@ impl IndexMethodCursor for FtsCursor {
 
     /// Returns the column value for the current result (score or match indicator).
     fn query_column(&mut self, idx: usize) -> IOResultOr<Value> {
-        // Column 0 = score for fts_score, or 1 (true) for fts_match
-        if idx != 0 {
-            return Err(LimboError::InternalError("FTS: only column 0 supported".into()).into());
+        // Column 0 is the score for score queries, or 1 (true) for match queries.
+        // Column 1 is the score for match queries.
+        if idx != 0
+            && !(idx == 1
+                && matches!(
+                    self.current_pattern,
+                    FTS_PATTERN_MATCH | FTS_PATTERN_MATCH_LIMIT
+                ))
+        {
+            return Err(LimboError::InternalError("FTS: column out of bounds".into()).into());
         }
 
         match self.current_pattern {
@@ -3273,8 +3302,15 @@ impl IndexMethodCursor for FtsCursor {
                     )
                     .into());
                 }
-                // For fts_match patterns, return 1 (true) - indicates this row matches
-                Ok(IOResult::Done(Value::from_i64(1)))
+                if idx == 0 {
+                    return Ok(IOResult::Done(Value::from_i64(1)));
+                }
+                let score = if let Some(stream) = &self.streaming_hits {
+                    stream.current.unwrap().0
+                } else {
+                    self.current_hits[self.hit_pos].0
+                };
+                Ok(IOResult::Done(Value::from_f64(score as f64)))
             }
             FTS_PATTERN_SCORE
             | FTS_PATTERN_COMBINED

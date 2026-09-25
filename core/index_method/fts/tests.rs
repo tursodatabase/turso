@@ -81,6 +81,43 @@ fn test_attachment() -> FtsIndexAttachment {
 }
 
 #[test]
+fn score_result_uses_the_fields_selected_by_the_query() {
+    let attachment = test_attachment();
+    let pattern = &attachment.patterns[FTS_PATTERN_COMBINED as usize];
+    let ast::OneSelect::Select { columns, .. } = &pattern.body.select else {
+        panic!("expected a SELECT pattern");
+    };
+    let ast::ResultColumn::Expr(score, _) = &columns[0] else {
+        panic!("expected a score result");
+    };
+    let ast::Expr::FunctionCall { args, .. } = score.as_ref() else {
+        panic!("expected a score function");
+    };
+
+    for (fields, expected_columns) in [("1", &[1][..]), ("0", &[0][..]), ("0,1", &[0, 1][..])] {
+        let parameters = FxHashMap::from_iter([
+            (1, Expr::Literal(Literal::String("'needle'".to_string()))),
+            (
+                crate::util::FTS_FIELD_PARAMETER,
+                Expr::Literal(Literal::String(format!("'{fields}'"))),
+            ),
+        ]);
+        let result = attachment.result_column(score, &parameters).unwrap();
+        let Expr::FunctionCall {
+            args: result_args, ..
+        } = result.as_ref()
+        else {
+            panic!("expected a score function");
+        };
+        assert_eq!(result_args.len(), expected_columns.len() + 1);
+        for (&expected, actual) in expected_columns.iter().zip(result_args) {
+            assert_eq!(actual.as_ref(), args[expected].as_ref());
+        }
+        assert_eq!(result_args.last().unwrap().as_ref(), &parameters[&1]);
+    }
+}
+
+#[test]
 fn indexed_text_is_not_duplicated_in_tantivy_document_store() {
     let attachment = test_attachment();
     for (_, field) in attachment.text_fields {
@@ -674,6 +711,7 @@ fn query_hits(cursor: &mut FtsCursor, pattern: i64, query: &str, limit: i64) -> 
         Register::Value(Value::from_i64(pattern)),
         Register::Value(Value::from_text(query.to_owned())),
         Register::Value(Value::from_i64(limit)),
+        Register::Value(Value::from_text("0,1".to_owned())),
     ];
     let mut hits = Vec::new();
     let mut next = cursor.query_start(&values).unwrap();

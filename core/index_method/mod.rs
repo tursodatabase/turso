@@ -65,6 +65,19 @@ pub struct IndexMethodConfiguration {
 pub trait IndexMethodAttachment: std::fmt::Debug + Send + Sync {
     fn definition<'a>(&'a self) -> IndexMethodDefinition<'a>;
     fn init(&self) -> Result<Box<dyn IndexMethodCursor>>;
+
+    /// Returns the result expression this index provides for the captured query parameters.
+    /// The planner compares it with the requested expression before using an index result
+    /// instead of evaluating the function. Return None if the index cannot provide it.
+    /// By default, this only replaces pattern placeholders; FTS also limits scores to
+    /// the fields selected by the search query.
+    fn result_column(
+        &self,
+        pattern: &ast::Expr,
+        parameters: &HashMap<i32, ast::Expr>,
+    ) -> Option<Box<ast::Expr>> {
+        crate::util::try_substitute_parameters(pattern, parameters)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
