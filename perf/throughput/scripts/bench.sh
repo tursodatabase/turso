@@ -35,6 +35,14 @@ BATCH_SIZE=${BATCH_SIZE:-100}
 CHECKPOINTER=${CHECKPOINTER:-1000}
 DURATION=${DURATION:-30}
 WARMUP=${WARMUP:-3}
+# off makes every Turso transaction write and sync the logical log on its
+# own instead of sharing a sync with the transactions committing next to it.
+GROUP_COMMIT=${GROUP_COMMIT:-on}
+case "$GROUP_COMMIT" in
+  on) GROUP_COMMIT_FLAG="" ;;
+  off) GROUP_COMMIT_FLAG="--no-group-commit" ;;
+  *) echo "GROUP_COMMIT must be on or off" >&2; exit 1 ;;
+esac
 
 mkdir -p "$OUT" "$DB_DIR"
 MOUNT="$(df --output=target "$DB_DIR" | tail -1)"
@@ -48,7 +56,7 @@ PARENT="$(lsblk -no PKNAME "$DEVICE" 2>/dev/null | head -1)"
 DISK="$(lsblk -dno MODEL "/dev/${PARENT:-$(basename "$DEVICE")}" 2>/dev/null | sed 's/ *$//')"
 FSTYPE="$(df --output=fstype "$DB_DIR" | tail -1)"
 echo "=== $(date) platform: $CPU, $(nproc) hardware threads, Linux $(uname -r), disk ${DISK:-unknown} ($FSTYPE on $DEVICE)" >> "$LOG"
-echo "=== connections \"$CONNS\" repeats $REPEATS idle $IDLE duration $DURATION warmup $WARMUP batch $BATCH_SIZE checkpointer $CHECKPOINTER db $DB_DIR" >> "$LOG"
+echo "=== connections \"$CONNS\" repeats $REPEATS idle $IDLE duration $DURATION warmup $WARMUP batch $BATCH_SIZE checkpointer $CHECKPOINTER group commit $GROUP_COMMIT db $DB_DIR" >> "$LOG"
 
 for run in $(seq 1 "$REPEATS"); do
   if [ $((run % 2)) -eq 1 ]; then
@@ -68,7 +76,7 @@ for run in $(seq 1 "$REPEATS"); do
       { "$BIN" --engine "$engine" --connections "$conns" \
             --batch-size "$BATCH_SIZE" --checkpointer "$CHECKPOINTER" \
             --duration "$DURATION" --warmup "$WARMUP" --run "$run" \
-            --db-dir "$DB_DIR" --out-dir "$OUT"
+            --db-dir "$DB_DIR" --out-dir "$OUT" $GROUP_COMMIT_FLAG
         echo $? > "$status"; } 2>&1 | tee -a "$LOG" >&2
       [ "$(cat "$status")" = 0 ] || exit 1
     done
