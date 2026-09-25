@@ -1627,6 +1627,44 @@ expect {
     text
 }
 
+# Regression: infinite REAL must quote as a reloadable numeric literal, not Inf.
+# SQLite emits 9.0e+999 so both engines can parse the dump back.
+test quote-positive-infinity {
+    CREATE TABLE t(x REAL);
+    INSERT INTO t VALUES(1e400);
+    SELECT quote(x) FROM t;
+}
+expect {
+    9.0e+999
+}
+
+test quote-negative-infinity {
+    SELECT quote(-1e400);
+}
+expect {
+    -9.0e+999
+}
+
+test quote-infinity-reload {
+    CREATE TABLE inf_src(x REAL);
+    INSERT INTO inf_src VALUES(1e400);
+    INSERT INTO inf_src VALUES(-1e400);
+    CREATE TABLE inf_dst(x REAL);
+    INSERT INTO inf_dst SELECT quote(x) FROM inf_src;
+    SELECT quote(x) FROM inf_dst ORDER BY rowid;
+}
+expect {
+    9.0e+999
+    -9.0e+999
+}
+
+test quote-blob {
+    SELECT quote(X'89504E47');
+}
+expect {
+    X'89504E47'
+}
+
 test sign-positive-integer {
     SELECT sign(42);
 }
