@@ -1677,6 +1677,15 @@ pub fn insn_to_row(
                 0,
                 "".to_string(),
             ),
+            Insn::ClearSubtype { reg } => (
+                "ClrSubtype",
+                *reg as i64,
+                0,
+                0,
+                Value::build_text(""),
+                0,
+                "".to_string(),
+            ),
             Insn::NoConflict {
                 cursor_id,
                 target_pc,

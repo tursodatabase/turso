@@ -2293,7 +2293,9 @@ fn where_term_is_null_rejecting_for_table(
 
         // NULL-propagating wrappers.
         ast::Expr::Unary(_, inner) | ast::Expr::Cast { expr: inner, .. } => rejects(inner),
-        ast::Expr::Collate(inner, _) => rejects(inner),
+        ast::Expr::Collate(inner, _) | ast::Expr::SubqueryColumnValue { expr: inner, .. } => {
+            rejects(inner)
+        }
         // A single-element parenthesized expression is just grouping; a
         // row value (more elements) is compared element-wise and can be
         // TRUE with a NULL element.
@@ -3526,7 +3528,9 @@ impl Optimizable for ast::Expr {
                         .is_some_and(|else_expr| else_expr.is_nonnull(tables))
             }
             Expr::Cast { expr, .. } => expr.is_nonnull(tables),
-            Expr::Collate(expr, _) => expr.is_nonnull(tables),
+            Expr::Collate(expr, _) | Expr::SubqueryColumnValue { expr, .. } => {
+                expr.is_nonnull(tables)
+            }
             Expr::DoublyQualified(..) => {
                 panic!("Do not call is_nonnull before DoublyQualified has been rewritten as Column")
             }
@@ -3632,7 +3636,9 @@ impl Optimizable for ast::Expr {
                         .is_none_or(|else_expr| else_expr.is_constant(resolver))
             }
             Expr::Cast { expr, .. } => expr.is_constant(resolver),
-            Expr::Collate(expr, _) => expr.is_constant(resolver),
+            Expr::Collate(expr, _) | Expr::SubqueryColumnValue { expr, .. } => {
+                expr.is_constant(resolver)
+            }
             // Not constant. Normally rewritten to Expr::Column by the optimizer,
             // but CHECK constraints bypass the rewrite pass and legitimately
             // contain DoublyQualified nodes.

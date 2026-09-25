@@ -1386,6 +1386,12 @@ pub enum Insn {
         reg: usize,
     },
 
+    /// Remove the subtype of the value in register `reg`, like SQLite's
+    /// OP_ClrSubtype. A value read from a subquery column has no subtype.
+    ClearSubtype {
+        reg: usize,
+    },
+
     /// If P4==0 then register P3 holds a blob constructed by [MakeRecord](https://sqlite.org/opcode.html#MakeRecord).
     /// If P4>0 then register P3 is the first of P4 registers that form an unpacked record.
     ///
@@ -2267,6 +2273,7 @@ impl InsnVariants {
             InsnVariants::NewRowid => execute::op_new_rowid,
             InsnVariants::MustBeInt => execute::op_must_be_int,
             InsnVariants::SoftNull => execute::op_soft_null,
+            InsnVariants::ClearSubtype => execute::op_clear_subtype,
             InsnVariants::NoConflict => execute::op_no_conflict,
             InsnVariants::NotExists => execute::op_not_exists,
             InsnVariants::OffsetLimit => execute::op_offset_limit,

@@ -1568,6 +1568,7 @@ fn expr_contains_subquery(expr: &Expr) -> bool {
             }
             Expr::Cast { expr, .. }
             | Expr::Collate(expr, _)
+            | Expr::SubqueryColumnValue { expr, .. }
             | Expr::IsNull(expr)
             | Expr::NotNull(expr)
             | Expr::Unary(_, expr) => {

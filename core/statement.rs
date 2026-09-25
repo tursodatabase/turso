@@ -198,7 +198,9 @@ fn infer_expression_primitive(
         Expr::Parenthesized(exprs) if exprs.len() == 1 => {
             infer_expression_primitive(exprs.first().unwrap(), referenced_tables)
         }
-        Expr::Collate(inner, _) => infer_expression_primitive(inner, referenced_tables),
+        Expr::Collate(inner, _) | Expr::SubqueryColumnValue { expr: inner, .. } => {
+            infer_expression_primitive(inner, referenced_tables)
+        }
         Expr::Unary(op, inner) => match op {
             UnaryOperator::Not | UnaryOperator::BitwiseNot => Some("INTEGER"),
             UnaryOperator::Negative => Some(combine_arithmetic_primitive(

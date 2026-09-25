@@ -13587,6 +13587,20 @@ pub fn op_soft_null(
     Ok(InsnFunctionStepResult::Step)
 }
 
+pub fn op_clear_subtype(
+    _program: &Program,
+    state: &mut ProgramState,
+    insn: &Insn,
+    _pager: &Arc<Pager>,
+) -> InsnResult {
+    load_insn!(ClearSubtype { reg }, insn);
+    if let Register::Value(Value::Text(text)) = &mut state.registers[*reg] {
+        text.subtype = crate::types::TextSubtype::Text;
+    }
+    state.pc += 1;
+    Ok(InsnFunctionStepResult::Step)
+}
+
 #[derive(Clone, Copy)]
 pub enum OpNoConflictState {
     Start,

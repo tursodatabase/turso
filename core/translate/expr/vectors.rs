@@ -25,7 +25,7 @@ pub fn expr_vector_size(expr: &Expr) -> Result<usize> {
             }
             1
         }
-        Expr::Register(_) => 1,
+        Expr::Register(_) | Expr::SubqueryColumnValue { .. } => 1,
         Expr::Case {
             base,
             when_then_pairs,

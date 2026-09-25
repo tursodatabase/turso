@@ -1072,7 +1072,10 @@ fn is_null_on_empty_input(expr: &Expr, aggregates: &[crate::translate::plan::Agg
             | ast::Operator::Concat,
             right,
         ) => is_null_on_empty_input(left, aggregates) || is_null_on_empty_input(right, aggregates),
-        Expr::Unary(_, inner) | Expr::Cast { expr: inner, .. } | Expr::Collate(inner, _) => {
+        Expr::Unary(_, inner)
+        | Expr::Cast { expr: inner, .. }
+        | Expr::Collate(inner, _)
+        | Expr::SubqueryColumnValue { expr: inner, .. } => {
             is_null_on_empty_input(inner, aggregates)
         }
         Expr::Parenthesized(exprs) if exprs.len() == 1 => {
