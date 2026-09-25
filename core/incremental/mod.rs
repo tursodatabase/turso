@@ -6,6 +6,8 @@ pub mod expr_compiler;
 pub mod filter_operator;
 pub mod input_operator;
 pub mod join_operator;
+#[cfg(test)]
+mod leaf_boundary_seek_tests;
 pub mod merge_operator;
 pub mod operator;
 pub mod persistence;

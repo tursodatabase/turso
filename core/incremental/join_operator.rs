@@ -5,13 +5,13 @@ use crate::incremental::dbsp::{Delta, DeltaPair, HashableRow};
 use crate::incremental::operator::{
     generate_storage_id, ComputationTracker, DbspStateCursors, EvalState, IncrementalOperator,
 };
-use crate::incremental::persistence::WriteRow;
+use crate::incremental::persistence::{LeafBoundarySeek, WriteRow};
 use crate::numeric::Numeric;
 use crate::storage::btree::CursorTrait;
 use crate::sync::Arc;
 use crate::sync::Mutex;
 use crate::types::IOResultOr;
-use crate::types::{IOResult, ImmutableRecord, ImmutableRecordRef, SeekKey, SeekOp, SeekResult};
+use crate::types::{IOResult, ImmutableRecord, ImmutableRecordRef, SeekKey, SeekOp};
 use crate::{return_and_restore_if_io, return_if_io, Result, Value};
 
 #[derive(Debug, Clone, PartialEq)]
@@ -24,7 +24,8 @@ pub enum JoinType {
 }
 
 // Helper function to read the next row from the BTree for joins
-fn read_next_join_row(
+pub(crate) fn read_next_join_row(
+    seek: &mut LeafBoundarySeek,
     storage_id: i64,
     join_key: &HashableRow,
     last_element_hash: Option<Hash128>,
@@ -57,11 +58,13 @@ fn read_next_join_row(
         SeekOp::GT
     };
 
-    let seek_result = return_if_io!(cursors
-        .index_cursor
-        .seek(SeekKey::IndexKey(index_record.as_record_ref()), seek_op));
+    let positioned = return_if_io!(seek.seek(
+        &mut cursors.index_cursor,
+        SeekKey::IndexKey(index_record.as_record_ref()),
+        seek_op
+    ));
 
-    if !matches!(seek_result, SeekResult::Found) {
+    if !positioned {
         return Ok(IOResult::Done(None));
     }
 
@@ -153,12 +156,14 @@ pub enum JoinEvalState {
         output: Delta,
         current_idx: usize,
         last_row_scanned: Option<Hash128>,
+        seek: LeafBoundarySeek,
     },
     ProcessRightJoin {
         deltas: DeltaPair,
         output: Delta,
         current_idx: usize,
         last_row_scanned: Option<Hash128>,
+        seek: LeafBoundarySeek,
     },
     Done {
         output: Delta,
@@ -203,6 +208,7 @@ impl JoinEvalState {
                         output: std::mem::take(output),
                         current_idx: 0,
                         last_row_scanned: None,
+                        seek: LeafBoundarySeek::default(),
                     };
                 }
                 JoinEvalState::ProcessLeftJoin {
@@ -210,6 +216,7 @@ impl JoinEvalState {
                     output,
                     current_idx,
                     last_row_scanned,
+                    seek,
                 } => {
                     if *current_idx >= deltas.left.changes.len() {
                         *self = JoinEvalState::ProcessRightJoin {
@@ -217,6 +224,7 @@ impl JoinEvalState {
                             output: std::mem::take(output),
                             current_idx: 0,
                             last_row_scanned: None,
+                            seek: LeafBoundarySeek::default(),
                         };
                     } else {
                         let (left_row, left_weight) = &deltas.left.changes[*current_idx];
@@ -228,6 +236,7 @@ impl JoinEvalState {
                         let left_key = HashableRow::new(0, key_values);
 
                         let next_row = return_if_io!(read_next_join_row(
+                            seek,
                             right_storage_id,
                             &left_key,
                             *last_row_scanned,
@@ -248,6 +257,7 @@ impl JoinEvalState {
                                     output: std::mem::take(output),
                                     current_idx: *current_idx,
                                     last_row_scanned: Some(element_hash),
+                                    seek: LeafBoundarySeek::default(),
                                 };
                             }
                             None => {
@@ -257,6 +267,7 @@ impl JoinEvalState {
                                     output: std::mem::take(output),
                                     current_idx: *current_idx + 1,
                                     last_row_scanned: None,
+                                    seek: LeafBoundarySeek::default(),
                                 };
                             }
                         }
@@ -267,6 +278,7 @@ impl JoinEvalState {
                     output,
                     current_idx,
                     last_row_scanned,
+                    seek,
                 } => {
                     if *current_idx >= deltas.right.changes.len() {
                         *self = JoinEvalState::Done {
@@ -282,6 +294,7 @@ impl JoinEvalState {
                         let right_key = HashableRow::new(0, key_values);
 
                         let next_row = return_if_io!(read_next_join_row(
+                            seek,
                             left_storage_id,
                             &right_key,
                             *last_row_scanned,
@@ -302,6 +315,7 @@ impl JoinEvalState {
                                     output: std::mem::take(output),
                                     current_idx: *current_idx,
                                     last_row_scanned: Some(element_hash),
+                                    seek: LeafBoundarySeek::default(),
                                 };
                             }
                             None => {
@@ -311,6 +325,7 @@ impl JoinEvalState {
                                     output: std::mem::take(output),
                                     current_idx: *current_idx + 1,
                                     last_row_scanned: None,
+                                    seek: LeafBoundarySeek::default(),
                                 };
                             }
                         }
@@ -573,7 +588,7 @@ fn deserialize_hashable_row(blob: &[u8]) -> Result<HashableRow> {
     Ok(HashableRow::new(rowid, values))
 }
 
-fn serialize_hashable_row(row: &HashableRow) -> Result<crate::ValueBlob> {
+pub(crate) fn serialize_hashable_row(row: &HashableRow) -> Result<crate::ValueBlob> {
     use crate::types::ImmutableRecord;
 
     let mut all_values = Vec::with_capacity(row.values.len() + 1);

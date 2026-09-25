@@ -108,6 +108,12 @@ struct Args {
     /// `--matview`, else 0.
     #[arg(long)]
     redundant_dml_probability: Option<f64>,
+
+    /// Probability that a step inserts 100-2000 rows into a table that a
+    /// materialized view reads. Requires `--matview`. Default: 0.05 with
+    /// `--matview`.
+    #[arg(long)]
+    bulk_insert_probability: Option<f64>,
 }
 
 #[derive(Subcommand, Debug)]
@@ -152,6 +158,7 @@ struct ConfigRecord {
     max_batch_size: usize,
     reopen_probability: Option<f64>,
     redundant_dml_probability: Option<f64>,
+    bulk_insert_probability: Option<f64>,
 }
 
 /// Summary written to the JSON report file.
@@ -178,6 +185,7 @@ impl ConfigRecord {
             max_batch_size: args.max_batch_size,
             reopen_probability: args.reopen_probability,
             redundant_dml_probability: args.redundant_dml_probability,
+            bulk_insert_probability: args.bulk_insert_probability,
         }
     }
 }
@@ -318,6 +326,9 @@ fn run_single_inner(args: &Args) -> Result<differential_fuzzer::SimStats> {
     if args.reopen_probability.is_some_and(|p| p > 0.0) && (!args.matview || args.mvcc) {
         anyhow::bail!("--reopen-probability requires --matview and does not support --mvcc");
     }
+    if args.bulk_insert_probability.is_some_and(|p| p > 0.0) && !args.matview {
+        anyhow::bail!("--bulk-insert-probability requires --matview");
+    }
     if args.max_batch_size < 2 {
         anyhow::bail!("--max-batch-size must be at least 2");
     }
@@ -343,6 +354,11 @@ fn run_single_inner(args: &Args) -> Result<differential_fuzzer::SimStats> {
         args.redundant_dml_probability,
         0.1,
     )?;
+    let bulk_insert_probability = probability(
+        "bulk-insert-probability",
+        args.bulk_insert_probability,
+        0.05,
+    )?;
     let config = SimConfig {
         seed: args.seed,
         num_tables: args.num_tables,
@@ -367,6 +383,7 @@ fn run_single_inner(args: &Args) -> Result<differential_fuzzer::SimStats> {
         max_batch_size: args.max_batch_size,
         reopen_probability,
         redundant_dml_probability,
+        bulk_insert_probability,
     };
 
     tracing::info!("Starting differential_fuzzer with config: {:?}", config);

@@ -6,7 +6,9 @@ use crate::incremental::dbsp::{Delta, DeltaPair, HashableRow};
 use crate::incremental::operator::{
     generate_storage_id, ComputationTracker, DbspStateCursors, EvalState, IncrementalOperator,
 };
-use crate::incremental::persistence::{ReadRecord, WriteRow};
+use crate::incremental::persistence::{
+    seek_dbsp_index_key, LeafBoundarySeek, ReadRecord, WriteRow,
+};
 use crate::numeric::Numeric;
 use crate::storage::btree::CursorTrait;
 use crate::sync::Arc;
@@ -401,6 +403,7 @@ pub enum AggregateEvalState {
         existing_groups: HashMap<String, AggregateState>,
         old_values: HashMap<String, Vec<Value>>,
         pre_existing_groups: HashSet<String>, // Track groups that existed before this delta
+        seek: LeafBoundarySeek,
     },
     FetchAggregateState {
         delta: Delta, // Keep original delta for merge operation
@@ -514,6 +517,7 @@ impl AggregateEvalState {
                     existing_groups,
                     old_values,
                     pre_existing_groups,
+                    seek,
                 } => {
                     if *current_idx >= groups_to_read.len() {
                         // All groups have been fetched, move to FetchDistinctValues
@@ -556,19 +560,13 @@ impl AggregateEvalState {
                             element_id.to_value()?,
                         ];
 
-                        // Create an immutable record for the index key
-                        let index_record = ImmutableRecord::from_values(
-                            &index_key_values,
-                            index_key_values.len(),
-                        )?;
-
-                        // Seek in the index to find if this row exists
-                        let seek_result = return_if_io!(cursors.index_cursor.seek(
-                            SeekKey::IndexKey(index_record.as_record_ref()),
-                            SeekOp::GE { eq_only: true }
+                        let found = return_if_io!(seek_dbsp_index_key(
+                            seek,
+                            &mut cursors.index_cursor,
+                            &index_key_values
                         ));
 
-                        let rowid = if matches!(seek_result, SeekResult::Found) {
+                        let rowid = if found {
                             // Found in index, get the table rowid
                             // The btree code handles extracting the rowid from the index record for has_rowid indexes
                             return_if_io!(cursors.index_cursor.rowid())
@@ -643,6 +641,7 @@ impl AggregateEvalState {
                         existing_groups: taken_existing,
                         old_values: taken_old_values,
                         pre_existing_groups: taken_pre_existing_groups,
+                        seek: LeafBoundarySeek::default(),
                     };
                     *self = next_state;
                 }
@@ -1484,6 +1483,7 @@ impl AggregateOperator {
                     existing_groups: HashMap::default(),
                     old_values: HashMap::default(),
                     pre_existing_groups: HashSet::default(), // Initialize empty
+                    seek: LeafBoundarySeek::default(),
                 }));
             }
             EvalState::Aggregate(_agg_state) => {
@@ -2248,6 +2248,8 @@ pub enum ScanState {
     FetchNextCandidate {
         /// Current candidate to seek past
         current_candidate: Value,
+        /// Phase of the seek that steps over a leaf page boundary
+        seek: LeafBoundarySeek,
         /// Group key being processed
         group_key: String,
         /// Column name being processed
@@ -2291,16 +2293,19 @@ impl ScanState {
     // we end up going into a different operator altogether. That means we have
     // exhausted this operator (or group) entirely, and no good candidate was found
     fn extract_new_candidate(
+        seek: &mut LeafBoundarySeek,
         cursors: &mut DbspStateCursors,
         index_record: &ImmutableRecord,
         seek_op: SeekOp,
         storage_id: i64,
         zset_hash: Hash128,
     ) -> IOResultOr<Option<Value>> {
-        let seek_result = return_if_io!(cursors
-            .index_cursor
-            .seek(SeekKey::IndexKey(index_record.as_record_ref()), seek_op));
-        if !matches!(seek_result, SeekResult::Found) {
+        let positioned = return_if_io!(seek.seek(
+            &mut cursors.index_cursor,
+            SeekKey::IndexKey(index_record.as_record_ref()),
+            seek_op
+        ));
+        if !positioned {
             return Ok(IOResult::Done(None));
         }
 
@@ -2395,6 +2400,7 @@ impl ScanState {
                             // Candidate is retracted, need to fetch next from index
                             *self = ScanState::FetchNextCandidate {
                                 current_candidate: cand_val.clone(),
+                                seek: LeafBoundarySeek::default(),
                                 group_key: std::mem::take(group_key),
                                 column_name: std::mem::take(column_name),
                                 storage_id: *storage_id,
@@ -2457,6 +2463,7 @@ impl ScanState {
 
                 ScanState::FetchNextCandidate {
                     current_candidate,
+                    seek,
                     group_key,
                     column_name,
                     storage_id,
@@ -2479,6 +2486,7 @@ impl ScanState {
                     };
 
                     let new_candidate = return_if_io!(Self::extract_new_candidate(
+                        seek,
                         cursors,
                         &index_record,
                         seek_op,
@@ -2551,6 +2559,7 @@ pub enum FetchDistinctState {
         group_key: String,
         column_idx: usize,
         value: Value,
+        seek: LeafBoundarySeek,
     },
     Done,
 }
@@ -2698,6 +2707,7 @@ impl FetchDistinctState {
                         group_key,
                         column_idx,
                         value,
+                        seek: LeafBoundarySeek::default(),
                     };
                 }
                 FetchDistinctState::ReadValue {
@@ -2708,6 +2718,7 @@ impl FetchDistinctState {
                     group_key,
                     column_idx,
                     value,
+                    seek,
                 } => {
                     // Read the record from BTree using the same pattern as WriteRow:
                     // 1. Seek in index to find the entry
@@ -2724,15 +2735,14 @@ impl FetchDistinctState {
                         zset_hash.to_value()?,
                         element_id.to_value()?,
                     ];
-                    let index_record = ImmutableRecord::from_values(&index_key, index_key.len())?;
-
-                    let seek_result = return_if_io!(cursors.index_cursor.seek(
-                        SeekKey::IndexKey(index_record.as_record_ref()),
-                        SeekOp::GE { eq_only: true }
+                    let found = return_if_io!(seek_dbsp_index_key(
+                        seek,
+                        &mut cursors.index_cursor,
+                        &index_key
                     ));
 
                     // Early exit if not found in index
-                    if !matches!(seek_result, SeekResult::Found) {
+                    if !found {
                         let groups = std::mem::take(groups_to_fetch);
                         let values = std::mem::take(values_to_fetch);
                         *self = FetchDistinctState::FetchGroup {
