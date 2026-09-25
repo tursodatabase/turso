@@ -11,7 +11,7 @@ use turso_core::{
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum QueuedIoOpKind {
+pub enum QueuedIoOpKind {
     Pread,
     Pwrite,
     Pwritev,
@@ -20,9 +20,9 @@ pub(crate) enum QueuedIoOpKind {
 }
 
 #[derive(Clone, Debug)]
-pub(crate) struct QueuedIoEvent {
-    pub(crate) path: String,
-    pub(crate) kind: QueuedIoOpKind,
+pub struct QueuedIoEvent {
+    pub path: String,
+    pub kind: QueuedIoOpKind,
 }
 
 struct QueuedIoOp {
@@ -54,20 +54,20 @@ impl QueuedIoState {
     }
 }
 
-pub(crate) struct QueuedIo {
+pub struct QueuedIo {
     inner: Arc<dyn IO>,
     state: Arc<QueuedIoState>,
 }
 
 impl QueuedIo {
-    pub(crate) fn new() -> Self {
+    pub fn new() -> Self {
         Self {
             inner: Arc::new(turso_core::MemoryIO::new()),
             state: Arc::new(QueuedIoState::new()),
         }
     }
 
-    pub(crate) fn step_one(&self) -> turso_core::Result<Option<QueuedIoEvent>> {
+    pub fn step_one(&self) -> turso_core::Result<Option<QueuedIoEvent>> {
         let Some(op) = self.state.pending.lock().unwrap().pop_front() else {
             return Ok(None);
         };
@@ -82,7 +82,7 @@ impl QueuedIo {
     /// REINDEX rollback tests use this to fail the destructive refill path at a
     /// deterministic write boundary while still exercising the normal queued I/O
     /// completion machinery.
-    pub(crate) fn fault_after(
+    pub fn fault_after(
         &self,
         path_suffix: impl Into<String>,
         kind: QueuedIoOpKind,
@@ -97,8 +97,14 @@ impl QueuedIo {
     }
 
     /// Removes the active queued-I/O fault so cleanup and integrity checks can run normally.
-    pub(crate) fn clear_fault(&self) {
+    pub fn clear_fault(&self) {
         *self.state.fault.lock().unwrap() = None;
+    }
+}
+
+impl Default for QueuedIo {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
