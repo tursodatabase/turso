@@ -197,6 +197,7 @@ enum DestroyState {
 
 struct DestroyInfo {
     state: DestroyState,
+    removed_entries: u64,
 }
 
 #[derive(Debug)]
@@ -815,7 +816,8 @@ pub trait CursorTrait: Any + Send + Sync {
     fn get_null_flag(&self) -> bool;
     /// Check if a key exists.
     fn exists(&mut self, key: &Value) -> IOResultOr<bool>;
-    fn clear_btree(&mut self) -> IOResultOr<Option<usize>>;
+    /// Remove every entry but keep the root page. Returns the number of entries removed.
+    fn clear_btree(&mut self) -> IOResultOr<u64>;
     fn btree_destroy(&mut self) -> IOResultOr<Option<usize>>;
     /// Count the number of entries in the b-tree
     ///
@@ -5489,11 +5491,14 @@ impl BTreeCursor {
     /// ```
     ///
     /// The destruction order would be: [4',4,5,2,6,7,3,1]
-    fn destroy_btree_contents(&mut self, keep_root: bool) -> IOResultOr<Option<usize>> {
+    ///
+    /// Returns the number of entries removed: every leaf cell, plus every index interior cell.
+    fn destroy_btree_contents(&mut self, keep_root: bool) -> IOResultOr<u64> {
         if let CursorState::None = &self.state {
             let c = return_if_io!(self.move_to_root_nonblock());
             self.state = CursorState::Destroy(DestroyInfo {
                 state: DestroyState::Start,
+                removed_entries: 0,
             });
             if let Some(c) = c {
                 io_yield_one!(c);
@@ -5605,6 +5610,7 @@ impl BTreeCursor {
                                 .state
                                 .mut_destroy_info()
                                 .expect("unable to get a mut reference to destroy state in cursor");
+                            destroy_info.removed_entries += 1;
                             destroy_info.state = DestroyState::ClearOverflowPages { cell };
                             continue;
                         }
@@ -5615,6 +5621,7 @@ impl BTreeCursor {
                                 let destroy_info = self.state.mut_destroy_info().expect(
                                     "unable to get a mut reference to destroy state in cursor",
                                 );
+                                destroy_info.removed_entries += 1;
                                 destroy_info.state = DestroyState::ClearOverflowPages { cell };
                                 continue;
                             }
@@ -5730,10 +5737,13 @@ impl BTreeCursor {
                             return_if_io!(self.pager.free_page(Some(page), page_id));
                         }
 
+                        let removed_entries = self
+                            .state
+                            .destroy_info()
+                            .expect("unable to get a reference to destroy state in cursor")
+                            .removed_entries;
                         self.state = CursorState::None;
-                        //  TODO: For now, no-op the result return None always. This will change once [AUTO_VACUUM](https://www.sqlite.org/lang_vacuum.html) is introduced
-                        //  At that point, the last root page(call this x) will be moved into the position of the root page of this table and the value returned will be x
-                        return Ok(IOResult::Done(None));
+                        return Ok(IOResult::Done(removed_entries));
                     }
                 }
             }
@@ -7349,7 +7359,7 @@ impl CursorTrait for BTreeCursor {
     /// Unlike [`btree_destroy`], which frees all pages including the root,
     /// this method only clears the tree’s contents. The root page remains
     /// allocated and is reset to an empty leaf page.
-    fn clear_btree(&mut self) -> IOResultOr<Option<usize>> {
+    fn clear_btree(&mut self) -> IOResultOr<u64> {
         // First entry only — destroy_btree_contents yields IO and resumes
         // through this method, so guard with the same state==None gate it
         // uses for its own state machine. Every page in this btree is about
@@ -7379,7 +7389,10 @@ impl CursorTrait for BTreeCursor {
         if matches!(self.state, CursorState::None) {
             self.pager.invalidate_peer_cursors(self);
         }
-        self.destroy_btree_contents(false)
+        let destroyed = self.destroy_btree_contents(false)?;
+        //  TODO: For now, no-op the result return None always. This will change once [AUTO_VACUUM](https://www.sqlite.org/lang_vacuum.html) is introduced
+        //  At that point, the last root page(call this x) will be moved into the position of the root page of this table and the value returned will be x
+        Ok(destroyed.map(|_| None))
     }
 
     #[cfg_attr(debug_assertions, instrument(skip(self), level = Level::DEBUG))]

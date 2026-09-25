@@ -1,6 +1,6 @@
 use crate::vdbe::{
     builder::CursorType,
-    insn::{IntegrityCkData, RegisterOrLiteral, SorterOpenData},
+    insn::{ClearBtreeCount, IntegrityCkData, RegisterOrLiteral, SorterOpenData},
 };
 use crate::HashSet;
 use turso_parser::ast::{ResolveType, SortOrder};
@@ -1801,11 +1801,11 @@ pub fn insn_to_row(
                 0,
                 "".to_string()
             ),
-            Insn::ClearBtree { db, root } => (
+            Insn::ClearBtree { db, root, count } => (
                 "ClearBtree",
                 *root,
                 *db as i64,
-                0,
+                i64::from(*count == ClearBtreeCount::ChangesAndRowsWritten),
                 Value::build_text(""),
                 0,
                 format!("root={root} iDb={db}"),

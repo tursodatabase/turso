@@ -250,6 +250,7 @@ fn test_attached_write_does_not_upgrade_stale_main_snapshot(
     conn1.execute(format!("ATTACH '{}' AS aux", aux_path.display()))?;
     conn2.execute(format!("ATTACH '{}' AS aux", aux_path.display()))?;
     conn1.execute("CREATE TABLE aux.t(x INTEGER)")?;
+    conn1.execute("CREATE INDEX aux.t_x ON t(x)")?;
     conn1.execute("INSERT INTO aux.t VALUES (1)")?;
 
     conn1.execute("BEGIN")?;
@@ -265,9 +266,18 @@ fn test_attached_write_does_not_upgrade_stale_main_snapshot(
     conn1
         .execute("DELETE FROM aux.t")
         .context("delete from aux")?;
-    assert_that!(limbo_exec_rows(&conn1, "SELECT x FROM aux.t")).is_empty();
+    assert_that!(limbo_exec_rows(
+        &conn1,
+        "SELECT x FROM aux.t INDEXED BY t_x"
+    ))
+    .is_empty();
     assert_that!(limbo_exec_rows(&conn1, "SELECT x FROM main_t")).is_equal_to(vec![row![1]]);
     conn1.execute("ROLLBACK")?;
+    assert_that!(limbo_exec_rows(
+        &conn1,
+        "SELECT x FROM aux.t INDEXED BY t_x"
+    ))
+    .is_equal_to(vec![row![2]]);
     Ok(())
 }
 

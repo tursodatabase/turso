@@ -379,6 +379,13 @@ pub struct HashDistinctData {
     pub target_pc: BranchOffset,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ClearBtreeCount {
+    Nothing,
+    RowsWritten,
+    ChangesAndRowsWritten,
+}
+
 // The opcodes the dispatch loop matches directly come first.
 #[repr(u8)]
 #[derive(Description, Debug, Clone, EnumDiscriminants)]
@@ -1467,6 +1474,9 @@ pub enum Insn {
     ClearBtree {
         db: usize,
         root: i64,
+        /// What the removed entries count toward. Whole-table DELETE counts every B-tree's
+        /// entries as written rows and the table's rows as changes. REINDEX counts nothing.
+        count: ClearBtreeCount,
     },
 
     /// Deletes an entire database table or index whose root page in the database file is given by P1.

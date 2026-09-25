@@ -189,7 +189,7 @@ set test_files {
   dbstatus             fail
   dbstatus2            fail
   delete               fail
-  delete2              fail
+  delete2              pass
   delete3              pass
   delete4            fail
   delete_db            fail
