@@ -216,6 +216,9 @@ pub struct SimConfig {
     pub reopen_probability: f64,
     /// Probability that a write that passed the check runs again unchanged.
     pub redundant_dml_probability: f64,
+    /// Probability that a step inserts 100-2000 rows into a table that a
+    /// materialized view reads.
+    pub bulk_insert_probability: f64,
 }
 
 impl Default for SimConfig {
@@ -240,6 +243,7 @@ impl Default for SimConfig {
             max_batch_size: 10,
             reopen_probability: 0.0,
             redundant_dml_probability: 0.0,
+            bulk_insert_probability: 0.0,
         }
     }
 }
@@ -265,6 +269,8 @@ pub struct SimStats {
     pub reopens: usize,
     /// Writes that ran a second time.
     pub repeats: usize,
+    /// Bulk inserts into tables that materialized views read.
+    pub bulk_inserts: usize,
 }
 
 impl SimStats {
@@ -358,6 +364,10 @@ impl SimStats {
             Cell::new("Repeated writes").fg(Color::Blue),
             Cell::new(self.repeats).fg(Color::Blue),
         ]);
+        table.add_row(vec![
+            Cell::new("Bulk inserts").fg(Color::Blue),
+            Cell::new(self.bulk_inserts).fg(Color::Blue),
+        ]);
 
         table
     }
@@ -391,6 +401,8 @@ enum Step {
     /// Non-DDL statements run inside BEGIN ... COMMIT.
     Batch(Vec<GeneratedStatement>),
     Reopen,
+    /// A bulk insert, sometimes followed by a delete of half of its rows.
+    BulkInsert(Vec<GeneratedStatement>),
 }
 
 impl RefUnwindSafe for Fuzzer {}
@@ -689,6 +701,11 @@ impl Fuzzer {
         if self.roll(self.config.reopen_probability) {
             return Ok(Step::Reopen);
         }
+        if self.roll(self.config.bulk_insert_probability) {
+            if let Some(writes) = self.bulk_insert(schema, matviews)? {
+                return Ok(Step::BulkInsert(writes));
+            }
+        }
         let first = match pending.take() {
             Some(generated) => generated,
             None => generator.generate(schema, matviews)?,
@@ -715,6 +732,116 @@ impl Fuzzer {
             }
         }
         Ok(Step::Batch(batch))
+    }
+
+    /// An INSERT of 100-2000 rows into a table that a materialized view reads,
+    /// so that the view's state spans several btree pages. Each column repeats
+    /// its values every `rows`, 50 or 5 rows, which gives many groups, many
+    /// rows for each key, or many values in each group. OR IGNORE skips the
+    /// rows that fail a CHECK constraint. Half of the time a
+    /// DELETE of every second inserted row follows, which writes each of those
+    /// keys again. Returns `None` when no view reads a table.
+    fn bulk_insert(
+        &self,
+        schema: &sql_gen::Schema,
+        matviews: &Matviews,
+    ) -> Result<Option<Vec<GeneratedStatement>>> {
+        let tables = self.tables_read_by_matviews(schema, matviews)?;
+        if tables.is_empty() {
+            return Ok(None);
+        }
+        let table = tables[self.below(tables.len())];
+        let rows = 100 + self.below(1901);
+        let unique_offset = 1_000_000 * (1 + self.below(1000));
+        let unique_columns = self.unique_columns(table)?;
+        let columns = table
+            .columns
+            .iter()
+            .map(|column| column.name.as_str())
+            .collect::<Vec<_>>()
+            .join(", ");
+        let values = table
+            .columns
+            .iter()
+            .map(|column| {
+                let number = if column.primary_key || unique_columns.contains(&column.name) {
+                    format!("{unique_offset} + i")
+                } else {
+                    let spread = [rows, 50, 5][self.below(3)];
+                    format!("i % {spread}")
+                };
+                bulk_value(column.data_type, &number)
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        let name = &table.name;
+        let mut writes = vec![format!(
+            "WITH RECURSIVE c(i) AS (SELECT 0 UNION ALL SELECT i + 1 FROM c WHERE i < {}) INSERT OR IGNORE INTO {name} ({columns}) SELECT {values} FROM c",
+            rows - 1
+        )];
+        if self.roll(0.5) {
+            writes.push(format!(
+                "DELETE FROM {name} WHERE rowid IN (SELECT rowid FROM {name} ORDER BY rowid DESC LIMIT {rows}) AND rowid % 2 = 0"
+            ));
+        }
+        Ok(Some(
+            writes
+                .into_iter()
+                .map(|sql| GeneratedStatement {
+                    sql,
+                    is_ddl: false,
+                    mutates_data: true,
+                    has_unordered_limit: false,
+                    unordered_limit_reason: None,
+                    check_unnesting_invariant: false,
+                })
+                .collect(),
+        ))
+    }
+
+    /// The columns of `table` that are part of a UNIQUE or PRIMARY KEY index.
+    fn unique_columns(&self, table: &sql_gen::Table) -> Result<Vec<String>> {
+        let mut columns = Vec::new();
+        let mut indexes = self
+            .sqlite_conn
+            .prepare("SELECT name FROM pragma_index_list(?1) WHERE \"unique\"")?;
+        for index in indexes.query_map([&table.name], |row| row.get::<_, String>(0))? {
+            let mut info = self
+                .sqlite_conn
+                .prepare("SELECT name FROM pragma_index_info(?1) WHERE name IS NOT NULL")?;
+            for column in info.query_map([index?], |row| row.get::<_, String>(0))? {
+                columns.push(column?);
+            }
+        }
+        Ok(columns)
+    }
+
+    /// The tables whose names appear in the SELECT of a live materialized view.
+    fn tables_read_by_matviews<'a>(
+        &self,
+        schema: &'a sql_gen::Schema,
+        matviews: &Matviews,
+    ) -> Result<Vec<&'a sql_gen::Table>> {
+        let mut words = std::collections::HashSet::new();
+        let mut query = self
+            .sqlite_conn
+            .prepare("SELECT name, sql FROM sqlite_schema WHERE type = 'view'")?;
+        let mut views = query.query([])?;
+        while let Some(view) = views.next()? {
+            if !matviews.contains_key(&view.get::<_, String>(0)?) {
+                continue;
+            }
+            let sql = view.get::<_, String>(1)?;
+            words.extend(
+                sql.split(|c: char| !(c.is_alphanumeric() || c == '_'))
+                    .map(str::to_lowercase),
+            );
+        }
+        Ok(schema
+            .tables
+            .iter()
+            .filter(|table| words.contains(&table.name.to_lowercase()))
+            .collect())
     }
 
     /// True with the given probability. Draws nothing when it is 0, so that
@@ -744,6 +871,14 @@ impl Fuzzer {
             }
             Step::Batch(stmts) => self.run_batch(i, stmts, schema, matviews, stats, executed_sql),
             Step::Reopen => self.reopen(schema, matviews, stats, executed_sql),
+            Step::BulkInsert(writes) => {
+                stats.bulk_inserts += 1;
+                for write in writes {
+                    self.current_sql.borrow_mut().clone_from(&write.sql);
+                    self.run_statement(i, write, schema, matviews, stats, executed_sql)?;
+                }
+                Ok(())
+            }
         }
     }
 
@@ -1366,6 +1501,21 @@ fn push_warning_comments(executed_sql: &mut Vec<String>, stmt_idx: usize, reason
     }
 }
 
+/// A value of the column's type that is distinct for each distinct `number`.
+fn bulk_value(data_type: sql_gen::DataType, number: &str) -> String {
+    match data_type {
+        sql_gen::DataType::Integer | sql_gen::DataType::Null => number.to_string(),
+        sql_gen::DataType::Real => format!("({number}) + 0.5"),
+        sql_gen::DataType::Text => format!("'k' || ({number})"),
+        sql_gen::DataType::Blob => format!("CAST('k' || ({number}) AS BLOB)"),
+        sql_gen::DataType::IntegerArray
+        | sql_gen::DataType::RealArray
+        | sql_gen::DataType::TextArray => {
+            unreachable!("materialized view mode does not create array columns")
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1401,6 +1551,7 @@ mod tests {
             max_batch_size: 10,
             reopen_probability: 0.0,
             redundant_dml_probability: 0.0,
+            bulk_insert_probability: 0.0,
         };
         let sim = Fuzzer::new(config);
         assert!(sim.is_ok());
@@ -1724,6 +1875,141 @@ mod tests {
         assert!(err.starts_with("Matview data mismatch in 'v'"), "{err}");
         assert!(err.contains("SQLite integrity check failed"), "{err}");
         assert_eq!(stats.oracle_failures, 2);
+    }
+
+    fn count_rows(fuzzer: &Fuzzer, table: &str) -> (QueryResult, QueryResult) {
+        let sql = format!("SELECT COUNT(*) FROM {table}");
+        (
+            DifferentialOracle::execute_turso(&fuzzer.turso_conn(), &sql),
+            DifferentialOracle::execute_sqlite(&fuzzer.sqlite_conn, &sql),
+        )
+    }
+
+    fn single_integer(result: &QueryResult) -> i64 {
+        match result {
+            QueryResult::Rows(rows) if rows.len() == 1 && rows[0].0.len() == 1 => {
+                match rows[0].0[0] {
+                    SqlValue::Integer(n) => n,
+                    _ => panic!("not an integer: {result:?}"),
+                }
+            }
+            _ => panic!("not one value: {result:?}"),
+        }
+    }
+
+    #[test]
+    fn a_bulk_insert_writes_only_into_a_table_that_a_view_reads() {
+        let fuzzer = matview_fuzzer();
+        let (mut stats, mut executed_sql) = (SimStats::default(), Vec::new());
+        let mut matviews = matview_over_t(&fuzzer, &mut executed_sql);
+        fuzzer.execute_on_both("CREATE TABLE u(a INTEGER, t TEXT)", &mut executed_sql);
+        let mut schema = fuzzer.introspect_and_verify_schemas().unwrap();
+
+        for _ in 0..3 {
+            let writes = fuzzer.bulk_insert(&schema, &matviews).unwrap().unwrap();
+            assert!(
+                writes[0]
+                    .sql
+                    .contains(" INSERT OR IGNORE INTO t (a, b) SELECT "),
+                "{}",
+                writes[0].sql
+            );
+            assert!(
+                writes[1..]
+                    .iter()
+                    .all(|w| w.sql.starts_with("DELETE FROM t "))
+            );
+            let step = Step::BulkInsert(writes);
+            fuzzer
+                .run_step(
+                    0,
+                    &step,
+                    &mut schema,
+                    &mut matviews,
+                    &mut stats,
+                    &mut executed_sql,
+                )
+                .unwrap();
+        }
+
+        let (turso, sqlite) = count_rows(&fuzzer, "t");
+        assert_eq!(turso, sqlite);
+        assert!(single_integer(&turso) >= 2 + 3 * 50, "{turso:?}");
+        assert_eq!(stats.bulk_inserts, 3);
+        assert_eq!(single_integer(&count_rows(&fuzzer, "u").0), 0);
+        assert_eq!(stats.oracle_failures, 0);
+    }
+
+    #[test]
+    fn there_is_no_bulk_insert_when_no_view_reads_a_table() {
+        let fuzzer = matview_fuzzer();
+        let mut executed_sql = Vec::new();
+        fuzzer.execute_on_both("CREATE TABLE t(a INTEGER)", &mut executed_sql);
+        let schema = fuzzer.introspect_and_verify_schemas().unwrap();
+
+        assert!(
+            fuzzer
+                .bulk_insert(&schema, &Matviews::new())
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn a_bulk_insert_gives_unique_columns_a_new_value_in_each_row() {
+        let fuzzer = matview_fuzzer();
+        let (mut stats, mut executed_sql) = (SimStats::default(), Vec::new());
+        for sql in [
+            "CREATE TABLE s(id INTEGER PRIMARY KEY, name TEXT UNIQUE, r REAL, b BLOB NOT NULL, g INTEGER) STRICT",
+            "CREATE UNIQUE INDEX s_g ON s(g)",
+            "CREATE TABLE k(code TEXT PRIMARY KEY, n INTEGER CHECK (n > 0))",
+        ] {
+            let (turso, sqlite) = fuzzer.execute_on_both(sql, &mut executed_sql);
+            assert!(!matches!(turso, QueryResult::Error(_)), "{turso:?}");
+            assert!(!matches!(sqlite, QueryResult::Error(_)), "{sqlite:?}");
+        }
+        let select = "SELECT r, COUNT(*) AS n FROM s GROUP BY r";
+        fuzzer
+            .turso_conn()
+            .execute(format!("CREATE MATERIALIZED VIEW sv AS {select}"))
+            .unwrap();
+        fuzzer
+            .sqlite_conn
+            .execute(&format!("CREATE VIEW sv AS {select}"), [])
+            .unwrap();
+        let mut matviews = Matviews::from([(
+            "sv".to_string(),
+            vec![
+                sql_gen_prop::ColumnDef::new("r", sql_gen_prop::DataType::Real),
+                sql_gen_prop::ColumnDef::new("n", sql_gen_prop::DataType::Integer),
+            ],
+        )]);
+        let mut schema = fuzzer.introspect_and_verify_schemas().unwrap();
+        let unique_columns = |name: &str| {
+            let table = schema.tables.iter().find(|t| t.name == name).unwrap();
+            let mut columns = fuzzer.unique_columns(table).unwrap();
+            columns.sort();
+            columns
+        };
+        assert_eq!(unique_columns("s"), ["g", "name"]);
+        assert_eq!(unique_columns("k"), ["code"]);
+
+        let insert = &fuzzer.bulk_insert(&schema, &matviews).unwrap().unwrap()[0];
+        fuzzer
+            .run_statement(
+                0,
+                insert,
+                &mut schema,
+                &mut matviews,
+                &mut stats,
+                &mut executed_sql,
+            )
+            .unwrap();
+
+        let (turso, sqlite) = count_rows(&fuzzer, "s");
+        assert_eq!(turso, sqlite);
+        assert!(single_integer(&turso) >= 100, "{}", insert.sql);
+        assert_eq!(stats.oracle_failures, 0);
     }
 
     #[test]
