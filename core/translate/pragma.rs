@@ -22,7 +22,9 @@ use crate::storage::sqlite3_ondisk::CacheSize;
 use crate::storage::wal::CheckpointMode;
 use crate::translate::emitter::{Resolver, TransactionMode};
 use crate::translate::plan::BitSet;
-use crate::util::{normalize_ident, parse_signed_number, parse_string, IOExt as _};
+use crate::util::{
+    normalize_ident, parse_signed_number, parse_string, pragma_value_is_true, IOExt as _,
+};
 use crate::vdbe::builder::{ProgramBuilder, ProgramBuilderOpts};
 use crate::vdbe::insn::{Cookie, Insn};
 use crate::{
@@ -325,20 +327,6 @@ fn update_pragma(
     schema_was_explicit: bool,
     program: &mut ProgramBuilder,
 ) -> crate::Result<TransactionMode> {
-    let parse_pragma_enabled = |expr: &ast::Expr| -> bool {
-        if let Expr::Literal(Literal::Numeric(n)) = expr {
-            return !matches!(n.as_str(), "0");
-        };
-        let name_bytes = match expr {
-            Expr::Literal(Literal::Keyword(name)) => name.as_bytes(),
-            Expr::Name(name) | Expr::Id(name) => name.as_str().as_bytes(),
-            _ => "".as_bytes(),
-        };
-        match_ignore_ascii_case!(match name_bytes {
-            b"ON" | b"TRUE" | b"YES" | b"1" => true,
-            _ => false,
-        })
-    };
     match pragma {
         PragmaName::ApplicationId => {
             let data = parse_signed_number(&value)?;
@@ -377,7 +365,7 @@ fn update_pragma(
             Ok(TransactionMode::None)
         }
         PragmaName::CacheSpill => {
-            let enabled = parse_pragma_enabled(&value);
+            let enabled = pragma_value_is_true(&value);
             connection.get_pager().set_spill_enabled(enabled);
             connection.bump_prepare_context_generation();
             Ok(TransactionMode::None)
@@ -429,12 +417,12 @@ fn update_pragma(
             )
         }
         PragmaName::FullColumnNames => {
-            let enabled = parse_pragma_enabled(&value);
+            let enabled = pragma_value_is_true(&value);
             connection.set_full_column_names(enabled);
             Ok(TransactionMode::None)
         }
         PragmaName::ShortColumnNames => {
-            let enabled = parse_pragma_enabled(&value);
+            let enabled = pragma_value_is_true(&value);
             connection.set_short_column_names(enabled);
             Ok(TransactionMode::None)
         }
@@ -677,7 +665,7 @@ fn update_pragma(
             Ok(TransactionMode::None)
         }
         PragmaName::DataSyncRetry => {
-            let retry_enabled = parse_pragma_enabled(&value);
+            let retry_enabled = pragma_value_is_true(&value);
             connection.set_data_sync_retry(retry_enabled);
             Ok(TransactionMode::None)
         }
@@ -708,7 +696,7 @@ fn update_pragma(
             Ok(TransactionMode::None)
         }
         PragmaName::MvccGroupCommit => {
-            connection.set_mvcc_group_commit(parse_pragma_enabled(&value))?;
+            connection.set_mvcc_group_commit(pragma_value_is_true(&value))?;
             Ok(TransactionMode::None)
         }
         PragmaName::FtsMergeThreshold => {
@@ -722,28 +710,28 @@ fn update_pragma(
             Ok(TransactionMode::None)
         }
         PragmaName::ForeignKeys => {
-            let enabled = parse_pragma_enabled(&value);
+            let enabled = pragma_value_is_true(&value);
             connection.set_foreign_keys_enabled(enabled);
             Ok(TransactionMode::None)
         }
         PragmaName::IAmADummy | PragmaName::RequireWhere => {
-            let enabled = parse_pragma_enabled(&value);
+            let enabled = pragma_value_is_true(&value);
             connection.set_dml_require_where(enabled);
             Ok(TransactionMode::None)
         }
         PragmaName::CountChanges => {
-            let enabled = parse_pragma_enabled(&value);
+            let enabled = pragma_value_is_true(&value);
             connection.set_count_changes(enabled);
             Ok(TransactionMode::None)
         }
         PragmaName::IgnoreCheckConstraints => {
-            let enabled = parse_pragma_enabled(&value);
+            let enabled = pragma_value_is_true(&value);
             connection.set_check_constraints_ignored(enabled);
             Ok(TransactionMode::None)
         }
         #[cfg(target_vendor = "apple")]
         PragmaName::Fullfsync => {
-            let enabled = parse_pragma_enabled(&value);
+            let enabled = pragma_value_is_true(&value);
             let sync_type = if enabled {
                 crate::io::FileSyncType::FullFsync
             } else {
@@ -795,7 +783,7 @@ fn update_pragma(
             Ok(TransactionMode::None)
         }
         PragmaName::VdbeTrace => {
-            let enabled = parse_pragma_enabled(&value);
+            let enabled = pragma_value_is_true(&value);
             connection.set_vdbe_trace(enabled);
             Ok(TransactionMode::None)
         }
@@ -1541,34 +1529,7 @@ fn query_pragma(
         }
         PragmaName::QueryOnly => {
             if let Some(value_expr) = value {
-                let is_query_only = match value_expr {
-                    ast::Expr::Literal(Literal::Numeric(i)) => i
-                        .parse::<i64>()
-                        .map(|v| v != 0)
-                        .or_else(|_| i.parse::<f64>().map(|v| v != 0.0))
-                        .map_err(|_| {
-                            LimboError::ParseError(format!(
-                                "Invalid numeric value for PRAGMA query_only: {i}"
-                            ))
-                        })?,
-                    ast::Expr::Literal(Literal::String(..)) | ast::Expr::Name(..) => {
-                        let s = match &value_expr {
-                            ast::Expr::Literal(Literal::String(s)) => s.as_bytes(),
-                            ast::Expr::Name(n) => n.as_str().as_bytes(),
-                            _ => unreachable!(),
-                        };
-                        match_ignore_ascii_case!(match s {
-                            b"1" | b"on" | b"true" => true,
-                            _ => false,
-                        })
-                    }
-                    _ => {
-                        return Err(LimboError::ParseError(format!(
-                            "Invalid value for PRAGMA query_only: {value_expr:?}"
-                        )));
-                    }
-                };
-                connection.set_query_only(is_query_only);
+                connection.set_query_only(pragma_value_is_true(&value_expr));
                 return Ok(TransactionMode::None);
             };
 
