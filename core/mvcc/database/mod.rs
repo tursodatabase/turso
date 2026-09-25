@@ -5316,6 +5316,19 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                         .filter(|index| index.is_btree_backed())
                         .map(|index| index.root_page),
                 )
+                .chain(
+                    schema
+                        .broken_tables
+                        .values()
+                        .flat_map(|entry| {
+                            entry
+                                .index_root_pages
+                                .iter()
+                                .copied()
+                                .chain([entry.root_page])
+                        })
+                        .filter(|root| *root >= 2),
+                )
         };
         for root_page in sqlite_schema_root_pages {
             turso_assert!(root_page > 0, "root_page={root_page} must be positive");

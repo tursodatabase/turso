@@ -289,9 +289,9 @@ pub fn emit_fk_child_decrement_on_delete(
     database_id: usize,
     resolver: &Resolver,
 ) -> crate::Result<()> {
-    for fk_ref in
-        resolver.with_schema(database_id, |s| s.resolved_fks_for_child(child_table_name))?
-    {
+    for fk_ref in resolver.with_schema(database_id, |s| {
+        s.resolved_fks_for_child_delete(child_table_name)
+    })? {
         if !fk_ref.fk.deferred {
             continue;
         }
