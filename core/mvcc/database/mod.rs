@@ -1875,6 +1875,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CommitStateMachine<Clock, A> {
                     self.tx_id,
                     self.connection.as_ref(),
                     self.db_id,
+                    self.did_commit_schema_change,
                 );
             }
             self.end_read_tx_for_db();
@@ -3665,28 +3666,11 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> StateTransition for CommitStat
 
                 inject_transition_yield!(self, CommitYieldPoint::BeforeGlobalHeaderUpdate);
 
-                let tx_header = *tx_unlocked.header.read();
-                {
-                    // Hold the header lock across the watermark update and header
-                    // publish so the guard decision and replacement are serialized.
-                    let mut global_header = mvcc_store.global_header.write();
-                    // Since we assign a commit timestamp and then we drive the commit to completion,
-                    // it is totally possible for so an older transaction can finish after a newer one.
-                    // In such case, we should not let older commit to set lower value than previous.
-                    // This value is used in checkpointing as a watermark boundary, and an incorrect
-                    // lower value can cause data loss / corruption.
-                    let last_committed_ts = mvcc_store
-                        .last_committed_tx_ts
-                        .fetch_max(*end_ts, Ordering::AcqRel);
-                    if last_committed_ts <= *end_ts {
-                        global_header.replace(tx_header);
-                    }
-                }
-                if self.did_commit_schema_change {
-                    mvcc_store
-                        .last_committed_schema_change_ts
-                        .fetch_max(*end_ts, Ordering::AcqRel);
-                }
+                mvcc_store.publish_committed_tx_ts(
+                    tx_unlocked,
+                    *end_ts,
+                    self.did_commit_schema_change,
+                );
 
                 // We have now updated all the versions with a reference to the
                 // transaction ID to a timestamp and can, therefore, remove the
@@ -7098,7 +7082,13 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         crate::without_allocation_faults!(self.remove_tx(tx_id).expect(ALLOC_ERR_MSG));
     }
 
-    fn cleanup_dropped_commit(&self, tx_id: TxID, connection: &Connection, db_id: usize) {
+    fn cleanup_dropped_commit(
+        &self,
+        tx_id: TxID,
+        connection: &Connection,
+        db_id: usize,
+        did_commit_schema_change: bool,
+    ) {
         let tx_state = self.txs.get(&tx_id).map(|tx| {
             let tx = tx.value();
             match tx.state.load() {
@@ -7130,6 +7120,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                 if let Some(tx) = self.txs.get(&tx_id) {
                     self.notify_committed_dependents(tx.value());
                     self.unlock_commit_lock_if_held(tx.value());
+                    self.publish_committed_tx_ts(tx.value(), end_ts, did_commit_schema_change);
                 }
                 if self.is_exclusive_tx(&tx_id) {
                     self.release_exclusive_tx(&tx_id);
@@ -7146,6 +7137,33 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                     self.release_exclusive_tx(&tx_id);
                 }
             }
+        }
+    }
+
+    fn publish_committed_tx_ts(
+        &self,
+        tx: &Transaction<A>,
+        end_ts: u64,
+        did_commit_schema_change: bool,
+    ) {
+        let tx_header = *tx.header.read();
+        {
+            // Hold the header lock across the watermark update and header
+            // publish so the guard decision and replacement are serialized.
+            let mut global_header = self.global_header.write();
+            // An older transaction can finish after a newer one, so the
+            // watermark must never move backwards. Checkpoints use it as their
+            // upper bound, so a lower value can cause data loss.
+            let last_committed_ts = self
+                .last_committed_tx_ts
+                .fetch_max(end_ts, Ordering::AcqRel);
+            if last_committed_ts <= end_ts {
+                global_header.replace(tx_header);
+            }
+        }
+        if did_commit_schema_change {
+            self.last_committed_schema_change_ts
+                .fetch_max(end_ts, Ordering::AcqRel);
         }
     }
 
