@@ -2727,12 +2727,12 @@ impl OngoingCheckpoint {
     }
 
     #[inline]
-    /// Remove any completed write operations from `inflight_writes`,
+    /// Remove successfully completed write operations from `inflight_writes`,
     /// returns whether any progress was made.
     fn process_inflight_writes(&mut self) -> bool {
         let before_len = self.inflight_writes.len();
         self.inflight_writes
-            .retain(|w| !w.done.load(Ordering::Acquire));
+            .retain(|w| !w.done.load(Ordering::Acquire) || w.err.get().is_some());
         before_len > self.inflight_writes.len()
     }
 
@@ -11151,5 +11151,46 @@ pub mod test {
             result.everything_backfilled(),
             "checkpoint must succeed after rollback, not return Busy"
         );
+    }
+
+    #[test]
+    fn process_inflight_writes_keeps_failed_write_batches() {
+        use super::{CheckpointState, InflightWriteBatch, OngoingCheckpoint, WriteBatch};
+        use crate::Clock;
+
+        let io = MemoryIO::new();
+        let succeeded = InflightWriteBatch::new();
+        succeeded.done.store(true, Ordering::Release);
+        let failed = InflightWriteBatch::new();
+        failed
+            .err
+            .set(CompletionError::IOError(
+                std::io::ErrorKind::StorageFull,
+                "pwrite",
+            ))
+            .unwrap();
+        failed.done.store(true, Ordering::Release);
+        let mut ongoing_checkpoint = OngoingCheckpoint {
+            time: io.current_time_monotonic(),
+            min_frame: 0,
+            max_frame: 0,
+            current_page: 0,
+            state: CheckpointState::Processing,
+            pending_writes: WriteBatch::new(),
+            inflight_reads: Vec::new(),
+            inflight_writes: vec![succeeded, failed],
+            pages_to_checkpoint: Vec::new(),
+        };
+
+        assert!(ongoing_checkpoint.process_inflight_writes());
+        assert_eq!(ongoing_checkpoint.inflight_writes.len(), 1);
+        assert_eq!(
+            ongoing_checkpoint.first_write_error(),
+            Some(CompletionError::IOError(
+                std::io::ErrorKind::StorageFull,
+                "pwrite"
+            ))
+        );
+        assert!(!ongoing_checkpoint.complete());
     }
 }

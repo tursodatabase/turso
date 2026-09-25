@@ -177,14 +177,18 @@ pub trait File: Send + Sync {
                 let c_main = c.clone();
                 let outstanding = outstanding.clone();
                 let total_written = total_written.clone();
-                Completion::new_write(move |n| {
-                    if let Ok(n) = n {
+                Completion::new_write(move |n| match n {
+                    Ok(n) => {
                         // accumulate bytes actually reported by the backend
                         total_written.fetch_add(n as usize, Ordering::SeqCst);
                         if outstanding.fetch_sub(1, Ordering::AcqRel) == 1 {
                             // last one finished
                             c_main.complete(total_written.load(Ordering::Acquire) as i32);
                         }
+                    }
+                    Err(e) => {
+                        outstanding.fetch_sub(1, Ordering::AcqRel);
+                        c_main.error(e);
                     }
                 })
             };
