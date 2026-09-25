@@ -14,11 +14,10 @@ use crate::storage::btree::{BTreeCursor, BTreeKey, CursorTrait};
 use crate::sync::Arc;
 use crate::translate::plan::IterationDirection;
 use crate::types::{
-    compare_immutable, IOCompletions, IOResult, ImmutableRecord, IndexInfo, SeekKey, SeekOp,
-    SeekResult, Value,
+    compare_immutable, IOResult, ImmutableRecord, IndexInfo, SeekKey, SeekOp, SeekResult, Value,
 };
 use crate::vdbe::Register;
-use crate::{return_if_io, Completion, Connection, LimboError, Pager, Result};
+use crate::{return_if_io, Connection, LimboError, Pager, Result};
 use std::any::Any;
 use std::fmt::Debug;
 use std::ops::Bound;
@@ -545,7 +544,6 @@ pub struct MvccLazyCursor<Clock: LogicalClock + 'static, A: ConcurrentAllocator 
     eq_seek_row: Option<Row>,
     btree_cursor: Box<dyn CursorTrait>,
     null_flag: bool,
-    creating_new_rowid: bool,
     state: Option<MvccLazyCursorState>,
     // we keep count_state separate to be able to call other public functions like rewind and next
     count_state: Option<CountState>,
@@ -554,18 +552,6 @@ pub struct MvccLazyCursor<Clock: LogicalClock + 'static, A: ConcurrentAllocator 
     dual_peek: DualCursorPeek<A>,
     /// Forward scan over `index_rows`; see [`IndexShadowScan`].
     index_shadow_scan: IndexShadowScan<A>,
-}
-
-pub enum NextRowidResult {
-    /// We need to go to the last rowid and intialize allocator
-    Uninitialized,
-    /// It was initialized, so we get a new rowid
-    Next {
-        new_rowid: i64,
-        prev_rowid: Option<i64>,
-    },
-    /// We reached end of available rowids (i64::MAX), so we will have to try and find a random rowid.
-    FindRandom,
 }
 
 impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> MvccLazyCursor<Clock, A> {
@@ -614,7 +600,6 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> MvccLazyCursor<Clock
             eq_seek_row: None,
             btree_cursor,
             null_flag: false,
-            creating_new_rowid: false,
             state: None,
             count_state: None,
             btree_advance_state: None,
@@ -751,60 +736,13 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> MvccLazyCursor<Clock
         Ok(())
     }
 
-    pub fn start_new_rowid(&mut self) -> IOResultOr<NextRowidResult> {
-        tracing::trace!("start_new_rowid");
-
-        let allocator = self.db.get_rowid_allocator(&self.table_id);
-        let locked = allocator.lock();
-        if !locked {
-            // Yield, some other cursor is generating new rowid
-            return Ok(IOResult::IO(IOCompletions(Completion::new_yield())));
-        }
-
-        self.creating_new_rowid = true;
-        let res = if allocator.is_uninitialized() {
-            NextRowidResult::Uninitialized
-        } else if let Some((next_rowid, prev_max_rowid)) = allocator.get_next_rowid() {
-            NextRowidResult::Next {
-                new_rowid: next_rowid,
-                prev_rowid: prev_max_rowid,
-            }
-        } else {
-            NextRowidResult::FindRandom
-        };
-        Ok(IOResult::Done(res))
-    }
-
-    pub fn initialize_max_rowid(&mut self, max_rowid: Option<i64>) -> Result<()> {
-        let allocator = self.db.get_rowid_allocator(&self.table_id);
-        turso_assert!(
-            self.creating_new_rowid,
-            "cursor didn't start creating new rowid"
-        );
-        allocator.initialize(max_rowid);
-        Ok(())
-    }
-
-    /// Allocate the next rowid from the (already initialized) allocator.
-    /// Must be called while holding the allocator lock.
-    pub fn allocate_next_rowid(&self) -> Option<(i64, Option<i64>)> {
-        let allocator = self.db.get_rowid_allocator(&self.table_id);
-        allocator.get_next_rowid()
-    }
-
-    pub fn end_new_rowid(&mut self) {
-        tracing::trace!(
-            "end_new_rowid creating_new_rowid={}",
-            self.creating_new_rowid
-        );
-        // if we started creating a new rowid, we need to unlock the allocator
-        // this might be false if there was an error during `op_new_rowid` before calling `start_new_rowid` so we can call this function
-        // in any case
-        if self.creating_new_rowid {
-            let allocator = self.db.get_rowid_allocator(&self.table_id);
-            allocator.unlock();
-            self.creating_new_rowid = false;
-        }
+    /// Picks the next automatic rowid: one past the larger of the largest rowid
+    /// this transaction can see and the table's shared allocator watermark.
+    /// Returns None when that rowid would overflow.
+    pub fn allocate_rowid(&self, largest_visible_rowid: Option<i64>) -> Option<(i64, Option<i64>)> {
+        self.db
+            .get_rowid_allocator(&self.table_id)
+            .allocate_after(largest_visible_rowid)
     }
 
     fn get_immutable_record_or_create(&mut self) -> Result<&mut ImmutableRecord> {
@@ -1253,15 +1191,6 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> MvccLazyCursor<Clock
             }
         }
         Ok(())
-    }
-}
-
-impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> Drop for MvccLazyCursor<Clock, A> {
-    fn drop(&mut self) {
-        // Release the per-table RowidAllocator lock if a Statement was dropped
-        // while paused at an op_new_rowid IO yield. end_new_rowid is a no-op
-        // when creating_new_rowid is false, so this is safe in every case.
-        self.end_new_rowid();
     }
 }
 
