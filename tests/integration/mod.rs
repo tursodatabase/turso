@@ -21,6 +21,7 @@ mod pragma;
 mod query_processing;
 mod query_timeout;
 mod queued_io;
+mod registry_db_opts;
 mod reindex;
 mod statement_metadata;
 mod statement_reset;
