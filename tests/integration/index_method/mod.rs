@@ -1,3 +1,6 @@
+#[cfg(all(feature = "fts", not(target_family = "wasm")))]
+mod json;
+
 use crate::assertions::{AssertColumn, AssertQueryPlan, Cell, NULL};
 
 fn is_fts_lookup(detail: &rusqlite::types::Value) -> bool {
