@@ -531,6 +531,14 @@ pub struct Connection {
     /// (`db->nVdbeActive`) for user statements, excluding internal helpers and
     /// subprogram execution.
     pub(crate) n_active_root_statements: AtomicI32,
+    /// How many of `n_active_root_statements` have a Transaction opcode in
+    /// their program and have not finished yet. A statement is counted from
+    /// its first step, before it reaches the Transaction opcode, like SQLite
+    /// counts `db->nVdbeRead` at the start of `sqlite3Step`. The transaction
+    /// is shared by these statements, so only the last of them may end it.
+    /// Incremental blob handles are counted too, like in SQLite, because
+    /// they keep reading their row until they are closed.
+    pub(crate) n_active_txn_statements: AtomicI32,
     /// How many of `n_active_root_statements` are parked incremental blob
     /// handles. A blob handle keeps a Root statement open from `blob_open`
     /// until close, but between blob operations it just sits on its row, so

@@ -4,6 +4,7 @@ mod assert_details;
 #[macro_use]
 mod assertions;
 mod attach;
+mod auto_checkpoint_active_select;
 mod checkpoint_crash_atomicity;
 mod common;
 mod conflict_resolution;

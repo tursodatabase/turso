@@ -2290,8 +2290,12 @@ impl ProgramBuilder {
     ) -> crate::Result<PreparedProgram> {
         self.resolve_labels()?;
 
+        let mut uses_transaction = false;
         // Fill in the is_index field on Next and Prev, now that we know all cursor types
         for (insn, _) in self.insns.iter_mut() {
+            if matches!(insn, Insn::Transaction { .. }) {
+                uses_transaction = true;
+            }
             if let Insn::Next {
                 cursor_id,
                 is_index,
@@ -2346,6 +2350,7 @@ impl ProgramBuilder {
             prepare_context,
             write_databases: self.write_databases,
             read_databases: self.read_databases,
+            uses_transaction,
         };
         Ok(prepared)
     }
