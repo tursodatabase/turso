@@ -64,34 +64,26 @@ impl ReadRecord {
     }
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub enum WriteRow {
-    #[default]
-    GetRecord,
-    Delete {
-        rowid: i64,
-    },
+    GetRecord { seek: LeafBoundarySeek },
+    Delete { rowid: i64 },
     DeleteTable,
     DeleteIndex,
-    ComputeNewRowId {
-        final_weight: isize,
-    },
-    InsertNew {
-        rowid: i64,
-        final_weight: isize,
-    },
-    InsertNewRow {
-        rowid: i64,
-        final_weight: isize,
-    },
-    InsertIndex {
-        rowid: i64,
-    },
-    UpdateExisting {
-        rowid: i64,
-        final_weight: isize,
-    },
+    ComputeNewRowId { final_weight: isize },
+    InsertNew { rowid: i64, final_weight: isize },
+    InsertNewRow { rowid: i64, final_weight: isize },
+    InsertIndex { rowid: i64 },
+    UpdateExisting { rowid: i64, final_weight: isize },
     Done,
+}
+
+impl Default for WriteRow {
+    fn default() -> Self {
+        Self::GetRecord {
+            seek: LeafBoundarySeek::default(),
+        }
+    }
 }
 
 impl WriteRow {
@@ -115,18 +107,14 @@ impl WriteRow {
     ) -> IOResultOr<()> {
         loop {
             match self {
-                WriteRow::GetRecord => {
-                    // First, seek in the index to find if the row exists
-                    let index_values = index_key.clone();
-                    let index_record =
-                        ImmutableRecord::from_values(&index_values, index_values.len())?;
-
-                    let res = return_if_io!(cursors.index_cursor.seek(
-                        SeekKey::IndexKey(index_record.as_record_ref()),
-                        SeekOp::GE { eq_only: true }
+                WriteRow::GetRecord { seek } => {
+                    let found = return_if_io!(seek_dbsp_index_key(
+                        seek,
+                        &mut cursors.index_cursor,
+                        &index_key
                     ));
 
-                    if !matches!(res, SeekResult::Found) {
+                    if !found {
                         // Row doesn't exist, we'll insert a new one
                         *self = WriteRow::ComputeNewRowId {
                             final_weight: weight,
@@ -299,6 +287,42 @@ impl WriteRow {
                 }
             }
         }
+    }
+}
+
+/// Returns whether the DBSP state index holds an entry whose
+/// `(storage_id, key_hash, element_hash)` prefix equals `index_key`, and leaves
+/// the cursor on it.
+pub fn seek_dbsp_index_key<C: CursorTrait>(
+    seek: &mut LeafBoundarySeek,
+    cursor: &mut C,
+    index_key: &[Value],
+) -> IOResultOr<bool> {
+    let index_record = ImmutableRecord::from_values(index_key, index_key.len())?;
+    seek.seek(
+        cursor,
+        SeekKey::IndexKey(index_record.as_record_ref()),
+        SeekOp::GE { eq_only: true },
+    )
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub enum LeafBoundarySeek {
+    #[default]
+    Seeking,
+}
+
+impl LeafBoundarySeek {
+    /// Puts `cursor` on the first entry that satisfies `op` and returns whether there
+    /// is one.
+    pub fn seek<C: CursorTrait>(
+        &mut self,
+        cursor: &mut C,
+        key: SeekKey<'_>,
+        op: SeekOp,
+    ) -> IOResultOr<bool> {
+        let result = return_if_io!(cursor.seek(key, op));
+        Ok(IOResult::Done(matches!(result, SeekResult::Found)))
     }
 }
 
