@@ -1513,19 +1513,29 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
 
     fn truncate_logical_log(&self) -> Result<Completion> {
         use crate::mvcc::persistent_storage::LogicalLogTruncateOutcome;
-        let boundary = if self.mode.should_restart_log() {
+        let boundary = if self.clears_whole_logical_log() {
             u64::MAX
         } else {
             self.durable_txid_max_new
         };
         let (c, outcome) = self.mvstore.storage.truncate(boundary)?;
-        if self.mode.should_restart_log() {
+        if self.clears_whole_logical_log() {
             turso_assert!(
                 matches!(outcome, LogicalLogTruncateOutcome::Truncated),
                 "TRUNCATE checkpoint must clear the logical log"
             );
         }
         Ok(c)
+    }
+
+    /// A TRUNCATE checkpoint may clear the whole logical log only when it holds the
+    /// blocking checkpoint lock from before `snapshot_ts` and writers respect it. Then
+    /// every frame in the log was written to the B-tree by this checkpoint. With
+    /// `experimental_mvcc_passive_checkpoint` enabled, the checkpoint collects rows before
+    /// taking the lock and writers never take it, so writers can commit after the
+    /// snapshot and those frames must stay in the log.
+    fn clears_whole_logical_log(&self) -> bool {
+        self.mode.should_restart_log() && !self.mvstore.uses_passive_checkpoint()
     }
 
     /// Perform a TRUNCATE checkpoint on the WAL
@@ -2906,7 +2916,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
                 self.state = CheckpointState::FsyncLogicalLog;
                 // if Completion Completed without errors we can continue
                 if c.succeeded() {
-                    if self.mode.should_restart_log() {
+                    if self.clears_whole_logical_log() {
                         turso_assert!(
                             self.mvstore.storage.logical_log_offset() == 0,
                             "TRUNCATE checkpoint must reset logical log offset to 0"

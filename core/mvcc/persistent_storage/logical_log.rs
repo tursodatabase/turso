@@ -1049,8 +1049,9 @@ impl LogicalLog {
         Ok(c)
     }
 
-    /// Truncate when `max_appended_commit_ts <= boundary`; passive uses `durable_txid_max_new`,
-    /// truncate mode uses `u64::MAX` (always empty after checkpoint).
+    /// Truncate when `max_appended_commit_ts <= boundary`. Checkpoints that collected
+    /// without the blocking lock pass `durable_txid_max_new` so later commits survive;
+    /// the blocking TRUNCATE path passes `u64::MAX` (always empty after checkpoint).
     pub fn truncate(
         &mut self,
         checkpointed_through_ts: u64,
