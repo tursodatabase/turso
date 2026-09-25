@@ -1841,12 +1841,14 @@ impl alloc::TryClone for ColumnMask {
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct BitSet<T = usize> {
     inline: u64,
-    /// invariant: `overflow` is `None` iff no bits ≥ 64 are set.
+    /// invariant: `overflow` is `None` iff no bits ≥ 64 are set. When it is
+    /// `Some`, the vector is never empty and its last word is never zero.
     overflow: Option<alloc::Vec<u64>>,
     _phantom: PhantomData<fn() -> T>,
 }
 
 impl<T> Default for BitSet<T> {
+    #[inline]
     fn default() -> Self {
         Self {
             inline: 0,
@@ -1859,6 +1861,7 @@ impl<T> Default for BitSet<T> {
 impl<T> alloc::TryClone for BitSet<T> {
     type Error = alloc::TryReserveError;
 
+    #[inline]
     fn try_clone(&self) -> Result<Self, Self::Error> {
         Ok(Self {
             inline: self.inline,
@@ -1872,32 +1875,43 @@ impl<T> alloc::TryClone for BitSet<T> {
 /// for the whole bitset.
 pub struct BitSetIter<T, B: std::borrow::Borrow<BitSet<T>>> {
     bitset: B,
-    /// Remaining bits to drain from the word currently pointed at by `word`.
+    /// Remaining bits to drain from the word that starts at `base`.
     current: u64,
-    /// `0` = inline word, `1..=overflow.len()` = `overflow[word - 1]`.
-    word: usize,
+    /// Position of bit 0 of `current` in the whole bitset.
+    base: usize,
+    /// Index of the next overflow word to drain.
+    next_overflow_word: usize,
     _phantom: PhantomData<fn() -> T>,
 }
 
 impl<T: From<usize>, B: std::borrow::Borrow<BitSet<T>>> Iterator for BitSetIter<T, B> {
     type Item = T;
 
+    #[inline]
     fn next(&mut self) -> Option<Self::Item> {
         loop {
             if self.current != 0 {
                 let bit = self.current.trailing_zeros() as usize;
                 self.current &= self.current - 1;
-                let base = if self.word == 0 {
-                    0
-                } else {
-                    BitSet::<T>::INLINE_BITS + (self.word - 1) * 64
-                };
-                return Some(T::from(base + bit));
+                return Some(T::from(self.base + bit));
             }
-            self.word += 1;
             let overflow = self.bitset.borrow().overflow.as_ref()?;
-            self.current = *overflow.get(self.word - 1)?;
+            let word = *overflow.get(self.next_overflow_word)?;
+            self.base = BitSet::<T>::INLINE_BITS + self.next_overflow_word * 64;
+            self.next_overflow_word += 1;
+            self.current = word;
         }
+    }
+
+    #[inline]
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let mut remaining = self.current.count_ones() as usize;
+        if let Some(overflow) = &self.bitset.borrow().overflow {
+            for &word in overflow.iter().skip(self.next_overflow_word) {
+                remaining += word.count_ones() as usize;
+            }
+        }
+        (remaining, Some(remaining))
     }
 }
 
@@ -1905,11 +1919,13 @@ impl<'a, T: From<usize>> IntoIterator for &'a BitSet<T> {
     type Item = T;
     type IntoIter = BitSetIter<T, &'a BitSet<T>>;
 
+    #[inline]
     fn into_iter(self) -> Self::IntoIter {
         BitSetIter {
             current: self.inline,
             bitset: self,
-            word: 0,
+            base: 0,
+            next_overflow_word: 0,
             _phantom: PhantomData,
         }
     }
@@ -1919,11 +1935,13 @@ impl<T: From<usize>> IntoIterator for BitSet<T> {
     type Item = T;
     type IntoIter = BitSetIter<T, BitSet<T>>;
 
+    #[inline]
     fn into_iter(self) -> Self::IntoIter {
         BitSetIter {
             current: self.inline,
             bitset: self,
-            word: 0,
+            base: 0,
+            next_overflow_word: 0,
             _phantom: PhantomData,
         }
     }
@@ -1937,53 +1955,41 @@ impl<T: From<usize>> BitSet<T>
 where
     usize: From<T>,
 {
+    #[inline]
     pub fn set(&mut self, index: T) -> Result<(), alloc::TryReserveError> {
         let index: usize = index.into();
         if index < Self::INLINE_BITS {
             self.inline |= 1 << index;
-        } else {
-            let overflow_idx = (index - Self::INLINE_BITS) / 64;
-            let bit = (index - Self::INLINE_BITS) % 64;
-            let overflow = self.overflow.get_or_insert_with(|| alloc::vec![]);
-            if overflow_idx >= overflow.len() {
-                overflow.try_reserve(overflow_idx + 1 - overflow.len())?;
-                overflow.resize(overflow_idx + 1, 0);
-            }
-            overflow[overflow_idx] |= 1 << bit;
+            return Ok(());
         }
-        Ok(())
+        Self::set_overflow(&mut self.overflow, index)
     }
 
     pub fn get(&self, index: T) -> bool {
         let index: usize = index.into();
         if index < Self::INLINE_BITS {
-            (self.inline >> index) & 1 != 0
-        } else {
-            let Some(overflow) = &self.overflow else {
-                return false;
-            };
-            let overflow_idx = (index - Self::INLINE_BITS) / 64;
-            let bit = (index - Self::INLINE_BITS) % 64;
-            overflow
-                .get(overflow_idx)
-                .is_some_and(|word| (word >> bit) & 1 != 0)
+            return (self.inline >> index) & 1 != 0;
         }
+        let Some(words) = &self.overflow else {
+            return false;
+        };
+        let (word_index, bit) = Self::overflow_position(index);
+        words
+            .get(word_index)
+            .is_some_and(|word| (word >> bit) & 1 != 0)
     }
 
+    #[inline]
     pub fn clear(&mut self, index: T) {
         let index: usize = index.into();
         if index < Self::INLINE_BITS {
             self.inline &= !(1 << index);
-        } else if let Some(overflow) = &mut self.overflow {
-            let overflow_idx = (index - Self::INLINE_BITS) / 64;
-            let bit = (index - Self::INLINE_BITS) % 64;
-            if let Some(word) = overflow.get_mut(overflow_idx) {
-                *word &= !(1 << bit);
-            }
-            self.trim_overflow();
+            return;
         }
+        Self::clear_overflow(&mut self.overflow, index);
     }
 
+    #[inline]
     pub fn contains_all_set_bits_of(&self, other: &Self) -> bool {
         if (self.inline & other.inline) != other.inline {
             return false;
@@ -1991,18 +1997,17 @@ where
         match (&self.overflow, &other.overflow) {
             (_, None) => true,
             (None, Some(_)) => false,
-            (Some(self_ov), Some(other_ov)) => {
-                if other_ov.len() > self_ov.len() {
-                    return false;
-                }
-                self_ov
-                    .iter()
-                    .zip(other_ov.iter())
-                    .all(|(&s, &o)| (s & o) == o)
+            (Some(words), Some(other_words)) => {
+                other_words.len() <= words.len()
+                    && words
+                        .iter()
+                        .zip(other_words)
+                        .all(|(&word, &other_word)| (word & other_word) == other_word)
             }
         }
     }
 
+    #[inline]
     pub fn is_empty(&self) -> bool {
         self.inline == 0 && self.overflow.is_none()
     }
@@ -2010,73 +2015,54 @@ where
     pub fn is_only(&self, index: T) -> bool {
         let index: usize = index.into();
         if index < Self::INLINE_BITS {
-            self.inline == (1 << index)
-                && self
-                    .overflow
-                    .as_ref()
-                    .is_none_or(|ov| ov.iter().all(|&w| w == 0))
-        } else {
-            if self.inline != 0 {
-                return false;
-            }
-            let Some(overflow) = &self.overflow else {
-                return false;
-            };
-            let overflow_idx = (index - Self::INLINE_BITS) / 64;
-            let bit = (index - Self::INLINE_BITS) % 64;
-            // The overflow vector must be long enough to contain the target index
-            if overflow_idx >= overflow.len() {
-                return false;
-            }
-            overflow.iter().enumerate().all(|(i, &w)| {
-                if i == overflow_idx {
-                    w == (1 << bit)
-                } else {
-                    w == 0
-                }
-            })
+            return self.inline == 1 << index && self.overflow.is_none();
         }
+        if self.inline != 0 {
+            return false;
+        }
+        let Some(words) = &self.overflow else {
+            return false;
+        };
+        let (word_index, bit) = Self::overflow_position(index);
+        words.len() == word_index + 1
+            && words[word_index] == 1 << bit
+            && words[..word_index].iter().all(|&word| word == 0)
     }
 
+    #[inline]
     pub fn subtract(&mut self, other: &Self) {
         self.inline &= !other.inline;
-        if let (Some(self_ov), Some(other_ov)) = (&mut self.overflow, &other.overflow) {
-            for (s, &o) in self_ov.iter_mut().zip(other_ov.iter()) {
-                *s &= !o;
-            }
-            self.trim_overflow();
+        if let Some(other_words) = other.overflow.as_deref() {
+            Self::subtract_overflow(&mut self.overflow, other_words);
         }
     }
 
+    #[inline]
     pub fn union_with(&mut self, other: &Self) -> Result<(), alloc::TryReserveError> {
         self.inline |= other.inline;
-        if let Some(other_ov) = &other.overflow {
-            let self_ov = self.overflow.get_or_insert_with(|| alloc::vec![]);
-            if self_ov.len() < other_ov.len() {
-                self_ov.try_reserve(other_ov.len() - self_ov.len())?;
-                self_ov.resize(other_ov.len(), 0);
-            }
-            for (s, &o) in self_ov.iter_mut().zip(other_ov.iter()) {
-                *s |= o;
-            }
+        match other.overflow.as_deref() {
+            Some(other_words) => Self::union_overflow(&mut self.overflow, other_words),
+            None => Ok(()),
         }
-        Ok(())
     }
 
+    #[inline]
     pub fn iter(&self) -> BitSetIter<T, &Self> {
         BitSetIter {
             current: self.inline,
             bitset: self,
-            word: 0,
+            base: 0,
+            next_overflow_word: 0,
             _phantom: PhantomData,
         }
     }
 
     /// returns the number of set bits
+    #[inline]
     pub fn count(&self) -> usize {
         let mut count = self.inline.count_ones() as usize;
-        if let Some(ref ov) = self.overflow {
-            for &word in ov {
+        if let Some(words) = &self.overflow {
+            for &word in words {
                 count += word.count_ones() as usize;
             }
         }
@@ -2086,57 +2072,119 @@ where
     /// Returns the number of set bits strictly below `index`.
     pub fn rank(&self, index: T) -> usize {
         let index: usize = index.into();
-        if index == 0 {
-            return 0;
-        }
-        if index <= Self::INLINE_BITS {
-            let mask = if index < 64 {
-                (1u64 << index) - 1
-            } else {
-                u64::MAX
-            };
-            return (self.inline & mask).count_ones() as usize;
+        if index < Self::INLINE_BITS {
+            return (self.inline & Self::mask_below(index)).count_ones() as usize;
         }
         let mut count = self.inline.count_ones() as usize;
-        let Some(ref ov) = self.overflow else {
+        let offset = index - Self::INLINE_BITS;
+        let full_words = offset / 64;
+        let Some(words) = &self.overflow else {
             return count;
         };
-        let remaining = index - Self::INLINE_BITS;
-        let full_words = remaining / 64;
-        let extra_bits = remaining % 64;
-        for &word in ov.iter().take(full_words) {
+        for &word in words.iter().take(full_words) {
             count += word.count_ones() as usize;
         }
-        if extra_bits > 0 {
-            if let Some(&word) = ov.get(full_words) {
-                count += (word & ((1u64 << extra_bits) - 1)).count_ones() as usize;
-            }
+        if let Some(&word) = words.get(full_words) {
+            count += (word & Self::mask_below(offset % 64)).count_ones() as usize;
         }
         count
     }
 
-    pub(crate) fn intersects(&self, other: &Self) -> bool {
+    #[inline]
+    pub fn intersects(&self, other: &Self) -> bool {
         if (self.inline & other.inline) != 0 {
             return true;
         }
         match (&self.overflow, &other.overflow) {
-            (Some(self_ov), Some(other_ov)) => self_ov
+            (Some(words), Some(other_words)) => words
                 .iter()
-                .zip(other_ov.iter())
-                .any(|(&a, &b)| (a & b) != 0),
+                .zip(other_words)
+                .any(|(&word, &other_word)| (word & other_word) != 0),
             _ => false,
         }
     }
+}
 
-    fn trim_overflow(&mut self) {
-        if let Some(overflow) = &mut self.overflow {
-            while overflow.last() == Some(&0) {
-                overflow.pop();
-            }
-            if overflow.is_empty() {
-                self.overflow = None;
-            }
+impl<T> BitSet<T> {
+    #[cold]
+    fn set_overflow(
+        overflow: &mut Option<alloc::Vec<u64>>,
+        index: usize,
+    ) -> Result<(), alloc::TryReserveError> {
+        let (word_index, bit) = Self::overflow_position(index);
+        let words = overflow.get_or_insert_with(|| alloc::vec![]);
+        if word_index >= words.len() {
+            words.try_reserve(word_index + 1 - words.len())?;
+            words.resize(word_index + 1, 0);
         }
+        words[word_index] |= 1 << bit;
+        Ok(())
+    }
+
+    #[cold]
+    fn clear_overflow(overflow: &mut Option<alloc::Vec<u64>>, index: usize) {
+        let (word_index, bit) = Self::overflow_position(index);
+        let Some(words) = overflow else {
+            return;
+        };
+        if let Some(word) = words.get_mut(word_index) {
+            *word &= !(1 << bit);
+        }
+        Self::trim_overflow(overflow);
+    }
+
+    #[cold]
+    fn subtract_overflow(overflow: &mut Option<alloc::Vec<u64>>, other_words: &[u64]) {
+        let Some(words) = &mut *overflow else {
+            return;
+        };
+        for (word, &other_word) in words.iter_mut().zip(other_words) {
+            *word &= !other_word;
+        }
+        Self::trim_overflow(overflow);
+    }
+
+    #[cold]
+    fn union_overflow(
+        overflow: &mut Option<alloc::Vec<u64>>,
+        other_words: &[u64],
+    ) -> Result<(), alloc::TryReserveError> {
+        let Some(words) = overflow else {
+            let mut copied = alloc::vec![];
+            copied.try_reserve(other_words.len())?;
+            copied.extend_from_slice(other_words);
+            *overflow = Some(copied);
+            return Ok(());
+        };
+        if words.len() < other_words.len() {
+            words.try_reserve(other_words.len() - words.len())?;
+            words.resize(other_words.len(), 0);
+        }
+        for (word, &other_word) in words.iter_mut().zip(other_words) {
+            *word |= other_word;
+        }
+        Ok(())
+    }
+
+    fn trim_overflow(overflow: &mut Option<alloc::Vec<u64>>) {
+        let Some(words) = &mut *overflow else {
+            return;
+        };
+        match words.iter().rposition(|&word| word != 0) {
+            Some(last_set) => words.truncate(last_set + 1),
+            None => *overflow = None,
+        }
+    }
+
+    #[inline]
+    fn overflow_position(index: usize) -> (usize, usize) {
+        let offset = index - Self::INLINE_BITS;
+        (offset / 64, offset % 64)
+    }
+
+    #[inline]
+    fn mask_below(bits: usize) -> u64 {
+        (1u64 << bits) - 1
     }
 }
 
@@ -4209,6 +4257,30 @@ mod tests {
         // Empty mask iter
         let empty = ColumnUsedMask::default();
         assert_eq!(empty.iter().count(), 0);
+        Ok(())
+    }
+
+    #[test]
+    fn test_bitset_iter_size_hint_matches_remaining() -> TestResult {
+        let mut mask = ColumnUsedMask::default();
+        let indices = [0, 5, 63, 64, 65, 127, 200];
+        for &index in &indices {
+            mask.set(index)?;
+        }
+
+        let mut iter = mask.iter();
+        let mut remaining = indices.len();
+        loop {
+            assert_eq!(iter.size_hint(), (remaining, Some(remaining)));
+            if iter.next().is_none() {
+                break;
+            }
+            remaining -= 1;
+        }
+        assert_eq!(remaining, 0);
+
+        let empty = ColumnUsedMask::default();
+        assert_eq!(empty.iter().size_hint(), (0, Some(0)));
         Ok(())
     }
 

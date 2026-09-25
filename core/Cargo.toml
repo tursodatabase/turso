@@ -300,6 +300,11 @@ name = "prepare_benchmark"
 harness = false
 
 [[bench]]
+name = "bitset_benchmark"
+harness = false
+required-features = ["bench"]
+
+[[bench]]
 name = "record_recycling"
 harness = false
 
