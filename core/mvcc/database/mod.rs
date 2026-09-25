@@ -8508,6 +8508,8 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
     /// Key-set mutation of `index_rows` (insert or empty-slot remove); see field docs.
     pub(crate) fn bump_index_rows_epoch(&self) {
         self.index_rows_epoch.fetch_add(1, Ordering::SeqCst);
+        #[cfg(shuttle)]
+        crate::thread::yield_now();
     }
 
     #[turso_macros::allocation_site(crate::alloc::MvStoreAllocationSite::IndexRowsEntry)]
