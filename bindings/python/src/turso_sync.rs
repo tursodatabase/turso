@@ -224,6 +224,8 @@ pub fn py_turso_sync_new(
         push_operations_threshold: sync_config.push_operations_threshold,
         pull_bytes_threshold: sync_config.pull_bytes_threshold,
         logical_mvcc_pull: sync_config.logical_mvcc_pull,
+        // the tape stays on: this binding pushes through the engine
+        cdc_mode: None,
     };
     let database =
         TursoDatabaseSync::<Vec<u8>>::new(db_config, sync_config).map_err(turso_error_to_py_err)?;
