@@ -430,6 +430,37 @@ pub struct RecursiveCtePlan {
 }
 
 impl Plan {
+    /// The SELECTs of a SELECT or compound SELECT plan, from left to right.
+    /// A recursive CTE, DELETE, or UPDATE plan has none.
+    pub fn selects(&self) -> Vec<&SelectPlan> {
+        match self {
+            Plan::Select(select) => vec![select],
+            Plan::CompoundSelect {
+                left, right_most, ..
+            } => left
+                .iter()
+                .map(|(select, _)| select)
+                .chain(std::iter::once(right_most.as_ref()))
+                .collect(),
+            Plan::RecursiveCte(_) | Plan::Delete(_) | Plan::Update(_) => vec![],
+        }
+    }
+
+    /// The SELECTs of [Self::selects], for changing them in place.
+    pub fn selects_mut(&mut self) -> Vec<&mut SelectPlan> {
+        match self {
+            Plan::Select(select) => vec![select],
+            Plan::CompoundSelect {
+                left, right_most, ..
+            } => left
+                .iter_mut()
+                .map(|(select, _)| select)
+                .chain(std::iter::once(right_most.as_mut()))
+                .collect(),
+            Plan::RecursiveCte(_) | Plan::Delete(_) | Plan::Update(_) => vec![],
+        }
+    }
+
     /// Return the estimated work for this plan's expected number of calls.
     pub(crate) fn estimated_cost(&self) -> Option<f64> {
         match self {

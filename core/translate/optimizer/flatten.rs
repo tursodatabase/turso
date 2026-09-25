@@ -219,12 +219,7 @@ fn flatten_subquery(plan: &mut SelectPlan, position: usize) -> Result<()> {
     };
     let mut inner = *inner;
 
-    let replacements = subquery
-        .columns
-        .iter()
-        .enumerate()
-        .map(|(index, column)| replacement_for_column(&inner, column, index))
-        .collect::<Result<Vec<_>>>()?;
+    let replacements = replacements_for_columns(&inner, &subquery.columns)?;
 
     let mut inner_tables = std::mem::take(inner.table_references.joined_tables_mut());
     let first_inner_table_id = inner_tables[0].internal_id;
@@ -250,16 +245,7 @@ fn flatten_subquery(plan: &mut SelectPlan, position: usize) -> Result<()> {
         }
     }
     for expr in plan.exprs_mut() {
-        walk_expr_mut(expr, &mut |expr: &mut Expr| -> Result<WalkControl> {
-            if let Expr::Column { table, column, .. } = expr {
-                if *table == subquery_id {
-                    *expr = replacements[*column].clone();
-                    return Ok(WalkControl::SkipChildren);
-                }
-            }
-            Ok(WalkControl::Continue)
-        })
-        .expect("replacing column references cannot fail");
+        replace_subquery_columns(expr, subquery_id, &replacements);
     }
 
     for term in inner.where_clause {
@@ -327,6 +313,19 @@ fn save_subquery_column_names(plan: &mut SelectPlan, position: usize) {
     }
 }
 
+/// The expressions that replace references to the subquery's columns, one
+/// for each column, taken from the result columns of `inner`.
+pub(super) fn replacements_for_columns(
+    inner: &SelectPlan,
+    columns: &[Column],
+) -> Result<Vec<Expr>> {
+    columns
+        .iter()
+        .enumerate()
+        .map(|(index, column)| replacement_for_column(inner, column, index))
+        .collect()
+}
+
 /// The expression that replaces a reference to subquery column `index`.
 fn replacement_for_column(inner: &SelectPlan, column: &Column, index: usize) -> Result<Expr> {
     let expr = &inner.result_columns[index].expr;
@@ -346,4 +345,22 @@ fn column_is_copied_unchanged(inner: &SelectPlan, column: &Column, index: usize)
     Ok(matches!(expr, Expr::Column { .. } | Expr::RowId { .. })
         && get_collseq_from_expr(expr, &inner.table_references)?.unwrap_or_default()
             == column.collation())
+}
+
+/// Replace each reference to a column of the subquery with its replacement.
+pub(super) fn replace_subquery_columns(
+    expr: &mut Expr,
+    subquery_id: TableInternalId,
+    replacements: &[Expr],
+) {
+    walk_expr_mut(expr, &mut |expr: &mut Expr| -> Result<WalkControl> {
+        if let Expr::Column { table, column, .. } = expr {
+            if *table == subquery_id {
+                *expr = replacements[*column].clone();
+                return Ok(WalkControl::SkipChildren);
+            }
+        }
+        Ok(WalkControl::Continue)
+    })
+    .expect("replacing column references cannot fail");
 }

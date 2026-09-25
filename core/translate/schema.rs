@@ -930,17 +930,7 @@ fn derive_ctas_schema(
         _ => bail_parse_error!("unexpected plan type for CTAS"),
     };
     // SQLite derives a compound output affinity from all arms, not only the leftmost arm.
-    let compound_arms = match &plan {
-        Plan::CompoundSelect {
-            left, right_most, ..
-        } => {
-            let mut arms = Vec::with_capacity(left.len() + 1);
-            arms.extend(left.iter().map(|(select, _)| select));
-            arms.push(right_most);
-            Some(arms)
-        }
-        _ => None,
-    };
+    let compound_arms = matches!(plan, Plan::CompoundSelect { .. }).then(|| plan.selects());
 
     // Collect names first, then deduplicate using SQLite's :N suffix convention.
     let mut names: Vec<String> = result_columns

@@ -461,10 +461,11 @@ pub enum Expr {
     /// `COLLATE`: expression
     Collate(Box<Expr>, Name),
     /// The expression of a FROM-clause subquery column, put in place of a
-    /// reference to that column when the subquery is merged into its parent
-    /// (produced by the optimizer, not by the parser). The value keeps the
-    /// column's collation with the priority of a table column's collation,
-    /// and it loses its subtype, as it would when read from the subquery.
+    /// reference to that column when the optimizer flattens the subquery or
+    /// copies a term into it (produced by the optimizer, not by the parser).
+    /// The value keeps the column's collation with the priority of a table
+    /// column's collation, and it loses its subtype, as it would when read
+    /// from the subquery.
     SubqueryColumnValue {
         /// the result expression of the subquery
         expr: Box<Expr>,

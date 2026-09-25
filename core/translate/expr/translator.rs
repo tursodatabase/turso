@@ -647,10 +647,7 @@ pub fn translate_expr(
             program.emit_insn(Insn::ClearSubtype {
                 reg: target_register,
             });
-            program.set_collation(Some((
-                subquery_column_value_collation(collation),
-                false,
-            )));
+            program.set_collation(Some((subquery_column_value_collation(collation), false)));
             Ok(target_register)
         }
         ast::Expr::DoublyQualified(_, _, _) => {

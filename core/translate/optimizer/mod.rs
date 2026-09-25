@@ -88,6 +88,7 @@ pub(crate) mod join;
 pub(crate) mod lift_common_subexpressions;
 pub(crate) mod multi_index;
 pub(crate) mod order;
+mod push_down;
 pub(crate) mod unnest;
 
 #[derive(Debug, Default)]
@@ -967,6 +968,7 @@ fn optimize_select_plan_with_cache(
     cache: &mut SubqueryPlanCache,
 ) -> Result<()> {
     flatten::flatten_from_clause_subqueries(plan, resolver)?;
+    push_down::push_where_terms_into_subqueries(plan, resolver)?;
     if !plan
         .non_from_clause_subqueries
         .iter()
@@ -1874,18 +1876,10 @@ fn optimize_plan_for_calls(
         optimize_select_plan_with_cache(plan, resolver, cache)
     };
 
-    match plan {
-        Plan::Select(plan) => optimize(plan),
-        Plan::CompoundSelect {
-            left, right_most, ..
-        } => {
-            for (plan, _) in left {
-                optimize(plan)?;
-            }
-            optimize(right_most)
-        }
-        Plan::RecursiveCte(_) | Plan::Delete(_) | Plan::Update(_) => Ok(()),
+    for select in plan.selects_mut() {
+        optimize(select)?;
     }
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
