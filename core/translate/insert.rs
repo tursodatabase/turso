@@ -2093,15 +2093,13 @@ fn bind_insert(
             upsert = upsert_opt.take();
         }
     }
-    if let ResolveType::Ignore = on_conflict {
-        program.set_resolve_type(ResolveType::Ignore);
-        upsert.replace(Box::new(ast::Upsert {
+    program.set_resolve_type(on_conflict);
+    if on_conflict == ResolveType::Ignore && upsert.is_none() {
+        upsert = Some(Box::new(ast::Upsert {
             do_clause: UpsertDo::Nothing,
             index: None,
             next: None,
         }));
-    } else {
-        program.set_resolve_type(on_conflict);
     }
     while let Some(mut upsert_opt) = upsert.take() {
         if let UpsertDo::Set {
