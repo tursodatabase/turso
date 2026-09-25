@@ -1641,6 +1641,7 @@ pub struct Pager {
     enable_encryption: AtomicBool,
     /// In Memory Page 1 for Empty Dbs
     init_page_1: Arc<ArcSwapOption<Page>>,
+    initial_database_page_size: Arc<AtomicU32>,
     /// Sync type for durability. FullFsync uses F_FULLFSYNC on macOS (PRAGMA fullfsync).
     /// Only stored on Apple platforms; on others, always returns Fsync.
     #[cfg(target_vendor = "apple")]
@@ -1890,6 +1891,7 @@ pub struct CollectingState {
 }
 
 impl Pager {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         db_file: Arc<dyn DatabaseStorage>,
         wal: Option<Arc<dyn Wal>>,
@@ -1898,6 +1900,7 @@ impl Pager {
         buffer_pool: Arc<BufferPool>,
         init_lock: Arc<Mutex<()>>,
         init_page_1: Arc<ArcSwapOption<Page>>,
+        initial_database_page_size: Arc<AtomicU32>,
     ) -> Result<Self> {
         let allocate_page1_state = if init_page_1.load().is_some() {
             RwLock::new(AllocatePage1State::Start)
@@ -1950,6 +1953,7 @@ impl Pager {
             io_ctx: RwLock::new(IOContext::default()),
             enable_encryption: AtomicBool::new(false),
             init_page_1,
+            initial_database_page_size,
             #[cfg(target_vendor = "apple")]
             sync_type: AtomicFileSyncType::new(FileSyncType::Fsync),
             cursor_registry: Mutex::new(rustc_hash::FxHashMap::default()),
@@ -3261,6 +3265,7 @@ impl Pager {
     #[inline(always)]
     #[cfg_attr(debug_assertions, instrument(skip_all, level = Level::DEBUG))]
     pub fn begin_read_tx(&self) -> Result<()> {
+        self.use_page_size_of_database_created_elsewhere();
         let Some(wal) = self.wal.as_ref() else {
             return Ok(());
         };
@@ -3272,6 +3277,21 @@ impl Pager {
             self.set_schema_cookie(None);
         }
         Ok(())
+    }
+
+    fn use_page_size_of_database_created_elsewhere(&self) {
+        if !matches!(*self.allocate_page1_state.read(), AllocatePage1State::Start)
+            || !self.db_initialized()
+        {
+            return;
+        }
+        let page_size = PageSize::new(self.initial_database_page_size.load(Ordering::SeqCst))
+            .expect("the pager that created page 1 must publish its page size");
+        if self.get_page_size() != Some(page_size) {
+            self.set_page_size(page_size);
+            self.clear_page_cache(false);
+        }
+        *self.allocate_page1_state.write() = AllocatePage1State::Done;
     }
 
     /// MVCC-only: refresh connection-private WAL change counters without starting a read tx and invalidate cache if needed.
@@ -3310,6 +3330,7 @@ impl Pager {
         // TODO(Diego): The only possibly allocate page1 here is because OpenEphemeral needs a write transaction
         // we should have a unique API to begin transactions, something like sqlite3BtreeBeginTrans
         return_if_io!(self.maybe_allocate_page1());
+        self.use_page_size_of_database_created_elsewhere();
         let Some(wal) = self.wal.as_ref() else {
             return Ok(IOResult::Done(()));
         };
@@ -3859,6 +3880,7 @@ impl Pager {
             buffer_pool,
             Arc::new(Mutex::new(())),
             init_page_1,
+            Arc::new(AtomicU32::new(0)),
         )
         .unwrap()
     }
@@ -5018,6 +5040,7 @@ impl Pager {
             let phase = self.checkpoint_state.read().phase.clone();
             match phase {
                 CheckpointPhase::NotCheckpointing => {
+                    self.use_page_size_of_database_created_elsewhere();
                     let mut state = self.checkpoint_state.write();
                     state.phase = CheckpointPhase::Checkpoint {
                         mode,
@@ -5667,6 +5690,8 @@ impl Pager {
                 if let Some(size) = self.get_page_size() {
                     default_header.page_size = size;
                 }
+                self.initial_database_page_size
+                    .store(default_header.page_size.get(), Ordering::SeqCst);
 
                 tracing::debug!(
                     "allocate_page1(Start) page_size = {:?}, reserved_space = {}",
@@ -6556,6 +6581,7 @@ mod tests {
                 buffer_pool,
                 Arc::new(crate::sync::Mutex::new(())),
                 init_page_1,
+                Arc::new(crate::sync::atomic::AtomicU32::new(0)),
             )
             .unwrap(),
         );
@@ -6753,6 +6779,7 @@ mod ptrmap_tests {
             buffer_pool,
             Arc::new(Mutex::new(())),
             init_page_1,
+            Arc::new(AtomicU32::new(0)),
         )
         .unwrap();
         run_until_done(|| pager.allocate_page1(), &pager).unwrap();
@@ -6813,6 +6840,7 @@ mod ptrmap_tests {
             buffer_pool,
             Arc::new(Mutex::new(())),
             Arc::new(ArcSwapOption::new(Some(default_page1(None)))),
+            Arc::new(AtomicU32::new(0)),
         )
         .unwrap();
 

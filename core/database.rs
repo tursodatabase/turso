@@ -39,8 +39,8 @@ use crate::{
     sync::{
         self,
         atomic::{
-            AtomicBool, AtomicI32, AtomicI64, AtomicIsize, AtomicU16, AtomicU64, AtomicU8,
-            AtomicUsize, Ordering,
+            AtomicBool, AtomicI32, AtomicI64, AtomicIsize, AtomicU16, AtomicU32, AtomicU64,
+            AtomicU8, AtomicUsize, Ordering,
         },
         Arc, LazyLock, Mutex, RwLock, Weak,
     },
@@ -648,6 +648,7 @@ pub struct Database<
 
     /// In Memory Page 1 for Empty Dbs
     init_page_1: Arc<ArcSwapOption<Page>>,
+    initial_database_page_size: Arc<AtomicU32>,
 
     // Encryption
     encryption_cipher_mode: AtomicCipherMode,
@@ -798,6 +799,7 @@ impl Database {
             },
 
             init_page_1: Arc::new(ArcSwapOption::new(init_page_1)),
+            initial_database_page_size: Arc::new(AtomicU32::new(0)),
 
             encryption_cipher_mode: AtomicCipherMode::new(
                 encryption_cipher_mode.unwrap_or(CipherMode::None),
@@ -3214,6 +3216,7 @@ impl Database {
             buffer_pool,
             self.init_lock.clone(),
             self.init_page_1.clone(),
+            self.initial_database_page_size.clone(),
         )?;
         pager.set_page_size(page_size);
         if let Some(reserved_bytes) = reserved_bytes {
