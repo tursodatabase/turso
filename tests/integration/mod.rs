@@ -5,6 +5,7 @@ mod assert_details;
 mod assertions;
 mod attach;
 mod checkpoint_crash_atomicity;
+mod checkpoint_write_failure;
 mod common;
 mod conflict_resolution;
 mod custom_types;
