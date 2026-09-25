@@ -198,7 +198,9 @@ fn infer_expression_primitive(
         Expr::Parenthesized(exprs) if exprs.len() == 1 => {
             infer_expression_primitive(exprs.first().unwrap(), referenced_tables)
         }
-        Expr::Collate(inner, _) => infer_expression_primitive(inner, referenced_tables),
+        Expr::Collate(inner, _) | Expr::SubqueryColumnValue { expr: inner, .. } => {
+            infer_expression_primitive(inner, referenced_tables)
+        }
         Expr::Unary(op, inner) => match op {
             UnaryOperator::Not | UnaryOperator::BitwiseNot => Some("INTEGER"),
             UnaryOperator::Negative => Some(combine_arithmetic_primitive(
@@ -1060,6 +1062,21 @@ impl Statement {
 
                 let full = self.program.connection.get_full_column_names();
                 let short = self.program.connection.get_short_column_names();
+
+                if let Some(name) = &column.subquery_column_name {
+                    if full {
+                        return Cow::Borrowed(&name.full_name);
+                    }
+                    if let Some(column_name) = name.column_name.as_deref().filter(|_| short) {
+                        return Cow::Borrowed(column_name);
+                    }
+                    return Cow::Borrowed(
+                        column
+                            .implicit_column_name
+                            .as_deref()
+                            .expect("a merged subquery column has an implicit name"),
+                    );
+                }
 
                 // 2. For column references, apply full/short column name logic.
                 match &column.expr {

@@ -165,6 +165,7 @@ pub fn process_returning_clause(
                 };
 
                 result_columns.push(ResultSetColumn {
+                    subquery_column_name: None,
                     expr: expr.as_ref().clone(),
                     alias,
                     implicit_column_name,
@@ -189,6 +190,7 @@ pub fn process_returning_clause(
                     };
 
                     result_columns.push(ResultSetColumn {
+                        subquery_column_name: None,
                         expr: column_expr,
                         alias: column.name.clone(),
                         implicit_column_name: None,

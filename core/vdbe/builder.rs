@@ -1188,6 +1188,7 @@ impl ProgramBuilder {
         // or invent another way to set pragma result columns
         let expr = ast::Expr::Id(ast::Name::empty());
         self.result_columns.push(ResultSetColumn {
+            subquery_column_name: None,
             expr,
             alias: Some(col_name),
             implicit_column_name: None,

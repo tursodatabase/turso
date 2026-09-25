@@ -74,7 +74,9 @@ where
                             stack.push(WalkItem::Expr(base_expr));
                         }
                     }
-                    ast::Expr::Cast { expr, .. } | ast::Expr::Collate(expr, _) => {
+                    ast::Expr::Cast { expr, .. }
+                    | ast::Expr::Collate(expr, _)
+                    | ast::Expr::SubqueryColumnValue { expr, .. } => {
                         stack.push(WalkItem::Expr(expr));
                     }
                     ast::Expr::Exists(_select) | ast::Expr::Subquery(_select) => {
@@ -404,7 +406,9 @@ where
                             stack.push(WalkItem::Expr(base_expr));
                         }
                     }
-                    ast::Expr::Cast { expr, .. } | ast::Expr::Collate(expr, _) => {
+                    ast::Expr::Cast { expr, .. }
+                    | ast::Expr::Collate(expr, _)
+                    | ast::Expr::SubqueryColumnValue { expr, .. } => {
                         stack.push(WalkItem::Expr(expr));
                     }
                     ast::Expr::Exists(_) | ast::Expr::Subquery(_) => {

@@ -107,7 +107,7 @@ snapshot-eqp multi-index-or-in-join-parenthesized-plan {
 # Snapshot test: verify CTE cardinality propagation improves join plan
 @setup graph_schema
 snapshot-eqp cte-join-with-or-plan {
-    WITH selected_nodes AS (
+    WITH selected_nodes AS MATERIALIZED (
         SELECT id FROM node WHERE id <= 2
     )
     SELECT e.id, e.source_id, e.target_id

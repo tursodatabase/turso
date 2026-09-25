@@ -111,12 +111,30 @@ pub struct ResultSetColumn {
     pub implicit_column_name: Option<String>,
     // TODO: encode which aggregates (e.g. index bitmask of plan.aggregates) are present in this column
     pub contains_aggregates: bool,
+    /// The name of the FROM-clause subquery column that this result column
+    /// read before the optimizer merged the subquery into this query.
+    pub subquery_column_name: Option<Box<SubqueryColumnName>>,
+}
+
+/// The names of a result column that reads a FROM-clause subquery column
+/// directly, as in `SELECT s.x FROM (SELECT a AS x FROM t) s`. The
+/// connection's column name settings choose which name the column gets. When
+/// both settings are off, the column gets its `implicit_column_name`.
+#[derive(Debug, Clone)]
+pub struct SubqueryColumnName {
+    /// `s.x`, used by `PRAGMA full_column_names`
+    pub full_name: String,
+    /// `x`, used by `PRAGMA short_column_names`
+    pub column_name: Option<String>,
 }
 
 impl ResultSetColumn {
     pub fn name<'a>(&'a self, tables: &'a TableReferences) -> Option<&'a str> {
         if let Some(alias) = &self.alias {
             return Some(alias);
+        }
+        if let Some(name) = &self.subquery_column_name {
+            return name.column_name.as_deref();
         }
         match &self.expr {
             ast::Expr::Column { table, column, .. } => {
@@ -412,6 +430,37 @@ pub struct RecursiveCtePlan {
 }
 
 impl Plan {
+    /// The SELECTs of a SELECT or compound SELECT plan, from left to right.
+    /// A recursive CTE, DELETE, or UPDATE plan has none.
+    pub fn selects(&self) -> Vec<&SelectPlan> {
+        match self {
+            Plan::Select(select) => vec![select],
+            Plan::CompoundSelect {
+                left, right_most, ..
+            } => left
+                .iter()
+                .map(|(select, _)| select)
+                .chain(std::iter::once(right_most.as_ref()))
+                .collect(),
+            Plan::RecursiveCte(_) | Plan::Delete(_) | Plan::Update(_) => vec![],
+        }
+    }
+
+    /// The SELECTs of [Self::selects], for changing them in place.
+    pub fn selects_mut(&mut self) -> Vec<&mut SelectPlan> {
+        match self {
+            Plan::Select(select) => vec![select],
+            Plan::CompoundSelect {
+                left, right_most, ..
+            } => left
+                .iter_mut()
+                .map(|(select, _)| select)
+                .chain(std::iter::once(right_most.as_mut()))
+                .collect(),
+            Plan::RecursiveCte(_) | Plan::Delete(_) | Plan::Update(_) => vec![],
+        }
+    }
+
     /// Return the estimated work for this plan's expected number of calls.
     pub(crate) fn estimated_cost(&self) -> Option<f64> {
         match self {
@@ -811,6 +860,61 @@ impl SelectPlan {
         self.aggregates.iter().map(|agg| agg.args.len()).sum()
     }
 
+    pub fn is_aggregate(&self) -> bool {
+        !self.aggregates.is_empty() || self.group_by.is_some()
+    }
+
+    /// Every top-level expression of this query outside its FROM clause and
+    /// window definition: result columns, WHERE and join terms, GROUP BY,
+    /// HAVING, ORDER BY, LIMIT, OFFSET, VALUES rows, and aggregate arguments.
+    pub fn exprs(&self) -> impl Iterator<Item = &ast::Expr> {
+        let (group_exprs, having) = match &self.group_by {
+            Some(group_by) => (Some(&group_by.exprs), group_by.having.as_ref()),
+            None => (None, None),
+        };
+        self.result_columns
+            .iter()
+            .map(|column| &column.expr)
+            .chain(self.where_clause.iter().map(|term| &term.expr))
+            .chain(group_exprs.into_iter().flatten())
+            .chain(having.into_iter().flatten())
+            .chain(self.order_by.iter().map(|(expr, _, _)| expr.as_ref()))
+            .chain(self.limit.iter().chain(self.offset.iter()).map(Box::as_ref))
+            .chain(self.values.iter().flatten())
+            .chain(self.aggregates.iter().flat_map(|aggregate| {
+                std::iter::once(&aggregate.original_expr)
+                    .chain(aggregate.args.iter())
+                    .chain(aggregate.filter_expr.iter())
+            }))
+    }
+
+    /// The expressions of [Self::exprs], for changing them in place.
+    pub fn exprs_mut(&mut self) -> impl Iterator<Item = &mut ast::Expr> {
+        let (group_exprs, having) = match &mut self.group_by {
+            Some(group_by) => (Some(&mut group_by.exprs), group_by.having.as_mut()),
+            None => (None, None),
+        };
+        self.result_columns
+            .iter_mut()
+            .map(|column| &mut column.expr)
+            .chain(self.where_clause.iter_mut().map(|term| &mut term.expr))
+            .chain(group_exprs.into_iter().flatten())
+            .chain(having.into_iter().flatten())
+            .chain(self.order_by.iter_mut().map(|(expr, _, _)| expr.as_mut()))
+            .chain(
+                self.limit
+                    .iter_mut()
+                    .chain(self.offset.iter_mut())
+                    .map(Box::as_mut),
+            )
+            .chain(self.values.iter_mut().flatten())
+            .chain(self.aggregates.iter_mut().flat_map(|aggregate| {
+                std::iter::once(&mut aggregate.original_expr)
+                    .chain(aggregate.args.iter_mut())
+                    .chain(aggregate.filter_expr.iter_mut())
+            }))
+    }
+
     /// Whether this query or any of its subqueries reference columns from the outer query.
     pub fn is_correlated(&self) -> bool {
         self.table_references
@@ -1089,6 +1193,7 @@ pub fn select_star(
                         }
                     });
                     ResultSetColumn {
+                        subquery_column_name: None,
                         alias,
                         implicit_column_name: None,
                         expr: ast::Expr::Column {
@@ -1427,6 +1532,15 @@ impl TableReferences {
         self.joined_tables[pos + 1..]
             .iter()
             .any(|t| t.join_info.as_ref().is_some_and(JoinInfo::is_full_outer))
+    }
+
+    pub fn has_full_join(&self) -> bool {
+        self.joined_tables.iter().any(|table| {
+            table
+                .join_info
+                .as_ref()
+                .is_some_and(JoinInfo::is_full_outer)
+        })
     }
 
     /// Like [Self::outer_join_may_null_extend], but true only when the

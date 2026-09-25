@@ -566,6 +566,7 @@ fn prepare_one_select_plan(
                                     }
                                 });
                                 plan.result_columns.push(ResultSetColumn {
+                                    subquery_column_name: None,
                                     expr: ast::Expr::Column {
                                         database: None, // TODO: support different databases
                                         table: table.internal_id,
@@ -604,6 +605,7 @@ fn prepare_one_select_plan(
                                 None => (None, None),
                             };
                             plan.result_columns.push(ResultSetColumn {
+                                subquery_column_name: None,
                                 alias,
                                 implicit_column_name,
                                 expr: *expr,
@@ -868,6 +870,7 @@ fn prepare_one_select_plan(
             let mut result_columns = Vec::with_capacity(len);
             for i in 0..len {
                 result_columns.push(ResultSetColumn {
+                    subquery_column_name: None,
                     // these result_columns work as placeholders for the values, so the expr doesn't matter
                     expr: ast::Expr::Literal(ast::Literal::Numeric(i.to_string())),
                     alias: Some(format!("column{}", i + 1)),
@@ -1568,6 +1571,7 @@ fn expr_contains_subquery(expr: &Expr) -> bool {
             }
             Expr::Cast { expr, .. }
             | Expr::Collate(expr, _)
+            | Expr::SubqueryColumnValue { expr, .. }
             | Expr::IsNull(expr)
             | Expr::NotNull(expr)
             | Expr::Unary(_, expr) => {

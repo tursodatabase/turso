@@ -843,7 +843,17 @@ pub fn exprs_are_equivalent(expr1: &Expr, expr2: &Expr) -> bool {
                     _ => false,
                 }
         }
-        (Expr::Collate(expr1, collation1), Expr::Collate(expr2, collation2)) => {
+        (Expr::Collate(expr1, collation1), Expr::Collate(expr2, collation2))
+        | (
+            Expr::SubqueryColumnValue {
+                expr: expr1,
+                collation: collation1,
+            },
+            Expr::SubqueryColumnValue {
+                expr: expr2,
+                collation: collation2,
+            },
+        ) => {
             // TODO: check correctness of comparing colation as strings
             exprs_are_equivalent(expr1, expr2)
                 && collation1

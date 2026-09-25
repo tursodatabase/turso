@@ -958,6 +958,11 @@ impl ToTokens for Expr {
                 s.append(TK_COLLATE, None)?;
                 s.append(TK_ID, Some(&collation.as_ident()))
             }
+            Self::SubqueryColumnValue { expr, .. } => {
+                s.append(TK_LP, None)?;
+                expr.to_tokens(s, context)?;
+                s.append(TK_RP, None)
+            }
             Self::DoublyQualified(db_name, tbl_name, col_name) => {
                 db_name.to_tokens(s, context)?;
                 s.append(TK_DOT, None)?;

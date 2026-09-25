@@ -7,7 +7,7 @@ use std::{
 
 use icu_collator::{options::CollatorOptions, Collator, CollatorBorrowed};
 use icu_locale::Locale;
-use turso_parser::ast::Expr;
+use turso_parser::ast::{Expr, Name};
 
 use crate::{
     connection::SymbolTable,
@@ -426,6 +426,11 @@ pub fn get_expr_collation_ctx_with_symbols(
                 }
                 return Ok(WalkControl::SkipChildren);
             }
+            Expr::SubqueryColumnValue { collation, .. } => {
+                maybe_column_collseq
+                    .get_or_insert_with(|| subquery_column_value_collation(collation));
+                return Ok(WalkControl::SkipChildren);
+            }
             Expr::Column { table, column, .. } => {
                 // generated columns (the SELF_TABLE placeholder) don't inherit an implicit
                 // collation from their expression, so we skip them
@@ -504,6 +509,9 @@ fn comparison_operand_column_collseq(
                 expr = sub_expr.as_ref()
             }
             Expr::Cast { expr: sub_expr, .. } => expr = sub_expr.as_ref(),
+            Expr::SubqueryColumnValue { collation, .. } => {
+                return Ok(Some(subquery_column_value_collation(collation)));
+            }
             Expr::Column { table, column, .. } => {
                 if table.is_self_table() {
                     return Ok(None);
@@ -557,6 +565,11 @@ fn get_collseq_parts_from_expr_with_symbols(
                 // Skip children since we've found a COLLATE operator
                 return Ok(WalkControl::SkipChildren);
             }
+            Expr::SubqueryColumnValue { collation, .. } => {
+                maybe_column_collseq
+                    .get_or_insert_with(|| subquery_column_value_collation(collation));
+                return Ok(WalkControl::SkipChildren);
+            }
             Expr::Column { table, column, .. } if table.is_self_table() => {
                 if maybe_column_collseq.is_none() {
                     maybe_column_collseq =
@@ -600,6 +613,13 @@ fn get_collseq_parts_from_expr_with_symbols(
     })?;
 
     Ok((maybe_explicit_collseq, maybe_column_collseq))
+}
+
+/// The collation of a [Expr::SubqueryColumnValue]. The name comes from a
+/// subquery column, whose collation is always a built-in or locale collation.
+pub(crate) fn subquery_column_value_collation(collation: &Name) -> CollationSeq {
+    CollationSeq::new(collation.as_str())
+        .expect("a subquery column has a built-in or locale collation")
 }
 
 #[cfg(test)]

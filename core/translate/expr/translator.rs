@@ -642,6 +642,14 @@ pub fn translate_expr(
             program.set_collation(Some((collation, true)));
             Ok(target_register)
         }
+        ast::Expr::SubqueryColumnValue { expr, collation } => {
+            translate_expr(program, referenced_tables, expr, target_register, resolver)?;
+            program.emit_insn(Insn::ClearSubtype {
+                reg: target_register,
+            });
+            program.set_collation(Some((subquery_column_value_collation(collation), false)));
+            Ok(target_register)
+        }
         ast::Expr::DoublyQualified(_, _, _) => {
             crate::bail_parse_error!("DoublyQualified should have been rewritten in optimizer")
         }

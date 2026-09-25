@@ -203,6 +203,7 @@ fn prepare_window_subquery(
     // `subquery_result_columns` may be empty. Add a constant expression to keep the query valid.
     if subquery_result_columns.is_empty() {
         subquery_result_columns.push(ResultSetColumn {
+            subquery_column_name: None,
             expr: Expr::Literal(Literal::Numeric("0".to_string())),
             alias: None,
             implicit_column_name: None,
@@ -562,6 +563,7 @@ fn push_new_subquery_column(
     };
     let subquery_expr = mem::replace(expr, subquery_ref);
     ctx.subquery_result_columns.push(ResultSetColumn {
+        subquery_column_name: None,
         expr: subquery_expr,
         alias: None,
         implicit_column_name: None,

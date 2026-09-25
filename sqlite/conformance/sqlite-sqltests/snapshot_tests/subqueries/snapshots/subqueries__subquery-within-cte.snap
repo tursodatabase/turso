@@ -31,8 +31,8 @@ QUERY PLAN
 
 BYTECODE
 addr  opcode             p1  p2  p3  p4              p5  comment
-   0  Init                0  47   0                   0  Start at 47
-   1  InitCoroutine       1  29   2                   0
+   0  Init                0  50   0                   0  Start at 50
+   1  InitCoroutine       1  32   2                   0
    2  Once               12   0   0                   0  goto 12
    3  OpenEphemeral       0   0   0                   0  cursor=0 is_table=false
    4  OpenRead            1   3   0  k(3,B,B,B)       0  table=categories, root=3, iDb=0
@@ -46,38 +46,42 @@ addr  opcode             p1  p2  p3  p4              p5  comment
   12  OpenRead            2   2   0  k(5,B,B,B,B,B)   0  table=products, root=2, iDb=0
   13  OpenRead            3   8   0  k(2,B)           0  index=idx_products_category, root=8, iDb=0
   14  NullRow             0   0   0                   0  Set cursor 0 to a (pseudo) NULL row
-  15  Rewind              0  28   0                   0  Rewind  ephemeral(ephemeral_index_where_sub_t2)
+  15  Rewind              0  31   0                   0  Rewind  ephemeral(ephemeral_index_where_sub_t2)
   16    Column            0   0   8                   0  r[8]=ephemeral(ephemeral_index_where_sub_t2).id
-  17    IsNull            8  27   0                   0  if (r[8]==NULL) goto 27
-  18    SeekGE            3  27   8                   0  key=[8..8]
-  19      IdxGT           3  27   8                   0  key=[8..8]
+  17    IsNull            8  30   0                   0  if (r[8]==NULL) goto 30
+  18    SeekGE            3  30   8                   0  key=[8..8]
+  19      IdxGT           3  30   8                   0  key=[8..8]
   20      DeferredSeek    3   2   0                   0
-  21      IdxRowId        3   5   0                   0  r[5]=cursor 3 for index idx_products_category.rowid
-  22      Column          2   1   6                   0  r[6]=products.name
-  23      Column          2   3   7                   0  r[7]=products.price
-  24      RealAffinity    7   0   0                   0
-  25      Yield           1   0   0                   0
-  26    Next              3  19   0                   0
-  27  Next                0  16   0                   0
-  28  EndCoroutine        1   0   0                   0
-  29  SorterOpen          4   1   0  k(1,-B)          0  cursor=4
-  30  InitCoroutine       1   0   2                   0
-  31    Yield             1  39   0                   0
-  32    Copy              7  13   0                   0  r[13]=r[7]
-  33    Le               13  14  38  Binary           0  if r[13]<=r[14] goto 38
-  34    Copy              7  15   0                   0  r[15]=r[7]
-  35    Copy              6  16   0                   0  r[16]=r[6]
-  36    MakeRecord       15   2  11                   0  r[11]=mkrec(r[15..16])
-  37    SorterInsert      4  11   0  0                0  key=r[11]
-  38  Goto                0  31   0                   0
-  39  OpenPseudo          5  11   2                   0  2 columns in r[11]
-  40  SorterSort          4  46   0                   0
-  41    SorterData        4  11   5                   0  r[11]=data
-  42    Column            5   1   9                   0  r[9]=pseudo.column 1
-  43    Column            5   0  10                   0  r[10]=pseudo.column 0
-  44    ResultRow         9   2   0                   0  output=r[9..10]
-  45  SorterNext          4  41   0                   0
-  46  Halt                0   0   0                   0
-  47  Transaction         0   1  11                   0  iDb=0 tx_mode=Read
-  48  Integer           100  14   0                   0  r[14]=100
-  49  Goto                0   1   0                   0
+  21      Column          2   3  10                   0  r[10]=products.price
+  22      RealAffinity   10   0   0                   0
+  23      Le             10  11  29  Binary           0  if r[10]<=r[11] goto 29
+  24      IdxRowId        3   5   0                   0  r[5]=cursor 3 for index idx_products_category.rowid
+  25      Column          2   1   6                   0  r[6]=products.name
+  26      Column          2   3   7                   0  r[7]=products.price
+  27      RealAffinity    7   0   0                   0
+  28      Yield           1   0   0                   0
+  29    Next              3  19   0                   0
+  30  Next                0  16   0                   0
+  31  EndCoroutine        1   0   0                   0
+  32  SorterOpen          4   1   0  k(1,-B)          0  cursor=4
+  33  InitCoroutine       1   0   2                   0
+  34    Yield             1  42   0                   0
+  35    Copy              7  16   0                   0  r[16]=r[7]
+  36    Le               16  17  41  Binary           0  if r[16]<=r[17] goto 41
+  37    Copy              7  18   0                   0  r[18]=r[7]
+  38    Copy              6  19   0                   0  r[19]=r[6]
+  39    MakeRecord       18   2  14                   0  r[14]=mkrec(r[18..19])
+  40    SorterInsert      4  14   0  0                0  key=r[14]
+  41  Goto                0  34   0                   0
+  42  OpenPseudo          5  14   2                   0  2 columns in r[14]
+  43  SorterSort          4  49   0                   0
+  44    SorterData        4  14   5                   0  r[14]=data
+  45    Column            5   1  12                   0  r[12]=pseudo.column 1
+  46    Column            5   0  13                   0  r[13]=pseudo.column 0
+  47    ResultRow        12   2   0                   0  output=r[12..13]
+  48  SorterNext          4  44   0                   0
+  49  Halt                0   0   0                   0
+  50  Transaction         0   1  11                   0  iDb=0 tx_mode=Read
+  51  Integer           100  11   0                   0  r[11]=100
+  52  Integer           100  17   0                   0  r[17]=100
+  53  Goto                0   1   0                   0
