@@ -1,6 +1,6 @@
 //! Property-based validation for simulation.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::PathBuf;
 
 use anyhow::{anyhow, bail};
@@ -402,10 +402,11 @@ struct PendingAutoCommit {
 /// Property that records Elle history for transactional consistency checking.
 /// Events are buffered in memory and sorted by index before writing to file.
 pub struct ElleHistoryRecorder {
-    /// Pending transactions per fiber: fiber_id -> PendingTxn
-    pending_txns: HashMap<usize, PendingTxn>,
+    /// Pending transactions per fiber: fiber_id -> PendingTxn.
+    /// Ordered by fiber so `finalize` writes the same history for the same seed.
+    pending_txns: BTreeMap<usize, PendingTxn>,
     /// Pending auto-commit operations per fiber: fiber_id -> PendingAutoCommit
-    pending_auto_commits: HashMap<usize, PendingAutoCommit>,
+    pending_auto_commits: BTreeMap<usize, PendingAutoCommit>,
     /// Buffered events to be sorted and written at the end
     events: Vec<BufferedElleEvent>,
     /// Counter for generating unique event indices
@@ -417,8 +418,8 @@ pub struct ElleHistoryRecorder {
 impl ElleHistoryRecorder {
     pub fn new(output_path: PathBuf) -> Self {
         Self {
-            pending_txns: HashMap::new(),
-            pending_auto_commits: HashMap::new(),
+            pending_txns: BTreeMap::new(),
+            pending_auto_commits: BTreeMap::new(),
             events: Vec::new(),
             index_counter: 0,
             output_path,
@@ -653,6 +654,7 @@ impl Property for ElleHistoryRecorder {
         op: &Operation,
         result: &OpResult,
     ) -> anyhow::Result<()> {
+        reject_ambiguous_fts_read(op, result)?;
         match op {
             Operation::Begin { .. } => {
                 // If Begin failed, clean up pending txn
@@ -828,8 +830,7 @@ impl Property for ElleHistoryRecorder {
 
     fn finalize(&mut self) -> anyhow::Result<()> {
         // Emit :info events for any pending transactions (incomplete)
-        let pending_txns: Vec<_> = self.pending_txns.drain().collect();
-        for (fiber_id, pending) in pending_txns {
+        for (fiber_id, pending) in std::mem::take(&mut self.pending_txns) {
             let Some(invoke_index) = pending.invoke_index else {
                 continue;
             };
@@ -859,8 +860,7 @@ impl Property for ElleHistoryRecorder {
         }
 
         // Emit :info events for any pending auto-commit operations (incomplete)
-        let pending_auto: Vec<_> = self.pending_auto_commits.drain().collect();
-        for (fiber_id, pending) in pending_auto {
+        for (fiber_id, pending) in std::mem::take(&mut self.pending_auto_commits) {
             self.add_event(
                 pending.invoke_index,
                 ElleEventType::Invoke,
@@ -881,6 +881,28 @@ impl Property for ElleHistoryRecorder {
         self.export()?;
         Ok(())
     }
+}
+
+/// An FTS-backed Elle read asks the index for one key token, so at most one
+/// row can come back. Two rows mean the index returned the same key twice,
+/// for example a replaced document whose tombstone the snapshot missed.
+fn reject_ambiguous_fts_read(op: &Operation, result: &OpResult) -> anyhow::Result<()> {
+    let (key, lookup) = match op {
+        Operation::ElleRead { key, lookup, .. } | Operation::ElleRwRead { key, lookup, .. } => {
+            (key, *lookup)
+        }
+        _ => return Ok(()),
+    };
+    let Ok(rows) = result else {
+        return Ok(());
+    };
+    if lookup.is_fts() && rows.len() > 1 {
+        anyhow::bail!(
+            "FTS-backed Elle read of key {key} returned {} rows, expected at most one: {rows:?}",
+            rows.len()
+        );
+    }
+    Ok(())
 }
 
 /// Parse the read result from query rows.
@@ -2133,6 +2155,7 @@ impl Property for SequenceCorrectnessProperty {
 #[allow(clippy::items_after_test_module)]
 mod tests {
     use super::*;
+    use crate::operations::ElleLookup;
 
     fn test_output_path(label: &str) -> PathBuf {
         std::env::temp_dir().join(format!(
@@ -2240,6 +2263,7 @@ mod tests {
                     table_name: "elle_lists".to_string(),
                     key: "k".to_string(),
                     value: 5,
+                    lookup: ElleLookup::PrimaryKey,
                 },
                 &Ok(vec![]),
             )
@@ -2257,6 +2281,60 @@ mod tests {
     }
 
     #[test]
+    fn elle_history_records_an_fts_read_like_a_primary_key_read() {
+        let mut recorder = ElleHistoryRecorder::new(test_output_path("fts-read"));
+        let read = Operation::ElleRwRead {
+            table_name: "elle_fts_rw".to_string(),
+            key: "k1".to_string(),
+            lookup: ElleLookup::FtsIndex,
+        };
+
+        recorder.init_op(0, 2, None, 40, &read).unwrap();
+        recorder
+            .finish_op(
+                0,
+                2,
+                None,
+                40,
+                41,
+                &read,
+                &Ok(vec![vec![Value::from_i64(42)]]),
+            )
+            .unwrap();
+
+        assert_eq!(recorder.events.len(), 2);
+        assert_eq!(recorder.events[0].ops[0].to_edn(), "[:r \"k1\" nil]");
+        assert_eq!(recorder.events[1].ops[0].to_edn(), "[:r \"k1\" 42]");
+    }
+
+    #[test]
+    fn elle_history_rejects_an_fts_read_that_returns_two_rows() {
+        let mut recorder = ElleHistoryRecorder::new(test_output_path("fts-two-rows"));
+        let two_rows = Ok(vec![vec![Value::from_i64(1)], vec![Value::from_i64(2)]]);
+
+        let primary_key_read = Operation::ElleRwRead {
+            table_name: "elle_rw".to_string(),
+            key: "k1".to_string(),
+            lookup: ElleLookup::PrimaryKey,
+        };
+        recorder.init_op(0, 2, None, 40, &primary_key_read).unwrap();
+        recorder
+            .finish_op(0, 2, None, 40, 41, &primary_key_read, &two_rows)
+            .unwrap();
+
+        let fts_read = Operation::ElleRead {
+            table_name: "elle_fts_lists".to_string(),
+            key: "k1".to_string(),
+            lookup: ElleLookup::FtsIndex,
+        };
+        recorder.init_op(0, 2, None, 42, &fts_read).unwrap();
+        let err = recorder
+            .finish_op(0, 2, None, 42, 43, &fts_read, &two_rows)
+            .expect_err("two rows for one key token must fail the property");
+        assert!(err.to_string().contains("returned 2 rows"), "{err}");
+    }
+
+    #[test]
     fn elle_history_abort_fiber_marks_pending_autocommit_as_info() {
         let mut recorder = ElleHistoryRecorder::new(test_output_path("abort-autocommit"));
 
@@ -2270,6 +2348,7 @@ mod tests {
                     table_name: "elle_rw".to_string(),
                     key: "k".to_string(),
                     value: 9,
+                    lookup: ElleLookup::PrimaryKey,
                 },
             )
             .unwrap();

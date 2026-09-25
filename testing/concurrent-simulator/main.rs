@@ -11,6 +11,7 @@ use turso_whopper::{
     StepResult, Whopper, WhopperOpts,
     chaotic_btree::BtreeRebalanceProfile,
     chaotic_elle::{ChaoticElleProfile, ChaoticWorkloadProfile, ElleModelKind},
+    operations::ElleLookup,
     properties::*,
     workloads::*,
 };
@@ -22,6 +23,10 @@ enum ElleModel {
     ListAppend,
     /// Rw-register model: transactions write and read single values
     RwRegister,
+    /// List-append model where every read goes through a full-text index
+    FtsListAppend,
+    /// Rw-register model where every read goes through a full-text index
+    FtsRwRegister,
 }
 
 #[derive(Parser)]
@@ -368,56 +373,35 @@ fn build_workloads_and_properties(args: &Args) -> BuildArtifacts {
     if let Some(elle_model) = args.elle {
         let elle_counter = Arc::new(std::sync::atomic::AtomicI64::new(1));
 
-        let (table_name, create_sql) = match elle_model {
-            ElleModel::ListAppend => (
-                "elle_lists",
-                "CREATE TABLE IF NOT EXISTS elle_lists (key TEXT PRIMARY KEY, vals TEXT DEFAULT '')",
-            ),
-            ElleModel::RwRegister => (
-                "elle_rw",
-                "CREATE TABLE IF NOT EXISTS elle_rw (key TEXT PRIMARY KEY, val INTEGER)",
-            ),
+        let model_kind = match elle_model {
+            ElleModel::ListAppend | ElleModel::FtsListAppend => ElleModelKind::ListAppend,
+            ElleModel::RwRegister | ElleModel::FtsRwRegister => ElleModelKind::RwRegister,
         };
 
-        let model_kind = match elle_model {
-            ElleModel::ListAppend => ElleModelKind::ListAppend,
-            ElleModel::RwRegister => ElleModelKind::RwRegister,
+        let lookup = match elle_model {
+            ElleModel::ListAppend | ElleModel::RwRegister => ElleLookup::PrimaryKey,
+            ElleModel::FtsListAppend | ElleModel::FtsRwRegister => ElleLookup::FtsIndex,
         };
+
+        let (table_name, create_sql) = lookup.schema(model_kind);
 
         let chaotic: Vec<(f64, &'static str, Box<dyn ChaoticWorkloadProfile>)> = vec![(
             0.3,
             "chaotic-elle",
-            Box::new(ChaoticElleProfile::new(
-                table_name.to_string(),
+            Box::new(ChaoticElleProfile::with_lookup(
+                table_name.clone(),
                 model_kind,
+                lookup,
                 elle_counter.clone(),
                 args.enable_mvcc,
             )),
         )];
 
-        let w: Vec<(u32, Box<dyn Workload>)> = match elle_model {
-            ElleModel::ListAppend => vec![
-                (40, Box::new(ElleAppendWorkload::with_counter(elle_counter))),
-                (30, Box::new(ElleReadWorkload)),
-                (30, Box::new(BeginWorkload)),
-                (15, Box::new(CommitWorkload)),
-                (5, Box::new(RollbackWorkload)),
-            ],
-            ElleModel::RwRegister => vec![
-                (
-                    40,
-                    Box::new(ElleRwWriteWorkload::with_counter(elle_counter)),
-                ),
-                (30, Box::new(ElleRwReadWorkload)),
-                (30, Box::new(BeginWorkload)),
-                (15, Box::new(CommitWorkload)),
-                (5, Box::new(RollbackWorkload)),
-            ],
-        };
+        let w = elle_workloads(model_kind, lookup, &table_name, elle_counter);
 
         let output_path = PathBuf::from(&args.elle_output);
         let p: Vec<Box<dyn Property>> = vec![Box::new(ElleHistoryRecorder::new(output_path))];
-        let et = vec![(table_name.to_string(), create_sql.to_string())];
+        let et = vec![(table_name, create_sql)];
 
         (w, p, et, chaotic)
     } else if is_btree_rebalance_mode(&args.mode) {

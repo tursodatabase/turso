@@ -13,8 +13,11 @@ use sql_generation::{
     },
 };
 
-use crate::elle::{ELLE_LIST_APPEND_KEY_COUNT, ELLE_RW_REGISTER_KEY_COUNT, elle_key_name};
-use crate::operations::{Operation, TxMode};
+use crate::chaotic_elle::ElleModelKind;
+use crate::elle::{
+    ELLE_LIST_APPEND_KEY_COUNT, ELLE_RW_REGISTER_KEY_COUNT, elle_fts_index_name, elle_key_name,
+};
+use crate::operations::{ElleLookup, Operation, TxMode};
 use crate::{FiberState, SimulatorState};
 
 /// Context passed to workloads for generating operations.
@@ -493,6 +496,49 @@ impl Workload for RollbackWorkload {
 // Elle Workloads for Consistency Checking
 // ============================================================================
 
+/// The weighted workload set of one Elle model: writes, reads, and
+/// transaction control. FTS-backed models also get a low-weight
+/// `OPTIMIZE INDEX` so segment merges happen while the history is recorded.
+pub fn elle_workloads(
+    model: ElleModelKind,
+    lookup: ElleLookup,
+    table_name: &str,
+    value_counter: std::sync::Arc<std::sync::atomic::AtomicI64>,
+) -> Vec<(u32, Box<dyn Workload>)> {
+    let (write, read): (Box<dyn Workload>, Box<dyn Workload>) = match model {
+        ElleModelKind::ListAppend => (
+            Box::new(ElleAppendWorkload::with_counter_and_lookup(
+                value_counter,
+                lookup,
+            )),
+            Box::new(ElleReadWorkload { lookup }),
+        ),
+        ElleModelKind::RwRegister => (
+            Box::new(ElleRwWriteWorkload::with_counter_and_lookup(
+                value_counter,
+                lookup,
+            )),
+            Box::new(ElleRwReadWorkload { lookup }),
+        ),
+    };
+    let mut workloads: Vec<(u32, Box<dyn Workload>)> = vec![
+        (40, write),
+        (30, read),
+        (30, Box::new(BeginWorkload)),
+        (15, Box::new(CommitWorkload)),
+        (5, Box::new(RollbackWorkload)),
+    ];
+    if lookup.is_fts() {
+        workloads.push((
+            2,
+            Box::new(ElleFtsOptimizeWorkload {
+                index_name: elle_fts_index_name(table_name),
+            }),
+        ));
+    }
+    workloads
+}
+
 /// Create Elle list table for consistency checking.
 pub struct CreateElleTableWorkload;
 
@@ -511,19 +557,26 @@ impl Workload for CreateElleTableWorkload {
 pub struct ElleAppendWorkload {
     /// Counter for generating unique append values
     pub value_counter: std::sync::Arc<std::sync::atomic::AtomicI64>,
+    pub lookup: ElleLookup,
 }
 
 impl ElleAppendWorkload {
     pub fn new() -> Self {
-        Self {
-            value_counter: std::sync::Arc::new(std::sync::atomic::AtomicI64::new(1)),
-        }
+        Self::with_counter(std::sync::Arc::new(std::sync::atomic::AtomicI64::new(1)))
     }
 
     /// Create with a shared counter (for coordinating with chaotic Elle workloads).
     pub fn with_counter(counter: std::sync::Arc<std::sync::atomic::AtomicI64>) -> Self {
+        Self::with_counter_and_lookup(counter, ElleLookup::PrimaryKey)
+    }
+
+    pub fn with_counter_and_lookup(
+        counter: std::sync::Arc<std::sync::atomic::AtomicI64>,
+        lookup: ElleLookup,
+    ) -> Self {
         Self {
             value_counter: counter,
+            lookup,
         }
     }
 }
@@ -549,12 +602,15 @@ impl Workload for ElleAppendWorkload {
             table_name,
             key,
             value,
+            lookup: self.lookup,
         })
     }
 }
 
 /// Read a random key from an Elle table.
-pub struct ElleReadWorkload;
+pub struct ElleReadWorkload {
+    pub lookup: ElleLookup,
+}
 
 impl Workload for ElleReadWorkload {
     fn generate(&self, ctx: &WorkloadContext, rng: &mut ChaCha8Rng) -> Option<Operation> {
@@ -564,7 +620,11 @@ impl Workload for ElleReadWorkload {
         let table_name = ctx.sim_state.elle_tables.pick(rng)?.0.clone();
         let key = elle_key_name(rng.random_range(0..ELLE_LIST_APPEND_KEY_COUNT));
 
-        Some(Operation::ElleRead { table_name, key })
+        Some(Operation::ElleRead {
+            table_name,
+            key,
+            lookup: self.lookup,
+        })
     }
 }
 
@@ -576,13 +636,22 @@ impl Workload for ElleReadWorkload {
 pub struct ElleRwWriteWorkload {
     /// Counter for generating unique write values
     pub value_counter: std::sync::Arc<std::sync::atomic::AtomicI64>,
+    pub lookup: ElleLookup,
 }
 
 impl ElleRwWriteWorkload {
     /// Create with a shared counter (for coordinating with chaotic Elle workloads).
     pub fn with_counter(counter: std::sync::Arc<std::sync::atomic::AtomicI64>) -> Self {
+        Self::with_counter_and_lookup(counter, ElleLookup::PrimaryKey)
+    }
+
+    pub fn with_counter_and_lookup(
+        counter: std::sync::Arc<std::sync::atomic::AtomicI64>,
+        lookup: ElleLookup,
+    ) -> Self {
         Self {
             value_counter: counter,
+            lookup,
         }
     }
 }
@@ -602,12 +671,15 @@ impl Workload for ElleRwWriteWorkload {
             table_name,
             key,
             value,
+            lookup: self.lookup,
         })
     }
 }
 
 /// Read a random key from an Elle rw-register table.
-pub struct ElleRwReadWorkload;
+pub struct ElleRwReadWorkload {
+    pub lookup: ElleLookup,
+}
 
 impl Workload for ElleRwReadWorkload {
     fn generate(&self, ctx: &WorkloadContext, rng: &mut ChaCha8Rng) -> Option<Operation> {
@@ -617,7 +689,30 @@ impl Workload for ElleRwReadWorkload {
         let table_name = ctx.sim_state.elle_tables.pick(rng)?.0.clone();
         let key = elle_key_name(rng.random_range(0..ELLE_RW_REGISTER_KEY_COUNT));
 
-        Some(Operation::ElleRwRead { table_name, key })
+        Some(Operation::ElleRwRead {
+            table_name,
+            key,
+            lookup: self.lookup,
+        })
+    }
+}
+
+/// Merge the segments of an FTS-backed Elle table's index while the history
+/// is being recorded. Runs only outside transactions: a merge that loses the
+/// per-index lease or a commit conflict then costs nothing in the history,
+/// while inside a transaction it would abort the whole Elle transaction.
+pub struct ElleFtsOptimizeWorkload {
+    pub index_name: String,
+}
+
+impl Workload for ElleFtsOptimizeWorkload {
+    fn generate(&self, ctx: &WorkloadContext, _rng: &mut ChaCha8Rng) -> Option<Operation> {
+        if *ctx.fiber_state != FiberState::Idle {
+            return None;
+        }
+        Some(Operation::Execute {
+            sql: format!("OPTIMIZE INDEX {}", self.index_name),
+        })
     }
 }
 
