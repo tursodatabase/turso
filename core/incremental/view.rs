@@ -10,7 +10,7 @@ use crate::translate::logical::LogicalPlanBuilder;
 use crate::types::IOResultOr;
 use crate::types::{IOResult, Value};
 use crate::util::{extract_view_columns, ViewColumnSchema};
-use crate::{return_if_io, LimboError, Pager, Result, Statement};
+use crate::{return_if_io, turso_assert, LimboError, Pager, Result, Statement};
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 use std::cell::RefCell;
 use std::fmt;
@@ -130,7 +130,32 @@ impl ViewTransactionState {
     pub fn len(&self) -> usize {
         self.table_deltas.borrow().values().map(|d| d.len()).sum()
     }
+
+    fn delta_lengths(&self) -> HashMap<String, usize> {
+        self.table_deltas
+            .borrow()
+            .iter()
+            .map(|(table_name, delta)| (table_name.clone(), delta.len()))
+            .collect()
+    }
+
+    fn truncate_deltas(&self, lengths: &HashMap<String, usize>) {
+        let mut deltas = self.table_deltas.borrow_mut();
+        deltas.retain(|table_name, _| lengths.contains_key(table_name));
+        for (table_name, delta) in deltas.iter_mut() {
+            let length = lengths[table_name];
+            turso_assert!(
+                delta.len() >= length,
+                "view delta shrank during a statement",
+                { "table_name": table_name, "length": delta.len(), "mark": length }
+            );
+            delta.changes.truncate(length);
+        }
+    }
 }
+
+#[derive(Debug, Default)]
+pub struct ViewDeltaMark(HashMap<String, HashMap<String, usize>>);
 
 /// Container for all view transaction states within a connection
 /// Provides interior mutability for the map of view states
@@ -174,6 +199,24 @@ impl AllViewsTxState {
     /// Clear all transaction states
     pub fn clear(&self) {
         self.states.borrow_mut().clear();
+    }
+
+    pub fn mark(&self) -> ViewDeltaMark {
+        ViewDeltaMark(
+            self.states
+                .borrow()
+                .iter()
+                .map(|(view_name, state)| (view_name.clone(), state.delta_lengths()))
+                .collect(),
+        )
+    }
+
+    pub fn rollback_to(&self, mark: &ViewDeltaMark) {
+        let mut states = self.states.borrow_mut();
+        states.retain(|view_name, _| mark.0.contains_key(view_name));
+        for (view_name, state) in states.iter() {
+            state.truncate_deltas(&mark.0[view_name]);
+        }
     }
 
     /// Check if there are no transaction states

@@ -5254,6 +5254,7 @@ impl Connection {
         }
         self.rollback_attached_wal_txns();
         self.index_methods_on_transaction_rolled_back();
+        self.view_transaction_states.clear();
         self.set_tx_state(TransactionState::None);
         self.clear_tx_poison();
     }

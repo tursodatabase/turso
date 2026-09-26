@@ -18,6 +18,7 @@
 //! <https://www.sqlite.org/opcode.html>
 
 use crate::alloc::{TryReserveError, TursoFromIterator};
+use crate::incremental::view::ViewDeltaMark;
 use crate::translate::plan::BitSet;
 use crate::types::IOResultOr;
 use crate::types::{Extendable, Text, ValueBlob};
@@ -1005,6 +1006,7 @@ pub struct ProgramState {
     /// When a statement subtransaction rolls back, the connection's deferred foreign key violations counter
     /// is reset to this value.
     fk_deferred_violations_when_stmt_started: AtomicIsize,
+    view_deltas_when_stmt_started: Option<ViewDeltaMark>,
     /// Number of immediate foreign key violations that occurred during the active statement. If nonzero,
     /// the statement subtransactionwill roll back.
     fk_immediate_violations_during_stmt: AtomicIsize,
@@ -1093,6 +1095,7 @@ impl ProgramState {
             view_delta_state: ViewDeltaCommitState::NotStarted,
             auto_txn_cleanup: TxnCleanup::None,
             fk_deferred_violations_when_stmt_started: AtomicIsize::new(0),
+            view_deltas_when_stmt_started: None,
             fk_immediate_violations_during_stmt: AtomicIsize::new(0),
             rowsets: HashMap::default(),
             spare_agg_payloads: Vec::new(),
@@ -1253,6 +1256,7 @@ impl ProgramState {
         self.auto_txn_cleanup = TxnCleanup::None;
         *self.fk_immediate_violations_during_stmt.get_mut() = 0;
         *self.fk_deferred_violations_when_stmt_started.get_mut() = 0;
+        self.view_deltas_when_stmt_started = None;
         if !self.rowsets.is_empty() {
             self.rowsets.clear();
         }
@@ -1557,6 +1561,7 @@ impl ProgramState {
         }
 
         self.has_stmt_transaction = true;
+        self.view_deltas_when_stmt_started = Some(connection.view_transaction_states.mark());
 
         // Store the deferred foreign key violations counter at the start of the statement.
         // This is used to ensure that if an interactive transaction had deferred FK violations and a statement subtransaction rolls back,
@@ -1596,6 +1601,10 @@ impl ProgramState {
             return Ok(());
         }
         self.has_stmt_transaction = false;
+        let view_deltas_when_stmt_started = self
+            .view_deltas_when_stmt_started
+            .take()
+            .expect("a statement transaction always records its view deltas");
 
         // Drain attached pagers upfront so we can clean them up regardless of path.
         let attached_pagers: Vec<Arc<Pager>> = self.attached_savepoint_pagers.drain(..).collect();
@@ -1686,6 +1695,9 @@ impl ProgramState {
                         .load(Ordering::Acquire),
                     Ordering::SeqCst,
                 );
+                connection
+                    .view_transaction_states
+                    .rollback_to(&view_deltas_when_stmt_started);
 
                 match pager_err {
                     Some(e) => Err(e),

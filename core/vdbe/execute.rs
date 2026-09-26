@@ -5121,6 +5121,8 @@ pub fn op_transaction_inner(
                     } else if statement_writes_db && in_explicit_txn {
                         if !state.has_stmt_transaction {
                             state.has_stmt_transaction = true;
+                            state.view_deltas_when_stmt_started =
+                                Some(program.connection.view_transaction_states.mark());
                             state.fk_deferred_violations_when_stmt_started.store(
                                 program
                                     .connection
