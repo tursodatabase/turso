@@ -2,7 +2,6 @@ use turso_parser::ast::{self, Expr, Literal, Name, QualifiedName, RefAct};
 
 use super::{translate_inner, ProgramBuilder, ProgramBuilderOpts};
 use crate::translate::emitter::emit_columns_and_dependencies;
-use crate::translate::expr::emit_table_column_for_dml;
 use crate::translate::plan::ColumnMask;
 use crate::{
     error::SQLITE_CONSTRAINT_FOREIGNKEY,
@@ -716,16 +715,11 @@ pub fn emit_parent_index_key_change_checks(
         .transpose()?;
     for (i, index_col) in index.columns.iter().enumerate() {
         if let Some(ref ctx) = dml_ctx {
-            emit_table_column_for_dml(
-                program,
-                cursor_id,
-                ctx.clone(),
-                &table_btree.columns()[index_col.pos_in_table],
-                index_col.pos_in_table,
-                old_key + i,
-                resolver,
-                &Arc::new(table_btree.clone()),
-            )?;
+            program.emit_insn(Insn::Copy {
+                src_reg: ctx.to_column_reg(index_col.pos_in_table),
+                dst_reg: old_key + i,
+                extra_amount: 0,
+            });
         } else {
             program.emit_column_or_rowid(cursor_id, index_col.pos_in_table, old_key + i);
         }
@@ -1017,7 +1011,7 @@ fn build_parent_key(
         .transpose()?;
 
     for (i, pcol) in parent_cols.iter().enumerate() {
-        let Some((pos, col)) = parent_bt.get_column(pcol) else {
+        let Some((pos, _)) = parent_bt.get_column(pcol) else {
             if ROWID_STRS.iter().any(|s| pcol.eq_ignore_ascii_case(s)) {
                 // child column references parent rowid
                 program.emit_insn(Insn::Copy {
@@ -1030,19 +1024,12 @@ fn build_parent_key(
             return Err(LimboError::InternalError(format!("col {pcol} missing")));
         };
 
-        if some_fk_cols_are_virtual {
-            // the virtual column will need the registers we previously copied
-            emit_table_column_for_dml(
-                program,
-                parent_cursor_id,
-                ctx.clone()
-                    .expect("ctx is always computed if some fk cols are virtual"),
-                col,
-                pos,
-                dest_start + i,
-                resolver,
-                &Arc::new(parent_bt.clone()),
-            )?;
+        if let Some(ref ctx) = ctx {
+            program.emit_insn(Insn::Copy {
+                src_reg: ctx.to_column_reg(pos),
+                dst_reg: dest_start + i,
+                extra_amount: 0,
+            });
         } else {
             program.emit_column_or_rowid(parent_cursor_id, pos, dest_start + i);
         }

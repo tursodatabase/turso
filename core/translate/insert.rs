@@ -1,3 +1,4 @@
+use crate::alloc::TursoIteratorExt;
 use crate::schema::ColumnLayout;
 use crate::translate::emitter::{emit_index_column_value_old_image, gencol};
 use crate::turso_debug_assert;
@@ -26,8 +27,8 @@ use crate::{
             open_read_index, open_read_table, ForeignKeyActions,
         },
         plan::{
-            ColumnUsedMask, EvalAt, JoinedTable, Operation, QueryDestination, ResultSetColumn,
-            TableReferences,
+            ColumnMask, ColumnUsedMask, EvalAt, JoinedTable, Operation, QueryDestination,
+            ResultSetColumn, TableReferences,
         },
         planner::{plan_ctes_as_outer_refs, ROWID_STRS},
         select::translate_select,
@@ -795,11 +796,30 @@ pub fn translate_insert(
     emit_notnulls(program, &ctx, &insertion, resolver, false)?;
 
     if insertion.has_virtual_columns() {
-        //TODO only compute the necessary virtual columns for CHECK and NOT NULL evaluation
+        let reads_whole_row = !result_columns.is_empty()
+            || !returning_subqueries.is_empty()
+            || !upsert_actions.is_empty()
+            || has_triggers_including_temp(
+                resolver,
+                database_id,
+                TriggerEvent::Insert,
+                None,
+                &btree_table,
+            );
+        let columns_to_compute = gencol::columns_needed_for_new_row(
+            &btree_table,
+            resolver,
+            database_id,
+            reads_whole_row,
+            has_fks,
+        )?;
+        let encoded_columns: ColumnMask = (0..ctx.table.columns().len()).try_collect()?;
         compute_virtual_columns(
             program,
-            &ctx.table.columns_topo_sort()?,
-            &dml_ctx,
+            &ctx.table
+                .columns_topo_sort()?
+                .retain_columns(&columns_to_compute),
+            &dml_ctx.with_encoded_columns(encoded_columns),
             resolver,
             &btree_table,
         )?;
@@ -992,14 +1012,6 @@ pub fn translate_insert(
     );
     let has_after_triggers = !relevant_after_triggers.is_empty();
     if has_after_triggers {
-        compute_virtual_columns(
-            program,
-            &ctx.table.columns_topo_sort()?,
-            &dml_ctx,
-            resolver,
-            &btree_table,
-        )?;
-
         // Build raw NEW registers for AFTER triggers. Values are encoded at this point;
         // fire_trigger will decode them via decode_trigger_registers.
         let key_reg = insertion.key_register();
@@ -1345,7 +1357,7 @@ fn emit_partial_index_check(
         .iter()
         .map(|cm| cm.column.clone())
         .collect();
-    let mut column_regs: Vec<usize> = insertion
+    let column_regs: Vec<usize> = insertion
         .col_mappings
         .iter()
         .map(|cm| {
@@ -1362,7 +1374,7 @@ fn emit_partial_index_check(
         resolver,
         expr,
         &columns,
-        &mut column_regs,
+        &column_regs,
         table,
         reg,
     )?;
@@ -3557,14 +3569,18 @@ fn emit_index_column_value_for_insert(
     idx_col: &IndexColumn,
     dest_reg: usize,
 ) -> Result<()> {
-    if let Some(expr) = &idx_col.expr {
+    if let Some(expr) = idx_col
+        .expr
+        .as_ref()
+        .filter(|_| idx_col.pos_in_table == EXPR_INDEX_SENTINEL)
+    {
         let expr = expr.as_ref().clone();
         let columns: Vec<Column> = insertion
             .col_mappings
             .iter()
             .map(|cm| cm.column.clone())
             .collect();
-        let mut column_regs: Vec<usize> = insertion
+        let column_regs: Vec<usize> = insertion
             .col_mappings
             .iter()
             .map(|cm| {
@@ -3580,18 +3596,10 @@ fn emit_index_column_value_for_insert(
             resolver,
             expr,
             &columns,
-            &mut column_regs,
+            &column_regs,
             table,
             dest_reg,
         )?;
-        // For virtual generated column references, apply the column's
-        // declared affinity to the computed expression result.
-        if idx_col.pos_in_table != EXPR_INDEX_SENTINEL {
-            let column = &table.columns()[idx_col.pos_in_table];
-            if column.is_virtual_generated() {
-                program.emit_column_affinity(dest_reg, column.affinity());
-            }
-        }
     } else {
         let Some(cm) = insertion.get_col_mapping_by_name(&idx_col.name) else {
             return Err(LimboError::PlanningError(

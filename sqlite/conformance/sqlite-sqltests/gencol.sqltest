@@ -5785,3 +5785,367 @@ expect {
     0
     ok
 }
+
+setup gencol_untyped_virtual_columns {
+    CREATE TABLE t(a INTEGER, b INTEGER, c AS (a + b), d AS (c * 2));
+}
+
+@skip-if mvcc "mvcc has different root pages"
+@setup gencol_untyped_virtual_columns
+snapshot gencol_select_untyped_virtual_columns {
+    SELECT c, d FROM t;
+}
+
+setup gencol_virtual_columns_after_insert_trigger {
+    CREATE TABLE t(a INTEGER, b INTEGER, c AS (a + b), d AS (c * 2));
+    CREATE TABLE log(x, y);
+    CREATE TRIGGER t_ai AFTER INSERT ON t BEGIN INSERT INTO log VALUES (NEW.c, NEW.d); END;
+}
+
+@skip-if mvcc "mvcc has different root pages"
+@setup gencol_virtual_columns_after_insert_trigger
+snapshot gencol_insert_after_trigger_reuses_virtual_columns {
+    INSERT INTO t(a, b) VALUES (1, 2);
+}
+
+test gencol_after_update_trigger_new_virtual_column_uses_new_rowid {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, x INT, c AS (id * 10));
+    CREATE TABLE log(old_id, old_c, new_id, new_c);
+    CREATE TRIGGER t_au AFTER UPDATE ON t BEGIN
+        INSERT INTO log VALUES (OLD.id, OLD.c, NEW.id, NEW.c);
+    END;
+    INSERT INTO t(id, x) VALUES (1, 0);
+    UPDATE t SET id = 5 WHERE id = 1;
+    SELECT * FROM log;
+}
+expect {
+    1|10|5|50
+}
+
+setup gencol_virtual_columns_after_update_trigger {
+    CREATE TABLE t(a INTEGER, b INTEGER, c AS (a + b), d AS (c * 2));
+    CREATE TABLE log(x, y);
+    CREATE TRIGGER t_au AFTER UPDATE ON t BEGIN INSERT INTO log VALUES (NEW.d, OLD.d); END;
+}
+
+@skip-if mvcc "mvcc has different root pages"
+@setup gencol_virtual_columns_after_update_trigger
+snapshot gencol_update_after_trigger_reuses_virtual_columns {
+    UPDATE t SET a = 5;
+}
+
+test gencol_update_not_null_virtual_column_sees_column_affinity {
+    CREATE TABLE t(a INTEGER, c AS (nullif(typeof(a), 'text')) NOT NULL);
+    INSERT INTO t(a) VALUES (1);
+    UPDATE t SET a = '5';
+    SELECT a, c FROM t;
+}
+expect {
+    5|integer
+}
+
+test gencol_update_not_null_virtual_column_checked_after_before_trigger {
+    CREATE TABLE t(a INTEGER, c AS (nullif(a, 0)) NOT NULL);
+    CREATE TABLE log(x);
+    CREATE TRIGGER t_bu BEFORE UPDATE ON t BEGIN INSERT INTO log VALUES (NEW.a); END;
+    INSERT INTO t(a) VALUES (1);
+    UPDATE t SET a = 0;
+}
+expect error {
+    NOT NULL constraint failed: t.c
+}
+
+test gencol_update_not_null_ignore_virtual_column_skips_row {
+    CREATE TABLE t(a INTEGER, c AS (nullif(a, 0)) NOT NULL ON CONFLICT IGNORE);
+    INSERT INTO t(a) VALUES (1), (2);
+    UPDATE t SET a = a - 1;
+    SELECT a, c FROM t;
+}
+expect {
+    1|1
+    1|1
+}
+
+setup gencol_virtual_columns_update {
+    CREATE TABLE t(a INTEGER, b INTEGER, c AS (a + b), d AS (c * 2));
+}
+
+@skip-if mvcc "mvcc has different root pages"
+@setup gencol_virtual_columns_update
+snapshot gencol_update_computes_virtual_columns_once {
+    UPDATE t SET a = 5 WHERE b = 3;
+}
+
+test gencol_upsert_check_on_virtual_column_sees_column_affinity {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, b INTEGER, c AS (typeof(b)) CHECK (c = 'integer'));
+    INSERT INTO t(id, b) VALUES (1, 5);
+    INSERT INTO t(id, b) VALUES (1, 0) ON CONFLICT(id) DO UPDATE SET b = '6';
+    SELECT id, b, c FROM t;
+}
+expect {
+    1|6|integer
+}
+
+setup gencol_virtual_columns_upsert {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, b INTEGER, c AS (id + b), d AS (c * 2));
+}
+
+@skip-if mvcc "mvcc has different root pages"
+@setup gencol_virtual_columns_upsert
+snapshot gencol_upsert_computes_virtual_columns_once {
+    INSERT INTO t(id, b) VALUES (1, 2) ON CONFLICT(id) DO UPDATE SET b = excluded.b + 1 RETURNING c, d;
+}
+
+test fk-gencol-parent-delete-key-reads-two-virtual-columns {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE p(a INTEGER, b INTEGER, c AS (a + 1), e AS (b + 100), k AS (c + e) UNIQUE);
+    CREATE TABLE ch(x REFERENCES p(k));
+    INSERT INTO p(a, b) VALUES (1, 2);
+    INSERT INTO ch VALUES (104);
+    DELETE FROM p;
+}
+expect error {
+    FOREIGN KEY constraint failed
+}
+
+test fk-gencol-parent-update-key-reads-two-virtual-columns {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE p(a INTEGER, b INTEGER, c AS (a + 1), e AS (b + 100), k AS (c + e) UNIQUE);
+    CREATE TABLE ch(x REFERENCES p(k));
+    INSERT INTO p(a, b) VALUES (1, 2);
+    INSERT INTO ch VALUES (104);
+    UPDATE p SET a = 5;
+}
+expect error {
+    FOREIGN KEY constraint failed
+}
+
+setup gencol_fk_parent_virtual_key {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE p(a INTEGER, b INTEGER, k AS (a + b) UNIQUE, z AS (a * 7));
+    CREATE TABLE c(x INTEGER REFERENCES p(k));
+}
+
+@skip-if mvcc "mvcc has different root pages"
+@setup gencol_fk_parent_virtual_key
+snapshot gencol_fk_parent_delete_computes_only_key_columns {
+    DELETE FROM p WHERE a = 1;
+}
+
+setup gencol_indexed_virtual_columns {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, a INTEGER, b INTEGER, c AS (a + b), e AS (a * 3) UNIQUE);
+    CREATE INDEX tc ON t(c);
+}
+
+@skip-if mvcc "mvcc has different root pages"
+@setup gencol_indexed_virtual_columns
+snapshot gencol_insert_index_keys_copy_virtual_columns {
+    INSERT INTO t(id, a, b) VALUES (1, 1, 2);
+}
+
+@skip-if mvcc "mvcc has different root pages"
+@setup gencol_indexed_virtual_columns
+snapshot gencol_update_index_keys_copy_virtual_columns {
+    UPDATE t SET a = 5 WHERE id = 1;
+}
+
+@skip-if mvcc "mvcc has different root pages"
+@setup gencol_indexed_virtual_columns
+snapshot gencol_upsert_index_keys_copy_virtual_columns {
+    INSERT INTO t(id, a, b) VALUES (1, 1, 2) ON CONFLICT(id) DO UPDATE SET a = 7;
+}
+
+@cross-check-integrity
+test gencol_index_keys_match_virtual_columns_after_writes {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, a INTEGER, b INTEGER, c AS (a + b), e AS (a * 3) UNIQUE);
+    CREATE INDEX tc ON t(c);
+    INSERT INTO t(id, a, b) VALUES (1, 1, 2), (2, 2, 2);
+    UPDATE t SET a = 5 WHERE id = 1;
+    INSERT INTO t(id, a, b) VALUES (2, 0, 0) ON CONFLICT(id) DO UPDATE SET a = 7;
+    SELECT id, c FROM t INDEXED BY tc WHERE c > 0 ORDER BY c;
+    SELECT id, e FROM t WHERE e = 21;
+    PRAGMA integrity_check;
+}
+expect {
+    1|7
+    2|9
+    2|21
+    ok
+}
+
+setup gencol_virtual_columns_delete_trigger {
+    CREATE TABLE t(a INTEGER, b INTEGER, c AS (a + b), d AS (c * 2));
+    CREATE TABLE log(x, y);
+    CREATE TRIGGER t_bd BEFORE DELETE ON t BEGIN INSERT INTO log VALUES (OLD.c, OLD.d); END;
+}
+
+@skip-if mvcc "mvcc has different root pages"
+@setup gencol_virtual_columns_delete_trigger
+snapshot gencol_delete_old_row_computes_virtual_columns_from_registers {
+    DELETE FROM t WHERE b = 3;
+}
+
+setup gencol_one_indexed_virtual_column {
+    CREATE TABLE t(a INTEGER, b INTEGER, c AS (a + b), d AS (c * 2), e AS (a * 3));
+    CREATE INDEX te ON t(e);
+}
+
+@skip-if mvcc "mvcc has different root pages"
+@setup gencol_one_indexed_virtual_column
+snapshot gencol_insert_computes_only_read_virtual_columns {
+    INSERT INTO t(a, b) VALUES (1, 2);
+}
+
+test gencol_insert_check_reads_virtual_column_through_another {
+    CREATE TABLE t(a INTEGER, b INTEGER, c AS (a + b), d AS (c * 2) CHECK (d < 10), e AS (a * 100));
+    INSERT INTO t(a, b) VALUES (1, 2);
+    INSERT INTO t(a, b) VALUES (3, 4);
+}
+expect error {
+    CHECK constraint failed: d < 10
+}
+
+@cross-check-integrity
+@skip-if mvcc "Expression indexes are not supported with MVCC"
+test gencol_insert_expression_and_partial_indexes_read_virtual_columns {
+    CREATE TABLE t(a INTEGER, b INTEGER, c AS (a + b), d AS (c * 2), e AS (a * 100));
+    CREATE INDEX t_expr ON t(d + 1);
+    CREATE INDEX t_part ON t(a) WHERE d > 5;
+    INSERT INTO t(a, b) VALUES (1, 1), (2, 2), (3, 3);
+    SELECT a FROM t INDEXED BY t_expr WHERE d + 1 = 9;
+    SELECT a FROM t INDEXED BY t_part WHERE d > 5 ORDER BY a;
+    PRAGMA integrity_check;
+}
+expect {
+    2
+    2
+    3
+    ok
+}
+
+test gencol_insert_not_null_reads_virtual_column_through_another {
+    CREATE TABLE t(a INTEGER, b INTEGER, c AS (a + b), d AS (c * 2) NOT NULL);
+    INSERT INTO t(a, b) VALUES (1, NULL);
+}
+expect error {
+    NOT NULL constraint failed: t.d
+}
+
+test gencol_insert_fk_child_key_is_virtual_column {
+    PRAGMA foreign_keys = ON;
+    CREATE TABLE p(id INTEGER PRIMARY KEY);
+    CREATE TABLE ch(x INTEGER, v AS (x + 1) REFERENCES p(id), w AS (x * 7));
+    INSERT INTO p VALUES (2);
+    INSERT INTO ch(x) VALUES (1);
+    INSERT INTO ch(x) VALUES (5);
+}
+expect error {
+    FOREIGN KEY constraint failed
+}
+
+test gencol_insert_fk_parent_key_is_virtual_column {
+    PRAGMA foreign_keys = ON;
+    CREATE TABLE p(a INTEGER, b INTEGER, k AS (a + b) UNIQUE, z AS (a * 7));
+    CREATE TABLE ch(x REFERENCES p(k) DEFERRABLE INITIALLY DEFERRED);
+    BEGIN;
+    INSERT INTO ch VALUES (3);
+    INSERT INTO p(a, b) VALUES (1, 2);
+    COMMIT;
+    SELECT count(*) FROM ch;
+}
+expect {
+    1
+}
+
+@skip-if mvcc "mvcc has different root pages"
+@setup gencol_one_indexed_virtual_column
+snapshot gencol_update_computes_only_read_virtual_columns {
+    UPDATE t SET a = 5;
+}
+
+@cross-check-integrity
+test gencol_update_index_key_reads_unchanged_virtual_column {
+    CREATE TABLE t(a INTEGER, b INTEGER, v AS (b * 10), w AS (a * 3));
+    CREATE INDEX t_av ON t(a, v);
+    INSERT INTO t(a, b) VALUES (1, 2);
+    UPDATE t SET a = 5;
+    SELECT a, v FROM t INDEXED BY t_av WHERE a = 5 AND v = 20;
+    PRAGMA integrity_check;
+}
+expect {
+    5|20
+    ok
+}
+
+test gencol_update_check_reads_unchanged_virtual_column {
+    CREATE TABLE t(a INTEGER, b INTEGER, v AS (b * 10), w AS (a * 3), CHECK (a < v));
+    INSERT INTO t(a, b) VALUES (1, 2);
+    UPDATE t SET a = 25;
+}
+expect error {
+    CHECK constraint failed: a < v
+}
+
+test gencol_update_check_reads_virtual_column_through_another {
+    CREATE TABLE t(a INTEGER, b INTEGER, c AS (a + b), d AS (c * 2) CHECK (d < 10), e AS (a * 100));
+    INSERT INTO t(a, b) VALUES (1, 2);
+    UPDATE t SET a = 3;
+}
+expect error {
+    CHECK constraint failed: d < 10
+}
+
+test gencol_update_not_null_reads_virtual_column_through_another {
+    CREATE TABLE t(a INTEGER, b INTEGER, c AS (a + b), d AS (c * 2) NOT NULL);
+    INSERT INTO t(a, b) VALUES (1, 1);
+    UPDATE t SET a = NULL;
+}
+expect error {
+    NOT NULL constraint failed: t.d
+}
+
+test gencol_update_fk_child_key_is_virtual_column {
+    PRAGMA foreign_keys = ON;
+    CREATE TABLE p(id INTEGER PRIMARY KEY);
+    CREATE TABLE ch(x INTEGER, v AS (x + 1) REFERENCES p(id), w AS (x * 7));
+    INSERT INTO p VALUES (2);
+    INSERT INTO ch(x) VALUES (1);
+    UPDATE ch SET x = 5;
+}
+expect error {
+    FOREIGN KEY constraint failed
+}
+
+setup gencol_one_indexed_virtual_column_with_key {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, a INTEGER, b INTEGER, c AS (a + b), d AS (c * 2), e AS (a * 3));
+    CREATE INDEX te ON t(e);
+}
+
+@skip-if mvcc "mvcc has different root pages"
+@setup gencol_one_indexed_virtual_column_with_key
+snapshot gencol_upsert_computes_only_read_virtual_columns {
+    INSERT INTO t(id, a, b) VALUES (1, 1, 2) ON CONFLICT(id) DO UPDATE SET a = 7;
+}
+
+test gencol_upsert_check_reads_virtual_column_through_another {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, a INTEGER, b INTEGER, c AS (a + b), d AS (c * 2) CHECK (d < 10), e AS (a * 100));
+    INSERT INTO t(id, a, b) VALUES (1, 1, 2);
+    INSERT INTO t(id, a, b) VALUES (1, 0, 0) ON CONFLICT(id) DO UPDATE SET a = 3;
+}
+expect error {
+    CHECK constraint failed: d < 10
+}
+
+@cross-check-integrity
+test gencol_upsert_index_key_reads_unchanged_virtual_column {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, a INTEGER, b INTEGER, v AS (b * 10), w AS (a * 3));
+    CREATE INDEX t_av ON t(a, v);
+    INSERT INTO t(id, a, b) VALUES (1, 1, 2);
+    INSERT INTO t(id, a, b) VALUES (1, 0, 0) ON CONFLICT(id) DO UPDATE SET a = 5;
+    SELECT a, v FROM t INDEXED BY t_av WHERE a = 5 AND v = 20;
+    PRAGMA integrity_check;
+}
+expect {
+    5|20
+    ok
+}

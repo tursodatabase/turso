@@ -25,7 +25,7 @@ use super::{
 use crate::alloc::{TryClone, TursoIteratorExt};
 use crate::instrument;
 use crate::schema::{
-    BTreeTable, CheckConstraint, Column, ColumnLayout, GeneratedType, IndexColumn, Schema, Table,
+    BTreeTable, CheckConstraint, Column, ColumnLayout, IndexColumn, Schema, Table,
     EXPR_INDEX_SENTINEL,
 };
 use crate::translate::fkeys::FkActionCompileStack;
@@ -1951,8 +1951,8 @@ pub(crate) fn init_limit(
     Ok(())
 }
 
-/// Emits `target_columns`, plus the stored columns needed by `target_columns`, into a
-/// DML row context. This takes into account stored columns, and any stored columns
+/// Emits `target_columns`, plus the columns needed by `target_columns`, into a
+/// DML row context. This takes into account stored columns, and any columns
 /// required by virtual columns in `target_columns`.
 ///
 /// Non-rowid target columns are allocated in target order. Rowid-alias columns resolve
@@ -1977,7 +1977,7 @@ pub(crate) fn emit_columns_and_dependencies(
     for (pos, idx) in non_rowid_targets.iter().copied().enumerate() {
         non_rowid_target_positions[idx] = Some(pos);
     }
-    let dependencies = table.dependencies_of_columns(targets.iter().copied())?;
+    let needed_columns = table.columns_with_dependencies(targets.iter().copied())?;
 
     let target_base = if non_rowid_targets.is_empty() {
         0
@@ -1985,7 +1985,7 @@ pub(crate) fn emit_columns_and_dependencies(
         program.alloc_registers(non_rowid_targets.len())
     };
     let extra_base = {
-        let mut dependencies_not_in_targets: ColumnMask = dependencies.try_clone()?;
+        let mut dependencies_not_in_targets: ColumnMask = needed_columns.try_clone()?;
         dependencies_not_in_targets -= &target_mask;
 
         let extra_count = table
@@ -2012,9 +2012,11 @@ pub(crate) fn emit_columns_and_dependencies(
             reg
         } else if col.is_rowid_alias() {
             rowid_reg
-        } else if dependencies.get(idx) {
+        } else if needed_columns.get(idx) {
             let reg = extra_base + extra_idx;
-            program.emit_column_or_rowid(cursor_id, idx, reg);
+            if !col.is_virtual_generated() {
+                program.emit_column_or_rowid(cursor_id, idx, reg);
+            }
             extra_idx += 1;
             reg
         } else {
@@ -2022,7 +2024,8 @@ pub(crate) fn emit_columns_and_dependencies(
         };
         (col, reg)
     });
-    let dml_ctx = DmlColumnContext::from_column_reg_mapping(pairs);
+    let dml_ctx = DmlColumnContext::from_column_reg_mapping(pairs)
+        .with_encoded_columns((0..table.columns().len()).try_collect()?);
     if targets
         .iter()
         .all(|&idx| !table.columns()[idx].is_rowid_alias())
@@ -2035,7 +2038,7 @@ pub(crate) fn emit_columns_and_dependencies(
     let table_arc = Arc::new(table.clone());
     gencol::compute_virtual_columns(
         program,
-        &table.columns_topo_sort()?,
+        &table.columns_topo_sort()?.retain_columns(&needed_columns),
         &dml_ctx,
         resolver,
         &table_arc,
@@ -2140,9 +2143,13 @@ fn emit_index_column_value_new_image(
     layout: &ColumnLayout,
     table: &Arc<BTreeTable>,
 ) -> Result<()> {
-    if let Some(expr) = &idx_col.expr {
+    if let Some(expr) = idx_col
+        .expr
+        .as_ref()
+        .filter(|_| idx_col.pos_in_table == EXPR_INDEX_SENTINEL)
+    {
         let expr = expr.as_ref().clone();
-        let mut column_regs: Vec<usize> = columns
+        let column_regs: Vec<usize> = columns
             .iter()
             .enumerate()
             .map(|(i, col)| {
@@ -2158,7 +2165,7 @@ fn emit_index_column_value_new_image(
             resolver,
             expr,
             columns,
-            &mut column_regs,
+            &column_regs,
             table,
             dest_reg,
         )?;
@@ -2166,34 +2173,16 @@ fn emit_index_column_value_new_image(
         let col_in_table = columns
             .get(idx_col.pos_in_table)
             .expect("column index out of bounds");
-        match col_in_table.generated_type() {
-            GeneratedType::Virtual { ref expr, .. } => {
-                gencol::emit_gencol_expr_from_registers(
-                    program,
-                    expr,
-                    dest_reg,
-                    columns_start_reg,
-                    columns,
-                    resolver,
-                    rowid_reg,
-                    layout,
-                    table,
-                )?;
-                program.emit_column_affinity(dest_reg, col_in_table.affinity());
-            }
-            GeneratedType::NotGenerated => {
-                let src_reg = if col_in_table.is_rowid_alias() {
-                    rowid_reg
-                } else {
-                    layout.to_register(columns_start_reg, idx_col.pos_in_table)
-                };
-                program.emit_insn(Insn::Copy {
-                    src_reg,
-                    dst_reg: dest_reg,
-                    extra_amount: 0,
-                });
-            }
-        }
+        let src_reg = if col_in_table.is_rowid_alias() {
+            rowid_reg
+        } else {
+            layout.to_register(columns_start_reg, idx_col.pos_in_table)
+        };
+        program.emit_insn(Insn::Copy {
+            src_reg,
+            dst_reg: dest_reg,
+            extra_amount: 0,
+        });
     }
     Ok(())
 }

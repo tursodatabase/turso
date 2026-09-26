@@ -1,0 +1,33 @@
+---
+source: gencol.sqltest
+expression: UPDATE t SET a = 5 WHERE b = 3;
+info:
+  statement_type: UPDATE
+  tables:
+  - t
+  setup_blocks:
+  - gencol_virtual_columns_update
+  database: ':memory:'
+---
+QUERY PLAN
+`--SCAN t
+
+BYTECODE
+addr  opcode        p1  p2  p3  p4      p5  comment
+   0  Init           0  13   0           0  Start at 13
+   1  OpenWrite      0   2   0           0  root=2; iDb=0
+   2  Rewind         0  12   0           0  Rewind table t
+   3    Column       0   1   2           0  r[2]=t.b
+   4    Ne           2   3  11  Binary   0  if r[2]!=r[3] goto 11
+   5    RowId        0   4   0           0  r[4]=t.rowid
+   6    IsNull       4  12   0           0  if (r[4]==NULL) goto 12
+   7    Column       0   1   6           0  r[6]=t.b
+   8    Affinity     5   2   0           0  r[5..7] = D, D
+   9    MakeRecord   5   2   9           0  r[9]=mkrec(r[5..6])
+  10    Insert       0   9   4  t        8  intkey=r[4] data=r[9]
+  11  Next           0   3   0           1
+  12  Halt           0   0   0           0
+  13  Transaction    0   2   1           0  iDb=0 tx_mode=Write
+  14  Integer        3   3   0           0  r[3]=3
+  15  Integer        5   5   0           0  r[5]=5
+  16  Goto           0   1   0           0
