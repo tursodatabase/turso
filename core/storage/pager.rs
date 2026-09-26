@@ -1600,6 +1600,12 @@ pub struct Pager {
     /// lock, so a reader that sees false can skip the lock: every page read
     /// checks for a pending entry first.
     has_pending_reads: AtomicBool,
+    /// Yield injector mirrored from the owning connection; see
+    /// [`Pager::set_yield_injector`].
+    #[cfg(any(test, injected_yields))]
+    yield_injector: RwLock<Option<Arc<dyn crate::mvcc::yield_points::YieldInjector>>>,
+    #[cfg(any(test, injected_yields))]
+    yield_instance_id_counter: AtomicU64,
     #[cfg(test)]
     spill_yield: SpillYieldHook,
     /// Dirty pages as a bitmap, naturally sorted by page number.
@@ -1890,6 +1896,31 @@ pub struct CollectingState {
 }
 
 impl Pager {
+    /// Mirror the owning connection's yield injector onto this pager so that
+    /// cursors created without a `Connection` in scope (IVM/DBSP state and view
+    /// cursors) participate in deterministic yield injection.
+    #[cfg(any(test, injected_yields))]
+    pub(crate) fn set_yield_injector(
+        &self,
+        injector: Option<Arc<dyn crate::mvcc::yield_points::YieldInjector>>,
+    ) {
+        *self.yield_injector.write() = injector;
+    }
+
+    #[cfg(any(test, injected_yields))]
+    pub(crate) fn yield_injector(
+        &self,
+    ) -> Option<Arc<dyn crate::mvcc::yield_points::YieldInjector>> {
+        self.yield_injector.read().clone()
+    }
+
+    #[cfg(any(test, injected_yields))]
+    #[inline(always)]
+    pub(crate) fn next_yield_instance_id(&self) -> u64 {
+        self.yield_instance_id_counter
+            .fetch_add(1, Ordering::Relaxed)
+    }
+
     pub fn new(
         db_file: Arc<dyn DatabaseStorage>,
         wal: Option<Arc<dyn Wal>>,
@@ -1911,6 +1942,10 @@ impl Pager {
             io,
             pending_reads: RwLock::new(HashMap::new()),
             has_pending_reads: AtomicBool::new(false),
+            #[cfg(any(test, injected_yields))]
+            yield_injector: RwLock::new(None),
+            #[cfg(any(test, injected_yields))]
+            yield_instance_id_counter: AtomicU64::new(0),
             #[cfg(test)]
             spill_yield: SpillYieldHook::new(),
             dirty_pages: Arc::new(RwLock::new(RoaringBitmap::new())),
