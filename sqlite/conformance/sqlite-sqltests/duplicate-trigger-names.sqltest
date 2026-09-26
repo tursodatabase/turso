@@ -45,6 +45,30 @@ expect error {
 }
 
 @setup schema
+test reserved-trigger-name {
+    CREATE TRIGGER sqlite_trg AFTER INSERT ON t1 BEGIN SELECT 1; END;
+}
+expect error {
+    object name reserved for internal use: sqlite_trg
+}
+
+@setup schema
+test reserved-trigger-name-quoted-case-insensitive {
+    CREATE TEMP TRIGGER "SQLITE_TRG" AFTER INSERT ON t1 BEGIN SELECT 1; END;
+}
+expect error {
+    object name reserved for internal use: SQLITE_TRG
+}
+
+@setup schema
+test reserved-trigger-name-if-not-exists {
+    CREATE TRIGGER IF NOT EXISTS sqlite_trg AFTER INSERT ON t1 BEGIN SELECT 1; END;
+}
+expect error {
+    object name reserved for internal use: sqlite_trg
+}
+
+@setup schema
 test correct-trigger-fires-after-failed-duplicate {
     CREATE TRIGGER tr AFTER INSERT ON t1 BEGIN INSERT INTO log VALUES('from_t1'); END;
     INSERT INTO t1 VALUES(1);
