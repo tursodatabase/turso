@@ -3,6 +3,8 @@
 //! Provides a trait-based interface to switch between different SQL generation
 //! backends (sql_gen and sql_gen_prop) via a config flag.
 
+use std::collections::BTreeMap;
+
 use anyhow::Result;
 use proptest::strategy::{Strategy, ValueTree};
 use proptest::test_runner::TestRunner;
@@ -24,6 +26,41 @@ pub struct GeneratedStatement {
 impl std::fmt::Display for GeneratedStatement {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}", self.sql)
+    }
+}
+
+/// Live materialized views by name, with their result columns. Ordered, so
+/// that a seed generates the same statements on every run.
+pub type Matviews = BTreeMap<String, Vec<sql_gen_prop::ColumnDef>>;
+
+/// One generated step for the runner.
+#[derive(Debug, Clone)]
+pub enum Generated {
+    /// A statement that runs unchanged on both engines.
+    Statement(GeneratedStatement),
+    /// A materialized view on Turso, and the same SELECT as a plain view on SQLite.
+    CreateMatview {
+        turso_sql: String,
+        sqlite_sql: String,
+        name: String,
+        columns: Vec<sql_gen_prop::ColumnDef>,
+        /// The view reads `sqlite_sequence`.
+        reads_sequence_table: bool,
+    },
+    DropMatview {
+        sql: String,
+        name: String,
+    },
+}
+
+impl Generated {
+    /// The SQL that runs on Turso.
+    pub fn sql(&self) -> &str {
+        match self {
+            Generated::Statement(stmt) => &stmt.sql,
+            Generated::CreateMatview { turso_sql, .. } => turso_sql,
+            Generated::DropMatview { sql, .. } => sql,
+        }
     }
 }
 
@@ -146,8 +183,8 @@ impl WeightProfile {
 
 /// Trait abstracting SQL generation backends.
 pub trait SqlGenerator {
-    /// Generate the next SQL statement given the current schema.
-    fn generate(&mut self, schema: &sql_gen::Schema) -> Result<GeneratedStatement>;
+    /// Generate the next step given the current schema and materialized views.
+    fn generate(&mut self, schema: &sql_gen::Schema, matviews: &Matviews) -> Result<Generated>;
 
     /// Take accumulated coverage data, if the backend supports it.
     fn take_coverage(&mut self) -> Option<sql_gen::Coverage> {
@@ -247,7 +284,11 @@ impl SqlGenBackend {
 }
 
 impl SqlGenerator for SqlGenBackend {
-    fn generate(&mut self, schema: &sql_gen::Schema) -> Result<GeneratedStatement> {
+    fn generate(&mut self, schema: &sql_gen::Schema, matviews: &Matviews) -> Result<Generated> {
+        assert!(
+            matviews.is_empty(),
+            "sql-gen does not generate materialized views"
+        );
         let mut policy = self.policy.clone();
         if !schema.triggers.is_empty() || schema_has_a_shadowed_table_name(schema) {
             // SQLite re-resolves every stored index and trigger during a table
@@ -282,14 +323,14 @@ impl SqlGenerator for SqlGenBackend {
             .or_else(|| stmt.non_unique_order_by_reason(schema))
             .map(str::to_string);
         let check_unnesting_invariant = self.ctx.take_generated_correlated_subquery();
-        Ok(GeneratedStatement {
+        Ok(Generated::Statement(GeneratedStatement {
             sql,
             is_ddl,
             mutates_data,
             has_unordered_limit,
             unordered_limit_reason,
             check_unnesting_invariant,
-        })
+        }))
     }
 
     fn take_coverage(&mut self) -> Option<sql_gen::Coverage> {
@@ -305,7 +346,12 @@ pub struct PropTestBackend {
 }
 
 impl PropTestBackend {
-    pub fn new(seed_bytes: [u8; 32], recursive_cte_focus: bool) -> Self {
+    pub fn new(
+        seed_bytes: [u8; 32],
+        recursive_cte_focus: bool,
+        weight_profile: WeightProfile,
+        matview: bool,
+    ) -> Self {
         let test_runner = TestRunner::new_with_rng(
             proptest::test_runner::Config::default(),
             proptest::test_runner::TestRng::from_seed(
@@ -313,7 +359,9 @@ impl PropTestBackend {
                 &seed_bytes,
             ),
         );
-        let mut profile = sql_gen_prop::StatementProfile::default();
+        let w = weight_profile.stmt_weights();
+        tracing::info!("Statement weight profile {weight_profile:?}: {w:?}");
+        let mut profile = prop_statement_profile(&w);
         profile
             .generation
             .expression
@@ -336,6 +384,21 @@ impl PropTestBackend {
             cte.recursive_weight = 100;
             cte.non_recursive_weight = 0;
         }
+        if matview {
+            profile.create_materialized_view_weight = 8;
+            profile.drop_materialized_view_weight = 2;
+            profile.create_table.extra.main_schema_only = true;
+            // Turso refuses ALTER TABLE on a table that a materialized view reads.
+            profile.alter_table.weight = 0;
+            profile.insert_or_replace_weight = profile.insert.weight / 5;
+            profile.upsert_weight = profile.insert.weight / 5;
+            profile.create_table.extra.shared_column_names = true;
+            // Repeated keys let a DELETE or UPDATE empty a group and let a
+            // replace hit an existing row.
+            profile.generation.value = profile.generation.value.narrow();
+            profile.generation.table_spelling.quoted = true;
+            profile.create_table.extra.autoincrement = true;
+        }
         Self {
             test_runner,
             profile,
@@ -344,9 +407,23 @@ impl PropTestBackend {
     }
 }
 
+/// sql_gen_prop does not generate triggers, so the trigger weights are not mapped.
+fn prop_statement_profile(w: &sql_gen::StmtWeights) -> sql_gen_prop::StatementProfile {
+    sql_gen_prop::StatementProfile::default()
+        .with_select(w.select)
+        .with_insert(w.insert)
+        .with_update(w.update)
+        .with_delete(w.delete)
+        .with_create_table(w.create_table)
+        .with_drop_table(w.drop_table)
+        .with_alter_table(w.alter_table)
+        .with_create_index(w.create_index)
+        .with_drop_index(w.drop_index)
+}
+
 impl SqlGenerator for PropTestBackend {
-    fn generate(&mut self, schema: &sql_gen::Schema) -> Result<GeneratedStatement> {
-        let prop_schema = to_prop_schema(schema);
+    fn generate(&mut self, schema: &sql_gen::Schema, matviews: &Matviews) -> Result<Generated> {
+        let prop_schema = to_prop_schema(schema, matviews);
         let mut profile = if self.recursive_cte_focus && prop_schema.tables.is_empty() {
             sql_gen_prop::StatementProfile::default()
         } else {
@@ -360,6 +437,24 @@ impl SqlGenerator for PropTestBackend {
             .new_tree(&mut self.test_runner)
             .map_err(|e| anyhow::anyhow!("Failed to generate statement: {e}"))?;
         let mut stmt = value_tree.current();
+        match stmt {
+            sql_gen_prop::SqlStatement::CreateMaterializedView(create) => {
+                return Ok(Generated::CreateMatview {
+                    turso_sql: create.to_string(),
+                    sqlite_sql: create.plain_view_sql(),
+                    reads_sequence_table: create.reads_sequence_table(),
+                    name: create.view_name,
+                    columns: create.output_columns,
+                });
+            }
+            sql_gen_prop::SqlStatement::DropMaterializedView(drop) => {
+                return Ok(Generated::DropMatview {
+                    sql: drop.to_string(),
+                    name: drop.view_name,
+                });
+            }
+            _ => {}
+        }
         // SQLite 3.50.2, currently bundled by rusqlite in this workspace,
         // has an ORDER BY elision regression for recursive CTEs that was
         // fixed in later SQLite versions. Avoid an outer LIMIT/OFFSET on any
@@ -379,23 +474,25 @@ impl SqlGenerator for PropTestBackend {
         let mutates_data = matches!(
             stmt_kind,
             sql_gen_prop::StatementKind::Insert
+                | sql_gen_prop::StatementKind::InsertOrReplace
+                | sql_gen_prop::StatementKind::Upsert
                 | sql_gen_prop::StatementKind::Update
                 | sql_gen_prop::StatementKind::Delete
         );
         let has_unordered_limit = stmt.has_unordered_limit();
-        Ok(GeneratedStatement {
+        Ok(Generated::Statement(GeneratedStatement {
             sql,
             is_ddl,
             mutates_data,
             has_unordered_limit,
             unordered_limit_reason: None,
             check_unnesting_invariant: false,
-        })
+        }))
     }
 }
 
-/// Convert a `sql_gen::Schema` to a `sql_gen_prop::Schema`.
-fn to_prop_schema(schema: &sql_gen::Schema) -> sql_gen_prop::Schema {
+/// Convert a `sql_gen::Schema` and the live materialized views to a `sql_gen_prop::Schema`.
+fn to_prop_schema(schema: &sql_gen::Schema, matviews: &Matviews) -> sql_gen_prop::Schema {
     let mut builder = sql_gen_prop::SchemaBuilder::new();
     for db in &schema.attached_databases {
         builder = builder.add_database(db.clone());
@@ -465,6 +562,13 @@ fn to_prop_schema(schema: &sql_gen::Schema) -> sql_gen_prop::Schema {
         }
         builder = builder.add_trigger(prop_trigger);
     }
+    for (name, columns) in matviews {
+        builder =
+            builder.add_materialized_view(sql_gen_prop::Table::new(name.clone(), columns.clone()));
+    }
+    if schema.has_sequence_table {
+        builder = builder.with_sequence_table();
+    }
     builder.build()
 }
 
@@ -489,7 +593,7 @@ mod tests {
                 .allow_order_dependent_aggregates
         );
 
-        let prop = PropTestBackend::new([1; 32], false);
+        let prop = PropTestBackend::new([1; 32], false, WeightProfile::default(), false);
         assert!(
             !prop
                 .profile
@@ -583,5 +687,230 @@ mod tests {
             1.0
         );
         assert_eq!(joins.policy.select_config.join_config.max_joins, 3);
+    }
+
+    #[test]
+    fn prop_profile_takes_each_statement_weight_from_the_same_statement_kind() {
+        let w = sql_gen::StmtWeights {
+            select: 101,
+            insert: 102,
+            update: 103,
+            delete: 104,
+            create_table: 105,
+            drop_table: 106,
+            alter_table: 107,
+            create_index: 108,
+            drop_index: 109,
+            ..sql_gen::StmtWeights::default()
+        };
+        let p = prop_statement_profile(&w);
+        assert_eq!(
+            [
+                p.select.weight,
+                p.insert.weight,
+                p.update.weight,
+                p.delete.weight,
+                p.create_table.weight,
+                p.drop_table_weight,
+                p.alter_table.weight,
+                p.create_index.weight,
+                p.drop_index_weight,
+            ],
+            [101, 102, 103, 104, 105, 106, 107, 108, 109]
+        );
+    }
+
+    #[test]
+    fn prop_backend_takes_its_statement_weights_from_the_weight_profile() {
+        fn weights(p: &sql_gen_prop::StatementProfile) -> [u32; 9] {
+            [
+                p.select.weight,
+                p.insert.weight,
+                p.update.weight,
+                p.delete.weight,
+                p.create_table.weight,
+                p.drop_table_weight,
+                p.alter_table.weight,
+                p.create_index.weight,
+                p.drop_index_weight,
+            ]
+        }
+        let backend = PropTestBackend::new([1; 32], false, WeightProfile::Ddl, false);
+        let expected = weights(&prop_statement_profile(&WeightProfile::Ddl.stmt_weights()));
+        assert_ne!(
+            expected,
+            weights(&sql_gen_prop::StatementProfile::default())
+        );
+        assert_eq!(weights(&backend.profile), expected);
+    }
+
+    fn generated_dml(matview: bool) -> Vec<String> {
+        use sql_gen::{ColumnDef, DataType, Table};
+        let schema = sql_gen::Schema {
+            tables: vec![Table::new(
+                "msg",
+                vec![
+                    ColumnDef::new("id", DataType::Integer).primary_key(),
+                    ColumnDef::new("v", DataType::Text),
+                ],
+            )],
+            ..Default::default()
+        };
+        let mut backend = PropTestBackend::new([3; 32], false, WeightProfile::Writes, matview);
+        (0..300)
+            .filter_map(
+                |_| match backend.generate(&schema, &Matviews::new()).unwrap() {
+                    Generated::Statement(stmt) if stmt.mutates_data => Some(stmt.sql),
+                    _ => None,
+                },
+            )
+            .collect()
+    }
+
+    #[test]
+    fn matview_mode_writes_table_names_in_quotes() {
+        let dml = generated_dml(true);
+        for spelling in ["INTO \"msg\"", "UPDATE [msg]", "FROM `msg`"] {
+            assert!(
+                dml.iter().any(|sql| sql.contains(spelling)),
+                "no DML contains {spelling:?}"
+            );
+        }
+        assert!(dml.iter().any(|sql| sql.contains(" msg ")));
+    }
+
+    #[test]
+    fn default_mode_writes_table_names_as_created() {
+        let dml = generated_dml(false);
+        assert!(!dml.is_empty());
+        assert!(dml.iter().all(|sql| {
+            ["\"msg\"", "[msg]", "`msg`"]
+                .iter()
+                .all(|quoted| !sql.contains(quoted))
+        }));
+    }
+
+    #[test]
+    fn every_generated_materialized_view_is_accepted_by_turso_and_sqlite() {
+        use crate::oracle::{DifferentialOracle, QueryResult};
+        use sql_gen_prop::{ColumnDef, DataType, SchemaBuilder, Table};
+        use std::sync::Arc;
+
+        let turso_db = turso_core::Database::open_file_with_flags(
+            Arc::new(crate::memory::MemorySimIO::new(7)),
+            "matview-shapes.db",
+            turso_core::OpenFlags::default(),
+            turso_core::DatabaseOpts::new().with_views(true),
+            None,
+            Arc::new(turso_core::SqliteDialect),
+        )
+        .unwrap();
+        let turso = turso_db.connect().unwrap();
+        let sqlite = rusqlite::Connection::open_in_memory().unwrap();
+        let tables = [
+            (
+                "CREATE TABLE items(id INTEGER PRIMARY KEY, name TEXT, score REAL, payload BLOB, qty INTEGER NOT NULL)",
+                Table::new(
+                    "items",
+                    vec![
+                        ColumnDef::new("id", DataType::Integer).primary_key(),
+                        ColumnDef::new("name", DataType::Text),
+                        ColumnDef::new("score", DataType::Real),
+                        ColumnDef::new("payload", DataType::Blob),
+                        ColumnDef::new("qty", DataType::Integer).not_null(),
+                    ],
+                ),
+            ),
+            (
+                "CREATE TABLE tags(tag TEXT, item INTEGER)",
+                Table::new(
+                    "tags",
+                    vec![
+                        ColumnDef::new("tag", DataType::Text),
+                        ColumnDef::new("item", DataType::Integer),
+                    ],
+                ),
+            ),
+            (
+                "CREATE TABLE notes(id INTEGER PRIMARY KEY, name TEXT, qty INTEGER)",
+                Table::new(
+                    "notes",
+                    vec![
+                        ColumnDef::new("id", DataType::Integer).primary_key(),
+                        ColumnDef::new("name", DataType::Text),
+                        ColumnDef::new("qty", DataType::Integer),
+                    ],
+                ),
+            ),
+            (
+                "CREATE TABLE blobs(b BLOB)",
+                Table::new("blobs", vec![ColumnDef::new("b", DataType::Blob)]),
+            ),
+            (
+                "CREATE TABLE strict_kv(k INTEGER PRIMARY KEY, v TEXT) STRICT",
+                Table::new_strict(
+                    "strict_kv",
+                    vec![
+                        ColumnDef::new("k", DataType::Integer).primary_key(),
+                        ColumnDef::new("v", DataType::Text),
+                    ],
+                ),
+            ),
+            (
+                "CREATE TABLE counters(id INTEGER PRIMARY KEY AUTOINCREMENT, label TEXT)",
+                Table::new(
+                    "counters",
+                    vec![
+                        ColumnDef::new("id", DataType::Integer).primary_key(),
+                        ColumnDef::new("label", DataType::Text),
+                    ],
+                ),
+            ),
+        ];
+        for (sql, _) in &tables {
+            turso.execute(sql).unwrap();
+            sqlite.execute(sql, []).unwrap();
+        }
+
+        let mut matviews = Matviews::new();
+        let mut runner = TestRunner::deterministic();
+        let (mut same_name_joins, mut self_joins, mut sequence_views) = (0, 0, 0);
+        for _ in 0..200 {
+            let mut builder = SchemaBuilder::new().with_sequence_table();
+            for (_, table) in &tables {
+                builder = builder.add_table(table.clone());
+            }
+            for (name, columns) in &matviews {
+                builder = builder.add_materialized_view(Table::new(name.clone(), columns.clone()));
+            }
+            let create = sql_gen_prop::strategies::create_materialized_view(&builder.build())
+                .new_tree(&mut runner)
+                .unwrap()
+                .current();
+            let turso_sql = create.to_string();
+            let turso_result = DifferentialOracle::execute_turso(&turso, &turso_sql);
+            let sqlite_result =
+                DifferentialOracle::execute_sqlite(&sqlite, &create.plain_view_sql());
+            sequence_views += usize::from(create.reads_sequence_table());
+            if crate::runner::turso_refused_sequence_table_view(
+                create.reads_sequence_table(),
+                &turso_result,
+                &sqlite_result,
+            ) {
+                sqlite
+                    .execute(&format!("DROP VIEW {}", create.view_name), [])
+                    .unwrap();
+                continue;
+            }
+            assert!(
+                !matches!(turso_result, QueryResult::Error(_))
+                    && !matches!(sqlite_result, QueryResult::Error(_)),
+                "{turso_sql}\n  Turso: {turso_result:?}\n  SQLite: {sqlite_result:?}"
+            );
+            same_name_joins += usize::from(turso_sql.contains("_l, "));
+            self_joins += usize::from(turso_sql.contains(" AS sjk, "));
+            matviews.insert(create.view_name, create.output_columns);
+        }
+        assert!(same_name_joins > 0 && self_joins > 0 && sequence_views > 0);
     }
 }
