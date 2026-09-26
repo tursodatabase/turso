@@ -14,6 +14,7 @@ use crate::schema::{Schema, Type};
 use crate::sync::Arc;
 use crate::turso_assert_ne;
 use crate::types::Value;
+use crate::util::normalize_ident;
 use crate::{LimboError, Result};
 use rustc_hash::FxHashMap as HashMap;
 use std::fmt::{self, Display, Formatter};
@@ -437,6 +438,14 @@ impl<'a> LogicalPlanBuilder<'a> {
         name.as_str().to_string()
     }
 
+    /// Spelling used for anything that names a table: table names, table
+    /// aliases, CTE names and the qualifier of a qualified column. SQL compares
+    /// these case-insensitively, and the IVM circuit keys its input deltas on
+    /// them, so every producer and consumer must agree on one spelling.
+    fn table_ident(name: &ast::Name) -> String {
+        normalize_ident(name.as_str())
+    }
+
     // Build a SELECT statement
     // Build a logical plan from a SELECT statement
     fn build_select(&mut self, select: &ast::Select) -> Result<LogicalPlan> {
@@ -458,7 +467,7 @@ impl<'a> LogicalPlanBuilder<'a> {
         // Build each CTE
         for cte in &with.ctes {
             let cte_plan = self.build_select(&cte.select)?;
-            let cte_name = Self::name_to_string(&cte.tbl_name);
+            let cte_name = Self::table_ident(&cte.tbl_name);
             cte_plans.insert(cte_name.clone(), Arc::new(cte_plan));
             self.ctes
                 .insert(cte_name.clone(), cte_plans[&cte_name].clone());
@@ -471,7 +480,7 @@ impl<'a> LogicalPlanBuilder<'a> {
 
         // Clear CTEs from builder context
         for cte in &with.ctes {
-            self.ctes.remove(&Self::name_to_string(&cte.tbl_name));
+            self.ctes.remove(&Self::table_ident(&cte.tbl_name));
         }
 
         Ok(LogicalPlan::WithCTE(WithCTE {
@@ -595,18 +604,22 @@ impl<'a> LogicalPlanBuilder<'a> {
     fn build_select_table(&mut self, table: &ast::SelectTable) -> Result<LogicalPlan> {
         match table {
             ast::SelectTable::Table(name, alias, _indexed) => {
-                let table_name = Self::name_to_string(&name.name);
-                // Check if it's a CTE reference
-                if let Some(cte_plan) = self.ctes.get(&table_name) {
+                let lookup_name = Self::table_ident(&name.name);
+                // A CTE shadows a real table of the same name
+                if let Some(cte_plan) = self.ctes.get(&lookup_name) {
                     return Ok(LogicalPlan::CTERef(CTERef {
-                        name: table_name.clone(),
+                        name: lookup_name.clone(),
                         schema: cte_plan.schema().clone(),
                     }));
                 }
 
-                // Regular table scan
-                let table_alias = alias.as_ref().map(|a| Self::name_to_string(a.name()));
-                let table_schema = self.get_table_schema(&table_name, table_alias.as_deref())?;
+                let table = self.schema.get_table(&lookup_name).ok_or_else(|| {
+                    LimboError::ParseError(format!("Table '{}' not found", name.name.as_str()))
+                })?;
+                let table_name = table.get_name().to_string();
+                let table_alias = alias.as_ref().map(|a| Self::table_ident(a.name()));
+                let table_schema =
+                    Self::build_table_schema(&table, &table_name, table_alias.as_deref());
                 Ok(LogicalPlan::TableScan(TableScan {
                     table_name,
                     alias: table_alias,
@@ -962,7 +975,7 @@ impl<'a> LogicalPlanBuilder<'a> {
                 }
                 ast::ResultColumn::TableStar(table) => {
                     // Expand table.* to all columns from that table
-                    let table_name = Self::name_to_string(table);
+                    let table_name = Self::table_ident(table);
                     for col in &input_schema.columns {
                         // Simple check - would need proper table tracking in real implementation
                         proj_exprs.push(LogicalExpr::Column(Column::with_table(
@@ -1622,17 +1635,13 @@ impl<'a> LogicalPlanBuilder<'a> {
             ast::Expr::DoublyQualified(db, table, col) => {
                 Ok(LogicalExpr::Column(Column::with_table(
                     Self::name_to_string(col),
-                    format!(
-                        "{}.{}",
-                        Self::name_to_string(db),
-                        Self::name_to_string(table)
-                    ),
+                    format!("{}.{}", Self::table_ident(db), Self::table_ident(table)),
                 )))
             }
 
             ast::Expr::Qualified(table, col) => Ok(LogicalExpr::Column(Column::with_table(
                 Self::name_to_string(col),
-                Self::name_to_string(table),
+                Self::table_ident(table),
             ))),
 
             ast::Expr::Literal(lit) => Ok(LogicalExpr::Literal(Self::build_literal(lit)?)),
@@ -2275,13 +2284,11 @@ impl<'a> LogicalPlanBuilder<'a> {
     }
 
     // Get table schema
-    fn get_table_schema(&self, table_name: &str, alias: Option<&str>) -> Result<SchemaRef> {
-        // Look up table in schema
-        let table = self
-            .schema
-            .get_table(table_name)
-            .ok_or_else(|| LimboError::ParseError(format!("Table '{table_name}' not found")))?;
-
+    fn build_table_schema(
+        table: &crate::schema::Table,
+        table_name: &str,
+        alias: Option<&str>,
+    ) -> SchemaRef {
         // Parse table_name which might be "db.table" for attached databases
         let (database, actual_table) = if table_name.contains('.') {
             let parts: Vec<&str> = table_name.splitn(2, '.').collect();
@@ -2303,7 +2310,7 @@ impl<'a> LogicalPlanBuilder<'a> {
             }
         }
 
-        Ok(Arc::new(LogicalSchema::new(columns)))
+        Arc::new(LogicalSchema::new(columns))
     }
 
     // Infer expression type
