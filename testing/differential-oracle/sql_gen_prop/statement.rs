@@ -18,8 +18,8 @@ use crate::insert::{
     InsertStatement, insert_for_table, insert_or_replace_for_table, upsert_for_table,
 };
 use crate::materialized_view::{
-    CreateMaterializedViewStatement, create_materialized_view, drop_materialized_view,
-    materialized_view_sources,
+    CreateMaterializedViewStatement, MaterializedViewProfile, can_create_materialized_view,
+    create_materialized_view, drop_materialized_view, materialized_view_sources,
 };
 use crate::profile::StatementProfile;
 use crate::schema::{Schema, TableRef};
@@ -213,7 +213,9 @@ impl SqlGeneratorKind for StatementKind {
             StatementKind::DropView => true, // Can always generate DROP VIEW IF EXISTS
 
             // DDL - Materialized view operations
-            StatementKind::CreateMaterializedView => !materialized_view_sources(schema).is_empty(),
+            StatementKind::CreateMaterializedView => {
+                !materialized_view_sources(schema, &MaterializedViewProfile::default()).is_empty()
+            }
             StatementKind::DropMaterializedView => !schema.materialized_views.is_empty(),
 
             // DDL - Trigger operations
@@ -366,9 +368,11 @@ impl SqlGeneratorKind for StatementKind {
                 .boxed(),
 
             // DDL - Materialized views
-            StatementKind::CreateMaterializedView => create_materialized_view(schema)
-                .prop_map(SqlStatement::CreateMaterializedView)
-                .boxed(),
+            StatementKind::CreateMaterializedView => {
+                create_materialized_view(schema, &profile.create_materialized_view.extra)
+                    .prop_map(SqlStatement::CreateMaterializedView)
+                    .boxed()
+            }
             StatementKind::DropMaterializedView => drop_materialized_view(schema)
                 .prop_map(SqlStatement::DropMaterializedView)
                 .boxed(),
@@ -487,6 +491,10 @@ pub fn statement_for_schema(
     let strategies: Vec<(u32, BoxedStrategy<SqlStatement>)> = profile
         .enabled_statements()
         .filter(|(kind, _)| kind.supported() && kind.available(schema))
+        .filter(|(kind, _)| {
+            *kind != StatementKind::CreateMaterializedView
+                || can_create_materialized_view(schema, &profile.create_materialized_view.extra)
+        })
         .map(|(kind, weight)| (weight, kind.strategy(schema, profile)))
         .collect();
 

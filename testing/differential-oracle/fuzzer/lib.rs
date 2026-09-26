@@ -10,7 +10,7 @@ pub mod runner;
 pub mod schema;
 pub mod shrink;
 
-pub use generate::{GeneratedStatement, GeneratorKind, SqlGenerator, WeightProfile};
+pub use generate::{GeneratedStatement, GeneratorKind, MatviewShape, SqlGenerator, WeightProfile};
 pub use memory::{MemorySimFile, MemorySimIO, SimIO};
 pub use oracle::{DifferentialOracle, Oracle, OracleResult, check_differential};
 pub use runner::{Fuzzer, SimConfig, SimStats, TreeMode};

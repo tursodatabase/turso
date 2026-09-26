@@ -48,7 +48,53 @@ impl CreateMaterializedViewStatement {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
+/// How often each view shape is generated. A shape with weight 0 is never generated.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MaterializedViewProfile {
+    pub star_weight: u32,
+    pub filtered_columns_weight: u32,
+    pub aggregate_weight: u32,
+    pub complex_filter_self_join_weight: u32,
+    pub join_weight: u32,
+    pub union_all_weight: u32,
+    pub union_all_join_weight: u32,
+    pub complex_filter_join_weight: u32,
+    /// A view may read another materialized view.
+    pub read_materialized_views: bool,
+}
+
+impl Default for MaterializedViewProfile {
+    fn default() -> Self {
+        Self {
+            star_weight: 1,
+            filtered_columns_weight: 2,
+            aggregate_weight: 1,
+            complex_filter_self_join_weight: 1,
+            join_weight: 1,
+            union_all_weight: 1,
+            union_all_join_weight: 1,
+            complex_filter_join_weight: 1,
+            read_materialized_views: true,
+        }
+    }
+}
+
+impl MaterializedViewProfile {
+    fn weight(&self, shape: Shape) -> u32 {
+        match shape {
+            Shape::Star => self.star_weight,
+            Shape::FilteredColumns => self.filtered_columns_weight,
+            Shape::Aggregate => self.aggregate_weight,
+            Shape::ComplexFilterSelfJoin => self.complex_filter_self_join_weight,
+            Shape::Join => self.join_weight,
+            Shape::UnionAll => self.union_all_weight,
+            Shape::UnionAllJoin => self.union_all_join_weight,
+            Shape::ComplexFilterJoin => self.complex_filter_join_weight,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Shape {
     /// SELECT * FROM t
     Star,
@@ -56,6 +102,8 @@ enum Shape {
     FilteredColumns,
     /// SELECT g, COUNT(*) FROM t GROUP BY g
     Aggregate,
+    /// SELECT a.k, a.c, b.c FROM t a JOIN t b ON a.r = b.k WHERE <complex predicate>
+    ComplexFilterSelfJoin,
     /// SELECT t.a, u.b FROM t JOIN u ON t.a = u.b
     Join,
     /// SELECT t.a AS c0, ... FROM t UNION ALL SELECT u.b AS c0, ... FROM u
@@ -65,8 +113,6 @@ enum Shape {
     /// SELECT t.c AS c_l, u.c AS c_r FROM t JOIN u ON t.k = u.k WHERE <complex predicate>,
     /// where `c` is a column name of both t and u
     ComplexFilterJoin,
-    /// SELECT a.k, a.c, b.c FROM t a JOIN t b ON a.r = b.k WHERE <complex predicate>
-    ComplexFilterSelfJoin,
 }
 
 /// Tables and materialized views that a materialized view can read.
@@ -74,12 +120,20 @@ enum Shape {
 /// Turso refuses materialized views over `temp` or attached tables. Columns named
 /// by an expression or a keyword (from `CREATE TABLE ... AS SELECT expr`) are
 /// left out because this module writes column names without quotes.
-pub fn materialized_view_sources(schema: &Schema) -> Vec<TableRef> {
+pub fn materialized_view_sources(
+    schema: &Schema,
+    profile: &MaterializedViewProfile,
+) -> Vec<TableRef> {
+    let materialized_views: &[TableRef] = if profile.read_materialized_views {
+        &schema.materialized_views
+    } else {
+        &[]
+    };
     schema
         .tables
         .iter()
         .filter(|t| t.database.is_none())
-        .chain(schema.materialized_views.iter())
+        .chain(materialized_views)
         .filter(|t| {
             is_plain_identifier(&t.name) && t.columns.iter().all(|c| is_plain_identifier(&c.name))
         })
@@ -116,13 +170,28 @@ const SQLITE_KEYWORDS: &str = "ABORT ACTION ADD AFTER ALL ALTER ALWAYS ANALYZE A
     THEN TIES TO TRANSACTION TRIGGER UNBOUNDED UNION UNIQUE UPDATE USING VACUUM VALUES VIEW \
     VIRTUAL WHEN WHERE WINDOW WITH WITHOUT";
 
+/// Whether the schema has a table, and the profile a shape, that a materialized view can use.
+pub fn can_create_materialized_view(schema: &Schema, profile: &MaterializedViewProfile) -> bool {
+    let sources = materialized_view_sources(schema, profile);
+    let shapes = weighted_shapes(profile, sources.len());
+    (0..sources.len()).any(|index| {
+        let others = others_than(&sources, index);
+        shapes
+            .iter()
+            .any(|(_, shape)| profile.weight(generated_shape(&sources[index], &others, *shape)) > 0)
+    })
+}
+
 /// Generate a CREATE MATERIALIZED VIEW statement over a table or another materialized view.
-pub fn create_materialized_view(schema: &Schema) -> BoxedStrategy<CreateMaterializedViewStatement> {
-    let sources = materialized_view_sources(schema);
+pub fn create_materialized_view(
+    schema: &Schema,
+    profile: &MaterializedViewProfile,
+) -> BoxedStrategy<CreateMaterializedViewStatement> {
     assert!(
-        !sources.is_empty(),
-        "Schema must have a table that a materialized view can read"
+        can_create_materialized_view(schema, profile),
+        "Schema must have a table that a materialized view of an enabled shape can read"
     );
+    let sources = materialized_view_sources(schema, profile);
     let existing_names: HashSet<String> = schema
         .table_names()
         .into_iter()
@@ -133,27 +202,13 @@ pub fn create_materialized_view(schema: &Schema) -> BoxedStrategy<CreateMaterial
         // Generated names are lowercase.
         .chain(SQLITE_KEYWORDS.split_whitespace().map(str::to_lowercase))
         .collect();
-
-    let mut shapes = vec![
-        (1, Shape::Star),
-        (2, Shape::FilteredColumns),
-        (1, Shape::Aggregate),
-        (1, Shape::ComplexFilterSelfJoin),
-    ];
-    if sources.len() >= 2 {
-        shapes.extend([
-            (1, Shape::Join),
-            (1, Shape::UnionAll),
-            (1, Shape::UnionAllJoin),
-            (1, Shape::ComplexFilterJoin),
-        ]);
-    }
     let shape = proptest::strategy::Union::new_weighted(
-        shapes
+        weighted_shapes(profile, sources.len())
             .into_iter()
             .map(|(weight, shape)| (weight, Just(shape)))
             .collect(),
     );
+    let profile = profile.clone();
 
     (
         any::<bool>(),
@@ -161,23 +216,90 @@ pub fn create_materialized_view(schema: &Schema) -> BoxedStrategy<CreateMaterial
         0..sources.len(),
         shape,
     )
-        .prop_flat_map(move |(if_not_exists, view_name, index, shape)| {
-            let others: Vec<TableRef> = sources
-                .iter()
-                .enumerate()
-                .filter(|(i, _)| *i != index)
-                .map(|(_, t)| t.clone())
-                .collect();
-            select_for_shape(sources[index].clone(), others, shape).prop_map(
-                move |(select_sql, output_columns)| CreateMaterializedViewStatement {
+        .prop_filter_map(
+            "the shape generated for this source is switched off",
+            move |(if_not_exists, view_name, index, shape)| {
+                let source = sources[index].clone();
+                let others = others_than(&sources, index);
+                let shape = generated_shape(&source, &others, shape);
+                (profile.weight(shape) > 0).then_some((
+                    if_not_exists,
+                    view_name,
+                    source,
+                    others,
+                    shape,
+                ))
+            },
+        )
+        .prop_flat_map(|(if_not_exists, view_name, source, others, shape)| {
+            select_for_shape(source, others, shape).prop_map(move |(select_sql, output_columns)| {
+                CreateMaterializedViewStatement {
                     if_not_exists,
                     view_name: view_name.clone(),
                     select_sql,
                     output_columns,
-                },
-            )
+                }
+            })
         })
         .boxed()
+}
+
+fn weighted_shapes(profile: &MaterializedViewProfile, source_count: usize) -> Vec<(u32, Shape)> {
+    let mut shapes = vec![
+        Shape::Star,
+        Shape::FilteredColumns,
+        Shape::Aggregate,
+        Shape::ComplexFilterSelfJoin,
+    ];
+    if source_count >= 2 {
+        shapes.extend([
+            Shape::Join,
+            Shape::UnionAll,
+            Shape::UnionAllJoin,
+            Shape::ComplexFilterJoin,
+        ]);
+    }
+    shapes
+        .into_iter()
+        .map(|shape| (profile.weight(shape), shape))
+        .filter(|(weight, _)| *weight > 0)
+        .collect()
+}
+
+fn others_than(sources: &[TableRef], index: usize) -> Vec<TableRef> {
+    sources
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| *i != index)
+        .map(|(_, t)| t.clone())
+        .collect()
+}
+
+/// A shape that needs columns or tables that the schema does not have falls
+/// back to a simpler shape.
+fn generated_shape(source: &Table, others: &[TableRef], shape: Shape) -> Shape {
+    let integer_columns = source
+        .columns
+        .iter()
+        .filter(|c| c.data_type == DataType::Integer)
+        .count();
+    match shape {
+        Shape::FilteredColumns
+            if source.columns.len() < 2 || source.filterable_columns().next().is_none() =>
+        {
+            Shape::Star
+        }
+        Shape::ComplexFilterSelfJoin if integer_columns < 2 => Shape::Star,
+        Shape::UnionAllJoin if others.iter().all(|t| t.columns.len() < 2) => Shape::Join,
+        Shape::ComplexFilterJoin
+            if others
+                .iter()
+                .all(|t| same_name_columns(source, t).is_none()) =>
+        {
+            Shape::Join
+        }
+        shape => shape,
+    }
 }
 
 fn select_for_shape(
@@ -197,13 +319,8 @@ fn select_for_shape(
         .collect();
     let name = source.name.clone();
     let filterable: Vec<ColumnDef> = source.filterable_columns().cloned().collect();
-    let integer_columns = source
-        .columns
-        .iter()
-        .filter(|c| c.data_type == DataType::Integer)
-        .count();
     match shape {
-        Shape::FilteredColumns if source.columns.len() >= 2 && !filterable.is_empty() => {
+        Shape::FilteredColumns => {
             let projected = &source.columns[..source.columns.len().min(3)];
             let projection = projected
                 .iter()
@@ -242,28 +359,26 @@ fn select_for_shape(
             vec![ColumnDef::new("cnt", DataType::Integer)],
         ))
         .boxed(),
-        Shape::ComplexFilterSelfJoin if integer_columns >= 2 => (0..COMPLEX_PREDICATE_KINDS)
+        Shape::ComplexFilterSelfJoin => (0..COMPLEX_PREDICATE_KINDS)
             .prop_map(move |kind| complex_filter_self_join(&source, kind))
             .boxed(),
-        Shape::Star | Shape::FilteredColumns | Shape::ComplexFilterSelfJoin => Just((
+        Shape::Star => Just((
             format!("SELECT * FROM {name}"),
             view_columns(&source.columns),
         ))
         .boxed(),
-        Shape::ComplexFilterJoin if !same_name_others.is_empty() => (
+        Shape::ComplexFilterJoin => (
             proptest::sample::select(same_name_others),
             0..COMPLEX_PREDICATE_KINDS,
         )
             .prop_map(move |(other, kind)| complex_filter_join(&source, &other, kind))
             .boxed(),
-        Shape::UnionAllJoin if !wide_others.is_empty() => proptest::sample::select(wide_others)
+        Shape::UnionAllJoin => proptest::sample::select(wide_others)
             .prop_map(move |other| union_all_join(&source, &other))
             .boxed(),
-        Shape::Join | Shape::UnionAllJoin | Shape::ComplexFilterJoin => {
-            proptest::sample::select(others)
-                .prop_map(move |other| join(&source, &other))
-                .boxed()
-        }
+        Shape::Join => proptest::sample::select(others)
+            .prop_map(move |other| join(&source, &other))
+            .boxed(),
         Shape::UnionAll => proptest::sample::select(others)
             .prop_map(move |other| union_all(&source, &other))
             .boxed(),
@@ -526,16 +641,17 @@ mod tests {
 
     #[test]
     fn sources_are_main_tables_and_materialized_views_with_plain_column_names() {
-        let names: Vec<String> = materialized_view_sources(&schema_with_matview())
-            .iter()
-            .map(|t| t.name.clone())
-            .collect();
+        let names: Vec<String> =
+            materialized_view_sources(&schema_with_matview(), &MaterializedViewProfile::default())
+                .iter()
+                .map(|t| t.name.clone())
+                .collect();
         assert_eq!(names, vec!["users", "mv_users"]);
     }
 
     proptest! {
         #[test]
-        fn plain_view_sql_differs_only_in_the_keyword(stmt in create_materialized_view(&schema_with_matview())) {
+        fn plain_view_sql_differs_only_in_the_keyword(stmt in create_materialized_view(&schema_with_matview(), &MaterializedViewProfile::default())) {
             let sql = stmt.to_string();
             prop_assert!(sql.starts_with("CREATE MATERIALIZED VIEW"));
             prop_assert_eq!(sql.replacen("MATERIALIZED ", "", 1), stmt.plain_view_sql());
@@ -546,7 +662,7 @@ mod tests {
     #[test]
     fn every_shape_is_generated_and_materialized_views_are_read() {
         let schema = schema_with_matview();
-        let strategy = create_materialized_view(&schema);
+        let strategy = create_materialized_view(&schema, &MaterializedViewProfile::default());
         let mut runner = proptest::test_runner::TestRunner::deterministic();
         let sqls: Vec<String> = (0..500)
             .map(|_| strategy.new_tree(&mut runner).unwrap().current().select_sql)
@@ -574,5 +690,136 @@ mod tests {
         assert!(sqls.iter().any(|sql| sql.contains(
             "SELECT a.id AS sjk, a.name AS sja, b.name AS sjb FROM users a JOIN users b ON a.manager_id = b.id"
         )));
+    }
+
+    const ALL_SHAPES: [Shape; 8] = [
+        Shape::Star,
+        Shape::FilteredColumns,
+        Shape::Aggregate,
+        Shape::ComplexFilterSelfJoin,
+        Shape::Join,
+        Shape::UnionAll,
+        Shape::UnionAllJoin,
+        Shape::ComplexFilterJoin,
+    ];
+
+    /// `solo` has one column, so shapes that need two columns fall back to simpler shapes over it.
+    fn schema_with_a_narrow_table() -> Schema {
+        SchemaBuilder::new()
+            .add_table(Table::new(
+                "users",
+                vec![
+                    ColumnDef::new("id", DataType::Integer).primary_key(),
+                    ColumnDef::new("name", DataType::Text),
+                    ColumnDef::new("team", DataType::Text),
+                    ColumnDef::new("manager_id", DataType::Integer),
+                ],
+            ))
+            .add_table(Table::new(
+                "solo",
+                vec![ColumnDef::new("x", DataType::Integer)],
+            ))
+            .add_materialized_view(Table::new(
+                "mv_users",
+                vec![
+                    ColumnDef::new("id", DataType::Integer),
+                    ColumnDef::new("name", DataType::Text),
+                ],
+            ))
+            .build()
+    }
+
+    fn only(shape: Shape) -> MaterializedViewProfile {
+        let mut profile = MaterializedViewProfile {
+            star_weight: 0,
+            filtered_columns_weight: 0,
+            aggregate_weight: 0,
+            complex_filter_self_join_weight: 0,
+            join_weight: 0,
+            union_all_weight: 0,
+            union_all_join_weight: 0,
+            complex_filter_join_weight: 0,
+            read_materialized_views: true,
+        };
+        let weight = match shape {
+            Shape::Star => &mut profile.star_weight,
+            Shape::FilteredColumns => &mut profile.filtered_columns_weight,
+            Shape::Aggregate => &mut profile.aggregate_weight,
+            Shape::ComplexFilterSelfJoin => &mut profile.complex_filter_self_join_weight,
+            Shape::Join => &mut profile.join_weight,
+            Shape::UnionAll => &mut profile.union_all_weight,
+            Shape::UnionAllJoin => &mut profile.union_all_join_weight,
+            Shape::ComplexFilterJoin => &mut profile.complex_filter_join_weight,
+        };
+        *weight = 1;
+        profile
+    }
+
+    fn shape_of(sql: &str) -> Shape {
+        if sql.contains(" AS sjk, ") {
+            Shape::ComplexFilterSelfJoin
+        } else if sql.contains(" UNION ALL ") {
+            if sql.contains(" JOIN ") {
+                Shape::UnionAllJoin
+            } else {
+                Shape::UnionAll
+            }
+        } else if sql.contains("_l, ") {
+            Shape::ComplexFilterJoin
+        } else if sql.contains(" JOIN ") {
+            Shape::Join
+        } else if sql.contains("COUNT(*)") {
+            Shape::Aggregate
+        } else if sql.starts_with("SELECT * FROM") {
+            Shape::Star
+        } else {
+            assert!(sql.contains(" WHERE "), "unknown shape: {sql}");
+            Shape::FilteredColumns
+        }
+    }
+
+    fn generated_selects(schema: &Schema, profile: &MaterializedViewProfile) -> Vec<String> {
+        let strategy = create_materialized_view(schema, profile);
+        let mut runner = proptest::test_runner::TestRunner::deterministic();
+        (0..200)
+            .map(|_| strategy.new_tree(&mut runner).unwrap().current().select_sql)
+            .collect()
+    }
+
+    #[test]
+    fn a_profile_with_one_shape_generates_only_that_shape() {
+        let schema = schema_with_a_narrow_table();
+        for shape in ALL_SHAPES {
+            for sql in generated_selects(&schema, &only(shape)) {
+                assert_eq!(shape_of(&sql), shape, "{sql}");
+            }
+        }
+    }
+
+    #[test]
+    fn views_read_only_tables_when_reading_materialized_views_is_off() {
+        let profile = MaterializedViewProfile {
+            read_materialized_views: false,
+            ..MaterializedViewProfile::default()
+        };
+        for sql in generated_selects(&schema_with_a_narrow_table(), &profile) {
+            assert!(!sql.contains("mv_users"), "{sql}");
+        }
+    }
+
+    #[test]
+    fn a_shape_that_no_table_allows_cannot_be_created() {
+        let schema = SchemaBuilder::new()
+            .add_table(Table::new(
+                "solo",
+                vec![ColumnDef::new("x", DataType::Integer)],
+            ))
+            .build();
+        assert!(can_create_materialized_view(&schema, &only(Shape::Star)));
+        assert!(!can_create_materialized_view(
+            &schema,
+            &only(Shape::FilteredColumns)
+        ));
+        assert!(!can_create_materialized_view(&schema, &only(Shape::Join)));
     }
 }

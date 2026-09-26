@@ -17,6 +17,7 @@ use turso_core::ConnectOpts;
 use turso_core::SqliteDialect;
 
 use anyhow::{Context, Result, bail};
+use clap::ValueEnum;
 use comfy_table::{Attribute, Cell, Color, ContentArrangement, Table};
 use parking_lot::Mutex;
 use rand::{RngCore, SeedableRng};
@@ -24,8 +25,8 @@ use rand_chacha::ChaCha8Rng;
 use turso_core::Database;
 
 use crate::generate::{
-    Generated, GeneratedStatement, GeneratorKind, Matviews, PropTestBackend, SqlGenBackend,
-    SqlGenerator, WeightProfile,
+    Generated, GeneratedStatement, GeneratorKind, MatviewShape, Matviews, PropTestBackend,
+    SqlGenBackend, SqlGenerator, WeightProfile,
 };
 use crate::memory::{MemorySimIO, SimIO};
 use crate::oracle::{DifferentialOracle, OracleResult, QueryResult, check_differential};
@@ -208,6 +209,8 @@ pub struct SimConfig {
     pub weight_profile: WeightProfile,
     /// Generate materialized views: Turso maintains them, SQLite runs them as plain views.
     pub matview: bool,
+    /// The parts of the materialized view workload to generate.
+    pub matview_shapes: Vec<MatviewShape>,
     /// Probability that a non-DDL statement starts a BEGIN ... COMMIT batch.
     pub batch_probability: f64,
     /// Probability that a batch holds 50-300 statements instead of 2..=`max_batch_size`.
@@ -236,6 +239,7 @@ impl Default for SimConfig {
             recursive_cte_focus: false,
             weight_profile: WeightProfile::default(),
             matview: false,
+            matview_shapes: MatviewShape::value_variants().to_vec(),
             batch_probability: 0.0,
             large_batch_probability: 0.0,
             max_batch_size: 10,
@@ -621,6 +625,7 @@ impl Fuzzer {
                     self.config.recursive_cte_focus,
                     self.config.weight_profile,
                     self.config.matview,
+                    &self.config.matview_shapes,
                 ))
             }
         };
@@ -1397,6 +1402,7 @@ mod tests {
             recursive_cte_focus: false,
             weight_profile: WeightProfile::default(),
             matview: false,
+            matview_shapes: MatviewShape::value_variants().to_vec(),
             batch_probability: 0.0,
             large_batch_probability: 0.0,
             max_batch_size: 10,

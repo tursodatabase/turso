@@ -16,6 +16,7 @@ pub use crate::delete::DeleteProfile;
 pub use crate::expression::{ExpressionProfile, ExtendedExpressionProfile};
 pub use crate::function::{ExtendedFunctionProfile, FunctionProfile};
 pub use crate::insert::InsertProfile;
+pub use crate::materialized_view::MaterializedViewProfile;
 pub use crate::select::SelectProfile;
 pub use crate::update::UpdateProfile;
 pub use crate::value::ValueProfile;
@@ -184,8 +185,8 @@ pub struct StatementProfile {
     pub drop_view_weight: u32,
 
     // DDL weights - Materialized views
-    /// CREATE MATERIALIZED VIEW weight.
-    pub create_materialized_view_weight: u32,
+    /// CREATE MATERIALIZED VIEW weight and view shape weights.
+    pub create_materialized_view: WeightedProfile<MaterializedViewProfile>,
     /// DROP VIEW weight for materialized views.
     pub drop_materialized_view_weight: u32,
 
@@ -232,7 +233,7 @@ impl Default for StatementProfile {
             drop_index_weight: 1,
             create_view_weight: 1,
             drop_view_weight: 1,
-            create_materialized_view_weight: 0,
+            create_materialized_view: WeightedProfile::new(0),
             drop_materialized_view_weight: 0,
             create_trigger: WeightedProfile::new(1),
             drop_trigger_weight: 1,
@@ -273,7 +274,7 @@ impl StatementProfile {
             drop_index_weight: 0,
             create_view_weight: 0,
             drop_view_weight: 0,
-            create_materialized_view_weight: 0,
+            create_materialized_view: WeightedProfile::new(0),
             drop_materialized_view_weight: 0,
             create_trigger: WeightedProfile::new(0),
             drop_trigger_weight: 0,
@@ -592,7 +593,7 @@ impl StatementProfile {
             + self.drop_index_weight
             + self.create_view_weight
             + self.drop_view_weight
-            + self.create_materialized_view_weight
+            + self.create_materialized_view.weight
             + self.drop_materialized_view_weight
             + self.create_trigger.weight
             + self.drop_trigger_weight
@@ -654,7 +655,7 @@ impl StatementProfile {
             StatementKind::DropIndex => self.drop_index_weight,
             StatementKind::CreateView => self.create_view_weight,
             StatementKind::DropView => self.drop_view_weight,
-            StatementKind::CreateMaterializedView => self.create_materialized_view_weight,
+            StatementKind::CreateMaterializedView => self.create_materialized_view.weight,
             StatementKind::DropMaterializedView => self.drop_materialized_view_weight,
             StatementKind::CreateTrigger => self.create_trigger.weight,
             StatementKind::DropTrigger => self.drop_trigger_weight,

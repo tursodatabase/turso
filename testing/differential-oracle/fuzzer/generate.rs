@@ -92,6 +92,32 @@ pub enum WeightProfile {
     Joins,
 }
 
+/// A part of the materialized view workload that `--matview-shapes` can switch on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum, serde::Serialize)]
+pub enum MatviewShape {
+    /// SELECT * FROM t
+    Star,
+    /// Up to three columns of one table with a WHERE clause
+    FilteredColumns,
+    /// COUNT(*), with GROUP BY when the table has a column to group by
+    Aggregate,
+    /// A table joined with itself, with a WHERE clause that is not a plain comparison
+    ComplexFilterSelfJoin,
+    /// Two tables joined on their first columns
+    Join,
+    /// Two tables combined with UNION ALL
+    UnionAll,
+    /// Two joins of the same two tables combined with UNION ALL
+    UnionAllJoin,
+    /// Two tables joined on their keys, reading a column name that both tables have,
+    /// with a WHERE clause that is not a plain comparison
+    ComplexFilterJoin,
+    /// Views that read other materialized views
+    Chain,
+    /// INSERT OR REPLACE and upsert statements
+    Replace,
+}
+
 impl WeightProfile {
     /// The top-level statement weights for this profile. Transaction and
     /// not-yet-implemented statements stay at 0, matching the fuzzer's scope.
@@ -361,6 +387,7 @@ impl PropTestBackend {
         recursive_cte_focus: bool,
         weight_profile: WeightProfile,
         matview: bool,
+        matview_shapes: &[MatviewShape],
     ) -> Self {
         let test_runner = TestRunner::new_with_rng(
             proptest::test_runner::Config::default(),
@@ -395,13 +422,18 @@ impl PropTestBackend {
             cte.non_recursive_weight = 0;
         }
         if matview {
-            profile.create_materialized_view_weight = 8;
+            profile.create_materialized_view = sql_gen_prop::WeightedProfile::with_extra(
+                8,
+                materialized_view_profile(matview_shapes),
+            );
             profile.drop_materialized_view_weight = 2;
             profile.create_table.extra.main_schema_only = true;
             // Turso refuses ALTER TABLE on a table that a materialized view reads.
             profile.alter_table.weight = 0;
-            profile.insert_or_replace_weight = profile.insert.weight / 5;
-            profile.upsert_weight = profile.insert.weight / 5;
+            if matview_shapes.contains(&MatviewShape::Replace) {
+                profile.insert_or_replace_weight = profile.insert.weight / 5;
+                profile.upsert_weight = profile.insert.weight / 5;
+            }
             profile.create_table.extra.shared_column_names = true;
             // Repeated keys let a DELETE or UPDATE empty a group and let a
             // replace hit an existing row.
@@ -412,6 +444,28 @@ impl PropTestBackend {
             profile,
             recursive_cte_focus,
         }
+    }
+}
+
+fn materialized_view_profile(shapes: &[MatviewShape]) -> sql_gen_prop::MaterializedViewProfile {
+    let all = sql_gen_prop::MaterializedViewProfile::default();
+    let weight = |shape, weight| if shapes.contains(&shape) { weight } else { 0 };
+    sql_gen_prop::MaterializedViewProfile {
+        star_weight: weight(MatviewShape::Star, all.star_weight),
+        filtered_columns_weight: weight(MatviewShape::FilteredColumns, all.filtered_columns_weight),
+        aggregate_weight: weight(MatviewShape::Aggregate, all.aggregate_weight),
+        complex_filter_self_join_weight: weight(
+            MatviewShape::ComplexFilterSelfJoin,
+            all.complex_filter_self_join_weight,
+        ),
+        join_weight: weight(MatviewShape::Join, all.join_weight),
+        union_all_weight: weight(MatviewShape::UnionAll, all.union_all_weight),
+        union_all_join_weight: weight(MatviewShape::UnionAllJoin, all.union_all_join_weight),
+        complex_filter_join_weight: weight(
+            MatviewShape::ComplexFilterJoin,
+            all.complex_filter_join_weight,
+        ),
+        read_materialized_views: shapes.contains(&MatviewShape::Chain),
     }
 }
 
@@ -588,6 +642,42 @@ mod tests {
     }
 
     #[test]
+    fn all_matview_shapes_give_the_default_view_profile() {
+        use clap::ValueEnum;
+        assert_eq!(
+            materialized_view_profile(MatviewShape::value_variants()),
+            sql_gen_prop::MaterializedViewProfile::default()
+        );
+    }
+
+    #[test]
+    fn matview_shapes_switch_off_every_part_that_is_not_listed() {
+        let backend = PropTestBackend::new(
+            [1; 32],
+            false,
+            WeightProfile::default(),
+            true,
+            &[MatviewShape::FilteredColumns],
+        );
+        assert_eq!(
+            backend.profile.create_materialized_view.extra,
+            sql_gen_prop::MaterializedViewProfile {
+                star_weight: 0,
+                filtered_columns_weight: 2,
+                aggregate_weight: 0,
+                complex_filter_self_join_weight: 0,
+                join_weight: 0,
+                union_all_weight: 0,
+                union_all_join_weight: 0,
+                complex_filter_join_weight: 0,
+                read_materialized_views: false,
+            }
+        );
+        assert_eq!(backend.profile.insert_or_replace_weight, 0);
+        assert_eq!(backend.profile.upsert_weight, 0);
+    }
+
+    #[test]
     fn aggregates_that_depend_on_input_order_are_disabled() {
         let sql_gen = SqlGenBackend::new(1);
         assert!(
@@ -597,7 +687,7 @@ mod tests {
                 .allow_order_dependent_aggregates
         );
 
-        let prop = PropTestBackend::new([1; 32], false, WeightProfile::default(), false);
+        let prop = PropTestBackend::new([1; 32], false, WeightProfile::default(), false, &[]);
         assert!(
             !prop
                 .profile
@@ -784,7 +874,7 @@ mod tests {
                 p.drop_index_weight,
             ]
         }
-        let backend = PropTestBackend::new([1; 32], false, WeightProfile::Ddl, false);
+        let backend = PropTestBackend::new([1; 32], false, WeightProfile::Ddl, false, &[]);
         let expected = weights(&prop_statement_profile(&WeightProfile::Ddl.stmt_weights()));
         assert_ne!(
             expected,
@@ -876,10 +966,13 @@ mod tests {
             for (name, columns) in &matviews {
                 builder = builder.add_materialized_view(Table::new(name.clone(), columns.clone()));
             }
-            let create = sql_gen_prop::strategies::create_materialized_view(&builder.build())
-                .new_tree(&mut runner)
-                .unwrap()
-                .current();
+            let create = sql_gen_prop::strategies::create_materialized_view(
+                &builder.build(),
+                &sql_gen_prop::MaterializedViewProfile::default(),
+            )
+            .new_tree(&mut runner)
+            .unwrap()
+            .current();
             let turso_sql = create.to_string();
             let turso_result = DifferentialOracle::execute_turso(&turso, &turso_sql);
             let sqlite_result =

@@ -7,8 +7,10 @@ use std::io::{IsTerminal, stdin};
 use std::path::PathBuf;
 
 use anyhow::Result;
-use clap::{Parser, Subcommand};
-use differential_fuzzer::{Fuzzer, GeneratorKind, SimConfig, TreeMode, WeightProfile};
+use clap::{Parser, Subcommand, ValueEnum};
+use differential_fuzzer::{
+    Fuzzer, GeneratorKind, MatviewShape, SimConfig, TreeMode, WeightProfile,
+};
 use rand::RngCore;
 use serde::Serialize;
 
@@ -83,6 +85,11 @@ struct Args {
     #[arg(long)]
     matview: bool,
 
+    /// Comma-separated parts of the materialized view workload to generate.
+    /// Default: all of them.
+    #[arg(long, value_enum, value_delimiter = ',', requires = "matview")]
+    matview_shapes: Option<Vec<MatviewShape>>,
+
     /// Probability that a non-DDL statement starts a BEGIN ... COMMIT batch
     /// of generated statements. Default: 0.3 with `--matview`, else 0.
     #[arg(long)]
@@ -147,6 +154,7 @@ struct ConfigRecord {
     recursive_cte_focus: bool,
     profile: String,
     matview: bool,
+    matview_shapes: Option<Vec<MatviewShape>>,
     batch_probability: Option<f64>,
     large_batch_probability: Option<f64>,
     max_batch_size: usize,
@@ -173,6 +181,7 @@ impl ConfigRecord {
             recursive_cte_focus: args.recursive_cte_focus,
             profile: format!("{:?}", args.profile),
             matview: args.matview,
+            matview_shapes: args.matview_shapes.clone(),
             batch_probability: args.batch_probability,
             large_batch_probability: args.large_batch_probability,
             max_batch_size: args.max_batch_size,
@@ -318,6 +327,16 @@ fn run_single_inner(args: &Args) -> Result<differential_fuzzer::SimStats> {
     if args.reopen_probability.is_some_and(|p| p > 0.0) && (!args.matview || args.mvcc) {
         anyhow::bail!("--reopen-probability requires --matview and does not support --mvcc");
     }
+    let matview_shapes = args
+        .matview_shapes
+        .clone()
+        .unwrap_or_else(|| MatviewShape::value_variants().to_vec());
+    if matview_shapes
+        .iter()
+        .all(|shape| matches!(shape, MatviewShape::Chain | MatviewShape::Replace))
+    {
+        anyhow::bail!("--matview-shapes needs a view shape besides chain and replace");
+    }
     if args.max_batch_size < 2 {
         anyhow::bail!("--max-batch-size must be at least 2");
     }
@@ -362,6 +381,7 @@ fn run_single_inner(args: &Args) -> Result<differential_fuzzer::SimStats> {
         recursive_cte_focus: args.recursive_cte_focus,
         weight_profile: args.profile,
         matview: args.matview,
+        matview_shapes,
         batch_probability,
         large_batch_probability,
         max_batch_size: args.max_batch_size,

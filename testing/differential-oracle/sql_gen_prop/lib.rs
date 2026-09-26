@@ -62,7 +62,7 @@ pub use function::{
 };
 pub use generator::{SqlGeneratorKind, WeightedKindIteratorExt};
 pub use insert::{InsertStatement, OnConflict};
-pub use materialized_view::CreateMaterializedViewStatement;
+pub use materialized_view::{CreateMaterializedViewStatement, MaterializedViewProfile};
 pub use profile::{
     CreateIndexProfile, CreateTableProfile, CreateTriggerProfile, DeleteProfile,
     ExtendedExpressionProfile, ExtendedFunctionProfile, GenerationProfile, InsertProfile,
@@ -132,7 +132,8 @@ pub mod strategies {
     pub use crate::view::{create_view, drop_view, drop_view_for_schema};
     // Materialized views
     pub use crate::materialized_view::{
-        create_materialized_view, drop_materialized_view, materialized_view_sources,
+        can_create_materialized_view, create_materialized_view, drop_materialized_view,
+        materialized_view_sources,
     };
     // Triggers
     pub use crate::create_trigger::{
