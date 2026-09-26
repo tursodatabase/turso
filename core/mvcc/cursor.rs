@@ -5,7 +5,8 @@ use crate::types::IOResultOr;
 
 use crate::mvcc::clock::LogicalClock;
 use crate::mvcc::database::{
-    create_seek_range, MVTableId, MvStore, Row, RowID, RowKey, RowVersions, SortableIndexKey,
+    create_seek_range, IndexKeyPrefix, MVTableId, MvStore, Row, RowID, RowKey, RowVersions,
+    SortableIndexKey,
 };
 #[cfg(any(test, injected_yields))]
 use crate::mvcc::yield_hooks::{ProvidesYieldContext, YieldContext, YieldPointMarker};
@@ -14,7 +15,7 @@ use crate::storage::btree::{BTreeCursor, BTreeKey, CursorTrait};
 use crate::sync::Arc;
 use crate::translate::plan::IterationDirection;
 use crate::types::{
-    compare_immutable, IOCompletions, IOResult, ImmutableRecord, IndexInfo, SeekKey, SeekOp,
+    compare_immutable_iter, IOCompletions, IOResult, ImmutableRecord, IndexInfo, SeekKey, SeekOp,
     SeekResult, Value,
 };
 use crate::vdbe::Register;
@@ -180,13 +181,12 @@ fn current_pos_matches_seek_key(
             let MvccCursorType::Index(index_info) = mv_cursor_type else {
                 return Ok(false);
             };
-            let key_info: Vec<_> = index_info
-                .key_info
-                .iter()
-                .take(target.column_count())
-                .cloned()
-                .collect();
-            compare_immutable(target.get_values()?, current.key.get_values()?, &key_info).is_eq()
+            compare_immutable_iter(
+                target.iter()?,
+                current.key.iter()?,
+                &index_info.key_info[..target.column_count().min(index_info.key_info.len())],
+            )?
+            .is_eq()
         }
         _ => false,
     })
@@ -1684,28 +1684,22 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> CursorTrait
                             }
                         }
                         SeekKey::IndexKey(index_key) => {
-                            let index_info = {
-                                let MvccCursorType::Index(index_info) = &self.mv_cursor_type else {
-                                    panic!("SeekKey::IndexKey requires Index cursor type");
-                                };
-                                Arc::new(IndexInfo::new_in(
-                                    index_info.key_info.iter().cloned(),
-                                    index_info.has_rowid,
-                                    index_key.column_count(),
-                                    index_info.is_unique,
-                                    self.db.allocator(),
-                                )?)
+                            let MvccCursorType::Index(index_info) = &self.mv_cursor_type else {
+                                panic!("SeekKey::IndexKey requires Index cursor type");
                             };
-                            let sortable_key = SortableIndexKey::new_from_payload_in(
-                                index_key,
-                                index_info,
-                                self.db.allocator(),
-                            )?;
+                            let prefix = IndexKeyPrefix {
+                                key: SortableIndexKey::new_from_payload_in(
+                                    index_key,
+                                    index_info.clone(),
+                                    self.db.allocator(),
+                                )?,
+                                num_cols: index_key.column_count(),
+                            };
 
                             // Seek in MVCC (synchronous)
                             let mvcc_rowid = self.db.seek_index(
                                 self.table_id,
-                                sortable_key.clone(),
+                                prefix,
                                 inclusive,
                                 op.eq_only(),
                                 direction,
@@ -1769,18 +1763,14 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> CursorTrait
                                     else {
                                         panic!("Index cursor expected");
                                     };
-                                    let key_info: Vec<_> = index_info
-                                        .key_info
-                                        .iter()
-                                        .take(index_key.column_count())
-                                        .cloned()
-                                        .collect();
-                                    let cmp = compare_immutable(
-                                        index_key.get_values()?,
-                                        found_key.key.get_values()?,
-                                        &key_info,
-                                    );
-                                    cmp.is_eq()
+                                    compare_immutable_iter(
+                                        index_key.iter()?,
+                                        found_key.key.iter()?,
+                                        &index_info.key_info[..index_key
+                                            .column_count()
+                                            .min(index_info.key_info.len())],
+                                    )?
+                                    .is_eq()
                                 }
                             };
                             if found {

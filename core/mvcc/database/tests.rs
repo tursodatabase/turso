@@ -282,9 +282,47 @@ fn write_set_take_transfers_entries_without_cloning() {
     assert!(write_set.seen.is_empty());
     assert_eq!(transferred.entries.as_ptr(), entries_ptr);
     assert_eq!(transferred.entries.capacity(), entries_capacity);
-    assert_eq!(transferred.seen.len(), 1);
     assert_eq!(Arc::strong_count(&row_versions), strong_count);
     assert!(Arc::ptr_eq(&transferred.entries[0].1, &row_versions));
+}
+
+#[test]
+fn write_set_rejects_duplicate_chains_before_and_after_it_grows_large() {
+    let mut write_set = WriteSet::<TursoAllocator>::new();
+    let chains: Vec<(RowID, RowVersions<TursoAllocator>)> = (0..40)
+        .map(|rowid| {
+            (
+                RowID::new(MVTableId::from(-2), RowKey::Int(rowid)),
+                Arc::new(RwLock::new(crate::alloc::vec![])),
+            )
+        })
+        .collect();
+
+    for (count, (row_id, versions)) in chains.iter().enumerate() {
+        assert!(write_set.insert(row_id.clone(), versions.clone()));
+        for (earlier_row_id, earlier_versions) in &chains[..=count] {
+            assert!(!write_set.insert(earlier_row_id.clone(), earlier_versions.clone()));
+        }
+    }
+    assert_eq!(write_set.entries.len(), chains.len());
+
+    write_set.retain(|row_id, _| matches!(row_id.row_id, RowKey::Int(rowid) if rowid < 3));
+    assert_eq!(write_set.entries.len(), 3);
+    for (row_id, versions) in &chains[..3] {
+        assert!(!write_set.insert(row_id.clone(), versions.clone()));
+    }
+    for (row_id, versions) in &chains[3..] {
+        assert!(write_set.insert(row_id.clone(), versions.clone()));
+    }
+    assert_eq!(write_set.entries.len(), chains.len());
+
+    write_set.retain(|_, _| false);
+    assert!(write_set.is_empty());
+    for (row_id, versions) in &chains {
+        assert!(write_set.insert(row_id.clone(), versions.clone()));
+        assert!(!write_set.insert(row_id.clone(), versions.clone()));
+    }
+    assert_eq!(write_set.entries.len(), chains.len());
 }
 
 #[test]
@@ -418,6 +456,170 @@ fn mv_store_skiplist_allocations_are_fallible() {
     assert!(store.rows.is_empty());
 }
 
+#[test]
+fn sortable_index_key_keeps_checked_collation_semantics() {
+    fn metadata(
+        sort_order: turso_parser::ast::SortOrder,
+        collation: crate::translate::collate::CollationSeq,
+    ) -> Arc<IndexInfo> {
+        Arc::new(
+            IndexInfo::new(
+                crate::alloc::vec![crate::types::KeyInfo {
+                    sort_order,
+                    collation,
+                    nulls_order: None,
+                }],
+                false,
+                1,
+                false,
+            )
+            .unwrap(),
+        )
+    }
+
+    fn text_key(value: &str, metadata: Arc<IndexInfo>) -> SortableIndexKey {
+        let record =
+            ImmutableRecord::from_values(&[Value::Text(Text::new(value.to_owned()))], 1).unwrap();
+        SortableIndexKey::new_from_payload_in(&record, metadata, TursoAllocator).unwrap()
+    }
+
+    let ascending = metadata(
+        turso_parser::ast::SortOrder::Asc,
+        crate::translate::collate::CollationSeq::Binary,
+    );
+    assert!(text_key("alpha", ascending.clone()) < text_key("beta", ascending.clone()));
+    assert!(text_key("z", ascending.clone()) < text_key("é", ascending.clone()));
+
+    let descending = metadata(
+        turso_parser::ast::SortOrder::Desc,
+        crate::translate::collate::CollationSeq::Binary,
+    );
+    assert!(text_key("alpha", descending.clone()) > text_key("beta", descending));
+
+    let nocase = metadata(
+        turso_parser::ast::SortOrder::Asc,
+        crate::translate::collate::CollationSeq::NoCase,
+    );
+    assert_eq!(
+        text_key("alpha", nocase.clone()).cmp(&text_key("ALPHA", nocase)),
+        std::cmp::Ordering::Equal
+    );
+
+    let invalid_utf8_record = [2, 15, 0xff];
+    let invalid =
+        SortableIndexKey::new_from_payload_in(invalid_utf8_record, ascending, TursoAllocator);
+    assert!(invalid.is_err());
+}
+
+#[test]
+fn compare_bytes_matches_slice_order() {
+    let mut rng = ChaCha8Rng::seed_from_u64(0xb17e5);
+    for _ in 0..20_000 {
+        let shared_len = rng.random_range(0..20);
+        let shared: Vec<u8> = (0..shared_len).map(|_| rng.random_range(0..4u8)).collect();
+        let mut lhs = shared.clone();
+        let mut rhs = shared;
+        lhs.extend((0..rng.random_range(0..12)).map(|_| rng.random_range(0..4u8) * 85));
+        rhs.extend((0..rng.random_range(0..12)).map(|_| rng.random_range(0..4u8) * 85));
+        assert_eq!(
+            compare_bytes(&lhs, &rhs),
+            lhs.cmp(&rhs),
+            "{lhs:?} vs {rhs:?}"
+        );
+    }
+}
+
+#[test]
+fn sortable_index_key_order_matches_value_comparison() {
+    use crate::translate::collate::CollationSeq;
+    use turso_parser::ast::SortOrder;
+
+    fn random_leading_value(rng: &mut ChaCha8Rng) -> Value {
+        match rng.random_range(0..10) {
+            0 => Value::Null,
+            1 => Value::from_i64(rng.random_range(-3..3)),
+            2 => Value::Blob(crate::alloc::vec![rng.random_range(0..3u8)]),
+            _ => {
+                let len = match rng.random_range(0..4) {
+                    0 => 0,
+                    1 => rng.random_range(55..70),
+                    _ => rng.random_range(1..6),
+                };
+                let text: String = (0..len)
+                    .map(|_| ['a', 'b', 'B', 'é'][rng.random_range(0..4)])
+                    .collect();
+                Value::Text(Text::new(text))
+            }
+        }
+    }
+
+    let mut rng = ChaCha8Rng::seed_from_u64(0x5eed);
+    for sort_order in [SortOrder::Asc, SortOrder::Desc] {
+        for collation in [CollationSeq::Binary, CollationSeq::NoCase] {
+            let key_info = [
+                crate::types::KeyInfo {
+                    sort_order,
+                    collation,
+                    nulls_order: None,
+                },
+                crate::types::KeyInfo {
+                    sort_order: SortOrder::Asc,
+                    collation: CollationSeq::Binary,
+                    nulls_order: None,
+                },
+            ];
+            let metadata = |num_cols: usize| {
+                Arc::new(IndexInfo::new(key_info.iter().cloned(), true, num_cols, false).unwrap())
+            };
+            let full = metadata(2);
+            let prefix = metadata(1);
+            for _ in 0..2000 {
+                let lhs_values = [
+                    random_leading_value(&mut rng),
+                    Value::from_i64(rng.random_range(0..3)),
+                ];
+                let rhs_values = [
+                    random_leading_value(&mut rng),
+                    Value::from_i64(rng.random_range(0..3)),
+                ];
+                let rhs_is_prefix = rng.random_range(0..4) == 0;
+                let rhs_cols = if rhs_is_prefix { 1 } else { 2 };
+                let lhs_record = ImmutableRecord::from_values(&lhs_values, 2).unwrap();
+                let rhs_record =
+                    ImmutableRecord::from_values(&rhs_values[..rhs_cols], rhs_cols).unwrap();
+                let lhs = SortableIndexKey::new_from_payload_in(
+                    &lhs_record,
+                    full.clone(),
+                    TursoAllocator,
+                )
+                .unwrap();
+                let rhs_metadata = if rhs_is_prefix {
+                    prefix.clone()
+                } else {
+                    full.clone()
+                };
+                let rhs = SortableIndexKey::new_from_payload_in(
+                    &rhs_record,
+                    rhs_metadata,
+                    TursoAllocator,
+                )
+                .unwrap();
+                let expected = compare_immutable(
+                    lhs_values[..rhs_cols].iter(),
+                    rhs_values[..rhs_cols].iter(),
+                    &key_info[..rhs_cols],
+                );
+                assert_eq!(
+                    lhs.cmp(&rhs),
+                    expected,
+                    "{lhs_values:?} vs {:?} ({sort_order:?}, {collation:?})",
+                    &rhs_values[..rhs_cols]
+                );
+            }
+        }
+    }
+}
+
 #[cfg(nightly)]
 #[test]
 fn row_payload_allocation_uses_passed_allocator() {
@@ -455,7 +657,7 @@ fn index_key_payload_allocation_uses_passed_allocator() {
 
     alloc.fail_allocations(true);
     let result = SortableIndexKey::new_from_payload_in(&record, index_info.clone(), alloc.clone());
-    assert!(matches!(result, Err(crate::alloc::TryReserveError)));
+    assert!(matches!(result, Err(LimboError::OutOfMemory)));
 
     alloc.fail_allocations(false);
     let key = SortableIndexKey::new_from_payload_in(record_ref, index_info, alloc).unwrap();
