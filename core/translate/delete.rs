@@ -1,23 +1,28 @@
-use crate::schema::{BTreeTable, Table};
+use crate::schema::{BTreeCharacteristics, BTreeTable, Table};
 use crate::sync::Arc;
 use crate::translate::emitter::{emit_program, Resolver};
 use crate::translate::expr::{process_returning_clause, walk_expr, WalkControl};
 use crate::translate::optimizer::optimize_plan;
 use crate::translate::plan::{
-    DeletePlan, DmlSafety, DmlSafetyReason, IterationDirection, JoinOrderMember, Operation, Plan,
-    QueryDestination, ResultSetColumn, Scan, SelectPlan,
+    select_star, ColumnMask, DeletePlan, DmlSafety, DmlSafetyReason, EphemeralRowidMode,
+    IterationDirection, JoinInfo, JoinOrderMember, JoinType, NonFromClauseSubquery, Operation,
+    OuterQueryReference, Plan, QueryDestination, ResultSetColumn, Scan, SelectPlan,
 };
-use crate::translate::planner::{parse_where, plan_ctes_as_outer_refs};
+use crate::translate::planner::{
+    append_vtab_predicates_to_where_clause, parse_from, parse_where, plan_ctes_as_outer_refs,
+};
 use crate::translate::subquery::{
     plan_subqueries_from_returning, plan_subqueries_from_select_plan,
     plan_subqueries_from_where_clause,
 };
 use crate::translate::trigger_exec::has_triggers_including_temp;
 use crate::util::normalize_ident;
-use crate::vdbe::builder::{ProgramBuilder, ProgramBuilderOpts};
+use crate::vdbe::builder::{CursorType, ProgramBuilder, ProgramBuilderOpts};
 use crate::Result;
 use smallvec::SmallVec;
-use turso_parser::ast::{Expr, QualifiedName, RefAct, ResultColumn, TriggerEvent, With};
+use turso_parser::ast::{
+    Expr, FromClause, QualifiedName, RefAct, ResultColumn, TriggerEvent, With,
+};
 
 use super::plan::{ColumnUsedMask, JoinedTable, TableReferences, WhereTerm};
 
@@ -78,6 +83,7 @@ fn validate_delete(
 #[turso_macros::trace_stack]
 pub fn translate_delete(
     tbl_name: &QualifiedName,
+    using: Option<FromClause>,
     resolver: &Resolver,
     where_clause: Option<Box<Expr>>,
     returning: Vec<ResultColumn>,
@@ -105,6 +111,7 @@ pub fn translate_delete(
         resolver,
         tbl_name,
         table,
+        using,
         where_clause,
         returning,
         indexed,
@@ -188,6 +195,7 @@ pub fn prepare_delete_plan(
     resolver: &Resolver,
     qualified_name: &QualifiedName,
     table: Arc<Table>,
+    using: Option<FromClause>,
     where_clause: Option<Box<Expr>>,
     mut returning: Vec<ResultColumn>,
     indexed: Option<turso_parser::ast::Indexed>,
@@ -213,6 +221,7 @@ pub fn prepare_delete_plan(
         internal_id: program.table_reference_counter.next(),
         join_info: None,
         col_used_mask: ColumnUsedMask::default(),
+        rowid_referenced: false,
         column_use_counts: Vec::new(),
         expression_index_usages: Vec::new(),
         database_id,
@@ -221,10 +230,79 @@ pub fn prepare_delete_plan(
     }];
     let mut table_references = TableReferences::new(joined_tables, vec![]);
 
-    // Plan CTEs and add them as outer query references for subquery resolution
-    plan_ctes_as_outer_refs(with, resolver, program, &mut table_references, connection)?;
-
     let mut where_predicates = vec![];
+    let mut using_subqueries = vec![];
+    let has_using = using.is_some();
+    if let Some(using_clause) = using {
+        let aliases = std::iter::once(using_clause.select.as_ref())
+            .chain(using_clause.joins.iter().map(|join| join.table.as_ref()))
+            .filter_map(|table| match table {
+                turso_parser::ast::SelectTable::Table(_, alias, _)
+                | turso_parser::ast::SelectTable::TableCall(_, _, alias)
+                | turso_parser::ast::SelectTable::Select(_, alias)
+                | turso_parser::ast::SelectTable::Sub(_, alias) => alias.as_ref(),
+            })
+            .map(|alias| normalize_ident(alias.name().as_str()))
+            .chain(
+                qualified_name
+                    .alias
+                    .iter()
+                    .map(|alias| normalize_ident(alias.as_str())),
+            )
+            .collect::<Vec<_>>();
+        let mut using_tables = TableReferences::new_empty();
+        let mut vtab_predicates = vec![];
+        parse_from(
+            Some(using_clause),
+            resolver,
+            program,
+            with,
+            true,
+            &mut where_predicates,
+            &mut vtab_predicates,
+            &mut using_tables,
+            connection,
+        )?;
+        let target = &table_references.joined_tables()[0];
+        for (index, table) in using_tables.joined_tables().iter().enumerate() {
+            let conflict = std::iter::once(target)
+                .chain(using_tables.joined_tables()[..index].iter())
+                .any(|previous| {
+                    previous.identifier == table.identifier
+                        && (previous.database_id == table.database_id
+                            || previous.btree().is_none()
+                            || table.btree().is_none()
+                            || aliases.contains(&table.identifier))
+                });
+            if conflict {
+                crate::bail_parse_error!(
+                    "table name \"{}\" specified more than once",
+                    table.identifier
+                );
+            }
+        }
+        append_vtab_predicates_to_where_clause(
+            &mut vtab_predicates,
+            &mut using_tables,
+            &[],
+            &mut where_predicates,
+            resolver,
+        )?;
+        plan_subqueries_from_where_clause(
+            program,
+            &mut using_subqueries,
+            &mut using_tables,
+            &mut where_predicates,
+            resolver,
+            connection,
+        )?;
+        if using_tables.right_join_swapped() {
+            table_references.set_right_join_swapped();
+        }
+        table_references.extend(using_tables);
+    } else {
+        plan_ctes_as_outer_refs(with, resolver, program, &mut table_references, connection)?;
+    }
 
     // Parse the WHERE clause
     parse_where(
@@ -234,6 +312,18 @@ pub fn prepare_delete_plan(
         &mut where_predicates,
         resolver,
     )?;
+
+    let using_read_masks = table_references
+        .joined_tables_mut()
+        .iter_mut()
+        .skip(1)
+        .map(|table| {
+            (
+                std::mem::take(&mut table.col_used_mask),
+                std::mem::take(&mut table.rowid_referenced),
+            )
+        })
+        .collect::<Vec<_>>();
 
     // Plan subqueries in RETURNING expressions before processing
     // (so SubqueryResult nodes are cloned into result_columns)
@@ -247,7 +337,36 @@ pub fn prepare_delete_plan(
         connection,
     )?;
 
-    let result_columns = process_returning_clause(&mut returning, &mut table_references, resolver)?;
+    let result_columns = if has_using {
+        process_delete_using_returning(&mut returning, &mut table_references, resolver)?
+    } else {
+        process_returning_clause(&mut returning, &mut table_references, resolver)?
+    };
+
+    let mut using_values = vec![];
+    for (table, (read_mask, rowid_referenced)) in table_references
+        .joined_tables_mut()
+        .iter_mut()
+        .skip(1)
+        .zip(using_read_masks)
+    {
+        for column in table.col_used_mask.iter() {
+            using_values.push(Expr::Column {
+                database: None,
+                table: table.internal_id,
+                column,
+                is_rowid_alias: table.columns()[column].is_rowid_alias(),
+            });
+        }
+        if table.rowid_referenced {
+            using_values.push(Expr::RowId {
+                database: None,
+                table: table.internal_id,
+            });
+        }
+        table.col_used_mask.union_with(&read_mask)?;
+        table.rowid_referenced |= rowid_referenced;
+    }
 
     // Check if there are DELETE triggers. If so, we need to materialize the write set into a RowSet first.
     // This is done in SQLite for all DELETE triggers on the affected table even if the trigger would not have an impact
@@ -266,6 +385,9 @@ pub fn prepare_delete_plan(
     };
 
     let mut safety = DmlSafety::default();
+    if has_using {
+        safety.require(DmlSafetyReason::DeleteUsing);
+    }
     if has_delete_triggers {
         safety.require(DmlSafetyReason::Trigger);
     }
@@ -284,15 +406,119 @@ pub fn prepare_delete_plan(
         indexes,
         rowset_plan: None,
         rowset_reg: None,
+        using_values,
         non_from_clause_subqueries,
         safety,
     };
 
-    if delete_plan.safety.requires_stable_write_set() {
+    if has_using {
+        prepare_delete_using_rows(program, &mut delete_plan, using_subqueries);
+    } else if delete_plan.safety.requires_stable_write_set() {
         ensure_delete_uses_rowset(program, &mut delete_plan);
     }
 
     Ok(Plan::Delete(Box::new(delete_plan)))
+}
+
+fn process_delete_using_returning(
+    returning: &mut [ResultColumn],
+    table_references: &mut TableReferences,
+    resolver: &Resolver,
+) -> Result<Vec<ResultSetColumn>> {
+    let mut result_columns = vec![];
+    for column in returning {
+        let start = result_columns.len();
+        match column {
+            ResultColumn::Star => {
+                select_star(
+                    &table_references.joined_tables()[..1],
+                    &mut result_columns,
+                    false,
+                    false,
+                )?;
+                select_star(
+                    &table_references.joined_tables()[1..],
+                    &mut result_columns,
+                    table_references.right_join_swapped(),
+                    false,
+                )?;
+            }
+            ResultColumn::TableStar(name) => {
+                let name = normalize_ident(name.as_str());
+                let mut matching_tables = table_references
+                    .joined_tables()
+                    .iter()
+                    .filter(|table| table.identifier == name);
+                let table = matching_tables.next().ok_or_else(|| {
+                    crate::LimboError::ParseError(format!("no such table: {name}"))
+                })?;
+                if matching_tables.next().is_some() {
+                    crate::bail_parse_error!("table reference \"{name}\" is ambiguous");
+                }
+                let mut table = table.clone();
+                table.join_info = None;
+                select_star(
+                    std::slice::from_ref(&table),
+                    &mut result_columns,
+                    false,
+                    false,
+                )?;
+            }
+            ResultColumn::Expr(..) => {
+                result_columns.extend(process_returning_clause(
+                    std::slice::from_mut(column),
+                    table_references,
+                    resolver,
+                )?);
+                continue;
+            }
+        }
+        for result_column in &result_columns[start..] {
+            let Expr::Column { table, column, .. } = &result_column.expr else {
+                unreachable!("RETURNING wildcards must expand to columns");
+            };
+            table_references.mark_column_used(*table, *column);
+        }
+    }
+    Ok(result_columns)
+}
+
+fn prepare_delete_using_rows(
+    program: &mut ProgramBuilder,
+    plan: &mut DeletePlan,
+    using_subqueries: Vec<NonFromClauseSubquery>,
+) {
+    let mut table_references = plan.table_references.clone();
+    let mut target = table_references.joined_tables_mut().remove(0);
+    target.join_info = Some(JoinInfo {
+        join_type: JoinType::Inner,
+        using: vec![],
+        no_reorder: false,
+    });
+    table_references.add_joined_table(target);
+    plan.rowset_plan = Some(build_delete_rowset_plan(
+        program,
+        plan,
+        table_references,
+        using_subqueries,
+    ));
+    let using_tables = plan.table_references.joined_tables_mut().split_off(1);
+    for table in using_tables {
+        plan.table_references
+            .add_outer_query_reference(OuterQueryReference {
+                identifier: table.identifier,
+                internal_id: table.internal_id,
+                table: table.table,
+                using_dedup_hidden_cols: ColumnMask::default(),
+                col_used_mask: table.col_used_mask,
+                cte_select: None,
+                cte_explicit_columns: vec![],
+                cte_id: None,
+                cte_definition_only: false,
+                rowid_referenced: table.rowid_referenced,
+                scope_depth: 0,
+            });
+    }
 }
 
 /// Returns true if any FK referencing `table_name` (transitively, following CASCADE chains)
@@ -414,6 +640,20 @@ fn ensure_delete_uses_rowset(program: &mut ProgramBuilder, plan: &mut DeletePlan
         return;
     }
 
+    plan.rowset_plan = Some(build_delete_rowset_plan(
+        program,
+        plan,
+        plan.table_references.clone(),
+        vec![],
+    ));
+}
+
+fn build_delete_rowset_plan(
+    program: &mut ProgramBuilder,
+    plan: &mut DeletePlan,
+    table_references: TableReferences,
+    non_from_clause_subqueries: Vec<NonFromClauseSubquery>,
+) -> SelectPlan {
     let rowid_internal_id = plan
         .table_references
         .joined_tables()
@@ -426,46 +666,74 @@ fn ensure_delete_uses_rowset(program: &mut ProgramBuilder, plan: &mut DeletePlan
         reg
     });
 
-    let rowset_plan = SelectPlan {
-        table_references: plan.table_references.clone(),
-        result_columns: vec![ResultSetColumn {
-            expr: Expr::RowId {
-                database: None,
-                table: rowid_internal_id,
-            },
+    let query_destination = if plan.using_values.is_empty() {
+        QueryDestination::RowSet { rowset_reg }
+    } else {
+        let scratch_table = Arc::new(BTreeTable::new(
+            0,
+            "delete_using".to_string(),
+            crate::alloc::vec![],
+            crate::alloc::vec![],
+            BTreeCharacteristics::HAS_ROWID,
+            crate::alloc::vec![],
+            crate::alloc::vec![],
+            crate::alloc::vec![],
+            None,
+        ));
+        let cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(scratch_table.clone()));
+        QueryDestination::EphemeralTable {
+            cursor_id,
+            table: scratch_table,
+            rowid_mode: EphemeralRowidMode::FromResultColumns,
+        }
+    };
+    let result_columns = plan
+        .using_values
+        .iter()
+        .cloned()
+        .chain(std::iter::once(Expr::RowId {
+            database: None,
+            table: rowid_internal_id,
+        }))
+        .map(|expr| ResultSetColumn {
+            expr,
             alias: None,
             implicit_column_name: None,
             contains_aggregates: false,
-        }],
+        })
+        .collect();
+    let join_order = table_references
+        .joined_tables()
+        .iter()
+        .enumerate()
+        .map(|(i, table)| JoinOrderMember {
+            table_id: table.internal_id,
+            original_idx: i,
+            is_outer: table.join_info.as_ref().is_some_and(JoinInfo::is_outer),
+        })
+        .collect();
+
+    SelectPlan {
+        table_references,
+        result_columns,
         where_clause: std::mem::take(&mut plan.where_clause),
         group_by: None,
         order_by: vec![],
         aggregates: vec![],
         limit: None,
-        query_destination: QueryDestination::RowSet { rowset_reg },
-        join_order: plan
-            .table_references
-            .joined_tables()
-            .iter()
-            .enumerate()
-            .map(|(i, t)| JoinOrderMember {
-                table_id: t.internal_id,
-                original_idx: i,
-                is_outer: false,
-            })
-            .collect(),
+        query_destination,
+        join_order,
         offset: None,
         contains_constant_false_condition: false,
         distinctness: super::plan::Distinctness::NonDistinct,
         values: vec![],
         window: None,
         // WHERE subqueries should already be planned into this SelectPlan when needed.
-        non_from_clause_subqueries: vec![],
+        non_from_clause_subqueries,
         input_cardinality_hint: None,
         estimated_output_rows: None,
         estimated_cost: None,
         simple_aggregate: None,
         phantom_params: vec![],
-    };
-    plan.rowset_plan = Some(rowset_plan);
+    }
 }

@@ -306,7 +306,7 @@ fn emit_recursive_cte_query(
         Plan::Select(select_plan) => {
             let mut context = TranslateCtx::new(
                 program,
-                resolver.fork(),
+                resolver.fork_with_outer_column_cache(&select_plan.table_references),
                 select_plan.joined_tables().len(),
                 false,
             );

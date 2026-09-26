@@ -375,6 +375,7 @@ fn trigger_cmd_to_stmt_for_subprogram(
             }
 
             Ok(ast::Stmt::Delete {
+                using: None,
                 tbl_name: QualifiedName {
                     db_name: subprogram_ctx.db_name.clone(),
                     name: tbl_name.clone(),

@@ -1307,6 +1307,7 @@ mod tests {
             internal_id,
             join_info,
             col_used_mask: ColumnUsedMask::default(),
+            rowid_referenced: false,
             column_use_counts: Vec::new(),
             expression_index_usages: Vec::new(),
             database_id: MAIN_DB_ID,

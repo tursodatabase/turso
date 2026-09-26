@@ -318,6 +318,7 @@ pub fn translate_inner(
         }
         ast::Stmt::Delete {
             tbl_name,
+            using,
             where_clause,
             returning,
             indexed,
@@ -330,6 +331,7 @@ pub fn translate_inner(
             }
             translate_delete(
                 &tbl_name,
+                using,
                 resolver,
                 where_clause,
                 returning,

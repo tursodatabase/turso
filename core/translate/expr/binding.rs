@@ -545,11 +545,28 @@ pub fn bind_and_rewrite_expr<'a>(
                                 let is_rowid_alias = col.is_rowid_alias();
                                 let normalized_tbl_name = normalize_ident(&tbl_name_str);
                                 let matching_tbl = referenced_tables
-                                    .find_table_and_internal_id_by_identifier(&normalized_tbl_name);
+                                    .joined_tables()
+                                    .iter()
+                                    .find(|reference| {
+                                        reference.identifier == normalized_tbl_name
+                                            && reference.table == *table
+                                    })
+                                    .map(|reference| reference.internal_id)
+                                    .or_else(|| {
+                                        referenced_tables
+                                            .outer_query_refs()
+                                            .iter()
+                                            .find(|reference| {
+                                                !reference.cte_definition_only
+                                                    && reference.identifier == normalized_tbl_name
+                                                    && reference.table == *table
+                                            })
+                                            .map(|reference| reference.internal_id)
+                                    });
 
-                                if let Some((tbl_id, _)) = matching_tbl {
+                                if let Some(tbl_id) = matching_tbl {
                                     *expr = Expr::Column {
-                                        database: Some(database_id),
+                                        database: None,
                                         table: tbl_id,
                                         column: col_idx,
                                         is_rowid_alias,
