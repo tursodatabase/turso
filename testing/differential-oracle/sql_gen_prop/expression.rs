@@ -24,7 +24,7 @@ use crate::generator::SqlGeneratorKind;
 use crate::profile::StatementProfile;
 use crate::schema::{ColumnDef, DataType};
 use crate::select::SelectStatement;
-use crate::value::{SqlValue, value_for_type};
+use crate::value::{SqlValue, ValueProfile, value_for_type};
 
 /// A SQL expression that can appear in SELECT lists, WHERE clauses, etc.
 #[derive(Debug, Clone, strum::EnumDiscriminants)]
@@ -945,6 +945,8 @@ pub struct ExpressionContext {
     pub case_when_clause_range: std::ops::RangeInclusive<usize>,
     /// Schema for generating subqueries.
     pub schema: crate::schema::Schema,
+    /// Domain of literal values.
+    pub values: ValueProfile,
 }
 
 impl ExpressionContext {
@@ -959,6 +961,7 @@ impl ExpressionContext {
             profile: ExpressionProfile::default(),
             case_when_clause_range: 1..=3,
             schema,
+            values: ValueProfile::default(),
         }
     }
 
@@ -992,6 +995,12 @@ impl ExpressionContext {
         self
     }
 
+    /// Set the domain of literal values.
+    pub fn with_values(mut self, values: ValueProfile) -> Self {
+        self.values = values;
+        self
+    }
+
     /// Set the CASE WHEN clause range.
     pub fn with_case_when_clause_range(mut self, range: std::ops::RangeInclusive<usize>) -> Self {
         self.case_when_clause_range = range;
@@ -1009,6 +1018,7 @@ impl ExpressionContext {
             profile: self.profile.clone(),
             case_when_clause_range: self.case_when_clause_range.clone(),
             schema: self.schema.clone(),
+            values: self.values.clone(),
         }
     }
 }
@@ -1531,6 +1541,7 @@ pub fn expression(ctx: &ExpressionContext) -> BoxedStrategy<Expression> {
     // This preserves subquery_max_depth and other settings from the context
     let mut profile = StatementProfile::default();
     profile.generation.expression.base = ctx.profile.clone();
+    profile.generation.value = ctx.values.clone();
 
     let weighted_strategies: Vec<(u32, BoxedStrategy<Expression>)> = ctx
         .profile
