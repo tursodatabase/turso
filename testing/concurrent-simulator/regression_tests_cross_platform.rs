@@ -28,6 +28,7 @@ fn test_concurrent_commit_no_yield_spin() {
     let io_rng = ChaCha8Rng::seed_from_u64(42);
     let fault_config = IOFaultConfig {
         cosmic_ray_probability: 0.0,
+        ..Default::default()
     };
     let io = Arc::new(SimulatorIO::new(false, io_rng, fault_config));
 
@@ -315,6 +316,7 @@ fn test_fts_workloads_use_the_index_and_replay_with_the_seed() {
         ChaCha8Rng::seed_from_u64(7),
         IOFaultConfig {
             cosmic_ray_probability: 0.0,
+            ..Default::default()
         },
     ));
     let db_path = format!("test-fts-plan-{}.db", std::process::id());

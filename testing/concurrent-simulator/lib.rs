@@ -50,7 +50,7 @@ use crate::{
     },
     chaotic_elle::{ChaoticWorkload, ChaoticWorkloadProfile},
     io::FILE_SIZE_SOFT_LIMIT,
-    properties::Property,
+    properties::{IntegrityCheckFoundCorruption, Property},
     workloads::{Workload, WorkloadContext},
 };
 
@@ -66,7 +66,7 @@ pub fn multiprocess_platform_io() -> anyhow::Result<Arc<dyn IO>> {
         Ok(Arc::new(turso_core::PlatformIO::new()?))
     }
 }
-pub use io::{IOFaultConfig, SimulatorIO};
+pub use io::{CosmicRayFlip, IOFaultConfig, SimulatorIO};
 pub use operations::{FiberState, OpContext, OpResult, Operation, TxMode};
 use yield_injection::{SimulatorYieldInjector, fiber_yield_seed};
 
@@ -275,6 +275,8 @@ pub struct WhopperOpts {
     pub max_drain_steps: usize,
     /// Probability of cosmic ray bit flip on each step (0.0-1.0).
     pub cosmic_ray_probability: f64,
+    /// If false, cosmic rays use the random numbers of a flip but change no bit.
+    pub flip_cosmic_ray_bits: bool,
     /// Keep mmap I/O files on disk after run.
     pub keep_files: bool,
     /// Enable MVCC (Multi-Version Concurrency Control).
@@ -350,6 +352,7 @@ impl Default for WhopperOpts {
             max_steps: 100_000,
             max_drain_steps: 1_000_000,
             cosmic_ray_probability: 0.0,
+            flip_cosmic_ray_bits: true,
             keep_files: false,
             enable_mvcc: false,
             experimental_mvcc_passive_checkpoint: false,
@@ -462,6 +465,11 @@ impl WhopperOpts {
 
     pub fn with_cosmic_ray_probability(mut self, probability: f64) -> Self {
         self.cosmic_ray_probability = probability;
+        self
+    }
+
+    pub fn with_flip_cosmic_ray_bits(mut self, flip: bool) -> Self {
+        self.flip_cosmic_ray_bits = flip;
         self
     }
 
@@ -709,6 +717,7 @@ impl Whopper {
 
         let fault_config = IOFaultConfig {
             cosmic_ray_probability: opts.cosmic_ray_probability,
+            flip_cosmic_ray_bits: opts.flip_cosmic_ray_bits,
         };
 
         let io = Arc::new(SimulatorIO::new(opts.keep_files, io_rng, fault_config));
@@ -1329,6 +1338,26 @@ impl Whopper {
         Ok(())
     }
 
+    /// The cosmic-ray flips into the database, WAL or logical log file that happened before
+    /// `error`, if `error` reports detected corruption. Empty otherwise.
+    pub fn cosmic_ray_flips_explaining(&self, error: &anyhow::Error) -> Vec<CosmicRayFlip> {
+        let detected_corruption = matches!(
+            error.downcast_ref::<LimboError>(),
+            Some(LimboError::Corrupt(_))
+        ) || error.is::<IntegrityCheckFoundCorruption>();
+        if !detected_corruption {
+            return Vec::new();
+        }
+        let mut flips = self.io.cosmic_ray_flips_into(&self.db_path);
+        flips.extend(self.io.cosmic_ray_flips_into(&self.wal_path));
+        flips.extend(
+            self.io
+                .cosmic_ray_flips_into(&format!("{}-log", self.db_path)),
+        );
+        flips.sort_by_key(|flip| flip.time_micros);
+        flips
+    }
+
     /// Dump database files to simulator-output directory.
     /// The database files the simulated IO holds, keyed by suffix (`.db`,
     /// `-wal`, `-log`) so two runs can be compared without their unique
@@ -1672,7 +1701,7 @@ impl Whopper {
             self.encryption_opts.clone(),
             Arc::new(SqliteDialect),
         )
-        .map_err(|e| anyhow::anyhow!("Database open failed: {}", e))?;
+        .map_err(|e| anyhow::Error::new(e).context("Database open failed"))?;
 
         if self.disable_mvcc_auto_checkpoint {
             if let Some(mv_store) = db.get_mv_store().as_ref() {

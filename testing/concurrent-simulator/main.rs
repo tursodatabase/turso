@@ -100,6 +100,12 @@ struct Args {
     /// Stream multiprocess operation/lifecycle history as JSONL for deterministic debugging
     #[arg(long)]
     history_output: Option<PathBuf>,
+    /// Draw cosmic rays with the same random numbers, but flip no bit.
+    #[arg(long, hide = true)]
+    no_cosmic_ray_flips: bool,
+    /// Seconds the replay without cosmic-ray bit flips may run before it counts as failed.
+    #[arg(long, default_value_t = 1800)]
+    replay_timeout_secs: u64,
 }
 
 #[derive(Subcommand)]
@@ -340,8 +346,34 @@ fn run_inprocess(args: &Args, seed: u64) -> anyhow::Result<()> {
         let _ = whopper.dump_db_files();
     }
 
-    if let Some(e) = loop_err {
-        return Err(e);
+    if let Some(error) = loop_err {
+        let flips = whopper.cosmic_ray_flips_explaining(&error);
+        if flips.is_empty() {
+            return Err(error);
+        }
+        drop(whopper);
+        println!(
+            "\nDetected corruption after {} cosmic-ray bit flips into the database, WAL or \
+             logical log file: {error:#}\nReplaying seed {seed} with the same random numbers but no bit flips:",
+            flips.len()
+        );
+        let replay = run_replay_without_flips(seed, args.replay_timeout_secs)?;
+        if !replay.success() {
+            anyhow::bail!(
+                "the replay without bit flips also failed ({replay}), so the flips do not \
+                 explain the detected corruption: {error:#}"
+            );
+        }
+        println!(
+            "\nCosmic-ray rule accepted: seed {seed}, 1 detected corruption after {} bit flips \
+             into the database, WAL or logical log file, and the replay without the flips \
+             passed; the run stops here: {error:#}",
+            flips.len()
+        );
+        for flip in &flips {
+            println!("  flip: {flip}");
+        }
+        return Ok(());
     }
     prop_result?;
 
@@ -362,6 +394,32 @@ fn run_inprocess(args: &Args, seed: u64) -> anyhow::Result<()> {
     }
 
     Ok(())
+}
+
+fn run_replay_without_flips(
+    seed: u64,
+    timeout_secs: u64,
+) -> anyhow::Result<std::process::ExitStatus> {
+    let mut replay = std::process::Command::new(std::env::current_exe()?)
+        .args(std::env::args_os().skip(1))
+        .arg("--no-cosmic-ray-flips")
+        .env("SEED", seed.to_string())
+        .spawn()?;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
+    loop {
+        if let Some(status) = replay.try_wait()? {
+            return Ok(status);
+        }
+        if std::time::Instant::now() >= deadline {
+            replay.kill()?;
+            replay.wait()?;
+            anyhow::bail!(
+                "the replay of seed {seed} without bit flips did not finish within \
+                 {timeout_secs} seconds and was killed"
+            );
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
 }
 
 fn build_workloads_and_properties(args: &Args) -> BuildArtifacts {
@@ -541,7 +599,8 @@ fn build_inprocess_opts(args: &Args, seed: u64) -> anyhow::Result<WhopperOpts> {
         .with_workloads(workloads)
         .with_properties(properties)
         .with_chaotic_profiles(chaotic_profiles)
-        .with_allocation_fault_probability(args.allocation_fault_probability);
+        .with_allocation_fault_probability(args.allocation_fault_probability)
+        .with_flip_cosmic_ray_bits(!args.no_cosmic_ray_flips);
     let opts = match args.checkpoint_probe_probability {
         Some(probability) => opts.with_checkpoint_probe_probability(probability),
         None => opts,
