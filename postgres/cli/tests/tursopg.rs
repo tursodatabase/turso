@@ -1289,6 +1289,41 @@ fn wire_copy_from_returns_copy_n() {
 }
 
 #[test]
+fn repl_load_extension_still_attempts_to_open_the_file() {
+    let output = run_tursopg(b"SELECT load_extension('/nonexistent/turso-audit-ext');\n");
+    let combined = format!(
+        "{}{}",
+        stdout(&output),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        combined.contains("Extension file not found"),
+        "interactive CLI should still try to load the library: {combined}"
+    );
+    assert!(
+        !combined.contains("runtime extension loading is disabled"),
+        "interactive CLI must keep load_extension enabled: {combined}"
+    );
+}
+
+#[test]
+fn wire_load_extension_is_disabled() {
+    with_pg_client(|client| {
+        client.send_query("SELECT load_extension('/nonexistent/turso-audit-ext')");
+        let response = client.read_until_ready();
+        let text = String::from_utf8_lossy(&response);
+        assert!(
+            text.contains("runtime extension loading is disabled"),
+            "wire listener must refuse load_extension, got: {text}"
+        );
+        assert!(
+            !text.contains("Extension file not found"),
+            "wire listener must not reach the filesystem open: {text}"
+        );
+    });
+}
+
+#[test]
 fn wire_comment_on_returns_comment_tag() {
     with_pg_client(|client| {
         let tags = client.query_command_tags("CREATE TABLE docs(id INT)");
