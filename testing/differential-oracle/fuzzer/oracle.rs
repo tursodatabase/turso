@@ -514,6 +514,11 @@ pub fn check_differential(
         _ => {}
     }
 
+    let readonly_result = check_readonly_flag(turso_conn, sqlite_conn, stmt);
+    if !readonly_result.is_pass() {
+        return readonly_result;
+    }
+
     let turso_result = DifferentialOracle::execute_turso(turso_conn, &stmt.sql);
     let sqlite_result = DifferentialOracle::execute_sqlite(sqlite_conn, &stmt.sql);
 
@@ -541,6 +546,30 @@ pub fn check_differential(
     }
 
     DifferentialOracle::verify_table_snapshots(turso_conn, sqlite_conn, schema, stmt)
+}
+
+/// Compares `sqlite3_stmt_readonly` before the statement runs: the flag of
+/// statements like `CREATE TABLE IF NOT EXISTS` depends on the schema.
+fn check_readonly_flag(
+    turso_conn: &Arc<turso_core::Connection>,
+    sqlite_conn: &rusqlite::Connection,
+    stmt: &GeneratedStatement,
+) -> OracleResult {
+    let turso_readonly = turso_conn
+        .prepare(&stmt.sql)
+        .expect("Turso prepared this statement for EXPLAIN")
+        .get_program()
+        .is_readonly();
+    let sqlite_readonly = sqlite_conn
+        .prepare(&stmt.sql)
+        .expect("SQLite prepared this statement for EXPLAIN")
+        .readonly();
+    if turso_readonly == sqlite_readonly {
+        return OracleResult::Pass;
+    }
+    OracleResult::Fail(format!(
+        "Read-only flag mismatch:\n  SQL: {stmt}\n  Turso readonly: {turso_readonly}\n  SQLite readonly: {sqlite_readonly}"
+    ))
 }
 
 #[cfg(test)]
@@ -731,6 +760,37 @@ mod tests {
             }
             other => panic!("expected skipped statement, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn select_with_an_internal_temporary_table_is_read_only_in_both_engines() {
+        let io = Arc::new(MemorySimIO::new(321));
+        let turso_db = Database::open_file_with_flags(
+            io,
+            "oracle-readonly-flag.db",
+            turso_core::OpenFlags::default(),
+            turso_core::DatabaseOpts::new(),
+            None,
+            Arc::new(SqliteDialect),
+        )
+        .unwrap();
+        let turso_conn = turso_db.connect().unwrap();
+        let sqlite_conn = rusqlite::Connection::open_in_memory().unwrap();
+        let schema = SchemaBuilder::new().build();
+
+        let stmt = GeneratedStatement {
+            sql: "WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM c WHERE x < 10) \
+                  SELECT count(*) FROM c"
+                .to_string(),
+            is_ddl: false,
+            mutates_data: false,
+            has_unordered_limit: false,
+            unordered_limit_reason: None,
+            check_unnesting_invariant: false,
+        };
+
+        let result = check_differential(&turso_conn, &sqlite_conn, &schema, &stmt);
+        assert!(result.is_pass(), "expected a pass, got {result:?}");
     }
 
     #[test]
