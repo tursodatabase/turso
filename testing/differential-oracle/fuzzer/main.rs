@@ -71,9 +71,43 @@ struct Args {
 
     /// Named statement-weight mix to generate with. Each profile stresses a
     /// different part of the engine. A failing seed reproduces under the same
-    /// profile.
+    /// profile. With `--generator sql-gen-prop`, the trigger weights and the
+    /// SELECT settings of `correlated-subqueries` and `joins` do not apply,
+    /// and CREATE TABLE AS keeps its sql-gen-prop default weight. Only the
+    /// default profile is allowed with `--recursive-cte-focus`.
     #[arg(long, default_value = "balanced", value_enum)]
     profile: WeightProfile,
+
+    /// Generate materialized views and compare them with plain SQLite views
+    /// after every write. Requires `--generator sql-gen-prop`.
+    #[arg(long)]
+    matview: bool,
+
+    /// Probability that a non-DDL statement starts a BEGIN ... COMMIT batch
+    /// of generated statements. Default: 0.3 with `--matview`, else 0.
+    #[arg(long)]
+    batch_probability: Option<f64>,
+
+    /// Probability that a batch holds 50-300 statements instead of
+    /// 2..=`--max-batch-size`. Default: 0.1 with `--matview`, else 0.
+    #[arg(long)]
+    large_batch_probability: Option<f64>,
+
+    /// Largest number of statements in a normal batch.
+    #[arg(long, default_value_t = 10)]
+    max_batch_size: usize,
+
+    /// Probability that a step closes and reopens the Turso database, then
+    /// compares all tables and materialized views. Requires `--matview`, not
+    /// supported with `--mvcc`. Default: 0.02 with `--matview`.
+    #[arg(long)]
+    reopen_probability: Option<f64>,
+
+    /// Probability that an INSERT, UPDATE or DELETE that passed the check
+    /// runs again unchanged, followed by the same checks. Default: 0.1 with
+    /// `--matview`, else 0.
+    #[arg(long)]
+    redundant_dml_probability: Option<f64>,
 }
 
 #[derive(Subcommand, Debug)]
@@ -112,6 +146,12 @@ struct ConfigRecord {
     mvcc: bool,
     recursive_cte_focus: bool,
     profile: String,
+    matview: bool,
+    batch_probability: Option<f64>,
+    large_batch_probability: Option<f64>,
+    max_batch_size: usize,
+    reopen_probability: Option<f64>,
+    redundant_dml_probability: Option<f64>,
 }
 
 /// Summary written to the JSON report file.
@@ -132,6 +172,12 @@ impl ConfigRecord {
             mvcc: args.mvcc,
             recursive_cte_focus: args.recursive_cte_focus,
             profile: format!("{:?}", args.profile),
+            matview: args.matview,
+            batch_probability: args.batch_probability,
+            large_batch_probability: args.large_batch_probability,
+            max_batch_size: args.max_batch_size,
+            reopen_probability: args.reopen_probability,
+            redundant_dml_probability: args.redundant_dml_probability,
         }
     }
 }
@@ -263,6 +309,40 @@ fn run_single_inner(args: &Args) -> Result<differential_fuzzer::SimStats> {
     if args.recursive_cte_focus && !matches!(args.generator, GeneratorKind::SqlGenProp) {
         anyhow::bail!("--recursive-cte-focus requires --generator sql-gen-prop");
     }
+    if args.recursive_cte_focus && args.profile != WeightProfile::default() {
+        anyhow::bail!("--recursive-cte-focus replaces the statement weights of --profile");
+    }
+    if args.matview && !matches!(args.generator, GeneratorKind::SqlGenProp) {
+        anyhow::bail!("--matview requires --generator sql-gen-prop");
+    }
+    if args.reopen_probability.is_some_and(|p| p > 0.0) && (!args.matview || args.mvcc) {
+        anyhow::bail!("--reopen-probability requires --matview and does not support --mvcc");
+    }
+    if args.max_batch_size < 2 {
+        anyhow::bail!("--max-batch-size must be at least 2");
+    }
+    let probability = |name: &str, value: Option<f64>, matview_default: f64| {
+        let p = value.unwrap_or(if args.matview { matview_default } else { 0.0 });
+        if (0.0..=1.0).contains(&p) {
+            Ok(p)
+        } else {
+            Err(anyhow::anyhow!("--{name} must be between 0 and 1, got {p}"))
+        }
+    };
+    let batch_probability = probability("batch-probability", args.batch_probability, 0.3)?;
+    let large_batch_probability =
+        probability("large-batch-probability", args.large_batch_probability, 0.1)?;
+    let reopen_default = if args.mvcc { 0.0 } else { 0.02 };
+    let reopen_probability = probability(
+        "reopen-probability",
+        args.reopen_probability,
+        reopen_default,
+    )?;
+    let redundant_dml_probability = probability(
+        "redundant-dml-probability",
+        args.redundant_dml_probability,
+        0.1,
+    )?;
     let config = SimConfig {
         seed: args.seed,
         num_tables: args.num_tables,
@@ -281,6 +361,12 @@ fn run_single_inner(args: &Args) -> Result<differential_fuzzer::SimStats> {
         window_function_probability: args.window_function_probability.clamp(0.0, 1.0),
         recursive_cte_focus: args.recursive_cte_focus,
         weight_profile: args.profile,
+        matview: args.matview,
+        batch_probability,
+        large_batch_probability,
+        max_batch_size: args.max_batch_size,
+        reopen_probability,
+        redundant_dml_probability,
     };
 
     tracing::info!("Starting differential_fuzzer with config: {:?}", config);
