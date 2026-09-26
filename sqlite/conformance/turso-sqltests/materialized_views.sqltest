@@ -317,6 +317,23 @@ expect {
     2|75.0|2
 }
 
+# With 100 groups the aggregate state index spans more than one btree page.
+# A group whose state sits at a page boundary must still be found.
+test matview-sum-finds-group-state-across-index-pages {
+    CREATE TABLE t(g TEXT, v INTEGER);
+    CREATE MATERIALIZED VIEW mv AS SELECT g, SUM(v) AS s FROM t GROUP BY g;
+    INSERT INTO t
+    WITH RECURSIVE c(i) AS (SELECT 0 UNION ALL SELECT i + 1 FROM c WHERE i < 99)
+    SELECT 'g' || i, 1 FROM c;
+    INSERT INTO t VALUES ('g46', 1);
+    SELECT * FROM mv WHERE g = 'g46';
+    SELECT count(*), sum(s) FROM mv;
+}
+expect {
+    g46|2.0
+    100|101.0
+}
+
 test matview-empty-table-population {
     CREATE TABLE t(a INTEGER, b INTEGER);
     CREATE MATERIALIZED VIEW v AS
@@ -2507,4 +2524,23 @@ test matview-reserved-prefix-sqlite {
 }
 expect error {
     object name reserved for internal use: sqlite_matview
+}
+
+# MIN/MAX of a group is recomputed by walking the DBSP state index. With more
+# entries than fit on one leaf page, the walk has to cross the page boundaries.
+test matview-min-max-walks-over-index-page-boundaries {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, v INTEGER);
+    WITH RECURSIVE c(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM c WHERE i < 20)
+    INSERT INTO t(v) SELECT (a.i - 1) * 20 + b.i FROM c AS a, c AS b ORDER BY 1;
+    CREATE MATERIALIZED VIEW mm AS SELECT MIN(v) AS lo, MAX(v) AS hi FROM t;
+    SELECT * FROM mm;
+    DELETE FROM t WHERE v <= 200;
+    SELECT * FROM mm;
+    DELETE FROM t WHERE v > 300;
+    SELECT * FROM mm;
+}
+expect {
+    1|400
+    201|400
+    201|300
 }
