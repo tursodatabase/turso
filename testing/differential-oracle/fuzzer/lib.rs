@@ -2,6 +2,7 @@
 //! the current database schema and generates statements based on it. It uses a
 //! differential oracle to compare Turso results with SQLite.
 
+pub mod cdc;
 pub mod generate;
 pub mod memory;
 pub mod oracle;
