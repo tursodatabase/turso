@@ -18,3 +18,4 @@ mod test_non_utf8_text;
 mod test_schema_updated;
 mod test_subquery_unnesting;
 mod test_transactions;
+mod test_vtab_in;
