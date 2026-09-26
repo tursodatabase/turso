@@ -750,3 +750,78 @@ fn upsert_or_replace_do_update_unique_failure_no_index_corruption(
     );
     Ok(())
 }
+
+#[turso_macros::test(
+    views,
+    init_sql = "CREATE TABLE t(id INTEGER PRIMARY KEY, a TEXT UNIQUE);"
+)]
+fn failed_autocommit_insert_leaves_matview_unchanged(tmp_db: TempDatabase) -> anyhow::Result<()> {
+    let conn = tmp_db.connect_limbo();
+    conn.execute("INSERT INTO t VALUES (1, 'x')")?;
+    conn.execute("CREATE MATERIALIZED VIEW v AS SELECT id, a FROM t")?;
+    conn.execute("INSERT INTO t VALUES (2, 'y'), (3, 'x')")
+        .expect_err("second row must fail the UNIQUE constraint");
+    assert_eq!(
+        query_rows(&conn, "SELECT id, a FROM v ORDER BY id"),
+        vec!["1|x"]
+    );
+    conn.execute("INSERT INTO t VALUES (4, 'z')")?;
+    assert_eq!(
+        query_rows(&conn, "SELECT id, a FROM v ORDER BY id"),
+        vec!["1|x", "4|z"]
+    );
+    Ok(())
+}
+
+#[turso_macros::test(
+    views,
+    init_sql = "CREATE TABLE t(id INTEGER PRIMARY KEY, a TEXT UNIQUE);"
+)]
+fn failed_update_in_transaction_keeps_only_earlier_statements_in_matview(
+    tmp_db: TempDatabase,
+) -> anyhow::Result<()> {
+    let conn = tmp_db.connect_limbo();
+    conn.execute("INSERT INTO t VALUES (1, 'x'), (2, 'y')")?;
+    conn.execute("CREATE MATERIALIZED VIEW v AS SELECT id, a FROM t")?;
+    conn.execute("BEGIN")?;
+    conn.execute("INSERT INTO t VALUES (3, 'w')")?;
+    conn.execute("UPDATE t SET a = 'z'")
+        .expect_err("second row must fail the UNIQUE constraint");
+    let expected = vec!["1|x", "2|y", "3|w"];
+    assert_eq!(
+        query_rows(&conn, "SELECT id, a FROM v ORDER BY id"),
+        expected
+    );
+    conn.execute("COMMIT")?;
+    assert_eq!(
+        query_rows(&conn, "SELECT id, a FROM v ORDER BY id"),
+        expected
+    );
+    Ok(())
+}
+
+#[turso_macros::test(
+    views,
+    init_sql = "CREATE TABLE t(id INTEGER PRIMARY KEY, a TEXT UNIQUE);"
+)]
+fn insert_or_rollback_failure_discards_whole_transaction_from_matview(
+    tmp_db: TempDatabase,
+) -> anyhow::Result<()> {
+    let conn = tmp_db.connect_limbo();
+    conn.execute("INSERT INTO t VALUES (1, 'x')")?;
+    conn.execute("CREATE MATERIALIZED VIEW v AS SELECT id, a FROM t")?;
+    conn.execute("BEGIN")?;
+    conn.execute("INSERT INTO t VALUES (2, 'y')")?;
+    conn.execute("INSERT OR ROLLBACK INTO t VALUES (3, 'q'), (4, 'x')")
+        .expect_err("second row must fail the UNIQUE constraint");
+    assert_eq!(
+        query_rows(&conn, "SELECT id, a FROM v ORDER BY id"),
+        vec!["1|x"]
+    );
+    conn.execute("INSERT INTO t VALUES (5, 'z')")?;
+    assert_eq!(
+        query_rows(&conn, "SELECT id, a FROM v ORDER BY id"),
+        vec!["1|x", "5|z"]
+    );
+    Ok(())
+}
