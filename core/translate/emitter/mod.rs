@@ -1387,26 +1387,32 @@ pub fn prepare_cdc_if_necessary(
     program: &mut ProgramBuilder,
     schema: &Schema,
     database_id: usize,
-    changed_table_name: Option<&str>,
+    changed_table_name: &str,
 ) -> Result<Option<(usize, Arc<BTreeTable>)>> {
-    let mode = program.capture_data_changes_info();
-    let cdc_table = mode.table();
-    let Some(cdc_table) = cdc_table else {
+    let Some(cdc_table) = program.capture_data_changes_info().table() else {
         return Ok(None);
     };
     if database_id == crate::TEMP_DB_ID {
         return Ok(None);
     }
-    // Self-exclusion: never capture changes to CDC's own bookkeeping tables. `None` means the
-    // caller has no associated table (e.g. a transaction-boundary COMMIT record) and always
-    // gets the cursor.
-    if let Some(changed_table_name) = changed_table_name {
-        if changed_table_name == cdc_table
-            || changed_table_name == crate::cdc::TURSO_CDC_VERSION_TABLE_NAME
-        {
-            return Ok(None);
-        }
+    // Self-exclusion: never capture changes to CDC's own bookkeeping tables.
+    if changed_table_name == cdc_table
+        || changed_table_name == crate::cdc::TURSO_CDC_VERSION_TABLE_NAME
+    {
+        return Ok(None);
     }
+    program.begin_write_operation()?;
+    open_cdc_table_cursor(program, schema).map(Some)
+}
+
+fn open_cdc_table_cursor(
+    program: &mut ProgramBuilder,
+    schema: &Schema,
+) -> Result<(usize, Arc<BTreeTable>)> {
+    let cdc_table = program
+        .capture_data_changes_info()
+        .table()
+        .expect("CDC must be enabled to open the CDC table");
     let Some(turso_cdc_table) = schema.get_table(NamespaceId::ROOT, cdc_table) else {
         crate::bail_parse_error!("no such table: {}", cdc_table);
     };
@@ -1417,9 +1423,9 @@ pub fn prepare_cdc_if_necessary(
     program.emit_insn(Insn::OpenWrite {
         cursor_id,
         root_page: cdc_btree.root_page.into(),
-        db: crate::MAIN_DB_ID, // CDC table always lives in the main database
+        db: crate::MAIN_DB_ID,
     });
-    Ok(Some((cursor_id, cdc_btree)))
+    Ok((cursor_id, cdc_btree))
 }
 
 pub fn emit_cdc_patch_record(
@@ -2010,9 +2016,8 @@ pub fn emit_cdc_autocommit_commit(
                 flags: crate::vdbe::insn::CmpInsFlags::default(),
                 collation: None,
             });
-            let (cursor_id, _) =
-                prepare_cdc_if_necessary(program, resolver.schema(), crate::MAIN_DB_ID, None)?
-                    .expect("CDC is active, so prepare_cdc_if_necessary must return a cursor");
+            program.begin_write_operation()?;
+            let (cursor_id, _) = open_cdc_table_cursor(program, resolver.schema())?;
             cursor_id
         }
     };
@@ -2077,12 +2082,8 @@ pub fn emit_cdc_explicit_commit_insns(
         schema_cookie: schema.schema_version,
     });
 
-    // A COMMIT record has no associated table, so pass `None` (no self-exclusion check).
-    if let Some((cdc_cursor_id, _)) =
-        prepare_cdc_if_necessary(program, schema, crate::MAIN_DB_ID, None)?
-    {
-        emit_cdc_commit_insns(program, resolver, cdc_cursor_id)?;
-    }
+    let (cdc_cursor_id, _) = open_cdc_table_cursor(program, schema)?;
+    emit_cdc_commit_insns(program, resolver, cdc_cursor_id)?;
 
     program.preassign_label_to_next_insn(skip_label);
     Ok(())

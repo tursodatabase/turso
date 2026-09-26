@@ -282,12 +282,8 @@ pub fn translate_create_index(
         root_page: RegisterOrLiteral::Literal(sqlite_table.root_page),
         db: database_id,
     });
-    let cdc_table = prepare_cdc_if_necessary(
-        program,
-        resolver.schema(),
-        database_id,
-        Some(SQLITE_TABLEID),
-    )?;
+    let cdc_table =
+        prepare_cdc_if_necessary(program, resolver.schema(), database_id, SQLITE_TABLEID)?;
     emit_schema_entry(
         program,
         resolver,
@@ -1304,12 +1300,8 @@ pub fn translate_drop_index(
         }
     }
 
-    let cdc_table = prepare_cdc_if_necessary(
-        program,
-        resolver.schema(),
-        database_id,
-        Some(SQLITE_TABLEID),
-    )?;
+    let cdc_table =
+        prepare_cdc_if_necessary(program, resolver.schema(), database_id, SQLITE_TABLEID)?;
 
     // According to sqlite should emit Null instruction
     // but why?
