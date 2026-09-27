@@ -4960,6 +4960,7 @@ impl WalFile {
                     // acquire the appropriate exclusive locks depending on the checkpoint mode
                     self.acquire_proper_checkpoint_guard(mode, lock_source)?;
                     let mut max_frame = self.determine_max_safe_checkpoint_frame();
+                    let nbackfills = self.load_coordination_snapshot().nbackfills;
 
                     if let CheckpointMode::Truncate {
                         upper_bound_inclusive: Some(upper_bound),
