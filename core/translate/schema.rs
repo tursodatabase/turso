@@ -1890,9 +1890,10 @@ pub fn translate_drop_table(
     let table_name_and_root_page_register = program.alloc_register(); //  r2, this register is special because it's first used to track table name and then moved root page
     let table_reg = program.emit_string8_new_reg(normalize_ident(tbl_name.name.as_str())); //  r3
     program.mark_last_insn_constant();
-    let _table_type = program.emit_string8_new_reg("trigger".to_string()); //  r4
+    let table_type_reg = program.emit_string8_new_reg("table".to_string()); //  r4
     program.mark_last_insn_constant();
     let row_id_reg = program.alloc_register(); //  r5
+    let entry_type_reg = program.alloc_register();
 
     let schema_table = resolver.schema().get_btree_table(SQLITE_TABLEID).unwrap();
     let sqlite_schema_cursor_id_0 = program.alloc_cursor_id(
@@ -1933,21 +1934,17 @@ pub fn translate_drop_table(
         cursor_id: sqlite_schema_cursor_id_0,
         dest: row_id_reg,
     });
+    program.emit_column_or_rowid(sqlite_schema_cursor_id_0, 0, entry_type_reg);
+    let skip_table_label = program.allocate_label();
+    program.emit_insn(Insn::Ne {
+        lhs: entry_type_reg,
+        rhs: table_type_reg,
+        target_pc: skip_table_label,
+        flags: CmpInsFlags::default(),
+        collation: None,
+    });
+    program.emit_column_or_rowid(sqlite_schema_cursor_id_0, 1, table_reg);
     if let Some((cdc_cursor_id, _)) = cdc_table {
-        let table_type = program.emit_string8_new_reg("table".to_string()); // r4
-        program.mark_last_insn_constant();
-
-        let skip_cdc_label = program.allocate_label();
-
-        let entry_type_reg = program.alloc_register();
-        program.emit_column_or_rowid(sqlite_schema_cursor_id_0, 0, entry_type_reg);
-        program.emit_insn(Insn::Ne {
-            lhs: entry_type_reg,
-            rhs: table_type,
-            target_pc: skip_cdc_label,
-            flags: CmpInsFlags::default(),
-            collation: None,
-        });
         let before_record_reg = if program.capture_data_changes_info().has_before() {
             Some(emit_cdc_full_record(
                 program,
@@ -1969,8 +1966,8 @@ pub fn translate_drop_table(
             None,
             SQLITE_TABLEID,
         )?;
-        program.preassign_label_to_next_insn(skip_cdc_label);
     }
+    program.preassign_label_to_next_insn(skip_table_label);
     program.emit_insn(Insn::Delete {
         cursor_id: sqlite_schema_cursor_id_0,
         table_name: SQLITE_TABLEID.to_string(),
@@ -2337,9 +2334,6 @@ pub fn translate_drop_table(
     }) {
         let seq_cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(seq_table.clone()));
         let seq_table_name_reg = program.alloc_register();
-        let dropped_table_name_reg =
-            program.emit_string8_new_reg(normalize_ident(tbl_name.name.as_str()));
-        program.mark_last_insn_constant();
 
         program.emit_insn(Insn::OpenWrite {
             cursor_id: seq_cursor_id,
@@ -2362,10 +2356,10 @@ pub fn translate_drop_table(
         let continue_loop_label = program.allocate_label();
         program.emit_insn(Insn::Ne {
             lhs: seq_table_name_reg,
-            rhs: dropped_table_name_reg,
+            rhs: table_reg,
             target_pc: continue_loop_label,
             flags: CmpInsFlags::default(),
-            collation: Some(crate::translate::collate::CollationSeq::NoCase),
+            collation: None,
         });
 
         program.emit_insn(Insn::Delete {

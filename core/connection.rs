@@ -5561,7 +5561,8 @@ mod tests {
             sqlite
                 .execute_batch(
                     "CREATE TABLE T(id INTEGER PRIMARY KEY AUTOINCREMENT); \
-                     INSERT INTO T(id) VALUES(99)",
+                     INSERT INTO T(id) VALUES(99); \
+                     INSERT INTO sqlite_sequence(name, seq) VALUES('t', 500)",
                 )
                 .unwrap();
         }
@@ -5571,10 +5572,14 @@ mod tests {
         drop(conn);
 
         let sqlite = rusqlite::Connection::open(&path).unwrap();
-        let remaining: i64 = sqlite
-            .query_row("SELECT count(*) FROM sqlite_sequence", [], |row| row.get(0))
+        let remaining: Vec<(String, i64)> = sqlite
+            .prepare("SELECT name, seq FROM sqlite_sequence")
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
             .unwrap();
-        assert_eq!(remaining, 0);
+        assert_eq!(remaining, vec![("t".to_string(), 500)]);
         sqlite
             .execute_batch(
                 "CREATE TABLE T(id INTEGER PRIMARY KEY AUTOINCREMENT); \
