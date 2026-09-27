@@ -69,6 +69,10 @@ pub struct CheckpointResult {
     pub wal_total_backfilled: u64,
     /// amount of new frames backfilled to the DB file during this checkpoint procedure
     pub wal_checkpoint_backfilled: u64,
+    /// first frame this checkpoint copied into the DB file
+    first_backfilled_frame: u64,
+    /// WAL generation (checkpoint sequence number) of the copied frames
+    checkpoint_seq: u32,
     /// In the case of everything backfilled, we need to hold the locks until the db
     /// file is truncated.
     maybe_guard: Option<CheckpointLocks>,
@@ -96,6 +100,8 @@ impl CheckpointResult {
             wal_max_frame,
             wal_total_backfilled,
             wal_checkpoint_backfilled,
+            first_backfilled_frame: 0,
+            checkpoint_seq: 0,
             maybe_guard: None,
             db_sync_sent: false,
             db_truncate_sent: false,
@@ -762,7 +768,7 @@ pub trait Wal: Debug + Send + Sync {
         db_header_crc32c: u32,
         sync_type: FileSyncType,
     ) -> Result<Option<Completion>>;
-    fn publish_backfill(&self, max_frame: u64);
+    fn publish_backfill(&self, checkpoint_result: &CheckpointResult);
     fn sync(&self, sync_type: FileSyncType) -> Result<Completion>;
     fn is_syncing(&self) -> bool;
     /// Whether the WAL file is dirty: frames were appended that no successful
@@ -2667,6 +2673,8 @@ struct OngoingCheckpoint {
     min_frame: u64,
     /// maximum safe frame number that will be backfilled by this checkpoint operation.
     max_frame: u64,
+    /// WAL generation (checkpoint sequence number) that `min_frame` and `max_frame` belong to.
+    checkpoint_seq: u32,
     /// cursor used to iterate through all the pages that might have a frame in the safe range
     current_page: u64,
     /// State of the checkpoint
@@ -2690,6 +2698,7 @@ impl OngoingCheckpoint {
     fn reset(&mut self) {
         self.min_frame = 0;
         self.max_frame = 0;
+        self.checkpoint_seq = 0;
         self.current_page = 0;
         self.pages_to_checkpoint.clear();
         self.pending_writes.clear();
@@ -4151,8 +4160,21 @@ impl Wal for WalFile {
         )
     }
 
-    fn publish_backfill(&self, max_frame: u64) {
+    fn publish_backfill(&self, checkpoint_result: &CheckpointResult) {
+        let max_frame = checkpoint_result.wal_total_backfilled;
         let snapshot = self.load_coordination_snapshot();
+        turso_assert!(
+            snapshot.checkpoint_seq == checkpoint_result.checkpoint_seq
+                && snapshot.nbackfills + 1 == checkpoint_result.first_backfilled_frame,
+            "published backfill must continue from the frames already copied in the same WAL generation",
+            {
+                "publish_backfill": max_frame,
+                "first_backfilled_frame": checkpoint_result.first_backfilled_frame,
+                "checkpoint_seq": checkpoint_result.checkpoint_seq,
+                "current_nbackfills": snapshot.nbackfills,
+                "current_checkpoint_seq": snapshot.checkpoint_seq
+            }
+        );
         turso_assert!(
             (snapshot.nbackfills..=snapshot.max_frame).contains(&max_frame),
             "published backfill must stay within the current WAL generation",
@@ -4838,6 +4860,7 @@ impl WalFile {
                 state: CheckpointState::Start,
                 min_frame: 0,
                 max_frame: 0,
+                checkpoint_seq: 0,
                 current_page: 0,
                 pages_to_checkpoint: Vec::new(),
                 inflight_reads: Vec::with_capacity(MAX_INFLIGHT_READS),
@@ -4960,7 +4983,8 @@ impl WalFile {
                     // acquire the appropriate exclusive locks depending on the checkpoint mode
                     self.acquire_proper_checkpoint_guard(mode, lock_source)?;
                     let mut max_frame = self.determine_max_safe_checkpoint_frame();
-                    let nbackfills = self.load_coordination_snapshot().nbackfills;
+                    let locked_snapshot = self.load_coordination_snapshot();
+                    let nbackfills = locked_snapshot.nbackfills;
 
                     if let CheckpointMode::Truncate {
                         upper_bound_inclusive: Some(upper_bound),
@@ -4984,6 +5008,7 @@ impl WalFile {
                         let mut oc = self.ongoing_checkpoint.write();
                         oc.max_frame = max_frame;
                         oc.min_frame = nbackfills + 1;
+                        oc.checkpoint_seq = locked_snapshot.checkpoint_seq;
                     }
                     let (oc_min_frame, oc_max_frame) = {
                         let oc = self.ongoing_checkpoint.read();
@@ -5150,7 +5175,19 @@ impl WalFile {
                         ongoing_chkpt.complete(),
                         "checkpoint pending flush must have finished"
                     );
-                    let wal_max_frame = self.load_coordination_snapshot().max_frame;
+                    let snapshot = self.load_coordination_snapshot();
+                    turso_assert!(
+                        snapshot.checkpoint_seq == ongoing_chkpt.checkpoint_seq
+                            && snapshot.nbackfills + 1 == ongoing_chkpt.min_frame,
+                        "the WAL generation and backfill point must not change while a checkpoint holds the checkpoint lock",
+                        {
+                            "min_frame": ongoing_chkpt.min_frame,
+                            "checkpoint_seq": ongoing_chkpt.checkpoint_seq,
+                            "current_nbackfills": snapshot.nbackfills,
+                            "current_checkpoint_seq": snapshot.checkpoint_seq
+                        }
+                    );
+                    let wal_max_frame = snapshot.max_frame;
                     let wal_total_backfilled = ongoing_chkpt.max_frame;
                     // Record two num pages fields to return as checkpoint result to caller.
                     // Ref: pnLog, pnCkpt on https://www.sqlite.org/c3ref/wal_checkpoint_v2.html
@@ -5159,11 +5196,13 @@ impl WalFile {
                     let wal_checkpoint_backfilled =
                         wal_total_backfilled.saturating_sub(ongoing_chkpt.min_frame - 1);
 
-                    let checkpoint_result = CheckpointResult::new(
+                    let mut checkpoint_result = CheckpointResult::new(
                         wal_max_frame,
                         wal_total_backfilled,
                         wal_checkpoint_backfilled,
                     );
+                    checkpoint_result.first_backfilled_frame = ongoing_chkpt.min_frame;
+                    checkpoint_result.checkpoint_seq = ongoing_chkpt.checkpoint_seq;
                     tracing::debug!("checkpoint_result={:?}, mode={:?}", checkpoint_result, mode);
                     if mode.require_all_backfilled() && !checkpoint_result.everything_backfilled() {
                         return Err(LimboError::Busy.into());
@@ -11152,5 +11191,97 @@ pub mod test {
             result.everything_backfilled(),
             "checkpoint must succeed after rollback, not return Busy"
         );
+    }
+
+    #[test]
+    #[should_panic(
+        expected = "the WAL generation and backfill point must not change while a checkpoint holds the checkpoint lock"
+    )]
+    fn test_checkpoint_asserts_when_backfill_point_moves_during_copy() {
+        let (db, _dir) = open_in_process_wal_database();
+        let conn = db.connect().unwrap();
+        conn.execute("create table t(id integer primary key, value text)")
+            .unwrap();
+        conn.execute("insert into t values (1, 'a')").unwrap();
+
+        let pager = conn.pager.load();
+        let wal = pager.wal.as_ref().unwrap();
+        let mut moved_backfill_point = false;
+        loop {
+            match wal.checkpoint(&pager, CheckpointMode::Full, SyncMode::Full) {
+                Ok(IOResult::IO(io)) => {
+                    io.wait(db.io.as_ref()).unwrap();
+                    if !moved_backfill_point {
+                        let shared = db.shared_wal.read();
+                        let nbackfills = shared.metadata.nbackfills.load(Ordering::SeqCst);
+                        shared
+                            .metadata
+                            .nbackfills
+                            .store(nbackfills + 1, Ordering::SeqCst);
+                        moved_backfill_point = true;
+                    }
+                }
+                Ok(IOResult::Done(_)) => break,
+                Err(err) => panic!("checkpoint should not fail: {err:?}"),
+            }
+        }
+    }
+
+    #[test]
+    #[should_panic(
+        expected = "published backfill must continue from the frames already copied in the same WAL generation"
+    )]
+    fn test_publish_backfill_asserts_when_another_checkpoint_published_first() {
+        let (db, _dir) = open_in_process_wal_database();
+        let conn = db.connect().unwrap();
+        conn.execute("create table t(id integer primary key, value text)")
+            .unwrap();
+        conn.execute("insert into t values (1, 'a')").unwrap();
+
+        let pager = conn.pager.load();
+        let wal = pager.wal.as_ref().unwrap();
+        let mut result = run_wal_checkpoint_until_done(&db, &pager, CheckpointMode::Full);
+        assert!(result.wal_checkpoint_backfilled > 0);
+        result.release_guard();
+
+        let other = db.connect().unwrap();
+        other.execute("pragma wal_checkpoint(passive)").unwrap();
+        wal.publish_backfill(&result);
+    }
+
+    #[test]
+    fn test_publish_backfill_uses_the_range_of_its_checkpoint_after_a_reset() {
+        let (db, _dir) = open_in_process_wal_database();
+        let conn = db.connect().unwrap();
+        conn.execute("create table t(id integer primary key, value text)")
+            .unwrap();
+        conn.execute("insert into t values (1, 'a')").unwrap();
+
+        let pager = conn.pager.load();
+        let wal = pager.wal.as_ref().unwrap();
+        let result = run_wal_checkpoint_until_done(&db, &pager, CheckpointMode::Full);
+        assert!(result.wal_checkpoint_backfilled > 0);
+        wal.abort_checkpoint();
+        wal.publish_backfill(&result);
+        assert_eq!(
+            db.shared_wal
+                .read()
+                .metadata
+                .nbackfills
+                .load(Ordering::SeqCst),
+            result.wal_total_backfilled
+        );
+    }
+
+    fn open_in_process_wal_database() -> (Arc<Database>, tempfile::TempDir) {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let path = temp_dir.path().join("test.db");
+        let io: Arc<dyn IO> = Arc::new(PlatformIO::new().unwrap());
+        let db = Database::open_file(io, path.to_str().unwrap(), Arc::new(SqliteDialect)).unwrap();
+        db.connect()
+            .unwrap()
+            .execute("pragma journal_mode = 'wal'")
+            .unwrap();
+        (db, temp_dir)
     }
 }
