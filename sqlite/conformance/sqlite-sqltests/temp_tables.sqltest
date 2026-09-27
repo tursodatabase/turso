@@ -270,6 +270,16 @@ expect {
     4096
 }
 
+test pragma-temp-freelist-count-matches-sqlite {
+    CREATE TEMP TABLE t(a);
+    INSERT INTO t SELECT zeroblob(5000) FROM generate_series(1, 10);
+    DELETE FROM t;
+    PRAGMA temp.freelist_count;
+}
+expect {
+    13
+}
+
 @cross-check-integrity
 test temp-store-change-outside-transaction-resets-temp-schema {
     CREATE TEMP TABLE reset_me(v INTEGER);

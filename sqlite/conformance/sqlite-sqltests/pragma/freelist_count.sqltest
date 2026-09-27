@@ -1,0 +1,13 @@
+@database :memory:
+
+@skip-if mvcc "freelist_count doesn't work under mvcc"
+test pragma-aux-freelist-count-matches-sqlite {
+    ATTACH ':memory:' AS aux;
+    CREATE TABLE aux.t(a);
+    INSERT INTO aux.t SELECT zeroblob(5000) FROM generate_series(1, 10);
+    DELETE FROM aux.t;
+    PRAGMA aux.freelist_count;
+}
+expect {
+    13
+}
