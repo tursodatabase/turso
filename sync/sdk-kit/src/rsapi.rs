@@ -42,6 +42,10 @@ pub struct TursoDatabaseSyncConfig {
     /// and persists it in the sync metadata; `Some(true)` forces MVCC
     /// logical-log streams; `Some(false)` forces page streams.
     pub logical_mvcc_pull: Option<bool>,
+    /// CDC mode for the engine's change tape. `None` = "full" (the default);
+    /// `Some("off")` skips capture for embedders that replicate out-of-band
+    /// and only pull through the engine.
+    pub cdc_mode: Option<String>,
 }
 
 pub type PartialSyncOpts = turso_sync_engine::types::PartialSyncOpts;
@@ -131,6 +135,8 @@ impl TursoDatabaseSyncConfig {
             } else {
                 None
             },
+            // not exposed over the C ABI (yet): capture stays on there
+            cdc_mode: None,
         })
     }
 }
@@ -262,6 +268,7 @@ impl<TBytes: AsRef<[u8]> + Send + Sync + 'static> TursoDatabaseSync<TBytes> {
             reserved_bytes: sync_config.reserved_bytes.unwrap_or(0),
             db_opts,
             partial_sync_opts: sync_config.partial_sync_opts.clone(),
+            cdc_mode: sync_config.cdc_mode.clone(),
             remote_encryption_key: sync_config.remote_encryption_key.clone(),
             push_operations_threshold: sync_config.push_operations_threshold,
             pull_bytes_threshold: sync_config.pull_bytes_threshold,

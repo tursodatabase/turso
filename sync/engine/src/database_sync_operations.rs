@@ -1747,7 +1747,6 @@ pub async fn db_bootstrap<IO: SyncEngineIo, Ctx>(
     db: Arc<dyn turso_core::File>,
 ) -> Result<DbSyncInfo> {
     tracing::info!("db_bootstrap");
-    let start_time = std::time::Instant::now();
     let db_info = db_info_http(ctx).await?;
     tracing::info!("db_bootstrap: fetched db_info={db_info:?}");
     let content = db_bootstrap_http(ctx, db_info.current_generation).await?;
@@ -1784,8 +1783,7 @@ pub async fn db_bootstrap<IO: SyncEngineIo, Ctx>(
     // sync file in the end
     sync_file(ctx.coro, &db).await?;
 
-    let elapsed = std::time::Instant::now().duration_since(start_time);
-    tracing::info!("db_bootstrap: finished: bytes={pos}, elapsed={:?}", elapsed);
+    tracing::info!("db_bootstrap: finished: bytes={pos}");
 
     Ok(db_info)
 }
@@ -3594,7 +3592,7 @@ pub async fn bootstrap_db_file_legacy<IO: SyncEngineIo, Ctx>(
 ) -> Result<DatabasePullRevision> {
     tracing::info!("bootstrap_db_file(path={})", main_db_path);
 
-    let start_time = std::time::Instant::now();
+    let start_time = io.current_time_monotonic();
     // cleanup all files left from previous attempt to bootstrap
     // we shouldn't write any WAL files - but let's truncate them too for safety
     if let Some(file) = io.try_open(main_db_path)? {
@@ -3610,7 +3608,7 @@ pub async fn bootstrap_db_file_legacy<IO: SyncEngineIo, Ctx>(
     let file = io.create(main_db_path)?;
     let db_info = db_bootstrap(ctx, file).await?;
 
-    let elapsed = std::time::Instant::now().duration_since(start_time);
+    let elapsed = io.current_time_monotonic().duration_since(start_time);
     tracing::info!(
         "bootstrap_db_files(path={}): finished: elapsed={:?}",
         main_db_path,
@@ -3892,7 +3890,6 @@ pub async fn wait_proto_message<Ctx, T: prost::Message + Default>(
     network_stats: &DataStats,
     bytes: &mut BytesMut,
 ) -> Result<Option<T>> {
-    let start_time = std::time::Instant::now();
     while completion.status()?.is_none() {
         coro.yield_(SyncEngineIoResult::IO).await?;
     }
@@ -3934,10 +3931,7 @@ pub async fn wait_proto_message<Ctx, T: prost::Message + Default>(
             Error::DatabaseSyncEngineError(format!("unable to deserialize protobuf message: {e}"))
         })?;
         let _ = bytes.split_to(message_length + prefix_length);
-        tracing::trace!(
-            "wait_proto_message: elapsed={:?}",
-            std::time::Instant::now().duration_since(start_time)
-        );
+        tracing::trace!("wait_proto_message: got message");
         return Ok(Some(message));
     }
 }
@@ -5812,6 +5806,7 @@ mod tests {
             reserved_bytes: 0,
             db_opts: turso_core::DatabaseOpts::default(),
             partial_sync_opts: None,
+            cdc_mode: None,
             remote_encryption_key: None,
             push_operations_threshold: None,
             pull_bytes_threshold: None,
