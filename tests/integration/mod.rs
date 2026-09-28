@@ -16,6 +16,7 @@ mod functions;
 mod fuzz_transaction;
 mod index_method;
 mod integrity_check;
+mod issue_9391_aborted_commit_views;
 mod mvcc;
 mod pragma;
 mod query_processing;
