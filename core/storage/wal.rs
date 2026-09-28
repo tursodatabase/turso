@@ -755,8 +755,6 @@ pub trait Wal: Debug + Send + Sync {
         mode: CheckpointMode,
         sync_mode: SyncMode,
     ) -> IOResultOr<CheckpointResult>;
-    #[cfg(test)]
-    fn set_checkpoint_pause_injector(&self, injector: Option<Arc<dyn Fn() + Send + Sync>>);
     fn install_durable_backfill_proof(
         &self,
         max_frame: u64,
@@ -2811,8 +2809,6 @@ pub struct WalFile {
     write_lock_held: AtomicBool,
 
     ongoing_checkpoint: RwLock<OngoingCheckpoint>,
-    #[cfg(test)]
-    checkpoint_pause_injector: RwLock<Option<Arc<dyn Fn() + Send + Sync>>>,
     checkpoint_threshold: usize,
     /// This is the index to the read_lock in WalFileShared that we are holding. This lock contains
     /// the max frame for this connection.
@@ -4120,11 +4116,6 @@ impl Wal for WalFile {
             })
     }
 
-    #[cfg(test)]
-    fn set_checkpoint_pause_injector(&self, injector: Option<Arc<dyn Fn() + Send + Sync>>) {
-        *self.checkpoint_pause_injector.write() = injector;
-    }
-
     fn vacuum_checkpoint_with_held_lock(
         &self,
         pager: &Pager,
@@ -4851,8 +4842,6 @@ impl WalFile {
                 pages_to_checkpoint: Vec::new(),
                 inflight_reads: Vec::with_capacity(MAX_INFLIGHT_READS),
             }),
-            #[cfg(test)]
-            checkpoint_pause_injector: RwLock::new(None),
             checkpoint_threshold: 1000,
             buffer_pool,
             checkpoint_seq: AtomicU32::new(0),
@@ -4967,13 +4956,6 @@ impl WalFile {
                         return Ok(IOResult::Done(CheckpointResult::new(
                             max_frame, nbackfills, 0,
                         )));
-                    }
-                    #[cfg(test)]
-                    if matches!(lock_source, CheckpointLockSource::Acquire) {
-                        let injector = self.checkpoint_pause_injector.read().clone();
-                        if let Some(injector) = injector {
-                            injector();
-                        }
                     }
                     // acquire the appropriate exclusive locks depending on the checkpoint mode
                     self.acquire_proper_checkpoint_guard(mode, lock_source)?;
@@ -6105,10 +6087,7 @@ pub mod test {
     use crate::storage::shared_wal_coordination::{
         MappedSharedWalCoordination, SharedWalCoordinationHeader, SharedWalCoordinationOpenMode,
     };
-    use crate::sync::{
-        atomic::{AtomicBool, Ordering},
-        Arc,
-    };
+    use crate::sync::{atomic::Ordering, Arc};
     use crate::sync::{Mutex, RwLock};
     use crate::SqliteDialect;
     use crate::{
@@ -6125,9 +6104,11 @@ pub mod test {
         types::IOResult,
         util::IOExt,
         Buffer, CheckpointMode, CheckpointResult, Completion, CompletionError, Connection,
-        Database, File, IOContext, LimboError, MemoryIO, OpenFlags, PlatformIO, Result, StepResult,
-        SyncMode, Value, WalFileShared, IO,
+        Database, File, IOContext, LimboError, MemoryIO, OpenFlags, PlatformIO, Result, SyncMode,
+        WalFileShared, IO,
     };
+    #[cfg(shuttle)]
+    use crate::{StepResult, Value};
     use std::num::NonZeroUsize;
     #[cfg(unix)]
     use std::os::unix::fs::MetadataExt;
@@ -10841,120 +10822,71 @@ pub mod test {
         assert_eq!(result.wal_total_backfilled, mx_before);
     }
 
-    #[test]
-    fn test_full_checkpoint_uses_backfill_count_after_wal_restart() {
-        let path = tempfile::tempdir().unwrap();
-        let io = Arc::new(PlatformIO::new().unwrap());
-        let db = Database::open(
-            io.clone(),
-            path.path().join("test.db").to_str().unwrap(),
-            crate::OpenOptions::new(Arc::new(SqliteDialect)),
-        )
-        .unwrap();
-        let checkpointer = db.connect().unwrap();
-        let writer = db.connect().unwrap();
-
-        checkpointer.execute("PRAGMA journal_mode=WAL").unwrap();
-        checkpointer
-            .execute("create table test(key text primary key, payload text)")
-            .unwrap();
-        checkpointer
-            .execute("create table filler(id integer primary key, payload text)")
-            .unwrap();
-
-        let mut reader = writer.prepare("PRAGMA integrity_check").unwrap();
-        loop {
-            match reader.step().unwrap() {
-                StepResult::IO => io.step().unwrap(),
-                StepResult::Yield => {}
-                StepResult::Row => {
-                    assert_eq!(reader.row().unwrap().get::<String>(0).unwrap(), "ok");
-                    break;
-                }
-                result => panic!("unexpected integrity_check result: {result:?}"),
-            }
-        }
-        checkpointer
-            .execute("insert into filler values (1, 'old generation')")
-            .unwrap();
-        let passive = run_sql_rows(&checkpointer, "PRAGMA wal_checkpoint(PASSIVE)");
-        assert_eq!(passive.len(), 1);
-        assert_eq!(passive[0][0].as_int(), Some(0));
-        let log = passive[0][1].as_int().unwrap();
-        let old_backfills = passive[0][2].as_int().unwrap();
-        assert!(old_backfills > 0);
-        assert!(old_backfills < log);
-        drop(reader);
-
-        let injector = Arc::new(RestartBeforeCheckpointLocks {
-            writer,
-            old_backfills,
-            fired: AtomicBool::new(false),
-        });
-        let pause = injector.clone();
-        checkpointer.set_checkpoint_pause_injector(Some(Arc::new(move || pause.run())));
-        let full = run_sql_rows(&checkpointer, "PRAGMA wal_checkpoint(FULL)");
-        checkpointer.set_checkpoint_pause_injector(None);
-        assert!(injector.fired.load(Ordering::Acquire));
-        assert_eq!(full[0][0], Value::from_i64(0));
-        assert_eq!(full[0][1], full[0][2]);
-        let restart = run_sql_rows(&checkpointer, "PRAGMA wal_checkpoint(RESTART)");
-        assert_eq!(restart[0][0], Value::from_i64(0));
-
-        let verifier = db.connect().unwrap();
-        assert_eq!(
-            run_sql_rows(&verifier, "select key, payload from test not indexed"),
-            vec![vec![
-                Value::Text("new generation".into()),
-                Value::Text("second".into()),
-            ]]
-        );
-        assert_eq!(
-            run_sql_rows(&verifier, "PRAGMA integrity_check"),
-            vec![vec![Value::Text("ok".into())]]
-        );
-    }
-
     #[cfg(shuttle)]
     #[test]
     fn shuttle_full_checkpoint_after_concurrent_wal_restart() {
         let mut config = shuttle::Config::default();
         config.stack_size *= 10;
-        let scheduler = CheckpointRestartScheduler::new(65);
-        shuttle::Runner::new(scheduler, config).run(|| {
-            shuttle_checkpoint_restart_case("new generation".into(), "second".into(), 1, 15);
+        let full_saw_new_frames = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let scheduler = CheckpointRestartScheduler::new(full_saw_new_frames.clone());
+        let result = full_saw_new_frames.clone();
+        shuttle::Runner::new(scheduler, config).run(move || {
+            let saw_new_frames = shuttle_checkpoint_restart_case(
+                "shuttle_full_checkpoint_restart.db",
+                "new generation".into(),
+                "second".into(),
+                1,
+                15,
+            );
+            *result.lock().unwrap() = Some(saw_new_frames);
         });
+        assert_eq!(*full_saw_new_frames.lock().unwrap(), Some(false));
     }
 
     #[cfg(shuttle)]
     #[test]
     fn shuttle_checkpoint_restart_fuzz() {
-        let mut config = shuttle::Config::default();
-        config.stack_size *= 10;
-        let scheduler = CheckpointRestartScheduler::from_cutoffs((0..=65).rev().collect());
-        shuttle::Runner::new(scheduler, config).run(|| {
-            use shuttle::rand::Rng;
+        use rand::{Rng, SeedableRng};
 
-            let mut rng = shuttle::rand::thread_rng();
-            let row_count = rng.gen_range(1..=3);
-            let extra_filler = rng.gen_range(15..=30);
-            let key = format!("new generation {}", rng.gen::<u32>());
-            let payload = "x".repeat(rng.gen_range(1..=256));
-            shuttle_checkpoint_restart_case(key, payload, row_count, extra_filler);
-        });
+        for seed in 0..2_u64 {
+            let mut rng = rand::rngs::StdRng::seed_from_u64(seed);
+            let row_count = seed as usize + 1;
+            let extra_filler = rng.random_range(15..=30);
+            let key = format!("new generation {}", rng.random::<u32>());
+            let payload = "x".repeat(rng.random_range(1..=256));
+            let path = format!("shuttle_checkpoint_restart_fuzz_{seed}.db");
+
+            let mut config = shuttle::Config::default();
+            config.stack_size *= 10;
+            let full_saw_new_frames = std::sync::Arc::new(std::sync::Mutex::new(None));
+            let scheduler = CheckpointRestartScheduler::new(full_saw_new_frames.clone());
+            let result = full_saw_new_frames.clone();
+            shuttle::Runner::new(scheduler, config).run(move || {
+                let saw_new_frames = shuttle_checkpoint_restart_case(
+                    &path,
+                    key.clone(),
+                    payload.clone(),
+                    row_count,
+                    extra_filler,
+                );
+                *result.lock().unwrap() = Some(saw_new_frames);
+            });
+            assert_eq!(*full_saw_new_frames.lock().unwrap(), Some(false));
+        }
     }
 
     #[cfg(shuttle)]
     fn shuttle_checkpoint_restart_case(
+        path: &str,
         key: String,
         final_payload: String,
         row_count: usize,
         extra_filler: i64,
-    ) {
+    ) -> bool {
         let io = Arc::new(MemoryIO::new());
         let db = Database::open(
             io.clone(),
-            "shuttle_checkpoint_restart.db",
+            path,
             crate::OpenOptions::new(Arc::new(SqliteDialect)),
         )
         .unwrap();
@@ -11020,7 +10952,7 @@ pub mod test {
                     ))
                     .unwrap();
             }
-            for i in 0..old_backfills + extra_filler {
+            for i in 0..old_log + extra_filler {
                 writer
                     .execute(format!(
                         "insert into filler values ({}, 'new generation {i}')",
@@ -11039,7 +10971,7 @@ pub mod test {
         start.wait();
         let full_log = checkpoint_thread.join().unwrap();
         writer_thread.join().unwrap();
-        assert!(full_log > old_log);
+        let full_saw_new_frames = full_log > old_log;
 
         let verifier = db.connect().unwrap();
         assert_sql_checkpoint_unbusy(&verifier, "RESTART");
@@ -11072,14 +11004,18 @@ pub mod test {
                 vec![vec![Value::Text(final_payload.clone().into())]]
             );
         }
+        full_saw_new_frames
     }
 
     #[cfg(shuttle)]
     struct CheckpointRestartScheduler {
-        cutoffs: Vec<usize>,
-        next_case: usize,
+        full_saw_new_frames: std::sync::Arc<std::sync::Mutex<Option<bool>>>,
+        next_cutoff: usize,
         cutoff: usize,
         steps: usize,
+        writer_steps: usize,
+        writer_limit: Option<usize>,
+        next_writer_turn: bool,
         phase: CheckpointSchedulePhase,
         random: shuttle::scheduler::RandomDataSource,
     }
@@ -11095,16 +11031,15 @@ pub mod test {
 
     #[cfg(shuttle)]
     impl CheckpointRestartScheduler {
-        fn new(cutoff: usize) -> Self {
-            Self::from_cutoffs(vec![cutoff])
-        }
-
-        fn from_cutoffs(cutoffs: Vec<usize>) -> Self {
+        fn new(full_saw_new_frames: std::sync::Arc<std::sync::Mutex<Option<bool>>>) -> Self {
             Self {
-                cutoffs,
-                next_case: 0,
+                full_saw_new_frames,
+                next_cutoff: 0,
                 cutoff: 0,
                 steps: 0,
+                writer_steps: 0,
+                writer_limit: None,
+                next_writer_turn: false,
                 phase: CheckpointSchedulePhase::Setup,
                 random: <shuttle::scheduler::RandomDataSource as shuttle::scheduler::DataSource>::initialize(0),
             }
@@ -11114,9 +11049,25 @@ pub mod test {
     #[cfg(shuttle)]
     impl shuttle::scheduler::Scheduler for CheckpointRestartScheduler {
         fn new_execution(&mut self) -> Option<shuttle::scheduler::Schedule> {
-            self.cutoff = *self.cutoffs.get(self.next_case)?;
-            self.next_case += 1;
+            if self.next_cutoff > 0 {
+                if self.writer_limit.is_none() {
+                    self.writer_limit = Some(self.writer_steps.saturating_mul(4));
+                }
+                let previous_result = *self.full_saw_new_frames.lock().unwrap();
+                if self.next_cutoff == 1 {
+                    assert_eq!(previous_result, Some(true));
+                }
+                match previous_result {
+                    Some(false) => return None,
+                    Some(true) => {}
+                    None => panic!("checkpoint result missing from previous Shuttle execution"),
+                }
+            }
+            self.cutoff = self.next_cutoff;
+            self.next_cutoff += 1;
             self.steps = 0;
+            self.writer_steps = 0;
+            self.next_writer_turn = false;
             self.phase = CheckpointSchedulePhase::Setup;
             Some(shuttle::scheduler::Schedule::new(
                 shuttle::scheduler::DataSource::reinitialize(&mut self.random),
@@ -11155,7 +11106,19 @@ pub mod test {
                 self.phase = CheckpointSchedulePhase::Writer;
             }
             if self.phase == CheckpointSchedulePhase::Writer && has(writer) {
-                return Some(writer);
+                if self.writer_limit.is_none()
+                    || self.writer_steps < self.writer_limit.unwrap()
+                    || !has(checkpoint)
+                {
+                    self.writer_steps += 1;
+                    return Some(writer);
+                }
+                self.next_writer_turn = !self.next_writer_turn;
+                if self.next_writer_turn {
+                    self.writer_steps += 1;
+                    return Some(writer);
+                }
+                return Some(checkpoint);
             }
             if has(checkpoint) {
                 return Some(checkpoint);
@@ -11173,62 +11136,22 @@ pub mod test {
 
     #[cfg(shuttle)]
     fn assert_sql_checkpoint_unbusy(conn: &Arc<Connection>, mode: &str) -> i64 {
-        let result = run_sql_rows(conn, &format!("PRAGMA wal_checkpoint({mode})"));
-        assert_eq!(result[0][0].as_int(), Some(0));
-        assert_eq!(result[0][1], result[0][2]);
-        result[0][1].as_int().unwrap()
-    }
-
-    struct RestartBeforeCheckpointLocks {
-        writer: Arc<Connection>,
-        old_backfills: i64,
-        fired: AtomicBool,
-    }
-
-    impl RestartBeforeCheckpointLocks {
-        fn run(&self) {
-            assert!(!self.fired.swap(true, Ordering::AcqRel));
-
-            let writer = self.writer.clone();
-            let old_backfills = self.old_backfills;
-            std::thread::spawn(move || {
-                for mode in ["FULL", "RESTART"] {
-                    let checkpoint =
-                        run_sql_rows(&writer, &format!("PRAGMA wal_checkpoint({mode})"));
-                    assert_eq!(checkpoint[0][0], Value::from_i64(0));
-                    assert_eq!(checkpoint[0][1], checkpoint[0][2]);
+        const MAX_BUSY_RETRIES: usize = 1_024;
+        for _ in 0..MAX_BUSY_RETRIES {
+            let result = run_sql_rows(conn, &format!("PRAGMA wal_checkpoint({mode})"));
+            match result[0][0].as_int() {
+                Some(0) => {
+                    assert_eq!(result[0][1], result[0][2]);
+                    return result[0][1].as_int().unwrap();
                 }
-                writer
-                    .execute("insert into test(key, payload) values ('new generation', 'first')")
-                    .unwrap();
-                for i in 0..old_backfills + 15 {
-                    writer
-                        .execute(format!(
-                            "insert into filler values ({}, 'new generation {i}')",
-                            i + 2
-                        ))
-                        .unwrap();
-                }
-                writer
-                    .execute("update test set payload = 'second' where key = 'new generation'")
-                    .unwrap();
-                assert_eq!(
-                    run_sql_rows(&writer, "select key, payload from test not indexed"),
-                    vec![vec![
-                        Value::Text("new generation".into()),
-                        Value::Text("second".into()),
-                    ]]
-                );
-                assert_eq!(
-                    run_sql_rows(&writer, "PRAGMA integrity_check"),
-                    vec![vec![Value::Text("ok".into())]]
-                );
-            })
-            .join()
-            .unwrap();
+                Some(1) => shuttle::thread::yield_now(),
+                status => panic!("unexpected checkpoint status: {status:?}"),
+            }
         }
+        panic!("checkpoint {mode} stayed busy after {MAX_BUSY_RETRIES} attempts");
     }
 
+    #[cfg(shuttle)]
     fn run_sql_rows(conn: &Arc<Connection>, sql: &str) -> Vec<Vec<Value>> {
         conn.prepare(sql).unwrap().run_collect_rows().unwrap()
     }

@@ -3099,16 +3099,6 @@ impl Connection {
         }
     }
 
-    #[cfg(test)]
-    pub(crate) fn set_checkpoint_pause_injector(
-        &self,
-        injector: Option<Arc<dyn Fn() + Send + Sync>>,
-    ) {
-        if let Some(wal) = self.pager.load().wal.as_ref() {
-            wal.set_checkpoint_pause_injector(injector);
-        }
-    }
-
     #[cfg(any(test, injected_yields))]
     pub(crate) fn yield_injector(&self) -> Option<Arc<dyn YieldInjector>> {
         self.yield_injector.read().clone()
