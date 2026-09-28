@@ -3078,6 +3078,93 @@ fn test_blocking_truncate_zeros_log_when_commit_races_acquire_lock() {
     );
 }
 
+/// Regression for https://github.com/tursodatabase/turso/issues/8076.
+///
+/// With `experimental_mvcc_passive_checkpoint` enabled, an explicit TRUNCATE checkpoint
+/// collects rows without the blocking checkpoint lock and writers never take it, so another
+/// connection can commit after the checkpoint snapshot. That commit is not in the B-tree
+/// yet, so the checkpoint must keep it in the logical log instead of clearing the whole
+/// file.
+#[test]
+fn test_passive_truncate_keeps_log_frames_committed_after_snapshot() {
+    let mut db = MvccTestDbNoConn::new_with_random_db_passive();
+    let conn = db.connect();
+    conn.execute("PRAGMA mvcc_checkpoint_threshold = -1")
+        .unwrap();
+    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)")
+        .unwrap();
+    conn.execute("INSERT INTO t VALUES (1, 'collected')")
+        .unwrap();
+
+    let mvcc_store = db.get_mvcc_store();
+    let pager = conn.pager.load().clone();
+    let mut checkpoint_sm = CheckpointStateMachine::new(
+        pager.clone(),
+        mvcc_store.clone(),
+        conn.clone(),
+        true,
+        conn.get_sync_mode(),
+        crate::MAIN_DB_ID,
+        CheckpointMode::Truncate {
+            upper_bound_inclusive: None,
+        },
+    );
+
+    while checkpoint_sm.state_for_test() != CheckpointState::BeginPagerTxn {
+        match checkpoint_sm.step(&()).unwrap() {
+            TransitionResult::Io(io) => io.wait(pager.io.as_ref()).unwrap(),
+            TransitionResult::Continue => {}
+            TransitionResult::Done(_) => panic!("checkpoint finished before collecting rows"),
+        }
+    }
+
+    let sibling = db.connect();
+    sibling
+        .execute("INSERT INTO t VALUES (2, 'after-snapshot')")
+        .unwrap();
+
+    let mut finished = false;
+    for _ in 0..50_000 {
+        match checkpoint_sm.step(&()).unwrap() {
+            TransitionResult::Io(io) => io.wait(pager.io.as_ref()).unwrap(),
+            TransitionResult::Continue => {}
+            TransitionResult::Done(_) => {
+                finished = true;
+                break;
+            }
+        }
+    }
+    assert!(
+        finished,
+        "TRUNCATE checkpoint must complete after the sibling commit"
+    );
+    assert!(
+        mvcc_store.get_logical_log_file().size().unwrap() > 0,
+        "logical log must keep the commit that landed after the checkpoint snapshot"
+    );
+
+    let rows = get_rows(&sibling, "SELECT id FROM t ORDER BY id");
+    assert_eq!(rows.len(), 2, "both rows must be visible before restart");
+    assert_eq!(rows[0][0].as_int().unwrap(), 1);
+    assert_eq!(rows[1][0].as_int().unwrap(), 2);
+
+    drop(sibling);
+    drop(conn);
+    db.restart();
+    let conn = db.connect();
+    let rows = get_rows(&conn, "SELECT id, v FROM t ORDER BY id");
+    assert_eq!(
+        rows.len(),
+        2,
+        "commit that landed after the TRUNCATE snapshot must survive reopen"
+    );
+    assert_eq!(rows[0][0].as_int().unwrap(), 1);
+    assert_eq!(rows[0][1].to_string(), "collected");
+    assert_eq!(rows[1][0].as_int().unwrap(), 2);
+    assert_eq!(rows[1][1].to_string(), "after-snapshot");
+    assert_integrity_ok(&conn);
+}
+
 /// What this test checks: Checkpoint accepts sqlite_schema index-row updates for already-checkpointed indexes
 /// (e.g. column rename), without requiring create/destroy special writes.
 /// Why this matters: RENAME COLUMN on indexed tables rewrites sqlite_schema index SQL text while preserving rootpage.
