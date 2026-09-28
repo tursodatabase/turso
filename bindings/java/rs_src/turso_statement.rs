@@ -88,10 +88,15 @@ pub extern "system" fn Java_tech_turso_core_TursoStatement_step<'local>(
 
 #[no_mangle]
 pub extern "system" fn Java_tech_turso_core_TursoStatement__1close<'local>(
-    _env: JNIEnv<'local>,
-    _obj: JObject<'local>,
+    mut env: JNIEnv<'local>,
+    obj: JObject<'local>,
     stmt_ptr: jlong,
 ) {
+    if stmt_ptr == 0 {
+        let e = TursoError::InvalidConnectionPointer;
+        set_err_msg_and_throw_exception(&mut env, obj, TURSO_ETC, e.to_string());
+        return;
+    }
     TursoStatement::drop(stmt_ptr);
 }
 
