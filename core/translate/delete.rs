@@ -67,7 +67,9 @@ fn validate_delete(
             views.iter().fold(String::new(), |_, s| s.to_string() + ", "),
         );
     }
-    Ok(())
+    // Pins the closure's error type: bail_parse_error! is polymorphic over
+    // boxed and unboxed LimboError since the InsnResult migration.
+    Ok::<(), crate::LimboError>(())
     })?;
     Ok(table)
 }
@@ -215,6 +217,7 @@ pub fn prepare_delete_plan(
         expression_index_usages: Vec::new(),
         database_id,
         indexed,
+        plan_estimate: None,
     }];
     let mut table_references = TableReferences::new(joined_tables, vec![]);
 

@@ -323,7 +323,7 @@ pub fn translate_create_index(
 /// records have been collected and sorted. Statement journaling is therefore required
 /// around REINDEX callers so any later refill error restores the original index b-tree.
 #[allow(clippy::too_many_arguments)]
-fn emit_refill_index(
+pub(crate) fn emit_refill_index(
     program: &mut ProgramBuilder,
     resolver: &Resolver,
     database_id: usize,
@@ -360,6 +360,7 @@ fn emit_refill_index(
             expression_index_usages: Vec::new(),
             database_id,
             indexed: None,
+            plan_estimate: None,
         }],
         vec![],
     );
@@ -451,6 +452,7 @@ fn emit_refill_index(
             cursor_id: table_cursor_id,
             pc_if_next: loop_start_label,
             fullscan: false,
+            is_index: false,
         });
         program.preassign_label_to_next_insn(loop_end_label);
     } else {
@@ -547,6 +549,7 @@ fn emit_refill_index(
             cursor_id: table_cursor_id,
             pc_if_next: loop_start_label,
             fullscan: false,
+            is_index: false,
         });
         program.preassign_label_to_next_insn(loop_end_label);
 
@@ -704,16 +707,21 @@ fn resolve_reindex_targets(
 
     let normalized_name = normalize_ident(name.name.as_str());
     if name.db_name.is_none() {
-        if let Ok(collation) = CollationSeq::new(&normalized_name) {
-            return Ok(collect_reindex_targets_by_collation(
-                resolver, connection, collation,
-            ));
+        let collation = CollationSeq::new(&normalized_name).ok();
+        if let Some(collation) = collation {
+            let targets = collect_reindex_targets_by_collation(resolver, connection, collation);
+            if !targets.is_empty() || !matches!(collation, CollationSeq::Locale(_)) {
+                return Ok(targets);
+            }
         }
         if let Some(targets) = find_reindex_table(&normalized_name, resolver, connection) {
             return Ok(targets);
         }
         if let Some(target) = find_reindex_index(&normalized_name, resolver, connection) {
             return Ok(vec![target]);
+        }
+        if collation.is_some() {
+            return Ok(Vec::new());
         }
         bail_parse_error!("unable to identify the object to be reindexed");
     }
@@ -1194,18 +1202,9 @@ pub fn resolve_index_method_parameters(
                 },
                 ast::Literal::Null => crate::Value::Null,
                 ast::Literal::String(s) => crate::Value::Text(s.into()),
-                ast::Literal::Blob(b) => crate::Value::Blob(
-                    ast::blob_literal_hex(&b)
-                        .as_bytes()
-                        .chunks_exact(2)
-                        .map(|pair| {
-                            // We assume that sqlite3-parser has already validated that
-                            // the input is valid hex string, thus unwrap is safe.
-                            let hex_byte = std::str::from_utf8(pair).unwrap();
-                            u8::from_str_radix(hex_byte, 16).unwrap()
-                        })
-                        .try_collect()?,
-                ),
+                ast::Literal::Blob(b) => {
+                    crate::Value::Blob(ast::blob_literal_bytes(&b).try_collect()?)
+                }
                 _ => bail_parse_error!("parameters must be constant literals"),
             },
             _ => bail_parse_error!("parameters must be constant literals"),
@@ -1349,7 +1348,6 @@ pub fn translate_drop_index(
                 sqlite_table.columns(),
                 sqlite_schema_cursor_id,
                 row_id_reg,
-                sqlite_table.is_strict,
             ))
         } else {
             None
@@ -1378,6 +1376,7 @@ pub fn translate_drop_index(
         cursor_id: sqlite_schema_cursor_id,
         pc_if_next: loop_start_label,
         fullscan: false,
+        is_index: false,
     });
 
     program.preassign_label_to_next_insn(loop_end_label);

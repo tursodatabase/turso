@@ -58,6 +58,14 @@ pub const INTEGRITY_FIXTURE_OVERFLOW_LIST_LENGTH_MISMATCH_REL_PATH: &str =
     "database/integrity_overflow_list_length_mismatch.db";
 pub const INTEGRITY_FIXTURE_GENCOL_NOT_NULL_VIOLATION_REL_PATH: &str =
     "database/integrity_gencol_not_null_violation.db";
+pub const INTEGRITY_FIXTURE_STRICT_TYPE_VIOLATION_REL_PATH: &str =
+    "database/integrity_strict_type_violation.db";
+pub const INTEGRITY_FIXTURE_STRICT_GENCOL_TYPE_VIOLATION_REL_PATH: &str =
+    "database/integrity_strict_gencol_type_violation.db";
+pub const INTEGRITY_FIXTURE_STRICT_NOT_NULL_VIOLATION_REL_PATH: &str =
+    "database/integrity_strict_not_null_violation.db";
+pub const INTEGRITY_FIXTURE_STRICT_REAL_INTEGER_SERIAL_REL_PATH: &str =
+    "database/integrity_strict_real_integer_serial.db";
 
 pub const INTEGRITY_FIXTURE_RELATIVE_PATHS: &[&str] = &[
     INTEGRITY_FIXTURE_MISSING_INDEX_ENTRY_REL_PATH,
@@ -72,6 +80,10 @@ pub const INTEGRITY_FIXTURE_RELATIVE_PATHS: &[&str] = &[
     INTEGRITY_FIXTURE_FREELIST_TRUNK_CORRUPT_REL_PATH,
     INTEGRITY_FIXTURE_OVERFLOW_LIST_LENGTH_MISMATCH_REL_PATH,
     INTEGRITY_FIXTURE_GENCOL_NOT_NULL_VIOLATION_REL_PATH,
+    INTEGRITY_FIXTURE_STRICT_TYPE_VIOLATION_REL_PATH,
+    INTEGRITY_FIXTURE_STRICT_GENCOL_TYPE_VIOLATION_REL_PATH,
+    INTEGRITY_FIXTURE_STRICT_NOT_NULL_VIOLATION_REL_PATH,
+    INTEGRITY_FIXTURE_STRICT_REAL_INTEGER_SERIAL_REL_PATH,
 ];
 
 /// A fake user record
@@ -529,72 +541,6 @@ fn sqlite_payload_overflow_local_with_pointer(
     Some(local + 4)
 }
 
-fn patch_set_second_table_column_to_null_in_first_row(
-    db_path: &Path,
-    page_size: usize,
-    root_page: usize,
-) -> Result<()> {
-    let mut bytes = std::fs::read(db_path)
-        .with_context(|| format!("failed to read fixture '{}'", db_path.display()))?;
-    let page_start = (root_page - 1) * page_size;
-    anyhow::ensure!(
-        bytes.len() > page_start + 8,
-        "fixture too small to patch page {root_page}"
-    );
-
-    let cell_count = u16::from_be_bytes([bytes[page_start + 3], bytes[page_start + 4]]) as usize;
-    anyhow::ensure!(
-        cell_count >= 1,
-        "cannot patch table row on page {root_page}: no cells"
-    );
-
-    let ptr_array_start = page_start + 8;
-    let first_cell_ptr =
-        u16::from_be_bytes([bytes[ptr_array_start], bytes[ptr_array_start + 1]]) as usize;
-    let cell_start = page_start + first_cell_ptr;
-    anyhow::ensure!(
-        cell_start < bytes.len(),
-        "cell pointer out of bounds on page {root_page}"
-    );
-
-    let (_, payload_varint_len) = parse_sqlite_varint(&bytes, cell_start)?;
-    let (_, rowid_varint_len) = parse_sqlite_varint(&bytes, cell_start + payload_varint_len)?;
-    let payload_start = cell_start + payload_varint_len + rowid_varint_len;
-    anyhow::ensure!(
-        payload_start < bytes.len(),
-        "payload start out of bounds on page {root_page}"
-    );
-
-    let (header_size, header_size_varint_len) = parse_sqlite_varint(&bytes, payload_start)?;
-    let header_end = payload_start + header_size as usize;
-    anyhow::ensure!(
-        header_end <= bytes.len(),
-        "record header out of bounds on page {root_page}"
-    );
-
-    let serials_start = payload_start + header_size_varint_len;
-    let (_, first_serial_len) = parse_sqlite_varint(&bytes, serials_start)?;
-    let second_serial_offset = serials_start + first_serial_len;
-    anyhow::ensure!(
-        second_serial_offset < header_end,
-        "record does not contain a second column on page {root_page}"
-    );
-
-    // The fixture inserts an empty string, so the second serial-type is expected to be
-    // TEXT(0) = 13 encoded in one byte. Replacing it with 0 flips value to NULL without
-    // changing record payload layout.
-    anyhow::ensure!(
-        bytes[second_serial_offset] == 13,
-        "unexpected serial type {} for fixture row",
-        bytes[second_serial_offset]
-    );
-    bytes[second_serial_offset] = 0;
-
-    std::fs::write(db_path, bytes)
-        .with_context(|| format!("failed to write fixture '{}'", db_path.display()))?;
-    Ok(())
-}
-
 fn patch_set_second_table_column_i8_in_first_row(
     db_path: &Path,
     page_size: usize,
@@ -836,7 +782,16 @@ async fn generate_not_null_violation_fixture(db_path: &Path) -> Result<()> {
 
     drop(conn);
     drop(db);
-    patch_set_second_table_column_to_null_in_first_row(db_path, page_size, table_root_page)?;
+    patch_first_row_serial_type(
+        db_path,
+        page_size,
+        table_root_page,
+        FirstRowSerialTypePatch {
+            column_index: 1,
+            expected_serial_type: SERIAL_TYPE_TEXT_EMPTY,
+            new_serial_type: SERIAL_TYPE_NULL,
+        },
+    )?;
     remove_db_sidecars(db_path)?;
     Ok(())
 }
@@ -891,18 +846,194 @@ async fn generate_gencol_not_null_violation_fixture(db_path: &Path) -> Result<()
 
     drop(conn);
     drop(db);
-    patch_set_first_table_column_to_null_in_first_row(db_path, page_size, table_root_page)?;
+    patch_first_row_serial_type(
+        db_path,
+        page_size,
+        table_root_page,
+        FirstRowSerialTypePatch {
+            column_index: 0,
+            expected_serial_type: SERIAL_TYPE_INT_ZERO,
+            new_serial_type: SERIAL_TYPE_NULL,
+        },
+    )?;
     remove_db_sidecars(db_path)?;
     Ok(())
 }
 
-/// Patch the first column of the first row in the table to NULL.
-/// Expects the column to have serial type 8 (integer zero, 0 body bytes).
-fn patch_set_first_table_column_to_null_in_first_row(
+const SERIAL_TYPE_NULL: u8 = 0;
+const SERIAL_TYPE_INT8: u8 = 1;
+const SERIAL_TYPE_INT64: u8 = 6;
+const SERIAL_TYPE_FLOAT64: u8 = 7;
+const SERIAL_TYPE_INT_ZERO: u8 = 8;
+const SERIAL_TYPE_TEXT_EMPTY: u8 = 13;
+const SERIAL_TYPE_TEXT_ONE_BYTE: u8 = 15;
+
+struct FirstRowSerialTypePatch {
+    column_index: usize,
+    expected_serial_type: u8,
+    new_serial_type: u8,
+}
+
+/// Generate a fixture where a STRICT column stores a value of a type that its
+/// declared type does not accept.
+///
+/// ```text
+/// CREATE TABLE t(a ANY, b TEXT) STRICT;
+/// INSERT INTO t VALUES('x', 'A'); -- 'A' is then made the integer 65
+/// ```
+async fn generate_strict_type_violation_fixture(db_path: &Path) -> Result<()> {
+    generate_strict_fixture(
+        db_path,
+        INTEGRITY_FIXTURE_STRICT_TYPE_VIOLATION_REL_PATH,
+        r#"
+        PRAGMA page_size=4096;
+        CREATE TABLE t(a ANY, b TEXT) STRICT;
+        INSERT INTO t VALUES('x', 'A');
+        "#,
+        FirstRowSerialTypePatch {
+            column_index: 1,
+            expected_serial_type: SERIAL_TYPE_TEXT_ONE_BYTE,
+            new_serial_type: SERIAL_TYPE_INT8,
+        },
+    )
+    .await
+}
+
+/// Generate a fixture where a virtual generated STRICT column computes a value
+/// of a type that its declared type does not accept. The empty string keeps its
+/// text type when the INT affinity of the column is applied to it.
+///
+/// ```text
+/// CREATE TABLE t(a ANY, b INT AS (a) VIRTUAL) STRICT;
+/// INSERT INTO t(a) VALUES(0); -- a is then made the empty string
+/// ```
+async fn generate_strict_gencol_type_violation_fixture(db_path: &Path) -> Result<()> {
+    generate_strict_fixture(
+        db_path,
+        INTEGRITY_FIXTURE_STRICT_GENCOL_TYPE_VIOLATION_REL_PATH,
+        r#"
+        PRAGMA page_size=4096;
+        CREATE TABLE t(a ANY, b INT AS (a) VIRTUAL) STRICT;
+        INSERT INTO t(a) VALUES(0);
+        "#,
+        FirstRowSerialTypePatch {
+            column_index: 0,
+            expected_serial_type: SERIAL_TYPE_INT_ZERO,
+            new_serial_type: SERIAL_TYPE_TEXT_EMPTY,
+        },
+    )
+    .await
+}
+
+/// Generate a fixture where a NOT NULL column of a STRICT table stores NULL.
+/// NULL is a legal type for every declared type, so only the NOT NULL error
+/// must be reported.
+///
+/// ```text
+/// CREATE TABLE t(a ANY, b TEXT NOT NULL) STRICT;
+/// INSERT INTO t VALUES('x', ''); -- '' is then made NULL
+/// ```
+async fn generate_strict_not_null_violation_fixture(db_path: &Path) -> Result<()> {
+    generate_strict_fixture(
+        db_path,
+        INTEGRITY_FIXTURE_STRICT_NOT_NULL_VIOLATION_REL_PATH,
+        r#"
+        PRAGMA page_size=4096;
+        CREATE TABLE t(a ANY, b TEXT NOT NULL) STRICT;
+        INSERT INTO t VALUES('x', '');
+        "#,
+        FirstRowSerialTypePatch {
+            column_index: 1,
+            expected_serial_type: SERIAL_TYPE_TEXT_EMPTY,
+            new_serial_type: SERIAL_TYPE_NULL,
+        },
+    )
+    .await
+}
+
+/// Generate a fixture where a REAL column of a STRICT table stores a value with
+/// an integer type. SQLite writes whole reals this way, so the database is
+/// valid and the integrity check must report no error.
+///
+/// ```text
+/// CREATE TABLE t(a ANY, r REAL) STRICT;
+/// INSERT INTO t VALUES('x', 1.5); -- the float type is then made an i64
+/// ```
+async fn generate_strict_real_integer_serial_fixture(db_path: &Path) -> Result<()> {
+    generate_strict_fixture(
+        db_path,
+        INTEGRITY_FIXTURE_STRICT_REAL_INTEGER_SERIAL_REL_PATH,
+        r#"
+        PRAGMA page_size=4096;
+        CREATE TABLE t(a ANY, r REAL) STRICT;
+        INSERT INTO t VALUES('x', 1.5);
+        "#,
+        FirstRowSerialTypePatch {
+            column_index: 1,
+            expected_serial_type: SERIAL_TYPE_FLOAT64,
+            new_serial_type: SERIAL_TYPE_INT64,
+        },
+    )
+    .await
+}
+
+/// Build a STRICT table with turso, then change the type of one value in the
+/// first row. Turso does not write these types through SQL, so the fixture
+/// changes the file directly.
+async fn generate_strict_fixture(
+    db_path: &Path,
+    relative_path: &str,
+    schema_sql: &str,
+    patch: FirstRowSerialTypePatch,
+) -> Result<()> {
+    clear_existing_db_and_sidecars(db_path)?;
+
+    let db_path_str = db_path.to_string_lossy().to_string();
+    let db = Builder::new_local(&db_path_str)
+        .experimental_generated_columns(true)
+        .build()
+        .await
+        .with_context(|| {
+            format!(
+                "failed to create integrity fixture database at '{}'",
+                db_path.display()
+            )
+        })?;
+    let conn = db
+        .connect()
+        .with_context(|| format!("failed to connect to fixture '{}'", db_path.display()))?;
+
+    conn.execute_batch(schema_sql)
+        .await
+        .with_context(|| format!("failed to initialize fixture '{relative_path}'"))?;
+    checkpoint_truncate(&conn, relative_path).await?;
+    let page_size = get_page_size(&conn, relative_path).await?;
+    let table_root_page = get_root_page(&conn, "t", relative_path).await?;
+
+    drop(conn);
+    drop(db);
+    patch_first_row_serial_type(db_path, page_size, table_root_page, patch)?;
+    remove_db_sidecars(db_path)?;
+    Ok(())
+}
+
+/// Replace the serial type of one column in the first row of a table page. Both
+/// serial types must store the same number of bytes, so that the rest of the
+/// record keeps its place.
+fn patch_first_row_serial_type(
     db_path: &Path,
     page_size: usize,
     root_page: usize,
+    patch: FirstRowSerialTypePatch,
 ) -> Result<()> {
+    anyhow::ensure!(
+        sqlite_serial_type_payload_len(u64::from(patch.expected_serial_type))
+            == sqlite_serial_type_payload_len(u64::from(patch.new_serial_type)),
+        "serial types {} and {} do not store the same number of bytes",
+        patch.expected_serial_type,
+        patch.new_serial_type
+    );
+
     let mut bytes = std::fs::read(db_path)
         .with_context(|| format!("failed to read fixture '{}'", db_path.display()))?;
     let page_start = (root_page - 1) * page_size;
@@ -934,17 +1065,31 @@ fn patch_set_first_table_column_to_null_in_first_row(
         "payload start out of bounds on page {root_page}"
     );
 
-    let (_, header_size_varint_len) = parse_sqlite_varint(&bytes, payload_start)?;
-    let first_serial_offset = payload_start + header_size_varint_len;
-
-    // a=0 has serial type 8 (integer zero, 0 body bytes).
-    // Replacing with 0 (NULL, also 0 body bytes) is a clean swap.
+    let (header_size, header_size_varint_len) = parse_sqlite_varint(&bytes, payload_start)?;
+    let header_end = payload_start + header_size as usize;
     anyhow::ensure!(
-        bytes[first_serial_offset] == 8,
-        "unexpected serial type {} for fixture row (expected 8 = integer zero)",
-        bytes[first_serial_offset]
+        header_end <= bytes.len(),
+        "record header out of bounds on page {root_page}"
     );
-    bytes[first_serial_offset] = 0;
+
+    let mut serial_offset = payload_start + header_size_varint_len;
+    for _ in 0..patch.column_index {
+        let (_, serial_len) = parse_sqlite_varint(&bytes, serial_offset)?;
+        serial_offset += serial_len;
+    }
+    anyhow::ensure!(
+        serial_offset < header_end,
+        "record has no column {} on page {root_page}",
+        patch.column_index
+    );
+    anyhow::ensure!(
+        bytes[serial_offset] == patch.expected_serial_type,
+        "unexpected serial type {} for column {} of the fixture row, expected {}",
+        bytes[serial_offset],
+        patch.column_index,
+        patch.expected_serial_type
+    );
+    bytes[serial_offset] = patch.new_serial_type;
 
     std::fs::write(db_path, bytes)
         .with_context(|| format!("failed to write fixture '{}'", db_path.display()))?;
@@ -1262,6 +1407,18 @@ pub async fn generate_integrity_fixture(db_path: &Path, relative_path: &str) -> 
         }
         INTEGRITY_FIXTURE_GENCOL_NOT_NULL_VIOLATION_REL_PATH => {
             generate_gencol_not_null_violation_fixture(db_path).await
+        }
+        INTEGRITY_FIXTURE_STRICT_TYPE_VIOLATION_REL_PATH => {
+            generate_strict_type_violation_fixture(db_path).await
+        }
+        INTEGRITY_FIXTURE_STRICT_GENCOL_TYPE_VIOLATION_REL_PATH => {
+            generate_strict_gencol_type_violation_fixture(db_path).await
+        }
+        INTEGRITY_FIXTURE_STRICT_NOT_NULL_VIOLATION_REL_PATH => {
+            generate_strict_not_null_violation_fixture(db_path).await
+        }
+        INTEGRITY_FIXTURE_STRICT_REAL_INTEGER_SERIAL_REL_PATH => {
+            generate_strict_real_integer_serial_fixture(db_path).await
         }
         _ => anyhow::bail!("unknown integrity fixture path '{relative_path}'"),
     }

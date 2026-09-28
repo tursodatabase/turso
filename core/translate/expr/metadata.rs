@@ -277,6 +277,13 @@ pub(super) fn try_emit_expression_index_value(
         return Ok(false);
     };
     let normalized = normalize_expr_for_index_matching(expr, table_reference, referenced_tables);
+    if !table_reference
+        .expression_index_usages
+        .iter()
+        .any(|usage| exprs_are_equivalent(&usage.normalized_expr, &normalized))
+    {
+        return Ok(false);
+    }
     let Some(expr_pos) = index.expression_to_index_pos(&normalized) else {
         return Ok(false);
     };

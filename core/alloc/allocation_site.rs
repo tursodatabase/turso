@@ -9,6 +9,19 @@ pub enum AllocationSite {
     ValueBlob(ValueBlobAllocationSite),
     Vector(VectorAllocationSite),
     NoFaultInjection,
+    Fts(FtsAllocationSite),
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum FtsAllocationSite {
+    CaptureBuffer,
+    AtomicMetadata,
+}
+
+impl From<FtsAllocationSite> for AllocationSite {
+    fn from(site: FtsAllocationSite) -> Self {
+        Self::Fts(site)
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]

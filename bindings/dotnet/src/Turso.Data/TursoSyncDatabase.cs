@@ -182,6 +182,60 @@ public sealed class TursoSyncDatabase : IDisposable, IAsyncDisposable
         }
     }
 
+    public void Push()
+        => RunSynchronously(() => PushAsync(CancellationToken.None));
+
+    public Task PushAsync(CancellationToken cancellationToken = default)
+        => RunVoidOperationAsync(
+            TursoSyncBindings.StartPush,
+            TursoSyncOperationKind.Push,
+            cancellationToken);
+
+    public void Checkpoint()
+        => RunSynchronously(() => CheckpointAsync(CancellationToken.None));
+
+    public Task CheckpointAsync(CancellationToken cancellationToken = default)
+        => RunVoidOperationAsync(
+            TursoSyncBindings.StartCheckpoint,
+            TursoSyncOperationKind.Checkpoint,
+            cancellationToken);
+
+    public TursoSyncStats GetStats()
+        => RunSynchronously(() => GetStatsAsync(CancellationToken.None));
+
+    public async Task<TursoSyncStats> GetStatsAsync(CancellationToken cancellationToken = default)
+    {
+        ThrowIfDisposed();
+        await _operationLock.WaitAsync(cancellationToken).ConfigureAwait(false);
+        try
+        {
+            ThrowIfDisposed();
+            using var operation = StartOperation(
+                TursoSyncBindings.StartStats,
+                TursoSyncOperationKind.Stats);
+            await DriveOperationAsync(
+                    operation,
+                    TursoSyncOperationKind.Stats,
+                    cancellationToken)
+                .ConfigureAwait(false);
+            EnsureResultKind(operation, TursoSyncOperationResultKind.Stats);
+            var stats = TursoSyncBindings.ExtractStats(operation);
+            return new TursoSyncStats(
+                stats.CdcOperations,
+                stats.MainWalSize,
+                stats.RevertWalSize,
+                ToTimestamp(stats.LastPullUnixTime),
+                ToTimestamp(stats.LastPushUnixTime),
+                stats.NetworkSentBytes,
+                stats.NetworkReceivedBytes,
+                stats.Revision);
+        }
+        finally
+        {
+            _operationLock.Release();
+        }
+    }
+
     public void Dispose()
     {
         ThrowIfIoReentrant();
@@ -211,6 +265,14 @@ public sealed class TursoSyncDatabase : IDisposable, IAsyncDisposable
         ThrowIfIoReentrant();
         ObjectDisposedException.ThrowIf(Volatile.Read(ref _resourcesDisposed) != 0, this);
         _operationLock.Wait();
+        return new ConnectionOperationLease(_operationLock);
+    }
+
+    internal async ValueTask<IDisposable> EnterConnectionOperationAsync(CancellationToken cancellationToken)
+    {
+        ThrowIfIoReentrant();
+        ObjectDisposedException.ThrowIf(Volatile.Read(ref _resourcesDisposed) != 0, this);
+        await _operationLock.WaitAsync(cancellationToken).ConfigureAwait(false);
         return new ConnectionOperationLease(_operationLock);
     }
 
@@ -737,10 +799,12 @@ public sealed class TursoSyncDatabase : IDisposable, IAsyncDisposable
         return new Uri(baseText + "/" + path.TrimStart('/'), UriKind.Absolute);
     }
 
-    private static TursoSyncDatabaseConfiguration CreateNativeConfiguration(
+    internal static TursoSyncDatabaseConfiguration CreateNativeConfiguration(
         TursoSyncDatabaseOptions options,
         Uri remoteUri)
     {
+        var partial = options.PartialSync;
+        var encryption = options.RemoteEncryption;
         return new TursoSyncDatabaseConfiguration
         {
             Path = options.Path,
@@ -750,6 +814,21 @@ public sealed class TursoSyncDatabase : IDisposable, IAsyncDisposable
                 ? 0
                 : checked((int)options.LongPollTimeout.Value.TotalMilliseconds),
             BootstrapIfEmpty = options.BootstrapIfEmpty,
+            ReservedBytes = encryption?.ReservedBytes ?? 0,
+            PartialBootstrapStrategyPrefix = partial?.PrefixLength ?? 0,
+            PartialBootstrapStrategyQuery = partial?.Query,
+            PartialBootstrapSegmentSize = partial?.SegmentSize is null ? 0 : (nuint)partial.SegmentSize.Value,
+            PartialBootstrapPrefetch = partial?.Prefetch ?? false,
+            RemoteEncryptionKey = encryption?.Key,
+            RemoteEncryptionCipher = encryption?.NativeName,
+            PushOperationsThreshold = options.PushOperationsThreshold is null
+                ? 0
+                : (nuint)options.PushOperationsThreshold.Value,
+            PullBytesThreshold = options.PullBytesThreshold is null
+                ? 0
+                : (nuint)options.PullBytesThreshold.Value,
+            LogicalMvccPull = options.ForceLogicalMvccPull,
+            ExperimentalFeatures = options.ExperimentalFeatures,
         };
     }
 
@@ -761,6 +840,9 @@ public sealed class TursoSyncDatabase : IDisposable, IAsyncDisposable
         if (actual != expected)
             throw new InvalidOperationException($"Expected Turso sync result {expected}, got {actual}.");
     }
+
+    private static DateTimeOffset? ToTimestamp(long value)
+        => value <= 0 ? null : DateTimeOffset.FromUnixTimeSeconds(value);
 
     private TursoSyncException CreateSyncException(
         TursoSyncOperationKind operation,

@@ -1,6 +1,0 @@
-#!/bin/bash
-
-for i in {0..99}
-do
-  ./gen-database.py "database$i.db" --count 10000
-done

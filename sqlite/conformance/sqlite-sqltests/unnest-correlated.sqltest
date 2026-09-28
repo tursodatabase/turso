@@ -28,6 +28,73 @@ setup correlated_rows {
     INSERT INTO outer_key2 VALUES (1, 10), (3, 20), (5, 40);
 }
 
+setup correlated_in_indexes {
+    CREATE INDEX inner_amount ON inner_rows(amount);
+    CREATE INDEX inner_key_amount ON inner_rows(key1, amount);
+    CREATE INDEX inner_text_nocase ON inner_rows(text_key COLLATE NOCASE);
+}
+
+setup correlated_comparison_many_rows {
+    CREATE TABLE many_outer(id INTEGER PRIMARY KEY, k INTEGER, v, text_key TEXT COLLATE NOCASE);
+    CREATE TABLE many_inner(k INTEGER, v, text_key TEXT COLLATE BINARY);
+    WITH RECURSIVE numbers(n) AS (
+        VALUES(1) UNION ALL SELECT n + 1 FROM numbers WHERE n < 45
+    )
+    INSERT INTO many_outer
+    SELECT n,
+           CASE WHEN n % 7 = 0 THEN NULL ELSE n % 5 END,
+           CASE WHEN n % 9 = 0 THEN NULL
+                WHEN n % 15 = 0 THEN x'0102'
+                WHEN n % 13 = 0 THEN CAST(n % 17 AS REAL)
+                WHEN n % 3 = 0 THEN CAST(n % 17 AS TEXT)
+                ELSE n % 17 END,
+           CASE WHEN n % 11 = 0 THEN NULL ELSE char(65 + n % 5) END
+    FROM numbers;
+    WITH RECURSIVE numbers(n) AS (
+        VALUES(1) UNION ALL SELECT n + 1 FROM numbers WHERE n < 50
+    )
+    INSERT INTO many_inner
+    SELECT CASE WHEN n % 8 = 0 THEN NULL ELSE n % 5 END,
+           CASE WHEN n % 10 = 0 THEN NULL
+                WHEN n % 15 = 0 THEN x'0102'
+                WHEN n % 13 = 0 THEN CAST(n % 17 AS REAL)
+                WHEN n % 4 = 0 THEN CAST(n % 17 AS TEXT)
+                ELSE n % 17 END,
+           CASE WHEN n % 12 = 0 THEN NULL ELSE char(65 + n % 5) END
+    FROM numbers;
+    CREATE INDEX many_inner_k_v ON many_inner(k, v);
+    CREATE INDEX many_inner_v ON many_inner(v);
+    ANALYZE;
+}
+
+setup selective_join_plan_rows {
+    CREATE TABLE plan_outer(
+        id INTEGER PRIMARY KEY,
+        k INTEGER,
+        lim INTEGER,
+        max_sum INTEGER,
+        text_key TEXT
+    );
+    CREATE TABLE plan_inner(k INTEGER, x INTEGER, v TEXT, text_key TEXT);
+    CREATE TABLE plan_list(k INTEGER);
+    WITH RECURSIVE rows(value) AS (
+        VALUES(1)
+        UNION ALL
+        SELECT value + 1 FROM rows WHERE value < 100
+    )
+    INSERT INTO plan_outer
+    SELECT value, value, value, value, value FROM rows;
+    WITH RECURSIVE rows(value) AS (
+        VALUES(1)
+        UNION ALL
+        SELECT value + 1 FROM rows WHERE value < 110
+    )
+    INSERT INTO plan_inner
+    SELECT value, value, json_object('n', value), value FROM rows;
+    INSERT INTO plan_list SELECT k FROM plan_outer;
+    ANALYZE;
+}
+
 # A table function uses hidden columns to hold its arguments. Those checks
 # must stay inside the correlated subquery.
 test one-value-table-function-keeps-arguments {
@@ -262,20 +329,20 @@ expect pattern {
 
 # A direct comparison can join the requested rows before building each string.
 # This avoids both the correlated scan and strings for unused inner keys.
-@setup correlated_rows
+@setup selective_join_plan_rows
 @skip-if sqlite "SQLite keeps this group_concat as a correlated subquery"
 test one-value-group-concat-joins-before-grouping {
     EXPLAIN QUERY PLAN
     SELECT o.id
-    FROM outer_rows o
+    FROM plan_outer o
     WHERE o.text_key = (
         SELECT group_concat(i.text_key, ':')
-        FROM inner_rows i
-        WHERE i.key1 = o.key1
+        FROM plan_inner i
+        WHERE i.k = o.k AND i.x = 1
     );
 }
 expect pattern {
-    (?s)JOIN inner_rows AS i.*SCAN outer_rows AS o.*USE SORTER FOR GROUP BY
+    (?s)JOIN plan_inner AS i.*USE SORTER FOR GROUP BY
 }
 
 # The joined form keeps a separate string for each outer row. A key with no
@@ -397,6 +464,32 @@ expect {
     6
     4
     5
+}
+
+# An outer query with no input rows does not need to build or probe a grouped
+# table for its scalar subquery.
+@setup correlated_rows
+test one-value-under-false-where-stays-unused {
+    SELECT (SELECT avg(i.amount) FROM inner_rows i WHERE i.key1 = o.key1) / 2
+    FROM outer_rows o
+    WHERE 0;
+}
+expect {
+}
+
+# Unnesting the IN subquery moves its WHERE clause to the outer query, and the
+# text term there is always false. The grouped table built for the scalar
+# subquery then has nothing to read, so the outer query keeps its correlated
+# form.
+@setup correlated_rows
+test one-value-beside-in-subquery-with-false-text-term {
+    SELECT (SELECT count(i.amount) FROM inner_rows i WHERE i.key1 = o.key1)
+    FROM outer_rows o
+    WHERE o.amount IN (
+        SELECT k.key2 FROM outer_key2 k WHERE 'not a number' AND o.key1 = k.key2
+    );
+}
+expect {
 }
 
 @setup correlated_rows
@@ -555,6 +648,170 @@ test correlated-in-with-outer-aggregate {
 }
 expect {
     2
+}
+
+@setup correlated_rows
+@setup correlated_in_indexes
+@var left_value { o.amount | o.key1 | 10 | NULL }
+@var comparison {
+    i.amount = o.amount | o.amount = i.amount
+    | i.amount <> o.amount | o.amount <> i.amount
+    | i.amount < o.amount | o.amount < i.amount
+    | i.amount <= o.amount | o.amount <= i.amount
+    | i.amount > o.amount | o.amount > i.amount
+    | i.amount >= o.amount | o.amount >= i.amount
+    | i.amount IS o.amount | o.amount IS i.amount
+    | i.amount IS NOT o.amount | o.amount IS NOT i.amount
+}
+@var link { i.key1 = o.key1 | i.key1 IS o.key1 | i.key1 < o.key1 }
+matrix correlated-in-comparison-results {
+    SELECT o.id
+    FROM outer_rows AS o
+    WHERE $left_value IN (
+        SELECT i.amount FROM inner_rows AS i
+        WHERE $comparison AND $link
+    )
+    ORDER BY o.id;
+}
+
+@setup correlated_comparison_many_rows
+@var left_value { o.v | 5 | NULL }
+@var comparison {
+    i.v < o.v | o.v < i.v
+    | i.v <= o.v | o.v <= i.v
+    | i.v <> o.v | o.v <> i.v
+    | i.v IS o.v | i.v IS NOT o.v
+}
+@var link { i.k = o.k | i.k IS o.k | i.k < o.k }
+matrix correlated-in-comparison-many-rows {
+    SELECT o.id
+    FROM many_outer AS o
+    WHERE $left_value IN (
+        SELECT i.v FROM many_inner AS i WHERE $comparison AND $link
+    )
+    ORDER BY o.id;
+}
+
+@setup correlated_comparison_many_rows
+@var polarity { EXISTS | NOT EXISTS }
+@var comparison {
+    i.v < o.v | o.v < i.v
+    | i.v <= o.v | o.v <= i.v
+    | i.v <> o.v | o.v <> i.v
+    | i.v IS o.v | i.v IS NOT o.v
+}
+@var link { i.k = o.k | i.k IS o.k | i.k < o.k }
+matrix correlated-exists-comparison-many-rows {
+    SELECT o.id
+    FROM many_outer AS o
+    WHERE $polarity (
+        SELECT 1 FROM many_inner AS i WHERE $comparison AND $link
+    )
+    ORDER BY o.id;
+}
+
+@setup correlated_rows
+@setup correlated_in_indexes
+@var left_value { o.amount | 10 | NULL }
+@var comparison {
+    i.key1 < o.key1 | o.key1 < i.key1
+    | i.key1 <= o.key1 | o.key1 <= i.key1
+    | i.key1 <> o.key1 | o.key1 <> i.key1
+    | i.key1 IS o.key1 | i.key1 IS NOT o.key1
+}
+matrix correlated-in-with-only-one-comparison {
+    SELECT o.id
+    FROM outer_rows AS o
+    WHERE $left_value IN (
+        SELECT i.amount FROM inner_rows AS i WHERE $comparison
+    )
+    ORDER BY o.id;
+}
+
+@setup correlated_rows
+@setup correlated_in_indexes
+@var comparison {
+    i.text_key < o.text_key COLLATE NOCASE
+    | o.text_key COLLATE NOCASE < i.text_key
+    | i.text_key IS NOT o.text_key COLLATE NOCASE
+}
+matrix correlated-in-keeps-text-collation {
+    SELECT o.id
+    FROM outer_rows AS o
+    WHERE o.text_key COLLATE NOCASE IN (
+        SELECT i.text_key FROM inner_rows AS i WHERE $comparison
+    )
+    ORDER BY o.id;
+}
+
+@setup correlated_rows
+@var join_type { LEFT | RIGHT }
+@var comparison { i.amount < k.key2 | k.key2 < i.amount | i.amount IS NOT k.key2 }
+matrix correlated-in-after-outer-join {
+    SELECT o.id, k.id
+    FROM outer_rows AS o $join_type JOIN outer_key2 AS k ON o.id = k.id
+    WHERE k.key2 IN (
+        SELECT i.amount FROM inner_rows AS i WHERE $comparison
+    )
+    ORDER BY o.id, k.id;
+}
+
+@setup correlated_rows
+@var comparison { s.amount < i.amount | i.amount < s.amount | s.amount IS NOT i.amount }
+matrix correlated-in-after-full-join {
+    SELECT o.id, k.id, i.key1, i.amount
+    FROM outer_rows AS o
+    JOIN outer_key2 AS k ON o.id = k.id
+    FULL JOIN inner_rows AS i ON k.key2 = i.key2
+    WHERE i.amount IN (
+        SELECT s.amount FROM outer_rows AS s WHERE $comparison
+    )
+    ORDER BY o.id, k.id, i.key1, i.amount;
+}
+
+@setup correlated_rows
+@var operator { IN | NOT IN }
+@var comparison { i.amount < o.amount | o.amount < i.amount | i.amount IS NOT o.amount }
+@var or_term { | OR o.id = 4 }
+matrix correlated-in-with-not-in-and-or {
+    SELECT o.id
+    FROM outer_rows AS o
+    WHERE o.amount $operator (
+        SELECT i.amount FROM inner_rows AS i WHERE $comparison
+    ) $or_term
+    ORDER BY o.id;
+}
+
+@setup correlated_rows
+@setup correlated_in_indexes
+@skip-if sqlite "query plan explanation output is different in sqlite"
+test correlated-in-inequality-uses-indexed-semi-join {
+    EXPLAIN QUERY PLAN
+    SELECT o.id
+    FROM outer_rows AS o
+    WHERE o.amount IN (
+        SELECT i.amount FROM inner_rows AS i
+        WHERE i.key1 = o.key1 AND i.amount < o.amount
+    );
+}
+expect pattern {
+    (?s)SCAN outer_rows AS o.*SEARCH i USING COVERING INDEX inner_key_amount
+}
+
+@setup correlated_rows
+@setup correlated_in_indexes
+@skip-if sqlite "query plan explanation output is different in sqlite"
+test correlated-in-with-only-inequality-uses-indexed-semi-join {
+    EXPLAIN QUERY PLAN
+    SELECT o.id
+    FROM outer_rows AS o
+    WHERE o.amount IN (
+        SELECT i.amount FROM inner_rows AS i INDEXED BY inner_key_amount
+        WHERE i.key1 < o.key1
+    );
+}
+expect pattern {
+    (?s)SCAN outer_rows AS o.*SEARCH i USING COVERING INDEX inner_key_amount \(key1<\?\)
 }
 
 @setup correlated_rows
@@ -830,21 +1087,19 @@ expect {
 # A sum can join the requested inner rows before grouping. This avoids one
 # subquery call per outer row without adding values for unused inner keys.
 @skip-if sqlite "SQLite keeps this sum as a correlated subquery"
+@setup selective_join_plan_rows
 test one-value-sum-joins-before-grouping {
-    CREATE TABLE sum_join_outer(id INTEGER PRIMARY KEY, k INTEGER, max_sum INTEGER);
-    CREATE TABLE sum_join_inner(k INTEGER, x INTEGER);
-
     EXPLAIN QUERY PLAN
     SELECT o.id
-    FROM sum_join_outer o
+    FROM plan_outer o
     WHERE o.max_sum > (
         SELECT sum(i.x)
-        FROM sum_join_inner i
-        WHERE i.k = o.k
+        FROM plan_inner i
+        WHERE i.k = o.k AND i.x = 1
     );
 }
 expect pattern {
-    (?s)HASH JOIN sum_join_inner AS i.*SCAN sum_join_outer AS o.*USE SORTER FOR GROUP BY
+    (?s)JOIN plan_inner AS i.*USE SORTER FOR GROUP BY
 }
 
 # Each outer row keeps its own sum. A missing match gives NULL. The values for
@@ -1000,42 +1255,37 @@ expect pattern {
 # result is the same for every joined copy, so it does not block the joined
 # form. TPC-H q20 has this shape.
 @skip-if sqlite "SQLite keeps this sum as a correlated subquery"
+@setup selective_join_plan_rows
 test one-value-sum-join-allows-uncorrelated-subquery-term {
-    CREATE TABLE in_term_outer(id INTEGER PRIMARY KEY, k INTEGER, lim INTEGER);
-    CREATE TABLE in_term_inner(k INTEGER, x INTEGER);
-    CREATE TABLE in_term_list(k INTEGER);
-
     EXPLAIN QUERY PLAN
     SELECT o.id
-    FROM in_term_outer o
-    WHERE o.k IN (SELECT k FROM in_term_list)
+    FROM plan_outer o
+    WHERE o.k IN (SELECT k FROM plan_list)
       AND o.lim > (
           SELECT sum(i.x)
-          FROM in_term_inner i
-          WHERE i.k = o.k
+          FROM plan_inner i
+          WHERE i.k = o.k AND i.x = 1
       );
 }
 expect pattern {
-    (?s)JOIN in_term_inner AS i.*USE SORTER FOR GROUP BY
+    (?s)JOIN plan_inner AS i.*USE SORTER FOR GROUP BY
 }
 
 # The subquery can be either side of the comparison.
 @skip-if sqlite "SQLite keeps this sum as a correlated subquery"
+@setup selective_join_plan_rows
 test one-value-sum-join-subquery-on-left-side {
-    CREATE TABLE left_side_outer(id INTEGER PRIMARY KEY, k INTEGER, lim INTEGER);
-    CREATE TABLE left_side_inner(k INTEGER, x INTEGER);
-
     EXPLAIN QUERY PLAN
     SELECT o.id
-    FROM left_side_outer o
+    FROM plan_outer o
     WHERE (
         SELECT sum(i.x)
-        FROM left_side_inner i
-        WHERE i.k = o.k
+        FROM plan_inner i
+        WHERE i.k = o.k AND i.x = 1
     ) > o.lim;
 }
 expect pattern {
-    (?s)JOIN left_side_inner AS i.*USE SORTER FOR GROUP BY
+    (?s)JOIN plan_inner AS i.*USE SORTER FOR GROUP BY
 }
 
 # key 1: 20 > 15. key 2: 10 > 5. key 3: no rows, sum is NULL, not returned.
@@ -1239,21 +1489,19 @@ expect {
 }
 
 @skip-if sqlite "Turso uses a different plan for this query"
+@setup selective_join_plan_rows
 test one-value-json-sum-uses-joined-form {
-    CREATE TABLE json_sum_plan_outer(id INTEGER PRIMARY KEY, k INTEGER, max_sum INTEGER);
-    CREATE TABLE json_sum_plan_inner(k INTEGER, v TEXT);
-
     EXPLAIN QUERY PLAN
     SELECT o.id
-    FROM json_sum_plan_outer o
+    FROM plan_outer o
     WHERE o.max_sum > (
         SELECT sum(json_extract(i.v, '$.n'))
-        FROM json_sum_plan_inner i
-        WHERE i.k = o.k
+        FROM plan_inner i
+        WHERE i.k = o.k AND i.x = 1
     );
 }
 expect pattern {
-    (?s)JOIN json_sum_plan_inner AS i.*SCAN json_sum_plan_outer AS o.*USE SORTER FOR GROUP BY
+    (?s)JOIN plan_inner AS i.*USE SORTER FOR GROUP BY
 }
 
 # json_extract runs before max. A grouped table would also run it for the
@@ -1311,6 +1559,148 @@ expect {
     2|0|0|SEARCH i USING COVERING INDEX ephemeral_limit_inner_t3 (k=? AND x=?)
 }
 
+# Semi-joins and anti-joins must apply the full comparison before they record a match.
+@setup correlated_rows
+test exists-keeps-correlated-comparison {
+    SELECT 'exists', o.id
+    FROM outer_rows AS o
+    WHERE EXISTS (
+        SELECT 1
+        FROM inner_rows AS i
+        WHERE i.key1 = o.key1
+          AND i.amount <> o.amount
+    )
+    ORDER BY o.id;
+
+    SELECT 'not exists', o.id
+    FROM outer_rows AS o
+    WHERE NOT EXISTS (
+        SELECT 1
+        FROM inner_rows AS i
+        WHERE i.key1 = o.key1
+          AND i.amount <> o.amount
+    )
+    ORDER BY o.id;
+}
+expect {
+    exists|1
+    exists|2
+    exists|3
+    not exists|4
+    not exists|5
+    not exists|6
+}
+
+# NULL-aware comparisons must keep their original EXISTS rules after the rewrite.
+@setup correlated_rows
+test exists-keeps-null-aware-correlated-comparisons {
+    SELECT 'exists', o.id
+    FROM outer_rows AS o
+    WHERE EXISTS (
+        SELECT 1
+        FROM inner_rows AS i
+        WHERE i.key1 IS o.key1
+          AND i.amount IS o.amount
+    )
+    ORDER BY o.id;
+
+    SELECT 'not exists', o.id
+    FROM outer_rows AS o
+    WHERE NOT EXISTS (
+        SELECT 1
+        FROM inner_rows AS i
+        WHERE i.key1 IS o.key1
+          AND i.amount IS NOT o.amount
+    )
+    ORDER BY o.id;
+}
+expect {
+    exists|3
+    exists|6
+    not exists|4
+}
+
+@setup correlated_rows
+@var polarity { EXISTS | NOT EXISTS }
+@var link { i.key1 = o.key1 | i.key1 IS o.key1 | i.key1 < o.key1 }
+@var comparison {
+    i.amount = o.amount | o.amount = i.amount
+    | i.amount <> o.amount | o.amount <> i.amount
+    | i.amount < o.amount | o.amount < i.amount
+    | i.amount <= o.amount | o.amount <= i.amount
+    | i.amount > o.amount | o.amount > i.amount
+    | i.amount >= o.amount | o.amount >= i.amount
+    | i.amount IS o.amount | o.amount IS i.amount
+    | i.amount IS NOT o.amount | o.amount IS NOT i.amount
+}
+matrix correlated-comparison-results {
+    SELECT o.id
+    FROM outer_rows AS o
+    WHERE $polarity (
+        SELECT 1 FROM inner_rows AS i
+        WHERE $link AND $comparison
+    )
+    ORDER BY o.id;
+}
+
+@setup correlated_rows
+@var join_type { LEFT | RIGHT }
+@var polarity { EXISTS | NOT EXISTS }
+@var comparison { i.amount < k.key2 | i.amount IS NOT k.key2 }
+matrix correlated-comparison-after-outer-join {
+    SELECT o.id, k.id
+    FROM outer_rows AS o $join_type JOIN outer_key2 AS k ON o.id = k.id
+    WHERE $polarity (
+        SELECT 1 FROM inner_rows AS i WHERE $comparison
+    )
+    ORDER BY o.id, k.id;
+}
+
+@setup correlated_rows
+@var polarity { EXISTS | NOT EXISTS }
+@var comparison { s.amount < i.amount | s.amount IS NOT i.amount }
+matrix correlated-comparison-after-full-join {
+    SELECT o.id, k.id, i.key1, i.amount
+    FROM outer_rows AS o
+    JOIN outer_key2 AS k ON o.id = k.id
+    FULL JOIN inner_rows AS i ON k.key2 = i.key2
+    WHERE $polarity (
+        SELECT 1 FROM outer_rows AS s WHERE $comparison
+    )
+    ORDER BY o.id, k.id, i.key1, i.amount;
+}
+
+# Both forms must use a join instead of a subquery call for each row.
+@setup correlated_rows
+@skip-if sqlite "query plan explanation output is different in sqlite"
+test correlated-comparison-uses-joins {
+    EXPLAIN QUERY PLAN
+    SELECT o.id
+    FROM outer_rows AS o
+    WHERE EXISTS (
+        SELECT 1
+        FROM inner_rows AS i
+        WHERE i.key1 = o.key1
+          AND i.amount <> o.amount
+    );
+
+    EXPLAIN QUERY PLAN
+    SELECT o.id
+    FROM outer_rows AS o
+    WHERE NOT EXISTS (
+        SELECT 1
+        FROM inner_rows AS i
+        WHERE i.key1 = o.key1
+          AND i.amount <> o.amount
+    );
+}
+expect {
+    1|0|0|SCAN outer_rows AS o
+    2|0|0|SEARCH i USING COVERING INDEX ephemeral_inner_rows_t3 (key1=?)
+    1|0|0|HASH JOIN inner_rows AS i
+    2|0|0|SCAN outer_rows AS o
+}
+
 # Each EXISTS keeps its own outer row. A second one must not make both use
 # nested scans.
 @skip-if sqlite "query plan explanation output is different in sqlite"
@@ -1355,10 +1745,223 @@ expect {
     2|0|0|SEARCH i USING COVERING INDEX ephemeral_filtered_exists_inner_t3 (key1=?)
 }
 
+setup hash_anti_rows {
+    CREATE TABLE hash_anti_outer(
+        id INTEGER PRIMARY KEY,
+        key_value INTEGER,
+        active INTEGER
+    );
+    CREATE TABLE hash_anti_inner(key_value INTEGER, value INTEGER);
+    INSERT INTO hash_anti_outer VALUES
+        (1,1,1),
+        (2,2,1),
+        (3,3,0),
+        (4,NULL,1),
+        (5,4,1),
+        (6,1,1),
+        (7,5,1),
+        (8,6,1);
+    INSERT INTO hash_anti_inner VALUES
+        (1,1),
+        (2,0),
+        (NULL,1),
+        (5,1),
+        (5,1),
+        (6,0),
+        (6,1);
+    ANALYZE;
+    DELETE FROM sqlite_stat1;
+    INSERT INTO sqlite_stat1(tbl, idx, stat) VALUES
+        ('hash_anti_outer', NULL, '100000'),
+        ('hash_anti_inner', NULL, '1000000');
+    ANALYZE sqlite_schema;
+}
+
+# A large anti-join can scan its inner table once without a temporary index.
+@setup hash_anti_rows
+@skip-if sqlite "SQLite uses a different NOT EXISTS plan"
+test not-exists-can-use-hash-anti-join {
+    EXPLAIN QUERY PLAN
+    SELECT o.id
+    FROM hash_anti_outer o
+    WHERE o.active = 1
+      AND NOT EXISTS (
+          SELECT 1
+          FROM hash_anti_inner i
+          WHERE i.key_value = o.key_value
+            AND i.value > 0
+      );
+}
+expect pattern {
+    (?s)HASH JOIN hash_anti_inner AS i.*SCAN hash_anti_outer AS o
+}
+
+# A hash anti-join keeps only build rows that have no complete inner match.
+@setup hash_anti_rows
+test hash-anti-join-keeps-unmatched-build-rows {
+    SELECT o.id
+    FROM hash_anti_outer o
+    WHERE o.active = 1
+      AND NOT EXISTS (
+          SELECT 1
+          FROM hash_anti_inner i
+          WHERE i.key_value = o.key_value
+            AND i.value > 0
+      )
+    ORDER BY o.id;
+}
+expect {
+    2
+    4
+    5
+}
+
+@setup hash_anti_rows
+test hash-anti-join-keeps-all-build-rows-when-probe-is-empty {
+    SELECT o.id
+    FROM hash_anti_outer o
+    WHERE o.active = 1
+      AND NOT EXISTS (
+          SELECT 1
+          FROM hash_anti_inner i
+          WHERE i.key_value = o.key_value
+            AND i.value > 100
+      )
+    ORDER BY o.id;
+}
+expect {
+    1
+    2
+    4
+    5
+    6
+    7
+    8
+}
+
+@setup hash_anti_rows
+test hash-anti-join-keeps-empty-build-input-empty {
+    SELECT o.id
+    FROM hash_anti_outer o
+    WHERE o.active = 9
+      AND NOT EXISTS (
+          SELECT 1
+          FROM hash_anti_inner i
+          WHERE i.key_value = o.key_value
+      );
+}
+expect {
+}
+
+setup hash_anti_spill_rows {
+    CREATE TABLE hash_anti_spill_outer(
+        id INTEGER PRIMARY KEY,
+        key_value INTEGER,
+        active INTEGER,
+        payload TEXT
+    );
+    CREATE TABLE hash_anti_spill_inner(key_value INTEGER, value INTEGER);
+    INSERT INTO hash_anti_spill_outer
+        SELECT value, value, 1, printf('%.*c', 10000, 'x')
+        FROM generate_series(1, 150);
+    INSERT INTO hash_anti_spill_inner
+        SELECT value, 1
+        FROM generate_series(76, 225);
+    ANALYZE;
+    DELETE FROM sqlite_stat1;
+    INSERT INTO sqlite_stat1(tbl, idx, stat) VALUES
+        ('hash_anti_spill_outer', NULL, '100000'),
+        ('hash_anti_spill_inner', NULL, '1000000');
+    ANALYZE sqlite_schema;
+}
+
+# The large payload makes the debug hash table spill to disk.
+@setup hash_anti_spill_rows
+test hash-anti-join-keeps-unmatched-rows-after-spill {
+    SELECT count(*), sum(length(o.payload))
+    FROM hash_anti_spill_outer o
+    WHERE o.active = 1
+      AND NOT EXISTS (
+          SELECT 1
+          FROM hash_anti_spill_inner i
+          WHERE i.key_value = o.key_value
+            AND i.value > 0
+      );
+}
+expect {
+    75|750000
+}
+
+setup exists_filter_before_anti_join {
+    CREATE TABLE exists_filter_outer(id INTEGER PRIMARY KEY, k INTEGER, flag INTEGER);
+    CREATE TABLE exists_filter_probe(k INTEGER, v INTEGER);
+    CREATE TABLE exists_filter_anti(k INTEGER);
+    INSERT INTO exists_filter_outer VALUES (1,10,1),(2,20,1),(3,30,1),(4,40,1);
+    INSERT INTO exists_filter_probe VALUES (10, 99);
+    INSERT INTO exists_filter_anti VALUES (20),(20),(40);
+    ANALYZE;
+    DELETE FROM sqlite_stat1;
+    INSERT INTO sqlite_stat1(tbl, idx, stat) VALUES
+        ('exists_filter_outer', NULL, '100000'),
+        ('exists_filter_anti', NULL, '1000000'),
+        ('exists_filter_probe', NULL, '50');
+    ANALYZE sqlite_schema;
+}
+
+# The correlated EXISTS filter must still apply when the optimizer moves its
+# evaluation to a later loop and that loop is a NOT EXISTS anti join. Inside an
+# anti join loop, a failed filter looks like "no match", which emits the outer
+# row instead of rejecting it.
+@setup exists_filter_before_anti_join
+test exists-filter-applies-when-moved-to-an-anti-join-loop {
+    SELECT o.id FROM exists_filter_outer o
+    WHERE EXISTS (
+            SELECT 1 FROM exists_filter_probe e
+            WHERE e.k = o.k AND e.v <> o.id
+          )
+      AND o.flag = 1
+      AND NOT EXISTS (
+            SELECT 1 FROM exists_filter_anti n
+            WHERE n.k = o.k
+          )
+    ORDER BY o.id;
+}
+expect {
+    1
+}
+
+# Same shape with an index on the anti-join key, so the anti join seeks a real
+# index instead of building an ephemeral one.
+@setup exists_filter_before_anti_join
+test exists-filter-applies-when-moved-to-an-indexed-anti-join-loop {
+    CREATE INDEX exists_filter_anti_k ON exists_filter_anti(k);
+    ANALYZE;
+    DELETE FROM sqlite_stat1;
+    INSERT INTO sqlite_stat1(tbl, idx, stat) VALUES
+        ('exists_filter_outer', NULL, '100000'),
+        ('exists_filter_anti', 'exists_filter_anti_k', '100 1'),
+        ('exists_filter_probe', NULL, '50');
+    ANALYZE sqlite_schema;
+
+    SELECT o.id FROM exists_filter_outer o
+    WHERE EXISTS (
+            SELECT 1 FROM exists_filter_probe e
+            WHERE e.k = o.k AND e.v <> o.id
+          )
+      AND o.flag = 1
+      AND NOT EXISTS (
+            SELECT 1 FROM exists_filter_anti n
+            WHERE n.k = o.k
+          )
+    ORDER BY o.id;
+}
+expect {
+    1
+}
+
 # With table counts from ANALYZE, one outer row should use the saved inner
 # index. All outer rows should group the inner table once.
 @skip-if sqlite "query plan explanation output is different in sqlite"
-@skip-if mvcc "MVCC does not reload sqlite_stat1 after this test changes it"
 test indexed-average-uses-outer-row-count {
     CREATE TABLE one_indexed_avg_outer(id INTEGER PRIMARY KEY, k INTEGER, x REAL);
     CREATE TABLE many_indexed_avg_outer(id INTEGER PRIMARY KEY, k INTEGER, x REAL);
@@ -1710,6 +2313,37 @@ setup comparison_keys {
     INSERT INTO nocase_inner VALUES ('a', 10), ('A', 20);
 }
 
+setup comparison_key_indexes {
+    CREATE INDEX text_inner_key_amount ON text_inner(key1, amount);
+    CREATE INDEX binary_inner_key_amount ON binary_inner(key1, amount);
+    CREATE INDEX nocase_inner_key_amount ON nocase_inner(key1, amount);
+}
+
+@setup comparison_keys
+@setup comparison_key_indexes
+@var comparison { i.amount > o.id | o.id < i.amount | i.amount IS NOT o.id }
+matrix correlated-in-inequality-keeps-number-to-text-comparison {
+    SELECT o.id
+    FROM number_outer AS o
+    WHERE o.key1 IN (
+        SELECT i.key1 FROM text_inner AS i WHERE $comparison
+    )
+    ORDER BY o.id;
+}
+
+@setup comparison_keys
+@setup comparison_key_indexes
+@var inner_table { binary_inner | nocase_inner }
+@var comparison { i.amount > o.id | o.id < i.amount | i.amount IS NOT o.id }
+matrix correlated-in-inequality-keeps-text-order {
+    SELECT o.id
+    FROM nocase_outer AS o
+    WHERE o.key1 IN (
+        SELECT i.key1 FROM $inner_table AS i WHERE $comparison
+    )
+    ORDER BY o.id;
+}
+
 @setup comparison_keys
 test one-value-number-and-text-stay-correlated {
     SELECT o.id, (SELECT sum(i.amount) FROM text_inner i WHERE i.key1 = o.key1)
@@ -1789,6 +2423,123 @@ expect error {
     .*malformed JSON.*
 }
 
+setup correlated_comparison_errors {
+    CREATE TABLE error_outer(id INTEGER, wanted INTEGER, limit_value INTEGER, text_value TEXT);
+    CREATE TABLE error_inner(value INTEGER, json_value TEXT);
+    INSERT INTO error_outer VALUES (1, 1, 10, '1'), (2, 1, 0, 'bad JSON');
+    INSERT INTO error_inner VALUES (1, '1'), (2, 'bad JSON');
+}
+
+@setup correlated_comparison_errors
+@var polarity { EXISTS | NOT EXISTS }
+@var comparison {
+    json_extract(i.json_value, '$') < o.limit_value
+    | o.limit_value > json_extract(i.json_value, '$')
+    | i.value < json_extract(o.text_value, '$')
+}
+@var other_term { | AND i.value = o.wanted }
+matrix correlated-exists-inequality-expression-errors {
+    SELECT o.id
+    FROM error_outer AS o
+    WHERE $polarity (
+        SELECT 1 FROM error_inner AS i WHERE $comparison $other_term
+    )
+    ORDER BY o.id;
+}
+
+@setup correlated_comparison_errors
+@var left_value { (SELECT json_extract(o.text_value, '$')) | (SELECT o.wanted) }
+@var comparison { i.value < o.limit_value | i.value >= o.limit_value }
+matrix correlated-in-with-left-subquery {
+    SELECT o.id
+    FROM error_outer AS o
+    WHERE $left_value IN (
+        SELECT i.value FROM error_inner AS i WHERE $comparison
+    )
+    ORDER BY o.id;
+}
+
+@setup correlated_comparison_errors
+@var comparison { i.value < o.limit_value | o.limit_value > i.value }
+matrix correlated-in-nested-result-error {
+    SELECT o.id
+    FROM error_outer AS o
+    WHERE o.wanted IN (
+        SELECT CASE WHEN i.value = 1 THEN 1
+                    ELSE (SELECT json_extract('bad JSON', '$')) END
+        FROM error_inner AS i
+        WHERE $comparison
+    )
+    ORDER BY o.id;
+}
+
+@setup correlated_comparison_errors
+test correlated-in-inequality-keeps-inner-filter-error {
+    SELECT o.id
+    FROM error_outer AS o
+    WHERE o.wanted IN (
+        SELECT i.value FROM error_inner AS i
+        WHERE json_extract(i.json_value, '$') < o.limit_value
+    );
+}
+expect error {
+    .*malformed JSON.*
+}
+
+@setup correlated_comparison_errors
+test correlated-in-inequality-keeps-result-error {
+    SELECT o.id
+    FROM error_outer AS o
+    WHERE o.wanted IN (
+        SELECT json_extract(i.json_value, '$') FROM error_inner AS i
+        WHERE i.value < o.limit_value
+    );
+}
+expect error {
+    .*malformed JSON.*
+}
+
+@setup correlated_comparison_errors
+test correlated-in-inequality-keeps-left-error {
+    SELECT o.id
+    FROM error_outer AS o
+    WHERE json_extract(o.text_value, '$') IN (
+        SELECT i.value FROM error_inner AS i
+        WHERE i.value < o.limit_value
+    );
+}
+expect error {
+    .*malformed JSON.*
+}
+
+@setup correlated_comparison_errors
+@skip-if sqlite "query plan explanation output is different in sqlite"
+test correlated-in-error-expressions-stay-subqueries {
+    EXPLAIN QUERY PLAN
+    SELECT o.id FROM error_outer AS o
+    WHERE o.wanted IN (
+        SELECT i.value FROM error_inner AS i
+        WHERE json_extract(i.json_value, '$') < o.limit_value
+    );
+
+    EXPLAIN QUERY PLAN
+    SELECT o.id FROM error_outer AS o
+    WHERE o.wanted IN (
+        SELECT json_extract(i.json_value, '$') FROM error_inner AS i
+        WHERE i.value < o.limit_value
+    );
+
+    EXPLAIN QUERY PLAN
+    SELECT o.id FROM error_outer AS o
+    WHERE json_extract(o.text_value, '$') IN (
+        SELECT i.value FROM error_inner AS i
+        WHERE i.value < o.limit_value
+    );
+}
+expect pattern {
+    (?s)CORRELATED LIST SUBQUERY.*CORRELATED LIST SUBQUERY.*CORRELATED LIST SUBQUERY
+}
+
 # These cases run every generated query against Turso and SQLite. The data has
 # repeated outer keys, repeated inner keys, NULL values, missing groups, and a
 # NULL outer key.
@@ -1810,6 +2561,27 @@ matrix one-value-aggregate-comparisons {
     SELECT o.id FROM outer_rows o
     WHERE o.amount $operator (SELECT $aggregate FROM inner_rows i WHERE $link)
     ORDER BY o.id;
+}
+
+# Check that automatic-index prefiltering preserves results for equality and
+# range conditions, reversed operands, NULLs, and one- or two-column keys.
+@setup correlated_rows
+@var comparison { = | < | <= | > | >= }
+@var link { i.key1 = o.key1 | i.key1 = o.key1 AND i.key2 = o.key2 }
+@var inner_filter { AND i.amount = 7 | AND i.amount > 6 | AND i.amount <= 20 | AND i.amount >= 6 AND i.amount < 20 | AND 20 >= i.amount AND 6 <= i.amount | AND i.amount IS NULL }
+matrix join-first-autoindex-prefilter {
+    SELECT candidate.id
+    FROM outer_rows candidate
+    WHERE candidate.id IN (
+        SELECT o.id
+        FROM outer_rows o
+        WHERE o.amount $comparison (
+            SELECT sum(i.amount)
+            FROM inner_rows i
+            WHERE $link $inner_filter
+        )
+    )
+    ORDER BY candidate.id;
 }
 
 @setup correlated_rows

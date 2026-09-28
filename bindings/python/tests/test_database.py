@@ -1800,3 +1800,240 @@ def test_fts_highlight_wraps_matched_terms():
     cur.execute("SELECT fts_highlight(body, '<b>', '</b>', 'rust') FROM articles WHERE fts_match(title, body, 'rust')")
     assert cur.fetchall() == [("Turso is a SQLite rewrite in <b>Rust</b>",)]
     conn.close()
+
+
+# ---------------------------------------------------------------------------
+# Parameterized batches (turso extension; no sqlite3 equivalent)
+# ---------------------------------------------------------------------------
+
+
+def _batch_connection():
+    conn = turso.connect("tests/database.db")
+    conn.execute("CREATE TABLE t_batch (id INTEGER PRIMARY KEY, name TEXT)")
+    conn.commit()
+    return conn
+
+
+def test_batch_executes_parameterized_statements_in_order():
+    conn = _batch_connection()
+    results = conn.batch(
+        [
+            ("INSERT INTO t_batch (name) VALUES (?)", ("Alice",)),
+            ("INSERT INTO t_batch (name) VALUES (?)", ("Bob",)),
+            "SELECT name FROM t_batch ORDER BY id",
+        ]
+    )
+    assert len(results) == 3
+    assert results[0].rowcount == 1
+    assert results[0].lastrowid == 1
+    # The embedded engine does not report per-statement execution
+    # statistics; the serverless driver fills these from the server.
+    assert results[0].rows_read is None
+    assert results[0].rows_written is None
+    assert results[0].query_duration_ms is None
+    assert results[1].lastrowid == 2
+    select = results[2]
+    assert select.description is not None
+    assert select.description[0][0] == "name"
+    assert select.rows == [("Alice",), ("Bob",)]
+    assert select.rowcount == -1
+    # The batch is not transactional: the inserts are already committed.
+    assert not conn.in_transaction
+    conn.close()
+
+    conn = turso.connect("tests/database.db")
+    assert conn.execute("SELECT COUNT(*) FROM t_batch").fetchone() == (2,)
+    conn.close()
+
+
+def test_batch_error_identifies_the_failing_statement():
+    conn = _batch_connection()
+    with pytest.raises(turso.DatabaseError, match="batch statement 1 failed") as excinfo:
+        conn.batch(
+            [
+                ("INSERT INTO t_batch (name) VALUES (?)", ("Alice",)),
+                ("INSERT INTO no_such_table VALUES (?)", (2,)),
+                ("INSERT INTO t_batch (name) VALUES (?)", ("Carol",)),
+            ]
+        )
+    assert excinfo.value.batch_index == 1
+    # One entry per statement: the completed first statement's result,
+    # None for the failing and skipped ones.
+    partial = excinfo.value.batch_results
+    assert len(partial) == 3
+    assert partial[0].rowcount == 1
+    assert partial[1] is None
+    assert partial[2] is None
+    # The statement before the failing one keeps its effect, and the one
+    # after it never ran.
+    assert conn.execute("SELECT COUNT(*) FROM t_batch").fetchone() == (1,)
+    conn.close()
+
+
+@pytest.mark.parametrize("mode", [None, "immediate"])
+def test_batch_validates_every_parameter_before_execution(mode):
+    conn = _batch_connection()
+    with pytest.raises(turso.DatabaseError, match="batch statement 1 failed") as excinfo:
+        conn.batch(
+            [
+                ("INSERT INTO t_batch (name) VALUES (?)", ("Alice",)),
+                ("INSERT INTO t_batch (name) VALUES (?)", (object(),)),
+            ],
+            mode=mode,
+        )
+    assert excinfo.value.batch_index == 1
+    assert excinfo.value.batch_results == []
+    assert conn.execute("SELECT COUNT(*) FROM t_batch").fetchone() == (0,)
+    assert not conn.in_transaction
+    conn.close()
+
+
+@pytest.mark.parametrize("mode", [None, "immediate"])
+def test_batch_rejects_infinity_before_execution(mode):
+    conn = _batch_connection()
+    with pytest.raises(ValueError, match="infinite float") as excinfo:
+        conn.batch(
+            [
+                ("INSERT INTO t_batch (name) VALUES (?)", ("Alice",)),
+                ("INSERT INTO t_batch (name) VALUES (?)", (float("inf"),)),
+            ],
+            mode=mode,
+        )
+    assert excinfo.value.batch_index == 1
+    assert excinfo.value.batch_results == []
+    assert conn.execute("SELECT COUNT(*) FROM t_batch").fetchone() == (0,)
+    assert not conn.in_transaction
+    conn.close()
+
+
+def test_batch_joins_an_open_transaction():
+    conn = _batch_connection()
+    conn.execute("BEGIN")
+    conn.batch(
+        [
+            ("INSERT INTO t_batch (name) VALUES (?)", ("Alice",)),
+            ("INSERT INTO t_batch (name) VALUES (?)", ("Bob",)),
+        ]
+    )
+    assert conn.in_transaction
+    conn.rollback()
+    assert conn.execute("SELECT COUNT(*) FROM t_batch").fetchone() == (0,)
+    conn.close()
+
+
+def test_batch_mode_commits_atomically():
+    conn = _batch_connection()
+    results = conn.batch(
+        [
+            ("INSERT INTO t_batch (name) VALUES (?)", ("Alice",)),
+            ("INSERT INTO t_batch (name) VALUES (?)", ("Bob",)),
+        ],
+        mode="immediate",
+    )
+    assert len(results) == 2
+    assert not conn.in_transaction
+    assert conn.execute("SELECT COUNT(*) FROM t_batch").fetchone() == (2,)
+    conn.close()
+
+
+def test_batch_mode_rolls_back_on_failure():
+    conn = _batch_connection()
+    with pytest.raises(turso.DatabaseError) as excinfo:
+        conn.batch(
+            [
+                ("INSERT INTO t_batch (name) VALUES (?)", ("Alice",)),
+                ("INSERT INTO no_such_table VALUES (?)", (2,)),
+            ],
+            mode="immediate",
+        )
+    assert excinfo.value.batch_index == 1
+    assert not conn.in_transaction
+    # The rollback undid the first insert.
+    assert conn.execute("SELECT COUNT(*) FROM t_batch").fetchone() == (0,)
+    conn.close()
+
+
+@pytest.mark.parametrize(
+    "sql",
+    [
+        "BEGIN",
+        "COMMIT",
+        "END",
+        "ROLLBACK",
+        "SAVEPOINT batch_savepoint",
+        "RELEASE batch_savepoint",
+        "; /* empty statement */ COMMIT",
+        "\ufeffCOMMIT",
+    ],
+)
+def test_batch_mode_rejects_transaction_control_before_begin(sql):
+    conn = _batch_connection()
+    with pytest.raises(
+        turso.ProgrammingError, match="transaction-control SQL is not allowed"
+    ) as excinfo:
+        conn.batch([sql], mode="immediate")
+    assert excinfo.value.batch_index == 0
+    assert excinfo.value.batch_results == []
+    assert not conn.in_transaction
+    conn.close()
+
+
+def test_batch_preserves_rollback_failure_on_primary_error():
+    conn = _batch_connection()
+    execute_transaction_sql = conn._exec_ddl_only
+
+    def fail_rollback(sql):
+        if sql == "ROLLBACK":
+            raise turso.OperationalError("rollback failed")
+        execute_transaction_sql(sql)
+
+    conn._exec_ddl_only = fail_rollback
+    with pytest.raises(turso.DatabaseError) as excinfo:
+        conn.batch(
+            [
+                ("INSERT INTO t_batch (name) VALUES (?)", ("Alice",)),
+                ("INSERT INTO no_such_table VALUES (?)", (2,)),
+            ],
+            mode="immediate",
+        )
+    assert excinfo.value.batch_index == 1
+    assert len(excinfo.value.batch_results) == 2
+    assert isinstance(excinfo.value.rollback_error, turso.OperationalError)
+    assert str(excinfo.value.rollback_error) == "rollback failed"
+
+    conn._exec_ddl_only = execute_transaction_sql
+    conn.rollback()
+    conn.close()
+
+
+def test_batch_constraint_error_preserves_exception_class():
+    conn = _batch_connection()
+    conn.execute("CREATE TABLE t_batch_uniq (x UNIQUE)")
+    conn.commit()
+    with pytest.raises(turso.IntegrityError) as excinfo:
+        conn.batch(
+            [
+                ("INSERT INTO t_batch_uniq VALUES (?)", (1,)),
+                ("INSERT INTO t_batch_uniq VALUES (?)", (1,)),
+            ]
+        )
+    assert excinfo.value.batch_index == 1
+    conn.close()
+
+
+def test_empty_batch_returns_no_results():
+    conn = _batch_connection()
+    assert conn.batch([]) == []
+    assert conn.batch([], mode="immediate") == []
+    conn.close()
+
+
+def test_batch_rejects_invalid_mode_and_statements():
+    conn = _batch_connection()
+    with pytest.raises(turso.ProgrammingError, match="batch mode"):
+        conn.batch(["SELECT 1"], mode="bogus")
+    with pytest.raises(turso.ProgrammingError, match="batch statement 1"):
+        conn.batch(["SELECT 1", 42])
+    with pytest.raises(turso.ProgrammingError, match="one statement at a time"):
+        conn.batch(["SELECT 1; SELECT 2"])
+    conn.close()

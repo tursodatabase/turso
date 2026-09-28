@@ -77,6 +77,58 @@ fn test_something() {
 }
 ```
 
+### Assertions
+
+Prefer the [`asserting`](https://github.com/innoave/asserting) crate for anything more than trivial assertions. The assertions it offers are extensive
+and make tests more readable. Some simple examples:
+
+```rust
+use asserting::prelude::*;
+
+assert_that!(conn.execute("SELECT * FROM t1;")).is_err();
+assert_that_code!(|| parse(bad_input)).panics_with_message("unexpected token");
+
+assert_that!(&rows)
+    .has_length(3)
+    .any_satisfies(|r| r
+    .name == "bob")
+    .first_element_ref()
+    .is_equal_to(&Row { id: 1, name: "alice".into() });
+
+assert_that!(&header)
+    .named("page 2 header")
+    .satisfies_with_message("be a leaf table page", |h| h[0] == 0x0d);
+
+// soft assertions: mark the test as failed but don't stop
+verify_that!(&plan)
+    .starts_with("SEARCH")
+    .contains("USING INDEX")
+    .soft_panic();
+```
+
+`crate::assertions` adds `row!` for result rows, plus `column` and query-plan
+assertions:
+
+```rust
+use crate::assertions::{AssertColumn, AssertQueryPlan, Cell, NULL};
+
+assert_that!(limbo_exec_rows(&conn, "SELECT id, name FROM t ORDER BY id"))
+    .is_equal_to(vec![row![1, "alice"], row![2, NULL]]);
+
+assert_that!(limbo_exec_rows(&conn, "SELECT id FROM t WHERE id = 1"))
+    .single_element()
+    .is_equal_to(row![1]);
+
+assert_that!(limbo_exec_rows(&conn, "SELECT id, name FROM t"))
+    .column(1)
+    .contains(Cell::from("alice"));
+
+assert_that!(limbo_exec_rows(&conn, "EXPLAIN QUERY PLAN SELECT id FROM t WHERE name = 'a'"))
+    .uses_index("idx_name")
+    .searches_table("t")
+    .has_table_access_order(["t"]);
+```
+
 ## Key Rules
 
 - Every functional change needs a test

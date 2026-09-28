@@ -178,6 +178,27 @@ test('reconnect-db', async () => {
     }
 })
 
+test('reopen file-backed replica after switching to MVCC sync', async () => {
+    const path = `mvcc-${crypto.randomUUID()}.sqlite`;
+    const url = process.env.VITE_TURSO_MVCC_DB_URL;
+    {
+        let remoteUrl: string | null = null;
+        const db = await connect({ path, url: () => remoteUrl, logicalMvccPull: true });
+        remoteUrl = url ?? null;
+        await db.pull();
+        await db.exec("CREATE TABLE IF NOT EXISTS mvcc_opfs_reopen(value TEXT)");
+        await db.exec("DELETE FROM mvcc_opfs_reopen");
+        await db.exec("INSERT INTO mvcc_opfs_reopen VALUES ('still here')");
+        await db.push();
+        await db.close();
+    }
+    {
+        const db = await connect({ path, url, logicalMvccPull: true });
+        expect(await (await db.prepare("SELECT value FROM mvcc_opfs_reopen")).all()).toEqual([{ value: 'still here' }]);
+        await db.close();
+    }
+})
+
 test('implicit connect', async () => {
     const db = new Database({ path: ':memory:', url: process.env.VITE_TURSO_DB_URL });
     const defer = await db.prepare("SELECT * FROM not_found");

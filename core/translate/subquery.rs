@@ -23,7 +23,10 @@ use crate::{
             emit_materialized_build_inputs, emit_program_for_select,
             emit_program_for_select_with_resolver, emit_query,
         },
-        eqp::{eqp_detail_for_table_op, EqpDetail, EqpJoin, EqpSubquery, EqpSubqueryExec},
+        eqp::{
+            eqp_detail_for_rowid_search, eqp_detail_for_table_op, EqpDetail, EqpJoin, EqpSubquery,
+            EqpSubqueryExec,
+        },
         expr::{get_expr_affinity, unwrap_parens, walk_expr, walk_expr_mut, WalkControl},
         optimizer::optimize_select_plan,
         plan::{
@@ -765,6 +768,7 @@ fn get_subquery_parser<'a>(
                     correlated,
                     origin,
                     eval_phase: origin.phase_floor(),
+                    preferred_eval_after_table: None,
                 });
                 Ok(WalkControl::Continue)
             }
@@ -901,6 +905,7 @@ fn get_subquery_parser<'a>(
                     correlated,
                     origin: effective_origin,
                     eval_phase: effective_origin.phase_floor(),
+                    preferred_eval_after_table: None,
                 });
                 if let Some(key) = cse_key {
                     cse_map.push((key, expr.clone()));
@@ -1051,6 +1056,7 @@ fn get_subquery_parser<'a>(
                     correlated,
                     origin,
                     eval_phase: origin.phase_floor(),
+                    preferred_eval_after_table: None,
                 });
                 Ok(WalkControl::Continue)
             }
@@ -1421,19 +1427,24 @@ pub fn emit_from_clause_subqueries(
     // OpenDup a CTE whose backing table has not been created yet.
     pre_materialize_multi_ref_ctes_in_tables(program, tables, t_ctx)?;
 
-    // Build the iteration order: join_order first (execution order), then any
-    // hash-join build tables that aren't already in the join order.
     let mut visit_order: Vec<usize> = join_order
         .iter()
         .map(|member| member.original_idx)
         .collect();
-    let visit_set: TableMask = visit_order.iter().copied().try_collect()?;
+    let mut visit_set: TableMask = visit_order.iter().copied().try_collect()?;
     for table in tables.joined_tables().iter() {
         if let Operation::HashJoin(hash_join_op) = &table.op {
             let build_idx = hash_join_op.build_table_idx;
-            if !visit_set.get(build_idx) {
-                visit_order.push(build_idx);
+            if visit_set.get(build_idx)
+                || t_ctx
+                    .materialized_build_inputs
+                    .get(&build_idx)
+                    .is_some_and(|input| !input.requires_build_table())
+            {
+                continue;
             }
+            visit_order.push(build_idx);
+            visit_set.set(build_idx)?;
         }
     }
 
@@ -1455,19 +1466,22 @@ pub fn emit_from_clause_subqueries(
             }
             _ => None,
         };
-        let eqp_subquery = eqp_subquery_info(program, table_reference, execution_mode.as_ref());
-        emit_explain!(
-            program,
-            true,
-            eqp_detail_for_table_op(
-                table_reference,
-                EqpJoin::from_join_info(
-                    table_reference.join_info.as_ref(),
-                    outer_table_set.get(table_index),
-                ),
-                eqp_subquery,
-            )
-        );
+        emit_explain!(program, true, {
+            let eqp_subquery = eqp_subquery_info(program, table_reference, execution_mode.as_ref());
+            let eqp_join = EqpJoin::from_join_info(
+                table_reference.join_info.as_ref(),
+                outer_table_set.get(table_index),
+            );
+            if t_ctx
+                .materialized_build_inputs
+                .get(&table_index)
+                .is_some_and(|input| input.requires_build_table())
+            {
+                eqp_detail_for_rowid_search(table_reference, eqp_join, eqp_subquery)
+            } else {
+                eqp_detail_for_table_op(table_reference, eqp_join, eqp_subquery)
+            }
+        });
 
         if let Table::FromClauseSubquery(from_clause_subquery) = &mut table_reference.table {
             let execution_mode =
@@ -1809,6 +1823,18 @@ fn emit_materialized_subquery_table(
     // Allocate registers for reading result columns
     let result_columns_start_reg = program.alloc_registers(columns.len());
 
+    let build_end = if plan_is_correlated(plan) {
+        None
+    } else {
+        let label = program.allocate_label();
+        // A correlated parent query can reach this code more than once.
+        // SQLite keeps an uncorrelated FROM source for the full statement.
+        program.emit_insn(Insn::Once {
+            target_pc_when_reentered: label,
+        });
+        Some(label)
+    };
+
     // Open the ephemeral table
     program.emit_insn(Insn::OpenEphemeral {
         cursor_id,
@@ -1872,6 +1898,10 @@ fn emit_materialized_subquery_table(
         Plan::Delete(_) | Plan::Update(_) => {
             unreachable!("DELETE/UPDATE plans cannot be FROM clause subqueries")
         }
+    }
+
+    if let Some(build_end) = build_end {
+        program.preassign_label_to_next_insn(build_end);
     }
 
     Ok((result_columns_start_reg, cursor_id, ephemeral_table))

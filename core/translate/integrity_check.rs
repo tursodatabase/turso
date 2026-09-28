@@ -1,8 +1,10 @@
+use crate::alloc::Arc;
+use crate::schema::Column;
 use crate::translate::expr::emit_table_column;
 use crate::vdbe::affinity::Affinity;
 use crate::vdbe::builder::SelfTableContext;
 use crate::{
-    schema::{GeneratedType, Index, Schema, Table, EXPR_INDEX_SENTINEL},
+    schema::{BTreeTable, GeneratedType, Index, Schema, Table, EXPR_INDEX_SENTINEL},
     translate::{
         emitter::Resolver,
         expr::{
@@ -41,15 +43,13 @@ struct BoundIntegrityIndex {
 
 /// Translate PRAGMA integrity_check.
 pub fn translate_integrity_check(
-    schema: &Schema,
     program: &mut ProgramBuilder,
     resolver: &Resolver,
     database_id: usize,
     max_errors: usize,
-    connection: &std::sync::Arc<crate::Connection>,
+    connection: &crate::Connection,
 ) -> crate::Result<()> {
     translate_integrity_check_impl(
-        schema,
         program,
         resolver,
         database_id,
@@ -61,36 +61,59 @@ pub fn translate_integrity_check(
 
 /// Translate PRAGMA quick_check.
 pub fn translate_quick_check(
-    schema: &Schema,
     program: &mut ProgramBuilder,
     resolver: &Resolver,
     database_id: usize,
     max_errors: usize,
-    connection: &std::sync::Arc<crate::Connection>,
+    connection: &crate::Connection,
 ) -> crate::Result<()> {
-    translate_integrity_check_impl(
-        schema,
-        program,
-        resolver,
-        database_id,
-        max_errors,
-        true,
-        connection,
-    )
+    translate_integrity_check_impl(program, resolver, database_id, max_errors, true, connection)
 }
 
-fn emit_integrity_result_row(
+fn translate_integrity_check_impl(
     program: &mut ProgramBuilder,
-    remaining_errors_reg: usize,
-    message_reg: usize,
-    had_error_reg: usize,
-) {
-    program.emit_int(1, had_error_reg);
-    program.emit_result_row(message_reg, 1);
+    resolver: &Resolver,
+    database_id: usize,
+    max_errors: usize,
+    quick: bool,
+    connection: &crate::Connection,
+) -> crate::Result<()> {
+    match connection.mv_store_for_db(database_id) {
+        Some(mv_store) => {
+            // Integrity checks read the target's physical file. Its root pages match the
+            // shared MVCC schema, not a connection's potentially older transaction snapshot.
+            let schema = connection.clone_shared_schema(database_id);
+            translate_integrity_check_for_schema(
+                &schema,
+                program,
+                resolver,
+                database_id,
+                max_errors,
+                quick,
+                Some(mv_store.as_ref()),
+            )
+        }
+        None => resolver.with_schema(database_id, |schema| {
+            translate_integrity_check_for_schema(
+                schema,
+                program,
+                resolver,
+                database_id,
+                max_errors,
+                quick,
+                None,
+            )
+        }),
+    }
+}
+
+fn emit_integrity_result_row(program: &mut ProgramBuilder, registers: &Registers) {
+    program.emit_int(1, registers.had_error);
+    program.emit_result_row(registers.message, 1);
 
     let continue_label = program.allocate_label();
     program.emit_insn(Insn::IfPos {
-        reg: remaining_errors_reg,
+        reg: registers.remaining_errors,
         target_pc: continue_label,
         decrement_by: 1,
     });
@@ -105,32 +128,29 @@ fn emit_integrity_result_row(
 
 fn emit_row_missing_from_index_error(
     program: &mut ProgramBuilder,
+    registers: &Registers,
     row_number_reg: usize,
-    scratch_reg: usize,
-    message_reg: usize,
     index_name: &str,
-    remaining_errors_reg: usize,
-    had_error_reg: usize,
 ) {
-    program.emit_string8("row ".to_string(), message_reg);
+    program.emit_string8("row ".to_string(), registers.message);
     program.emit_insn(Insn::Concat {
-        lhs: message_reg,
+        lhs: registers.message,
         rhs: row_number_reg,
-        dest: message_reg,
+        dest: registers.message,
     });
-    program.emit_string8(" missing from index ".to_string(), scratch_reg);
+    program.emit_string8(" missing from index ".to_string(), registers.scratch);
     program.emit_insn(Insn::Concat {
-        lhs: message_reg,
-        rhs: scratch_reg,
-        dest: message_reg,
+        lhs: registers.message,
+        rhs: registers.scratch,
+        dest: registers.message,
     });
-    program.emit_string8(index_name.to_string(), scratch_reg);
+    program.emit_string8(index_name.to_string(), registers.scratch);
     program.emit_insn(Insn::Concat {
-        lhs: message_reg,
-        rhs: scratch_reg,
-        dest: message_reg,
+        lhs: registers.message,
+        rhs: registers.scratch,
+        dest: registers.message,
     });
-    emit_integrity_result_row(program, remaining_errors_reg, message_reg, had_error_reg);
+    emit_integrity_result_row(program, registers);
 }
 
 fn bind_expr_for_table(
@@ -149,14 +169,14 @@ fn bind_expr_for_table(
     Ok(out)
 }
 
-fn translate_integrity_check_impl(
+fn translate_integrity_check_for_schema(
     schema: &Schema,
     program: &mut ProgramBuilder,
     resolver: &Resolver,
     database_id: usize,
     max_errors: usize,
     quick: bool,
-    connection: &std::sync::Arc<crate::Connection>,
+    mv_store: Option<&crate::MvStore>,
 ) -> crate::Result<()> {
     // 1) Run low-level btree/freelist/overflow verification first. This mirrors
     // SQLite's OP_IntegrityCk front-pass and can already emit corruption errors
@@ -166,9 +186,8 @@ fn translate_integrity_check_impl(
 
     // integrity_check verifies the physical file, so a placeholder (negative) root for an
     // object a passive checkpoint has since materialized must be resolved to its real page.
-    let mv_store_guard = connection.db.get_mv_store();
     let resolve_root = |root_page: i64| -> i64 {
-        match mv_store_guard.as_ref() {
+        match mv_store {
             Some(mv) => mv.resolve_root_page(root_page),
             None => root_page,
         }
@@ -194,8 +213,7 @@ fn translate_integrity_check_impl(
         }
     }
 
-    let passive =
-        mv_store_guard.is_some() && connection.experimental_mvcc_passive_checkpoint_enabled();
+    let passive = mv_store.is_some_and(|mv_store| mv_store.uses_passive_checkpoint());
     let mut dropped_roots = Vec::new();
     for &dropped_root in &schema.dropped_root_pages {
         if live_root_pages.contains(&dropped_root) {
@@ -208,14 +226,7 @@ fn translate_integrity_check_impl(
         }
     }
 
-    let remaining_errors_reg = program.alloc_register();
-    program.emit_int((max_errors.saturating_sub(1)) as i64, remaining_errors_reg);
-
-    let had_error_reg = program.alloc_register();
-    program.emit_int(0, had_error_reg);
-
-    let message_reg = program.alloc_register();
-    let scratch_reg = program.alloc_register();
+    let registers = Registers::init(program, max_errors);
 
     program.emit_insn(Insn::IntegrityCk {
         data: Box::new(IntegrityCkData {
@@ -223,23 +234,29 @@ fn translate_integrity_check_impl(
             max_errors,
             roots: root_pages,
             dropped_roots,
-            message_register: message_reg,
+            message_register: registers.message,
         }),
     });
 
     let no_structural_error_label = program.allocate_label();
     program.emit_insn(Insn::IsNull {
-        reg: message_reg,
+        reg: registers.message,
         target_pc: no_structural_error_label,
     });
 
-    program.emit_string8("*** in database main ***\n".to_string(), scratch_reg);
+    let database_name = resolver
+        .get_database_name_by_index(database_id)
+        .expect("resolved integrity-check database must still exist");
+    program.emit_string8(
+        format!("*** in database {database_name} ***\n"),
+        registers.scratch,
+    );
     program.emit_insn(Insn::Concat {
-        lhs: scratch_reg,
-        rhs: message_reg,
-        dest: message_reg,
+        lhs: registers.scratch,
+        rhs: registers.message,
+        dest: registers.message,
     });
-    emit_integrity_result_row(program, remaining_errors_reg, message_reg, had_error_reg);
+    emit_integrity_result_row(program, &registers);
     program.preassign_label_to_next_insn(no_structural_error_label);
 
     // 2) For each ordinary btree table, scan every row and validate:
@@ -282,6 +299,7 @@ fn translate_integrity_check_impl(
                 expression_index_usages: Vec::new(),
                 database_id,
                 indexed: None,
+                plan_estimate: None,
             }],
             vec![],
         );
@@ -349,27 +367,6 @@ fn translate_integrity_check_impl(
             )?);
         }
 
-        let not_null_columns: Vec<(BoundIndexColumn, String)> = btree_table
-            .columns()
-            .iter()
-            .enumerate()
-            .filter(|(_, col)| col.notnull() && !col.is_rowid_alias())
-            .filter_map(|(idx, col)| {
-                let name = col.name.clone().unwrap_or_else(|| format!("column{idx}"));
-                match col.generated_type() {
-                    GeneratedType::Virtual { expr, .. } => {
-                        let bound =
-                            bind_expr_for_table(expr, &mut table_references, resolver).ok()?;
-                        Some((
-                            BoundIndexColumn::Expr(Box::new(bound), Some(col.affinity())),
-                            name,
-                        ))
-                    }
-                    GeneratedType::NotGenerated => Some((BoundIndexColumn::Column(idx), name)),
-                }
-            })
-            .collect();
-
         let row_number_reg = program.alloc_register();
         program.emit_int(0, row_number_reg);
 
@@ -387,48 +384,50 @@ fn translate_integrity_check_impl(
             value: 1,
         });
 
-        for (col_ref, col_name) in &not_null_columns {
-            let col_value_reg = program.alloc_register();
-            match col_ref {
-                BoundIndexColumn::Column(idx) => {
-                    program.emit_column_or_rowid(table_cursor_id, *idx, col_value_reg);
-                }
-                BoundIndexColumn::Expr(expr, _affinity) => {
-                    let self_table_context = table_references.joined_tables().first().map(|jt| {
-                        SelfTableContext::ForSelect {
-                            table_ref_id: jt.internal_id,
-                            referenced_tables: table_references.clone(),
-                        }
-                    });
-                    resolver.with_self_table_context(
-                        program,
-                        self_table_context.as_ref(),
-                        |program, _| {
-                            translate_expr_no_constant_opt(
-                                program,
-                                Some(&table_references),
-                                expr,
-                                col_value_reg,
-                                resolver,
-                                NoConstantOptReason::RegisterReuse,
-                            )?;
-                            Ok(())
-                        },
-                    )?;
-                }
-            }
+        let type_check_table = BTreeTable::type_check_table_ref(btree_table, schema);
+        // check for NOT NULL columns, plus all non-IPK columns in strict tables
+        let checked_columns = btree_table
+            .columns()
+            .iter()
+            .enumerate()
+            .filter(|(_, c)| !c.is_rowid_alias()) // nothing to check on IPK cols
+            .filter(|(_, c)| c.notnull() || btree_table.is_strict)
+            .map(|(idx, col)| {
+                let col_ref = match col.generated_type() {
+                    GeneratedType::Virtual { expr, .. } => BoundIndexColumn::Expr(
+                        Box::new(bind_expr_for_table(expr, &mut table_references, resolver)?),
+                        Some(col.affinity()),
+                    ),
+                    GeneratedType::NotGenerated => BoundIndexColumn::Column(idx),
+                };
 
-            let not_null_ok = program.allocate_label();
-            program.emit_insn(Insn::NotNull {
-                reg: col_value_reg,
-                target_pc: not_null_ok,
-            });
-            program.emit_string8(
-                format!("NULL value in {}.{}", btree_table.name, col_name),
-                message_reg,
-            );
-            emit_integrity_result_row(program, remaining_errors_reg, message_reg, had_error_reg);
-            program.preassign_label_to_next_insn(not_null_ok);
+                Ok((col_ref, col, &type_check_table.columns()[idx]))
+            })
+            .collect::<crate::Result<Vec<_>>>()?;
+
+        for (col_ref, col, type_check_col) in &checked_columns {
+            let col_reg = emit_column(
+                program,
+                resolver,
+                table_cursor_id,
+                &table_references,
+                col_ref,
+            )?;
+
+            let col_name = col.name.as_deref().unwrap_or("");
+            if btree_table.is_strict {
+                emit_strict_type_check(
+                    program,
+                    &registers,
+                    btree_table,
+                    type_check_col,
+                    col_name,
+                    col_reg,
+                );
+            }
+            if col.notnull() {
+                emit_notnull_check(program, &registers, btree_table, col_name, col_reg);
+            }
         }
 
         for check_expr in &bound_checks {
@@ -453,9 +452,9 @@ fn translate_integrity_check_impl(
             });
             program.emit_string8(
                 format!("CHECK constraint failed in {}", btree_table.name),
-                message_reg,
+                registers.message,
             );
-            emit_integrity_result_row(program, remaining_errors_reg, message_reg, had_error_reg);
+            emit_integrity_result_row(program, &registers);
             program.preassign_label_to_next_insn(check_ok);
         }
 
@@ -551,14 +550,12 @@ fn translate_integrity_check_impl(
                     record_reg: key_start_reg,
                     num_regs: bound_index.columns.len() + 1,
                 });
+                //TODO these 3 registers are always used together, need to package them in a struct
                 emit_row_missing_from_index_error(
                     program,
+                    &registers,
                     row_number_reg,
-                    scratch_reg,
-                    message_reg,
                     &bound_index.index.name,
-                    remaining_errors_reg,
-                    had_error_reg,
                 );
                 program.preassign_label_to_next_insn(found_label);
 
@@ -586,6 +583,7 @@ fn translate_integrity_check_impl(
                         cursor_id: bound_index.cursor_id,
                         pc_if_next: next_exists,
                         fullscan: false,
+                        is_index: false,
                     });
                     program.emit_insn(Insn::Goto {
                         target_pc: unique_ok,
@@ -600,14 +598,9 @@ fn translate_integrity_check_impl(
                     });
                     program.emit_string8(
                         format!("non-unique entry in index {}", bound_index.index.name),
-                        message_reg,
+                        registers.message,
                     );
-                    emit_integrity_result_row(
-                        program,
-                        remaining_errors_reg,
-                        message_reg,
-                        had_error_reg,
-                    );
+                    emit_integrity_result_row(program, &registers);
                     program.preassign_label_to_next_insn(unique_ok);
                 }
             }
@@ -618,6 +611,7 @@ fn translate_integrity_check_impl(
             cursor_id: table_cursor_id,
             pc_if_next: loop_start_label,
             fullscan: false,
+            is_index: false,
         });
         program.preassign_label_to_next_insn(table_empty_label);
 
@@ -650,14 +644,9 @@ fn translate_integrity_check_impl(
                 });
                 program.emit_string8(
                     format!("wrong # of entries in index {}", bound_index.index.name),
-                    message_reg,
+                    registers.message,
                 );
-                emit_integrity_result_row(
-                    program,
-                    remaining_errors_reg,
-                    message_reg,
-                    had_error_reg,
-                );
+                emit_integrity_result_row(program, &registers);
                 program.preassign_label_to_next_insn(counts_match);
             }
 
@@ -673,12 +662,12 @@ fn translate_integrity_check_impl(
 
     let has_errors_label = program.allocate_label();
     program.emit_insn(Insn::If {
-        reg: had_error_reg,
+        reg: registers.had_error,
         target_pc: has_errors_label,
         jump_if_null: false,
     });
-    program.emit_string8("ok".to_string(), message_reg);
-    program.emit_result_row(message_reg, 1);
+    program.emit_string8("ok".to_string(), registers.message);
+    program.emit_result_row(registers.message, 1);
     program.preassign_label_to_next_insn(has_errors_label);
 
     let column_name = if quick {
@@ -689,4 +678,126 @@ fn translate_integrity_check_impl(
     program.add_pragma_result_column(column_name.into());
 
     Ok(())
+}
+
+struct Registers {
+    message: usize,
+    scratch: usize,
+    had_error: usize,
+    remaining_errors: usize,
+}
+
+impl Registers {
+    fn init(program: &mut ProgramBuilder, max_errors: usize) -> Self {
+        let remaining_errors = program.alloc_register();
+        let had_error = program.alloc_register();
+        let message = program.alloc_register();
+        let scratch = program.alloc_register();
+
+        program.emit_int(max_errors.saturating_sub(1) as i64, remaining_errors);
+        program.emit_int(0, had_error);
+
+        Self {
+            message,
+            scratch,
+            had_error,
+            remaining_errors,
+        }
+    }
+}
+
+fn emit_strict_type_check(
+    program: &mut ProgramBuilder,
+    registers: &Registers,
+    btree_table: &Arc<BTreeTable>,
+    type_check_col: &Column,
+    col_name: &str,
+    col_reg: usize,
+) {
+    let Some(value_type) = type_check_col.strict_value_type() else {
+        return;
+    };
+
+    let type_ok = program.allocate_label();
+    program.emit_insn(Insn::IsType {
+        reg: col_reg,
+        target_pc: type_ok,
+        value_type,
+    });
+    program.emit_string8(
+        format!(
+            "non-{} value in {}.{}",
+            type_check_col.ty_str.to_ascii_uppercase(),
+            btree_table.name,
+            col_name
+        ),
+        registers.message,
+    );
+    emit_integrity_result_row(program, registers);
+    program.preassign_label_to_next_insn(type_ok);
+}
+
+fn emit_notnull_check(
+    program: &mut ProgramBuilder,
+    registers: &Registers,
+    btree_table: &Arc<BTreeTable>,
+    col_name: &str,
+    col_reg: usize,
+) {
+    let not_null_ok = program.allocate_label();
+    program.emit_insn(Insn::NotNull {
+        reg: col_reg,
+        target_pc: not_null_ok,
+    });
+    program.emit_string8(
+        format!("NULL value in {}.{}", btree_table.name, col_name),
+        registers.message,
+    );
+    emit_integrity_result_row(program, registers);
+    program.preassign_label_to_next_insn(not_null_ok);
+}
+
+/// Returns the register containing the column
+fn emit_column(
+    program: &mut ProgramBuilder,
+    resolver: &Resolver,
+    table_cursor_id: usize,
+    table_references: &TableReferences,
+    col_ref: &BoundIndexColumn,
+) -> crate::Result<usize> {
+    let col_value_reg = program.alloc_register();
+    match col_ref {
+        BoundIndexColumn::Column(idx) => {
+            program.emit_column_or_rowid(table_cursor_id, *idx, col_value_reg);
+        }
+        BoundIndexColumn::Expr(expr, affinity) => {
+            let self_table_context =
+                table_references
+                    .joined_tables()
+                    .first()
+                    .map(|jt| SelfTableContext::ForSelect {
+                        table_ref_id: jt.internal_id,
+                        referenced_tables: table_references.clone(),
+                    });
+            resolver.with_self_table_context(
+                program,
+                self_table_context.as_ref(),
+                |program, _| {
+                    translate_expr_no_constant_opt(
+                        program,
+                        Some(table_references),
+                        expr,
+                        col_value_reg,
+                        resolver,
+                        NoConstantOptReason::RegisterReuse,
+                    )?;
+                    if let Some(affinity) = affinity {
+                        program.emit_column_affinity(col_value_reg, *affinity);
+                    }
+                    Ok(())
+                },
+            )?;
+        }
+    }
+    Ok(col_value_reg)
 }

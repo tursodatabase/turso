@@ -1,0 +1,20 @@
+[package]
+name = "fts-benchmark"
+version = "0.1.0"
+edition = "2024"
+license.workspace = true
+
+[features]
+flamegraph = ["dep:pprof"]
+
+[dependencies]
+anyhow.workspace = true
+clap = { workspace = true, features = ["derive"] }
+memory-benchmark = { path = "../memory", features = ["fts"] }
+rusqlite.workspace = true
+serde_json.workspace = true
+tempfile.workspace = true
+tokio = { workspace = true, features = ["full"] }
+
+[target.'cfg(any(target_os = "linux", target_os = "macos"))'.dependencies]
+pprof = { version = "0.15.0", optional = true }

@@ -429,6 +429,20 @@ pub fn aggregate_functions() -> impl Iterator<Item = &'static FunctionDef> {
     AGGREGATE_FUNCTIONS.iter()
 }
 
+pub fn aggregate_result_depends_on_input_order(name: &str) -> bool {
+    [
+        "GROUP_CONCAT",
+        "STRING_AGG",
+        "ARRAY_AGG",
+        "JSON_GROUP_ARRAY",
+        "JSONB_GROUP_ARRAY",
+        "JSON_GROUP_OBJECT",
+        "JSONB_GROUP_OBJECT",
+    ]
+    .iter()
+    .any(|candidate| name.eq_ignore_ascii_case(candidate))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -501,6 +515,25 @@ mod tests {
         assert!(agg_funcs.iter().any(|f| f.name == "COUNT"));
         assert!(agg_funcs.iter().any(|f| f.name == "SUM"));
         assert!(agg_funcs.iter().all(|f| f.is_aggregate));
+    }
+
+    #[test]
+    fn collection_aggregate_results_depend_on_input_order() {
+        for name in [
+            "GROUP_CONCAT",
+            "STRING_AGG",
+            "ARRAY_AGG",
+            "JSON_GROUP_ARRAY",
+            "JSONB_GROUP_ARRAY",
+            "JSON_GROUP_OBJECT",
+            "JSONB_GROUP_OBJECT",
+        ] {
+            assert!(aggregate_result_depends_on_input_order(name), "{name}");
+        }
+
+        for name in ["COUNT", "SUM", "AVG", "TOTAL", "MIN", "MAX"] {
+            assert!(!aggregate_result_depends_on_input_order(name), "{name}");
+        }
     }
 
     #[test]

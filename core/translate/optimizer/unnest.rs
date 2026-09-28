@@ -98,10 +98,13 @@
 //!   `count` returns 0 and `sum` returns NULL. An extension aggregate may return
 //!   something else, and this code does not know which value to use.
 //!
-//! The code only moves direct `=` checks between an inner and outer column. Other
-//! forms stay as subqueries. `NOT IN` also stays as a subquery because NULL values
-//! can change its result. A one-value subquery stays as it is unless its result for
-//! an empty input is known.
+//! The `EXISTS`, `NOT EXISTS`, and direct positive `IN` rewrites can move
+//! comparisons between inner and outer expressions.
+//! They keep an inner `WHERE` expression in the subquery if it can fail.
+//! A join can skip a row that the subquery tests and hide an error.
+//! Aggregate rewrites only move direct `=` checks between inner and outer columns.
+//! `NOT IN` stays as a subquery because NULL values can change its result.
+//! A one-value subquery stays as it is unless its result for an empty input is known.
 //!
 //! References:
 //! - SQLite subquery results: https://sqlite.org/lang_expr.html#subquery_expressions
@@ -131,7 +134,8 @@ use crate::translate::{
     emitter::Resolver,
     expr::{
         expr_contains_nondeterministic_scalar_function, expr_references_any_subquery,
-        expr_references_subquery_id, get_expr_affinity, walk_expr, walk_expr_mut, WalkControl,
+        expr_references_subquery_id, expression_can_fail_on_input, get_expr_affinity, walk_expr,
+        walk_expr_mut, WalkControl,
     },
     plan::{
         plan_is_correlated, Distinctness, GroupBy, JoinInfo, JoinType, JoinedTable,
@@ -305,10 +309,6 @@ fn try_rewrite_in(
     if inner_plan.result_columns.len() != 1
         || expression_can_fail_on_input(&left)
         || expression_can_fail_on_input(&right)
-        || inner_plan
-            .where_clause
-            .iter()
-            .any(|term| expression_can_fail_on_input(&term.expr))
     {
         return Ok(false);
     }
@@ -1019,53 +1019,6 @@ fn aggregate_can_run_for_unused_rows(plan: &SelectPlan) -> bool {
         .any(expression_can_fail_on_input)
 }
 
-/// Return whether evaluating this expression can return an error.
-///
-/// For example, `json_extract(value, '$')` fails when `value` contains invalid
-/// JSON. This check uses these simple, strict rules:
-///
-/// - Every function call counts because an extension function can return an
-///   error, and there is no list of functions proved to be safe.
-/// - `LIKE` counts because it can call a user-defined `like` function.
-/// - `RAISE` counts because its purpose is to return an error.
-/// - JSON and array operators count because they can reject invalid input.
-///
-/// Callers use this check in two cases:
-///
-/// - An `IN` semi-join stops after its first match. It must not hide an error in
-///   a later inner row.
-/// - A grouped table computes keys that no outer row uses. It must not create
-///   an error that the original correlated subquery never created.
-fn expression_can_fail_on_input(expr: &Expr) -> bool {
-    let mut can_fail = false;
-    walk_expr(expr, &mut |expr: &Expr| -> Result<WalkControl> {
-        if matches!(
-            expr,
-            Expr::FunctionCall { .. }
-                | Expr::FunctionCallStar { .. }
-                | Expr::Like { .. }
-                | Expr::Raise(_, _)
-                | Expr::Binary(
-                    _,
-                    ast::Operator::ArrowRight
-                        | ast::Operator::ArrowRightShift
-                        | ast::Operator::ArrayContains
-                        | ast::Operator::ArrayOverlap,
-                    _
-                )
-        ) {
-            can_fail = true;
-        }
-        Ok(if can_fail {
-            WalkControl::SkipChildren
-        } else {
-            WalkControl::Continue
-        })
-    })
-    .expect("walking an expression cannot fail");
-    can_fail
-}
-
 /// Return the result for no input rows, if it is known.
 fn result_on_empty_input(plan: &SelectPlan) -> Option<EmptyInputValue> {
     let expr = &plan.result_columns[0].expr;
@@ -1341,7 +1294,9 @@ fn can_rewrite_as_semi_join(plan: &SelectPlan, resolver: &Resolver<'_>) -> Resul
     }
 
     for term in &plan.where_clause {
-        if expr_contains_nondeterministic_scalar_function(&term.expr, resolver)? {
+        if expression_can_fail_on_input(&term.expr)
+            || expr_contains_nondeterministic_scalar_function(&term.expr, resolver)?
+        {
             return Ok(false);
         }
     }
@@ -1441,40 +1396,43 @@ fn can_move_join_term(
         return true;
     }
 
-    is_inner_outer_equal_check(expr, outer_table_ids, inner_table_ids)
+    is_inner_outer_comparison(expr, outer_table_ids, inner_table_ids)
 }
 
-/// One side of an `=` check may use inner tables and the other may use outer tables.
-fn is_inner_outer_equal_check(
+/// One side of a comparison may use inner tables and the other may use outer tables.
+fn is_inner_outer_comparison(
     expr: &Expr,
     outer_table_ids: &[TableInternalId],
     inner_table_ids: &[TableInternalId],
 ) -> bool {
-    if let Expr::Binary(left, ast::Operator::Equals, right) = expr {
-        let left_tables = collect_table_refs(left);
-        let right_tables = collect_table_refs(right);
-
-        let left_is_outer = left_tables
-            .iter()
-            .all(|table| outer_table_ids.contains(table))
-            && !left_tables.is_empty();
-        let left_is_inner = left_tables
-            .iter()
-            .all(|table| inner_table_ids.contains(table))
-            && !left_tables.is_empty();
-        let right_is_outer = right_tables
-            .iter()
-            .all(|table| outer_table_ids.contains(table))
-            && !right_tables.is_empty();
-        let right_is_inner = right_tables
-            .iter()
-            .all(|table| inner_table_ids.contains(table))
-            && !right_tables.is_empty();
-
-        (left_is_outer && right_is_inner) || (left_is_inner && right_is_outer)
-    } else {
-        false
+    let Expr::Binary(left, operator, right) = expr else {
+        return false;
+    };
+    if !operator.is_comparison() {
+        return false;
     }
+
+    let left_tables = collect_table_refs(left);
+    let right_tables = collect_table_refs(right);
+
+    let left_is_outer = left_tables
+        .iter()
+        .all(|table| outer_table_ids.contains(table))
+        && !left_tables.is_empty();
+    let left_is_inner = left_tables
+        .iter()
+        .all(|table| inner_table_ids.contains(table))
+        && !left_tables.is_empty();
+    let right_is_outer = right_tables
+        .iter()
+        .all(|table| outer_table_ids.contains(table))
+        && !right_tables.is_empty();
+    let right_is_inner = right_tables
+        .iter()
+        .all(|table| inner_table_ids.contains(table))
+        && !right_tables.is_empty();
+
+    (left_is_outer && right_is_inner) || (left_is_inner && right_is_outer)
 }
 
 /// Return each table used by an expression.

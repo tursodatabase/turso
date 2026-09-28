@@ -9,6 +9,7 @@ use std::{
 use tokio::sync::Mutex;
 
 use crate::{
+    batch::{build_batch, decode_batch_result, BatchResult, IntoBatchStatement},
     params::{IntoParams, Params},
     protocol::{encode_value, NamedArg, Stmt, StreamRequest, StreamResponse, StreamResult},
     rows::{Row, Rows},
@@ -122,6 +123,199 @@ impl Connection {
                 "missing sequence result in pipeline response".to_string(),
             )),
         }
+    }
+
+    /// Execute multiple parameterized statements in a single HTTP request.
+    ///
+    /// The statements are sent as one batch (section 6.2 of the protocol
+    /// specification) and execute in order. Execution stops at the first
+    /// statement that fails: the remaining statements are skipped and the
+    /// returned [`Error::BatchStatementFailed`] carries the zero-based
+    /// index of the failing statement together with the underlying error.
+    ///
+    /// The batch is not transactional: each statement commits as it
+    /// executes, so statements that ran before a failure stay committed.
+    /// For all-or-nothing execution use
+    /// [`transactional_batch`](Connection::transactional_batch). If a
+    /// transaction is open on this connection — including when calling
+    /// through a [`Transaction`] — the statements join it instead of
+    /// committing individually.
+    ///
+    /// Accepts plain SQL strings, `(sql, params)` pairs, and
+    /// [`crate::BatchStatement`]s (see [`IntoBatchStatement`]). Returns one
+    /// [`BatchResult`] per statement, in order.
+    ///
+    /// # Example
+    ///
+    /// ```rust,no_run
+    /// # async fn run(conn: turso_serverless::Connection) -> turso_serverless::Result<()> {
+    /// // Statements whose parameters have the same type can be passed
+    /// // as (sql, params) pairs.
+    /// conn.batch([
+    ///     ("INSERT INTO users (name) VALUES (?1)", ("Alice",)),
+    ///     ("INSERT INTO users (name) VALUES (?1)", ("Bob",)),
+    /// ])
+    /// .await?;
+    ///
+    /// // Batches mixing parameter shapes use `BatchStatement`.
+    /// use turso_serverless::BatchStatement;
+    /// let results = conn
+    ///     .batch(vec![
+    ///         BatchStatement::new("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)", ())?,
+    ///         BatchStatement::new("INSERT INTO t (v) VALUES (?1)", ("x",))?,
+    ///     ])
+    ///     .await?;
+    /// assert_eq!(results[1].rows_affected(), 1);
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn batch<I>(&self, stmts: I) -> Result<Vec<BatchResult>>
+    where
+        I: IntoIterator,
+        I::Item: IntoBatchStatement,
+    {
+        self.run_batch(stmts, None).await
+    }
+
+    /// Execute multiple parameterized statements atomically, in a single
+    /// HTTP request.
+    ///
+    /// Like [`batch`](Connection::batch), but the statements are wrapped
+    /// in `BEGIN <behavior>` / `COMMIT`, with a `ROLLBACK` on failure, all
+    /// carried by the same request: either every statement commits or none
+    /// does. On failure the returned [`Error::BatchStatementFailed`]
+    /// carries the zero-based index of the failing statement.
+    ///
+    /// This method owns the surrounding transaction, so the statements
+    /// must not contain their own transaction-control SQL (`BEGIN`,
+    /// `COMMIT`, `END`, `ROLLBACK`, `SAVEPOINT`, `RELEASE`); a user-supplied
+    /// `COMMIT` would close the wrapper transaction mid-batch and leave
+    /// earlier statements committed, defeating the all-or-nothing contract.
+    /// If a transaction is already open on this connection, the wrapping is
+    /// skipped and the statements join it, exactly as with
+    /// [`batch`](Connection::batch).
+    ///
+    /// # Example
+    ///
+    /// ```rust,no_run
+    /// # async fn run(conn: turso_serverless::Connection) -> turso_serverless::Result<()> {
+    /// use turso_serverless::{BatchStatement, TransactionBehavior};
+    /// // A schema migration as one atomic round trip: DDL plus a
+    /// // parameterized bookkeeping INSERT.
+    /// conn.transactional_batch(
+    ///     vec![
+    ///         BatchStatement::new("CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT)", ())?,
+    ///         BatchStatement::new(
+    ///             "INSERT INTO migrations (version, applied_at) VALUES (?1, ?2)",
+    ///             (3, "2026-08-27"),
+    ///         )?,
+    ///     ],
+    ///     TransactionBehavior::Immediate,
+    /// )
+    /// .await?;
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn transactional_batch<I>(
+        &self,
+        stmts: I,
+        behavior: TransactionBehavior,
+    ) -> Result<Vec<BatchResult>>
+    where
+        I: IntoIterator,
+        I::Item: IntoBatchStatement,
+    {
+        self.run_batch(stmts, Some(behavior)).await
+    }
+
+    async fn run_batch<I>(
+        &self,
+        stmts: I,
+        wrap: Option<TransactionBehavior>,
+    ) -> Result<Vec<BatchResult>>
+    where
+        I: IntoIterator,
+        I::Item: IntoBatchStatement,
+    {
+        let stmts = Self::build_batch_stmts(stmts)?;
+        if stmts.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut session = self.session.lock().await;
+        self.maybe_handle_dangling_tx(&mut session).await?;
+        // With a transaction already open on the connection, another BEGIN
+        // would fail; the statements join the open transaction instead
+        // (matching the JavaScript driver).
+        let wrap = if self.shared.autocommit.load(Ordering::Relaxed) {
+            wrap
+        } else {
+            None
+        };
+        if wrap.is_some() {
+            Self::validate_managed_batch(&stmts)?;
+        }
+        let (batch, layout) = build_batch(stmts, wrap);
+        let results = session
+            .pipeline(vec![StreamRequest::Batch { batch }], true)
+            .await?;
+        match results.into_iter().next() {
+            Some(StreamResult::Ok {
+                response: StreamResponse::Batch { result },
+            }) => {
+                let decoded = decode_batch_result(result, &layout);
+                if let Some(rowid) = decoded.last_insert_rowid {
+                    session
+                        .shared
+                        .last_insert_rowid
+                        .store(rowid, Ordering::Relaxed);
+                }
+                decoded.outcome
+            }
+            Some(StreamResult::Error { error }) => Err(error.into()),
+            _ => Err(Error::Http(
+                "missing batch result in pipeline response".to_string(),
+            )),
+        }
+    }
+
+    fn build_batch_stmts<I>(stmts: I) -> Result<Vec<Stmt>>
+    where
+        I: IntoIterator,
+        I::Item: IntoBatchStatement,
+    {
+        stmts
+            .into_iter()
+            .enumerate()
+            .map(|(index, stmt)| {
+                stmt.into_batch_statement()
+                    .and_then(|stmt| Self::build_stmt(&stmt.sql, stmt.params, true))
+                    .map_err(|error| Error::BatchStatementFailed {
+                        index,
+                        error: Box::new(error),
+                        results: Vec::new(),
+                    })
+            })
+            .collect()
+    }
+
+    fn validate_managed_batch(stmts: &[Stmt]) -> Result<()> {
+        for (index, stmt) in stmts.iter().enumerate() {
+            if stmt
+                .sql
+                .as_deref()
+                .is_some_and(is_transaction_control_statement)
+            {
+                return Err(Error::BatchStatementFailed {
+                    index,
+                    error: Box::new(Error::Misuse(
+                        "transaction-control SQL is not allowed in a managed transactional batch"
+                            .to_string(),
+                    )),
+                    results: Vec::new(),
+                });
+            }
+        }
+        Ok(())
     }
 
     /// Prepare a SQL statement.
@@ -313,7 +507,7 @@ impl Connection {
                 None => {
                     return Err(Error::Http(
                         "missing execute result in pipeline response".to_string(),
-                    ))
+                    ));
                 }
             }
         }
@@ -343,5 +537,109 @@ impl Connection {
             }
         }
         Ok(stmt)
+    }
+}
+
+fn is_transaction_control_statement(sql: &str) -> bool {
+    let mut sql = sql;
+    loop {
+        sql = sql.trim_start_matches(|c: char| c.is_whitespace() || c == '\u{feff}' || c == ';');
+        if let Some(comment) = sql.strip_prefix("--") {
+            sql = comment.split_once('\n').map_or("", |(_, rest)| rest);
+        } else if let Some(comment) = sql.strip_prefix("/*") {
+            let Some((_, rest)) = comment.split_once("*/") else {
+                return false;
+            };
+            sql = rest;
+        } else {
+            break;
+        }
+    }
+    let keyword_end = sql
+        .find(|c: char| !c.is_ascii_alphabetic())
+        .unwrap_or(sql.len());
+    matches!(
+        &sql[..keyword_end].to_ascii_uppercase()[..],
+        "BEGIN" | "COMMIT" | "END" | "ROLLBACK" | "SAVEPOINT" | "RELEASE"
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{named_params, BatchStatement};
+
+    #[test]
+    fn batch_preflight_reports_late_infinite_positional_param() {
+        let statements = vec![
+            BatchStatement::new("SELECT ?1", (1.0,)).unwrap(),
+            BatchStatement::new("SELECT ?1", (f64::INFINITY,)).unwrap(),
+        ];
+        let error = Connection::build_batch_stmts(statements).unwrap_err();
+
+        assert!(matches!(
+            error,
+            Error::BatchStatementFailed {
+                index: 1,
+                error,
+                results,
+            } if matches!(*error, Error::ToSqlConversionFailure(_)) && results.is_empty()
+        ));
+    }
+
+    #[test]
+    fn batch_preflight_reports_infinite_named_param() {
+        let stmt =
+            BatchStatement::new("SELECT :x", named_params![":x": f64::NEG_INFINITY]).unwrap();
+        let error = Connection::build_batch_stmts([stmt]).unwrap_err();
+        assert!(matches!(
+            error,
+            Error::BatchStatementFailed {
+                index: 0,
+                error,
+                results,
+            } if matches!(*error, Error::ToSqlConversionFailure(_)) && results.is_empty()
+        ));
+    }
+
+    #[test]
+    fn transaction_control_detection_skips_space_and_comments() {
+        for sql in [
+            "BEGIN",
+            "  -- why\ncommit transaction",
+            "/* first */ SAVEPOINT s",
+            "; /* empty statement */ COMMIT",
+            "\u{feff}release s",
+            "END",
+        ] {
+            assert!(is_transaction_control_statement(sql), "{sql:?}");
+        }
+        for sql in [
+            "SELECT 'COMMIT'",
+            "CREATE TABLE rollback_log (x)",
+            "BEGINNING",
+            "/* unterminated",
+        ] {
+            assert!(!is_transaction_control_statement(sql), "{sql:?}");
+        }
+    }
+
+    #[test]
+    fn managed_batch_rejects_transaction_control_with_its_user_index() {
+        let stmts = Connection::build_batch_stmts([
+            "SELECT 1",
+            "; /* empty statement */ COMMIT",
+            "SELECT 2",
+        ])
+        .unwrap();
+        let error = Connection::validate_managed_batch(&stmts).unwrap_err();
+        assert!(matches!(
+            error,
+            Error::BatchStatementFailed {
+                index: 1,
+                error,
+                results,
+            } if matches!(*error, Error::Misuse(_)) && results.is_empty()
+        ));
     }
 }

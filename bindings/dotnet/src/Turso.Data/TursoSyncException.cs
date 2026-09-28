@@ -10,6 +10,9 @@ public enum TursoSyncOperationKind
     Connect,
     Pull,
     Apply,
+    Push,
+    Checkpoint,
+    Stats,
 }
 
 public sealed class TursoSyncException : TursoException

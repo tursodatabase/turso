@@ -1,17 +1,6 @@
-use std::sync::Arc;
-
-use crate::common::{ExecRows, TempDatabase};
-
-fn explain_plans(conn: &Arc<turso_core::Connection>, sql: &str) -> anyhow::Result<Vec<String>> {
-    let mut stmt = conn.prepare(format!("EXPLAIN QUERY PLAN {sql}"))?;
-    let mut plans = Vec::new();
-    stmt.run_with_row_callback(|row| {
-        plans.push(row.get::<String>(3)?);
-        Ok(())
-    })?;
-
-    Ok(plans)
-}
+use crate::assertions::AssertQueryPlan;
+use crate::common::{limbo_exec_rows, TempDatabase};
+use asserting::prelude::*;
 
 #[test]
 fn expression_index_used_for_where() -> anyhow::Result<()> {
@@ -25,14 +14,14 @@ fn expression_index_used_for_where() -> anyhow::Result<()> {
 
     conn.execute("CREATE INDEX idx_expr ON t(a + b)")?;
 
-    let plans = explain_plans(&conn, "SELECT * FROM t WHERE a + b = 7")?;
-    assert!(
-        plans.iter().any(|p| p.contains("idx_expr")),
-        "expected query plan to mention idx_expr, got {plans:?}"
-    );
+    assert_that!(limbo_exec_rows(
+        &conn,
+        "EXPLAIN QUERY PLAN SELECT * FROM t WHERE a + b = 7"
+    ))
+    .uses_index("idx_expr");
 
-    let rows: Vec<(i64, i64)> = conn.exec_rows("SELECT a, b FROM t WHERE a + b = 7");
-    assert_eq!(rows, vec![(3, 4)]);
+    assert_that!(limbo_exec_rows(&conn, "SELECT a, b FROM t WHERE a + b = 7"))
+        .is_equal_to(vec![row![3, 4]]);
     Ok(())
 }
 
@@ -48,18 +37,17 @@ fn expression_index_used_for_order_by() -> anyhow::Result<()> {
 
     conn.execute("CREATE INDEX idx_expr_order ON t(a + b)")?;
 
-    let plans = explain_plans(
+    assert_that!(limbo_exec_rows(
         &conn,
-        "SELECT a, b FROM t WHERE a + b > 0 ORDER BY a + b DESC LIMIT 1 OFFSET 0",
-    )?;
-    assert!(
-        plans.iter().any(|p| p.contains("idx_expr_order")),
-        "expected query plan to mention idx_expr_order, got {plans:?}"
-    );
+        "EXPLAIN QUERY PLAN SELECT a, b FROM t WHERE a + b > 0 ORDER BY a + b DESC LIMIT 1 OFFSET 0"
+    ))
+    .uses_index("idx_expr_order");
 
-    let rows: Vec<(i64, i64)> =
-        conn.exec_rows("SELECT a, b FROM t WHERE a + b > 0 ORDER BY a + b DESC LIMIT 1");
-    assert_eq!(rows, vec![(0, 5)]);
+    assert_that!(limbo_exec_rows(
+        &conn,
+        "SELECT a, b FROM t WHERE a + b > 0 ORDER BY a + b DESC LIMIT 1"
+    ))
+    .is_equal_to(vec![row![0, 5]]);
     Ok(())
 }
 
@@ -75,15 +63,16 @@ fn expression_index_covering_scan() -> anyhow::Result<()> {
 
     conn.execute("CREATE INDEX idx_expr_proj ON t(a + b)")?;
 
-    let plans = explain_plans(&conn, "SELECT a + b FROM t")?;
-    assert!(
-        plans
-            .iter()
-            .any(|p| p.contains("USING COVERING INDEX idx_expr_proj")),
-        "expected covering index usage, got {plans:?}"
-    );
+    assert_that!(limbo_exec_rows(
+        &conn,
+        "EXPLAIN QUERY PLAN SELECT a + b FROM t"
+    ))
+    .has_step_containing("USING COVERING INDEX idx_expr_proj");
 
-    let rows: Vec<(i64,)> = conn.exec_rows("SELECT a + b FROM t ORDER BY a + b");
-    assert_eq!(rows, vec![(3,), (7,), (11,)]);
+    assert_that!(limbo_exec_rows(&conn, "SELECT a + b FROM t ORDER BY a + b")).is_equal_to(vec![
+        row![3],
+        row![7],
+        row![11],
+    ]);
     Ok(())
 }

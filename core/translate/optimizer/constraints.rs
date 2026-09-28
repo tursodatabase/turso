@@ -4,7 +4,7 @@ use crate::translate::expr::comparison_affinity;
 use crate::{
     schema::{Column, Index, Schema},
     translate::{
-        collate::{get_collseq_from_expr, CollationSeq},
+        collate::{get_collseq_from_expr, resolve_comparison_collseq, CollationSeq},
         expr::{
             as_binary_components, get_expr_affinity, truth_test_rhs, unwrap_parens, walk_expr,
             walk_expr_mut, WalkControl,
@@ -210,9 +210,8 @@ impl Constraint {
 
     /// Whether this constraint can drive an index seek on its target column.
     /// Composes the `usable`/`table_col_pos` gates with the affinity check
-    /// against the column at `table_col_pos` in `columns` (set `is_strict`
-    /// only for STRICT tables; subqueries pass `false`).
-    pub fn can_drive_index_seek(&self, columns: &[Column], is_strict: bool) -> bool {
+    /// against the column at `table_col_pos` in `columns`.
+    pub fn can_drive_index_seek(&self, columns: &[Column]) -> bool {
         if !self.usable {
             return false;
         }
@@ -222,7 +221,7 @@ impl Constraint {
         let col = columns.get(pos).unwrap_or_else(|| {
             unreachable!("constraint table_col_pos {pos} out of bounds for {columns:?}")
         });
-        self.satisfies_index_affinity(col.affinity_with_strict(is_strict))
+        self.satisfies_index_affinity(col.affinity())
     }
 }
 
@@ -295,11 +294,10 @@ pub(super) fn automatic_index_terms(
     constraints: &TableConstraints,
 ) -> SmallVec<[ConstraintRef; 4]> {
     let columns = table.columns();
-    let is_strict = table.table.is_strict();
     let usable_constraints: SmallVec<[&Constraint; 4]> = constraints
         .constraints
         .iter()
-        .filter(|term| term.can_drive_index_seek(columns, is_strict))
+        .filter(|term| term.can_drive_index_seek(columns))
         .collect();
     let index_columns = ordered_ephemeral_key_columns(&usable_constraints);
 
@@ -307,7 +305,7 @@ pub(super) fn automatic_index_terms(
         .constraints
         .iter()
         .enumerate()
-        .filter(|(_, term)| term.can_drive_index_seek(columns, is_strict))
+        .filter(|(_, term)| term.can_drive_index_seek(columns))
         .filter_map(|(term_index, term)| {
             let table_col_pos = term.table_col_pos?;
             Some(ConstraintRef {
@@ -516,6 +514,168 @@ fn expression_matches_table(
             .is_some_and(|idx| mask.get(idx) && mask.count() == 1),
         Err(_) => false,
     }
+}
+
+pub(super) fn add_implied_column_equalities(
+    where_clause: &mut Vec<WhereTerm>,
+    table_references: &TableReferences,
+) -> Result<()> {
+    let mut columns = Vec::new();
+    let mut parents = Vec::new();
+    let mut direct_pairs = Vec::new();
+
+    for term in where_clause
+        .iter()
+        .filter(|term| term.from_outer_join.is_none())
+    {
+        let Some((left, operator, right)) = as_binary_components(&term.expr)? else {
+            continue;
+        };
+        if operator.as_ast_operator() != Some(ast::Operator::Equals) {
+            continue;
+        }
+        let (Some((left_table, left_column)), Some((right_table, right_column))) =
+            (plain_column(left), plain_column(right))
+        else {
+            continue;
+        };
+        if left_table == right_table {
+            continue;
+        }
+
+        let left_affinity = get_expr_affinity(left, Some(table_references), None);
+        let right_affinity = get_expr_affinity(right, Some(table_references), None);
+        let left_collation = get_collseq_from_expr(left, table_references)?.unwrap_or_default();
+        let right_collation = get_collseq_from_expr(right, table_references)?.unwrap_or_default();
+        if left_affinity != right_affinity
+            || left_collation != right_collation
+            || !matches!(
+                left_collation,
+                CollationSeq::Binary | CollationSeq::NoCase | CollationSeq::Rtrim
+            )
+        {
+            continue;
+        }
+
+        let left_index = find_or_add_equal_column(
+            &mut columns,
+            &mut parents,
+            left_table,
+            left_column,
+            left.clone(),
+        );
+        let right_index = find_or_add_equal_column(
+            &mut columns,
+            &mut parents,
+            right_table,
+            right_column,
+            right.clone(),
+        );
+        direct_pairs.push(ordered_pair(left_index, right_index));
+        union_equal_columns(&mut parents, left_index, right_index);
+    }
+
+    let mut inferred = Vec::new();
+    for member in 0..columns.len() {
+        let representative = equal_column_root(&mut parents, member);
+        if representative == member
+            || columns[representative].table == columns[member].table
+            || direct_pairs.contains(&ordered_pair(representative, member))
+            || both_columns_are_rowid_aliases(&columns[representative].expr, &columns[member].expr)
+        {
+            continue;
+        }
+        inferred.push(WhereTerm {
+            expr: ast::Expr::Binary(
+                Box::new(columns[representative].expr.clone()),
+                ast::Operator::Equals,
+                Box::new(columns[member].expr.clone()),
+            ),
+            from_outer_join: None,
+            // The inferred term can select an access path. The original
+            // equalities still verify the result during execution.
+            consumed: true,
+        });
+    }
+
+    where_clause.extend(inferred);
+    Ok(())
+}
+
+fn both_columns_are_rowid_aliases(left: &ast::Expr, right: &ast::Expr) -> bool {
+    matches!(
+        left,
+        ast::Expr::Column {
+            is_rowid_alias: true,
+            ..
+        }
+    ) && matches!(
+        right,
+        ast::Expr::Column {
+            is_rowid_alias: true,
+            ..
+        }
+    )
+}
+
+struct EqualColumn {
+    table: TableInternalId,
+    column: usize,
+    expr: ast::Expr,
+}
+
+fn plain_column(expr: &ast::Expr) -> Option<(TableInternalId, usize)> {
+    let ast::Expr::Column { table, column, .. } = expr else {
+        return None;
+    };
+    Some((*table, *column))
+}
+
+fn find_or_add_equal_column(
+    columns: &mut Vec<EqualColumn>,
+    parents: &mut Vec<usize>,
+    table: TableInternalId,
+    column: usize,
+    expr: ast::Expr,
+) -> usize {
+    if let Some(index) = columns
+        .iter()
+        .position(|item| item.table == table && item.column == column)
+    {
+        return index;
+    }
+    let index = columns.len();
+    columns.push(EqualColumn {
+        table,
+        column,
+        expr,
+    });
+    parents.push(index);
+    index
+}
+
+fn ordered_pair(left: usize, right: usize) -> (usize, usize) {
+    (left.min(right), left.max(right))
+}
+
+fn union_equal_columns(parents: &mut [usize], left: usize, right: usize) {
+    let left_root = equal_column_root(parents, left);
+    let right_root = equal_column_root(parents, right);
+    if left_root != right_root {
+        let representative = left_root.min(right_root);
+        parents[left_root] = representative;
+        parents[right_root] = representative;
+    }
+}
+
+fn equal_column_root(parents: &mut [usize], column: usize) -> usize {
+    let parent = parents[column];
+    if parent == column {
+        return column;
+    }
+    let root = equal_column_root(parents, parent);
+    parents[column] = root;
+    root
 }
 
 /// Precompute all potentially usable [Constraints] from a WHERE clause.
@@ -1021,12 +1181,31 @@ pub fn constraints_from_where_clause(
                 .table_col_pos
                 .and_then(|pos| table_reference.table.columns().get(pos));
             let column_collation = constrained_column.map(|c| c.collation());
-            let constraining_expr = constraint.get_constraining_expr_ref(where_clause);
-            // Index seek keys must use the same collation as the constrained column.
-            match (
-                get_collseq_from_expr(constraining_expr, table_references)?,
-                column_collation,
-            ) {
+            // Index seek keys compare with the index's collation, so the seek is
+            // only valid when the comparison itself uses that collation. The
+            // comparison collation follows the left operand, so a plain BINARY
+            // column on the left disqualifies an index on a NOCASE column even
+            // though neither side declares a collation explicitly.
+            let comparison_collation = if constraint.constraining_expr.is_some() {
+                get_collseq_from_expr(
+                    constraint.get_constraining_expr_ref(where_clause),
+                    table_references,
+                )?
+            } else {
+                let term_expr = &where_clause[constraint.where_clause_pos.0].expr;
+                match as_binary_components(term_expr)? {
+                    Some((lhs, op, rhs))
+                        if op.as_ast_operator().is_some_and(|op| op.is_comparison()) =>
+                    {
+                        Some(resolve_comparison_collseq(lhs, rhs, table_references)?)
+                    }
+                    _ => get_collseq_from_expr(
+                        constraint.get_constraining_expr_ref(where_clause),
+                        table_references,
+                    )?,
+                }
+            };
+            match (comparison_collation, column_collation) {
                 (Some(collation), Some(column_collation)) if collation != column_collation => {
                     constraint.usable = false;
                     continue;
@@ -1096,8 +1275,7 @@ pub fn constraints_from_where_clause(
                         {
                             continue;
                         }
-                        let idx_col_aff = constrained_column
-                            .affinity_with_strict(table_reference.table.is_strict());
+                        let idx_col_aff = constrained_column.affinity();
                         if !constraint.satisfies_index_affinity(idx_col_aff) {
                             continue;
                         }
@@ -1302,7 +1480,7 @@ pub fn usable_constraints_for_lhs_mask(
         if other_side_refers_to_self {
             // Self-referential constraints cannot seed a lookup, but if they are
             // on a later index column they also terminate the usable prefix.
-            if cref.index_col_pos != current_required_column_pos {
+            if cref.index_col_pos > current_required_column_pos {
                 break;
             }
             continue;
@@ -1311,7 +1489,7 @@ pub fn usable_constraints_for_lhs_mask(
             // Join-dependent constraints are only usable when every referenced
             // outer table is already on the left side of the join order. As
             // above, a missing earlier prefix column terminates the prefix.
-            if cref.index_col_pos != current_required_column_pos {
+            if cref.index_col_pos > current_required_column_pos {
                 break;
             }
             continue;
@@ -1499,7 +1677,7 @@ pub(super) fn partial_index_predicate_terms(
         .expect("partial_index_predicate_terms requires a partial index");
     let can_use_query_term = |term: &WhereTerm| -> bool {
         let Some(join_info) = &table_reference.join_info else {
-            return true;
+            return term.from_outer_join.is_none();
         };
         if join_info.is_full_outer() {
             return false;

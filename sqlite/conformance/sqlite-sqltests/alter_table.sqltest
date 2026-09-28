@@ -45,6 +45,30 @@ expect {
     CREATE INDEX i ON t (b)
 }
 
+@cross-check-integrity
+test alter-table-rename-column-table-unique-collate {
+    CREATE TABLE t (a TEXT, b TEXT, UNIQUE (a COLLATE NOCASE));
+    INSERT INTO t VALUES ('a', 'x');
+    ALTER TABLE t RENAME COLUMN b TO c;
+    ALTER TABLE t RENAME COLUMN a TO d;
+    SELECT d, c FROM t;
+}
+expect {
+    a|x
+}
+
+@cross-check-integrity
+test alter-table-rename-column-table-primary-key-collate {
+    CREATE TABLE t (a TEXT, b TEXT, PRIMARY KEY (a COLLATE NOCASE));
+    INSERT INTO t VALUES ('a', 'x');
+    ALTER TABLE t RENAME COLUMN b TO c;
+    ALTER TABLE t RENAME COLUMN a TO d;
+    SELECT d, c FROM t;
+}
+expect {
+    a|x
+}
+
 @skip-if mvcc "views not supported in MVCC mode"
 test alter-table-rename-column-view {
     CREATE TABLE t (a, b);
@@ -270,6 +294,19 @@ test alter-table-add-column-typed {
 expect {
     CREATE TABLE t (a, b DEFAULT 0)
     1|0
+}
+
+@cross-check-integrity
+test alter-table-add-drop-column-preserves-type-size {
+    CREATE TABLE t (a VARCHAR(10));
+    ALTER TABLE t ADD COLUMN b DECIMAL(10, 2);
+    SELECT sql FROM sqlite_schema;
+    ALTER TABLE t DROP COLUMN a;
+    SELECT sql FROM sqlite_schema;
+}
+expect {
+    CREATE TABLE t (a VARCHAR(10), b DECIMAL(10, 2))
+    CREATE TABLE t (b DECIMAL(10, 2))
 }
 
 @cross-check-integrity
@@ -582,6 +619,28 @@ test fail-alter-table-rename-to-existing-table {
 expect error {
 }
 
+@skip-if mvcc "views not supported in MVCC mode"
+@cross-check-integrity
+test fail-alter-table-rename-to-existing-view {
+    CREATE TABLE x (a);
+    CREATE VIEW y AS SELECT 1;
+    ALTER TABLE x RENAME TO y;
+}
+expect error {
+    there is already another table or index with this name: y
+}
+
+@skip-if mvcc "views not supported in MVCC mode"
+@cross-check-integrity
+test fail-alter-table-rename-to-existing-view-different-case {
+    CREATE TABLE x (a);
+    CREATE VIEW y AS SELECT 1;
+    ALTER TABLE x RENAME TO Y;
+}
+expect error {
+    there is already another table or index with this name: Y
+}
+
 @cross-check-integrity
 test alter-table-rename-to-quoted-identifier {
     CREATE TABLE t (a);
@@ -802,11 +861,13 @@ expect {
 test strict-alter-add-column-any {
     CREATE TABLE t(a INTEGER) STRICT;
     ALTER TABLE t ADD COLUMN b ANY;
-    INSERT INTO t VALUES(1, 3.14);
-    SELECT a, b FROM t;
+    INSERT INTO t VALUES(1, 3.14), (2, '000123'), (3, '1.5');
+    SELECT a, b, typeof(b) FROM t ORDER BY a;
 }
 expect {
-    1|3.14
+    1|3.14|real
+    2|000123|text
+    3|1.5|text
 }
 
 @cross-check-integrity
@@ -900,6 +961,51 @@ test strict-alter-add-column-default-mismatch-empty-table {
 }
 expect error {
     cannot store REAL value in INTEGER column t.b
+}
+
+# https://github.com/tursodatabase/turso/issues/8763
+@cross-check-integrity
+test nonstrict-alter-add-column-default-blob-from-text {
+    CREATE TABLE t(a INTEGER);
+    INSERT INTO t VALUES (1);
+    ALTER TABLE t ADD COLUMN b BLOB DEFAULT '';
+    SELECT quote(b), typeof(b) FROM t;
+}
+expect {
+    ''|text
+}
+
+@cross-check-integrity
+test nonstrict-alter-add-column-default-integer-fractional {
+    CREATE TABLE t(a INTEGER);
+    INSERT INTO t VALUES (1);
+    ALTER TABLE t ADD COLUMN b INTEGER DEFAULT 3.7;
+    SELECT b, typeof(b) FROM t;
+}
+expect {
+    3.7|real
+}
+
+@cross-check-integrity
+test nonstrict-alter-add-column-default-text-from-blob {
+    CREATE TABLE t(a INTEGER);
+    INSERT INTO t VALUES (1);
+    ALTER TABLE t ADD COLUMN b TEXT DEFAULT X'CAFE';
+    SELECT quote(b), typeof(b) FROM t;
+}
+expect {
+    X'CAFE'|blob
+}
+
+@cross-check-integrity
+test nonstrict-alter-add-column-default-real-nonnumeric {
+    CREATE TABLE t(a INTEGER);
+    INSERT INTO t VALUES (1);
+    ALTER TABLE t ADD COLUMN b REAL DEFAULT 'abc';
+    SELECT quote(b), typeof(b) FROM t;
+}
+expect {
+    'abc'|text
 }
 
 @cross-check-integrity

@@ -242,4 +242,4 @@ MIT
 ## Support
 
 - [GitHub Issues](https://github.com/tursodatabase/turso/issues)
-- [Discord Community](https://discord.gg/turso)
+- [Discord Community](https://tur.so/discord)

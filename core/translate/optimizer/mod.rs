@@ -4,15 +4,15 @@ use super::{
     plan::{
         DeletePlan, GroupBy, InSeekSource, IterationDirection, JoinInfo, JoinOrderMember, JoinType,
         JoinedTable, MinMaxDef, MultiIndexBranch, MultiIndexScanOp, Operation, Plan, Search,
-        SeekDef, SeekKey, SelectPlan, SetOperation, SimpleAggregate, TableReferences, UpdatePlan,
-        WhereTerm,
+        SeekDef, SeekKey, SelectPlan, SetOperation, SimpleAggregate, TablePlanEstimate,
+        TableReferences, UpdatePlan, WhereTerm,
     },
 };
 use crate::alloc::TursoIteratorExt;
 use crate::schema::GeneratedType;
 use crate::translate::expression_index::expression_index_column_usage;
 use crate::translate::plan::{BitSet, ColumnMask, MultiIndexBranchAccess};
-use crate::translate::planner::TableMask;
+use crate::translate::planner::{table_mask_from_expr, TableMask};
 use crate::{
     function::{AggFunc, Deterministic},
     index_method::{IndexMethodCostContext, IndexMethodCostEstimate},
@@ -22,6 +22,9 @@ use crate::{
         ROWID_SENTINEL,
     },
     translate::{
+        expr::{
+            expr_references_any_subquery, expr_references_outer_query, expression_can_fail_on_input,
+        },
         insert::ROWID_COLUMN,
         optimizer::{
             access_method::{AccessMethod, AccessMethodParams},
@@ -52,15 +55,15 @@ use crate::{
 };
 use crate::{turso_assert, turso_assert_eq, turso_debug_assert, turso_soft_unreachable};
 use constraints::{
-    can_use_partial_index, constraints_from_where_clause, partial_index,
-    partial_index_predicate_terms, Constraint,
+    add_implied_column_equalities, can_use_partial_index, constraints_from_where_clause,
+    partial_index, partial_index_predicate_terms, Constraint,
 };
-use cost::Cost;
+use cost::{estimate_scan_cost, estimate_sort_cpu_cost, Cost};
 use join::{
     compute_best_join_order_with_context, count_subquery_calls_for_plan, BestJoinOrderResult,
-    JoinN, JoinPlanningContext,
+    CorrelatedSubqueryEstimate, JoinN, JoinPlanningContext,
 };
-use lift_common_subexpressions::lift_common_subexpressions_from_binary_or_terms;
+use lift_common_subexpressions::rewrite_or_terms;
 use order::{
     compute_order_target, plan_satisfies_order_target, simple_aggregate_order_target,
     EliminatesSortBy, OrderTargetPurpose,
@@ -231,6 +234,54 @@ struct IndexMethodPatternMatch {
     pattern_columns: Vec<ast::ResultColumn>,
 }
 
+pub(crate) fn plan_index_method_predicate<'a>(
+    term: &WhereTerm,
+    table_references: &'a TableReferences,
+    resolver: &Resolver,
+) -> Option<(&'a JoinedTable, IndexMethodQuery)> {
+    let available_indexes = AvailableIndexes::for_table_references(resolver, table_references);
+    for table in table_references.joined_tables() {
+        let Some(indexes) = available_indexes.indexes_for_table(table.internal_id) else {
+            continue;
+        };
+        for index in indexes {
+            let Some(module) = &index.index_method else {
+                continue;
+            };
+            if index.is_backing_btree_index() {
+                continue;
+            }
+            for (pattern_idx, pattern) in module.definition().patterns.iter().enumerate() {
+                let Some(matched) = try_match_index_method_pattern(
+                    pattern,
+                    table,
+                    std::slice::from_ref(term),
+                    &[],
+                    &None,
+                    &None,
+                    pattern_idx,
+                    true,
+                ) else {
+                    continue;
+                };
+                if matched.where_covered.is_none() {
+                    continue;
+                }
+                return Some((
+                    table,
+                    IndexMethodQuery {
+                        index: index.clone(),
+                        pattern_idx,
+                        arguments: sorted_arguments_from_parameters(&matched.parameters),
+                        covered_columns: HashMap::default(),
+                    },
+                ));
+            }
+        }
+    }
+    None
+}
+
 /// Try to match an index method pattern against a query's clauses.
 #[allow(clippy::too_many_arguments)]
 fn try_match_index_method_pattern(
@@ -371,6 +422,7 @@ fn try_match_index_method_pattern(
             let captured = try_capture_parameters(pattern_off, query_off)?;
             parameters.extend(captured);
         }
+        (None, Some(_)) if pattern_has_limit => return None,
         (None, Some(_)) | (None, None) => {}
     }
 
@@ -820,13 +872,17 @@ fn detect_simple_aggregate(plan: &SelectPlan) -> Option<SimpleAggregate> {
         return None;
     }
 
+    let is_unfiltered_btree_count = matches!(table_ref.table, Table::BTree(..))
+        && plan.table_references.outer_query_refs().is_empty()
+        && plan.where_clause.is_empty()
+        && plan.offset.is_none();
+
     match agg.func {
-        AggFunc::Count0
-            if matches!(table_ref.table, Table::BTree(..))
-                && plan.table_references.outer_query_refs().is_empty()
-                && plan.where_clause.is_empty()
-                && plan.limit.is_none()
-                && plan.offset.is_none() =>
+        AggFunc::Count0 if is_unfiltered_btree_count => Some(SimpleAggregate::Count),
+        AggFunc::Count
+            if is_unfiltered_btree_count
+                && matches!(agg.distinctness, super::plan::Distinctness::NonDistinct)
+                && agg.args[0].is_nonnull(&plan.table_references) =>
         {
             Some(SimpleAggregate::Count)
         }
@@ -865,9 +921,10 @@ struct TableAccessPlan {
     access_methods: Vec<AccessMethod>,
     constraints: Vec<TableConstraints>,
     join: JoinN,
-    subquery_calls: SmallVec<[(TableInternalId, f64); 2]>,
+    subquery_calls: SmallVec<[CorrelatedSubqueryEstimate; 2]>,
     order_target: Option<OrderTarget>,
     sort_eliminated: bool,
+    initial_input_rows: f64,
 }
 
 #[derive(Default)]
@@ -889,6 +946,19 @@ pub fn optimize_select_plan(plan: &mut SelectPlan, resolver: &Resolver) -> Resul
     optimize_select_plan_with_cache(plan, resolver, &mut cache)
 }
 
+/// Whether the unnested form can be emitted.
+///
+/// Unnesting moves a subquery's WHERE clause into the outer query, so a term
+/// that is always false can travel with it, as in
+/// `WHERE a IN (SELECT z FROM t WHERE 'abc' AND t.z = o.b)`. The emitter skips
+/// loop setup for a query that returns no rows, and that setup is where a table
+/// the rewrite added to the FROM clause gets its result registers. Reading
+/// those registers afterwards is a bug, so run the correlated form instead. It
+/// returns the same rows.
+fn rewritten_form_is_emittable(rewritten: &SelectPlan) -> bool {
+    !rewritten.contains_constant_false_condition
+}
+
 #[turso_macros::trace_stack]
 fn optimize_select_plan_with_cache(
     plan: &mut SelectPlan,
@@ -900,6 +970,11 @@ fn optimize_select_plan_with_cache(
         .iter()
         .any(|subquery| subquery.correlated)
     {
+        return optimize_select_plan_form(plan, resolver, cache);
+    }
+
+    #[cfg(feature = "simulator")]
+    if resolver.subquery_unnesting_mode() == crate::SubqueryUnnestingMode::Disabled {
         return optimize_select_plan_form(plan, resolver, cache);
     }
 
@@ -927,18 +1002,47 @@ fn optimize_select_plan_with_cache(
     if full_join_rewrite_is_complete {
         let rewritten_table_plan =
             find_select_plan_form(&mut rewritten, resolver, cache, false, None)?;
+        if !rewritten_form_is_emittable(&rewritten) {
+            return optimize_select_plan_form(plan, resolver, cache);
+        }
+        *plan = rewritten;
+        apply_select_table_plan(plan, rewritten_table_plan, resolver)?;
+        return Ok(());
+    }
+
+    #[cfg(feature = "simulator")]
+    if resolver.subquery_unnesting_mode() == crate::SubqueryUnnestingMode::Forced {
+        let rewritten_table_plan =
+            find_select_plan_form(&mut rewritten, resolver, cache, false, None)?;
+        if !rewritten_form_is_emittable(&rewritten) {
+            return optimize_select_plan_form(plan, resolver, cache);
+        }
         *plan = rewritten;
         apply_select_table_plan(plan, rewritten_table_plan, resolver)?;
         return Ok(());
     }
 
     let original_table_plan = find_select_plan_form(plan, resolver, cache, true, None)?;
+    // The query already returns no rows, so a cheaper form cannot be found.
+    if plan.contains_constant_false_condition {
+        apply_select_table_plan(plan, original_table_plan, resolver)?;
+        return Ok(());
+    }
     let cost_limit = plan.estimated_cost.map(Cost);
     let rewritten_table_plan =
         find_select_plan_form(&mut rewritten, resolver, cache, false, cost_limit)?;
-    let use_rewritten = matches!(
-        (plan.estimated_cost, rewritten.estimated_cost),
-        (Some(original_cost), Some(rewritten_cost)) if rewritten_cost <= original_cost
+    // A form that returns no rows costs nothing, so it would always win the
+    // comparison below. Check that it can be emitted before comparing costs.
+    let use_rewritten = rewritten_form_is_emittable(&rewritten)
+        && matches!(
+            (plan.estimated_cost, rewritten.estimated_cost),
+            (Some(original_cost), Some(rewritten_cost)) if rewritten_cost <= original_cost
+        );
+    tracing::debug!(
+        original_cost = plan.estimated_cost,
+        rewritten_cost = rewritten.estimated_cost,
+        use_rewritten,
+        "correlated-subquery form cost comparison"
     );
     if use_rewritten {
         // Equal work is better without one subquery call per outer row.
@@ -1004,7 +1108,7 @@ fn find_select_plan_form(
     optimize_subqueries(plan, resolver, cache, save_subquery_plans)?;
     let available_indexes =
         AvailableIndexes::for_table_references(resolver, &plan.table_references);
-    lift_common_subexpressions_from_binary_or_terms(&mut plan.where_clause)?;
+    rewrite_or_terms(&mut plan.where_clause, &available_indexes)?;
     if let ConstantConditionEliminationResult::ImpossibleCondition =
         eliminate_constant_conditions(&mut plan.where_clause)?
     {
@@ -1040,7 +1144,9 @@ fn find_select_plan_form(
         plan.simple_aggregate = None;
     }
 
-    let table_cost = table_plan.as_ref().map(|table_plan| table_plan.join.cost);
+    let table_cost = table_plan.as_ref().map(|table_plan| {
+        table_plan.join.cost + required_group_sort_and_read_cost(plan, table_plan, params)
+    });
     let mut subquery_calls = table_plan
         .as_ref()
         .map(|table_plan| table_plan.subquery_calls.clone())
@@ -1074,8 +1180,8 @@ fn find_select_plan_form(
                         // These call counts cover the full result. LIMIT only
                         // needs the same share of those calls.
                         let call_scale = (rows / rows_before_limit).min(1.0);
-                        for (_, calls) in &mut subquery_calls {
-                            *calls *= call_scale;
+                        for estimate in &mut subquery_calls {
+                            estimate.calls *= call_scale;
                         }
                     }
                 }
@@ -1106,7 +1212,8 @@ fn find_select_plan_form(
                     let calls = if subquery.correlated {
                         subquery_calls
                             .iter()
-                            .find_map(|(id, calls)| (*id == subquery.internal_id).then_some(*calls))
+                            .find(|estimate| estimate.subquery_id == subquery.internal_id)
+                            .map(|estimate| estimate.calls)
                             .unwrap_or_else(|| plan.input_cardinality_hint.unwrap_or(1.0))
                     } else {
                         1.0
@@ -1123,6 +1230,27 @@ fn find_select_plan_form(
     }
 
     Ok(table_plan)
+}
+
+fn required_group_sort_and_read_cost(
+    plan: &SelectPlan,
+    table_plan: &TableAccessPlan,
+    params: &cost_params::CostModelParams,
+) -> Cost {
+    let group_sort_eliminated = table_plan.sort_eliminated
+        && table_plan.order_target.as_ref().is_some_and(|target| {
+            matches!(
+                &target.purpose,
+                OrderTargetPurpose::EliminatesSort(
+                    EliminatesSortBy::Group | EliminatesSortBy::GroupByAndOrder
+                )
+            )
+        });
+    if plan.group_by.as_ref().is_none_or(|group| group.sort_elided) || group_sort_eliminated {
+        return Cost(0.0);
+    }
+    let rows = table_plan.join.output_cardinality;
+    estimate_sort_cpu_cost(rows, params) + estimate_scan_cost(rows, 1.0, params)
 }
 
 /// Write the winning table plan into one version of a query.
@@ -1152,7 +1280,7 @@ fn optimize_delete_plan(plan: &mut DeletePlan, resolver: &Resolver) -> Result<()
     #[cfg(all(feature = "fts", not(target_family = "wasm")))]
     transform_match_to_fts_match(&mut plan.where_clause, resolver, &plan.table_references)?;
 
-    lift_common_subexpressions_from_binary_or_terms(&mut plan.where_clause)?;
+    rewrite_or_terms(&mut plan.where_clause, &available_indexes)?;
     if let ConstantConditionEliminationResult::ImpossibleCondition =
         eliminate_constant_conditions(&mut plan.where_clause)?
     {
@@ -1200,7 +1328,8 @@ fn optimize_update_plan(
     );
     #[cfg(all(feature = "fts", not(target_family = "wasm")))]
     transform_match_to_fts_match(&mut plan.where_clause, resolver, &target_tables)?;
-    lift_common_subexpressions_from_binary_or_terms(&mut plan.where_clause)?;
+    let available_indexes = AvailableIndexes::for_table_references(resolver, &target_tables);
+    rewrite_or_terms(&mut plan.where_clause, &available_indexes)?;
     if let ConstantConditionEliminationResult::ImpossibleCondition =
         eliminate_constant_conditions(&mut plan.where_clause)?
     {
@@ -1226,7 +1355,6 @@ fn optimize_update_plan(
     }
 
     let mut order_by = vec![];
-    let available_indexes = AvailableIndexes::for_table_references(resolver, &target_tables);
     let optimize_result = optimize_table_access(
         schema,
         resolver,
@@ -1689,7 +1817,7 @@ fn optimize_subqueries(
 fn plan_correlated_subqueries(
     plan: &mut SelectPlan,
     resolver: &Resolver,
-    subquery_calls: &[(TableInternalId, f64)],
+    subquery_calls: &[CorrelatedSubqueryEstimate],
     cache: &mut SubqueryPlanCache,
     save_plans: bool,
 ) -> Result<()> {
@@ -1700,9 +1828,13 @@ fn plan_correlated_subqueries(
         if !subquery.correlated || subquery.origin.is_write_statement() {
             continue;
         }
-        let call_count = subquery_calls
+        let estimate = subquery_calls
             .iter()
-            .find_map(|(id, calls)| (*id == subquery.internal_id).then_some(*calls))
+            .find(|estimate| estimate.subquery_id == subquery.internal_id);
+        subquery.preferred_eval_after_table =
+            estimate.and_then(|estimate| estimate.eval_after_table);
+        let call_count = estimate
+            .map(|estimate| estimate.calls)
             .unwrap_or_else(|| plan.input_cardinality_hint.unwrap_or(1.0))
             .max(1.0);
         let SubqueryState::Unevaluated {
@@ -1762,6 +1894,7 @@ fn optimize_table_access_with_custom_modules(
     result_columns: &mut [ResultSetColumn],
     table_references: &mut TableReferences,
     available_indexes: &AvailableIndexes,
+    subqueries: &[NonFromClauseSubquery],
     where_query: &mut [WhereTerm],
     order_by: &mut Vec<(
         Box<ast::Expr>,
@@ -1772,7 +1905,7 @@ fn optimize_table_access_with_custom_modules(
     limit: &mut Option<Box<Expr>>,
     offset: &mut Option<Box<Expr>>,
 ) -> Result<bool> {
-    let tables = table_references.joined_tables_mut();
+    let tables = table_references.joined_tables();
     if tables.is_empty() {
         return Ok(false);
     }
@@ -1784,7 +1917,7 @@ fn optimize_table_access_with_custom_modules(
 
     // Only optimize the first table with custom index methods.
     // This allows FTS to be used as the driving table in joins.
-    let table = &mut tables[0];
+    let table = &tables[0];
     let Some(indexes) = available_indexes.indexes_for_table(table.internal_id) else {
         return Ok(false);
     };
@@ -1796,7 +1929,7 @@ fn optimize_table_access_with_custom_modules(
             continue;
         }
         let definition = module.definition();
-        for (pattern_idx, pattern) in definition.patterns.iter().enumerate() {
+        'patterns: for (pattern_idx, pattern) in definition.patterns.iter().enumerate() {
             let Some(pattern_match) = try_match_index_method_pattern(
                 pattern,
                 table,
@@ -1809,6 +1942,12 @@ fn optimize_table_access_with_custom_modules(
             ) else {
                 continue;
             };
+
+            for argument in pattern_match.parameters.values() {
+                if !table_mask_from_expr(argument, table_references, subqueries)?.is_empty() {
+                    continue 'patterns;
+                }
+            }
 
             // Mark WHERE clause as consumed
             if let Some(where_covered) = pattern_match.where_covered {
@@ -1865,12 +2004,13 @@ fn optimize_table_access_with_custom_modules(
             // Sort and collect arguments
             let arguments = sorted_arguments_from_parameters(&pattern_match.parameters);
 
-            table.op = Operation::IndexMethodQuery(IndexMethodQuery {
-                index: index.clone(),
-                pattern_idx: pattern_match.pattern_idx,
-                covered_columns,
-                arguments,
-            });
+            table_references.joined_tables_mut()[0].op =
+                Operation::IndexMethodQuery(IndexMethodQuery {
+                    index: index.clone(),
+                    pattern_idx: pattern_match.pattern_idx,
+                    covered_columns,
+                    arguments,
+                });
             return Ok(true);
         }
     }
@@ -2240,7 +2380,7 @@ fn optimize_table_access(
     result_columns: &mut [ResultSetColumn],
     table_references: &mut TableReferences,
     available_indexes: &AvailableIndexes,
-    where_clause: &mut [WhereTerm],
+    where_clause: &mut Vec<WhereTerm>,
     order_by: &mut Vec<(
         Box<ast::Expr>,
         SortOrder,
@@ -2289,7 +2429,7 @@ fn find_table_access_plan(
     result_columns: &mut [ResultSetColumn],
     table_references: &mut TableReferences,
     available_indexes: &AvailableIndexes,
-    where_clause: &mut [WhereTerm],
+    where_clause: &mut Vec<WhereTerm>,
     order_by: &mut Vec<(
         Box<ast::Expr>,
         SortOrder,
@@ -2349,6 +2489,7 @@ fn find_table_access_plan(
             result_columns,
             table_references,
             available_indexes,
+            subqueries,
             where_clause,
             order_by,
             group_by,
@@ -2364,7 +2505,7 @@ fn find_table_access_plan(
 
     // For multi-table queries, collect index method candidates to pass to the DP algorithm.
     // This allows the optimizer to consider index methods at any position in the join order.
-    let base_table_rows_for_candidates = table_references
+    let base_table_rows = table_references
         .joined_tables()
         .iter()
         .map(|t| base_row_estimate(schema, t, params))
@@ -2379,7 +2520,7 @@ fn find_table_access_plan(
             group_by,
             limit,
             offset,
-            &base_table_rows_for_candidates,
+            &base_table_rows,
             params,
         )?
     } else {
@@ -2388,21 +2529,6 @@ fn find_table_access_plan(
     let maybe_order_target = simple_aggregate
         .and_then(|sa| simple_aggregate_order_target(sa, table_references))
         .or_else(|| compute_order_target(order_by, group_by.as_mut(), table_references));
-    let mut constraints_per_table = constraints_from_where_clause(
-        where_clause,
-        table_references,
-        available_indexes,
-        subqueries,
-        schema,
-        params,
-    )?;
-
-    let base_table_rows = table_references
-        .joined_tables()
-        .iter()
-        .map(|t| base_row_estimate(schema, t, params))
-        .collect::<Vec<_>>();
-
     // Currently the expressions we evaluate as constraints are binary comparisons that (except for IS/IS NOT)
     // will never be true for a NULL operand.
     // If there are any constraints on the right hand side table of an outer join that are not part of the outer join condition,
@@ -2412,9 +2538,7 @@ fn find_table_access_plan(
     // there can never be a situation where null columns are emitted for t2 because t2.id = 5 will never be true in that case.
     // hence: we can convert the outer join into an inner join.
     //
-    // Converting a LEFT JOIN into an INNER JOIN is an optimization opportunity:
-    // it can enable join reordering and let more predicates participate in key selection.
-    // -> recompute constraints if we rewrote a LEFT JOIN into an INNER JOIN.
+    // Converting a LEFT JOIN into an INNER JOIN can enable join reordering.
     loop {
         let mut outer_join_rewritten = false;
         for t in table_references.joined_tables_mut().iter_mut().filter(|t| {
@@ -2448,15 +2572,17 @@ fn find_table_access_plan(
         if !outer_join_rewritten {
             break;
         }
-        constraints_per_table = constraints_from_where_clause(
-            where_clause,
-            table_references,
-            available_indexes,
-            subqueries,
-            schema,
-            params,
-        )?;
     }
+
+    add_implied_column_equalities(where_clause, table_references)?;
+    let mut constraints_per_table = constraints_from_where_clause(
+        where_clause,
+        table_references,
+        available_indexes,
+        subqueries,
+        schema,
+        params,
+    )?;
 
     // Enforce INDEXED BY / NOT INDEXED after outer-join rewrites settle, because
     // a null-rejecting WHERE term can turn a LEFT JOIN into an INNER JOIN and
@@ -2543,6 +2669,7 @@ fn find_table_access_plan(
         subquery_calls,
         order_target: maybe_order_target,
         sort_eliminated,
+        initial_input_rows: initial_input_cardinality,
     }))
 }
 
@@ -2566,6 +2693,7 @@ fn apply_table_access_plan(
         subquery_calls: _,
         order_target: maybe_order_target,
         sort_eliminated,
+        initial_input_rows,
     } = plan;
 
     if sort_eliminated {
@@ -2595,6 +2723,33 @@ fn apply_table_access_plan(
         best_plan.best_access_methods().collect::<Vec<_>>(),
         best_plan.table_numbers().collect::<Vec<_>>(),
     );
+
+    for table in table_references.joined_tables_mut() {
+        table.plan_estimate = None;
+    }
+    let mut input_rows = initial_input_rows;
+    let mut total_cost = 0.0;
+    for (position, (&table_idx, &access_method_idx)) in best_table_numbers
+        .iter()
+        .zip(&best_access_methods)
+        .enumerate()
+    {
+        let access_method = &access_methods_arena[access_method_idx];
+        total_cost += access_method.cost.0;
+        let output_rows = best_plan.prefix_cardinalities[position];
+        table_references.joined_tables_mut()[table_idx].plan_estimate = Some(TablePlanEstimate {
+            input_rows,
+            rows_per_input: if input_rows == 0.0 {
+                0.0
+            } else {
+                output_rows / input_rows
+            },
+            output_rows,
+            access_cost: access_method.cost.0,
+            total_cost,
+        });
+        input_rows = output_rows;
+    }
 
     // Collect hash join build/probe table indices. Build tables are excluded from the main
     // join order because they are consumed during hash build. A table may appear as both
@@ -2722,7 +2877,11 @@ fn apply_table_access_plan(
                     );
                     *index = Some(Arc::new(ephemeral_index_build(
                         &table_references.joined_tables()[table_idx],
+                        table_references,
+                        &constraints_per_table[table_idx].constraints,
                         constraint_refs,
+                        where_clause,
+                        resolver,
                     )?));
                     *build_index = false;
                 }
@@ -3031,6 +3190,11 @@ fn apply_table_access_plan(
             hash_build_by_probe[member.original_idx] = Some(hash_join_op.build_table_idx);
         }
     }
+    let selected_build_searches: Vec<bool> = table_references
+        .joined_tables()
+        .iter()
+        .map(|table| matches!(table.op, Operation::Search(_)))
+        .collect();
 
     // If hash-join build constraints are still evaluated later (not consumed),
     // avoid materializing the build input to reduce redundant scans.
@@ -3083,7 +3247,7 @@ fn apply_table_access_plan(
             has_prior_constraints = true;
             break;
         }
-        if !has_prior_constraints {
+        if !has_prior_constraints && !selected_build_searches[hash_join_op.build_table_idx] {
             hash_join_op.materialize_build_input = false;
         }
     }
@@ -3341,6 +3505,8 @@ impl Optimizable for ast::Expr {
                 lhs, start, end, ..
             } => lhs.is_nonnull(tables) && start.is_nonnull(tables) && end.is_nonnull(tables),
             Expr::Binary(_, ast::Operator::Modulus | ast::Operator::Divide, _) => false, // 1 % 0, 1 / 0
+            Expr::Binary(_, ast::Operator::ArrowRight | ast::Operator::ArrowRightShift, _) => false, // JSON path may be absent, yielding NULL
+            Expr::Binary(_, ast::Operator::ArrayContains | ast::Operator::ArrayOverlap, _) => false,
             Expr::Binary(expr, _, expr1) => expr.is_nonnull(tables) && expr1.is_nonnull(tables),
             Expr::Case {
                 when_then_pairs,
@@ -3395,7 +3561,19 @@ impl Optimizable for ast::Expr {
             Expr::InSelect { .. } => false,
             Expr::InTable { .. } => false,
             Expr::IsNull(..) => true,
-            Expr::Like { lhs, rhs, .. } => lhs.is_nonnull(tables) && rhs.is_nonnull(tables),
+            Expr::Like {
+                op: ast::LikeOperator::Regexp,
+                ..
+            } => false,
+            Expr::Like {
+                lhs, rhs, escape, ..
+            } => {
+                lhs.is_nonnull(tables)
+                    && rhs.is_nonnull(tables)
+                    && escape
+                        .as_ref()
+                        .is_none_or(|escape| escape.is_nonnull(tables))
+            }
             Expr::Literal(literal) => match literal {
                 ast::Literal::Numeric(_) => true,
                 ast::Literal::String(_) => true,
@@ -3622,7 +3800,11 @@ impl Optimizable for ast::Expr {
 
 fn ephemeral_index_build(
     table_reference: &JoinedTable,
+    table_references: &TableReferences,
+    constraints: &[Constraint],
     constraint_refs: &[RangeConstraintRef],
+    where_clause: &[WhereTerm],
+    resolver: &Resolver<'_>,
 ) -> Result<Index> {
     let mut ephemeral_columns: crate::alloc::Vec<IndexColumn> = table_reference
         .columns()
@@ -3674,7 +3856,15 @@ fn ephemeral_index_build(
         ephemeral: true,
         table_name: table_reference.table.get_name().to_string(),
         root_page: 0,
-        where_clause: None,
+        where_clause: autoindex_prefilter(
+            table_reference,
+            table_references,
+            constraints,
+            constraint_refs,
+            where_clause,
+            resolver,
+        )
+        .map(Box::new),
         has_rowid: table_reference
             .table
             .btree()
@@ -3684,6 +3874,98 @@ fn ephemeral_index_build(
     };
 
     Ok(ephemeral_index)
+}
+
+/// Find conditions that can filter rows while an automatic index is built.
+///
+/// For example, given:
+///
+/// ```sql
+/// SELECT *
+/// FROM accounts AS a
+/// JOIN events AS e ON e.account_id = a.id
+/// WHERE e.created_at >= '2024-01-01';
+/// ```
+///
+/// `e.account_id = a.id` needs the current account, so it is applied when the
+/// index is searched. The date condition needs only an event row and a fixed
+/// value, so rows before that date can be left out of the index entirely.
+fn autoindex_prefilter(
+    table_reference: &JoinedTable,
+    table_references: &TableReferences,
+    constraints: &[Constraint],
+    constraint_refs: &[RangeConstraintRef],
+    where_clause: &[WhereTerm],
+    resolver: &Resolver<'_>,
+) -> Option<Expr> {
+    let is_outer_join = table_reference
+        .join_info
+        .as_ref()
+        .is_some_and(JoinInfo::is_outer);
+    if table_reference
+        .join_info
+        .as_ref()
+        .is_some_and(JoinInfo::is_full_outer)
+    {
+        return None;
+    }
+
+    let mut term_positions = SmallVec::<[usize; 4]>::new();
+    for constraint_ref in constraint_refs {
+        for constraint_pos in [
+            constraint_ref.eq.as_ref().map(|eq| eq.constraint_pos),
+            constraint_ref.lower_bound,
+            constraint_ref.upper_bound,
+        ] {
+            let Some(constraint_pos) = constraint_pos else {
+                continue;
+            };
+            let constraint = &constraints[constraint_pos];
+            let Some(column_pos) = constraint.table_col_pos else {
+                continue;
+            };
+            let column = &table_reference.columns()[column_pos];
+            let depends_on_another_table = !constraint.lhs_mask.is_empty();
+            let is_virtual_column = column.is_virtual_generated();
+            let is_array = column.is_array();
+            let has_custom_type = resolver
+                .schema()
+                .get_type_def(&column.ty_str, table_reference.table.is_strict())
+                .is_some();
+            if depends_on_another_table || is_virtual_column || is_array || has_custom_type {
+                continue;
+            }
+
+            let term_pos = constraint.where_clause_pos.0;
+            let term = &where_clause[term_pos];
+            let runs_before_outer_join_condition =
+                is_outer_join && term.from_outer_join != Some(table_reference.internal_id);
+            let comes_from_another_outer_join = term
+                .from_outer_join
+                .is_some_and(|table_id| table_id != table_reference.internal_id);
+            let depends_on_outer_query = expr_references_outer_query(&term.expr, table_references);
+            let contains_subquery = expr_references_any_subquery(&term.expr);
+            // The build scans inner rows whose keys might never be searched.
+            // Do not make a possibly failing expression run for those rows.
+            let can_fail_for_unused_row = expression_can_fail_on_input(&term.expr);
+            let was_already_added = term_positions.contains(&term_pos);
+            if runs_before_outer_join_condition
+                || comes_from_another_outer_join
+                || depends_on_outer_query
+                || contains_subquery
+                || can_fail_for_unused_row
+                || was_already_added
+            {
+                continue;
+            }
+            term_positions.push(term_pos);
+        }
+    }
+
+    term_positions
+        .into_iter()
+        .map(|term_pos| where_clause[term_pos].expr.clone())
+        .reduce(|left, right| Expr::Binary(Box::new(left), ast::Operator::And, Box::new(right)))
 }
 
 /// Build a [SeekDef] for a given list of [Constraint]s

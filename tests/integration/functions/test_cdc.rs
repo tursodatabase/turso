@@ -4,7 +4,9 @@ use rusqlite::types::Value;
 use turso_core::types::ImmutableRecord;
 use turso_core::CDC_VERSION_CURRENT;
 
+use crate::assertions::{AssertColumn, Cell};
 use crate::common::{limbo_exec_rows, limbo_exec_rows_fallible, TempDatabase};
+use asserting::prelude::*;
 
 fn replace_column_with_null(rows: Vec<Vec<Value>>, column: usize) -> Vec<Vec<Value>> {
     rows.into_iter()
@@ -1738,10 +1740,11 @@ fn test_cdc_v2_no_change_commit_then_rollback(db: TempDatabase) {
         &conn,
         "SELECT change_txn_id FROM turso_cdc WHERE change_type = 2",
     );
-    assert_eq!(commits.len(), 2);
-    assert!(commits
-        .iter()
-        .all(|row| !matches!(row[0], Value::Integer(-1))));
+    assert_that!(commits)
+        .named("commit records")
+        .has_length(2)
+        .column(0)
+        .does_not_contain(Cell::from(-1));
 }
 
 #[turso_macros::test]

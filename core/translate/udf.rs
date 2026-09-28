@@ -314,6 +314,7 @@ fn emit_delete_function_row(
         cursor_id: functions_cursor_id,
         pc_if_next: loop_start_label,
         fullscan: false,
+        is_index: false,
     });
     program.preassign_label_to_next_insn(end_loop_label);
 }

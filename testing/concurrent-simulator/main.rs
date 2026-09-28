@@ -479,6 +479,11 @@ fn build_workloads_and_properties(args: &Args) -> BuildArtifacts {
             (10, Box::new(AutoincInsertWorkload)),
             (5, Box::new(AutoincUpdateRowidWorkload)),
             (3, Box::new(AutoincDeleteWorkload)),
+            (12, Box::new(FtsInsertWorkload)),
+            (8, Box::new(FtsUpdateWorkload)),
+            (6, Box::new(FtsDeleteWorkload)),
+            (10, Box::new(FtsMatchWorkload)),
+            (2, Box::new(FtsOptimizeWorkload)),
             (30, Box::new(BeginWorkload)),
             (10, Box::new(CommitWorkload)),
             (10, Box::new(RollbackWorkload)),
@@ -490,9 +495,10 @@ fn build_workloads_and_properties(args: &Args) -> BuildArtifacts {
             Box::new(SimpleKeysDoNotDisappear::new()),
             Box::new(SequenceCorrectnessProperty::new()),
             Box::new(AutoincWatermarkMonotonicity::new()),
+            Box::new(FtsSelfDifferentialProperty),
         ];
 
-        (w, p, vec![], vec![])
+        (w, p, fts_sim_schema(), vec![])
     }
 }
 
@@ -557,12 +563,13 @@ fn format_stats(stats: &turso_whopper::Stats, elle_mode: bool) -> String {
         format!("{}/{}", stats.elle_writes, stats.elle_reads)
     } else {
         format!(
-            "{}/{}/{}/{}/{}",
+            "{}/{}/{}/{}/{}/{}",
             stats.inserts,
             stats.updates,
             stats.deletes,
             stats.integrity_checks,
-            stats.sequence_nextvals
+            stats.sequence_nextvals,
+            stats.fts_checks
         )
     }
 }
@@ -572,7 +579,7 @@ fn progress_art(elle_mode: bool) -> [&'static str; 11] {
         if elle_mode {
             "       .             W/R"
         } else {
-            "       .             I/U/D/C/S"
+            "       .             I/U/D/C/S/F"
         },
         "       .             ",
         "       .             ",
@@ -596,6 +603,11 @@ fn init_logger() {
                 .without_time()
                 .with_thread_ids(false),
         )
-        .with(EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")))
+        // Tantivy chatters at INFO on every FTS segment build/merge; keep
+        // the progress display readable by default.
+        .with(
+            EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| EnvFilter::new("info,tantivy=warn")),
+        )
         .try_init();
 }

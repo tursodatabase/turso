@@ -58,7 +58,7 @@ using [sqlite-viz](https://github.com/LeMikaelF/sqlite-viz). SQLite (and possibl
 can also dump information about certain pages in a human-readable form (see the `dump` command and the `-p` flag for
 pages, or `-t` for trees), so that you can either reason better about them, or pass them to an LLM.
 
-You might also try binary-searching for the time that the corruption occured. The resolution of `rewind()` is
+You might also try binary-searching for the time that the corruption occurred. The resolution of `rewind()` is
 only one millisecond, but that will at least give you an idea:
 
 ```js

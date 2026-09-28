@@ -9,8 +9,9 @@ use crate::incremental::operator::{
 use crate::sync::Mutex;
 use crate::sync::{atomic::Ordering, Arc};
 use crate::types::IOResult;
+use crate::types::IOResultOr;
 use crate::SqliteDialect;
-use crate::{Connection, Database, Result, Value};
+use crate::{Connection, Database, Value};
 
 #[derive(Debug, Clone)]
 pub struct ProjectColumn {
@@ -104,7 +105,7 @@ impl IncrementalOperator for ProjectOperator {
         &mut self,
         state: &mut EvalState,
         _cursors: &mut DbspStateCursors,
-    ) -> Result<IOResult<Delta>> {
+    ) -> IOResultOr<Delta> {
         let delta = match state {
             EvalState::Init { deltas } => {
                 // Project operators only use left_delta, right_delta must be empty
@@ -135,11 +136,7 @@ impl IncrementalOperator for ProjectOperator {
         Ok(IOResult::Done(output_delta))
     }
 
-    fn commit(
-        &mut self,
-        deltas: DeltaPair,
-        _cursors: &mut DbspStateCursors,
-    ) -> Result<IOResult<Delta>> {
+    fn commit(&mut self, deltas: DeltaPair, _cursors: &mut DbspStateCursors) -> IOResultOr<Delta> {
         // Project operator only uses left delta, right must be empty
         assert!(
             deltas.right.is_empty(),

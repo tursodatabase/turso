@@ -749,10 +749,6 @@ fn emit_delete_row_common(
                     table_reference.table.columns(),
                     main_table_cursor_id,
                     rowid_reg,
-                    table_reference
-                        .table
-                        .btree()
-                        .is_some_and(|btree| btree.is_strict),
                 ))
             } else {
                 None

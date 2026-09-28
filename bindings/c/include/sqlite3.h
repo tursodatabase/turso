@@ -88,6 +88,7 @@ int sqlite3_trace_v2(sqlite3 *_db,
 void sqlite3_progress_handler(sqlite3 *_db, int _n, int (*_callback)(void *), void *_context);
 
 int sqlite3_busy_timeout(sqlite3 *_db, int _ms);
+int sqlite3_db_readonly(sqlite3 *_db, const char *_db_name);
 
 int sqlite3_set_authorizer(sqlite3 *db,
                            int (*xAuth)(void*, int, const char*, const char*, const char*, const char*),
@@ -186,6 +187,8 @@ int sqlite3_deserialize(sqlite3 *_db, const char *_schema, const void *_in_, int
 int sqlite3_get_autocommit(sqlite3 *_db);
 
 int sqlite3_total_changes(sqlite3 *_db);
+
+int64_t sqlite3_total_changes64(sqlite3 *_db);
 
 int64_t sqlite3_last_insert_rowid(sqlite3 *_db);
 
@@ -349,6 +352,8 @@ int sqlite3_blob_bytes(void *_blob);
 int sqlite3_blob_close(void *_blob);
 
 int sqlite3_stricmp(const char *_a, const char *_b);
+
+int sqlite3_strnicmp(const char *_a, const char *_b, int _n);
 
 int sqlite3_create_collation_v2(sqlite3 *_db,
                                 const char *_name,

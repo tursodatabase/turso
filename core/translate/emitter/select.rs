@@ -308,19 +308,17 @@ struct MaterializationSpec {
     payload_columns: Vec<MaterializedColumnRef>,
 }
 
-/// Build materialized hash-build inputs for hash joins that depend on prior joins.
+/// Store filtered hash-build inputs before the hash table is built.
 ///
 /// A materialized build input is an ephemeral table that captures the rows
-/// a hash join is allowed to build from after earlier joins and filters have
-/// been applied. This prevents the build side from being re-scanned in its
-/// full, unfiltered form when prior join constraints must be respected.
+/// a hash join can use after earlier reads and filters have run. This prevents
+/// a second, unfiltered scan of the build table.
 ///
 /// The materialization uses a join-prefix: all tables that appear before the
 /// probe table in the join order, plus the build table itself. This prefix
 /// represents the minimal context needed to evaluate build-side constraints.
-/// For probe->build chaining we store join keys and payload columns directly
-/// in the ephemeral table; otherwise we only store rowids and `SeekRowid`
-/// during probing when needed.
+/// The table stores keys and payload for a filtered read or a multi-table
+/// prefix. It can store rowids for a single unfiltered table.
 pub(crate) fn emit_materialized_build_inputs(
     program: &mut ProgramBuilder,
     resolver: &Resolver,
@@ -352,6 +350,7 @@ pub(crate) fn emit_materialized_build_inputs(
                 continue;
             }
             seen_build_tables.set(hash_join_op.build_table_idx)?;
+            let build_table = &plan.table_references.joined_tables()[hash_join_op.build_table_idx];
 
             let probe_table_idx = hash_join_op.probe_table_idx;
             let probe_pos = plan
@@ -402,10 +401,14 @@ pub(crate) fn emit_materialized_build_inputs(
             let prefix_has_other_tables = included_tables
                 .iter()
                 .any(|table_idx| table_idx != hash_join_op.build_table_idx);
+            let build_read_is_in_seek =
+                matches!(build_table.op, Operation::Search(Search::InSeek { .. }));
 
-            if build_table_was_prior_probe || prefix_has_other_tables {
-                // Prior probe -> build chaining OR any multi-table prefix requires keys+payload
-                // so we do not lose multiplicity or correlation.
+            if build_table_was_prior_probe
+                || prefix_has_other_tables
+                || build_read_is_in_seek
+                || build_table.selected_index_stores_used_columns()
+            {
                 let payload_columns = collect_materialized_payload_columns(plan, &included_tables)?;
                 let key_exprs: Vec<Expr> = hash_join_op
                     .join_keys
@@ -485,6 +488,7 @@ pub(crate) fn emit_materialized_build_inputs(
             true,
             crate::translate::eqp::EqpDetail::HashBuild {
                 table: crate::translate::eqp::EqpTable::from_joined(build_table),
+                estimate: build_table.plan_estimate,
             }
         );
         program.emit_insn(Insn::OpenEphemeral {
@@ -521,6 +525,10 @@ pub(crate) fn emit_materialized_build_inputs(
                 prefix_tables: spec.prefix_tables.clone(),
             },
         );
+    }
+
+    for build_table_idx in build_inputs.keys() {
+        plan.table_references.joined_tables_mut()[*build_table_idx].clear_expression_index_usages();
     }
 
     // Drop any join-prefix tables already captured by key+payload materializations.
@@ -802,6 +810,14 @@ fn build_materialized_build_input_plan(
     // the materialization subplan does not try to use an access path that
     // requires tables outside the prefix. If it does, we fall back to a scan.
     let mut table_references = plan.table_references.clone();
+    if matches!(mode, MaterializedBuildInputMode::KeyPayload { .. }) {
+        for table_idx in included_tables.iter() {
+            let table = &mut table_references.joined_tables_mut()[table_idx];
+            if !table.selected_index_stores_used_columns() {
+                table.clear_expression_index_usages();
+            }
+        }
+    }
     for joined_table in table_references.joined_tables_mut().iter_mut() {
         if let Operation::HashJoin(hash_join_op) = &mut joined_table.op {
             if hash_join_op.build_table_idx == build_table_idx {

@@ -704,6 +704,15 @@ pub fn insn_to_row(
                     cursor_id, column, target_pc.as_debug_int()
                 ),
             ),
+            Insn::IsType { reg, target_pc, value_type } => (
+                "IsType",
+                *reg as i64,
+                target_pc.as_debug_int() as i64,
+                0,
+                Value::build_text(value_type.to_string()),
+                0,
+                String::new(),
+            ),
             Insn::TypeCheck {
                 start_reg,
                 count,
@@ -973,6 +982,7 @@ pub fn insn_to_row(
                 cursor_id,
                 pc_if_next,
                 fullscan,
+                ..
             } => (
                 "Next",
                 *cursor_id as i64,
@@ -2065,6 +2075,7 @@ pub fn insn_to_row(
                 cursor_id,
                 pc_if_prev,
                 fullscan,
+                ..
             } => (
                 "Prev",
                 *cursor_id as i64,
@@ -2574,7 +2585,7 @@ pub fn insn_to_row(
             0,
             String::new(),
         ),
-        Insn::HashProbe{hash_table_id: hash_table_reg, key_start_reg, num_keys, dest_reg, target_pc, payload_dest_reg, num_payload, probe_rowid_reg: _} => {
+        Insn::HashProbe{hash_table_id: hash_table_reg, key_start_reg, num_keys, dest_reg, target_pc, deferred_target_pc: _, payload_dest_reg, num_payload, probe_rowid_reg: _} => {
             let payload_info = if let Some(p_reg) = payload_dest_reg {
                 format!(" payload=r[{}]..r[{}]", p_reg, p_reg + num_payload - 1)
             } else {

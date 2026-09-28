@@ -1,0 +1,41 @@
+@database :memory:
+
+# Regression tests for https://github.com/tursodatabase/turso/issues/9068
+#
+# ADD COLUMN rewrites the stored CREATE TABLE text. A column named with a
+# keyword (`"order"`) that appears inside a table-level PRIMARY KEY must keep
+# its quotes in the rewritten text. Otherwise the schema text becomes
+# `PRIMARY KEY (id, order)`, which no longer parses, so every later ALTER
+# fails and the database file cannot be opened again.
+
+setup keyword-pk-column {
+    CREATE TABLE g(id INTEGER, "order" NUMERIC, val INTEGER, PRIMARY KEY(id, "order"));
+    INSERT INTO g VALUES (1, 2, 3);
+    ALTER TABLE g ADD COLUMN added REAL;
+}
+
+@setup keyword-pk-column
+test add-column-keeps-quotes-in-table-level-primary-key {
+    SELECT instr(sql, '"order")') > 0 FROM sqlite_schema WHERE name = 'g';
+}
+expect {
+    1
+}
+
+@setup keyword-pk-column
+test rename-column-after-add-column-with-quoted-pk-column {
+    ALTER TABLE g RENAME COLUMN val TO v2;
+    SELECT id, "order", v2, added FROM g;
+}
+expect {
+    1|2|3|
+}
+
+@setup keyword-pk-column
+test add-second-column-after-add-column-with-quoted-pk-column {
+    ALTER TABLE g ADD COLUMN more TEXT;
+    SELECT id, "order", val, added, more FROM g;
+}
+expect {
+    1|2|3||
+}

@@ -78,7 +78,8 @@ async def test_checkpoint():
         await conn.commit()
         for i in range(1024):
             await conn.execute(f"INSERT INTO t VALUES ({i})")
-            await conn.commit()
+            if i % 4 == 3:
+                await conn.commit()
         stats1 = await conn.stats()
         await conn.checkpoint()
         stats2 = await conn.stats()

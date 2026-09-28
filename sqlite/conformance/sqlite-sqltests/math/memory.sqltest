@@ -3083,3 +3083,35 @@ test mod-huge-dividend-log10-modulus {
 expect {
     1
 }
+
+test arithmetic-on-integer-and-float-columns {
+    CREATE TABLE t(a, b);
+    INSERT INTO t VALUES (9223372036854775807, 1), (-9223372036854775808, 1), (1e308, 10), (1e308, 0.0), (0.25, 3), (3, 0.25), (1, 0.5), ('1.5', 2), (2, '0.5'), (NULL, 1.0), (1, NULL);
+    SELECT a + b, a - b, a * b, typeof(a * b), typeof((a * b) - (a * b)) FROM t;
+}
+expect {
+    9.22337203685478e+18|9223372036854775806|9223372036854775807|integer|integer
+    -9223372036854775807|-9.22337203685478e+18|-9223372036854775808|integer|integer
+    1.0e+308|1.0e+308|Inf|real|null
+    1.0e+308|1.0e+308|0.0|real|real
+    3.25|-2.75|0.75|real|real
+    3.25|2.75|0.75|real|real
+    1.5|0.5|0.5|real|real
+    3.5|-0.5|3.0|real|real
+    2.5|1.5|1.0|real|real
+    |||null|null
+    |||null|null
+}
+expect @js {
+    9223372036854776000|9223372036854775806|9223372036854775807|integer|integer
+    -9223372036854775807|-9223372036854776000|-9223372036854775808|integer|integer
+    1e+308|1e+308|Inf|real|null
+    1e+308|1e+308|0|real|real
+    3.25|-2.75|0.75|real|real
+    3.25|2.75|0.75|real|real
+    1.5|0.5|0.5|real|real
+    3.5|-0.5|3|real|real
+    2.5|1.5|1|real|real
+    |||null|null
+    |||null|null
+}

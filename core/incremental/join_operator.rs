@@ -10,6 +10,7 @@ use crate::numeric::Numeric;
 use crate::storage::btree::CursorTrait;
 use crate::sync::Arc;
 use crate::sync::Mutex;
+use crate::types::IOResultOr;
 use crate::types::{IOResult, ImmutableRecord, ImmutableRecordRef, SeekKey, SeekOp, SeekResult};
 use crate::{return_and_restore_if_io, return_if_io, Result, Value};
 
@@ -28,7 +29,7 @@ fn read_next_join_row(
     join_key: &HashableRow,
     last_element_hash: Option<Hash128>,
     cursors: &mut DbspStateCursors,
-) -> Result<IOResult<Option<(Hash128, HashableRow, isize)>>> {
+) -> IOResultOr<Option<(Hash128, HashableRow, isize)>> {
     // Build the index key: (storage_id, zset_id, element_id)
     // zset_id is the hash of the join key
     let zset_hash = join_key.cached_hash();
@@ -192,7 +193,7 @@ impl JoinEvalState {
         right_key_indices: &[usize],
         left_storage_id: i64,
         right_storage_id: i64,
-    ) -> Result<IOResult<Delta>> {
+    ) -> IOResultOr<Delta> {
         loop {
             match self {
                 JoinEvalState::ProcessDeltaJoin { deltas, output } => {
@@ -462,7 +463,7 @@ impl JoinOperator {
         &mut self,
         state: &mut EvalState,
         cursors: &mut DbspStateCursors,
-    ) -> Result<IOResult<Delta>> {
+    ) -> IOResultOr<Delta> {
         // Get the join state out of the enum
         match state {
             EvalState::Join(js) => js.process_join_state(
@@ -480,7 +481,7 @@ impl JoinOperator {
         &mut self,
         state: &mut EvalState,
         cursors: &mut DbspStateCursors,
-    ) -> Result<IOResult<Delta>> {
+    ) -> IOResultOr<Delta> {
         loop {
             let loop_state = std::mem::replace(state, EvalState::Uninitialized);
             match loop_state {
@@ -584,20 +585,12 @@ fn serialize_hashable_row(row: &HashableRow) -> Result<crate::ValueBlob> {
 }
 
 impl IncrementalOperator for JoinOperator {
-    fn eval(
-        &mut self,
-        state: &mut EvalState,
-        cursors: &mut DbspStateCursors,
-    ) -> Result<IOResult<Delta>> {
+    fn eval(&mut self, state: &mut EvalState, cursors: &mut DbspStateCursors) -> IOResultOr<Delta> {
         let delta = return_if_io!(self.eval_internal(state, cursors));
         Ok(IOResult::Done(delta))
     }
 
-    fn commit(
-        &mut self,
-        deltas: DeltaPair,
-        cursors: &mut DbspStateCursors,
-    ) -> Result<IOResult<Delta>> {
+    fn commit(&mut self, deltas: DeltaPair, cursors: &mut DbspStateCursors) -> IOResultOr<Delta> {
         loop {
             let mut state = std::mem::replace(&mut self.commit_state, JoinCommitState::Invalid);
             match &mut state {

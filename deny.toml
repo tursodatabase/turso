@@ -7,8 +7,7 @@ all-features = true
 # Exclude internal perf/testing crates from license checks
 exclude = [
     "encryption-throughput",
-    "write-throughput",
-    "write-throughput-sqlite",
+    "txn-throughput",
 ]
 
 [licenses]

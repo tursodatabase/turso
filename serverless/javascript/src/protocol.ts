@@ -16,6 +16,18 @@ export interface ExecuteResult {
   rows: Value[][];
   affected_row_count: number;
   last_insert_rowid?: string | number;
+  rows_read?: number;
+  rows_written?: number;
+  query_duration_ms?: number;
+}
+
+/** The result of a `batch` pipeline request (PROTOCOL.md section 6.2):
+ * one entry per step in each array. A step that executed has its result
+ * set, a step that failed has its error set, and a step skipped by its
+ * condition has both set to null. */
+export interface BatchResultData {
+  step_results: Array<ExecuteResult | null>;
+  step_errors: Array<{ message: string; code?: string; extended_code?: string } | null>;
 }
 
 export interface NamedArg {
@@ -95,7 +107,7 @@ export interface PipelineResponse {
     type: 'ok' | 'error';
     response?: {
       type: 'execute' | 'batch' | 'sequence' | 'close' | 'describe' | 'get_autocommit';
-      result?: ExecuteResult | DescribeResult;
+      result?: ExecuteResult | DescribeResult | BatchResultData;
       is_autocommit?: boolean;
     };
     error?: {
@@ -125,6 +137,9 @@ export function encodeValue(value: any): Value {
   }
   
   if (typeof value === 'bigint') {
+    if (value < -(1n << 63n) || value > (1n << 63n) - 1n) {
+      throw new Error("BigInt value is outside SQLite's signed 64-bit integer range");
+    }
     return { type: 'integer', value: value.toString() };
   }
   

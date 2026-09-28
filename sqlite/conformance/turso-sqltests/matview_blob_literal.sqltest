@@ -1,0 +1,27 @@
+@database :memory:
+@requires-file materialized_views ""
+@skip-file-if mvcc "materialized_views not supported with mvcc"
+
+# A hex blob literal selected in a materialized view must come back as the
+# same blob bytes, not as the text of its hex digits.
+# See: https://github.com/tursodatabase/turso/issues/7355
+
+test matview-blob-literal-select-star {
+    CREATE TABLE t(id INT);
+    CREATE MATERIALIZED VIEW mv AS SELECT x'FF' FROM t;
+    INSERT INTO t VALUES(1);
+    SELECT hex("x'FF'") FROM mv;
+}
+expect {
+    FF
+}
+
+test matview-blob-literal-type-and-bytes {
+    CREATE TABLE t2(id INT);
+    CREATE MATERIALIZED VIEW mv2 AS SELECT id, x'FF' AS b, X'0102ab' AS c FROM t2;
+    INSERT INTO t2 VALUES(1);
+    SELECT id, typeof(b), hex(b), length(b), typeof(c), hex(c), length(c) FROM mv2;
+}
+expect {
+    1|blob|FF|1|blob|0102AB|3
+}

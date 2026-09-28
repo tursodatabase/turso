@@ -45,6 +45,11 @@ typedef struct CachedStmt {
     sqlite3_stmt *stmt;    /* prepared statement */
 } CachedStmt;
 
+#define TURSO_OPEN_READONLY  0x00000001
+#define TURSO_OPEN_READWRITE 0x00000002
+#define TURSO_OPEN_CREATE    0x00000004
+#define TURSO_OPEN_URI       0x00000040
+
 typedef struct TursoDb {
     sqlite3    *db;
     Tcl_Interp *interp;
@@ -62,7 +67,41 @@ typedef struct TursoDb {
      * see zombie_dbs below. */
     char           *zombie_name;
     struct TursoDb *next_zombie;
+    Tcl_Obj        *progress_script; /* [db progress N SCRIPT] */
+    int             progress_nops;
+    int             in_progress_cb;   /* the script above is running */
+    int             progress_pending; /* [db progress] changed inside it */
 } TursoDb;
+
+/* The engine calls this every N virtual machine steps; a non-zero result
+ * from the script interrupts the statement, as in the upstream binding.
+ * The engine holds its handler lock while calling us, so a [db progress]
+ * issued by the script cannot be applied here; it is recorded and applied
+ * on the next command the handle runs. A statement the script runs on the
+ * same connection does not fire the handler again. */
+static int tcl_progress_bridge(void *pArg)
+{
+    TursoDb *tdb = (TursoDb *)pArg;
+    if (!tdb->progress_script || tdb->in_progress_cb) return 0;
+    tdb->in_progress_cb = 1;
+    int rc = Tcl_EvalObjEx(tdb->interp, tdb->progress_script, TCL_EVAL_GLOBAL);
+    tdb->in_progress_cb = 0;
+    if (rc != TCL_OK) return 1;
+    int result = 0;
+    Tcl_GetIntFromObj(NULL, Tcl_GetObjResult(tdb->interp), &result);
+    return result;
+}
+
+static void apply_progress_handler(TursoDb *tdb)
+{
+    tdb->progress_pending = 0;
+    if (tdb->progress_script) {
+        sqlite3_progress_handler(tdb->db, tdb->progress_nops,
+                                 tcl_progress_bridge, tdb);
+    } else {
+        sqlite3_progress_handler(tdb->db, 0, NULL, NULL);
+    }
+}
 
 /* Connections closed with [sqlite3_close_v2] while statements were still
  * outstanding. The library keeps such a zombie alive until its last
@@ -115,6 +154,38 @@ typedef struct TclFuncData {
     int         n_args;
     Tcl_Obj    *arg_names[MAX_FUNC_ARGS];  /* argument variable names */
 } TclFuncData;
+
+/* A TCL script registered with [db collate NAME SCRIPT]. The engine calls
+ * it with the two strings appended and expects an integer back. */
+typedef struct TclCollateData {
+    Tcl_Interp *interp;
+    Tcl_Obj    *script;
+} TclCollateData;
+
+static int tcl_collate_bridge(void *pApp, int nA, const void *zA,
+                              int nB, const void *zB)
+{
+    TclCollateData *data = (TclCollateData *)pApp;
+    Tcl_Obj *cmd = Tcl_DuplicateObj(data->script);
+    Tcl_IncrRefCount(cmd);
+    Tcl_ListObjAppendElement(data->interp, cmd,
+                             Tcl_NewStringObj((const char *)zA, nA));
+    Tcl_ListObjAppendElement(data->interp, cmd,
+                             Tcl_NewStringObj((const char *)zB, nB));
+    int result = 0;
+    if (Tcl_EvalObjEx(data->interp, cmd, TCL_EVAL_GLOBAL) == TCL_OK) {
+        Tcl_GetIntFromObj(NULL, Tcl_GetObjResult(data->interp), &result);
+    }
+    Tcl_DecrRefCount(cmd);
+    return result;
+}
+
+static void tcl_collate_destroy(void *pApp)
+{
+    TclCollateData *data = (TclCollateData *)pApp;
+    Tcl_DecrRefCount(data->script);
+    Tcl_Free((char *)data);
+}
 
 /* ------------------------------------------------------------------ */
 /* Value helpers                                                        */
@@ -379,6 +450,7 @@ static int exec_sql_collect(TursoDb *tdb,
     Tcl_IncrRefCount(result_list);
     const char *remaining   = sql;
     int         rc;
+    int         n_statements = 0;
 
     while (remaining && *remaining) {
         /* skip leading whitespace and bare semicolons */
@@ -404,6 +476,8 @@ static int exec_sql_collect(TursoDb *tdb,
             continue;
         }
 
+        n_statements++;
+
         /* Bind TCL variables to any parameters */
         bind_tcl_variables(interp, stmt);
 
@@ -426,9 +500,11 @@ static int exec_sql_collect(TursoDb *tdb,
 
         capture_stmt_status(tdb, stmt);
 
-        /* Cache single-statement SQL with bind parameters */
-        if (sqlite3_bind_parameter_count(stmt) > 0) {
-            /* Check if tail is empty (single statement) */
+        /* Cache single-statement SQL with bind parameters. The cache is
+         * keyed by the whole string, so only a string that holds exactly
+         * one statement may be stored: the last of several would otherwise
+         * be run alone on the next call. */
+        if (sqlite3_bind_parameter_count(stmt) > 0 && n_statements == 1) {
             const char *p = tail;
             if (p) {
                 while (*p == ' ' || *p == '\n' || *p == '\t' ||
@@ -470,6 +546,7 @@ static void TursoDbFree(ClientData cd)
         sqlite3_close(tdb->db);
     }
     if (tdb->null_obj) Tcl_DecrRefCount(tdb->null_obj);
+    if (tdb->progress_script) Tcl_DecrRefCount(tdb->progress_script);
     Tcl_Free((char *)tdb);
 }
 
@@ -481,16 +558,31 @@ static int TursoDbCmd(ClientData cd, Tcl_Interp *interp,
         "eval", "one", "exists", "changes", "total_changes",
         "last_insert_rowid", "errorcode", "errmsg", "null", "nullvalue",
         "func", "function", "close", "limit", "status", "transaction",
-        "cache",
+        "cache", "collate", "timeout", "interrupt", "version",
+        "busy", "auth", "authorizer", "progress", "commit_hook",
+        "update_hook", "rollback_hook", "wal_hook", "preupdate", "trace",
+        "trace_v2", "profile", "unlock_notify", "enable_load_extension",
+        "config", "erase", "bind_fallback", "collation_needed",
+        "backup", "restore", "incrblob", "serialize", "deserialize",
+        "copy",
         NULL
     };
     enum {
         CMD_EVAL, CMD_ONE, CMD_EXISTS, CMD_CHANGES, CMD_TOTAL_CHANGES,
         CMD_LAST_INSERT_ROWID, CMD_ERRORCODE, CMD_ERRMSG, CMD_NULL, CMD_NULLVALUE,
         CMD_FUNC, CMD_FUNCTION, CMD_CLOSE, CMD_LIMIT, CMD_STATUS, CMD_TRANSACTION,
-        CMD_CACHE
+        CMD_CACHE, CMD_COLLATE, CMD_TIMEOUT, CMD_INTERRUPT, CMD_VERSION,
+        CMD_BUSY, CMD_AUTH, CMD_AUTHORIZER, CMD_PROGRESS, CMD_COMMIT_HOOK,
+        CMD_UPDATE_HOOK, CMD_ROLLBACK_HOOK, CMD_WAL_HOOK, CMD_PREUPDATE, CMD_TRACE,
+        CMD_TRACE_V2, CMD_PROFILE, CMD_UNLOCK_NOTIFY, CMD_ENABLE_LOAD_EXTENSION,
+        CMD_CONFIG, CMD_ERASE, CMD_BIND_FALLBACK, CMD_COLLATION_NEEDED,
+        CMD_BACKUP, CMD_RESTORE, CMD_INCRBLOB, CMD_SERIALIZE, CMD_DESERIALIZE,
+        CMD_COPY
     };
     int cmdIdx;
+    if (tdb->progress_pending && !tdb->in_progress_cb) {
+        apply_progress_handler(tdb);
+    }
 
     if (objc < 2) {
         Tcl_WrongNumArgs(interp, 1, objv, "subcommand ?args?");
@@ -682,6 +774,116 @@ static int TursoDbCmd(ClientData cd, Tcl_Interp *interp,
         }
         return rc;
     }
+
+    /* ---- collate NAME SCRIPT ---- */
+
+    case CMD_COLLATE: {
+        if (objc != 4) {
+            Tcl_WrongNumArgs(interp, 2, objv, "NAME SCRIPT");
+            return TCL_ERROR;
+        }
+        TclCollateData *data = (TclCollateData *)Tcl_Alloc(sizeof(TclCollateData));
+        data->interp = interp;
+        data->script = objv[3];
+        Tcl_IncrRefCount(data->script);
+        int rc = sqlite3_create_collation_v2(
+            tdb->db, Tcl_GetString(objv[2]), 0, (void *)data,
+            (int (*)(void))tcl_collate_bridge,
+            (void (*)(void))tcl_collate_destroy);
+        if (rc != SQLITE_OK) {
+            tcl_collate_destroy(data);
+            Tcl_SetResult(interp, (char *)sqlite3_errmsg(tdb->db), TCL_VOLATILE);
+            return TCL_ERROR;
+        }
+        return TCL_OK;
+    }
+
+    /* ---- timeout MS ---- */
+
+    case CMD_TIMEOUT: {
+        int ms;
+        if (objc != 3) {
+            Tcl_WrongNumArgs(interp, 2, objv, "MILLISECONDS");
+            return TCL_ERROR;
+        }
+        if (Tcl_GetIntFromObj(interp, objv[2], &ms) != TCL_OK) return TCL_ERROR;
+        sqlite3_busy_timeout(tdb->db, ms);
+        return TCL_OK;
+    }
+
+    case CMD_INTERRUPT:
+        sqlite3_interrupt(tdb->db);
+        return TCL_OK;
+
+    case CMD_VERSION:
+        Tcl_SetResult(interp, (char *)sqlite3_libversion(), TCL_STATIC);
+        return TCL_OK;
+
+    /* Subcommands of the upstream binding that Turso has no engine support
+     * for. They accept their arguments and do nothing, so a test file that
+     * calls them at top level keeps running; the tests that depend on
+     * their effect fail on their own assertions. A hook subcommand called
+     * with no script returns the empty string, as upstream does when no
+     * hook is set. */
+    /* ---- progress N SCRIPT ---- */
+
+    case CMD_PROGRESS: {
+        if (objc == 2) {
+            Tcl_ResetResult(interp);
+            return TCL_OK;
+        }
+        if (objc != 4) {
+            Tcl_WrongNumArgs(interp, 2, objv, "N SCRIPT");
+            return TCL_ERROR;
+        }
+        int n_ops;
+        if (Tcl_GetIntFromObj(interp, objv[2], &n_ops) != TCL_OK) return TCL_ERROR;
+        if (tdb->progress_script) {
+            Tcl_DecrRefCount(tdb->progress_script);
+            tdb->progress_script = NULL;
+        }
+        tdb->progress_nops = n_ops;
+        if (Tcl_GetString(objv[3])[0] != '\0') {
+            tdb->progress_script = objv[3];
+            Tcl_IncrRefCount(tdb->progress_script);
+        }
+        if (tdb->in_progress_cb) {
+            tdb->progress_pending = 1;
+        } else {
+            apply_progress_handler(tdb);
+        }
+        return TCL_OK;
+    }
+
+    case CMD_BUSY:
+    case CMD_AUTH:
+    case CMD_AUTHORIZER:
+    case CMD_COMMIT_HOOK:
+    case CMD_UPDATE_HOOK:
+    case CMD_ROLLBACK_HOOK:
+    case CMD_WAL_HOOK:
+    case CMD_PREUPDATE:
+    case CMD_TRACE:
+    case CMD_TRACE_V2:
+    case CMD_PROFILE:
+    case CMD_UNLOCK_NOTIFY:
+    case CMD_ENABLE_LOAD_EXTENSION:
+    case CMD_CONFIG:
+    case CMD_ERASE:
+    case CMD_BIND_FALLBACK:
+    case CMD_COLLATION_NEEDED:
+    case CMD_BACKUP:
+    case CMD_RESTORE:
+    case CMD_SERIALIZE:
+    case CMD_DESERIALIZE:
+    case CMD_COPY:
+        Tcl_ResetResult(interp);
+        return TCL_OK;
+
+    case CMD_INCRBLOB:
+        Tcl_SetResult(interp, (char *)"incremental blob I/O is not supported",
+                      TCL_STATIC);
+        return TCL_ERROR;
 
     /* ---- eval ---- */
 
@@ -2065,6 +2267,334 @@ static int TursoTotalChangesCmd(ClientData cd, Tcl_Interp *interp,
     return TCL_OK;
 }
 
+/* sqlite3_get_autocommit DB */
+static int TursoGetAutocommitCmd(ClientData cd, Tcl_Interp *interp,
+                                 int objc, Tcl_Obj *const objv[])
+{
+    (void)cd;
+    TursoDb *tdb;
+    if (db_only_args(interp, objc, objv, &tdb) != TCL_OK) return TCL_ERROR;
+    Tcl_SetObjResult(interp, Tcl_NewIntObj(sqlite3_get_autocommit(tdb->db)));
+    return TCL_OK;
+}
+
+/* sqlite3_interrupt DB */
+static int TursoInterruptCmd(ClientData cd, Tcl_Interp *interp,
+                             int objc, Tcl_Obj *const objv[])
+{
+    (void)cd;
+    TursoDb *tdb;
+    if (db_only_args(interp, objc, objv, &tdb) != TCL_OK) return TCL_ERROR;
+    sqlite3_interrupt(tdb->db);
+    return TCL_OK;
+}
+
+/* sqlite3_extended_result_codes DB BOOLEAN */
+static int TursoExtendedResultCodesCmd(ClientData cd, Tcl_Interp *interp,
+                                       int objc, Tcl_Obj *const objv[])
+{
+    (void)cd;
+    int onoff;
+    if (objc != 3) {
+        Tcl_WrongNumArgs(interp, 1, objv, "DB BOOLEAN");
+        return TCL_ERROR;
+    }
+    TursoDb *tdb = find_turso_db(interp, Tcl_GetString(objv[1]));
+    if (!tdb) {
+        Tcl_AppendResult(interp, "no such database: ", Tcl_GetString(objv[1]), NULL);
+        return TCL_ERROR;
+    }
+    if (Tcl_GetBooleanFromObj(interp, objv[2], &onoff) != TCL_OK) return TCL_ERROR;
+    sqlite3_extended_result_codes(tdb->db, onoff);
+    return TCL_OK;
+}
+
+/* sqlite3_db_readonly DB NAME */
+static int TursoDbReadonlyCmd(ClientData cd, Tcl_Interp *interp,
+                              int objc, Tcl_Obj *const objv[])
+{
+    (void)cd;
+    if (objc != 3) {
+        Tcl_WrongNumArgs(interp, 1, objv, "DB NAME");
+        return TCL_ERROR;
+    }
+    TursoDb *tdb = find_turso_db(interp, Tcl_GetString(objv[1]));
+    if (!tdb) {
+        Tcl_AppendResult(interp, "no such database: ", Tcl_GetString(objv[1]), NULL);
+        return TCL_ERROR;
+    }
+    Tcl_SetObjResult(interp, Tcl_NewIntObj(
+        sqlite3_db_readonly(tdb->db, Tcl_GetString(objv[2]))));
+    return TCL_OK;
+}
+
+/* sqlite3_wal_checkpoint DB ?NAME? */
+static int TursoWalCheckpointCmd(ClientData cd, Tcl_Interp *interp,
+                                 int objc, Tcl_Obj *const objv[])
+{
+    (void)cd;
+    if (objc != 2 && objc != 3) {
+        Tcl_WrongNumArgs(interp, 1, objv, "DB ?NAME?");
+        return TCL_ERROR;
+    }
+    TursoDb *tdb = find_turso_db(interp, Tcl_GetString(objv[1]));
+    if (!tdb) {
+        Tcl_AppendResult(interp, "no such database: ", Tcl_GetString(objv[1]), NULL);
+        return TCL_ERROR;
+    }
+    const char *name = objc == 3 ? Tcl_GetString(objv[2]) : NULL;
+    int rc = sqlite3_wal_checkpoint(tdb->db, name);
+    Tcl_SetResult(interp, (char *)sqlite3_errstr(rc), TCL_STATIC);
+    return TCL_OK;
+}
+
+/* sqlite3_wal_checkpoint_v2 DB MODE ?NAME? -> {busy nLog nCkpt} */
+static int TursoWalCheckpointV2Cmd(ClientData cd, Tcl_Interp *interp,
+                                   int objc, Tcl_Obj *const objv[])
+{
+    (void)cd;
+    static const char *modes[] = {"passive", "full", "restart", "truncate", NULL};
+    int mode;
+    if (objc != 3 && objc != 4) {
+        Tcl_WrongNumArgs(interp, 1, objv, "DB MODE ?NAME?");
+        return TCL_ERROR;
+    }
+    TursoDb *tdb = find_turso_db(interp, Tcl_GetString(objv[1]));
+    if (!tdb) {
+        Tcl_AppendResult(interp, "no such database: ", Tcl_GetString(objv[1]), NULL);
+        return TCL_ERROR;
+    }
+    if (Tcl_GetIndexFromObj(interp, objv[2], modes, "mode", 0, &mode) != TCL_OK) {
+        return TCL_ERROR;
+    }
+    const char *name = objc == 4 ? Tcl_GetString(objv[3]) : NULL;
+    int n_log = 0, n_ckpt = 0;
+    int rc = sqlite3_wal_checkpoint_v2(tdb->db, name, mode, &n_log, &n_ckpt);
+    if (rc != SQLITE_OK && rc != SQLITE_BUSY) {
+        Tcl_SetResult(interp, (char *)sqlite3_errstr(rc), TCL_STATIC);
+        return TCL_ERROR;
+    }
+    Tcl_Obj *res = Tcl_NewListObj(0, NULL);
+    Tcl_ListObjAppendElement(interp, res, Tcl_NewIntObj(rc == SQLITE_BUSY));
+    Tcl_ListObjAppendElement(interp, res, Tcl_NewIntObj(n_log));
+    Tcl_ListObjAppendElement(interp, res, Tcl_NewIntObj(n_ckpt));
+    Tcl_SetObjResult(interp, res);
+    return TCL_OK;
+}
+
+/* ------------------------------------------------------------------ */
+/* randomjson: the random_json() and random_json5() SQL functions of   */
+/* upstream ext/misc/randomjson.c, which json106.test loads with        */
+/* [load_static_extension db randomjson]. Same generator and same      */
+/* tables, so the same seed gives the same document as in SQLite.      */
+/* ------------------------------------------------------------------ */
+
+typedef struct RjPrng {
+    unsigned int x, y;
+} RjPrng;
+
+static void rj_prng_seed(RjPrng *p, unsigned int seed)
+{
+    p->x = seed | 1;
+    p->y = seed;
+}
+
+static unsigned int rj_prng_int(RjPrng *p)
+{
+    p->x = (p->x >> 1) ^ ((1 + ~(p->x & 1)) & 0xd0000001);
+    p->y = p->y * 1103515245 + 12345;
+    return p->x ^ p->y;
+}
+
+static const char *rj_atoms[] = {
+    /* JSON                    JSON-5 */
+    "0",                       "0",
+    "1",                       "1",
+    "-1",                      "-1",
+    "2",                       "+2",
+    "3DDDD",                   "3DDDD",
+    "2.5DD",                   "2.5DD",
+    "0.75",                    ".75",
+    "-4.0e2",                  "-4.e2",
+    "5.0e-3",                  "+5e-3",
+    "6.DDe+0DD",               "6.DDe+0DD",
+    "0",                       "0x0",
+    "512",                     "0x200",
+    "256",                     "+0x100",
+    "-2748",                   "-0xabc",
+    "true",                    "true",
+    "false",                   "false",
+    "null",                    "null",
+    "9.0e999",                 "Infinity",
+    "-9.0e999",                "-Infinity",
+    "9.0e999",                 "+Infinity",
+    "null",                    "NaN",
+    "-0.0005DD",               "-0.0005DD",
+    "4.35e-3",                 "+4.35e-3",
+    "\"gem\\\"hay\"",          "\"gem\\\"hay\"",
+    "\"icy'joy\"",             "'icy\\'joy\'",
+    "\"keylog\"",              "\"key\\\nlog\"",
+    "\"mix\\\\\\tnet\"",       "\"mix\\\\\\tnet\"",
+    "\"oat\\r\\n\"",           "\"oat\\r\\n\"",
+    "\"\\fpan\\b\"",           "\"\\fpan\\b\"",
+    "{}",                      "{}",
+    "[]",                      "[]",
+    "[]",                      "[/*empty*/]",
+    "{}",                      "{//empty\n}",
+    "\"ask\"",                 "\"ask\"",
+    "\"bag\"",                 "\"bag\"",
+    "\"can\"",                 "\"can\"",
+    "\"day\"",                 "\"day\"",
+    "\"end\"",                 "'end'",
+    "\"fly\"",                 "\"fly\"",
+    "\"\\u00XX\\u00XX\"",      "\"\\xXX\\xXX\"",
+    "\"y\\uXXXXz\"",           "\"y\\uXXXXz\"",
+    "\"\"",                    "\"\"",
+};
+static const char *rj_templates[] = {
+    /* JSON                                      JSON-5 */
+    "{\"a\":%,\"b\":%,\"cDD\":%}",               "{a:%,b:%,cDD:%}",
+    "{\"a\":%,\"b\":%,\"c\":%,\"d\":%,\"e\":%}", "{a:%,b:%,c:%,d:%,e:%}",
+    "{\"a\":%,\"b\":%,\"c\":%,\"d\":%,\"\":%}",  "{a:%,b:%,c:%,d:%,'':%}",
+    "{\"d\":%}",                                 "{d:%}",
+    "{\"eeee\":%, \"ffff\":%}",                  "{eeee:% /*and*/, ffff:%}",
+    "{\"$g\":%,\"_h_\":%,\"a b c d\":%}",        "{$g:%,_h_:%,\"a b c d\":%}",
+    "{\"x\":%,\n  \"y\":%}",                     "{\"x\":%,\n  \"y\":%}",
+    "{\"\\u00XX\":%,\"\\uXXXX\":%}",             "{\"\\xXX\":%,\"\\uXXXX\":%}",
+    "{\"Z\":%}",                                 "{Z:%,}",
+    "[%]",                                       "[%,]",
+    "[%,%]",                                     "[%,%]",
+    "[%,%,%]",                                   "[%,%,%,]",
+    "[%,%,%,%]",                                 "[%,%,%,%]",
+    "[%,%,%,%,%]",                               "[%,%,%,%,%]",
+};
+
+#define RJ_COUNT(X) (sizeof(X) / sizeof(X[0]))
+#define RJ_STRSZ 10000
+
+static void rj_expand(const char *src, char *dest, RjPrng *p, int e_type,
+                      unsigned int r)
+{
+    unsigned int i, j, k;
+    const char *z;
+    char *zx;
+    size_t n;
+    char buf[200];
+
+    j = 0;
+    if (src == 0) src = "%";
+    if (strlen(src) >= RJ_STRSZ / 10) r = 0;
+    for (i = 0; src[i]; i++) {
+        if (src[i] != '%') {
+            if (j < RJ_STRSZ) dest[j++] = src[i];
+            continue;
+        }
+        if (r == 0 || (r < 1000 && (rj_prng_int(p) % 1000) <= r)) {
+            k = rj_prng_int(p) % (RJ_COUNT(rj_atoms) / 2);
+            k = k * 2 + e_type;
+            z = rj_atoms[k];
+        } else {
+            k = rj_prng_int(p) % (RJ_COUNT(rj_templates) / 2);
+            k = k * 2 + e_type;
+            z = rj_templates[k];
+        }
+        n = strlen(z);
+        if ((zx = strstr(z, "XX")) != 0) {
+            unsigned int y = rj_prng_int(p);
+            if ((y & 0xff) == ((y >> 8) & 0xff)) y += 0x100;
+            while ((y & 0xff) == ((y >> 16) & 0xff)
+                   || ((y >> 8) & 0xff) == ((y >> 16) & 0xff)) {
+                y += 0x10000;
+            }
+            memcpy(buf, z, n + 1);
+            z = buf;
+            zx = strstr(buf, "XX");
+            while (zx != 0) {
+                zx[0] = "0123456789abcdef"[y % 16];  y /= 16;
+                zx[1] = "0123456789abcdef"[y % 16];  y /= 16;
+                zx = strstr(zx, "XX");
+            }
+        } else if ((zx = strstr(z, "DD")) != 0) {
+            unsigned int y = rj_prng_int(p);
+            memcpy(buf, z, n + 1);
+            z = buf;
+            zx = strstr(buf, "DD");
+            while (zx != 0) {
+                zx[0] = "0123456789"[y % 10];  y /= 10;
+                zx[1] = "0123456789"[y % 10];  y /= 10;
+                zx = strstr(zx, "DD");
+            }
+        }
+        if (j + n < RJ_STRSZ) {
+            memcpy(&dest[j], z, n);
+            j += (unsigned int)n;
+        }
+    }
+    dest[RJ_STRSZ - 1] = 0;
+    if (j < RJ_STRSZ) dest[j] = 0;
+}
+
+static void rj_func(void *context, int argc, void **argv)
+{
+    (void)argc;
+    int e_type = *(int *)sqlite3_user_data(context);
+    RjPrng prng;
+    char z1[RJ_STRSZ + 1], z2[RJ_STRSZ + 1];
+
+    rj_prng_seed(&prng, (unsigned int)sqlite3_value_int(argv[0]));
+    rj_expand(0, z2, &prng, e_type, 1000);
+    rj_expand(z2, z1, &prng, e_type, 1000);
+    rj_expand(z1, z2, &prng, e_type, 100);
+    rj_expand(z2, z1, &prng, e_type, 0);
+    sqlite3_result_text(context, z1, -1, SQLITE_TRANSIENT);
+}
+
+static int rj_register(sqlite3 *db)
+{
+    static int c_zero = 0;
+    static int c_one = 1;
+    int rc = sqlite3_create_function_v2(db, "random_json", 1, 0, &c_zero,
+                                        (void (*)(void))rj_func, NULL, NULL, NULL);
+    if (rc == SQLITE_OK) {
+        rc = sqlite3_create_function_v2(db, "random_json5", 1, 0, &c_one,
+                                        (void (*)(void))rj_func, NULL, NULL, NULL);
+    }
+    return rc;
+}
+
+/* load_static_extension DB NAME ?NAME ...?
+ *
+ * Upstream's testfixture links the extensions under ext/misc statically and
+ * this command registers one on a connection. Only randomjson exists here;
+ * every other name is accepted and does nothing, so the tests that use the
+ * missing extension fail on their own assertions instead of the whole file
+ * stopping at this line. */
+static int TursoLoadStaticExtensionCmd(ClientData cd, Tcl_Interp *interp,
+                                       int objc, Tcl_Obj *const objv[])
+{
+    (void)cd;
+    int i;
+    if (objc < 3) {
+        Tcl_WrongNumArgs(interp, 1, objv, "DB NAME ...");
+        return TCL_ERROR;
+    }
+    TursoDb *tdb = find_turso_db(interp, Tcl_GetString(objv[1]));
+    if (!tdb) {
+        Tcl_AppendResult(interp, "no such database: ", Tcl_GetString(objv[1]), NULL);
+        return TCL_ERROR;
+    }
+    for (i = 2; i < objc; i++) {
+        if (strcmp(Tcl_GetString(objv[i]), "randomjson") == 0) {
+            if (rj_register(tdb->db) != SQLITE_OK) {
+                Tcl_SetResult(interp, (char *)sqlite3_errmsg(tdb->db), TCL_VOLATILE);
+                return TCL_ERROR;
+            }
+        }
+    }
+    Tcl_ResetResult(interp);
+    return TCL_OK;
+}
+
 /* sqlite3_last_insert_rowid DB */
 static int TursoLastInsertRowidCmd(ClientData cd, Tcl_Interp *interp,
                                    int objc, Tcl_Obj *const objv[])
@@ -2750,11 +3280,38 @@ static int TursoOpenCmd(ClientData cd, Tcl_Interp *interp,
     const char *handle_name = Tcl_GetString(objv[1]);
     const char *filename    = Tcl_GetString(objv[2]);
 
+    /* Options of the upstream binding. -readonly and -uri change how the
+     * file is opened; -vfs, -key, -nomutex, -fullmutex, -nofollow and
+     * -create have no Turso equivalent and are accepted and ignored. */
+    int flags = TURSO_OPEN_READWRITE | TURSO_OPEN_CREATE;
+    int i;
+    for (i = 3; i + 1 < objc; i += 2) {
+        const char *opt = Tcl_GetString(objv[i]);
+        int         val = 0;
+        if (strcmp(opt, "-readonly") == 0) {
+            if (Tcl_GetBooleanFromObj(interp, objv[i + 1], &val) != TCL_OK) {
+                return TCL_ERROR;
+            }
+            if (val) flags = (flags & ~(TURSO_OPEN_READWRITE | TURSO_OPEN_CREATE))
+                             | TURSO_OPEN_READONLY;
+        } else if (strcmp(opt, "-uri") == 0) {
+            if (Tcl_GetBooleanFromObj(interp, objv[i + 1], &val) != TCL_OK) {
+                return TCL_ERROR;
+            }
+            if (val) flags |= TURSO_OPEN_URI;
+        } else if (strcmp(opt, "-create") == 0) {
+            if (Tcl_GetBooleanFromObj(interp, objv[i + 1], &val) != TCL_OK) {
+                return TCL_ERROR;
+            }
+            if (!val) flags &= ~TURSO_OPEN_CREATE;
+        }
+    }
+
     sqlite3 *db  = NULL;
-    int      rc  = sqlite3_open(filename, &db);
+    int      rc  = sqlite3_open_v2(filename, &db, flags, NULL);
 
     if (rc != SQLITE_OK) {
-        const char *errmsg = db ? sqlite3_errmsg(db) : "out of memory";
+        const char *errmsg = db ? sqlite3_errmsg(db) : sqlite3_errstr(rc);
         Tcl_SetResult(interp, (char *)errmsg, TCL_VOLATILE);
         if (db) sqlite3_close(db);
         return TCL_ERROR;
@@ -2874,6 +3431,20 @@ int Tursotcl_Init(Tcl_Interp *interp)
                          TursoChangesCmd, NULL, NULL);
     Tcl_CreateObjCommand(interp, "sqlite3_total_changes",
                          TursoTotalChangesCmd, NULL, NULL);
+    Tcl_CreateObjCommand(interp, "sqlite3_get_autocommit",
+                         TursoGetAutocommitCmd, NULL, NULL);
+    Tcl_CreateObjCommand(interp, "sqlite3_interrupt",
+                         TursoInterruptCmd, NULL, NULL);
+    Tcl_CreateObjCommand(interp, "sqlite3_extended_result_codes",
+                         TursoExtendedResultCodesCmd, NULL, NULL);
+    Tcl_CreateObjCommand(interp, "sqlite3_db_readonly",
+                         TursoDbReadonlyCmd, NULL, NULL);
+    Tcl_CreateObjCommand(interp, "sqlite3_wal_checkpoint",
+                         TursoWalCheckpointCmd, NULL, NULL);
+    Tcl_CreateObjCommand(interp, "sqlite3_wal_checkpoint_v2",
+                         TursoWalCheckpointV2Cmd, NULL, NULL);
+    Tcl_CreateObjCommand(interp, "load_static_extension",
+                         TursoLoadStaticExtensionCmd, NULL, NULL);
     Tcl_CreateObjCommand(interp, "sqlite3_last_insert_rowid",
                          TursoLastInsertRowidCmd, NULL, NULL);
     Tcl_CreateObjCommand(interp, "sqlite3_complete",

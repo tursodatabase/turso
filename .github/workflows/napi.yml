@@ -114,6 +114,9 @@ jobs:
         with:
           toolchain: stable
           targets: ${{ matrix.settings.target }}
+      - name: Setup MSVC
+        if: runner.os == 'Windows'
+        uses: "./.github/shared/setup-msvc"
       - name: Cache cargo
         uses: actions/cache@v4
         with:
@@ -361,6 +364,8 @@ jobs:
           architecture: x64
       - name: Setup Rust toolchain
         uses: dtolnay/rust-toolchain@stable
+      - name: Setup MSVC
+        uses: "./.github/shared/setup-msvc"
       - name: Rust cache
         uses: Swatinem/rust-cache@v2
         with:

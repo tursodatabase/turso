@@ -112,15 +112,22 @@ impl InitLoop {
                 }
             );
         }
-        // Include hash-join build tables so their cursors are opened for hash build.
         let mut required_tables: TableMask = join_order
             .iter()
             .map(|member| member.original_idx)
             .try_collect()?;
         for table in tables.joined_tables().iter() {
-            if let Operation::HashJoin(hash_join_op) = &table.op {
-                required_tables.set(hash_join_op.build_table_idx)?;
+            let Operation::HashJoin(hash_join_op) = &table.op else {
+                continue;
+            };
+            if t_ctx
+                .materialized_build_inputs
+                .get(&hash_join_op.build_table_idx)
+                .is_some_and(|input| !input.requires_build_table())
+            {
+                continue;
             }
+            required_tables.set(hash_join_op.build_table_idx)?;
         }
 
         for (table_index, table) in tables.joined_tables().iter().enumerate() {
@@ -142,7 +149,9 @@ impl InitLoop {
                     };
                     t_ctx.meta_left_joins[table_index] = Some(lj_metadata);
                 }
-                if join_info.is_semi_or_anti() {
+                let is_hash_anti = matches!(table.op, Operation::HashJoin(ref hj) if
+                    hj.join_type == HashJoinType::LeftAnti);
+                if join_info.is_semi_or_anti() && !is_hash_anti {
                     let join_idx = join_order
                         .iter()
                         .position(|m| m.original_idx == table_index)

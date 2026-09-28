@@ -1915,6 +1915,13 @@ expect {
     {"name":"John","age":30,"city":"New York"}
 }
 
+test jsonb_null_is_sql_null {
+    SELECT typeof(jsonb(NULL)), jsonb(NULL) IS NULL;
+}
+expect {
+    null|1
+}
+
 test json_complex_nested {
     SELECT json(jsonb('{"complex": {"nested": ["array", "of", "values"], "numbers": [1, 2, 3]}}'));
 }
@@ -3460,4 +3467,24 @@ test jsonb-oversized-child-remove {
     SELECT json_remove(x'8BC7C8000000000000', '$[0]');
 }
 expect {
+}
+
+test json_each_over_null_column {
+    WITH t(id, tags) AS (
+        VALUES (1, '["x"]'), (2, NULL)
+    )
+    SELECT COUNT(*) FROM t, json_each(t.tags);
+}
+expect {
+    1
+}
+
+test json_tree_over_null_column {
+    WITH t(id, tags) AS (
+        VALUES (1, '["x"]'), (2, NULL)
+    )
+    SELECT COUNT(*) FROM t, json_tree(t.tags);
+}
+expect {
+    2
 }

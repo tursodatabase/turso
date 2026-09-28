@@ -2,6 +2,7 @@
 //! be rejected instead of entering the engine as text or being demoted to blobs.
 
 use crate::common::try_limbo_exec_rows;
+use asserting::prelude::*;
 use turso_core::LimboError;
 
 #[turso_macros::test(init_sql = "CREATE TABLE t(val TEXT);")]
@@ -30,11 +31,9 @@ fn test_non_utf8_text_is_rejected(tmp_db: crate::common::TempDatabase) -> anyhow
     }
 
     let rows = try_limbo_exec_rows(&tmp_db, &limbo_conn, "SELECT CAST(X'FF' AS BLOB)")?;
-    assert_eq!(
-        rows,
-        vec![vec![rusqlite::types::Value::Blob(vec![0xFF])]],
-        "the same bytes remain valid when explicitly typed as a blob"
-    );
+    assert_that!(rows)
+        .described_as("the same bytes remain valid when explicitly typed as a blob")
+        .is_equal_to(vec![row![vec![0xFF_u8]]]);
 
     Ok(())
 }

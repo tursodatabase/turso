@@ -10,21 +10,28 @@ pub struct StressDb {
     db_file: String,
     vfs: Option<String>,
     sql_logger: Arc<SqlLogger>,
+    fts: bool,
 }
 
 impl StressDb {
-    pub(crate) fn new(db_file: String, sql_logger: Arc<SqlLogger>, vfs: Option<String>) -> Self {
+    pub(crate) fn new(
+        db_file: String,
+        sql_logger: Arc<SqlLogger>,
+        vfs: Option<String>,
+        fts: bool,
+    ) -> Self {
         Self {
             db: None,
             db_file,
             sql_logger,
             vfs,
+            fts,
         }
     }
 
     async fn get_or_init(&mut self) -> turso::Result<&turso::Database> {
         if self.db.is_none() {
-            let mut builder = Builder::new_local(&self.db_file);
+            let mut builder = Builder::new_local(&self.db_file).experimental_index_method(self.fts);
             if let Some(ref vfs) = self.vfs {
                 builder = builder.with_io(vfs.clone());
             }
@@ -80,6 +87,13 @@ impl StressConn {
         let result = self.conn.execute(sql, params).await;
         self.sql_logger.log_result(&self.thread, sql, &result);
         result
+    }
+
+    pub async fn rollback_if_open(&self) -> turso::Result<()> {
+        if !self.conn.is_autocommit()? {
+            self.execute("ROLLBACK", ()).await?;
+        }
+        Ok(())
     }
 
     pub async fn pragma_update<V: std::fmt::Display>(

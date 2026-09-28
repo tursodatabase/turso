@@ -176,6 +176,7 @@ fn open_turso() -> TursoDatabase {
     )
     .unwrap();
     let conn = db.connect().unwrap();
+    execute_turso(&db, &conn, "PRAGMA fts_merge_threshold = 0");
     execute_turso(
         &db,
         &conn,
@@ -373,6 +374,11 @@ fn bench_queries(criterion: &mut Criterion) {
     let sqlite = open_sqlite();
     populate_turso(&turso, &batches);
     populate_sqlite(&sqlite, &batches);
+    execute_turso(&turso.db, &turso.conn, "OPTIMIZE INDEX docs_fts");
+    sqlite
+        .conn
+        .execute("INSERT INTO docs_fts(docs_fts) VALUES ('optimize')", [])
+        .unwrap();
     assert_workload_parity(&turso, &sqlite);
 
     let mut group = criterion.benchmark_group("FTS comparison - warm queries");
