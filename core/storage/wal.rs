@@ -10915,6 +10915,270 @@ pub mod test {
         );
     }
 
+    #[cfg(shuttle)]
+    #[test]
+    fn shuttle_full_checkpoint_after_concurrent_wal_restart() {
+        let mut config = shuttle::Config::default();
+        config.stack_size *= 10;
+        let scheduler = CheckpointRestartScheduler::new(65);
+        shuttle::Runner::new(scheduler, config).run(|| {
+            shuttle_checkpoint_restart_case("new generation".into(), "second".into(), 1, 15);
+        });
+    }
+
+    #[cfg(shuttle)]
+    #[test]
+    fn shuttle_checkpoint_restart_fuzz() {
+        let mut config = shuttle::Config::default();
+        config.stack_size *= 10;
+        let scheduler = CheckpointRestartScheduler::from_cutoffs((0..=65).rev().collect());
+        shuttle::Runner::new(scheduler, config).run(|| {
+            use shuttle::rand::Rng;
+
+            let mut rng = shuttle::rand::thread_rng();
+            let row_count = rng.gen_range(1..=3);
+            let extra_filler = rng.gen_range(15..=30);
+            let key = format!("new generation {}", rng.gen::<u32>());
+            let payload = "x".repeat(rng.gen_range(1..=256));
+            shuttle_checkpoint_restart_case(key, payload, row_count, extra_filler);
+        });
+    }
+
+    #[cfg(shuttle)]
+    fn shuttle_checkpoint_restart_case(
+        key: String,
+        final_payload: String,
+        row_count: usize,
+        extra_filler: i64,
+    ) {
+        let io = Arc::new(MemoryIO::new());
+        let db = Database::open(
+            io.clone(),
+            "shuttle_checkpoint_restart.db",
+            crate::OpenOptions::new(Arc::new(SqliteDialect)),
+        )
+        .unwrap();
+        let checkpointer = db.connect().unwrap();
+        let writer = db.connect().unwrap();
+
+        checkpointer.execute("PRAGMA journal_mode=WAL").unwrap();
+        checkpointer
+            .execute("create table test(key text primary key, payload text)")
+            .unwrap();
+        checkpointer
+            .execute("create table filler(id integer primary key, payload text)")
+            .unwrap();
+
+        let mut reader = writer.prepare("PRAGMA integrity_check").unwrap();
+        loop {
+            match reader.step().unwrap() {
+                StepResult::IO => io.step().unwrap(),
+                StepResult::Yield => {}
+                StepResult::Row => {
+                    assert_eq!(reader.row().unwrap().get::<String>(0).unwrap(), "ok");
+                    break;
+                }
+                result => panic!("unexpected integrity_check result: {result:?}"),
+            }
+        }
+        checkpointer
+            .execute("insert into filler values (1, 'old generation')")
+            .unwrap();
+        let passive = run_sql_rows(&checkpointer, "PRAGMA wal_checkpoint(PASSIVE)");
+        assert_eq!(passive[0][0].as_int(), Some(0));
+        let old_log = passive[0][1].as_int().unwrap();
+        let old_backfills = passive[0][2].as_int().unwrap();
+        assert!(old_backfills > 0);
+        assert!(old_backfills < old_log);
+        drop(reader);
+
+        let keys: Vec<String> = (0..row_count)
+            .map(|i| {
+                if i == 0 {
+                    key.clone()
+                } else {
+                    format!("{key}-{i}")
+                }
+            })
+            .collect();
+        let start = Arc::new(shuttle::sync::Barrier::new(3));
+        let checkpoint_start = start.clone();
+        let checkpoint_thread = shuttle::thread::spawn(move || {
+            checkpoint_start.wait();
+            assert_sql_checkpoint_unbusy(&checkpointer, "FULL")
+        });
+        let writer_start = start.clone();
+        let writer_keys = keys.clone();
+        let writer_payload = final_payload.clone();
+        let writer_thread = shuttle::thread::spawn(move || {
+            writer_start.wait();
+            assert_sql_checkpoint_unbusy(&writer, "RESTART");
+            for row_key in &writer_keys {
+                writer
+                    .execute(format!(
+                        "insert into test(key, payload) values ('{row_key}', 'first')"
+                    ))
+                    .unwrap();
+            }
+            for i in 0..old_backfills + extra_filler {
+                writer
+                    .execute(format!(
+                        "insert into filler values ({}, 'new generation {i}')",
+                        i + 2
+                    ))
+                    .unwrap();
+            }
+            for row_key in &writer_keys {
+                writer
+                    .execute(format!(
+                        "update test set payload = '{writer_payload}' where key = '{row_key}'"
+                    ))
+                    .unwrap();
+            }
+        });
+        start.wait();
+        let full_log = checkpoint_thread.join().unwrap();
+        writer_thread.join().unwrap();
+        assert!(full_log > old_log);
+
+        let verifier = db.connect().unwrap();
+        assert_sql_checkpoint_unbusy(&verifier, "RESTART");
+        let expected: Vec<Vec<Value>> = keys
+            .iter()
+            .map(|row_key| {
+                vec![
+                    Value::Text(row_key.clone().into()),
+                    Value::Text(final_payload.clone().into()),
+                ]
+            })
+            .collect();
+        assert_eq!(
+            run_sql_rows(
+                &verifier,
+                "select key, payload from test not indexed order by key"
+            ),
+            expected
+        );
+        assert_eq!(
+            run_sql_rows(&verifier, "PRAGMA integrity_check"),
+            vec![vec![Value::Text("ok".into())]]
+        );
+        for row_key in &keys {
+            assert_eq!(
+                run_sql_rows(
+                    &verifier,
+                    &format!("select payload from test where key = '{row_key}'")
+                ),
+                vec![vec![Value::Text(final_payload.clone().into())]]
+            );
+        }
+    }
+
+    #[cfg(shuttle)]
+    struct CheckpointRestartScheduler {
+        cutoffs: Vec<usize>,
+        next_case: usize,
+        cutoff: usize,
+        steps: usize,
+        phase: CheckpointSchedulePhase,
+        random: shuttle::scheduler::RandomDataSource,
+    }
+
+    #[cfg(shuttle)]
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum CheckpointSchedulePhase {
+        Setup,
+        Barrier,
+        Checkpoint,
+        Writer,
+    }
+
+    #[cfg(shuttle)]
+    impl CheckpointRestartScheduler {
+        fn new(cutoff: usize) -> Self {
+            Self::from_cutoffs(vec![cutoff])
+        }
+
+        fn from_cutoffs(cutoffs: Vec<usize>) -> Self {
+            Self {
+                cutoffs,
+                next_case: 0,
+                cutoff: 0,
+                steps: 0,
+                phase: CheckpointSchedulePhase::Setup,
+                random: <shuttle::scheduler::RandomDataSource as shuttle::scheduler::DataSource>::initialize(0),
+            }
+        }
+    }
+
+    #[cfg(shuttle)]
+    impl shuttle::scheduler::Scheduler for CheckpointRestartScheduler {
+        fn new_execution(&mut self) -> Option<shuttle::scheduler::Schedule> {
+            self.cutoff = *self.cutoffs.get(self.next_case)?;
+            self.next_case += 1;
+            self.steps = 0;
+            self.phase = CheckpointSchedulePhase::Setup;
+            Some(shuttle::scheduler::Schedule::new(
+                shuttle::scheduler::DataSource::reinitialize(&mut self.random),
+            ))
+        }
+
+        fn next_task(
+            &mut self,
+            runnable: &[&shuttle::scheduler::Task],
+            _current: Option<shuttle::scheduler::TaskId>,
+            _is_yielding: bool,
+        ) -> Option<shuttle::scheduler::TaskId> {
+            let has = |id| runnable.iter().any(|task| task.id() == id);
+            let main = shuttle::scheduler::TaskId::from(0);
+            let checkpoint = shuttle::scheduler::TaskId::from(1);
+            let writer = shuttle::scheduler::TaskId::from(2);
+
+            if self.phase == CheckpointSchedulePhase::Setup {
+                if has(main) {
+                    return Some(main);
+                }
+                self.phase = CheckpointSchedulePhase::Barrier;
+            }
+            if self.phase == CheckpointSchedulePhase::Barrier {
+                if has(main) && has(checkpoint) && has(writer) {
+                    self.phase = CheckpointSchedulePhase::Checkpoint;
+                } else {
+                    return Some(if has(checkpoint) { checkpoint } else { writer });
+                }
+            }
+            if self.phase == CheckpointSchedulePhase::Checkpoint {
+                if has(checkpoint) && self.steps < self.cutoff {
+                    self.steps += 1;
+                    return Some(checkpoint);
+                }
+                self.phase = CheckpointSchedulePhase::Writer;
+            }
+            if self.phase == CheckpointSchedulePhase::Writer && has(writer) {
+                return Some(writer);
+            }
+            if has(checkpoint) {
+                return Some(checkpoint);
+            }
+            if has(writer) {
+                return Some(writer);
+            }
+            Some(main)
+        }
+
+        fn next_u64(&mut self) -> u64 {
+            shuttle::scheduler::DataSource::next_u64(&mut self.random)
+        }
+    }
+
+    #[cfg(shuttle)]
+    fn assert_sql_checkpoint_unbusy(conn: &Arc<Connection>, mode: &str) -> i64 {
+        let result = run_sql_rows(conn, &format!("PRAGMA wal_checkpoint({mode})"));
+        assert_eq!(result[0][0].as_int(), Some(0));
+        assert_eq!(result[0][1], result[0][2]);
+        result[0][1].as_int().unwrap()
+    }
+
     struct RestartBeforeCheckpointLocks {
         writer: Arc<Connection>,
         old_backfills: i64,
