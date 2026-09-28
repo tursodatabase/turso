@@ -38,7 +38,7 @@ impl TursoStatement {
 
 pub fn to_turso_statement(ptr: jlong) -> Result<&'static mut TursoStatement> {
     if ptr == 0 {
-        Err(TursoError::InvalidConnectionPointer)
+        Err(TursoError::InvalidStatementPointer)
     } else {
         unsafe { Ok(&mut *(ptr as *mut TursoStatement)) }
     }
@@ -88,10 +88,15 @@ pub extern "system" fn Java_tech_turso_core_TursoStatement_step<'local>(
 
 #[no_mangle]
 pub extern "system" fn Java_tech_turso_core_TursoStatement__1close<'local>(
-    _env: JNIEnv<'local>,
-    _obj: JObject<'local>,
+    mut env: JNIEnv<'local>,
+    obj: JObject<'local>,
     stmt_ptr: jlong,
 ) {
+    if stmt_ptr == 0 {
+        let e = TursoError::InvalidStatementPointer;
+        set_err_msg_and_throw_exception(&mut env, obj, TURSO_ETC, e.to_string());
+        return;
+    }
     TursoStatement::drop(stmt_ptr);
 }
 
@@ -124,10 +129,16 @@ fn row_to_obj_array<'local>(
 #[no_mangle]
 pub extern "system" fn Java_tech_turso_core_TursoStatement_columns<'local>(
     mut env: JNIEnv<'local>,
-    _obj: JObject<'local>,
+    obj: JObject<'local>,
     stmt_ptr: jlong,
 ) -> JObject<'local> {
-    let stmt = to_turso_statement(stmt_ptr).unwrap();
+    let stmt = match to_turso_statement(stmt_ptr) {
+        Ok(stmt) => stmt,
+        Err(e) => {
+            set_err_msg_and_throw_exception(&mut env, obj, TURSO_ETC, e.to_string());
+            return JObject::null();
+        }
+    };
     let num_columns = stmt.stmt.num_columns();
     let obj_arr: JObjectArray = env
         .new_object_array(num_columns as i32, "java/lang/String", JObject::null())
