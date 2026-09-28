@@ -3989,6 +3989,19 @@ impl BTreeTable {
         }
         Ok(deps)
     }
+
+    pub(crate) fn columns_with_dependencies(
+        &self,
+        targets: impl IntoIterator<Item = usize>,
+    ) -> Result<ColumnMask> {
+        let graph = self.column_graph()?;
+        let mut columns = ColumnMask::default();
+        for j in targets {
+            columns.set(j)?;
+            columns.union_with(&graph.dependencies[j])?;
+        }
+        Ok(columns)
+    }
 }
 
 fn push_on_conflict_clause(sql: &mut String, conflict_clause: Option<ResolveType>) {
@@ -4016,6 +4029,11 @@ impl<'a> ColumnsTopologicalSort<'a> {
         self.topological_sort
             .iter()
             .map(|&idx| (idx, &self.columns[idx]))
+    }
+
+    pub fn retain_columns(mut self, columns: &ColumnMask) -> Self {
+        self.topological_sort.retain(|&idx| columns.get(idx));
+        self
     }
 }
 
@@ -4172,6 +4190,39 @@ fn collect_column_dependencies_of_gencol(expr: &Expr, columns: &[Column], out: &
         }
         Ok(WalkControl::Continue)
     });
+}
+
+pub(crate) fn columns_referenced_by_expr(expr: &Expr, columns: &[Column]) -> Result<ColumnMask> {
+    let mut referenced = ColumnMask::default();
+    let mut has_subquery = false;
+    walk_expr(expr, &mut |e| {
+        match e {
+            Expr::Column { table, column, .. } if table.is_self_table() => {
+                referenced.set(*column)?;
+            }
+            Expr::Id(name)
+            | Expr::Name(name)
+            | Expr::Qualified(_, name)
+            | Expr::DoublyQualified(_, _, name) => {
+                if let Some(idx) = find_column_index_by_name(columns, name.as_str()) {
+                    referenced.set(idx)?;
+                }
+            }
+            Expr::Subquery(_)
+            | Expr::Exists(_)
+            | Expr::InTable { .. }
+            | Expr::SubqueryResult { .. } => {
+                has_subquery = true;
+                return Ok(WalkControl::SkipChildren);
+            }
+            _ => {}
+        }
+        Ok(WalkControl::Continue)
+    })?;
+    if has_subquery {
+        return Ok((0..columns.len()).try_collect()?);
+    }
+    Ok(referenced)
 }
 
 fn find_column_index_by_name(columns: &[Column], col_name: &str) -> Option<usize> {
@@ -7368,6 +7419,12 @@ mod tests {
         );
         assert_eq!(stored(&t.dependencies_of_columns([3])?), vec![0]);
         assert_eq!(stored(&t.dependencies_of_columns([1])?), vec![0]);
+        assert_eq!(
+            indices(&t.columns_with_dependencies([3])?),
+            vec![0, 1, 2, 3]
+        );
+        assert_eq!(indices(&t.columns_with_dependencies([1])?), vec![0, 1]);
+        assert_eq!(indices(&t.columns_with_dependencies([0])?), vec![0]);
         Ok(())
     }
 

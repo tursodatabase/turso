@@ -1,11 +1,42 @@
-use crate::schema::{BTreeTable, ColumnLayout, ColumnsTopologicalSort, GeneratedType};
+use crate::alloc::TursoIteratorExt;
+use crate::schema::{
+    columns_referenced_by_expr, BTreeTable, Column, ColumnsTopologicalSort, GeneratedType, Index,
+    EXPR_INDEX_SENTINEL,
+};
 use crate::translate::expr::translate_expr;
-use crate::vdbe::affinity::Affinity;
+use crate::translate::plan::ColumnMask;
 use crate::vdbe::builder::{DmlColumnContext, SelfTableContext};
 use crate::{Arc, Result};
-use turso_parser::ast;
 
 use super::{ProgramBuilder, Resolver};
+
+pub(crate) fn emit_row_from_cursor(
+    program: &mut ProgramBuilder,
+    table: &Arc<BTreeTable>,
+    cursor_id: usize,
+    column_regs: &[usize],
+    resolver: &Resolver,
+) -> Result<()> {
+    let columns = table.columns();
+    for (idx, column) in columns.iter().enumerate() {
+        if !column.is_virtual_generated() {
+            program.emit_column_or_rowid(cursor_id, idx, column_regs[idx]);
+        }
+    }
+    if !table.has_virtual_columns {
+        return Ok(());
+    }
+    let dml_ctx =
+        DmlColumnContext::from_column_reg_mapping(columns.iter().zip(column_regs.iter().copied()))
+            .with_encoded_columns((0..columns.len()).try_collect()?);
+    compute_virtual_columns(
+        program,
+        &table.columns_topo_sort()?,
+        &dml_ctx,
+        resolver,
+        table,
+    )
+}
 
 /// Emit bytecode to compute virtual generated columns for a row.
 #[turso_macros::trace_stack]
@@ -27,35 +58,78 @@ pub fn compute_virtual_columns(
             };
             let target_reg = dml_ctx.to_column_reg(idx);
             translate_expr(program, None, expr, target_reg, resolver)?;
-            if column.affinity() != Affinity::Blob {
-                program.emit_column_affinity(target_reg, column.affinity());
-            }
+            program.emit_column_affinity(target_reg, column.affinity());
         }
         Ok(())
     })
 }
 
-/// Emit bytecode to compute a single virtual generated column expression.
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn emit_gencol_expr_from_registers(
-    program: &mut ProgramBuilder,
-    expr: &ast::Expr,
-    target_reg: usize,
-    registers_start: usize,
-    columns: &[crate::schema::Column],
+pub(crate) fn columns_needed_for_new_row(
+    table: &BTreeTable,
     resolver: &Resolver,
-    rowid_reg: usize,
-    layout: &ColumnLayout,
-    table: &Arc<BTreeTable>,
-) -> Result<()> {
-    let ctx = SelfTableContext::ForDML {
-        dml_ctx: DmlColumnContext::layout(columns, registers_start, rowid_reg, layout.clone()),
-        table: Arc::clone(table),
-    };
-    resolver.with_self_table_context(program, Some(&ctx), |program, _| {
-        translate_expr(program, None, expr, target_reg, resolver)?;
-        Ok(())
-    })?;
+    database_id: usize,
+    reads_whole_row: bool,
+    reads_foreign_keys: bool,
+) -> Result<ColumnMask> {
+    let columns = table.columns();
+    if reads_whole_row || table.is_strict {
+        return Ok((0..columns.len()).try_collect()?);
+    }
+    let mut needed = ColumnMask::default();
+    for (idx, column) in columns.iter().enumerate() {
+        if column.notnull() {
+            needed.set(idx)?;
+        }
+    }
+    for check in &table.check_constraints {
+        needed.union_with(&columns_referenced_by_expr(&check.expr, columns)?)?;
+    }
+    let indexes: Vec<Arc<Index>> = resolver.with_schema(database_id, |s| {
+        s.get_indices(table.name.as_str()).cloned().collect()
+    });
+    for index in &indexes {
+        needed.union_with(&columns_read_by_index(index, columns)?)?;
+    }
+    if reads_foreign_keys {
+        needed.union_with(&foreign_key_columns(table, resolver, database_id)?)?;
+    }
+    table.columns_with_dependencies(needed.iter())
+}
 
-    Ok(())
+pub(crate) fn columns_read_by_index(index: &Index, columns: &[Column]) -> Result<ColumnMask> {
+    let mut read = ColumnMask::default();
+    for index_column in &index.columns {
+        if index_column.pos_in_table == EXPR_INDEX_SENTINEL {
+            let expr = index_column
+                .expr
+                .as_ref()
+                .expect("expression index column has an expression");
+            read.union_with(&columns_referenced_by_expr(expr, columns)?)?;
+        } else {
+            read.set(index_column.pos_in_table)?;
+        }
+    }
+    if let Some(where_clause) = &index.where_clause {
+        read.union_with(&columns_referenced_by_expr(where_clause, columns)?)?;
+    }
+    Ok(read)
+}
+
+pub(crate) fn foreign_key_columns(
+    table: &BTreeTable,
+    resolver: &Resolver,
+    database_id: usize,
+) -> Result<ColumnMask> {
+    let mut columns = ColumnMask::default();
+    for fk in resolver.with_schema(database_id, |s| s.resolved_fks_for_child(&table.name))? {
+        for &pos in fk.child_pos.iter() {
+            columns.set(pos)?;
+        }
+    }
+    for fk in resolver.with_schema(database_id, |s| s.resolved_fks_referencing(&table.name))? {
+        for &pos in fk.parent_pos.iter() {
+            columns.set(pos)?;
+        }
+    }
+    Ok(columns)
 }

@@ -316,6 +316,40 @@ fn test_cdc_simple_full(db: TempDatabase) {
 }
 
 #[turso_macros::test]
+fn test_cdc_update_records_changed_virtual_column(db: TempDatabase) {
+    let conn = db.connect_limbo();
+    conn.execute("CREATE TABLE t (x INTEGER PRIMARY KEY, y, z AS (y + 1))")
+        .unwrap();
+    conn.execute("INSERT INTO t VALUES (1, 2)").unwrap();
+    conn.execute("PRAGMA capture_data_changes_conn('full')")
+        .unwrap();
+    conn.execute("UPDATE t SET y = 3 WHERE x = 1").unwrap();
+    let rows = normalize_cdc_v2_rows(limbo_exec_rows(&conn, "SELECT * FROM turso_cdc"));
+
+    assert_eq!(
+        rows,
+        vec![
+            v2_row(
+                0,
+                "t",
+                1,
+                Some(record([Value::Integer(1), Value::Integer(2)])),
+                Some(record([Value::Integer(1), Value::Integer(3)])),
+                Some(record([
+                    Value::Integer(0),
+                    Value::Integer(1),
+                    Value::Integer(1),
+                    Value::Null,
+                    Value::Integer(3),
+                    Value::Integer(4)
+                ])),
+            ),
+            v2_commit(),
+        ]
+    );
+}
+
+#[turso_macros::test]
 fn test_cdc_crud(db: TempDatabase) {
     let conn = db.connect_limbo();
     conn.execute("CREATE TABLE t (x INTEGER PRIMARY KEY, y)")

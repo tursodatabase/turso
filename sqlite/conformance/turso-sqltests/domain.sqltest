@@ -1573,3 +1573,15 @@ expect {
     1|42
     2|42
 }
+
+setup domain_without_decode {
+    CREATE DOMAIN posint AS integer CHECK (value > 0);
+    CREATE TABLE t1(x posint) STRICT;
+}
+
+@requires custom_types "uses CREATE DOMAIN"
+@skip-if mvcc "mvcc has different root pages"
+@setup domain_without_decode
+snapshot domain_select_without_decode_has_no_null_check {
+    SELECT x FROM t1;
+}

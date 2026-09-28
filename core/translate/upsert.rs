@@ -4,7 +4,9 @@ use std::sync::Arc;
 
 use turso_parser::ast::{self, TriggerEvent, TriggerTime, Upsert};
 
-use super::emitter::gencol::compute_virtual_columns;
+use super::emitter::gencol::{
+    columns_needed_for_new_row, compute_virtual_columns, emit_row_from_cursor,
+};
 use crate::alloc::TursoIteratorExt;
 use crate::error::SQLITE_CONSTRAINT_PRIMARYKEY;
 use crate::schema::{BTreeTable, ColumnLayout, IndexColumn, EXPR_INDEX_SENTINEL, ROWID_SENTINEL};
@@ -502,20 +504,10 @@ pub fn emit_upsert(
         .expect("upsert must have a target table")
         .internal_id;
     let current_start = program.alloc_registers(num_cols);
-    for i in 0..num_cols {
-        let col = &table.columns()[i];
-        let reg = layout.to_register(current_start, i);
-        emit_table_column(
-            program,
-            ctx.cursor_id,
-            table_ref_id,
-            table_references,
-            col,
-            i,
-            reg,
-            resolver,
-        )?;
-    }
+    let current_regs: Vec<usize> = (0..num_cols)
+        .map(|i| layout.to_register(current_start, i))
+        .collect();
+    emit_row_from_cursor(program, ctx.table, ctx.cursor_id, &current_regs, resolver)?;
 
     // BEFORE for index maintenance / CDC
     let before_start = if ctx.cdc_table.is_some() || !ctx.idx_cursors.is_empty() {
@@ -728,8 +720,47 @@ pub fn emit_upsert(
                     None,
                 )?,
             });
+        } else {
+            // For non-STRICT tables, apply column affinity to the values.
+            // This must happen early so that both index records and the table record
+            // use the converted values.
+            let affinity = bt
+                .columns()
+                .iter()
+                .filter(|c| !c.is_virtual_generated())
+                .map(|c| c.affinity());
+
+            if affinity.clone().any(|a| a != Affinity::Blob) {
+                if let Ok(count) = NonZeroUsize::try_from(layout.num_non_virtual_cols()) {
+                    program.emit_insn(Insn::Affinity {
+                        start_reg: new_start,
+                        count,
+                        affinities: affinity.map(|a| a.aff_mask()).collect(),
+                    });
+                }
+            }
         }
     }
+
+    let updated_positions: ColumnMask = set_pairs
+        .iter()
+        .map(|(col_idx, _)| *col_idx)
+        .try_collect()?;
+    let reads_whole_row = !returning.is_empty()
+        || has_triggers_including_temp(
+            resolver,
+            ctx.database_id,
+            TriggerEvent::Update,
+            Some(&updated_positions),
+            ctx.table,
+        );
+    let columns_to_compute = columns_needed_for_new_row(
+        ctx.table,
+        resolver,
+        ctx.database_id,
+        reads_whole_row,
+        connection.foreign_keys_enabled(),
+    )?;
 
     // Recompute virtual columns for the new row after SET clauses have modified base columns.
     // This must happen before CHECK constraints, triggers, and index updates.
@@ -740,6 +771,8 @@ pub fn emit_upsert(
         new_rowid_reg.unwrap_or(ctx.conflict_rowid_reg),
         &layout,
         resolver,
+        ColumnMask::default(),
+        &columns_to_compute,
     )?;
 
     if let Some(bt) = table.btree() {
@@ -764,25 +797,6 @@ pub fn emit_upsert(
                 check_generated: true,
                 table_reference: BTreeTable::type_check_table_ref(&bt, resolver.schema()),
             });
-        } else {
-            // For non-STRICT tables, apply column affinity to the values.
-            // This must happen early so that both index records and the table record
-            // use the converted values.
-            let affinity = bt
-                .columns()
-                .iter()
-                .filter(|c| !c.is_virtual_generated())
-                .map(|c| c.affinity());
-
-            if affinity.clone().any(|a| a != Affinity::Blob) {
-                if let Ok(count) = NonZeroUsize::try_from(layout.num_non_virtual_cols()) {
-                    program.emit_insn(Insn::Affinity {
-                        start_reg: new_start,
-                        count,
-                        affinities: affinity.map(|a| a.aff_mask()).collect(),
-                    });
-                }
-            }
         }
 
         // Evaluate CHECK constraints on the new values
@@ -808,10 +822,6 @@ pub fn emit_upsert(
 
     // Fire BEFORE UPDATE triggers
     let upsert_database_id = ctx.database_id;
-    let updated_positions: ColumnMask = set_pairs
-        .iter()
-        .map(|(col_idx, _)| *col_idx)
-        .try_collect()?;
     let table_btree = table.btree();
     let affected_parent_fks = match (connection.foreign_keys_enabled(), table_btree.as_deref()) {
         (true, Some(table)) => {
@@ -888,18 +898,10 @@ pub fn emit_upsert(
             // index deletion must use the row as it is on disk now, or the
             // trigger's index entries are left behind (#8744).
             if let Some(before) = before_start {
-                for (i, column) in table.columns().iter().enumerate() {
-                    emit_table_column(
-                        program,
-                        ctx.cursor_id,
-                        table_ref_id,
-                        table_references,
-                        column,
-                        i,
-                        layout.to_register(before, i),
-                        resolver,
-                    )?;
-                }
+                let before_regs: Vec<usize> = (0..num_cols)
+                    .map(|i| layout.to_register(before, i))
+                    .collect();
+                emit_row_from_cursor(program, ctx.table, ctx.cursor_id, &before_regs, resolver)?;
             }
 
             // Same for the NEW image: like SQLite, columns not in the SET list
@@ -928,6 +930,8 @@ pub fn emit_upsert(
                 new_rowid_reg.unwrap_or(ctx.conflict_rowid_reg),
                 &layout,
                 resolver,
+                (0..num_cols).try_collect()?,
+                &columns_to_compute,
             )?;
 
             let has_relevant_after_triggers = has_triggers_including_temp(
@@ -1138,7 +1142,7 @@ pub fn emit_upsert(
             // NEW key (use NEW rowid if present)
             let ins = program.alloc_registers(k + 1);
             for (i, ic) in idx_meta.columns.iter().enumerate() {
-                if ic.expr.is_some() {
+                if ic.pos_in_table == EXPR_INDEX_SENTINEL {
                     emit_upsert_expr_index_value(
                         program,
                         resolver,
@@ -1260,7 +1264,7 @@ pub fn emit_upsert(
             // DELETE old key
             let del = program.alloc_registers(k + 1);
             for (i, ic) in pending.idx_meta.columns.iter().enumerate() {
-                if ic.expr.is_some() {
+                if ic.pos_in_table == EXPR_INDEX_SENTINEL {
                     emit_upsert_expr_index_value(
                         program,
                         resolver,
@@ -1543,18 +1547,6 @@ pub fn emit_upsert(
         }
     }
 
-    // Compute virtual columns for RETURNING (if any virtual columns exist)
-    if !returning.is_empty() {
-        compute_new_row_virtual_columns(
-            program,
-            ctx,
-            new_start,
-            new_rowid_reg.unwrap_or(ctx.conflict_rowid_reg),
-            &layout,
-            resolver,
-        )?;
-    }
-
     // RETURNING from NEW image + final rowid
     if !returning.is_empty() {
         emit_returning_results(
@@ -1575,6 +1567,7 @@ pub fn emit_upsert(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn compute_new_row_virtual_columns(
     program: &mut ProgramBuilder,
     ctx: &InsertEmitCtx,
@@ -1582,15 +1575,20 @@ fn compute_new_row_virtual_columns(
     rowid_reg: usize,
     layout: &ColumnLayout,
     resolver: &Resolver,
+    encoded_columns: ColumnMask,
+    columns_to_compute: &ColumnMask,
 ) -> crate::Result<()> {
     if !ctx.table.has_virtual_columns {
         return Ok(());
     }
     let dml_ctx =
-        DmlColumnContext::layout(ctx.table.columns(), new_start, rowid_reg, layout.clone());
+        DmlColumnContext::layout(ctx.table.columns(), new_start, rowid_reg, layout.clone())
+            .with_encoded_columns(encoded_columns);
     compute_virtual_columns(
         program,
-        &ctx.table.columns_topo_sort()?,
+        &ctx.table
+            .columns_topo_sort()?
+            .retain_columns(columns_to_compute),
         &dml_ctx,
         resolver,
         ctx.table,
@@ -1659,7 +1657,7 @@ fn eval_partial_pred_for_row_image(
     let columns = table.columns();
     let bt = table.require_btree().ok()?;
 
-    let mut column_regs: Vec<usize> = columns
+    let column_regs: Vec<usize> = columns
         .iter()
         .enumerate()
         .map(|(i, col)| {
@@ -1677,7 +1675,7 @@ fn eval_partial_pred_for_row_image(
         resolver,
         expr,
         columns,
-        &mut column_regs,
+        &column_regs,
         &bt,
         r,
     )
@@ -1696,12 +1694,15 @@ fn emit_upsert_expr_index_value(
     dest_reg: usize,
     layout: &ColumnLayout,
 ) -> crate::Result<()> {
-    let expr = idx_col.expr.as_ref().expect("caller checked is_some");
+    let expr = idx_col
+        .expr
+        .as_ref()
+        .expect("expression index column has an expression");
     let expr = expr.as_ref().clone();
     let columns = table.columns();
     let bt = table.require_btree()?;
 
-    let mut column_regs: Vec<usize> = columns
+    let column_regs: Vec<usize> = columns
         .iter()
         .enumerate()
         .map(|(i, col)| {
@@ -1717,7 +1718,7 @@ fn emit_upsert_expr_index_value(
         resolver,
         expr,
         columns,
-        &mut column_regs,
+        &column_regs,
         &bt,
         dest_reg,
     )?;
