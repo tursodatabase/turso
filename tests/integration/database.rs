@@ -145,6 +145,32 @@ fn test_open_short_file_reports_not_a_database() {
     assert_turso_says_not_a_database(&truncated);
 }
 
+/// Turso has no fts5 module. Opening a file that has an fts5 table must fail:
+/// with only part of the schema loaded, writes skip index updates and
+/// corrupt the file.
+#[test]
+fn test_open_refuses_file_with_unknown_virtual_table_module() {
+    let tmp_dir = tempfile::TempDir::new().unwrap();
+    let path = tmp_dir.path().join("fts5.db");
+    let sqlite = rusqlite::Connection::open(&path).unwrap();
+    sqlite
+        .execute_batch(
+            "CREATE TABLE a(x); CREATE INDEX ax ON a(x);
+             CREATE VIRTUAL TABLE f USING fts5(b);
+             CREATE TABLE z(y);",
+        )
+        .unwrap();
+    drop(sqlite);
+
+    match open_plain_file(&path) {
+        Err(turso_core::LimboError::ExtensionError(msg)) => {
+            assert_that!(msg).contains("fts5");
+        }
+        Err(other) => panic!("expected missing fts5 module error, got {other:?}"),
+        Ok(_) => panic!("expected missing fts5 module error, got a successful open"),
+    }
+}
+
 /// Regression test: TursoConnection.close() must finalize outstanding statements
 /// so that the Statement → Arc<Connection> → Arc<Database> chain is broken.
 ///
