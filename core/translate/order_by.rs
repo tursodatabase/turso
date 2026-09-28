@@ -196,11 +196,25 @@ impl EmitOrderBy {
         let has_custom_comparator = order_by.iter().any(|(expr, _, _)| {
             custom_type_comparator(expr, referenced_tables, t_ctx.resolver.schema()).is_some()
         });
+        let mut has_custom_collation = false;
+        for (expr, _, _) in order_by {
+            if get_collseq_from_expr_with_symbols(
+                expr,
+                referenced_tables,
+                Some(t_ctx.resolver.symbol_table),
+            )?
+            .is_some_and(CollationSeq::is_custom)
+            {
+                has_custom_collation = true;
+                break;
+            }
+        }
         let use_heap_sort = !has_distinct
             && !has_group_by
             && has_limit
             && !has_explicit_nulls
-            && !has_custom_comparator;
+            && !has_custom_comparator
+            && !has_custom_collation;
 
         // only emit sequence column if (we have GROUP BY and ORDER BY is not only aggregates or constants) OR (we decided to use heap-sort)
         let has_sequence = (has_group_by && !only_aggs) || use_heap_sort;

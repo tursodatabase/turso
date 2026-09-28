@@ -877,6 +877,22 @@ fn custom_collations_cover_dotnet_create_collation_cases(
         ]
     );
 
+    assert_that!(limbo_exec_rows(
+        &conn,
+        "SELECT value FROM names ORDER BY value COLLATE dotnet_nocase, value LIMIT 3"
+    ))
+    .is_equal_to(vec![row!["ALPHA"], row!["alpha"], row!["beta"]]);
+    assert_that!(limbo_exec_rows(
+        &conn,
+        "SELECT value FROM names ORDER BY value COLLATE dotnet_nocase DESC LIMIT 1"
+    ))
+    .is_equal_to(vec![row!["Gamma"]]);
+    assert_that!(limbo_exec_rows(
+        &conn,
+        "SELECT value FROM names ORDER BY value COLLATE dotnet_nocase LIMIT 1 OFFSET 2"
+    ))
+    .is_equal_to(vec![row!["beta"]]);
+
     let equal_rows: Vec<(String,)> = conn.exec_rows(
         "SELECT value FROM names WHERE value = 'ALPHA' COLLATE dotnet_nocase ORDER BY value",
     );
