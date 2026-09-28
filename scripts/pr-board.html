@@ -85,6 +85,7 @@ button, input, select { font: inherit; color: inherit; }
 
 .actions { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
 .status { color: var(--muted); font-size: 12.5px; font-variant-numeric: tabular-nums; }
+.status:empty { display: none; }
 
 .button {
   height: 30px;
@@ -291,6 +292,20 @@ button, input, select { font: inherit; color: inherit; }
 .connect p { margin: 8px 0; }
 .connect ol { margin: 8px 0; padding-left: 20px; }
 .connect li { margin: 4px 0; }
+.command {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  margin: 8px 0 12px;
+  padding: 8px 8px 8px 14px;
+  background: var(--page);
+  border: 1px solid var(--border-strong);
+  border-radius: 8px;
+}
+.command code { font: 600 15px/1.4 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+.command code::before { content: "$ "; color: var(--muted); font-weight: 400; }
+.command .button { height: 28px; }
 .token-form { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 14px; }
 .token-form input {
   flex: 1 1 260px;
@@ -357,19 +372,25 @@ button, input, select { font: inherit; color: inherit; }
 
 <section id="connect" class="connect" hidden>
   <h2>Connect to GitHub</h2>
-  <p>The board gets pull requests from the GitHub GraphQL API. This API needs a personal access token.</p>
+  <p>The board gets pull requests from the GitHub GraphQL API. This API needs a GitHub token.</p>
   <ol>
-    <li>Create a <a href="https://github.com/settings/personal-access-tokens/new" target="_blank" rel="noopener noreferrer">fine-grained token</a> with read-only access to public repositories. A <a href="https://github.com/settings/tokens/new?description=Turso%20PR%20board" target="_blank" rel="noopener noreferrer">classic token</a> with no scopes also works.</li>
-    <li>Paste the token here and click <strong>Save</strong>.</li>
+    <li>In a terminal, run this command of the GitHub CLI:
+      <div class="command">
+        <code id="token-command">gh auth token</code>
+        <button id="copy-command" class="button" type="button">Copy</button>
+      </div>
+    </li>
+    <li>Paste the output of the command here and click <strong>Save</strong>.</li>
   </ol>
   <form id="token-form" class="token-form">
-    <input id="token-input" type="password" autocomplete="off" spellcheck="false" placeholder="github_pat_… or ghp_…" aria-label="GitHub token" required>
+    <input id="token-input" type="password" autocomplete="off" spellcheck="false" placeholder="Output of gh auth token" aria-label="Output of gh auth token" required>
     <button class="button primary" type="submit">Save</button>
     <button id="token-cancel" class="button" type="button">Cancel</button>
     <button id="token-remove" class="button" type="button">Remove token</button>
   </form>
   <p id="token-error" class="token-error" role="alert"></p>
   <p class="note">The browser keeps the token in local storage. The page sends the token only to api.github.com.</p>
+  <p class="note">If you do not use the GitHub CLI, make a <a href="https://github.com/settings/tokens/new?description=Turso%20PR%20board" target="_blank" rel="noopener noreferrer">classic token</a> with no scopes. This token has read-only access to public data.</p>
 </section>
 
 <main id="board" class="board">
@@ -476,6 +497,8 @@ const page = {
   showLabels: document.getElementById("show-labels"),
   messages: document.getElementById("messages"),
   connect: document.getElementById("connect"),
+  tokenCommand: document.getElementById("token-command"),
+  copyCommand: document.getElementById("copy-command"),
   tokenForm: document.getElementById("token-form"),
   tokenInput: document.getElementById("token-input"),
   tokenCancel: document.getElementById("token-cancel"),
@@ -552,6 +575,7 @@ function connectControls() {
     state.editingToken = true;
     showView();
   });
+  page.copyCommand.addEventListener("click", onCopyCommand);
   page.tokenForm.addEventListener("submit", onTokenSubmit);
   page.tokenCancel.addEventListener("click", () => {
     state.editingToken = false;
@@ -589,6 +613,19 @@ function connectControls() {
   page.mergedSince.addEventListener("blur", () => {
     if (!isDateText(page.mergedSince.value)) page.mergedSince.value = mergedSinceText();
   });
+}
+
+async function onCopyCommand() {
+  try {
+    await navigator.clipboard.writeText(page.tokenCommand.textContent);
+    page.copyCommand.textContent = "Copied";
+  } catch {
+    getSelection().selectAllChildren(page.tokenCommand);
+    page.copyCommand.textContent = "Press Ctrl+C";
+  }
+  setTimeout(() => {
+    page.copyCommand.textContent = "Copy";
+  }, 2000);
 }
 
 function onTokenSubmit(event) {
