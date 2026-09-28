@@ -185,6 +185,32 @@ fn chunk_assembly_rejects_stray_chunk_numbers_without_panicking() {
 }
 
 #[test]
+fn metadata_fields_borrow_the_record_and_validate_types() {
+    let values = [
+        Value::from_text("fts2/seg/test"),
+        Value::from_i64(3),
+        Value::Blob(vec![4, 9, 2]),
+    ];
+    let record = crate::types::ImmutableRecord::from_values(values.iter(), 3).unwrap();
+    let (path, chunk, bytes) = row_fields(&record).unwrap();
+    assert_eq!((path, chunk, bytes), ("fts2/seg/test", 3, &[4, 9, 2][..]));
+    let crate::types::ValueRef::Text(stored_path) = record.get_value_opt(0).unwrap() else {
+        panic!("expected text");
+    };
+    let crate::types::ValueRef::Blob(stored_bytes) = record.get_value_opt(2).unwrap() else {
+        panic!("expected blob");
+    };
+    assert_eq!(path.as_ptr(), stored_path.value.as_ptr());
+    assert_eq!(bytes.as_ptr(), stored_bytes.as_ptr());
+    for column in 0..3 {
+        let mut invalid = values.clone();
+        invalid[column] = Value::Null;
+        let record = crate::types::ImmutableRecord::from_values(invalid.iter(), 3).unwrap();
+        assert!(matches!(row_fields(&record), Err(LimboError::Corrupt(_))));
+    }
+}
+
+#[test]
 fn query_limit_is_exact_and_bounded_by_live_documents() {
     assert_eq!(bounded_query_limit(None, 1_500_000), 1_500_000);
     assert_eq!(bounded_query_limit(Some(-1), 1_500_000), 1_500_000);
@@ -361,6 +387,29 @@ fn rowid_lookup_uses_current_deletes_with_reordered_segments() {
         vec![(first_id, 0)]
     );
     assert!(cursor.live_postings_for_rowid(99).unwrap().is_empty());
+    assert_eq!(cursor.segment_positions[&first_id], 1);
+    assert_eq!(cursor.segment_positions[&second_id], 0);
+
+    cursor.segments.reverse();
+    cursor.invalidate_snapshot_view();
+    assert!(cursor.segment_positions.is_empty());
+    assert_eq!(
+        cursor.live_postings_for_rowid(7).unwrap(),
+        vec![(first_id, 0)]
+    );
+    assert_eq!(cursor.segment_positions[&first_id], 0);
+
+    let (replacement, _) = build_and_load_segment(&attachment, &[(7, "replacement")]);
+    let replacement_id = replacement.id();
+    cursor.segments = vec![replacement];
+    cursor.invalidate_snapshot_view();
+    assert_eq!(
+        cursor.live_postings_for_rowid(7).unwrap(),
+        vec![(replacement_id, 0)]
+    );
+    cursor.reset_to_init();
+    assert!(cursor.segment_positions.is_empty());
+    assert!(cursor.live_postings_for_rowid(7).unwrap().is_empty());
 }
 
 fn identities_of(segment: &LoadedSegment) -> Vec<DocumentIdentity> {
@@ -557,7 +606,8 @@ fn snapshots_with_different_segment_sets_do_not_share_searchers() {
     let (segment_b, _) = build_and_load_segment(&attachment, &[(2, "beta")]);
 
     let key_a = searcher_key(std::slice::from_ref(&segment_a));
-    let key_ab = searcher_key(&[segment_a.clone(), segment_b]);
+    let segments_ab = [segment_a.clone(), segment_b];
+    let key_ab = searcher_key(&segments_ab);
     assert_ne!(key_a, key_ab);
 
     // Tombstone state is part of the identity.
@@ -567,6 +617,38 @@ fn snapshots_with_different_segment_sets_do_not_share_searchers() {
         searcher_key(std::slice::from_ref(&segment_a)),
         searcher_key(std::slice::from_ref(&tombstoned))
     );
+}
+
+#[test]
+fn cached_searcher_compares_exact_borrowed_delete_sets() {
+    let attachment = test_attachment();
+    let (mut first, _) = build_and_load_segment(&attachment, &[(1, "alpha"), (2, "beta")]);
+    let (second, _) = build_and_load_segment(&attachment, &[(3, "gamma")]);
+    first.deleted.insert(0);
+    let key = searcher_key(std::slice::from_ref(&first));
+    assert!(std::ptr::eq(key[0].2, &first.deleted));
+
+    let mut cursor = FtsCursor::new(&attachment);
+    cursor.segments = vec![first.clone(), second.clone()];
+    cursor.ensure_searcher().unwrap();
+    let mut cache = attachment.shared.searchers.lock();
+    assert!(cache
+        .get(&searcher_key(&[second.clone(), first.clone()]))
+        .is_some());
+    assert!(cache
+        .get(&searcher_key(&[first.clone(), first.clone()]))
+        .is_none());
+    assert!(cache
+        .get(&searcher_key(std::slice::from_ref(&first)))
+        .is_none());
+
+    first.deleted = BTreeSet::from([1]);
+    assert!(cache
+        .get(&searcher_key(&[first.clone(), second.clone()]))
+        .is_none());
+    first.deleted = BTreeSet::from([0]);
+    first.descriptor.max_doc += 1;
+    assert!(cache.get(&searcher_key(&[first, second])).is_none());
 }
 
 #[test]

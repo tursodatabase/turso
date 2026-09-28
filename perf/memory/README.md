@@ -75,6 +75,29 @@ caches that remain live until the connection closes.
 snapshots, not a query peak. The latter includes dhat stack collection and report
 generation overhead, which can be large. Use the heap metrics for query analysis.
 
+## Measure metadata scans and deletes
+
+```bash
+cargo run --profile bench-profile -p memory-benchmark --features fts \
+  --example fts_metadata -- --documents 10000 --tombstones 1000 --operation open
+cargo run --profile bench-profile -p memory-benchmark --features fts \
+  --example fts_metadata -- --documents 100000 --operation delete \
+  --dhat-file /tmp/fts-delete.json
+```
+
+This example uses one connection, MVCC by default (`--mode wal` is also supported),
+and constant document text. It disables automatic merging and verifies the stored
+segment and tombstone counts. Tombstones delete the lowest rowids and therefore
+concentrate in the first segments. Setup and one no-hit query warm-up are excluded.
+`open` measures repeated no-hit SQL searches, including preparation and snapshot
+opening. `delete` measures one range-delete statement inside `BEGIN`/`ROLLBACK`.
+`--operations` defaults to 100: queries for `open`, rows for `delete`.
+JSON reports elapsed batch microseconds and, with `--dhat-file`, allocation totals,
+allocation count, and peak tracked heap bytes. These exclude existing cache memory.
+Run multiple independent invocations for timing comparisons, without `--dhat-file`;
+active profiling adds overhead. Divide batch time by operations for an average,
+not a latency percentile. This fixture does not measure concurrent writers.
+
 ## Measure concurrent transaction lifecycles
 
 ```bash

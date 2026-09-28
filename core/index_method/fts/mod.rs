@@ -473,20 +473,14 @@ impl SegmentByteCache {
 /// Cache identity of one assembled searcher: the visible segment set with
 /// each segment's tombstone state. Exact comparison — a wrong reuse would
 /// silently produce wrong query results.
-type SearcherKey = Vec<(SegmentId, u32, BTreeSet<u32>)>;
+type SearcherKey<T = BTreeSet<u32>> = Vec<(SegmentId, u32, T)>;
 
-fn searcher_key(segments: &[LoadedSegment]) -> SearcherKey {
-    let mut key: SearcherKey = segments
+fn searcher_key(segments: &[LoadedSegment]) -> SearcherKey<&BTreeSet<u32>> {
+    let mut key: SearcherKey<_> = segments
         .iter()
-        .map(|segment| {
-            (
-                segment.id(),
-                segment.descriptor.max_doc,
-                segment.deleted.clone(),
-            )
-        })
+        .map(|segment| (segment.id(), segment.descriptor.max_doc, &segment.deleted))
         .collect();
-    key.sort_by_key(|(id, _, _)| id.uuid_string());
+    key.sort_unstable_by_key(|(id, _, _)| *id);
     key
 }
 
@@ -505,8 +499,15 @@ struct SearcherCache {
 }
 
 impl SearcherCache {
-    fn get(&mut self, key: &SearcherKey) -> Option<&SearcherCacheEntry> {
-        let position = self.entries.iter().position(|entry| &entry.key == key)?;
+    fn get(&mut self, key: &SearcherKey<&BTreeSet<u32>>) -> Option<&SearcherCacheEntry> {
+        let position = self.entries.iter().position(|entry| {
+            entry.key.len() == key.len()
+                && entry.key.iter().zip(key).all(
+                    |((id, max_doc, deleted), (other_id, other_max_doc, other_deleted))| {
+                        id == other_id && max_doc == other_max_doc && deleted == *other_deleted
+                    },
+                )
+        })?;
         let entry = self.entries.remove(position);
         self.entries.push(entry);
         self.entries.last()
@@ -1038,10 +1039,12 @@ pub struct FtsCursor {
     /// tombstone state), including this transaction's own published
     /// segments. Valid once `snapshot_loaded`.
     segments: Vec<LoadedSegment>,
+    segment_positions: HashMap<SegmentId, usize>,
     snapshot_loaded: bool,
 
     // Scratch for the open/scan machine.
     scan_descriptors: Vec<SegmentDescriptor>,
+    scan_segment_ids: HashSet<SegmentId>,
     /// Identities of every visible tombstone row.
     scan_tombs: HashSet<DocumentIdentity>,
     scan_data: HashMap<SegmentId, Arc<SegmentData>>,
@@ -1121,8 +1124,10 @@ impl FtsCursor {
             backing: None,
             control: None,
             segments: Vec::new(),
+            segment_positions: HashMap::default(),
             snapshot_loaded: false,
             scan_descriptors: Vec::new(),
+            scan_segment_ids: HashSet::default(),
             scan_tombs: HashSet::default(),
             scan_data: HashMap::default(),
             probe_only: false,
@@ -1331,6 +1336,10 @@ impl FtsCursor {
             })
             .collect::<Result<_>>()?;
         if publish_to_cache {
+            let key = key
+                .into_iter()
+                .map(|(id, max_doc, deleted)| (id, max_doc, deleted.clone()))
+                .collect();
             self.shared.searchers.lock().put(SearcherCacheEntry {
                 key,
                 index: index.clone(),
@@ -1359,6 +1368,7 @@ impl FtsCursor {
 
     /// Invalidate the assembled view after the segment set changed.
     fn invalidate_snapshot_view(&mut self) {
+        self.segment_positions.clear();
         self.index = None;
         self.reader = None;
         self.searcher = None;
@@ -1400,6 +1410,7 @@ impl FtsCursor {
                 FtsState::Init => {
                     self.open_cursor(&conn, database_id)?;
                     self.scan_descriptors.clear();
+                    self.scan_segment_ids.clear();
                     self.scan_tombs.clear();
                     self.scan_data.clear();
                     self.state = FtsState::SeekControl;
@@ -1446,7 +1457,7 @@ impl FtsCursor {
                         self.state = FtsState::ProbeFormat { rewound: false };
                         continue;
                     }
-                    self.control = Some(match FtsControl::decode(&bytes)? {
+                    self.control = Some(match FtsControl::decode(bytes)? {
                         ControlRecord::Current(control) => control,
                         ControlRecord::OtherVersion(format_version) => {
                             return Err(self.unsupported_format_error(format_version).into());
@@ -1583,15 +1594,11 @@ impl FtsCursor {
                         continue;
                     };
                     let segment_id = parse_segment_id(uuid)?;
-                    let descriptor = SegmentDescriptor::decode(segment_id, &bytes)?;
+                    let descriptor = SegmentDescriptor::decode(segment_id, bytes)?;
                     // Duplicate segment ids in one searcher trip a
                     // SearcherGeneration assert inside Tantivy; dedupe the
                     // registry scan defensively.
-                    if self
-                        .scan_descriptors
-                        .iter()
-                        .all(|existing| existing.segment_id != segment_id)
-                    {
+                    if self.scan_segment_ids.insert(segment_id) {
                         self.scan_descriptors.push(descriptor);
                     } else {
                         let existing = self
@@ -1705,7 +1712,7 @@ impl FtsCursor {
                                 if chunks
                                     .entry(file_ord)
                                     .or_default()
-                                    .insert(chunk_no, bytes)
+                                    .insert(chunk_no, bytes.to_vec())
                                     .is_some()
                                 {
                                     return Err(LimboError::Corrupt(format!(
@@ -1747,6 +1754,7 @@ impl FtsCursor {
                     if !self.snapshot_loaded {
                         // Adopt the scan results as the visible set.
                         let descriptors = std::mem::take(&mut self.scan_descriptors);
+                        self.scan_segment_ids.clear();
                         let tombs = std::mem::take(&mut self.scan_tombs);
                         let mut data_by_id = std::mem::take(&mut self.scan_data);
                         let mut applied_tombstones = 0usize;
@@ -2334,18 +2342,22 @@ impl FtsCursor {
             .searcher
             .as_ref()
             .expect("searcher built by ensure_searcher");
-        let segments_by_id: HashMap<_, _> = self
-            .segments
-            .iter()
-            .map(|segment| (segment.id(), segment))
-            .collect();
+        if self.segment_positions.is_empty() {
+            self.segment_positions.extend(
+                self.segments
+                    .iter()
+                    .enumerate()
+                    .map(|(position, segment)| (segment.id(), position)),
+            );
+        }
         let term = Term::from_field_i64(self.rowid_field, rowid);
         let mut hits = Vec::new();
         for segment_reader in searcher.segment_readers() {
             let segment_id = segment_reader.segment_id();
-            let Some(segment) = segments_by_id.get(&segment_id) else {
+            let Some(&position) = self.segment_positions.get(&segment_id) else {
                 continue;
             };
+            let segment = &self.segments[position];
             let inverted = segment_reader
                 .inverted_index(self.rowid_field)
                 .map_err(|e| LimboError::InternalError(format!("FTS rowid lookup: {e}")))?;
@@ -2418,6 +2430,7 @@ impl FtsCursor {
         self.segments.clear();
         self.snapshot_loaded = false;
         self.scan_descriptors.clear();
+        self.scan_segment_ids.clear();
         self.scan_tombs.clear();
         self.scan_data.clear();
         self.control = None;
@@ -2761,7 +2774,8 @@ impl FtsBackingRowDumper {
             let hash = bytes.iter().fold(0xcbf2_9ce4_8422_2325u64, |hash, byte| {
                 (hash ^ u64::from(*byte)).wrapping_mul(0x100_0000_01b3)
             });
-            self.rows.push((path, chunk_no, bytes.len(), hash));
+            self.rows
+                .push((path.to_owned(), chunk_no, bytes.len(), hash));
             self.advance_pending = true;
         }
     }
@@ -2980,21 +2994,15 @@ impl IndexMethodCursor for FtsCursor {
         // rows for the next flush.
         let postings = self.live_postings_for_rowid(rowid)?;
         for (segment_id, doc_id) in postings {
-            if let Some(segment) = self
-                .segments
-                .iter_mut()
-                .find(|segment| segment.id() == segment_id)
-            {
-                if segment.deleted.insert(doc_id) {
-                    let identity =
-                        segment.data.identities.identity_of(doc_id).ok_or_else(|| {
-                            LimboError::Corrupt(format!(
-                                "FTS segment {} document {doc_id} has no identity",
-                                segment_id.uuid_string()
-                            ))
-                        })?;
-                    self.pending_tombstone_rows.push(identity);
-                }
+            let segment = &mut self.segments[self.segment_positions[&segment_id]];
+            if segment.deleted.insert(doc_id) {
+                let identity = segment.data.identities.identity_of(doc_id).ok_or_else(|| {
+                    LimboError::Corrupt(format!(
+                        "FTS segment {} document {doc_id} has no identity",
+                        segment_id.uuid_string()
+                    ))
+                })?;
+                self.pending_tombstone_rows.push(identity);
             }
         }
 

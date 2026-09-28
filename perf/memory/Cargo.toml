@@ -18,6 +18,10 @@ name = "fts-memory"
 path = "src/fts_memory.rs"
 required-features = ["fts"]
 
+[[example]]
+name = "fts_metadata"
+required-features = ["fts"]
+
 [features]
 stacker = ["turso/stacker"]
 fts = ["turso/fts", "dep:tempfile", "dep:turso_core"]

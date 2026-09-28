@@ -32,6 +32,17 @@ The `fts-memory` binary and `perf/memory/codspeed/benches/fts_queries.rs` share
 `memory_benchmark::fts`, independently of the existing SQL profile runner.
 See `perf/memory/README.md` for commands, corpus details, and measurement limits.
 
+For tombstone/segment-count scaling and delete batches, run
+`cargo run --profile bench-profile -p memory-benchmark --features fts --example
+fts_metadata -- --documents 10000 --tombstones 1000 --operation open`.
+Use `--operation delete` for one range-delete statement inside BEGIN/ROLLBACK.
+`--operations` defaults to 100 queries or deleted rows. The example disables
+automatic merging, checks stored segment/tombstone counts, and excludes setup
+and a no-hit warm-up. It defaults to MVCC; `--mode wal` also works.
+`--dhat-file /tmp/fts-metadata.json` enables allocation profiling; omit it for
+repeated timing runs. JSON reports batch microseconds and optional heap totals.
+See the README for fixture and measurement limits.
+
 ```bash
 cargo run -p memory-benchmark --features fts --bin fts-memory -- \
   --query common --state warm --documents 10000 --queries 100 \
