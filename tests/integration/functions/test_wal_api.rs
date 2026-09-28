@@ -1010,3 +1010,13 @@ fn test_wal_api_simulate_spilled_frames(db: TempDatabase) {
             .unwrap();
     }
 }
+
+#[turso_macros::test()]
+fn test_wal_insert_begin_on_closed_connection(db: TempDatabase) {
+    let closed = db.connect_limbo();
+    let other = db.connect_limbo();
+    other.execute("CREATE TABLE t(x)").unwrap();
+    closed.close().unwrap();
+    assert!(closed.wal_insert_begin().is_err());
+    other.execute("INSERT INTO t VALUES (1)").unwrap();
+}
