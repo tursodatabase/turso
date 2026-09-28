@@ -1,0 +1,1171 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light dark">
+<title>Turso PR board</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Crect x='0.5' y='1' width='3.5' height='14' rx='1' fill='%230969da'/%3E%3Crect x='4.5' y='1' width='3.5' height='9' rx='1' fill='%23bc4c00'/%3E%3Crect x='8.5' y='1' width='3.5' height='11' rx='1' fill='%231a7f37'/%3E%3Crect x='12.5' y='1' width='3.5' height='6' rx='1' fill='%238250df'/%3E%3C/svg%3E">
+<style>
+:root {
+  --page: #f4f5f7;
+  --panel: #e8ebef;
+  --card: #ffffff;
+  --border: #d5dae1;
+  --border-strong: #b6bec9;
+  --text: #1f2328;
+  --muted: #59636e;
+  --link: #0969da;
+  --ready: #0969da;
+  --back: #bc4c00;
+  --approved: #1a7f37;
+  --merged: #8250df;
+  --danger: #d1242f;
+  --danger-soft: #ffebe9;
+  --warning: #9a6700;
+  --warning-soft: #fff8c5;
+  --pending: #bf8700;
+  --pressed: #ddf4ff;
+  --shadow: 0 1px 2px rgb(31 35 40 / 0.08);
+}
+
+@media (prefers-color-scheme: dark) {
+  :root {
+    --page: #0d1117;
+    --panel: #161b22;
+    --card: #1f2630;
+    --border: #30363d;
+    --border-strong: #4a525c;
+    --text: #e6edf3;
+    --muted: #9198a1;
+    --link: #4493f8;
+    --ready: #4493f8;
+    --back: #f0883e;
+    --approved: #3fb950;
+    --merged: #ab7df8;
+    --danger: #f85149;
+    --danger-soft: rgb(248 81 73 / 0.12);
+    --warning: #d29922;
+    --warning-soft: rgb(187 128 9 / 0.15);
+    --pending: #d29922;
+    --pressed: rgb(56 139 253 / 0.18);
+    --shadow: none;
+  }
+}
+
+* { box-sizing: border-box; }
+[hidden] { display: none !important; }
+
+body {
+  margin: 0;
+  background: var(--page);
+  color: var(--text);
+  font: 14px/1.45 system-ui, -apple-system, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+}
+
+a { color: var(--link); }
+button, input, select { font: inherit; color: inherit; }
+:focus-visible { outline: 2px solid var(--link); outline-offset: 2px; }
+
+.top-bar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px 16px;
+  padding: 10px 16px;
+  background: var(--card);
+  border-bottom: 1px solid var(--border);
+}
+
+.brand { display: flex; flex-wrap: wrap; align-items: baseline; gap: 4px 10px; }
+.brand h1 { margin: 0; font-size: 17px; font-weight: 650; }
+.repository { color: var(--muted); font-size: 13px; text-decoration: none; }
+.repository:hover { color: var(--link); text-decoration: underline; }
+
+.actions { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
+.status { color: var(--muted); font-size: 12.5px; font-variant-numeric: tabular-nums; }
+
+.button {
+  height: 30px;
+  padding: 0 12px;
+  border: 1px solid var(--border-strong);
+  border-radius: 6px;
+  background: var(--card);
+  font-size: 13px;
+  font-weight: 500;
+  cursor: pointer;
+}
+.button:hover:not(:disabled) { border-color: var(--muted); }
+.button:disabled { opacity: 0.6; cursor: default; }
+.button.primary { background: var(--approved); border-color: transparent; color: #ffffff; }
+
+.toolbar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px 16px;
+  padding: 10px 16px;
+}
+
+.authors { display: flex; flex-wrap: wrap; gap: 6px; }
+
+.chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  height: 28px;
+  padding: 0 10px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  background: var(--card);
+  font-size: 13px;
+  cursor: pointer;
+}
+.chip .avatar { margin-left: -5px; }
+.chip:hover { border-color: var(--border-strong); }
+.chip[aria-pressed="true"] { border-color: var(--ready); background: var(--pressed); }
+
+.options { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 14px; }
+.options input[type="search"], .options select {
+  height: 30px;
+  padding: 0 10px;
+  border: 1px solid var(--border-strong);
+  border-radius: 6px;
+  background: var(--card);
+  font-size: 13px;
+}
+.options input[type="search"] { width: 220px; max-width: 100%; }
+.toggle { display: inline-flex; align-items: center; gap: 6px; font-size: 13px; cursor: pointer; }
+
+.messages { display: grid; gap: 6px; padding: 0 16px 8px; }
+.messages:empty { display: none; }
+.message { margin: 0; padding: 8px 12px; border: 1px solid; border-radius: 6px; font-size: 13px; }
+.message.error { background: var(--danger-soft); border-color: var(--danger); }
+.message.warning { background: var(--warning-soft); border-color: var(--warning); }
+
+.board {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  align-items: start;
+  gap: 12px;
+  padding: 0 16px 16px;
+}
+
+.column {
+  display: flex;
+  flex-direction: column;
+  background: var(--panel);
+  border-top: 3px solid var(--accent);
+  border-radius: 10px;
+}
+.column.ready { --accent: var(--ready); }
+.column.back { --accent: var(--back); }
+.column.approved { --accent: var(--approved); }
+.column.merged { --accent: var(--merged); }
+
+.column-head { padding: 10px 12px 8px; }
+.column-title { display: flex; align-items: center; gap: 8px; }
+.column-title h2 { margin: 0; font-size: 14px; font-weight: 650; }
+
+.count {
+  min-width: 24px;
+  padding: 0 7px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  background: var(--card);
+  color: var(--muted);
+  font-size: 12px;
+  text-align: center;
+  font-variant-numeric: tabular-nums;
+}
+
+.spinner {
+  display: none;
+  width: 12px;
+  height: 12px;
+  border: 2px solid var(--border-strong);
+  border-top-color: var(--accent);
+  border-radius: 50%;
+  animation: spin 0.8s linear infinite;
+}
+.column[aria-busy="true"] .spinner { display: inline-block; }
+@keyframes spin { to { transform: rotate(360deg); } }
+@media (prefers-reduced-motion: reduce) { .spinner { animation-duration: 3s; } }
+
+.column-rule { margin: 3px 0 0; color: var(--muted); font-size: 12px; }
+.column-rule code {
+  padding: 0 4px;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  background: var(--card);
+  font-size: 11.5px;
+}
+
+.since { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 6px; }
+.since input {
+  height: 26px;
+  padding: 0 6px;
+  border: 1px solid var(--border-strong);
+  border-radius: 6px;
+  background: var(--card);
+  font-size: 12.5px;
+}
+
+.cards { display: flex; flex-direction: column; gap: 8px; padding: 2px 8px 8px; }
+.empty { margin: 10px 4px; color: var(--muted); font-size: 13px; text-align: center; }
+
+.card {
+  padding: 9px 11px 10px;
+  background: var(--card);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  box-shadow: var(--shadow);
+}
+.card:hover { border-color: var(--border-strong); }
+
+.card-head { display: flex; align-items: center; gap: 6px; min-width: 0; color: var(--muted); font-size: 12px; }
+.avatar { flex: none; width: 18px; height: 18px; border-radius: 50%; background: var(--panel); }
+.author { color: var(--text); font-weight: 550; }
+.number { color: var(--muted); text-decoration: none; font-variant-numeric: tabular-nums; }
+.number:hover { color: var(--link); text-decoration: underline; }
+
+.badge {
+  padding: 0 6px;
+  border: 1px solid var(--border-strong);
+  border-radius: 999px;
+  color: var(--muted);
+  font-size: 11px;
+  line-height: 17px;
+}
+.badge.conflict { border-color: var(--danger); color: var(--danger); }
+
+.checks { flex: none; width: 10px; height: 10px; margin-left: auto; border-radius: 50%; }
+.checks.passed { background: var(--approved); }
+.checks.failed { background: var(--danger); }
+.checks.pending { border: 2px solid var(--pending); }
+
+.title {
+  display: block;
+  margin: 4px 0 5px;
+  color: var(--text);
+  font-size: 13.5px;
+  font-weight: 600;
+  line-height: 1.35;
+  text-decoration: none;
+  overflow-wrap: anywhere;
+}
+.title:hover { color: var(--link); text-decoration: underline; }
+
+.meta { color: var(--muted); font-size: 12px; }
+.added { color: var(--approved); }
+.deleted { color: var(--danger); }
+
+.reviewers { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 7px; }
+.reviewer {
+  padding: 0 7px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  color: var(--muted);
+  font-size: 11.5px;
+  line-height: 19px;
+}
+.reviewer.approved { border-color: var(--approved); color: var(--approved); }
+.reviewer.changes { border-color: var(--danger); color: var(--danger); }
+
+.labels { display: flex; flex-wrap: wrap; gap: 4px 10px; margin-top: 7px; }
+.label { display: inline-flex; align-items: center; gap: 4px; color: var(--muted); font-size: 11.5px; }
+.swatch { width: 8px; height: 8px; border-radius: 50%; background: var(--border-strong); }
+
+.connect {
+  max-width: 580px;
+  margin: 40px auto;
+  padding: 22px 24px;
+  background: var(--card);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  box-shadow: var(--shadow);
+}
+.connect h2 { margin: 0 0 8px; font-size: 18px; }
+.connect p { margin: 8px 0; }
+.connect ol { margin: 8px 0; padding-left: 20px; }
+.connect li { margin: 4px 0; }
+.token-form { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 14px; }
+.token-form input {
+  flex: 1 1 260px;
+  height: 34px;
+  padding: 0 10px;
+  border: 1px solid var(--border-strong);
+  border-radius: 6px;
+  background: var(--page);
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 13px;
+}
+.token-form .button { height: 34px; }
+.note { color: var(--muted); font-size: 12.5px; }
+.token-error { color: var(--danger); font-size: 13px; }
+.token-error:empty { display: none; }
+
+@media (min-width: 1100px) {
+  body.showing-board { display: flex; flex-direction: column; height: 100vh; overflow: hidden; }
+  .showing-board .board { flex: 1; min-height: 0; align-items: stretch; }
+  .showing-board .column { min-height: 0; }
+  .showing-board .cards { flex: 1; min-height: 0; overflow-y: auto; }
+}
+
+@media (max-width: 1099px) {
+  .board { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+}
+
+@media (max-width: 680px) {
+  .board { grid-template-columns: minmax(0, 1fr); }
+  .options input[type="search"] { width: 100%; }
+  .options { width: 100%; }
+  .connect { margin: 16px; padding: 18px 16px; }
+}
+</style>
+</head>
+<body>
+<header class="top-bar">
+  <div class="brand">
+    <h1>Turso PR board</h1>
+    <a id="repository-link" class="repository" target="_blank" rel="noopener noreferrer"></a>
+  </div>
+  <div class="actions">
+    <span id="status" class="status"></span>
+    <button id="refresh-button" class="button" type="button">Refresh</button>
+    <button id="token-button" class="button" type="button">GitHub token</button>
+  </div>
+</header>
+
+<div id="toolbar" class="toolbar">
+  <div id="author-filter" class="authors" role="group" aria-label="Authors"></div>
+  <div class="options">
+    <input id="text-filter" type="search" placeholder="Filter by title or #number" aria-label="Filter by title or number">
+    <select id="sort-order" aria-label="Sort order">
+      <option value="updated">Recently updated</option>
+      <option value="newest">Newest</option>
+      <option value="oldest">Oldest</option>
+    </select>
+    <label class="toggle"><input id="show-drafts" type="checkbox"> Show drafts</label>
+    <label class="toggle"><input id="show-labels" type="checkbox"> Show labels</label>
+  </div>
+</div>
+
+<div id="messages" class="messages"></div>
+
+<section id="connect" class="connect" hidden>
+  <h2>Connect to GitHub</h2>
+  <p>The board gets pull requests from the GitHub GraphQL API. This API needs a personal access token.</p>
+  <ol>
+    <li>Create a <a href="https://github.com/settings/personal-access-tokens/new" target="_blank" rel="noopener noreferrer">fine-grained token</a> with read-only access to public repositories. A <a href="https://github.com/settings/tokens/new?description=Turso%20PR%20board" target="_blank" rel="noopener noreferrer">classic token</a> with no scopes also works.</li>
+    <li>Paste the token here and click <strong>Save</strong>.</li>
+  </ol>
+  <form id="token-form" class="token-form">
+    <input id="token-input" type="password" autocomplete="off" spellcheck="false" placeholder="github_pat_… or ghp_…" aria-label="GitHub token" required>
+    <button class="button primary" type="submit">Save</button>
+    <button id="token-cancel" class="button" type="button">Cancel</button>
+    <button id="token-remove" class="button" type="button">Remove token</button>
+  </form>
+  <p id="token-error" class="token-error" role="alert"></p>
+  <p class="note">The browser keeps the token in local storage. The page sends the token only to api.github.com.</p>
+</section>
+
+<main id="board" class="board">
+  <section id="ready-column" class="column ready" aria-labelledby="ready-title">
+    <header class="column-head">
+      <div class="column-title"><h2 id="ready-title">Ready for Review</h2><span id="ready-count" class="count">0</span><span class="spinner" aria-hidden="true"></span></div>
+      <p id="ready-rule" class="column-rule">No team approval yet</p>
+    </header>
+    <div id="ready-cards" class="cards"></div>
+  </section>
+  <section id="back-column" class="column back" aria-labelledby="back-title">
+    <header class="column-head">
+      <div class="column-title"><h2 id="back-title">Back to Author</h2><span id="back-count" class="count">0</span><span class="spinner" aria-hidden="true"></span></div>
+      <p id="back-rule" class="column-rule">Has the <code id="back-to-author-label"></code> label</p>
+    </header>
+    <div id="back-cards" class="cards"></div>
+  </section>
+  <section id="approved-column" class="column approved" aria-labelledby="approved-title">
+    <header class="column-head">
+      <div class="column-title"><h2 id="approved-title">Approved</h2><span id="approved-count" class="count">0</span><span class="spinner" aria-hidden="true"></span></div>
+      <p id="approved-rule" class="column-rule">Approved by a team member</p>
+    </header>
+    <div id="approved-cards" class="cards"></div>
+  </section>
+  <section id="merged-column" class="column merged" aria-labelledby="merged-title">
+    <header class="column-head">
+      <div class="column-title"><h2 id="merged-title">Merged</h2><span id="merged-count" class="count">0</span><span class="spinner" aria-hidden="true"></span></div>
+      <label class="column-rule since">Merged on or after <input id="merged-since" type="date"></label>
+    </header>
+    <div id="merged-cards" class="cards"></div>
+  </section>
+</main>
+
+<script>
+"use strict";
+
+const REPOSITORY = "tursodatabase/turso";
+const BACK_TO_AUTHOR_LABEL = "back-to-author";
+const TEAM = [
+  { login: "penberg", name: "Pekka" },
+  { login: "pedrocarlo", name: "Pedro" },
+  { login: "jussisaurio", name: "Jussi" },
+  { login: "pereman2", name: "Pere" },
+  { login: "avinassh", name: "Avinash" },
+  { login: "glommer", name: "Glauber" },
+  { login: "LeMikaelF", name: "Mikaël" },
+  { login: "sivukhin", name: "Nikita" },
+];
+const TEAM_BY_LOGIN = new Map(TEAM.map((member) => [member.login.toLowerCase(), member]));
+const GRAPHQL_URL = "https://api.github.com/graphql";
+const PAGE_SIZE = 50;
+const MAX_PAGES_PER_SEARCH = 10;
+const REFRESH_INTERVAL_MS = 5 * 60 * 1000;
+const DATE_CHANGE_DELAY_MS = 400;
+const EARLIEST_MERGE_DATE = "2023-01-01";
+const TOKEN_KEY = "turso-pr-board.token";
+const SETTINGS_KEY = "turso-pr-board.settings";
+const SORT_ORDERS = ["updated", "newest", "oldest"];
+
+const OPEN_PULL_REQUEST_FIELDS = `
+  number
+  title
+  url
+  isDraft
+  createdAt
+  updatedAt
+  additions
+  deletions
+  mergeable
+  author { login avatarUrl(size: 40) }
+  labels(first: 30) { nodes { name color } }
+  latestOpinionatedReviews(first: 30) { nodes { state submittedAt author { login } } }
+  reviewRequests(first: 20) { nodes { requestedReviewer { ... on User { login } } } }
+  timelineItems(itemTypes: [LABELED_EVENT], last: 20) {
+    nodes { ... on LabeledEvent { createdAt label { name } actor { login } } }
+  }
+  commits(last: 1) { nodes { commit { statusCheckRollup { state } } } }
+`;
+
+const MERGED_PULL_REQUEST_FIELDS = `
+  number
+  title
+  url
+  createdAt
+  updatedAt
+  mergedAt
+  additions
+  deletions
+  author { login avatarUrl(size: 40) }
+  mergedBy { login }
+  labels(first: 30) { nodes { name color } }
+`;
+
+const page = {
+  repositoryLink: document.getElementById("repository-link"),
+  status: document.getElementById("status"),
+  refreshButton: document.getElementById("refresh-button"),
+  tokenButton: document.getElementById("token-button"),
+  toolbar: document.getElementById("toolbar"),
+  authorFilter: document.getElementById("author-filter"),
+  textFilter: document.getElementById("text-filter"),
+  sortOrder: document.getElementById("sort-order"),
+  showDrafts: document.getElementById("show-drafts"),
+  showLabels: document.getElementById("show-labels"),
+  messages: document.getElementById("messages"),
+  connect: document.getElementById("connect"),
+  tokenForm: document.getElementById("token-form"),
+  tokenInput: document.getElementById("token-input"),
+  tokenCancel: document.getElementById("token-cancel"),
+  tokenRemove: document.getElementById("token-remove"),
+  tokenError: document.getElementById("token-error"),
+  board: document.getElementById("board"),
+  mergedSince: document.getElementById("merged-since"),
+  columns: {
+    ready: columnParts("ready"),
+    back: columnParts("back"),
+    approved: columnParts("approved"),
+    merged: columnParts("merged"),
+  },
+};
+
+const state = {
+  token: readStorage(TOKEN_KEY),
+  settings: loadSettings(),
+  textFilter: "",
+  editingToken: false,
+  refreshStartedAt: 0,
+  mergedSinceTimer: 0,
+  rateLimit: null,
+  open: emptyList(),
+  merged: emptyList(),
+};
+
+start();
+
+function start() {
+  describeColumns();
+  renderAuthorFilter();
+  connectControls();
+  showView();
+  if (state.token) refreshAll();
+  setInterval(onClockTick, 30 * 1000);
+  document.addEventListener("visibilitychange", onClockTick);
+}
+
+function describeColumns() {
+  page.repositoryLink.textContent = REPOSITORY;
+  page.repositoryLink.href = `https://github.com/${REPOSITORY}/pulls`;
+  document.getElementById("back-to-author-label").textContent = BACK_TO_AUTHOR_LABEL;
+  document.getElementById("ready-rule").title =
+    `Open PRs without the ${BACK_TO_AUTHOR_LABEL} label and without an approval from a team member.`;
+  document.getElementById("back-rule").title =
+    `Open PRs with the ${BACK_TO_AUTHOR_LABEL} label. A PR with this label stays here also when a team member approved it.`;
+  document.getElementById("approved-rule").title =
+    `Open PRs without the ${BACK_TO_AUTHOR_LABEL} label. The last review of at least one team member is an approval.`;
+}
+
+function renderAuthorFilter() {
+  const everyone = element("button", { type: "button", class: "chip", "data-login": "" }, "Everyone");
+  const members = TEAM.map((member) =>
+    element("button", { type: "button", class: "chip", "data-login": member.login.toLowerCase(), title: member.login }, [
+      element("img", {
+        class: "avatar",
+        src: `https://github.com/${member.login}.png?size=40`,
+        alt: "",
+        width: 18,
+        height: 18,
+        loading: "lazy",
+      }),
+      member.name,
+    ]),
+  );
+  page.authorFilter.replaceChildren(everyone, ...members);
+  updateAuthorChips();
+}
+
+function connectControls() {
+  page.refreshButton.addEventListener("click", () => refreshAll());
+  page.tokenButton.addEventListener("click", () => {
+    state.editingToken = true;
+    showView();
+  });
+  page.tokenForm.addEventListener("submit", onTokenSubmit);
+  page.tokenCancel.addEventListener("click", () => {
+    state.editingToken = false;
+    page.tokenError.textContent = "";
+    showView();
+  });
+  page.tokenRemove.addEventListener("click", onTokenRemove);
+  page.authorFilter.addEventListener("click", onAuthorChipClick);
+  page.textFilter.addEventListener("input", () => {
+    state.textFilter = page.textFilter.value.trim().toLowerCase();
+    renderBoard();
+  });
+  page.sortOrder.value = state.settings.sortOrder;
+  page.sortOrder.addEventListener("change", () => {
+    state.settings.sortOrder = page.sortOrder.value;
+    saveSettings();
+    renderBoard();
+  });
+  page.showDrafts.checked = state.settings.showDrafts;
+  page.showDrafts.addEventListener("change", () => {
+    state.settings.showDrafts = page.showDrafts.checked;
+    saveSettings();
+    renderBoard();
+  });
+  page.showLabels.checked = state.settings.showLabels;
+  page.showLabels.addEventListener("change", () => {
+    state.settings.showLabels = page.showLabels.checked;
+    saveSettings();
+    renderBoard();
+  });
+  page.mergedSince.min = EARLIEST_MERGE_DATE;
+  page.mergedSince.max = todayText();
+  page.mergedSince.value = mergedSinceText();
+  page.mergedSince.addEventListener("change", onMergedSinceChange);
+  page.mergedSince.addEventListener("blur", () => {
+    if (!isDateText(page.mergedSince.value)) page.mergedSince.value = mergedSinceText();
+  });
+}
+
+function onTokenSubmit(event) {
+  event.preventDefault();
+  const token = page.tokenInput.value.trim();
+  if (!token) return;
+  state.token = token;
+  writeStorage(TOKEN_KEY, token);
+  state.editingToken = false;
+  page.tokenError.textContent = "";
+  showView();
+  refreshAll();
+}
+
+function onTokenRemove() {
+  removeStorage(TOKEN_KEY);
+  state.token = null;
+  state.editingToken = false;
+  state.rateLimit = null;
+  state.open = emptyList();
+  state.merged = emptyList();
+  page.tokenError.textContent = "";
+  showView();
+}
+
+function onAuthorChipClick(event) {
+  const chip = event.target.closest("button[data-login]");
+  if (!chip) return;
+  const login = chip.dataset.login;
+  const authors = new Set(state.settings.authors);
+  if (login === "") authors.clear();
+  else if (authors.has(login)) authors.delete(login);
+  else authors.add(login);
+  state.settings.authors = [...authors];
+  saveSettings();
+  updateAuthorChips();
+  renderBoard();
+}
+
+function updateAuthorChips() {
+  const selected = new Set(state.settings.authors);
+  for (const chip of page.authorFilter.querySelectorAll("button[data-login]")) {
+    const login = chip.dataset.login;
+    const pressed = login === "" ? selected.size === 0 : selected.has(login);
+    chip.setAttribute("aria-pressed", String(pressed));
+  }
+}
+
+function onMergedSinceChange() {
+  const value = page.mergedSince.value;
+  clearTimeout(state.mergedSinceTimer);
+  state.mergedSinceTimer = setTimeout(() => applyMergedSince(value), DATE_CHANGE_DELAY_MS);
+}
+
+function applyMergedSince(value) {
+  if (!isDateText(value) || value === mergedSinceText()) return;
+  state.settings.mergedSince = value;
+  saveSettings();
+  renderBoard();
+  if (state.token) loadMergedPullRequests();
+}
+
+function showView() {
+  const askForToken = !state.token || state.editingToken;
+  document.body.classList.toggle("showing-board", !askForToken);
+  page.connect.hidden = !askForToken;
+  page.toolbar.hidden = askForToken;
+  page.board.hidden = askForToken;
+  page.tokenCancel.hidden = !state.token;
+  page.tokenRemove.hidden = !state.token;
+  page.tokenInput.value = "";
+  if (askForToken) page.tokenInput.focus();
+  render();
+}
+
+function refreshAll() {
+  state.refreshStartedAt = Date.now();
+  return Promise.all([loadOpenPullRequests(), loadMergedPullRequests()]);
+}
+
+function loadOpenPullRequests() {
+  const searches = TEAM.map((member) => ({
+    name: member.name,
+    query: `repo:${REPOSITORY} is:pr is:open author:${member.login} sort:updated-desc`,
+  }));
+  return loadList(state.open, searches, OPEN_PULL_REQUEST_FIELDS);
+}
+
+function loadMergedPullRequests() {
+  const since = mergedSinceDate().toISOString().replace(/\.\d+Z$/, "Z");
+  const searches = TEAM.map((member) => ({
+    name: member.name,
+    query: `repo:${REPOSITORY} is:pr is:merged author:${member.login} merged:>=${since} sort:updated-desc`,
+  }));
+  return loadList(state.merged, searches, MERGED_PULL_REQUEST_FIELDS);
+}
+
+async function loadList(list, searches, fields) {
+  const generation = ++list.generation;
+  list.loading = true;
+  render();
+  try {
+    const result = await searchPullRequests(searches, fields);
+    if (generation !== list.generation) return;
+    list.items = result.pullRequests;
+    list.warnings = result.warnings;
+    list.error = null;
+    list.loadedAt = Date.now();
+    if (result.rateLimit) state.rateLimit = result.rateLimit;
+  } catch (error) {
+    if (generation !== list.generation) return;
+    list.error = error.message;
+    if (error.tokenRejected) rejectToken(error.message);
+  } finally {
+    if (generation === list.generation) list.loading = false;
+    render();
+  }
+}
+
+function rejectToken(message) {
+  removeStorage(TOKEN_KEY);
+  state.token = null;
+  state.editingToken = false;
+  state.open = emptyList();
+  state.merged = emptyList();
+  showView();
+  page.tokenError.textContent = message;
+}
+
+async function searchPullRequests(searches, fields) {
+  const found = new Map();
+  const warnings = [];
+  let rateLimit = null;
+  let pending = searches.map((search) => ({ ...search, cursor: null, pages: 0, count: 0 }));
+  while (pending.length > 0) {
+    const { data, errors } = await runSearches(pending, fields);
+    rateLimit = data.rateLimit ?? rateLimit;
+    warnings.push(...topLevelErrors(errors));
+    const next = [];
+    pending.forEach((search, index) => {
+      const connection = data[`s${index}`];
+      if (!connection) {
+        const reason = errors.find((error) => error.path?.[0] === `s${index}`)?.message ?? "GitHub returned no data.";
+        warnings.push(`Cannot get the PRs of ${search.name}. ${reason}`);
+        return;
+      }
+      for (const node of connection.nodes) {
+        if (!node?.number) continue;
+        found.set(node.number, node);
+        search.count += 1;
+      }
+      search.pages += 1;
+      if (!connection.pageInfo.hasNextPage) return;
+      if (search.pages >= MAX_PAGES_PER_SEARCH) {
+        warnings.push(`The board shows only the first ${search.count} PRs of ${search.name}.`);
+        return;
+      }
+      next.push({ ...search, cursor: connection.pageInfo.endCursor });
+    });
+    pending = next;
+  }
+  return { pullRequests: [...found.values()], warnings, rateLimit };
+}
+
+function runSearches(searches, fields) {
+  const variables = {};
+  const definitions = [];
+  const selections = [];
+  searches.forEach((search, index) => {
+    variables[`q${index}`] = search.query;
+    variables[`c${index}`] = search.cursor;
+    definitions.push(`$q${index}: String!, $c${index}: String`);
+    selections.push(`s${index}: search(query: $q${index}, type: ISSUE, first: ${PAGE_SIZE}, after: $c${index}) { ...SearchPage }`);
+  });
+  const query = `query (${definitions.join(", ")}) {
+  rateLimit { limit remaining resetAt }
+  ${selections.join("\n  ")}
+}
+fragment SearchPage on SearchResultItemConnection {
+  pageInfo { hasNextPage endCursor }
+  nodes { ... on PullRequest { ...PullRequestFields } }
+}
+fragment PullRequestFields on PullRequest {${fields}}`;
+  return callGitHub(query, variables);
+}
+
+async function callGitHub(query, variables) {
+  let response;
+  try {
+    response = await fetch(GRAPHQL_URL, {
+      method: "POST",
+      headers: { Authorization: `bearer ${state.token}`, "Content-Type": "application/json" },
+      body: JSON.stringify({ query, variables }),
+    });
+  } catch {
+    throw new Error("Cannot connect to api.github.com.");
+  }
+  const body = await response.json().catch(() => null);
+  if (response.status === 401) {
+    const error = new Error("GitHub did not accept the token. Enter a new token.");
+    error.tokenRejected = true;
+    throw error;
+  }
+  if (!response.ok) {
+    throw new Error(`GitHub returned HTTP ${response.status}. ${body?.message ?? ""}`.trim());
+  }
+  if (!body?.data) {
+    throw new Error(body?.errors?.map((error) => error.message).join(" ") || "GitHub returned no data.");
+  }
+  return { data: body.data, errors: body.errors ?? [] };
+}
+
+function topLevelErrors(errors) {
+  for (const error of errors) {
+    if ((error.path?.length ?? 0) > 1) console.warn("GitHub:", error.message, error.path);
+  }
+  return errors.filter((error) => !error.path).map((error) => error.message);
+}
+
+function onClockTick() {
+  for (const time of document.querySelectorAll("time[datetime]")) {
+    time.textContent = timeAgo(Date.parse(time.dateTime));
+  }
+  if (document.activeElement !== page.mergedSince) {
+    page.mergedSince.max = todayText();
+    page.mergedSince.value = mergedSinceText();
+  }
+  renderStatus();
+  const loading = state.open.loading || state.merged.loading;
+  const due = Date.now() - state.refreshStartedAt >= REFRESH_INTERVAL_MS;
+  if (state.token && !state.editingToken && !loading && due && document.visibilityState === "visible") {
+    refreshAll();
+  }
+}
+
+function render() {
+  renderStatus();
+  renderMessages();
+  renderBoard();
+}
+
+function renderStatus() {
+  const loading = state.open.loading || state.merged.loading;
+  page.refreshButton.disabled = loading || !state.token;
+  page.refreshButton.textContent = loading ? "Loading…" : "Refresh";
+  const loadedAt = oldestLoadTime();
+  page.status.textContent = state.token && loadedAt !== null ? `Updated ${timeAgo(loadedAt)}` : "";
+  page.status.title = rateLimitText();
+}
+
+function oldestLoadTime() {
+  const times = [state.open.loadedAt, state.merged.loadedAt].filter((time) => time !== null);
+  return times.length > 0 ? Math.min(...times) : null;
+}
+
+function rateLimitText() {
+  const limit = state.rateLimit;
+  if (!limit) return "";
+  const resetAt = new Date(limit.resetAt).toLocaleTimeString();
+  return `GitHub API: ${limit.remaining} of ${limit.limit} points left. The limit resets at ${resetAt}.`;
+}
+
+function renderMessages() {
+  const messages = [];
+  if (state.token && !state.editingToken) {
+    if (state.open.error) messages.push(message("error", `Cannot load the open PRs. ${state.open.error}`));
+    if (state.merged.error) messages.push(message("error", `Cannot load the merged PRs. ${state.merged.error}`));
+    for (const warning of new Set([...state.open.warnings, ...state.merged.warnings])) {
+      messages.push(message("warning", warning));
+    }
+  }
+  page.messages.replaceChildren(...messages);
+}
+
+function message(kind, text) {
+  return element("p", { class: `message ${kind}`, role: kind === "error" ? "alert" : "status" }, text);
+}
+
+function renderBoard() {
+  const columns = { ready: [], back: [], approved: [], merged: [] };
+  for (const pullRequest of state.open.items) {
+    if (isShown(pullRequest)) columns[columnFor(pullRequest)].push(pullRequest);
+  }
+  const mergedSince = mergedSinceDate().getTime();
+  for (const pullRequest of state.merged.items) {
+    if (isShown(pullRequest) && Date.parse(pullRequest.mergedAt) >= mergedSince) columns.merged.push(pullRequest);
+  }
+  const openOrder = compareBySortOrder(state.settings.sortOrder);
+  for (const [columnId, pullRequests] of Object.entries(columns)) {
+    const isMerged = columnId === "merged";
+    pullRequests.sort(isMerged ? compareByMergeTime : openOrder);
+    renderColumn(page.columns[columnId], columnId, pullRequests, isMerged ? state.merged : state.open);
+  }
+}
+
+function isShown(pullRequest) {
+  const login = pullRequest.author?.login?.toLowerCase() ?? "";
+  if (state.settings.authors.length > 0 && !state.settings.authors.includes(login)) return false;
+  if (pullRequest.isDraft && !state.settings.showDrafts) return false;
+  if (!state.textFilter) return true;
+  const number = state.textFilter.replace(/^#/, "");
+  return pullRequest.title.toLowerCase().includes(state.textFilter) || String(pullRequest.number).startsWith(number);
+}
+
+function columnFor(pullRequest) {
+  if (hasBackToAuthorLabel(pullRequest)) return "back";
+  if (teamApprovals(pullRequest).length > 0) return "approved";
+  return "ready";
+}
+
+function compareBySortOrder(sortOrder) {
+  if (sortOrder === "newest") return (a, b) => Date.parse(b.createdAt) - Date.parse(a.createdAt);
+  if (sortOrder === "oldest") return (a, b) => Date.parse(a.createdAt) - Date.parse(b.createdAt);
+  return (a, b) => Date.parse(b.updatedAt) - Date.parse(a.updatedAt);
+}
+
+function compareByMergeTime(a, b) {
+  return Date.parse(b.mergedAt) - Date.parse(a.mergedAt);
+}
+
+function renderColumn(column, columnId, pullRequests, list) {
+  column.count.textContent = String(pullRequests.length);
+  column.section.setAttribute("aria-busy", String(list.loading));
+  if (pullRequests.length > 0) {
+    column.cards.replaceChildren(...pullRequests.map((pullRequest) => renderCard(pullRequest, columnId)));
+    return;
+  }
+  const text = emptyColumnText(list);
+  column.cards.replaceChildren(...(text ? [element("p", { class: "empty" }, text)] : []));
+}
+
+function emptyColumnText(list) {
+  if (list.loading) return "Loading…";
+  if (list.error) return "Cannot load the PRs.";
+  if (list.loadedAt === null) return "";
+  return "No PRs.";
+}
+
+function renderCard(pullRequest, columnId) {
+  const isOpen = columnId !== "merged";
+  return element("article", { class: "card" }, [
+    element("div", { class: "card-head" }, [
+      avatar(pullRequest.author),
+      element("span", { class: "author" }, displayName(pullRequest.author?.login)),
+      element("a", { class: "number", href: pullRequest.url, target: "_blank", rel: "noopener noreferrer" }, `#${pullRequest.number}`),
+      pullRequest.isDraft ? element("span", { class: "badge" }, "Draft") : null,
+      pullRequest.mergeable === "CONFLICTING" ? element("span", { class: "badge conflict" }, "Conflicts") : null,
+      isOpen ? checksIndicator(pullRequest) : null,
+    ]),
+    element("a", { class: "title", href: pullRequest.url, target: "_blank", rel: "noopener noreferrer" }, pullRequest.title),
+    element("div", { class: "meta" }, [...cardFacts(pullRequest, columnId), " · ", changeSize(pullRequest)]),
+    isOpen ? reviewerList(pullRequest) : null,
+    state.settings.showLabels ? labelList(pullRequest) : null,
+  ]);
+}
+
+function cardFacts(pullRequest, columnId) {
+  if (columnId === "merged") {
+    const mergedBy = pullRequest.mergedBy ? ` by ${displayName(pullRequest.mergedBy.login)}` : "";
+    return ["Merged ", timeElement(pullRequest.mergedAt), mergedBy];
+  }
+  if (columnId === "back") {
+    const labeled = backToAuthorEvent(pullRequest);
+    if (labeled) {
+      const actor = labeled.actor ? ` by ${displayName(labeled.actor.login)}` : "";
+      return ["Sent back ", timeElement(labeled.createdAt), actor];
+    }
+  }
+  if (columnId === "approved") {
+    const lastApproval = teamApprovals(pullRequest)
+      .map((review) => review.submittedAt)
+      .filter(Boolean)
+      .sort()
+      .at(-1);
+    if (lastApproval) return ["Approved ", timeElement(lastApproval)];
+  }
+  return ["Opened ", timeElement(pullRequest.createdAt), " · updated ", timeElement(pullRequest.updatedAt)];
+}
+
+function backToAuthorEvent(pullRequest) {
+  const events = (pullRequest.timelineItems?.nodes ?? []).filter((event) => isBackToAuthorLabel(event?.label));
+  return events.at(-1) ?? null;
+}
+
+function hasBackToAuthorLabel(pullRequest) {
+  return (pullRequest.labels?.nodes ?? []).some(isBackToAuthorLabel);
+}
+
+function isBackToAuthorLabel(label) {
+  return label?.name?.toLowerCase() === BACK_TO_AUTHOR_LABEL.toLowerCase();
+}
+
+function teamApprovals(pullRequest) {
+  return teamReviews(pullRequest).filter((review) => review.state === "APPROVED");
+}
+
+function teamReviews(pullRequest) {
+  const author = pullRequest.author?.login?.toLowerCase();
+  return (pullRequest.latestOpinionatedReviews?.nodes ?? []).filter((review) => {
+    const reviewer = review?.author?.login?.toLowerCase();
+    return reviewer !== undefined && reviewer !== author && TEAM_BY_LOGIN.has(reviewer);
+  });
+}
+
+function reviewerList(pullRequest) {
+  const chips = [];
+  const reviewed = new Set();
+  for (const review of teamReviews(pullRequest)) {
+    reviewed.add(review.author.login.toLowerCase());
+    if (review.state === "APPROVED") chips.push(reviewerChip("approved", "✓", review.author.login, "approved"));
+    if (review.state === "CHANGES_REQUESTED") chips.push(reviewerChip("changes", "✗", review.author.login, "requested changes"));
+  }
+  for (const request of pullRequest.reviewRequests?.nodes ?? []) {
+    const login = request?.requestedReviewer?.login;
+    if (!login || reviewed.has(login.toLowerCase()) || !TEAM_BY_LOGIN.has(login.toLowerCase())) continue;
+    chips.push(reviewerChip("requested", "○", login, "has a review request"));
+  }
+  return chips.length > 0 ? element("div", { class: "reviewers" }, chips) : null;
+}
+
+function reviewerChip(kind, symbol, login, action) {
+  const name = displayName(login);
+  return element("span", { class: `reviewer ${kind}`, title: `${name} ${action}` }, `${symbol} ${name}`);
+}
+
+function checksIndicator(pullRequest) {
+  const checkState = pullRequest.commits?.nodes?.[0]?.commit?.statusCheckRollup?.state;
+  if (!checkState) return null;
+  let kind = "pending";
+  if (checkState === "SUCCESS") kind = "passed";
+  if (checkState === "FAILURE" || checkState === "ERROR") kind = "failed";
+  const text = { passed: "Checks passed", failed: "Checks failed", pending: "Checks are not complete" }[kind];
+  return element("span", { class: `checks ${kind}`, role: "img", title: text, "aria-label": text });
+}
+
+function changeSize(pullRequest) {
+  const title = `${pullRequest.additions} lines added, ${pullRequest.deletions} lines removed`;
+  return element("span", { class: "size", title }, [
+    element("span", { class: "added" }, `+${pullRequest.additions}`),
+    " ",
+    element("span", { class: "deleted" }, `−${pullRequest.deletions}`),
+  ]);
+}
+
+function labelList(pullRequest) {
+  const labels = pullRequest.labels?.nodes ?? [];
+  if (labels.length === 0) return null;
+  return element(
+    "div",
+    { class: "labels" },
+    labels.map((label) => {
+      const swatch = element("span", { class: "swatch" });
+      if (/^[0-9a-f]{6}$/i.test(label.color)) swatch.style.backgroundColor = `#${label.color}`;
+      return element("span", { class: "label" }, [swatch, label.name]);
+    }),
+  );
+}
+
+function avatar(author) {
+  if (!author?.avatarUrl) return null;
+  return element("img", { class: "avatar", src: author.avatarUrl, alt: "", width: 18, height: 18, loading: "lazy" });
+}
+
+function timeElement(isoDate) {
+  const time = Date.parse(isoDate);
+  return element("time", { datetime: isoDate, title: new Date(time).toLocaleString() }, timeAgo(time));
+}
+
+function timeAgo(time) {
+  const minutes = Math.floor(Math.max(0, Date.now() - time) / 60000);
+  const hours = Math.floor(minutes / 60);
+  const days = Math.floor(hours / 24);
+  if (minutes < 1) return "just now";
+  if (hours < 1) return `${minutes}m ago`;
+  if (days < 1) return `${hours}h ago`;
+  if (days < 60) return `${days}d ago`;
+  if (days < 730) return `${Math.floor(days / 30)}mo ago`;
+  return `${Math.floor(days / 365)}y ago`;
+}
+
+function displayName(login) {
+  if (!login) return "unknown";
+  return TEAM_BY_LOGIN.get(login.toLowerCase())?.name ?? login;
+}
+
+function element(tag, attributes, children) {
+  const node = document.createElement(tag);
+  for (const [name, value] of Object.entries(attributes ?? {})) {
+    if (value === null || value === undefined || value === false) continue;
+    if (name === "class") node.className = value;
+    else node.setAttribute(name, String(value));
+  }
+  for (const child of [children].flat(Infinity)) {
+    if (child === null || child === undefined || child === false || child === "") continue;
+    node.append(child);
+  }
+  return node;
+}
+
+function columnParts(columnId) {
+  return {
+    section: document.getElementById(`${columnId}-column`),
+    count: document.getElementById(`${columnId}-count`),
+    cards: document.getElementById(`${columnId}-cards`),
+  };
+}
+
+function emptyList() {
+  return { items: [], warnings: [], error: null, loading: false, loadedAt: null, generation: 0 };
+}
+
+function loadSettings() {
+  const saved = readJson(SETTINGS_KEY) ?? {};
+  return {
+    authors: Array.isArray(saved.authors) ? saved.authors.filter((login) => TEAM_BY_LOGIN.has(login)) : [],
+    sortOrder: SORT_ORDERS.includes(saved.sortOrder) ? saved.sortOrder : "updated",
+    showDrafts: saved.showDrafts === true,
+    showLabels: saved.showLabels === true,
+    mergedSince: isDateText(saved.mergedSince) ? saved.mergedSince : null,
+  };
+}
+
+function saveSettings() {
+  writeStorage(SETTINGS_KEY, JSON.stringify(state.settings));
+}
+
+function mergedSinceText() {
+  return state.settings.mergedSince ?? todayText();
+}
+
+function mergedSinceDate() {
+  const [year, month, day] = mergedSinceText().split("-").map(Number);
+  return new Date(year, month - 1, day);
+}
+
+function todayText() {
+  const now = new Date();
+  const month = String(now.getMonth() + 1).padStart(2, "0");
+  const day = String(now.getDate()).padStart(2, "0");
+  return `${now.getFullYear()}-${month}-${day}`;
+}
+
+function isDateText(value) {
+  return typeof value === "string" && /^\d{4}-\d{2}-\d{2}$/.test(value) && value >= EARLIEST_MERGE_DATE;
+}
+
+function readJson(key) {
+  try {
+    return JSON.parse(readStorage(key) ?? "null");
+  } catch {
+    return null;
+  }
+}
+
+function readStorage(key) {
+  try {
+    return localStorage.getItem(key);
+  } catch {
+    return null;
+  }
+}
+
+function writeStorage(key, value) {
+  try {
+    localStorage.setItem(key, value);
+  } catch {
+    return;
+  }
+}
+
+function removeStorage(key) {
+  try {
+    localStorage.removeItem(key);
+  } catch {
+    return;
+  }
+}
+</script>
+</body>
+</html>
