@@ -166,6 +166,7 @@ impl EmitOrderBy {
         referenced_tables: &TableReferences,
         has_group_by: bool,
         has_distinct: bool,
+        has_limit: bool,
         aggregates: &[Aggregate],
     ) -> Result<()> {
         // Block ORDER BY on custom type columns without OPERATOR '<'
@@ -192,8 +193,14 @@ impl EmitOrderBy {
             .all(|(e, _, _)| is_orderby_agg_or_const(&t_ctx.resolver, e, aggregates));
 
         let has_explicit_nulls = order_by.iter().any(|(_, _, nulls)| nulls.is_some());
-        let use_heap_sort =
-            !has_distinct && !has_group_by && t_ctx.limit_ctx.is_some() && !has_explicit_nulls;
+        let has_custom_comparator = order_by.iter().any(|(expr, _, _)| {
+            custom_type_comparator(expr, referenced_tables, t_ctx.resolver.schema()).is_some()
+        });
+        let use_heap_sort = !has_distinct
+            && !has_group_by
+            && has_limit
+            && !has_explicit_nulls
+            && !has_custom_comparator;
 
         // only emit sequence column if (we have GROUP BY and ORDER BY is not only aggregates or constants) OR (we decided to use heap-sort)
         let has_sequence = (has_group_by && !only_aggs) || use_heap_sort;
@@ -569,6 +576,11 @@ impl EmitOrderBy {
                 target_pc: insert_label,
                 decrement_by: 1,
             });
+            program.emit_insn(Insn::If {
+                reg: limit_reg,
+                target_pc: insert_label,
+                jump_if_null: false,
+            });
             program.emit_insn(Insn::Last {
                 cursor_id: *sort_cursor,
                 pc_if_empty: insert_label,
@@ -576,7 +588,7 @@ impl EmitOrderBy {
             program.emit_insn(Insn::IdxLE {
                 cursor_id: *sort_cursor,
                 start_reg,
-                num_regs: orderby_sorter_column_count,
+                num_regs: order_by_len,
                 target_pc: skip_label,
             });
             program.emit_insn(Insn::Delete {

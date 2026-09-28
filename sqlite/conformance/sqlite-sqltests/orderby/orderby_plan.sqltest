@@ -24,3 +24,8 @@ snapshot orderby_rowid_no_sorter {
 snapshot orderby_rowid_desc_no_sorter {
     SELECT * FROM t ORDER BY rowid DESC;
 }
+
+@setup orderby_plan
+snapshot orderby_limit_uses_top_n {
+    SELECT * FROM t ORDER BY a LIMIT 3;
+}

@@ -1,5 +1,138 @@
 @database :memory:
 
+test orderby_limit_skips_unused_values {
+    CREATE TABLE t(a, b);
+    INSERT INTO t VALUES (1, 10), (2, 20), (3, -9223372036854775808);
+    SELECT abs(b) FROM t ORDER BY a LIMIT 2;
+}
+expect {
+    10
+    20
+}
+
+test orderby_limit_replaces_candidates {
+    CREATE TABLE t(a, b, c);
+    INSERT INTO t VALUES (2, 3, 'a'), (1, 1, 'b'), (3, 2, 'c'),
+                         (1, 4, 'd'), (3, 5, 'e'), (2, 1, 'f');
+    SELECT c FROM t ORDER BY a DESC, b ASC LIMIT 3;
+}
+expect {
+    c
+    e
+    f
+}
+
+test orderby_limit_equal_keys {
+    CREATE TABLE t(a, b);
+    INSERT INTO t VALUES (1, 'z'), (1, 'a'), (1, 'm'), (0, 'first');
+    SELECT b FROM t ORDER BY a LIMIT 3;
+}
+expect {
+    first
+    z
+    a
+}
+
+test orderby_limit_negative {
+    CREATE TABLE t(a);
+    INSERT INTO t VALUES (3), (1), (2);
+    SELECT a FROM t ORDER BY a LIMIT -1;
+}
+expect {
+    1
+    2
+    3
+}
+
+test orderby_limit_min_integer_offset {
+    CREATE TABLE t(a);
+    INSERT INTO t VALUES (3), (1), (2);
+    SELECT a FROM t ORDER BY a LIMIT (SELECT -9223372036854775808) OFFSET 1;
+}
+expect {
+    2
+    3
+}
+
+test orderby_limit_offset_overflow {
+    CREATE TABLE t(a);
+    INSERT INTO t VALUES (3), (1), (2);
+    SELECT a FROM t ORDER BY a LIMIT 2 OFFSET 9223372036854775807;
+}
+expect {
+}
+
+test orderby_limit_zero_with_group_by {
+    CREATE TABLE t(a);
+    INSERT INTO t VALUES (3), (1), (2);
+    SELECT a, count(*) FROM t GROUP BY a ORDER BY a DESC LIMIT 0;
+}
+expect {
+}
+
+test orderby_limit_zero {
+    CREATE TABLE t(a);
+    INSERT INTO t VALUES (-9223372036854775808);
+    SELECT abs(a) FROM t ORDER BY a LIMIT 0;
+}
+expect {
+}
+
+test orderby_limit_offset {
+    CREATE TABLE t(a);
+    INSERT INTO t VALUES (5), (1), (4), (2), (3);
+    SELECT a FROM t ORDER BY a LIMIT 2 OFFSET 2;
+}
+expect {
+    3
+    4
+}
+
+test orderby_limit_negative_offset {
+    CREATE TABLE t(a);
+    INSERT INTO t VALUES (3), (1), (2);
+    SELECT a FROM t ORDER BY a LIMIT 2 OFFSET -1;
+}
+expect {
+    1
+    2
+}
+
+test orderby_limit_nulls_and_collation {
+    CREATE TABLE t(a TEXT COLLATE NOCASE, b);
+    INSERT INTO t VALUES ('z', 1), ('a', 2), ('A', 3), (NULL, 4), ('b', 5);
+    SELECT b FROM t ORDER BY a LIMIT 3;
+}
+expect {
+    4
+    2
+    3
+}
+
+test orderby_limit_join {
+    CREATE TABLE t(a, b);
+    CREATE TABLE u(a, c);
+    INSERT INTO t VALUES (1, 'one'), (2, 'two'), (3, 'three');
+    INSERT INTO u VALUES (1, 4), (2, 2), (3, 3), (1, 1);
+    SELECT b, c FROM t JOIN u ON t.a = u.a ORDER BY c LIMIT 2;
+}
+expect {
+    one|1
+    two|2
+}
+
+test orderby_limit_correlated_subquery {
+    CREATE TABLE t(a, b);
+    INSERT INTO t VALUES (1, 'a'), (2, 'b'), (3, 'c');
+    SELECT a, (SELECT b FROM t AS t2 WHERE t2.a <= t1.a ORDER BY b DESC LIMIT 1)
+    FROM t AS t1 ORDER BY a;
+}
+expect {
+    1|a
+    2|b
+    3|c
+}
+
 @cross-check-integrity
 test distinct_orderby_regression {
     CREATE TABLE t (a,b,c,d);

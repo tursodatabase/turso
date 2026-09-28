@@ -1,0 +1,40 @@
+---
+source: orderby_plan.sqltest
+expression: SELECT * FROM t ORDER BY a LIMIT 3;
+info:
+  statement_type: SELECT
+  tables:
+  - t
+  setup_blocks:
+  - orderby_plan
+  database: ':memory:'
+---
+QUERY PLAN
+|--SCAN t
+`--USE TEMP B-TREE FOR ORDER BY
+
+BYTECODE
+addr  opcode         p1  p2  p3  p4      p5  comment
+   0  Init            0  21   0           0  Start at 21
+   1  OpenEphemeral   0   0   0           0  cursor=0 is_table=false
+   2  Integer         3   3   0           0  r[3]=3; LIMIT counter
+   3  IfNot           3  16   0           0  if !r[3] goto 16
+   4  OpenRead        1   2   0  k(2,B)   0  table=t, root=2, iDb=0
+   5  Rewind          1  16   0           0  Rewind table t
+   6    Column        1   0   4           0  r[4]=t.a
+   7    IfPos         3  12   1           0  r[3]>0 -> r[3]-=1, goto 12
+   8    If            3  12   0           0  if r[3] goto 12
+   9    Last          0  12   0           0
+  10    IdxLE         0  15   4           0  key=[4..4]
+  11    Delete        0   0   0           0
+  12    Sequence      0   5   0           0
+  13    MakeRecord    4   2   2           0  r[2]=mkrec(r[4..5])
+  14    IdxInsert     0   2   0           0  key=r[2]
+  15  Next            1   6   0           1
+  16  Rewind          0  20   0           0  Rewind  ephemeral(heap_sort_1)
+  17    Column        0   0   1           0  r[1]=ephemeral(heap_sort_1).0
+  18    ResultRow     1   1   0           0  output=r[1]
+  19  Next            0  17   0           0
+  20  Halt            0   0   0           0
+  21  Transaction     0   1   1           0  iDb=0 tx_mode=Read
+  22  Goto            0   1   0           0

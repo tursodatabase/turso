@@ -152,6 +152,7 @@ pub fn emit_query<'a>(
 
     // Initialize cursors and other resources needed for query execution
     if !plan.order_by.is_empty() {
+        let has_limit = plan.limit.is_some() || t_ctx.limit_ctx.is_some();
         EmitOrderBy::init(
             program,
             t_ctx,
@@ -160,6 +161,7 @@ pub fn emit_query<'a>(
             &plan.table_references,
             has_group_by_exprs,
             plan.distinctness != Distinctness::NonDistinct,
+            has_limit,
             &plan.aggregates,
         )?;
     }
