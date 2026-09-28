@@ -5,7 +5,7 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="color-scheme" content="light dark">
 <title>Turso PR board</title>
-<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Crect x='0.5' y='1' width='3.5' height='14' rx='1' fill='%230969da'/%3E%3Crect x='4.5' y='1' width='3.5' height='9' rx='1' fill='%23bc4c00'/%3E%3Crect x='8.5' y='1' width='3.5' height='11' rx='1' fill='%231a7f37'/%3E%3Crect x='12.5' y='1' width='3.5' height='6' rx='1' fill='%238250df'/%3E%3C/svg%3E">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Crect x='0.5' y='1' width='4.5' height='14' rx='1' fill='%230969da'/%3E%3Crect x='5.75' y='1' width='4.5' height='10' rx='1' fill='%231a7f37'/%3E%3Crect x='11' y='1' width='4.5' height='7' rx='1' fill='%238250df'/%3E%3C/svg%3E">
 <style>
 :root {
   --page: #f4f5f7;
@@ -17,7 +17,6 @@
   --muted: #59636e;
   --link: #0969da;
   --ready: #0969da;
-  --back: #bc4c00;
   --approved: #1a7f37;
   --merged: #8250df;
   --danger: #d1242f;
@@ -40,7 +39,6 @@
     --muted: #9198a1;
     --link: #4493f8;
     --ready: #4493f8;
-    --back: #f0883e;
     --approved: #3fb950;
     --merged: #ab7df8;
     --danger: #f85149;
@@ -148,7 +146,7 @@ button, input, select { font: inherit; color: inherit; }
 
 .board {
   display: grid;
-  grid-template-columns: repeat(4, minmax(0, 1fr));
+  grid-template-columns: repeat(3, minmax(0, 1fr));
   align-items: start;
   gap: 12px;
   padding: 0 16px 16px;
@@ -162,7 +160,6 @@ button, input, select { font: inherit; color: inherit; }
   border-radius: 10px;
 }
 .column.ready { --accent: var(--ready); }
-.column.back { --accent: var(--back); }
 .column.approved { --accent: var(--approved); }
 .column.merged { --accent: var(--merged); }
 
@@ -196,13 +193,6 @@ button, input, select { font: inherit; color: inherit; }
 @media (prefers-reduced-motion: reduce) { .spinner { animation-duration: 3s; } }
 
 .column-rule { margin: 3px 0 0; color: var(--muted); font-size: 12px; }
-.column-rule code {
-  padding: 0 4px;
-  border: 1px solid var(--border);
-  border-radius: 4px;
-  background: var(--card);
-  font-size: 11.5px;
-}
 
 .since { display: flex; flex-wrap: wrap; align-items: center; gap: 4px 6px; }
 .since input {
@@ -322,19 +312,18 @@ button, input, select { font: inherit; color: inherit; }
 .token-error { color: var(--danger); font-size: 13px; }
 .token-error:empty { display: none; }
 
-@media (min-width: 1100px) {
+@media (min-width: 800px) {
   body.showing-board { display: flex; flex-direction: column; height: 100vh; overflow: hidden; }
   .showing-board .board { flex: 1; min-height: 0; align-items: stretch; }
   .showing-board .column { min-height: 0; }
   .showing-board .cards { flex: 1; min-height: 0; overflow-y: auto; }
 }
 
-@media (max-width: 1099px) {
-  .board { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+@media (max-width: 799px) {
+  .board { grid-template-columns: minmax(0, 1fr); }
 }
 
 @media (max-width: 680px) {
-  .board { grid-template-columns: minmax(0, 1fr); }
   .options input[type="search"] { width: 100%; }
   .options { width: 100%; }
   .connect { margin: 16px; padding: 18px 16px; }
@@ -401,13 +390,6 @@ button, input, select { font: inherit; color: inherit; }
     </header>
     <div id="ready-cards" class="cards"></div>
   </section>
-  <section id="back-column" class="column back" aria-labelledby="back-title">
-    <header class="column-head">
-      <div class="column-title"><h2 id="back-title">Back to Author</h2><span id="back-count" class="count">0</span><span class="spinner" aria-hidden="true"></span></div>
-      <p id="back-rule" class="column-rule">Has the <code id="back-to-author-label"></code> label</p>
-    </header>
-    <div id="back-cards" class="cards"></div>
-  </section>
   <section id="approved-column" class="column approved" aria-labelledby="approved-title">
     <header class="column-head">
       <div class="column-title"><h2 id="approved-title">Approved</h2><span id="approved-count" class="count">0</span><span class="spinner" aria-hidden="true"></span></div>
@@ -428,7 +410,6 @@ button, input, select { font: inherit; color: inherit; }
 "use strict";
 
 const REPOSITORY = "tursodatabase/turso";
-const BACK_TO_AUTHOR_LABEL = "back-to-author";
 const TEAM = [
   { login: "penberg", name: "Pekka" },
   { login: "pedrocarlo", name: "Pedro" },
@@ -465,9 +446,6 @@ const OPEN_PULL_REQUEST_FIELDS = `
   labels(first: 30) { nodes { name color } }
   latestOpinionatedReviews(first: 30) { nodes { state submittedAt author { login } } }
   reviewRequests(first: 20) { nodes { requestedReviewer { ... on User { login } } } }
-  timelineItems(itemTypes: [LABELED_EVENT], last: 20) {
-    nodes { ... on LabeledEvent { createdAt label { name } actor { login } } }
-  }
   commits(last: 1) { nodes { commit { statusCheckRollup { state } } } }
 `;
 
@@ -509,7 +487,6 @@ const page = {
   mergedSince: document.getElementById("merged-since"),
   columns: {
     ready: columnParts("ready"),
-    back: columnParts("back"),
     approved: columnParts("approved"),
     merged: columnParts("merged"),
   },
@@ -542,13 +519,9 @@ function start() {
 function describeColumns() {
   page.repositoryLink.textContent = REPOSITORY;
   page.repositoryLink.href = `https://github.com/${REPOSITORY}/pulls`;
-  document.getElementById("back-to-author-label").textContent = BACK_TO_AUTHOR_LABEL;
-  document.getElementById("ready-rule").title =
-    `Open PRs without the ${BACK_TO_AUTHOR_LABEL} label and without an approval from a team member.`;
-  document.getElementById("back-rule").title =
-    `Open PRs with the ${BACK_TO_AUTHOR_LABEL} label. A PR with this label stays here also when a team member approved it.`;
+  document.getElementById("ready-rule").title = "Open PRs without an approval from a team member.";
   document.getElementById("approved-rule").title =
-    `Open PRs without the ${BACK_TO_AUTHOR_LABEL} label. The last review of at least one team member is an approval.`;
+    "Open PRs where the last review of at least one team member is an approval.";
 }
 
 function renderAuthorFilter() {
@@ -911,7 +884,7 @@ function message(kind, text) {
 }
 
 function renderBoard() {
-  const columns = { ready: [], back: [], approved: [], merged: [] };
+  const columns = { ready: [], approved: [], merged: [] };
   for (const pullRequest of state.open.items) {
     if (isShown(pullRequest)) columns[columnFor(pullRequest)].push(pullRequest);
   }
@@ -937,9 +910,7 @@ function isShown(pullRequest) {
 }
 
 function columnFor(pullRequest) {
-  if (hasBackToAuthorLabel(pullRequest)) return "back";
-  if (teamApprovals(pullRequest).length > 0) return "approved";
-  return "ready";
+  return teamApprovals(pullRequest).length > 0 ? "approved" : "ready";
 }
 
 function compareBySortOrder(sortOrder) {
@@ -993,13 +964,6 @@ function cardFacts(pullRequest, columnId) {
     const mergedBy = pullRequest.mergedBy ? ` by ${displayName(pullRequest.mergedBy.login)}` : "";
     return ["Merged ", timeElement(pullRequest.mergedAt), mergedBy];
   }
-  if (columnId === "back") {
-    const labeled = backToAuthorEvent(pullRequest);
-    if (labeled) {
-      const actor = labeled.actor ? ` by ${displayName(labeled.actor.login)}` : "";
-      return ["Sent back ", timeElement(labeled.createdAt), actor];
-    }
-  }
   if (columnId === "approved") {
     const lastApproval = teamApprovals(pullRequest)
       .map((review) => review.submittedAt)
@@ -1009,19 +973,6 @@ function cardFacts(pullRequest, columnId) {
     if (lastApproval) return ["Approved ", timeElement(lastApproval)];
   }
   return ["Opened ", timeElement(pullRequest.createdAt), " · updated ", timeElement(pullRequest.updatedAt)];
-}
-
-function backToAuthorEvent(pullRequest) {
-  const events = (pullRequest.timelineItems?.nodes ?? []).filter((event) => isBackToAuthorLabel(event?.label));
-  return events.at(-1) ?? null;
-}
-
-function hasBackToAuthorLabel(pullRequest) {
-  return (pullRequest.labels?.nodes ?? []).some(isBackToAuthorLabel);
-}
-
-function isBackToAuthorLabel(label) {
-  return label?.name?.toLowerCase() === BACK_TO_AUTHOR_LABEL.toLowerCase();
 }
 
 function teamApprovals(pullRequest) {
