@@ -78,8 +78,6 @@ button, input, select { font: inherit; color: inherit; }
 
 .brand { display: flex; flex-wrap: wrap; align-items: baseline; gap: 4px 10px; }
 .brand h1 { margin: 0; font-size: 17px; font-weight: 650; }
-.repository { color: var(--muted); font-size: 13px; text-decoration: none; }
-.repository:hover { color: var(--link); text-decoration: underline; }
 
 .actions { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; }
 .status { color: var(--muted); font-size: 12.5px; font-variant-numeric: tabular-nums; }
@@ -108,7 +106,8 @@ button, input, select { font: inherit; color: inherit; }
   padding: 10px 16px;
 }
 
-.authors { display: flex; flex-wrap: wrap; gap: 6px; }
+.filters { display: flex; flex-direction: column; gap: 6px; }
+.chips { display: flex; flex-wrap: wrap; gap: 6px; }
 
 .chip {
   display: inline-flex;
@@ -334,7 +333,6 @@ button, input, select { font: inherit; color: inherit; }
 <header class="top-bar">
   <div class="brand">
     <h1>Turso PR board</h1>
-    <a id="repository-link" class="repository" target="_blank" rel="noopener noreferrer"></a>
   </div>
   <div class="actions">
     <span id="status" class="status"></span>
@@ -344,7 +342,10 @@ button, input, select { font: inherit; color: inherit; }
 </header>
 
 <div id="toolbar" class="toolbar">
-  <div id="author-filter" class="authors" role="group" aria-label="Authors"></div>
+  <div class="filters">
+    <div id="author-filter" class="chips" role="group" aria-label="Authors"></div>
+    <div id="repository-filter" class="chips" role="group" aria-label="Repositories"></div>
+  </div>
   <div class="options">
     <input id="text-filter" type="search" placeholder="Filter by title or #number" aria-label="Filter by title or number">
     <select id="sort-order" aria-label="Sort order">
@@ -379,7 +380,7 @@ button, input, select { font: inherit; color: inherit; }
   </form>
   <p id="token-error" class="token-error" role="alert"></p>
   <p class="note">The browser keeps the token in local storage. The page sends the token only to api.github.com.</p>
-  <p class="note">If you do not use the GitHub CLI, make a <a href="https://github.com/settings/tokens/new?description=Turso%20PR%20board" target="_blank" rel="noopener noreferrer">classic token</a> with no scopes. This token has read-only access to public data.</p>
+  <p class="note">If you do not use the GitHub CLI, make a <a href="https://github.com/settings/personal-access-tokens/new" target="_blank" rel="noopener noreferrer">fine-grained token</a> with read-only access to the pull requests of these repositories: <span id="token-repositories"></span>.</p>
 </section>
 
 <main id="board" class="board">
@@ -409,7 +410,7 @@ button, input, select { font: inherit; color: inherit; }
 <script>
 "use strict";
 
-const REPOSITORY = "tursodatabase/turso";
+const REPOSITORIES = ["tursodatabase/turso", "tursodatabase/turso-platform", "tursodatabase/turso-server"];
 const TEAM = [
   { login: "penberg", name: "Pekka" },
   { login: "pedrocarlo", name: "Pedro" },
@@ -421,6 +422,7 @@ const TEAM = [
   { login: "sivukhin", name: "Nikita" },
 ];
 const TEAM_BY_LOGIN = new Map(TEAM.map((member) => [member.login.toLowerCase(), member]));
+const REPOSITORY_KEYS = new Set(REPOSITORIES.map((fullName) => fullName.toLowerCase()));
 const GRAPHQL_URL = "https://api.github.com/graphql";
 const PAGE_SIZE = 20;
 const MAX_PAGES_PER_SEARCH = 25;
@@ -436,6 +438,7 @@ const OPEN_PULL_REQUEST_FIELDS = `
   number
   title
   url
+  repository { name nameWithOwner }
   isDraft
   createdAt
   updatedAt
@@ -445,7 +448,6 @@ const OPEN_PULL_REQUEST_FIELDS = `
   author { login avatarUrl(size: 40) }
   labels(first: 30) { nodes { name color } }
   latestOpinionatedReviews(first: 30) { nodes { state submittedAt author { login } } }
-  reviewRequests(first: 20) { nodes { requestedReviewer { ... on User { login } } } }
   commits(last: 1) { nodes { commit { statusCheckRollup { state } } } }
 `;
 
@@ -453,6 +455,7 @@ const MERGED_PULL_REQUEST_FIELDS = `
   number
   title
   url
+  repository { name nameWithOwner }
   createdAt
   updatedAt
   mergedAt
@@ -464,12 +467,12 @@ const MERGED_PULL_REQUEST_FIELDS = `
 `;
 
 const page = {
-  repositoryLink: document.getElementById("repository-link"),
   status: document.getElementById("status"),
   refreshButton: document.getElementById("refresh-button"),
   tokenButton: document.getElementById("token-button"),
   toolbar: document.getElementById("toolbar"),
   authorFilter: document.getElementById("author-filter"),
+  repositoryFilter: document.getElementById("repository-filter"),
   textFilter: document.getElementById("text-filter"),
   sortOrder: document.getElementById("sort-order"),
   showDrafts: document.getElementById("show-drafts"),
@@ -477,6 +480,7 @@ const page = {
   messages: document.getElementById("messages"),
   connect: document.getElementById("connect"),
   tokenCommand: document.getElementById("token-command"),
+  tokenRepositories: document.getElementById("token-repositories"),
   copyCommand: document.getElementById("copy-command"),
   tokenForm: document.getElementById("token-form"),
   tokenInput: document.getElementById("token-input"),
@@ -499,6 +503,8 @@ const state = {
   editingToken: false,
   refreshStartedAt: 0,
   mergedSinceTimer: 0,
+  repositoryCheck: null,
+  repositoryWarnings: [],
   rateLimit: null,
   open: emptyList(),
   merged: emptyList(),
@@ -507,8 +513,8 @@ const state = {
 start();
 
 function start() {
-  describeColumns();
-  renderAuthorFilter();
+  describePage();
+  renderFilters();
   connectControls();
   showView();
   if (state.token) refreshAll();
@@ -516,18 +522,19 @@ function start() {
   document.addEventListener("visibilitychange", onClockTick);
 }
 
-function describeColumns() {
-  page.repositoryLink.textContent = REPOSITORY;
-  page.repositoryLink.href = `https://github.com/${REPOSITORY}/pulls`;
+function describePage() {
+  page.tokenRepositories.textContent = REPOSITORIES.join(", ");
   document.getElementById("ready-rule").title = "Open PRs without an approval from a team member.";
   document.getElementById("approved-rule").title =
     "Open PRs where the last review of at least one team member is an approval.";
 }
 
-function renderAuthorFilter() {
-  const everyone = element("button", { type: "button", class: "chip", "data-login": "" }, "Everyone");
+function renderFilters() {
   const members = TEAM.map((member) =>
-    element("button", { type: "button", class: "chip", "data-login": member.login.toLowerCase(), title: member.login }, [
+    filterChip(
+      member.login.toLowerCase(),
+      member.name,
+      member.login,
       element("img", {
         class: "avatar",
         src: `https://github.com/${member.login}.png?size=40`,
@@ -536,11 +543,16 @@ function renderAuthorFilter() {
         height: 18,
         loading: "lazy",
       }),
-      member.name,
-    ]),
+    ),
   );
-  page.authorFilter.replaceChildren(everyone, ...members);
-  updateAuthorChips();
+  page.authorFilter.replaceChildren(filterChip("", "Everyone"), ...members);
+  const repositories = REPOSITORIES.map((fullName) => filterChip(fullName.toLowerCase(), fullName.split("/")[1], fullName));
+  page.repositoryFilter.replaceChildren(filterChip("", "All repositories"), ...repositories);
+  updateFilterChips();
+}
+
+function filterChip(value, text, title, icon) {
+  return element("button", { type: "button", class: "chip", "data-value": value, title }, [icon, text]);
 }
 
 function connectControls() {
@@ -557,7 +569,8 @@ function connectControls() {
     showView();
   });
   page.tokenRemove.addEventListener("click", onTokenRemove);
-  page.authorFilter.addEventListener("click", onAuthorChipClick);
+  page.authorFilter.addEventListener("click", (event) => onFilterChipClick(event, "authors"));
+  page.repositoryFilter.addEventListener("click", (event) => onFilterChipClick(event, "repositories"));
   page.textFilter.addEventListener("input", () => {
     state.textFilter = page.textFilter.value.trim().toLowerCase();
     renderBoard();
@@ -573,6 +586,7 @@ function connectControls() {
     state.settings.showDrafts = page.showDrafts.checked;
     saveSettings();
     renderBoard();
+    if (state.settings.showDrafts && state.token) loadOpenPullRequests();
   });
   page.showLabels.checked = state.settings.showLabels;
   page.showLabels.addEventListener("change", () => {
@@ -619,32 +633,38 @@ function onTokenRemove() {
   state.token = null;
   state.editingToken = false;
   state.rateLimit = null;
+  state.repositoryCheck = null;
+  state.repositoryWarnings = [];
   state.open = emptyList();
   state.merged = emptyList();
   page.tokenError.textContent = "";
   showView();
 }
 
-function onAuthorChipClick(event) {
-  const chip = event.target.closest("button[data-login]");
+function onFilterChipClick(event, settingName) {
+  const chip = event.target.closest("button[data-value]");
   if (!chip) return;
-  const login = chip.dataset.login;
-  const authors = new Set(state.settings.authors);
-  if (login === "") authors.clear();
-  else if (authors.has(login)) authors.delete(login);
-  else authors.add(login);
-  state.settings.authors = [...authors];
+  const value = chip.dataset.value;
+  const selected = new Set(state.settings[settingName]);
+  if (value === "") selected.clear();
+  else if (selected.has(value)) selected.delete(value);
+  else selected.add(value);
+  state.settings[settingName] = [...selected];
   saveSettings();
-  updateAuthorChips();
+  updateFilterChips();
   renderBoard();
 }
 
-function updateAuthorChips() {
-  const selected = new Set(state.settings.authors);
-  for (const chip of page.authorFilter.querySelectorAll("button[data-login]")) {
-    const login = chip.dataset.login;
-    const pressed = login === "" ? selected.size === 0 : selected.has(login);
-    chip.setAttribute("aria-pressed", String(pressed));
+function updateFilterChips() {
+  markPressedChips(page.authorFilter, state.settings.authors);
+  markPressedChips(page.repositoryFilter, state.settings.repositories);
+}
+
+function markPressedChips(group, values) {
+  const selected = new Set(values);
+  for (const chip of group.querySelectorAll("button[data-value]")) {
+    const value = chip.dataset.value;
+    chip.setAttribute("aria-pressed", String(value === "" ? selected.size === 0 : selected.has(value)));
   }
 }
 
@@ -677,31 +697,28 @@ function showView() {
 
 function refreshAll() {
   state.refreshStartedAt = Date.now();
+  state.repositoryCheck = null;
   return Promise.all([loadOpenPullRequests(), loadMergedPullRequests()]);
 }
 
 function loadOpenPullRequests() {
-  const searches = TEAM.map((member) => ({
-    name: member.name,
-    query: `repo:${REPOSITORY} is:pr is:open author:${member.login} sort:updated-desc`,
-  }));
-  return loadList(state.open, searches, OPEN_PULL_REQUEST_FIELDS);
+  const drafts = state.settings.showDrafts ? "" : " draft:false";
+  return loadList(state.open, OPEN_PULL_REQUEST_FIELDS, (member) => `is:pr is:open${drafts} author:${member.login}`);
 }
 
 function loadMergedPullRequests() {
   const since = mergedSinceDate().toISOString().replace(/\.\d+Z$/, "Z");
-  const searches = TEAM.map((member) => ({
-    name: member.name,
-    query: `repo:${REPOSITORY} is:pr is:merged author:${member.login} merged:>=${since} sort:updated-desc`,
-  }));
-  return loadList(state.merged, searches, MERGED_PULL_REQUEST_FIELDS);
+  return loadList(state.merged, MERGED_PULL_REQUEST_FIELDS, (member) => `is:pr is:merged merged:>=${since} author:${member.login}`);
 }
 
-async function loadList(list, searches, fields) {
+async function loadList(list, fields, filterFor) {
   const generation = ++list.generation;
   list.loading = true;
   render();
   try {
+    const repositories = await readableRepositories();
+    const scope = repositories.map((fullName) => `repo:${fullName}`).join(" ");
+    const searches = TEAM.map((member) => ({ name: member.name, query: `${scope} ${filterFor(member)} sort:updated-desc` }));
     const result = await searchPullRequests(searches, fields);
     if (generation !== list.generation) return;
     list.items = result.pullRequests;
@@ -719,10 +736,48 @@ async function loadList(list, searches, fields) {
   }
 }
 
+function readableRepositories() {
+  state.repositoryCheck ??= checkRepositories().catch((error) => {
+    state.repositoryCheck = null;
+    throw error;
+  });
+  return state.repositoryCheck;
+}
+
+async function checkRepositories() {
+  const variables = {};
+  const definitions = [];
+  const selections = [];
+  REPOSITORIES.forEach((fullName, index) => {
+    const [owner, name] = fullName.split("/");
+    variables[`owner${index}`] = owner;
+    variables[`name${index}`] = name;
+    definitions.push(`$owner${index}: String!, $name${index}: String!`);
+    selections.push(`r${index}: repository(owner: $owner${index}, name: $name${index}) { nameWithOwner }`);
+  });
+  const query = `query (${definitions.join(", ")}) {\n  ${selections.join("\n  ")}\n}`;
+  const { data, errors } = await callGitHub(query, variables);
+  const readable = [];
+  const warnings = [];
+  REPOSITORIES.forEach((fullName, index) => {
+    if (data[`r${index}`]) {
+      readable.push(fullName);
+      return;
+    }
+    const reason = errors.find((error) => error.path?.[0] === `r${index}`)?.message ?? "";
+    warnings.push(`The token cannot read ${fullName}. ${reason}`.trim());
+  });
+  state.repositoryWarnings = warnings;
+  if (readable.length === 0) throw new Error("The token cannot read the repositories of the board.");
+  return readable;
+}
+
 function rejectToken(message) {
   removeStorage(TOKEN_KEY);
   state.token = null;
   state.editingToken = false;
+  state.repositoryCheck = null;
+  state.repositoryWarnings = [];
   state.open = emptyList();
   state.merged = emptyList();
   showView();
@@ -740,7 +795,7 @@ async function searchPullRequests(searches, fields) {
       warnings.push(`Cannot get the PRs of ${searches[index].name}. ${result.reason.message}`);
       continue;
     }
-    for (const pullRequest of result.value.pullRequests) found.set(pullRequest.number, pullRequest);
+    for (const pullRequest of result.value.pullRequests) found.set(pullRequest.url, pullRequest);
     warnings.push(...result.value.warnings);
     rateLimit = result.value.rateLimit ?? rateLimit;
   }
@@ -872,7 +927,7 @@ function renderMessages() {
   if (state.token && !state.editingToken) {
     if (state.open.error) messages.push(message("error", `Cannot load the open PRs. ${state.open.error}`));
     if (state.merged.error) messages.push(message("error", `Cannot load the merged PRs. ${state.merged.error}`));
-    for (const warning of new Set([...state.open.warnings, ...state.merged.warnings])) {
+    for (const warning of new Set([...state.repositoryWarnings, ...state.open.warnings, ...state.merged.warnings])) {
       messages.push(message("warning", warning));
     }
   }
@@ -903,6 +958,8 @@ function renderBoard() {
 function isShown(pullRequest) {
   const login = pullRequest.author?.login?.toLowerCase() ?? "";
   if (state.settings.authors.length > 0 && !state.settings.authors.includes(login)) return false;
+  const repository = pullRequest.repository?.nameWithOwner?.toLowerCase() ?? "";
+  if (state.settings.repositories.length > 0 && !state.settings.repositories.includes(repository)) return false;
   if (pullRequest.isDraft && !state.settings.showDrafts) return false;
   if (!state.textFilter) return true;
   const number = state.textFilter.replace(/^#/, "");
@@ -947,7 +1004,7 @@ function renderCard(pullRequest, columnId) {
     element("div", { class: "card-head" }, [
       avatar(pullRequest.author),
       element("span", { class: "author" }, displayName(pullRequest.author?.login)),
-      element("a", { class: "number", href: pullRequest.url, target: "_blank", rel: "noopener noreferrer" }, `#${pullRequest.number}`),
+      element("a", { class: "number", href: pullRequest.url, target: "_blank", rel: "noopener noreferrer" }, `${pullRequest.repository?.name ?? ""}#${pullRequest.number}`),
       pullRequest.isDraft ? element("span", { class: "badge" }, "Draft") : null,
       pullRequest.mergeable === "CONFLICTING" ? element("span", { class: "badge conflict" }, "Conflicts") : null,
       isOpen ? checksIndicator(pullRequest) : null,
@@ -989,16 +1046,9 @@ function teamReviews(pullRequest) {
 
 function reviewerList(pullRequest) {
   const chips = [];
-  const reviewed = new Set();
   for (const review of teamReviews(pullRequest)) {
-    reviewed.add(review.author.login.toLowerCase());
     if (review.state === "APPROVED") chips.push(reviewerChip("approved", "✓", review.author.login, "approved"));
     if (review.state === "CHANGES_REQUESTED") chips.push(reviewerChip("changes", "✗", review.author.login, "requested changes"));
-  }
-  for (const request of pullRequest.reviewRequests?.nodes ?? []) {
-    const login = request?.requestedReviewer?.login;
-    if (!login || reviewed.has(login.toLowerCase()) || !TEAM_BY_LOGIN.has(login.toLowerCase())) continue;
-    chips.push(reviewerChip("requested", "○", login, "has a review request"));
   }
   return chips.length > 0 ? element("div", { class: "reviewers" }, chips) : null;
 }
@@ -1098,6 +1148,7 @@ function loadSettings() {
   const saved = readJson(SETTINGS_KEY) ?? {};
   return {
     authors: Array.isArray(saved.authors) ? saved.authors.filter((login) => TEAM_BY_LOGIN.has(login)) : [],
+    repositories: Array.isArray(saved.repositories) ? saved.repositories.filter((key) => REPOSITORY_KEYS.has(key)) : [],
     sortOrder: SORT_ORDERS.includes(saved.sortOrder) ? saved.sortOrder : "updated",
     showDrafts: saved.showDrafts === true,
     showLabels: saved.showLabels === true,
