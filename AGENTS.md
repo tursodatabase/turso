@@ -55,7 +55,7 @@ limbo/
 ├── testing/        # simulator/, concurrent-simulator/, differential-oracle/
 ├── sync/           # engine/, sdk-kit/ (Turso Cloud sync)
 ├── sdk-kit/        # High-level SDK abstraction
-└── tools/          # dbhash utility
+└── tools/          # dbhash utility, thesis (local Antithesis runner)
 ```
 
 ## Where to Look

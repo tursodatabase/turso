@@ -443,6 +443,15 @@ testing (DST) tool for the following:
 - Discovering bugs that the DST did not catch (and improve the DST)
 - Discovering bugs that the DST does not cover (for example, non-simulated I/O)
 
+The test templates live in `testing/antithesis/`. You can run one locally, without an Antithesis account, with
+[`thesis`](tools/thesis):
+
+```bash
+uv run --group antithesis thesis run testing/antithesis/stress-composer --seed 42
+```
+
+See [`testing/antithesis/README.md`](testing/antithesis/README.md#running-a-template-locally) for details.
+
 If you have an Antithesis account, you first need to configure some
 environment variables:
 
