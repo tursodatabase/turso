@@ -1461,6 +1461,7 @@ pub enum Insn {
         start_reg: usize,
         count_reg: usize,
         pc_if_empty: BranchOffset,
+        count_target: Option<usize>,
     },
 
     /// Delete all contents from a persistent table or index b-tree while keeping its root page.

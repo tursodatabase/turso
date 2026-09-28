@@ -14156,6 +14156,7 @@ pub fn op_index_method_query(
             start_reg,
             count_reg,
             pc_if_empty,
+            count_target,
         },
         insn
     );
@@ -14163,6 +14164,16 @@ pub fn op_index_method_query(
         .as_mut()
         .expect("cursor should exist");
     let cursor = cursor.as_index_method_mut();
+    if let Some(target) = count_target {
+        let count = return_if_io!(
+            state,
+            cursor.query_count(&state.registers[*start_reg..*start_reg + *count_reg])
+        );
+        state.registers[*target].set_int(count);
+        state.record_rows_read(count as u64);
+        state.pc += 1;
+        return Ok(InsnFunctionStepResult::Step);
+    }
     let has_rows = return_if_io!(
         state,
         cursor.query_start(&state.registers[*start_reg..*start_reg + *count_reg])
