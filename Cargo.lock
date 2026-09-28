@@ -2258,7 +2258,7 @@ dependencies = [
  "anyhow",
  "clap",
  "memory-benchmark",
- "pprof 0.15.0",
+ "pprof",
  "rusqlite",
  "serde_json",
  "tempfile",
@@ -4560,29 +4560,6 @@ checksum = "439ee305def115ba05938db6eb1644ff94165c5ab5e9420d1c1bcedbba909391"
 
 [[package]]
 name = "pprof"
-version = "0.14.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ebbe2f8898beba44815fdc9e5a4ae9c929e21c5dc29b0c774a15555f7f58d6d0"
-dependencies = [
- "aligned-vec",
- "backtrace",
- "cfg-if",
- "criterion",
- "findshlibs",
- "inferno",
- "libc",
- "log",
- "nix 0.26.4",
- "once_cell",
- "parking_lot",
- "smallvec",
- "symbolic-demangle",
- "tempfile",
- "thiserror 1.0.69",
-]
-
-[[package]]
-name = "pprof"
 version = "0.15.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "38a01da47675efa7673b032bf8efd8214f1917d89685e07e395ab125ea42b187"
@@ -4590,7 +4567,9 @@ dependencies = [
  "aligned-vec",
  "backtrace",
  "cfg-if",
+ "criterion",
  "findshlibs",
+ "inferno",
  "libc",
  "log",
  "nix 0.26.4",
@@ -7256,7 +7235,7 @@ dependencies = [
  "parking_lot",
  "pastey",
  "polling",
- "pprof 0.14.0",
+ "pprof",
  "quickcheck",
  "quickcheck_macros",
  "rand 0.9.4",
@@ -7348,7 +7327,7 @@ dependencies = [
  "fallible-iterator 0.3.0",
  "memchr",
  "miette",
- "pprof 0.14.0",
+ "pprof",
  "serde",
  "strum",
  "strum_macros",
