@@ -22,12 +22,13 @@ void TursoSyncDatabaseHostObject::throwError(jsi::Runtime &rt, const char *error
 
 jsi::Value TursoSyncDatabaseHostObject::get(jsi::Runtime &rt, const jsi::PropNameID &name) {
     auto propName = name.utf8(rt);
+    auto self = shared_from_this();
 
     if (propName == "open") {
         return jsi::Function::createFromHostFunction(
             rt, name, 0,
-            [this](jsi::Runtime &rt, const jsi::Value &, const jsi::Value *, size_t) -> jsi::Value {
-                return this->open(rt);
+            [self](jsi::Runtime &rt, const jsi::Value &, const jsi::Value *, size_t) -> jsi::Value {
+                return self->open(rt);
             }
         );
     }
@@ -35,8 +36,8 @@ jsi::Value TursoSyncDatabaseHostObject::get(jsi::Runtime &rt, const jsi::PropNam
     if (propName == "create") {
         return jsi::Function::createFromHostFunction(
             rt, name, 0,
-            [this](jsi::Runtime &rt, const jsi::Value &, const jsi::Value *, size_t) -> jsi::Value {
-                return this->create(rt);
+            [self](jsi::Runtime &rt, const jsi::Value &, const jsi::Value *, size_t) -> jsi::Value {
+                return self->create(rt);
             }
         );
     }
@@ -44,8 +45,8 @@ jsi::Value TursoSyncDatabaseHostObject::get(jsi::Runtime &rt, const jsi::PropNam
     if (propName == "connect") {
         return jsi::Function::createFromHostFunction(
             rt, name, 0,
-            [this](jsi::Runtime &rt, const jsi::Value &, const jsi::Value *, size_t) -> jsi::Value {
-                return this->connect(rt);
+            [self](jsi::Runtime &rt, const jsi::Value &, const jsi::Value *, size_t) -> jsi::Value {
+                return self->connect(rt);
             }
         );
     }
@@ -53,8 +54,8 @@ jsi::Value TursoSyncDatabaseHostObject::get(jsi::Runtime &rt, const jsi::PropNam
     if (propName == "stats") {
         return jsi::Function::createFromHostFunction(
             rt, name, 0,
-            [this](jsi::Runtime &rt, const jsi::Value &, const jsi::Value *, size_t) -> jsi::Value {
-                return this->stats(rt);
+            [self](jsi::Runtime &rt, const jsi::Value &, const jsi::Value *, size_t) -> jsi::Value {
+                return self->stats(rt);
             }
         );
     }
@@ -62,8 +63,8 @@ jsi::Value TursoSyncDatabaseHostObject::get(jsi::Runtime &rt, const jsi::PropNam
     if (propName == "checkpoint") {
         return jsi::Function::createFromHostFunction(
             rt, name, 0,
-            [this](jsi::Runtime &rt, const jsi::Value &, const jsi::Value *, size_t) -> jsi::Value {
-                return this->checkpoint(rt);
+            [self](jsi::Runtime &rt, const jsi::Value &, const jsi::Value *, size_t) -> jsi::Value {
+                return self->checkpoint(rt);
             }
         );
     }
@@ -71,8 +72,8 @@ jsi::Value TursoSyncDatabaseHostObject::get(jsi::Runtime &rt, const jsi::PropNam
     if (propName == "pushChanges") {
         return jsi::Function::createFromHostFunction(
             rt, name, 0,
-            [this](jsi::Runtime &rt, const jsi::Value &, const jsi::Value *, size_t) -> jsi::Value {
-                return this->pushChanges(rt);
+            [self](jsi::Runtime &rt, const jsi::Value &, const jsi::Value *, size_t) -> jsi::Value {
+                return self->pushChanges(rt);
             }
         );
     }
@@ -80,8 +81,8 @@ jsi::Value TursoSyncDatabaseHostObject::get(jsi::Runtime &rt, const jsi::PropNam
     if (propName == "waitChanges") {
         return jsi::Function::createFromHostFunction(
             rt, name, 0,
-            [this](jsi::Runtime &rt, const jsi::Value &, const jsi::Value *, size_t) -> jsi::Value {
-                return this->waitChanges(rt);
+            [self](jsi::Runtime &rt, const jsi::Value &, const jsi::Value *, size_t) -> jsi::Value {
+                return self->waitChanges(rt);
             }
         );
     }
@@ -89,8 +90,8 @@ jsi::Value TursoSyncDatabaseHostObject::get(jsi::Runtime &rt, const jsi::PropNam
     if (propName == "applyChanges") {
         return jsi::Function::createFromHostFunction(
             rt, name, 1,
-            [this](jsi::Runtime &rt, const jsi::Value &, const jsi::Value *args, size_t count) -> jsi::Value {
-                return this->applyChanges(rt, args, count);
+            [self](jsi::Runtime &rt, const jsi::Value &, const jsi::Value *args, size_t count) -> jsi::Value {
+                return self->applyChanges(rt, args, count);
             }
         );
     }
@@ -98,8 +99,8 @@ jsi::Value TursoSyncDatabaseHostObject::get(jsi::Runtime &rt, const jsi::PropNam
     if (propName == "ioTakeItem") {
         return jsi::Function::createFromHostFunction(
             rt, name, 0,
-            [this](jsi::Runtime &rt, const jsi::Value &, const jsi::Value *, size_t) -> jsi::Value {
-                return this->ioTakeItem(rt);
+            [self](jsi::Runtime &rt, const jsi::Value &, const jsi::Value *, size_t) -> jsi::Value {
+                return self->ioTakeItem(rt);
             }
         );
     }
@@ -107,8 +108,8 @@ jsi::Value TursoSyncDatabaseHostObject::get(jsi::Runtime &rt, const jsi::PropNam
     if (propName == "ioStepCallbacks") {
         return jsi::Function::createFromHostFunction(
             rt, name, 0,
-            [this](jsi::Runtime &rt, const jsi::Value &, const jsi::Value *, size_t) -> jsi::Value {
-                return this->ioStepCallbacks(rt);
+            [self](jsi::Runtime &rt, const jsi::Value &, const jsi::Value *, size_t) -> jsi::Value {
+                return self->ioStepCallbacks(rt);
             }
         );
     }
@@ -116,8 +117,8 @@ jsi::Value TursoSyncDatabaseHostObject::get(jsi::Runtime &rt, const jsi::PropNam
     if (propName == "close") {
         return jsi::Function::createFromHostFunction(
             rt, name, 0,
-            [this](jsi::Runtime &rt, const jsi::Value &, const jsi::Value *, size_t) -> jsi::Value {
-                return this->close(rt);
+            [self](jsi::Runtime &rt, const jsi::Value &, const jsi::Value *, size_t) -> jsi::Value {
+                return self->close(rt);
             }
         );
     }
