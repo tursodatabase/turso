@@ -9,6 +9,7 @@ use crate::mvcc::yield_hooks::{ProvidesYieldContext, YieldContext, YieldPointMar
 use crate::mvcc::yield_points::{inject_transition_failure, inject_transition_yield};
 use crate::schema::{Schema, Sequence, Table};
 use crate::skiplist::comparator::BasicComparator;
+use crate::skiplist::equivalent::{Comparable, Equivalent};
 use crate::skiplist::map::Entry;
 use crate::skiplist::SkipMap;
 use crate::state_machine::StateMachine;
@@ -19,13 +20,15 @@ use crate::storage::btree::BTreeKey;
 use crate::storage::btree::CursorTrait;
 use crate::storage::btree::CursorValidState;
 use crate::storage::pager::SavepointResult;
-use crate::storage::sqlite3_ondisk::DatabaseHeader;
+use crate::storage::sqlite3_ondisk::{read_value_serial_type, DatabaseHeader};
 use crate::storage::wal::{CheckpointMode, CheckpointResult, TursoRwLock};
 use crate::sync::atomic::{AtomicBool, AtomicI64};
 use crate::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use crate::sync::Arc;
 use crate::sync::{Mutex, RwLock};
+use crate::translate::collate::CollationSeq;
 use crate::translate::plan::IterationDirection;
+use crate::types::cmp_in_column;
 use crate::types::compare_immutable;
 use crate::types::IOCompletions;
 use crate::types::IOResult;
@@ -34,6 +37,7 @@ use crate::types::ImmutableRecord;
 use crate::types::ImmutableRecordRef;
 use crate::types::IndexInfo;
 use crate::types::SeekResult;
+use crate::types::ValueIterator;
 use crate::Completion;
 use crate::File;
 use crate::IOExt;
@@ -58,6 +62,7 @@ use std::ops::Bound;
 use strum::EnumCount;
 use tracing::instrument;
 use tracing::Level;
+use turso_parser::ast::SortOrder;
 
 pub mod checkpoint_state_machine;
 pub use checkpoint_state_machine::{
@@ -191,6 +196,9 @@ impl std::fmt::Display for MVTableId {
     }
 }
 
+#[derive(Debug, Clone)]
+struct ValidatedIndexText;
+
 /// Wrapper for index keys that implements collation-aware, ASC/DESC-aware ordering.
 #[derive(Debug, Clone)]
 pub struct SortableIndexKey {
@@ -198,6 +206,7 @@ pub struct SortableIndexKey {
     pub key: ImmutableRecordRef<'static>,
     /// Index metadata containing sort orders and collations
     pub metadata: Arc<IndexInfo>,
+    _validated_text: ValidatedIndexText,
 }
 
 impl SortableIndexKey {
@@ -205,33 +214,40 @@ impl SortableIndexKey {
         payload: impl AsRef<[u8]>,
         metadata: Arc<IndexInfo>,
         alloc: A,
-    ) -> Result<Self, TryReserveError> {
+    ) -> Result<Self> {
+        let key = ImmutableRecordRef::from_shared_record(
+            crate::alloc::try_arc_slice_from_slice_in(payload.as_ref(), alloc)?,
+        );
+        validate_index_text(&key)?;
         Ok(Self {
-            key: ImmutableRecordRef::from_shared_record(crate::alloc::try_arc_slice_from_slice_in(
-                payload.as_ref(),
-                alloc,
-            )?),
+            key,
             metadata,
+            _validated_text: ValidatedIndexText,
         })
     }
 
     fn compare(&self, other: &Self) -> Result<std::cmp::Ordering> {
-        // We sometimes need to compare a shorter key to a longer one,
-        // for example when seeking with an index key that is a prefix of the full key.
-        let num_cols = self.metadata.num_cols.min(other.metadata.num_cols);
+        self.compare_first_columns(other, self.metadata.num_cols.min(other.metadata.num_cols))
+    }
+
+    fn compare_first_columns(&self, other: &Self, num_cols: usize) -> Result<std::cmp::Ordering> {
+        if num_cols > 0 {
+            if let Some(cmp) = compare_leading_binary_text(
+                self.key.get_payload(),
+                other.key.get_payload(),
+                &self.metadata.key_info[0],
+            ) {
+                if cmp != std::cmp::Ordering::Equal || num_cols == 1 {
+                    return Ok(cmp);
+                }
+            }
+        }
 
         let mut lhs = self.key.iter()?;
         let mut rhs = other.key.iter()?;
 
         for i in 0..num_cols {
-            let lhs_value = lhs.next().expect("we already checked length")?;
-            let rhs_value = rhs.next().expect("we already checked length")?;
-
-            let cmp = compare_immutable(
-                std::iter::once(&lhs_value),
-                std::iter::once(&rhs_value),
-                &self.metadata.key_info[i..i + 1],
-            );
+            let cmp = compare_next_index_value(&mut lhs, &mut rhs, &self.metadata.key_info[i])?;
 
             if cmp != std::cmp::Ordering::Equal {
                 return Ok(cmp);
@@ -288,6 +304,124 @@ impl SortableIndexKey {
     }
 }
 
+fn validate_index_text(key: &ImmutableRecordRef<'_>) -> Result<()> {
+    let mut values = key.iter()?;
+    while let Some(value) = values.next_serialized_value() {
+        let (serial_type, data) = value?;
+        if is_text_serial_type(serial_type) {
+            read_value_serial_type(data, serial_type)?;
+        }
+    }
+    Ok(())
+}
+
+fn compare_next_index_value(
+    lhs: &mut ValueIterator<'_>,
+    rhs: &mut ValueIterator<'_>,
+    key_info: &crate::types::KeyInfo,
+) -> Result<std::cmp::Ordering> {
+    let (lhs_serial_type, lhs_data) = lhs
+        .next_serialized_value()
+        .expect("index metadata has more columns than its record")?;
+    let (rhs_serial_type, rhs_data) = rhs
+        .next_serialized_value()
+        .expect("index metadata has more columns than its record")?;
+
+    if is_text_serial_type(lhs_serial_type)
+        && is_text_serial_type(rhs_serial_type)
+        && matches!(
+            key_info.collation,
+            CollationSeq::Unset | CollationSeq::Binary
+        )
+    {
+        let cmp = compare_bytes(lhs_data, rhs_data);
+        return Ok(match key_info.sort_order {
+            SortOrder::Asc => cmp,
+            SortOrder::Desc => cmp.reverse(),
+        });
+    }
+
+    let lhs_value = read_value_serial_type(lhs_data, lhs_serial_type)?.0;
+    let rhs_value = read_value_serial_type(rhs_data, rhs_serial_type)?.0;
+    Ok(cmp_in_column(&lhs_value, &rhs_value, key_info))
+}
+
+fn is_text_serial_type(serial_type: u64) -> bool {
+    serial_type >= 13 && serial_type % 2 == 1
+}
+
+/// Orders two index records by their first column when both hold BINARY text
+/// whose header size and serial type fit in one varint byte. Returns `None`
+/// for any other shape, so the caller compares the general way.
+fn compare_leading_binary_text(
+    lhs: &[u8],
+    rhs: &[u8],
+    key_info: &crate::types::KeyInfo,
+) -> Option<std::cmp::Ordering> {
+    if !matches!(
+        key_info.collation,
+        CollationSeq::Unset | CollationSeq::Binary
+    ) {
+        return None;
+    }
+    let cmp = compare_bytes(leading_text_column(lhs)?, leading_text_column(rhs)?);
+    Some(match key_info.sort_order {
+        SortOrder::Asc => cmp,
+        SortOrder::Desc => cmp.reverse(),
+    })
+}
+
+fn leading_text_column(record: &[u8]) -> Option<&[u8]> {
+    let [header_size, serial_type, ..] = *record else {
+        return None;
+    };
+    if !(2..0x80).contains(&header_size) || serial_type >= 0x80 {
+        return None;
+    }
+    if !is_text_serial_type(serial_type as u64) {
+        return None;
+    }
+    let start = header_size as usize;
+    let len = (serial_type as usize - 13) / 2;
+    record.get(start..start + len)
+}
+
+/// Lexicographic byte order, eight bytes at a time. Index keys are short, so
+/// this avoids a `memcmp` call per comparison. The last word may overlap the
+/// previous one; the overlapping bytes are already known to be equal.
+fn compare_bytes(lhs: &[u8], rhs: &[u8]) -> std::cmp::Ordering {
+    let common = lhs.len().min(rhs.len());
+    if common < 8 {
+        for i in 0..common {
+            if lhs[i] != rhs[i] {
+                return lhs[i].cmp(&rhs[i]);
+            }
+        }
+        return lhs.len().cmp(&rhs.len());
+    }
+    let mut start = 0;
+    loop {
+        let start_of_word = start.min(common - 8);
+        let lhs_word = word_at(lhs, start_of_word);
+        let rhs_word = word_at(rhs, start_of_word);
+        if lhs_word != rhs_word {
+            return lhs_word.cmp(&rhs_word);
+        }
+        if start_of_word + 8 == common {
+            return lhs.len().cmp(&rhs.len());
+        }
+        start += 8;
+    }
+}
+
+fn word_at(bytes: &[u8], start: usize) -> u64 {
+    u64::from_be_bytes(
+        bytes[start..start + 8]
+            .try_into()
+            .expect("slice has eight bytes"),
+    )
+}
+
 impl PartialEq for SortableIndexKey {
     fn eq(&self, other: &Self) -> bool {
         if self.key.get_payload() == other.key.get_payload() {
@@ -311,6 +445,25 @@ impl PartialOrd for SortableIndexKey {
 impl Ord for SortableIndexKey {
     fn cmp(&self, other: &Self) -> std::cmp::Ordering {
         self.compare(other).expect("Failed to compare IndexKeys")
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct IndexKeyPrefix {
+    pub key: SortableIndexKey,
+    pub num_cols: usize,
+}
+
+impl Equivalent<IndexKeyPrefix> for Arc<SortableIndexKey> {
+    fn equivalent(&self, prefix: &IndexKeyPrefix) -> bool {
+        Comparable::compare(self, prefix) == std::cmp::Ordering::Equal
+    }
+}
+
+impl Comparable<IndexKeyPrefix> for Arc<SortableIndexKey> {
+    fn compare(&self, prefix: &IndexKeyPrefix) -> std::cmp::Ordering {
+        self.compare_first_columns(&prefix.key, prefix.num_cols.min(self.metadata.num_cols))
+            .expect("Failed to compare IndexKeys")
     }
 }
 
@@ -949,6 +1102,9 @@ struct WriteSet<A: RowVersionAllocator = TursoAllocator> {
     /// This is correct because instances of [RowVersions] are created once per [RowID] and then
     /// reused by cloning the [Arc]. It would be nice to encode this in the type system, but I'm
     /// not sure how.
+    ///
+    /// Empty while the write set is small enough to deduplicate by scanning `entries`;
+    /// otherwise it holds exactly the addresses of `entries`.
     seen: HashSet<usize>,
 }
 
@@ -962,12 +1118,29 @@ impl<A: RowVersionAllocator> Default for WriteSet<A> {
 }
 
 impl<A: RowVersionAllocator> WriteSet<A> {
+    const MAX_ENTRIES_DEDUPLICATED_BY_SCAN: usize = 16;
+
     fn new() -> Self {
         Self::default()
     }
 
     /// Returns `true` if this `RowVersions` was not already contained in the write set.
     fn insert(&mut self, id: RowID, row_versions: RowVersions<A>) -> bool {
+        if self.seen.is_empty() && self.entries.len() < Self::MAX_ENTRIES_DEDUPLICATED_BY_SCAN {
+            if self
+                .entries
+                .iter()
+                .any(|(_, existing)| Arc::ptr_eq(existing, &row_versions))
+            {
+                return false;
+            }
+            self.entries.push((id, row_versions));
+            return true;
+        }
+        if self.seen.is_empty() {
+            self.seen
+                .extend(self.entries.iter().map(|(_, rv)| Arc::as_ptr(rv) as usize));
+        }
         let ptr = Arc::as_ptr(&row_versions) as usize;
         if self.seen.insert(ptr) {
             self.entries.push((id, row_versions));
@@ -2149,16 +2322,11 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CommitStateMachine<Clock, A> {
             return Ok(());
         }
 
-        // Create a prefix key over the indexed columns for range lookup.
-        // Due to SortableIndexKey's Ord using min(num_cols), this key compares Equal
-        // to all entries with the same indexed columns (regardless of rowid).
-        let prefix_key = {
-            let mut index_info = record.metadata.as_ref().clone();
-            index_info.num_cols = num_indexed_cols;
-            SortableIndexKey {
-                key: record.key.clone(),
-                metadata: Arc::new(index_info),
-            }
+        // This prefix compares Equal to all entries with the same indexed columns
+        // (regardless of rowid).
+        let prefix_key = IndexKeyPrefix {
+            key: record.as_ref().clone(),
+            num_cols: num_indexed_cols,
         };
 
         let table_id = rowid.table_id;
@@ -2171,7 +2339,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CommitStateMachine<Clock, A> {
         // Use range to efficiently find all entries that match the prefix.
         // Since entries are ordered by Ord, all entries with the same indexed columns
         // are contiguous. We start from the prefix_key and stop when prefix no longer matches.
-        for entry in index_rows.range::<SortableIndexKey, _>(&prefix_key..) {
+        for entry in index_rows.range::<IndexKeyPrefix, _>(&prefix_key..) {
             let other_key = entry.key();
             // Check if prefix still matches - if not, we've passed all matching entries
             if !record.matches_prefix(other_key, num_indexed_cols)? {
@@ -6235,7 +6403,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
     pub fn seek_index(
         &self,
         index_id: MVTableId,
-        start: SortableIndexKey,
+        start: IndexKeyPrefix,
         inclusive: bool,
         eq_only: bool,
         direction: IterationDirection,
@@ -6251,8 +6419,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
             // stops at the matching cluster instead of scanning forward over every
             // invisible neighbor until it happens to find the next visible row.
             //
-            // `SortableIndexKey` ordering compares only the probe's columns (see
-            // `SortableIndexKey::compare`, which clamps to `min(num_cols)`), so
+            // An `IndexKeyPrefix` compares only its first `num_cols` columns, so
             // `start..=start` captures all entries sharing the probed prefix
             // regardless of their trailing rowid — exactly the set an eq-only seek
             // may match. Without this bound a single seek costs O(pending invisible
@@ -10397,7 +10564,7 @@ impl RowidAllocator {
     }
 }
 
-pub fn create_seek_range<K: Ord>(
+pub fn create_seek_range<K>(
     limit_boundary: Bound<K>,
     direction: IterationDirection,
 ) -> (Bound<K>, Bound<K>) {

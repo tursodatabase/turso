@@ -1317,11 +1317,10 @@ impl BTreeCursor {
     pub fn new_index_boxed(
         pager: Arc<Pager>,
         root_page: i64,
-        index: &Index,
+        index_info: Arc<IndexInfo>,
         num_columns: usize,
-    ) -> Result<Box<Self>> {
-        let index_info = Arc::new(IndexInfo::new_from_index(index)?);
-        Ok(Self::new_with_index_info(pager, root_page, num_columns, Some(index_info)).into_boxed())
+    ) -> Box<Self> {
+        Self::new_with_index_info(pager, root_page, num_columns, Some(index_info)).into_boxed()
     }
 
     /// Resets the cached count state so the next `count()` call re-traverses the
