@@ -8471,7 +8471,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
             if !self.index_versions_still_mapped(index, canonical_key.as_ref(), &row_versions) {
                 continue;
             }
-            row_version.row.id.row_id = RowKey::Record(canonical_key.clone());
+            row_version.row.id.row_id = RowKey::Record(key);
             self.insert_version_raw(&mut versions, row_version)?;
             drop(versions);
             return Ok((canonical_key, row_versions));
