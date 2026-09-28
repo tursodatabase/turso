@@ -15803,6 +15803,7 @@ pub fn op_read_cookie(
                 Cookie::UserVersion => header.user_version.get().into(),
                 Cookie::SchemaVersion => header.schema_cookie.get().into(),
                 Cookie::LargestRootPageNumber => header.vacuum_mode_largest_root_page.get().into(),
+                Cookie::PageSize => header.page_size.get().into(),
                 cookie => todo!("{cookie:?} is not yet implement for ReadCookie"),
             },
         ) {
@@ -15905,6 +15906,9 @@ pub fn op_set_cookie(
                 })?;
                 header.schema_cookie = (*value as u32).into();
             }
+            Cookie::PageSize => unreachable!(
+                "page size is not set via SetCookie; changing it is deferred to Connection::reset_page_size"
+            ),
         };
         Ok(())
     })? {
@@ -19615,7 +19619,7 @@ fn op_vacuum_into_inner(program: &Program, state: &mut ProgramState, insn: &Insn
                     Some(codec) => output_db.connect_with_page_codec(codec)?,
                     None => output_db.connect()?,
                 };
-                output_conn.reset_page_size(page_size)?;
+                output_conn.reset_page_size(MAIN_DB_ID, page_size)?;
                 // set reserved_space on output to match source
                 // this is important for databases using encryption or checksums
                 // must be set before page 1 is allocated (before any schema operations)

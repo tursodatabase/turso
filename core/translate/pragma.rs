@@ -520,7 +520,7 @@ fn update_pragma(
                 Value::Numeric(Numeric::Float(size)) => f64::from(size) as i64,
                 _ => bail_parse_error!("Invalid value for page size pragma"),
             };
-            update_page_size(connection, page_size as u32)?;
+            update_page_size(connection, database_id, page_size as u32)?;
             Ok(TransactionMode::None)
         }
         PragmaName::AutoVacuum => {
@@ -1462,13 +1462,11 @@ fn query_pragma(
             Ok(TransactionMode::Read)
         }
         PragmaName::PageSize => {
-            program.emit_int(
-                pager
-                    .io
-                    .block(|| pager.with_header(|header| header.page_size.get()))
-                    .unwrap_or_else(|_| connection.get_page_size().get()) as i64,
-                register,
-            );
+            program.emit_insn(Insn::ReadCookie {
+                db: database_id,
+                dest: register,
+                cookie: Cookie::PageSize,
+            });
             program.emit_result_row(register, 1);
             program.add_pragma_result_column(pragma.to_string());
             Ok(TransactionMode::None)
@@ -1941,7 +1939,11 @@ fn update_cache_size(
     Ok(())
 }
 
-fn update_page_size(connection: Arc<crate::Connection>, page_size: u32) -> crate::Result<()> {
-    connection.reset_page_size(page_size)?;
+fn update_page_size(
+    connection: Arc<crate::Connection>,
+    database_id: usize,
+    page_size: u32,
+) -> crate::Result<()> {
+    connection.reset_page_size(database_id, page_size)?;
     Ok(())
 }
