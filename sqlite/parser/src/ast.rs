@@ -2032,6 +2032,7 @@ pub enum TriggerCmd {
         or_conflict: Option<ResolveType>,
         /// table name
         tbl_name: Name,
+        alias: Option<Name>,
         /// `SET` assignments
         sets: Vec<Set>,
         /// `FROM`
@@ -2045,6 +2046,7 @@ pub enum TriggerCmd {
         or_conflict: Option<ResolveType>,
         /// table name
         tbl_name: Name,
+        alias: Option<Name>,
         /// `COLUMNS`
         col_names: Vec<Name>,
         /// `SELECT` or `VALUES`
@@ -2058,6 +2060,7 @@ pub enum TriggerCmd {
     Delete {
         /// table name
         tbl_name: Name,
+        alias: Option<Name>,
         /// `WHERE` clause
         where_clause: Option<Box<Expr>>,
     },

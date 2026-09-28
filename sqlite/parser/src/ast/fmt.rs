@@ -2305,6 +2305,7 @@ impl ToTokens for TriggerCmd {
             Self::Update {
                 or_conflict,
                 tbl_name,
+                alias,
                 sets,
                 from,
                 where_clause,
@@ -2315,6 +2316,10 @@ impl ToTokens for TriggerCmd {
                     or_conflict.to_tokens(s, context)?;
                 }
                 tbl_name.to_tokens(s, context)?;
+                if let Some(alias) = alias {
+                    s.append(TK_AS, None)?;
+                    alias.to_tokens(s, context)?;
+                }
                 s.append(TK_SET, None)?;
                 comma(sets, s, context)?;
                 if let Some(from) = from {
@@ -2330,6 +2335,7 @@ impl ToTokens for TriggerCmd {
             Self::Insert {
                 or_conflict,
                 tbl_name,
+                alias,
                 col_names,
                 select,
                 upsert,
@@ -2346,6 +2352,10 @@ impl ToTokens for TriggerCmd {
                 }
                 s.append(TK_INTO, None)?;
                 tbl_name.to_tokens(s, context)?;
+                if let Some(alias) = alias {
+                    s.append(TK_AS, None)?;
+                    alias.to_tokens(s, context)?;
+                }
                 if !col_names.is_empty() {
                     s.append(TK_LP, None)?;
                     comma(col_names, s, context)?;
@@ -2363,11 +2373,16 @@ impl ToTokens for TriggerCmd {
             }
             Self::Delete {
                 tbl_name,
+                alias,
                 where_clause,
             } => {
                 s.append(TK_DELETE, None)?;
                 s.append(TK_FROM, None)?;
                 tbl_name.to_tokens(s, context)?;
+                if let Some(alias) = alias {
+                    s.append(TK_AS, None)?;
+                    alias.to_tokens(s, context)?;
+                }
                 if let Some(where_clause) = where_clause {
                     s.append(TK_WHERE, None)?;
                     where_clause.to_tokens(s, context)?;

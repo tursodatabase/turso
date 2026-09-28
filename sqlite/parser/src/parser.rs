@@ -4624,6 +4624,7 @@ impl<'a> Parser<'a> {
 
         eat_expect!(self, TK_INTO);
         let tbl_name = self.parse_nm()?;
+        let alias = self.parse_trigger_table_alias()?;
         let col_names = self.parse_nm_list_opt()?;
         let select = self.parse_select()?;
         let (upsert, returning) = self.parse_upsert()?;
@@ -4635,6 +4636,7 @@ impl<'a> Parser<'a> {
         Ok(TriggerCmd::Insert {
             or_conflict: resolve_type,
             tbl_name,
+            alias,
             col_names,
             select,
             upsert,
@@ -4646,6 +4648,7 @@ impl<'a> Parser<'a> {
         eat_assert!(self, TK_UPDATE);
         let or_conflict = self.parse_or_conflict()?;
         let tbl_name = self.parse_nm()?;
+        let alias = self.parse_trigger_table_alias()?;
         eat_expect!(self, TK_SET);
         let sets = self.parse_set_list()?;
         let from = self.parse_from_clause_opt()?;
@@ -4658,6 +4661,7 @@ impl<'a> Parser<'a> {
         Ok(TriggerCmd::Update {
             or_conflict,
             tbl_name,
+            alias,
             sets,
             from,
             where_clause,
@@ -4668,6 +4672,7 @@ impl<'a> Parser<'a> {
         eat_assert!(self, TK_DELETE);
         eat_expect!(self, TK_FROM);
         let tbl_name = self.parse_nm()?;
+        let alias = self.parse_trigger_table_alias()?;
         let where_clause = self.parse_where()?;
         if matches!(self.peek()?, Some(tok) if tok.token_type == TK_RETURNING) {
             return Err(Error::Custom(
@@ -4676,8 +4681,18 @@ impl<'a> Parser<'a> {
         }
         Ok(TriggerCmd::Delete {
             tbl_name,
+            alias,
             where_clause,
         })
+    }
+
+    fn parse_trigger_table_alias(&mut self) -> Result<Option<Name>> {
+        if matches!(self.peek()?, Some(tok) if tok.token_type == TK_AS) {
+            eat_assert!(self, TK_AS);
+            Ok(Some(self.parse_nm()?))
+        } else {
+            Ok(None)
+        }
     }
 
     fn parse_trigger_cmd(&mut self) -> Result<TriggerCmd> {
@@ -12239,6 +12254,7 @@ mod tests {
                         TriggerCmd::Insert {
                             or_conflict: None,
                             tbl_name: Name::exact("foo".to_owned()),
+                            alias: None,
                             col_names: vec![],
                             select: Select {
                                 with: None,
@@ -12283,6 +12299,7 @@ mod tests {
                         TriggerCmd::Insert {
                             or_conflict: Some(ResolveType::Rollback),
                             tbl_name: Name::exact("foo".to_owned()),
+                            alias: None,
                             col_names: vec![
                                 Name::exact("bar".to_owned()),
                                 Name::exact("baz".to_owned()),
@@ -12330,6 +12347,7 @@ mod tests {
                         TriggerCmd::Insert {
                             or_conflict: None,
                             tbl_name: Name::exact("foo".to_owned()),
+                            alias: None,
                             col_names: vec![],
                             select: Select {
                                 with: None,
@@ -12396,6 +12414,7 @@ mod tests {
                         TriggerCmd::Update {
                             or_conflict: None,
                             tbl_name: Name::exact("foo".to_owned()),
+                            alias: None,
                             sets: vec![
                                 Set {
                                     col_names: vec![Name::exact("bar".to_owned())],
@@ -12431,6 +12450,7 @@ mod tests {
                     commands: vec![
                         TriggerCmd::Delete {
                             tbl_name: Name::exact("foo".to_owned()),
+                            alias: None,
                             where_clause: None,
                         },
                     ],
@@ -12458,6 +12478,7 @@ mod tests {
                     commands: vec![
                         TriggerCmd::Delete {
                             tbl_name: Name::exact("foo".to_owned()),
+                            alias: None,
                             where_clause: Some(Box::new(Expr::Literal(Literal::Numeric("1".to_owned())))),
                         },
                     ],

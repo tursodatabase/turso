@@ -2426,3 +2426,45 @@ test selectC-2-1 {
 expect error {
     no such column: new.x
 }
+
+test trigger-update-target-alias {
+    CREATE TABLE t1(a);
+    CREATE TABLE t2(a, b);
+    INSERT INTO t2 VALUES (1, 10), (2, 20);
+    CREATE TRIGGER tr1 AFTER INSERT ON t1 BEGIN
+        UPDATE t2 AS u SET b = u.b + NEW.a WHERE u.a = 1;
+    END;
+    INSERT INTO t1 VALUES (5);
+    SELECT a, b FROM t2 ORDER BY a;
+}
+expect {
+    1|15
+    2|20
+}
+
+test trigger-delete-target-alias {
+    CREATE TABLE t1(a);
+    CREATE TABLE t2(a);
+    INSERT INTO t2 VALUES (1), (2);
+    CREATE TRIGGER tr1 AFTER INSERT ON t1 BEGIN
+        DELETE FROM t2 AS d WHERE d.a = NEW.a;
+    END;
+    INSERT INTO t1 VALUES (2);
+    SELECT a FROM t2;
+}
+expect {
+    1
+}
+
+test trigger-insert-target-alias {
+    CREATE TABLE t1(a);
+    CREATE TABLE t2(a);
+    CREATE TRIGGER tr1 AFTER INSERT ON t1 BEGIN
+        INSERT INTO t2 AS i(a) VALUES (NEW.a);
+    END;
+    INSERT INTO t1 VALUES (5);
+    SELECT a FROM t2;
+}
+expect {
+    5
+}

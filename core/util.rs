@@ -3653,6 +3653,7 @@ pub fn rewrite_trigger_cmd_table_refs(cmd: &mut ast::TriggerCmd, old_tbl: &str, 
         ast::TriggerCmd::Delete {
             tbl_name,
             where_clause,
+            ..
         } => {
             if tbl_name.as_str().eq_ignore_ascii_case(old_tbl) {
                 *tbl_name = ast::Name::exact(new_tbl.to_owned());
@@ -4723,6 +4724,7 @@ pub fn trigger_still_references_renamed_column(
             ast::TriggerCmd::Delete {
                 tbl_name,
                 where_clause,
+                ..
             } => {
                 if let Some(where_clause) = where_clause {
                     if expr_still_references_renamed_column(
@@ -4932,6 +4934,7 @@ pub fn rewrite_trigger_cmd_column_refs(
         ast::TriggerCmd::Delete {
             tbl_name,
             where_clause,
+            ..
         } => {
             let targets_renamed_table = tbl_name.as_str().eq_ignore_ascii_case(table);
             if targets_renamed_table {

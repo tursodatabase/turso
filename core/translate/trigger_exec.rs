@@ -290,6 +290,7 @@ fn trigger_cmd_to_stmt_for_subprogram(
         ast::TriggerCmd::Insert {
             or_conflict,
             tbl_name,
+            alias,
             col_names,
             select,
             upsert,
@@ -313,7 +314,7 @@ fn trigger_cmd_to_stmt_for_subprogram(
                 tbl_name: QualifiedName {
                     db_name: subprogram_ctx.db_name.clone(),
                     name: tbl_name.clone(),
-                    alias: None,
+                    alias: alias.clone(),
                 },
                 columns: col_names.clone(),
                 body,
@@ -323,6 +324,7 @@ fn trigger_cmd_to_stmt_for_subprogram(
         ast::TriggerCmd::Update {
             or_conflict,
             tbl_name,
+            alias,
             sets,
             from,
             where_clause,
@@ -355,7 +357,7 @@ fn trigger_cmd_to_stmt_for_subprogram(
                 tbl_name: QualifiedName {
                     db_name: subprogram_ctx.db_name.clone(),
                     name: tbl_name.clone(),
-                    alias: None,
+                    alias: alias.clone(),
                 },
                 indexed: None,
                 sets: sets_clone,
@@ -366,6 +368,7 @@ fn trigger_cmd_to_stmt_for_subprogram(
         }
         ast::TriggerCmd::Delete {
             tbl_name,
+            alias,
             where_clause,
         } => {
             // Rewrite NEW/OLD references in WHERE clause
@@ -378,7 +381,7 @@ fn trigger_cmd_to_stmt_for_subprogram(
                 tbl_name: QualifiedName {
                     db_name: subprogram_ctx.db_name.clone(),
                     name: tbl_name.clone(),
-                    alias: None,
+                    alias: alias.clone(),
                 },
                 where_clause: where_clause_clone,
                 returning: vec![],

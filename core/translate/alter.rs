@@ -4033,6 +4033,7 @@ fn apply_trigger_cmd_for_column_rename(
         ast::TriggerCmd::Delete {
             tbl_name,
             where_clause,
+            ..
         } => {
             let delete_table_name_norm = normalize_ident(tbl_name.as_str());
             if let Some(where_expr) = where_clause {
@@ -4596,6 +4597,7 @@ fn validate_trigger_cmd_table_refs_after_rename(
         ast::TriggerCmd::Delete {
             tbl_name,
             where_clause,
+            ..
         } => {
             if !table_reference_exists_after_rename(
                 tbl_name.as_str(),
