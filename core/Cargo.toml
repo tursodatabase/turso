@@ -181,9 +181,6 @@ aegis = { version = "0.9.8" }
 [build-dependencies]
 cfg_aliases = "0.2.1"
 
-[target.'cfg(not(target_family = "windows"))'.dev-dependencies]
-pprof = { workspace = true, features = ["criterion", "flamegraph"] }
-
 [dev-dependencies]
 asserting = { workspace = true }
 memory-stats = "1.2.0"

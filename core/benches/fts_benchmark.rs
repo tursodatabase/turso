@@ -12,8 +12,6 @@
 
 #[cfg(not(feature = "codspeed"))]
 use criterion::{criterion_group, criterion_main, BatchSize, BenchmarkId, Criterion};
-#[cfg(not(feature = "codspeed"))]
-use pprof::criterion::{Output, PProfProfiler};
 use turso_core::SqliteDialect;
 
 #[cfg(feature = "codspeed")]
@@ -849,16 +847,6 @@ fn check_fts_searcher_cache_query(conn: &Arc<turso_core::Connection>, db: &Arc<D
     assert_eq!(count, 3);
 }
 
-#[cfg(not(feature = "codspeed"))]
-criterion_group! {
-    name = fts_benches;
-    config = Criterion::default()
-        .with_profiler(PProfProfiler::new(100, Output::Flamegraph(None)))
-        .sample_size(50);
-    targets = bench_fts_cold_query, bench_fts_warm_query, bench_fts_connection_pool_query, bench_fts_query_selectivity, bench_fts_insert_then_query, bench_fts_segment_churn_query, bench_fts_single_row_commit_churn, bench_fts_large_merge_boundary, bench_fts_fragmented_delete, bench_fts_fragmented_registry_scan
-}
-
-#[cfg(feature = "codspeed")]
 criterion_group! {
     name = fts_benches;
     config = Criterion::default().sample_size(50);

@@ -9,8 +9,6 @@
 
 #[cfg(not(feature = "codspeed"))]
 use criterion::{criterion_group, criterion_main, Criterion};
-#[cfg(not(feature = "codspeed"))]
-use pprof::criterion::{Output, PProfProfiler};
 
 #[cfg(feature = "codspeed")]
 use codspeed_criterion_compat::{criterion_group, criterion_main, Criterion};
@@ -225,15 +223,6 @@ fn exec(conn: &Arc<Connection>, db: &Arc<Database>, sql: &str) {
     }
 }
 
-#[cfg(not(feature = "codspeed"))]
-criterion_group! {
-    name = checkpoint_n_rows_benches;
-    config = Criterion::default()
-        .with_profiler(PProfProfiler::new(100, Output::Flamegraph(None)));
-    targets = bench_checkpoint_passive_n_rows
-}
-
-#[cfg(feature = "codspeed")]
 criterion_group! {
     name = checkpoint_n_rows_benches;
     config = Criterion::default();
