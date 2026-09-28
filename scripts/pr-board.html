@@ -441,8 +441,9 @@ const TEAM = [
 ];
 const TEAM_BY_LOGIN = new Map(TEAM.map((member) => [member.login.toLowerCase(), member]));
 const GRAPHQL_URL = "https://api.github.com/graphql";
-const PAGE_SIZE = 50;
-const MAX_PAGES_PER_SEARCH = 10;
+const PAGE_SIZE = 20;
+const MAX_PAGES_PER_SEARCH = 25;
+const RETRY_DELAY_MS = 2000;
 const REFRESH_INTERVAL_MS = 5 * 60 * 1000;
 const DATE_CHANGE_DELAY_MS = 400;
 const EARLIEST_MERGE_DATE = "2023-01-01";
@@ -756,60 +757,61 @@ function rejectToken(message) {
 }
 
 async function searchPullRequests(searches, fields) {
+  const results = await Promise.allSettled(searches.map((search) => searchAllPages(search, fields)));
   const found = new Map();
   const warnings = [];
   let rateLimit = null;
-  let pending = searches.map((search) => ({ ...search, cursor: null, pages: 0, count: 0 }));
-  while (pending.length > 0) {
-    const { data, errors } = await runSearches(pending, fields);
-    rateLimit = data.rateLimit ?? rateLimit;
-    warnings.push(...topLevelErrors(errors));
-    const next = [];
-    pending.forEach((search, index) => {
-      const connection = data[`s${index}`];
-      if (!connection) {
-        const reason = errors.find((error) => error.path?.[0] === `s${index}`)?.message ?? "GitHub returned no data.";
-        warnings.push(`Cannot get the PRs of ${search.name}. ${reason}`);
-        return;
-      }
-      for (const node of connection.nodes) {
-        if (!node?.number) continue;
-        found.set(node.number, node);
-        search.count += 1;
-      }
-      search.pages += 1;
-      if (!connection.pageInfo.hasNextPage) return;
-      if (search.pages >= MAX_PAGES_PER_SEARCH) {
-        warnings.push(`The board shows only the first ${search.count} PRs of ${search.name}.`);
-        return;
-      }
-      next.push({ ...search, cursor: connection.pageInfo.endCursor });
-    });
-    pending = next;
+  for (const [index, result] of results.entries()) {
+    if (result.status === "rejected") {
+      if (result.reason.tokenRejected) throw result.reason;
+      warnings.push(`Cannot get the PRs of ${searches[index].name}. ${result.reason.message}`);
+      continue;
+    }
+    for (const pullRequest of result.value.pullRequests) found.set(pullRequest.number, pullRequest);
+    warnings.push(...result.value.warnings);
+    rateLimit = result.value.rateLimit ?? rateLimit;
   }
+  if (results.every((result) => result.status === "rejected")) throw results[0].reason;
   return { pullRequests: [...found.values()], warnings, rateLimit };
 }
 
-function runSearches(searches, fields) {
-  const variables = {};
-  const definitions = [];
-  const selections = [];
-  searches.forEach((search, index) => {
-    variables[`q${index}`] = search.query;
-    variables[`c${index}`] = search.cursor;
-    definitions.push(`$q${index}: String!, $c${index}: String`);
-    selections.push(`s${index}: search(query: $q${index}, type: ISSUE, first: ${PAGE_SIZE}, after: $c${index}) { ...SearchPage }`);
-  });
-  const query = `query (${definitions.join(", ")}) {
+async function searchAllPages(search, fields) {
+  const pullRequests = [];
+  const warnings = [];
+  let rateLimit = null;
+  let cursor = null;
+  for (let pages = 1; ; pages += 1) {
+    const { data, errors } = await runSearch(search.query, cursor, fields);
+    rateLimit = data.rateLimit ?? rateLimit;
+    warnings.push(...topLevelErrors(errors));
+    if (!data.search) throw new Error(errors[0]?.message ?? "GitHub returned no data.");
+    pullRequests.push(...data.search.nodes.filter((node) => node?.number));
+    if (!data.search.pageInfo.hasNextPage) break;
+    if (pages === MAX_PAGES_PER_SEARCH) {
+      warnings.push(`The board shows only the first ${pullRequests.length} PRs of ${search.name}.`);
+      break;
+    }
+    cursor = data.search.pageInfo.endCursor;
+  }
+  return { pullRequests, warnings, rateLimit };
+}
+
+async function runSearch(searchQuery, cursor, fields) {
+  const query = `query ($searchQuery: String!, $cursor: String) {
   rateLimit { limit remaining resetAt }
-  ${selections.join("\n  ")}
-}
-fragment SearchPage on SearchResultItemConnection {
-  pageInfo { hasNextPage endCursor }
-  nodes { ... on PullRequest { ...PullRequestFields } }
-}
-fragment PullRequestFields on PullRequest {${fields}}`;
-  return callGitHub(query, variables);
+  search(query: $searchQuery, type: ISSUE, first: ${PAGE_SIZE}, after: $cursor) {
+    pageInfo { hasNextPage endCursor }
+    nodes { ... on PullRequest { ${fields} } }
+  }
+}`;
+  const variables = { searchQuery, cursor };
+  try {
+    return await callGitHub(query, variables);
+  } catch (error) {
+    if (!error.temporary) throw error;
+    await new Promise((resolve) => setTimeout(resolve, RETRY_DELAY_MS));
+    return callGitHub(query, variables);
+  }
 }
 
 async function callGitHub(query, variables) {
@@ -821,7 +823,9 @@ async function callGitHub(query, variables) {
       body: JSON.stringify({ query, variables }),
     });
   } catch {
-    throw new Error("Cannot connect to api.github.com.");
+    const error = new Error("GitHub did not reply, or the reply was not permitted by the browser (CORS).");
+    error.temporary = true;
+    throw error;
   }
   const body = await response.json().catch(() => null);
   if (response.status === 401) {
@@ -830,7 +834,9 @@ async function callGitHub(query, variables) {
     throw error;
   }
   if (!response.ok) {
-    throw new Error(`GitHub returned HTTP ${response.status}. ${body?.message ?? ""}`.trim());
+    const error = new Error(`GitHub returned HTTP ${response.status}. ${body?.message ?? ""}`.trim());
+    error.temporary = response.status >= 500;
+    throw error;
   }
   if (!body?.data) {
     throw new Error(body?.errors?.map((error) => error.message).join(" ") || "GitHub returned no data.");
