@@ -1458,6 +1458,17 @@ impl Schema {
             .filter(|i| !i.is_backing_btree_index())
     }
 
+    pub fn get_indices_including_backing_btrees(
+        &self,
+        table_name: &str,
+    ) -> impl Iterator<Item = &Arc<Index>> {
+        let name = normalize_ident(table_name);
+        self.indexes
+            .get(&name)
+            .map(|v| v.iter())
+            .unwrap_or_default()
+    }
+
     #[cfg(all(feature = "fts", not(target_family = "wasm")))]
     pub fn has_fts_index(&self, table_name: &str) -> bool {
         self.get_indices(table_name).any(|idx| {
