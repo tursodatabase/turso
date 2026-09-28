@@ -38,7 +38,7 @@ use crate::{
         DatabaseRowTransformResult, DatabaseSchemaKind, DatabaseSchemaReplay,
         DatabaseStatementReplay, DatabaseSyncEngineProtocolVersion, DatabaseTapeOperation,
         DatabaseTapeRowChange, DatabaseTapeRowChangeType, DbSyncInfo, DbSyncStatus,
-        PartialBootstrapStrategy, PartialSyncOpts, RemotePullProtocol, SyncEngineIoResult,
+        PartialBootstrapStrategy, PartialSyncOpts, RemotePullProtocol, Secret, SyncEngineIoResult,
     },
     wal_session::WalSession,
     Result,
@@ -806,7 +806,7 @@ pub struct SyncOperationCtx<'a, IO: SyncEngineIo, Ctx> {
     // optional remote url set in the saved configuration section of metadata file
     pub remote_url: Option<String>,
     // optional remote encryption key for the encrypted Turso Cloud databases, base64 encoded
-    pub remote_encryption_key: Option<String>,
+    pub remote_encryption_key: Option<Secret>,
 }
 
 impl<'a, IO: SyncEngineIo, Ctx> SyncOperationCtx<'a, IO, Ctx> {
@@ -816,13 +816,13 @@ impl<'a, IO: SyncEngineIo, Ctx> SyncOperationCtx<'a, IO, Ctx> {
         coro: &'a Coro<Ctx>,
         io: &'a SyncEngineIoStats<IO>,
         remote_url: Option<String>,
-        remote_encryption_key: Option<&str>,
+        remote_encryption_key: Option<&Secret>,
     ) -> Self {
         Self {
             coro,
             io,
             remote_url: remote_url.map(|x| x.to_string()),
-            remote_encryption_key: remote_encryption_key.map(|k| k.to_string()),
+            remote_encryption_key: remote_encryption_key.cloned(),
         }
     }
     pub fn http(
@@ -835,7 +835,7 @@ impl<'a, IO: SyncEngineIo, Ctx> SyncOperationCtx<'a, IO, Ctx> {
         let encryption_header = self
             .remote_encryption_key
             .as_ref()
-            .map(|key| (ENCRYPTION_KEY_HEADER, key.as_str()));
+            .map(|key| (ENCRYPTION_KEY_HEADER, key.expose()));
 
         let all_headers: Vec<_> = headers.iter().copied().chain(encryption_header).collect();
 
@@ -4000,7 +4000,7 @@ mod tests {
         types::{
             parse_bin_record, Coro, DatabasePullRevision, DatabaseRowMutation,
             DatabaseRowTransformResult, DatabaseSchemaReplay, DatabaseTapeOperation,
-            DatabaseTapeRowChange, DatabaseTapeRowChangeType,
+            DatabaseTapeRowChange, DatabaseTapeRowChangeType, Secret,
         },
         Result,
     };
@@ -5167,7 +5167,7 @@ mod tests {
                     &coro,
                     &stats,
                     Some("https://example.com".to_string()),
-                    Some("dGVzdC1lbmNyeXB0aW9uLWtleQ=="),
+                    Some(&Secret::new("dGVzdC1lbmNyeXB0aW9uLWtleQ==")),
                 );
                 let err = pull_updates_v1(&ctx, &file, "g1:o40", None, true)
                     .await
