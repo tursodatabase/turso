@@ -328,26 +328,28 @@ fn test_drop_sqlite_created_mixed_case_table() -> anyhow::Result<()> {
 #[test]
 fn test_drop_sqlite_created_mixed_case_autoincrement_table() -> anyhow::Result<()> {
     let (_tmp_dir, db_path) = create_database_with_sqlite(
-        "CREATE TABLE T1(a INTEGER PRIMARY KEY AUTOINCREMENT); \
-         INSERT INTO T1(a) VALUES(99); \
-         INSERT INTO sqlite_sequence(name, seq) VALUES('t1', 500)",
+        "CREATE TABLE T1(a INTEGER PRIMARY KEY AUTOINCREMENT, b); \
+         INSERT INTO T1(a, b) VALUES(99, 1)",
     )?;
     let db = TempDatabase::builder().with_db_path(&db_path).build();
-    db.connect_limbo().execute("DROP TABLE T1")?;
+    let conn = db.connect_limbo();
+    conn.execute("INSERT INTO T1(b) VALUES(2)")?;
+    conn.execute("DROP TABLE T1")?;
+    drop(conn);
     drop(db);
 
     let sqlite = rusqlite::Connection::open(&db_path)?;
-    let remaining: Vec<(String, i64)> = sqlite
-        .prepare("SELECT name, seq FROM sqlite_sequence")?
-        .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?
-        .collect::<rusqlite::Result<_>>()?;
-    assert_eq!(remaining, vec![("t1".to_string(), 500)]);
-    sqlite.execute_batch(
-        "CREATE TABLE T1(a INTEGER PRIMARY KEY AUTOINCREMENT); \
-         INSERT INTO T1 DEFAULT VALUES",
-    )?;
-    let id: i64 = sqlite.query_row("SELECT a FROM T1", [], |row| row.get(0))?;
-    assert_eq!(id, 1);
+    let remaining: i64 =
+        sqlite.query_row("SELECT count(*) FROM sqlite_sequence", [], |row| row.get(0))?;
+    assert_eq!(remaining, 0);
+    drop(sqlite);
+
+    let db = TempDatabase::builder().with_db_path(&db_path).build();
+    let conn = db.connect_limbo();
+    conn.execute("CREATE TABLE t1(a INTEGER PRIMARY KEY AUTOINCREMENT, b)")?;
+    conn.execute("INSERT INTO t1(b) VALUES(3)")?;
+    let rows: Vec<(i64,)> = conn.exec_rows("SELECT a FROM t1");
+    assert_eq!(rows, vec![(1,)]);
     Ok(())
 }
 
