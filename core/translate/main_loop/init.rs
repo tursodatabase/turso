@@ -87,7 +87,7 @@ impl InitLoop {
                 "DISTINCT aggregate functions must have exactly one argument"
             );
             let collations = vec![get_collseq_from_expr_with_symbols(
-                &agg.original_expr,
+                &agg.args[0],
                 tables,
                 Some(t_ctx.resolver.symbol_table),
             )?
