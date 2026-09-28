@@ -11,8 +11,6 @@
 
 #[cfg(not(feature = "codspeed"))]
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion, Throughput};
-#[cfg(not(feature = "codspeed"))]
-use pprof::criterion::{Output, PProfProfiler};
 use turso_core::SqliteDialect;
 
 #[cfg(feature = "codspeed")]
@@ -837,16 +835,6 @@ fn bench_fsync_overhead(criterion: &mut Criterion) {
     group.finish();
 }
 
-#[cfg(not(feature = "codspeed"))]
-criterion_group! {
-    name = write_perf_benches;
-    config = Criterion::default()
-        .with_profiler(PProfProfiler::new(100, Output::Flamegraph(None)))
-        .sample_size(50);
-    targets = bench_index_impact, bench_transaction_size, bench_key_pattern, bench_update_performance, bench_delete_performance, bench_large_transaction_commit, bench_fsync_overhead
-}
-
-#[cfg(feature = "codspeed")]
 criterion_group! {
     name = write_perf_benches;
     config = Criterion::default().sample_size(50);
