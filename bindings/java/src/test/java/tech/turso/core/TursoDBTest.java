@@ -6,6 +6,7 @@ import static org.junit.jupiter.api.Assertions.assertThrows;
 
 import java.io.File;
 import java.nio.file.Files;
+import java.sql.SQLException;
 import org.junit.jupiter.api.Test;
 import tech.turso.TestUtils;
 import tech.turso.TursoErrorCode;
@@ -21,6 +22,41 @@ public class TursoDBTest {
     db.close();
 
     assertFalse(db.isOpen());
+  }
+
+  @Test
+  void close_twice_should_free_the_database_only_once() throws Exception {
+    String dbPath = TestUtils.createTempFile();
+    TursoDB db = TursoDB.create("jdbc:turso:" + dbPath, dbPath);
+
+    db.close();
+    db.close();
+
+    assertFalse(db.isOpen());
+  }
+
+  @Test
+  void connect_after_close_should_throw_instead_of_touching_freed_memory() throws Exception {
+    String dbPath = TestUtils.createTempFile();
+    TursoDB db = TursoDB.create("jdbc:turso:" + dbPath, dbPath);
+    db.close();
+
+    assertThrows(SQLException.class, db::connect);
+    assertThrows(SQLException.class, () -> new TursoConnection("jdbc:turso:" + dbPath, db));
+  }
+
+  @Test
+  void connection_should_keep_working_after_its_database_is_closed() throws Exception {
+    String dbPath = TestUtils.createTempFile();
+    TursoDB db = TursoDB.create("jdbc:turso:" + dbPath, dbPath);
+    TursoConnection conn = new TursoConnection("jdbc:turso:" + dbPath, db);
+    db.close();
+
+    try (TursoStatement stmt = conn.prepare("SELECT 1")) {
+      assertThat(stmt.execute()).isTrue();
+      assertThat(stmt.getResultSet().get(1)).isEqualTo(1L);
+    }
+    conn.close();
   }
 
   @Test
