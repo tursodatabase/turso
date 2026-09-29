@@ -2437,6 +2437,8 @@ impl Insn {
 // TODO: Add remaining cookies.
 #[derive(Description, Debug, Clone, Copy)]
 pub enum Cookie {
+    /// The number of free pages.
+    FreePageCount = 0,
     /// The schema cookie.
     SchemaVersion = 1,
     /// The schema format number. Supported schema formats are 1, 2, 3, and 4.

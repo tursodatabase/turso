@@ -15804,6 +15804,7 @@ pub fn op_read_cookie(
                 Cookie::SchemaVersion => header.schema_cookie.get().into(),
                 Cookie::LargestRootPageNumber => header.vacuum_mode_largest_root_page.get().into(),
                 Cookie::PageSize => header.page_size.get().into(),
+                Cookie::FreePageCount => header.freelist_pages.get().into(),
                 cookie => todo!("{cookie:?} is not yet implement for ReadCookie"),
             },
         ) {
@@ -15909,6 +15910,7 @@ pub fn op_set_cookie(
             Cookie::PageSize => unreachable!(
                 "page size is not set via SetCookie; changing it is deferred to Connection::reset_page_size"
             ),
+            Cookie::FreePageCount => unreachable!("freelist page count is not set via SetCookie"),
         };
         Ok(())
     })? {
