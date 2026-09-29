@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.8.1 -- 2026-09-29
+
+### Updated
+
+* ci/dotnet: pin the iOS workload set to 10.0.401 (Pekka Enberg)
+
 ## 0.8.0 -- 2026-09-28
 
 ### Added
