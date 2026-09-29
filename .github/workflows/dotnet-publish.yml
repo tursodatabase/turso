@@ -786,8 +786,11 @@ jobs:
         with:
           dotnet-version: 10.0.x
 
+      # Workload set 10.0.401.1 moved the iOS SDK to 27.0, which requires
+      # Xcode 27. The macos-26 runner image only ships Xcode 26.x, so stay on
+      # the last workload set whose iOS SDK (26.5) builds with Xcode 26.
       - name: Install iOS workload
-        run: dotnet workload install ios
+        run: dotnet workload install ios --version 10.0.401
 
       - name: Download NuGet packages
         uses: actions/download-artifact@v7
