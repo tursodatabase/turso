@@ -3004,6 +3004,10 @@ pub struct SeekDef {
     pub end: SeekKey,
     /// The direction of the scan that follows the seek.
     pub iter_dir: IterationDirection,
+    /// Whether the range bounds come from a LIKE or GLOB prefix. A TEXT column
+    /// can still hold BLOB values, which sort after all text, so the range is
+    /// searched a second time with both bounds cast to BLOB.
+    pub repeat_for_blobs: bool,
 }
 
 pub struct SeekDefKeyIterator<'a, T> {

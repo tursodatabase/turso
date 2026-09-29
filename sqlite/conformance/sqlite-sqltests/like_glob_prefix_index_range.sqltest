@@ -1,0 +1,78 @@
+# LIKE and GLOB with a literal prefix should search an index with a range
+# instead of scanning the whole table or index.
+
+@database :memory:
+
+setup glob_schema {
+    CREATE TABLE t2(a INTEGER PRIMARY KEY, b, c, d, e, f TEXT, g);
+    CREATE INDEX t2b ON t2(b);
+    CREATE INDEX t2f ON t2(f);
+    INSERT INTO t2 VALUES (1, 1070, 0, 0, 0, 'ghij', 0);
+    INSERT INTO t2 VALUES (2, 1, 0, 0, 0, 'ghijk', 0);
+    INSERT INTO t2 VALUES (3, 2, 0, 0, 0, 'ghik', 0);
+    INSERT INTO t2 VALUES (4, 3, 0, 0, 0, 'GHIJ', 0);
+    INSERT INTO t2 VALUES (5, 1070, 0, 0, 0, 'abc', 0);
+}
+
+setup like_nocase_schema {
+    CREATE TABLE t3(a INTEGER PRIMARY KEY, f TEXT);
+    CREATE INDEX t3f ON t3(f COLLATE NOCASE);
+    INSERT INTO t3 VALUES (1, 'ghij');
+    INSERT INTO t3 VALUES (2, 'GHIJK');
+    INSERT INTO t3 VALUES (3, 'ghik');
+}
+
+@setup glob_schema
+@skip-if sqlite "query plan explanation output is different in sqlite"
+test glob-prefix-uses-index-range-plan {
+    EXPLAIN QUERY PLAN SELECT a FROM t2 WHERE f GLOB 'ghij*';
+}
+expect pattern {
+    SEARCH t2 USING COVERING INDEX t2f \(f>=?\? AND f<\?\)
+}
+
+@setup glob_schema
+@skip-if sqlite "query plan explanation output is different in sqlite"
+test glob-prefix-in-multi-index-or-plan {
+    EXPLAIN QUERY PLAN SELECT a FROM t2 WHERE b = 1070 OR f GLOB 'ghij*';
+}
+expect pattern {
+    MULTI-INDEX OR t2
+}
+
+@setup like_nocase_schema
+@skip-if sqlite "query plan explanation output is different in sqlite"
+test like-prefix-uses-nocase-index-range-plan {
+    EXPLAIN QUERY PLAN SELECT a FROM t3 WHERE f LIKE 'ghij%';
+}
+expect pattern {
+    SEARCH t3 USING COVERING INDEX t3f \(f>=?\? AND f<\?\)
+}
+
+@setup glob_schema
+test glob-prefix-results {
+    SELECT a FROM t2 WHERE f GLOB 'ghij*' ORDER BY a;
+}
+expect {
+    1
+    2
+}
+
+@setup glob_schema
+test glob-prefix-in-or-results {
+    SELECT a FROM t2 WHERE b = 1070 OR f GLOB 'ghij*' ORDER BY a;
+}
+expect {
+    1
+    2
+    5
+}
+
+@setup like_nocase_schema
+test like-prefix-nocase-results {
+    SELECT a FROM t3 WHERE f LIKE 'ghij%' ORDER BY a;
+}
+expect {
+    1
+    2
+}

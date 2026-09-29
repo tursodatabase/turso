@@ -361,7 +361,7 @@ impl OpenLoop {
                                 .size(&seek_def.start)
                                 .max(seek_def.size(&seek_def.end));
                             let start_reg = program.alloc_registers(max_registers);
-                            SeekEmitter::new(
+                            let blob_pass = SeekEmitter::new(
                                 program,
                                 table_references,
                                 seek_def,
@@ -372,6 +372,7 @@ impl OpenLoop {
                                 index.as_ref(),
                             )
                             .emit(loop_start, bloom_filter)?;
+                            t_ctx.meta_blob_passes[joined_table_index] = blob_pass;
 
                             if let Some(materialized_subquery_storage) =
                                 materialized_subquery_storage
