@@ -19,7 +19,7 @@ use crate::translate::{
     plan::{ColumnUsedMask, IterationDirection, JoinedTable, Operation, Scan, TableReferences},
 };
 use crate::vdbe::builder::{CursorKey, ProgramBuilderOpts, SelfTableContext};
-use crate::vdbe::insn::{to_u32, CmpInsFlags, Cookie};
+use crate::vdbe::insn::{to_u32, ClearBtreeCount, CmpInsFlags, Cookie};
 use crate::{bail_parse_error, CaptureDataChangesExt, LimboError, MAIN_DB_ID, TEMP_DB_ID};
 use crate::{
     schema::{
@@ -553,6 +553,7 @@ pub(crate) fn emit_refill_index(
             program.emit_insn(Insn::ClearBtree {
                 db: database_id,
                 root,
+                count: ClearBtreeCount::Nothing,
             });
         }
         program.emit_insn(Insn::OpenWrite {

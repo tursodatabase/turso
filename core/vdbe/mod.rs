@@ -1275,6 +1275,11 @@ impl ProgramState {
         bump_change_count(&self.n_total_change);
     }
 
+    pub(crate) fn record_statement_changes(&self, count: i64) {
+        add_to_change_count(&self.n_change, count);
+        add_to_change_count(&self.n_total_change, count);
+    }
+
     pub(crate) fn record_total_change(&self) {
         bump_change_count(&self.n_total_change);
     }
@@ -3703,8 +3708,13 @@ impl Deref for Program {
 
 #[inline(always)]
 fn bump_change_count(count: &AtomicI64) {
+    add_to_change_count(count, 1);
+}
+
+#[inline(always)]
+fn add_to_change_count(count: &AtomicI64, amount: i64) {
     count.store(
-        count.load(Ordering::Relaxed).wrapping_add(1),
+        count.load(Ordering::Relaxed).wrapping_add(amount),
         Ordering::Relaxed,
     );
 }

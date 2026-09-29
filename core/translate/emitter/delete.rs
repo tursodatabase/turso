@@ -29,7 +29,7 @@ use crate::{
     },
     vdbe::{
         builder::{CursorKey, CursorType, ProgramBuilder},
-        insn::{Insn, RegisterOrLiteral},
+        insn::{ClearBtreeCount, Insn, RegisterOrLiteral},
     },
     CaptureDataChangesExt, Connection,
 };
@@ -42,6 +42,21 @@ pub fn emit_program_for_delete(
     resolver: &Resolver,
     program: &mut ProgramBuilder,
     mut plan: DeletePlan,
+) -> Result<()> {
+    if !emit_clear_btree_delete(connection, resolver, program, &plan)? {
+        emit_row_loop_delete(connection, resolver, program, &mut plan)?;
+    }
+
+    program.result_columns = plan.result_columns;
+    program.table_references.extend(plan.table_references);
+    Ok(())
+}
+
+fn emit_row_loop_delete(
+    connection: &Arc<Connection>,
+    resolver: &Resolver,
+    program: &mut ProgramBuilder,
+    plan: &mut DeletePlan,
 ) -> Result<()> {
     let mut t_ctx = Box::new(TranslateCtx::new(
         program,
@@ -273,10 +288,71 @@ pub fn emit_program_for_delete(
         program.emit_insn(Insn::FkCheck { deferred: false });
         emit_returning_scan_back(program, buf);
     }
-    // Finalize program
-    program.result_columns = plan.result_columns;
-    program.table_references.extend(plan.table_references);
     Ok(())
+}
+
+fn emit_clear_btree_delete(
+    connection: &Arc<Connection>,
+    resolver: &Resolver,
+    program: &mut ProgramBuilder,
+    plan: &DeletePlan,
+) -> Result<bool> {
+    if !plan.where_clause.is_empty()
+        || !plan.result_columns.is_empty()
+        || plan.rowset_plan.is_some()
+        || plan.safety.requires_stable_write_set()
+        || program.capture_data_changes_info().is_some()
+        || plan
+            .indexes
+            .iter()
+            .any(|index| index.index_method.is_some())
+    {
+        return Ok(false);
+    }
+
+    let table_ref = plan
+        .table_references
+        .joined_tables()
+        .first()
+        .expect("DELETE always has one joined table");
+    let Some(table) = table_ref.btree() else {
+        return Ok(false);
+    };
+    if connection.mv_store_for_db(table_ref.database_id).is_some() {
+        return Ok(false);
+    }
+
+    let table_name = table_ref.table.get_name();
+    let has_dependent_views = resolver.with_schema(table_ref.database_id, |schema| {
+        !schema
+            .get_dependent_materialized_views(table_name)
+            .is_empty()
+    });
+    if has_dependent_views {
+        return Ok(false);
+    }
+    if connection.foreign_keys_enabled() {
+        let has_foreign_keys = resolver.with_schema(table_ref.database_id, |schema| {
+            schema.any_resolved_fks_referencing(table_name) || schema.has_child_fks(table_name)
+        });
+        if has_foreign_keys {
+            return Ok(false);
+        }
+    }
+
+    for index in &plan.indexes {
+        program.emit_insn(Insn::ClearBtree {
+            db: table_ref.database_id,
+            root: index.root_page,
+            count: ClearBtreeCount::RowsWritten,
+        });
+    }
+    program.emit_insn(Insn::ClearBtree {
+        db: table_ref.database_id,
+        root: table.root_page,
+        count: ClearBtreeCount::ChangesAndRowsWritten,
+    });
+    Ok(true)
 }
 
 #[allow(clippy::too_many_arguments)]
