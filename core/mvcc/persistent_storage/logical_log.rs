@@ -593,6 +593,7 @@ pub struct LogicalLog {
     /// doesn't corrupt the chain.
     #[cfg_attr(feature = "aristo-instr", inspect(name = "pending_running_crc"))]
     pending_running_crc: Option<u32>,
+    pending_header_upgrade: Option<(LogHeader, Completion)>,
     encryption_ctx: Option<EncryptionContext>,
     /// Plaintext bytes per encrypted payload chunk. Production uses the fixed format constant;
     /// tests may override via `new_with_encrypted_payload_chunk_size_for_test`.
@@ -625,6 +626,7 @@ impl LogicalLog {
             header: None,
             running_crc: 0,
             pending_running_crc: None,
+            pending_header_upgrade: None,
             encryption_ctx,
             encrypted_payload_chunk_size,
             max_appended_commit_ts: 0,
@@ -650,6 +652,7 @@ impl LogicalLog {
     }
 
     pub(crate) fn set_header(&mut self, header: LogHeader) {
+        self.discard_pending_header_upgrade();
         self.running_crc = derive_initial_crc(header.salt);
         self.header = Some(header);
     }
@@ -914,20 +917,31 @@ impl LogicalLog {
             return Ok(None);
         }
 
-        let upgraded_header = {
-            let header = self.header.as_mut().ok_or_else(|| {
-                LimboError::InternalError(
-                    "Logical log header not initialized before portable upgrade".to_string(),
-                )
-            })?;
-            if header.version != LOG_VERSION_V2 {
+        if let Some((header, c)) = self.pending_header_upgrade.take() {
+            if !c.finished() {
+                self.pending_header_upgrade = Some((header, c.clone()));
+                return Ok(Some(c));
+            }
+            if c.succeeded() {
+                self.header = Some(header);
                 return Ok(None);
             }
-            header.version = LOG_VERSION;
-            header.clone()
-        };
+        }
 
-        Ok(Some(self.write_header(upgraded_header, None)?))
+        let header = self.header.as_ref().ok_or_else(|| {
+            LimboError::InternalError(
+                "Logical log header not initialized before portable upgrade".to_string(),
+            )
+        })?;
+        if header.version != LOG_VERSION_V2 {
+            return Ok(None);
+        }
+        let mut upgraded_header = header.clone();
+        upgraded_header.version = LOG_VERSION;
+
+        let (upgraded_header, c) = self.write_header(upgraded_header, None)?;
+        self.pending_header_upgrade = Some((upgraded_header, c.clone()));
+        Ok(Some(c))
     }
 
     /// Writes a transaction to the log but does NOT advance the writer offset.
@@ -987,14 +1001,14 @@ impl LogicalLog {
         ))
     }
 
-    #[aristo::intent("the in-memory log header is published only after the on-disk header pwrite has completed durably", id = "aristos:logical_log_header_publish_after_fsync", verify = "full")]
-    /// Writes the header. The write is added to `group`, when given,
-    /// before it is submitted.
+    /// Writes the header and returns it with its CRC filled in. The caller
+    /// decides when the returned header becomes the in-memory header. The
+    /// write is added to `group`, when given, before it is submitted.
     fn write_header(
-        &mut self,
+        &self,
         mut header: LogHeader,
         group: Option<&mut CompletionGroup>,
-    ) -> Result<Completion> {
+    ) -> Result<(LogHeader, Completion)> {
         let header_bytes = header.encode();
         header.hdr_crc32c = u32::from_le_bytes([
             header_bytes[LOG_HDR_CRC_START],
@@ -1002,7 +1016,6 @@ impl LogicalLog {
             header_bytes[LOG_HDR_CRC_START + 2],
             header_bytes[LOG_HDR_CRC_START + 3],
         ]);
-        self.header = Some(header);
 
         let buffer = Arc::new(Buffer::new(header_bytes.to_vec()));
         let c = Completion::new_write({
@@ -1020,18 +1033,23 @@ impl LogicalLog {
         if let Some(group) = group {
             group.add(&c);
         }
-        self.file.pwrite(0, buffer, c)
+        let c = self.file.pwrite(0, buffer, c)?;
+        Ok((header, c))
     }
 
     pub fn update_header(&mut self) -> Result<Completion> {
+        self.discard_pending_header_upgrade();
         let header = self.current_or_new_header()?;
-        self.write_header(header, None)
+        let (header, c) = self.write_header(header, None)?;
+        self.header = Some(header);
+        Ok(c)
     }
 
     #[aristo::intent("the running CRC of the log is reseeded only after the truncate operation has completed durably", id = "aristos:logical_log_truncate_crc_reseed_after_completion", verify = "full")]
     fn truncate_to_zero(&mut self) -> Result<Completion> {
         // Regenerate salt so stale frames (from before truncation) cannot validate
         // against the new CRC chain.
+        self.pending_header_upgrade = None;
         let mut header = self.current_or_new_header()?;
         header.salt = self.io.generate_random_number() as u64;
         self.running_crc = derive_initial_crc(header.salt);
@@ -1077,14 +1095,15 @@ impl LogicalLog {
     pub fn reset_to_fresh_header(&mut self) -> Result<Completion> {
         // Regenerate salt so stale frames from before the reset cannot validate
         // against this new CRC chain.
+        self.discard_pending_header_upgrade();
         let mut header = self.current_or_new_header()?;
         header.salt = self.io.generate_random_number() as u64;
         self.running_crc = derive_initial_crc(header.salt);
         self.pending_running_crc = None;
-        self.header = Some(header.clone());
 
         let mut group = CompletionGroup::new(|_| {});
-        let _header_c = self.write_header(header, Some(&mut group))?;
+        let (header, _header_c) = self.write_header(header, Some(&mut group))?;
+        self.header = Some(header);
         let c = Completion::new_trunc(move |result| {
             if let Err(err) = result {
                 tracing::error!("logical_log_truncate failed: {}", err);
@@ -1094,6 +1113,15 @@ impl LogicalLog {
         let _truncate_c = self.file.truncate(LOG_HDR_SIZE as u64, c)?;
         self.offset = 0;
         Ok(group.build())
+    }
+
+    fn discard_pending_header_upgrade(&mut self) {
+        if let Some((_, c)) = self.pending_header_upgrade.take() {
+            turso_assert!(
+                c.finished(),
+                "logical log header was rewritten while a header upgrade write was in flight"
+            );
+        }
     }
 }
 
@@ -4030,6 +4058,55 @@ mod tests {
         }
         fn truncate(&self, _len: u64, _c: Completion) -> crate::Result<Completion> {
             unimplemented!("SlowReadFile is read-only")
+        }
+    }
+
+    struct HeaderWriteFailingFile {
+        inner: Arc<dyn crate::File>,
+        fail_header_write: std::sync::atomic::AtomicBool,
+    }
+
+    impl crate::File for HeaderWriteFailingFile {
+        fn lock_file(&self, exclusive: bool) -> crate::Result<()> {
+            self.inner.lock_file(exclusive)
+        }
+        fn unlock_file(&self) -> crate::Result<()> {
+            self.inner.unlock_file()
+        }
+        fn pread(&self, pos: u64, c: Completion) -> crate::Result<Completion> {
+            self.inner.pread(pos, c)
+        }
+        fn pwrite(
+            &self,
+            pos: u64,
+            buffer: Arc<Buffer>,
+            c: Completion,
+        ) -> crate::Result<Completion> {
+            if pos == 0
+                && self
+                    .fail_header_write
+                    .load(std::sync::atomic::Ordering::SeqCst)
+            {
+                c.error(crate::CompletionError::IOError(
+                    std::io::ErrorKind::Other,
+                    "injected header write failure",
+                ));
+                return Ok(c);
+            }
+            self.inner.pwrite(pos, buffer, c)
+        }
+        fn sync(
+            &self,
+            c: Completion,
+            sync_type: crate::io::FileSyncType,
+        ) -> crate::Result<Completion> {
+            self.inner.sync(c, sync_type)
+        }
+        fn size(&self) -> crate::Result<u64> {
+            self.inner.size()
+        }
+        fn truncate(&self, len: u64, c: Completion) -> crate::Result<Completion> {
+            self.inner.truncate(len, c)
         }
     }
 
@@ -7202,6 +7279,10 @@ mod tests {
             .unwrap()
             .unwrap();
         io.wait_for_completion(c).unwrap();
+        assert!(log
+            .upgrade_header_for_log_tx(&portable_tx)
+            .unwrap()
+            .is_none());
         let c = log.log_tx(portable_tx).unwrap();
         io.wait_for_completion(c).unwrap();
 
@@ -7224,6 +7305,63 @@ mod tests {
             ),
             EXT_FRAME_MAGIC
         );
+    }
+
+    #[cfg(feature = "conn_raw_api")]
+    #[test]
+    fn test_failed_lml3_header_upgrade_keeps_lml2_header_and_retries() {
+        init_tracing();
+        let io: Arc<dyn crate::IO> = Arc::new(MemoryIO::new());
+        let inner = io
+            .open_file("failed-lml3-upgrade.db-log", OpenFlags::Create, false)
+            .unwrap();
+        let file = Arc::new(HeaderWriteFailingFile {
+            inner: inner.clone(),
+            fail_header_write: std::sync::atomic::AtomicBool::new(false),
+        });
+        let mut log = LogicalLog::new(file.clone(), io.clone(), None);
+
+        let tx = crate::mvcc::database::LogRecord::for_test(
+            10,
+            &[make_test_row_version((-2).into(), 1, "visible", 10)],
+            None,
+        );
+        let c = log.log_tx(tx).unwrap();
+        io.wait_for_completion(c).unwrap();
+
+        let mut portable_tx = crate::mvcc::database::LogRecord::for_test(
+            20,
+            &[make_test_row_version((-2).into(), 2, "visible", 20)],
+            None,
+        );
+        portable_tx.portable_changes_enabled = true;
+        portable_tx.portable_changes = crate::alloc::vec![0x1a, 0x00];
+
+        file.fail_header_write
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let c = log
+            .upgrade_header_for_log_tx(&portable_tx)
+            .unwrap()
+            .unwrap();
+        assert!(io.wait_for_completion(c).is_err());
+        assert_eq!(log.header().unwrap().version, LOG_VERSION_V2);
+
+        file.fail_header_write
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        let c = log
+            .upgrade_header_for_log_tx(&portable_tx)
+            .unwrap()
+            .unwrap();
+        io.wait_for_completion(c).unwrap();
+        assert!(log
+            .upgrade_header_for_log_tx(&portable_tx)
+            .unwrap()
+            .is_none());
+        assert_eq!(log.header().unwrap().version, LOG_VERSION);
+
+        let bytes = read_file_bytes(inner, &io);
+        let header = LogHeader::decode(&bytes[..LOG_HDR_SIZE]).unwrap();
+        assert_eq!(header.version, LOG_VERSION);
     }
 
     #[cfg(feature = "conn_raw_api")]

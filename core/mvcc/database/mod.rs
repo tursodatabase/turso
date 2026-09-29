@@ -3454,9 +3454,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> StateTransition for CommitStat
                 }
                 let header_c = mvcc_store.storage.upgrade_header_for_log_tx(log_record)?;
                 if let Some(c) = header_c {
-                    if !c.succeeded() {
-                        return Ok(TransitionResult::Io(IOCompletions(c)));
-                    }
+                    return Ok(TransitionResult::Io(IOCompletions(c)));
                 }
                 let end_ts = *end_ts;
                 let log_record = match std::mem::replace(
