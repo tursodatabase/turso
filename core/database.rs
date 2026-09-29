@@ -1633,15 +1633,6 @@ impl Database {
                             // Release the schema lock
                             state.schema_guard = None;
                         }
-                        Err(err) if matches!(*err, LimboError::ExtensionError(_)) => {
-                            let LimboError::ExtensionError(e) = *err else {
-                                unreachable!()
-                            };
-                            // this means that a vtab exists and we no longer have the module loaded.
-                            // we print a warning to the user to load the module
-                            state.schema_guard = None;
-                            tracing::warn!("open warning, failed to load extension: {e}");
-                        }
                         Err(e) => return Err(e),
                     }
 
