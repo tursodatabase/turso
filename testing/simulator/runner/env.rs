@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt::Display;
 use std::mem;
 use std::ops::{Deref, DerefMut};
@@ -13,6 +13,7 @@ use rand::{Rng, SeedableRng};
 use rand_chacha::ChaCha8Rng;
 use sql_generation::generation::GenerationContext;
 use sql_generation::generation::generated_expr::rename_column_refs_in_expr;
+use sql_generation::model::query::Insert;
 use sql_generation::model::query::transaction::Rollback;
 use sql_generation::model::table::{SimValue, Table};
 use tracing::trace;
@@ -137,8 +138,15 @@ pub struct Snapshot {
     operations: Vec<TxOperation>,
     /// Named savepoint snapshots in this transaction.
     savepoints: Vec<ShadowSavepoint>,
+    databases: SnapshotDatabases,
 
     transaction_mode: TransactionMode,
+}
+
+#[derive(Debug, Clone)]
+enum SnapshotDatabases {
+    All,
+    Only(HashSet<String>),
 }
 
 impl Snapshot {
@@ -157,9 +165,15 @@ pub struct ShadowSavepoint {
 }
 
 #[derive(Debug, Clone)]
+pub struct DeferredSavepoint {
+    name: String,
+    starts_transaction: bool,
+}
+
+#[derive(Debug, Clone)]
 pub enum TransactionTables {
     /// Deferred transaction. Snapshot of the tables has not been taken yet
-    Deferred,
+    Deferred(Vec<DeferredSavepoint>),
     Snapshot(Snapshot),
 }
 
@@ -167,7 +181,7 @@ impl TransactionTables {
     #[inline]
     fn into_snapshot(self) -> Option<Snapshot> {
         match self {
-            TransactionTables::Deferred => None,
+            TransactionTables::Deferred(_) => None,
             TransactionTables::Snapshot(snapshot) => Some(snapshot),
         }
     }
@@ -175,7 +189,7 @@ impl TransactionTables {
     #[inline]
     fn as_snaphot_opt(&self) -> Option<&Snapshot> {
         match self {
-            TransactionTables::Deferred => None,
+            TransactionTables::Deferred(_) => None,
             TransactionTables::Snapshot(snapshot) => Some(snapshot),
         }
     }
@@ -183,7 +197,7 @@ impl TransactionTables {
     #[inline]
     fn as_snapshot_mut_opt(&mut self) -> Option<&mut Snapshot> {
         match self {
-            TransactionTables::Deferred => None,
+            TransactionTables::Deferred(_) => None,
             TransactionTables::Snapshot(snapshot) => Some(snapshot),
         }
     }
@@ -571,27 +585,29 @@ where
     }
 
     pub fn savepoint(&mut self, name: String) {
-        let starts_transaction = self.transaction_tables.is_none();
-        if starts_transaction
-            || matches!(
-                self.transaction_tables.as_ref(),
-                Some(TransactionTables::Deferred)
-            )
-        {
-            self.create_snapshot(TransactionMode::Write);
+        match self.transaction_tables.as_mut() {
+            None => {
+                *self.transaction_tables =
+                    Some(TransactionTables::Deferred(vec![DeferredSavepoint {
+                        name,
+                        starts_transaction: true,
+                    }]));
+            }
+            Some(TransactionTables::Deferred(savepoints)) => {
+                savepoints.push(DeferredSavepoint {
+                    name,
+                    starts_transaction: false,
+                });
+            }
+            Some(TransactionTables::Snapshot(snapshot)) => {
+                snapshot.savepoints.push(ShadowSavepoint {
+                    name,
+                    current_tables: snapshot.current_tables.clone(),
+                    operation_len: snapshot.operations.len(),
+                    starts_transaction: false,
+                });
+            }
         }
-
-        let snapshot = self
-            .transaction_tables
-            .as_mut()
-            .expect("savepoint should create a transaction snapshot")
-            .expect_snapshot_mut();
-        snapshot.savepoints.push(ShadowSavepoint {
-            name,
-            current_tables: snapshot.current_tables.clone(),
-            operation_len: snapshot.operations.len(),
-            starts_transaction,
-        });
     }
 
     pub fn rollback_to_savepoint(&mut self, name: &str) -> anyhow::Result<()> {
@@ -600,7 +616,16 @@ where
                 "cannot rollback to savepoint {name}: no active transaction"
             ));
         };
-        let snapshot = txn.expect_snapshot_mut();
+        let snapshot = match txn {
+            TransactionTables::Deferred(savepoints) => {
+                let Some(savepoint_idx) = savepoints.iter().rposition(|sp| sp.name == name) else {
+                    return Err(anyhow::anyhow!("no such savepoint: {name}"));
+                };
+                savepoints.truncate(savepoint_idx + 1);
+                return Ok(());
+            }
+            TransactionTables::Snapshot(snapshot) => snapshot,
+        };
         let Some(savepoint_idx) = snapshot.savepoints.iter().rposition(|sp| sp.name == name) else {
             return Err(anyhow::anyhow!("no such savepoint: {name}"));
         };
@@ -618,7 +643,20 @@ where
                 "cannot release savepoint {name}: no active transaction"
             ));
         };
-        let snapshot = txn.expect_snapshot_mut();
+        let snapshot = match txn {
+            TransactionTables::Deferred(savepoints) => {
+                let Some(savepoint_idx) = savepoints.iter().rposition(|sp| sp.name == name) else {
+                    return Err(anyhow::anyhow!("no such savepoint: {name}"));
+                };
+                let starts_transaction = savepoints[savepoint_idx].starts_transaction;
+                savepoints.truncate(savepoint_idx);
+                if starts_transaction {
+                    *self.transaction_tables = None;
+                }
+                return Ok(());
+            }
+            TransactionTables::Snapshot(snapshot) => snapshot,
+        };
         let Some(savepoint_idx) = snapshot.savepoints.iter().rposition(|sp| sp.name == name) else {
             return Err(anyhow::anyhow!("no such savepoint: {name}"));
         };
@@ -642,7 +680,9 @@ where
         };
         if let Some(txn) = self.transaction_tables.as_mut() {
             match txn {
-                TransactionTables::Deferred => self.create_snapshot(transaction_mode),
+                TransactionTables::Deferred(_) => {
+                    self.take_snapshot(transaction_mode, SnapshotDatabases::Only(HashSet::new()))
+                }
                 TransactionTables::Snapshot(snapshot) => {
                     match (snapshot.transaction_mode, transaction_mode) {
                         (_, TransactionMode::Concurrent) => {
@@ -667,19 +707,64 @@ where
                 }
             }
         }
+        self.start_reading_databases(query);
+    }
+
+    fn start_reading_databases(&mut self, query: &Query) {
+        let Some(TransactionTables::Snapshot(snapshot)) = self.transaction_tables.as_mut() else {
+            return;
+        };
+        let SnapshotDatabases::Only(databases) = &mut snapshot.databases else {
+            return;
+        };
+        for database in query_databases(query) {
+            if !databases.insert(database.clone()) {
+                continue;
+            }
+            replace_database_tables(
+                &mut snapshot.current_tables,
+                self.commited_tables,
+                &database,
+            );
+            for savepoint in &mut snapshot.savepoints {
+                replace_database_tables(
+                    &mut savepoint.current_tables,
+                    self.commited_tables,
+                    &database,
+                );
+            }
+        }
     }
 
     #[inline]
     pub fn create_deferred_snapshot(&mut self) {
-        *self.transaction_tables = Some(TransactionTables::Deferred);
+        *self.transaction_tables = Some(TransactionTables::Deferred(Vec::new()));
     }
 
     #[inline]
     pub fn create_snapshot(&mut self, transaction_mode: TransactionMode) {
+        self.take_snapshot(transaction_mode, SnapshotDatabases::All);
+    }
+
+    fn take_snapshot(&mut self, transaction_mode: TransactionMode, databases: SnapshotDatabases) {
+        let current_tables = self.commited_tables.clone();
+        let savepoints = match self.transaction_tables.take() {
+            Some(TransactionTables::Deferred(savepoints)) => savepoints
+                .into_iter()
+                .map(|savepoint| ShadowSavepoint {
+                    name: savepoint.name,
+                    current_tables: current_tables.clone(),
+                    operation_len: 0,
+                    starts_transaction: savepoint.starts_transaction,
+                })
+                .collect(),
+            Some(TransactionTables::Snapshot(_)) | None => Vec::new(),
+        };
         *self.transaction_tables = Some(TransactionTables::Snapshot(Snapshot {
-            current_tables: self.commited_tables.clone(),
+            current_tables,
             operations: Vec::new(),
-            savepoints: Vec::new(),
+            savepoints,
+            databases,
             transaction_mode,
         }));
     }
@@ -918,6 +1003,33 @@ where
     }
 }
 
+fn query_databases(query: &Query) -> HashSet<String> {
+    let mut tables = query.uses();
+    if let Query::Insert(Insert::Select { select, .. }) = query {
+        tables.extend(select.dependencies());
+    }
+    tables
+        .iter()
+        .map(|table| table_database(table).to_string())
+        .collect()
+}
+
+fn table_database(table_name: &str) -> &str {
+    table_name
+        .split_once('.')
+        .map_or("main", |(database, _)| database)
+}
+
+fn replace_database_tables(tables: &mut Vec<Table>, commited_tables: &[Table], database: &str) {
+    tables.retain(|table| table_database(&table.name) != database);
+    tables.extend(
+        commited_tables
+            .iter()
+            .filter(|table| table_database(&table.name) == database)
+            .cloned(),
+    );
+}
+
 impl<'a> Deref for ShadowTablesMut<'a> {
     type Target = Vec<Table>;
 
@@ -961,18 +1073,95 @@ mod tests {
                 &mut sequences,
             );
             tables.savepoint("sp".to_string());
-            let snapshot = tables
-                .transaction_tables
-                .as_ref()
-                .expect("savepoint should create a transaction")
-                .expect_snaphot();
-            assert_eq!(snapshot.savepoints.len(), 1);
-            assert!(snapshot.savepoints[0].starts_transaction);
+            let Some(TransactionTables::Deferred(savepoints)) = tables.transaction_tables.as_ref()
+            else {
+                panic!("savepoint should start a deferred transaction");
+            };
+            assert_eq!(savepoints.len(), 1);
+            assert!(savepoints[0].starts_transaction);
 
             tables.release_savepoint("sp").unwrap();
         }
 
         assert!(transaction_tables.is_none());
+    }
+
+    #[test]
+    fn savepoint_outside_transaction_sees_commits_made_before_first_read() {
+        let mut commited_tables = vec![table_with_unique_generated_column(&[(1, 2)])];
+        let mut transaction_tables = None;
+        let mut sequences = Vec::new();
+
+        let mut tables = shadow_tables_mut(
+            &mut commited_tables,
+            &mut transaction_tables,
+            &mut sequences,
+        );
+        tables.savepoint("sp".to_string());
+        tables.commited_tables[0] = table_with_unique_generated_column(&[(1, 2), (3, 4)]);
+        tables.create_snapshot(TransactionMode::Read);
+
+        let snapshot = tables
+            .transaction_tables
+            .as_ref()
+            .expect("first read should take the snapshot")
+            .expect_snaphot();
+        assert_eq!(snapshot.current_tables[0].rows.len(), 2);
+        assert_eq!(snapshot.savepoints.len(), 1);
+        assert_eq!(snapshot.savepoints[0].name, "sp");
+        assert!(snapshot.savepoints[0].starts_transaction);
+        assert_eq!(snapshot.savepoints[0].current_tables[0].rows.len(), 2);
+    }
+
+    #[test]
+    fn deferred_transaction_reads_attached_database_when_first_used() {
+        use sql_generation::model::query::Select;
+        use sql_generation::model::query::predicate::Predicate;
+
+        fn named_table(name: &str, rows: &[(i64, i64)]) -> Table {
+            Table {
+                name: name.to_string(),
+                ..table_with_unique_generated_column(rows)
+            }
+        }
+        fn select_all(table: &str) -> Query {
+            Query::Select(Select::simple(table.to_string(), Predicate::true_()))
+        }
+
+        let mut commited_tables = vec![
+            named_table("t", &[(1, 2)]),
+            named_table("aux1.t", &[(1, 2)]),
+        ];
+        let mut transaction_tables = None;
+        let mut sequences = Vec::new();
+
+        let mut tables = shadow_tables_mut(
+            &mut commited_tables,
+            &mut transaction_tables,
+            &mut sequences,
+        );
+        tables.create_deferred_snapshot();
+        tables.upgrade_transaction(&select_all("t"));
+        tables.commited_tables[0] = named_table("t", &[(1, 2), (3, 4)]);
+        tables.commited_tables[1] = named_table("aux1.t", &[(1, 2), (3, 4)]);
+        tables.upgrade_transaction(&select_all("aux1.t"));
+
+        let snapshot = tables
+            .transaction_tables
+            .as_ref()
+            .expect("transaction should stay open")
+            .expect_snaphot();
+        let rows_in = |name: &str| {
+            snapshot
+                .current_tables
+                .iter()
+                .find(|table| table.name == name)
+                .expect("table should be in the snapshot")
+                .rows
+                .len()
+        };
+        assert_eq!(rows_in("t"), 1);
+        assert_eq!(rows_in("aux1.t"), 2);
     }
 
     #[test]
@@ -1127,7 +1316,7 @@ mod tests {
     #[test]
     fn savepoint_inside_deferred_transaction_stays_open_on_release() {
         let mut commited_tables = Vec::new();
-        let mut transaction_tables = Some(TransactionTables::Deferred);
+        let mut transaction_tables = Some(TransactionTables::Deferred(Vec::new()));
         let mut sequences = Vec::new();
 
         let mut tables = shadow_tables_mut(
@@ -1136,22 +1325,19 @@ mod tests {
             &mut sequences,
         );
         tables.savepoint("sp".to_string());
-        let snapshot = tables
-            .transaction_tables
-            .as_ref()
-            .expect("deferred transaction should materialize")
-            .expect_snaphot();
-        assert_eq!(snapshot.transaction_mode, TransactionMode::Write);
-        assert_eq!(snapshot.savepoints.len(), 1);
-        assert!(!snapshot.savepoints[0].starts_transaction);
+        let Some(TransactionTables::Deferred(savepoints)) = tables.transaction_tables.as_ref()
+        else {
+            panic!("savepoint should not take the snapshot");
+        };
+        assert_eq!(savepoints.len(), 1);
+        assert!(!savepoints[0].starts_transaction);
 
         tables.release_savepoint("sp").unwrap();
-        let snapshot = tables
-            .transaction_tables
-            .as_ref()
-            .expect("outer transaction should remain open")
-            .expect_snaphot();
-        assert!(snapshot.savepoints.is_empty());
+        let Some(TransactionTables::Deferred(savepoints)) = tables.transaction_tables.as_ref()
+        else {
+            panic!("outer transaction should remain open");
+        };
+        assert!(savepoints.is_empty());
     }
 }
 
