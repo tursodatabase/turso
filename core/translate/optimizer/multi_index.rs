@@ -101,10 +101,12 @@ enum MultiIdxBranchAccess {
     },
 }
 
-/// Flattens nested OR expressions into a list of disjuncts.
+/// Flattens nested OR expressions into a list of disjuncts, looking through
+/// grouping parentheses at every level.
 ///
-/// For example, `(a OR b) OR c` becomes `[a, b, c]`.
+/// For example, `(a OR (b OR c)) OR d` becomes `[a, b, c, d]`.
 fn flatten_or_expr(expr: &ast::Expr) -> Vec<&ast::Expr> {
+    let expr = crate::translate::expr::unwrap_parens(expr).unwrap_or(expr);
     match expr {
         ast::Expr::Binary(lhs, ast::Operator::Or, rhs) => {
             let mut result = flatten_or_expr(lhs);
@@ -115,10 +117,15 @@ fn flatten_or_expr(expr: &ast::Expr) -> Vec<&ast::Expr> {
     }
 }
 
-/// Flattens nested AND expressions into a list of conjuncts.
+/// Flattens nested AND expressions into a list of conjuncts, looking through
+/// grouping parentheses at every level.
 ///
-/// For example, `(a AND b) AND c` becomes `[a, b, c]`.
+/// For example, `((a AND b)) AND c` becomes `[a, b, c]`. A BETWEEN that the
+/// planner has already rewritten into `x >= lo AND x <= hi` keeps the
+/// parentheses it was written with, so `(x BETWEEN lo AND hi) AND y = 1`
+/// arrives here as `(x >= lo AND x <= hi) AND y = 1`.
 fn flatten_and_expr(expr: &ast::Expr) -> Vec<&ast::Expr> {
+    let expr = crate::translate::expr::unwrap_parens(expr).unwrap_or(expr);
     match expr {
         ast::Expr::Binary(lhs, ast::Operator::And, rhs) => {
             let mut result = flatten_and_expr(lhs);
