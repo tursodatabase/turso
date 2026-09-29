@@ -2453,6 +2453,8 @@ pub enum Cookie {
     IncrementalVacuum = 7,
     /// The application ID as set by the application_id pragma.
     ApplicationId = 8,
+    /// The page size, as read by the page_size pragma.
+    PageSize = 9,
 }
 
 #[cfg(test)]

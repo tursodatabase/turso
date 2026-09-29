@@ -1218,7 +1218,7 @@ fn test_vacuum_into_preserves_page_size(_tmp_db: TempDatabase) -> anyhow::Result
     let source_db = TempDatabase::new_empty();
     let conn = source_db.connect_limbo();
     // Set non-default page_size (must be done before any tables are created)
-    conn.reset_page_size(8192)?;
+    conn.reset_page_size(turso_core::MAIN_DB_ID, 8192)?;
 
     conn.execute("CREATE TABLE t (a INTEGER, b TEXT)")?;
     conn.execute("INSERT INTO t VALUES (1, 'hello'), (2, 'world')")?;

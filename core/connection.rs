@@ -2784,23 +2784,26 @@ impl Connection {
     /// Instead, the new page size is remembered and is used to set the page size when the database
     /// is first created, if it does not already exist when the page_size pragma is issued,
     /// or at the next VACUUM command that is run on the same database connection while not in WAL mode.
-    pub fn reset_page_size(&self, size: u32) -> Result<()> {
-        if self.db.initialized() {
+    pub fn reset_page_size(&self, database_id: usize, size: u32) -> Result<()> {
+        if self.get_source_database(database_id).initialized() {
             return Ok(());
         }
         let Some(size) = PageSize::new(size) else {
             return Ok(());
         };
 
-        self.pager.load().set_initial_page_size(size)?;
-        self.page_size.store(size.get_raw(), Ordering::SeqCst);
+        let pager = self.get_pager_from_database_index(&database_id)?;
+        pager.set_initial_page_size(size)?;
+        if database_id == MAIN_DB_ID {
+            self.page_size.store(size.get_raw(), Ordering::SeqCst);
+        }
         // MvStore caches a copy of the database header in `global_header`, captured from the
         // pager during bootstrap (before any PRAGMA page_size can run). Propagate the new
         // page size so subsequent transactions and any header lookups see the same value the
         // pager will write to disk; otherwise paths like op_open_ephemeral allocate buffers
         // sized to the connection's page_size but compute usable_space from the stale 4 KiB
         // global header, tripping the btree_init_page assertion.
-        if let Some(mv_store) = self.db.get_mv_store().as_ref() {
+        if let Some(mv_store) = self.mv_store_for_db(database_id).as_ref() {
             mv_store.set_global_page_size(size);
         }
         self.bump_prepare_context_generation();
