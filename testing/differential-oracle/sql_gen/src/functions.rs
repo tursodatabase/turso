@@ -157,6 +157,7 @@ const ANY: Option<DataType> = None;
 const TEXT: Option<DataType> = Some(DataType::Text);
 const INT: Option<DataType> = Some(DataType::Integer);
 const REAL: Option<DataType> = Some(DataType::Real);
+const LARGEST_CODEPOINT_BELOW_SURROGATES: i64 = 0xD7FF;
 
 /// All built-in scalar functions.
 pub static SCALAR_FUNCTIONS: &[FunctionDef] = &[
@@ -239,7 +240,8 @@ pub static SCALAR_FUNCTIONS: &[FunctionDef] = &[
         .args(&[INT])
         .arity(1, 5)
         .returns(DataType::Text)
-        .category(FunctionCategory::String),
+        .category(FunctionCategory::String)
+        .int_arg_max(LARGEST_CODEPOINT_BELOW_SURROGATES),
     FunctionDef::new("QUOTE")
         .args(&[ANY])
         .returns(DataType::Text)

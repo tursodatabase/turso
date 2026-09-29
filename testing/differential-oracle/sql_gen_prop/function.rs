@@ -26,6 +26,8 @@ use crate::generator::SqlGeneratorKind;
 use crate::profile::StatementProfile;
 use crate::schema::DataType;
 
+const LARGEST_CODEPOINT_BELOW_SURROGATES: i64 = 0xD7FF;
+
 /// Categories of SQL functions.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, strum::EnumIter)]
 pub enum FunctionCategory {
@@ -565,7 +567,8 @@ pub fn string_functions() -> Vec<FunctionDef> {
             .args(&[Some(DataType::Integer)])
             .arity(1, 10)
             .returns(DataType::Text)
-            .category(FunctionCategory::String),
+            .category(FunctionCategory::String)
+            .int_arg_max(LARGEST_CODEPOINT_BELOW_SURROGATES),
         FunctionDef::new("QUOTE")
             .args(&[None])
             .returns(DataType::Text)

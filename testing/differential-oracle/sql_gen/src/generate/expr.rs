@@ -834,6 +834,31 @@ mod tests {
     }
 
     #[test]
+    fn char_arguments_are_never_surrogate_codepoints() {
+        let generator = test_generator();
+        let table = generator.schema().tables[0].clone();
+        let char_func = crate::functions::SCALAR_FUNCTIONS
+            .iter()
+            .find(|f| f.name == "CHAR")
+            .unwrap();
+        let mut ctx = Context::new_with_seed(42);
+
+        for _ in 0..10_000 {
+            let arg = ctx
+                .with_table_scope([(table.clone(), None)], |ctx| {
+                    generate_function_arg(&generator, ctx, 0, char_func, 0)
+                })
+                .unwrap();
+            match arg {
+                Expr::Literal(Literal::Integer(codepoint)) => {
+                    assert!((0..0xD800).contains(&codepoint), "{codepoint}")
+                }
+                other => panic!("expected an integer literal, got {other}"),
+            }
+        }
+    }
+
+    #[test]
     fn test_function_call_in_select() {
         use crate::policy::ExprWeights;
 
