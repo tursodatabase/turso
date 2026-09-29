@@ -65,6 +65,7 @@ use in_seek::{emit_in_seek_end, emit_in_seek_start, open_in_seek_source_cursor};
 pub(crate) use init::{init_distinct, InitLoop};
 use multi_index::emit_multi_index_scan_loop;
 pub(crate) use open::OpenLoop;
+pub(crate) use seek::BlobPass;
 use seek::SeekEmitter;
 
 #[derive(Debug)]

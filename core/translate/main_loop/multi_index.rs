@@ -135,7 +135,7 @@ fn emit_seek_multi_index_branch(
         .max(seek_def.size(&seek_def.end))
         .max(1);
     let key_start_reg = program.alloc_registers(max_key_regs);
-    SeekEmitter::new(
+    let blob_pass = SeekEmitter::new(
         program,
         table_references,
         seek_def,
@@ -198,6 +198,9 @@ fn emit_seek_multi_index_branch(
             fullscan: false,
             is_index: false,
         }),
+    }
+    if let Some(blob_pass) = blob_pass {
+        blob_pass.emit_repeat(program);
     }
     program.preassign_label_to_next_insn(branch_loop_end);
 

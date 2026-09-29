@@ -3778,6 +3778,9 @@ fn mark_seek_constraints_consumed(
         ] {
             let Some(pos) = pos else { continue };
             let constraint = &constraints[pos];
+            if !constraint.consumes_where_term() {
+                continue;
+            }
             let where_term = &mut where_clause[constraint.where_clause_pos.0];
             if where_term.consumed {
                 continue;
@@ -4438,6 +4441,7 @@ pub fn build_seek_def_from_constraints(
         return Ok(SeekDef {
             prefix: Vec::new(),
             iter_dir,
+            repeat_for_blobs: false,
             start: SeekKey {
                 last_component: SeekKeyComponent::None,
                 op: start_op,
@@ -4458,7 +4462,13 @@ pub fn build_seek_def_from_constraints(
         })
         .collect();
 
-    let seek_def = build_seek_def(iter_dir, key)?;
+    let mut seek_def = build_seek_def(iter_dir, key)?;
+    seek_def.repeat_for_blobs = constraint_refs.last().is_some_and(|range| {
+        [range.lower_bound, range.upper_bound]
+            .into_iter()
+            .flatten()
+            .any(|pos| constraints[pos].pattern_collation.is_some())
+    });
     Ok(seek_def)
 }
 
@@ -4503,6 +4513,7 @@ fn build_seek_def(
         return Ok(SeekDef {
             prefix: key,
             iter_dir,
+            repeat_for_blobs: false,
             start: SeekKey {
                 last_component: SeekKeyComponent::None,
                 op: start_op,
@@ -4716,6 +4727,7 @@ fn build_seek_def(
                 iter_dir,
                 start,
                 end,
+                repeat_for_blobs: false,
             }
         }
         IterationDirection::Backwards => {
@@ -4837,6 +4849,7 @@ fn build_seek_def(
                 iter_dir,
                 start,
                 end,
+                repeat_for_blobs: false,
             }
         }
     })

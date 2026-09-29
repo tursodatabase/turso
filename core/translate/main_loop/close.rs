@@ -697,6 +697,9 @@ pub(super) fn emit_table_read_advance(
                             is_index: false,
                         });
                     }
+                    if let Some(blob_pass) = t_ctx.meta_blob_passes[table_index] {
+                        blob_pass.emit_repeat(program);
+                    }
                 }
                 Search::InSeek { index, .. } => {
                     let meta = t_ctx.meta_in_seeks[table_index]

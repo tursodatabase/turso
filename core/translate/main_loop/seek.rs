@@ -91,6 +91,55 @@ pub(super) struct SeekEmitter<'a, 'plan> {
     loop_end: BranchOffset,
     seek_index: Option<&'a Arc<Index>>,
     is_index: bool,
+    blob_pass: Option<BlobPass>,
+}
+
+/// State for searching a LIKE or GLOB prefix range a second time with BLOB
+/// bounds. See [SeekDef::repeat_for_blobs].
+///
+/// The counter starts at 1 and [BlobPass::emit_repeat] decrements it at the
+/// end of the first search, so it is 1 during the first search and 0 during
+/// the second one.
+#[derive(Debug, Clone, Copy)]
+pub struct BlobPass {
+    counter_reg: usize,
+    blob_counter_value: bool,
+    restart: BranchOffset,
+    range_end: BranchOffset,
+}
+
+impl BlobPass {
+    /// Emit the jump back to the search for the second range. Must be emitted
+    /// right after the loop's Next or Prev instruction.
+    pub(super) fn emit_repeat(&self, program: &mut ProgramBuilder) {
+        program.preassign_label_to_next_insn(self.range_end);
+        program.emit_insn(Insn::DecrJumpZero {
+            reg: self.counter_reg,
+            target_pc: self.restart,
+        });
+    }
+
+    fn emit_cast_on_blob_pass(&self, program: &mut ProgramBuilder, reg: usize) {
+        let skip_cast = program.allocate_label();
+        if self.blob_counter_value {
+            program.emit_insn(Insn::IfNot {
+                reg: self.counter_reg,
+                target_pc: skip_cast,
+                jump_if_null: false,
+            });
+        } else {
+            program.emit_insn(Insn::If {
+                reg: self.counter_reg,
+                target_pc: skip_cast,
+                jump_if_null: false,
+            });
+        }
+        program.emit_insn(Insn::Cast {
+            reg,
+            affinity: Affinity::Blob,
+        });
+        program.preassign_label_to_next_insn(skip_cast);
+    }
 }
 
 impl<'a, 'plan> SeekEmitter<'a, 'plan> {
@@ -115,7 +164,34 @@ impl<'a, 'plan> SeekEmitter<'a, 'plan> {
             loop_end,
             seek_index,
             is_index: seek_index.is_some(),
+            blob_pass: None,
         }
+    }
+
+    /// Start the first of the two searches for a LIKE or GLOB prefix range.
+    /// Searching backwards, or forwards on a descending index column, visits
+    /// BLOB values before text, so the BLOB bounds are used first.
+    fn begin_blob_pass(&mut self) {
+        let counter_reg = self.program.alloc_register();
+        self.program.emit_insn(Insn::Integer {
+            value: 1,
+            dest: counter_reg,
+        });
+        let range_column_is_descending = self.seek_index.is_some_and(|index| {
+            index.columns[self.seek_def.prefix.len()].order == SortOrder::Desc
+        });
+        let visits_blobs_first =
+            (self.seek_def.iter_dir == IterationDirection::Backwards) != range_column_is_descending;
+        let restart = self.program.allocate_label();
+        self.program.preassign_label_to_next_insn(restart);
+        let range_end = self.program.allocate_label();
+        self.blob_pass = Some(BlobPass {
+            counter_reg,
+            blob_counter_value: visits_blobs_first,
+            restart,
+            range_end,
+        });
+        self.loop_end = range_end;
     }
 
     /// Emit the start bound and position the cursor at the first candidate row.
@@ -178,6 +254,11 @@ impl<'a, 'plan> SeekEmitter<'a, 'plan> {
                         &self.t_ctx.resolver,
                         NoConstantOptReason::RegisterReuse,
                     )?;
+                    if i == self.seek_def.prefix.len() {
+                        if let Some(blob_pass) = self.blob_pass {
+                            blob_pass.emit_cast_on_blob_pass(self.program, reg);
+                        }
+                    }
                     // A NULL key can never satisfy `=`, so the loop is done as
                     // soon as one shows up. `IS` matches NULL instead: keep the
                     // NULL in the seek register and let the index comparison
@@ -336,6 +417,9 @@ impl<'a, 'plan> SeekEmitter<'a, 'plan> {
                     &self.t_ctx.resolver,
                     NoConstantOptReason::RegisterReuse,
                 )?;
+                if let Some(blob_pass) = self.blob_pass {
+                    blob_pass.emit_cast_on_blob_pass(self.program, last_reg);
+                }
                 if let Some(idx) = self.seek_index {
                     encode_seek_keys_for_custom_types(
                         self.program,
@@ -459,8 +543,22 @@ impl<'a, 'plan> SeekEmitter<'a, 'plan> {
         Ok(())
     }
 
-    pub(super) fn emit(mut self, loop_start: BranchOffset, use_bloom_filter: bool) -> Result<()> {
+    /// Returns the [BlobPass] when the range must also be searched for BLOB
+    /// values; the caller then calls [BlobPass::emit_repeat] after the loop.
+    pub(super) fn emit(
+        mut self,
+        loop_start: BranchOffset,
+        use_bloom_filter: bool,
+    ) -> Result<Option<BlobPass>> {
+        if self.seek_def.repeat_for_blobs {
+            turso_assert!(
+                self.seek_index.is_some(),
+                "a LIKE or GLOB prefix range needs an index"
+            );
+            self.begin_blob_pass();
+        }
         self.emit_start_bound(use_bloom_filter)?;
-        self.emit_termination(loop_start)
+        self.emit_termination(loop_start)?;
+        Ok(self.blob_pass)
     }
 }
