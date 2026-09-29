@@ -3353,6 +3353,7 @@ int Tursotcl_Init(Tcl_Interp *interp)
     turso_enable_experimental();
 
     Tcl_CreateObjCommand(interp, "sqlite3", TursoOpenCmd, NULL, NULL);
+    Tcl_CreateObjCommand(interp, "sqlite", TursoOpenCmd, NULL, NULL);
     Tcl_CreateObjCommand(interp, "sqlite3_exec", TursoExecCmd, NULL, NULL);
     Tcl_CreateObjCommand(interp, "sqlite3_connection_pointer",
                          TursoConnectionPointerCmd, NULL, NULL);
