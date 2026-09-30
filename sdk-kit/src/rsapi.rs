@@ -567,7 +567,10 @@ impl TursoDatabaseConfig {
 
 fn open_flags_from_capi(flags: u32) -> Result<OpenFlags, TursoError> {
     const READONLY: u32 = c::turso_database_open_flags_t_TURSO_DATABASE_OPEN_READONLY;
-    if flags & !READONLY != 0 {
+    const READWRITE: u32 = c::turso_database_open_flags_t_TURSO_DATABASE_OPEN_READWRITE;
+    if flags & !(READONLY | READWRITE) != 0
+        || flags & (READONLY | READWRITE) == (READONLY | READWRITE)
+    {
         return Err(TursoError::Misuse(format!(
             "unknown database open flags: 0x{flags:x}"
         )));
@@ -575,6 +578,8 @@ fn open_flags_from_capi(flags: u32) -> Result<OpenFlags, TursoError> {
 
     if flags & READONLY != 0 {
         Ok(OpenFlags::ReadOnly)
+    } else if flags & READWRITE != 0 {
+        Ok(OpenFlags::None)
     } else {
         Ok(OpenFlags::default())
     }
@@ -1839,6 +1844,27 @@ mod tests {
     use turso_core::{
         LimboError, PageCodec, PageCodecContext, PageCodecHeaderInfo, PageCodecId, Value,
     };
+
+    #[test]
+    fn database_open_flags_distinguish_create_readwrite_and_readonly() {
+        assert_eq!(super::open_flags_from_capi(0).unwrap(), OpenFlags::Create);
+        assert_eq!(
+            super::open_flags_from_capi(
+                c::turso_database_open_flags_t_TURSO_DATABASE_OPEN_READWRITE
+            )
+            .unwrap(),
+            OpenFlags::None
+        );
+        assert_eq!(
+            super::open_flags_from_capi(
+                c::turso_database_open_flags_t_TURSO_DATABASE_OPEN_READONLY
+            )
+            .unwrap(),
+            OpenFlags::ReadOnly
+        );
+        assert!(super::open_flags_from_capi(4).is_err());
+        assert!(super::open_flags_from_capi(3).is_err());
+    }
 
     #[test]
     fn commit_dependency_abort_requires_transaction_retry() {

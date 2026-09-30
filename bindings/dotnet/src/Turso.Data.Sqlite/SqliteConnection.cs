@@ -170,9 +170,18 @@ public partial class SqliteConnection : DbConnection
         var sharedMemoryPath = IsSharedMemory(_connectionOptions) ? RegisterSharedMemoryFile(filename) : null;
         try
         {
-            _database = CanPool(_connectionOptions, filename, sharedMemoryPath)
+            var openMode = _connectionOptions.Mode switch
+            {
+                SqliteOpenMode.ReadWriteCreate => TursoDatabaseOpenMode.CreateIfMissing,
+                SqliteOpenMode.ReadWrite => TursoDatabaseOpenMode.ReadWrite,
+                SqliteOpenMode.ReadOnly => TursoDatabaseOpenMode.ReadOnly,
+                SqliteOpenMode.Memory => TursoDatabaseOpenMode.CreateIfMissing,
+                _ => throw new ArgumentOutOfRangeException(),
+            };
+            _database = openMode == TursoDatabaseOpenMode.CreateIfMissing
+                && CanPool(_connectionOptions, filename, sharedMemoryPath)
                 ? SqliteDatabasePool.Connect(filename)
-                : TursoBindings.OpenDatabase(filename);
+                : TursoBindings.OpenDatabase(filename, openMode);
             _dataSource = filename;
             _readOnly = readOnly;
             _sharedMemoryPath = sharedMemoryPath;

@@ -10,7 +10,7 @@ public static class TursoBindings
     public static TursoDatabaseHandle OpenDatabase(string path)
     {
         ArgumentNullException.ThrowIfNull(path);
-        return OpenDatabase(path, cipher: null, hexkey: null);
+        return OpenDatabase(path, cipher: null, hexkey: null, TursoDatabaseOpenMode.CreateIfMissing);
     }
 
     /// <summary>
@@ -25,7 +25,13 @@ public static class TursoBindings
         ArgumentNullException.ThrowIfNull(path);
         ArgumentNullException.ThrowIfNull(hexkey);
 
-        return OpenDatabase(path, cipher.ToRustString(), hexkey);
+        return OpenDatabase(path, cipher.ToRustString(), hexkey, TursoDatabaseOpenMode.CreateIfMissing);
+    }
+
+    public static TursoDatabaseHandle OpenDatabase(string path, TursoDatabaseOpenMode mode)
+    {
+        ArgumentNullException.ThrowIfNull(path);
+        return OpenDatabase(path, cipher: null, hexkey: null, mode);
     }
 
     /// <summary>
@@ -352,7 +358,11 @@ public static class TursoBindings
         }
     }
 
-    private static TursoDatabaseHandle OpenDatabase(string path, string? cipher, string? hexkey)
+    private static TursoDatabaseHandle OpenDatabase(
+        string path,
+        string? cipher,
+        string? hexkey,
+        TursoDatabaseOpenMode mode)
     {
         var databasePtr = NewOpenedDatabase(path, cipher, hexkey);
         var connectionPtr = IntPtr.Zero;
@@ -388,7 +398,13 @@ public static class TursoBindings
             EncryptionCipher = cipherString.Pointer,
             EncryptionHexKey = hexkeyString.Pointer,
             PageCodec = IntPtr.Zero,
-            OpenFlags = 0,
+            OpenFlags = mode switch
+            {
+                TursoDatabaseOpenMode.CreateIfMissing => TursoInterop.DatabaseOpenDefault,
+                TursoDatabaseOpenMode.ReadWrite => TursoInterop.DatabaseOpenReadWrite,
+                TursoDatabaseOpenMode.ReadOnly => TursoInterop.DatabaseOpenReadOnly,
+                _ => throw new ArgumentOutOfRangeException(nameof(mode)),
+            },
         };
 
         var status = TursoInterop.DatabaseNew(ref config, out var databasePtr, out var errorPtr);

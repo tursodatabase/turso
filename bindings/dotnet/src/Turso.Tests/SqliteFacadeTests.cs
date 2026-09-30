@@ -451,6 +451,35 @@ public class SqliteFacadeTests
     }
 
     [Test]
+    public void OpenModeReadWriteRequiresExistingDatabase()
+    {
+        using var directory = new TemporaryDirectory();
+        var path = Path.Combine(directory.Path, "missing.db");
+        using var connection = new SqliteConnection($"Data Source={path};Mode=ReadWrite");
+
+        var exception = Assert.Throws<SqliteException>(connection.Open);
+
+        exception.SqliteErrorCode.Should().Be(14);
+        File.Exists(path).Should().BeFalse();
+    }
+
+    [Test]
+    public void OpenModeReadWriteOpensExistingDatabaseForWrites()
+    {
+        using var directory = new TemporaryDirectory();
+        var path = Path.Combine(directory.Path, "existing.db");
+        using (var create = new SqliteConnection($"Data Source={path}"))
+        {
+            create.Open();
+            create.ExecuteNonQuery("CREATE TABLE Data(Value);");
+        }
+
+        using var connection = new SqliteConnection($"Data Source={path};Mode=ReadWrite");
+        connection.Open();
+        connection.ExecuteNonQuery("INSERT INTO Data VALUES (1);").Should().Be(1);
+    }
+
+    [Test]
     public void SharedMemoryConnectionsUseSameBackingStore()
     {
         var connectionString = "Data Source=turso-shared-test;Mode=Memory;Cache=Shared";
