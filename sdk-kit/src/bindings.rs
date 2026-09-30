@@ -312,6 +312,7 @@ pub const turso_codec_location_t_TURSO_CODEC_LOCATION_WAL: turso_codec_location_
 pub type turso_codec_location_t = ::std::os::raw::c_uint;
 pub const turso_database_open_flags_t_TURSO_DATABASE_OPEN_DEFAULT: turso_database_open_flags_t = 0;
 pub const turso_database_open_flags_t_TURSO_DATABASE_OPEN_READONLY: turso_database_open_flags_t = 1;
+pub const turso_database_open_flags_t_TURSO_DATABASE_OPEN_READWRITE: turso_database_open_flags_t = 2;
 pub type turso_database_open_flags_t = ::std::os::raw::c_uint;
 #[repr(C)]
 #[derive(Debug, Default, Copy, Clone)]

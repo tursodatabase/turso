@@ -14,6 +14,10 @@ Application code only needs to install `Turso.Data.Sqlite.Provider` and referenc
 
 The package targets `net8.0`, `net9.0`, and `net10.0`. Its `Turso.Data.Native` dependency supplies native runtime assets for Windows, Linux, macOS, Android (`android-arm64`, `android-arm`, `android-x64`, and `android-x86`), and iOS as an XCFramework with device and simulator slices.
 
+For local `Turso.Data.Sqlite` connections, `Mode=ReadWriteCreate` remains the default and creates a missing database. `Mode=ReadWrite` now opens an existing database for writing without creating it, while `Mode=ReadOnly` opens an existing database read-only. Missing-file checks remain enforced by the managed facade and the native SDK.
+
+The dynamic package matrix is `win-x64`, `win-arm64`, `linux-x64`, `linux-arm64`, `osx-x64`, `osx-arm64`, `android-arm64`, `android-arm`, `android-x64`, `android-x86`, and the `ios-universal` XCFramework. Release packaging verifies every listed asset, package contents, size limits, exported sync symbols, and the six NativeAOT static packages in `.github/workflows/dotnet-publish.yml`.
+
 ## NativeAOT static linking
 
 NativeAOT apps can opt into statically linking the Turso native library so publish output does not include a sidecar `turso_sdk_kit` DLL, `.so`, or `.dylib`. Reference the neutral RID-specific static package alongside `Turso.Data.Sqlite.Provider`:
