@@ -21623,9 +21623,9 @@ fn test_checkpoint_seek_skip_divider_reinsert_loses_row() {
 /// Regression test for https://github.com/tursodatabase/turso/issues/7477.
 ///
 /// A large committed DELETE whose commit statement is dropped mid-flight
-/// (after `LogRecordPrepared`, before finishing tombstone TxID rewriting)
-/// must not leave tombstones pointing at the removed TxID; otherwise a
-/// later writer panics with
+/// (after its log record is owned, before finishing tombstone TxID
+/// rewriting) must not leave tombstones pointing at the removed TxID;
+/// otherwise a later writer panics with
 /// "check_version_conflicts: tombstone end TxID not found in txn map".
 #[test]
 fn mvcc_bug_repro_dropped_committed_delete_rewrites_all_tombstone_txids() {
@@ -21653,18 +21653,17 @@ fn mvcc_bug_repro_dropped_committed_delete_rewrites_all_tombstone_txids() {
     conn_a.execute("BEGIN CONCURRENT").unwrap();
     conn_a.execute("DELETE FROM t").unwrap();
 
-    let log_record_prepared =
-        FixedYieldInjector::new([CommitYieldPoint::LogRecordPrepared.point()]);
-    conn_a.set_yield_injector(Some(log_record_prepared.clone()));
+    let log_owned = FixedYieldInjector::new([CommitYieldPoint::LogRecordMarkedWritten.point()]);
+    conn_a.set_yield_injector(Some(log_owned.clone()));
 
     let mut commit_a = conn_a.prepare("COMMIT").unwrap();
 
     for _ in 0..10_000 {
         match commit_a.step().unwrap() {
-            StepResult::IO | StepResult::Yield if log_record_prepared.is_empty() => break,
+            StepResult::IO | StepResult::Yield if log_owned.is_empty() => break,
             StepResult::IO | StepResult::Yield => {}
-            StepResult::Done => panic!("COMMIT completed before LogRecordPrepared yielded"),
-            other => panic!("unexpected COMMIT result before LogRecordPrepared: {other:?}"),
+            StepResult::Done => panic!("COMMIT completed before LogRecordMarkedWritten yielded"),
+            other => panic!("unexpected COMMIT result before LogRecordMarkedWritten: {other:?}"),
         }
     }
 
@@ -21673,7 +21672,7 @@ fn mvcc_bug_repro_dropped_committed_delete_rewrites_all_tombstone_txids() {
     match commit_a.step().unwrap() {
         StepResult::IO | StepResult::Yield => {}
         StepResult::Done => panic!("COMMIT completed before RewriteLiveVersions yielded"),
-        other => panic!("unexpected COMMIT result after LogRecordPrepared: {other:?}"),
+        other => panic!("unexpected COMMIT result after LogRecordMarkedWritten: {other:?}"),
     }
 
     drop(commit_a);
