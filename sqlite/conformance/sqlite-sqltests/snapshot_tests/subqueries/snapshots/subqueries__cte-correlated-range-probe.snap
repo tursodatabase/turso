@@ -28,9 +28,10 @@ info:
   database: ':memory:'
 ---
 QUERY PLAN
-|--SCAN sample_points
-|--USE HASH TABLE FOR DISTINCT
-|--USE SORTER FOR ORDER BY
+|--MATERIALIZE ordered_points
+|  |--SCAN sample_points
+|  |--USE HASH TABLE FOR DISTINCT
+|  `--USE SORTER FOR ORDER BY
 `--SCAN previous_points
    |--SCAN ordered_points AS p1
    `--CORRELATED SCALAR SUBQUERY 1

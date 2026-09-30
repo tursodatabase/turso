@@ -1393,6 +1393,17 @@ impl ProgramBuilder {
         name: &str,
         emit: impl FnOnce(&mut Self) -> Result<T>,
     ) -> Result<T> {
+        let is_eqp = self.mode.is_explain_query_plan();
+        if is_eqp {
+            crate::emit_explain!(
+                self,
+                true,
+                EqpDetail::CteMaterialize {
+                    name: name.to_string()
+                }
+            );
+        }
+        let wrapper_idx = is_eqp.then(|| self.insns.len() - 1);
         let insns_start = self.insns.len();
         let emitted = emit(self)?;
         if self.mode.is_explain_query_plan() {
@@ -1407,6 +1418,9 @@ impl ProgramBuilder {
                         name: name.to_string(),
                         node_ids,
                     });
+            }
+            if wrapper_idx.is_some() {
+                self.pop_current_parent_explain();
             }
         }
         Ok(emitted)
