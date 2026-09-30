@@ -1,0 +1,22 @@
+@database :memory:
+
+# Regression test for float literals in PRAGMA query_only assignment.
+# Should not panic and should coerce non-zero to true, zero to false.
+
+test pragma-query-only-float-enable {
+    PRAGMA query_only = 0;
+    PRAGMA query_only = 1.5;
+    PRAGMA query_only;
+}
+expect {
+    1
+}
+
+test pragma-query-only-float-disable {
+    PRAGMA query_only = 1;
+    PRAGMA query_only = 0.0;
+    PRAGMA query_only;
+}
+expect {
+    0
+}

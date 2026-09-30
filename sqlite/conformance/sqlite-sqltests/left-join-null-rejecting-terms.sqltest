@@ -1,0 +1,55 @@
+@database :memory:
+
+# A LEFT JOIN may only be rewritten to an inner join when the WHERE clause
+# rejects the join's null-extended rows — i.e. the term can never be TRUE when
+# every column of the right table is NULL. A NULL test hidden inside a bigger
+# expression breaks that rule: `(b.x IS NULL) = 1` is TRUE on the
+# null-extended row, so the rewrite would wrongly delete it.
+
+test left-join-survives-a-nested-null-test-in-where {
+    CREATE TABLE a(x);
+    CREATE TABLE b(x);
+    INSERT INTO a VALUES (1);
+    INSERT INTO b VALUES (2);
+    SELECT count(*) FROM a LEFT JOIN b ON a.x = b.x WHERE (b.x IS NULL) = 1;
+}
+expect {
+    1
+}
+
+test left-join-survives-a-nested-null-test-under-not {
+    CREATE TABLE c(x);
+    CREATE TABLE d(x);
+    INSERT INTO c VALUES (1);
+    INSERT INTO d VALUES (2);
+    SELECT count(*) FROM c LEFT JOIN d ON c.x = d.x WHERE NOT (d.x IS NOT NULL);
+}
+expect {
+    1
+}
+
+test left-join-survives-a-case-term-in-where {
+    CREATE TABLE e(x);
+    CREATE TABLE f(x);
+    INSERT INTO e VALUES (1);
+    INSERT INTO f VALUES (2);
+    SELECT count(*) FROM e LEFT JOIN f ON e.x = f.x
+    WHERE CASE WHEN f.x > 5 THEN f.x ELSE 1 END > 0;
+}
+expect {
+    1
+}
+
+# The other direction: a null-rejecting OR of terms on the right table must
+# still filter correctly (whether or not the join is rewritten to inner).
+
+test left-join-where-or-terms-filter-null-extended-rows {
+    CREATE TABLE g(id);
+    CREATE TABLE h(id, v, w);
+    INSERT INTO g VALUES (1), (2);
+    INSERT INTO h VALUES (1, 5, 0);
+    SELECT g.id FROM g LEFT JOIN h ON g.id = h.id WHERE h.v = 5 OR h.w = 7;
+}
+expect {
+    1
+}

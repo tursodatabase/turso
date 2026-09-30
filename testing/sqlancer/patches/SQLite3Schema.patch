@@ -1,0 +1,24 @@
+--- a/src/sqlancer/sqlite3/schema/SQLite3Schema.java
++++ b/src/sqlancer/sqlite3/schema/SQLite3Schema.java
+@@ -274,8 +274,8 @@ public class SQLite3Schema extends AbstractSchema<SQLite3GlobalState, SQLite3Tab
+         SQLConnection con = globalState.getConnection();
+
+         try (Statement s = con.createStatement()) {
+-            try (ResultSet rs = s.executeQuery("SELECT name, type as category, sql FROM sqlite_master UNION "
+-                    + "SELECT name, 'temp_table' as category, sql FROM sqlite_temp_master WHERE type='table' UNION SELECT name, 'view' as category, sql FROM sqlite_temp_master WHERE type='view' GROUP BY name;")) {
++            // Modified for Limbo: removed sqlite_temp_master queries (temp tables not supported)
++            try (ResultSet rs = s.executeQuery("SELECT name, type as category, sql FROM sqlite_master GROUP BY name;")) {
+                 while (rs.next()) {
+                     String tableName = rs.getString("name");
+                     String tableType = rs.getString("category");
+@@ -322,7 +322,8 @@ public class SQLite3Schema extends AbstractSchema<SQLite3GlobalState, SQLite3Tab
+             } catch (SQLException e) {
+                 // ignore
+             }
+-            try (ResultSet rs = s.executeQuery(
+-                    "SELECT name FROM SQLite_master WHERE type = 'index' UNION SELECT name FROM sqlite_temp_master WHERE type='index'")) {
++            // Modified for Limbo: removed sqlite_temp_master query
++            try (ResultSet rs = s.executeQuery("SELECT name FROM SQLite_master WHERE type = 'index'")) {
+                 while (rs.next()) {
+                     String name = rs.getString(1);
+                     if (name.contains("_autoindex")) {

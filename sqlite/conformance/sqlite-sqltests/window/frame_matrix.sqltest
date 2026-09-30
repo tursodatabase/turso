@@ -1,0 +1,68 @@
+@database :memory:
+
+# Cross-product coverage of the window-frame matrix: every frame mode and
+# bound combination (legal and illegal — rejected shapes must error in both
+# engines), every EXCLUDE variant, over data with peer groups, a NULL key
+# and a second partition. Each expansion is verified differentially against
+# the bundled SQLite oracle at run time. The aggregated column is the ORDER
+# BY key itself, so rows tied in the ORDER BY are indistinguishable and tie
+# order cannot make the output nondeterministic.
+
+setup shapes {
+    CREATE TABLE t(p INT, k INT);
+    INSERT INTO t VALUES (1,NULL),(1,1),(1,1),(1,3),(1,4),(1,4),(2,7);
+}
+
+@setup shapes
+@var mode { ROWS | GROUPS | RANGE }
+@var start { UNBOUNDED PRECEDING | 2 PRECEDING | 1 PRECEDING | 0 PRECEDING | CURRENT ROW | 0 FOLLOWING | 1 FOLLOWING }
+@var end { 2 PRECEDING | 1 PRECEDING | CURRENT ROW | 0 FOLLOWING | 1 FOLLOWING | UNBOUNDED FOLLOWING }
+@var exclude { | EXCLUDE NO OTHERS | EXCLUDE CURRENT ROW | EXCLUDE GROUP | EXCLUDE TIES }
+matrix frame-asc {
+    SELECT p, k, sum(k) OVER w, count(*) OVER w, min(k) OVER w, max(k) OVER w,
+           group_concat(k,',') OVER w, first_value(k) OVER w, last_value(k) OVER w,
+           nth_value(k,2) OVER w
+    FROM t
+    WINDOW w AS (PARTITION BY p ORDER BY k $mode BETWEEN $start AND $end $exclude)
+    ORDER BY p, k;
+}
+
+# Aggregating a NON-key column with the outer ORDER BY referencing the
+# window value: the window function must be shared (not duplicated into a
+# second window layer) and its rewritten argument must stay resolvable.
+# Only order-insensitive functions are used — the k=1 peer group has two
+# distinct v values, so peer-tie visit order must not affect output.
+setup shapes3 {
+    CREATE TABLE t3(p INT, k INT, v TEXT);
+    INSERT INTO t3 VALUES (1,NULL,'q'),(1,1,'m'),(1,1,'c'),(1,3,'z'),(1,4,'a'),(2,7,'k');
+}
+
+@setup shapes3
+@var fn { min | max | count }
+@var mode { ROWS | GROUPS | RANGE }
+@var start { UNBOUNDED PRECEDING | 1 PRECEDING | CURRENT ROW | 1 FOLLOWING }
+@var end { CURRENT ROW | 1 FOLLOWING | UNBOUNDED FOLLOWING }
+@var exclude { | EXCLUDE TIES }
+matrix frame-nonkey-ordered-by-window-value {
+    SELECT p, k, $fn(v) OVER w AS wv
+    FROM t3
+    WINDOW w AS (PARTITION BY p ORDER BY k $mode BETWEEN $start AND $end $exclude)
+    ORDER BY wv, p, k;
+}
+
+# DESC plus explicit NULLS placement: the frame-boundary peer logic and the
+# EXCLUDE filters must follow the reversed ordering, with the NULL key
+# forming its own peer group at either end.
+@setup shapes
+@var mode { ROWS | GROUPS | RANGE }
+@var start { UNBOUNDED PRECEDING | 1 PRECEDING | CURRENT ROW }
+@var end { CURRENT ROW | 1 FOLLOWING | UNBOUNDED FOLLOWING }
+@var nulls { NULLS FIRST | NULLS LAST }
+@var exclude { | EXCLUDE TIES }
+matrix frame-desc-nulls {
+    SELECT p, k, sum(k) OVER w, count(*) OVER w, group_concat(k,',') OVER w,
+           first_value(k) OVER w, last_value(k) OVER w
+    FROM t
+    WINDOW w AS (PARTITION BY p ORDER BY k DESC $nulls $mode BETWEEN $start AND $end $exclude)
+    ORDER BY p, k DESC $nulls;
+}

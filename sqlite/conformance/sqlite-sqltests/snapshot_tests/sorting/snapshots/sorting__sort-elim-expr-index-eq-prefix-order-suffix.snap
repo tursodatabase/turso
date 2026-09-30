@@ -1,0 +1,17 @@
+---
+source: sorting.sqltest
+expression: |-
+  SELECT id, lower(title), score
+      FROM expr_articles
+      WHERE status = 'active'
+      ORDER BY lower(title), score DESC;
+info:
+  statement_type: SELECT
+  tables:
+  - expr_articles
+  setup_blocks:
+  - expr_sort_elim
+  database: ':memory:'
+---
+QUERY PLAN
+`--SEARCH expr_articles USING INDEX idx_expr_articles (status=?)

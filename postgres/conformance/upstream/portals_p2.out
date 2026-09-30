@@ -1,0 +1,122 @@
+--
+-- PORTALS_P2
+--
+BEGIN;
+DECLARE foo13 CURSOR FOR
+   SELECT * FROM onek WHERE unique1 = 50;
+DECLARE foo14 CURSOR FOR
+   SELECT * FROM onek WHERE unique1 = 51;
+DECLARE foo15 CURSOR FOR
+   SELECT * FROM onek WHERE unique1 = 52;
+DECLARE foo16 CURSOR FOR
+   SELECT * FROM onek WHERE unique1 = 53;
+DECLARE foo17 CURSOR FOR
+   SELECT * FROM onek WHERE unique1 = 54;
+DECLARE foo18 CURSOR FOR
+   SELECT * FROM onek WHERE unique1 = 55;
+DECLARE foo19 CURSOR FOR
+   SELECT * FROM onek WHERE unique1 = 56;
+DECLARE foo20 CURSOR FOR
+   SELECT * FROM onek WHERE unique1 = 57;
+DECLARE foo21 CURSOR FOR
+   SELECT * FROM onek WHERE unique1 = 58;
+DECLARE foo22 CURSOR FOR
+   SELECT * FROM onek WHERE unique1 = 59;
+DECLARE foo23 CURSOR FOR
+   SELECT * FROM onek WHERE unique1 = 60;
+DECLARE foo24 CURSOR FOR
+   SELECT * FROM onek2 WHERE unique1 = 50;
+DECLARE foo25 CURSOR FOR
+   SELECT * FROM onek2 WHERE unique1 = 60;
+FETCH all in foo13;
+ unique1 | unique2 | two | four | ten | twenty | hundred | thousand | twothousand | fivethous | tenthous | odd | even | stringu1 | stringu2 | string4 
+---------+---------+-----+------+-----+--------+---------+----------+-------------+-----------+----------+-----+------+----------+----------+---------
+      50 |     253 |   0 |    2 |   0 |     10 |       0 |       50 |          50 |        50 |       50 |   0 |    1 | YBAAAA   | TJAAAA   | HHHHxx
+(1 row)
+
+FETCH all in foo14;
+ unique1 | unique2 | two | four | ten | twenty | hundred | thousand | twothousand | fivethous | tenthous | odd | even | stringu1 | stringu2 | string4 
+---------+---------+-----+------+-----+--------+---------+----------+-------------+-----------+----------+-----+------+----------+----------+---------
+      51 |      76 |   1 |    3 |   1 |     11 |       1 |       51 |          51 |        51 |       51 |   2 |    3 | ZBAAAA   | YCAAAA   | AAAAxx
+(1 row)
+
+FETCH all in foo15;
+ unique1 | unique2 | two | four | ten | twenty | hundred | thousand | twothousand | fivethous | tenthous | odd | even | stringu1 | stringu2 | string4 
+---------+---------+-----+------+-----+--------+---------+----------+-------------+-----------+----------+-----+------+----------+----------+---------
+      52 |     985 |   0 |    0 |   2 |     12 |       2 |       52 |          52 |        52 |       52 |   4 |    5 | ACAAAA   | XLBAAA   | HHHHxx
+(1 row)
+
+FETCH all in foo16;
+ unique1 | unique2 | two | four | ten | twenty | hundred | thousand | twothousand | fivethous | tenthous | odd | even | stringu1 | stringu2 | string4 
+---------+---------+-----+------+-----+--------+---------+----------+-------------+-----------+----------+-----+------+----------+----------+---------
+      53 |     196 |   1 |    1 |   3 |     13 |       3 |       53 |          53 |        53 |       53 |   6 |    7 | BCAAAA   | OHAAAA   | AAAAxx
+(1 row)
+
+FETCH all in foo17;
+ unique1 | unique2 | two | four | ten | twenty | hundred | thousand | twothousand | fivethous | tenthous | odd | even | stringu1 | stringu2 | string4 
+---------+---------+-----+------+-----+--------+---------+----------+-------------+-----------+----------+-----+------+----------+----------+---------
+      54 |     356 |   0 |    2 |   4 |     14 |       4 |       54 |          54 |        54 |       54 |   8 |    9 | CCAAAA   | SNAAAA   | AAAAxx
+(1 row)
+
+FETCH all in foo18;
+ unique1 | unique2 | two | four | ten | twenty | hundred | thousand | twothousand | fivethous | tenthous | odd | even | stringu1 | stringu2 | string4 
+---------+---------+-----+------+-----+--------+---------+----------+-------------+-----------+----------+-----+------+----------+----------+---------
+      55 |     627 |   1 |    3 |   5 |     15 |       5 |       55 |          55 |        55 |       55 |  10 |   11 | DCAAAA   | DYAAAA   | VVVVxx
+(1 row)
+
+FETCH all in foo19;
+ unique1 | unique2 | two | four | ten | twenty | hundred | thousand | twothousand | fivethous | tenthous | odd | even | stringu1 | stringu2 | string4 
+---------+---------+-----+------+-----+--------+---------+----------+-------------+-----------+----------+-----+------+----------+----------+---------
+      56 |      54 |   0 |    0 |   6 |     16 |       6 |       56 |          56 |        56 |       56 |  12 |   13 | ECAAAA   | CCAAAA   | OOOOxx
+(1 row)
+
+FETCH all in foo20;
+ unique1 | unique2 | two | four | ten | twenty | hundred | thousand | twothousand | fivethous | tenthous | odd | even | stringu1 | stringu2 | string4 
+---------+---------+-----+------+-----+--------+---------+----------+-------------+-----------+----------+-----+------+----------+----------+---------
+      57 |     942 |   1 |    1 |   7 |     17 |       7 |       57 |          57 |        57 |       57 |  14 |   15 | FCAAAA   | GKBAAA   | OOOOxx
+(1 row)
+
+FETCH all in foo21;
+ unique1 | unique2 | two | four | ten | twenty | hundred | thousand | twothousand | fivethous | tenthous | odd | even | stringu1 | stringu2 | string4 
+---------+---------+-----+------+-----+--------+---------+----------+-------------+-----------+----------+-----+------+----------+----------+---------
+      58 |     114 |   0 |    2 |   8 |     18 |       8 |       58 |          58 |        58 |       58 |  16 |   17 | GCAAAA   | KEAAAA   | OOOOxx
+(1 row)
+
+FETCH all in foo22;
+ unique1 | unique2 | two | four | ten | twenty | hundred | thousand | twothousand | fivethous | tenthous | odd | even | stringu1 | stringu2 | string4 
+---------+---------+-----+------+-----+--------+---------+----------+-------------+-----------+----------+-----+------+----------+----------+---------
+      59 |     593 |   1 |    3 |   9 |     19 |       9 |       59 |          59 |        59 |       59 |  18 |   19 | HCAAAA   | VWAAAA   | HHHHxx
+(1 row)
+
+FETCH all in foo23;
+ unique1 | unique2 | two | four | ten | twenty | hundred | thousand | twothousand | fivethous | tenthous | odd | even | stringu1 | stringu2 | string4 
+---------+---------+-----+------+-----+--------+---------+----------+-------------+-----------+----------+-----+------+----------+----------+---------
+      60 |     483 |   0 |    0 |   0 |      0 |       0 |       60 |          60 |        60 |       60 |   0 |    1 | ICAAAA   | PSAAAA   | VVVVxx
+(1 row)
+
+FETCH all in foo24;
+ unique1 | unique2 | two | four | ten | twenty | hundred | thousand | twothousand | fivethous | tenthous | odd | even | stringu1 | stringu2 | string4 
+---------+---------+-----+------+-----+--------+---------+----------+-------------+-----------+----------+-----+------+----------+----------+---------
+      50 |     253 |   0 |    2 |   0 |     10 |       0 |       50 |          50 |        50 |       50 |   0 |    1 | YBAAAA   | TJAAAA   | HHHHxx
+(1 row)
+
+FETCH all in foo25;
+ unique1 | unique2 | two | four | ten | twenty | hundred | thousand | twothousand | fivethous | tenthous | odd | even | stringu1 | stringu2 | string4 
+---------+---------+-----+------+-----+--------+---------+----------+-------------+-----------+----------+-----+------+----------+----------+---------
+      60 |     483 |   0 |    0 |   0 |      0 |       0 |       60 |          60 |        60 |       60 |   0 |    1 | ICAAAA   | PSAAAA   | VVVVxx
+(1 row)
+
+CLOSE foo13;
+CLOSE foo14;
+CLOSE foo15;
+CLOSE foo16;
+CLOSE foo17;
+CLOSE foo18;
+CLOSE foo19;
+CLOSE foo20;
+CLOSE foo21;
+CLOSE foo22;
+CLOSE foo23;
+CLOSE foo24;
+CLOSE foo25;
+END;

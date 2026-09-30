@@ -1,0 +1,202 @@
+# 2015-10-06
+#
+# The author disclaims copyright to this source code.  In place of
+# a legal notice, here is a blessing:
+#
+#    May you do good and not evil.
+#    May you find forgiveness for yourself and forgive others.
+#    May you share freely, never taking more than you give.
+#
+#***********************************************************************
+# 
+# This file implements test cases for the [b65cb2c8d91f6685841d7d1e13b6]
+# bug:  Correct handling of LIMIT and OFFSET on a UNION ALL query where
+# the right-hand SELECT contains an ORDER BY in a subquery.
+#
+
+set testdir [file dirname $argv0]
+source $testdir/tester.tcl
+
+ifcapable !compound {
+  finish_test
+  return
+}
+
+do_execsql_test offset1-1.1 {
+  CREATE TABLE t1(a,b);
+  INSERT INTO t1 VALUES(1,'a'),(2,'b'),(3,'c'),(4,'d'),(5,'e');
+  CREATE TABLE t2(x,y);
+  INSERT INTO t2 VALUES(8,'y'),(9,'z'),(6,'w'),(7,'x');
+  SELECT count(*) FROM t1, t2;
+} {20}
+
+do_execsql_test offset1-1.2.0 {
+  SELECT a, b FROM t1
+  UNION ALL
+  SELECT * FROM (SELECT x, y FROM t2 ORDER BY y)
+  LIMIT 3 OFFSET 0;
+} {1 a 2 b 3 c}
+do_execsql_test offset1-1.2.1 {
+  SELECT a, b FROM t1
+  UNION ALL
+  SELECT * FROM (SELECT x, y FROM t2 ORDER BY y)
+  LIMIT 3 OFFSET 1;
+} {2 b 3 c 4 d}
+do_execsql_test offset1-1.2.2 {
+  SELECT a, b FROM t1
+  UNION ALL
+  SELECT * FROM (SELECT x, y FROM t2 ORDER BY y)
+  LIMIT 3 OFFSET 2;
+} {3 c 4 d 5 e}
+do_execsql_test offset1-1.2.3 {
+  SELECT a, b FROM t1
+  UNION ALL
+  SELECT * FROM (SELECT x, y FROM t2 ORDER BY y)
+  LIMIT 3 OFFSET 3;
+} {4 d 5 e 6 w}
+do_execsql_test offset1-1.2.4 {
+  SELECT a, b FROM t1
+  UNION ALL
+  SELECT * FROM (SELECT x, y FROM t2 ORDER BY y)
+  LIMIT 3 OFFSET 4;
+} {5 e 6 w 7 x}
+do_execsql_test offset1-1.2.5 {
+  SELECT a, b FROM t1
+  UNION ALL
+  SELECT * FROM (SELECT x, y FROM t2 ORDER BY y)
+  LIMIT 3 OFFSET 5;
+} {6 w 7 x 8 y}
+do_execsql_test offset1-1.2.6 {
+  SELECT a, b FROM t1
+  UNION ALL
+  SELECT * FROM (SELECT x, y FROM t2 ORDER BY y)
+  LIMIT 3 OFFSET 6;
+} {7 x 8 y 9 z}
+do_execsql_test offset1-1.2.7 {
+  SELECT a, b FROM t1
+  UNION ALL
+  SELECT * FROM (SELECT x, y FROM t2 ORDER BY y)
+  LIMIT 3 OFFSET 7;
+} {8 y 9 z}
+do_execsql_test offset1-1.2.8 {
+  SELECT a, b FROM t1
+  UNION ALL
+  SELECT * FROM (SELECT x, y FROM t2 ORDER BY y)
+  LIMIT 3 OFFSET 8;
+} {9 z}
+do_execsql_test offset1-1.2.9 {
+  SELECT a, b FROM t1
+  UNION ALL
+  SELECT * FROM (SELECT x, y FROM t2 ORDER BY y)
+  LIMIT 3 OFFSET 9;
+} {}
+
+do_execsql_test offset1-1.3.0 {
+  SELECT * FROM t1 LIMIT 0;
+} {}
+
+do_execsql_test offset1-1.4.0 {
+  SELECT a, b FROM t1
+  UNION ALL
+  SELECT * FROM (SELECT x, y FROM t2 ORDER BY y)
+  LIMIT 0 OFFSET 1;
+} {}
+do_execsql_test offset1-1.4.1 {
+  SELECT a, b FROM t1
+  UNION ALL
+  SELECT * FROM (SELECT x, y FROM t2 ORDER BY y)
+  LIMIT 1 OFFSET 1;
+} {2 b}
+do_execsql_test offset1-1.4.2 {
+  SELECT a, b FROM t1
+  UNION ALL
+  SELECT * FROM (SELECT x, y FROM t2 ORDER BY y)
+  LIMIT 2 OFFSET 1;
+} {2 b 3 c}
+do_execsql_test offset1-1.4.3 {
+  SELECT a, b FROM t1
+  UNION ALL
+  SELECT * FROM (SELECT x, y FROM t2 ORDER BY y)
+  LIMIT 3 OFFSET 1;
+} {2 b 3 c 4 d}
+do_execsql_test offset1-1.4.4 {
+  SELECT a, b FROM t1
+  UNION ALL
+  SELECT * FROM (SELECT x, y FROM t2 ORDER BY y)
+  LIMIT 4 OFFSET 1;
+} {2 b 3 c 4 d 5 e}
+do_execsql_test offset1-1.4.5 {
+  SELECT a, b FROM t1
+  UNION ALL
+  SELECT * FROM (SELECT x, y FROM t2 ORDER BY y)
+  LIMIT 5 OFFSET 1;
+} {2 b 3 c 4 d 5 e 6 w}
+do_execsql_test offset1-1.4.6 {
+  SELECT a, b FROM t1
+  UNION ALL
+  SELECT * FROM (SELECT x, y FROM t2 ORDER BY y)
+  LIMIT 6 OFFSET 1;
+} {2 b 3 c 4 d 5 e 6 w 7 x}
+do_execsql_test offset1-1.4.7 {
+  SELECT a, b FROM t1
+  UNION ALL
+  SELECT * FROM (SELECT x, y FROM t2 ORDER BY y)
+  LIMIT 7 OFFSET 1;
+} {2 b 3 c 4 d 5 e 6 w 7 x 8 y}
+do_execsql_test offset1-1.4.8 {
+  SELECT a, b FROM t1
+  UNION ALL
+  SELECT * FROM (SELECT x, y FROM t2 ORDER BY y)
+  LIMIT 8 OFFSET 1;
+} {2 b 3 c 4 d 5 e 6 w 7 x 8 y 9 z}
+do_execsql_test offset1-1.4.9 {
+  SELECT a, b FROM t1
+  UNION ALL
+  SELECT * FROM (SELECT x, y FROM t2 ORDER BY y)
+  LIMIT 9 OFFSET 1;
+} {2 b 3 c 4 d 5 e 6 w 7 x 8 y 9 z}
+
+# 2022-08-04
+# https://sqlite.org/forum/forumpost/6b5e9188f0657616
+#
+do_execsql_test offset1-2.0 {
+  CREATE TABLE employees (
+    id integer primary key,
+    name text,
+    city text,
+    department text,
+    salary integer
+  );
+  INSERT INTO employees VALUES
+    (11,'Diane','London','hr',70),
+    (12,'Bob','London','hr',78),
+    (21,'Emma','London','it',84),
+    (22,'Grace','Berlin','it',90),
+    (23,'Henry','London','it',104),
+    (24,'Irene','Berlin','it',104),
+    (25,'Frank','Berlin','it',120),
+    (31,'Cindy','Berlin','sales',96),
+    (32,'Dave','London','sales',96),
+    (33,'Alice','Berlin','sales',100);
+  CREATE VIEW v AS
+    SELECT * FROM (
+      SELECT * FROM employees 
+       WHERE salary < 100
+       ORDER BY salary desc)
+     UNION ALL 
+     SELECT * FROM (
+       SELECT * FROM employees
+       WHERE salary >= 100
+       ORDER BY salary asc);
+} {}
+do_execsql_test offset1-2.1 {
+  SELECT * FROM v LIMIT 5 OFFSET 2;
+} {
+  22  Grace  Berlin  it      90
+  21  Emma   London  it      84
+  12  Bob    London  hr      78
+  11  Diane  London  hr      70
+  33  Alice  Berlin  sales   100
+}
+
+finish_test

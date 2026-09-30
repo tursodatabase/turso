@@ -1,0 +1,20 @@
+---
+source: subquery-sort-elision.sqltest
+expression: |-
+  WITH grouped AS (
+          SELECT y, COUNT(*) AS cnt FROM t1 GROUP BY y
+      )
+      SELECT * FROM grouped ORDER BY y;
+info:
+  statement_type: WITH (CTE)
+  tables:
+  - grouped
+  - t1
+  setup_blocks:
+  - elision_schema
+  database: ':memory:'
+---
+QUERY PLAN
+`--SCAN grouped
+   |--SCAN t1
+   `--USE SORTER FOR GROUP BY

@@ -1,0 +1,574 @@
+@database :memory:
+
+# Basic single row delete test
+@cross-check-integrity
+test delete-single-1 {
+    CREATE TABLE t1 (x INTEGER PRIMARY KEY);
+    INSERT INTO t1 VALUES (1);
+    INSERT INTO t1 VALUES (2);
+    INSERT INTO t1 VALUES (3);
+    DELETE FROM t1 WHERE x = 2;
+    SELECT * FROM t1 ORDER BY x;
+}
+expect {
+    1
+    3
+}
+
+# Test alternating delete-insert pattern to stress freelist
+@cross-check-integrity
+test delete-insert-alternate-1 {
+    CREATE TABLE t4 (x INTEGER PRIMARY KEY);
+    INSERT INTO t4 VALUES (1);
+    INSERT INTO t4 VALUES (2);
+    INSERT INTO t4 VALUES (3);
+    DELETE FROM t4 WHERE x = 2;
+    INSERT INTO t4 VALUES (4);
+    DELETE FROM t4 WHERE x = 1;
+    INSERT INTO t4 VALUES (5);
+    SELECT * FROM t4 ORDER BY x;
+}
+expect {
+    3
+    4
+    5
+}
+
+# Test deleting from both ends
+@cross-check-integrity
+test delete-ends-1 {
+    CREATE TABLE t5 (x INTEGER PRIMARY KEY);
+    INSERT INTO t5 VALUES (1);
+    INSERT INTO t5 VALUES (2);
+    INSERT INTO t5 VALUES (3);
+    INSERT INTO t5 VALUES (4);
+    INSERT INTO t5 VALUES (5);
+    -- Delete from both ends
+    DELETE FROM t5 WHERE x = 1;
+    DELETE FROM t5 WHERE x = 5;
+    SELECT * FROM t5 ORDER BY x;
+}
+expect {
+    2
+    3
+    4
+}
+
+# Test delete-insert cycles with value reuse
+@cross-check-integrity
+test delete-reuse-1 {
+    CREATE TABLE t6 (x INTEGER PRIMARY KEY);
+    INSERT INTO t6 VALUES (1);
+    INSERT INTO t6 VALUES (2);
+    INSERT INTO t6 VALUES (3);
+    DELETE FROM t6 WHERE x = 2;
+    INSERT INTO t6 VALUES (2);  -- Reuse same value
+    SELECT * FROM t6 ORDER BY x;
+}
+expect {
+    1
+    2
+    3
+}
+
+# Test delete works when there are indexes
+@cross-check-integrity
+test delete-all-with-indexes-1 {
+    CREATE TABLE t (a PRIMARY KEY);
+    CREATE INDEX tasc ON t(a);
+    CREATE INDEX tdesc ON t(a DESC);
+    INSERT INTO t VALUES (randomblob(1000));
+    DELETE FROM t;
+    SELECT * FROM t;
+}
+expect {
+}
+
+@skip-if mvcc "page-level whole-table DELETE is disabled in MVCC mode"
+@cross-check-integrity
+test delete-all-clears-every-btree-and-rolls-back {
+    CREATE TABLE clear_me(id INTEGER PRIMARY KEY, name TEXT, score INTEGER);
+    CREATE UNIQUE INDEX clear_me_name ON clear_me(name);
+    CREATE INDEX clear_me_positive_score ON clear_me(score) WHERE score > 0;
+    WITH RECURSIVE c(x) AS (
+        VALUES(1)
+        UNION ALL
+        SELECT x + 1 FROM c WHERE x < 2000
+    )
+    INSERT INTO clear_me SELECT x, printf('name-%d', x), x - 1000 FROM c;
+    BEGIN;
+    DELETE FROM clear_me;
+    SELECT changes(), total_changes(), count(*) FROM clear_me;
+    ROLLBACK;
+    SELECT total_changes(), count(*), min(id), max(id) FROM clear_me;
+    DELETE FROM clear_me;
+    SELECT changes(), total_changes(), count(*) FROM clear_me;
+    INSERT INTO clear_me VALUES(1, 'name-1', 1);
+    SELECT id, name, score FROM clear_me INDEXED BY clear_me_name;
+}
+expect {
+    2000|4000|0
+    4000|2000|1|2000
+    2000|6000|0
+    1|name-1|1
+}
+
+@cross-check-integrity
+test delete-all-empty-keeps-autoincrement-watermark {
+    CREATE TABLE numbered(id INTEGER PRIMARY KEY AUTOINCREMENT, value TEXT);
+    DELETE FROM numbered;
+    SELECT changes(), total_changes();
+    INSERT INTO numbered(value) VALUES('one'), ('two'), ('three');
+    DELETE FROM numbered;
+    SELECT changes(), total_changes(), count(*) FROM numbered;
+    INSERT INTO numbered(value) VALUES('four');
+    SELECT id, value FROM numbered;
+}
+expect {
+    0|0
+    3|6|0
+    4|four
+}
+
+@cross-check-integrity
+test delete-all-rolls-back-to-nested-savepoint {
+    CREATE TABLE saved(id INTEGER PRIMARY KEY, value TEXT UNIQUE, score INTEGER);
+    CREATE INDEX saved_positive ON saved(score) WHERE score > 0;
+    WITH RECURSIVE c(x) AS (
+        VALUES(1)
+        UNION ALL
+        SELECT x + 1 FROM c WHERE x < 1000
+    )
+    INSERT INTO saved SELECT x, printf('value-%d', x), x - 500 FROM c;
+    SAVEPOINT outer;
+    SAVEPOINT inner;
+    DELETE FROM saved;
+    SELECT changes(), count(*) FROM saved;
+    ROLLBACK TO inner;
+    SELECT count(*), min(id), max(id) FROM saved;
+    SELECT id FROM saved INDEXED BY sqlite_autoindex_saved_1 WHERE value = 'value-777';
+    RELEASE inner;
+    DELETE FROM saved;
+    RELEASE outer;
+    SELECT changes(), count(*) FROM saved;
+    INSERT INTO saved VALUES(1, 'value-1', 1);
+    SELECT id, value, score FROM saved INDEXED BY saved_positive WHERE score > 0;
+}
+expect {
+    1000|0
+    1000|1|1000
+    777
+    1000|0
+    1|value-1|1
+}
+
+@cross-check-integrity
+test delete-all-preserves-trigger-and-foreign-key-effects {
+    PRAGMA foreign_keys = ON;
+    CREATE TABLE Parents(id INTEGER PRIMARY KEY);
+    CREATE TABLE children(parent_id REFERENCES PARENTS(id) ON DELETE CASCADE);
+    CREATE TABLE audit(parent_id INTEGER);
+    CREATE TRIGGER audit_parent_delete AFTER DELETE ON parents BEGIN
+        INSERT INTO audit VALUES(old.id);
+    END;
+    INSERT INTO parents VALUES(1), (2), (3);
+    INSERT INTO children VALUES(1), (2), (3);
+    DELETE FROM parents;
+    SELECT changes(),
+           (SELECT count(*) FROM parents),
+           (SELECT count(*) FROM children),
+           (SELECT count(*) FROM audit),
+           (SELECT sum(parent_id) FROM audit);
+}
+expect {
+    3|0|0|3|6
+}
+
+@cross-check-integrity
+test delete-all-clears-temp-table-indexes {
+    CREATE TEMP TABLE temp_items(id INTEGER PRIMARY KEY, value TEXT);
+    CREATE INDEX temp.temp_items_value ON temp_items(value);
+    INSERT INTO temp_items VALUES(1, 'one'), (2, 'two'), (3, 'three');
+    DELETE FROM temp_items WHERE id = 2;
+    SELECT id, value FROM temp_items INDEXED BY temp_items_value ORDER BY value;
+    DELETE FROM temp_items;
+    SELECT changes(), count(*) FROM temp_items INDEXED BY temp_items_value;
+    INSERT INTO temp_items VALUES(4, 'four');
+    SELECT id, value FROM temp_items INDEXED BY temp_items_value;
+}
+expect {
+    1|one
+    3|three
+    2|0
+    4|four
+}
+
+@cross-check-integrity
+test delete-all-with-indexes-reports-the-row-count {
+    CREATE TABLE counted(id INTEGER PRIMARY KEY, name TEXT, score INTEGER);
+    CREATE UNIQUE INDEX counted_name ON counted(name);
+    CREATE INDEX counted_positive_score ON counted(score) WHERE score > 0;
+    WITH RECURSIVE c(x) AS (
+        VALUES(1)
+        UNION ALL
+        SELECT x + 1 FROM c WHERE x < 2000
+    )
+    INSERT INTO counted SELECT x, printf('name-%d', x), x - 1000 FROM c;
+    DELETE FROM counted;
+    SELECT changes(), count(*) FROM counted;
+    DELETE FROM counted;
+    SELECT changes(), count(*) FROM counted;
+    INSERT INTO counted VALUES(7, 'name-7', 7);
+    SELECT id, score FROM counted INDEXED BY counted_name WHERE name = 'name-7';
+    SELECT id, name FROM counted INDEXED BY counted_positive_score WHERE score > 0;
+}
+expect {
+    2000|0
+    0|0
+    7|7
+    7|name-7
+}
+
+@cross-check-integrity
+test delete-all-counts-rows-added-after-pages-were-freed {
+    CREATE TABLE churn(id INTEGER PRIMARY KEY, payload BLOB, tag TEXT);
+    CREATE INDEX churn_tag ON churn(tag);
+    WITH RECURSIVE c(x) AS (
+        VALUES(1)
+        UNION ALL
+        SELECT x + 1 FROM c WHERE x < 600
+    )
+    INSERT INTO churn SELECT x, zeroblob(400), printf('tag-%d', x % 7) FROM c;
+    DELETE FROM churn WHERE id % 2 = 0;
+    SELECT changes(), count(*) FROM churn;
+    BEGIN;
+    WITH RECURSIVE c(x) AS (
+        VALUES(601)
+        UNION ALL
+        SELECT x + 1 FROM c WHERE x < 640
+    )
+    INSERT INTO churn SELECT x, zeroblob(400), printf('tag-%d', x % 7) FROM c;
+    DELETE FROM churn;
+    SELECT changes(), count(*) FROM churn;
+    COMMIT;
+    INSERT INTO churn VALUES(1, zeroblob(400), 'tag-1');
+    SELECT id, tag FROM churn INDEXED BY churn_tag WHERE tag = 'tag-1';
+}
+expect {
+    300|300
+    340|0
+    1|tag-1
+}
+
+@cross-check-integrity
+test delete-all-with-foreign-keys-off-leaves-child-rows {
+    CREATE TABLE parents(id INTEGER PRIMARY KEY);
+    CREATE TABLE children(id INTEGER PRIMARY KEY, parent_id REFERENCES parents(id) ON DELETE CASCADE);
+    INSERT INTO parents VALUES(1), (2), (3);
+    INSERT INTO children VALUES(10, 1), (20, 2), (30, 3);
+    DELETE FROM parents;
+    SELECT changes(),
+           (SELECT count(*) FROM parents),
+           (SELECT count(*) FROM children);
+}
+expect {
+    3|0|3
+}
+
+@cross-check-integrity
+test delete-all-from-a-child-table-with-foreign-keys-on {
+    PRAGMA foreign_keys = ON;
+    CREATE TABLE parents(id INTEGER PRIMARY KEY);
+    CREATE TABLE children(id INTEGER PRIMARY KEY, parent_id REFERENCES parents(id));
+    INSERT INTO parents VALUES(1), (2), (3);
+    INSERT INTO children VALUES(10, 1), (20, 2), (30, 3);
+    DELETE FROM children;
+    SELECT changes(),
+           (SELECT count(*) FROM children),
+           (SELECT count(*) FROM parents);
+    DELETE FROM parents;
+    SELECT changes(), count(*) FROM parents;
+}
+expect {
+    3|0|3
+    3|0
+}
+
+test delete-all-fails-while-child-rows-still-point-at-the-table {
+    PRAGMA foreign_keys = ON;
+    CREATE TABLE parents(id INTEGER PRIMARY KEY);
+    CREATE TABLE children(id INTEGER PRIMARY KEY, parent_id REFERENCES parents(id));
+    INSERT INTO parents VALUES(1), (2), (3);
+    INSERT INTO children VALUES(10, 1);
+    DELETE FROM parents;
+}
+expect error {
+    (?i)foreign key constraint failed
+}
+
+@cross-check-integrity
+test delete-all-sees-foreign-keys-turned-on-after-an-earlier-delete {
+    CREATE TABLE parents(id INTEGER PRIMARY KEY);
+    CREATE TABLE children(id INTEGER PRIMARY KEY, parent_id REFERENCES parents(id) ON DELETE CASCADE);
+    DELETE FROM parents;
+    SELECT changes();
+    INSERT INTO parents VALUES(1), (2);
+    INSERT INTO children VALUES(10, 1), (20, 2);
+    PRAGMA foreign_keys = ON;
+    DELETE FROM parents;
+    SELECT changes(),
+           (SELECT count(*) FROM parents),
+           (SELECT count(*) FROM children);
+}
+expect {
+    0
+    2|0|0
+}
+
+@skip-if mvcc "in MVCC mode CREATE INDEX adds one to total_changes()"
+@cross-check-integrity
+test delete-all-inside-a-trigger-does-not-change-what-changes-reports {
+    CREATE TABLE trigger_source(id INTEGER PRIMARY KEY);
+    CREATE TABLE cleared(id INTEGER PRIMARY KEY, value TEXT);
+    CREATE INDEX cleared_value ON cleared(value);
+    CREATE TRIGGER clear_on_insert AFTER INSERT ON trigger_source BEGIN
+        DELETE FROM cleared;
+    END;
+    INSERT INTO cleared VALUES(1, 'a'), (2, 'b'), (3, 'c');
+    INSERT INTO trigger_source VALUES(1);
+    SELECT changes(), total_changes(), (SELECT count(*) FROM cleared);
+    INSERT INTO cleared VALUES(4, 'd');
+    SELECT id, value FROM cleared INDEXED BY cleared_value;
+}
+expect {
+    1|7|0
+    4|d
+}
+
+@cross-check-integrity
+test delete_where_falsy {
+    CREATE TABLE resourceful_schurz (diplomatic_kaplan BLOB);
+    INSERT INTO resourceful_schurz VALUES (X'696E646570656E64656E745F6A6165636B6C65'), (X'67656E65726F75735F62617262616E65677261'), (X'73757065725F74616E6E656E6261756D'), (X'6D6F76696E675F6E616F756D6F76'), (X'7374756E6E696E675F6B62');
+    INSERT INTO resourceful_schurz VALUES (X'70617373696F6E6174655F726F62696E'), (X'666169746866756C5F74686F6D6173'), (X'76696272616E745F6D69726F736C6176'), (X'737061726B6C696E675F67726179');
+    DELETE FROM resourceful_schurz WHERE - x'666169746866756c5f74686f6d6173';
+    SELECT * FROM resourceful_schurz;
+}
+expect {
+    independent_jaeckle
+    generous_barbanegra
+    super_tannenbaum
+    moving_naoumov
+    stunning_kb
+    passionate_robin
+    faithful_thomas
+    vibrant_miroslav
+    sparkling_gray
+}
+
+@cross-check-integrity
+test doubly-qualified-delete {
+    create table test(col);
+    insert into test(col) values (1);
+    insert into test(col) values (2);
+    delete from test where main.test.col = 2;
+    select col from test;
+}
+expect {
+    1
+}
+
+# Test DELETE with IN subquery
+@cross-check-integrity
+test delete-in-subquery-1 {
+    CREATE TABLE file_input (id INTEGER PRIMARY KEY, name TEXT);
+    CREATE TABLE eval_input_path (file_input_id INTEGER);
+    INSERT INTO file_input VALUES (1, 'file1'), (2, 'file2'), (3, 'file3'), (4, 'file4');
+    INSERT INTO eval_input_path VALUES (1), (2), (NULL);
+    DELETE FROM file_input WHERE id IN (SELECT file_input_id FROM eval_input_path WHERE file_input_id IS NOT NULL);
+    SELECT id, name FROM file_input ORDER BY id;
+}
+expect {
+    3|file3
+    4|file4
+}
+
+
+# Test DELETE with NOT IN subquery
+@cross-check-integrity
+test delete-not-in-subquery-1  {
+    CREATE TABLE file_input (id INTEGER PRIMARY KEY, name TEXT);
+    CREATE TABLE eval_input_path (file_input_id INTEGER);
+    INSERT INTO file_input VALUES (1, 'file1'), (2, 'file2'), (3, 'file3'), (4, 'file4');
+    INSERT INTO eval_input_path VALUES (1), (2), (NULL);
+    DELETE FROM file_input WHERE id NOT IN (SELECT file_input_id FROM eval_input_path WHERE file_input_id IS NOT NULL);
+    SELECT id, name FROM file_input ORDER BY id;
+}
+expect {
+    1|file1
+    2|file2
+}
+
+# Test DELETE with IN subquery returning empty set
+@cross-check-integrity
+test delete-in-subquery-empty-1  {
+    CREATE TABLE t1 (id INTEGER PRIMARY KEY, val TEXT);
+    CREATE TABLE t2 (ref_id INTEGER);
+    INSERT INTO t1 VALUES (1, 'a'), (2, 'b'), (3, 'c');
+    DELETE FROM t1 WHERE id IN (SELECT ref_id FROM t2);
+    SELECT id, val FROM t1 ORDER BY id;
+}
+expect {
+    1|a
+    2|b
+    3|c
+}
+
+
+# Test DELETE with NOT IN subquery returning empty set (should delete all)
+@cross-check-integrity
+test delete-not-in-subquery-empty-1 {
+    CREATE TABLE t1 (id INTEGER PRIMARY KEY, val TEXT);
+    CREATE TABLE t2 (ref_id INTEGER);
+    INSERT INTO t1 VALUES (1, 'a'), (2, 'b'), (3, 'c');
+    DELETE FROM t1 WHERE id NOT IN (SELECT ref_id FROM t2);
+    SELECT id, val FROM t1 ORDER BY id;
+}
+expect {
+}
+
+# Test DELETE with IN subquery and multiple columns in outer table
+@cross-check-integrity
+test delete-in-subquery-multicol-1 {
+    CREATE TABLE products (id INTEGER PRIMARY KEY, name TEXT, price REAL);
+    CREATE TABLE discontinued (product_id INTEGER);
+    INSERT INTO products VALUES (1, 'Widget', 10.99), (2, 'Gadget', 25.50), (3, 'Doodad', 5.00);
+    INSERT INTO discontinued VALUES (2);
+    DELETE FROM products WHERE id IN (SELECT product_id FROM discontinued);
+    SELECT id, name FROM products ORDER BY id;
+}
+expect {
+    1|Widget
+    3|Doodad
+}
+
+
+# Test DELETE with EXISTS subquery
+@cross-check-integrity
+test delete-exists-subquery-1 {
+    CREATE TABLE orders (id INTEGER PRIMARY KEY, customer_id INTEGER, status TEXT);
+    CREATE TABLE order_items (order_id INTEGER, product TEXT);
+    INSERT INTO orders VALUES (1, 100, 'pending'), (2, 101, 'pending'), (3, 102, 'pending');
+    INSERT INTO order_items VALUES (1, 'widget'), (3, 'gadget');
+    DELETE FROM orders WHERE EXISTS (SELECT 1 FROM order_items WHERE order_items.order_id = orders.id);
+    SELECT id, status FROM orders ORDER BY id;
+}
+expect {
+    2|pending
+}
+
+# Test DELETE with NOT EXISTS subquery
+@cross-check-integrity
+test delete-not-exists-subquery-1 {
+    CREATE TABLE orders (id INTEGER PRIMARY KEY, customer_id INTEGER, status TEXT);
+    CREATE TABLE order_items (order_id INTEGER, product TEXT);
+    INSERT INTO orders VALUES (1, 100, 'pending'), (2, 101, 'pending'), (3, 102, 'pending');
+    INSERT INTO order_items VALUES (1, 'widget'), (3, 'gadget');
+    DELETE FROM orders WHERE NOT EXISTS (SELECT 1 FROM order_items WHERE order_items.order_id = orders.id);
+    SELECT id, status FROM orders ORDER BY id;
+}
+expect {
+    1|pending
+    3|pending
+}
+
+# Test DELETE with scalar comparison subquery (=)
+@cross-check-integrity
+test delete-scalar-eq-subquery-1 {
+    CREATE TABLE employees (id INTEGER PRIMARY KEY, name TEXT, department_id INTEGER);
+    CREATE TABLE departments (id INTEGER PRIMARY KEY, name TEXT);
+    INSERT INTO employees VALUES (1, 'Alice', 1), (2, 'Bob', 2), (3, 'Charlie', 1);
+    INSERT INTO departments VALUES (1, 'Sales'), (2, 'Engineering');
+    DELETE FROM employees WHERE department_id = (SELECT id FROM departments WHERE name = 'Sales');
+    SELECT id, name FROM employees ORDER BY id;
+}
+expect {
+    2|Bob
+}
+
+# Test DELETE with scalar comparison subquery (>)
+@cross-check-integrity
+test delete-scalar-gt-subquery-1 {
+    CREATE TABLE t1 (id INTEGER PRIMARY KEY, val INTEGER);
+    CREATE TABLE t2 (max_val INTEGER);
+    INSERT INTO t1 VALUES (1, 10), (2, 20), (3, 30), (4, 40);
+    INSERT INTO t2 VALUES (25);
+    DELETE FROM t1 WHERE val > (SELECT max_val FROM t2);
+    SELECT id, val FROM t1 ORDER BY id;
+}
+expect {
+    1|10
+    2|20
+}
+
+# Test DELETE with scalar comparison subquery (<)
+@cross-check-integrity
+test delete-scalar-lt-subquery-1 {
+    CREATE TABLE t1 (id INTEGER PRIMARY KEY, val INTEGER);
+    CREATE TABLE t2 (min_val INTEGER);
+    INSERT INTO t1 VALUES (1, 10), (2, 20), (3, 30), (4, 40);
+    INSERT INTO t2 VALUES (25);
+    DELETE FROM t1 WHERE val < (SELECT min_val FROM t2);
+    SELECT id, val FROM t1 ORDER BY id;
+}
+expect {
+    3|30
+    4|40
+}
+
+
+# Test DELETE with scalar subquery using aggregate
+@cross-check-integrity
+test delete-scalar-agg-subquery-1 {
+    CREATE TABLE items (id INTEGER PRIMARY KEY, score INTEGER);
+    INSERT INTO items VALUES (1, 10), (2, 20), (3, 30), (4, 40), (5, 50);
+    DELETE FROM items WHERE score < (SELECT AVG(score) FROM items);
+    SELECT id, score FROM items ORDER BY id;
+}
+expect {
+    3|30
+    4|40
+    5|50
+}
+
+# Test DELETE with EXISTS and empty subquery result
+@cross-check-integrity
+test delete-exists-empty-1 {
+    CREATE TABLE t1 (id INTEGER PRIMARY KEY, val TEXT);
+    CREATE TABLE t2 (ref_id INTEGER);
+    INSERT INTO t1 VALUES (1, 'a'), (2, 'b'), (3, 'c');
+    DELETE FROM t1 WHERE EXISTS (SELECT 1 FROM t2 WHERE t2.ref_id = t1.id);
+    SELECT id, val FROM t1 ORDER BY id;
+}
+expect {
+    1|a
+    2|b
+    3|c
+}
+
+# under MVCC, a DELETE that drives its scan through a UNIQUE index must still visit
+# b-tree-resident rows after the un-checkpointed MVCC rows are exhausted.
+@skip-if sqlite "MVCC is not supported in SQLite"
+test mvcc-delete-via-index-removes-checkpointed-rows {
+    PRAGMA journal_mode='MVCC';
+    CREATE TABLE t(id INTEGER PRIMARY KEY, c INTEGER UNIQUE);
+    INSERT INTO t VALUES (1, 400), (2, 500), (3, 600);
+    PRAGMA wal_checkpoint(TRUNCATE);
+    INSERT INTO t VALUES (4, 100), (5, 200);
+    DELETE FROM t WHERE c < 1000;
+    SELECT count(*) FROM t;
+}
+expect {
+    mvcc
+    0|0|0
+    0
+}

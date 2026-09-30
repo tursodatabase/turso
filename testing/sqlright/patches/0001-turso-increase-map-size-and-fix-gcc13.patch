@@ -1,0 +1,93 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Turso <noreply@turso.tech>
+Subject: [PATCH] Increase MAP_SIZE for Turso coverage guards and fix GCC 13 builds
+
+Turso's instrumented binary has ~1.1M PCGUARD coverage guards, which
+overflows AFL's default 2^18 map. Increase to 2^21.
+
+GCC 13 requires explicit <cstdint> and <cstring> includes that were
+previously provided implicitly.
+
+diff --git a/SQLite/docker/src/AFL/config.h b/SQLite/docker/src/AFL/config.h
+index 4e7b3b5..c93ea17 100644
+--- a/SQLite/docker/src/AFL/config.h
++++ b/SQLite/docker/src/AFL/config.h
+@@ -320,7 +320,7 @@
+    problems with complex programs). You need to recompile the target binary
+    after changing this - otherwise, SEGVs may ensue. */
+
+-#define MAP_SIZE_POW2 18
++#define MAP_SIZE_POW2 21
+ #define MAP_SIZE (1 << MAP_SIZE_POW2)
+
+ /* Maximum allocator request size (keep well under INT_MAX): */
+diff --git a/SQLite/docker/src/oracle/sqlite_rowid.cpp b/SQLite/docker/src/oracle/sqlite_rowid.cpp
+index da040a5..3bf5d95 100644
+--- a/SQLite/docker/src/oracle/sqlite_rowid.cpp
++++ b/SQLite/docker/src/oracle/sqlite_rowid.cpp
+@@ -1,7 +1,7 @@
+ #include "./sqlite_rowid.h"
+ #include "../include/mutator.h"
+ #include <iostream>
+-
++#include <cstring>
+ #include <regex>
+ #include <string>
+
+diff --git a/SQLite/docker/src/oracle/sqlite_tlp.cpp b/SQLite/docker/src/oracle/sqlite_tlp.cpp
+index 7c9e01b..549b094 100644
+--- a/SQLite/docker/src/oracle/sqlite_tlp.cpp
++++ b/SQLite/docker/src/oracle/sqlite_tlp.cpp
+@@ -1,7 +1,7 @@
+ #include "./sqlite_tlp.h"
+ #include "../include/mutator.h"
+ #include <iostream>
+-
++#include <cstring>
+ #include <algorithm>
+ #include <regex>
+ #include <string>
+diff --git a/SQLite/docker/src/parser/bison_parser.y b/SQLite/docker/src/parser/bison_parser.y
+index 7d0180c..f9d312d 100644
+--- a/SQLite/docker/src/parser/bison_parser.y
++++ b/SQLite/docker/src/parser/bison_parser.y
+@@ -17,6 +17,7 @@
+
+ #include <stdio.h>
+ #include <string.h>
++#include <cstdint>
+
+
+ int yyerror(YYLTYPE* llocp, Program * result, yyscan_t scanner, const char *msg) {
+@@ -34,7 +35,7 @@ int yyerror(YYLTYPE* llocp, Program * result, yyscan_t scanner, const char *msg)
+ %code requires {
+ // %code requires block
+
+-
++#include <cstdint>
+ #include "../include/ast.h"
+ #include "../include/define.h"
+ #include "parser_typedef.h"
+diff --git a/SQLite/docker/src/src/mutator.cpp b/SQLite/docker/src/src/mutator.cpp
+index 4d92066..2240e67 100644
+--- a/SQLite/docker/src/src/mutator.cpp
++++ b/SQLite/docker/src/src/mutator.cpp
+@@ -3,6 +3,7 @@
+ #include "../include/define.h"
+ #include "../include/utils.h"
+
++#include <cstring>
+ #include "../parser/bison_parser.h"
+ #include "../parser/flex_lexer.h"
+
+diff --git a/SQLite/docker/src/src/utils.cpp b/SQLite/docker/src/src/utils.cpp
+index 80c3b89..b57b1b2 100644
+--- a/SQLite/docker/src/src/utils.cpp
++++ b/SQLite/docker/src/src/utils.cpp
+@@ -1,5 +1,6 @@
+ #include "../include/utils.h"
+ #include <algorithm>
++#include <cstring>
+ #include <regex>
+
+ string magic_string_generator(string &s) {

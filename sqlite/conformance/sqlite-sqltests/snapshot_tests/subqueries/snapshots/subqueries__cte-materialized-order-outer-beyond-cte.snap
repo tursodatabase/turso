@@ -1,0 +1,21 @@
+---
+source: subqueries.sqltest
+expression: |-
+  WITH ordered AS MATERIALIZED (
+          SELECT * FROM t ORDER BY a ASC
+      )
+      SELECT * FROM ordered ORDER BY a ASC, b ASC;
+info:
+  statement_type: WITH (CTE)
+  tables:
+  - ordered
+  - t
+  setup_blocks:
+  - multi_col_schema
+  database: ':memory:'
+---
+QUERY PLAN
+|--SCAN t
+|--USE SORTER FOR ORDER BY
+|--SCAN ordered
+`--USE SORTER FOR ORDER BY

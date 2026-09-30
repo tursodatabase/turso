@@ -1,0 +1,75 @@
+@database :memory:
+
+test correlated-subquery-nested-exists-count-sum {
+    CREATE TABLE t1(b, c);
+    CREATE TABLE t2(x, y);
+    CREATE TABLE t3(p, q);
+
+    INSERT INTO t1 VALUES(7, 10);
+    INSERT INTO t2 VALUES(1, 1), (4, 7);
+    INSERT INTO t3 VALUES(4, 7);
+
+    CREATE INDEX t2_yx ON t2(y, x);
+    CREATE INDEX t3_pq ON t3(p, q);
+
+    SELECT count(*), sum(c)
+    FROM t1 AS A
+    WHERE EXISTS (
+        SELECT 1
+        FROM t2 AS B
+        WHERE EXISTS (
+            SELECT 1
+            FROM t3 AS C
+            WHERE C.p = B.x AND C.q = A.b
+        )
+    );
+}
+expect {
+    1|10
+}
+
+# Regression case from https://sqlite.org/forum/forumpost/0ab502f519
+# Broken in SQLite < 3.53 for multiple releases; fixed in SQLite 3.53+.
+@skip-if sqlite "CI SQLite is 3.51.x; upstream BETWEEN/subquery fix is in 3.53+"
+test update-between-subquery-equivalence {
+    CREATE TABLE t(v INT);
+    INSERT INTO t VALUES(1), (2);
+
+    BEGIN;
+    UPDATE t SET v = 100
+     WHERE v = 1 OR (1 BETWEEN 0 AND ((SELECT min(v) FROM t) >= v));
+    SELECT 'original', group_concat(v, '|') FROM (SELECT v FROM t ORDER BY v);
+    ROLLBACK;
+
+    UPDATE t SET v = 100
+     WHERE v = 1 OR ((1 >= 0) AND (1 <= ((SELECT min(v) FROM t) >= v)));
+    SELECT 'equivalent..?', group_concat(v, '|') FROM (SELECT v FROM t ORDER BY v);
+}
+expect {
+    original|2|100
+    equivalent..?|2|100
+}
+
+test correlated-exists-limit-offset-empty-after-offset {
+    CREATE TABLE t2(id INT, data INT);
+    CREATE TABLE t3(amount INT);
+
+    INSERT INTO t2 VALUES (1, 0), (2, 0);
+    INSERT INTO t3 VALUES (1), (1);
+
+    SELECT COUNT(*) AS matched
+    FROM t2
+    WHERE EXISTS (SELECT 1 FROM t3 WHERE t3.amount > t2.data);
+
+    SELECT COUNT(*) AS rows_out
+    FROM (
+      SELECT id
+      FROM t2
+      WHERE EXISTS (SELECT 1 FROM t3 WHERE t3.amount > t2.data)
+      LIMIT 2 OFFSET 3
+    );
+}
+expect {
+    2
+    0
+}

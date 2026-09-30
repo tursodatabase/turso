@@ -1,0 +1,931 @@
+CREATE TEMP TABLE x (
+	a serial,
+	b int,
+	c text not null default 'stuff',
+	d text,
+	e text
+) ;
+CREATE FUNCTION fn_x_before () RETURNS TRIGGER AS '
+  BEGIN
+		NEW.e := ''before trigger fired''::text;
+		return NEW;
+	END;
+' LANGUAGE plpgsql;
+CREATE FUNCTION fn_x_after () RETURNS TRIGGER AS '
+  BEGIN
+		UPDATE x set e=''after trigger fired'' where c=''stuff'';
+		return NULL;
+	END;
+' LANGUAGE plpgsql;
+CREATE TRIGGER trg_x_after AFTER INSERT ON x
+FOR EACH ROW EXECUTE PROCEDURE fn_x_after();
+CREATE TRIGGER trg_x_before BEFORE INSERT ON x
+FOR EACH ROW EXECUTE PROCEDURE fn_x_before();
+COPY x (a, b, c, d, e) from stdin;
+COPY x (b, d) from stdin;
+COPY x (b, d) from stdin;
+COPY x (a, b, c, d, e) from stdin;
+-- non-existent column in column list: should fail
+COPY x (xyz) from stdin;
+ERROR:  column "xyz" of relation "x" does not exist
+-- redundant options
+COPY x from stdin (format CSV, FORMAT CSV);
+ERROR:  conflicting or redundant options
+LINE 1: COPY x from stdin (format CSV, FORMAT CSV);
+                                       ^
+COPY x from stdin (freeze off, freeze on);
+ERROR:  conflicting or redundant options
+LINE 1: COPY x from stdin (freeze off, freeze on);
+                                       ^
+COPY x from stdin (delimiter ',', delimiter ',');
+ERROR:  conflicting or redundant options
+LINE 1: COPY x from stdin (delimiter ',', delimiter ',');
+                                          ^
+COPY x from stdin (null ' ', null ' ');
+ERROR:  conflicting or redundant options
+LINE 1: COPY x from stdin (null ' ', null ' ');
+                                     ^
+COPY x from stdin (header off, header on);
+ERROR:  conflicting or redundant options
+LINE 1: COPY x from stdin (header off, header on);
+                                       ^
+COPY x from stdin (quote ':', quote ':');
+ERROR:  conflicting or redundant options
+LINE 1: COPY x from stdin (quote ':', quote ':');
+                                      ^
+COPY x from stdin (escape ':', escape ':');
+ERROR:  conflicting or redundant options
+LINE 1: COPY x from stdin (escape ':', escape ':');
+                                       ^
+COPY x from stdin (force_quote (a), force_quote *);
+ERROR:  conflicting or redundant options
+LINE 1: COPY x from stdin (force_quote (a), force_quote *);
+                                            ^
+COPY x from stdin (force_not_null (a), force_not_null (b));
+ERROR:  conflicting or redundant options
+LINE 1: COPY x from stdin (force_not_null (a), force_not_null (b));
+                                               ^
+COPY x from stdin (force_null (a), force_null (b));
+ERROR:  conflicting or redundant options
+LINE 1: COPY x from stdin (force_null (a), force_null (b));
+                                           ^
+COPY x from stdin (convert_selectively (a), convert_selectively (b));
+ERROR:  conflicting or redundant options
+LINE 1: COPY x from stdin (convert_selectively (a), convert_selectiv...
+                                                    ^
+COPY x from stdin (encoding 'sql_ascii', encoding 'sql_ascii');
+ERROR:  conflicting or redundant options
+LINE 1: COPY x from stdin (encoding 'sql_ascii', encoding 'sql_ascii...
+                                                 ^
+COPY x from stdin (on_error ignore, on_error ignore);
+ERROR:  conflicting or redundant options
+LINE 1: COPY x from stdin (on_error ignore, on_error ignore);
+                                            ^
+COPY x from stdin (log_verbosity default, log_verbosity verbose);
+ERROR:  conflicting or redundant options
+LINE 1: COPY x from stdin (log_verbosity default, log_verbosity verb...
+                                                  ^
+-- incorrect options
+COPY x from stdin (format BINARY, delimiter ',');
+ERROR:  cannot specify DELIMITER in BINARY mode
+COPY x from stdin (format BINARY, null 'x');
+ERROR:  cannot specify NULL in BINARY mode
+COPY x from stdin (format BINARY, on_error ignore);
+ERROR:  only ON_ERROR STOP is allowed in BINARY mode
+COPY x from stdin (on_error unsupported);
+ERROR:  COPY ON_ERROR "unsupported" not recognized
+LINE 1: COPY x from stdin (on_error unsupported);
+                           ^
+COPY x from stdin (format TEXT, force_quote(a));
+ERROR:  COPY FORCE_QUOTE requires CSV mode
+COPY x from stdin (format TEXT, force_quote *);
+ERROR:  COPY FORCE_QUOTE requires CSV mode
+COPY x from stdin (format CSV, force_quote(a));
+ERROR:  COPY FORCE_QUOTE cannot be used with COPY FROM
+COPY x from stdin (format CSV, force_quote *);
+ERROR:  COPY FORCE_QUOTE cannot be used with COPY FROM
+COPY x from stdin (format TEXT, force_not_null(a));
+ERROR:  COPY FORCE_NOT_NULL requires CSV mode
+COPY x from stdin (format TEXT, force_not_null *);
+ERROR:  COPY FORCE_NOT_NULL requires CSV mode
+COPY x to stdout (format CSV, force_not_null(a));
+ERROR:  COPY FORCE_NOT_NULL cannot be used with COPY TO
+COPY x to stdout (format CSV, force_not_null *);
+ERROR:  COPY FORCE_NOT_NULL cannot be used with COPY TO
+COPY x from stdin (format TEXT, force_null(a));
+ERROR:  COPY FORCE_NULL requires CSV mode
+COPY x from stdin (format TEXT, force_null *);
+ERROR:  COPY FORCE_NULL requires CSV mode
+COPY x to stdout (format CSV, force_null(a));
+ERROR:  COPY FORCE_NULL cannot be used with COPY TO
+COPY x to stdout (format CSV, force_null *);
+ERROR:  COPY FORCE_NULL cannot be used with COPY TO
+COPY x to stdout (format BINARY, on_error unsupported);
+ERROR:  COPY ON_ERROR cannot be used with COPY TO
+LINE 1: COPY x to stdout (format BINARY, on_error unsupported);
+                                         ^
+COPY x from stdin (log_verbosity unsupported);
+ERROR:  COPY LOG_VERBOSITY "unsupported" not recognized
+LINE 1: COPY x from stdin (log_verbosity unsupported);
+                           ^
+COPY x from stdin with (reject_limit 1);
+ERROR:  COPY REJECT_LIMIT requires ON_ERROR to be set to IGNORE
+COPY x from stdin with (on_error ignore, reject_limit 0);
+ERROR:  REJECT_LIMIT (0) must be greater than zero
+-- too many columns in column list: should fail
+COPY x (a, b, c, d, e, d, c) from stdin;
+ERROR:  column "d" specified more than once
+-- missing data: should fail
+COPY x from stdin;
+ERROR:  invalid input syntax for type integer: ""
+CONTEXT:  COPY x, line 1, column a: ""
+COPY x from stdin;
+ERROR:  missing data for column "e"
+CONTEXT:  COPY x, line 1: "2000	230	23	23"
+COPY x from stdin;
+ERROR:  missing data for column "e"
+CONTEXT:  COPY x, line 1: "2001	231	\N	\N"
+-- extra data: should fail
+COPY x from stdin;
+ERROR:  extra data after last expected column
+CONTEXT:  COPY x, line 1: "2002	232	40	50	60	70	80"
+-- various COPY options: delimiters, oids, NULL string, encoding
+COPY x (b, c, d, e) from stdin delimiter ',' null 'x';
+COPY x from stdin WITH DELIMITER AS ';' NULL AS '';
+COPY x from stdin WITH DELIMITER AS ':' NULL AS E'\\X' ENCODING 'sql_ascii';
+COPY x TO stdout WHERE a = 1;
+ERROR:  WHERE clause not allowed with COPY TO
+LINE 1: COPY x TO stdout WHERE a = 1;
+                         ^
+COPY x from stdin WHERE a = 50004;
+COPY x from stdin WHERE a > 60003;
+COPY x from stdin WHERE f > 60003;
+ERROR:  column "f" does not exist
+LINE 1: COPY x from stdin WHERE f > 60003;
+                                ^
+COPY x from stdin WHERE a = max(x.b);
+ERROR:  aggregate functions are not allowed in COPY FROM WHERE conditions
+LINE 1: COPY x from stdin WHERE a = max(x.b);
+                                    ^
+COPY x from stdin WHERE a IN (SELECT 1 FROM x);
+ERROR:  cannot use subquery in COPY FROM WHERE condition
+LINE 1: COPY x from stdin WHERE a IN (SELECT 1 FROM x);
+                                  ^
+COPY x from stdin WHERE a IN (generate_series(1,5));
+ERROR:  set-returning functions are not allowed in COPY FROM WHERE conditions
+LINE 1: COPY x from stdin WHERE a IN (generate_series(1,5));
+                                      ^
+COPY x from stdin WHERE a = row_number() over(b);
+ERROR:  window functions are not allowed in COPY FROM WHERE conditions
+LINE 1: COPY x from stdin WHERE a = row_number() over(b);
+                                    ^
+-- check results of copy in
+SELECT * FROM x;
+   a   | b  |     c      |   d    |          e           
+-------+----+------------+--------+----------------------
+  9999 |    | \N         | NN     | before trigger fired
+ 10000 | 21 | 31         | 41     | before trigger fired
+ 10001 | 22 | 32         | 42     | before trigger fired
+ 10002 | 23 | 33         | 43     | before trigger fired
+ 10003 | 24 | 34         | 44     | before trigger fired
+ 10004 | 25 | 35         | 45     | before trigger fired
+ 10005 | 26 | 36         | 46     | before trigger fired
+     6 |    | 45         | 80     | before trigger fired
+     7 |    | x          | \x     | before trigger fired
+     8 |    | ,          | \,     | before trigger fired
+  3000 |    | c          |        | before trigger fired
+  4000 |    | C          |        | before trigger fired
+  4001 |  1 | empty      |        | before trigger fired
+  4002 |  2 | null       |        | before trigger fired
+  4003 |  3 | Backslash  | \      | before trigger fired
+  4004 |  4 | BackslashX | \X     | before trigger fired
+  4005 |  5 | N          | N      | before trigger fired
+  4006 |  6 | BackslashN | \N     | before trigger fired
+  4007 |  7 | XX         | XX     | before trigger fired
+  4008 |  8 | Delimiter  | :      | before trigger fired
+ 50004 | 25 | 35         | 45     | before trigger fired
+ 60004 | 25 | 35         | 45     | before trigger fired
+ 60005 | 26 | 36         | 46     | before trigger fired
+     1 |  1 | stuff      | test_1 | after trigger fired
+     2 |  2 | stuff      | test_2 | after trigger fired
+     3 |  3 | stuff      | test_3 | after trigger fired
+     4 |  4 | stuff      | test_4 | after trigger fired
+     5 |  5 | stuff      | test_5 | after trigger fired
+(28 rows)
+
+-- check copy out
+COPY x TO stdout;
+9999	\N	\\N	NN	before trigger fired
+10000	21	31	41	before trigger fired
+10001	22	32	42	before trigger fired
+10002	23	33	43	before trigger fired
+10003	24	34	44	before trigger fired
+10004	25	35	45	before trigger fired
+10005	26	36	46	before trigger fired
+6	\N	45	80	before trigger fired
+7	\N	x	\\x	before trigger fired
+8	\N	,	\\,	before trigger fired
+3000	\N	c	\N	before trigger fired
+4000	\N	C	\N	before trigger fired
+4001	1	empty		before trigger fired
+4002	2	null	\N	before trigger fired
+4003	3	Backslash	\\	before trigger fired
+4004	4	BackslashX	\\X	before trigger fired
+4005	5	N	N	before trigger fired
+4006	6	BackslashN	\\N	before trigger fired
+4007	7	XX	XX	before trigger fired
+4008	8	Delimiter	:	before trigger fired
+50004	25	35	45	before trigger fired
+60004	25	35	45	before trigger fired
+60005	26	36	46	before trigger fired
+1	1	stuff	test_1	after trigger fired
+2	2	stuff	test_2	after trigger fired
+3	3	stuff	test_3	after trigger fired
+4	4	stuff	test_4	after trigger fired
+5	5	stuff	test_5	after trigger fired
+COPY x (c, e) TO stdout;
+\\N	before trigger fired
+31	before trigger fired
+32	before trigger fired
+33	before trigger fired
+34	before trigger fired
+35	before trigger fired
+36	before trigger fired
+45	before trigger fired
+x	before trigger fired
+,	before trigger fired
+c	before trigger fired
+C	before trigger fired
+empty	before trigger fired
+null	before trigger fired
+Backslash	before trigger fired
+BackslashX	before trigger fired
+N	before trigger fired
+BackslashN	before trigger fired
+XX	before trigger fired
+Delimiter	before trigger fired
+35	before trigger fired
+35	before trigger fired
+36	before trigger fired
+stuff	after trigger fired
+stuff	after trigger fired
+stuff	after trigger fired
+stuff	after trigger fired
+stuff	after trigger fired
+COPY x (b, e) TO stdout WITH NULL 'I''m null';
+I'm null	before trigger fired
+21	before trigger fired
+22	before trigger fired
+23	before trigger fired
+24	before trigger fired
+25	before trigger fired
+26	before trigger fired
+I'm null	before trigger fired
+I'm null	before trigger fired
+I'm null	before trigger fired
+I'm null	before trigger fired
+I'm null	before trigger fired
+1	before trigger fired
+2	before trigger fired
+3	before trigger fired
+4	before trigger fired
+5	before trigger fired
+6	before trigger fired
+7	before trigger fired
+8	before trigger fired
+25	before trigger fired
+25	before trigger fired
+26	before trigger fired
+1	after trigger fired
+2	after trigger fired
+3	after trigger fired
+4	after trigger fired
+5	after trigger fired
+CREATE TEMP TABLE y (
+	col1 text,
+	col2 text
+);
+INSERT INTO y VALUES ('Jackson, Sam', E'\\h');
+INSERT INTO y VALUES ('It is "perfect".',E'\t');
+INSERT INTO y VALUES ('', NULL);
+COPY y TO stdout WITH CSV;
+"Jackson, Sam",\h
+"It is ""perfect"".",	
+"",
+COPY y TO stdout WITH CSV QUOTE '''' DELIMITER '|';
+Jackson, Sam|\h
+It is "perfect".|	
+''|
+COPY y TO stdout WITH CSV FORCE QUOTE col2 ESCAPE E'\\' ENCODING 'sql_ascii';
+"Jackson, Sam","\\h"
+"It is \"perfect\".","	"
+"",
+COPY y TO stdout WITH CSV FORCE QUOTE *;
+"Jackson, Sam","\h"
+"It is ""perfect"".","	"
+"",
+-- Repeat above tests with new 9.0 option syntax
+COPY y TO stdout (FORMAT CSV);
+"Jackson, Sam",\h
+"It is ""perfect"".",	
+"",
+COPY y TO stdout (FORMAT CSV, QUOTE '''', DELIMITER '|');
+Jackson, Sam|\h
+It is "perfect".|	
+''|
+COPY y TO stdout (FORMAT CSV, FORCE_QUOTE (col2), ESCAPE E'\\');
+"Jackson, Sam","\\h"
+"It is \"perfect\".","	"
+"",
+COPY y TO stdout (FORMAT CSV, FORCE_QUOTE *);
+"Jackson, Sam","\h"
+"It is ""perfect"".","	"
+"",
+\copy y TO stdout (FORMAT CSV)
+"Jackson, Sam",\h
+"It is ""perfect"".",	
+"",
+\copy y TO stdout (FORMAT CSV, QUOTE '''', DELIMITER '|')
+Jackson, Sam|\h
+It is "perfect".|	
+''|
+\copy y TO stdout (FORMAT CSV, FORCE_QUOTE (col2), ESCAPE E'\\')
+"Jackson, Sam","\\h"
+"It is \"perfect\".","	"
+"",
+\copy y TO stdout (FORMAT CSV, FORCE_QUOTE *)
+"Jackson, Sam","\h"
+"It is ""perfect"".","	"
+"",
+--test that we read consecutive LFs properly
+CREATE TEMP TABLE testnl (a int, b text, c int);
+COPY testnl FROM stdin CSV;
+-- test end of copy marker
+CREATE TEMP TABLE testeoc (a text);
+COPY testeoc FROM stdin CSV;
+COPY testeoc TO stdout CSV;
+a\.
+\.b
+c\.d
+"\."
+-- test handling of nonstandard null marker that violates escaping rules
+CREATE TEMP TABLE testnull(a int, b text);
+INSERT INTO testnull VALUES (1, E'\\0'), (NULL, NULL);
+COPY testnull TO stdout WITH NULL AS E'\\0';
+1	\\0
+\0	\0
+COPY testnull FROM stdin WITH NULL AS E'\\0';
+SELECT * FROM testnull;
+ a  | b  
+----+----
+  1 | \0
+    | 
+ 42 | \0
+    | 
+(4 rows)
+
+BEGIN;
+CREATE TABLE vistest (LIKE testeoc);
+COPY vistest FROM stdin CSV;
+COMMIT;
+SELECT * FROM vistest;
+ a  
+----
+ a0
+ b
+(2 rows)
+
+BEGIN;
+TRUNCATE vistest;
+COPY vistest FROM stdin CSV;
+SELECT * FROM vistest;
+ a  
+----
+ a1
+ b
+(2 rows)
+
+SAVEPOINT s1;
+TRUNCATE vistest;
+COPY vistest FROM stdin CSV;
+SELECT * FROM vistest;
+ a  
+----
+ d1
+ e
+(2 rows)
+
+COMMIT;
+SELECT * FROM vistest;
+ a  
+----
+ d1
+ e
+(2 rows)
+
+BEGIN;
+TRUNCATE vistest;
+COPY vistest FROM stdin CSV FREEZE;
+SELECT * FROM vistest;
+ a  
+----
+ a2
+ b
+(2 rows)
+
+SAVEPOINT s1;
+TRUNCATE vistest;
+COPY vistest FROM stdin CSV FREEZE;
+SELECT * FROM vistest;
+ a  
+----
+ d2
+ e
+(2 rows)
+
+COMMIT;
+SELECT * FROM vistest;
+ a  
+----
+ d2
+ e
+(2 rows)
+
+BEGIN;
+TRUNCATE vistest;
+COPY vistest FROM stdin CSV FREEZE;
+SELECT * FROM vistest;
+ a 
+---
+ x
+ y
+(2 rows)
+
+COMMIT;
+TRUNCATE vistest;
+COPY vistest FROM stdin CSV FREEZE;
+ERROR:  cannot perform COPY FREEZE because the table was not created or truncated in the current subtransaction
+BEGIN;
+TRUNCATE vistest;
+SAVEPOINT s1;
+COPY vistest FROM stdin CSV FREEZE;
+ERROR:  cannot perform COPY FREEZE because the table was not created or truncated in the current subtransaction
+COMMIT;
+BEGIN;
+INSERT INTO vistest VALUES ('z');
+SAVEPOINT s1;
+TRUNCATE vistest;
+ROLLBACK TO SAVEPOINT s1;
+COPY vistest FROM stdin CSV FREEZE;
+ERROR:  cannot perform COPY FREEZE because the table was not created or truncated in the current subtransaction
+COMMIT;
+CREATE FUNCTION truncate_in_subxact() RETURNS VOID AS
+$$
+BEGIN
+	TRUNCATE vistest;
+EXCEPTION
+  WHEN OTHERS THEN
+	INSERT INTO vistest VALUES ('subxact failure');
+END;
+$$ language plpgsql;
+BEGIN;
+INSERT INTO vistest VALUES ('z');
+SELECT truncate_in_subxact();
+ truncate_in_subxact 
+---------------------
+ 
+(1 row)
+
+COPY vistest FROM stdin CSV FREEZE;
+SELECT * FROM vistest;
+ a  
+----
+ d4
+ e
+(2 rows)
+
+COMMIT;
+SELECT * FROM vistest;
+ a  
+----
+ d4
+ e
+(2 rows)
+
+-- Test FORCE_NOT_NULL and FORCE_NULL options
+CREATE TEMP TABLE forcetest (
+    a INT NOT NULL,
+    b TEXT NOT NULL,
+    c TEXT,
+    d TEXT,
+    e TEXT
+);
+\pset null NULL
+-- should succeed with no effect ("b" remains an empty string, "c" remains NULL)
+BEGIN;
+COPY forcetest (a, b, c) FROM STDIN WITH (FORMAT csv, FORCE_NOT_NULL(b), FORCE_NULL(c));
+COMMIT;
+SELECT b, c FROM forcetest WHERE a = 1;
+ b |  c   
+---+------
+   | NULL
+(1 row)
+
+-- should succeed, FORCE_NULL and FORCE_NOT_NULL can be both specified
+BEGIN;
+COPY forcetest (a, b, c, d) FROM STDIN WITH (FORMAT csv, FORCE_NOT_NULL(c,d), FORCE_NULL(c,d));
+COMMIT;
+SELECT c, d FROM forcetest WHERE a = 2;
+ c |  d   
+---+------
+   | NULL
+(1 row)
+
+-- should fail with not-null constraint violation
+BEGIN;
+COPY forcetest (a, b, c) FROM STDIN WITH (FORMAT csv, FORCE_NULL(b), FORCE_NOT_NULL(c));
+ERROR:  null value in column "b" of relation "forcetest" violates not-null constraint
+DETAIL:  Failing row contains (3, null, , null, null).
+CONTEXT:  COPY forcetest, line 1: "3,,"""
+ROLLBACK;
+-- should fail with "not referenced by COPY" error
+BEGIN;
+COPY forcetest (d, e) FROM STDIN WITH (FORMAT csv, FORCE_NOT_NULL(b));
+ERROR:  FORCE_NOT_NULL column "b" not referenced by COPY
+ROLLBACK;
+-- should fail with "not referenced by COPY" error
+BEGIN;
+COPY forcetest (d, e) FROM STDIN WITH (FORMAT csv, FORCE_NULL(b));
+ERROR:  FORCE_NULL column "b" not referenced by COPY
+ROLLBACK;
+-- should succeed with no effect ("b" remains an empty string, "c" remains NULL)
+BEGIN;
+COPY forcetest (a, b, c) FROM STDIN WITH (FORMAT csv, FORCE_NOT_NULL *, FORCE_NULL *);
+COMMIT;
+SELECT b, c FROM forcetest WHERE a = 4;
+ b |  c   
+---+------
+   | NULL
+(1 row)
+
+-- should succeed with effect ("b" remains an empty string)
+BEGIN;
+COPY forcetest (a, b, c) FROM STDIN WITH (FORMAT csv, FORCE_NOT_NULL *);
+COMMIT;
+SELECT b, c FROM forcetest WHERE a = 5;
+ b | c 
+---+---
+   | 
+(1 row)
+
+-- should succeed with effect ("c" remains NULL)
+BEGIN;
+COPY forcetest (a, b, c) FROM STDIN WITH (FORMAT csv, FORCE_NULL *);
+COMMIT;
+SELECT b, c FROM forcetest WHERE a = 6;
+ b |  c   
+---+------
+ b | NULL
+(1 row)
+
+-- should fail with "conflicting or redundant options" error
+BEGIN;
+COPY forcetest (a, b, c) FROM STDIN WITH (FORMAT csv, FORCE_NOT_NULL *, FORCE_NOT_NULL(b));
+ERROR:  conflicting or redundant options
+LINE 1: ...c) FROM STDIN WITH (FORMAT csv, FORCE_NOT_NULL *, FORCE_NOT_...
+                                                             ^
+ROLLBACK;
+-- should fail with "conflicting or redundant options" error
+BEGIN;
+COPY forcetest (a, b, c) FROM STDIN WITH (FORMAT csv, FORCE_NULL *, FORCE_NULL(b));
+ERROR:  conflicting or redundant options
+LINE 1: ... b, c) FROM STDIN WITH (FORMAT csv, FORCE_NULL *, FORCE_NULL...
+                                                             ^
+ROLLBACK;
+\pset null ''
+-- test case with whole-row Var in a check constraint
+create table check_con_tbl (f1 int);
+create function check_con_function(check_con_tbl) returns bool as $$
+begin
+  raise notice 'input = %', row_to_json($1);
+  return $1.f1 > 0;
+end $$ language plpgsql immutable;
+alter table check_con_tbl add check (check_con_function(check_con_tbl.*));
+\d+ check_con_tbl
+                               Table "public.check_con_tbl"
+ Column |  Type   | Collation | Nullable | Default | Storage | Stats target | Description 
+--------+---------+-----------+----------+---------+---------+--------------+-------------
+ f1     | integer |           |          |         | plain   |              | 
+Check constraints:
+    "check_con_tbl_check" CHECK (check_con_function(check_con_tbl.*))
+
+copy check_con_tbl from stdin;
+NOTICE:  input = {"f1":1}
+NOTICE:  input = {"f1":null}
+copy check_con_tbl from stdin;
+NOTICE:  input = {"f1":0}
+ERROR:  new row for relation "check_con_tbl" violates check constraint "check_con_tbl_check"
+DETAIL:  Failing row contains (0).
+CONTEXT:  COPY check_con_tbl, line 1: "0"
+select * from check_con_tbl;
+ f1 
+----
+  1
+   
+(2 rows)
+
+-- test with RLS enabled.
+CREATE ROLE regress_rls_copy_user;
+CREATE ROLE regress_rls_copy_user_colperms;
+CREATE TABLE rls_t1 (a int, b int, c int);
+COPY rls_t1 (a, b, c) from stdin;
+CREATE POLICY p1 ON rls_t1 FOR SELECT USING (a % 2 = 0);
+ALTER TABLE rls_t1 ENABLE ROW LEVEL SECURITY;
+ALTER TABLE rls_t1 FORCE ROW LEVEL SECURITY;
+GRANT SELECT ON TABLE rls_t1 TO regress_rls_copy_user;
+GRANT SELECT (a, b) ON TABLE rls_t1 TO regress_rls_copy_user_colperms;
+-- all columns
+COPY rls_t1 TO stdout;
+1	4	1
+2	3	2
+3	2	3
+4	1	4
+COPY rls_t1 (a, b, c) TO stdout;
+1	4	1
+2	3	2
+3	2	3
+4	1	4
+-- subset of columns
+COPY rls_t1 (a) TO stdout;
+1
+2
+3
+4
+COPY rls_t1 (a, b) TO stdout;
+1	4
+2	3
+3	2
+4	1
+-- column reordering
+COPY rls_t1 (b, a) TO stdout;
+4	1
+3	2
+2	3
+1	4
+SET SESSION AUTHORIZATION regress_rls_copy_user;
+-- all columns
+COPY rls_t1 TO stdout;
+2	3	2
+4	1	4
+COPY rls_t1 (a, b, c) TO stdout;
+2	3	2
+4	1	4
+-- subset of columns
+COPY rls_t1 (a) TO stdout;
+2
+4
+COPY rls_t1 (a, b) TO stdout;
+2	3
+4	1
+-- column reordering
+COPY rls_t1 (b, a) TO stdout;
+3	2
+1	4
+RESET SESSION AUTHORIZATION;
+SET SESSION AUTHORIZATION regress_rls_copy_user_colperms;
+-- attempt all columns (should fail)
+COPY rls_t1 TO stdout;
+ERROR:  permission denied for table rls_t1
+COPY rls_t1 (a, b, c) TO stdout;
+ERROR:  permission denied for table rls_t1
+-- try to copy column with no privileges (should fail)
+COPY rls_t1 (c) TO stdout;
+ERROR:  permission denied for table rls_t1
+-- subset of columns (should succeed)
+COPY rls_t1 (a) TO stdout;
+2
+4
+COPY rls_t1 (a, b) TO stdout;
+2	3
+4	1
+RESET SESSION AUTHORIZATION;
+-- test with INSTEAD OF INSERT trigger on a view
+CREATE TABLE instead_of_insert_tbl(id serial, name text);
+CREATE VIEW instead_of_insert_tbl_view AS SELECT ''::text AS str;
+COPY instead_of_insert_tbl_view FROM stdin; -- fail
+ERROR:  cannot copy to view "instead_of_insert_tbl_view"
+HINT:  To enable copying to a view, provide an INSTEAD OF INSERT trigger.
+CREATE FUNCTION fun_instead_of_insert_tbl() RETURNS trigger AS $$
+BEGIN
+  INSERT INTO instead_of_insert_tbl (name) VALUES (NEW.str);
+  RETURN NULL;
+END;
+$$ LANGUAGE plpgsql;
+CREATE TRIGGER trig_instead_of_insert_tbl_view
+  INSTEAD OF INSERT ON instead_of_insert_tbl_view
+  FOR EACH ROW EXECUTE PROCEDURE fun_instead_of_insert_tbl();
+COPY instead_of_insert_tbl_view FROM stdin;
+SELECT * FROM instead_of_insert_tbl;
+ id | name  
+----+-------
+  1 | test1
+(1 row)
+
+-- Test of COPY optimization with view using INSTEAD OF INSERT
+-- trigger when relation is created in the same transaction as
+-- when COPY is executed.
+BEGIN;
+CREATE VIEW instead_of_insert_tbl_view_2 as select ''::text as str;
+CREATE TRIGGER trig_instead_of_insert_tbl_view_2
+  INSTEAD OF INSERT ON instead_of_insert_tbl_view_2
+  FOR EACH ROW EXECUTE PROCEDURE fun_instead_of_insert_tbl();
+COPY instead_of_insert_tbl_view_2 FROM stdin;
+SELECT * FROM instead_of_insert_tbl;
+ id | name  
+----+-------
+  1 | test1
+  2 | test1
+(2 rows)
+
+COMMIT;
+-- tests for on_error option
+CREATE TABLE check_ign_err (n int, m int[], k int);
+COPY check_ign_err FROM STDIN WITH (on_error stop);
+ERROR:  invalid input syntax for type integer: "a"
+CONTEXT:  COPY check_ign_err, line 2, column n: "a"
+-- want context for notices
+\set SHOW_CONTEXT always
+COPY check_ign_err FROM STDIN WITH (on_error ignore, log_verbosity verbose);
+NOTICE:  skipping row due to data type incompatibility at line 2 for column "n": "a"
+CONTEXT:  COPY check_ign_err
+NOTICE:  skipping row due to data type incompatibility at line 3 for column "k": "3333333333"
+CONTEXT:  COPY check_ign_err
+NOTICE:  skipping row due to data type incompatibility at line 4 for column "m": "{a, 4}"
+CONTEXT:  COPY check_ign_err
+NOTICE:  skipping row due to data type incompatibility at line 5 for column "n": ""
+CONTEXT:  COPY check_ign_err
+NOTICE:  skipping row due to data type incompatibility at line 7 for column "m": "a"
+CONTEXT:  COPY check_ign_err
+NOTICE:  skipping row due to data type incompatibility at line 8 for column "k": "a"
+CONTEXT:  COPY check_ign_err
+NOTICE:  6 rows were skipped due to data type incompatibility
+-- tests for on_error option with log_verbosity and null constraint via domain
+CREATE DOMAIN dcheck_ign_err2 varchar(15) NOT NULL;
+CREATE TABLE check_ign_err2 (n int, m int[], k int, l dcheck_ign_err2);
+COPY check_ign_err2 FROM STDIN WITH (on_error ignore, log_verbosity verbose);
+NOTICE:  skipping row due to data type incompatibility at line 2 for column "l": null input
+CONTEXT:  COPY check_ign_err2
+NOTICE:  1 row was skipped due to data type incompatibility
+COPY check_ign_err2 FROM STDIN WITH (on_error ignore, log_verbosity silent);
+-- reset context choice
+\set SHOW_CONTEXT errors
+SELECT * FROM check_ign_err;
+ n |  m  | k 
+---+-----+---
+ 1 | {1} | 1
+ 5 | {5} | 5
+ 8 | {8} | 8
+(3 rows)
+
+SELECT * FROM check_ign_err2;
+ n |  m  | k |   l   
+---+-----+---+-------
+ 1 | {1} | 1 | 'foo'
+ 3 | {3} | 3 | 'bar'
+(2 rows)
+
+-- test datatype error that can't be handled as soft: should fail
+CREATE TABLE hard_err(foo widget);
+COPY hard_err FROM STDIN WITH (on_error ignore);
+ERROR:  invalid input syntax for type widget: "1"
+CONTEXT:  COPY hard_err, line 1, column foo: "1"
+-- test missing data: should fail
+COPY check_ign_err FROM STDIN WITH (on_error ignore);
+ERROR:  missing data for column "k"
+CONTEXT:  COPY check_ign_err, line 1: "1	{1}"
+-- test extra data: should fail
+COPY check_ign_err FROM STDIN WITH (on_error ignore);
+ERROR:  extra data after last expected column
+CONTEXT:  COPY check_ign_err, line 1: "1	{1}	3	abc"
+-- tests for reject_limit option
+COPY check_ign_err FROM STDIN WITH (on_error ignore, reject_limit 3);
+ERROR:  skipped more than REJECT_LIMIT (3) rows due to data type incompatibility
+CONTEXT:  COPY check_ign_err, line 5, column n: ""
+COPY check_ign_err FROM STDIN WITH (on_error ignore, reject_limit 4);
+NOTICE:  4 rows were skipped due to data type incompatibility
+-- clean up
+DROP TABLE forcetest;
+DROP TABLE vistest;
+DROP FUNCTION truncate_in_subxact();
+DROP TABLE x, y;
+DROP TABLE rls_t1 CASCADE;
+DROP ROLE regress_rls_copy_user;
+DROP ROLE regress_rls_copy_user_colperms;
+DROP FUNCTION fn_x_before();
+DROP FUNCTION fn_x_after();
+DROP TABLE instead_of_insert_tbl;
+DROP VIEW instead_of_insert_tbl_view;
+DROP VIEW instead_of_insert_tbl_view_2;
+DROP FUNCTION fun_instead_of_insert_tbl();
+DROP TABLE check_ign_err;
+DROP TABLE check_ign_err2;
+DROP DOMAIN dcheck_ign_err2;
+DROP TABLE hard_err;
+--
+-- COPY FROM ... DEFAULT
+--
+create temp table copy_default (
+	id integer primary key,
+	text_value text not null default 'test',
+	ts_value timestamp without time zone not null default '2022-07-05'
+);
+-- if DEFAULT is not specified, then the marker will be regular data
+copy copy_default from stdin;
+select id, text_value, ts_value from copy_default;
+ id | text_value |         ts_value         
+----+------------+--------------------------
+  1 | value      | Mon Jul 04 00:00:00 2022
+  2 | D          | Tue Jul 05 00:00:00 2022
+(2 rows)
+
+truncate copy_default;
+copy copy_default from stdin with (format csv);
+select id, text_value, ts_value from copy_default;
+ id | text_value |         ts_value         
+----+------------+--------------------------
+  1 | value      | Mon Jul 04 00:00:00 2022
+  2 | \D         | Tue Jul 05 00:00:00 2022
+(2 rows)
+
+truncate copy_default;
+-- DEFAULT cannot be used in binary mode
+copy copy_default from stdin with (format binary, default '\D');
+ERROR:  cannot specify DEFAULT in BINARY mode
+-- DEFAULT cannot be new line nor carriage return
+copy copy_default from stdin with (default E'\n');
+ERROR:  COPY default representation cannot use newline or carriage return
+copy copy_default from stdin with (default E'\r');
+ERROR:  COPY default representation cannot use newline or carriage return
+-- DELIMITER cannot appear in DEFAULT spec
+copy copy_default from stdin with (delimiter ';', default 'test;test');
+ERROR:  COPY delimiter character must not appear in the DEFAULT specification
+-- CSV quote cannot appear in DEFAULT spec
+copy copy_default from stdin with (format csv, quote '"', default 'test"test');
+ERROR:  CSV quote character must not appear in the DEFAULT specification
+-- NULL and DEFAULT spec must be different
+copy copy_default from stdin with (default '\N');
+ERROR:  NULL specification and DEFAULT specification cannot be the same
+-- cannot use DEFAULT marker in column that has no DEFAULT value
+copy copy_default from stdin with (default '\D');
+ERROR:  unexpected default marker in COPY data
+DETAIL:  Column "id" has no default value.
+CONTEXT:  COPY copy_default, line 1: "\D	value	'2022-07-04'"
+copy copy_default from stdin with (format csv, default '\D');
+ERROR:  unexpected default marker in COPY data
+DETAIL:  Column "id" has no default value.
+CONTEXT:  COPY copy_default, line 1: "\D,value,2022-07-04"
+-- The DEFAULT marker must be unquoted and unescaped or it's not recognized
+copy copy_default from stdin with (default '\D');
+select id, text_value, ts_value from copy_default;
+ id | text_value |         ts_value         
+----+------------+--------------------------
+  1 | test       | Mon Jul 04 00:00:00 2022
+  2 | \D         | Mon Jul 04 00:00:00 2022
+  3 | "D"        | Mon Jul 04 00:00:00 2022
+(3 rows)
+
+truncate copy_default;
+copy copy_default from stdin with (format csv, default '\D');
+select id, text_value, ts_value from copy_default;
+ id | text_value |         ts_value         
+----+------------+--------------------------
+  1 | test       | Mon Jul 04 00:00:00 2022
+  2 | \\D        | Mon Jul 04 00:00:00 2022
+  3 | \D         | Mon Jul 04 00:00:00 2022
+(3 rows)
+
+truncate copy_default;
+-- successful usage of DEFAULT option in COPY
+copy copy_default from stdin with (default '\D');
+select id, text_value, ts_value from copy_default;
+ id | text_value |         ts_value         
+----+------------+--------------------------
+  1 | value      | Mon Jul 04 00:00:00 2022
+  2 | test       | Sun Jul 03 00:00:00 2022
+  3 | test       | Tue Jul 05 00:00:00 2022
+(3 rows)
+
+truncate copy_default;
+copy copy_default from stdin with (format csv, default '\D');
+select id, text_value, ts_value from copy_default;
+ id | text_value |         ts_value         
+----+------------+--------------------------
+  1 | value      | Mon Jul 04 00:00:00 2022
+  2 | test       | Sun Jul 03 00:00:00 2022
+  3 | test       | Tue Jul 05 00:00:00 2022
+(3 rows)
+
+truncate copy_default;
+-- DEFAULT cannot be used in COPY TO
+copy (select 1 as test) TO stdout with (default '\D');
+ERROR:  COPY DEFAULT cannot be used with COPY TO

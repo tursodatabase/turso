@@ -1,0 +1,396 @@
+# 2021-03-06
+#
+# The author disclaims copyright to this source code.  In place of
+# a legal notice, here is a blessing:
+#
+#    May you do good and not evil.
+#    May you find forgiveness for yourself and forgive others.
+#    May you share freely, never taking more than you give.
+#
+#***********************************************************************
+# TESTRUNNER: shell
+# 
+# This file implements tests for the appendvfs extension.
+#
+# Tests performed:
+# avfs-1.0. Test that an appendvfs DB can be added to an empty (ZLF) file.
+# avfs-1.1. Test that the DB can be read with correct content upon reopen.
+# avfs-1.2. Test that an appendvfs DB can be added to a simple text file.
+# avfs-1.3. Test that the DB can be read with correct content upon reopen.
+# avfs-1.4. Test that appended DB is aligned to default page boundary.
+# avfs-2.1. Test that the simple text file retains its initial text.
+# avfs-3.1. Test that the appendvfs can grow and shrink, remaining intact.
+# avfs-3.2. Test that appendvfs is intact after grow/shrink/close/reopen.
+# avfs-3.3. Test that appendvfs can grow by many pages and be written.
+# avfs-3.4. Test that grown appendvfs can be reopened and appear intact.
+# avfs-3.5. Test that much grown appendvfs can shrink and reopen intact.
+# avfs-4.1. Test shell's ability to append to a non-appendvfs file.
+# avfs-4.2. Test shell's ability to append to empty or nonexistent file.
+# avfs-4.3. Test shell's ability to reopen and alter an appendvfs file.
+# avfs-5.1. Test appendvfs refusal to open too-tiny DB appended onto ZLF.
+# avfs-5.2. Test appendvfs refusal to open too-tiny DB appended on other.
+# ...
+# (more to come)
+
+set testdir [file dirname $argv0]
+source $testdir/tester.tcl
+set ::testprefix avfs
+
+# Do not attempt this test if SQLITE_OMIT_VIRTUALTABLE is defined. 
+#
+ifcapable !vtab {
+  finish_test
+  return
+}
+
+set CLI [test_find_cli]
+db close
+# forcedelete test.db
+
+load_static_extension db appendvfs
+
+set ::fa avfs.adb
+set ::fza avfs.sdb
+forcedelete $::fa $::fza
+set ::result {}
+
+proc shellDoesAr {} {
+  set shdo "sh_app1.sql"
+  forcedelete $shdo
+  set fd [open $shdo w]
+  puts $fd ".help\n.q"
+  close $fd
+  set res [catchcmd "-batch -cmd \".read $shdo\""]
+  return [regexp {^.archive} [lindex $res 1]]
+}
+
+set ::vf "&vfs=apndvfs"
+
+# Return file offset of appendvfs portion of a file, or {} if none such.
+proc fosAvfs {fname} {
+  if {[file size $fname] < 25} {
+    return {}
+  }
+  if {[catch {set fd [open $fname rb]}]} {
+    return {}
+  }
+  seek $fd -25 end
+  set am [read $fd 17]
+  set ao [read $fd 8]
+  close $fd
+  if {$am ne "Start-Of-SQLite3-"} {
+    return {}
+  }
+  binary scan $ao "W" rvo
+  return $rvo
+}
+
+do_test 1.0 {
+  set results {}
+  set out [open $::fza wb]
+  close $out
+  sqlite3 adb "file:$::fza?mode=rwc$::vf" -uri 1
+  adb eval {
+    PRAGMA page_size=1024;
+    PRAGMA cache_size=10;
+    CREATE TABLE t1(a TEXT);
+    INSERT INTO t1 VALUES ('dog'),('cat');
+    SELECT group_concat(a) as pets FROM (SELECT a FROM t1 ORDER BY a);
+  } { lappend results $pets }
+  adb close
+  lappend results [fosAvfs $fza]
+  set ::result [join $results " | "]
+} {cat,dog | 0}
+
+do_test 1.1 {
+  set results {}
+  sqlite3 adb "file:$::fza?mode=rw$::vf" -uri 1
+  adb eval {
+    SELECT group_concat(a) as pets FROM (SELECT a FROM t1 ORDER BY a DESC);
+  } { lappend results $pets }
+  adb close
+  set ::result [join $results " | "]
+} {dog,cat}
+
+do_test 1.2 {
+  set results {}
+  set out [open $::fa wb]
+  set ::tlo { "Just some text," "and more text," "ending at 3 lines." }
+  puts $out [join $::tlo "\n"]
+  close $out
+  set adbSz [file size $::fa]
+  sqlite3 adb "file:$::fa?mode=rwc$::vf" -uri 1
+  adb eval {
+    PRAGMA auto_vacuum = 0;
+    PRAGMA page_size=512;
+    PRAGMA cache_size=0;
+    CREATE TABLE t1(a TEXT);
+    INSERT INTO t1 VALUES ('dog'),('cat'),('pig');
+    SELECT group_concat(a) as pets FROM (SELECT a FROM t1 ORDER BY a);
+  } { lappend results $pets }
+  adb close
+  set adaSz [file size $::fa]
+  lappend results "Bytes before/after $adbSz/$adaSz"
+  set ::result [join $results " | "]
+} {cat,dog,pig | Bytes before/after 50/5145}
+
+do_test 1.3 {
+  set results {}
+  sqlite3 adb "file:$::fa?mode=rw$::vf" -uri 1
+  adb eval {
+    SELECT group_concat(a) as pets FROM (SELECT a FROM t1 ORDER BY a DESC);
+  } { lappend results $pets }
+  adb close
+  set ::result [join $results " | "]
+} {pig,dog,cat}
+
+do_test 1.4 {
+  set ::result [fosAvfs $fa]
+} {4096}
+
+do_test 2.1 {
+  set in [open $::fa r]
+  set tli {}
+  for {set i [llength $::tlo]} {$i > 0} {incr i -1} {
+    lappend tli [gets $in]
+  }
+  close $in
+  if { [join $tli ":"] ne [join $::tlo ":"] } {
+    set ::result "Appendee changed."
+  } else {
+    set ::result "Appendee intact."
+  }
+} {Appendee intact.}
+
+# Set of repeatable random integers for a couple tests.
+set ::nrint 50000
+proc rint {v} {
+  return [::tcl::mathfunc::int [expr $v * 100000]]
+}
+array set ::randints [list 0 [rint [::tcl::mathfunc::srand 0]]]
+for {set i 1} {$i < $::nrint} {incr i} {
+  set ::randints($i) [rint [::tcl::mathfunc::rand]]
+}
+
+do_test 3.1 {
+  set results {}
+  sqlite3 adb "file:$::fa?mode=rw$::vf" -uri 1
+  adb eval {
+    DROP TABLE t1;
+    PRAGMA cache_size=10;
+    CREATE TABLE ri (i INTEGER);
+    BEGIN;
+  }
+  for {set i 0} {$i < $::nrint} {incr i} {
+    set r $::randints($i)
+    set s $::randints([incr i])
+    set t $::randints([incr i])
+    set u $::randints([incr i])
+    set v $::randints([incr i])
+    adb eval {
+      INSERT INTO ri VALUES ($r),($s),($t),($u),($v)
+    }
+  }
+  adb eval {
+    COMMIT;
+    SELECT integrity_check as ic FROM pragma_integrity_check();
+  } { lappend results $ic }
+  set adbSz [file size $::fa]
+  set qr {}
+  adb eval {
+    SELECT count(*) as ic FROM ri;
+    DELETE FROM ri WHERE (i % 50) <> 25;
+    SELECT integrity_check as ic FROM pragma_integrity_check();
+    VACUUM;
+    SELECT integrity_check as ic FROM pragma_integrity_check();
+    SELECT count(*) as ic FROM ri;
+  } { lappend qr $ic }
+  adb close
+  set adaSz [file size $::fa]
+  set adba [expr ($adbSz + 0.1)/$adaSz]
+  # lappend results $adba
+  set results [concat $results [lrange $qr 0 2]]
+  lappend results [expr {$adba > 10.0}]
+  set ::result [join $results " | "]
+} "ok | $::nrint | ok | ok | 1"
+
+do_test 3.2 {
+  set results {}
+  sqlite3 adb "file:$::fa?mode=rw$::vf" -uri 1
+  adb eval {
+    SELECT integrity_check as ic FROM pragma_integrity_check();
+  } { lappend results $ic }
+  adb close
+  set ::result [join $results " | "]
+} {ok}
+
+# avfs-3.3. Test that appendvfs can grow by many pages and be written.
+do_test 3.3 {
+  set results {}
+  sqlite3 adb "file:$::fa?mode=rw$::vf" -uri 1
+  set npages 300
+  adb eval { BEGIN }
+  while {$npages > 0} {
+    adb eval { INSERT INTO ri VALUES (randomblob(1500)) }
+    incr npages -1
+  }
+  adb eval { COMMIT }
+  adb eval {
+    SELECT integrity_check as ic FROM pragma_integrity_check();
+  } { lappend results $ic }
+  adb close
+  set adaSzr [expr [file size $::fa] / 300.0 / 1500 ]
+  set okSzr [expr $adaSzr > 1.0 && $adaSzr < 1.3 ]
+  lappend results $okSzr
+  set ::result [join $results " | "]
+} {ok | 1}
+
+# avfs-3.4. Test that grown appendvfs can be reopened and appear intact.
+do_test 3.4 {
+  set results {}
+  sqlite3 adb "file:$::fa?mode=rw$::vf" -uri 1
+  adb eval {
+    SELECT integrity_check as ic FROM pragma_integrity_check();
+  } { lappend results $ic }
+  adb close
+  set ::result $ic
+} {ok}
+
+# avfs-3.5. Test that much grown appendvfs can shrink and reopen intact.
+do_test 3.5 {
+  set results {}
+  set adbsz [file size $::fa]
+  sqlite3 adb "file:$::fa?mode=rw$::vf" -uri 1
+  adb eval {
+    DELETE FROM ri WHERE rowid % 8 <> 0;
+    SELECT integrity_check as ic FROM pragma_integrity_check();
+    VACUUM;
+    SELECT integrity_check as ic FROM pragma_integrity_check();
+  } { lappend results $ic }
+  adb close
+  set adasz [file size $::fa]
+  lappend results [expr {$adbsz/$adasz > 5}]
+  sqlite3 adb "file:$::fa?mode=rw$::vf" -uri 1
+  adb eval {
+    SELECT integrity_check as ic FROM pragma_integrity_check();
+  } { lappend results $ic }
+  adb close
+  set ::result [join $results " | "]
+} {ok | ok | 1 | ok}
+
+set ::cliDoesAr [shellDoesAr]
+
+do_test 4.1 {
+  set shdo "sh_app1.sql"
+  set shod "sh_app1.adb"
+  forcedelete $shdo $shod
+  set ofd [open $shdo w]
+  if {$::cliDoesAr} {
+    puts $ofd ".ar -c"
+  } else {
+    puts $ofd "pragma page_size=512;"
+    puts $ofd "create table sqlar (a);"
+  }
+  puts $ofd ".tables"
+  puts $ofd ".q"
+  close $ofd
+  set ofd [open $shod wb]
+  puts $ofd "Some text."
+  close $ofd
+  set res [catchcmd "-append -batch -init $shdo $shod" ""]
+  lappend res [fosAvfs $shod]
+  forcedelete $shdo $shod
+  set ::result [join $res " | "]
+} {0 | sqlar | 4096}
+
+do_test 4.2 {
+  set shdo "sh_app1.sql"
+  set shod "sh_app1.adb"
+  forcedelete $shdo $shod
+  set ofd [open $shdo w]
+  if {$::cliDoesAr} {
+    puts $ofd ".ar -c"
+  } else {
+    puts $ofd "pragma page_size=512;"
+    puts $ofd "create table sqlar (a);"
+  }
+  puts $ofd ".tables"
+  puts $ofd ".q"
+  close $ofd
+  set ofd [open $shod wb]
+  close $ofd
+  set res [catchcmd "-append -batch -init $shdo $shod" ""]
+  lappend res [fosAvfs $shod]
+  forcedelete $shdo ; # Leave $shod for next test.
+  set ::result [join $res " | "]
+} {0 | sqlar | 0}
+
+do_test 4.3 {
+  set shdo "sh_app1.sql"
+  set shod "sh_app1.adb" ; # Same as test 4.2, reusing ADB.
+  forcedelete $shdo
+  set ofd [open $shdo w]
+  if {$::cliDoesAr} {
+    puts $ofd ".ar -u $shdo"
+    puts $ofd "select count(*) from sqlar where name = '$shdo';"
+  } else {
+    puts $ofd "insert into sqlar values (1);"
+    puts $ofd "select count(*) from sqlar;"
+  }
+  puts $ofd ".q"
+  close $ofd
+  set res [catchcmd "-append -batch -init $shdo $shod" ""]
+  sqlite3 adb "file:$shod?mode=rw$::vf" -uri 1
+  adb eval {
+    SELECT count(*) as n FROM sqlar
+  } { lappend res $n }
+  adb close
+  forcedelete $shdo $shod;
+  set ::result [join $res " | "]
+} {0 | 1 | 1}
+
+do_test 5.1 {
+  set fake "faketiny.sdb"
+  forcedelete $fake
+  set ofd [open $fake wb]
+  puts -nonewline $ofd "SQLite format 3"
+  puts -nonewline $ofd [binary format "c" 0]
+  puts -nonewline $ofd "Start-Of-SQLite3-"
+  puts -nonewline $ofd [binary format "W" 0]
+  close $ofd
+  if {[catch {sqlite3 adb "file:$fake?mode=rw$::vf" -uri 1}]} {
+    set res "Open failed."
+  } else {
+    adb close
+    set res "Opened when should not."
+  }
+  forcedelete $fake
+  set ::result $res
+} {Open failed.}
+
+do_test 5.2 {
+  set fake "faketiny.sdb"
+  forcedelete $fake
+  set ofd [open $fake wb]
+  set fakeAppendee "Dog ate my homework.\n"
+  puts -nonewline $ofd $fakeAppendee
+  puts -nonewline $ofd "SQLite format 3"
+  puts -nonewline $ofd [binary format "c" 0]
+  puts -nonewline $ofd "Start-Of-SQLite3-"
+  puts -nonewline $ofd [binary format "W" [string length $fakeAppendee]]
+  close $ofd
+  if {[catch {sqlite3 adb "file:$fake?mode=rw$::vf" -uri 1}]} {
+    set res "Open failed."
+  } else {
+    adb close
+    set res "Opened when should not."
+  }
+  forcedelete $fake
+  set ::result $res
+} {Open failed.}
+
+forcedelete $::fa $::fza
+
+unset -nocomplain ::fa ::fza ::tlo ::result ::randints ::nrint ::cliDoesAr
+
+finish_test

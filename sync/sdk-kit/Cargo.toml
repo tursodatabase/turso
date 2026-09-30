@@ -1,0 +1,35 @@
+[package]
+name = "turso_sync_sdk_kit"
+description = "Low-level C ABI for Turso Cloud sync in language bindings. For Rust applications, use the `turso` crate instead."
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[features]
+pure-rust-crypto = ["turso_core/pure-rust-crypto", "turso_sdk_kit/pure-rust-crypto"]
+fts = ["turso_core/fts", "turso_sdk_kit/fts"]
+
+[lib]
+doc = false
+crate-type = ["lib", "cdylib", "staticlib"]
+
+[dependencies]
+env_logger = { workspace = true, default-features = false }
+turso_core = { workspace = true }
+turso_sync_engine = { workspace = true }
+turso_sdk_kit = { workspace = true }
+turso_sdk_kit_macros = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true, features = ["env-filter"] }
+genawaiter = { version = "0.99.1", default-features = false }
+parking_lot = { workspace = true, features = ["arc_lock", "send_guard"] }
+
+# Rolling file appender: no filesystem to roll onto in a browser, and its symlink path does not
+# compile for wasm.
+[target.'cfg(not(target_family = "wasm"))'.dependencies]
+tracing-appender = { workspace = true }
+
+[build-dependencies]
+bindgen = "0.69.5"

@@ -1,0 +1,31 @@
+@database :memory:
+
+# sqlite3_errmsg reports constraint failures without a result-code suffix;
+# the "(19)" the sqlite3 shell prints is shell decoration. Turso used to bake
+# " (19)" into UNIQUE, NOT NULL, and PRIMARY KEY failure messages.
+
+test unique-constraint-error-has-no-result-code-suffix {
+    CREATE TABLE u (a UNIQUE);
+    INSERT INTO u VALUES (1);
+    INSERT INTO u VALUES (1);
+}
+expect error {
+    ^UNIQUE constraint failed: u\.a$
+}
+
+test not-null-constraint-error-has-no-result-code-suffix {
+    CREATE TABLE nn (a NOT NULL);
+    INSERT INTO nn VALUES (NULL);
+}
+expect error {
+    ^NOT NULL constraint failed: nn\.a$
+}
+
+test primary-key-constraint-error-has-no-result-code-suffix {
+    CREATE TABLE pk (a INTEGER PRIMARY KEY);
+    INSERT INTO pk VALUES (1);
+    INSERT INTO pk VALUES (1);
+}
+expect error {
+    ^UNIQUE constraint failed: pk\.a$
+}

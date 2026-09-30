@@ -1,0 +1,41 @@
+@database :memory:
+
+@cross-check-integrity
+test avg_hex_large {
+    CREATE TABLE t1 (a);
+    INSERT INTO t1 VALUES (hex(18446744073709551488));
+    SELECT typeof(AVG(a)), AVG(a) FROM t1;
+}
+expect {
+    real|Inf
+}
+
+@cross-check-integrity
+test sum_hex_large {
+    CREATE TABLE t2 (a);
+    INSERT INTO t2 VALUES (hex(18446744073709551488));
+    SELECT typeof(SUM(a)), SUM(a) FROM t2;
+}
+expect {
+    real|Inf
+}
+
+@cross-check-integrity
+test avg_extreme_exponent_text {
+    CREATE TABLE t3 (a);
+    INSERT INTO t3 VALUES ('1e999');
+    SELECT typeof(AVG(a)), AVG(a) FROM t3;
+}
+expect {
+    real|Inf
+}
+
+@cross-check-integrity
+test sum_extreme_exponent_text {
+    CREATE TABLE t4 (a);
+    INSERT INTO t4 VALUES ('1e999');
+    SELECT typeof(SUM(a)), SUM(a) FROM t4;
+}
+expect {
+    real|Inf
+}

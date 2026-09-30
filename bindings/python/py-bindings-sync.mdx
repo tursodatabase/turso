@@ -1,0 +1,128 @@
+---
+name: 2025-11-26-py-bindings
+---
+
+<Output path="./turso/lib_sync.py">
+
+<Code model="openai/gpt-5" language="python">
+
+Turso - is the SQLite compatible database written in Rust.
+One of the important features of the Turso - is native ability to sync database with the Cloud in both directions (push local changes and pull remote changes).
+
+Your task is to generate EXTRA functionality on top of the existing Python driver which will extend regular embedded with sync capability.
+Do not modify existing driver - its already implemented in the lib.py
+Your task is to write extra code which will use abstractions lib.py and build sync support in the Python on top of it in the lib_sync.py file.
+
+# Rules
+
+General rules for driver implementation you **MUST** follow and never go against these rules:
+
+- USE already implemented driver - DO NOT copy it
+- SET async_io=True for the driver database configuration - because partial sync support requires TURSO_IO to handled externally from the bindings
+- STRUCTURE of the implementation
+  - Declaration order of elements and semantic blocks MUST be exsactly the same
+  - (details and full enumerations omited in the example for brevity but you must generate full code)
+
+```py
+# ALL imports MUST be at the beginning - no imports in the middle of function
+from typing import ...
+from dataclasses import dataclass
+# for HTTP IO
+import urllib.request
+import urllib.error
+
+from .lib import Connection as _Connection
+from ._turso import ( ... )
+
+class ConnectionSync(_Connection):
+    def __init__(...): ...
+
+    def pull(self) -> bool: ... # returns True of new updates were pulled; False if no new updates were fetched; determine changes by inspecting .empty() method of changes
+    def push(self) -> None: ...
+    def checkpoint(self) -> None: ...
+    def stats(self) -> None: ...
+
+@dataclass
+class PartialSyncPrefixBootstrap:
+    # Bootstraps DB by fetching first N bytes/pages; enables partial sync
+    length: int
+
+
+@dataclass
+class PartialSyncQueryBootstrap:
+    # Bootstraps DB by fetching pages touched by given SQL query on server
+    query: str
+
+@dataclass
+class PartialSyncOpts:
+    bootstrap_strategy: Union[PartialSyncPrefixBootstrap, PartialSyncQueryBootstrap]
+    segment_size: Optional[int] = None
+    prefetch: Optional[bool] = None
+
+def connect_sync(
+    path: str, # path to the main database file locally
+    # remote url for the sync - can be lambda which will be evaluated on every http request; if lambda returns None - internal http processing must return error which will bubble-up in the sync engine
+    # remote_url MUST be used in all sync engine operations: during bootstrap and all further operations
+    # remote_url must accept either http://, https:// or libsql:// protocol, where later must be just replaced with https:// under the hood for now
+    remote_url: Union[str, Callable[[], Optional[str]]],
+    *,
+    # token for remote authentication - can be lambda which will be evaluted on every http request; if lambda returns None - internal http processing must return error which will bubble-up in the sync engine
+    # auth token value ("fixed" or got from lambda) WILL not have any prefix and must be used as "Authorization" header prepended with "Bearer " prefix
+    auth_token: Optional[Union[str, Callable[[], Optional[str]]]],
+    client_name: Optional[str], # optional unique client name (library MUST use `turso-sync-py` if omitted)
+    long_poll_timeout_ms: Optional[number], # long polling timeout
+    bootstrap_if_empty: bool = True, # if not set, initial bootstrap phase will be skipped and caller must call .pull(...) explicitly in order to get initial state from remote
+    partial_sync_experimental: Optional[PartialSyncOpts] = None, # EXPERIMENTAL partial sync configuration
+    experimental_features: Optional[str] = None, # pass it as-is to the underlying connection
+    isolation_level: Optional[str] = "DEFERRED", # pass it as-is to the underlying connection
+) -> ConnectionSync: ...
+
+```
+
+- STREAM data from the http request to the completion in chunks and spin async operation in between in order to prevent loading whole response in memory
+
+```py
+# event loop for async operation "op"
+while True:
+    chunk = e.read(CHUNK_SIZE)
+    if not chunk:
+        break
+    io_item.push_buffer(chunk)
+    op.resume() # assert that None is returned
+```
+
+- AVOID unnecessary FFI calls as their cost is non zero
+- AVOID unnecessary strings transformations - replace them with more efficient alternatives if possible
+- AVOID cryptic names - prefer short but concise names (wr is BAD, full_write is GOOD)
+- AVOID duplication of IO processing between `connect_sync` function and methods of `ConnectionSync` class
+- DO NOT use getattr unless this is necessary - use simple field access through dot
+- NEVER EVER put import in the middle of a function - always put all necessary immports at the beginning of the file
+- FOCUS on code readability: extract helper functions if it will contribute to the code readability (do not overoptimize - it's fine to have some logic inlined especially if it is not repeated anywhere else)
+- WATCH OUT for variables scopes and do not use variables which are no longer accessible
+
+# Implementation
+
+- Annotate public API with types
+- Add comments about public API fields/functions to clarify meaning and usage scenarios
+- Use `create()` method for creation of the synced database for now - DO NOT use init + open pair
+- Access #[pyo3(get)] fields through dot (e.g. stats.cdc_operations)
+
+# Bindings
+
+You must use bindings in the lib.rs written with `pyo3` library which has certain conventions.
+
+<File path="./src/lib.rs" />
+<File path="./src/turso_sync.rs" />
+
+Remember, that it can accept `py: Python` argument which will be passed implicitly and exported bindings will not have this extra arg
+
+# Driver
+
+You must integrate with current driver implementation:
+
+<File path="./src/turso.rs" />
+<File path="./turso/lib.py" />
+
+</Code>
+
+</Output>

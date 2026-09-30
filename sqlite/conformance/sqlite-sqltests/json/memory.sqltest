@@ -1,0 +1,124 @@
+@database :memory:
+
+test non-string-path {
+    SELECT * FROM json_each('{}', 123);
+}
+expect error {
+}
+
+test invalid-path {
+    SELECT * FROM json_each('{}', '$$$');
+}
+expect error {
+}
+
+test json-tree-non-string-path {
+    SELECT * FROM json_tree('{}', 123);
+}
+expect error {
+}
+
+test json-tree-invalid-path {
+    SELECT * FROM json_tree('{}', '$$$');
+}
+expect error {
+}
+
+# Malformed JSON edge cases - must error like SQLite
+test json-malformed-empty-string {
+    SELECT json('');
+}
+expect error {
+}
+
+test json-malformed-plus-only {
+    SELECT json('+');
+}
+expect error {
+}
+
+test json-malformed-minus-only {
+    SELECT json('-');
+}
+expect error {
+}
+
+test json-malformed-double-minus {
+    SELECT json('--1');
+}
+expect error {
+}
+
+test json-malformed-double-plus {
+    SELECT json('++1');
+}
+expect error {
+}
+
+test json-malformed-incomplete-exponent {
+    SELECT json('1e');
+}
+expect error {
+}
+
+test json-malformed-incomplete-exponent-plus {
+    SELECT json('1e+');
+}
+expect error {
+}
+
+test json-malformed-incomplete-exponent-minus {
+    SELECT json('1e-');
+}
+expect error {
+}
+
+test json-malformed-hex-no-digits {
+    SELECT json('0x');
+}
+expect error {
+}
+
+test json-malformed-leading-zeros {
+    SELECT json('00');
+}
+expect error {
+}
+
+test json-malformed-leading-zero-digit {
+    SELECT json('01');
+}
+expect error {
+}
+
+# Regression: invalid JSON BLOB must not bypass CHECK(json_valid(...)).
+@cross-check-integrity
+test json_valid_blob_check_constraint_rejects_invalid_blob {
+    CREATE TABLE json_valid_guard_1(data BLOB CHECK(json_valid(data)));
+    INSERT INTO json_valid_guard_1 VALUES (x'696e76616c6964');
+}
+expect error {
+    CHECK constraint failed
+}
+
+@cross-check-integrity
+test json_valid_blob_check_constraint_ignore_does_not_insert {
+    CREATE TABLE json_valid_guard_2(data BLOB CHECK(json_valid(data)));
+    INSERT OR IGNORE INTO json_valid_guard_2 VALUES (x'696e76616c6964');
+    SELECT count(*) FROM json_valid_guard_2;
+}
+expect {
+    0
+}
+
+# From sqlite tcl test
+@cross-check-integrity
+test json101-8-1 {
+		CREATE TABLE t8(a,b);
+		INSERT INTO t8(a) VALUES('abc' || char(1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,32,33,34,35) || 'xyz');
+		UPDATE t8 SET b=json_array(a);
+		SELECT b FROM t8;
+} 
+expect {
+		["abc\u0001\u0002\u0003\u0004\u0005\u0006\u0007\b\t\n\u000b\f\r\u000e\u000f\u0010\u0011\u0012\u0013\u0014\u0015\u0016\u0017\u0018\u0019\u001a\u001b\u001c\u001d\u001e\u001f !\"#xyz"]
+}

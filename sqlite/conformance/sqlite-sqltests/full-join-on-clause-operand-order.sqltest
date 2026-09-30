@@ -1,0 +1,31 @@
+@database :memory:
+
+# A FULL JOIN needs an equality in the ON clause to build its hash join.
+# Both operand orders must be accepted: `t1.a = t2.b` and `t2.b = t1.a`
+# mean the same thing.
+
+test full-join-on-clause-accepts-left-to-right-operands {
+    CREATE TABLE t1(a);
+    CREATE TABLE t2(b);
+    INSERT INTO t1 VALUES (1), (2);
+    INSERT INTO t2 VALUES (2), (3);
+    SELECT quote(a), quote(b) FROM t1 FULL JOIN t2 ON t1.a = t2.b ORDER BY 1, 2;
+}
+expect {
+    1|NULL
+    2|2
+    NULL|3
+}
+
+test full-join-on-clause-accepts-right-to-left-operands {
+    CREATE TABLE t3(a);
+    CREATE TABLE t4(b);
+    INSERT INTO t3 VALUES (1), (2);
+    INSERT INTO t4 VALUES (2), (3);
+    SELECT quote(a), quote(b) FROM t3 FULL JOIN t4 ON t4.b = t3.a ORDER BY 1, 2;
+}
+expect {
+    1|NULL
+    2|2
+    NULL|3
+}

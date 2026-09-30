@@ -1,0 +1,82 @@
+---
+source: indexes.sqltest
+expression: |-
+  SELECT o.id, o.order_date, i.quantity
+      FROM orders o
+      JOIN inventory i ON o.id = i.product_id
+      WHERE o.customer_id = 100;
+info:
+  statement_type: SELECT
+  tables:
+  - inventory
+  - o.id
+  - orders
+  setup_blocks:
+  - schema
+  database: ':memory:'
+---
+QUERY PLAN
+|--MATERIALIZE hash build input for orders AS o
+|  `--SEARCH o USING COVERING INDEX idx_orders_customer_date (customer_id=?)
+`--HASH JOIN inventory AS i
+
+BYTECODE
+addr  opcode               p1  p2  p3  p4                                          p5  comment
+   0  Init                  0  55   0                                               0  Start at 55
+   1  OpenEphemeral         0   1   0                                               0  cursor=0 is_table=true
+   2  OpenRead              1   7   0  k(3,B,B)                                     0  index=idx_orders_customer_date, root=7, iDb=0
+   3  Integer             100   6   0                                               0  r[6]=100
+   4  SeekGE                1  16   6                                               0  key=[6..6]
+   5    IdxGT               1  16   6                                               0  key=[6..6]
+   6    Column              1   0   8                                               0  r[8]=idx_orders_customer_date.customer_id
+   7    Ne                  8   9  15  Binary                                       0  if r[8]!=r[9] goto 15
+   8    IdxRowId            1   1   0                                               0  r[1]=cursor 1 for index idx_orders_customer_date.rowid
+   9    IdxRowId            1   2   0                                               0  r[2]=cursor 1 for index idx_orders_customer_date.rowid
+  10    ColumnRange         1   0   3  2                                            0  r[3..4]=idx_orders_customer_date.customer_id..order_date
+  11    IdxRowId            1   5   0                                               0  r[5]=cursor 1 for index idx_orders_customer_date.rowid
+  12    MakeRecord          1   5  10                                               0  r[10]=mkrec(r[1..5]); for hash_build_input_t3
+  13    NewRowid            0  11   0                                               0  r[11]=rowid
+  14    Insert              0  10  11  hash_build_input_t3                          4  intkey=r[11] data=r[10]
+  15  Next                  1   5   0                                               0
+  16  OpenRead              2   9   0  k(5,B,B,B,B,B)                               0  table=inventory, root=9, iDb=0
+  17  Once                 26   0   0                                               0  goto 26
+  18  Rewind                0  25   0                                               0  Rewind  ephemeral(hash_build_input_t3)
+  19    Column              0   0  15                                               0  r[15]=ephemeral(hash_build_input_t3).key_0
+  20    Affinity           15   1   0                                               0  r[15..16] = C
+  21    ColumnRange         0   1  16  4                                            0  r[16..19]=ephemeral(hash_build_input_t3).payload_0..payload_3
+  22    HashBuild           0  15   1  r=[1] budget=67108864 payload=r[16]..r[19]   0
+  23    FilterAdd           0  15   1                                               0  bloom_filter_add(r[15..16])
+  24  Next                  0  19   0                                               0
+  25  HashBuildFinalize     1   0   0                                               0
+  26  Rewind                2  41   0                                               0  Rewind table inventory
+  27    Column              2   2  20                                               0  r[20]=inventory.product_id
+  28    Affinity           20   1   0                                               0  r[20..21] = C
+  29    Filter              0  40  20                                               1  if !bloom_filter(r[20..21]) goto 40
+  30    RowId               2  25   0                                               0  r[25]=inventory.rowid
+  31    Integer             0  26   0                                               0  r[26]=0
+  32    HashProbe           1  20   1  r[27]=40 payload=r[21]..r[24]                0
+  33    Copy               21  12   0                                               0  r[12]=r[21]
+  34    Copy               23  13   0                                               0  r[13]=r[23]
+  35    Column              2   3  14                                               0  r[14]=inventory.quantity
+  36    ResultRow          12   3   0                                               0  output=r[12..14]
+  37    IfPos              26  48   0                                               0  r[26]>0 -> r[26]-=0, goto 48
+  38    HashNext            1  27  40   payload=r[21]..r[24]                        0
+  39    Goto                0  33   0                                               0
+  40  Next                  2  27   0                                               0
+  41  HashGraceInit         1   0  53                                               0  hash_table_id=1
+  42  Integer               1  26   0                                               0  r[26]=1
+  43  HashGraceLoadPart     1   0  52                                               0  hash_table_id=1
+  44  HashGraceNextProbe    1  20  50                                               0  hash_table_id=1 keys=r[20]..r[20] probe_rowid_dest=r[25]
+  45  SeekRowid             2  25  44                                               0  if (r[25]!=cursor 2 for table inventory.rowid) goto 44
+  46  HashProbe             1  20   1  r[27]=44 payload=r[21]..r[24]                0
+  47  Goto                  0  33   0                                               0
+  48  HashNext              1  27  44   payload=r[21]..r[24]                        0
+  49  Goto                  0  33   0                                               0
+  50  HashGraceAdvPart      1   0  52                                               0  hash_table_id=1
+  51  Goto                  0  43   0                                               0
+  52  Integer               0  26   0                                               0  r[26]=0
+  53  HashClose             1   0   0                                               0
+  54  Halt                  0   0   0                                               0
+  55  Transaction           0   1  14                                               0  iDb=0 tx_mode=Read
+  56  Integer             100   9   0                                               0  r[9]=100
+  57  Goto                  0   1   0                                               0

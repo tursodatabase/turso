@@ -1,0 +1,35 @@
+---
+source: gencol.sqltest
+expression: UPDATE t SET c = '42';
+info:
+  statement_type: UPDATE
+  tables:
+  - t
+  setup_blocks:
+  - strict_update_generated_columns
+  database: ':memory:'
+---
+QUERY PLAN
+`--SCAN t
+
+BYTECODE
+addr  opcode        p1  p2  p3  p4  p5  comment
+   0  Init           0  15   0       0  Start at 15
+   1  OpenWrite      0   2   0       0  root=2; iDb=0
+   2  Rewind         0  14   0       0  Rewind table t
+   3    RowId        0   1   0       0  r[1]=t.rowid
+   4    IsNull       1  14   0       0  if (r[1]==NULL) goto 14
+   5    Column       0   0   2       0  r[2]=t.a
+   6    TypeCheck    2   2   0       0
+   7    Copy         2   5   0       0  r[5]=r[2]
+   8    Add          5   6   4       0  r[4]=r[5]+r[6]
+   9    Affinity     4   1   0       0  r[4..5] = D
+  10    TypeCheck    2   3   1       0
+  11    MakeRecord   2   2   7       0  r[7]=mkrec(r[2..3])
+  12    Insert       0   7   1  t    8  intkey=r[1] data=r[7]
+  13  Next           0   3   0       1
+  14  Halt           0   0   0       0
+  15  Transaction    0   2   1       0  iDb=0 tx_mode=Write
+  16  String8        0   3   0  42   0  r[3]='42'
+  17  Integer        1   6   0       0  r[6]=1
+  18  Goto           0   1   0       0

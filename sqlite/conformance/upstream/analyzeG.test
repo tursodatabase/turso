@@ -1,0 +1,84 @@
+# 2020-02-23
+#
+# The author disclaims copyright to this source code.  In place of
+# a legal notice, here is a blessing:
+#
+#    May you do good and not evil.
+#    May you find forgiveness for yourself and forgive others.
+#    May you share freely, never taking more than you give.
+#
+#***********************************************************************
+# Tests for functionality related to ANALYZE.
+#
+
+set testdir [file dirname $argv0]
+source $testdir/tester.tcl
+
+ifcapable !stat4 {
+  finish_test
+  return
+}
+set testprefix analyzeG
+
+#-------------------------------------------------------------------------
+# Test cases 1.* seek to verify that even if an index is not used, its
+# stat4 data may be used by the planner to estimate the number of
+# rows that match an unindexed constraint on the same column.
+#
+do_execsql_test 1.0 {
+  PRAGMA automatic_index = 0;
+  CREATE TABLE t1(a, x);
+  CREATE TABLE t2(b, y);
+  WITH s(i) AS (
+    SELECT 1 UNION ALL SELECT i+1 FROM s WHERE i<100
+  )
+  INSERT INTO t1 SELECT (i%50), NULL FROM s;
+  WITH s(i) AS (
+    SELECT 1 UNION ALL SELECT i+1 FROM s WHERE i<100
+  )
+  INSERT INTO t2 SELECT (CASE WHEN i<95 THEN 44 ELSE i END), NULL FROM s;
+}
+
+# Join tables t1 and t2. Both contain 100 rows. (a=44) matches 2 rows
+# in "t1", (b=44) matches 95 rows in table "t2". But the planner doesn't
+# know this, so it has no preference as to which order the tables are
+# scanned in. In practice this means that tables are scanned in the order
+# they are specified in in the FROM clause.
+do_eqp_test 1.1.1 {
+  SELECT * FROM t1, t2 WHERE a=44 AND b=44;
+} {
+
+}
+do_eqp_test 1.1.2 {
+  SELECT * FROM t2, t1 WHERE a=44 AND b=44 
+} {
+  QUERY PLAN
+  |--SCAN t2
+  `--SCAN t1
+}
+
+do_execsql_test 1.2 {
+  CREATE INDEX t2b ON t2(b);
+  ANALYZE;
+}
+
+# Now, with the ANALYZE data, the planner knows that (b=44) matches a 
+# large number of rows. So it elects to scan table "t1" first, regardless
+# of the order in which the tables are specified in the FROM clause.
+do_eqp_test 1.3.1 {
+  SELECT * FROM t1, t2 WHERE a=44 AND b=44;
+} {
+  QUERY PLAN
+  |--SCAN t1
+  `--SCAN t2
+}
+do_eqp_test 1.3.2 {
+  SELECT * FROM t2, t1 WHERE a=44 AND b=44 
+} {
+  QUERY PLAN
+  |--SCAN t1
+  `--SCAN t2
+}
+
+
+finish_test

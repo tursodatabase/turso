@@ -1,0 +1,28 @@
+@database :memory:
+
+test group-by-literal-having-truthy {
+    SELECT 1 AS x GROUP BY 1 HAVING 1;
+}
+expect {
+    1
+}
+
+test group-by-literal-having-falsy {
+    SELECT 1 AS x GROUP BY 1 HAVING 0;
+}
+expect {
+}
+
+test group-by-literal-having-value {
+    SELECT 42 GROUP BY 1 HAVING 1;
+}
+expect {
+    42
+}
+
+test group-by-literal-having-no-alias {
+    SELECT 1 GROUP BY 1 HAVING 1;
+}
+expect {
+    1
+}

@@ -1,0 +1,70 @@
+@database :memory:
+
+# RAISE(ABORT) outside trigger - Turso extension
+# In Turso, RAISE(ABORT, msg) can be used outside triggers to fail a query
+
+# RAISE(ABORT) in SELECT fails the query
+test raise-abort-outside-trigger {
+    SELECT RAISE(ABORT, 'query failed');
+}
+expect error {
+    query failed
+}
+
+# RAISE(ABORT) in CASE WHEN ELSE - conditional failure
+test raise-abort-in-case {
+    CREATE TABLE raise_ext_t1 (x INTEGER);
+    INSERT INTO raise_ext_t1 VALUES (1), (2), (3);
+    SELECT CASE WHEN x > 2 THEN RAISE(ABORT, 'too large') ELSE x END FROM raise_ext_t1;
+}
+expect error {
+    too large
+}
+
+# RAISE(ABORT) in CASE with no trigger - value under threshold is fine
+test raise-abort-conditional-pass {
+    SELECT CASE WHEN 5 > 10 THEN RAISE(ABORT, 'should not fire') ELSE 'ok' END;
+}
+expect {
+    ok
+}
+
+# RAISE(FAIL) outside trigger should error (not allowed)
+test fail-raise-fail-outside-trigger {
+    SELECT RAISE(FAIL, 'should fail');
+}
+expect error {
+    .*
+}
+
+# RAISE(ROLLBACK) outside trigger should error (not allowed)
+test fail-raise-rollback-outside-trigger {
+    SELECT RAISE(ROLLBACK, 'should fail');
+}
+expect error {
+    .*
+}
+
+# RAISE(IGNORE) outside trigger should error (not allowed)
+test fail-raise-ignore-outside-trigger {
+    SELECT RAISE(IGNORE);
+}
+expect error {
+    .*
+}
+
+# RAISE('message') shorthand - defaults to ABORT
+test raise-shorthand {
+    SELECT RAISE('shorthand error');
+}
+expect error {
+    shorthand error
+}
+
+# RAISE('message') shorthand in CASE WHEN
+test raise-shorthand-in-case {
+    SELECT CASE WHEN 1 = 1 THEN RAISE('conditional error') ELSE 'ok' END;
+}
+expect error {
+    conditional error
+}

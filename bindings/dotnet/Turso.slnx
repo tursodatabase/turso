@@ -1,0 +1,25 @@
+<Solution>
+  <Configurations>
+    <Platform Name="Any CPU" />
+    <Platform Name="x64" />
+    <Platform Name="x86" />
+  </Configurations>
+  <Project Path="src\Benchmarks\Benchmarks.csproj" Type="Classic C#">
+    <Configuration Solution="Debug|x64" Project="Debug|Any CPU" />
+    <Configuration Solution="Debug|x86" Project="Debug|Any CPU" />
+    <Configuration Solution="Release|x64" Project="Release|Any CPU" />
+    <Configuration Solution="Release|x86" Project="Release|Any CPU" />
+  </Project>
+  <Project Path="src\Turso.Tests\Turso.Tests.csproj" Type="Classic C#">
+    <Configuration Solution="Debug|x64" Project="Debug|Any CPU" />
+    <Configuration Solution="Debug|x86" Project="Debug|Any CPU" />
+    <Configuration Solution="Release|x64" Project="Release|Any CPU" />
+    <Configuration Solution="Release|x86" Project="Release|Any CPU" />
+  </Project>
+  <Project Path="src\Turso.Data.Sqlite\Turso.Data.Sqlite.csproj" />
+  <Project Path="src\Turso.EntityFrameworkCore.Sqlite\Turso.EntityFrameworkCore.Sqlite.csproj" />
+  <Project Path="src\Turso.Data\Turso.Data.csproj" />
+  <Project Path="src\Turso.Platform.Client\Turso.Platform.Client.csproj" />
+  <Project Path="src\Turso.Serverless.Client\Turso.Serverless.Client.csproj" />
+  <Project Path="src\Turso.Raw\Turso.Raw.csproj" Type="Classic C#" />
+</Solution>

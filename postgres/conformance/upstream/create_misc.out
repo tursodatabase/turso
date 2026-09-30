@@ -1,0 +1,487 @@
+--
+-- CREATE_MISC
+--
+--
+-- a is the type root
+-- b and c inherit from a (one-level single inheritance)
+-- d inherits from b and c (two-level multiple inheritance)
+-- e inherits from c (two-level single inheritance)
+-- f inherits from e (three-level single inheritance)
+--
+CREATE TABLE a_star (
+	class		char,
+	a 			int4
+);
+CREATE TABLE b_star (
+	b 			text
+) INHERITS (a_star);
+CREATE TABLE c_star (
+	c 			name
+) INHERITS (a_star);
+CREATE TABLE d_star (
+	d 			float8
+) INHERITS (b_star, c_star);
+NOTICE:  merging multiple inherited definitions of column "class"
+NOTICE:  merging multiple inherited definitions of column "a"
+CREATE TABLE e_star (
+	e 			int2
+) INHERITS (c_star);
+CREATE TABLE f_star (
+	f 			polygon
+) INHERITS (e_star);
+INSERT INTO a_star (class, a) VALUES ('a', 1);
+INSERT INTO a_star (class, a) VALUES ('a', 2);
+INSERT INTO a_star (class) VALUES ('a');
+INSERT INTO b_star (class, a, b) VALUES ('b', 3, 'mumble'::text);
+INSERT INTO b_star (class, a) VALUES ('b', 4);
+INSERT INTO b_star (class, b) VALUES ('b', 'bumble'::text);
+INSERT INTO b_star (class) VALUES ('b');
+INSERT INTO c_star (class, a, c) VALUES ('c', 5, 'hi mom'::name);
+INSERT INTO c_star (class, a) VALUES ('c', 6);
+INSERT INTO c_star (class, c) VALUES ('c', 'hi paul'::name);
+INSERT INTO c_star (class) VALUES ('c');
+INSERT INTO d_star (class, a, b, c, d)
+   VALUES ('d', 7, 'grumble'::text, 'hi sunita'::name, '0.0'::float8);
+INSERT INTO d_star (class, a, b, c)
+   VALUES ('d', 8, 'stumble'::text, 'hi koko'::name);
+INSERT INTO d_star (class, a, b, d)
+   VALUES ('d', 9, 'rumble'::text, '1.1'::float8);
+INSERT INTO d_star (class, a, c, d)
+   VALUES ('d', 10, 'hi kristin'::name, '10.01'::float8);
+INSERT INTO d_star (class, b, c, d)
+   VALUES ('d', 'crumble'::text, 'hi boris'::name, '100.001'::float8);
+INSERT INTO d_star (class, a, b)
+   VALUES ('d', 11, 'fumble'::text);
+INSERT INTO d_star (class, a, c)
+   VALUES ('d', 12, 'hi avi'::name);
+INSERT INTO d_star (class, a, d)
+   VALUES ('d', 13, '1000.0001'::float8);
+INSERT INTO d_star (class, b, c)
+   VALUES ('d', 'tumble'::text, 'hi andrew'::name);
+INSERT INTO d_star (class, b, d)
+   VALUES ('d', 'humble'::text, '10000.00001'::float8);
+INSERT INTO d_star (class, c, d)
+   VALUES ('d', 'hi ginger'::name, '100000.000001'::float8);
+INSERT INTO d_star (class, a) VALUES ('d', 14);
+INSERT INTO d_star (class, b) VALUES ('d', 'jumble'::text);
+INSERT INTO d_star (class, c) VALUES ('d', 'hi jolly'::name);
+INSERT INTO d_star (class, d) VALUES ('d', '1000000.0000001'::float8);
+INSERT INTO d_star (class) VALUES ('d');
+INSERT INTO e_star (class, a, c, e)
+   VALUES ('e', 15, 'hi carol'::name, '-1'::int2);
+INSERT INTO e_star (class, a, c)
+   VALUES ('e', 16, 'hi bob'::name);
+INSERT INTO e_star (class, a, e)
+   VALUES ('e', 17, '-2'::int2);
+INSERT INTO e_star (class, c, e)
+   VALUES ('e', 'hi michelle'::name, '-3'::int2);
+INSERT INTO e_star (class, a)
+   VALUES ('e', 18);
+INSERT INTO e_star (class, c)
+   VALUES ('e', 'hi elisa'::name);
+INSERT INTO e_star (class, e)
+   VALUES ('e', '-4'::int2);
+INSERT INTO f_star (class, a, c, e, f)
+   VALUES ('f', 19, 'hi claire'::name, '-5'::int2, '(1,3),(2,4)'::polygon);
+INSERT INTO f_star (class, a, c, e)
+   VALUES ('f', 20, 'hi mike'::name, '-6'::int2);
+INSERT INTO f_star (class, a, c, f)
+   VALUES ('f', 21, 'hi marcel'::name, '(11,44),(22,55),(33,66)'::polygon);
+INSERT INTO f_star (class, a, e, f)
+   VALUES ('f', 22, '-7'::int2, '(111,555),(222,666),(333,777),(444,888)'::polygon);
+INSERT INTO f_star (class, c, e, f)
+   VALUES ('f', 'hi keith'::name, '-8'::int2,
+	   '(1111,3333),(2222,4444)'::polygon);
+INSERT INTO f_star (class, a, c)
+   VALUES ('f', 24, 'hi marc'::name);
+INSERT INTO f_star (class, a, e)
+   VALUES ('f', 25, '-9'::int2);
+INSERT INTO f_star (class, a, f)
+   VALUES ('f', 26, '(11111,33333),(22222,44444)'::polygon);
+INSERT INTO f_star (class, c, e)
+   VALUES ('f', 'hi allison'::name, '-10'::int2);
+INSERT INTO f_star (class, c, f)
+   VALUES ('f', 'hi jeff'::name,
+           '(111111,333333),(222222,444444)'::polygon);
+INSERT INTO f_star (class, e, f)
+   VALUES ('f', '-11'::int2, '(1111111,3333333),(2222222,4444444)'::polygon);
+INSERT INTO f_star (class, a) VALUES ('f', 27);
+INSERT INTO f_star (class, c) VALUES ('f', 'hi carl'::name);
+INSERT INTO f_star (class, e) VALUES ('f', '-12'::int2);
+INSERT INTO f_star (class, f)
+   VALUES ('f', '(11111111,33333333),(22222222,44444444)'::polygon);
+INSERT INTO f_star (class) VALUES ('f');
+-- Analyze the X_star tables for better plan stability in later tests
+ANALYZE a_star;
+ANALYZE b_star;
+ANALYZE c_star;
+ANALYZE d_star;
+ANALYZE e_star;
+ANALYZE f_star;
+--
+-- inheritance stress test
+--
+SELECT * FROM a_star*;
+ class | a  
+-------+----
+ a     |  1
+ a     |  2
+ a     |   
+ b     |  3
+ b     |  4
+ b     |   
+ b     |   
+ c     |  5
+ c     |  6
+ c     |   
+ c     |   
+ d     |  7
+ d     |  8
+ d     |  9
+ d     | 10
+ d     |   
+ d     | 11
+ d     | 12
+ d     | 13
+ d     |   
+ d     |   
+ d     |   
+ d     | 14
+ d     |   
+ d     |   
+ d     |   
+ d     |   
+ e     | 15
+ e     | 16
+ e     | 17
+ e     |   
+ e     | 18
+ e     |   
+ e     |   
+ f     | 19
+ f     | 20
+ f     | 21
+ f     | 22
+ f     |   
+ f     | 24
+ f     | 25
+ f     | 26
+ f     |   
+ f     |   
+ f     |   
+ f     | 27
+ f     |   
+ f     |   
+ f     |   
+ f     |   
+(50 rows)
+
+SELECT *
+   FROM b_star* x
+   WHERE x.b = text 'bumble' or x.a < 3;
+ class | a |   b    
+-------+---+--------
+ b     |   | bumble
+(1 row)
+
+SELECT class, a
+   FROM c_star* x
+   WHERE x.c ~ text 'hi';
+ class | a  
+-------+----
+ c     |  5
+ c     |   
+ d     |  7
+ d     |  8
+ d     | 10
+ d     |   
+ d     | 12
+ d     |   
+ d     |   
+ d     |   
+ e     | 15
+ e     | 16
+ e     |   
+ e     |   
+ f     | 19
+ f     | 20
+ f     | 21
+ f     |   
+ f     | 24
+ f     |   
+ f     |   
+ f     |   
+(22 rows)
+
+SELECT class, b, c
+   FROM d_star* x
+   WHERE x.a < 100;
+ class |    b    |     c      
+-------+---------+------------
+ d     | grumble | hi sunita
+ d     | stumble | hi koko
+ d     | rumble  | 
+ d     |         | hi kristin
+ d     | fumble  | 
+ d     |         | hi avi
+ d     |         | 
+ d     |         | 
+(8 rows)
+
+SELECT class, c FROM e_star* x WHERE x.c NOTNULL;
+ class |      c      
+-------+-------------
+ e     | hi carol
+ e     | hi bob
+ e     | hi michelle
+ e     | hi elisa
+ f     | hi claire
+ f     | hi mike
+ f     | hi marcel
+ f     | hi keith
+ f     | hi marc
+ f     | hi allison
+ f     | hi jeff
+ f     | hi carl
+(12 rows)
+
+SELECT * FROM f_star* x WHERE x.c ISNULL;
+ class | a  | c |  e  |                     f                     
+-------+----+---+-----+-------------------------------------------
+ f     | 22 |   |  -7 | ((111,555),(222,666),(333,777),(444,888))
+ f     | 25 |   |  -9 | 
+ f     | 26 |   |     | ((11111,33333),(22222,44444))
+ f     |    |   | -11 | ((1111111,3333333),(2222222,4444444))
+ f     | 27 |   |     | 
+ f     |    |   | -12 | 
+ f     |    |   |     | ((11111111,33333333),(22222222,44444444))
+ f     |    |   |     | 
+(8 rows)
+
+-- grouping and aggregation on inherited sets have been busted in the past...
+SELECT sum(a) FROM a_star*;
+ sum 
+-----
+ 355
+(1 row)
+
+SELECT class, sum(a) FROM a_star* GROUP BY class ORDER BY class;
+ class | sum 
+-------+-----
+ a     |   3
+ b     |   7
+ c     |  11
+ d     |  84
+ e     |  66
+ f     | 184
+(6 rows)
+
+ALTER TABLE f_star RENAME COLUMN f TO ff;
+ALTER TABLE e_star* RENAME COLUMN e TO ee;
+ALTER TABLE d_star* RENAME COLUMN d TO dd;
+ALTER TABLE c_star* RENAME COLUMN c TO cc;
+ALTER TABLE b_star* RENAME COLUMN b TO bb;
+ALTER TABLE a_star* RENAME COLUMN a TO aa;
+SELECT class, aa
+   FROM a_star* x
+   WHERE aa ISNULL;
+ class | aa 
+-------+----
+ a     |   
+ b     |   
+ b     |   
+ c     |   
+ c     |   
+ d     |   
+ d     |   
+ d     |   
+ d     |   
+ d     |   
+ d     |   
+ d     |   
+ d     |   
+ e     |   
+ e     |   
+ e     |   
+ f     |   
+ f     |   
+ f     |   
+ f     |   
+ f     |   
+ f     |   
+ f     |   
+ f     |   
+(24 rows)
+
+-- As of Postgres 7.1, ALTER implicitly recurses,
+-- so this should be same as ALTER a_star*
+ALTER TABLE a_star RENAME COLUMN aa TO foo;
+SELECT class, foo
+   FROM a_star* x
+   WHERE x.foo >= 2;
+ class | foo 
+-------+-----
+ a     |   2
+ b     |   3
+ b     |   4
+ c     |   5
+ c     |   6
+ d     |   7
+ d     |   8
+ d     |   9
+ d     |  10
+ d     |  11
+ d     |  12
+ d     |  13
+ d     |  14
+ e     |  15
+ e     |  16
+ e     |  17
+ e     |  18
+ f     |  19
+ f     |  20
+ f     |  21
+ f     |  22
+ f     |  24
+ f     |  25
+ f     |  26
+ f     |  27
+(25 rows)
+
+ALTER TABLE a_star RENAME COLUMN foo TO aa;
+SELECT *
+   from a_star*
+   WHERE aa < 1000;
+ class | aa 
+-------+----
+ a     |  1
+ a     |  2
+ b     |  3
+ b     |  4
+ c     |  5
+ c     |  6
+ d     |  7
+ d     |  8
+ d     |  9
+ d     | 10
+ d     | 11
+ d     | 12
+ d     | 13
+ d     | 14
+ e     | 15
+ e     | 16
+ e     | 17
+ e     | 18
+ f     | 19
+ f     | 20
+ f     | 21
+ f     | 22
+ f     | 24
+ f     | 25
+ f     | 26
+ f     | 27
+(26 rows)
+
+ALTER TABLE f_star ADD COLUMN f int4;
+UPDATE f_star SET f = 10;
+ALTER TABLE e_star* ADD COLUMN e int4;
+--UPDATE e_star* SET e = 42;
+SELECT * FROM e_star*;
+ class | aa |     cc      | ee  | e 
+-------+----+-------------+-----+---
+ e     | 15 | hi carol    |  -1 |  
+ e     | 16 | hi bob      |     |  
+ e     | 17 |             |  -2 |  
+ e     |    | hi michelle |  -3 |  
+ e     | 18 |             |     |  
+ e     |    | hi elisa    |     |  
+ e     |    |             |  -4 |  
+ f     | 19 | hi claire   |  -5 |  
+ f     | 20 | hi mike     |  -6 |  
+ f     | 21 | hi marcel   |     |  
+ f     | 22 |             |  -7 |  
+ f     |    | hi keith    |  -8 |  
+ f     | 24 | hi marc     |     |  
+ f     | 25 |             |  -9 |  
+ f     | 26 |             |     |  
+ f     |    | hi allison  | -10 |  
+ f     |    | hi jeff     |     |  
+ f     |    |             | -11 |  
+ f     | 27 |             |     |  
+ f     |    | hi carl     |     |  
+ f     |    |             | -12 |  
+ f     |    |             |     |  
+ f     |    |             |     |  
+(23 rows)
+
+ALTER TABLE a_star* ADD COLUMN a text;
+NOTICE:  merging definition of column "a" for child "d_star"
+-- That ALTER TABLE should have added TOAST tables.
+SELECT relname, reltoastrelid <> 0 AS has_toast_table
+   FROM pg_class
+   WHERE oid::regclass IN ('a_star', 'c_star')
+   ORDER BY 1;
+ relname | has_toast_table 
+---------+-----------------
+ a_star  | t
+ c_star  | t
+(2 rows)
+
+--UPDATE b_star*
+--   SET a = text 'gazpacho'
+--   WHERE aa > 4;
+SELECT class, aa, a FROM a_star*;
+ class | aa | a 
+-------+----+---
+ a     |  1 | 
+ a     |  2 | 
+ a     |    | 
+ b     |  3 | 
+ b     |  4 | 
+ b     |    | 
+ b     |    | 
+ c     |  5 | 
+ c     |  6 | 
+ c     |    | 
+ c     |    | 
+ d     |  7 | 
+ d     |  8 | 
+ d     |  9 | 
+ d     | 10 | 
+ d     |    | 
+ d     | 11 | 
+ d     | 12 | 
+ d     | 13 | 
+ d     |    | 
+ d     |    | 
+ d     |    | 
+ d     | 14 | 
+ d     |    | 
+ d     |    | 
+ d     |    | 
+ d     |    | 
+ e     | 15 | 
+ e     | 16 | 
+ e     | 17 | 
+ e     |    | 
+ e     | 18 | 
+ e     |    | 
+ e     |    | 
+ f     | 19 | 
+ f     | 20 | 
+ f     | 21 | 
+ f     | 22 | 
+ f     |    | 
+ f     | 24 | 
+ f     | 25 | 
+ f     | 26 | 
+ f     |    | 
+ f     |    | 
+ f     |    | 
+ f     | 27 | 
+ f     |    | 
+ f     |    | 
+ f     |    | 
+ f     |    | 
+(50 rows)
+

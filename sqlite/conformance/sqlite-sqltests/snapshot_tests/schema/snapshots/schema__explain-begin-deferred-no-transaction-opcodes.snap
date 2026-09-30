@@ -1,0 +1,16 @@
+---
+source: schema.sqltest
+expression: BEGIN DEFERRED;
+info:
+  statement_type: OTHER
+  database: ':memory:'
+---
+QUERY PLAN
+
+
+BYTECODE
+addr  opcode      p1  p2  p3  p4  p5  comment
+   0  Init         0   3   0       0  Start at 3
+   1  AutoCommit   0   0   0       0  auto_commit=false, rollback=false
+   2  Halt         0   0   0       0
+   3  Goto         0   1   0       0

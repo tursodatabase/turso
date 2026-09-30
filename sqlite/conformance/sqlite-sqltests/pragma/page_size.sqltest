@@ -1,0 +1,13 @@
+@database :memory:
+
+test pragma-attached-page-size-independent-of-main {
+    ATTACH ':memory:' AS aux;
+    PRAGMA aux.page_size=512;
+    CREATE TABLE aux.t(a);
+    PRAGMA aux.page_size;
+    PRAGMA main.page_size;
+}
+expect {
+    512
+    4096
+}

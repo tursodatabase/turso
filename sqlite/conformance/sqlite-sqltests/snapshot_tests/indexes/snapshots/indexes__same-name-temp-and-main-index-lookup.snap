@@ -1,0 +1,20 @@
+---
+source: indexes.sqltest
+expression: |-
+  SELECT t.b, m.b
+      FROM temp.same_name AS t
+      JOIN main.same_name AS m ON m.a = t.a
+      WHERE t.a = 1 AND m.a = 2;
+info:
+  statement_type: SELECT
+  tables:
+  - m.a
+  - main.same_name
+  - temp.same_name
+  setup_blocks:
+  - attached_schema_indexes
+  database: ':memory:'
+---
+QUERY PLAN
+|--SEARCH t USING INDEX idx_same_temp_a (a=?)
+`--SEARCH m USING INDEX idx_same_main_a (a=?)

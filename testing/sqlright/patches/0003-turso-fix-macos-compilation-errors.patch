@@ -1,0 +1,45 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Turso <noreply@turso.tech>
+Subject: [PATCH] Fix macOS compilation errors
+
+Fix std::count calls to use character literal instead of string literal.
+Replace conflicting uint64_t typedef with proper cstdint include.
+
+diff --git a/SQLite/docker/src/oracle/sqlite_likely.cpp b/SQLite/docker/src/oracle/sqlite_likely.cpp
+index 0bcc74f..2ab8fc6 100644
+--- a/SQLite/docker/src/oracle/sqlite_likely.cpp
++++ b/SQLite/docker/src/oracle/sqlite_likely.cpp
+@@ -125,9 +125,9 @@ bool SQL_LIKELY::compare_norm(
+       --res_int_2;
+   }
+
+-  res_int_0 += std::count(res_str_0.begin(), res_str_0.end(), "\n");
+-  res_int_1 += std::count(res_str_1.begin(), res_str_1.end(), "\n");
+-  res_int_2 += std::count(res_str_2.begin(), res_str_2.end(), "\n");
++  res_int_0 += std::count(res_str_0.begin(), res_str_0.end(), '\n');
++  res_int_1 += std::count(res_str_1.begin(), res_str_1.end(), '\n');
++  res_int_2 += std::count(res_str_2.begin(), res_str_2.end(), '\n');
+
+   if (res_int_0 != res_int_1 || res_int_0 != res_int_2) {
+     res.comp_res = ORA_COMP_RES::Fail;
+diff --git a/SQLite/docker/src/src/utils.cpp b/SQLite/docker/src/src/utils.cpp
+index b57b1b2..989d9b2 100644
+--- a/SQLite/docker/src/src/utils.cpp
++++ b/SQLite/docker/src/src/utils.cpp
+@@ -1,6 +1,7 @@
+ #include "../include/utils.h"
+ #include <algorithm>
+ #include <cstring>
++#include <cstdint>
+ #include <regex>
+
+ string magic_string_generator(string &s) {
+@@ -10,8 +11,6 @@ string magic_string_generator(string &s) {
+   return "**%s**";
+ }
+
+-typedef unsigned long uint64_t;
+-
+ uint64_t fuzzing_hash(const void *key, int len) {
+   const uint64_t m = 0xc6a4a7935bd1e995;
+   const int r = 47;

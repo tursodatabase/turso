@@ -1,0 +1,12 @@
+#!/bin/bash
+
+set -e
+
+if [[ -n "$@" ]]; then
+    cargo run -p limbo_sim -- "$@"
+else
+    echo "Running limbo_sim in infinite loop..."
+    while true; do
+        cargo run -p limbo_sim
+    done
+fi

@@ -1,0 +1,191 @@
+@database :memory:
+
+setup rank_base {
+    CREATE TABLE rank_items(id INTEGER PRIMARY KEY, g TEXT, v INTEGER);
+    INSERT INTO rank_items VALUES
+        (1, 'a', 10),
+        (2, 'a', 10),
+        (3, 'a', 20),
+        (4, 'b', 5),
+        (5, 'b', 5),
+        (6, 'b', 5),
+        (7, 'c', 100);
+}
+
+@setup rank_base
+test rank-basic-with-peers {
+    SELECT id, v, rank() OVER (ORDER BY v) FROM rank_items ORDER BY id;
+}
+expect {
+    1|10|4
+    2|10|4
+    3|20|6
+    4|5|1
+    5|5|1
+    6|5|1
+    7|100|7
+}
+
+@setup rank_base
+test rank-partition-by-group {
+    SELECT id, g, v, rank() OVER (PARTITION BY g ORDER BY v) FROM rank_items ORDER BY id;
+}
+expect {
+    1|a|10|1
+    2|a|10|1
+    3|a|20|3
+    4|b|5|1
+    5|b|5|1
+    6|b|5|1
+    7|c|100|1
+}
+
+@setup rank_base
+test rank-no-order-by {
+    SELECT id, rank() OVER (PARTITION BY g) FROM rank_items ORDER BY id;
+}
+expect {
+    1|1
+    2|1
+    3|1
+    4|1
+    5|1
+    6|1
+    7|1
+}
+
+setup rank_nulls {
+    CREATE TABLE rank_n(v INTEGER);
+    INSERT INTO rank_n VALUES (NULL), (NULL), (1), (2), (2);
+}
+
+@setup rank_nulls
+test rank-null-values-share-rank {
+    SELECT v, rank() OVER (ORDER BY v) FROM rank_n ORDER BY v;
+}
+expect {
+    |1
+    |1
+    1|3
+    2|4
+    2|4
+}
+
+setup rank_empty {
+    CREATE TABLE rank_e(v INTEGER);
+}
+
+@setup rank_empty
+test rank-empty-input {
+    SELECT v, rank() OVER (ORDER BY v) FROM rank_e;
+}
+expect {
+}
+
+@setup rank_base
+test rank-alongside-row-number {
+    SELECT id, v,
+           rank() OVER (ORDER BY v),
+           row_number() OVER (ORDER BY v)
+    FROM rank_items ORDER BY id;
+}
+expect {
+    1|10|4|4
+    2|10|4|5
+    3|20|6|6
+    4|5|1|1
+    5|5|1|2
+    6|5|1|3
+    7|100|7|7
+}
+
+setup rank_multikey {
+    CREATE TABLE rank_mk(id INTEGER PRIMARY KEY, a INTEGER, b INTEGER);
+    INSERT INTO rank_mk VALUES
+        (1, 1, 1),
+        (2, 1, 1),
+        (3, 1, 2),
+        (4, 2, 1);
+}
+
+# Peers are defined by the full ORDER BY tuple, not by any one column.
+@setup rank_multikey
+test rank-multi-column-order-by {
+    SELECT id, a, b, rank() OVER (ORDER BY a, b) FROM rank_mk ORDER BY id;
+}
+expect {
+    1|1|1|1
+    2|1|1|1
+    3|1|2|3
+    4|2|1|4
+}
+
+@setup rank_multikey
+test rank-order-by-desc {
+    SELECT id, a, rank() OVER (ORDER BY a DESC) FROM rank_mk ORDER BY id;
+}
+expect {
+    1|1|2
+    2|1|2
+    3|1|2
+    4|2|1
+}
+
+setup rank_collate {
+    CREATE TABLE rank_c(v TEXT COLLATE NOCASE);
+    INSERT INTO rank_c VALUES ('Apple'), ('apple'), ('Banana'), ('banana');
+}
+
+# Peer detection respects the column's collation: 'Apple' and 'apple'
+# compare equal under NOCASE, so they share rank and the next group
+# starts at 3 (rank gap reflects the two-row peer group).
+@setup rank_collate
+test rank-collate-nocase-peers {
+    SELECT v, rank() OVER (ORDER BY v) FROM rank_c ORDER BY v;
+}
+expect {
+    Apple|1
+    apple|1
+    Banana|3
+    banana|3
+}
+
+setup rank_partition_repeated {
+    CREATE TABLE rank_pr(g TEXT, v INTEGER);
+    INSERT INTO rank_pr VALUES
+        ('a', 1), ('a', 1), ('a', 2),
+        ('b', 1), ('b', 2), ('b', 2), ('b', 3);
+}
+
+# Values reappear across partitions; rank must reset to 1 at each
+# partition boundary regardless of what came before.
+@setup rank_partition_repeated
+test rank-resets-across-partitions-with-repeated-values {
+    SELECT g, v, rank() OVER (PARTITION BY g ORDER BY v) FROM rank_pr ORDER BY g, v;
+}
+expect {
+    a|1|1
+    a|1|1
+    a|2|3
+    b|1|1
+    b|2|2
+    b|2|2
+    b|3|4
+}
+
+@setup rank_base
+test two-rank-windows-different-orderings {
+    SELECT id, v,
+           rank() OVER (ORDER BY v),
+           rank() OVER (ORDER BY v DESC)
+    FROM rank_items ORDER BY id;
+}
+expect {
+    1|10|4|3
+    2|10|4|3
+    3|20|6|2
+    4|5|1|5
+    5|5|1|5
+    6|5|1|5
+    7|100|7|1
+}

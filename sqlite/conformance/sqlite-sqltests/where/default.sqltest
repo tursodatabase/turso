@@ -1,0 +1,842 @@
+@database :default:
+@database :default-no-rowidalias:
+
+test where-clause-eq {
+    select last_name from users where id = 2000;
+}
+expect {
+    Carter
+}
+
+test where-clause-eq-string {
+    select count(1) from users where last_name = 'Rodriguez';
+}
+expect {
+    23
+}
+
+test where-clause-isnull {
+    select count(1) from users where last_name isnull;
+}
+expect {
+    0
+}
+
+test where-clause-isnull-or-false {
+    select count(1) from users where null isnull or 1 != 1;
+}
+expect {
+    10000
+}
+
+test where-clause-notnull {
+    select count(1) from users where last_name not null;
+}
+expect {
+    10000
+}
+
+test where-clause-notnull-or-false {
+    select count(1) from users where last_name not null or 1 != 1;
+}
+expect {
+    10000
+}
+
+test where-clause-ne {
+    select count(1) from users where id != 2000;
+}
+expect {
+    9999
+}
+
+test where-clause-gt {
+    select count(1) from users where id > 2000;
+}
+expect {
+    8000
+}
+
+test where-clause-gte {
+    select count(1) from users where id >= 2000;
+}
+expect {
+    8001
+}
+
+test where-clause-lt {
+    select count(1) from users where id < 2000;
+}
+expect {
+    1999
+}
+
+test where-clause-lte {
+    select count(1) from users where id <= 2000;
+}
+expect {
+    2000
+}
+
+test where-clause-unary-true {
+    select count(1) from users where 1;
+}
+expect {
+    10000
+}
+
+# not correct? should be 0?
+test where-clause-unary-false {
+    select count(1) from users where 0;
+}
+expect {
+    0
+}
+
+test where-clause-no-table-constant-condition-true {
+    select 1 where 1;
+}
+expect {
+    1
+}
+
+test where-clause-no-table-constant-condition-identifier-true {
+    select 1 where true;
+}
+expect {
+    1
+}
+
+test where-clause-no-table-constant-condition-true-2 {
+    select 1 where '1';
+}
+expect {
+    1
+}
+
+test where-clause-no-table-constant-condition-true-3 {
+    select 1 where 6.66;
+}
+expect {
+    1
+}
+
+test where-clause-no-table-constant-condition-true-4 {
+    select 1 where '6.66';
+}
+expect {
+    1
+}
+
+test where-clause-no-table-constant-condition-true-5 {
+    select 1 where -1;
+}
+expect {
+    1
+}
+
+test where-clause-no-table-constant-condition-true-6 {
+    select 1 where '-1';
+}
+expect {
+    1
+}
+
+test where-clause-no-table-constant-condition-false {
+    select 1 where 0;
+}
+expect {
+}
+
+test where-clause-no-table-constant-condition-identifier-false {
+    select 1 where false;
+}
+expect {
+}
+
+test where-clause-no-table-constant-condition-false-2 {
+    select 1 where '0';
+}
+expect {
+}
+
+test where-clause-no-table-constant-condition-false-3 {
+    select 1 where 0.0;
+}
+expect {
+}
+
+test where-clause-no-table-constant-condition-false-4 {
+    select 1 where '0.0';
+}
+expect {
+}
+
+test where-clause-no-table-constant-condition-false-5 {
+    select 1 where -0.0;
+}
+expect {
+}
+
+test where-clause-no-table-constant-condition-false-6 {
+    select 1 where '-0.0';
+}
+expect {
+}
+
+test where-clause-no-table-constant-condition-false-7 {
+    select 1 where 'hamburger';
+}
+expect {
+}
+
+# this test functions as an assertion that the index on users.age is being used, since the results are ordered by age without an order by.
+test select-where-and {
+    select first_name, age from users where first_name = 'Jamie' and age > 80
+}
+expect {
+    Jamie|86
+}
+
+test select-where-or {
+    select first_name, age from users where first_name = 'Jamie' and age > 80
+}
+expect {
+    Jamie|86
+}
+
+test select-where-and-or {
+    select first_name, age from users where first_name = 'Jamie' or age = 1 and age = 2
+}
+expect {
+    Jamie|48
+    Jamie|62
+    Jamie|86
+    Jamie|34
+}
+
+test where-float-int {
+    select * from products where price > 50 and name != 'hat';
+}
+expect {
+    4|sweater|68.9227440029754
+    6|shorts|50.0363795824125
+    9|boots|59.7782771700224
+}
+
+test where-multiple-and {
+    select * from products where price > 50 and name != 'sweatshirt' and price < 75;
+}
+expect {
+    4|sweater|68.9227440029754
+    6|shorts|50.0363795824125
+    9|boots|59.7782771700224
+}
+
+test where-multiple-or {
+    select * from products where price > 75 or name = 'shirt' or name = 'coat';
+}
+expect {
+    1|hat|82.9389679823547
+    3|shirt|22.7209470048471
+    10|coat|8.85709624556419
+}
+
+test where_in_list {
+    select * from products where name in ('hat', 'sweatshirt', 'shorts');
+}
+expect {
+    1|hat|82.9389679823547
+    5|sweatshirt|23.8100541984648
+    6|shorts|50.0363795824125
+}
+
+test where_not_in_list {
+    select * from products where name not in ('hat', 'sweatshirt', 'shorts');
+}
+expect {
+    2|cap|32.2475410444338
+    3|shirt|22.7209470048471
+    4|sweater|68.9227440029754
+    7|jeans|47.9379799632405
+    8|sneakers|36.1006791183673
+    9|boots|59.7782771700224
+    10|coat|8.85709624556419
+    11|accessories|47.5875632652657
+}
+
+test where_in_list_or_another_list {
+    select * from products where name in ('hat', 'sweatshirt', 'shorts') or price in (81.0, 82.0);
+}
+expect {
+    1|hat|82.9389679823547
+    5|sweatshirt|23.8100541984648
+    6|shorts|50.0363795824125
+}
+
+test where_not_in_list_and_not_in_another_list {
+    select * from products where name not in ('hat', 'sweatshirt', 'shorts') and price not in (81.0, 82.0, 78.0, 1.0, 33.0);
+}
+expect {
+    2|cap|32.2475410444338
+    3|shirt|22.7209470048471
+    4|sweater|68.9227440029754
+    7|jeans|47.9379799632405
+    8|sneakers|36.1006791183673
+    9|boots|59.7782771700224
+    10|coat|8.85709624556419
+    11|accessories|47.5875632652657
+}
+
+test where_in_list_or_not_in_another_list {
+    select * from products where name in ('hat', 'sweatshirt', 'shorts') or price not in (82.0, 18.0, 78.0, 33.0, 81.0);
+}
+expect {
+    1|hat|82.9389679823547
+    2|cap|32.2475410444338
+    3|shirt|22.7209470048471
+    4|sweater|68.9227440029754
+    5|sweatshirt|23.8100541984648
+    6|shorts|50.0363795824125
+    7|jeans|47.9379799632405
+    8|sneakers|36.1006791183673
+    9|boots|59.7782771700224
+    10|coat|8.85709624556419
+    11|accessories|47.5875632652657
+}
+
+test where_in_empty_list {
+    select * from products where name in ();
+}
+expect {
+}
+
+test where_not_in_empty_list {
+    select * from products where name not in ();
+}
+expect {
+    1|hat|82.9389679823547
+    2|cap|32.2475410444338
+    3|shirt|22.7209470048471
+    4|sweater|68.9227440029754
+    5|sweatshirt|23.8100541984648
+    6|shorts|50.0363795824125
+    7|jeans|47.9379799632405
+    8|sneakers|36.1006791183673
+    9|boots|59.7782771700224
+    10|coat|8.85709624556419
+    11|accessories|47.5875632652657
+}
+
+test where_name_in_list_and_price_gt_70_or_name_exactly_boots {
+    select * from products where name in ('hat', 'sweatshirt', 'shorts') and price > 70 or name = 'boots';
+}
+expect {
+    1|hat|82.9389679823547
+    9|boots|59.7782771700224
+}
+
+test where_name_in_list_or_price_gt_70_and_name_like_shirt {
+    select * from products where name in ('hat', 'shorts') or price > 70 and name like '%shirt%';
+}
+expect {
+    1|hat|82.9389679823547
+    6|shorts|50.0363795824125
+}
+
+test where_name_not_in_list_or_name_eq_shirt {
+    select * from products where name not in ('shirt', 'boots') or name = 'shirt';
+}
+expect {
+    1|hat|82.9389679823547
+    2|cap|32.2475410444338
+    3|shirt|22.7209470048471
+    4|sweater|68.9227440029754
+    5|sweatshirt|23.8100541984648
+    6|shorts|50.0363795824125
+    7|jeans|47.9379799632405
+    8|sneakers|36.1006791183673
+    10|coat|8.85709624556419
+    11|accessories|47.5875632652657
+}
+
+test where_multiple {
+    select id, first_name, age from users where id = 5 and age < 50;
+}
+expect {
+    5|Nikko|39
+}
+
+test where_multiple_flipped {
+    select id, first_name, age from users where age < 50 and id = 5;
+}
+expect {
+    5|Nikko|39
+}
+
+test where-parentheses-and {
+    select id, name from products where (id = 5 and name = 'sweatshirt') and (id = 5 and name = 'sweatshirt') ORDER BY id;
+}
+expect {
+    5|sweatshirt
+}
+
+test where-nested-parentheses {
+    select id, name from products where ((id = 5 and name = 'sweatshirt') or (id = 1 and name = 'hat')) ORDER BY id;
+}
+expect {
+    1|hat
+    5|sweatshirt
+}
+
+test where-complex-parentheses {
+    select id, name from products where ((id = 5 and name = 'sweatshirt') or (id = 1 and name = 'hat')) and (name = 'sweatshirt' or name = 'hat') ORDER BY id;
+}
+expect {
+    1|hat
+    5|sweatshirt
+}
+
+# regression test for primary key index behavior
+test where-id-index-seek-regression-test {
+    select id from users where id > 9995;
+}
+expect {
+    9996
+    9997
+    9998
+    9999
+    10000
+}
+
+test where-id-index-seek-regression-test-opposite {
+    select id from users where 9999 < id;
+    select id from users where 10000 <= id;
+    select id from users where 2 > id;
+    select id from users where 1 >= id;
+}
+expect {
+    10000
+    10000
+    1
+    1
+}
+
+test where-id-index-seek-regression-test-2 {
+    select count(1) from users where id > 0;
+}
+expect {
+    10000
+}
+
+# regression test for secondary index (users.age) behavior
+test where-age-index-seek-regression-test {
+    select age from users where age >= 100 limit 20;
+}
+expect {
+    100
+    100
+    100
+    100
+    100
+    100
+    100
+    100
+    100
+    100
+    100
+    100
+    100
+    100
+    100
+    100
+    100
+    100
+    100
+    100
+}
+
+test where-age-index-seek-regression-test-2 {
+    select count(1) from users where age > 0;
+}
+expect {
+    10000
+}
+
+test where-age-index-seek-regression-test-3 {
+    select age from users where age > 90 order by age limit 1;
+}
+expect {
+    91
+}
+
+test where-simple-between {
+    SELECT * FROM products WHERE price BETWEEN 70 AND 100;
+}
+expect {
+    1|hat|82.9389679823547
+}
+
+test between-price-range-with-names {
+    SELECT * FROM products
+    WHERE (price BETWEEN 70 AND 100)
+    AND (name = 'sweatshirt' OR name = 'sneakers');
+}
+expect {
+}
+
+test where-between-true-and-2 {
+    select id from users where id between true and 2;
+}
+expect {
+    1
+    2
+}
+
+test nested-parens-conditionals-or-and-or {
+    SELECT count(*) FROM users WHERE ((age > 25 OR age < 18) AND (city = 'Boston' OR state = 'MA'));
+}
+expect {
+    176
+}
+
+test nested-parens-conditionals-and-or-and {
+    SELECT * FROM users WHERE (((age > 18 AND city = 'New Mario') OR age = 92) AND city = 'Lake Paul');
+}
+expect {
+}
+
+test nested-parens-conditionals-and-double-or {
+    SELECT * FROM users WHERE ((age > 30 OR age < 20) AND (state = 'NY' OR state = 'CA')) AND first_name glob 'An*' order by id;
+}
+expect {
+    87|Antonia|Weber|carole@example.org|246-841-4611 x364|Casey Roads|Watsica side|CA|687|78
+    308|Angelo|Murphy|dallin@example.net|550.247.0891 x538|Coralie Hollow|Frami mouth|CA|97854|92
+    1734|Antonina|Kunde|faustino@example.org|981-504-2398 x5149|Koelpin Pine|Hammes burgh|CA|983|36
+    6192|Antwan|Corkery|frederique@example.org|(703) 464-9976 x710|VonRueden Port|Kutch burgh|NY|5242|31
+}
+
+# Regression test for nested parens + OR + AND. This returned 0 rows before the fix.
+# It should always return 1 row because it is true for id = 6.
+test nested-parens-and-inside-or-regression-test {
+    SELECT count(1) FROM users
+    WHERE (
+    (
+    (
+    (id != 5)
+    AND
+    (id = 5 OR TRUE)
+    )
+    OR FALSE
+    )
+    AND
+    (id = 6 OR FALSE)
+    );
+}
+expect {
+    1
+}
+
+# Regression tests for binary conditional jump comparisons where one operand is null
+# Test behavior of binary comparisons (=,>,<,>=,<=,!=) when one operand is NULL
+# Each test has 3 variants:
+# 1. Simple comparison with NULL (should return empty)
+# 2. Comparison with NULL OR id=1 (should return Jamie)
+# 3. Comparison with NULL AND id=1 (should return empty)
+
+# Operator: =
+test where-binary-one-operand-null-eq {
+    select * from users where first_name = NULL;
+}
+expect {
+}
+
+test where-binary-one-operand-null-or-eq {
+    select first_name from users where first_name = NULL OR id = 1;
+}
+expect {
+    Dan
+}
+
+test where-binary-one-operand-null-and-eq {
+    select first_name from users where first_name = NULL AND id = 1;
+}
+expect {
+}
+
+# Operator: >
+test where-binary-one-operand-null-gt {
+    select * from users where first_name > NULL;
+}
+expect {
+}
+
+test where-binary-one-operand-null-or-gt {
+    select first_name from users where first_name > NULL OR id = 1;
+}
+expect {
+    Dan
+}
+
+test where-binary-one-operand-null-and-gt {
+    select first_name from users where first_name > NULL AND id = 1;
+}
+expect {
+}
+
+# Operator: <
+test where-binary-one-operand-null-lt {
+    select * from users where first_name < NULL;
+}
+expect {
+}
+
+test where-binary-one-operand-null-or-lt {
+    select first_name from users where first_name < NULL OR id = 1;
+}
+expect {
+    Dan
+}
+
+test where-binary-one-operand-null-and-lt {
+    select first_name from users where first_name < NULL AND id = 1;
+}
+expect {
+}
+
+# Operator: >=
+test where-binary-one-operand-null-gte {
+    select * from users where first_name >= NULL;
+}
+expect {
+}
+
+test where-binary-one-operand-null-or-gte {
+    select first_name from users where first_name >= NULL OR id = 1;
+}
+expect {
+    Dan
+}
+
+test where-binary-one-operand-null-and-gte {
+    select first_name from users where first_name >= NULL AND id = 1;
+}
+expect {
+}
+
+# Operator: <=
+test where-binary-one-operand-null-lte {
+    select * from users where first_name <= NULL;
+}
+expect {
+}
+
+test where-binary-one-operand-null-or-lte {
+    select first_name from users where first_name <= NULL OR id = 1;
+}
+expect {
+    Dan
+}
+
+test where-binary-one-operand-null-and-lte {
+    select first_name from users where first_name <= NULL AND id = 1;
+}
+expect {
+}
+
+# Operator: !=
+test where-binary-one-operand-null-ne {
+    select * from users where first_name != NULL;
+}
+expect {
+}
+
+test where-binary-one-operand-null-or-ne {
+    select first_name from users where first_name != NULL OR id = 1;
+}
+expect {
+    Dan
+}
+
+test where-binary-one-operand-null-and-ne {
+    select first_name from users where first_name != NULL AND id = 1;
+}
+expect {
+}
+
+# Test literals in WHERE clause
+test where-literal-string {
+    select count(*) from users where 'yes';
+}
+expect {
+    0
+}
+
+# FIXME: should return 0
+#do_execsql_test where-literal-number {
+#    select count(*) from users where x'DEADBEEF';
+#} {0}
+# Test CAST in WHERE clause
+test where-cast-string-to-int {
+    select count(*) from users where cast('1' as integer);
+}
+expect {
+    10000
+}
+
+test where-cast-float-to-int {
+    select count(*) from users where cast('0' as integer);
+}
+expect {
+    0
+}
+
+# Test FunctionCall in WHERE clause
+test where-function-length {
+    select count(*) from users where length(first_name);
+}
+expect {
+    10000
+}
+
+# Test CASE in WHERE clause
+test where-case-simple {
+    select count(*) from users where
+    case when age > 0 then 1 else 0 end;
+}
+expect {
+    10000
+}
+
+test where-case-searched {
+    select count(*) from users where
+    case age
+    when 0 then 0
+    else 1
+    end;
+}
+expect {
+    10000
+}
+
+# Test unary operators in WHERE clause
+test where-unary-not {
+    select count(*) from users where not (id = 1);
+}
+expect {
+    9999
+}
+
+test where-unary-plus {
+    select count(*) from users where +1;
+}
+expect {
+    10000
+}
+
+test where-unary-minus {
+    select count(*) from users where -1;
+}
+expect {
+    10000
+}
+
+test where-unary-bitnot {
+    select count(*) from users where ~1;
+}
+expect {
+    10000
+}
+
+# Test binary math operators in WHERE clause
+test where-binary-add {
+    select count(*) from users where 1 + 1;
+}
+expect {
+    10000
+}
+
+test where-binary-subtract {
+    select count(*) from users where 2 - 1;
+}
+expect {
+    10000
+}
+
+test where-binary-multiply {
+    select count(*) from users where 2 * 1;
+}
+expect {
+    10000
+}
+
+test where-binary-divide {
+    select count(*) from users where 2 / 2;
+}
+expect {
+    10000
+}
+
+test where-binary-modulo {
+    select count(*) from users where 3 % 2;
+}
+expect {
+    10000
+}
+
+test where-binary-shift-left {
+    select count(*) from users where 1 << 1;
+}
+expect {
+    10000
+}
+
+test where-binary-shift-right {
+    select count(*) from users where 2 >> 1;
+}
+expect {
+    10000
+}
+
+test where-binary-bitwise-and {
+    select count(*) from users where 3 & 1;
+}
+expect {
+    10000
+}
+
+test where-binary-bitwise-or {
+    select count(*) from users where 2 | 1;
+}
+expect {
+    10000
+}
+
+test where-constant-condition-no-tables {
+    select 1 where 1 IS NULL;
+}
+expect {
+}
+
+test where-constant-condition-no-tables-2 {
+    select 1 where 1 IS NOT NULL;
+}
+expect {
+    1
+}
+
+# We had a bug where NULL was incorrectly used as a seek key, returning all rows (because NULL < everything in index keys)
+test where-null-comparison-index-seek-regression-test {
+    select age from users where age > NULL;
+}
+expect {
+}
+
+# We had a bug where Limbo tried to use an index when there was a WHERE term like 't.x = t.x'
+test where-self-referential-regression {
+    select count(1) from users where id = id;
+}
+expect {
+    10000
+}
+

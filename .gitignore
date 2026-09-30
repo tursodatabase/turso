@@ -1,0 +1,115 @@
+/target
+/target.noindex
+/.idea
+/.vscode
+/.sqlite3
+**/target
+
+*.so
+*.dylib
+*.dSYM/
+*.ipynb
+*.o
+*.sqlite
+!bindings/dotnet/src/Turso.Data.Sqlite/
+!bindings/dotnet/src/Turso.Data.Sqlite/**
+# Python
+*.egg-info/
+.hypothesis/
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+.venv*/
+__pycache__/
+.coverage
+venv
+env
+.env
+.venv
+dist/
+.tmp/
+
+*.db
+**/*.db-wal
+**/*.db-shm
+**/*-wal
+**/*.db-tshm
+
+# perf
+**/*/Mobibench
+perf/mobibench/plot/results.csv
+perf/mobibench/plot/mobibench.pdf
+perf/mobibench/plot/uv.lock
+
+# OS
+.DS_Store
+
+# Javascript
+**/node_modules/
+
+# .NET build outputs
+examples/dotnet/obj/
+
+# testing
+testing/stress/git.diff
+testing/stress/targeted_coverage.json
+testing/limbo_output.txt
+**/limbo_output.txt
+testing/*.log
+.bugbase
+limbostress.log
+simulator.log
+**/*.txt
+profile.json.gz
+simulator-output/
+tests/*.sql
+stress-go/stress-go
+&1
+bisected.sql
+*.log
+
+*.db-log
+settings.local.json
+.claude/agents/
+.build-hash
+
+# Track empty wals for read only databases
+!sqlite/conformance/database/*
+sqlite/conformance/database/integrity_*.db
+
+
+# For simulator redo
+test.sql
+
+# for elle edn transaction history
+*.edn
+elle-history-results/
+custom-types-fuzzer-output/
+CLAUDE.md
+bindings/python/dev.py
+bindings/python/implementation-test/
+bindings/javascript/wasi-sdk-*
+dhat-heap.json
+
+# Aristo runtime, cache, and per-user state: never commit these.
+# Durable state (.aristo/proofs/*.proof, .aristo/specs/, .aristo/feedback/,
+# .aristo/expectations.toml, .aristo/canon-matches.toml, aristo.toml) is
+# committed and intentionally not listed here.
+.aristo/index.toml
+# Per-annotation docs: normally committed, but excluded from this PR to keep the
+# diff small. Regenerate with `aristo doc` (see CONTRIBUTING.md -> Aristo).
+.aristo/doc/
+.aristo/sessions/
+.aristo/nudge-state.toml
+.aristo/verify-queue/
+.aristo/critique-queue/
+.aristo/critiques/
+.aristo/proofs/*.proof.bak
+.aristo/archive/
+
+# pgregress actual output and diffs
+postgres/regress/results/
+
+# Amp orb runtime files
+.amp/portals/*
+sqlite/conformance/upstream/logs/

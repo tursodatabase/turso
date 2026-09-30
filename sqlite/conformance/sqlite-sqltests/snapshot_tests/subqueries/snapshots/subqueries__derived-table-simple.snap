@@ -1,0 +1,21 @@
+---
+source: subqueries.sqltest
+expression: |-
+  SELECT subq.category_id, subq.avg_price
+      FROM (
+          SELECT category_id, avg(price) AS avg_price
+          FROM products
+          GROUP BY category_id
+      ) AS subq
+      WHERE subq.avg_price > 50;
+info:
+  statement_type: SELECT
+  tables:
+  - products
+  setup_blocks:
+  - schema
+  database: ':memory:'
+---
+QUERY PLAN
+`--SCAN subq
+   `--SCAN products USING INDEX idx_products_category

@@ -1,0 +1,587 @@
+# Subquery chain sort elision tests
+# Tests that ORDER BY sorts are elided when a CTE/subquery chain
+# already provides the needed order, and NOT elided when it would be wrong.
+
+@database :memory:
+@skip-file-if mvcc "mvcc has slightly different cursor ids, so skipping it for now"
+
+setup elision_schema {
+    CREATE TABLE t1 (x INTEGER, y INTEGER, z TEXT);
+    INSERT INTO t1 VALUES (3, 10, 'c');
+    INSERT INTO t1 VALUES (1, 30, 'a');
+    INSERT INTO t1 VALUES (5, 20, 'e');
+    INSERT INTO t1 VALUES (2, 10, 'b');
+    INSERT INTO t1 VALUES (4, 30, 'd');
+    INSERT INTO t1 VALUES (1, 20, 'f');
+    INSERT INTO t1 VALUES (3, 30, 'g');
+}
+
+# ══════════════════════════════════════════════════════════════════
+# Positive cases: sort correctly elided
+# ══════════════════════════════════════════════════════════════════
+
+# CTE ORDER BY x, outer ORDER BY x — outer sort elided
+@setup elision_schema
+test outer-orderby-elided-by-cte {
+    WITH ordered AS (
+        SELECT x, y FROM t1 ORDER BY x
+    )
+    SELECT * FROM ordered ORDER BY x;
+}
+expect {
+    1|30
+    1|20
+    2|10
+    3|10
+    3|30
+    4|30
+    5|20
+}
+
+# Multi-hop CTE passthrough preserves order
+@setup elision_schema
+test multi-hop-outer-orderby-elided {
+    WITH step1 AS (
+        SELECT x, y FROM t1 ORDER BY x
+    ),
+    step2 AS (
+        SELECT x, y FROM step1
+    )
+    SELECT * FROM step2 ORDER BY x;
+}
+expect {
+    1|30
+    1|20
+    2|10
+    3|10
+    3|30
+    4|30
+    5|20
+}
+
+# Three-hop passthrough chain
+@setup elision_schema
+test three-hop-passthrough {
+    WITH cte1 AS (SELECT x, y FROM t1 ORDER BY x),
+         cte2 AS (SELECT x, y FROM cte1),
+         cte3 AS (SELECT x, y FROM cte2)
+    SELECT x, y FROM cte3 ORDER BY x;
+}
+expect {
+    1|30
+    1|20
+    2|10
+    3|10
+    3|30
+    4|30
+    5|20
+}
+
+# CTE GROUP BY y, outer ORDER BY y — sort elided via group
+@setup elision_schema
+test outer-orderby-elided-by-group {
+    WITH grouped AS (
+        SELECT y, COUNT(*) AS cnt FROM t1 GROUP BY y
+    )
+    SELECT * FROM grouped ORDER BY y;
+}
+expect {
+    10|2
+    20|2
+    30|3
+}
+
+# CTE ORDER BY x → window OVER (ORDER BY x) — window sort elided
+@setup elision_schema
+test cte-order-feeds-window {
+    WITH ordered AS (
+        SELECT x, y FROM t1 ORDER BY x
+    )
+    SELECT x, SUM(y) OVER (ORDER BY x) AS running
+    FROM ordered;
+}
+expect {
+    1|50
+    1|50
+    2|60
+    3|100
+    3|100
+    4|130
+    5|150
+}
+
+# Multi-hop CTE chain with window
+@setup elision_schema
+test multi-hop-cte-window {
+    WITH step1 AS (
+        SELECT x, y FROM t1 ORDER BY x
+    ),
+    step2 AS (
+        SELECT x, y FROM step1
+    )
+    SELECT x, SUM(y) OVER (ORDER BY x) AS running
+    FROM step2;
+}
+expect {
+    1|50
+    1|50
+    2|60
+    3|100
+    3|100
+    4|130
+    5|150
+}
+
+# CTE GROUP BY feeds window
+@setup elision_schema
+test cte-group-feeds-window {
+    WITH grouped AS (
+        SELECT y, COUNT(*) AS cnt FROM t1 GROUP BY y
+    )
+    SELECT y, SUM(cnt) OVER (ORDER BY y) AS running
+    FROM grouped;
+}
+expect {
+    10|2
+    20|4
+    30|7
+}
+
+# ══════════════════════════════════════════════════════════════════
+# Negative cases: sort must NOT be elided
+# ══════════════════════════════════════════════════════════════════
+
+# CTE ASC, outer DESC — different direction
+@setup elision_schema
+test asc-vs-desc-not-elided {
+    WITH cte AS (SELECT x FROM t1 ORDER BY x ASC)
+    SELECT x FROM cte ORDER BY x DESC;
+}
+expect {
+    5
+    4
+    3
+    3
+    2
+    1
+    1
+}
+
+# Multi-column direction mismatch (a ASC, b ASC) vs (a ASC, b DESC)
+@setup elision_schema
+test multi-col-direction-mismatch {
+    WITH cte AS (SELECT x, y FROM t1 ORDER BY x ASC, y ASC)
+    SELECT x, y FROM cte ORDER BY x ASC, y DESC;
+}
+expect {
+    1|30
+    1|20
+    2|10
+    3|30
+    3|10
+    4|30
+    5|20
+}
+
+# CTE ORDER BY x, outer ORDER BY y, x — different column (tiebreaker for determinism)
+@setup elision_schema
+test different-orderby-column {
+    WITH cte AS (SELECT x, y FROM t1 ORDER BY x)
+    SELECT x, y FROM cte ORDER BY y, x;
+}
+expect {
+    2|10
+    3|10
+    1|20
+    5|20
+    1|30
+    3|30
+    4|30
+}
+
+# CTE ORDER BY x → outer ORDER BY x, y — partial match insufficient
+@setup elision_schema
+test partial-order-match-not-elided {
+    WITH ordered AS (
+        SELECT x, y FROM t1 ORDER BY x
+    )
+    SELECT * FROM ordered ORDER BY x, y;
+}
+expect {
+    1|20
+    1|30
+    2|10
+    3|10
+    3|30
+    4|30
+    5|20
+}
+
+# CTE without ORDER BY — outer sort must remain
+@setup elision_schema
+test no-cte-order-not-elided {
+    WITH unordered AS (
+        SELECT x, y FROM t1
+    )
+    SELECT * FROM unordered ORDER BY x;
+}
+expect {
+    1|30
+    1|20
+    2|10
+    3|10
+    3|30
+    4|30
+    5|20
+}
+
+# LIMIT in intermediate CTE breaks order guarantee
+@setup elision_schema
+test limit-breaks-chain {
+    WITH cte1 AS (SELECT x, y FROM t1 ORDER BY x),
+         cte2 AS (SELECT x, y FROM cte1 LIMIT 4),
+         cte3 AS (SELECT x, y FROM cte2)
+    SELECT * FROM cte3 ORDER BY x;
+}
+expect {
+    1|30
+    1|20
+    2|10
+    3|10
+}
+
+# OFFSET in CTE breaks chain
+@setup elision_schema
+test offset-breaks-chain {
+    WITH cte AS (SELECT x FROM t1 ORDER BY x LIMIT 100 OFFSET 2)
+    SELECT x FROM cte ORDER BY x;
+}
+expect {
+    2
+    3
+    3
+    4
+    5
+}
+
+# DISTINCT in intermediate CTE
+@setup elision_schema
+test distinct-in-cte {
+    WITH cte AS (SELECT DISTINCT x FROM t1 ORDER BY x)
+    SELECT x FROM cte ORDER BY x;
+}
+expect {
+    1
+    2
+    3
+    4
+    5
+}
+
+# Aggregate in CTE
+@setup elision_schema
+test aggregate-in-cte {
+    WITH cte AS (SELECT x, COUNT(*) AS cnt FROM t1 GROUP BY x ORDER BY x)
+    SELECT x, cnt FROM cte ORDER BY x;
+}
+expect {
+    1|2
+    2|1
+    3|2
+    4|1
+    5|1
+}
+
+# Window in intermediate CTE
+@setup elision_schema
+test window-in-intermediate-cte {
+    WITH cte AS (
+        SELECT x, y, SUM(y) OVER (ORDER BY x) AS running FROM t1
+    )
+    SELECT x, y, running FROM cte ORDER BY x;
+}
+expect {
+    1|30|50
+    1|20|50
+    2|10|60
+    3|10|100
+    3|30|100
+    4|30|130
+    5|20|150
+}
+
+# Join in CTE — multi-table prevents elision
+@setup elision_schema
+test join-in-cte {
+    CREATE TABLE t2(a INTEGER, b INTEGER);
+    INSERT INTO t2 VALUES (1, 100);
+    INSERT INTO t2 VALUES (2, 200);
+    INSERT INTO t2 VALUES (3, 300);
+    WITH cte AS (
+        SELECT t1.x, t2.b FROM t1 JOIN t2 ON t1.x = t2.a ORDER BY t1.x
+    )
+    SELECT x, b FROM cte ORDER BY x;
+}
+expect {
+    1|100
+    1|100
+    2|200
+    3|300
+    3|300
+}
+
+# DESC inner, ASC outer — opposite directions
+@setup elision_schema
+test desc-inner-asc-outer {
+    WITH cte1 AS (SELECT x FROM t1 ORDER BY x DESC),
+         cte2 AS (SELECT x FROM cte1)
+    SELECT x FROM cte2 ORDER BY x ASC;
+}
+expect {
+    1
+    1
+    2
+    3
+    3
+    4
+    5
+}
+
+# Collation mismatch: column NOCASE, outer BINARY
+@setup elision_schema
+test collation-mismatch {
+    CREATE TABLE names(name TEXT COLLATE NOCASE);
+    INSERT INTO names VALUES ('alice');
+    INSERT INTO names VALUES ('Bob');
+    INSERT INTO names VALUES ('CHARLIE');
+    INSERT INTO names VALUES ('dave');
+    WITH cte AS (SELECT name FROM names ORDER BY name)
+    SELECT name FROM cte ORDER BY name COLLATE BINARY;
+}
+expect {
+    Bob
+    CHARLIE
+    alice
+    dave
+}
+
+# Partial window partition match — CTE provides only partition order,
+# but window needs PARTITION BY x ORDER BY y
+@setup elision_schema
+test partial-partition-match {
+    WITH cte AS (SELECT x, y, z FROM t1 ORDER BY x)
+    SELECT x, y, SUM(y) OVER (PARTITION BY x ORDER BY y) AS s FROM cte;
+}
+expect {
+    1|20|20
+    1|30|50
+    2|10|10
+    3|10|10
+    3|30|40
+    4|30|30
+    5|20|20
+}
+
+# Expression ordering: CTE orders by x+y expression
+@setup elision_schema
+test expression-ordering {
+    WITH cte AS (SELECT x, y, x+y AS s FROM t1 ORDER BY x+y)
+    SELECT x, y, s FROM cte ORDER BY s;
+}
+expect {
+    2|10|12
+    3|10|13
+    1|20|21
+    5|20|25
+    1|30|31
+    3|30|33
+    4|30|34
+}
+
+# NULLs in ORDER BY column
+@setup elision_schema
+test nulls-in-order-column {
+    CREATE TABLE t3(a INTEGER, b INTEGER);
+    INSERT INTO t3 VALUES (1, NULL);
+    INSERT INTO t3 VALUES (2, 10);
+    INSERT INTO t3 VALUES (NULL, 20);
+    INSERT INTO t3 VALUES (3, NULL);
+    INSERT INTO t3 VALUES (NULL, 5);
+    WITH cte AS (SELECT a, b FROM t3 ORDER BY a)
+    SELECT a, b FROM cte ORDER BY a;
+}
+expect {
+    |20
+    |5
+    1|
+    2|10
+    3|
+}
+
+# Duplicate values — ordering stability
+@setup elision_schema
+test duplicate-values-stability {
+    WITH cte AS (SELECT x, y, z FROM t1 ORDER BY x)
+    SELECT x, z FROM cte ORDER BY x;
+}
+expect {
+    1|a
+    1|f
+    2|b
+    3|c
+    3|g
+    4|d
+    5|e
+}
+
+# Empty result set
+@setup elision_schema
+test empty-result-set {
+    WITH cte AS (SELECT x FROM t1 WHERE x > 100 ORDER BY x)
+    SELECT x FROM cte ORDER BY x;
+}
+expect {
+}
+
+# Window sort NOT elided: CTE ORDER BY x → window OVER (ORDER BY x, y) — partial
+@setup elision_schema
+test window-partial-not-elided {
+    WITH ordered AS (
+        SELECT x, y FROM t1 ORDER BY x
+    )
+    SELECT x, y, SUM(y) OVER (ORDER BY x, y) AS running
+    FROM ordered;
+}
+expect {
+    1|20|20
+    1|30|50
+    2|10|60
+    3|10|70
+    3|30|100
+    4|30|130
+    5|20|150
+}
+
+# Window sort NOT elided: CTE without ORDER BY
+@setup elision_schema
+test window-no-cte-order-not-elided {
+    WITH unordered AS (
+        SELECT x, y FROM t1
+    )
+    SELECT x, SUM(y) OVER (ORDER BY x) AS running
+    FROM unordered;
+}
+expect {
+    1|50
+    1|50
+    2|60
+    3|100
+    3|100
+    4|130
+    5|150
+}
+
+# ══════════════════════════════════════════════════════════════════
+# EQP snapshots: verify sort presence/absence in query plans
+# ══════════════════════════════════════════════════════════════════
+
+# Sort elided: CTE ORDER BY x → outer ORDER BY x
+@setup elision_schema
+snapshot-eqp eqp-outer-orderby-elided-by-cte {
+    WITH ordered AS (
+        SELECT x, y FROM t1 ORDER BY x
+    )
+    SELECT * FROM ordered ORDER BY x;
+}
+
+# Sort elided: multi-hop chain
+@setup elision_schema
+snapshot-eqp eqp-multi-hop-outer-orderby-elided {
+    WITH step1 AS (
+        SELECT x, y FROM t1 ORDER BY x
+    ),
+    step2 AS (
+        SELECT x, y FROM step1
+    )
+    SELECT * FROM step2 ORDER BY x;
+}
+
+# Sort elided: GROUP BY feeds outer ORDER BY
+@setup elision_schema
+snapshot-eqp eqp-outer-orderby-elided-by-group {
+    WITH grouped AS (
+        SELECT y, COUNT(*) AS cnt FROM t1 GROUP BY y
+    )
+    SELECT * FROM grouped ORDER BY y;
+}
+
+# Sort elided: CTE ORDER BY → window OVER (ORDER BY same)
+@setup elision_schema
+snapshot-eqp eqp-window-sort-elided-by-cte-order {
+    WITH ordered AS (
+        SELECT x, y FROM t1 ORDER BY x
+    )
+    SELECT x, SUM(y) OVER (ORDER BY x) AS running
+    FROM ordered;
+}
+
+# Sort elided: multi-hop → window
+@setup elision_schema
+snapshot-eqp eqp-window-sort-elided-multi-hop {
+    WITH step1 AS (
+        SELECT x, y FROM t1 ORDER BY x
+    ),
+    step2 AS (
+        SELECT x, y FROM step1
+    )
+    SELECT x, SUM(y) OVER (ORDER BY x) AS running
+    FROM step2;
+}
+
+# Sort elided: GROUP BY → window
+@setup elision_schema
+snapshot-eqp eqp-window-sort-elided-by-group {
+    WITH grouped AS (
+        SELECT y, COUNT(*) AS cnt FROM t1 GROUP BY y
+    )
+    SELECT y, SUM(cnt) OVER (ORDER BY y) AS running
+    FROM grouped;
+}
+
+# Sort NOT elided: no CTE order
+@setup elision_schema
+snapshot-eqp eqp-outer-orderby-not-elided-no-cte-order {
+    WITH unordered AS (
+        SELECT x, y FROM t1
+    )
+    SELECT * FROM unordered ORDER BY x;
+}
+
+# Sort NOT elided: partial column match
+@setup elision_schema
+snapshot-eqp eqp-outer-orderby-not-elided-partial {
+    WITH ordered AS (
+        SELECT x, y FROM t1 ORDER BY x
+    )
+    SELECT * FROM ordered ORDER BY x, y;
+}
+
+# Sort NOT elided: window partial match
+@setup elision_schema
+snapshot-eqp eqp-window-sort-not-elided-partial {
+    WITH ordered AS (
+        SELECT x, y FROM t1 ORDER BY x
+    )
+    SELECT x, y, SUM(y) OVER (ORDER BY x, y) AS running
+    FROM ordered;
+}
+
+# Sort NOT elided: window with no CTE order
+@setup elision_schema
+snapshot-eqp eqp-window-sort-not-elided-no-cte-order {
+    WITH unordered AS (
+        SELECT x, y FROM t1
+    )
+    SELECT x, SUM(y) OVER (ORDER BY x) AS running
+    FROM unordered;
+}

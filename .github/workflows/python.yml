@@ -1,0 +1,240 @@
+name: Python
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+    tags:
+      - v*
+  pull_request:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.sha }}
+  cancel-in-progress: true
+
+env:
+  working-directory: bindings/python
+  PIP_DISABLE_PIP_VERSION_CHECK: "true"
+  CARGO_INCREMENTAL: "0"
+  CARGO_NET_RETRY: 10
+  # Blacksmith Windows images ship VS Build Tools without LLVM, so the aegis
+  # crate's clang-cl preference fails; force the MSVC compiler instead.
+  CC_x86_64_pc_windows_msvc: cl.exe
+
+jobs:
+  test:
+    timeout-minutes: 30
+    strategy:
+      matrix:
+        os:
+          - blacksmith-4vcpu-ubuntu-2404
+          - blacksmith-6vcpu-macos-latest
+          - blacksmith-8vcpu-windows-2025
+        python-version: ["3.10", "3.14"]
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Setup MSVC
+        if: runner.os == 'Windows'
+        uses: "./.github/shared/setup-msvc"
+
+      - name: Setup mold linker
+        if: runner.os == 'Linux'
+        uses: rui314/setup-mold@v1
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: "v1-rust"
+          cache-on-failure: true
+
+
+      - name: Build Rust (debug)
+        run: cargo build -p turso_cli --bin tursodb --locked
+
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: useblacksmith/setup-python@v6
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install uv
+        uses: useblacksmith/setup-uv@v4
+        with:
+          enable-cache: true
+
+      - name: Install the project
+        working-directory: ${{ env.working-directory }}
+        run: uv sync --all-extras --dev --all-packages
+
+      - name: Run Pytest
+        working-directory: ${{ env.working-directory }}
+        run: uv run pytest tests/test_database.py
+
+      - name: Run Pytest (async driver)
+        working-directory: ${{ env.working-directory }}
+        run: uv run pytest tests/test_database_aio.py
+
+      - name: Run Pytest (sync)
+        working-directory: ${{ env.working-directory }}
+        if: runner.os != 'Windows'
+        env:
+          LOCAL_SYNC_SERVER: "../../target/debug/tursodb"
+        run: uv run pytest tests/test_database_sync.py --durations=10
+
+      - name: Run Pytest (sync, async driver)
+        working-directory: ${{ env.working-directory }}
+        if: runner.os != 'Windows'
+        env:
+          LOCAL_SYNC_SERVER: "../../target/debug/tursodb"
+        run: uv run pytest tests/test_database_sync_aio.py --durations=10
+
+      - name: Run Pytest (windows, sync drivers)
+        working-directory: ${{ env.working-directory }}
+        if: runner.os == 'Windows'
+        shell: bash
+        env:
+          LOCAL_SYNC_SERVER: "..\\..\\target\\debug\\tursodb.exe"
+        run: |
+          set -euo pipefail
+          uv run --no-sync pytest tests/test_database_sync.py --durations=10 >sync.log 2>&1 &
+          sync_pid=$!
+          uv run --no-sync pytest tests/test_database_sync_aio.py --durations=10 >async.log 2>&1 &
+          async_pid=$!
+          sync_status=0
+          wait "$sync_pid" || sync_status=$?
+          async_status=0
+          wait "$async_pid" || async_status=$?
+          cat sync.log
+          cat async.log
+          if [ "$sync_status" -ne 0 ] || [ "$async_status" -ne 0 ]; then
+            exit 1
+          fi
+
+  lint:
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: useblacksmith/setup-python@v6
+
+      - name: Install uv
+        uses: useblacksmith/setup-uv@v4
+        with:
+          enable-cache: true
+
+      - name: Ruff lint
+        run: uvx ruff@0.5.4 check
+
+  linux:
+    timeout-minutes: 30
+    defaults:
+      run:
+        working-directory: ${{ env.working-directory }}
+    strategy:
+      matrix:
+        include:
+          - target: x86_64
+            runner: blacksmith-4vcpu-ubuntu-2404
+          - target: aarch64
+            runner: blacksmith-2vcpu-ubuntu-2404-arm
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: useblacksmith/setup-python@v6
+        with:
+          python-version: '3.10'
+      - name: Build wheels
+        uses: PyO3/maturin-action@v1
+        with:
+          working-directory: ${{ env.working-directory }}
+          target: ${{ matrix.target }}
+          args: --profile release-official --out dist
+          sccache: 'true'
+          manylinux: auto
+      - name: Upload wheels
+        uses: actions/upload-artifact@v4
+        with:
+          name: wheels-linux-${{ matrix.target }}
+          path: bindings/python/dist
+
+  macos:
+    runs-on: blacksmith-6vcpu-macos-latest
+    timeout-minutes: 30
+    defaults:
+      run:
+        working-directory: ${{ env.working-directory }}
+    strategy:
+      matrix:
+        target: [x86_64, aarch64]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        env:
+          CXX: clang++
+          CC: clang
+        with:
+          python-version: '3.10'
+      - name: Build wheels
+        uses: PyO3/maturin-action@v1
+        with:
+          working-directory: ${{ env.working-directory }}
+          target: ${{ matrix.target }}
+          args: --profile release-official --out dist
+          sccache: 'true'
+      - name: Upload wheels
+        uses: actions/upload-artifact@v4
+        with:
+          name: wheels-macos-${{ matrix.target }}
+          path: bindings/python/dist
+
+  sdist:
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    timeout-minutes: 30
+    defaults:
+      run:
+        working-directory: ${{ env.working-directory }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build sdist
+        uses: PyO3/maturin-action@v1
+        with:
+          working-directory: ${{ env.working-directory }}
+          command: sdist
+          args: --out dist
+      - name: Upload sdist
+        uses: actions/upload-artifact@v4
+        with:
+          name: wheels-sdist
+          path: bindings/python/dist
+
+  release:
+    name: Release
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    timeout-minutes: 30
+    if: "startsWith(github.ref, 'refs/tags/')"
+    needs: [linux, macos, sdist]
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: bindings/python/dist
+          pattern: wheels-*
+          merge-multiple: true
+      - name: Publish to PyPI
+        uses: PyO3/maturin-action@v1
+        env:
+          MATURIN_PYPI_TOKEN: ${{ secrets.PYPI_API_TOKEN }}
+        with:
+          working-directory: ${{ env.working-directory }}
+          command: upload
+          args: --skip-existing dist/*

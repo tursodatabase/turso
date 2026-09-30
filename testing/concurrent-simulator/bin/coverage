@@ -1,0 +1,97 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+runs="${1:-}"
+shift || true
+
+if [ -z "${runs}" ]; then
+    runs=10
+fi
+
+case "${runs}" in
+    ''|*[!0-9]*)
+        echo "WHOPPER_RUNS must be a positive integer" >&2
+        exit 1
+        ;;
+esac
+
+if [ "${runs}" -eq 0 ]; then
+    echo "WHOPPER_RUNS must be > 0" >&2
+    exit 1
+fi
+
+features=()
+args=()
+checksum_enabled=false
+encryption_enabled=false
+
+for arg in "$@"; do
+    if [[ "${arg}" == "--enable-checksums" ]]; then
+        features=(--features checksum)
+        checksum_enabled=true
+    elif [[ "${arg}" == "--enable-encryption" ]]; then
+        encryption_enabled=true
+        args+=("${arg}")
+    else
+        args+=("${arg}")
+    fi
+done
+
+if [[ "${checksum_enabled}" == true && "${encryption_enabled}" == true ]]; then
+    echo "Error: --enable-checksums and --enable-encryption are not compatible with each other" >&2
+    exit 1
+fi
+
+repo_root="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
+coverage_dir="${repo_root}/.coverage/whopper"
+profiles_dir="${coverage_dir}/profiles"
+target_dir="${coverage_dir}/target"
+binary_path="${target_dir}/debug/turso_whopper"
+profdata_path="${coverage_dir}/turso_whopper.profdata"
+text_report_path="${coverage_dir}/report.txt"
+html_report_dir="${coverage_dir}/html"
+
+toolchain_bin_dir="$(rustc --print sysroot)/lib/rustlib/$(rustc -vV | sed -n 's/^host: //p')/bin"
+llvm_profdata="${toolchain_bin_dir}/llvm-profdata"
+llvm_cov="${toolchain_bin_dir}/llvm-cov"
+
+if [ ! -x "${llvm_profdata}" ] || [ ! -x "${llvm_cov}" ]; then
+    echo "llvm coverage tools are missing" >&2
+    echo "install them with: rustup component add llvm-tools-preview" >&2
+    exit 1
+fi
+
+mkdir -p "${profiles_dir}" "${html_report_dir}"
+rm -f "${profiles_dir}"/*.profraw "${profdata_path}" "${text_report_path}"
+
+export CARGO_TARGET_DIR="${target_dir}"
+export RUSTFLAGS="-Cinstrument-coverage"
+
+cargo build "${features[@]}" -p turso_whopper
+
+for run in $(seq 1 "${runs}"); do
+    echo "coverage run ${run}/${runs}"
+    LLVM_PROFILE_FILE="${profiles_dir}/turso_whopper-${run}-%p-%m.profraw" \
+        RUST_BACKTRACE=full \
+        "${binary_path}" "${args[@]}"
+done
+
+"${llvm_profdata}" merge -sparse "${profiles_dir}"/*.profraw -o "${profdata_path}"
+"${llvm_cov}" report "${binary_path}" \
+    --instr-profile "${profdata_path}" \
+    --ignore-filename-regex='\.cargo|rustc|/usr/'
+"${llvm_cov}" show "${binary_path}" \
+    --instr-profile "${profdata_path}" \
+    --show-line-counts-or-regions \
+    --ignore-filename-regex='\.cargo|rustc|/usr/' \
+    > "${text_report_path}"
+"${llvm_cov}" show "${binary_path}" \
+    --instr-profile "${profdata_path}" \
+    --format html \
+    --output-dir "${html_report_dir}" \
+    --ignore-filename-regex='\.cargo|rustc|/usr/'
+
+echo
+echo "text report: ${text_report_path}"
+echo "html report: ${html_report_dir}/index.html"

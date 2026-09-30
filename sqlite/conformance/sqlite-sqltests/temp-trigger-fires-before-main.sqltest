@@ -1,0 +1,48 @@
+@database :memory:
+
+# TEMP triggers fire before the table's own triggers, and among themselves in
+# creation order; the table's own triggers fire newest-first. SQLite builds
+# its trigger list by walking the temp schema's trigger hash (newest first)
+# and prepending each hit onto the table's own list, which is itself built by
+# prepending at CREATE TRIGGER time. Turso appended temp triggers after the
+# main ones, so when one trigger's changes feed another the final table
+# differed.
+
+@cross-check-integrity
+test temp-triggers-fire-first-in-creation-order {
+    CREATE TABLE t(x);
+    CREATE TABLE log(seq INTEGER PRIMARY KEY AUTOINCREMENT, who TEXT);
+    CREATE TRIGGER main1 BEFORE INSERT ON t BEGIN INSERT INTO log(who) VALUES ('main1'); END;
+    CREATE TRIGGER main2 BEFORE INSERT ON t BEGIN INSERT INTO log(who) VALUES ('main2'); END;
+    CREATE TEMP TRIGGER temp1 BEFORE INSERT ON t BEGIN INSERT INTO log(who) VALUES ('temp1'); END;
+    CREATE TEMP TRIGGER temp2 BEFORE INSERT ON t BEGIN INSERT INTO log(who) VALUES ('temp2'); END;
+    INSERT INTO t VALUES (1);
+    SELECT seq, who FROM log ORDER BY seq;
+}
+expect {
+    1|temp1
+    2|temp2
+    3|main2
+    4|main1
+}
+
+# The order is observable through data: the temp trigger empties the table
+# before the main trigger refills it, so the main trigger's rows survive.
+# In the other order the temp trigger would delete them.
+@cross-check-integrity
+test temp-delete-all-runs-before-main-insert {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT);
+    INSERT INTO t VALUES (1, 'old');
+    CREATE TRIGGER main_tr BEFORE INSERT ON t
+        WHEN NEW.v = 'outer'
+        BEGIN INSERT INTO t(id, v) VALUES (100, 'from-main'); END;
+    CREATE TEMP TRIGGER temp_tr BEFORE INSERT ON t
+        WHEN NEW.v = 'outer'
+        BEGIN DELETE FROM t WHERE v = 'old' OR v = 'from-main'; END;
+    INSERT INTO t VALUES (2, 'outer');
+    SELECT id, v FROM t ORDER BY id;
+}
+expect {
+    2|outer
+    100|from-main
+}

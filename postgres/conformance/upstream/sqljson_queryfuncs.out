@@ -1,0 +1,1474 @@
+-- JSON_EXISTS
+SELECT JSON_EXISTS(NULL::jsonb, '$');
+ json_exists 
+-------------
+ 
+(1 row)
+
+SELECT JSON_EXISTS(jsonb '[]', '$');
+ json_exists 
+-------------
+ t
+(1 row)
+
+SELECT JSON_EXISTS(JSON_OBJECT(RETURNING jsonb), '$');
+ json_exists 
+-------------
+ t
+(1 row)
+
+SELECT JSON_EXISTS(jsonb '1', '$');
+ json_exists 
+-------------
+ t
+(1 row)
+
+SELECT JSON_EXISTS(jsonb 'null', '$');
+ json_exists 
+-------------
+ t
+(1 row)
+
+SELECT JSON_EXISTS(jsonb '[]', '$');
+ json_exists 
+-------------
+ t
+(1 row)
+
+SELECT JSON_EXISTS(jsonb '1', '$.a');
+ json_exists 
+-------------
+ f
+(1 row)
+
+SELECT JSON_EXISTS(jsonb '1', 'strict $.a'); -- FALSE on error
+ json_exists 
+-------------
+ f
+(1 row)
+
+SELECT JSON_EXISTS(jsonb '1', 'strict $.a' ERROR ON ERROR);
+ERROR:  jsonpath member accessor can only be applied to an object
+SELECT JSON_EXISTS(jsonb 'null', '$.a');
+ json_exists 
+-------------
+ f
+(1 row)
+
+SELECT JSON_EXISTS(jsonb '[]', '$.a');
+ json_exists 
+-------------
+ f
+(1 row)
+
+SELECT JSON_EXISTS(jsonb '[1, "aaa", {"a": 1}]', 'strict $.a'); -- FALSE on error
+ json_exists 
+-------------
+ f
+(1 row)
+
+SELECT JSON_EXISTS(jsonb '[1, "aaa", {"a": 1}]', 'lax $.a');
+ json_exists 
+-------------
+ t
+(1 row)
+
+SELECT JSON_EXISTS(jsonb '{}', '$.a');
+ json_exists 
+-------------
+ f
+(1 row)
+
+SELECT JSON_EXISTS(jsonb '{"b": 1, "a": 2}', '$.a');
+ json_exists 
+-------------
+ t
+(1 row)
+
+SELECT JSON_EXISTS(jsonb '1', '$.a.b');
+ json_exists 
+-------------
+ f
+(1 row)
+
+SELECT JSON_EXISTS(jsonb '{"a": {"b": 1}}', '$.a.b');
+ json_exists 
+-------------
+ t
+(1 row)
+
+SELECT JSON_EXISTS(jsonb '{"a": 1, "b": 2}', '$.a.b');
+ json_exists 
+-------------
+ f
+(1 row)
+
+SELECT JSON_EXISTS(jsonb '{"a": 1, "b": 2}', '$.* ? (@ > $x)' PASSING 1 AS x);
+ json_exists 
+-------------
+ t
+(1 row)
+
+SELECT JSON_EXISTS(jsonb '{"a": 1, "b": 2}', '$.* ? (@ > $x)' PASSING '1' AS x);
+ json_exists 
+-------------
+ f
+(1 row)
+
+SELECT JSON_EXISTS(jsonb '{"a": 1, "b": 2}', '$.* ? (@ > $x && @ < $y)' PASSING 0 AS x, 2 AS y);
+ json_exists 
+-------------
+ t
+(1 row)
+
+SELECT JSON_EXISTS(jsonb '{"a": 1, "b": 2}', '$.* ? (@ > $x && @ < $y)' PASSING 0 AS x, 1 AS y);
+ json_exists 
+-------------
+ f
+(1 row)
+
+-- extension: boolean expressions
+SELECT JSON_EXISTS(jsonb '1', '$ > 2');
+ json_exists 
+-------------
+ t
+(1 row)
+
+SELECT JSON_EXISTS(jsonb '1', '$.a > 2' ERROR ON ERROR);
+ json_exists 
+-------------
+ t
+(1 row)
+
+-- JSON_VALUE
+SELECT JSON_VALUE(NULL::jsonb, '$');
+ json_value 
+------------
+ 
+(1 row)
+
+SELECT JSON_VALUE(jsonb 'null', '$');
+ json_value 
+------------
+ 
+(1 row)
+
+SELECT JSON_VALUE(jsonb 'null', '$' RETURNING int);
+ json_value 
+------------
+           
+(1 row)
+
+SELECT JSON_VALUE(jsonb 'true', '$');
+ json_value 
+------------
+ t
+(1 row)
+
+SELECT JSON_VALUE(jsonb 'true', '$' RETURNING bool);
+ json_value 
+------------
+ t
+(1 row)
+
+SELECT JSON_VALUE(jsonb '123', '$');
+ json_value 
+------------
+ 123
+(1 row)
+
+SELECT JSON_VALUE(jsonb '123', '$' RETURNING int) + 234;
+ ?column? 
+----------
+      357
+(1 row)
+
+SELECT JSON_VALUE(jsonb '123', '$' RETURNING text);
+ json_value 
+------------
+ 123
+(1 row)
+
+/* jsonb bytea ??? */
+SELECT JSON_VALUE(jsonb '123', '$' RETURNING bytea ERROR ON ERROR);
+ json_value 
+------------
+ \x313233
+(1 row)
+
+SELECT JSON_VALUE(jsonb '1.23', '$');
+ json_value 
+------------
+ 1.23
+(1 row)
+
+SELECT JSON_VALUE(jsonb '1.23', '$' RETURNING int);
+ json_value 
+------------
+           
+(1 row)
+
+SELECT JSON_VALUE(jsonb '"1.23"', '$' RETURNING numeric);
+ json_value 
+------------
+       1.23
+(1 row)
+
+SELECT JSON_VALUE(jsonb '"1.23"', '$' RETURNING int ERROR ON ERROR);
+ERROR:  invalid input syntax for type integer: "1.23"
+SELECT JSON_VALUE(jsonb '"aaa"', '$');
+ json_value 
+------------
+ aaa
+(1 row)
+
+SELECT JSON_VALUE(jsonb '"aaa"', '$' RETURNING text);
+ json_value 
+------------
+ aaa
+(1 row)
+
+SELECT JSON_VALUE(jsonb '"aaa"', '$' RETURNING char(5));
+ json_value 
+------------
+ aaa  
+(1 row)
+
+SELECT JSON_VALUE(jsonb '"aaa"', '$' RETURNING char(2) ERROR ON ERROR);
+ERROR:  value too long for type character(2)
+SELECT JSON_VALUE(jsonb '"aaa"', '$' RETURNING char(2));
+ json_value 
+------------
+ 
+(1 row)
+
+SELECT JSON_VALUE(jsonb '"aaa"', '$' RETURNING char(3) ERROR ON ERROR);
+ json_value 
+------------
+ aaa
+(1 row)
+
+SELECT JSON_VALUE(jsonb '"aaa"', '$' RETURNING json);
+ json_value 
+------------
+ "aaa"
+(1 row)
+
+SELECT JSON_VALUE(jsonb '"aaa"', '$' RETURNING jsonb);
+ json_value 
+------------
+ "aaa"
+(1 row)
+
+SELECT JSON_VALUE(jsonb '"aaa"', '$' RETURNING json ERROR ON ERROR);
+ json_value 
+------------
+ "aaa"
+(1 row)
+
+SELECT JSON_VALUE(jsonb '"aaa"', '$' RETURNING jsonb ERROR ON ERROR);
+ json_value 
+------------
+ "aaa"
+(1 row)
+
+SELECT JSON_VALUE(jsonb '"\"aaa\""', '$' RETURNING json);
+ json_value 
+------------
+ "\"aaa\""
+(1 row)
+
+SELECT JSON_VALUE(jsonb '"\"aaa\""', '$' RETURNING jsonb);
+ json_value 
+------------
+ "\"aaa\""
+(1 row)
+
+SELECT JSON_VALUE(jsonb '"aaa"', '$' RETURNING int);
+ json_value 
+------------
+           
+(1 row)
+
+SELECT JSON_VALUE(jsonb '"aaa"', '$' RETURNING int ERROR ON ERROR);
+ERROR:  invalid input syntax for type integer: "aaa"
+SELECT JSON_VALUE(jsonb '"aaa"', '$' RETURNING int DEFAULT 111 ON ERROR);
+ json_value 
+------------
+        111
+(1 row)
+
+SELECT JSON_VALUE(jsonb '"123"', '$' RETURNING int) + 234;
+ ?column? 
+----------
+      357
+(1 row)
+
+SELECT JSON_VALUE(jsonb '"2017-02-20"', '$' RETURNING date) + 9;
+  ?column?  
+------------
+ 03-01-2017
+(1 row)
+
+-- Test NULL checks execution in domain types
+CREATE DOMAIN sqljsonb_int_not_null AS int NOT NULL;
+SELECT JSON_VALUE(jsonb 'null', '$' RETURNING sqljsonb_int_not_null);
+ERROR:  could not coerce ON ERROR expression (NULL) to the RETURNING type
+DETAIL:  domain sqljsonb_int_not_null does not allow null values
+SELECT JSON_VALUE(jsonb 'null', '$' RETURNING sqljsonb_int_not_null ERROR ON ERROR);
+ERROR:  domain sqljsonb_int_not_null does not allow null values
+SELECT JSON_VALUE(jsonb 'null', '$' RETURNING sqljsonb_int_not_null DEFAULT 2 ON EMPTY ERROR ON ERROR);
+ERROR:  domain sqljsonb_int_not_null does not allow null values
+SELECT JSON_VALUE(jsonb '1',  '$.a' RETURNING sqljsonb_int_not_null DEFAULT 2 ON EMPTY ERROR ON ERROR);
+ json_value 
+------------
+          2
+(1 row)
+
+SELECT JSON_VALUE(jsonb '1',  '$.a' RETURNING sqljsonb_int_not_null DEFAULT NULL ON EMPTY ERROR ON ERROR);
+ERROR:  domain sqljsonb_int_not_null does not allow null values
+CREATE TYPE rainbow AS ENUM ('red', 'orange', 'yellow', 'green', 'blue', 'purple');
+CREATE DOMAIN rgb AS rainbow CHECK (VALUE IN ('red', 'green', 'blue'));
+SELECT JSON_VALUE('"purple"'::jsonb, 'lax $[*]' RETURNING rgb);
+ json_value 
+------------
+ 
+(1 row)
+
+SELECT JSON_VALUE('"purple"'::jsonb, 'lax $[*]' RETURNING rgb ERROR ON ERROR);
+ERROR:  value for domain rgb violates check constraint "rgb_check"
+SELECT JSON_VALUE(jsonb '[]', '$');
+ json_value 
+------------
+ 
+(1 row)
+
+SELECT JSON_VALUE(jsonb '[]', '$' ERROR ON ERROR);
+ERROR:  JSON path expression in JSON_VALUE must return single scalar item
+SELECT JSON_VALUE(jsonb '{}', '$');
+ json_value 
+------------
+ 
+(1 row)
+
+SELECT JSON_VALUE(jsonb '{}', '$' ERROR ON ERROR);
+ERROR:  JSON path expression in JSON_VALUE must return single scalar item
+SELECT JSON_VALUE(jsonb '1', '$.a');
+ json_value 
+------------
+ 
+(1 row)
+
+SELECT JSON_VALUE(jsonb '1', 'strict $.a' ERROR ON ERROR);
+ERROR:  jsonpath member accessor can only be applied to an object
+SELECT JSON_VALUE(jsonb '1', 'strict $.a' DEFAULT 'error' ON ERROR);
+ json_value 
+------------
+ error
+(1 row)
+
+SELECT JSON_VALUE(jsonb '1', 'lax $.a' ERROR ON ERROR);	-- NULL ON EMPTY
+ json_value 
+------------
+ 
+(1 row)
+
+SELECT JSON_VALUE(jsonb '1', 'lax $.a' ERROR ON EMPTY ERROR ON ERROR);
+ERROR:  no SQL/JSON item found for specified path
+SELECT JSON_VALUE(jsonb '1', 'strict $.*' DEFAULT 2 ON ERROR);
+ json_value 
+------------
+ 2
+(1 row)
+
+SELECT JSON_VALUE(jsonb '1', 'lax $.a' DEFAULT 2 ON ERROR);
+ json_value 
+------------
+ 
+(1 row)
+
+SELECT JSON_VALUE(jsonb '1', 'lax $.a' DEFAULT '2' ON EMPTY);
+ json_value 
+------------
+ 2
+(1 row)
+
+SELECT JSON_VALUE(jsonb '1', 'lax $.a' NULL ON EMPTY DEFAULT '2' ON ERROR);
+ json_value 
+------------
+ 
+(1 row)
+
+SELECT JSON_VALUE(jsonb '1', 'lax $.a' DEFAULT '2' ON EMPTY DEFAULT '3' ON ERROR);
+ json_value 
+------------
+ 2
+(1 row)
+
+SELECT JSON_VALUE(jsonb '1', 'lax $.a' ERROR ON EMPTY DEFAULT '3' ON ERROR);
+ERROR:  no SQL/JSON item found for specified path
+SELECT JSON_VALUE(jsonb '[1,2]', '$[*]' ERROR ON ERROR);
+ERROR:  JSON path expression in JSON_VALUE must return single scalar item
+SELECT JSON_VALUE(jsonb '[1,2]', '$[*]' DEFAULT '0' ON ERROR);
+ json_value 
+------------
+ 0
+(1 row)
+
+SELECT JSON_VALUE(jsonb '[" "]', '$[*]' RETURNING int ERROR ON ERROR);
+ERROR:  invalid input syntax for type integer: " "
+SELECT JSON_VALUE(jsonb '[" "]', '$[*]' RETURNING int DEFAULT 2 + 3 ON ERROR);
+ json_value 
+------------
+          5
+(1 row)
+
+SELECT JSON_VALUE(jsonb '["1"]', '$[*]' RETURNING int DEFAULT 2 + 3 ON ERROR);
+ json_value 
+------------
+          1
+(1 row)
+
+SELECT JSON_VALUE(jsonb '["1"]', '$[*]' RETURNING int FORMAT JSON); -- RETURNING FORMAT not allowed
+ERROR:  cannot specify FORMAT JSON in RETURNING clause of JSON_VALUE()
+LINE 1: ...CT JSON_VALUE(jsonb '["1"]', '$[*]' RETURNING int FORMAT JSO...
+                                                             ^
+-- RETUGNING pseudo-types not allowed
+SELECT JSON_VALUE(jsonb '["1"]', '$[*]' RETURNING record);
+ERROR:  returning pseudo-types is not supported in SQL/JSON functions
+SELECT
+	x,
+	JSON_VALUE(
+		jsonb '{"a": 1, "b": 2}',
+		'$.* ? (@ > $x)' PASSING x AS x
+		RETURNING int
+		DEFAULT -1 ON EMPTY
+		DEFAULT -2 ON ERROR
+	) y
+FROM
+	generate_series(0, 2) x;
+ x | y  
+---+----
+ 0 | -2
+ 1 |  2
+ 2 | -1
+(3 rows)
+
+SELECT JSON_VALUE(jsonb 'null', '$a' PASSING point ' (1, 2 )' AS a);
+ json_value 
+------------
+ (1,2)
+(1 row)
+
+SELECT JSON_VALUE(jsonb 'null', '$a' PASSING point ' (1, 2 )' AS a RETURNING point);
+ json_value 
+------------
+ (1,2)
+(1 row)
+
+SELECT JSON_VALUE(jsonb 'null', '$a' PASSING point ' (1, 2 )' AS a RETURNING point ERROR ON ERROR);
+ json_value 
+------------
+ (1,2)
+(1 row)
+
+-- Test PASSING and RETURNING date/time types
+SELECT JSON_VALUE(jsonb 'null', '$ts' PASSING timestamptz '2018-02-21 12:34:56 +10' AS ts);
+          json_value          
+------------------------------
+ Tue Feb 20 18:34:56 2018 PST
+(1 row)
+
+SELECT JSON_VALUE(jsonb 'null', '$ts' PASSING timestamptz '2018-02-21 12:34:56 +10' AS ts RETURNING timestamptz);
+          json_value          
+------------------------------
+ Tue Feb 20 18:34:56 2018 PST
+(1 row)
+
+SELECT JSON_VALUE(jsonb 'null', '$ts' PASSING timestamptz '2018-02-21 12:34:56 +10' AS ts RETURNING timestamp);
+        json_value        
+--------------------------
+ Tue Feb 20 18:34:56 2018
+(1 row)
+
+SELECT JSON_VALUE(jsonb 'null', '$ts' PASSING date '2018-02-21 12:34:56 +10' AS ts RETURNING date);
+ json_value 
+------------
+ 02-21-2018
+(1 row)
+
+SELECT JSON_VALUE(jsonb 'null', '$ts' PASSING time '2018-02-21 12:34:56 +10' AS ts RETURNING time);
+ json_value 
+------------
+ 12:34:56
+(1 row)
+
+SELECT JSON_VALUE(jsonb 'null', '$ts' PASSING timetz '2018-02-21 12:34:56 +10' AS ts RETURNING timetz);
+ json_value  
+-------------
+ 12:34:56+10
+(1 row)
+
+SELECT JSON_VALUE(jsonb 'null', '$ts' PASSING timestamp '2018-02-21 12:34:56 +10' AS ts RETURNING timestamp);
+        json_value        
+--------------------------
+ Wed Feb 21 12:34:56 2018
+(1 row)
+
+-- Also test RETURNING json[b]
+SELECT JSON_VALUE(jsonb 'null', '$ts' PASSING timestamptz '2018-02-21 12:34:56 +10' AS ts RETURNING json);
+         json_value          
+-----------------------------
+ "2018-02-21T02:34:56+00:00"
+(1 row)
+
+SELECT JSON_VALUE(jsonb 'null', '$ts' PASSING timestamptz '2018-02-21 12:34:56 +10' AS ts RETURNING jsonb);
+         json_value          
+-----------------------------
+ "2018-02-21T02:34:56+00:00"
+(1 row)
+
+-- Test that numeric JSON values are coerced uniformly
+select json_value('{"a": 1.234}', '$.a' returning int error on error);
+ERROR:  invalid input syntax for type integer: "1.234"
+select json_value('{"a": "1.234"}', '$.a' returning int error on error);
+ERROR:  invalid input syntax for type integer: "1.234"
+-- JSON_QUERY
+SELECT JSON_VALUE(NULL::jsonb, '$');
+ json_value 
+------------
+ 
+(1 row)
+
+SELECT
+	JSON_QUERY(js, '$') AS "unspec",
+	JSON_QUERY(js, '$' WITHOUT WRAPPER) AS "without",
+	JSON_QUERY(js, '$' WITH CONDITIONAL WRAPPER) AS "with cond",
+	JSON_QUERY(js, '$' WITH UNCONDITIONAL ARRAY WRAPPER) AS "with uncond",
+	JSON_QUERY(js, '$' WITH ARRAY WRAPPER) AS "with"
+FROM
+	(VALUES
+		(jsonb 'null'),
+		('12.3'),
+		('true'),
+		('"aaa"'),
+		('[1, null, "2"]'),
+		('{"a": 1, "b": [2]}')
+	) foo(js);
+       unspec       |      without       |     with cond      |     with uncond      |         with         
+--------------------+--------------------+--------------------+----------------------+----------------------
+ null               | null               | null               | [null]               | [null]
+ 12.3               | 12.3               | 12.3               | [12.3]               | [12.3]
+ true               | true               | true               | [true]               | [true]
+ "aaa"              | "aaa"              | "aaa"              | ["aaa"]              | ["aaa"]
+ [1, null, "2"]     | [1, null, "2"]     | [1, null, "2"]     | [[1, null, "2"]]     | [[1, null, "2"]]
+ {"a": 1, "b": [2]} | {"a": 1, "b": [2]} | {"a": 1, "b": [2]} | [{"a": 1, "b": [2]}] | [{"a": 1, "b": [2]}]
+(6 rows)
+
+SELECT
+	JSON_QUERY(js, 'strict $[*]') AS "unspec",
+	JSON_QUERY(js, 'strict $[*]' WITHOUT WRAPPER) AS "without",
+	JSON_QUERY(js, 'strict $[*]' WITH CONDITIONAL WRAPPER) AS "with cond",
+	JSON_QUERY(js, 'strict $[*]' WITH UNCONDITIONAL ARRAY WRAPPER) AS "with uncond",
+	JSON_QUERY(js, 'strict $[*]' WITH ARRAY WRAPPER) AS "with"
+FROM
+	(VALUES
+		(jsonb '1'),
+		('[]'),
+		('[null]'),
+		('[12.3]'),
+		('[true]'),
+		('["aaa"]'),
+		('[[1, 2, 3]]'),
+		('[{"a": 1, "b": [2]}]'),
+		('[1, "2", null, [3]]')
+	) foo(js);
+       unspec       |      without       |      with cond      |     with uncond      |         with         
+--------------------+--------------------+---------------------+----------------------+----------------------
+                    |                    |                     |                      | 
+                    |                    |                     |                      | 
+ null               | null               | null                | [null]               | [null]
+ 12.3               | 12.3               | 12.3                | [12.3]               | [12.3]
+ true               | true               | true                | [true]               | [true]
+ "aaa"              | "aaa"              | "aaa"               | ["aaa"]              | ["aaa"]
+ [1, 2, 3]          | [1, 2, 3]          | [1, 2, 3]           | [[1, 2, 3]]          | [[1, 2, 3]]
+ {"a": 1, "b": [2]} | {"a": 1, "b": [2]} | {"a": 1, "b": [2]}  | [{"a": 1, "b": [2]}] | [{"a": 1, "b": [2]}]
+                    |                    | [1, "2", null, [3]] | [1, "2", null, [3]]  | [1, "2", null, [3]]
+(9 rows)
+
+SELECT JSON_QUERY(jsonb '"aaa"', '$' RETURNING text);
+ json_query 
+------------
+ "aaa"
+(1 row)
+
+SELECT JSON_QUERY(jsonb '"aaa"', '$' RETURNING text KEEP QUOTES);
+ json_query 
+------------
+ "aaa"
+(1 row)
+
+SELECT JSON_QUERY(jsonb '"aaa"', '$' RETURNING text KEEP QUOTES ON SCALAR STRING);
+ json_query 
+------------
+ "aaa"
+(1 row)
+
+SELECT JSON_QUERY(jsonb '"aaa"', '$' RETURNING text OMIT QUOTES);
+ json_query 
+------------
+ aaa
+(1 row)
+
+SELECT JSON_QUERY(jsonb '"aaa"', '$' RETURNING text OMIT QUOTES ON SCALAR STRING);
+ json_query 
+------------
+ aaa
+(1 row)
+
+SELECT JSON_QUERY(jsonb '"aaa"', '$' OMIT QUOTES ERROR ON ERROR);
+ERROR:  invalid input syntax for type json
+DETAIL:  Token "aaa" is invalid.
+CONTEXT:  JSON data, line 1: aaa
+SELECT JSON_QUERY(jsonb '"aaa"', '$' RETURNING json OMIT QUOTES ERROR ON ERROR);
+ERROR:  invalid input syntax for type json
+DETAIL:  Token "aaa" is invalid.
+CONTEXT:  JSON data, line 1: aaa
+SELECT JSON_QUERY(jsonb '"aaa"', '$' RETURNING bytea FORMAT JSON OMIT QUOTES ERROR ON ERROR);
+ json_query 
+------------
+ \x616161
+(1 row)
+
+-- Behavior when a RETURNING type has typmod != -1
+SELECT JSON_QUERY(jsonb '"aaa"', '$' RETURNING char(3) ERROR ON ERROR);
+ERROR:  value too long for type character(3)
+SELECT JSON_QUERY(jsonb '"aaa"', '$' RETURNING char(3));
+ json_query 
+------------
+ 
+(1 row)
+
+SELECT JSON_QUERY(jsonb '"aaa"', '$' RETURNING char(3) OMIT QUOTES ERROR ON ERROR);
+ json_query 
+------------
+ aaa
+(1 row)
+
+SELECT JSON_QUERY(jsonb '"aaa"', '$.a' RETURNING char(2) OMIT QUOTES DEFAULT 'bb' ON EMPTY);
+ json_query 
+------------
+ bb
+(1 row)
+
+SELECT JSON_QUERY(jsonb '"aaa"', '$.a' RETURNING char(2) OMIT QUOTES DEFAULT '"bb"'::jsonb ON EMPTY);
+ json_query 
+------------
+ bb
+(1 row)
+
+-- OMIT QUOTES behavior should not be specified when WITH WRAPPER used:
+-- Should fail
+SELECT JSON_QUERY(jsonb '[1]', '$' WITH WRAPPER OMIT QUOTES);
+ERROR:  SQL/JSON QUOTES behavior must not be specified when WITH WRAPPER is used
+LINE 1: SELECT JSON_QUERY(jsonb '[1]', '$' WITH WRAPPER OMIT QUOTES)...
+               ^
+SELECT JSON_QUERY(jsonb '[1]', '$' WITH CONDITIONAL WRAPPER OMIT QUOTES);
+ERROR:  SQL/JSON QUOTES behavior must not be specified when WITH WRAPPER is used
+LINE 1: SELECT JSON_QUERY(jsonb '[1]', '$' WITH CONDITIONAL WRAPPER ...
+               ^
+-- Should succeed
+SELECT JSON_QUERY(jsonb '["1"]', '$[*]' WITH CONDITIONAL WRAPPER KEEP QUOTES);
+ json_query 
+------------
+ "1"
+(1 row)
+
+SELECT JSON_QUERY(jsonb '["1"]', '$[*]' WITH UNCONDITIONAL WRAPPER KEEP QUOTES);
+ json_query 
+------------
+ ["1"]
+(1 row)
+
+SELECT JSON_QUERY(jsonb '["1"]', '$[*]' WITH WRAPPER KEEP QUOTES);
+ json_query 
+------------
+ ["1"]
+(1 row)
+
+SELECT JSON_QUERY(jsonb '["1"]', '$[*]' WITHOUT WRAPPER OMIT QUOTES);
+ json_query 
+------------
+ 1
+(1 row)
+
+SELECT JSON_QUERY(jsonb '["1"]', '$[*]' WITHOUT WRAPPER KEEP QUOTES);
+ json_query 
+------------
+ "1"
+(1 row)
+
+-- test QUOTES behavior.
+SELECT JSON_QUERY(jsonb'{"rec": "{1,2,3}"}', '$.rec' returning int[] omit quotes);
+ json_query 
+------------
+ {1,2,3}
+(1 row)
+
+SELECT JSON_QUERY(jsonb'{"rec": "{1,2,3}"}', '$.rec' returning int[] keep quotes);
+ json_query 
+------------
+ 
+(1 row)
+
+SELECT JSON_QUERY(jsonb'{"rec": "{1,2,3}"}', '$.rec' returning int[] keep quotes error on error);
+ERROR:  expected JSON array
+SELECT JSON_QUERY(jsonb'{"rec": "[1,2]"}', '$.rec' returning int4range omit quotes);
+ json_query 
+------------
+ [1,3)
+(1 row)
+
+SELECT JSON_QUERY(jsonb'{"rec": "[1,2]"}', '$.rec' returning int4range keep quotes);
+ json_query 
+------------
+ 
+(1 row)
+
+SELECT JSON_QUERY(jsonb'{"rec": "[1,2]"}', '$.rec' 	returning int4range keep quotes error on error);
+ERROR:  malformed range literal: ""[1,2]""
+DETAIL:  Missing left parenthesis or bracket.
+CREATE DOMAIN qf_char_domain AS char(1);
+CREATE DOMAIN qf_jsonb_domain AS jsonb;
+SELECT JSON_QUERY(jsonb '"1"', '$' RETURNING qf_char_domain OMIT QUOTES ERROR ON ERROR);
+ json_query 
+------------
+ 1
+(1 row)
+
+SELECT JSON_QUERY(jsonb '"1"', '$' RETURNING qf_jsonb_domain OMIT QUOTES ERROR ON ERROR);
+ json_query 
+------------
+ 1
+(1 row)
+
+DROP DOMAIN qf_char_domain, qf_jsonb_domain;
+SELECT JSON_QUERY(jsonb '[]', '$[*]');
+ json_query 
+------------
+ 
+(1 row)
+
+SELECT JSON_QUERY(jsonb '[]', '$[*]' NULL ON EMPTY);
+ json_query 
+------------
+ 
+(1 row)
+
+SELECT JSON_QUERY(jsonb '[]', '$[*]' EMPTY ON EMPTY);
+ json_query 
+------------
+ []
+(1 row)
+
+SELECT JSON_QUERY(jsonb '[]', '$[*]' EMPTY ARRAY ON EMPTY);
+ json_query 
+------------
+ []
+(1 row)
+
+SELECT JSON_QUERY(jsonb '[]', '$[*]' EMPTY OBJECT ON EMPTY);
+ json_query 
+------------
+ {}
+(1 row)
+
+SELECT JSON_QUERY(jsonb '[]', '$[*]' ERROR ON EMPTY);
+ERROR:  no SQL/JSON item found for specified path
+SELECT JSON_QUERY(jsonb '[]', '$[*]' DEFAULT '"empty"' ON EMPTY);
+ json_query 
+------------
+ "empty"
+(1 row)
+
+SELECT JSON_QUERY(jsonb '[]', '$[*]' ERROR ON EMPTY NULL ON ERROR);
+ERROR:  no SQL/JSON item found for specified path
+SELECT JSON_QUERY(jsonb '[]', '$[*]' ERROR ON EMPTY EMPTY ARRAY ON ERROR);
+ERROR:  no SQL/JSON item found for specified path
+SELECT JSON_QUERY(jsonb '[]', '$[*]' ERROR ON EMPTY EMPTY OBJECT ON ERROR);
+ERROR:  no SQL/JSON item found for specified path
+SELECT JSON_QUERY(jsonb '[]', '$[*]' ERROR ON EMPTY ERROR ON ERROR);
+ERROR:  no SQL/JSON item found for specified path
+SELECT JSON_QUERY(jsonb '[]', '$[*]' ERROR ON ERROR);	-- NULL ON EMPTY
+ json_query 
+------------
+ 
+(1 row)
+
+SELECT JSON_QUERY(jsonb '[1,2]', '$[*]' ERROR ON ERROR);
+ERROR:  JSON path expression in JSON_QUERY must return single item when no wrapper is requested
+HINT:  Use the WITH WRAPPER clause to wrap SQL/JSON items into an array.
+SELECT JSON_QUERY(jsonb '[1,2]', '$[*]' DEFAULT '"empty"' ON ERROR);
+ json_query 
+------------
+ "empty"
+(1 row)
+
+SELECT JSON_QUERY(jsonb '[1,2]', '$' RETURNING json);
+ json_query 
+------------
+ [1, 2]
+(1 row)
+
+SELECT JSON_QUERY(jsonb '[1,2]', '$' RETURNING json FORMAT JSON);
+ json_query 
+------------
+ [1, 2]
+(1 row)
+
+SELECT JSON_QUERY(jsonb '[1,2]', '$' RETURNING jsonb);
+ json_query 
+------------
+ [1, 2]
+(1 row)
+
+SELECT JSON_QUERY(jsonb '[1,2]', '$' RETURNING jsonb FORMAT JSON);
+ json_query 
+------------
+ [1, 2]
+(1 row)
+
+SELECT JSON_QUERY(jsonb '[1,2]', '$' RETURNING text);
+ json_query 
+------------
+ [1, 2]
+(1 row)
+
+SELECT JSON_QUERY(jsonb '[1,2]', '$' RETURNING char(10));
+ json_query 
+------------
+ [1, 2]    
+(1 row)
+
+SELECT JSON_QUERY(jsonb '[1,2]', '$' RETURNING text FORMAT JSON);
+ json_query 
+------------
+ [1, 2]
+(1 row)
+
+SELECT JSON_QUERY(jsonb '[1,2]', '$' RETURNING bytea);
+   json_query   
+----------------
+ \x5b312c20325d
+(1 row)
+
+SELECT JSON_QUERY(jsonb '[1,2]', '$' RETURNING bytea FORMAT JSON);
+   json_query   
+----------------
+ \x5b312c20325d
+(1 row)
+
+SELECT JSON_QUERY(jsonb '[1,2]', '$[*]' RETURNING bytea EMPTY OBJECT ON ERROR);
+ json_query 
+------------
+ \x7b7d
+(1 row)
+
+SELECT JSON_QUERY(jsonb '[1,2]', '$[*]' RETURNING bytea FORMAT JSON EMPTY OBJECT ON ERROR);
+ json_query 
+------------
+ \x7b7d
+(1 row)
+
+SELECT JSON_QUERY(jsonb '[1,2]', '$[*]' RETURNING json EMPTY OBJECT ON ERROR);
+ json_query 
+------------
+ {}
+(1 row)
+
+SELECT JSON_QUERY(jsonb '[1,2]', '$[*]' RETURNING jsonb EMPTY OBJECT ON ERROR);
+ json_query 
+------------
+ {}
+(1 row)
+
+SELECT JSON_QUERY(jsonb '[3,4]', '$[*]' RETURNING bigint[] EMPTY OBJECT ON ERROR);
+ERROR:  could not coerce ON ERROR expression (EMPTY OBJECT) to the RETURNING type
+DETAIL:  expected JSON array
+SELECT JSON_QUERY(jsonb '"[3,4]"', '$[*]' RETURNING bigint[] EMPTY OBJECT ON ERROR);
+ERROR:  could not coerce ON ERROR expression (EMPTY OBJECT) to the RETURNING type
+DETAIL:  expected JSON array
+-- Coercion fails with quotes on
+SELECT JSON_QUERY(jsonb '"123.1"', '$' RETURNING int2 error on error);
+ERROR:  invalid input syntax for type smallint: ""123.1""
+SELECT JSON_QUERY(jsonb '"123.1"', '$' RETURNING int4 error on error);
+ERROR:  invalid input syntax for type integer: ""123.1""
+SELECT JSON_QUERY(jsonb '"123.1"', '$' RETURNING int8 error on error);
+ERROR:  invalid input syntax for type bigint: ""123.1""
+SELECT JSON_QUERY(jsonb '"123.1"', '$' RETURNING bool error on error);
+ERROR:  invalid input syntax for type boolean: ""123.1""
+SELECT JSON_QUERY(jsonb '"123.1"', '$' RETURNING numeric error on error);
+ERROR:  invalid input syntax for type numeric: ""123.1""
+SELECT JSON_QUERY(jsonb '"123.1"', '$' RETURNING real error on error);
+ERROR:  invalid input syntax for type real: ""123.1""
+SELECT JSON_QUERY(jsonb '"123.1"', '$' RETURNING float8 error on error);
+ERROR:  invalid input syntax for type double precision: ""123.1""
+-- Fine with OMIT QUOTES
+SELECT JSON_QUERY(jsonb '"123.1"', '$' RETURNING int2 omit quotes error on error);
+ERROR:  invalid input syntax for type smallint: "123.1"
+SELECT JSON_QUERY(jsonb '"123.1"', '$' RETURNING float8 omit quotes error on error);
+ json_query 
+------------
+      123.1
+(1 row)
+
+-- RETUGNING pseudo-types not allowed
+SELECT JSON_QUERY(jsonb '[3,4]', '$[*]' RETURNING anyarray EMPTY OBJECT ON ERROR);
+ERROR:  returning pseudo-types is not supported in SQL/JSON functions
+SELECT
+	x, y,
+	JSON_QUERY(
+		jsonb '[1,2,3,4,5,null]',
+		'$[*] ? (@ >= $x && @ <= $y)'
+		PASSING x AS x, y AS y
+		WITH CONDITIONAL WRAPPER
+		EMPTY ARRAY ON EMPTY
+	) list
+FROM
+	generate_series(0, 4) x,
+	generate_series(0, 4) y;
+ x | y |     list     
+---+---+--------------
+ 0 | 0 | []
+ 0 | 1 | 1
+ 0 | 2 | [1, 2]
+ 0 | 3 | [1, 2, 3]
+ 0 | 4 | [1, 2, 3, 4]
+ 1 | 0 | []
+ 1 | 1 | 1
+ 1 | 2 | [1, 2]
+ 1 | 3 | [1, 2, 3]
+ 1 | 4 | [1, 2, 3, 4]
+ 2 | 0 | []
+ 2 | 1 | []
+ 2 | 2 | 2
+ 2 | 3 | [2, 3]
+ 2 | 4 | [2, 3, 4]
+ 3 | 0 | []
+ 3 | 1 | []
+ 3 | 2 | []
+ 3 | 3 | 3
+ 3 | 4 | [3, 4]
+ 4 | 0 | []
+ 4 | 1 | []
+ 4 | 2 | []
+ 4 | 3 | []
+ 4 | 4 | 4
+(25 rows)
+
+-- record type returning with quotes behavior.
+CREATE TYPE comp_abc AS (a text, b int, c timestamp);
+SELECT JSON_QUERY(jsonb'{"rec": "(abc,42,01.02.2003)"}', '$.rec' returning comp_abc omit quotes);
+             json_query              
+-------------------------------------
+ (abc,42,"Thu Jan 02 00:00:00 2003")
+(1 row)
+
+SELECT JSON_QUERY(jsonb'{"rec": "(abc,42,01.02.2003)"}', '$.rec' returning comp_abc keep quotes);
+ json_query 
+------------
+ 
+(1 row)
+
+SELECT JSON_QUERY(jsonb'{"rec": "(abc,42,01.02.2003)"}', '$.rec' returning comp_abc keep quotes error on error);
+ERROR:  cannot call populate_composite on a scalar
+DROP TYPE comp_abc;
+-- Extension: record types returning
+CREATE TYPE sqljsonb_rec AS (a int, t text, js json, jb jsonb, jsa json[]);
+CREATE TYPE sqljsonb_reca AS (reca sqljsonb_rec[]);
+SELECT JSON_QUERY(jsonb '[{"a": 1, "b": "foo", "t": "aaa", "js": [1, "2", {}], "jb": {"x": [1, "2", {}]}},  {"a": 2}]', '$[0]' RETURNING sqljsonb_rec);
+                     json_query                      
+-----------------------------------------------------
+ (1,aaa,"[1, ""2"", {}]","{""x"": [1, ""2"", {}]}",)
+(1 row)
+
+SELECT JSON_QUERY(jsonb '[{"a": "a", "b": "foo", "t": "aaa", "js": [1, "2", {}], "jb": {"x": [1, "2", {}]}},  {"a": 2}]', '$[0]' RETURNING sqljsonb_rec ERROR ON ERROR);
+ERROR:  invalid input syntax for type integer: "a"
+SELECT JSON_QUERY(jsonb '[{"a": "a", "b": "foo", "t": "aaa", "js": [1, "2", {}], "jb": {"x": [1, "2", {}]}},  {"a": 2}]', '$[0]' RETURNING sqljsonb_rec);
+ json_query 
+------------
+ 
+(1 row)
+
+SELECT * FROM unnest((JSON_QUERY(jsonb '{"jsa":  [{"a": 1, "b": ["foo"]}, {"a": 2, "c": {}}, 123]}', '$' RETURNING sqljsonb_rec)).jsa);
+         unnest         
+------------------------
+ {"a": 1, "b": ["foo"]}
+ {"a": 2, "c": {}}
+ 123
+(3 rows)
+
+SELECT * FROM unnest((JSON_QUERY(jsonb '{"reca": [{"a": 1, "t": ["foo", []]}, {"a": 2, "jb": [{}, true]}]}', '$' RETURNING sqljsonb_reca)).reca);
+ a |      t      | js |     jb     | jsa 
+---+-------------+----+------------+-----
+ 1 | ["foo", []] |    |            | 
+ 2 |             |    | [{}, true] | 
+(2 rows)
+
+SELECT JSON_QUERY(jsonb '[{"a": 1, "b": "foo", "t": "aaa", "js": [1, "2", {}], "jb": {"x": [1, "2", {}]}},  {"a": 2}]', '$[0]' RETURNING jsonpath);
+ json_query 
+------------
+ 
+(1 row)
+
+SELECT JSON_QUERY(jsonb '[{"a": 1, "b": "foo", "t": "aaa", "js": [1, "2", {}], "jb": {"x": [1, "2", {}]}},  {"a": 2}]', '$[0]' RETURNING jsonpath ERROR ON ERROR);
+ERROR:  syntax error at or near "{" of jsonpath input
+-- Extension: array types returning
+SELECT JSON_QUERY(jsonb '[1,2,null,"3"]', '$[*]' RETURNING int[] WITH WRAPPER);
+  json_query  
+--------------
+ {1,2,NULL,3}
+(1 row)
+
+SELECT JSON_QUERY(jsonb '[1,2,null,"a"]', '$[*]' RETURNING int[] WITH WRAPPER ERROR ON ERROR);
+ERROR:  invalid input syntax for type integer: "a"
+SELECT JSON_QUERY(jsonb '[1,2,null,"a"]', '$[*]' RETURNING int[] WITH WRAPPER);
+ json_query 
+------------
+ 
+(1 row)
+
+SELECT * FROM unnest(JSON_QUERY(jsonb '[{"a": 1, "t": ["foo", []]}, {"a": 2, "jb": [{}, true]}]', '$' RETURNING sqljsonb_rec[]));
+ a |      t      | js |     jb     | jsa 
+---+-------------+----+------------+-----
+ 1 | ["foo", []] |    |            | 
+ 2 |             |    | [{}, true] | 
+(2 rows)
+
+-- Extension: domain types returning
+SELECT JSON_QUERY(jsonb '{"a": 1}', '$.a' RETURNING sqljsonb_int_not_null);
+ json_query 
+------------
+          1
+(1 row)
+
+SELECT JSON_QUERY(jsonb '{"a": 1}', '$.b' RETURNING sqljsonb_int_not_null);
+ERROR:  could not coerce ON EMPTY expression (NULL) to the RETURNING type
+DETAIL:  domain sqljsonb_int_not_null does not allow null values
+SELECT JSON_QUERY(jsonb '{"a": 1}', '$.b' RETURNING sqljsonb_int_not_null ERROR ON EMPTY ERROR ON ERROR);
+ERROR:  no SQL/JSON item found for specified path
+-- Test timestamptz passing and output
+SELECT JSON_QUERY(jsonb 'null', '$ts' PASSING timestamptz '2018-02-21 12:34:56 +10' AS ts);
+         json_query          
+-----------------------------
+ "2018-02-21T02:34:56+00:00"
+(1 row)
+
+SELECT JSON_QUERY(jsonb 'null', '$ts' PASSING timestamptz '2018-02-21 12:34:56 +10' AS ts RETURNING json);
+         json_query          
+-----------------------------
+ "2018-02-21T02:34:56+00:00"
+(1 row)
+
+SELECT JSON_QUERY(jsonb 'null', '$ts' PASSING timestamptz '2018-02-21 12:34:56 +10' AS ts RETURNING jsonb);
+         json_query          
+-----------------------------
+ "2018-02-21T02:34:56+00:00"
+(1 row)
+
+-- Test constraints
+CREATE TABLE test_jsonb_constraints (
+	js text,
+	i int,
+	x jsonb DEFAULT JSON_QUERY(jsonb '[1,2]', '$[*]' WITH WRAPPER)
+	CONSTRAINT test_jsonb_constraint1
+		CHECK (js IS JSON)
+	CONSTRAINT test_jsonb_constraint2
+		CHECK (JSON_EXISTS(js::jsonb, '$.a' PASSING i + 5 AS int, i::text AS "TXT", array[1,2,3] as arr))
+	CONSTRAINT test_jsonb_constraint3
+		CHECK (JSON_VALUE(js::jsonb, '$.a' RETURNING int DEFAULT '12' ON EMPTY ERROR ON ERROR) > i)
+	CONSTRAINT test_jsonb_constraint4
+		CHECK (JSON_QUERY(js::jsonb, '$.a' WITH CONDITIONAL WRAPPER EMPTY OBJECT ON ERROR) = jsonb '[10]')
+	CONSTRAINT test_jsonb_constraint5
+		CHECK (JSON_QUERY(js::jsonb, '$.a' RETURNING char(5) OMIT QUOTES EMPTY ARRAY ON EMPTY) >  'a' COLLATE "C")
+);
+\d test_jsonb_constraints
+                                                Table "public.test_jsonb_constraints"
+ Column |  Type   | Collation | Nullable |                                          Default                                           
+--------+---------+-----------+----------+--------------------------------------------------------------------------------------------
+ js     | text    |           |          | 
+ i      | integer |           |          | 
+ x      | jsonb   |           |          | JSON_QUERY('[1, 2]'::jsonb, '$[*]' RETURNING jsonb WITH UNCONDITIONAL WRAPPER KEEP QUOTES)
+Check constraints:
+    "test_jsonb_constraint1" CHECK (js IS JSON)
+    "test_jsonb_constraint2" CHECK (JSON_EXISTS(js::jsonb, '$."a"' PASSING i + 5 AS "int", i::text AS "TXT", ARRAY[1, 2, 3] AS arr))
+    "test_jsonb_constraint3" CHECK (JSON_VALUE(js::jsonb, '$."a"' RETURNING integer DEFAULT 12 ON EMPTY ERROR ON ERROR) > i)
+    "test_jsonb_constraint4" CHECK (JSON_QUERY(js::jsonb, '$."a"' RETURNING jsonb WITH CONDITIONAL WRAPPER KEEP QUOTES EMPTY OBJECT ON ERROR) = '[10]'::jsonb)
+    "test_jsonb_constraint5" CHECK (JSON_QUERY(js::jsonb, '$."a"' RETURNING character(5) WITHOUT WRAPPER OMIT QUOTES EMPTY ARRAY ON EMPTY) > ('a'::bpchar COLLATE "C"))
+
+SELECT check_clause
+FROM information_schema.check_constraints
+WHERE constraint_name LIKE 'test_jsonb_constraint%'
+ORDER BY 1;
+                                                              check_clause                                                              
+----------------------------------------------------------------------------------------------------------------------------------------
+ (JSON_QUERY((js)::jsonb, '$."a"' RETURNING character(5) WITHOUT WRAPPER OMIT QUOTES EMPTY ARRAY ON EMPTY) > ('a'::bpchar COLLATE "C"))
+ (JSON_QUERY((js)::jsonb, '$."a"' RETURNING jsonb WITH CONDITIONAL WRAPPER KEEP QUOTES EMPTY OBJECT ON ERROR) = '[10]'::jsonb)
+ (JSON_VALUE((js)::jsonb, '$."a"' RETURNING integer DEFAULT 12 ON EMPTY ERROR ON ERROR) > i)
+ (js IS JSON)
+ JSON_EXISTS((js)::jsonb, '$."a"' PASSING (i + 5) AS "int", (i)::text AS "TXT", ARRAY[1, 2, 3] AS arr)
+(5 rows)
+
+SELECT pg_get_expr(adbin, adrelid)
+FROM pg_attrdef
+WHERE adrelid = 'test_jsonb_constraints'::regclass
+ORDER BY 1;
+                                        pg_get_expr                                         
+--------------------------------------------------------------------------------------------
+ JSON_QUERY('[1, 2]'::jsonb, '$[*]' RETURNING jsonb WITH UNCONDITIONAL WRAPPER KEEP QUOTES)
+(1 row)
+
+INSERT INTO test_jsonb_constraints VALUES ('', 1);
+ERROR:  new row for relation "test_jsonb_constraints" violates check constraint "test_jsonb_constraint1"
+DETAIL:  Failing row contains (, 1, [1, 2]).
+INSERT INTO test_jsonb_constraints VALUES ('1', 1);
+ERROR:  new row for relation "test_jsonb_constraints" violates check constraint "test_jsonb_constraint2"
+DETAIL:  Failing row contains (1, 1, [1, 2]).
+INSERT INTO test_jsonb_constraints VALUES ('[]');
+ERROR:  new row for relation "test_jsonb_constraints" violates check constraint "test_jsonb_constraint2"
+DETAIL:  Failing row contains ([], null, [1, 2]).
+INSERT INTO test_jsonb_constraints VALUES ('{"b": 1}', 1);
+ERROR:  new row for relation "test_jsonb_constraints" violates check constraint "test_jsonb_constraint2"
+DETAIL:  Failing row contains ({"b": 1}, 1, [1, 2]).
+INSERT INTO test_jsonb_constraints VALUES ('{"a": 1}', 1);
+ERROR:  new row for relation "test_jsonb_constraints" violates check constraint "test_jsonb_constraint3"
+DETAIL:  Failing row contains ({"a": 1}, 1, [1, 2]).
+INSERT INTO test_jsonb_constraints VALUES ('{"a": 10}', 1);
+ERROR:  new row for relation "test_jsonb_constraints" violates check constraint "test_jsonb_constraint4"
+DETAIL:  Failing row contains ({"a": 10}, 1, [1, 2]).
+DROP TABLE test_jsonb_constraints;
+-- Test mutabilily of query functions
+CREATE TABLE test_jsonb_mutability(js jsonb, b int);
+CREATE INDEX ON test_jsonb_mutability (JSON_QUERY(js, '$'));
+CREATE INDEX ON test_jsonb_mutability (JSON_QUERY(js, '$.a[0]'));
+CREATE INDEX ON test_jsonb_mutability (JSON_QUERY(js, '$.time()'));
+ERROR:  functions in index expression must be marked IMMUTABLE
+CREATE INDEX ON test_jsonb_mutability (JSON_QUERY(js, '$.date()'));
+ERROR:  functions in index expression must be marked IMMUTABLE
+CREATE INDEX ON test_jsonb_mutability (JSON_QUERY(js, '$.time_tz()'));
+ERROR:  functions in index expression must be marked IMMUTABLE
+CREATE INDEX ON test_jsonb_mutability (JSON_QUERY(js, '$.timestamp()'));
+ERROR:  functions in index expression must be marked IMMUTABLE
+CREATE INDEX ON test_jsonb_mutability (JSON_QUERY(js, '$.timestamp_tz()'));
+ERROR:  functions in index expression must be marked IMMUTABLE
+CREATE INDEX ON test_jsonb_mutability (JSON_QUERY(js, '$.a ? (@.date() < $.time_tz())'));
+ERROR:  functions in index expression must be marked IMMUTABLE
+CREATE INDEX ON test_jsonb_mutability (JSON_QUERY(js, '$.a ? (@.date() < $.time())'));
+ERROR:  functions in index expression must be marked IMMUTABLE
+CREATE INDEX ON test_jsonb_mutability (JSON_QUERY(js, '$.a ? (@.time() < $.time())'));
+ERROR:  functions in index expression must be marked IMMUTABLE
+CREATE INDEX ON test_jsonb_mutability (JSON_QUERY(js, '$.a ? (@.time() < $.time_tz())'));
+ERROR:  functions in index expression must be marked IMMUTABLE
+CREATE INDEX ON test_jsonb_mutability (JSON_QUERY(js, '$.a ? (@.timestamp() < $.timestamp_tz())'));
+ERROR:  functions in index expression must be marked IMMUTABLE
+CREATE INDEX ON test_jsonb_mutability (JSON_QUERY(js, '$.a ? (@.timestamp_tz() < $.timestamp_tz())'));
+ERROR:  functions in index expression must be marked IMMUTABLE
+CREATE INDEX ON test_jsonb_mutability (JSON_QUERY(js, '$.a ? (@.time() < $.datetime("HH:MI TZH"))'));
+ERROR:  functions in index expression must be marked IMMUTABLE
+CREATE INDEX ON test_jsonb_mutability (JSON_QUERY(js, '$.a ? (@.date() < $.datetime("HH:MI TZH"))'));
+ERROR:  functions in index expression must be marked IMMUTABLE
+CREATE INDEX ON test_jsonb_mutability (JSON_QUERY(js, '$.a ? (@.timestamp() < $.datetime("HH:MI TZH"))'));
+ERROR:  functions in index expression must be marked IMMUTABLE
+CREATE INDEX ON test_jsonb_mutability (JSON_QUERY(js, '$.a ? (@.timestamp() < $.datetime("HH:MI"))'));
+ERROR:  functions in index expression must be marked IMMUTABLE
+CREATE INDEX ON test_jsonb_mutability (JSON_QUERY(js, '$.a ? (@.timestamp_tz() < $.datetime("HH:MI TZH"))'));
+ERROR:  functions in index expression must be marked IMMUTABLE
+CREATE INDEX ON test_jsonb_mutability (JSON_QUERY(js, '$.a ? (@.timestamp_tz() < $.datetime("HH:MI"))'));
+ERROR:  functions in index expression must be marked IMMUTABLE
+CREATE INDEX ON test_jsonb_mutability (JSON_QUERY(js, '$.date() < $x' PASSING '12:34'::timetz AS x));
+ERROR:  functions in index expression must be marked IMMUTABLE
+CREATE INDEX ON test_jsonb_mutability (JSON_QUERY(js, '$.date() < $x' PASSING '1234'::int AS x));
+ERROR:  functions in index expression must be marked IMMUTABLE
+CREATE INDEX ON test_jsonb_mutability (JSON_QUERY(js, '$.a ? (@.timestamp(2) < $.timestamp(3))'));
+ERROR:  functions in index expression must be marked IMMUTABLE
+CREATE INDEX ON test_jsonb_mutability (JSON_QUERY(js, '$.datetime()'));
+CREATE INDEX ON test_jsonb_mutability (JSON_QUERY(js, '$.a ? (@ < $.datetime())'));
+CREATE INDEX ON test_jsonb_mutability (JSON_QUERY(js, '$.a ? (@.datetime() < $.datetime())'));
+ERROR:  functions in index expression must be marked IMMUTABLE
+CREATE INDEX ON test_jsonb_mutability (JSON_QUERY(js, '$.a ? (@.datetime() < $.datetime("HH:MI TZH"))'));
+ERROR:  functions in index expression must be marked IMMUTABLE
+CREATE INDEX ON test_jsonb_mutability (JSON_QUERY(js, '$.a ? (@.datetime("HH:MI TZH") < $.datetime("HH:MI TZH"))'));
+CREATE INDEX ON test_jsonb_mutability (JSON_QUERY(js, '$.a ? (@.datetime("HH:MI") < $.datetime("YY-MM-DD HH:MI"))'));
+CREATE INDEX ON test_jsonb_mutability (JSON_QUERY(js, '$.a ? (@.datetime("HH:MI TZH") < $.datetime("YY-MM-DD HH:MI"))'));
+ERROR:  functions in index expression must be marked IMMUTABLE
+CREATE INDEX ON test_jsonb_mutability (JSON_QUERY(js, '$.datetime("HH:MI TZH") < $x' PASSING '12:34'::timetz AS x));
+CREATE INDEX ON test_jsonb_mutability (JSON_QUERY(js, '$.datetime("HH:MI TZH") < $y' PASSING '12:34'::timetz AS x));
+CREATE INDEX ON test_jsonb_mutability (JSON_QUERY(js, '$.datetime() < $x' PASSING '12:34'::timetz AS x));
+ERROR:  functions in index expression must be marked IMMUTABLE
+CREATE INDEX ON test_jsonb_mutability (JSON_QUERY(js, '$.datetime() < $x' PASSING '1234'::int AS x));
+CREATE INDEX ON test_jsonb_mutability (JSON_QUERY(js, '$.datetime() ? (@ == $x)' PASSING '12:34'::time AS x));
+ERROR:  functions in index expression must be marked IMMUTABLE
+CREATE INDEX ON test_jsonb_mutability (JSON_QUERY(js, '$.datetime("YY-MM-DD") ? (@ == $x)' PASSING '2020-07-14'::date AS x));
+CREATE INDEX ON test_jsonb_mutability (JSON_QUERY(js, '$[1, $.a ? (@.datetime() == $x)]' PASSING '12:34'::time AS x));
+ERROR:  functions in index expression must be marked IMMUTABLE
+CREATE INDEX ON test_jsonb_mutability (JSON_QUERY(js, '$[1, 0 to $.a ? (@.datetime() == $x)]' PASSING '12:34'::time AS x));
+ERROR:  functions in index expression must be marked IMMUTABLE
+CREATE INDEX ON test_jsonb_mutability (JSON_QUERY(js, '$[1, $.a ? (@.datetime("HH:MI") == $x)]' PASSING '12:34'::time AS x));
+CREATE INDEX ON test_jsonb_mutability (JSON_VALUE(js, '$' DEFAULT random()::int ON ERROR));
+ERROR:  functions in index expression must be marked IMMUTABLE
+-- DEFAULT expression
+CREATE OR REPLACE FUNCTION ret_setint() RETURNS SETOF integer AS
+$$
+BEGIN
+    RETURN QUERY EXECUTE 'select 1 union all select 1';
+END;
+$$
+LANGUAGE plpgsql IMMUTABLE;
+SELECT JSON_QUERY(js, '$'  RETURNING int DEFAULT ret_setint() ON ERROR) FROM test_jsonb_mutability;
+ERROR:  DEFAULT expression must not return a set
+LINE 1: SELECT JSON_QUERY(js, '$'  RETURNING int DEFAULT ret_setint(...
+                                                         ^
+SELECT JSON_QUERY(js, '$'  RETURNING int DEFAULT b + 1 ON ERROR) FROM test_jsonb_mutability;
+ERROR:  DEFAULT expression must not contain column references
+LINE 1: SELECT JSON_QUERY(js, '$'  RETURNING int DEFAULT b + 1 ON ER...
+                                                         ^
+SELECT JSON_QUERY(js, '$'  RETURNING int DEFAULT sum(1) over() ON ERROR) FROM test_jsonb_mutability;
+ERROR:  can only specify a constant, non-aggregate function, or operator expression for DEFAULT
+LINE 1: SELECT JSON_QUERY(js, '$'  RETURNING int DEFAULT sum(1) over...
+                                                         ^
+SELECT JSON_QUERY(js, '$'  RETURNING int DEFAULT (SELECT 1) ON ERROR) FROM test_jsonb_mutability;
+ERROR:  can only specify a constant, non-aggregate function, or operator expression for DEFAULT
+LINE 1: SELECT JSON_QUERY(js, '$'  RETURNING int DEFAULT (SELECT 1) ...
+                                                         ^
+DROP TABLE test_jsonb_mutability;
+DROP FUNCTION ret_setint;
+CREATE DOMAIN queryfuncs_test_domain AS text CHECK (value <> 'foo');
+SELECT JSON_VALUE(jsonb '{"d1": "H"}', '$.a2' RETURNING queryfuncs_test_domain DEFAULT 'foo'::queryfuncs_test_domain ON EMPTY);
+ERROR:  could not coerce ON EMPTY expression (DEFAULT) to the RETURNING type
+DETAIL:  value for domain queryfuncs_test_domain violates check constraint "queryfuncs_test_domain_check"
+SELECT JSON_VALUE(jsonb '{"d1": "H"}', '$.a2' RETURNING queryfuncs_test_domain DEFAULT 'foo1'::queryfuncs_test_domain ON EMPTY);
+ json_value 
+------------
+ foo1
+(1 row)
+
+SELECT JSON_VALUE(jsonb '{"d1": "H"}', '$.a2' RETURNING queryfuncs_test_domain DEFAULT '"foo1"'::jsonb::text ON EMPTY);
+ json_value 
+------------
+ "foo1"
+(1 row)
+
+SELECT JSON_VALUE(jsonb '{"d1": "foo"}', '$.a2' RETURNING queryfuncs_test_domain DEFAULT 'foo1'::queryfuncs_test_domain ON EMPTY);
+ json_value 
+------------
+ foo1
+(1 row)
+
+-- Check the cases where a coercion-related expression is masking an
+-- unsupported expressions
+-- CoerceViaIO
+SELECT JSON_QUERY('"a"', '$.a'  RETURNING int DEFAULT (SELECT '"1"')::jsonb ON ERROR);
+ERROR:  can only specify a constant, non-aggregate function, or operator expression for DEFAULT
+LINE 1: ...CT JSON_QUERY('"a"', '$.a'  RETURNING int DEFAULT (SELECT '"...
+                                                             ^
+-- CoerceToDomain
+SELECT JSON_QUERY('"a"', '$.a' RETURNING queryfuncs_test_domain DEFAULT (select '"1"')::queryfuncs_test_domain ON ERROR);
+ERROR:  can only specify a constant, non-aggregate function, or operator expression for DEFAULT
+LINE 1: ...', '$.a' RETURNING queryfuncs_test_domain DEFAULT (select '"...
+                                                             ^
+-- RelabelType
+SELECT JSON_QUERY('"a"', '$.a'  RETURNING int DEFAULT (SELECT 1)::oid::int ON ERROR);
+ERROR:  can only specify a constant, non-aggregate function, or operator expression for DEFAULT
+LINE 1: ...CT JSON_QUERY('"a"', '$.a'  RETURNING int DEFAULT (SELECT 1)...
+                                                             ^
+-- ArrayCoerceExpr
+SELECT JSON_QUERY('"a"', '$.a'  RETURNING int[] DEFAULT (SELECT '{1}')::oid[]::int[] ON ERROR);
+ERROR:  can only specify a constant, non-aggregate function, or operator expression for DEFAULT
+LINE 1: ... JSON_QUERY('"a"', '$.a'  RETURNING int[] DEFAULT (SELECT '{...
+                                                             ^
+-- CollateExpr
+SELECT JSON_QUERY('"a"', '$.a'  RETURNING int[] DEFAULT (SELECT '{1}')::text COLLATE "C" ON ERROR);
+ERROR:  can only specify a constant, non-aggregate function, or operator expression for DEFAULT
+LINE 1: ... JSON_QUERY('"a"', '$.a'  RETURNING int[] DEFAULT (SELECT '{...
+                                                             ^
+-- ConvertRowtypeExpr
+CREATE TABLE someparent (a int);
+CREATE TABLE somechild () INHERITS (someparent);
+SELECT JSON_QUERY('"a"', '$.a'  RETURNING someparent DEFAULT (SELECT '(1)')::somechild::someparent ON ERROR);
+ERROR:  can only specify a constant, non-aggregate function, or operator expression for DEFAULT
+LINE 1: ..._QUERY('"a"', '$.a'  RETURNING someparent DEFAULT (SELECT '(...
+                                                             ^
+DROP DOMAIN queryfuncs_test_domain;
+DROP TABLE someparent, somechild;
+-- Extension: non-constant JSON path
+SELECT JSON_EXISTS(jsonb '{"a": 123}', '$' || '.' || 'a');
+ json_exists 
+-------------
+ t
+(1 row)
+
+SELECT JSON_VALUE(jsonb '{"a": 123}', '$' || '.' || 'a');
+ json_value 
+------------
+ 123
+(1 row)
+
+SELECT JSON_VALUE(jsonb '{"a": 123}', '$' || '.' || 'b' DEFAULT 'foo' ON EMPTY);
+ json_value 
+------------
+ foo
+(1 row)
+
+SELECT JSON_QUERY(jsonb '{"a": 123}', '$' || '.' || 'a');
+ json_query 
+------------
+ 123
+(1 row)
+
+SELECT JSON_QUERY(jsonb '{"a": 123}', '$' || '.' || 'a' WITH WRAPPER);
+ json_query 
+------------
+ [123]
+(1 row)
+
+SELECT JSON_QUERY(jsonb '{"a": 123}', ('$' || '.' || 'a' || NULL)::date WITH WRAPPER);
+ERROR:  JSON path expression must be of type jsonpath, not of type date
+LINE 1: SELECT JSON_QUERY(jsonb '{"a": 123}', ('$' || '.' || 'a' || ...
+                                               ^
+-- Should fail (invalid path)
+SELECT JSON_QUERY(jsonb '{"a": 123}', 'error' || ' ' || 'error');
+ERROR:  syntax error at or near " " of jsonpath input
+-- Non-jsonb inputs automatically coerced to jsonb
+SELECT JSON_EXISTS(json '{"a": 123}', '$' || '.' || 'a');
+ json_exists 
+-------------
+ t
+(1 row)
+
+SELECT JSON_QUERY(NULL FORMAT JSON, '$');
+ json_query 
+------------
+ 
+(1 row)
+
+-- Test non-const jsonpath
+CREATE TEMP TABLE jsonpaths (path) AS SELECT '$';
+SELECT json_value('"aaa"', path RETURNING json) FROM jsonpaths;
+ json_value 
+------------
+ "aaa"
+(1 row)
+
+SELECT json_value('"aaa"', jsonpaths RETURNING json) FROM jsonpaths;
+ERROR:  JSON path expression must be of type jsonpath, not of type jsonpaths
+LINE 1: SELECT json_value('"aaa"', jsonpaths RETURNING json) FROM js...
+                                   ^
+-- Test PASSING argument parsing
+SELECT JSON_QUERY(jsonb 'null', '$xyz' PASSING 1 AS xy);
+ERROR:  could not find jsonpath variable "xyz"
+SELECT JSON_QUERY(jsonb 'null', '$xy' PASSING 1 AS xyz);
+ERROR:  could not find jsonpath variable "xy"
+SELECT JSON_QUERY(jsonb 'null', '$xyz' PASSING 1 AS xyz);
+ json_query 
+------------
+ 1
+(1 row)
+
+SELECT JSON_QUERY(jsonb 'null', '$Xyz' PASSING 1 AS Xyz);
+ERROR:  could not find jsonpath variable "Xyz"
+SELECT JSON_QUERY(jsonb 'null', '$Xyz' PASSING 1 AS "Xyz");
+ json_query 
+------------
+ 1
+(1 row)
+
+SELECT JSON_QUERY(jsonb 'null', '$"Xyz"' PASSING 1 AS "Xyz");
+ json_query 
+------------
+ 1
+(1 row)
+
+-- Test ON ERROR / EMPTY value validity for the function; all fail.
+SELECT JSON_EXISTS(jsonb '1', '$' DEFAULT 1 ON ERROR);
+ERROR:  invalid ON ERROR behavior
+LINE 1: SELECT JSON_EXISTS(jsonb '1', '$' DEFAULT 1 ON ERROR);
+                                          ^
+DETAIL:  Only ERROR, TRUE, FALSE, or UNKNOWN is allowed in ON ERROR for JSON_EXISTS().
+SELECT JSON_VALUE(jsonb '1', '$' EMPTY ON ERROR);
+ERROR:  invalid ON ERROR behavior
+LINE 1: SELECT JSON_VALUE(jsonb '1', '$' EMPTY ON ERROR);
+                                         ^
+DETAIL:  Only ERROR, NULL, or DEFAULT expression is allowed in ON ERROR for JSON_VALUE().
+SELECT JSON_QUERY(jsonb '1', '$' TRUE ON ERROR);
+ERROR:  invalid ON ERROR behavior
+LINE 1: SELECT JSON_QUERY(jsonb '1', '$' TRUE ON ERROR);
+                                         ^
+DETAIL:  Only ERROR, NULL, EMPTY ARRAY, EMPTY OBJECT, or DEFAULT expression is allowed in ON ERROR for JSON_QUERY().
+-- Test implicit coercion to a domain over fixed-length type specified in
+-- RETURNING
+CREATE DOMAIN queryfuncs_char2 AS char(2);
+CREATE DOMAIN queryfuncs_char2_chk AS char(2) CHECK (VALUE NOT IN ('12'));
+SELECT JSON_QUERY(jsonb '123', '$' RETURNING queryfuncs_char2 ERROR ON ERROR);
+ERROR:  value too long for type character(2)
+SELECT JSON_QUERY(jsonb '123', '$' RETURNING queryfuncs_char2 DEFAULT '1' ON ERROR);
+ json_query 
+------------
+ 1 
+(1 row)
+
+SELECT JSON_QUERY(jsonb '123', '$' RETURNING queryfuncs_char2_chk ERROR ON ERROR);
+ERROR:  value too long for type character(2)
+SELECT JSON_QUERY(jsonb '123', '$' RETURNING queryfuncs_char2_chk DEFAULT '1' ON ERROR);
+ json_query 
+------------
+ 1 
+(1 row)
+
+SELECT JSON_VALUE(jsonb '123', '$' RETURNING queryfuncs_char2 ERROR ON ERROR);
+ERROR:  value too long for type character(2)
+SELECT JSON_VALUE(jsonb '123', '$' RETURNING queryfuncs_char2 DEFAULT 1 ON ERROR);
+ json_value 
+------------
+ 1 
+(1 row)
+
+SELECT JSON_VALUE(jsonb '123', '$' RETURNING queryfuncs_char2_chk ERROR ON ERROR);
+ERROR:  value too long for type character(2)
+SELECT JSON_VALUE(jsonb '123', '$' RETURNING queryfuncs_char2_chk DEFAULT 1 ON ERROR);
+ json_value 
+------------
+ 1 
+(1 row)
+
+DROP DOMAIN queryfuncs_char2, queryfuncs_char2_chk;
+-- Test coercion to domain over another fixed-length type of the ON ERROR /
+-- EMPTY expressions.  Ask user to cast the DEFAULT expression explicitly if
+-- automatic casting cannot be done, for example, from int to bit(2).
+CREATE DOMAIN queryfuncs_d_varbit3 AS varbit(3) CHECK (VALUE <> '01');
+SELECT JSON_VALUE(jsonb '1234', '$' RETURNING queryfuncs_d_varbit3  DEFAULT '111111' ON ERROR);
+ERROR:  bit string too long for type bit varying(3)
+SELECT JSON_VALUE(jsonb '1234', '$' RETURNING queryfuncs_d_varbit3  DEFAULT '010' ON ERROR);
+ json_value 
+------------
+ 010
+(1 row)
+
+SELECT JSON_VALUE(jsonb '1234', '$' RETURNING queryfuncs_d_varbit3  DEFAULT '01' ON ERROR);
+ERROR:  could not coerce ON ERROR expression (DEFAULT) to the RETURNING type
+DETAIL:  value for domain queryfuncs_d_varbit3 violates check constraint "queryfuncs_d_varbit3_check"
+SELECT JSON_VALUE(jsonb '"111"', '$'  RETURNING bit(2) ERROR ON ERROR);
+ERROR:  bit string length 3 does not match type bit(2)
+SELECT JSON_VALUE(jsonb '1234', '$' RETURNING bit(3)  DEFAULT 1 ON ERROR);
+ERROR:  cannot cast behavior expression of type integer to bit
+LINE 1: ...VALUE(jsonb '1234', '$' RETURNING bit(3)  DEFAULT 1 ON ERROR...
+                                                             ^
+HINT:  You will need to explicitly cast the expression to type bit.
+SELECT JSON_VALUE(jsonb '1234', '$' RETURNING bit(3)  DEFAULT 1::bit(3) ON ERROR);
+ json_value 
+------------
+ 001
+(1 row)
+
+SELECT JSON_VALUE(jsonb '"111"', '$.a'  RETURNING bit(3) DEFAULT '1111' ON EMPTY);
+ERROR:  bit string length 4 does not match type bit(3)
+DROP DOMAIN queryfuncs_d_varbit3;

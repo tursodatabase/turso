@@ -1,0 +1,350 @@
+@database :memory:
+
+test row-ordering-null-register-reuse {
+    CREATE TABLE t(a, b);
+    INSERT INTO t VALUES (0, 0), (NULL, 2), (2, NULL), (1, 1);
+    SELECT
+        ((a, b) <  (1, 1)) IS NULL, (a, b) <  (1, 1),
+        ((a, b) >  (1, 1)) IS NULL, (a, b) >  (1, 1),
+        ((a, b) <= (1, 1)) IS NULL, (a, b) <= (1, 1),
+        ((a, b) >= (1, 1)) IS NULL, (a, b) >= (1, 1)
+    FROM t ORDER BY rowid;
+}
+expect {
+    0|1|0|0|0|1|0|0
+    1||1||1||1|
+    0|0|0|1|0|0|0|1
+    0|0|0|0|0|1|0|1
+}
+
+test row-comparison-in-case-when {
+    CREATE TABLE t(a, b);
+    INSERT INTO t VALUES (1, 1), (NULL, 2), (1, NULL), (1, 2);
+    SELECT
+        CASE
+            WHEN (a, b) < (1, 2) THEN 'T'
+            WHEN (a, b) = (1, 2) THEN 'E'
+            ELSE 'F'
+        END,
+        ((a, b) < (1, 2)) IS NULL,
+        ((a, b) = (1, 2)) IS NULL
+    FROM t ORDER BY rowid;
+}
+expect {
+    T|0|0
+    F|1|1
+    F|1|1
+    E|0|0
+}
+
+test row-comparison-collation-first-element {
+    SELECT
+        ('b' COLLATE NOCASE, 1) < ('A', 1),
+        ('b' COLLATE NOCASE, 1) > ('A', 1),
+        ('b' COLLATE NOCASE, 1) = ('B', 1);
+}
+expect {
+    0|1|1
+}
+
+test row-literal-comparison {
+    SELECT (1, 1) = (1, 1), (1, 1) != (1, 2), (1, 2) < (1, 3), (1, 2) >= (1, 2);
+}
+expect {
+    1|1|1|1
+}
+
+test row-literal-null-comparison {
+    SELECT (1, NULL) = (1, NULL), (1, NULL) IS (1, NULL), ((1, NULL) < (1, 2)) IS NULL, ((2, NULL) > (1, 9)) IS NULL;
+}
+expect {
+    |1|1|0
+}
+
+test row-literal-all-comparison-operators {
+    SELECT (1,2)=(1,2), (1,2)!=(1,2), (1,2)<(1,2), (1,2)<=(1,2), (1,2)>(1,2), (1,2)>=(1,2);
+}
+expect {
+    1|0|0|1|0|1
+}
+
+test row-literal-null-semantics-ne {
+    SELECT (1,NULL)!=(1,NULL), ((1,NULL)!=(1,NULL)) IS NULL;
+}
+expect {
+    |1
+}
+
+test row-literal-null-semantics-ordering {
+    SELECT (NULL,2)<(1,1), ((NULL,2)<(1,1)) IS NULL;
+}
+expect {
+    |1
+}
+
+test row-literal-decisive-prefix-overrides-later-null {
+    SELECT (2,NULL)>(1,999), ((2,NULL)>(1,999)) IS NULL, (1,NULL)=(0,5), ((1,NULL)=(0,5)) IS NULL, (1,NULL)!=(0,5), ((1,NULL)!=(0,5)) IS NULL;
+}
+expect {
+    1|0|0|0|1|0
+}
+
+test row-literal-is-is-not {
+    SELECT (1,2) IS (1,2), (1,NULL) IS NOT (1,NULL), (1,NULL) IS NOT (1,5), (1,5) IS NOT (1,NULL);
+}
+expect {
+    1|0|1|1
+}
+
+test row-value-arity-mismatch-eq {
+    SELECT (1,2) = (1);
+}
+expect error {
+}
+
+test row-value-misuse-unary-not {
+    SELECT NOT (1,2);
+}
+expect error {
+}
+
+test row-value-misuse-is-null {
+    SELECT (1,2) IS NULL;
+}
+expect error {
+}
+
+test row-comparison-per-element-collation {
+    SELECT
+        ('a', 'b' COLLATE NOCASE) < ('a', 'A'),
+        ('a', 'b' COLLATE NOCASE) = ('a', 'B'),
+        ('a' COLLATE NOCASE, 'b') = ('A', 'b'),
+        ('a', 'b') = ('A', 'b' COLLATE NOCASE),
+        ('a', 'b' COLLATE NOCASE) = ('A', 'b');
+}
+expect {
+    0|1|1|0|0
+}
+
+test row-comparison-three-columns-null-ordering {
+    SELECT
+        (1,2,3) < (1,2,4),
+        (1,2,3) < (1,1,9),
+        (1,2,3) < (1,2,NULL),
+        ((1,2,3) < (1,2,NULL)) IS NULL,
+        (1,2,NULL) < (1,3,0),
+        ((1,2,NULL) < (1,3,0)) IS NULL,
+        (2,NULL,0) > (1,999,999),
+        ((2,NULL,0) > (1,999,999)) IS NULL;
+}
+expect {
+    1|0||1|1|0|1|0
+}
+
+test row-comparison-three-columns-where-and-or {
+    CREATE TABLE t(a,b,c);
+    INSERT INTO t VALUES (1,2,3),(1,2,NULL),(1,3,0),(2,NULL,0),(NULL,2,3);
+
+    SELECT a,b,c FROM t WHERE (a,b,c) < (1,3,0) ORDER BY rowid;
+    SELECT a,b,c FROM t WHERE (a,b,c) >= (1,3,0) ORDER BY rowid;
+    SELECT CASE WHEN (a,b,c) < (1,3,0) OR (a,b,c) = (2,NULL,0) THEN 'Y' ELSE 'N' END FROM t ORDER BY rowid;
+}
+expect {
+    1|2|3
+    1|2|
+    1|3|0
+    2||0
+    Y
+    Y
+    N
+    N
+    N
+}
+
+test row-comparison-empty-subquery {
+    SELECT
+        (SELECT 1,2 WHERE 0) = (1,2),
+        ((SELECT 1,2 WHERE 0) = (1,2)) IS NULL,
+        (SELECT 1,2 WHERE 0) IS (NULL,NULL),
+        (SELECT 1,2 WHERE 0) IS NOT (NULL,NULL),
+        (SELECT 1,2 WHERE 0) < (1,2),
+        ((SELECT 1,2 WHERE 0) < (1,2)) IS NULL;
+}
+expect {
+    |1|1|0||1
+}
+
+test row-comparison-and-or-null-propagation {
+    SELECT
+        ((1,2) < (1,3)) AND ((1,2) > (0,9)),
+        ((1,NULL) < (1,3)) AND 1,
+        ((1,NULL) < (1,3)) OR 1,
+        ((1,NULL) < (1,3)) OR 0;
+}
+expect {
+    1||1|
+}
+
+test row-comparison-in-join-on-equals {
+    CREATE TABLE l(a,b);
+    CREATE TABLE r(x,y,tag);
+    INSERT INTO l VALUES (1,1),(1,2),(1,NULL),(NULL,2),(2,0);
+    INSERT INTO r VALUES (1,1,'eq11'),(1,3,'gt13'),(2,0,'eq20'),(NULL,2,'null2');
+
+    SELECT l.a,l.b,r.tag FROM l JOIN r ON (l.a,l.b) = (r.x,r.y) ORDER BY l.rowid, r.rowid;
+}
+expect {
+    1|1|eq11
+    2|0|eq20
+}
+
+test row-comparison-in-left-join-on-ordering {
+    CREATE TABLE l(a,b);
+    CREATE TABLE r(x,y,tag);
+    INSERT INTO l VALUES (1,1),(1,2),(1,NULL),(NULL,2),(2,0);
+    INSERT INTO r VALUES (1,1,'eq11'),(1,3,'gt13'),(2,0,'eq20'),(NULL,2,'null2');
+
+    SELECT l.a,l.b,COALESCE(r.tag,'-') FROM l LEFT JOIN r ON (l.a,l.b) < (r.x,r.y) ORDER BY l.rowid, r.rowid;
+}
+expect {
+    1|1|gt13
+    1|1|eq20
+    1|2|gt13
+    1|2|eq20
+    1||eq20
+    |2|-
+    2|0|-
+}
+
+test row-comparison-in-left-join-on-is {
+    CREATE TABLE l(a,b);
+    CREATE TABLE r(x,y,tag);
+    INSERT INTO l VALUES (1,1),(1,2),(1,NULL),(NULL,2),(2,0);
+    INSERT INTO r VALUES (1,1,'eq11'),(1,3,'gt13'),(2,0,'eq20'),(NULL,2,'null2');
+
+    SELECT l.a,l.b,COALESCE(r.tag,'-') FROM l LEFT JOIN r ON (l.a,l.b) IS (r.x,r.y) ORDER BY l.rowid, r.rowid;
+}
+expect {
+    1|1|eq11
+    1|2|-
+    1||-
+    |2|null2
+    2|0|eq20
+}
+
+test row-predicate-select-list-vs-where-equivalence {
+    CREATE TABLE t(a,b);
+    INSERT INTO t VALUES (0,0),(1,1),(1,2),(1,NULL),(NULL,2),(2,0);
+
+    WITH base AS (
+        SELECT rowid id, a, b FROM t
+    ),
+    eval AS (
+        SELECT
+            id,
+            (a,b) < (1,2) AS p_lt,
+            (a,b) = (1,2) AS p_eq,
+            (a,b) IS (1,2) AS p_is
+        FROM base
+    ),
+    flt_lt AS (
+        SELECT id FROM base WHERE (a,b) < (1,2)
+    ),
+    flt_eq AS (
+        SELECT id FROM base WHERE (a,b) = (1,2)
+    ),
+    flt_is AS (
+        SELECT id FROM base WHERE (a,b) IS (1,2)
+    )
+    SELECT
+        id,
+        p_lt,
+        id IN (SELECT id FROM flt_lt),
+        p_eq,
+        id IN (SELECT id FROM flt_eq),
+        p_is,
+        id IN (SELECT id FROM flt_is)
+    FROM eval
+    ORDER BY id;
+}
+expect {
+    1|1|1|0|0|0|0
+    2|1|1|0|0|0|0
+    3|0|0|1|1|1|1
+    4||0||0|0|0
+    5||0||0|0|0
+    6|0|0|0|0|0|0
+}
+
+test row-predicate-inner-join-on-vs-where-equivalence {
+    CREATE TABLE l(a,b);
+    CREATE TABLE r(x,y);
+    INSERT INTO l VALUES (1,1),(1,2),(1,NULL),(NULL,2),(2,0);
+    INSERT INTO r VALUES (1,1),(1,3),(2,0),(NULL,2);
+
+    WITH on_join AS (
+        SELECT l.rowid AS lid, r.rowid AS rid
+        FROM l JOIN r ON (l.a,l.b) < (r.x,r.y)
+    ),
+    where_join AS (
+        SELECT l.rowid AS lid, r.rowid AS rid
+        FROM l, r
+        WHERE (l.a,l.b) < (r.x,r.y)
+    )
+    SELECT
+        (SELECT COUNT(*) FROM (SELECT lid,rid FROM on_join EXCEPT SELECT lid,rid FROM where_join)),
+        (SELECT COUNT(*) FROM (SELECT lid,rid FROM where_join EXCEPT SELECT lid,rid FROM on_join));
+}
+expect {
+    0|0
+}
+
+test row-where-column-vs-column {
+    CREATE TABLE t(a,b,c,d);
+    INSERT INTO t VALUES (1,2,1,2),(1,2,2,1),(1,NULL,1,NULL),(1,NULL,1,5),(NULL,2,NULL,2),(NULL,2,0,2);
+
+    SELECT a,b,c,d FROM t WHERE (a,b) = (c,d) ORDER BY rowid;
+    SELECT a,b,c,d FROM t WHERE (a,b) IS (c,d) ORDER BY rowid;
+    SELECT a,b,c,d FROM t WHERE (a,b) != (c,d) ORDER BY rowid;
+}
+expect {
+    1|2|1|2
+    1|2|1|2
+    1||1|
+    |2||2
+    1|2|2|1
+}
+
+test row-where-table-collation {
+    CREATE TABLE t(a TEXT COLLATE NOCASE, b TEXT);
+    INSERT INTO t VALUES ('a','x'),('A','x'),('a','X'),('b','x');
+
+    SELECT a,b FROM t WHERE (a,b) = ('A','x') ORDER BY rowid;
+    SELECT a,b FROM t WHERE (a,b COLLATE NOCASE) = ('a','X') ORDER BY rowid;
+    SELECT a,b FROM t WHERE (a,b) < ('B','x') ORDER BY rowid;
+}
+expect {
+    a|x
+    A|x
+    a|x
+    A|x
+    a|X
+    a|x
+    A|x
+    a|X
+}
+
+test row-where-not-over-row-comparison {
+    CREATE TABLE t(a,b);
+    INSERT INTO t VALUES (1,2),(1,3),(1,NULL),(2,1),(NULL,1);
+
+    SELECT a,b FROM t WHERE NOT ((a,b) = (1,2)) ORDER BY rowid;
+    SELECT a,b FROM t WHERE NOT ((a,b) < (1,3)) ORDER BY rowid;
+}
+expect {
+    1|3
+    2|1
+    |1
+    1|3
+    2|1
+}

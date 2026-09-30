@@ -1,0 +1,929 @@
+use crate::common::{do_flush, limbo_exec_rows, sqlite_exec_rows, ExecRows, TempDatabase};
+use crate::unreliable_io::UnreliableIo;
+use anyhow::Context;
+use asserting::prelude::*;
+use rusqlite::params;
+use rusqlite::Connection as RusqliteConnection;
+use std::fs::File;
+use std::io::{Read, Seek, SeekFrom};
+use std::path::Path;
+use std::sync::Arc;
+use tempfile::TempDir;
+use turso_core::SqliteDialect;
+use turso_core::{Database, DatabaseOpts, OpenFlags};
+
+const PAGE_SIZE_OFFSET: u64 = 16;
+const RESERVED_SPACE_OFFSET: u64 = 20;
+
+fn attach_enabled_db(opts: DatabaseOpts) -> TempDatabase {
+    TempDatabase::builder()
+        .with_opts(opts.with_encryption(true).with_attach(true))
+        .build()
+}
+
+fn read_header_page_size(path: &Path) -> anyhow::Result<u16> {
+    let mut file = File::open(path)?;
+    file.seek(SeekFrom::Start(PAGE_SIZE_OFFSET))?;
+    let mut buf = [0u8; 2];
+    file.read_exact(&mut buf)?;
+    Ok(u16::from_be_bytes(buf))
+}
+
+fn read_header_reserved_space(path: &Path) -> anyhow::Result<u8> {
+    let mut file = File::open(path)?;
+    file.seek(SeekFrom::Start(RESERVED_SPACE_OFFSET))?;
+    let mut buf = [0u8; 1];
+    file.read_exact(&mut buf)?;
+    Ok(buf[0])
+}
+
+fn checkpoint_attached_database(
+    conn: &std::sync::Arc<turso_core::Connection>,
+    db: &TempDatabase,
+    alias: &str,
+) -> anyhow::Result<()> {
+    do_flush(conn, db)?;
+    let pragma = format!("PRAGMA {alias}.wal_checkpoint(TRUNCATE)");
+    let _ = limbo_exec_rows(conn, &pragma);
+    do_flush(conn, db)?;
+    Ok(())
+}
+
+#[test]
+fn test_attached_wal_commit_uses_attached_synchronous_mode() -> anyhow::Result<()> {
+    const MAIN_PATH: &str = "attached-wal-sync-main.db";
+    const AUX_PATH: &str = "attached-wal-sync-aux.db";
+
+    let io = Arc::new(UnreliableIo::new());
+    let conn = open_unreliable_attached_database(io.clone(), MAIN_PATH)?;
+    conn.execute("PRAGMA main.synchronous=OFF")?;
+    conn.execute(format!("ATTACH '{AUX_PATH}' AS aux"))?;
+    conn.execute("CREATE TABLE aux.t(id INTEGER PRIMARY KEY)")?;
+    io.mark_all_durable();
+
+    conn.execute("INSERT INTO aux.t VALUES (1)")?;
+
+    assert!(
+        !io.has_unsynced_writes(&format!("{AUX_PATH}-wal")),
+        "an attached WAL commit must fsync using aux.synchronous=FULL"
+    );
+
+    io.mark_all_durable();
+    conn.execute("PRAGMA main.synchronous=FULL")?;
+    conn.execute("PRAGMA aux.synchronous=OFF")?;
+    conn.execute("INSERT INTO aux.t VALUES (2)")?;
+    assert!(
+        io.has_unsynced_writes(&format!("{AUX_PATH}-wal")),
+        "aux.synchronous=OFF must not inherit main's FULL fsync"
+    );
+    Ok(())
+}
+
+#[test]
+fn test_attached_checkpoint_uses_attached_synchronous_mode() -> anyhow::Result<()> {
+    const MAIN_PATH: &str = "attached-checkpoint-sync-main.db";
+    const AUX_PATH: &str = "attached-checkpoint-sync-aux.db";
+
+    let io = Arc::new(UnreliableIo::new());
+    let conn = open_unreliable_attached_database(io.clone(), MAIN_PATH)?;
+    conn.execute("PRAGMA main.synchronous=OFF")?;
+    conn.execute(format!("ATTACH '{AUX_PATH}' AS aux"))?;
+    conn.execute("CREATE TABLE aux.t(id INTEGER PRIMARY KEY)")?;
+    conn.execute("INSERT INTO aux.t VALUES (1)")?;
+    io.mark_all_durable();
+
+    assert_that!(limbo_exec_rows(&conn, "PRAGMA aux.wal_checkpoint(PASSIVE)"))
+        .described_as("the aux checkpoint must backfill WAL frames")
+        .single_element()
+        .satisfies(|row| {
+            matches!(
+                row.as_slice(),
+                [
+                    rusqlite::types::Value::Integer(0),
+                    rusqlite::types::Value::Integer(_),
+                    rusqlite::types::Value::Integer(backfilled),
+                ] if *backfilled > 0
+            )
+        });
+    assert!(
+        !io.has_unsynced_writes(AUX_PATH),
+        "the aux checkpoint must fsync using aux.synchronous=FULL"
+    );
+    Ok(())
+}
+
+#[test]
+fn test_attached_mvcc_checkpoint_uses_attached_passive_setting() -> anyhow::Result<()> {
+    let db = TempDatabase::builder()
+        .with_opts(
+            DatabaseOpts::new()
+                .with_attach(true)
+                .with_experimental_mvcc_passive_checkpoint(true),
+        )
+        .with_mvcc(true)
+        .build();
+    let conn = db.connect_limbo();
+    conn.execute("PRAGMA main.wal_checkpoint(PASSIVE)")?;
+
+    let aux_path = db.path.with_extension("attach_mvcc_checkpoint_mode.db");
+    conn.execute(format!("ATTACH '{}' AS aux", aux_path.display()))?;
+
+    let error = conn
+        .execute("PRAGMA aux.wal_checkpoint(PASSIVE)")
+        .unwrap_err()
+        .to_string();
+    assert_eq!(
+        error,
+        "PASSIVE checkpoint requires experimental_mvcc_passive_checkpoint"
+    );
+    Ok(())
+}
+
+#[test]
+fn test_attached_mvcc_auto_checkpoint_uses_attached_pager_and_sync_mode() -> anyhow::Result<()> {
+    const MAIN_PATH: &str = "attached-mvcc-checkpoint-main.db";
+    const AUX_PATH: &str = "attached-mvcc-checkpoint-aux.db";
+
+    let io = Arc::new(UnreliableIo::new());
+    let conn = open_unreliable_attached_database(io.clone(), MAIN_PATH)?;
+    conn.execute("PRAGMA journal_mode=mvcc")?;
+    conn.execute("PRAGMA main.synchronous=OFF")?;
+    conn.execute(format!("ATTACH '{AUX_PATH}' AS aux"))?;
+    conn.execute("CREATE TABLE aux.t(id INTEGER PRIMARY KEY)")?;
+    conn.execute("PRAGMA aux.wal_checkpoint(TRUNCATE)")?;
+
+    let aux_db = Database::open_file_with_flags(
+        io.clone(),
+        AUX_PATH,
+        OpenFlags::default(),
+        DatabaseOpts::new(),
+        None,
+        Arc::new(SqliteDialect),
+    )
+    .context("look up attached database")?;
+    aux_db
+        .get_mv_store()
+        .as_ref()
+        .expect("attached database must use MVCC")
+        .set_checkpoint_threshold(0);
+    io.mark_all_durable();
+    let before = io.durable_files();
+
+    conn.execute("INSERT INTO aux.t VALUES (1)")?;
+
+    let after = io.durable_files();
+    assert_eq!(
+        after.get(MAIN_PATH),
+        before.get(MAIN_PATH),
+        "an attached MVCC checkpoint must not write the main database"
+    );
+    assert_ne!(
+        after.get(AUX_PATH),
+        before.get(AUX_PATH),
+        "an attached MVCC checkpoint must write and fsync the attached database"
+    );
+    assert!(
+        !io.has_unsynced_writes(&format!("{AUX_PATH}-log")),
+        "an attached MVCC commit must fsync using aux.synchronous=FULL"
+    );
+    Ok(())
+}
+
+fn open_unreliable_attached_database(
+    io: Arc<UnreliableIo>,
+    path: &str,
+) -> anyhow::Result<Arc<turso_core::Connection>> {
+    let db = Database::open_file_with_flags(
+        io,
+        path,
+        OpenFlags::default(),
+        DatabaseOpts::new().with_attach(true),
+        None,
+        Arc::new(SqliteDialect),
+    )?;
+    Ok(db.connect()?)
+}
+
+#[turso_macros::test]
+fn test_attached_schema_refreshes_after_other_connection_create(
+    tmp_db: TempDatabase,
+) -> anyhow::Result<()> {
+    let aux_path = tmp_db
+        .path
+        .parent()
+        .unwrap()
+        .join("attach_schema_refresh.db")
+        .to_string_lossy()
+        .to_string();
+
+    let conn1 = tmp_db.connect_limbo();
+    let conn2 = tmp_db.connect_limbo();
+
+    conn1.execute(format!("ATTACH '{aux_path}' AS aux"))?;
+    conn2.execute(format!("ATTACH '{aux_path}' AS aux"))?;
+
+    conn1.execute("CREATE TABLE aux.bootstrap (x INTEGER)")?;
+
+    // Populate conn2's attached-schema cache before conn1 adds another table.
+    let _ = limbo_exec_rows(&conn2, "SELECT * FROM aux.bootstrap");
+
+    conn1.execute("CREATE TABLE aux.created_later (y INTEGER)")?;
+    conn1.execute("INSERT INTO aux.created_later VALUES (1)")?;
+
+    assert_that!(limbo_exec_rows(&conn2, "SELECT y FROM aux.created_later"))
+        .described_as("conn2 should see the newly created attached table")
+        .is_equal_to(vec![row![1]]);
+
+    Ok(())
+}
+
+#[turso_macros::test]
+fn test_attached_write_does_not_upgrade_stale_main_snapshot(
+    tmp_db: TempDatabase,
+) -> anyhow::Result<()> {
+    let aux_path = tmp_db.path.with_extension("attach_busy_snapshot.db");
+    let conn1 = tmp_db.connect_limbo();
+    let conn2 = tmp_db.connect_limbo();
+
+    conn1.execute("CREATE TABLE main_t(x INTEGER)")?;
+    conn1.execute("INSERT INTO main_t VALUES (1)")?;
+    conn1.execute(format!("ATTACH '{}' AS aux", aux_path.display()))?;
+    conn2.execute(format!("ATTACH '{}' AS aux", aux_path.display()))?;
+    conn1.execute("CREATE TABLE aux.t(x INTEGER)")?;
+    conn1.execute("CREATE INDEX aux.t_x ON t(x)")?;
+    conn1.execute("INSERT INTO aux.t VALUES (1)")?;
+
+    conn1.execute("BEGIN")?;
+    assert_that!(limbo_exec_rows(&conn1, "SELECT x FROM main_t")).is_equal_to(vec![row![1]]);
+
+    conn2
+        .execute("UPDATE main_t SET x = 2")
+        .context("update main")?;
+    conn2
+        .execute("UPDATE aux.t SET x = 2")
+        .context("update aux")?;
+
+    conn1
+        .execute("DELETE FROM aux.t")
+        .context("delete from aux")?;
+    assert_that!(limbo_exec_rows(
+        &conn1,
+        "SELECT x FROM aux.t INDEXED BY t_x"
+    ))
+    .is_empty();
+    assert_that!(limbo_exec_rows(&conn1, "SELECT x FROM main_t")).is_equal_to(vec![row![1]]);
+    conn1.execute("ROLLBACK")?;
+    assert_that!(limbo_exec_rows(
+        &conn1,
+        "SELECT x FROM aux.t INDEXED BY t_x"
+    ))
+    .is_equal_to(vec![row![2]]);
+    Ok(())
+}
+
+#[turso_macros::test]
+fn test_fresh_attach_inherits_main_page_size(_tmp_db: TempDatabase) -> anyhow::Result<()> {
+    let db = attach_enabled_db(DatabaseOpts::new());
+    let conn = db.connect_limbo();
+    conn.execute("PRAGMA page_size = 8192")?;
+
+    let aux_path = db.path.with_extension("attach_page_size.db");
+    conn.execute(format!("ATTACH '{}' AS aux", aux_path.display()))?;
+    conn.execute("CREATE TABLE aux.t(x INTEGER)")?;
+    checkpoint_attached_database(&conn, &db, "aux")?;
+
+    assert_eq!(read_header_page_size(&aux_path)?, 8192);
+    Ok(())
+}
+
+#[turso_macros::test]
+fn test_fresh_attach_inherits_main_reserved_space(_tmp_db: TempDatabase) -> anyhow::Result<()> {
+    const RESERVED_BYTES: u8 = 48;
+
+    let db = attach_enabled_db(DatabaseOpts::new());
+    let conn = db.connect_limbo();
+    conn.set_reserved_bytes(RESERVED_BYTES)?;
+
+    let aux_path = db.path.with_extension("attach_reserved_space.db");
+    conn.execute(format!("ATTACH '{}' AS aux", aux_path.display()))?;
+    conn.execute("CREATE TABLE aux.t(x INTEGER)")?;
+    checkpoint_attached_database(&conn, &db, "aux")?;
+
+    assert_eq!(read_header_reserved_space(&aux_path)?, RESERVED_BYTES);
+    Ok(())
+}
+
+#[turso_macros::test]
+fn test_fresh_attach_from_legacy_main_respects_attached_reserved_space_minimum(
+    _tmp_db: TempDatabase,
+) -> anyhow::Result<()> {
+    let temp_dir = TempDir::new()?;
+    let main_path = temp_dir.path().join("legacy_main.db");
+    let aux_path = temp_dir.path().join("legacy_aux.db");
+
+    {
+        let sqlite = RusqliteConnection::open(&main_path)?;
+        sqlite.execute("CREATE TABLE main_t(x INTEGER)", ())?;
+    }
+
+    let db = TempDatabase::builder()
+        .with_db_path(&main_path)
+        .with_opts(DatabaseOpts::new().with_encryption(true).with_attach(true))
+        .build();
+    let conn = db.connect_limbo();
+
+    conn.execute(format!("ATTACH '{}' AS aux", aux_path.display()))?;
+    conn.execute("CREATE TABLE aux.t(x INTEGER)")?;
+    checkpoint_attached_database(&conn, &db, "aux")?;
+
+    #[cfg(feature = "checksum")]
+    assert_eq!(read_header_reserved_space(&aux_path)?, 8);
+    #[cfg(not(feature = "checksum"))]
+    assert_eq!(read_header_reserved_space(&aux_path)?, 0);
+
+    Ok(())
+}
+
+#[turso_macros::test]
+fn test_fresh_attach_inherits_mvcc_before_first_write(_tmp_db: TempDatabase) -> anyhow::Result<()> {
+    let db = attach_enabled_db(DatabaseOpts::new());
+    let conn = db.connect_limbo();
+    conn.pragma_update("journal_mode", "'mvcc'")?;
+
+    let aux_path = db.path.with_extension("attach_mvcc.db");
+    conn.execute(format!("ATTACH '{}' AS aux", aux_path.display()))?;
+    conn.execute("CREATE TABLE aux.t(x INTEGER)")?;
+    conn.execute("INSERT INTO aux.t VALUES(1)")?;
+    checkpoint_attached_database(&conn, &db, "aux")?;
+
+    let aux_db = Database::open_file_with_flags(
+        db.io.clone(),
+        aux_path.to_str().unwrap(),
+        OpenFlags::default(),
+        DatabaseOpts::new(),
+        None,
+        Arc::new(SqliteDialect),
+    )?;
+    let aux_conn = aux_db.connect()?;
+    assert!(aux_conn.mvcc_enabled());
+
+    Ok(())
+}
+
+#[turso_macros::test]
+fn test_attach_rejects_initialized_page_size_mismatch(_tmp_db: TempDatabase) -> anyhow::Result<()> {
+    let db = attach_enabled_db(DatabaseOpts::new());
+    let conn = db.connect_limbo();
+    conn.execute("PRAGMA page_size = 8192")?;
+    conn.execute("CREATE TABLE main_t(x INTEGER)")?;
+
+    let aux_path = db.path.with_extension("attach_page_size_mismatch.db");
+    let aux_db = Database::open_file_with_flags(
+        db.io.clone(),
+        aux_path.to_str().unwrap(),
+        OpenFlags::default(),
+        DatabaseOpts::new(),
+        None,
+        Arc::new(SqliteDialect),
+    )?;
+    let aux_conn = aux_db.connect()?;
+    aux_conn.execute("CREATE TABLE t(x INTEGER)")?;
+
+    let err = conn
+        .execute(format!("ATTACH '{}' AS aux", aux_path.display()))
+        .unwrap_err()
+        .to_string();
+    assert_eq!(
+        err,
+        format!(
+            "cannot attach database 'aux': page size mismatch (main={:?}, attached={:?})",
+            turso_core::storage::sqlite3_ondisk::PageSize::new(8192).unwrap(),
+            turso_core::storage::sqlite3_ondisk::PageSize::new(4096).unwrap(),
+        )
+    );
+
+    Ok(())
+}
+
+#[turso_macros::test]
+fn test_attach_rejects_fresh_read_only_database(_tmp_db: TempDatabase) -> anyhow::Result<()> {
+    let db = attach_enabled_db(DatabaseOpts::new());
+    let conn = db.connect_limbo();
+
+    let aux_path = db.path.with_extension("attach_read_only.db");
+    File::create(&aux_path)?;
+
+    let err = conn
+        .execute(format!(
+            "ATTACH 'file:{}?mode=ro' AS aux",
+            aux_path.display()
+        ))
+        .unwrap_err()
+        .to_string();
+    assert_eq!(
+        err,
+        "cannot attach database 'aux': fresh read-only databases cannot be initialized during attach"
+    );
+
+    Ok(())
+}
+
+/// A WAL holding frames next to a database file with zero pages does not
+/// belong to it: page 1 reaches the main file before the first WAL commit, so
+/// this pair only shows up when the database file was deleted or truncated
+/// and the `-wal` was left behind. Attaching such a file discards the WAL and
+/// attaches an empty database, the same thing SQLite's
+/// `pagerOpenWalIfPresent()` does when it finds a WAL next to a zero-page
+/// database.
+#[turso_macros::test]
+fn test_attach_discards_orphan_wal_of_zero_byte_database(
+    _tmp_db: TempDatabase,
+) -> anyhow::Result<()> {
+    let temp_dir = TempDir::new()?;
+    let source_path = temp_dir.path().join("wal_backed_source.db");
+    let aux_path = temp_dir.path().join("wal_backed_aux.db");
+    let wal_path = aux_path.with_extension("db-wal");
+
+    // Build the pair with SQLite and copy it aside while the WAL is still hot
+    // (SQLite checkpoints and removes the WAL when the connection closes), so
+    // the files under test have no open handles.
+    let sqlite = RusqliteConnection::open(&source_path)?;
+    sqlite.pragma_update(None, "journal_mode", "WAL")?;
+    sqlite.execute("CREATE TABLE t(x INTEGER)", ())?;
+    sqlite.execute("INSERT INTO t VALUES (1)", ())?;
+    std::fs::copy(&source_path, &aux_path)?;
+    std::fs::copy(source_path.with_extension("db-wal"), &wal_path)?;
+    drop(sqlite);
+
+    assert_that!(std::fs::metadata(&wal_path)?.len()).is_greater_than(0);
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(&aux_path)?
+        .set_len(0)?;
+    assert_that!(std::fs::metadata(&aux_path)?.len()).is_zero();
+
+    let db = attach_enabled_db(DatabaseOpts::new());
+    let conn = db.connect_limbo();
+
+    conn.execute(format!("ATTACH '{}' AS aux", aux_path.display()))?;
+    assert_that!(limbo_exec_rows(
+        &conn,
+        "SELECT count(*) FROM aux.sqlite_schema"
+    ))
+    .described_as("the orphan WAL must not be replayed into the attached database")
+    .is_equal_to(vec![row![0]]);
+    // The orphan frames are gone for good: the WAL file is deleted and
+    // immediately recreated empty by the open that follows the deletion.
+    assert_that!(std::fs::metadata(&wal_path)?.len()).is_zero();
+
+    Ok(())
+}
+
+#[turso_macros::test]
+fn test_fresh_mvcc_attach_rejects_custom_durable_storage_without_attached_backend(
+    tmp_db: TempDatabase,
+) -> anyhow::Result<()> {
+    let db_path = tmp_db.path.with_extension("main_custom_durable_storage.db");
+    let log_path = db_path.with_extension("db-log");
+    let aux_path = tmp_db.path.with_extension("aux_custom_durable_storage.db");
+
+    let file = tmp_db
+        .io
+        .open_file(log_path.to_str().unwrap(), OpenFlags::default(), false)?;
+    let durable_storage = Arc::new(turso_core::mvcc::persistent_storage::Storage::new(
+        file,
+        tmp_db.io.clone(),
+        None,
+    ));
+
+    let db = Database::open(
+        tmp_db.io.clone(),
+        db_path.to_str().unwrap(),
+        turso_core::OpenOptions::new(Arc::new(SqliteDialect))
+            .db_opts(DatabaseOpts::new().with_attach(true))
+            .durable_storage(
+                durable_storage as Arc<dyn turso_core::mvcc::persistent_storage::DurableStorage>,
+            ),
+    )?;
+    let conn = db.connect()?;
+    conn.pragma_update("journal_mode", "'mvcc'")?;
+
+    let err = conn
+        .execute(format!("ATTACH '{}' AS aux", aux_path.display()))
+        .unwrap_err()
+        .to_string();
+    assert_eq!(
+        err,
+        "cannot attach database 'aux': fresh MVCC attach does not support inheriting custom durable storage"
+    );
+
+    Ok(())
+}
+
+#[turso_macros::test]
+fn test_attach_inherits_generated_columns_flag_on_reattach(
+    _tmp_db: TempDatabase,
+) -> anyhow::Result<()> {
+    let db = attach_enabled_db(DatabaseOpts::new().with_generated_columns(true));
+    let conn = db.connect_limbo();
+
+    let aux_path = db.path.with_extension("attach_generated_columns.db");
+    conn.execute(format!("ATTACH '{}' AS aux", aux_path.display()))?;
+    conn.execute("CREATE TABLE aux.t(x INTEGER, y INTEGER GENERATED ALWAYS AS (x + 1) VIRTUAL)")?;
+    conn.execute("INSERT INTO aux.t(x) VALUES (41)")?;
+    conn.execute("DETACH aux")?;
+
+    conn.execute(format!("ATTACH '{}' AS aux", aux_path.display()))?;
+    let rows: Vec<(i64, i64)> = conn.exec_rows("SELECT x, y FROM aux.t");
+    assert_eq!(rows, vec![(41, 42)]);
+
+    Ok(())
+}
+
+#[turso_macros::test]
+fn test_attach_inherits_index_method_flag_on_reattach(_tmp_db: TempDatabase) -> anyhow::Result<()> {
+    let db = attach_enabled_db(DatabaseOpts::new().with_index_method(true));
+    let conn = db.connect_limbo();
+
+    let aux_path = db.path.with_extension("attach_index_method.db");
+    conn.execute(format!("ATTACH '{}' AS aux", aux_path.display()))?;
+    conn.execute("CREATE TABLE aux.docs(id INTEGER PRIMARY KEY, content TEXT)")?;
+    conn.execute("CREATE INDEX aux.fts_docs ON docs USING fts (content)")?;
+    conn.execute("INSERT INTO aux.docs(content) VALUES ('hello world')")?;
+    conn.execute("DETACH aux")?;
+
+    conn.execute(format!("ATTACH '{}' AS aux", aux_path.display()))?;
+    let rows: Vec<(i64,)> =
+        conn.exec_rows("SELECT id FROM aux.docs WHERE fts_match(content, 'hello')");
+    assert_eq!(rows, vec![(1,)]);
+
+    Ok(())
+}
+
+/// Statements on an attached database never set the connection-level write
+/// transaction state, so an attached FTS write can pick up the connection's
+/// cached read state from an earlier query instead of loading writer state.
+/// The write must still reach the backing B-tree: a document inserted after a
+/// warm read has to be findable. The writing connection has no retained FTS
+/// writer of its own (another connection did the earlier write), which is
+/// what routes its open_write through the cached read state.
+#[cfg(all(feature = "fts", not(target_family = "wasm")))]
+#[turso_macros::test]
+fn test_attached_fts_insert_after_warm_read_is_searchable(
+    _tmp_db: TempDatabase,
+) -> anyhow::Result<()> {
+    let db = attach_enabled_db(DatabaseOpts::new().with_index_method(true));
+    let seeder = db.connect_limbo();
+
+    let aux_path = db.path.with_extension("attached_fts_warm_read.db");
+    seeder.execute(format!("ATTACH '{}' AS aux", aux_path.display()))?;
+    seeder.execute("CREATE TABLE aux.docs(id INTEGER PRIMARY KEY, content TEXT)")?;
+    seeder.execute("CREATE INDEX aux.docs_fts ON docs USING fts(content)")?;
+    seeder.execute("INSERT INTO aux.docs VALUES (1, 'hello world')")?;
+
+    let conn = db.connect_limbo();
+    conn.execute(format!("ATTACH '{}' AS aux", aux_path.display()))?;
+
+    // Warm this connection's cached FTS read state for the attached index.
+    let warm: Vec<(i64,)> =
+        conn.exec_rows("SELECT id FROM aux.docs WHERE fts_match(content, 'hello')");
+    assert_eq!(warm, vec![(1,)]);
+
+    conn.execute("INSERT INTO aux.docs VALUES (2, 'fresh needle')")?;
+
+    let fresh: Vec<(i64,)> =
+        conn.exec_rows("SELECT id FROM aux.docs WHERE fts_match(content, 'needle')");
+    assert_eq!(
+        fresh,
+        vec![(2,)],
+        "a document inserted after a warm FTS read must be searchable"
+    );
+    let still_there: Vec<(i64,)> =
+        conn.exec_rows("SELECT id FROM aux.docs WHERE fts_match(content, 'hello')");
+    assert_eq!(still_there, vec![(1,)]);
+
+    // The document must also have been persisted, not merely retained in
+    // this connection's in-memory caches.
+    conn.execute("DETACH aux")?;
+    conn.execute(format!("ATTACH '{}' AS aux", aux_path.display()))?;
+    let reopened: Vec<(i64,)> =
+        conn.exec_rows("SELECT id FROM aux.docs WHERE fts_match(content, 'needle')");
+    assert_eq!(
+        reopened,
+        vec![(2,)],
+        "the document inserted after a warm FTS read must survive reattach"
+    );
+
+    Ok(())
+}
+
+#[cfg(all(feature = "fts", not(target_family = "wasm")))]
+#[turso_macros::test]
+fn test_attached_mvcc_fts_uses_attached_store(_tmp_db: TempDatabase) -> anyhow::Result<()> {
+    let db = attach_enabled_db(DatabaseOpts::new().with_index_method(true));
+    let conn = db.connect_limbo();
+    let aux_path = db.path.with_extension("attached_mvcc_fts.db");
+
+    conn.execute(format!("ATTACH '{}' AS aux", aux_path.display()))?;
+    conn.execute("PRAGMA aux.journal_mode = 'experimental_mvcc'")?;
+    conn.execute("CREATE TABLE aux.docs(id INTEGER PRIMARY KEY, content TEXT)")?;
+    conn.execute("CREATE INDEX aux.docs_fts ON docs USING fts(content)")?;
+
+    conn.execute("BEGIN")?;
+    conn.execute("INSERT INTO aux.docs VALUES (1, 'attached committed')")?;
+    conn.execute("COMMIT")?;
+    conn.execute("BEGIN")?;
+    conn.execute("INSERT INTO aux.docs VALUES (2, 'attached rolledback')")?;
+    conn.execute("ROLLBACK")?;
+
+    let committed: Vec<(i64,)> =
+        conn.exec_rows("SELECT id FROM aux.docs WHERE fts_match(content, 'committed')");
+    assert_eq!(committed, vec![(1,)]);
+    // The MATCH operator spelling must plan against the attached database's
+    // FTS index too (it used to be rejected because the planner resolved the
+    // index against the main schema only).
+    let committed_match: Vec<(i64,)> =
+        conn.exec_rows("SELECT id FROM aux.docs WHERE content MATCH 'committed'");
+    assert_eq!(committed_match, vec![(1,)]);
+    let rolled_back: Vec<(i64,)> =
+        conn.exec_rows("SELECT id FROM aux.docs WHERE fts_match(content, 'rolledback')");
+    assert!(rolled_back.is_empty());
+
+    conn.execute("DETACH aux")?;
+    conn.execute(format!("ATTACH '{}' AS aux", aux_path.display()))?;
+    let recovered: Vec<(i64,)> =
+        conn.exec_rows("SELECT id FROM aux.docs WHERE fts_match(content, 'attached')");
+    assert_eq!(recovered, vec![(1,)]);
+    Ok(())
+}
+
+#[test]
+fn test_attach_create_stores_canonical_schema_sql() -> anyhow::Result<()> {
+    let aux_db = TempDatabase::builder().build();
+    let aux_conn = aux_db.connect_limbo();
+    aux_conn.execute("CREATE TABLE t(name TEXT)")?;
+    do_flush(&aux_conn, &aux_db)?;
+
+    let db = attach_enabled_db(DatabaseOpts::new());
+    let conn = db.connect_limbo();
+
+    conn.execute(format!("ATTACH '{}' AS aux", aux_db.path.display()))?;
+    conn.execute("CREATE TABLE aux.t2(col TEXT)")?;
+    conn.execute("CREATE INDEX aux.idx_t_name ON t(name)")?;
+
+    let rows: Vec<(String,)> =
+        conn.exec_rows("SELECT sql FROM aux.sqlite_schema WHERE type = 'table' AND name = 't2'");
+    assert_eq!(rows, vec![("CREATE TABLE t2 (col TEXT)".to_string(),)]);
+
+    let rows: Vec<(String,)> = conn.exec_rows(
+        "SELECT sql FROM aux.sqlite_schema WHERE type = 'index' AND name = 'idx_t_name'",
+    );
+    assert_eq!(
+        rows,
+        vec![("CREATE INDEX idx_t_name ON t (name)".to_string(),)]
+    );
+
+    Ok(())
+}
+
+/// this test is very much same like `test_attach_create_stores_canonical_schema_sql` except
+/// we don't attach any db, rather access the main db as if it was attached
+#[test]
+fn test_attach_create_stores_canonical_schema_sql_on_main() -> anyhow::Result<()> {
+    let db = TempDatabase::builder().build();
+    let conn = db.connect_limbo();
+    conn.execute("CREATE TABLE t(name TEXT)")?;
+    do_flush(&conn, &db)?;
+
+    conn.execute("CREATE TABLE main.t2(col TEXT)")?;
+    conn.execute("CREATE INDEX main.idx_t_name ON t(name)")?;
+
+    let rows: Vec<(String,)> =
+        conn.exec_rows("SELECT sql FROM sqlite_schema WHERE type = 'table' AND name = 't2'");
+    assert_eq!(rows, vec![("CREATE TABLE t2 (col TEXT)".to_string(),)]);
+
+    let rows: Vec<(String,)> = conn
+        .exec_rows("SELECT sql FROM sqlite_schema WHERE type = 'index' AND name = 'idx_t_name'");
+    assert_eq!(
+        rows,
+        vec![("CREATE INDEX idx_t_name ON t (name)".to_string(),)]
+    );
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Transaction-opcode emission tests
+//
+// SQLite emits `Transaction` for every open database (main, temp, each
+// attached) on `BEGIN IMMEDIATE` and `BEGIN EXCLUSIVE`. Verify that turso
+// emits the same number, covering the db-id set we expect.
+// ---------------------------------------------------------------------------
+
+/// Extract the set of `p1` (db index) values from `Transaction` opcodes
+/// in an EXPLAIN result set. Column 1 = opcode name, column 2 = p1.
+fn transaction_db_ids_from_explain(rows: &[Vec<rusqlite::types::Value>]) -> Vec<i64> {
+    rows.iter()
+        .filter_map(|row| {
+            let opcode = match &row[1] {
+                rusqlite::types::Value::Text(s) => s.as_str(),
+                _ => return None,
+            };
+            if opcode != "Transaction" {
+                return None;
+            }
+            match &row[2] {
+                rusqlite::types::Value::Integer(db_id) => Some(*db_id),
+                _ => None,
+            }
+        })
+        .collect()
+}
+
+#[turso_macros::test]
+fn test_begin_immediate_transaction_count_no_attached(_tmp_db: TempDatabase) -> anyhow::Result<()> {
+    let db = attach_enabled_db(DatabaseOpts::new());
+    let turso = db.connect_limbo();
+    let sqlite = RusqliteConnection::open_in_memory()?;
+
+    let turso_ids =
+        transaction_db_ids_from_explain(&limbo_exec_rows(&turso, "EXPLAIN BEGIN IMMEDIATE"));
+    let sqlite_ids =
+        transaction_db_ids_from_explain(&sqlite_exec_rows(&sqlite, "EXPLAIN BEGIN IMMEDIATE"));
+
+    assert_that!(&turso_ids).has_length(sqlite_ids.len());
+    // Transaction for main, which is db 0.
+    assert_that!(turso_ids).contains(0);
+    Ok(())
+}
+
+#[turso_macros::test]
+fn test_begin_immediate_transaction_count_one_attached(
+    _tmp_db: TempDatabase,
+) -> anyhow::Result<()> {
+    let db = attach_enabled_db(DatabaseOpts::new());
+    let turso = db.connect_limbo();
+    let sqlite = RusqliteConnection::open_in_memory()?;
+
+    turso.execute("ATTACH ':memory:' AS aux")?;
+    sqlite.execute("ATTACH ':memory:' AS aux", params![])?;
+
+    turso.execute("CREATE TABLE aux.t(x INTEGER)")?;
+    sqlite.execute("CREATE TABLE aux.t(x INTEGER)", params![])?;
+
+    let turso_ids =
+        transaction_db_ids_from_explain(&limbo_exec_rows(&turso, "EXPLAIN BEGIN IMMEDIATE"));
+    let sqlite_ids =
+        transaction_db_ids_from_explain(&sqlite_exec_rows(&sqlite, "EXPLAIN BEGIN IMMEDIATE"));
+
+    assert_that!(&turso_ids).has_length(sqlite_ids.len());
+    // Transaction for main, then for the attached database, which gets
+    // index 2 because slot 1 is always temp.
+    assert_that!(turso_ids)
+        .contains(0)
+        .any_satisfies(|db_id| *db_id >= 2);
+    Ok(())
+}
+
+#[turso_macros::test]
+fn test_begin_immediate_transaction_count_two_attached(
+    _tmp_db: TempDatabase,
+) -> anyhow::Result<()> {
+    let db = attach_enabled_db(DatabaseOpts::new());
+    let turso = db.connect_limbo();
+    let sqlite = RusqliteConnection::open_in_memory()?;
+
+    for alias in ["aux1", "aux2"] {
+        turso.execute(format!("ATTACH ':memory:' AS {alias}"))?;
+        sqlite.execute(&format!("ATTACH ':memory:' AS {alias}"), params![])?;
+        turso.execute(format!("CREATE TABLE {alias}.t(x INTEGER)"))?;
+        sqlite.execute(&format!("CREATE TABLE {alias}.t(x INTEGER)"), params![])?;
+    }
+
+    let turso_ids =
+        transaction_db_ids_from_explain(&limbo_exec_rows(&turso, "EXPLAIN BEGIN IMMEDIATE"));
+    let sqlite_ids =
+        transaction_db_ids_from_explain(&sqlite_exec_rows(&sqlite, "EXPLAIN BEGIN IMMEDIATE"));
+
+    assert_that!(&turso_ids).has_length(sqlite_ids.len());
+    // Transaction for main, then for both attached databases.
+    assert_that!(&turso_ids).contains(&0);
+    assert_that!(turso_ids)
+        .filtered_on(|db_id| *db_id >= 2)
+        .has_length(2);
+    Ok(())
+}
+
+#[turso_macros::test]
+fn test_begin_immediate_transaction_count_with_temp(_tmp_db: TempDatabase) -> anyhow::Result<()> {
+    let db = attach_enabled_db(DatabaseOpts::new());
+    let turso = db.connect_limbo();
+    let sqlite = RusqliteConnection::open_in_memory()?;
+
+    turso.execute("CREATE TEMP TABLE tt(v INTEGER)")?;
+    sqlite.execute("CREATE TEMP TABLE tt(v INTEGER)", params![])?;
+
+    let turso_ids =
+        transaction_db_ids_from_explain(&limbo_exec_rows(&turso, "EXPLAIN BEGIN IMMEDIATE"));
+    let sqlite_ids =
+        transaction_db_ids_from_explain(&sqlite_exec_rows(&sqlite, "EXPLAIN BEGIN IMMEDIATE"));
+
+    assert_that!(&turso_ids).has_length(sqlite_ids.len());
+    // Transaction for main and for temp, which is db 1.
+    assert_that!(turso_ids).contains(0).contains(1);
+    Ok(())
+}
+
+#[turso_macros::test]
+fn test_begin_deferred_emits_no_transaction_opcodes(_tmp_db: TempDatabase) -> anyhow::Result<()> {
+    let db = attach_enabled_db(DatabaseOpts::new());
+    let turso = db.connect_limbo();
+    let sqlite = RusqliteConnection::open_in_memory()?;
+
+    turso.execute("ATTACH ':memory:' AS aux")?;
+    sqlite.execute("ATTACH ':memory:' AS aux", params![])?;
+    turso.execute("CREATE TABLE aux.t(x INTEGER)")?;
+    sqlite.execute("CREATE TABLE aux.t(x INTEGER)", params![])?;
+
+    let turso_ids = transaction_db_ids_from_explain(&limbo_exec_rows(&turso, "EXPLAIN BEGIN"));
+    let sqlite_ids = transaction_db_ids_from_explain(&sqlite_exec_rows(&sqlite, "EXPLAIN BEGIN"));
+
+    // BEGIN is deferred, so it emits no Transaction opcode at all.
+    assert_that!(turso_ids).is_empty();
+    assert!(
+        sqlite_ids.is_empty(),
+        "SQLite BEGIN (deferred) should emit no Transaction opcodes, got: {sqlite_ids:?}"
+    );
+    Ok(())
+}
+
+/// Regression test: an I/O error while a write statement begins its
+/// transaction on an attached database must roll the attached transaction
+/// back. The attached Transaction opcode runs before the main-database one,
+/// so when it fails nothing has marked the implicit transaction for rollback
+/// on abort; without the attached-side marking the failed statement leaves
+/// the attached WAL write lock held, and the next statement on the
+/// connection — even one that never touches the attached database — tries to
+/// commit that leftover transaction at halt and fails in its place.
+#[test]
+fn test_attached_write_txn_rolled_back_after_io_error() -> anyhow::Result<()> {
+    use crate::queued_io::{QueuedIo, QueuedIoOpKind};
+
+    let io = Arc::new(QueuedIo::new());
+    let db = Database::open_file_with_flags(
+        io.clone(),
+        "queued-attach-lock.db",
+        OpenFlags::default(),
+        DatabaseOpts::new().with_attach(true),
+        None,
+        Arc::new(SqliteDialect),
+    )?;
+
+    let conn = db.connect()?;
+    conn.execute("ATTACH 'queued-attach-lock-aux.db' AS aux1")?;
+    conn.execute("CREATE TABLE main_t (x INTEGER)")?;
+    conn.execute("INSERT INTO main_t VALUES (1)")?;
+    conn.execute("CREATE TABLE aux1.t (a INTEGER)")?;
+    conn.execute("INSERT INTO aux1.t VALUES (1)")?;
+    // Move the attached database's pages out of its WAL so the header read
+    // below hits the database file, where the fault is targeted.
+    conn.execute("PRAGMA aux1.wal_checkpoint(TRUNCATE)")?;
+
+    // A write from another connection advances the attached WAL, so `conn`'s
+    // next attached read transaction sees the database as changed, drops its
+    // cached pages and cached schema cookie, and must re-read the header page
+    // from disk inside its attached Transaction opcode.
+    let conn2 = db.connect()?;
+    conn2.execute("ATTACH 'queued-attach-lock-aux.db' AS aux1")?;
+    conn2.execute("INSERT INTO aux1.t VALUES (2)")?;
+
+    // Fail every attached-database read from here on. The UPDATE dies inside
+    // its attached Transaction opcode: after the write lock is taken, while
+    // re-reading the header page for the schema-cookie check.
+    io.fault_after("queued-attach-lock-aux.db", QueuedIoOpKind::Pread, 0);
+    let result = conn.execute("UPDATE aux1.t SET a = a + 10");
+    assert!(
+        result.is_err(),
+        "UPDATE should fail under the injected read fault"
+    );
+
+    // The failed statement must have rolled back the attached write
+    // transaction. If it leaked, this main-only statement commits the
+    // leftover transaction at halt, hits the still-failing attached read,
+    // and errors even though it never touches the attached database.
+    let rows = limbo_exec_rows(&conn, "SELECT count(*) FROM main_t");
+    assert_eq!(rows, vec![vec![rusqlite::types::Value::Integer(1)]]);
+
+    io.clear_fault();
+
+    // The connection keeps working normally afterwards.
+    conn.execute("UPDATE aux1.t SET a = a + 10")?;
+    let rows = limbo_exec_rows(&conn, "SELECT a FROM aux1.t ORDER BY a");
+    assert_eq!(
+        rows,
+        vec![
+            vec![rusqlite::types::Value::Integer(11)],
+            vec![rusqlite::types::Value::Integer(12)],
+        ]
+    );
+    Ok(())
+}

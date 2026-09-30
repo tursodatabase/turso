@@ -1,0 +1,31 @@
+[workspace]
+members = ["cargo:."]
+
+# Config for 'dist'
+[dist]
+# The preferred dist version to use in CI (Cargo.toml SemVer syntax)
+cargo-dist-version = "0.31.0"
+# CI backends to support
+ci = "github"
+# The installers to generate for each app
+installers = ["shell", "powershell"]
+# Target platforms to build apps for (Rust target-triple syntax)
+targets = ["aarch64-apple-darwin", "aarch64-pc-windows-msvc", "aarch64-unknown-linux-gnu", "x86_64-apple-darwin", "x86_64-unknown-linux-gnu", "x86_64-pc-windows-msvc"]
+# Which actions to run on pull requests
+pr-run-mode = "plan"
+# Path that installers should place binaries in
+install-path = "~/.turso"
+# Whether to install an updater program. Must stay off: dist provides no
+# prebuilt updater binary for aarch64-pc-windows-msvc, and the setting cannot
+# be toggled per target, so enabling it fails the Windows ARM64 release build.
+install-updater = false
+# Whether to consider the binaries in a package for distribution (defaults true)
+dist = false
+# Whether to enable GitHub Attestations
+github-attestations = true
+# Build only the required packages
+precise-builds = true
+# release.yml is hand-edited to add Azure Windows code signing (see PR #7618),
+# which cargo-dist can't generate itself. Allow the CI file to differ from
+# `dist generate` output so the `dist plan` check doesn't fail.
+allow-dirty = ["ci"]

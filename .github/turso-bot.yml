@@ -1,0 +1,9 @@
+# Turso Bot configuration
+# Place this file in your repository at .github/turso-bot.yml
+
+# Enable or disable the bot for this repository
+enabled: true
+
+# BetterStack schedule ID to fetch on-call users
+scheduleId: "335158"
+

@@ -1,0 +1,11 @@
+@database :memory:
+
+@backend cli
+test tables-includes-views {
+    CREATE TABLE t1(a);
+    CREATE VIEW v1 AS SELECT a FROM t1;
+    .tables
+}
+expect raw {
+t1 v1
+}

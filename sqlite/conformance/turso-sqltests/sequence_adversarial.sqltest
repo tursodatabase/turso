@@ -1,0 +1,393 @@
+@database :memory:
+
+# Adversarial coverage for sequence-backed tables. Focused on edge cases
+# that the existing sequence / mvcc_sequence / attach/sequence files don't
+# directly exercise: lifecycle (DROP TABLE / re-CREATE), explicit-rowid
+# interactions on AUTOINCREMENT, descending-sequence watermarks across
+# checkpoint, i64 boundary behavior, multi-row INSERT with sequence DEFAULT,
+# and PG-compatible setval semantics.
+
+# --- DROP TABLE on AUTOINCREMENT releases the implicit sequence ---
+
+# A re-created table with the same name must NOT inherit the prior table's
+# rowid watermark. Pre-fix this regressed under MVCC (the orphan
+# `__turso_internal_seq___turso_internal_autoincrement_<table>` survived
+# DROP TABLE and the new table resumed nextval from the old watermark).
+test drop-table-removes-autoincrement-backing-table {
+    CREATE TABLE t(id INTEGER PRIMARY KEY AUTOINCREMENT, v);
+    INSERT INTO t(v) VALUES('a'),('b'),('c');
+    DROP TABLE t;
+    SELECT count(*) FROM sqlite_schema WHERE name LIKE '__turso_internal_seq_%';
+    CREATE TABLE t(id INTEGER PRIMARY KEY AUTOINCREMENT, v);
+    INSERT INTO t(v) VALUES('x'),('y');
+    SELECT id, v FROM t ORDER BY id;
+    SELECT name, seq FROM sqlite_sequence;
+}
+expect {
+    0
+    1|x
+    2|y
+    t|2
+}
+
+# DROP TABLE on a non-AUTOINCREMENT INTEGER PRIMARY KEY table must NOT
+# attempt sequence cleanup (no implicit sequence exists). Regression guard
+# for the gate added in translate_drop_table.
+test drop-table-non-autoinc-noop {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, v);
+    INSERT INTO t VALUES(10, 'a'), (20, 'b');
+    DROP TABLE t;
+    CREATE TABLE t(id INTEGER PRIMARY KEY, v);
+    INSERT INTO t VALUES(1, 'x');
+    SELECT id FROM t;
+}
+expect {
+    1
+}
+
+# --- Backing-table compaction on the SKIPPED (non-MVCC-concurrent) path ---
+
+# WAL/rollback mode: the inline compaction gate fires every nextval
+# because path_kind_reg resolved to SEQ_PATH_SKIPPED (no MVCC). The
+# backing table must stay at one row regardless of how many nextvals
+# ran, and `Last`/`Rewind` on that single row must still return the
+# correct watermark. Pre-fix WAL non-CYCLE backing tables grew without
+# bound (one row per nextval) because the only post-write compactor —
+# MVCC's SeqCompactDriver — does not run in WAL mode.
+test wal-non-cycle-backing-table-stays-at-one-row {
+    CREATE SEQUENCE s;
+    SELECT nextval('s');
+    SELECT nextval('s');
+    SELECT nextval('s');
+    SELECT nextval('s');
+    SELECT nextval('s');
+    SELECT count(*), max(value) FROM "__turso_internal_seq_s";
+    SELECT nextval('s');
+}
+expect {
+    1
+    2
+    3
+    4
+    5
+    1|5
+    6
+}
+
+# Descending non-CYCLE follows the same gate. After the compaction
+# leaves only the most-advanced (= lowest) row, `Rewind` must still
+# pick up the right watermark.
+test wal-descending-non-cycle-backing-table-stays-at-one-row {
+    CREATE SEQUENCE d START WITH 10 INCREMENT BY -1 MINVALUE 0 MAXVALUE 10;
+    SELECT nextval('d');
+    SELECT nextval('d');
+    SELECT nextval('d');
+    SELECT nextval('d');
+    SELECT count(*), min(value) FROM "__turso_internal_seq_d";
+    SELECT nextval('d');
+}
+expect {
+    10
+    9
+    8
+    7
+    1|7
+    6
+}
+
+# --- ALTER TABLE RENAME on AUTOINCREMENT (WAL/rollback mode) ---
+
+# WAL: rename must update the backing-table sqlite_schema row + sqlite_sequence
+# entry. Persistence is implicit (the in-memory schema is reparsed on next
+# session); covered separately for MVCC where the in-memory rename is
+# load-bearing.
+test alter-rename-autoincrement-table-preserves-watermark {
+    CREATE TABLE old(id INTEGER PRIMARY KEY AUTOINCREMENT, v);
+    INSERT INTO old(v) VALUES('a'),('b');
+    ALTER TABLE old RENAME TO new;
+    INSERT INTO new(v) VALUES('c');
+    SELECT id, v FROM new ORDER BY id;
+    SELECT name FROM sqlite_schema WHERE name LIKE '__turso_internal_seq_%';
+    SELECT name, seq FROM sqlite_sequence;
+}
+expect {
+    1|a
+    2|b
+    3|c
+    __turso_internal_seq___turso_internal_autoincrement_new
+    new|3
+}
+
+# Rename to a name conflicting with an existing __turso_internal_ prefix
+# must be rejected at the validate stage (RESERVED_TABLE_PREFIXES guard) —
+# regression so a user can't shadow their own sequence's backing table.
+test alter-rename-rejects-internal-prefix-target {
+    CREATE TABLE t(id INTEGER PRIMARY KEY AUTOINCREMENT, v);
+    ALTER TABLE t RENAME TO __turso_internal_evil;
+}
+expect error {
+    .*
+}
+
+# --- DROP / re-CREATE SEQUENCE round-trip ---
+
+# Re-creating a sequence with the same name after DROP must use the new
+# descriptor, not the previous one. Pre-fix the in-memory sequence entry
+# survived because the backing table did, leading to start=1 even when the
+# user requested START WITH 100.
+test drop-create-sequence-uses-new-descriptor {
+    CREATE SEQUENCE s;
+    SELECT nextval('s');
+    SELECT nextval('s');
+    DROP SEQUENCE s;
+    CREATE SEQUENCE s START WITH 100 INCREMENT BY 5;
+    SELECT nextval('s');
+    SELECT nextval('s');
+}
+expect {
+    1
+    2
+    100
+    105
+}
+
+# DROP SEQUENCE IF EXISTS is a no-op when the sequence doesn't exist.
+test drop-sequence-if-exists-missing {
+    DROP SEQUENCE IF EXISTS does_not_exist;
+    SELECT 'ok';
+}
+expect {
+    ok
+}
+
+# CREATE SEQUENCE IF NOT EXISTS does not error nor reset existing state.
+test create-sequence-if-not-exists-preserves-state {
+    CREATE SEQUENCE s START WITH 50;
+    SELECT nextval('s');
+    SELECT nextval('s');
+    CREATE SEQUENCE IF NOT EXISTS s START WITH 1000;
+    SELECT nextval('s');
+}
+expect {
+    50
+    51
+    52
+}
+
+# --- Descending sequence + setval + range edges ---
+
+# Descending non-CYCLE crosses zero, lands at MIN, and the next call
+# errors with the documented underflow message — not a corruption.
+test descending-crosses-zero-and-errors-at-min {
+    CREATE SEQUENCE down START WITH 2 INCREMENT BY -1 MINVALUE -2 MAXVALUE 5;
+    SELECT nextval('down');
+    SELECT nextval('down');
+    SELECT nextval('down');
+    SELECT nextval('down');
+    SELECT nextval('down');
+    SELECT nextval('down');
+}
+expect error {
+    nextval: reached minimum value of sequence "down"
+}
+
+# Descending CYCLE wraps to MAXVALUE. The inline compaction for CYCLE
+# (emit_backing_table_compaction at the bottom of nextval) is exercised
+# here: without it the descending Rewind would re-read pre-wrap rows.
+test descending-cycle-wrap-to-max {
+    CREATE SEQUENCE wd START WITH 2 INCREMENT BY -1 MINVALUE 0 MAXVALUE 3 CYCLE;
+    SELECT nextval('wd');
+    SELECT nextval('wd');
+    SELECT nextval('wd');
+    SELECT nextval('wd');
+    SELECT nextval('wd');
+}
+expect {
+    2
+    1
+    0
+    3
+    2
+}
+
+# setval below MINVALUE for a descending sequence: must error.
+test descending-setval-out-of-bounds {
+    CREATE SEQUENCE dd START WITH 0 INCREMENT BY -1 MINVALUE -10 MAXVALUE 10;
+    SELECT setval('dd', -11);
+}
+expect error {
+    setval: value -11 is out of bounds for sequence "dd" \(-10..10\)
+}
+
+# --- i64 boundary behavior ---
+
+# Exhaustion at i64::MAX raises Database-Full (mirrors SQLite AUTOINCREMENT
+# exhaustion) — no silent overflow.
+test exhaustion-at-i64-max-errors {
+    CREATE SEQUENCE bigg
+        START WITH 9223372036854775805
+        MINVALUE 1
+        MAXVALUE 9223372036854775807;
+    SELECT nextval('bigg');
+    SELECT nextval('bigg');
+    SELECT nextval('bigg');
+    SELECT nextval('bigg');
+}
+expect error {
+    nextval: reached maximum value of sequence "bigg"
+}
+
+# --- Multi-row INSERT with nextval DEFAULT must allocate per row ---
+
+# A single multi-row INSERT must call nextval N times, not once.
+test multi-row-insert-default-nextval-per-row {
+    CREATE SEQUENCE mr;
+    CREATE TABLE t(id INTEGER PRIMARY KEY, n INTEGER DEFAULT (nextval('mr')), v);
+    INSERT INTO t(v) VALUES('a'),('b'),('c'),('d'),('e');
+    SELECT n, v FROM t ORDER BY id;
+}
+expect {
+    1|a
+    2|b
+    3|c
+    4|d
+    5|e
+}
+
+# Mixed-source INSERT…SELECT pulling from another table — nextval must
+# allocate per row of the SELECT, not once per statement.
+test insert-select-nextval-per-source-row {
+    CREATE SEQUENCE iss;
+    CREATE TABLE src(x);
+    INSERT INTO src VALUES('p'),('q'),('r');
+    CREATE TABLE dst(id INTEGER PRIMARY KEY, n INTEGER DEFAULT (nextval('iss')), x);
+    INSERT INTO dst(x) SELECT x FROM src ORDER BY x;
+    SELECT n, x FROM dst ORDER BY id;
+}
+expect {
+    1|p
+    2|q
+    3|r
+}
+
+# --- setval PG-semantics regression ---
+
+# setval(seq, value)             → is_called=true, next nextval = value+inc.
+# setval(seq, value, false)      → is_called=false, next nextval = value.
+# setval(seq, value, true)       → same as the two-arg form.
+# Returns the supplied value in all forms (matches PostgreSQL).
+test setval-three-arg-semantics {
+    CREATE SEQUENCE p START WITH 1;
+    SELECT setval('p', 50);
+    SELECT nextval('p');
+    SELECT setval('p', 100, false);
+    SELECT nextval('p');
+    SELECT nextval('p');
+    SELECT setval('p', 200, true);
+    SELECT nextval('p');
+}
+expect {
+    50
+    51
+    100
+    100
+    101
+    200
+    201
+}
+
+# --- AUTOINCREMENT explicit rowid: out-of-range / forward jump ---
+
+# Explicit rowid LESS than current watermark must NOT regress the
+# watermark; the next implicit AUTOINCREMENT pick continues from the
+# (unchanged) high-water mark. Uses gaps that don't collide with the
+# auto-assigned ids 1..3 from the initial inserts.
+test autoinc-explicit-low-rowid-preserves-watermark {
+    CREATE TABLE t(id INTEGER PRIMARY KEY AUTOINCREMENT, v);
+    INSERT INTO t(v) VALUES('a'),('b'),('c');
+    INSERT INTO t(id, v) VALUES(2000, 'jump');
+    INSERT INTO t(id, v) VALUES(10, 'mid');
+    INSERT INTO t(v) VALUES('z');
+    SELECT id, v FROM t ORDER BY id;
+    SELECT name, seq FROM sqlite_sequence;
+}
+expect {
+    1|a
+    2|b
+    3|c
+    10|mid
+    2000|jump
+    2001|z
+    t|2001
+}
+
+# AUTOINCREMENT respects INSERT OR IGNORE on a secondary unique conflict:
+# the rowid is consumed (burned) on the failed-but-ignored attempt, then
+# the next INSERT skips past it. Matches SQLite.
+test autoinc-insert-or-ignore-burns-rowid {
+    CREATE TABLE t(id INTEGER PRIMARY KEY AUTOINCREMENT, u UNIQUE);
+    INSERT INTO t(u) VALUES(10);
+    INSERT OR IGNORE INTO t(u) VALUES(10);
+    INSERT INTO t(u) VALUES(20);
+    SELECT id, u FROM t ORDER BY id;
+    SELECT seq FROM sqlite_sequence;
+}
+expect {
+    1|10
+    3|20
+    3
+}
+
+# DELETE all rows then INSERT must preserve sqlite_sequence high-water
+# mark — SQLite-compatible AUTOINCREMENT contract.
+test autoinc-delete-all-preserves-sqlite-sequence {
+    CREATE TABLE t(id INTEGER PRIMARY KEY AUTOINCREMENT, v);
+    INSERT INTO t(v) VALUES('a'),('b');
+    DELETE FROM t;
+    INSERT INTO t(v) VALUES('c');
+    SELECT id, v FROM t;
+    SELECT seq FROM sqlite_sequence;
+}
+expect {
+    3|c
+    3
+}
+
+# --- CREATE SEQUENCE namespace reservation ---
+
+# User must not be able to create a sequence in the AUTOINCREMENT-reserved
+# namespace; if they could, sqlite_sequence corruption for an attacker-
+# chosen table name would be possible via the autoincrement-sync path.
+test create-sequence-rejects-autoincrement-prefix-various-cases {
+    CREATE SEQUENCE __turso_internal_autoincrement_evil;
+}
+expect error {
+    is reserved for internal AUTOINCREMENT use
+}
+
+# Mixed-case spelling of the reserved prefix is rejected after
+# normalize_ident lowercases it.
+test create-sequence-rejects-reserved-prefix-case-insensitive {
+    CREATE SEQUENCE __TURSO_INTERNAL_AUTOINCREMENT_X;
+}
+expect error {
+    is reserved for internal AUTOINCREMENT use
+}
+
+# --- currval session semantics ---
+
+# currval is per-connection-and-per-sequence; nextval establishes it,
+# DROP SEQUENCE removes the underlying sequence so subsequent currval
+# errors with "does not exist" (the stale per-session value is shadowed
+# by the existence check — regression guard for connection.find_sequence).
+test currval-after-drop-then-recreate-uses-new-sequence-currval {
+    CREATE SEQUENCE c;
+    SELECT nextval('c');
+    SELECT currval('c');
+    DROP SEQUENCE c;
+    CREATE SEQUENCE c START WITH 500;
+    SELECT currval('c');
+}
+expect error {
+    currval of sequence "c" is not yet defined in this session
+}

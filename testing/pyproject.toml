@@ -1,0 +1,36 @@
+[project]
+description = "Turso Python Testing Project"
+name = "turso_test"
+readme = "README.md"
+requires-python = ">=3.13"
+version = "0.1.0"
+dependencies = [
+    "faker>=37.1.0",
+ "pydantic>=2.11.1",
+ "rich>=15.0.0",
+]
+
+[project.scripts]
+test-write = "cli_tests.write:main"
+test-shell = "cli_tests.cli_test_cases:main"
+test-extensions = "cli_tests.extensions:main"
+test-update = "cli_tests.update:main"
+test-memory = "cli_tests.memory:main"
+bench-vfs = "cli_tests.vfs_bench:main"
+bench-sqlite = "cli_tests.sqlite_bench:main"
+test-constraint = "cli_tests.constraint:main"
+test-collate = "cli_tests.collate:main"
+test-mvcc = "cli_tests.mvcc:main"
+
+[tool.uv]
+package = true
+
+[build-system]
+build-backend = "hatchling.build"
+requires = ["hatchling", "hatch-vcs"]
+
+[tool.hatch.build.targets.wheel]
+packages = ["cli_tests"]
+
+[tool.hatch.metadata]
+allow-direct-references = true

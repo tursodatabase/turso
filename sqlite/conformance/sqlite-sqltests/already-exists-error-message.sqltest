@@ -1,0 +1,115 @@
+@database :memory:
+
+# SQLite reports a name collision on CREATE TABLE/VIEW/TRIGGER by echoing the
+# new object's name token exactly as the user wrote it, quotes included:
+# `CREATE TABLE "t2"` fails with `table "t2" already exists`. Index names are
+# reported without quotes, and a clash between the index and table namespaces
+# uses "there is already a[n] ..." instead of "already exists". Turso used to
+# strip quotes everywhere and had its own spellings ("Trigger t already
+# exists", "Error: index with name 't' already exists.").
+
+setup base-table {
+    CREATE TABLE test2 (a);
+}
+
+@setup base-table
+test create-table-duplicate-plain-name {
+    CREATE TABLE test2 (a);
+}
+expect error {
+    table test2 already exists
+}
+
+@setup base-table
+test create-table-duplicate-double-quoted-name {
+    CREATE TABLE "test2" (a);
+}
+expect error {
+    table "test2" already exists
+}
+
+@setup base-table
+test create-table-duplicate-bracket-quoted-name {
+    CREATE TABLE [test2] (a);
+}
+expect error {
+    table \[test2\] already exists
+}
+
+@setup base-table
+test create-table-duplicate-backtick-quoted-name {
+    CREATE TABLE `test2` (a);
+}
+expect error {
+    table `test2` already exists
+}
+
+@setup base-table
+test create-table-duplicate-escaped-quote-name {
+    CREATE TABLE "te""st" (a);
+    CREATE TABLE "te""st" (a);
+}
+expect error {
+    table "te""st" already exists
+}
+
+@setup base-table
+test create-view-duplicate-quoted-name {
+    CREATE VIEW v AS SELECT 1;
+    CREATE VIEW "v" AS SELECT 1;
+}
+expect error {
+    view "v" already exists
+}
+
+@setup base-table
+test create-table-over-existing-view {
+    CREATE VIEW v AS SELECT 1;
+    CREATE TABLE v (a);
+}
+expect error {
+    view v already exists
+}
+
+@setup base-table
+test create-view-over-existing-table {
+    CREATE VIEW test2 AS SELECT 1;
+}
+expect error {
+    table test2 already exists
+}
+
+@setup base-table
+test create-trigger-duplicate-quoted-name {
+    CREATE TRIGGER trg AFTER INSERT ON test2 BEGIN SELECT 1; END;
+    CREATE TRIGGER "trg" AFTER INSERT ON test2 BEGIN SELECT 1; END;
+}
+expect error {
+    trigger "trg" already exists
+}
+
+@setup base-table
+test create-index-duplicate-name-reported-without-quotes {
+    CREATE INDEX "idx1" ON test2 (a);
+    CREATE INDEX "idx1" ON test2 (a);
+}
+expect error {
+    index idx1 already exists
+}
+
+@setup base-table
+test create-table-over-existing-index {
+    CREATE INDEX idx1 ON test2 (a);
+    CREATE TABLE idx1 (a);
+}
+expect error {
+    there is already an index named idx1
+}
+
+@setup base-table
+test create-index-over-existing-table-name {
+    CREATE INDEX test2 ON test2 (a);
+}
+expect error {
+    there is already a table named test2
+}

@@ -1,0 +1,39 @@
+@database :memory:
+
+# OR REPLACE resolves a NOT NULL violation by substituting the column default,
+# but the substituted value must still satisfy NOT NULL. A column can declare
+# DEFAULT (NULL), so the substitution can leave the value NULL — SQLite then
+# aborts. Turso's UPDATE path substituted the default without re-checking, so
+# it stored NULL instead of failing.
+
+@cross-check-integrity
+test update-or-replace-not-null-default-null-aborts {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, c BLOB NOT NULL DEFAULT (NULL));
+    INSERT INTO t VALUES(1, X'AA');
+    UPDATE OR REPLACE t SET c = NULL;
+}
+expect error {
+    NOT NULL constraint failed: t\.c
+}
+
+# A non-null default is substituted normally and the UPDATE succeeds.
+@cross-check-integrity
+test update-or-replace-not-null-default-value-substitutes {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, c INTEGER NOT NULL DEFAULT 7);
+    INSERT INTO t VALUES(1, 100);
+    UPDATE OR REPLACE t SET c = NULL;
+    SELECT c FROM t;
+}
+expect {
+    7
+}
+
+# INSERT OR REPLACE behaves the same way.
+@cross-check-integrity
+test insert-or-replace-not-null-default-null-aborts {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, c BLOB NOT NULL DEFAULT (NULL));
+    INSERT OR REPLACE INTO t VALUES(1, NULL);
+}
+expect error {
+    NOT NULL constraint failed: t\.c
+}

@@ -1,0 +1,13 @@
+---
+source: multi_index_dml.sqltest
+expression: SELECT id FROM t WHERE i1 = 5 OR i2 = 6;
+info:
+  statement_type: SELECT
+  tables:
+  - t
+  setup_blocks:
+  - multi_index_dml_schema
+  database: ':memory:'
+---
+QUERY PLAN
+`--MULTI-INDEX OR t (t_i1, t_i2)

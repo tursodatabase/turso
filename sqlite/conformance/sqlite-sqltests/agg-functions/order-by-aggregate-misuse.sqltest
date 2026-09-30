@@ -1,0 +1,81 @@
+@database :memory:
+
+# Aggregate functions in ORDER BY should be rejected when the query
+# is not already an aggregate query (no GROUP BY and no aggregates
+# in SELECT/HAVING).  SQLite returns "misuse of aggregate: min()".
+
+test order-by-min-misuse {
+    CREATE TABLE test1(f1 int, f2 int);
+    INSERT INTO test1 VALUES(11,22);
+    INSERT INTO test1 VALUES(33,44);
+    SELECT f1 FROM test1 ORDER BY min(f1);
+}
+expect error {
+    misuse of aggregate: min()
+}
+
+test order-by-max-misuse {
+    CREATE TABLE test2(f1 int, f2 int);
+    INSERT INTO test2 VALUES(11,22);
+    INSERT INTO test2 VALUES(33,44);
+    SELECT f1 FROM test2 ORDER BY max(f1);
+}
+expect error {
+    misuse of aggregate: max()
+}
+
+test order-by-sum-misuse {
+    CREATE TABLE test3(f1 int, f2 int);
+    INSERT INTO test3 VALUES(11,22);
+    INSERT INTO test3 VALUES(33,44);
+    SELECT f1 FROM test3 ORDER BY sum(f1);
+}
+expect error {
+    misuse of aggregate: sum()
+}
+
+test order-by-count-misuse {
+    CREATE TABLE test4(f1 int, f2 int);
+    INSERT INTO test4 VALUES(11,22);
+    INSERT INTO test4 VALUES(33,44);
+    SELECT f1 FROM test4 ORDER BY count(f1);
+}
+expect error {
+    misuse of aggregate: count()
+}
+
+# Two-arg min() is the scalar function, not an aggregate — should succeed.
+test order-by-scalar-min-ok {
+    CREATE TABLE test5(f1 int, f2 int);
+    INSERT INTO test5 VALUES(11,22);
+    INSERT INTO test5 VALUES(33,44);
+    SELECT f1 FROM test5 ORDER BY min(f1, f2);
+}
+expect {
+    11
+    33
+}
+
+# Aggregate in ORDER BY is fine when the query has GROUP BY.
+test order-by-agg-with-group-by-ok {
+    CREATE TABLE test6(f1 int, f2 int);
+    INSERT INTO test6 VALUES(11,22);
+    INSERT INTO test6 VALUES(11,44);
+    INSERT INTO test6 VALUES(33,55);
+    SELECT f1, count(*) FROM test6 GROUP BY f1 ORDER BY min(f2);
+}
+expect {
+    11|2
+    33|1
+}
+
+# Aggregate in ORDER BY is fine when there are already aggregates in SELECT.
+test order-by-agg-with-select-agg-ok {
+    CREATE TABLE test7(f1 int, f2 int);
+    INSERT INTO test7 VALUES(11,22);
+    INSERT INTO test7 VALUES(33,44);
+    SELECT count(*) FROM test7 ORDER BY min(f1);
+}
+expect {
+    2
+}

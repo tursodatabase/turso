@@ -1,0 +1,17 @@
+@database database/integrity_missing_expression_index_entry.db readonly
+
+
+test integrity-check-corrupt-missing-expression-index-entry {
+    PRAGMA integrity_check;
+}
+expect unordered {
+    wrong # of entries in index idx_expr
+    row 3 missing from index idx_expr
+}
+
+test quick-check-corrupt-missing-expression-index-entry {
+    PRAGMA quick_check;
+}
+expect {
+    wrong # of entries in index idx_expr
+}

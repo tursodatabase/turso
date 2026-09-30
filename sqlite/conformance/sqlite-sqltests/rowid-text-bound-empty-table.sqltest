@@ -1,0 +1,34 @@
+@database :memory:
+
+# Every integer sorts before every text value, so `rowid <= <text>` is true
+# for all rows and the seek turns into "jump to the last row". On an empty
+# table there is no last row, but Turso reported the seek as found anyway and
+# the scan emitted one garbage row.
+
+@cross-check-integrity
+test rowid-le-text-on-empty-table-returns-nothing {
+    CREATE TABLE b(id INTEGER PRIMARY KEY);
+    SELECT 1 FROM b WHERE id <= '' ORDER BY id DESC;
+}
+expect {
+}
+
+@cross-check-integrity
+test rowid-lt-text-on-empty-table-returns-nothing {
+    CREATE TABLE b(id INTEGER PRIMARY KEY);
+    SELECT 1 FROM b WHERE id < 'x' ORDER BY id DESC;
+}
+expect {
+}
+
+# With a row present, the rewritten seek must still find it.
+@cross-check-integrity
+test rowid-le-text-still-scans-existing-rows {
+    CREATE TABLE b(id INTEGER PRIMARY KEY);
+    INSERT INTO b VALUES (7), (9);
+    SELECT id FROM b WHERE id <= '' ORDER BY id DESC;
+}
+expect {
+    9
+    7
+}

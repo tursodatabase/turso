@@ -1,0 +1,214 @@
+@database :memory:
+
+# Coverage for runs of column reads that share one record-header walk
+# (Insn::ColumnRange): wide SELECT *, narrow and out-of-order projections,
+# short records (ALTER TABLE ADD COLUMN) hitting per-column defaults, and
+# NULL/TEXT/BLOB values interleaved with fixed-width ones so record header
+# offsets are non-uniform across rows.
+
+test select-star-wide-mixed-types {
+    CREATE TABLE w(c0 INTEGER, c1 TEXT, c2 REAL, c3 BLOB, c4 TEXT, c5 INTEGER,
+                   c6 TEXT, c7 INTEGER, c8 REAL, c9 TEXT, c10 INTEGER, c11 TEXT);
+    INSERT INTO w VALUES (1, 'one', 1.5, x'4142', 'aa', 10, 'bb', 100, 10.25, 'cc', 1000, 'dd');
+    INSERT INTO w VALUES (2, NULL, NULL, NULL, '', 20, 'longer text value here', 200, -0.5, NULL, 2000, 'e');
+    INSERT INTO w VALUES (NULL, 'three', 3.5, x'00ff10', 'a much longer string to shift offsets', NULL, 'f', NULL, 3.75, 'g', NULL, 'h');
+    SELECT c0, c1, c2, hex(c3), c4, c5, c6, c7, c8, c9, c10, c11 FROM w;
+}
+expect {
+    1|one|1.5|4142|aa|10|bb|100|10.25|cc|1000|dd
+    2|||||20|longer text value here|200|-0.5||2000|e
+    |three|3.5|00FF10|a much longer string to shift offsets||f||3.75|g||h
+}
+
+test select-single-late-column {
+    CREATE TABLE t(c0, c1, c2, c3, c4, c5, c6, c7, c8, c9);
+    INSERT INTO t VALUES (0,1,2,3,4,5,6,7,8,9);
+    INSERT INTO t VALUES (10,11,12,13,14,15,16,17,18,19);
+    SELECT c9 FROM t;
+}
+expect {
+    9
+    19
+}
+
+test select-columns-out-of-order {
+    CREATE TABLE t(c0, c1, c2, c3, c4, c5, c6, c7, c8, c9);
+    INSERT INTO t VALUES (0,1,2,3,4,5,6,7,8,9);
+    INSERT INTO t VALUES (10,11,12,13,14,15,16,17,18,19);
+    SELECT c9, c2, c5 FROM t;
+}
+expect {
+    9|2|5
+    19|12|15
+}
+
+test select-columns-descending {
+    CREATE TABLE t(c0, c1, c2, c3, c4);
+    INSERT INTO t VALUES ('a','b','c','d','e');
+    SELECT c4, c3, c2, c1, c0 FROM t;
+}
+expect {
+    e|d|c|b|a
+}
+
+test select-star-short-records-defaults {
+    CREATE TABLE t(a INTEGER, b TEXT, c INTEGER);
+    INSERT INTO t VALUES (1, 'old1', 10);
+    INSERT INTO t VALUES (2, 'old2', 20);
+    ALTER TABLE t ADD COLUMN d TEXT DEFAULT 'dt';
+    ALTER TABLE t ADD COLUMN e INTEGER DEFAULT 42;
+    ALTER TABLE t ADD COLUMN f TEXT;
+    INSERT INTO t VALUES (3, 'new3', 30, 'real-d', 99, 'real-f');
+    SELECT a, b, c, d, e, f FROM t ORDER BY a;
+}
+expect {
+    1|old1|10|dt|42|
+    2|old2|20|dt|42|
+    3|new3|30|real-d|99|real-f
+}
+
+test select-late-columns-only-from-short-records {
+    CREATE TABLE t(a INTEGER, b TEXT);
+    INSERT INTO t VALUES (1, 'x');
+    ALTER TABLE t ADD COLUMN c TEXT DEFAULT 'cd';
+    ALTER TABLE t ADD COLUMN d INTEGER DEFAULT -7;
+    SELECT c, d FROM t;
+}
+expect {
+    cd|-7
+}
+
+test select-star-rowid-alias-splits-run {
+    CREATE TABLE r(id INTEGER PRIMARY KEY, p TEXT, q TEXT, s INTEGER);
+    INSERT INTO r VALUES (1, 'p1', 'q1', 100);
+    INSERT INTO r VALUES (5, 'p5', 'q5', 500);
+    SELECT * FROM r;
+}
+expect {
+    1|p1|q1|100
+    5|p5|q5|500
+}
+
+test select-rowid-alias-in-middle {
+    CREATE TABLE r(p TEXT, id INTEGER PRIMARY KEY, q TEXT, s TEXT);
+    INSERT INTO r VALUES ('p1', 1, 'q1', 's1');
+    INSERT INTO r VALUES ('p2', 2, 'q2', 's2');
+    SELECT * FROM r;
+}
+expect {
+    p1|1|q1|s1
+    p2|2|q2|s2
+}
+
+test select-star-order-by-sorter {
+    CREATE TABLE t(a INTEGER, b TEXT, c TEXT, d INTEGER);
+    INSERT INTO t VALUES (3, 'b3', 'c3', 30);
+    INSERT INTO t VALUES (1, 'b1', 'c1', 10);
+    INSERT INTO t VALUES (2, 'b2', 'c2', 20);
+    SELECT * FROM t ORDER BY b DESC;
+}
+expect {
+    3|b3|c3|30
+    2|b2|c2|20
+    1|b1|c1|10
+}
+
+test select-order-by-non-selected-column {
+    CREATE TABLE t(a INTEGER, b TEXT, c TEXT, d INTEGER);
+    INSERT INTO t VALUES (3, 'b3', 'c3', 30);
+    INSERT INTO t VALUES (1, 'b1', 'c1', 10);
+    INSERT INTO t VALUES (2, 'b2', 'c2', 20);
+    SELECT b, c, a FROM t ORDER BY d DESC;
+}
+expect {
+    b3|c3|3
+    b2|c2|2
+    b1|c1|1
+}
+
+test select-group-by-multi-column {
+    CREATE TABLE t(g TEXT, a INTEGER, b TEXT, c INTEGER);
+    INSERT INTO t VALUES ('x', 1, 'p', 10);
+    INSERT INTO t VALUES ('x', 2, 'q', 20);
+    INSERT INTO t VALUES ('y', 3, 'r', 30);
+    SELECT g, count(*), sum(a), sum(c) FROM t GROUP BY g ORDER BY g;
+}
+expect {
+    x|2|3|30
+    y|1|3|30
+}
+
+test select-left-join-null-row {
+    CREATE TABLE l(id INTEGER, v TEXT);
+    CREATE TABLE r(id INTEGER, p TEXT, q TEXT, s TEXT);
+    INSERT INTO l VALUES (1, 'l1');
+    INSERT INTO l VALUES (2, 'l2');
+    INSERT INTO r VALUES (1, 'p1', 'q1', 's1');
+    SELECT l.id, l.v, r.p, r.q, r.s FROM l LEFT JOIN r ON l.id = r.id ORDER BY l.id;
+}
+expect {
+    1|l1|p1|q1|s1
+    2|l2|||
+}
+
+test select-covering-index-run {
+    CREATE TABLE t(a INTEGER, b TEXT, c TEXT, d INTEGER);
+    CREATE INDEX idx ON t(b, c, d);
+    INSERT INTO t VALUES (1, 'b1', 'c1', 10);
+    INSERT INTO t VALUES (2, 'b2', 'c2', 20);
+    SELECT b, c, d FROM t WHERE b >= 'b1' ORDER BY b;
+}
+expect {
+    b1|c1|10
+    b2|c2|20
+}
+
+test select-star-empty-strings-and-zeroes {
+    CREATE TABLE t(a INTEGER, b TEXT, c INTEGER, d TEXT, e INTEGER);
+    INSERT INTO t VALUES (0, '', 1, '', 0);
+    INSERT INTO t VALUES (-1, 'x', 0, '', 9223372036854775807);
+    SELECT * FROM t;
+}
+expect {
+    0||1||0
+    -1|x|0||9223372036854775807
+}
+
+test returning-star-buffered-scan-back {
+    CREATE TABLE t(a INTEGER, b TEXT, c TEXT);
+    INSERT INTO t VALUES (1, 'b1', 'c1'), (2, 'b2', 'c2') RETURNING *;
+}
+expect {
+    1|b1|c1
+    2|b2|c2
+}
+
+test update-returning-star {
+    CREATE TABLE t(a INTEGER, b TEXT, c TEXT);
+    INSERT INTO t VALUES (1, 'b1', 'c1');
+    UPDATE t SET b = 'nb' WHERE a = 1 RETURNING a, b, c;
+}
+expect {
+    1|nb|c1
+}
+
+test select-star-compound-union-all {
+    CREATE TABLE t1(a INTEGER, b TEXT, c TEXT);
+    CREATE TABLE t2(a INTEGER, b TEXT, c TEXT);
+    INSERT INTO t1 VALUES (1, 'x1', 'y1');
+    INSERT INTO t2 VALUES (2, 'x2', 'y2');
+    SELECT * FROM t1 UNION ALL SELECT * FROM t2 ORDER BY a;
+}
+expect {
+    1|x1|y1
+    2|x2|y2
+}
+
+test select-star-overflow-record {
+    CREATE TABLE t(a INTEGER, b TEXT, c TEXT, d INTEGER);
+    INSERT INTO t VALUES (1, printf('%08000d', 7), 'tail', 99);
+    SELECT a, length(b), c, d FROM t;
+}
+expect {
+    1|8000|tail|99
+}

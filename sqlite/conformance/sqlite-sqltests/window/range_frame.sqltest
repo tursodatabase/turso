@@ -1,0 +1,489 @@
+@database :memory:
+
+setup base {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, v INTEGER, g INTEGER);
+    INSERT INTO t VALUES (1,10,1),(2,20,1),(3,30,2),(4,40,2),(5,50,2);
+}
+
+# Offset-free RANGE boundaries expand CURRENT ROW to the current peer group.
+@setup base
+test range-unbounded-preceding-to-current-row {
+    SELECT id, g,
+           sum(v) OVER w,
+           count(*) OVER w,
+           last_value(v) OVER w,
+           first_value(v) OVER w,
+           nth_value(v, 2) OVER w
+    FROM t
+    WINDOW w AS (ORDER BY g RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW);
+}
+expect {
+    1|1|30|2|20|10|20
+    2|1|30|2|20|10|20
+    3|2|150|5|50|10|20
+    4|2|150|5|50|10|20
+    5|2|150|5|50|10|20
+}
+
+@setup base
+test range-unbounded-preceding-to-unbounded-following {
+    SELECT id, g, sum(v) OVER w, count(*) OVER w
+    FROM t
+    WINDOW w AS (ORDER BY g RANGE BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING);
+}
+expect {
+    1|1|150|5
+    2|1|150|5
+    3|2|150|5
+    4|2|150|5
+    5|2|150|5
+}
+
+@setup base
+test range-current-row-to-current-row {
+    SELECT id, g,
+           sum(v) OVER w,
+           count(*) OVER w,
+           last_value(v) OVER w,
+           first_value(v) OVER w,
+           nth_value(v, 2) OVER w
+    FROM t
+    WINDOW w AS (ORDER BY g RANGE BETWEEN CURRENT ROW AND CURRENT ROW);
+}
+expect {
+    1|1|30|2|20|10|20
+    2|1|30|2|20|10|20
+    3|2|120|3|50|30|40
+    4|2|120|3|50|30|40
+    5|2|120|3|50|30|40
+}
+
+@setup base
+test range-current-row-to-unbounded-following {
+    SELECT id, g,
+           sum(v) OVER w,
+           count(*) OVER w,
+           last_value(v) OVER w,
+           first_value(v) OVER w,
+           nth_value(v, 2) OVER w
+    FROM t
+    WINDOW w AS (ORDER BY g RANGE BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING);
+}
+expect {
+    1|1|150|5|50|10|20
+    2|1|150|5|50|10|20
+    3|2|120|3|50|30|40
+    4|2|120|3|50|30|40
+    5|2|120|3|50|30|40
+}
+
+# Peer identity follows the complete ORDER BY key for offset-free RANGE.
+@setup base
+test range-current-row-multi-column-order-by {
+    SELECT id, g, sum(v) OVER
+        (ORDER BY g, id RANGE BETWEEN CURRENT ROW AND CURRENT ROW)
+    FROM t;
+}
+expect {
+    1|1|10
+    2|1|20
+    3|2|30
+    4|2|40
+    5|2|50
+}
+
+# DESC changes peer-group order, not peer membership.
+@setup base
+test range-desc-current-row-to-unbounded-following {
+    SELECT id, g, sum(v) OVER
+        (ORDER BY g DESC RANGE BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING)
+    FROM t;
+}
+expect {
+    3|2|150
+    4|2|150
+    5|2|150
+    1|1|30
+    2|1|30
+}
+
+# Without ORDER BY the entire partition is one peer group.
+@setup base
+test range-no-order-by-current-row {
+    SELECT id, sum(v) OVER
+        (RANGE BETWEEN CURRENT ROW AND CURRENT ROW)
+    FROM t;
+}
+expect {
+    1|150
+    2|150
+    3|150
+    4|150
+    5|150
+}
+
+setup partitioned {
+    CREATE TABLE tp(p INTEGER, id INTEGER, peer INTEGER, v INTEGER);
+    INSERT INTO tp VALUES
+        (1,1,1,10),(1,2,1,20),(1,3,2,30),
+        (2,1,1,100),(2,2,2,200),(2,3,2,300);
+}
+
+@setup partitioned
+test range-peer-state-resets-per-partition {
+    SELECT p, id, sum(v) OVER
+        (PARTITION BY p ORDER BY peer RANGE BETWEEN CURRENT ROW AND CURRENT ROW)
+    FROM tp;
+}
+expect {
+    1|1|30
+    1|2|30
+    1|3|30
+    2|1|100
+    2|2|500
+    2|3|500
+}
+
+# Symmetric value window: include every row within ±5 of the current
+# row's ORDER BY value.
+@setup base
+test range-symmetric-offset {
+    SELECT id, v, sum(v) OVER (ORDER BY v RANGE BETWEEN 5 PRECEDING AND 5 FOLLOWING) FROM t;
+}
+expect {
+    1|10|10
+    2|20|20
+    3|30|30
+    4|40|40
+    5|50|50
+}
+
+# Trailing range: include every row whose ORDER BY value is within 10
+# behind the current row.
+@setup base
+test range-trailing-offset {
+    SELECT id, v, sum(v) OVER (ORDER BY v RANGE 10 PRECEDING) FROM t;
+}
+expect {
+    1|10|10
+    2|20|30
+    3|30|50
+    4|40|70
+    5|50|90
+}
+
+# DESC ordering: arithmetic and comparison still hold.
+@setup base
+test range-desc-symmetric-offset {
+    SELECT id, v, sum(v) OVER (ORDER BY v DESC RANGE BETWEEN 5 PRECEDING AND 5 FOLLOWING) FROM t;
+}
+expect {
+    5|50|50
+    4|40|40
+    3|30|30
+    2|20|20
+    1|10|10
+}
+
+# Pattern B: the frame end trails the current ORDER BY value.
+@setup base
+test range-unbounded-preceding-to-10-preceding {
+    SELECT id, v, sum(v) OVER w, count(*) OVER w
+    FROM t
+    WINDOW w AS (ORDER BY v RANGE BETWEEN UNBOUNDED PRECEDING AND 10 PRECEDING);
+}
+expect {
+    1|10||0
+    2|20|10|1
+    3|30|30|2
+    4|40|60|3
+    5|50|100|4
+}
+
+@setup base
+test range-10-preceding-to-10-preceding {
+    SELECT id, v, sum(v) OVER w, count(*) OVER w
+    FROM t
+    WINDOW w AS (ORDER BY v RANGE BETWEEN 10 PRECEDING AND 10 PRECEDING);
+}
+expect {
+    1|10||0
+    2|20|10|1
+    3|30|20|1
+    4|40|30|1
+    5|50|40|1
+}
+
+@setup base
+test range-20-preceding-to-10-preceding {
+    SELECT id, v, sum(v) OVER w, count(*) OVER w
+    FROM t
+    WINDOW w AS (ORDER BY v RANGE BETWEEN 20 PRECEDING AND 10 PRECEDING);
+}
+expect {
+    1|10||0
+    2|20|10|1
+    3|30|30|2
+    4|40|50|2
+    5|50|70|2
+}
+
+# Pattern C with a moving start and bounded or unbounded end.
+@setup base
+test range-10-preceding-to-10-following {
+    SELECT id, v, sum(v) OVER w, count(*) OVER w
+    FROM t
+    WINDOW w AS (ORDER BY v RANGE BETWEEN 10 PRECEDING AND 10 FOLLOWING);
+}
+expect {
+    1|10|30|2
+    2|20|60|3
+    3|30|90|3
+    4|40|120|3
+    5|50|90|2
+}
+
+@setup base
+test range-10-preceding-to-unbounded-following {
+    SELECT id, v, sum(v) OVER w, count(*) OVER w
+    FROM t
+    WINDOW w AS (ORDER BY v RANGE BETWEEN 10 PRECEDING AND UNBOUNDED FOLLOWING);
+}
+expect {
+    1|10|150|5
+    2|20|150|5
+    3|30|140|4
+    4|40|120|3
+    5|50|90|2
+}
+
+@setup base
+test range-current-row-to-10-following {
+    SELECT id, v, sum(v) OVER w, count(*) OVER w
+    FROM t
+    WINDOW w AS (ORDER BY v RANGE BETWEEN CURRENT ROW AND 10 FOLLOWING);
+}
+expect {
+    1|10|30|2
+    2|20|50|2
+    3|30|70|2
+    4|40|90|2
+    5|50|50|1
+}
+
+# Pattern A: both value boundaries follow the current row.
+@setup base
+test range-10-following-to-20-following {
+    SELECT id, v,
+           sum(v) OVER w,
+           count(*) OVER w,
+           last_value(v) OVER w,
+           first_value(v) OVER w,
+           nth_value(v, 2) OVER w
+    FROM t
+    WINDOW w AS (ORDER BY v RANGE BETWEEN 10 FOLLOWING AND 20 FOLLOWING);
+}
+expect {
+    1|10|50|2|30|20|30
+    2|20|70|2|40|30|40
+    3|30|90|2|50|40|50
+    4|40|50|1|50|50|
+    5|50||0|||
+}
+
+@setup base
+test range-20-following-to-10-following-is-empty {
+    SELECT id, v, sum(v) OVER w, count(*) OVER w
+    FROM t
+    WINDOW w AS (ORDER BY v RANGE BETWEEN 20 FOLLOWING AND 10 FOLLOWING);
+}
+expect {
+    1|10||0
+    2|20||0
+    3|30||0
+    4|40||0
+    5|50||0
+}
+
+@setup base
+test range-10-following-to-unbounded-following {
+    SELECT id, v, sum(v) OVER w, count(*) OVER w
+    FROM t
+    WINDOW w AS (ORDER BY v RANGE BETWEEN 10 FOLLOWING AND UNBOUNDED FOLLOWING);
+}
+expect {
+    1|10|140|4
+    2|20|120|3
+    3|30|90|2
+    4|40|50|1
+    5|50||0
+}
+
+# Offsets are value distances, while equal ORDER BY values remain peers.
+setup peers {
+    CREATE TABLE p(id INTEGER PRIMARY KEY, k REAL, v INTEGER);
+    INSERT INTO p VALUES
+        (1,1,10),(2,1,20),(3,2,30),(4,2,40),(5,4,50);
+}
+
+@setup peers
+test range-offset-peer-groups {
+    SELECT id, k, sum(v) OVER
+        (ORDER BY k RANGE BETWEEN 0.5 PRECEDING AND 0.5 FOLLOWING)
+    FROM p;
+}
+expect {
+    1|1.0|30
+    2|1.0|30
+    3|2.0|70
+    4|2.0|70
+    5|4.0|50
+}
+expect @js {
+    1|1|30
+    2|1|30
+    3|2|70
+    4|2|70
+    5|4|50
+}
+
+setup mixed_keys {
+    CREATE TABLE m(id INTEGER PRIMARY KEY, k, v INTEGER);
+    INSERT INTO m VALUES
+        (1,NULL,10),(2,NULL,20),(3,0,30),(4,10,40),
+        (5,'a',50),(6,'A',60),(7,'b',70);
+}
+
+# NULL and nonnumeric keys use peer equality instead of arithmetic.
+@setup mixed_keys
+test range-offset-nonnumeric-keys-and-collation {
+    SELECT id, typeof(k), sum(v) OVER
+        (ORDER BY k COLLATE NOCASE RANGE BETWEEN 5 PRECEDING AND 5 FOLLOWING)
+    FROM m;
+}
+expect {
+    1|null|30
+    2|null|30
+    3|integer|30
+    4|integer|40
+    5|text|110
+    6|text|110
+    7|text|70
+}
+
+@setup mixed_keys
+test range-offset-asc-nulls-last {
+    SELECT id, sum(v) OVER
+        (ORDER BY k ASC NULLS LAST RANGE BETWEEN 5 PRECEDING AND 5 FOLLOWING)
+    FROM m;
+}
+expect {
+    3|30
+    4|40
+    6|60
+    5|50
+    7|70
+    1|30
+    2|30
+}
+
+@setup mixed_keys
+test range-offset-desc-nulls-first {
+    SELECT id, sum(v) OVER
+        (ORDER BY k COLLATE NOCASE DESC NULLS FIRST
+         RANGE BETWEEN 5 PRECEDING AND 5 FOLLOWING)
+    FROM m;
+}
+expect {
+    1|30
+    2|30
+    7|70
+    5|110
+    6|110
+    4|40
+    3|30
+}
+
+# RANGE offsets accept any non-negative numeric value, including numeric text.
+@setup base
+test range-real-and-numeric-text-offsets {
+    SELECT id,
+           sum(v) OVER (ORDER BY v RANGE 10.5 PRECEDING),
+           sum(v) OVER (ORDER BY v RANGE '10.5' PRECEDING)
+    FROM t;
+}
+expect {
+    1|10|10
+    2|30|30
+    3|50|50
+    4|70|70
+    5|90|90
+}
+
+setup range_partitions {
+    CREATE TABLE rp(p INTEGER, id INTEGER, k INTEGER, v INTEGER);
+    INSERT INTO rp VALUES
+        (1,1,0,10),(1,2,10,20),(1,3,20,30),
+        (2,1,0,100),(2,2,20,200),(2,3,30,300);
+}
+
+@setup range_partitions
+test range-offset-state-resets-per-partition {
+    SELECT p, id, sum(v) OVER
+        (PARTITION BY p ORDER BY k RANGE BETWEEN 10 PRECEDING AND 10 FOLLOWING)
+    FROM rp;
+}
+expect {
+    1|1|30
+    1|2|60
+    1|3|50
+    2|1|100
+    2|2|500
+    2|3|500
+}
+
+# Invalid offsets use SQLite's frame-specific runtime error.
+@setup base
+test range-negative-start-offset {
+    SELECT sum(v) OVER (ORDER BY v RANGE BETWEEN -1 PRECEDING AND CURRENT ROW) FROM t;
+}
+expect error {
+}
+
+@setup base
+test range-null-end-offset {
+    SELECT sum(v) OVER (ORDER BY v RANGE BETWEEN CURRENT ROW AND NULL FOLLOWING) FROM t;
+}
+expect error {
+}
+
+@setup base
+test range-text-start-offset {
+    SELECT sum(v) OVER (ORDER BY v RANGE BETWEEN 'nope' PRECEDING AND CURRENT ROW) FROM t;
+}
+expect error {
+}
+
+@setup base
+test range-blob-end-offset {
+    SELECT sum(v) OVER (ORDER BY v RANGE BETWEEN CURRENT ROW AND X'01' FOLLOWING) FROM t;
+}
+expect error {
+}
+
+# RANGE with an offset bound requires exactly one ORDER BY column
+# (SQLite, window.c:680-684).
+
+@setup base
+test range-offset-rejects-multi-order-by {
+    SELECT sum(v) OVER (ORDER BY g, v RANGE BETWEEN 5 PRECEDING AND CURRENT ROW) FROM t;
+}
+expect error {
+}
+
+@setup base
+test range-offset-rejects-zero-order-by {
+    SELECT sum(v) OVER (RANGE BETWEEN 5 PRECEDING AND CURRENT ROW) FROM t;
+}
+expect error {
+}

@@ -1,0 +1,24 @@
+@database :temp:
+@skip-file-if sqlite "run heavy test only on tursodb"
+@skip-file-if mvcc "MVCC variant lives in big-mvcc.sqltest"
+
+# Regression coverage for https://github.com/tursodatabase/turso/issues/5665:
+# a large WAL transaction used to drive a single coalesced pwritev call past
+# INT_MAX, which Darwin rejects with EINVAL. UnixIO::pwritev now caps each
+# syscall at INT_MAX bytes, so the checkpoint completes.
+#
+# 1.5M rows of 1500-byte blobs is just past INT_MAX (2.147 GB), enough to
+# force the cap to kick in.
+
+@backend cli
+test big-db {
+    DROP TABLE IF EXISTS t;
+    CREATE TABLE t (x);
+    INSERT INTO t SELECT randomblob(1500) FROM generate_series(1, 1500000);
+    PRAGMA wal_checkpoint(TRUNCATE);
+    SELECT COUNT(*) FROM t;
+}
+expect {
+   0|0|0
+   1500000
+}

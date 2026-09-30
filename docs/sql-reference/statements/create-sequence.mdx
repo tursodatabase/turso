@@ -1,0 +1,300 @@
+---
+title: CREATE SEQUENCE
+description: Define a named sequence generator for producing auto-incrementing numeric values
+sidebarTitle: CREATE SEQUENCE
+---
+
+# CREATE SEQUENCE
+
+<Info>
+**Turso Extension**: CREATE SEQUENCE is a Turso-specific statement not available in standard SQLite.
+</Info>
+
+The CREATE SEQUENCE statement defines a named sequence object that generates a series of numeric values. Sequences are independent of any table and can be used across multiple tables and queries via the `nextval()`, `currval()`, and `setval()` functions.
+
+## Syntax
+
+```sql
+CREATE SEQUENCE [IF NOT EXISTS] [schema-name.]sequence-name
+    [START [WITH] value]
+    [INCREMENT [BY] value]
+    [MINVALUE value]
+    [MAXVALUE value]
+    [CYCLE | NO CYCLE];
+```
+
+## Description
+
+A sequence generates a series of integer values according to its configuration. Each call to `nextval()` produces the next value in the series. Sequences are persisted in the database schema and survive restarts.
+
+Unlike `AUTOINCREMENT` on an `INTEGER PRIMARY KEY`, sequences are standalone objects. A single sequence can supply values to multiple tables, or multiple sequences can feed into different columns of the same table.
+
+### Parameters
+
+| Parameter | Description | Default |
+|-----------|-------------|---------|
+| `IF NOT EXISTS` | Prevents an error if a sequence with the same name already exists. The statement is a no-op when the sequence is present. | |
+| `schema-name` | The name of an attached database. Defaults to the main database if omitted. | |
+| `sequence-name` | The name of the sequence to create. | |
+| `START [WITH]` | The first value returned by `nextval()`. | `MINVALUE` for ascending sequences, `MAXVALUE` for descending sequences. |
+| `INCREMENT [BY]` | The step between consecutive values. Use a negative value for descending sequences. | `1` |
+| `MINVALUE` | The lower bound of the sequence. | `1` for ascending sequences, minimum 64-bit integer for descending sequences. |
+| `MAXVALUE` | The upper bound of the sequence. | Maximum 64-bit integer for ascending sequences, `-1` for descending sequences. |
+| `CYCLE` | When the sequence reaches its boundary, wrap around to the opposite end instead of raising an error. | `NO CYCLE` |
+
+### Validation
+
+The following rules are enforced at creation time:
+
+- `INCREMENT BY` must not be zero.
+- `MINVALUE` must be less than `MAXVALUE`.
+- For ascending sequences (`INCREMENT > 0`): `START` must be greater than or equal to `MINVALUE`.
+- For descending sequences (`INCREMENT < 0`): `START` must be less than or equal to `MAXVALUE`.
+
+## Sequence Functions
+
+### nextval()
+
+Returns the next value from the sequence and advances it.
+
+```sql
+SELECT nextval('counter');
+-- 1
+SELECT nextval('counter');
+-- 2
+```
+
+On the first call, `nextval()` returns the `START` value. Each subsequent call increments by `INCREMENT BY`.
+
+Sequence persistence under WAL mode is transactional: the sequence backing-table update is committed or rolled back with the transaction that called `nextval()`. Under MVCC mode (`journal_mode=experimental_mvcc`) inside `BEGIN CONCURRENT`, the backing-table write is autonomous and survives an outer `ROLLBACK` (postgres-like). For BEGIN / BEGIN IMMEDIATE / autocommit, the inner write is bundled with the outer and rolls back with it (SQLite-like).
+
+Turso does not guarantee gap-free sequences, and it also does not guarantee PostgreSQL-style permanent burning of values from rolled-back transactions in WAL mode or under an exclusive (BEGIN IMMEDIATE / BEGIN DEFERRED) MVCC outer.
+
+If a transaction calls `nextval()` and rolls back, that value may be generated again later if no committed transaction used that value or a later value. If another concurrent transaction commits after allocating a later value, the rolled-back value can remain a gap. The guarantee is that persisted sequence state remains consistent with committed database state.
+
+### currval()
+
+Returns the last value returned by `nextval()` in the current connection. Raises an error if `nextval()` has not been called on this sequence in the current session.
+
+```sql
+CREATE SEQUENCE my_seq;
+SELECT nextval('my_seq');
+-- 1
+SELECT nextval('my_seq');
+-- 2
+SELECT currval('my_seq');
+-- 2
+```
+
+### setval()
+
+Sets the sequence to an explicit value.
+
+```sql
+setval(sequence_name, value)
+setval(sequence_name, value, is_called)
+```
+
+| Parameter | Description |
+|-----------|-------------|
+| `sequence_name` | The name of the sequence. |
+| `value` | The value to set. Must be within the sequence's `MINVALUE`..`MAXVALUE` range. |
+| `is_called` | When `true` (the default), the next `nextval()` will return `value + increment`. When `false`, the next `nextval()` will return `value` itself. |
+
+```sql
+CREATE SEQUENCE my_seq;
+SELECT setval('my_seq', 100);
+-- 100
+SELECT nextval('my_seq');
+-- 101
+
+SELECT setval('my_seq', 200, false);
+-- 200
+SELECT nextval('my_seq');
+-- 200 (returns the set value since is_called was false)
+SELECT nextval('my_seq');
+-- 201
+```
+
+## Examples
+
+### Basic Sequence
+
+```sql
+CREATE SEQUENCE counter;
+SELECT nextval('counter');
+-- 1
+SELECT nextval('counter');
+-- 2
+SELECT nextval('counter');
+-- 3
+```
+
+### Custom Start and Increment
+
+```sql
+CREATE SEQUENCE order_seq START WITH 1000 INCREMENT BY 10;
+SELECT nextval('order_seq');
+-- 1000
+SELECT nextval('order_seq');
+-- 1010
+SELECT nextval('order_seq');
+-- 1020
+```
+
+### Descending Sequence
+
+```sql
+CREATE SEQUENCE countdown START WITH 10 INCREMENT BY -1 MINVALUE 1 MAXVALUE 10;
+SELECT nextval('countdown');
+-- 10
+SELECT nextval('countdown');
+-- 9
+SELECT nextval('countdown');
+-- 8
+```
+
+### Cycling Sequence
+
+When the sequence reaches its boundary, it wraps around:
+
+```sql
+CREATE SEQUENCE color_cycle MINVALUE 1 MAXVALUE 3 CYCLE;
+SELECT nextval('color_cycle');
+-- 1
+SELECT nextval('color_cycle');
+-- 2
+SELECT nextval('color_cycle');
+-- 3
+SELECT nextval('color_cycle');
+-- 1 (wraps around)
+SELECT nextval('color_cycle');
+-- 2
+```
+
+Without `CYCLE`, exceeding the boundary raises an error:
+
+```sql
+CREATE SEQUENCE bounded MINVALUE 1 MAXVALUE 3;
+SELECT nextval('bounded');
+-- 1
+SELECT nextval('bounded');
+-- 2
+SELECT nextval('bounded');
+-- 3
+SELECT nextval('bounded');
+-- Error: nextval: reached maximum value of sequence "bounded"
+```
+
+### Sequence as Column Default
+
+A sequence can supply default values for a table column:
+
+```sql
+CREATE SEQUENCE invoice_seq START WITH 1000;
+
+CREATE TABLE invoices (
+    id INTEGER PRIMARY KEY,
+    invoice_number INTEGER DEFAULT (nextval('invoice_seq')),
+    description TEXT
+);
+
+INSERT INTO invoices (description) VALUES ('First order');
+INSERT INTO invoices (description) VALUES ('Second order');
+INSERT INTO invoices (description) VALUES ('Third order');
+
+SELECT * FROM invoices;
+-- 1|1000|First order
+-- 2|1001|Second order
+-- 3|1002|Third order
+```
+
+### IF NOT EXISTS
+
+```sql
+-- Safe to run multiple times
+CREATE SEQUENCE IF NOT EXISTS my_seq;
+CREATE SEQUENCE IF NOT EXISTS my_seq;
+SELECT nextval('my_seq');
+-- 1
+```
+
+## Concurrency
+
+`nextval()` and `setval()` persist sequence state to a backing table.
+
+In **WAL mode** (the default), the backing-table write rides on the caller's
+write transaction. Only one connection can hold the write lock at a time; if
+another connection is already writing, `SELECT nextval(...)` will return
+`SQLITE_BUSY` ("Database is busy"). This is different from `AUTOINCREMENT`,
+which uses a process-local allocator and writes the committed watermark with
+the table insert.
+
+In **MVCC mode** (`journal_mode=experimental_mvcc`), `nextval()` inside a
+`BEGIN CONCURRENT` outer wraps the backing-table write in an autonomous inner
+transaction that commits immediately and independently of the outer's eventual
+commit or rollback. This lets multiple concurrent `BEGIN CONCURRENT` callers
+each get a fresh value (serialized by the standard MVCC PK conflict + bounded
+retry on the backing table), and matches PostgreSQL's "burnt value" semantics
+for this case. For autocommit, `BEGIN`, `BEGIN IMMEDIATE`, and `BEGIN DEFERRED`,
+the outer holds the exclusive lock and the inner write runs inline — under
+those modes a `ROLLBACK` un-burns the value (SQLite-like).
+
+In rollback cases, generated values are not guaranteed to be reused and are
+not guaranteed to remain gaps. Reuse depends on the outer transaction mode
+and on whether another committed transaction advanced the durable watermark
+past that value.
+
+If your workload calls `nextval()` from many concurrent connections in WAL
+mode, consider using `AUTOINCREMENT` instead, or serializing sequence access
+at the application level.
+
+## Recovering the current value
+
+The "current value" reachable from a fresh connection depends on mode:
+
+* **WAL mode**: read `seq` from `sqlite_sequence` (for AUTOINCREMENT tables)
+  or query the sequence backing table directly:
+
+  ```sql
+  SELECT MAX(value) FROM "__turso_internal_seq_<sequence_name>";
+  ```
+
+  Both are kept in sync at commit time.
+
+* **MVCC mode**: `sqlite_sequence` is updated **only at checkpoint time** —
+  between checkpoints it may lag the actual high-water mark or be empty for a
+  freshly-created AUTOINCREMENT table. Do **not** rely on `sqlite_sequence`
+  to recover the live value in MVCC mode. Instead, query the internal
+  sequence backing table directly:
+
+  ```sql
+  SELECT MAX(value) FROM "__turso_internal_seq_<sequence_name>";
+  ```
+
+  For AUTOINCREMENT, the sequence name is `__turso_internal_autoincrement_<table>`,
+  so the backing-table query becomes:
+
+  ```sql
+  SELECT MAX(value) FROM "__turso_internal_seq___turso_internal_autoincrement_<table>";
+  ```
+
+  After `PRAGMA wal_checkpoint(TRUNCATE)`, the backing table is coalesced to
+  a single row and `sqlite_sequence` is also brought up to date with exactly
+  one row per AUTOINCREMENT table — at that point both are safe to read with
+  normal SQLite-compatible queries.
+
+## Errors
+
+| Error | Cause |
+|-------|-------|
+| `sequence "name" already exists` | A sequence with that name already exists and `IF NOT EXISTS` was not specified. |
+| `INCREMENT must not be zero` | `INCREMENT BY 0` was specified. |
+| `MINVALUE (x) must be less than MAXVALUE (y)` | `MINVALUE` is greater than or equal to `MAXVALUE`. |
+| `START value (x) cannot be less than MINVALUE (y)` | For ascending sequences, `START` is below `MINVALUE`. |
+| `START value (x) cannot be greater than MAXVALUE (y)` | For descending sequences, `START` is above `MAXVALUE`. |
+
+## See Also
+
+- [DROP SEQUENCE](/docs/sql-reference/statements/drop-sequence) for removing sequences
+- [CREATE TABLE](/docs/sql-reference/statements/create-table) for `AUTOINCREMENT` on `INTEGER PRIMARY KEY` columns

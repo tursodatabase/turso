@@ -1,0 +1,696 @@
+# Multi-index OR with compound AND disjuncts
+# Tests the case where each OR branch is itself an AND of multiple conditions,
+# e.g. (a = ? AND b = x.id AND c = ?) OR (d = ? AND e = x.id AND f = ?)
+# The optimizer should reuse normal compound-seek analysis per branch, using as
+# much of each branch as the chosen index can support and leaving only the
+# leftover conjuncts as residual filters.
+
+@database :memory:
+
+setup graph_schema {
+    CREATE TABLE item (
+        id VARCHAR(36) PRIMARY KEY NOT NULL,
+        label VARCHAR NOT NULL DEFAULT '',
+        type VARCHAR DEFAULT 'item'
+    );
+    CREATE TABLE link (
+        id VARCHAR(36) PRIMARY KEY NOT NULL,
+        src VARCHAR(36) NOT NULL DEFAULT '',
+        dst VARCHAR(36) NOT NULL DEFAULT '',
+        label VARCHAR NOT NULL DEFAULT ''
+    );
+    CREATE INDEX idx_link_label ON link(label);
+    CREATE INDEX idx_link_src ON link(src);
+    CREATE INDEX idx_link_dst ON link(dst);
+
+    INSERT INTO item VALUES ('n1', 'Alice', 'entity');
+    INSERT INTO item VALUES ('n2', 'Bob', 'entity');
+    INSERT INTO item VALUES ('n3', 'Carol', 'entity');
+    INSERT INTO item VALUES ('n4', 'Dave', 'other');
+
+    -- links: n1 --knows--> n2, n2 --knows--> n3, n1 --likes--> n3, n4 --knows--> n1
+    INSERT INTO link VALUES ('e1', 'n1', 'n2', 'knows');
+    INSERT INTO link VALUES ('e2', 'n2', 'n3', 'knows');
+    INSERT INTO link VALUES ('e3', 'n1', 'n3', 'likes');
+    INSERT INTO link VALUES ('e4', 'n4', 'n1', 'knows');
+}
+
+setup benchmark_shape_schema {
+    CREATE TABLE node (
+        id VARCHAR(36) PRIMARY KEY NOT NULL,
+        type VARCHAR NOT NULL DEFAULT 'node'
+    );
+    CREATE TABLE edge (
+        id VARCHAR(36) PRIMARY KEY NOT NULL,
+        fromId VARCHAR(36) NOT NULL DEFAULT '',
+        toId VARCHAR(36) NOT NULL DEFAULT '',
+        label VARCHAR NOT NULL DEFAULT ''
+    );
+    CREATE INDEX idx_edge_label ON edge(label);
+    CREATE INDEX idx_edge_fromId ON edge(fromId);
+    CREATE INDEX idx_edge_toId ON edge(toId);
+
+    INSERT INTO node VALUES ('n1', 'entity');
+    INSERT INTO node VALUES ('n2', 'entity');
+    INSERT INTO node VALUES ('n3', 'entity');
+    INSERT INTO node VALUES ('n4', 'other');
+
+    INSERT INTO edge VALUES ('e1', 'n1', 'n2', 'knows');
+    INSERT INTO edge VALUES ('e2', 'n2', 'n3', 'knows');
+    INSERT INTO edge VALUES ('e3', 'n1', 'n3', 'likes');
+    INSERT INTO edge VALUES ('e4', 'n4', 'n1', 'knows');
+}
+
+setup correlated_subquery_schema {
+    CREATE TABLE t(a INT, b INT);
+    CREATE TABLE u(x INT);
+    CREATE INDEX idx_t_a ON t(a);
+
+    INSERT INTO t VALUES (1, 10), (1, 20), (2, 10), (3, 30);
+    INSERT INTO u VALUES (10);
+}
+
+setup rowid_branch_schema {
+    CREATE TABLE t(a INT, b INT);
+    CREATE INDEX idx_t_a ON t(a);
+
+    INSERT INTO t VALUES (10, 100), (20, 200), (20, 300);
+}
+
+setup compound_branch_seek_schema {
+    CREATE TABLE link(src INT, dst INT);
+    CREATE TABLE item(id INT, kind INT, name TEXT);
+    CREATE INDEX idx_item_id_kind ON item(id, kind);
+
+    INSERT INTO link VALUES (1, 2), (3, 1), (1, 4), (5, 6);
+    INSERT INTO item VALUES (2, 7, 'a');
+    INSERT INTO item VALUES (2, 8, 'b');
+    INSERT INTO item VALUES (3, 7, 'c');
+    INSERT INTO item VALUES (4, 7, 'd');
+    INSERT INTO item VALUES (6, 7, 'e');
+}
+
+setup or_join_rows {
+    CREATE TABLE or_left(id INTEGER PRIMARY KEY, x INTEGER, flag INTEGER);
+    CREATE INDEX or_left_x ON or_left(x);
+    INSERT INTO or_left VALUES
+        (1, 1, 1), (2, 1, 0), (3, 2, 1), (4, 2, 0), (5, NULL, 1), (6, 3, 1);
+
+    CREATE TABLE or_right(id INTEGER PRIMARY KEY, left_id INTEGER, y INTEGER);
+    CREATE INDEX or_right_y ON or_right(y);
+    INSERT INTO or_right VALUES
+        (1, 1, 2), (2, 1, 1), (3, 2, 2), (4, 3, 1),
+        (5, 3, 2), (6, 4, 1), (7, 5, NULL), (8, 999, 1);
+}
+
+setup implied_or_plan_schema {
+    CREATE TABLE a(x INTEGER, z INTEGER);
+    CREATE INDEX ax ON a(x);
+    CREATE TABLE b(y INTEGER);
+}
+
+# Basic: find entities connected to a specific node via 'knows' edges (bidirectional)
+@setup graph_schema
+test compound-or-basic {
+    SELECT DISTINCT i.id
+    FROM item i
+    JOIN link l
+      ON (
+        (l.src = 'n1' AND l.dst = i.id AND l.label = 'knows')
+        OR
+        (l.dst = 'n1' AND l.src = i.id AND l.label = 'knows')
+      )
+    WHERE i.type = 'entity'
+    ORDER BY i.id;
+}
+expect {
+    n2
+}
+
+# Bidirectional: n2 connects to n1 (via e1 dst) and n3 (via e2 src)
+@setup graph_schema
+test compound-or-node2 {
+    SELECT DISTINCT i.id
+    FROM item i
+    JOIN link l
+      ON (
+        (l.src = 'n2' AND l.dst = i.id AND l.label = 'knows')
+        OR
+        (l.dst = 'n2' AND l.src = i.id AND l.label = 'knows')
+      )
+    WHERE i.type = 'entity'
+    ORDER BY i.id;
+}
+expect {
+    n1
+    n3
+}
+
+# Include non-entity filter: n4 is 'other' type, should be excluded
+@setup graph_schema
+test compound-or-type-filter {
+    SELECT DISTINCT i.id
+    FROM item i
+    JOIN link l
+      ON (
+        (l.src = 'n1' AND l.dst = i.id AND l.label = 'knows')
+        OR
+        (l.dst = 'n1' AND l.src = i.id AND l.label = 'knows')
+      )
+    ORDER BY i.id;
+}
+expect {
+    n2
+    n4
+}
+
+# No matches: node n3 has no 'knows' edges where n3 is src or dst
+# (n3 is only a dst in e2 and e3, but e3 is 'likes' not 'knows')
+@setup graph_schema
+test compound-or-no-match {
+    SELECT DISTINCT i.id
+    FROM item i
+    JOIN link l
+      ON (
+        (l.src = 'n3' AND l.dst = i.id AND l.label = 'knows')
+        OR
+        (l.dst = 'n3' AND l.src = i.id AND l.label = 'knows')
+      )
+    WHERE i.type = 'entity'
+    ORDER BY i.id;
+}
+expect {
+    n2
+}
+
+# All entities with any 'knows' connection (no specific node filter)
+@setup graph_schema
+test compound-or-all-entities {
+    SELECT DISTINCT i.id
+    FROM item i
+    JOIN link l
+      ON (
+        (l.src = i.id AND l.label = 'knows')
+        OR
+        (l.dst = i.id AND l.label = 'knows')
+      )
+    WHERE i.type = 'entity'
+    ORDER BY i.id;
+}
+expect {
+    n1
+    n2
+    n3
+}
+
+# Benchmark shape: the join pattern from the larger kin database should use multi-index OR
+@setup benchmark_shape_schema
+test compound-or-benchmark-shape {
+    SELECT DISTINCT n.id
+    FROM node n
+    JOIN edge e
+      ON (
+        (e.fromId = 'n1' AND e.toId = n.id AND e.label = 'knows')
+        OR
+        (e.toId = 'n1' AND e.fromId = n.id AND e.label = 'knows')
+      )
+    WHERE n.type = 'entity'
+    ORDER BY n.id;
+}
+expect {
+    n2
+}
+
+# Correlated residual subqueries should still return correct results
+@setup correlated_subquery_schema
+test compound-or-correlated-subquery {
+    SELECT b FROM t
+    WHERE (a = 1 AND EXISTS(SELECT 1 FROM u WHERE u.x = t.b))
+       OR (a = 2 AND EXISTS(SELECT 1 FROM u WHERE u.x = t.b))
+    ORDER BY b, a;
+}
+expect {
+    10
+    10
+}
+
+# Rowid branches may participate in the same multi-index OR as indexed branches
+@setup rowid_branch_schema
+test compound-or-rowid-branch {
+    SELECT rowid, a FROM t
+    WHERE (rowid = 1 AND rowid > 0)
+       OR (a = 20 AND a > 0)
+    ORDER BY rowid;
+}
+expect {
+    1|10
+    2|20
+    3|20
+}
+
+# Compound OR branches should reuse full compound seek analysis, not just pick a
+# single indexed conjunct. With only (id, kind) indexed, each branch must seek
+# on both columns to be indexable.
+@setup compound_branch_seek_schema
+test compound-or-compound-branch-seek {
+    SELECT DISTINCT i.id
+    FROM item i
+    JOIN link l
+      ON (
+        (l.src = 1 AND i.id = l.dst AND i.kind = 7)
+        OR
+        (l.dst = 1 AND i.id = l.src AND i.kind = 7)
+      )
+    ORDER BY i.id;
+}
+expect {
+    2
+    3
+    4
+}
+
+# Residuals that reference both the scanned table and an outer table should still
+# use multi-index OR and position the scanned table cursor for evaluation.
+@setup graph_schema
+test compound-or-mixed-residual {
+    SELECT DISTINCT i.id
+    FROM item i
+    JOIN link l
+      ON (
+        (l.src = 'n1' AND l.dst = i.id AND ((i.type = 'entity' AND l.label = 'knows') OR l.id = 'e4'))
+        OR
+        (l.dst = 'n1' AND l.src = i.id AND ((i.type = 'entity' AND l.label = 'knows') OR l.id = 'e4'))
+      )
+    ORDER BY i.id;
+}
+expect {
+    n2
+    n4
+}
+
+# Snapshot EQP: verify multi-index OR is used
+@setup graph_schema
+snapshot-eqp compound-or-eqp {
+    SELECT DISTINCT i.id
+    FROM item i
+    JOIN link l
+      ON (
+        (l.src = 'n1' AND l.dst = i.id AND l.label = 'knows')
+        OR
+        (l.dst = 'n1' AND l.src = i.id AND l.label = 'knows')
+      )
+    WHERE i.type = 'entity';
+}
+
+# Snapshot EQP: variant without parameters in the seek position
+@setup graph_schema
+snapshot-eqp compound-or-cross-table-eqp {
+    SELECT DISTINCT i.id
+    FROM item i
+    JOIN link l
+      ON (
+        (l.src = i.id AND l.label = 'knows')
+        OR
+        (l.dst = i.id AND l.label = 'knows')
+      )
+    WHERE i.type = 'entity';
+}
+
+# Snapshot EQP: benchmark-shaped join should also use multi-index OR
+@setup benchmark_shape_schema
+snapshot-eqp compound-or-benchmark-shape-eqp {
+    SELECT DISTINCT n.id
+    FROM node n
+    JOIN edge e
+      ON (
+        (e.fromId = 'n1' AND e.toId = n.id AND e.label = 'knows')
+        OR
+        (e.toId = 'n1' AND e.fromId = n.id AND e.label = 'knows')
+      )
+    WHERE n.type = 'entity';
+}
+
+# ANALYZE must not make a temporary type index win when it leaves the full
+# join condition to run for every matching pair.
+@skip-if sqlite "query plan explanation output is different in sqlite"
+@setup benchmark_shape_schema
+test compound-or-analyzed-benchmark-shape-eqp {
+    ANALYZE;
+    DELETE FROM sqlite_stat1;
+    INSERT INTO sqlite_stat1(tbl, idx, stat) VALUES
+        ('node', 'sqlite_autoindex_node_1', '2286 1'),
+        ('edge', 'sqlite_autoindex_edge_1', '2787 1'),
+        ('edge', 'idx_edge_label', '2787 200'),
+        ('edge', 'idx_edge_fromId', '2787 3'),
+        ('edge', 'idx_edge_toId', '2787 2');
+    ANALYZE sqlite_schema;
+
+    EXPLAIN QUERY PLAN
+    SELECT DISTINCT n.id
+    FROM node n
+    JOIN edge e
+      ON (
+        (e.fromId = 'uuid' AND e.toId = n.id AND e.label = 'requires')
+        OR
+        (e.toId = 'uuid' AND e.fromId = n.id AND e.label = 'requires')
+      )
+    WHERE n.type = 'course';
+}
+expect {
+    1|0|0|SEARCH e USING INDEX idx_edge_label (label=?)
+    2|0|0|MULTI-INDEX OR n (sqlite_autoindex_node_1, sqlite_autoindex_node_1)
+    4|0|0|USE HASH TABLE FOR DISTINCT
+}
+
+@skip-if sqlite "Turso summarizes multi-index branches on one plan row"
+test compound-or-keeps-correlated-index-columns-together {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, x INTEGER, y INTEGER, payload TEXT);
+    CREATE INDEX txy ON t(x, y);
+
+    EXPLAIN QUERY PLAN
+    SELECT *
+    FROM t
+    WHERE (x = 1 AND y = 10) OR (x = 2 AND y = 20);
+}
+expect {
+    1|0|0|MULTI-INDEX OR t (txy, txy)
+}
+
+@skip-if sqlite "Turso reports its row estimates in JSON"
+test derived-or-filter-skips-correlated-columns {
+    CREATE TABLE correlated_values(x INTEGER, y INTEGER);
+    ANALYZE;
+    DELETE FROM sqlite_stat1;
+    INSERT INTO sqlite_stat1(tbl, idx, stat)
+        VALUES ('correlated_values', NULL, '1000');
+    ANALYZE sqlite_schema;
+
+    EXPLAIN QUERY PLAN FORMAT=JSON
+    SELECT count(*)
+    FROM correlated_values
+    WHERE (x = 1 AND y = 1) OR (x = 2 AND y = 2);
+}
+expect pattern {
+    "rows_per_input":1000
+}
+
+@setup implied_or_plan_schema
+@skip-if sqlite "Turso uses one index search for the implied IN filter"
+test implied-or-filter-accepts-parenthesized-equalities {
+    EXPLAIN QUERY PLAN
+    SELECT * FROM a JOIN b ON 1 = 1
+    WHERE ((a.x = 1) AND b.y = 1)
+       OR ((a.x = 2) AND b.y = 2);
+}
+expect {
+    1|0|0|SCAN b
+    2|0|0|SEARCH a USING INDEX ax (x=?)
+}
+
+@setup implied_or_plan_schema
+@skip-if sqlite "Turso uses one index search for the implied IN filter"
+test implied-or-filter-accepts-negative-numbers {
+    EXPLAIN QUERY PLAN
+    SELECT * FROM a JOIN b ON 1 = 1
+    WHERE (a.x = -1 AND b.y = 1)
+       OR (a.x = -2 AND b.y = 2);
+}
+expect {
+    1|0|0|SCAN b
+    2|0|0|SEARCH a USING INDEX ax (x=?)
+}
+
+@setup implied_or_plan_schema
+@skip-if sqlite "Turso uses one index search for the implied IN filter"
+test implied-or-filter-uses-only-indexed-column {
+    EXPLAIN QUERY PLAN
+    SELECT * FROM a JOIN b ON 1 = 1
+    WHERE (a.x = 1 AND a.z = 10 AND b.y = 1)
+       OR (a.x = 2 AND a.z = 20 AND b.y = 2);
+}
+expect {
+    1|0|0|SCAN b
+    2|0|0|SEARCH a USING INDEX ax (x=?)
+}
+
+@skip-if sqlite "Turso summarizes multi-index branches on one plan row"
+test implied-or-filter-keeps-compound-index-searches {
+    CREATE TABLE a(x INTEGER, z INTEGER);
+    CREATE INDEX axz ON a(x, z);
+    CREATE TABLE b(y INTEGER);
+
+    EXPLAIN QUERY PLAN
+    SELECT * FROM a JOIN b ON 1 = 1
+    WHERE (a.x = 1 AND a.z = 10 AND b.y = 1)
+       OR (a.x = 2 AND a.z = 20 AND b.y = 2);
+}
+expect {
+    1|0|0|SCAN b
+    2|0|0|MULTI-INDEX OR a (axz, axz)
+}
+
+test implied-or-filter-keeps-negative-number-results {
+    CREATE TABLE a(id INTEGER PRIMARY KEY, x INTEGER);
+    CREATE INDEX ax ON a(x);
+    INSERT INTO a VALUES (1, -1), (2, -2), (3, 1), (4, NULL);
+    CREATE TABLE b(y INTEGER);
+    INSERT INTO b VALUES (1), (2);
+
+    SELECT a.id, b.y FROM a JOIN b ON 1 = 1
+    WHERE ((a.x) = (-1) AND b.y = 1)
+       OR ((a.x) = (-2) AND b.y = 2)
+    ORDER BY a.id, b.y;
+}
+expect {
+    1|1
+    2|2
+}
+
+test implied-or-filter-keeps-correlated-column-results {
+    CREATE TABLE a(id INTEGER PRIMARY KEY, x INTEGER, z INTEGER);
+    CREATE INDEX ax ON a(x);
+    INSERT INTO a VALUES (1, 1, 10), (2, 1, 20), (3, 2, 10), (4, 2, 20);
+    CREATE TABLE b(y INTEGER);
+    INSERT INTO b VALUES (1), (2);
+
+    SELECT a.id, b.y FROM a JOIN b ON 1 = 1
+    WHERE (a.x = 1 AND a.z = 10 AND b.y = 1)
+       OR (a.x = 2 AND a.z = 20 AND b.y = 2)
+    ORDER BY a.id, b.y;
+}
+expect {
+    1|1
+    4|2
+}
+
+@skip-if sqlite "Turso summarizes repeated IN searches on one plan row"
+test nested-or-branches-use-one-index-search {
+    CREATE TABLE t(x INTEGER);
+    CREATE INDEX tx ON t(x);
+
+    EXPLAIN QUERY PLAN
+    SELECT *
+    FROM t
+    WHERE x = 1 OR (x = 2 OR x = 3);
+}
+expect {
+    1|0|0|SEARCH t USING COVERING INDEX tx (x=?)
+}
+
+@skip-if sqlite "Turso summarizes repeated IN searches on one plan row"
+test nested-and-branches-use-one-index-search {
+    CREATE TABLE t(x INTEGER, y INTEGER, z INTEGER);
+    CREATE INDEX tx ON t(x);
+
+    EXPLAIN QUERY PLAN
+    SELECT *
+    FROM t
+    WHERE (y > 0 AND (x = 1 AND z > 0))
+       OR (y < 0 AND (x = 2 AND z < 0));
+}
+expect {
+    1|0|0|SEARCH t USING INDEX tx (x=?)
+}
+
+@setup or_join_rows
+@var join_type { JOIN | LEFT JOIN | FULL OUTER JOIN }
+@var filter {
+    (l.x = 1 AND r.y = 2) OR (l.x = 2 AND r.y = 1)
+    | (1 = l.x AND 2 = r.y) OR (2 = l.x AND 1 = r.y)
+    | (l.x = 1 AND r.y = 2) OR r.y = 1
+    | (l.x = 1 AND (r.y = 2 AND l.flag = 1)) OR (l.x = 2 AND (r.y = 1 AND l.flag = 1))
+}
+matrix inferred-or-filters-keep-join-results {
+    SELECT l.id, r.id, l.x, r.y
+    FROM or_left AS l $join_type or_right AS r ON l.id = r.left_id
+    WHERE $filter
+    ORDER BY l.id, r.id;
+}
+
+@setup or_join_rows
+test outer-join-or-condition-keeps-unmatched-left-rows {
+    SELECT l.id, r.id
+    FROM or_left AS l
+    LEFT JOIN or_right AS r
+      ON l.id = r.left_id
+     AND ((l.x = 1 AND r.y = 2) OR (l.x = 2 AND r.y = 1))
+    ORDER BY l.id, r.id;
+}
+expect {
+    1|1
+    2|3
+    3|4
+    4|6
+    5|
+    6|
+}
+
+@setup or_join_rows
+test inferred-or-filter-keeps-update-results {
+    UPDATE or_left SET flag = flag + 10 WHERE x = 1 OR x = 2;
+    SELECT id, flag FROM or_left ORDER BY id;
+}
+expect {
+    1|11
+    2|10
+    3|11
+    4|10
+    5|1
+    6|1
+}
+
+@setup or_join_rows
+test two-column-or-keeps-delete-results {
+    DELETE FROM or_left
+    WHERE (x = 1 AND flag = 0) OR (x = 2 AND flag = 1);
+    SELECT id FROM or_left ORDER BY id;
+}
+expect {
+    1
+    4
+    5
+    6
+}
+
+test inferred-or-filter-keeps-text-collation {
+    CREATE TABLE collated_values(id INTEGER PRIMARY KEY, value TEXT COLLATE NOCASE);
+    CREATE INDEX collated_value_index ON collated_values(value);
+    INSERT INTO collated_values VALUES
+        (1, 'abc'), (2, 'ABC'), (3, 'def'), (4, 'xyz'), (5, NULL);
+
+    SELECT id FROM collated_values
+    WHERE value = 'AbC' OR value = 'DeF'
+    ORDER BY id;
+}
+expect {
+    1
+    2
+    3
+}
+
+test inferred-or-filter-keeps-blob-and-integer-values {
+    CREATE TABLE mixed_values(id INTEGER PRIMARY KEY, value BLOB);
+    CREATE INDEX mixed_value_index ON mixed_values(value);
+    INSERT INTO mixed_values VALUES
+        (1, X'31'), (2, 1), (3, '1'), (4, X'32'), (5, NULL);
+
+    SELECT id FROM mixed_values
+    WHERE value = X'31' OR value = 1
+    ORDER BY id;
+}
+expect {
+    1
+    2
+}
+
+# Snapshot EQP: correlated subquery residuals should fall back to a regular scan
+@setup correlated_subquery_schema
+snapshot-eqp compound-or-correlated-subquery-eqp {
+    SELECT b FROM t
+    WHERE (a = 1 AND EXISTS(SELECT 1 FROM u WHERE u.x = t.b))
+       OR (a = 2 AND EXISTS(SELECT 1 FROM u WHERE u.x = t.b));
+}
+
+# Snapshot EQP: rowid branch plus indexed branch still uses multi-index OR
+@setup rowid_branch_schema
+snapshot-eqp compound-or-rowid-branch-eqp {
+    SELECT rowid, a FROM t
+    WHERE (rowid = 1 AND rowid > 0)
+       OR (a = 20 AND a > 0);
+}
+
+# Snapshot EQP: compound branch seeks should use the composite index in both branches.
+@setup compound_branch_seek_schema
+snapshot-eqp compound-or-compound-branch-seek-eqp {
+    SELECT DISTINCT i.id
+    FROM item i
+    JOIN link l
+      ON (
+        (l.src = 1 AND i.id = l.dst AND i.kind = 7)
+        OR
+        (l.dst = 1 AND i.id = l.src AND i.kind = 7)
+      );
+}
+
+# Snapshot EQP: mixed residuals over outer + scanned tables should still use multi-index OR
+@setup graph_schema
+snapshot-eqp compound-or-mixed-residual-eqp {
+    SELECT DISTINCT i.id
+    FROM item i
+    JOIN link l
+      ON (
+        (l.src = 'n1' AND l.dst = i.id AND ((i.type = 'entity' AND l.label = 'knows') OR l.id = 'e4'))
+        OR
+        (l.dst = 'n1' AND l.src = i.id AND ((i.type = 'entity' AND l.label = 'knows') OR l.id = 'e4'))
+      );
+}
+
+# Grouping parentheses inside a branch must not hide its constraints. The
+# planner rewrites BETWEEN into two comparisons in place, so a branch written
+# as ((a BETWEEN 2 AND 4) AND a != 3) reaches the multi-index planner as
+# ((a >= 2 AND a <= 4) AND a != 3); the inner group has to be flattened like
+# any other AND, or the branch has no seek and the whole plan is dropped.
+setup paren_branch_schema {
+    CREATE TABLE t2(a INTEGER PRIMARY KEY, b INT, c INT);
+    CREATE INDEX idx_t2_b ON t2(b);
+    CREATE INDEX idx_t2_c ON t2(c);
+
+    INSERT INTO t2 VALUES (1, 10, 100), (2, 20, 200), (3, 30, 300),
+                          (4, 40, 400), (5, 50, 500), (6, 60, 600);
+}
+
+@setup paren_branch_schema
+test compound-or-parenthesized-between-branch {
+    SELECT a FROM t2
+    WHERE b = 60 OR ((a BETWEEN 2 AND 4) AND a != 3)
+    ORDER BY a;
+}
+expect {
+    2
+    4
+    6
+}
+
+@setup paren_branch_schema
+snapshot-eqp compound-or-parenthesized-between-branch-eqp {
+    SELECT a FROM t2
+    WHERE b = 60 OR ((a BETWEEN 2 AND 4) AND a != 3);
+}
+
+@setup paren_branch_schema
+test compound-or-parenthesized-nested-or {
+    SELECT a FROM t2
+    WHERE b = 10 OR (c = 300 OR (b = 50))
+    ORDER BY a;
+}
+expect {
+    1
+    3
+    5
+}
+
+@setup paren_branch_schema
+snapshot-eqp compound-or-parenthesized-nested-or-eqp {
+    SELECT a FROM t2
+    WHERE b = 10 OR (c = 300 OR (b = 50));
+}

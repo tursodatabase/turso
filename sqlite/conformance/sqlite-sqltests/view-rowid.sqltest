@@ -1,0 +1,17 @@
+@database :memory:
+
+test view-rowid-order-by-index {
+    CREATE TABLE t(a);
+    CREATE VIEW v AS SELECT * FROM t;
+    SELECT rowid FROM v ORDER BY 1;
+}
+expect error {
+}
+
+test view-rowid-select {
+    CREATE TABLE t(a);
+    CREATE VIEW v AS SELECT * FROM t;
+    SELECT rowid FROM v;
+}
+expect error {
+}

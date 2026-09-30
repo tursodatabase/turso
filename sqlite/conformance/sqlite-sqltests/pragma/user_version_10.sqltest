@@ -1,0 +1,9 @@
+@database database/testing_user_version_10.db readonly
+
+test pragma-user-version-user-set {
+    PRAGMA user_version
+}
+expect {
+    10
+}
+

@@ -1,0 +1,20 @@
+FROM rust:1.88.0 as builder
+
+WORKDIR /app
+
+# Copy the actual source code
+COPY . .
+
+# Build the CLI binary
+RUN cargo build --release --package turso_cli
+
+# Runtime stage
+FROM rust:1.88.0-slim
+
+WORKDIR /app
+
+# Copy the built binary
+COPY --from=builder /app/target/release/tursodb /usr/local/bin/
+
+# Set the entrypoint
+ENTRYPOINT ["tursodb"]

@@ -1,0 +1,55 @@
+@database :memory:
+
+setup schema {
+    CREATE TABLE t1(a);
+    CREATE TABLE t2(a);
+    CREATE TABLE log(msg);
+}
+
+@setup schema
+test duplicate-trigger-name-different-tables {
+    CREATE TRIGGER tr AFTER INSERT ON t1 BEGIN INSERT INTO log VALUES('t1'); END;
+    CREATE TRIGGER tr AFTER INSERT ON t2 BEGIN INSERT INTO log VALUES('t2'); END;
+}
+expect error {
+    trigger tr already exists
+}
+
+@setup schema
+test duplicate-trigger-name-same-table {
+    CREATE TRIGGER tr AFTER INSERT ON t1 BEGIN INSERT INTO log VALUES('first'); END;
+    CREATE TRIGGER tr AFTER INSERT ON t1 BEGIN INSERT INTO log VALUES('second'); END;
+}
+expect error {
+    trigger tr already exists
+}
+
+@setup schema
+test duplicate-trigger-if-not-exists {
+    CREATE TRIGGER tr AFTER INSERT ON t1 BEGIN INSERT INTO log VALUES('t1'); END;
+    CREATE TRIGGER IF NOT EXISTS tr AFTER INSERT ON t2 BEGIN INSERT INTO log VALUES('t2'); END;
+    INSERT INTO t1 VALUES(1);
+    SELECT * FROM log;
+}
+expect {
+    t1
+}
+
+@setup schema
+test trigger-name-case-insensitive {
+    CREATE TRIGGER TR AFTER INSERT ON t1 BEGIN INSERT INTO log VALUES('t1'); END;
+    CREATE TRIGGER tr AFTER INSERT ON t2 BEGIN INSERT INTO log VALUES('t2'); END;
+}
+expect error {
+    trigger tr already exists
+}
+
+@setup schema
+test correct-trigger-fires-after-failed-duplicate {
+    CREATE TRIGGER tr AFTER INSERT ON t1 BEGIN INSERT INTO log VALUES('from_t1'); END;
+    INSERT INTO t1 VALUES(1);
+    SELECT * FROM log;
+}
+expect {
+    from_t1
+}

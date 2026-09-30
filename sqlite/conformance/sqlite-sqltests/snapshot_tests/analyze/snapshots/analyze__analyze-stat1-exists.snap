@@ -1,0 +1,74 @@
+---
+source: analyze.sqltest
+expression: ANALYZE items;
+info:
+  statement_type: OTHER
+  setup_blocks:
+  - stat1_exists
+  database: ':memory:'
+---
+QUERY PLAN
+
+
+BYTECODE
+addr  opcode       p1  p2  p3  p4                  p5  comment
+   0  Init          0  52   0                       0  Start at 52
+   1  Null          0   1   0                       0  r[1]=NULL
+   2  OpenWrite     0   5   0                       0  root=5; iDb=0
+   3  Rewind        0  10   0                       0  Rewind  sqlite_stat1
+   4      Column    0   0   2                       0  r[2]=sqlite_stat1.tbl
+   5      Ne        2   3   9                       0  if r[2]!=r[3] goto 9
+   6      RowId     0   4   0                       0  r[4]=sqlite_stat1.rowid
+   7      Delete    0   0   0  sqlite_stat1         0
+   8    Next        0   4   0                       0
+   9  Next          0   4   0                       0
+  10  OpenRead      1   2   0  k(3,B,B,B)           0  =items, root=2, iDb=0
+  11  OpenRead      2   4   0  k(2,B)               0  =idx_items_category, root=4, iDb=0
+  12  Integer       1   7   0                       0  r[7]=1
+  13  Function      0   7   6  stat_init            0  r[6]=func(r[7])
+  14  Rewind        2  31   0                       0  Rewind  idx_items_category
+  15  Integer       0   7   0                       0  r[7]=0
+  16  Goto          0  22   0                       0
+  17    Integer     0   7   0                       0  r[7]=0
+  18    Column      2   0   9                       0  r[9]=idx_items_category.category
+  19    Ne          9   8  22                       0  if r[9]!=r[8] goto 22
+  20    Integer     1   7   0                       0  r[7]=1
+  21    Goto        0  23   0                       0
+  22    Column      2   0   8                       0  r[8]=idx_items_category.category
+  23    Function    0   6   6  stat_push            0  r[6]=func(r[6..7])
+  24  Next          2  17   0                       0
+  25  Function      0   6  10  stat_get             0  r[10]=func(r[6])
+  26  IsNull       10  31   0                       0  if (r[10]==NULL) goto 31
+  27  Copy         10  13   0                       0  r[13]=r[10]
+  28  MakeRecord   11   3  14                       0  r[14]=mkrec(r[11..13])
+  29  NewRowid      0  15   0                       0  r[15]=rowid
+  30  Insert        0  14  15  sqlite_stat1         0  intkey=r[15] data=r[14]
+  31  OpenRead      3   3   0  k(2,B)               0  =idx_items_name, root=3, iDb=0
+  32  Integer       1  17   0                       0  r[17]=1
+  33  Function      0  17  16  stat_init            0  r[16]=func(r[17])
+  34  Rewind        3  51   0                       0  Rewind  idx_items_name
+  35  Integer       0  17   0                       0  r[17]=0
+  36  Goto          0  42   0                       0
+  37    Integer     0  17   0                       0  r[17]=0
+  38    Column      3   0  19                       0  r[19]=idx_items_name.name
+  39    Ne         19  18  42                       0  if r[19]!=r[18] goto 42
+  40    Integer     1  17   0                       0  r[17]=1
+  41    Goto        0  43   0                       0
+  42    Column      3   0  18                       0  r[18]=idx_items_name.name
+  43    Function    0  16  16  stat_push            0  r[16]=func(r[16..17])
+  44  Next          3  37   0                       0
+  45  Function      0  16  20  stat_get             0  r[20]=func(r[16])
+  46  IsNull       20  51   0                       0  if (r[20]==NULL) goto 51
+  47  Copy         20  23   0                       0  r[23]=r[20]
+  48  MakeRecord   21   3  24                       0  r[24]=mkrec(r[21..23])
+  49  NewRowid      0  25   0                       0  r[25]=rowid
+  50  Insert        0  24  25  sqlite_stat1         0  intkey=r[25] data=r[24]
+  51  Halt          0   0   0                       0
+  52  Transaction   0   2   4                       0  iDb=0 tx_mode=Write
+  53  String8       0   3   0  items                0  r[3]='items'
+  54  String8       0   5   0  items                0  r[5]='items'
+  55  String8       0  11   0  items                0  r[11]='items'
+  56  String8       0  12   0  idx_items_category   0  r[12]='idx_items_category'
+  57  String8       0  21   0  items                0  r[21]='items'
+  58  String8       0  22   0  idx_items_name       0  r[22]='idx_items_name'
+  59  Goto          0   1   0                       0

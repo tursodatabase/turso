@@ -1,0 +1,104 @@
+@database :default:
+@database :default-no-rowidalias:
+
+#!/usr/bin/env tclsh
+test concat {
+    SELECT 'Hello' || ' ' || 'World';
+}
+expect {
+    Hello World
+}
+
+test concat-2 {
+    SELECT 'Hello' || NULL;
+}
+expect {
+}
+
+test concat-3 {
+    SELECT 'Hello' || NULL;
+}
+expect {
+}
+
+test concat-4 {
+    SELECT 'A good ' || name FROM products WHERE name = 'hat';
+}
+expect {
+    A good hat
+}
+
+test concat-4-2 {
+    SELECT 'A good ' || name FROM products WHERE name = 'watch';
+}
+expect {
+}
+
+test concat-blob {
+    SELECT hex(x'01' || x'02');
+}
+expect {
+    0102
+}
+
+test concat-no-args-error {
+    SELECT concat();
+}
+expect error {
+    wrong number of arguments to function concat()
+}
+
+test concat-ws-no-args-error {
+    SELECT concat_ws();
+}
+expect error {
+    wrong number of arguments to function concat_ws()
+}
+
+test concat-ws-one-arg-error {
+    SELECT concat_ws(',');
+}
+expect error {
+    wrong number of arguments to function concat_ws()
+}
+
+# `||` converts each side to text. Only a TEXT value is already in that form;
+# every other type is rendered first, so each one needs its own case.
+test concat-value-types {
+    SELECT quote(1 || 2);
+    SELECT quote(1.5 || 'x');
+    SELECT quote(-0.0 || '');
+    SELECT quote(1e300 || '');
+    SELECT quote('' || 'b');
+    SELECT quote(NULL || 'a');
+    SELECT quote('a' || NULL);
+}
+expect {
+    '12'
+    '1.5x'
+    '0.0'
+    '1.0e+300'
+    'b'
+    NULL
+    NULL
+}
+
+test concat-mixed-blob-and-text {
+    SELECT quote(x'41' || 'b');
+    SELECT quote('b' || x'41');
+    SELECT quote(x'e282ac' || 'x');
+}
+expect {
+    'Ab'
+    'bA'
+    '€x'
+}
+
+test concat-multibyte-text {
+    SELECT quote('héllo' || '—');
+    SELECT length('héllo' || '—');
+}
+expect {
+    'héllo—'
+    6
+}

@@ -1,0 +1,22 @@
+@database :memory:
+@skip-file-if mvcc "materialized views not supported in MVCC mode"
+@skip-file-if sqlite "materialized views are a turso-specific feature"
+@requires materialized_views "requires materialized view support"
+
+test create-index-does-not-corrupt-matview {
+    CREATE TABLE t (id INTEGER, val TEXT, score REAL);
+    INSERT INTO t VALUES (1, 'hello', 3.14);
+    INSERT INTO t VALUES (2, 'world', 2.72);
+    CREATE MATERIALIZED VIEW mv AS SELECT * FROM t;
+    SELECT COUNT(*) FROM mv;
+
+    CREATE INDEX idx ON t (id DESC);
+    SELECT COUNT(*) FROM mv;
+    SELECT * FROM mv ORDER BY id;
+}
+expect {
+    2
+    2
+    1|hello|3.14
+    2|world|2.72
+}

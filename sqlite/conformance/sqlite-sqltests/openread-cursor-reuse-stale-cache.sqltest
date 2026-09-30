@@ -1,0 +1,145 @@
+@database :memory:
+
+# Regression tests for stale per-cursor btree caches on reused OpenRead cursors.
+#
+# op_open_read reuses the existing btree cursor when the slot already holds one
+# on the same root page. A correlated scalar subquery therefore runs Last on
+# the same cursor once per outer row. BTreeCursor caches the rightmost page id
+# (move_to_rightmost's skip-a-seek optimization) and a memoized count; when the
+# btree is modified through a *different* cursor (same-statement writer or a
+# trigger subprogram), those shape caches must be invalidated, otherwise Last
+# lands on a page that is no longer the rightmost leaf: wrong max values, NULL
+# from a non-empty table, or a rowid read from an interior page.
+
+setup grow_split_root {
+    CREATE TABLE u(a INTEGER PRIMARY KEY, b INT);
+    CREATE TABLE t(a INTEGER PRIMARY KEY, pad BLOB);
+    INSERT INTO u VALUES (1,0),(2,0),(3,0),(4,0),(5,0),(6,0),(7,0),(8,0);
+    INSERT INTO t VALUES (1, zeroblob(1000));
+    CREATE TRIGGER trg AFTER UPDATE ON u BEGIN
+      INSERT INTO t VALUES ((SELECT max(a)+1 FROM t), zeroblob(1000));
+    END;
+}
+
+@setup grow_split_root
+test openread-reuse-trigger-grow-splits-root {
+    -- t starts as a single leaf-root page; the per-row trigger inserts split it
+    -- into an interior root. A stale rightmost-page cache made Last position on
+    -- the interior page and read a "rowid" from it (debug assert panic).
+    UPDATE u SET b = (SELECT a+0*u.a FROM t ORDER BY a DESC LIMIT 1);
+    SELECT a, b FROM u;
+}
+expect {
+    1|1
+    2|2
+    3|3
+    4|4
+    5|5
+    6|6
+    7|7
+    8|8
+}
+
+setup grow_split_leaf {
+    CREATE TABLE u(a INTEGER PRIMARY KEY, b INT);
+    CREATE TABLE t(a INTEGER PRIMARY KEY, pad BLOB);
+    INSERT INTO u VALUES (1,0),(2,0),(3,0),(4,0),(5,0),(6,0),(7,0),(8,0);
+    INSERT INTO t SELECT value, zeroblob(1000) FROM generate_series(1,12);
+    CREATE TRIGGER trg AFTER UPDATE ON u BEGIN
+      INSERT INTO t VALUES ((SELECT max(a)+1 FROM t), zeroblob(1000));
+    END;
+}
+
+@setup grow_split_leaf
+test openread-reuse-trigger-grow-splits-leaf {
+    -- Multi-page t: the cached rightmost leaf splits but stays a leaf, so the
+    -- stale cache silently returned the old page's last row (b stuck at 12)
+    -- instead of the progressing max.
+    UPDATE u SET b = (SELECT a+0*u.a FROM t ORDER BY a DESC LIMIT 1);
+    SELECT a, b FROM u;
+}
+expect {
+    1|12
+    2|13
+    3|14
+    4|15
+    5|16
+    6|17
+    7|18
+    8|19
+}
+
+setup no_trigger_self_update {
+    CREATE TABLE t(a INTEGER PRIMARY KEY, b INT, pad BLOB);
+    INSERT INTO t SELECT value, 0, zeroblob(100) FROM generate_series(1,40);
+}
+
+@setup no_trigger_self_update
+test openread-reuse-same-statement-writer {
+    -- No triggers: the UPDATE's own write cursor grows rows and splits pages
+    -- while the correlated subquery's read cursor runs Last per row. max(a)
+    -- never changes, so every row must see 40; the stale cache returned
+    -- decreasing values (40, 18, 10, 8) as splits progressed.
+    UPDATE t SET b = (SELECT s.a+0*t.a FROM t AS s ORDER BY s.a DESC LIMIT 1), pad = zeroblob(1000);
+    SELECT DISTINCT b FROM t;
+}
+expect {
+    40
+}
+
+setup shrink_delete {
+    CREATE TABLE u(a INTEGER PRIMARY KEY, b INT);
+    CREATE TABLE t(a INTEGER PRIMARY KEY, pad BLOB);
+    INSERT INTO u SELECT value, 0 FROM generate_series(1,6);
+    INSERT INTO t SELECT value, zeroblob(1000) FROM generate_series(1,12);
+    CREATE TRIGGER trg AFTER UPDATE ON u BEGIN
+      DELETE FROM t WHERE a > (SELECT max(a)-3 FROM t);
+    END;
+}
+
+@setup shrink_delete
+test openread-reuse-trigger-delete-shrinks {
+    -- Deletes free the cached rightmost page; the stale cache made Last treat
+    -- the (now empty) page as the whole tree and return NULL from a non-empty
+    -- table.
+    UPDATE u SET b = (SELECT a+0*u.a FROM t ORDER BY a DESC LIMIT 1);
+    SELECT a, b FROM u;
+}
+expect {
+    1|12
+    2|9
+    3|6
+    4|3
+    5|
+    6|
+}
+
+setup index_desc_scan {
+    CREATE TABLE u(a INTEGER PRIMARY KEY, b TEXT);
+    CREATE TABLE t(a INTEGER PRIMARY KEY, c TEXT);
+    CREATE INDEX tidx ON t(c);
+    INSERT INTO u SELECT value, '' FROM generate_series(1,8);
+    INSERT INTO t SELECT value, printf('%08d', value) || hex(zeroblob(240)) FROM generate_series(1,6);
+    CREATE TRIGGER trg AFTER UPDATE ON u BEGIN
+      INSERT INTO t VALUES ((SELECT max(a)+1 FROM t), printf('%08d', (SELECT max(a)+1 FROM t)) || hex(zeroblob(240)));
+    END;
+}
+
+@setup index_desc_scan
+test openread-reuse-index-descending {
+    -- Same class on an index btree: ORDER BY c DESC LIMIT 1 runs Last on tidx
+    -- while the trigger's inserts split index leaves. The stale cache returned
+    -- the old leaf's largest key instead of the true maximum.
+    UPDATE u SET b = (SELECT substr(c,1,8) || (0*u.a) FROM t ORDER BY c DESC LIMIT 1);
+    SELECT a, b FROM u;
+}
+expect {
+    1|000000060
+    2|000000070
+    3|000000080
+    4|000000090
+    5|000000100
+    6|000000110
+    7|000000120
+    8|000000130
+}

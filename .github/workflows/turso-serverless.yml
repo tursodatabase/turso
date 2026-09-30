@@ -1,0 +1,40 @@
+name: turso-serverless
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ main ]
+    paths:
+      - 'serverless/javascript/**'
+      - '.github/workflows/turso-serverless.yml'
+  pull_request:
+    paths:
+      - 'serverless/javascript/**'
+      - '.github/workflows/turso-serverless.yml'
+
+env:
+  working-directory: serverless/javascript
+
+jobs:
+  build:
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    timeout-minutes: 20
+    defaults:
+      run:
+        working-directory: ${{ env.working-directory }}
+    
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Setup Node.js
+      uses: useblacksmith/setup-node@v5
+      with:
+        node-version: '24'
+        cache: 'npm'
+        cache-dependency-path: ${{ env.working-directory }}/package-lock.json
+    
+    - name: Install dependencies
+      run: npm ci
+    
+    - name: Build
+      run: npm run build

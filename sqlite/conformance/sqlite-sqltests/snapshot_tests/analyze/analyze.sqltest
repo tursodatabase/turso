@@ -1,0 +1,442 @@
+# ANALYZE Statement Snapshot Tests
+# These snapshots capture EXPLAIN QUERY PLAN output for ANALYZE-related operations
+# and queries that demonstrate how statistics affect query planning
+
+@database :memory:
+@skip-file-if mvcc "mvcc has slightly different cursor ids, so skipping it for now"
+
+setup schema {
+    -- Products table with various indexes for testing ANALYZE effects
+    CREATE TABLE products (
+        id INTEGER PRIMARY KEY,
+        sku TEXT NOT NULL,
+        name TEXT NOT NULL,
+        category TEXT NOT NULL,
+        price REAL NOT NULL,
+        stock_qty INTEGER NOT NULL
+    );
+
+    -- Single-column index
+    CREATE INDEX idx_products_sku ON products(sku);
+
+    -- Index on category for selectivity tests
+    CREATE INDEX idx_products_category ON products(category);
+
+    -- Index on price for range scan tests
+    CREATE INDEX idx_products_price ON products(price);
+
+    -- Orders table for multi-column index tests
+    CREATE TABLE orders (
+        id INTEGER PRIMARY KEY,
+        customer_id INTEGER NOT NULL,
+        order_date TEXT NOT NULL,
+        status TEXT NOT NULL,
+        total_amount REAL NOT NULL
+    );
+
+    -- Multi-column index
+    CREATE INDEX idx_orders_customer_date ON orders(customer_id, order_date);
+
+    -- Index on status
+    CREATE INDEX idx_orders_status ON orders(status);
+
+    -- Inventory table for three-column index tests
+    CREATE TABLE inventory (
+        id INTEGER PRIMARY KEY,
+        warehouse_id INTEGER NOT NULL,
+        product_id INTEGER NOT NULL,
+        bin_location TEXT NOT NULL,
+        quantity INTEGER NOT NULL
+    );
+
+    -- Three-column composite index
+    CREATE INDEX idx_inventory_location ON inventory(warehouse_id, product_id, bin_location);
+}
+
+setup populated_products {
+    -- Products table with various indexes for testing ANALYZE effects
+    CREATE TABLE products (
+        id INTEGER PRIMARY KEY,
+        sku TEXT NOT NULL,
+        name TEXT NOT NULL,
+        category TEXT NOT NULL,
+        price REAL NOT NULL,
+        stock_qty INTEGER NOT NULL
+    );
+
+    CREATE INDEX idx_products_sku ON products(sku);
+    CREATE INDEX idx_products_category ON products(category);
+    CREATE INDEX idx_products_price ON products(price);
+
+    -- Insert diverse product data
+    INSERT INTO products VALUES (1, 'SKU001', 'Widget A', 'Electronics', 29.99, 100);
+    INSERT INTO products VALUES (2, 'SKU002', 'Widget B', 'Electronics', 39.99, 50);
+    INSERT INTO products VALUES (3, 'SKU003', 'Gadget C', 'Electronics', 149.99, 25);
+    INSERT INTO products VALUES (4, 'SKU004', 'Tool D', 'Hardware', 19.99, 200);
+    INSERT INTO products VALUES (5, 'SKU005', 'Tool E', 'Hardware', 24.99, 150);
+    INSERT INTO products VALUES (6, 'SKU006', 'Part F', 'Hardware', 9.99, 500);
+    INSERT INTO products VALUES (7, 'SKU007', 'Supply G', 'Office', 4.99, 1000);
+    INSERT INTO products VALUES (8, 'SKU008', 'Supply H', 'Office', 7.99, 800);
+    INSERT INTO products VALUES (9, 'SKU009', 'Supply I', 'Office', 3.99, 1200);
+    INSERT INTO products VALUES (10, 'SKU010', 'Supply J', 'Office', 5.99, 600);
+
+    -- Run ANALYZE to gather statistics
+    ANALYZE;
+}
+
+setup populated_orders {
+    -- Orders table for multi-column index tests
+    CREATE TABLE orders (
+        id INTEGER PRIMARY KEY,
+        customer_id INTEGER NOT NULL,
+        order_date TEXT NOT NULL,
+        status TEXT NOT NULL,
+        total_amount REAL NOT NULL
+    );
+
+    CREATE INDEX idx_orders_customer_date ON orders(customer_id, order_date);
+    CREATE INDEX idx_orders_status ON orders(status);
+
+    -- Insert order data with varied distribution
+    INSERT INTO orders VALUES (1, 100, '2024-01-15', 'completed', 150.00);
+    INSERT INTO orders VALUES (2, 100, '2024-01-20', 'completed', 75.50);
+    INSERT INTO orders VALUES (3, 100, '2024-02-01', 'pending', 200.00);
+    INSERT INTO orders VALUES (4, 101, '2024-01-10', 'completed', 99.99);
+    INSERT INTO orders VALUES (5, 101, '2024-01-25', 'shipped', 125.00);
+    INSERT INTO orders VALUES (6, 102, '2024-01-18', 'completed', 50.00);
+    INSERT INTO orders VALUES (7, 102, '2024-02-05', 'pending', 175.00);
+    INSERT INTO orders VALUES (8, 103, '2024-01-22', 'completed', 89.99);
+    INSERT INTO orders VALUES (9, 103, '2024-01-30', 'completed', 110.00);
+    INSERT INTO orders VALUES (10, 104, '2024-02-10', 'pending', 225.00);
+
+    ANALYZE;
+}
+
+setup populated_inventory {
+    -- Inventory table for three-column index tests
+    CREATE TABLE inventory (
+        id INTEGER PRIMARY KEY,
+        warehouse_id INTEGER NOT NULL,
+        product_id INTEGER NOT NULL,
+        bin_location TEXT NOT NULL,
+        quantity INTEGER NOT NULL
+    );
+
+    CREATE INDEX idx_inventory_location ON inventory(warehouse_id, product_id, bin_location);
+
+    -- Insert inventory data across warehouses
+    INSERT INTO inventory VALUES (1, 1, 100, 'A1', 50);
+    INSERT INTO inventory VALUES (2, 1, 100, 'A2', 30);
+    INSERT INTO inventory VALUES (3, 1, 101, 'B1', 75);
+    INSERT INTO inventory VALUES (4, 1, 102, 'B2', 100);
+    INSERT INTO inventory VALUES (5, 2, 100, 'A1', 25);
+    INSERT INTO inventory VALUES (6, 2, 100, 'A2', 40);
+    INSERT INTO inventory VALUES (7, 2, 101, 'B1', 60);
+    INSERT INTO inventory VALUES (8, 3, 100, 'A1', 80);
+    INSERT INTO inventory VALUES (9, 3, 103, 'C1', 90);
+    INSERT INTO inventory VALUES (10, 3, 103, 'C2', 45);
+
+    ANALYZE;
+}
+
+setup null_values {
+    -- Table with NULL values for testing ANALYZE with NULLs
+    CREATE TABLE items (
+        id INTEGER PRIMARY KEY,
+        category TEXT,
+        subcategory TEXT
+    );
+
+    CREATE INDEX idx_items_cat ON items(category, subcategory);
+
+    INSERT INTO items VALUES (1, NULL, 'sub1');
+    INSERT INTO items VALUES (2, NULL, 'sub1');
+    INSERT INTO items VALUES (3, NULL, 'sub2');
+    INSERT INTO items VALUES (4, 'cat1', NULL);
+    INSERT INTO items VALUES (5, 'cat1', NULL);
+    INSERT INTO items VALUES (6, 'cat1', 'sub3');
+    INSERT INTO items VALUES (7, 'cat2', 'sub4');
+    INSERT INTO items VALUES (8, 'cat2', 'sub4');
+
+    ANALYZE;
+}
+
+setup identical_values {
+    -- Table where all indexed values are identical
+    CREATE TABLE uniform (
+        id INTEGER PRIMARY KEY,
+        status TEXT NOT NULL,
+        value INTEGER NOT NULL
+    );
+
+    CREATE INDEX idx_uniform_status ON uniform(status);
+    CREATE INDEX idx_uniform_status_value ON uniform(status, value);
+
+    INSERT INTO uniform VALUES (1, 'active', 100);
+    INSERT INTO uniform VALUES (2, 'active', 100);
+    INSERT INTO uniform VALUES (3, 'active', 100);
+    INSERT INTO uniform VALUES (4, 'active', 100);
+    INSERT INTO uniform VALUES (5, 'active', 100);
+
+    ANALYZE;
+}
+
+# =============================================================================
+# 1. ANALYZE Statement Bytecode - Direct ANALYZE operations
+# =============================================================================
+
+# ANALYZE on empty table (sqlite_stat1 doesn't exist yet - creates it)
+@setup schema
+snapshot analyze-empty-table {
+    ANALYZE products;
+}
+
+# =============================================================================
+# 1a. ANALYZE when sqlite_stat1 already exists
+# =============================================================================
+
+setup stat1_exists {
+    -- Create table with index
+    CREATE TABLE items (
+        id INTEGER PRIMARY KEY,
+        name TEXT NOT NULL,
+        category TEXT NOT NULL
+    );
+    CREATE INDEX idx_items_name ON items(name);
+    CREATE INDEX idx_items_category ON items(category);
+
+    -- Insert some data
+    INSERT INTO items VALUES (1, 'Apple', 'Fruit');
+    INSERT INTO items VALUES (2, 'Banana', 'Fruit');
+    INSERT INTO items VALUES (3, 'Carrot', 'Vegetable');
+    INSERT INTO items VALUES (4, 'Date', 'Fruit');
+    INSERT INTO items VALUES (5, 'Eggplant', 'Vegetable');
+
+    -- First ANALYZE creates sqlite_stat1
+    ANALYZE;
+}
+
+# ANALYZE when sqlite_stat1 already exists (different bytecode - no CreateBtree)
+@setup stat1_exists
+snapshot analyze-stat1-exists {
+    ANALYZE items;
+}
+
+# ANALYZE specific index when sqlite_stat1 already exists
+@setup stat1_exists
+snapshot analyze-index-stat1-exists {
+    ANALYZE idx_items_name;
+}
+
+# ANALYZE all when sqlite_stat1 already exists
+@setup stat1_exists
+snapshot analyze-all-stat1-exists {
+    ANALYZE;
+}
+
+# ANALYZE on specific index
+@setup schema
+snapshot analyze-specific-index {
+    ANALYZE idx_products_sku;
+}
+
+# ANALYZE all tables in database
+@setup schema
+snapshot analyze-all {
+    ANALYZE;
+}
+
+# ANALYZE main database
+@setup schema
+snapshot analyze-database {
+    ANALYZE main;
+}
+
+# =============================================================================
+# 2. Query Plans After ANALYZE - Single-column index
+# =============================================================================
+
+# Equality lookup after ANALYZE
+@setup populated_products
+snapshot query-after-analyze-equality {
+    SELECT id, name, price FROM products WHERE sku = 'SKU005';
+}
+
+# Range scan after ANALYZE
+@setup populated_products
+snapshot query-after-analyze-range {
+    SELECT id, name, price FROM products WHERE price > 20.00 AND price < 50.00;
+}
+
+# Category lookup with statistics
+@setup populated_products
+snapshot query-after-analyze-category {
+    SELECT id, name, price FROM products WHERE category = 'Office';
+}
+
+# =============================================================================
+# 3. Query Plans After ANALYZE - Multi-column index
+# =============================================================================
+
+# Full composite index usage after ANALYZE
+@setup populated_orders
+snapshot query-composite-full-after-analyze {
+    SELECT id, status, total_amount
+    FROM orders
+    WHERE customer_id = 100 AND order_date = '2024-01-15';
+}
+
+# Partial composite index (first column) after ANALYZE
+@setup populated_orders
+snapshot query-composite-partial-after-analyze {
+    SELECT id, order_date, total_amount
+    FROM orders
+    WHERE customer_id = 100;
+}
+
+# Range on second column of composite index after ANALYZE
+@setup populated_orders
+snapshot query-composite-range-after-analyze {
+    SELECT id, order_date, total_amount
+    FROM orders
+    WHERE customer_id = 100 AND order_date >= '2024-01-01' AND order_date < '2024-02-01';
+}
+
+# =============================================================================
+# 4. Query Plans After ANALYZE - Three-column index
+# =============================================================================
+
+# Full three-column index usage after ANALYZE
+@setup populated_inventory
+snapshot query-three-column-full-after-analyze {
+    SELECT id, quantity
+    FROM inventory
+    WHERE warehouse_id = 1 AND product_id = 100 AND bin_location = 'A1';
+}
+
+# Two-column prefix usage after ANALYZE
+@setup populated_inventory
+snapshot query-three-column-partial-after-analyze {
+    SELECT id, bin_location, quantity
+    FROM inventory
+    WHERE warehouse_id = 1 AND product_id = 100;
+}
+
+# First column only after ANALYZE
+@setup populated_inventory
+snapshot query-three-column-first-only-after-analyze {
+    SELECT id, product_id, bin_location, quantity
+    FROM inventory
+    WHERE warehouse_id = 2;
+}
+
+# =============================================================================
+# 5. Query Plans After ANALYZE - NULL handling
+# =============================================================================
+
+# Query on table with NULL values after ANALYZE
+@setup null_values
+snapshot query-with-nulls-after-analyze {
+    SELECT id, category, subcategory FROM items WHERE category = 'cat1';
+}
+
+# Query for NULL values after ANALYZE
+@setup null_values
+snapshot query-for-nulls-after-analyze {
+    SELECT id, category, subcategory FROM items WHERE category IS NULL;
+}
+
+# =============================================================================
+# 6. Query Plans After ANALYZE - Uniform distribution
+# =============================================================================
+
+# Query on table where all values are identical after ANALYZE
+@setup identical_values
+snapshot query-identical-values-after-analyze {
+    SELECT id, status, value FROM uniform WHERE status = 'active';
+}
+
+# Query on two-column index with identical values after ANALYZE
+@setup identical_values
+snapshot query-identical-composite-after-analyze {
+    SELECT id, value FROM uniform WHERE status = 'active' AND value = 100;
+}
+
+# =============================================================================
+# 7. Aggregation and Ordering After ANALYZE
+# =============================================================================
+
+# Aggregation query after ANALYZE
+@setup populated_products
+snapshot aggregate-after-analyze {
+    SELECT category, COUNT(*) as cnt, AVG(price) as avg_price
+    FROM products
+    GROUP BY category;
+}
+
+# ORDER BY with index after ANALYZE
+@setup populated_products
+snapshot order-by-index-after-analyze {
+    SELECT id, sku, price FROM products ORDER BY price LIMIT 5;
+}
+
+# MIN/MAX optimization after ANALYZE
+@setup populated_products
+snapshot min-after-analyze {
+    SELECT MIN(price) FROM products;
+}
+
+@setup populated_products
+snapshot max-after-analyze {
+    SELECT MAX(price) FROM products;
+}
+
+# =============================================================================
+# 8. Join Queries After ANALYZE
+# =============================================================================
+
+setup join_tables {
+    CREATE TABLE customers (
+        id INTEGER PRIMARY KEY,
+        name TEXT NOT NULL
+    );
+
+    CREATE TABLE purchases (
+        id INTEGER PRIMARY KEY,
+        customer_id INTEGER NOT NULL,
+        amount REAL NOT NULL
+    );
+
+    CREATE INDEX idx_purchases_customer ON purchases(customer_id);
+
+    INSERT INTO customers VALUES (1, 'Alice');
+    INSERT INTO customers VALUES (2, 'Bob');
+    INSERT INTO customers VALUES (3, 'Charlie');
+
+    INSERT INTO purchases VALUES (1, 1, 100.00);
+    INSERT INTO purchases VALUES (2, 1, 50.00);
+    INSERT INTO purchases VALUES (3, 2, 75.00);
+    INSERT INTO purchases VALUES (4, 2, 125.00);
+    INSERT INTO purchases VALUES (5, 2, 25.00);
+    INSERT INTO purchases VALUES (6, 3, 200.00);
+
+    ANALYZE;
+}
+
+# Join query after ANALYZE
+@setup join_tables
+snapshot join-after-analyze {
+    SELECT c.name, p.amount
+    FROM customers c
+    JOIN purchases p ON c.id = p.customer_id
+    WHERE c.id = 2;
+}
+
+# Join with aggregation after ANALYZE
+@setup join_tables
+snapshot join-aggregate-after-analyze {
+    SELECT c.name, COUNT(*) as purchase_count, SUM(p.amount) as total
+    FROM customers c
+    JOIN purchases p ON c.id = p.customer_id
+    GROUP BY c.id;
+}

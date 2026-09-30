@@ -1,0 +1,132 @@
+---
+title: EXPLAIN
+description: Display the execution plan or bytecode for a SQL statement
+sidebarTitle: EXPLAIN
+---
+
+# EXPLAIN
+
+The EXPLAIN statement displays information about how Turso executes a SQL statement. There are two forms: `EXPLAIN` shows the virtual machine bytecode, and `EXPLAIN QUERY PLAN` shows the high-level query execution strategy.
+
+## Syntax
+
+```sql
+EXPLAIN statement;
+EXPLAIN QUERY PLAN statement;
+```
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| statement | SQL | Any SQL statement (SELECT, INSERT, UPDATE, DELETE, etc.) |
+
+## EXPLAIN
+
+The `EXPLAIN` prefix causes Turso to return the sequence of virtual machine (VDBE) opcodes that would be used to execute the statement, rather than executing the statement itself.
+
+```sql
+EXPLAIN SELECT * FROM users WHERE id = 1;
+-- addr | opcode     | p1 | p2 | p3 | p4       | p5
+-- 0    | Init       | 0  | 9  | 0  |          | 0
+-- 1    | OpenRead   | 0  | 2  | 0  | 3        | 0
+-- 2    | SeekRowid  | 0  | 8  | 1  |          | 0
+-- ...
+```
+
+### Output Columns
+
+| Column | Description |
+|--------|-------------|
+| addr | Instruction address (sequential integer) |
+| opcode | The operation name (e.g., OpenRead, SeekRowid, Column, ResultRow) |
+| p1 | First operand |
+| p2 | Second operand |
+| p3 | Third operand |
+| p4 | Fourth operand (often a string value like table name or collation) |
+| p5 | Fifth operand (flags) |
+
+## EXPLAIN QUERY PLAN
+
+The `EXPLAIN QUERY PLAN` prefix provides a high-level description of the strategy the query optimizer chose for executing a statement. This output is more useful than raw EXPLAIN for understanding query performance.
+
+```sql
+EXPLAIN QUERY PLAN SELECT * FROM users WHERE name = 'Alice';
+-- id | parent | notused | detail
+-- 2  | 0      | 0       | SCAN users
+```
+
+```sql
+CREATE INDEX idx_name ON users(name);
+EXPLAIN QUERY PLAN SELECT * FROM users WHERE name = 'Alice';
+-- id | parent | notused | detail
+-- 3  | 0      | 0       | SEARCH users USING INDEX idx_name (name=?)
+```
+
+### Output Columns
+
+| Column | Description |
+|--------|-------------|
+| id | A unique identifier for this step |
+| parent | The id of the parent step (0 for top-level) |
+| notused | Reserved for future use (always 0) |
+| detail | Human-readable description of the execution step |
+
+### Common Detail Messages
+
+| Detail Pattern | Meaning |
+|----------------|---------|
+| `SCAN table` | Full table scan (no index used) |
+| `SEARCH table USING INDEX idx (col=?)` | Index lookup on the specified column |
+| `SEARCH table USING INTEGER PRIMARY KEY (rowid=?)` | Direct rowid lookup |
+| `USE TEMP B-TREE FOR ORDER BY` | A temporary B-tree is used for sorting |
+| `USE TEMP B-TREE FOR DISTINCT` | A temporary B-tree is used for deduplication |
+| `COMPOUND SUBQUERY` | Indicates a UNION, INTERSECT, or EXCEPT |
+| `CORRELATED SCALAR SUBQUERY` | A correlated subquery that returns a single value |
+
+## Examples
+
+### Comparing Query Plans
+
+```sql
+CREATE TABLE orders (
+    id INTEGER PRIMARY KEY,
+    customer_id INTEGER,
+    total REAL
+);
+
+-- Without index: full table scan
+EXPLAIN QUERY PLAN SELECT * FROM orders WHERE customer_id = 42;
+-- SCAN orders
+
+-- After creating an index
+CREATE INDEX idx_customer ON orders(customer_id);
+EXPLAIN QUERY PLAN SELECT * FROM orders WHERE customer_id = 42;
+-- SEARCH orders USING INDEX idx_customer (customer_id=?)
+```
+
+### Join Order
+
+```sql
+EXPLAIN QUERY PLAN
+SELECT o.id, c.name
+FROM orders o
+INNER JOIN customers c ON c.id = o.customer_id
+WHERE c.name = 'Alice';
+-- SCAN orders AS o
+-- SEARCH customers AS c USING INTEGER PRIMARY KEY (rowid=?)
+```
+
+### Subqueries
+
+```sql
+EXPLAIN QUERY PLAN
+SELECT * FROM orders
+WHERE customer_id IN (SELECT id FROM customers WHERE active = 1);
+-- SCAN orders
+-- LIST SUBQUERY
+--   SCAN customers
+```
+
+## See Also
+
+- [ANALYZE](/docs/sql-reference/statements/analyze) for collecting statistics that improve query plans
+- [CREATE INDEX](/docs/sql-reference/statements/create-index) for creating indexes to speed up queries

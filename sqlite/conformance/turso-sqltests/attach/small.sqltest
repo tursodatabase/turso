@@ -1,0 +1,20 @@
+@database database/testing_small.db readonly
+
+# Test qualified table name access to main database
+test attach-main-qualified {
+    SELECT count(id) FROM main.demo;
+}
+expect {
+    5
+}
+
+# Test unqualified vs qualified access
+test attach-unqualified-vs-qualified {
+    SELECT COUNT(*) FROM demo;
+    SELECT COUNT(*) FROM main.demo;
+}
+expect {
+    5
+    5
+}
+

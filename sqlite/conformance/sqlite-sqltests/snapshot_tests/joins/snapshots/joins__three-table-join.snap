@@ -1,0 +1,32 @@
+---
+source: joins.sqltest
+expression: |-
+  SELECT
+          c.name AS customer_name,
+          o.order_id,
+          o.order_date,
+          p.name AS product_name,
+          oi.quantity,
+          oi.unit_price
+      FROM
+          customers c,
+          orders o,
+          order_items oi,
+          products p
+      WHERE
+          c.customer_id = o.customer_id
+          AND o.order_id = oi.order_id
+          AND oi.product_id = p.product_id;
+info:
+  statement_type: SELECT
+  tables:
+  - customers
+  setup_blocks:
+  - schema
+  database: ':memory:'
+---
+QUERY PLAN
+|--SCAN order_items AS oi
+|--SEARCH p USING INTEGER PRIMARY KEY (rowid=?)
+|--SEARCH o USING INTEGER PRIMARY KEY (rowid=?)
+`--SEARCH c USING INTEGER PRIMARY KEY (rowid=?)

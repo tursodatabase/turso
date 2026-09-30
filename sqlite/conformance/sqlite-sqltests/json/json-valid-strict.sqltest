@@ -1,0 +1,954 @@
+@database :memory:
+
+# One-argument json_valid() accepts only canonical RFC 8259 text.
+# JSON5-only syntax parses fine in the other JSON functions but must
+# return 0 here, matching SQLite.
+
+test json_valid_accepts_strict_document {
+    SELECT json_valid('{"a":5,"b":6}');
+}
+expect {
+    1
+}
+
+test json_valid_rejects_unquoted_object_keys {
+    SELECT json_valid('{a:5,b:6}');
+}
+expect {
+    0
+}
+
+test json_valid_rejects_object_trailing_comma {
+    SELECT json_valid('{"a":5, "b":6, }');
+}
+expect {
+    0
+}
+
+test json_valid_rejects_array_trailing_comma {
+    SELECT json_valid('[5, 6,]');
+}
+expect {
+    0
+}
+
+test json_valid_rejects_single_quoted_strings {
+    SELECT json_valid('{"a": ''abcd''}');
+}
+expect {
+    0
+}
+
+test json_valid_rejects_escaped_newline_in_string {
+    SELECT json_valid('{"a": "abc' || char(0x5c, 0x0a) || 'xyz"}');
+}
+expect {
+    0
+}
+
+test json_valid_rejects_raw_control_character_in_string {
+    SELECT json_valid('"abc' || char(1) || 'xyz"');
+}
+expect {
+    0
+}
+
+test json_valid_rejects_plus_signed_number {
+    SELECT json_valid('{"x":+5}');
+}
+expect {
+    0
+}
+
+test json_valid_rejects_hex_number {
+    SELECT json_valid('{"x":0x35}');
+}
+expect {
+    0
+}
+
+test json_valid_rejects_trailing_dot_number {
+    SELECT json_valid('{"x":4.}');
+}
+expect {
+    0
+}
+
+test json_valid_rejects_infinity_literal {
+    SELECT json_valid('{"x":Infinity}');
+}
+expect {
+    0
+}
+
+test json_valid_rejects_nan_literal {
+    SELECT json_valid('{"x":NaN}');
+}
+expect {
+    0
+}
+
+test json_valid_rejects_comments {
+    SELECT json_valid('{"a":1} /*c*/'), json_valid('/*c*/ 1'), json_valid('// c
+1');
+}
+expect {
+    0|0|0
+}
+
+test json_valid_accepts_standard_escapes_and_whitespace {
+    SELECT json_valid('"aA\n\/b"'), json_valid(char(9,10,13,32)||'1');
+}
+expect {
+    1|1
+}
+
+# A JSON5-only escape or raw control byte keeps the string JSON5 even
+# when a standard escape follows it, and the stored JSONB element type
+# stays TEXT5 (0x69 header) rather than demoting to TEXTJ.
+test json_valid_json5_marking_survives_later_standard_escape {
+    SELECT json_valid('"\x41\n"'), json_valid('"a' || char(1) || '\n"'),
+           json_valid('"\n\x41"'), hex(jsonb('"\x41\n"'));
+}
+expect {
+    0|0|0|695C7834315C6E
+}
+
+test json_valid_number_arguments_are_valid {
+    SELECT json_valid(123), json_valid(4.5);
+}
+expect {
+    1|1
+}
+
+test json_valid_infinite_float_argument_is_invalid {
+    SELECT json_valid(9e999), json_valid(-9e999);
+}
+expect {
+    0|0
+}
+
+test json_valid_jsonb_blob_is_invalid_for_one_arg_form {
+    SELECT json_valid(jsonb('{"a":1}'));
+}
+expect {
+    0
+}
+
+test json_valid_non_jsonb_blob_validates_as_text {
+    SELECT json_valid(x'7B7D'), json_valid(x'ABCD');
+}
+expect {
+    1|0
+}
+
+# x'2033343535' is the text " 3455". The raw blob decides whether it is
+# JSONB; the leading space says it is not, so it validates as text even
+# though the bytes after the space happen to form a JSONB integer.
+test json_valid_blob_is_classified_before_whitespace {
+    SELECT json_valid(x'2033343535');
+}
+expect {
+    1
+}
+
+# x'5B6E756C6C5D' is the text "[null]", whose first byte also parses as
+# a JSONB array header claiming the whole blob. Text can only
+# masquerade like that with a '{', '[' or digit first byte and a small
+# payload, and there full validation decides: this one fails it and is
+# read as text.
+test json_valid_ambiguous_small_blob_falls_back_to_text {
+    SELECT json_valid(x'5B6E756C6C5D');
+}
+expect {
+    1
+}
+
+# The deciding validation checks payload bytes, not just structure:
+# x'34313233' is the text "4123", whose first byte claims an INT5
+# element, but "123" is not a hex literal, so the blob is read as
+# text. x'3431322E' really is "412." under the same headers, which is
+# not JSON either way.
+test json_valid_ambiguous_blob_checks_payload_bytes {
+    SELECT json_valid(x'34313233'), json_valid(x'35313233'), json_valid(x'3431322E');
+}
+expect {
+    1|1|0
+}
+
+test json_valid_error_position_still_json5_lenient {
+    SELECT json_valid('{"x":+0}'), NOT json_error_position('{"x":+0}');
+}
+expect {
+    0|1
+}
+
+# A string that hits end of input before its closing quote is
+# malformed. A NUL inside the text ends parsing like SQLite, so a
+# quoted string cut off by one is unterminated too.
+test unterminated_string_is_malformed {
+    SELECT json_valid('"abc'), json_valid('["a","b'),
+           json_valid('"a' || char(0) || '"x'),
+           json_error_position('"abc'), json_error_position('["a","b'),
+           json_error_position('[''abc');
+}
+expect {
+    0|0|0|5|8|6
+}
+
+test unterminated_string_document_errors {
+    SELECT json('"abc');
+}
+expect error {
+    ^(Runtime error: )?(Parse error: )?malformed JSON$
+}
+
+# Even JSON5 numbers need a digit in the mantissa: a bare dot, a bare
+# sign, and an exponent with no mantissa are all malformed. SQLite
+# reports an unsigned bare dot at the dot, a signed one just after the
+# dot, and the rest at the start of the number.
+test json5_numbers_need_a_mantissa_digit {
+    SELECT json_valid('.', 2), json_valid('+e1', 2), json_valid('-e1', 2),
+           json_valid('.5', 2), json_valid('5.', 2), json_valid('+.5', 2),
+           json_error_position('.'), json_error_position('.e1'),
+           json_error_position('+.'), json_error_position('-.'),
+           json_error_position('+'), json_error_position('[.5, .]');
+}
+expect {
+    0|0|0|1|1|1|1|1|3|3|1|6
+}
+
+# A number holds at most one dot and one exponent, and the exponent
+# cannot hold a dot. The offending character is reported.
+test json5_numbers_reject_repeated_dots_and_exponents {
+    SELECT json_valid('0..', 2), json_valid('1.2.3', 2), json_valid('1e1e1', 2),
+           json_valid('1e1.5', 2), json_valid('5.e2', 2),
+           json_error_position('0..'), json_error_position('1.2.3'),
+           json_error_position('1e1e1'), json_error_position('1e1.5');
+}
+expect {
+    0|0|0|0|1|3|4|4|4
+}
+
+test digitless_number_document_errors {
+    SELECT json('.');
+}
+expect error {
+    ^(Runtime error: )?(Parse error: )?malformed JSON$
+}
+
+# The error position counts characters, not bytes: é is one character
+# but two UTF-8 bytes, both before an unterminated end of input and
+# before any other syntax error.
+test json_error_position_counts_characters_not_bytes {
+    SELECT json_error_position('"é'), json_error_position('"日本'),
+           json_error_position('{"é": x}');
+}
+expect {
+    3|4|7
+}
+
+# Two-argument json_valid(X, Y): Y is a bitmask picking which
+# representations count as valid (1 = strict RFC 8259 text, 2 = JSON5
+# text, 4 = blob that superficially looks like JSONB, 8 = blob that is
+# valid JSONB).
+
+test json_valid_flag2_accepts_json5_text {
+    SELECT json_valid('{a:1}', 1), json_valid('{a:1}', 2), json_valid('{"a":1}', 1);
+}
+expect {
+    0|1|1
+}
+
+test json_valid_blob_flags_match_jsonb_blobs_only {
+    SELECT json_valid(jsonb('{"a":1}'), 2), json_valid(jsonb('{"a":1}'), 4),
+           json_valid(jsonb('{"a":1}'), 8), json_valid(x'ABCD', 4), json_valid(x'ABCD', 8);
+}
+expect {
+    0|1|1|0|0
+}
+
+# x'3B133132' has a valid outer JSONB wrapper (ARRAY of 3 payload
+# bytes) around malformed contents: flag 4 only looks at the wrapper,
+# flag 8 validates all the way down.
+test json_valid_flag4_is_shallow_flag8_is_deep {
+    SELECT json_valid(x'3B133132', 4), json_valid(x'3B133132', 8);
+}
+expect {
+    1|0
+}
+
+# json_valid flag 8 validates numeric payload bytes, so an INT whose
+# payload is not digits fails it while document functions still accept
+# the blob shallowly.
+test json_valid_flag8_checks_numeric_payloads {
+    SELECT json_valid(x'1301', 8), json_valid(x'13FF', 8), json_valid(x'1331', 8);
+}
+expect {
+    0|0|1
+}
+
+# x'2033343535' is the text " 3455". The raw blob decides whether it is
+# JSONB, so the leading space makes this text, not a JSONB integer.
+test json_valid_flags_classify_blob_before_whitespace {
+    SELECT json_valid(x'2033343535', 1), json_valid(x'2033343535', 2),
+           json_valid(x'2033343535', 4), json_valid(x'2033343535', 8);
+}
+expect {
+    1|1|0|0
+}
+
+# x'5B6E756C6C5D' is the text "[null]": its first byte looks like a
+# JSONB array header, but small '{'/'['/digit-prefixed blobs are fully
+# validated before counting as JSONB, so this one is text under every
+# flag.
+test json_valid_flags_ambiguous_small_blob_is_text {
+    SELECT json_valid(x'5B6E756C6C5D', 1), json_valid(x'5B6E756C6C5D', 2),
+           json_valid(x'5B6E756C6C5D', 4), json_valid(x'5B6E756C6C5D', 8);
+}
+expect {
+    1|1|0|0
+}
+
+test json_valid_text_never_matches_blob_flags {
+    SELECT json_valid('[1]', 4), json_valid('[1]', 8), json_valid('[1,2,3]', 6);
+}
+expect {
+    0|0|1
+}
+
+test json_valid_flags_combine_as_bitmask {
+    SELECT json_valid('{a:1}', 3), json_valid('{a:1}', 15), json_valid(jsonb('{"a":1}'), 12);
+}
+expect {
+    1|1|1
+}
+
+test json_valid_two_arg_numbers_render_as_text {
+    SELECT json_valid(123, 1), json_valid(123, 2), json_valid(123, 4),
+           json_valid(9e999, 1), json_valid(9e999, 2);
+}
+expect {
+    1|1|0|0|1
+}
+
+test json_valid_two_arg_null_x_is_null {
+    SELECT json_valid(NULL, 1) IS NULL;
+}
+expect {
+    1
+}
+
+test json_valid_flags_coerce_numerically {
+    SELECT json_valid('{}', '2'), json_valid('{}', 2.5);
+}
+expect {
+    1|1
+}
+
+# TEXT flags take their leading integer prefix, like sqlite3_value_int:
+# '1e1' means flag 1, not 10, so a JSONB blob fails it.
+test json_valid_text_flags_use_integer_prefix {
+    SELECT json_valid(x'2B1331', '1e1'), json_valid('{}', '1e1');
+}
+expect {
+    0|1
+}
+
+test json_valid_flags_zero_is_an_error {
+    SELECT json_valid('{}', 0);
+}
+expect error {
+    ^FLAGS parameter to json_valid\(\) must be between 1 and 15$
+}
+
+test json_valid_flags_sixteen_is_an_error {
+    SELECT json_valid('{}', 16);
+}
+expect error {
+    ^FLAGS parameter to json_valid\(\) must be between 1 and 15$
+}
+
+test json_valid_flags_null_is_an_error_even_for_null_x {
+    SELECT json_valid(NULL, NULL);
+}
+expect error {
+    ^FLAGS parameter to json_valid\(\) must be between 1 and 15$
+}
+
+# Flag 8 also validates string payload syntax: TEXTJ allows only the
+# RFC 8259 escapes, TEXT5 adds the JSON5 ones (where the two bytes
+# after \x are not checked as hex digits, like SQLite), and TEXTRAW
+# accepts anything. x'38615C71' is TEXTJ "a\q", whose first byte is
+# the digit '8', so the failed strict check also makes flag 4 read it
+# as text.
+test json_valid_flag8_checks_string_escapes {
+    SELECT json_valid(x'38615C71', 8), json_valid(x'38615C71', 4),
+           json_valid(x'38615C6E', 8), json_valid(x'78615C7530303431', 8),
+           json_valid(x'78615C755A5A5A5A', 8), json_valid(x'39615C71', 8),
+           json_valid(x'49615C3035', 8), json_valid(x'59615C785A5A', 8),
+           json_valid(x'2A615C', 8);
+}
+expect {
+    0|0|1|1|0|0|0|1|1
+}
+
+# NULL, TRUE and FALSE are valid JSONB only as their bare one-byte
+# headers: an extended-size encoding of the empty payload like x'C000'
+# fails flag 8 even though its payload adds up.
+test json_valid_flag8_rejects_extended_headers_on_primitives {
+    SELECT json_valid(x'C000', 8), json_valid(x'C100', 8), json_valid(x'C200', 8),
+           json_valid(x'00', 8);
+}
+expect {
+    0|0|0|1
+}
+
+# The strict checks work on raw bytes: a text payload does not have
+# to be UTF-8, so a raw 0xFF byte passes flag 8 in every text element
+# type. A truncated UTF-8 lead byte after a line continuation only
+# consumes itself, so the bad escape after it is still found.
+test json_valid_flag8_accepts_non_utf8_text_payloads {
+    SELECT json_valid(x'17FF', 8), json_valid(x'18FF', 8),
+           json_valid(x'19FF', 8), json_valid(x'1AFF', 8),
+           json_valid(x'C9055C0AC35C71', 8);
+}
+expect {
+    1|1|1|1|0
+}
+
+# A backslash followed by a NUL byte passes as a standard escape in
+# TEXTJ and TEXT5 payloads (SQLite's strchr-based escape test matches
+# the needle string's own terminator), but TEXT allows no escapes.
+test json_valid_flag8_accepts_backslash_nul_like_sqlite {
+    SELECT json_valid(x'C8025C00', 8), json_valid(x'C9025C00', 8),
+           json_valid(x'C7025C00', 8);
+}
+expect {
+    1|1|0
+}
+
+# x'7B295C3033313233' is SQLite's jsonb('["\0",123]'): the TEXT5
+# payload ends in \0 and the next element's header byte is the digit
+# '3'. The \0 digit lookahead must stop at the payload end, so the
+# blob is valid.
+test json_valid_flag8_bounds_escape_lookahead_to_the_payload {
+    SELECT json_valid(x'7B295C3033313233', 8);
+}
+expect {
+    1
+}
+
+# \uZZZZ alone is a bad escape, but reached through a line
+# continuation SQLite converts the hex digits blindly and accepts it.
+test json_valid_flag8_skips_hex_checks_for_u_after_continuation {
+    SELECT json_valid(x'C9065C755A5A5A5A', 8), json_valid(x'C9085C0A5C755A5A5A5A', 8);
+}
+expect {
+    0|1
+}
+
+# Header nibble 15 declares an 8-byte payload size, which SQLite reads
+# with a 32-bit size: the header is valid JSONB exactly when the first
+# four size bytes are zero, at any nesting level.
+test json_valid_flags_accept_nine_byte_size_headers {
+    SELECT json_valid(x'FB0000000000000000', 4), json_valid(x'FB0000000000000000', 8),
+           json_valid(x'9BFB0000000000000000', 8),
+           json_valid(x'F3000000000000000133', 8),
+           json_valid(x'FB0000000100000000', 4), json_valid(x'FB0000000100000000', 8);
+}
+expect {
+    1|1|1|1|0|0
+}
+
+# The nested element here is a NULL with a 9-byte header: the size
+# marker itself parses, but primitives are valid only as their bare
+# one-byte headers, so flag 8 fails while the shallow flag 4 passes.
+test json_valid_flag8_rejects_nine_byte_headers_on_primitives {
+    SELECT json_valid(x'CB09F00000000000000000', 8),
+           json_valid(x'CB09F00000000000000000', 4);
+}
+expect {
+    0|1
+}
+
+# Exactly 1000 nested containers are the deepest JSONB SQLite's strict
+# check accepts; one more fails.
+test json_valid_flag8_depth_limit {
+    SELECT json_valid(x'DB0B23DB0B20DB0B1DDB0B1ADB0B17DB0B14DB0B11DB0B0EDB0B0BDB0B08DB0B05DB0B02DB0AFFDB0AFCDB0AF9DB0AF6DB0AF3DB0AF0DB0AEDDB0AEADB0AE7DB0AE4DB0AE1DB0ADEDB0ADBDB0AD8DB0AD5DB0AD2DB0ACFDB0ACCDB0AC9DB0AC6DB0AC3DB0AC0DB0ABDDB0ABADB0AB7DB0AB4DB0AB1DB0AAEDB0AABDB0AA8DB0AA5DB0AA2DB0A9FDB0A9CDB0A99DB0A96DB0A93DB0A90DB0A8DDB0A8ADB0A87DB0A84DB0A81DB0A7EDB0A7BDB0A78DB0A75DB0A72DB0A6FDB0A6CDB0A69DB0A66DB0A63DB0A60DB0A5DDB0A5ADB0A57DB0A54DB0A51DB0A4EDB0A4BDB0A48DB0A45DB0A42DB0A3FDB0A3CDB0A39DB0A36DB0A33DB0A30DB0A2DDB0A2ADB0A27DB0A24DB0A21DB0A1EDB0A1BDB0A18DB0A15DB0A12DB0A0FDB0A0CDB0A09DB0A06DB0A03DB0A00DB09FDDB09FADB09F7DB09F4DB09F1DB09EEDB09EBDB09E8DB09E5DB09E2DB09DFDB09DCDB09D9DB09D6DB09D3DB09D0DB09CDDB09CADB09C7DB09C4DB09C1DB09BEDB09BBDB09B8DB09B5DB09B2DB09AFDB09ACDB09A9DB09A6DB09A3DB09A0DB099DDB099ADB0997DB0994DB0991DB098EDB098BDB0988DB0985DB0982DB097FDB097CDB0979DB0976DB0973DB0970DB096DDB096ADB0967DB0964DB0961DB095EDB095BDB0958DB0955DB0952DB094FDB094CDB0949DB0946DB0943DB0940DB093DDB093ADB0937DB0934DB0931DB092EDB092BDB0928DB0925DB0922DB091FDB091CDB0919DB0916DB0913DB0910DB090DDB090ADB0907DB0904DB0901DB08FEDB08FBDB08F8DB08F5DB08F2DB08EFDB08ECDB08E9DB08E6DB08E3DB08E0DB08DDDB08DADB08D7DB08D4DB08D1DB08CEDB08CBDB08C8DB08C5DB08C2DB08BFDB08BCDB08B9DB08B6DB08B3DB08B0DB08ADDB08AADB08A7DB08A4DB08A1DB089EDB089BDB0898DB0895DB0892DB088FDB088CDB0889DB0886DB0883DB0880DB087DDB087ADB0877DB0874DB0871DB086EDB086BDB0868DB0865DB0862DB085FDB085CDB0859DB0856DB0853DB0850DB084DDB084ADB0847DB0844DB0841DB083EDB083BDB0838DB0835DB0832DB082FDB082CDB0829DB0826DB0823DB0820DB081DDB081ADB0817DB0814DB0811DB080EDB080BDB0808DB0805DB0802DB07FFDB07FCDB07F9DB07F6DB07F3DB07F0DB07EDDB07EADB07E7DB07E4DB07E1DB07DEDB07DBDB07D8DB07D5DB07D2DB07CFDB07CCDB07C9DB07C6DB07C3DB07C0DB07BDDB07BADB07B7DB07B4DB07B1DB07AEDB07ABDB07A8DB07A5DB07A2DB079FDB079CDB0799DB0796DB0793DB0790DB078DDB078ADB0787DB0784DB0781DB077EDB077BDB0778DB0775DB0772DB076FDB076CDB0769DB0766DB0763DB0760DB075DDB075ADB0757DB0754DB0751DB074EDB074BDB0748DB0745DB0742DB073FDB073CDB0739DB0736DB0733DB0730DB072DDB072ADB0727DB0724DB0721DB071EDB071BDB0718DB0715DB0712DB070FDB070CDB0709DB0706DB0703DB0700DB06FDDB06FADB06F7DB06F4DB06F1DB06EEDB06EBDB06E8DB06E5DB06E2DB06DFDB06DCDB06D9DB06D6DB06D3DB06D0DB06CDDB06CADB06C7DB06C4DB06C1DB06BEDB06BBDB06B8DB06B5DB06B2DB06AFDB06ACDB06A9DB06A6DB06A3DB06A0DB069DDB069ADB0697DB0694DB0691DB068EDB068BDB0688DB0685DB0682DB067FDB067CDB0679DB0676DB0673DB0670DB066DDB066ADB0667DB0664DB0661DB065EDB065BDB0658DB0655DB0652DB064FDB064CDB0649DB0646DB0643DB0640DB063DDB063ADB0637DB0634DB0631DB062EDB062BDB0628DB0625DB0622DB061FDB061CDB0619DB0616DB0613DB0610DB060DDB060ADB0607DB0604DB0601DB05FEDB05FBDB05F8DB05F5DB05F2DB05EFDB05ECDB05E9DB05E6DB05E3DB05E0DB05DDDB05DADB05D7DB05D4DB05D1DB05CEDB05CBDB05C8DB05C5DB05C2DB05BFDB05BCDB05B9DB05B6DB05B3DB05B0DB05ADDB05AADB05A7DB05A4DB05A1DB059EDB059BDB0598DB0595DB0592DB058FDB058CDB0589DB0586DB0583DB0580DB057DDB057ADB0577DB0574DB0571DB056EDB056BDB0568DB0565DB0562DB055FDB055CDB0559DB0556DB0553DB0550DB054DDB054ADB0547DB0544DB0541DB053EDB053BDB0538DB0535DB0532DB052FDB052CDB0529DB0526DB0523DB0520DB051DDB051ADB0517DB0514DB0511DB050EDB050BDB0508DB0505DB0502DB04FFDB04FCDB04F9DB04F6DB04F3DB04F0DB04EDDB04EADB04E7DB04E4DB04E1DB04DEDB04DBDB04D8DB04D5DB04D2DB04CFDB04CCDB04C9DB04C6DB04C3DB04C0DB04BDDB04BADB04B7DB04B4DB04B1DB04AEDB04ABDB04A8DB04A5DB04A2DB049FDB049CDB0499DB0496DB0493DB0490DB048DDB048ADB0487DB0484DB0481DB047EDB047BDB0478DB0475DB0472DB046FDB046CDB0469DB0466DB0463DB0460DB045DDB045ADB0457DB0454DB0451DB044EDB044BDB0448DB0445DB0442DB043FDB043CDB0439DB0436DB0433DB0430DB042DDB042ADB0427DB0424DB0421DB041EDB041BDB0418DB0415DB0412DB040FDB040CDB0409DB0406DB0403DB0400DB03FDDB03FADB03F7DB03F4DB03F1DB03EEDB03EBDB03E8DB03E5DB03E2DB03DFDB03DCDB03D9DB03D6DB03D3DB03D0DB03CDDB03CADB03C7DB03C4DB03C1DB03BEDB03BBDB03B8DB03B5DB03B2DB03AFDB03ACDB03A9DB03A6DB03A3DB03A0DB039DDB039ADB0397DB0394DB0391DB038EDB038BDB0388DB0385DB0382DB037FDB037CDB0379DB0376DB0373DB0370DB036DDB036ADB0367DB0364DB0361DB035EDB035BDB0358DB0355DB0352DB034FDB034CDB0349DB0346DB0343DB0340DB033DDB033ADB0337DB0334DB0331DB032EDB032BDB0328DB0325DB0322DB031FDB031CDB0319DB0316DB0313DB0310DB030DDB030ADB0307DB0304DB0301DB02FEDB02FBDB02F8DB02F5DB02F2DB02EFDB02ECDB02E9DB02E6DB02E3DB02E0DB02DDDB02DADB02D7DB02D4DB02D1DB02CEDB02CBDB02C8DB02C5DB02C2DB02BFDB02BCDB02B9DB02B6DB02B3DB02B0DB02ADDB02AADB02A7DB02A4DB02A1DB029EDB029BDB0298DB0295DB0292DB028FDB028CDB0289DB0286DB0283DB0280DB027DDB027ADB0277DB0274DB0271DB026EDB026BDB0268DB0265DB0262DB025FDB025CDB0259DB0256DB0253DB0250DB024DDB024ADB0247DB0244DB0241DB023EDB023BDB0238DB0235DB0232DB022FDB022CDB0229DB0226DB0223DB0220DB021DDB021ADB0217DB0214DB0211DB020EDB020BDB0208DB0205DB0202DB01FFDB01FCDB01F9DB01F6DB01F3DB01F0DB01EDDB01EADB01E7DB01E4DB01E1DB01DEDB01DBDB01D8DB01D5DB01D2DB01CFDB01CCDB01C9DB01C6DB01C3DB01C0DB01BDDB01BADB01B7DB01B4DB01B1DB01AEDB01ABDB01A8DB01A5DB01A2DB019FDB019CDB0199DB0196DB0193DB0190DB018DDB018ADB0187DB0184DB0181DB017EDB017BDB0178DB0175DB0172DB016FDB016CDB0169DB0166DB0163DB0160DB015DDB015ADB0157DB0154DB0151DB014EDB014BDB0148DB0145DB0142DB013FDB013CDB0139DB0136DB0133DB0130DB012DDB012ADB0127DB0124DB0121DB011EDB011BDB0118DB0115DB0112DB010FDB010CDB0109DB0106DB0103DB0100CBFECBFCCBFACBF8CBF6CBF4CBF2CBF0CBEECBECCBEACBE8CBE6CBE4CBE2CBE0CBDECBDCCBDACBD8CBD6CBD4CBD2CBD0CBCECBCCCBCACBC8CBC6CBC4CBC2CBC0CBBECBBCCBBACBB8CBB6CBB4CBB2CBB0CBAECBACCBAACBA8CBA6CBA4CBA2CBA0CB9ECB9CCB9ACB98CB96CB94CB92CB90CB8ECB8CCB8ACB88CB86CB84CB82CB80CB7ECB7CCB7ACB78CB76CB74CB72CB70CB6ECB6CCB6ACB68CB66CB64CB62CB60CB5ECB5CCB5ACB58CB56CB54CB52CB50CB4ECB4CCB4ACB48CB46CB44CB42CB40CB3ECB3CCB3ACB38CB36CB34CB32CB30CB2ECB2CCB2ACB28CB26CB24CB22CB20CB1ECB1CCB1ACB18CB16CB14CB12CB10CB0ECB0CBBAB9B8B7B6B5B4B3B2B1B0B', 8),
+           json_valid(x'DB0B26DB0B23DB0B20DB0B1DDB0B1ADB0B17DB0B14DB0B11DB0B0EDB0B0BDB0B08DB0B05DB0B02DB0AFFDB0AFCDB0AF9DB0AF6DB0AF3DB0AF0DB0AEDDB0AEADB0AE7DB0AE4DB0AE1DB0ADEDB0ADBDB0AD8DB0AD5DB0AD2DB0ACFDB0ACCDB0AC9DB0AC6DB0AC3DB0AC0DB0ABDDB0ABADB0AB7DB0AB4DB0AB1DB0AAEDB0AABDB0AA8DB0AA5DB0AA2DB0A9FDB0A9CDB0A99DB0A96DB0A93DB0A90DB0A8DDB0A8ADB0A87DB0A84DB0A81DB0A7EDB0A7BDB0A78DB0A75DB0A72DB0A6FDB0A6CDB0A69DB0A66DB0A63DB0A60DB0A5DDB0A5ADB0A57DB0A54DB0A51DB0A4EDB0A4BDB0A48DB0A45DB0A42DB0A3FDB0A3CDB0A39DB0A36DB0A33DB0A30DB0A2DDB0A2ADB0A27DB0A24DB0A21DB0A1EDB0A1BDB0A18DB0A15DB0A12DB0A0FDB0A0CDB0A09DB0A06DB0A03DB0A00DB09FDDB09FADB09F7DB09F4DB09F1DB09EEDB09EBDB09E8DB09E5DB09E2DB09DFDB09DCDB09D9DB09D6DB09D3DB09D0DB09CDDB09CADB09C7DB09C4DB09C1DB09BEDB09BBDB09B8DB09B5DB09B2DB09AFDB09ACDB09A9DB09A6DB09A3DB09A0DB099DDB099ADB0997DB0994DB0991DB098EDB098BDB0988DB0985DB0982DB097FDB097CDB0979DB0976DB0973DB0970DB096DDB096ADB0967DB0964DB0961DB095EDB095BDB0958DB0955DB0952DB094FDB094CDB0949DB0946DB0943DB0940DB093DDB093ADB0937DB0934DB0931DB092EDB092BDB0928DB0925DB0922DB091FDB091CDB0919DB0916DB0913DB0910DB090DDB090ADB0907DB0904DB0901DB08FEDB08FBDB08F8DB08F5DB08F2DB08EFDB08ECDB08E9DB08E6DB08E3DB08E0DB08DDDB08DADB08D7DB08D4DB08D1DB08CEDB08CBDB08C8DB08C5DB08C2DB08BFDB08BCDB08B9DB08B6DB08B3DB08B0DB08ADDB08AADB08A7DB08A4DB08A1DB089EDB089BDB0898DB0895DB0892DB088FDB088CDB0889DB0886DB0883DB0880DB087DDB087ADB0877DB0874DB0871DB086EDB086BDB0868DB0865DB0862DB085FDB085CDB0859DB0856DB0853DB0850DB084DDB084ADB0847DB0844DB0841DB083EDB083BDB0838DB0835DB0832DB082FDB082CDB0829DB0826DB0823DB0820DB081DDB081ADB0817DB0814DB0811DB080EDB080BDB0808DB0805DB0802DB07FFDB07FCDB07F9DB07F6DB07F3DB07F0DB07EDDB07EADB07E7DB07E4DB07E1DB07DEDB07DBDB07D8DB07D5DB07D2DB07CFDB07CCDB07C9DB07C6DB07C3DB07C0DB07BDDB07BADB07B7DB07B4DB07B1DB07AEDB07ABDB07A8DB07A5DB07A2DB079FDB079CDB0799DB0796DB0793DB0790DB078DDB078ADB0787DB0784DB0781DB077EDB077BDB0778DB0775DB0772DB076FDB076CDB0769DB0766DB0763DB0760DB075DDB075ADB0757DB0754DB0751DB074EDB074BDB0748DB0745DB0742DB073FDB073CDB0739DB0736DB0733DB0730DB072DDB072ADB0727DB0724DB0721DB071EDB071BDB0718DB0715DB0712DB070FDB070CDB0709DB0706DB0703DB0700DB06FDDB06FADB06F7DB06F4DB06F1DB06EEDB06EBDB06E8DB06E5DB06E2DB06DFDB06DCDB06D9DB06D6DB06D3DB06D0DB06CDDB06CADB06C7DB06C4DB06C1DB06BEDB06BBDB06B8DB06B5DB06B2DB06AFDB06ACDB06A9DB06A6DB06A3DB06A0DB069DDB069ADB0697DB0694DB0691DB068EDB068BDB0688DB0685DB0682DB067FDB067CDB0679DB0676DB0673DB0670DB066DDB066ADB0667DB0664DB0661DB065EDB065BDB0658DB0655DB0652DB064FDB064CDB0649DB0646DB0643DB0640DB063DDB063ADB0637DB0634DB0631DB062EDB062BDB0628DB0625DB0622DB061FDB061CDB0619DB0616DB0613DB0610DB060DDB060ADB0607DB0604DB0601DB05FEDB05FBDB05F8DB05F5DB05F2DB05EFDB05ECDB05E9DB05E6DB05E3DB05E0DB05DDDB05DADB05D7DB05D4DB05D1DB05CEDB05CBDB05C8DB05C5DB05C2DB05BFDB05BCDB05B9DB05B6DB05B3DB05B0DB05ADDB05AADB05A7DB05A4DB05A1DB059EDB059BDB0598DB0595DB0592DB058FDB058CDB0589DB0586DB0583DB0580DB057DDB057ADB0577DB0574DB0571DB056EDB056BDB0568DB0565DB0562DB055FDB055CDB0559DB0556DB0553DB0550DB054DDB054ADB0547DB0544DB0541DB053EDB053BDB0538DB0535DB0532DB052FDB052CDB0529DB0526DB0523DB0520DB051DDB051ADB0517DB0514DB0511DB050EDB050BDB0508DB0505DB0502DB04FFDB04FCDB04F9DB04F6DB04F3DB04F0DB04EDDB04EADB04E7DB04E4DB04E1DB04DEDB04DBDB04D8DB04D5DB04D2DB04CFDB04CCDB04C9DB04C6DB04C3DB04C0DB04BDDB04BADB04B7DB04B4DB04B1DB04AEDB04ABDB04A8DB04A5DB04A2DB049FDB049CDB0499DB0496DB0493DB0490DB048DDB048ADB0487DB0484DB0481DB047EDB047BDB0478DB0475DB0472DB046FDB046CDB0469DB0466DB0463DB0460DB045DDB045ADB0457DB0454DB0451DB044EDB044BDB0448DB0445DB0442DB043FDB043CDB0439DB0436DB0433DB0430DB042DDB042ADB0427DB0424DB0421DB041EDB041BDB0418DB0415DB0412DB040FDB040CDB0409DB0406DB0403DB0400DB03FDDB03FADB03F7DB03F4DB03F1DB03EEDB03EBDB03E8DB03E5DB03E2DB03DFDB03DCDB03D9DB03D6DB03D3DB03D0DB03CDDB03CADB03C7DB03C4DB03C1DB03BEDB03BBDB03B8DB03B5DB03B2DB03AFDB03ACDB03A9DB03A6DB03A3DB03A0DB039DDB039ADB0397DB0394DB0391DB038EDB038BDB0388DB0385DB0382DB037FDB037CDB0379DB0376DB0373DB0370DB036DDB036ADB0367DB0364DB0361DB035EDB035BDB0358DB0355DB0352DB034FDB034CDB0349DB0346DB0343DB0340DB033DDB033ADB0337DB0334DB0331DB032EDB032BDB0328DB0325DB0322DB031FDB031CDB0319DB0316DB0313DB0310DB030DDB030ADB0307DB0304DB0301DB02FEDB02FBDB02F8DB02F5DB02F2DB02EFDB02ECDB02E9DB02E6DB02E3DB02E0DB02DDDB02DADB02D7DB02D4DB02D1DB02CEDB02CBDB02C8DB02C5DB02C2DB02BFDB02BCDB02B9DB02B6DB02B3DB02B0DB02ADDB02AADB02A7DB02A4DB02A1DB029EDB029BDB0298DB0295DB0292DB028FDB028CDB0289DB0286DB0283DB0280DB027DDB027ADB0277DB0274DB0271DB026EDB026BDB0268DB0265DB0262DB025FDB025CDB0259DB0256DB0253DB0250DB024DDB024ADB0247DB0244DB0241DB023EDB023BDB0238DB0235DB0232DB022FDB022CDB0229DB0226DB0223DB0220DB021DDB021ADB0217DB0214DB0211DB020EDB020BDB0208DB0205DB0202DB01FFDB01FCDB01F9DB01F6DB01F3DB01F0DB01EDDB01EADB01E7DB01E4DB01E1DB01DEDB01DBDB01D8DB01D5DB01D2DB01CFDB01CCDB01C9DB01C6DB01C3DB01C0DB01BDDB01BADB01B7DB01B4DB01B1DB01AEDB01ABDB01A8DB01A5DB01A2DB019FDB019CDB0199DB0196DB0193DB0190DB018DDB018ADB0187DB0184DB0181DB017EDB017BDB0178DB0175DB0172DB016FDB016CDB0169DB0166DB0163DB0160DB015DDB015ADB0157DB0154DB0151DB014EDB014BDB0148DB0145DB0142DB013FDB013CDB0139DB0136DB0133DB0130DB012DDB012ADB0127DB0124DB0121DB011EDB011BDB0118DB0115DB0112DB010FDB010CDB0109DB0106DB0103DB0100CBFECBFCCBFACBF8CBF6CBF4CBF2CBF0CBEECBECCBEACBE8CBE6CBE4CBE2CBE0CBDECBDCCBDACBD8CBD6CBD4CBD2CBD0CBCECBCCCBCACBC8CBC6CBC4CBC2CBC0CBBECBBCCBBACBB8CBB6CBB4CBB2CBB0CBAECBACCBAACBA8CBA6CBA4CBA2CBA0CB9ECB9CCB9ACB98CB96CB94CB92CB90CB8ECB8CCB8ACB88CB86CB84CB82CB80CB7ECB7CCB7ACB78CB76CB74CB72CB70CB6ECB6CCB6ACB68CB66CB64CB62CB60CB5ECB5CCB5ACB58CB56CB54CB52CB50CB4ECB4CCB4ACB48CB46CB44CB42CB40CB3ECB3CCB3ACB38CB36CB34CB32CB30CB2ECB2CCB2ACB28CB26CB24CB22CB20CB1ECB1CCB1ACB18CB16CB14CB12CB10CB0ECB0CBBAB9B8B7B6B5B4B3B2B1B0B', 8);
+}
+expect {
+    1|0
+}
+
+# json_quote must escape control characters so its output is always
+# strict RFC 8259 text: \b \f \n \r \t for the named ones, \u00xx for
+# the rest. The forward slash is not escaped.
+
+test json_quote_escapes_control_characters {
+    SELECT json_quote('a' || char(1) || 'z'), json_quote('a' || char(11) || 'z'),
+           json_quote('a' || char(31) || 'z');
+}
+expect {
+    "a\u0001z"|"a\u000bz"|"a\u001fz"
+}
+
+test json_quote_uses_short_escapes_for_named_controls {
+    SELECT json_quote('a' || char(10) || 'z'), json_quote('a' || char(9) || 'z'),
+           json_quote('a' || char(13) || 'z'), json_quote('a' || char(8) || 'z'),
+           json_quote('a' || char(12) || 'z');
+}
+expect {
+    "a\nz"|"a\tz"|"a\rz"|"a\bz"|"a\fz"
+}
+
+test json_quote_leaves_slash_alone {
+    SELECT json_quote('a/b'), json_quote('a"b');
+}
+expect {
+    "a/b"|"a\"b"
+}
+
+test json_quote_output_is_always_strict_json {
+    WITH RECURSIVE c(x) AS (VALUES(1) UNION ALL SELECT x+1 FROM c WHERE x < 0x1f)
+    SELECT sum(json_valid(json_quote('a' || char(x) || 'z'))) FROM c;
+}
+expect {
+    31
+}
+
+# JSON5 strings may span lines by escaping any of the four line
+# terminators: LF, CR, CRLF, U+2028 and U+2029. The continuation is
+# dropped from the string value.
+
+test json5_line_continuation_lf {
+    SELECT ('{a: "abc' || char(0x5c, 0x0a) || 'xyz"}') ->> 'a';
+}
+expect {
+    abcxyz
+}
+
+test json5_line_continuation_cr {
+    SELECT ('{a: "abc' || char(0x5c, 0x0d) || 'xyz"}') ->> 'a';
+}
+expect {
+    abcxyz
+}
+
+test json5_line_continuation_crlf_is_one_terminator {
+    SELECT ('{a: "abc' || char(0x5c, 0x0d, 0x0a) || 'xyz"}') ->> 'a';
+}
+expect {
+    abcxyz
+}
+
+test json5_line_continuation_u2028_u2029 {
+    SELECT ('{a: "abc' || char(0x5c, 0x2028) || 'xyz"}') ->> 'a',
+           ('{a: "abc' || char(0x5c, 0x2029) || 'xyz"}') ->> 'a';
+}
+expect {
+    abcxyz|abcxyz
+}
+
+test json5_line_continuation_json_rendering {
+    SELECT json('{a: "abc' || char(0x5c, 0x0d) || 'xyz"}');
+}
+expect {
+    {"a":"abcxyz"}
+}
+
+test json5_escaped_double_quote_unescapes {
+    SELECT ('{a: "abc' || char(0x5c, 0x22) || 'xyz"}') ->> 'a';
+}
+expect {
+    abc"xyz
+}
+
+# The JSON5 vertical-tab escape decodes to U+000B on extraction, but
+# json() renders it with the horizontal-tab escape u0009, matching the
+# SQLite version we target (upstream fixed the escape in 3.51.2).
+
+test json5_vertical_tab_escape_decodes_to_0x0b {
+    SELECT hex(('{a: "x' || char(0x5c, 0x76) || 'z"}') ->> 'a'),
+           json('{a: "x' || char(0x5c, 0x76) || 'z"}');
+}
+expect {
+    780B7A|{"a":"x\u0009z"}
+}
+
+# JSON5 numbers with a trailing decimal point: the canonical rendering
+# inserts the missing zero after the dot, before any exponent. Numbers
+# whose only JSON5 feature is a leading '+' stay untouched.
+
+test json5_trailing_dot_gets_zero_inserted {
+    SELECT json('{x: 4.}'), json('{x: 4.e0}'), json('{x: +4.e1}'), json('{x: -4.e2}');
+}
+expect {
+    {"x":4.0}|{"x":4.0e0}|{"x":4.0e1}|{"x":-4.0e2}
+}
+
+# CAST to TEXT so the engine formats the REAL results; the JS driver
+# would otherwise render 4.0 as the bare number 4.
+test json5_trailing_dot_extracted_value {
+    SELECT CAST(('{x: 4.e0}')->>'x' AS TEXT),
+           CAST(('{x: +4.e1}')->>'x' AS TEXT),
+           CAST(('{x: -4.e2}')->>'x' AS TEXT);
+}
+expect {
+    4.0|40.0|-400.0
+}
+
+test json5_plus_only_numbers_stay_canonical {
+    SELECT json('{x: +4e1}'), json('{x: +5.5}'), json('{x: 4.E2}');
+}
+expect {
+    {"x":4e1}|{"x":5.5}|{"x":4.0E2}
+}
+
+# JSON5 Infinity: -> renders the JSON text 9e999, while ->> and
+# json_extract return the infinite REAL.
+
+test json5_infinity_arrow_renders_9e999 {
+    SELECT '{x:Infinity}'->'x', typeof('{x:Infinity}'->'x');
+}
+expect {
+    9e999|text
+}
+
+test json5_infinity_double_arrow_returns_real {
+    SELECT '{x:Infinity}'->>'x', typeof('{x:Infinity}'->>'x'),
+           '{x:-Infinity}'->>'x', json_extract('{x:Infinity}','$.x');
+}
+expect {
+    Inf|real|-Inf|Inf
+}
+
+test json5_infinity_document_renderings {
+    SELECT json('Infinity'), json('{x:-Infinity}'), json('{"x":9e999}'), json_quote(9e999);
+}
+expect {
+    9e999|{"x":-9e999}|{"x":9e999}|9.0e+999
+}
+
+# A leading-plus overflow number is an ordinary JSON5 number, not the
+# Infinity literal: its text must survive rendering unchanged even
+# though its value is infinite.
+test json5_plus_overflow_number_keeps_its_text {
+    SELECT '+9.0e+999'->'$', '{x: +9.0e+999}'->'$.x', typeof('+9.0e+999'->>'$');
+}
+expect {
+    9.0e+999|9.0e+999|real
+}
+
+# Unquoted JSON5 object keys follow SQLite's identifier rules: ASCII
+# letters, '_' and '$' may start one, digits may only continue one,
+# non-ASCII characters are accepted, everything else is malformed.
+
+test json5_unquoted_key_charset {
+    SELECT json_valid('{x1:5}',2), json_valid('{_x:5}',2), json_valid('{$x:5}',2),
+           json_valid('{éx:5}',2);
+}
+expect {
+    1|1|1|1
+}
+
+test json5_unquoted_key_rejects_illegal_characters {
+    SELECT json_valid('{1x:5}',2), json_valid('{x-y:5}',2), json_valid('{x.y:5}',2),
+           json_valid('{x/y:5}',2), json_valid('{:5}',2), json_valid('{a'||char(1)||':1}',2);
+}
+expect {
+    0|0|0|0|0|0
+}
+
+test json5_unquoted_key_slash_is_malformed {
+    SELECT json('{ MNO_123/xyz : 789 }');
+}
+expect error {
+    ^(Parse error: )?malformed JSON$
+}
+
+# \uXXXX escapes may appear anywhere in an unquoted key, whatever they
+# decode to; rendering keeps the escape and path matching decodes it.
+# No other escape is allowed in a key.
+test json5_unquoted_key_accepts_unicode_escapes {
+    SELECT json('{' || char(0x5c) || 'u0061:1}'),
+           ('{' || char(0x5c) || 'u0061:1}')->>'a',
+           ('{a' || char(0x5c) || 'u0062:1}')->>'ab',
+           json('{' || char(0x5c) || 'u0031:1}');
+}
+expect {
+    {"\u0061":1}|1|1|{"\u0031":1}
+}
+
+test json5_unquoted_key_rejects_other_escapes {
+    SELECT json_valid('{a' || char(0x5c) || 'tb:1}', 2),
+           json_valid('{a' || char(0x5c) || 'x62:1}', 2),
+           json_valid('{' || char(0x5c) || 'u061:1}', 2);
+}
+expect {
+    0|0|0
+}
+
+# A comment directly after an unquoted key acts as whitespace.
+test json5_unquoted_key_ends_at_comment {
+    SELECT json('{x/*c*/:1}'), json('{x//c' || char(10) || ':1}'), json_valid('{x/y:1}', 2);
+}
+expect {
+    {"x":1}|{"x":1}|0
+}
+
+# Array locators counting from the end: leading zeros in [#-n] keep the
+# sign, and [#-0] addresses the same one-past-the-end position as [#].
+
+test json_path_from_end_leading_zeros_keep_sign {
+    SELECT json_extract('{"b":[1,[2,3],4]}','$.b[#-02]'),
+           json_extract('{"b":[1,[2,3],4]}','$.b[#-000001]'),
+           json_extract('{"b":[1,2]}','$.b[#-00002]');
+}
+expect {
+    [2,3]|4|1
+}
+
+test json_path_minus_zero_is_one_past_the_end {
+    SELECT json_remove('{"b":[1,2]}','$.b[#-0]'),
+           json_extract('{"b":[1,2]}','$.b[#-0]') IS NULL;
+}
+expect {
+    {"b":[1,2]}|1
+}
+
+# Appending with [#] or the exact one-past-the-end index works for both
+# json_set and json_insert; larger indexes and from-end locators are
+# no-ops for insert-only mode.
+
+test json_array_append_with_hash_and_end_index {
+    SELECT json_insert('{"b":[1,2]}','$.b[#]','X'),
+           json_insert('{"b":[1,2]}','$.b[2]','X'),
+           json_set('{"b":[1,2]}','$.b[#]','X','$.b[#]','Y'),
+           json_insert('[1,2]','$[#]','X'),
+           json_insert('{"b":[[2,3]]}','$.b[0][2]','X');
+}
+expect {
+    {"b":[1,2,"X"]}|{"b":[1,2,"X"]}|{"b":[1,2,"X","Y"]}|[1,2,"X"]|{"b":[[2,3,"X"]]}
+}
+
+test json_array_append_out_of_range_is_noop {
+    SELECT json_insert('{"b":[1,2]}','$.b[5]','X'),
+           json_insert('{"b":[1,2]}','$.b[#-1]','X'),
+           json_insert('{"b":[[2,3]]}','$.b[0][5]','X');
+}
+expect {
+    {"b":[1,2]}|{"b":[1,2]}|{"b":[[2,3]]}
+}
+
+test json_appended_document_stays_well_formed {
+    SELECT json_extract(json_set('{"b":[1,2]}','$.b[#]','X'),'$.b[2]'),
+           json(jsonb_set('{"b":[1,2]}','$.b[#]','X'));
+}
+expect {
+    X|{"b":[1,2,"X"]}
+}
+
+# An 11-byte array payload sits exactly on a JSONB header size-format
+# boundary: appending grows the array's own header, which shifts the
+# contents. The appended value and the document must survive that.
+test json_append_across_array_header_size_boundary {
+    SELECT json_extract(json_set(json('{"b":' || json_array(
+               null,null,null,null,null,null,null,null,null,null,null) || '}'),
+               '$.b[#]', 'X'), '$.b[10]', '$.b[11]'),
+           json_valid(jsonb_set(json('{"b":' || json_array(
+               null,null,null,null,null,null,null,null,null,null,null) || '}'),
+               '$.b[11]', 'X'), 8);
+}
+expect {
+    [null,"X"]|1
+}
+
+# x'8C1762CB0413311332' encodes {"b":[1,2]} with a non-minimal
+# two-byte header on the array. Appending rewrites the header
+# minimally, which shrinks it and shifts the contents left.
+test json_append_shrinks_non_minimal_array_header {
+    SELECT json_insert(x'8C1762CB0413311332','$.b[2]','X'),
+           json_insert(x'8C1762CB0413311332','$.b[#]','X');
+}
+expect {
+    {"b":[1,2,"X"]}|{"b":[1,2,"X"]}
+}
+
+# When a later path segment fails, the placeholder container an
+# earlier append segment created must not survive: the document stays
+# unchanged.
+test json_append_failed_traversal_leaves_document_unchanged {
+    SELECT json_insert('{"b":[1,2]}','$.b[#][5]','X'),
+           json_insert('{"b":[1,2]}','$.b[2][5]','X'),
+           json_insert('{"b":[1,2]}','$.b[#][0]','X');
+}
+expect {
+    {"b":[1,2]}|{"b":[1,2]}|{"b":[1,2,["X"]]}
+}
+
+# Malformed paths report SQLite's message format, with the path quoted.
+
+test json_bad_path_error_message_format {
+    SELECT json_extract('{"b":[1]}', '$.b[#-]');
+}
+expect error {
+    ^(Parse error: )?bad JSON path: '\$\.b\[#-\]'$
+}
+
+# Apostrophes in the path are doubled in the message, like SQLite's %Q.
+test json_bad_path_message_doubles_apostrophes {
+    SELECT json_extract('{}', 'x''y''z');
+}
+expect error {
+    ^(Parse error: )?bad JSON path: 'x''y''z'$
+}
+
+# %Q reads a C string, so the message stops at an embedded NUL.
+test json_bad_path_message_stops_at_nul {
+    SELECT json_extract('{}', 'x' || char(0) || 'y');
+}
+expect error {
+    ^(Parse error: )?bad JSON path: 'x'$
+}
+
+# subtype() reports 74 ('J') for TEXT a JSON function produced, and 0
+# for everything else — including JSONB blobs, whose acceptance as
+# arguments is purely structural.
+
+test subtype_reports_json_text_only {
+    SELECT subtype(json('{}')), subtype(jsonb('{}')), subtype('{}'),
+           subtype(1), subtype(NULL), subtype(json_extract('{"a":[1]}','$.a')),
+           subtype(json_extract('{"a":1}','$.a'));
+}
+expect {
+    74|0|0|0|0|74|0
+}
+
+test double_arrow_result_never_carries_subtype {
+    SELECT subtype('{"a":[7,8]}'->'a'), subtype('{"a":[7,8]}'->>'a'),
+           typeof('{"a":[7,8]}'->>'a');
+}
+expect {
+    74|0|text
+}
+
+test jsonb_blob_arguments_accepted_structurally {
+    SELECT json_array(jsonb_array(1,2)), json(jsonb_array(json_array(1,2))),
+           json_object('ex', jsonb('[52,3.14159]')),
+           json_set('{"a":2,"c":4}', '$.c', jsonb('[97,96]')),
+           json_array(x'0B'), json_quote(x'0B');
+}
+expect {
+    [[1,2]]|[[1,2]]|{"ex":[52,3.14159]}|{"a":2,"c":[97,96]}|[[]]|[]
+}
+
+test non_jsonb_blob_arguments_error {
+    SELECT json_array(x'313233');
+}
+expect error {
+    ^(Runtime error: )?(Parse error: )?JSON cannot hold BLOB values$
+}
+
+# Document arguments accept blobs everywhere: JSONB blobs directly,
+# and other blobs as JSON text (x'313233' is the text "123").
+test patch_and_error_position_accept_blobs {
+    SELECT json_patch(jsonb('{"a":1}'), jsonb('{"b":2}')),
+           json(jsonb_patch(jsonb('{"a":1}'), jsonb('{"b":2}'))),
+           json_patch(x'313233', '{}'),
+           json_error_position(jsonb('{"a":1}')),
+           json_error_position(x'313233'), json_error_position(x'ABCD');
+}
+expect {
+    {"a":1,"b":2}|{"a":1,"b":2}|{}|0|0|1
+}
+
+# Only text a JSON function produced as a JSON value carries the 'J'
+# subtype: json_quote and json_patch results do, while metadata text
+# from json_type and display text from json_pretty do not.
+test subtype_marks_json_values_not_metadata {
+    SELECT subtype(json_quote('x')), subtype(json_quote(5)), subtype(json_quote(NULL)),
+           subtype(json_patch('{}','null')), subtype(json_patch('{"a":1}','{"b":2}')),
+           subtype(json_type('{}')), subtype(json_type('[3]','$[0]')),
+           subtype(json_pretty('{}'));
+}
+expect {
+    74|74|74|74|74|0|0|0
+}
+
+# Unmarked json_type output nests as a plain string.
+test json_type_output_nests_as_text {
+    SELECT json_array(json_type('{}'));
+}
+expect {
+    ["object"]
+}
+
+# A JSON null patch result stays a JSON value: json_patch returns the
+# text 'null' with the 'J' subtype and jsonb_patch the JSONB null blob,
+# not SQL NULL.
+test patch_json_null_result_stays_json {
+    SELECT json_patch('{}', jsonb('null')), subtype(json_patch('{}', jsonb('null'))),
+           json_patch('{}', x'00'), json_patch('{}', 'null'),
+           json_patch('{"a":1}', 'null'),
+           hex(jsonb_patch('{}', jsonb('null'))), hex(jsonb_patch('{}', 'null'));
+}
+expect {
+    null|74|null|null|null|00|00
+}
+
+# A malformed blob target errors even when the patch is the text
+# 'null'.
+test patch_validates_target_before_null_patch {
+    SELECT json_patch(x'ABCD', 'null');
+}
+expect error {
+    ^(Runtime error: )?(Parse error: )?malformed JSON$
+}
+
+test jsonb_patch_validates_target_before_null_patch {
+    SELECT jsonb_patch(x'ABCD', 'null');
+}
+expect error {
+    ^(Runtime error: )?(Parse error: )?malformed JSON$
+}
+
+# json_error_position reads a non-JSONB blob as text that stops at the
+# first NUL: x'3132330078' is "123" followed by NUL and garbage.
+test json_error_position_blob_stops_at_nul {
+    SELECT json_error_position(x'3132330078');
+}
+expect {
+    0
+}
+
+# A blob that looks like JSONB reports the byte offset of its first
+# malformed element instead of being re-read as text: x'3B133132' is an
+# array whose second element claims to be FALSE with a payload, and
+# x'1301' and x'2B31FF' carry non-digit bytes in numeric payloads.
+# x'5B6E756C6C5D' is the text "[null]" whose first byte only looks like
+# an array header, and x'22FF22' reads as text because FALSE cannot
+# carry a payload.
+test json_error_position_reports_jsonb_offsets {
+    SELECT json_error_position(x'3B133132'), json_error_position(x'1301'),
+           json_error_position(x'2B31FF'), json_error_position(x'5B6E756C6C5D'),
+           json_error_position(x'22FF22'), json_error_position(x'CB01');
+}
+expect {
+    4|2|2|0|0|1
+}
+
+# Text parsed as a JSON document stops at the first NUL, like SQLite,
+# so trailing bytes after one are invisible to the parser. A text
+# value converted to a JSON string keeps the NUL as an escape.
+test json_text_stops_at_first_nul {
+    SELECT json('123' || char(0) || 'x'),
+           json_extract('{"a":7}' || char(0) || 'junk', '$.a'),
+           json_array_length('[1,2]' || char(0) || 'zzz'),
+           json_error_position('"a' || char(0) || '"x'),
+           json_insert('{}', '$.a', 'x' || char(0) || 'y');
+}
+expect {
+    123|7|2|3|{"a":"x\u0000y"}
+}

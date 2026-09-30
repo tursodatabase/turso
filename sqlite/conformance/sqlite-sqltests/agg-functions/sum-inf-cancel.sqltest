@@ -1,0 +1,43 @@
+@database :memory:
+
+@cross-check-integrity
+test sum_inf_minus_inf {
+    CREATE TABLE t1 (a);
+    INSERT INTO t1 VALUES ('1e999');
+    INSERT INTO t1 VALUES ('-1e999');
+    SELECT typeof(SUM(a)), SUM(a) FROM t1;
+}
+expect {
+    null|
+}
+
+@cross-check-integrity
+test avg_inf_minus_inf {
+    CREATE TABLE t2 (a);
+    INSERT INTO t2 VALUES ('1e999');
+    INSERT INTO t2 VALUES ('-1e999');
+    SELECT typeof(AVG(a)), AVG(a) FROM t2;
+}
+expect {
+    null|
+}
+
+@cross-check-integrity
+test total_inf_minus_inf {
+    CREATE TABLE t3 (a);
+    INSERT INTO t3 VALUES ('1e999');
+    INSERT INTO t3 VALUES ('-1e999');
+    SELECT typeof(TOTAL(a)), TOTAL(a) FROM t3;
+}
+expect {
+    null|
+}
+
+@cross-check-integrity
+test sum_inf_cancel_with_finite_values {
+    WITH t1(x) AS (VALUES(1.0),(-9e+999),(2.0),(+9e+999),(3.0))
+    SELECT typeof(sum(x)), sum(x) FROM t1;
+}
+expect {
+    null|
+}

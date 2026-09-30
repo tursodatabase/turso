@@ -1,0 +1,67 @@
+@database :memory:
+
+# Regression test for #7371: NATURAL JOIN and USING() were rejecting
+# columns whose stored name was not all-lowercase (i.e. any column that
+# was originally quoted with mixed case, including names containing
+# punctuation that forced quoting). The USING-clause expansion in
+# planner.rs lowercased the join column name but then compared it
+# case-sensitively against `Column::name`, which preserves the original
+# casing for quoted identifiers. SQLite identifier comparisons are
+# case-insensitive.
+
+setup natural-join-quoted-hyphen-schema {
+    CREATE TABLE t("NUMERIC-ish" NUMERIC);
+    INSERT INTO t VALUES (1);
+}
+
+@setup natural-join-quoted-hyphen-schema
+test issue-7371-natural-join-quoted-hyphen {
+    SELECT *
+    FROM t AS a
+    NATURAL JOIN t AS b;
+}
+expect {
+1
+}
+
+setup natural-join-mixed-case-schema {
+    CREATE TABLE t("MyCol" INTEGER);
+    INSERT INTO t VALUES (7);
+}
+
+@setup natural-join-mixed-case-schema
+test issue-7371-natural-join-mixed-case {
+    SELECT *
+    FROM t AS a
+    NATURAL JOIN t AS b;
+}
+expect {
+7
+}
+
+setup using-mixed-case-schema {
+    CREATE TABLE t1("MyCol" INTEGER, x INTEGER);
+    CREATE TABLE t2("MyCol" INTEGER, y INTEGER);
+    INSERT INTO t1 VALUES (1, 10);
+    INSERT INTO t2 VALUES (1, 20);
+}
+
+@setup using-mixed-case-schema
+test issue-7371-using-quoted-mixed-case {
+    SELECT *
+    FROM t1 JOIN t2 USING("MyCol")
+    ORDER BY 1;
+}
+expect {
+1|10|20
+}
+
+@setup using-mixed-case-schema
+test issue-7371-using-bare-different-case {
+    SELECT *
+    FROM t1 JOIN t2 USING(mycol)
+    ORDER BY 1;
+}
+expect {
+1|10|20
+}

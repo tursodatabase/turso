@@ -1,0 +1,161 @@
+---
+title: Multi-Process Access
+description: Share a Turso database file between multiple OS processes using the experimental multiprocess WAL coordinator
+sidebarTitle: Multi-Process Access
+---
+
+# Multi-Process Access
+
+<Warning>
+Multi-process access is **experimental**. The on-disk coordination format and the public API may change between releases. Do not rely on the format for long-term storage across Turso versions.
+</Warning>
+
+By default, a Turso database file is opened by a single OS process. Multiple threads and connections within that process can safely share the database, but opening the same file from a second process is rejected with a locking error.
+
+Multi-process access removes that restriction. When the `multiprocess_wal` feature is enabled, several processes can open the same `.db` file concurrently and coordinate WAL reads, writes, and checkpoints through a shared memory file.
+
+## When to Use It
+
+Enable multi-process access when you need:
+
+- Multiple independent OS processes (workers, sidecars, CLI + embedded app) to read and write the same database file without a server tier.
+- Zero-downtime deploys where an old process and a new process briefly overlap on the same database.
+- Process-per-connection deployments that need stronger isolation than threads.
+
+For single-process applications — including multi-threaded servers using a connection pool — the default mode is faster and requires no configuration.
+
+## How It Works
+
+When multi-process access is enabled, Turso creates an additional sibling file next to the database:
+
+| File | Purpose |
+|------|---------|
+| `mydb.db` | The database file (unchanged). |
+| `mydb.db-wal` | The write-ahead log (unchanged). |
+| `mydb.db-tshm` | Turso shared memory. Memory-mapped coordinator that tracks WAL state, the active writer, the active checkpointer, reader slots, and a shared page-to-frame index. |
+
+All participating processes mmap the `.tshm` file and coordinate through:
+
+- A **single-writer** slot. At most one process across the cluster holds the writer lock at any time.
+- A **single-checkpointer** slot. Checkpointing is serialized across processes.
+- A bounded set of **reader slots**. Each active read transaction pins a WAL frame so it is not overwritten by concurrent writers or reclaimed by the checkpointer.
+- A shared **frame index** so readers in any process can resolve a page number to the latest WAL frame without scanning the WAL from the beginning.
+
+Cross-process byte-range locks on the `.tshm` file (OFD locks on Linux, `fcntl` on macOS) gate ownership transitions; the mmap regions provide the fast path for metadata lookups.
+
+## Requirements
+
+Multi-process WAL is only available when all of the following hold:
+
+- **Platform**:  64-bit Unix-like OS (Linux, macOS, Android, other supported Unix systems). On Windows, WASM, and 32-bit targets the flag is accepted but has no effect, and the database opens in single-process mode.
+- **IO backend**: The active IO backend must implement shared WAL coordination. The default file-backed backends do; memory-only and some custom VFSes do not.
+- **Filesystem**: The database must live on a local filesystem that implements POSIX byte-range locks and mmap correctly. The following filesystems are **explicitly rejected** because shared mmap coordination is not safe on them:
+
+  | Filesystem | Reason |
+  |------------|--------|
+  | NFS | Advisory lock semantics diverge across clients |
+  | CIFS / SMB2 | Same as above; mmap coherence is not guaranteed |
+  | CephFS | Distributed cache semantics |
+  | GFS2 | Cluster filesystem; not validated |
+  | Lustre | Distributed; not validated |
+  | OCFS2 | Cluster filesystem; not validated |
+  | AFS, CODA, NCP, 9P (v9fs) | Network/legacy filesystems with unreliable mmap+lock semantics |
+
+  Opening a database on any of these filesystems with `multiprocess_wal` enabled returns `InvalidArgument`.
+
+- **Not in-memory**: `:memory:` and `file::memory:` paths are rejected — shared coordination requires a durable file.
+
+## Enabling Multi-Process Access
+
+### CLI
+
+Pass `--experimental-multiprocess-wal`:
+
+```bash
+tursodb --experimental-multiprocess-wal mydb.db
+```
+
+Every `tursodb` (or SDK) process that opens `mydb.db` at the same time must pass the flag. Mixing modes is rejected — see [Mixing Modes](#mixing-modes).
+
+### Rust SDK
+
+```rust
+use turso::Builder;
+
+let db = Builder::new_local("mydb.db")
+    .experimental_multiprocess_wal(true)
+    .build()?;
+```
+
+### JavaScript / Node.js SDK
+
+```typescript
+import { Database } from "@tursodatabase/libsql";
+
+const db = new Database("file:mydb.db", {
+    experimental: ["multiprocess_wal"],
+});
+```
+
+### Python SDK
+
+```python
+import turso
+
+conn = turso.connect(
+    "mydb.db",
+    experimental_features="multiprocess_wal",
+)
+```
+
+### Go SDK
+
+```go
+db, err := turso.NewDatabase(turso.TursoDatabaseConfig{
+    Path:                 "mydb.db",
+    ExperimentalFeatures: "multiprocess_wal",
+})
+```
+
+Or via DSN:
+
+```go
+db, err := sql.Open("turso", "mydb.db?experimental=multiprocess_wal")
+```
+
+## Concurrency Model
+
+Multi-process access preserves Turso's WAL concurrency guarantees across processes:
+
+- **Writers are serialized across processes.** At any instant, at most one process (and one connection within that process) holds the writer slot. Writers in other processes block until it is released.
+- **Readers never block writers.** Each active read transaction registers a reader slot that pins its snapshot's max-frame. A reader in one process cannot be invalidated by a writer in another.
+- **Checkpointing is serialized across processes.** A single checkpointer truncates the WAL; readers pinning older frames prevent premature reclamation regardless of which process owns them.
+- **Snapshots are stable.** Each read transaction observes a consistent snapshot, even if a concurrent process commits new frames.
+
+Schema changes (DDL) made in one process are picked up by other processes on their next statement via the existing schema refresh path — prepared statements in sibling processes may return `SchemaUpdated` and re-prepare, just as they do across connections within a single process.
+
+## Mixing Modes
+
+The database cannot be open simultaneously in single-process mode from one process and multi-process mode from another. The open path probes for an incompatible live opener and fails fast:
+
+- Opening without `multiprocess_wal` while another process holds a live `.tshm` authority fails with:
+  > Database is already open with experimental multiprocess WAL in another process
+- Opening with `multiprocess_wal` while another process holds the legacy exclusive DB-file lock fails with:
+  > Database is already open without experimental multiprocess WAL in another process
+
+To switch modes, close all existing connections to the database, then reopen with the desired configuration. The `.tshm` file may be left in place — Turso reuses it on the next multi-process open and rebuilds its state from the WAL if necessary.
+
+Read-only opens are advisory: if `multiprocess_wal` is requested on a read-only open and no `.tshm` file exists, Turso falls back to the legacy read-only WAL path rather than failing. This lets read-only tooling work against a database that was closed cleanly by a single-process writer.
+
+## Limitations
+
+- The `.tshm` file format is versioned and may change in future releases. A format bump invalidates existing `.tshm` files — Turso recreates them on open; it does not attempt cross-version migration.
+- Attached databases (via [ATTACH DATABASE](/docs/sql-reference/statements/attach-database)) inherit the multi-process setting of the main connection.
+- The feature is not yet supported under MVCC (`BEGIN CONCURRENT`). Use either MVCC within a single process or multi-process WAL with the default isolation model, not both.
+- The concurrent-simulator and stress tests for multi-process mode run only on 64-bit Unix targets. Windows, WASM, and 32-bit builds silently ignore the flag.
+
+## See Also
+
+- [Experimental Features](/docs/sql-reference/experimental-features) — how to enable experimental features across all surfaces
+- [Transactions](/docs/sql-reference/statements/transactions) — WAL concurrency model and `BEGIN CONCURRENT`
+- [Compatibility](/docs/sql-reference/compatibility) — SQLite compatibility matrix

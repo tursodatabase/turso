@@ -1,0 +1,13 @@
+---
+source: indexes.sqltest
+expression: SELECT rowid, name, value FROM items WHERE rowid = 5;
+info:
+  statement_type: SELECT
+  tables:
+  - items
+  setup_blocks:
+  - no_rowid_alias
+  database: ':memory:'
+---
+QUERY PLAN
+`--SEARCH items USING INTEGER PRIMARY KEY (rowid=?)

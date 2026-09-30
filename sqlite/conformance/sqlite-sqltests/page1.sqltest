@@ -1,0 +1,16 @@
+@database :memory:
+
+@cross-check-integrity
+test page1-intersect-on-fresh-database {
+    values (1) intersect values (1);
+}
+expect {
+    1
+}
+
+@cross-check-integrity
+test page1-group-concat-window-over-empty-sqlite-schema {
+    select group_concat(name) over () from sqlite_schema;
+}
+expect {
+}

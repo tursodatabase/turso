@@ -1,0 +1,1278 @@
+use crate::{turso_assert, turso_assert_eq};
+use core::fmt::{self, Debug};
+use std::{
+    future::Future,
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc, OnceLock,
+    },
+    task::{Poll, Waker},
+};
+
+use crate::sync::Mutex;
+
+use crate::{Buffer, CompletionError};
+
+/// Callback for read completions. Returns `Some(error)` if the callback detects an error
+/// (e.g., short read), which will be stored in the completion and propagated to VDBE.
+pub type ReadComplete =
+    dyn Fn(Result<(Arc<Buffer>, i32), CompletionError>) -> Option<CompletionError> + Send + Sync;
+pub type WriteComplete = dyn Fn(Result<i32, CompletionError>) + Send + Sync;
+pub type SyncComplete = dyn Fn(Result<i32, CompletionError>) + Send + Sync;
+pub type TruncateComplete = dyn Fn(Result<i32, CompletionError>) + Send + Sync;
+
+#[must_use]
+#[derive(Debug, Clone)]
+pub struct Completion {
+    /// Optional completion state. If None, it means we are Yield in order to not allocate anything
+    pub(super) inner: Option<Arc<CompletionInner>>,
+}
+
+impl Future for Completion {
+    type Output = Result<(), crate::LimboError>;
+
+    fn poll(self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> Poll<Self::Output> {
+        self.set_waker(cx.waker());
+        if self.finished() {
+            self.wake();
+            let res = self
+                .get_error()
+                .map_or(Ok(()), |err| Err(crate::LimboError::CompletionError(err)));
+            return Poll::Ready(res);
+        }
+        Poll::Pending
+    }
+}
+
+#[derive(Debug, Default)]
+struct ContextInner {
+    waker: Option<Waker>,
+    // TODO: add abort signal
+}
+
+#[derive(Debug, Clone)]
+pub struct Context {
+    inner: Arc<Mutex<ContextInner>>,
+}
+
+impl ContextInner {
+    pub fn new() -> Self {
+        Self { waker: None }
+    }
+
+    pub fn wake(&mut self) {
+        if let Some(waker) = self.waker.take() {
+            waker.wake();
+        }
+    }
+
+    pub fn set_waker(&mut self, waker: &Waker) {
+        if let Some(curr_waker) = self.waker.as_mut() {
+            // only call and change waker if it would awake a different task
+            if !curr_waker.will_wake(waker) {
+                let prev_waker = std::mem::replace(curr_waker, waker.clone());
+                prev_waker.wake();
+            }
+        } else {
+            self.waker = Some(waker.clone());
+        }
+    }
+}
+
+impl Default for Context {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Context {
+    pub fn new() -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(ContextInner::new())),
+        }
+    }
+
+    pub fn wake(&self) {
+        self.inner.lock().wake();
+    }
+
+    pub fn set_waker(&self, waker: &Waker) {
+        self.inner.lock().set_waker(waker);
+    }
+}
+
+pub(super) struct CompletionInner {
+    completion_type: CompletionType,
+    /// None means we completed successfully
+    // Thread safe with OnceLock
+    pub(super) result: crate::sync::OnceLock<Option<CompletionError>>,
+    context: Context,
+    /// The group this completion belongs to, if any. `CompletionGroup::add`
+    /// sets it before the completion is submitted, so by the time the
+    /// completion finishes and its callback counts it into the group, the
+    /// link is already there.
+    parent: Mutex<Option<Completion>>,
+    /// Keeps the write buffer alive for async I/O backends (io_uring, VFS)
+    /// where pwrite returns before the kernel has consumed the buffer.
+    write_buffer: OnceLock<Arc<Buffer>>,
+}
+
+impl fmt::Debug for CompletionInner {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("CompletionInner")
+            .field("completion_type", &self.completion_type)
+            .field("parent", &self.parent.lock().is_some())
+            .finish()
+    }
+}
+
+/// Waits for a set of child completions. The group finishes when every
+/// child has finished and `build` has been called.
+///
+/// The group counts how many things are still outstanding. It starts at 1:
+/// a token held by the builder, released by `build`. Each `add` counts one
+/// more. That token keeps the group from finishing while children are still
+/// being added, even if the ones added so far finish right away.
+pub struct CompletionGroup {
+    completions: Vec<Completion>,
+    /// The group's own completion, handed out by `build`.
+    completion: Completion,
+    inner: Arc<GroupCompletionInner>,
+}
+
+impl fmt::Debug for CompletionGroup {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("CompletionGroup")
+            .field("children", &self.completions.len())
+            .field(
+                "outstanding",
+                &self.inner.outstanding.load(Ordering::SeqCst),
+            )
+            .finish()
+    }
+}
+
+impl CompletionGroup {
+    pub fn new<F>(callback: F) -> Self
+    where
+        F: Fn(Result<i32, CompletionError>) + Send + Sync + 'static,
+    {
+        let inner = Arc::new(GroupCompletionInner {
+            outstanding: AtomicUsize::new(1),
+            complete: Box::new(callback),
+            result: OnceLock::new(),
+        });
+        let completion = Completion::new(CompletionType::Group(GroupCompletion {
+            inner: inner.clone(),
+        }));
+        Self {
+            completions: Vec::new(),
+            completion,
+            inner,
+        }
+    }
+
+    /// Add a child. Call this before the child is submitted to the IO
+    /// backend. The child's own callback is what counts it into the group,
+    /// so the link has to be there before the child can finish.
+    pub fn add(&mut self, c: &Completion) {
+        self.completions.push(c.clone());
+        self.inner.outstanding.fetch_add(1, Ordering::SeqCst);
+        let mut parent = c.get_inner().parent.lock();
+        turso_assert!(parent.is_none(), "completion can only be linked once");
+        *parent = Some(self.completion.clone());
+        drop(parent);
+        turso_assert!(
+            !c.finished(),
+            "completion was added to a group after it finished"
+        );
+    }
+
+    /// The children added so far. Used by error paths that need to
+    /// wait on the kernel side via `IO::drain_completions` after
+    /// cancelling the group.
+    pub fn completions(&self) -> &[Completion] {
+        &self.completions
+    }
+
+    pub fn len(&self) -> usize {
+        self.completions.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.completions.is_empty()
+    }
+
+    pub fn cancel(&self) {
+        for c in &self.completions {
+            c.abort();
+        }
+    }
+
+    /// Release the builder's token. The group finishes now if every child
+    /// has already finished, or later when the last one does.
+    pub fn build(self) -> Completion {
+        self.completion.group_one_done(None);
+        self.completion
+    }
+}
+
+pub struct GroupCompletion {
+    inner: Arc<GroupCompletionInner>,
+}
+
+impl fmt::Debug for GroupCompletion {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("GroupCompletion")
+            .field(
+                "outstanding",
+                &self.inner.outstanding.load(Ordering::SeqCst),
+            )
+            .finish()
+    }
+}
+
+struct GroupCompletionInner {
+    /// Number of completions that need to finish
+    outstanding: AtomicUsize,
+    /// Callback to invoke when all completions finish
+    complete: Box<dyn Fn(Result<i32, CompletionError>) + Send + Sync>,
+    /// Cached result after all completions finish
+    result: OnceLock<Option<CompletionError>>,
+}
+
+impl GroupCompletion {
+    pub fn callback(&self, result: Result<i32, CompletionError>) {
+        turso_assert_eq!(
+            self.inner.outstanding.load(Ordering::SeqCst),
+            0,
+            "callback called before all completions finished"
+        );
+        (self.inner.complete)(result);
+    }
+}
+
+impl Debug for CompletionType {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Read(..) => f.debug_tuple("Read").finish(),
+            Self::Write(..) => f.debug_tuple("Write").finish(),
+            Self::Sync(..) => f.debug_tuple("Sync").finish(),
+            Self::Truncate(..) => f.debug_tuple("Truncate").finish(),
+            Self::Group(..) => f.debug_tuple("Group").finish(),
+            Self::Yield => f.debug_tuple("Yield").finish(),
+        }
+    }
+}
+
+pub enum CompletionType {
+    Read(ReadCompletion),
+    Write(WriteCompletion),
+    Sync(SyncCompletion),
+    Truncate(TruncateCompletion),
+    Group(GroupCompletion),
+    Yield,
+}
+
+impl CompletionInner {
+    fn new(completion_type: CompletionType) -> Self {
+        Self {
+            completion_type,
+            result: OnceLock::new(),
+            context: Context::new(),
+            parent: Mutex::new(None),
+            write_buffer: OnceLock::new(),
+        }
+    }
+}
+
+impl Completion {
+    pub fn new(completion_type: CompletionType) -> Self {
+        Self {
+            inner: Some(Arc::new(CompletionInner::new(completion_type))),
+        }
+    }
+
+    pub(super) fn get_inner(&self) -> &Arc<CompletionInner> {
+        self.inner
+            .as_ref()
+            .expect("completion inner should be initialized")
+    }
+
+    /// Stores a write buffer reference in the completion to keep it alive
+    /// until the I/O completes. Required for async backends (io_uring, VFS)
+    /// where pwrite returns before the kernel has consumed the buffer.
+    pub fn keep_write_buffer_alive(&self, buf: Arc<Buffer>) {
+        self.get_inner()
+            .write_buffer
+            .set(buf)
+            .expect("write buffer should only be set once");
+    }
+
+    pub fn new_write<F>(complete: F) -> Self
+    where
+        F: Fn(Result<i32, CompletionError>) + Send + Sync + 'static,
+    {
+        Self::new(CompletionType::Write(WriteCompletion::new(Box::new(
+            complete,
+        ))))
+    }
+
+    pub fn new_read<F>(buf: Arc<Buffer>, complete: F) -> Self
+    where
+        F: Fn(Result<(Arc<Buffer>, i32), CompletionError>) -> Option<CompletionError>
+            + Send
+            + Sync
+            + 'static,
+    {
+        Self::new(CompletionType::Read(ReadCompletion::new(
+            buf,
+            Box::new(complete),
+        )))
+    }
+    pub fn new_sync<F>(complete: F) -> Self
+    where
+        F: Fn(Result<i32, CompletionError>) + Send + Sync + 'static,
+    {
+        Self::new(CompletionType::Sync(SyncCompletion::new(Box::new(
+            complete,
+        ))))
+    }
+
+    pub fn new_trunc<F>(complete: F) -> Self
+    where
+        F: Fn(Result<i32, CompletionError>) + Send + Sync + 'static,
+    {
+        Self::new(CompletionType::Truncate(TruncateCompletion::new(Box::new(
+            complete,
+        ))))
+    }
+
+    /// Create a yield completion. These are completed by default allowing to yield control without
+    /// allocating memory.
+    pub fn new_yield() -> Self {
+        Self { inner: None }
+    }
+
+    /// A completion no IO backend finishes: whoever the caller waits for
+    /// calls `complete` on it.
+    pub fn new_wait() -> Self {
+        Self::new(CompletionType::Yield)
+    }
+
+    pub fn is_wait(&self) -> bool {
+        self.inner
+            .as_ref()
+            .is_some_and(|inner| matches!(inner.completion_type, CompletionType::Yield))
+    }
+
+    pub fn wake(&self) {
+        if let Some(inner) = &self.inner {
+            inner.context.wake();
+        }
+    }
+
+    /// Fire a "progress wake" without consuming the completion's result —
+    /// wakes the waker on this completion *and* on its parent group, if any.
+    /// Used by IO backends to nudge the future when an operation made progress
+    /// but isn't fully done (e.g. an io_uring writev that completed only the
+    /// first chunk and was resubmitted internally). Without this, a poll
+    /// whose drained CQEs are all intermediate-chunk completions returns
+    /// without waking anything, and since `step()` is the only thing that
+    /// drains the CQ, the resubmitted chunks pile up and the task deadlocks.
+    pub fn wake_progress(&self) {
+        if let Some(inner) = &self.inner {
+            let group = inner.parent.lock().clone();
+            if let Some(group) = group {
+                group.wake();
+            }
+            inner.context.wake();
+        }
+    }
+
+    pub fn set_waker(&self, waker: &Waker) {
+        if self.finished() || self.inner.is_none() {
+            waker.wake_by_ref();
+        } else {
+            self.get_inner().context.set_waker(waker);
+        }
+    }
+
+    pub fn succeeded(&self) -> bool {
+        match &self.inner {
+            Some(inner) => match &inner.completion_type {
+                CompletionType::Group(g) => {
+                    g.inner.outstanding.load(Ordering::SeqCst) == 0
+                        && g.inner.result.get().is_some_and(|e| e.is_none())
+                }
+                _ => inner.result.get().is_some_and(|e| e.is_none()),
+            },
+            None => true,
+        }
+    }
+
+    pub fn failed(&self) -> bool {
+        match &self.inner {
+            Some(inner) => inner.result.get().is_some_and(|val| val.is_some()),
+            None => false,
+        }
+    }
+
+    pub fn get_error(&self) -> Option<CompletionError> {
+        match &self.inner {
+            Some(inner) => {
+                match &inner.completion_type {
+                    CompletionType::Group(g) => {
+                        // For groups, check the group's cached result field
+                        // (set when the last completion finishes)
+                        g.inner.result.get().and_then(|res| *res)
+                    }
+                    _ => inner.result.get().and_then(|res| *res),
+                }
+            }
+            None => None,
+        }
+    }
+
+    /// Checks if the Completion completed or errored
+    pub fn finished(&self) -> bool {
+        match &self.inner {
+            Some(inner) => match &inner.completion_type {
+                CompletionType::Group(g) => g.inner.outstanding.load(Ordering::SeqCst) == 0,
+                _ => inner.result.get().is_some(),
+            },
+            None => true,
+        }
+    }
+
+    /// Returns true if this completion is an explicit yield — a signal to
+    /// return control to the cooperative scheduler so other connections can make
+    /// progress. Unlike real I/O completions that happen to be finished,
+    /// yield completions must not be treated as "ready to continue immediately"
+    /// because the yielding operation is waiting on external state (e.g. a lock
+    /// held by another fiber) that can only change when other fibers are stepped.
+    pub fn is_explicit_yield(&self) -> bool {
+        self.inner.is_none()
+    }
+
+    pub fn complete(&self, result: i32) {
+        let result = Ok(result);
+        self.callback(result);
+    }
+
+    pub fn error(&self, err: CompletionError) {
+        let result = Err(err);
+        self.callback(result);
+    }
+
+    pub fn abort(&self) {
+        self.error(CompletionError::Aborted);
+    }
+
+    fn callback(&self, result: Result<i32, CompletionError>) {
+        let inner = self.get_inner();
+        let mut first = false;
+        inner.result.get_or_init(|| {
+            first = true;
+            // Run the type-specific callback. For ReadCompletion, this returns
+            // an optional error detected by the callback (e.g., short read).
+            let callback_error = match &inner.completion_type {
+                CompletionType::Read(r) => r.callback(result),
+                CompletionType::Write(w) => {
+                    w.callback(result);
+                    None
+                }
+                CompletionType::Sync(s) => {
+                    s.callback(result);
+                    None
+                }
+                CompletionType::Truncate(t) => {
+                    t.callback(result);
+                    None
+                }
+                CompletionType::Group(g) => {
+                    g.callback(result);
+                    None
+                }
+                CompletionType::Yield => None,
+            };
+
+            // Use callback error if present, otherwise use the original IO error
+            callback_error.or_else(|| result.err())
+        });
+        // Only the call that finished this completion counts it into its
+        // group.
+        if first {
+            let parent = inner.parent.lock().take();
+            if let Some(group) = parent {
+                group.group_one_done(inner.result.get().and_then(|e| *e));
+            }
+        }
+        inner.context.wake();
+    }
+
+    fn group_one_done(&self, err: Option<CompletionError>) {
+        let group = match &self.get_inner().completion_type {
+            CompletionType::Group(group) => &group.inner,
+            _ => unreachable!("parent must be a group completion"),
+        };
+        if let Some(err) = err {
+            let _ = group.result.set(Some(err));
+        }
+        let prev = group.outstanding.fetch_sub(1, Ordering::SeqCst);
+        turso_assert!(prev > 0, "completion group counted below zero");
+        if prev > 1 {
+            self.wake();
+            return;
+        }
+        let _ = group.result.set(None);
+        let result = group.result.get().and_then(|e| *e);
+        self.callback(result.map_or(Ok(0), Err));
+    }
+
+    /// only call this method if you are sure that the completion is
+    /// a ReadCompletion, panics otherwise
+    pub fn as_read(&self) -> &ReadCompletion {
+        let inner = self.get_inner();
+        match inner.completion_type {
+            CompletionType::Read(ref r) => r,
+            _ => unreachable!(),
+        }
+    }
+}
+
+pub struct ReadCompletion {
+    pub buf: Arc<Buffer>,
+    pub complete: Box<ReadComplete>,
+}
+
+impl ReadCompletion {
+    pub fn new(buf: Arc<Buffer>, complete: Box<ReadComplete>) -> Self {
+        Self { buf, complete }
+    }
+
+    pub fn buf(&self) -> &Buffer {
+        &self.buf
+    }
+
+    pub fn callback(&self, bytes_read: Result<i32, CompletionError>) -> Option<CompletionError> {
+        (self.complete)(bytes_read.map(|b| (self.buf.clone(), b)))
+    }
+
+    pub fn buf_arc(&self) -> Arc<Buffer> {
+        self.buf.clone()
+    }
+}
+
+pub struct WriteCompletion {
+    pub complete: Box<WriteComplete>,
+}
+
+impl WriteCompletion {
+    pub fn new(complete: Box<WriteComplete>) -> Self {
+        Self { complete }
+    }
+
+    pub fn callback(&self, bytes_written: Result<i32, CompletionError>) {
+        (self.complete)(bytes_written);
+    }
+}
+
+pub struct SyncCompletion {
+    pub complete: Box<SyncComplete>,
+}
+
+impl SyncCompletion {
+    pub fn new(complete: Box<SyncComplete>) -> Self {
+        Self { complete }
+    }
+
+    pub fn callback(&self, res: Result<i32, CompletionError>) {
+        (self.complete)(res);
+    }
+}
+
+pub struct TruncateCompletion {
+    pub complete: Box<TruncateComplete>,
+}
+
+impl TruncateCompletion {
+    pub fn new(complete: Box<TruncateComplete>) -> Self {
+        Self { complete }
+    }
+
+    pub fn callback(&self, res: Result<i32, CompletionError>) {
+        (self.complete)(res);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::CompletionError;
+
+    use super::*;
+
+    #[test]
+    fn group_finishes_when_child_completes_on_another_thread_during_build() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        use std::thread;
+        for i in 0..20_000 {
+            let child = Completion::new_write(|_| {});
+            let go = Arc::new(AtomicBool::new(false));
+            let (c2, go2) = (child.clone(), go.clone());
+            let t = thread::spawn(move || {
+                while !go2.load(Ordering::Acquire) {
+                    std::hint::spin_loop();
+                }
+                c2.complete(0);
+            });
+            let mut group = CompletionGroup::new(|_| {});
+            group.add(&child);
+            go.store(true, Ordering::Release);
+            let g = group.build();
+            t.join().unwrap();
+            assert!(child.finished());
+            assert!(
+                g.finished(),
+                "iteration {i}: child finished but the group did not"
+            );
+        }
+    }
+
+    #[test]
+    fn group_callback_fires_once_when_children_finished_before_build() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let calls = Arc::new(AtomicUsize::new(0));
+        let c1 = Completion::new_write(|_| {});
+        let c2 = Completion::new_write(|_| {});
+        let calls2 = calls.clone();
+        let mut group = CompletionGroup::new(move |_| {
+            calls2.fetch_add(1, Ordering::SeqCst);
+        });
+        group.add(&c1);
+        group.add(&c2);
+        c1.complete(0);
+        c2.complete(0);
+        let g = group.build();
+        assert!(g.finished());
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    #[should_panic(expected = "added to a group after it finished")]
+    fn adding_a_finished_completion_panics() {
+        let c = Completion::new_write(|_| {});
+        c.complete(0);
+        let mut group = CompletionGroup::new(|_| {});
+        group.add(&c);
+    }
+
+    #[test]
+    fn test_completion_group_empty() {
+        use crate::sync::atomic::{AtomicBool, Ordering};
+
+        let callback_called = Arc::new(AtomicBool::new(false));
+        let callback_called_clone = callback_called.clone();
+
+        let group = CompletionGroup::new(move |_| {
+            callback_called_clone.store(true, Ordering::SeqCst);
+        });
+        let group = group.build();
+        assert!(group.finished());
+        assert!(group.succeeded());
+        assert!(group.get_error().is_none());
+
+        // Verify the callback was actually called
+        assert!(
+            callback_called.load(Ordering::SeqCst),
+            "callback should be called for empty group"
+        );
+    }
+
+    #[test]
+    fn test_completion_group_single_completion() {
+        let mut group = CompletionGroup::new(|_| {});
+        let c = Completion::new_write(|_| {});
+        group.add(&c);
+        let group = group.build();
+
+        assert!(!group.finished());
+        assert!(!group.succeeded());
+
+        c.complete(0);
+
+        assert!(group.finished());
+        assert!(group.succeeded());
+        assert!(group.get_error().is_none());
+    }
+
+    #[test]
+    fn test_completion_group_multiple_completions() {
+        let mut group = CompletionGroup::new(|_| {});
+        let c1 = Completion::new_write(|_| {});
+        let c2 = Completion::new_write(|_| {});
+        let c3 = Completion::new_write(|_| {});
+        group.add(&c1);
+        group.add(&c2);
+        group.add(&c3);
+        let group = group.build();
+
+        assert!(!group.succeeded());
+        assert!(!group.finished());
+
+        c1.complete(0);
+        assert!(!group.succeeded());
+        assert!(!group.finished());
+
+        c2.complete(0);
+        assert!(!group.succeeded());
+        assert!(!group.finished());
+
+        c3.complete(0);
+        assert!(group.succeeded());
+        assert!(group.finished());
+    }
+
+    #[test]
+    fn test_completion_group_with_error() {
+        let mut group = CompletionGroup::new(|_| {});
+        let c1 = Completion::new_write(|_| {});
+        let c2 = Completion::new_write(|_| {});
+        group.add(&c1);
+        group.add(&c2);
+        let group = group.build();
+
+        c1.complete(0);
+        c2.error(CompletionError::Aborted);
+
+        assert!(group.finished());
+        assert!(!group.succeeded());
+        assert_eq!(group.get_error(), Some(CompletionError::Aborted));
+    }
+
+    #[test]
+    fn test_completion_group_callback() {
+        use crate::sync::atomic::{AtomicBool, Ordering};
+        let called = Arc::new(AtomicBool::new(false));
+        let called_clone = called.clone();
+
+        let mut group = CompletionGroup::new(move |_| {
+            called_clone.store(true, Ordering::SeqCst);
+        });
+
+        let c1 = Completion::new_write(|_| {});
+        let c2 = Completion::new_write(|_| {});
+        group.add(&c1);
+        group.add(&c2);
+        let group = group.build();
+
+        assert!(!called.load(Ordering::SeqCst));
+
+        c1.complete(0);
+        assert!(!called.load(Ordering::SeqCst));
+
+        c2.complete(0);
+        assert!(called.load(Ordering::SeqCst));
+        assert!(group.finished());
+        assert!(group.succeeded());
+    }
+
+    #[test]
+    fn test_completion_group_some_already_completed() {
+        // Test some completions added to group, then finish before build()
+        let mut group = CompletionGroup::new(|_| {});
+        let c1 = Completion::new_write(|_| {});
+        let c2 = Completion::new_write(|_| {});
+        let c3 = Completion::new_write(|_| {});
+
+        // Add all to group while pending
+        group.add(&c1);
+        group.add(&c2);
+        group.add(&c3);
+
+        // Complete c1 and c2 AFTER adding but BEFORE build()
+        c1.complete(0);
+        c2.complete(0);
+
+        let group = group.build();
+
+        // c1 and c2 finished before build(), so outstanding should account for them
+        // Only c3 should be pending
+        assert!(!group.finished());
+        assert!(!group.succeeded());
+
+        // Complete c3
+        c3.complete(0);
+
+        // Now the group should be finished
+        assert!(group.finished());
+        assert!(group.succeeded());
+        assert!(group.get_error().is_none());
+    }
+
+    #[test]
+    fn test_completion_group_all_already_completed() {
+        // Test when all completions are already finished before build()
+        let mut group = CompletionGroup::new(|_| {});
+        let c1 = Completion::new_write(|_| {});
+        let c2 = Completion::new_write(|_| {});
+
+        group.add(&c1);
+        group.add(&c2);
+
+        // Complete both before build()
+        c1.complete(0);
+        c2.complete(0);
+
+        let group = group.build();
+
+        // All completions were already complete, so group should be finished immediately
+        assert!(group.finished());
+        assert!(group.succeeded());
+        assert!(group.get_error().is_none());
+    }
+
+    #[test]
+    fn test_completion_group_mixed_finished_and_pending() {
+        use crate::sync::atomic::{AtomicBool, Ordering};
+        let called = Arc::new(AtomicBool::new(false));
+        let called_clone = called.clone();
+
+        let mut group = CompletionGroup::new(move |_| {
+            called_clone.store(true, Ordering::SeqCst);
+        });
+
+        let c1 = Completion::new_write(|_| {});
+        let c2 = Completion::new_write(|_| {});
+        let c3 = Completion::new_write(|_| {});
+        let c4 = Completion::new_write(|_| {});
+
+        group.add(&c1);
+        group.add(&c2);
+        group.add(&c3);
+        group.add(&c4);
+
+        // Complete c1 and c3 before build()
+        c1.complete(0);
+        c3.complete(0);
+
+        let group = group.build();
+
+        // Only c2 and c4 should be pending
+        assert!(!group.finished());
+        assert!(!called.load(Ordering::SeqCst));
+
+        c2.complete(0);
+        assert!(!group.finished());
+        assert!(!called.load(Ordering::SeqCst));
+
+        c4.complete(0);
+        assert!(group.finished());
+        assert!(group.succeeded());
+        assert!(called.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn test_completion_group_already_completed_with_error() {
+        // Test when a completion finishes with error before build()
+        let mut group = CompletionGroup::new(|_| {});
+        let c1 = Completion::new_write(|_| {});
+        let c2 = Completion::new_write(|_| {});
+
+        group.add(&c1);
+        group.add(&c2);
+
+        // Fail c1 before build()
+        c1.error(CompletionError::Aborted);
+
+        let group = group.build();
+
+        // The group waits for c2 even though c1 already failed: a waiter
+        // must not carry on while a child's IO is still in flight.
+        assert!(!group.finished());
+
+        c2.complete(0);
+        assert!(group.finished());
+        assert!(!group.succeeded());
+        assert_eq!(group.get_error(), Some(CompletionError::Aborted));
+    }
+
+    #[test]
+    fn test_completion_group_nested() {
+        use crate::sync::atomic::{AtomicUsize, Ordering};
+
+        // Track callbacks at different levels
+        let parent_called = Arc::new(AtomicUsize::new(0));
+        let child1_called = Arc::new(AtomicUsize::new(0));
+        let child2_called = Arc::new(AtomicUsize::new(0));
+
+        // Create child group 1 with 2 completions
+        let child1_called_clone = child1_called.clone();
+        let mut child_group1 = CompletionGroup::new(move |_| {
+            child1_called_clone.fetch_add(1, Ordering::SeqCst);
+        });
+        let c1 = Completion::new_write(|_| {});
+        let c2 = Completion::new_write(|_| {});
+        child_group1.add(&c1);
+        child_group1.add(&c2);
+        let child_group1 = child_group1.build();
+
+        // Create child group 2 with 2 completions
+        let child2_called_clone = child2_called.clone();
+        let mut child_group2 = CompletionGroup::new(move |_| {
+            child2_called_clone.fetch_add(1, Ordering::SeqCst);
+        });
+        let c3 = Completion::new_write(|_| {});
+        let c4 = Completion::new_write(|_| {});
+        child_group2.add(&c3);
+        child_group2.add(&c4);
+        let child_group2 = child_group2.build();
+
+        // Create parent group containing both child groups
+        let parent_called_clone = parent_called.clone();
+        let mut parent_group = CompletionGroup::new(move |_| {
+            parent_called_clone.fetch_add(1, Ordering::SeqCst);
+        });
+        parent_group.add(&child_group1);
+        parent_group.add(&child_group2);
+        let parent_group = parent_group.build();
+
+        // Initially nothing should be finished
+        assert!(!parent_group.finished());
+        assert!(!child_group1.finished());
+        assert!(!child_group2.finished());
+        assert_eq!(parent_called.load(Ordering::SeqCst), 0);
+        assert_eq!(child1_called.load(Ordering::SeqCst), 0);
+        assert_eq!(child2_called.load(Ordering::SeqCst), 0);
+
+        // Complete first completion in child group 1
+        c1.complete(0);
+        assert!(!child_group1.finished());
+        assert!(!parent_group.finished());
+        assert_eq!(child1_called.load(Ordering::SeqCst), 0);
+        assert_eq!(parent_called.load(Ordering::SeqCst), 0);
+
+        // Complete second completion in child group 1 - should finish child group 1
+        c2.complete(0);
+        assert!(child_group1.finished());
+        assert!(child_group1.succeeded());
+        assert_eq!(child1_called.load(Ordering::SeqCst), 1);
+
+        // Parent should not be finished yet because child group 2 is still pending
+        assert!(!parent_group.finished());
+        assert_eq!(parent_called.load(Ordering::SeqCst), 0);
+
+        // Complete first completion in child group 2
+        c3.complete(0);
+        assert!(!child_group2.finished());
+        assert!(!parent_group.finished());
+        assert_eq!(child2_called.load(Ordering::SeqCst), 0);
+        assert_eq!(parent_called.load(Ordering::SeqCst), 0);
+
+        // Complete second completion in child group 2 - should finish everything
+        c4.complete(0);
+        assert!(child_group2.finished());
+        assert!(child_group2.succeeded());
+        assert_eq!(child2_called.load(Ordering::SeqCst), 1);
+
+        // Parent should now be finished
+        assert!(parent_group.finished());
+        assert!(parent_group.succeeded());
+        assert_eq!(parent_called.load(Ordering::SeqCst), 1);
+        assert!(parent_group.get_error().is_none());
+    }
+
+    #[test]
+    fn test_completion_group_nested_with_error() {
+        use crate::sync::atomic::{AtomicBool, Ordering};
+
+        let parent_called = Arc::new(AtomicBool::new(false));
+        let child_called = Arc::new(AtomicBool::new(false));
+
+        // Create child group with 2 completions
+        let child_called_clone = child_called.clone();
+        let mut child_group = CompletionGroup::new(move |_| {
+            child_called_clone.store(true, Ordering::SeqCst);
+        });
+        let c1 = Completion::new_write(|_| {});
+        let c2 = Completion::new_write(|_| {});
+        child_group.add(&c1);
+        child_group.add(&c2);
+        let child_group = child_group.build();
+
+        // Create parent group containing child group and another completion
+        let parent_called_clone = parent_called.clone();
+        let mut parent_group = CompletionGroup::new(move |_| {
+            parent_called_clone.store(true, Ordering::SeqCst);
+        });
+        let c3 = Completion::new_write(|_| {});
+        parent_group.add(&child_group);
+        parent_group.add(&c3);
+        let parent_group = parent_group.build();
+
+        // Complete child group with success
+        c1.complete(0);
+        c2.complete(0);
+        assert!(child_group.finished());
+        assert!(child_group.succeeded());
+        assert!(child_called.load(Ordering::SeqCst));
+
+        // Parent still pending
+        assert!(!parent_group.finished());
+        assert!(!parent_called.load(Ordering::SeqCst));
+
+        // Complete c3 with error
+        c3.error(CompletionError::Aborted);
+
+        // Parent should finish with error
+        assert!(parent_group.finished());
+        assert!(!parent_group.succeeded());
+        assert_eq!(parent_group.get_error(), Some(CompletionError::Aborted));
+        assert!(parent_called.load(Ordering::SeqCst));
+    }
+
+    // Tests for individual completion success/failure status
+
+    #[test]
+    fn test_write_completion_pending_status() {
+        let c = Completion::new_write(|_| {});
+
+        // Pending completion should not be finished, succeeded, or failed
+        assert!(!c.finished());
+        assert!(!c.succeeded());
+        assert!(!c.failed());
+        assert!(c.get_error().is_none());
+    }
+
+    #[test]
+    fn test_write_completion_success() {
+        let c = Completion::new_write(|_| {});
+
+        c.complete(42);
+
+        assert!(c.finished());
+        assert!(c.succeeded());
+        assert!(!c.failed());
+        assert!(c.get_error().is_none());
+    }
+
+    #[test]
+    fn test_write_completion_failure() {
+        let c = Completion::new_write(|_| {});
+
+        c.error(CompletionError::Aborted);
+
+        assert!(c.finished());
+        assert!(!c.succeeded());
+        assert!(c.failed());
+        assert_eq!(c.get_error(), Some(CompletionError::Aborted));
+    }
+
+    #[test]
+    fn test_read_completion_pending_status() {
+        let buf = Arc::new(crate::Buffer::new_temporary(4096));
+        let c = Completion::new_read(buf, |_| None);
+
+        assert!(!c.finished());
+        assert!(!c.succeeded());
+        assert!(!c.failed());
+        assert!(c.get_error().is_none());
+    }
+
+    #[test]
+    fn test_read_completion_success() {
+        let buf = Arc::new(crate::Buffer::new_temporary(4096));
+        let c = Completion::new_read(buf, |_| None);
+
+        c.complete(1024);
+
+        assert!(c.finished());
+        assert!(c.succeeded());
+        assert!(!c.failed());
+        assert!(c.get_error().is_none());
+    }
+
+    #[test]
+    fn test_read_completion_failure() {
+        let buf = Arc::new(crate::Buffer::new_temporary(4096));
+        let c = Completion::new_read(buf, |_| None);
+
+        c.error(CompletionError::Aborted);
+
+        assert!(c.finished());
+        assert!(!c.succeeded());
+        assert!(c.failed());
+        assert_eq!(c.get_error(), Some(CompletionError::Aborted));
+    }
+
+    #[test]
+    fn test_sync_completion_pending_status() {
+        let c = Completion::new_sync(|_| {});
+
+        assert!(!c.finished());
+        assert!(!c.succeeded());
+        assert!(!c.failed());
+        assert!(c.get_error().is_none());
+    }
+
+    #[test]
+    fn test_sync_completion_success() {
+        let c = Completion::new_sync(|_| {});
+
+        c.complete(0);
+
+        assert!(c.finished());
+        assert!(c.succeeded());
+        assert!(!c.failed());
+        assert!(c.get_error().is_none());
+    }
+
+    #[test]
+    fn test_sync_completion_failure() {
+        let c = Completion::new_sync(|_| {});
+
+        c.error(CompletionError::Aborted);
+
+        assert!(c.finished());
+        assert!(!c.succeeded());
+        assert!(c.failed());
+        assert_eq!(c.get_error(), Some(CompletionError::Aborted));
+    }
+
+    #[test]
+    fn test_truncate_completion_pending_status() {
+        let c = Completion::new_trunc(|_| {});
+
+        assert!(!c.finished());
+        assert!(!c.succeeded());
+        assert!(!c.failed());
+        assert!(c.get_error().is_none());
+    }
+
+    #[test]
+    fn test_truncate_completion_success() {
+        let c = Completion::new_trunc(|_| {});
+
+        c.complete(0);
+
+        assert!(c.finished());
+        assert!(c.succeeded());
+        assert!(!c.failed());
+        assert!(c.get_error().is_none());
+    }
+
+    #[test]
+    fn test_truncate_completion_failure() {
+        let c = Completion::new_trunc(|_| {});
+
+        c.error(CompletionError::Aborted);
+
+        assert!(c.finished());
+        assert!(!c.succeeded());
+        assert!(c.failed());
+        assert_eq!(c.get_error(), Some(CompletionError::Aborted));
+    }
+
+    #[test]
+    fn test_yield_completion_status() {
+        let c = Completion::new_yield();
+
+        // Yield completions are always considered finished and succeeded
+        assert!(c.finished());
+        assert!(c.succeeded());
+        assert!(!c.failed());
+        assert!(c.get_error().is_none());
+    }
+
+    #[test]
+    fn test_completion_abort() {
+        let c = Completion::new_write(|_| {});
+
+        c.abort();
+
+        assert!(c.finished());
+        assert!(!c.succeeded());
+        assert!(c.failed());
+        assert_eq!(c.get_error(), Some(CompletionError::Aborted));
+    }
+
+    #[test]
+    fn test_completion_callback_receives_success_result() {
+        use crate::sync::atomic::{AtomicI32, Ordering};
+
+        let result_value = Arc::new(AtomicI32::new(-1));
+        let result_value_clone = result_value.clone();
+
+        let c = Completion::new_write(move |res| {
+            if let Ok(val) = res {
+                result_value_clone.store(val, Ordering::SeqCst);
+            }
+        });
+
+        c.complete(42);
+
+        assert_eq!(result_value.load(Ordering::SeqCst), 42);
+        assert!(c.succeeded());
+    }
+
+    #[test]
+    fn test_completion_callback_receives_error_result() {
+        use crate::sync::atomic::{AtomicBool, Ordering};
+
+        let got_error = Arc::new(AtomicBool::new(false));
+        let got_error_clone = got_error.clone();
+
+        let c = Completion::new_write(move |res| {
+            if res.is_err() {
+                got_error_clone.store(true, Ordering::SeqCst);
+            }
+        });
+
+        c.error(CompletionError::Aborted);
+
+        assert!(got_error.load(Ordering::SeqCst));
+        assert!(c.failed());
+    }
+
+    #[test]
+    fn test_completion_idempotent_complete() {
+        // Completing a completion multiple times should only trigger the callback once
+        use crate::sync::atomic::{AtomicUsize, Ordering};
+
+        let call_count = Arc::new(AtomicUsize::new(0));
+        let call_count_clone = call_count.clone();
+
+        let c = Completion::new_write(move |_| {
+            call_count_clone.fetch_add(1, Ordering::SeqCst);
+        });
+
+        c.complete(1);
+        c.complete(2);
+        c.complete(3);
+
+        // Callback should only be called once
+        assert_eq!(call_count.load(Ordering::SeqCst), 1);
+        assert!(c.succeeded());
+    }
+
+    #[test]
+    fn test_completion_idempotent_error() {
+        // Erroring a completion multiple times should only trigger the callback once
+        use crate::sync::atomic::{AtomicUsize, Ordering};
+
+        let call_count = Arc::new(AtomicUsize::new(0));
+        let call_count_clone = call_count.clone();
+
+        let c = Completion::new_write(move |_| {
+            call_count_clone.fetch_add(1, Ordering::SeqCst);
+        });
+
+        c.error(CompletionError::Aborted);
+        c.error(CompletionError::Aborted);
+        c.complete(0); // Try completing after error
+
+        // Callback should only be called once
+        assert_eq!(call_count.load(Ordering::SeqCst), 1);
+        assert!(c.failed());
+    }
+}

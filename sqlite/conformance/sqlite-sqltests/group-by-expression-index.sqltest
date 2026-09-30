@@ -1,0 +1,56 @@
+@database :memory:
+
+# Regression: GROUP BY on expression index covering scan.
+# The GROUP BY key must be read back from the sorter even when the key
+# is a compound expression (not a bare column).
+
+test group-by-expr-index-basic {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, a INTEGER);
+    CREATE INDEX idx_expr ON t((a % 10));
+    INSERT INTO t VALUES
+        (1,1),(2,2),(3,3),(4,4),(5,5),
+        (6,6),(7,7),(8,8),(9,9),(10,10),
+        (11,11),(12,12),(13,13),(14,14),(15,15),
+        (16,16),(17,17),(18,18),(19,19),(20,20),
+        (21,21),(22,22),(23,23),(24,24),(25,25),
+        (26,26),(27,27),(28,28),(29,29),(30,30);
+    UPDATE t SET a = a + 1 WHERE id = 1;
+    SELECT (a % 10) AS m, count(*) AS c FROM t GROUP BY m;
+}
+expect {
+    0|3
+    1|2
+    2|4
+    3|3
+    4|3
+    5|3
+    6|3
+    7|3
+    8|3
+    9|3
+}
+
+# Same query without the expression index — ensures the GROUP BY key
+# for compound expressions is emitted correctly in the non-index path too.
+test group-by-compound-expr-no-index {
+    CREATE TABLE t2(id INTEGER PRIMARY KEY, a INTEGER);
+    INSERT INTO t2 VALUES (1,1),(2,2),(3,3),(4,11),(5,12),(6,13);
+    SELECT (a % 10) AS m, count(*) AS c FROM t2 GROUP BY m;
+}
+expect {
+    1|2
+    2|2
+    3|2
+}
+
+# Expression index with function call as GROUP BY key.
+test group-by-func-expr-index {
+    CREATE TABLE t3(id INTEGER PRIMARY KEY, name TEXT);
+    CREATE INDEX idx_lower ON t3(lower(name));
+    INSERT INTO t3 VALUES (1,'Alice'),(2,'BOB'),(3,'alice'),(4,'bob');
+    SELECT lower(name) AS n, count(*) AS c FROM t3 GROUP BY n;
+}
+expect {
+    alice|2
+    bob|2
+}

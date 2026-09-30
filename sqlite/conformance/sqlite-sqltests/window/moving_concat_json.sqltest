@@ -1,0 +1,152 @@
+@database :memory:
+
+setup moving_values {
+    CREATE TABLE t(
+        id INTEGER PRIMARY KEY,
+        p TEXT,
+        v TEXT,
+        sep TEXT,
+        j TEXT,
+        k TEXT,
+        keep INTEGER
+    );
+    INSERT INTO t VALUES
+        (1,'A','a',':',json_object('x',json_array(1,2)),'k1',1),
+        (2,'A','β','--',json_quote('comma' || char(44) || 'brace'),'k2',1),
+        (3,'A',NULL,'/',json_array(3,json_object('z','q' || char(44) || 'r')),'k3',1),
+        (4,'A','','💠','null','k4',0),
+        (5,'A','e',NULL,json_object('n',5),'k5',1),
+        (6,'B','x',',','1','b1',1),
+        (7,'B','y','::','"two"','b2',1);
+}
+
+@setup moving_values
+@cross-check-integrity
+test moving-group-concat-variable-separators {
+    SELECT id,
+           quote(group_concat(v, sep) OVER w),
+           quote(string_agg(v, sep) OVER w)
+    FROM t
+    WINDOW w AS (
+        PARTITION BY p ORDER BY id
+        ROWS BETWEEN 2 PRECEDING AND CURRENT ROW
+    )
+    ORDER BY id;
+}
+expect {
+    1|'a'|'a'
+    2|'a--β'|'a--β'
+    3|'a--β'|'a--β'
+    4|'β💠'|'β💠'
+    5|'e'|'e'
+    6|'x'|'x'
+    7|'x::y'|'x::y'
+}
+
+@setup moving_values
+@cross-check-integrity
+test moving-json-group-filter-and-nested-values {
+    SELECT id,
+           json_group_array(jsonb(j)) FILTER (WHERE keep) OVER w,
+           json_group_object(k, jsonb(j)) FILTER (WHERE keep) OVER w,
+           json(jsonb_group_array(jsonb(j)) FILTER (WHERE keep) OVER w),
+           json(jsonb_group_object(k, jsonb(j)) FILTER (WHERE keep) OVER w)
+    FROM t
+    WINDOW w AS (
+        PARTITION BY p ORDER BY id
+        ROWS BETWEEN 1 PRECEDING AND CURRENT ROW
+    )
+    ORDER BY id;
+}
+expect {
+    1|[{"x":[1,2]}]|{"k1":{"x":[1,2]}}|[{"x":[1,2]}]|{"k1":{"x":[1,2]}}
+    2|[{"x":[1,2]},"comma,brace"]|{"k1":{"x":[1,2]},"k2":"comma,brace"}|[{"x":[1,2]},"comma,brace"]|{"k1":{"x":[1,2]},"k2":"comma,brace"}
+    3|["comma,brace",[3,{"z":"q,r"}]]|{"k2":"comma,brace","k3":[3,{"z":"q,r"}]}|["comma,brace",[3,{"z":"q,r"}]]|{"k2":"comma,brace","k3":[3,{"z":"q,r"}]}
+    4|[[3,{"z":"q,r"}]]|{"k3":[3,{"z":"q,r"}]}|[[3,{"z":"q,r"}]]|{"k3":[3,{"z":"q,r"}]}
+    5|[{"n":5}]|{"k5":{"n":5}}|[{"n":5}]|{"k5":{"n":5}}
+    6|[1]|{"b1":1}|[1]|{"b1":1}
+    7|[1,"two"]|{"b1":1,"b2":"two"}|[1,"two"]|{"b1":1,"b2":"two"}
+}
+
+setup empty_concat_values {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT, sep TEXT);
+    INSERT INTO t VALUES
+        (1,'','|'),
+        (2,'','|'),
+        (3,'x','|'),
+        (4,'y','--');
+}
+
+@setup empty_concat_values
+@cross-check-integrity
+test moving-group-concat-empty-prefix {
+    SELECT id,
+           quote(group_concat(v, sep) OVER w),
+           quote(string_agg(v, sep) OVER w)
+    FROM t
+    WINDOW w AS (ORDER BY id ROWS BETWEEN 1 PRECEDING AND CURRENT ROW)
+    ORDER BY id;
+}
+expect {
+    1|''|''
+    2|'|'|'|'
+    3|'x'|'x'
+    4|'y'|'y'
+}
+
+setup peer_values {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, k INTEGER, v TEXT, sep TEXT);
+    INSERT INTO t VALUES
+        (1,10,'a',':'),
+        (2,10,'b','--'),
+        (3,20,'c','/'),
+        (4,20,'d','|'),
+        (5,30,'e',';');
+}
+
+@setup peer_values
+@cross-check-integrity
+test moving-group-concat-groups-and-range {
+    SELECT id,
+           group_concat(v, sep) OVER (
+               ORDER BY k
+               GROUPS BETWEEN 1 PRECEDING AND CURRENT ROW
+           ),
+           group_concat(v, sep) OVER (
+               ORDER BY k
+               RANGE BETWEEN 10 PRECEDING AND CURRENT ROW
+           ),
+           json_group_array(v) OVER (
+               ORDER BY k
+               GROUPS BETWEEN 1 PRECEDING AND CURRENT ROW
+           )
+    FROM t ORDER BY id;
+}
+expect {
+    1|a--b|a--b|["a","b"]
+    2|a--b|a--b|["a","b"]
+    3|a--b/c|d|a--b/c|d|["a","b","c","d"]
+    4|a--b/c|d|a--b/c|d|["a","b","c","d"]
+    5|c|d;e|c|d;e|["c","d","e"]
+}
+
+@setup peer_values
+@cross-check-integrity
+test concat-json-crossed-empty-frame-defaults {
+    SELECT id,
+           group_concat(v, sep) OVER w,
+           json_group_array(v) OVER w,
+           json_group_object(id, v) OVER w
+    FROM t
+    WINDOW w AS (
+        ORDER BY id ROWS BETWEEN 1 PRECEDING AND 2 PRECEDING
+    )
+    ORDER BY id;
+}
+expect {
+    1||[]|{}
+    2||[]|{}
+    3||[]|{}
+    4||[]|{}
+    5||[]|{}
+}

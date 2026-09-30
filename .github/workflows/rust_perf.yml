@@ -1,0 +1,141 @@
+name: Rust Benchmarks
+
+on:
+  workflow_dispatch:
+  push:
+    branches: ["main", "master", "notmain"]
+
+env:
+  CARGO_TERM_COLOR: never
+  CARGO_INCREMENTAL: "0"
+  CARGO_NET_RETRY: 10
+
+jobs:
+  bench:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - bench: benchmark
+            features: "--features bench"
+          - bench: mvcc_benchmark
+            features: "--features bench"
+          - bench: json_benchmark
+            features: "--features bench"
+          - bench: sql_functions
+            features: "--features bench"
+          - bench: hash_spill_benchmark
+            features: "--features bench"
+          - bench: write_perf_benchmark
+            features: "--features bench"
+          - bench: fts_benchmark
+            features: "--features bench"
+          - bench: parser_benchmark
+            features: ""
+          - bench: graph_queries_benchmark
+            features: "--features bench"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: "v1-rust"
+          cache-on-failure: true
+      - name: Generate graph-queries DB
+        if: matrix.bench == 'graph_queries_benchmark'
+        run: |
+          python3 perf/graph-queries/generate_seed.py | sqlite3 perf/graph-queries/graph-queries.db
+          cp perf/graph-queries/graph-queries.db perf/graph-queries/graph-queries-analyzed.db
+          sqlite3 perf/graph-queries/graph-queries-analyzed.db "ANALYZE;"
+      - name: Bench ${{ matrix.bench }}
+        run: cargo bench --bench ${{ matrix.bench }} ${{ matrix.features }}
+
+  clickbench:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: "v1-rust"
+          cache-on-failure: true
+      - uses: useblacksmith/setup-node@v5
+        with:
+          node-version: 24
+
+      - name: Clickbench
+        run: make clickbench
+
+  tpc-h-criterion:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      DB_FILE: "perf/tpc-h/TPC-H.db"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: "v1-rust"
+          cache-on-failure: true
+
+      - name: Cache TPC-H
+        id: cache-primes
+        uses: useblacksmith/cache@v5
+        with:
+          path: ${{ env.DB_FILE }}
+          key: tpc-h
+      - name: Download TPC-H
+        if: steps.cache-primes.outputs.cache-hit != 'true'
+        env:
+          DB_URL: "https://github.com/lovasoa/TPCH-sqlite/releases/download/v1.0/TPC-H.db"
+        run: wget -O $DB_FILE --no-verbose $DB_URL
+
+      - name: Bench
+        run: cargo bench --bench tpc_h_benchmark --locked
+
+  tpc-h:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: "v1-rust"
+          cache-on-failure: true
+      - name: TPC-H
+        env:
+          RUST_LOG: "off"
+        run: ./perf/tpc-h/benchmark.sh
+
+  vfs-bench-compile:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: "v1-rust"
+          cache-on-failure: true
+
+      - name: Build
+        run: cargo build --release --verbose --locked
+
+      - name: Install uv
+        uses: useblacksmith/setup-uv@v4
+        with:
+          enable-cache: true
+
+      - name: Set up Python
+        run: uv python install
+
+      - name: Install the project
+        run: uv sync --package turso_test
+
+      - name: Run benchmark
+        run: uv run bench-vfs "SELECT 1;" 100

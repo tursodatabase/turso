@@ -1,0 +1,41 @@
+[package]
+name = "turso_sync_engine"
+description = "Turso sync engine"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+turso_core = { workspace = true, features = ["conn_raw_api"] }
+turso_parser = { workspace = true }
+thiserror = "2.0.12"
+tracing = "0.1.41"
+serde_json.workspace = true
+serde = { workspace = true, features = ["derive"] }
+bytes = "1.11.1"
+genawaiter = { version = "0.99.1", default-features = false }
+http = "1.3.1"
+uuid = "1.17.0"
+base64 = "0.22.1"
+prost = "0.14.1"
+roaring = "0.11.2"
+crc32c = "0.6.8"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = { version = "0.2.172" }
+
+[dev-dependencies]
+ctor = "0.4.2"
+tempfile = { workspace = true }
+tracing-subscriber = { workspace = true, features = ["env-filter"] }
+tokio = { workspace = true, features = [
+    "macros",
+    "rt-multi-thread",
+    "test-util",
+] }
+uuid = "1.17.0"
+rand = { workspace = true }
+rand_chacha = { workspace = true }
+futures = { workspace = true }

@@ -1,0 +1,1298 @@
+from __future__ import annotations
+
+import math
+import sys
+from collections.abc import Iterable, Iterator, Mapping, Sequence
+from dataclasses import dataclass
+from types import TracebackType
+from typing import Any, Callable, Optional, TypeVar
+
+from ._turso import (
+    Busy,
+    Constraint,
+    Corrupt,
+    DatabaseFull,
+    Interrupt,
+    Misuse,
+    NotAdb,
+    PyTursoConnection,
+    PyTursoDatabase,
+    PyTursoDatabaseConfig,
+    PyTursoEncryptionConfig,
+    PyTursoExecutionResult,
+    PyTursoLog,
+    PyTursoSetupConfig,
+    PyTursoStatement,
+    PyTursoStatusCode,
+    py_turso_database_open,
+    py_turso_setup,
+)
+from ._turso import (
+    Error as TursoError,
+)
+from ._turso import (
+    PyTursoStatusCode as Status,
+)
+
+# DB-API 2.0 module attributes
+apilevel = "2.0"
+threadsafety = 1  # 1 means: Threads may share the module, but not connections.
+paramstyle = "qmark"  # Only positional parameters are supported.
+
+
+def _get_sqlite_version() -> tuple[str, tuple[int, int, int]]:
+    """Get SQLite version from a temporary connection."""
+    try:
+        cfg = PyTursoDatabaseConfig(path=":memory:")
+        db = py_turso_database_open(cfg)
+        conn = db.connect()
+        stmt = conn.prepare("SELECT sqlite_version()")
+        result = stmt.step()
+        version_str = result[0]
+        parts = tuple(int(p) for p in version_str.split("."))
+        # Ensure we have exactly 3 parts
+        while len(parts) < 3:
+            parts = (*parts, 0)
+        return version_str, parts[:3]
+    except Exception:
+        # Fallback to the SQLite version Turso tracks
+        # (SQLITE_VERSION in core/dialect/sqlite.rs)
+        return "3.50.4", (3, 50, 4)
+
+
+sqlite_version, sqlite_version_info = _get_sqlite_version()
+
+
+# Exception hierarchy following DB-API 2.0
+class Warning(Exception):
+    pass
+
+
+class Error(Exception):
+    pass
+
+
+class InterfaceError(Error):
+    pass
+
+
+class DatabaseError(Error):
+    pass
+
+
+class DataError(DatabaseError):
+    pass
+
+
+class OperationalError(DatabaseError):
+    pass
+
+
+class IntegrityError(DatabaseError):
+    pass
+
+
+class InternalError(DatabaseError):
+    pass
+
+
+class ProgrammingError(DatabaseError):
+    pass
+
+
+class NotSupportedError(DatabaseError):
+    pass
+
+
+def _map_turso_exception(exc: Exception) -> Exception:
+    """Maps Turso-specific exceptions to DB-API 2.0 exception hierarchy"""
+    if isinstance(exc, Busy):
+        return OperationalError(str(exc))
+    if isinstance(exc, Interrupt):
+        return OperationalError(str(exc))
+    if isinstance(exc, Misuse):
+        return InterfaceError(str(exc))
+    if isinstance(exc, Constraint):
+        return IntegrityError(str(exc))
+    if isinstance(exc, TursoError):
+        # Generic Turso error -> DatabaseError
+        return DatabaseError(str(exc))
+    if isinstance(exc, DatabaseFull):
+        return OperationalError(str(exc))
+    if isinstance(exc, NotAdb):
+        return DatabaseError(str(exc))
+    if isinstance(exc, Corrupt):
+        return DatabaseError(str(exc))
+    return exc
+
+
+# Internal helpers
+
+_DBCursorT = TypeVar("_DBCursorT", bound="Cursor")
+
+
+def _first_keyword(sql: str) -> str:
+    """
+    Return the first SQL keyword (uppercased) ignoring leading whitespace,
+    empty statements, and single-line and multi-line comments.
+
+    This is intentionally minimal and only used to detect DML for implicit
+    transaction handling. It may not handle all edge cases (e.g. complex WITH).
+    """
+    i = 0
+    n = len(sql)
+    while i < n:
+        c = sql[i]
+        if c.isspace() or c in (";", "\ufeff"):
+            i += 1
+            continue
+        if c == "-" and i + 1 < n and sql[i + 1] == "-":
+            # line comment
+            i += 2
+            while i < n and sql[i] not in ("\r", "\n"):
+                i += 1
+            continue
+        if c == "/" and i + 1 < n and sql[i + 1] == "*":
+            # block comment
+            i += 2
+            while i + 1 < n and not (sql[i] == "*" and sql[i + 1] == "/"):
+                i += 1
+            i = min(i + 2, n)
+            continue
+        break
+    # read token
+    j = i
+    while j < n and (sql[j].isalpha() or sql[j] == "_"):
+        j += 1
+    return sql[i:j].upper()
+
+
+def _is_dml(sql: str) -> bool:
+    kw = _first_keyword(sql)
+    if kw in ("INSERT", "UPDATE", "DELETE", "REPLACE"):
+        return True
+    # "WITH" can also prefix DML, but we conservatively skip it to avoid false positives.
+    return False
+
+
+def _is_insert_or_replace(sql: str) -> bool:
+    kw = _first_keyword(sql)
+    return kw in ("INSERT", "REPLACE")
+
+
+@dataclass
+class BatchResult:
+    """The result of one statement of a [`Connection.batch`] call, in
+    DB-API vocabulary: `description` and `rows` for statements that return
+    rows, `rowcount` for DML (−1 when the statement returned rows), and
+    `lastrowid` for INSERT/REPLACE. `rows_read`, `rows_written`, and
+    `query_duration_ms` are server-side execution statistics reported by
+    the serverless driver; the embedded engine does not report them per
+    statement, so they are None here."""
+
+    rows: list[tuple]
+    description: Optional[tuple[tuple[str, None, None, None, None, None, None], ...]]
+    rowcount: int
+    lastrowid: Optional[int]
+    rows_read: Optional[int] = None
+    rows_written: Optional[int] = None
+    query_duration_ms: Optional[float] = None
+
+
+# Accepted values for the `mode` argument of Connection.batch and the
+# BEGIN statement each maps to.
+_BATCH_MODES = {
+    "deferred": "BEGIN DEFERRED",
+    "immediate": "BEGIN IMMEDIATE",
+    "exclusive": "BEGIN EXCLUSIVE",
+    "concurrent": "BEGIN CONCURRENT",
+}
+
+_TRANSACTION_CONTROL_KEYWORDS = {
+    "BEGIN",
+    "COMMIT",
+    "END",
+    "ROLLBACK",
+    "SAVEPOINT",
+    "RELEASE",
+}
+
+
+def _batch_begin_sql(mode: Optional[str]) -> Optional[str]:
+    if mode is None:
+        return None
+    begin_sql = _BATCH_MODES.get(str(mode).lower())
+    if begin_sql is None:
+        raise ProgrammingError(
+            f"batch mode must be one of {sorted(_BATCH_MODES)} or None, got {mode!r}"
+        )
+    return begin_sql
+
+
+def _normalize_batch_statements(
+    statements: Iterable[Any],
+) -> list[tuple[str, Sequence[Any] | Mapping[str, Any]]]:
+    """Normalize batch input to (sql, parameters) pairs. Accepts SQL
+    strings and (sql, parameters) pairs."""
+    normalized = []
+    for index, statement in enumerate(statements):
+        if isinstance(statement, str):
+            normalized.append((statement, ()))
+            continue
+        if (
+            isinstance(statement, (tuple, list))
+            and len(statement) == 2
+            and isinstance(statement[0], str)
+        ):
+            normalized.append((statement[0], statement[1]))
+            continue
+        raise ProgrammingError(
+            f"batch statement {index} must be a SQL string or a (sql, parameters) pair"
+        )
+    return normalized
+
+
+def _reject_transaction_control_statements(
+    statements: list[tuple[str, Sequence[Any] | Mapping[str, Any]]],
+) -> None:
+    for index, (sql, _parameters) in enumerate(statements):
+        if _first_keyword(sql) in _TRANSACTION_CONTROL_KEYWORDS:
+            error = ProgrammingError(
+                "transaction-control SQL is not allowed in a batch with a transaction mode"
+            )
+            raise _batch_statement_error(index, error) from error
+
+
+def _batch_statement_error(
+    index: int,
+    error: Exception,
+    results: Optional[list] = None,
+) -> Exception:
+    """Wrap a statement failure so the raised exception identifies which
+    statement failed, preserving the DB-API exception class. The zero-based
+    index is available as the `batch_index` attribute, and `batch_results`
+    is empty when validation fails before execution. Otherwise it carries
+    one entry per statement: the completed statement's `BatchResult`, or
+    None for the failing statement and the statements that did not run."""
+    wrapped = type(error)(f"batch statement {index} failed: {error}")
+    wrapped.batch_index = index
+    wrapped.batch_results = results if results is not None else []
+    return wrapped
+
+
+def _run_execute_with_io(stmt: PyTursoStatement, extra_io: Optional[Callable[[], None]]) -> PyTursoExecutionResult:
+    """
+    Run PyTursoStatement.execute() handling potential async IO loops.
+    """
+    while True:
+        result = stmt.execute()
+        status = result.status
+        if status == Status.Io:
+            stmt.run_io()
+            if extra_io:
+                extra_io()
+            continue
+        return result
+
+
+def _step_once_with_io(stmt: PyTursoStatement, extra_io: Optional[Callable[[], None]]) -> PyTursoStatusCode:
+    """
+    Run PyTursoStatement.step() once handling potential async IO loops.
+    """
+    while True:
+        status = stmt.step()
+        if status == Status.Io:
+            stmt.run_io()
+            if extra_io:
+                extra_io()
+            continue
+        return status
+
+
+def _reject_stdlib_row_factory(rf: Any) -> None:
+    stdlib_sqlite3 = sys.modules.get("sqlite3")
+    if stdlib_sqlite3 is None:
+        return
+    if isinstance(rf, type) and issubclass(rf, stdlib_sqlite3.Row):
+        raise TypeError("sqlite3.Row is not supported as a row_factory on turso connections; use turso.Row instead")
+
+
+@dataclass
+class _Prepared:
+    stmt: PyTursoStatement
+    tail_index: int
+    has_columns: bool
+    column_names: tuple[str, ...]
+
+
+# Connection goes FIRST
+class Connection:
+    """
+    A connection to a Turso (SQLite-compatible) database.
+
+    Similar to sqlite3.Connection with a subset of features focusing on DB-API 2.0.
+    """
+
+    # Expose exception classes as attributes like sqlite3.Connection does
+    @property
+    def DataError(self) -> type[DataError]:
+        return DataError
+
+    @property
+    def DatabaseError(self) -> type[DatabaseError]:
+        return DatabaseError
+
+    @property
+    def Error(self) -> type[Error]:
+        return Error
+
+    @property
+    def IntegrityError(self) -> type[IntegrityError]:
+        return IntegrityError
+
+    @property
+    def InterfaceError(self) -> type[InterfaceError]:
+        return InterfaceError
+
+    @property
+    def InternalError(self) -> type[InternalError]:
+        return InternalError
+
+    @property
+    def NotSupportedError(self) -> type[NotSupportedError]:
+        return NotSupportedError
+
+    @property
+    def OperationalError(self) -> type[OperationalError]:
+        return OperationalError
+
+    @property
+    def ProgrammingError(self) -> type[ProgrammingError]:
+        return ProgrammingError
+
+    @property
+    def Warning(self) -> type[Warning]:
+        return Warning
+
+    def __init__(
+        self,
+        conn: PyTursoConnection,
+        *,
+        isolation_level: Optional[str] = "DEFERRED",
+        extra_io: Optional[Callable[[], None]] = None,
+    ) -> None:
+        self._conn: PyTursoConnection = conn
+        # autocommit behavior:
+        # - True: SQLite autocommit mode; commit/rollback are no-ops.
+        # - False: PEP 249 compliant: ensure a transaction is always open.
+        #   We'll use BEGIN DEFERRED after commit/rollback.
+        # - "LEGACY": implicit transactions on DML when isolation_level is not None.
+        self._autocommit_mode: object | bool = "LEGACY"
+        self.isolation_level: Optional[str] = isolation_level
+        self.row_factory: Callable[[Cursor, Row], object] | type[Row] | None = None
+        self.text_factory: Any = str
+        self.extra_io = extra_io
+
+        # If autocommit is False, ensure a transaction is open
+        if self._autocommit_mode is False:
+            self._ensure_transaction_open()
+
+    def _ensure_transaction_open(self) -> None:
+        """
+        Ensure a transaction is open when autocommit is False.
+        """
+        try:
+            if self._conn.get_auto_commit():
+                # No transaction active -> open new one according to isolation_level (default to DEFERRED)
+                level = self.isolation_level or "DEFERRED"
+                self._exec_ddl_only(f"BEGIN {level}")
+        except Exception as exc:  # noqa: BLE001
+            raise _map_turso_exception(exc)
+
+    def _exec_ddl_only(self, sql: str) -> None:
+        """
+        Execute a SQL statement that does not produce rows and ignore any result rows.
+        """
+        try:
+            stmt = self._conn.prepare_single(sql)
+            _run_execute_with_io(stmt, self.extra_io)
+            # finalize to ensure completion; finalize never mixes with execute
+            stmt.finalize()
+        except Exception as exc:  # noqa: BLE001
+            raise _map_turso_exception(exc)
+
+    def _prepare_first(self, sql: str) -> _Prepared:
+        """
+        Prepare the first statement in the given SQL string and return metadata.
+        """
+        try:
+            opt = self._conn.prepare_first(sql)
+        except Exception as exc:  # noqa: BLE001
+            raise _map_turso_exception(exc)
+        if opt is None:
+            raise ProgrammingError("no SQL statements to execute")
+
+        stmt, tail_idx = opt
+        # Determine whether statement returns columns (rows)
+        try:
+            columns = tuple(stmt.columns())
+        except Exception as exc:  # noqa: BLE001
+            # Clean up statement before re-raising
+            try:
+                stmt.finalize()
+            except Exception:
+                pass
+            raise _map_turso_exception(exc)
+        has_cols = len(columns) > 0
+        return _Prepared(stmt=stmt, tail_index=tail_idx, has_columns=has_cols, column_names=columns)
+
+    def _raise_if_multiple_statements(self, sql: str, tail_index: int) -> None:
+        """
+        Ensure there is no second statement after the first one; otherwise raise ProgrammingError.
+        """
+        # Skip any trailing whitespace/comments after tail_index, and check if another statement exists.
+        rest = sql[tail_index:]
+        try:
+            nxt = self._conn.prepare_first(rest)
+            if nxt is not None:
+                # Clean-up the prepared second statement immediately
+                second_stmt, _ = nxt
+                try:
+                    second_stmt.finalize()
+                except Exception:
+                    pass
+                raise ProgrammingError("You can only execute one statement at a time")
+        except ProgrammingError:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            raise _map_turso_exception(exc)
+
+    @property
+    def in_transaction(self) -> bool:
+        try:
+            return not self._conn.get_auto_commit()
+        except Exception as exc:  # noqa: BLE001
+            raise _map_turso_exception(exc)
+
+    # Provide autocommit property for sqlite3-like API (optional)
+    @property
+    def autocommit(self) -> object | bool:
+        return self._autocommit_mode
+
+    @autocommit.setter
+    def autocommit(self, val: object | bool) -> None:
+        # Accept True, False, or "LEGACY"
+        if val not in (True, False, "LEGACY"):
+            raise ProgrammingError("autocommit must be True, False, or 'LEGACY'")
+        self._autocommit_mode = val
+        # If switching to False, ensure a transaction is open
+        if val is False:
+            self._ensure_transaction_open()
+        # If switching to True or LEGACY, nothing else to do immediately.
+
+    def close(self) -> None:
+        # In sqlite3: If autocommit is False, pending transaction is implicitly rolled back.
+        try:
+            if self._autocommit_mode is False and self.in_transaction:
+                try:
+                    self._exec_ddl_only("ROLLBACK")
+                except Exception:
+                    # As sqlite3 does, ignore rollback failure on close
+                    pass
+            self._conn.close()
+        except Exception as exc:  # noqa: BLE001
+            raise _map_turso_exception(exc)
+
+    def commit(self) -> None:
+        try:
+            if self._autocommit_mode is True:
+                # No-op in SQLite autocommit mode
+                return
+            if self.in_transaction:
+                self._exec_ddl_only("COMMIT")
+            if self._autocommit_mode is False:
+                # Re-open a transaction to maintain PEP 249 behavior
+                self._ensure_transaction_open()
+        except Exception as exc:  # noqa: BLE001
+            raise _map_turso_exception(exc)
+
+    def rollback(self) -> None:
+        try:
+            if self._autocommit_mode is True:
+                # No-op in SQLite autocommit mode
+                return
+            if self.in_transaction:
+                self._exec_ddl_only("ROLLBACK")
+            if self._autocommit_mode is False:
+                # Re-open a transaction to maintain PEP 249 behavior
+                self._ensure_transaction_open()
+        except Exception as exc:  # noqa: BLE001
+            raise _map_turso_exception(exc)
+
+    def interrupt(self) -> None:
+        """
+        Abort any query currently executing on this connection.
+
+        Mirrors ``sqlite3.Connection.interrupt``: call it from another thread to
+        cancel a long-running ``execute``/``fetch*`` in flight; that call raises
+        ``OperationalError`` ("interrupted"). The underlying execution methods
+        release the GIL, so a watchdog thread can actually run while a query is
+        busy. If no statement is running the call is a no-op.
+        """
+        try:
+            self._conn.interrupt()
+        except Exception as exc:  # noqa: BLE001
+            raise _map_turso_exception(exc)
+
+    def set_query_timeout(self, milliseconds: int) -> None:
+        """
+        Set the maximum time (in milliseconds) a single statement may run before
+        it is interrupted (raising ``OperationalError``). ``0`` disables the
+        timeout. Unlike ``interrupt()`` this needs no watchdog thread: the
+        deadline is enforced inside the engine. Turso extension (not in stdlib
+        ``sqlite3``).
+        """
+        if milliseconds < 0:
+            raise ProgrammingError("query timeout must be non-negative")
+        try:
+            self._conn.set_query_timeout(milliseconds)
+        except Exception as exc:  # noqa: BLE001
+            raise _map_turso_exception(exc)
+
+    def get_query_timeout(self) -> int:
+        """Return the current per-statement query timeout in milliseconds (``0`` = disabled)."""
+        try:
+            return self._conn.get_query_timeout()
+        except Exception as exc:  # noqa: BLE001
+            raise _map_turso_exception(exc)
+
+    def _maybe_implicit_begin(self, sql: str) -> None:
+        """
+        Implement sqlite3 legacy implicit transaction behavior:
+
+        If autocommit is LEGACY_TRANSACTION_CONTROL, isolation_level is not None, sql is a DML
+        (INSERT/UPDATE/DELETE/REPLACE), and there is no open transaction, issue:
+            BEGIN <isolation_level>
+        """
+        if self._autocommit_mode == "LEGACY" and self.isolation_level is not None:
+            if not self.in_transaction and _is_dml(sql):
+                level = self.isolation_level or "DEFERRED"
+                self._exec_ddl_only(f"BEGIN {level}")
+
+    def cursor(self, factory: Optional[Callable[[Connection], _DBCursorT]] = None) -> _DBCursorT | Cursor:
+        if factory is None:
+            return Cursor(self)
+        return factory(self)
+
+    def execute(self, sql: str, parameters: Sequence[Any] | Mapping[str, Any] = ()) -> Cursor:
+        cur = self.cursor()
+        cur.execute(sql, parameters)
+        return cur
+
+    def executemany(self, sql: str, parameters: Iterable[Sequence[Any] | Mapping[str, Any]]) -> Cursor:
+        cur = self.cursor()
+        cur.executemany(sql, parameters)
+        return cur
+
+    def executescript(self, sql_script: str) -> Cursor:
+        cur = self.cursor()
+        cur.executescript(sql_script)
+        return cur
+
+    def batch(
+        self,
+        statements: Iterable[str | tuple[str, Sequence[Any] | Mapping[str, Any]]],
+        mode: Optional[str] = None,
+    ) -> list[BatchResult]:
+        """Execute multiple parameterized statements as a batch.
+
+        The statements — SQL strings or (sql, parameters) pairs, with the
+        same parameter forms as `execute()` — execute in order. Execution
+        stops at the first statement that fails: the remaining statements
+        are skipped and the raised exception identifies the failing
+        statement by its zero-based index (the `batch_index` attribute)
+        and carries the per-statement results in the `batch_results`
+        attribute. It is empty when parameter validation fails before
+        execution; otherwise it has one entry per statement — the completed
+        statement's `BatchResult`, or None for the failing statement and
+        the statements that did not run.
+
+        With `mode` set to "deferred", "immediate", "exclusive", or
+        "concurrent", the statements are wrapped in `BEGIN <mode>` /
+        `COMMIT`, with a `ROLLBACK` on failure: either every statement
+        commits or none does. The statements must not contain their own
+        transaction-control SQL in that case. If `ROLLBACK` itself fails,
+        the primary exception has a `rollback_error` attribute and the
+        connection's transaction state is unknown. With `mode` unset the
+        batch is not transactional: each statement commits as it executes.
+
+        Unlike `execute()`, `batch()` never opens a legacy implicit
+        transaction. If a transaction is already open on this connection,
+        the statements join it (and `mode` is ignored).
+
+        Returns one `BatchResult` per statement, in order.
+        """
+        begin_sql = _batch_begin_sql(mode)
+        stmts = _normalize_batch_statements(statements)
+        if not stmts:
+            return []
+        stmts = self._prevalidate_batch_parameters(stmts)
+        if self.in_transaction:
+            begin_sql = None
+        if begin_sql is None:
+            return self._run_batch_statements(stmts)
+        _reject_transaction_control_statements(stmts)
+        self._exec_ddl_only(begin_sql)
+        try:
+            results = self._run_batch_statements(stmts)
+            self._exec_ddl_only("COMMIT")
+        except Exception as primary_error:
+            try:
+                self._exec_ddl_only("ROLLBACK")
+            except Exception as rollback_error:
+                primary_error.rollback_error = rollback_error
+            raise
+        return results
+
+    def _prevalidate_batch_parameters(
+        self, stmts: list[tuple[str, Sequence[Any] | Mapping[str, Any]]]
+    ) -> list[tuple[str, Sequence[Any] | Mapping[str, Any]]]:
+        validator = self._conn.prepare_single("SELECT ?")
+        validated = []
+        try:
+            for index, (sql, parameters) in enumerate(stmts):
+                try:
+                    if isinstance(parameters, Mapping):
+                        copied_parameters: Sequence[Any] | Mapping[str, Any] = dict(parameters)
+                        values = copied_parameters.values()
+                    else:
+                        copied_parameters = Cursor._to_positional_params(parameters)
+                        values = copied_parameters
+                    for value in values:
+                        if isinstance(value, float) and math.isinf(value):
+                            raise ValueError(
+                                "infinite float values cannot be sent over the protocol"
+                            )
+                        validator.bind_positional(1, value)
+                except Exception as exc:  # noqa: BLE001
+                    raise _batch_statement_error(index, _map_turso_exception(exc)) from exc
+                validated.append((sql, copied_parameters))
+        finally:
+            validator.finalize()
+        return validated
+
+    def _run_batch_statements(
+        self, stmts: list[tuple[str, Sequence[Any] | Mapping[str, Any]]]
+    ) -> list[BatchResult]:
+        """Execute the statements of a batch in order, stopping at the
+        first failure and reporting its index along with the results of
+        the statements that completed."""
+        results = []
+        for index, (sql, parameters) in enumerate(stmts):
+            try:
+                results.append(self._execute_batch_statement(sql, parameters))
+            except Exception as exc:  # noqa: BLE001
+                # One entry per statement: the completed statements'
+                # results, None for the failing and skipped ones.
+                partial = list(results) + [None] * (len(stmts) - len(results))
+                raise _batch_statement_error(index, exc, partial) from exc
+        return results
+
+    def _execute_batch_statement(
+        self, sql: str, parameters: Sequence[Any] | Mapping[str, Any]
+    ) -> BatchResult:
+        """Execute one statement of a batch, buffering its rows."""
+        prepared = self._prepare_first(sql)
+        self._raise_if_multiple_statements(sql, prepared.tail_index)
+        stmt = prepared.stmt
+        try:
+            Cursor._bind_params(stmt, parameters)
+            if prepared.has_columns:
+                rows = []
+                while _step_once_with_io(stmt, self.extra_io) == Status.Row:
+                    rows.append(tuple(stmt.row()))  # type: ignore[call-arg]
+                description = tuple(
+                    (name, None, None, None, None, None, None) for name in prepared.column_names
+                )
+                result = BatchResult(rows=rows, description=description, rowcount=-1, lastrowid=None)
+            else:
+                execution = _run_execute_with_io(stmt, self.extra_io)
+                lastrowid = None
+                if execution.rows_changed > 0 and _is_insert_or_replace(sql):
+                    lastrowid = self._last_insert_rowid()
+                result = BatchResult(
+                    rows=[],
+                    description=None,
+                    rowcount=int(execution.rows_changed),
+                    lastrowid=lastrowid,
+                )
+            stmt.finalize()
+            return result
+        except Exception as exc:  # noqa: BLE001
+            try:
+                stmt.finalize()
+            except Exception:
+                pass
+            raise _map_turso_exception(exc)
+
+    def _last_insert_rowid(self) -> Optional[int]:
+        """The rowid of the most recent successful INSERT on this
+        connection, read from the engine without executing a statement."""
+        try:
+            return self._conn.last_insert_rowid()
+        except Exception:
+            return None
+
+    def __call__(self, sql: str) -> PyTursoStatement:
+        # Shortcut to prepare a single statement
+        try:
+            return self._conn.prepare_single(sql)
+        except Exception as exc:  # noqa: BLE001
+            raise _map_turso_exception(exc)
+
+    def __enter__(self) -> "Connection":
+        return self
+
+    def __exit__(
+        self,
+        type: type[BaseException] | None,
+        value: BaseException | None,
+        traceback: TracebackType | None,
+    ) -> bool:
+        # sqlite3 behavior: In context manager, if no exception -> commit, else rollback (legacy and PEP 249 modes)
+        try:
+            if type is None:
+                self.commit()
+            else:
+                self.rollback()
+        finally:
+            # Always propagate exceptions (returning False)
+            return False
+
+
+# Cursor goes SECOND
+class Cursor:
+    arraysize: int
+
+    def __init__(self, connection: Connection, /) -> None:
+        self._connection: Connection = connection
+        self.arraysize = 1
+        self.row_factory: Callable[[Cursor, Row], object] | type[Row] | None = connection.row_factory
+
+        # State for the last executed statement
+        self._active_stmt: Optional[PyTursoStatement] = None
+        self._active_has_rows: bool = False
+        self._description: Optional[tuple[tuple[str, None, None, None, None, None, None], ...]] = None
+        self._lastrowid: Optional[int] = None
+        self._rowcount: int = -1
+        self._closed: bool = False
+
+    @property
+    def connection(self) -> Connection:
+        return self._connection
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        try:
+            # Finalize any active statement to ensure completion.
+            if self._active_stmt is not None:
+                try:
+                    self._active_stmt.finalize()
+                except Exception:
+                    pass
+        finally:
+            self._active_stmt = None
+            self._active_has_rows = False
+            self._closed = True
+
+    def _ensure_open(self) -> None:
+        if self._closed:
+            raise ProgrammingError("Cannot operate on a closed cursor")
+
+    @property
+    def description(self) -> tuple[tuple[str, None, None, None, None, None, None], ...] | None:
+        return self._description
+
+    @property
+    def lastrowid(self) -> int | None:
+        return self._lastrowid
+
+    @property
+    def rowcount(self) -> int:
+        return self._rowcount
+
+    def _reset_last_result(self) -> None:
+        # Ensure any previous statement is finalized to not leak resources
+        if self._active_stmt is not None:
+            try:
+                self._active_stmt.finalize()
+            except Exception:
+                pass
+        self._active_stmt = None
+        self._active_has_rows = False
+        self._description = None
+        self._rowcount = -1
+        # Do not reset lastrowid here; sqlite3 preserves lastrowid until next insert.
+
+    @staticmethod
+    def _to_positional_params(parameters: Sequence[Any] | Mapping[str, Any]) -> tuple[Any, ...]:
+        if isinstance(parameters, Mapping):
+            # Named placeholders are not supported
+            raise ProgrammingError("Named parameters are not supported; use positional parameters with '?'")
+        if parameters is None:
+            return ()
+        if isinstance(parameters, tuple):
+            return parameters
+        # Convert arbitrary sequences to tuple efficiently
+        return tuple(parameters)
+
+    @staticmethod
+    def _bind_named_params(stmt: PyTursoStatement, parameters: Mapping[str, Any]) -> None:
+        """
+        Bind mapping-style parameters to a prepared SQLite statement, emulating
+        the behavior of Python's ``sqlite3`` module for named parameters.
+
+        SQLite supports the following parameter syntaxes:
+
+            :name
+            @name
+            $name
+            ?NNN
+
+        When a mapping (dict-like object) is supplied:
+
+        1. Keys are interpreted as parameter names without the prefix.
+           For example:
+
+                {"name": "Alice"}
+
+           can bind to any of:
+
+                :name
+                @name
+                $name
+
+        2. Extra keys in the mapping that do not correspond to parameters in
+           the SQL statement are ignored.
+
+        3. Missing keys for parameters present in the SQL statement result in
+           an error raised by the underlying SQLite engine.
+
+        4. Positional parameters using '?' are NOT supported with mappings and
+           must be bound using positional sequences (tuple/list).
+
+        5. Numeric parameters of the form '?NNN' may be bound using a mapping
+           key of the numeric portion as a string:
+
+                {"1": value}  -> binds to ?1
+
+           This mirrors Python's sqlite3 behavior where numeric parameters can
+           be addressed via their 1-based index.
+
+        6. Keys that already include a prefix (e.g. ":name") are not required
+           and are not relied upon for matching; plain names are preferred.
+        """
+        for key, value in parameters.items():
+            if not isinstance(key, str):
+                continue
+            candidates = [f":{key}", f"@{key}", f"${key}"]
+            if key.isdigit():
+                candidates.append(f"?{key}")
+            for candidate in candidates:
+                try:
+                    index = stmt.named_position(candidate)
+                except TursoError:
+                    continue
+                stmt.bind_positional(index, value)
+                break
+
+    @staticmethod
+    def _bind_params(stmt: PyTursoStatement, parameters: Sequence[Any] | Mapping[str, Any]) -> None:
+        if isinstance(parameters, Mapping):
+            Cursor._bind_named_params(stmt, parameters)
+            return
+        params = Cursor._to_positional_params(parameters)
+        if params:
+            stmt.bind(params)
+
+    def _maybe_implicit_begin(self, sql: str) -> None:
+        self._connection._maybe_implicit_begin(sql)
+
+    def _prepare_single_statement(self, sql: str) -> _Prepared:
+        prepared = self._connection._prepare_first(sql)
+        # Ensure there are no further statements
+        self._connection._raise_if_multiple_statements(sql, prepared.tail_index)
+        return prepared
+
+    def execute(self, sql: str, parameters: Sequence[Any] | Mapping[str, Any] = ()) -> "Cursor":
+        self._ensure_open()
+        self._reset_last_result()
+
+        # Implement legacy implicit transactions if needed
+        self._maybe_implicit_begin(sql)
+
+        # Prepare exactly one statement
+        prepared = self._prepare_single_statement(sql)
+
+        stmt = prepared.stmt
+        try:
+            self._bind_params(stmt, parameters)
+
+            if prepared.has_columns:
+                # Stepped statement (e.g., SELECT or DML with RETURNING)
+                self._active_stmt = stmt
+                self._active_has_rows = True
+                # Set description immediately (even if there are no rows)
+                self._description = tuple((name, None, None, None, None, None, None) for name in prepared.column_names)
+                # For statements that return rows, DB-API specifies rowcount is -1
+                self._rowcount = -1
+                # Do not compute lastrowid here
+            else:
+                # Executed statement (no rows returned)
+                result = _run_execute_with_io(stmt, self._connection.extra_io)
+                # rows_changed from execution result
+                self._rowcount = int(result.rows_changed)
+                # Set description to None
+                self._description = None
+                # Set lastrowid for INSERT/REPLACE (best-effort)
+                self._lastrowid = self._fetch_last_insert_rowid_if_needed(sql, result.rows_changed)
+                # Finalize the statement to release resources
+                stmt.finalize()
+        except Exception as exc:  # noqa: BLE001
+            # Ensure cleanup on error
+            try:
+                stmt.finalize()
+            except Exception:
+                pass
+            raise _map_turso_exception(exc)
+
+        return self
+
+    def _fetch_last_insert_rowid_if_needed(self, sql: str, rows_changed: int) -> Optional[int]:
+        if rows_changed <= 0 or not _is_insert_or_replace(sql):
+            return self._lastrowid
+        rowid = self._connection._last_insert_rowid()
+        # lastrowid remains unchanged when it cannot be determined.
+        return rowid if rowid is not None else self._lastrowid
+
+    def executemany(self, sql: str, seq_of_parameters: Iterable[Sequence[Any] | Mapping[str, Any]]) -> "Cursor":
+        self._ensure_open()
+        self._reset_last_result()
+
+        # executemany only accepts DML; enforce this to match sqlite3 semantics
+        if not _is_dml(sql):
+            raise ProgrammingError("executemany() requires a single DML (INSERT/UPDATE/DELETE/REPLACE) statement")
+
+        # Implement legacy implicit transaction: same as execute()
+        self._maybe_implicit_begin(sql)
+
+        prepared = self._prepare_single_statement(sql)
+        stmt = prepared.stmt
+        try:
+            # For executemany, discard any rows produced (even if RETURNING was used)
+            # Therefore we ALWAYS use execute() path per-iteration.
+            for parameters in seq_of_parameters:
+                # Reset previous bindings and program memory before reusing
+                stmt.reset()
+                self._bind_params(stmt, parameters)
+                result = _run_execute_with_io(stmt, self._connection.extra_io)
+                # rowcount is "the number of modified rows" for the LAST executed statement only
+                self._rowcount = int(result.rows_changed) + (self._rowcount if self._rowcount != -1 else 0)
+            # After loop, finalize statement
+            stmt.finalize()
+            # Cursor description is None for DML executed via executemany()
+            self._description = None
+            # sqlite3 leaves lastrowid unchanged for executemany
+        except Exception as exc:  # noqa: BLE001
+            try:
+                stmt.finalize()
+            except Exception:
+                pass
+            raise _map_turso_exception(exc)
+        return self
+
+    def executescript(self, sql_script: str) -> "Cursor":
+        self._ensure_open()
+        self._reset_last_result()
+
+        # sqlite3 behavior: If autocommit is LEGACY and there is a pending transaction, implicitly COMMIT first
+        if self._connection._autocommit_mode == "LEGACY" and self._connection.in_transaction:
+            try:
+                self._connection._exec_ddl_only("COMMIT")
+            except Exception as exc:  # noqa: BLE001
+                raise _map_turso_exception(exc)
+
+        # Iterate over statements in the script and execute them, discarding rows
+        sql = sql_script
+        total_rowcount = -1
+        try:
+            offset = 0
+            while True:
+                opt = self._connection._conn.prepare_first(sql[offset:])
+                if opt is None:
+                    break
+                stmt, tail = opt
+                # Note: per DB-API, any resulting rows are discarded
+                result = _run_execute_with_io(stmt, self._connection.extra_io)
+                total_rowcount = int(result.rows_changed) if result.rows_changed > 0 else total_rowcount
+                # finalize to ensure completion
+                stmt.finalize()
+                offset += tail
+        except Exception as exc:  # noqa: BLE001
+            raise _map_turso_exception(exc)
+
+        self._description = None
+        self._rowcount = total_rowcount
+        return self
+
+    def _fetchone_tuple(self) -> Optional[tuple[Any, ...]]:
+        """
+        Fetch one row as a plain Python tuple, or return None if no more rows.
+        """
+        if not self._active_has_rows or self._active_stmt is None:
+            return None
+        try:
+            status = _step_once_with_io(self._active_stmt, self._connection.extra_io)
+            if status == Status.Row:
+                row_tuple = tuple(self._active_stmt.row())  # type: ignore[call-arg]
+                return row_tuple
+            # status == Done: finalize and clean up
+            self._active_stmt.finalize()
+            self._active_stmt = None
+            self._active_has_rows = False
+            return None
+        except Exception as exc:  # noqa: BLE001
+            # Finalize and clean up on error
+            try:
+                if self._active_stmt is not None:
+                    self._active_stmt.finalize()
+            except Exception:
+                pass
+            self._active_stmt = None
+            self._active_has_rows = False
+            raise _map_turso_exception(exc)
+
+    def _apply_row_factory(self, row_values: tuple[Any, ...]) -> Any:
+        rf = self.row_factory
+        if rf is None:
+            return row_values
+        if isinstance(rf, type) and issubclass(rf, Row):
+            return rf(self, Row(self, row_values))  # type: ignore[call-arg]
+        if callable(rf):
+            try:
+                return rf(self, Row(self, row_values))  # type: ignore[misc]
+            except TypeError:
+                _reject_stdlib_row_factory(rf)
+                raise
+        # Fallback: return tuple
+        return row_values
+
+    def fetchone(self) -> Any:
+        self._ensure_open()
+        row = self._fetchone_tuple()
+        if row is None:
+            return None
+        return self._apply_row_factory(row)
+
+    def fetchmany(self, size: Optional[int] = None) -> list[Any]:
+        self._ensure_open()
+        if size is None:
+            size = self.arraysize
+        if size < 0:
+            raise ValueError("size must be non-negative")
+        result: list[Any] = []
+        for _ in range(size):
+            row = self._fetchone_tuple()
+            if row is None:
+                break
+            result.append(self._apply_row_factory(row))
+        return result
+
+    def fetchall(self) -> list[Any]:
+        self._ensure_open()
+        result: list[Any] = []
+        while True:
+            row = self._fetchone_tuple()
+            if row is None:
+                break
+            result.append(self._apply_row_factory(row))
+        return result
+
+    def setinputsizes(self, sizes: Any, /) -> None:
+        # No-op for DB-API compliance
+        return None
+
+    def setoutputsize(self, size: Any, column: Any = None, /) -> None:
+        # No-op for DB-API compliance
+        return None
+
+    def __iter__(self) -> "Cursor":
+        return self
+
+    def __next__(self) -> Any:
+        row = self.fetchone()
+        if row is None:
+            raise StopIteration
+        return row
+
+
+# Row goes THIRD
+class Row(Sequence[Any]):
+    """
+    sqlite3.Row-like container supporting index and name-based access.
+    """
+
+    def __new__(cls, cursor: Cursor, data: tuple[Any, ...], /) -> "Row":
+        obj = super().__new__(cls)
+        # Attach metadata
+        obj._cursor = cursor
+        obj._data = data
+        # Build mapping from column name to index
+        desc = cursor.description or ()
+        obj._keys = tuple(col[0] for col in desc)
+        obj._index = {name: idx for idx, name in enumerate(obj._keys)}
+        return obj
+
+    def keys(self) -> list[str]:
+        return list(self._keys)
+
+    def __getitem__(self, key: int | str | slice, /) -> Any:
+        if isinstance(key, slice):
+            return self._data[key]
+        if isinstance(key, int):
+            return self._data[key]
+        # key is column name
+        idx = self._index.get(key)
+        if idx is None:
+            raise KeyError(key)
+        return self._data[idx]
+
+    def __hash__(self) -> int:
+        return hash((self._keys, self._data))
+
+    def __iter__(self) -> Iterator[Any]:
+        return iter(self._data)
+
+    def __len__(self) -> int:
+        return len(self._data)
+
+    def __eq__(self, value: object, /) -> bool:
+        if not isinstance(value, Row):
+            return NotImplemented  # type: ignore[return-value]
+        return self._keys == value._keys and self._data == value._data
+
+    def __ne__(self, value: object, /) -> bool:
+        if not isinstance(value, Row):
+            return NotImplemented  # type: ignore[return-value]
+        return not self.__eq__(value)
+
+    # The rest return NotImplemented for non-Row comparisons
+    def __lt__(self, value: object, /) -> bool:
+        if not isinstance(value, Row):
+            return NotImplemented  # type: ignore[return-value]
+        return (self._keys, self._data) < (value._keys, value._data)
+
+    def __le__(self, value: object, /) -> bool:
+        if not isinstance(value, Row):
+            return NotImplemented  # type: ignore[return-value]
+        return (self._keys, self._data) <= (value._keys, value._data)
+
+    def __gt__(self, value: object, /) -> bool:
+        if not isinstance(value, Row):
+            return NotImplemented  # type: ignore[return-value]
+        return (self._keys, self._data) > (value._keys, value._data)
+
+    def __ge__(self, value: object, /) -> bool:
+        if not isinstance(value, Row):
+            return NotImplemented  # type: ignore[return-value]
+        return (self._keys, self._data) >= (value._keys, value._data)
+
+
+@dataclass
+class EncryptionOpts:
+    cipher: str
+    hexkey: str
+
+
+def connect(
+    database: str,
+    *,
+    experimental_features: Optional[str] = None,
+    vfs: Optional[str] = None,
+    encryption: Optional[EncryptionOpts] = None,
+    isolation_level: Optional[str] = "DEFERRED",
+    extra_io: Optional[Callable[[], None]] = None,
+) -> Connection:
+    """
+    Open a Turso (SQLite-compatible) database and return a Connection.
+
+    Parameters:
+    - database: path or identifier of the database.
+    - experimental_features: comma-separated list of features to enable.
+    - isolation_level: one of "DEFERRED" (default), "IMMEDIATE", "EXCLUSIVE", or None.
+    """
+    try:
+        cfg = PyTursoDatabaseConfig(
+            path=database,
+            experimental_features=experimental_features,
+            vfs=vfs,
+            encryption=PyTursoEncryptionConfig(cipher=encryption.cipher, hexkey=encryption.hexkey)
+            if encryption
+            else None,
+        )
+        db: PyTursoDatabase = py_turso_database_open(cfg)
+        conn: PyTursoConnection = db.connect()
+        return Connection(conn, isolation_level=isolation_level, extra_io=extra_io)
+    except Exception as exc:  # noqa: BLE001
+        raise _map_turso_exception(exc)
+
+
+# Make it easy to enable logging with native `logging` Python module
+def setup_logging(level: Optional[int] = None) -> None:
+    """
+    Setup Turso logging to integrate with Python's logging module.
+
+    Usage:
+        import turso
+        turso.setup_logging(logging.DEBUG)
+    """
+    import logging
+
+    level = level or logging.INFO
+    logger = logging.getLogger("turso")
+    logger.setLevel(level)
+
+    def _py_logger(log: PyTursoLog) -> None:
+        # Map Rust/Turso log level strings to Python logging levels (best-effort)
+        lvl_map = {
+            "ERROR": logging.ERROR,
+            "WARN": logging.WARNING,
+            "INFO": logging.INFO,
+            "DEBUG": logging.DEBUG,
+            "TRACE": logging.DEBUG,
+        }
+        py_level = lvl_map.get(log.level.upper(), level)
+        logger.log(
+            py_level,
+            "%s [%s:%s] %s",
+            log.target,
+            log.file,
+            log.line,
+            log.message,
+        )
+
+    try:
+        py_turso_setup(
+            PyTursoSetupConfig(
+                logger=_py_logger,
+                log_level={
+                    logging.ERROR: "error",
+                    logging.WARN: "warn",
+                    logging.INFO: "info",
+                    logging.DEBUG: "debug",
+                }[level],
+            )
+        )
+    except Exception as exc:  # noqa: BLE001
+        raise _map_turso_exception(exc)

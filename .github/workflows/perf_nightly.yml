@@ -1,0 +1,280 @@
+name: Nightly Benchmarks on Nyrkiö Runners (stability)
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '24 4 * * *'
+  # These jobs need the dedicated Nyrkiö runners and take ~45 minutes, so we only
+  # want them on the nightly schedule above, which runs on main. There is no branch
+  # named "notmain", which is how the push and pull_request triggers stay switched
+  # off. Removing these filters turns the benchmarks on for every push and every PR.
+  push:
+  #   branches: ["main", "notmain", "master"]
+    branches: ["notmain"]
+  pull_request:
+  #   branches: ["main", "notmain", "master"]
+    branches: ["notmain"]
+
+env:
+  CARGO_TERM_COLOR: never
+
+jobs:
+  bench:
+    runs-on: nyrkio_perf_server_4cpu_ubuntu2404
+    # Nyrkiö runners kill a job after 92 minutes. scripts/nightly-bench.sh
+    # stops running benchmarks before that, so that the results so far still
+    # get uploaded.
+    timeout-minutes: 92
+    env:
+      DISABLE_RUSQLITE_BENCHMARK: 1
+    steps:
+      - uses: actions/checkout@v4
+      - uses: useblacksmith/setup-node@v5
+        with:
+          node-version: 24
+      #     cache: 'npm'
+      # - name: Install dependencies
+      #   run: npm install && npm run build
+
+      - name: Generate graph-queries DB
+        run: |
+          python3 perf/graph-queries/generate_seed.py | sqlite3 perf/graph-queries/graph-queries.db
+          cp perf/graph-queries/graph-queries.db perf/graph-queries/graph-queries-analyzed.db
+          sqlite3 perf/graph-queries/graph-queries-analyzed.db "ANALYZE;"
+
+      # One step per bench binary, so that when a benchmark starves the runner
+      # and GitHub throws the job log away, the step timings still say which
+      # benchmark it was. scripts/nightly-bench.sh explains the rest.
+      - name: Runner facts
+        run: |
+          nproc
+          free -m
+          swapon --show
+          df -hT
+          findmnt -t tmpfs || true
+          ulimit -a
+          cat /proc/self/cgroup
+          if sudo -n true 2>/dev/null; then echo "sudo: yes"; else echo "sudo: no"; fi
+      - name: Build benchmarks
+        run: scripts/nightly-bench.sh build
+      - name: Check every benchmark has a step
+        if: ${{ !cancelled() }}
+        run: scripts/nightly-bench.sh check .github/workflows/perf_nightly.yml
+      - name: Bench alloc_collections
+        if: ${{ !cancelled() }}
+        run: scripts/nightly-bench.sh run alloc_collections
+      - name: Bench benchmark
+        if: ${{ !cancelled() }}
+        run: scripts/nightly-bench.sh run benchmark
+      - name: Bench count_benchmark
+        if: ${{ !cancelled() }}
+        run: scripts/nightly-bench.sh run count_benchmark
+      - name: Bench create_index_benchmark
+        if: ${{ !cancelled() }}
+        run: scripts/nightly-bench.sh run create_index_benchmark
+      - name: Bench fts_benchmark
+        if: ${{ !cancelled() }}
+        run: scripts/nightly-bench.sh run fts_benchmark
+      - name: Bench fts_comparison_benchmark
+        if: ${{ !cancelled() }}
+        run: scripts/nightly-bench.sh run fts_comparison_benchmark
+      - name: Bench graph_queries_benchmark
+        if: ${{ !cancelled() }}
+        run: scripts/nightly-bench.sh run graph_queries_benchmark
+      - name: Bench hash_spill_benchmark
+        if: ${{ !cancelled() }}
+        run: scripts/nightly-bench.sh run hash_spill_benchmark
+      - name: Bench json_benchmark
+        if: ${{ !cancelled() }}
+        run: scripts/nightly-bench.sh run json_benchmark
+      - name: Bench logical_log_serialization
+        if: ${{ !cancelled() }}
+        run: scripts/nightly-bench.sh run logical_log_serialization
+      - name: Bench mvcc_benchmark
+        if: ${{ !cancelled() }}
+        run: scripts/nightly-bench.sh run mvcc_benchmark
+      - name: Bench mvcc_recovery_benchmark
+        if: ${{ !cancelled() }}
+        run: scripts/nightly-bench.sh run mvcc_recovery_benchmark
+      - name: Bench parser_benchmark
+        if: ${{ !cancelled() }}
+        run: scripts/nightly-bench.sh run parser_benchmark
+      - name: Bench prepare_benchmark
+        if: ${{ !cancelled() }}
+        run: scripts/nightly-bench.sh run prepare_benchmark
+      - name: Bench prepare_params_benchmark
+        if: ${{ !cancelled() }}
+        run: scripts/nightly-bench.sh run prepare_params_benchmark
+      - name: Bench record_recycling
+        if: ${{ !cancelled() }}
+        run: scripts/nightly-bench.sh run record_recycling
+      - name: Bench scan_loop_benchmark
+        if: ${{ !cancelled() }}
+        run: scripts/nightly-bench.sh run scan_loop_benchmark
+      - name: Bench select_star_benchmark
+        if: ${{ !cancelled() }}
+        run: scripts/nightly-bench.sh run select_star_benchmark
+      - name: Bench sql_functions
+        if: ${{ !cancelled() }}
+        run: scripts/nightly-bench.sh run sql_functions
+      - name: Bench string_expr_benchmark
+        if: ${{ !cancelled() }}
+        run: scripts/nightly-bench.sh run string_expr_benchmark
+      - name: Bench struct_union_benchmark
+        if: ${{ !cancelled() }}
+        run: scripts/nightly-bench.sh run struct_union_benchmark
+      - name: Bench struct_union_profile
+        if: ${{ !cancelled() }}
+        run: scripts/nightly-bench.sh run struct_union_profile
+      - name: Bench text_validate_benchmark
+        if: ${{ !cancelled() }}
+        run: scripts/nightly-bench.sh run text_validate_benchmark
+      - name: Bench triggers
+        if: ${{ !cancelled() }}
+        run: scripts/nightly-bench.sh run triggers
+      - name: Bench write_perf_benchmark
+        if: ${{ !cancelled() }}
+        run: scripts/nightly-bench.sh run write_perf_benchmark
+      - name: Analyze benchmark result with Nyrkiö
+        if: ${{ !cancelled() }}
+        uses: nyrkio/change-detection@f1e26bea1b51177e5d4fe3f83dbc807410c4bc1d
+        with:
+          name: nightly/turso
+          tool: criterion
+          output-file-path: output.txt
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+
+          # What to do if a change is immediately detected by Nyrkiö.
+          # Note that smaller changes are only detected with delay, usually after a change
+          # persisted over 2-7 commits. Go to nyrkiö.com to view those or configure alerts.
+          # Note that Nyrkiö will find all changes, also improvements. This means fail-on-alert
+          # on pull events isn't compatible with this workflow being required to pass branch protection.
+          fail-on-alert: false
+          comment-on-alert: false
+          comment-always: false
+          # Nyrkiö configuration
+          # Get yours from https://nyrkio.com/docs/getting-started
+          nyrkio-token: ${{ secrets.NYRKIO_JWT_TOKEN }}
+          # HTTP requests will fail for all non-core contributors that don't have their own token.
+          # Don't want that to spoil the build, so:
+          never-fail: true
+          # Make results and change points public, so that any oss contributor can see them
+          nyrkio-public: true
+
+          # parameters of the algorithm. Note: These are global, so we only set them once and for all.
+          # Smaller p-value = less change points found. Larger p-value = more, but also more false positives.
+          nyrkio-settings-pvalue: 0.00001
+          # Ignore changes smaller than this.
+          nyrkio-settings-threshold: 0%
+
+  clickbench:
+    runs-on: nyrkio_perf_server_4cpu_ubuntu2404
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: useblacksmith/setup-node@v5
+        with:
+          node-version: 24
+
+      - name: Clickbench
+        run: make clickbench
+
+      - name: Analyze TURSO result with Nyrkiö
+        uses: nyrkio/change-detection@f1e26bea1b51177e5d4fe3f83dbc807410c4bc1d
+        with:
+          name: nightly/clickbench/turso
+          tool: time
+          output-file-path: clickbench-tursodb.txt
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          # What to do if a change is immediately detected by Nyrkiö.
+          # Note that smaller changes are only detected with delay, usually after a change
+          # persisted over 2-7 commits. Go to nyrkiö.com to view those or configure alerts.
+          # Note that Nyrkiö will find all changes, also improvements. This means fail-on-alert
+          # on pull events isn't compatible with this workflow being required to pass branch protection.
+          fail-on-alert: false
+          comment-on-alert: false
+          comment-always: false
+          # Nyrkiö configuration
+          # Get yours from https://nyrkio.com/docs/getting-started
+          nyrkio-token: ${{ secrets.NYRKIO_JWT_TOKEN }}
+          # HTTP requests will fail for all non-core contributors that don't have their own token.
+          # Don't want that to spoil the build, so:
+          never-fail: true
+          # Make results and change points public, so that any oss contributor can see them
+          nyrkio-public: true
+          nyrkio-settings-pvalue: 0.00001
+          nyrkio-settings-threshold: 0%
+
+      - name: Analyze SQLITE3 result with Nyrkiö
+        uses: nyrkio/change-detection@f1e26bea1b51177e5d4fe3f83dbc807410c4bc1d
+        with:
+          name: nightly/clickbench/sqlite3
+          tool: time
+          output-file-path: clickbench-sqlite3.txt
+          fail-on-alert: false
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          comment-on-alert: false
+          comment-always: false
+          nyrkio-token: ${{ secrets.NYRKIO_JWT_TOKEN }}
+          never-fail: true
+          nyrkio-public: true
+          nyrkio-settings-pvalue: 0.00001
+          nyrkio-settings-threshold: 0%
+
+  tpc-h-criterion:
+    runs-on: nyrkio_perf_server_4cpu_ubuntu2404
+    timeout-minutes: 60
+    env:
+      DB_FILE: "perf/tpc-h/TPC-H.db"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: "v1-rust"
+          cache-on-failure: true
+
+      - name: Cache TPC-H
+        id: cache-primes
+        uses: useblacksmith/cache@v5
+        with:
+          path: ${{ env.DB_FILE }}
+          key: tpc-h
+      - name: Download TPC-H
+        if: steps.cache-primes.outputs.cache-hit != 'true'
+        env:
+          DB_URL: "https://github.com/lovasoa/TPCH-sqlite/releases/download/v1.0/TPC-H.db"
+        run: wget -O $DB_FILE --no-verbose $DB_URL
+
+      - name: Bench
+        run: cargo bench --bench tpc_h_benchmark  2>&1 | tee output.txt
+      - name: Analyze benchmark result with Nyrkiö
+        uses: nyrkio/change-detection@f1e26bea1b51177e5d4fe3f83dbc807410c4bc1d
+        with:
+          name: nightly/tpc-h
+          tool: criterion
+          output-file-path: output.txt
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+
+          # What to do if a change is immediately detected by Nyrkiö.
+          # Note that smaller changes are only detected with delay, usually after a change
+          # persisted over 2-7 commits. Go to nyrkiö.com to view those or configure alerts.
+          # Note that Nyrkiö will find all changes, also improvements. This means fail-on-alert
+          # on pull events isn't compatible with this workflow being required to pass branch protection.
+          fail-on-alert: false
+          comment-on-alert: false
+          comment-always: false
+          # Nyrkiö configuration
+          # Get yours from https://nyrkio.com/docs/getting-started
+          nyrkio-token: ${{ secrets.NYRKIO_JWT_TOKEN }}
+          # HTTP requests will fail for all non-core contributors that don't have their own token.
+          # Don't want that to spoil the build, so:
+          never-fail: true
+          # Make results and change points public, so that any oss contributor can see them
+          nyrkio-public: true
+
+          # parameters of the algorithm. Note: These are global, so we only set them once and for all.
+          # Smaller p-value = less change points found. Larger p-value = more, but also more false positives.
+          nyrkio-settings-pvalue: 0.00001
+          nyrkio-settings-threshold: 0%
+
+

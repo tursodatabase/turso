@@ -1,0 +1,10 @@
+@database database/integrity_check_constraint_violation.db
+
+@skip-file-if mvcc "not supported in MVCC mode"
+
+test integrity-check-check-constraint-violation {
+    PRAGMA integrity_check;
+}
+expect {
+    CHECK constraint failed in t
+}

@@ -1,0 +1,95 @@
+---
+title: CREATE MATERIALIZED VIEW
+description: Create a materialized view that stores precomputed results and updates automatically
+sidebarTitle: CREATE MATERIALIZED VIEW
+---
+
+# CREATE MATERIALIZED VIEW
+
+<Info>
+**Turso Extension**: Materialized views are a Turso-specific feature not available in SQLite. This feature is experimental and must be [enabled before use](/docs/sql-reference/experimental-features).
+</Info>
+
+A materialized view stores precomputed query results on disk and automatically keeps them up to date using Incremental View Maintenance (IVM). Unlike standard views, reading from a materialized view does not re-execute the underlying SELECT.
+
+## Syntax
+
+```sql
+CREATE MATERIALIZED VIEW [IF NOT EXISTS] view-name AS select-statement;
+```
+
+### Parameters
+
+| Parameter | Description |
+|-----------|-------------|
+| `IF NOT EXISTS` | Prevents an error if a materialized view with the same name already exists. The statement is a no-op when the view is present. |
+| `view-name` | A unique name for the materialized view within the database. |
+| `select-statement` | The SELECT query that defines the materialized view's contents. |
+
+## How Incremental View Maintenance Works
+
+When you modify data in a table that underlies a materialized view, Turso incrementally updates the materialized view within the same transaction. There is no manual `REFRESH` step. The materialized view is always consistent with the base tables.
+
+- Changes to the materialized view are committed or rolled back together with the changes to the base tables.
+- Aggregations like `COUNT`, `SUM`, and `AVG` are maintained efficiently — Turso does not recompute the entire result set on each change.
+
+## Current Limitations
+
+- Not all SQL functions are supported in materialized view definitions.
+- A materialized view cannot reference another view or materialized view.
+- The `TEMPORARY` modifier is not supported for materialized views.
+
+## Examples
+
+### Precomputed Aggregations
+
+```sql
+CREATE TABLE orders (
+    id INTEGER PRIMARY KEY,
+    customer_id INTEGER,
+    amount REAL,
+    created_at TEXT
+);
+
+-- Precompute per-customer totals
+CREATE MATERIALIZED VIEW customer_totals AS
+SELECT
+    customer_id,
+    COUNT(*) AS order_count,
+    SUM(amount) AS total_spent
+FROM orders
+GROUP BY customer_id;
+
+-- Fast read — no aggregation at query time
+SELECT * FROM customer_totals WHERE total_spent > 1000;
+```
+
+### Automatic Updates
+
+```sql
+-- When new orders are inserted, customer_totals updates automatically
+INSERT INTO orders VALUES (1, 100, 59.99, '2025-01-15');
+INSERT INTO orders VALUES (2, 100, 24.50, '2025-01-16');
+
+-- Reflects both inserts without a manual refresh
+SELECT * FROM customer_totals WHERE customer_id = 100;
+-- customer_id: 100, order_count: 2, total_spent: 84.49
+```
+
+### Filtered Summary
+
+```sql
+CREATE MATERIALIZED VIEW recent_activity AS
+SELECT
+    customer_id,
+    COUNT(*) AS recent_orders
+FROM orders
+WHERE created_at >= '2025-01-01'
+GROUP BY customer_id;
+```
+
+## See Also
+
+- [CREATE VIEW](/docs/sql-reference/statements/create-view) for standard (non-materialized) views
+- [DROP VIEW](/docs/sql-reference/statements/drop-view) for removing materialized views
+- [SELECT](/docs/sql-reference/statements/select) for the query syntax used in view definitions

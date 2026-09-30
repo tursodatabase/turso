@@ -1,0 +1,23 @@
+[package]
+name = "turso_ext_tests"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Limbo extension tests"
+
+[lib]
+crate-type = ["cdylib", "lib"]
+
+[features]
+static= [ "turso_ext/static" ]
+
+[dependencies]
+env_logger = { workspace = true }
+lazy_static = "1.5.0"
+turso_ext = { workspace = true, features = ["static", "vfs"] }
+log = "0.4.26"
+
+[target.'cfg(not(target_family = "wasm"))'.dependencies]
+mimalloc = { version = "0.1", default-features = false }

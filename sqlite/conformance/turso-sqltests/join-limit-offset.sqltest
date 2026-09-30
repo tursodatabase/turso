@@ -1,0 +1,70 @@
+@database :memory:
+
+test join-limit-offset-no-order-by {
+    CREATE TABLE t1(a INT);
+    CREATE TABLE t2(b INT);
+    INSERT INTO t1 VALUES(1),(2),(3);
+    INSERT INTO t2 VALUES(1),(2);
+    SELECT * FROM t1 INNER JOIN t2 ON t1.a = t2.b LIMIT 1 OFFSET 0;
+}
+expect {
+    1|1
+}
+
+test join-limit-offset-skip-first {
+    CREATE TABLE t1(a INT);
+    CREATE TABLE t2(b INT);
+    INSERT INTO t1 VALUES(1),(2),(3);
+    INSERT INTO t2 VALUES(1),(2);
+    SELECT * FROM t1 INNER JOIN t2 ON t1.a = t2.b LIMIT 1 OFFSET 1;
+}
+expect {
+    2|2
+}
+
+test join-limit-offset-all {
+    CREATE TABLE t1(a INT);
+    CREATE TABLE t2(b INT);
+    INSERT INTO t1 VALUES(1),(2),(3);
+    INSERT INTO t2 VALUES(1),(2);
+    SELECT * FROM t1 INNER JOIN t2 ON t1.a = t2.b LIMIT 10 OFFSET 0;
+}
+expect {
+    1|1
+    2|2
+}
+
+test join-limit-zero {
+    CREATE TABLE t1(a INT);
+    CREATE TABLE t2(b INT);
+    INSERT INTO t1 VALUES(1),(2),(3);
+    INSERT INTO t2 VALUES(1),(2);
+    SELECT * FROM t1 INNER JOIN t2 ON t1.a = t2.b LIMIT 0 OFFSET 0;
+}
+expect {
+}
+
+test three-table-join-limit-offset {
+    CREATE TABLE t1(a INT);
+    CREATE TABLE t2(b INT);
+    CREATE TABLE t3(c INT);
+    INSERT INTO t1 VALUES(1),(2),(3);
+    INSERT INTO t2 VALUES(1),(2);
+    INSERT INTO t3 VALUES(1),(2),(3);
+    SELECT * FROM t1 INNER JOIN t2 ON t1.a = t2.b INNER JOIN t3 ON t2.b = t3.c LIMIT 2 OFFSET 1;
+}
+expect {
+    2|2|2
+}
+
+test left-join-limit-offset {
+    CREATE TABLE t1(a INT);
+    CREATE TABLE t2(b INT);
+    INSERT INTO t1 VALUES(1),(2),(3);
+    INSERT INTO t2 VALUES(1),(2);
+    SELECT * FROM t1 LEFT JOIN t2 ON t1.a = t2.b LIMIT 2 OFFSET 1;
+}
+expect {
+    2|2
+    3|
+}

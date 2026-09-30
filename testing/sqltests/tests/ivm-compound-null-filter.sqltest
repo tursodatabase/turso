@@ -1,0 +1,70 @@
+@database :memory:
+@skip-file-if mvcc "materialized views not supported in MVCC mode"
+@requires materialized_views "requires materialized view support"
+
+test ivm-null-where-compound-and-incremental {
+    CREATE TABLE n (id INTEGER PRIMARY KEY, a TEXT, b TEXT);
+
+    CREATE MATERIALIZED VIEW mv_n AS
+    SELECT a, b FROM n WHERE a IS NOT NULL AND b IS NOT NULL;
+
+    INSERT INTO n (a, b) VALUES ('x', NULL);
+    INSERT INTO n (a, b) VALUES (NULL, 'y');
+    INSERT INTO n (a, b) VALUES ('x', 'y');
+    INSERT INTO n (a, b) VALUES (NULL, NULL);
+
+    SELECT a, b FROM mv_n ORDER BY a, b;
+}
+expect {
+    x|y
+}
+
+test ivm-null-where-compound-mixed-incremental {
+    CREATE TABLE nh (id INTEGER PRIMARY KEY AUTOINCREMENT, region TEXT NOT NULL, block_id TEXT, ts INTEGER NOT NULL, closed_at TEXT);
+
+    CREATE MATERIALIZED VIEW focus_roots AS
+    SELECT region, block_id AS root_id, ts AS added_ts, id AS history_id
+    FROM nh
+    WHERE closed_at IS NULL AND block_id IS NOT NULL;
+
+    INSERT INTO nh (region, block_id, ts) VALUES ('main', NULL, 1000);
+    INSERT INTO nh (region, block_id, ts) VALUES ('main', 'block:a', 1001);
+    INSERT INTO nh (region, block_id, ts) VALUES ('main', 'block:b', 1002);
+
+    SELECT region, root_id FROM focus_roots ORDER BY history_id;
+}
+expect {
+    main|block:a
+    main|block:b
+}
+
+test ivm-null-where-compound-update-to-null {
+    CREATE TABLE u (id INTEGER PRIMARY KEY, a TEXT, b TEXT);
+
+    CREATE MATERIALIZED VIEW mv_u AS
+    SELECT a, b FROM u WHERE a IS NOT NULL AND b IS NOT NULL;
+
+    INSERT INTO u (id, a, b) VALUES (1, 'x', 'y');
+
+    UPDATE u SET b = NULL WHERE id = 1;
+
+    SELECT a, b FROM mv_u ORDER BY a, b;
+}
+expect {
+}
+
+test ivm-null-where-compound-and-from-scratch-parens {
+    CREATE TABLE p (id INTEGER PRIMARY KEY, a TEXT, b TEXT);
+    INSERT INTO p (a, b) VALUES ('x', NULL);
+    INSERT INTO p (a, b) VALUES (NULL, 'y');
+    INSERT INTO p (a, b) VALUES ('x', 'y');
+    INSERT INTO p (a, b) VALUES (NULL, NULL);
+
+    CREATE MATERIALIZED VIEW mv_p AS
+    SELECT a, b FROM p WHERE (a IS NOT NULL) AND (b IS NOT NULL);
+
+    SELECT a, b FROM mv_p ORDER BY a, b;
+}
+expect {
+    x|y
+}

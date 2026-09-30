@@ -1,0 +1,2049 @@
+@database :memory:
+
+setup sort_data {
+    CREATE TABLE t1(a INT, b TEXT);
+    INSERT INTO t1 VALUES(3,'c'),(1,'a'),(4,'d'),(1,'b'),(5,'e'),(2,'f');
+}
+
+setup multi_col {
+    CREATE TABLE mc(a INT, b INT, c INT);
+    INSERT INTO mc VALUES(1,2,9),(1,1,8),(2,1,7),(2,2,6),(1,3,5);
+}
+
+setup grp_data {
+    CREATE TABLE g1(a INT, b INT);
+    INSERT INTO g1 VALUES(1,10),(1,20),(2,30),(2,40),(3,50),(3,60);
+}
+
+setup range_data {
+    CREATE TABLE r1(a INT, b TEXT);
+    INSERT INTO r1 VALUES(1,'a'),(2,'b'),(3,'c'),(4,'d'),(5,'e');
+}
+
+setup null_data {
+    CREATE TABLE n1(a INT, b TEXT);
+    INSERT INTO n1 VALUES(NULL,'null'),(1,'a'),(2,'b'),(NULL,'null2'),(3,'c');
+}
+
+setup composite_data {
+    CREATE TABLE comp(grp INT, val INT, label TEXT);
+    INSERT INTO comp VALUES(1,10,'a'),(1,20,'b'),(1,30,'c'),(2,10,'d'),(2,20,'e'),(2,30,'f');
+}
+
+setup join_data {
+    CREATE TABLE j1(a INT, b TEXT);
+    INSERT INTO j1 VALUES(1,'x'),(2,'y'),(3,'z');
+    CREATE TABLE j2(a INT, c TEXT);
+    INSERT INTO j2 VALUES(1,'p'),(2,'q'),(4,'r');
+}
+
+setup sales_data {
+    CREATE TABLE sales(region TEXT, amount INT);
+    INSERT INTO sales VALUES('east',100),('west',200),('east',150),('west',50),('north',300);
+}
+
+setup or_data {
+    CREATE TABLE o1(a INT, b TEXT);
+    CREATE INDEX idx_o1_a ON o1(a);
+    INSERT INTO o1 VALUES(1,'a'),(2,'b'),(3,'c'),(4,'d'),(5,'e');
+}
+
+setup or_multi {
+    CREATE TABLE om(a INT, b INT, c TEXT);
+    CREATE INDEX idx_om_a ON om(a);
+    CREATE INDEX idx_om_b ON om(b);
+    INSERT INTO om VALUES(1,10,'x'),(2,20,'y'),(3,30,'z'),(4,10,'w');
+}
+
+setup wtf_data {
+    CREATE TABLE t(x INTEGER, y TEXT, z REAL);
+    INSERT INTO t VALUES(1,'a',1.5),(2,'b',2.5),(3,'c',3.5),(4,'d',4.5),(5,'e',5.5);
+    INSERT INTO t VALUES(NULL,NULL,NULL),(0,'',0.0),(-1,'z',-1.5);
+}
+
+setup business_data {
+    CREATE TABLE orders(id INTEGER PRIMARY KEY, customer_id INT, amount REAL, status TEXT);
+    CREATE TABLE customers(id INTEGER PRIMARY KEY, name TEXT, tier TEXT);
+    INSERT INTO customers VALUES(1,'Alice','gold'),(2,'Bob','silver'),(3,'Carol','gold'),(4,'Dave','bronze');
+    INSERT INTO orders VALUES(1,1,100.0,'shipped'),(2,1,200.0,'pending'),(3,2,50.0,'shipped');
+    INSERT INTO orders VALUES(4,2,75.0,'shipped'),(5,3,300.0,'cancelled'),(6,3,150.0,'shipped');
+    INSERT INTO orders VALUES(7,4,25.0,'pending'),(8,NULL,999.0,'shipped'),(9,1,0.0,'shipped');
+}
+
+@setup sort_data
+test sort-elision-cte-limit-parent-order {
+    WITH cte AS (SELECT a, b FROM t1 ORDER BY a LIMIT 4)
+    SELECT * FROM cte ORDER BY a;
+}
+expect {
+    1|a
+    1|b
+    2|f
+    3|c
+}
+
+@setup sort_data
+test sort-elision-cte-asc-parent-desc {
+    WITH cte AS (SELECT a, b FROM t1 ORDER BY a ASC)
+    SELECT * FROM cte ORDER BY a DESC;
+}
+expect {
+    5|e
+    4|d
+    3|c
+    2|f
+    1|a
+    1|b
+}
+
+@setup multi_col
+test sort-elision-multi-col-same {
+    WITH cte AS (SELECT a, b, c FROM mc ORDER BY a, b)
+    SELECT * FROM cte ORDER BY a, b;
+}
+expect {
+    1|1|8
+    1|2|9
+    1|3|5
+    2|1|7
+    2|2|6
+}
+
+@setup multi_col
+test sort-elision-multi-col-different {
+    WITH cte AS (SELECT a, b, c FROM mc ORDER BY a, b)
+    SELECT * FROM cte ORDER BY a, c;
+}
+expect {
+    1|3|5
+    1|1|8
+    1|2|9
+    2|2|6
+    2|1|7
+}
+
+test sort-elision-mixed-asc-desc {
+    CREATE TABLE sd(a INT, b INT);
+    INSERT INTO sd VALUES(1,3),(1,1),(1,2),(2,2),(2,1),(2,3);
+    WITH cte AS (SELECT a, b FROM sd ORDER BY a ASC, b DESC)
+    SELECT * FROM cte ORDER BY a ASC, b ASC;
+}
+expect {
+    1|1
+    1|2
+    1|3
+    2|1
+    2|2
+    2|3
+}
+
+@setup grp_data
+test sort-elision-group-by {
+    WITH cte AS (SELECT a, b FROM g1 ORDER BY a)
+    SELECT a, SUM(b) FROM cte GROUP BY a ORDER BY a;
+}
+expect {
+    1|30
+    2|70
+    3|110
+}
+
+@setup grp_data
+@skip-if sqlite "SQLite planner bug: GROUP BY sort elision swallows the outer ORDER BY direction when a CTE provides pre-ordered rows, causing the CTE's internal order to leak through"
+test sort-elision-group-by-opposite-dir {
+    WITH cte AS (SELECT a, b FROM g1 ORDER BY a)
+    SELECT a, SUM(b) AS total FROM cte GROUP BY a ORDER BY a DESC;
+}
+expect {
+    3|110
+    2|70
+    1|30
+}
+
+@setup sort_data
+test sort-elision-cte-desc-parent-asc {
+    WITH cte AS (SELECT a, b FROM t1 ORDER BY a DESC)
+    SELECT * FROM cte ORDER BY a ASC;
+}
+expect {
+    1|a
+    1|b
+    2|f
+    3|c
+    4|d
+    5|e
+}
+
+test sort-elision-expression-order {
+    CREATE TABLE eo(a INT, b INT);
+    INSERT INTO eo VALUES(3,1),(1,2),(2,3);
+    WITH cte AS (SELECT a, b, a+b AS s FROM eo ORDER BY a+b)
+    SELECT * FROM cte ORDER BY s;
+}
+expect {
+    1|2|3
+    3|1|4
+    2|3|5
+}
+
+test sort-elision-collate-nocase-vs-default {
+    CREATE TABLE names(name TEXT);
+    INSERT INTO names VALUES('Alice'),('bob'),('Charlie'),('dave');
+    WITH cte AS (SELECT name FROM names ORDER BY name COLLATE NOCASE)
+    SELECT * FROM cte ORDER BY name;
+}
+expect {
+    Alice
+    Charlie
+    bob
+    dave
+}
+
+test sort-elision-nulls-in-order-by {
+    CREATE TABLE nn(a INT);
+    INSERT INTO nn VALUES(3),(NULL),(1),(NULL),(2);
+    WITH cte AS (SELECT a FROM nn ORDER BY a)
+    SELECT * FROM cte ORDER BY a;
+}
+expect {
+
+
+    1
+    2
+    3
+}
+
+test sort-elision-limit-offset {
+    CREATE TABLE lo(a INT);
+    INSERT INTO lo VALUES(5),(3),(1),(4),(2);
+    WITH cte AS (SELECT a FROM lo ORDER BY a)
+    SELECT * FROM cte ORDER BY a LIMIT 3 OFFSET 1;
+}
+expect {
+    2
+    3
+    4
+}
+
+test sort-elision-distinct {
+    CREATE TABLE dd(a INT, b INT);
+    INSERT INTO dd VALUES(1,1),(2,1),(1,2),(2,2),(3,1);
+    WITH cte AS (SELECT DISTINCT a FROM dd ORDER BY a)
+    SELECT * FROM cte ORDER BY a;
+}
+expect {
+    1
+    2
+    3
+}
+
+test sort-elision-cte-order-total-parent-order-a {
+    CREATE TABLE oa(a INT, b INT);
+    INSERT INTO oa VALUES(1,5),(2,4),(3,3),(4,2),(5,1);
+    WITH cte AS (SELECT a, b, a+b AS total FROM oa ORDER BY total)
+    SELECT * FROM cte ORDER BY a;
+}
+expect {
+    1|5|6
+    2|4|6
+    3|3|6
+    4|2|6
+    5|1|6
+}
+
+@setup range_data
+test range-scan-equality {
+    WITH cte AS (SELECT a, b FROM r1)
+    SELECT * FROM cte WHERE a = 3;
+}
+expect {
+    3|c
+}
+
+@setup range_data
+test range-scan-between {
+    WITH cte AS (SELECT a, b FROM r1)
+    SELECT * FROM cte WHERE a BETWEEN 2 AND 4 ORDER BY a;
+}
+expect {
+    2|b
+    3|c
+    4|d
+}
+
+@setup range_data
+test range-scan-strict-inequality {
+    WITH cte AS (SELECT a, b FROM r1)
+    SELECT * FROM cte WHERE a > 2 AND a < 5 ORDER BY a;
+}
+expect {
+    3|c
+    4|d
+}
+
+@setup range_data
+test range-scan-inclusive {
+    WITH cte AS (SELECT a, b FROM r1)
+    SELECT * FROM cte WHERE a >= 2 AND a <= 4 ORDER BY a;
+}
+expect {
+    2|b
+    3|c
+    4|d
+}
+
+@setup null_data
+test range-scan-nulls-excluded {
+    WITH cte AS (SELECT a, b FROM n1)
+    SELECT * FROM cte WHERE a > 0 ORDER BY a;
+}
+expect {
+    1|a
+    2|b
+    3|c
+}
+
+@setup null_data
+test range-scan-is-null {
+    WITH cte AS (SELECT a, b FROM n1)
+    SELECT * FROM cte WHERE a IS NULL ORDER BY b;
+}
+expect {
+    |null
+    |null2
+}
+
+test range-scan-empty-table {
+    CREATE TABLE empty(a INT, b TEXT);
+    WITH cte AS (SELECT a, b FROM empty)
+    SELECT * FROM cte WHERE a = 1;
+}
+expect {
+}
+
+test range-scan-duplicates {
+    CREATE TABLE dup(a INT, b TEXT);
+    INSERT INTO dup VALUES(1,'a'),(1,'b'),(1,'c'),(2,'d'),(2,'e');
+    WITH cte AS (SELECT a, b FROM dup)
+    SELECT * FROM cte WHERE a = 1 ORDER BY b;
+}
+expect {
+    1|a
+    1|b
+    1|c
+}
+
+test range-scan-double-filter {
+    CREATE TABLE df(a INT, b INT);
+    INSERT INTO df VALUES(1,100),(2,200),(3,300),(4,400),(5,500);
+    WITH cte AS (SELECT a, b FROM df WHERE a > 1)
+    SELECT * FROM cte WHERE b < 400 ORDER BY a;
+}
+expect {
+    2|200
+    3|300
+}
+
+@setup composite_data
+test range-scan-composite-eq-plus-range {
+    WITH cte AS (SELECT grp, val, label FROM comp ORDER BY grp, val)
+    SELECT * FROM cte WHERE grp = 1 AND val > 10 ORDER BY val;
+}
+expect {
+    1|20|b
+    1|30|c
+}
+
+test range-scan-negative-numbers {
+    CREATE TABLE neg(a INT);
+    INSERT INTO neg VALUES(-5),(-3),(-1),(0),(1),(3),(5);
+    WITH cte AS (SELECT a FROM neg)
+    SELECT * FROM cte WHERE a >= -3 AND a <= 1 ORDER BY a;
+}
+expect {
+    -3
+    -1
+    0
+    1
+}
+
+@setup range_data
+test range-scan-in-clause {
+    WITH cte AS (SELECT a, b FROM r1)
+    SELECT * FROM cte WHERE a IN (1,3,5) ORDER BY a;
+}
+expect {
+    1|a
+    3|c
+    5|e
+}
+
+@setup range_data
+test range-scan-not-in {
+    WITH cte AS (SELECT a, b FROM r1)
+    SELECT * FROM cte WHERE a NOT IN (1,3,5) ORDER BY a;
+}
+expect {
+    2|b
+    4|d
+}
+
+test range-scan-aliased-columns {
+    CREATE TABLE al(a INT, b INT);
+    INSERT INTO al VALUES(1,10),(2,20),(3,30),(4,40),(5,50);
+    WITH cte AS (SELECT a AS key, b AS value FROM al)
+    SELECT * FROM cte WHERE key > 2 AND key < 5 ORDER BY key;
+}
+expect {
+    3|30
+    4|40
+}
+
+test range-scan-text-vs-int-affinity {
+    CREATE TABLE ta(a TEXT, b INT);
+    INSERT INTO ta VALUES('1',10),('2',20),('10',100),('3',30);
+    WITH cte AS (SELECT a, b FROM ta)
+    SELECT * FROM cte WHERE a > 2 ORDER BY a;
+}
+expect {
+    3|30
+}
+
+@setup grp_data
+test min-max-basic-min {
+    WITH cte AS (SELECT a FROM g1 ORDER BY a)
+    SELECT MIN(a) FROM cte;
+}
+expect {
+    1
+}
+
+@setup grp_data
+test min-max-basic-max {
+    WITH cte AS (SELECT a FROM g1 ORDER BY a)
+    SELECT MAX(a) FROM cte;
+}
+expect {
+    3
+}
+
+test min-max-empty {
+    CREATE TABLE empty_mm(a INT);
+    WITH cte AS (SELECT a FROM empty_mm ORDER BY a)
+    SELECT MIN(a) FROM cte;
+}
+expect {
+
+}
+
+test min-max-all-null {
+    CREATE TABLE all_null(a INT);
+    INSERT INTO all_null VALUES(NULL),(NULL),(NULL);
+    WITH cte AS (SELECT a FROM all_null ORDER BY a)
+    SELECT MIN(a) FROM cte;
+}
+expect {
+
+}
+
+test min-max-with-nulls {
+    CREATE TABLE mn(a INT);
+    INSERT INTO mn VALUES(NULL),(3),(NULL),(1),(NULL);
+    WITH cte AS (SELECT a FROM mn ORDER BY a)
+    SELECT MAX(a) FROM cte;
+}
+expect {
+    3
+}
+
+test min-max-both-together {
+    CREATE TABLE mm(a INT);
+    INSERT INTO mm VALUES(3),(1),(4),(1),(5);
+    WITH cte AS (SELECT a FROM mm ORDER BY a)
+    SELECT MIN(a), MAX(a) FROM cte;
+}
+expect {
+    1|5
+}
+
+test min-max-with-where {
+    CREATE TABLE mw(a INT, b INT);
+    INSERT INTO mw VALUES(1,100),(2,200),(3,300),(4,400),(5,500);
+    WITH cte AS (SELECT a, b FROM mw ORDER BY a)
+    SELECT MIN(a) FROM cte WHERE b > 200;
+}
+expect {
+    3
+}
+
+test min-max-on-cte-with-limit {
+    CREATE TABLE ml(a INT);
+    INSERT INTO ml VALUES(3),(1),(4),(1),(5);
+    WITH cte AS (SELECT a FROM ml ORDER BY a LIMIT 3)
+    SELECT MAX(a) FROM cte;
+}
+expect {
+    3
+}
+
+test min-max-text-column {
+    CREATE TABLE mt(a TEXT);
+    INSERT INTO mt VALUES('banana'),('apple'),('cherry'),('date');
+    WITH cte AS (SELECT a FROM mt ORDER BY a)
+    SELECT MIN(a) FROM mt;
+}
+expect {
+    apple
+}
+
+test min-max-group-by-min-on-cte {
+    CREATE TABLE gm(grp TEXT, val INT);
+    INSERT INTO gm VALUES('a',3),('a',1),('b',4),('b',2),('a',5),('b',6);
+    WITH cte AS (SELECT grp, val FROM gm ORDER BY grp, val)
+    SELECT grp, MIN(val) FROM cte GROUP BY grp ORDER BY grp;
+}
+expect {
+    a|1
+    b|2
+}
+
+@setup grp_data
+test min-max-correlated-from-cte {
+    WITH cte AS (SELECT a AS grp, b AS val FROM g1 ORDER BY val)
+    SELECT grp, (SELECT MAX(val) FROM cte c2 WHERE c2.grp = t.grp)
+    FROM (SELECT DISTINCT a AS grp FROM g1) t ORDER BY grp;
+}
+expect {
+    1|20
+    2|40
+    3|60
+}
+
+@setup or_data
+test multi-or-basic {
+    SELECT * FROM o1 WHERE a = 1 OR a = 3 OR a = 5 ORDER BY a;
+}
+expect {
+    1|a
+    3|c
+    5|e
+}
+
+@setup or_data
+test multi-or-range {
+    SELECT * FROM o1 WHERE a < 2 OR a > 4 ORDER BY a;
+}
+expect {
+    1|a
+    5|e
+}
+
+@setup or_multi
+test multi-or-different-columns {
+    SELECT * FROM om WHERE a = 1 OR b = 30 ORDER BY a;
+}
+expect {
+    1|10|x
+    3|30|z
+}
+
+@setup or_data
+test multi-or-delete {
+    DELETE FROM o1 WHERE a = 2 OR a = 4;
+    SELECT * FROM o1 ORDER BY a;
+}
+expect {
+    1|a
+    3|c
+    5|e
+}
+
+test multi-or-update {
+    CREATE TABLE ou(a INT, b TEXT);
+    CREATE INDEX idx_ou_a ON ou(a);
+    INSERT INTO ou VALUES(1,'a'),(2,'b'),(3,'c'),(4,'d'),(5,'e');
+    UPDATE ou SET b = 'updated' WHERE a = 1 OR a = 5;
+    SELECT * FROM ou ORDER BY a;
+}
+expect {
+    1|updated
+    2|b
+    3|c
+    4|d
+    5|updated
+}
+
+test multi-or-dedup {
+    CREATE TABLE od(a INT, b INT);
+    CREATE INDEX idx_od_a ON od(a);
+    CREATE INDEX idx_od_b ON od(b);
+    INSERT INTO od VALUES(1,1),(2,2),(3,3),(4,4),(5,5);
+    SELECT * FROM od WHERE a = 3 OR b = 3 ORDER BY a;
+}
+expect {
+    3|3
+}
+
+@setup or_data
+test multi-or-with-limit {
+    SELECT * FROM o1 WHERE a = 1 OR a = 3 OR a = 5 ORDER BY a LIMIT 2;
+}
+expect {
+    1|a
+    3|c
+}
+
+test complex-cte-self-join {
+    CREATE TABLE sj(a INT, b TEXT);
+    INSERT INTO sj VALUES(1,'x'),(2,'y'),(3,'z'),(4,'w');
+    WITH cte AS (SELECT a, b FROM sj ORDER BY a)
+    SELECT c1.a, c2.b FROM cte c1 JOIN cte c2 ON c1.a = c2.a WHERE c1.a > 1 ORDER BY c1.a;
+}
+expect {
+    2|y
+    3|z
+    4|w
+}
+
+test complex-cte-in-subquery-and-main {
+    CREATE TABLE sm(a INT);
+    INSERT INTO sm VALUES(1),(2),(3),(4),(5);
+    WITH cte AS (SELECT a FROM sm)
+    SELECT a FROM cte WHERE a > (SELECT MIN(a) FROM cte) ORDER BY a;
+}
+expect {
+    2
+    3
+    4
+    5
+}
+
+test complex-cte-chain {
+    CREATE TABLE ch(a INT);
+    INSERT INTO ch VALUES(1),(2),(3),(4),(5);
+    WITH
+      c1 AS (SELECT a FROM ch WHERE a > 1),
+      c2 AS (SELECT a FROM c1 WHERE a < 5),
+      c3 AS (SELECT a*2 AS a FROM c2)
+    SELECT * FROM c3 ORDER BY a;
+}
+expect {
+    4
+    6
+    8
+}
+
+test complex-cte-union {
+    CREATE TABLE u1(a INT);
+    INSERT INTO u1 VALUES(1),(2),(3);
+    CREATE TABLE u2(a INT);
+    INSERT INTO u2 VALUES(2),(3),(4);
+    WITH cte AS (SELECT a FROM u1 UNION SELECT a FROM u2)
+    SELECT * FROM cte ORDER BY a;
+}
+expect {
+    1
+    2
+    3
+    4
+}
+
+test complex-cte-with-having {
+    CREATE TABLE hv(grp TEXT, val INT);
+    INSERT INTO hv VALUES('a',1),('a',2),('b',3),('b',4),('c',5);
+    WITH cte AS (SELECT grp, SUM(val) as s FROM hv GROUP BY grp HAVING SUM(val) > 3)
+    SELECT * FROM cte ORDER BY grp;
+}
+expect {
+    b|7
+    c|5
+}
+
+test complex-cte-chain-aggregation {
+    CREATE TABLE ca(id INT, customer_id INT, amount REAL);
+    INSERT INTO ca VALUES(1,1,10.0),(2,1,20.0),(3,2,30.0),(4,2,40.0),(5,3,50.0);
+    WITH
+      totals AS (SELECT customer_id, SUM(amount) as total FROM ca GROUP BY customer_id),
+      ranked AS (SELECT customer_id, total FROM totals WHERE total > 25)
+    SELECT * FROM ranked ORDER BY customer_id;
+}
+expect {
+    1|30.0
+    2|70.0
+    3|50.0
+}
+expect @js {
+    1|30
+    2|70
+    3|50
+}
+
+@setup join_data
+test cte-join-table {
+    WITH cte AS (SELECT a, b FROM j1)
+    SELECT cte.a, cte.b, j2.c FROM cte JOIN j2 ON cte.a = j2.a ORDER BY cte.a;
+}
+expect {
+    1|x|p
+    2|y|q
+}
+
+@setup join_data
+test cte-left-join-table {
+    WITH cte AS (SELECT a, b FROM j1)
+    SELECT cte.a, cte.b, j2.c FROM cte LEFT JOIN j2 ON cte.a = j2.a ORDER BY cte.a;
+}
+expect {
+    1|x|p
+    2|y|q
+    3|z|
+}
+
+test cte-exists-subquery {
+    CREATE TABLE ex1(a INT);
+    INSERT INTO ex1 VALUES(1),(2),(3),(4),(5);
+    CREATE TABLE ex2(a INT);
+    INSERT INTO ex2 VALUES(2),(4),(6);
+    WITH cte AS (SELECT a FROM ex1)
+    SELECT * FROM cte WHERE EXISTS (SELECT 1 FROM ex2 WHERE ex2.a = cte.a) ORDER BY a;
+}
+expect {
+    2
+    4
+}
+
+test cte-cross-join-self {
+    CREATE TABLE cj(a INT);
+    INSERT INTO cj VALUES(1),(2),(3);
+    WITH cte AS (SELECT a FROM cj ORDER BY a)
+    SELECT c1.a AS x, c2.a AS y FROM cte c1, cte c2 ORDER BY c1.a, c2.a;
+}
+expect {
+    1|1
+    1|2
+    1|3
+    2|1
+    2|2
+    2|3
+    3|1
+    3|2
+    3|3
+}
+
+test cte-order-by-join-preserves-order {
+    CREATE TABLE jp1(id INT PRIMARY KEY, a INT);
+    INSERT INTO jp1 VALUES(1,30),(2,10),(3,20);
+    CREATE TABLE jp2(id INT PRIMARY KEY, b INT);
+    INSERT INTO jp2 VALUES(1,300),(2,100),(3,200);
+    WITH cte AS (SELECT id, a FROM jp1 ORDER BY a)
+    SELECT cte.a, jp2.b FROM cte JOIN jp2 ON cte.id = jp2.id ORDER BY cte.a;
+}
+expect {
+    10|100
+    20|200
+    30|300
+}
+
+test cte-left-join-order-preserved {
+    CREATE TABLE lj1(a INT);
+    INSERT INTO lj1 VALUES(1),(2),(3),(4),(5);
+    CREATE TABLE lj2(a INT, b TEXT);
+    INSERT INTO lj2 VALUES(2,'two'),(4,'four');
+    WITH cte AS (SELECT a FROM lj1 ORDER BY a)
+    SELECT cte.a, lj2.b FROM cte LEFT JOIN lj2 ON cte.a = lj2.a ORDER BY cte.a;
+}
+expect {
+    1|
+    2|two
+    3|
+    4|four
+    5|
+}
+
+test evil-cte-from-where-subquery {
+    CREATE TABLE ew(a INT, b INT);
+    INSERT INTO ew VALUES(1,50),(2,40),(3,30),(4,20),(5,10);
+    WITH cte AS (SELECT a, b FROM ew ORDER BY a)
+    SELECT * FROM cte c1
+    WHERE c1.b > (SELECT AVG(b) FROM cte)
+    ORDER BY c1.a;
+}
+expect {
+    1|50
+    2|40
+}
+
+test evil-cte-limit-then-different-order {
+    CREATE TABLE el(a INT, b TEXT);
+    INSERT INTO el VALUES(1,'z'),(2,'y'),(3,'x'),(4,'w'),(5,'v'),(6,'u'),(7,'t');
+    WITH cte AS (SELECT a, b FROM el ORDER BY a LIMIT 5)
+    SELECT * FROM cte WHERE a > 2 ORDER BY b;
+}
+expect {
+    5|v
+    4|w
+    3|x
+}
+
+test evil-two-ctes-different-orders-joined {
+    CREATE TABLE ej(a INT, b TEXT);
+    INSERT INTO ej VALUES(1,'c'),(2,'a'),(3,'b');
+    WITH
+      c1 AS (SELECT a, b FROM ej ORDER BY a),
+      c2 AS (SELECT a, b FROM ej ORDER BY b)
+    SELECT c1.a, c1.b AS c1b, c2.a AS c2a, c2.b AS c2b
+    FROM c1 JOIN c2 ON c1.a = c2.a
+    ORDER BY c1.a;
+}
+expect {
+    1|c|1|c
+    2|a|2|a
+    3|b|3|b
+}
+
+test evil-cte-groupby-having-order-flip {
+    CREATE TABLE ef(a INT, b INT, c TEXT);
+    INSERT INTO ef VALUES(1,10,'x'),(1,20,'y'),(2,30,'z'),(2,5,'w'),(3,15,'v');
+    WITH cte AS (
+      SELECT a, SUM(b) AS total, GROUP_CONCAT(c) AS items
+      FROM ef GROUP BY a HAVING SUM(b) > 10 ORDER BY total DESC
+    )
+    SELECT * FROM cte ORDER BY a;
+}
+expect {
+    1|30|x,y
+    2|35|z,w
+    3|15|v
+}
+
+test evil-cte-correlated-scalar-plus-range {
+    CREATE TABLE ec1(a INT, b INT);
+    INSERT INTO ec1 VALUES(1,10),(2,20),(3,30);
+    CREATE TABLE ec2(x INT, y INT);
+    INSERT INTO ec2 VALUES(1,100),(2,200),(3,300);
+    WITH cte AS (
+      SELECT a, (SELECT y FROM ec2 WHERE ec2.x = ec1.a) AS looked_up FROM ec1
+    )
+    SELECT * FROM cte WHERE a > 1 ORDER BY a;
+}
+expect {
+    2|200
+    3|300
+}
+
+@setup sales_data
+test evil-cte-aggregate-then-range {
+    WITH cte AS (SELECT region, SUM(amount) AS total FROM sales GROUP BY region)
+    SELECT * FROM cte WHERE total > 100 ORDER BY region;
+}
+expect {
+    east|250
+    north|300
+    west|250
+}
+
+test evil-chained-ctes-flip-order {
+    CREATE TABLE cf(x INT);
+    INSERT INTO cf VALUES(1),(2),(3),(4),(5);
+    WITH
+      a AS (SELECT x FROM cf WHERE x > 1 ORDER BY x),
+      b AS (SELECT x FROM a WHERE x < 5 ORDER BY x DESC),
+      c AS (SELECT x FROM b ORDER BY x)
+    SELECT * FROM c ORDER BY x;
+}
+expect {
+    2
+    3
+    4
+}
+
+test evil-cte-with-internal-filter-parent-range {
+    CREATE TABLE ir(a INT, b INT);
+    INSERT INTO ir VALUES(1,100),(2,200),(3,300),(4,400),(5,500),(6,600);
+    WITH cte AS (SELECT a, b FROM ir WHERE b >= 200)
+    SELECT * FROM cte WHERE a <= 4 ORDER BY a;
+}
+expect {
+    2|200
+    3|300
+    4|400
+}
+
+test evil-self-join-offset-seek {
+    CREATE TABLE ss(a INT, b INT);
+    INSERT INTO ss VALUES(1,10),(2,20),(3,30),(4,40),(5,50);
+    WITH cte AS (SELECT a, b FROM ss)
+    SELECT c1.a, c1.b, c2.a AS a2, c2.b AS b2
+    FROM cte c1 JOIN cte c2 ON c1.a + 1 = c2.a
+    ORDER BY c1.a;
+}
+expect {
+    1|10|2|20
+    2|20|3|30
+    3|30|4|40
+    4|40|5|50
+}
+
+test from-sub-basic-elision {
+    CREATE TABLE fs(a INT, b TEXT);
+    INSERT INTO fs VALUES(3,'c'),(1,'a'),(2,'b'),(5,'e'),(4,'d');
+    SELECT * FROM (SELECT a, b FROM fs ORDER BY a) sub ORDER BY a;
+}
+expect {
+    1|a
+    2|b
+    3|c
+    4|d
+    5|e
+}
+
+test from-sub-desc-parent-asc {
+    CREATE TABLE fd(a INT);
+    INSERT INTO fd VALUES(3),(1),(2),(5),(4);
+    SELECT * FROM (SELECT a FROM fd ORDER BY a DESC) sub ORDER BY a ASC;
+}
+expect {
+    1
+    2
+    3
+    4
+    5
+}
+
+test from-sub-nested {
+    CREATE TABLE fn(a INT);
+    INSERT INTO fn VALUES(5),(3),(1),(4),(2);
+    SELECT * FROM (
+      SELECT * FROM (
+        SELECT a FROM fn ORDER BY a
+      ) inner_sub
+    ) outer_sub ORDER BY a;
+}
+expect {
+    1
+    2
+    3
+    4
+    5
+}
+
+test from-sub-aggregate-different-order {
+    CREATE TABLE fa(grp TEXT, val INT);
+    INSERT INTO fa VALUES('a',1),('b',2),('a',3),('b',4),('c',5);
+    SELECT * FROM (
+      SELECT grp, SUM(val) AS total FROM fa GROUP BY grp ORDER BY grp
+    ) sub ORDER BY total DESC;
+}
+expect {
+    b|6
+    c|5
+    a|4
+}
+
+test from-sub-joined {
+    CREATE TABLE fj1(a INT, b TEXT);
+    INSERT INTO fj1 VALUES(1,'x'),(2,'y'),(3,'z');
+    CREATE TABLE fj2(a INT, c TEXT);
+    INSERT INTO fj2 VALUES(1,'p'),(2,'q'),(3,'r');
+    SELECT sub.a, sub.b, fj2.c
+    FROM (SELECT a, b FROM fj1 ORDER BY a) sub
+    JOIN fj2 ON sub.a = fj2.a
+    ORDER BY sub.a;
+}
+expect {
+    1|x|p
+    2|y|q
+    3|z|r
+}
+
+@setup grp_data
+test group-by-cte-order-feeds-groupby-no-parent-order {
+    WITH cte AS (SELECT a, b FROM g1 ORDER BY a)
+    SELECT a, SUM(b) AS total FROM cte GROUP BY a;
+}
+expect {
+    1|30
+    2|70
+    3|110
+}
+
+@setup sales_data
+test group-by-count-star {
+    WITH cte AS (SELECT region, amount FROM sales ORDER BY region)
+    SELECT region, COUNT(*) AS cnt FROM cte GROUP BY region ORDER BY region;
+}
+expect {
+    east|2
+    north|1
+    west|2
+}
+
+@setup grp_data
+test group-by-cte-order-on-different-col {
+    WITH cte AS (SELECT a, b FROM g1 ORDER BY b)
+    SELECT a, SUM(b) FROM cte GROUP BY a ORDER BY a;
+}
+expect {
+    1|30
+    2|70
+    3|110
+}
+
+test join-two-ctes-different-cardinalities {
+    CREATE TABLE small(id INT PRIMARY KEY, val TEXT);
+    INSERT INTO small VALUES(1,'a'),(2,'b'),(3,'c');
+    CREATE TABLE big(id INT PRIMARY KEY, sid INT, data TEXT);
+    INSERT INTO big VALUES(1,1,'x1'),(2,1,'x2'),(3,2,'x3'),(4,2,'x4'),(5,3,'x5'),(6,3,'x6');
+    WITH s AS (SELECT id, val FROM small),
+         b AS (SELECT id, sid, data FROM big)
+    SELECT s.val, b.data FROM s JOIN b ON s.id = b.sid ORDER BY b.id;
+}
+expect {
+    a|x1
+    a|x2
+    b|x3
+    b|x4
+    c|x5
+    c|x6
+}
+
+test join-three-way-cte-table-cte {
+    CREATE TABLE jt1(id INT PRIMARY KEY, a TEXT);
+    INSERT INTO jt1 VALUES(1,'x'),(2,'y'),(3,'z');
+    CREATE TABLE jt2(id INT PRIMARY KEY, t1_id INT, t3_id INT);
+    INSERT INTO jt2 VALUES(1,1,1),(2,1,2),(3,2,1),(4,3,3);
+    CREATE TABLE jt3(id INT PRIMARY KEY, b TEXT);
+    INSERT INTO jt3 VALUES(1,'p'),(2,'q'),(3,'r');
+    WITH c1 AS (SELECT id, a FROM jt1),
+         c3 AS (SELECT id, b FROM jt3)
+    SELECT c1.a, jt2.id AS link, c3.b
+    FROM c1 JOIN jt2 ON c1.id = jt2.t1_id JOIN c3 ON jt2.t3_id = c3.id
+    ORDER BY jt2.id;
+}
+expect {
+    x|1|p
+    x|2|q
+    y|3|p
+    z|4|r
+}
+
+test join-anti-join-left-join-is-null {
+    CREATE TABLE all_ids(id INT PRIMARY KEY);
+    INSERT INTO all_ids VALUES(1),(2),(3),(4),(5);
+    CREATE TABLE used_ids(id INT PRIMARY KEY);
+    INSERT INTO used_ids VALUES(2),(4);
+    WITH cte AS (SELECT id FROM used_ids)
+    SELECT a.id FROM all_ids a LEFT JOIN cte ON a.id = cte.id
+    WHERE cte.id IS NULL ORDER BY a.id;
+}
+expect {
+    1
+    3
+    5
+}
+
+test join-cte-self-non-equi {
+    CREATE TABLE vals(v INT);
+    INSERT INTO vals VALUES(1),(2),(3),(4),(5);
+    WITH cte AS (SELECT v FROM vals)
+    SELECT a.v AS lo, b.v AS hi FROM cte a JOIN cte b ON a.v < b.v
+    ORDER BY a.v, b.v;
+}
+expect {
+    1|2
+    1|3
+    1|4
+    1|5
+    2|3
+    2|4
+    2|5
+    3|4
+    3|5
+    4|5
+}
+
+test join-cte-self-graph-walk {
+    CREATE TABLE edges(src INT, dst INT);
+    INSERT INTO edges VALUES(1,2),(2,3),(3,4),(1,3);
+    WITH cte AS (SELECT src, dst FROM edges)
+    SELECT a.src, a.dst, b.dst AS dst2
+    FROM cte a JOIN cte b ON a.dst = b.src
+    ORDER BY a.src, a.dst, b.dst;
+}
+expect {
+    1|2|3
+    1|3|4
+    2|3|4
+}
+
+test join-aggregate-cte-to-table {
+    CREATE TABLE jsales(id INT, product TEXT, amount REAL);
+    INSERT INTO jsales VALUES(1,'a',10),(2,'a',20),(3,'b',30),(4,'b',40),(5,'c',50);
+    CREATE TABLE jproducts(name TEXT PRIMARY KEY, category TEXT);
+    INSERT INTO jproducts VALUES('a','cat1'),('b','cat1'),('c','cat2');
+    WITH totals AS (SELECT product, SUM(amount) AS total FROM jsales GROUP BY product)
+    SELECT p.category, t.product, t.total
+    FROM totals t JOIN jproducts p ON t.product = p.name
+    ORDER BY p.category, t.product;
+}
+expect {
+    cat1|a|30.0
+    cat1|b|70.0
+    cat2|c|50.0
+}
+expect @js {
+    cat1|a|30
+    cat1|b|70
+    cat2|c|50
+}
+
+test join-correlated-sub-from-cte-in-select {
+    CREATE TABLE departments(id INT PRIMARY KEY, name TEXT);
+    INSERT INTO departments VALUES(1,'eng'),(2,'sales'),(3,'hr');
+    CREATE TABLE employees(id INT PRIMARY KEY, dept_id INT, salary INT);
+    INSERT INTO employees VALUES(1,1,100),(2,1,120),(3,2,80),(4,2,90),(5,3,70);
+    WITH emp AS (SELECT id, dept_id, salary FROM employees)
+    SELECT d.name,
+           (SELECT COUNT(*) FROM emp WHERE emp.dept_id = d.id) AS cnt,
+           (SELECT MAX(salary) FROM emp WHERE emp.dept_id = d.id) AS max_sal
+    FROM departments d ORDER BY d.id;
+}
+expect {
+    eng|2|120
+    sales|2|90
+    hr|1|70
+}
+
+test join-distinct-cte-to-table {
+    CREATE TABLE jlog(ts INT, user_id INT, action TEXT);
+    INSERT INTO jlog VALUES(1,1,'view'),(2,1,'click'),(3,2,'view'),(4,1,'view'),(5,3,'click');
+    CREATE TABLE jusers(id INT PRIMARY KEY, name TEXT);
+    INSERT INTO jusers VALUES(1,'alice'),(2,'bob'),(3,'carol');
+    WITH active AS (SELECT DISTINCT user_id FROM jlog)
+    SELECT u.name FROM active a JOIN jusers u ON a.user_id = u.id ORDER BY u.name;
+}
+expect {
+    alice
+    bob
+    carol
+}
+
+test min-max-no-order-in-cte {
+    CREATE TABLE mm_no(a INT);
+    INSERT INTO mm_no VALUES(5),(3),(1),(4),(2);
+    WITH cte AS (SELECT a FROM mm_no)
+    SELECT MIN(a), MAX(a) FROM cte;
+}
+expect {
+    1|5
+}
+
+test min-max-min-on-desc-cte {
+    CREATE TABLE mm_desc(a INT);
+    INSERT INTO mm_desc VALUES(5),(3),(1),(4),(2);
+    WITH cte AS (SELECT a FROM mm_desc ORDER BY a DESC)
+    SELECT MIN(a) FROM cte;
+}
+expect {
+    1
+}
+
+test min-max-group-by-both {
+    CREATE TABLE mm_grp(grp INT, val INT);
+    INSERT INTO mm_grp VALUES(1,10),(1,50),(1,30),(2,20),(2,40),(2,60);
+    WITH cte AS (SELECT grp, val FROM mm_grp ORDER BY grp, val)
+    SELECT grp, MIN(val), MAX(val) FROM cte GROUP BY grp ORDER BY grp;
+}
+expect {
+    1|10|50
+    2|20|60
+}
+
+test min-max-multiple-aggregates {
+    CREATE TABLE mm_multi(a INT);
+    INSERT INTO mm_multi VALUES(10),(20),(30),(40),(50);
+    WITH cte AS (SELECT a FROM mm_multi ORDER BY a)
+    SELECT COUNT(*), MIN(a), MAX(a), SUM(a) FROM cte;
+}
+expect {
+    5|10|50|150
+}
+
+test min-max-limit-zero {
+    CREATE TABLE mm_lz(a INT);
+    INSERT INTO mm_lz VALUES(1),(2),(3);
+    WITH cte AS (SELECT a FROM mm_lz ORDER BY a LIMIT 0)
+    SELECT MIN(a), MAX(a) FROM cte;
+}
+expect {
+    |
+}
+
+test compound-cte-except {
+    CREATE TABLE ce1(a INT);
+    INSERT INTO ce1 VALUES(1),(2),(3),(4),(5);
+    CREATE TABLE ce2(a INT);
+    INSERT INTO ce2 VALUES(2),(4);
+    WITH cte AS (SELECT a FROM ce1 EXCEPT SELECT a FROM ce2)
+    SELECT * FROM cte ORDER BY a;
+}
+expect {
+    1
+    3
+    5
+}
+
+test compound-cte-intersect {
+    CREATE TABLE ci1(a INT);
+    INSERT INTO ci1 VALUES(1),(2),(3),(4),(5);
+    CREATE TABLE ci2(a INT);
+    INSERT INTO ci2 VALUES(2),(4),(6);
+    WITH cte AS (SELECT a FROM ci1 INTERSECT SELECT a FROM ci2)
+    SELECT * FROM cte ORDER BY a;
+}
+expect {
+    2
+    4
+}
+
+test compound-not-exists-with-cte {
+    CREATE TABLE ne1(id INT PRIMARY KEY, val TEXT);
+    INSERT INTO ne1 VALUES(1,'a'),(2,'b'),(3,'c'),(4,'d');
+    CREATE TABLE ne2(t1_id INT);
+    INSERT INTO ne2 VALUES(1),(3);
+    WITH cte AS (SELECT t1_id FROM ne2)
+    SELECT val FROM ne1 WHERE NOT EXISTS (SELECT 1 FROM cte WHERE cte.t1_id = ne1.id) ORDER BY id;
+}
+expect {
+    b
+    d
+}
+
+test compound-cte-in-case-expr {
+    CREATE TABLE cc1(a INT);
+    INSERT INTO cc1 VALUES(1),(2),(3),(4),(5);
+    WITH cte AS (SELECT AVG(a) AS avg_a FROM cc1)
+    SELECT a, CASE WHEN a > (SELECT avg_a FROM cte) THEN 'above' ELSE 'below' END AS label
+    FROM cc1 ORDER BY a;
+}
+expect {
+    1|below
+    2|below
+    3|below
+    4|above
+    5|above
+}
+
+test compound-double-aggregate {
+    CREATE TABLE da(grp INT, val INT);
+    INSERT INTO da VALUES(1,10),(1,20),(2,30),(2,40),(3,50);
+    WITH grp_totals AS (SELECT grp, SUM(val) AS total FROM da GROUP BY grp)
+    SELECT MIN(total), MAX(total), SUM(total) FROM grp_totals;
+}
+expect {
+    30|70|150
+}
+
+test internals-range-desc-on-ephemeral {
+    CREATE TABLE rd(a INT, b TEXT);
+    INSERT INTO rd VALUES(1,'a'),(2,'b'),(3,'c'),(4,'d'),(5,'e');
+    WITH cte AS (SELECT a, b FROM rd)
+    SELECT * FROM cte WHERE a >= 2 AND a <= 4 ORDER BY a DESC;
+}
+expect {
+    4|d
+    3|c
+    2|b
+}
+
+test internals-equality-non-first-col {
+    CREATE TABLE enf(a INT, b INT, c TEXT);
+    INSERT INTO enf VALUES(1,10,'x'),(2,20,'y'),(3,10,'z'),(4,20,'w'),(5,10,'v');
+    WITH cte AS (SELECT a, b, c FROM enf)
+    SELECT * FROM cte WHERE b = 10 ORDER BY a;
+}
+expect {
+    1|10|x
+    3|10|z
+    5|10|v
+}
+
+test internals-null-in-join-col {
+    CREATE TABLE njc1(id INT);
+    INSERT INTO njc1 VALUES(1),(2),(NULL),(3);
+    CREATE TABLE njc2(id INT, val TEXT);
+    INSERT INTO njc2 VALUES(1,'a'),(2,'b'),(3,'c'),(NULL,'null');
+    WITH cte AS (SELECT id, val FROM njc2)
+    SELECT njc1.id, cte.val FROM njc1 JOIN cte ON njc1.id = cte.id ORDER BY njc1.id;
+}
+expect {
+    1|a
+    2|b
+    3|c
+}
+
+test internals-materialized-cte-probed-per-outer-row {
+    CREATE TABLE probe_outer(key INT);
+    INSERT INTO probe_outer VALUES(1),(3),(5);
+    CREATE TABLE probe_inner(a INT, b TEXT);
+    INSERT INTO probe_inner VALUES(1,'one'),(2,'two'),(3,'three'),(4,'four'),(5,'five');
+    WITH cte AS (SELECT a, b FROM probe_inner)
+    SELECT o.key, cte.b FROM probe_outer o JOIN cte ON o.key = cte.a ORDER BY o.key;
+}
+expect {
+    1|one
+    3|three
+    5|five
+}
+
+test internals-delete-via-cte-in {
+    CREATE TABLE del_t(id INT PRIMARY KEY, val TEXT);
+    INSERT INTO del_t VALUES(1,'a'),(2,'b'),(3,'c'),(4,'d'),(5,'e');
+    CREATE TABLE del_bl(id INT);
+    INSERT INTO del_bl VALUES(2),(4);
+    WITH bl AS (SELECT id FROM del_bl)
+    DELETE FROM del_t WHERE id IN (SELECT id FROM bl);
+    SELECT * FROM del_t ORDER BY id;
+}
+expect {
+    1|a
+    3|c
+    5|e
+}
+
+test internals-update-via-correlated-cte {
+    CREATE TABLE upd_t(id INT PRIMARY KEY, val INT);
+    INSERT INTO upd_t VALUES(1,0),(2,0),(3,0);
+    CREATE TABLE upd_src(id INT, new_val INT);
+    INSERT INTO upd_src VALUES(1,100),(3,300);
+    WITH cte AS (SELECT id, new_val FROM upd_src)
+    UPDATE upd_t SET val = (SELECT new_val FROM cte WHERE cte.id = upd_t.id)
+    WHERE id IN (SELECT id FROM cte);
+    SELECT * FROM upd_t ORDER BY id;
+}
+expect {
+    1|100
+    2|0
+    3|300
+}
+
+test join-order-3table-order-across {
+    CREATE TABLE jo_a(id INT PRIMARY KEY, val INT);
+    INSERT INTO jo_a VALUES(1,30),(2,10),(3,20);
+    CREATE TABLE jo_b(id INT PRIMARY KEY, a_id INT, c_id INT, label TEXT);
+    INSERT INTO jo_b VALUES(1,1,1,'b1'),(2,2,2,'b2'),(3,3,1,'b3'),(4,1,2,'b4');
+    CREATE TABLE jo_c(id INT PRIMARY KEY, name TEXT);
+    INSERT INTO jo_c VALUES(1,'x'),(2,'y');
+    SELECT jo_a.val, jo_b.label, jo_c.name
+    FROM jo_a JOIN jo_b ON jo_a.id = jo_b.a_id JOIN jo_c ON jo_b.c_id = jo_c.id
+    ORDER BY jo_a.val, jo_b.label;
+}
+expect {
+    10|b2|y
+    20|b3|x
+    30|b1|x
+    30|b4|y
+}
+
+test join-order-cte-ordered-parent-order-different-table {
+    CREATE TABLE joc1(id INT PRIMARY KEY, a INT);
+    INSERT INTO joc1 VALUES(1,30),(2,10),(3,20);
+    CREATE TABLE joc2(id INT PRIMARY KEY, t1_id INT, b INT);
+    INSERT INTO joc2 VALUES(1,1,5),(2,2,3),(3,3,7);
+    WITH cte AS (SELECT id, a FROM joc1 ORDER BY a)
+    SELECT cte.a, joc2.b FROM cte JOIN joc2 ON cte.id = joc2.t1_id ORDER BY joc2.b;
+}
+expect {
+    10|3
+    30|5
+    20|7
+}
+
+test join-order-left-join-order-by-nullable {
+    CREATE TABLE jol1(id INT PRIMARY KEY, name TEXT);
+    INSERT INTO jol1 VALUES(1,'alice'),(2,'bob'),(3,'carol');
+    CREATE TABLE jol2(id INT PRIMARY KEY, t1_id INT, score INT);
+    INSERT INTO jol2 VALUES(1,1,80),(2,3,90);
+    SELECT jol1.name, jol2.score FROM jol1 LEFT JOIN jol2 ON jol1.id = jol2.t1_id ORDER BY jol2.score, jol1.name;
+}
+expect {
+    bob|
+    alice|80
+    carol|90
+}
+
+test join-order-cte-agg-join-order-across {
+    CREATE TABLE jos(region TEXT, product TEXT, amount INT);
+    INSERT INTO jos VALUES('east','a',10),('east','b',20),('west','a',30),('west','b',40),('east','a',5);
+    CREATE TABLE jop(product TEXT PRIMARY KEY, category TEXT);
+    INSERT INTO jop VALUES('a','cat1'),('b','cat2');
+    WITH sales AS (SELECT region, product, SUM(amount) AS total FROM jos GROUP BY region, product)
+    SELECT jop.category, sales.region, sales.total
+    FROM sales JOIN jop ON sales.product = jop.product
+    ORDER BY jop.category, sales.total DESC;
+}
+expect {
+    cat1|west|30
+    cat1|east|15
+    cat2|west|40
+    cat2|east|20
+}
+
+test cost-large-table-small-cte {
+    CREATE TABLE cost_big(id INT PRIMARY KEY, val INT);
+    INSERT INTO cost_big VALUES(1,1),(2,2),(3,3),(4,4),(5,5),(6,6),(7,7),(8,8),(9,9),(10,10);
+    INSERT INTO cost_big SELECT id+10, val FROM cost_big;
+    INSERT INTO cost_big SELECT id+20, val FROM cost_big WHERE id <= 10;
+    WITH small_cte AS (SELECT DISTINCT val FROM cost_big WHERE val <= 3)
+    SELECT b.id, s.val FROM cost_big b JOIN small_cte s ON b.val = s.val ORDER BY b.id;
+}
+expect {
+    1|1
+    2|2
+    3|3
+    11|1
+    12|2
+    13|3
+    21|1
+    22|2
+    23|3
+}
+
+test cost-cte-order-plus-limit {
+    CREATE TABLE cost_lim(a INT, b INT);
+    INSERT INTO cost_lim VALUES(5,50),(3,30),(1,10),(4,40),(2,20);
+    WITH cte AS (SELECT a, b FROM cost_lim ORDER BY a)
+    SELECT * FROM cte LIMIT 2;
+}
+expect {
+    1|10
+    2|20
+}
+
+test cost-cte-multi-col-groupby-different-order {
+    CREATE TABLE cost_mcg(a INT, b INT, c INT);
+    INSERT INTO cost_mcg VALUES(1,1,10),(1,2,20),(2,1,30),(2,2,40),(1,1,50);
+    WITH cte AS (SELECT a, b, c FROM cost_mcg ORDER BY a, b)
+    SELECT a, b, SUM(c) FROM cte GROUP BY a, b ORDER BY SUM(c) DESC;
+}
+expect {
+    1|1|60
+    2|2|40
+    2|1|30
+    1|2|20
+}
+
+@setup wtf_data
+test wtf-empty-cte-left-join {
+    WITH empty AS (SELECT x, y FROM t WHERE 1=0 ORDER BY x)
+    SELECT t.x, e.y FROM t LEFT JOIN empty e ON t.x = e.x ORDER BY t.x;
+}
+expect {
+    |
+    -1|
+    0|
+    1|
+    2|
+    3|
+    4|
+    5|
+}
+
+@setup wtf_data
+test wtf-expr-order-elision {
+    WITH c AS (SELECT x, y, x*x AS xsq FROM t WHERE x IS NOT NULL ORDER BY x*x DESC)
+    SELECT xsq, y FROM c ORDER BY xsq DESC LIMIT 5;
+}
+expect {
+    25|e
+    16|d
+    9|c
+    4|b
+    1|a
+}
+
+@setup wtf_data
+test wtf-cte-self-join-sum-condition {
+    WITH c AS (SELECT x, y FROM t WHERE x IS NOT NULL ORDER BY x)
+    SELECT a.x, b.x, a.y, b.y FROM c a JOIN c b ON a.x + b.x = 5 ORDER BY a.x, b.x;
+}
+expect {
+    0|5||e
+    1|4|a|d
+    2|3|b|c
+    3|2|c|b
+    4|1|d|a
+    5|0|e|
+}
+
+@setup wtf_data
+test wtf-all-nulls-cte-aggregate {
+    WITH nulls AS (SELECT NULL AS a, NULL AS b, NULL AS c FROM t)
+    SELECT COUNT(*), COUNT(a), SUM(a), MIN(a), MAX(a), GROUP_CONCAT(a) FROM nulls;
+}
+expect {
+    8|0||||
+}
+
+@setup wtf_data
+test wtf-cte-four-ways {
+    WITH c AS (SELECT x, y FROM t WHERE x > 0 ORDER BY x)
+    SELECT x, y,
+      (SELECT COUNT(*) FROM c WHERE c.x <= outer_t.x) AS rank,
+      CASE WHEN EXISTS (SELECT 1 FROM c WHERE c.x = outer_t.x + 1) THEN 'has_next' ELSE 'last' END AS status
+    FROM (SELECT x, y FROM c) outer_t
+    WHERE x IN (SELECT x FROM c WHERE x % 2 = 1)
+    ORDER BY x;
+}
+expect {
+    1|a|1|has_next
+    3|c|3|has_next
+    5|e|5|last
+}
+
+@setup wtf_data
+test wtf-cte-chain-conflicting-orders {
+    WITH
+      c1 AS (SELECT x, y FROM t WHERE x IS NOT NULL ORDER BY x ASC),
+      c2 AS (SELECT x, y FROM c1 WHERE x > 0 ORDER BY x DESC),
+      c3 AS (SELECT x, y FROM c2 WHERE x < 5 ORDER BY y ASC)
+    SELECT * FROM c3 ORDER BY x ASC;
+}
+expect {
+    1|a
+    2|b
+    3|c
+    4|d
+}
+
+@setup wtf_data
+test wtf-union-all-partition-aggregate {
+    WITH c AS (
+      SELECT x, 'pos' AS label FROM t WHERE x > 0
+      UNION ALL
+      SELECT x, 'neg' AS label FROM t WHERE x < 0
+      UNION ALL
+      SELECT x, 'zero' AS label FROM t WHERE x = 0
+      UNION ALL
+      SELECT x, 'null' AS label FROM t WHERE x IS NULL
+    )
+    SELECT label, COUNT(*), MIN(x), MAX(x) FROM c GROUP BY label ORDER BY label;
+}
+expect {
+    neg|1|-1|-1
+    null|1||
+    pos|5|1|5
+    zero|1|0|0
+}
+
+@setup wtf_data
+test wtf-case-in-order-by {
+    WITH c AS (
+      SELECT x, y,
+        CASE WHEN x IS NULL THEN 999
+             WHEN x < 0 THEN 500 - x
+             ELSE x END AS sort_key
+      FROM t
+      ORDER BY sort_key
+    )
+    SELECT x, y, sort_key FROM c ORDER BY sort_key;
+}
+expect {
+    0||0
+    1|a|1
+    2|b|2
+    3|c|3
+    4|d|4
+    5|e|5
+    -1|z|501
+    ||999
+}
+
+@setup wtf_data
+test wtf-triple-self-join-combos {
+    WITH c AS (SELECT x FROM t WHERE x > 0 ORDER BY x)
+    SELECT a.x, b.x, cc.x FROM c a, c b, c cc
+    WHERE a.x < b.x AND b.x < cc.x
+    ORDER BY a.x, b.x, cc.x;
+}
+expect {
+    1|2|3
+    1|2|4
+    1|2|5
+    1|3|4
+    1|3|5
+    1|4|5
+    2|3|4
+    2|3|5
+    2|4|5
+    3|4|5
+}
+
+@setup wtf_data
+test wtf-huge-limit-offset {
+    WITH c AS (SELECT x, y FROM t WHERE x IS NOT NULL ORDER BY x ASC LIMIT 999 OFFSET 2)
+    SELECT * FROM c ORDER BY x;
+}
+expect {
+    1|a
+    2|b
+    3|c
+    4|d
+    5|e
+}
+
+@setup wtf_data
+test wtf-correlated-not-exists {
+    WITH c AS (SELECT x, y FROM t WHERE x IS NOT NULL)
+    SELECT a.x, a.y FROM c a
+    WHERE NOT EXISTS (SELECT 1 FROM c b WHERE b.x = a.x + 1)
+    ORDER BY a.x;
+}
+expect {
+    5|e
+}
+
+@setup wtf_data
+test wtf-coalesce-nullif-iif-typeof {
+    WITH c AS (
+      SELECT COALESCE(x, -999) AS cx, y, NULLIF(y, '') AS ny,
+        IIF(z > 2.0, 'big', 'small') AS category, TYPEOF(x) AS tx
+      FROM t ORDER BY cx
+    )
+    SELECT category, COUNT(*), MIN(cx), MAX(cx), GROUP_CONCAT(tx) FROM c
+    GROUP BY category ORDER BY category;
+}
+expect {
+    big|4|2|5|integer,integer,integer,integer
+    small|4|-999|1|null,integer,integer,integer
+}
+
+@setup wtf_data
+test wtf-cte-order-ignored-by-parent-group {
+    WITH c AS (SELECT x, y, z FROM t WHERE x IS NOT NULL ORDER BY z DESC)
+    SELECT y, SUM(x) AS sx FROM c WHERE x > 0 GROUP BY y ORDER BY y;
+}
+expect {
+    a|1
+    b|2
+    c|3
+    d|4
+    e|5
+}
+
+@setup wtf_data
+test wtf-cte-scalar-sub-everywhere {
+    WITH c AS (SELECT x, z FROM t WHERE x > 0 ORDER BY x)
+    SELECT x, z,
+      (SELECT SUM(z) FROM c) AS grand_total,
+      z * 100.0 / (SELECT SUM(z) FROM c) AS pct
+    FROM c
+    WHERE z > (SELECT MIN(z) FROM c)
+    ORDER BY x;
+}
+expect {
+    2|2.5|17.5|14.2857142857143
+    3|3.5|17.5|20.0
+    4|4.5|17.5|25.7142857142857
+    5|5.5|17.5|31.4285714285714
+}
+expect @js {
+    2|2.5|17.5|14.2857142857143
+    3|3.5|17.5|20
+    4|4.5|17.5|25.7142857142857
+    5|5.5|17.5|31.4285714285714
+}
+
+@setup wtf_data
+test wtf-column-is-correlated-subquery {
+    WITH c AS (
+      SELECT x, (SELECT COUNT(*) FROM t t2 WHERE t2.x < t.x AND t2.x IS NOT NULL) AS rank_val
+      FROM t WHERE x IS NOT NULL
+    )
+    SELECT * FROM c ORDER BY rank_val DESC, x DESC;
+}
+expect {
+    5|6
+    4|5
+    3|4
+    2|3
+    1|2
+    0|1
+    -1|0
+}
+
+@setup wtf_data
+test wtf-cte-as-config-variable {
+    WITH config AS (SELECT 3 AS threshold, 'x' AS sort_col)
+    SELECT t.x, t.y, t.z FROM t, config
+    WHERE t.x > config.threshold
+    ORDER BY t.x;
+}
+expect {
+    4|d|4.5
+    5|e|5.5
+}
+
+@setup wtf_data
+test wtf-distinct-modulo-cte {
+    WITH c AS (SELECT DISTINCT x % 3 AS bucket FROM t WHERE x IS NOT NULL ORDER BY x % 3)
+    SELECT * FROM c ORDER BY bucket;
+}
+expect {
+    -1
+    0
+    1
+    2
+}
+
+@setup wtf_data
+test wtf-limit-chop-then-group-by {
+    WITH c AS (SELECT x % 2 AS parity, z FROM t WHERE x IS NOT NULL ORDER BY x LIMIT 4)
+    SELECT parity, SUM(z), COUNT(*) FROM c GROUP BY parity ORDER BY parity;
+}
+expect {
+    -1|-1.5|1
+    0|2.5|2
+    1|1.5|1
+}
+
+@setup wtf_data
+test wtf-text-between-range-scan {
+    WITH c AS (SELECT x, y, z FROM t WHERE y IS NOT NULL ORDER BY y)
+    SELECT * FROM c WHERE y BETWEEN 'b' AND 'd' ORDER BY y;
+}
+expect {
+    2|b|2.5
+    3|c|3.5
+    4|d|4.5
+}
+
+@setup wtf_data
+test wtf-cross-join-two-ctes {
+    WITH
+      a AS (SELECT x AS ax FROM t WHERE x > 0 AND x < 4),
+      b AS (SELECT x AS bx FROM t WHERE x > 2 AND x < 6)
+    SELECT ax, bx, ax * bx AS product FROM a, b
+    WHERE ax <> bx
+    ORDER BY product, ax;
+}
+expect {
+    1|3|3
+    1|4|4
+    1|5|5
+    2|3|6
+    2|4|8
+    2|5|10
+    3|4|12
+    3|5|15
+}
+
+@setup wtf_data
+test wtf-five-cte-chain-join-all {
+    WITH
+      c1 AS (SELECT x FROM t WHERE x IS NOT NULL),
+      c2 AS (SELECT x, x*2 AS x2 FROM c1 WHERE x > 0),
+      c3 AS (SELECT x, x2, x*3 AS x3 FROM c2 WHERE x < 5),
+      c4 AS (SELECT x, x2, x3, x2+x3 AS combo FROM c3),
+      c5 AS (SELECT x, combo, combo*combo AS combo_sq FROM c4)
+    SELECT c5.x, c2.x2, c3.x3, c4.combo, c5.combo_sq
+    FROM c5 JOIN c4 ON c5.x = c4.x JOIN c3 ON c4.x = c3.x JOIN c2 ON c3.x = c2.x
+    ORDER BY c5.x;
+}
+expect {
+    1|2|3|5|25
+    2|4|6|10|100
+    3|6|9|15|225
+    4|8|12|20|400
+}
+
+@setup wtf_data
+test wtf-empty-zero-null-group-by {
+    WITH horrors AS (
+      SELECT '' AS val UNION ALL SELECT '' UNION ALL SELECT '0'
+      UNION ALL SELECT 0 UNION ALL SELECT NULL UNION ALL SELECT NULL UNION ALL SELECT 0.0
+    )
+    SELECT TYPEOF(val), val, COUNT(*) FROM horrors GROUP BY val ORDER BY TYPEOF(val), val;
+}
+expect {
+    integer|0|2
+    null||2
+    text||2
+    text|0|1
+}
+
+@setup wtf_data
+test wtf-cte-bounds-filter {
+    WITH
+      bounds AS (SELECT MIN(x) AS lo, MAX(x) AS hi FROM t WHERE x IS NOT NULL),
+      middle AS (SELECT x, y FROM t WHERE x > (SELECT lo FROM bounds) AND x < (SELECT hi FROM bounds) ORDER BY x)
+    SELECT COUNT(*), MIN(x), MAX(x), GROUP_CONCAT(y, '-') FROM middle;
+}
+expect {
+    5|0|4|-a-b-c-d
+}
+
+@setup wtf_data
+test wtf-cte-array-indexing {
+    WITH ordered AS (SELECT x, y FROM t WHERE x IS NOT NULL ORDER BY x)
+    SELECT
+      (SELECT y FROM ordered LIMIT 1 OFFSET 0) AS first_y,
+      (SELECT y FROM ordered LIMIT 1 OFFSET 2) AS third_y,
+      (SELECT x FROM ordered LIMIT 1 OFFSET 4) AS fifth_x,
+      (SELECT COUNT(*) FROM ordered) AS total;
+}
+expect {
+    z|a|3|7
+}
+
+@setup wtf_data
+test wtf-fake-factorial-self-join {
+    WITH nums AS (SELECT 1 AS n UNION ALL SELECT 2 UNION ALL SELECT 3 UNION ALL SELECT 4 UNION ALL SELECT 5)
+    SELECT a.n,
+      CASE a.n WHEN 1 THEN 1 WHEN 2 THEN 2 WHEN 3 THEN 6 WHEN 4 THEN 24 WHEN 5 THEN 120 END AS factorial,
+      (SELECT COUNT(*) FROM nums b, nums c WHERE b.n <= a.n AND c.n <= a.n) AS n_squared
+    FROM nums a ORDER BY a.n;
+}
+expect {
+    1|1|1
+    2|2|4
+    3|6|9
+    4|24|16
+    5|120|25
+}
+
+@setup wtf_data
+test wtf-linear-regression-cte {
+    WITH stats AS (
+      SELECT COUNT(*) AS n, SUM(x) AS sx, SUM(x*x) AS sxx, SUM(z) AS sz, SUM(x*z) AS sxz
+      FROM t WHERE x IS NOT NULL AND z IS NOT NULL
+    )
+    SELECT n, sx, sz,
+      CAST((n * sxz - sx * sz) AS REAL) / (n * sxx - sx * sx) AS slope,
+      CAST(sz AS REAL) / n - (CAST((n * sxz - sx * sz) AS REAL) / (n * sxx - sx * sx)) * CAST(sx AS REAL) / n AS intercept
+    FROM stats;
+}
+expect {
+    7|14|16.0|1.14285714285714|0.0
+}
+expect @js {
+    7|14|16|1.14285714285714|0
+}
+
+@setup wtf_data
+test wtf-cte-union-with-itself {
+    WITH c AS (SELECT x, y FROM t WHERE x > 0 AND x <= 3)
+    SELECT * FROM (SELECT x, y, 'first' AS src FROM c UNION ALL SELECT x, y, 'second' FROM c) combo
+    ORDER BY src, x;
+}
+expect {
+    1|a|first
+    2|b|first
+    3|c|first
+    1|a|second
+    2|b|second
+    3|c|second
+}
+
+@setup wtf_data
+test wtf-agg-of-agg-with-subquery {
+    WITH c AS (
+      SELECT x % 3 AS bucket, COUNT(*) AS cnt, SUM(z) AS total
+      FROM t WHERE x IS NOT NULL GROUP BY x % 3
+    )
+    SELECT MIN(cnt), MAX(cnt), MIN(total), MAX(total),
+      (SELECT bucket FROM c ORDER BY cnt DESC, bucket ASC LIMIT 1) AS biggest_bucket
+    FROM c;
+}
+expect {
+    1|2|-1.5|8.0|0
+}
+expect @js {
+    1|2|-1.5|8|0
+}
+
+@setup wtf_data
+test wtf-group-expr-having-order-diff-agg {
+    WITH c AS (
+      SELECT ABS(x) AS ax, SUM(z) AS sz, COUNT(*) AS cnt
+      FROM t WHERE x IS NOT NULL
+      GROUP BY ABS(x) HAVING COUNT(*) = 1
+      ORDER BY SUM(z) DESC
+    )
+    SELECT * FROM c ORDER BY sz DESC;
+}
+expect {
+    5|5.5|1
+    4|4.5|1
+    3|3.5|1
+    2|2.5|1
+    0|0.0|1
+}
+expect @js {
+    5|5.5|1
+    4|4.5|1
+    3|3.5|1
+    2|2.5|1
+    0|0|1
+}
+
+@setup wtf_data
+test wtf-pure-literal-cte-aggregate {
+    WITH constants AS (
+      SELECT 42 AS magic, 'hello' AS greeting UNION ALL SELECT 0, 'world'
+      UNION ALL SELECT -1, 'goodbye' UNION ALL SELECT 42, 'duplicate'
+    )
+    SELECT magic, COUNT(*), GROUP_CONCAT(greeting, ' | ') FROM constants
+    GROUP BY magic ORDER BY magic;
+}
+expect {
+    -1|1|goodbye
+    0|1|world
+    42|2|hello | duplicate
+}
+
+@setup wtf_data
+test wtf-coalesce-join-negation {
+    WITH c AS (SELECT COALESCE(x, -42) AS cx, y FROM t ORDER BY cx)
+    SELECT a.cx, a.y, b.cx, b.y FROM c a JOIN c b ON a.cx = -b.cx
+    ORDER BY a.cx;
+}
+expect {
+    -1|z|1|a
+    0||0|
+    1|a|-1|z
+}
+
+@setup wtf_data
+test wtf-divide-by-null-cte {
+    WITH total AS (SELECT SUM(x) AS s FROM t WHERE x > 999)
+    SELECT t.x, t.z,
+      CASE WHEN (SELECT s FROM total) IS NULL THEN 'N/A'
+           ELSE CAST(t.z / (SELECT s FROM total) AS TEXT) END AS ratio
+    FROM t WHERE x IS NOT NULL ORDER BY x;
+}
+expect {
+    -1|-1.5|N/A
+    0|0.0|N/A
+    1|1.5|N/A
+    2|2.5|N/A
+    3|3.5|N/A
+    4|4.5|N/A
+    5|5.5|N/A
+}
+expect @js {
+    -1|-1.5|N/A
+    0|0|N/A
+    1|1.5|N/A
+    2|2.5|N/A
+    3|3.5|N/A
+    4|4.5|N/A
+    5|5.5|N/A
+}
+
+@setup business_data
+test wtf-running-total-correlated-join {
+    WITH ranked_orders AS (
+      SELECT o.id, o.customer_id, o.amount, o.status,
+        (SELECT SUM(o2.amount) FROM orders o2 WHERE o2.customer_id = o.customer_id AND o2.id <= o.id) AS running_total
+      FROM orders o
+      WHERE o.customer_id IS NOT NULL AND o.status = 'shipped'
+      ORDER BY o.customer_id, o.id
+    )
+    SELECT c.name, r.id, r.amount, r.running_total
+    FROM ranked_orders r JOIN customers c ON r.customer_id = c.id
+    ORDER BY c.name, r.id;
+}
+expect {
+    Alice|1|100.0|100.0
+    Alice|9|0.0|300.0
+    Bob|3|50.0|50.0
+    Bob|4|75.0|125.0
+    Carol|6|150.0|450.0
+}
+expect @js {
+    Alice|1|100|100
+    Alice|9|0|300
+    Bob|3|50|50
+    Bob|4|75|125
+    Carol|6|150|450
+}
+
+@setup business_data
+test wtf-cte-chain-filter-back {
+    WITH
+      c1 AS (SELECT customer_id, SUM(amount) AS total FROM orders
+             WHERE customer_id IS NOT NULL AND status='shipped' GROUP BY customer_id),
+      c2 AS (SELECT customer_id, total FROM c1 WHERE total > (SELECT AVG(total) FROM c1)),
+      c3 AS (SELECT c.name, c2.total FROM c2 JOIN customers c ON c2.customer_id = c.id)
+    SELECT * FROM c3 ORDER BY total DESC;
+}
+expect {
+    Carol|150.0
+}
+expect @js {
+    Carol|150
+}
+
+@setup business_data
+test wtf-tier-cross-join-comparison {
+    WITH tier_stats AS (
+      SELECT c.tier, COUNT(DISTINCT c.id) AS num_customers,
+        COALESCE(SUM(o.amount), 0) AS total_amount, COUNT(o.id) AS num_orders
+      FROM customers c LEFT JOIN orders o ON c.id = o.customer_id
+      GROUP BY c.tier ORDER BY c.tier
+    )
+    SELECT a.tier AS tier_a, b.tier AS tier_b,
+      CASE WHEN a.total_amount > b.total_amount THEN a.tier ELSE b.tier END AS winner
+    FROM tier_stats a CROSS JOIN tier_stats b
+    WHERE a.tier < b.tier ORDER BY a.tier, b.tier;
+}
+expect {
+    bronze|gold|gold
+    bronze|silver|silver
+    gold|silver|gold
+}
+
+@setup business_data
+test wtf-nested-aggregate-cte {
+    WITH inner_agg AS (
+      SELECT customer_id, COUNT(*) AS order_cnt, SUM(amount) AS order_sum
+      FROM orders WHERE customer_id IS NOT NULL GROUP BY customer_id
+    ),
+    outer_agg AS (
+      SELECT MIN(order_cnt) AS min_orders, MAX(order_cnt) AS max_orders,
+        SUM(order_sum) AS grand_total, COUNT(*) AS num_customers
+      FROM inner_agg
+    )
+    SELECT *, grand_total / num_customers AS avg_per_customer FROM outer_agg;
+}
+expect {
+    1|3|900.0|4|225.0
+}
+expect @js {
+    1|3|900|4|225
+}
+
+@setup business_data
+test wtf-insert-select-cte {
+    CREATE TABLE summary(name TEXT, total REAL);
+    INSERT INTO summary
+      WITH order_totals AS (
+        SELECT c.name, SUM(o.amount) AS total
+        FROM customers c JOIN orders o ON c.id = o.customer_id
+        GROUP BY c.name
+      ) SELECT * FROM order_totals;
+    SELECT * FROM summary ORDER BY name;
+}
+expect {
+    Alice|300.0
+    Bob|125.0
+    Carol|450.0
+    Dave|25.0
+}
+expect @js {
+    Alice|300
+    Bob|125
+    Carol|450
+    Dave|25
+}

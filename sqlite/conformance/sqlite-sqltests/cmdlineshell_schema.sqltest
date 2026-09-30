@@ -1,0 +1,12 @@
+@database :memory:
+
+@backend cli
+test schema-includes-trigger {
+    CREATE TABLE t1(a);
+    CREATE TRIGGER trg AFTER INSERT ON t1 BEGIN SELECT 1; END;
+    .schema
+}
+expect raw {
+CREATE TABLE t1 (a);
+CREATE TRIGGER trg AFTER INSERT ON t1 BEGIN SELECT 1; END;
+}

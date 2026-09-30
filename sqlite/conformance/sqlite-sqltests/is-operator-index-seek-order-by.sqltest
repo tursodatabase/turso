@@ -1,0 +1,73 @@
+@database :memory:
+
+# A UNIQUE index stores every NULL key separately, so `x IS NULL` can match
+# many rows even when the index is unique. The planner must not treat such a
+# seek as a single-row lookup: if it does, it skips the sorter for
+# ORDER BY (x, <inner loop column>) and rows come out in nested-loop order
+# instead of sorted order.
+
+test is-null-seek-on-unique-index-keeps-the-sorter {
+    CREATE TABLE t1(x);
+    CREATE UNIQUE INDEX i1 ON t1(x);
+    CREATE TABLE t2(y);
+    INSERT INTO t1 VALUES (NULL), (NULL);
+    INSERT INTO t2 VALUES (1), (2);
+    SELECT t2.y FROM t1 JOIN t2 WHERE t1.x IS NULL ORDER BY t1.x, t2.rowid;
+}
+expect {
+    1
+    1
+    2
+    2
+}
+
+# The same wrong "one row per seek" claim can be reached with plain `=` when
+# the ORDER BY mentions the equality column itself: the column is then counted
+# twice (once as an equality, once as a consumed ORDER BY term), which makes
+# the planner believe the ORDER BY prefix reached the rowid.
+
+test eq-seek-on-non-unique-index-keeps-the-sorter {
+    CREATE TABLE t5(x);
+    CREATE INDEX i5 ON t5(x);
+    CREATE TABLE t6(y);
+    INSERT INTO t5 VALUES (5), (5);
+    INSERT INTO t6 VALUES (1), (2);
+    SELECT t6.y FROM t5 JOIN t6 WHERE t5.x = 5 ORDER BY t5.x, t6.rowid;
+}
+expect {
+    1
+    1
+    2
+    2
+}
+
+test eq-seek-on-partial-unique-index-prefix-keeps-the-sorter {
+    CREATE TABLE t7(x, z);
+    CREATE UNIQUE INDEX i7 ON t7(x, z);
+    CREATE TABLE t8(y);
+    INSERT INTO t7 VALUES (5, 1), (5, 2);
+    INSERT INTO t8 VALUES (1), (2);
+    SELECT t8.y FROM t7 JOIN t8 WHERE t7.x = 5 ORDER BY t7.x, t8.rowid;
+}
+expect {
+    1
+    1
+    2
+    2
+}
+
+test is-null-seek-on-unique-column-keeps-the-sorter-with-forced-inner-index {
+    CREATE TABLE t3(a UNIQUE);
+    CREATE TABLE t4(c);
+    CREATE INDEX t4c ON t4(c);
+    INSERT INTO t3 VALUES (NULL), (NULL);
+    INSERT INTO t4 VALUES (2), (1);
+    SELECT quote(t3.a), t4.c FROM t3 CROSS JOIN t4 INDEXED BY t4c
+    WHERE t3.a IS NULL ORDER BY t3.a, t4.c;
+}
+expect {
+    NULL|1
+    NULL|1
+    NULL|2
+    NULL|2
+}

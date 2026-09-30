@@ -1,0 +1,23 @@
+---
+source: cte_cardinality.sqltest
+expression: |-
+  WITH small AS (
+          SELECT id FROM items LIMIT 3
+      )
+      SELECT s.id, i.name
+      FROM items i
+      JOIN small s ON i.id = s.id;
+info:
+  statement_type: WITH (CTE)
+  tables:
+  - i.id
+  - items
+  - small
+  setup_blocks:
+  - tables
+  database: ':memory:'
+---
+QUERY PLAN
+|--SCAN small AS s
+|  `--SCAN items
+`--SEARCH i USING INTEGER PRIMARY KEY (rowid=?)

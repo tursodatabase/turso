@@ -1,0 +1,874 @@
+use std::{
+    collections::{BTreeMap, HashMap},
+    sync::{Arc, Mutex},
+};
+
+use serde::{Deserialize, Serialize};
+
+use crate::{database_sync_operations::MutexSlot, errors::Error, Result};
+
+pub struct Coro<Ctx> {
+    pub ctx: Mutex<Ctx>,
+    gen: genawaiter::sync::Co<SyncEngineIoResult, Result<Ctx>>,
+}
+
+impl<Ctx> Coro<Ctx> {
+    pub fn new(ctx: Ctx, gen: genawaiter::sync::Co<SyncEngineIoResult, Result<Ctx>>) -> Self {
+        Self {
+            ctx: Mutex::new(ctx),
+            gen,
+        }
+    }
+    pub async fn yield_(&self, value: SyncEngineIoResult) -> Result<()> {
+        let ctx = self.gen.yield_(value).await?;
+        *self.ctx.lock().unwrap() = ctx;
+        Ok(())
+    }
+}
+
+impl From<genawaiter::sync::Co<SyncEngineIoResult, Result<()>>> for Coro<()> {
+    fn from(value: genawaiter::sync::Co<SyncEngineIoResult, Result<()>>) -> Self {
+        Self {
+            gen: value,
+            ctx: Mutex::new(()),
+        }
+    }
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub struct Secret(String);
+
+impl Secret {
+    pub fn new(value: impl Into<String>) -> Self {
+        Self(value.into())
+    }
+
+    pub fn expose(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Debug for Secret {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("<redacted>")
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum PartialBootstrapStrategy {
+    Prefix { length: usize },
+    Query { query: String },
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+pub struct PartialSyncOpts {
+    pub bootstrap_strategy: Option<PartialBootstrapStrategy>,
+    pub segment_size: usize,
+    pub prefetch: bool,
+}
+
+impl PartialSyncOpts {
+    pub fn segment_size(&self) -> usize {
+        if self.segment_size == 0 {
+            128 * 1024
+        } else {
+            self.segment_size
+        }
+    }
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+pub struct DbSyncInfo {
+    pub current_generation: u64,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+pub struct DbSyncStatus {
+    pub baton: Option<String>,
+    pub status: String,
+    pub generation: u64,
+    pub max_frame_no: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DbChangesStreamKind {
+    LegacyPages,
+    Pages,
+    Logical,
+    ReplaceBasePages,
+}
+
+pub struct DbChangesStatus {
+    pub time: turso_core::WallClockInstant,
+    pub revision: DatabasePullRevision,
+    pub file_slot: Option<MutexSlot<Arc<dyn turso_core::File>>>,
+    pub stream_kind: DbChangesStreamKind,
+}
+
+impl DbChangesStatus {
+    pub fn is_empty(&self) -> bool {
+        self.file_slot.is_none()
+    }
+}
+
+impl std::fmt::Debug for DbChangesStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DbChangesStatus")
+            .field("time", &self.time)
+            .field("revision", &self.revision)
+            .field("file_slot.is_some()", &self.file_slot.is_some())
+            .field("stream_kind", &self.stream_kind)
+            .finish()
+    }
+}
+
+#[derive(Debug, Serialize)]
+pub struct SyncEngineStats {
+    pub cdc_operations: i64,
+    pub main_wal_size: u64,
+    pub revert_wal_size: u64,
+    pub last_pull_unix_time: Option<i64>,
+    pub last_push_unix_time: Option<i64>,
+    pub revision: Option<String>,
+    pub network_sent_bytes: usize,
+    pub network_received_bytes: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum DatabaseChangeType {
+    Delete,
+    Update,
+    Insert,
+    Commit,
+}
+
+pub const DATABASE_METADATA_VERSION: &str = "v1";
+
+/// Sync protocol the remote database speaks for incremental pulls.
+///
+/// `Unknown` means the client has not yet learned the remote's protocol —
+/// either the replica predates auto-detection or it was created with deferred
+/// bootstrap and has not contacted the server yet. The first pull-updates
+/// response resolves it (explicit `protocol` header field, revision shape as
+/// fallback for older servers) and the result is persisted in the metadata.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum RemotePullProtocol {
+    #[default]
+    Unknown,
+    Pages,
+    MvccLogical,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+pub struct DatabaseMetadata {
+    pub version: String,
+    /// Unique identifier of the client - generated on sync startup
+    pub client_unique_id: String,
+    /// Latest generation from remote which was pulled locally to the Synced DB
+    pub synced_revision: Option<DatabasePullRevision>,
+    /// pair of frame_no for Draft and Synced DB such that content of the database file up to these frames is identical
+    pub revert_since_wal_salt: Option<Vec<u32>>,
+    pub revert_since_wal_watermark: u64,
+    /// Unix time of last successful pull
+    pub last_pull_unix_time: Option<i64>,
+    /// Unix time of last successful push
+    pub last_push_unix_time: Option<i64>,
+    pub last_pushed_pull_gen_hint: i64,
+    pub last_pushed_change_id_hint: i64,
+    #[serde(default)]
+    pub last_pushed_replay_floor_change_id_hint: i64,
+    pub partial_bootstrap_server_revision: Option<DatabasePullRevision>,
+    #[serde(default)]
+    pub fresh_bootstrap_pending_cdc_ack: bool,
+    /// Detected remote sync protocol; source of truth for pull dispatch.
+    /// Metadata files written before this field existed deserialize to
+    /// `Unknown` and are pinned to `Pages` in [`DatabaseMetadata::load`]
+    /// (MVCC logical sync never shipped without this field).
+    #[serde(default)]
+    pub remote_pull_protocol: RemotePullProtocol,
+    #[serde(default)]
+    pub logical_table_names_by_stable_id: BTreeMap<u64, String>,
+    /// optional saved configuration
+    /// this will be used by sync engine if some parameters were omitted
+    pub saved_configuration: Option<DatabaseSavedConfiguration>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+pub struct DatabaseSavedConfiguration {
+    pub remote_url: Option<String>,
+    pub partial_sync_prefetch: Option<bool>,
+    pub partial_sync_segment_size: Option<usize>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum DatabasePullRevision {
+    Legacy {
+        generation: u64,
+        synced_frame_no: Option<u64>,
+    },
+    V1 {
+        revision: String,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq)]
+pub enum DatabaseSyncEngineProtocolVersion {
+    Legacy,
+    V1,
+}
+
+impl DatabaseMetadata {
+    pub fn remote_url(&self) -> Option<String> {
+        self.saved_configuration
+            .as_ref()
+            .and_then(|x| x.remote_url.as_deref())
+            .map(|x| x.to_string())
+    }
+    pub fn partial_sync_opts(&self) -> Option<PartialSyncOpts> {
+        if self.partial_bootstrap_server_revision.is_none() {
+            None
+        } else {
+            let partial_sync_opts = PartialSyncOpts {
+                bootstrap_strategy: None,
+                segment_size: self
+                    .saved_configuration
+                    .as_ref()
+                    .and_then(|x| x.partial_sync_segment_size)
+                    .unwrap_or(128 * 1024),
+                prefetch: self
+                    .saved_configuration
+                    .as_ref()
+                    .and_then(|x| x.partial_sync_prefetch)
+                    .unwrap_or_default(),
+            };
+            Some(partial_sync_opts)
+        }
+    }
+    pub fn update_configuration(&mut self, configuration: DatabaseSavedConfiguration) -> bool {
+        let Some(saved_configuration) = &mut self.saved_configuration else {
+            self.saved_configuration = Some(configuration);
+            return true;
+        };
+        // Only report a change when a value actually differs: every open calls
+        // this, and a spurious `true` makes every open rewrite the metadata
+        // file, racing with concurrent opens reading it.
+        let mut changed = false;
+        if let Some(remote_url) = configuration.remote_url {
+            if saved_configuration.remote_url.as_ref() != Some(&remote_url) {
+                saved_configuration.remote_url = Some(remote_url);
+                changed = true;
+            }
+        }
+        if let Some(partial_sync_prefetch) = configuration.partial_sync_prefetch {
+            if saved_configuration.partial_sync_prefetch != Some(partial_sync_prefetch) {
+                saved_configuration.partial_sync_prefetch = Some(partial_sync_prefetch);
+                changed = true;
+            }
+        }
+        if let Some(partial_sync_segment_size) = configuration.partial_sync_segment_size {
+            if saved_configuration.partial_sync_segment_size != Some(partial_sync_segment_size) {
+                saved_configuration.partial_sync_segment_size = Some(partial_sync_segment_size);
+                changed = true;
+            }
+        }
+        changed
+    }
+    pub fn load(data: &[u8]) -> Result<Self> {
+        let value: serde_json::Value = serde_json::from_slice(data)?;
+
+        // detect version field presence and type separately in order to provide nicer error message when user accidentally tried to run tursodb sync on top of the libsql sync metadata file
+        match value.get("version").and_then(serde_json::Value::as_str) {
+            Some(version) => {
+                let version = version.to_string();
+                let mut meta: DatabaseMetadata = serde_json::from_value(value).map_err(|err|
+                    Error::JsonDecode(format!("unable to parse metadata file with version {version}: {err}"))
+                )?;
+                // Metadata written before remote_pull_protocol existed belongs
+                // to a page-protocol replica (MVCC logical sync never shipped
+                // without this field). A replica that already holds a revision
+                // has talked to the server, so pin it to Pages; deferred
+                // replicas stay Unknown and detect on first contact.
+                if meta.remote_pull_protocol == RemotePullProtocol::Unknown
+                    && meta.synced_revision.is_some()
+                {
+                    meta.remote_pull_protocol = RemotePullProtocol::Pages;
+                }
+                Ok(meta)
+            }
+            None => Err(Error::JsonDecode(
+                "unexpected metadata file format, 'version' field must be present and have string type".to_string(),
+            )),
+        }
+    }
+    pub fn dump(&self) -> Result<Vec<u8>> {
+        let data = serde_json::to_string(self)?;
+        Ok(data.into_bytes())
+    }
+    /// True when this replica syncs via MVCC logical-log pulls.
+    pub fn logical_mvcc_pull_active(&self) -> bool {
+        self.remote_pull_protocol == RemotePullProtocol::MvccLogical
+    }
+}
+
+/// [DatabaseChange] struct represents data from CDC table as-i
+/// (see `turso_cdc_table_columns` definition in turso-core)
+#[derive(Clone)]
+pub struct DatabaseChange {
+    /// Monotonically incrementing change number
+    pub change_id: i64,
+    /// Unix timestamp of the change (not guaranteed to be strictly monotonic as host clocks can drift)
+    pub change_time: u64,
+    /// CDC v2: transaction ID for grouping CDC records by transaction. None for v1.
+    pub change_txn_id: Option<i64>,
+    /// Type of the change
+    pub change_type: DatabaseChangeType,
+    /// Table of the change
+    pub table_name: String,
+    /// Rowid of changed row
+    pub id: i64,
+    /// Binary record of the row before the change, if CDC pragma set to either 'before' or 'full'
+    pub before: Option<Vec<u8>>,
+    /// Binary record of the row after the change, if CDC pragma set to either 'after' or 'full'
+    pub after: Option<Vec<u8>>,
+    /// Binary record from "updates" column, if CDC pragma set to 'full'
+    pub updates: Option<Vec<u8>>,
+}
+
+impl DatabaseChange {
+    /// Converts [DatabaseChange] into the operation which effect will be the application of the change
+    pub fn into_apply(self) -> Result<DatabaseTapeRowChange> {
+        let tape_change = match self.change_type {
+            DatabaseChangeType::Delete => DatabaseTapeRowChangeType::Delete {
+                before: parse_bin_record(self.before.ok_or_else(|| {
+                    Error::DatabaseTapeError(
+                        "cdc_mode must be set to either 'full' or 'before'".to_string(),
+                    )
+                })?)?,
+                key: None,
+            },
+            DatabaseChangeType::Update => DatabaseTapeRowChangeType::Update {
+                before: parse_bin_record(self.before.ok_or_else(|| {
+                    Error::DatabaseTapeError("cdc_mode must be set to 'full'".to_string())
+                })?)?,
+                after: parse_bin_record(self.after.ok_or_else(|| {
+                    Error::DatabaseTapeError("cdc_mode must be set to 'full'".to_string())
+                })?)?,
+                updates: if let Some(updates) = self.updates {
+                    Some(parse_bin_record(updates)?)
+                } else {
+                    None
+                },
+            },
+            DatabaseChangeType::Insert => DatabaseTapeRowChangeType::Insert {
+                after: parse_bin_record(self.after.ok_or_else(|| {
+                    Error::DatabaseTapeError(
+                        "cdc_mode must be set to either 'full' or 'after'".to_string(),
+                    )
+                })?)?,
+            },
+            DatabaseChangeType::Commit => {
+                return Err(Error::DatabaseTapeError(
+                    "Commit changes cannot be converted to row changes".to_string(),
+                ))
+            }
+        };
+        Ok(DatabaseTapeRowChange {
+            change_id: self.change_id,
+            change_time: self.change_time,
+            change: tape_change,
+            table_name: self.table_name,
+            id: self.id,
+        })
+    }
+    /// Converts [DatabaseChange] into the operation which effect will be the revert of the change
+    pub fn into_revert(self) -> Result<DatabaseTapeRowChange> {
+        let tape_change = match self.change_type {
+            DatabaseChangeType::Delete => DatabaseTapeRowChangeType::Insert {
+                after: parse_bin_record(self.before.ok_or_else(|| {
+                    Error::DatabaseTapeError(
+                        "cdc_mode must be set to either 'full' or 'before'".to_string(),
+                    )
+                })?)?,
+            },
+            DatabaseChangeType::Update => DatabaseTapeRowChangeType::Update {
+                before: parse_bin_record(self.after.ok_or_else(|| {
+                    Error::DatabaseTapeError("cdc_mode must be set to 'full'".to_string())
+                })?)?,
+                after: parse_bin_record(self.before.ok_or_else(|| {
+                    Error::DatabaseTapeError(
+                        "cdc_mode must be set to either 'full' or 'before'".to_string(),
+                    )
+                })?)?,
+                updates: None,
+            },
+            DatabaseChangeType::Insert => DatabaseTapeRowChangeType::Delete {
+                before: parse_bin_record(self.after.ok_or_else(|| {
+                    Error::DatabaseTapeError(
+                        "cdc_mode must be set to either 'full' or 'after'".to_string(),
+                    )
+                })?)?,
+                key: None,
+            },
+            DatabaseChangeType::Commit => {
+                return Err(Error::DatabaseTapeError(
+                    "Commit changes cannot be converted to row changes".to_string(),
+                ))
+            }
+        };
+        Ok(DatabaseTapeRowChange {
+            change_id: self.change_id,
+            change_time: self.change_time,
+            change: tape_change,
+            table_name: self.table_name,
+            id: self.id,
+        })
+    }
+}
+
+impl std::fmt::Debug for DatabaseChange {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("DatabaseChange")
+            .field("change_id", &self.change_id)
+            .field("change_time", &self.change_time)
+            .field("change_txn_id", &self.change_txn_id)
+            .field("change_type", &self.change_type)
+            .field("table_name", &self.table_name)
+            .field("id", &self.id)
+            .field("before.len()", &self.before.as_ref().map(|x| x.len()))
+            .field("after.len()", &self.after.as_ref().map(|x| x.len()))
+            .finish()
+    }
+}
+
+impl TryFrom<&turso_core::Row> for DatabaseChange {
+    type Error = Error;
+
+    /// Parse a CDC row using v1 layout (8 columns, no change_txn_id).
+    fn try_from(row: &turso_core::Row) -> Result<Self> {
+        Self::from_row_v1(row)
+    }
+}
+
+fn parse_change_type(value: i64) -> Result<DatabaseChangeType> {
+    match value {
+        -1 => Ok(DatabaseChangeType::Delete),
+        0 => Ok(DatabaseChangeType::Update),
+        1 => Ok(DatabaseChangeType::Insert),
+        2 => Ok(DatabaseChangeType::Commit),
+        v => Err(Error::DatabaseTapeError(format!(
+            "unexpected change type: expected -1|0|1|2, got '{v:?}'"
+        ))),
+    }
+}
+
+impl DatabaseChange {
+    /// Parse a CDC row using v1 layout (8 columns, no change_txn_id).
+    pub fn from_row_v1(row: &turso_core::Row) -> Result<Self> {
+        let change_id = get_core_value_i64(row, 0)?;
+        let change_time = get_core_value_i64(row, 1)? as u64;
+        let change_type = get_core_value_i64(row, 2)?;
+        let table_name = get_core_value_text(row, 3)?;
+        let id = get_core_value_i64(row, 4)?;
+        let before = get_core_value_blob_or_null(row, 5)?;
+        let after = get_core_value_blob_or_null(row, 6)?;
+        let updates = get_core_value_blob_or_null(row, 7)?;
+        let change_type = parse_change_type(change_type)?;
+        Ok(Self {
+            change_id,
+            change_time,
+            change_txn_id: None,
+            change_type,
+            table_name,
+            id,
+            before,
+            after,
+            updates,
+        })
+    }
+
+    /// Parse a CDC row using v2 layout (9 columns, with change_txn_id).
+    pub fn from_row_v2(row: &turso_core::Row) -> Result<Self> {
+        let change_id = get_core_value_i64(row, 0)?;
+        let change_time = get_core_value_i64(row, 1)? as u64;
+        let change_txn_id = get_core_value_i64_or_null(row, 2)?;
+        let change_type = match get_core_value_i64_or_null(row, 3)? {
+            Some(change_type) => parse_change_type(change_type)?,
+            None if is_null_cdc_v2_commit_payload(row) => DatabaseChangeType::Commit,
+            None => {
+                return Err(Error::DatabaseTapeError(
+                    "column 3 type mismatch: expected integer for non-COMMIT CDC row, got NULL"
+                        .to_string(),
+                ))
+            }
+        };
+        // COMMIT records have NULL for table_name and id
+        let table_name = get_core_value_text_or_null(row, 4)?.unwrap_or_default();
+        let id = get_core_value_i64_or_null(row, 5)?.unwrap_or(0);
+        let before = get_core_value_blob_or_null(row, 6)?;
+        let after = get_core_value_blob_or_null(row, 7)?;
+        let updates = get_core_value_blob_or_null(row, 8)?;
+        Ok(Self {
+            change_id,
+            change_time,
+            change_txn_id,
+            change_type,
+            table_name,
+            id,
+            before,
+            after,
+            updates,
+        })
+    }
+
+    pub fn from_row(row: &turso_core::Row, cdc_version: turso_core::CdcVersion) -> Result<Self> {
+        match cdc_version {
+            turso_core::CdcVersion::V2 => Self::from_row_v2(row),
+            turso_core::CdcVersion::V1 => Self::from_row_v1(row),
+        }
+    }
+}
+
+fn is_null_cdc_v2_commit_payload(row: &turso_core::Row) -> bool {
+    (4..=8).all(|index| matches!(row.get_value(index), turso_core::Value::Null))
+}
+
+pub struct DatabaseRowMutation {
+    pub change_time: u64,
+    pub table_name: String,
+    pub id: i64,
+    pub change_type: DatabaseChangeType,
+    pub before: Option<HashMap<String, turso_core::Value>>,
+    pub after: Option<HashMap<String, turso_core::Value>>,
+    pub updates: Option<HashMap<String, turso_core::Value>>,
+}
+
+#[derive(Debug, Clone)]
+pub struct DatabaseStatementReplay {
+    pub sql: String,
+    pub values: Vec<turso_core::Value>,
+}
+
+#[derive(Debug, Clone)]
+pub enum DatabaseRowTransformResult {
+    Keep,
+    Skip,
+    Rewrite(DatabaseStatementReplay),
+}
+
+#[derive(Clone)]
+pub enum DatabaseTapeRowChangeType {
+    Delete {
+        before: crate::alloc::Vec<turso_core::Value>,
+        /// Primary-key values in declared key order when the source only
+        /// provides a delete key rather than a complete before image.
+        key: Option<crate::alloc::Vec<turso_core::Value>>,
+    },
+    Update {
+        before: crate::alloc::Vec<turso_core::Value>,
+        after: crate::alloc::Vec<turso_core::Value>,
+        updates: Option<crate::alloc::Vec<turso_core::Value>>,
+    },
+    Insert {
+        after: crate::alloc::Vec<turso_core::Value>,
+    },
+}
+
+impl From<&DatabaseTapeRowChangeType> for DatabaseChangeType {
+    fn from(value: &DatabaseTapeRowChangeType) -> Self {
+        match value {
+            DatabaseTapeRowChangeType::Delete { .. } => DatabaseChangeType::Delete,
+            DatabaseTapeRowChangeType::Update { .. } => DatabaseChangeType::Update,
+            DatabaseTapeRowChangeType::Insert { .. } => DatabaseChangeType::Insert,
+        }
+    }
+}
+
+/// [DatabaseTapeOperation] extends [DatabaseTapeRowChange] by adding information about transaction boundary
+///
+/// This helps [crate::database_tape::DatabaseTapeSession] to properly maintain transaction state and COMMIT or ROLLBACK changes in appropriate time
+/// by consuming events from [crate::database_tape::DatabaseChangesIterator]
+#[derive(Debug)]
+pub enum DatabaseTapeOperation {
+    StmtReplay(DatabaseStatementReplay),
+    SchemaReplay(DatabaseSchemaReplay),
+    RowChange(DatabaseTapeRowChange),
+    Commit,
+}
+
+#[derive(Debug)]
+pub enum DatabaseSchemaReplay {
+    Create {
+        sql: String,
+    },
+    Drop {
+        kind: DatabaseSchemaKind,
+        name: String,
+    },
+    Refresh {
+        kind: DatabaseSchemaKind,
+        name: String,
+        sql: String,
+    },
+    Alter {
+        sql: String,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DatabaseSchemaKind {
+    Table,
+    Index,
+    Trigger,
+    View,
+}
+
+/// [DatabaseTapeRowChange] is the specific operation over single row which can be performed on database
+#[derive(Debug, Clone)]
+pub struct DatabaseTapeRowChange {
+    pub change_id: i64,
+    pub change_time: u64,
+    pub change: DatabaseTapeRowChangeType,
+    pub table_name: String,
+    pub id: i64,
+}
+
+impl std::fmt::Debug for DatabaseTapeRowChangeType {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Delete { before, key } => f
+                .debug_struct("Delete")
+                .field("before.len()", &before.len())
+                .field("key.len()", &key.as_ref().map(|key| key.len()))
+                .finish(),
+            Self::Update {
+                before,
+                after,
+                updates,
+            } => f
+                .debug_struct("Update")
+                .field("before.len()", &before.len())
+                .field("after.len()", &after.len())
+                .field("updates.len()", &updates.as_ref().map(|x| x.len()))
+                .finish(),
+            Self::Insert { after } => f
+                .debug_struct("Insert")
+                .field("after.len()", &after.len())
+                .finish(),
+        }
+    }
+}
+
+fn get_core_value_i64(row: &turso_core::Row, index: usize) -> Result<i64> {
+    match row.get_value(index) {
+        turso_core::Value::Numeric(turso_core::Numeric::Integer(v)) => Ok(*v),
+        v => Err(Error::DatabaseTapeError(format!(
+            "column {index} type mismatch: expected integer, got '{v:?}'"
+        ))),
+    }
+}
+
+fn get_core_value_i64_or_null(row: &turso_core::Row, index: usize) -> Result<Option<i64>> {
+    match row.get_value(index) {
+        turso_core::Value::Numeric(turso_core::Numeric::Integer(v)) => Ok(Some(*v)),
+        turso_core::Value::Null => Ok(None),
+        v => Err(Error::DatabaseTapeError(format!(
+            "column {index} type mismatch: expected integer or null, got '{v:?}'"
+        ))),
+    }
+}
+
+fn get_core_value_text(row: &turso_core::Row, index: usize) -> Result<String> {
+    match row.get_value(index) {
+        turso_core::Value::Text(x) => Ok(x.to_string()),
+        v => Err(Error::DatabaseTapeError(format!(
+            "column {index} type mismatch: expected string, got '{v:?}'"
+        ))),
+    }
+}
+
+fn get_core_value_text_or_null(row: &turso_core::Row, index: usize) -> Result<Option<String>> {
+    match row.get_value(index) {
+        turso_core::Value::Text(x) => Ok(Some(x.to_string())),
+        turso_core::Value::Null => Ok(None),
+        v => Err(Error::DatabaseTapeError(format!(
+            "column {index} type mismatch: expected string or null, got '{v:?}'"
+        ))),
+    }
+}
+
+fn get_core_value_blob_or_null(row: &turso_core::Row, index: usize) -> Result<Option<Vec<u8>>> {
+    match row.get_value(index) {
+        turso_core::Value::Null => Ok(None),
+        turso_core::Value::Blob(x) => Ok(Some(x.to_vec())),
+        v => Err(Error::DatabaseTapeError(format!(
+            "column {index} type mismatch: expected blob, got '{v:?}'"
+        ))),
+    }
+}
+
+pub enum SyncEngineIoResult {
+    // Protocol waits for some IO - caller must spin turso-db IO event loop and also drive ProtocolIO
+    IO,
+}
+
+pub fn parse_bin_record(
+    bin_record: impl AsRef<[u8]>,
+) -> Result<crate::alloc::Vec<turso_core::Value>> {
+    match turso_core::types::ImmutableRecordRef::from_bin_record(bin_record.as_ref())
+        .get_values_owned()
+    {
+        Ok(values) => Ok(values),
+        Err(err) => Err(Error::DatabaseTapeError(format!(
+            "unable to parse bin record: {err}"
+        ))),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{DatabaseMetadata, DatabaseSavedConfiguration, RemotePullProtocol};
+
+    #[test]
+    fn update_configuration_reports_change_only_when_values_differ() {
+        let mut meta = DatabaseMetadata::load(
+            br#"{
+                "version": "v1",
+                "client_unique_id": "client-a",
+                "synced_revision": null,
+                "revert_since_wal_salt": null,
+                "revert_since_wal_watermark": 0,
+                "last_pull_unix_time": null,
+                "last_push_unix_time": null,
+                "last_pushed_pull_gen_hint": 0,
+                "last_pushed_change_id_hint": 0,
+                "partial_bootstrap_server_revision": null,
+                "saved_configuration": null
+            }"#,
+        )
+        .unwrap();
+        let configuration = DatabaseSavedConfiguration {
+            remote_url: Some("http://remote".to_string()),
+            partial_sync_prefetch: Some(true),
+            partial_sync_segment_size: Some(4096),
+        };
+
+        assert!(meta.update_configuration(configuration.clone()));
+        assert_eq!(meta.saved_configuration, Some(configuration.clone()));
+
+        // Re-applying the identical configuration (what every open of an
+        // existing replica does) must not report a change, otherwise every
+        // open rewrites the metadata file.
+        assert!(!meta.update_configuration(configuration.clone()));
+
+        let updated = DatabaseSavedConfiguration {
+            remote_url: Some("http://other-remote".to_string()),
+            ..configuration
+        };
+        assert!(meta.update_configuration(updated.clone()));
+        assert_eq!(meta.saved_configuration, Some(updated));
+    }
+
+    #[test]
+    fn metadata_load_defaults_missing_logical_table_map() {
+        let meta = DatabaseMetadata::load(
+            br#"{
+                "version": "v1",
+                "client_unique_id": "client-a",
+                "synced_revision": null,
+                "revert_since_wal_salt": null,
+                "revert_since_wal_watermark": 0,
+                "last_pull_unix_time": null,
+                "last_push_unix_time": null,
+                "last_pushed_pull_gen_hint": 0,
+                "last_pushed_change_id_hint": 0,
+                "partial_bootstrap_server_revision": null,
+                "saved_configuration": null
+            }"#,
+        )
+        .unwrap();
+
+        assert_eq!(meta.last_pushed_replay_floor_change_id_hint, 0);
+        assert!(!meta.fresh_bootstrap_pending_cdc_ack);
+        assert!(!meta.logical_mvcc_pull_active());
+        assert!(meta.logical_table_names_by_stable_id.is_empty());
+    }
+
+    #[test]
+    fn metadata_load_pins_pre_protocol_replicas_with_revisions_to_pages() {
+        // A replica whose metadata predates remote_pull_protocol is a
+        // page-protocol replica by definition (MVCC logical sync never
+        // shipped without the field). Pinning it to Pages keeps existing
+        // WAL replicas on the exact same code path after upgrading.
+        let pages_meta = DatabaseMetadata::load(
+            br#"{
+                "version": "v1",
+                "client_unique_id": "client-a",
+                "synced_revision": {"type": "v1", "revision": "{\"generation\":3,\"wal_fragment_no\":7}"},
+                "revert_since_wal_salt": null,
+                "revert_since_wal_watermark": 0,
+                "last_pull_unix_time": null,
+                "last_push_unix_time": null,
+                "last_pushed_pull_gen_hint": 0,
+                "last_pushed_change_id_hint": 0,
+                "partial_bootstrap_server_revision": null,
+                "saved_configuration": null
+            }"#,
+        )
+        .unwrap();
+        assert_eq!(pages_meta.remote_pull_protocol, RemotePullProtocol::Pages);
+        assert!(!pages_meta.logical_mvcc_pull_active());
+    }
+
+    #[test]
+    fn metadata_load_keeps_unknown_protocol_for_replicas_without_revision() {
+        // Deferred-bootstrap replicas have never contacted the server; the
+        // first pull must detect the protocol instead of assuming one.
+        let meta = DatabaseMetadata::load(
+            br#"{
+                "version": "v1",
+                "client_unique_id": "client-a",
+                "synced_revision": null,
+                "revert_since_wal_salt": null,
+                "revert_since_wal_watermark": 0,
+                "last_pull_unix_time": null,
+                "last_push_unix_time": null,
+                "last_pushed_pull_gen_hint": 0,
+                "last_pushed_change_id_hint": 0,
+                "partial_bootstrap_server_revision": null,
+                "saved_configuration": null
+            }"#,
+        )
+        .unwrap();
+        assert_eq!(meta.remote_pull_protocol, RemotePullProtocol::Unknown);
+    }
+
+    #[test]
+    fn metadata_round_trips_remote_pull_protocol() {
+        let mut meta = DatabaseMetadata::load(
+            br#"{
+                "version": "v1",
+                "client_unique_id": "client-a",
+                "synced_revision": null,
+                "revert_since_wal_salt": null,
+                "revert_since_wal_watermark": 0,
+                "last_pull_unix_time": null,
+                "last_push_unix_time": null,
+                "last_pushed_pull_gen_hint": 0,
+                "last_pushed_change_id_hint": 0,
+                "partial_bootstrap_server_revision": null,
+                "saved_configuration": null
+            }"#,
+        )
+        .unwrap();
+        meta.remote_pull_protocol = RemotePullProtocol::MvccLogical;
+        let reloaded = DatabaseMetadata::load(&meta.dump().unwrap()).unwrap();
+        assert_eq!(
+            reloaded.remote_pull_protocol,
+            RemotePullProtocol::MvccLogical
+        );
+        assert!(reloaded.logical_mvcc_pull_active());
+    }
+}

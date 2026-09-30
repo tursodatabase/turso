@@ -1,0 +1,102 @@
+---
+title: REPLACE
+description: Insert a row, replacing any existing row that conflicts on a unique constraint
+sidebarTitle: REPLACE
+---
+
+# REPLACE
+
+The `REPLACE` statement inserts a row into a table. If the row violates a `UNIQUE` or `PRIMARY KEY` constraint, the existing conflicting row is deleted before the new row is inserted.
+
+## Syntax
+
+```sql
+REPLACE INTO table-name [(column-name [, column-name ...])]
+VALUES (expression [, expression ...]) [, (expression [, expression ...]) ...]
+
+REPLACE INTO table-name [(column-name [, column-name ...])]
+select-statement
+```
+
+## Description
+
+`REPLACE` is equivalent to `INSERT OR REPLACE`. When a `REPLACE` inserts a row that would violate a `UNIQUE` or `PRIMARY KEY` constraint, it deletes the existing row that causes the conflict, then inserts the new row. If no constraint violation occurs, `REPLACE` behaves identically to `INSERT`.
+
+### How REPLACE Differs from INSERT
+
+With a plain `INSERT`, a constraint violation causes the statement to fail with an error. With `REPLACE`, the conflicting row is silently deleted and the new row takes its place.
+
+Because the conflicting row is deleted first, `REPLACE` may fire `DELETE` triggers on the old row and `INSERT` triggers on the new row.
+
+<Info>
+`REPLACE` deletes the entire conflicting row and inserts a new one. This means any columns not specified in the `REPLACE` statement receive their default values, not the values from the deleted row. If you want to keep existing column values while updating specific columns, use [INSERT ... ON CONFLICT DO UPDATE](/docs/sql-reference/statements/upsert) instead.
+</Info>
+
+### Constraint Behavior
+
+When multiple `UNIQUE` constraints exist on a table, `REPLACE` deletes every row that conflicts with the new row before inserting it. This can result in more than one row being deleted by a single `REPLACE` operation.
+
+If a `NOT NULL` constraint is violated on a column that has no `DEFAULT` value, the `REPLACE` fails with an error.
+
+## Examples
+
+### Basic REPLACE
+
+```sql
+CREATE TABLE settings (key TEXT PRIMARY KEY, value TEXT);
+
+INSERT INTO settings VALUES ('theme', 'light');
+SELECT * FROM settings;
+-- theme|light
+
+-- The existing row is deleted and a new row is inserted
+REPLACE INTO settings VALUES ('theme', 'dark');
+SELECT * FROM settings;
+-- theme|dark
+```
+
+### REPLACE deletes and re-inserts
+
+Unlike `UPDATE`, `REPLACE` removes the old row entirely. Columns not specified in the statement receive their default values:
+
+```sql
+CREATE TABLE users (
+    id INTEGER PRIMARY KEY,
+    name TEXT NOT NULL,
+    email TEXT UNIQUE,
+    created_at TEXT DEFAULT (datetime('now'))
+);
+
+INSERT INTO users VALUES (1, 'Alice', 'alice@example.com', '2025-01-01');
+
+-- This deletes row with id=1 and inserts a completely new row.
+-- The created_at column gets its DEFAULT value, not '2025-01-01'.
+REPLACE INTO users (id, name, email) VALUES (1, 'Alice', 'alice@new.com');
+
+SELECT id, name, email FROM users;
+-- 1|Alice|alice@new.com
+```
+
+### Multi-row REPLACE
+
+```sql
+CREATE TABLE inventory (sku TEXT PRIMARY KEY, quantity INTEGER);
+INSERT INTO inventory VALUES ('A001', 10);
+INSERT INTO inventory VALUES ('B002', 20);
+
+REPLACE INTO inventory VALUES
+    ('A001', 15),
+    ('B002', 25),
+    ('C003', 30);
+
+SELECT * FROM inventory;
+-- A001|15
+-- B002|25
+-- C003|30
+```
+
+## See Also
+
+- [INSERT](/docs/sql-reference/statements/insert) for adding rows without conflict resolution
+- [INSERT ... ON CONFLICT](/docs/sql-reference/statements/upsert) for conditional insert-or-update with control over which columns are updated
+- [UPDATE](/docs/sql-reference/statements/update) for modifying existing rows in place

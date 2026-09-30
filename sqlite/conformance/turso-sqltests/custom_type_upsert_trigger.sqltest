@@ -1,0 +1,65 @@
+@database :memory:
+@requires-file custom_types "uses custom types"
+
+@requires strict "uses STRICT tables"
+@requires trigger "uses triggers"
+test before-update-trigger-upsert-sees-decoded-new {
+    CREATE TYPE cents BASE integer ENCODE value * 100 DECODE value / 100;
+    CREATE TABLE t1(id INTEGER PRIMARY KEY, amount cents) STRICT;
+    CREATE TABLE log(msg TEXT);
+    CREATE TRIGGER tr_before BEFORE UPDATE ON t1
+    BEGIN INSERT INTO log VALUES ('old=' || OLD.amount || ' new=' || NEW.amount); END;
+    INSERT INTO t1 VALUES (1, 10);
+    INSERT INTO t1 VALUES (1, 20) ON CONFLICT(id) DO UPDATE SET amount = excluded.amount;
+    SELECT * FROM log;
+}
+expect {
+    old=10 new=20
+}
+
+@requires strict "uses STRICT tables"
+@requires trigger "uses triggers"
+test after-update-trigger-upsert-sees-decoded-new {
+    CREATE TYPE cents BASE integer ENCODE value * 100 DECODE value / 100;
+    CREATE TABLE t1(id INTEGER PRIMARY KEY, amount cents) STRICT;
+    CREATE TABLE log(msg TEXT);
+    CREATE TRIGGER tr_after AFTER UPDATE ON t1
+    BEGIN INSERT INTO log VALUES ('old=' || OLD.amount || ' new=' || NEW.amount); END;
+    INSERT INTO t1 VALUES (1, 10);
+    INSERT INTO t1 VALUES (1, 20) ON CONFLICT(id) DO UPDATE SET amount = excluded.amount;
+    SELECT * FROM log;
+}
+expect {
+    old=10 new=20
+}
+
+@requires strict "uses STRICT tables"
+@requires trigger "uses triggers"
+test before-update-trigger-upsert-data-correct {
+    CREATE TYPE cents BASE integer ENCODE value * 100 DECODE value / 100;
+    CREATE TABLE t1(id INTEGER PRIMARY KEY, amount cents) STRICT;
+    CREATE TRIGGER tr_before BEFORE UPDATE ON t1
+    BEGIN SELECT 1; END;
+    INSERT INTO t1 VALUES (1, 10);
+    INSERT INTO t1 VALUES (1, 50) ON CONFLICT(id) DO UPDATE SET amount = excluded.amount;
+    SELECT id, amount FROM t1;
+}
+expect {
+    1|50
+}
+
+@requires strict "uses STRICT tables"
+@requires trigger "uses triggers"
+test before-update-trigger-direct-update-still-works {
+    CREATE TYPE cents BASE integer ENCODE value * 100 DECODE value / 100;
+    CREATE TABLE t1(id INTEGER PRIMARY KEY, amount cents) STRICT;
+    CREATE TABLE log(msg TEXT);
+    CREATE TRIGGER tr_before BEFORE UPDATE ON t1
+    BEGIN INSERT INTO log VALUES ('old=' || OLD.amount || ' new=' || NEW.amount); END;
+    INSERT INTO t1 VALUES (1, 10);
+    UPDATE t1 SET amount = 20 WHERE id = 1;
+    SELECT * FROM log;
+}
+expect {
+    old=10 new=20
+}

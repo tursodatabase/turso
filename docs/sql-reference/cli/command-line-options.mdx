@@ -1,0 +1,197 @@
+---
+title: Command-Line Options
+description: CLI flags, arguments, and server modes for the tursodb command
+sidebarTitle: Command-Line Options
+---
+
+# Command-Line Options
+
+```bash
+tursodb [OPTIONS] [DATABASE] [SQL]
+```
+
+## Arguments
+
+| Argument | Default | Description |
+|----------|---------|-------------|
+| `DATABASE` | `:memory:` | Path to a SQLite database file. If omitted, an in-memory database is created |
+| `SQL` | — | SQL statement to execute. If provided, the shell runs the query and exits |
+
+### Examples
+
+```bash
+# In-memory database
+tursodb
+
+# Open an existing file
+tursodb customers.db
+
+# Run a query and exit
+tursodb customers.db "SELECT count(*) FROM orders;"
+
+# Pipe SQL from stdin
+echo "SELECT 1 + 1;" | tursodb -q
+```
+
+## Options
+
+### `-m, --output-mode <MODE>`
+
+Set the output display format.
+
+| Mode | Description |
+|------|-------------|
+| `pretty` | Table with borders (default) |
+| `list` | Pipe-delimited values |
+| `line` | One column per line with column names |
+
+```bash
+tursodb -m list mydata.db "SELECT * FROM users;"
+```
+
+### `-o, --output <PATH>`
+
+Redirect query output to a file instead of stdout.
+
+```bash
+tursodb -o results.txt mydata.db "SELECT * FROM users;"
+```
+
+### `-q, --quiet`
+
+Suppress the startup banner and version information.
+
+```bash
+tursodb -q mydata.db
+```
+
+### `-e, --echo`
+
+Print each SQL statement before executing it. Useful for debugging scripts.
+
+```bash
+echo "SELECT 42;" | tursodb -q -e
+```
+
+```
+SELECT 42;
+42
+```
+
+### `-v, --vfs <VFS>`
+
+Select the Virtual File System backend.
+
+| VFS | Description |
+|-----|-------------|
+| `syscall` | Standard OS file I/O (default) |
+| `memory` | In-memory storage |
+| `io_uring` | Linux io_uring (requires feature flag) |
+
+```bash
+tursodb -v memory
+```
+
+### `-t, --tracing-output <PATH>`
+
+Write internal log traces to a file. Useful for debugging and performance analysis.
+
+```bash
+tursodb -t trace.log mydata.db
+```
+
+### `--readonly`
+
+Open the database in read-only mode. Write operations will return an error.
+
+```bash
+tursodb --readonly production.db "SELECT count(*) FROM users;"
+```
+
+Attempting to write in read-only mode:
+
+```bash
+tursodb --readonly production.db "INSERT INTO users VALUES (1, 'test');"
+# Error: Resource is read-only
+```
+
+### `--mcp`
+
+Start a Model Context Protocol server instead of the interactive shell. This allows AI assistants and other MCP clients to interact with the database via JSON-RPC.
+
+```bash
+tursodb --mcp mydata.db
+```
+
+### `--sync-server <ADDRESS>`
+
+Start a sync server for database replication, listening at the given address.
+
+```bash
+tursodb --sync-server 0.0.0.0:8080 mydata.db
+```
+
+### `--sync-dir <PATH>`
+
+Serve every database file under `PATH` over the sync server, instead of a single database. `PATH` must already exist as a directory. Requires `--sync-server`, and cannot be combined with a positional `DATABASE` argument.
+
+```bash
+tursodb --sync-server 127.0.0.1:8080 --sync-dir ./dbs
+```
+
+Each database is addressed by name in the URL, beneath `/db/{name}`:
+
+```
+http://localhost:8080/db/{name}/v2/pipeline
+http://localhost:8080/db/{name}/pull-updates
+```
+
+A request to `/db/db1` reads and writes `./dbs/db1/data`: each database gets its own directory, so its WAL and logical log stay grouped with it as `data-wal`, `data-shm`, and so on — the same layout `sqld` uses. Databases are created on first request, except under `--readonly`: a read-only server cannot create a file, so a request for a database that does not already exist fails with `404 Not Found`. Opened handles are cached for the process lifetime and never revalidated against the filesystem, so removing a database's directory is safe only while the server is stopped; deleting it while the server is running leaves that handle reading and writing the deleted files, and the server must be restarted before the name can be served correctly again.
+
+Names must match `^[a-z0-9_-]+$` and are capped at 128 characters — no uppercase, dots, slashes, or percent-encoding — and anything else is rejected with `400 Bad Request`. Names are lowercase only so that one name is one database on case-insensitive filesystems as well.
+
+`--readonly`, `--vfs`, and the `--experimental-*` flags apply to every database served this way, the same as they would for a single database.
+
+<Warning>
+Directory mode handles one request at a time across all databases, so distinct databases do not progress independently. WAL retention follows the same behavior as the single-database sync server. Opened database handles stay cached for the life of the process without eviction, and at most `--sync-max-databases` may be open at once (default 256); beyond that, a request for a database that is not already open is refused with `503 Service Unavailable` until the server restarts. Any client that can reach the port can create a database simply by requesting a new valid name, so disk space and inodes still accumulate without bound. The name restrictions above do not confine a client to the served directory: `VACUUM INTO` can write a copy to any path the server process can reach, and with `--experimental-attach` a client can `ATTACH DATABASE` an arbitrary filesystem path. There is no authentication or multi-tenancy; directory mode is intended for local and development use.
+</Warning>
+
+## Experimental Feature Flags
+
+These flags enable features that are still under development. They may change or be removed in future releases.
+
+<Warning>
+Experimental features may have incomplete implementations or known limitations. Use them for testing and development only.
+</Warning>
+
+| Flag | Description |
+|------|-------------|
+| `--experimental-views` | Enable views (`CREATE VIEW` / `CREATE MATERIALIZED VIEW`) |
+| `--experimental-custom-types` | Enable custom types (`CREATE TYPE` / `DROP TYPE` / `CREATE DOMAIN` / `DROP DOMAIN`) |
+| `--experimental-encryption` | Enable at-rest database encryption |
+| `--experimental-index-method` | Enable custom index methods. Necessary for FTS and sparse vector indexes |
+| `--experimental-autovacuum` | Enable automatic database vacuuming |
+| `--experimental-vacuum` | Enable in-place `VACUUM` |
+| `--experimental-attach` | Enable `ATTACH DATABASE` / `DETACH DATABASE` |
+| `--experimental-generated-columns` | Enable virtual `GENERATED ALWAYS AS` columns |
+| `--experimental-without-rowid` | Enable `WITHOUT ROWID` tables |
+| `--experimental-multiprocess-wal` | Enable sharing a database between processes via a shared WAL coordinator |
+| `--experimental-mvcc-passive-checkpoint` | Enable passive checkpointing under MVCC (`journal_mode=mvcc`) |
+
+<Info>
+Triggers (`CREATE TRIGGER` / `DROP TRIGGER`) are stable as of Turso 0.7 and no longer require a flag.
+</Info>
+
+```bash
+# Enable views, custom types, and in-place VACUUM
+tursodb --experimental-views --experimental-custom-types --experimental-vacuum mydata.db
+```
+
+## Other Flags
+
+| Flag | Description |
+|------|-------------|
+| `--mvcc` | Start the MVCC concurrent-transaction harness instead of the normal shell |
+| `--unsafe-testing` | Enable unsafe testing features (e.g., `sqlite_dbpage` writes) |
+| `-h, --help` | Print usage help |
+| `-V, --version` | Print version information |

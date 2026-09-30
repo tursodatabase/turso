@@ -1,0 +1,2 @@
+typing-extensions==4.12.2
+    # via pyturso (pyproject.toml)

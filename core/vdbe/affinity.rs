@@ -1,0 +1,840 @@
+use either::Either;
+use turso_parser::ast::{Expr, Literal};
+
+use crate::{
+    numeric::{format_float, DoubleDouble, Numeric},
+    types::AsValueRef,
+    Value, ValueRef,
+};
+
+/// # SQLite Column Type Affinities
+///
+/// Each column in an SQLite 3 database is assigned one of the following type affinities:
+///
+/// - **TEXT**
+/// - **NUMERIC**
+/// - **INTEGER**
+/// - **REAL**
+/// - **BLOB**
+///
+/// > **Note:** Historically, the "BLOB" type affinity was called "NONE". However, this term was renamed to avoid confusion with "no affinity".
+///
+/// ## Affinity Descriptions
+///
+/// ### **TEXT**
+/// - Stores data using the NULL, TEXT, or BLOB storage classes.
+/// - Numerical data inserted into a column with TEXT affinity is converted into text form before being stored.
+/// - **Example:**
+///   ```sql
+///   CREATE TABLE example (col TEXT);
+///   INSERT INTO example (col) VALUES (123); -- Stored as '123' (text)
+///   SELECT typeof(col) FROM example; -- Returns 'text'
+///   ```
+///
+/// ### **NUMERIC**
+/// - Can store values using all five storage classes.
+/// - Text data is converted to INTEGER or REAL (in that order of preference) if it is a well-formed integer or real literal.
+/// - If the text represents an integer too large for a 64-bit signed integer, it is converted to REAL.
+/// - If the text is not a well-formed literal, it is stored as TEXT.
+/// - Hexadecimal integer literals are stored as TEXT for historical compatibility.
+/// - Floating-point values that can be exactly represented as integers are converted to integers.
+/// - **Example:**
+///   ```sql
+///   CREATE TABLE example (col NUMERIC);
+///   INSERT INTO example (col) VALUES ('3.0e+5'); -- Stored as 300000 (integer)
+///   SELECT typeof(col) FROM example; -- Returns 'integer'
+///   ```
+///
+/// ### **INTEGER**
+/// - Behaves like NUMERIC affinity but differs in `CAST` expressions.
+/// - **Example:**
+///   ```sql
+///   CREATE TABLE example (col INTEGER);
+///   INSERT INTO example (col) VALUES (4.0); -- Stored as 4 (integer)
+///   SELECT typeof(col) FROM example; -- Returns 'integer'
+///   ```
+///
+/// ### **REAL**
+/// - Similar to NUMERIC affinity but forces integer values into floating-point representation.
+/// - **Optimization:** Small floating-point values with no fractional component may be stored as integers on disk to save space. This is invisible at the SQL level.
+/// - **Example:**
+///   ```sql
+///   CREATE TABLE example (col REAL);
+///   INSERT INTO example (col) VALUES (4); -- Stored as 4.0 (real)
+///   SELECT typeof(col) FROM example; -- Returns 'real'
+///   ```
+///
+/// ### **BLOB**
+/// - Does not prefer any storage class.
+/// - No coercion is performed between storage classes.
+/// - **Example:**
+///   ```sql
+///   CREATE TABLE example (col BLOB);
+///   INSERT INTO example (col) VALUES (x'1234'); -- Stored as a binary blob
+///   SELECT typeof(col) FROM example; -- Returns 'blob'
+///   ```
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Affinity {
+    Blob = 1,
+    Text = 2,
+    Numeric = 3,
+    Integer = 4,
+    Real = 5,
+    None = 6,
+}
+
+pub const SQLITE_AFF_NONE: char = '@';
+pub const SQLITE_AFF_BLOB: char = 'A';
+pub const SQLITE_AFF_TEXT: char = 'B';
+pub const SQLITE_AFF_NUMERIC: char = 'C';
+pub const SQLITE_AFF_INTEGER: char = 'D';
+pub const SQLITE_AFF_REAL: char = 'E';
+
+impl Affinity {
+    pub fn from_repr(repr: u32) -> Option<Self> {
+        match repr {
+            1 => Some(Affinity::Blob),
+            2 => Some(Affinity::Text),
+            3 => Some(Affinity::Numeric),
+            4 => Some(Affinity::Integer),
+            5 => Some(Affinity::Real),
+            6 => Some(Affinity::None),
+            _ => None,
+        }
+    }
+
+    /// This is meant to be used in opcodes like Eq, which state:
+    ///
+    /// "The SQLITE_AFF_MASK portion of P5 must be an affinity character - SQLITE_AFF_TEXT, SQLITE_AFF_INTEGER, and so forth.
+    /// An attempt is made to coerce both inputs according to this affinity before the comparison is made.
+    /// If the SQLITE_AFF_MASK is 0x00, then numeric affinity is used.
+    /// Note that the affinity conversions are stored back into the input registers P1 and P3.
+    /// So this opcode can cause persistent changes to registers P1 and P3.""
+    pub fn aff_mask(&self) -> char {
+        match self {
+            Affinity::Integer => SQLITE_AFF_INTEGER,
+            Affinity::Text => SQLITE_AFF_TEXT,
+            Affinity::Blob => SQLITE_AFF_BLOB,
+            Affinity::Real => SQLITE_AFF_REAL,
+            Affinity::Numeric => SQLITE_AFF_NUMERIC,
+            Affinity::None => SQLITE_AFF_NONE,
+        }
+    }
+
+    pub fn from_char(char: char) -> Self {
+        match char {
+            SQLITE_AFF_INTEGER => Affinity::Integer,
+            SQLITE_AFF_TEXT => Affinity::Text,
+            SQLITE_AFF_BLOB => Affinity::Blob,
+            SQLITE_AFF_REAL => Affinity::Real,
+            SQLITE_AFF_NUMERIC => Affinity::Numeric,
+            _ => Affinity::Blob,
+        }
+    }
+
+    pub fn as_char_code(&self) -> u8 {
+        self.aff_mask() as u8
+    }
+
+    pub fn from_char_code(code: u8) -> Self {
+        Self::from_char(code as char)
+    }
+
+    /// Convert affinity to the corresponding Type enum
+    pub fn to_type(self) -> crate::schema::Type {
+        use crate::schema::Type;
+        match self {
+            Affinity::Blob | Affinity::None => Type::Blob,
+            Affinity::Text => Type::Text,
+            Affinity::Numeric => Type::Numeric,
+            Affinity::Integer => Type::Integer,
+            Affinity::Real => Type::Real,
+        }
+    }
+
+    pub fn is_numeric(&self) -> bool {
+        matches!(self, Affinity::Integer | Affinity::Real | Affinity::Numeric)
+    }
+
+    /// Loosely matches SQLite's `azType[]` in `createTableStmt()` (`build.c`).
+    /// Returns an empty string for BLOB and NONE affinity (no declared type).
+    pub fn short_type_name(&self) -> &'static str {
+        match self {
+            Affinity::Blob | Affinity::None => "",
+            Affinity::Text => "TEXT",
+            Affinity::Numeric => "NUM",
+            Affinity::Integer => "INT",
+            Affinity::Real => "REAL",
+        }
+    }
+
+    /// 3.1. Determination Of Column Affinity
+    /// For tables not declared as STRICT, the affinity of a column is determined by the declared type of the column, according to the following rules in the order shown:
+    ///
+    /// If the declared type contains the string "INT" then it is assigned INTEGER affinity.
+    ///
+    /// If the declared type of the column contains any of the strings "CHAR", "CLOB", or "TEXT" then that column has TEXT affinity. Notice that the type VARCHAR contains the string "CHAR" and is thus assigned TEXT affinity.
+    ///
+    /// If the declared type for a column contains the string "BLOB" or if no type is specified then the column has affinity BLOB.
+    ///
+    /// If the declared type for a column contains any of the strings "REAL", "FLOA", or "DOUB" then the column has REAL affinity.
+    ///
+    /// Otherwise, the affinity is NUMERIC.
+    ///
+    /// Note that the order of the rules for determining column affinity is important. A column whose declared type is "CHARINT" will match both rules 1 and 2 but the first rule takes precedence and so the column affinity will be INTEGER.
+    #[expect(clippy::self_named_constructors)]
+    pub fn affinity(datatype: &str) -> Self {
+        let datatype = datatype.to_ascii_uppercase();
+
+        // Rule 1: INT -> INTEGER affinity
+        if datatype.contains("INT") {
+            return Affinity::Integer;
+        }
+
+        // Rule 2: CHAR/CLOB/TEXT -> TEXT affinity
+        if datatype.contains("CHAR") || datatype.contains("CLOB") || datatype.contains("TEXT") {
+            return Affinity::Text;
+        }
+
+        // Rule 3: BLOB or empty -> BLOB affinity (historically called NONE)
+        if datatype.contains("BLOB") || datatype.is_empty() {
+            return Affinity::Blob;
+        }
+
+        // Rule 4: REAL/FLOA/DOUB -> REAL affinity
+        if datatype.contains("REAL") || datatype.contains("FLOA") || datatype.contains("DOUB") {
+            return Affinity::Real;
+        }
+
+        // Rule 5: Otherwise -> NUMERIC affinity
+        Affinity::Numeric
+    }
+
+    pub fn convert<'a>(&self, val: &'a impl AsValueRef) -> Option<Either<ValueRef<'a>, Value>> {
+        let val = val.as_value_ref();
+        let is_text = matches!(val, ValueRef::Text(_));
+        // Apply affinity conversions
+        match self {
+            Affinity::Numeric | Affinity::Integer => is_text
+                .then(|| apply_numeric_affinity(val, false))
+                .flatten()
+                .map(Either::Left),
+
+            Affinity::Text => {
+                // TEXT affinity: Convert numeric values to their text representation
+                match val {
+                    ValueRef::Numeric(Numeric::Integer(i)) => {
+                        Some(Either::Right(Value::Text(i.to_string().into())))
+                    }
+                    ValueRef::Numeric(Numeric::Float(f)) => Some(Either::Right(Value::Text(
+                        format_float(f64::from(f)).into(),
+                    ))),
+                    ValueRef::Text(_) => {
+                        // If it's already text but looks numeric, ensure it's in canonical text form
+                        if is_numeric_value(val) {
+                            stringify_register(val).map(Either::Right)
+                        } else {
+                            None // Already text, no conversion needed
+                        }
+                    }
+                    _ => None, // Blob and Null are not converted
+                }
+            }
+
+            Affinity::Real => {
+                let mut left = is_text
+                    .then(|| apply_numeric_affinity(val, false))
+                    .flatten();
+
+                if let ValueRef::Numeric(Numeric::Integer(i)) = left.unwrap_or(val) {
+                    left = Some(ValueRef::from_f64(i as f64));
+                }
+
+                left.map(Either::Left)
+            }
+
+            Affinity::Blob | Affinity::None => None, // Do nothing for blob affinity.
+        }
+    }
+
+    /// Like [`Self::convert`] but for the value-pre-conversion that comparison
+    /// opcodes apply via the affinity flag in `OP_Eq` and friends.
+    ///
+    /// Storage and default-value paths use [`Self::convert`], which forces
+    /// `Numeric::Integer` operands into `Numeric::Float` for `Affinity::Real`.
+    /// That's correct for *storing* into a REAL column, but would silently
+    /// lose precision when used to compare a REAL column against a 64-bit
+    /// integer literal: `i as f64` rounds the integer onto the nearest
+    /// representable double, which can collapse to the same double as the
+    /// column's value even when the underlying integer is distinct.
+    ///
+    /// SQLite avoids this by only applying numeric affinity to TEXT operands
+    /// in `OP_Eq` (see `applyNumericAffinity` in `vdbeaux.c`); int-vs-real
+    /// comparisons fall through to `sqlite3IntFloatCompare`, which keeps the
+    /// integer at full 64-bit precision.
+    pub fn convert_for_compare<'a>(
+        &self,
+        val: &'a impl AsValueRef,
+    ) -> Option<Either<ValueRef<'a>, Value>> {
+        let val_ref = val.as_value_ref();
+        let is_text = matches!(val_ref, ValueRef::Text(_));
+        match self {
+            Affinity::Numeric | Affinity::Integer | Affinity::Real => is_text
+                .then(|| apply_numeric_affinity(val_ref, false))
+                .flatten()
+                .map(Either::Left),
+            Affinity::Text => self.convert(val),
+            Affinity::Blob | Affinity::None => None,
+        }
+    }
+
+    /// Can an index column with `self` affinity drive a seek for a
+    /// comparison whose resolved affinity is `comparison_aff`?
+    ///
+    /// Port of SQLite's `sqlite3IndexAffinityOk` (src/expr.c).
+    /// The basic idea is: an index can be used if probing it would
+    /// produce the same result as a scan + WHERE filter.
+    ///
+    /// - `Blob`: e.g. `x IS NULL`. No coercion either way. Any index OK.
+    /// - `Text`: e.g. `WHERE txt = 5` (txt TEXT). WHERE coerces `5` to
+    ///   `'5'`. Only a TEXT index's keys are stored as text, so it can
+    ///   match `'5'` directly.
+    /// - `Numeric`: e.g. `WHERE l.txt = r.flag` (l.txt TEXT, r.flag
+    ///   INTEGER). WHERE NUMERIC-coerces both sides: `'6'` → 6, 6 = 6,
+    ///   match. A TEXT-index seek would probe stored text `'6'` with
+    ///   integer 6, but the b-tree comparator orders every integer
+    ///   below every text (INTEGER < TEXT) and finds nothing — opposite
+    ///   answer from the scan. Only a numeric-affinity index is safe.
+    pub fn index_affinity_ok(self, comparison_aff: Affinity) -> bool {
+        match comparison_aff {
+            Affinity::Blob | Affinity::None => true,
+            Affinity::Text => matches!(self, Affinity::Text),
+            Affinity::Numeric | Affinity::Integer | Affinity::Real => self.is_numeric(),
+        }
+    }
+
+    /// Return TRUE if the given expression is a constant which would be
+    /// unchanged by OP_Affinity with the affinity given in the second
+    /// argument.
+    ///
+    /// This routine is used to determine if the OP_Affinity operation
+    /// can be omitted.  When in doubt return FALSE.  A false negative
+    /// is harmless.  A false positive, however, can result in the wrong
+    /// answer.
+    ///
+    /// reference https://github.com/sqlite/sqlite/blob/master/src/expr.c#L3000
+    pub fn expr_needs_no_affinity_change(&self, expr: &Expr) -> bool {
+        if matches!(self, Affinity::Blob | Affinity::None) {
+            return true;
+        }
+        // TODO: check for unary minus in the expr, as it may be an additional optimization.
+        // This involves mostly likely walking the expression
+        match expr {
+            Expr::Literal(literal) => match literal {
+                Literal::Numeric(_) => self.is_numeric(),
+                Literal::String(_) => matches!(self, Affinity::Text),
+                Literal::Blob(_) => true,
+                _ => false,
+            },
+            Expr::Column {
+                is_rowid_alias: true,
+                ..
+            } => self.is_numeric(),
+            _ => false,
+        }
+    }
+}
+
+#[derive(Debug, PartialEq)]
+pub enum NumericParseResult {
+    NotNumeric,      // not a valid number
+    PureInteger,     // pure integer (entire string)
+    HasDecimalOrExp, // has decimal point or exponent (entire string)
+    ValidPrefixOnly, // valid prefix but not entire string
+}
+
+#[derive(Debug)]
+pub enum ParsedNumber {
+    None,
+    Integer(i64),
+    Float(f64),
+}
+
+impl ParsedNumber {
+    fn as_integer(&self) -> Option<i64> {
+        match self {
+            ParsedNumber::Integer(i) => Some(*i),
+            _ => None,
+        }
+    }
+
+    fn as_float(&self) -> Option<f64> {
+        match self {
+            ParsedNumber::Float(f) => Some(*f),
+            _ => None,
+        }
+    }
+}
+
+pub fn try_for_float(bytes: &[u8]) -> (NumericParseResult, ParsedNumber) {
+    if bytes.is_empty() {
+        return (NumericParseResult::NotNumeric, ParsedNumber::None);
+    }
+
+    let mut pos = 0;
+    let len = bytes.len();
+
+    while pos < len && is_space(bytes[pos]) {
+        pos += 1;
+    }
+
+    if pos >= len {
+        return (NumericParseResult::NotNumeric, ParsedNumber::None);
+    }
+
+    let mut sign = 1i64;
+
+    if bytes[pos] == b'-' {
+        sign = -1;
+        pos += 1;
+    } else if bytes[pos] == b'+' {
+        pos += 1;
+    }
+
+    if pos >= len {
+        return (NumericParseResult::NotNumeric, ParsedNumber::None);
+    }
+
+    let mut significand = 0u64;
+    let mut decimal_adjust = 0i32;
+    let mut has_digits = false;
+
+    // Parse digits before decimal point
+    while pos < len && bytes[pos].is_ascii_digit() {
+        has_digits = true;
+        let digit = (bytes[pos] - b'0') as u64;
+
+        if significand <= (u64::MAX - 9) / 10 {
+            significand = significand * 10 + digit;
+        } else {
+            // Skip overflow digits but adjust exponent
+            decimal_adjust += 1;
+        }
+        pos += 1;
+    }
+
+    let mut has_decimal = false;
+    let mut has_exponent = false;
+
+    // Check for decimal point
+    if pos < len && bytes[pos] == b'.' {
+        has_decimal = true;
+        pos += 1;
+
+        // Parse fractional digits
+        while pos < len && bytes[pos].is_ascii_digit() {
+            has_digits = true;
+            let digit = (bytes[pos] - b'0') as u64;
+
+            if significand <= (u64::MAX - 9) / 10 {
+                significand = significand * 10 + digit;
+                decimal_adjust -= 1;
+            }
+            pos += 1;
+        }
+    }
+
+    if !has_digits {
+        return (NumericParseResult::NotNumeric, ParsedNumber::None);
+    }
+
+    // Check for exponent
+    let mut exponent = 0i32;
+    if pos < len && (bytes[pos] == b'e' || bytes[pos] == b'E') {
+        has_exponent = true;
+        pos += 1;
+
+        if pos >= len {
+            // Incomplete exponent, but we have valid digits before
+            return create_result_from_significand(
+                significand,
+                sign,
+                decimal_adjust,
+                has_decimal,
+                has_exponent,
+                NumericParseResult::ValidPrefixOnly,
+            );
+        }
+
+        let mut exp_sign = 1i32;
+        if bytes[pos] == b'-' {
+            exp_sign = -1;
+            pos += 1;
+        } else if bytes[pos] == b'+' {
+            pos += 1;
+        }
+
+        if pos >= len || !bytes[pos].is_ascii_digit() {
+            // Incomplete exponent
+            return create_result_from_significand(
+                significand,
+                sign,
+                decimal_adjust,
+                has_decimal,
+                false,
+                NumericParseResult::ValidPrefixOnly,
+            );
+        }
+
+        // Parse exponent digits
+        while pos < len && bytes[pos].is_ascii_digit() {
+            let digit = (bytes[pos] - b'0') as i32;
+            if exponent < 10000 {
+                exponent = exponent * 10 + digit;
+            } else {
+                exponent = 10000; // Cap at large value
+            }
+            pos += 1;
+        }
+        exponent *= exp_sign;
+    }
+
+    // Skip trailing whitespace
+    while pos < len && is_space(bytes[pos]) {
+        pos += 1;
+    }
+
+    // Determine if we consumed the entire string
+    let consumed_all = pos >= len;
+    let final_exponent = decimal_adjust + exponent;
+
+    let parse_result = if !consumed_all {
+        NumericParseResult::ValidPrefixOnly
+    } else if has_decimal || has_exponent {
+        NumericParseResult::HasDecimalOrExp
+    } else {
+        NumericParseResult::PureInteger
+    };
+
+    create_result_from_significand(
+        significand,
+        sign,
+        final_exponent,
+        has_decimal,
+        has_exponent,
+        parse_result,
+    )
+}
+
+fn create_result_from_significand(
+    significand: u64,
+    sign: i64,
+    exponent: i32,
+    has_decimal: bool,
+    has_exponent: bool,
+    parse_result: NumericParseResult,
+) -> (NumericParseResult, ParsedNumber) {
+    if significand == 0 {
+        match parse_result {
+            NumericParseResult::PureInteger => {
+                return (parse_result, ParsedNumber::Integer(0));
+            }
+            _ => {
+                return (parse_result, ParsedNumber::Float(0.0));
+            }
+        }
+    }
+
+    // For pure integers without exponent, try to return as integer.
+    // The digits were accumulated as an unsigned magnitude, so the limit is
+    // sign-dependent: a negative number may reach |i64::MIN| == i64::MAX + 1.
+    // This mirrors sqlite3Atoi64, which compares against "9223372036854775807"
+    // for positives and "9223372036854775808" for negatives.
+    let magnitude_limit = if sign < 0 {
+        i64::MAX as u64 + 1
+    } else {
+        i64::MAX as u64
+    };
+    if !has_decimal && !has_exponent && exponent == 0 && significand <= magnitude_limit {
+        let signed_val = (significand as i64).wrapping_mul(sign);
+        return (parse_result, ParsedNumber::Integer(signed_val));
+    }
+
+    // Convert to float using Dekker double-double arithmetic for precision
+    // This matches SQLite's sqlite3AtoF implementation
+    let mut result = DoubleDouble::from(significand);
+
+    let mut exp = exponent;
+    match exp.cmp(&0) {
+        std::cmp::Ordering::Greater => {
+            while exp >= 100 {
+                result *= DoubleDouble::E100;
+                exp -= 100;
+            }
+            while exp >= 10 {
+                result *= DoubleDouble::E10;
+                exp -= 10;
+            }
+            while exp >= 1 {
+                result *= DoubleDouble::E1;
+                exp -= 1;
+            }
+        }
+        std::cmp::Ordering::Less => {
+            while exp <= -100 {
+                result *= DoubleDouble::NEG_E100;
+                exp += 100;
+            }
+            while exp <= -10 {
+                result *= DoubleDouble::NEG_E10;
+                exp += 10;
+            }
+            while exp <= -1 {
+                result *= DoubleDouble::NEG_E1;
+                exp += 1;
+            }
+        }
+        std::cmp::Ordering::Equal => {}
+    }
+
+    let mut final_result: f64 = result.into();
+    if final_result.is_nan() {
+        final_result = f64::INFINITY;
+    }
+    if sign < 0 {
+        final_result = -final_result;
+    }
+
+    (parse_result, ParsedNumber::Float(final_result))
+}
+
+pub fn is_space(byte: u8) -> bool {
+    // Matches SQLite's ctype table (0x09-0x0D, 0x20), which includes 0x0B
+    // (vertical tab) unlike Rust's is_ascii_whitespace().
+    matches!(byte, b' ' | b'\t' | b'\n' | b'\x0b' | b'\x0c' | b'\r')
+}
+
+pub(crate) fn real_to_i64(r: f64) -> i64 {
+    if r < -9223372036854774784.0 {
+        i64::MIN
+    } else if r > 9223372036854774784.0 {
+        i64::MAX
+    } else {
+        r as i64
+    }
+}
+
+fn apply_integer_affinity(val: ValueRef) -> Option<ValueRef> {
+    let ValueRef::Numeric(Numeric::Float(nn)) = val else {
+        return None;
+    };
+
+    let f: f64 = nn.into();
+    let ix = real_to_i64(f);
+
+    // Only convert if round-trip is exact and not at extreme values
+    if f == (ix as f64) && ix > i64::MIN && ix < i64::MAX {
+        Some(ValueRef::Numeric(Numeric::Integer(ix)))
+    } else {
+        None
+    }
+}
+
+/// Try to convert a value into a numeric representation if we can
+/// do so without loss of information. In other words, if the string
+/// looks like a number, convert it into a number. If it does not
+/// look like a number, leave it alone.
+pub fn apply_numeric_affinity(val: ValueRef, try_for_int: bool) -> Option<ValueRef> {
+    let ValueRef::Text(text) = val else {
+        return None; // Only apply to text values
+    };
+
+    let text_str = text.as_str();
+    let (parse_result, parsed_value) = try_for_float(text_str.as_bytes());
+
+    // Only convert if we have a complete valid number (not just a prefix)
+    match parse_result {
+        NumericParseResult::NotNumeric | NumericParseResult::ValidPrefixOnly => {
+            None // Leave as text
+        }
+        NumericParseResult::PureInteger => {
+            if let Some(int_val) = parsed_value.as_integer() {
+                Some(ValueRef::Numeric(Numeric::Integer(int_val)))
+            } else if let Some(float_val) = parsed_value.as_float() {
+                let res = ValueRef::from_f64(float_val);
+                if try_for_int {
+                    apply_integer_affinity(res)
+                } else {
+                    Some(res)
+                }
+            } else {
+                None
+            }
+        }
+        NumericParseResult::HasDecimalOrExp => {
+            if let Some(float_val) = parsed_value.as_float() {
+                // Failed parses can occasionally surface as NaN. Treat those as
+                // non-convertible so we keep the original text value instead of
+                // coercing to NULL during comparison affinity conversion.
+                if float_val.is_nan() {
+                    return None;
+                }
+
+                let res = ValueRef::from_f64(float_val);
+                // If try_for_int is true, try to convert float to int if exact
+                if try_for_int {
+                    apply_integer_affinity(res)
+                } else {
+                    Some(res)
+                }
+            } else {
+                None
+            }
+        }
+    }
+}
+
+fn is_numeric_value(val: ValueRef) -> bool {
+    matches!(val, ValueRef::Numeric(_))
+}
+
+fn stringify_register(val: ValueRef) -> Option<Value> {
+    match val {
+        ValueRef::Numeric(Numeric::Integer(i)) => Some(Value::build_text(i.to_string())),
+        ValueRef::Numeric(Numeric::Float(f)) => Some(Value::build_text(f64::from(f).to_string())),
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_apply_numeric_affinity_partial_numbers() {
+        let val = Value::Text("123abc".into());
+        let res = apply_numeric_affinity(val.as_value_ref(), false);
+        assert!(res.is_none());
+
+        let val = Value::Text("-53093015420544-15062897".into());
+        let res = apply_numeric_affinity(val.as_value_ref(), false);
+        assert!(res.is_none());
+
+        let val = Value::Text("123.45xyz".into());
+        let res = apply_numeric_affinity(val.as_value_ref(), false);
+        assert!(res.is_none());
+    }
+
+    #[test]
+    fn test_apply_numeric_affinity_complete_numbers() {
+        let val = Value::Text("123".into());
+        let res = apply_numeric_affinity(val.as_value_ref(), false);
+        assert_eq!(res, Some(ValueRef::Numeric(Numeric::Integer(123))));
+
+        let val = Value::Text("123.45".into());
+        let res = apply_numeric_affinity(val.as_value_ref(), false);
+        assert_eq!(res, Some(ValueRef::from_f64(123.45)));
+
+        let val = Value::Text("  -456  ".into());
+        let res = apply_numeric_affinity(val.as_value_ref(), false);
+        assert_eq!(res, Some(ValueRef::Numeric(Numeric::Integer(-456))));
+
+        let val = Value::Text("0".into());
+        let res = apply_numeric_affinity(val.as_value_ref(), false);
+        assert_eq!(res, Some(ValueRef::Numeric(Numeric::Integer(0))));
+    }
+
+    #[test]
+    fn test_apply_numeric_affinity_vertical_tab() {
+        // vertical tab (0x0B) is whitespace to SQLite, unlike Rust's
+        // is_ascii_whitespace(). https://github.com/tursodatabase/turso/issues/8454
+        let val = Value::Text("\x0b12".into());
+        let res = apply_numeric_affinity(val.as_value_ref(), false);
+        assert_eq!(res, Some(ValueRef::Numeric(Numeric::Integer(12))));
+
+        let val = Value::Text("12\x0b".into());
+        let res = apply_numeric_affinity(val.as_value_ref(), false);
+        assert_eq!(res, Some(ValueRef::Numeric(Numeric::Integer(12))));
+    }
+
+    #[test]
+    fn test_apply_numeric_affinity_extreme_exponent_gives_infinity() {
+        let val = Value::Text("3139353734372E383932303939343135".into());
+        let res = apply_numeric_affinity(val.as_value_ref(), false);
+        assert!(res.is_some());
+        match res.unwrap() {
+            ValueRef::Numeric(Numeric::Float(f)) => assert!(f64::from(f).is_infinite()),
+            other => panic!("expected Float, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_try_for_float_precision() {
+        // This test verifies that try_for_float uses high-precision arithmetic
+        // to avoid rounding errors when computing significand * 10^exponent.
+        // Naive f64 multiplication accumulates errors; Dekker double-double fixes this.
+        let (_, parsed) = try_for_float(b"12345678901234567e-5");
+        let expected: f64 = "12345678901234567e-5".parse().unwrap();
+        assert_eq!(
+            parsed.as_float().unwrap().to_bits(),
+            expected.to_bits(),
+            "try_for_float precision mismatch: got {}, expected {expected}",
+            parsed.as_float().unwrap(),
+        );
+    }
+
+    #[test]
+    fn test_try_for_float_i64_min_is_integer() {
+        // |i64::MIN| is one past i64::MAX, so the integer range check has to be
+        // sign-dependent the way sqlite3Atoi64 is.
+        let (res, parsed) = try_for_float(b"-9223372036854775808");
+        assert_eq!(res, NumericParseResult::PureInteger);
+        assert_eq!(parsed.as_integer(), Some(i64::MIN));
+
+        let (res, parsed) = try_for_float(b"  -9223372036854775808  ");
+        assert_eq!(res, NumericParseResult::PureInteger);
+        assert_eq!(parsed.as_integer(), Some(i64::MIN));
+
+        let (res, parsed) = try_for_float(b"-009223372036854775808");
+        assert_eq!(res, NumericParseResult::PureInteger);
+        assert_eq!(parsed.as_integer(), Some(i64::MIN));
+
+        // One past the negative limit, and the positive twin, stay floats.
+        let (_, parsed) = try_for_float(b"-9223372036854775809");
+        assert_eq!(parsed.as_integer(), None);
+        let (_, parsed) = try_for_float(b"9223372036854775808");
+        assert_eq!(parsed.as_integer(), None);
+
+        // The limits that already worked must keep working.
+        let (_, parsed) = try_for_float(b"-9223372036854775807");
+        assert_eq!(parsed.as_integer(), Some(-i64::MAX));
+        let (_, parsed) = try_for_float(b"9223372036854775807");
+        assert_eq!(parsed.as_integer(), Some(i64::MAX));
+
+        // The magnitude is only integral when it is a bare integer.
+        let (_, parsed) = try_for_float(b"-9223372036854775808.0");
+        assert_eq!(parsed.as_integer(), None);
+        let (_, parsed) = try_for_float(b"-9.223372036854775808e18");
+        assert_eq!(parsed.as_integer(), None);
+    }
+
+    #[test]
+    fn affinity_repr_round_trips() {
+        for affinity in [
+            Affinity::Blob,
+            Affinity::Text,
+            Affinity::Numeric,
+            Affinity::Integer,
+            Affinity::Real,
+            Affinity::None,
+        ] {
+            assert_eq!(
+                Affinity::from_repr(affinity as u32),
+                Some(affinity),
+                "{affinity:?} did not round trip",
+            );
+        }
+
+        assert_eq!(Affinity::from_repr(0), None);
+    }
+}

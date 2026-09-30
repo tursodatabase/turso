@@ -1,0 +1,1926 @@
+#![cfg_attr(nightly, feature(allocator_api))]
+
+/// Whopper is a deterministic simulator for testing the Turso database.
+use rand::{Rng, RngCore, SeedableRng};
+use rand_chacha::ChaCha8Rng;
+use sql_generation::{
+    generation::Opts,
+    model::{
+        query::{create::Create, create_index::CreateIndex},
+        table::{Column, ColumnType, Index, Table},
+    },
+};
+use std::cell::RefCell;
+use std::collections::{BTreeMap, HashMap};
+use std::fmt::Write;
+use std::ops::Bound;
+use std::sync::Arc;
+use tracing::{debug, error, trace};
+use turso_core::SqliteDialect;
+#[cfg(target_os = "windows")]
+use turso_core::WindowsIOCP;
+use turso_core::schema::SEQ_BACKING_TABLE_PREFIX;
+use turso_core::{
+    CheckpointMode, CipherMode, Connection, Database, DatabaseOpts, EncryptionOpts, IO, LimboError,
+    OpenFlags, Statement, Value,
+};
+use turso_parser::ast::{ColumnConstraint, SortOrder};
+
+mod allocation_fault;
+pub mod chaotic_btree;
+pub mod chaotic_elle;
+pub mod elle;
+pub mod error_handling;
+mod io;
+#[cfg(all(any(unix, target_os = "windows"), target_pointer_width = "64"))]
+pub mod multiprocess;
+pub mod operations;
+pub mod properties;
+#[cfg(all(any(unix, target_os = "windows"), target_pointer_width = "64"))]
+pub mod protocol;
+#[cfg(all(any(unix, target_os = "windows"), target_pointer_width = "64"))]
+pub mod worker;
+pub mod workloads;
+mod yield_injection;
+
+use crate::{
+    allocation_fault::{
+        AllocationFaultConfig, AllocationFaultContext, SimulatorAllocationFaultInjector,
+        install_global_allocation_fault_backend,
+    },
+    chaotic_elle::{ChaoticWorkload, ChaoticWorkloadProfile},
+    io::FILE_SIZE_SOFT_LIMIT,
+    properties::Property,
+    workloads::{Workload, WorkloadContext},
+};
+
+#[cfg(all(any(unix, target_os = "windows"), target_pointer_width = "64"))]
+pub fn multiprocess_platform_io() -> anyhow::Result<Arc<dyn IO>> {
+    #[cfg(target_os = "windows")]
+    {
+        return Ok(Arc::new(WindowsIOCP::new()?));
+    }
+
+    #[cfg(unix)]
+    {
+        Ok(Arc::new(turso_core::PlatformIO::new()?))
+    }
+}
+pub use io::{IOFaultConfig, SimulatorIO};
+pub use operations::{FiberState, OpContext, OpResult, Operation, TxMode};
+use yield_injection::{SimulatorYieldInjector, fiber_yield_seed};
+
+struct InstalledYieldInjector<'a> {
+    connection: &'a Arc<Connection>,
+}
+
+impl Drop for InstalledYieldInjector<'_> {
+    fn drop(&mut self) {
+        self.connection.set_yield_injector(None);
+    }
+}
+
+fn step_stmt_with_injected_yield(
+    connection: &Arc<Connection>,
+    yield_injector: Arc<SimulatorYieldInjector>,
+    stmt: &mut Statement,
+) -> turso_core::Result<turso_core::StepResult> {
+    connection.set_yield_injector(Some(yield_injector));
+    let _guard = InstalledYieldInjector { connection };
+    stmt.step()
+}
+
+fn step_stmt_with_injections(
+    connection: &Arc<Connection>,
+    yield_injector: Arc<SimulatorYieldInjector>,
+    allocation_fault_injector: Option<&'static SimulatorAllocationFaultInjector>,
+    allocation_fault_context: AllocationFaultContext,
+    stmt: &mut Statement,
+) -> turso_core::Result<turso_core::StepResult> {
+    let _allocation_fault_guard =
+        allocation_fault_injector.map(|injector| injector.enter_context(allocation_fault_context));
+    step_stmt_with_injected_yield(connection, yield_injector, stmt)
+}
+
+/// A bounded container for sampling values with reservoir sampling.
+#[derive(Debug, Clone)]
+pub struct SamplesContainer<T> {
+    samples: Vec<T>,
+    capacity: usize,
+    /// Counter for reservoir sampling
+    total_added: usize,
+}
+
+impl<T> SamplesContainer<T> {
+    pub fn new(capacity: usize) -> Self {
+        Self {
+            samples: Vec::with_capacity(capacity),
+            capacity,
+            total_added: 0,
+        }
+    }
+
+    /// Add a sample. Uses reservoir sampling to maintain bounded memory.
+    pub fn add(&mut self, value: T, rng: &mut ChaCha8Rng) {
+        self.total_added += 1;
+        if self.samples.len() < self.capacity {
+            self.samples.push(value);
+        } else {
+            // Reservoir sampling: replace with probability capacity/total_added
+            let idx = rng.random_range(0..self.total_added);
+            if idx < self.capacity {
+                self.samples[idx] = value;
+            }
+        }
+    }
+
+    /// Pick a random sample, if any exist.
+    pub fn pick(&self, rng: &mut ChaCha8Rng) -> Option<&T> {
+        if self.samples.is_empty() {
+            None
+        } else {
+            Some(&self.samples[rng.random_range(0..self.samples.len())])
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        self.samples.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.samples.is_empty()
+    }
+}
+
+/// A map backed by BTree that supports merge operations with tombstones.
+/// Tombstones mark deleted keys and are propagated during merge.
+#[derive(Debug, Clone)]
+pub struct MergableMap<K: Ord + Clone, V: Clone> {
+    /// None value represents a tombstone (deleted key)
+    data: BTreeMap<K, Option<V>>,
+}
+
+impl<K: Ord + Clone, V: Clone> Default for MergableMap<K, V> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl<K: Ord + Clone, V: Clone> MergableMap<K, V> {
+    pub fn new() -> Self {
+        Self {
+            data: BTreeMap::new(),
+        }
+    }
+
+    /// Get a value by key. Returns None if key doesn't exist or is tombstoned.
+    pub fn get(&self, key: &K) -> Option<&V> {
+        self.data.get(key).and_then(|v| v.as_ref())
+    }
+
+    /// Insert a value. Removes any existing tombstone.
+    pub fn insert(&mut self, key: K, value: V) {
+        self.data.insert(key, Some(value));
+    }
+
+    /// Remove a key by inserting a tombstone.
+    pub fn remove(&mut self, key: &K) {
+        self.data.insert(key.clone(), None);
+    }
+
+    /// Check if a key exists (not tombstoned).
+    pub fn contains_key(&self, key: &K) -> bool {
+        self.data.get(key).is_some_and(|v| v.is_some())
+    }
+
+    /// Pick a random key-value pair within the given bounds.
+    /// Returns None if no live entries exist in the range.
+    pub fn pick_range(
+        &self,
+        lower: Bound<&K>,
+        upper: Bound<&K>,
+        rng: &mut ChaCha8Rng,
+    ) -> Option<(&K, &V)> {
+        let live_entries: Vec<_> = self
+            .data
+            .range((lower, upper))
+            .filter_map(|(k, v)| v.as_ref().map(|val| (k, val)))
+            .collect();
+
+        if live_entries.is_empty() {
+            None
+        } else {
+            let idx = rng.random_range(0..live_entries.len());
+            Some(live_entries[idx])
+        }
+    }
+
+    /// Pick a random key-value pair from the entire map.
+    pub fn pick(&self, rng: &mut ChaCha8Rng) -> Option<(&K, &V)> {
+        self.pick_range(Bound::Unbounded, Bound::Unbounded, rng)
+    }
+
+    /// Merge another map into this one.
+    /// Values from `other` overwrite values in `self`.
+    /// Tombstones from `other` are copied to `self`.
+    pub fn merge(&mut self, other: &Self) {
+        for (key, value) in &other.data {
+            self.data.insert(key.clone(), value.clone());
+        }
+    }
+
+    /// Get the number of live (non-tombstoned) entries.
+    pub fn len(&self) -> usize {
+        self.data.values().filter(|v| v.is_some()).count()
+    }
+
+    /// Check if the map has no live entries.
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Iterate over live entries.
+    pub fn iter(&self) -> impl Iterator<Item = (&K, &V)> {
+        self.data
+            .iter()
+            .filter_map(|(k, v)| v.as_ref().map(|val| (k, val)))
+    }
+
+    /// Get all live keys.
+    pub fn keys(&self) -> impl Iterator<Item = &K> {
+        self.iter().map(|(k, _)| k)
+    }
+
+    /// Compact the map by removing tombstones.
+    pub fn compact(&mut self) {
+        self.data.retain(|_, v| v.is_some());
+    }
+}
+
+/// Configuration options for the Whopper simulator.
+pub struct WhopperOpts {
+    /// Random seed for deterministic simulation. If None, a random seed is generated.
+    pub seed: Option<u64>,
+    /// Maximum number of concurrent connections (1-8 typical).
+    pub max_connections: usize,
+    /// Maximum number of simulation steps to run.
+    pub max_steps: usize,
+    /// Maximum iterations the reopen drain loop runs before declaring an
+    /// engine-level infinite loop. Drain iterations do not count against
+    /// `max_steps`: legitimate IO-heavy operations (e.g.
+    /// `PRAGMA integrity_check`) can use thousands of yields per page and
+    /// would routinely exhaust the main budget during a reopen near the end
+    /// of a run. Exceeding `max_drain_steps` within a single reopen surfaces
+    /// as an error.
+    pub max_drain_steps: usize,
+    /// Probability of cosmic ray bit flip on each step (0.0-1.0).
+    pub cosmic_ray_probability: f64,
+    /// Keep mmap I/O files on disk after run.
+    pub keep_files: bool,
+    /// Enable MVCC (Multi-Version Concurrency Control).
+    pub enable_mvcc: bool,
+    /// Enable the experimental non-blocking (passive) MVCC checkpoint.
+    pub experimental_mvcc_passive_checkpoint: bool,
+    /// Enable database encryption with random cipher.
+    pub enable_encryption: bool,
+    /// Elle tables to create: vec of (table_name, create_sql).
+    pub elle_tables: Vec<(String, String)>,
+    /// Workloads with weights: (weight, workload). Higher weight = more likely.
+    pub workloads: Vec<(u32, Box<dyn Workload>)>,
+    /// Properties to check
+    pub properties: Vec<Box<dyn Property>>,
+    /// Chaotic workload profiles: (probability, name, profile).
+    /// On each idle step, each profile fires with the given probability (0.0–1.0).
+    /// If none fires, regular workloads run instead.
+    pub chaotic_profiles: Vec<(f64, &'static str, Box<dyn ChaoticWorkloadProfile>)>,
+    /// Schema-generation bias.
+    pub schema_bias: SchemaBias,
+    /// If true, MVCC's auto-checkpoint is disabled on the Database immediately after open.
+    /// Recovery bugs need uncheckpointed schema rows to remain in the logical log to exercise recovery.
+    pub disable_mvcc_auto_checkpoint: bool,
+    /// If set, overrides the MVCC auto-checkpoint threshold (bytes of logical log) on the
+    /// Database immediately after open. A small value makes checkpoints fire often enough for
+    /// short runs to exercise them. Ignored when `disable_mvcc_auto_checkpoint` is true.
+    pub mvcc_checkpoint_threshold: Option<i64>,
+    /// If false, don't close connections before dropping them
+    pub close_connections_gracefully: bool,
+    /// Probabilty of a reopen fault.
+    pub reopen_probability: f64,
+    /// Probability of failing a scoped Turso allocation while stepping a statement.
+    pub allocation_fault_probability: f64,
+    /// Probability that, on a step where the chosen fiber's statement is
+    /// suspended mid-execution, the simulator attempts a checkpoint on that
+    /// same connection (PRAGMA wal_checkpoint or the Connection::checkpoint
+    /// API, chosen at random) and asserts the engine rejects it. Checkpoints
+    /// invalidate the connection's cursors and page cache, so allowing one
+    /// would break the suspended statement.
+    pub checkpoint_probe_probability: f64,
+}
+
+/// Schema-generation bias
+#[derive(Debug, Clone)]
+pub struct SchemaBias {
+    /// Probability that a generated table uses a non-integer PRIMARY KEY
+    pub non_rowid_pk_prob: f64,
+    /// Probability that a column is UNIQUE (autoindex)
+    pub unique_col_prob: f64,
+    pub num_tables_range: std::ops::RangeInclusive<u32>,
+    pub num_columns_range: std::ops::RangeInclusive<u32>,
+    /// Initial rows per table. Rows are guaranteed unique, so that INSERTs won't fail.
+    pub initial_rows_per_table: u32,
+}
+
+impl Default for SchemaBias {
+    fn default() -> Self {
+        Self {
+            non_rowid_pk_prob: 0.0,
+            unique_col_prob: 0.3,
+            num_tables_range: 1..=5,
+            num_columns_range: 2..=8,
+            initial_rows_per_table: 0,
+        }
+    }
+}
+
+impl Default for WhopperOpts {
+    fn default() -> Self {
+        Self {
+            seed: None,
+            max_connections: 4,
+            max_steps: 100_000,
+            max_drain_steps: 1_000_000,
+            cosmic_ray_probability: 0.0,
+            keep_files: false,
+            enable_mvcc: false,
+            experimental_mvcc_passive_checkpoint: false,
+            enable_encryption: false,
+            elle_tables: vec![],
+            workloads: vec![],
+            properties: vec![],
+            chaotic_profiles: vec![],
+            schema_bias: SchemaBias::default(),
+            disable_mvcc_auto_checkpoint: false,
+            mvcc_checkpoint_threshold: None,
+            close_connections_gracefully: true,
+            reopen_probability: 0.0,
+            allocation_fault_probability: 0.0,
+            checkpoint_probe_probability: 0.01,
+        }
+    }
+}
+
+impl WhopperOpts {
+    /// Create options for "fast" mode: 100k steps, no cosmic rays.
+    pub fn fast() -> Self {
+        Self {
+            max_steps: 100_000,
+            ..Default::default()
+        }
+    }
+
+    /// Create options for "chaos" mode: 10M steps, no cosmic rays.
+    pub fn chaos() -> Self {
+        Self {
+            max_steps: 10_000_000,
+            ..Default::default()
+        }
+    }
+
+    /// Create options for "ragnarök" mode: 1M steps, 0.01% cosmic ray probability.
+    pub fn ragnarok() -> Self {
+        Self {
+            max_steps: 1_000_000,
+            cosmic_ray_probability: 0.0001,
+            ..Default::default()
+        }
+    }
+
+    pub fn recovery_heavy() -> Self {
+        Self {
+            schema_bias: SchemaBias {
+                non_rowid_pk_prob: 0.5,
+                unique_col_prob: 0.5,
+                num_tables_range: 1..=2,
+                num_columns_range: 2..=4,
+                initial_rows_per_table: 3,
+            },
+            disable_mvcc_auto_checkpoint: true,
+            close_connections_gracefully: false,
+            reopen_probability: 0.1,
+            ..Self::fast()
+        }
+    }
+
+    pub fn schema_clone_faults() -> Self {
+        Self {
+            max_steps: 200_000,
+            schema_bias: SchemaBias {
+                non_rowid_pk_prob: 0.4,
+                unique_col_prob: 0.8,
+                num_tables_range: 6..=12,
+                num_columns_range: 8..=16,
+                initial_rows_per_table: 2,
+            },
+            reopen_probability: 0.05,
+            ..Default::default()
+        }
+    }
+
+    pub fn btree_rebalance() -> Self {
+        Self {
+            max_steps: 500_000,
+            schema_bias: SchemaBias {
+                non_rowid_pk_prob: 0.0,
+                unique_col_prob: 0.0,
+                num_tables_range: 0..=0,
+                num_columns_range: 2..=2,
+                initial_rows_per_table: 0,
+            },
+            ..Default::default()
+        }
+    }
+
+    pub fn with_seed(mut self, seed: u64) -> Self {
+        self.seed = Some(seed);
+        self
+    }
+
+    pub fn with_max_connections(mut self, max_connections: usize) -> Self {
+        self.max_connections = max_connections;
+        self
+    }
+
+    pub fn with_max_steps(mut self, max_steps: usize) -> Self {
+        self.max_steps = max_steps;
+        self
+    }
+
+    pub fn with_max_drain_steps(mut self, max_drain_steps: usize) -> Self {
+        self.max_drain_steps = max_drain_steps;
+        self
+    }
+
+    pub fn with_cosmic_ray_probability(mut self, probability: f64) -> Self {
+        self.cosmic_ray_probability = probability;
+        self
+    }
+
+    pub fn with_keep_files(mut self, keep: bool) -> Self {
+        self.keep_files = keep;
+        self
+    }
+
+    pub fn with_enable_mvcc(mut self, enable: bool) -> Self {
+        self.enable_mvcc = enable;
+        self
+    }
+
+    pub fn with_experimental_mvcc_passive_checkpoint(mut self, enable: bool) -> Self {
+        self.experimental_mvcc_passive_checkpoint = enable;
+        self
+    }
+
+    pub fn with_mvcc_checkpoint_threshold(mut self, threshold: Option<i64>) -> Self {
+        self.mvcc_checkpoint_threshold = threshold;
+        self
+    }
+
+    pub fn with_enable_encryption(mut self, enable: bool) -> Self {
+        self.enable_encryption = enable;
+        self
+    }
+
+    pub fn with_elle_tables(mut self, tables: Vec<(String, String)>) -> Self {
+        self.elle_tables = tables;
+        self
+    }
+
+    pub fn with_workloads(mut self, workloads: Vec<(u32, Box<dyn Workload>)>) -> Self {
+        self.workloads = workloads;
+        self
+    }
+
+    pub fn with_properties(mut self, properties: Vec<Box<dyn Property>>) -> Self {
+        self.properties = properties;
+        self
+    }
+
+    pub fn with_chaotic_profiles(
+        mut self,
+        profiles: Vec<(f64, &'static str, Box<dyn ChaoticWorkloadProfile>)>,
+    ) -> Self {
+        self.chaotic_profiles = profiles;
+        self
+    }
+
+    pub fn with_checkpoint_probe_probability(mut self, probability: f64) -> Self {
+        self.checkpoint_probe_probability = probability;
+        self
+    }
+
+    pub fn with_allocation_fault_probability(mut self, probability: f64) -> Self {
+        self.allocation_fault_probability = probability;
+        self
+    }
+}
+
+/// Parameters for a created sequence.
+#[derive(Debug, Clone)]
+pub struct SequenceParams {
+    pub start: i64,
+    pub increment: i64,
+    pub min_value: i64,
+    pub max_value: i64,
+    pub cycle: bool,
+}
+
+/// Persisted user sequence state reconstructed after a simulator restart.
+#[derive(Debug, Clone)]
+pub struct PersistedSequenceState {
+    pub params: SequenceParams,
+    pub watermark: i64,
+}
+
+/// Statistics collected during simulation.
+#[derive(Default, Debug, Clone)]
+pub struct Stats {
+    pub inserts: usize,
+    pub updates: usize,
+    pub deletes: usize,
+    pub integrity_checks: usize,
+    /// Elle-mode: write operations (append + rw-write)
+    pub elle_writes: usize,
+    /// Elle-mode: read operations (list-read + rw-read)
+    pub elle_reads: usize,
+    /// Multiprocess: corruption events detected and survived
+    pub corruption_events: usize,
+    /// Sequence nextval calls
+    pub sequence_nextvals: usize,
+    /// FTS self-differential checks that ran to completion
+    pub fts_checks: usize,
+    /// Same-connection checkpoint probes fired against suspended statements
+    pub checkpoint_probes: usize,
+}
+
+/// Result of a single simulation step.
+#[derive(Debug)]
+pub enum StepResult {
+    /// Step completed normally.
+    Ok,
+    /// WAL file size exceeded soft limit, simulation should stop.
+    WalSizeLimitExceeded,
+}
+
+pub struct SimulatorFiber {
+    connection: Arc<Connection>,
+    yield_injector: Arc<SimulatorYieldInjector>,
+    state: FiberState,
+    statement: RefCell<Option<Statement>>,
+    rows: Vec<Vec<Value>>,
+    /// Current execution ID for tracing statement lifecycle
+    execution_id: Option<u64>,
+    /// Current transaction ID for tracing statement lifecycle
+    txn_id: Option<u64>,
+    /// Current operation being executed
+    current_op: Option<Operation>,
+    /// Active chaotic workload (if any)
+    chaotic_workload: Option<Box<dyn ChaoticWorkload>>,
+    /// Saved result from last completed operation, for the chaotic workload.
+    /// Not overwritten if already set (preserves error across auto-rollback).
+    last_chaotic_result: Option<OpResult>,
+}
+
+/// Shared state for simulator that can be accessed by workloads.
+#[derive(Debug, Clone)]
+pub struct SimulatorState {
+    /// Schema tables
+    pub tables: MergableMap<String, Table>,
+    /// Active indexes: index_name -> table_name
+    pub indexes: MergableMap<String, String>,
+    /// Simple key-value tables for SimpleSelectWorkload/SimpleInsertWorkload
+    pub simple_tables: MergableMap<String, ()>,
+    /// Sample of inserted keys per table for use in selects
+    pub simple_tables_keys: HashMap<String, SamplesContainer<String>>,
+    /// Elle tables for consistency checking
+    pub elle_tables: MergableMap<String, ()>,
+    /// Created sequences: seq_name -> parameters
+    pub sequences: MergableMap<String, SequenceParams>,
+    /// Tables with sequence-backed DEFAULT columns: table_name -> seq_name
+    pub seq_default_tables: MergableMap<String, String>,
+    /// Counter for generating unique execution IDs
+    pub execution_id: u64,
+    /// Counter for generating unique transaction IDs
+    pub txn_id: u64,
+}
+
+impl SimulatorState {
+    pub fn new(tables: Vec<Table>, indexes: Vec<(String, String)>) -> Self {
+        let mut table_map = MergableMap::new();
+        for table in &tables {
+            table_map.insert(table.name.clone(), table.clone());
+        }
+        let mut index_map = MergableMap::new();
+        for (table_name, index_name) in indexes {
+            index_map.insert(index_name, table_name);
+        }
+        Self {
+            tables: table_map,
+            indexes: index_map,
+            simple_tables: MergableMap::new(),
+            simple_tables_keys: HashMap::new(),
+            elle_tables: MergableMap::new(),
+            sequences: MergableMap::new(),
+            seq_default_tables: MergableMap::new(),
+            execution_id: 0,
+            txn_id: 0,
+        }
+    }
+    pub fn tables_vec(&self) -> Vec<Table> {
+        self.tables.iter().map(|(_, t)| t.clone()).collect()
+    }
+    pub fn gen_execution_id(&mut self) -> u64 {
+        self.execution_id += 1;
+        self.execution_id
+    }
+    pub fn gen_txn_id(&mut self) -> u64 {
+        self.txn_id += 1;
+        self.txn_id
+    }
+}
+
+struct SimulatorContext {
+    fibers: Vec<SimulatorFiber>,
+    state: SimulatorState,
+    enable_mvcc: bool,
+}
+
+/// The Whopper deterministic simulator.
+pub struct Whopper {
+    context: SimulatorContext,
+    io: Arc<SimulatorIO>,
+    file_sizes: Arc<std::sync::Mutex<HashMap<String, u64>>>,
+    db_path: String,
+    wal_path: String,
+    encryption_opts: Option<EncryptionOpts>,
+    max_connections: usize,
+    workloads: Vec<(u32, Box<dyn Workload>)>,
+    properties: Vec<std::sync::Mutex<Box<dyn Property>>>,
+    total_weight: u32,
+    opts: Opts,
+    pub rng: ChaCha8Rng,
+    pub current_step: usize,
+    pub max_steps: usize,
+    pub max_drain_steps: usize,
+    pub seed: u64,
+    pub stats: Stats,
+    /// Chaotic workload profiles: (probability, name, profile).
+    chaotic_profiles: Vec<(f64, &'static str, Box<dyn ChaoticWorkloadProfile>)>,
+    /// Setting this to true sets `pramga mvcc_checkpoint_threshold = -1` (disabled).
+    disable_mvcc_auto_checkpoint: bool,
+    /// If set, overrides the MVCC auto-checkpoint threshold (bytes of logical log) after open.
+    mvcc_checkpoint_threshold: Option<i64>,
+    /// Open databases with the experimental non-blocking (passive) MVCC checkpoint enabled.
+    experimental_mvcc_passive_checkpoint: bool,
+    /// If false, drop fiber connections without first closing them.
+    close_connections_gracefully: bool,
+    allocation_fault_injector: Option<&'static SimulatorAllocationFaultInjector>,
+    /// See [`WhopperOpts::checkpoint_probe_probability`].
+    checkpoint_probe_probability: f64,
+}
+
+impl Whopper {
+    /// Create a new Whopper simulator with the given options.
+    pub fn new(opts: WhopperOpts) -> anyhow::Result<Self> {
+        let seed = opts.seed.unwrap_or_else(|| {
+            let mut rng = rand::rng();
+            rng.next_u64()
+        });
+
+        let mut rng = ChaCha8Rng::seed_from_u64(seed);
+        let allocation_fault_injector = install_global_allocation_fault_backend(
+            AllocationFaultConfig {
+                probability: opts.allocation_fault_probability,
+            },
+            seed.wrapping_add(2),
+        )?;
+
+        // Create a separate RNG for IO operations with a derived seed
+        let io_rng = ChaCha8Rng::seed_from_u64(seed.wrapping_add(1));
+
+        let fault_config = IOFaultConfig {
+            cosmic_ray_probability: opts.cosmic_ray_probability,
+        };
+
+        let io = Arc::new(SimulatorIO::new(opts.keep_files, io_rng, fault_config));
+        let file_sizes = io.file_sizes();
+
+        // Use an absolute path to match `PRAGMA journal_mode = 'mvcc'` (which canonicalizes the
+        // path), otherwise recovery is a no-op, because SimulatorIO's file cache is keyed on the
+        // path string, and an absolute/relative mismatch will make it think that there was no
+        // existing logical log.
+        let db_path = std::env::current_dir()?
+            .join(format!("whopper-{}-{}.db", seed, std::process::id()))
+            .to_str()
+            .unwrap()
+            .to_string();
+        let wal_path = format!("{db_path}-wal");
+
+        let encryption_opts = if opts.enable_encryption {
+            Some(random_encryption_config(&mut rng))
+        } else {
+            None
+        };
+
+        let db = {
+            let db_opts = DatabaseOpts::new()
+                .with_encryption(encryption_opts.is_some())
+                // Index methods power the FTS workloads; the flag only
+                // gates `CREATE INDEX ... USING` and `OPTIMIZE INDEX`, so
+                // it is safe globally.
+                .with_index_method(true)
+                .with_experimental_mvcc_passive_checkpoint(
+                    opts.experimental_mvcc_passive_checkpoint,
+                );
+
+            match Database::open_file_with_flags(
+                io.clone(),
+                &db_path,
+                OpenFlags::default(),
+                db_opts,
+                encryption_opts.clone(),
+                Arc::new(SqliteDialect),
+            ) {
+                Ok(db) => db,
+                Err(e) => {
+                    return Err(anyhow::anyhow!("Database open failed: {}", e));
+                }
+            }
+        };
+
+        let bootstrap_conn = match db.connect() {
+            Ok(conn) => may_be_set_encryption(conn, &encryption_opts)?,
+            Err(e) => {
+                return Err(anyhow::anyhow!("Connection failed: {}", e));
+            }
+        };
+
+        // Enable MVCC if requested
+        if opts.enable_mvcc {
+            bootstrap_conn.execute("PRAGMA journal_mode = 'mvcc'")?;
+        }
+
+        let schema = create_initial_schema(&mut rng, &opts.schema_bias);
+        let tables = schema.iter().map(|t| t.table.clone()).collect::<Vec<_>>();
+        for create_table in &schema {
+            let sql = create_table.to_string();
+            debug!("{}", sql);
+            bootstrap_conn.execute(&sql)?;
+        }
+
+        let indexes = create_initial_indexes(&mut rng, &tables);
+        for create_index in &indexes {
+            let sql = create_index.to_string();
+            debug!("{}", sql);
+            bootstrap_conn.execute(&sql)?;
+        }
+
+        if opts.schema_bias.initial_rows_per_table > 0 {
+            for create_table in &schema {
+                for row_idx in 0..opts.schema_bias.initial_rows_per_table {
+                    let sql = seed_insert_sql(&create_table.table, row_idx);
+                    bootstrap_conn.execute(&sql)?;
+                }
+            }
+        }
+
+        // Create Elle tables if configured
+        let mut elle_table_names = Vec::new();
+        for (table_name, create_sql) in &opts.elle_tables {
+            debug!("{}", create_sql);
+            bootstrap_conn.execute(create_sql)?;
+            elle_table_names.push(table_name.clone());
+        }
+
+        bootstrap_conn.close()?;
+
+        let indexes_vec: Vec<(String, String)> = indexes
+            .iter()
+            .map(|idx| (idx.table_name.clone(), idx.index_name.clone()))
+            .collect();
+
+        let mut state = SimulatorState::new(tables, indexes_vec);
+        for table_name in elle_table_names {
+            state.elle_tables.insert(table_name, ());
+        }
+
+        let context = SimulatorContext {
+            fibers: vec![],
+            state,
+            enable_mvcc: opts.enable_mvcc,
+        };
+
+        let total_weight: u32 = opts.workloads.iter().map(|(w, _)| w).sum();
+
+        let mut whopper = Self {
+            context,
+            rng,
+            io,
+            file_sizes,
+            db_path,
+            wal_path,
+            encryption_opts,
+            max_connections: opts.max_connections,
+            workloads: opts.workloads,
+            properties: opts
+                .properties
+                .into_iter()
+                .map(std::sync::Mutex::new)
+                .collect(),
+            total_weight,
+            opts: Opts::default(),
+            current_step: 0,
+            max_steps: opts.max_steps,
+            max_drain_steps: opts.max_drain_steps,
+            seed,
+            stats: Stats::default(),
+            chaotic_profiles: opts.chaotic_profiles,
+            disable_mvcc_auto_checkpoint: opts.disable_mvcc_auto_checkpoint,
+            mvcc_checkpoint_threshold: opts.mvcc_checkpoint_threshold,
+            experimental_mvcc_passive_checkpoint: opts.experimental_mvcc_passive_checkpoint,
+            close_connections_gracefully: opts.close_connections_gracefully,
+            allocation_fault_injector,
+            checkpoint_probe_probability: opts.checkpoint_probe_probability,
+        };
+
+        whopper.open_connections()?;
+
+        Ok(whopper)
+    }
+
+    /// Check if the simulation is complete (reached max steps or WAL limit).
+    pub fn is_done(&self) -> bool {
+        self.current_step >= self.max_steps
+    }
+
+    pub fn allocation_fault_count(&self) -> u64 {
+        self.allocation_fault_injector
+            .map(SimulatorAllocationFaultInjector::injected_faults)
+            .unwrap_or(0)
+    }
+
+    /// Perform a single simulation step.
+    /// Returns `StepResult::Ok` if the step completed normally,
+    /// or `StepResult::WalSizeLimitExceeded` if the WAL file exceeded the soft limit.
+    pub fn step(&mut self) -> anyhow::Result<StepResult> {
+        trace!("step={}", self.current_step);
+        if self.current_step >= self.max_steps {
+            return Ok(StepResult::Ok);
+        }
+
+        let fiber_idx = self.current_step % self.context.fibers.len();
+        self.perform_work(fiber_idx)?;
+        self.io.step()?;
+        self.current_step += 1;
+
+        if file_size_soft_limit_exceeded(&self.wal_path, self.file_sizes.clone()) {
+            return Ok(StepResult::WalSizeLimitExceeded);
+        }
+
+        Ok(StepResult::Ok)
+    }
+
+    /// The fiber's statement is suspended mid-execution. Occasionally try to
+    /// checkpoint the same connection and check the contract the engine
+    /// promises: the checkpoint is refused (running it would invalidate the
+    /// suspended statement's cursors and page cache), and refusal leaves no
+    /// state behind — the suspended statement keeps running on later steps
+    /// and the rest of the workload continues on this connection.
+    ///
+    /// Regression coverage for checkpoints racing suspended statements: on
+    /// unguarded builds the checkpoint runs, and the suspended statement
+    /// either panics on resume, silently loses a write, or silently returns
+    /// wrong rows.
+    fn maybe_probe_checkpoint_on_suspended_statement(
+        &mut self,
+        fiber_idx: usize,
+    ) -> anyhow::Result<()> {
+        if self.checkpoint_probe_probability <= 0.0
+            || !self.rng.random_bool(self.checkpoint_probe_probability)
+        {
+            return Ok(());
+        }
+        self.stats.checkpoint_probes += 1;
+        let connection = self.context.fibers[fiber_idx].connection.clone();
+        // Default-mode MVCC rejects PASSIVE at prepare time (it requires
+        // experimental_mvcc_passive_checkpoint), so probe with a checkpoint
+        // mode the engine's configuration supports — same selection as
+        // WalCheckpointWorkload's allow_passive. The guard must refuse any
+        // mode while a statement is suspended.
+        let passive_allowed =
+            !self.context.enable_mvcc || self.experimental_mvcc_passive_checkpoint;
+        let via_api = self.rng.random_bool(0.5);
+        let outcome: Result<(), LimboError> = if via_api {
+            let mode = if passive_allowed {
+                CheckpointMode::Passive {
+                    upper_bound_inclusive: None,
+                }
+            } else {
+                CheckpointMode::Truncate {
+                    upper_bound_inclusive: None,
+                }
+            };
+            connection.checkpoint(mode).map(|_| ())
+        } else {
+            // Step the pragma until it resolves, driving any I/O it needs on
+            // the way to the checkpoint opcode (bounded, so an engine bug
+            // cannot hang the simulator).
+            let sql = if passive_allowed {
+                "PRAGMA wal_checkpoint(PASSIVE)"
+            } else {
+                "PRAGMA wal_checkpoint(TRUNCATE)"
+            };
+            let mut stmt = connection.prepare(sql)?;
+            let mut budget = 10_000usize;
+            loop {
+                match stmt.step() {
+                    Ok(turso_core::StepResult::IO) => self.io.step()?,
+                    Ok(turso_core::StepResult::Row | turso_core::StepResult::Yield) => {}
+                    Ok(turso_core::StepResult::Done) => break Ok(()),
+                    Ok(other) => {
+                        anyhow::bail!(
+                            "checkpoint probe: step={} fiber={fiber_idx}: unexpected step result {other:?}",
+                            self.current_step
+                        )
+                    }
+                    Err(err) => break Err(err),
+                }
+                budget -= 1;
+                if budget == 0 {
+                    anyhow::bail!(
+                        "checkpoint probe: step={} fiber={fiber_idx}: pragma did not resolve",
+                        self.current_step
+                    );
+                }
+            }
+        };
+        let via = if via_api {
+            "Connection::checkpoint"
+        } else {
+            "PRAGMA wal_checkpoint"
+        };
+        match outcome {
+            Ok(()) => anyhow::bail!(
+                "checkpoint probe: step={} fiber={fiber_idx}: {via} was allowed while \
+                 a statement on the same connection was suspended mid-execution",
+                self.current_step
+            ),
+            Err(LimboError::StatementsInProgress(_) | LimboError::TableLocked) => Ok(()),
+            Err(err) => anyhow::bail!(
+                "checkpoint probe: step={} fiber={fiber_idx}: expected {via} to be \
+                 rejected with StatementsInProgress or TableLocked, got: {err}",
+                self.current_step
+            ),
+        }
+    }
+
+    fn perform_work(&mut self, fiber_idx: usize) -> anyhow::Result<()> {
+        let exec_id = self.context.fibers[fiber_idx].execution_id;
+        let txn_id = self.context.fibers[fiber_idx].txn_id;
+        trace!(
+            "perform_work: step={}, fiber_idx={}/{} exec_id={:?} txn_id={:?}",
+            self.current_step,
+            fiber_idx,
+            self.context.fibers.len(),
+            exec_id,
+            txn_id
+        );
+
+        // If we have a statement, step it.
+        let step_result = {
+            let connection = self.context.fibers[fiber_idx].connection.clone();
+            let yield_injector = self.context.fibers[fiber_idx].yield_injector.clone();
+            let mut stmt_borrow = self.context.fibers[fiber_idx].statement.borrow_mut();
+            if let Some(stmt) = stmt_borrow.as_mut() {
+                let span = tracing::debug_span!(
+                    "step",
+                    step = self.current_step,
+                    fiber = fiber_idx,
+                    exec_id = exec_id,
+                    txn_id = txn_id
+                );
+                let _enter = span.enter();
+                let step_result = step_stmt_with_injections(
+                    &connection,
+                    yield_injector,
+                    self.allocation_fault_injector,
+                    AllocationFaultContext {
+                        step: self.current_step as u64,
+                        fiber_idx: fiber_idx as u64,
+                        execution_id: exec_id.unwrap_or(0),
+                    },
+                    stmt,
+                );
+                match step_result {
+                    Ok(result) => {
+                        trace!("{:?}", result);
+                        match result {
+                            turso_core::StepResult::Row => {
+                                if let Some(row) = stmt.row() {
+                                    let values: Vec<Value> = row.get_values().cloned().collect();
+                                    drop(stmt_borrow);
+                                    self.context.fibers[fiber_idx].rows.push(values);
+                                }
+                                Ok(None)
+                            }
+                            turso_core::StepResult::Done => Ok(Some(())),
+                            turso_core::StepResult::Busy => Err(turso_core::LimboError::Busy),
+                            _ => Ok(None),
+                        }
+                    }
+                    Err(e) => Err(e),
+                }
+            } else {
+                Ok(Some(()))
+            }
+        };
+
+        // If the statement has more work, we're done for this simulation step
+        if let Ok(None) = step_result {
+            self.maybe_probe_checkpoint_on_suspended_statement(fiber_idx)?;
+            return Ok(());
+        }
+
+        // drop statement - we finished its execution
+        self.context.fibers[fiber_idx].statement.replace(None);
+        self.context.fibers[fiber_idx].execution_id = None;
+
+        // get current completed operation
+        let completed_op = self.context.fibers[fiber_idx].current_op.take();
+        if let Some(completed_op) = completed_op {
+            let rows = std::mem::take(&mut self.context.fibers[fiber_idx].rows);
+            let current_exec_id = self.context.state.execution_id;
+            let mut ctx = OpContext {
+                fiber: &mut self.context.fibers[fiber_idx],
+                sim_state: &mut self.context.state,
+                stats: &mut self.stats,
+                rng: &mut self.rng,
+            };
+            // handle operation result
+            let span = tracing::debug_span!(
+                "complete",
+                step = self.current_step,
+                fiber = fiber_idx,
+                exec_id = exec_id,
+                current_exec_id = current_exec_id,
+                txn_id = txn_id
+            );
+            let _enter = span.enter();
+            debug!("result={step_result:?}, rows.len()={}", rows.len());
+
+            if let Operation::Begin { mode } = completed_op {
+                if step_result.is_ok() {
+                    ctx.fiber.state = if mode == TxMode::Concurrent {
+                        FiberState::InConcurrentTx
+                    } else {
+                        FiberState::InTx
+                    };
+                }
+            }
+
+            let txn_id = ctx.fiber.txn_id;
+
+            let op_result = step_result.map(|_| rows);
+
+            if matches!(
+                &op_result,
+                Err(turso_core::LimboError::Busy
+                    | turso_core::LimboError::BusySnapshot
+                    | turso_core::LimboError::WriteWriteConflict
+                    | turso_core::LimboError::CommitDependencyAborted
+                    | turso_core::LimboError::OutOfMemory)
+            ) && ctx.fiber.connection.get_auto_commit()
+            {
+                let _ = ctx.fiber.connection.execute("ROLLBACK");
+            }
+
+            completed_op.finish_op(&mut ctx, &op_result);
+
+            for property in &self.properties {
+                let mut property = property.lock().unwrap();
+                property
+                    .finish_op(
+                        self.current_step,
+                        fiber_idx,
+                        txn_id,
+                        exec_id.unwrap(),
+                        current_exec_id,
+                        &completed_op,
+                        &op_result,
+                    )
+                    .inspect_err(|e| error!("property failed: {e}"))?;
+            }
+
+            // Save result for chaotic workload.
+            // Don't overwrite if already set — preserves the original error
+            // across auto-rollback sequences. If chaotic_workload is None
+            // (already completed), the result is silently dropped — benign,
+            // since try_resume_chaotic won't consume it anyway.
+            if ctx.fiber.chaotic_workload.is_some() && ctx.fiber.last_chaotic_result.is_none() {
+                ctx.fiber.last_chaotic_result = Some(op_result.clone());
+            }
+
+            if ctx.fiber.connection.get_auto_commit() {
+                ctx.fiber.state = FiberState::Idle;
+                ctx.fiber.txn_id = None;
+            }
+
+            if let Err(error) = op_result {
+                let in_tx = ctx.fiber.state.is_in_tx() && !ctx.fiber.connection.get_auto_commit();
+                match crate::error_handling::classify_op_error(&error, in_tx) {
+                    crate::error_handling::ErrorAction::Rollback => {
+                        ctx.fiber.current_op = Some(Operation::Rollback);
+                    }
+                    crate::error_handling::ErrorAction::ClearTxn => {
+                        ctx.fiber.txn_id = None;
+                    }
+                    // In-process whopper has no worker process to respawn,
+                    // so Corrupt/CheckpointFailed surface as fatal here.
+                    crate::error_handling::ErrorAction::Respawn
+                    | crate::error_handling::ErrorAction::Fatal => return Err(error.into()),
+                }
+            }
+        }
+
+        if self.context.fibers[fiber_idx].current_op.is_none() {
+            // Try chaotic workload first
+            if !self.chaotic_profiles.is_empty() {
+                self.try_resume_chaotic(fiber_idx);
+            }
+
+            // Fall through to regular workloads if chaotic didn't produce an op
+            if self.context.fibers[fiber_idx].current_op.is_some() {
+                // chaotic workload produced an op, skip regular workloads
+            } else if self.total_weight == 0 {
+                return Ok(());
+            } else {
+                let mut roll = self.rng.random_range(0..self.total_weight);
+                for (weight, workload) in &self.workloads {
+                    if roll >= *weight {
+                        roll = roll.saturating_sub(*weight);
+                        continue;
+                    }
+                    let fiber = &self.context.fibers[fiber_idx];
+                    let state_str = format!("{:?}", &fiber.state);
+                    let span =
+                        tracing::debug_span!("generate", fiber = fiber_idx, state = state_str);
+                    let _enter = span.enter();
+
+                    let ctx = WorkloadContext {
+                        fiber_state: &fiber.state,
+                        sim_state: &self.context.state,
+                        opts: &self.opts,
+                        enable_mvcc: self.context.enable_mvcc,
+                        tables_vec: self.context.state.tables_vec(),
+                    };
+
+                    // Generate operation from workload; skip current workload if it returned None
+                    let Some(op) = workload.generate(&ctx, &mut self.rng) else {
+                        continue;
+                    };
+
+                    debug!("set fiber operation: {:?}", op);
+                    self.context.fibers[fiber_idx].current_op = Some(op);
+                    break;
+                }
+            }
+        }
+
+        // initialize new operation
+        if let Some(op) = self.context.fibers[fiber_idx].current_op.take() {
+            // Assign new execution_id for this statement
+            let exec_id = self.context.state.gen_execution_id();
+
+            let fiber = &mut self.context.fibers[fiber_idx];
+            let state_str = format!("{:?}", &fiber.state);
+            let span = tracing::debug_span!(
+                "init",
+                step = self.current_step,
+                fiber = fiber_idx,
+                exec_id = exec_id,
+                txn_id = fiber.txn_id,
+                state = state_str
+            );
+            let _enter = span.enter();
+
+            // Prepare the operation
+            let mut ctx = OpContext {
+                fiber,
+                sim_state: &mut self.context.state,
+                stats: &mut self.stats,
+                rng: &mut self.rng,
+            };
+            debug!("prepare operation: op={:?}", op);
+            ctx.fiber.yield_injector = Arc::new(SimulatorYieldInjector::new(fiber_yield_seed(
+                self.seed, fiber_idx,
+            )));
+            if let Err(e) = op.init_op(&mut ctx) {
+                let err = e.to_string().to_lowercase();
+                // Allow "no such table/index" and "already exists" errors
+                if err.contains("no such")
+                    || err.contains("already exists")
+                    || err.contains("not exist")
+                {
+                    debug!("init operation skipped: {}", err);
+                    return Ok(());
+                } else {
+                    panic!("Failed to init operation: {}\nSQL: {}", e, op.sql());
+                }
+            }
+            // Store operation and execution_id
+            if let Operation::Begin { .. } = &op {
+                self.context.fibers[fiber_idx].txn_id = Some(ctx.sim_state.gen_txn_id());
+            }
+            let txn_id = self.context.fibers[fiber_idx].txn_id;
+            self.context.fibers[fiber_idx].execution_id = Some(exec_id);
+            self.context.fibers[fiber_idx].current_op = Some(op.clone());
+
+            // Notify properties that operation is starting
+            for property in &self.properties {
+                let mut property = property.lock().unwrap();
+                property.init_op(self.current_step, fiber_idx, txn_id, exec_id, &op)?;
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Try to resume or start a chaotic workload for the given fiber.
+    /// Sets `current_op` on the fiber if a workload produces an operation.
+    fn try_resume_chaotic(&mut self, fiber_idx: usize) {
+        // Resume active workload with saved result
+        if let Some(result) = self.context.fibers[fiber_idx].last_chaotic_result.take() {
+            let mut workload = self.context.fibers[fiber_idx].chaotic_workload.take();
+            if let Some(ref mut wl) = workload {
+                if let Some(op) = wl.next(Some(result)) {
+                    debug!("chaotic: resumed workload, next op: {:?}", op);
+                    self.context.fibers[fiber_idx].current_op = Some(op);
+                    self.context.fibers[fiber_idx].chaotic_workload = workload;
+                    return;
+                }
+                debug!("chaotic: workload completed");
+            }
+        }
+
+        // No active workload — pick a new one (only when idle, since chaotic
+        // workloads start with BEGIN and can't nest inside an existing transaction)
+        if self.context.fibers[fiber_idx].chaotic_workload.is_none()
+            && self.context.fibers[fiber_idx].state == FiberState::Idle
+        {
+            if let Some(op) = self.pick_chaotic_workload(fiber_idx) {
+                self.context.fibers[fiber_idx].current_op = Some(op);
+            }
+        }
+    }
+
+    /// Pick a chaotic workload for the given fiber using weighted random selection.
+    /// Each profile's weight is its probability (0.0–1.0) of being selected on any
+    /// given idle step. If no profile fires, regular workloads run instead.
+    fn pick_chaotic_workload(&mut self, fiber_idx: usize) -> Option<Operation> {
+        if self.chaotic_profiles.is_empty() {
+            return None;
+        }
+
+        for (probability, name, profile) in &self.chaotic_profiles {
+            if !self.rng.random_bool(*probability) {
+                continue;
+            }
+            let fiber_rng = ChaCha8Rng::seed_from_u64(self.rng.next_u64());
+            let mut workload = profile.generate(fiber_rng, fiber_idx);
+            if let Some(op) = workload.next(None) {
+                debug!(
+                    "chaotic: picked workload '{}' for fiber {}",
+                    name, fiber_idx
+                );
+                self.context.fibers[fiber_idx].chaotic_workload = Some(workload);
+                return Some(op);
+            }
+        }
+        None
+    }
+
+    /// Run the simulation to completion (up to max_steps or WAL limit).
+    pub fn run(&mut self) -> anyhow::Result<()> {
+        while !self.is_done() {
+            match self.step()? {
+                StepResult::Ok => {}
+                StepResult::WalSizeLimitExceeded => break,
+            }
+        }
+        self.finalize_properties()?;
+        Ok(())
+    }
+
+    /// Finalize all properties (e.g., export Elle history).
+    pub fn finalize_properties(&self) -> anyhow::Result<()> {
+        for property in &self.properties {
+            let mut property = property.lock().unwrap();
+            property.finalize()?;
+        }
+        Ok(())
+    }
+
+    /// Dump database files to simulator-output directory.
+    /// The database files the simulated IO holds, keyed by suffix (`.db`,
+    /// `-wal`, `-log`) so two runs can be compared without their unique
+    /// path prefix.
+    pub fn db_file_bytes(&self) -> Vec<(String, Vec<u8>)> {
+        self.io.db_file_bytes()
+    }
+
+    pub fn dump_db_files(&self) -> anyhow::Result<()> {
+        let out_dir = std::path::PathBuf::from("simulator-output");
+        if !out_dir.exists() {
+            std::fs::create_dir_all(&out_dir)?;
+        }
+        self.io.dump_files(&out_dir)?;
+        Ok(())
+    }
+
+    /// Step one fiber's in-flight statement one tick during reopen drain.
+    /// Returns `Some(OpResult)` when the statement finished (Done/Busy/Err),
+    /// `None` when more drain ticks are needed.
+    fn step_drained_statement(&mut self, fiber_idx: usize) -> Option<OpResult> {
+        let span = tracing::debug_span!("step", step = self.current_step, fiber = fiber_idx);
+        let _enter = span.enter();
+        let fiber = &mut self.context.fibers[fiber_idx];
+        let connection = fiber.connection.clone();
+        let yield_injector = fiber.yield_injector.clone();
+        let exec_id = fiber.execution_id.unwrap_or(0);
+
+        let mut stmt_borrow = fiber.statement.borrow_mut();
+        let Some(stmt) = stmt_borrow.as_mut() else {
+            return Some(Ok(Vec::new()));
+        };
+        let step_result = step_stmt_with_injections(
+            &connection,
+            yield_injector,
+            self.allocation_fault_injector,
+            AllocationFaultContext {
+                step: self.current_step as u64,
+                fiber_idx: fiber_idx as u64,
+                execution_id: exec_id,
+            },
+            stmt,
+        );
+        match step_result {
+            Ok(turso_core::StepResult::Row) => {
+                if let Some(row) = stmt.row() {
+                    let values: Vec<Value> = row.get_values().cloned().collect();
+                    fiber.rows.push(values);
+                }
+                None
+            }
+            Ok(turso_core::StepResult::Done) => {
+                let rows = std::mem::take(&mut fiber.rows);
+                Some(Ok(rows))
+            }
+            Ok(turso_core::StepResult::Busy) => Some(Err(turso_core::LimboError::Busy)),
+            Ok(_) => None,
+            Err(e) => Some(Err(e)),
+        }
+    }
+
+    /// Apply an op-finish callback to properties and the operation itself
+    /// for a statement that finished during reopen drain. Mirrors the
+    /// finish-op block of `step()` so the property checker sees drained
+    /// commits and rollbacks rather than silently losing them.
+    fn finalize_drained_statement(&mut self, fiber_idx: usize, op_result: OpResult) {
+        let fiber = &mut self.context.fibers[fiber_idx];
+        let completed_op = fiber.current_op.take();
+        let exec_id = fiber.execution_id.take();
+        let txn_id = fiber.txn_id;
+
+        // Drop the statement now that we've taken its result.
+        fiber
+            .statement
+            .replace(None)
+            .unwrap()
+            .reset()
+            .expect("statement reset should succeed before restart");
+        let row_count = fiber.rows.len();
+        fiber.rows.clear();
+
+        debug!(
+            "fiber {}: completed with {} rows before restart (result={:?})",
+            fiber_idx, row_count, op_result
+        );
+
+        let Some(completed_op) = completed_op else {
+            return;
+        };
+        let Some(exec_id) = exec_id else {
+            return;
+        };
+
+        // Apply state-machine changes (the same call site as step()'s
+        // finish_op block).
+        let current_exec_id = self.context.state.execution_id;
+        let mut ctx = OpContext {
+            fiber: &mut self.context.fibers[fiber_idx],
+            sim_state: &mut self.context.state,
+            stats: &mut self.stats,
+            rng: &mut self.rng,
+        };
+        completed_op.finish_op(&mut ctx, &op_result);
+
+        for property in &self.properties {
+            let mut property = property.lock().unwrap();
+            if let Err(e) = property.finish_op(
+                self.current_step,
+                fiber_idx,
+                txn_id,
+                exec_id,
+                current_exec_id,
+                &completed_op,
+                &op_result,
+            ) {
+                error!("property failed during drain: {e}");
+            }
+        }
+    }
+
+    /// Drain in-flight statements on all fibers. Used before reopen.
+    fn drain_active_statements(&mut self, reason: &str) -> anyhow::Result<()> {
+        let mut drain_iterations = 0usize;
+        while self
+            .context
+            .fibers
+            .iter()
+            .any(|f| f.statement.borrow().is_some())
+        {
+            if drain_iterations >= self.max_drain_steps {
+                let stuck: Vec<usize> = self
+                    .context
+                    .fibers
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(i, f)| f.statement.borrow().is_some().then_some(i))
+                    .collect();
+                anyhow::bail!(
+                    "{reason} drain exceeded max_drain_steps ({}) with statements still live on \
+                     fibers {:?}; likely a leaked lock or other infinite loop in the engine",
+                    self.max_drain_steps,
+                    stuck,
+                );
+            }
+            for fiber_idx in 0..self.context.fibers.len() {
+                if self.context.fibers[fiber_idx].statement.borrow().is_none() {
+                    continue;
+                }
+                let Some(op_result) = self.step_drained_statement(fiber_idx) else {
+                    continue;
+                };
+                self.finalize_drained_statement(fiber_idx, op_result);
+            }
+            self.io.step()?;
+            drain_iterations += 1;
+        }
+        Ok(())
+    }
+
+    /// Reopen the database by closing all connections and recreating them.
+    /// This simulates a database restart/reopen scenario.
+    /// Active statements are run to completion before closing.
+    pub fn reopen(&mut self) -> anyhow::Result<()> {
+        debug!(
+            "Restarting database, completing active statements for {} fibers",
+            self.context.fibers.len()
+        );
+
+        self.drain_active_statements("reopen")?;
+        // Close and drop all fiber connections to release database Arc references
+        {
+            let fibers = self.context.fibers.drain(..).collect::<Vec<_>>();
+            for fiber in fibers {
+                drop(fiber.statement.into_inner());
+                if self.close_connections_gracefully {
+                    if let Err(e) = fiber.connection.close() {
+                        debug!("Error closing connection during restart: {}", e);
+                    }
+                }
+                drop(fiber.connection);
+            }
+            // All fibers are now dropped, database Arc should be released
+        }
+
+        // Without this, the Database object is never dropped and recovery never happens
+        turso_core::clear_database_registry();
+
+        // Reopen connections (creates new Database instance)
+        self.open_connections()?;
+
+        // Query persisted user sequence state from backing tables after restart.
+        let persisted_sequences = if !self.context.fibers.is_empty() {
+            self.query_persisted_sequence_states()?
+        } else {
+            HashMap::new()
+        };
+
+        // Notify properties that a restart occurred, passing persisted state.
+        for prop in &self.properties {
+            prop.lock().unwrap().on_restart(&persisted_sequences)?;
+        }
+
+        // Rebuild sequence state from the reopened database.
+        if !self.context.fibers.is_empty() {
+            self.rebuild_sequences_after_restart(&persisted_sequences);
+        }
+
+        debug!(
+            "Database restarted with {} fibers",
+            self.context.fibers.len()
+        );
+        Ok(())
+    }
+
+    /// Query backing tables to get persisted state for each sequence
+    /// (user-created AND AUTOINCREMENT-implicit). Direction-aware:
+    /// ascending sequences keep the max value, descending keep the
+    /// min.
+    ///
+    /// AUTOINCREMENT backing tables are included so the
+    /// `AutoincWatermarkMonotonicity` property can verify cross-reopen
+    /// watermark continuity. The user-sequence workloads filter to
+    /// `!seq_name.starts_with(AUTOINCREMENT_SEQ_PREFIX)` themselves via
+    /// `sim_state.sequences`, so they remain untouched.
+    fn query_persisted_sequence_states(
+        &self,
+    ) -> anyhow::Result<HashMap<String, PersistedSequenceState>> {
+        let conn = &self.context.fibers[0].connection;
+        let mut backing_tables = Vec::new();
+        {
+            let mut stmt = conn.prepare("SELECT name FROM sqlite_schema WHERE type = 'table'")?;
+            stmt.run_with_row_callback(|row| {
+                let name = row.get::<&str>(0)?;
+                let Some(seq_name) = name.strip_prefix(SEQ_BACKING_TABLE_PREFIX) else {
+                    return Ok(());
+                };
+                backing_tables.push((seq_name.to_string(), name.to_string()));
+                Ok(())
+            })?;
+        }
+
+        let mut sequences = HashMap::new();
+
+        for (seq_name, backing_table) in backing_tables {
+            let escaped = backing_table.replace('"', "\"\"");
+            // We also read `MAX(is_called)` so we can distinguish a fresh
+            // sequence (CREATE SEQUENCE only; backing row is (value=start,
+            // is_called=0) and nothing has been produced yet) from one where
+            // nextval/setval has already run (is_called=1, value is the last
+            // produced watermark). The property checker's watermark is "the
+            // last value produced by nextval", so for a fresh sequence the
+            // correct property-level watermark is `start - increment` (which
+            // equals `value - increment` since value == start before any
+            // nextval). Without this, the first successful nextval after a
+            // restart would look like it regressed the watermark.
+            let mut stmt = conn.prepare(format!(
+                "SELECT \
+                 CASE WHEN MAX(inc) < 0 THEN MIN(value) ELSE MAX(value) END, \
+                 MAX(start), MAX(inc), MAX(min), MAX(max), MAX(cycle), \
+                 MAX(is_called) \
+                 FROM \"{escaped}\""
+            ))?;
+            stmt.run_with_row_callback(|row| {
+                if matches!(row.get_value(0), Value::Null) {
+                    return Ok(());
+                }
+                let raw_value = row.get::<i64>(0)?;
+                let start = row.get::<i64>(1)?;
+                let increment = row.get::<i64>(2)?;
+                let min_value = row.get::<i64>(3)?;
+                let max_value = row.get::<i64>(4)?;
+                let cycle = row.get::<i64>(5)? != 0;
+                let is_called = row.get::<i64>(6).unwrap_or(0) != 0;
+                let watermark = if is_called {
+                    raw_value
+                } else {
+                    raw_value - increment
+                };
+                let seq = turso_core::schema::Sequence::new(
+                    seq_name.clone(),
+                    Some(start),
+                    Some(increment),
+                    Some(min_value),
+                    Some(max_value),
+                    cycle,
+                )?;
+                sequences.insert(
+                    seq_name.clone(),
+                    PersistedSequenceState {
+                        params: SequenceParams {
+                            start: seq.start_value,
+                            increment: seq.increment_by,
+                            min_value: seq.min_value,
+                            max_value: seq.max_value,
+                            cycle: seq.cycle,
+                        },
+                        watermark,
+                    },
+                );
+                Ok(())
+            })?;
+        }
+
+        Ok(sequences)
+    }
+
+    /// Rebuild sim_state.sequences from persisted USER sequence backing
+    /// tables. AUTOINCREMENT-implicit sequences (with the
+    /// `__turso_internal_autoincrement_` prefix) live in
+    /// `persisted_sequences` so the `AutoincWatermarkMonotonicity`
+    /// property can read their cross-reopen watermark, but they must
+    /// NOT show up in `sim_state.sequences` — the sequence workloads
+    /// (nextval/setval/drop) would otherwise pick them as targets and
+    /// trip the engine's internal-name guards on the next op.
+    fn rebuild_sequences_after_restart(
+        &mut self,
+        persisted_sequences: &HashMap<String, PersistedSequenceState>,
+    ) {
+        use turso_core::schema::AUTOINCREMENT_SEQ_PREFIX;
+        let mut new_sequences = MergableMap::new();
+        for (name, state) in persisted_sequences {
+            if name.starts_with(AUTOINCREMENT_SEQ_PREFIX) {
+                continue;
+            }
+            new_sequences.insert(name.clone(), state.params.clone());
+        }
+        self.context.state.sequences = new_sequences;
+    }
+
+    /// Open database connections for all fibers.
+    fn open_connections(&mut self) -> anyhow::Result<()> {
+        let db_opts = DatabaseOpts::new()
+            .with_encryption(self.encryption_opts.is_some())
+            .with_index_method(true)
+            .with_experimental_mvcc_passive_checkpoint(self.experimental_mvcc_passive_checkpoint);
+        let db = Database::open_file_with_flags(
+            self.io.clone(),
+            &self.db_path,
+            OpenFlags::default(),
+            db_opts,
+            self.encryption_opts.clone(),
+            Arc::new(SqliteDialect),
+        )
+        .map_err(|e| anyhow::anyhow!("Database open failed: {}", e))?;
+
+        if self.disable_mvcc_auto_checkpoint {
+            if let Some(mv_store) = db.get_mv_store().as_ref() {
+                mv_store.set_checkpoint_threshold(-1);
+            }
+        } else if let Some(threshold) = self.mvcc_checkpoint_threshold {
+            if let Some(mv_store) = db.get_mv_store().as_ref() {
+                mv_store.set_checkpoint_threshold(threshold);
+            }
+        }
+
+        for i in 0..self.max_connections {
+            let conn = db
+                .connect()
+                .map_err(|e| anyhow::anyhow!("Failed to create fiber connection {}: {}", i, e))?;
+            let conn = may_be_set_encryption(conn, &self.encryption_opts)?;
+            self.context.fibers.push(SimulatorFiber {
+                connection: conn,
+                yield_injector: Arc::new(SimulatorYieldInjector::new(fiber_yield_seed(
+                    self.seed, i,
+                ))),
+                state: FiberState::Idle,
+                statement: RefCell::new(None),
+                rows: vec![],
+                execution_id: None,
+                txn_id: None,
+                current_op: None,
+                chaotic_workload: None,
+                last_chaotic_result: None,
+            });
+        }
+
+        Ok(())
+    }
+}
+
+fn may_be_set_encryption(
+    conn: Arc<Connection>,
+    opts: &Option<EncryptionOpts>,
+) -> anyhow::Result<Arc<Connection>> {
+    if let Some(opts) = opts {
+        conn.pragma_update("cipher", format!("'{}'", opts.cipher.clone()))?;
+        conn.pragma_update("hexkey", format!("'{}'", opts.hexkey.clone()))?;
+    }
+    Ok(conn)
+}
+
+pub fn create_initial_indexes(rng: &mut ChaCha8Rng, tables: &[Table]) -> Vec<CreateIndex> {
+    let mut indexes = Vec::new();
+
+    // Create 0-3 indexes per table
+    for table in tables {
+        let num_indexes = rng.random_range(0..=3);
+        for i in 0..num_indexes {
+            if !table.columns.is_empty() {
+                // Pick 1-3 columns for the index
+                let num_columns = rng.random_range(1..=std::cmp::min(3, table.columns.len()));
+                let mut selected_columns = Vec::new();
+                let mut available_columns = table.columns.clone();
+
+                for _ in 0..num_columns {
+                    if available_columns.is_empty() {
+                        break;
+                    }
+                    let col_idx = rng.random_range(0..available_columns.len());
+                    let column = available_columns.remove(col_idx);
+                    let sort_order = if rng.random_bool(0.5) {
+                        SortOrder::Asc
+                    } else {
+                        SortOrder::Desc
+                    };
+                    selected_columns.push((column.name, sort_order));
+                }
+
+                if !selected_columns.is_empty() {
+                    let index_name = format!("idx_{}_{}", table.name, i);
+                    let create_index = CreateIndex {
+                        index: Index {
+                            index_name,
+                            table_name: table.name.clone(),
+                            columns: selected_columns,
+                        },
+                    };
+                    indexes.push(create_index);
+                }
+            }
+        }
+    }
+
+    indexes
+}
+
+fn seed_insert_sql(table: &Table, row_idx: u32) -> String {
+    let mut sql = format!("INSERT INTO {} VALUES (", table.name);
+    let mut first = true;
+    for col in &table.columns {
+        if !first {
+            sql.push_str(", ");
+        }
+        first = false;
+        // use unique values to avoid UNIQUE or PRIMARY KEY constraint violations
+        match col.column_type {
+            ColumnType::Integer => {
+                let _ = write!(sql, "{}", row_idx as i64);
+            }
+            ColumnType::Float => {
+                let _ = write!(sql, "{row_idx}.0");
+            }
+            ColumnType::Text => {
+                let _ = write!(sql, "'seed_{}_{}'", col.name, row_idx);
+            }
+            ColumnType::Blob => {
+                let _ = write!(sql, "x'{row_idx:08x}'");
+            }
+        }
+    }
+    sql.push(')');
+    sql
+}
+
+pub fn create_initial_schema(rng: &mut ChaCha8Rng, bias: &SchemaBias) -> Vec<Create> {
+    let mut schema = Vec::new();
+
+    let num_tables = rng.random_range(bias.num_tables_range.clone());
+
+    for i in 0..num_tables {
+        let table_name = format!("table_{i}");
+
+        let num_columns = rng.random_range(bias.num_columns_range.clone());
+        let mut columns = Vec::new();
+
+        let id_column = if rng.random_bool(bias.non_rowid_pk_prob) {
+            Column {
+                name: "id".to_string(),
+                column_type: ColumnType::Text,
+                constraints: vec![ColumnConstraint::PrimaryKey {
+                    order: None,
+                    conflict_clause: None,
+                    auto_increment: false,
+                }],
+            }
+        } else {
+            Column {
+                name: "id".to_string(),
+                column_type: ColumnType::Integer,
+                constraints: vec![],
+            }
+        };
+        columns.push(id_column);
+
+        // Add random columns
+        for j in 1..num_columns {
+            let col_type = match rng.random_range(0..3) {
+                0 => ColumnType::Integer,
+                1 => ColumnType::Text,
+                _ => ColumnType::Float,
+            };
+            let constraints = if rng.random_bool(bias.unique_col_prob) {
+                vec![ColumnConstraint::Unique(None)]
+            } else {
+                Vec::new()
+            };
+
+            columns.push(Column {
+                name: format!("col_{j}"),
+                column_type: col_type,
+                constraints,
+            });
+        }
+
+        let table = Table {
+            name: table_name,
+            columns,
+            rows: vec![],
+            indexes: vec![],
+        };
+
+        schema.push(Create { table });
+    }
+
+    // Always seed an AUTOINCREMENT table so workloads can stress the
+    // INTEGER PRIMARY KEY AUTOINCREMENT path under MVCC (the historical
+    // bug class is UPDATE-on-rowid silently desyncing the watermark from
+    // sqlite_sequence).
+    schema.push(Create {
+        table: Table {
+            name: AUTOINC_TABLE_NAME.to_string(),
+            columns: vec![
+                Column {
+                    name: "id".to_string(),
+                    column_type: ColumnType::Integer,
+                    constraints: vec![ColumnConstraint::PrimaryKey {
+                        order: None,
+                        conflict_clause: None,
+                        auto_increment: true,
+                    }],
+                },
+                Column {
+                    name: "payload".to_string(),
+                    column_type: ColumnType::Text,
+                    constraints: vec![],
+                },
+            ],
+            rows: vec![],
+            indexes: vec![],
+        },
+    });
+
+    schema
+}
+
+/// Fixed name for the AUTOINCREMENT table seeded by `create_initial_schema`.
+/// Workloads that target it look it up by this constant; the property
+/// tracker monitors only this name when it cross-checks against
+/// `sqlite_sequence.seq`.
+pub const AUTOINC_TABLE_NAME: &str = "t_autoinc";
+
+fn random_encryption_config(rng: &mut ChaCha8Rng) -> EncryptionOpts {
+    let cipher_modes = [
+        CipherMode::Aes128Gcm,
+        CipherMode::Aes256Gcm,
+        CipherMode::Aegis256,
+        CipherMode::Aegis128L,
+        CipherMode::Aegis128X2,
+        CipherMode::Aegis128X4,
+        CipherMode::Aegis256X2,
+        CipherMode::Aegis256X4,
+    ];
+
+    let cipher_mode = cipher_modes[rng.random_range(0..cipher_modes.len())];
+
+    let key_size = cipher_mode.required_key_size();
+    let mut key = vec![0u8; key_size];
+    rng.fill_bytes(&mut key);
+
+    EncryptionOpts {
+        cipher: cipher_mode.to_string(),
+        hexkey: hex::encode(&key),
+    }
+}
+
+fn file_size_soft_limit_exceeded(
+    wal_path: &str,
+    file_sizes: Arc<std::sync::Mutex<HashMap<String, u64>>>,
+) -> bool {
+    let wal_size = {
+        let sizes = file_sizes.lock().unwrap();
+        sizes.get(wal_path).cloned().unwrap_or(0)
+    };
+    wal_size > FILE_SIZE_SOFT_LIMIT
+}

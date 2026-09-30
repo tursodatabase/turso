@@ -1,0 +1,13 @@
+---
+source: indexes.sqltest
+expression: SELECT id FROM collated_values_composite_larger_table WHERE val IN ('hello');
+info:
+  statement_type: SELECT
+  tables:
+  - collated_values_composite_larger_table
+  setup_blocks:
+  - collated-composite-mismatch-larger-table
+  database: ':memory:'
+---
+QUERY PLAN
+`--SCAN collated_values_composite_larger_table USING COVERING INDEX idx_collated_values_composite_nocase

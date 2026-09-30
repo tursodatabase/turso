@@ -1,0 +1,10 @@
+{
+  "name": "batch",
+  "version": "1.0.0",
+  "main": "index.mjs",
+  "author": "Giovanni Benussi",
+  "license": "MIT",
+  "dependencies": {
+    "@tursodatabase/serverless": "../.."
+  }
+}

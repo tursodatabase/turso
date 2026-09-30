@@ -1,0 +1,14 @@
+name: "Install SQLite"
+description: "Installs sqlite3 CLI for compat tests that invoke it as a subprocess (make test-compat)"
+
+runs:
+  using: "composite"
+  steps:
+    - name: Install SQLite
+      # The version is pinned in scripts/install-sqlite3.sh; keep that in
+      # sync with SQLITE_VERSION in core/dialect/sqlite.rs.
+      run: |
+        "$GITHUB_WORKSPACE/scripts/install-sqlite3.sh"
+        echo "$GITHUB_WORKSPACE/.sqlite3" >> "$GITHUB_PATH"
+        "$GITHUB_WORKSPACE/.sqlite3/sqlite3" --version
+      shell: bash

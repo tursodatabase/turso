@@ -1,0 +1,110 @@
+# 2022 October 18
+#
+# The author disclaims copyright to this source code.  In place of
+# a legal notice, here is a blessing:
+#
+#    May you do good and not evil.
+#    May you find forgiveness for yourself and forgive others.
+#    May you share freely, never taking more than you give.
+#
+#***********************************************************************
+#
+
+set testdir [file dirname $argv0]
+source $testdir/tester.tcl
+set testprefix windowE
+
+proc custom {a b} { return [string compare $a $b] }
+db collate custom custom
+
+do_execsql_test 1.0 {
+  CREATE TABLE t1(a INTEGER PRIMARY KEY, b TEXT COLLATE custom);
+  INSERT INTO t1 VALUES(1, 'one');
+  INSERT INTO t1 VALUES(2, 'two');
+  INSERT INTO t1 VALUES(3, 'three');
+  INSERT INTO t1 VALUES(4, 'four');
+  INSERT INTO t1 VALUES(5, 'five');
+  INSERT INTO t1 VALUES(6, 'six');
+  CREATE INDEX t1b ON t1(b);
+}
+
+do_execsql_test 1.1 {
+  SELECT * FROM t1
+} {
+  1 one 2 two 3 three 4 four 5 five 6 six
+}
+
+do_execsql_test 1.2 {
+  SELECT group_concat(a,',') OVER win FROM t1 
+  WINDOW win AS (
+    ORDER BY b RANGE BETWEEN 1 PRECEDING AND 2 PRECEDING
+  )
+} {
+  5 4 1 6 3 2
+}
+
+proc custom {a b} { return [string compare $b $a] }
+
+do_execsql_test 1.3 {
+  SELECT group_concat(a,',') OVER win FROM t1 
+  WINDOW win AS (
+    ORDER BY b RANGE BETWEEN 1 PRECEDING AND 2 PRECEDING
+  )
+} {
+  5 5,4 5,4,1 5,4,1,6 5,4,1,6,3 5,4,1,6,3,2
+}
+
+#-------------------------------------------------------------------------
+reset_db
+do_execsql_test 2.0 {
+  CREATE TABLE t1(x);
+}
+
+sqlite3_create_aggregate db
+
+breakpoint
+do_catchsql_test 2.1 {
+  SELECT min(x) OVER w1 FROM t1
+    WINDOW w1 AS (PARTITION BY x_count(x) OVER w1);
+} {1 {x_count() may not be used as a window function}}
+
+do_catchsql_test 2.2 {
+  SELECT min(x) FILTER (WHERE x_count(x) OVER w1) OVER w1 FROM t1
+    WINDOW w1 AS (PARTITION BY x OVER w1);
+} {1 {near "OVER": syntax error}}
+
+#-------------------------------------------------------------------------
+reset_db
+do_execsql_test 3.0 {
+  BEGIN TRANSACTION;
+    CREATE TABLE t2(c1 INT, c2 REAL);
+    INSERT INTO t2 VALUES
+    (447,0.0), (448,0.0), (449,0.0), (452,0.0), (453,0.0), (454,0.0), (455,0.0),
+    (456,0.0), (459,0.0), (460,0.0), (462,0.0), (463,0.0), (466,0.0), (467,0.0),
+    (468,0.0), (469,0.0), (470,0.0), (473,0.0), (474,0.0), (475,0.0), (476,0.0),
+    (477,0.0), (480,0.0), (481,0.0), (482,0.0), (483,0.0), (484,0.0), (487,0.0),
+    (488,0.0), (489,0.0), (490,0.0), (491,0.0), (494,0.0), (495,0.0), (496,0.0),
+    (497,0.0), (498,0.0), (501,0.0), (502,0.0), (503,0.0), (504,0.0), (505,0.0),
+    (508,0.0), (509,0.0), (510,0.0), (511,0.0), (512,0.0), (515,0.0), (516,0.0),
+    (517,0.0), (518,0.0), (519,0.0), (522,0.0), (523,0.0), (524,0.0), (525,0.0),
+    (526,0.0), (529,0.0), (530,0.0), (531,0.0), (532,0.0), (533,0.0), (536,0.0),
+    (537,1.0), (538,0.0), (539,0.0), (540,0.0), (543,0.0), (544,0.0);
+  COMMIT;
+}
+
+do_execsql_test 3.1 {
+  select c1, max(c2) over (order by c1 range 366.0 preceding) from t2;
+} {
+  447 0.0 448 0.0 449 0.0 452 0.0 453 0.0 454 0.0 455 0.0 456 0.0 459 0.0 
+  460 0.0 462 0.0 463 0.0 466 0.0 467 0.0 468 0.0 469 0.0 470 0.0 473 0.0 
+  474 0.0 475 0.0 476 0.0 477 0.0 480 0.0 481 0.0 482 0.0 483 0.0 484 0.0 
+  487 0.0 488 0.0 489 0.0 490 0.0 491 0.0 494 0.0 495 0.0 496 0.0 497 0.0 
+  498 0.0 501 0.0 502 0.0 503 0.0 504 0.0 505 0.0 508 0.0 509 0.0 510 0.0 
+  511 0.0 512 0.0 515 0.0 516 0.0 517 0.0 518 0.0 519 0.0 522 0.0 523 0.0 
+  524 0.0 525 0.0 526 0.0 529 0.0 530 0.0 531 0.0 532 0.0 533 0.0 536 0.0 
+  537 1.0 538 1.0 539 1.0 540 1.0 543 1.0 544 1.0
+}
+
+
+finish_test
+

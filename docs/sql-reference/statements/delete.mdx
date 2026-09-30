@@ -1,0 +1,102 @@
+---
+title: DELETE
+description: Remove rows from a table
+sidebarTitle: DELETE
+---
+
+# DELETE
+
+The `DELETE` statement removes rows from a table.
+
+## Syntax
+
+```sql
+DELETE FROM table-name
+[WHERE expression]
+[RETURNING result-column [, result-column ...]]
+```
+
+## Description
+
+`DELETE` removes rows that match the `WHERE` condition. If no `WHERE` clause is provided, all rows in the table are deleted. The table itself is not removed; use [DROP TABLE](/docs/sql-reference/statements/drop-table) to remove a table entirely.
+
+### WHERE Clause
+
+The `WHERE` clause restricts which rows are deleted. Only rows where the expression evaluates to true are removed. Without a `WHERE` clause, every row in the table is deleted.
+
+```sql
+DELETE FROM logs WHERE created_at < date('now', '-90 days');
+```
+
+### RETURNING Clause
+
+The `RETURNING` clause causes the `DELETE` statement to return the values of each deleted row. The result columns can be any expression referencing the deleted row's columns.
+
+```sql
+DELETE FROM sessions
+WHERE expires_at < datetime('now')
+RETURNING session_id, user_id;
+```
+
+<Info>
+`ORDER BY` and `LIMIT` clauses are not supported on `DELETE` statements. This matches default SQLite builds, which only accept them when compiled with `SQLITE_ENABLE_UPDATE_DELETE_LIMIT`. To delete a bounded number of rows in a specific order, select the target rows with a subquery:
+
+```sql
+DELETE FROM logs
+WHERE id IN (SELECT id FROM logs ORDER BY created_at ASC LIMIT 1000);
+```
+</Info>
+
+## Examples
+
+### Delete rows matching a condition
+
+```sql
+CREATE TABLE tasks (id INTEGER PRIMARY KEY, title TEXT, completed INTEGER);
+INSERT INTO tasks VALUES (1, 'Write docs', 1);
+INSERT INTO tasks VALUES (2, 'Review PR', 0);
+INSERT INTO tasks VALUES (3, 'Fix bug', 1);
+
+DELETE FROM tasks WHERE completed = 1;
+
+SELECT * FROM tasks;
+-- 2|Review PR|0
+```
+
+### Delete with RETURNING
+
+```sql
+CREATE TABLE queue (id INTEGER PRIMARY KEY, payload TEXT, priority INTEGER);
+INSERT INTO queue VALUES (1, 'job_a', 10);
+INSERT INTO queue VALUES (2, 'job_b', 5);
+INSERT INTO queue VALUES (3, 'job_c', 10);
+
+DELETE FROM queue
+WHERE id = (SELECT id FROM queue ORDER BY priority DESC, id ASC LIMIT 1)
+RETURNING id, payload;
+-- 1|job_a
+```
+
+### Delete the oldest rows with a subquery
+
+```sql
+CREATE TABLE events (id INTEGER PRIMARY KEY, message TEXT, created_at TEXT);
+INSERT INTO events VALUES (1, 'startup', '2025-01-01');
+INSERT INTO events VALUES (2, 'request', '2025-01-02');
+INSERT INTO events VALUES (3, 'shutdown', '2025-01-03');
+INSERT INTO events VALUES (4, 'startup', '2025-01-04');
+
+DELETE FROM events
+WHERE id IN (SELECT id FROM events ORDER BY created_at ASC LIMIT 2);
+
+SELECT * FROM events;
+-- 3|shutdown|2025-01-03
+-- 4|startup|2025-01-04
+```
+
+## See Also
+
+- [UPDATE](/docs/sql-reference/statements/update) for modifying existing rows
+- [INSERT](/docs/sql-reference/statements/insert) for adding new rows
+- [DROP TABLE](/docs/sql-reference/statements/drop-table) for removing an entire table
+- [SELECT](/docs/sql-reference/statements/select) for querying data

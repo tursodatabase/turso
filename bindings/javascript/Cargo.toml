@@ -1,0 +1,30 @@
+[package]
+name = "turso_node"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "The Turso database library Node bindings"
+
+[lints]
+workspace = true
+
+[lib]
+crate-type = ["cdylib", "lib"]
+
+[dependencies]
+turso_core = { workspace = true, features = ["fts"] }
+turso_parser = { workspace = true }
+napi = { version = "3.8.3", default-features = false, features = ["napi6"] }
+napi-derive = { version = "3.5.2", default-features = true }
+tracing-subscriber = { workspace = true, features = ["env-filter"] }
+tracing.workspace = true
+chrono = { workspace = true, default-features = false, features = ["clock"] }
+
+[features]
+browser = []
+test_helper = ["turso_core/test_helper"]
+tracing_release = ["turso_core/tracing_release"]
+[build-dependencies]
+napi-build = "2.3.1"

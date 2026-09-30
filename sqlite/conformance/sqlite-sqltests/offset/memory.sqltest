@@ -1,0 +1,151 @@
+@database :memory:
+
+@cross-check-integrity
+test select-limit-comma-offset-equivalence {
+    CREATE TABLE nums (x INTEGER);
+    INSERT INTO nums VALUES (1),(2),(3),(4),(5),(6),(7),(8),(9),(10);
+    SELECT x FROM nums ORDER BY x LIMIT 3 OFFSET 2;
+    SELECT x FROM nums ORDER BY x LIMIT 2,3;
+}
+expect {
+    3
+    4
+    5
+    3
+    4
+    5
+}
+
+@cross-check-integrity
+test offset-continues-the-innermost-join-loop {
+    CREATE TABLE offset_left(x INTEGER);
+    CREATE TABLE offset_right(y INTEGER);
+    INSERT INTO offset_left VALUES (1), (2);
+    INSERT INTO offset_right VALUES (10), (20), (30);
+    SELECT count(*) FROM (
+        SELECT *
+        FROM offset_left CROSS JOIN offset_right
+        LIMIT 2 OFFSET 2
+    );
+}
+expect {
+    2
+}
+
+# https://github.com/tursodatabase/turso/issues/8727
+@cross-check-integrity
+test offset-over-join-skips-result-rows-not-outer-rows {
+    CREATE TABLE offset_join_a(k INTEGER PRIMARY KEY);
+    CREATE TABLE offset_join_b(k INTEGER PRIMARY KEY);
+    INSERT INTO offset_join_a VALUES (1), (2), (3);
+    INSERT INTO offset_join_b VALUES (1), (2);
+    SELECT offset_join_a.k, offset_join_b.k
+        FROM offset_join_a, offset_join_b
+        ORDER BY offset_join_a.k, offset_join_b.k
+        LIMIT 10 OFFSET 2;
+    CREATE TABLE offset_join_dest(x, y);
+    INSERT INTO offset_join_dest
+        SELECT offset_join_a.k, offset_join_b.k
+        FROM offset_join_a, offset_join_b
+        ORDER BY offset_join_a.k, offset_join_b.k
+        LIMIT 10 OFFSET 2;
+    SELECT x, y FROM offset_join_dest ORDER BY x, y;
+}
+expect {
+    2|1
+    2|2
+    3|1
+    3|2
+    2|1
+    2|2
+    3|1
+    3|2
+}
+
+# https://github.com/tursodatabase/turso/issues/3300
+@cross-check-integrity
+test select-ungrouped-aggregate-with-offset-limit {
+    CREATE TABLE t(a INTEGER);
+    INSERT INTO t VALUES (1),(2),(3),(4),(5),(6),(7),(8),(9),(10);
+    SELECT COUNT(a) FROM t LIMIT 1 OFFSET 1;
+}
+expect {
+}
+
+test offset-expr-can-be-cast-losslessly-1 {
+    SELECT 1 LIMIT 3 OFFSET 1.1 + 2.9;
+}
+expect {
+}
+
+@cross-check-integrity
+test offset-expr-can-be-cast-losslessly-2 {
+    CREATE TABLE T(a);
+    INSERT INTO T VALUES (1),(2),(3),(4);
+    SELECT * FROM T LIMIT 1+'2' OFFSET 1.6/2 + 3.6/3 + 4*0.25;
+}
+expect {
+    4
+}
+
+# Strings are cast to float. Final result is integer losslessly
+@cross-check-integrity
+test offset-expr-can-be-cast-losslessly-3 {
+    CREATE TABLE T(a);
+    INSERT INTO T VALUES (1),(2),(3),(4);
+    SELECT * FROM T LIMIT 3 OFFSET '0.8' + '1.2' + '4'*'0.25';
+}
+expect {
+    4
+}
+
+# Strings are cast to 0. Expression still valid.
+test offset-expr-int-and-string {
+    SELECT 1 LIMIT 3 OFFSET 3/3 + 'test' + 4*'test are best';
+}
+expect {
+}
+
+test offset-expr-cannot-be-cast-losslessly-1 {
+    SELECT 1 LIMIT 3 OFFSET 1.1;
+}
+expect error {
+    datatype mismatch
+}
+
+test offset-expr-cannot-be-cast-losslessly-2 {
+    SELECT 1 LIMIT 3 OFFSET 1.1 + 2.2 + 1.9/8;
+}
+expect error {
+    datatype mismatch
+}
+
+# Return error as float in expression cannot be cast losslessly
+test offset-expr-cannot-be-cast-losslessly-3 {
+    SELECT 1 LIMIT 3 OFFSET 1.1 + 'a';
+}
+expect error {
+    datatype mismatch
+}
+
+test offset-expr-invalid-data-type-1 {
+    SELECT 1 LIMIT 3 OFFSET 'a';
+}
+expect error {
+    datatype mismatch
+}
+
+test offset-expr-invalid-data-type-2 {
+    SELECT 1 LIMIT 3 OFFSET NULL;
+}
+expect error {
+    datatype mismatch
+}
+
+# Expression below evaluates to NULL (string → 0)
+test offset-expr-invalid-data-type-3 {
+    SELECT 1 LIMIT 3 OFFSET 1/'iwillbezero ;-; ';
+}
+expect error {
+    datatype mismatch
+}

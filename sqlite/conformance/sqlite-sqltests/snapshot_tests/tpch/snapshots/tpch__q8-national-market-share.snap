@@ -1,0 +1,60 @@
+---
+source: tpch.sqltest
+expression: |-
+  select
+          o_year,
+          sum(cast(case
+              when nation = 'INDIA' then volume
+              else 0
+          end as number)) / sum(volume) as mkt_share
+      from
+          (
+              select
+                  substr(o_orderdate, 1, 4) as o_year,
+                  l_extendedprice * (1 - l_discount) as volume,
+                  n2.n_name as nation
+              from
+                  part,
+                  supplier,
+                  lineitem,
+                  orders,
+                  customer,
+                  nation n1,
+                  nation n2,
+                  region
+              where
+                  p_partkey = l_partkey
+                  and s_suppkey = l_suppkey
+                  and l_orderkey = o_orderkey
+                  and o_custkey = c_custkey
+                  and c_nationkey = n1.n_nationkey
+                  and n1.n_regionkey = r_regionkey
+                  and r_name = 'ASIA'
+                  and s_nationkey = n2.n_nationkey
+                  and o_orderdate between
+                      '1995-01-01' and '1996-12-31'
+                  and p_type = 'PROMO BRUSHED COPPER'
+          ) as all_nations
+      group by
+          o_year
+      order by
+          o_year;
+info:
+  statement_type: SELECT
+  tables:
+  - part
+  setup_blocks:
+  - schema
+  database: ':memory:'
+---
+QUERY PLAN
+|--SCAN all_nations
+|  |--SCAN orders
+|  |--SEARCH lineitem USING INDEX sqlite_autoindex_lineitem_1 (l_orderkey=?)
+|  |--SEARCH part USING INTEGER PRIMARY KEY (rowid=?)
+|  |--SEARCH customer USING INTEGER PRIMARY KEY (rowid=?)
+|  |--SEARCH n1 USING INTEGER PRIMARY KEY (rowid=?)
+|  |--SEARCH region USING INTEGER PRIMARY KEY (rowid=?)
+|  |--SEARCH supplier USING INTEGER PRIMARY KEY (rowid=?)
+|  `--SEARCH n2 USING INTEGER PRIMARY KEY (rowid=?)
+`--USE SORTER FOR GROUP BY

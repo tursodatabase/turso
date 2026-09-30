@@ -1,0 +1,17 @@
+@database database/integrity_missing_partial_index_entry.db readonly
+
+@skip-file-if mvcc "not supported in MVCC mode"
+
+test integrity-check-corrupt-missing-partial-index-entry {
+    PRAGMA integrity_check;
+}
+expect {
+    row 3 missing from index idx_partial
+}
+
+test quick-check-corrupt-missing-partial-index-entry {
+    PRAGMA quick_check;
+}
+expect {
+    ok
+}

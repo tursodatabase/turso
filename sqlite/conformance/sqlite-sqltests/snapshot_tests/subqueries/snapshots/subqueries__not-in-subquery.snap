@@ -1,0 +1,23 @@
+---
+source: subqueries.sqltest
+expression: |-
+  SELECT id, name, department
+      FROM employees
+      WHERE id NOT IN (
+          SELECT DISTINCT manager_id
+          FROM employees
+          WHERE manager_id IS NOT NULL
+      );
+info:
+  statement_type: SELECT
+  tables:
+  - employees
+  setup_blocks:
+  - schema
+  database: ':memory:'
+---
+QUERY PLAN
+|--LIST SUBQUERY 1
+|  |--SCAN employees USING COVERING INDEX idx_employees_manager
+|  `--USE HASH TABLE FOR DISTINCT
+`--SCAN employees

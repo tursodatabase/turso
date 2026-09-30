@@ -1,0 +1,23 @@
+[package]
+name = "turso-java"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[lints]
+workspace = true
+
+[features]
+tracing_release = ["turso_core/tracing_release"]
+[lib]
+name = "_turso_java"
+crate-type = ["cdylib"]
+path = "rs_src/lib.rs"
+
+[dependencies]
+turso_core = { workspace = true, features = ["io_uring"] }
+jni = "0.21.1"
+thiserror = { workspace = true }

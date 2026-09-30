@@ -1,0 +1,2039 @@
+import logging
+import os
+import sqlite3
+
+import pytest
+import turso
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s", force=True)
+
+
+def connect(provider, database):
+    if provider == "turso":
+        return turso.connect(database)
+    if provider == "sqlite3":
+        return sqlite3.connect(database)
+    raise Exception(f"Provider `{provider}` is not supported")
+
+
+@pytest.fixture(autouse=True)
+def setup_database():
+    db_path = "tests/database.db"
+    db_wal_path = "tests/database.db-wal"
+
+    # Ensure the database file is created fresh for each test
+    try:
+        if os.path.exists(db_path):
+            os.remove(db_path)
+        if os.path.exists(db_wal_path):
+            os.remove(db_wal_path)
+    except PermissionError as e:
+        print(f"Failed to clean up: {e}")
+
+    # Create a new database file
+    conn = sqlite3.connect(db_path)
+    cursor = conn.cursor()
+    cursor.execute("CREATE TABLE IF NOT EXISTS users (id INT PRIMARY KEY, username TEXT)")
+    cursor.execute("""
+        INSERT INTO users (id, username)
+        SELECT 1, 'alice'
+        WHERE NOT EXISTS (SELECT 1 FROM users WHERE id = 1)
+    """)
+    cursor.execute("""
+        INSERT INTO users (id, username)
+        SELECT 2, 'bob'
+        WHERE NOT EXISTS (SELECT 1 FROM users WHERE id = 2)
+    """)
+    conn.commit()
+    conn.close()
+
+    yield db_path
+
+    # Cleanup after the test
+    try:
+        if os.path.exists(db_path):
+            os.remove(db_path)
+        if os.path.exists(db_wal_path):
+            os.remove(db_wal_path)
+    except PermissionError as e:
+        print(f"Failed to clean up: {e}")
+
+
+@pytest.mark.parametrize("provider", ["sqlite3", "turso"])
+def test_fetchall_select_all_users(provider, setup_database):
+    conn = connect(provider, setup_database)
+    cursor = conn.cursor()
+    cursor.execute("SELECT * FROM users")
+
+    users = cursor.fetchall()
+
+    conn.close()
+    assert users
+    assert users == [(1, "alice"), (2, "bob")]
+
+
+@pytest.mark.parametrize("provider", ["sqlite3", "turso"])
+def test_fetchall_select_user_ids(provider):
+    conn = connect(provider, "tests/database.db")
+    cursor = conn.cursor()
+    cursor.execute("SELECT id FROM users")
+
+    user_ids = cursor.fetchall()
+
+    conn.close()
+    assert user_ids
+    assert user_ids == [(1,), (2,)]
+
+
+@pytest.mark.parametrize("provider", ["sqlite3", "turso"])
+def test_in_memory_fetchone_select_all_users(provider):
+    conn = connect(provider, ":memory:")
+    cursor = conn.cursor()
+    cursor.execute("CREATE TABLE users (id INTEGER PRIMARY KEY, username TEXT)")
+    cursor.execute("INSERT INTO users VALUES (1, 'alice')")
+
+    cursor.execute("SELECT * FROM users")
+
+    alice = cursor.fetchone()
+
+    conn.close()
+    assert alice
+    assert alice == (1, "alice")
+
+
+@pytest.mark.parametrize("provider", ["sqlite3", "turso"])
+def test_in_memory_index(provider):
+    conn = connect(provider, ":memory:")
+    cursor = conn.cursor()
+    cursor.execute("CREATE TABLE users (name TEXT PRIMARY KEY, email TEXT)")
+    cursor.execute("CREATE INDEX email_idx ON users(email)")
+    cursor.execute("INSERT INTO users VALUES ('alice', 'a@b.c'), ('bob', 'b@d.e')")
+
+    cursor.execute("SELECT * FROM users WHERE email = 'a@b.c'")
+    alice = cursor.fetchall()
+
+    cursor.execute("SELECT * FROM users WHERE email = 'b@d.e'")
+    bob = cursor.fetchall()
+
+    conn.close()
+    assert alice == [("alice", "a@b.c")]
+    assert bob == [("bob", "b@d.e")]
+
+
+@pytest.mark.parametrize("provider", ["sqlite3", "turso"])
+def test_fetchone_select_all_users(provider):
+    conn = connect(provider, "tests/database.db")
+    cursor = conn.cursor()
+    cursor.execute("SELECT * FROM users")
+
+    alice = cursor.fetchone()
+    assert alice
+    assert alice == (1, "alice")
+
+    bob = cursor.fetchone()
+
+    conn.close()
+    assert bob
+    assert bob == (2, "bob")
+
+
+@pytest.mark.parametrize("provider", ["sqlite3", "turso"])
+def test_fetchone_select_max_user_id(provider):
+    conn = connect(provider, "tests/database.db")
+    cursor = conn.cursor()
+    cursor.execute("SELECT MAX(id) FROM users")
+
+    max_id = cursor.fetchone()
+
+    conn.close()
+    assert max_id
+    assert max_id == (2,)
+
+
+# Test case for: https://github.com/tursodatabase/turso/issues/494
+@pytest.mark.parametrize("provider", ["sqlite3", "turso"])
+def test_commit(provider):
+    conn = connect(provider, "tests/database.db")
+    cur = conn.cursor()
+
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS users_b (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            username TEXT NOT NULL,
+            email TEXT NOT NULL,
+            role TEXT NOT NULL,
+            created_at DATETIME NOT NULL DEFAULT (datetime('now'))
+        )
+    """)
+
+    conn.commit()
+
+    sample_users = [
+        ("alice", "alice@example.com", "admin"),
+        ("bob", "bob@example.com", "user"),
+        ("charlie", "charlie@example.com", "moderator"),
+        ("diana", "diana@example.com", "user"),
+    ]
+
+    for username, email, role in sample_users:
+        cur.execute("INSERT INTO users_b (username, email, role) VALUES (?, ?, ?)", (username, email, role))
+
+    conn.commit()
+
+    # Now query the table
+    res = cur.execute("SELECT * FROM users_b")
+    record = res.fetchone()
+
+    conn.close()
+    assert record
+
+
+# Test case for: https://github.com/tursodatabase/turso/issues/2002
+@pytest.mark.parametrize("provider", ["sqlite3", "turso"])
+def test_first_rollback(provider, tmp_path):
+    db_file = tmp_path / "test_first_rollback.db"
+
+    conn = connect(provider, str(db_file))
+    cur = conn.cursor()
+    cur.execute("CREATE TABLE users (id INTEGER PRIMARY KEY, username TEXT)")
+    cur.execute("INSERT INTO users VALUES (1, 'alice')")
+    cur.execute("INSERT INTO users VALUES (2, 'bob')")
+
+    conn.rollback()
+
+    cur.execute("SELECT * FROM users")
+    users = cur.fetchall()
+
+    assert users == []
+    conn.close()
+
+
+@pytest.mark.parametrize("provider", ["sqlite3", "turso"])
+def test_with_statement(provider):
+    with connect(provider, "tests/database.db") as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT MAX(id) FROM users")
+
+        max_id = cursor.fetchone()
+
+        assert max_id
+        assert max_id == (2,)
+
+
+# DB-API 2.0 tests
+
+
+@pytest.mark.parametrize("provider", ["sqlite3", "turso"])
+def test_cursor_description(provider):
+    conn = connect(provider, ":memory:")
+    cursor = conn.cursor()
+    cursor.execute("CREATE TABLE test (id INTEGER, name TEXT, value REAL)")
+    cursor.execute("INSERT INTO test VALUES (1, 'test', 3.14)")
+    cursor.execute("SELECT * FROM test")
+
+    assert cursor.description is not None
+    assert len(cursor.description) == 3
+    assert cursor.description[0][0] == "id"
+    assert cursor.description[1][0] == "name"
+    assert cursor.description[2][0] == "value"
+
+    conn.close()
+
+
+@pytest.mark.parametrize("provider", ["sqlite3", "turso"])
+def test_cursor_rowcount_insert(provider):
+    conn = connect(provider, ":memory:")
+    cursor = conn.cursor()
+    cursor.execute("CREATE TABLE test (id INTEGER, name TEXT)")
+    cursor.execute("INSERT INTO test VALUES (1, 'alice'), (2, 'bob'), (3, 'charlie')")
+
+    assert cursor.rowcount == 3
+
+    conn.close()
+
+
+@pytest.mark.parametrize("provider", ["sqlite3", "turso"])
+def test_cursor_rowcount_update(provider):
+    conn = connect(provider, ":memory:")
+    cursor = conn.cursor()
+    cursor.execute("CREATE TABLE test (id INTEGER, name TEXT)")
+    cursor.execute("INSERT INTO test VALUES (1, 'alice'), (2, 'bob')")
+    cursor.execute("UPDATE test SET name = 'updated' WHERE id = 1")
+
+    assert cursor.rowcount == 1
+
+    conn.close()
+
+
+@pytest.mark.parametrize("provider", ["sqlite3", "turso"])
+def test_cursor_rowcount_delete(provider):
+    conn = connect(provider, ":memory:")
+    cursor = conn.cursor()
+    cursor.execute("CREATE TABLE test (id INTEGER, name TEXT)")
+    cursor.execute("INSERT INTO test VALUES (1, 'alice'), (2, 'bob'), (3, 'charlie')")
+    cursor.execute("DELETE FROM test WHERE id > 1")
+
+    assert cursor.rowcount == 2
+
+    conn.close()
+
+
+@pytest.mark.parametrize("provider", ["sqlite3", "turso"])
+def test_cursor_fetchmany(provider):
+    conn = connect(provider, ":memory:")
+    cursor = conn.cursor()
+    cursor.execute("CREATE TABLE test (id INTEGER)")
+    cursor.execute("INSERT INTO test VALUES (1), (2), (3), (4), (5)")
+    cursor.execute("SELECT * FROM test")
+
+    cursor.arraysize = 2
+    rows = cursor.fetchmany()
+    assert len(rows) == 2
+    assert rows == [(1,), (2,)]
+
+    rows = cursor.fetchmany(3)
+    assert len(rows) == 3
+    assert rows == [(3,), (4,), (5,)]
+
+    conn.close()
+
+
+@pytest.mark.parametrize("provider", ["sqlite3", "turso"])
+def test_cursor_iterator(provider):
+    conn = connect(provider, ":memory:")
+    cursor = conn.cursor()
+    cursor.execute("CREATE TABLE test (id INTEGER)")
+    cursor.execute("INSERT INTO test VALUES (1), (2), (3)")
+    cursor.execute("SELECT * FROM test")
+
+    rows = list(cursor)
+    assert rows == [(1,), (2,), (3,)]
+
+    conn.close()
+
+
+@pytest.mark.parametrize("provider", ["sqlite3", "turso"])
+def test_cursor_close(provider):
+    conn = connect(provider, ":memory:")
+    cursor = conn.cursor()
+    cursor.execute("CREATE TABLE test (id INTEGER)")
+    cursor.close()
+
+    with pytest.raises(Exception):
+        cursor.execute("SELECT * FROM test")
+
+    conn.close()
+
+
+@pytest.mark.parametrize("provider", ["sqlite3", "turso"])
+def test_connection_execute(provider):
+    conn = connect(provider, ":memory:")
+    conn.execute("CREATE TABLE test (id INTEGER, name TEXT)")
+    cursor = conn.execute("INSERT INTO test VALUES (?, ?)", (1, "alice"))
+
+    assert cursor.rowcount == 1
+
+    cursor = conn.execute("SELECT * FROM test")
+    rows = cursor.fetchall()
+    assert rows == [(1, "alice")]
+
+    conn.close()
+
+
+@pytest.mark.parametrize("provider", ["sqlite3", "turso"])
+def test_connection_executemany(provider):
+    conn = connect(provider, ":memory:")
+    conn.execute("CREATE TABLE test (id INTEGER, name TEXT)")
+
+    data = [(1, "alice"), (2, "bob"), (3, "charlie")]
+    cursor = conn.executemany("INSERT INTO test VALUES (?, ?)", data)
+
+    assert cursor.rowcount == 3
+
+    conn.close()
+
+
+@pytest.mark.parametrize("provider", ["sqlite3", "turso"])
+def test_connection_executescript(provider):
+    conn = connect(provider, ":memory:")
+    script = """
+        CREATE TABLE test (id INTEGER, name TEXT);
+        INSERT INTO test VALUES (1, 'alice');
+        INSERT INTO test VALUES (2, 'bob');
+    """
+    conn.executescript(script)
+
+    cursor = conn.execute("SELECT * FROM test")
+    rows = cursor.fetchall()
+    assert len(rows) == 2
+
+    conn.close()
+
+
+@pytest.mark.parametrize("provider", ["sqlite3", "turso"])
+def test_row_factory(provider):
+    conn = connect(provider, ":memory:")
+    conn.row_factory = turso.Row if provider == "turso" else sqlite3.Row
+
+    cursor = conn.cursor()
+    cursor.execute("CREATE TABLE test (id INTEGER, name TEXT)")
+    cursor.execute("INSERT INTO test VALUES (1, 'alice')")
+    cursor.execute("SELECT * FROM test")
+
+    row = cursor.fetchone()
+    assert row["id"] == 1
+    assert row["name"] == "alice"
+    assert row[0] == 1
+    assert row[1] == "alice"
+
+    conn.close()
+
+
+@pytest.mark.parametrize("provider", ["sqlite3", "turso"])
+def test_row_factory_keys(provider):
+    conn = connect(provider, ":memory:")
+    conn.row_factory = turso.Row if provider == "turso" else sqlite3.Row
+
+    cursor = conn.cursor()
+    cursor.execute("CREATE TABLE test (id INTEGER, name TEXT, value REAL)")
+    cursor.execute("INSERT INTO test VALUES (1, 'alice', 3.14)")
+    cursor.execute("SELECT * FROM test")
+
+    row = cursor.fetchone()
+    keys = row.keys()
+    assert keys == ["id", "name", "value"]
+
+    conn.close()
+
+
+def test_stdlib_sqlite3_row_factory_rejected():
+    """sqlite3.Row cannot work with turso cursors (its C constructor requires a
+    real sqlite3.Cursor), so fetching raises an error that points at turso.Row
+    instead of the cryptic C-level TypeError."""
+    conn = turso.connect(":memory:")
+    conn.row_factory = sqlite3.Row
+    conn.execute("CREATE TABLE t (id INTEGER, name TEXT)")
+    conn.execute("INSERT INTO t VALUES (1, 'alice')")
+    with pytest.raises(TypeError, match="turso.Row"):
+        conn.execute("SELECT * FROM t").fetchone()
+    conn.close()
+
+
+def test_stdlib_sqlite3_row_subclass_rejected_on_cursor():
+    """Rejection also applies to per-cursor assignment and sqlite3.Row subclasses."""
+    conn = turso.connect(":memory:")
+
+    class SubRow(sqlite3.Row):
+        pass
+
+    cur = conn.cursor()
+    cur.execute("CREATE TABLE t (id INTEGER)")
+    cur.execute("INSERT INTO t VALUES (1)")
+    cur.row_factory = SubRow
+    cur.execute("SELECT * FROM t")
+    with pytest.raises(TypeError, match="turso.Row"):
+        cur.fetchall()
+    conn.close()
+
+
+def test_turso_row_factory_works_where_stdlib_row_is_rejected():
+    """turso.Row is the supported replacement and provides the same interface."""
+    conn = turso.connect(":memory:")
+    conn.row_factory = turso.Row
+    conn.execute("CREATE TABLE t (id INTEGER, name TEXT)")
+    conn.execute("INSERT INTO t VALUES (1, 'alice')")
+    row = conn.execute("SELECT * FROM t").fetchone()
+    assert row["id"] == 1
+    assert row["name"] == "alice"
+    assert row[0] == 1
+    assert row.keys() == ["id", "name"]
+    conn.close()
+
+
+@pytest.mark.parametrize("provider", ["sqlite3", "turso"])
+def test_parameterized_query(provider):
+    conn = connect(provider, ":memory:")
+    cursor = conn.cursor()
+    cursor.execute("CREATE TABLE test (id INTEGER, name TEXT)")
+    cursor.execute("INSERT INTO test VALUES (?, ?)", (1, "alice"))
+    cursor.execute("INSERT INTO test VALUES (?, ?)", (2, "bob"))
+
+    cursor.execute("SELECT * FROM test WHERE id = ?", (1,))
+    row = cursor.fetchone()
+    assert row == (1, "alice")
+
+    conn.close()
+
+
+@pytest.mark.parametrize("provider", ["sqlite3", "turso"])
+def test_executemany_with_parameters(provider):
+    conn = connect(provider, ":memory:")
+    cursor = conn.cursor()
+    cursor.execute("CREATE TABLE test (id INTEGER, name TEXT)")
+
+    data = [(1, "alice"), (2, "bob"), (3, "charlie")]
+    cursor.executemany("INSERT INTO test VALUES (?, ?)", data)
+
+    cursor.execute("SELECT COUNT(*) FROM test")
+    count = cursor.fetchone()[0]
+    assert count == 3
+
+    conn.close()
+
+
+# SQL tests
+
+
+@pytest.mark.parametrize("provider", ["sqlite3", "turso"])
+def test_subquery(provider):
+    conn = connect(provider, ":memory:")
+    cursor = conn.cursor()
+    cursor.execute("CREATE TABLE test (id INTEGER, value INTEGER)")
+    cursor.execute("INSERT INTO test VALUES (1, 10), (2, 20), (3, 30)")
+
+    cursor.execute("SELECT id FROM test WHERE value > (SELECT AVG(value) FROM test)")
+    rows = cursor.fetchall()
+    assert rows == [(3,)]
+
+    conn.close()
+
+
+@pytest.mark.parametrize("provider", ["sqlite3", "turso"])
+def test_insert_returning(provider):
+    conn = connect(provider, ":memory:")
+    cursor = conn.cursor()
+    cursor.execute("CREATE TABLE test (id INTEGER PRIMARY KEY, name TEXT)")
+    cursor.execute("INSERT INTO test (id, name) VALUES (1, 'alice') RETURNING id, name")
+
+    row = cursor.fetchone()
+    assert row == (1, "alice")
+
+    conn.close()
+
+
+@pytest.mark.parametrize("provider", ["sqlite3", "turso"])
+def test_insert_returning_partial_fetch(provider):
+    conn = connect(provider, ":memory:")
+    cursor = conn.cursor()
+    cursor.execute("CREATE TABLE test (id INTEGER PRIMARY KEY, name TEXT)")
+    cursor.execute("INSERT INTO test (id, name) VALUES (1, 'alice'), (2, 'bob'), (3, 'charlie') RETURNING id, name")
+
+    row = cursor.fetchone()
+    assert row == (1, "alice")
+
+    cursor.close()
+
+    cursor = conn.cursor()
+    cursor.execute("SELECT COUNT(*) FROM test")
+    count = cursor.fetchone()[0]
+    assert count == 3
+
+    conn.close()
+
+
+@pytest.mark.parametrize("provider", ["sqlite3", "turso"])
+def test_conflict_clause_ignore(provider):
+    conn = connect(provider, ":memory:")
+    cursor = conn.cursor()
+    cursor.execute("CREATE TABLE test (id INTEGER PRIMARY KEY, name TEXT)")
+    cursor.execute("INSERT INTO test VALUES (1, 'alice')")
+    cursor.execute("INSERT OR IGNORE INTO test VALUES (1, 'bob')")
+
+    cursor.execute("SELECT * FROM test")
+    rows = cursor.fetchall()
+    assert rows == [(1, "alice")]
+
+    conn.close()
+
+
+@pytest.mark.parametrize("provider", ["sqlite3", "turso"])
+def test_conflict_clause_replace(provider):
+    conn = connect(provider, ":memory:")
+    cursor = conn.cursor()
+    cursor.execute("CREATE TABLE test (id INTEGER PRIMARY KEY, name TEXT)")
+    cursor.execute("INSERT INTO test VALUES (1, 'alice')")
+    cursor.execute("INSERT OR REPLACE INTO test VALUES (1, 'bob')")
+
+    cursor.execute("SELECT * FROM test")
+    rows = cursor.fetchall()
+    assert rows == [(1, "bob")]
+
+    conn.close()
+
+
+@pytest.mark.parametrize("provider", ["sqlite3", "turso"])
+def test_conflict_clause_rollback(provider):
+    conn = connect(provider, ":memory:")
+    cursor = conn.cursor()
+    cursor.execute("CREATE TABLE test (id INTEGER PRIMARY KEY, name TEXT)")
+    cursor.execute("INSERT INTO test VALUES (1, 'alice')")
+
+    try:
+        cursor.execute("INSERT OR ROLLBACK INTO test VALUES (1, 'bob')")
+    except Exception:
+        pass
+
+    cursor.execute("SELECT * FROM test")
+    rows = cursor.fetchall()
+    assert len(rows) <= 1
+
+    conn.close()
+
+
+@pytest.mark.parametrize("provider", ["sqlite3", "turso"])
+def test_drop_table(provider):
+    conn = connect(provider, ":memory:")
+    cursor = conn.cursor()
+    cursor.execute("CREATE TABLE test (id INTEGER)")
+    cursor.execute("DROP TABLE test")
+
+    try:
+        cursor.execute("SELECT * FROM test")
+        assert False, "Table should not exist"
+    except Exception:
+        pass
+
+    conn.close()
+
+
+@pytest.mark.parametrize("provider", ["sqlite3", "turso"])
+def test_alter_table_add_column(provider):
+    conn = connect(provider, ":memory:")
+    cursor = conn.cursor()
+    cursor.execute("CREATE TABLE test (id INTEGER)")
+    cursor.execute("INSERT INTO test VALUES (1)")
+    cursor.execute("ALTER TABLE test ADD COLUMN name TEXT")
+    cursor.execute("UPDATE test SET name = 'alice' WHERE id = 1")
+
+    cursor.execute("SELECT * FROM test")
+    row = cursor.fetchone()
+    assert row == (1, "alice")
+
+    conn.close()
+
+
+@pytest.mark.parametrize("provider", ["sqlite3", "turso"])
+def test_alter_table_rename(provider):
+    conn = connect(provider, ":memory:")
+    cursor = conn.cursor()
+    cursor.execute("CREATE TABLE test (id INTEGER)")
+    cursor.execute("INSERT INTO test VALUES (1)")
+    cursor.execute("ALTER TABLE test RENAME TO new_test")
+
+    cursor.execute("SELECT * FROM new_test")
+    row = cursor.fetchone()
+    assert row == (1,)
+
+    conn.close()
+
+
+@pytest.mark.parametrize("provider", ["sqlite3", "turso"])
+def test_inner_join(provider):
+    conn = connect(provider, ":memory:")
+    cursor = conn.cursor()
+    cursor.execute("CREATE TABLE users (id INTEGER, name TEXT)")
+    cursor.execute("CREATE TABLE orders (id INTEGER, user_id INTEGER, item TEXT)")
+    cursor.execute("INSERT INTO users VALUES (1, 'alice'), (2, 'bob')")
+    cursor.execute("INSERT INTO orders VALUES (1, 1, 'book'), (2, 1, 'pen'), (3, 2, 'notebook')")
+
+    cursor.execute("""
+        SELECT users.name, orders.item
+        FROM users
+        INNER JOIN orders ON users.id = orders.user_id
+        WHERE users.id = 1
+    """)
+    rows = cursor.fetchall()
+    assert rows == [("alice", "book"), ("alice", "pen")]
+
+    conn.close()
+
+
+@pytest.mark.parametrize("provider", ["sqlite3", "turso"])
+def test_left_join(provider):
+    conn = connect(provider, ":memory:")
+    cursor = conn.cursor()
+    cursor.execute("CREATE TABLE users (id INTEGER, name TEXT)")
+    cursor.execute("CREATE TABLE orders (id INTEGER, user_id INTEGER, item TEXT)")
+    cursor.execute("INSERT INTO users VALUES (1, 'alice'), (2, 'bob'), (3, 'charlie')")
+    cursor.execute("INSERT INTO orders VALUES (1, 1, 'book'), (2, 2, 'pen')")
+
+    cursor.execute("""
+        SELECT users.name, orders.item
+        FROM users
+        LEFT JOIN orders ON users.id = orders.user_id
+    """)
+    rows = cursor.fetchall()
+    assert len(rows) == 3
+    assert ("charlie", None) in rows
+
+    conn.close()
+
+
+@pytest.mark.parametrize("provider", ["sqlite3", "turso"])
+def test_json_extract(provider):
+    conn = connect(provider, ":memory:")
+    cursor = conn.cursor()
+    cursor.execute("CREATE TABLE test (id INTEGER, data TEXT)")
+    cursor.execute('INSERT INTO test VALUES (1, \'{"name": "alice", "age": 30}\')')
+
+    cursor.execute("SELECT json_extract(data, '$.name') FROM test")
+    row = cursor.fetchone()
+    assert row[0] == "alice"
+
+    conn.close()
+
+
+@pytest.mark.parametrize("provider", ["sqlite3", "turso"])
+def test_json_array(provider):
+    conn = connect(provider, ":memory:")
+    cursor = conn.cursor()
+    cursor.execute("SELECT json_array(1, 2, 3)")
+
+    row = cursor.fetchone()
+    assert row[0] == "[1,2,3]"
+
+    conn.close()
+
+
+@pytest.mark.parametrize("provider", ["sqlite3", "turso"])
+def test_json_object(provider):
+    conn = connect(provider, ":memory:")
+    cursor = conn.cursor()
+    cursor.execute("SELECT json_object('name', 'alice', 'age', 30)")
+
+    row = cursor.fetchone()
+    assert "alice" in row[0]
+    assert "30" in row[0]
+
+    conn.close()
+
+
+@pytest.mark.parametrize("provider", ["sqlite3", "turso"])
+def test_aggregate_functions(provider):
+    conn = connect(provider, ":memory:")
+    cursor = conn.cursor()
+    cursor.execute("CREATE TABLE test (value INTEGER)")
+    cursor.execute("INSERT INTO test VALUES (10), (20), (30), (40)")
+
+    cursor.execute("SELECT AVG(value), SUM(value), MIN(value), MAX(value), COUNT(*) FROM test")
+    row = cursor.fetchone()
+    assert row == (25.0, 100, 10, 40, 4)
+
+    conn.close()
+
+
+@pytest.mark.parametrize("provider", ["sqlite3", "turso"])
+def test_group_by(provider):
+    conn = connect(provider, ":memory:")
+    cursor = conn.cursor()
+    cursor.execute("CREATE TABLE test (category TEXT, value INTEGER)")
+    cursor.execute("INSERT INTO test VALUES ('A', 10), ('A', 20), ('B', 30), ('B', 40)")
+
+    cursor.execute("SELECT category, SUM(value) FROM test GROUP BY category")
+    rows = cursor.fetchall()
+    assert rows == [("A", 30), ("B", 70)]
+
+    conn.close()
+
+
+@pytest.mark.parametrize("provider", ["sqlite3", "turso"])
+def test_having_clause(provider):
+    conn = connect(provider, ":memory:")
+    cursor = conn.cursor()
+    cursor.execute("CREATE TABLE test (category TEXT, value INTEGER)")
+    cursor.execute("INSERT INTO test VALUES ('A', 10), ('A', 20), ('B', 5), ('B', 10)")
+
+    cursor.execute("SELECT category, SUM(value) as total FROM test GROUP BY category HAVING total > 20")
+    rows = cursor.fetchall()
+    assert rows == [("A", 30)]
+
+    conn.close()
+
+
+@pytest.mark.parametrize("provider", ["sqlite3", "turso"])
+def test_create_view(provider):
+    conn = connect(provider, ":memory:")
+    cursor = conn.cursor()
+    cursor.execute("CREATE TABLE test (id INTEGER, value INTEGER)")
+    cursor.execute("INSERT INTO test VALUES (1, 10), (2, 20), (3, 30)")
+    cursor.execute("CREATE VIEW test_view AS SELECT id, value * 2 as doubled FROM test")
+
+    cursor.execute("SELECT * FROM test_view WHERE id = 2")
+    row = cursor.fetchone()
+    assert row == (2, 40)
+
+    conn.close()
+
+
+@pytest.mark.parametrize("provider", ["sqlite3", "turso"])
+def test_drop_view(provider):
+    conn = connect(provider, ":memory:")
+    cursor = conn.cursor()
+    cursor.execute("CREATE TABLE test (id INTEGER)")
+    cursor.execute("CREATE VIEW test_view AS SELECT * FROM test")
+    cursor.execute("DROP VIEW test_view")
+
+    try:
+        cursor.execute("SELECT * FROM test_view")
+        assert False, "View should not exist"
+    except Exception:
+        pass
+
+    conn.close()
+
+
+@pytest.mark.parametrize("provider", ["sqlite3", "turso"])
+def test_with_cte(provider):
+    conn = connect(provider, ":memory:")
+    cursor = conn.cursor()
+    cursor.execute("CREATE TABLE test (id INTEGER, value INTEGER)")
+    cursor.execute("INSERT INTO test VALUES (1, 10), (2, 20), (3, 30)")
+
+    cursor.execute("""
+        WITH doubled AS (SELECT id, value * 2 as doubled_value FROM test)
+        SELECT * FROM doubled WHERE doubled_value > 30
+    """)
+    rows = cursor.fetchall()
+    assert rows == [(2, 40), (3, 60)]
+
+    conn.close()
+
+
+@pytest.mark.parametrize("provider", ["sqlite3", "turso"])
+def test_case_expression(provider):
+    conn = connect(provider, ":memory:")
+    cursor = conn.cursor()
+    cursor.execute("CREATE TABLE test (id INTEGER, value INTEGER)")
+    cursor.execute("INSERT INTO test VALUES (1, 10), (2, 20), (3, 30)")
+
+    cursor.execute("""
+        SELECT id,
+               CASE
+                   WHEN value < 15 THEN 'low'
+                   WHEN value < 25 THEN 'medium'
+                   ELSE 'high'
+               END as category
+        FROM test
+    """)
+    rows = cursor.fetchall()
+    assert rows == [(1, "low"), (2, "medium"), (3, "high")]
+
+    conn.close()
+
+
+@pytest.mark.parametrize("provider", ["sqlite3", "turso"])
+def test_between_operator(provider):
+    conn = connect(provider, ":memory:")
+    cursor = conn.cursor()
+    cursor.execute("CREATE TABLE test (id INTEGER, value INTEGER)")
+    cursor.execute("INSERT INTO test VALUES (1, 10), (2, 20), (3, 30), (4, 40)")
+
+    cursor.execute("SELECT * FROM test WHERE value BETWEEN 15 AND 35")
+    rows = cursor.fetchall()
+    assert rows == [(2, 20), (3, 30)]
+
+    conn.close()
+
+
+@pytest.mark.parametrize("provider", ["sqlite3", "turso"])
+def test_in_operator(provider):
+    conn = connect(provider, ":memory:")
+    cursor = conn.cursor()
+    cursor.execute("CREATE TABLE test (id INTEGER, name TEXT)")
+    cursor.execute("INSERT INTO test VALUES (1, 'alice'), (2, 'bob'), (3, 'charlie')")
+
+    cursor.execute("SELECT * FROM test WHERE name IN ('alice', 'charlie')")
+    rows = cursor.fetchall()
+    assert rows == [(1, "alice"), (3, "charlie")]
+
+    conn.close()
+
+
+@pytest.mark.parametrize("provider", ["sqlite3", "turso"])
+def test_like_operator(provider):
+    conn = connect(provider, ":memory:")
+    cursor = conn.cursor()
+    cursor.execute("CREATE TABLE test (id INTEGER, name TEXT)")
+    cursor.execute("INSERT INTO test VALUES (1, 'alice'), (2, 'bob'), (3, 'alicia')")
+
+    cursor.execute("SELECT * FROM test WHERE name LIKE 'ali%'")
+    rows = cursor.fetchall()
+    assert len(rows) == 2
+
+    conn.close()
+
+
+@pytest.mark.parametrize("provider", ["sqlite3", "turso"])
+def test_glob_operator(provider):
+    conn = connect(provider, ":memory:")
+    cursor = conn.cursor()
+    cursor.execute("CREATE TABLE test (id INTEGER, name TEXT)")
+    cursor.execute("INSERT INTO test VALUES (1, 'alice'), (2, 'bob'), (3, 'alicia')")
+
+    cursor.execute("SELECT * FROM test WHERE name GLOB 'ali*'")
+    rows = cursor.fetchall()
+    assert len(rows) == 2
+
+    conn.close()
+
+
+@pytest.mark.parametrize("provider", ["sqlite3", "turso"])
+def test_exists_operator(provider):
+    conn = connect(provider, ":memory:")
+    cursor = conn.cursor()
+    cursor.execute("CREATE TABLE users (id INTEGER, name TEXT)")
+    cursor.execute("CREATE TABLE orders (id INTEGER, user_id INTEGER)")
+    cursor.execute("INSERT INTO users VALUES (1, 'alice'), (2, 'bob')")
+    cursor.execute("INSERT INTO orders VALUES (1, 1)")
+
+    cursor.execute("""
+        SELECT name FROM users
+        WHERE EXISTS (SELECT 1 FROM orders WHERE orders.user_id = users.id)
+    """)
+    rows = cursor.fetchall()
+    assert rows == [("alice",)]
+
+    conn.close()
+
+
+@pytest.mark.parametrize("provider", ["sqlite3", "turso"])
+def test_transaction_begin_commit(provider):
+    conn = connect(provider, ":memory:")
+    cursor = conn.cursor()
+    cursor.execute("CREATE TABLE test (id INTEGER, value TEXT)")
+
+    cursor.execute("BEGIN")
+    cursor.execute("INSERT INTO test VALUES (1, 'test')")
+    cursor.execute("COMMIT")
+
+    cursor.execute("SELECT * FROM test")
+    rows = cursor.fetchall()
+    assert rows == [(1, "test")]
+
+    conn.close()
+
+
+@pytest.mark.parametrize("provider", ["sqlite3", "turso"])
+def test_transaction_begin_rollback(provider):
+    conn = connect(provider, ":memory:")
+    cursor = conn.cursor()
+    cursor.execute("CREATE TABLE test (id INTEGER, value TEXT)")
+
+    cursor.execute("BEGIN")
+    cursor.execute("INSERT INTO test VALUES (2, 'rollback')")
+    cursor.execute("ROLLBACK")
+
+    cursor.execute("SELECT * FROM test")
+    rows = cursor.fetchall()
+    assert rows == []
+
+    conn.close()
+
+
+@pytest.mark.parametrize("provider", ["sqlite3", "turso"])
+def test_multiple_cursors_same_connection(provider):
+    conn = connect(provider, ":memory:")
+    cursor1 = conn.cursor()
+    cursor2 = conn.cursor()
+
+    cursor1.execute("CREATE TABLE test (id INTEGER)")
+    cursor1.execute("INSERT INTO test VALUES (1), (2)")
+
+    cursor2.execute("SELECT * FROM test")
+    rows = cursor2.fetchall()
+    assert len(rows) == 2
+
+    cursor1.close()
+    cursor2.close()
+    conn.close()
+
+
+@pytest.mark.parametrize("provider", ["sqlite3", "turso"])
+def test_cursor_description_before_execute(provider):
+    conn = connect(provider, ":memory:")
+    cursor = conn.cursor()
+
+    assert cursor.description is None
+
+    cursor.execute("CREATE TABLE test (id INTEGER)")
+    cursor.execute("SELECT * FROM test")
+
+    assert cursor.description is not None
+
+    conn.close()
+
+
+@pytest.mark.parametrize("provider", ["sqlite3", "turso"])
+def test_cursor_arraysize_default(provider):
+    conn = connect(provider, ":memory:")
+    cursor = conn.cursor()
+
+    assert cursor.arraysize == 1
+
+    conn.close()
+
+
+@pytest.mark.parametrize("provider", ["sqlite3", "turso"])
+def test_empty_fetchall(provider):
+    conn = connect(provider, ":memory:")
+    cursor = conn.cursor()
+    cursor.execute("CREATE TABLE test (id INTEGER)")
+    cursor.execute("SELECT * FROM test")
+
+    rows = cursor.fetchall()
+    assert rows == []
+
+    conn.close()
+
+
+@pytest.mark.parametrize("provider", ["sqlite3", "turso"])
+def test_empty_fetchone(provider):
+    conn = connect(provider, ":memory:")
+    cursor = conn.cursor()
+    cursor.execute("CREATE TABLE test (id INTEGER)")
+    cursor.execute("SELECT * FROM test")
+
+    row = cursor.fetchone()
+    assert row is None
+
+    conn.close()
+
+
+@pytest.mark.parametrize("provider", ["sqlite3", "turso"])
+def test_empty_fetchmany(provider):
+    conn = connect(provider, ":memory:")
+    cursor = conn.cursor()
+    cursor.execute("CREATE TABLE test (id INTEGER)")
+    cursor.execute("SELECT * FROM test")
+
+    rows = cursor.fetchmany(5)
+    assert rows == []
+
+    conn.close()
+
+
+@pytest.mark.parametrize("provider", ["sqlite3", "turso"])
+def test_unicode_data(provider):
+    conn = connect(provider, ":memory:")
+    cursor = conn.cursor()
+    cursor.execute("CREATE TABLE test (id INTEGER, text TEXT)")
+    cursor.execute("INSERT INTO test VALUES (?, ?)", (1, "Hello 世界 🌍"))
+
+    cursor.execute("SELECT text FROM test")
+    row = cursor.fetchone()
+    assert row[0] == "Hello 世界 🌍"
+
+    conn.close()
+
+
+@pytest.mark.parametrize("provider", ["sqlite3", "turso"])
+def test_null_values(provider):
+    conn = connect(provider, ":memory:")
+    cursor = conn.cursor()
+    cursor.execute("CREATE TABLE test (id INTEGER, value TEXT)")
+    cursor.execute("INSERT INTO test VALUES (1, NULL)")
+
+    cursor.execute("SELECT * FROM test")
+    row = cursor.fetchone()
+    assert row == (1, None)
+
+    conn.close()
+
+
+@pytest.mark.parametrize("provider", ["sqlite3", "turso"])
+def test_blob_data(provider):
+    conn = connect(provider, ":memory:")
+    cursor = conn.cursor()
+    cursor.execute("CREATE TABLE test (id INTEGER, data BLOB)")
+
+    blob_data = b"\x00\x01\x02\x03\x04"
+    cursor.execute("INSERT INTO test VALUES (?, ?)", (1, blob_data))
+
+    cursor.execute("SELECT data FROM test")
+    row = cursor.fetchone()
+    assert row[0] == blob_data
+
+    conn.close()
+
+
+@pytest.mark.parametrize("provider", ["sqlite3", "turso"])
+def test_limit_offset(provider):
+    conn = connect(provider, ":memory:")
+    cursor = conn.cursor()
+    cursor.execute("CREATE TABLE test (id INTEGER)")
+    cursor.execute("INSERT INTO test VALUES (1), (2), (3), (4), (5)")
+
+    cursor.execute("SELECT * FROM test LIMIT 2 OFFSET 2")
+    rows = cursor.fetchall()
+    assert rows == [(3,), (4,)]
+
+    conn.close()
+
+
+@pytest.mark.parametrize("provider", ["sqlite3", "turso"])
+def test_order_by_desc(provider):
+    conn = connect(provider, ":memory:")
+    cursor = conn.cursor()
+    cursor.execute("CREATE TABLE test (id INTEGER, value INTEGER)")
+    cursor.execute("INSERT INTO test VALUES (1, 30), (2, 10), (3, 20)")
+
+    cursor.execute("SELECT * FROM test ORDER BY value DESC")
+    rows = cursor.fetchall()
+    assert rows == [(1, 30), (3, 20), (2, 10)]
+
+    conn.close()
+
+
+@pytest.mark.parametrize("provider", ["sqlite3", "turso"])
+def test_distinct(provider):
+    conn = connect(provider, ":memory:")
+    cursor = conn.cursor()
+    cursor.execute("CREATE TABLE test (value TEXT)")
+    cursor.execute("INSERT INTO test VALUES ('a'), ('b'), ('a'), ('c'), ('b')")
+
+    cursor.execute("SELECT DISTINCT value FROM test ORDER BY value")
+    rows = cursor.fetchall()
+    assert rows == [("a",), ("b",), ("c",)]
+
+    conn.close()
+
+
+@pytest.mark.parametrize("provider", ["sqlite3", "turso"])
+def test_coalesce_function(provider):
+    conn = connect(provider, ":memory:")
+    cursor = conn.cursor()
+    cursor.execute("CREATE TABLE test (id INTEGER, a TEXT, b TEXT)")
+    cursor.execute("INSERT INTO test VALUES (1, NULL, 'fallback'), (2, 'value', 'fallback')")
+
+    cursor.execute("SELECT COALESCE(a, b) FROM test ORDER BY id")
+    rows = cursor.fetchall()
+    assert rows == [("fallback",), ("value",)]
+
+    conn.close()
+
+
+@pytest.mark.parametrize("provider", ["sqlite3", "turso"])
+def test_union_operator(provider):
+    conn = connect(provider, ":memory:")
+    cursor = conn.cursor()
+    cursor.execute("CREATE TABLE t1 (value INTEGER)")
+    cursor.execute("CREATE TABLE t2 (value INTEGER)")
+    cursor.execute("INSERT INTO t1 VALUES (1), (2)")
+    cursor.execute("INSERT INTO t2 VALUES (2), (3)")
+
+    cursor.execute("SELECT value FROM t1 UNION SELECT value FROM t2")
+    rows = cursor.fetchall()
+    assert len(rows) == 3
+
+    conn.close()
+
+
+@pytest.mark.parametrize("provider", ["sqlite3", "turso"])
+def test_union_all_operator(provider):
+    conn = connect(provider, ":memory:")
+    cursor = conn.cursor()
+    cursor.execute("CREATE TABLE t1 (value INTEGER)")
+    cursor.execute("CREATE TABLE t2 (value INTEGER)")
+    cursor.execute("INSERT INTO t1 VALUES (1), (2)")
+    cursor.execute("INSERT INTO t2 VALUES (2), (3)")
+
+    cursor.execute("SELECT value FROM t1 UNION ALL SELECT value FROM t2")
+    rows = cursor.fetchall()
+    assert len(rows) == 4
+
+    conn.close()
+
+
+@pytest.mark.parametrize("provider", ["sqlite3", "turso"])
+def test_is_null_operator(provider):
+    conn = connect(provider, ":memory:")
+    cursor = conn.cursor()
+    cursor.execute("CREATE TABLE test (id INTEGER, value TEXT)")
+    cursor.execute("INSERT INTO test VALUES (1, 'a'), (2, NULL), (3, 'c')")
+
+    cursor.execute("SELECT id FROM test WHERE value IS NULL")
+    rows = cursor.fetchall()
+    assert rows == [(2,)]
+
+    conn.close()
+
+
+@pytest.mark.parametrize("provider", ["sqlite3", "turso"])
+def test_is_not_null_operator(provider):
+    conn = connect(provider, ":memory:")
+    cursor = conn.cursor()
+    cursor.execute("CREATE TABLE test (id INTEGER, value TEXT)")
+    cursor.execute("INSERT INTO test VALUES (1, 'a'), (2, NULL), (3, 'c')")
+
+    cursor.execute("SELECT id FROM test WHERE value IS NOT NULL ORDER BY id")
+    rows = cursor.fetchall()
+    assert rows == [(1,), (3,)]
+
+    conn.close()
+
+
+@pytest.mark.parametrize("provider", ["sqlite3", "turso"])
+def test_not_in_operator(provider):
+    conn = connect(provider, ":memory:")
+    cursor = conn.cursor()
+    cursor.execute("CREATE TABLE test (id INTEGER, name TEXT)")
+    cursor.execute("INSERT INTO test VALUES (1, 'alice'), (2, 'bob'), (3, 'charlie')")
+
+    cursor.execute("SELECT * FROM test WHERE name NOT IN ('alice', 'charlie') ORDER BY id")
+    rows = cursor.fetchall()
+    assert rows == [(2, "bob")]
+
+    conn.close()
+
+
+@pytest.mark.parametrize("provider", ["sqlite3", "turso"])
+def test_not_exists_operator(provider):
+    conn = connect(provider, ":memory:")
+    cursor = conn.cursor()
+    cursor.execute("CREATE TABLE users (id INTEGER, name TEXT)")
+    cursor.execute("CREATE TABLE orders (id INTEGER, user_id INTEGER)")
+    cursor.execute("INSERT INTO users VALUES (1, 'alice'), (2, 'bob')")
+    cursor.execute("INSERT INTO orders VALUES (1, 1)")
+
+    cursor.execute("""
+        SELECT name FROM users
+        WHERE NOT EXISTS (SELECT 1 FROM orders WHERE orders.user_id = users.id)
+    """)
+    rows = cursor.fetchall()
+    assert rows == [("bob",)]
+
+    conn.close()
+
+
+@pytest.mark.parametrize("provider", ["sqlite3", "turso"])
+def test_substr_function(provider):
+    conn = connect(provider, ":memory:")
+    cursor = conn.cursor()
+    cursor.execute("SELECT substr('Hello World', 1, 5)")
+
+    row = cursor.fetchone()
+    assert row[0] == "Hello"
+
+    conn.close()
+
+
+@pytest.mark.parametrize("provider", ["sqlite3", "turso"])
+def test_length_function(provider):
+    conn = connect(provider, ":memory:")
+    cursor = conn.cursor()
+    cursor.execute("SELECT length('Hello')")
+
+    row = cursor.fetchone()
+    assert row[0] == 5
+
+    conn.close()
+
+
+@pytest.mark.parametrize("provider", ["sqlite3", "turso"])
+def test_upper_lower_functions(provider):
+    conn = connect(provider, ":memory:")
+    cursor = conn.cursor()
+    cursor.execute("SELECT upper('hello'), lower('WORLD')")
+
+    row = cursor.fetchone()
+    assert row == ("HELLO", "world")
+
+    conn.close()
+
+
+@pytest.mark.parametrize("provider", ["sqlite3", "turso"])
+def test_trim_functions(provider):
+    conn = connect(provider, ":memory:")
+    cursor = conn.cursor()
+    cursor.execute("SELECT trim('  hello  '), ltrim('  hello'), rtrim('hello  ')")
+
+    row = cursor.fetchone()
+    assert row == ("hello", "hello", "hello")
+
+    conn.close()
+
+
+@pytest.mark.parametrize("provider", ["sqlite3", "turso"])
+def test_replace_function(provider):
+    conn = connect(provider, ":memory:")
+    cursor = conn.cursor()
+    cursor.execute("SELECT replace('Hello World', 'World', 'Python')")
+
+    row = cursor.fetchone()
+    assert row[0] == "Hello Python"
+
+    conn.close()
+
+
+@pytest.mark.parametrize("provider", ["sqlite3", "turso"])
+def test_abs_function(provider):
+    conn = connect(provider, ":memory:")
+    cursor = conn.cursor()
+    cursor.execute("SELECT abs(-42), abs(42)")
+
+    row = cursor.fetchone()
+    assert row == (42, 42)
+
+    conn.close()
+
+
+@pytest.mark.parametrize("provider", ["sqlite3", "turso"])
+def test_typeof_function(provider):
+    conn = connect(provider, ":memory:")
+    cursor = conn.cursor()
+    cursor.execute("SELECT typeof(123), typeof('text'), typeof(NULL), typeof(3.14)")
+
+    row = cursor.fetchone()
+    assert row == ("integer", "text", "null", "real")
+
+    conn.close()
+
+
+@pytest.mark.parametrize("provider", ["sqlite3", "turso"])
+def test_create_table_if_not_exists(provider):
+    conn = connect(provider, ":memory:")
+    cursor = conn.cursor()
+    cursor.execute("CREATE TABLE IF NOT EXISTS test (id INTEGER)")
+    cursor.execute("CREATE TABLE IF NOT EXISTS test (id INTEGER)")
+
+    cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='test'")
+    row = cursor.fetchone()
+    assert row is not None
+
+    conn.close()
+
+
+@pytest.mark.parametrize("provider", ["sqlite3", "turso"])
+def test_drop_table_if_exists(provider):
+    conn = connect(provider, ":memory:")
+    cursor = conn.cursor()
+    cursor.execute("CREATE TABLE test (id INTEGER)")
+    cursor.execute("DROP TABLE IF EXISTS test")
+    cursor.execute("DROP TABLE IF EXISTS test")
+
+    cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='test'")
+    row = cursor.fetchone()
+    assert row is None
+
+    conn.close()
+
+
+@pytest.mark.parametrize("provider", ["sqlite3", "turso"])
+def test_multiple_ctes(provider):
+    conn = connect(provider, ":memory:")
+    cursor = conn.cursor()
+    cursor.execute("CREATE TABLE test (value INTEGER)")
+    cursor.execute("INSERT INTO test VALUES (10), (20), (30)")
+
+    cursor.execute("""
+        WITH
+            doubled AS (SELECT value * 2 as v FROM test),
+            tripled AS (SELECT value * 3 as v FROM test)
+        SELECT doubled.v, tripled.v FROM doubled, tripled WHERE doubled.v = 20 AND tripled.v = 30
+    """)
+    row = cursor.fetchone()
+    assert row == (20, 30)
+
+    conn.close()
+
+
+@pytest.mark.parametrize("provider", ["sqlite3", "turso"])
+def test_nested_subqueries(provider):
+    conn = connect(provider, ":memory:")
+    cursor = conn.cursor()
+    cursor.execute("CREATE TABLE test (id INTEGER, value INTEGER)")
+    cursor.execute("INSERT INTO test VALUES (1, 10), (2, 20), (3, 30), (4, 40)")
+
+    cursor.execute("""
+        SELECT id FROM test
+        WHERE value > (
+            SELECT AVG(value) FROM test
+            WHERE value > (SELECT MIN(value) FROM test)
+        )
+    """)
+    rows = cursor.fetchall()
+    assert len(rows) > 0
+
+    conn.close()
+
+
+@pytest.mark.parametrize("provider", ["sqlite3", "turso"])
+def test_correlated_subquery(provider):
+    conn = connect(provider, ":memory:")
+    cursor = conn.cursor()
+    cursor.execute("CREATE TABLE test (id INTEGER, category TEXT, value INTEGER)")
+    cursor.execute("INSERT INTO test VALUES (1, 'A', 10), (2, 'A', 20), (3, 'B', 15), (4, 'B', 25)")
+
+    cursor.execute("""
+        SELECT t1.id, t1.value
+        FROM test t1
+        WHERE t1.value > (SELECT AVG(t2.value) FROM test t2 WHERE t2.category = t1.category)
+    """)
+    rows = cursor.fetchall()
+    assert len(rows) == 2
+
+    conn.close()
+
+
+# Additional tests appended
+
+
+@pytest.mark.parametrize("provider", ["sqlite3", "turso"])
+def test_executemany_requires_dml(provider):
+    conn = connect(provider, ":memory:")
+    cur = conn.cursor()
+    with pytest.raises(Exception):
+        cur.executemany("SELECT 1", [()])
+    conn.close()
+
+
+@pytest.mark.parametrize("provider", ["sqlite3", "turso"])
+def test_execute_multiple_statements_prohibited(provider):
+    conn = connect(provider, ":memory:")
+    cur = conn.cursor()
+    with pytest.raises(Exception):
+        cur.execute("SELECT 1; SELECT 2")
+    conn.close()
+
+
+@pytest.mark.parametrize("provider", ["sqlite3", "turso"])
+def test_description_none_after_insert(provider):
+    conn = connect(provider, ":memory:")
+    cur = conn.cursor()
+    cur.execute("CREATE TABLE test (id INTEGER)")
+    cur.execute("INSERT INTO test VALUES (1), (2)")
+    assert cur.description is None
+    conn.close()
+
+
+@pytest.mark.parametrize("provider", ["sqlite3", "turso"])
+def test_rowcount_select_is_minus_one(provider):
+    conn = connect(provider, ":memory:")
+    cur = conn.cursor()
+    cur.execute("CREATE TABLE test (id INTEGER)")
+    cur.execute("INSERT INTO test VALUES (1), (2)")
+    cur.execute("SELECT * FROM test")
+    assert cur.rowcount == -1
+    conn.close()
+
+
+@pytest.mark.parametrize("provider", ["sqlite3", "turso"])
+def test_cursor_setinput_output_size_noop(provider):
+    conn = connect(provider, ":memory:")
+    cur = conn.cursor()
+    # Should not raise
+    cur.setinputsizes([None])
+    cur.setoutputsize(1024, 0)
+    conn.close()
+
+
+@pytest.mark.parametrize("provider", ["sqlite3", "turso"])
+def test_custom_row_factory_callable(provider):
+    conn = connect(provider, ":memory:")
+
+    # row factory that returns a dict for each row
+    def dict_factory(cursor, row):
+        return {cursor.description[i][0]: row[i] for i in range(len(row))}
+
+    conn.row_factory = dict_factory
+    cur = conn.cursor()
+    cur.execute("CREATE TABLE test (id INTEGER, name TEXT)")
+    cur.execute("INSERT INTO test VALUES (1, 'alice')")
+    cur.execute("SELECT * FROM test")
+    row = cur.fetchone()
+    assert isinstance(row, dict)
+    assert row["id"] == 1
+    assert row["name"] == "alice"
+    conn.close()
+
+
+@pytest.mark.parametrize("provider", ["sqlite3", "turso"])
+def test_in_transaction_toggle_with_commit(provider):
+    conn = connect(provider, ":memory:")
+    cur = conn.cursor()
+    cur.execute("CREATE TABLE test (id INTEGER)")
+    # Before DML, should not be in a transaction
+    assert not conn.in_transaction
+    # DML should start a transaction in legacy mode
+    cur.execute("INSERT INTO test VALUES (1)")
+    assert conn.in_transaction
+    conn.commit()
+    assert not conn.in_transaction
+    conn.close()
+
+
+@pytest.mark.parametrize("provider", ["sqlite3", "turso"])
+def test_isolation_level_none_autocommit(provider, tmp_path):
+    db_file = tmp_path / "auto_commit.db"
+
+    if provider == "turso":
+        conn = turso.connect(str(db_file), isolation_level=None)
+    else:
+        conn = sqlite3.connect(str(db_file))
+        conn.isolation_level = None
+
+    cur = conn.cursor()
+    cur.execute("CREATE TABLE test (id INTEGER)")
+    cur.execute("INSERT INTO test VALUES (1)")
+    # No explicit commit; in autocommit mode data should persist
+    conn.close()
+
+    conn2 = connect(provider, str(db_file))
+    cur2 = conn2.cursor()
+    cur2.execute("SELECT COUNT(*) FROM test")
+    count = cur2.fetchone()[0]
+    assert count == 1
+    conn2.close()
+
+
+@pytest.mark.parametrize("provider", ["sqlite3", "turso"])
+def test_generate_series_virtual_table(provider):
+    conn = connect(provider, ":memory:")
+    cur = conn.cursor()
+    if provider == "turso":
+        cur.execute("SELECT value FROM generate_series(1, 3)")
+        rows = cur.fetchall()
+        assert rows == [(1,), (2,), (3,)]
+    else:
+        with pytest.raises(Exception):
+            cur.execute("SELECT value FROM generate_series(1, 3)")
+    conn.close()
+
+
+@pytest.mark.parametrize("provider", ["sqlite3", "turso"])
+def test_connection_exception_attributes_present(provider):
+    conn = connect(provider, ":memory:")
+    # Ensure DB-API exception classes are exposed on the connection
+    assert issubclass(conn.Error, Exception)
+    assert issubclass(conn.DatabaseError, Exception)
+    assert issubclass(conn.ProgrammingError, Exception)
+    conn.close()
+
+
+@pytest.mark.parametrize("provider", ["sqlite3", "turso"])
+def test_insert_returning_single_and_multiple_commit_without_consuming(provider):
+    # turso.setup_logging(level=logging.DEBUG)
+    conn = connect(provider, ":memory:")
+    try:
+        cur = conn.cursor()
+        cur.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT)")
+        cur.execute(
+            "INSERT INTO t(name) VALUES (?), (?) RETURNING id",
+            ("bob", "alice"),
+        )
+        cur.fetchone()
+        with pytest.raises(Exception):
+            conn.commit()
+    finally:
+        conn.close()
+
+
+@pytest.mark.parametrize("provider", ["sqlite3", "turso"])
+def test_pragma_integrity_check(provider):
+    conn = connect(provider, ":memory:")
+    cursor = conn.cursor()
+    cursor.execute("PRAGMA integrity_check")
+
+    # Verify fetchone returns the expected result, not None
+    # Bug: missing add_pragma_result_column in translate_integrity_check
+    # caused column_count to be 0, making execute() finalize the statement
+    # and leaving fetchone() to return None
+    row = cursor.fetchone()
+    assert row is not None, "PRAGMA integrity_check should return a row"
+    assert row == ("ok",)
+
+    conn.close()
+
+
+def test_encryption_enabled(tmp_path):
+    tmp_path = tmp_path / "local.db"
+    conn = turso.connect(
+        str(tmp_path),
+        experimental_features="encryption",
+        encryption=turso.EncryptionOpts(
+            cipher="aegis256", hexkey="b1bbfda4f589dc9daaf004fe21111e00dc00c98237102f5c7002a5669fc76327"
+        ),
+    )
+    cursor = conn.cursor()
+    cursor.execute("create table t(x)")
+    cursor.execute("insert into t select 'secret' from generate_series(1, 1024)")
+    conn.commit()
+    cursor.execute("pragma wal_checkpoint(truncate)").fetchall()
+    conn.commit()
+
+    content = open(tmp_path, "rb").read()
+    assert len(content) > 16 * 1024
+    assert b"secret" not in content
+
+
+def test_encryption_disabled(tmp_path):
+    tmp_path = tmp_path / "local.db"
+    conn = turso.connect(
+        str(tmp_path),
+    )
+    cursor = conn.cursor()
+    cursor.execute("create table t(x)")
+    cursor.execute("insert into t select 'secret' from generate_series(1, 1024)")
+    conn.commit()
+    cursor.execute("pragma wal_checkpoint(truncate)").fetchall()
+    conn.commit()
+
+    content = open(tmp_path, "rb").read()
+    assert len(content) > 16 * 1024
+    assert b"secret" in content
+
+
+def test_encryption(tmp_path):
+    tmp_path = tmp_path / "local.db"
+    hexkey = "b1bbfda4f589dc9daaf004fe21111e00dc00c98237102f5c7002a5669fc76327"
+    wrong_key = "aaaaaaa4f589dc9daaf004fe21111e00dc00c98237102f5c7002a5669fc76327"
+
+    conn = turso.connect(
+        str(tmp_path),
+        experimental_features="encryption",
+        encryption=turso.EncryptionOpts(cipher="aegis256", hexkey=hexkey),
+    )
+    cursor = conn.cursor()
+    cursor.execute("create table t(x)")
+    cursor.execute("insert into t select 'secret' from generate_series(1, 1024)")
+    conn.commit()
+    cursor.execute("pragma wal_checkpoint(truncate)").fetchall()
+    conn.commit()
+    conn.close()
+
+    # verify we can re-open with the same key
+    conn2 = turso.connect(
+        str(tmp_path),
+        experimental_features="encryption",
+        encryption=turso.EncryptionOpts(cipher="aegis256", hexkey=hexkey),
+    )
+    cursor2 = conn2.cursor()
+    cursor2.execute("select count(*) from t")
+    assert cursor2.fetchone()[0] == 1024
+    conn2.close()
+
+    # verify opening with wrong key fails
+    with pytest.raises(Exception):
+        conn3 = turso.connect(
+            str(tmp_path),
+            experimental_features="encryption",
+            encryption=turso.EncryptionOpts(cipher="aegis256", hexkey=wrong_key),
+        )
+        cursor3 = conn3.cursor()
+        cursor3.execute("select * from t")
+        cursor3.fetchone()  # trigger actual data read to cause decryption error
+
+    # verify opening without encryption fails
+    with pytest.raises(Exception):
+        conn5 = turso.connect(str(tmp_path))
+        cursor5 = conn5.cursor()
+        cursor5.execute("select * from t")
+        cursor5.fetchone()  # trigger actual data read to cause decryption error
+
+
+@pytest.mark.parametrize("provider", ["sqlite3", "turso"])
+def test_named_params_update_with_dict(provider):
+    conn = connect(provider, ":memory:")
+    cur = conn.cursor()
+    cur.execute("CREATE TABLE users(name TEXT, email TEXT)")
+    cur.execute("INSERT INTO users VALUES ('old', 'alice@example.com')")
+    cur.execute(
+        "UPDATE users SET name = :name WHERE email = :email",
+        {"name": "Alice", "email": "alice@example.com"},
+    )
+    cur.execute("SELECT name FROM users WHERE email = 'alice@example.com'")
+    assert cur.fetchone() == ("Alice",)
+    conn.close()
+
+
+@pytest.mark.parametrize("provider", ["sqlite3", "turso"])
+def test_named_params_reused_placeholder(provider):
+    conn = connect(provider, ":memory:")
+    cur = conn.cursor()
+    cur.execute("SELECT :x + :x", {"x": 7})
+    assert cur.fetchone() == (14,)
+    conn.close()
+
+
+@pytest.mark.parametrize("provider", ["sqlite3", "turso"])
+def test_named_params_extra_key_ignored(provider):
+    conn = connect(provider, ":memory:")
+    cur = conn.cursor()
+    cur.execute("SELECT :x", {"x": 1, "unused": 999})
+    assert cur.fetchone() == (1,)
+    conn.close()
+
+
+@pytest.mark.parametrize("provider", ["sqlite3", "turso"])
+def test_executemany_named_params_dicts(provider):
+    conn = connect(provider, ":memory:")
+    cur = conn.cursor()
+    cur.execute("CREATE TABLE users(name TEXT, age INTEGER)")
+    cur.executemany(
+        "INSERT INTO users(name, age) VALUES (:name, :age)",
+        [
+            {"name": "alice", "age": 31},
+            {"name": "bob", "age": 29},
+        ],
+    )
+    cur.execute("SELECT name, age FROM users ORDER BY age DESC")
+    assert cur.fetchall() == [("alice", 31), ("bob", 29)]
+    conn.close()
+
+
+@pytest.mark.parametrize("provider", ["sqlite3", "turso"])
+def test_named_params_dict_with_indexed_qmark_is_allowed(provider):
+    conn = connect(provider, ":memory:")
+    cur = conn.cursor()
+    cur.execute("SELECT ?1 + :x", {"1": 2, "x": 3})
+    assert cur.fetchone() == (5,)
+    conn.close()
+
+
+@pytest.mark.parametrize("provider", ["sqlite3", "turso"])
+def test_named_params_at_and_dollar_styles(provider):
+    conn = connect(provider, ":memory:")
+    cur = conn.cursor()
+    cur.execute("SELECT @x", {"x": 11})
+    assert cur.fetchone() == (11,)
+    cur.execute("SELECT $x", {"x": 12})
+    assert cur.fetchone() == (12,)
+    conn.close()
+
+
+@pytest.mark.parametrize("provider", ["sqlite3", "turso"])
+def test_named_params_non_string_key_is_ignored(provider):
+    conn = connect(provider, ":memory:")
+    cur = conn.cursor()
+    cur.execute("SELECT :x", {1: "ignored", "x": 7})
+    assert cur.fetchone() == (7,)
+    conn.close()
+
+
+@pytest.mark.parametrize("provider", ["sqlite3", "turso"])
+def test_named_params_prefixed_key_currently_allowed_difference(provider):
+    conn = connect(provider, ":memory:")
+    cur = conn.cursor()
+    if provider == "sqlite3":
+        # sqlite3 expects unprefixed mapping keys and raises here.
+        with pytest.raises(Exception):
+            cur.execute("SELECT :x", {":x": 1})
+    else:
+        # NOTE: Turso currently allows this path and returns NULL instead of raising.
+        cur.execute("SELECT :x", {":x": 1})
+        assert cur.fetchone() == (None,)
+    conn.close()
+
+
+@pytest.mark.parametrize("provider", ["sqlite3", "turso"])
+def test_named_params_plain_qmark_mapping_currently_allowed_difference(provider):
+    conn = connect(provider, ":memory:")
+    cur = conn.cursor()
+    if provider == "sqlite3":
+        # sqlite3 raises: plain '?' is positional and mapping should fail.
+        with pytest.raises(Exception):
+            cur.execute("SELECT ?", {"x": 1})
+    else:
+        # NOTE: Turso currently allows this and leaves the parameter as NULL.
+        cur.execute("SELECT ?", {"x": 1})
+        assert cur.fetchone() == (None,)
+    conn.close()
+
+
+@pytest.mark.parametrize("provider", ["sqlite3", "turso"])
+def test_named_params_missing_indexed_qmark_currently_allowed_difference(provider):
+    conn = connect(provider, ":memory:")
+    cur = conn.cursor()
+    if provider == "sqlite3":
+        # sqlite3 raises when a required indexed parameter is not supplied.
+        with pytest.raises(Exception):
+            cur.execute("SELECT ?1, ?2", {"1": "ONE"})
+    else:
+        # NOTE: Turso currently allows partial binding and keeps missing values as NULL.
+        cur.execute("SELECT ?1, ?2", {"1": "ONE"})
+        assert cur.fetchone() == ("ONE", None)
+    conn.close()
+
+
+# --- Full-text search (Tantivy) ---------------------------------------------
+# FTS is Turso-only and gated behind the `index_method` experimental feature.
+# It is exposed purely through SQL: `CREATE INDEX ... USING fts (...)` plus the
+# fts_match()/fts_score()/fts_highlight() functions.
+
+
+def _fts_connection():
+    conn = turso.connect(":memory:", experimental_features="index_method")
+    cur = conn.cursor()
+    cur.execute("CREATE TABLE articles (id INTEGER PRIMARY KEY, title TEXT, body TEXT)")
+    cur.execute("INSERT INTO articles VALUES (1, 'Rust databases', 'Turso is a SQLite rewrite in Rust')")
+    cur.execute("INSERT INTO articles VALUES (2, 'Cooking', 'A recipe for tomato soup')")
+    cur.execute("CREATE INDEX fts_articles ON articles USING fts (title, body)")
+    return conn, cur
+
+
+def test_fts_match_filters_rows():
+    conn, cur = _fts_connection()
+    cur.execute("SELECT id, title FROM articles WHERE fts_match(title, body, 'rust')")
+    assert cur.fetchall() == [(1, "Rust databases")]
+    # A term present in neither document matches nothing.
+    cur.execute("SELECT id FROM articles WHERE fts_match(title, body, 'pizza')")
+    assert cur.fetchall() == []
+    conn.close()
+
+
+def test_fts_score_orders_results():
+    conn, cur = _fts_connection()
+    cur.execute(
+        "SELECT id, fts_score(title, body, 'rust') AS score FROM articles "
+        "WHERE fts_match(title, body, 'rust') ORDER BY score DESC LIMIT 5"
+    )
+    rows = cur.fetchall()
+    assert [r[0] for r in rows] == [1]
+    # Relevance score for a matching row is strictly positive.
+    assert rows[0][1] > 0
+    conn.close()
+
+
+def test_fts_highlight_wraps_matched_terms():
+    conn, cur = _fts_connection()
+    # Signature: fts_highlight(text..., before_tag, after_tag, query)
+    cur.execute("SELECT fts_highlight(body, '<b>', '</b>', 'rust') FROM articles WHERE fts_match(title, body, 'rust')")
+    assert cur.fetchall() == [("Turso is a SQLite rewrite in <b>Rust</b>",)]
+    conn.close()
+
+
+# ---------------------------------------------------------------------------
+# Parameterized batches (turso extension; no sqlite3 equivalent)
+# ---------------------------------------------------------------------------
+
+
+def _batch_connection():
+    conn = turso.connect("tests/database.db")
+    conn.execute("CREATE TABLE t_batch (id INTEGER PRIMARY KEY, name TEXT)")
+    conn.commit()
+    return conn
+
+
+def test_batch_executes_parameterized_statements_in_order():
+    conn = _batch_connection()
+    results = conn.batch(
+        [
+            ("INSERT INTO t_batch (name) VALUES (?)", ("Alice",)),
+            ("INSERT INTO t_batch (name) VALUES (?)", ("Bob",)),
+            "SELECT name FROM t_batch ORDER BY id",
+        ]
+    )
+    assert len(results) == 3
+    assert results[0].rowcount == 1
+    assert results[0].lastrowid == 1
+    # The embedded engine does not report per-statement execution
+    # statistics; the serverless driver fills these from the server.
+    assert results[0].rows_read is None
+    assert results[0].rows_written is None
+    assert results[0].query_duration_ms is None
+    assert results[1].lastrowid == 2
+    select = results[2]
+    assert select.description is not None
+    assert select.description[0][0] == "name"
+    assert select.rows == [("Alice",), ("Bob",)]
+    assert select.rowcount == -1
+    # The batch is not transactional: the inserts are already committed.
+    assert not conn.in_transaction
+    conn.close()
+
+    conn = turso.connect("tests/database.db")
+    assert conn.execute("SELECT COUNT(*) FROM t_batch").fetchone() == (2,)
+    conn.close()
+
+
+def test_batch_error_identifies_the_failing_statement():
+    conn = _batch_connection()
+    with pytest.raises(turso.DatabaseError, match="batch statement 1 failed") as excinfo:
+        conn.batch(
+            [
+                ("INSERT INTO t_batch (name) VALUES (?)", ("Alice",)),
+                ("INSERT INTO no_such_table VALUES (?)", (2,)),
+                ("INSERT INTO t_batch (name) VALUES (?)", ("Carol",)),
+            ]
+        )
+    assert excinfo.value.batch_index == 1
+    # One entry per statement: the completed first statement's result,
+    # None for the failing and skipped ones.
+    partial = excinfo.value.batch_results
+    assert len(partial) == 3
+    assert partial[0].rowcount == 1
+    assert partial[1] is None
+    assert partial[2] is None
+    # The statement before the failing one keeps its effect, and the one
+    # after it never ran.
+    assert conn.execute("SELECT COUNT(*) FROM t_batch").fetchone() == (1,)
+    conn.close()
+
+
+@pytest.mark.parametrize("mode", [None, "immediate"])
+def test_batch_validates_every_parameter_before_execution(mode):
+    conn = _batch_connection()
+    with pytest.raises(turso.DatabaseError, match="batch statement 1 failed") as excinfo:
+        conn.batch(
+            [
+                ("INSERT INTO t_batch (name) VALUES (?)", ("Alice",)),
+                ("INSERT INTO t_batch (name) VALUES (?)", (object(),)),
+            ],
+            mode=mode,
+        )
+    assert excinfo.value.batch_index == 1
+    assert excinfo.value.batch_results == []
+    assert conn.execute("SELECT COUNT(*) FROM t_batch").fetchone() == (0,)
+    assert not conn.in_transaction
+    conn.close()
+
+
+@pytest.mark.parametrize("mode", [None, "immediate"])
+def test_batch_rejects_infinity_before_execution(mode):
+    conn = _batch_connection()
+    with pytest.raises(ValueError, match="infinite float") as excinfo:
+        conn.batch(
+            [
+                ("INSERT INTO t_batch (name) VALUES (?)", ("Alice",)),
+                ("INSERT INTO t_batch (name) VALUES (?)", (float("inf"),)),
+            ],
+            mode=mode,
+        )
+    assert excinfo.value.batch_index == 1
+    assert excinfo.value.batch_results == []
+    assert conn.execute("SELECT COUNT(*) FROM t_batch").fetchone() == (0,)
+    assert not conn.in_transaction
+    conn.close()
+
+
+def test_batch_joins_an_open_transaction():
+    conn = _batch_connection()
+    conn.execute("BEGIN")
+    conn.batch(
+        [
+            ("INSERT INTO t_batch (name) VALUES (?)", ("Alice",)),
+            ("INSERT INTO t_batch (name) VALUES (?)", ("Bob",)),
+        ]
+    )
+    assert conn.in_transaction
+    conn.rollback()
+    assert conn.execute("SELECT COUNT(*) FROM t_batch").fetchone() == (0,)
+    conn.close()
+
+
+def test_batch_mode_commits_atomically():
+    conn = _batch_connection()
+    results = conn.batch(
+        [
+            ("INSERT INTO t_batch (name) VALUES (?)", ("Alice",)),
+            ("INSERT INTO t_batch (name) VALUES (?)", ("Bob",)),
+        ],
+        mode="immediate",
+    )
+    assert len(results) == 2
+    assert not conn.in_transaction
+    assert conn.execute("SELECT COUNT(*) FROM t_batch").fetchone() == (2,)
+    conn.close()
+
+
+def test_batch_mode_rolls_back_on_failure():
+    conn = _batch_connection()
+    with pytest.raises(turso.DatabaseError) as excinfo:
+        conn.batch(
+            [
+                ("INSERT INTO t_batch (name) VALUES (?)", ("Alice",)),
+                ("INSERT INTO no_such_table VALUES (?)", (2,)),
+            ],
+            mode="immediate",
+        )
+    assert excinfo.value.batch_index == 1
+    assert not conn.in_transaction
+    # The rollback undid the first insert.
+    assert conn.execute("SELECT COUNT(*) FROM t_batch").fetchone() == (0,)
+    conn.close()
+
+
+@pytest.mark.parametrize(
+    "sql",
+    [
+        "BEGIN",
+        "COMMIT",
+        "END",
+        "ROLLBACK",
+        "SAVEPOINT batch_savepoint",
+        "RELEASE batch_savepoint",
+        "; /* empty statement */ COMMIT",
+        "\ufeffCOMMIT",
+    ],
+)
+def test_batch_mode_rejects_transaction_control_before_begin(sql):
+    conn = _batch_connection()
+    with pytest.raises(
+        turso.ProgrammingError, match="transaction-control SQL is not allowed"
+    ) as excinfo:
+        conn.batch([sql], mode="immediate")
+    assert excinfo.value.batch_index == 0
+    assert excinfo.value.batch_results == []
+    assert not conn.in_transaction
+    conn.close()
+
+
+def test_batch_preserves_rollback_failure_on_primary_error():
+    conn = _batch_connection()
+    execute_transaction_sql = conn._exec_ddl_only
+
+    def fail_rollback(sql):
+        if sql == "ROLLBACK":
+            raise turso.OperationalError("rollback failed")
+        execute_transaction_sql(sql)
+
+    conn._exec_ddl_only = fail_rollback
+    with pytest.raises(turso.DatabaseError) as excinfo:
+        conn.batch(
+            [
+                ("INSERT INTO t_batch (name) VALUES (?)", ("Alice",)),
+                ("INSERT INTO no_such_table VALUES (?)", (2,)),
+            ],
+            mode="immediate",
+        )
+    assert excinfo.value.batch_index == 1
+    assert len(excinfo.value.batch_results) == 2
+    assert isinstance(excinfo.value.rollback_error, turso.OperationalError)
+    assert str(excinfo.value.rollback_error) == "rollback failed"
+
+    conn._exec_ddl_only = execute_transaction_sql
+    conn.rollback()
+    conn.close()
+
+
+def test_batch_constraint_error_preserves_exception_class():
+    conn = _batch_connection()
+    conn.execute("CREATE TABLE t_batch_uniq (x UNIQUE)")
+    conn.commit()
+    with pytest.raises(turso.IntegrityError) as excinfo:
+        conn.batch(
+            [
+                ("INSERT INTO t_batch_uniq VALUES (?)", (1,)),
+                ("INSERT INTO t_batch_uniq VALUES (?)", (1,)),
+            ]
+        )
+    assert excinfo.value.batch_index == 1
+    conn.close()
+
+
+def test_empty_batch_returns_no_results():
+    conn = _batch_connection()
+    assert conn.batch([]) == []
+    assert conn.batch([], mode="immediate") == []
+    conn.close()
+
+
+def test_batch_rejects_invalid_mode_and_statements():
+    conn = _batch_connection()
+    with pytest.raises(turso.ProgrammingError, match="batch mode"):
+        conn.batch(["SELECT 1"], mode="bogus")
+    with pytest.raises(turso.ProgrammingError, match="batch statement 1"):
+        conn.batch(["SELECT 1", 42])
+    with pytest.raises(turso.ProgrammingError, match="one statement at a time"):
+        conn.batch(["SELECT 1; SELECT 2"])
+    conn.close()

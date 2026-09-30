@@ -1,0 +1,66 @@
+@database :memory:
+
+# Regression tests for https://github.com/tursodatabase/turso/issues/7516
+#
+# ALTER TABLE re-validates every trigger in the schema. A trigger whose target
+# table is written with a quoted identifier (`ON "t1"`) must resolve to the bare
+# table name `t1` during that re-validation. Otherwise an unrelated ALTER on
+# another table fails with `no such table: "t1"` even though the trigger and its
+# target table are perfectly valid.
+
+setup quoted-target-trigger {
+    CREATE TABLE t1 (id INTEGER PRIMARY KEY, updated_at REAL);
+    CREATE TRIGGER trg AFTER UPDATE ON "t1" FOR EACH ROW
+        WHEN NEW.updated_at = OLD.updated_at
+        BEGIN
+            UPDATE t1 SET updated_at = julianday('now') WHERE id = NEW.id;
+        END;
+}
+
+@setup quoted-target-trigger
+test drop-column-with-unrelated-quoted-trigger-target {
+    CREATE TABLE t2 (id INTEGER PRIMARY KEY, drop_me TEXT, keep_col TEXT);
+    ALTER TABLE t2 DROP COLUMN drop_me;
+    SELECT sql FROM sqlite_schema WHERE name = 't2';
+}
+expect {
+    CREATE TABLE t2 (id INTEGER PRIMARY KEY, keep_col TEXT)
+}
+
+@setup quoted-target-trigger
+test rename-column-with-unrelated-quoted-trigger-target {
+    CREATE TABLE t2 (id INTEGER PRIMARY KEY, c TEXT);
+    ALTER TABLE t2 RENAME COLUMN c TO d;
+    SELECT sql FROM sqlite_schema WHERE name = 't2';
+}
+expect {
+    CREATE TABLE t2 (id INTEGER PRIMARY KEY, d TEXT)
+}
+
+@setup quoted-target-trigger
+test rename-table-with-unrelated-quoted-trigger-target {
+    CREATE TABLE t2 (id INTEGER PRIMARY KEY, c TEXT);
+    ALTER TABLE t2 RENAME TO t3;
+    SELECT name FROM sqlite_schema WHERE type = 'table' ORDER BY name;
+}
+expect {
+    t1
+    t3
+}
+
+# The quoted-target trigger must still actually fire after all of this: the
+# bare-name normalization that fixes ALTER must not break trigger dispatch.
+test quoted-target-trigger-still-fires {
+    CREATE TABLE "tq" (id INTEGER PRIMARY KEY, v INTEGER);
+    CREATE TABLE audit (id INTEGER);
+    CREATE TRIGGER trg_fire AFTER UPDATE ON "tq" FOR EACH ROW
+        BEGIN
+            INSERT INTO audit VALUES (NEW.id);
+        END;
+    INSERT INTO tq VALUES (1, 10);
+    UPDATE tq SET v = 20 WHERE id = 1;
+    SELECT * FROM audit;
+}
+expect {
+    1
+}

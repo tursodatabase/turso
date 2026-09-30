@@ -1,0 +1,50 @@
+@database :memory:
+
+# =============================================================================
+# Bug: IN (subquery) returns wrong value in ungrouped aggregate with empty result
+#
+# When a SELECT has both an IN(subquery) expression and an aggregate function
+# (making it an ungrouped aggregate), and the WHERE clause filters out all
+# rows, SQLite correctly returns NULL for the IN expression (since no row
+# was read). Turso incorrectly returns 1 (true), evaluating the IN against
+# stale cursor data.
+#
+# This causes data corruption when the result is stored via INSERT...SELECT.
+#
+# Simulator gap: The simulator does NOT generate IN(subquery) expressions
+# (commented out in sql_generation/generation/expr.rs). The differential
+# fuzzer found this bug (seed 16648648351493581373).
+# =============================================================================
+
+test in-subquery-empty-aggregate-null {
+    CREATE TABLE src(a TEXT PRIMARY KEY, val REAL NOT NULL, flag INTEGER);
+    INSERT INTO src VALUES (NULL, 1.5, NULL);
+    -- No rows match WHERE, ungrouped aggregate returns one row
+    -- IN expression should be NULL since no row was read
+    SELECT val IN (SELECT a FROM src), AVG(1) FROM src WHERE flag >= 99;
+}
+expect {
+    |
+}
+
+test in-subquery-empty-aggregate-stored {
+    CREATE TABLE src2(a TEXT PRIMARY KEY, val REAL NOT NULL, flag INTEGER);
+    INSERT INTO src2 VALUES (NULL, 1.5, NULL);
+    CREATE TABLE dst(in_result, agg_result);
+    INSERT INTO dst SELECT val IN (SELECT a FROM src2), AVG(1) FROM src2 WHERE flag >= 99;
+    SELECT in_result, typeof(in_result), agg_result, typeof(agg_result) FROM dst;
+}
+expect {
+    |null||null
+}
+
+test in-subquery-empty-aggregate-decision {
+    CREATE TABLE src3(a TEXT PRIMARY KEY, val REAL NOT NULL, flag INTEGER);
+    INSERT INTO src3 VALUES (NULL, 1.5, NULL);
+    CREATE TABLE dst3(in_result, agg_result);
+    INSERT INTO dst3 SELECT val IN (SELECT a FROM src3), AVG(1) FROM src3 WHERE flag >= 99;
+    SELECT CASE WHEN in_result = 1 THEN 'BUG' ELSE 'OK' END FROM dst3;
+}
+expect {
+    OK
+}

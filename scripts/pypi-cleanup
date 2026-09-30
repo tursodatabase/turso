@@ -1,0 +1,220 @@
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.10"
+# dependencies = ["requests"]
+# ///
+"""Delete old RC versions of pyturso from PyPI.
+
+Dry-run by default. Pass --execute to actually delete.
+"""
+
+import argparse
+import datetime
+import getpass
+import logging
+import os
+import re
+import sys
+import time
+from html.parser import HTMLParser
+
+import requests
+
+PYPI_URL = "https://pypi.org"
+PACKAGE = "pyturso"
+USERNAME = "penberg"
+RC_PATTERN = re.compile(r".*rc.*")
+MAX_AGE_DAYS = 90
+
+logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
+log = logging.getLogger(__name__)
+
+
+class FormParser(HTMLParser):
+    """Parse all forms and their inputs from an HTML page."""
+
+    def __init__(self):
+        super().__init__()
+        self.forms = []
+        self._current = None
+
+    def handle_starttag(self, tag, attrs):
+        attrs = dict(attrs)
+        if tag == "form":
+            self._current = {"action": attrs.get("action", ""), "inputs": {}}
+        elif tag == "input" and self._current is not None:
+            name = attrs.get("name")
+            if name:
+                self._current["inputs"][name] = attrs.get("value", "")
+
+    def handle_endtag(self, tag):
+        if tag == "form" and self._current is not None:
+            self.forms.append(self._current)
+            self._current = None
+
+
+def find_csrf(html, form_match=None, required_input=None):
+    """Find a CSRF token in HTML. Optionally filter by form action or required input."""
+    parser = FormParser()
+    parser.feed(html)
+
+    for form in parser.forms:
+        if "csrf_token" not in form["inputs"]:
+            continue
+        if form_match and form_match not in form["action"]:
+            continue
+        if required_input and required_input not in form["inputs"]:
+            continue
+        return form["inputs"]["csrf_token"], parser.forms
+
+    return None, parser.forms
+
+
+def get_versions():
+    """Get all versions and their latest upload dates from PyPI Simple API."""
+    r = requests.get(
+        f"{PYPI_URL}/simple/{PACKAGE}/",
+        headers={"Accept": "application/vnd.pypi.simple.v1+json"},
+    )
+    r.raise_for_status()
+    data = r.json()
+
+    versions = {}
+    pkg = PACKAGE.lower().replace("-", "_")
+    for version in data["versions"]:
+        dates = [
+            datetime.datetime.strptime(f["upload-time"], "%Y-%m-%dT%H:%M:%S.%f%z")
+            for f in data["files"]
+            if f["filename"].lower().startswith(f"{pkg}-{version}-")
+            or f["filename"].lower() in (f"{pkg}-{version}.tar.gz", f"{pkg}-{version}.zip")
+        ]
+        if dates:
+            versions[version] = max(dates)
+
+    return versions
+
+
+def login(session):
+    """Log into PyPI, handling 2FA if needed."""
+    r = session.get(f"{PYPI_URL}/account/login/")
+    r.raise_for_status()
+
+    csrf, forms = find_csrf(r.text, form_match="/account/login")
+    if not csrf:
+        # Fallback: any csrf on the page
+        csrf, _ = find_csrf(r.text)
+    if not csrf:
+        log.error("No CSRF token on login page. Forms found:")
+        for f in forms:
+            log.error("  action=%r inputs=%s", f["action"], list(f["inputs"].keys()))
+        sys.exit(1)
+
+    password = os.getenv("PYPI_CLEANUP_PASSWORD") or getpass.getpass("PyPI password: ")
+
+    r = session.post(
+        f"{PYPI_URL}/account/login/",
+        data={"csrf_token": csrf, "username": USERNAME, "password": password},
+        headers={"referer": f"{PYPI_URL}/account/login/"},
+    )
+    r.raise_for_status()
+
+    if r.url == f"{PYPI_URL}/account/login/":
+        log.error("Login failed for user %s", USERNAME)
+        sys.exit(1)
+
+    if "/account/two-factor/" in r.url:
+        csrf, forms = find_csrf(r.text)
+        if not csrf:
+            log.error("No CSRF token on 2FA page")
+            sys.exit(1)
+        totp = input("2FA code: ")
+        two_factor_url = r.url
+        r = session.post(
+            two_factor_url,
+            data={"csrf_token": csrf, "method": "totp", "totp_value": totp},
+            headers={"referer": two_factor_url},
+        )
+        r.raise_for_status()
+        if "/account/two-factor/" in r.url:
+            log.error("2FA verification failed")
+            sys.exit(1)
+
+    log.info("Logged in to PyPI as %s", USERNAME)
+
+
+def delete_version(session, version):
+    """Delete a single version from PyPI."""
+    url = f"{PYPI_URL}/manage/project/{PACKAGE}/release/{version}/"
+    r = session.get(url)
+    r.raise_for_status()
+
+    # Look for a form with a confirm_delete_version input
+    csrf, forms = find_csrf(r.text, required_input="confirm_delete_version")
+    if not csrf:
+        # Fallback: any form whose action contains "delete" or the version
+        csrf, _ = find_csrf(r.text, form_match="delete")
+    if not csrf:
+        # Last resort: any csrf on the page
+        csrf, _ = find_csrf(r.text)
+
+    if not csrf:
+        log.error("Cannot find delete form for %s", version)
+        log.error("Page URL: %s -> %s", url, r.url)
+        log.error("Forms on page (%d):", len(forms))
+        for f in forms:
+            log.error("  action=%r inputs=%s", f["action"], list(f["inputs"].keys()))
+        if not forms:
+            log.error("Page snippet: %.500s", r.text)
+        return False
+
+    r = session.post(
+        url,
+        data={"csrf_token": csrf, "confirm_delete_version": version},
+        headers={"referer": url},
+    )
+    r.raise_for_status()
+    log.info("Deleted %s", version)
+    return True
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--execute", action="store_true", help="actually delete (default is dry run)")
+    args = parser.parse_args()
+
+    cutoff = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(days=MAX_AGE_DAYS)
+    versions = get_versions()
+    to_delete = sorted(
+        ((v, d) for v, d in versions.items() if RC_PATTERN.match(v) and d < cutoff),
+        key=lambda x: x[1],
+    )
+
+    if not to_delete:
+        log.info("No RC versions older than %d days found", MAX_AGE_DAYS)
+        return
+
+    for v, d in to_delete:
+        log.info("%s  (%s)%s", v, d.strftime("%Y-%m-%d"), "" if args.execute else "  [dry run]")
+
+    log.info("%d version(s) to delete", len(to_delete))
+
+    if not args.execute:
+        log.info("Dry run. Pass --execute to actually delete.")
+        return
+
+    with requests.Session() as session:
+        login(session)
+
+        log.warning("Will delete %d versions in 5 seconds — Ctrl-C to abort!", len(to_delete))
+        time.sleep(5)
+
+        for v, _ in to_delete:
+            if not delete_version(session, v):
+                log.error("Stopping due to error")
+                sys.exit(1)
+
+    log.info("Done — deleted %d versions", len(to_delete))
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,17 @@
+@database database/integrity_missing_unique_index_entry.db readonly
+
+@skip-file-if mvcc "not supported in MVCC mode"
+
+test integrity-check-missing-unique-index-entry {
+    PRAGMA integrity_check;
+}
+expect {
+    row 2 missing from index idx_u_missing
+}
+
+test quick-check-missing-unique-index-entry {
+    PRAGMA quick_check;
+}
+expect {
+    ok
+}

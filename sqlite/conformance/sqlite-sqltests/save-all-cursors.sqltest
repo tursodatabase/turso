@@ -1,0 +1,109 @@
+@database :memory:
+
+# Regression tests for the saveAllCursors port (#7341).
+#
+# These cases all use the pattern from window-selfjoin-reset-sorter.sqltest:
+# a window function over a self-joined source produces enough rows to
+# overflow an ephemeral btree (forcing splits) and the window's
+# ResetSorter then clears that btree while OpenDup peer cursors are
+# still live. Without saveAllCursors-driven peer invalidation in
+# clear_btree, the dup cursor navigates to a freed page on the next
+# round of inserts and the subsequent balance trips on
+# "parent page is a leaf page, expected interior page".
+#
+# All cases below were verified red-first by neutralising
+# drive_pending_peer_save and invalidate_peer_cursors in the
+# btree.rs runtime — they then fail with the corruption error above.
+
+# -----------------------------------------------------------------------------
+# Multi-partition variant of window-selfjoin-reset-sorter. Three distinct
+# partitions over a wider integer key surface more ResetSorter calls
+# between partitions than the two-partition base case.
+# -----------------------------------------------------------------------------
+setup multi_partition {
+    CREATE TABLE w(p TEXT, v INT);
+    INSERT INTO w SELECT 'p' || (value % 3), value FROM generate_series(1, 60);
+}
+
+@setup multi_partition
+test save-all-cursors-window-triple-selfjoin-multi-partition {
+    SELECT a.p
+    FROM w AS a JOIN w AS b USING (p) JOIN w AS d USING (p)
+    ORDER BY a.p, sum(1e18) OVER (ORDER BY a.p)
+    LIMIT 6;
+}
+expect {
+    p0
+    p0
+    p0
+    p0
+    p0
+    p0
+}
+
+# -----------------------------------------------------------------------------
+# DELETE driven by a scalar subquery that contains the same
+# window-over-triple-selfjoin pattern. Exercises the peer-invalidate
+# path while the outer statement is in the write entry of a delete.
+# -----------------------------------------------------------------------------
+@setup multi_partition
+@cross-check-integrity
+test save-all-cursors-window-triple-selfjoin-delete-scalar-subquery {
+    DELETE FROM w WHERE v = (
+        SELECT a.v
+        FROM w AS a JOIN w AS b USING (p) JOIN w AS d USING (p)
+        ORDER BY a.v, sum(1e18) OVER (ORDER BY a.p)
+        LIMIT 1
+    );
+    SELECT count(*) FROM w;
+}
+expect {
+    59
+}
+
+# -----------------------------------------------------------------------------
+# UPDATE driven by an IN subquery that contains the bad pattern.
+# -----------------------------------------------------------------------------
+@setup multi_partition
+@cross-check-integrity
+test save-all-cursors-window-triple-selfjoin-update-in-subquery {
+    UPDATE w SET v = -v WHERE v IN (
+        SELECT a.v
+        FROM w AS a JOIN w AS b USING (p) JOIN w AS d USING (p)
+        ORDER BY a.v, sum(1e18) OVER (ORDER BY a.p)
+        LIMIT 3
+    );
+    SELECT count(*) FROM w WHERE v < 0;
+}
+expect {
+    1
+}
+
+# -----------------------------------------------------------------------------
+# Same window-over-self-join pattern but the source is a materialized
+# CTE referenced three times. The OpenDup cursors here come from the
+# CTE references rather than directly from the table, so the peer set
+# the registry tracks is on the ephemeral CTE btree.
+# -----------------------------------------------------------------------------
+setup cte_source {
+    CREATE TABLE v0(c1 TEXT);
+    INSERT INTO v0(c1) VALUES
+        ('a'),('a'),('a'),('a'),('a'),('a'),('a'),
+        ('b'),('b'),('b'),('b'),('b'),('b');
+}
+
+@setup cte_source
+test save-all-cursors-window-triple-selfjoin-via-cte {
+    WITH cte AS MATERIALIZED (SELECT c1 FROM v0)
+    SELECT a.c1
+    FROM cte AS a JOIN cte AS b USING (c1) JOIN cte AS d USING (c1)
+    ORDER BY a.c1, sum(1e18) OVER (ORDER BY a.c1)
+    LIMIT 5;
+}
+expect {
+    a
+    a
+    a
+    a
+    a
+}

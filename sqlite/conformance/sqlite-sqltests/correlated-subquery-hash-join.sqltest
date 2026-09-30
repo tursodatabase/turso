@@ -1,0 +1,109 @@
+@database :memory:
+
+# Regression tests for #5543: Correlated subquery with explicit JOIN
+# returns wrong results after first row when hash join is used.
+
+setup schema {
+    CREATE TABLE t1(id INT);
+    CREATE TABLE t2(id INT, val INT);
+    CREATE TABLE t3(val INT, label TEXT);
+    INSERT INTO t1 VALUES (1),(2),(3);
+    INSERT INTO t2 VALUES (1,10),(2,20),(3,30);
+    INSERT INTO t3 VALUES (10,'ten'),(20,'twenty'),(30,'thirty');
+}
+
+# Exact reproducer from issue #5543
+@setup schema
+test correlated-subquery-with-join-basic {
+    SELECT t1.id,
+      (SELECT t3.label FROM t2 JOIN t3 ON t2.val = t3.val WHERE t2.id = t1.id) as label
+    FROM t1 ORDER BY t1.id;
+}
+expect {
+    1|ten
+    2|twenty
+    3|thirty
+}
+
+# Same query without ORDER BY
+@setup schema
+test correlated-subquery-with-join-no-order {
+    SELECT t1.id,
+      (SELECT t3.label FROM t2 JOIN t3 ON t2.val = t3.val WHERE t2.id = t1.id) as label
+    FROM t1;
+}
+expect unordered {
+    1|ten
+    2|twenty
+    3|thirty
+}
+
+# Outer row has no match in inner tables
+setup schema-with-gaps {
+    CREATE TABLE t1(id INT);
+    CREATE TABLE t2(id INT, val INT);
+    CREATE TABLE t3(val INT, label TEXT);
+    INSERT INTO t1 VALUES (1),(2),(3),(4);
+    INSERT INTO t2 VALUES (1,10),(3,30);
+    INSERT INTO t3 VALUES (10,'ten'),(20,'twenty'),(30,'thirty');
+}
+
+@setup schema-with-gaps
+test correlated-subquery-with-join-missing-rows {
+    SELECT t1.id,
+      (SELECT t3.label FROM t2 JOIN t3 ON t2.val = t3.val WHERE t2.id = t1.id) as label
+    FROM t1 ORDER BY t1.id;
+}
+expect {
+    1|ten
+    2|
+    3|thirty
+    4|
+}
+
+# Reversed join order: t3 JOIN t2 instead of t2 JOIN t3
+@setup schema
+test correlated-subquery-reversed-join {
+    SELECT t1.id,
+      (SELECT t3.label FROM t3 JOIN t2 ON t2.val = t3.val WHERE t2.id = t1.id) as label
+    FROM t1 ORDER BY t1.id;
+}
+expect {
+    1|ten
+    2|twenty
+    3|thirty
+}
+
+# Multiple correlated subqueries in the same SELECT
+@setup schema
+test correlated-subquery-with-join-multiple-cols {
+    SELECT t1.id,
+      (SELECT t2.val FROM t2 JOIN t3 ON t2.val = t3.val WHERE t2.id = t1.id) as val,
+      (SELECT t3.label FROM t2 JOIN t3 ON t2.val = t3.val WHERE t2.id = t1.id) as label
+    FROM t1 ORDER BY t1.id;
+}
+expect {
+    1|10|ten
+    2|20|twenty
+    3|30|thirty
+}
+
+# Single outer row that is not the first id (edge case)
+setup schema-single-row {
+    CREATE TABLE t1(id INT);
+    CREATE TABLE t2(id INT, val INT);
+    CREATE TABLE t3(val INT, label TEXT);
+    INSERT INTO t1 VALUES (2);
+    INSERT INTO t2 VALUES (1,10),(2,20),(3,30);
+    INSERT INTO t3 VALUES (10,'ten'),(20,'twenty'),(30,'thirty');
+}
+
+@setup schema-single-row
+test correlated-subquery-single-outer-row {
+    SELECT t1.id,
+      (SELECT t3.label FROM t2 JOIN t3 ON t2.val = t3.val WHERE t2.id = t1.id) as label
+    FROM t1;
+}
+expect {
+    2|twenty
+}

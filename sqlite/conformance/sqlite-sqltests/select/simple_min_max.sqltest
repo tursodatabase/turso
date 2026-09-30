@@ -1,0 +1,627 @@
+@database :memory:
+
+test unindexed-max-does-not-early-exit {
+    CREATE TABLE measurements(value INTEGER);
+    INSERT INTO measurements VALUES (10), (25), (15);
+
+    SELECT MAX(value) FROM measurements;
+}
+expect {
+    25
+}
+
+test unindexed-min-does-not-early-exit {
+    CREATE TABLE measurements(value INTEGER);
+    INSERT INTO measurements VALUES (20), (10), (25), (15);
+
+    SELECT MIN(value) FROM measurements;
+}
+expect {
+    10
+}
+
+test simple-count-scalar-subquery {
+    CREATE TABLE measurements(value INTEGER);
+    INSERT INTO measurements VALUES (10), (25), (15);
+
+    SELECT (SELECT COUNT(*) FROM measurements);
+}
+expect {
+    3
+}
+
+test indexed-max-result {
+    CREATE TABLE measurements(value INTEGER);
+    CREATE INDEX idx_measurements_value ON measurements(value);
+    INSERT INTO measurements VALUES (NULL), (10), (25), (15);
+
+    SELECT MAX(value) FROM measurements;
+}
+expect {
+    25
+}
+
+test indexed-min-result-skips-null {
+    CREATE TABLE measurements(value INTEGER);
+    CREATE INDEX idx_measurements_value ON measurements(value);
+    INSERT INTO measurements VALUES (NULL), (10), (25), (15);
+
+    SELECT MIN(value) FROM measurements;
+}
+expect {
+    10
+}
+
+test indexed-min-all-null-returns-null {
+    CREATE TABLE measurements(value INTEGER);
+    CREATE INDEX idx_measurements_value ON measurements(value);
+    INSERT INTO measurements VALUES (NULL), (NULL), (NULL);
+
+    SELECT MIN(value) FROM measurements;
+}
+expect {
+
+}
+
+test indexed-min-empty-table-returns-null {
+    CREATE TABLE measurements(value INTEGER);
+    CREATE INDEX idx_measurements_value ON measurements(value);
+
+    SELECT MIN(value) FROM measurements;
+}
+expect {
+
+}
+
+test indexed-max-with-equality-prefix {
+    CREATE TABLE measurements(category TEXT, value INTEGER);
+    CREATE INDEX idx_measurements_category_value ON measurements(category, value);
+    INSERT INTO measurements VALUES
+        ('a', 10),
+        ('a', 25),
+        ('a', 15),
+        ('b', 99);
+
+    SELECT MAX(value) FROM measurements WHERE category = 'a';
+}
+expect {
+    25
+}
+
+test indexed-min-with-equality-prefix-skips-null {
+    CREATE TABLE measurements(category TEXT, value INTEGER);
+    CREATE INDEX idx_measurements_category_value ON measurements(category, value);
+    INSERT INTO measurements VALUES
+        ('a', NULL),
+        ('a', 10),
+        ('a', 25),
+        ('a', 15),
+        ('b', 1);
+
+    SELECT MIN(value) FROM measurements WHERE category = 'a';
+}
+expect {
+    10
+}
+
+# ============================================================
+# Indexed fast-path: type affinity variants
+# ============================================================
+
+test indexed-min-max-text {
+    CREATE TABLE t_text(val TEXT);
+    CREATE INDEX idx_t_text ON t_text(val);
+    INSERT INTO t_text VALUES ('banana'), ('apple'), ('cherry');
+
+    SELECT MIN(val) FROM t_text;
+}
+expect {
+    apple
+}
+
+test indexed-max-text {
+    CREATE TABLE t_text(val TEXT);
+    CREATE INDEX idx_t_text ON t_text(val);
+    INSERT INTO t_text VALUES ('banana'), ('apple'), ('cherry');
+
+    SELECT MAX(val) FROM t_text;
+}
+expect {
+    cherry
+}
+
+test indexed-min-max-real-with-negatives {
+    CREATE TABLE t_real(val REAL);
+    CREATE INDEX idx_t_real ON t_real(val);
+    INSERT INTO t_real VALUES (-3.14), (2.71), (0.0), (-100.5);
+
+    SELECT MIN(val) FROM t_real;
+}
+expect {
+    -100.5
+}
+
+test indexed-max-real-with-negatives {
+    CREATE TABLE t_real(val REAL);
+    CREATE INDEX idx_t_real ON t_real(val);
+    INSERT INTO t_real VALUES (-3.14), (2.71), (0.0), (-100.5);
+
+    SELECT MAX(val) FROM t_real;
+}
+expect {
+    2.71
+}
+
+test indexed-min-max-extreme-integers {
+    CREATE TABLE t_extreme(val INTEGER);
+    CREATE INDEX idx_extreme ON t_extreme(val);
+    INSERT INTO t_extreme VALUES (9223372036854775807), (-9223372036854775808), (0);
+
+    SELECT MIN(val) FROM t_extreme;
+}
+expect {
+    -9223372036854775808
+}
+
+test indexed-max-extreme-integers {
+    CREATE TABLE t_extreme(val INTEGER);
+    CREATE INDEX idx_extreme ON t_extreme(val);
+    INSERT INTO t_extreme VALUES (9223372036854775807), (-9223372036854775808), (0);
+
+    SELECT MAX(val) FROM t_extreme;
+}
+expect {
+    9223372036854775807
+}
+
+test indexed-min-single-row {
+    CREATE TABLE t_one(val INTEGER);
+    CREATE INDEX idx_one ON t_one(val);
+    INSERT INTO t_one VALUES (42);
+
+    SELECT MIN(val) FROM t_one;
+}
+expect {
+    42
+}
+
+test indexed-max-single-row {
+    CREATE TABLE t_one(val INTEGER);
+    CREATE INDEX idx_one ON t_one(val);
+    INSERT INTO t_one VALUES (42);
+
+    SELECT MAX(val) FROM t_one;
+}
+expect {
+    42
+}
+
+test indexed-max-all-null-returns-null {
+    CREATE TABLE t_allnull(val INTEGER);
+    CREATE INDEX idx_allnull ON t_allnull(val);
+    INSERT INTO t_allnull VALUES (NULL), (NULL), (NULL);
+
+    SELECT MAX(val) FROM t_allnull;
+}
+expect {
+
+}
+
+test indexed-max-empty-table-returns-null {
+    CREATE TABLE t_empty(val INTEGER);
+    CREATE INDEX idx_empty ON t_empty(val);
+
+    SELECT MAX(val) FROM t_empty;
+}
+expect {
+
+}
+
+test materialized-cte-max-with-where {
+    CREATE TABLE products(price REAL NOT NULL);
+    CREATE INDEX idx_products_price ON products(price);
+    INSERT INTO products VALUES (10), (25), (15), (125);
+
+    WITH prices(price) AS MATERIALIZED (
+        SELECT price FROM products
+    )
+    SELECT MAX(price) FROM prices WHERE price < 100;
+}
+expect {
+    25.0
+}
+expect @js {
+    25
+}
+
+test materialized-cte-min-with-where-skips-null {
+    CREATE TABLE products(price REAL);
+    CREATE INDEX idx_products_price ON products(price);
+    INSERT INTO products VALUES (NULL), (10), (25), (15), (125);
+
+    WITH prices(price) AS MATERIALIZED (
+        SELECT price FROM products
+    )
+    SELECT MIN(price) FROM prices WHERE price < 100;
+}
+expect {
+    10.0
+}
+expect @js {
+    10
+}
+
+test materialized-cte-max-without-where {
+    CREATE TABLE products(price REAL NOT NULL);
+    CREATE INDEX idx_products_price ON products(price);
+    INSERT INTO products VALUES (10), (25), (15), (125);
+
+    WITH prices(price) AS MATERIALIZED (
+        SELECT price FROM products
+    )
+    SELECT MAX(price) FROM prices;
+}
+expect {
+    125.0
+}
+expect @js {
+    125
+}
+
+test materialized-cte-correlated-max-with-implicit-inner-order {
+    CREATE TABLE products(price REAL NOT NULL);
+    CREATE INDEX idx_products_price ON products(price);
+    INSERT INTO products VALUES (10), (25), (15), (125);
+
+    WITH prices(price) AS MATERIALIZED (
+        SELECT price FROM products
+    )
+    SELECT p1.price, (
+        SELECT MAX(p2.price)
+        FROM prices p2
+        WHERE p2.price < p1.price
+    )
+    FROM prices p1
+    WHERE p1.price < 100
+    ORDER BY p1.price;
+}
+expect {
+    10.0|
+    15.0|10.0
+    25.0|15.0
+}
+expect @js {
+    10|
+    15|10
+    25|15
+}
+
+test unordered-materialized-cte-max-without-where {
+    CREATE TABLE products(price REAL NOT NULL);
+    INSERT INTO products VALUES (10), (25), (15), (125);
+
+    WITH prices(price) AS MATERIALIZED (
+        SELECT price FROM products
+    )
+    SELECT MAX(price) FROM prices;
+}
+expect {
+    125.0
+}
+expect @js {
+    125
+}
+
+test unordered-materialized-cte-correlated-max {
+    CREATE TABLE products(price REAL NOT NULL);
+    INSERT INTO products VALUES (10), (25), (15), (125);
+
+    WITH prices(price) AS MATERIALIZED (
+        SELECT price FROM products
+    )
+    SELECT p1.price, (
+        SELECT MAX(p2.price)
+        FROM prices p2
+        WHERE p2.price < p1.price
+    )
+    FROM prices p1
+    WHERE p1.price < 100
+    ORDER BY p1.price;
+}
+expect {
+    10.0|
+    15.0|10.0
+    25.0|15.0
+}
+expect @js {
+    10|
+    15|10
+    25|15
+}
+
+# ============================================================
+# Indexed fast-path: collation
+# ============================================================
+
+test indexed-min-nocase-column-collation {
+    CREATE TABLE t_nocase(val TEXT COLLATE NOCASE);
+    CREATE INDEX idx_nocase ON t_nocase(val);
+    INSERT INTO t_nocase VALUES ('apple'), ('BANANA'), ('cherry'), ('Apple');
+
+    SELECT MIN(val) FROM t_nocase;
+}
+expect {
+    apple
+}
+
+test indexed-max-nocase-column-collation {
+    CREATE TABLE t_nocase(val TEXT COLLATE NOCASE);
+    CREATE INDEX idx_nocase ON t_nocase(val);
+    INSERT INTO t_nocase VALUES ('apple'), ('BANANA'), ('cherry'), ('Apple');
+
+    SELECT MAX(val) FROM t_nocase;
+}
+expect {
+    cherry
+}
+
+# ============================================================
+# Indexed fast-path: DESC index
+# ============================================================
+
+test indexed-min-desc-index {
+    CREATE TABLE t_desc(val INTEGER);
+    CREATE INDEX idx_desc ON t_desc(val DESC);
+    INSERT INTO t_desc VALUES (10), (5), (20), (NULL);
+
+    SELECT MIN(val) FROM t_desc;
+}
+expect {
+    5
+}
+
+test indexed-max-desc-index {
+    CREATE TABLE t_desc(val INTEGER);
+    CREATE INDEX idx_desc ON t_desc(val DESC);
+    INSERT INTO t_desc VALUES (10), (5), (20), (NULL);
+
+    SELECT MAX(val) FROM t_desc;
+}
+expect {
+    20
+}
+
+# ============================================================
+# Indexed fast-path: multiple equality prefix columns
+# ============================================================
+
+test indexed-min-multi-equality-prefix {
+    CREATE TABLE t_mwhere(a TEXT, b TEXT, val INTEGER);
+    CREATE INDEX idx_mwhere ON t_mwhere(a, b, val);
+    INSERT INTO t_mwhere VALUES ('x', 'p', 10), ('x', 'p', 5), ('x', 'q', 1), ('y', 'p', 100);
+
+    SELECT MIN(val) FROM t_mwhere WHERE a = 'x' AND b = 'p';
+}
+expect {
+    5
+}
+
+test indexed-max-multi-equality-prefix {
+    CREATE TABLE t_mwhere(a TEXT, b TEXT, val INTEGER);
+    CREATE INDEX idx_mwhere ON t_mwhere(a, b, val);
+    INSERT INTO t_mwhere VALUES ('x', 'p', 10), ('x', 'p', 5), ('x', 'q', 1), ('y', 'p', 100);
+
+    SELECT MAX(val) FROM t_mwhere WHERE a = 'x' AND b = 'p';
+}
+expect {
+    10
+}
+
+# ============================================================
+# Indexed fast-path: subquery context
+# ============================================================
+
+test indexed-min-in-scalar-subquery {
+    CREATE TABLE t_outer(id INTEGER, val INTEGER);
+    INSERT INTO t_outer VALUES (1, 5), (2, 10), (3, 1);
+    CREATE TABLE t_inner(val INTEGER);
+    CREATE INDEX idx_inner ON t_inner(val);
+    INSERT INTO t_inner VALUES (5), (10), (1);
+
+    SELECT id FROM t_outer WHERE val = (SELECT MIN(val) FROM t_inner);
+}
+expect {
+    3
+}
+
+# ============================================================
+# Negative cases: should NOT use indexed fast path
+# (these test that the fallback aggregation path is correct)
+# ============================================================
+
+# Expression wrapping aggregate: result column != bare aggregate
+test negative-min-plus-constant {
+    CREATE TABLE t_wrap(val INTEGER);
+    CREATE INDEX idx_wrap ON t_wrap(val);
+    INSERT INTO t_wrap VALUES (10), (5), (20);
+
+    SELECT MIN(val) + 0 FROM t_wrap;
+}
+expect {
+    5
+}
+
+test negative-max-times-one {
+    CREATE TABLE t_wrap(val INTEGER);
+    CREATE INDEX idx_wrap ON t_wrap(val);
+    INSERT INTO t_wrap VALUES (10), (5), (20);
+
+    SELECT MAX(val) * 1 FROM t_wrap;
+}
+expect {
+    20
+}
+
+test negative-negated-min {
+    CREATE TABLE t_wrap(val INTEGER);
+    CREATE INDEX idx_wrap ON t_wrap(val);
+    INSERT INTO t_wrap VALUES (10), (5), (20);
+
+    SELECT -MIN(val) FROM t_wrap;
+}
+expect {
+    -5
+}
+
+test negative-coalesce-wrapping-max {
+    CREATE TABLE t_wrap(val INTEGER);
+    CREATE INDEX idx_wrap ON t_wrap(val);
+    INSERT INTO t_wrap VALUES (10), (5), (20);
+
+    SELECT COALESCE(MAX(val), 0) FROM t_wrap;
+}
+expect {
+    20
+}
+
+test negative-length-of-min {
+    CREATE TABLE t_len(val TEXT);
+    CREATE INDEX idx_len ON t_len(val);
+    INSERT INTO t_len VALUES ('abc'), ('de'), ('fghij');
+
+    SELECT length(MIN(val)) FROM t_len;
+}
+expect {
+    3
+}
+
+# Multiple aggregates: disqualifies fast path
+test negative-min-and-max-together {
+    CREATE TABLE t_multi(val INTEGER);
+    INSERT INTO t_multi VALUES (1), (2), (3);
+
+    SELECT MIN(val), MAX(val) FROM t_multi;
+}
+expect {
+    1|3
+}
+
+# GROUP BY present: disqualifies fast path
+test negative-min-with-group-by {
+    CREATE TABLE t_group(grp TEXT, val INTEGER);
+    INSERT INTO t_group VALUES ('a', 1), ('a', 5), ('b', 3);
+
+    SELECT grp, MIN(val) FROM t_group GROUP BY grp;
+}
+expect {
+    a|1
+    b|3
+}
+
+# Expression argument: index can't satisfy MIN(val+1) or MIN(ABS(val))
+test negative-min-expression-argument {
+    CREATE TABLE t_expr(val INTEGER);
+    CREATE INDEX idx_expr ON t_expr(val);
+    INSERT INTO t_expr VALUES (10), (5), (20);
+
+    SELECT MIN(val + 1) FROM t_expr;
+}
+expect {
+    6
+}
+
+test negative-min-abs-expression {
+    CREATE TABLE t_abs(val INTEGER);
+    CREATE INDEX idx_abs ON t_abs(val);
+    INSERT INTO t_abs VALUES (-10), (5), (-20), (3);
+
+    SELECT MIN(ABS(val)) FROM t_abs;
+}
+expect {
+    3
+}
+
+# Partial prefix: MIN(b) on index(a,b) without WHERE on a can't use fast path
+test negative-min-partial-index-prefix {
+    CREATE TABLE t_prefix(a TEXT, b INTEGER);
+    CREATE INDEX idx_prefix ON t_prefix(a, b);
+    INSERT INTO t_prefix VALUES ('x', 10), ('y', 1), ('z', 5);
+
+    SELECT MIN(b) FROM t_prefix;
+}
+expect {
+    1
+}
+
+test negative-max-partial-index-prefix {
+    CREATE TABLE t_prefix(a TEXT, b INTEGER);
+    CREATE INDEX idx_prefix ON t_prefix(a, b);
+    INSERT INTO t_prefix VALUES ('x', 10), ('y', 1), ('z', 5);
+
+    SELECT MAX(b) FROM t_prefix;
+}
+expect {
+    10
+}
+
+# WHERE with inequality (range predicate, not equality prefix)
+test negative-min-with-inequality-where {
+    CREATE TABLE t_ineq(val INTEGER, other INTEGER);
+    CREATE INDEX idx_ineq ON t_ineq(val);
+    INSERT INTO t_ineq VALUES (10, 1), (5, 2), (20, 3), (1, 4);
+
+    SELECT MIN(val) FROM t_ineq WHERE other > 2;
+}
+expect {
+    1
+}
+
+test negative-max-with-inequality-where {
+    CREATE TABLE t_ineq(val INTEGER, other INTEGER);
+    CREATE INDEX idx_ineq ON t_ineq(val);
+    INSERT INTO t_ineq VALUES (10, 1), (5, 2), (20, 3), (1, 4);
+
+    SELECT MAX(val) FROM t_ineq WHERE other > 2;
+}
+expect {
+    20
+}
+
+# LIMIT 0 on aggregation should return no rows
+test negative-max-with-limit-zero {
+    CREATE TABLE t_lim0(val INTEGER);
+    CREATE INDEX idx_lim0 ON t_lim0(val);
+    INSERT INTO t_lim0 VALUES (1), (2), (3);
+
+    SELECT MAX(val) FROM t_lim0 LIMIT 0;
+}
+expect {
+}
+
+# MIN with CAST: argument expression doesn't match index column
+test negative-min-cast-argument {
+    CREATE TABLE t_cast(val TEXT);
+    CREATE INDEX idx_cast ON t_cast(val);
+    INSERT INTO t_cast VALUES ('100'), ('20'), ('3');
+
+    SELECT MIN(CAST(val AS INTEGER)) FROM t_cast;
+}
+expect {
+    3
+}
+
+# Correlated subquery: outer ref disqualifies fast path
+test negative-min-correlated-subquery {
+    CREATE TABLE t_outer(id INTEGER, val INTEGER);
+    INSERT INTO t_outer VALUES (1, 5), (2, 10), (3, 1);
+    CREATE TABLE t_inner(val INTEGER);
+    CREATE INDEX idx_inner ON t_inner(val);
+    INSERT INTO t_inner VALUES (5), (10), (1);
+
+    SELECT id, (SELECT MIN(t_inner.val) FROM t_inner WHERE t_inner.val > t_outer.val) FROM t_outer;
+}
+expect {
+    1|10
+    2|
+    3|5
+}

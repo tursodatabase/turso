@@ -1,0 +1,19 @@
+[package]
+name = "sql_gen_prop"
+version.workspace = true
+authors.workspace = true
+edition = "2024"
+license.workspace = true
+repository.workspace = true
+
+[lib]
+path = "lib.rs"
+
+[dependencies]
+proptest = "1.9"
+strum.workspace = true
+serde = { workspace = true, features = ["derive", "rc"] }
+anarchist-readable-name-generator-lib = "0.2.0"
+
+[lints]
+workspace = true

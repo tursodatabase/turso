@@ -1,0 +1,54 @@
+use crate::sync::Arc;
+
+use crate::{
+    index_method::{
+        IndexMethod, IndexMethodAttachment, IndexMethodConfiguration, IndexMethodCursor,
+        IndexMethodDefinition, BACKING_BTREE_INDEX_METHOD_NAME,
+    },
+    LimboError, Result,
+};
+
+/// Special 'backing_btree' index method which can be used by other custom index methods
+///
+/// Under the hood, it's marked as 'treat_as_btree' which recognized by the tursodb core as a special index method
+/// which should be translated to ordinary btree but also do not explicitly managed by the core
+#[derive(Debug)]
+pub struct BackingBtreeIndexMethod;
+
+#[derive(Debug)]
+pub struct BackingBTreeIndexMethodAttachment {
+    table_name: String,
+    index_name: String,
+}
+
+impl IndexMethod for BackingBtreeIndexMethod {
+    fn attach(
+        &self,
+        configuration: &IndexMethodConfiguration,
+    ) -> Result<Arc<dyn IndexMethodAttachment>> {
+        Ok(Arc::new(BackingBTreeIndexMethodAttachment {
+            table_name: configuration.table_name.clone(),
+            index_name: configuration.index_name.clone(),
+        }))
+    }
+}
+
+impl IndexMethodAttachment for BackingBTreeIndexMethodAttachment {
+    fn definition<'a>(&'a self) -> IndexMethodDefinition<'a> {
+        IndexMethodDefinition {
+            method_name: BACKING_BTREE_INDEX_METHOD_NAME,
+            table_name: &self.table_name,
+            index_name: &self.index_name,
+            patterns: &[],
+            backing_btree: true,
+            results_materialized: false,
+            mvcc_support: super::IndexMethodMvccSupport::TransactionalBackingStore,
+        }
+    }
+
+    fn init(&self) -> Result<Box<dyn IndexMethodCursor>> {
+        Err(LimboError::InternalError(
+            "init is not supported for backing_btree index method".to_string(),
+        ))
+    }
+}

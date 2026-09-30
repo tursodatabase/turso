@@ -1,0 +1,2942 @@
+--
+-- STRINGS
+-- Test various data entry syntaxes.
+--
+-- SQL string continuation syntax
+-- E021-03 character string literals
+SELECT 'first line'
+' - next line'
+	' - third line'
+	AS "Three lines to one";
+         Three lines to one          
+-------------------------------------
+ first line - next line - third line
+(1 row)
+
+-- illegal string continuation syntax
+SELECT 'first line'
+' - next line' /* this comment is not allowed here */
+' - third line'
+	AS "Illegal comment within continuation";
+ERROR:  syntax error at or near "' - third line'"
+LINE 3: ' - third line'
+        ^
+-- Unicode escapes
+SET standard_conforming_strings TO on;
+SELECT U&'d\0061t\+000061' AS U&"d\0061t\+000061";
+ data 
+------
+ data
+(1 row)
+
+SELECT U&'d!0061t\+000061' UESCAPE '!' AS U&"d*0061t\+000061" UESCAPE '*';
+ dat\+000061 
+-------------
+ dat\+000061
+(1 row)
+
+SELECT U&'a\\b' AS "a\b";
+ a\b 
+-----
+ a\b
+(1 row)
+
+SELECT U&' \' UESCAPE '!' AS "tricky";
+ tricky 
+--------
+  \
+(1 row)
+
+SELECT 'tricky' AS U&"\" UESCAPE '!';
+   \    
+--------
+ tricky
+(1 row)
+
+SELECT U&'wrong: \061';
+ERROR:  invalid Unicode escape
+LINE 1: SELECT U&'wrong: \061';
+                         ^
+HINT:  Unicode escapes must be \XXXX or \+XXXXXX.
+SELECT U&'wrong: \+0061';
+ERROR:  invalid Unicode escape
+LINE 1: SELECT U&'wrong: \+0061';
+                         ^
+HINT:  Unicode escapes must be \XXXX or \+XXXXXX.
+SELECT U&'wrong: +0061' UESCAPE +;
+ERROR:  UESCAPE must be followed by a simple string literal at or near "+"
+LINE 1: SELECT U&'wrong: +0061' UESCAPE +;
+                                        ^
+SELECT U&'wrong: +0061' UESCAPE '+';
+ERROR:  invalid Unicode escape character at or near "'+'"
+LINE 1: SELECT U&'wrong: +0061' UESCAPE '+';
+                                        ^
+SELECT U&'wrong: \db99';
+ERROR:  invalid Unicode surrogate pair
+LINE 1: SELECT U&'wrong: \db99';
+                              ^
+SELECT U&'wrong: \db99xy';
+ERROR:  invalid Unicode surrogate pair
+LINE 1: SELECT U&'wrong: \db99xy';
+                              ^
+SELECT U&'wrong: \db99\\';
+ERROR:  invalid Unicode surrogate pair
+LINE 1: SELECT U&'wrong: \db99\\';
+                              ^
+SELECT U&'wrong: \db99\0061';
+ERROR:  invalid Unicode surrogate pair
+LINE 1: SELECT U&'wrong: \db99\0061';
+                              ^
+SELECT U&'wrong: \+00db99\+000061';
+ERROR:  invalid Unicode surrogate pair
+LINE 1: SELECT U&'wrong: \+00db99\+000061';
+                                 ^
+SELECT U&'wrong: \+2FFFFF';
+ERROR:  invalid Unicode escape value
+LINE 1: SELECT U&'wrong: \+2FFFFF';
+                         ^
+-- while we're here, check the same cases in E-style literals
+SELECT E'd\u0061t\U00000061' AS "data";
+ data 
+------
+ data
+(1 row)
+
+SELECT E'a\\b' AS "a\b";
+ a\b 
+-----
+ a\b
+(1 row)
+
+SELECT E'wrong: \u061';
+ERROR:  invalid Unicode escape
+LINE 1: SELECT E'wrong: \u061';
+                        ^
+HINT:  Unicode escapes must be \uXXXX or \UXXXXXXXX.
+SELECT E'wrong: \U0061';
+ERROR:  invalid Unicode escape
+LINE 1: SELECT E'wrong: \U0061';
+                        ^
+HINT:  Unicode escapes must be \uXXXX or \UXXXXXXXX.
+SELECT E'wrong: \udb99';
+ERROR:  invalid Unicode surrogate pair at or near "'"
+LINE 1: SELECT E'wrong: \udb99';
+                              ^
+SELECT E'wrong: \udb99xy';
+ERROR:  invalid Unicode surrogate pair at or near "x"
+LINE 1: SELECT E'wrong: \udb99xy';
+                              ^
+SELECT E'wrong: \udb99\\';
+ERROR:  invalid Unicode surrogate pair at or near "\"
+LINE 1: SELECT E'wrong: \udb99\\';
+                              ^
+SELECT E'wrong: \udb99\u0061';
+ERROR:  invalid Unicode surrogate pair at or near "\u0061"
+LINE 1: SELECT E'wrong: \udb99\u0061';
+                              ^
+SELECT E'wrong: \U0000db99\U00000061';
+ERROR:  invalid Unicode surrogate pair at or near "\U00000061"
+LINE 1: SELECT E'wrong: \U0000db99\U00000061';
+                                  ^
+SELECT E'wrong: \U002FFFFF';
+ERROR:  invalid Unicode escape value at or near "\U002FFFFF"
+LINE 1: SELECT E'wrong: \U002FFFFF';
+                        ^
+SET standard_conforming_strings TO off;
+SELECT U&'d\0061t\+000061' AS U&"d\0061t\+000061";
+ERROR:  unsafe use of string constant with Unicode escapes
+LINE 1: SELECT U&'d\0061t\+000061' AS U&"d\0061t\+000061";
+               ^
+DETAIL:  String constants with Unicode escapes cannot be used when "standard_conforming_strings" is off.
+SELECT U&'d!0061t\+000061' UESCAPE '!' AS U&"d*0061t\+000061" UESCAPE '*';
+ERROR:  unsafe use of string constant with Unicode escapes
+LINE 1: SELECT U&'d!0061t\+000061' UESCAPE '!' AS U&"d*0061t\+000061...
+               ^
+DETAIL:  String constants with Unicode escapes cannot be used when "standard_conforming_strings" is off.
+SELECT U&' \' UESCAPE '!' AS "tricky";
+ERROR:  unsafe use of string constant with Unicode escapes
+LINE 1: SELECT U&' \' UESCAPE '!' AS "tricky";
+               ^
+DETAIL:  String constants with Unicode escapes cannot be used when "standard_conforming_strings" is off.
+SELECT 'tricky' AS U&"\" UESCAPE '!';
+   \    
+--------
+ tricky
+(1 row)
+
+SELECT U&'wrong: \061';
+ERROR:  unsafe use of string constant with Unicode escapes
+LINE 1: SELECT U&'wrong: \061';
+               ^
+DETAIL:  String constants with Unicode escapes cannot be used when "standard_conforming_strings" is off.
+SELECT U&'wrong: \+0061';
+ERROR:  unsafe use of string constant with Unicode escapes
+LINE 1: SELECT U&'wrong: \+0061';
+               ^
+DETAIL:  String constants with Unicode escapes cannot be used when "standard_conforming_strings" is off.
+SELECT U&'wrong: +0061' UESCAPE '+';
+ERROR:  unsafe use of string constant with Unicode escapes
+LINE 1: SELECT U&'wrong: +0061' UESCAPE '+';
+               ^
+DETAIL:  String constants with Unicode escapes cannot be used when "standard_conforming_strings" is off.
+RESET standard_conforming_strings;
+-- bytea
+SET bytea_output TO hex;
+SELECT E'\\xDeAdBeEf'::bytea;
+   bytea    
+------------
+ \xdeadbeef
+(1 row)
+
+SELECT E'\\x De Ad Be Ef '::bytea;
+   bytea    
+------------
+ \xdeadbeef
+(1 row)
+
+SELECT E'\\xDeAdBeE'::bytea;
+ERROR:  invalid hexadecimal data: odd number of digits
+LINE 1: SELECT E'\\xDeAdBeE'::bytea;
+               ^
+SELECT E'\\xDeAdBeEx'::bytea;
+ERROR:  invalid hexadecimal digit: "x"
+LINE 1: SELECT E'\\xDeAdBeEx'::bytea;
+               ^
+SELECT E'\\xDe00BeEf'::bytea;
+   bytea    
+------------
+ \xde00beef
+(1 row)
+
+SELECT E'DeAdBeEf'::bytea;
+       bytea        
+--------------------
+ \x4465416442654566
+(1 row)
+
+SELECT E'De\\000dBeEf'::bytea;
+       bytea        
+--------------------
+ \x4465006442654566
+(1 row)
+
+SELECT E'De\123dBeEf'::bytea;
+       bytea        
+--------------------
+ \x4465536442654566
+(1 row)
+
+SELECT E'De\\123dBeEf'::bytea;
+       bytea        
+--------------------
+ \x4465536442654566
+(1 row)
+
+SELECT E'De\\678dBeEf'::bytea;
+ERROR:  invalid input syntax for type bytea
+LINE 1: SELECT E'De\\678dBeEf'::bytea;
+               ^
+SELECT reverse(''::bytea);
+ reverse 
+---------
+ \x
+(1 row)
+
+SELECT reverse('\xaa'::bytea);
+ reverse 
+---------
+ \xaa
+(1 row)
+
+SELECT reverse('\xabcd'::bytea);
+ reverse 
+---------
+ \xcdab
+(1 row)
+
+SET bytea_output TO escape;
+SELECT E'\\xDeAdBeEf'::bytea;
+      bytea       
+------------------
+ \336\255\276\357
+(1 row)
+
+SELECT E'\\x De Ad Be Ef '::bytea;
+      bytea       
+------------------
+ \336\255\276\357
+(1 row)
+
+SELECT E'\\xDe00BeEf'::bytea;
+      bytea       
+------------------
+ \336\000\276\357
+(1 row)
+
+SELECT E'DeAdBeEf'::bytea;
+  bytea   
+----------
+ DeAdBeEf
+(1 row)
+
+SELECT E'De\\000dBeEf'::bytea;
+    bytea    
+-------------
+ De\000dBeEf
+(1 row)
+
+SELECT E'De\\123dBeEf'::bytea;
+  bytea   
+----------
+ DeSdBeEf
+(1 row)
+
+-- Test non-error-throwing API too
+SELECT pg_input_is_valid(E'\\xDeAdBeE', 'bytea');
+ pg_input_is_valid 
+-------------------
+ f
+(1 row)
+
+SELECT * FROM pg_input_error_info(E'\\xDeAdBeE', 'bytea');
+                    message                     | detail | hint | sql_error_code 
+------------------------------------------------+--------+------+----------------
+ invalid hexadecimal data: odd number of digits |        |      | 22023
+(1 row)
+
+SELECT * FROM pg_input_error_info(E'\\xDeAdBeEx', 'bytea');
+            message             | detail | hint | sql_error_code 
+--------------------------------+--------+------+----------------
+ invalid hexadecimal digit: "x" |        |      | 22023
+(1 row)
+
+SELECT * FROM pg_input_error_info(E'foo\\99bar', 'bytea');
+               message               | detail | hint | sql_error_code 
+-------------------------------------+--------+------+----------------
+ invalid input syntax for type bytea |        |      | 22P02
+(1 row)
+
+--
+-- test conversions between various string types
+-- E021-10 implicit casting among the character data types
+--
+SELECT CAST(f1 AS text) AS "text(char)" FROM CHAR_TBL;
+ text(char) 
+------------
+ a
+ ab
+ abcd
+ abcd
+(4 rows)
+
+SELECT CAST(f1 AS text) AS "text(varchar)" FROM VARCHAR_TBL;
+ text(varchar) 
+---------------
+ a
+ ab
+ abcd
+ abcd
+(4 rows)
+
+SELECT CAST(name 'namefield' AS text) AS "text(name)";
+ text(name) 
+------------
+ namefield
+(1 row)
+
+-- since this is an explicit cast, it should truncate w/o error:
+SELECT CAST(f1 AS char(10)) AS "char(text)" FROM TEXT_TBL;
+ char(text) 
+------------
+ doh!      
+ hi de ho n
+(2 rows)
+
+-- note: implicit-cast case is tested in char.sql
+SELECT CAST(f1 AS char(20)) AS "char(text)" FROM TEXT_TBL;
+      char(text)      
+----------------------
+ doh!                
+ hi de ho neighbor   
+(2 rows)
+
+SELECT CAST(f1 AS char(10)) AS "char(varchar)" FROM VARCHAR_TBL;
+ char(varchar) 
+---------------
+ a         
+ ab        
+ abcd      
+ abcd      
+(4 rows)
+
+SELECT CAST(name 'namefield' AS char(10)) AS "char(name)";
+ char(name) 
+------------
+ namefield 
+(1 row)
+
+SELECT CAST(f1 AS varchar) AS "varchar(text)" FROM TEXT_TBL;
+   varchar(text)   
+-------------------
+ doh!
+ hi de ho neighbor
+(2 rows)
+
+SELECT CAST(f1 AS varchar) AS "varchar(char)" FROM CHAR_TBL;
+ varchar(char) 
+---------------
+ a
+ ab
+ abcd
+ abcd
+(4 rows)
+
+SELECT CAST(name 'namefield' AS varchar) AS "varchar(name)";
+ varchar(name) 
+---------------
+ namefield
+(1 row)
+
+--
+-- test SQL string functions
+-- E### and T### are feature reference numbers from SQL99
+--
+-- E021-09 trim function
+SELECT TRIM(BOTH FROM '  bunch o blanks  ') = 'bunch o blanks' AS "bunch o blanks";
+ bunch o blanks 
+----------------
+ t
+(1 row)
+
+SELECT TRIM(LEADING FROM '  bunch o blanks  ') = 'bunch o blanks  ' AS "bunch o blanks  ";
+ bunch o blanks   
+------------------
+ t
+(1 row)
+
+SELECT TRIM(TRAILING FROM '  bunch o blanks  ') = '  bunch o blanks' AS "  bunch o blanks";
+   bunch o blanks 
+------------------
+ t
+(1 row)
+
+SELECT TRIM(BOTH 'x' FROM 'xxxxxsome Xsxxxxx') = 'some Xs' AS "some Xs";
+ some Xs 
+---------
+ t
+(1 row)
+
+-- E021-06 substring expression
+SELECT SUBSTRING('1234567890' FROM 3) = '34567890' AS "34567890";
+ 34567890 
+----------
+ t
+(1 row)
+
+SELECT SUBSTRING('1234567890' FROM 4 FOR 3) = '456' AS "456";
+ 456 
+-----
+ t
+(1 row)
+
+-- test overflow cases
+SELECT SUBSTRING('string' FROM 2 FOR 2147483646) AS "tring";
+ tring 
+-------
+ tring
+(1 row)
+
+SELECT SUBSTRING('string' FROM -10 FOR 2147483646) AS "string";
+ string 
+--------
+ string
+(1 row)
+
+SELECT SUBSTRING('string' FROM -10 FOR -2147483646) AS "error";
+ERROR:  negative substring length not allowed
+-- T581 regular expression substring (with SQL's bizarre regexp syntax)
+SELECT SUBSTRING('abcdefg' SIMILAR 'a#"(b_d)#"%' ESCAPE '#') AS "bcd";
+ bcd 
+-----
+ bcd
+(1 row)
+
+-- obsolete SQL99 syntax
+SELECT SUBSTRING('abcdefg' FROM 'a#"(b_d)#"%' FOR '#') AS "bcd";
+ bcd 
+-----
+ bcd
+(1 row)
+
+-- No match should return NULL
+SELECT SUBSTRING('abcdefg' SIMILAR '#"(b_d)#"%' ESCAPE '#') IS NULL AS "True";
+ True 
+------
+ t
+(1 row)
+
+-- Null inputs should return NULL
+SELECT SUBSTRING('abcdefg' SIMILAR '%' ESCAPE NULL) IS NULL AS "True";
+ True 
+------
+ t
+(1 row)
+
+SELECT SUBSTRING(NULL SIMILAR '%' ESCAPE '#') IS NULL AS "True";
+ True 
+------
+ t
+(1 row)
+
+SELECT SUBSTRING('abcdefg' SIMILAR NULL ESCAPE '#') IS NULL AS "True";
+ True 
+------
+ t
+(1 row)
+
+-- The first and last parts should act non-greedy
+SELECT SUBSTRING('abcdefg' SIMILAR 'a#"%#"g' ESCAPE '#') AS "bcdef";
+ bcdef 
+-------
+ bcdef
+(1 row)
+
+SELECT SUBSTRING('abcdefg' SIMILAR 'a*#"%#"g*' ESCAPE '#') AS "abcdefg";
+ abcdefg 
+---------
+ abcdefg
+(1 row)
+
+-- Vertical bar in any part affects only that part
+SELECT SUBSTRING('abcdefg' SIMILAR 'a|b#"%#"g' ESCAPE '#') AS "bcdef";
+ bcdef 
+-------
+ bcdef
+(1 row)
+
+SELECT SUBSTRING('abcdefg' SIMILAR 'a#"%#"x|g' ESCAPE '#') AS "bcdef";
+ bcdef 
+-------
+ bcdef
+(1 row)
+
+SELECT SUBSTRING('abcdefg' SIMILAR 'a#"%|ab#"g' ESCAPE '#') AS "bcdef";
+ bcdef 
+-------
+ bcdef
+(1 row)
+
+-- Can't have more than two part separators
+SELECT SUBSTRING('abcdefg' SIMILAR 'a*#"%#"g*#"x' ESCAPE '#') AS "error";
+ERROR:  SQL regular expression may not contain more than two escape-double-quote separators
+CONTEXT:  SQL function "substring" statement 1
+-- Postgres extension: with 0 or 1 separator, assume parts 1 and 3 are empty
+SELECT SUBSTRING('abcdefg' SIMILAR 'a#"%g' ESCAPE '#') AS "bcdefg";
+ bcdefg 
+--------
+ bcdefg
+(1 row)
+
+SELECT SUBSTRING('abcdefg' SIMILAR 'a%g' ESCAPE '#') AS "abcdefg";
+ abcdefg 
+---------
+ abcdefg
+(1 row)
+
+-- substring() with just two arguments is not allowed by SQL spec;
+-- we accept it, but we interpret the pattern as a POSIX regexp not SQL
+SELECT SUBSTRING('abcdefg' FROM 'c.e') AS "cde";
+ cde 
+-----
+ cde
+(1 row)
+
+-- With a parenthesized subexpression, return only what matches the subexpr
+SELECT SUBSTRING('abcdefg' FROM 'b(.*)f') AS "cde";
+ cde 
+-----
+ cde
+(1 row)
+
+-- Check case where we have a match, but not a subexpression match
+SELECT SUBSTRING('foo' FROM 'foo(bar)?') IS NULL AS t;
+ t 
+---
+ t
+(1 row)
+
+-- Check behavior of SIMILAR TO, which uses largely the same regexp variant
+SELECT 'abcdefg' SIMILAR TO '_bcd%' AS true;
+ true 
+------
+ t
+(1 row)
+
+SELECT 'abcdefg' SIMILAR TO 'bcd%' AS false;
+ false 
+-------
+ f
+(1 row)
+
+SELECT 'abcdefg' SIMILAR TO '_bcd#%' ESCAPE '#' AS false;
+ false 
+-------
+ f
+(1 row)
+
+SELECT 'abcd%' SIMILAR TO '_bcd#%' ESCAPE '#' AS true;
+ true 
+------
+ t
+(1 row)
+
+-- Postgres uses '\' as the default escape character, which is not per spec
+SELECT 'abcdefg' SIMILAR TO '_bcd\%' AS false;
+ false 
+-------
+ f
+(1 row)
+
+-- and an empty string to mean "no escape", which is also not per spec
+SELECT 'abcd\efg' SIMILAR TO '_bcd\%' ESCAPE '' AS true;
+ true 
+------
+ t
+(1 row)
+
+-- these behaviors are per spec, though:
+SELECT 'abcdefg' SIMILAR TO '_bcd%' ESCAPE NULL AS null;
+ null 
+------
+ 
+(1 row)
+
+SELECT 'abcdefg' SIMILAR TO '_bcd#%' ESCAPE '##' AS error;
+ERROR:  invalid escape string
+HINT:  Escape string must be empty or one character.
+-- Characters that should be left alone in character classes when a
+-- SIMILAR TO regexp pattern is converted to POSIX style.
+-- Underscore "_"
+EXPLAIN (COSTS OFF) SELECT * FROM TEXT_TBL WHERE f1 SIMILAR TO '_[_[:alpha:]_]_';
+                   QUERY PLAN                   
+------------------------------------------------
+ Seq Scan on text_tbl
+   Filter: (f1 ~ '^(?:.[_[:alpha:]_].)$'::text)
+(2 rows)
+
+-- Percentage "%"
+EXPLAIN (COSTS OFF) SELECT * FROM TEXT_TBL WHERE f1 SIMILAR TO '%[%[:alnum:]%]%';
+                    QUERY PLAN                    
+--------------------------------------------------
+ Seq Scan on text_tbl
+   Filter: (f1 ~ '^(?:.*[%[:alnum:]%].*)$'::text)
+(2 rows)
+
+-- Dot "."
+EXPLAIN (COSTS OFF) SELECT * FROM TEXT_TBL WHERE f1 SIMILAR TO '.[.[:alnum:].].';
+                    QUERY PLAN                    
+--------------------------------------------------
+ Seq Scan on text_tbl
+   Filter: (f1 ~ '^(?:\.[.[:alnum:].]\.)$'::text)
+(2 rows)
+
+-- Dollar "$"
+EXPLAIN (COSTS OFF) SELECT * FROM TEXT_TBL WHERE f1 SIMILAR TO '$[$[:alnum:]$]$';
+                    QUERY PLAN                    
+--------------------------------------------------
+ Seq Scan on text_tbl
+   Filter: (f1 ~ '^(?:\$[$[:alnum:]$]\$)$'::text)
+(2 rows)
+
+-- Opening parenthesis "("
+EXPLAIN (COSTS OFF) SELECT * FROM TEXT_TBL WHERE f1 SIMILAR TO '()[([:alnum:](]()';
+                      QUERY PLAN                      
+------------------------------------------------------
+ Seq Scan on text_tbl
+   Filter: (f1 ~ '^(?:(?:)[([:alnum:](](?:))$'::text)
+(2 rows)
+
+-- Caret "^"
+EXPLAIN (COSTS OFF) SELECT * FROM TEXT_TBL WHERE f1 SIMILAR TO '^[^[:alnum:]^[^^][[^^]][\^][[\^]]\^]^';
+                               QUERY PLAN                               
+------------------------------------------------------------------------
+ Seq Scan on text_tbl
+   Filter: (f1 ~ '^(?:\^[^[:alnum:]^[^^][[^^]][\^][[\^]]\^]\^)$'::text)
+(2 rows)
+
+-- Closing square bracket "]" at the beginning of character class
+EXPLAIN (COSTS OFF) SELECT * FROM TEXT_TBL WHERE f1 SIMILAR TO '[]%][^]%][^%]%';
+                   QUERY PLAN                   
+------------------------------------------------
+ Seq Scan on text_tbl
+   Filter: (f1 ~ '^(?:[]%][^]%][^%].*)$'::text)
+(2 rows)
+
+-- Closing square bracket effective after two carets at the beginning
+-- of character class.
+EXPLAIN (COSTS OFF) SELECT * FROM TEXT_TBL WHERE f1 SIMILAR TO '[^^]^';
+              QUERY PLAN               
+---------------------------------------
+ Seq Scan on text_tbl
+   Filter: (f1 ~ '^(?:[^^]\^)$'::text)
+(2 rows)
+
+-- Closing square bracket after an escape sequence at the beginning of
+-- a character closes the character class
+EXPLAIN (COSTS OFF) SELECT * FROM TEXT_TBL WHERE f1 SIMILAR TO '[|a]%' ESCAPE '|';
+              QUERY PLAN               
+---------------------------------------
+ Seq Scan on text_tbl
+   Filter: (f1 ~ '^(?:[\a].*)$'::text)
+(2 rows)
+
+-- Test backslash escapes in regexp_replace's replacement string
+SELECT regexp_replace('1112223333', E'(\\d{3})(\\d{3})(\\d{4})', E'(\\1) \\2-\\3');
+ regexp_replace 
+----------------
+ (111) 222-3333
+(1 row)
+
+SELECT regexp_replace('foobarrbazz', E'(.)\\1', E'X\\&Y', 'g');
+  regexp_replace   
+-------------------
+ fXooYbaXrrYbaXzzY
+(1 row)
+
+SELECT regexp_replace('foobarrbazz', E'(.)\\1', E'X\\\\Y', 'g');
+ regexp_replace 
+----------------
+ fX\YbaX\YbaX\Y
+(1 row)
+
+-- not an error, though perhaps it should be:
+SELECT regexp_replace('foobarrbazz', E'(.)\\1', E'X\\Y\\1Z\\');
+ regexp_replace  
+-----------------
+ fX\YoZ\barrbazz
+(1 row)
+
+SELECT regexp_replace('AAA   BBB   CCC   ', E'\\s+', ' ', 'g');
+ regexp_replace 
+----------------
+ AAA BBB CCC 
+(1 row)
+
+SELECT regexp_replace('AAA', '^|$', 'Z', 'g');
+ regexp_replace 
+----------------
+ ZAAAZ
+(1 row)
+
+SELECT regexp_replace('AAA aaa', 'A+', 'Z', 'gi');
+ regexp_replace 
+----------------
+ Z Z
+(1 row)
+
+-- invalid regexp option
+SELECT regexp_replace('AAA aaa', 'A+', 'Z', 'z');
+ERROR:  invalid regular expression option: "z"
+-- extended regexp_replace tests
+SELECT regexp_replace('A PostgreSQL function', 'A|e|i|o|u', 'X', 1);
+    regexp_replace     
+-----------------------
+ X PostgreSQL function
+(1 row)
+
+SELECT regexp_replace('A PostgreSQL function', 'A|e|i|o|u', 'X', 1, 2);
+    regexp_replace     
+-----------------------
+ A PXstgreSQL function
+(1 row)
+
+SELECT regexp_replace('A PostgreSQL function', 'a|e|i|o|u', 'X', 1, 0, 'i');
+    regexp_replace     
+-----------------------
+ X PXstgrXSQL fXnctXXn
+(1 row)
+
+SELECT regexp_replace('A PostgreSQL function', 'a|e|i|o|u', 'X', 1, 1, 'i');
+    regexp_replace     
+-----------------------
+ X PostgreSQL function
+(1 row)
+
+SELECT regexp_replace('A PostgreSQL function', 'a|e|i|o|u', 'X', 1, 2, 'i');
+    regexp_replace     
+-----------------------
+ A PXstgreSQL function
+(1 row)
+
+SELECT regexp_replace('A PostgreSQL function', 'a|e|i|o|u', 'X', 1, 3, 'i');
+    regexp_replace     
+-----------------------
+ A PostgrXSQL function
+(1 row)
+
+SELECT regexp_replace('A PostgreSQL function', 'a|e|i|o|u', 'X', 1, 9, 'i');
+    regexp_replace     
+-----------------------
+ A PostgreSQL function
+(1 row)
+
+SELECT regexp_replace('A PostgreSQL function', 'A|e|i|o|u', 'X', 7, 0, 'i');
+    regexp_replace     
+-----------------------
+ A PostgrXSQL fXnctXXn
+(1 row)
+
+-- 'g' flag should be ignored when N is specified
+SELECT regexp_replace('A PostgreSQL function', 'a|e|i|o|u', 'X', 1, 1, 'g');
+    regexp_replace     
+-----------------------
+ A PXstgreSQL function
+(1 row)
+
+-- errors
+SELECT regexp_replace('A PostgreSQL function', 'a|e|i|o|u', 'X', -1, 0, 'i');
+ERROR:  invalid value for parameter "start": -1
+SELECT regexp_replace('A PostgreSQL function', 'a|e|i|o|u', 'X', 1, -1, 'i');
+ERROR:  invalid value for parameter "n": -1
+-- erroneous invocation of non-extended form
+SELECT regexp_replace('A PostgreSQL function', 'a|e|i|o|u', 'X', '1');
+ERROR:  invalid regular expression option: "1"
+HINT:  If you meant to use regexp_replace() with a start parameter, cast the fourth argument to integer explicitly.
+--  regexp_count tests
+SELECT regexp_count('123123123123123', '(12)3');
+ regexp_count 
+--------------
+            5
+(1 row)
+
+SELECT regexp_count('123123123123', '123', 1);
+ regexp_count 
+--------------
+            4
+(1 row)
+
+SELECT regexp_count('123123123123', '123', 3);
+ regexp_count 
+--------------
+            3
+(1 row)
+
+SELECT regexp_count('123123123123', '123', 33);
+ regexp_count 
+--------------
+            0
+(1 row)
+
+SELECT regexp_count('ABCABCABCABC', 'Abc', 1, '');
+ regexp_count 
+--------------
+            0
+(1 row)
+
+SELECT regexp_count('ABCABCABCABC', 'Abc', 1, 'i');
+ regexp_count 
+--------------
+            4
+(1 row)
+
+-- errors
+SELECT regexp_count('123123123123', '123', 0);
+ERROR:  invalid value for parameter "start": 0
+SELECT regexp_count('123123123123', '123', -3);
+ERROR:  invalid value for parameter "start": -3
+-- regexp_like tests
+SELECT regexp_like('Steven', '^Ste(v|ph)en$');
+ regexp_like 
+-------------
+ t
+(1 row)
+
+SELECT regexp_like('a'||CHR(10)||'d', 'a.d', 'n');
+ regexp_like 
+-------------
+ f
+(1 row)
+
+SELECT regexp_like('a'||CHR(10)||'d', 'a.d', 's');
+ regexp_like 
+-------------
+ t
+(1 row)
+
+SELECT regexp_like('abc', ' a . c ', 'x');
+ regexp_like 
+-------------
+ t
+(1 row)
+
+SELECT regexp_like('abc', 'a.c', 'g');  -- error
+ERROR:  regexp_like() does not support the "global" option
+-- regexp_instr tests
+SELECT regexp_instr('abcdefghi', 'd.f');
+ regexp_instr 
+--------------
+            4
+(1 row)
+
+SELECT regexp_instr('abcdefghi', 'd.q');
+ regexp_instr 
+--------------
+            0
+(1 row)
+
+SELECT regexp_instr('abcabcabc', 'a.c');
+ regexp_instr 
+--------------
+            1
+(1 row)
+
+SELECT regexp_instr('abcabcabc', 'a.c', 2);
+ regexp_instr 
+--------------
+            4
+(1 row)
+
+SELECT regexp_instr('abcabcabc', 'a.c', 1, 3);
+ regexp_instr 
+--------------
+            7
+(1 row)
+
+SELECT regexp_instr('abcabcabc', 'a.c', 1, 4);
+ regexp_instr 
+--------------
+            0
+(1 row)
+
+SELECT regexp_instr('abcabcabc', 'A.C', 1, 2, 0, 'i');
+ regexp_instr 
+--------------
+            4
+(1 row)
+
+SELECT regexp_instr('1234567890', '(123)(4(56)(78))', 1, 1, 0, 'i', 0);
+ regexp_instr 
+--------------
+            1
+(1 row)
+
+SELECT regexp_instr('1234567890', '(123)(4(56)(78))', 1, 1, 0, 'i', 1);
+ regexp_instr 
+--------------
+            1
+(1 row)
+
+SELECT regexp_instr('1234567890', '(123)(4(56)(78))', 1, 1, 0, 'i', 2);
+ regexp_instr 
+--------------
+            4
+(1 row)
+
+SELECT regexp_instr('1234567890', '(123)(4(56)(78))', 1, 1, 0, 'i', 3);
+ regexp_instr 
+--------------
+            5
+(1 row)
+
+SELECT regexp_instr('1234567890', '(123)(4(56)(78))', 1, 1, 0, 'i', 4);
+ regexp_instr 
+--------------
+            7
+(1 row)
+
+SELECT regexp_instr('1234567890', '(123)(4(56)(78))', 1, 1, 0, 'i', 5);
+ regexp_instr 
+--------------
+            0
+(1 row)
+
+SELECT regexp_instr('1234567890', '(123)(4(56)(78))', 1, 1, 1, 'i', 0);
+ regexp_instr 
+--------------
+            9
+(1 row)
+
+SELECT regexp_instr('1234567890', '(123)(4(56)(78))', 1, 1, 1, 'i', 1);
+ regexp_instr 
+--------------
+            4
+(1 row)
+
+SELECT regexp_instr('1234567890', '(123)(4(56)(78))', 1, 1, 1, 'i', 2);
+ regexp_instr 
+--------------
+            9
+(1 row)
+
+SELECT regexp_instr('1234567890', '(123)(4(56)(78))', 1, 1, 1, 'i', 3);
+ regexp_instr 
+--------------
+            7
+(1 row)
+
+SELECT regexp_instr('1234567890', '(123)(4(56)(78))', 1, 1, 1, 'i', 4);
+ regexp_instr 
+--------------
+            9
+(1 row)
+
+SELECT regexp_instr('1234567890', '(123)(4(56)(78))', 1, 1, 1, 'i', 5);
+ regexp_instr 
+--------------
+            0
+(1 row)
+
+-- Check case where we have a match, but not a subexpression match
+SELECT regexp_instr('foo', 'foo(bar)?', 1, 1, 0, '', 1);
+ regexp_instr 
+--------------
+            0
+(1 row)
+
+-- errors
+SELECT regexp_instr('abcabcabc', 'a.c', 0, 1);
+ERROR:  invalid value for parameter "start": 0
+SELECT regexp_instr('abcabcabc', 'a.c', 1, 0);
+ERROR:  invalid value for parameter "n": 0
+SELECT regexp_instr('abcabcabc', 'a.c', 1, 1, -1);
+ERROR:  invalid value for parameter "endoption": -1
+SELECT regexp_instr('abcabcabc', 'a.c', 1, 1, 2);
+ERROR:  invalid value for parameter "endoption": 2
+SELECT regexp_instr('abcabcabc', 'a.c', 1, 1, 0, 'g');
+ERROR:  regexp_instr() does not support the "global" option
+SELECT regexp_instr('abcabcabc', 'a.c', 1, 1, 0, '', -1);
+ERROR:  invalid value for parameter "subexpr": -1
+-- regexp_substr tests
+SELECT regexp_substr('abcdefghi', 'd.f');
+ regexp_substr 
+---------------
+ def
+(1 row)
+
+SELECT regexp_substr('abcdefghi', 'd.q') IS NULL AS t;
+ t 
+---
+ t
+(1 row)
+
+SELECT regexp_substr('abcabcabc', 'a.c');
+ regexp_substr 
+---------------
+ abc
+(1 row)
+
+SELECT regexp_substr('abcabcabc', 'a.c', 2);
+ regexp_substr 
+---------------
+ abc
+(1 row)
+
+SELECT regexp_substr('abcabcabc', 'a.c', 1, 3);
+ regexp_substr 
+---------------
+ abc
+(1 row)
+
+SELECT regexp_substr('abcabcabc', 'a.c', 1, 4) IS NULL AS t;
+ t 
+---
+ t
+(1 row)
+
+SELECT regexp_substr('abcabcabc', 'A.C', 1, 2, 'i');
+ regexp_substr 
+---------------
+ abc
+(1 row)
+
+SELECT regexp_substr('1234567890', '(123)(4(56)(78))', 1, 1, 'i', 0);
+ regexp_substr 
+---------------
+ 12345678
+(1 row)
+
+SELECT regexp_substr('1234567890', '(123)(4(56)(78))', 1, 1, 'i', 1);
+ regexp_substr 
+---------------
+ 123
+(1 row)
+
+SELECT regexp_substr('1234567890', '(123)(4(56)(78))', 1, 1, 'i', 2);
+ regexp_substr 
+---------------
+ 45678
+(1 row)
+
+SELECT regexp_substr('1234567890', '(123)(4(56)(78))', 1, 1, 'i', 3);
+ regexp_substr 
+---------------
+ 56
+(1 row)
+
+SELECT regexp_substr('1234567890', '(123)(4(56)(78))', 1, 1, 'i', 4);
+ regexp_substr 
+---------------
+ 78
+(1 row)
+
+SELECT regexp_substr('1234567890', '(123)(4(56)(78))', 1, 1, 'i', 5) IS NULL AS t;
+ t 
+---
+ t
+(1 row)
+
+-- Check case where we have a match, but not a subexpression match
+SELECT regexp_substr('foo', 'foo(bar)?', 1, 1, '', 1) IS NULL AS t;
+ t 
+---
+ t
+(1 row)
+
+-- errors
+SELECT regexp_substr('abcabcabc', 'a.c', 0, 1);
+ERROR:  invalid value for parameter "start": 0
+SELECT regexp_substr('abcabcabc', 'a.c', 1, 0);
+ERROR:  invalid value for parameter "n": 0
+SELECT regexp_substr('abcabcabc', 'a.c', 1, 1, 'g');
+ERROR:  regexp_substr() does not support the "global" option
+SELECT regexp_substr('abcabcabc', 'a.c', 1, 1, '', -1);
+ERROR:  invalid value for parameter "subexpr": -1
+-- set so we can tell NULL from empty string
+\pset null '\\N'
+-- return all matches from regexp
+SELECT regexp_matches('foobarbequebaz', $re$(bar)(beque)$re$);
+ regexp_matches 
+----------------
+ {bar,beque}
+(1 row)
+
+-- test case insensitive
+SELECT regexp_matches('foObARbEqUEbAz', $re$(bar)(beque)$re$, 'i');
+ regexp_matches 
+----------------
+ {bAR,bEqUE}
+(1 row)
+
+-- global option - more than one match
+SELECT regexp_matches('foobarbequebazilbarfbonk', $re$(b[^b]+)(b[^b]+)$re$, 'g');
+ regexp_matches 
+----------------
+ {bar,beque}
+ {bazil,barf}
+(2 rows)
+
+-- empty capture group (matched empty string)
+SELECT regexp_matches('foobarbequebaz', $re$(bar)(.*)(beque)$re$);
+ regexp_matches 
+----------------
+ {bar,"",beque}
+(1 row)
+
+-- no match
+SELECT regexp_matches('foobarbequebaz', $re$(bar)(.+)(beque)$re$);
+ regexp_matches 
+----------------
+(0 rows)
+
+-- optional capture group did not match, null entry in array
+SELECT regexp_matches('foobarbequebaz', $re$(bar)(.+)?(beque)$re$);
+  regexp_matches  
+------------------
+ {bar,NULL,beque}
+(1 row)
+
+-- no capture groups
+SELECT regexp_matches('foobarbequebaz', $re$barbeque$re$);
+ regexp_matches 
+----------------
+ {barbeque}
+(1 row)
+
+-- start/end-of-line matches are of zero length
+SELECT regexp_matches('foo' || chr(10) || 'bar' || chr(10) || 'bequq' || chr(10) || 'baz', '^', 'mg');
+ regexp_matches 
+----------------
+ {""}
+ {""}
+ {""}
+ {""}
+(4 rows)
+
+SELECT regexp_matches('foo' || chr(10) || 'bar' || chr(10) || 'bequq' || chr(10) || 'baz', '$', 'mg');
+ regexp_matches 
+----------------
+ {""}
+ {""}
+ {""}
+ {""}
+(4 rows)
+
+SELECT regexp_matches('1' || chr(10) || '2' || chr(10) || '3' || chr(10) || '4' || chr(10), '^.?', 'mg');
+ regexp_matches 
+----------------
+ {1}
+ {2}
+ {3}
+ {4}
+ {""}
+(5 rows)
+
+SELECT regexp_matches(chr(10) || '1' || chr(10) || '2' || chr(10) || '3' || chr(10) || '4' || chr(10), '.?$', 'mg');
+ regexp_matches 
+----------------
+ {""}
+ {1}
+ {""}
+ {2}
+ {""}
+ {3}
+ {""}
+ {4}
+ {""}
+ {""}
+(10 rows)
+
+SELECT regexp_matches(chr(10) || '1' || chr(10) || '2' || chr(10) || '3' || chr(10) || '4', '.?$', 'mg');
+ regexp_matches 
+----------------
+ {""}
+ {1}
+ {""}
+ {2}
+ {""}
+ {3}
+ {""}
+ {4}
+ {""}
+(9 rows)
+
+-- give me errors
+SELECT regexp_matches('foobarbequebaz', $re$(bar)(beque)$re$, 'gz');
+ERROR:  invalid regular expression option: "z"
+SELECT regexp_matches('foobarbequebaz', $re$(barbeque$re$);
+ERROR:  invalid regular expression: parentheses () not balanced
+SELECT regexp_matches('foobarbequebaz', $re$(bar)(beque){2,1}$re$);
+ERROR:  invalid regular expression: invalid repetition count(s)
+-- split string on regexp
+SELECT foo, length(foo) FROM regexp_split_to_table('the quick brown fox jumps over the lazy dog', $re$\s+$re$) AS foo;
+  foo  | length 
+-------+--------
+ the   |      3
+ quick |      5
+ brown |      5
+ fox   |      3
+ jumps |      5
+ over  |      4
+ the   |      3
+ lazy  |      4
+ dog   |      3
+(9 rows)
+
+SELECT regexp_split_to_array('the quick brown fox jumps over the lazy dog', $re$\s+$re$);
+             regexp_split_to_array             
+-----------------------------------------------
+ {the,quick,brown,fox,jumps,over,the,lazy,dog}
+(1 row)
+
+SELECT foo, length(foo) FROM regexp_split_to_table('the quick brown fox jumps over the lazy dog', $re$\s*$re$) AS foo;
+ foo | length 
+-----+--------
+ t   |      1
+ h   |      1
+ e   |      1
+ q   |      1
+ u   |      1
+ i   |      1
+ c   |      1
+ k   |      1
+ b   |      1
+ r   |      1
+ o   |      1
+ w   |      1
+ n   |      1
+ f   |      1
+ o   |      1
+ x   |      1
+ j   |      1
+ u   |      1
+ m   |      1
+ p   |      1
+ s   |      1
+ o   |      1
+ v   |      1
+ e   |      1
+ r   |      1
+ t   |      1
+ h   |      1
+ e   |      1
+ l   |      1
+ a   |      1
+ z   |      1
+ y   |      1
+ d   |      1
+ o   |      1
+ g   |      1
+(35 rows)
+
+SELECT regexp_split_to_array('the quick brown fox jumps over the lazy dog', $re$\s*$re$);
+                          regexp_split_to_array                          
+-------------------------------------------------------------------------
+ {t,h,e,q,u,i,c,k,b,r,o,w,n,f,o,x,j,u,m,p,s,o,v,e,r,t,h,e,l,a,z,y,d,o,g}
+(1 row)
+
+SELECT foo, length(foo) FROM regexp_split_to_table('the quick brown fox jumps over the lazy dog', '') AS foo;
+ foo | length 
+-----+--------
+ t   |      1
+ h   |      1
+ e   |      1
+     |      1
+ q   |      1
+ u   |      1
+ i   |      1
+ c   |      1
+ k   |      1
+     |      1
+ b   |      1
+ r   |      1
+ o   |      1
+ w   |      1
+ n   |      1
+     |      1
+ f   |      1
+ o   |      1
+ x   |      1
+     |      1
+ j   |      1
+ u   |      1
+ m   |      1
+ p   |      1
+ s   |      1
+     |      1
+ o   |      1
+ v   |      1
+ e   |      1
+ r   |      1
+     |      1
+ t   |      1
+ h   |      1
+ e   |      1
+     |      1
+ l   |      1
+ a   |      1
+ z   |      1
+ y   |      1
+     |      1
+ d   |      1
+ o   |      1
+ g   |      1
+(43 rows)
+
+SELECT regexp_split_to_array('the quick brown fox jumps over the lazy dog', '');
+                                          regexp_split_to_array                                          
+---------------------------------------------------------------------------------------------------------
+ {t,h,e," ",q,u,i,c,k," ",b,r,o,w,n," ",f,o,x," ",j,u,m,p,s," ",o,v,e,r," ",t,h,e," ",l,a,z,y," ",d,o,g}
+(1 row)
+
+-- case insensitive
+SELECT foo, length(foo) FROM regexp_split_to_table('thE QUick bROWn FOx jUMPs ovEr The lazy dOG', 'e', 'i') AS foo;
+            foo            | length 
+---------------------------+--------
+ th                        |      2
+  QUick bROWn FOx jUMPs ov |     25
+ r Th                      |      4
+  lazy dOG                 |      9
+(4 rows)
+
+SELECT regexp_split_to_array('thE QUick bROWn FOx jUMPs ovEr The lazy dOG', 'e', 'i');
+                regexp_split_to_array                
+-----------------------------------------------------
+ {th," QUick bROWn FOx jUMPs ov","r Th"," lazy dOG"}
+(1 row)
+
+-- no match of pattern
+SELECT foo, length(foo) FROM regexp_split_to_table('the quick brown fox jumps over the lazy dog', 'nomatch') AS foo;
+                     foo                     | length 
+---------------------------------------------+--------
+ the quick brown fox jumps over the lazy dog |     43
+(1 row)
+
+SELECT regexp_split_to_array('the quick brown fox jumps over the lazy dog', 'nomatch');
+              regexp_split_to_array              
+-------------------------------------------------
+ {"the quick brown fox jumps over the lazy dog"}
+(1 row)
+
+-- some corner cases
+SELECT regexp_split_to_array('123456','1');
+ regexp_split_to_array 
+-----------------------
+ {"",23456}
+(1 row)
+
+SELECT regexp_split_to_array('123456','6');
+ regexp_split_to_array 
+-----------------------
+ {12345,""}
+(1 row)
+
+SELECT regexp_split_to_array('123456','.');
+ regexp_split_to_array  
+------------------------
+ {"","","","","","",""}
+(1 row)
+
+SELECT regexp_split_to_array('123456','');
+ regexp_split_to_array 
+-----------------------
+ {1,2,3,4,5,6}
+(1 row)
+
+SELECT regexp_split_to_array('123456','(?:)');
+ regexp_split_to_array 
+-----------------------
+ {1,2,3,4,5,6}
+(1 row)
+
+SELECT regexp_split_to_array('1','');
+ regexp_split_to_array 
+-----------------------
+ {1}
+(1 row)
+
+-- errors
+SELECT foo, length(foo) FROM regexp_split_to_table('thE QUick bROWn FOx jUMPs ovEr The lazy dOG', 'e', 'zippy') AS foo;
+ERROR:  invalid regular expression option: "z"
+SELECT regexp_split_to_array('thE QUick bROWn FOx jUMPs ovEr The lazy dOG', 'e', 'iz');
+ERROR:  invalid regular expression option: "z"
+-- global option meaningless for regexp_split
+SELECT foo, length(foo) FROM regexp_split_to_table('thE QUick bROWn FOx jUMPs ovEr The lazy dOG', 'e', 'g') AS foo;
+ERROR:  regexp_split_to_table() does not support the "global" option
+SELECT regexp_split_to_array('thE QUick bROWn FOx jUMPs ovEr The lazy dOG', 'e', 'g');
+ERROR:  regexp_split_to_array() does not support the "global" option
+-- change NULL-display back
+\pset null ''
+-- E021-11 position expression
+SELECT POSITION('4' IN '1234567890') = '4' AS "4";
+ 4 
+---
+ t
+(1 row)
+
+SELECT POSITION('5' IN '1234567890') = '5' AS "5";
+ 5 
+---
+ t
+(1 row)
+
+SELECT POSITION('\x11'::bytea IN ''::bytea) = 0 AS "0";
+ 0 
+---
+ t
+(1 row)
+
+SELECT POSITION('\x33'::bytea IN '\x1122'::bytea) = 0 AS "0";
+ 0 
+---
+ t
+(1 row)
+
+SELECT POSITION(''::bytea IN '\x1122'::bytea) = 1 AS "1";
+ 1 
+---
+ t
+(1 row)
+
+SELECT POSITION('\x22'::bytea IN '\x1122'::bytea) = 2 AS "2";
+ 2 
+---
+ t
+(1 row)
+
+SELECT POSITION('\x5678'::bytea IN '\x1234567890'::bytea) = 3 AS "3";
+ 3 
+---
+ t
+(1 row)
+
+-- T312 character overlay function
+SELECT OVERLAY('abcdef' PLACING '45' FROM 4) AS "abc45f";
+ abc45f 
+--------
+ abc45f
+(1 row)
+
+SELECT OVERLAY('yabadoo' PLACING 'daba' FROM 5) AS "yabadaba";
+ yabadaba 
+----------
+ yabadaba
+(1 row)
+
+SELECT OVERLAY('yabadoo' PLACING 'daba' FROM 5 FOR 0) AS "yabadabadoo";
+ yabadabadoo 
+-------------
+ yabadabadoo
+(1 row)
+
+SELECT OVERLAY('babosa' PLACING 'ubb' FROM 2 FOR 4) AS "bubba";
+ bubba 
+-------
+ bubba
+(1 row)
+
+--
+-- test LIKE
+-- Be sure to form every test as a LIKE/NOT LIKE pair.
+--
+-- simplest examples
+-- E061-04 like predicate
+SELECT 'hawkeye' LIKE 'h%' AS "true";
+ true 
+------
+ t
+(1 row)
+
+SELECT 'hawkeye' NOT LIKE 'h%' AS "false";
+ false 
+-------
+ f
+(1 row)
+
+SELECT 'hawkeye' LIKE 'H%' AS "false";
+ false 
+-------
+ f
+(1 row)
+
+SELECT 'hawkeye' NOT LIKE 'H%' AS "true";
+ true 
+------
+ t
+(1 row)
+
+SELECT 'hawkeye' LIKE 'indio%' AS "false";
+ false 
+-------
+ f
+(1 row)
+
+SELECT 'hawkeye' NOT LIKE 'indio%' AS "true";
+ true 
+------
+ t
+(1 row)
+
+SELECT 'hawkeye' LIKE 'h%eye' AS "true";
+ true 
+------
+ t
+(1 row)
+
+SELECT 'hawkeye' NOT LIKE 'h%eye' AS "false";
+ false 
+-------
+ f
+(1 row)
+
+SELECT 'indio' LIKE '_ndio' AS "true";
+ true 
+------
+ t
+(1 row)
+
+SELECT 'indio' NOT LIKE '_ndio' AS "false";
+ false 
+-------
+ f
+(1 row)
+
+SELECT 'indio' LIKE 'in__o' AS "true";
+ true 
+------
+ t
+(1 row)
+
+SELECT 'indio' NOT LIKE 'in__o' AS "false";
+ false 
+-------
+ f
+(1 row)
+
+SELECT 'indio' LIKE 'in_o' AS "false";
+ false 
+-------
+ f
+(1 row)
+
+SELECT 'indio' NOT LIKE 'in_o' AS "true";
+ true 
+------
+ t
+(1 row)
+
+SELECT 'abc'::name LIKE '_b_' AS "true";
+ true 
+------
+ t
+(1 row)
+
+SELECT 'abc'::name NOT LIKE '_b_' AS "false";
+ false 
+-------
+ f
+(1 row)
+
+SELECT 'abc'::bytea LIKE '_b_'::bytea AS "true";
+ true 
+------
+ t
+(1 row)
+
+SELECT 'abc'::bytea NOT LIKE '_b_'::bytea AS "false";
+ false 
+-------
+ f
+(1 row)
+
+-- unused escape character
+SELECT 'hawkeye' LIKE 'h%' ESCAPE '#' AS "true";
+ true 
+------
+ t
+(1 row)
+
+SELECT 'hawkeye' NOT LIKE 'h%' ESCAPE '#' AS "false";
+ false 
+-------
+ f
+(1 row)
+
+SELECT 'indio' LIKE 'ind_o' ESCAPE '$' AS "true";
+ true 
+------
+ t
+(1 row)
+
+SELECT 'indio' NOT LIKE 'ind_o' ESCAPE '$' AS "false";
+ false 
+-------
+ f
+(1 row)
+
+-- escape character
+-- E061-05 like predicate with escape clause
+SELECT 'h%' LIKE 'h#%' ESCAPE '#' AS "true";
+ true 
+------
+ t
+(1 row)
+
+SELECT 'h%' NOT LIKE 'h#%' ESCAPE '#' AS "false";
+ false 
+-------
+ f
+(1 row)
+
+SELECT 'h%wkeye' LIKE 'h#%' ESCAPE '#' AS "false";
+ false 
+-------
+ f
+(1 row)
+
+SELECT 'h%wkeye' NOT LIKE 'h#%' ESCAPE '#' AS "true";
+ true 
+------
+ t
+(1 row)
+
+SELECT 'h%wkeye' LIKE 'h#%%' ESCAPE '#' AS "true";
+ true 
+------
+ t
+(1 row)
+
+SELECT 'h%wkeye' NOT LIKE 'h#%%' ESCAPE '#' AS "false";
+ false 
+-------
+ f
+(1 row)
+
+SELECT 'h%awkeye' LIKE 'h#%a%k%e' ESCAPE '#' AS "true";
+ true 
+------
+ t
+(1 row)
+
+SELECT 'h%awkeye' NOT LIKE 'h#%a%k%e' ESCAPE '#' AS "false";
+ false 
+-------
+ f
+(1 row)
+
+SELECT 'indio' LIKE '_ndio' ESCAPE '$' AS "true";
+ true 
+------
+ t
+(1 row)
+
+SELECT 'indio' NOT LIKE '_ndio' ESCAPE '$' AS "false";
+ false 
+-------
+ f
+(1 row)
+
+SELECT 'i_dio' LIKE 'i$_d_o' ESCAPE '$' AS "true";
+ true 
+------
+ t
+(1 row)
+
+SELECT 'i_dio' NOT LIKE 'i$_d_o' ESCAPE '$' AS "false";
+ false 
+-------
+ f
+(1 row)
+
+SELECT 'i_dio' LIKE 'i$_nd_o' ESCAPE '$' AS "false";
+ false 
+-------
+ f
+(1 row)
+
+SELECT 'i_dio' NOT LIKE 'i$_nd_o' ESCAPE '$' AS "true";
+ true 
+------
+ t
+(1 row)
+
+SELECT 'i_dio' LIKE 'i$_d%o' ESCAPE '$' AS "true";
+ true 
+------
+ t
+(1 row)
+
+SELECT 'i_dio' NOT LIKE 'i$_d%o' ESCAPE '$' AS "false";
+ false 
+-------
+ f
+(1 row)
+
+SELECT 'a_c'::bytea LIKE 'a$__'::bytea ESCAPE '$'::bytea AS "true";
+ true 
+------
+ t
+(1 row)
+
+SELECT 'a_c'::bytea NOT LIKE 'a$__'::bytea ESCAPE '$'::bytea AS "false";
+ false 
+-------
+ f
+(1 row)
+
+-- escape character same as pattern character
+SELECT 'maca' LIKE 'm%aca' ESCAPE '%' AS "true";
+ true 
+------
+ t
+(1 row)
+
+SELECT 'maca' NOT LIKE 'm%aca' ESCAPE '%' AS "false";
+ false 
+-------
+ f
+(1 row)
+
+SELECT 'ma%a' LIKE 'm%a%%a' ESCAPE '%' AS "true";
+ true 
+------
+ t
+(1 row)
+
+SELECT 'ma%a' NOT LIKE 'm%a%%a' ESCAPE '%' AS "false";
+ false 
+-------
+ f
+(1 row)
+
+SELECT 'bear' LIKE 'b_ear' ESCAPE '_' AS "true";
+ true 
+------
+ t
+(1 row)
+
+SELECT 'bear' NOT LIKE 'b_ear' ESCAPE '_' AS "false";
+ false 
+-------
+ f
+(1 row)
+
+SELECT 'be_r' LIKE 'b_e__r' ESCAPE '_' AS "true";
+ true 
+------
+ t
+(1 row)
+
+SELECT 'be_r' NOT LIKE 'b_e__r' ESCAPE '_' AS "false";
+ false 
+-------
+ f
+(1 row)
+
+SELECT 'be_r' LIKE '__e__r' ESCAPE '_' AS "false";
+ false 
+-------
+ f
+(1 row)
+
+SELECT 'be_r' NOT LIKE '__e__r' ESCAPE '_' AS "true";
+ true 
+------
+ t
+(1 row)
+
+--
+-- test ILIKE (case-insensitive LIKE)
+-- Be sure to form every test as an ILIKE/NOT ILIKE pair.
+--
+SELECT 'hawkeye' ILIKE 'h%' AS "true";
+ true 
+------
+ t
+(1 row)
+
+SELECT 'hawkeye' NOT ILIKE 'h%' AS "false";
+ false 
+-------
+ f
+(1 row)
+
+SELECT 'hawkeye' ILIKE 'H%' AS "true";
+ true 
+------
+ t
+(1 row)
+
+SELECT 'hawkeye' NOT ILIKE 'H%' AS "false";
+ false 
+-------
+ f
+(1 row)
+
+SELECT 'hawkeye' ILIKE 'H%Eye' AS "true";
+ true 
+------
+ t
+(1 row)
+
+SELECT 'hawkeye' NOT ILIKE 'H%Eye' AS "false";
+ false 
+-------
+ f
+(1 row)
+
+SELECT 'Hawkeye' ILIKE 'h%' AS "true";
+ true 
+------
+ t
+(1 row)
+
+SELECT 'Hawkeye' NOT ILIKE 'h%' AS "false";
+ false 
+-------
+ f
+(1 row)
+
+SELECT 'ABC'::name ILIKE '_b_' AS "true";
+ true 
+------
+ t
+(1 row)
+
+SELECT 'ABC'::name NOT ILIKE '_b_' AS "false";
+ false 
+-------
+ f
+(1 row)
+
+--
+-- test %/_ combination cases, cf bugs #4821 and #5478
+--
+SELECT 'foo' LIKE '_%' as t, 'f' LIKE '_%' as t, '' LIKE '_%' as f;
+ t | t | f 
+---+---+---
+ t | t | f
+(1 row)
+
+SELECT 'foo' LIKE '%_' as t, 'f' LIKE '%_' as t, '' LIKE '%_' as f;
+ t | t | f 
+---+---+---
+ t | t | f
+(1 row)
+
+SELECT 'foo' LIKE '__%' as t, 'foo' LIKE '___%' as t, 'foo' LIKE '____%' as f;
+ t | t | f 
+---+---+---
+ t | t | f
+(1 row)
+
+SELECT 'foo' LIKE '%__' as t, 'foo' LIKE '%___' as t, 'foo' LIKE '%____' as f;
+ t | t | f 
+---+---+---
+ t | t | f
+(1 row)
+
+SELECT 'jack' LIKE '%____%' AS t;
+ t 
+---
+ t
+(1 row)
+
+--
+-- basic tests of LIKE with indexes
+--
+CREATE TABLE texttest (a text PRIMARY KEY, b int);
+SELECT * FROM texttest WHERE a LIKE '%1%';
+ a | b 
+---+---
+(0 rows)
+
+CREATE TABLE byteatest (a bytea PRIMARY KEY, b int);
+SELECT * FROM byteatest WHERE a LIKE '%1%';
+ a | b 
+---+---
+(0 rows)
+
+DROP TABLE texttest, byteatest;
+--
+-- test implicit type conversion
+--
+-- E021-07 character concatenation
+SELECT 'unknown' || ' and unknown' AS "Concat unknown types";
+ Concat unknown types 
+----------------------
+ unknown and unknown
+(1 row)
+
+SELECT text 'text' || ' and unknown' AS "Concat text to unknown type";
+ Concat text to unknown type 
+-----------------------------
+ text and unknown
+(1 row)
+
+SELECT char(20) 'characters' || ' and text' AS "Concat char to unknown type";
+ Concat char to unknown type 
+-----------------------------
+ characters and text
+(1 row)
+
+SELECT text 'text' || char(20) ' and characters' AS "Concat text to char";
+ Concat text to char 
+---------------------
+ text and characters
+(1 row)
+
+SELECT text 'text' || varchar ' and varchar' AS "Concat text to varchar";
+ Concat text to varchar 
+------------------------
+ text and varchar
+(1 row)
+
+--
+-- test substr with toasted text values
+--
+CREATE TABLE toasttest(f1 text);
+insert into toasttest values(repeat('1234567890',10000));
+insert into toasttest values(repeat('1234567890',10000));
+--
+-- Ensure that some values are uncompressed, to test the faster substring
+-- operation used in that case
+--
+alter table toasttest alter column f1 set storage external;
+insert into toasttest values(repeat('1234567890',10000));
+insert into toasttest values(repeat('1234567890',10000));
+-- If the starting position is zero or less, then return from the start of the string
+-- adjusting the length to be consistent with the "negative start" per SQL.
+SELECT substr(f1, -1, 5) from toasttest;
+ substr 
+--------
+ 123
+ 123
+ 123
+ 123
+(4 rows)
+
+-- If the length is less than zero, an ERROR is thrown.
+SELECT substr(f1, 5, -1) from toasttest;
+ERROR:  negative substring length not allowed
+-- If no third argument (length) is provided, the length to the end of the
+-- string is assumed.
+SELECT substr(f1, 99995) from toasttest;
+ substr 
+--------
+ 567890
+ 567890
+ 567890
+ 567890
+(4 rows)
+
+-- If start plus length is > string length, the result is truncated to
+-- string length
+SELECT substr(f1, 99995, 10) from toasttest;
+ substr 
+--------
+ 567890
+ 567890
+ 567890
+ 567890
+(4 rows)
+
+TRUNCATE TABLE toasttest;
+INSERT INTO toasttest values (repeat('1234567890',300));
+INSERT INTO toasttest values (repeat('1234567890',300));
+INSERT INTO toasttest values (repeat('1234567890',300));
+INSERT INTO toasttest values (repeat('1234567890',300));
+-- expect >0 blocks
+SELECT pg_relation_size(reltoastrelid) = 0 AS is_empty
+  FROM pg_class where relname = 'toasttest';
+ is_empty 
+----------
+ f
+(1 row)
+
+TRUNCATE TABLE toasttest;
+ALTER TABLE toasttest set (toast_tuple_target = 4080);
+INSERT INTO toasttest values (repeat('1234567890',300));
+INSERT INTO toasttest values (repeat('1234567890',300));
+INSERT INTO toasttest values (repeat('1234567890',300));
+INSERT INTO toasttest values (repeat('1234567890',300));
+-- expect 0 blocks
+SELECT pg_relation_size(reltoastrelid) = 0 AS is_empty
+  FROM pg_class where relname = 'toasttest';
+ is_empty 
+----------
+ t
+(1 row)
+
+DROP TABLE toasttest;
+--
+-- test substr with toasted bytea values
+--
+CREATE TABLE toasttest(f1 bytea);
+insert into toasttest values(decode(repeat('1234567890',10000),'escape'));
+insert into toasttest values(decode(repeat('1234567890',10000),'escape'));
+--
+-- Ensure that some values are uncompressed, to test the faster substring
+-- operation used in that case
+--
+alter table toasttest alter column f1 set storage external;
+insert into toasttest values(decode(repeat('1234567890',10000),'escape'));
+insert into toasttest values(decode(repeat('1234567890',10000),'escape'));
+-- If the starting position is zero or less, then return from the start of the string
+-- adjusting the length to be consistent with the "negative start" per SQL.
+SELECT substr(f1, -1, 5) from toasttest;
+ substr 
+--------
+ 123
+ 123
+ 123
+ 123
+(4 rows)
+
+-- If the length is less than zero, an ERROR is thrown.
+SELECT substr(f1, 5, -1) from toasttest;
+ERROR:  negative substring length not allowed
+-- If no third argument (length) is provided, the length to the end of the
+-- string is assumed.
+SELECT substr(f1, 99995) from toasttest;
+ substr 
+--------
+ 567890
+ 567890
+ 567890
+ 567890
+(4 rows)
+
+-- If start plus length is > string length, the result is truncated to
+-- string length
+SELECT substr(f1, 99995, 10) from toasttest;
+ substr 
+--------
+ 567890
+ 567890
+ 567890
+ 567890
+(4 rows)
+
+DROP TABLE toasttest;
+-- test internally compressing datums
+-- this tests compressing a datum to a very small size which exercises a
+-- corner case in packed-varlena handling: even though small, the compressed
+-- datum must be given a 4-byte header because there are no bits to indicate
+-- compression in a 1-byte header
+CREATE TABLE toasttest (c char(4096));
+INSERT INTO toasttest VALUES('x');
+SELECT length(c), c::text FROM toasttest;
+ length | c 
+--------+---
+      1 | x
+(1 row)
+
+SELECT c FROM toasttest;
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                c                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 
+------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ x                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                               
+(1 row)
+
+DROP TABLE toasttest;
+--
+-- test length
+--
+SELECT length('abcdef') AS "length_6";
+ length_6 
+----------
+        6
+(1 row)
+
+--
+-- test strpos
+--
+SELECT strpos('abcdef', 'cd') AS "pos_3";
+ pos_3 
+-------
+     3
+(1 row)
+
+SELECT strpos('abcdef', 'xy') AS "pos_0";
+ pos_0 
+-------
+     0
+(1 row)
+
+SELECT strpos('abcdef', '') AS "pos_1";
+ pos_1 
+-------
+     1
+(1 row)
+
+SELECT strpos('', 'xy') AS "pos_0";
+ pos_0 
+-------
+     0
+(1 row)
+
+SELECT strpos('', '') AS "pos_1";
+ pos_1 
+-------
+     1
+(1 row)
+
+--
+-- test replace
+--
+SELECT replace('abcdef', 'de', '45') AS "abc45f";
+ abc45f 
+--------
+ abc45f
+(1 row)
+
+SELECT replace('yabadabadoo', 'ba', '123') AS "ya123da123doo";
+ ya123da123doo 
+---------------
+ ya123da123doo
+(1 row)
+
+SELECT replace('yabadoo', 'bad', '') AS "yaoo";
+ yaoo 
+------
+ yaoo
+(1 row)
+
+--
+-- test split_part
+--
+select split_part('','@',1) AS "empty string";
+ empty string 
+--------------
+ 
+(1 row)
+
+select split_part('','@',-1) AS "empty string";
+ empty string 
+--------------
+ 
+(1 row)
+
+select split_part('joeuser@mydatabase','',1) AS "joeuser@mydatabase";
+ joeuser@mydatabase 
+--------------------
+ joeuser@mydatabase
+(1 row)
+
+select split_part('joeuser@mydatabase','',2) AS "empty string";
+ empty string 
+--------------
+ 
+(1 row)
+
+select split_part('joeuser@mydatabase','',-1) AS "joeuser@mydatabase";
+ joeuser@mydatabase 
+--------------------
+ joeuser@mydatabase
+(1 row)
+
+select split_part('joeuser@mydatabase','',-2) AS "empty string";
+ empty string 
+--------------
+ 
+(1 row)
+
+select split_part('joeuser@mydatabase','@',0) AS "an error";
+ERROR:  field position must not be zero
+select split_part('joeuser@mydatabase','@@',1) AS "joeuser@mydatabase";
+ joeuser@mydatabase 
+--------------------
+ joeuser@mydatabase
+(1 row)
+
+select split_part('joeuser@mydatabase','@@',2) AS "empty string";
+ empty string 
+--------------
+ 
+(1 row)
+
+select split_part('joeuser@mydatabase','@',1) AS "joeuser";
+ joeuser 
+---------
+ joeuser
+(1 row)
+
+select split_part('joeuser@mydatabase','@',2) AS "mydatabase";
+ mydatabase 
+------------
+ mydatabase
+(1 row)
+
+select split_part('joeuser@mydatabase','@',3) AS "empty string";
+ empty string 
+--------------
+ 
+(1 row)
+
+select split_part('@joeuser@mydatabase@','@',2) AS "joeuser";
+ joeuser 
+---------
+ joeuser
+(1 row)
+
+select split_part('joeuser@mydatabase','@',-1) AS "mydatabase";
+ mydatabase 
+------------
+ mydatabase
+(1 row)
+
+select split_part('joeuser@mydatabase','@',-2) AS "joeuser";
+ joeuser 
+---------
+ joeuser
+(1 row)
+
+select split_part('joeuser@mydatabase','@',-3) AS "empty string";
+ empty string 
+--------------
+ 
+(1 row)
+
+select split_part('@joeuser@mydatabase@','@',-2) AS "mydatabase";
+ mydatabase 
+------------
+ mydatabase
+(1 row)
+
+--
+-- test to_bin, to_oct, and to_hex
+--
+select to_bin(-1234) AS "11111111111111111111101100101110";
+ 11111111111111111111101100101110 
+----------------------------------
+ 11111111111111111111101100101110
+(1 row)
+
+select to_bin(-1234::bigint);
+                              to_bin                              
+------------------------------------------------------------------
+ 1111111111111111111111111111111111111111111111111111101100101110
+(1 row)
+
+select to_bin(256*256*256 - 1) AS "111111111111111111111111";
+ 111111111111111111111111 
+--------------------------
+ 111111111111111111111111
+(1 row)
+
+select to_bin(256::bigint*256::bigint*256::bigint*256::bigint - 1) AS "11111111111111111111111111111111";
+ 11111111111111111111111111111111 
+----------------------------------
+ 11111111111111111111111111111111
+(1 row)
+
+select to_oct(-1234) AS "37777775456";
+ 37777775456 
+-------------
+ 37777775456
+(1 row)
+
+select to_oct(-1234::bigint) AS "1777777777777777775456";
+ 1777777777777777775456 
+------------------------
+ 1777777777777777775456
+(1 row)
+
+select to_oct(256*256*256 - 1) AS "77777777";
+ 77777777 
+----------
+ 77777777
+(1 row)
+
+select to_oct(256::bigint*256::bigint*256::bigint*256::bigint - 1) AS "37777777777";
+ 37777777777 
+-------------
+ 37777777777
+(1 row)
+
+select to_hex(-1234) AS "fffffb2e";
+ fffffb2e 
+----------
+ fffffb2e
+(1 row)
+
+select to_hex(-1234::bigint) AS "fffffffffffffb2e";
+ fffffffffffffb2e 
+------------------
+ fffffffffffffb2e
+(1 row)
+
+select to_hex(256*256*256 - 1) AS "ffffff";
+ ffffff 
+--------
+ ffffff
+(1 row)
+
+select to_hex(256::bigint*256::bigint*256::bigint*256::bigint - 1) AS "ffffffff";
+ ffffffff 
+----------
+ ffffffff
+(1 row)
+
+--
+-- SHA-2
+--
+SET bytea_output TO hex;
+SELECT sha224('');
+                           sha224                           
+------------------------------------------------------------
+ \xd14a028c2a3a2bc9476102bb288234c415a2b01f828ea62ac5b3e42f
+(1 row)
+
+SELECT sha224('The quick brown fox jumps over the lazy dog.');
+                           sha224                           
+------------------------------------------------------------
+ \x619cba8e8e05826e9b8c519c0a5c68f4fb653e8a3d8aa04bb2c8cd4c
+(1 row)
+
+SELECT sha256('');
+                               sha256                               
+--------------------------------------------------------------------
+ \xe3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855
+(1 row)
+
+SELECT sha256('The quick brown fox jumps over the lazy dog.');
+                               sha256                               
+--------------------------------------------------------------------
+ \xef537f25c895bfa782526529a9b63d97aa631564d5d789c2b765448c8635fb6c
+(1 row)
+
+SELECT sha384('');
+                                               sha384                                               
+----------------------------------------------------------------------------------------------------
+ \x38b060a751ac96384cd9327eb1b1e36a21fdb71114be07434c0cc7bf63f6e1da274edebfe76f65fbd51ad2f14898b95b
+(1 row)
+
+SELECT sha384('The quick brown fox jumps over the lazy dog.');
+                                               sha384                                               
+----------------------------------------------------------------------------------------------------
+ \xed892481d8272ca6df370bf706e4d7bc1b5739fa2177aae6c50e946678718fc67a7af2819a021c2fc34e91bdb63409d7
+(1 row)
+
+SELECT sha512('');
+                                                               sha512                                                               
+------------------------------------------------------------------------------------------------------------------------------------
+ \xcf83e1357eefb8bdf1542850d66d8007d620e4050b5715dc83f4a921d36ce9ce47d0d13c5d85f2b0ff8318d2877eec2f63b931bd47417a81a538327af927da3e
+(1 row)
+
+SELECT sha512('The quick brown fox jumps over the lazy dog.');
+                                                               sha512                                                               
+------------------------------------------------------------------------------------------------------------------------------------
+ \x91ea1245f20d46ae9a037a989f54f1f790f0a47607eeb8a14d12890cea77a1bbc6c7ed9cf205e67b7f2b8fd4c7dfd3a7a8617e45f3c463d481c7e586c39ac1ed
+(1 row)
+
+--
+-- CRC
+--
+SELECT crc32('');
+ crc32 
+-------
+     0
+(1 row)
+
+SELECT crc32('The quick brown fox jumps over the lazy dog.');
+   crc32    
+------------
+ 1368401385
+(1 row)
+
+SELECT crc32c('');
+ crc32c 
+--------
+      0
+(1 row)
+
+SELECT crc32c('The quick brown fox jumps over the lazy dog.');
+  crc32c   
+-----------
+ 419469235
+(1 row)
+
+SELECT crc32c(repeat('A', 127)::bytea);
+  crc32c   
+-----------
+ 291820082
+(1 row)
+
+SELECT crc32c(repeat('A', 128)::bytea);
+  crc32c   
+-----------
+ 816091258
+(1 row)
+
+SELECT crc32c(repeat('A', 129)::bytea);
+   crc32c   
+------------
+ 4213642571
+(1 row)
+
+SELECT crc32c(repeat('A', 800)::bytea);
+   crc32c   
+------------
+ 3134039419
+(1 row)
+
+--
+-- encode/decode
+--
+SELECT encode('\x1234567890abcdef00', 'hex');
+       encode       
+--------------------
+ 1234567890abcdef00
+(1 row)
+
+SELECT decode('1234567890abcdef00', 'hex');
+        decode        
+----------------------
+ \x1234567890abcdef00
+(1 row)
+
+SELECT encode(('\x' || repeat('1234567890abcdef0001', 7))::bytea, 'base64');
+                                    encode                                    
+------------------------------------------------------------------------------
+ EjRWeJCrze8AARI0VniQq83vAAESNFZ4kKvN7wABEjRWeJCrze8AARI0VniQq83vAAESNFZ4kKvN+
+ 7wABEjRWeJCrze8AAQ==
+(1 row)
+
+SELECT decode(encode(('\x' || repeat('1234567890abcdef0001', 7))::bytea,
+                     'base64'), 'base64');
+                                                                     decode                                                                     
+------------------------------------------------------------------------------------------------------------------------------------------------
+ \x1234567890abcdef00011234567890abcdef00011234567890abcdef00011234567890abcdef00011234567890abcdef00011234567890abcdef00011234567890abcdef0001
+(1 row)
+
+SELECT encode('\x1234567890abcdef00', 'escape');
+           encode            
+-----------------------------
+ \x124Vx\220\253\315\357\000
+(1 row)
+
+SELECT decode(encode('\x1234567890abcdef00', 'escape'), 'escape');
+        decode        
+----------------------
+ \x1234567890abcdef00
+(1 row)
+
+--
+-- get_bit/set_bit etc
+--
+SELECT get_bit('\x1234567890abcdef00'::bytea, 43);
+ get_bit 
+---------
+       1
+(1 row)
+
+SELECT get_bit('\x1234567890abcdef00'::bytea, 99);  -- error
+ERROR:  index 99 out of valid range, 0..71
+SELECT set_bit('\x1234567890abcdef00'::bytea, 43, 0);
+       set_bit        
+----------------------
+ \x1234567890a3cdef00
+(1 row)
+
+SELECT set_bit('\x1234567890abcdef00'::bytea, 99, 0);  -- error
+ERROR:  index 99 out of valid range, 0..71
+SELECT get_byte('\x1234567890abcdef00'::bytea, 3);
+ get_byte 
+----------
+      120
+(1 row)
+
+SELECT get_byte('\x1234567890abcdef00'::bytea, 99);  -- error
+ERROR:  index 99 out of valid range, 0..8
+SELECT set_byte('\x1234567890abcdef00'::bytea, 7, 11);
+       set_byte       
+----------------------
+ \x1234567890abcd0b00
+(1 row)
+
+SELECT set_byte('\x1234567890abcdef00'::bytea, 99, 11);  -- error
+ERROR:  index 99 out of valid range, 0..8
+--
+-- conversions between bytea and integer types
+--
+SELECT 0x1234::int2::bytea AS "\x1234", (-0x1234)::int2::bytea AS "\xedcc";
+ \x1234 | \xedcc 
+--------+--------
+ \x1234 | \xedcc
+(1 row)
+
+SELECT 0x12345678::int4::bytea AS "\x12345678", (-0x12345678)::int4::bytea AS "\xedcba988";
+ \x12345678 | \xedcba988 
+------------+------------
+ \x12345678 | \xedcba988
+(1 row)
+
+SELECT 0x1122334455667788::int8::bytea AS "\x1122334455667788",
+       (-0x1122334455667788)::int8::bytea AS "\xeeddccbbaa998878";
+ \x1122334455667788 | \xeeddccbbaa998878 
+--------------------+--------------------
+ \x1122334455667788 | \xeeddccbbaa998878
+(1 row)
+
+SELECT ''::bytea::int2 AS "0";
+ 0 
+---
+ 0
+(1 row)
+
+SELECT '\x12'::bytea::int2 AS "18";
+ 18 
+----
+ 18
+(1 row)
+
+SELECT '\x1234'::bytea::int2 AS "4460";
+ 4460 
+------
+ 4660
+(1 row)
+
+SELECT '\x123456'::bytea::int2; -- error
+ERROR:  smallint out of range
+SELECT ''::bytea::int4 AS "0";
+ 0 
+---
+ 0
+(1 row)
+
+SELECT '\x12'::bytea::int4 AS "18";
+ 18 
+----
+ 18
+(1 row)
+
+SELECT '\x12345678'::bytea::int4 AS "305419896";
+ 305419896 
+-----------
+ 305419896
+(1 row)
+
+SELECT '\x123456789A'::bytea::int4; -- error
+ERROR:  integer out of range
+SELECT ''::bytea::int8 AS "0";
+ 0 
+---
+ 0
+(1 row)
+
+SELECT '\x12'::bytea::int8 AS "18";
+ 18 
+----
+ 18
+(1 row)
+
+SELECT '\x1122334455667788'::bytea::int8 AS "1234605616436508552";
+ 1234605616436508552 
+---------------------
+ 1234605616436508552
+(1 row)
+
+SELECT '\x112233445566778899'::bytea::int8; -- error
+ERROR:  bigint out of range
+-- min/max integer values
+SELECT '\x8000'::bytea::int2 AS "-32768", '\x7FFF'::bytea::int2 AS "32767";
+ -32768 | 32767 
+--------+-------
+ -32768 | 32767
+(1 row)
+
+SELECT '\x80000000'::bytea::int4 AS "-2147483648", '\x7FFFFFFF'::bytea::int4 AS "2147483647";
+ -2147483648 | 2147483647 
+-------------+------------
+ -2147483648 | 2147483647
+(1 row)
+
+SELECT '\x8000000000000000'::bytea::int8 AS "-9223372036854775808",
+       '\x7FFFFFFFFFFFFFFF'::bytea::int8 AS "9223372036854775807";
+ -9223372036854775808 | 9223372036854775807 
+----------------------+---------------------
+ -9223372036854775808 | 9223372036854775807
+(1 row)
+
+--
+-- test behavior of escape_string_warning and standard_conforming_strings options
+--
+set escape_string_warning = off;
+set standard_conforming_strings = off;
+show escape_string_warning;
+ escape_string_warning 
+-----------------------
+ off
+(1 row)
+
+show standard_conforming_strings;
+ standard_conforming_strings 
+-----------------------------
+ off
+(1 row)
+
+set escape_string_warning = on;
+set standard_conforming_strings = on;
+show escape_string_warning;
+ escape_string_warning 
+-----------------------
+ on
+(1 row)
+
+show standard_conforming_strings;
+ standard_conforming_strings 
+-----------------------------
+ on
+(1 row)
+
+select 'a\bcd' as f1, 'a\b''cd' as f2, 'a\b''''cd' as f3, 'abcd\'   as f4, 'ab\''cd' as f5, '\\' as f6;
+  f1   |   f2   |   f3    |  f4   |   f5   | f6 
+-------+--------+---------+-------+--------+----
+ a\bcd | a\b'cd | a\b''cd | abcd\ | ab\'cd | \\
+(1 row)
+
+set standard_conforming_strings = off;
+select 'a\\bcd' as f1, 'a\\b\'cd' as f2, 'a\\b\'''cd' as f3, 'abcd\\'   as f4, 'ab\\\'cd' as f5, '\\\\' as f6;
+WARNING:  nonstandard use of \\ in a string literal
+LINE 1: select 'a\\bcd' as f1, 'a\\b\'cd' as f2, 'a\\b\'''cd' as f3,...
+               ^
+HINT:  Use the escape string syntax for backslashes, e.g., E'\\'.
+WARNING:  nonstandard use of \\ in a string literal
+LINE 1: select 'a\\bcd' as f1, 'a\\b\'cd' as f2, 'a\\b\'''cd' as f3,...
+                               ^
+HINT:  Use the escape string syntax for backslashes, e.g., E'\\'.
+WARNING:  nonstandard use of \\ in a string literal
+LINE 1: select 'a\\bcd' as f1, 'a\\b\'cd' as f2, 'a\\b\'''cd' as f3,...
+                                                 ^
+HINT:  Use the escape string syntax for backslashes, e.g., E'\\'.
+WARNING:  nonstandard use of \\ in a string literal
+LINE 1: ...bcd' as f1, 'a\\b\'cd' as f2, 'a\\b\'''cd' as f3, 'abcd\\'  ...
+                                                             ^
+HINT:  Use the escape string syntax for backslashes, e.g., E'\\'.
+WARNING:  nonstandard use of \\ in a string literal
+LINE 1: ...'cd' as f2, 'a\\b\'''cd' as f3, 'abcd\\'   as f4, 'ab\\\'cd'...
+                                                             ^
+HINT:  Use the escape string syntax for backslashes, e.g., E'\\'.
+WARNING:  nonstandard use of \\ in a string literal
+LINE 1: ...'''cd' as f3, 'abcd\\'   as f4, 'ab\\\'cd' as f5, '\\\\' as ...
+                                                             ^
+HINT:  Use the escape string syntax for backslashes, e.g., E'\\'.
+  f1   |   f2   |   f3    |  f4   |   f5   | f6 
+-------+--------+---------+-------+--------+----
+ a\bcd | a\b'cd | a\b''cd | abcd\ | ab\'cd | \\
+(1 row)
+
+set escape_string_warning = off;
+set standard_conforming_strings = on;
+select 'a\bcd' as f1, 'a\b''cd' as f2, 'a\b''''cd' as f3, 'abcd\'   as f4, 'ab\''cd' as f5, '\\' as f6;
+  f1   |   f2   |   f3    |  f4   |   f5   | f6 
+-------+--------+---------+-------+--------+----
+ a\bcd | a\b'cd | a\b''cd | abcd\ | ab\'cd | \\
+(1 row)
+
+set standard_conforming_strings = off;
+select 'a\\bcd' as f1, 'a\\b\'cd' as f2, 'a\\b\'''cd' as f3, 'abcd\\'   as f4, 'ab\\\'cd' as f5, '\\\\' as f6;
+  f1   |   f2   |   f3    |  f4   |   f5   | f6 
+-------+--------+---------+-------+--------+----
+ a\bcd | a\b'cd | a\b''cd | abcd\ | ab\'cd | \\
+(1 row)
+
+reset standard_conforming_strings;
+--
+-- Additional string functions
+--
+SET bytea_output TO escape;
+SELECT initcap('hi THOMAS');
+  initcap  
+-----------
+ Hi Thomas
+(1 row)
+
+SELECT lpad('hi', 5, 'xy');
+ lpad  
+-------
+ xyxhi
+(1 row)
+
+SELECT lpad('hi', 5);
+ lpad  
+-------
+    hi
+(1 row)
+
+SELECT lpad('hi', -5, 'xy');
+ lpad 
+------
+ 
+(1 row)
+
+SELECT lpad('hello', 2);
+ lpad 
+------
+ he
+(1 row)
+
+SELECT lpad('hi', 5, '');
+ lpad 
+------
+ hi
+(1 row)
+
+SELECT rpad('hi', 5, 'xy');
+ rpad  
+-------
+ hixyx
+(1 row)
+
+SELECT rpad('hi', 5);
+ rpad  
+-------
+ hi   
+(1 row)
+
+SELECT rpad('hi', -5, 'xy');
+ rpad 
+------
+ 
+(1 row)
+
+SELECT rpad('hello', 2);
+ rpad 
+------
+ he
+(1 row)
+
+SELECT rpad('hi', 5, '');
+ rpad 
+------
+ hi
+(1 row)
+
+SELECT ltrim('zzzytrim', 'xyz');
+ ltrim 
+-------
+ trim
+(1 row)
+
+SELECT translate('', '14', 'ax');
+ translate 
+-----------
+ 
+(1 row)
+
+SELECT translate('12345', '14', 'ax');
+ translate 
+-----------
+ a23x5
+(1 row)
+
+SELECT translate('12345', '134', 'a');
+ translate 
+-----------
+ a25
+(1 row)
+
+SELECT ascii('x');
+ ascii 
+-------
+   120
+(1 row)
+
+SELECT ascii('');
+ ascii 
+-------
+     0
+(1 row)
+
+SELECT chr(65);
+ chr 
+-----
+ A
+(1 row)
+
+SELECT chr(0);
+ERROR:  null character not permitted
+SELECT repeat('Pg', 4);
+  repeat  
+----------
+ PgPgPgPg
+(1 row)
+
+SELECT repeat('Pg', -4);
+ repeat 
+--------
+ 
+(1 row)
+
+SELECT SUBSTRING('1234567890'::bytea FROM 3) "34567890";
+ 34567890 
+----------
+ 34567890
+(1 row)
+
+SELECT SUBSTRING('1234567890'::bytea FROM 4 FOR 3) AS "456";
+ 456 
+-----
+ 456
+(1 row)
+
+SELECT SUBSTRING('string'::bytea FROM 2 FOR 2147483646) AS "tring";
+ tring 
+-------
+ tring
+(1 row)
+
+SELECT SUBSTRING('string'::bytea FROM -10 FOR 2147483646) AS "string";
+ string 
+--------
+ string
+(1 row)
+
+SELECT SUBSTRING('string'::bytea FROM -10 FOR -2147483646) AS "error";
+ERROR:  negative substring length not allowed
+SELECT trim(E'\\000'::bytea from E'\\000Tom\\000'::bytea);
+ btrim 
+-------
+ Tom
+(1 row)
+
+SELECT trim(leading E'\\000'::bytea from E'\\000Tom\\000'::bytea);
+  ltrim  
+---------
+ Tom\000
+(1 row)
+
+SELECT trim(trailing E'\\000'::bytea from E'\\000Tom\\000'::bytea);
+  rtrim  
+---------
+ \000Tom
+(1 row)
+
+SELECT btrim(E'\\000trim\\000'::bytea, E'\\000'::bytea);
+ btrim 
+-------
+ trim
+(1 row)
+
+SELECT btrim(''::bytea, E'\\000'::bytea);
+ btrim 
+-------
+ 
+(1 row)
+
+SELECT btrim(E'\\000trim\\000'::bytea, ''::bytea);
+    btrim     
+--------------
+ \000trim\000
+(1 row)
+
+SELECT encode(overlay(E'Th\\000omas'::bytea placing E'Th\\001omas'::bytea from 2),'escape');
+   encode    
+-------------
+ TTh\x01omas
+(1 row)
+
+SELECT encode(overlay(E'Th\\000omas'::bytea placing E'\\002\\003'::bytea from 8),'escape');
+       encode       
+--------------------
+ Th\000omas\x02\x03
+(1 row)
+
+SELECT encode(overlay(E'Th\\000omas'::bytea placing E'\\002\\003'::bytea from 5 for 3),'escape');
+     encode      
+-----------------
+ Th\000o\x02\x03
+(1 row)
+
+SELECT bit_count('\x1234567890'::bytea);
+ bit_count 
+-----------
+        15
+(1 row)
+
+SELECT unistr('\0064at\+0000610');
+ unistr 
+--------
+ data0
+(1 row)
+
+SELECT unistr('d\u0061t\U000000610');
+ unistr 
+--------
+ data0
+(1 row)
+
+SELECT unistr('a\\b');
+ unistr 
+--------
+ a\b
+(1 row)
+
+-- errors:
+SELECT unistr('wrong: \db99');
+ERROR:  invalid Unicode surrogate pair
+SELECT unistr('wrong: \db99\0061');
+ERROR:  invalid Unicode surrogate pair
+SELECT unistr('wrong: \+00db99\+000061');
+ERROR:  invalid Unicode surrogate pair
+SELECT unistr('wrong: \+2FFFFF');
+ERROR:  invalid Unicode code point: 2FFFFF
+SELECT unistr('wrong: \udb99\u0061');
+ERROR:  invalid Unicode surrogate pair
+SELECT unistr('wrong: \U0000db99\U00000061');
+ERROR:  invalid Unicode surrogate pair
+SELECT unistr('wrong: \U002FFFFF');
+ERROR:  invalid Unicode code point: 2FFFFF
+SELECT unistr('wrong: \xyz');
+ERROR:  invalid Unicode escape
+HINT:  Unicode escapes must be \XXXX, \+XXXXXX, \uXXXX, or \UXXXXXXXX.

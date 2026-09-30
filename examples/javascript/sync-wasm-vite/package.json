@@ -1,0 +1,21 @@
+{
+  "name": "sync-wasm-vite",
+  "version": "1.0.0",
+  "main": "index.js",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "serve": "node server.mjs",
+    "tsc-build": "echo 'no tsc-build'",
+    "test": "echo 'no tests'"
+  },
+  "author": "",
+  "license": "ISC",
+  "description": "",
+  "devDependencies": {
+    "vite": "^7.3.5"
+  },
+  "dependencies": {
+    "@tursodatabase/sync-wasm": "../../../bindings/javascript/sync/packages/wasm"
+  }
+}

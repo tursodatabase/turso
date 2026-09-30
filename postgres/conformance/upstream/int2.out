@@ -1,0 +1,486 @@
+--
+-- INT2
+--
+-- int2_tbl was already created and filled in test_setup.sql.
+-- Here we just try to insert bad values.
+INSERT INTO INT2_TBL(f1) VALUES ('34.5');
+ERROR:  invalid input syntax for type smallint: "34.5"
+LINE 1: INSERT INTO INT2_TBL(f1) VALUES ('34.5');
+                                         ^
+INSERT INTO INT2_TBL(f1) VALUES ('100000');
+ERROR:  value "100000" is out of range for type smallint
+LINE 1: INSERT INTO INT2_TBL(f1) VALUES ('100000');
+                                         ^
+INSERT INTO INT2_TBL(f1) VALUES ('asdf');
+ERROR:  invalid input syntax for type smallint: "asdf"
+LINE 1: INSERT INTO INT2_TBL(f1) VALUES ('asdf');
+                                         ^
+INSERT INTO INT2_TBL(f1) VALUES ('    ');
+ERROR:  invalid input syntax for type smallint: "    "
+LINE 1: INSERT INTO INT2_TBL(f1) VALUES ('    ');
+                                         ^
+INSERT INTO INT2_TBL(f1) VALUES ('- 1234');
+ERROR:  invalid input syntax for type smallint: "- 1234"
+LINE 1: INSERT INTO INT2_TBL(f1) VALUES ('- 1234');
+                                         ^
+INSERT INTO INT2_TBL(f1) VALUES ('4 444');
+ERROR:  invalid input syntax for type smallint: "4 444"
+LINE 1: INSERT INTO INT2_TBL(f1) VALUES ('4 444');
+                                         ^
+INSERT INTO INT2_TBL(f1) VALUES ('123 dt');
+ERROR:  invalid input syntax for type smallint: "123 dt"
+LINE 1: INSERT INTO INT2_TBL(f1) VALUES ('123 dt');
+                                         ^
+INSERT INTO INT2_TBL(f1) VALUES ('');
+ERROR:  invalid input syntax for type smallint: ""
+LINE 1: INSERT INTO INT2_TBL(f1) VALUES ('');
+                                         ^
+SELECT * FROM INT2_TBL;
+   f1   
+--------
+      0
+   1234
+  -1234
+  32767
+ -32767
+(5 rows)
+
+-- Also try it with non-error-throwing API
+SELECT pg_input_is_valid('34', 'int2');
+ pg_input_is_valid 
+-------------------
+ t
+(1 row)
+
+SELECT pg_input_is_valid('asdf', 'int2');
+ pg_input_is_valid 
+-------------------
+ f
+(1 row)
+
+SELECT pg_input_is_valid('50000', 'int2');
+ pg_input_is_valid 
+-------------------
+ f
+(1 row)
+
+SELECT * FROM pg_input_error_info('50000', 'int2');
+                     message                     | detail | hint | sql_error_code 
+-------------------------------------------------+--------+------+----------------
+ value "50000" is out of range for type smallint |        |      | 22003
+(1 row)
+
+-- While we're here, check int2vector as well
+SELECT pg_input_is_valid(' 1 3  5 ', 'int2vector');
+ pg_input_is_valid 
+-------------------
+ t
+(1 row)
+
+SELECT * FROM pg_input_error_info('1 asdf', 'int2vector');
+                    message                     | detail | hint | sql_error_code 
+------------------------------------------------+--------+------+----------------
+ invalid input syntax for type smallint: "asdf" |        |      | 22P02
+(1 row)
+
+SELECT * FROM pg_input_error_info('50000', 'int2vector');
+                     message                     | detail | hint | sql_error_code 
+-------------------------------------------------+--------+------+----------------
+ value "50000" is out of range for type smallint |        |      | 22003
+(1 row)
+
+SELECT * FROM INT2_TBL AS f(a, b);
+ERROR:  table "f" has 1 columns available but 2 columns specified
+SELECT * FROM (TABLE int2_tbl) AS s (a, b);
+ERROR:  table "s" has 1 columns available but 2 columns specified
+SELECT i.* FROM INT2_TBL i WHERE i.f1 <> int2 '0';
+   f1   
+--------
+   1234
+  -1234
+  32767
+ -32767
+(4 rows)
+
+SELECT i.* FROM INT2_TBL i WHERE i.f1 <> int4 '0';
+   f1   
+--------
+   1234
+  -1234
+  32767
+ -32767
+(4 rows)
+
+SELECT i.* FROM INT2_TBL i WHERE i.f1 = int2 '0';
+ f1 
+----
+  0
+(1 row)
+
+SELECT i.* FROM INT2_TBL i WHERE i.f1 = int4 '0';
+ f1 
+----
+  0
+(1 row)
+
+SELECT i.* FROM INT2_TBL i WHERE i.f1 < int2 '0';
+   f1   
+--------
+  -1234
+ -32767
+(2 rows)
+
+SELECT i.* FROM INT2_TBL i WHERE i.f1 < int4 '0';
+   f1   
+--------
+  -1234
+ -32767
+(2 rows)
+
+SELECT i.* FROM INT2_TBL i WHERE i.f1 <= int2 '0';
+   f1   
+--------
+      0
+  -1234
+ -32767
+(3 rows)
+
+SELECT i.* FROM INT2_TBL i WHERE i.f1 <= int4 '0';
+   f1   
+--------
+      0
+  -1234
+ -32767
+(3 rows)
+
+SELECT i.* FROM INT2_TBL i WHERE i.f1 > int2 '0';
+  f1   
+-------
+  1234
+ 32767
+(2 rows)
+
+SELECT i.* FROM INT2_TBL i WHERE i.f1 > int4 '0';
+  f1   
+-------
+  1234
+ 32767
+(2 rows)
+
+SELECT i.* FROM INT2_TBL i WHERE i.f1 >= int2 '0';
+  f1   
+-------
+     0
+  1234
+ 32767
+(3 rows)
+
+SELECT i.* FROM INT2_TBL i WHERE i.f1 >= int4 '0';
+  f1   
+-------
+     0
+  1234
+ 32767
+(3 rows)
+
+-- positive odds
+SELECT i.* FROM INT2_TBL i WHERE (i.f1 % int2 '2') = int2 '1';
+  f1   
+-------
+ 32767
+(1 row)
+
+-- any evens
+SELECT i.* FROM INT2_TBL i WHERE (i.f1 % int4 '2') = int2 '0';
+  f1   
+-------
+     0
+  1234
+ -1234
+(3 rows)
+
+SELECT i.f1, i.f1 * int2 '2' AS x FROM INT2_TBL i;
+ERROR:  smallint out of range
+SELECT i.f1, i.f1 * int2 '2' AS x FROM INT2_TBL i
+WHERE abs(f1) < 16384;
+  f1   |   x   
+-------+-------
+     0 |     0
+  1234 |  2468
+ -1234 | -2468
+(3 rows)
+
+SELECT i.f1, i.f1 * int4 '2' AS x FROM INT2_TBL i;
+   f1   |   x    
+--------+--------
+      0 |      0
+   1234 |   2468
+  -1234 |  -2468
+  32767 |  65534
+ -32767 | -65534
+(5 rows)
+
+SELECT i.f1, i.f1 + int2 '2' AS x FROM INT2_TBL i;
+ERROR:  smallint out of range
+SELECT i.f1, i.f1 + int2 '2' AS x FROM INT2_TBL i
+WHERE f1 < 32766;
+   f1   |   x    
+--------+--------
+      0 |      2
+   1234 |   1236
+  -1234 |  -1232
+ -32767 | -32765
+(4 rows)
+
+SELECT i.f1, i.f1 + int4 '2' AS x FROM INT2_TBL i;
+   f1   |   x    
+--------+--------
+      0 |      2
+   1234 |   1236
+  -1234 |  -1232
+  32767 |  32769
+ -32767 | -32765
+(5 rows)
+
+SELECT i.f1, i.f1 - int2 '2' AS x FROM INT2_TBL i;
+ERROR:  smallint out of range
+SELECT i.f1, i.f1 - int2 '2' AS x FROM INT2_TBL i
+WHERE f1 > -32767;
+  f1   |   x   
+-------+-------
+     0 |    -2
+  1234 |  1232
+ -1234 | -1236
+ 32767 | 32765
+(4 rows)
+
+SELECT i.f1, i.f1 - int4 '2' AS x FROM INT2_TBL i;
+   f1   |   x    
+--------+--------
+      0 |     -2
+   1234 |   1232
+  -1234 |  -1236
+  32767 |  32765
+ -32767 | -32769
+(5 rows)
+
+SELECT i.f1, i.f1 / int2 '2' AS x FROM INT2_TBL i;
+   f1   |   x    
+--------+--------
+      0 |      0
+   1234 |    617
+  -1234 |   -617
+  32767 |  16383
+ -32767 | -16383
+(5 rows)
+
+SELECT i.f1, i.f1 / int4 '2' AS x FROM INT2_TBL i;
+   f1   |   x    
+--------+--------
+      0 |      0
+   1234 |    617
+  -1234 |   -617
+  32767 |  16383
+ -32767 | -16383
+(5 rows)
+
+-- corner cases
+SELECT (-1::int2<<15)::text;
+  text  
+--------
+ -32768
+(1 row)
+
+SELECT ((-1::int2<<15)+1::int2)::text;
+  text  
+--------
+ -32767
+(1 row)
+
+-- check sane handling of INT16_MIN overflow cases
+SELECT (-32768)::int2 * (-1)::int2;
+ERROR:  smallint out of range
+SELECT (-32768)::int2 / (-1)::int2;
+ERROR:  smallint out of range
+SELECT (-32768)::int2 % (-1)::int2;
+ ?column? 
+----------
+        0
+(1 row)
+
+-- check rounding when casting from float
+SELECT x, x::int2 AS int2_value
+FROM (VALUES (-2.5::float8),
+             (-1.5::float8),
+             (-0.5::float8),
+             (0.0::float8),
+             (0.5::float8),
+             (1.5::float8),
+             (2.5::float8)) t(x);
+  x   | int2_value 
+------+------------
+ -2.5 |         -2
+ -1.5 |         -2
+ -0.5 |          0
+    0 |          0
+  0.5 |          0
+  1.5 |          2
+  2.5 |          2
+(7 rows)
+
+-- check rounding when casting from numeric
+SELECT x, x::int2 AS int2_value
+FROM (VALUES (-2.5::numeric),
+             (-1.5::numeric),
+             (-0.5::numeric),
+             (0.0::numeric),
+             (0.5::numeric),
+             (1.5::numeric),
+             (2.5::numeric)) t(x);
+  x   | int2_value 
+------+------------
+ -2.5 |         -3
+ -1.5 |         -2
+ -0.5 |         -1
+  0.0 |          0
+  0.5 |          1
+  1.5 |          2
+  2.5 |          3
+(7 rows)
+
+-- non-decimal literals
+SELECT int2 '0b100101';
+ int2 
+------
+   37
+(1 row)
+
+SELECT int2 '0o273';
+ int2 
+------
+  187
+(1 row)
+
+SELECT int2 '0x42F';
+ int2 
+------
+ 1071
+(1 row)
+
+SELECT int2 '0b';
+ERROR:  invalid input syntax for type smallint: "0b"
+LINE 1: SELECT int2 '0b';
+                    ^
+SELECT int2 '0o';
+ERROR:  invalid input syntax for type smallint: "0o"
+LINE 1: SELECT int2 '0o';
+                    ^
+SELECT int2 '0x';
+ERROR:  invalid input syntax for type smallint: "0x"
+LINE 1: SELECT int2 '0x';
+                    ^
+-- cases near overflow
+SELECT int2 '0b111111111111111';
+ int2  
+-------
+ 32767
+(1 row)
+
+SELECT int2 '0b1000000000000000';
+ERROR:  value "0b1000000000000000" is out of range for type smallint
+LINE 1: SELECT int2 '0b1000000000000000';
+                    ^
+SELECT int2 '0o77777';
+ int2  
+-------
+ 32767
+(1 row)
+
+SELECT int2 '0o100000';
+ERROR:  value "0o100000" is out of range for type smallint
+LINE 1: SELECT int2 '0o100000';
+                    ^
+SELECT int2 '0x7FFF';
+ int2  
+-------
+ 32767
+(1 row)
+
+SELECT int2 '0x8000';
+ERROR:  value "0x8000" is out of range for type smallint
+LINE 1: SELECT int2 '0x8000';
+                    ^
+SELECT int2 '-0b1000000000000000';
+  int2  
+--------
+ -32768
+(1 row)
+
+SELECT int2 '-0b1000000000000001';
+ERROR:  value "-0b1000000000000001" is out of range for type smallint
+LINE 1: SELECT int2 '-0b1000000000000001';
+                    ^
+SELECT int2 '-0o100000';
+  int2  
+--------
+ -32768
+(1 row)
+
+SELECT int2 '-0o100001';
+ERROR:  value "-0o100001" is out of range for type smallint
+LINE 1: SELECT int2 '-0o100001';
+                    ^
+SELECT int2 '-0x8000';
+  int2  
+--------
+ -32768
+(1 row)
+
+SELECT int2 '-0x8001';
+ERROR:  value "-0x8001" is out of range for type smallint
+LINE 1: SELECT int2 '-0x8001';
+                    ^
+-- underscores
+SELECT int2 '1_000';
+ int2 
+------
+ 1000
+(1 row)
+
+SELECT int2 '1_2_3';
+ int2 
+------
+  123
+(1 row)
+
+SELECT int2 '0xE_FF';
+ int2 
+------
+ 3839
+(1 row)
+
+SELECT int2 '0o2_73';
+ int2 
+------
+  187
+(1 row)
+
+SELECT int2 '0b_10_0101';
+ int2 
+------
+   37
+(1 row)
+
+-- error cases
+SELECT int2 '_100';
+ERROR:  invalid input syntax for type smallint: "_100"
+LINE 1: SELECT int2 '_100';
+                    ^
+SELECT int2 '100_';
+ERROR:  invalid input syntax for type smallint: "100_"
+LINE 1: SELECT int2 '100_';
+                    ^
+SELECT int2 '10__000';
+ERROR:  invalid input syntax for type smallint: "10__000"
+LINE 1: SELECT int2 '10__000';
+                    ^

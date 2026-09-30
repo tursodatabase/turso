@@ -1,0 +1,414 @@
+# 2022 May 17
+#
+# The author disclaims copyright to this source code.  In place of
+# a legal notice, here is a blessing:
+#
+#    May you do good and not evil.
+#    May you find forgiveness for yourself and forgive others.
+#    May you share freely, never taking more than you give.
+#
+#***********************************************************************
+# This file implements regression tests for SQLite library.
+#
+
+set testdir [file dirname $argv0]
+source $testdir/tester.tcl
+set testprefix joinH
+
+do_execsql_test 1.0 {
+  CREATE TABLE t1(a INT);
+  CREATE TABLE t2(b INT);
+  INSERT INTO t2(b) VALUES(NULL);
+}
+
+db nullvalue NULL
+
+do_execsql_test 1.1 {
+  SELECT DISTINCT a FROM t1 FULL JOIN t2 ON true WHERE (b ISNULL);
+} {NULL}
+do_execsql_test 1.2 {
+  SELECT a FROM t1 FULL JOIN t2 ON true;
+} {NULL}
+do_execsql_test 1.3 {
+  SELECT a FROM t1 FULL JOIN t2 ON true WHERE (b ISNULL);
+} {NULL}
+do_execsql_test 1.4 {
+  SELECT DISTINCT a FROM t1 FULL JOIN t2 ON true;
+} {NULL}
+
+#-----------------------------------------------------------
+
+reset_db
+do_execsql_test 2.0 {
+  CREATE TABLE r3(x);
+  CREATE TABLE r4(y INTEGER PRIMARY KEY);
+  INSERT INTO r4 VALUES(55);
+}
+
+do_execsql_test 2.1 {
+  SELECT 'value!' FROM r3 FULL JOIN r4 ON (y=x);
+} {value!}
+
+do_execsql_test 2.2 {
+  SELECT 'value!' FROM r3 FULL JOIN r4 ON (y=x) WHERE +y=55;
+} {value!}
+
+#-----------------------------------------------------------
+reset_db
+do_execsql_test 3.1 {
+  CREATE TABLE t0 (c0);
+  CREATE TABLE t1 (c0);
+  CREATE TABLE t2 (c0 , c1 , c2 , UNIQUE (c0), UNIQUE (c2 DESC));
+  INSERT INTO t2 VALUES ('x', 'y', 'z');
+  ANALYZE;
+  CREATE VIEW v0(c0) AS SELECT FALSE;
+}
+
+do_catchsql_test 3.2 {
+  SELECT * FROM t0 LEFT OUTER JOIN t1 ON v0.c0 INNER JOIN v0 INNER JOIN t2 ON (t2.c2 NOT NULL); 
+} {1 {ON clause references tables to its right}}
+
+#-------------------------------------------------------------
+
+reset_db
+do_execsql_test 4.1 {
+  CREATE TABLE t1(a,b,c,d,e,f,g,h,PRIMARY KEY(a,b,c)) WITHOUT ROWID;
+  CREATE TABLE t2(i, j);
+  INSERT INTO t2 VALUES(10, 20);
+}
+
+do_execsql_test 4.2 {
+  SELECT (d IS NULL) FROM t1 RIGHT JOIN t2 ON (j=33);
+} {1}
+
+do_execsql_test 4.3 {
+  CREATE INDEX i1 ON t1( (d IS NULL), d );
+}
+
+do_execsql_test 4.4 {
+  SELECT (d IS NULL) FROM t1 RIGHT JOIN t2 ON (j=33);
+} {1}
+
+#-------------------------------------------------------------------------
+#
+reset_db
+do_execsql_test 5.0 {
+  CREATE TABLE t0(w);
+  CREATE TABLE t1(x);
+  CREATE TABLE t2(y);
+  CREATE TABLE t3(z);
+  INSERT INTO t3 VALUES('t3val');
+}
+
+do_execsql_test 5.1 {
+  SELECT * FROM t1 INNER JOIN t2 ON (0) RIGHT OUTER JOIN t3;
+} {{} {} t3val}
+
+do_execsql_test 5.2 {
+  SELECT * FROM t1 INNER JOIN t2 ON (0) FULL OUTER JOIN t3;
+} {{} {} t3val}
+
+do_execsql_test 5.3 {
+  SELECT * FROM t3 LEFT JOIN t2 ON (0);
+} {t3val {}}
+
+do_execsql_test 5.4 {
+  SELECT * FROM t0 RIGHT JOIN t1 INNER JOIN t2 ON (0) RIGHT JOIN t3
+} {{} {} {} t3val}
+
+do_execsql_test 5.5 {
+  SELECT * FROM t0 RIGHT JOIN t1 INNER JOIN t2 ON (0)
+} {}
+
+
+reset_db
+db null NULL
+do_execsql_test 6.0 {
+  CREATE TABLE t1(a INT);
+  CREATE TABLE t2(b INT);
+  INSERT INTO t1 VALUES(3);
+  SELECT CASE WHEN t2.b THEN 0 ELSE 1 END FROM t1 LEFT JOIN t2 ON true;
+} {1}
+do_execsql_test 6.1 {
+  SELECT * FROM t1 LEFT JOIN t2 ON true WHERE CASE WHEN t2.b THEN 0 ELSE 1 END;
+} {3 NULL}
+
+#-------------------------------------------------------------------------
+reset_db
+do_execsql_test 7.0 {
+  CREATE TABLE t1(a, b);
+  CREATE TABLE t2(c);
+  CREATE TABLE t3(d);
+
+  INSERT INTO t1 VALUES ('a', 'a');
+  INSERT INTO t2 VALUES ('ddd');
+  INSERT INTO t3 VALUES(1234);
+}
+
+do_execsql_test 7.1 {
+  SELECT t2.rowid FROM t1 JOIN (t2 JOIN t3);
+} {1}
+
+do_execsql_test 7.1 {
+  UPDATE t1 SET b = t2.rowid FROM t2, t3;
+}
+
+do_execsql_test 7.2 { 
+  SELECT * FROM t1
+} {a 1}
+
+#-------------------------------------------------------------------------
+reset_db
+do_execsql_test 8.0 {
+  CREATE TABLE x1(a INTEGER PRIMARY KEY, b);
+  CREATE TABLE x2(c, d);
+  CREATE TABLE x3(rowid, _rowid_);
+
+  CREATE TABLE x4(rowid, _rowid_, oid);
+
+  INSERT INTO x1 VALUES(1000, 'thousand');
+  INSERT INTO x2 VALUES('c', 'd');
+  INSERT INTO x3(oid, rowid, _rowid_) VALUES(43, 'hello', 'world');
+  INSERT INTO x4(oid, rowid, _rowid_) VALUES('forty three', 'hello', 'world');
+}
+
+do_execsql_test 8.1 {
+  SELECT x3.oid FROM x1 JOIN (x2 JOIN x3 ON c='c')
+} 43
+
+breakpoint
+do_execsql_test 8.2 {
+  SELECT x3.rowid FROM x1 JOIN (x2 JOIN x3 ON c='c')
+} {hello}
+
+do_execsql_test 8.3 {
+  SELECT x4.oid FROM x1 JOIN (x2 JOIN x4 ON c='c')
+} {{forty three}}
+
+
+#---------------------------------------------------------------------
+#
+reset_db
+do_execsql_test 9.0 {
+  CREATE TABLE x1(a);
+  CREATE TABLE x2(b);
+  CREATE TABLE x3(c);
+
+  CREATE TABLE wo1(a PRIMARY KEY, b) WITHOUT ROWID;
+  CREATE TABLE wo2(a PRIMARY KEY, rowid) WITHOUT ROWID;
+  CREATE TABLE wo3(a PRIMARY KEY, b) WITHOUT ROWID;
+}
+
+do_catchsql_test 9.1 {
+  SELECT rowid FROM wo1, x1, x2;
+} {1 {ambiguous column name: rowid}}
+do_catchsql_test 9.2 {
+  SELECT rowid FROM wo1, (x1, x2);
+} {1 {ambiguous column name: rowid}}
+do_catchsql_test 9.3 {
+  SELECT rowid FROM wo1 JOIN (x1 JOIN x2);
+} {1 {ambiguous column name: rowid}}
+do_catchsql_test 9.4 {
+  SELECT a FROM wo1, x1, x2;
+} {1 {ambiguous column name: a}}
+
+
+# It is not possible to use "rowid" in a USING clause.
+#
+do_catchsql_test 9.5 {
+  SELECT * FROM x1 JOIN x2 USING (rowid);
+} {1 {cannot join using column rowid - column not present in both tables}}
+do_catchsql_test 9.6 {
+  SELECT * FROM wo2 JOIN x2 USING (rowid);
+} {1 {cannot join using column rowid - column not present in both tables}}
+
+# "rowid" columns are not matched by NATURAL JOIN. If they were, then
+# the SELECT below would return zero rows.
+do_execsql_test 9.7 {
+  INSERT INTO x1(rowid, a) VALUES(101, 'A');
+  INSERT INTO x2(rowid, b) VALUES(55, 'B');
+  SELECT * FROM x1 NATURAL JOIN x2;
+} {A B}
+
+do_execsql_test 9.8 {
+  INSERT INTO wo1(a, b) VALUES('mya', 'myb');
+  INSERT INTO wo2(a, rowid) VALUES('mypk', 'myrowid');
+  INSERT INTO wo3(a, b) VALUES('MYA', 'MYB');
+  INSERT INTO x3(rowid, c) VALUES(99, 'x3B');
+}
+
+do_catchsql_test 9.8 {
+  SELECT rowid FROM x1 JOIN (x2 JOIN wo2);
+} {0 myrowid}
+do_catchsql_test 9.9 {
+  SELECT _rowid_ FROM wo1 JOIN (wo3 JOIN x3)
+} {0 99}
+do_catchsql_test 9.10 {
+  SELECT oid FROM wo1 JOIN (wo3 JOIN x3)
+} {0 99}
+do_catchsql_test 9.11 {
+  SELECT oid FROM wo2 JOIN (wo3 JOIN x3)
+} {0 99}
+
+reset_db
+do_execsql_test 10.0 {
+  CREATE TABLE rt0 (c0 INTEGER, c1 INTEGER, c2 INTEGER, c3 INTEGER, c4 INTEGER);
+  CREATE TABLE rt3 (c3 INTEGER);
+
+  INSERT INTO rt0(c3, c1) VALUES (x'', '1');
+  INSERT INTO rt0(c3, c1) VALUES ('-1', -1e500);
+  INSERT INTO rt0(c3, c1) VALUES (1, x'');
+
+  CREATE VIEW v6(c0, c1, c2) AS SELECT 0, 0, 0;
+}
+
+do_execsql_test 10.1 {
+  SELECT COUNT(*) FROM rt0 LEFT JOIN rt3 JOIN v6 ON ((CASE v6.c0 WHEN rt0.c4 THEN rt3.c3 END) NOT BETWEEN (rt0.c4) AND (NULL)) WHERE (rt0.c1); -- 2
+} {0}
+
+do_execsql_test 10.2 {
+  SELECT COUNT(*) FROM rt0 LEFT JOIN rt3 RIGHT OUTER JOIN v6 ON ((CASE v6.c0 WHEN rt0.c4 THEN rt3.c3 END) NOT BETWEEN (rt0.c4) AND (NULL)) WHERE (rt0.c1); -- 2
+} {0}
+
+#-------------------------------------------------------------------------
+
+do_execsql_test 11.1 {
+  CREATE TABLE t1(a, b);
+  CREATE TABLE t2(c, d);
+  CREATE TABLE t3(e, f);
+
+  INSERT INTO t1 VALUES(1, 1);
+  INSERT INTO t2 VALUES(2, 2);
+  INSERT INTO t3 VALUES(3, 3);
+}
+
+do_execsql_test 11.2 {
+  SELECT * FROM t1 LEFT JOIN t2 RIGHT JOIN t3 ON (t2.c=10)
+} {{} {} {} {} 3 3}
+
+do_execsql_test 11.3 {
+  SELECT * FROM t1 LEFT JOIN t2 RIGHT JOIN t3 ON (t2.c=10) WHERE t1.a=1
+} {}
+
+#-------------------------------------------------------------------------
+reset_db
+
+do_execsql_test 12.1 {
+  CREATE TABLE t1(a1 INT, b1 TEXT);
+  INSERT INTO t1 VALUES(88,'');
+  CREATE TABLE t2(c2 INT, d2 TEXT);
+  INSERT INTO t2 VALUES(88,'');
+  CREATE TABLE t3(e3 TEXT PRIMARY KEY);
+  INSERT INTO t3 VALUES('');
+}
+
+do_execsql_test 12.2 {
+  SELECT * FROM t1 LEFT JOIN t2 ON true RIGHT JOIN t3 ON d2=e3 WHERE c2 BETWEEN NULL AND a1;
+}
+do_execsql_test 12.3 {
+  SELECT * FROM t1 LEFT JOIN t2 ON true RIGHT JOIN t3 ON d2=e3 WHERE c2 BETWEEN NULL AND a1;
+}
+
+#-------------------------------------------------------------------------
+# 2024-04-05 dbsqlfuzz b9e65e2f110df998f1306571fae7af6c01e4d92b
+reset_db
+do_execsql_test 13.1 {
+  CREATE TABLE t1(a INT AS (b), b INT);
+  INSERT INTO t1(b) VALUES(123);
+  CREATE TABLE t2(a INT, c INT);
+  SELECT a FROM t2 NATURAL RIGHT JOIN t1;
+} {123}
+do_execsql_test 13.2 {
+  CREATE INDEX t1a ON t1(a);
+  SELECT a FROM t2 NATURAL RIGHT JOIN t1;
+} {123}
+# Further tests of the same logic (indexes on expressions
+# used by RIGHT JOIN) from check-in ffe23af73fcb324d and
+# forum post https://sqlite.org/forum/forumpost/9b491e1debf0b67a.
+db null NULL
+do_execsql_test 13.3 {
+  CREATE TABLE t3(a INT, b INT);
+  CREATE UNIQUE INDEX t3x ON t3(a, a+b);
+  INSERT INTO t3(a,b) VALUES(1,2),(4,8),(16,32),(4,80),(1,-300);
+  CREATE TABLE t4(x INT, y INT);
+  INSERT INTO t4(x,y) SELECT a, b FROM t3;
+  INSERT INTO t4(x,y) VALUES(99,99);
+  SELECT a1.a, sum( a1.a+a1.b ) FROM t3 AS a1 RIGHT JOIN t4 ON a=x
+   GROUP BY a1.a ORDER BY 1;
+} {NULL NULL 1 -592 4 192 16 48}
+do_execsql_test 13.4 {
+  SELECT sum( a1.a+a1.b ) FROM t3 AS a1 RIGHT JOIN t3 ON true
+   GROUP BY a1.a ORDER BY 1;
+} {-1480 240 480}
+
+#-------------------------------------------------------------------------
+# 2025-05-30
+# https://sqlite.org/forum/forumpost/5028c785b6
+#
+reset_db
+
+do_execsql_test 14.0 {
+  CREATE TABLE t1(c0 INT);
+  CREATE TABLE t2(c0 BLOB);
+  CREATE TABLE t3(c0 BLOB);
+  CREATE TABLE t4(c4 BLOB);
+  INSERT INTO t1(c0) VALUES(0);
+  INSERT INTO t3(c0) VALUES('0');
+}
+
+do_execsql_test 14.1.1 {
+  SELECT * FROM t1 NATURAL LEFT JOIN t2 NATURAL JOIN t3;
+} {0}
+
+do_execsql_test 14.1.2 {
+  SELECT * FROM t1 NATURAL LEFT JOIN t2 NATURAL JOIN t3 FULL JOIN t4 ON true;
+} {0 {}}
+
+do_execsql_test 14.1.3 {
+  SELECT * FROM (t1 NATURAL LEFT JOIN t2 NATURAL JOIN t3) FULL JOIN t4 ON true;
+} {0 {}}
+
+do_execsql_test 14.1.4 {
+  SELECT * 
+  FROM (t1 NATURAL LEFT JOIN t2 NATURAL JOIN t3) AS qq FULL JOIN t4 ON true;
+} {0 {}}
+
+do_execsql_test 14.2.1 {
+  SELECT * FROM t3 NATURAL LEFT JOIN t2 NATURAL JOIN t1;
+} {0}
+
+do_execsql_test 14.2.2 {
+  SELECT * FROM t3 NATURAL LEFT JOIN t2 NATURAL JOIN t1 FULL JOIN t4 ON true;
+} {0 {}}
+
+do_execsql_test 14.2.3 {
+  SELECT * FROM (t3 NATURAL LEFT JOIN t2 NATURAL JOIN t1) FULL JOIN t4 ON true;
+} {0 {}}
+
+do_execsql_test 14.2.4 {
+  SELECT * 
+  FROM (t3 NATURAL LEFT JOIN t2 NATURAL JOIN t1) AS qq FULL JOIN t4 ON true;
+} {0 {}}
+
+# 2025-06-01 
+#
+reset_db
+do_execsql_test 15.1 {
+  CREATE TABLE t0(c0);
+  CREATE TABLE t1(c0);
+  CREATE TABLE t2(c0);
+  INSERT INTO t0 VALUES ('1.0');
+  INSERT INTO t2(c0) VALUES (9);
+  SELECT t0.c0,t2.c0 FROM (SELECT CAST(t0.c0 as REAL) AS c0 FROM t0) as subquery NATURAL LEFT JOIN t1  NATURAL JOIN t0  RIGHT JOIN t2 ON 1;
+} {1.0 9}
+do_execsql_test 15.2 {
+  CREATE TABLE x1(x COLLATE nocase);
+  CREATE TABLE x2(x);
+  CREATE TABLE x3(x);
+  CREATE TABLE t4(y);
+  INSERT INTO x1 VALUES('ABC');
+  INSERT INTO x3 VALUES('abc');
+  SELECT lower(x), quote(y) FROM x1 LEFT JOIN x2 USING (x) JOIN x3 USING (x) FULL JOIN t4;
+} {abc NULL}
+
+finish_test

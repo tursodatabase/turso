@@ -1,0 +1,43 @@
+---
+source: indexes.sqltest
+expression: |-
+  SELECT item_id,
+             MIN(seen_ms) AS first_seen_ms,
+             MAX(seen_ms) AS last_seen_ms,
+             COUNT(*) AS seen_count
+      FROM (
+          SELECT t.id AS item_id,
+                 t.created_ms AS seen_ms
+          FROM timeline_items t
+          WHERE t.item_kind = 'entry'
+            AND (
+                t.id IN (
+                    SELECT l.source_id
+                    FROM item_links l
+                    WHERE l.link_kind = 'links'
+                      AND l.target_id = 500
+                )
+                OR t.id IN (
+                    SELECT l.target_id
+                    FROM item_links l
+                    WHERE l.link_kind = 'links'
+                      AND l.source_id = 500
+                )
+            )
+      ) AS matched_entries;
+info:
+  statement_type: SELECT
+  tables:
+  - item_links
+  - timeline_items
+  setup_blocks:
+  - relation-history
+  database: ':memory:'
+---
+QUERY PLAN
+`--SCAN matched_entries
+   |--LIST SUBQUERY 1
+   |  `--SEARCH l USING INDEX idx_item_links_target (target_id=?)
+   |--LIST SUBQUERY 2
+   |  `--SEARCH l USING INDEX idx_item_links_source (source_id=?)
+   `--MULTI-INDEX OR t (PRIMARY KEY, PRIMARY KEY)

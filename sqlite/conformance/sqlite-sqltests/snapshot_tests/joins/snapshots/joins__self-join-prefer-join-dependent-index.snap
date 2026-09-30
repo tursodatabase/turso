@@ -1,0 +1,44 @@
+---
+source: joins.sqltest
+expression: |-
+  SELECT DISTINCT
+          p1.name, p2.name
+      FROM bundle b1
+      JOIN bundle b2 ON b1.source = b2.source
+      JOIN product p1 ON b1.target = p1.id
+      JOIN product p2 ON b2.target = p2.id
+      JOIN product container ON b1.source = container.id
+      LEFT JOIN bundle x1 ON p1.id = x1.target AND x1.kind = 'variant'
+      LEFT JOIN bundle x2 ON p2.id = x2.target AND x2.kind = 'variant'
+      WHERE b1.kind = 'contains'
+        AND b2.kind = 'contains'
+        AND b1.target <> b2.target
+        AND b1.target < b2.target
+        AND container.category = 'kit'
+        AND p1.category NOT IN ('shipping', 'meta', 'kit')
+        AND p2.category NOT IN ('shipping', 'meta', 'kit')
+        AND x1.id IS NULL
+        AND x2.id IS NULL;
+info:
+  statement_type: SELECT
+  tables:
+  - b1.source
+  - b1.target
+  - b2.target
+  - bundle
+  - p1.id
+  - p2.id
+  - product
+  setup_blocks:
+  - catalog_schema
+  database: ':memory:'
+---
+QUERY PLAN
+|--SEARCH b1 USING INDEX idx_bundle_kind (kind=?)
+|--SEARCH container USING INDEX sqlite_autoindex_product_1 (id=?)
+|--SEARCH p1 USING INDEX sqlite_autoindex_product_1 (id=?)
+|--SEARCH b2 USING INDEX idx_bundle_source (source=?)
+|--SEARCH p2 USING INDEX sqlite_autoindex_product_1 (id=?)
+|--SEARCH x1 USING INDEX idx_bundle_target (target=?) LEFT-JOIN
+|--SEARCH x2 USING INDEX idx_bundle_target (target=?) LEFT-JOIN
+`--USE HASH TABLE FOR DISTINCT

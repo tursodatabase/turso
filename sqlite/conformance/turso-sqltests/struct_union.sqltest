@@ -1,0 +1,1301 @@
+@database :memory:
+@requires-file custom_types "struct/union tests require custom types support"
+
+# STRUCT and UNION type tests
+
+# ============================================================================
+# STRUCT basics
+# ============================================================================
+
+test struct-basic-insert-select {
+    CREATE TYPE point AS STRUCT(x INT, y INT);
+    CREATE TABLE t(id INT, pos point) STRICT;
+    INSERT INTO t VALUES (1, struct_pack(10, 20));
+    SELECT id, pos.x, pos.y FROM t;
+}
+expect {
+    1|10|20
+}
+
+test struct-multiple-rows {
+    CREATE TYPE point AS STRUCT(x INT, y INT);
+    CREATE TABLE t(id INT, pos point) STRICT;
+    INSERT INTO t VALUES (1, struct_pack(10, 20));
+    INSERT INTO t VALUES (2, struct_pack(30, 40));
+    INSERT INTO t VALUES (3, struct_pack(5, 50));
+    SELECT id, pos.x, pos.y FROM t ORDER BY id;
+}
+expect {
+    1|10|20
+    2|30|40
+    3|5|50
+}
+
+test struct-where-field-access {
+    CREATE TYPE point AS STRUCT(x INT, y INT);
+    CREATE TABLE t(id INT, pos point) STRICT;
+    INSERT INTO t VALUES (1, struct_pack(10, 20));
+    INSERT INTO t VALUES (2, struct_pack(30, 40));
+    INSERT INTO t VALUES (3, struct_pack(5, 50));
+    SELECT id FROM t WHERE pos.x > 15;
+}
+expect {
+    2
+}
+
+test struct-where-field-equality {
+    CREATE TYPE point AS STRUCT(x INT, y INT);
+    CREATE TABLE t(id INT, pos point) STRICT;
+    INSERT INTO t VALUES (1, struct_pack(10, 20));
+    INSERT INTO t VALUES (2, struct_pack(30, 40));
+    INSERT INTO t VALUES (3, struct_pack(5, 50));
+    SELECT id FROM t WHERE pos.x = 10;
+}
+expect {
+    1
+}
+
+test struct-order-by-field {
+    CREATE TYPE point AS STRUCT(x INT, y INT);
+    CREATE TABLE t(id INT, pos point) STRICT;
+    INSERT INTO t VALUES (1, struct_pack(10, 20));
+    INSERT INTO t VALUES (2, struct_pack(30, 40));
+    INSERT INTO t VALUES (3, struct_pack(5, 50));
+    SELECT id, pos.x FROM t ORDER BY pos.x;
+}
+expect {
+    3|5
+    1|10
+    2|30
+}
+
+test struct-typeof-field {
+    CREATE TYPE point AS STRUCT(x INT, y INT);
+    CREATE TABLE t(id INT, pos point) STRICT;
+    INSERT INTO t VALUES (1, struct_pack(10, 20));
+    SELECT typeof(pos.x), typeof(pos.y) FROM t;
+}
+expect {
+    integer|integer
+}
+
+test struct-text-field {
+    CREATE TYPE record AS STRUCT(name TEXT, age INT);
+    CREATE TABLE t(id INT, data record) STRICT;
+    INSERT INTO t VALUES (1, struct_pack('Alice', 30));
+    INSERT INTO t VALUES (2, struct_pack('Bob', 25));
+    SELECT data.name, data.age FROM t ORDER BY data.age;
+}
+expect {
+    Bob|25
+    Alice|30
+}
+
+test struct-null-value {
+    CREATE TYPE point AS STRUCT(x INT, y INT);
+    CREATE TABLE t(id INT, pos point) STRICT;
+    INSERT INTO t VALUES (1, NULL);
+    SELECT pos.x, pos.y FROM t;
+}
+expect {
+    |
+}
+
+test struct-table-column-priority {
+    CREATE TYPE point AS STRUCT(x INT, y INT);
+    CREATE TABLE t(id INT, pos point) STRICT;
+    INSERT INTO t VALUES (1, struct_pack(10, 20));
+    INSERT INTO t VALUES (2, struct_pack(30, 40));
+    SELECT t.id FROM t ORDER BY t.id;
+}
+expect {
+    1
+    2
+}
+
+# ============================================================================
+# UNION basics
+# ============================================================================
+
+test union-basic-insert-select {
+    CREATE TYPE number AS UNION(i INT, f REAL);
+    CREATE TABLE tagged(id INT, val number) STRICT;
+    INSERT INTO tagged VALUES (1, union_value('i', 42));
+    INSERT INTO tagged VALUES (2, union_value('f', 3.14));
+    SELECT id, union_tag(val) FROM tagged ORDER BY id;
+}
+expect {
+    1|i
+    2|f
+}
+
+test union-dot-access-matching-tag {
+    CREATE TYPE number AS UNION(i INT, f REAL);
+    CREATE TABLE tagged(id INT, val number) STRICT;
+    INSERT INTO tagged VALUES (1, union_value('i', 42));
+    INSERT INTO tagged VALUES (2, union_value('f', 3.14));
+    SELECT val.i FROM tagged WHERE id = 1;
+}
+expect {
+    42
+}
+
+test union-dot-access-wrong-tag-returns-null {
+    CREATE TYPE number AS UNION(i INT, f REAL);
+    CREATE TABLE tagged(id INT, val number) STRICT;
+    INSERT INTO tagged VALUES (1, union_value('i', 42));
+    SELECT val.f FROM tagged WHERE id = 1;
+}
+expect {
+
+}
+
+test union-extract-function {
+    CREATE TYPE number AS UNION(i INT, f REAL);
+    CREATE TABLE tagged(id INT, val number) STRICT;
+    INSERT INTO tagged VALUES (1, union_value('i', 42));
+    INSERT INTO tagged VALUES (2, union_value('f', 3.14));
+    SELECT union_extract(val, 'i') FROM tagged ORDER BY id;
+}
+expect {
+    42
+
+}
+
+test union-where-union-tag {
+    CREATE TYPE number AS UNION(i INT, f REAL);
+    CREATE TABLE tagged(id INT, val number) STRICT;
+    INSERT INTO tagged VALUES (1, union_value('i', 42));
+    INSERT INTO tagged VALUES (2, union_value('f', 3.14));
+    INSERT INTO tagged VALUES (3, union_value('i', 100));
+    SELECT id, val.i FROM tagged WHERE union_tag(val) = 'i' ORDER BY id;
+}
+expect {
+    1|42
+    3|100
+}
+
+test union-null-value {
+    CREATE TYPE number AS UNION(i INT, f REAL);
+    CREATE TABLE tagged(id INT, val number) STRICT;
+    INSERT INTO tagged VALUES (1, NULL);
+    SELECT val.i, union_tag(val) FROM tagged;
+}
+expect {
+    |
+}
+
+# ============================================================================
+# CREATE INDEX rejection
+# ============================================================================
+
+test struct-reject-index {
+    CREATE TYPE point AS STRUCT(x INT, y INT);
+    CREATE TABLE t(id INT PRIMARY KEY, pos point) STRICT;
+    CREATE INDEX idx ON t(pos);
+}
+expect error {
+    cannot create index on STRUCT/UNION column 'pos'
+}
+
+test union-reject-index {
+    CREATE TYPE number AS UNION(i INT, f REAL);
+    CREATE TABLE t(id INT PRIMARY KEY, val number) STRICT;
+    CREATE INDEX idx ON t(val);
+}
+expect error {
+    cannot create index on STRUCT/UNION column 'val'
+}
+
+test non-struct-index-still-works {
+    CREATE TYPE point AS STRUCT(x INT, y INT);
+    CREATE TABLE t(id INT PRIMARY KEY, pos point) STRICT;
+    CREATE INDEX idx ON t(id);
+    INSERT INTO t VALUES (1, struct_pack(10, 20));
+    SELECT id FROM t WHERE id = 1;
+}
+expect {
+    1
+}
+
+# ============================================================================
+# Error handling
+# ============================================================================
+
+test union-extract-requires-string-literal {
+    CREATE TYPE number AS UNION(i INT, f REAL);
+    CREATE TABLE tagged(id INT, val number) STRICT;
+    SELECT union_extract(val, 123) FROM tagged;
+}
+expect error {
+    union_extract\(\) second argument must be a string literal
+}
+
+test union-value-requires-string-tag {
+    CREATE TYPE number AS UNION(i INT, f REAL);
+    CREATE TABLE tagged(id INT, val number) STRICT;
+    SELECT union_value(123, 42);
+}
+expect error {
+    union_value\(\) first argument must be a string literal
+}
+
+test union-value-standalone-select {
+    CREATE TYPE number AS UNION(i INT, f REAL);
+    SELECT union_value('i', 42);
+}
+expect error {
+    union_value\(\) can only be used in INSERT/UPDATE targeting a union-typed column
+}
+
+test struct-no-such-field {
+    CREATE TYPE point AS STRUCT(x INT, y INT);
+    CREATE TABLE t(id INT, pos point) STRICT;
+    INSERT INTO t VALUES (1, struct_pack(10, 20));
+    SELECT pos.z FROM t;
+}
+expect error {
+    no such field 'z' in struct type 'point'
+}
+
+test union-no-such-variant {
+    CREATE TYPE number AS UNION(i INT, f REAL);
+    CREATE TABLE tagged(id INT, val number) STRICT;
+    INSERT INTO tagged VALUES (1, union_value('i', 42));
+    SELECT val.z FROM tagged;
+}
+expect error {
+    no such variant 'z' in union type 'number'
+}
+
+# ============================================================================
+# UPDATE and DELETE with struct/union columns
+# ============================================================================
+
+test struct-update-column {
+    CREATE TYPE point AS STRUCT(x INT, y INT);
+    CREATE TABLE t(id INT, pos point) STRICT;
+    INSERT INTO t VALUES (1, struct_pack(10, 20));
+    INSERT INTO t VALUES (2, struct_pack(30, 40));
+    UPDATE t SET pos = struct_pack(99, 88) WHERE id = 1;
+    SELECT id, pos.x, pos.y FROM t ORDER BY id;
+}
+expect {
+    1|99|88
+    2|30|40
+}
+
+test struct-delete-where-field {
+    CREATE TYPE point AS STRUCT(x INT, y INT);
+    CREATE TABLE t(id INT, pos point) STRICT;
+    INSERT INTO t VALUES (1, struct_pack(10, 20));
+    INSERT INTO t VALUES (2, struct_pack(30, 40));
+    INSERT INTO t VALUES (3, struct_pack(5, 50));
+    DELETE FROM t WHERE pos.x < 15;
+    SELECT id, pos.x FROM t;
+}
+expect {
+    2|30
+}
+
+test union-update-column {
+    CREATE TYPE number AS UNION(i INT, f REAL);
+    CREATE TABLE tagged(id INT, val number) STRICT;
+    INSERT INTO tagged VALUES (1, union_value('i', 42));
+    UPDATE tagged SET val = union_value('f', 2.5) WHERE id = 1;
+    SELECT union_tag(val), val.f FROM tagged;
+}
+expect {
+    f|2.5
+}
+
+test union-delete-where-tag {
+    CREATE TYPE number AS UNION(i INT, f REAL);
+    CREATE TABLE tagged(id INT, val number) STRICT;
+    INSERT INTO tagged VALUES (1, union_value('i', 42));
+    INSERT INTO tagged VALUES (2, union_value('f', 3.14));
+    INSERT INTO tagged VALUES (3, union_value('i', 100));
+    DELETE FROM tagged WHERE union_tag(val) = 'f';
+    SELECT id, val.i FROM tagged ORDER BY id;
+}
+expect {
+    1|42
+    3|100
+}
+
+# ============================================================================
+# JOIN with dot-notation
+# ============================================================================
+
+test struct-join-dot-notation {
+    CREATE TYPE point AS STRUCT(x INT, y INT);
+    CREATE TABLE t1(id INT, pos point) STRICT;
+    CREATE TABLE t2(id INT, label TEXT) STRICT;
+    INSERT INTO t1 VALUES (1, struct_pack(10, 20));
+    INSERT INTO t2 VALUES (1, 'hello');
+    SELECT t1.id, pos.x, t2.label FROM t1 JOIN t2 ON t1.id = t2.id;
+}
+expect {
+    1|10|hello
+}
+
+test struct-ambiguous-column-in-join {
+    CREATE TYPE point AS STRUCT(x INT, y INT);
+    CREATE TABLE t1(id INT, data point) STRICT;
+    CREATE TABLE t2(id INT, data point) STRICT;
+    INSERT INTO t1 VALUES (1, struct_pack(10, 20));
+    INSERT INTO t2 VALUES (1, struct_pack(30, 40));
+    SELECT data.x FROM t1 JOIN t2 ON t1.id = t2.id;
+}
+expect error {
+    ambiguous column reference
+}
+
+test struct-qualified-dot-notation-in-join {
+    CREATE TYPE point AS STRUCT(x INT, y INT);
+    CREATE TABLE t1(id INT, pos point) STRICT;
+    CREATE TABLE t2(id INT, label TEXT) STRICT;
+    INSERT INTO t1 VALUES (1, struct_pack(10, 20));
+    INSERT INTO t2 VALUES (1, 'hello');
+    SELECT t1.pos.x FROM t1 JOIN t2 ON t1.id = t2.id;
+}
+expect {
+    10
+}
+
+test struct-qualified-disambiguates-in-join {
+    CREATE TYPE point AS STRUCT(x INT, y INT);
+    CREATE TABLE t1(id INT, pos point) STRICT;
+    CREATE TABLE t2(id INT, pos point) STRICT;
+    INSERT INTO t1 VALUES (1, struct_pack(10, 20));
+    INSERT INTO t2 VALUES (1, struct_pack(30, 40));
+    SELECT t1.pos.x, t2.pos.y FROM t1 JOIN t2 ON t1.id = t2.id;
+}
+expect {
+    10|40
+}
+
+test struct-dot-on-non-struct-column {
+    CREATE TABLE t(id INT, name TEXT) STRICT;
+    INSERT INTO t VALUES (1, 'hello');
+    SELECT t.name.x FROM t;
+}
+expect error {
+    column 'name' is not a STRUCT or UNION type
+}
+
+test struct-dot-on-integer-column {
+    CREATE TABLE t(id INT, val INT) STRICT;
+    INSERT INTO t VALUES (1, 42);
+    SELECT t.val.x FROM t;
+}
+expect error {
+    column 'val' is not a STRUCT or UNION type
+}
+
+# ============================================================================
+# Dot-notation precedence rules (DuckDB-style)
+#
+# Resolution order for `a.b`:   table.column > column.field
+# Resolution order for `a.b.c`: db.table.column > table.column.field
+#
+# Table/schema references always win. Users disambiguate with aliases.
+# ============================================================================
+
+# When table name = struct column name, `t.x` means table.column, not column.field
+test precedence-table-wins-over-struct-field {
+    CREATE TYPE point AS STRUCT(x INT, y INT);
+    CREATE TABLE t(x INT, t point) STRICT;
+    INSERT INTO t VALUES (99, struct_pack(10, 20));
+    SELECT t.x FROM t;
+}
+expect {
+    99
+}
+
+# Same scenario: access the struct field via alias to prove it's reachable
+test precedence-struct-field-via-alias {
+    CREATE TYPE point AS STRUCT(x INT, y INT);
+    CREATE TABLE t(x INT, t point) STRICT;
+    INSERT INTO t VALUES (99, struct_pack(10, 20));
+    SELECT s.t.x FROM t AS s;
+}
+expect {
+    10
+}
+
+# table.column.field works when table name differs from column name
+test precedence-table-column-field {
+    CREATE TYPE point AS STRUCT(x INT, y INT);
+    CREATE TABLE items(id INT, pos point) STRICT;
+    INSERT INTO items VALUES (1, struct_pack(10, 20));
+    SELECT items.pos.x FROM items;
+}
+expect {
+    10
+}
+
+# Bare column.field works in single-table context
+test precedence-bare-column-field {
+    CREATE TYPE point AS STRUCT(x INT, y INT);
+    CREATE TABLE t(id INT, pos point) STRICT;
+    INSERT INTO t VALUES (1, struct_pack(10, 20));
+    SELECT pos.x FROM t;
+}
+expect {
+    10
+}
+
+# ============================================================================
+# NULL handling edge cases
+# ============================================================================
+
+test struct-null-where-comparison {
+    CREATE TYPE point AS STRUCT(x INT, y INT);
+    CREATE TABLE t(id INT, pos point) STRICT;
+    INSERT INTO t VALUES (1, struct_pack(10, 20));
+    INSERT INTO t VALUES (2, NULL);
+    INSERT INTO t VALUES (3, struct_pack(5, 50));
+    SELECT id FROM t WHERE pos.x > 0 ORDER BY id;
+}
+expect {
+    1
+    3
+}
+
+test union-null-extract-all-variants {
+    CREATE TYPE number AS UNION(i INT, f REAL);
+    CREATE TABLE tagged(id INT, val number) STRICT;
+    INSERT INTO tagged VALUES (1, NULL);
+    SELECT val.i, val.f, union_tag(val) FROM tagged;
+}
+expect {
+    ||
+}
+
+# ============================================================================
+# Aggregation with struct/union fields
+# ============================================================================
+
+test struct-aggregate-sum {
+    CREATE TYPE point AS STRUCT(x INT, y INT);
+    CREATE TABLE t(id INT, pos point) STRICT;
+    INSERT INTO t VALUES (1, struct_pack(10, 20));
+    INSERT INTO t VALUES (2, struct_pack(30, 40));
+    INSERT INTO t VALUES (3, struct_pack(5, 50));
+    SELECT SUM(pos.x), MIN(pos.y), MAX(pos.x) FROM t;
+}
+expect {
+    45|20|30
+}
+
+test struct-group-by-field {
+    CREATE TYPE record AS STRUCT(category TEXT, value INT);
+    CREATE TABLE t(id INT, data record) STRICT;
+    INSERT INTO t VALUES (1, struct_pack('a', 10));
+    INSERT INTO t VALUES (2, struct_pack('b', 20));
+    INSERT INTO t VALUES (3, struct_pack('a', 30));
+    SELECT data.category, SUM(data.value) FROM t GROUP BY data.category ORDER BY data.category;
+}
+expect {
+    a|40
+    b|20
+}
+
+test union-count-by-tag {
+    CREATE TYPE number AS UNION(i INT, f REAL);
+    CREATE TABLE tagged(id INT, val number) STRICT;
+    INSERT INTO tagged VALUES (1, union_value('i', 42));
+    INSERT INTO tagged VALUES (2, union_value('f', 3.14));
+    INSERT INTO tagged VALUES (3, union_value('i', 100));
+    INSERT INTO tagged VALUES (4, union_value('f', 2.5));
+    SELECT union_tag(val), COUNT(*) FROM tagged GROUP BY union_tag(val) ORDER BY union_tag(val);
+}
+expect {
+    f|2
+    i|2
+}
+
+# ============================================================================
+# Struct field NULL values inside struct
+# ============================================================================
+
+test struct-field-null-values {
+    CREATE TYPE point AS STRUCT(x INT, y INT);
+    CREATE TABLE t(id INT, pos point) STRICT;
+    INSERT INTO t VALUES (1, struct_pack(NULL, 20));
+    INSERT INTO t VALUES (2, struct_pack(10, NULL));
+    INSERT INTO t VALUES (3, struct_pack(NULL, NULL));
+    SELECT pos.x, pos.y FROM t ORDER BY id;
+}
+expect {
+    |20
+    10|
+    |
+}
+
+test struct-null-field-is-null {
+    CREATE TYPE point AS STRUCT(x INT, y INT);
+    CREATE TABLE t(id INT, pos point) STRICT;
+    INSERT INTO t VALUES (1, struct_pack(NULL, 20));
+    INSERT INTO t VALUES (2, struct_pack(10, NULL));
+    SELECT id FROM t WHERE pos.x IS NULL;
+}
+expect {
+    1
+}
+
+# ============================================================================
+# Single-field and many-field structs
+# ============================================================================
+
+test struct-single-field {
+    CREATE TYPE wrapper AS STRUCT(val INT);
+    CREATE TABLE t(id INT, data wrapper) STRICT;
+    INSERT INTO t VALUES (1, struct_pack(42));
+    SELECT data.val FROM t;
+}
+expect {
+    42
+}
+
+test struct-many-fields {
+    CREATE TYPE wide AS STRUCT(a INT, b INT, c INT, d INT, e INT, f INT, g INT, h INT, i INT, j INT);
+    CREATE TABLE t(id INT, data wide) STRICT;
+    INSERT INTO t VALUES (1, struct_pack(1, 2, 3, 4, 5, 6, 7, 8, 9, 10));
+    SELECT data.a, data.e, data.j FROM t;
+}
+expect {
+    1|5|10
+}
+
+# ============================================================================
+# Mixed types in struct
+# ============================================================================
+
+test struct-mixed-types {
+    CREATE TYPE record AS STRUCT(name TEXT, age INT, score REAL);
+    CREATE TABLE t(id INT, r record) STRICT;
+    INSERT INTO t VALUES (1, struct_pack('Alice', 30, 95.5));
+    SELECT r.name, r.age, r.score FROM t;
+}
+expect {
+    Alice|30|95.5
+}
+
+# ============================================================================
+# Struct/union in subqueries and CTEs
+# ============================================================================
+
+test struct-in-subquery {
+    CREATE TYPE point AS STRUCT(x INT, y INT);
+    CREATE TABLE t(id INT, pos point) STRICT;
+    INSERT INTO t VALUES (1, struct_pack(10, 20));
+    INSERT INTO t VALUES (2, struct_pack(30, 40));
+    SELECT sub.id, sub.px FROM (SELECT id, pos.x AS px FROM t) sub WHERE sub.px > 15;
+}
+expect {
+    2|30
+}
+
+test struct-in-cte {
+    CREATE TYPE point AS STRUCT(x INT, y INT);
+    CREATE TABLE t(id INT, pos point) STRICT;
+    INSERT INTO t VALUES (1, struct_pack(10, 20));
+    WITH pts AS (SELECT id, pos.x AS x, pos.y AS y FROM t)
+    SELECT id, x + y FROM pts;
+}
+expect {
+    1|30
+}
+
+# ============================================================================
+# Struct field in expressions
+# ============================================================================
+
+test struct-field-arithmetic {
+    CREATE TYPE point AS STRUCT(x INT, y INT);
+    CREATE TABLE t(id INT, pos point) STRICT;
+    INSERT INTO t VALUES (1, struct_pack(10, 20));
+    SELECT pos.x + pos.y, pos.x * 2 FROM t;
+}
+expect {
+    30|20
+}
+
+test struct-field-in-case {
+    CREATE TYPE point AS STRUCT(x INT, y INT);
+    CREATE TABLE t(id INT, pos point) STRICT;
+    INSERT INTO t VALUES (1, struct_pack(10, 20));
+    INSERT INTO t VALUES (2, struct_pack(-5, 40));
+    SELECT id, CASE WHEN pos.x > 0 THEN 'positive' ELSE 'negative' END FROM t ORDER BY id;
+}
+expect {
+    1|positive
+    2|negative
+}
+
+test struct-field-in-coalesce {
+    CREATE TYPE point AS STRUCT(x INT, y INT);
+    CREATE TABLE t(id INT, pos point) STRICT;
+    INSERT INTO t VALUES (1, NULL);
+    INSERT INTO t VALUES (2, struct_pack(10, 20));
+    SELECT id, COALESCE(pos.x, -1) FROM t ORDER BY id;
+}
+expect {
+    1|-1
+    2|10
+}
+
+test struct-pack-computed-args {
+    CREATE TYPE point AS STRUCT(x INT, y INT);
+    CREATE TABLE t(id INT, pos point) STRICT;
+    INSERT INTO t VALUES (1, struct_pack(1 + 2, 3 * 4));
+    SELECT pos.x, pos.y FROM t;
+}
+expect {
+    3|12
+}
+
+# ============================================================================
+# INSERT...SELECT with struct columns
+# ============================================================================
+
+test struct-insert-select {
+    CREATE TYPE point AS STRUCT(x INT, y INT);
+    CREATE TABLE t1(id INT, pos point) STRICT;
+    CREATE TABLE t2(id INT, pos point) STRICT;
+    INSERT INTO t1 VALUES (1, struct_pack(10, 20));
+    INSERT INTO t1 VALUES (2, struct_pack(30, 40));
+    INSERT INTO t2 SELECT * FROM t1;
+    SELECT id, pos.x, pos.y FROM t2 ORDER BY id;
+}
+expect {
+    1|10|20
+    2|30|40
+}
+
+# ============================================================================
+# DISTINCT on struct fields
+# ============================================================================
+
+test struct-distinct-field {
+    CREATE TYPE point AS STRUCT(x INT, y INT);
+    CREATE TABLE t(id INT, pos point) STRICT;
+    INSERT INTO t VALUES (1, struct_pack(10, 20));
+    INSERT INTO t VALUES (2, struct_pack(10, 40));
+    INSERT INTO t VALUES (3, struct_pack(30, 20));
+    SELECT DISTINCT pos.x FROM t ORDER BY pos.x;
+}
+expect {
+    10
+    30
+}
+
+# ============================================================================
+# Union tag case-sensitivity behavior
+# ============================================================================
+
+test union-extract-case-insensitive {
+    CREATE TYPE number AS UNION(i INT, f REAL);
+    CREATE TABLE tagged(id INT, val number) STRICT;
+    INSERT INTO tagged VALUES (1, union_value('i', 42));
+    SELECT union_extract(val, 'I') FROM tagged;
+}
+expect {
+    42
+}
+
+test union-tag-preserves-case {
+    CREATE TYPE number AS UNION(i INT, f REAL);
+    CREATE TABLE tagged(id INT, val number) STRICT;
+    INSERT INTO tagged VALUES (1, union_value('i', 42));
+    SELECT union_tag(val) FROM tagged;
+}
+expect {
+    i
+}
+
+# ============================================================================
+# Struct field in HAVING clause
+# ============================================================================
+
+test struct-field-in-having {
+    CREATE TYPE record AS STRUCT(category TEXT, value INT);
+    CREATE TABLE t(id INT, data record) STRICT;
+    INSERT INTO t VALUES (1, struct_pack('a', 10));
+    INSERT INTO t VALUES (2, struct_pack('b', 20));
+    INSERT INTO t VALUES (3, struct_pack('a', 30));
+    SELECT data.category, SUM(data.value) AS total FROM t GROUP BY data.category HAVING SUM(data.value) > 20 ORDER BY data.category;
+}
+expect {
+    a|40
+}
+
+# ============================================================================
+# CREATE TYPE IF NOT EXISTS
+# ============================================================================
+
+test struct-create-type-if-not-exists {
+    CREATE TYPE point AS STRUCT(x INT, y INT);
+    CREATE TYPE IF NOT EXISTS point AS STRUCT(a TEXT, b TEXT);
+    CREATE TABLE t(id INT, pos point) STRICT;
+    INSERT INTO t VALUES (1, struct_pack(10, 20));
+    SELECT pos.x FROM t;
+}
+expect {
+    10
+}
+
+# ============================================================================
+# Persistence round-trip
+# ============================================================================
+
+test struct-type-sql-roundtrip {
+    CREATE TYPE point AS STRUCT(x INT, y INT);
+    SELECT sql FROM sqlite_turso_types WHERE name = 'point';
+}
+expect {
+    CREATE TYPE point AS STRUCT(x INT, y INT)
+}
+
+# ============================================================================
+# Argument count validation
+# ============================================================================
+
+test union-tag-zero-args {
+    SELECT union_tag();
+}
+expect error {
+    union_tag\(\) requires exactly 1 argument
+}
+
+test union-tag-two-args {
+    SELECT union_tag(1, 2);
+}
+expect error {
+    union_tag\(\) requires exactly 1 argument
+}
+
+test union-value-one-arg {
+    SELECT union_value('i');
+}
+expect error {
+    union_value\(\) requires exactly 2 arguments
+}
+
+test union-value-three-args {
+    SELECT union_value('i', 42, 99);
+}
+expect error {
+    union_value\(\) requires exactly 2 arguments
+}
+
+test union-extract-one-arg {
+    CREATE TYPE number AS UNION(i INT, f REAL);
+    CREATE TABLE ue1(val number) STRICT;
+    INSERT INTO ue1 VALUES (union_value('i', 42));
+    SELECT union_extract(val) FROM ue1;
+}
+expect error {
+    union_extract\(\) requires exactly 2 arguments
+}
+
+test union-extract-zero-args {
+    SELECT union_extract();
+}
+expect error {
+    union_extract\(\) requires exactly 2 arguments
+}
+
+test union-extract-three-args {
+    CREATE TYPE number AS UNION(i INT, f REAL);
+    CREATE TABLE ue2(val number) STRICT;
+    INSERT INTO ue2 VALUES (union_value('i', 42));
+    SELECT union_extract(val, 'i', 'extra') FROM ue2;
+}
+expect error {
+    union_extract\(\) requires exactly 2 arguments
+}
+
+# ============================================================================
+# Boundary conditions
+# ============================================================================
+
+test struct-nesting-depth-limit {
+    CREATE TYPE deeply_nested AS STRUCT(a STRUCT(b STRUCT(c STRUCT(d STRUCT(e STRUCT(f STRUCT(g STRUCT(h STRUCT(i STRUCT(j STRUCT(k STRUCT(l STRUCT(m STRUCT(n STRUCT(o STRUCT(p STRUCT(q STRUCT(r STRUCT(s STRUCT(t STRUCT(u STRUCT(v STRUCT(w STRUCT(x STRUCT(y STRUCT(z STRUCT(a1 STRUCT(b1 STRUCT(c1 STRUCT(d1 STRUCT(e1 STRUCT(f1 STRUCT(g1 INT))))))))))))))))))))))))))))))))))));
+}
+expect error {
+    nesting depth exceeds maximum
+}
+
+test struct-inline-type-rejected {
+    CREATE TABLE t(s STRUCT(x INT, y INT)) STRICT;
+}
+expect error {
+    inline STRUCT/UNION column types are not supported
+}
+
+test union-create-if-not-exists {
+    CREATE TYPE platform AS UNION(telegram INT, slack TEXT);
+    CREATE TYPE IF NOT EXISTS platform AS UNION(telegram INT, slack TEXT);
+    SELECT sql FROM sqlite_turso_types WHERE name = 'platform';
+}
+expect {
+    CREATE TYPE platform AS UNION(telegram INT, slack TEXT)
+}
+
+# ============================================================================
+# Bug #1: Expression index with union functions (union_tag / union_extract)
+# ============================================================================
+
+test expr-index-union-tag-filter {
+    CREATE TYPE msg AS UNION(a INT, b TEXT);
+    CREATE TABLE t(id INT, v msg) STRICT;
+    CREATE INDEX ix_tag ON t(union_tag(v));
+    INSERT INTO t VALUES (1, union_value('a', 42));
+    INSERT INTO t VALUES (2, union_value('b', 'hello'));
+    SELECT id FROM t WHERE union_tag(v) = 'a';
+}
+expect {
+    1
+}
+
+test expr-index-union-tag-preexisting {
+    CREATE TYPE msg AS UNION(a INT, b TEXT);
+    CREATE TABLE t(id INT, v msg) STRICT;
+    INSERT INTO t VALUES (1, union_value('a', 10));
+    CREATE INDEX ix_tag ON t(union_tag(v));
+    INSERT INTO t VALUES (2, union_value('b', 'hi'));
+    INSERT INTO t VALUES (3, union_value('a', 20));
+    SELECT id FROM t WHERE union_tag(v) = 'a' ORDER BY id;
+}
+expect {
+    1
+    3
+}
+
+test expr-index-union-extract {
+    CREATE TYPE msg AS UNION(a INT, b TEXT);
+    CREATE TABLE t(id INT, v msg) STRICT;
+    CREATE INDEX ix_ext ON t(union_extract(v, 'a'));
+    INSERT INTO t VALUES (1, union_value('a', 42));
+    INSERT INTO t VALUES (2, union_value('a', 100));
+    INSERT INTO t VALUES (3, union_value('b', 'x'));
+    SELECT id FROM t WHERE union_extract(v, 'a') = 42;
+}
+expect {
+    1
+}
+
+# ============================================================================
+# Feature #2: struct_extract() scalar function
+# ============================================================================
+
+test struct-extract-basic {
+    CREATE TYPE point AS STRUCT(x INT, y INT);
+    CREATE TABLE t(id INT, pos point) STRICT;
+    INSERT INTO t VALUES (1, struct_pack(10, 20));
+    INSERT INTO t VALUES (2, struct_pack(30, 40));
+    SELECT struct_extract(pos, 'x'), struct_extract(pos, 'y') FROM t ORDER BY id;
+}
+expect {
+    10|20
+    30|40
+}
+
+test struct-extract-with-union-extract {
+    CREATE TYPE telegram_msg AS STRUCT(chat_id INT, text TEXT);
+    CREATE TYPE platform AS UNION(telegram telegram_msg, slack TEXT);
+    CREATE TABLE msgs(id INT, data platform) STRICT;
+    INSERT INTO msgs VALUES (1, union_value('telegram', struct_pack(100, 'hello')));
+    INSERT INTO msgs VALUES (2, union_value('slack', 'world'));
+    SELECT struct_extract(union_extract(data, 'telegram'), 'chat_id') FROM msgs WHERE id = 1;
+}
+expect {
+    100
+}
+
+test struct-extract-null-propagation {
+    CREATE TYPE point AS STRUCT(x INT, y INT);
+    CREATE TABLE t(id INT, pos point) STRICT;
+    INSERT INTO t VALUES (1, NULL);
+    SELECT struct_extract(pos, 'x'), struct_extract(pos, 'y') FROM t;
+}
+expect {
+    |
+}
+
+test struct-extract-error-bad-field {
+    CREATE TYPE point AS STRUCT(x INT, y INT);
+    CREATE TABLE t(id INT, pos point) STRICT;
+    SELECT struct_extract(pos, 'z') FROM t;
+}
+expect error {
+    cannot resolve struct field 'z' for struct_extract
+}
+
+test struct-extract-error-not-string {
+    CREATE TYPE point AS STRUCT(x INT, y INT);
+    CREATE TABLE t(id INT, pos point) STRICT;
+    SELECT struct_extract(pos, 123) FROM t;
+}
+expect error {
+    second argument must be a string literal
+}
+
+# ============================================================================
+# Feature #2: Dot notation for union-struct variants (col.variant.field)
+# ============================================================================
+
+test union-struct-variant-dot-access {
+    CREATE TYPE telegram_msg AS STRUCT(chat_id INT, text TEXT);
+    CREATE TYPE platform AS UNION(telegram telegram_msg, slack TEXT);
+    CREATE TABLE msgs(id INT, data platform) STRICT;
+    INSERT INTO msgs VALUES (1, union_value('telegram', struct_pack(100, 'hello')));
+    INSERT INTO msgs VALUES (2, union_value('telegram', struct_pack(200, 'world')));
+    SELECT data.telegram.chat_id, data.telegram.text FROM msgs ORDER BY id;
+}
+expect {
+    100|hello
+    200|world
+}
+
+test union-struct-variant-where {
+    CREATE TYPE telegram_msg AS STRUCT(chat_id INT, text TEXT);
+    CREATE TYPE platform AS UNION(telegram telegram_msg, slack TEXT);
+    CREATE TABLE msgs(id INT, data platform) STRICT;
+    INSERT INTO msgs VALUES (1, union_value('telegram', struct_pack(100, 'hello')));
+    INSERT INTO msgs VALUES (2, union_value('telegram', struct_pack(200, 'world')));
+    INSERT INTO msgs VALUES (3, union_value('slack', 'general'));
+    SELECT id FROM msgs WHERE data.telegram.chat_id = 200;
+}
+expect {
+    2
+}
+
+# ============================================================================
+# Feature #3: Expression indexes on struct/union fields
+# ============================================================================
+
+test expr-index-struct-extract-union-extract {
+    CREATE TYPE telegram_msg AS STRUCT(chat_id INT, text TEXT);
+    CREATE TYPE platform AS UNION(telegram telegram_msg, slack TEXT);
+    CREATE TABLE msgs(id INT, data platform) STRICT;
+    CREATE INDEX ix_chat ON msgs(struct_extract(union_extract(data, 'telegram'), 'chat_id'));
+    INSERT INTO msgs VALUES (1, union_value('telegram', struct_pack(100, 'hello')));
+    INSERT INTO msgs VALUES (2, union_value('telegram', struct_pack(200, 'world')));
+    INSERT INTO msgs VALUES (3, union_value('slack', 'general'));
+    SELECT id FROM msgs WHERE struct_extract(union_extract(data, 'telegram'), 'chat_id') = 100;
+}
+expect {
+    1
+}
+
+test expr-index-struct-field {
+    CREATE TYPE point AS STRUCT(x INT, y INT);
+    CREATE TABLE t(id INT, pos point) STRICT;
+    CREATE INDEX ix_x ON t(struct_extract(pos, 'x'));
+    INSERT INTO t VALUES (1, struct_pack(10, 20));
+    INSERT INTO t VALUES (2, struct_pack(30, 40));
+    SELECT id FROM t WHERE struct_extract(pos, 'x') = 30;
+}
+expect {
+    2
+}
+
+test expr-index-deep-chain {
+    CREATE TYPE inner_s AS STRUCT(val INT);
+    CREATE TYPE outer_s AS STRUCT(sub inner_s);
+    CREATE TABLE t(id INT, data outer_s) STRICT;
+    CREATE INDEX ix_val ON t(struct_extract(struct_extract(data, 'sub'), 'val'));
+    INSERT INTO t VALUES (1, struct_pack(struct_pack(10)));
+    INSERT INTO t VALUES (2, struct_pack(struct_pack(20)));
+    SELECT id FROM t WHERE struct_extract(struct_extract(data, 'sub'), 'val') = 20;
+}
+expect {
+    2
+}
+
+# ============================================================================
+# Deep chains: nested dot access and function composition
+# ============================================================================
+
+test dot-chain-struct-in-struct {
+    CREATE TYPE inner_s AS STRUCT(a INT, b INT);
+    CREATE TYPE outer_s AS STRUCT(sub inner_s, c INT);
+    CREATE TABLE t(id INT, data outer_s) STRICT;
+    INSERT INTO t VALUES (1, struct_pack(struct_pack(10, 20), 30));
+    SELECT data.sub.a, data.sub.b, data.c FROM t;
+}
+expect {
+    10|20|30
+}
+
+test deep-chain-function-composition {
+    CREATE TYPE inner_s AS STRUCT(val INT);
+    CREATE TYPE mid_s AS STRUCT(sub inner_s);
+    CREATE TABLE t(id INT, data mid_s) STRICT;
+    INSERT INTO t VALUES (1, struct_pack(struct_pack(42)));
+    SELECT struct_extract(struct_extract(data, 'sub'), 'val') FROM t;
+}
+expect {
+    42
+}
+
+test dot-chain-union-struct-function {
+    CREATE TYPE telegram_msg AS STRUCT(chat_id INT, text TEXT);
+    CREATE TYPE platform AS UNION(telegram telegram_msg, slack TEXT);
+    CREATE TABLE msgs(id INT, data platform) STRICT;
+    INSERT INTO msgs VALUES (1, union_value('telegram', struct_pack(100, 'hello')));
+    SELECT struct_extract(union_extract(data, 'telegram'), 'text') FROM msgs;
+}
+expect {
+    hello
+}
+
+# ============================================================================
+# Expression index maintenance for STRUCT/UNION during UPDATE
+# ============================================================================
+
+test expr-idx-union-tag-update {
+    CREATE TYPE s1 AS STRUCT(f INT);
+    CREATE TYPE m1 AS UNION(a s1, b s1);
+    CREATE TABLE t_tag(id INT PRIMARY KEY, v m1) STRICT;
+    CREATE INDEX ix_tag ON t_tag(union_tag(v));
+    INSERT INTO t_tag VALUES (1, union_value('a', struct_pack(1)));
+    SELECT COUNT(*) FROM t_tag WHERE union_tag(v) = 'a';
+    UPDATE t_tag SET v = union_value('a', struct_pack(99)) WHERE id = 1;
+    SELECT COUNT(*) FROM t_tag WHERE union_tag(v) = 'a';
+}
+expect {
+    1
+    1
+}
+
+test expr-idx-struct-extract-union-extract-update {
+    CREATE TYPE s2 AS STRUCT(f INT);
+    CREATE TYPE m2 AS UNION(a s2, b s2);
+    CREATE TABLE t_ext(id INT PRIMARY KEY, v m2) STRICT;
+    CREATE INDEX ix_ext ON t_ext(struct_extract(union_extract(v, 'a'), 'f'));
+    INSERT INTO t_ext VALUES (1, union_value('a', struct_pack(1)));
+    UPDATE t_ext SET v = union_value('a', struct_pack(99)) WHERE id = 1;
+    SELECT struct_extract(union_extract(v, 'a'), 'f') FROM t_ext WHERE id = 1;
+}
+expect {
+    99
+}
+
+test expr-idx-union-tag-update-changes-variant {
+    CREATE TYPE s3 AS STRUCT(f INT);
+    CREATE TYPE m3 AS UNION(a s3, b s3);
+    CREATE TABLE t_var(id INT PRIMARY KEY, v m3) STRICT;
+    CREATE INDEX ix_var ON t_var(union_tag(v));
+    INSERT INTO t_var VALUES (1, union_value('a', struct_pack(1)));
+    SELECT COUNT(*) FROM t_var WHERE union_tag(v) = 'a';
+    UPDATE t_var SET v = union_value('b', struct_pack(2)) WHERE id = 1;
+    SELECT COUNT(*) FROM t_var WHERE union_tag(v) = 'a';
+    SELECT COUNT(*) FROM t_var WHERE union_tag(v) = 'b';
+}
+expect {
+    1
+    0
+    1
+}
+
+# ============================================================================
+# Expression index maintenance for STRUCT/UNION during UPSERT
+# ============================================================================
+
+test expr-idx-union-tag-upsert {
+    CREATE TYPE s4 AS STRUCT(f INT);
+    CREATE TYPE m4 AS UNION(a s4, b s4);
+    CREATE TABLE t_ups(id INT PRIMARY KEY, v m4) STRICT;
+    CREATE INDEX ix_ups ON t_ups(union_tag(v));
+    INSERT INTO t_ups VALUES (1, union_value('a', struct_pack(1)));
+    SELECT COUNT(*) FROM t_ups WHERE union_tag(v) = 'a';
+    INSERT INTO t_ups VALUES (1, union_value('a', struct_pack(99)))
+        ON CONFLICT(id) DO UPDATE SET v = excluded.v;
+    SELECT COUNT(*) FROM t_ups WHERE union_tag(v) = 'a';
+    SELECT struct_extract(union_extract(v, 'a'), 'f') FROM t_ups WHERE id = 1;
+}
+expect {
+    1
+    1
+    99
+}
+
+test expr-idx-union-tag-upsert-changes-variant {
+    CREATE TYPE s5 AS STRUCT(f INT);
+    CREATE TYPE m5 AS UNION(a s5, b s5);
+    CREATE TABLE t_ups2(id INT PRIMARY KEY, v m5) STRICT;
+    CREATE INDEX ix_ups2 ON t_ups2(union_tag(v));
+    INSERT INTO t_ups2 VALUES (1, union_value('a', struct_pack(1)));
+    SELECT COUNT(*) FROM t_ups2 WHERE union_tag(v) = 'a';
+    INSERT INTO t_ups2 VALUES (1, union_value('b', struct_pack(2)))
+        ON CONFLICT(id) DO UPDATE SET v = excluded.v;
+    SELECT COUNT(*) FROM t_ups2 WHERE union_tag(v) = 'a';
+    SELECT COUNT(*) FROM t_ups2 WHERE union_tag(v) = 'b';
+}
+expect {
+    1
+    0
+    1
+}
+
+test expr-idx-struct-extract-upsert {
+    CREATE TYPE s6 AS STRUCT(f INT);
+    CREATE TYPE m6 AS UNION(a s6, b s6);
+    CREATE TABLE t_ups3(id INT PRIMARY KEY, v m6) STRICT;
+    CREATE INDEX ix_ups3 ON t_ups3(struct_extract(union_extract(v, 'a'), 'f'));
+    INSERT INTO t_ups3 VALUES (1, union_value('a', struct_pack(10)));
+    SELECT struct_extract(union_extract(v, 'a'), 'f') FROM t_ups3 WHERE id = 1;
+    INSERT INTO t_ups3 VALUES (1, union_value('a', struct_pack(20)))
+        ON CONFLICT(id) DO UPDATE SET v = excluded.v;
+    SELECT struct_extract(union_extract(v, 'a'), 'f') FROM t_ups3 WHERE id = 1;
+}
+expect {
+    10
+    20
+}
+
+# ============================================================================
+# Regression: to_sql() must quote type names in STRUCT/UNION field definitions
+# so that the stored SQL can be re-parsed during schema loading.
+# ============================================================================
+
+test to-sql-quotes-type-names {
+    CREATE TYPE inner_t AS STRUCT(v INT);
+    CREATE TYPE outer_s AS STRUCT(f inner_t);
+    CREATE TYPE outer_u AS UNION(a inner_t, b INT);
+    CREATE TABLE t_quote(id INT PRIMARY KEY, s outer_s, u outer_u) STRICT;
+    INSERT INTO t_quote VALUES (1, struct_pack(struct_pack(42)), union_value('a', struct_pack(99)));
+    SELECT struct_extract(struct_extract(s, 'f'), 'v') FROM t_quote WHERE id = 1;
+    SELECT struct_extract(union_extract(u, 'a'), 'v') FROM t_quote WHERE id = 1;
+}
+expect {
+    42
+    99
+}
+
+# ============================================================================
+# Regression: struct_extract(union_extract(NEW.col, ...), ...) in trigger body
+# fails with "cannot resolve struct field" because the trigger compiler does
+# not propagate type information for nested extract expressions.
+# https://github.com/tursodatabase/turso/pull/6369
+# ============================================================================
+
+test trigger-struct-extract-union-extract {
+    CREATE TYPE payload AS STRUCT(name TEXT);
+    CREATE TYPE variant AS UNION(user payload);
+    CREATE TABLE src(id INTEGER PRIMARY KEY, data variant NOT NULL) STRICT;
+    CREATE TABLE sink(id INTEGER PRIMARY KEY, name TEXT NOT NULL) STRICT;
+    CREATE TRIGGER src_ai AFTER INSERT ON src BEGIN
+        INSERT INTO sink(id, name) VALUES (
+            NEW.id,
+            struct_extract(union_extract(NEW.data, 'user'), 'name')
+        );
+    END;
+    INSERT INTO src(id, data) VALUES (1, union_value('user', struct_pack('alice')));
+    INSERT INTO src(id, data) VALUES (2, union_value('user', struct_pack('bob')));
+    SELECT id, name FROM sink ORDER BY id;
+}
+expect {
+    1|alice
+    2|bob
+}
+
+# ============================================================================
+# Multiple union columns in one table
+# ============================================================================
+
+# Two different union types on the same table — INSERT must resolve each
+# union_value() against the correct column's type, not a stale global.
+test multi-union-column-insert-select {
+    CREATE TYPE direction AS UNION(north INTEGER, south INTEGER);
+    CREATE TYPE color AS UNION(red TEXT, blue TEXT);
+    CREATE TABLE t_multi(id INT PRIMARY KEY, dir direction, col color) STRICT;
+    INSERT INTO t_multi VALUES (1, union_value('north', 10), union_value('red', 'crimson'));
+    INSERT INTO t_multi VALUES (2, union_value('south', 20), union_value('blue', 'navy'));
+    SELECT id, union_tag(dir), union_extract(dir, 'north'), union_extract(dir, 'south'),
+           union_tag(col), union_extract(col, 'red'), union_extract(col, 'blue')
+    FROM t_multi ORDER BY id;
+}
+expect {
+    1|north|10||red|crimson|
+    2|south||20|blue||navy
+}
+
+test multi-union-column-update {
+    CREATE TYPE direction AS UNION(north INTEGER, south INTEGER);
+    CREATE TYPE color AS UNION(red TEXT, blue TEXT);
+    CREATE TABLE t_multi(id INT PRIMARY KEY, dir direction, col color) STRICT;
+    INSERT INTO t_multi VALUES (1, union_value('north', 10), union_value('red', 'crimson'));
+    UPDATE t_multi SET dir = union_value('south', 99), col = union_value('blue', 'sky') WHERE id = 1;
+    SELECT id, union_tag(dir), union_extract(dir, 'south'),
+           union_tag(col), union_extract(col, 'blue')
+    FROM t_multi;
+}
+expect {
+    1|south|99|blue|sky
+}
+
+test multi-union-column-upsert {
+    CREATE TYPE direction AS UNION(north INTEGER, south INTEGER);
+    CREATE TYPE color AS UNION(red TEXT, blue TEXT);
+    CREATE TABLE t_multi(id INT PRIMARY KEY, dir direction, col color) STRICT;
+    INSERT INTO t_multi VALUES (1, union_value('north', 10), union_value('red', 'crimson'));
+    INSERT INTO t_multi VALUES (1, union_value('south', 50), union_value('blue', 'teal'))
+        ON CONFLICT(id) DO UPDATE SET dir = excluded.dir, col = excluded.col;
+    SELECT id, union_tag(dir), union_extract(dir, 'south'),
+           union_tag(col), union_extract(col, 'blue')
+    FROM t_multi;
+}
+expect {
+    1|south|50|blue|teal
+}
+
+# Verify tag from one union can't accidentally resolve against the other
+test multi-union-column-wrong-tag-rejected {
+    CREATE TYPE direction AS UNION(north INTEGER, south INTEGER);
+    CREATE TYPE color AS UNION(red TEXT, blue TEXT);
+    CREATE TABLE t_multi(id INT PRIMARY KEY, dir direction, col color) STRICT;
+    INSERT INTO t_multi VALUES (1, union_value('red', 10), union_value('red', 'x'));
+}
+expect error {
+    unknown variant 'red' in union type 'direction'
+}
+
+# ============================================================================
+# Nested UNION (union-in-union)
+# ============================================================================
+
+# A union variant whose type is itself a union type.
+# The inner union_value() must resolve its tag against the INNER union,
+# not the outer one.
+test nested-union-insert-select {
+    CREATE TYPE inner_u AS UNION(a INTEGER, b TEXT);
+    CREATE TYPE outer_u AS UNION(x inner_u, y REAL);
+    CREATE TABLE t_nested(id INT PRIMARY KEY, val outer_u) STRICT;
+    INSERT INTO t_nested VALUES (1, union_value('x', union_value('a', 42)));
+    INSERT INTO t_nested VALUES (2, union_value('y', 3.14));
+    INSERT INTO t_nested VALUES (3, union_value('x', union_value('b', 'hello')));
+    SELECT id, union_tag(val) FROM t_nested ORDER BY id;
+}
+expect {
+    1|x
+    2|y
+    3|x
+}
+
+test nested-union-update {
+    CREATE TYPE inner_u AS UNION(a INTEGER, b TEXT);
+    CREATE TYPE outer_u AS UNION(x inner_u, y REAL);
+    CREATE TABLE t_nested(id INT PRIMARY KEY, val outer_u) STRICT;
+    INSERT INTO t_nested VALUES (1, union_value('y', 1.5));
+    UPDATE t_nested SET val = union_value('x', union_value('a', 99)) WHERE id = 1;
+    SELECT id, union_tag(val) FROM t_nested;
+}
+expect {
+    1|x
+}

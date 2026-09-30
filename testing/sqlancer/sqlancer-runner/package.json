@@ -1,0 +1,14 @@
+{
+	"name": "sqlancer-runner",
+	"description": "A script to run SQLancer in a docker container in a loop and post issues to GitHub when failures are detected",
+	"module": "docker-entrypoint.sqlancer.ts",
+	"type": "module",
+	"dependencies": {
+		"octokit": "4.1.2"
+	},
+	"devDependencies": {
+		"@types/node": "^22.0.0",
+		"bun-types": "^1.3.5",
+		"typescript": "5.7.3"
+	}
+}

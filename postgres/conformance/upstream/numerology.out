@@ -1,0 +1,483 @@
+--
+-- NUMEROLOGY
+-- Test various combinations of numeric types and functions.
+--
+--
+-- numeric literals
+--
+SELECT 0b100101;
+ ?column? 
+----------
+       37
+(1 row)
+
+SELECT 0o273;
+ ?column? 
+----------
+      187
+(1 row)
+
+SELECT 0x42F;
+ ?column? 
+----------
+     1071
+(1 row)
+
+-- cases near int4 overflow
+SELECT 0b1111111111111111111111111111111;
+  ?column?  
+------------
+ 2147483647
+(1 row)
+
+SELECT 0b10000000000000000000000000000000;
+  ?column?  
+------------
+ 2147483648
+(1 row)
+
+SELECT 0o17777777777;
+  ?column?  
+------------
+ 2147483647
+(1 row)
+
+SELECT 0o20000000000;
+  ?column?  
+------------
+ 2147483648
+(1 row)
+
+SELECT 0x7FFFFFFF;
+  ?column?  
+------------
+ 2147483647
+(1 row)
+
+SELECT 0x80000000;
+  ?column?  
+------------
+ 2147483648
+(1 row)
+
+SELECT -0b10000000000000000000000000000000;
+  ?column?   
+-------------
+ -2147483648
+(1 row)
+
+SELECT -0b10000000000000000000000000000001;
+  ?column?   
+-------------
+ -2147483649
+(1 row)
+
+SELECT -0o20000000000;
+  ?column?   
+-------------
+ -2147483648
+(1 row)
+
+SELECT -0o20000000001;
+  ?column?   
+-------------
+ -2147483649
+(1 row)
+
+SELECT -0x80000000;
+  ?column?   
+-------------
+ -2147483648
+(1 row)
+
+SELECT -0x80000001;
+  ?column?   
+-------------
+ -2147483649
+(1 row)
+
+-- cases near int8 overflow
+SELECT 0b111111111111111111111111111111111111111111111111111111111111111;
+      ?column?       
+---------------------
+ 9223372036854775807
+(1 row)
+
+SELECT 0b1000000000000000000000000000000000000000000000000000000000000000;
+      ?column?       
+---------------------
+ 9223372036854775808
+(1 row)
+
+SELECT 0o777777777777777777777;
+      ?column?       
+---------------------
+ 9223372036854775807
+(1 row)
+
+SELECT 0o1000000000000000000000;
+      ?column?       
+---------------------
+ 9223372036854775808
+(1 row)
+
+SELECT 0x7FFFFFFFFFFFFFFF;
+      ?column?       
+---------------------
+ 9223372036854775807
+(1 row)
+
+SELECT 0x8000000000000000;
+      ?column?       
+---------------------
+ 9223372036854775808
+(1 row)
+
+SELECT -0b1000000000000000000000000000000000000000000000000000000000000000;
+       ?column?       
+----------------------
+ -9223372036854775808
+(1 row)
+
+SELECT -0b1000000000000000000000000000000000000000000000000000000000000001;
+       ?column?       
+----------------------
+ -9223372036854775809
+(1 row)
+
+SELECT -0o1000000000000000000000;
+       ?column?       
+----------------------
+ -9223372036854775808
+(1 row)
+
+SELECT -0o1000000000000000000001;
+       ?column?       
+----------------------
+ -9223372036854775809
+(1 row)
+
+SELECT -0x8000000000000000;
+       ?column?       
+----------------------
+ -9223372036854775808
+(1 row)
+
+SELECT -0x8000000000000001;
+       ?column?       
+----------------------
+ -9223372036854775809
+(1 row)
+
+-- error cases
+SELECT 123abc;
+ERROR:  trailing junk after numeric literal at or near "123abc"
+LINE 1: SELECT 123abc;
+               ^
+SELECT 0x0o;
+ERROR:  trailing junk after numeric literal at or near "0x0o"
+LINE 1: SELECT 0x0o;
+               ^
+SELECT 0.a;
+ERROR:  trailing junk after numeric literal at or near "0.a"
+LINE 1: SELECT 0.a;
+               ^
+SELECT 0.0a;
+ERROR:  trailing junk after numeric literal at or near "0.0a"
+LINE 1: SELECT 0.0a;
+               ^
+SELECT .0a;
+ERROR:  trailing junk after numeric literal at or near ".0a"
+LINE 1: SELECT .0a;
+               ^
+SELECT 0.0e1a;
+ERROR:  trailing junk after numeric literal at or near "0.0e1a"
+LINE 1: SELECT 0.0e1a;
+               ^
+SELECT 0.0e;
+ERROR:  trailing junk after numeric literal at or near "0.0e"
+LINE 1: SELECT 0.0e;
+               ^
+SELECT 0.0e+a;
+ERROR:  trailing junk after numeric literal at or near "0.0e+"
+LINE 1: SELECT 0.0e+a;
+               ^
+PREPARE p1 AS SELECT $1a;
+ERROR:  trailing junk after parameter at or near "$1a"
+LINE 1: PREPARE p1 AS SELECT $1a;
+                             ^
+PREPARE p1 AS SELECT $2147483648;
+ERROR:  parameter number too large at or near "$2147483648"
+LINE 1: PREPARE p1 AS SELECT $2147483648;
+                             ^
+SELECT 0b;
+ERROR:  invalid binary integer at or near "0b"
+LINE 1: SELECT 0b;
+               ^
+SELECT 1b;
+ERROR:  trailing junk after numeric literal at or near "1b"
+LINE 1: SELECT 1b;
+               ^
+SELECT 0b0x;
+ERROR:  trailing junk after numeric literal at or near "0b0x"
+LINE 1: SELECT 0b0x;
+               ^
+SELECT 0o;
+ERROR:  invalid octal integer at or near "0o"
+LINE 1: SELECT 0o;
+               ^
+SELECT 1o;
+ERROR:  trailing junk after numeric literal at or near "1o"
+LINE 1: SELECT 1o;
+               ^
+SELECT 0o0x;
+ERROR:  trailing junk after numeric literal at or near "0o0x"
+LINE 1: SELECT 0o0x;
+               ^
+SELECT 0x;
+ERROR:  invalid hexadecimal integer at or near "0x"
+LINE 1: SELECT 0x;
+               ^
+SELECT 1x;
+ERROR:  trailing junk after numeric literal at or near "1x"
+LINE 1: SELECT 1x;
+               ^
+SELECT 0x0y;
+ERROR:  trailing junk after numeric literal at or near "0x0y"
+LINE 1: SELECT 0x0y;
+               ^
+-- underscores
+SELECT 1_000_000;
+ ?column? 
+----------
+  1000000
+(1 row)
+
+SELECT 1_2_3;
+ ?column? 
+----------
+      123
+(1 row)
+
+SELECT 0x1EEE_FFFF;
+ ?column?  
+-----------
+ 518979583
+(1 row)
+
+SELECT 0o2_73;
+ ?column? 
+----------
+      187
+(1 row)
+
+SELECT 0b_10_0101;
+ ?column? 
+----------
+       37
+(1 row)
+
+SELECT 1_000.000_005;
+  ?column?   
+-------------
+ 1000.000005
+(1 row)
+
+SELECT 1_000.;
+ ?column? 
+----------
+     1000
+(1 row)
+
+SELECT .000_005;
+ ?column? 
+----------
+ 0.000005
+(1 row)
+
+SELECT 1_000.5e0_1;
+ ?column? 
+----------
+    10005
+(1 row)
+
+DO $$
+DECLARE
+  i int;
+BEGIN
+  FOR i IN 1_001..1_003 LOOP
+    RAISE NOTICE 'i = %', i;
+  END LOOP;
+END $$;
+NOTICE:  i = 1001
+NOTICE:  i = 1002
+NOTICE:  i = 1003
+-- error cases
+SELECT _100;
+ERROR:  column "_100" does not exist
+LINE 1: SELECT _100;
+               ^
+SELECT 100_;
+ERROR:  trailing junk after numeric literal at or near "100_"
+LINE 1: SELECT 100_;
+               ^
+SELECT 100__000;
+ERROR:  trailing junk after numeric literal at or near "100__000"
+LINE 1: SELECT 100__000;
+               ^
+SELECT _1_000.5;
+ERROR:  syntax error at or near ".5"
+LINE 1: SELECT _1_000.5;
+                     ^
+SELECT 1_000_.5;
+ERROR:  trailing junk after numeric literal at or near "1_000_"
+LINE 1: SELECT 1_000_.5;
+               ^
+SELECT 1_000._5;
+ERROR:  trailing junk after numeric literal at or near "1_000._5"
+LINE 1: SELECT 1_000._5;
+               ^
+SELECT 1_000.5_;
+ERROR:  trailing junk after numeric literal at or near "1_000.5_"
+LINE 1: SELECT 1_000.5_;
+               ^
+SELECT 1_000.5e_1;
+ERROR:  trailing junk after numeric literal at or near "1_000.5e_1"
+LINE 1: SELECT 1_000.5e_1;
+               ^
+PREPARE p1 AS SELECT $0_1;
+ERROR:  trailing junk after parameter at or near "$0_1"
+LINE 1: PREPARE p1 AS SELECT $0_1;
+                             ^
+--
+-- Test implicit type conversions
+-- This fails for Postgres v6.1 (and earlier?)
+--  so let's try explicit conversions for now - tgl 97/05/07
+--
+CREATE TABLE TEMP_FLOAT (f1 FLOAT8);
+INSERT INTO TEMP_FLOAT (f1)
+  SELECT float8(f1) FROM INT4_TBL;
+INSERT INTO TEMP_FLOAT (f1)
+  SELECT float8(f1) FROM INT2_TBL;
+SELECT f1 FROM TEMP_FLOAT
+  ORDER BY f1;
+     f1      
+-------------
+ -2147483647
+     -123456
+      -32767
+       -1234
+           0
+           0
+        1234
+       32767
+      123456
+  2147483647
+(10 rows)
+
+-- int4
+CREATE TABLE TEMP_INT4 (f1 INT4);
+INSERT INTO TEMP_INT4 (f1)
+  SELECT int4(f1) FROM FLOAT8_TBL
+  WHERE (f1 > -2147483647) AND (f1 < 2147483647);
+INSERT INTO TEMP_INT4 (f1)
+  SELECT int4(f1) FROM INT2_TBL;
+SELECT f1 FROM TEMP_INT4
+  ORDER BY f1;
+   f1   
+--------
+ -32767
+  -1234
+  -1004
+    -35
+      0
+      0
+      0
+   1234
+  32767
+(9 rows)
+
+-- int2
+CREATE TABLE TEMP_INT2 (f1 INT2);
+INSERT INTO TEMP_INT2 (f1)
+  SELECT int2(f1) FROM FLOAT8_TBL
+  WHERE (f1 >= -32767) AND (f1 <= 32767);
+INSERT INTO TEMP_INT2 (f1)
+  SELECT int2(f1) FROM INT4_TBL
+  WHERE (f1 >= -32767) AND (f1 <= 32767);
+SELECT f1 FROM TEMP_INT2
+  ORDER BY f1;
+  f1   
+-------
+ -1004
+   -35
+     0
+     0
+     0
+(5 rows)
+
+--
+-- Group-by combinations
+--
+CREATE TABLE TEMP_GROUP (f1 INT4, f2 INT4, f3 FLOAT8);
+INSERT INTO TEMP_GROUP
+  SELECT 1, (- i.f1), (- f.f1)
+  FROM INT4_TBL i, FLOAT8_TBL f;
+INSERT INTO TEMP_GROUP
+  SELECT 2, i.f1, f.f1
+  FROM INT4_TBL i, FLOAT8_TBL f;
+SELECT DISTINCT f1 AS two FROM TEMP_GROUP ORDER BY 1;
+ two 
+-----
+   1
+   2
+(2 rows)
+
+SELECT f1 AS two, max(f3) AS max_float, min(f3) as min_float
+  FROM TEMP_GROUP
+  GROUP BY f1
+  ORDER BY two, max_float, min_float;
+ two |      max_float       |       min_float       
+-----+----------------------+-----------------------
+   1 | 1.2345678901234e+200 |                    -0
+   2 |                    0 | -1.2345678901234e+200
+(2 rows)
+
+-- GROUP BY a result column name is not legal per SQL92, but we accept it
+-- anyway (if the name is not the name of any column exposed by FROM).
+SELECT f1 AS two, max(f3) AS max_float, min(f3) AS min_float
+  FROM TEMP_GROUP
+  GROUP BY two
+  ORDER BY two, max_float, min_float;
+ two |      max_float       |       min_float       
+-----+----------------------+-----------------------
+   1 | 1.2345678901234e+200 |                    -0
+   2 |                    0 | -1.2345678901234e+200
+(2 rows)
+
+SELECT f1 AS two, (max(f3) + 1) AS max_plus_1, (min(f3) - 1) AS min_minus_1
+  FROM TEMP_GROUP
+  GROUP BY f1
+  ORDER BY two, min_minus_1;
+ two |      max_plus_1      |      min_minus_1      
+-----+----------------------+-----------------------
+   1 | 1.2345678901234e+200 |                    -1
+   2 |                    1 | -1.2345678901234e+200
+(2 rows)
+
+SELECT f1 AS two,
+       max(f2) + min(f2) AS max_plus_min,
+       min(f3) - 1 AS min_minus_1
+  FROM TEMP_GROUP
+  GROUP BY f1
+  ORDER BY two, min_minus_1;
+ two | max_plus_min |      min_minus_1      
+-----+--------------+-----------------------
+   1 |            0 |                    -1
+   2 |            0 | -1.2345678901234e+200
+(2 rows)
+
+DROP TABLE TEMP_INT2;
+DROP TABLE TEMP_INT4;
+DROP TABLE TEMP_FLOAT;
+DROP TABLE TEMP_GROUP;

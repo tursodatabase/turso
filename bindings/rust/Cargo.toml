@@ -1,0 +1,68 @@
+# Copyright 2025 the Turso authors. All rights reserved. MIT license.
+
+[package]
+name = "turso"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Turso Rust API"
+
+[lints]
+workspace = true
+
+[features]
+default = ["mimalloc", "fts"]
+mimalloc = ["dep:mimalloc"]
+pure-rust-crypto = ["turso_sdk_kit/pure-rust-crypto", "turso_sync_sdk_kit/pure-rust-crypto"]
+fts = ["turso_sdk_kit/fts"]
+stacker = ["turso_core/stacker"]
+test_helper = ["turso_core/test_helper"]
+# Test-only: exposes the `memory_yield` VFS for stress/simulator harnesses.
+io_memory_yield = ["turso_core/io_memory_yield"]
+sync = [
+    "dep:hyper",
+    "dep:tokio",
+    "dep:hyper-rustls",
+    "dep:hyper-util",
+    "dep:http-body-util",
+    "dep:bytes",
+]
+
+[dependencies]
+turso_core = { workspace = true }
+turso_sdk_kit = { workspace = true }
+turso_sync_sdk_kit = { workspace = true }
+thiserror = { workspace = true }
+tracing-subscriber.workspace = true
+tracing.workspace = true
+
+hyper = { version = "1.8.1", features = ["http1"], optional = true }
+tokio = { workspace = true, features = ["full"], optional = true }
+hyper-rustls = { features = [ "rustls-native-certs", "http1" ], optional = true, version = "0.27.9" }
+hyper-util = { version = "0.1.19", features = [
+    "http1",
+    "tokio",
+], optional = true }
+http-body-util = { version = "0.1.3", optional = true }
+bytes = { version = "1.11.1", optional = true }
+
+[target.'cfg(not(target_family = "wasm"))'.dependencies]
+mimalloc = { workspace = true, optional = true }
+
+[[example]]
+name = "sync_example"
+required-features = ["sync"]
+
+[[example]]
+name = "concurrent_writes"
+
+[dev-dependencies]
+tempfile = { workspace = true }
+tokio = { workspace = true, features = ["full"] }
+rand.workspace = true
+rand_chacha = { workspace = true }
+anyhow.workspace = true
+reqwest = { version = "0.13.2", features = ["json"] }
+serde_json.workspace = true

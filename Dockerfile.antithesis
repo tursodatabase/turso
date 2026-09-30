@@ -1,0 +1,100 @@
+FROM lukemathwalker/cargo-chef:0.1.72-rust-1.88.0-slim-bookworm AS chef
+RUN apt update \
+    && apt install -y git libssl-dev pkg-config\
+    && apt clean \
+    && rm -rf /var/lib/apt/lists/*
+WORKDIR /app
+
+#
+# Cache dependencies
+#
+
+FROM chef AS planner
+RUN --mount=type=bind,source=.,target=/app,ro \
+    cargo chef prepare --bin turso_stress --recipe-path /tmp/recipe.json
+
+#
+# Build the project.
+#
+
+FROM chef AS builder
+
+ARG antithesis=true
+
+RUN apt-get update && apt-get install -y pip && rm -rf /var/lib/apt/lists/*
+RUN pip install --break-system-packages maturin
+
+# Antithesis instrumentation library
+ADD https://antithesis.com/assets/instrumentation/libvoidstar.so /opt/antithesis/libvoidstar.so
+
+COPY --from=planner /tmp/recipe.json recipe.json
+RUN cargo chef cook --bin turso_stress --release --recipe-path recipe.json
+COPY . .
+
+# Remove cdylib and staticlib from this line: `crate-type = ["lib", "cdylib", "staticlib"]`
+# This is because somehow we lose llvm sanitizer coverage if the crate is not just a lib.
+RUN for f in sdk-kit/Cargo.toml sync/sdk-kit/Cargo.toml; do \
+        grep -qF 'crate-type = ["lib", "cdylib", "staticlib"]' "$f" \
+        || { echo "ERROR: expected crate-type not found in $f"; exit 1; }; \
+    done \
+    && sed -i 's/crate-type = \["lib", "cdylib", "staticlib"\]/crate-type = ["lib"]/' \
+        sdk-kit/Cargo.toml sync/sdk-kit/Cargo.toml
+
+RUN if [ "$antithesis" = "true" ]; then \
+        cp /opt/antithesis/libvoidstar.so /usr/lib/libvoidstar.so && \
+        export RUSTFLAGS="--cfg=tokio_unstable --cfg=antithesis -Ccodegen-units=1 -Cpasses=sancov-module -Cllvm-args=-sanitizer-coverage-level=3 -Cllvm-args=-sanitizer-coverage-trace-pc-guard -Clink-args=-Wl,--build-id -L/usr/lib/ -lvoidstar" && \
+        cargo build --bin turso_stress --profile antithesis; \
+    else \
+        cargo build --bin turso_stress --release; \
+    fi
+
+WORKDIR /app/bindings/python
+RUN maturin build
+
+WORKDIR /app/testing/unreliable-libc
+RUN make
+
+#
+# The final image.
+#
+
+FROM debian:bookworm-slim AS runtime
+RUN apt-get update && apt-get install -y bash curl xz-utils python3 procps sqlite3 bc binutils pip rust-gdb && rm -rf /var/lib/apt/lists/*
+RUN pip install --break-system-packages antithesis
+
+WORKDIR /app
+EXPOSE 8080
+COPY --from=builder /usr/lib/libvoidstar.so* /usr/lib/
+COPY --from=builder /app/testing/unreliable-libc/unreliable-libc.so /usr/lib/
+COPY --from=builder /app/target/antithesis/turso_stress /bin/turso_stress
+COPY --from=builder /app/target/antithesis/turso_stress /symbols
+COPY testing/stress/docker-entrypoint.sh /bin
+RUN chmod +x /bin/docker-entrypoint.sh
+
+COPY --from=builder /app/target/wheels/* /tmp
+RUN pip install --break-system-packages /tmp/*.whl
+
+WORKDIR /app
+COPY ./testing/antithesis/bank-test/*.py /opt/antithesis/test/v1/bank-test/
+COPY ./testing/antithesis/stress-composer/*.py /opt/antithesis/test/v1/stress-composer/
+COPY ./testing/antithesis/multiprocess/*.py /opt/antithesis/test/v1/multiprocess/
+COPY ./testing/antithesis/stress /opt/antithesis/test/v1/stress
+COPY ./testing/antithesis/stress-fts /opt/antithesis/test/v1/stress-fts
+COPY ./testing/antithesis/stress-fts-mvcc /opt/antithesis/test/v1/stress-fts-mvcc
+COPY ./testing/antithesis/stress-memory_yield /opt/antithesis/test/v1/stress-memory_yield
+COPY ./testing/antithesis/stress-io_uring /opt/antithesis/test/v1/stress-io_uring
+COPY ./testing/antithesis/stress-mvcc /opt/antithesis/test/v1/stress-mvcc
+COPY ./testing/antithesis/stress-io_uring-mvcc /opt/antithesis/test/v1/stress-io_uring-mvcc
+COPY ./testing/antithesis/stress-unreliable /opt/antithesis/test/v1/stress-unreliable
+RUN chmod 777 -R /opt/antithesis/test/v1
+RUN chmod -x /opt/antithesis/test/v1/multiprocess/helper_*.py /opt/antithesis/test/v1/stress-composer/helper_utils.py /opt/antithesis/test/v1/stress-unreliable/helper_integrity_check.py
+
+RUN mkdir /opt/antithesis/catalog
+RUN ln -s /opt/antithesis/test/v1/bank-test/*.py /opt/antithesis/catalog
+RUN for f in /opt/antithesis/test/v1/multiprocess/*.py; do ln -s "$f" "/opt/antithesis/catalog/multiprocess_$(basename "$f")"; done
+
+COPY testing/stress/targeted_coverage.jso[n] /opt/antithesis/
+
+ENV RUST_BACKTRACE=1
+
+ENTRYPOINT ["/bin/docker-entrypoint.sh"]

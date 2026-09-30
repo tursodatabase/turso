@@ -1,0 +1,53 @@
+name: Java Tests
+
+on:
+  push:
+    branches:
+      - main
+    tags:
+      - v*
+  pull_request:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.sha }}
+  cancel-in-progress: true
+
+env:
+  working-directory: bindings/java
+  CARGO_INCREMENTAL: "0"
+  CARGO_NET_RETRY: 10
+
+jobs:
+  test:
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    timeout-minutes: 30
+
+    defaults:
+      run:
+        working-directory: ${{ env.working-directory }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install Rust(stable)
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Setup mold linker
+        uses: rui314/setup-mold@v1
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: "v1-rust"
+          cache-on-failure: true
+
+
+      - name: Set up JDK
+        uses: useblacksmith/setup-java@v5
+        with:
+          distribution: 'temurin'
+          java-version: '8'
+
+      - name: Run Java tests
+        run: make test

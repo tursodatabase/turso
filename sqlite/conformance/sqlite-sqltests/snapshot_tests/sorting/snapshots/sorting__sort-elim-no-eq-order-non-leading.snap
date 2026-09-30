@@ -1,0 +1,16 @@
+---
+source: sorting.sqltest
+expression: |-
+  SELECT * FROM articles
+      ORDER BY published_at DESC;
+info:
+  statement_type: SELECT
+  tables:
+  - articles
+  setup_blocks:
+  - sort_elim
+  database: ':memory:'
+---
+QUERY PLAN
+|--SCAN articles
+`--USE SORTER FOR ORDER BY

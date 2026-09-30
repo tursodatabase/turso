@@ -1,0 +1,25 @@
+# Aristo lite PR gate — the cheap, local checks via the shared aristo-action
+# (aretta-ai/aristo-action). No token needed; runs entirely on the runner.
+#
+#   audit — every committed .aristo/proofs/*.proof is fresh vs source (no
+#           stale/refuted/orphan). The 0.4 proof-freshness gate that replaces
+#           the legacy `stamp --check`; .aristo/index.toml is now a gitignored,
+#           regenerable cache (never committed), rebuilt from source on demand.
+#   lint  — annotation quality (strict by default: warnings fail the build).
+# The `doc` check is intentionally omitted in this PR: .aristo/doc/ is
+# gitignored to keep the diff small. Regenerate the docs with `aristo doc` and
+# add `doc` back here to re-enable the in-sync check.
+#
+# `version` is left unpinned, so the action installs the latest aristo from
+# crates.io. Heavy canon verification (`aristo verify`) is a separate workflow:
+# .github/workflows/aristo-verify.yml (manual + nightly, needs ARETTA_TOKEN).
+name: aristo
+on: [push, pull_request]
+jobs:
+  aristo:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: aretta-ai/aristo-action@v1
+        with:
+          checks: audit, lint

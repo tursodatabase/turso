@@ -1,0 +1,180 @@
+import http.server
+import os
+import random
+import string
+import subprocess
+import threading
+import time
+
+import requests
+
+
+def random_str() -> str:
+    return "".join([random.choice(string.ascii_letters) for _ in range(8)])
+
+
+# headers that must not be forwarded verbatim - the proxy/requests recompute them.
+# content-encoding is dropped because `requests` already decompresses resp.content.
+_HOP_BY_HOP_HEADERS = {
+    "host",
+    "content-length",
+    "content-encoding",
+    "connection",
+    "keep-alive",
+    "transfer-encoding",
+    "accept-encoding",
+}
+
+
+class CountingProxy:
+    """
+    Transparent reverse proxy used by sync tests to observe how the sync engine
+    splits its HTTP traffic into batches. Forwards every request to ``upstream``
+    and counts the POST requests whose path ends with ``path_suffix``.
+
+    The upstream host (including any cloud subdomain) is embedded in ``upstream``,
+    so ``requests`` sets the correct Host header automatically for both the local
+    sync server and Turso Cloud.
+    """
+
+    def __init__(self, upstream: str, path_suffix: str):
+        self._upstream = upstream.rstrip("/")
+        self._path_suffix = path_suffix
+        self.count = 0
+        proxy = self
+
+        class _Handler(http.server.BaseHTTPRequestHandler):
+            def log_message(self, *args):
+                pass
+
+            def _forward(self, method: str):
+                length = int(self.headers.get("Content-Length", 0))
+                body = self.rfile.read(length) if length else None
+                if method == "POST" and self.path.endswith(proxy._path_suffix):
+                    proxy.count += 1
+                headers = {k: v for k, v in self.headers.items() if k.lower() not in _HOP_BY_HOP_HEADERS}
+                resp = requests.request(method, proxy._upstream + self.path, data=body, headers=headers)
+                self.send_response(resp.status_code)
+                for k, v in resp.headers.items():
+                    if k.lower() not in _HOP_BY_HOP_HEADERS:
+                        self.send_header(k, v)
+                self.send_header("Content-Length", str(len(resp.content)))
+                self.end_headers()
+                self.wfile.write(resp.content)
+
+            def do_GET(self):
+                self._forward("GET")
+
+            def do_POST(self):
+                self._forward("POST")
+
+        self._server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), _Handler)
+        self._thread = threading.Thread(target=self._server.serve_forever, daemon=True)
+        self._thread.start()
+
+    def url(self) -> str:
+        host, port = self._server.server_address
+        return f"http://{host}:{port}"
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, type, value, traceback):
+        self._server.shutdown()
+        self._server.server_close()
+
+
+def handle_response(r):
+    if r.status_code == 400 and "already exists" in r.text:
+        return
+    r.raise_for_status()
+
+
+ADMIN_URL = "http://localhost:8081"
+USER_URL = "http://localhost:8080"
+
+
+class TursoServer:
+    def __init__(self):
+        if "LOCAL_SYNC_SERVER" not in os.environ:
+            name = random_str()
+            tokens = USER_URL.split("://")
+            handle_response(requests.post(ADMIN_URL + f"/v1/tenants/{name}"))
+            handle_response(requests.post(ADMIN_URL + f"/v1/tenants/{name}/groups/{name}"))
+            handle_response(requests.post(ADMIN_URL + f"/v1/tenants/{name}/groups/{name}/databases/{name}"))
+            self._user_url = USER_URL
+            self._db_url = f"{tokens[0]}://{name}--{name}--{name}.{tokens[1]}"
+            self._host = f"{name}--{name}--{name}.localhost"
+            self._server = None
+        else:
+            # Retry with different ports in case the chosen port is
+            # unavailable (common on Windows where OS reserves port ranges).
+            max_attempts = 5
+            for attempt in range(max_attempts):
+                port = random.randint(10_000, 65535)
+                self._server = subprocess.Popen(
+                    [os.environ["LOCAL_SYNC_SERVER"], "--sync-server", f"0.0.0.0:{port}"],
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                )
+                self._user_url = f"http://localhost:{port}"
+                self._db_url = f"http://localhost:{port}"
+                self._host = ""
+                # wait for server to be available
+                deadline = time.time() + 30
+                while time.time() < deadline:
+                    rc = self._server.poll()
+                    if rc is not None:
+                        stderr = self._server.stderr.read().decode(errors="replace")
+                        if (
+                            "os error 10013" in stderr
+                            or "os error 10048" in stderr
+                            or "address already in use" in stderr.lower()
+                        ):
+                            break  # retry with a different port
+                        raise RuntimeError(
+                            f"sync server exited with code {rc} before accepting connections\nstderr: {stderr}"
+                        )
+                    try:
+                        requests.get(self._user_url, timeout=5)
+                        break
+                    except Exception:
+                        time.sleep(0.1)
+                else:
+                    stderr = ""
+                    if self._server.poll() is not None:
+                        stderr = self._server.stderr.read().decode(errors="replace")
+                    self._server.kill()
+                    raise TimeoutError(
+                        f"sync server did not become available within 30s\nstderr: {stderr}"
+                    )
+                # If the inner loop broke out due to a port conflict, retry
+                if self._server.poll() is not None:
+                    if attempt == max_attempts - 1:
+                        raise RuntimeError(
+                            f"sync server failed to bind after {max_attempts} port attempts"
+                        )
+                    continue
+                break  # server is up
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, type, value, traceback):
+        if self._server:
+            self._server.kill()
+
+    def db_url(self) -> str:
+        return self._db_url
+
+    def db_sql(self, sql: str):
+        result = requests.post(
+            self._user_url + "/v2/pipeline",
+            json={"requests": [{"type": "execute", "stmt": {"sql": sql}}]},
+            headers={"Host": self._host},
+        )
+        result.raise_for_status()
+        result = result.json()
+        if result["results"][0]["type"] != "ok":
+            raise Exception(f"remote sql execution failed: {result}")
+        return [[cell["value"] for cell in row] for row in result["results"][0]["response"]["result"]["rows"]]

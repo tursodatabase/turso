@@ -1,0 +1,38 @@
+@database :memory:
+
+# Regression test for https://github.com/tursodatabase/turso/issues/8203
+# With PRAGMA count_changes = on, each INSERT, UPDATE, and DELETE must
+# return one row with the number of rows it changed.
+
+test pragma-count-changes-insert {
+    CREATE TABLE t1 (x);
+    PRAGMA count_changes = on;
+    INSERT INTO t1 VALUES (1), (2);
+}
+expect {
+    2
+}
+
+test pragma-count-changes-update-delete {
+    CREATE TABLE t1 (x);
+    PRAGMA count_changes = on;
+    INSERT INTO t1 VALUES (1), (2), (3);
+    UPDATE t1 SET x = x + 1 WHERE x >= 2;
+    DELETE FROM t1;
+}
+expect {
+    3
+    2
+    3
+}
+
+test pragma-count-changes-off-is-silent {
+    CREATE TABLE t1 (x);
+    PRAGMA count_changes = on;
+    PRAGMA count_changes = off;
+    INSERT INTO t1 VALUES (1), (2);
+    SELECT count(*) FROM t1;
+}
+expect {
+    2
+}

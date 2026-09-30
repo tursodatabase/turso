@@ -1,0 +1,13 @@
+---
+source: indexes.sqltest
+expression: SELECT b FROM aux.same_name WHERE a = 7;
+info:
+  statement_type: SELECT
+  tables:
+  - aux.same_name
+  setup_blocks:
+  - attached_schema_indexes
+  database: ':memory:'
+---
+QUERY PLAN
+`--SEARCH same_name USING INDEX idx_same_aux_a (a=?)

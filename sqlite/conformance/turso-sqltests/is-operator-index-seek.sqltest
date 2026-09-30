@@ -1,0 +1,194 @@
+@database :memory:
+
+# `IS` is an index-usable, NULL-matching equality, exactly like SQLite: it seeks
+# the index (see the query-plan tests below) and a NULL key component matches the
+# rows whose key component is NULL, which `=` can never do.
+
+test is-matches-null-key-component-on-composite-pk {
+    CREATE TABLE t (a, b, c, PRIMARY KEY (a, b));
+    INSERT INTO t VALUES ('a1', NULL, 'c1'), ('a1', 'b1', 'c2'), ('a2', 'b2', 'c3'), (NULL, NULL, 'c4');
+
+    SELECT c FROM t WHERE a IS 'a1' AND b IS NULL;
+}
+expect {
+    c1
+}
+
+test equals-never-matches-null-key-component {
+    CREATE TABLE t (a, b, c, PRIMARY KEY (a, b));
+    INSERT INTO t VALUES ('a1', NULL, 'c1'), ('a1', 'b1', 'c2');
+
+    SELECT count(*) FROM t WHERE a = 'a1' AND b = NULL;
+}
+expect {
+    0
+}
+
+test is-matches-null-in-every-key-component {
+    CREATE TABLE t (a, b, c, PRIMARY KEY (a, b));
+    INSERT INTO t VALUES ('a1', NULL, 'c1'), (NULL, NULL, 'c4'), (NULL, 'b6', 'c6');
+
+    SELECT c FROM t WHERE a IS NULL AND b IS NULL;
+}
+expect {
+    c4
+}
+
+test is-mixed-with-equals-on-the-same-key {
+    CREATE TABLE t (a, b, c, PRIMARY KEY (a, b));
+    INSERT INTO t VALUES ('a1', NULL, 'c1'), ('a1', 'b1', 'c2');
+
+    SELECT c FROM t WHERE a = 'a1' AND b IS NULL;
+}
+expect {
+    c1
+}
+
+test is-deletes-row-with-null-key-component {
+    CREATE TABLE t (a, b, c, PRIMARY KEY (a, b));
+    INSERT INTO t VALUES ('a1', NULL, 'c1'), ('a1', 'b1', 'c2');
+    DELETE FROM t WHERE a IS 'a1' AND b IS NULL;
+
+    SELECT c FROM t ORDER BY c;
+}
+expect {
+    c2
+}
+
+test is-updates-row-with-null-key-component {
+    CREATE TABLE t (a, b, c, PRIMARY KEY (a, b));
+    INSERT INTO t VALUES ('a1', NULL, 'c1'), ('a1', 'b1', 'c2');
+    UPDATE t SET c = 'updated' WHERE a IS 'a1' AND b IS NULL;
+
+    SELECT c FROM t ORDER BY c;
+}
+expect {
+    c2
+    updated
+}
+
+test is-matches-null-on-single-column-primary-key {
+    CREATE TABLE s (k, v);
+    CREATE UNIQUE INDEX si ON s (k);
+    INSERT INTO s VALUES ('k1', 'v1'), (NULL, 'v2');
+
+    SELECT v FROM s WHERE k IS NULL;
+}
+expect {
+    v2
+}
+
+test is-null-matches-across-a-left-join {
+    CREATE TABLE t (a, b, c, PRIMARY KEY (a, b));
+    INSERT INTO t VALUES ('a1', NULL, 'c1'), (NULL, 'a1', 'c2');
+
+    SELECT t1.c, t2.c FROM t t1 LEFT JOIN t t2 ON t1.a IS t2.b ORDER BY t1.c;
+}
+expect {
+    c1|c2
+    c2|c1
+}
+
+# A UNIQUE index accepts any number of NULLs, so a NULL key component can match
+# more than one row. The seek must return all of them, not stop at the first.
+test is-matches-every-row-with-a-null-key-component {
+    CREATE TABLE t (a, b, c, PRIMARY KEY (a, b));
+    INSERT INTO t VALUES ('a1', NULL, 'c1'), ('a1', NULL, 'c2'), ('a1', NULL, 'c3'), ('a1', 'b1', 'c4'), ('a2', NULL, 'c5');
+
+    SELECT c FROM t WHERE a IS 'a1' AND b IS NULL ORDER BY c;
+}
+expect {
+    c1
+    c2
+    c3
+}
+
+test is-matches-every-null-in-a-unique-index {
+    CREATE TABLE s (k, v);
+    CREATE UNIQUE INDEX si ON s (k);
+    INSERT INTO s VALUES ('k1', 'v1'), (NULL, 'v2'), (NULL, 'v3'), (NULL, 'v4');
+
+    SELECT v FROM s WHERE k IS NULL ORDER BY v;
+}
+expect {
+    v2
+    v3
+    v4
+}
+
+# A descending index stores NULLs at the other end, so the seek runs backwards
+# from the NULL key instead of forwards.
+test is-matches-null-key-component-on-descending-index {
+    CREATE TABLE t (a, b, c);
+    CREATE INDEX ti ON t (a DESC, b ASC);
+    INSERT INTO t VALUES (1, NULL, 'c1'), (1, NULL, 'c2'), (1, 2, 'c3'), (NULL, NULL, 'c4');
+
+    SELECT c FROM t WHERE a IS 1 AND b IS NULL ORDER BY c;
+}
+expect {
+    c1
+    c2
+}
+
+# A rowid is never NULL, so seeking a table b-tree with a NULL key finds nothing
+# even though `IS` matches NULL in an index.
+test is-null-never-matches-a-rowid {
+    CREATE TABLE r (k INTEGER PRIMARY KEY, v);
+    INSERT INTO r VALUES (1, 'v1'), (2, 'v2');
+
+    SELECT count(*) FROM r WHERE k IS NULL;
+}
+expect {
+    0
+}
+
+# TRUE and FALSE on the right of IS check boolean value, not equality. For
+# example, 2 and text '1' are true even though neither is equal to integer 1.
+# The rule applies when TRUE or FALSE is on the right, also inside
+# parentheses or under COLLATE — but not on the left, and not under a unary
+# `+`, which turns it back into an ordinary comparison with 1 or 0.
+test is-true-and-false-keep-boolean-semantics-with-an-index {
+    CREATE TABLE t (x);
+    CREATE INDEX ti ON t (x);
+    INSERT INTO t VALUES (NULL), (0), (1), (2), (-1), ('1'), ('true'), ('x');
+
+    SELECT 'true', quote(x) FROM t WHERE x IS TRUE ORDER BY rowid;
+    SELECT 'false', quote(x) FROM t WHERE x IS FALSE ORDER BY rowid;
+    SELECT 'paren', quote(x) FROM t WHERE x IS (TRUE) ORDER BY rowid;
+
+    SELECT 'left', quote(x) FROM t WHERE TRUE IS x;
+    SELECT 'plus', quote(x) FROM t WHERE x IS +TRUE;
+}
+expect {
+    true|1
+    true|2
+    true|-1
+    true|'1'
+    false|0
+    false|'true'
+    false|'x'
+    paren|1
+    paren|2
+    paren|-1
+    paren|'1'
+    left|1
+    plus|1
+}
+
+# The antijoin idiom. `e.id IS NULL` is TRUE for a null-extended row, so it must
+# not be pushed into the loop of the LEFT JOIN's right-hand table: doing so
+# removes the very rows whose absence produces the null extension, and every
+# left row comes back as unmatched.
+test is-null-in-where-does-not-constrain-a-left-join-rhs {
+    CREATE TABLE p (id INTEGER PRIMARY KEY, n);
+    CREATE TABLE e (id INTEGER PRIMARY KEY, pid, v);
+    CREATE INDEX ei ON e (pid);
+    INSERT INTO p VALUES (1, 'p1'), (2, 'p2'), (3, 'p3');
+    INSERT INTO e VALUES (10, 1, 'x'), (11, 1, 'y');
+
+    SELECT p.n FROM p LEFT JOIN e ON e.pid = p.id WHERE e.id IS NULL ORDER BY p.n;
+}
+expect {
+    p2
+    p3
+}

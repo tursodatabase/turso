@@ -1,0 +1,75 @@
+[env]
+LIBSQLITE3_FLAGS = "-DSQLITE_ENABLE_MATH_FUNCTIONS" # necessary for rusqlite dependency in order to bundle SQLite with math functions included
+
+[build]
+# turso-sync package uses tokio_unstable to seed LocalRuntime and make it deterministic
+# unfortunately, cargo commands invoked from workspace root didn't capture config.toml from dependent crate
+# so, we set this cfg globally for workspace (see relevant issue build build-target: https://github.com/rust-lang/cargo/issues/7004)
+rustflags = [
+    "--cfg=tokio_unstable",
+]
+
+
+# without these rustflags, cargo test failing because we are using shared napi library (turso_node)
+# (these settings copied from napi-rs itself, see https://github.com/napi-rs/napi-rs/issues/2130#issuecomment-2239407809)
+
+[target.'cfg(target_vendor = "apple")']
+rustflags = [
+  "--cfg=tokio_unstable",
+  "-C",
+  "link-args=-Wl,-undefined,dynamic_lookup,-no_fixup_chains",
+]
+
+# getrandom 0.3 needs this cfg (https://docs.rs/getrandom/latest/getrandom/#webassembly-support)
+[target.wasm32-unknown-unknown]
+rustflags = [
+    '--cfg=getrandom_backend="wasm_js"',
+]
+
+# To be able to run unit tests on Linux, support compilation to 'x86_64-unknown-linux-gnu'.
+# pthread_key_create() destructors and segfault after a DSO unloading https://sourceware.org/bugzilla/show_bug.cgi?id=21031
+[target.'cfg(all(target_os = "linux", target_env = "gnu"))']
+rustflags = [
+  "--cfg=tokio_unstable",
+  "-C",
+  "link-args=-Wl,--warn-unresolved-symbols",
+  "-C",
+  "link-args=-Wl,-z,nodelete",
+]
+
+# To be able to run unit tests on Windows, support compilation to MSVC targets.
+[target.'cfg(target_env = "msvc")']
+rustflags = [
+  "--cfg=tokio_unstable",
+  "-C",
+  "link-args=/FORCE"
+]
+
+# Android targets need 16KB page alignment for Android 15+ compatibility
+[target.aarch64-linux-android]
+rustflags = [
+  "--cfg=tokio_unstable",
+  "-C",
+  "link-args=-Wl,-z,max-page-size=16384",
+]
+
+[target.armv7-linux-androideabi]
+rustflags = [
+  "--cfg=tokio_unstable",
+  "-C",
+  "link-args=-Wl,-z,max-page-size=16384",
+]
+
+[target.x86_64-linux-android]
+rustflags = [
+  "--cfg=tokio_unstable",
+  "-C",
+  "link-args=-Wl,-z,max-page-size=16384",
+]
+
+[target.i686-linux-android]
+rustflags = [
+  "--cfg=tokio_unstable",
+  "-C",
+  "link-args=-Wl,-z,max-page-size=16384",
+]

@@ -1,0 +1,86 @@
+@database :memory:
+
+setup schema {
+    CREATE TABLE "my table"("my col" INTEGER);
+    CREATE TABLE log(msg TEXT);
+}
+
+@setup schema
+test trigger-with-quoted-identifiers {
+    CREATE TRIGGER "my trigger" AFTER INSERT ON "my table" BEGIN
+      INSERT INTO log VALUES('inserted: ' || NEW."my col");
+    END;
+    INSERT INTO "my table" VALUES(42);
+    SELECT * FROM log;
+}
+expect {
+    inserted: 42
+}
+
+setup schema-hyphen {
+    CREATE TABLE "my-table"("my-col" INTEGER);
+    CREATE TABLE log2(msg TEXT);
+}
+
+@setup schema-hyphen
+test trigger-with-hyphenated-identifiers {
+    CREATE TRIGGER "my-trigger" AFTER INSERT ON "my-table" BEGIN
+      INSERT INTO log2 VALUES('val: ' || NEW."my-col");
+    END;
+    INSERT INTO "my-table" VALUES(99);
+    SELECT * FROM log2;
+}
+expect {
+    val: 99
+}
+
+setup schema-reserved {
+    CREATE TABLE "select"("order" INTEGER);
+    CREATE TABLE log3(msg TEXT);
+}
+
+@setup schema-reserved
+test trigger-with-reserved-word-identifiers {
+    CREATE TRIGGER "insert" AFTER INSERT ON "select" BEGIN
+      INSERT INTO log3 VALUES('got: ' || NEW."order");
+    END;
+    INSERT INTO "select" VALUES(7);
+    SELECT * FROM log3;
+}
+expect {
+    got: 7
+}
+
+setup schema-update-of {
+    CREATE TABLE "my table"("my col" INTEGER, "other col" TEXT);
+    CREATE TABLE log4(msg TEXT);
+}
+
+@setup schema-update-of
+test trigger-update-of-quoted-columns {
+    CREATE TRIGGER "my update trigger" AFTER UPDATE OF "my col" ON "my table" BEGIN
+      INSERT INTO log4 VALUES('updated to: ' || NEW."my col");
+    END;
+    INSERT INTO "my table" VALUES(1, 'a');
+    UPDATE "my table" SET "my col" = 2 WHERE "my col" = 1;
+    SELECT * FROM log4;
+}
+expect {
+    updated to: 2
+}
+
+@setup schema
+test trigger-persists-across-multiple-inserts {
+    CREATE TRIGGER "my trigger" AFTER INSERT ON "my table" BEGIN
+      INSERT INTO log VALUES('inserted: ' || NEW."my col");
+    END;
+    INSERT INTO "my table" VALUES(1);
+    INSERT INTO "my table" VALUES(2);
+    INSERT INTO "my table" VALUES(3);
+    SELECT * FROM log;
+}
+expect {
+    inserted: 1
+    inserted: 2
+    inserted: 3
+}

@@ -1,0 +1,145 @@
+@database :memory:
+
+# Regression tests for compound SELECT (UNION / UNION ALL / INTERSECT /
+# EXCEPT) inside WHERE-clause IN subqueries. Previously these were rejected at
+# parse time; the query planner now threads compound selects through the IN
+# subquery code path.
+#
+# EXISTS and scalar (RowValue) subqueries still reject compound selects at
+# parse time and are intentionally not covered here.
+
+setup fruits {
+    CREATE TABLE fruit (id INTEGER PRIMARY KEY, name TEXT);
+    INSERT INTO fruit VALUES (1, 'apple'), (2, 'banana'), (3, 'cherry'),
+                             (4, 'date'), (5, 'elderberry');
+
+    CREATE TABLE red_fruit (name TEXT);
+    INSERT INTO red_fruit VALUES ('apple'), ('cherry');
+
+    CREATE TABLE yellow_fruit (name TEXT);
+    INSERT INTO yellow_fruit VALUES ('banana');
+
+    CREATE TABLE tropical_fruit (name TEXT);
+    INSERT INTO tropical_fruit VALUES ('banana'), ('date'), ('mango');
+}
+
+# -----------------------------------------------------------------------------
+# IN subquery with UNION / UNION ALL / INTERSECT / EXCEPT
+# -----------------------------------------------------------------------------
+
+@setup fruits
+test in-union {
+    SELECT id, name FROM fruit
+    WHERE name IN (SELECT name FROM red_fruit
+                   UNION
+                   SELECT name FROM yellow_fruit)
+    ORDER BY id;
+}
+expect {
+    1|apple
+    2|banana
+    3|cherry
+}
+
+@setup fruits
+test in-union-all {
+    SELECT id, name FROM fruit
+    WHERE name IN (SELECT name FROM red_fruit
+                   UNION ALL
+                   SELECT name FROM yellow_fruit
+                   UNION ALL
+                   SELECT name FROM tropical_fruit)
+    ORDER BY id;
+}
+expect {
+    1|apple
+    2|banana
+    3|cherry
+    4|date
+}
+
+@setup fruits
+test in-intersect {
+    SELECT id, name FROM fruit
+    WHERE name IN (SELECT name FROM tropical_fruit
+                   INTERSECT
+                   SELECT name FROM yellow_fruit)
+    ORDER BY id;
+}
+expect {
+    2|banana
+}
+
+@setup fruits
+test in-except {
+    SELECT id, name FROM fruit
+    WHERE name IN (SELECT name FROM tropical_fruit
+                   EXCEPT
+                   SELECT name FROM yellow_fruit)
+    ORDER BY id;
+}
+expect {
+    4|date
+}
+
+@setup fruits
+test not-in-union {
+    SELECT id, name FROM fruit
+    WHERE name NOT IN (SELECT name FROM red_fruit
+                       UNION
+                       SELECT name FROM yellow_fruit)
+    ORDER BY id;
+}
+expect {
+    4|date
+    5|elderberry
+}
+
+# -----------------------------------------------------------------------------
+# Row-value IN with a compound select returning multiple columns
+# -----------------------------------------------------------------------------
+
+setup pairs {
+    CREATE TABLE pair (a INTEGER, b INTEGER);
+    INSERT INTO pair VALUES (1, 10), (2, 20), (3, 30), (4, 40);
+
+    CREATE TABLE want_a (a INTEGER, b INTEGER);
+    INSERT INTO want_a VALUES (1, 10), (3, 30);
+
+    CREATE TABLE want_b (a INTEGER, b INTEGER);
+    INSERT INTO want_b VALUES (2, 20);
+}
+
+@setup pairs
+test row-value-in-union {
+    SELECT a, b FROM pair
+    WHERE (a, b) IN (SELECT a, b FROM want_a
+                     UNION
+                     SELECT a, b FROM want_b)
+    ORDER BY a;
+}
+expect {
+    1|10
+    2|20
+    3|30
+}
+
+# -----------------------------------------------------------------------------
+# Compound SELECT in a WHERE IN subquery that references the outer query.
+# This exercises Plan::used_outer_query_ref_ids(), which must walk every
+# component SELECT of the compound to collect outer-query refs.
+# -----------------------------------------------------------------------------
+
+@setup fruits
+test correlated-in-union {
+    SELECT id, name FROM fruit f
+    WHERE name IN (SELECT name FROM red_fruit    WHERE LENGTH(name) = LENGTH(f.name)
+                   UNION
+                   SELECT name FROM yellow_fruit WHERE LENGTH(name) = LENGTH(f.name))
+    ORDER BY id;
+}
+expect {
+    1|apple
+    2|banana
+    3|cherry
+}

@@ -1,0 +1,20 @@
+---
+source: subquery-sort-elision.sqltest
+expression: |-
+  WITH unordered AS (
+          SELECT x, y FROM t1
+      )
+      SELECT * FROM unordered ORDER BY x;
+info:
+  statement_type: WITH (CTE)
+  tables:
+  - t1
+  - unordered
+  setup_blocks:
+  - elision_schema
+  database: ':memory:'
+---
+QUERY PLAN
+|--SCAN unordered
+|  `--SCAN t1
+`--USE SORTER FOR ORDER BY

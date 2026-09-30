@@ -1,0 +1,14 @@
+---
+source: partial_idx.sqltest
+expression: SELECT a, b, c FROM indexed_items WHERE a = 2 OR c = 3 ORDER BY b, c;
+info:
+  statement_type: SELECT
+  tables:
+  - indexed_items
+  setup_blocks:
+  - partial_index_multi_index_or_schema
+  database: ':memory:'
+---
+QUERY PLAN
+|--SCAN indexed_items
+`--USE SORTER FOR ORDER BY

@@ -1,0 +1,282 @@
+# Sorting and Limiting Query Plan Snapshots
+# These snapshots capture EXPLAIN QUERY PLAN output for ORDER BY and LIMIT patterns
+
+@database :memory:
+@skip-file-if mvcc "mvcc has slightly different cursor ids, so skipping it for now"
+
+setup schema {
+    -- Table for basic sorting tests
+    CREATE TABLE products (
+        id INTEGER PRIMARY KEY,
+        name TEXT NOT NULL,
+        price REAL NOT NULL,
+        category TEXT,
+        stock INTEGER,
+        created_at TEXT
+    );
+
+    -- Index on price for index-assisted sorting
+    CREATE INDEX idx_products_price ON products(price);
+
+    -- Compound index for multi-column sorting
+    CREATE INDEX idx_products_category_price ON products(category, price);
+
+    -- Index for descending order tests
+    CREATE INDEX idx_products_stock_desc ON products(stock DESC);
+
+    -- Table with nullable columns for NULL ordering tests
+    CREATE TABLE employees (
+        id INTEGER PRIMARY KEY,
+        name TEXT NOT NULL,
+        department TEXT,
+        salary REAL,
+        hire_date TEXT
+    );
+
+    -- Index on nullable column
+    CREATE INDEX idx_employees_salary ON employees(salary);
+    CREATE INDEX idx_employees_department ON employees(department);
+}
+
+# Test 1: ORDER BY single column - simple sort (no index on name)
+@setup schema
+snapshot order-by-single-column {
+    SELECT id, name, price
+    FROM products
+    ORDER BY name;
+}
+
+# Test 2: ORDER BY with index - index-assisted sort (should use index)
+@setup schema
+snapshot-eqp order-by-with-index {
+    SELECT id, name, price
+    FROM products
+    ORDER BY price;
+}
+
+# Test 3: ORDER BY multiple columns - compound sort
+@setup schema
+snapshot-eqp order-by-multiple-columns {
+    SELECT id, name, category, price
+    FROM products
+    ORDER BY category, price;
+}
+
+# Test 4: ORDER BY + LIMIT - top-N optimization
+@setup schema
+snapshot-eqp order-by-with-limit {
+    SELECT id, name, price
+    FROM products
+    ORDER BY price DESC
+    LIMIT 10;
+}
+
+# Test 5: LIMIT with OFFSET - pagination
+@setup schema
+snapshot limit-with-offset {
+    SELECT id, name, price
+    FROM products
+    ORDER BY id
+    LIMIT 10 OFFSET 20;
+}
+
+# Test 6: ORDER BY expression - computed sort key
+@setup schema
+snapshot order-by-expression {
+    SELECT id, name, price, stock, price * stock AS total_value
+    FROM products
+    ORDER BY price * stock DESC;
+}
+
+# Test 7: ORDER BY DESC - descending order
+@setup schema
+snapshot-eqp order-by-desc {
+    SELECT id, name, stock
+    FROM products
+    ORDER BY stock DESC;
+}
+
+# Test 8: ORDER BY with NULLS - null ordering (NULLs sort first/last)
+@setup schema
+snapshot-eqp order-by-with-nulls {
+    SELECT id, name, salary
+    FROM employees
+    ORDER BY salary;
+}
+
+# Test 9: ORDER BY nullable column DESC
+@setup schema
+snapshot-eqp order-by-nullable-desc {
+    SELECT id, name, department
+    FROM employees
+    ORDER BY department DESC;
+}
+
+# Test 10: Multiple ORDER BY with mixed ASC/DESC
+@setup schema
+snapshot order-by-mixed-direction {
+    SELECT id, name, category, price
+    FROM products
+    ORDER BY category ASC, price DESC;
+}
+
+# Test 11: ORDER BY with WHERE clause - filtered sort
+@setup schema
+snapshot order-by-with-where {
+    SELECT id, name, price
+    FROM products
+    WHERE category = 'Electronics'
+    ORDER BY price;
+}
+
+# Test 12: ORDER BY with LIMIT 1 - min/max optimization candidate
+@setup schema
+snapshot order-by-limit-one {
+    SELECT id, name, price
+    FROM products
+    ORDER BY price ASC
+    LIMIT 1;
+}
+
+# Test 13: LIMIT without ORDER BY - arbitrary rows
+@setup schema
+snapshot limit-without-order {
+    SELECT id, name, price
+    FROM products
+    LIMIT 5;
+}
+
+# Test 14: Large OFFSET with small LIMIT
+@setup schema
+snapshot large-offset-small-limit {
+    SELECT id, name, price
+    FROM products
+    ORDER BY price
+    LIMIT 5 OFFSET 1000;
+}
+
+# Test 15: ORDER BY on indexed column with range filter
+@setup schema
+snapshot-eqp order-by-index-with-range {
+    SELECT id, name, price
+    FROM products
+    WHERE price BETWEEN 10 AND 100
+    ORDER BY price;
+}
+
+# =============================================================================
+# Composite index sort elimination edge cases
+# =============================================================================
+
+setup sort_elim {
+    CREATE TABLE articles (
+        id INTEGER PRIMARY KEY,
+        status TEXT NOT NULL,
+        category TEXT NOT NULL,
+        published_at TEXT NOT NULL,
+        title TEXT NOT NULL
+    );
+    -- 3-column composite index for prefix skip tests
+    CREATE INDEX idx_articles_status_cat_pub ON articles(status, category, published_at DESC);
+}
+
+# Equality on prefix, ORDER BY on suffix — sort should be eliminated
+@setup sort_elim
+snapshot-eqp sort-elim-eq-prefix-order-suffix {
+    SELECT * FROM articles
+    WHERE status = 'published'
+    ORDER BY category, published_at DESC;
+}
+
+# Equality on full prefix, ORDER BY on last column — sort eliminated
+@setup sort_elim
+snapshot-eqp sort-elim-two-eq-order-last {
+    SELECT * FROM articles
+    WHERE status = 'published' AND category = 'tech'
+    ORDER BY published_at DESC;
+}
+
+# ORDER BY eq column with DESC — direction irrelevant for constant, sort eliminated
+@setup sort_elim
+snapshot-eqp sort-elim-eq-col-desc-direction {
+    SELECT * FROM articles
+    WHERE status = 'published'
+    ORDER BY status DESC, category, published_at DESC;
+}
+
+# All index columns eq-constrained, ORDER BY on non-index column — needs sorter
+@setup sort_elim
+snapshot-eqp sort-elim-all-eq-order-non-index {
+    SELECT * FROM articles
+    WHERE status = 'published' AND category = 'tech' AND published_at = '2024-01-01'
+    ORDER BY title;
+}
+
+# No equality prefix — ORDER BY on non-leading column needs sorter
+@setup sort_elim
+snapshot-eqp sort-elim-no-eq-order-non-leading {
+    SELECT * FROM articles
+    ORDER BY published_at DESC;
+}
+
+# Range constraint on prefix — cannot skip, sorter needed
+@setup sort_elim
+snapshot-eqp sort-elim-range-prefix-order-suffix {
+    SELECT * FROM articles
+    WHERE status > 'draft'
+    ORDER BY category;
+}
+
+setup expr_sort_elim {
+    CREATE TABLE expr_articles (
+        id INTEGER PRIMARY KEY,
+        status TEXT NOT NULL,
+        title TEXT NOT NULL,
+        score INTEGER NOT NULL
+    );
+    CREATE INDEX idx_expr_articles ON expr_articles(status, lower(title), score DESC);
+}
+
+@setup expr_sort_elim
+snapshot-eqp sort-elim-expr-index-eq-prefix-order-suffix {
+    SELECT id, lower(title), score
+    FROM expr_articles
+    WHERE status = 'active'
+    ORDER BY lower(title), score DESC;
+}
+
+@setup expr_sort_elim
+snapshot-eqp sort-elim-expr-index-group-by-eq-prefix {
+    SELECT lower(title), COUNT(*), MAX(score)
+    FROM expr_articles
+    WHERE status = 'active'
+    GROUP BY lower(title)
+    ORDER BY lower(title);
+}
+
+setup outer_left_order {
+    CREATE TABLE lhs_orders (
+        id INTEGER PRIMARY KEY,
+        customer_id INTEGER NOT NULL
+    );
+    CREATE INDEX idx_lhs_customer ON lhs_orders(customer_id);
+
+    CREATE TABLE rhs_items (
+        id INTEGER PRIMARY KEY,
+        order_id INTEGER NOT NULL,
+        product TEXT NOT NULL,
+        qty INTEGER NOT NULL
+    );
+    CREATE INDEX idx_rhs_product_qty ON rhs_items(product, qty);
+}
+
+@setup outer_left_order
+snapshot-eqp sort-elim-left-join-outer-rowid-suffix {
+    SELECT o.customer_id, o.id
+    FROM lhs_orders o
+    LEFT JOIN rhs_items i
+        ON i.order_id = o.id
+       AND i.product = 'x'
+    WHERE o.customer_id = 300
+    ORDER BY o.customer_id, o.id;
+}

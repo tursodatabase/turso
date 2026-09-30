@@ -1,0 +1,76 @@
+@database :memory:
+
+# Regression tests: bare columns in ungrouped aggregate queries with 0 matching
+# rows must return NULL, not stale values from non-matching rows.
+#
+# When no rows pass the WHERE filter, the table cursor may still be positioned
+# on a valid row from the scan. Without NullRow, Column instructions would read
+# stale data from that row instead of returning NULL.
+
+setup single-row {
+    CREATE TABLE t(a INTEGER PRIMARY KEY, b TEXT, c INTEGER NOT NULL);
+    INSERT INTO t VALUES(NULL, 'hello', 10);
+}
+
+@setup single-row
+test sum-zero-rows-bare-col {
+    SELECT SUM(a IS NOT NULL), b FROM t WHERE a < -999;
+}
+expect {
+    |
+}
+
+@setup single-row
+test sum-zero-rows-bare-col-with-order-by {
+    SELECT SUM(a IS NOT NULL), b FROM t WHERE a < -999 ORDER BY c DESC;
+}
+expect {
+    |
+}
+
+@setup single-row
+test count-zero-rows-bare-col {
+    SELECT COUNT(a), b FROM t WHERE a < -999;
+}
+expect {
+    0|
+}
+
+setup multi-row {
+    CREATE TABLE t2(a INTEGER PRIMARY KEY, b TEXT, c TEXT, d INTEGER NOT NULL);
+    INSERT INTO t2 VALUES(1, 'foo', 'bar', 10);
+    INSERT INTO t2 VALUES(2, 'baz', 'qux', 20);
+}
+
+@setup multi-row
+test count-star-zero-rows-multiple-bare-cols {
+    SELECT COUNT(*), b, c FROM t2 WHERE a > 999;
+}
+expect {
+    0||
+}
+
+@setup multi-row
+test avg-zero-rows-bare-col {
+    SELECT AVG(d), b FROM t2 WHERE a > 999;
+}
+expect {
+    |
+}
+
+@setup multi-row
+test max-zero-rows-bare-col {
+    SELECT MAX(d), b, c FROM t2 WHERE a > 999;
+}
+expect {
+    ||
+}
+
+# With matching rows the bare column should return a value from a matching row
+@setup single-row
+test sum-matching-rows-bare-col {
+    SELECT SUM(a IS NOT NULL), b FROM t WHERE c = 10;
+}
+expect {
+    1|hello
+}

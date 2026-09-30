@@ -1,0 +1,37 @@
+@database :temp:
+@skip-file-if sqlite "MVCC is not supported in SQLite"
+
+test pragma-temp-journal-mode-mvcc-is-ignored {
+    CREATE TABLE m(x INTEGER);
+    CREATE TEMP TABLE t(x INTEGER);
+    PRAGMA temp.journal_mode='mvcc';
+    INSERT INTO m VALUES(1);
+    SELECT x FROM m;
+}
+expect {
+    wal
+    1
+}
+
+@skip-if mvcc "with --mvcc the main db already has MVCC, so BEGIN CONCURRENT succeeds"
+test begin-concurrent-still-fails-after-temp-journal-mode-mvcc {
+    CREATE TABLE m(x INTEGER);
+    CREATE TEMP TABLE t(x INTEGER);
+    PRAGMA temp.journal_mode='mvcc';
+    BEGIN CONCURRENT;
+}
+expect error {
+    Concurrent transaction mode is only supported when MVCC is enabled
+}
+
+test temp-autoincrement-is-allowed-when-main-db-is-mvcc {
+    PRAGMA journal_mode='MVCC';
+    CREATE TEMP TABLE t(id INTEGER PRIMARY KEY AUTOINCREMENT, v TEXT);
+    INSERT INTO temp.t(v) VALUES ('a'), ('b');
+    SELECT id, v FROM temp.t ORDER BY id;
+}
+expect {
+    mvcc
+    1|a
+    2|b
+}

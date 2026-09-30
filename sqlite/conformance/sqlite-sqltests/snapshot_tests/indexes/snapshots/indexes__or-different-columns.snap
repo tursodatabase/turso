@@ -1,0 +1,16 @@
+---
+source: indexes.sqltest
+expression: |-
+  SELECT id, event_type, severity
+      FROM events
+      WHERE event_type = 'ERROR' OR severity > 8;
+info:
+  statement_type: SELECT
+  tables:
+  - events
+  setup_blocks:
+  - schema
+  database: ':memory:'
+---
+QUERY PLAN
+`--MULTI-INDEX OR events (idx_events_type, idx_events_severity)

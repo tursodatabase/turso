@@ -1,0 +1,17 @@
+---
+source: partial_idx.sqltest
+expression: |-
+  SELECT id, a, c
+      FROM t_between_forced INDEXED BY idx_between_forced
+      WHERE e BETWEEN -10 AND 10
+      ORDER BY a, c, id;
+info:
+  statement_type: SELECT
+  tables:
+  - t_between_forced
+  setup_blocks:
+  - partial_index_indexed_by_between_schema
+  database: ':memory:'
+---
+QUERY PLAN
+`--SCAN t_between_forced USING INDEX idx_between_forced

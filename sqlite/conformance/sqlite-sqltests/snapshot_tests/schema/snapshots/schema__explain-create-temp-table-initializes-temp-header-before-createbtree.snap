@@ -1,0 +1,35 @@
+---
+source: schema.sqltest
+expression: CREATE TEMP TABLE y(b);
+info:
+  statement_type: CREATE
+  tables:
+  - y
+  database: ':memory:'
+---
+QUERY PLAN
+
+
+BYTECODE
+addr  opcode       p1  p2  p3  p4                                    p5  comment
+   0  Init          0  18   0                                         0  Start at 18
+   1  ReadCookie    1   1   2                                         0
+   2  If            1   5   0                                         0  if r[1] goto 5
+   3  SetCookie     1   2   4                                         0
+   4  SetCookie     1   5   1                                         0
+   5  CreateBtree   1   2   1                                         0  r[2]=root iDb=1 flags=1
+   6  OpenWrite     0   1   1                                         0  root=1; iDb=1
+   7  NewRowid      0   3   0                                         0  r[3]=rowid
+   8  String8       0   4   0  table                                  0  r[4]='table'
+   9  String8       0   5   0  y                                      0  r[5]='y'
+  10  String8       0   6   0  y                                      0  r[6]='y'
+  11  Copy          2   7   0                                         0  r[7]=r[2]
+  12  String8       0   8   0  CREATE TABLE y (b)                     0  r[8]='CREATE TABLE y (b)'
+  13  MakeRecord    4   5   9                                         0  r[9]=mkrec(r[4..8])
+  14  Insert        0   9   3  y                                      0  intkey=r[3] data=r[9]
+  15  SetCookie     1   1   1                                         0
+  16  ParseSchema   1   0   0  tbl_name = 'y' AND type != 'trigger'   0  tbl_name = 'y' AND type != 'trigger'
+  17  Halt          0   0   0                                         0
+  18  Transaction   0   2   0                                         0  iDb=0 tx_mode=Write
+  19  Transaction   1   2   0                                         0  iDb=1 tx_mode=Write
+  20  Goto          0   1   0                                         0

@@ -1,0 +1,50 @@
+name: Build and push sqlancer-runner image
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+    paths:
+      - "bindings/java/**"
+      - "scripts/corruption-debug-tools/**"
+      - "testing/sqlancer/**"
+      - ".github/workflows/build-sqlancer.yml"
+
+# Add permissions needed for OIDC authentication with AWS
+permissions:
+  id-token: write # allow getting OIDC token
+  contents: read # allow reading repository contents
+
+# Ensure only one build runs at a time. A new push to main will cancel any in-progress build.
+concurrency:
+  group: "build-sqlancer"
+  cancel-in-progress: true
+
+env:
+  AWS_REGION: ${{ secrets.LIMBO_SIM_AWS_REGION }}
+  IAM_ROLE: ${{ secrets.SQLANCER_DEPLOYER_IAM_ROLE }}
+  ECR_URL: ${{ secrets.SQLANCER_ECR_URL }}
+  GIT_HASH: ${{ github.sha }}
+
+jobs:
+  deploy:
+    runs-on: blacksmith
+    timeout-minutes: 45
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ env.IAM_ROLE }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build and push sqlancer-runner docker image
+        run: |
+          docker build -f testing/sqlancer/sqlancer-runner/Dockerfile.sqlancer -t ${{ env.ECR_URL }}:latest --build-arg GIT_HASH=${{ env.GIT_HASH }} .
+          docker push ${{ env.ECR_URL }}:latest

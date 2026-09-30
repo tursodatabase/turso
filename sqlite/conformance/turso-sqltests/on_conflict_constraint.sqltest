@@ -1,0 +1,58 @@
+@database :memory:
+
+# https://github.com/tursodatabase/turso/issues/5339
+# ON CONFLICT clause on table-level and column-level constraints is now supported.
+
+test create-table-unique-on-conflict-ignore {
+    CREATE TABLE t(a, b, UNIQUE(a) ON CONFLICT IGNORE);
+    INSERT INTO t VALUES(1, 'first');
+    INSERT INTO t VALUES(1, 'second');
+    SELECT * FROM t;
+}
+expect {
+    1|first
+}
+
+test create-table-unique-on-conflict-replace {
+    CREATE TABLE t2(a, b, UNIQUE(a) ON CONFLICT REPLACE);
+    INSERT INTO t2 VALUES(1, 'first');
+    INSERT INTO t2 VALUES(1, 'second');
+    SELECT * FROM t2;
+}
+expect {
+    1|second
+}
+
+test create-table-unique-on-conflict-abort {
+    CREATE TABLE t3(a, b, UNIQUE(a) ON CONFLICT ABORT);
+    INSERT INTO t3 VALUES(1, 'first');
+    INSERT INTO t3 VALUES(1, 'second');
+}
+expect error {
+}
+
+test create-table-unique-on-conflict-rollback {
+    CREATE TABLE t4(a, b, UNIQUE(a) ON CONFLICT ROLLBACK);
+    INSERT INTO t4 VALUES(1, 'first');
+    INSERT INTO t4 VALUES(1, 'second');
+}
+expect error {
+}
+
+test create-table-unique-on-conflict-fail {
+    CREATE TABLE t5(a, b, UNIQUE(a) ON CONFLICT FAIL);
+    INSERT INTO t5 VALUES(1, 'first');
+    INSERT INTO t5 VALUES(1, 'second');
+}
+expect error {
+}
+
+test create-table-primary-key-on-conflict-ignore {
+    CREATE TABLE t6(a, b, PRIMARY KEY(a) ON CONFLICT IGNORE);
+    INSERT INTO t6 VALUES(1, 'first');
+    INSERT INTO t6 VALUES(1, 'second');
+    SELECT * FROM t6;
+}
+expect {
+    1|first
+}

@@ -1,0 +1,195 @@
+@database :memory:
+@requires-file custom_types "uses custom types"
+
+# Bug 24: STRICT table type checking bypassed for custom type columns.
+# Custom type columns should reject values whose type doesn't match the BASE type,
+# just like non-custom STRICT columns do.
+
+# ============================================================================
+# Base case: non-custom INTEGER column rejects TEXT (already works)
+# ============================================================================
+
+@requires strict "uses STRICT tables"
+test plain-integer-rejects-text {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, amount INTEGER) STRICT;
+    INSERT INTO t VALUES (1, 'hello');
+}
+expect error {
+    cannot store TEXT value in INTEGER column
+}
+
+# ============================================================================
+# Custom type with BASE integer should also reject TEXT
+# ============================================================================
+
+@requires strict "uses STRICT tables"
+test cents-rejects-text {
+    CREATE TYPE cents BASE integer ENCODE value * 100 DECODE value / 100;
+    CREATE TABLE t(id INTEGER PRIMARY KEY, amount cents) STRICT;
+    INSERT INTO t VALUES (1, 'hello');
+}
+expect error {
+    cannot store TEXT value in INTEGER column
+}
+
+@requires strict "uses STRICT tables"
+test cents-rejects-blob {
+    CREATE TYPE cents BASE integer ENCODE value * 100 DECODE value / 100;
+    CREATE TABLE t(id INTEGER PRIMARY KEY, amount cents) STRICT;
+    INSERT INTO t VALUES (1, x'AABB');
+}
+expect error {
+    cannot store BLOB value in INTEGER column
+}
+
+@requires strict "uses STRICT tables"
+test cents-accepts-integer {
+    CREATE TYPE cents BASE integer ENCODE value * 100 DECODE value / 100;
+    CREATE TABLE t(id INTEGER PRIMARY KEY, amount cents) STRICT;
+    INSERT INTO t VALUES (1, 42);
+    SELECT amount FROM t;
+}
+expect {
+    42
+}
+
+@requires strict "uses STRICT tables"
+test cents-accepts-real-convertible-to-int {
+    CREATE TYPE cents BASE integer ENCODE value * 100 DECODE value / 100;
+    CREATE TABLE t(id INTEGER PRIMARY KEY, amount cents) STRICT;
+    INSERT INTO t VALUES (1, 3.0);
+    SELECT amount FROM t;
+}
+expect {
+    3
+}
+
+@requires strict "uses STRICT tables"
+test cents-rejects-real-not-convertible {
+    CREATE TYPE cents BASE integer ENCODE value * 100 DECODE value / 100;
+    CREATE TABLE t(id INTEGER PRIMARY KEY, amount cents) STRICT;
+    INSERT INTO t VALUES (1, 3.14);
+}
+expect error {
+    cannot store REAL value in INTEGER column
+}
+
+# ============================================================================
+# Custom type with BASE text should reject INTEGER and BLOB
+# ============================================================================
+
+@requires strict "uses STRICT tables"
+test text-type-accepts-integer-via-affinity {
+    CREATE TYPE upper_text BASE text ENCODE upper(value) DECODE value;
+    CREATE TABLE t(id INTEGER PRIMARY KEY, val upper_text) STRICT;
+    INSERT INTO t VALUES (1, 42);
+    SELECT val FROM t;
+}
+expect {
+    42
+}
+
+@requires strict "uses STRICT tables"
+test text-type-rejects-blob {
+    CREATE TYPE upper_text BASE text ENCODE upper(value) DECODE value;
+    CREATE TABLE t(id INTEGER PRIMARY KEY, val upper_text) STRICT;
+    INSERT INTO t VALUES (1, x'AABB');
+}
+expect error {
+    cannot store BLOB value in TEXT column
+}
+
+@requires strict "uses STRICT tables"
+test text-type-accepts-text {
+    CREATE TYPE upper_text BASE text ENCODE upper(value) DECODE value;
+    CREATE TABLE t(id INTEGER PRIMARY KEY, val upper_text) STRICT;
+    INSERT INTO t VALUES (1, 'hello');
+    SELECT val FROM t;
+}
+expect {
+    HELLO
+}
+
+# ============================================================================
+# Custom type with BASE real should reject TEXT and BLOB
+# ============================================================================
+
+@requires strict "uses STRICT tables"
+test real-type-rejects-text {
+    CREATE TYPE scaled BASE real ENCODE value * 1.5 DECODE value / 1.5;
+    CREATE TABLE t(id INTEGER PRIMARY KEY, val scaled) STRICT;
+    INSERT INTO t VALUES (1, 'hello');
+}
+expect error {
+    cannot store TEXT value in REAL column
+}
+
+# ============================================================================
+# NULL should always be accepted (existing behavior)
+# ============================================================================
+
+@requires strict "uses STRICT tables"
+test cents-accepts-null {
+    CREATE TYPE cents BASE integer ENCODE value * 100 DECODE value / 100;
+    CREATE TABLE t(id INTEGER PRIMARY KEY, amount cents) STRICT;
+    INSERT INTO t VALUES (1, NULL);
+    SELECT COALESCE(amount, 'NULL') FROM t;
+}
+expect {
+    NULL
+}
+
+# ============================================================================
+# UPDATE should also validate input types
+# ============================================================================
+
+@requires strict "uses STRICT tables"
+test update-rejects-wrong-type {
+    CREATE TYPE cents BASE integer ENCODE value * 100 DECODE value / 100;
+    CREATE TABLE t(id INTEGER PRIMARY KEY, amount cents) STRICT;
+    INSERT INTO t VALUES (1, 42);
+    UPDATE t SET amount = 'hello' WHERE id = 1;
+}
+expect error {
+    cannot store TEXT value in INTEGER column
+}
+
+@requires strict "uses STRICT tables"
+test update-accepts-correct-type {
+    CREATE TYPE cents BASE integer ENCODE value * 100 DECODE value / 100;
+    CREATE TABLE t(id INTEGER PRIMARY KEY, amount cents) STRICT;
+    INSERT INTO t VALUES (1, 42);
+    UPDATE t SET amount = 99 WHERE id = 1;
+    SELECT amount FROM t;
+}
+expect {
+    99
+}
+
+# ============================================================================
+# Boolean type should accept both integers and text (BASE any)
+# ============================================================================
+
+@requires strict "uses STRICT tables"
+test boolean-accepts-integer {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, flag boolean) STRICT;
+    INSERT INTO t VALUES (1, 1);
+    INSERT INTO t VALUES (2, 0);
+    SELECT id, flag FROM t ORDER BY id;
+}
+expect {
+    1|1
+    2|0
+}
+
+@requires strict "uses STRICT tables"
+test boolean-accepts-true-false {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, flag boolean) STRICT;
+    INSERT INTO t VALUES (1, true);
+    INSERT INTO t VALUES (2, false);
+    SELECT id, flag FROM t ORDER BY id;
+}
+expect {
+    1|1
+    2|0
+}

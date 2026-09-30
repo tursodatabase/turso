@@ -1,0 +1,28 @@
+[package]
+name = "sql_generation"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lib]
+path = "lib.rs"
+
+[dependencies]
+hex = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+turso_core = { workspace = true, features = ["simulator"] }
+turso_parser = { workspace = true, features = ["serde", "simulator"] }
+rand = { workspace = true }
+anarchist-readable-name-generator-lib = "0.2.0"
+itertools = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+schemars = { workspace = true }
+garde = { workspace = true, features = ["derive", "serde"] }
+indexmap = { workspace = true }
+strum = { workspace = true }
+
+[dev-dependencies]
+rand_chacha = { workspace = true }

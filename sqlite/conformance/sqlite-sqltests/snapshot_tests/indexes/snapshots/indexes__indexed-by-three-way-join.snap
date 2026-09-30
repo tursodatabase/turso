@@ -1,0 +1,24 @@
+---
+source: indexes.sqltest
+expression: |-
+  SELECT p.name, o.order_date, e.message
+      FROM products p INDEXED BY idx_products_category
+      JOIN orders o INDEXED BY idx_orders_status_shipping ON p.id = o.customer_id
+      JOIN events e ON o.id = e.severity
+      WHERE p.category = 'electronics' AND o.status = 'shipped';
+info:
+  statement_type: SELECT
+  tables:
+  - events
+  - o.id
+  - orders
+  - p.id
+  - products
+  setup_blocks:
+  - schema
+  database: ':memory:'
+---
+QUERY PLAN
+|--SEARCH o USING INDEX idx_orders_status_shipping (status=?)
+|--SEARCH p USING INDEX idx_products_category (category=?)
+`--SEARCH e USING INDEX idx_events_severity (severity=?)

@@ -1,0 +1,566 @@
+---
+title: Date and Time Functions
+description: Functions for creating, formatting, and manipulating dates, times, and timestamps
+sidebarTitle: Date & Time
+---
+
+# Date and Time Functions
+
+Turso provides a complete set of date and time functions compatible with SQLite. These functions accept time values in various formats, apply optional modifiers, and return results as TEXT, REAL, or INTEGER depending on the function.
+
+All date and time functions use the [proleptic Gregorian calendar](https://en.wikipedia.org/wiki/Proleptic_Gregorian_calendar) and assume UTC unless the `localtime` modifier is applied.
+
+## Functions
+
+### date()
+
+Returns the date as TEXT in `YYYY-MM-DD` format.
+
+```sql
+date(time-value, modifier, modifier, ...)
+```
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `time-value` | TEXT, REAL, or INTEGER | A time value in any [supported format](#time-value-formats) |
+| `modifier` | TEXT | Zero or more [modifiers](#modifiers) applied left to right |
+
+**Returns:** TEXT in `YYYY-MM-DD` format, or NULL if any argument is invalid.
+
+```sql
+SELECT date('now');
+-- '2025-06-15'
+
+SELECT date('2025-06-15 14:30:00');
+-- '2025-06-15'
+
+SELECT date('2025-06-15', '+1 month');
+-- '2025-07-15'
+
+SELECT date('2025-06-15', 'start of year');
+-- '2025-01-01'
+```
+
+---
+
+### time()
+
+Returns the time as TEXT in `HH:MM:SS` format.
+
+```sql
+time(time-value, modifier, modifier, ...)
+```
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `time-value` | TEXT, REAL, or INTEGER | A time value in any [supported format](#time-value-formats) |
+| `modifier` | TEXT | Zero or more [modifiers](#modifiers) applied left to right |
+
+**Returns:** TEXT in `HH:MM:SS` format, or NULL if any argument is invalid.
+
+```sql
+SELECT time('now');
+-- '14:30:00'
+
+SELECT time('2025-06-15 14:30:00');
+-- '14:30:00'
+
+SELECT time('14:30:00', '+2 hours');
+-- '16:30:00'
+
+SELECT time('14:30:00', '+90 minutes');
+-- '16:00:00'
+```
+
+---
+
+### datetime()
+
+Returns the date and time as TEXT in `YYYY-MM-DD HH:MM:SS` format.
+
+```sql
+datetime(time-value, modifier, modifier, ...)
+```
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `time-value` | TEXT, REAL, or INTEGER | A time value in any [supported format](#time-value-formats) |
+| `modifier` | TEXT | Zero or more [modifiers](#modifiers) applied left to right |
+
+**Returns:** TEXT in `YYYY-MM-DD HH:MM:SS` format, or NULL if any argument is invalid.
+
+```sql
+SELECT datetime('now');
+-- '2025-06-15 14:30:00'
+
+SELECT datetime('2025-06-15', '+1 day', '+6 hours');
+-- '2025-06-16 06:00:00'
+
+SELECT datetime(1718458200, 'unixepoch');
+-- '2024-06-15 14:30:00'
+```
+
+---
+
+### julianday()
+
+Returns the [Julian day number](https://en.wikipedia.org/wiki/Julian_day) as a REAL. The Julian day number is the number of days since noon on November 24, 4714 B.C. (proleptic Gregorian calendar).
+
+```sql
+julianday(time-value, modifier, modifier, ...)
+```
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `time-value` | TEXT, REAL, or INTEGER | A time value in any [supported format](#time-value-formats) |
+| `modifier` | TEXT | Zero or more [modifiers](#modifiers) applied left to right |
+
+**Returns:** REAL representing the Julian day number, or NULL if any argument is invalid.
+
+```sql
+SELECT julianday('2025-06-15');
+-- 2460811.5
+
+SELECT julianday('now');
+-- 2460811.104166...
+
+-- Compute the number of days between two dates
+SELECT julianday('2025-12-25') - julianday('2025-06-15');
+-- 193.0
+```
+
+---
+
+### unixepoch()
+
+Returns the Unix timestamp as an INTEGER. The Unix timestamp is the number of seconds since `1970-01-01 00:00:00 UTC`.
+
+```sql
+unixepoch(time-value, modifier, modifier, ...)
+```
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `time-value` | TEXT, REAL, or INTEGER | A time value in any [supported format](#time-value-formats) |
+| `modifier` | TEXT | Zero or more [modifiers](#modifiers) applied left to right |
+
+**Returns:** INTEGER representing seconds since the Unix epoch, or NULL if any argument is invalid. If the `subsec` modifier is used, returns REAL with fractional seconds.
+
+```sql
+SELECT unixepoch('now');
+-- 1718458200
+
+SELECT unixepoch('2025-06-15 14:30:00');
+-- 1750001400
+
+SELECT unixepoch('2025-06-15 14:30:00.123', 'subsec');
+-- 1750001400.123
+```
+
+---
+
+### strftime()
+
+Returns a formatted date/time string according to the specified format string.
+
+```sql
+strftime(format, time-value, modifier, modifier, ...)
+```
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `format` | TEXT | A format string containing [substitution codes](#strftime-format-codes) |
+| `time-value` | TEXT, REAL, or INTEGER | A time value in any [supported format](#time-value-formats) |
+| `modifier` | TEXT | Zero or more [modifiers](#modifiers) applied left to right |
+
+**Returns:** TEXT with format codes replaced by date/time components, or NULL if any argument is invalid.
+
+The other date/time functions can be expressed as `strftime` calls:
+
+| Function | Equivalent strftime |
+|----------|---------------------|
+| `date(...)` | `strftime('%Y-%m-%d', ...)` |
+| `time(...)` | `strftime('%H:%M:%S', ...)` |
+| `datetime(...)` | `strftime('%Y-%m-%d %H:%M:%S', ...)` |
+| `julianday(...)` | `strftime('%J', ...)` (as TEXT) |
+| `unixepoch(...)` | `strftime('%s', ...)` (as TEXT) |
+
+```sql
+SELECT strftime('%Y', 'now');
+-- '2025'
+
+SELECT strftime('%m/%d/%Y', '2025-06-15');
+-- '06/15/2025'
+
+SELECT strftime('%H:%M', '2025-06-15 14:30:00');
+-- '14:30'
+
+SELECT strftime('%Y-%m-%d %H:%M:%f', '2025-06-15 14:30:00.123');
+-- '2025-06-15 14:30:00.123'
+
+SELECT strftime('%s', '2025-06-15 14:30:00');
+-- '1750001400'
+
+SELECT strftime('%W', '2025-06-15');
+-- '23' (week of year)
+```
+
+#### strftime Format Codes
+
+| Code | Description | Example |
+|------|-------------|---------|
+| `%d` | Day of month (01-31) | `15` |
+| `%e` | Day of month with leading space ( 1-31) | `15` |
+| `%f` | Fractional seconds (SS.SSS) | `00.123` |
+| `%F` | ISO 8601 date (YYYY-MM-DD) | `2025-06-15` |
+| `%H` | Hour (00-23) | `14` |
+| `%I` | Hour (01-12) | `02` |
+| `%j` | Day of year (001-366) | `166` |
+| `%J` | Julian day number | `2460811.5` |
+| `%k` | Hour with leading space ( 0-23) | `14` |
+| `%l` | Hour with leading space ( 1-12) | ` 2` |
+| `%m` | Month (01-12) | `06` |
+| `%M` | Minute (00-59) | `30` |
+| `%p` | AM or PM | `PM` |
+| `%P` | am or pm | `pm` |
+| `%R` | Time as HH:MM | `14:30` |
+| `%s` | Seconds since Unix epoch | `1750001400` |
+| `%S` | Seconds (00-59) | `00` |
+| `%T` | Time as HH:MM:SS | `14:30:00` |
+| `%u` | Day of week (1=Monday, 7=Sunday) | `7` |
+| `%w` | Day of week (0=Sunday, 6=Saturday) | `0` |
+| `%W` | Week of year (00-53) | `23` |
+| `%Y` | Year (0000-9999) | `2025` |
+| `%%` | Literal `%` character | `%` |
+
+---
+
+### timediff()
+
+Returns the difference between two time values as a TEXT string in the format `(+|-)YYYY-MM-DD HH:MM:SS.SSS`. The result represents the time that must be added to `time2` to produce `time1`.
+
+```sql
+timediff(time1, time2)
+```
+
+| Parameter | Type | Description |
+|-----------|------|-------------|
+| `time1` | TEXT, REAL, or INTEGER | The later time value |
+| `time2` | TEXT, REAL, or INTEGER | The earlier time value |
+
+**Returns:** TEXT in `(+|-)YYYY-MM-DD HH:MM:SS.SSS` format, or NULL if either argument is invalid.
+
+```sql
+SELECT timediff('2025-06-15', '2025-06-10');
+-- '+0000-00-05 00:00:00.000'
+
+SELECT timediff('2025-01-01', '2024-01-01');
+-- '+0001-00-00 00:00:00.000'
+
+SELECT timediff('2025-06-15 14:30:00', '2025-06-15 10:00:00');
+-- '+0000-00-00 04:30:00.000'
+
+SELECT timediff('2024-01-01', '2025-06-15');
+-- '-0001-05-14 00:00:00.000'
+```
+
+## Time Value Formats
+
+All date and time functions accept time values in the following formats.
+
+| Format | Example | Description |
+|--------|---------|-------------|
+| `YYYY-MM-DD` | `'2025-06-15'` | Date only (time defaults to 00:00:00) |
+| `YYYY-MM-DD HH:MM` | `'2025-06-15 14:30'` | Date and time (seconds default to 00) |
+| `YYYY-MM-DD HH:MM:SS` | `'2025-06-15 14:30:00'` | Date and time with seconds |
+| `YYYY-MM-DD HH:MM:SS.SSS` | `'2025-06-15 14:30:00.123'` | Date and time with fractional seconds |
+| `YYYY-MM-DDTHH:MM` | `'2025-06-15T14:30'` | ISO 8601 with `T` separator |
+| `YYYY-MM-DDTHH:MM:SS` | `'2025-06-15T14:30:00'` | ISO 8601 with `T` separator |
+| `YYYY-MM-DDTHH:MM:SS.SSS` | `'2025-06-15T14:30:00.123'` | ISO 8601 with `T` separator |
+| `HH:MM` | `'14:30'` | Time only (date defaults to 2000-01-01) |
+| `HH:MM:SS` | `'14:30:00'` | Time only with seconds |
+| `HH:MM:SS.SSS` | `'14:30:00.123'` | Time only with fractional seconds |
+| `now` | `'now'` | Current date and time in UTC |
+| Julian day number | `2460811.5` | REAL number representing a Julian day |
+| Unix timestamp | `1718458200` | INTEGER, requires `'unixepoch'` modifier |
+
+<Info>
+When passing a Unix timestamp as the time value, you must include the `'unixepoch'` modifier so the function knows to interpret the number as seconds since 1970-01-01, not as a Julian day number.
+</Info>
+
+```sql
+-- Unix timestamp requires the 'unixepoch' modifier
+SELECT datetime(1718458200, 'unixepoch');
+-- '2024-06-15 14:30:00'
+
+-- Without 'unixepoch', the number is treated as a Julian day
+SELECT datetime(1718458200);
+-- NULL (or a very distant date)
+
+-- 'now' returns the current UTC time
+SELECT datetime('now');
+-- '2025-06-15 14:30:00'
+```
+
+## Modifiers
+
+Modifiers transform the time value. Multiple modifiers are applied left to right. If any modifier is invalid, the function returns NULL.
+
+### Offset Modifiers
+
+Offset modifiers add or subtract a specified amount from the time value.
+
+| Modifier | Description | Example |
+|----------|-------------|---------|
+| `NNN days` | Add NNN days | `'+7 days'`, `'-1 days'` |
+| `NNN hours` | Add NNN hours | `'+6 hours'` |
+| `NNN minutes` | Add NNN minutes | `'+30 minutes'` |
+| `NNN seconds` | Add NNN seconds | `'+90 seconds'` |
+| `NNN.NNNN seconds` | Add fractional seconds | `'+0.5 seconds'` |
+| `NNN months` | Add NNN months | `'+1 months'` |
+| `NNN years` | Add NNN years | `'+1 years'` |
+
+NNN can be a positive or negative integer (or real number for seconds). The `+` sign is optional for positive values.
+
+```sql
+SELECT date('2025-06-15', '+7 days');
+-- '2025-06-22'
+
+SELECT datetime('2025-06-15 14:30:00', '-6 hours');
+-- '2025-06-15 08:30:00'
+
+SELECT date('2025-01-31', '+1 months');
+-- '2025-03-03' (Jan 31 + 1 month = Mar 3)
+```
+
+### Time Offset Modifier
+
+A time offset in the format `+HH:MM` or `-HH:MM` adds or subtracts the specified hours and minutes.
+
+```sql
+SELECT time('14:30:00', '+05:30');
+-- '20:00:00'
+
+SELECT datetime('2025-06-15 14:30:00', '-08:00');
+-- '2025-06-15 06:30:00'
+```
+
+### Start-of Modifiers
+
+These modifiers reset the time value to the start of a period.
+
+| Modifier | Description |
+|----------|-------------|
+| `start of day` | Sets time to 00:00:00, keeps date |
+| `start of month` | Sets to first day of the month, time to 00:00:00 |
+| `start of year` | Sets to January 1 of the year, time to 00:00:00 |
+
+```sql
+SELECT datetime('2025-06-15 14:30:00', 'start of day');
+-- '2025-06-15 00:00:00'
+
+SELECT date('2025-06-15', 'start of month');
+-- '2025-06-01'
+
+SELECT date('2025-06-15', 'start of year');
+-- '2025-01-01'
+```
+
+### Weekday Modifier
+
+The `weekday N` modifier advances the date to the next occurrence of the specified weekday, where 0 = Sunday, 1 = Monday, ..., 6 = Saturday. If the current date already falls on that weekday, it is unchanged.
+
+```sql
+-- Next Sunday (weekday 0)
+SELECT date('2025-06-15', 'weekday 0');
+-- '2025-06-15' (June 15, 2025 is a Sunday)
+
+-- Next Monday
+SELECT date('2025-06-15', 'weekday 1');
+-- '2025-06-16'
+
+-- Next Friday
+SELECT date('2025-06-15', 'weekday 5');
+-- '2025-06-20'
+```
+
+### Interpretation Modifiers
+
+| Modifier | Description |
+|----------|-------------|
+| `unixepoch` | Interpret the time value as a Unix timestamp (seconds since 1970-01-01) |
+| `julianday` | Interpret the time value as a Julian day number |
+| `auto` | Automatically detect whether the value is a Unix timestamp or Julian day |
+
+```sql
+SELECT datetime(1718458200, 'unixepoch');
+-- '2024-06-15 14:30:00'
+
+SELECT datetime(2460811.5, 'julianday');
+-- '2025-06-15 00:00:00'
+
+SELECT datetime(0, 'unixepoch');
+-- '1970-01-01 00:00:00'
+```
+
+### Timezone Modifiers
+
+| Modifier | Description |
+|----------|-------------|
+| `localtime` | Convert from UTC to local time |
+| `utc` | Convert from local time to UTC |
+
+```sql
+SELECT datetime('2025-06-15 14:30:00', 'localtime');
+-- '2025-06-15 07:30:00' (example: UTC-7)
+
+SELECT time('now', 'localtime');
+-- Local current time
+```
+
+### Rounding Modifiers
+
+| Modifier | Description |
+|----------|-------------|
+| `ceiling` | When adding months, if the day overflows, advance to the first day of the next month |
+| `floor` | When adding months, if the day overflows, use the last day of the target month |
+
+These modifiers affect how month arithmetic handles months with different numbers of days.
+
+```sql
+-- Without floor/ceiling, month overflow rolls forward
+SELECT date('2025-01-31', '+1 months');
+-- '2025-03-03'
+
+-- With floor, clamp to last day of target month
+SELECT date('2025-01-31', 'floor', '+1 months');
+-- '2025-02-28'
+
+-- With ceiling, advance to first of next month
+SELECT date('2025-01-31', 'ceiling', '+1 months');
+-- '2025-03-01'
+```
+
+### Subsec Modifier
+
+The `subsec` modifier causes `unixepoch()` to return a REAL with fractional seconds instead of truncating to INTEGER.
+
+```sql
+SELECT unixepoch('2025-06-15 14:30:00.456', 'subsec');
+-- 1750001400.456
+```
+
+## Practical Examples
+
+### Get the Current Date and Time
+
+```sql
+SELECT date('now');                    -- Current UTC date
+SELECT time('now');                    -- Current UTC time
+SELECT datetime('now');                -- Current UTC date and time
+SELECT datetime('now', 'localtime');   -- Current local date and time
+```
+
+### Date Arithmetic
+
+```sql
+-- Tomorrow
+SELECT date('now', '+1 day');
+
+-- 90 days from now
+SELECT date('now', '+90 days');
+
+-- Last day of the current month
+SELECT date('now', 'start of month', '+1 month', '-1 day');
+
+-- First Monday of the current month
+SELECT date('now', 'start of month', 'weekday 1');
+```
+
+### Age Calculation
+
+```sql
+SELECT
+    name,
+    birth_date,
+    timediff('now', birth_date) AS age_diff
+FROM users;
+```
+
+### Convert Between Formats
+
+```sql
+-- Unix timestamp to human-readable
+SELECT datetime(1718458200, 'unixepoch');
+
+-- Human-readable to Unix timestamp
+SELECT unixepoch('2025-06-15 14:30:00');
+
+-- Date to Julian day
+SELECT julianday('2025-06-15');
+
+-- Julian day to date
+SELECT date(2460811.5);
+```
+
+### Group Records by Time Period
+
+```sql
+-- Count orders per month
+SELECT
+    strftime('%Y-%m', order_date) AS month,
+    COUNT(*) AS order_count
+FROM orders
+GROUP BY strftime('%Y-%m', order_date)
+ORDER BY month;
+
+-- Count events per day of week
+SELECT
+    CASE strftime('%w', event_date)
+        WHEN '0' THEN 'Sunday'
+        WHEN '1' THEN 'Monday'
+        WHEN '2' THEN 'Tuesday'
+        WHEN '3' THEN 'Wednesday'
+        WHEN '4' THEN 'Thursday'
+        WHEN '5' THEN 'Friday'
+        WHEN '6' THEN 'Saturday'
+    END AS day_name,
+    COUNT(*) AS event_count
+FROM events
+GROUP BY strftime('%w', event_date)
+ORDER BY strftime('%w', event_date);
+```
+
+### Filter by Date Range
+
+```sql
+-- Records from the last 30 days
+SELECT * FROM logs
+WHERE timestamp >= datetime('now', '-30 days');
+
+-- Records from a specific month
+SELECT * FROM orders
+WHERE order_date >= '2025-06-01'
+  AND order_date < '2025-07-01';
+
+-- Records from this year
+SELECT * FROM sales
+WHERE date(sale_date) >= date('now', 'start of year');
+```
+
+### Compute Elapsed Time
+
+```sql
+-- Days between two dates
+SELECT julianday('2025-12-25') - julianday('now') AS days_until_christmas;
+
+-- Seconds between two timestamps
+SELECT unixepoch('2025-06-15 18:00:00') - unixepoch('2025-06-15 14:30:00') AS seconds_elapsed;
+-- 12600
+```
+
+## See Also
+
+- [Expressions](/docs/sql-reference/expressions) for using functions in expressions
+- [Data Types](/docs/sql-reference/data-types) for TEXT, REAL, and INTEGER storage classes
+- [Scalar Functions](/docs/sql-reference/functions/scalar) for other built-in functions

@@ -1,0 +1,969 @@
+//! Main simulation runner.
+//!
+//! This module orchestrates the simulation by:
+//! 1. Creating both Turso and SQLite databases
+//! 2. Generating and executing CREATE TABLE statements
+//! 3. Generating statements (DML and DDL) using sql_gen
+//! 4. Executing them on both databases
+//! 5. Checking the differential oracle
+//! 6. Re-introspecting schemas after DDL statements
+
+use std::cell::RefCell;
+use std::io::Write;
+use std::panic::RefUnwindSafe;
+use std::path::PathBuf;
+use std::sync::Arc;
+use turso_core::SqliteDialect;
+
+use anyhow::{Context, Result, bail};
+use comfy_table::{Attribute, Cell, Color, ContentArrangement, Table};
+use parking_lot::Mutex;
+use rand::{RngCore, SeedableRng};
+use rand_chacha::ChaCha8Rng;
+use turso_core::Database;
+
+use crate::generate::{GeneratorKind, PropTestBackend, SqlGenBackend, SqlGenerator, WeightProfile};
+use crate::memory::{MemorySimIO, SimIO};
+use crate::oracle::{DifferentialOracle, OracleResult, QueryResult, check_differential};
+use crate::schema::SchemaIntrospector;
+pub use sql_gen::TreeMode;
+use sql_gen_prop::SqlValue;
+
+const MAX_GENERATED_SQL_BYTES: usize = 64 * 1024;
+
+fn generated_sql_is_too_large(sql: &str) -> bool {
+    sql.len() > MAX_GENERATED_SQL_BYTES
+}
+
+/// Run `sql` on Turso and return each row as a vector of `ncols` text columns.
+/// Used by the failure-state dumper, whose queries only ever select text.
+fn turso_text_rows(
+    conn: &Arc<turso_core::Connection>,
+    sql: &str,
+    ncols: usize,
+) -> Vec<Vec<String>> {
+    let mut out = Vec::new();
+    let Ok(mut stmt) = conn.prepare(sql) else {
+        return out;
+    };
+    let _ = stmt.run_with_row_callback(|row| {
+        let mut cols = Vec::with_capacity(ncols);
+        for c in 0..ncols {
+            cols.push(match row.get_value(c).clone() {
+                turso_core::Value::Text(s) => s.as_str().to_string(),
+                turso_core::Value::Null => String::new(),
+                other => format!("{other:?}"),
+            });
+        }
+        out.push(cols);
+        Ok(())
+    });
+    out
+}
+
+/// Same as [`turso_text_rows`] but for the SQLite reference connection.
+fn sqlite_text_rows(conn: &rusqlite::Connection, sql: &str, ncols: usize) -> Vec<Vec<String>> {
+    let mut out = Vec::new();
+    let Ok(mut stmt) = conn.prepare(sql) else {
+        return out;
+    };
+    let Ok(mut rows) = stmt.query([]) else {
+        return out;
+    };
+    while let Ok(Some(r)) = rows.next() {
+        let mut cols = Vec::with_capacity(ncols);
+        for c in 0..ncols {
+            cols.push(
+                r.get::<_, Option<String>>(c)
+                    .ok()
+                    .flatten()
+                    .unwrap_or_default(),
+            );
+        }
+        out.push(cols);
+    }
+    out
+}
+
+/// The sqlite_master query for one object kind in one database.
+fn state_ddl_query(db: &str, kind: &str) -> String {
+    let master = if db == "main" {
+        "sqlite_master".to_string()
+    } else {
+        format!("{db}.sqlite_master")
+    };
+    format!("SELECT name, sql FROM {master} WHERE type='{kind}' AND sql IS NOT NULL")
+}
+
+/// Rewrite a stored CREATE statement so it recreates the object in the same
+/// database it came from: temp objects get the TEMP keyword, aux objects get
+/// an `aux.` prefix on the object name. Generated names are simple unquoted
+/// identifiers, so a single textual replacement is enough.
+fn rewrite_state_ddl(db: &str, name: &str, sql: &str, keyword: &str) -> String {
+    match db {
+        "temp" => sql.replacen("CREATE ", "CREATE TEMP ", 1),
+        "aux" => sql.replacen(
+            &format!("{keyword} {name}"),
+            &format!("{keyword} aux.{name}"),
+            1,
+        ),
+        _ => sql.to_string(),
+    }
+}
+
+/// Build a self-contained SQL script that reconstructs one engine's full state
+/// (main, temp, and aux tables with all rows), followed by the failing
+/// statement as a comment. `query` runs a text-only query against that engine.
+fn build_state_dump(
+    schema: &sql_gen::Schema,
+    failing_sql: &str,
+    query: &dyn Fn(&str, usize) -> Vec<Vec<String>>,
+) -> String {
+    let mut out = String::new();
+    out.push_str("-- Reconstructed engine state captured at an oracle failure.\n");
+    out.push_str("ATTACH ':memory:' AS aux;\n\n-- tables\n");
+
+    // Tables first, so the data inserts below have somewhere to go.
+    for db in ["main", "temp", "aux"] {
+        for row in query(&state_ddl_query(db, "table"), 2) {
+            out.push_str(&rewrite_state_ddl(db, &row[0], &row[1], "TABLE"));
+            out.push_str(";\n");
+        }
+    }
+
+    // Data. qualified_name() already carries the temp./aux. prefix.
+    out.push_str("\n-- data\n");
+    for table in &schema.tables {
+        if table.columns.is_empty() {
+            continue;
+        }
+        let quoted: Vec<String> = table
+            .columns
+            .iter()
+            .map(|c| format!("quote(\"{}\")", c.name))
+            .collect();
+        let qname = table.qualified_name();
+        let insert_query = format!(
+            "SELECT 'INSERT INTO {qname} VALUES(' || {} || ');' FROM {qname}",
+            quoted.join(" || ',' || ")
+        );
+        for row in query(&insert_query, 1) {
+            out.push_str(&row[0]);
+            out.push('\n');
+        }
+    }
+
+    // Indexes and triggers last, so inserting the data above did not fire them.
+    out.push_str("\n-- indexes and triggers\n");
+    for db in ["main", "temp", "aux"] {
+        for (kind, keyword) in [("index", "INDEX"), ("trigger", "TRIGGER")] {
+            for row in query(&state_ddl_query(db, kind), 2) {
+                out.push_str(&rewrite_state_ddl(db, &row[0], &row[1], keyword));
+                out.push_str(";\n");
+            }
+        }
+    }
+
+    out.push_str("\n-- FAILING STATEMENT:\n-- ");
+    out.push_str(failing_sql);
+    out.push('\n');
+    out
+}
+
+/// Configuration for the simulator.
+#[derive(Debug, Clone)]
+pub struct SimConfig {
+    /// Random seed for deterministic execution.
+    pub seed: u64,
+    /// Number of tables to create.
+    pub num_tables: usize,
+    /// Number of columns per table.
+    pub columns_per_table: usize,
+    /// Number of statements to generate and execute.
+    pub num_statements: usize,
+    /// Whether to print verbose output.
+    pub verbose: bool,
+    /// Keep simulation databases
+    pub keep_files: bool,
+    /// Which SQL generator backend to use.
+    pub generator: GeneratorKind,
+    /// Whether to write a coverage report.
+    pub coverage: bool,
+    /// Coverage report tree mode.
+    pub tree_mode: TreeMode,
+    /// Whether to enable MVCC mode.
+    pub mvcc: bool,
+    /// Probability that each expression-list SELECT column is generated
+    /// as a window function. 0.0 disables window-function generation
+    /// entirely; values up to 1.0 weight the SELECT list heavily toward
+    /// `func(...) OVER (...)` projections.
+    pub window_function_probability: f64,
+    /// Generate SELECT-only workloads whose CTE definitions are all recursive.
+    pub recursive_cte_focus: bool,
+    /// Named statement-weight mix to generate with.
+    pub weight_profile: WeightProfile,
+}
+
+impl Default for SimConfig {
+    fn default() -> Self {
+        Self {
+            seed: rand::rng().next_u64(),
+            num_tables: 2,
+            columns_per_table: 5,
+            num_statements: 100,
+            verbose: false,
+            keep_files: false,
+            generator: GeneratorKind::default(),
+            coverage: false,
+            tree_mode: TreeMode::default(),
+            mvcc: false,
+            window_function_probability: 0.0,
+            recursive_cte_focus: false,
+            weight_profile: WeightProfile::default(),
+        }
+    }
+}
+
+/// Statistics from a simulation run.
+#[derive(Debug, Default)]
+pub struct SimStats {
+    /// Number of statements executed.
+    pub statements_executed: usize,
+    /// Number of statements skipped because EXPLAIN failed in at least one engine.
+    pub statements_skipped: usize,
+    /// Number of oracle warnings (e.g., LIMIT without ORDER BY mismatches).
+    pub warnings: usize,
+    /// Number of oracle failures.
+    pub oracle_failures: usize,
+    /// Number of errors encountered.
+    pub errors: usize,
+    /// Correlated SELECTs checked with unnesting forced and disabled.
+    pub unnesting_invariants_checked: usize,
+}
+
+impl SimStats {
+    /// Returns true if the simulation completed successfully (no failures).
+    pub fn is_success(&self) -> bool {
+        self.oracle_failures == 0
+    }
+
+    /// Create a colorful table displaying simulation results.
+    pub fn to_table(&self, config: &SimConfig) -> Table {
+        let mut table = Table::new();
+        table.set_content_arrangement(ContentArrangement::Dynamic);
+
+        // Header
+        let status = if self.is_success() {
+            Cell::new("PASSED")
+                .fg(Color::Green)
+                .add_attribute(Attribute::Bold)
+        } else {
+            Cell::new("FAILED")
+                .fg(Color::Red)
+                .add_attribute(Attribute::Bold)
+        };
+
+        table.set_header(vec![
+            Cell::new("Simulation Results").add_attribute(Attribute::Bold),
+            status,
+        ]);
+
+        // Config section
+        table.add_row(vec![
+            Cell::new("Seed").fg(Color::Cyan),
+            Cell::new(config.seed),
+        ]);
+        table.add_row(vec![
+            Cell::new("Target Statements").fg(Color::Cyan),
+            Cell::new(config.num_statements),
+        ]);
+
+        // Results section
+        table.add_row(vec![
+            Cell::new("Statements Executed").fg(Color::Blue),
+            Cell::new(self.statements_executed).fg(Color::Blue),
+        ]);
+        table.add_row(vec![
+            Cell::new("Statements Skipped").fg(Color::Yellow),
+            Cell::new(self.statements_skipped).fg(Color::Yellow),
+        ]);
+
+        // Warnings - yellow if any
+        let warnings_cell = if self.warnings > 0 {
+            Cell::new(self.warnings).fg(Color::Yellow)
+        } else {
+            Cell::new(self.warnings).fg(Color::Green)
+        };
+        table.add_row(vec![Cell::new("Warnings").fg(Color::Yellow), warnings_cell]);
+
+        // Failures - red if any
+        let failures_cell = if self.oracle_failures > 0 {
+            Cell::new(self.oracle_failures)
+                .fg(Color::Red)
+                .add_attribute(Attribute::Bold)
+        } else {
+            Cell::new(self.oracle_failures).fg(Color::Green)
+        };
+        table.add_row(vec![
+            Cell::new("Oracle Failures").fg(Color::Red),
+            failures_cell,
+        ]);
+
+        // Errors - red if any
+        let errors_cell = if self.errors > 0 {
+            Cell::new(self.errors).fg(Color::Red)
+        } else {
+            Cell::new(self.errors).fg(Color::Green)
+        };
+        table.add_row(vec![Cell::new("Errors").fg(Color::Red), errors_cell]);
+        table.add_row(vec![
+            Cell::new("Unnesting invariants").fg(Color::Blue),
+            Cell::new(self.unnesting_invariants_checked).fg(Color::Blue),
+        ]);
+
+        table
+    }
+
+    /// Print the stats as a colorful table to stdout.
+    pub fn print_table(&self, config: &SimConfig) {
+        println!("\n{}", self.to_table(config));
+    }
+}
+
+/// The main simulator.
+pub struct Fuzzer {
+    config: SimConfig,
+    rng: RefCell<ChaCha8Rng>,
+    turso_conn: Arc<turso_core::Connection>,
+    sqlite_conn: rusqlite::Connection,
+    #[expect(dead_code)]
+    turso_db: Arc<Database>,
+    /// In-memory IO for the Turso database.
+    io: Arc<MemorySimIO>,
+    /// Directory to save run artifacts
+    pub out_dir: PathBuf,
+    /// Captures panic hook info (location + backtrace) for the last panic.
+    panic_context: Arc<Mutex<Option<String>>>,
+}
+
+impl RefUnwindSafe for Fuzzer {}
+
+impl Fuzzer {
+    /// Create a new simulator with in-memory databases.
+    ///
+    /// Uses `MemorySimIO` for deterministic in-memory storage.
+    pub fn new(config: SimConfig) -> Result<Self> {
+        let out_dir: PathBuf = "simulator-output".into();
+        let rng = ChaCha8Rng::seed_from_u64(config.seed);
+
+        if !out_dir.exists() {
+            std::fs::create_dir_all(&out_dir)?;
+        }
+
+        // Create Turso in-memory database using MemorySimIO
+        let io = Arc::new(MemorySimIO::new(config.seed));
+        let opts = turso_core::DatabaseOpts::new().with_attach(true);
+
+        let turso_db = Database::open_file_with_flags(
+            io.clone(),
+            out_dir.join("test.db").to_str().unwrap(),
+            turso_core::OpenFlags::default(),
+            opts,
+            None,
+            Arc::new(SqliteDialect),
+        )?;
+        let turso_conn = turso_db.connect()?;
+
+        // Create SQLite in-memory database
+        let sqlite_conn = if config.keep_files {
+            let path = out_dir.join("test-sqlite.db");
+            if path.exists() {
+                std::fs::remove_file(&path)?;
+            }
+            rusqlite::Connection::open(path.to_str().unwrap())
+        } else {
+            rusqlite::Connection::open_in_memory()
+        }
+        .context("Failed to open SQLite database")?;
+
+        // Attach an in-memory database on both connections
+        turso_conn
+            .execute("ATTACH ':memory:' AS aux")
+            .context("Failed to ATTACH on Turso")?;
+        sqlite_conn
+            .execute("ATTACH ':memory:' AS aux", [])
+            .context("Failed to ATTACH on SQLite")?;
+        tracing::info!("Attached ':memory:' AS aux on both connections");
+
+        // Enable MVCC after ATTACH (ATTACH is not supported in MVCC mode)
+        if config.mvcc {
+            turso_conn
+                .execute("PRAGMA journal_mode = 'mvcc'")
+                .context("Failed to enable MVCC mode")?;
+        }
+
+        Ok(Self {
+            config,
+            rng: RefCell::new(rng),
+            turso_conn,
+            sqlite_conn,
+            turso_db,
+            io,
+            out_dir,
+            panic_context: Arc::new(Mutex::new(None)),
+        })
+    }
+
+    /// Persist the in-memory database files to disk.
+    ///
+    /// Writes `.db`, `.wal`, and `.log` files to the filesystem.
+    pub fn persist_files(&self) -> Result<()> {
+        self.io.persist_files()?;
+        Ok(())
+    }
+
+    /// Introspect and return the current schema from the Turso
+    /// database, including attached databases.
+    ///
+    /// Uses `from_turso_with_attached` so callers see the same view
+    /// the internal schema verification path (`introspect_and_verify_schemas`)
+    /// uses; otherwise the diff fuzzer's "my view of the schema" and
+    /// "the schema I run integrity checks against" could silently
+    /// diverge when attached databases are present.
+    pub fn get_schema(&self) -> Result<sql_gen::Schema> {
+        SchemaIntrospector::from_turso_with_attached(&self.turso_conn)
+            .context("Failed to introspect Turso schema (with attached)")
+    }
+
+    /// Run the simulation.
+    pub fn run(&self) -> Result<SimStats> {
+        let mut stats = SimStats::default();
+        let mut executed_sql = Vec::new();
+        let mut coverage = None;
+
+        let result = self.run_inner(&mut stats, &mut executed_sql, &mut coverage);
+
+        // Always write SQL file and print stats, even on error
+        if let Err(e) = self.write_sql_file(&executed_sql) {
+            tracing::warn!("Failed to write test.sql: {e}");
+        }
+        if self.config.coverage {
+            if let Some(cov) = coverage {
+                if let Err(e) = self.write_coverage_report(&cov) {
+                    tracing::warn!("Failed to write coverage report: {e}");
+                }
+            }
+        }
+        stats.print_table(&self.config);
+
+        result.map(|()| stats)
+    }
+
+    /// Write the coverage report to simulator-output/coverage.txt
+    fn write_coverage_report(&self, coverage: &sql_gen::Coverage) -> Result<()> {
+        let report = coverage.report_with_mode(self.config.tree_mode);
+        let full_path = self.out_dir.join("coverage.txt");
+        std::fs::write(&full_path, report.to_string())?;
+        tracing::info!("Wrote coverage report to {}", full_path.display());
+        Ok(())
+    }
+
+    /// Write all executed SQL statements to test.sql
+    fn write_sql_file(&self, statements: &[String]) -> Result<()> {
+        let full_path = self.out_dir.join("test.sql");
+        let mut file = std::fs::File::create(full_path.clone())?;
+        for sql in statements {
+            writeln!(file, "{sql};")?;
+        }
+        tracing::info!(
+            "Wrote {} statements to {}",
+            statements.len(),
+            full_path.display()
+        );
+        Ok(())
+    }
+
+    /// On an oracle failure, dump each engine's full state as reconstructable
+    /// SQL (turso-state.sql, sqlite-state.sql). This captures main, temp, and
+    /// aux tables with all rows, so a divergence that depends on accumulated
+    /// state can be replayed as a small self-contained script. Returns the
+    /// SQLite-side dump, which the shrinker uses as its replay baseline.
+    fn dump_failure_state(&self, schema: &sql_gen::Schema, failing_sql: &str) -> String {
+        let turso_conn = self.turso_conn.clone();
+        let turso_query = move |sql: &str, ncols: usize| turso_text_rows(&turso_conn, sql, ncols);
+        let turso_dump = build_state_dump(schema, failing_sql, &turso_query);
+        let sqlite_query =
+            |sql: &str, ncols: usize| sqlite_text_rows(&self.sqlite_conn, sql, ncols);
+        let sqlite_dump = build_state_dump(schema, failing_sql, &sqlite_query);
+        for (name, body) in [
+            ("turso-state.sql", turso_dump.as_str()),
+            ("sqlite-state.sql", sqlite_dump.as_str()),
+        ] {
+            let path = self.out_dir.join(name);
+            if let Err(e) = std::fs::write(&path, body) {
+                tracing::warn!("Failed to write {}: {e}", path.display());
+            } else {
+                tracing::info!("Wrote state dump to {}", path.display());
+            }
+        }
+        sqlite_dump
+    }
+
+    /// Minimize the failing statement against the dumped state — or against
+    /// the run's executed statements when the divergence needs the history —
+    /// and write the result (state script + minimized statement) to
+    /// minimized.sql.
+    fn shrink_and_write(&self, state_dump: &str, executed_sql: &[String], failing_sql: &str) {
+        // The executed statements double as a replay script. Skip comment
+        // lines (skipped/warning markers) the runner interleaves.
+        let history: String = executed_sql
+            .iter()
+            .filter(|s| !s.trim_start().starts_with("--"))
+            .map(|s| format!("{s};\n"))
+            .collect();
+        match crate::shrink::shrink_statement(state_dump, &history, failing_sql) {
+            Ok(Some(minimized)) => {
+                let path = self.out_dir.join("minimized.sql");
+                let body = format!(
+                    "{}\n-- MINIMIZED STATEMENT:\n{};\n",
+                    minimized.state_sql, minimized.statement
+                );
+                if let Err(e) = std::fs::write(&path, body) {
+                    tracing::warn!("Failed to write {}: {e}", path.display());
+                } else {
+                    tracing::info!(
+                        "Wrote minimized reproduction ({} state lines, {} byte statement) to {}",
+                        minimized.state_sql.lines().count(),
+                        minimized.statement.len(),
+                        path.display()
+                    );
+                }
+            }
+            Ok(None) => {}
+            Err(e) => tracing::warn!("Shrinking failed: {e}"),
+        }
+    }
+
+    fn run_inner(
+        &self,
+        stats: &mut SimStats,
+        executed_sql: &mut Vec<String>,
+        coverage_out: &mut Option<sql_gen::Coverage>,
+    ) -> Result<()> {
+        tracing::info!(
+            "Starting simulation with seed={}, tables={}, statements={}, generator={:?}",
+            self.config.seed,
+            self.config.num_tables,
+            self.config.num_statements,
+            self.config.generator,
+        );
+
+        let mut generator: Box<dyn SqlGenerator> = match self.config.generator {
+            GeneratorKind::SqlGen => {
+                let seed: u64 = self.rng.borrow_mut().next_u64();
+                Box::new(SqlGenBackend::new_with_window_weight(
+                    seed,
+                    self.config.window_function_probability,
+                    self.config.weight_profile,
+                ))
+            }
+            GeneratorKind::SqlGenProp => {
+                let seed_bytes: [u8; 32] = {
+                    let mut bytes = [0u8; 32];
+                    self.rng.borrow_mut().fill_bytes(&mut bytes);
+                    bytes
+                };
+                Box::new(PropTestBackend::new(
+                    seed_bytes,
+                    self.config.recursive_cte_focus,
+                ))
+            }
+        };
+
+        let mut schema = self.introspect_and_verify_schemas()?;
+
+        for i in 0..self.config.num_statements {
+            let stmt = generator.generate(&schema)?;
+
+            // A generated expression can branch into several subqueries at
+            // each level. This occasionally produces hundreds of kilobytes of
+            // SQL. Preparing such a statement uses enough recursive calls to
+            // exhaust the process stack before either engine can return an
+            // error. These statements add little useful coverage, so skip
+            // them before passing them to either engine.
+            if generated_sql_is_too_large(&stmt.sql) {
+                stats.statements_skipped += 1;
+                let reason = format!(
+                    "Statement skipped because it is {} bytes; the limit is {MAX_GENERATED_SQL_BYTES} bytes",
+                    stmt.sql.len()
+                );
+                push_warning_comments(executed_sql, i, &reason);
+                tracing::debug!("Skipped generated statement {i}: {reason}");
+                continue;
+            }
+
+            if self.config.verbose {
+                let stmt_type = if stmt.is_ddl { "DDL" } else { "DML" };
+                tracing::info!("Statement {} [{}]: {}", i, stmt_type, stmt.sql);
+            }
+
+            // Execute on both databases and check oracle.
+            // catch_unwind so that a panic inside Turso still reports
+            // stats and the offending SQL instead of just a stack trace.
+            let ctx = Arc::clone(&self.panic_context);
+            let prev_hook = std::panic::take_hook();
+            std::panic::set_hook(Box::new(move |info| {
+                let bt = std::backtrace::Backtrace::force_capture();
+                *ctx.lock() = Some(format!("{info}\n{bt}"));
+            }));
+
+            let oracle_result = std::panic::catch_unwind(|| {
+                check_differential(&self.turso_conn, &self.sqlite_conn, &schema, &stmt)
+            });
+
+            std::panic::set_hook(prev_hook);
+
+            let oracle_result = match oracle_result {
+                Ok(result) => result,
+                Err(panic) => {
+                    let msg = panic
+                        .downcast_ref::<&str>()
+                        .map(|s| s.to_string())
+                        .or_else(|| panic.downcast_ref::<String>().cloned())
+                        .unwrap_or_else(|| "Unknown panic".to_string());
+                    let context = self.panic_context.lock().take().unwrap_or_default();
+                    executed_sql.push(format!("-- PANIC: {}", stmt.sql));
+                    stats.oracle_failures += 1;
+                    tracing::error!("Panic at statement {i}: {msg}");
+                    tracing::error!("Panicking SQL: {}", stmt.sql);
+                    tracing::error!("Backtrace:\n{context}");
+                    return Err(anyhow::anyhow!(
+                        "Panic during statement {i}: {msg}\n  SQL: {}\n{context}",
+                        stmt.sql
+                    ));
+                }
+            };
+
+            match oracle_result {
+                OracleResult::Pass => {
+                    stats.statements_executed += 1;
+                    executed_sql.push(stmt.sql.clone());
+                }
+                OracleResult::PassWithUnnestingInvariant => {
+                    stats.statements_executed += 1;
+                    stats.unnesting_invariants_checked += 1;
+                    executed_sql.push(stmt.sql.clone());
+                }
+                OracleResult::Skipped(reason) => {
+                    stats.statements_skipped += 1;
+                    push_warning_comments(executed_sql, i, &reason);
+                    executed_sql.push(format!("-- SKIPPED: {}", stmt.sql));
+                    tracing::debug!("Skipped generated statement {i}: {reason}");
+                    continue;
+                }
+                OracleResult::Warning(reason) => {
+                    stats.statements_executed += 1;
+                    stats.warnings += 1;
+                    push_warning_comments(executed_sql, i, &reason);
+                    executed_sql.push(stmt.sql.clone());
+                    tracing::warn!("Oracle warning at statement {i}: {reason}");
+                }
+                OracleResult::Fail(reason) => {
+                    stats.oracle_failures += 1;
+                    executed_sql.push(format!("-- FAILED: {}", stmt.sql));
+                    tracing::error!("Oracle failure at statement {i}: {reason}");
+                    if !self.config.verbose {
+                        tracing::error!("Failing SQL: {}", stmt.sql);
+                    }
+                    let state_dump = self.dump_failure_state(&schema, &stmt.sql);
+                    self.shrink_and_write(&state_dump, executed_sql, &stmt.sql);
+                    return Err(anyhow::anyhow!("Oracle failure: {reason}"));
+                }
+            }
+
+            if stmt.is_ddl {
+                schema = self.introspect_and_verify_schemas().map_err(|e| {
+                    anyhow::anyhow!(
+                        "Schema mismatch after DDL statement {i} ({}): {e}",
+                        stmt.sql
+                    )
+                })?;
+                tracing::debug!(
+                    "Schema updated after DDL: {} tables, {} indexes",
+                    schema.tables.len(),
+                    schema.indexes.len()
+                );
+            }
+        }
+
+        self.run_integrity_check(stats, executed_sql)?;
+
+        *coverage_out = generator.take_coverage();
+
+        Ok(())
+    }
+
+    /// Run `PRAGMA integrity_check` on both databases and fail if either reports corruption.
+    fn run_integrity_check(
+        &self,
+        stats: &mut SimStats,
+        executed_sql: &mut Vec<String>,
+    ) -> Result<()> {
+        if self.config.mvcc {
+            tracing::info!("Skipping integrity check (not supported with MVCC)");
+            return Ok(());
+        }
+        tracing::info!("Running integrity check on both databases...");
+
+        let sql = "PRAGMA integrity_check";
+        executed_sql.push(sql.to_string());
+
+        let turso_result = DifferentialOracle::execute_turso(&self.turso_conn, sql);
+        let sqlite_result = DifferentialOracle::execute_sqlite(&self.sqlite_conn, sql);
+
+        let check_ok = |result: &QueryResult, db_name: &str| -> Result<()> {
+            match result {
+                QueryResult::Rows(rows) if rows.len() == 1 && rows[0].0.len() == 1 => {
+                    if let SqlValue::Text(ref text) = rows[0].0[0] {
+                        if text == "ok" {
+                            return Ok(());
+                        }
+                    }
+                    bail!("{db_name} integrity check failed: {:?}", rows);
+                }
+                QueryResult::Rows(rows) => {
+                    // Multiple rows means multiple integrity errors
+                    bail!("{db_name} integrity check failed: {:?}", rows);
+                }
+                QueryResult::Error(e) => {
+                    bail!("{db_name} integrity check errored: {e}");
+                }
+                QueryResult::Ok => {
+                    bail!("{db_name} integrity check returned no results");
+                }
+            }
+        };
+
+        if let Err(e) = check_ok(&turso_result, "Turso") {
+            stats.oracle_failures += 1;
+            executed_sql.push(format!("-- FAILED: {sql} ({e})"));
+            tracing::error!("{e}");
+            return Err(e);
+        }
+
+        if let Err(e) = check_ok(&sqlite_result, "SQLite") {
+            stats.oracle_failures += 1;
+            executed_sql.push(format!("-- FAILED: {sql} ({e})"));
+            tracing::error!("{e}");
+            return Err(e);
+        }
+
+        tracing::info!("Integrity check passed on both databases");
+        Ok(())
+    }
+
+    /// Introspect schemas from both databases and verify they match.
+    fn introspect_and_verify_schemas(&self) -> Result<sql_gen::Schema> {
+        let (turso_schema, sqlite_schema) = (
+            SchemaIntrospector::from_turso_with_attached(&self.turso_conn)
+                .context("Failed to introspect Turso schema (with attached)")?,
+            SchemaIntrospector::from_sqlite_with_attached(&self.sqlite_conn)
+                .context("Failed to introspect SQLite schema (with attached)")?,
+        );
+
+        // Verify table names match (using qualified names to distinguish databases)
+        let turso_tables: std::collections::HashSet<_> = turso_schema
+            .tables
+            .iter()
+            .map(|t| t.qualified_name())
+            .collect();
+        let sqlite_tables: std::collections::HashSet<_> = sqlite_schema
+            .tables
+            .iter()
+            .map(|t| t.qualified_name())
+            .collect();
+
+        if turso_tables != sqlite_tables {
+            bail!(
+                "Table mismatch: Turso has {:?}, SQLite has {:?}",
+                turso_tables,
+                sqlite_tables
+            );
+        }
+
+        let turso_indexes: std::collections::HashSet<_> = turso_schema
+            .indexes
+            .iter()
+            .map(|i| i.qualified_name())
+            .collect();
+        let sqlite_indexes: std::collections::HashSet<_> = sqlite_schema
+            .indexes
+            .iter()
+            .map(|i| i.qualified_name())
+            .collect();
+
+        if turso_indexes != sqlite_indexes {
+            bail!(
+                "Index mismatch: Turso has {:?}, SQLite has {:?}",
+                turso_indexes,
+                sqlite_indexes
+            );
+        }
+
+        let turso_triggers: std::collections::HashSet<_> = turso_schema
+            .triggers
+            .iter()
+            .map(|trigger| {
+                (
+                    trigger.qualified_name(),
+                    trigger.table_name.as_str().to_string(),
+                )
+            })
+            .collect();
+        let sqlite_triggers: std::collections::HashSet<_> = sqlite_schema
+            .triggers
+            .iter()
+            .map(|trigger| {
+                (
+                    trigger.qualified_name(),
+                    trigger.table_name.as_str().to_string(),
+                )
+            })
+            .collect();
+
+        if turso_triggers != sqlite_triggers {
+            bail!(
+                "Trigger mismatch: Turso has {:?}, SQLite has {:?}",
+                turso_triggers,
+                sqlite_triggers
+            );
+        }
+
+        // Verify each table's columns and strict flags match
+        for turso_table in turso_schema.tables.iter() {
+            let sqlite_table = sqlite_schema
+                .tables
+                .iter()
+                .find(|t| t.name == turso_table.name && t.database == turso_table.database)
+                .expect("Table should exist in SQLite schema");
+
+            if turso_table.strict != sqlite_table.strict {
+                bail!(
+                    "STRICT mismatch in table '{}': Turso strict={}, SQLite strict={}",
+                    turso_table.name,
+                    turso_table.strict,
+                    sqlite_table.strict
+                );
+            }
+
+            let turso_cols: Vec<_> = turso_table.columns.iter().map(|c| &c.name).collect();
+            let sqlite_cols: Vec<_> = sqlite_table.columns.iter().map(|c| &c.name).collect();
+
+            if turso_cols != sqlite_cols {
+                bail!(
+                    "Column mismatch in table '{}': Turso has {:?}, SQLite has {:?}",
+                    turso_table.qualified_name(),
+                    turso_cols,
+                    sqlite_cols
+                );
+            }
+        }
+
+        for turso_index in turso_schema.indexes.iter() {
+            let sqlite_index = sqlite_schema
+                .indexes
+                .iter()
+                .find(|i| i.name == turso_index.name && i.database == turso_index.database)
+                .expect("Index should exist in SQLite schema");
+
+            if turso_index.table_name != sqlite_index.table_name {
+                bail!(
+                    "Index target mismatch for '{}': Turso targets '{}', SQLite targets '{}'",
+                    turso_index.qualified_name(),
+                    turso_index.table_name,
+                    sqlite_index.table_name
+                );
+            }
+
+            if turso_index.unique != sqlite_index.unique {
+                bail!(
+                    "UNIQUE mismatch for index '{}': Turso unique={}, SQLite unique={}",
+                    turso_index.qualified_name(),
+                    turso_index.unique,
+                    sqlite_index.unique
+                );
+            }
+
+            if turso_index.columns != sqlite_index.columns {
+                bail!(
+                    "Index column mismatch for '{}': Turso has {:?}, SQLite has {:?}",
+                    turso_index.qualified_name(),
+                    turso_index.columns,
+                    sqlite_index.columns
+                );
+            }
+        }
+
+        Ok(turso_schema)
+    }
+}
+
+fn push_warning_comments(executed_sql: &mut Vec<String>, stmt_idx: usize, reason: &str) {
+    for (line_idx, line) in reason.lines().enumerate() {
+        executed_sql.push(format!(
+            "-- WARNING stmt={stmt_idx} line={line_idx}: {line}"
+        ));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn test_sim_config_default() {
+        let config = SimConfig::default();
+        // seed is now randomly generated by default
+        assert!(config.seed > 0);
+        assert_eq!(config.num_tables, 2);
+        assert_eq!(config.num_statements, 100);
+    }
+
+    #[test]
+    fn test_simulator_creation() {
+        let config = SimConfig {
+            seed: 12345,
+            num_tables: 1,
+            columns_per_table: 3,
+            num_statements: 10,
+            verbose: false,
+            keep_files: false,
+            generator: GeneratorKind::default(),
+            coverage: false,
+            tree_mode: TreeMode::default(),
+            mvcc: false,
+            window_function_probability: 0.0,
+            recursive_cte_focus: false,
+            weight_profile: WeightProfile::default(),
+        };
+        let sim = Fuzzer::new(config);
+        assert!(sim.is_ok());
+    }
+
+    #[test]
+    fn test_push_warning_comments_multiline() {
+        let mut out = Vec::new();
+        push_warning_comments(&mut out, 465, "first\nsecond");
+        assert_eq!(out[0], "-- WARNING stmt=465 line=0: first");
+        assert_eq!(out[1], "-- WARNING stmt=465 line=1: second");
+    }
+
+    #[test]
+    fn statements_over_64_kib_are_too_large() {
+        assert!(!generated_sql_is_too_large(
+            &"x".repeat(MAX_GENERATED_SQL_BYTES)
+        ));
+        assert!(generated_sql_is_too_large(
+            &"x".repeat(MAX_GENERATED_SQL_BYTES + 1)
+        ));
+    }
+}

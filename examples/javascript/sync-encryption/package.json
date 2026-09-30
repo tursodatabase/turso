@@ -1,0 +1,11 @@
+{
+  "name": "sync-example",
+  "version": "1.0.0",
+  "type": "module",
+  "scripts": {
+    "start": "node sync_example.mjs"
+  },
+  "dependencies": {
+    "@tursodatabase/sync": "file:../../../bindings/javascript/sync/packages/native"
+  }
+}

@@ -1,0 +1,57 @@
+@database :temp:
+@skip-file-if sqlite "MVCC is not supported in SQLite"
+
+# Regression test: UPDATE t SET v=v should not delete rows in MVCC mode.
+# When data exists in the btree before MVCC is enabled, the noop check
+# must be skipped because cursor.record() reads stale btree data after
+# a tombstone-only delete.
+
+test mvcc-update-self-does-not-delete-rows {
+    CREATE TABLE t(v);
+    INSERT INTO t VALUES('hello');
+    PRAGMA journal_mode='MVCC';
+    UPDATE t SET v=v;
+    SELECT count(*) FROM t;
+}
+expect {
+    mvcc
+    1
+}
+
+test mvcc-update-self-data-intact {
+    CREATE TABLE t(v);
+    INSERT INTO t VALUES('hello');
+    PRAGMA journal_mode='MVCC';
+    UPDATE t SET v=v;
+    SELECT v FROM t;
+}
+expect {
+    mvcc
+    hello
+}
+
+test mvcc-update-self-multiple-rows {
+    CREATE TABLE t(v);
+    INSERT INTO t VALUES('a');
+    INSERT INTO t VALUES('b');
+    INSERT INTO t VALUES('c');
+    PRAGMA journal_mode='MVCC';
+    UPDATE t SET v=v;
+    SELECT count(*) FROM t;
+}
+expect {
+    mvcc
+    3
+}
+
+test mvcc-update-different-value {
+    CREATE TABLE t(v);
+    INSERT INTO t VALUES('hello');
+    PRAGMA journal_mode='MVCC';
+    UPDATE t SET v='world';
+    SELECT v FROM t;
+}
+expect {
+    mvcc
+    world
+}

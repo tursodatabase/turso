@@ -1,0 +1,78 @@
+@database :memory:
+
+setup tables {
+    CREATE TABLE v0 (c1, c2);
+    INSERT INTO v0 VALUES ('a', 1), ('b', 2), ('c', 3);
+}
+
+@setup tables
+test left-join-ifnull-not-null-rejecting {
+    SELECT count(*) FROM v0 AS a4 LEFT JOIN v0 AS a5 ON (a5.c1 = a5.c2)
+    WHERE IFNULL(a5.c2, 2147483647) >= 127;
+}
+expect {
+    3
+}
+
+@setup tables
+test left-join-coalesce-not-null-rejecting {
+    SELECT count(*) FROM v0 AS a4 LEFT JOIN v0 AS a5 ON (a5.c1 = a5.c2)
+    WHERE coalesce(a5.c2, 2147483647) >= 127;
+}
+expect {
+    3
+}
+
+@setup tables
+test left-join-nested-null-masking-not-null-rejecting {
+    SELECT count(*) FROM v0 AS a4 LEFT JOIN v0 AS a5 ON (a5.c1 = a5.c2)
+    WHERE coalesce(ifnull(a5.c2, 2147483647), 1) >= 127;
+}
+expect {
+    3
+}
+
+@setup tables
+test left-join-bare-column-null-rejecting {
+    SELECT count(*) FROM v0 AS a4 LEFT JOIN v0 AS a5 ON (a5.c1 = a5.c2)
+    WHERE a5.c2 >= 127;
+}
+expect {
+    0
+}
+
+@setup tables
+test left-join-is-null-not-null-rejecting {
+    SELECT count(*) FROM v0 AS a4 LEFT JOIN v0 AS a5 ON (a5.c1 = a5.c2)
+    WHERE a5.c2 IS NULL;
+}
+expect {
+    3
+}
+
+@setup tables
+test left-join-is-between-rhs-columns-not-null-rejecting {
+    SELECT count(*) FROM v0 AS a4 LEFT JOIN v0 AS a5 ON (a5.c1 = a5.c2)
+    WHERE a5.c2 IS a5.c1;
+}
+expect {
+    3
+}
+
+@setup tables
+test left-join-is-not-literal-not-null-rejecting {
+    SELECT count(*) FROM v0 AS a4 LEFT JOIN v0 AS a5 ON (a5.c1 = a5.c2)
+    WHERE a5.c2 IS NOT 5;
+}
+expect {
+    3
+}
+
+@setup tables
+test left-join-is-not-expression-not-null-rejecting {
+    SELECT count(*) FROM v0 AS a4 LEFT JOIN v0 AS a5 ON (a5.c1 = a5.c2)
+    WHERE a5.c2 IS NOT (2 + 3);
+}
+expect {
+    3
+}

@@ -1,0 +1,173 @@
+# Adversarial tests for multi-index OR in joins.
+# Each test is designed to expose a specific category of semantic bug
+# in the optimizer's handling of OR-by-union index scans during joins.
+
+@database :memory:
+
+setup graph_with_nulls_and_selfloop {
+    CREATE TABLE node (id INTEGER PRIMARY KEY, label TEXT);
+    CREATE TABLE edge (id INTEGER PRIMARY KEY, source_id INTEGER, target_id INTEGER, label TEXT);
+    CREATE INDEX idx_edge_source ON edge(source_id);
+    CREATE INDEX idx_edge_target ON edge(target_id);
+
+    INSERT INTO node VALUES (1, 'A');
+    INSERT INTO node VALUES (2, 'B');
+    INSERT INTO node VALUES (3, 'C');
+    INSERT INTO node VALUES (4, 'D');
+
+    INSERT INTO edge VALUES (1, 1, 2, 'alpha');
+    INSERT INTO edge VALUES (2, 2, 3, 'beta');
+    INSERT INTO edge VALUES (3, 3, 4, 'gamma');
+    INSERT INTO edge VALUES (4, 4, 1, 'delta');
+    -- Self-loop: both source and target point to the same node
+    INSERT INTO edge VALUES (5, 2, 2, 'self');
+    -- NULL in source column
+    INSERT INTO edge VALUES (6, NULL, 3, 'null_src');
+    -- NULL in target column
+    INSERT INTO edge VALUES (7, 1, NULL, 'null_tgt');
+}
+
+# RowSet deduplication: edge 5 has source_id=2 AND target_id=2.
+# Both index branches match for node 2, but the row must appear only once.
+@setup graph_with_nulls_and_selfloop
+test or-join-self-loop-dedup {
+    SELECT n.id, e.id, e.source_id, e.target_id
+    FROM node n
+    JOIN edge e ON e.source_id = n.id OR e.target_id = n.id
+    WHERE n.id = 2
+    ORDER BY e.id;
+}
+expect {
+    2|1|1|2
+    2|2|2|3
+    2|5|2|2
+}
+
+# NULLs must not match through OR index scan.
+# edge 6 has NULL source but target=3, should match node 3.
+# No phantom rows from NULL source matching anything.
+@setup graph_with_nulls_and_selfloop
+test or-join-null-columns {
+    SELECT n.id, e.id, e.source_id, e.target_id
+    FROM node n
+    JOIN edge e ON e.source_id = n.id OR e.target_id = n.id
+    WHERE n.id = 3
+    ORDER BY e.id;
+}
+expect {
+    3|2|2|3
+    3|3|3|4
+    3|6||3
+}
+
+# Additional WHERE filter alongside consumed OR term.
+# The OR is consumed by multi-index scan, but e.label='delta' must still filter.
+@setup graph_with_nulls_and_selfloop
+test or-join-extra-where-filter {
+    SELECT n.id, e.id, e.label
+    FROM node n
+    JOIN edge e ON e.source_id = n.id OR e.target_id = n.id
+    WHERE n.id = 1 AND e.label = 'delta'
+    ORDER BY e.id;
+}
+expect {
+    1|4|delta
+}
+
+# LEFT JOIN with OR and a filter that rejects all edges.
+# Every node must still appear with NULL edge columns.
+@setup graph_with_nulls_and_selfloop
+test or-join-left-join-no-match {
+    SELECT n.id, e.id
+    FROM node n
+    LEFT JOIN edge e ON (e.source_id = n.id OR e.target_id = n.id) AND e.label = 'nonexistent'
+    ORDER BY n.id;
+}
+expect {
+    1|
+    2|
+    3|
+    4|
+}
+
+# Three-way join with TWO OR conditions (the customer's actual pattern).
+# node -> edge (OR on source/target) -> node (OR on source/target), exclude self.
+@setup graph_with_nulls_and_selfloop
+test or-join-double-or-three-way {
+    SELECT n.id AS node_id, e.id AS edge_id, o.id AS origin_id
+    FROM node n
+    JOIN edge e ON (e.source_id = n.id OR e.target_id = n.id)
+    JOIN node o ON (e.source_id = o.id OR e.target_id = o.id) AND n.id != o.id
+    WHERE n.id = 2
+    ORDER BY e.id, o.id;
+}
+expect {
+    2|1|1
+    2|2|3
+}
+
+# CTE as outer loop with multiple rows: RowSet must reset between iterations.
+# If RowSet leaks across outer rows, ids.id=3 would see edges from ids.id=1.
+@setup graph_with_nulls_and_selfloop
+test or-join-rowset-reset-across-outer {
+    WITH ids AS (SELECT 1 AS id UNION ALL SELECT 3)
+    SELECT ids.id, e.id, e.source_id, e.target_id
+    FROM ids
+    JOIN edge e ON e.source_id = ids.id OR e.target_id = ids.id
+    ORDER BY ids.id, e.id;
+}
+expect {
+    1|1|1|2
+    1|4|4|1
+    1|7|1|
+    3|2|2|3
+    3|3|3|4
+    3|6||3
+}
+
+# Asymmetric OR: one branch matches rows, the other matches nothing.
+# e.target_id = 9999 matches zero rows. Only source_id branch contributes.
+@setup graph_with_nulls_and_selfloop
+test or-join-asymmetric-branches {
+    SELECT n.id, e.id
+    FROM node n
+    JOIN edge e ON e.source_id = n.id OR e.target_id = 9999
+    WHERE n.id = 1
+    ORDER BY e.id;
+}
+expect {
+    1|1
+    1|7
+}
+
+# Aggregate over OR join: COUNT must not be inflated by RowSet duplicates.
+@setup graph_with_nulls_and_selfloop
+test or-join-aggregate-no-phantom-dupes {
+    SELECT n.id, COUNT(*) as edge_count
+    FROM node n
+    JOIN edge e ON e.source_id = n.id OR e.target_id = n.id
+    WHERE n.id IN (1, 2)
+    GROUP BY n.id
+    ORDER BY n.id;
+}
+expect {
+    1|3
+    2|3
+}
+
+# Full customer pattern: CTE -> edge (OR) -> node (OR), exclude self.
+@setup graph_with_nulls_and_selfloop
+test or-join-customer-cte-pattern {
+    WITH selected AS (SELECT id FROM node WHERE id IN (1, 2))
+    SELECT s.id AS sel_id, e.id AS edge_id, n.id AS neighbor_id
+    FROM selected s
+    JOIN edge e ON (e.source_id = s.id OR e.target_id = s.id)
+    JOIN node n ON (e.source_id = n.id OR e.target_id = n.id) AND n.id != s.id
+    ORDER BY s.id, e.id, n.id;
+}
+expect {
+    1|1|2
+    1|4|4
+    2|1|1
+    2|2|3
+}

@@ -1,0 +1,16 @@
+---
+source: sorting.sqltest
+expression: |-
+  SELECT * FROM articles
+      WHERE status = 'published' AND category = 'tech'
+      ORDER BY published_at DESC;
+info:
+  statement_type: SELECT
+  tables:
+  - articles
+  setup_blocks:
+  - sort_elim
+  database: ':memory:'
+---
+QUERY PLAN
+`--SEARCH articles USING INDEX idx_articles_status_cat_pub (status=? AND category=?)

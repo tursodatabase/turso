@@ -1,0 +1,425 @@
+@database :default:
+@database :default-no-rowidalias:
+
+test group_by {
+    select u.first_name, sum(u.age) from users u group by u.first_name limit 10;
+}
+expect {
+    Aaliyah|362
+    Aaron|172
+    Abagail|212
+    Abbey|181
+    Abbie|184
+    Abbigail|70
+    Abby|197
+    Abdul|291
+    Abdullah|214
+    Abel|168
+}
+
+test group_by_without_aggs {
+    select u.first_name from users u group by u.first_name limit 10;
+}
+expect {
+    Aaliyah
+    Aaron
+    Abagail
+    Abbey
+    Abbie
+    Abbigail
+    Abby
+    Abdul
+    Abdullah
+    Abel
+}
+
+test group_by_two_joined_columns {
+    select u.first_name, p.name, sum(u.age) from users u join products p on u.id = p.id group by u.first_name, p.name limit 10;
+}
+expect {
+    Chaz|cap|10
+    Dan|hat|31
+    Darryl|sneakers|18
+    Edmond|shirt|83
+    Gerald|coat|48
+    Krystel|sweater|88
+    Lesley|boots|41
+    Lexie|accessories|17
+    Lilly|jeans|33
+    Nikko|sweatshirt|39
+}
+
+test group_by_order_by {
+    select u.first_name, p.name, sum(u.age) from users u join products p on u.id = p.id group by u.first_name, p.name order by p.name limit 10;
+}
+expect {
+    Lexie|accessories|17
+    Lesley|boots|41
+    Chaz|cap|10
+    Gerald|coat|48
+    Dan|hat|31
+    Lilly|jeans|33
+    Edmond|shirt|83
+    Roscoe|shorts|27
+    Darryl|sneakers|18
+    Krystel|sweater|88
+}
+
+test group_by_order_by_aggregate {
+    select u.first_name, p.name, sum(u.age) from users u join products p on u.id = p.id group by u.first_name, p.name order by sum(u.age) limit 10;
+}
+expect {
+    Chaz|cap|10
+    Lexie|accessories|17
+    Darryl|sneakers|18
+    Roscoe|shorts|27
+    Dan|hat|31
+    Lilly|jeans|33
+    Nikko|sweatshirt|39
+    Lesley|boots|41
+    Gerald|coat|48
+    Edmond|shirt|83
+}
+
+test group_by_multiple_aggregates {
+    select u.first_name, sum(u.age), count(u.age) from users u group by u.first_name order by sum(u.age) limit 10;
+}
+expect {
+    Daniella|1|1
+    Oleta|1|1
+    Raymundo|1|1
+    Rebeca|1|1
+    Trinity|1|1
+    Dwight|2|1
+    Lambert|2|1
+    Leonor|2|1
+    Ruth|2|1
+    Sydni|2|1
+}
+
+test group_by_multiple_aggregates_2 {
+    select u.first_name, sum(u.age), group_concat(u.age) from users u group by u.first_name order by u.first_name limit 10;
+}
+expect {
+    Aaliyah|362|44,92,85,93,48
+    Aaron|172|1,89,82
+    Abagail|212|23,31,86,35,37
+    Abbey|181|30,29,26,96
+    Abbie|184|19,86,79
+    Abbigail|70|36,34
+    Abby|197|44,14,56,78,5
+    Abdul|291|21,95,63,63,13,36
+    Abdullah|214|93,35,8,78
+    Abel|168|65,42,61
+}
+
+test group_by_complex_order_by {
+    select u.first_name, group_concat(u.last_name) from users u group by u.first_name order by -1 * length(group_concat(u.last_name)) limit 1;
+}
+expect {
+    America|Jast,Willms,Erdman,Kshlerin,Hilpert,Waters,Klocko,Kertzmann,Parker,Rice,Klocko
+}
+
+test group_by_complex_order_by_2 {
+    select u.first_name, sum(u.age) from users u group by u.first_name order by -1 * sum(u.age) limit 10;
+}
+expect {
+    Amely|616
+    Rocky|616
+    Daren|597
+    Rosemary|591
+    America|575
+    Trystan|549
+    Morton|547
+    Sheldon|535
+    Garnett|515
+    Neha|515
+}
+
+test group_by_and_binary_expression_that_depends_on_two_aggregates {
+    select u.first_name, sum(u.age) + count(1) from users u group by u.first_name limit 5;
+}
+expect {
+    Aaliyah|367
+    Aaron|175
+    Abagail|217
+    Abbey|185
+    Abbie|187
+}
+
+test group_by_function_expression {
+    select length(phone_number), count(1) from users group by length(phone_number) order by count(1);
+}
+expect {
+    14|1231
+    21|1240
+    18|1245
+    12|1255
+    17|1259
+    20|1263
+    19|2507
+}
+
+test group_by_function_expression_ridiculous {
+    select upper(substr(phone_number, 1,3)), count(1) from users group by upper(substr(phone_number, 1,3)) order by -1 * count(1) limit 5;
+}
+expect {
+    1-1|325
+    1-8|306
+    1-9|281
+    1-7|274
+    1-3|273
+}
+
+test group_by_count_star {
+    select u.first_name, count(*) from users u group by u.first_name limit 1;
+}
+expect {
+    Aaliyah|5
+}
+
+test group_by_count_star_in_expression {
+    select u.first_name, count(*) % 3 from users u group by u.first_name order by u.first_name limit 3;
+}
+expect {
+    Aaliyah|2
+    Aaron|0
+    Abagail|2
+}
+
+test group_by_count_no_args_in_expression {
+    select u.first_name, count() % 3 from users u group by u.first_name order by u.first_name limit 3;
+}
+expect {
+    Aaliyah|2
+    Aaron|0
+    Abagail|2
+}
+
+test having {
+    select u.first_name, round(avg(u.age)) from users u group by u.first_name having avg(u.age) > 97 order by avg(u.age) desc limit 5;
+}
+expect {
+    Stefanie|100.0
+    Sallie|100.0
+    Jennifer|100.0
+    Geo|100.0
+    Casimer|100.0
+}
+expect @js {
+    Stefanie|100
+    Sallie|100
+    Jennifer|100
+    Geo|100
+    Casimer|100
+}
+
+test having_with_binary_cond {
+    select u.first_name, sum(u.age) from users u group by u.first_name having sum(u.age) + 400 = 1016;
+}
+expect {
+    Amely|616
+    Rocky|616
+}
+
+test having_with_scalar_fn_over_aggregate {
+    select u.first_name, concat(count(1), ' people with this name') from users u group by u.first_name having count(1) >= 10 order by count(1) asc limit 5;
+}
+expect {
+    Amely|10 people with this name
+    Clifton|10 people with this name
+    Garnett|10 people with this name
+    Neha|10 people with this name
+    Rosemary|10 people with this name
+}
+
+test having_with_multiple_conditions {
+    select u.first_name, count(*), round(avg(u.age)) as avg_age
+    from users u
+    group by u.first_name
+    having count(*) >= 9 and avg(u.age) > 50
+    order by count(*) desc, avg(u.age) desc, first_name
+    limit 5;
+}
+expect {
+    America|11|52.0
+    Amely|10|62.0
+    Rosemary|10|59.0
+    Trystan|10|55.0
+    Garnett|10|52.0
+}
+expect @js {
+    America|11|52
+    Amely|10|62
+    Rosemary|10|59
+    Trystan|10|55
+    Garnett|10|52
+}
+
+# Trystan = 10, America = 11, Jaida = 11
+test column_alias_in_group_by_order_by_having {
+    select first_name as fn, count(1) as fn_count from users where fn in ('Jaida', 'America', 'Trystan') group by fn having fn_count >= 10 order by fn_count;
+}
+expect {
+    Trystan|10
+    America|11
+    Jaida|11
+}
+
+test group_by_column_number {
+    select u.first_name, count(1) from users u group by 1 limit 1;
+}
+expect {
+    Aaliyah|5
+}
+
+# There was a regression where we incorrectly removed SOME order by terms and left others in place, which is invalid and results in wrong rows being returned.
+test groupby_orderby_removal_regression_test {
+    select id, last_name, count(1) from users GROUP BY 1,2 order by id, last_name desc limit 3;
+}
+expect {
+    1|Parker|1
+    2|Zemlak|1
+    3|Doyle|1
+}
+
+test group_by_no_sorting_required {
+    select age, count(1) from users group by age limit 3;
+}
+expect {
+    1|96
+    2|117
+    3|78
+}
+
+# Compile-time constants are moved to the end of the program.
+# Verify that the jump to AggStep works correctly even when the location of the ',' constant has changed.
+test group_by_no_sorting_required_and_const_agg_arg {
+    select group_concat(state, ',') from users group by age limit 2;
+}
+expect {
+    DE,NY,MS,SC,ME,SC,UT,WY,MN,KY,OR,OR,WY,IL,TN,ID,WY,NY,DE,WA,ND,NE,OH,NE,KS,WV,OK,KS,LA,DE,RI,RI,WA,PA,WY,ND,MD,MA,NC,MD,OR,SC,ME,VT,TX,IN,GA,AL,WY,WA,LA,ME,WY,AK,WV,WY,NC,MN,NM,OH,RI,KY,VT,NV,UT,TN,AL,WV,NE,AL,ND,CT,NH,RI,NJ,ID,IL,CT,OK,AZ,HI,AZ,IA,MO,PA,NV,MD,AZ,KY,IA,NH,CT,KS,SC,KY,MN
+    VA,FL,IA,AR,CT,WY,VA,NE,WA,HI,MS,CT,WY,NM,IL,WI,MA,KY,AR,AL,DE,WA,NY,AK,NY,RI,NM,RI,SD,AL,AZ,RI,NV,IA,WI,WY,CA,GA,OR,GA,KY,WI,AK,ID,FL,NE,FL,NE,NV,MN,LA,ME,WY,NM,FL,DE,MI,OH,VA,NV,AK,NJ,IA,MN,OR,TN,MA,NY,DE,KS,DE,MS,MD,WY,MO,PA,WI,MD,CT,NC,SD,MA,MN,ID,AL,AK,WV,MA,SD,HI,MO,NM,CT,IA,MD,NC,NE,IL,FL,IL,NV,SD,AR,CA,SD,VA,ID,AR,SC,CO,NV,ID,IA,FL,WI,MA,OH
+}
+
+test distinct_agg_functions {
+    select first_name, sum(distinct age), count(distinct age), avg(distinct age)
+    from users
+    group by 1
+    limit 3;
+}
+expect {
+    Aaliyah|362|5|72.4
+    Aaron|172|3|57.3333333333333
+    Abagail|212|5|42.4
+}
+
+test complex_result_expression_containing_aggregate {
+    select
+    case when price > 70 then group_concat(name, ',') else '<undisclosed>' end names
+    from products
+    group by price
+    order by price;
+}
+expect {
+    <undisclosed>
+    <undisclosed>
+    <undisclosed>
+    <undisclosed>
+    <undisclosed>
+    <undisclosed>
+    <undisclosed>
+    <undisclosed>
+    <undisclosed>
+    <undisclosed>
+    hat
+}
+
+test complex_result_expression_containing_aggregate_and_rowid {
+    select
+    case when rowid >= 5 then group_concat(name, ',') else '<undisclosed>' end names
+    from products
+    group by rowid
+    order by rowid;
+}
+expect {
+    <undisclosed>
+    <undisclosed>
+    <undisclosed>
+    <undisclosed>
+    sweatshirt
+    shorts
+    jeans
+    sneakers
+    boots
+    coat
+    accessories
+}
+
+test complex_having_expression_containing_aggregate {
+    select group_concat(name, ',') from products group by price having (group_concat(name, ',') || price) like 'ca%';
+}
+expect {
+    cap
+}
+
+test complex_order_by_expression_containing_aggregate {
+    select group_concat(name, ',') from products group by price order by (group_concat(name, ',') || price);
+}
+expect {
+    accessories
+    boots
+    cap
+    coat
+    hat
+    jeans
+    shirt
+    shorts
+    sneakers
+    sweater
+    sweatshirt
+}
+
+# There was a bug where, while resetting accumulator registers, subsequent  registers were also reset.
+# This happened when there were more arguments than aggregate functions — the number of registers to reset
+# was calculated as the sum of the arguments, not the number of aggregates.
+# The issue affected cases where rows were pre-sorted, hence the 'GROUP BY id' test.
+test more_args_than_aggregates {
+    SELECT group_concat(name, ','), group_concat(name, ';'), group_concat(name, '.') FROM products GROUP BY id;
+}
+expect {
+    hat|hat|hat
+    cap|cap|cap
+    shirt|shirt|shirt
+    sweater|sweater|sweater
+    sweatshirt|sweatshirt|sweatshirt
+    shorts|shorts|shorts
+    jeans|jeans|jeans
+    sneakers|sneakers|sneakers
+    boots|boots|boots
+    coat|coat|coat
+    accessories|accessories|accessories
+}
+
+# make sure we return the group by key sorted DESC when the order by has only an aggregate term
+test proper-sort-order {
+    SELECT u.first_name, COUNT(*) AS c
+    FROM users u
+    JOIN products p ON p.id = u.id
+    GROUP BY u.first_name
+    ORDER BY c DESC;
+}
+expect {
+    Roscoe|1
+    Nikko|1
+    Lilly|1
+    Lexie|1
+    Lesley|1
+    Krystel|1
+    Gerald|1
+    Edmond|1
+    Darryl|1
+    Dan|1
+    Chaz|1
+}
+

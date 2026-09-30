@@ -1,0 +1,14 @@
+@database :memory:
+
+test analyze-indexed-table-does-not-insert-null-stat1-row {
+    CREATE TABLE t(a, b);
+    CREATE INDEX i_t_a ON t(a);
+    INSERT INTO t VALUES (1, 10), (2, 20), (2, 30);
+    ANALYZE;
+    SELECT tbl, coalesce(idx, '<null>'), stat
+    FROM sqlite_stat1
+    ORDER BY tbl, idx IS NOT NULL, idx;
+}
+expect {
+    t|i_t_a|3 2
+}

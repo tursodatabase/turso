@@ -1,0 +1,24 @@
+---
+source: multi_index_or_compound.sqltest
+expression: |-
+  SELECT DISTINCT i.id
+      FROM item i
+      JOIN link l
+        ON (
+          (l.src = 1 AND i.id = l.dst AND i.kind = 7)
+          OR
+          (l.dst = 1 AND i.id = l.src AND i.kind = 7)
+        );
+info:
+  statement_type: SELECT
+  tables:
+  - item
+  - link
+  setup_blocks:
+  - compound_branch_seek_schema
+  database: ':memory:'
+---
+QUERY PLAN
+|--SCAN link AS l
+|--MULTI-INDEX OR i (idx_item_id_kind, idx_item_id_kind)
+`--USE HASH TABLE FOR DISTINCT

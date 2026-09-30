@@ -1,0 +1,947 @@
+import test from "ava";
+import crypto from 'crypto';
+import fs from 'fs';
+
+test.beforeEach(async (t) => {
+  const [db, path, provider, errorType] = await connect();
+  db.exec(`
+      DROP TABLE IF EXISTS users;
+      CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT, email TEXT)
+  `);
+  db.exec(
+    "INSERT INTO users (id, name, email) VALUES (1, 'Alice', 'alice@example.org')"
+  );
+  db.exec(
+    "INSERT INTO users (id, name, email) VALUES (2, 'Bob', 'bob@example.com')"
+  );
+  t.context = {
+    db,
+    path,
+    provider,
+    errorType,
+  };
+});
+
+test.afterEach.always(async (t) => {
+  // Close the database connection
+  if (t.context.db != undefined) {
+    t.context.db.close();
+  }
+  // Remove the database file if it exists
+  if (t.context.path) {
+    const walPath = t.context.path + "-wal";
+    const shmPath = t.context.path + "-shm";
+    if (fs.existsSync(t.context.path)) {
+      fs.unlinkSync(t.context.path);
+    }
+    if (fs.existsSync(walPath)) {
+      fs.unlinkSync(walPath);
+    }
+    if (fs.existsSync(shmPath)) {
+      fs.unlinkSync(shmPath);
+    }
+  }
+});
+
+test.serial("Open in-memory database", async (t) => {
+  const [db] = await connect(":memory:");
+  t.is(db.memory, true);
+});
+
+// ==========================================================================
+// Database.exec()
+// ==========================================================================
+
+test.skip("Database.exec() syntax error", async (t) => {
+  const db = t.context.db;
+
+  const syntaxError = t.throws(() => {
+    db.exec("SYNTAX ERROR");
+  }, {
+    instanceOf: t.context.errorType,
+    message: 'near "SYNTAX": syntax error',
+    code: 'SQLITE_ERROR'
+  });
+  const noTableError = t.throws(() => {
+    db.exec("SELECT * FROM missing_table");
+  }, {
+    instanceOf: t.context.errorType,
+    message: "no such table: missing_table",
+    code: 'SQLITE_ERROR'
+  });
+
+  if (t.context.provider === 'libsql') {
+    t.is(noTableError.rawCode, 1)
+    t.is(syntaxError.rawCode, 1)
+  }
+});
+
+test.serial("Database.exec() after close()", async (t) => {
+  const db = t.context.db;
+  db.close();
+  t.throws(() => {
+    db.exec("SELECT 1");
+  }, {
+    instanceOf: TypeError,
+    message: "The database connection is not open"
+  });
+});
+
+// ==========================================================================
+// Database.prepare()
+// ==========================================================================
+
+test.skip("Statement.prepare() syntax error", async (t) => {
+  const db = t.context.db;
+
+  t.throws(() => {
+    return db.prepare("SYNTAX ERROR");
+  }, {
+    instanceOf: t.context.errorType,
+    message: 'near "SYNTAX": syntax error'
+  });
+});
+
+test.serial("Database.prepare() after close()", async (t) => {
+  const db = t.context.db;
+  db.close();
+  t.throws(() => {
+    db.prepare("SELECT 1");
+  }, {
+    instanceOf: TypeError,
+    message: "The database connection is not open"
+  });
+});
+
+// ==========================================================================
+// Database.pragma()
+// ==========================================================================
+
+test.serial("Database.pragma()", async (t) => {
+  const db = t.context.db;
+  db.pragma("cache_size = 2000");
+  t.deepEqual(db.pragma("cache_size"), [{ "cache_size": 2000 }]);
+});
+
+test.serial("Database.pragma() after close()", async (t) => {
+  const db = t.context.db;
+  db.close();
+  t.throws(() => {
+    db.pragma("cache_size = 2000");
+  }, {
+    instanceOf: TypeError,
+    message: "The database connection is not open"
+  });
+});
+
+// ==========================================================================
+// Database.transaction()
+// ==========================================================================
+
+test.serial("Database.transaction()", async (t) => {
+  const db = t.context.db;
+
+  const insert = db.prepare(
+    "INSERT INTO users(name, email) VALUES (:name, :email)"
+  );
+
+  const insertMany = db.transaction((users) => {
+    t.is(db.inTransaction, true);
+    for (const user of users) insert.run(user);
+  });
+
+  t.is(db.inTransaction, false);
+  insertMany([
+    { name: "Joey", email: "joey@example.org" },
+    { name: "Sally", email: "sally@example.org" },
+    { name: "Junior", email: "junior@example.org" },
+  ]);
+  t.is(db.inTransaction, false);
+
+  const stmt = db.prepare("SELECT * FROM users WHERE id = ?");
+  t.is(stmt.get(3).name, "Joey");
+  t.is(stmt.get(4).name, "Sally");
+  t.is(stmt.get(5).name, "Junior");
+});
+
+test.serial("Database.inTransaction property", async (t) => {
+  const db = t.context.db;
+
+  // A fresh connection is in autocommit, not a transaction.
+  t.false(db.inTransaction, "fresh connection is not in a transaction");
+
+  // The transaction() helper reports in-transaction inside its callback and
+  // autocommit once it completes.
+  let insideTxn;
+  const txn = db.transaction(() => { insideTxn = db.inTransaction; });
+  txn();
+  t.true(insideTxn, "in a transaction inside the transaction() callback");
+  t.false(db.inTransaction, "autocommit after transaction() completes");
+
+  // inTransaction must reflect the real transaction state, so it also tracks
+  // transactions opened with raw BEGIN/COMMIT/ROLLBACK.
+  db.exec("BEGIN");
+  t.true(db.inTransaction, "in a transaction after raw BEGIN");
+  db.exec("COMMIT");
+  t.false(db.inTransaction, "autocommit after raw COMMIT");
+
+  db.exec("BEGIN");
+  t.true(db.inTransaction, "in a transaction after raw BEGIN");
+  db.exec("ROLLBACK");
+  t.false(db.inTransaction, "autocommit after raw ROLLBACK");
+});
+
+test.serial("Database.transaction().immediate()", async (t) => {
+  const db = t.context.db;
+  const insert = db.prepare(
+    "INSERT INTO users(name, email) VALUES (:name, :email)"
+  );
+  const insertMany = db.transaction((users) => {
+    t.is(db.inTransaction, true);
+    for (const user of users) insert.run(user);
+  });
+  t.is(db.inTransaction, false);
+  insertMany.immediate([
+    { name: "Joey", email: "joey@example.org" },
+    { name: "Sally", email: "sally@example.org" },
+    { name: "Junior", email: "junior@example.org" },
+  ]);
+  t.is(db.inTransaction, false);
+});
+
+// ==========================================================================
+// Database.batch()
+// ==========================================================================
+
+test.serial("Database.batch() returns per-statement result sets", async (t) => {
+  if (!["turso", "libsql"].includes(t.context.provider)) {
+    t.pass();
+    return;
+  }
+  const db = t.context.db;
+
+  const results = db.batch([
+    { sql: "INSERT INTO users (id, name, email) VALUES (?, ?, ?)", args: [3, "Carol", "carol@example.org"] },
+    { sql: "UPDATE users SET email = ? WHERE id = ?", args: ["alice@new.org", 1] },
+    "SELECT id, name FROM users ORDER BY id",
+  ]);
+
+  t.true(Array.isArray(results));
+  t.is(results.length, 3);
+  t.deepEqual(results[0].columns, []);
+  t.deepEqual(results[0].columnTypes, []);
+  t.deepEqual(results[0].rows, []);
+  t.is(results[0].rowsAffected, 1);
+  t.false("lastInsertRowid" in results[0]);
+  t.is(results[0].toJSON, undefined);
+
+  t.is(results[1].rowsAffected, 1);
+  t.false("lastInsertRowid" in results[1]);
+
+  t.deepEqual(results[2].columns, ["id", "name"]);
+  t.is(results[2].rowsAffected, 0);
+  t.is(results[2].rows.length, 3);
+  t.false(Array.isArray(results[2].rows[0]));
+  t.is(results[2].rows[0].id, 1);
+  t.is(results[2].rows[0].name, "Alice");
+});
+
+test.serial("Database.batch() raw option returns array rows", async (t) => {
+  if (!["turso", "libsql"].includes(t.context.provider)) {
+    t.pass();
+    return;
+  }
+  const db = t.context.db;
+
+  const [rs] = db.batch([
+    { sql: "SELECT id, name FROM users WHERE id = ?", args: [1] },
+  ], { raw: true });
+
+  t.deepEqual(rs.rows, [[1, "Alice"]]);
+});
+
+test.serial("Database.batch() rolls back on error when given a mode", async (t) => {
+  if (!["turso", "libsql"].includes(t.context.provider)) {
+    t.pass();
+    return;
+  }
+  const db = t.context.db;
+
+  t.throws(() => {
+    db.batch([
+      { sql: "INSERT INTO users (id, name, email) VALUES (?, ?, ?)", args: [10, "Dan", "dan@example.org"] },
+      { sql: "INSERT INTO users (id, name, email) VALUES (?, ?, ?)", args: [1, "Dup", "dup@example.org"] },
+    ], "write");
+  }, { any: true });
+
+  const row = db.prepare("SELECT count(*) AS c FROM users WHERE id = 10").get();
+  t.is(row.c, 0);
+});
+
+// ==========================================================================
+// Statement.run()
+// ==========================================================================
+
+test.serial("Statement.run() returning rows", async (t) => {
+  const db = t.context.db;
+
+  const stmt = db.prepare("SELECT 1");
+  const info = stmt.run();
+  t.is(info.changes, 0);
+});
+
+test.serial("Statement.run() [positional]", async (t) => {
+  const db = t.context.db;
+
+  const stmt = db.prepare("INSERT INTO users(name, email) VALUES (?, ?)");
+  const info = stmt.run(["Carol", "carol@example.net"]);
+  t.is(info.changes, 1);
+  t.is(info.lastInsertRowid, 3);
+});
+
+test.serial("Statement.run() [named]", async (t) => {
+  const db = t.context.db;
+
+  const stmt = db.prepare("INSERT INTO users(name, email) VALUES (@name, @email);");
+  const info = stmt.run({"name": "Carol", "email": "carol@example.net"});
+  t.is(info.changes, 1);
+  t.is(info.lastInsertRowid, 3);
+});
+
+test.skip("Statement.run() with array bind parameter", async (t) => {
+  const db = t.context.db;
+
+  db.exec(`
+      DROP TABLE IF EXISTS t;
+      CREATE TABLE t (value BLOB);
+  `);
+
+  const array = [1, 2, 3];
+
+  const insertStmt = db.prepare("INSERT INTO t (value) VALUES (?)");
+  t.throws(() => {
+    insertStmt.run([array]);
+  }, {
+    message: 'SQLite3 can only bind numbers, strings, bigints, buffers, and null'
+  });
+});
+
+test.skip("Statement.run() with Float32Array bind parameter", async (t) => {
+  const db = t.context.db;
+
+  db.exec(`
+      DROP TABLE IF EXISTS t;
+      CREATE TABLE t (value BLOB);
+  `);
+
+  const array = new Float32Array([1, 2, 3]);
+
+  const insertStmt = db.prepare("INSERT INTO t (value) VALUES (?)");
+  insertStmt.run([array]);
+
+  const selectStmt = db.prepare("SELECT value FROM t");
+  t.deepEqual(selectStmt.raw().get()[0], Buffer.from(array.buffer));
+});
+
+test.skip("Statement.run() for vector feature with Float32Array bind parameter", async (t) => {
+  if (t.context.provider === 'better-sqlite3') {
+    // skip this test for better-sqlite3
+    t.assert(true);
+    return;
+  }
+  const db = t.context.db;
+
+  db.exec(`
+    DROP TABLE IF EXISTS t;
+    CREATE TABLE t (embedding FLOAT32(8));
+    CREATE INDEX t_idx ON t ( libsql_vector_idx(embedding) );
+  `);
+
+  const insertStmt = db.prepare("INSERT INTO t VALUES (?)");
+  insertStmt.run([new Float32Array([1,1,1,1,1,1,1,1])]);
+  insertStmt.run([new Float32Array([-1,-1,-1,-1,-1,-1,-1,-1])]);
+
+  const selectStmt = db.prepare("SELECT embedding FROM vector_top_k('t_idx', vector('[2,2,2,2,2,2,2,2]'), 1) n JOIN t ON n.rowid = t.rowid");
+  t.deepEqual(selectStmt.raw().get()[0], Buffer.from(new Float32Array([1,1,1,1,1,1,1,1]).buffer));
+
+  // we need to explicitly delete this table because later when sqlite-based (not LibSQL) tests will delete table 't' they will leave 't_idx_shadow' table untouched
+  db.exec(`DROP TABLE t`);
+});
+
+// ==========================================================================
+// Statement.get()
+// ==========================================================================
+
+test.serial("Statement.get() [no parameters]", async (t) => {
+  const db = t.context.db;
+
+  var stmt = 0;
+
+  stmt = db.prepare("SELECT * FROM users");
+  t.is(stmt.get().name, "Alice");
+  t.deepEqual(stmt.raw().get(), [1, 'Alice', 'alice@example.org']);
+});
+
+test.serial("Statement.get() [positional]", async (t) => {
+  const db = t.context.db;
+
+  var stmt = 0;
+
+  stmt = db.prepare("SELECT * FROM users WHERE id = ?");
+  t.is(stmt.get(0), undefined);
+  t.is(stmt.get([0]), undefined);
+  t.is(stmt.get(1).name, "Alice");
+  t.is(stmt.get(2).name, "Bob");
+
+  stmt = db.prepare("SELECT * FROM users WHERE id = ?1");
+  t.is(stmt.get({1: 0}), undefined);
+  t.is(stmt.get({1: 1}).name, "Alice");
+  t.is(stmt.get({1: 2}).name, "Bob");
+});
+
+test.serial("Statement.get() [named]", async (t) => {
+  const db = t.context.db;
+
+  var stmt = undefined;
+
+  stmt = db.prepare("SELECT :b, :a");
+  t.deepEqual(stmt.raw().get({ a: 'a', b: 'b' }), ['b', 'a']);
+
+  stmt = db.prepare("SELECT * FROM users WHERE id = :id");
+  t.is(stmt.get({ id: 0 }), undefined);
+  t.is(stmt.get({ id: 1 }).name, "Alice");
+  t.is(stmt.get({ id: 2 }).name, "Bob");
+
+  stmt = db.prepare("SELECT * FROM users WHERE id = @id");
+  t.is(stmt.get({ id: 0 }), undefined);
+  t.is(stmt.get({ id: 1 }).name, "Alice");
+  t.is(stmt.get({ id: 2 }).name, "Bob");
+
+  stmt = db.prepare("SELECT * FROM users WHERE id = $id");
+  t.is(stmt.get({ id: 0 }), undefined);
+  t.is(stmt.get({ id: 1 }).name, "Alice");
+  t.is(stmt.get({ id: 2 }).name, "Bob");
+});
+
+test.serial("Statement.get() [raw]", async (t) => {
+  const db = t.context.db;
+
+  const stmt = db.prepare("SELECT * FROM users WHERE id = ?");
+  t.deepEqual(stmt.raw().get(1), [1, "Alice", "alice@example.org"]);
+});
+
+test.serial("Statement.get() collapses duplicate column names", async (t) => {
+  const db = t.context.db;
+
+  db.exec("DROP TABLE IF EXISTS role; DROP TABLE IF EXISTS org_unit");
+  db.exec("CREATE TABLE role(path TEXT); CREATE TABLE org_unit(path TEXT)");
+  db.exec("INSERT INTO role VALUES ('/Employee'); INSERT INTO org_unit VALUES ('/')");
+
+  const stmt = db.prepare("SELECT role.path, org_unit.path FROM role JOIN org_unit");
+  const row = stmt.get();
+
+  t.deepEqual(Object.keys(row), ["path"]);
+  t.is(row.path, "/");
+  t.is(row[0], undefined);
+  t.is(row[1], undefined);
+  t.deepEqual(row, { path: "/" });
+
+  t.deepEqual(stmt.raw().get(), ["/Employee", "/"]);
+});
+
+test.serial("Statement.get() values", async (t) => {
+  const db = t.context.db;
+
+  const stmt = db.prepare("SELECT ?").raw();
+  t.deepEqual(stmt.get(1), [1]);
+  t.deepEqual(stmt.get(Number.MIN_VALUE), [Number.MIN_VALUE]);
+  t.deepEqual(stmt.get(Number.MAX_VALUE), [Number.MAX_VALUE]);
+  t.deepEqual(stmt.get(Number.MAX_SAFE_INTEGER), [Number.MAX_SAFE_INTEGER]);
+  t.deepEqual(stmt.get(9007199254740991n), [9007199254740991]);
+});
+
+
+test.serial("Statement.get() datetime('now')", async (t) => {
+  const db = t.context.db;
+
+  const stmt = db.prepare("SELECT datetime('now') AS now");
+  const row = stmt.get();
+  t.truthy(row.now, "datetime('now') should return a value");
+  // Verify the result matches the expected ISO 8601 datetime format: YYYY-MM-DD HH:MM:SS
+  t.regex(row.now, /^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$/, "datetime('now') should return a valid datetime string");
+});
+
+
+test.serial("Statement.get() [blob]", (t) => {
+  const db = t.context.db;
+
+  // Create table with blob column
+  db.exec("CREATE TABLE IF NOT EXISTS blobs (id INTEGER PRIMARY KEY, data BLOB)");
+  
+  // Test inserting and retrieving blob data
+  const binaryData = Buffer.from([0x48, 0x65, 0x6c, 0x6c, 0x6f, 0x20, 0x57, 0x6f, 0x72, 0x6c, 0x64]); // "Hello World"
+  const insertStmt = db.prepare("INSERT INTO blobs (data) VALUES (?)");
+  insertStmt.run([binaryData]);
+  
+  // Retrieve the blob data
+  const selectStmt = db.prepare("SELECT data FROM blobs WHERE id = 1");
+  const result = selectStmt.get();
+  
+  t.truthy(result, "Should return a result");
+  t.true(Buffer.isBuffer(result.data), "Should return Buffer for blob data");
+  t.deepEqual(result.data, binaryData, "Blob data should match original");
+});
+
+// ==========================================================================
+// Statement.iterate()
+// ==========================================================================
+
+test.serial("Statement.iterate() [empty]", async (t) => {
+  const db = t.context.db;
+
+  const stmt = db.prepare("SELECT * FROM users WHERE id = 0");
+  t.is(stmt.iterate().next().done, true);
+  t.is(stmt.iterate([]).next().done, true);
+  t.is(stmt.iterate({}).next().done, true);
+});
+
+test.serial("Statement.iterate()", async (t) => {
+  const db = t.context.db;
+
+  const stmt = db.prepare("SELECT * FROM users");
+  const expected = [1, 2];
+  var idx = 0;
+  for (const row of stmt.iterate()) {
+    t.is(row.id, expected[idx++]);
+  }
+});
+
+// ==========================================================================
+// Statement.all()
+// ==========================================================================
+
+test.serial("Statement.all()", async (t) => {
+  const db = t.context.db;
+
+  const stmt = db.prepare("SELECT * FROM users");
+  const expected = [
+    { id: 1, name: "Alice", email: "alice@example.org" },
+    { id: 2, name: "Bob", email: "bob@example.com" },
+  ];
+  t.deepEqual(stmt.all(), expected);
+});
+
+test.serial("Statement.all() [raw]", async (t) => {
+  const db = t.context.db;
+
+  const stmt = db.prepare("SELECT * FROM users");
+  const expected = [
+    [1, "Alice", "alice@example.org"],
+    [2, "Bob", "bob@example.com"],
+  ];
+  t.deepEqual(stmt.raw().all(), expected);
+});
+
+test.serial("Statement.all() [pluck]", async (t) => {
+  const db = t.context.db;
+
+  const stmt = db.prepare("SELECT * FROM users");
+  const expected = [
+    1,
+    2,
+  ];
+  t.deepEqual(stmt.pluck().all(), expected);
+});
+
+test.serial("Statement.all() [default safe integers]", async (t) => {
+  const db = t.context.db;
+  db.defaultSafeIntegers();
+  const stmt = db.prepare("SELECT * FROM users");
+  const expected = [
+    [1n, "Alice", "alice@example.org"],
+    [2n, "Bob", "bob@example.com"],
+  ];
+  t.deepEqual(stmt.raw().all(), expected);
+});
+
+test.serial("Statement.all() [statement safe integers]", async (t) => {
+  const db = t.context.db;
+  const stmt = db.prepare("SELECT * FROM users");
+  stmt.safeIntegers();
+  const expected = [
+    [1n, "Alice", "alice@example.org"],
+    [2n, "Bob", "bob@example.com"],
+  ];
+  t.deepEqual(stmt.raw().all(), expected);
+});
+
+// ==========================================================================
+// Big integers
+//
+// Coverage for the area around tursodatabase/turso#7556. Integers outside the
+// JS safe-integer range (notably i64::MAX = 9223372036854775807, the value
+// Turso's internal sequence metadata stores) must round-trip losslessly when
+// safe integers are enabled. The default number mode is intentionally lossy
+// above 2^53, matching better-sqlite3.
+// ==========================================================================
+
+test.serial("Big integers [round-trip with safe integers]", async (t) => {
+  const db = t.context.db;
+  db.exec("DROP TABLE IF EXISTS bigints");
+  db.exec("CREATE TABLE bigints (id INTEGER PRIMARY KEY, v INTEGER)");
+
+  const values = [
+    [1, 9223372036854775807n], // i64::MAX
+    [2, -9223372036854775808n], // i64::MIN
+    [3, 9007199254740993n], // 2^53 + 1, first integer Number cannot represent
+  ];
+  const insert = db.prepare("INSERT INTO bigints (id, v) VALUES (?, ?)");
+  for (const [id, v] of values) {
+    insert.run(id, v);
+  }
+
+  const stmt = db.prepare("SELECT v FROM bigints ORDER BY id");
+  stmt.safeIntegers();
+  t.deepEqual(stmt.pluck().all(), values.map(([, v]) => v));
+});
+
+// ==========================================================================
+// Statement.raw()
+// ==========================================================================
+
+test.skip("Statement.raw() [failure]", async (t) => {
+  const db = t.context.db;
+  const stmt = db.prepare("INSERT INTO users (id, name, email) VALUES (?, ?, ?)");
+  t.throws(() => {
+    stmt.raw()
+  }, {
+    message: 'The raw() method is only for statements that return data'
+  });
+});
+
+// ==========================================================================
+// Statement.columns()
+// ==========================================================================
+
+test.serial("Statement.columns()", async (t) => {
+  const db = t.context.db;
+
+  var stmt = undefined;
+
+  stmt = db.prepare("SELECT 1");
+  const columns1 = stmt.columns();
+  t.is(columns1.length, 1);
+  t.is(columns1[0].name, '1');
+  // For "SELECT 1", type varies by provider, so just check it exists
+  t.true('type' in columns1[0]);
+
+  stmt = await db.prepare("SELECT * FROM users WHERE id = ?");
+  const columns2 = stmt.columns();
+  t.is(columns2.length, 3);
+  
+  // Check column names and types only
+  t.is(columns2[0].name, "id");
+  t.is(columns2[0].type, "INTEGER");
+  
+  t.is(columns2[1].name, "name");  
+  t.is(columns2[1].type, "TEXT");
+  
+  t.is(columns2[2].name, "email");
+  t.is(columns2[2].type, "TEXT");
+});
+
+// ==========================================================================
+// Statement.reader
+// ==========================================================================
+
+test.serial("Statement.reader [SELECT is true]", (t) => {
+  const db = t.context.db;
+
+  const stmt = db.prepare("SELECT * FROM users WHERE id = ?");
+  t.is(stmt.reader, true);
+});
+
+test.serial("Statement.reader [INSERT is false]", (t) => {
+  const db = t.context.db;
+
+  const stmt = db.prepare("INSERT INTO users (name, email) VALUES (?, ?)");
+  t.is(stmt.reader, false);
+});
+
+test.serial("Statement.reader [UPDATE is false]", (t) => {
+  const db = t.context.db;
+
+  const stmt = db.prepare("UPDATE users SET name = ? WHERE id = ?");
+  t.is(stmt.reader, false);
+});
+
+test.serial("Statement.reader [DELETE is false]", (t) => {
+  const db = t.context.db;
+
+  const stmt = db.prepare("DELETE FROM users WHERE id = ?");
+  t.is(stmt.reader, false);
+});
+
+test.serial("Statement.reader [INSERT RETURNING is true]", (t) => {
+  const db = t.context.db;
+
+  const stmt = db.prepare("INSERT INTO users (name, email) VALUES (?, ?) RETURNING *");
+  t.is(stmt.reader, true);
+});
+
+test.serial("Statement.reader [UPDATE RETURNING is true]", (t) => {
+  const db = t.context.db;
+
+  const stmt = db.prepare("UPDATE users SET name = ? WHERE id = ? RETURNING *");
+  t.is(stmt.reader, true);
+});
+
+test.serial("Statement.reader [DELETE RETURNING is true]", (t) => {
+  const db = t.context.db;
+
+  const stmt = db.prepare("DELETE FROM users WHERE id = ? RETURNING *");
+  t.is(stmt.reader, true);
+});
+
+const queryTimeoutInterruptsLongRunningQueryTest =
+  process.env.PROVIDER === "better-sqlite3" ? test.serial.skip : test.serial;
+
+queryTimeoutInterruptsLongRunningQueryTest("Query timeout option interrupts long-running query", async (t) => {
+  const path = genDatabaseFilename();
+  const [db] = await connect(path, { defaultQueryTimeout: 50 });
+  const stmt = db.prepare("SELECT sum(value) FROM generate_series(1, 1000000000);");
+
+  const error = t.throws(() => {
+    stmt.get();
+  }, { any: true });
+  t.truthy(error);
+  t.true(error.message.toLowerCase().includes("interrupt"));
+
+  db.close();
+  cleanupDatabaseFiles(path);
+});
+
+test.serial("Query timeout option allows short-running query", async (t) => {
+  const path = genDatabaseFilename();
+  const [db] = await connect(path, { defaultQueryTimeout: 50 });
+  const stmt = db.prepare("SELECT 1 AS value");
+  t.deepEqual(stmt.get(), { value: 1 });
+
+  db.close();
+  cleanupDatabaseFiles(path);
+});
+
+test.serial("Per-query timeout option interrupts long-running Statement.get()", async (t) => {
+  if (t.context.provider !== "turso") {
+    t.pass("Skipping queryTimeout test for non-Turso providers");
+    return;
+  }
+
+  const path = genDatabaseFilename();
+  const [db] = await connect(path);
+  const stmt = db.prepare("SELECT sum(value) FROM generate_series(1, 1000000000);");
+
+  const error = t.throws(() => {
+    stmt.get(undefined, { queryTimeout: 50 });
+  });
+  t.truthy(error);
+  t.true(error.message.toLowerCase().includes("interrupt"));
+
+  db.close();
+  cleanupDatabaseFiles(path);
+});
+
+test.serial("Per-query timeout option is accepted by Database.exec()", async (t) => {
+  if (t.context.provider !== "turso") {
+    t.pass("Skipping queryTimeout test for non-Turso providers");
+    return;
+  }
+
+  const path = genDatabaseFilename();
+  const [db] = await connect(path);
+  t.notThrows(() => db.exec("SELECT 1", { queryTimeout: 50 }));
+
+  db.close();
+  cleanupDatabaseFiles(path);
+});
+
+test.skip("Timeout option", async (t) => {
+  const timeout = 1000;
+  const path = genDatabaseFilename();
+  const [conn1] = await connect(path);
+  conn1.exec("CREATE TABLE t(x)");
+  conn1.exec("BEGIN IMMEDIATE");
+  conn1.exec("INSERT INTO t VALUES (1)")
+  const options = { timeout };
+  const [conn2] = await connect(path, options);
+  const start = Date.now();
+  try {
+    conn2.exec("INSERT INTO t VALUES (1)")
+  } catch (e) {
+    t.is(e.code, "SQLITE_BUSY");
+    const end = Date.now();
+    const elapsed = end - start;
+    // Allow some tolerance for the timeout.
+    t.is(elapsed > timeout/2, true);
+  }
+  fs.unlinkSync(path);
+});
+
+// ==========================================================================
+// Database rename
+// ==========================================================================
+
+test.serial("Open database after rename", async (t) => {
+  // 1. Open database A, create a table and insert data.
+  const pathA = genDatabaseFilename();
+  const pathB = genDatabaseFilename();
+  const [dbA] = await connect(pathA);
+  dbA.exec("CREATE TABLE t(x INTEGER)");
+  dbA.exec("INSERT INTO t VALUES (42)");
+  const row = dbA.prepare("SELECT x FROM t").get();
+  t.is(row.x, 42);
+
+  // 2. Close database A.
+  dbA.close();
+
+  // 3. Rename A -> B on disk (main file + WAL + SHM).
+  fs.renameSync(pathA, pathB);
+  if (fs.existsSync(pathA + "-wal")) {
+    fs.renameSync(pathA + "-wal", pathB + "-wal");
+  }
+  if (fs.existsSync(pathA + "-shm")) {
+    fs.renameSync(pathA + "-shm", pathB + "-shm");
+  }
+
+  // 4. Open a new database at the original path A.
+  const [dbA2] = await connect(pathA);
+
+  // 5. The new A should be a fresh, empty database — table 't' must not exist.
+  const tables = dbA2.prepare(
+    "SELECT name FROM sqlite_master WHERE type='table' AND name='t'"
+  ).all();
+  t.is(tables.length, 0,
+    "New database at A should not have table 't' — " +
+    "DATABASE_MANAGER returned stale Database after rename"
+  );
+
+  // Cleanup.
+  dbA2.close();
+  for (const p of [pathA, pathB]) {
+    for (const suffix of ["", "-wal", "-shm"]) {
+      if (fs.existsSync(p + suffix)) fs.unlinkSync(p + suffix);
+    }
+  }
+});
+
+
+// ==========================================================================
+// Interactive transaction conformance
+// ==========================================================================
+
+test.serial("Interactive transaction COMMIT visibility across connections", async (t) => {
+  const db = t.context.db;
+  const [db2] = await connect(t.context.path);
+
+  const countByName = (conn, name) => Number(
+    conn.prepare("SELECT COUNT(*) AS count FROM users WHERE name = ?").get([name]).count,
+  );
+
+  try {
+    db.exec("BEGIN");
+    db.prepare("INSERT INTO users(name, email) VALUES (?, ?)").run(["TxCommit", "tx-commit@example.org"]);
+
+    t.is(countByName(db, "TxCommit"), 1);
+    t.is(countByName(db2, "TxCommit"), 0);
+
+    db.exec("COMMIT");
+
+    t.is(countByName(db2, "TxCommit"), 1);
+  } finally {
+    db2.close();
+  }
+});
+
+test.serial("Interactive transaction ROLLBACK discards writes", async (t) => {
+  const db = t.context.db;
+
+  const countByName = (name) => Number(
+    db.prepare("SELECT COUNT(*) AS count FROM users WHERE name = ?").get([name]).count,
+  );
+
+  db.exec("BEGIN IMMEDIATE");
+  db.prepare("INSERT INTO users(name, email) VALUES (?, ?)").run(["TxRollback", "tx-rollback@example.org"]);
+  t.is(countByName("TxRollback"), 1);
+
+  db.exec("ROLLBACK");
+  t.is(countByName("TxRollback"), 0);
+});
+
+test.serial("Interactive transaction error + ROLLBACK keeps connection usable", async (t) => {
+  const db = t.context.db;
+
+  const countByName = (name) => Number(
+    db.prepare("SELECT COUNT(*) AS count FROM users WHERE name = ?").get([name]).count,
+  );
+
+  db.exec("BEGIN");
+  db.prepare("INSERT INTO users(name, email) VALUES (?, ?)").run(["WillRollback", "will-rollback@example.org"]);
+
+  const constraintError = t.throws(() => {
+    db.prepare("INSERT INTO users(id, name, email) VALUES (?, ?, ?)").run([1, "DuplicateId", "duplicate-id@example.org"]);
+  }, {
+    any: true,
+  });
+  t.truthy(constraintError);
+  const constraintHint = `${constraintError.code ?? ""} ${constraintError.message ?? ""}`.toUpperCase();
+  t.true(
+    constraintHint.includes("CONSTRAINT")
+    || constraintHint.includes("UNIQUE")
+    || constraintHint.includes("PRIMARYKEY"),
+  );
+
+  db.exec("ROLLBACK");
+  t.is(countByName("WillRollback"), 0);
+
+  db.exec("BEGIN");
+  db.prepare("INSERT INTO users(name, email) VALUES (?, ?)").run(["AfterRollback", "after-rollback@example.org"]);
+  db.exec("COMMIT");
+
+  t.is(countByName("AfterRollback"), 1);
+});
+const connect = async (path, options = {}) => {
+  if (!path) {
+    path = genDatabaseFilename();
+  }
+  const provider = process.env.PROVIDER;
+  if (provider === "turso") {
+    const { Database, SqliteError }= await import("@tursodatabase/database/compat");
+    const db = new Database(path, options);
+    return [db, path, provider, SqliteError];
+  }
+  if (provider === "libsql") {
+    const x = await import("libsql");
+    const db = new x.default(path, options);
+    return [db, path, provider, x.SqliteError];
+  }
+  if (provider == "better-sqlite3") {
+    const x = await import("better-sqlite3");
+    const db = x.default(path, options);
+    return [db, path, provider, x.default.SqliteError];
+  }
+  throw new Error("Unknown provider: " + provider);
+};
+
+/// Generate a unique database filename
+const genDatabaseFilename = () => {
+  return `test-${crypto.randomBytes(8).toString('hex')}.db`;
+};
+
+const cleanupDatabaseFiles = (path) => {
+  for (const suffix of ["", "-wal", "-shm"]) {
+    const file = path + suffix;
+    if (fs.existsSync(file)) {
+      fs.unlinkSync(file);
+    }
+  }
+};

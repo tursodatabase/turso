@@ -1,0 +1,39 @@
+@database :memory:
+
+# NATURAL JOIN with no common columns should produce a cross join
+# Per SQLite docs: "A NATURAL join automatically uses all common column names for the join condition"
+# When there are no common columns, this degenerates to a cross join
+test natural-join-no-common-columns {
+    create table t1 (a int, b int);
+    create table t2 (c int, d int);
+    insert into t1 values (1, 2), (3, 4);
+    insert into t2 values (5, 6), (7, 8);
+    select * from t1 natural join t2;
+}
+expect {
+    1|2|5|6
+    1|2|7|8
+    3|4|5|6
+    3|4|7|8
+}
+
+# NATURAL JOIN with no common columns and empty tables
+test natural-join-no-common-columns-empty {
+    create table t3 (x int);
+    create table t4 (y int);
+    select * from t3 natural join t4;
+}
+expect {
+}
+
+# NATURAL JOIN with no common columns - single row each
+test natural-join-no-common-columns-single {
+    create table t5 (p text);
+    create table t6 (q text);
+    insert into t5 values ('hello');
+    insert into t6 values ('world');
+    select * from t5 natural join t6;
+}
+expect {
+    hello|world
+}

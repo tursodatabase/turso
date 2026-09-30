@@ -1,0 +1,49 @@
+# 2024 March 20
+#
+# The author disclaims copyright to this source code.  In place of
+# a legal notice, here is a blessing:
+#
+#    May you do good and not evil.
+#    May you find forgiveness for yourself and forgive others.
+#    May you share freely, never taking more than you give.
+#
+#***********************************************************************
+#
+
+set testdir [file dirname $argv0]
+source $testdir/tester.tcl
+
+set testprefix eqp2
+
+do_execsql_test 1.0 {
+  CREATE TABLE t1(a, b, c, d);
+  CREATE INDEX i1 ON t1(a, b, c);
+}
+
+do_eqp_test 1.1 {
+  SELECT * FROM t1 ORDER BY a, b, c
+} {
+  QUERY PLAN
+  `--SCAN t1 USING INDEX i1
+}
+
+
+do_eqp_test 1.2 {
+  SELECT * FROM t1 ORDER BY a, b, +c
+} {
+  QUERY PLAN
+  |--SCAN t1 USING INDEX i1
+  `--USE TEMP B-TREE FOR LAST TERM OF ORDER BY
+}
+
+do_eqp_test 1.3 {
+  SELECT * FROM t1 ORDER BY a, +b, +c
+} {
+  QUERY PLAN
+  |--SCAN t1 USING INDEX i1
+  `--USE TEMP B-TREE FOR LAST 2 TERMS OF ORDER BY
+}
+
+finish_test
+
+

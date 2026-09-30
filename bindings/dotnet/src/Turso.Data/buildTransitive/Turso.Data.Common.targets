@@ -1,0 +1,57 @@
+<Project>
+  <PropertyGroup>
+    <_TursoDataNativeStaticEnabled Condition="'$(PublishAot)' == 'true' and '$(TursoUseStaticNativeLibrary)' == 'true'">true</_TursoDataNativeStaticEnabled>
+    <_TursoDataNativeStaticSupportedRid Condition="'$(RuntimeIdentifier)' == 'win-x64' or '$(RuntimeIdentifier)' == 'win-arm64' or '$(RuntimeIdentifier)' == 'linux-x64' or '$(RuntimeIdentifier)' == 'linux-arm64' or '$(RuntimeIdentifier)' == 'osx-x64' or '$(RuntimeIdentifier)' == 'osx-arm64'">true</_TursoDataNativeStaticSupportedRid>
+    <_TursoDataNativeStaticPackageId>Turso.Data.NativeAot.$(RuntimeIdentifier)</_TursoDataNativeStaticPackageId>
+  </PropertyGroup>
+
+  <Target Name="ConfigureTursoStaticNativeLibrary"
+          BeforeTargets="SetupOSSpecificProps"
+          Condition="'$(_TursoDataNativeStaticEnabled)' == 'true'">
+    <Error Condition="'$(RuntimeIdentifier)' == ''"
+           Text="TursoUseStaticNativeLibrary requires a RuntimeIdentifier, for example win-x64, linux-x64, or osx-arm64." />
+    <Error Condition="'$(RuntimeIdentifier)' != '' and '$(_TursoDataNativeStaticSupportedRid)' != 'true'"
+           Text="TursoUseStaticNativeLibrary does not support RuntimeIdentifier '$(RuntimeIdentifier)'." />
+    <Error Condition="'$(_TursoDataNativeStaticSupportedRid)' == 'true' and '$(_TursoDataNativeStaticLibrary)' == ''"
+           Text="TursoUseStaticNativeLibrary for $(RuntimeIdentifier) requires a PackageReference to $(_TursoDataNativeStaticPackageId)." />
+    <Error Condition="'$(_TursoDataNativeStaticLibrary)' != '' and !Exists('$(_TursoDataNativeStaticLibrary)')"
+           Text="Missing Turso static native library '$(_TursoDataNativeStaticLibrary)'." />
+
+    <ItemGroup>
+      <DirectPInvoke Include="turso_sdk_kit" />
+      <NativeLibrary Include="$(_TursoDataNativeStaticLibrary)"
+                     Condition="'$(_TursoDataNativeStaticLibrary)' != ''" />
+      <_TursoDataNativeWindowsStaticDependencies Include="$(_TursoDataNativeStaticDependencyDirectory)windows*.lib"
+                                                  Condition="'$(_TursoDataNativeStaticDependencyDirectory)' != ''" />
+    </ItemGroup>
+
+    <Error Condition="('$(RuntimeIdentifier)' == 'win-x64' or '$(RuntimeIdentifier)' == 'win-arm64') and '@(_TursoDataNativeWindowsStaticDependencies)' == ''"
+           Text="Missing Turso Windows static native dependency libraries from $(_TursoDataNativeStaticPackageId)." />
+
+    <ItemGroup Condition="'$(RuntimeIdentifier)' == 'win-x64' or '$(RuntimeIdentifier)' == 'win-arm64'">
+      <LinkerArg Include="/NODEFAULTLIB:MSVCRT" />
+      <NativeLibrary Include="@(_TursoDataNativeWindowsStaticDependencies)" />
+      <NativeLibrary Include="bcrypt.lib" />
+      <NativeLibrary Include="advapi32.lib" />
+      <NativeLibrary Include="kernel32.lib" />
+      <NativeLibrary Include="ntdll.lib" />
+      <NativeLibrary Include="userenv.lib" />
+      <NativeLibrary Include="ws2_32.lib" />
+      <NativeLibrary Include="dbghelp.lib" />
+    </ItemGroup>
+
+    <ItemGroup Condition="'$(RuntimeIdentifier)' == 'linux-x64' or '$(RuntimeIdentifier)' == 'linux-arm64'">
+      <NativeSystemLibrary Include="util" />
+    </ItemGroup>
+  </Target>
+
+  <Target Name="RemoveTursoDynamicNativeLibraryForStaticLink"
+          AfterTargets="ResolvePackageAssets"
+          BeforeTargets="CopyFilesToOutputDirectory;ComputeFilesToPublish"
+          Condition="'$(_TursoDataNativeStaticEnabled)' == 'true'">
+    <ItemGroup>
+      <NativeCopyLocalItems Remove="@(NativeCopyLocalItems)"
+                            Condition="'%(NativeCopyLocalItems.FileName)%(NativeCopyLocalItems.Extension)' == 'turso_sdk_kit.dll' or '%(NativeCopyLocalItems.FileName)%(NativeCopyLocalItems.Extension)' == 'libturso_sdk_kit.so' or '%(NativeCopyLocalItems.FileName)%(NativeCopyLocalItems.Extension)' == 'libturso_sdk_kit.dylib'" />
+    </ItemGroup>
+  </Target>
+</Project>
