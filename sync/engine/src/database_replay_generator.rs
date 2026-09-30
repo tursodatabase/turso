@@ -659,6 +659,75 @@ impl DatabaseReplayGenerator {
         })
     }
 
+    pub async fn rename_and_drop_local_columns_to_match_remote<Ctx>(
+        &self,
+        coro: &Coro<Ctx>,
+        create_table: &str,
+    ) -> Result<()> {
+        let mut parser = Parser::new(create_table.as_bytes());
+        let Some(Ok(turso_parser::ast::Cmd::Stmt(turso_parser::ast::Stmt::CreateTable {
+            tbl_name,
+            body: turso_parser::ast::CreateTableBody::ColumnsAndConstraints { columns, .. },
+            ..
+        }))) = parser.next()
+        else {
+            return Ok(());
+        };
+        let Some(local_columns) = self
+            .local_column_definitions(coro, tbl_name.name.as_str())
+            .await?
+        else {
+            return Ok(());
+        };
+        let (renamed_columns, dropped_columns) =
+            renamed_and_dropped_columns(&local_columns, &columns);
+        for (old_name, new_name) in renamed_columns {
+            let rename_column =
+                format!("ALTER TABLE {tbl_name} RENAME COLUMN {old_name} TO {new_name}");
+            self.execute_ddl(&rename_column)?;
+        }
+        for name in dropped_columns.into_iter().rev() {
+            let drop_column = format!("ALTER TABLE {tbl_name} DROP COLUMN {name}");
+            self.execute_ddl(&drop_column)?;
+        }
+        return Ok(());
+
+        fn renamed_and_dropped_columns<'a>(
+            local_columns: &'a [turso_parser::ast::ColumnDefinition],
+            remote_columns: &'a [turso_parser::ast::ColumnDefinition],
+        ) -> (
+            Vec<(&'a turso_parser::ast::Name, &'a turso_parser::ast::Name)>,
+            Vec<&'a turso_parser::ast::Name>,
+        ) {
+            let mut renamed = Vec::new();
+            let mut dropped = Vec::new();
+            let mut remote_columns = remote_columns.iter().peekable();
+            for (index, local_column) in local_columns.iter().enumerate() {
+                let local_name = &local_column.col_name;
+                let Some(remote_column) = remote_columns.peek() else {
+                    dropped.push(local_name);
+                    continue;
+                };
+                let remote_name = &remote_column.col_name;
+                if local_name
+                    .as_str()
+                    .eq_ignore_ascii_case(remote_name.as_str())
+                {
+                    remote_columns.next();
+                } else if has_column(&local_columns[index + 1..], remote_name.as_str()) {
+                    // This doesn't correctly handle a remote transaction that swaps two columns,
+                    // https://github.com/tursodatabase/turso/issues/9430 . But for now, this is the
+                    // best we can do. Note that this change didn't introduce the bug.
+                    dropped.push(local_name);
+                } else {
+                    renamed.push((local_name, remote_name));
+                    remote_columns.next();
+                }
+            }
+            (renamed, dropped)
+        }
+    }
+
     /// Execute a DDL statement idempotently: CREATE TABLE for an existing table
     /// drops the generated columns that it removes or changes and adds the
     /// columns that are missing, named schema objects are skipped when already
