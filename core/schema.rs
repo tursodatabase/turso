@@ -1313,9 +1313,12 @@ impl Schema {
     pub fn get_trigger_for_table(&self, table_name: &str, name: &str) -> Option<Arc<Trigger>> {
         let table_name = normalize_ident(table_name);
         let name = normalize_ident(name);
-        self.triggers
-            .get(&table_name)
-            .and_then(|triggers| triggers.iter().find(|t| t.name == name).cloned())
+        self.triggers.get(&table_name).and_then(|triggers| {
+            triggers
+                .iter()
+                .find(|t| t.name.eq_ignore_ascii_case(&name))
+                .cloned()
+        })
     }
 
     pub fn get_triggers_for_table(
@@ -1334,7 +1337,7 @@ impl Schema {
         self.triggers
             .values()
             .flatten()
-            .find(|t| t.name == name)
+            .find(|t| t.name.eq_ignore_ascii_case(&name))
             .cloned()
     }
 
