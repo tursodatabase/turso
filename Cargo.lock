@@ -7192,6 +7192,7 @@ dependencies = [
  "strum",
  "strum_macros",
  "tantivy",
+ "tantivy-common",
  "tempfile",
  "test-log",
  "thiserror 2.0.16",
