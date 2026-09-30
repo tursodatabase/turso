@@ -3411,6 +3411,79 @@ mod tests {
     }
 
     #[test]
+    pub fn test_database_tape_replay_update_of_table_with_virtual_column() {
+        let temp_file1 = NamedTempFile::new().unwrap();
+        let db_path1 = temp_file1.path().to_str().unwrap();
+        let temp_file2 = NamedTempFile::new().unwrap();
+        let db_path2 = temp_file2.path().to_str().unwrap();
+
+        let io: Arc<dyn turso_core::IO> = Arc::new(turso_core::PlatformIO::new().unwrap());
+        let open = |path: &str| {
+            let opts = turso_core::OpenOptions::new(Arc::new(SqliteDialect))
+                .db_opts(turso_core::DatabaseOpts::new().with_generated_columns(true));
+            let db = turso_core::Database::open(io.clone(), path, opts).unwrap();
+            Arc::new(DatabaseTape::new(db))
+        };
+        let db1 = open(db_path1);
+        let db2 = open(db_path2);
+
+        let mut gen = genawaiter::sync::Gen::new({
+            |coro| async move {
+                let coro: Coro<()> = coro.into();
+                let schema =
+                    "CREATE TABLE t(id INTEGER PRIMARY KEY, a INTEGER, v AS (a + 1), b INTEGER)";
+                let conn1 = db1.connect(&coro).await.unwrap();
+                conn1.execute(schema).unwrap();
+                conn1
+                    .execute("INSERT INTO t(id, a, b) VALUES (1, 10, 20)")
+                    .unwrap();
+                conn1.execute("UPDATE t SET b = 30 WHERE id = 1").unwrap();
+                conn1
+                    .execute("INSERT INTO t(id, a, b) VALUES (2, 40, 50)")
+                    .unwrap();
+                conn1.execute("UPDATE t SET a = 41 WHERE id = 2").unwrap();
+
+                let conn2 = db2.connect(&coro).await.unwrap();
+                conn2.execute(schema).unwrap();
+                {
+                    let opts = DatabaseReplaySessionOpts {
+                        use_implicit_rowid: false,
+                    };
+                    let mut session = db2.start_replay_session(&coro, opts).await.unwrap();
+                    let mut iterator = db1.iterate_changes(Default::default()).unwrap();
+                    while let Some(operation) = iterator.next(&coro).await.unwrap() {
+                        session.replay(&coro, operation).await.unwrap();
+                    }
+                }
+
+                let mut rows = Vec::new();
+                let mut stmt = conn2
+                    .prepare("SELECT id, a, v, b FROM t ORDER BY id")
+                    .unwrap();
+                while let Some(row) = run_stmt_once(&coro, &mut stmt).await.unwrap() {
+                    rows.push(row.get_values().cloned().collect::<Vec<_>>());
+                }
+                rows
+            }
+        });
+        let rows = loop {
+            match gen.resume_with(Ok(())) {
+                genawaiter::GeneratorState::Yielded(..) => io.step().unwrap(),
+                genawaiter::GeneratorState::Complete(result) => break result,
+            }
+        };
+
+        let int = turso_core::Value::from_i64;
+        assert_eq!(
+            rows,
+            vec![
+                vec![int(1), int(10), int(11), int(30)],
+                vec![int(2), int(41), int(42), int(50)],
+            ]
+        );
+    }
+
+    #[test]
     pub fn test_schema_refresh_of_table_with_generated_column_adds_missing_column() {
         let rows = replay_on_table_with_generated_columns(
             &[
