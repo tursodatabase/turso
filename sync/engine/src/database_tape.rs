@@ -3409,4 +3409,233 @@ mod tests {
             "the swap must keep both rows"
         );
     }
+
+    #[test]
+    pub fn test_schema_refresh_of_table_with_generated_column_adds_missing_column() {
+        let rows = replay_on_table_with_generated_columns(
+            &[
+                "CREATE TABLE core (id STRING PRIMARY KEY, sort TEXT, search TEXT AS (CAST (sort AS TEXT)))",
+                "INSERT INTO core (id, sort) VALUES ('a', 'Hello')",
+            ],
+            vec![table_refresh(
+                "CREATE TABLE core (id STRING PRIMARY KEY, sort TEXT, search TEXT AS (CAST (sort AS TEXT)), note TEXT)",
+            )],
+            "SELECT id, sort, search, note FROM core",
+        )
+        .unwrap();
+        assert_eq!(
+            rows,
+            vec![vec![
+                text("a"),
+                text("Hello"),
+                text("Hello"),
+                turso_core::Value::Null
+            ]]
+        );
+    }
+
+    #[test]
+    pub fn test_schema_refresh_replaces_changed_generated_column() {
+        let setup = &[
+            "CREATE TABLE core (id STRING PRIMARY KEY, sort TEXT, search TEXT AS (CAST (sort AS TEXT)))",
+            "INSERT INTO core (id, sort) VALUES ('a', 'Hello')",
+        ];
+        let insert_row = || {
+            DatabaseTapeOperation::RowChange(DatabaseTapeRowChange {
+                change_id: 0,
+                change_time: 0,
+                change: DatabaseTapeRowChangeType::Insert {
+                    after: crate::alloc::vec![text("b"), text("World")],
+                },
+                table_name: "core".to_string(),
+                id: 2,
+            })
+        };
+        let expected = vec![
+            vec![text("a"), text("Hello"), text("HELLO")],
+            vec![text("b"), text("World"), text("WORLD")],
+        ];
+
+        let drop_then_add = replay_on_table_with_generated_columns(
+            setup,
+            vec![
+                table_refresh("CREATE TABLE core (id STRING PRIMARY KEY, sort TEXT)"),
+                table_refresh(
+                    "CREATE TABLE core (id STRING PRIMARY KEY, sort TEXT, search TEXT AS (UPPER (sort)))",
+                ),
+                insert_row(),
+            ],
+            "SELECT id, sort, search FROM core ORDER BY id",
+        )
+        .unwrap();
+        assert_eq!(drop_then_add, expected);
+
+        let redefine_in_one_refresh = replay_on_table_with_generated_columns(
+            setup,
+            vec![
+                table_refresh(
+                    "CREATE TABLE core (id STRING PRIMARY KEY, sort TEXT, search TEXT AS (UPPER (sort)))",
+                ),
+                insert_row(),
+            ],
+            "SELECT id, sort, search FROM core ORDER BY id",
+        )
+        .unwrap();
+        assert_eq!(redefine_in_one_refresh, expected);
+    }
+
+    #[test]
+    pub fn test_schema_refresh_drops_removed_generated_column() {
+        let rows = replay_on_table_with_generated_columns(
+            &[
+                "CREATE TABLE core (id STRING PRIMARY KEY, sort TEXT, search TEXT AS (CAST (sort AS TEXT)))",
+                "INSERT INTO core (id, sort) VALUES ('a', 'Hello')",
+            ],
+            vec![table_refresh(
+                "CREATE TABLE core (id STRING PRIMARY KEY, sort TEXT)",
+            )],
+            "SELECT * FROM core",
+        )
+        .unwrap();
+        assert_eq!(rows, vec![vec![text("a"), text("Hello")]]);
+    }
+
+    #[test]
+    pub fn test_add_column_replay_skips_existing_generated_column() {
+        let rows = replay_on_table_with_generated_columns(
+            &[
+                "CREATE TABLE core (id STRING PRIMARY KEY, sort TEXT, search TEXT AS (CAST (sort AS TEXT)))",
+                "INSERT INTO core (id, sort) VALUES ('a', 'Hello')",
+            ],
+            vec![DatabaseTapeOperation::SchemaReplay(
+                DatabaseSchemaReplay::Alter {
+                    sql: "ALTER TABLE core ADD COLUMN search TEXT AS (CAST (sort AS TEXT))"
+                        .to_string(),
+                },
+            )],
+            "SELECT id, sort, search FROM core",
+        )
+        .unwrap();
+        assert_eq!(rows, vec![vec![text("a"), text("Hello"), text("Hello")]]);
+    }
+
+    #[test]
+    pub fn test_schema_refresh_matches_column_names_case_insensitively() {
+        let rows = replay_on_table_with_generated_columns(
+            &[
+                "CREATE TABLE core (id STRING PRIMARY KEY, Note TEXT)",
+                "INSERT INTO core (id, Note) VALUES ('a', 'Hello')",
+            ],
+            vec![table_refresh(
+                "CREATE TABLE core (id STRING PRIMARY KEY, note TEXT)",
+            )],
+            "SELECT id, note FROM core",
+        )
+        .unwrap();
+        assert_eq!(rows, vec![vec![text("a"), text("Hello")]]);
+    }
+
+    #[test]
+    pub fn test_add_column_replay_matches_column_names_case_insensitively() {
+        let rows = replay_on_table_with_generated_columns(
+            &[
+                "CREATE TABLE core (id STRING PRIMARY KEY, Note TEXT)",
+                "INSERT INTO core (id, Note) VALUES ('a', 'Hello')",
+            ],
+            vec![DatabaseTapeOperation::SchemaReplay(
+                DatabaseSchemaReplay::Alter {
+                    sql: "ALTER TABLE core ADD COLUMN note TEXT".to_string(),
+                },
+            )],
+            "SELECT id, note FROM core",
+        )
+        .unwrap();
+        assert_eq!(rows, vec![vec![text("a"), text("Hello")]]);
+    }
+
+    #[test]
+    pub fn test_schema_refresh_of_table_with_indexed_generated_column_adds_missing_column() {
+        let rows = replay_on_table_with_generated_columns(
+            &[
+                "CREATE TABLE core (id STRING PRIMARY KEY, sort TEXT, search TEXT AS (CAST (sort AS TEXT)))",
+                "CREATE INDEX idx ON core (search)",
+                "INSERT INTO core (id, sort) VALUES ('a', 'Hello')",
+            ],
+            vec![table_refresh(
+                "CREATE TABLE core (id STRING PRIMARY KEY, sort TEXT, search TEXT AS (CAST (sort AS TEXT)), note TEXT)",
+            )],
+            "SELECT id, sort, search, note FROM core WHERE search = 'Hello'",
+        )
+        .unwrap();
+        assert_eq!(
+            rows,
+            vec![vec![
+                text("a"),
+                text("Hello"),
+                text("Hello"),
+                turso_core::Value::Null
+            ]]
+        );
+    }
+
+    fn replay_on_table_with_generated_columns(
+        setup: &[&str],
+        operations: Vec<DatabaseTapeOperation>,
+        query: &str,
+    ) -> crate::Result<Vec<Vec<turso_core::Value>>> {
+        let temp_file = NamedTempFile::new()?;
+        let db_path = temp_file.path().to_str().unwrap();
+        let io: Arc<dyn turso_core::IO> = Arc::new(turso_core::PlatformIO::new()?);
+        let db = turso_core::Database::open(
+            io.clone(),
+            db_path,
+            turso_core::OpenOptions::new(Arc::new(SqliteDialect))
+                .db_opts(turso_core::DatabaseOpts::new().with_generated_columns(true)),
+        )?;
+        let db = Arc::new(DatabaseTape::new(db));
+        let setup = setup.iter().map(|sql| sql.to_string()).collect::<Vec<_>>();
+        let query = query.to_string();
+        let mut gen = genawaiter::sync::Gen::new({
+            let db = db.clone();
+            |coro| async move {
+                let coro: Coro<()> = coro.into();
+                let conn = db.connect(&coro).await.unwrap();
+                for sql in &setup {
+                    conn.execute(sql).unwrap();
+                }
+                let opts = DatabaseReplaySessionOpts {
+                    use_implicit_rowid: false,
+                };
+                let mut session = db.start_replay_session(&coro, opts).await.unwrap();
+                for operation in operations {
+                    session.replay(&coro, operation).await?;
+                }
+                session.replay(&coro, DatabaseTapeOperation::Commit).await?;
+                let mut stmt = conn.prepare(&query).unwrap();
+                let mut rows = Vec::new();
+                while let Some(row) = run_stmt_once(&coro, &mut stmt).await.unwrap() {
+                    rows.push(row.get_values().cloned().collect::<Vec<_>>());
+                }
+                Ok(rows)
+            }
+        });
+        loop {
+            match gen.resume_with(Ok(())) {
+                genawaiter::GeneratorState::Yielded(..) => io.step()?,
+                genawaiter::GeneratorState::Complete(result) => break result,
+            }
+        }
+    }
+
+    fn table_refresh(sql: &str) -> DatabaseTapeOperation {
+        DatabaseTapeOperation::SchemaReplay(DatabaseSchemaReplay::Refresh {
+            kind: DatabaseSchemaKind::Table,
+            name: "core".to_string(),
+            sql: sql.to_string(),
+        })
+    }
+
+    fn text(value: &str) -> turso_core::Value {
+        turso_core::Value::from_text(value.to_string())
+    }
 }
