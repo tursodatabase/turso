@@ -533,14 +533,14 @@ fn update_pragma(
                         b"none" => Some(AutoVacuumMode::None),
                         b"full" => Some(AutoVacuumMode::Full),
                         b"incremental" => Some(AutoVacuumMode::Incremental),
-                        _ => None,
+                        _ => Some(AutoVacuumMode::None),
                     })
                 }
                 _ => match parse_signed_number(&value) {
                     Ok(Value::Numeric(Numeric::Integer(n @ 0..=2))) => {
                         Some(AutoVacuumMode::from(n as u8))
                     }
-                    _ => None,
+                    _ => Some(AutoVacuumMode::None),
                 },
             };
 
