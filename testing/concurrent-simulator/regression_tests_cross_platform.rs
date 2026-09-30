@@ -517,7 +517,17 @@ fn parse_edn_read(slice: &str) -> Option<(String, bool, &str)> {
 /// While the bug exists this test FAILS with the panic.
 #[test]
 fn paused_read_across_commit_must_not_panic() {
+    run_paused_read_across_commit(true);
+}
+
+#[test]
+fn paused_read_across_commit_in_wal_must_not_panic() {
+    run_paused_read_across_commit(false);
+}
+
+fn run_paused_read_across_commit(enable_mvcc: bool) {
     use std::sync::Mutex;
+    use turso_whopper::properties::IntegrityCheckProperty;
     use turso_whopper::workloads::{Workload, WorkloadContext};
     use turso_whopper::{Operation, TxMode, Whopper, WhopperOpts};
 
@@ -553,25 +563,35 @@ fn paused_read_across_commit_must_not_panic() {
                     .to_string(),
             },
             Operation::Begin {
-                mode: TxMode::Concurrent,
+                mode: if enable_mvcc {
+                    TxMode::Concurrent
+                } else {
+                    TxMode::Deferred
+                },
             },
             Operation::PausedRead {
                 sql: "SELECT key, length(value) FROM kv ORDER BY key".to_string(),
             },
             Operation::Commit,
+            Operation::WalCheckpoint {
+                mode: "TRUNCATE".to_string(),
+            },
             Operation::ResumePausedRead,
+            Operation::IntegrityCheck,
         ],
         next: Mutex::new(0),
     };
 
     let opts = WhopperOpts {
-        seed: Some(7),
+        seed: Some(if enable_mvcc { 7 } else { 8 }),
         max_connections: 1,
         max_steps: 5_000,
-        enable_mvcc: true,
+        enable_mvcc,
         workloads: vec![(1, Box::new(script))],
+        properties: vec![Box::new(IntegrityCheckProperty)],
         ..Default::default()
     };
     let mut whopper = Whopper::new(opts).expect("create whopper");
     whopper.run().expect("run must complete without panicking");
+    assert_eq!(whopper.stats.integrity_checks, 1);
 }
