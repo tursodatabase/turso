@@ -1,0 +1,199 @@
+@database :memory:
+
+@cross-check-integrity
+test qualified-update-target-is-case-insensitive {
+    CREATE TABLE ConnectionHistory(ID INTEGER, Name TEXT);
+    INSERT INTO ConnectionHistory VALUES(1, 'before');
+    UPDATE ConnectionHistory
+       SET Name = 'after'
+     WHERE ConnectionHistory.ID = 1;
+    SELECT ID, Name FROM ConnectionHistory;
+}
+expect {
+    1|after
+}
+
+@cross-check-integrity
+test quoted-qualified-update-target-is-case-insensitive {
+    CREATE TABLE "ConnectionHistory"("ID" INTEGER, "Name" TEXT);
+    INSERT INTO "ConnectionHistory" VALUES(1, 'before');
+    UPDATE "ConnectionHistory"
+       SET "Name" = 'after'
+     WHERE "ConnectionHistory"."ID" = 1;
+    SELECT "ID", "Name" FROM "ConnectionHistory";
+}
+expect {
+    1|after
+}
+
+@cross-check-integrity
+test mixed-case-update-alias-is-case-insensitive {
+    CREATE TABLE ConnectionHistory(ID INTEGER, Name TEXT);
+    INSERT INTO ConnectionHistory VALUES(1, 'before');
+    UPDATE ConnectionHistory AS HistoryAlias
+       SET Name = 'after'
+     WHERE historyalias.ID = 1;
+    SELECT ID, Name FROM ConnectionHistory;
+}
+expect {
+    1|after
+}
+
+@cross-check-integrity
+test qualified-update-target-is-visible-in-correlated-subquery {
+    CREATE TABLE ConnectionHistory(ID INTEGER, Name TEXT);
+    INSERT INTO ConnectionHistory VALUES(1, 'before');
+    UPDATE ConnectionHistory
+       SET Name = 'after'
+     WHERE EXISTS (
+       SELECT 1
+        WHERE CONNECTIONHISTORY.ID = 1
+     );
+    SELECT ID, Name FROM ConnectionHistory;
+}
+expect {
+    1|after
+}
+
+@cross-check-integrity
+test mixed-case-update-returning-uses-base-table-name {
+    CREATE TABLE ConnectionHistory(ID INTEGER, Name TEXT);
+    INSERT INTO ConnectionHistory VALUES(1, 'before');
+    UPDATE ConnectionHistory AS HistoryAlias
+       SET Name = 'after'
+     WHERE historyalias.ID = 1
+    RETURNING CONNECTIONHISTORY.ID, Name;
+}
+expect {
+    1|after
+}
+
+@cross-check-integrity
+test rdm-minimal-trigger-qualified-update {
+    CREATE TABLE Connections(ID guid PRIMARY KEY, DATA TEXT, Name TEXT);
+    CREATE TABLE ConnectionHistory(ID guid, DATA TEXT, Name TEXT);
+    CREATE TRIGGER ConnectionsInsert AFTER INSERT ON Connections BEGIN
+      UPDATE ConnectionHistory SET Name='R' WHERE ConnectionHistory.ID=NEW.ID;
+      INSERT INTO ConnectionHistory(ID,DATA,Name) VALUES(NEW.ID,NEW.DATA,NEW.Name);
+    END;
+    INSERT INTO Connections(ID,DATA,Name) VALUES(X'33221100554477668899AABBCCDDEEFF','synthetic-baseline','synthetic connection');
+    SELECT hex(ID), DATA, Name FROM ConnectionHistory ORDER BY rowid;
+}
+expect {
+    33221100554477668899AABBCCDDEEFF|synthetic-baseline|synthetic connection
+}
+
+@cross-check-integrity
+test rdm-v155-insert-trigger-body {
+    CREATE TABLE DatabaseInfo(ConnectionCacheID BLOB);
+    INSERT INTO DatabaseInfo VALUES(NULL);
+    CREATE TABLE Connections(
+      ID guid PRIMARY KEY,
+      DATA TEXT,
+      SecurityGroup TEXT,
+      CustomerID TEXT,
+      ConnectionType TEXT,
+      ConnectionSubType TEXT,
+      GroupName TEXT,
+      Name TEXT,
+      UnsafePassword TEXT,
+      DataSourceID TEXT,
+      MetaData TEXT,
+      CreationDate TEXT,
+      Description TEXT,
+      ModifiedDate TEXT,
+      ModifiedUsername TEXT,
+      ModifiedLoggedUserName TEXT,
+      ParentID TEXT
+    );
+    CREATE TABLE ConnectionHistory(
+      HistoryType TEXT,
+      ConnectionID guid,
+      DATA TEXT,
+      SecurityGroup TEXT,
+      CustomerID TEXT,
+      ConnectionType TEXT,
+      ConnectionSubType TEXT,
+      GroupName TEXT,
+      Name TEXT,
+      UnsafePassword TEXT,
+      DataSourceID TEXT,
+      MetaData TEXT,
+      CreationDate TEXT,
+      Description TEXT,
+      ModifiedDate TEXT,
+      ModifiedUsername TEXT,
+      ModifiedLoggedUserName TEXT,
+      ParentID TEXT
+    );
+    INSERT INTO ConnectionHistory(HistoryType, ConnectionID, Name)
+    VALUES('D', X'33221100554477668899AABBCCDDEEFF', 'deleted');
+    CREATE TRIGGER IF NOT EXISTS Connections_Trigger_Insert INSERT ON Connections
+    BEGIN
+        UPDATE DatabaseInfo SET ConnectionCacheID = randomblob(16);
+        UPDATE ConnectionHistory
+        SET HistoryType = 'R'
+        WHERE ConnectionHistory.ConnectionID = new.ID
+          and ConnectionHistory.HistoryType = 'D';
+        insert into ConnectionHistory (HistoryType, ConnectionID, DATA, SecurityGroup, CustomerID, ConnectionType, ConnectionSubType, GroupName, Name, UnsafePassword, DataSourceID, MetaData, CreationDate, Description, ModifiedDate, ModifiedUsername, ModifiedLoggedUserName, ParentID)
+        select 'I', new.ID, new.DATA, new.SecurityGroup, new.CustomerID, new.ConnectionType, new.ConnectionSubType, new.GroupName, new.Name, new.UnsafePassword, new.DataSourceID, new.MetaData, new.CreationDate, new.Description, ifnull(new.ModifiedDate, datetime('now')), new.ModifiedUsername, new.ModifiedLoggedUserName, new.ParentID;
+    END;
+    INSERT INTO Connections(ID, DATA, Name)
+    VALUES(X'33221100554477668899AABBCCDDEEFF', 'current', 'restored');
+    SELECT HistoryType, hex(ConnectionID), DATA, Name
+      FROM ConnectionHistory
+     ORDER BY rowid;
+    SELECT name, tbl_name
+      FROM sqlite_schema
+     WHERE name = 'Connections_Trigger_Insert';
+}
+expect {
+    R|33221100554477668899AABBCCDDEEFF||deleted
+    I|33221100554477668899AABBCCDDEEFF|current|restored
+    Connections_Trigger_Insert|Connections
+}
+
+@cross-check-integrity
+test sqlite-schema-preserves-table-trigger-and-autoindex-casing {
+    CREATE TABLE Connections(ID guid PRIMARY KEY, DATA TEXT, Name TEXT);
+    CREATE TABLE ConnectionHistory(ID guid, DATA TEXT, Name TEXT);
+    CREATE TRIGGER ConnectionsInsert AFTER INSERT ON Connections BEGIN
+      UPDATE ConnectionHistory SET Name='R' WHERE ConnectionHistory.ID=NEW.ID;
+      INSERT INTO ConnectionHistory(ID,DATA,Name) VALUES(NEW.ID,NEW.DATA,NEW.Name);
+    END;
+    SELECT type, name, tbl_name
+      FROM sqlite_schema
+     WHERE name IN (
+       'ConnectionHistory',
+       'Connections',
+       'ConnectionsInsert',
+       'sqlite_autoindex_Connections_1'
+     )
+     ORDER BY type DESC, name;
+}
+expect {
+    trigger|ConnectionsInsert|Connections
+    table|ConnectionHistory|ConnectionHistory
+    table|Connections|Connections
+    index|sqlite_autoindex_Connections_1|Connections
+}
+
+@cross-check-integrity
+test mixed-case-catalog-objects-can-be-dropped-case-insensitively {
+    CREATE TABLE Connections(ID guid PRIMARY KEY);
+    CREATE TRIGGER ConnectionsInsert AFTER INSERT ON Connections BEGIN
+      SELECT NEW.ID;
+    END;
+    DROP TRIGGER connectionsinsert;
+    DROP TABLE connections;
+    SELECT count(*)
+      FROM sqlite_schema
+     WHERE name IN (
+       'Connections',
+       'ConnectionsInsert',
+       'sqlite_autoindex_Connections_1'
+     );
+}
+expect {
+    0
+}

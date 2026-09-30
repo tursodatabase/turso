@@ -1,4 +1,5 @@
 use crate::schema::RESERVED_TABLE_PREFIXES;
+use crate::translate::collate::CollationSeq;
 use crate::translate::emitter::Resolver;
 use crate::translate::schema::{emit_schema_entry, SchemaEntryType, SQLITE_TABLEID};
 use crate::translate::ProgramBuilder;
@@ -218,8 +219,8 @@ pub fn translate_create_trigger(
         sqlite_schema_cursor_id,
         None, // cdc_table_cursor_id, no cdc for triggers
         SchemaEntryType::Trigger,
-        &normalized_trigger_name,
-        &normalized_table_name,
+        trigger_name.name.as_str(),
+        tbl_name.name.as_str(),
         0, // triggers don't have a root page
         Some(sql),
     )?;
@@ -234,7 +235,7 @@ pub fn translate_create_trigger(
     });
 
     // Parse schema to load the new trigger
-    let escaped_trigger_name = escape_sql_string_literal(&normalized_trigger_name);
+    let escaped_trigger_name = escape_sql_string_literal(trigger_name.name.as_str());
     program.emit_insn(Insn::ParseSchema {
         db: database_id,
         where_clause: Some(format!(
@@ -577,7 +578,7 @@ pub fn translate_drop_trigger(
         rhs: trigger_name_str_reg,
         target_pc: skip_non_trigger_label,
         flags: crate::vdbe::insn::CmpInsFlags::default(),
-        collation: program.curr_collation(),
+        collation: Some(CollationSeq::NoCase),
     });
 
     // Found it! Delete the row
