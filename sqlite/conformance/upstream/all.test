@@ -367,7 +367,7 @@ set test_files {
   lock                 fail
   lock2                fail
   lock3                fail
-  lock4                fail
+  lock4                hang {polls for a test2.db-journal file, which WAL mode never creates}
   lock5                fail
   lock6                fail
   lock7                fail
