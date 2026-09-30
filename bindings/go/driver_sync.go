@@ -379,8 +379,15 @@ func (d *TursoSyncDb) Checkpoint(ctx context.Context) error {
 }
 
 // driveOpUntilDone resumes an async operation until completion, serving IO requests as needed.
-// It returns the final result kind and the operation handle that must be deinitialized by the caller.
-func (d *TursoSyncDb) driveOpUntilDone(ctx context.Context, op TursoSyncOperation) (TursoSyncOperationResultType, TursoSyncOperation, error) {
+// On success it returns the final result kind and the operation handle that must be deinitialized by the caller.
+// On error it deinitializes the operation itself: an unfinished operation can hold engine locks
+// (wait_changes holds the sync engine for its whole HTTP round-trip), which would block every later operation.
+func (d *TursoSyncDb) driveOpUntilDone(ctx context.Context, op TursoSyncOperation) (_ TursoSyncOperationResultType, _ TursoSyncOperation, err error) {
+	defer func() {
+		if err != nil {
+			turso_sync_operation_deinit(op)
+		}
+	}()
 	for {
 		if ctx != nil && ctx.Err() != nil {
 			return TURSO_ASYNC_RESULT_NONE, op, ctx.Err()
