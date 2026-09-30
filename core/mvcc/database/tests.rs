@@ -22818,7 +22818,7 @@ fn connect_async_yields_instead_of_spinning_on_preparing_commit_dependency() {
     // Park a second ANALYZE inside its commit: its new sqlite_stat1 versions
     // stay in `Preparing` until the statement is stepped again.
     writer.set_yield_injector(Some(FixedYieldInjector::new([
-        CommitYieldPoint::LogicalLogOwned.point(),
+        CommitYieldPoint::LogRecordMarkedWritten.point(),
     ])));
     let mut parked = writer.prepare("ANALYZE t2").unwrap();
     assert!(
@@ -22895,7 +22895,7 @@ fn dropping_connect_async_state_mid_wait_does_not_block() {
     writer.execute("ANALYZE").unwrap();
 
     writer.set_yield_injector(Some(FixedYieldInjector::new([
-        CommitYieldPoint::LogicalLogOwned.point(),
+        CommitYieldPoint::LogRecordMarkedWritten.point(),
     ])));
     let mut parked = writer.prepare("ANALYZE t1").unwrap();
     assert!(matches!(
