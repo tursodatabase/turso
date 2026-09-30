@@ -5124,33 +5124,6 @@ mod tests {
         assert!(checkpoint.collect_index_key_cursor.is_none());
     }
 
-    /// Drives `collect` until it stops yielding and the current write batch is
-    /// empty. After every yield, `append` commits rows that sit above the walk,
-    /// like a writer that keeps inserting while the checkpoint runs. A filled
-    /// write set is a stream pause, not a yield, so `drain_batch` clears it and
-    /// collect continues.
-    fn collect_while_rows_are_appended(
-        mut collect: impl FnMut() -> Result<Option<IOCompletions>>,
-        mut drain_batch: impl FnMut() -> bool,
-        mut append: impl FnMut(),
-    ) {
-        let mut yields = 0;
-        loop {
-            match collect().unwrap() {
-                Some(_) => {
-                    yields += 1;
-                    assert!(
-                        yields <= 4,
-                        "collect kept scanning rows committed after its snapshot"
-                    );
-                    append();
-                }
-                None if drain_batch() => {}
-                None => return,
-            }
-        }
-    }
-
     fn append_table_rows(
         mvstore: &crate::sync::Arc<
             MvStore<crate::mvcc::clock::MvccClock, crate::alloc::DynAllocator>,
@@ -5198,18 +5171,21 @@ mod tests {
             insert_row_version(&mvstore, committed_table_row_version(other, 1));
 
             let mut next_rowid = row_count as i64;
-            collect_while_rows_are_appended(
-                || checkpoint.collect_table_rows(),
-                || {
-                    if checkpoint.write_set.is_empty() {
-                        false
-                    } else {
-                        checkpoint.write_set.clear();
-                        true
+            let mut yields = 0;
+            loop {
+                match checkpoint.collect_table_rows().unwrap() {
+                    Some(_) => {
+                        yields += 1;
+                        assert!(
+                            yields <= 4,
+                            "collect kept scanning rows committed after its snapshot"
+                        );
+                        append_table_rows(&mvstore, walked, &mut next_rowid);
                     }
-                },
-                || append_table_rows(&mvstore, walked, &mut next_rowid),
-            );
+                    None if !checkpoint.write_set.is_empty() => checkpoint.write_set.clear(),
+                    None => break,
+                }
+            }
 
             assert_eq!(
                 checkpoint.table_gc_keys.len(),
@@ -5237,18 +5213,23 @@ mod tests {
             insert_dirty_index_version(&mvstore, other, key, version);
 
             let mut next_rowid = row_count as i64;
-            collect_while_rows_are_appended(
-                || checkpoint.collect_index_rows(),
-                || {
-                    if checkpoint.index_write_set.is_empty() {
-                        false
-                    } else {
-                        checkpoint.index_write_set.clear();
-                        true
+            let mut yields = 0;
+            loop {
+                match checkpoint.collect_index_rows().unwrap() {
+                    Some(_) => {
+                        yields += 1;
+                        assert!(
+                            yields <= 4,
+                            "collect kept scanning rows committed after its snapshot"
+                        );
+                        append_index_rows(&mvstore, walked, &mut next_rowid);
                     }
-                },
-                || append_index_rows(&mvstore, walked, &mut next_rowid),
-            );
+                    None if !checkpoint.index_write_set.is_empty() => {
+                        checkpoint.index_write_set.clear()
+                    }
+                    None => break,
+                }
+            }
 
             assert_eq!(
                 checkpoint.index_gc_keys.len(),
