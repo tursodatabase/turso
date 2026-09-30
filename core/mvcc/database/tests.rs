@@ -3110,7 +3110,10 @@ fn test_passive_truncate_keeps_log_frames_committed_after_snapshot() {
         },
     );
 
-    while checkpoint_sm.state_for_test() != CheckpointState::BeginPagerTxn {
+    while !matches!(
+        checkpoint_sm.state_for_test(),
+        CheckpointState::WriteRow { .. }
+    ) {
         match checkpoint_sm.step(&()).unwrap() {
             TransitionResult::Io(io) => io.wait(pager.io.as_ref()).unwrap(),
             TransitionResult::Continue => {}
