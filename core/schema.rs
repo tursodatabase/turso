@@ -1943,7 +1943,7 @@ impl Schema {
             let referenced_tables = incremental_view.get_referenced_table_names();
 
             // Create a BTreeTable for the materialized view
-            let cols = incremental_view.column_schema.flat_columns();
+            let cols = incremental_view.column_schema.flat_columns()?;
             let logical_to_physical_map =
                 BTreeTable::build_logical_to_physical_map(&cols, &[], true);
             let table = Arc::new(Table::BTree(Arc::new(BTreeTable {
@@ -2285,7 +2285,7 @@ impl Schema {
 
                             // If column names were provided in CREATE VIEW (col1, col2, ...),
                             // use them to rename the columns
-                            let mut final_columns = view_column_schema.flat_columns();
+                            let mut final_columns = view_column_schema.flat_columns()?;
                             for (i, indexed_col) in column_names.iter().enumerate() {
                                 if let Some(col) = final_columns.get_mut(i) {
                                     // as_str: Display would render the quoted form,

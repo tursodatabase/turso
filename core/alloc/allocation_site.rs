@@ -69,6 +69,7 @@ pub enum MvStoreAllocationSite {
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum SchemaAllocationSite {
     MakeMut,
+    FlatViewColumns,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]

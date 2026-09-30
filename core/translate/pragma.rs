@@ -26,7 +26,8 @@ use crate::util::{normalize_ident, parse_signed_number, parse_string, IOExt as _
 use crate::vdbe::builder::{ProgramBuilder, ProgramBuilderOpts};
 use crate::vdbe::insn::{Cookie, Insn};
 use crate::{
-    bail_parse_error, CaptureDataChangesInfo, LimboError, Numeric, Value, CDC_VERSION_CURRENT,
+    bail_parse_error, CaptureDataChangesInfo, LimboError, Numeric, Result, Value,
+    CDC_VERSION_CURRENT,
 };
 use std::str::FromStr;
 use strum::IntoEnumIterator;
@@ -1330,7 +1331,7 @@ fn query_pragma(
                     &name,
                 )?;
                 let lookup_name = normalize_table_pragma_lookup_name(table_database_id, &name);
-                resolver.with_schema(table_database_id, |db_schema| {
+                resolver.with_schema(table_database_id, |db_schema| -> Result<()> {
                     if let Some(table) = db_schema.get_table(&lookup_name) {
                         let primary_key_columns = match table.as_ref() {
                             Table::BTree(bt) => Some(bt.primary_key_columns.as_slice()),
@@ -1345,7 +1346,7 @@ fn query_pragma(
                         );
                     } else if let Some(view_mutex) = db_schema.get_materialized_view(&lookup_name) {
                         let view = view_mutex.lock();
-                        let flat_columns = view.column_schema.flat_columns();
+                        let flat_columns = view.column_schema.flat_columns()?;
                         emit_columns_for_table_info(
                             program,
                             &flat_columns,
@@ -1365,7 +1366,8 @@ fn query_pragma(
                             false,
                         );
                     }
-                });
+                    Ok(())
+                })?;
             }
             let col_names = ["cid", "name", "type", "notnull", "dflt_value", "pk"];
             for name in col_names {
@@ -1390,7 +1392,7 @@ fn query_pragma(
                     &name,
                 )?;
                 let lookup_name = normalize_table_pragma_lookup_name(table_database_id, &name);
-                resolver.with_schema(table_database_id, |db_schema| {
+                resolver.with_schema(table_database_id, |db_schema| -> Result<()> {
                     if let Some(table) = db_schema.get_table(&lookup_name) {
                         let primary_key_columns = match table.as_ref() {
                             Table::BTree(bt) => Some(bt.primary_key_columns.as_slice()),
@@ -1405,7 +1407,7 @@ fn query_pragma(
                         );
                     } else if let Some(view_mutex) = db_schema.get_materialized_view(&lookup_name) {
                         let view = view_mutex.lock();
-                        let flat_columns = view.column_schema.flat_columns();
+                        let flat_columns = view.column_schema.flat_columns()?;
                         emit_columns_for_table_info(
                             program,
                             &flat_columns,
@@ -1425,7 +1427,8 @@ fn query_pragma(
                             true,
                         );
                     }
-                });
+                    Ok(())
+                })?;
             }
             let col_names = [
                 "cid",
