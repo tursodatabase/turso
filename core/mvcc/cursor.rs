@@ -666,11 +666,12 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> MvccLazyCursor<Clock
                 },
                 true,
                 false,
+                false,
                 IterationDirection::Backwards,
-                self.tx_id,
+                self.snapshot,
                 &mut self.table_iterator,
             )
-            .map(|(rowid, _)| match rowid.row_id {
+            .map(|(rowid, _, _)| match rowid.row_id {
                 RowKey::Int(rowid) => rowid,
                 RowKey::Record(_) => unreachable!("table rowids are integers"),
             });

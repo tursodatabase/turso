@@ -22842,7 +22842,6 @@ fn dropping_passive_checkpoint_after_pager_commit_does_not_release_write_lock_tw
 #[path = "group_commit_tests.rs"]
 mod group_commit_tests;
 
-<<<<<<< HEAD
 #[path = "group_commit_sync_mode_tests.rs"]
 mod group_commit_sync_mode_tests;
 
