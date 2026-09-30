@@ -18,6 +18,7 @@ pub struct DatabaseReplayGenerator {
     pub opts: DatabaseReplaySessionOpts,
 }
 
+/// SQL and ancillary info required to replay a change type (insert, update, delete) on a given table.
 #[derive(Debug)]
 pub struct ReplayInfo {
     pub change_type: DatabaseChangeType,
@@ -374,7 +375,7 @@ impl DatabaseReplayGenerator {
                     Ok(delete)
                 }
                 DatabaseTapeRowChangeType::Insert { after } => {
-                    assert!(after.len() == 5);
+                    assert_eq!(after.len(), 5);
                     let Some(turso_core::Value::Text(sql)) = after.last() else {
                         return Err(Error::DatabaseTapeError(format!(
                             "unexpected 'sql' column of sqlite_schema table: {:?}",
@@ -397,8 +398,7 @@ impl DatabaseReplayGenerator {
                             "'updates' column of CDC table must be populated".to_string(),
                         ));
                     };
-                    assert!(updates.len() % 2 == 0);
-                    assert!(updates.len() / 2 == 5);
+                    assert_eq!(updates.len(), 10);
                     let turso_core::Value::Text(ddl_stmt) = updates.last().unwrap() else {
                         panic!(
                             "unexpected 'sql' column of sqlite_schema table update record: {:?}",
