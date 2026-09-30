@@ -26,8 +26,6 @@ use crate::generator::SqlGeneratorKind;
 use crate::profile::StatementProfile;
 use crate::schema::DataType;
 
-const LARGEST_CODEPOINT_BELOW_SURROGATES: i64 = 0xD7FF;
-
 /// Categories of SQL functions.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, strum::EnumIter)]
 pub enum FunctionCategory {
@@ -128,6 +126,7 @@ pub struct FunctionDef {
     pub is_deterministic: bool,
     /// Maximum value for integer arguments (for functions like ZEROBLOB that allocate memory).
     pub int_arg_max: Option<i64>,
+    pub int_args_are_non_surrogate_codepoints: bool,
 }
 
 impl FunctionDef {
@@ -144,6 +143,7 @@ impl FunctionDef {
             is_window: false,
             is_deterministic: true,
             int_arg_max: None,
+            int_args_are_non_surrogate_codepoints: false,
         }
     }
 
@@ -211,6 +211,11 @@ impl FunctionDef {
     /// Set maximum value for integer arguments (for functions that allocate memory).
     pub fn int_arg_max(mut self, max: i64) -> Self {
         self.int_arg_max = Some(max);
+        self
+    }
+
+    pub fn int_args_are_non_surrogate_codepoints(mut self) -> Self {
+        self.int_args_are_non_surrogate_codepoints = true;
         self
     }
 
@@ -568,7 +573,7 @@ pub fn string_functions() -> Vec<FunctionDef> {
             .arity(1, 10)
             .returns(DataType::Text)
             .category(FunctionCategory::String)
-            .int_arg_max(LARGEST_CODEPOINT_BELOW_SURROGATES),
+            .int_args_are_non_surrogate_codepoints(),
         FunctionDef::new("QUOTE")
             .args(&[None])
             .returns(DataType::Text)

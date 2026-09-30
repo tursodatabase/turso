@@ -55,6 +55,7 @@ pub struct FunctionDef {
     pub is_deterministic: bool,
     /// Maximum value for integer arguments (for functions like ZEROBLOB that allocate memory).
     pub int_arg_max: Option<i64>,
+    pub int_args_are_non_surrogate_codepoints: bool,
 }
 
 impl FunctionDef {
@@ -71,6 +72,7 @@ impl FunctionDef {
             is_window: false,
             is_deterministic: true,
             int_arg_max: None,
+            int_args_are_non_surrogate_codepoints: false,
         }
     }
 
@@ -119,6 +121,11 @@ impl FunctionDef {
         self
     }
 
+    pub const fn int_args_are_non_surrogate_codepoints(mut self) -> Self {
+        self.int_args_are_non_surrogate_codepoints = true;
+        self
+    }
+
     /// Get the number of arguments to generate for this function.
     pub fn arg_count(&self, ctx: &mut Context) -> usize {
         if self.min_args == self.max_args {
@@ -157,7 +164,6 @@ const ANY: Option<DataType> = None;
 const TEXT: Option<DataType> = Some(DataType::Text);
 const INT: Option<DataType> = Some(DataType::Integer);
 const REAL: Option<DataType> = Some(DataType::Real);
-const LARGEST_CODEPOINT_BELOW_SURROGATES: i64 = 0xD7FF;
 
 /// All built-in scalar functions.
 pub static SCALAR_FUNCTIONS: &[FunctionDef] = &[
@@ -241,7 +247,7 @@ pub static SCALAR_FUNCTIONS: &[FunctionDef] = &[
         .arity(1, 5)
         .returns(DataType::Text)
         .category(FunctionCategory::String)
-        .int_arg_max(LARGEST_CODEPOINT_BELOW_SURROGATES),
+        .int_args_are_non_surrogate_codepoints(),
     FunctionDef::new("QUOTE")
         .args(&[ANY])
         .returns(DataType::Text)

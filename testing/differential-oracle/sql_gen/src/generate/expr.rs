@@ -12,6 +12,10 @@ use crate::schema::DataType;
 use crate::trace::{ExprKind, Origin};
 use sql_gen_macros::trace_gen;
 
+const FIRST_SURROGATE: i64 = 0xD800;
+const LAST_SURROGATE: i64 = 0xDFFF;
+const LARGEST_CODEPOINT: i64 = 0x10FFFF;
+
 /// Generate an expression.
 pub fn generate_expr<C: Capabilities>(
     generator: &SqlGen<C>,
@@ -459,6 +463,13 @@ fn generate_function_arg<C: Capabilities>(
     func: &FunctionDef,
     arg_index: usize,
 ) -> Result<Expr, GenError> {
+    if func.int_args_are_non_surrogate_codepoints
+        && func.arg_type_at(arg_index) == Some(DataType::Integer)
+    {
+        let codepoint = generate_non_surrogate_codepoint(ctx);
+        return Ok(Expr::literal(ctx, Literal::Integer(codepoint)));
+    }
+
     // Check if this function has integer argument constraints (e.g., zeroblob)
     if let Some(max_val) = func.int_arg_max {
         if let Some(expected_type) = func.arg_type_at(arg_index) {
@@ -506,6 +517,16 @@ fn generate_function_arg<C: Capabilities>(
 
     // Otherwise, generate a general expression
     generate_expr(generator, ctx, depth + 1)
+}
+
+fn generate_non_surrogate_codepoint(ctx: &mut Context) -> i64 {
+    let surrogate_count = LAST_SURROGATE - FIRST_SURROGATE + 1;
+    let codepoint = ctx.gen_i64_range(0, LARGEST_CODEPOINT - surrogate_count);
+    if codepoint < FIRST_SURROGATE {
+        codepoint
+    } else {
+        codepoint + surrogate_count
+    }
 }
 
 /// Generate an IS NULL / IS NOT NULL expression.
@@ -834,7 +855,7 @@ mod tests {
     }
 
     #[test]
-    fn char_arguments_are_never_surrogate_codepoints() {
+    fn char_arguments_are_any_codepoint_except_surrogates() {
         let generator = test_generator();
         let table = generator.schema().tables[0].clone();
         let char_func = crate::functions::SCALAR_FUNCTIONS
@@ -842,6 +863,8 @@ mod tests {
             .find(|f| f.name == "CHAR")
             .unwrap();
         let mut ctx = Context::new_with_seed(42);
+        let mut smallest_codepoint = i64::MAX;
+        let mut largest_codepoint = i64::MIN;
 
         for _ in 0..10_000 {
             let arg = ctx
@@ -851,11 +874,20 @@ mod tests {
                 .unwrap();
             match arg {
                 Expr::Literal(Literal::Integer(codepoint)) => {
-                    assert!((0..0xD800).contains(&codepoint), "{codepoint}")
+                    assert!((0..=LARGEST_CODEPOINT).contains(&codepoint), "{codepoint}");
+                    assert!(
+                        !(FIRST_SURROGATE..=LAST_SURROGATE).contains(&codepoint),
+                        "{codepoint}"
+                    );
+                    smallest_codepoint = smallest_codepoint.min(codepoint);
+                    largest_codepoint = largest_codepoint.max(codepoint);
                 }
                 other => panic!("expected an integer literal, got {other}"),
             }
         }
+
+        assert!(smallest_codepoint < FIRST_SURROGATE, "{smallest_codepoint}");
+        assert!(largest_codepoint > 0xFFFF, "{largest_codepoint}");
     }
 
     #[test]
