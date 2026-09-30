@@ -735,6 +735,7 @@ pub struct Schema {
 
     /// table_name to list of indexes for the table
     pub indexes: HashMap<String, VecDeque<Arc<Index>>>,
+    pub table_display_names: HashMap<String, String>,
     pub has_indexes: HashSet<String>,
     pub schema_version: u32,
     /// Statistics collected via ANALYZE for regular B-tree tables and indexes.
@@ -867,6 +868,7 @@ impl Schema {
         let mut table_names_by_root_page = HashMap::default();
         let has_indexes = HashSet::default();
         let indexes: HashMap<String, VecDeque<Arc<Index>>> = HashMap::default();
+        let table_display_names = HashMap::default();
         #[allow(clippy::arc_with_non_send_sync)]
         tables.insert(
             SCHEMA_TABLE_NAME.to_string(),
@@ -895,6 +897,7 @@ impl Schema {
             views,
             triggers,
             indexes,
+            table_display_names,
             has_indexes,
             schema_version: 0,
             analyze_stats: AnalyzeStats::default(),
@@ -2081,6 +2084,8 @@ impl Schema {
     ) -> Result<()> {
         match ty {
             "table" => {
+                self.table_display_names
+                    .insert(normalize_ident(table_name), table_name.to_string());
                 let sql = maybe_sql.expect("sql should be present for table");
                 // In the SQLite file format a `type='table'` row describes a
                 // virtual table iff its rootpage is 0: virtual tables have no
@@ -2827,6 +2832,7 @@ impl TryClone for Schema {
             views,
             triggers,
             indexes,
+            table_display_names: self.table_display_names.try_clone()?,
             has_indexes: self.has_indexes.try_clone()?,
             schema_version: self.schema_version,
             analyze_stats: self.analyze_stats.clone(),

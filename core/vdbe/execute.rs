@@ -11598,19 +11598,22 @@ pub fn op_function(
                         }
                     };
                     let rename_to = normalize_ident(original_rename_to.as_str());
+                    let rename_to_display = original_rename_to.to_string();
 
-                    let new_name = if let Some(column) =
-                        &name.strip_prefix(&format!("sqlite_autoindex_{rename_from}_"))
+                    let autoindex_prefix = format!("sqlite_autoindex_{rename_from}_");
+                    let new_name = if name.len() >= autoindex_prefix.len()
+                        && name[..autoindex_prefix.len()].eq_ignore_ascii_case(&autoindex_prefix)
                     {
-                        format!("sqlite_autoindex_{rename_to}_{column}")
-                    } else if name == rename_from {
-                        rename_to.clone()
+                        let column = &name[autoindex_prefix.len()..];
+                        format!("sqlite_autoindex_{rename_to_display}_{column}")
+                    } else if name.eq_ignore_ascii_case(&rename_from) {
+                        rename_to_display.clone()
                     } else {
                         name
                     };
 
-                    let new_tbl_name = if tbl_name == rename_from {
-                        rename_to.clone()
+                    let new_tbl_name = if tbl_name.eq_ignore_ascii_case(&rename_from) {
+                        rename_to_display.clone()
                     } else {
                         tbl_name
                     };
