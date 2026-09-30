@@ -358,6 +358,7 @@ pub enum SyncRowStep {
 #[derive(Default)]
 pub(crate) struct StatementActivity {
     explicit_checkpoint_active: bool,
+    pub(crate) mvcc_readers: HashMap<crate::mvcc::database::TxID, i32>,
 }
 
 pub(crate) struct ExplicitCheckpointGuard {

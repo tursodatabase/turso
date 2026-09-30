@@ -525,32 +525,68 @@ fn paused_read_across_commit_in_wal_must_not_panic() {
     run_paused_read_across_commit(false);
 }
 
+#[test]
+fn paused_read_reopen_preserves_autocommit_sequence_value() {
+    use std::sync::Mutex;
+    use turso_whopper::properties::SequenceCorrectnessProperty;
+    use turso_whopper::{Operation, TxMode, Whopper, WhopperOpts};
+
+    let script = ScriptedWorkload {
+        ops: vec![
+            Operation::Execute {
+                sql: "CREATE TABLE kv (key TEXT PRIMARY KEY, value BLOB)".to_string(),
+            },
+            Operation::Execute {
+                sql: "INSERT INTO kv VALUES ('k1', zeroblob(8)), ('k2', zeroblob(8))".to_string(),
+            },
+            Operation::CreateSequence {
+                seq_name: "s".to_string(),
+                start: -1,
+                increment: -1,
+                min_value: -10,
+                max_value: -1,
+                cycle: false,
+            },
+            Operation::Begin {
+                mode: TxMode::Concurrent,
+            },
+            Operation::PausedRead {
+                sql: "SELECT key FROM kv ORDER BY key".to_string(),
+            },
+            Operation::Commit,
+            Operation::NextVal {
+                seq_name: "s".to_string(),
+            },
+            Operation::Begin {
+                mode: TxMode::Concurrent,
+            },
+            Operation::Rollback,
+            Operation::IntegrityCheck,
+        ],
+        next: Mutex::new(0),
+    };
+    let mut whopper = Whopper::new(WhopperOpts {
+        seed: Some(9),
+        max_connections: 1,
+        max_steps: 5_000,
+        enable_mvcc: true,
+        workloads: vec![(1, Box::new(script))],
+        properties: vec![Box::new(SequenceCorrectnessProperty::new())],
+        ..Default::default()
+    })
+    .unwrap();
+    while whopper.stats.integrity_checks == 0 && !whopper.is_done() {
+        whopper.step().unwrap();
+    }
+    assert_eq!(whopper.stats.sequence_nextvals, 1);
+    assert_eq!(whopper.stats.integrity_checks, 1);
+    whopper.reopen().unwrap();
+}
+
 fn run_paused_read_across_commit(enable_mvcc: bool) {
     use std::sync::Mutex;
     use turso_whopper::properties::IntegrityCheckProperty;
-    use turso_whopper::workloads::{Workload, WorkloadContext};
     use turso_whopper::{Operation, TxMode, Whopper, WhopperOpts};
-
-    /// Emits a fixed sequence of operations, one per completed operation.
-    struct ScriptedWorkload {
-        ops: Vec<Operation>,
-        next: Mutex<usize>,
-    }
-
-    impl Workload for ScriptedWorkload {
-        fn generate(
-            &self,
-            _ctx: &WorkloadContext,
-            _rng: &mut rand_chacha::ChaCha8Rng,
-        ) -> Option<Operation> {
-            let mut next = self.next.lock().unwrap();
-            let op = self.ops.get(*next).cloned();
-            if op.is_some() {
-                *next += 1;
-            }
-            op
-        }
-    }
 
     let script = ScriptedWorkload {
         ops: vec![
@@ -594,4 +630,24 @@ fn run_paused_read_across_commit(enable_mvcc: bool) {
     let mut whopper = Whopper::new(opts).expect("create whopper");
     whopper.run().expect("run must complete without panicking");
     assert_eq!(whopper.stats.integrity_checks, 1);
+}
+
+struct ScriptedWorkload {
+    ops: Vec<turso_whopper::Operation>,
+    next: std::sync::Mutex<usize>,
+}
+
+impl turso_whopper::workloads::Workload for ScriptedWorkload {
+    fn generate(
+        &self,
+        _ctx: &turso_whopper::workloads::WorkloadContext,
+        _rng: &mut rand_chacha::ChaCha8Rng,
+    ) -> Option<turso_whopper::Operation> {
+        let mut next = self.next.lock().unwrap();
+        let op = self.ops.get(*next).cloned();
+        if op.is_some() {
+            *next += 1;
+        }
+        op
+    }
 }

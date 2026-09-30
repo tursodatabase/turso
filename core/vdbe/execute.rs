@@ -5103,6 +5103,25 @@ pub fn op_transaction_inner(
                 *state.active_op_state.transaction() = OpTransactionState::BeginStatement;
             }
             OpTransactionState::BeginStatement => {
+                if state.is_root_statement
+                    && is_main_db
+                    && !statement_writes_db
+                    && mv_store.is_some()
+                    && state.mvcc_read_tx_id.is_none()
+                {
+                    let tx_id = program
+                        .connection
+                        .get_mv_tx_id()
+                        .expect("MVCC read statement must have a transaction");
+                    *program
+                        .connection
+                        .statement_activity
+                        .lock()
+                        .mvcc_readers
+                        .entry(tx_id)
+                        .or_default() += 1;
+                    state.mvcc_read_tx_id = Some(tx_id);
+                }
                 let needs_stmt_journal = program.needs_stmt_subtransactions.load(Ordering::Relaxed);
                 let auto_commit = program.connection.auto_commit.load(Ordering::SeqCst);
                 let in_explicit_txn = !auto_commit;

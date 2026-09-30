@@ -1481,7 +1481,7 @@ impl Whopper {
             .context
             .fibers
             .iter()
-            .any(|f| f.statement.borrow().is_some())
+            .any(|f| f.statement.borrow().is_some() || f.paused_statement.borrow().is_some())
         {
             if drain_iterations >= self.max_drain_steps {
                 let stuck: Vec<usize> = self
@@ -1489,7 +1489,10 @@ impl Whopper {
                     .fibers
                     .iter()
                     .enumerate()
-                    .filter_map(|(i, f)| f.statement.borrow().is_some().then_some(i))
+                    .filter_map(|(i, f)| {
+                        (f.statement.borrow().is_some() || f.paused_statement.borrow().is_some())
+                            .then_some(i)
+                    })
                     .collect();
                 anyhow::bail!(
                     "{reason} drain exceeded max_drain_steps ({}) with statements still live on \
@@ -1499,8 +1502,12 @@ impl Whopper {
                 );
             }
             for fiber_idx in 0..self.context.fibers.len() {
-                if self.context.fibers[fiber_idx].statement.borrow().is_none() {
-                    continue;
+                let fiber = &self.context.fibers[fiber_idx];
+                if fiber.statement.borrow().is_none() {
+                    let Some(stmt) = fiber.paused_statement.borrow_mut().take() else {
+                        continue;
+                    };
+                    fiber.statement.replace(Some(stmt));
                 }
                 let Some(op_result) = self.step_drained_statement(fiber_idx) else {
                     continue;
