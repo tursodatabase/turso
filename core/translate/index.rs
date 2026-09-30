@@ -272,8 +272,13 @@ pub fn translate_create_index(
         sqlite_schema_cursor_id,
         cdc_table.map(|x| x.0),
         SchemaEntryType::Index,
-        &idx_name,
-        &tbl_name,
+        &original_idx_name.name.to_string(),
+        &resolver
+            .schema()
+            .table_display_names
+            .get(&tbl_name)
+            .cloned()
+            .unwrap_or_else(|| tbl.name.clone()),
         root_page_reg,
         Some(sql),
     )?;

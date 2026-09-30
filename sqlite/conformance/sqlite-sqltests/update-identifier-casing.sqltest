@@ -197,3 +197,30 @@ test mixed-case-catalog-objects-can-be-dropped-case-insensitively {
 expect {
     0
 }
+
+@cross-check-integrity
+test sqlite-schema-preserves-user-index-casing {
+    CREATE TABLE Connections(ID INTEGER, Name TEXT);
+    CREATE INDEX ConnectionNameIndex ON Connections(Name);
+    SELECT type, name, tbl_name
+      FROM sqlite_schema
+     WHERE name = 'ConnectionNameIndex';
+}
+expect {
+    index|ConnectionNameIndex|Connections
+}
+
+@cross-check-integrity
+test sqlite-schema-renames-mixed-case-table-and-index {
+    CREATE TABLE Connections(ID INTEGER PRIMARY KEY, Name TEXT);
+    CREATE INDEX ConnectionNameIndex ON Connections(Name);
+    ALTER TABLE connections RENAME TO RenamedConnections;
+    SELECT type, name, tbl_name
+      FROM sqlite_schema
+     WHERE name IN ('RenamedConnections', 'ConnectionNameIndex')
+     ORDER BY type DESC, name;
+}
+expect {
+    table|RenamedConnections|RenamedConnections
+    index|ConnectionNameIndex|RenamedConnections
+}
