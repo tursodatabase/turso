@@ -4869,6 +4869,7 @@ impl Connection {
     /// Request interruption of currently running root statements on this connection.
     /// If no root statement is active, the request is ignored to match SQLite semantics.
     pub fn interrupt(&self) {
+        let _activity = self.statement_activity.lock();
         if self.n_active_root_statements.load(Ordering::SeqCst) > 0 {
             self.interrupt_requested.store(true, Ordering::SeqCst);
         }
@@ -4877,13 +4878,6 @@ impl Connection {
     /// Returns true if an interrupt is currently pending for this connection.
     pub fn is_interrupted(&self) -> bool {
         self.interrupt_requested.load(Ordering::SeqCst)
-    }
-
-    /// Clear the connection interrupt once no root statements remain active.
-    pub(crate) fn clear_interrupt_if_idle(&self) {
-        if self.n_active_root_statements.load(Ordering::SeqCst) == 0 {
-            self.interrupt_requested.store(false, Ordering::SeqCst);
-        }
     }
 
     pub(crate) fn start_root_statement(&self) -> Result<()> {

@@ -4194,7 +4194,7 @@ mod tests {
             assert!(matches!(stmt.step(), Err(LimboError::IntegerOverflow)));
             assert_eq!(stmt.execution_state(), ProgramExecutionState::Failed);
 
-            conn.set_progress_handler(1, Some(Box::new(|| true)));
+            conn.set_progress_handler(1, Some(std::sync::Arc::new(|| true)));
             let mut stmt = conn.prepare("WITH RECURSIVE t(x) AS (VALUES(1) UNION ALL SELECT x+1 FROM t WHERE x<1000) SELECT sum(x) FROM t").unwrap();
             assert!(matches!(stmt.step().unwrap(), StepResult::Interrupt));
             assert_eq!(stmt.execution_state(), ProgramExecutionState::Interrupted);

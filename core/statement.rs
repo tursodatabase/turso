@@ -537,6 +537,7 @@ impl Statement {
 
     fn release_active_root_if_counted(&mut self) {
         if self.counted_as_active_root {
+            let _activity = self.program.connection.statement_activity.lock();
             // Blob count drops before the root count so a concurrent
             // checkpoint-guard read never sees fewer non-blob statements
             // than are really active (a stale-high read only causes a
@@ -553,7 +554,10 @@ impl Statement {
                 .n_active_root_statements
                 .fetch_sub(1, Ordering::SeqCst);
             if previous == 1 {
-                self.program.connection.clear_interrupt_if_idle();
+                self.program
+                    .connection
+                    .interrupt_requested
+                    .store(false, Ordering::SeqCst);
             }
             self.counted_as_active_root = false;
         }
