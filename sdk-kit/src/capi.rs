@@ -524,6 +524,17 @@ pub extern "C" fn turso_statement_execute(
 
 #[no_mangle]
 #[signature(c)]
+pub extern "C" fn turso_statement_set_query_timeout_ms(
+    statement: *const c::turso_statement_t,
+    timeout_ms: u64,
+) {
+    if let Ok(statement) = unsafe { TursoStatement::ref_from_capi(statement) } {
+        statement.set_query_timeout((timeout_ms != 0).then(|| Duration::from_millis(timeout_ms)));
+    }
+}
+
+#[no_mangle]
+#[signature(c)]
 pub extern "C" fn turso_statement_step(
     statement: *const c::turso_statement_t,
     error_opt_out: *mut *const std::ffi::c_char,
@@ -1087,8 +1098,8 @@ mod tests {
             turso_statement_bind_positional_text, turso_statement_column_count,
             turso_statement_deinit, turso_statement_execute, turso_statement_n_change,
             turso_statement_named_position, turso_statement_parameters_count,
-            turso_statement_run_io, turso_statement_step, turso_status_code_t, turso_str_deinit,
-            turso_version,
+            turso_statement_run_io, turso_statement_set_query_timeout_ms, turso_statement_step,
+            turso_status_code_t, turso_str_deinit, turso_version,
         },
         value_from_c_value,
     };
@@ -1252,6 +1263,8 @@ mod tests {
             );
             assert_eq!(status, turso_status_code_t::TURSO_OK);
             assert_eq!(turso_statement_n_change(statement), 0);
+            turso_statement_set_query_timeout_ms(statement, 25);
+            turso_statement_set_query_timeout_ms(statement, 0);
 
             turso_statement_deinit(statement);
             turso_connection_deinit(connection);

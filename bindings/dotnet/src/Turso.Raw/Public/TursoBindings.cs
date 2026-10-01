@@ -30,6 +30,9 @@ public static class TursoBindings
         }
     }
 
+    public static TursoInterruptHandle RetainInterruptHandle(TursoDatabaseHandle db)
+        => new(db);
+
     public static void SetQueryTimeout(TursoDatabaseHandle db, TimeSpan timeout)
     {
         db.ThrowIfInvalid();
@@ -44,6 +47,21 @@ public static class TursoBindings
         db.ThrowIfInvalid();
         var milliseconds = TursoInterop.ConnectionGetQueryTimeout(db);
         return TimeSpan.FromMilliseconds(checked((long)milliseconds));
+    }
+
+    public static bool IsAutocommit(TursoDatabaseHandle db)
+    {
+        db.ThrowIfInvalid();
+        return TursoInterop.ConnectionGetAutocommit(db);
+    }
+
+    public static void SetQueryTimeout(TursoStatementHandle statement, TimeSpan timeout)
+    {
+        statement.ThrowIfInvalid();
+        ArgumentOutOfRangeException.ThrowIfLessThan(timeout, TimeSpan.Zero);
+
+        var milliseconds = checked((ulong)(timeout.Ticks / TimeSpan.TicksPerMillisecond));
+        TursoInterop.StatementSetQueryTimeout(statement, milliseconds);
     }
 
     public static TursoDatabaseHandle OpenDatabase(string path)
@@ -464,18 +482,23 @@ public static class TursoBindings
     private static void ThrowIfError(TursoStatusCode status, IntPtr errorPtr, string? messagePrefix = null)
     {
         if (errorPtr != IntPtr.Zero)
-            ThrowException(errorPtr, messagePrefix);
+            ThrowException(status, errorPtr, messagePrefix);
 
         if (status is TursoStatusCode.Ok or TursoStatusCode.Done or TursoStatusCode.Row)
             return;
 
-        throw new TursoException($"Turso native call failed with status {status}.");
+        throw new TursoException((uint)status, $"Turso native call failed with status {status}.");
     }
 
-    private static void ThrowException(IntPtr errorPtr, string? messagePrefix = null)
+    private static void ThrowException(
+        TursoStatusCode status,
+        IntPtr errorPtr,
+        string? messagePrefix = null)
     {
         var errorMessage = Marshal.PtrToStringUTF8(errorPtr);
-        var exception = new TursoException($"{messagePrefix}{errorMessage ?? "Internal error"}");
+        var exception = new TursoException(
+            (uint)status,
+            $"{messagePrefix}{errorMessage ?? "Internal error"}");
         TursoInterop.FreeString(errorPtr);
         throw exception;
     }

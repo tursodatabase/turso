@@ -1205,8 +1205,14 @@ pub unsafe extern "C" fn sqlite3_step(stmt: *mut sqlite3_stmt) -> ffi::c_int {
             stmt.clear_text_cache();
             SQLITE_DONE
         }
-        Err(LimboError::Busy) => SQLITE_BUSY,
-        Err(LimboError::Interrupt) => SQLITE_INTERRUPT,
+        Err(LimboError::Busy) => {
+            let mut db_inner = db.inner.lock().unwrap();
+            set_db_err(&mut db_inner, LimboError::Busy)
+        }
+        Err(LimboError::Interrupt) => {
+            let mut db_inner = db.inner.lock().unwrap();
+            set_db_err(&mut db_inner, LimboError::Interrupt)
+        }
         Err(err) => {
             let mut db_inner = db.inner.lock().unwrap();
             set_db_err(&mut db_inner, err)

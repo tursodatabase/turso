@@ -1052,6 +1052,7 @@ impl Statement {
 
         // Save parameters before they are reset
         let parameters = std::mem::take(&mut self.state.parameters);
+        let query_deadline = self.state.query_deadline;
         let (max_registers, cursor_count) = match self.query_mode {
             QueryMode::Normal => (new_program.max_registers, new_program.cursor_ref.len()),
             QueryMode::Explain => (EXPLAIN_COLUMNS.len(), 0),
@@ -1073,6 +1074,7 @@ impl Statement {
         self.program = new_program;
         // Load the parameters back into the state
         self.state.parameters = parameters;
+        self.state.query_deadline = query_deadline;
         Ok(())
     }
 

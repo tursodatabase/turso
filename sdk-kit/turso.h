@@ -435,6 +435,9 @@ turso_status_code_t turso_statement_execute(
     /** Optional return error parameter (can be null) */
     const char **error_opt_out);
 
+/** Set the timeout for this statement execution. Zero disables the timeout. */
+void turso_statement_set_query_timeout_ms(const turso_statement_t *self, uint64_t timeout_ms);
+
 /** Step statement execution once
  * Returns TURSO_DONE if execution finished
  * Returns TURSO_ROW if execution generated the row (row values can be inspected with corresponding statement methods)
