@@ -1554,6 +1554,11 @@ pub fn translate_alter_table(
                 },
             )?
         }
+        ast::AlterTableBody::RowSecurity(_) => {
+            return Err(LimboError::ParseError(
+                "ALTER TABLE ... ROW LEVEL SECURITY is not supported".to_string(),
+            ));
+        }
         ast::AlterTableBody::RenameTo(new_name) => {
             reject_dependent_materialized_views(resolver, database_id, table_name)?;
             let new_name = new_name.as_str();

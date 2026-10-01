@@ -505,6 +505,8 @@ pub fn translate_inner(
         ast::Stmt::SetRole { role_name } => {
             access_control::translate_set_role(role_name.as_ref(), program)?
         }
+        ast::Stmt::CreatePolicy(..) => bail_parse_error!("CREATE POLICY is not supported"),
+        ast::Stmt::DropPolicy { .. } => bail_parse_error!("DROP POLICY is not supported"),
     };
 
     if is_write {
@@ -576,6 +578,8 @@ pub(crate) fn stmt_kind(stmt: &ast::Stmt) -> &'static str {
         ast::Stmt::CreateRole { .. } => "create_role",
         ast::Stmt::DropRole { .. } => "drop_role",
         ast::Stmt::SetRole { .. } => "set_role",
+        ast::Stmt::CreatePolicy(..) => "create_policy",
+        ast::Stmt::DropPolicy { .. } => "drop_policy",
     }
 }
 
