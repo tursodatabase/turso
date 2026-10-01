@@ -564,6 +564,10 @@ impl Value {
 
         Ok(match (value, start_value) {
             (Value::Blob(b), Value::Numeric(Numeric::Integer(start))) => {
+                // sqlite3_value_blob() is NULL for a zero-length blob, so substrFunc returns NULL
+                if b.is_empty() {
+                    return Ok(Value::Null);
+                }
                 let (start, end) = calculate_postions(start, b.len(), length_value.as_ref());
                 return Value::from_slice(&b[start..end]);
             }
@@ -3229,6 +3233,29 @@ mod tests {
                 Some(&length_value),
             )),
             expected_val
+        );
+
+        let blob_value = Value::Blob(crate::alloc::vec![]);
+        let start_value = Value::from_i64(1);
+        let length_value = Value::from_i64(10);
+        assert_eq!(
+            allocated(Value::exec_substring(
+                &blob_value,
+                &start_value,
+                Some(&length_value),
+            )),
+            Value::Null
+        );
+        assert_eq!(
+            allocated(Value::exec_substring(&blob_value, &start_value, None)),
+            Value::Null
+        );
+
+        let blob_value = Value::Blob(crate::alloc::vec![0]);
+        let start_value = Value::from_i64(2);
+        assert_eq!(
+            allocated(Value::exec_substring(&blob_value, &start_value, None)),
+            Value::Blob(crate::alloc::vec![])
         );
     }
 
