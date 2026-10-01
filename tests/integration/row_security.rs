@@ -661,3 +661,47 @@ fn test_owner_policy_runs_before_multi_index_branch_conditions() {
         vec![1]
     );
 }
+
+/// A query's own conditions must never run on a hidden row, or an error they
+/// raise, such as malformed JSON, would reveal the row. The policy filter is
+/// evaluated before them in every query shape.
+#[test]
+fn test_query_conditions_never_see_hidden_rows() {
+    let db = TempDatabase::builder().build();
+    let conn = db.connect_limbo();
+    create_docs_with_owner_policy(&conn);
+    conn.execute("ALTER TABLE docs ADD COLUMN body TEXT")
+        .unwrap();
+    conn.execute("UPDATE docs SET body = '{\"x\": 1}'").unwrap();
+    conn.execute("UPDATE docs SET body = 'not json' WHERE id = 2")
+        .unwrap();
+    let hidden_row_query = "SELECT id FROM docs WHERE json_extract(body, '$.x') = 1";
+    assert_error_contains(conn.execute(hidden_row_query), "malformed JSON");
+
+    conn.set_role(Some("alice")).unwrap();
+    let queries = [
+        hidden_row_query,
+        "SELECT id FROM docs WHERE id = 2 AND json_extract(body, '$.x') = 1",
+        "SELECT id FROM docs WHERE json_extract(body, '$.x') = 1 AND id > 0",
+        "SELECT docs.id FROM ids JOIN docs ON docs.id = ids.id WHERE json_extract(docs.body, '$.x') = 1",
+        "SELECT docs.id FROM docs JOIN ids ON docs.id = ids.id WHERE json_extract(docs.body, '$.x') = 1",
+        "SELECT ids.id FROM ids LEFT JOIN docs ON docs.id = ids.id AND json_extract(docs.body, '$.x') = 1",
+        "SELECT id FROM (SELECT * FROM docs) WHERE json_extract(body, '$.x') = 1",
+        "SELECT id FROM docs WHERE EXISTS (SELECT 1 WHERE json_extract(docs.body, '$.x') = 1)",
+        "SELECT json_extract(body, '$.x') FROM docs",
+        "SELECT id FROM docs ORDER BY json_extract(body, '$.x')",
+        "SELECT count(*) FROM docs GROUP BY json_extract(body, '$.x')",
+    ];
+    for sql in queries {
+        conn.execute(sql)
+            .unwrap_or_else(|err| panic!("{sql}: {err}"));
+    }
+    conn.set_role(None).unwrap();
+    conn.execute("CREATE INDEX docs_owner ON docs(owner)")
+        .unwrap();
+    conn.set_role(Some("alice")).unwrap();
+    for sql in queries {
+        conn.execute(sql)
+            .unwrap_or_else(|err| panic!("with index, {sql}: {err}"));
+    }
+}
