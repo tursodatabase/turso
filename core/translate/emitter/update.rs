@@ -511,13 +511,30 @@ struct UpdateColumnCtx<'a> {
 }
 
 impl UpdateColumnCtx<'_> {
-    fn col_len(&self) -> usize {
-        self.target_table.table.columns().len()
+    /// Returns `None` when CDC does not record updates, or when the column is virtual
+    /// and so has no entry in the `updates` record.
+    fn cdc_update_registers(&self, idx: usize, column: &Column) -> Option<CdcUpdateRegisters> {
+        if column.is_virtual_generated() {
+            return None;
+        }
+        let start = self.cdc_updates_register?;
+        let stored_col_count = self.layout.num_non_virtual_cols();
+        let offset = self.layout.to_reg_offset(idx);
+        Some(CdcUpdateRegisters {
+            change_flag: start + offset,
+            new_value: start + stored_col_count + offset,
+        })
     }
 
     fn table_name(&self) -> &str {
         self.target_table.table.get_name()
     }
+}
+
+/// Registers of one column's entries in the CDC `updates` record.
+struct CdcUpdateRegisters {
+    change_flag: usize,
+    new_value: usize,
 }
 
 /// Emit the VDBE instructions that enforce a `NOT NULL` constraint on the
@@ -914,22 +931,24 @@ fn emit_update_column_values<'a>(
                     )?;
                 }
 
-                if let Some(cdc_updates_register) = column_ctx.cdc_updates_register {
-                    let change_reg = cdc_updates_register + idx;
-                    let value_reg = cdc_updates_register + column_ctx.col_len() + idx;
-                    program.emit_bool(true, change_reg);
+                if let Some(CdcUpdateRegisters {
+                    change_flag,
+                    new_value,
+                }) = column_ctx.cdc_update_registers(idx, table_column)
+                {
+                    program.emit_bool(true, change_flag);
                     program.mark_last_insn_constant();
                     let mut updated = false;
                     if let Some(ddl_query_for_cdc_update) = column_ctx.cdc_update_alter_statement {
                         if table_column.name.as_deref() == Some("sql") {
-                            program.emit_string8(ddl_query_for_cdc_update.to_string(), value_reg);
+                            program.emit_string8(ddl_query_for_cdc_update.to_string(), new_value);
                             updated = true;
                         }
                     }
                     if !updated {
                         program.emit_insn(Insn::Copy {
                             src_reg: target_reg,
-                            dst_reg: value_reg,
+                            dst_reg: new_value,
                             extra_amount: 0,
                         });
                     }
@@ -977,12 +996,14 @@ fn emit_update_column_values<'a>(
                 }
             }
 
-            if let Some(cdc_updates_register) = column_ctx.cdc_updates_register {
-                let change_bit_reg = cdc_updates_register + idx;
-                let value_reg = cdc_updates_register + column_ctx.col_len() + idx;
-                program.emit_bool(false, change_bit_reg);
+            if let Some(CdcUpdateRegisters {
+                change_flag,
+                new_value,
+            }) = column_ctx.cdc_update_registers(idx, table_column)
+            {
+                program.emit_bool(false, change_flag);
                 program.mark_last_insn_constant();
-                program.emit_null(value_reg, None);
+                program.emit_null(new_value, None);
                 program.mark_last_insn_constant();
             }
         }
@@ -1232,16 +1253,16 @@ fn emit_update_insns<'a>(
     // we scan a column at a time, loading either the column's values, or the new value
     // from the Set expression, into registers so we can emit a MakeRecord and update the row.
 
+    let layout = ColumnLayout::from_table(&target_table.as_ref().table)?;
     // we allocate 2C registers for "updates" as the structure of this column for CDC table is following:
     // [C boolean values where true set for changed columns] [C values with updates where NULL is set for not-changed columns]
     let cdc_updates_register = if program.capture_data_changes_info().has_updates() {
-        Some(program.alloc_registers(2 * col_len))
+        Some(program.alloc_registers(2 * layout.num_non_virtual_cols()))
     } else {
         None
     };
     let table_name = target_table.table.get_name();
     let start = if is_virtual_table { beg + 2 } else { beg + 1 };
-    let layout = ColumnLayout::from_table(&target_table.as_ref().table)?;
     let target_btree = target_table.table.btree();
     let affected_columns = match target_btree.as_deref() {
         Some(table) => table.columns_affected_by_update(&updated_column_indices)?,
@@ -2480,7 +2501,7 @@ fn emit_update_insns<'a>(
                 let record_reg = program.alloc_register();
                 program.emit_insn(Insn::MakeRecord {
                     start_reg: to_u32(cdc_updates_register),
-                    count: to_u32(2 * col_len),
+                    count: to_u32(2 * layout.num_non_virtual_cols()),
                     dest_reg: to_u32(record_reg),
                     index_name: None,
                     affinity_str: None,
