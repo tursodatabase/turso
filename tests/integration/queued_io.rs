@@ -1,7 +1,10 @@
 use std::{
     collections::VecDeque,
     io::ErrorKind,
-    sync::{Arc, Mutex},
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc, Mutex,
+    },
 };
 
 use turso_core::{
@@ -42,6 +45,7 @@ struct QueuedIoState {
     pending: Mutex<VecDeque<QueuedIoOp>>,
     history: Mutex<Vec<QueuedIoEvent>>,
     fault: Mutex<Option<QueuedIoFault>>,
+    blocking_waits: AtomicUsize,
 }
 
 impl QueuedIoState {
@@ -50,6 +54,7 @@ impl QueuedIoState {
             pending: Mutex::new(VecDeque::new()),
             history: Mutex::new(Vec::new()),
             fault: Mutex::new(None),
+            blocking_waits: AtomicUsize::new(0),
         }
     }
 }
@@ -100,6 +105,18 @@ impl QueuedIo {
     pub(crate) fn clear_fault(&self) {
         *self.state.fault.lock().unwrap() = None;
     }
+
+    /// Number of times the engine waited for I/O itself through `step()` or
+    /// `drain_completions()` instead of returning it to the caller. An
+    /// asynchronous-only backend, such as browser OPFS, cannot complete I/O
+    /// while the engine waits.
+    pub(crate) fn blocking_waits(&self) -> usize {
+        self.state.blocking_waits.load(Ordering::SeqCst)
+    }
+
+    fn count_blocking_wait(&self) {
+        self.state.blocking_waits.fetch_add(1, Ordering::SeqCst);
+    }
 }
 
 impl Clock for QueuedIo {
@@ -132,10 +149,12 @@ impl IO for QueuedIo {
     }
 
     fn step(&self) -> turso_core::Result<()> {
+        self.count_blocking_wait();
         self.step_one().map(|_| ())
     }
 
     fn drain_completions(&self, completions: &[Completion]) -> turso_core::Result<()> {
+        self.count_blocking_wait();
         while completions.iter().any(|c| !c.finished()) {
             if self.step_one()?.is_none() {
                 break;

@@ -7,6 +7,7 @@
 //! a SELECT statement will be translated into a sequence of instructions that
 //! will read rows from the database and filter them according to a WHERE clause.
 
+pub(crate) mod access_control;
 pub(crate) mod aggregation;
 pub(crate) mod alter;
 pub(crate) mod analyze;
@@ -185,6 +186,8 @@ pub fn translate_inner(
             | ast::Stmt::Insert { .. }
             | ast::Stmt::CreateSequence { .. }
             | ast::Stmt::DropSequence { .. }
+            | ast::Stmt::CreateRole { .. }
+            | ast::Stmt::DropRole { .. }
     );
     let is_vacuum = matches!(stmt, ast::Stmt::Vacuum { .. });
 
@@ -486,8 +489,13 @@ pub fn translate_inner(
         } => {
             sequence::translate_drop_sequence(&seq_name, if_exists, resolver, program)?;
         }
-        ast::Stmt::CreateRole { .. } => bail_parse_error!("CREATE ROLE is not supported"),
-        ast::Stmt::DropRole { .. } => bail_parse_error!("DROP ROLE is not supported"),
+        ast::Stmt::CreateRole { role_name } => {
+            access_control::translate_create_role(&role_name, resolver, program)?
+        }
+        ast::Stmt::DropRole {
+            if_exists,
+            role_name,
+        } => access_control::translate_drop_role(&role_name, if_exists, resolver, program)?,
         ast::Stmt::SetRole { .. } => bail_parse_error!("SET ROLE is not supported"),
     };
 

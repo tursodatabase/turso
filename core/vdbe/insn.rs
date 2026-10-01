@@ -1652,6 +1652,11 @@ pub enum Insn {
         /// by `SequenceBeginInnerTx`). Empty blob means "no outer tx".
         saved_outer_reg: usize,
     },
+    /// Apply a change to the in-memory access control catalog
+    UpdateAccessControl {
+        db: usize,
+        change: Box<crate::access_control::AccessControlChange>,
+    },
     /// Add a custom type to the in-memory schema by parsing its CREATE TYPE SQL
     AddType {
         /// The database within which this type needs to be added
@@ -2302,6 +2307,7 @@ impl InsnVariants {
             InsnVariants::SequenceBeginInnerTx => execute::op_sequence_begin_inner_tx,
             InsnVariants::SequenceCommitInnerTx => execute::op_sequence_commit_inner_tx,
             InsnVariants::AddType => execute::op_add_type,
+            InsnVariants::UpdateAccessControl => execute::op_update_access_control,
             InsnVariants::DropView => execute::op_drop_view,
             InsnVariants::Close => execute::op_close,
             InsnVariants::IsNull => execute::op_is_null,
@@ -2423,6 +2429,7 @@ impl Insn {
             | Self::SequenceBeginInnerTx { .. }
             | Self::SequenceCommitInnerTx { .. }
             | Self::AddType { .. }
+            | Self::UpdateAccessControl { .. }
             | Self::ParseSchema { .. }
             | Self::PopulateMaterializedViews { .. }
             | Self::SetCookie { .. }

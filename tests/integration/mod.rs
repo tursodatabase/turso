@@ -1,5 +1,6 @@
 mod abandoned_create_index;
 mod abandoned_statement_pager;
+mod access_control;
 mod assert_details;
 #[macro_use]
 mod assertions;

@@ -14517,6 +14517,21 @@ pub fn op_add_type(
     Ok(InsnFunctionStepResult::Step)
 }
 
+pub fn op_update_access_control(
+    program: &Program,
+    state: &mut ProgramState,
+    insn: &Insn,
+    _pager: &Arc<Pager>,
+) -> InsnResult {
+    load_insn!(UpdateAccessControl { db, change }, insn);
+    let conn = program.connection.clone();
+    conn.with_database_schema_mut(*db, |schema| {
+        std::sync::Arc::make_mut(&mut schema.access_control).apply(change)
+    })?;
+    state.pc += 1;
+    Ok(InsnFunctionStepResult::Step)
+}
+
 /// Compute the next value of a sequence from a watermark row that has
 /// already been loaded into registers by the surrounding bytecode. Pure
 /// arithmetic — no I/O. The translator emits a cursor seek + Column reads
