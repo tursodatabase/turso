@@ -194,6 +194,8 @@ pub fn translate_inner(
             | ast::Stmt::DropSequence { .. }
             | ast::Stmt::CreateRole { .. }
             | ast::Stmt::DropRole { .. }
+            | ast::Stmt::CreatePolicy(..)
+            | ast::Stmt::DropPolicy { .. }
     );
     let is_vacuum = matches!(stmt, ast::Stmt::Vacuum { .. });
 
@@ -505,8 +507,20 @@ pub fn translate_inner(
         ast::Stmt::SetRole { role_name } => {
             access_control::translate_set_role(role_name.as_ref(), program)?
         }
-        ast::Stmt::CreatePolicy(..) => bail_parse_error!("CREATE POLICY is not supported"),
-        ast::Stmt::DropPolicy { .. } => bail_parse_error!("DROP POLICY is not supported"),
+        ast::Stmt::CreatePolicy(policy) => {
+            access_control::translate_create_policy(&policy, resolver, program)?
+        }
+        ast::Stmt::DropPolicy {
+            if_exists,
+            policy_name,
+            tbl_name,
+        } => access_control::translate_drop_policy(
+            &policy_name,
+            &tbl_name,
+            if_exists,
+            resolver,
+            program,
+        )?,
     };
 
     if is_write {

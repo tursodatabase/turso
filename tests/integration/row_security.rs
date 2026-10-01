@@ -293,6 +293,246 @@ fn test_query_expressions_never_run_on_hidden_rows() {
     }
 }
 
+fn create_docs_with_owner_policy(conn: &Arc<Connection>) {
+    create_docs_with_row_security(conn);
+    conn.execute("CREATE ROLE bob").unwrap();
+    conn.execute("CREATE POLICY own ON docs USING (owner = current_user)")
+        .unwrap();
+}
+
+fn visible_ids(conn: &Arc<Connection>, sql: &str) -> Vec<i64> {
+    let rows: Vec<(i64,)> = conn.exec_rows(sql);
+    rows.into_iter().map(|(id,)| id).collect()
+}
+
+#[test]
+fn test_owner_policy_shows_rows_owned_by_role() {
+    let db = TempDatabase::builder().build();
+    let conn = db.connect_limbo();
+    create_docs_with_owner_policy(&conn);
+    conn.set_role(Some("alice")).unwrap();
+    for sql in [
+        "SELECT id FROM docs ORDER BY id",
+        "SELECT d.id FROM docs AS d ORDER BY d.id",
+        "SELECT id FROM docs WHERE id IN (1, 2, 3) ORDER BY id",
+        "SELECT docs.id FROM ids JOIN docs ON docs.id >= ids.id WHERE ids.id = 1 ORDER BY docs.id",
+        "WITH d AS (SELECT * FROM docs) SELECT id FROM d ORDER BY id",
+    ] {
+        assert_eq!(visible_ids(&conn, sql), vec![1, 3], "{sql}");
+    }
+    assert_eq!(
+        visible_ids(&conn, "SELECT count(*) FROM docs WHERE id = 2"),
+        vec![0]
+    );
+    conn.set_role(Some("bob")).unwrap();
+    assert_eq!(visible_ids(&conn, "SELECT id FROM docs"), vec![2]);
+}
+
+#[test]
+fn test_owner_policy_accepts_supabase_spellings() {
+    for using in [
+        "current_user = owner",
+        "docs.owner = current_user()",
+        "(SELECT current_user) = owner",
+        "((owner) = (SELECT current_user()))",
+    ] {
+        let db = TempDatabase::builder().build();
+        let conn = db.connect_limbo();
+        create_docs_with_row_security(&conn);
+        conn.execute(format!("CREATE POLICY own ON docs USING ({using})"))
+            .unwrap();
+        conn.set_role(Some("alice")).unwrap();
+        assert_eq!(
+            visible_ids(&conn, "SELECT id FROM docs ORDER BY id"),
+            vec![1, 3],
+            "{using}"
+        );
+    }
+}
+
+#[test]
+fn test_policies_combine_with_or() {
+    let db = TempDatabase::builder().build();
+    let conn = db.connect_limbo();
+    create_docs_with_owner_policy(&conn);
+    conn.execute("ALTER TABLE docs ADD COLUMN editor TEXT")
+        .unwrap();
+    conn.execute("UPDATE docs SET editor = 'alice' WHERE id = 2")
+        .unwrap();
+    conn.execute("CREATE POLICY edit ON docs FOR SELECT USING (editor = current_user)")
+        .unwrap();
+    conn.execute("CREATE POLICY none ON docs USING (false)")
+        .unwrap();
+    conn.set_role(Some("alice")).unwrap();
+    assert_eq!(
+        visible_ids(&conn, "SELECT id FROM docs ORDER BY id"),
+        vec![1, 2, 3]
+    );
+    conn.set_role(None).unwrap();
+    conn.execute("CREATE POLICY everything ON docs USING (true)")
+        .unwrap();
+    conn.set_role(Some("bob")).unwrap();
+    assert_eq!(
+        visible_ids(&conn, "SELECT id FROM docs ORDER BY id"),
+        vec![1, 2, 3]
+    );
+}
+
+#[test]
+fn test_owner_policy_compares_role_names_exactly() {
+    let db = TempDatabase::builder().build();
+    let conn = db.connect_limbo();
+    conn.execute("CREATE TABLE docs(id INTEGER PRIMARY KEY, owner TEXT COLLATE NOCASE)")
+        .unwrap();
+    conn.execute("INSERT INTO docs VALUES (1, 'alice'), (2, 'ALICE')")
+        .unwrap();
+    conn.execute("CREATE ROLE alice").unwrap();
+    conn.execute("ALTER TABLE docs ENABLE ROW LEVEL SECURITY")
+        .unwrap();
+    conn.execute("CREATE POLICY own ON docs USING (owner = current_user)")
+        .unwrap();
+    conn.set_role(Some("alice")).unwrap();
+    assert_eq!(visible_ids(&conn, "SELECT id FROM docs"), vec![1]);
+}
+
+#[test]
+fn test_owner_policy_uses_index_on_owner_column() {
+    let db = TempDatabase::builder().build();
+    let conn = db.connect_limbo();
+    create_docs_with_owner_policy(&conn);
+    conn.execute("CREATE INDEX docs_owner ON docs(owner)")
+        .unwrap();
+    conn.set_role(Some("alice")).unwrap();
+    let plan: Vec<(i64, i64, i64, String)> =
+        conn.exec_rows("EXPLAIN QUERY PLAN SELECT id FROM docs");
+    assert!(
+        plan.iter()
+            .any(|(_, _, _, detail)| detail.contains("docs_owner")),
+        "{plan:?}"
+    );
+    assert_eq!(
+        visible_ids(&conn, "SELECT id FROM docs ORDER BY id"),
+        vec![1, 3]
+    );
+}
+
+#[test]
+fn test_unsupported_policies_are_rejected() {
+    let db = TempDatabase::builder().build();
+    let conn = db.connect_limbo();
+    create_docs_with_row_security(&conn);
+    for (sql, expected) in [
+        (
+            "CREATE POLICY p ON docs AS RESTRICTIVE USING (true)",
+            "RESTRICTIVE",
+        ),
+        (
+            "CREATE POLICY p ON docs FOR INSERT WITH CHECK (true)",
+            "FOR SELECT",
+        ),
+        ("CREATE POLICY p ON docs TO alice USING (true)", "TO PUBLIC"),
+        (
+            "CREATE POLICY p ON docs USING (true) WITH CHECK (true)",
+            "WITH CHECK",
+        ),
+        ("CREATE POLICY p ON docs", "USING"),
+        (
+            "CREATE POLICY p ON docs USING (owner = 'alice')",
+            "unsupported policy condition",
+        ),
+        (
+            "CREATE POLICY p ON docs USING (owner = current_user AND id > 1)",
+            "unsupported policy condition",
+        ),
+        (
+            "CREATE POLICY p ON docs USING (owner IN (SELECT current_user))",
+            "unsupported policy condition",
+        ),
+        (
+            "CREATE POLICY p ON docs USING (missing = current_user)",
+            "no such column",
+        ),
+        ("CREATE POLICY p ON nope USING (true)", "no such table"),
+    ] {
+        assert_error_contains(conn.execute(sql), expected);
+    }
+    conn.execute("CREATE POLICY p ON docs USING (true)")
+        .unwrap();
+    assert_error_contains(
+        conn.execute("CREATE POLICY p ON docs USING (true)"),
+        "already exists",
+    );
+}
+
+#[test]
+fn test_policy_owner_column_cannot_be_generated() {
+    let db = TempDatabase::builder()
+        .with_opts(DatabaseOpts::new().with_generated_columns(true))
+        .build();
+    let conn = db.connect_limbo();
+    conn.execute("CREATE TABLE g(a TEXT, b TEXT AS (a || ''))")
+        .unwrap();
+    assert_error_contains(
+        conn.execute("CREATE POLICY p ON g USING (b = current_user)"),
+        "generated column",
+    );
+}
+
+#[test]
+fn test_policies_have_no_effect_without_row_security() {
+    let db = TempDatabase::builder().build();
+    let conn = db.connect_limbo();
+    create_docs_with_owner_policy(&conn);
+    conn.execute("ALTER TABLE docs DISABLE ROW LEVEL SECURITY")
+        .unwrap();
+    conn.set_role(Some("alice")).unwrap();
+    assert_eq!(
+        visible_ids(&conn, "SELECT id FROM docs ORDER BY id"),
+        vec![1, 2, 3]
+    );
+}
+
+#[test]
+fn test_drop_policy() {
+    let db = TempDatabase::builder().build();
+    let conn = db.connect_limbo();
+    create_docs_with_owner_policy(&conn);
+    conn.execute("DROP POLICY own ON docs").unwrap();
+    assert_error_contains(conn.execute("DROP POLICY own ON docs"), "does not exist");
+    conn.execute("DROP POLICY IF EXISTS own ON docs").unwrap();
+    conn.set_role(Some("alice")).unwrap();
+    assert_eq!(visible_ids(&conn, "SELECT count(*) FROM docs"), vec![0]);
+}
+
+#[test]
+fn test_policies_survive_reopen_and_are_seen_by_other_connections() {
+    for mvcc in [false, true] {
+        let db = TempDatabase::builder().with_mvcc(mvcc).build();
+        let conn = db.connect_limbo();
+        let other = db.connect_limbo();
+        let _: Vec<(i64,)> = other.exec_rows("SELECT count(*) FROM sqlite_schema");
+        create_docs_with_owner_policy(&conn);
+        other.set_role(Some("alice")).unwrap();
+        assert_eq!(
+            visible_ids(&other, "SELECT id FROM docs ORDER BY id"),
+            vec![1, 3]
+        );
+        conn.close().unwrap();
+        other.close().unwrap();
+        let path = db.path.clone();
+        drop(db);
+
+        let db = TempDatabase::new_with_existent(&path);
+        let conn = db.connect_limbo();
+        conn.set_role(Some("alice")).unwrap();
+        assert_eq!(
+            visible_ids(&conn, "SELECT id FROM docs ORDER BY id"),
+            vec![1, 3],
+            "mvcc={mvcc}"
+        );
+    }
+}
+
 #[test]
 fn test_drop_table_keeps_roles() {
     let db = TempDatabase::builder().build();
@@ -308,4 +548,65 @@ fn test_drop_table_keeps_roles() {
     let rows: Vec<(String, String)> =
         conn.exec_rows("SELECT kind, name FROM __turso_internal_access_control");
     assert_eq!(rows, vec![("role".to_string(), "alice".to_string())]);
+}
+
+#[test]
+fn test_policy_owner_column_cannot_change() {
+    let db = TempDatabase::builder().build();
+    let conn = db.connect_limbo();
+    create_docs_with_owner_policy(&conn);
+    for sql in [
+        "ALTER TABLE docs RENAME COLUMN owner TO author",
+        "ALTER TABLE docs DROP COLUMN owner",
+        "ALTER TABLE docs RENAME TO papers",
+    ] {
+        assert_error_contains(conn.execute(sql), "row-level security");
+    }
+    conn.execute("ALTER TABLE docs ADD COLUMN title TEXT")
+        .unwrap();
+    conn.execute("ALTER TABLE docs RENAME COLUMN title TO name")
+        .unwrap();
+    conn.execute("CREATE TEMP TABLE docs(id INTEGER, owner TEXT)")
+        .unwrap();
+    conn.execute("ALTER TABLE temp.docs RENAME COLUMN owner TO author")
+        .unwrap();
+}
+
+#[test]
+fn test_drop_table_removes_policies() {
+    let db = TempDatabase::builder().build();
+    let conn = db.connect_limbo();
+    create_docs_with_owner_policy(&conn);
+    conn.execute("DROP TABLE docs").unwrap();
+    let rows: Vec<(String,)> =
+        conn.exec_rows("SELECT kind FROM __turso_internal_access_control WHERE tbl_name = 'docs'");
+    assert!(rows.is_empty(), "{rows:?}");
+    conn.execute("CREATE TABLE docs(id INTEGER, owner TEXT)")
+        .unwrap();
+    conn.execute("CREATE POLICY own ON docs USING (true)")
+        .unwrap();
+}
+
+#[test]
+fn test_owner_policy_runs_before_multi_index_branch_conditions() {
+    let db = TempDatabase::builder().build();
+    let conn = db.connect_limbo();
+    create_docs_with_owner_policy(&conn);
+    conn.execute("ALTER TABLE docs ADD COLUMN body TEXT")
+        .unwrap();
+    conn.execute("ALTER TABLE docs ADD COLUMN x INTEGER")
+        .unwrap();
+    conn.execute("UPDATE docs SET body = '{\"x\": 1}', x = id")
+        .unwrap();
+    conn.execute("UPDATE docs SET body = 'not json' WHERE id = 2")
+        .unwrap();
+    conn.execute("CREATE INDEX docs_x ON docs(x)").unwrap();
+    conn.set_role(Some("alice")).unwrap();
+    assert_eq!(
+        visible_ids(
+            &conn,
+            "SELECT id FROM docs WHERE id = 1 OR (x = 2 AND json_extract(body, '$.x') = 1)"
+        ),
+        vec![1]
+    );
 }
