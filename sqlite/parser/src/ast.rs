@@ -359,6 +359,23 @@ pub enum Stmt {
         /// sequence name
         seq_name: QualifiedName,
     },
+    /// `CREATE ROLE`
+    CreateRole {
+        /// role name
+        role_name: Name,
+    },
+    /// `DROP ROLE`
+    DropRole {
+        /// `IF EXISTS`
+        if_exists: bool,
+        /// role name
+        role_name: Name,
+    },
+    /// `SET ROLE name`, or `RESET ROLE` / `SET ROLE NONE` when `None`
+    SetRole {
+        /// role name
+        role_name: Option<Name>,
+    },
 }
 
 #[repr(transparent)]

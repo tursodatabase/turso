@@ -868,6 +868,34 @@ impl ToTokens for Stmt {
                 seq_name.to_tokens(s, context)?;
                 Ok(())
             }
+            Self::CreateRole { role_name } => {
+                s.append(TK_CREATE, None)?;
+                s.append(TK_ID, Some("ROLE"))?;
+                role_name.to_tokens(s, context)
+            }
+            Self::DropRole {
+                if_exists,
+                role_name,
+            } => {
+                s.append(TK_DROP, None)?;
+                s.append(TK_ID, Some("ROLE"))?;
+                if *if_exists {
+                    s.append(TK_IF, None)?;
+                    s.append(TK_EXISTS, None)?;
+                }
+                role_name.to_tokens(s, context)
+            }
+            Self::SetRole { role_name } => match role_name {
+                Some(role_name) => {
+                    s.append(TK_SET, None)?;
+                    s.append(TK_ID, Some("ROLE"))?;
+                    role_name.to_tokens(s, context)
+                }
+                None => {
+                    s.append(TK_ID, Some("RESET"))?;
+                    s.append(TK_ID, Some("ROLE"))
+                }
+            },
             Self::DropDomain {
                 if_exists,
                 domain_name,

@@ -486,6 +486,9 @@ pub fn translate_inner(
         } => {
             sequence::translate_drop_sequence(&seq_name, if_exists, resolver, program)?;
         }
+        ast::Stmt::CreateRole { .. } => bail_parse_error!("CREATE ROLE is not supported"),
+        ast::Stmt::DropRole { .. } => bail_parse_error!("DROP ROLE is not supported"),
+        ast::Stmt::SetRole { .. } => bail_parse_error!("SET ROLE is not supported"),
     };
 
     if is_write {
@@ -554,6 +557,9 @@ fn stmt_kind(stmt: &ast::Stmt) -> &'static str {
         ast::Stmt::Optimize { .. } => "optimize",
         ast::Stmt::CreateSequence { .. } => "create_sequence",
         ast::Stmt::DropSequence { .. } => "drop_sequence",
+        ast::Stmt::CreateRole { .. } => "create_role",
+        ast::Stmt::DropRole { .. } => "drop_role",
+        ast::Stmt::SetRole { .. } => "set_role",
     }
 }
 

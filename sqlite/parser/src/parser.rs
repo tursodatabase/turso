@@ -707,6 +707,9 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_stmt(&mut self) -> Result<Stmt> {
+        if let Some(stmt) = self.parse_set_role()? {
+            return Ok(stmt);
+        }
         let tok = peek_expect!(
             self,
             TK_BEGIN,
@@ -1071,6 +1074,12 @@ impl<'a> Parser<'a> {
             }
             TK_ID if first_tok.to_utf8().eq_ignore_ascii_case("SEQUENCE") => {
                 self.parse_create_sequence()
+            }
+            TK_ID if first_tok.to_utf8().eq_ignore_ascii_case("ROLE") => {
+                eat_assert!(self, TK_ID);
+                Ok(Stmt::CreateRole {
+                    role_name: self.parse_nm()?,
+                })
             }
             _ => Err(Error::ParseError(format!(
                 "unexpected token: {}",
@@ -5144,6 +5153,33 @@ impl<'a> Parser<'a> {
         })
     }
 
+    /// `SET ROLE name`, `SET ROLE NONE` or `RESET ROLE`.
+    fn parse_set_role(&mut self) -> Result<Option<Stmt>> {
+        let Some(tok) = self.peek()? else {
+            return Ok(None);
+        };
+        let reset = match tok.token_type {
+            TK_SET => false,
+            TK_ID if tok.to_utf8().eq_ignore_ascii_case("RESET") => true,
+            _ => return Ok(None),
+        };
+        self.eat()?;
+        let role_kw = eat_expect!(self, TK_ID);
+        if !role_kw.to_utf8().eq_ignore_ascii_case("ROLE") {
+            return Err(Error::ParseError("expected ROLE".to_owned()));
+        }
+        if reset {
+            return Ok(Some(Stmt::SetRole { role_name: None }));
+        }
+        let role = self.parse_nm()?;
+        let role_name = if !role.quoted() && role.as_str().eq_ignore_ascii_case("NONE") {
+            None
+        } else {
+            Some(role)
+        };
+        Ok(Some(Stmt::SetRole { role_name }))
+    }
+
     fn parse_create_sequence(&mut self) -> Result<Stmt> {
         eat_assert!(self, TK_ID); // eat SEQUENCE
         let if_not_exists = self.parse_if_not_exists()?;
@@ -5313,6 +5349,15 @@ impl<'a> Parser<'a> {
                 Ok(Stmt::DropSequence {
                     if_exists,
                     seq_name,
+                })
+            }
+            TK_ID if tok.to_utf8().eq_ignore_ascii_case("ROLE") => {
+                eat_assert!(self, TK_ID);
+                let if_exists = self.parse_if_exists()?;
+                let role_name = self.parse_nm()?;
+                Ok(Stmt::DropRole {
+                    if_exists,
+                    role_name,
                 })
             }
             _ => Err(Error::ParseError(format!(
@@ -13437,6 +13482,22 @@ mod tests {
             }
             _ => panic!("expected DropSequence"),
         }
+    }
+
+    #[test]
+    fn test_parse_role_statements_print_back_to_same_sql() {
+        for sql in [
+            "CREATE ROLE alice",
+            "DROP ROLE alice",
+            "DROP ROLE IF EXISTS alice",
+            "SET ROLE alice",
+            "RESET ROLE",
+        ] {
+            let cmd = Parser::new(sql.as_bytes()).next().unwrap().unwrap();
+            assert_eq!(cmd.stmt().to_string(), sql);
+        }
+        let cmd = Parser::new(b"SET ROLE NONE").next().unwrap().unwrap();
+        assert_eq!(cmd.stmt(), &Stmt::SetRole { role_name: None });
     }
 
     #[test]
