@@ -896,6 +896,22 @@ impl ToTokens for Stmt {
                     s.append(TK_ID, Some("ROLE"))
                 }
             },
+            Self::CreatePolicy(policy) => policy.to_tokens(s, context),
+            Self::DropPolicy {
+                if_exists,
+                policy_name,
+                tbl_name,
+            } => {
+                s.append(TK_DROP, None)?;
+                s.append(TK_ID, Some("POLICY"))?;
+                if *if_exists {
+                    s.append(TK_IF, None)?;
+                    s.append(TK_EXISTS, None)?;
+                }
+                policy_name.to_tokens(s, context)?;
+                s.append(TK_ON, None)?;
+                tbl_name.to_tokens(s, context)
+            }
             Self::DropDomain {
                 if_exists,
                 domain_name,
@@ -1706,7 +1722,58 @@ impl ToTokens for AlterTableBody {
                 s.append(TK_COLUMNKW, None)?;
                 name.to_tokens(s, context)
             }
+            Self::RowSecurity(enable) => {
+                s.append(TK_ID, Some(if *enable { "ENABLE" } else { "DISABLE" }))?;
+                s.append(TK_ROW, None)?;
+                s.append(TK_ID, Some("LEVEL"))?;
+                s.append(TK_ID, Some("SECURITY"))
+            }
         }
+    }
+}
+
+impl_display_for_to_tokens!(CreatePolicy);
+impl ToTokens for CreatePolicy {
+    fn to_tokens<S: TokenStream + ?Sized, C: ToSqlContext>(
+        &self,
+        s: &mut S,
+        context: &C,
+    ) -> Result<(), S::Error> {
+        s.append(TK_CREATE, None)?;
+        s.append(TK_ID, Some("POLICY"))?;
+        self.policy_name.to_tokens(s, context)?;
+        s.append(TK_ON, None)?;
+        self.tbl_name.to_tokens(s, context)?;
+        if self.restrictive {
+            s.append(TK_AS, None)?;
+            s.append(TK_ID, Some("RESTRICTIVE"))?;
+        }
+        s.append(TK_FOR, None)?;
+        match self.command {
+            PolicyCommand::All => s.append(TK_ALL, None)?,
+            PolicyCommand::Select => s.append(TK_SELECT, None)?,
+            PolicyCommand::Insert => s.append(TK_INSERT, None)?,
+            PolicyCommand::Update => s.append(TK_UPDATE, None)?,
+            PolicyCommand::Delete => s.append(TK_DELETE, None)?,
+        }
+        if !self.roles.is_empty() {
+            s.append(TK_TO, None)?;
+            comma(&self.roles, s, context)?;
+        }
+        if let Some(expr) = &self.using_expr {
+            s.append(TK_USING, None)?;
+            s.append(TK_LP, None)?;
+            expr.to_tokens(s, context)?;
+            s.append(TK_RP, None)?;
+        }
+        if let Some(expr) = &self.check_expr {
+            s.append(TK_WITH, None)?;
+            s.append(TK_CHECK, None)?;
+            s.append(TK_LP, None)?;
+            expr.to_tokens(s, context)?;
+            s.append(TK_RP, None)?;
+        }
+        Ok(())
     }
 }
 

@@ -89,7 +89,9 @@ impl StmtClass {
             | Stmt::DropDomain { .. }
             | Stmt::DropSequence { .. }
             | Stmt::CreateRole { .. }
-            | Stmt::DropRole { .. } => Some(Self::Schema),
+            | Stmt::DropRole { .. }
+            | Stmt::CreatePolicy(_)
+            | Stmt::DropPolicy { .. } => Some(Self::Schema),
             Stmt::Analyze { .. }
             | Stmt::Attach { .. }
             | Stmt::Begin { .. }

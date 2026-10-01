@@ -1,16 +1,16 @@
 use crate::ast::{
     check::ColumnCount, AlterTable, AlterTableBody, As, Cmd, ColumnConstraint, ColumnDefinition,
-    CommonTableExpr, CompoundOperator, CompoundSelect, CreateTableBody, CreateTypeBody,
-    CreateVirtualTable, DeferSubclause, Distinctness, DomainConstraint, EqpFormat, Expr,
-    ForeignKeyClause, FrameBound, FrameClause, FrameExclude, FrameMode, FromClause, FunctionTail,
-    GeneratedColumnType, GroupBy, Indexed, IndexedColumn, InitDeferredPred, InsertBody,
-    JoinConstraint, JoinOperator, JoinType, JoinedSelectTable, LikeOperator, Limit, Literal,
-    Materialized, Name, NamedColumnConstraint, NamedTableConstraint, NullsOrder, OneSelect,
-    Operator, Over, PragmaBody, PragmaValue, QualifiedName, RefAct, RefArg, ResolveType,
-    ResultColumn, Select, SelectBody, SelectTable, Set, SortOrder, SortedColumn, Stmt,
-    TableConstraint, TableOptions, TransactionType, TriggerCmd, TriggerEvent, TriggerTime, Type,
-    TypeField, TypeOperator, TypeParam, TypeSize, UnaryOperator, Update, Upsert, UpsertDo,
-    UpsertIndex, Variable, Window, WindowDef, With,
+    CommonTableExpr, CompoundOperator, CompoundSelect, CreatePolicy, CreateTableBody,
+    CreateTypeBody, CreateVirtualTable, DeferSubclause, Distinctness, DomainConstraint, EqpFormat,
+    Expr, ForeignKeyClause, FrameBound, FrameClause, FrameExclude, FrameMode, FromClause,
+    FunctionTail, GeneratedColumnType, GroupBy, Indexed, IndexedColumn, InitDeferredPred,
+    InsertBody, JoinConstraint, JoinOperator, JoinType, JoinedSelectTable, LikeOperator, Limit,
+    Literal, Materialized, Name, NamedColumnConstraint, NamedTableConstraint, NullsOrder,
+    OneSelect, Operator, Over, PolicyCommand, PragmaBody, PragmaValue, QualifiedName, RefAct,
+    RefArg, ResolveType, ResultColumn, Select, SelectBody, SelectTable, Set, SortOrder,
+    SortedColumn, Stmt, TableConstraint, TableOptions, TransactionType, TriggerCmd, TriggerEvent,
+    TriggerTime, Type, TypeField, TypeOperator, TypeParam, TypeSize, UnaryOperator, Update, Upsert,
+    UpsertDo, UpsertIndex, Variable, Window, WindowDef, With,
 };
 use crate::error::Error;
 use crate::lexer::{Lexer, Token};
@@ -1080,6 +1080,9 @@ impl<'a> Parser<'a> {
                 Ok(Stmt::CreateRole {
                     role_name: self.parse_nm()?,
                 })
+            }
+            TK_ID if first_tok.to_utf8().eq_ignore_ascii_case("POLICY") => {
+                self.parse_create_policy()
             }
             _ => Err(Error::ParseError(format!(
                 "unexpected token: {}",
@@ -4312,6 +4315,12 @@ impl<'a> Parser<'a> {
         eat_assert!(self, TK_ALTER);
         eat_expect!(self, TK_TABLE);
         let tbl_name = self.parse_fullname(false)?;
+        if let Some(enable) = self.parse_row_security_change()? {
+            return Ok(Stmt::AlterTable(AlterTable {
+                name: tbl_name,
+                body: AlterTableBody::RowSecurity(enable),
+            }));
+        }
         let tok = eat_expect!(self, TK_ADD, TK_DROP, TK_RENAME, TK_ALTER);
 
         match tok.token_type {
@@ -4380,6 +4389,29 @@ impl<'a> Parser<'a> {
             }
             _ => unreachable!(),
         }
+    }
+
+    /// `ENABLE ROW LEVEL SECURITY` is `Some(true)`, `DISABLE ROW LEVEL
+    /// SECURITY` is `Some(false)`.
+    fn parse_row_security_change(&mut self) -> Result<Option<bool>> {
+        let tok = self.peek_no_eof()?;
+        if tok.token_type != TK_ID {
+            return Ok(None);
+        }
+        let enable = match tok.to_utf8().to_ascii_uppercase().as_str() {
+            "ENABLE" => true,
+            "DISABLE" => false,
+            _ => return Ok(None),
+        };
+        eat_assert!(self, TK_ID);
+        eat_expect!(self, TK_ROW);
+        for keyword in ["LEVEL", "SECURITY"] {
+            let tok = eat_expect!(self, TK_ID);
+            if !tok.to_utf8().eq_ignore_ascii_case(keyword) {
+                return Err(Error::ParseError(format!("expected {keyword}")));
+            }
+        }
+        Ok(Some(enable))
     }
 
     fn parse_create_index_using(&mut self) -> Result<Option<Name>> {
@@ -5256,6 +5288,90 @@ impl<'a> Parser<'a> {
         })
     }
 
+    fn parse_create_policy(&mut self) -> Result<Stmt> {
+        eat_assert!(self, TK_ID); // eat POLICY
+        let policy_name = self.parse_nm()?;
+        eat_expect!(self, TK_ON);
+        let tbl_name = self.parse_fullname(false)?;
+
+        let mut restrictive = false;
+        if matches!(self.peek()?, Some(t) if t.token_type == TK_AS) {
+            eat_assert!(self, TK_AS);
+            let kind = eat_expect!(self, TK_ID);
+            let kind = kind.to_utf8();
+            if kind.eq_ignore_ascii_case("RESTRICTIVE") {
+                restrictive = true;
+            } else if !kind.eq_ignore_ascii_case("PERMISSIVE") {
+                return Err(Error::ParseError(format!(
+                    "expected PERMISSIVE or RESTRICTIVE, found {kind}"
+                )));
+            }
+        }
+
+        let mut command = PolicyCommand::All;
+        if matches!(self.peek()?, Some(t) if t.token_type == TK_FOR) {
+            eat_assert!(self, TK_FOR);
+            let tok = eat_expect!(self, TK_ALL, TK_SELECT, TK_INSERT, TK_UPDATE, TK_DELETE);
+            command = match tok.token_type {
+                TK_ALL => PolicyCommand::All,
+                TK_SELECT => PolicyCommand::Select,
+                TK_INSERT => PolicyCommand::Insert,
+                TK_UPDATE => PolicyCommand::Update,
+                TK_DELETE => PolicyCommand::Delete,
+                _ => unreachable!(),
+            };
+        }
+
+        let mut roles = Vec::new();
+        let mut to_public = false;
+        if matches!(self.peek()?, Some(t) if t.token_type == TK_TO) {
+            eat_assert!(self, TK_TO);
+            loop {
+                let role = self.parse_nm()?;
+                if !role.quoted() && role.as_str().eq_ignore_ascii_case("PUBLIC") {
+                    to_public = true;
+                } else {
+                    roles.push(role);
+                }
+                if matches!(self.peek()?, Some(t) if t.token_type == TK_COMMA) {
+                    eat_assert!(self, TK_COMMA);
+                } else {
+                    break;
+                }
+            }
+        }
+        if to_public {
+            roles.clear();
+        }
+
+        let mut using_expr = None;
+        if matches!(self.peek()?, Some(t) if t.token_type == TK_USING) {
+            eat_assert!(self, TK_USING);
+            eat_expect!(self, TK_LP);
+            using_expr = Some(self.parse_expr(0)?);
+            eat_expect!(self, TK_RP);
+        }
+
+        let mut check_expr = None;
+        if matches!(self.peek()?, Some(t) if t.token_type == TK_WITH) {
+            eat_assert!(self, TK_WITH);
+            eat_expect!(self, TK_CHECK);
+            eat_expect!(self, TK_LP);
+            check_expr = Some(self.parse_expr(0)?);
+            eat_expect!(self, TK_RP);
+        }
+
+        Ok(Stmt::CreatePolicy(Box::new(CreatePolicy {
+            policy_name,
+            tbl_name,
+            restrictive,
+            command,
+            roles,
+            using_expr,
+            check_expr,
+        })))
+    }
+
     fn parse_sequence_i64(&mut self) -> Result<i64> {
         let tok = self.peek_no_eof()?;
         let sign: i64 = if tok.token_type == TK_MINUS {
@@ -5358,6 +5474,18 @@ impl<'a> Parser<'a> {
                 Ok(Stmt::DropRole {
                     if_exists,
                     role_name,
+                })
+            }
+            TK_ID if tok.to_utf8().eq_ignore_ascii_case("POLICY") => {
+                eat_assert!(self, TK_ID);
+                let if_exists = self.parse_if_exists()?;
+                let policy_name = self.parse_nm()?;
+                eat_expect!(self, TK_ON);
+                let tbl_name = self.parse_fullname(false)?;
+                Ok(Stmt::DropPolicy {
+                    if_exists,
+                    policy_name,
+                    tbl_name,
                 })
             }
             _ => Err(Error::ParseError(format!(
@@ -13498,6 +13626,34 @@ mod tests {
         }
         let cmd = Parser::new(b"SET ROLE NONE").next().unwrap().unwrap();
         assert_eq!(cmd.stmt(), &Stmt::SetRole { role_name: None });
+    }
+
+    #[test]
+    fn test_parse_policy_statements_print_back_to_same_sql() {
+        for sql in [
+            "CREATE POLICY p ON t FOR ALL USING (owner = 1)",
+            "CREATE POLICY p ON t AS RESTRICTIVE FOR UPDATE TO alice, bob USING (a = 1) WITH CHECK (b = 2)",
+            "CREATE POLICY p ON t FOR INSERT WITH CHECK (1)",
+            "DROP POLICY p ON t",
+            "DROP POLICY IF EXISTS p ON main.t",
+            "ALTER TABLE t ENABLE ROW LEVEL SECURITY",
+            "ALTER TABLE t DISABLE ROW LEVEL SECURITY",
+        ] {
+            let cmd = Parser::new(sql.as_bytes()).next().unwrap().unwrap();
+            assert_eq!(cmd.stmt().to_string(), sql);
+        }
+    }
+
+    #[test]
+    fn test_parse_create_policy_defaults_to_permissive_for_all_to_public() {
+        let sql = b"CREATE POLICY p ON t TO PUBLIC USING (1)";
+        let cmd = Parser::new(sql).next().unwrap().unwrap();
+        let Cmd::Stmt(Stmt::CreatePolicy(policy)) = cmd else {
+            panic!("expected CreatePolicy");
+        };
+        assert!(!policy.restrictive);
+        assert_eq!(policy.command, PolicyCommand::All);
+        assert!(policy.roles.is_empty());
     }
 
     #[test]
