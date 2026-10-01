@@ -4910,6 +4910,8 @@ impl Pager {
         state.result = None;
         state.mode = None;
         state.lock_source = CheckpointLockSource::Acquire;
+        drop(state);
+        *self.header_ref_state.write() = HeaderRefState::Start;
     }
 
     /// Clean up after a auto-checkpoint failure.
