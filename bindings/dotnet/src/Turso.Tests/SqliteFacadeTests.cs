@@ -390,11 +390,26 @@ public class SqliteFacadeTests
         {
             create.Open();
             create.ExecuteNonQuery("CREATE TABLE Data(Value);");
+            create.ExecuteNonQuery("PRAGMA wal_checkpoint(TRUNCATE);");
         }
+        File.Delete(path + "-wal");
 
         using var connection = new SqliteConnection($"Data Source={path};Mode=ReadWrite");
         connection.Open();
         connection.ExecuteNonQuery("INSERT INTO Data VALUES (1);").Should().Be(1);
+    }
+
+    [Test]
+    public void OpenModeReadWriteUriRequiresExistingDatabase()
+    {
+        using var directory = new TemporaryDirectory();
+        var path = Path.Combine(directory.Path, "missing-uri.db");
+        using var connection = new SqliteConnection($"Data Source=file:{path};Mode=ReadWrite");
+
+        var exception = Assert.Throws<SqliteException>(connection.Open);
+
+        exception.SqliteErrorCode.Should().Be(14);
+        File.Exists(path).Should().BeFalse();
     }
 
     [Test]

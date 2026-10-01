@@ -1081,20 +1081,21 @@ public partial class SqliteConnection : DbConnection
             return options.Cache == SqliteCacheMode.Shared && dataSource.Length > 0
                 ? GetSharedMemoryFile(dataSource)
                 : ":memory:";
-        if (dataSource.StartsWith("file:", StringComparison.OrdinalIgnoreCase))
-            return NormalizeUriDataSource(dataSource);
+        var filename = dataSource.StartsWith("file:", StringComparison.OrdinalIgnoreCase)
+            ? NormalizeUriDataSource(dataSource)
+            : dataSource;
 
         const string dataDirectory = "|DataDirectory|";
-        if (dataSource.StartsWith(dataDirectory, StringComparison.OrdinalIgnoreCase))
+        if (filename.StartsWith(dataDirectory, StringComparison.OrdinalIgnoreCase))
         {
             var baseDirectory = AppDomain.CurrentDomain.GetData("DataDirectory") as string
                                 ?? AppContext.BaseDirectory;
-            dataSource = Path.Combine(baseDirectory, dataSource[dataDirectory.Length..].TrimStart(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar));
+            filename = Path.Combine(baseDirectory, filename[dataDirectory.Length..].TrimStart(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar));
         }
 
-        var filename = Path.IsPathRooted(dataSource)
-            ? dataSource
-            : Path.Combine(AppContext.BaseDirectory, dataSource);
+        filename = Path.IsPathRooted(filename)
+            ? filename
+            : Path.Combine(AppContext.BaseDirectory, filename);
 
         if ((options.Mode == SqliteOpenMode.ReadOnly || options.Mode == SqliteOpenMode.ReadWrite) && !File.Exists(filename))
             throw new SqliteException(Properties.Resources.SqliteNativeError(SQLITE_CANTOPEN, "unable to open database file"), SQLITE_CANTOPEN);
@@ -1121,8 +1122,6 @@ public partial class SqliteConnection : DbConnection
                 throw new SqliteException(Properties.Resources.SqliteNativeError(SQLITE_ERROR, "no such access mode: " + mode), SQLITE_ERROR);
             if (mode.Equals("memory", StringComparison.OrdinalIgnoreCase))
                 return ":memory:";
-            if ((mode.Equals("ro", StringComparison.OrdinalIgnoreCase) || mode.Equals("rw", StringComparison.OrdinalIgnoreCase)) && !File.Exists(path))
-                throw new SqliteException(Properties.Resources.SqliteNativeError(SQLITE_CANTOPEN, "unable to open database file"), SQLITE_CANTOPEN);
         }
 
         return Path.IsPathRooted(path)
