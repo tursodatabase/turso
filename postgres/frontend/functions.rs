@@ -5,6 +5,9 @@ use turso_parser::ast::RefAct;
 
 const USER_TABLE_OID_START: i64 = 16384;
 
+/// The superuser every session connects as; `pg_roles` lists only this role.
+const SESSION_USER: &str = "turso";
+
 /// Resolve a PostgreSQL scalar function by name and argument count. Entry
 /// point for [`crate::catalog::PostgresDialect::resolve_function`].
 pub(crate) fn resolve_scalar(name: &str, arg_count: usize) -> bool {
@@ -23,7 +26,8 @@ pub(crate) fn resolve_scalar(name: &str, arg_count: usize) -> bool {
         "format_type" | "pg_get_constraintdef" | "pg_get_indexdef" | "obj_description" => &[1, 2],
         "pg_get_expr" => &[2, 3],
         "to_char" | "pg_input_is_valid" | "booleq" | "boolne" | "col_description" => &[2],
-        "version" | "current_database" | "current_schema" | "pg_backend_pid" => &[0],
+        "version" | "current_database" | "current_schema" | "pg_backend_pid" | "current_user"
+        | "session_user" => &[0],
         _ => return false,
     };
     arities.contains(&(arg_count as i64))
@@ -64,6 +68,11 @@ pub(crate) fn exec_scalar(conn: &Connection, name: &str, args: &[Value]) -> Resu
         // namespace, so that is always the current schema.
         "current_schema" => Ok(Value::build_text("public")),
         "pg_backend_pid" => Ok(Value::from_i64(std::process::id() as i64)),
+        "current_user" => Ok(Value::build_text(
+            conn.current_role()
+                .unwrap_or_else(|| SESSION_USER.to_string()),
+        )),
+        "session_user" => Ok(Value::build_text(SESSION_USER)),
         "quote_ident" => match args.first() {
             Some(Value::Null) | None => Ok(Value::Null),
             _ => Ok(Value::build_text(turso_pg_parser::quote_identifier(

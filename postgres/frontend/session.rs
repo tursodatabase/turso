@@ -7,9 +7,9 @@ use crate::catalog::{self, PostgresDialect};
 use turso_core::{Connection, LimboError, PrepareOptions, Result, Statement, Value};
 use turso_parser::ast::{self};
 use turso_pg_parser::translator::{
-    is_comment_on, is_refresh_matview, try_extract_copy_from, try_extract_create_schema,
-    try_extract_drop_schema, try_extract_set, try_extract_show, PgCopyFromStmt, PgCreateSchemaStmt,
-    PgDropSchemaStmt, PgSetStmt, PostgreSQLTranslator,
+    is_comment_on, is_grant_or_revoke, is_refresh_matview, is_set_role, try_extract_copy_from,
+    try_extract_create_schema, try_extract_drop_schema, try_extract_set, try_extract_show,
+    PgCopyFromStmt, PgCreateSchemaStmt, PgDropSchemaStmt, PgSetStmt, PostgreSQLTranslator,
 };
 
 use crate::copy::parse_copy_text_format;
@@ -252,6 +252,14 @@ fn try_prepare_special(pg_conn: &Arc<PgConnectionInner>, sql: &str) -> Result<Op
         Ok(result) => result,
         Err(_) => return Ok(None),
     };
+
+    if is_set_role(&parse_result) {
+        return Ok(None);
+    }
+
+    if is_grant_or_revoke(&parse_result) {
+        return Ok(Some(noop_statement(&pg_conn.conn)?));
+    }
 
     if let Some(set_stmt) = try_extract_set(&parse_result) {
         let stmt = handle_pg_set(pg_conn, &set_stmt)?;

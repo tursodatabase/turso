@@ -22,5 +22,8 @@ turso_core = { workspace = true, default-features = true, features = [
 ] }
 turso_pg = { workspace = true }
 
+[dev-dependencies]
+turso_pg_client = { workspace = true }
+
 [lints]
 workspace = true

@@ -192,7 +192,7 @@ INTEGER. Unknown type names pass through as custom types.
 | SELECT ... FOR UPDATE/SHARE | ❌ Not supported | Accepted but silently ignored — no locking happens |
 | SELECT FOR NO KEY UPDATE/SELECT FOR KEY SHARE lock modes | ❌ Not supported | Accepted but silently ignored — no locking happens |
 | SQL standard interval handling | ❌ Not supported | interval degrades to TEXT; no interval arithmetic |
-| SYSTEM_USER | ❌ Not supported | current_user/current_role return stub values |
+| SYSTEM_USER | ❌ Not supported | current_user/current_role return the role set with SET ROLE, or `turso` |
 | TABLE statement | ✅ Supported | |
 | Underscores (_) for thousands separators | ✅ Supported | |
 | unnest/array_agg | 🟡 Partial | array_agg works; unnest is not implemented |
@@ -372,7 +372,7 @@ Upgrade is not supported.
 | Default permissions | ❌ Not supported | |
 | Direct TLS negotiation ("sslnegotiation") | ❌ Not supported | |
 | FIPS mode validation | ❌ Not supported | |
-| GRANT/REVOKE ON ALL TABLES/SEQUENCES/FUNCTIONS | ❌ Not supported | GRANT/REVOKE not supported at all |
+| GRANT/REVOKE ON ALL TABLES/SEQUENCES/FUNCTIONS | ❌ Not supported | GRANT/REVOKE are accepted but ignored: privileges are not checked, so every role can read and write every table that row-level security does not restrict |
 | GSSAPI client and server-side encryption | ❌ Not supported | |
 | GSSAPI support | ❌ Not supported | |
 | Kerberos credential delegation | ❌ Not supported | |
@@ -386,8 +386,8 @@ Upgrade is not supported.
 | Per user/database connection limits | ❌ Not supported | |
 | Predefined roles | ❌ Not supported | |
 | Privileges for setting configuration parameters | ❌ Not supported | |
-| ROLES | ❌ Not supported | pg_roles exposes a single hardcoded `turso` role |
-| Row-level security | ❌ Not supported | |
+| ROLES | 🟡 Partial | `CREATE ROLE` without options, `DROP ROLE [IF EXISTS]` of one role, `SET ROLE`, `SET ROLE NONE` and `RESET ROLE`; `SET LOCAL ROLE` is rejected. Sessions connect as the superuser `turso`. A role can only read and write rows: DDL, ATTACH, VACUUM and setting parameters are denied. Roles are stored per database and are not listed in pg_roles |
+| Row-level security | 🟡 Partial | `ALTER TABLE ... ENABLE/DISABLE ROW LEVEL SECURITY`, and `CREATE/DROP POLICY` for permissive `FOR SELECT`/`FOR ALL` policies `TO PUBLIC` whose `USING` is `true`, `false` or `<column> = current_user` (also `(SELECT current_user)`). A role sees the rows any policy shows, through joins, subqueries and views. A role cannot write to tables with row-level security yet; other policy forms, FULL JOIN with such tables, tables outside `public`, and renaming them or changing their owner column are rejected. Views are checked as the querying role, not the view owner. pg_policy is empty |
 | SCRAM-SHA-256 authentication | ❌ Not supported | |
 | Search+bind mode operation for LDAP authentication | ❌ Not supported | |
 | security_barrier option on views | ❌ Not supported | |
