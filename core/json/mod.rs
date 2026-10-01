@@ -370,23 +370,20 @@ pub fn json_array_length(
     }
 
     let make_jsonb_fn = curry_convert_dbtype_to_jsonb(Conv::Strict);
-    let json = json_cache.get_or_insert_with(value, make_jsonb_fn)?;
-
-    if path.is_none() {
-        let len = json.array_len()?;
-        return Ok(Value::from_i64(len as i64));
-    }
-
-    let path = json_path_from_db_value(path.expect("We already checked none"), true)?;
-
-    if let Some(path) = path {
-        if let Ok(Some(pos)) = jsonb::find_path_element(json.as_slice(), &path) {
-            if let Ok(len) = jsonb::element_at(json.as_slice(), pos)?.array_len() {
-                return Ok(Value::from_i64(len as i64));
+    json_cache.with_jsonb(value, make_jsonb_fn, |json| {
+        let Some(path) = path else {
+            let len = json.array_len()?;
+            return Ok(Value::from_i64(len as i64));
+        };
+        if let Some(path) = json_path_from_db_value(path, true)? {
+            if let Ok(Some(pos)) = jsonb::find_path_element(json.as_slice(), &path) {
+                if let Ok(len) = jsonb::element_at(json.as_slice(), pos)?.array_len() {
+                    return Ok(Value::from_i64(len as i64));
+                }
             }
         }
-    }
-    Ok(Value::Null)
+        Ok(Value::Null)
+    })
 }
 
 pub fn json_set<I, E, V>(args: I, json_cache: &JsonCacheCell) -> crate::Result<Value>
@@ -588,25 +585,24 @@ where
         };
     }
 
-    let value =
-        json_cache.get_or_insert_with(value, curry_convert_dbtype_to_jsonb(Conv::Strict))?;
-    let mut result = Jsonb::make_empty_array(value.len())?;
-
-    for path in paths {
-        let path = json_path_from_db_value(&path, true);
-        if let Some(path) = path? {
-            match find_element(&value, &path)? {
-                Some(element) => result.append_to_array_unsafe(&element.data()),
-                None => {
-                    result.append_to_array_unsafe(JsonbHeader::make_null().into_bytes().as_bytes())
+    let convert_to_jsonb = curry_convert_dbtype_to_jsonb(Conv::Strict);
+    json_cache.with_jsonb(value, convert_to_jsonb, |value| {
+        let mut result = Jsonb::make_empty_array(value.len())?;
+        for path in paths {
+            let path = json_path_from_db_value(&path, true);
+            if let Some(path) = path? {
+                match find_element(value, &path)? {
+                    Some(element) => result.append_to_array_unsafe(&element.data()),
+                    None => result
+                        .append_to_array_unsafe(JsonbHeader::make_null().into_bytes().as_bytes()),
                 }
+            } else {
+                return Ok((null()?, ElementType::NULL));
             }
-        } else {
-            return Ok((null()?, ElementType::NULL));
         }
-    }
-    result.finalize_unsafe(ElementType::ARRAY)?;
-    Ok((result, ElementType::ARRAY))
+        result.finalize_unsafe(ElementType::ARRAY)?;
+        Ok((result, ElementType::ARRAY))
+    })
 }
 
 fn extract_path_element(
@@ -626,16 +622,16 @@ fn extract_path_element(
                 Ok(Some(jsonb::element_at(document, pos)?))
             }
             Ok(Some(_)) | Err(_) => {
-                let json = json_cache.get_or_insert_with(value, convert_to_jsonb)?;
-                find_element(&json, &path)
+                json_cache.with_jsonb(value, convert_to_jsonb, |json| find_element(json, &path))
             }
         };
     }
-    let json = json_cache.get_or_insert_with(value, convert_to_jsonb)?;
-    let Some(path) = json_path_from_db_value(path, strict_path)? else {
-        return Ok(None);
-    };
-    find_element(&json, &path)
+    json_cache.with_jsonb(value, convert_to_jsonb, |json| {
+        let Some(path) = json_path_from_db_value(path, strict_path)? else {
+            return Ok(None);
+        };
+        find_element(json, &path)
+    })
 }
 
 fn find_element(json: &Jsonb, path: &JsonPath) -> crate::Result<Option<Jsonb>> {

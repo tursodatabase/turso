@@ -43,42 +43,52 @@ impl JsonCache {
     pub fn insert(
         &mut self,
         key: impl AsValueRef,
-        value: &Jsonb,
-    ) -> std::result::Result<(), TryReserveError> {
+        value: Jsonb,
+    ) -> std::result::Result<usize, TryReserveError> {
         let key = key.as_value_ref();
-        let entry = (key.to_owned()?, value.try_clone()?);
-        if self.used < JSON_CACHE_SIZE {
-            self.entries[self.used] = Some(entry);
-            self.age[self.used] = self.counter;
-            self.counter += 1;
-            self.used += 1
+        let entry = (key.to_owned()?, value);
+        let slot = if self.used < JSON_CACHE_SIZE {
+            self.used += 1;
+            self.used - 1
         } else {
-            let id = self.find_oldest_entry();
-
-            self.entries[id] = Some(entry);
-            self.age[id] = self.counter;
-            self.counter += 1;
-        }
-        Ok(())
+            self.find_oldest_entry()
+        };
+        self.entries[slot] = Some(entry);
+        self.age[slot] = self.counter;
+        self.counter += 1;
+        Ok(slot)
     }
 
+    #[cfg(test)]
     pub fn lookup(
         &mut self,
         key: impl AsValueRef,
     ) -> std::result::Result<Option<Jsonb>, TryReserveError> {
+        match self.find(key) {
+            Some(slot) => Ok(Some(self.entry(slot).try_clone()?)),
+            None => Ok(None),
+        }
+    }
+
+    fn find(&mut self, key: impl AsValueRef) -> Option<usize> {
         let key = key.as_value_ref();
         for i in (0..self.used).rev() {
-            if let Some((stored_key, value)) = &self.entries[i] {
+            if let Some((stored_key, _)) = &self.entries[i] {
                 if key == *stored_key {
-                    let json = value.try_clone()?;
                     self.age[i] = self.counter;
                     self.counter += 1;
-
-                    return Ok(Some(json));
+                    return Some(i);
                 }
             }
         }
-        Ok(None)
+        None
+    }
+
+    fn entry(&self, slot: usize) -> &Jsonb {
+        let (_, json) = self.entries[slot]
+            .as_ref()
+            .expect("a slot returned by find or insert holds an entry");
+        json
     }
 
     pub fn clear(&mut self) {
@@ -145,31 +155,25 @@ impl JsonCacheCell {
         key: impl AsValueRef,
         value: impl FnOnce(ValueRef) -> crate::Result<Jsonb>,
     ) -> crate::Result<Jsonb> {
+        self.with_jsonb(key, value, |json| Ok(json.try_clone()?))
+    }
+
+    pub fn with_jsonb<R>(
+        &self,
+        key: impl AsValueRef,
+        value: impl FnOnce(ValueRef) -> crate::Result<Jsonb>,
+        read: impl FnOnce(&Jsonb) -> crate::Result<R>,
+    ) -> crate::Result<R> {
         let key = key.as_value_ref();
         let _guard = self.access_guard();
-        unsafe {
-            let cache_ptr = self.inner.get();
-            if (*cache_ptr).is_none() {
-                *cache_ptr = Some(JsonCache::new());
-            }
-
-            if let Some(cache) = &mut (*cache_ptr) {
-                if let Some(jsonb) = cache.lookup(key)? {
-                    Ok(jsonb)
-                } else {
-                    let result = value(key);
-                    match result {
-                        Ok(json) => {
-                            cache.insert(key, &json)?;
-                            Ok(json)
-                        }
-                        Err(e) => Err(e),
-                    }
-                }
-            } else {
-                value(key)
-            }
-        }
+        // SAFETY: the access guard asserts that no other borrow of the
+        // cache is alive, and neither closure can reach this cell.
+        let cache = unsafe { (*self.inner.get()).get_or_insert_with(JsonCache::new) };
+        let slot = match cache.find(key) {
+            Some(slot) => slot,
+            None => cache.insert(key, value(key)?)?,
+        };
+        read(cache.entry(slot))
     }
 
     pub fn clear(&mut self) {
@@ -220,7 +224,7 @@ mod tests {
 
         // Insert a value
         cache
-            .insert(&key, &value)
+            .insert(&key, value.try_clone().unwrap())
             .expect(crate::alloc::ALLOC_ERR_MSG);
 
         // Verify it was inserted
@@ -259,13 +263,13 @@ mod tests {
         let (key3, value3) = create_test_pair("{\"id\": 3}");
 
         cache
-            .insert(&key1, &value1)
+            .insert(&key1, value1.try_clone().unwrap())
             .expect(crate::alloc::ALLOC_ERR_MSG);
         cache
-            .insert(&key2, &value2)
+            .insert(&key2, value2.try_clone().unwrap())
             .expect(crate::alloc::ALLOC_ERR_MSG);
         cache
-            .insert(&key3, &value3)
+            .insert(&key3, value3.try_clone().unwrap())
             .expect(crate::alloc::ALLOC_ERR_MSG);
 
         // Verify they were all inserted
@@ -297,16 +301,16 @@ mod tests {
         let (key5, value5) = create_test_pair("{\"id\": 5}");
 
         cache
-            .insert(&key1, &value1)
+            .insert(&key1, value1.try_clone().unwrap())
             .expect(crate::alloc::ALLOC_ERR_MSG);
         cache
-            .insert(&key2, &value2)
+            .insert(&key2, value2.try_clone().unwrap())
             .expect(crate::alloc::ALLOC_ERR_MSG);
         cache
-            .insert(&key3, &value3)
+            .insert(&key3, value3.try_clone().unwrap())
             .expect(crate::alloc::ALLOC_ERR_MSG);
         cache
-            .insert(&key4, &value4)
+            .insert(&key4, value4.try_clone().unwrap())
             .expect(crate::alloc::ALLOC_ERR_MSG);
 
         // Cache is now full
@@ -317,7 +321,7 @@ mod tests {
 
         // Insert one more entry - should evict the oldest (key2)
         cache
-            .insert(&key5, &value5)
+            .insert(&key5, value5.try_clone().unwrap())
             .expect(crate::alloc::ALLOC_ERR_MSG);
 
         // Cache size should still be JSON_CACHE_SIZE
@@ -344,13 +348,13 @@ mod tests {
         let (key3, value3) = create_test_pair("{\"id\": 3}");
 
         cache
-            .insert(&key1, &value1)
+            .insert(&key1, value1.try_clone().unwrap())
             .expect(crate::alloc::ALLOC_ERR_MSG);
         cache
-            .insert(&key2, &value2)
+            .insert(&key2, value2.try_clone().unwrap())
             .expect(crate::alloc::ALLOC_ERR_MSG);
         cache
-            .insert(&key3, &value3)
+            .insert(&key3, value3.try_clone().unwrap())
             .expect(crate::alloc::ALLOC_ERR_MSG);
 
         // key1 should be the oldest
