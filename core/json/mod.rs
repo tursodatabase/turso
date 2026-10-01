@@ -17,7 +17,7 @@ use crate::{bail_constraint_error, LimboError, ValueRef};
 pub use cache::JsonCacheCell;
 use jsonb::{
     find_nul, jsonb_error_position, unescape_string, validate_jsonb, ElementType, Jsonb,
-    JsonbHeader, ParseInfo, PathOperationMode, SearchOperation, SetOperation,
+    JsonbHeader, PathOperationMode, SearchOperation, SetOperation,
 };
 use std::borrow::Cow;
 use std::fmt::Write as _;
@@ -132,17 +132,6 @@ fn parse_as_json_text(slice: &[u8], mode: Conv) -> crate::Result<Jsonb> {
     let str = std::str::from_utf8(truncated)
         .map_err(|_| LimboError::ParseError("malformed JSON".to_string()))?;
     Jsonb::from_str_with_mode(str, mode).map_err(Into::into)
-}
-
-/// Parses like [parse_as_json_text] but also reports whether the text
-/// used any JSON5-only syntax, which json_valid needs to tell strict
-/// RFC 8259 documents apart from merely parseable ones.
-fn parse_as_json_text_tracking(slice: &[u8]) -> crate::Result<(Jsonb, ParseInfo)> {
-    let zero_pos = find_nul(slice).unwrap_or(slice.len());
-    let truncated = &slice[..zero_pos];
-    let str = std::str::from_utf8(truncated)
-        .map_err(|_| LimboError::ParseError("malformed JSON".to_string()))?;
-    Jsonb::from_str_tracking(str).map_err(Into::into)
 }
 
 fn malformed_json_error(error: JsonError) -> LimboError {
@@ -990,21 +979,22 @@ pub fn is_json_valid(
         ));
     }
 
-    let text_checks = |slice: &[u8]| -> crate::Result<bool> {
+    let text_checks = |text: &str| -> crate::Result<bool> {
         // With neither text flag selected the answer is already 0.
         // SQLite does not parse at all in that case, so a huge input
         // must not turn into an out-of-memory error here either.
         if flags & (JSON_VALID_FLAG_TEXT_STRICT | JSON_VALID_FLAG_TEXT_JSON5) == 0 {
             return Ok(false);
         }
-        match parse_as_json_text_tracking(slice) {
+        let text = &text[..find_nul(text.as_bytes()).unwrap_or(text.len())];
+        match Jsonb::from_str_tracking(text) {
             Ok((_, info)) => Ok(if info.has_json5 {
                 flags & JSON_VALID_FLAG_TEXT_JSON5 != 0
             } else {
                 flags & (JSON_VALID_FLAG_TEXT_STRICT | JSON_VALID_FLAG_TEXT_JSON5) != 0
             }),
-            Err(LimboError::OutOfMemory) => Err(LimboError::OutOfMemory),
-            Err(_) => Ok(false),
+            Err(JsonError::OutOfMemory) => Err(LimboError::OutOfMemory),
+            Err(JsonError::Message { .. }) => Ok(false),
         }
     };
 
@@ -1019,10 +1009,14 @@ pub fn is_json_valid(
                 flags & JSON_VALID_FLAG_BLOB_PROBABLE != 0
                     || (flags & JSON_VALID_FLAG_BLOB_STRICT != 0 && jsonb_error_position(blob) == 0)
             } else {
-                text_checks(blob)?
+                let blob = &blob[..find_nul(blob).unwrap_or(blob.len())];
+                match std::str::from_utf8(blob) {
+                    Ok(text) => text_checks(text)?,
+                    Err(_) => false,
+                }
             }
         }
-        ValueRef::Text(text) => text_checks(text.as_str().as_bytes())?,
+        ValueRef::Text(text) => text_checks(text.as_str())?,
         ValueRef::Numeric(Numeric::Float(float)) => {
             let float: f64 = float.into();
             if float.is_infinite() {
