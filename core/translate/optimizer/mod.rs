@@ -15,7 +15,7 @@ use crate::translate::plan::{BitSet, ColumnMask, MultiIndexBranchAccess};
 use crate::translate::planner::{table_mask_from_expr, TableMask};
 use crate::{
     function::{AggFunc, Deterministic},
-    index_method::{IndexMethodCostContext, IndexMethodCostEstimate},
+    index_method::{IndexMethodAttachment, IndexMethodCostContext, IndexMethodCostEstimate},
     numeric::Numeric,
     schema::{
         BTreeCharacteristics, BTreeTable, ColDef, Column, Index, IndexColumn, Schema, Table, Type,
@@ -45,7 +45,7 @@ use crate::{
     types::SeekOp,
     util::{
         count_fts_column_args, exprs_are_equivalent, simple_bind_expr, try_capture_parameters,
-        try_capture_parameters_column_agnostic, try_substitute_parameters,
+        try_capture_parameters_column_agnostic,
     },
     vdbe::{
         affinity::Affinity,
@@ -442,6 +442,13 @@ fn try_match_index_method_pattern(
             let Some(captured) = captured else {
                 continue;
             };
+            if captured.iter().any(|(key, value)| {
+                parameters
+                    .get(key)
+                    .is_some_and(|previous| !exprs_are_equivalent(previous, value))
+            }) {
+                continue;
+            }
             parameters.extend(captured);
             where_query_covered = Some(i);
             break;
@@ -475,6 +482,7 @@ fn try_match_index_method_pattern(
 /// Build covered columns mapping from pattern columns.
 /// Returns a HashMap mapping synthetic column IDs to pattern column IDs.
 fn build_covered_columns_mapping(
+    module: &dyn IndexMethodAttachment,
     pattern_columns: &[ast::ResultColumn],
     parameters: &HashMap<i32, ast::Expr>,
 ) -> HashMap<usize, usize> {
@@ -484,7 +492,7 @@ fn build_covered_columns_mapping(
         let ast::ResultColumn::Expr(pattern_expr, _) = pattern_column else {
             continue;
         };
-        let Some(_substituted) = try_substitute_parameters(pattern_expr, parameters) else {
+        let Some(_substituted) = module.result_column(pattern_expr, parameters) else {
             continue;
         };
         covered_columns.insert(covered_column_id, pattern_column_id);
@@ -558,6 +566,7 @@ fn collect_index_method_candidates(
 
                 // Build covered columns mapping from pattern match
                 let covered_columns = build_covered_columns_mapping(
+                    module.as_ref(),
                     &pattern_match.pattern_columns,
                     &pattern_match.parameters,
                 );
@@ -1966,7 +1975,7 @@ fn optimize_table_access_with_custom_modules(
                     continue;
                 };
                 let Some(substituted) =
-                    try_substitute_parameters(pattern_expr, &pattern_match.parameters)
+                    module.result_column(pattern_expr, &pattern_match.parameters)
                 else {
                     continue;
                 };

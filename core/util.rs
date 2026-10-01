@@ -665,6 +665,8 @@ pub fn count_fts_column_args(expr: &Expr) -> usize {
     }
 }
 
+pub const FTS_FIELD_PARAMETER: i32 = i32::MAX;
+
 /// Match FTS function calls where column arguments can appear in any order.
 ///
 /// FTS functions like `fts_match(col1, col2, 'query')` should match
@@ -711,8 +713,9 @@ pub fn try_capture_parameters_column_agnostic(
         return None;
     }
 
-    // Argument counts must match
-    if pattern_args.len() != query_args.len() {
+    let suffix_len = pattern_args.len().checked_sub(num_column_args)?;
+    let query_column_count = query_args.len().checked_sub(suffix_len)?;
+    if query_column_count == 0 || query_column_count > num_column_args {
         return None;
     }
     // Distinctness must match (we don't support it)
@@ -740,12 +743,10 @@ pub fn try_capture_parameters_column_agnostic(
 
     // Split args into column args (reorderable) and remaining args (positional)
     let pattern_col_args = &pattern_args[..num_column_args];
-    let query_col_args = &query_args[..num_column_args];
+    let query_col_args = &query_args[..query_column_count];
     let pattern_rest = &pattern_args[num_column_args..];
-    let query_rest = &query_args[num_column_args..];
+    let query_rest = &query_args[query_column_count..];
 
-    // For column arguments: check that the same set of columns is used (order-independent)
-    // We use a greedy matching approach: for each query column, find a matching pattern column
     let mut matched_pattern_indices = BitSet::default();
 
     for query_col in query_col_args {
@@ -764,15 +765,21 @@ pub fn try_capture_parameters_column_agnostic(
             return None;
         }
     }
-    // All pattern columns must be matched
-    if matched_pattern_indices.count() != pattern_col_args.len() {
-        return None;
-    }
     // Remaining args must match positionally (includes the query string parameter)
     for (pattern_arg, query_arg) in pattern_rest.iter().zip(query_rest.iter()) {
         let result = try_capture_parameters(pattern_arg, query_arg)?;
         captured.extend(result);
     }
+
+    let fields = (0..num_column_args)
+        .filter(|&i| matched_pattern_indices.get(i))
+        .map(|i| i.to_string())
+        .collect::<Vec<_>>()
+        .join(",");
+    captured.insert(
+        FTS_FIELD_PARAMETER,
+        Expr::Literal(Literal::String(format!("'{fields}'"))),
+    );
 
     Some(captured)
 }

@@ -731,6 +731,7 @@ fn test_fts_insert_query(tmp_db: TempDatabase) {
             Register::Value(Value::from_i64(0)), // pattern index
             Register::Value(Value::Text(turso_core::types::Text::from("Rust"))),
             Register::Value(Value::from_i64(10)), // limit
+            Register::Value(Value::Text(turso_core::types::Text::from("0,1"))),
         ];
         assert!(run(&tmp_db, || cursor.query_start(&values)).unwrap());
 
@@ -767,6 +768,7 @@ fn test_fts_insert_query(tmp_db: TempDatabase) {
             Register::Value(Value::from_i64(0)),
             Register::Value(Value::Text(turso_core::types::Text::from("Python"))),
             Register::Value(Value::from_i64(10)),
+            Register::Value(Value::Text(turso_core::types::Text::from("0,1"))),
         ];
         assert!(run(&tmp_db, || cursor.query_start(&values)).unwrap());
 
@@ -1480,73 +1482,163 @@ fn fts_with_clause_rejects_bad_ngram_window(tmp_db: TempDatabase) {
     }
 }
 
-/// Test fts_highlight function for text highlighting
-/// Signature: fts_highlight(text1, text2, ..., before_tag, after_tag, query)
 #[cfg(all(feature = "fts", not(target_family = "wasm")))]
 #[turso_macros::test]
-fn test_fts_highlight_basic(tmp_db: TempDatabase) {
-    let _ = env_logger::try_init();
+fn test_fts_functions_require_selected_index(tmp_db: TempDatabase) {
     let conn = tmp_db.connect_limbo();
+    conn.execute("CREATE TABLE docs(id INTEGER PRIMARY KEY, body TEXT, other TEXT)")
+        .unwrap();
+    conn.execute("CREATE INDEX docs_fts ON docs USING fts(body)")
+        .unwrap();
+    conn.execute("INSERT INTO docs VALUES (1, 'quick fox', 'quick')")
+        .unwrap();
 
-    // Test basic highlighting (single text column)
+    for sql in [
+        "SELECT fts_match('salt and pepper', 'quick AND fox')",
+        "SELECT fts_score('quick fox', 'quick')",
+        "SELECT 'quick fox' MATCH 'quick'",
+        "SELECT fts_match(other, 'quick') FROM docs",
+        "SELECT fts_score(body, 'quick') FROM docs WHERE id = 1",
+        "SELECT id FROM docs WHERE fts_match(body, 'quick') ORDER BY fts_score(body, 'fox') DESC LIMIT 1",
+        "SELECT fts_match(body, 'fox') FROM docs WHERE fts_match(body, 'quick')",
+        "SELECT fts_score(body, 'fox') FROM docs WHERE fts_match(body, 'quick')",
+        "SELECT id FROM docs WHERE fts_match(body, 'quick') OR fts_match(body, 'fox')",
+    ] {
+        let error = conn.prepare(sql).expect_err(sql);
+        assert!(
+            matches!(&error, turso_core::LimboError::ParseError(_)),
+            "expected a parse error for {sql}, got {error}"
+        );
+        assert!(error.to_string().contains("FTS"), "{sql}: {error}");
+    }
+}
+
+#[cfg(all(feature = "fts", not(target_family = "wasm")))]
+#[turso_macros::test]
+fn test_fts_highlight_without_selected_index(tmp_db: TempDatabase) {
+    let conn = tmp_db.connect_limbo();
+    conn.execute("CREATE TABLE docs(id INTEGER PRIMARY KEY, body TEXT)")
+        .unwrap();
+    conn.execute("INSERT INTO docs VALUES (1, 'haystack'), (2, 'a needle in the haystack')")
+        .unwrap();
+
+    assert_eq!(
+        limbo_exec_rows(
+            &conn,
+            "SELECT fts_highlight(body, '<b>', '</b>', 'needle') FROM docs WHERE id = 2"
+        ),
+        vec![vec![rusqlite::types::Value::Text(
+            "a <b>needle</b> in the haystack".to_string()
+        )]]
+    );
+    assert_eq!(
+        limbo_exec_rows(
+            &conn,
+            "SELECT fts_highlight('quick fox', '<b>', '</b>', 'fox')"
+        ),
+        vec![vec![rusqlite::types::Value::Text(
+            "quick <b>fox</b>".to_string()
+        )]]
+    );
+}
+
+#[cfg(all(feature = "fts", not(target_family = "wasm")))]
+#[turso_macros::test]
+fn test_fts_score_uses_selected_match_index(tmp_db: TempDatabase) {
+    let conn = tmp_db.connect_limbo();
+    conn.execute("CREATE TABLE docs(id INTEGER PRIMARY KEY, body TEXT)")
+        .unwrap();
+    conn.execute("CREATE INDEX docs_fts ON docs USING fts(body)")
+        .unwrap();
+    conn.execute("INSERT INTO docs VALUES (1, 'quick'), (2, 'quick quick quick')")
+        .unwrap();
+
     let rows = limbo_exec_rows(
         &conn,
-        "SELECT fts_highlight('The quick brown fox', '<b>', '</b>', 'quick')",
+        "SELECT id, fts_score(body, 'quick') FROM docs WHERE fts_match(body, 'quick') AND id > 0 ORDER BY id",
     );
-    assert_that!(rows)
-        .column(0)
-        .single_element()
-        .is_equal_to(Cell::from("The <b>quick</b> brown fox"));
+    assert_eq!(rows.len(), 2);
+    let [rusqlite::types::Value::Real(first), rusqlite::types::Value::Real(second)] =
+        [&rows[0][1], &rows[1][1]]
+    else {
+        panic!("expected real FTS scores: {rows:?}");
+    };
+    assert!(
+        first > &0.0 && second > first,
+        "expected ranked scores: {rows:?}"
+    );
+}
 
-    // Test multiple matches
+#[cfg(all(feature = "fts", not(target_family = "wasm")))]
+#[turso_macros::test]
+fn test_fts_query_restricts_matches_to_named_field(tmp_db: TempDatabase) {
+    let conn = tmp_db.connect_limbo();
+    conn.execute("CREATE TABLE docs(id INTEGER PRIMARY KEY, title TEXT, body TEXT)")
+        .unwrap();
+    conn.execute("CREATE INDEX docs_fts ON docs USING fts(title, body)")
+        .unwrap();
+    conn.execute("INSERT INTO docs VALUES (1, 'needle', 'haystack'), (2, 'haystack', 'needle')")
+        .unwrap();
+
     let rows = limbo_exec_rows(
         &conn,
-        "SELECT fts_highlight('hello world hello', '[', ']', 'hello')",
+        "SELECT id, fts_score(body, 'needle') FROM docs \
+         WHERE fts_match(body, 'needle') ORDER BY id",
     );
-    assert_that!(rows)
-        .column(0)
-        .single_element()
-        .is_equal_to(Cell::from("[hello] world [hello]"));
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0][0], rusqlite::types::Value::Integer(2));
+    assert!(matches!(rows[0][1], rusqlite::types::Value::Real(score) if score > 0.0));
 
-    // Test case-insensitive matching (tokenizer lowercases)
+    let rows = limbo_exec_rows(&conn, "SELECT id FROM docs WHERE body MATCH 'needle'");
+    assert_eq!(rows, vec![vec![rusqlite::types::Value::Integer(2)]]);
+
     let rows = limbo_exec_rows(
         &conn,
-        "SELECT fts_highlight('Hello World', '<em>', '</em>', 'hello')",
+        "SELECT id, fts_score(body, 'needle') AS score FROM docs ORDER BY score DESC LIMIT 1",
     );
-    assert_that!(rows)
-        .column(0)
-        .single_element()
-        .is_equal_to(Cell::from("<em>Hello</em> World"));
+    assert_eq!(rows[0][0], rusqlite::types::Value::Integer(2));
 
-    // Test no matches - should return original text
     let rows = limbo_exec_rows(
         &conn,
-        "SELECT fts_highlight('The quick brown fox', '<b>', '</b>', 'zebra')",
+        "SELECT id FROM docs WHERE fts_match(title, 'needle')",
     );
-    assert_that!(rows)
-        .column(0)
-        .single_element()
-        .is_equal_to(Cell::from("The quick brown fox"));
+    assert_eq!(rows, vec![vec![rusqlite::types::Value::Integer(1)]]);
 
-    // Test empty query - should return original text
     let rows = limbo_exec_rows(
         &conn,
-        "SELECT fts_highlight('Some text here', '<b>', '</b>', '')",
+        "SELECT id FROM docs WHERE fts_match(title, body, 'needle') ORDER BY id",
     );
-    assert_that!(rows)
-        .column(0)
-        .single_element()
-        .is_equal_to(Cell::from("Some text here"));
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0][0], rusqlite::types::Value::Integer(1));
+    assert_eq!(rows[1][0], rusqlite::types::Value::Integer(2));
 
-    // Test multiple text columns
+    let error = limbo_exec_rows_fallible(
+        &tmp_db,
+        &conn,
+        "SELECT fts_score(title, body, 'needle') FROM docs WHERE fts_match(body, 'needle')",
+    )
+    .expect_err("score must use the same fields as the match predicate");
+    assert!(error.to_string().contains("selected FTS index"));
+
+    conn.execute("CREATE TABLE more(id INTEGER PRIMARY KEY, title TEXT, summary TEXT, body TEXT)")
+        .unwrap();
+    conn.execute("CREATE INDEX more_fts ON more USING fts(title, summary, body)")
+        .unwrap();
+    conn.execute(
+        "INSERT INTO more VALUES (1, 'needle', '', ''), (2, '', 'needle', ''), (3, '', '', 'needle')",
+    )
+    .unwrap();
     let rows = limbo_exec_rows(
         &conn,
-        "SELECT fts_highlight('Hello world', 'Goodbye moon', '<b>', '</b>', 'world')",
+        "SELECT id FROM more WHERE fts_match(body, title, 'needle') ORDER BY id",
     );
-    assert_that!(rows)
-        .column(0)
-        .single_element()
-        .is_equal_to(Cell::from("Hello <b>world</b> Goodbye moon"));
+    assert_eq!(
+        rows,
+        vec![
+            vec![rusqlite::types::Value::Integer(1)],
+            vec![rusqlite::types::Value::Integer(3)]
+        ]
+    );
 }
 
 /// Test fts_highlight with FTS index queries
@@ -1598,43 +1690,21 @@ fn test_fts_highlight_with_fts_query(tmp_db: TempDatabase) {
 #[cfg(all(feature = "fts", not(target_family = "wasm")))]
 #[turso_macros::test]
 fn test_fts_highlight_null_handling(tmp_db: TempDatabase) {
-    let _ = env_logger::try_init();
     let conn = tmp_db.connect_limbo();
+    conn.execute("CREATE TABLE docs(body TEXT)").unwrap();
+    conn.execute("CREATE INDEX docs_fts ON docs USING fts(body)")
+        .unwrap();
+    conn.execute("INSERT INTO docs VALUES ('some text')")
+        .unwrap();
 
-    // NULL text should skip that column (not return NULL)
-    // New behavior: NULL text columns are skipped when concatenating
-    let rows = limbo_exec_rows(
-        &conn,
-        "SELECT fts_highlight(NULL, 'some text', '<b>', '</b>', 'text')",
-    );
-    assert_that!(rows)
-        .column(0)
-        .single_element()
-        .is_equal_to(Cell::from("some <b>text</b>"));
-
-    // NULL query should return NULL
-    assert_that!(limbo_exec_rows(
-        &conn,
-        "SELECT fts_highlight('text', '<b>', '</b>', NULL)"
-    ))
-    .single_element()
-    .is_equal_to(row![NULL]);
-
-    // NULL before_tag should return NULL
-    assert_that!(limbo_exec_rows(
-        &conn,
-        "SELECT fts_highlight('text', NULL, '</b>', 'query')"
-    ))
-    .single_element()
-    .is_equal_to(row![NULL]);
-
-    // NULL after_tag should return NULL
-    assert_that!(limbo_exec_rows(
-        &conn,
-        "SELECT fts_highlight('text', '<b>', NULL, 'query')"
-    ))
-    .single_element()
-    .is_equal_to(row![NULL]);
+    for sql in [
+        "SELECT fts_highlight(body, NULL, '</b>', 'text') FROM docs WHERE fts_match(body, 'text')",
+        "SELECT fts_highlight(body, '<b>', NULL, 'text') FROM docs WHERE fts_match(body, 'text')",
+    ] {
+        assert_that!(limbo_exec_rows(&conn, sql))
+            .single_element()
+            .is_equal_to(row![NULL]);
+    }
 }
 
 /// Test field weights configuration for FTS indexes
@@ -4358,7 +4428,7 @@ fn fts_tiny_retained_cache_budget_only_affects_performance() {
     assert_eq!(
         limbo_exec_rows(
             &conn_a,
-            "SELECT id FROM docs WHERE fts_match(body, 'bravo') OR fts_match(body, 'charlie') ORDER BY id"
+            "SELECT id FROM docs WHERE fts_match(body, 'bravo') UNION SELECT id FROM docs WHERE fts_match(body, 'charlie') ORDER BY id"
         ),
         vec![
             vec![rusqlite::types::Value::Integer(2)],
