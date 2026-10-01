@@ -2591,7 +2591,11 @@ impl Program {
         state: &mut ProgramState,
         pager: &Arc<Pager>,
     ) -> Option<ProgramStep> {
-        Some(match self.abort(pager, None, state, true) {
+        let abort_result = self.abort(pager, None, state, true);
+        if state.is_active_write && !self.connection.get_auto_commit() {
+            self.rollback_current_txn(pager);
+        }
+        Some(match abort_result {
             Ok(()) => ProgramStep::Interrupt,
             Err(err) => ProgramStep::Error(err.into()),
         })
