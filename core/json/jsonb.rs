@@ -659,46 +659,6 @@ impl PathOperation for InsertOperation {
     }
 }
 
-pub struct SearchOperation {
-    value: Jsonb,
-    mode: PathOperationMode,
-}
-
-impl SearchOperation {
-    pub fn new(capacity: usize) -> std::result::Result<Self, TryReserveError> {
-        Ok(Self {
-            mode: PathOperationMode::ReplaceExisting,
-            value: Jsonb::new(capacity)?,
-        })
-    }
-
-    pub fn result(self) -> Jsonb {
-        self.value
-    }
-}
-
-impl PathOperation for SearchOperation {
-    fn operation_mode(&self) -> PathOperationMode {
-        self.mode
-    }
-
-    fn execute(&mut self, json: &mut Jsonb, mut stack: Vec<JsonTraversalResult>) -> Result<()> {
-        let target = stack.pop().ok_or_else(|| {
-            LimboError::InternalError("stack should not be empty after check".to_string())
-        })?;
-        let idx = if let Some(idx) = target.get_array_index() {
-            idx
-        } else {
-            target.field_value_index
-        };
-        let (JsonbHeader(_, size), header_size) = json.read_header(idx)?;
-        let end = json.element_end(idx, &[header_size, size])?;
-        self.value.data.extend_from_slice(&json.data[idx..end]);
-
-        Ok(())
-    }
-}
-
 impl JsonTraversalResult {
     pub fn new(field_value_index: usize, field_key_index: JsonLocationKind, delta: isize) -> Self {
         Self {
@@ -2638,6 +2598,90 @@ impl Jsonb {
         }
 
         Ok(stack)
+    }
+
+    pub fn find_path_element(&self, path: &JsonPath) -> Result<Option<usize>> {
+        let mut pos = 0;
+        for segment in path.elements.iter() {
+            let found = match segment {
+                PathElement::Root() => Some(pos),
+                PathElement::Key(key, is_raw) => self.find_object_value(pos, key, *is_raw)?,
+                PathElement::ArrayLocator(index) => self.find_array_element(pos, *index)?,
+                PathElement::BracketQuotedKey(_) => None,
+            };
+            let Some(found) = found else {
+                return Ok(None);
+            };
+            pos = found;
+        }
+        Ok(Some(pos))
+    }
+
+    pub fn element_at(&self, pos: usize) -> Result<Jsonb> {
+        let (JsonbHeader(_, size), header_size) = self.read_header(pos)?;
+        let end = self.element_end(pos, &[header_size, size])?;
+        Ok(Jsonb::from_raw_data(&self.data[pos..end])?)
+    }
+
+    fn find_object_value(
+        &self,
+        pos: usize,
+        key: &str,
+        key_is_quoted: bool,
+    ) -> Result<Option<usize>> {
+        let (JsonbHeader(element_type, size), header_size) = self.read_header(pos)?;
+        if element_type != ElementType::OBJECT {
+            return Ok(None);
+        }
+        let end = self.element_end(pos, &[header_size, size])?;
+        let mut entry = pos + header_size;
+        while entry < end {
+            let (JsonbHeader(key_type, key_len), key_header_len) = self.read_header(entry)?;
+            if !key_type.is_valid_key() {
+                bail_parse_error!("Key should be string");
+            }
+            let key_start = entry + key_header_len;
+            let entry_key = read_text_payload(&self.data, key_start, key_len)?;
+            let value = key_start + key_len;
+            if compare((entry_key, key_type), (key, key_is_quoted)) {
+                return Ok(Some(value));
+            }
+            entry = self.skip_element(value)?;
+        }
+        Ok(None)
+    }
+
+    fn find_array_element(&self, pos: usize, index: Option<i32>) -> Result<Option<usize>> {
+        let (JsonbHeader(element_type, size), header_size) = self.read_header(pos)?;
+        if element_type != ElementType::ARRAY {
+            return Ok(None);
+        }
+        let end = self.element_end(pos, &[header_size, size])?;
+        let first = pos + header_size;
+        let index = match index {
+            None => return Ok(None),
+            Some(index) if index >= 0 => index as usize,
+            Some(from_end) => {
+                let mut count = 0usize;
+                let mut element = first;
+                while element < end {
+                    element = self.skip_element(element)?;
+                    count += 1;
+                }
+                match count.checked_sub(from_end.unsigned_abs() as usize) {
+                    Some(index) => index,
+                    None => return Ok(None),
+                }
+            }
+        };
+        let mut element = first;
+        for _ in 0..index {
+            if element >= end {
+                return Ok(None);
+            }
+            element = self.skip_element(element)?;
+        }
+        Ok((element < end).then_some(element))
     }
 
     pub fn operate_on_path<T>(&mut self, path: &JsonPath, operation: &mut T) -> Result<()>
@@ -5743,26 +5787,15 @@ mod path_operations_tests {
     #[test]
     fn test_search_operation() {
         let json_str = r#"{"person": {"name": "John", "age": 30}}"#;
-        let mut jsonb = Jsonb::from_str(json_str).unwrap();
+        let jsonb = Jsonb::from_str(json_str).unwrap();
 
-        // Create a search operation
-        let mut operation = SearchOperation::new(100).unwrap();
-
-        // Create a path to the "person" property
         let path = create_path(vec![
             PathElement::Root(),
             PathElement::Key(Cow::Borrowed("person"), false),
         ]);
 
-        // Execute the operation
-        let result = jsonb.operate_on_path(&path, &mut operation);
-        assert!(result.is_ok());
-
-        // Get the search result
-        let search_result = operation.result();
-        let result_str = search_result.to_string().unwrap();
-
-        // Verify the search found the correct value
+        let pos = jsonb.find_path_element(&path).unwrap().unwrap();
+        let result_str = jsonb.element_at(pos).unwrap().to_string().unwrap();
         assert_eq!(result_str, r#"{"name":"John","age":30}"#);
     }
 
@@ -5911,7 +5944,7 @@ mod path_operations_tests {
     }
 
     /// A child element whose declared size runs past the buffer must not reach
-    /// the slice in `SearchOperation` or the `drain` in `DeleteOperation`.
+    /// the slice in `element_at` or the `drain` in `DeleteOperation`.
     ///
     /// Blob-sourced documents are validated on the way in, so no SQL input
     /// reaches these ranges today. The checks exist because the sizes are
@@ -5923,18 +5956,17 @@ mod path_operations_tests {
     fn malformed_element_size_is_rejected_before_slicing() {
         // ARRAY (type 11, inline payload size 8) whose single child is a TEXT5
         // with a 1-byte size marker declaring 200 bytes, in a 9-byte buffer.
-        let bytes = [0x8Bu8, 0xC7, 0xC8, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00];
         let path = create_path(vec![
             PathElement::Root(),
             PathElement::ArrayLocator(Some(0)),
         ]);
 
-        let mut jsonb = Jsonb {
+        let jsonb = Jsonb {
             data: crate::alloc::vec![0x8B, 0xC7, 0xC8, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00],
         };
-        let mut search = SearchOperation::new(bytes.len()).unwrap();
+        let found = jsonb.find_path_element(&path).unwrap().unwrap();
         assert!(
-            jsonb.operate_on_path(&path, &mut search).is_err(),
+            jsonb.element_at(found).is_err(),
             "oversized child size must not be sliced out of bounds"
         );
 

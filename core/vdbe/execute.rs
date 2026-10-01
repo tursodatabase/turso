@@ -10712,15 +10712,13 @@ pub fn op_function(
                             "bin_record_json_object: function arguments must be of type TEXT and BLOB correspondingly".to_string()
                         ).into());
                     };
-                    let mut columns_json_array =
-                        json::jsonb::Jsonb::from_str(columns_str.as_str())?;
+                    let columns_json_array = json::jsonb::Jsonb::from_str(columns_str.as_str())?;
                     let columns_len = columns_json_array.array_len()?;
 
                     let mut payload_iterator = ValueIterator::new(bin_record.as_slice())?;
 
                     let mut json = json::jsonb::Jsonb::make_empty_obj(columns_len)?;
                     for i in 0..columns_len {
-                        let mut op = json::jsonb::SearchOperation::new(0)?;
                         let path = json::path::JsonPath {
                             elements: vec![
                                 json::path::PathElement::Root(),
@@ -10728,8 +10726,10 @@ pub fn op_function(
                             ],
                         };
 
-                        columns_json_array.operate_on_path(&path, &mut op)?;
-                        let column_name = op.result();
+                        let Some(column_pos) = columns_json_array.find_path_element(&path)? else {
+                            return Err(LimboError::ParseError("Not found!".to_string()).into());
+                        };
+                        let column_name = columns_json_array.element_at(column_pos)?;
                         json.append_jsonb_to_end(column_name.data());
 
                         let val = match payload_iterator.next() {

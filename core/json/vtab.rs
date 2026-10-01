@@ -7,7 +7,7 @@ use turso_ext::{ConstraintOp, ConstraintUsage, ResultCode};
 use crate::{
     json::{
         convert_dbtype_to_jsonb, json_path_from_db_value,
-        jsonb::{IteratorState, Jsonb, SearchOperation},
+        jsonb::{IteratorState, Jsonb},
         path::{json_path, JsonPath, PathElement},
         vtab::columns::{Columns, Key},
         Conv,
@@ -273,7 +273,7 @@ impl InternalVirtualTableCursor for JsonEachCursor {
             }
         }
 
-        let mut jsonb = convert_dbtype_to_jsonb(&args[0], Conv::Strict)?;
+        let jsonb = convert_dbtype_to_jsonb(&args[0], Conv::Strict)?;
 
         let (path, root_json) = if args.len() == 1 {
             let path = "$";
@@ -284,7 +284,7 @@ impl InternalVirtualTableCursor for JsonEachCursor {
                     "root path should be text".to_owned(),
                 ));
             };
-            let root_json = if let Some(json) = navigate_to_path(&mut jsonb, &args[1])? {
+            let root_json = if let Some(json) = navigate_to_path(&jsonb, &args[1])? {
                 json
             } else {
                 return Ok(false);
@@ -490,18 +490,14 @@ fn json_iterator_from(json: &Jsonb) -> crate::Result<IteratorState> {
         }
     }
 }
-fn navigate_to_path(jsonb: &mut Jsonb, path: &Value) -> Result<Option<Jsonb>, LimboError> {
+fn navigate_to_path(jsonb: &Jsonb, path: &Value) -> Result<Option<Jsonb>, LimboError> {
     let json_path = json_path_from_db_value(path, true)?.ok_or_else(|| {
         LimboError::InvalidArgument(format!("path '{path}' is not a valid json path"))
     })?;
-    let mut search_operation = SearchOperation::new(jsonb.len() / 2)?;
-    if jsonb
-        .operate_on_path(&json_path, &mut search_operation)
-        .is_err()
-    {
-        return Ok(None);
+    match jsonb.find_path_element(&json_path) {
+        Ok(Some(pos)) => Ok(Some(jsonb.element_at(pos)?)),
+        Ok(None) | Err(_) => Ok(None),
     }
-    Ok(Some(search_operation.result()))
 }
 
 mod columns {

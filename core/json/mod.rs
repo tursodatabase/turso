@@ -17,7 +17,7 @@ use crate::{bail_constraint_error, LimboError, ValueRef};
 pub use cache::JsonCacheCell;
 use jsonb::{
     find_nul, jsonb_error_position, unescape_string, validate_jsonb, ElementType, Jsonb,
-    JsonbHeader, PathOperationMode, SearchOperation, SetOperation,
+    JsonbHeader, PathOperationMode, SetOperation,
 };
 use std::borrow::Cow;
 use std::fmt::Write as _;
@@ -370,7 +370,7 @@ pub fn json_array_length(
     }
 
     let make_jsonb_fn = curry_convert_dbtype_to_jsonb(Conv::Strict);
-    let mut json = json_cache.get_or_insert_with(value, make_jsonb_fn)?;
+    let json = json_cache.get_or_insert_with(value, make_jsonb_fn)?;
 
     if path.is_none() {
         let len = json.array_len()?;
@@ -380,10 +380,10 @@ pub fn json_array_length(
     let path = json_path_from_db_value(path.expect("We already checked none"), true)?;
 
     if let Some(path) = path {
-        let mut op = SearchOperation::new(json.len() / 2)?;
-        let _ = json.operate_on_path(&path, &mut op);
-        if let Ok(len) = op.result().array_len() {
-            return Ok(Value::from_i64(len as i64));
+        if let Ok(Some(pos)) = json.find_path_element(&path) {
+            if let Ok(len) = json.element_at(pos)?.array_len() {
+                return Ok(Value::from_i64(len as i64));
+            }
         }
     }
     Ok(Value::Null)
@@ -487,15 +487,11 @@ pub fn json_arrow_extract(
     }
 
     let make_jsonb_fn = curry_convert_dbtype_to_jsonb(Conv::Strict);
-    let mut json = json_cache.get_or_insert_with(value, make_jsonb_fn)?;
+    let json = json_cache.get_or_insert_with(value, make_jsonb_fn)?;
     if let Some(path) = json_path_from_db_value(&path, false)? {
-        let mut op = SearchOperation::new(json.len())?;
-        let res = json.operate_on_path(&path, &mut op);
-        let extracted = op.result();
-        if res.is_ok() {
-            Ok(Value::Text(Text::json(extracted.to_string()?)))
-        } else {
-            Ok(Value::Null)
+        match json.find_path_element(&path) {
+            Ok(Some(pos)) => Ok(Value::Text(Text::json(json.element_at(pos)?.to_string()?))),
+            Ok(None) | Err(_) => Ok(Value::Null),
         }
     } else {
         Ok(Value::Null)
@@ -514,25 +510,21 @@ pub fn json_arrow_shift_extract(
         return Ok(Value::Null);
     }
     let make_jsonb_fn = curry_convert_dbtype_to_jsonb(Conv::Strict);
-    let mut json = json_cache.get_or_insert_with(value, make_jsonb_fn)?;
+    let json = json_cache.get_or_insert_with(value, make_jsonb_fn)?;
     if let Some(path) = json_path_from_db_value(&path, false)? {
-        let mut op = SearchOperation::new(json.len())?;
-        let res = json.operate_on_path(&path, &mut op);
-        let extracted = op.result();
+        let extracted = match json.find_path_element(&path) {
+            Ok(Some(pos)) => json.element_at(pos)?,
+            Ok(None) | Err(_) => return Ok(Value::Null),
+        };
         let element_type = match extracted.element_type() {
             Err(_) => return Ok(Value::Null),
             Ok(el) => el,
         };
-
-        if res.is_ok() {
-            Ok(json_string_to_db_type(
-                extracted,
-                element_type,
-                OutputVariant::ElementTypePlain,
-            )?)
-        } else {
-            Ok(Value::Null)
-        }
+        Ok(json_string_to_db_type(
+            extracted,
+            element_type,
+            OutputVariant::ElementTypePlain,
+        )?)
     } else {
         Ok(Value::Null)
     }
@@ -607,39 +599,30 @@ where
             crate::LimboError::InternalError("paths should have one element".to_string())
         })?;
         if let Some(path) = json_path_from_db_value(&first_path, true)? {
-            let mut json = value;
-
-            let mut op = SearchOperation::new(json.len())?;
-            let res = json.operate_on_path(&path, &mut op);
-            let extracted = op.result();
+            let extracted = match value.find_path_element(&path) {
+                Ok(Some(pos)) => value.element_at(pos)?,
+                Ok(None) | Err(_) => return Ok((null, ElementType::NULL)),
+            };
             let element_type = match extracted.element_type() {
                 Err(_) => return Ok((null, ElementType::NULL)),
                 Ok(el) => el,
             };
-            if res.is_ok() {
-                return Ok((extracted, element_type));
-            } else {
-                return Ok((null, ElementType::NULL));
-            }
+            return Ok((extracted, element_type));
         } else {
             return Ok((null, ElementType::NULL));
         }
     }
 
-    let mut json = value;
-    let mut result = Jsonb::make_empty_array(json.len())?;
+    let mut result = Jsonb::make_empty_array(value.len())?;
 
-    // TODO: make an op to avoid creating new json for every path element
     for path in paths {
         let path = json_path_from_db_value(&path, true);
         if let Some(path) = path? {
-            let mut op = SearchOperation::new(json.len())?;
-            let res = json.operate_on_path(&path, &mut op);
-            let extracted = op.result();
-            if res.is_ok() {
-                result.append_to_array_unsafe(&extracted.data());
-            } else {
-                result.append_to_array_unsafe(JsonbHeader::make_null().into_bytes().as_bytes());
+            match value.find_path_element(&path) {
+                Ok(Some(pos)) => result.append_to_array_unsafe(&value.element_at(pos)?.data()),
+                Ok(None) | Err(_) => {
+                    result.append_to_array_unsafe(JsonbHeader::make_null().into_bytes().as_bytes())
+                }
             }
         } else {
             return Ok((null, ElementType::NULL));
