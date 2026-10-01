@@ -3606,7 +3606,7 @@ impl Connection {
                         let mv_store = journal_mode::open_mv_store(
                             init.db.io.clone(),
                             &init.db.path,
-                            init.db.open_flags,
+                            init.db.open_flags | OpenFlags::Create,
                             init.db.durable_storage.clone(),
                             enc_ctx,
                             init.db.allocators.mv_store.clone(),

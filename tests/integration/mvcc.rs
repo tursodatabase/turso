@@ -25,6 +25,45 @@ fn create_mvcc_db(io: &Arc<dyn turso_core::io::IO + Send>, path: &Path) -> anyho
     Ok(())
 }
 
+#[test]
+fn writable_must_exist_database_can_create_mvcc_log() -> anyhow::Result<()> {
+    let directory = tempfile::TempDir::new()?;
+    let path = directory.path().join("must-exist-mvcc.db");
+    let path_str = path.to_str().unwrap();
+    let io = Arc::new(turso_core::PlatformIO::new()?);
+    {
+        let db = Database::open_file_with_flags(
+            io.clone(),
+            path_str,
+            OpenFlags::Create,
+            DatabaseOpts::new(),
+            None,
+            Arc::new(SqliteDialect),
+        )?;
+        let conn = db.connect()?;
+        conn.execute("CREATE TABLE data(value)")?;
+        conn.close()?;
+    }
+
+    let log_path = path.with_extension("db-log");
+    assert!(!log_path.exists());
+    let db = Database::open_file_with_flags(
+        io,
+        path_str,
+        OpenFlags::None,
+        DatabaseOpts::new(),
+        None,
+        Arc::new(SqliteDialect),
+    )?;
+    let conn = db.connect()?;
+
+    conn.pragma_update("journal_mode", "'mvcc'")?;
+
+    assert!(log_path.exists());
+    conn.close()?;
+    Ok(())
+}
+
 /// A minimal DurableStorage wrapper that delegates to the built-in implementation,
 /// but records that it was used. This validates per-database injection via
 /// `Database::open` with `OpenOptions::durable_storage`.
