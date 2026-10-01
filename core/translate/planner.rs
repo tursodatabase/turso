@@ -1846,6 +1846,9 @@ fn parse_table(
         let alias = maybe_alias.map(|a| normalize_ident(a.name().as_str()));
         let internal_id = program.table_reference_counter.next();
         let tbl_ref = if let Table::Virtual(tbl) = table.as_ref() {
+            if program.trigger.is_some() && !tbl.innocuous {
+                crate::bail_parse_error!("unsafe use of virtual table \"{}\"", tbl.name);
+            }
             transform_args_into_where_terms(args, internal_id, vtab_predicates, table.as_ref())?;
             Table::Virtual(tbl.clone())
         } else if let Table::BTree(table) = table.as_ref() {
