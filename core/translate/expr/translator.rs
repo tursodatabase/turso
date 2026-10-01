@@ -665,7 +665,9 @@ fn translate_case_expr(
     // case statement we're processing.
     let base_reg = base.as_ref().map(|_| program.alloc_register());
     let expr_reg = program.alloc_register();
+    let mut base_collation_ctx = None;
     if let Some(base_expr) = base {
+        program.reset_collation();
         translate_expr(
             program,
             referenced_tables,
@@ -673,8 +675,12 @@ fn translate_case_expr(
             base_reg.unwrap(),
             resolver,
         )?;
+        base_collation_ctx = program.curr_collation_ctx();
     };
     for (when_expr, then_expr) in when_then_pairs {
+        if base_reg.is_some() {
+            program.reset_collation();
+        }
         translate_expr_no_constant_opt(
             program,
             referenced_tables,
@@ -691,7 +697,11 @@ fn translate_case_expr(
                 target_pc: next_case_label,
                 // A NULL result is considered untrue when evaluating WHEN terms.
                 flags: CmpInsFlags::default().jump_if_null(),
-                collation: program.curr_collation(),
+                collation: combine_operand_collations(
+                    base_collation_ctx,
+                    program.curr_collation_ctx(),
+                )
+                .map(|(collation, _)| collation),
             }),
             // CASE WHEN 0 THEN 0 ELSE 1 becomes ifnot 0 branch to next clause
             None => program.emit_insn(Insn::IfNot {
