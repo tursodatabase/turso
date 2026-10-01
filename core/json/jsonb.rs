@@ -1751,7 +1751,51 @@ impl Jsonb {
         }
     }
 
+    #[cfg_attr(not(debug_assertions), inline(always))]
     fn deserialize_string(
+        &mut self,
+        input: &[u8],
+        pos: usize,
+        info: &mut ParseInfo,
+    ) -> PResult<usize> {
+        if input.get(pos) == Some(&b'"') {
+            let start = pos + 1;
+            let end = find_string_special_byte(input, start, b'"');
+            if end < input.len() && input[end] == b'"' {
+                self.push_text_header(end - start)
+                    .map_err(|_| PError::Message {
+                        msg: "Failed to write header".to_string(),
+                        location: Some(start),
+                    })?;
+                self.data.extend_from_slice(&input[start..end]);
+                return Ok(end + 1);
+            }
+        }
+        self.deserialize_escaped_or_json5_string(input, pos, info)
+    }
+
+    #[cfg_attr(not(debug_assertions), inline(always))]
+    fn push_text_header(&mut self, len: usize) -> Result<()> {
+        let text = ElementType::TEXT as u8;
+        match len {
+            0..=11 => self.data.push(text | ((len as u8) << 4)),
+            12..=0xFF => self
+                .data
+                .extend_from_slice(&[text | (SIZE_MARKER_8BIT << 4), len as u8]),
+            0x100..=0xFFFF => {
+                let [high, low] = (len as u16).to_be_bytes();
+                self.data
+                    .extend_from_slice(&[text | (SIZE_MARKER_16BIT << 4), high, low]);
+            }
+            _ => {
+                self.write_element_header(self.data.len(), ElementType::TEXT, len, false)?;
+            }
+        }
+        Ok(())
+    }
+
+    #[inline(never)]
+    fn deserialize_escaped_or_json5_string(
         &mut self,
         input: &[u8],
         mut pos: usize,
