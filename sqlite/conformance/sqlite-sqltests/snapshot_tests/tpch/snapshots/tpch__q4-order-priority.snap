@@ -33,7 +33,7 @@ info:
 ---
 QUERY PLAN
 |--SCAN orders
-|--SEARCH lineitem USING INDEX sqlite_autoindex_lineitem_1 (l_orderkey=?)
+|--SEARCH lineitem USING INDEX sqlite_autoindex_LINEITEM_1 (l_orderkey=?)
 `--USE SORTER FOR GROUP BY
 
 BYTECODE
@@ -46,7 +46,7 @@ addr  opcode                    p1  p2  p3  p4                                  
    5          Gosub             12  53   0                                          0  ; go to clear accumulator subroutine
    6          OpenRead           2   9   0  k(9,B,B,B,B,B,B,B,B,B)                  0  table=orders, root=9, iDb=0
    7          OpenRead           3  10   0  k(17,B,B,B,B,B,B,B,B,B,B,B,B,B,B,B,B)   0  table=lineitem, root=10, iDb=0
-   8          OpenRead           4  11   0  k(3,B,B)                                0  index=sqlite_autoindex_lineitem_1, root=11, iDb=0
+   8          OpenRead           4  11   0  k(3,B,B)                                0  index=sqlite_autoindex_LINEITEM_1, root=11, iDb=0
    9          Rewind             2  27   0                                          0  Rewind table orders
   10            Column           2   4  14                                          0  r[14]=orders.O_ORDERDATE
   11            Lt              14  15  26  Binary                                  0  if r[14]<r[15] goto 26

@@ -869,7 +869,7 @@ mod tests {
         assert_eq!(rows.len(), 1);
         assert_eq!(
             rows[0][0].to_string().trim_matches('\''),
-            "strict: CREATE TABLE u (x INTEGER)"
+            "strict: CREATE TABLE \"u\" (x INTEGER)"
         );
         conn.execute("INSERT INTO u VALUES (1)").unwrap();
         conn.close().unwrap();

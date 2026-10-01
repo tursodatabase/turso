@@ -54,7 +54,7 @@ QUERY PLAN
 |  |--MATERIALIZE hash build input for partsupp
 |  |  |--LIST SUBQUERY 2
 |  |  |  `--SCAN part
-|  |  `--SEARCH partsupp USING INDEX sqlite_autoindex_partsupp_1 (ps_partkey=?)
+|  |  `--SEARCH partsupp USING INDEX sqlite_autoindex_PARTSUPP_1 (ps_partkey=?)
 |  |--LIST SUBQUERY 3
 |  |  `--SCAN part
 |  |--HASH JOIN lineitem
@@ -81,7 +81,7 @@ addr  opcode                        p1   p2   p3  p4                            
   13              IdxInsert          0    6    0                                               8  key=r[6]
   14            Next                 3    8    0                                               1
   15            OpenRead             4    6    0  k(6,B,B,B,B,B)                               0  table=partsupp, root=6, iDb=0
-  16            OpenRead             5    7    0  k(3,B,B)                                     0  index=sqlite_autoindex_partsupp_1, root=7, iDb=0
+  16            OpenRead             5    7    0  k(3,B,B)                                     0  index=sqlite_autoindex_PARTSUPP_1, root=7, iDb=0
   17            NullRow              0    0    0                                               0  Set cursor 0 to a (pseudo) NULL row
   18            Rewind               0   51    0                                               0  Rewind  ephemeral(ephemeral_index_where_sub_t5)
   19              Column             0    0   13                                               0  r[13]=ephemeral(ephemeral_index_where_sub_t5).P_PARTKEY
@@ -90,7 +90,7 @@ addr  opcode                        p1   p2   p3  p4                            
   22                IdxGT            5   50   13                                               0  key=[13..13]
   23                DeferredSeek     5    4    0                                               0
   24                Integer          0   14    0                                               0  r[14]=0
-  25                Column           5    0   15                                               0  r[15]=sqlite_autoindex_partsupp_1.ps_partkey
+  25                Column           5    0   15                                               0  r[15]=sqlite_autoindex_PARTSUPP_1.ps_partkey
   26                IsNull          15   30    0                                               0  if (r[15]==NULL) goto 30
   27                Affinity        15    1    0                                               0  r[15..16] = C
   28                NotFound         0   30   15                                               0  if not found goto 30
@@ -107,8 +107,8 @@ addr  opcode                        p1   p2   p3  p4                            
   39                Goto             0   41    0                                               0
   40                Null             0   14    0                                               0  r[14]=NULL
   41                IfNot           14   49    1                                               0  if !r[14] goto 49
-  42                ColumnRange      5    0    7  2                                            0  r[7..8]=sqlite_autoindex_partsupp_1.ps_partkey..ps_suppkey
-  43                ColumnRange      5    0    9  2                                            0  r[9..10]=sqlite_autoindex_partsupp_1.ps_partkey..ps_suppkey
+  42                ColumnRange      5    0    7  2                                            0  r[7..8]=sqlite_autoindex_PARTSUPP_1.ps_partkey..ps_suppkey
+  43                ColumnRange      5    0    9  2                                            0  r[9..10]=sqlite_autoindex_PARTSUPP_1.ps_partkey..ps_suppkey
   44                Column           4    2   11                                               0  r[11]=partsupp.PS_AVAILQTY
   45                RowId            4   12    0                                               0  r[12]=partsupp.rowid
   46                MakeRecord       7    6   17                                               0  r[17]=mkrec(r[7..12]); for hash_build_input_t9
