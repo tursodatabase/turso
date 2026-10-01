@@ -139,6 +139,7 @@ extern "C" {
     );
     fn sqlite3_busy_timeout(db: *mut sqlite3, ms: i32) -> i32;
     fn sqlite3_interrupt(db: *mut sqlite3);
+    fn turso_set_query_timeout(db: *mut sqlite3, milliseconds: u64) -> i32;
     fn sqlite3_get_table(
         db: *mut sqlite3,
         sql: *const libc::c_char,
@@ -2871,6 +2872,77 @@ mod tests {
                 matches!(finalize_rc, SQLITE_OK | SQLITE_INTERRUPT),
                 "unexpected finalize rc: {finalize_rc}"
             );
+            assert_eq!(sqlite3_close(db), SQLITE_OK);
+        }
+    }
+
+    #[test]
+    fn test_turso_query_timeout_interrupts_cpu_bound_statement() {
+        unsafe {
+            let mut db: *mut sqlite3 = ptr::null_mut();
+            assert_eq!(sqlite3_open(c":memory:".as_ptr(), &mut db), SQLITE_OK);
+            assert_eq!(
+                sqlite3_exec(
+                    db,
+                    c"CREATE TABLE numbers(v INTEGER); CREATE TABLE output(v INTEGER); INSERT INTO numbers(v) VALUES (0),(1),(2),(3),(4),(5),(6),(7),(8),(9);".as_ptr(),
+                    None,
+                    ptr::null_mut(),
+                    ptr::null_mut(),
+                ),
+                SQLITE_OK
+            );
+            assert_eq!(turso_set_query_timeout(db, 10), SQLITE_OK);
+
+            let mut stmt: *mut sqlite3_stmt = ptr::null_mut();
+            assert_eq!(
+                sqlite3_prepare_v2(
+                    db,
+                    c"INSERT INTO output SELECT a.v FROM numbers AS a, numbers AS b, numbers AS c, numbers AS d, numbers AS e, numbers AS f, numbers AS g, numbers AS h".as_ptr(),
+                    -1,
+                    &mut stmt,
+                    ptr::null_mut(),
+                ),
+                SQLITE_OK
+            );
+            assert_eq!(sqlite3_step(stmt), SQLITE_INTERRUPT);
+            assert!(matches!(
+                sqlite3_finalize(stmt),
+                SQLITE_OK | SQLITE_INTERRUPT
+            ));
+            assert_eq!(sqlite3_close(db), SQLITE_OK);
+        }
+    }
+
+    #[test]
+    fn test_sqlite3_exec_dml_can_be_interrupted() {
+        unsafe {
+            let mut db: *mut sqlite3 = ptr::null_mut();
+            assert_eq!(sqlite3_open(c":memory:".as_ptr(), &mut db), SQLITE_OK);
+            assert_eq!(
+                sqlite3_exec(
+                    db,
+                    c"CREATE TABLE numbers(v INTEGER); CREATE TABLE output(v INTEGER); INSERT INTO numbers(v) VALUES (0),(1),(2),(3),(4),(5),(6),(7),(8),(9);".as_ptr(),
+                    None,
+                    ptr::null_mut(),
+                    ptr::null_mut(),
+                ),
+                SQLITE_OK
+            );
+
+            let db_addr = db as usize;
+            let interrupter = std::thread::spawn(move || {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+                sqlite3_interrupt(db_addr as *mut sqlite3);
+            });
+            let rc = sqlite3_exec(
+                db,
+                c"INSERT INTO output SELECT a.v FROM numbers AS a, numbers AS b, numbers AS c, numbers AS d, numbers AS e, numbers AS f, numbers AS g, numbers AS h".as_ptr(),
+                None,
+                ptr::null_mut(),
+                ptr::null_mut(),
+            );
+            interrupter.join().unwrap();
+            assert_eq!(rc, SQLITE_INTERRUPT, "expected SQLITE_INTERRUPT, got {rc}");
             assert_eq!(sqlite3_close(db), SQLITE_OK);
         }
     }

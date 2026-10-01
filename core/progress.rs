@@ -1,7 +1,8 @@
 use crate::sync::{atomic::AtomicU64, RwLock};
 use std::sync::atomic::Ordering;
+use std::sync::Arc;
 
-pub(crate) type ProgressHandlerCallback = Box<dyn Fn() -> bool + Send + Sync>;
+pub(crate) type ProgressHandlerCallback = Arc<dyn Fn() -> bool + Send + Sync>;
 
 /// Connection-scoped progress callback state.
 ///
@@ -65,8 +66,8 @@ impl ProgressHandler {
         if ops == 0 || prev_steps / ops == vm_steps / ops {
             return false;
         }
-        let callback = self.callback.read();
-        match callback.as_ref() {
+        let callback = self.callback.read().as_ref().cloned();
+        match callback {
             Some(callback) => callback(),
             None => false,
         }
@@ -95,7 +96,7 @@ mod tests {
         let callback_calls = Arc::clone(&calls);
         handler.set(
             3,
-            Some(Box::new(move || {
+            Some(Arc::new(move || {
                 callback_calls.fetch_add(1, Ordering::SeqCst);
                 false
             })),
@@ -116,7 +117,7 @@ mod tests {
     #[test]
     fn handler_can_request_interrupt() {
         let handler = ProgressHandler::new();
-        handler.set(2, Some(Box::new(|| true)));
+        handler.set(2, Some(Arc::new(|| true)));
 
         assert!(!handler.should_interrupt(0, 1));
         assert!(handler.should_interrupt(1, 2));
@@ -129,7 +130,7 @@ mod tests {
         let callback_calls = Arc::clone(&calls);
         handler.set(
             1,
-            Some(Box::new(move || {
+            Some(Arc::new(move || {
                 callback_calls.fetch_add(1, Ordering::SeqCst);
                 true
             })),
@@ -140,5 +141,21 @@ mod tests {
         handler.set(0, None);
         assert!(!handler.should_interrupt(1, 2));
         assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn callback_can_replace_handler() {
+        let handler = Arc::new(ProgressHandler::new());
+        let weak_handler = Arc::downgrade(&handler);
+        handler.set(
+            1,
+            Some(Arc::new(move || {
+                weak_handler.upgrade().unwrap().set(0, None);
+                false
+            })),
+        );
+
+        assert!(!handler.should_interrupt(0, 1));
+        assert!(!handler.is_enabled());
     }
 }
