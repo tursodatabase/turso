@@ -63,11 +63,8 @@ impl<A: ConcurrentAllocator> Debug for CursorPosition<A> {
 
 #[derive(Debug, Clone, Copy)]
 enum ExistsState {
-    /// Last B-tree row, to set the NotExists skip bound.
     SeekBtreeLast,
-    /// Read that row's rowid.
     ReadBtreeLast,
-    /// Search the B-tree for the key.
     ExistsBtree,
 }
 
