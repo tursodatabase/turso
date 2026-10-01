@@ -1808,39 +1808,22 @@ impl Jsonb {
         let mut len = 0;
 
         if quoted {
-            // Try to find the closing quote and check for simple string
-            let mut end_pos = pos;
-            let is_simple = true;
-
-            while end_pos < input.len() {
-                let c = input[end_pos];
-                if c == quote {
-                    // Found end of string - check if it's simple
-                    if is_simple {
-                        let len = end_pos - pos;
-                        let header_pos = self.data.len();
-
-                        // Write header and content
-                        if len <= 11 {
-                            self.data
-                                .push((ElementType::TEXT as u8) | ((len as u8) << 4));
-                        } else {
-                            self.write_element_header(header_pos, ElementType::TEXT, len, false)
-                                .map_err(|_| PError::Message {
-                                    msg: "Failed to write header".to_string(),
-                                    location: Some(pos),
-                                })?;
-                        }
-
-                        self.data.extend_from_slice(&input[pos..end_pos]);
-                        return Ok(end_pos + 1); // Skip past closing quote
-                    }
-                    break;
-                } else if c == b'\\' || c < 32 {
-                    // Not a simple string
-                    break;
+            let end_pos = find_string_special_byte(input, pos, quote);
+            if end_pos < input.len() && input[end_pos] == quote {
+                let len = end_pos - pos;
+                let header_pos = self.data.len();
+                if len <= 11 {
+                    self.data
+                        .push((ElementType::TEXT as u8) | ((len as u8) << 4));
+                } else {
+                    self.write_element_header(header_pos, ElementType::TEXT, len, false)
+                        .map_err(|_| PError::Message {
+                            msg: "Failed to write header".to_string(),
+                            location: Some(pos),
+                        })?;
                 }
-                end_pos += 1;
+                self.data.extend_from_slice(&input[pos..end_pos]);
+                return Ok(end_pos + 1);
             }
         }
 
@@ -1891,6 +1874,15 @@ impl Jsonb {
         let mut closed = false;
 
         while pos < input.len() {
+            if quoted {
+                let run_end = find_string_special_byte(input, pos, quote);
+                self.data.extend_from_slice(&input[pos..run_end]);
+                len += run_end - pos;
+                pos = run_end;
+                if pos == input.len() {
+                    break;
+                }
+            }
             let c = input[pos];
             pos += 1;
 
@@ -4277,6 +4269,35 @@ fn json5_whitespace_len(input: &[u8]) -> usize {
     }
 }
 
+#[inline(always)]
+fn find_string_special_byte(input: &[u8], mut pos: usize, quote: u8) -> usize {
+    const ONES: u64 = u64::from_ne_bytes([0x01; 8]);
+    const HIGH_BITS: u64 = u64::from_ne_bytes([0x80; 8]);
+    let quotes = ONES * quote as u64;
+    let backslashes = ONES * b'\\' as u64;
+    while let Some(chunk) = input.get(pos..pos + 8) {
+        let word = u64::from_le_bytes(chunk.try_into().expect("chunk has 8 bytes"));
+        let quote_bytes = word ^ quotes;
+        let backslash_bytes = word ^ backslashes;
+        let matches = (quote_bytes.wrapping_sub(ONES) & !quote_bytes)
+            | (backslash_bytes.wrapping_sub(ONES) & !backslash_bytes)
+            | (word.wrapping_sub(ONES * 0x20) & !word);
+        let matches = matches & HIGH_BITS;
+        if matches != 0 {
+            return pos + (matches.trailing_zeros() / 8) as usize;
+        }
+        pos += 8;
+    }
+    while pos < input.len() {
+        let c = input[pos];
+        if c == quote || c == b'\\' || c < 0x20 {
+            return pos;
+        }
+        pos += 1;
+    }
+    pos
+}
+
 /// The common case is no whitespace at all, so the check for it must
 /// inline into the deserializers the way the pre-tracking
 /// implementation did: an outlined call here costs more than the
@@ -4381,6 +4402,41 @@ mod tests {
     fn parse_has_json5(input: &str) -> bool {
         let (_, info) = Jsonb::from_str_tracking(input).unwrap();
         info.has_json5
+    }
+
+    #[test]
+    fn string_scan_stops_at_the_same_byte_as_a_byte_by_byte_scan() {
+        let mut state = 0x9E37_79B9_7F4A_7C15u64;
+        let mut next_byte = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state as u8
+        };
+        let special = [b'"', b'\'', b'\\', 0x00, 0x1F, 0x20, 0x7F, 0x80, 0xFF];
+        for len in 0..40 {
+            for _ in 0..100 {
+                let input: Vec<u8> = (0..len)
+                    .map(|_| match next_byte() {
+                        r @ 0..16 => special[r as usize % special.len()],
+                        r @ 16..64 => 0x80 | r,
+                        r => b'a' + r % 26,
+                    })
+                    .collect();
+                for quote in [b'"', b'\''] {
+                    for start in 0..=len {
+                        let expected = (start..len)
+                            .find(|&i| input[i] == quote || input[i] == b'\\' || input[i] < 0x20)
+                            .unwrap_or(len);
+                        assert_eq!(
+                            find_string_special_byte(&input, start, quote),
+                            expected,
+                            "input {input:?}, start {start}, quote {quote}"
+                        );
+                    }
+                }
+            }
+        }
     }
 
     #[test]
