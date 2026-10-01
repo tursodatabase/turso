@@ -6,6 +6,7 @@ use super::plan::{
 use crate::schema::Table;
 use crate::stack::trace_stack;
 use crate::sync::Arc;
+use crate::translate::access_control;
 use crate::translate::collate::CollationSeq;
 use crate::translate::emitter::{OperationMode, Resolver};
 use crate::translate::expr::{
@@ -334,6 +335,11 @@ fn prepare_one_select_plan(
                     &mut vtab_predicates,
                     &mut table_references,
                     connection,
+                )?;
+                access_control::add_select_row_security_filters(
+                    &mut table_references,
+                    &mut where_predicates,
+                    resolver,
                 )?;
             }
 
