@@ -2225,12 +2225,13 @@ pub fn translate_alter_table(
             // Update view SQL for renamed columns
             for (view_database_id, view_name, new_sql) in views_to_rewrite {
                 let escaped_sql = escape_sql_string_literal(&new_sql);
+                let escaped_view_name = escape_sql_string_literal(&view_name);
                 let view_schema_table = schema_table_name_for_db(resolver, view_database_id);
                 let update_stmt = format!(
                     r#"
                         UPDATE {view_schema_table}
                         SET sql = '{escaped_sql}'
-                        WHERE name = '{view_name}' COLLATE NOCASE AND type = 'view'
+                        WHERE name = '{escaped_view_name}' COLLATE NOCASE AND type = 'view'
                     "#,
                 );
 
