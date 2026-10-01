@@ -5,9 +5,7 @@ use crate::mvcc::yield_points::{FailureInjector, YieldInjector};
 use crate::statement::StatementOrigin;
 use crate::storage::{journal_mode, pager::SavepointResult};
 use crate::sync::{
-    atomic::{
-        AtomicBool, AtomicI32, AtomicI64, AtomicIsize, AtomicU16, AtomicU64, AtomicU8, Ordering,
-    },
+    atomic::{AtomicBool, AtomicI32, AtomicI64, AtomicIsize, AtomicU64, AtomicU8, Ordering},
     Arc, Mutex, RwLock,
 };
 use crate::types::IOResultOr;
@@ -404,9 +402,6 @@ pub struct Connection {
     pub(crate) syms: parking_lot::RwLock<SymbolTable>,
     pub(super) _shared_cache: bool,
     pub(super) cache_size: AtomicI32,
-    /// page size used for an uninitialized database or the next vacuum command.
-    /// it's not always equal to the current page size of the database
-    pub(super) page_size: AtomicU16,
     /// Allowed automatic WAL maintenance actions for this connection.
     /// Stored as the `bits()` of a `WalAutoActions`. Default is
     /// `WalAutoActions::all_enabled()`. `wal_auto_actions_disable` clears
@@ -2744,8 +2739,7 @@ impl Connection {
         self.cdc_transaction_id.store(id, Ordering::SeqCst);
     }
     pub fn get_page_size(&self) -> PageSize {
-        let value = self.page_size.load(Ordering::SeqCst);
-        PageSize::new_from_header_u16(value).unwrap_or_default()
+        self.pager.load().get_page_size_unchecked()
     }
 
     pub fn is_closed(&self) -> bool {
@@ -2794,9 +2788,6 @@ impl Connection {
 
         let pager = self.get_pager_from_database_index(&database_id)?;
         pager.set_initial_page_size(size)?;
-        if database_id == MAIN_DB_ID {
-            self.page_size.store(size.get_raw(), Ordering::SeqCst);
-        }
         // MvStore caches a copy of the database header in `global_header`, captured from the
         // pager during bootstrap (before any PRAGMA page_size can run). Propagate the new
         // page size so subsequent transactions and any header lookups see the same value the

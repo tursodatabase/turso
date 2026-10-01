@@ -10611,7 +10611,9 @@ mod tests {
         },
         schema::IndexColumn,
         storage::{
-            database::DatabaseFile, page_cache::PageCache, pager::default_page1,
+            database::DatabaseFile,
+            page_cache::PageCache,
+            pager::{default_page1, SharedPagerState},
             sqlite3_ondisk::PageSize,
         },
         types::Text,
@@ -10619,7 +10621,6 @@ mod tests {
         BufferPool, Completion, Connection, IOContext, StepResult, Wal, WalAutoActions, WalFile,
         WalFileShared,
     };
-    use arc_swap::ArcSwapOption;
     use std::{
         mem::transmute,
         ops::Deref,
@@ -12725,7 +12726,7 @@ mod tests {
         ));
 
         // For new empty databases, init_page_1 must be Some(page) so allocate_page1() can be called
-        let init_page_1 = Arc::new(ArcSwapOption::new(Some(default_page1(None))));
+        let shared = Arc::new(SharedPagerState::new(Some(default_page1(None))));
         let pager = Arc::new(
             Pager::new(
                 db_file,
@@ -12733,27 +12734,20 @@ mod tests {
                 io,
                 PageCache::new(10),
                 buffer_pool,
-                Arc::new(crate::sync::Mutex::new(())),
-                init_page_1,
+                shared,
             )
             .unwrap(),
         );
 
         pager.io.step().unwrap();
 
+        pager
+            .set_initial_page_size(PageSize::new(page_size as u32).unwrap())
+            .unwrap();
         let _ = run_until_done(|| pager.allocate_page1(), &pager);
         for _ in 0..(database_size - 1) {
             let _res = pager.allocate_page().unwrap();
         }
-
-        pager
-            .io
-            .block(|| {
-                pager.with_header_mut(|header| {
-                    header.page_size = PageSize::new(page_size as u32).unwrap()
-                })
-            })
-            .unwrap();
 
         pager
     }

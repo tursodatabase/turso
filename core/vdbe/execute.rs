@@ -24,7 +24,9 @@ use crate::storage::btree::{
 use crate::storage::database::DatabaseFile;
 use crate::storage::journal_mode;
 use crate::storage::page_cache::PageCache;
-use crate::storage::pager::{default_page1, CreateBTreeFlags, PageRef, SavepointResult};
+use crate::storage::pager::{
+    default_page1, CreateBTreeFlags, PageRef, SavepointResult, SharedPagerState,
+};
 use crate::storage::sqlite3_ondisk::{DatabaseHeader, PageSize, RawVersion};
 use crate::translate::collate::CollationSeq;
 use crate::types::IOResultOr;
@@ -160,7 +162,7 @@ use super::{
     },
     CommitState,
 };
-use crate::sync::{Mutex, RwLock};
+use crate::sync::RwLock;
 use turso_parser::ast::{self, ForeignKeyClause, Name, QualifiedName, ResolveType};
 use turso_parser::parser::Parser;
 
@@ -16217,21 +16219,16 @@ pub fn op_open_ephemeral(
 
             let buffer_pool = program.connection.db.buffer_pool.clone();
 
-            // Ephemeral databases always start empty, so create their own init_page_1
-            let ephemeral_init_page_1 =
-                Arc::new(arc_swap::ArcSwapOption::new(Some(default_page1(None))));
-
             let pager = Arc::new(Pager::new(
                 db_file,
                 None,
                 db_file_io,
                 PageCache::default(),
                 buffer_pool,
-                Arc::new(Mutex::new(())),
-                ephemeral_init_page_1,
+                Arc::new(SharedPagerState::new(Some(default_page1(None)))),
             )?);
 
-            pager.set_page_size(page_size);
+            pager.set_initial_page_size(page_size)?;
 
             *state.active_op_state.open_ephemeral() = OpOpenEphemeralState::StartingTxn {
                 pager,
