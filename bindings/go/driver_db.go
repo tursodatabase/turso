@@ -160,8 +160,9 @@ func (c *tursoDbConnection) PrepareContext(ctx context.Context, query string) (d
 	}
 	// determine number of inputs and then finalize immediately to avoid keeping state
 	num := int(turso_statement_parameters_count(stmt))
-	_ = turso_statement_finalize(stmt)
-	turso_statement_deinit(stmt)
+	if err := c.finishStatement(stmt); err != nil {
+		return nil, err
+	}
 
 	return &tursoDbStatement{
 		conn:      c,
@@ -248,16 +249,16 @@ func (c *tursoDbConnection) ExecContext(ctx context.Context, query string, args 
 		// Bind only for the first statement
 		if first {
 			if err := bindArgs(stmt, args); err != nil {
-				_ = turso_statement_finalize(stmt)
-				turso_statement_deinit(stmt)
+				_ = c.finishStatement(stmt)
 				return nil, err
 			}
 		}
 		// Execute statement fully
 		affected, err := c.executeFully(ctx, stmt)
 		// finalize and deinit regardless of status
-		_ = turso_statement_finalize(stmt)
-		turso_statement_deinit(stmt)
+		if finishErr := c.finishStatement(stmt); err == nil {
+			err = finishErr
+		}
 		if err != nil {
 			return nil, err
 		}
@@ -292,8 +293,7 @@ func (c *tursoDbConnection) QueryContext(ctx context.Context, query string, args
 		return nil, err
 	}
 	if err := bindArgs(stmt, args); err != nil {
-		_ = turso_statement_finalize(stmt)
-		turso_statement_deinit(stmt)
+		_ = c.finishStatement(stmt)
 		return nil, err
 	}
 	// Return rows wrapper; do not step yet, leave cursor before first row
@@ -504,9 +504,7 @@ func (r *tursoDbRows) Close() error {
 		return nil
 	}
 	r.closed = true
-	_ = turso_statement_finalize(r.stmt)
-	turso_statement_deinit(r.stmt)
-	return nil
+	return r.conn.finishStatement(r.stmt)
 }
 
 func (r *tursoDbRows) Next(dest []driver.Value) error {
@@ -728,6 +726,29 @@ func (c *tursoDbConnection) executeFully(ctx context.Context, stmt TursoStatemen
 			// and loop again
 		default:
 			return 0, statusToError(status, "")
+		}
+	}
+}
+
+// finishStatement finalizes a statement, running it to completion if it was left mid-execution, and frees it.
+// A statement that fails on the way to completion is reported as an error, not as a success.
+func (c *tursoDbConnection) finishStatement(stmt TursoStatement) error {
+	defer turso_statement_deinit(stmt)
+	for {
+		status, err := turso_statement_finalize(stmt)
+		if err != nil {
+			return err
+		}
+		if status != TURSO_IO {
+			return nil
+		}
+		if c.extraIo != nil {
+			if err := c.extraIo(); err != nil {
+				return err
+			}
+		}
+		if err := turso_statement_run_io(stmt); err != nil {
+			return err
 		}
 	}
 }

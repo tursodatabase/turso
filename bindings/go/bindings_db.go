@@ -534,15 +534,18 @@ func turso_statement_reset(self TursoStatement) error {
 	return statusToError(TursoStatusCode(status), msg)
 }
 
-// turso_statement_finalize finalizes a statement.
-func turso_statement_finalize(self TursoStatement) error {
+// turso_statement_finalize runs a statement that is still executing to completion and finalizes it.
+// Returns DONE when finalization completed, IO when an IO iteration is needed before calling it again, or an error.
+func turso_statement_finalize(self TursoStatement) (TursoStatusCode, error) {
 	var errPtr *byte
 	status := c_turso_statement_finalize(self, &errPtr)
-	if status == int32(TURSO_OK) {
-		return nil
+	switch TursoStatusCode(status) {
+	case TURSO_DONE, TURSO_IO:
+		return TursoStatusCode(status), nil
+	default:
+		msg := decodeAndFreeCString(errPtr)
+		return TursoStatusCode(status), statusToError(TursoStatusCode(status), msg)
 	}
-	msg := decodeAndFreeCString(errPtr)
-	return statusToError(TursoStatusCode(status), msg)
 }
 
 // turso_statement_n_change returns amount of row modifications (insert/delete operations) made by the most recent executed statement.
