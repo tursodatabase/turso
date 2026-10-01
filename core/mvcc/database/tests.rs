@@ -7056,9 +7056,8 @@ fn exists_skips_the_btree_for_a_rowid_above_the_allocator_max() {
     )
     .unwrap();
 
-    // Seeds from btree max (5); 100 cannot be there, so no ExistsBtreeFallback.
     assert_eq!(probe_exists(&db, &mut cursor, 100), (false, false));
-    assert_eq!(allocator.max_rowid(), Some(5));
+    assert_eq!(allocator.max_rowid(), None);
     assert_eq!(probe_exists(&db, &mut cursor, 3), (false, true));
     assert!(probe_exists(&db, &mut cursor, 5).0);
 
@@ -7072,6 +7071,58 @@ fn exists_skips_the_btree_for_a_rowid_above_the_allocator_max() {
 
     db.mvcc_store
         .rollback_tx(tx_id, db.conn.pager.load().clone(), db.conn.as_ref(), 0);
+}
+
+#[test]
+fn notexists_does_not_raise_the_next_automatic_rowid_past_a_deleted_tail() {
+    let mut db = MvccTestDbNoConn::new_with_random_db();
+    {
+        let conn = db.connect();
+        conn.execute("CREATE TABLE t(x INTEGER PRIMARY KEY, v TEXT)")
+            .unwrap();
+        conn.execute("INSERT INTO t VALUES (1, 'a'), (2, 'b'), (100, 'c')")
+            .unwrap();
+        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+        conn.close().unwrap();
+    }
+    db.restart();
+    let conn = db.connect();
+    conn.execute("DELETE FROM t WHERE x = 100").unwrap();
+
+    let dup = conn.execute("INSERT INTO t VALUES (2, 'dup')");
+    assert!(dup.is_err(), "rowid 2 must still be taken");
+
+    conn.execute("INSERT INTO t(v) VALUES ('auto')").unwrap();
+    let rows = get_rows(&conn, "SELECT x, v FROM t ORDER BY x");
+    assert_eq!(
+        rows,
+        vec![
+            vec![Value::from_i64(1), Value::from_text("a")],
+            vec![Value::from_i64(2), Value::from_text("b")],
+            vec![Value::from_i64(3), Value::from_text("auto")],
+        ]
+    );
+}
+
+#[test]
+fn new_rowid_reuses_the_gap_after_a_deleted_uncheckpointed_tail() {
+    let mut db = MvccTestDbNoConn::new_with_random_db();
+    {
+        let conn = db.connect();
+        conn.execute("CREATE TABLE t(x INTEGER PRIMARY KEY, v TEXT)")
+            .unwrap();
+        conn.execute("INSERT INTO t VALUES (1, 'a'), (2, 'b'), (100, 'c')")
+            .unwrap();
+        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+        conn.close().unwrap();
+    }
+    db.restart();
+    let conn = db.connect();
+    conn.execute("DELETE FROM t WHERE x = 100").unwrap();
+    conn.execute("INSERT INTO t(v) VALUES ('auto')").unwrap();
+    let rows = get_rows(&conn, "SELECT x FROM t ORDER BY x");
+    let ids: Vec<i64> = rows.iter().map(|r| r[0].as_int().unwrap()).collect();
+    assert_eq!(ids, vec![1, 2, 3], "got {ids:?}");
 }
 
 #[test]
@@ -24055,9 +24106,9 @@ fn step_until_busy_then_release(
     }
 }
 
-/// Non-positive rowids must still search the B-tree: the allocator's 0
-/// sentinel is not a bound, so recovery can leave a committed rowid above
-/// a non-positive max.
+/// Non-positive rowids never take the skip. Recovery can leave a committed
+/// rowid above a non-positive physical last, and the store last can sit
+/// above that last, so the skip bound is not a safe ceiling here.
 #[test]
 fn notexists_descends_the_btree_for_non_positive_rowids() {
     let db = MvccTestDbNoConn::new_with_random_db();
@@ -24088,7 +24139,6 @@ fn notexists_descends_the_btree_for_non_positive_rowids() {
     .unwrap();
     let conn = db2.connect(ConnectOpts::new()).unwrap();
 
-    // INSERT (-3) seeds from btree last (-5), below the replayed -1.
     conn.execute("INSERT INTO t VALUES (-3, 'c')").unwrap();
     conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
 
