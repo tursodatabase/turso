@@ -1818,28 +1818,21 @@ impl Jsonb {
         }
         pos += 1; // consume quote
 
-        let quoted = quote == b'"' || quote == b'\'';
-        let mut len = 0;
-
-        if quoted {
-            let end_pos = find_string_special_byte(input, pos, quote);
-            if end_pos < input.len() && input[end_pos] == quote {
-                let len = end_pos - pos;
-                let header_pos = self.data.len();
-                if len <= 11 {
-                    self.data
-                        .push((ElementType::TEXT as u8) | ((len as u8) << 4));
-                } else {
-                    self.write_element_header(header_pos, ElementType::TEXT, len, false)
-                        .map_err(|_| PError::Message {
-                            msg: "Failed to write header".to_string(),
-                            location: Some(pos),
-                        })?;
-                }
-                self.data.extend_from_slice(&input[pos..end_pos]);
-                return Ok(end_pos + 1);
+        if quote == b'"' || quote == b'\'' {
+            let (end, element_type) = scan_quoted_string(input, pos, quote)?;
+            if element_type == ElementType::TEXT5 {
+                info.has_json5 = true;
             }
+            self.push_element_header(element_type, end - pos)
+                .map_err(|_| PError::Message {
+                    msg: "Failed to write header".to_string(),
+                    location: Some(pos),
+                })?;
+            self.data.extend_from_slice(&input[pos..end]);
+            return Ok(end + 1);
         }
+
+        let mut len = 0;
 
         // Write placeholder header to be updated later
         self.write_element_header(string_start, ElementType::TEXT, 0, false)
@@ -1857,53 +1850,38 @@ impl Jsonb {
 
         let mut element_type = ElementType::TEXT;
 
-        // Special case for unquoted JSON5 keys (identifiers)
-        if !quoted {
-            if quote == b'\\' && input.get(pos) == Some(&b'u') {
-                // The key starts with a \uXXXX escape, which SQLite
-                // accepts no matter what it decodes to. Rewind one byte
-                // so the escape handling below consumes it.
-                pos -= 1;
-            } else if !is_json5_id_char(quote, true) {
-                return Err(PError::Message {
-                    msg: "Invalid character in unquoted object key".to_string(),
-                    location: Some(pos),
-                });
-            } else {
-                self.data.push(quote);
-                len += 1;
-            }
+        // Unquoted JSON5 keys (identifiers)
+        if quote == b'\\' && input.get(pos) == Some(&b'u') {
+            // The key starts with a \uXXXX escape, which SQLite
+            // accepts no matter what it decodes to. Rewind one byte
+            // so the escape handling below consumes it.
+            pos -= 1;
+        } else if !is_json5_id_char(quote, true) {
+            return Err(PError::Message {
+                msg: "Invalid character in unquoted object key".to_string(),
+                location: Some(pos),
+            });
+        } else {
+            self.data.push(quote);
+            len += 1;
+        }
 
-            if len > 0 && pos < input.len() && input[pos] == b':' {
-                self.write_element_header(string_start, element_type, len, false)
-                    .map_err(|_| PError::Message {
-                        msg: "Failed to write header".to_string(),
-                        location: Some(pos),
-                    })?;
-                return Ok(pos);
-            }
+        if len > 0 && pos < input.len() && input[pos] == b':' {
+            self.write_element_header(string_start, element_type, len, false)
+                .map_err(|_| PError::Message {
+                    msg: "Failed to write header".to_string(),
+                    location: Some(pos),
+                })?;
+            return Ok(pos);
         }
 
         let mut escape_buffer = [0u8; 6]; // Buffer for escape sequences
-        let mut closed = false;
 
         while pos < input.len() {
-            if quoted {
-                let run_end = find_string_special_byte(input, pos, quote);
-                self.data.extend_from_slice(&input[pos..run_end]);
-                len += run_end - pos;
-                pos = run_end;
-                if pos == input.len() {
-                    break;
-                }
-            }
             let c = input[pos];
             pos += 1;
 
-            if quoted && c == quote {
-                closed = true;
-                break; // End of string
-            } else if !quoted && (c == b'"' || c == b'\'') {
+            if c == b'"' || c == b'\'' {
                 return Err(PError::Message {
                     msg: "Unexpected input".to_string(),
                     location: Some(pos),
@@ -1921,7 +1899,7 @@ impl Jsonb {
                 pos += 1;
 
                 // SQLite allows only \uXXXX escapes in unquoted keys.
-                if !quoted && esc != b'u' {
+                if esc != b'u' {
                     return Err(PError::Message {
                         msg: "Invalid character in unquoted object key".to_string(),
                         location: Some(pos),
@@ -2085,40 +2063,25 @@ impl Jsonb {
                         });
                     }
                 }
-            } else if !quoted
-                && (c == b':'
-                    || c.is_ascii_whitespace()
-                    || (c == b'/' && matches!(input.get(pos), Some(b'/' | b'*'))))
+            } else if c == b':'
+                || c.is_ascii_whitespace()
+                || (c == b'/' && matches!(input.get(pos), Some(b'/' | b'*')))
             {
                 // End of unquoted identifier. A comment right after the
                 // key acts as whitespace, so its opening '/' ends the
                 // key and the whitespace skipping before ':' eats it.
                 pos -= 1; // Put back the terminating character
                 break;
-            } else if !quoted && !is_json5_id_char(c, false) {
+            } else if !is_json5_id_char(c, false) {
                 return Err(PError::Message {
                     msg: "Invalid character in unquoted object key".to_string(),
                     location: Some(pos),
                 });
-            } else if c <= 0x1F {
-                // Control character
-                element_type = ElementType::TEXT5;
-                self.data.push(c);
-                len += 1;
             } else {
                 // Normal character
                 self.data.push(c);
                 len += 1;
             }
-        }
-
-        // A quoted string must end with its closing quote before the
-        // input runs out.
-        if quoted && !closed {
-            return Err(PError::Message {
-                msg: "Unexpected end of input".to_string(),
-                location: Some(pos),
-            });
         }
 
         if matches!(element_type, ElementType::TEXT5) {
@@ -4408,6 +4371,93 @@ fn json5_whitespace_len(input: &[u8]) -> usize {
         [0xe3, 0x80, 0x80, ..] => 3,
         [0xef, 0xbb, 0xbf, ..] => 3,
         _ => 0,
+    }
+}
+
+fn scan_quoted_string(input: &[u8], mut pos: usize, quote: u8) -> PResult<(usize, ElementType)> {
+    let unexpected_end = |pos: usize| PError::Message {
+        msg: "Unexpected end of input".to_string(),
+        location: Some(pos),
+    };
+    let mut element_type = ElementType::TEXT;
+    loop {
+        pos = find_string_special_byte(input, pos, quote);
+        let Some(&c) = input.get(pos) else {
+            return Err(unexpected_end(pos));
+        };
+        if c == quote {
+            return Ok((pos, element_type));
+        }
+        pos += 1;
+        if c != b'\\' {
+            element_type = ElementType::TEXT5;
+            continue;
+        }
+        let Some(&escape) = input.get(pos) else {
+            return Err(unexpected_end(pos));
+        };
+        pos += 1;
+        match escape {
+            b'b' | b'f' | b'n' | b'r' | b't' | b'\\' | b'"' | b'/' => {
+                if element_type == ElementType::TEXT {
+                    element_type = ElementType::TEXTJ;
+                }
+            }
+            b'u' => {
+                if pos + 4 > input.len() {
+                    return Err(PError::Message {
+                        msg: "Incomplete unicode escape sequence".to_string(),
+                        location: Some(pos),
+                    });
+                }
+                if !input[pos..pos + 4].iter().all(|&h| is_hex_digit(h)) {
+                    return Err(PError::Message {
+                        msg: "Invalid unicode escape sequence".to_string(),
+                        location: Some(pos),
+                    });
+                }
+                pos += 4;
+                if element_type == ElementType::TEXT {
+                    element_type = ElementType::TEXTJ;
+                }
+            }
+            b'\n' | b'\'' | b'0' | b'v' => element_type = ElementType::TEXT5,
+            b'\r' => {
+                if input.get(pos) == Some(&b'\n') {
+                    pos += 1;
+                }
+                element_type = ElementType::TEXT5;
+            }
+            0xe2 if pos + 1 < input.len()
+                && input[pos] == 0x80
+                && (input[pos + 1] == 0xa8 || input[pos + 1] == 0xa9) =>
+            {
+                pos += 2;
+                element_type = ElementType::TEXT5;
+            }
+            b'x' => {
+                if pos + 2 > input.len() {
+                    return Err(PError::Message {
+                        msg: "Incopmlete hex escape sequence".to_string(),
+                        location: Some(pos),
+                    });
+                }
+                if !input[pos..pos + 2].iter().all(|&h| is_hex_digit(h)) {
+                    return Err(PError::Message {
+                        msg: "Invalid hex escape sequence".to_string(),
+                        location: Some(pos),
+                    });
+                }
+                pos += 2;
+                element_type = ElementType::TEXT5;
+            }
+            _ => {
+                return Err(PError::Message {
+                    msg: "Invalid escape sequence".to_string(),
+                    location: Some(pos),
+                });
+            }
+        }
     }
 }
 
