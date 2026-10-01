@@ -20,6 +20,7 @@ use crate::{
         RESERVED_TABLE_PREFIXES,
     },
     translate::{
+        access_control,
         emitter::{emit_check_constraints, gencol::compute_virtual_columns, Resolver},
         expr::{translate_expr, walk_expr, walk_expr_mut, WalkControl},
         plan::{ColumnMask, ColumnUsedMask, OuterQueryReference, TableReferences},
@@ -1554,13 +1555,22 @@ pub fn translate_alter_table(
                 },
             )?
         }
-        ast::AlterTableBody::RowSecurity(_) => {
-            return Err(LimboError::ParseError(
-                "ALTER TABLE ... ROW LEVEL SECURITY is not supported".to_string(),
-            ));
+        ast::AlterTableBody::RowSecurity(enable) => {
+            access_control::translate_row_security_change(
+                &qualified_name,
+                database_id,
+                enable,
+                resolver,
+                program,
+            )?;
         }
         ast::AlterTableBody::RenameTo(new_name) => {
             reject_dependent_materialized_views(resolver, database_id, table_name)?;
+            access_control::reject_rename_of_table_with_row_security(
+                table_name,
+                database_id,
+                resolver,
+            )?;
             let new_name = new_name.as_str();
             let normalized_old_name = normalize_ident(table_name);
             let normalized_new_name = normalize_ident(new_name);

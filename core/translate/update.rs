@@ -1,4 +1,5 @@
 use crate::sync::Arc;
+use crate::translate::access_control;
 use rustc_hash::FxHashMap as HashMap;
 
 use crate::schema::{EXPR_INDEX_SENTINEL, ROWID_SENTINEL};
@@ -260,6 +261,7 @@ fn prepare_update_plan(
     if table.btree().is_some_and(|bt| !bt.has_rowid) {
         bail_parse_error!("UPDATE of WITHOUT ROWID tables is not supported");
     }
+    access_control::reject_write_with_row_security(target_name.as_str(), database_id, resolver)?;
     let schema_cookie = resolver.with_schema(database_id, |s| s.schema_version);
     program.begin_write_on_database(database_id, schema_cookie)?;
     validate_update(
@@ -303,6 +305,7 @@ fn prepare_update_plan(
         &mut from_tables,
         connection,
     )?;
+    access_control::add_select_row_security_filters(&mut from_tables, &mut where_clause, resolver)?;
 
     // SQLite rejects UPDATE FROM when a NATURAL JOIN (or explicit USING) introduces
     // a column name that already appears in another FROM-side table without being

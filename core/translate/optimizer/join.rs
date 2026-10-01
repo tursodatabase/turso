@@ -812,7 +812,9 @@ fn join_lhs_and_rhs<'a>(
             let allow_hash_join = !rhs_has_selective_seek
                 && !probe_table_is_prior_build
                 && (!build_has_prior_constraints || build_has_rowid)
-                && !chaining_across_outer;
+                && !chaining_across_outer
+                && !table_references.is_row_security_filtered(build_table.internal_id)
+                && !table_references.is_row_security_filtered(rhs_table_reference.internal_id);
 
             tracing::debug!(
                 lhs_table = build_table.table.get_name(),

@@ -1,4 +1,5 @@
 use crate::schema::ColumnLayout;
+use crate::translate::access_control;
 use crate::translate::emitter::{emit_index_column_value_old_image, gencol};
 use crate::turso_debug_assert;
 use crate::{
@@ -303,6 +304,7 @@ pub fn translate_insert(
             crate::util::table_name_for_error(&tbl_name)
         );
     };
+    access_control::reject_write_with_row_security(&btree_table.name, database_id, resolver)?;
 
     let BoundInsertResult {
         mut values,

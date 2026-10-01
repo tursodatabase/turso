@@ -8,10 +8,11 @@ use crate::{
         ACCESS_CONTROL_TABLE_SQL,
     },
     bail_parse_error,
-    schema::BTreeTable,
+    schema::{BTreeTable, Table},
     storage::pager::CreateBTreeFlags,
     translate::{
         emitter::Resolver,
+        plan::{TableReferences, WhereTerm},
         schema::{emit_schema_entry, SchemaEntryType, SQLITE_TABLEID},
     },
     util::normalize_ident,
@@ -72,6 +73,164 @@ pub fn translate_set_role(
         role: role_name.map(|name| normalize_ident(name.as_str())),
     });
     Ok(())
+}
+
+pub fn translate_row_security_change(
+    tbl_name: &ast::QualifiedName,
+    database_id: usize,
+    enable: bool,
+    resolver: &Resolver,
+    program: &mut ProgramBuilder,
+) -> Result<()> {
+    if database_id != MAIN_DB_ID {
+        bail_parse_error!("row-level security is only supported for tables in the main database");
+    }
+    let table = normalize_ident(tbl_name.name.as_str());
+    if catalog(resolver).has_row_security(&table) == enable {
+        return Ok(());
+    }
+    let rows = AccessControlRows::open(resolver, program)?;
+    if enable {
+        rows.emit_insert(program, &["row_security", "", &table, "", ""]);
+    } else {
+        rows.emit_delete(program, &[("row_security", 0), (&table, 2)]);
+    }
+    emit_catalog_update(
+        program,
+        resolver,
+        AccessControlChange::SetRowSecurity {
+            table,
+            enabled: enable,
+        },
+    );
+    Ok(())
+}
+
+/// DROP TABLE removes the table's row-level security.
+pub fn emit_drop_table_access_control_cleanup(
+    table_name: &str,
+    database_id: usize,
+    resolver: &Resolver,
+    program: &mut ProgramBuilder,
+) -> Result<()> {
+    if database_id != MAIN_DB_ID || !catalog(resolver).has_row_security(table_name) {
+        return Ok(());
+    }
+    let table = normalize_ident(table_name);
+    let rows = AccessControlRows::open(resolver, program)?;
+    rows.emit_delete(program, &[("row_security", 0), (&table, 2)]);
+    emit_catalog_update(program, resolver, AccessControlChange::DropTable(table));
+    Ok(())
+}
+
+pub fn reject_rename_of_table_with_row_security(
+    table_name: &str,
+    database_id: usize,
+    resolver: &Resolver,
+) -> Result<()> {
+    if database_id == MAIN_DB_ID && catalog(resolver).has_row_security(table_name) {
+        bail_parse_error!(
+            "cannot rename table \"{table_name}\": renaming tables with row-level security is not supported"
+        );
+    }
+    Ok(())
+}
+
+/// A role sees no rows of a table with row-level security: every such table
+/// in the FROM clause gets a filter that is always false. For the right side
+/// of an outer join the filter is part of the join condition, so the hidden
+/// rows produce NULLs like rows that do not exist. The tables are recorded
+/// so the optimizer does not choose access methods that evaluate the query's
+/// expressions on a row before its filter.
+pub fn add_select_row_security_filters(
+    table_references: &mut TableReferences,
+    where_clause: &mut Vec<WhereTerm>,
+    resolver: &Resolver,
+) -> Result<()> {
+    let mut filters = Vec::new();
+    let mut filtered_tables = Vec::new();
+    for table in table_references.joined_tables() {
+        let Table::BTree(btree) = &table.table else {
+            continue;
+        };
+        if !row_security_applies(&btree.name, table.database_id, resolver)? {
+            continue;
+        }
+        if table_references
+            .joined_tables()
+            .iter()
+            .any(|table| table.join_info.as_ref().is_some_and(|j| j.is_full_outer()))
+        {
+            bail_parse_error!(
+                "FULL JOIN with table \"{}\" that has row-level security is not supported",
+                btree.name
+            );
+        }
+        filtered_tables.push(table.internal_id);
+        filters.push(WhereTerm {
+            expr: ast::Expr::Literal(ast::Literal::Numeric("0".to_string())),
+            from_outer_join: table
+                .join_info
+                .as_ref()
+                .is_some_and(|join_info| join_info.is_outer())
+                .then_some(table.internal_id),
+            consumed: false,
+        });
+    }
+    for internal_id in filtered_tables {
+        table_references.mark_row_security_filtered(internal_id);
+    }
+    where_clause.splice(0..0, filters);
+    Ok(())
+}
+
+/// A role cannot write to a table with row-level security yet.
+pub fn reject_write_with_row_security(
+    table_name: &str,
+    database_id: usize,
+    resolver: &Resolver,
+) -> Result<()> {
+    if row_security_applies(table_name, database_id, resolver)? {
+        bail_parse_error!(
+            "writing to table \"{table_name}\" with row-level security is not supported for roles"
+        );
+    }
+    Ok(())
+}
+
+/// Virtual tables that read the database file directly would show the rows
+/// row-level security hides.
+pub fn reject_raw_storage_for_roles(table_name: &str, resolver: &Resolver) -> Result<()> {
+    if resolver.role.is_some()
+        && ["sqlite_dbpage", "btree_dump"]
+            .iter()
+            .any(|name| name.eq_ignore_ascii_case(table_name))
+    {
+        bail_parse_error!("permission denied: {table_name} requires the superuser");
+    }
+    Ok(())
+}
+
+/// Whether row-level security restricts what the statement being compiled
+/// may do with `table_name`. The catalog only covers the main database, so
+/// tables of attached databases that have their own catalog are rejected
+/// instead of being treated as unprotected.
+fn row_security_applies(table_name: &str, database_id: usize, resolver: &Resolver) -> Result<bool> {
+    if resolver.role.is_none() {
+        return Ok(false);
+    }
+    if database_id != MAIN_DB_ID {
+        let has_catalog = resolver.with_schema(database_id, |schema| {
+            schema.get_btree_table(ACCESS_CONTROL_TABLE_NAME).is_some()
+        });
+        if has_catalog {
+            bail_parse_error!(
+                "table \"{table_name}\" is in an attached database with access control, which is not supported"
+            );
+        }
+        return Ok(false);
+    }
+    Ok(catalog(resolver).has_row_security(table_name))
 }
 
 /// A connection acting as a role may only read and write rows. Everything

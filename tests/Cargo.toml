@@ -61,8 +61,9 @@ turso_macros.workspace = true
 crossbeam-epoch = "0.9.18"
 
 [features]
-default = ["test_helper", "fts", "io_uring"]
+default = ["test_helper", "fts", "io_uring", "cli_only"]
 checksum = ["turso_core/checksum"]
+cli_only = ["turso_core/cli_only"]
 test_helper = ["turso_core/test_helper"]
 fts = ["turso_core/fts"]
 io_memory_yield = ["turso_core/io_memory_yield"]

@@ -1883,6 +1883,12 @@ pub fn translate_drop_table(
     {
         emit_fk_drop_table_check(program, resolver, name, connection, database_id)?;
     }
+    crate::translate::access_control::emit_drop_table_access_control_cleanup(
+        name,
+        database_id,
+        resolver,
+        program,
+    )?;
     let cdc_table = prepare_cdc_if_necessary(program, resolver.schema(), Some(SQLITE_TABLEID))?;
 
     let null_reg = program.alloc_register(); //  r1

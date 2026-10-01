@@ -1021,6 +1021,9 @@ fn find_best_access_method_for_btree(
             );
         }
 
+        if table_references.is_row_security_filtered(rhs_table.internal_id) {
+            return Ok(Some(best_access_method));
+        }
         if let Some(multi_idx_method) = consider_multi_index_union(
             rhs_table,
             where_clause,

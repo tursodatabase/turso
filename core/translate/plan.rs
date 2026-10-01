@@ -1333,6 +1333,8 @@ pub struct TableReferences {
     /// Set when a RIGHT JOIN is rewritten as LEFT JOIN by swapping the two tables,
     /// so `select_star` emits columns in the original user-visible order.
     right_join_swapped: bool,
+    /// Tables whose rows a row-level security filter hides from the role.
+    row_security_filtered: Vec<TableInternalId>,
 }
 
 impl Default for TableReferences {
@@ -1355,6 +1357,7 @@ impl TableReferences {
             joined_tables,
             outer_query_refs,
             right_join_swapped: false,
+            row_security_filtered: Vec::new(),
         }
     }
 
@@ -1363,6 +1366,7 @@ impl TableReferences {
             joined_tables: Vec::new(),
             outer_query_refs: Vec::new(),
             right_join_swapped: false,
+            row_security_filtered: Vec::new(),
         }
     }
 
@@ -1373,6 +1377,19 @@ impl TableReferences {
     /// Mark that tables were swapped for a RIGHT-to-LEFT JOIN rewrite.
     pub const fn set_right_join_swapped(&mut self) {
         self.right_join_swapped = true;
+    }
+
+    /// Records that a row-level security filter hides rows of the table.
+    pub fn mark_row_security_filtered(&mut self, internal_id: TableInternalId) {
+        self.row_security_filtered.push(internal_id);
+    }
+
+    /// Whether a row-level security filter hides rows of the table. Access
+    /// methods that evaluate the query's expressions on a row before the
+    /// table's WHERE terms, such as hash joins and multi-index scans, must
+    /// not be used for such a table.
+    pub fn is_row_security_filtered(&self, internal_id: TableInternalId) -> bool {
+        self.row_security_filtered.contains(&internal_id)
     }
 
     /// Whether tables were swapped for a RIGHT JOIN rewrite.
@@ -1690,7 +1707,9 @@ impl TableReferences {
             joined_tables,
             outer_query_refs,
             right_join_swapped: _,
+            row_security_filtered,
         } = other;
+        self.row_security_filtered.extend(row_security_filtered);
 
         // Avoid `Vec::extend` here: `JoinedTable` is large, and many prepare
         // paths append into an empty `TableReferences`. Taking ownership of the
