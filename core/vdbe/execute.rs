@@ -11587,7 +11587,7 @@ pub fn op_function(
                     };
 
                     let new_tbl_name = if tbl_name.eq_ignore_ascii_case(&rename_from) {
-                        rename_to_display.clone()
+                        rename_to_display
                     } else {
                         tbl_name
                     };
