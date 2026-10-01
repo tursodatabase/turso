@@ -380,8 +380,8 @@ pub fn json_array_length(
     let path = json_path_from_db_value(path.expect("We already checked none"), true)?;
 
     if let Some(path) = path {
-        if let Ok(Some(pos)) = json.find_path_element(&path) {
-            if let Ok(len) = json.element_at(pos)?.array_len() {
+        if let Ok(Some(pos)) = jsonb::find_path_element(json.as_slice(), &path) {
+            if let Ok(len) = jsonb::element_at(json.as_slice(), pos)?.array_len() {
                 return Ok(Value::from_i64(len as i64));
             }
         }
@@ -489,8 +489,10 @@ pub fn json_arrow_extract(
     let make_jsonb_fn = curry_convert_dbtype_to_jsonb(Conv::Strict);
     let json = json_cache.get_or_insert_with(value, make_jsonb_fn)?;
     if let Some(path) = json_path_from_db_value(&path, false)? {
-        match json.find_path_element(&path) {
-            Ok(Some(pos)) => Ok(Value::Text(Text::json(json.element_at(pos)?.to_string()?))),
+        match jsonb::find_path_element(json.as_slice(), &path) {
+            Ok(Some(pos)) => Ok(Value::Text(Text::json(
+                jsonb::element_at(json.as_slice(), pos)?.to_string()?,
+            ))),
             Ok(None) | Err(_) => Ok(Value::Null),
         }
     } else {
@@ -512,8 +514,8 @@ pub fn json_arrow_shift_extract(
     let make_jsonb_fn = curry_convert_dbtype_to_jsonb(Conv::Strict);
     let json = json_cache.get_or_insert_with(value, make_jsonb_fn)?;
     if let Some(path) = json_path_from_db_value(&path, false)? {
-        let extracted = match json.find_path_element(&path) {
-            Ok(Some(pos)) => json.element_at(pos)?,
+        let extracted = match jsonb::find_path_element(json.as_slice(), &path) {
+            Ok(Some(pos)) => jsonb::element_at(json.as_slice(), pos)?,
             Ok(None) | Err(_) => return Ok(Value::Null),
         };
         let element_type = match extracted.element_type() {
@@ -599,8 +601,8 @@ where
             crate::LimboError::InternalError("paths should have one element".to_string())
         })?;
         if let Some(path) = json_path_from_db_value(&first_path, true)? {
-            let extracted = match value.find_path_element(&path) {
-                Ok(Some(pos)) => value.element_at(pos)?,
+            let extracted = match jsonb::find_path_element(value.as_slice(), &path) {
+                Ok(Some(pos)) => jsonb::element_at(value.as_slice(), pos)?,
                 Ok(None) | Err(_) => return Ok((null, ElementType::NULL)),
             };
             let element_type = match extracted.element_type() {
@@ -618,8 +620,10 @@ where
     for path in paths {
         let path = json_path_from_db_value(&path, true);
         if let Some(path) = path? {
-            match value.find_path_element(&path) {
-                Ok(Some(pos)) => result.append_to_array_unsafe(&value.element_at(pos)?.data()),
+            match jsonb::find_path_element(value.as_slice(), &path) {
+                Ok(Some(pos)) => {
+                    result.append_to_array_unsafe(&jsonb::element_at(value.as_slice(), pos)?.data())
+                }
                 Ok(None) | Err(_) => {
                     result.append_to_array_unsafe(JsonbHeader::make_null().into_bytes().as_bytes())
                 }

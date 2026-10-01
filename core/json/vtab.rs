@@ -494,8 +494,8 @@ fn navigate_to_path(jsonb: &Jsonb, path: &Value) -> Result<Option<Jsonb>, LimboE
     let json_path = json_path_from_db_value(path, true)?.ok_or_else(|| {
         LimboError::InvalidArgument(format!("path '{path}' is not a valid json path"))
     })?;
-    match jsonb.find_path_element(&json_path) {
-        Ok(Some(pos)) => Ok(Some(jsonb.element_at(pos)?)),
+    match jsonb::find_path_element(jsonb.as_slice(), &json_path) {
+        Ok(Some(pos)) => Ok(Some(jsonb::element_at(jsonb.as_slice(), pos)?)),
         Ok(None) | Err(_) => Ok(None),
     }
 }

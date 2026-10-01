@@ -904,6 +904,10 @@ impl Jsonb {
         })
     }
 
+    pub fn as_slice(&self) -> &[u8] {
+        &self.data
+    }
+
     pub fn len(&self) -> usize {
         self.data.len()
     }
@@ -2600,90 +2604,6 @@ impl Jsonb {
         Ok(stack)
     }
 
-    pub fn find_path_element(&self, path: &JsonPath) -> Result<Option<usize>> {
-        let mut pos = 0;
-        for segment in path.elements.iter() {
-            let found = match segment {
-                PathElement::Root() => Some(pos),
-                PathElement::Key(key, is_raw) => self.find_object_value(pos, key, *is_raw)?,
-                PathElement::ArrayLocator(index) => self.find_array_element(pos, *index)?,
-                PathElement::BracketQuotedKey(_) => None,
-            };
-            let Some(found) = found else {
-                return Ok(None);
-            };
-            pos = found;
-        }
-        Ok(Some(pos))
-    }
-
-    pub fn element_at(&self, pos: usize) -> Result<Jsonb> {
-        let (JsonbHeader(_, size), header_size) = self.read_header(pos)?;
-        let end = self.element_end(pos, &[header_size, size])?;
-        Ok(Jsonb::from_raw_data(&self.data[pos..end])?)
-    }
-
-    fn find_object_value(
-        &self,
-        pos: usize,
-        key: &str,
-        key_is_quoted: bool,
-    ) -> Result<Option<usize>> {
-        let (JsonbHeader(element_type, size), header_size) = self.read_header(pos)?;
-        if element_type != ElementType::OBJECT {
-            return Ok(None);
-        }
-        let end = self.element_end(pos, &[header_size, size])?;
-        let mut entry = pos + header_size;
-        while entry < end {
-            let (JsonbHeader(key_type, key_len), key_header_len) = self.read_header(entry)?;
-            if !key_type.is_valid_key() {
-                bail_parse_error!("Key should be string");
-            }
-            let key_start = entry + key_header_len;
-            let entry_key = read_text_payload(&self.data, key_start, key_len)?;
-            let value = key_start + key_len;
-            if compare((entry_key, key_type), (key, key_is_quoted)) {
-                return Ok(Some(value));
-            }
-            entry = self.skip_element(value)?;
-        }
-        Ok(None)
-    }
-
-    fn find_array_element(&self, pos: usize, index: Option<i32>) -> Result<Option<usize>> {
-        let (JsonbHeader(element_type, size), header_size) = self.read_header(pos)?;
-        if element_type != ElementType::ARRAY {
-            return Ok(None);
-        }
-        let end = self.element_end(pos, &[header_size, size])?;
-        let first = pos + header_size;
-        let index = match index {
-            None => return Ok(None),
-            Some(index) if index >= 0 => index as usize,
-            Some(from_end) => {
-                let mut count = 0usize;
-                let mut element = first;
-                while element < end {
-                    element = self.skip_element(element)?;
-                    count += 1;
-                }
-                match count.checked_sub(from_end.unsigned_abs() as usize) {
-                    Some(index) => index,
-                    None => return Ok(None),
-                }
-            }
-        };
-        let mut element = first;
-        for _ in 0..index {
-            if element >= end {
-                return Ok(None);
-            }
-            element = self.skip_element(element)?;
-        }
-        Ok((element < end).then_some(element))
-    }
-
     pub fn operate_on_path<T>(&mut self, path: &JsonPath, operation: &mut T) -> Result<()>
     where
         T: PathOperation,
@@ -3646,6 +3566,96 @@ fn new_key_element_type(path_key: &str, is_quoted: bool) -> ElementType {
 /// unquoted label are literal characters), or quoted but containing no
 /// backslash.
 #[inline]
+pub fn find_path_element(data: &[u8], path: &JsonPath) -> Result<Option<usize>> {
+    let mut pos = 0;
+    for segment in path.elements.iter() {
+        let found = match segment {
+            PathElement::Root() => Some(pos),
+            PathElement::Key(key, is_raw) => find_object_value(data, pos, key, *is_raw)?,
+            PathElement::ArrayLocator(index) => find_array_element(data, pos, *index)?,
+            PathElement::BracketQuotedKey(_) => None,
+        };
+        let Some(found) = found else {
+            return Ok(None);
+        };
+        pos = found;
+    }
+    Ok(Some(pos))
+}
+
+pub fn element_at(data: &[u8], pos: usize) -> Result<Jsonb> {
+    let (_, _, end) = element_bounds(data, pos)?;
+    Ok(Jsonb::from_raw_data(&data[pos..end])?)
+}
+
+fn find_object_value(
+    data: &[u8],
+    pos: usize,
+    key: &str,
+    key_is_quoted: bool,
+) -> Result<Option<usize>> {
+    let (JsonbHeader(element_type, _), payload_start, end) = element_bounds(data, pos)?;
+    if element_type != ElementType::OBJECT {
+        return Ok(None);
+    }
+    let mut entry = payload_start;
+    while entry < end {
+        let (JsonbHeader(key_type, key_len), key_header_len) =
+            JsonbHeader::from_slice(entry, data)?;
+        if !key_type.is_valid_key() {
+            bail_parse_error!("Key should be string");
+        }
+        let key_start = entry + key_header_len;
+        let entry_key = read_text_payload(data, key_start, key_len)?;
+        let value = key_start + key_len;
+        if compare((entry_key, key_type), (key, key_is_quoted)) {
+            return Ok(Some(value));
+        }
+        entry = element_bounds(data, value)?.2;
+    }
+    Ok(None)
+}
+
+fn find_array_element(data: &[u8], pos: usize, index: Option<i32>) -> Result<Option<usize>> {
+    let (JsonbHeader(element_type, _), first, end) = element_bounds(data, pos)?;
+    if element_type != ElementType::ARRAY {
+        return Ok(None);
+    }
+    let index = match index {
+        None => return Ok(None),
+        Some(index) if index >= 0 => index as usize,
+        Some(from_end) => {
+            let mut count = 0usize;
+            let mut element = first;
+            while element < end {
+                element = element_bounds(data, element)?.2;
+                count += 1;
+            }
+            match count.checked_sub(from_end.unsigned_abs() as usize) {
+                Some(index) => index,
+                None => return Ok(None),
+            }
+        }
+    };
+    let mut element = first;
+    for _ in 0..index {
+        if element >= end {
+            return Ok(None);
+        }
+        element = element_bounds(data, element)?.2;
+    }
+    Ok((element < end).then_some(element))
+}
+
+fn element_bounds(data: &[u8], pos: usize) -> Result<(JsonbHeader, usize, usize)> {
+    let (header, header_size) = JsonbHeader::from_slice(pos, data)?;
+    let payload_start = pos + header_size;
+    match payload_start.checked_add(header.1) {
+        Some(end) if end <= data.len() => Ok((header, payload_start, end)),
+        _ => bail_parse_error!("malformed JSON"),
+    }
+}
+
 fn compare(key: (&str, ElementType), path_key: (&str, bool)) -> bool {
     let (key, element_type) = key;
     let (path_key, is_quoted) = path_key;
@@ -5794,8 +5804,11 @@ mod path_operations_tests {
             PathElement::Key(Cow::Borrowed("person"), false),
         ]);
 
-        let pos = jsonb.find_path_element(&path).unwrap().unwrap();
-        let result_str = jsonb.element_at(pos).unwrap().to_string().unwrap();
+        let pos = find_path_element(jsonb.as_slice(), &path).unwrap().unwrap();
+        let result_str = element_at(jsonb.as_slice(), pos)
+            .unwrap()
+            .to_string()
+            .unwrap();
         assert_eq!(result_str, r#"{"name":"John","age":30}"#);
     }
 
@@ -5964,9 +5977,9 @@ mod path_operations_tests {
         let jsonb = Jsonb {
             data: crate::alloc::vec![0x8B, 0xC7, 0xC8, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00],
         };
-        let found = jsonb.find_path_element(&path).unwrap().unwrap();
+        let found = find_path_element(jsonb.as_slice(), &path).unwrap().unwrap();
         assert!(
-            jsonb.element_at(found).is_err(),
+            element_at(jsonb.as_slice(), found).is_err(),
             "oversized child size must not be sliced out of bounds"
         );
 

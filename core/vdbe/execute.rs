@@ -10726,10 +10726,13 @@ pub fn op_function(
                             ],
                         };
 
-                        let Some(column_pos) = columns_json_array.find_path_element(&path)? else {
+                        let Some(column_pos) =
+                            json::jsonb::find_path_element(columns_json_array.as_slice(), &path)?
+                        else {
                             return Err(LimboError::ParseError("Not found!".to_string()).into());
                         };
-                        let column_name = columns_json_array.element_at(column_pos)?;
+                        let column_name =
+                            json::jsonb::element_at(columns_json_array.as_slice(), column_pos)?;
                         json.append_jsonb_to_end(column_name.data());
 
                         let val = match payload_iterator.next() {
