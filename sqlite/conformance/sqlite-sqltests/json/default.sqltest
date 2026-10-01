@@ -386,6 +386,13 @@ expect {
     4|6|5|6
 }
 
+test json_extract_reads_jsonb_blob_with_malformed_value_outside_the_path {
+    SELECT json_extract(X'8C17611331176217FF', '$.a'), X'8C17611331176217FF' ->> '$.a', X'8C17611331176217FF' -> '$.a';
+}
+expect {
+    1|1|1
+}
+
 test json_extract_malformed_json_1 {
 		SELECT json_extract(X'256162', '$');
 }

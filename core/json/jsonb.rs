@@ -3588,6 +3588,13 @@ pub fn element_at(data: &[u8], pos: usize) -> Result<Jsonb> {
     Ok(Jsonb::from_raw_data(&data[pos..end])?)
 }
 
+pub fn is_valid_element_at(data: &[u8], pos: usize) -> bool {
+    match element_bounds(data, pos) {
+        Ok((_, _, end)) => validate_element(data, pos, end, 0, false).is_ok(),
+        Err(_) => false,
+    }
+}
+
 fn find_object_value(
     data: &[u8],
     pos: usize,
