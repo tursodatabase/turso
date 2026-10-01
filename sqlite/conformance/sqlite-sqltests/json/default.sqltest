@@ -365,6 +365,27 @@ expect {
     -9e999
 }
 
+test json_array_elements_without_comma_are_malformed {
+    SELECT json('[1 2]');
+}
+expect error {
+    .*malformed JSON.*
+}
+
+test json_valid_rejects_array_elements_without_comma {
+    SELECT json_valid('[1 2]'), json_valid('[[1] [2]]'), json_valid('[1, 2 "a"]');
+}
+expect {
+    0|0|0
+}
+
+test json_error_position_points_at_array_element_without_comma {
+    SELECT json_error_position('[1 2]'), json_error_position('[1,2 3]'), json_error_position('[1  "a"]'), json_error_position('[[1] [2]]');
+}
+expect {
+    4|6|5|6
+}
+
 test json_extract_malformed_json_1 {
 		SELECT json_extract(X'256162', '$');
 }

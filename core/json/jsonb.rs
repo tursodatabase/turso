@@ -1776,6 +1776,13 @@ impl Jsonb {
 
                     // Parse array element
                     pos = self.deserialize_value(input, pos, depth + 1, info)?;
+                    pos = skip_whitespace_tracking(input, pos, info);
+                    if pos < input.len() && !matches!(input[pos], b',' | b']') {
+                        return Err(PError::Message {
+                            msg: "Should be , or ]".to_string(),
+                            location: Some(pos),
+                        });
+                    }
 
                     first = false;
                 }
