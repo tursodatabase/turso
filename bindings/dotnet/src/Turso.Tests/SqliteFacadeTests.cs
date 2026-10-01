@@ -591,6 +591,27 @@ public class SqliteFacadeTests
     }
 
     [Test]
+    public void UriReadWriteModeOverridesSharedMemoryCleanup()
+    {
+        using var directory = new TemporaryDirectory();
+        var path = Path.Combine(directory.Path, "uri-existing.db");
+        using (var create = new SqliteConnection($"Data Source={path}"))
+        {
+            create.Open();
+            create.ExecuteNonQuery("CREATE TABLE Data(Value); INSERT INTO Data VALUES (42);");
+        }
+
+        using (var connection = new SqliteConnection(
+                   $"Data Source=file:{path}?mode=rw;Mode=Memory;Cache=Shared"))
+        {
+            connection.Open();
+            connection.ExecuteScalar<long>("SELECT Value FROM Data;").Should().Be(42);
+        }
+
+        File.Exists(path).Should().BeTrue();
+    }
+
+    [Test]
     public void SharedMemoryConnectionsUseSameBackingStore()
     {
         var connectionString = "Data Source=turso-shared-test;Mode=Memory;Cache=Shared";
