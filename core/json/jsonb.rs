@@ -1550,7 +1550,6 @@ impl Jsonb {
             });
         }
 
-        pos = skip_whitespace_tracking(input, pos, info);
         if pos >= input.len() {
             return Err(PError::Message {
                 msg: "Unexpected end of input".to_string(),
@@ -1630,8 +1629,8 @@ impl Jsonb {
         let obj_start = self.len();
         let mut first = true;
 
+        pos = skip_whitespace_tracking(input, pos, info);
         loop {
-            pos = skip_whitespace_tracking(input, pos, info);
             if pos >= input.len() {
                 return Err(PError::Message {
                     msg: "Unexpected end of input".to_string(),
@@ -1727,8 +1726,8 @@ impl Jsonb {
         let arr_start = self.len();
         let mut first = true;
 
+        pos = skip_whitespace_tracking(input, pos, info);
         loop {
-            pos = skip_whitespace_tracking(input, pos, info);
             if pos >= input.len() {
                 return Err(PError::Message {
                     msg: "Unexpected end of input".to_string(),
@@ -1772,8 +1771,6 @@ impl Jsonb {
                     }
                 }
                 _ => {
-                    pos = skip_whitespace_tracking(input, pos, info);
-
                     // Parse array element
                     pos = self.deserialize_value(input, pos, depth + 1, info)?;
                     pos = skip_whitespace_tracking(input, pos, info);
@@ -2524,7 +2521,7 @@ impl Jsonb {
         }
 
         // Parse the first complete JSON value
-        let mut pos = 0;
+        let mut pos = skip_whitespace_tracking(input, 0, &mut info);
         pos = result.deserialize_value(input, pos, 0, &mut info)?;
 
         // Skip any trailing whitespace
