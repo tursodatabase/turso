@@ -564,6 +564,8 @@ fn translate_statement(
         ast::Stmt::DropSchema { name } => {
             schema::translate_drop_schema(&name, resolver, program)?;
         }
+        ast::Stmt::CreatePolicy(..) => bail_parse_error!("CREATE POLICY is not supported"),
+        ast::Stmt::DropPolicy { .. } => bail_parse_error!("DROP POLICY is not supported"),
     };
 
     if is_write {
@@ -653,6 +655,8 @@ fn stmt_kind(stmt: &ast::Stmt) -> &'static str {
         ast::Stmt::DropSequence { .. } => "drop_sequence",
         ast::Stmt::CreateSchema { .. } => "create_schema",
         ast::Stmt::DropSchema { .. } => "drop_schema",
+        ast::Stmt::CreatePolicy(..) => "create_policy",
+        ast::Stmt::DropPolicy { .. } => "drop_policy",
     }
 }
 

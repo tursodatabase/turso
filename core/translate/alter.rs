@@ -1548,6 +1548,11 @@ pub fn translate_alter_table(
                 },
             )?
         }
+        ast::AlterTableBody::RowSecurity(_) => {
+            return Err(LimboError::ParseError(
+                "ALTER TABLE ... ROW LEVEL SECURITY is not supported".to_string(),
+            ));
+        }
         ast::AlterTableBody::RenameTo(new_name) => {
             reject_dependent_materialized_views(resolver, namespace, table_name)?;
             let new_name = new_name.as_str();
@@ -2482,6 +2487,9 @@ fn reject_alter_of_view(
         }
         ast::AlterTableBody::DropColumn(_) => {
             crate::bail_parse_error!("cannot drop column from view \"{view_name}\"")
+        }
+        ast::AlterTableBody::RowSecurity(_) => {
+            crate::bail_parse_error!("\"{view_name}\" is not a table")
         }
     }
 }
