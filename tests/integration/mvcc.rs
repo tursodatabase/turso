@@ -64,6 +64,46 @@ fn writable_must_exist_database_can_create_mvcc_log() -> anyhow::Result<()> {
     Ok(())
 }
 
+#[test]
+fn existing_mvcc_database_does_not_recreate_missing_log() -> anyhow::Result<()> {
+    let directory = tempfile::TempDir::new()?;
+    let path = directory.path().join("missing-mvcc-log.db");
+    let path_str = path.to_str().unwrap();
+    let io = Arc::new(turso_core::PlatformIO::new()?);
+    {
+        let db = Database::open_file_with_flags(
+            io.clone(),
+            path_str,
+            OpenFlags::Create,
+            DatabaseOpts::new(),
+            None,
+            Arc::new(SqliteDialect),
+        )?;
+        let conn = db.connect()?;
+        conn.pragma_update("journal_mode", "'mvcc'")?;
+        conn.execute("CREATE TABLE data(value); INSERT INTO data VALUES (1)")?;
+        conn.close()?;
+    }
+
+    let log_path = path.with_extension("db-log");
+    std::fs::remove_file(&log_path)?;
+    let open_failed = match Database::open_file_with_flags(
+        io,
+        path_str,
+        OpenFlags::Create,
+        DatabaseOpts::new(),
+        None,
+        Arc::new(SqliteDialect),
+    ) {
+        Ok(db) => db.connect().is_err(),
+        Err(_) => true,
+    };
+
+    assert!(open_failed);
+    assert!(!log_path.exists());
+    Ok(())
+}
+
 /// A minimal DurableStorage wrapper that delegates to the built-in implementation,
 /// but records that it was used. This validates per-database injection via
 /// `Database::open` with `OpenOptions::durable_storage`.

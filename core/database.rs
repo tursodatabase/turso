@@ -2273,7 +2273,7 @@ impl Database {
                         let mv_store = journal_mode::open_mv_store(
                             self.io.clone(),
                             &canonical_path,
-                            self.open_flags,
+                            self.open_flags & !OpenFlags::Create,
                             self.durable_storage.clone(),
                             enc_ctx,
                             self.allocators.mv_store.clone(),
@@ -2354,7 +2354,7 @@ impl Database {
             let mv_store = journal_mode::open_mv_store(
                 self.io.clone(),
                 &self.path,
-                self.open_flags,
+                self.open_flags & !OpenFlags::Create,
                 self.durable_storage.clone(),
                 None,
                 self.allocators.mv_store.clone(),
