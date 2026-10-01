@@ -4277,7 +4277,49 @@ fn json5_whitespace_len(input: &[u8]) -> usize {
 }
 
 #[inline(always)]
-fn find_string_special_byte(input: &[u8], mut pos: usize, quote: u8) -> usize {
+fn find_string_special_byte(input: &[u8], pos: usize, quote: u8) -> usize {
+    #[cfg(target_arch = "x86_64")]
+    let pos = match find_string_special_byte_sse2(input, pos, quote) {
+        Ok(found) => return found,
+        Err(tail_start) => tail_start,
+    };
+    find_string_special_byte_swar(input, pos, quote)
+}
+
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+fn find_string_special_byte_sse2(input: &[u8], mut pos: usize, quote: u8) -> Result<usize, usize> {
+    use std::arch::x86_64::{
+        _mm_cmpeq_epi8, _mm_loadu_si128, _mm_min_epu8, _mm_movemask_epi8, _mm_or_si128,
+        _mm_set1_epi8,
+    };
+    // SAFETY: SSE2 is part of the x86_64 baseline, so these intrinsics are
+    // always available, and the loop condition keeps each 16-byte unaligned
+    // load inside `input`.
+    unsafe {
+        let quotes = _mm_set1_epi8(quote as i8);
+        let backslashes = _mm_set1_epi8(b'\\' as i8);
+        let last_control = _mm_set1_epi8(0x1F);
+        while pos + 16 <= input.len() {
+            let chunk = _mm_loadu_si128(input.as_ptr().add(pos).cast());
+            let is_quote = _mm_cmpeq_epi8(chunk, quotes);
+            let is_backslash = _mm_cmpeq_epi8(chunk, backslashes);
+            let is_control = _mm_cmpeq_epi8(_mm_min_epu8(chunk, last_control), chunk);
+            let mask = _mm_movemask_epi8(_mm_or_si128(
+                _mm_or_si128(is_quote, is_backslash),
+                is_control,
+            ));
+            if mask != 0 {
+                return Ok(pos + mask.trailing_zeros() as usize);
+            }
+            pos += 16;
+        }
+    }
+    Err(pos)
+}
+
+#[inline(always)]
+fn find_string_special_byte_swar(input: &[u8], mut pos: usize, quote: u8) -> usize {
     const ONES: u64 = u64::from_ne_bytes([0x01; 8]);
     const HIGH_BITS: u64 = u64::from_ne_bytes([0x80; 8]);
     let quotes = ONES * quote as u64;
@@ -4421,7 +4463,7 @@ mod tests {
             state as u8
         };
         let special = [b'"', b'\'', b'\\', 0x00, 0x1F, 0x20, 0x7F, 0x80, 0xFF];
-        for len in 0..40 {
+        for len in 0..80 {
             for _ in 0..100 {
                 let input: Vec<u8> = (0..len)
                     .map(|_| match next_byte() {
@@ -4437,6 +4479,11 @@ mod tests {
                             .unwrap_or(len);
                         assert_eq!(
                             find_string_special_byte(&input, start, quote),
+                            expected,
+                            "input {input:?}, start {start}, quote {quote}"
+                        );
+                        assert_eq!(
+                            find_string_special_byte_swar(&input, start, quote),
                             expected,
                             "input {input:?}, start {start}, quote {quote}"
                         );
