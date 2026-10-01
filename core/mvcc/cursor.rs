@@ -63,7 +63,7 @@ impl<A: ConcurrentAllocator> Debug for CursorPosition<A> {
 
 #[derive(Debug, Clone, Copy)]
 enum ExistsState {
-    /// Last B-tree row, to seed the allocator.
+    /// Last B-tree row, to set the NotExists skip bound.
     SeekBtreeLast,
     /// Read that row's rowid.
     ReadBtreeLast,
@@ -643,53 +643,14 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> MvccLazyCursor<Clock
             .clone()
     }
 
-    /// False when `rowid` is above a positive allocator max or shadowed in MVCC.
+    /// False when `rowid` is above a positive physical B-tree last or shadowed in MVCC.
     fn btree_may_hold(&mut self, rowid: i64) -> bool {
         // `insert_row_id_maybe_update` drops rowids <= 0 while max is still the
         // 0 sentinel, so a non-positive max is not a bound.
-        match self.rowid_allocator().max_rowid() {
+        match self.rowid_allocator().notexists_max() {
             Some(max) if max > 0 && rowid > max => false,
             _ => self.query_btree_version_is_valid(&RowKey::Int(rowid)),
         }
-    }
-
-    /// Seed from the larger of the last B-tree rowid and the last visible
-    /// version-store rowid. Try the lock so a concurrent NewRowid can seed
-    /// instead.
-    fn seed_rowid_allocator(&mut self, btree_max: Option<i64>) {
-        let store_max = self
-            .db
-            .seek_rowid(
-                RowID {
-                    table_id: self.table_id,
-                    row_id: RowKey::Int(i64::MAX),
-                },
-                true,
-                false,
-                false,
-                IterationDirection::Backwards,
-                self.snapshot,
-                &mut self.table_iterator,
-            )
-            .map(|(rowid, _, _)| match rowid.row_id {
-                RowKey::Int(rowid) => rowid,
-                RowKey::Record(_) => unreachable!("table rowids are integers"),
-            });
-        let max = match (btree_max, store_max) {
-            (Some(a), Some(b)) => a.max(b),
-            (Some(max), None) | (None, Some(max)) => max,
-            // Leave empty tables unseeded. A seeded 0 would skip the rowids
-            // SQLite hands out after a later explicit non-positive insert.
-            (None, None) => return,
-        };
-        let allocator = self.rowid_allocator();
-        if !allocator.lock() {
-            return;
-        }
-        if allocator.is_uninitialized() {
-            allocator.initialize(Some(max));
-        }
-        allocator.unlock();
     }
 
     /// Forward-direction shadow check: `IndexShadowScan` fast-path for index
@@ -2081,7 +2042,7 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> CursorTrait
                         self.state = None;
                         return Ok(IOResult::Done(false));
                     }
-                    if self.rowid_allocator().max_rowid().is_none() {
+                    if self.rowid_allocator().notexists_max().is_none() {
                         self.state
                             .replace(MvccLazyCursorState::Exists(ExistsState::SeekBtreeLast));
                         continue;
@@ -2101,7 +2062,7 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> CursorTrait
                 }
                 Some(MvccLazyCursorState::Exists(ExistsState::ReadBtreeLast)) => {
                     let btree_max = return_if_io!(self.btree_cursor.rowid());
-                    self.seed_rowid_allocator(btree_max);
+                    self.rowid_allocator().record_notexists_max(btree_max);
                     if !self.btree_may_hold(int_key) {
                         self.state = None;
                         return Ok(IOResult::Done(false));

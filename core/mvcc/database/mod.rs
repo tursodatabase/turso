@@ -4038,6 +4038,11 @@ pub struct RowidAllocator {
     max_rowid: AtomicI64,
     /// True after the first btree-max scan. Never reset to false.
     initialized: AtomicBool,
+    /// Physical B-tree last rowid used only as the NotExists skip bound.
+    /// A deleted tail can sit here until checkpoint. Never copy this into
+    /// `max_rowid`.
+    notexists_max: AtomicI64,
+    notexists_ready: AtomicBool,
 }
 
 /// Sub state machine for [`MvStore::bootstrap_nonblock`]. Carried by the
@@ -10240,6 +10245,8 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                     lock: TursoRwLock::new(),
                     max_rowid: AtomicI64::new(0),
                     initialized: AtomicBool::new(false),
+                    notexists_max: AtomicI64::new(0),
+                    notexists_ready: AtomicBool::new(false),
                 })
             })
             .clone()
@@ -10373,16 +10380,38 @@ impl RowidAllocator {
         loop {
             let cur = self.max_rowid.load(Ordering::SeqCst);
             if rowid <= cur {
-                return;
+                break;
             }
             if self
                 .max_rowid
                 .compare_exchange(cur, rowid, Ordering::SeqCst, Ordering::SeqCst)
                 .is_ok()
             {
-                return;
+                break;
             }
         }
+        self.raise_notexists_max(rowid);
+    }
+
+    pub fn notexists_max(&self) -> Option<i64> {
+        self.notexists_ready
+            .load(Ordering::SeqCst)
+            .then(|| self.notexists_max.load(Ordering::SeqCst))
+    }
+
+    pub fn record_notexists_max(&self, rowid: Option<i64>) {
+        if let Some(rowid) = rowid {
+            self.raise_notexists_max(rowid);
+        }
+        self.notexists_ready.store(true, Ordering::SeqCst);
+    }
+
+    fn raise_notexists_max(&self, rowid: i64) {
+        let _ = self
+            .notexists_max
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |cur| {
+                (rowid > cur).then_some(rowid)
+            });
     }
 
     pub fn is_uninitialized(&self) -> bool {
@@ -10396,7 +10425,7 @@ impl RowidAllocator {
             .then(|| self.max_rowid.load(Ordering::SeqCst))
     }
 
-    /// Initialize from btree max. Called once per table, under lock.
+    /// Initialize from the visible max. Called once per table, under lock.
     pub fn initialize(&self, rowid: Option<i64>) {
         tracing::trace!("initialize({rowid:?})");
         let _ = self
