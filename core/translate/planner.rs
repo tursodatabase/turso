@@ -1942,7 +1942,7 @@ fn parse_table(
 
         // This is a materialized view with storage - treat it as a regular BTree table
         // Create a BTreeTable from the view's metadata
-        let columns = view_guard.column_schema.flat_columns();
+        let columns = view_guard.column_schema.flat_columns()?;
         let btree_table = Arc::new(crate::schema::BTreeTable::new(
             root_page,
             view_guard.name().to_string(),

@@ -1570,12 +1570,13 @@ pub struct ViewColumnSchema {
 
 impl ViewColumnSchema {
     /// Get all columns as a flat vector (without table association info)
-    pub fn flat_columns(&self) -> crate::alloc::Vec<Column> {
-        self.columns
+    #[turso_macros::allocation_site(crate::alloc::SchemaAllocationSite::FlatViewColumns)]
+    pub fn flat_columns(&self) -> Result<crate::alloc::Vec<Column>> {
+        Ok(self
+            .columns
             .iter()
             .map(|vc| vc.column.clone())
-            .try_collect()
-            .expect(crate::alloc::ALLOC_ERR_MSG)
+            .try_collect()?)
     }
 
     /// Get columns that belong to a specific table
@@ -2595,7 +2596,7 @@ mod rename_column_view {
         explicit: &[ast::IndexedColumn],
     ) -> Result<crate::alloc::Vec<Column>> {
         let view_column_schema = extract_view_columns(select, schema)?;
-        let mut columns = view_column_schema.flat_columns();
+        let mut columns = view_column_schema.flat_columns()?;
         for (i, indexed_col) in explicit.iter().enumerate() {
             if let Some(col) = columns.get_mut(i) {
                 col.name = Some(indexed_col.col_name.as_str().to_string());

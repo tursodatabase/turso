@@ -237,6 +237,7 @@ fn allocation_site_id(site: AllocationSite) -> u64 {
         },
         AllocationSite::Schema(site) => match site {
             SchemaAllocationSite::MakeMut => 14,
+            SchemaAllocationSite::FlatViewColumns => 42,
         },
         AllocationSite::ValueBlob(site) => match site {
             ValueBlobAllocationSite::Concat => 23,
