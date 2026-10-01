@@ -371,3 +371,54 @@ test later-column-rename-keeps-on-table-display-casing-in-trigger-sql {
 expect {
     1|1|1
 }
+
+@cross-check-integrity
+test table-rename-handles-unicode-explicit-index-name {
+    CREATE TABLE Foo(ID INTEGER);
+    CREATE INDEX "abcdefghijklmnopqrsté" ON Foo(ID);
+    ALTER TABLE Foo RENAME TO Bar;
+    SELECT name, tbl_name
+      FROM sqlite_schema
+     WHERE type = 'index';
+    SELECT ID FROM Bar;
+}
+expect {
+    abcdefghijklmnopqrsté|Bar
+}
+
+@cross-check-integrity
+test add-column-after-rename-keeps-table-display-casing {
+    CREATE TABLE Foo(A INTEGER, B INTEGER);
+    ALTER TABLE Foo RENAME TO New_MiXeD;
+    ALTER TABLE new_mixed ADD COLUMN C INTEGER;
+    SELECT name,
+           tbl_name,
+           instr(sql, 'CREATE TABLE "New_MiXeD"') = 1
+      FROM sqlite_schema
+     WHERE type = 'table'
+       AND name = 'New_MiXeD';
+}
+expect {
+    New_MiXeD|New_MiXeD|1
+}
+
+test analyze-uses-mixed-case-index-statistics {
+    CREATE TABLE AnalyzeNames(a INTEGER, b INTEGER);
+    WITH RECURSIVE n(x) AS (
+      VALUES(1)
+      UNION ALL
+      SELECT x + 1 FROM n WHERE x < 10000
+    )
+    INSERT INTO AnalyzeNames SELECT 1, x FROM n;
+    CREATE INDEX GoodIndex ON AnalyzeNames(b);
+    CREATE INDEX BadIndex ON AnalyzeNames(a);
+    ANALYZE;
+    EXPLAIN QUERY PLAN
+      SELECT *
+        FROM AnalyzeNames
+       WHERE a = 1
+         AND b = 9999;
+}
+expect pattern {
+    USING INDEX GoodIndex
+}

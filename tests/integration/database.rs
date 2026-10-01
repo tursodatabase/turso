@@ -161,7 +161,17 @@ fn test_mixed_case_table_rename_preserves_autoindex_casing() {
         reopened_conn.exec_rows("SELECT value FROM new_mixed WHERE ID = 'a'");
     assert_eq!(value_rows, vec![("v".to_string(),)]);
     reopened_conn
-        .execute("INSERT INTO NEW_MIXED VALUES ('b', 'two', 'w')")
+        .execute("ALTER TABLE new_mixed ADD COLUMN AddedValue TEXT")
+        .unwrap();
+    let table_sql: Vec<(String,)> = reopened_conn
+        .exec_rows("SELECT sql FROM sqlite_schema WHERE type = 'table' AND name = 'New_MiXeD'");
+    assert!(
+        table_sql[0].0.starts_with("CREATE TABLE \"New_MiXeD\""),
+        "{}",
+        table_sql[0].0
+    );
+    reopened_conn
+        .execute("INSERT INTO NEW_MIXED(ID, Code, value) VALUES ('b', 'two', 'w')")
         .unwrap();
     let count_rows: Vec<(i64,)> = reopened_conn.exec_rows("SELECT count(*) FROM New_MiXeD");
     assert_eq!(count_rows, vec![(2,)]);

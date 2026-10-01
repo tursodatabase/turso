@@ -126,6 +126,14 @@ pub fn normalize_ident(identifier: &str) -> String {
     identifier.to_ascii_lowercase()
 }
 
+pub fn strip_prefix_ignore_ascii_case<'a>(value: &'a str, prefix: &str) -> Option<&'a str> {
+    let prefix_bytes = value.as_bytes().get(..prefix.len())?;
+    if !prefix_bytes.eq_ignore_ascii_case(prefix.as_bytes()) {
+        return None;
+    }
+    value.get(prefix.len()..)
+}
+
 /// Escape a SQL string literal payload for safe interpolation inside single quotes.
 pub fn escape_sql_string_literal(literal: &str) -> String {
     literal.replace('\'', "''")

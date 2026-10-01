@@ -41,7 +41,8 @@ use crate::util::{
     rewrite_fk_parent_cols_if_self_ref, rewrite_fk_parent_table_if_needed,
     rewrite_inline_col_fk_target_if_needed, rewrite_trigger_cmd_column_refs,
     rewrite_trigger_cmd_table_refs, rewrite_view_sql_for_column_rename,
-    trigger_still_references_renamed_column, trim_ascii_whitespace, RewrittenView,
+    strip_prefix_ignore_ascii_case, trigger_still_references_renamed_column, trim_ascii_whitespace,
+    RewrittenView,
 };
 use crate::vdbe::affinity::{
     apply_numeric_affinity, real_to_i64, try_for_float, Affinity, NumericParseResult, ParsedNumber,
@@ -11569,11 +11570,14 @@ pub fn op_function(
                     let autoindex_prefix = format!("sqlite_autoindex_{rename_from}_");
                     let new_name = if entry_type.as_str().eq_ignore_ascii_case("index")
                         && tbl_name.eq_ignore_ascii_case(&rename_from)
-                        && name.len() >= autoindex_prefix.len()
-                        && name[..autoindex_prefix.len()].eq_ignore_ascii_case(&autoindex_prefix)
                     {
-                        let column = &name[autoindex_prefix.len()..];
-                        format!("sqlite_autoindex_{rename_to_display}_{column}")
+                        if let Some(column) =
+                            strip_prefix_ignore_ascii_case(&name, &autoindex_prefix)
+                        {
+                            format!("sqlite_autoindex_{rename_to_display}_{column}")
+                        } else {
+                            name
+                        }
                     } else if entry_type.as_str().eq_ignore_ascii_case("table")
                         && name.eq_ignore_ascii_case(&rename_from)
                     {
@@ -16939,6 +16943,10 @@ pub fn op_rename_table(
         schema
             .table_display_names
             .insert(normalized_to.clone(), to.clone());
+        schema.table_sql_names.remove(&normalized_from);
+        schema
+            .table_sql_names
+            .insert(normalized_to.clone(), double_quoted_name(to).to_string());
 
         if let Some(mut indexes) = schema.indexes.remove(&normalized_from) {
             let autoindex_prefix = format!("sqlite_autoindex_{normalized_from}_");
@@ -16946,10 +16954,8 @@ pub fn op_rename_table(
                 let index = Arc::make_mut(index);
                 normalized_to.clone_into(&mut index.table_name);
                 // Rename autoindexes to match the new table name
-                if index.name.len() >= autoindex_prefix.len()
-                    && index.name[..autoindex_prefix.len()].eq_ignore_ascii_case(&autoindex_prefix)
+                if let Some(suffix) = strip_prefix_ignore_ascii_case(&index.name, &autoindex_prefix)
                 {
-                    let suffix = &index.name[autoindex_prefix.len()..];
                     index.name = format!("sqlite_autoindex_{to}_{suffix}");
                 }
             });

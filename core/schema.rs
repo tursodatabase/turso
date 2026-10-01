@@ -739,6 +739,7 @@ pub struct Schema {
     /// table_name to list of indexes for the table
     pub indexes: HashMap<String, VecDeque<Arc<Index>>>,
     pub table_display_names: HashMap<String, String>,
+    pub table_sql_names: HashMap<String, String>,
     pub has_indexes: HashSet<String>,
     pub schema_version: u32,
     /// Statistics collected via ANALYZE for regular B-tree tables and indexes.
@@ -872,6 +873,7 @@ impl Schema {
         let has_indexes = HashSet::default();
         let indexes: HashMap<String, VecDeque<Arc<Index>>> = HashMap::default();
         let table_display_names = HashMap::default();
+        let table_sql_names = HashMap::default();
         #[allow(clippy::arc_with_non_send_sync)]
         tables.insert(
             SCHEMA_TABLE_NAME.to_string(),
@@ -901,6 +903,7 @@ impl Schema {
             triggers,
             indexes,
             table_display_names,
+            table_sql_names,
             has_indexes,
             schema_version: 0,
             analyze_stats: AnalyzeStats::default(),
@@ -1379,6 +1382,7 @@ impl Schema {
     pub fn remove_table(&mut self, table_name: &str) {
         let name = normalize_ident(table_name);
         self.table_display_names.remove(&name);
+        self.table_sql_names.remove(&name);
         #[cfg(feature = "conn_raw_api")]
         {
             if let Some(table) = self.tables.remove(&name) {
@@ -2099,7 +2103,12 @@ impl Schema {
                 // only the B-tree arm needs to parse the row's stored SQL.
                 if root_page == 0 {
                     match Parser::new(sql.as_bytes()).next_cmd()? {
-                        Some(Cmd::Stmt(Stmt::CreateVirtualTable(_))) => {}
+                        Some(Cmd::Stmt(Stmt::CreateVirtualTable(create))) => {
+                            self.table_sql_names.insert(
+                                normalize_ident(table_name),
+                                create.tbl_name.name.to_string(),
+                            );
+                        }
                         other => {
                             return Err(LimboError::Corrupt(format!(
                                 "sqlite_schema table row {name} with root page 0 has unexpected SQL {sql:?}: parsed as {other:?}"
@@ -2124,6 +2133,16 @@ impl Schema {
                     self.add_virtual_table(vtab)?;
                 } else {
                     let table = dialect.parse_table_sql(sql, root_page)?;
+                    let table_sql_name = match dialect.parse_table_sql_ast(sql)? {
+                        Stmt::CreateTable { tbl_name, .. } => tbl_name.name.to_string(),
+                        other => {
+                            return Err(LimboError::Corrupt(format!(
+                                "sqlite_schema table row {name} has unexpected SQL {sql:?}: parsed as {other:?}"
+                            )));
+                        }
+                    };
+                    self.table_sql_names
+                        .insert(normalize_ident(table_name), table_sql_name);
 
                     if table.has_virtual_columns && !self.generated_columns_enabled {
                         return Err(LimboError::ParseError(format!(
@@ -2839,6 +2858,7 @@ impl TryClone for Schema {
             triggers,
             indexes,
             table_display_names: self.table_display_names.try_clone()?,
+            table_sql_names: self.table_sql_names.try_clone()?,
             has_indexes: self.has_indexes.try_clone()?,
             schema_version: self.schema_version,
             analyze_stats: self.analyze_stats.clone(),
@@ -3588,7 +3608,15 @@ impl BTreeTable {
     /// For example, if a user creates a table like: `CREATE TABLE t              (x)`, we store it as
     /// `CREATE TABLE t (x)`, whereas sqlite stores it with the original extra whitespace.
     pub fn to_sql(&self) -> String {
-        let mut sql = format!("CREATE TABLE {} (", quote_ident(&self.name));
+        self.to_sql_with_name(&self.name)
+    }
+
+    pub fn to_sql_with_name(&self, table_name: &str) -> String {
+        self.to_sql_with_name_sql(&quote_ident(table_name))
+    }
+
+    pub fn to_sql_with_name_sql(&self, table_name_sql: &str) -> String {
+        let mut sql = format!("CREATE TABLE {table_name_sql} (");
         let needs_pk_inline = self.primary_key_columns.len() == 1;
         // Add columns
         for (i, column) in self.columns.iter().enumerate() {
