@@ -165,8 +165,8 @@ public partial class SqliteConnection : DbConnection
             throw new InvalidOperationException(Properties.Resources.EncryptionNotSupported("e_sqlite3"));
 
         var originalState = State;
-        var (filename, openMode, readOnly) = NormalizeDataSource(_connectionOptions);
-        var sharedMemoryPath = IsSharedMemory(_connectionOptions) ? RegisterSharedMemoryFile(filename) : null;
+        var (filename, openMode, readOnly, sharedMemory) = NormalizeDataSource(_connectionOptions);
+        var sharedMemoryPath = sharedMemory ? RegisterSharedMemoryFile(filename) : null;
         try
         {
             _database = TursoBindings.OpenDatabase(filename, openMode);
@@ -1058,7 +1058,7 @@ public partial class SqliteConnection : DbConnection
     private static bool IsSqlIdentifierPart(char value)
         => char.IsLetterOrDigit(value) || value == '_' || value == '$';
 
-    private static (string Filename, TursoDatabaseOpenMode OpenMode, bool ReadOnly) NormalizeDataSource(
+    private static (string Filename, TursoDatabaseOpenMode OpenMode, bool ReadOnly, bool SharedMemory) NormalizeDataSource(
         SqliteConnectionStringBuilder options)
     {
         var dataSource = options.DataSource;
@@ -1074,7 +1074,7 @@ public partial class SqliteConnection : DbConnection
         var mode = uriMode ?? options.Mode;
         if (mode == SqliteOpenMode.Memory)
             return uriMode is null && options.Cache == SqliteCacheMode.Shared
-                ? (GetSharedMemoryFile(dataSource), TursoDatabaseOpenMode.CreateIfMissing, false)
+                ? (GetSharedMemoryFile(dataSource), TursoDatabaseOpenMode.CreateIfMissing, false, true)
                 : NormalizeMemoryDataSource(mode);
 
         const string dataDirectory = "|DataDirectory|";
@@ -1101,7 +1101,8 @@ public partial class SqliteConnection : DbConnection
                 SqliteOpenMode.ReadOnly => TursoDatabaseOpenMode.ReadOnly,
                 _ => throw new ArgumentOutOfRangeException(nameof(mode)),
             },
-            mode == SqliteOpenMode.ReadOnly);
+            mode == SqliteOpenMode.ReadOnly,
+            false);
     }
 
     private static (string Filename, SqliteOpenMode? Mode) NormalizeUriDataSource(string dataSource)
@@ -1137,7 +1138,7 @@ public partial class SqliteConnection : DbConnection
             uriMode);
     }
 
-    private static (string Filename, TursoDatabaseOpenMode OpenMode, bool ReadOnly) NormalizeMemoryDataSource(
+    private static (string Filename, TursoDatabaseOpenMode OpenMode, bool ReadOnly, bool SharedMemory) NormalizeMemoryDataSource(
         SqliteOpenMode mode)
         => (
             ":memory:",
@@ -1146,7 +1147,8 @@ public partial class SqliteConnection : DbConnection
                 : mode == SqliteOpenMode.ReadWrite
                     ? TursoDatabaseOpenMode.ReadWrite
                     : TursoDatabaseOpenMode.CreateIfMissing,
-            mode == SqliteOpenMode.ReadOnly);
+            mode == SqliteOpenMode.ReadOnly,
+            false);
 
     private static bool IsSupportedVfs(string vfs)
         => vfs.Equals("win32-longpath", StringComparison.OrdinalIgnoreCase)
@@ -1163,9 +1165,6 @@ public partial class SqliteConnection : DbConnection
 
     private static string QuoteIdentifier(string identifier)
         => "\"" + identifier.Replace("\"", "\"\"", StringComparison.Ordinal) + "\"";
-
-    private static bool IsSharedMemory(SqliteConnectionStringBuilder options)
-        => options.Mode == SqliteOpenMode.Memory && options.Cache == SqliteCacheMode.Shared && options.DataSource.Length > 0;
 
     private static string RegisterSharedMemoryFile(string path)
     {
