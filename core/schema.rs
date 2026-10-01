@@ -51,6 +51,7 @@ pub struct Trigger {
     pub name: String,
     pub sql: String,
     pub table_name: String,
+    pub table_name_sql: String,
     pub time: turso_parser::ast::TriggerTime,
     pub event: turso_parser::ast::TriggerEvent,
     pub for_each_row: bool,
@@ -77,6 +78,7 @@ impl Trigger {
         name: String,
         sql: String,
         table_name: String,
+        table_name_sql: String,
         time: Option<turso_parser::ast::TriggerTime>,
         event: turso_parser::ast::TriggerEvent,
         for_each_row: bool,
@@ -89,6 +91,7 @@ impl Trigger {
             name,
             sql,
             table_name,
+            table_name_sql,
             time: time.unwrap_or(turso_parser::ast::TriggerTime::Before),
             event,
             for_each_row,
@@ -1095,7 +1098,7 @@ impl Schema {
         !self
             .indexes
             .iter()
-            .any(|idx| idx.1.iter().any(|i| i.name == name))
+            .any(|idx| idx.1.iter().any(|i| i.name.eq_ignore_ascii_case(name)))
     }
 
     pub fn add_materialized_view(&mut self, view: IncrementalView, table: Arc<Table>, sql: String) {
@@ -1375,6 +1378,7 @@ impl Schema {
 
     pub fn remove_table(&mut self, table_name: &str) {
         let name = normalize_ident(table_name);
+        self.table_display_names.remove(&name);
         #[cfg(feature = "conn_raw_api")]
         {
             if let Some(table) = self.tables.remove(&name) {
@@ -1478,7 +1482,7 @@ impl Schema {
         self.indexes
             .get(&name)?
             .iter()
-            .find(|index| index.name == index_name)
+            .find(|index| index.name.eq_ignore_ascii_case(index_name))
     }
 
     pub fn remove_indices_for_table(&mut self, table_name: &str) {
@@ -2364,6 +2368,7 @@ impl Schema {
                         // schema lookup since `normalize_ident` does not strip quotes.
                         // This must match the bucket key used in `add_trigger` below.
                         tbl_name.name.as_str().to_string(),
+                        tbl_name.name.to_string(),
                         time,
                         event,
                         for_each_row,
@@ -5964,7 +5969,7 @@ impl Index {
                 with_clause,
                 ..
             })) => {
-                let index_name = normalize_ident(idx_name.name.as_str());
+                let index_name = idx_name.name.as_str().to_string();
                 let index_columns = resolve_sorted_columns(table, &columns)?;
                 if let Some(using) = using {
                     if where_clause.is_some() {
@@ -6072,7 +6077,7 @@ impl Index {
         assert!(primary_keys.len() == column_count);
 
         Ok(Index {
-            name: normalize_ident(index_name.as_str()),
+            name: index_name,
             table_name: table.name.clone(),
             root_page,
             columns: primary_keys,
@@ -6124,7 +6129,7 @@ impl Index {
         }
 
         Ok(Index {
-            name: normalize_ident(index_name.as_str()),
+            name: index_name,
             table_name: table.name.clone(),
             root_page,
             columns: unique_cols,

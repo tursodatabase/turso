@@ -199,6 +199,10 @@ pub fn quote_identifier(name: &str) -> String {
     }
 }
 
+pub fn double_quoted_name(name: &str) -> ast::Name {
+    ast::Name::from_string(format!("\"{}\"", name.replace('"', "\"\"")))
+}
+
 pub const PRIMARY_KEY_AUTOMATIC_INDEX_NAME_PREFIX: &str = "sqlite_autoindex_";
 
 /// Unparsed index that comes from a sql query, i.e not an automatic index
@@ -3515,7 +3519,7 @@ pub fn rewrite_check_expr_table_refs(expr: &mut ast::Expr, from: &str, to: &str)
                 ast::Expr::Qualified(tbl, col) => {
                     if tbl.as_str().eq_ignore_ascii_case(from) {
                         let col = col.clone();
-                        *e = ast::Expr::Qualified(ast::Name::exact(to.to_owned()), col);
+                        *e = ast::Expr::Qualified(double_quoted_name(to), col);
                     }
                 }
                 ast::Expr::Exists(select) | ast::Expr::Subquery(select) => {
@@ -3526,7 +3530,7 @@ pub fn rewrite_check_expr_table_refs(expr: &mut ast::Expr, from: &str, to: &str)
                 }
                 ast::Expr::InTable { rhs, .. } => {
                     if rhs.name.as_str().eq_ignore_ascii_case(from) {
-                        rhs.name = ast::Name::exact(to.to_owned());
+                        rhs.name = double_quoted_name(to);
                     }
                 }
                 _ => {}
@@ -3586,7 +3590,7 @@ pub fn rewrite_fk_parent_table_if_needed(
     new_tbl: &str,
 ) -> bool {
     if clause.tbl_name.as_str().eq_ignore_ascii_case(old_tbl) {
-        clause.tbl_name = ast::Name::exact(new_tbl.to_owned());
+        clause.tbl_name = double_quoted_name(new_tbl);
         return true;
     }
     false
@@ -3624,7 +3628,7 @@ pub fn rewrite_trigger_cmd_table_refs(cmd: &mut ast::TriggerCmd, old_tbl: &str, 
             ..
         } => {
             if tbl_name.as_str().eq_ignore_ascii_case(old_tbl) {
-                *tbl_name = ast::Name::exact(new_tbl.to_owned());
+                *tbl_name = double_quoted_name(new_tbl);
             }
             for set in sets {
                 rewrite_check_expr_table_refs(&mut set.expr, old_tbl, new_tbl);
@@ -3643,7 +3647,7 @@ pub fn rewrite_trigger_cmd_table_refs(cmd: &mut ast::TriggerCmd, old_tbl: &str, 
             ..
         } => {
             if tbl_name.as_str().eq_ignore_ascii_case(old_tbl) {
-                *tbl_name = ast::Name::exact(new_tbl.to_owned());
+                *tbl_name = double_quoted_name(new_tbl);
             }
             rewrite_select_table_refs(select, old_tbl, new_tbl);
             if let Some(ref mut upsert) = upsert {
@@ -3655,7 +3659,7 @@ pub fn rewrite_trigger_cmd_table_refs(cmd: &mut ast::TriggerCmd, old_tbl: &str, 
             where_clause,
         } => {
             if tbl_name.as_str().eq_ignore_ascii_case(old_tbl) {
-                *tbl_name = ast::Name::exact(new_tbl.to_owned());
+                *tbl_name = double_quoted_name(new_tbl);
             }
             if let Some(ref mut wc) = where_clause {
                 rewrite_check_expr_table_refs(wc, old_tbl, new_tbl);
@@ -4992,7 +4996,7 @@ fn rewrite_one_select_table_refs(one: &mut ast::OneSelect, old_tbl: &str, new_tb
                     }
                     ast::ResultColumn::TableStar(ref mut name) => {
                         if name.as_str().eq_ignore_ascii_case(old_tbl) {
-                            *name = ast::Name::exact(new_tbl.to_owned());
+                            *name = double_quoted_name(new_tbl);
                         }
                     }
                     ast::ResultColumn::Star => {}
@@ -5031,12 +5035,12 @@ fn rewrite_select_table_entry_table_refs(st: &mut ast::SelectTable, old_tbl: &st
     match st {
         ast::SelectTable::Table(ref mut name, _, _) => {
             if name.name.as_str().eq_ignore_ascii_case(old_tbl) {
-                name.name = ast::Name::exact(new_tbl.to_owned());
+                name.name = double_quoted_name(new_tbl);
             }
         }
         ast::SelectTable::TableCall(ref mut name, ref mut args, _) => {
             if name.name.as_str().eq_ignore_ascii_case(old_tbl) {
-                name.name = ast::Name::exact(new_tbl.to_owned());
+                name.name = double_quoted_name(new_tbl);
             }
             for arg in args {
                 rewrite_check_expr_table_refs(arg, old_tbl, new_tbl);

@@ -35,7 +35,7 @@ use crate::types::{
     IOCompletions, IOResult, ImmutableRecord, IndexInfo, SeekResult, Text, ValueIterator,
 };
 use crate::util::{
-    escape_sql_string_literal, normalize_ident, rename_identifiers,
+    double_quoted_name, escape_sql_string_literal, normalize_ident, rename_identifiers,
     rename_identifiers_scoped_when_clause, rewrite_check_expr_table_refs,
     rewrite_column_level_fk_parent_columns_if_needed, rewrite_column_references_if_needed,
     rewrite_fk_parent_cols_if_self_ref, rewrite_fk_parent_table_if_needed,
@@ -11564,16 +11564,19 @@ pub fn op_function(
                             _ => panic!("rename_to parameter should be TEXT"),
                         }
                     };
-                    let rename_to = normalize_ident(original_rename_to.as_str());
                     let rename_to_display = original_rename_to.to_string();
 
                     let autoindex_prefix = format!("sqlite_autoindex_{rename_from}_");
-                    let new_name = if name.len() >= autoindex_prefix.len()
+                    let new_name = if entry_type.as_str().eq_ignore_ascii_case("index")
+                        && tbl_name.eq_ignore_ascii_case(&rename_from)
+                        && name.len() >= autoindex_prefix.len()
                         && name[..autoindex_prefix.len()].eq_ignore_ascii_case(&autoindex_prefix)
                     {
                         let column = &name[autoindex_prefix.len()..];
                         format!("sqlite_autoindex_{rename_to_display}_{column}")
-                    } else if name.eq_ignore_ascii_case(&rename_from) {
+                    } else if entry_type.as_str().eq_ignore_ascii_case("table")
+                        && name.eq_ignore_ascii_case(&rename_from)
+                    {
                         rename_to_display.clone()
                     } else {
                         name
@@ -11623,7 +11626,7 @@ pub fn op_function(
 
                                 Some(
                                     ast::Stmt::CreateIndex {
-                                        tbl_name: ast::Name::exact(original_rename_to.to_string()),
+                                        tbl_name: double_quoted_name(original_rename_to.as_str()),
                                         unique,
                                         if_not_exists,
                                         idx_name,
@@ -11690,7 +11693,7 @@ pub fn op_function(
                                             rewrite_check_expr_table_refs(
                                                 expr,
                                                 &rename_from,
-                                                &rename_to,
+                                                original_rename_to.as_str(),
                                             );
                                             // The captured source text no longer
                                             // matches the rewritten expression.
@@ -11707,7 +11710,7 @@ pub fn op_function(
                                                 rewrite_check_expr_table_refs(
                                                     expr,
                                                     &rename_from,
-                                                    &rename_to,
+                                                    original_rename_to.as_str(),
                                                 );
                                                 *source = None;
                                             }
@@ -11720,7 +11723,7 @@ pub fn op_function(
                                     let new_stmt = ast::Stmt::CreateTable {
                                         tbl_name: ast::QualifiedName {
                                             db_name: None,
-                                            name: ast::Name::exact(original_rename_to.to_string()),
+                                            name: double_quoted_name(original_rename_to.as_str()),
                                             alias: None,
                                         },
                                         temporary,
@@ -11774,8 +11777,8 @@ pub fn op_function(
                                         ast::Stmt::CreateVirtualTable(ast::CreateVirtualTable {
                                             tbl_name: ast::QualifiedName {
                                                 db_name: tbl_name.db_name,
-                                                name: ast::Name::exact(
-                                                    original_rename_to.to_string(),
+                                                name: double_quoted_name(
+                                                    original_rename_to.as_str(),
                                                 ),
                                                 alias: None,
                                             },
@@ -11803,7 +11806,7 @@ pub fn op_function(
                                 let new_trigger_tbl_name = if trigger_tbl == rename_from {
                                     ast::QualifiedName {
                                         db_name: trigger_tbl_name.db_name,
-                                        name: ast::Name::exact(original_rename_to.to_string()),
+                                        name: double_quoted_name(original_rename_to.as_str()),
                                         alias: None,
                                     }
                                 } else {
@@ -16822,7 +16825,7 @@ fn regenerate_trigger_sql(trigger: &crate::schema::Trigger) -> String {
     };
     let tbl_name = QualifiedName {
         db_name: None,
-        name: Name::from_string(&trigger.table_name),
+        name: Name::from_string(&trigger.table_name_sql),
         alias: None,
     };
     create_trigger_to_sql(
@@ -16864,14 +16867,14 @@ fn with_relevant_trigger_schemas_mut(
 fn rewrite_trigger_for_table_rename(
     trigger: &mut crate::schema::Trigger,
     normalized_from: &str,
-    normalized_to: &str,
+    new_name: &str,
 ) {
     let old_sql = trigger.sql.clone();
     for cmd in &mut trigger.commands {
-        rewrite_trigger_cmd_table_refs(cmd, normalized_from, normalized_to);
+        rewrite_trigger_cmd_table_refs(cmd, normalized_from, new_name);
     }
     if let Some(ref mut when) = trigger.when_clause {
-        rewrite_check_expr_table_refs(when, normalized_from, normalized_to);
+        rewrite_check_expr_table_refs(when, normalized_from, new_name);
     }
     let new_sql = regenerate_trigger_sql(trigger);
     if new_sql != old_sql {
@@ -16932,14 +16935,22 @@ pub fn op_rename_table(
     let conn = program.connection.clone();
 
     conn.with_database_schema_mut(*db, |schema| -> crate::Result<()> {
+        schema.table_display_names.remove(&normalized_from);
+        schema
+            .table_display_names
+            .insert(normalized_to.clone(), to.clone());
+
         if let Some(mut indexes) = schema.indexes.remove(&normalized_from) {
             let autoindex_prefix = format!("sqlite_autoindex_{normalized_from}_");
             indexes.iter_mut().for_each(|index| {
                 let index = Arc::make_mut(index);
                 normalized_to.clone_into(&mut index.table_name);
                 // Rename autoindexes to match the new table name
-                if let Some(suffix) = index.name.strip_prefix(&autoindex_prefix) {
-                    index.name = format!("sqlite_autoindex_{normalized_to}_{suffix}");
+                if index.name.len() >= autoindex_prefix.len()
+                    && index.name[..autoindex_prefix.len()].eq_ignore_ascii_case(&autoindex_prefix)
+                {
+                    let suffix = &index.name[autoindex_prefix.len()..];
+                    index.name = format!("sqlite_autoindex_{to}_{suffix}");
                 }
             });
 
@@ -16965,11 +16976,7 @@ pub fn op_rename_table(
 
                 // Rewrite table-qualified refs in CHECK constraints
                 for check in &mut btree.check_constraints {
-                    rewrite_check_expr_table_refs(
-                        &mut check.expr,
-                        &normalized_from,
-                        &normalized_to,
-                    );
+                    rewrite_check_expr_table_refs(&mut check.expr, &normalized_from, to);
                     // The captured source text no longer matches the
                     // rewritten expression.
                     check.source = None;
@@ -17008,8 +17015,9 @@ pub fn op_rename_table(
         if let Some(mut triggers) = schema.triggers.remove(&normalized_from) {
             for trigger_arc in &mut triggers {
                 let trigger = Arc::make_mut(trigger_arc);
-                normalized_to.clone_into(&mut trigger.table_name);
-                rewrite_trigger_for_table_rename(trigger, &normalized_from, &normalized_to);
+                to.clone_into(&mut trigger.table_name);
+                trigger.table_name_sql = double_quoted_name(to).to_string();
+                rewrite_trigger_for_table_rename(trigger, &normalized_from, to);
             }
             schema.triggers.insert(normalized_to.to_owned(), triggers);
         }
@@ -17058,7 +17066,7 @@ pub fn op_rename_table(
                     continue;
                 }
                 let trigger = Arc::make_mut(trigger_arc);
-                rewrite_trigger_for_table_rename(trigger, &normalized_from, &normalized_to);
+                rewrite_trigger_for_table_rename(trigger, &normalized_from, to);
             }
         }
 
@@ -17083,8 +17091,9 @@ pub fn op_rename_table(
                     };
                     if targets_renamed_database {
                         let trigger = Arc::make_mut(&mut trigger_arc);
-                        normalized_to.clone_into(&mut trigger.table_name);
-                        rewrite_trigger_for_table_rename(trigger, &normalized_from, &normalized_to);
+                        to.clone_into(&mut trigger.table_name);
+                        trigger.table_name_sql = double_quoted_name(to).to_string();
+                        rewrite_trigger_for_table_rename(trigger, &normalized_from, to);
                         triggers_to_rename.push_back(trigger_arc);
                     } else {
                         triggers_to_keep.push_back(trigger_arc);
@@ -17108,7 +17117,7 @@ pub fn op_rename_table(
                         continue;
                     }
                     let trigger = Arc::make_mut(trigger_arc);
-                    rewrite_trigger_for_table_rename(trigger, &normalized_from, &normalized_to);
+                    rewrite_trigger_for_table_rename(trigger, &normalized_from, to);
                 }
             }
             Ok(())
