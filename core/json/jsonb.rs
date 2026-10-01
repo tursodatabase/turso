@@ -41,6 +41,8 @@ const fn make_whitespace_table() -> [u8; 256] {
     table[0xE3] |= 2; // First byte of U+3000
     table[0xEF] |= 2; // First byte of U+FEFF
 
+    table[b'/' as usize] |= 4;
+
     table
 }
 
@@ -4306,7 +4308,7 @@ fn find_string_special_byte(input: &[u8], mut pos: usize, quote: u8) -> usize {
 #[inline(always)]
 pub fn skip_whitespace_tracking(input: &[u8], pos: usize, info: &mut ParseInfo) -> usize {
     // Fast path for non-whitespace, non-comment
-    if pos >= input.len() || ((WS_TABLE[input[pos] as usize] & 3) == 0 && input[pos] != b'/') {
+    if pos >= input.len() || WS_TABLE[input[pos] as usize] == 0 {
         return pos;
     }
     skip_whitespace_and_comments(input, pos, info)
