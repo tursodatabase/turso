@@ -376,14 +376,16 @@ pub fn json_array_length(
             let len = json.array_len()?;
             return Ok(Value::from_i64(len as i64));
         };
-        if let Some(path) = json_path_from_db_value(path, true)? {
-            if let Ok(Some(pos)) = jsonb::find_path_element(json.as_slice(), &path) {
-                if let Ok(len) = jsonb::element_at(json.as_slice(), pos)?.array_len() {
-                    return Ok(Value::from_i64(len as i64));
+        json_cache.with_path(path.as_value_ref(), true, |path| {
+            if let Some(path) = path {
+                if let Ok(Some(pos)) = jsonb::find_path_element(json.as_slice(), path) {
+                    if let Ok(len) = jsonb::element_at(json.as_slice(), pos)?.array_len() {
+                        return Ok(Value::from_i64(len as i64));
+                    }
                 }
             }
-        }
-        Ok(Value::Null)
+            Ok(Value::Null)
+        })
     })
 }
 
@@ -583,15 +585,20 @@ where
     json_cache.with_jsonb(value, convert_to_jsonb, |value| {
         let mut result = Jsonb::make_empty_array(value.len())?;
         for path in paths {
-            let path = json_path_from_db_value(&path, true);
-            if let Some(path) = path? {
-                match find_and_read(value.as_slice(), &path, jsonb::element_at)? {
-                    Some(element) => result.append_to_array_unsafe(&element.data()),
-                    None => result
-                        .append_to_array_unsafe(JsonbHeader::make_null().into_bytes().as_bytes()),
+            let found = json_cache.with_path(path.as_value_ref(), true, |path| match path {
+                Some(path) => Ok(Some(find_and_read(
+                    value.as_slice(),
+                    path,
+                    jsonb::element_at,
+                )?)),
+                None => Ok(None),
+            })?;
+            match found {
+                Some(Some(element)) => result.append_to_array_unsafe(&element.data()),
+                Some(None) => {
+                    result.append_to_array_unsafe(JsonbHeader::make_null().into_bytes().as_bytes())
                 }
-            } else {
-                return Ok(Value::Null);
+                None => return Ok(Value::Null),
             }
         }
         result.finalize_unsafe(ElementType::ARRAY)?;
@@ -607,25 +614,28 @@ fn extract_path_element<R>(
     read: impl FnOnce(&[u8], usize) -> crate::Result<R>,
 ) -> crate::Result<Option<R>> {
     let convert_to_jsonb = curry_convert_dbtype_to_jsonb(Conv::Strict);
+    let path = path.as_value_ref();
     if let Some(document) = jsonb_blob_document(value) {
-        let Some(path) = json_path_from_db_value(path, strict_path)? else {
-            return Ok(None);
-        };
-        return match jsonb::find_path_element(document, &path) {
-            Ok(None) => Ok(None),
-            Ok(Some(pos)) if jsonb::is_valid_element_at(document, pos) => {
-                read(document, pos).map(Some)
+        return json_cache.with_path(path, strict_path, |path| {
+            let Some(path) = path else {
+                return Ok(None);
+            };
+            match jsonb::find_path_element(document, path) {
+                Ok(None) => Ok(None),
+                Ok(Some(pos)) if jsonb::is_valid_element_at(document, pos) => {
+                    read(document, pos).map(Some)
+                }
+                Ok(Some(_)) | Err(_) => json_cache.with_jsonb(value, convert_to_jsonb, |json| {
+                    find_and_read(json.as_slice(), path, read)
+                }),
             }
-            Ok(Some(_)) | Err(_) => json_cache.with_jsonb(value, convert_to_jsonb, |json| {
-                find_and_read(json.as_slice(), &path, read)
-            }),
-        };
+        });
     }
     json_cache.with_jsonb(value, convert_to_jsonb, |json| {
-        let Some(path) = json_path_from_db_value(path, strict_path)? else {
-            return Ok(None);
-        };
-        find_and_read(json.as_slice(), &path, read)
+        json_cache.with_path(path, strict_path, |path| match path {
+            Some(path) => find_and_read(json.as_slice(), path, read),
+            None => Ok(None),
+        })
     })
 }
 

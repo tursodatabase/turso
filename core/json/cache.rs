@@ -1,12 +1,15 @@
-use std::cell::{Cell, UnsafeCell};
+use std::cell::{Cell, RefCell, UnsafeCell};
 
 use crate::alloc::{TryClone, TryReserveError};
 use crate::types::AsValueRef;
 use crate::{Value, ValueRef};
 
+use super::json_path_from_db_value;
 use super::jsonb::Jsonb;
+use super::path::JsonPath;
 
 const JSON_CACHE_SIZE: usize = 4;
+const PATH_CACHE_SIZE: usize = 4;
 
 #[derive(Debug)]
 pub struct JsonCache {
@@ -101,6 +104,39 @@ impl JsonCache {
 pub struct JsonCacheCell {
     inner: UnsafeCell<Option<JsonCache>>,
     accessed: Cell<bool>,
+    paths: RefCell<ParsedPathCache>,
+}
+
+#[derive(Debug, Default)]
+struct ParsedPathCache {
+    entries: Vec<ParsedPath>,
+    next_slot: usize,
+}
+
+#[derive(Debug)]
+struct ParsedPath {
+    text: String,
+    strict: bool,
+    path: JsonPath<'static>,
+}
+
+impl ParsedPathCache {
+    fn find(&self, text: &str, strict: bool) -> Option<usize> {
+        self.entries
+            .iter()
+            .position(|entry| entry.strict == strict && entry.text == text)
+    }
+
+    fn insert(&mut self, entry: ParsedPath) -> usize {
+        if self.entries.len() < PATH_CACHE_SIZE {
+            self.entries.push(entry);
+            return self.entries.len() - 1;
+        }
+        let slot = self.next_slot;
+        self.next_slot = (slot + 1) % PATH_CACHE_SIZE;
+        self.entries[slot] = entry;
+        slot
+    }
 }
 
 struct JsonCacheAccessGuard<'a> {
@@ -122,6 +158,7 @@ impl JsonCacheCell {
         Self {
             inner: UnsafeCell::new(None),
             accessed: Cell::new(false),
+            paths: RefCell::new(ParsedPathCache::default()),
         }
     }
 
@@ -156,6 +193,33 @@ impl JsonCacheCell {
         value: impl FnOnce(ValueRef) -> crate::Result<Jsonb>,
     ) -> crate::Result<Jsonb> {
         self.with_jsonb(key, value, |json| Ok(json.try_clone()?))
+    }
+
+    pub fn with_path<R>(
+        &self,
+        path: ValueRef<'_>,
+        strict: bool,
+        read: impl FnOnce(Option<&JsonPath<'_>>) -> crate::Result<R>,
+    ) -> crate::Result<R> {
+        let ValueRef::Text(text) = path else {
+            let parsed = json_path_from_db_value(&path, strict)?;
+            return read(parsed.as_ref());
+        };
+        let mut paths = self.paths.borrow_mut();
+        let slot = match paths.find(text.as_str(), strict) {
+            Some(slot) => slot,
+            None => {
+                let Some(parsed) = json_path_from_db_value(&path, strict)? else {
+                    return read(None);
+                };
+                paths.insert(ParsedPath {
+                    text: text.as_str().to_string(),
+                    strict,
+                    path: parsed.into_owned(),
+                })
+            }
+        };
+        read(Some(&paths.entries[slot].path))
     }
 
     pub fn with_jsonb<R>(
@@ -205,6 +269,28 @@ mod tests {
         let value = Jsonb::from_str(json_str).unwrap();
 
         (key, value)
+    }
+
+    #[test]
+    fn parsed_path_cache_returns_the_same_parse_as_the_parser() {
+        let cache_cell = JsonCacheCell::new();
+        let texts = ["$.a", "$.b[1]", "a", "$", "$.c.d", "$.a", "a", "$[#-1]"];
+        for _ in 0..3 {
+            for text in texts {
+                let value = Value::build_text(text);
+                for strict in [true, false] {
+                    let expected = json_path_from_db_value(&value, strict)
+                        .map(|path| path.map(|path| format!("{:?}", path.elements)))
+                        .map_err(|err| err.to_string());
+                    let cached = cache_cell
+                        .with_path(value.as_value_ref(), strict, |path| {
+                            Ok(path.map(|path| format!("{:?}", path.elements)))
+                        })
+                        .map_err(|err| err.to_string());
+                    assert_eq!(cached, expected, "{text} strict={strict}");
+                }
+            }
+        }
     }
 
     #[test]
