@@ -2476,23 +2476,24 @@ impl Jsonb {
 
         let new_len = header_bytes.len();
 
+        let old_end = self.data.len();
         match new_len.cmp(&old_len) {
             std::cmp::Ordering::Greater => {
-                self.data.try_reserve(new_len - old_len)?;
-                self.data.splice(
-                    cursor + old_len..cursor + old_len,
-                    std::iter::repeat_n(0, new_len - old_len),
-                );
+                let growth = new_len - old_len;
+                self.data.try_reserve(growth)?;
+                self.data.resize(old_end + growth, 0);
+                self.data
+                    .copy_within(cursor + old_len..old_end, cursor + new_len);
             }
             std::cmp::Ordering::Less => {
-                self.data.drain(cursor + new_len..cursor + old_len);
+                self.data
+                    .copy_within(cursor + old_len..old_end, cursor + new_len);
+                self.data.truncate(old_end - (old_len - new_len));
             }
             std::cmp::Ordering::Equal => {}
         }
 
-        for (i, &byte) in header_bytes.iter().enumerate() {
-            self.data[cursor + i] = byte;
-        }
+        self.data[cursor..cursor + new_len].copy_from_slice(header_bytes);
 
         Ok(new_len)
     }
