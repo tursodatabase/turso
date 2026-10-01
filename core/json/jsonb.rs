@@ -3588,6 +3588,11 @@ pub fn element_at(data: &[u8], pos: usize) -> Result<Jsonb> {
     Ok(Jsonb::from_raw_data(&data[pos..end])?)
 }
 
+pub fn element_payload(data: &[u8], pos: usize) -> Result<(ElementType, &[u8])> {
+    let (JsonbHeader(element_type, _), payload_start, end) = element_bounds(data, pos)?;
+    Ok((element_type, &data[payload_start..end]))
+}
+
 pub fn is_valid_element_at(data: &[u8], pos: usize) -> bool {
     match element_bounds(data, pos) {
         Ok((_, _, end)) => validate_element(data, pos, end, 0, false).is_ok(),

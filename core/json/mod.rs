@@ -31,6 +31,7 @@ pub enum Conv {
 }
 
 #[cfg(feature = "json")]
+#[derive(Clone, Copy)]
 pub enum OutputVariant {
     ElementType,
     ElementTypePlain,
@@ -482,10 +483,12 @@ pub fn json_arrow_extract(
     if let ValueRef::Null = value {
         return Ok(Value::Null);
     }
-    match extract_path_element(value, &path, false, json_cache)? {
-        Some(element) => Ok(Value::Text(Text::json(element.to_string()?))),
-        None => Ok(Value::Null),
-    }
+    let element = extract_path_element(value, &path, false, json_cache, |data, pos| {
+        Ok(Value::Text(Text::json(
+            jsonb::element_at(data, pos)?.to_string()?,
+        )))
+    })?;
+    Ok(element.unwrap_or(Value::Null))
 }
 
 /// Implements the ->> operator. Always returns a SQL representation of the JSON subcomponent.
@@ -499,14 +502,10 @@ pub fn json_arrow_shift_extract(
     if let ValueRef::Null = value {
         return Ok(Value::Null);
     }
-    let Some(extracted) = extract_path_element(value, &path, false, json_cache)? else {
-        return Ok(Value::Null);
-    };
-    let element_type = match extracted.element_type() {
-        Err(_) => return Ok(Value::Null),
-        Ok(el) => el,
-    };
-    json_string_to_db_type(extracted, element_type, OutputVariant::ElementTypePlain)
+    let element = extract_path_element(value, &path, false, json_cache, |data, pos| {
+        element_to_db_type(data, pos, OutputVariant::ElementTypePlain)
+    })?;
+    Ok(element.unwrap_or(Value::Null))
 }
 
 /// Extracts a JSON value from a JSON object or array.
@@ -531,11 +530,7 @@ where
     if paths.len() == 0 {
         return Ok(Value::Null);
     }
-    let (json, element_type) = jsonb_extract_internal(value, paths, json_cache)?;
-
-    let result = json_string_to_db_type(json, element_type, OutputVariant::ElementType)?;
-
-    Ok(result)
+    jsonb_extract_internal(value, paths, json_cache, OutputVariant::ElementType)
 }
 
 pub fn jsonb_extract<I, E, V>(
@@ -556,33 +551,32 @@ where
     if paths.len() == 0 {
         return Ok(Value::Null);
     }
-    let (json, element_type) = jsonb_extract_internal(value.as_value_ref(), paths, json_cache)?;
-    let result = json_string_to_db_type(json, element_type, OutputVariant::ElementType)?;
-
-    Ok(result)
+    jsonb_extract_internal(
+        value.as_value_ref(),
+        paths,
+        json_cache,
+        OutputVariant::ElementType,
+    )
 }
 
 fn jsonb_extract_internal<E, V>(
     value: ValueRef<'_>,
     mut paths: E,
     json_cache: &JsonCacheCell,
-) -> crate::Result<(Jsonb, ElementType)>
+    flag: OutputVariant,
+) -> crate::Result<Value>
 where
     V: AsValueRef,
     E: ExactSizeIterator<Item = V>,
 {
-    let null = || Jsonb::from_raw_data(JsonbHeader::make_null().into_bytes().as_bytes());
     if paths.len() == 1 {
         let first_path = paths.next().ok_or_else(|| {
             crate::LimboError::InternalError("paths should have one element".to_string())
         })?;
-        let Some(extracted) = extract_path_element(value, &first_path, true, json_cache)? else {
-            return Ok((null()?, ElementType::NULL));
-        };
-        return match extracted.element_type() {
-            Ok(element_type) => Ok((extracted, element_type)),
-            Err(_) => Ok((null()?, ElementType::NULL)),
-        };
+        let element = extract_path_element(value, &first_path, true, json_cache, |data, pos| {
+            element_to_db_type(data, pos, flag)
+        })?;
+        return Ok(element.unwrap_or(Value::Null));
     }
 
     let convert_to_jsonb = curry_convert_dbtype_to_jsonb(Conv::Strict);
@@ -591,26 +585,27 @@ where
         for path in paths {
             let path = json_path_from_db_value(&path, true);
             if let Some(path) = path? {
-                match find_element(value, &path)? {
+                match find_and_read(value.as_slice(), &path, jsonb::element_at)? {
                     Some(element) => result.append_to_array_unsafe(&element.data()),
                     None => result
                         .append_to_array_unsafe(JsonbHeader::make_null().into_bytes().as_bytes()),
                 }
             } else {
-                return Ok((null()?, ElementType::NULL));
+                return Ok(Value::Null);
             }
         }
         result.finalize_unsafe(ElementType::ARRAY)?;
-        Ok((result, ElementType::ARRAY))
+        json_string_to_db_type(result, ElementType::ARRAY, flag)
     })
 }
 
-fn extract_path_element(
+fn extract_path_element<R>(
     value: ValueRef<'_>,
     path: &impl AsValueRef,
     strict_path: bool,
     json_cache: &JsonCacheCell,
-) -> crate::Result<Option<Jsonb>> {
+    read: impl FnOnce(&[u8], usize) -> crate::Result<R>,
+) -> crate::Result<Option<R>> {
     let convert_to_jsonb = curry_convert_dbtype_to_jsonb(Conv::Strict);
     if let Some(document) = jsonb_blob_document(value) {
         let Some(path) = json_path_from_db_value(path, strict_path)? else {
@@ -619,24 +614,28 @@ fn extract_path_element(
         return match jsonb::find_path_element(document, &path) {
             Ok(None) => Ok(None),
             Ok(Some(pos)) if jsonb::is_valid_element_at(document, pos) => {
-                Ok(Some(jsonb::element_at(document, pos)?))
+                read(document, pos).map(Some)
             }
-            Ok(Some(_)) | Err(_) => {
-                json_cache.with_jsonb(value, convert_to_jsonb, |json| find_element(json, &path))
-            }
+            Ok(Some(_)) | Err(_) => json_cache.with_jsonb(value, convert_to_jsonb, |json| {
+                find_and_read(json.as_slice(), &path, read)
+            }),
         };
     }
     json_cache.with_jsonb(value, convert_to_jsonb, |json| {
         let Some(path) = json_path_from_db_value(path, strict_path)? else {
             return Ok(None);
         };
-        find_element(json, &path)
+        find_and_read(json.as_slice(), &path, read)
     })
 }
 
-fn find_element(json: &Jsonb, path: &JsonPath) -> crate::Result<Option<Jsonb>> {
-    match jsonb::find_path_element(json.as_slice(), path) {
-        Ok(Some(pos)) => Ok(Some(jsonb::element_at(json.as_slice(), pos)?)),
+fn find_and_read<R>(
+    data: &[u8],
+    path: &JsonPath,
+    read: impl FnOnce(&[u8], usize) -> crate::Result<R>,
+) -> crate::Result<Option<R>> {
+    match jsonb::find_path_element(data, path) {
+        Ok(Some(pos)) => read(data, pos).map(Some),
         Ok(None) | Err(_) => Ok(None),
     }
 }
@@ -652,6 +651,44 @@ fn jsonb_blob_document(value: ValueRef<'_>) -> Option<&[u8]> {
         return None;
     }
     looks_like_jsonb_blob(blob).then_some(blob)
+}
+
+fn element_to_db_type(data: &[u8], pos: usize, flag: OutputVariant) -> crate::Result<Value> {
+    let (element_type, payload) = jsonb::element_payload(data, pos)?;
+    if matches!(
+        flag,
+        OutputVariant::ElementType | OutputVariant::ElementTypePlain
+    ) {
+        let text = std::str::from_utf8(payload);
+        match (element_type, text) {
+            (ElementType::NULL, _) => return Ok(Value::Null),
+            (ElementType::TRUE, _) => return Ok(Value::from_i64(1)),
+            (ElementType::FALSE, _) => return Ok(Value::from_i64(0)),
+            (ElementType::INT, Ok(text)) => {
+                if let Ok(int) = i64::from_str(text) {
+                    return Ok(Value::from_i64(int));
+                }
+            }
+            (ElementType::FLOAT, Ok(text)) => {
+                if let Ok(float) = text.parse::<f64>() {
+                    return Ok(Value::from_f64(float));
+                }
+            }
+            (ElementType::TEXT | ElementType::TEXTRAW, Ok(text)) => {
+                return Ok(Value::Text(Text::new(text.to_string())));
+            }
+            (ElementType::TEXTJ, Ok(text)) if !payload.iter().any(|&b| b <= 0x1F) => {
+                return Ok(Value::Text(Text::new(unescape_string(text))));
+            }
+            _ => {}
+        }
+    }
+    let element = jsonb::element_at(data, pos)?;
+    let element_type = match element.element_type() {
+        Ok(element_type) => element_type,
+        Err(_) => return Ok(Value::Null),
+    };
+    json_string_to_db_type(element, element_type, flag)
 }
 
 /// converts a `Jsonb` value to a db Value
@@ -1097,6 +1134,44 @@ mod tests {
     use super::*;
     use crate::numeric::Numeric;
     use crate::types::Value;
+
+    #[test]
+    fn direct_element_conversion_matches_conversion_through_json_text() {
+        let parsed = Jsonb::from_str(
+            r#"[1, -0, 1.5, 1e400, -2.5e-3, 9223372036854775807, 9223372036854775808,
+               -9223372036854775809, 0x1F, +5, .5, 5., Infinity, -Infinity, NaN,
+               true, false, null, "plain", "esc\n\"é😀\/", 'single\x41',
+               "tab	in", "", {"a":1}, [1,[2]]]"#,
+        )
+        .unwrap();
+        let text_raw = [0x6Bu8, 0x5A, b'a', b'"', b'b', b'\\', b'c'];
+        let text_json_with_control = [0x4Bu8, 0x38, b'a', 0x01, b'\\'];
+        let documents: [&[u8]; 3] = [parsed.as_slice(), &text_raw, &text_json_with_control];
+        for data in documents {
+            let mut index = 0;
+            loop {
+                let path = JsonPath {
+                    elements: vec![PathElement::Root(), PathElement::ArrayLocator(Some(index))],
+                };
+                let Some(pos) = jsonb::find_path_element(data, &path).unwrap() else {
+                    break;
+                };
+                for flag in [OutputVariant::ElementType, OutputVariant::ElementTypePlain] {
+                    let element = jsonb::element_at(data, pos).unwrap();
+                    let element_type = element.element_type().unwrap();
+                    let expected = json_string_to_db_type(element, element_type, flag);
+                    let actual = element_to_db_type(data, pos, flag);
+                    assert_eq!(
+                        format!("{actual:?}"),
+                        format!("{expected:?}"),
+                        "element {index} of {data:?}"
+                    );
+                }
+                index += 1;
+            }
+            assert!(index > 0);
+        }
+    }
 
     #[test]
     fn json_valid_bad_flags_are_a_plain_sql_error_not_a_constraint() {
