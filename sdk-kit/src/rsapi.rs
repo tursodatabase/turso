@@ -898,7 +898,10 @@ impl TursoDatabase {
 
     /// create database holder struct but do not initialize it yet
     /// this can be useful for some environments, where IO operations must be executed in certain fashion (and open do IO under the hood)
-    pub fn new(config: TursoDatabaseConfig) -> Arc<Self> {
+    pub fn new(mut config: TursoDatabaseConfig) -> Arc<Self> {
+        if config.path == ":memory:" {
+            config.open_flags |= OpenFlags::Create;
+        }
         Arc::new(Self {
             config,
             db: Arc::new(Mutex::new(None)),
@@ -1864,6 +1867,22 @@ mod tests {
         );
         assert!(super::open_flags_from_capi(4).is_err());
         assert!(super::open_flags_from_capi(3).is_err());
+    }
+
+    #[test]
+    fn memory_database_always_creates_its_backing_store() {
+        for open_flags in [OpenFlags::None, OpenFlags::ReadOnly] {
+            let db = TursoDatabase::new(TursoDatabaseConfig {
+                path: ":memory:".to_string(),
+                open_flags,
+                ..config_with_features(None)
+            });
+            assert!(db.config.open_flags.contains(OpenFlags::Create));
+            assert_eq!(
+                db.config.open_flags.contains(OpenFlags::ReadOnly),
+                open_flags.contains(OpenFlags::ReadOnly)
+            );
+        }
     }
 
     #[test]
