@@ -435,10 +435,7 @@ unsafe extern "C" {
 }
 unsafe extern "C" {
     #[doc = " Set the maximum duration of each statement started on the connection. Zero disables the timeout."]
-    pub fn turso_connection_set_query_timeout_ms(
-        self_: *const turso_connection_t,
-        timeout_ms: u64,
-    );
+    pub fn turso_connection_set_query_timeout_ms(self_: *const turso_connection_t, timeout_ms: u64);
 }
 unsafe extern "C" {
     #[doc = " Get the current per-statement query timeout in milliseconds."]
@@ -561,10 +558,7 @@ unsafe extern "C" {
 }
 unsafe extern "C" {
     #[doc = " Set the timeout for this statement execution. Zero disables the timeout."]
-    pub fn turso_statement_set_query_timeout_ms(
-        self_: *const turso_statement_t,
-        timeout_ms: u64,
-    );
+    pub fn turso_statement_set_query_timeout_ms(self_: *const turso_statement_t, timeout_ms: u64);
 }
 unsafe extern "C" {
     #[doc = " Step statement execution once\n Returns TURSO_DONE if execution finished\n Returns TURSO_ROW if execution generated the row (row values can be inspected with corresponding statement methods)\n Returns TURSO_IO if async_io was set and statement needs to execute IO to make progress"]

@@ -140,6 +140,7 @@ extern "C" {
     );
     fn sqlite3_busy_timeout(db: *mut sqlite3, ms: i32) -> i32;
     fn sqlite3_interrupt(db: *mut sqlite3);
+    #[cfg(not(feature = "sqlite3"))]
     fn turso_set_query_timeout(db: *mut sqlite3, milliseconds: u64) -> i32;
     fn sqlite3_get_table(
         db: *mut sqlite3,
@@ -2936,6 +2937,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(feature = "sqlite3"))]
     fn test_interrupted_create_table_as_select_rolls_back_savepoint_and_schema() {
         unsafe {
             let mut db: *mut sqlite3 = ptr::null_mut();
@@ -3078,6 +3080,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(feature = "sqlite3"))]
     fn test_turso_query_timeout_interrupts_cpu_bound_statement() {
         unsafe {
             let mut db: *mut sqlite3 = ptr::null_mut();
