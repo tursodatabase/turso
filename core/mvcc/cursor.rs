@@ -643,14 +643,11 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> MvccLazyCursor<Clock
             .clone()
     }
 
-    /// False when `rowid` is above a positive physical B-tree last or shadowed in MVCC.
     fn btree_may_hold(&mut self, rowid: i64) -> bool {
-        // `insert_row_id_maybe_update` drops rowids <= 0 while max is still the
-        // 0 sentinel, so a non-positive max is not a bound.
-        match self.rowid_allocator().notexists_max() {
-            Some(max) if max > 0 && rowid > max => false,
-            _ => self.query_btree_version_is_valid(&RowKey::Int(rowid)),
+        if self.rowid_allocator().btree_last_rules_out(rowid) {
+            return false;
         }
+        self.query_btree_version_is_valid(&RowKey::Int(rowid))
     }
 
     /// Forward-direction shadow check: `IndexShadowScan` fast-path for index
@@ -2042,7 +2039,7 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> CursorTrait
                         self.state = None;
                         return Ok(IOResult::Done(false));
                     }
-                    if self.rowid_allocator().notexists_max().is_none() {
+                    if self.rowid_allocator().btree_last().is_none() {
                         self.state
                             .replace(MvccLazyCursorState::Exists(ExistsState::SeekBtreeLast));
                         continue;
@@ -2062,7 +2059,7 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> CursorTrait
                 }
                 Some(MvccLazyCursorState::Exists(ExistsState::ReadBtreeLast)) => {
                     let btree_max = return_if_io!(self.btree_cursor.rowid());
-                    self.rowid_allocator().record_notexists_max(btree_max);
+                    self.rowid_allocator().record_btree_last(btree_max);
                     if !self.btree_may_hold(int_key) {
                         self.state = None;
                         return Ok(IOResult::Done(false));

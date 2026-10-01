@@ -4038,11 +4038,8 @@ pub struct RowidAllocator {
     max_rowid: AtomicI64,
     /// True after the first btree-max scan. Never reset to false.
     initialized: AtomicBool,
-    /// Physical B-tree last rowid used only as the NotExists skip bound.
-    /// A deleted tail can sit here until checkpoint. Never copy this into
-    /// `max_rowid`.
-    notexists_max: AtomicI64,
-    notexists_ready: AtomicBool,
+    btree_last: AtomicI64,
+    btree_last_known: AtomicBool,
 }
 
 /// Sub state machine for [`MvStore::bootstrap_nonblock`]. Carried by the
@@ -10245,8 +10242,8 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                     lock: TursoRwLock::new(),
                     max_rowid: AtomicI64::new(0),
                     initialized: AtomicBool::new(false),
-                    notexists_max: AtomicI64::new(0),
-                    notexists_ready: AtomicBool::new(false),
+                    btree_last: AtomicI64::new(0),
+                    btree_last_known: AtomicBool::new(false),
                 })
             })
             .clone()
@@ -10390,25 +10387,34 @@ impl RowidAllocator {
                 break;
             }
         }
-        self.raise_notexists_max(rowid);
+        self.raise_btree_last(rowid);
     }
 
-    pub fn notexists_max(&self) -> Option<i64> {
-        self.notexists_ready
+    pub fn btree_last(&self) -> Option<i64> {
+        self.btree_last_known
             .load(Ordering::SeqCst)
-            .then(|| self.notexists_max.load(Ordering::SeqCst))
+            .then(|| self.btree_last.load(Ordering::SeqCst))
     }
 
-    pub fn record_notexists_max(&self, rowid: Option<i64>) {
+    pub fn btree_last_rules_out(&self, rowid: i64) -> bool {
+        // A last <= 0 is not a ceiling. Keys can sit to its right.
+        //
+        //   last = -5                    last = 5
+        //   -5  -3   0   3               1   3   5  100
+        //   [search every probe]         [search] [skip]
+        matches!(self.btree_last(), Some(last) if last > 0 && rowid > last)
+    }
+
+    pub fn record_btree_last(&self, rowid: Option<i64>) {
         if let Some(rowid) = rowid {
-            self.raise_notexists_max(rowid);
+            self.raise_btree_last(rowid);
         }
-        self.notexists_ready.store(true, Ordering::SeqCst);
+        self.btree_last_known.store(true, Ordering::SeqCst);
     }
 
-    fn raise_notexists_max(&self, rowid: i64) {
+    fn raise_btree_last(&self, rowid: i64) {
         let _ = self
-            .notexists_max
+            .btree_last
             .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |cur| {
                 (rowid > cur).then_some(rowid)
             });
