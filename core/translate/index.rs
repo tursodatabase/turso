@@ -272,13 +272,14 @@ pub fn translate_create_index(
         sqlite_schema_cursor_id,
         cdc_table.map(|x| x.0),
         SchemaEntryType::Index,
-        &original_idx_name.name.to_string(),
-        &resolver
-            .schema()
-            .table_display_names
-            .get(&tbl_name)
-            .cloned()
-            .unwrap_or_else(|| tbl.name.clone()),
+        original_idx_name.name.as_str(),
+        &resolver.with_schema(database_id, |schema| {
+            schema
+                .table_display_names
+                .get(&tbl_name)
+                .cloned()
+                .unwrap_or_else(|| tbl.name.clone())
+        }),
         root_page_reg,
         Some(sql),
     )?;
@@ -302,7 +303,7 @@ pub fn translate_create_index(
         p5: 0,
     });
     // Parse the schema table to get the index root page and add new index to Schema
-    let escaped_idx_name = escape_sql_string_literal(&idx_name);
+    let escaped_idx_name = escape_sql_string_literal(original_idx_name.name.as_str());
     let parse_schema_where_clause = format!("name = '{escaped_idx_name}' AND type = 'index'");
     program.emit_insn(Insn::ParseSchema {
         db: database_id,
@@ -1222,7 +1223,7 @@ pub fn translate_drop_index(
         s.indexes
             .values()
             .flat_map(|v| v.iter())
-            .filter(|idx| idx.name == idx_name)
+            .filter(|idx| idx.name.eq_ignore_ascii_case(&idx_name))
             .cloned()
             .collect()
     });
@@ -1303,7 +1304,7 @@ pub fn translate_drop_index(
         rhs: dest_reg,
         target_pc: next_label,
         flags: CmpInsFlags::default(),
-        collation: program.curr_collation(),
+        collation: Some(crate::translate::collate::CollationSeq::NoCase),
     });
 
     // read type of table
@@ -1435,7 +1436,7 @@ pub fn translate_optimize(
         resolver.with_schema(database_id, |schema| {
             for val in schema.indexes.values() {
                 for idx in val {
-                    if idx.name == idx_name {
+                    if idx.name.eq_ignore_ascii_case(&idx_name) {
                         if idx.index_method.is_some() && !idx.is_backing_btree_index() {
                             indexes_to_optimize.push((database_id, idx.clone()));
                         } else {
