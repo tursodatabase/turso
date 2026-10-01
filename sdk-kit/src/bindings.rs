@@ -430,6 +430,21 @@ unsafe extern "C" {
     pub fn turso_connection_set_busy_timeout_ms(self_: *const turso_connection_t, timeout_ms: i64);
 }
 unsafe extern "C" {
+    #[doc = " Interrupt statements currently executing on the connection. Safe to call from another thread while self remains valid."]
+    pub fn turso_connection_interrupt(self_: *const turso_connection_t);
+}
+unsafe extern "C" {
+    #[doc = " Set the maximum duration of each statement started on the connection. Zero disables the timeout."]
+    pub fn turso_connection_set_query_timeout_ms(
+        self_: *const turso_connection_t,
+        timeout_ms: u64,
+    );
+}
+unsafe extern "C" {
+    #[doc = " Get the current per-statement query timeout in milliseconds."]
+    pub fn turso_connection_get_query_timeout_ms(self_: *const turso_connection_t) -> u64;
+}
+unsafe extern "C" {
     #[doc = " Get autocommit state of the connection"]
     pub fn turso_connection_get_autocommit(self_: *const turso_connection_t) -> bool;
 }

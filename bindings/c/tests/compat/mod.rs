@@ -222,6 +222,8 @@ const SQLITE_OPEN_URI: i32 = 0x00000040;
 
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
 
     #[test]
     fn test_libversion() {
@@ -2929,10 +2931,14 @@ mod tests {
                 SQLITE_OK
             );
 
+            let finished = Arc::new(AtomicBool::new(false));
+            let finished_in_thread = Arc::clone(&finished);
             let db_addr = db as usize;
             let interrupter = std::thread::spawn(move || {
-                std::thread::sleep(std::time::Duration::from_millis(10));
-                sqlite3_interrupt(db_addr as *mut sqlite3);
+                while !finished_in_thread.load(Ordering::Acquire) {
+                    sqlite3_interrupt(db_addr as *mut sqlite3);
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
             });
             let rc = sqlite3_exec(
                 db,
@@ -2941,6 +2947,7 @@ mod tests {
                 ptr::null_mut(),
                 ptr::null_mut(),
             );
+            finished.store(true, Ordering::Release);
             interrupter.join().unwrap();
             assert_eq!(rc, SQLITE_INTERRUPT, "expected SQLITE_INTERRUPT, got {rc}");
             assert_eq!(sqlite3_close(db), SQLITE_OK);

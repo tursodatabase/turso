@@ -2593,7 +2593,7 @@ impl Program {
     ) -> Option<ProgramStep> {
         let abort_result = self.abort(pager, None, state, true);
         if state.is_active_write && !self.connection.get_auto_commit() {
-            self.rollback_current_txn(pager);
+            self.connection.rollback_manual_txn_cleanup(pager, true);
         }
         Some(match abort_result {
             Ok(()) => ProgramStep::Interrupt,

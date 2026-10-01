@@ -1,5 +1,6 @@
 ﻿using System.Data;
 using System.Data.Common;
+using System.Diagnostics;
 using AwesomeAssertions;
 using Turso.Raw.Public;
 using Turso.Raw.Public.Value;
@@ -25,6 +26,72 @@ public class TursoTests
         reader.GetInt32(0).Should().Be(2);
 
         reader.Read().Should().BeFalse();
+    }
+
+    [Test]
+    public async Task LocalCancellationInterruptsCpuBoundQuery()
+    {
+        using var connection = new TursoConnection();
+        connection.Open();
+        connection.ExecuteNonQuery(
+            "CREATE TABLE numbers(v INTEGER);");
+        connection.ExecuteNonQuery(
+            "INSERT INTO numbers VALUES (0),(1),(2),(3),(4),(5),(6),(7),(8),(9);");
+
+        using var command = new TursoCommand(
+            connection,
+            "SELECT count(*) FROM numbers a, numbers b, numbers c, numbers d, numbers e, numbers f, numbers g, numbers h;");
+        using var cancellation = new CancellationTokenSource(TimeSpan.FromMilliseconds(50));
+        var stopwatch = Stopwatch.StartNew();
+
+        var action = async () => await command.ExecuteScalarAsync(cancellation.Token);
+
+        await action.Should().ThrowAsync<OperationCanceledException>();
+        TestContext.Out.WriteLine($"Managed interrupt elapsed: {stopwatch.Elapsed.TotalMilliseconds:F0} ms");
+        stopwatch.Elapsed.Should().BeLessThan(TimeSpan.FromSeconds(1));
+    }
+
+    [Test]
+    public void RawQueryTimeoutInterruptsCpuBoundQuery()
+    {
+        using var db = TursoBindings.OpenDatabase(":memory:");
+        ExecuteRaw(db, "CREATE TABLE numbers(v INTEGER);");
+        ExecuteRaw(db, "INSERT INTO numbers VALUES (0),(1),(2),(3),(4),(5),(6),(7),(8),(9);");
+        TursoBindings.SetQueryTimeout(db, TimeSpan.FromMilliseconds(20));
+        TursoBindings.GetQueryTimeout(db).Should().Be(TimeSpan.FromMilliseconds(20));
+
+        using var statement = TursoBindings.PrepareStatement(
+            db,
+            "SELECT count(*) FROM numbers a, numbers b, numbers c, numbers d, numbers e, numbers f, numbers g, numbers h;");
+        var stopwatch = Stopwatch.StartNew();
+
+        var action = () =>
+        {
+            while (TursoBindings.Read(statement))
+            {
+            }
+        };
+
+        action.Should().Throw<TursoException>();
+        TestContext.Out.WriteLine($"Native query timeout elapsed: {stopwatch.Elapsed.TotalMilliseconds:F0} ms");
+        stopwatch.Elapsed.Should().BeLessThan(TimeSpan.FromSeconds(1));
+    }
+
+    [Test]
+    public void RawTryInterruptIsHarmlessAfterConnectionClose()
+    {
+        var connection = TursoBindings.OpenDatabase(":memory:");
+        connection.Dispose();
+
+        TursoBindings.TryInterrupt(connection).Should().BeFalse();
+    }
+
+    private static void ExecuteRaw(Turso.Raw.Public.Handles.TursoDatabaseHandle db, string sql)
+    {
+        using var statement = TursoBindings.PrepareStatement(db, sql);
+        while (TursoBindings.Read(statement))
+        {
+        }
     }
 
     [Test]

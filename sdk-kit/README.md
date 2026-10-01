@@ -13,6 +13,14 @@ Key ideas:
 
 Note: turso.h is the single C header exported by the crate and can be translated to bindings.rs with rust-bindgen.
 
+## Cancellation and query deadlines
+
+`turso_connection_interrupt` requests cancellation of statements currently executing on a connection. It is safe to call from another thread while the connection pointer remains valid. Calling it with no active statement has no effect. An interrupted step returns `TURSO_INTERRUPT`, rolls back the interrupted write, and leaves the connection reusable.
+
+`turso_connection_set_query_timeout_ms` sets the wall-clock limit applied when each statement starts. Zero disables the limit. `turso_connection_get_query_timeout_ms` returns the current setting. This limit is separate from `turso_connection_set_busy_timeout_ms`: query timeout stops VDBE execution, while busy timeout only limits retries when waiting for a database lock.
+
+These functions are additive C ABI exports and use fixed-width integer types from `stdint.h`. The interrupt and setter functions do not return a status; a null pointer has no effect, and the getter returns zero. Callers must not deinitialize a connection while another thread is using its pointer. Cancellation is checked between VDBE instruction batches, so it cannot stop a blocking operating-system call or application callback until that call returns. Deadline timing uses the platform monotonic clock and does not depend on wall-clock adjustments.
+
 ## External page codecs
 
 `turso_database_config_t.page_codec` accepts a versioned `turso_page_codec_v1_t` callback table. The callbacks transform complete page images between on-disk bytes and plaintext SQLite pages. They are intended for compatibility layers such as legacy SQLite codec formats where the application supplies the crypto implementation.
