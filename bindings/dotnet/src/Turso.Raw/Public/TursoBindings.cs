@@ -7,6 +7,45 @@ namespace Turso.Raw.Public;
 
 public static class TursoBindings
 {
+    public static void Interrupt(TursoDatabaseHandle db)
+    {
+        db.ThrowIfInvalid();
+        TursoInterop.ConnectionInterrupt(db);
+    }
+
+    public static bool TryInterrupt(TursoDatabaseHandle db)
+    {
+        ArgumentNullException.ThrowIfNull(db);
+        if (db.IsClosed || db.IsInvalid)
+            return false;
+
+        try
+        {
+            TursoInterop.ConnectionInterrupt(db);
+            return true;
+        }
+        catch (ObjectDisposedException)
+        {
+            return false;
+        }
+    }
+
+    public static void SetQueryTimeout(TursoDatabaseHandle db, TimeSpan timeout)
+    {
+        db.ThrowIfInvalid();
+        ArgumentOutOfRangeException.ThrowIfLessThan(timeout, TimeSpan.Zero);
+
+        var milliseconds = checked((ulong)(timeout.Ticks / TimeSpan.TicksPerMillisecond));
+        TursoInterop.ConnectionSetQueryTimeout(db, milliseconds);
+    }
+
+    public static TimeSpan GetQueryTimeout(TursoDatabaseHandle db)
+    {
+        db.ThrowIfInvalid();
+        var milliseconds = TursoInterop.ConnectionGetQueryTimeout(db);
+        return TimeSpan.FromMilliseconds(checked((long)milliseconds));
+    }
+
     public static TursoDatabaseHandle OpenDatabase(string path)
     {
         ArgumentNullException.ThrowIfNull(path);

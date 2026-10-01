@@ -128,6 +128,36 @@ pub extern "C" fn turso_connection_set_busy_timeout_ms(
 
 #[no_mangle]
 #[signature(c)]
+pub extern "C" fn turso_connection_interrupt(connection: *const c::turso_connection_t) {
+    if let Ok(connection) = unsafe { TursoConnection::ref_from_capi(connection) } {
+        connection.interrupt();
+    }
+}
+
+#[no_mangle]
+#[signature(c)]
+pub extern "C" fn turso_connection_set_query_timeout_ms(
+    connection: *const c::turso_connection_t,
+    timeout_ms: u64,
+) {
+    if let Ok(connection) = unsafe { TursoConnection::ref_from_capi(connection) } {
+        connection.set_query_timeout(Duration::from_millis(timeout_ms));
+    }
+}
+
+#[no_mangle]
+#[signature(c)]
+pub extern "C" fn turso_connection_get_query_timeout_ms(
+    connection: *const c::turso_connection_t,
+) -> u64 {
+    match unsafe { TursoConnection::ref_from_capi(connection) } {
+        Ok(connection) => connection.get_query_timeout().as_millis() as u64,
+        Err(_) => 0,
+    }
+}
+
+#[no_mangle]
+#[signature(c)]
 pub extern "C" fn turso_connection_get_autocommit(
     connection: *const c::turso_connection_t,
 ) -> bool {
@@ -1048,8 +1078,10 @@ mod tests {
 
     use crate::capi::{
         c::{
-            self, turso_connection_deinit, turso_connection_prepare_single, turso_database_connect,
-            turso_database_deinit, turso_database_new, turso_database_open, turso_setup,
+            self, turso_connection_deinit, turso_connection_get_query_timeout_ms,
+            turso_connection_interrupt, turso_connection_prepare_single,
+            turso_connection_set_query_timeout_ms, turso_database_connect, turso_database_deinit,
+            turso_database_new, turso_database_open, turso_setup,
             turso_statement_bind_positional_blob, turso_statement_bind_positional_double,
             turso_statement_bind_positional_int, turso_statement_bind_positional_null,
             turso_statement_bind_positional_text, turso_statement_column_count,
@@ -1149,6 +1181,42 @@ mod tests {
             let mut connection = std::ptr::null_mut();
             let status = turso_database_connect(db, &mut connection, std::ptr::null_mut());
             assert_eq!(status, turso_status_code_t::TURSO_OK);
+
+            turso_connection_deinit(connection);
+            turso_database_deinit(db);
+        }
+    }
+
+    #[test]
+    pub fn test_connection_interrupt_and_query_timeout() {
+        unsafe {
+            let path = CString::new(":memory:").unwrap();
+            let config = c::turso_database_config_t {
+                path: path.as_ptr(),
+                ..Default::default()
+            };
+            let mut db = std::ptr::null();
+            assert_eq!(
+                turso_database_new(&config, &mut db, std::ptr::null_mut()),
+                turso_status_code_t::TURSO_OK
+            );
+            assert_eq!(
+                turso_database_open(db, std::ptr::null_mut()),
+                turso_status_code_t::TURSO_OK
+            );
+
+            let mut connection = std::ptr::null_mut();
+            assert_eq!(
+                turso_database_connect(db, &mut connection, std::ptr::null_mut()),
+                turso_status_code_t::TURSO_OK
+            );
+
+            assert_eq!(turso_connection_get_query_timeout_ms(connection), 0);
+            turso_connection_set_query_timeout_ms(connection, 25);
+            assert_eq!(turso_connection_get_query_timeout_ms(connection), 25);
+            turso_connection_interrupt(connection);
+            turso_connection_set_query_timeout_ms(connection, 0);
+            assert_eq!(turso_connection_get_query_timeout_ms(connection), 0);
 
             turso_connection_deinit(connection);
             turso_database_deinit(db);

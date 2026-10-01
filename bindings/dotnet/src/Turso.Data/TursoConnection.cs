@@ -187,6 +187,21 @@ public class TursoConnection : DbConnection
         return command.ExecuteNonQuery();
     }
 
+    public void Interrupt()
+    {
+        ObjectDisposedException.ThrowIf(_disposed, this);
+        if (_remoteClient is not null)
+            throw new NotSupportedException("Interrupt is only supported for local connections.");
+
+        TursoBindings.Interrupt(Turso);
+    }
+
+    internal void TryInterrupt()
+    {
+        if (_turso is { } turso)
+            TursoBindings.TryInterrupt(turso);
+    }
+
     public void Sync()
     {
         SyncAsync(CancellationToken.None).GetAwaiter().GetResult();

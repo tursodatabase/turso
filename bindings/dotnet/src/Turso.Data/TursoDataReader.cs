@@ -19,6 +19,8 @@ public class TursoDataReader : DbDataReader
     private readonly Type?[] _fieldTypes;
     private IDisposable? _syncOperation;
     private TursoConnection? _syncConnection;
+    private readonly CancellationToken _executionCancellationToken;
+    private CancellationTokenRegistration _cancellationRegistration;
     private bool _isClosed;
 
     public TursoDataReader(TursoCommand command, TursoStatementHandle statement, CommandBehavior behavior)
@@ -30,12 +32,18 @@ public class TursoDataReader : DbDataReader
         TursoCommand command,
         TursoStatementHandle statement,
         CommandBehavior behavior,
-        IDisposable? syncOperation)
+        IDisposable? syncOperation,
+        CancellationToken cancellationToken = default)
     {
         _command = command;
         _statement = statement;
         _behavior = behavior;
         _syncOperation = syncOperation;
+        _executionCancellationToken = cancellationToken;
+        if (cancellationToken.CanBeCanceled)
+            _cancellationRegistration = cancellationToken.UnsafeRegister(
+                static state => ((TursoCommand)state!).Cancel(),
+                command);
         _fieldTypes = new Type?[TursoBindings.GetFieldCount(statement)];
         if (syncOperation is not null && command.Connection is TursoConnection connection)
         {
@@ -244,7 +252,7 @@ public class TursoDataReader : DbDataReader
     public override bool NextResult()
     {
         EnsureOpen();
-        while (TursoBindings.Read(_statement, RunExternalIo))
+        while (Read())
         {
         }
 
@@ -256,6 +264,7 @@ public class TursoDataReader : DbDataReader
         if (disposing && !_isClosed)
         {
             _statement.Dispose();
+            _cancellationRegistration.Dispose();
             _syncOperation?.Dispose();
             _syncOperation = null;
             _syncConnection?.UnregisterSyncReader(this);
@@ -271,7 +280,54 @@ public class TursoDataReader : DbDataReader
     public override bool Read()
     {
         EnsureOpen();
-        return TursoBindings.Read(_statement, RunExternalIo);
+        try
+        {
+            return TursoBindings.Read(_statement, RunExternalIo);
+        }
+        catch (TursoException exception) when (_executionCancellationToken.IsCancellationRequested)
+        {
+            throw new OperationCanceledException(
+                "The query was canceled.",
+                exception,
+                _executionCancellationToken);
+        }
+    }
+
+    public override Task<bool> ReadAsync(CancellationToken cancellationToken)
+    {
+        if (!cancellationToken.CanBeCanceled)
+            return ReadTask();
+        if (cancellationToken.IsCancellationRequested)
+            return Task.FromCanceled<bool>(cancellationToken);
+
+        using var registration = cancellationToken.UnsafeRegister(
+            static state => ((TursoCommand)state!).Cancel(),
+            _command);
+        try
+        {
+            return Task.FromResult(Read());
+        }
+        catch (TursoException exception) when (cancellationToken.IsCancellationRequested)
+        {
+            return Task.FromException<bool>(
+                new OperationCanceledException("The query was canceled.", exception, cancellationToken));
+        }
+        catch (Exception exception)
+        {
+            return Task.FromException<bool>(exception);
+        }
+
+        Task<bool> ReadTask()
+        {
+            try
+            {
+                return Task.FromResult(Read());
+            }
+            catch (Exception exception)
+            {
+                return Task.FromException<bool>(exception);
+            }
+        }
     }
 
     public override int Depth => 0;

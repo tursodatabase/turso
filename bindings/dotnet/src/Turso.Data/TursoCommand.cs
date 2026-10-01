@@ -105,6 +105,8 @@ public class TursoCommand : DbCommand
 
     public override void Cancel()
     {
+        if (_connection is { IsRemote: false } connection)
+            connection.TryInterrupt();
     }
 
     public override int ExecuteNonQuery()
@@ -239,7 +241,7 @@ public class TursoCommand : DbCommand
         if (_connection?.IsRemote == true)
             return ExecuteRemoteAsync(behavior, cancellationToken);
 
-        return Task.FromResult(Execute(behavior));
+        return Task.FromResult(Execute(behavior, cancellationToken));
     }
 
     private static string RewriteFacadePragmas(string sql, TursoConnection connection)
@@ -271,7 +273,9 @@ public class TursoCommand : DbCommand
               || value.Equals("YES", StringComparison.OrdinalIgnoreCase);
     }
 
-    private DbDataReader Execute(CommandBehavior behavior = CommandBehavior.Default)
+    private DbDataReader Execute(
+        CommandBehavior behavior = CommandBehavior.Default,
+        CancellationToken cancellationToken = default)
     {
         if (_connection is null)
             throw new InvalidOperationException("Connection must be set before executing a command.");
@@ -279,16 +283,23 @@ public class TursoCommand : DbCommand
         if (_connection.IsRemote)
             return ExecuteRemoteAsync(behavior, CancellationToken.None).GetAwaiter().GetResult();
 
+        cancellationToken.ThrowIfCancellationRequested();
         IDisposable? syncOperation = _connection.EnterSyncOperation();
         try
         {
+            TursoBindings.SetQueryTimeout(_connection.Turso, TimeSpan.FromSeconds(CommandTimeout));
             PrepareCore();
 
             var statement = _statement ?? throw new InvalidOperationException("Command was not prepared.");
             _statement = null;
             try
             {
-                var reader = new TursoDataReader(this, statement, behavior, syncOperation);
+                var reader = new TursoDataReader(
+                    this,
+                    statement,
+                    behavior,
+                    syncOperation,
+                    cancellationToken);
                 syncOperation = null;
                 return reader;
             }

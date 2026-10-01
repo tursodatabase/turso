@@ -747,6 +747,10 @@ impl Statement {
                 self.analyze_refresh = Some(RefreshAnalyzeStatsState::Start);
                 return self.drive_analyze_refresh(waker);
             }
+        } else if matches!(res, Ok(StepResult::Interrupt)) || res.is_err() {
+            self.busy = false;
+            self.busy_handler_state = None;
+            self.state.query_deadline = None;
         } else {
             self.busy = true;
         }
@@ -838,9 +842,8 @@ impl Statement {
                     self.pager.io.step()?
                 }
                 vdbe::StepResult::Row => continue,
-                vdbe::StepResult::Interrupt | vdbe::StepResult::Busy => {
-                    return Err(LimboError::Busy)
-                }
+                vdbe::StepResult::Interrupt => return Err(LimboError::Interrupt),
+                vdbe::StepResult::Busy => return Err(LimboError::Busy),
             }
         }
     }
@@ -857,9 +860,8 @@ impl Statement {
                     values.push(self.row().unwrap().get_values().cloned().collect());
                     continue;
                 }
-                vdbe::StepResult::Interrupt | vdbe::StepResult::Busy => {
-                    return Err(LimboError::Busy)
-                }
+                vdbe::StepResult::Interrupt => return Err(LimboError::Interrupt),
+                vdbe::StepResult::Busy => return Err(LimboError::Busy),
             }
         }
     }

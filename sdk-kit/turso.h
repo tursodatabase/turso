@@ -317,6 +317,15 @@ turso_status_code_t turso_database_connect(
 /** Set busy timeout for the connection */
 void turso_connection_set_busy_timeout_ms(const turso_connection_t *self, int64_t timeout_ms);
 
+/** Interrupt statements currently executing on the connection. Safe to call from another thread while self remains valid. */
+void turso_connection_interrupt(const turso_connection_t *self);
+
+/** Set the maximum duration of each statement started on the connection. Zero disables the timeout. */
+void turso_connection_set_query_timeout_ms(const turso_connection_t *self, uint64_t timeout_ms);
+
+/** Get the current per-statement query timeout in milliseconds. */
+uint64_t turso_connection_get_query_timeout_ms(const turso_connection_t *self);
+
 /** Get autocommit state of the connection */
 bool turso_connection_get_autocommit(const turso_connection_t *self);
 
