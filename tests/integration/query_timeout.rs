@@ -58,3 +58,27 @@ fn query_timeout_allows_short_running_query(tmp_db: TempDatabase) -> anyhow::Res
     );
     Ok(())
 }
+
+#[turso_macros::test]
+fn interrupt_rolls_back_explicit_write_transaction(tmp_db: TempDatabase) -> anyhow::Result<()> {
+    let conn = tmp_db.connect_limbo();
+    conn.execute("CREATE TABLE t(x INTEGER);")?;
+    conn.execute("BEGIN;")?;
+    conn.execute("INSERT INTO t VALUES (1);")?;
+    conn.set_query_timeout(Duration::from_millis(10));
+
+    let mut stmt = conn.prepare(
+        "INSERT INTO t SELECT a.x FROM t a, t b, t c, t d, t e, t f, t g, t h, t i, t j;",
+    )?;
+    let result = run_until_terminal(&mut stmt)?;
+    assert!(matches!(result, StepResult::Interrupt));
+    assert!(conn.get_auto_commit());
+
+    let mut count = conn.prepare("SELECT count(*) FROM t;")?;
+    assert!(matches!(run_until_terminal(&mut count)?, StepResult::Row));
+    assert_eq!(
+        count.row().unwrap().get_value(0)?,
+        &turso_core::Value::Integer(0)
+    );
+    Ok(())
+}
