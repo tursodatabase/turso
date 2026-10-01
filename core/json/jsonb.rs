@@ -1762,7 +1762,7 @@ impl Jsonb {
             let start = pos + 1;
             let end = find_string_special_byte(input, start, b'"');
             if end < input.len() && input[end] == b'"' {
-                self.push_text_header(end - start)
+                self.push_element_header(ElementType::TEXT, end - start)
                     .map_err(|_| PError::Message {
                         msg: "Failed to write header".to_string(),
                         location: Some(start),
@@ -1775,20 +1775,20 @@ impl Jsonb {
     }
 
     #[cfg_attr(not(debug_assertions), inline(always))]
-    fn push_text_header(&mut self, len: usize) -> Result<()> {
-        let text = ElementType::TEXT as u8;
+    fn push_element_header(&mut self, element_type: ElementType, len: usize) -> Result<()> {
+        let type_bits = element_type as u8;
         match len {
-            0..=11 => self.data.push(text | ((len as u8) << 4)),
+            0..=11 => self.data.push(type_bits | ((len as u8) << 4)),
             12..=0xFF => self
                 .data
-                .extend_from_slice(&[text | (SIZE_MARKER_8BIT << 4), len as u8]),
+                .extend_from_slice(&[type_bits | (SIZE_MARKER_8BIT << 4), len as u8]),
             0x100..=0xFFFF => {
                 let [high, low] = (len as u16).to_be_bytes();
                 self.data
-                    .extend_from_slice(&[text | (SIZE_MARKER_16BIT << 4), high, low]);
+                    .extend_from_slice(&[type_bits | (SIZE_MARKER_16BIT << 4), high, low]);
             }
             _ => {
-                self.write_element_header(self.data.len(), ElementType::TEXT, len, false)?;
+                self.write_element_header(self.data.len(), element_type, len, false)?;
             }
         }
         Ok(())
@@ -2135,7 +2135,32 @@ impl Jsonb {
         Ok(pos)
     }
 
+    #[cfg_attr(not(debug_assertions), inline(always))]
     fn deserialize_number(
+        &mut self,
+        input: &[u8],
+        pos: usize,
+        info: &mut ParseInfo,
+    ) -> PResult<usize> {
+        if let Some((end, is_float)) = scan_plain_json_number(input, pos) {
+            let element_type = if is_float {
+                ElementType::FLOAT
+            } else {
+                ElementType::INT
+            };
+            self.push_element_header(element_type, end - pos)
+                .map_err(|_| PError::Message {
+                    msg: "Failed to write header".to_string(),
+                    location: Some(pos),
+                })?;
+            self.data.extend_from_slice(&input[pos..end]);
+            return Ok(end);
+        }
+        self.deserialize_number_of_any_form(input, pos, info)
+    }
+
+    #[inline(never)]
+    fn deserialize_number_of_any_form(
         &mut self,
         input: &[u8],
         mut pos: usize,
@@ -4386,6 +4411,52 @@ fn json5_whitespace_len(input: &[u8]) -> usize {
     }
 }
 
+#[cfg_attr(not(debug_assertions), inline(always))]
+fn scan_plain_json_number(input: &[u8], mut pos: usize) -> Option<(usize, bool)> {
+    let skip_digits = |mut pos: usize| {
+        while input.get(pos).is_some_and(u8::is_ascii_digit) {
+            pos += 1;
+        }
+        pos
+    };
+    if input.get(pos) == Some(&b'-') {
+        pos += 1;
+    }
+    match input.get(pos)? {
+        b'0' => pos += 1,
+        b'1'..=b'9' => pos = skip_digits(pos + 1),
+        _ => return None,
+    }
+    let mut is_float = false;
+    if input.get(pos) == Some(&b'.') {
+        let fraction_end = skip_digits(pos + 1);
+        if fraction_end == pos + 1 {
+            return None;
+        }
+        pos = fraction_end;
+        is_float = true;
+    }
+    if matches!(input.get(pos), Some(b'e' | b'E')) {
+        let mut exponent = pos + 1;
+        if matches!(input.get(exponent), Some(b'+' | b'-')) {
+            exponent += 1;
+        }
+        let exponent_end = skip_digits(exponent);
+        if exponent_end == exponent {
+            return None;
+        }
+        pos = exponent_end;
+        is_float = true;
+    }
+    if matches!(
+        input.get(pos),
+        Some(b'0'..=b'9' | b'.' | b'e' | b'E' | b'x' | b'X')
+    ) {
+        return None;
+    }
+    Some((pos, is_float))
+}
+
 #[inline(always)]
 fn find_string_special_byte(input: &[u8], pos: usize, quote: u8) -> usize {
     #[cfg(target_arch = "x86_64")]
@@ -4626,6 +4697,68 @@ mod tests {
     fn parse_has_json5(input: &str) -> bool {
         let (_, info) = Jsonb::from_str_tracking(input).unwrap();
         info.has_json5
+    }
+
+    #[test]
+    fn plain_number_parse_matches_the_general_number_parser() {
+        for input in [
+            "0",
+            "-0",
+            "1",
+            "-1",
+            "123",
+            "1.5",
+            "-1.5e10",
+            "1E+5",
+            "1e-5",
+            "0.0",
+            "0e0",
+            "1.",
+            ".5",
+            "+1",
+            "01",
+            "-01",
+            "0x1F",
+            "0X1f",
+            "1.5.3",
+            "1e5e3",
+            "1e",
+            "1e+",
+            "-",
+            "-.5",
+            "Infinity",
+            "-Infinity",
+            "1x",
+            "12,",
+            "12]",
+            "12 ",
+            "12}",
+            "0,",
+            "-0]",
+            "9223372036854775808",
+            "0.5e",
+            "5e5.",
+            "1.5x",
+            "0.",
+        ] {
+            let bytes = input.as_bytes();
+            let mut plain = Jsonb::new(16).unwrap();
+            let mut general = Jsonb::new(16).unwrap();
+            let mut plain_info = ParseInfo::default();
+            let mut general_info = ParseInfo::default();
+            let plain_result = plain.deserialize_number(bytes, 0, &mut plain_info);
+            let general_result =
+                general.deserialize_number_of_any_form(bytes, 0, &mut general_info);
+            assert_eq!(
+                format!("{plain_result:?}"),
+                format!("{general_result:?}"),
+                "{input}"
+            );
+            if plain_result.is_ok() {
+                assert_eq!(plain.data, general.data, "{input}");
+                assert_eq!(plain_info.has_json5, general_info.has_json5, "{input}");
+            }
+        }
     }
 
     #[test]
