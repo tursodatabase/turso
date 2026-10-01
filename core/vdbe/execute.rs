@@ -14517,6 +14517,20 @@ pub fn op_add_type(
     Ok(InsnFunctionStepResult::Step)
 }
 
+pub fn op_set_role(
+    program: &Program,
+    state: &mut ProgramState,
+    insn: &Insn,
+    _pager: &Arc<Pager>,
+) -> InsnResult {
+    load_insn!(SetRole { role }, insn);
+    program
+        .connection
+        .set_role_in_current_schema(role.as_deref())?;
+    state.pc += 1;
+    Ok(InsnFunctionStepResult::Step)
+}
+
 pub fn op_update_access_control(
     program: &Program,
     state: &mut ProgramState,

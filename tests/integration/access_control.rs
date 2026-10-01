@@ -190,3 +190,118 @@ fn test_failed_role_statement_leaves_roles_unchanged() {
     }
     conn.execute("ROLLBACK").unwrap();
 }
+
+#[test]
+fn test_set_role_requires_existing_role() {
+    let db = TempDatabase::builder().build();
+    let conn = db.connect_limbo();
+    let err = conn.set_role(Some("alice")).unwrap_err();
+    assert!(err.to_string().contains("does not exist"), "{err}");
+    conn.execute("CREATE ROLE alice").unwrap();
+    conn.set_role(Some("alice")).unwrap();
+    assert_eq!(conn.current_role().as_deref(), Some("alice"));
+    conn.set_role(None).unwrap();
+    assert_eq!(conn.current_role(), None);
+}
+
+#[test]
+fn test_set_role_sees_role_created_on_another_connection() {
+    let db = TempDatabase::builder().build();
+    let first = db.connect_limbo();
+    let second = db.connect_limbo();
+    second.execute("CREATE TABLE t(x)").unwrap();
+    first.execute("CREATE ROLE alice").unwrap();
+    second.set_role(Some("alice")).unwrap();
+}
+
+#[test]
+fn test_role_can_only_read_and_write_rows() {
+    let db = TempDatabase::builder()
+        .with_opts(DatabaseOpts::new().with_attach(true).with_vacuum(true))
+        .build();
+    let conn = db.connect_limbo();
+    conn.execute("CREATE TABLE t(x)").unwrap();
+    conn.execute("CREATE ROLE alice").unwrap();
+    conn.set_role(Some("alice")).unwrap();
+
+    for sql in [
+        "BEGIN",
+        "INSERT INTO t VALUES (1)",
+        "UPDATE t SET x = 2",
+        "SELECT * FROM t",
+        "DELETE FROM t",
+        "COMMIT",
+        "PRAGMA foreign_keys",
+        "SET ROLE alice",
+    ] {
+        conn.execute(sql).unwrap();
+    }
+    for sql in [
+        "CREATE TABLE u(x)",
+        "DROP TABLE t",
+        "ALTER TABLE t ADD COLUMN y",
+        "CREATE INDEX t_x ON t(x)",
+        "CREATE VIEW v AS SELECT * FROM t",
+        "CREATE TRIGGER tr AFTER INSERT ON t BEGIN SELECT 1; END",
+        "CREATE ROLE bob",
+        "DROP ROLE alice",
+        "ATTACH ':memory:' AS other",
+        "VACUUM",
+        "ANALYZE",
+        "PRAGMA foreign_keys = OFF",
+        "PRAGMA table_info(t)",
+    ] {
+        assert_error_contains(conn.execute(sql), "permission denied");
+    }
+    conn.execute("RESET ROLE").unwrap();
+    assert_eq!(conn.current_role(), None);
+}
+
+#[test]
+fn test_statement_prepared_by_superuser_is_checked_again_for_role() {
+    let db = TempDatabase::builder().build();
+    let conn = db.connect_limbo();
+    conn.execute("CREATE ROLE alice").unwrap();
+    let mut stmt = conn.prepare("CREATE TABLE t(x)").unwrap();
+    conn.set_role(Some("alice")).unwrap();
+    let err = stmt.run_ignore_rows().unwrap_err();
+    assert!(err.to_string().contains("permission denied"), "{err}");
+}
+
+#[test]
+fn test_set_role_statement_changes_role_when_executed() {
+    let db = TempDatabase::builder().build();
+    let conn = db.connect_limbo();
+    conn.execute("CREATE ROLE alice").unwrap();
+    conn.execute("CREATE ROLE bob").unwrap();
+    let mut set_alice = conn.prepare("SET ROLE alice").unwrap();
+    assert_eq!(conn.current_role(), None);
+    conn.execute("SET ROLE bob").unwrap();
+    assert_eq!(conn.current_role().as_deref(), Some("bob"));
+    set_alice.run_ignore_rows().unwrap();
+    assert_eq!(conn.current_role().as_deref(), Some("alice"));
+    conn.execute("RESET ROLE").unwrap();
+    assert_eq!(conn.current_role(), None);
+    conn.execute("SET ROLE alice").unwrap();
+    conn.execute("SET ROLE NONE").unwrap();
+    assert_eq!(conn.current_role(), None);
+    assert_error_contains(conn.execute("SET ROLE carol"), "does not exist");
+}
+
+#[test]
+fn test_role_cannot_change_inside_transaction() {
+    let db = TempDatabase::builder().build();
+    let conn = db.connect_limbo();
+    conn.execute("CREATE ROLE alice").unwrap();
+    conn.execute("CREATE ROLE bob").unwrap();
+    conn.execute("SET ROLE alice").unwrap();
+    conn.execute("BEGIN").unwrap();
+    for sql in ["RESET ROLE", "SET ROLE NONE", "SET ROLE bob"] {
+        assert_error_contains(conn.execute(sql), "inside a transaction");
+    }
+    assert_error_contains(conn.set_role(None), "inside a transaction");
+    conn.execute("ROLLBACK").unwrap();
+    assert_eq!(conn.current_role().as_deref(), Some("alice"));
+    conn.execute("RESET ROLE").unwrap();
+    assert_eq!(conn.current_role(), None);
+}

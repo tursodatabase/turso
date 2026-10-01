@@ -1652,6 +1652,10 @@ pub enum Insn {
         /// by `SequenceBeginInnerTx`). Empty blob means "no outer tx".
         saved_outer_reg: usize,
     },
+    /// Make the connection act as `role`, or as the superuser for `None`
+    SetRole {
+        role: Option<String>,
+    },
     /// Apply a change to the in-memory access control catalog
     UpdateAccessControl {
         db: usize,
@@ -2308,6 +2312,7 @@ impl InsnVariants {
             InsnVariants::SequenceCommitInnerTx => execute::op_sequence_commit_inner_tx,
             InsnVariants::AddType => execute::op_add_type,
             InsnVariants::UpdateAccessControl => execute::op_update_access_control,
+            InsnVariants::SetRole => execute::op_set_role,
             InsnVariants::DropView => execute::op_drop_view,
             InsnVariants::Close => execute::op_close,
             InsnVariants::IsNull => execute::op_is_null,

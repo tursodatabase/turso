@@ -1976,6 +1976,15 @@ pub fn insn_to_row(
                     "commit inner tx; r[{status_reg}] = 0=Ok | 1=ConflictRetry"
                 ),
             ),
+            Insn::SetRole { role } => (
+                "SetRole",
+                0,
+                0,
+                0,
+                Value::build_text(role.clone().unwrap_or_default()),
+                0,
+                "SET ROLE".to_string(),
+            ),
             Insn::UpdateAccessControl { db, change } => (
                 "UpdateAccessControl",
                 *db as i64,

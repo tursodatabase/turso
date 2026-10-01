@@ -577,6 +577,8 @@ pub struct Connection {
     pub(crate) prepare_context_generation: AtomicU64,
     /// Per-connection last-returned value for each sequence (for currval()).
     pub(crate) sequence_currvals: RwLock<HashMap<String, i64>>,
+    /// Role set with `set_role()`. `None` is the superuser.
+    pub(crate) current_role: RwLock<Option<String>>,
 }
 
 // SAFETY: This needs to be audited for thread safety.
@@ -3043,6 +3045,47 @@ impl Connection {
 
     pub fn current_schema(&self) -> Arc<Schema> {
         self.schema.read().clone()
+    }
+
+    /// Makes the connection act as `role`, or as the superuser when `role` is
+    /// `None`. Prepared statements are planned again for the new role. The
+    /// role is checked against the current schema, so a role another process
+    /// created or dropped is seen. The role cannot change inside a
+    /// transaction, because ROLLBACK would not change it back.
+    pub fn set_role(self: &Arc<Connection>, role: Option<&str>) -> Result<()> {
+        if role.is_some() {
+            self.maybe_update_schema();
+            self.maybe_reparse_schema()?;
+        }
+        self.set_role_in_current_schema(role)
+    }
+
+    /// `set_role()` against the schema the connection already has, for
+    /// statements that have made sure the schema is current.
+    pub(crate) fn set_role_in_current_schema(&self, role: Option<&str>) -> Result<()> {
+        if !self.get_auto_commit() {
+            return Err(LimboError::TxError(
+                "cannot change the role inside a transaction".to_string(),
+            ));
+        }
+        let role = match role {
+            Some(role) => {
+                if !self.schema.read().access_control.has_role(role) {
+                    return Err(LimboError::ParseError(format!(
+                        "role \"{role}\" does not exist"
+                    )));
+                }
+                Some(crate::util::normalize_ident(role))
+            }
+            None => None,
+        };
+        *self.current_role.write() = role;
+        self.bump_prepare_context_generation();
+        Ok(())
+    }
+
+    pub fn current_role(&self) -> Option<String> {
+        self.current_role.read().clone()
     }
 
     pub fn attached_database_names(&self) -> Vec<String> {
