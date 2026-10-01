@@ -1439,21 +1439,40 @@ fn decode_recovery_ops_to_logical_txn(
 
     let mut ops = header_ops;
     append_schema_ops(schema_deltas, &mut ops)?;
-    // Every row delete in a transaction is applied before every row upsert.
+    // Sort row_ops so that deletes appear before upserts.
     //
-    // MVCC coalesces a transaction to one final version per rowid, and a row
-    // whose primary key changed arrives as a delete of its old key followed by
-    // an upsert of its new image. Applying those pairs row by row breaks as soon
-    // as two rows exchange keys inside one transaction: the second row's delete
-    // targets the key the first row's upsert just took, so it removes the row
-    // that was just written and the replica silently ends up one row short.
+    // We do this because we replay upserts using the PK as the conflict target, but the logical log
+    // emits upserts using rowid as the conflict target. Replaying ops in order could therefore
+    // diverge from the source DB. Consider the following schema and tx:
     //
-    // Draining the deletes first applies the transaction as a set difference,
-    // which is also what lets both upserts land without tripping the unique
-    // index on an intermediate state — the remote needed a temporary key to make
-    // the same swap statement by statement. A rowid appears at most once per
-    // coalesced transaction, so no upsert can depend on a delete of its own row
-    // running later.
+    // CREATE TABLE t(a PRIMARY KEY, b);
+    // -- table: [(1, 1), (2, 2)]
+    //
+    // BEGIN;
+    // UPDATE t SET a = 3 WHERE a = 2;
+    // UPDATE t SET a = 2 WHERE a = 1;
+    // COMMIT;
+    // -- table: [(2, 1), (3, 2)]
+    //
+    // The logical log for this transaction contains:
+    //   1. delete rowid 1, key a = 1
+    //   2. upsert rowid 1, (2, 1)
+    //   3. delete rowid 2, key a = 2
+    //   4. upsert rowid 2, (3, 2)
+    //
+    // Replaying these by primary key, in this order, would then give:
+    //   1. delete a = 1    -- [(2, 2)]
+    //   2. upsert (2, 1)   -- [(2, 1)]  the database upserted using the rowid, but we upsert using
+    //                                   the PK, so we would end up overwriting the wrong row!
+    //   3. delete a = 2    -- []        deletes the row from step 2!
+    //   4. upsert (3, 2)   -- [(3, 2)]
+    //
+    // The state of the table at step 4 would now be inconsistent with the original transaction. But
+    // if we issue all deletes first, we're consistent with the source:
+    //   1. delete a = 1    -- [(2, 2)]
+    //   2. delete a = 2    -- []
+    //   3. upsert (2, 1)   -- [(2, 1)]
+    //   4. upsert (3, 2)   -- [(2, 1), (3, 2)]
     let (row_deletes, row_upserts): (Vec<_>, Vec<_>) = row_ops
         .into_iter()
         .partition(|op| op.op_type == LogicalOpType::DeleteRow as i32);
