@@ -19,6 +19,8 @@ Note: turso.h is the single C header exported by the crate and can be translated
 
 `turso_connection_set_query_timeout_ms` sets the wall-clock limit applied when each statement starts. Zero disables the limit. `turso_connection_get_query_timeout_ms` returns the current setting. This limit is separate from `turso_connection_set_busy_timeout_ms`: query timeout stops VDBE execution, while busy timeout only limits retries when waiting for a database lock.
 
+`turso_statement_set_query_timeout_ms` overrides the connection timeout for one prepared statement. Zero disables the timeout for that statement. This allows concurrent commands to use different deadlines without changing shared connection state.
+
 These functions are additive C ABI exports and use fixed-width integer types from `stdint.h`. The interrupt and setter functions do not return a status; a null pointer has no effect, and the getter returns zero. Callers must not deinitialize a connection while another thread is using its pointer. Cancellation is checked between VDBE instruction batches, so it cannot stop a blocking operating-system call or application callback until that call returns. Deadline timing uses the platform monotonic clock and does not depend on wall-clock adjustments.
 
 ## External page codecs

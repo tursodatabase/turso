@@ -82,11 +82,18 @@ internal static class TursoInterop
     [DllImport(DllName, EntryPoint = "turso_connection_interrupt", CallingConvention = CallingConvention.Cdecl)]
     public static extern void ConnectionInterrupt(TursoDatabaseHandle connection);
 
+    [DllImport(DllName, EntryPoint = "turso_connection_interrupt", CallingConvention = CallingConvention.Cdecl)]
+    public static extern void ConnectionInterruptRetained(IntPtr connection);
+
     [DllImport(DllName, EntryPoint = "turso_connection_set_query_timeout_ms", CallingConvention = CallingConvention.Cdecl)]
     public static extern void ConnectionSetQueryTimeout(TursoDatabaseHandle connection, ulong timeoutMs);
 
     [DllImport(DllName, EntryPoint = "turso_connection_get_query_timeout_ms", CallingConvention = CallingConvention.Cdecl)]
     public static extern ulong ConnectionGetQueryTimeout(TursoDatabaseHandle connection);
+
+    [DllImport(DllName, EntryPoint = "turso_connection_get_autocommit", CallingConvention = CallingConvention.Cdecl)]
+    [return: MarshalAs(UnmanagedType.I1)]
+    public static extern bool ConnectionGetAutocommit(TursoDatabaseHandle connection);
 
     [DllImport(DllName, EntryPoint = "turso_connection_register_scalar_function", CallingConvention = CallingConvention.Cdecl)]
     public static extern TursoStatusCode RegisterScalarFunction(
@@ -162,6 +169,9 @@ internal static class TursoInterop
 
     [DllImport(DllName, EntryPoint = "turso_statement_step", CallingConvention = CallingConvention.Cdecl)]
     public static extern TursoStatusCode StatementStep(TursoStatementHandle statement, out IntPtr errorPtr);
+
+    [DllImport(DllName, EntryPoint = "turso_statement_set_query_timeout_ms", CallingConvention = CallingConvention.Cdecl)]
+    public static extern void StatementSetQueryTimeout(TursoStatementHandle statement, ulong timeoutMs);
 
     [DllImport(DllName, EntryPoint = "turso_statement_run_io", CallingConvention = CallingConvention.Cdecl)]
     public static extern TursoStatusCode StatementRunIo(TursoStatementHandle statement, out IntPtr errorPtr);

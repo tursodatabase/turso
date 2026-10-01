@@ -287,13 +287,13 @@ public class TursoCommand : DbCommand
         IDisposable? syncOperation = _connection.EnterSyncOperation();
         try
         {
-            TursoBindings.SetQueryTimeout(_connection.Turso, TimeSpan.FromSeconds(CommandTimeout));
             PrepareCore();
 
             var statement = _statement ?? throw new InvalidOperationException("Command was not prepared.");
             _statement = null;
             try
             {
+                TursoBindings.SetQueryTimeout(statement, TimeSpan.FromSeconds(CommandTimeout));
                 var reader = new TursoDataReader(
                     this,
                     statement,

@@ -2604,8 +2604,10 @@ impl Program {
         state: &mut ProgramState,
         pager: &Arc<Pager>,
     ) -> Option<ProgramStep> {
-        let abort_result = self.abort(pager, None, state, true);
-        if state.is_active_write && !self.connection.get_auto_commit() {
+        let rollback_explicit_write = state.is_active_write && !self.connection.get_auto_commit();
+        let interrupt = LimboError::Interrupt;
+        let abort_result = self.abort(pager, Some(&interrupt), state, true);
+        if rollback_explicit_write {
             self.connection.rollback_manual_txn_cleanup(pager, true);
         }
         Some(match abort_result {

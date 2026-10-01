@@ -20,6 +20,7 @@ public class TursoDataReader : DbDataReader
     private IDisposable? _syncOperation;
     private TursoConnection? _syncConnection;
     private readonly CancellationToken _executionCancellationToken;
+    private TursoInterruptHandle? _interruptHandle;
     private CancellationTokenRegistration _cancellationRegistration;
     private bool _isClosed;
 
@@ -40,11 +41,14 @@ public class TursoDataReader : DbDataReader
         _behavior = behavior;
         _syncOperation = syncOperation;
         _executionCancellationToken = cancellationToken;
+        _fieldTypes = new Type?[TursoBindings.GetFieldCount(statement)];
+        _interruptHandle = TursoBindings.RetainInterruptHandle(
+            (command.Connection as TursoConnection)?.Turso
+            ?? throw new InvalidOperationException("The command connection is closed."));
         if (cancellationToken.CanBeCanceled)
             _cancellationRegistration = cancellationToken.UnsafeRegister(
-                static state => ((TursoCommand)state!).Cancel(),
-                command);
-        _fieldTypes = new Type?[TursoBindings.GetFieldCount(statement)];
+                static state => ((TursoInterruptHandle)state!).TryInterrupt(),
+                _interruptHandle);
         if (syncOperation is not null && command.Connection is TursoConnection connection)
         {
             _syncConnection = connection;
@@ -263,8 +267,8 @@ public class TursoDataReader : DbDataReader
     {
         if (disposing && !_isClosed)
         {
+            CompleteExecutionCancellation();
             _statement.Dispose();
-            _cancellationRegistration.Dispose();
             _syncOperation?.Dispose();
             _syncOperation = null;
             _syncConnection?.UnregisterSyncReader(this);
@@ -280,54 +284,73 @@ public class TursoDataReader : DbDataReader
     public override bool Read()
     {
         EnsureOpen();
+        _executionCancellationToken.ThrowIfCancellationRequested();
         try
         {
-            return TursoBindings.Read(_statement, RunExternalIo);
+            var hasRow = TursoBindings.Read(_statement, RunExternalIo);
+            if (!hasRow)
+                CompleteExecutionCancellation();
+            return hasRow;
         }
-        catch (TursoException exception) when (_executionCancellationToken.IsCancellationRequested)
+        catch (TursoException exception)
         {
-            throw new OperationCanceledException(
-                "The query was canceled.",
-                exception,
-                _executionCancellationToken);
+            CompleteExecutionCancellation();
+            CompleteInterruptedTransaction(exception);
+            if (exception.IsInterrupt && _executionCancellationToken.IsCancellationRequested)
+            {
+                throw new OperationCanceledException(
+                    "The query was canceled.",
+                    exception,
+                    _executionCancellationToken);
+            }
+
+            throw;
         }
     }
 
-    public override Task<bool> ReadAsync(CancellationToken cancellationToken)
+    public override async Task<bool> ReadAsync(CancellationToken cancellationToken)
     {
-        if (!cancellationToken.CanBeCanceled)
-            return ReadTask();
-        if (cancellationToken.IsCancellationRequested)
-            return Task.FromCanceled<bool>(cancellationToken);
-
-        using var registration = cancellationToken.UnsafeRegister(
-            static state => ((TursoCommand)state!).Cancel(),
-            _command);
+        cancellationToken.ThrowIfCancellationRequested();
+        var interruptHandle = _interruptHandle;
+        using var registration = cancellationToken.CanBeCanceled && interruptHandle is not null
+            ? cancellationToken.UnsafeRegister(
+                static state => ((TursoInterruptHandle)state!).TryInterrupt(),
+                interruptHandle)
+            : default;
         try
         {
-            return Task.FromResult(Read());
+            return await Task.FromResult(Read()).ConfigureAwait(false);
         }
-        catch (TursoException exception) when (cancellationToken.IsCancellationRequested)
+        catch (TursoException exception) when (
+            exception.IsInterrupt && cancellationToken.IsCancellationRequested)
         {
-            return Task.FromException<bool>(
-                new OperationCanceledException("The query was canceled.", exception, cancellationToken));
+            CompleteInterruptedTransaction(exception);
+            throw new OperationCanceledException(
+                "The query was canceled.",
+                exception,
+                cancellationToken);
         }
-        catch (Exception exception)
+    }
+
+    private void CompleteExecutionCancellation()
+    {
+        _cancellationRegistration.Dispose();
+        _interruptHandle?.Dispose();
+        _interruptHandle = null;
+    }
+
+    private void CompleteInterruptedTransaction(TursoException exception)
+    {
+        if (!exception.IsInterrupt
+            || _command.Transaction is not TursoTransaction transaction
+            || _command.Connection is not TursoConnection connection
+            || connection.State != ConnectionState.Open
+            || !TursoBindings.IsAutocommit(connection.Turso))
         {
-            return Task.FromException<bool>(exception);
+            return;
         }
 
-        Task<bool> ReadTask()
-        {
-            try
-            {
-                return Task.FromResult(Read());
-            }
-            catch (Exception exception)
-            {
-                return Task.FromException<bool>(exception);
-            }
-        }
+        transaction.MarkRolledBackByInterrupt();
     }
 
     public override int Depth => 0;
