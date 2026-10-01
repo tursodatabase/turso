@@ -16,8 +16,8 @@ use crate::types::{AsValueRef, Text, TextSubtype, Value, ValueType};
 use crate::{bail_constraint_error, LimboError, ValueRef};
 pub use cache::JsonCacheCell;
 use jsonb::{
-    jsonb_error_position, unescape_string, validate_jsonb, ElementType, Jsonb, JsonbHeader,
-    ParseInfo, PathOperationMode, SearchOperation, SetOperation,
+    find_nul, jsonb_error_position, unescape_string, validate_jsonb, ElementType, Jsonb,
+    JsonbHeader, ParseInfo, PathOperationMode, SearchOperation, SetOperation,
 };
 use std::borrow::Cow;
 use std::fmt::Write as _;
@@ -127,7 +127,7 @@ pub fn convert_dbtype_to_jsonb(val: impl AsValueRef, strict: Conv) -> crate::Res
 }
 
 fn parse_as_json_text(slice: &[u8], mode: Conv) -> crate::Result<Jsonb> {
-    let zero_pos = slice.iter().position(|&b| b == 0).unwrap_or(slice.len());
+    let zero_pos = find_nul(slice).unwrap_or(slice.len());
     let truncated = &slice[..zero_pos];
     let str = std::str::from_utf8(truncated)
         .map_err(|_| LimboError::ParseError("malformed JSON".to_string()))?;
@@ -138,7 +138,7 @@ fn parse_as_json_text(slice: &[u8], mode: Conv) -> crate::Result<Jsonb> {
 /// used any JSON5-only syntax, which json_valid needs to tell strict
 /// RFC 8259 documents apart from merely parseable ones.
 fn parse_as_json_text_tracking(slice: &[u8]) -> crate::Result<(Jsonb, ParseInfo)> {
-    let zero_pos = slice.iter().position(|&b| b == 0).unwrap_or(slice.len());
+    let zero_pos = find_nul(slice).unwrap_or(slice.len());
     let truncated = &slice[..zero_pos];
     let str = std::str::from_utf8(truncated)
         .map_err(|_| LimboError::ParseError("malformed JSON".to_string()))?;
@@ -212,7 +212,7 @@ pub fn convert_ref_dbtype_to_jsonb(val: ValueRef<'_>, strict: Conv) -> crate::Re
                 let str = if matches!(strict, Conv::ToString) {
                     str
                 } else {
-                    &str[..str.find('\0').unwrap_or(str.len())]
+                    &str[..find_nul(str.as_bytes()).unwrap_or(str.len())]
                 };
                 Jsonb::from_str_with_mode(str, strict)
             } else {
@@ -822,7 +822,7 @@ pub fn json_error_position(json: impl AsValueRef) -> crate::Result<Value> {
             // Like SQLite, text parsed as a JSON document stops at the
             // first NUL.
             let text = t.as_str();
-            let text = &text[..text.find('\0').unwrap_or(text.len())];
+            let text = &text[..find_nul(text.as_bytes()).unwrap_or(text.len())];
             match Jsonb::from_str(text) {
                 Ok(_) => Ok(Value::from_i64(0)),
                 Err(JsonError::Message { location, .. }) => {
@@ -857,7 +857,7 @@ pub fn json_error_position(json: impl AsValueRef) -> crate::Result<Value> {
             if looks_like_jsonb_blob(blob) {
                 return Ok(Value::from_i64(jsonb_error_position(blob) as i64));
             }
-            let zero_pos = blob.iter().position(|&b| b == 0).unwrap_or(blob.len());
+            let zero_pos = find_nul(blob).unwrap_or(blob.len());
             match Jsonb::from_str(&String::from_utf8_lossy(&blob[..zero_pos])) {
                 Ok(_) => Ok(Value::from_i64(0)),
                 Err(JsonError::Message { location, .. }) => {

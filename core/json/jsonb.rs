@@ -4286,6 +4286,71 @@ fn find_string_special_byte(input: &[u8], pos: usize, quote: u8) -> usize {
     find_string_special_byte_swar(input, pos, quote)
 }
 
+pub(crate) fn find_nul(input: &[u8]) -> Option<usize> {
+    #[cfg(target_arch = "x86_64")]
+    let pos = match find_nul_sse2(input) {
+        Ok(found) => return Some(found),
+        Err(tail_start) => tail_start,
+    };
+    #[cfg(not(target_arch = "x86_64"))]
+    let pos = 0;
+    find_nul_swar(input, pos)
+}
+
+#[cfg(target_arch = "x86_64")]
+fn find_nul_sse2(input: &[u8]) -> Result<usize, usize> {
+    use std::arch::x86_64::{
+        _mm_cmpeq_epi8, _mm_loadu_si128, _mm_min_epu8, _mm_movemask_epi8, _mm_setzero_si128,
+    };
+    let mut pos = 0;
+    // SAFETY: SSE2 is part of the x86_64 baseline, so these intrinsics are
+    // always available, and the loop conditions keep each unaligned load
+    // inside `input`.
+    unsafe {
+        let zero = _mm_setzero_si128();
+        while pos + 64 <= input.len() {
+            let block = input.as_ptr().add(pos);
+            let smallest = _mm_min_epu8(
+                _mm_min_epu8(
+                    _mm_loadu_si128(block.cast()),
+                    _mm_loadu_si128(block.add(16).cast()),
+                ),
+                _mm_min_epu8(
+                    _mm_loadu_si128(block.add(32).cast()),
+                    _mm_loadu_si128(block.add(48).cast()),
+                ),
+            );
+            if _mm_movemask_epi8(_mm_cmpeq_epi8(smallest, zero)) != 0 {
+                break;
+            }
+            pos += 64;
+        }
+        while pos + 16 <= input.len() {
+            let chunk = _mm_loadu_si128(input.as_ptr().add(pos).cast());
+            let mask = _mm_movemask_epi8(_mm_cmpeq_epi8(chunk, zero));
+            if mask != 0 {
+                return Ok(pos + mask.trailing_zeros() as usize);
+            }
+            pos += 16;
+        }
+    }
+    Err(pos)
+}
+
+fn find_nul_swar(input: &[u8], mut pos: usize) -> Option<usize> {
+    const ONES: u64 = u64::from_ne_bytes([0x01; 8]);
+    const HIGH_BITS: u64 = u64::from_ne_bytes([0x80; 8]);
+    while let Some(chunk) = input.get(pos..pos + 8) {
+        let word = u64::from_le_bytes(chunk.try_into().expect("chunk has 8 bytes"));
+        let zero_bytes = word.wrapping_sub(ONES) & !word & HIGH_BITS;
+        if zero_bytes != 0 {
+            return Some(pos + (zero_bytes.trailing_zeros() / 8) as usize);
+        }
+        pos += 8;
+    }
+    input[pos..].iter().position(|&b| b == 0).map(|i| pos + i)
+}
+
 #[cfg(target_arch = "x86_64")]
 #[inline(always)]
 fn find_string_special_byte_sse2(input: &[u8], mut pos: usize, quote: u8) -> Result<usize, usize> {
@@ -4451,6 +4516,36 @@ mod tests {
     fn parse_has_json5(input: &str) -> bool {
         let (_, info) = Jsonb::from_str_tracking(input).unwrap();
         info.has_json5
+    }
+
+    #[test]
+    fn nul_search_finds_the_first_nul() {
+        let fill = |input: &mut [u8]| {
+            for (i, byte) in input.iter_mut().enumerate() {
+                *byte = [b'a', 0x80, 0xFF, 0x01, b'"'][i % 5];
+            }
+        };
+        for len in 0..200 {
+            let mut input = vec![0; len];
+            fill(&mut input);
+            assert_eq!(find_nul(&input), None);
+            assert_eq!(find_nul_swar(&input, 0), None);
+            for first in 0..len {
+                fill(&mut input);
+                input[first] = 0;
+                for later in [first + 1, first + 17, first + 70] {
+                    if later < len {
+                        input[later] = 0;
+                    }
+                }
+                assert_eq!(find_nul(&input), Some(first), "len {len}, first {first}");
+                assert_eq!(
+                    find_nul_swar(&input, 0),
+                    Some(first),
+                    "len {len}, first {first}"
+                );
+            }
+        }
     }
 
     #[test]
