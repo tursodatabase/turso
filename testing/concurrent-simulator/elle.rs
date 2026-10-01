@@ -219,6 +219,11 @@ pub fn elle_key_name(index: usize) -> String {
     format!("k{index}")
 }
 
+/// Name of the full-text index on an FTS-backed Elle table.
+pub fn elle_fts_index_name(table_name: &str) -> String {
+    format!("{table_name}_idx")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
