@@ -393,6 +393,13 @@ expect {
     1|1|1
 }
 
+test json_extract_skips_jsonb_blob_key_with_invalid_utf8_that_does_not_match {
+    SELECT json_extract(X'8C17FF133117611332', '$.a'), X'8C17FF133117611332' ->> '$.a', json_extract(X'8C17FF133117611332', '$.b') IS NULL;
+}
+expect {
+    2|2|1
+}
+
 test json_extract_malformed_json_1 {
 		SELECT json_extract(X'256162', '$');
 }

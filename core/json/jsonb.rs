@@ -3566,13 +3566,18 @@ impl std::str::FromStr for Jsonb {
 /// decode would hand invalid UTF-8 to `&str` consumers such as
 /// [`unescape_string`], which is undefined behaviour.
 fn read_text_payload(data: &[u8], start: usize, len: usize) -> Result<&str> {
+    let bytes = text_payload_bytes(data, start, len)?;
+    from_utf8(bytes).map_err(|_| LimboError::ParseError("malformed JSON".to_string()))
+}
+
+fn text_payload_bytes(data: &[u8], start: usize, len: usize) -> Result<&[u8]> {
     let Some(end) = start.checked_add(len) else {
         bail_parse_error!("malformed JSON: text payload size overflow");
     };
     let Some(bytes) = data.get(start..end) else {
         bail_parse_error!("malformed JSON: text payload extends beyond data");
     };
-    from_utf8(bytes).map_err(|_| LimboError::ParseError("malformed JSON".to_string()))
+    Ok(bytes)
 }
 
 /// Picks the element type for an object key created from a path label.
@@ -3645,6 +3650,7 @@ fn find_object_value(
     if element_type != ElementType::OBJECT {
         return Ok(None);
     }
+    let key_has_no_escapes = !key_is_quoted || !key.contains('\\');
     let mut entry = payload_start;
     while entry < end {
         let (JsonbHeader(key_type, key_len), key_header_len) =
@@ -3653,9 +3659,17 @@ fn find_object_value(
             bail_parse_error!("Key should be string");
         }
         let key_start = entry + key_header_len;
-        let entry_key = read_text_payload(data, key_start, key_len)?;
+        let entry_key = text_payload_bytes(data, key_start, key_len)?;
         let value = key_start + key_len;
-        if compare((entry_key, key_type), (key, key_is_quoted)) {
+        let found =
+            if key_has_no_escapes && matches!(key_type, ElementType::TEXT | ElementType::TEXTRAW) {
+                entry_key == key.as_bytes()
+            } else {
+                let entry_key = from_utf8(entry_key)
+                    .map_err(|_| LimboError::ParseError("malformed JSON".to_string()))?;
+                compare((entry_key, key_type), (key, key_is_quoted))
+            };
+        if found {
             return Ok(Some(value));
         }
         entry = element_bounds(data, value)?.2;
