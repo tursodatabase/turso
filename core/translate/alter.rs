@@ -865,6 +865,13 @@ pub fn translate_alter_table(
     program.begin_write_on_database(database_id, schema_cookie)?;
     program.begin_write_operation()?;
     let table_name = qualified_name.name.as_str();
+    let table_sql_name = resolver.with_schema(database_id, |schema| {
+        schema
+            .table_sql_names
+            .get(&normalize_ident(table_name))
+            .cloned()
+            .unwrap_or_else(|| table_name.to_owned())
+    });
     // For attached databases, qualify sqlite_schema with the database name
     // so that the UPDATE targets the correct database's schema table.
     let qualified_schema_table = schema_table_name_for_db(resolver, database_id);
@@ -1151,7 +1158,7 @@ pub fn translate_alter_table(
 
             btree.columns_mut().remove(dropped_index);
 
-            let sql = escape_sql_string_literal(&btree.to_sql());
+            let sql = escape_sql_string_literal(&btree.to_sql_with_name_sql(&table_sql_name));
 
             let escaped_table_name = escape_sql_string_literal(table_name);
             let stmt = format!(
@@ -1437,7 +1444,7 @@ pub fn translate_alter_table(
             // visible to the empty-table check below.
             column = btree.columns().last().unwrap().clone();
 
-            let escaped = escape_sql_string_literal(&btree.to_sql());
+            let escaped = escape_sql_string_literal(&btree.to_sql_with_name_sql(&table_sql_name));
             let escaped_table_name = escape_sql_string_literal(table_name);
             let stmt = format!(
                 r#"

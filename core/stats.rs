@@ -42,6 +42,10 @@ pub struct TableStat {
 }
 
 impl TableStat {
+    pub fn get_index_stats(&self, index_name: &str) -> Option<&IndexStat> {
+        self.index_stats.get(&normalize_ident(index_name))
+    }
+
     /// Get or create the per-index statistics bucket for the given index name.
     pub fn index_stats_mut(&mut self, index_name: &str) -> &mut IndexStat {
         let index_name = normalize_ident(index_name);
