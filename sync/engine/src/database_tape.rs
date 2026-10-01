@@ -658,17 +658,23 @@ impl DatabaseReplaySession {
                             })?;
                     }
                     DatabaseSchemaReplay::Refresh { kind, name, sql } => {
-                        if kind != DatabaseSchemaKind::Table {
+                        let refresh_error = |err: Error| {
+                            Error::DatabaseTapeError(format!(
+                                "failed to replay schema refresh DDL `{sql}`: {err}"
+                            ))
+                        };
+                        if kind == DatabaseSchemaKind::Table {
+                            self.generator
+                                .rename_and_drop_local_columns_to_match_remote(coro, &sql)
+                                .await
+                                .map_err(refresh_error)?;
+                        } else {
                             self.conn.execute(Self::schema_drop_sql(kind, &name))?;
                         }
                         self.generator
                             .execute_ddl_idempotent(coro, &sql)
                             .await
-                            .map_err(|err| {
-                                Error::DatabaseTapeError(format!(
-                                    "failed to replay schema refresh DDL `{sql}`: {err}"
-                                ))
-                            })?;
+                            .map_err(refresh_error)?;
                     }
                     DatabaseSchemaReplay::Drop { kind, name } => {
                         self.conn.execute(Self::schema_drop_sql(kind, &name))?;
@@ -3601,6 +3607,124 @@ mod tests {
         );
     }
 
+    #[test]
+    pub fn test_schema_refresh_drops_column_that_remote_dropped() {
+        let rows = replay_on_table_with_generated_columns(
+            &[
+                "CREATE TABLE core (id TEXT PRIMARY KEY, a TEXT, b TEXT)",
+                "INSERT INTO core VALUES ('x', 'A1', 'B1')",
+            ],
+            vec![
+                table_refresh("CREATE TABLE core (id TEXT PRIMARY KEY, b TEXT)"),
+                row_upsert(1, &["x", "B2"]),
+            ],
+            "SELECT * FROM core",
+        )
+        .unwrap();
+        assert_eq!(rows, vec![vec![text("x"), text("B2")]]);
+    }
+
+    #[test]
+    pub fn test_schema_refresh_renames_column_that_remote_renamed() {
+        let rows = replay_on_table_with_generated_columns(
+            &[
+                "CREATE TABLE core (id TEXT PRIMARY KEY, a TEXT, b TEXT)",
+                "INSERT INTO core VALUES ('x', 'A1', 'B1'), ('y', 'A3', 'B3')",
+            ],
+            vec![
+                table_refresh("CREATE TABLE core (id TEXT PRIMARY KEY, a2 TEXT, b TEXT)"),
+                row_upsert(1, &["x", "A2", "B1"]),
+            ],
+            "SELECT * FROM core ORDER BY id",
+        )
+        .unwrap();
+        assert_eq!(
+            rows,
+            vec![
+                vec![text("x"), text("A2"), text("B1")],
+                vec![text("y"), text("A3"), text("B3")],
+            ]
+        );
+    }
+
+    #[test]
+    #[ignore = "Turso currently rejects case-only renames, see https://github.com/tursodatabase/turso/issues/9429"]
+    pub fn test_schema_refresh_renames_column_whose_name_changed_only_in_case() {
+        let rows = replay_on_table_with_generated_columns(
+            &["CREATE TABLE core (id TEXT PRIMARY KEY, a TEXT, b TEXT)"],
+            vec![table_refresh(
+                "CREATE TABLE core (id TEXT PRIMARY KEY, A TEXT, b TEXT)",
+            )],
+            "SELECT name FROM pragma_table_info('core')",
+        )
+        .unwrap();
+        assert_eq!(
+            rows,
+            vec![vec![text("id")], vec![text("A")], vec![text("b")]]
+        );
+    }
+
+    #[test]
+    pub fn test_schema_refresh_renames_column_that_generated_column_uses() {
+        let rows = replay_on_table_with_generated_columns(
+            &[
+                "CREATE TABLE core (id TEXT PRIMARY KEY, a TEXT, v TEXT AS (a || '!'), b TEXT)",
+                "INSERT INTO core (id, a, b) VALUES ('x', 'A1', 'B1')",
+            ],
+            vec![table_refresh(
+                "CREATE TABLE core (id TEXT PRIMARY KEY, a2 TEXT, v TEXT AS (a2 || '!'), b TEXT)",
+            )],
+            "SELECT id, a2, v, b FROM core",
+        )
+        .unwrap();
+        assert_eq!(
+            rows,
+            vec![vec![text("x"), text("A1"), text("A1!"), text("B1")]]
+        );
+    }
+
+    #[test]
+    pub fn test_schema_refresh_drops_generated_column_before_the_column_it_uses() {
+        let rows = replay_on_table_with_generated_columns(
+            &[
+                "CREATE TABLE core (id TEXT PRIMARY KEY, a TEXT, v TEXT AS (a || '!'), b TEXT)",
+                "INSERT INTO core (id, a, b) VALUES ('x', 'A1', 'B1')",
+            ],
+            vec![
+                table_refresh("CREATE TABLE core (id TEXT PRIMARY KEY, b TEXT)"),
+                row_upsert(1, &["x", "B1"]),
+            ],
+            "SELECT * FROM core",
+        )
+        .unwrap();
+        assert_eq!(rows, vec![vec![text("x"), text("B1")]]);
+    }
+
+    #[test]
+    pub fn test_schema_refresh_drops_renames_and_adds_columns_in_one_refresh() {
+        let rows = replay_on_table_with_generated_columns(
+            &[
+                "CREATE TABLE core (id TEXT PRIMARY KEY, a TEXT, b TEXT, c TEXT)",
+                "INSERT INTO core VALUES ('x', 'A1', 'B1', 'C1')",
+            ],
+            vec![
+                table_refresh("CREATE TABLE core (id TEXT PRIMARY KEY, b TEXT, c2 TEXT, d TEXT)"),
+                row_upsert(1, &["x", "B1", "C1"]),
+            ],
+            "SELECT id, b, c2, d FROM core",
+        )
+        .unwrap();
+        assert_eq!(
+            rows,
+            vec![vec![
+                text("x"),
+                text("B1"),
+                text("C1"),
+                turso_core::Value::Null
+            ]]
+        );
+    }
+
     fn replay_on_table_with_generated_columns(
         setup: &[&str],
         operations: Vec<DatabaseTapeOperation>,
@@ -3655,6 +3779,20 @@ mod tests {
             kind: DatabaseSchemaKind::Table,
             name: "core".to_string(),
             sql: sql.to_string(),
+        })
+    }
+
+    fn row_upsert(id: i64, values: &[&str]) -> DatabaseTapeOperation {
+        let mut after = crate::alloc::Vec::new();
+        for value in values {
+            after.push(text(value));
+        }
+        DatabaseTapeOperation::RowChange(DatabaseTapeRowChange {
+            change_id: 0,
+            change_time: 0,
+            change: DatabaseTapeRowChangeType::Insert { after },
+            table_name: "core".to_string(),
+            id,
         })
     }
 
