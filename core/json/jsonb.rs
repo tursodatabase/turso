@@ -1500,6 +1500,7 @@ impl Jsonb {
         cursor
     }
 
+    #[cfg_attr(not(debug_assertions), inline(always))]
     fn deserialize_value(
         &mut self,
         input: &[u8],
@@ -1561,6 +1562,7 @@ impl Jsonb {
         Ok(pos)
     }
 
+    #[inline(never)]
     fn deserialize_obj(
         &mut self,
         input: &[u8],
@@ -1667,6 +1669,7 @@ impl Jsonb {
         }
     }
 
+    #[inline(never)]
     fn deserialize_array(
         &mut self,
         input: &[u8],
