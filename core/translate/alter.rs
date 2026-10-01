@@ -906,6 +906,12 @@ pub fn translate_alter_table(
         ast::AlterTableBody::DropColumn(column_name) => {
             reject_dependent_materialized_views(resolver, database_id, table_name)?;
             let column_name = column_name.as_str();
+            access_control::reject_change_of_policy_column(
+                table_name,
+                database_id,
+                column_name,
+                resolver,
+            )?;
 
             // Tables always have at least one column.
             turso_assert_ne!(btree.columns().len(), 0);
@@ -1840,6 +1846,12 @@ pub fn translate_alter_table(
 
             let from = from.as_str();
             let col_name = col_name.as_str();
+            access_control::reject_change_of_policy_column(
+                table_name,
+                database_id,
+                from,
+                resolver,
+            )?;
 
             let Some((column_index, _)) = btree.get_column(from) else {
                 return Err(LimboError::ParseError(format!(
