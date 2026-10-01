@@ -682,6 +682,7 @@ impl DatabaseReplayGenerator {
                 let Some(mut local_columns) =
                     self.local_column_definitions(coro, table_name).await?
                 else {
+                    // the local table didn't exist
                     self.execute_ddl(ddl)?;
                     return Ok(());
                 };
@@ -712,7 +713,7 @@ impl DatabaseReplayGenerator {
                         self.execute_ddl(&add_column)?;
                     }
                 }
-                return Ok(());
+                Ok(())
             }
             turso_parser::ast::Stmt::CreateIndex { idx_name, .. } => {
                 if self
@@ -722,7 +723,7 @@ impl DatabaseReplayGenerator {
                     return Ok(());
                 }
                 self.execute_ddl(ddl)?;
-                return Ok(());
+                Ok(())
             }
             turso_parser::ast::Stmt::CreateTrigger { trigger_name, .. } => {
                 if self
@@ -732,7 +733,7 @@ impl DatabaseReplayGenerator {
                     return Ok(());
                 }
                 self.execute_ddl(ddl)?;
-                return Ok(());
+                Ok(())
             }
             turso_parser::ast::Stmt::CreateMaterializedView { view_name, .. }
             | turso_parser::ast::Stmt::CreateView { view_name, .. } => {
@@ -743,34 +744,36 @@ impl DatabaseReplayGenerator {
                     return Ok(());
                 }
                 self.execute_ddl(ddl)?;
-                return Ok(());
+                Ok(())
             }
-            _ => {}
+            turso_parser::ast::Stmt::AlterTable(turso_parser::ast::AlterTable {
+                name: tbl_name,
+                body: turso_parser::ast::AlterTableBody::AddColumn(col_def),
+            }) => {
+                let table_name = tbl_name.name.as_str();
+                let local_columns = self
+                    .local_column_definitions(coro, table_name)
+                    .await?
+                    .unwrap_or_default();
+                let col_name = col_def.col_name.as_str();
+
+                if has_column(&local_columns, col_name) {
+                    tracing::debug!(
+                        "execute_ddl_idempotent: column {col_name} already exists in {table_name}, skipping"
+                    );
+                } else {
+                    self.execute_ddl(ddl)?;
+                }
+                Ok(())
+            }
+            _ => {
+                self.conn.execute(ddl)?;
+                Ok(())
+            }
         }
-        let turso_parser::ast::Stmt::AlterTable(turso_parser::ast::AlterTable {
-            name: tbl_name,
-            body: turso_parser::ast::AlterTableBody::AddColumn(col_def),
-        }) = stmt
-        else {
-            self.conn.execute(ddl)?;
-            return Ok(());
-        };
-        let table_name = tbl_name.name.as_str();
-        let local_columns = self
-            .local_column_definitions(coro, table_name)
-            .await?
-            .unwrap_or_default();
-        let col_name = col_def.col_name.as_str();
-        if has_column(&local_columns, col_name) {
-            tracing::debug!(
-                "execute_ddl_idempotent: column {col_name} already exists in {table_name}, skipping"
-            );
-            return Ok(());
-        }
-        self.execute_ddl(ddl)?;
-        Ok(())
     }
 
+    /// Returns `None` if there is no matching local table
     async fn local_column_definitions<Ctx>(
         &self,
         coro: &Coro<Ctx>,
