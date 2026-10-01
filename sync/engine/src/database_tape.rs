@@ -3554,6 +3554,29 @@ mod tests {
     }
 
     #[test]
+    pub fn test_add_column_replay_fails_when_local_table_is_missing() {
+        let error = replay_on_table_with_generated_columns(
+            &[],
+            vec![DatabaseTapeOperation::SchemaReplay(
+                DatabaseSchemaReplay::Alter {
+                    sql: "ALTER TABLE core ADD COLUMN note TEXT".to_string(),
+                },
+            )],
+            "SELECT * FROM core",
+        )
+        .unwrap_err();
+        let crate::errors::Error::DatabaseTapeError(message) = &error else {
+            panic!("unexpected error: {error:?}");
+        };
+        assert!(
+            message.contains(
+                "failed to execute DDL `ALTER TABLE core ADD COLUMN note TEXT`: Parse error: no such table: core"
+            ),
+            "{message}"
+        );
+    }
+
+    #[test]
     pub fn test_schema_refresh_of_table_with_indexed_generated_column_adds_missing_column() {
         let rows = replay_on_table_with_generated_columns(
             &[
