@@ -2661,6 +2661,7 @@ impl Database {
             schema_reparse_in_progress: AtomicBool::new(false),
             prepare_context_generation: AtomicU64::new(0),
             sequence_currvals: RwLock::new(HashMap::default()),
+            current_role: RwLock::new(None),
         });
         self.n_connections
             .fetch_add(1, crate::sync::atomic::Ordering::SeqCst);

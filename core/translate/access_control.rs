@@ -59,6 +59,50 @@ pub fn translate_drop_role(
     Ok(())
 }
 
+/// SET ROLE and RESET ROLE change the role when the statement runs, not
+/// when it is prepared. The read transaction makes the statement check that
+/// the schema is current first, so a role created by another process is
+/// found.
+pub fn translate_set_role(
+    role_name: Option<&ast::Name>,
+    program: &mut ProgramBuilder,
+) -> Result<()> {
+    program.begin_read_operation()?;
+    program.emit_insn(Insn::SetRole {
+        role: role_name.map(|name| normalize_ident(name.as_str())),
+    });
+    Ok(())
+}
+
+/// A connection acting as a role may only read and write rows. Everything
+/// else, such as changing the schema, ATTACH, VACUUM or setting a PRAGMA,
+/// needs the superuser.
+pub fn reject_statement_not_allowed_for_roles(stmt: &ast::Stmt) -> Result<()> {
+    let allowed = match stmt {
+        ast::Stmt::Select(_)
+        | ast::Stmt::Insert { .. }
+        | ast::Stmt::Update(_)
+        | ast::Stmt::Delete { .. }
+        | ast::Stmt::Begin { .. }
+        | ast::Stmt::Commit { .. }
+        | ast::Stmt::Rollback { .. }
+        | ast::Stmt::Savepoint { .. }
+        | ast::Stmt::Release { .. }
+        | ast::Stmt::SetRole { .. } => true,
+        ast::Stmt::Pragma { body, .. } => body.is_none(),
+        _ => false,
+    };
+    if !allowed {
+        bail_parse_error!(
+            "permission denied: {} requires the superuser",
+            crate::translate::stmt_kind(stmt)
+                .replace('_', " ")
+                .to_uppercase()
+        );
+    }
+    Ok(())
+}
+
 fn catalog(resolver: &Resolver) -> Arc<AccessControlCatalog> {
     resolver.with_schema(MAIN_DB_ID, |schema| schema.access_control.clone())
 }

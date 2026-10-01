@@ -130,6 +130,12 @@ pub fn translate(
     );
     #[cfg(feature = "simulator")]
     resolver.set_subquery_unnesting_mode(connection.subquery_unnesting_mode());
+    if !matches!(origin, crate::statement::StatementOrigin::InternalHelper) {
+        resolver.role = connection.current_role();
+    }
+    if resolver.role.is_some() {
+        access_control::reject_statement_not_allowed_for_roles(&stmt)?;
+    }
 
     match stmt {
         // There can be no nesting with pragma, so lift it up here
@@ -496,7 +502,9 @@ pub fn translate_inner(
             if_exists,
             role_name,
         } => access_control::translate_drop_role(&role_name, if_exists, resolver, program)?,
-        ast::Stmt::SetRole { .. } => bail_parse_error!("SET ROLE is not supported"),
+        ast::Stmt::SetRole { role_name } => {
+            access_control::translate_set_role(role_name.as_ref(), program)?
+        }
     };
 
     if is_write {
@@ -530,7 +538,7 @@ pub fn translate_inner(
     Ok(())
 }
 
-fn stmt_kind(stmt: &ast::Stmt) -> &'static str {
+pub(crate) fn stmt_kind(stmt: &ast::Stmt) -> &'static str {
     match stmt {
         ast::Stmt::AlterTable(_) => "alter_table",
         ast::Stmt::Analyze { .. } => "analyze",
