@@ -1252,27 +1252,39 @@ fn append_schema_ops(
     deltas: BTreeMap<i64, SchemaRowDelta>,
     ops: &mut Vec<LogicalOp>,
 ) -> Result<()> {
+    let mut drops = Vec::new();
+    let mut table_changes = Vec::new();
+    let mut creates = Vec::new();
     for delta in deltas.into_values() {
         match (delta.old, delta.new) {
-            (Some(old), Some(new)) => {
+            (Some(old), Some(new)) if is_table(&old) => {
                 if is_logically_replayable_table(&old.name) {
-                    ops.push(schema_logical_op(&new, LogicalSchemaAction::Refresh)?);
+                    table_changes.push(schema_logical_op(&new, LogicalSchemaAction::Refresh)?);
                 }
             }
-            (None, Some(new)) => {
-                if is_logically_replayable_table(&new.name) {
-                    ops.push(schema_logical_op(&new, LogicalSchemaAction::Create)?);
+            (old, new) => {
+                if let Some(old) = old.filter(|old| is_logically_replayable_table(&old.name)) {
+                    drops.push(schema_logical_op(&old, LogicalSchemaAction::Drop)?);
+                }
+                if let Some(new) = new.filter(|new| is_logically_replayable_table(&new.name)) {
+                    let create = schema_logical_op(&new, LogicalSchemaAction::Create)?;
+                    if is_table(&new) {
+                        table_changes.push(create);
+                    } else {
+                        creates.push(create);
+                    }
                 }
             }
-            (Some(old), None) => {
-                if is_logically_replayable_table(&old.name) {
-                    ops.push(schema_logical_op(&old, LogicalSchemaAction::Drop)?);
-                }
-            }
-            (None, None) => {}
         }
     }
+    ops.extend(drops);
+    ops.extend(table_changes);
+    ops.extend(creates);
     Ok(())
+}
+
+fn is_table(row: &DecodedSchemaRow) -> bool {
+    row.row_type.eq_ignore_ascii_case("table")
 }
 
 fn decode_update_header_op(payload: &[u8]) -> Result<LogicalOp> {
@@ -5491,6 +5503,210 @@ mod tests {
                 turso_core::Value::Text(turso_core::types::Text::new("remote".to_string())),
             ]]
         );
+    }
+
+    #[test]
+    fn schema_ops_drop_indexes_before_table_refresh_and_create_them_after() {
+        let deltas = BTreeMap::from([
+            (
+                2,
+                schema_delta(
+                    Some((
+                        "table",
+                        "core",
+                        "CREATE TABLE core (id TEXT PRIMARY KEY, a, b)",
+                    )),
+                    Some((
+                        "table",
+                        "core",
+                        "CREATE TABLE core (id TEXT PRIMARY KEY, b)",
+                    )),
+                ),
+            ),
+            (
+                3,
+                schema_delta(
+                    Some(("index", "core_a", "CREATE INDEX core_a ON core (a)")),
+                    None,
+                ),
+            ),
+            (
+                4,
+                schema_delta(
+                    Some(("index", "core_b", "CREATE INDEX core_b ON core (b)")),
+                    Some(("index", "core_b", "CREATE INDEX core_b ON core (b DESC)")),
+                ),
+            ),
+        ]);
+
+        let mut ops = Vec::new();
+        super::append_schema_ops(deltas, &mut ops).unwrap();
+
+        let actions = ops
+            .iter()
+            .map(|op| (op.schema_action, op.schema_name.as_str(), op.sql.as_str()))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            actions,
+            vec![
+                (Some(LogicalSchemaAction::Drop as i32), "core_a", ""),
+                (Some(LogicalSchemaAction::Drop as i32), "core_b", ""),
+                (
+                    Some(LogicalSchemaAction::Refresh as i32),
+                    "core",
+                    "CREATE TABLE core (id TEXT PRIMARY KEY, b)"
+                ),
+                (
+                    Some(LogicalSchemaAction::Create as i32),
+                    "core_b",
+                    "CREATE INDEX core_b ON core (b DESC)"
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn mvcc_pull_drops_indexed_generated_column_and_its_index_in_one_transaction() {
+        let rows = replay_schema_deltas(
+            BTreeMap::from([
+                (
+                    2,
+                    schema_delta(
+                        Some(("table", "core", CORE_WITH_GENERATED_COLUMN)),
+                        Some(("table", "core", "CREATE TABLE core (id, sort)")),
+                    ),
+                ),
+                (
+                    3,
+                    schema_delta(Some(("index", "idx", CORE_SEARCH_INDEX)), None),
+                ),
+            ]),
+            "SELECT *, (SELECT count(*) FROM sqlite_schema WHERE name = 'idx') FROM core",
+        )
+        .unwrap();
+        assert_eq!(
+            rows,
+            vec![vec![
+                turso_core::Value::build_text("a"),
+                turso_core::Value::build_text("Hello"),
+                turso_core::Value::from_i64(0),
+            ]]
+        );
+    }
+
+    #[test]
+    fn mvcc_pull_redefines_indexed_generated_column_and_its_index_in_one_transaction() {
+        let rows = replay_schema_deltas(
+            BTreeMap::from([
+                (
+                    2,
+                    schema_delta(
+                        Some(("table", "core", CORE_WITH_GENERATED_COLUMN)),
+                        Some((
+                            "table",
+                            "core",
+                            "CREATE TABLE core (id, sort, search AS (UPPER (sort)))",
+                        )),
+                    ),
+                ),
+                (
+                    3,
+                    schema_delta(Some(("index", "idx", CORE_SEARCH_INDEX)), None),
+                ),
+                (
+                    4,
+                    schema_delta(None, Some(("index", "idx", CORE_SEARCH_INDEX))),
+                ),
+            ]),
+            "SELECT id, sort, search, (SELECT count(*) FROM sqlite_schema WHERE name = 'idx') FROM core WHERE search = 'HELLO'",
+        )
+        .unwrap();
+        assert_eq!(
+            rows,
+            vec![vec![
+                turso_core::Value::build_text("a"),
+                turso_core::Value::build_text("Hello"),
+                turso_core::Value::build_text("HELLO"),
+                turso_core::Value::from_i64(1),
+            ]]
+        );
+    }
+
+    const CORE_WITH_GENERATED_COLUMN: &str =
+        "CREATE TABLE core (id, sort, search AS (CAST (sort AS TEXT)))";
+    const CORE_SEARCH_INDEX: &str = "CREATE INDEX idx ON core (search)";
+
+    fn replay_schema_deltas(
+        deltas: BTreeMap<i64, super::SchemaRowDelta>,
+        query: &str,
+    ) -> Result<Vec<Vec<turso_core::Value>>> {
+        let mut ops = Vec::new();
+        super::append_schema_ops(deltas, &mut ops)?;
+        let operations = logical_txn_to_tape_operations(&LogicalTxnData {
+            end_offset: 1,
+            commit_ts: 1,
+            ops,
+            origin_client_id: "remote".to_string(),
+        })?;
+        let temp_file = NamedTempFile::new()?;
+        let io: Arc<dyn turso_core::IO> = Arc::new(turso_core::PlatformIO::new().unwrap());
+        let db = turso_core::Database::open(
+            io.clone(),
+            temp_file.path().to_str().unwrap(),
+            turso_core::OpenOptions::new(Arc::new(SqliteDialect))
+                .db_opts(turso_core::DatabaseOpts::new().with_generated_columns(true)),
+        )?;
+        let db = Arc::new(DatabaseTape::new(db));
+        let query = query.to_string();
+        let mut gen = genawaiter::sync::Gen::new({
+            let db = db.clone();
+            |coro| async move {
+                let coro: Coro<()> = coro.into();
+                let conn = db.connect(&coro).await.unwrap();
+                for sql in [
+                    CORE_WITH_GENERATED_COLUMN,
+                    CORE_SEARCH_INDEX,
+                    "INSERT INTO core (id, sort) VALUES ('a', 'Hello')",
+                ] {
+                    conn.execute(sql).unwrap();
+                }
+                let opts = DatabaseReplaySessionOpts {
+                    use_implicit_rowid: true,
+                };
+                let mut session = db.start_replay_session(&coro, opts).await.unwrap();
+                for operation in operations {
+                    session.replay(&coro, operation).await?;
+                }
+                session.replay(&coro, DatabaseTapeOperation::Commit).await?;
+                let mut stmt = conn.prepare(&query).unwrap();
+                let mut rows = Vec::new();
+                while let Some(row) = run_stmt_once(&coro, &mut stmt).await.unwrap() {
+                    rows.push(row.get_values().cloned().collect::<Vec<_>>());
+                }
+                Ok(rows)
+            }
+        });
+        loop {
+            match gen.resume_with(Ok(())) {
+                genawaiter::GeneratorState::Yielded(..) => io.step()?,
+                genawaiter::GeneratorState::Complete(result) => break result,
+            }
+        }
+    }
+
+    fn schema_delta(
+        old: Option<(&str, &str, &str)>,
+        new: Option<(&str, &str, &str)>,
+    ) -> super::SchemaRowDelta {
+        let row = |(row_type, name, sql): (&str, &str, &str)| super::DecodedSchemaRow {
+            row_type: row_type.to_string(),
+            name: name.to_string(),
+            sql: sql.to_string(),
+        };
+        super::SchemaRowDelta {
+            old: old.map(row),
+            new: new.map(row),
+        }
     }
 
     #[test]
