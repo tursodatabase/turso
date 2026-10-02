@@ -1556,29 +1556,21 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
         if self.mode.should_restart_log() {
             return;
         }
-        let (max_frame, backfilled) = {
-            let Some(result) = self.checkpoint_result.as_ref() else {
-                return;
-            };
-            if result.wal_checkpoint_backfilled == 0 {
-                return;
-            }
-            (
-                result.wal_total_backfilled,
-                result.wal_checkpoint_backfilled,
-            )
+        let Some(result) = self.checkpoint_result.as_mut() else {
+            return;
         };
-        if let Some(result) = self.checkpoint_result.as_mut() {
-            result.release_guard();
+        if result.wal_checkpoint_backfilled == 0 {
+            return;
         }
+        result.release_guard();
         turso_assert!(self.pager.wal.is_some(), "No WAL to publish backfill");
         let wal = self.pager.wal.as_ref().unwrap();
         tracing::debug!(
-            max_frame,
-            backfilled,
+            max_frame = result.wal_total_backfilled,
+            backfilled = result.wal_checkpoint_backfilled,
             "publishing WAL backfill after MVCC checkpoint"
         );
-        wal.publish_backfill(max_frame);
+        wal.publish_backfill(result);
     }
 
     fn has_unpublished_schema_changes(&self) -> bool {
