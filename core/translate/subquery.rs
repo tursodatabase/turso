@@ -40,7 +40,9 @@ use crate::{
     types::Value,
     util::parse_signed_number,
     vdbe::{
-        builder::{CursorKey, CursorType, MaterializedCteInfo, ProgramBuilder},
+        builder::{
+            CursorKey, CursorType, MaterializedCteInfo, ProgramBuilder, SubqueryFillSubroutine,
+        },
         insn::Insn,
         CursorID,
     },
@@ -60,9 +62,11 @@ pub(crate) enum MaterializedFromClauseSubqueryStorage {
 
 enum FromClauseSubqueryExecutionMode {
     Coroutine,
-    MaterializedTable {
-        shared_with_other_cte_references: bool,
-    },
+    MaterializedTable,
+    /// Materialized because the subquery is an inner loop. It is filled the
+    /// first time that loop starts, like SQLite, so an outer loop without rows
+    /// never runs it. Other references to the same CTE do not reuse it.
+    InnerLoopMaterializedTable,
     DirectMaterializedIndex(DirectMaterializedSubquery),
 }
 
@@ -1361,9 +1365,10 @@ fn eqp_subquery_info(
     } else {
         match execution_mode {
             Some(FromClauseSubqueryExecutionMode::Coroutine) | None => EqpSubqueryExec::Coroutine,
-            Some(FromClauseSubqueryExecutionMode::MaterializedTable { .. }) => {
-                EqpSubqueryExec::Materialized
-            }
+            Some(
+                FromClauseSubqueryExecutionMode::MaterializedTable
+                | FromClauseSubqueryExecutionMode::InnerLoopMaterializedTable,
+            ) => EqpSubqueryExec::Materialized,
             Some(FromClauseSubqueryExecutionMode::DirectMaterializedIndex(_)) => {
                 EqpSubqueryExec::IndexedMaterialized
             }
@@ -1405,20 +1410,14 @@ fn choose_from_clause_subquery_execution_mode(
                 affinity_str: super::plan::synthesized_seek_affinity_str(index, seek_def),
             })
         }
-        _ if needs_materialized_seek => FromClauseSubqueryExecutionMode::MaterializedTable {
-            shared_with_other_cte_references: true,
-        },
+        _ if needs_materialized_seek => FromClauseSubqueryExecutionMode::MaterializedTable,
         _ if from_clause_subquery.requires_table_materialization() => {
-            FromClauseSubqueryExecutionMode::MaterializedTable {
-                shared_with_other_cte_references: true,
-            }
+            FromClauseSubqueryExecutionMode::MaterializedTable
         }
         Operation::Scan(Scan::Subquery { .. })
             if is_inner_loop && !plan_has_outer_scope_dependency(&from_clause_subquery.plan) =>
         {
-            FromClauseSubqueryExecutionMode::MaterializedTable {
-                shared_with_other_cte_references: false,
-            }
+            FromClauseSubqueryExecutionMode::InnerLoopMaterializedTable
         }
         _ => FromClauseSubqueryExecutionMode::Coroutine,
     }
@@ -1566,9 +1565,7 @@ pub fn emit_from_clause_subqueries(
                     from_clause_subquery.plan.as_mut(),
                     t_ctx,
                 )?),
-                FromClauseSubqueryExecutionMode::MaterializedTable {
-                    shared_with_other_cte_references,
-                } => {
+                FromClauseSubqueryExecutionMode::MaterializedTable => {
                     let (result_columns_start, cte_cursor_id, cte_table) =
                         emit_materialized_subquery_table(
                             program,
@@ -1577,10 +1574,7 @@ pub fn emit_from_clause_subqueries(
                             &from_clause_subquery.columns,
                         )?;
                     from_clause_subquery.materialized_cursor_id = Some(cte_cursor_id);
-                    if let Some(cte_id) = from_clause_subquery
-                        .cte_id()
-                        .filter(|_| shared_with_other_cte_references)
-                    {
+                    if let Some(cte_id) = from_clause_subquery.cte_id() {
                         program.register_materialized_cte(
                             cte_id,
                             MaterializedCteInfo {
@@ -1590,6 +1584,17 @@ pub fn emit_from_clause_subqueries(
                             },
                         );
                     }
+                    Some(result_columns_start)
+                }
+                FromClauseSubqueryExecutionMode::InnerLoopMaterializedTable => {
+                    let (result_columns_start, cursor_id) = emit_subquery_fill_subroutine(
+                        program,
+                        from_clause_subquery.plan.as_mut(),
+                        t_ctx,
+                        &from_clause_subquery.columns,
+                        table_reference.internal_id,
+                    )?;
+                    from_clause_subquery.materialized_cursor_id = Some(cursor_id);
                     Some(result_columns_start)
                 }
                 FromClauseSubqueryExecutionMode::DirectMaterializedIndex(direct_index) => {
@@ -1614,6 +1619,36 @@ pub fn emit_from_clause_subqueries(
         program.pop_current_parent_explain();
     }
     Ok(())
+}
+
+/// Emit the materialization of an inner-loop FROM clause subquery as a
+/// subroutine and return its result column registers and cursor. The loop
+/// that reads the subquery calls the subroutine before its first scan.
+fn emit_subquery_fill_subroutine(
+    program: &mut ProgramBuilder,
+    plan: &mut Plan,
+    t_ctx: &mut TranslateCtx,
+    columns: &[Column],
+    internal_id: TableInternalId,
+) -> Result<(usize, CursorID)> {
+    let fill = SubqueryFillSubroutine {
+        start: program.allocate_label(),
+        return_reg: program.alloc_register(),
+    };
+    let after_fill = program.allocate_label();
+    program.emit_insn(Insn::Goto {
+        target_pc: after_fill,
+    });
+    program.preassign_label_to_next_insn(fill.start);
+    let (result_columns_start, cursor_id, _) =
+        emit_materialized_subquery_table(program, plan, t_ctx, columns)?;
+    program.emit_insn(Insn::Return {
+        return_reg: fill.return_reg,
+        can_fallthrough: false,
+    });
+    program.preassign_label_to_next_insn(after_fill);
+    program.set_subquery_fill_subroutine(internal_id, fill);
+    Ok((result_columns_start, cursor_id))
 }
 
 /// Emit a FROM clause subquery and return the start register of the result columns.
