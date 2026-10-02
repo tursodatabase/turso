@@ -209,6 +209,8 @@ pub fn convert_ref_dbtype_to_jsonb(val: ValueRef<'_>, strict: Conv) -> crate::Re
                     &str[..find_nul(str.as_bytes()).unwrap_or(str.len())]
                 };
                 Jsonb::from_str_with_mode(str, strict)
+            } else if !jsonb::has_byte_to_escape(text.as_str().as_bytes()) {
+                return Jsonb::from_payload(ElementType::TEXT, text.as_str().as_bytes());
             } else {
                 // Handle as a string literal otherwise
                 // Escape backslashes first, then double quotes
@@ -305,7 +307,7 @@ pub fn convert_ref_dbtype_to_jsonb(val: ValueRef<'_>, strict: Conv) -> crate::Re
             }
         }
         ValueRef::Numeric(Numeric::Integer(int)) => {
-            Jsonb::from_str(&int.to_string()).map_err(malformed_json_error)
+            Jsonb::from_payload(ElementType::INT, int.to_string().as_bytes())
         }
     }
 }

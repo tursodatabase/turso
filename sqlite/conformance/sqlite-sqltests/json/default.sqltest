@@ -1253,6 +1253,29 @@ expect {
     {"key":40.7128}
 }
 
+test jsonb_array_of_sql_text_and_integers {
+    SELECT hex(jsonb_array('x', '', 'é', 'a"b', 'a' || char(92) || 'b', -9223372036854775808, 0, 42));
+}
+expect {
+    CB2B17780727C3A948615C226248615C5C62C3142D393232333337323033363835343737353830381330233432
+}
+
+test jsonb_object_of_long_sql_text_and_integer {
+    SELECT hex(jsonb_object('k', printf('%.20c', 'z'), 'n', 9223372036854775807));
+}
+expect {
+    CC2F176BC7147A7A7A7A7A7A7A7A7A7A7A7A7A7A7A7A7A7A7A7A176EC31339323233333732303336383534373735383037
+}
+
+test json_object_of_sql_text_and_integer_extracts_both {
+    SELECT json_object('k', 'v', 'n', -5) ->> '$.k',
+           json_object('k', 'v', 'n', -5) ->> '$.n',
+           json_type(json_object('k', 'v', 'n', -5), '$.n');
+}
+expect {
+    v|-5|integer
+}
+
 test json_object_nested {
     SELECT json_object('grandparent',json_object('parent', json_object('child', 'value')));
 }

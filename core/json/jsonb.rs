@@ -933,6 +933,13 @@ impl Jsonb {
         })
     }
 
+    pub(crate) fn from_payload(element_type: ElementType, payload: &[u8]) -> Result<Self> {
+        let mut json = Self::new(payload.len() + 9)?;
+        json.push_element_header(element_type, payload.len())?;
+        json.data.extend_from_slice(payload);
+        Ok(json)
+    }
+
     pub fn as_slice(&self) -> &[u8] {
         &self.data
     }
@@ -4886,6 +4893,10 @@ fn string_special_or_non_ascii_mask_sse2(data: &[u8], pos: usize) -> u32 {
         let special = _mm_or_si128(_mm_or_si128(is_quote, is_backslash), is_control);
         (_mm_movemask_epi8(special) | _mm_movemask_epi8(chunk)) as u32
     }
+}
+
+pub(crate) fn has_byte_to_escape(bytes: &[u8]) -> bool {
+    find_string_special_byte(bytes, 0, b'"') != bytes.len()
 }
 
 pub(crate) fn find_nul(input: &[u8]) -> Option<usize> {
