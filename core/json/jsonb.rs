@@ -937,6 +937,11 @@ impl Jsonb {
         &self.data
     }
 
+    #[cfg(test)]
+    pub fn data_capacity(&self) -> usize {
+        self.data.capacity()
+    }
+
     pub fn len(&self) -> usize {
         self.data.len()
     }
@@ -2543,6 +2548,20 @@ impl Jsonb {
 
     pub fn from_str_tracking(input: &str) -> PResult<(Self, ParseInfo)> {
         let mut result = Self::new(input.len())?;
+        let info = result.parse_text_tracking(input)?;
+        Ok((result, info))
+    }
+
+    pub fn replace_with_parsed_text(&mut self, input: &str) -> PResult<()> {
+        self.data.clear();
+        self.data
+            .try_reserve(input.len())
+            .map_err(|_| PError::OutOfMemory)?;
+        self.parse_text_tracking(input)?;
+        Ok(())
+    }
+
+    fn parse_text_tracking(&mut self, input: &str) -> PResult<ParseInfo> {
         let input = input.as_bytes();
         let mut info = ParseInfo::default();
 
@@ -2555,7 +2574,7 @@ impl Jsonb {
 
         // Parse the first complete JSON value
         let mut pos = skip_whitespace_tracking(input, 0, &mut info);
-        pos = result.deserialize_value(input, pos, 0, &mut info)?;
+        pos = self.deserialize_value(input, pos, 0, &mut info)?;
 
         // Skip any trailing whitespace
         pos = skip_whitespace_tracking(input, pos, &mut info);
@@ -2568,7 +2587,7 @@ impl Jsonb {
             });
         }
 
-        Ok((result, info))
+        Ok(info)
     }
 
     pub fn from_str_with_mode(input: &str, mode: Conv) -> PResult<Self> {

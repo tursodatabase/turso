@@ -370,8 +370,7 @@ pub fn json_array_length(
         return Ok(Value::Null);
     }
 
-    let make_jsonb_fn = curry_convert_dbtype_to_jsonb(Conv::Strict);
-    json_cache.with_jsonb(value, make_jsonb_fn, |json| {
+    json_cache.with_parsed_jsonb(value, parse_strict_into, |json| {
         let Some(path) = path else {
             let len = json.array_len()?;
             return Ok(Value::from_i64(len as i64));
@@ -581,8 +580,7 @@ where
         return Ok(element.unwrap_or(Value::Null));
     }
 
-    let convert_to_jsonb = curry_convert_dbtype_to_jsonb(Conv::Strict);
-    json_cache.with_jsonb(value, convert_to_jsonb, |value| {
+    json_cache.with_parsed_jsonb(value, parse_strict_into, |value| {
         let mut result = Jsonb::make_empty_array(value.len())?;
         for path in paths {
             let found = json_cache.with_path(path.as_value_ref(), true, |path| match path {
@@ -613,7 +611,6 @@ fn extract_path_element<R>(
     json_cache: &JsonCacheCell,
     read: impl FnOnce(&[u8], usize) -> crate::Result<R>,
 ) -> crate::Result<Option<R>> {
-    let convert_to_jsonb = curry_convert_dbtype_to_jsonb(Conv::Strict);
     let path = path.as_value_ref();
     if let Some(document) = jsonb_blob_document(value) {
         return json_cache.with_path(path, strict_path, |path| {
@@ -625,18 +622,32 @@ fn extract_path_element<R>(
                 Ok(Some(pos)) if jsonb::is_valid_element_at(document, pos) => {
                     read(document, pos).map(Some)
                 }
-                Ok(Some(_)) | Err(_) => json_cache.with_jsonb(value, convert_to_jsonb, |json| {
-                    find_and_read(json.as_slice(), path, read)
-                }),
+                Ok(Some(_)) | Err(_) => {
+                    json_cache.with_parsed_jsonb(value, parse_strict_into, |json| {
+                        find_and_read(json.as_slice(), path, read)
+                    })
+                }
             }
         });
     }
-    json_cache.with_jsonb(value, convert_to_jsonb, |json| {
+    json_cache.with_parsed_jsonb(value, parse_strict_into, |json| {
         json_cache.with_path(path, strict_path, |path| match path {
             Some(path) => find_and_read(json.as_slice(), path, read),
             None => Ok(None),
         })
     })
+}
+
+fn parse_strict_into(val: ValueRef<'_>, json: &mut Jsonb) -> crate::Result<()> {
+    if let ValueRef::Text(text) = val {
+        let text = text.as_str();
+        let text = &text[..find_nul(text.as_bytes()).unwrap_or(text.len())];
+        return json
+            .replace_with_parsed_text(text)
+            .map_err(malformed_json_error);
+    }
+    *json = convert_ref_dbtype_to_jsonb(val, Conv::Strict)?;
+    Ok(())
 }
 
 fn find_and_read<R>(
