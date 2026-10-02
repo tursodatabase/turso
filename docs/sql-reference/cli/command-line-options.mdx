@@ -152,9 +152,19 @@ Names must match `^[a-z0-9_-]+$` and are capped at 128 characters — no upperca
 
 `--readonly`, `--vfs`, and the `--experimental-*` flags apply to every database served this way, the same as they would for a single database.
 
+Up to `--sync-workers` requests are served at a time, so requests to different databases do not wait for each other. Requests to one database are served one at a time, because each database has a single connection.
+
 <Warning>
-Directory mode handles one request at a time across all databases, so distinct databases do not progress independently. WAL retention follows the same behavior as the single-database sync server. Opened database handles stay cached for the life of the process without eviction, and at most `--sync-max-databases` may be open at once (default 256); beyond that, a request for a database that is not already open is refused with `503 Service Unavailable` until the server restarts. Any client that can reach the port can create a database simply by requesting a new valid name, so disk space and inodes still accumulate without bound. The name restrictions above do not confine a client to the served directory: `VACUUM INTO` can write a copy to any path the server process can reach, and with `--experimental-attach` a client can `ATTACH DATABASE` an arbitrary filesystem path. There is no authentication or multi-tenancy; directory mode is intended for local and development use.
+WAL retention follows the same behavior as the single-database sync server. Opened database handles stay cached for the life of the process without eviction, and at most `--sync-max-databases` may be open at once (default 256); beyond that, a request for a database that is not already open is refused with `503 Service Unavailable` until the server restarts. Any client that can reach the port can create a database simply by requesting a new valid name, so disk space and inodes still accumulate without bound. The name restrictions above do not confine a client to the served directory: `VACUUM INTO` can write a copy to any path the server process can reach, and with `--experimental-attach` a client can `ATTACH DATABASE` an arbitrary filesystem path. There is no authentication or multi-tenancy; directory mode is intended for local and development use.
 </Warning>
+
+### `--sync-workers <N>`
+
+How many sync server requests are handled at once. Requests to different databases are handled in parallel; requests to the same database still run one at a time. Defaults to the number of CPU cores, capped at 16. Requires `--sync-server`.
+
+```bash
+tursodb --sync-server 127.0.0.1:8080 --sync-dir ./dbs --sync-workers 8
+```
 
 ## Experimental Feature Flags
 
