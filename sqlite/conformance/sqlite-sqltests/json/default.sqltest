@@ -3674,3 +3674,73 @@ test json-error-position-of-empty-text {
 expect {
     1|1|1|0
 }
+
+test json-error-position-of-comma-where-a-key-starts {
+    SELECT json_error_position(CAST(X'7b2c7d' AS TEXT));
+}
+expect {
+    2
+}
+
+test json-error-position-of-digit-where-a-key-starts {
+    SELECT json_error_position(CAST(X'7b303a317d' AS TEXT));
+}
+expect {
+    2
+}
+
+test json-error-position-of-colon-where-a-key-starts {
+    SELECT json_error_position(CAST(X'7b3a317d' AS TEXT));
+}
+expect {
+    2
+}
+
+test json-error-position-of-comma-after-space-where-a-key-starts {
+    SELECT json_error_position(CAST(X'7b202c7d' AS TEXT));
+}
+expect {
+    3
+}
+
+test json-error-position-of-minus-inside-an-unquoted-key {
+    SELECT json_error_position(CAST(X'7b612d623a317d' AS TEXT));
+}
+expect {
+    3
+}
+
+test json-error-position-of-percent-inside-an-unquoted-key {
+    SELECT json_error_position(CAST(X'7b61622463253a317d' AS TEXT));
+}
+expect {
+    6
+}
+
+test json-error-position-of-invalid-escape-in-an-unquoted-key {
+    SELECT json_error_position(CAST(X'7b615c713a317d' AS TEXT));
+}
+expect {
+    3
+}
+
+test json-error-position-of-invalid-escape-at-the-start-of-an-unquoted-key {
+    SELECT json_error_position(CAST(X'7b5c713a317d' AS TEXT));
+}
+expect {
+    2
+}
+
+test json-error-position-of-short-unicode-escape-in-an-unquoted-key {
+    SELECT json_error_position(CAST(X'7b615c7530303a317d' AS TEXT));
+}
+expect {
+    3
+}
+
+test json-error-position-of-backslash-at-the-end-of-an-unquoted-key {
+    SELECT json_error_position(CAST(X'7b615c' AS TEXT));
+}
+expect {
+    3
+}

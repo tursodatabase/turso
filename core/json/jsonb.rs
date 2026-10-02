@@ -1939,7 +1939,7 @@ impl Jsonb {
         } else if !is_json5_id_char(quote, true) {
             return Err(PError::Message {
                 msg: "Invalid character in unquoted object key".to_string(),
-                location: Some(pos),
+                location: Some(pos - 1),
             });
         } else {
             self.data.push(quote);
@@ -1967,11 +1967,12 @@ impl Jsonb {
                     location: Some(pos),
                 });
             } else if c == b'\\' {
+                let backslash_pos = pos - 1;
                 // Handle escape sequences
                 if pos >= input.len() {
                     return Err(PError::Message {
                         msg: "Unexpected end of input".to_string(),
-                        location: Some(pos),
+                        location: Some(backslash_pos),
                     });
                 }
 
@@ -1982,7 +1983,7 @@ impl Jsonb {
                 if esc != b'u' {
                     return Err(PError::Message {
                         msg: "Invalid character in unquoted object key".to_string(),
-                        location: Some(pos),
+                        location: Some(backslash_pos),
                     });
                 }
 
@@ -2038,7 +2039,7 @@ impl Jsonb {
                         if pos + 4 > input.len() {
                             return Err(PError::Message {
                                 msg: "Incomplete unicode escape sequence".to_string(),
-                                location: Some(pos),
+                                location: Some(backslash_pos),
                             });
                         }
 
@@ -2050,7 +2051,7 @@ impl Jsonb {
                             if !is_hex_digit(h) {
                                 return Err(PError::Message {
                                     msg: "Invalid unicode escape sequence".to_string(),
-                                    location: Some(pos),
+                                    location: Some(backslash_pos),
                                 });
                             }
                             escape_buffer[2 + i] = h;
@@ -2155,7 +2156,7 @@ impl Jsonb {
             } else if !is_json5_id_char(c, false) {
                 return Err(PError::Message {
                     msg: "Invalid character in unquoted object key".to_string(),
-                    location: Some(pos),
+                    location: Some(pos - 1),
                 });
             } else {
                 // Normal character
