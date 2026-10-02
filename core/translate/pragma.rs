@@ -557,6 +557,8 @@ fn update_pragma(
                 ));
             }
 
+            let pager = connection.get_pager_from_database_index(&database_id)?;
+
             // Like SQLite, the auto-vacuum mode is fixed once page 1 exists,
             // so the pragma is silently ignored after that.
             if pager.db_initialized() {
@@ -1475,6 +1477,7 @@ fn query_pragma(
             Ok(TransactionMode::None)
         }
         PragmaName::AutoVacuum => {
+            let pager = connection.get_pager_from_database_index(&database_id)?;
             let auto_vacuum_mode = pager.get_auto_vacuum_mode();
             let auto_vacuum_mode_i64: i64 = match auto_vacuum_mode {
                 AutoVacuumMode::None => 0,
