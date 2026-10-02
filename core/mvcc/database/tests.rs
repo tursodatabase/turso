@@ -1478,7 +1478,9 @@ fn mvcc_btree_read_dual_gate() {
     store.record_rootpage_alloc(new_id, root, drop + 5, mark(3, 10));
     store.publish_rootpage_visible(new_id, mark(3, 10));
     assert_eq!(
-        store.get_table_id_from_root_page_at(root as i64, drop - 1),
+        store
+            .get_table_id_from_root_page_at(root as i64, drop - 1)
+            .unwrap(),
         old_id
     );
     assert!(!store.is_btree_readable_at(&old_id, drop + 1, WalPos::STAGED)); // past its end
@@ -1539,6 +1541,17 @@ fn mvcc_try_get_table_id_stale_schema_read_returns_none() {
         store.try_get_table_id_from_root_page_at(-12, 0),
         Some(MVTableId::from(-12_i64))
     );
+}
+
+#[test]
+fn mvcc_get_table_id_from_unmapped_root_page_returns_error() {
+    let db = MvccTestDb::new();
+    let result = db.mvcc_store.get_table_id_from_root_page_at(26, 0);
+    assert!(matches!(
+        result,
+        Err(LimboError::InternalError(msg))
+            if msg == "Positive root page is not mapped to a table id: 26"
+    ));
 }
 
 #[test]
