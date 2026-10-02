@@ -15,6 +15,7 @@ const PATH_CACHE_SIZE: usize = 4;
 #[derive(Debug)]
 pub struct JsonCache {
     entries: [Option<(Value, Jsonb)>; JSON_CACHE_SIZE],
+    key_lens: [usize; JSON_CACHE_SIZE],
     age: [usize; JSON_CACHE_SIZE],
     used: usize,
     counter: usize,
@@ -24,6 +25,7 @@ impl JsonCache {
     pub fn new() -> Self {
         Self {
             entries: [None, None, None, None],
+            key_lens: [0; JSON_CACHE_SIZE],
             age: [0, 0, 0, 0],
             used: 0,
             counter: 0,
@@ -62,16 +64,21 @@ impl JsonCache {
         } else {
             self.find_oldest_entry()
         };
-        let (old_key, mut json) = match self.entries[slot].take() {
-            Some((old_key, json)) => (Some(old_key), json),
-            None => (None, Jsonb::empty()),
-        };
-        parse(key, &mut json)?;
-        let stored_key = match old_key {
-            Some(old_key) => reuse_key_buffer(old_key, key)?,
-            None => key.to_owned()?,
-        };
-        self.entries[slot] = Some((stored_key, json));
+        match &mut self.entries[slot] {
+            Some((stored_key, json)) => {
+                let stored = parse(key, json).and_then(|()| copy_key_into(stored_key, key));
+                if let Err(error) = stored {
+                    self.entries[slot] = None;
+                    return Err(error);
+                }
+            }
+            None => {
+                let mut json = Jsonb::empty();
+                parse(key, &mut json)?;
+                self.entries[slot] = Some((key.to_owned()?, json));
+            }
+        }
+        self.key_lens[slot] = key_byte_len(key);
         if slot == self.used {
             self.used += 1;
         }
@@ -90,7 +97,11 @@ impl JsonCache {
 
     fn find(&mut self, key: impl AsValueRef) -> Option<usize> {
         let key = key.as_value_ref();
+        let key_len = key_byte_len(key);
         for i in (0..self.used).rev() {
+            if self.key_lens[i] != key_len {
+                continue;
+            }
             if let Some((stored_key, _)) = &self.entries[i] {
                 if key == *stored_key {
                     self.age[i] = self.counter;
@@ -115,30 +126,35 @@ impl JsonCache {
     }
 }
 
-fn reuse_key_buffer(old_key: Value, key: ValueRef) -> crate::Result<Value> {
-    match (old_key, key) {
+fn copy_key_into(stored_key: &mut Value, key: ValueRef) -> crate::Result<()> {
+    match (stored_key, key) {
         (
             Value::Text(Text {
-                value: Cow::Owned(mut text),
-                ..
+                value: Cow::Owned(text),
+                subtype,
             }),
             ValueRef::Text(new_text),
         ) => {
             text.clear();
             text.try_reserve(new_text.value.len())?;
             text.push_str(new_text.value);
-            Ok(Value::Text(Text {
-                value: Cow::Owned(text),
-                subtype: new_text.subtype,
-            }))
+            *subtype = new_text.subtype;
         }
-        (Value::Blob(mut blob), ValueRef::Blob(new_blob)) => {
+        (Value::Blob(blob), ValueRef::Blob(new_blob)) => {
             blob.clear();
             blob.try_reserve(new_blob.len())?;
             blob.extend_from_slice(new_blob);
-            Ok(Value::Blob(blob))
         }
-        (_, key) => Ok(key.to_owned()?),
+        (stored_key, key) => *stored_key = key.to_owned()?,
+    }
+    Ok(())
+}
+
+fn key_byte_len(key: ValueRef) -> usize {
+    match key {
+        ValueRef::Text(text) => text.value.len(),
+        ValueRef::Blob(blob) => blob.len(),
+        ValueRef::Null | ValueRef::Numeric(_) => 0,
     }
 }
 
@@ -668,6 +684,43 @@ mod tests {
         for key in &keys[1..] {
             let expected = Jsonb::from_str(key.to_text().unwrap()).unwrap();
             assert_eq!(cache.lookup(key).unwrap(), Some(expected));
+        }
+    }
+
+    #[test]
+    fn lookup_does_not_match_a_key_of_the_same_length_with_other_bytes() {
+        let mut cache = JsonCache::new();
+        let (key, value) = create_test_pair("[1]");
+        cache.insert(&key, value.try_clone().unwrap()).unwrap();
+
+        assert!(cache.lookup(Value::build_text("[2]")).unwrap().is_none());
+        assert!(cache
+            .lookup(Value::from_blob(b"[1]".to_vec()))
+            .unwrap()
+            .is_none());
+        assert_eq!(cache.lookup(&key).unwrap(), Some(value));
+    }
+
+    #[test]
+    fn insert_after_eviction_replaces_a_text_key_with_a_blob_key() {
+        let mut cache = JsonCache::new();
+        let pairs: Vec<(Value, Jsonb)> = (0..4)
+            .map(|i| create_test_pair(&format!("[{i}]")))
+            .collect();
+        for (key, value) in &pairs {
+            cache.insert(key, value.try_clone().unwrap()).unwrap();
+        }
+
+        let blob_key = Value::from_blob(b"[0]".to_vec());
+        let blob_value = Jsonb::from_str("[0]").unwrap();
+        cache
+            .insert(&blob_key, blob_value.try_clone().unwrap())
+            .unwrap();
+
+        assert!(cache.lookup(&pairs[0].0).unwrap().is_none());
+        assert_eq!(cache.lookup(&blob_key).unwrap(), Some(blob_value));
+        for (key, value) in &pairs[1..] {
+            assert_eq!(cache.lookup(key).unwrap().as_ref(), Some(value));
         }
     }
 
