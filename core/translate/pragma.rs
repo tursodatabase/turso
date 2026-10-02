@@ -239,12 +239,13 @@ pub fn translate_pragma(
         return Ok(());
     }
 
+    let database_id = resolver.resolve_database_id(name)?;
+
     let Some(pragma) = parse_pragma_name(name.name.as_str()) else {
         // SQLite silently ignores unknown PRAGMA names.
         return Ok(());
     };
 
-    let database_id = resolver.resolve_database_id(name)?;
     let schema_was_explicit = name.db_name.is_some();
     let query_only = connection.get_query_only();
 
