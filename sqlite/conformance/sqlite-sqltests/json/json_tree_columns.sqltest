@@ -89,3 +89,38 @@ expect {
     2|{"c":null}|object||$.a.b[2]|$.a.b
     c||null||$.a.b[2].c|$.a.b[2]
 }
+
+test json-each-fullkey-of-multi-digit-array-index {
+    SELECT key, fullkey, path FROM json_each('[0,1,2,3,4,5,6,7,8,9,10,11]') WHERE key >= 9;
+}
+expect {
+    9|$[9]|$
+    10|$[10]|$
+    11|$[11]|$
+}
+
+test json-each-fullkey-of-three-digit-array-index {
+    SELECT key, fullkey FROM json_each('[' || substr(replace(hex(zeroblob(101)), '00', '0,'), 1, 201) || ']') WHERE key >= 99;
+}
+expect {
+    99|$[99]
+    100|$[100]
+}
+
+test json-tree-fullkey-below-multi-digit-array-index {
+    SELECT fullkey FROM json_tree('{"a":[0,1,2,3,4,5,6,7,8,9,[10,11,12,13,14,15,16,17,18,19,20]]}') WHERE fullkey LIKE '%[10]%';
+}
+expect {
+    $.a[10]
+    $.a[10][0]
+    $.a[10][1]
+    $.a[10][2]
+    $.a[10][3]
+    $.a[10][4]
+    $.a[10][5]
+    $.a[10][6]
+    $.a[10][7]
+    $.a[10][8]
+    $.a[10][9]
+    $.a[10][10]
+}

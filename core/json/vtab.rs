@@ -1,5 +1,4 @@
 use crate::sync::{Arc, RwLock};
-use std::fmt::Write;
 use std::iter::successors;
 use std::result::Result;
 
@@ -700,8 +699,25 @@ impl InPlaceJsonPath {
     fn push_array_index(&mut self, idx: usize) {
         self.last_element = Key::Integer(idx as i64);
         let start = self.string.len();
-        write!(self.string, "[{idx}]").expect("writing to a String does not fail");
+        self.string.push('[');
+        push_decimal(&mut self.string, idx);
+        self.string.push(']');
         self.element_lengths.push(self.string.len() - start);
+
+        fn push_decimal(string: &mut String, mut value: usize) {
+            let mut digits = [0u8; 20];
+            let mut first = digits.len();
+            loop {
+                first -= 1;
+                digits[first] = b'0' + (value % 10) as u8;
+                value /= 10;
+                if value == 0 {
+                    break;
+                }
+            }
+            string
+                .push_str(std::str::from_utf8(&digits[first..]).expect("decimal digits are ASCII"));
+        }
     }
 
     fn push_object_key(&mut self, key: &str) -> crate::Result<()> {
