@@ -79,7 +79,7 @@ test inner-loop-grouped-subquery-cross-join-aggregate {
     CREATE TABLE t(d TEXT, kind TEXT, amount INT);
     INSERT INTO t VALUES
         ('2024-01-05', 'in', 10), ('2024-01-20', 'out', 5),
-        ('2024-02-03', 'in', 7), ('2024-03-11', 'in', 3),
+        ('2024-02-03', 'in', 7), ('2024-03-11', 'in', 4),
         ('2024-03-12', 'fee', 100);
     SELECT avg(m.net), count(*)
         FROM (SELECT strftime('%Y-%m', d) AS ym, sum(amount) AS net
@@ -88,7 +88,7 @@ test inner-loop-grouped-subquery-cross-join-aggregate {
         WHERE m.ym > strftime('%Y-%m', b.first_day);
 }
 expect {
-    5.0|2
+    5.5|2
 }
 
 test inner-loop-cte-in-two-sibling-subqueries {
