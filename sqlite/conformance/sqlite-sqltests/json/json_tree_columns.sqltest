@@ -186,3 +186,15 @@ expect {
     4|
     5|$.a $.a[0]
 }
+
+test correlated-json-each-keeps-its-constant-path-for-every-row {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, j TEXT);
+    INSERT INTO t VALUES (1, '{"a":[1,2]}'), (2, '{"a":[3]}'), (3, '{"b":4}'), (4, '{"a":[5,6,7]}');
+    SELECT id, (SELECT group_concat(value) FROM json_each(t.j, '$.a')), (SELECT count(*) FROM json_tree(t.j, '$.a')) FROM t ORDER BY id;
+}
+expect {
+    1|1,2|3
+    2|3|2
+    3||0
+    4|5,6,7|4
+}

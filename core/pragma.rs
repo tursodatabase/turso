@@ -429,7 +429,7 @@ impl PragmaVirtualTableCursor {
         Ok(value)
     }
 
-    pub(crate) fn filter(&mut self, args: crate::alloc::Vec<Value>) -> crate::Result<bool> {
+    pub(crate) fn filter(&mut self, args: &[Value]) -> crate::Result<bool> {
         if args.len() > self.max_arg_count {
             return Err(LimboError::ParseError(format!(
                 "Too many arguments for pragma {}: expected at most {}, got {}",
@@ -440,7 +440,7 @@ impl PragmaVirtualTableCursor {
         }
 
         let to_text = |v: &Value| v.to_text().map(str::to_owned);
-        let (arg, schema) = match args.as_slice() {
+        let (arg, schema) = match args {
             [arg0] if self.has_pragma_arg => (to_text(arg0), None),
             [arg0] => (None, to_text(arg0)),
             [arg0, arg1] => (to_text(arg0), to_text(arg1)),
@@ -503,17 +503,13 @@ mod tests {
         };
         let mut cursor = pragma_vtab.open(conn).unwrap();
 
-        assert!(cursor
-            .filter(crate::alloc::vec![Value::from_text("scan_target")])
-            .unwrap());
+        assert!(cursor.filter(&[Value::from_text("scan_target")]).unwrap());
         assert_eq!(cursor.rowid(), 1);
         assert!(cursor.next().unwrap());
         assert_eq!(cursor.rowid(), 2);
         assert!(!cursor.next().unwrap());
 
-        assert!(cursor
-            .filter(crate::alloc::vec![Value::from_text("scan_target")])
-            .unwrap());
+        assert!(cursor.filter(&[Value::from_text("scan_target")]).unwrap());
         assert_eq!(cursor.rowid(), 1);
     }
 

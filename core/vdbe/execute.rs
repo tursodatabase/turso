@@ -1602,18 +1602,29 @@ pub fn op_vfilter(
         insn
     );
     let has_rows = {
-        let cursor = get_cursor!(state, *cursor_id);
-        let cursor = cursor.as_virtual_mut();
-
-        let args = (0..*arg_count)
-            .map(|i| state.registers[args_reg + i].get_value().try_clone())
-            .try_collect::<Result<crate::alloc::Vec<_>>>()??;
         let idx_str = if let Some(idx_str) = idx_str {
             Some(state.registers[*idx_str].get_value().to_string())
         } else {
             None
         };
-        cursor.filter(*idx_num as i32, idx_str, *arg_count, args)?
+        let arg_registers = &mut state.registers[*args_reg..*args_reg + *arg_count];
+        let mut args = crate::alloc::Vec::try_with_capacity_ext(*arg_count)?;
+        for register in arg_registers.iter_mut() {
+            let value = match register {
+                Register::Value(value) => std::mem::replace(value, Value::Null),
+                register => register.get_value().try_clone()?,
+            };
+            args.try_push(value)?;
+        }
+        let cursor = get_cursor!(state, *cursor_id).as_virtual_mut();
+        let has_rows = cursor.filter(*idx_num as i32, idx_str, *arg_count, &args);
+        let arg_registers = &mut state.registers[*args_reg..*args_reg + *arg_count];
+        for (register, value) in arg_registers.iter_mut().zip(args) {
+            if let Register::Value(slot) = register {
+                *slot = value;
+            }
+        }
+        has_rows?
     };
     // Increment filter_operations metric for virtual table filter
     state.metrics.filter_operations = state.metrics.filter_operations.wrapping_add(1);
