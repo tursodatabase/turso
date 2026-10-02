@@ -682,16 +682,16 @@ fn element_to_db_type(data: &[u8], pos: usize, flag: OutputVariant) -> crate::Re
         flag,
         OutputVariant::ElementType | OutputVariant::ElementTypePlain
     ) {
+        if element_type == ElementType::INT {
+            if let Some(int) = parse_decimal_i64(payload) {
+                return Ok(Value::from_i64(int));
+            }
+        }
         let text = std::str::from_utf8(payload);
         match (element_type, text) {
             (ElementType::NULL, _) => return Ok(Value::Null),
             (ElementType::TRUE, _) => return Ok(Value::from_i64(1)),
             (ElementType::FALSE, _) => return Ok(Value::from_i64(0)),
-            (ElementType::INT, Ok(text)) => {
-                if let Ok(int) = i64::from_str(text) {
-                    return Ok(Value::from_i64(int));
-                }
-            }
             (ElementType::FLOAT, Ok(text)) => {
                 if let Ok(float) = text.parse::<f64>() {
                     return Ok(Value::from_f64(float));
@@ -712,6 +712,31 @@ fn element_to_db_type(data: &[u8], pos: usize, flag: OutputVariant) -> crate::Re
         Err(_) => return Ok(Value::Null),
     };
     json_string_to_db_type(element, element_type, flag)
+}
+
+fn parse_decimal_i64(text: &[u8]) -> Option<i64> {
+    let (negative, digits) = match text {
+        [b'-', digits @ ..] => (true, digits),
+        [b'+', digits @ ..] => (false, digits),
+        digits => (false, digits),
+    };
+    if digits.is_empty() {
+        return None;
+    }
+    let mut value: i64 = 0;
+    for &byte in digits {
+        let digit = byte.wrapping_sub(b'0');
+        if digit > 9 {
+            return None;
+        }
+        value = value.checked_mul(10)?;
+        value = if negative {
+            value.checked_sub(i64::from(digit))?
+        } else {
+            value.checked_add(i64::from(digit))?
+        };
+    }
+    Some(value)
 }
 
 /// converts a `Jsonb` value to a db Value
@@ -1193,6 +1218,36 @@ mod tests {
                 index += 1;
             }
             assert!(index > 0);
+        }
+    }
+
+    #[test]
+    fn parse_decimal_i64_accepts_what_i64_from_str_accepts() {
+        for text in [
+            "",
+            "-",
+            "+",
+            "0",
+            "-0",
+            "+7",
+            "007",
+            "-1234",
+            "9223372036854775807",
+            "9223372036854775808",
+            "-9223372036854775808",
+            "-9223372036854775809",
+            "1a",
+            " 1",
+            "1.0",
+            "1e3",
+            "--1",
+            "\u{0661}",
+        ] {
+            assert_eq!(
+                parse_decimal_i64(text.as_bytes()),
+                i64::from_str(text).ok(),
+                "{text:?}"
+            );
         }
     }
 

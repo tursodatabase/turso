@@ -3523,3 +3523,24 @@ test json_tree_over_null_column {
 expect {
     2
 }
+
+test json-arrow-extract-integer-limits-from-text {
+    SELECT '{"a":9223372036854775807}' ->> '$.a', '{"a":-9223372036854775808}' ->> '$.a', '{"a":-0}' ->> '$.a', typeof('{"a":-0}' ->> '$.a');
+}
+expect {
+    9223372036854775807|-9223372036854775808|0|integer
+}
+
+test json-arrow-extract-integer-limits-from-jsonb {
+    SELECT jsonb('{"a":9223372036854775807}') ->> '$.a', jsonb('{"a":-9223372036854775808}') ->> '$.a', jsonb('[-12,0,7]') ->> '$[0]', jsonb('[-12,0,7]') ->> '$[2]';
+}
+expect {
+    9223372036854775807|-9223372036854775808|-12|7
+}
+
+test json-arrow-extract-integers-past-the-limits-become-real {
+    SELECT typeof('{"a":9223372036854775808}' ->> '$.a'), typeof(jsonb('{"a":-9223372036854775809}') ->> '$.a'), ('{"a":9223372036854775808}' ->> '$.a') = 9223372036854775808.0;
+}
+expect {
+    real|real|1
+}
