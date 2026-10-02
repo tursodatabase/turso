@@ -342,15 +342,15 @@ fn run_inprocess(args: &Args, seed: u64) -> anyhow::Result<()> {
         println!(
             "FTS: {} result comparisons, {} recovery copies, {} canceled statements",
             whopper.stats.fts_checks,
-            whopper.stats.fts_crash_checks,
-            whopper.stats.fts_abandoned_statements
+            whopper.stats.fts_recovery_copies,
+            whopper.stats.fts_canceled_statements
         );
         println!(
-            "FTS: {} optimizes, {} commits, {} savepoint rollbacks, {} snapshot reads, {} checkpoints",
-            whopper.stats.fts_optimizes,
+            "FTS: {} OPTIMIZE statements, {} commits, {} savepoint rollbacks, {} old-view reads, {} checkpoints",
+            whopper.stats.fts_optimize_statements,
             whopper.stats.fts_commits,
             whopper.stats.fts_savepoint_rollbacks,
-            whopper.stats.fts_snapshot_reads,
+            whopper.stats.fts_old_view_reads,
             whopper.stats.fts_checkpoints
         );
     }
@@ -519,7 +519,7 @@ fn build_workloads_and_properties(args: &Args) -> BuildArtifacts {
             Box::new(SimpleKeysDoNotDisappear::new()),
             Box::new(SequenceCorrectnessProperty::new()),
             Box::new(AutoincWatermarkMonotonicity::new()),
-            Box::new(FtsSelfDifferentialProperty),
+            Box::new(FtsResultComparisonProperty),
         ];
 
         (w, p, fts_sim_schema(), vec![])

@@ -6,9 +6,9 @@ use rand_chacha::ChaCha8Rng;
 use turso_core::{Connection, Database, DatabaseOpts, OpenFlags, SqliteDialect, Value};
 
 use crate::chaotic_elle::{ChaoticWorkload, ChaoticWorkloadProfile};
-use crate::properties::{FtsSelfDifferentialProperty, IntegrityCheckProperty, Property};
+use crate::properties::{FtsResultComparisonProperty, IntegrityCheckProperty, Property};
 use crate::workloads::{
-    FTS_SIM_INDEX, FTS_SIM_TABLE, FTS_SIM_TOKENS, FtsMatchWorkload, fts_sim_schema,
+    FTS_SIM_INDEX, FTS_SIM_TABLE, FTS_SIM_WORDS, FtsMatchWorkload, fts_sim_schema,
 };
 use crate::{FiberState, OpResult, Operation, SchemaBias, TxMode, Whopper, WhopperOpts};
 
@@ -36,7 +36,7 @@ impl FtsProfile {
                 FTS_SIM_TABLE.to_owned(),
                 format!(
                     "INSERT INTO {FTS_SIM_TABLE} VALUES ({id}, 'alpha {}')",
-                    FTS_SIM_TOKENS[1 + id as usize % 7]
+                    FTS_SIM_WORDS[1 + id as usize % 7]
                 ),
             ));
         }
@@ -51,7 +51,7 @@ impl FtsProfile {
             elle_tables: schema,
             workloads: vec![(1, Box::new(FtsMatchWorkload))],
             properties: vec![
-                Box::new(FtsSelfDifferentialProperty),
+                Box::new(FtsResultComparisonProperty),
                 Box::new(IntegrityCheckProperty),
             ],
             chaotic_profiles: vec![(
@@ -76,38 +76,38 @@ struct FtsWorkloadProfile {
 
 impl ChaoticWorkloadProfile for FtsWorkloadProfile {
     fn generate(&self, mut rng: ChaCha8Rng, fiber_id: usize) -> Box<dyn ChaoticWorkload> {
-        let mut ops = vec![Operation::Execute {
+        let mut operations = vec![Operation::Execute {
             sql: format!("PRAGMA fts_merge_threshold = {}", [0, 2, 4][fiber_id % 3]),
         }];
-        let mut compare_results = Vec::new();
+        let mut result_comparisons = Vec::new();
         if self.profile == FtsProfile::Snapshots && fiber_id == 0 {
-            ops.push(Operation::Begin {
+            operations.push(Operation::Begin {
                 mode: if self.enable_mvcc {
                     TxMode::Concurrent
                 } else {
                     TxMode::Deferred
                 },
             });
-            let token = FTS_SIM_TOKENS[rng.random_range(0..FTS_SIM_TOKENS.len())];
-            let baseline = ops.len();
-            ops.push(Operation::Select {
+            let word = FTS_SIM_WORDS[rng.random_range(0..FTS_SIM_WORDS.len())];
+            let expected_op_index = operations.len();
+            operations.push(Operation::Select {
                 sql: format!(
                     "SELECT id, body FROM {FTS_SIM_TABLE} \
-                     WHERE (' '||body||' ') LIKE '% {token} %' ORDER BY id"
+                     WHERE (' '||body||' ') LIKE '% {word} %' ORDER BY id"
                 ),
             });
             for _ in 0..rng.random_range(24..48) {
-                compare_results.push((ops.len(), baseline));
-                ops.push(Operation::Select {
+                result_comparisons.push((operations.len(), expected_op_index));
+                operations.push(Operation::Select {
                     sql: format!(
                         "SELECT id, body FROM {FTS_SIM_TABLE} \
-                         WHERE fts_match(body, '{token}') ORDER BY id"
+                         WHERE fts_match(body, '{word}') ORDER BY id"
                     ),
                 });
             }
-            ops.push(Operation::Commit);
+            operations.push(Operation::Commit);
         } else {
-            ops.push(Operation::Begin {
+            operations.push(Operation::Begin {
                 mode: if self.enable_mvcc {
                     TxMode::Concurrent
                 } else {
@@ -115,87 +115,87 @@ impl ChaoticWorkloadProfile for FtsWorkloadProfile {
                 },
             });
             let id = rng.random_range(0..32);
-            let old_token = FTS_SIM_TOKENS[rng.random_range(0..FTS_SIM_TOKENS.len())];
-            let new_token = FTS_SIM_TOKENS[rng.random_range(0..FTS_SIM_TOKENS.len())];
-            ops.push(Operation::Execute {
+            let old_word = FTS_SIM_WORDS[rng.random_range(0..FTS_SIM_WORDS.len())];
+            let new_word = FTS_SIM_WORDS[rng.random_range(0..FTS_SIM_WORDS.len())];
+            operations.push(Operation::Execute {
                 sql: format!(
-                    "INSERT OR REPLACE INTO {FTS_SIM_TABLE} VALUES ({}, 'hotel {old_token}')",
+                    "INSERT OR REPLACE INTO {FTS_SIM_TABLE} VALUES ({}, 'hotel {old_word}')",
                     32 + fiber_id
                 ),
             });
-            let baseline = ops.len();
-            ops.push(Operation::Select {
+            let expected_op_index = operations.len();
+            operations.push(Operation::Select {
                 sql: format!("SELECT id, body FROM {FTS_SIM_TABLE} ORDER BY id"),
             });
             let savepoint = format!("fts_sp_{fiber_id}");
-            ops.push(Operation::Savepoint {
+            operations.push(Operation::Savepoint {
                 name: savepoint.clone(),
             });
             if rng.random_bool(0.5) {
-                ops.push(Operation::Execute {
+                operations.push(Operation::Execute {
                     sql: format!("DELETE FROM {FTS_SIM_TABLE} WHERE id = {id}"),
                 });
-                ops.push(Operation::Execute {
-                    sql: format!("INSERT INTO {FTS_SIM_TABLE} VALUES ({id}, 'alpha {old_token}')"),
+                operations.push(Operation::Execute {
+                    sql: format!("INSERT INTO {FTS_SIM_TABLE} VALUES ({id}, 'alpha {old_word}')"),
                 });
             } else {
-                ops.push(Operation::Execute {
+                operations.push(Operation::Execute {
                     sql: format!(
-                        "INSERT OR REPLACE INTO {FTS_SIM_TABLE} VALUES ({id}, 'alpha {old_token}')"
+                        "INSERT OR REPLACE INTO {FTS_SIM_TABLE} VALUES ({id}, 'alpha {old_word}')"
                     ),
                 });
             }
-            ops.push(Operation::Execute {
+            operations.push(Operation::Execute {
                 sql: format!("OPTIMIZE INDEX {FTS_SIM_INDEX}"),
             });
-            ops.push(Operation::Execute {
+            operations.push(Operation::Execute {
                 sql: format!(
-                    "UPDATE {FTS_SIM_TABLE} SET body = 'bravo {new_token}' WHERE id = {id}"
+                    "UPDATE {FTS_SIM_TABLE} SET body = 'bravo {new_word}' WHERE id = {id}"
                 ),
             });
             if rng.random_bool(0.5) {
-                ops.push(Operation::RollbackToSavepoint {
+                operations.push(Operation::RollbackToSavepoint {
                     name: savepoint.clone(),
                 });
-                compare_results.push((ops.len(), baseline));
-                ops.push(ops[baseline].clone());
+                result_comparisons.push((operations.len(), expected_op_index));
+                operations.push(operations[expected_op_index].clone());
             }
-            ops.push(Operation::ReleaseSavepoint { name: savepoint });
-            for &token in FTS_SIM_TOKENS {
-                ops.push(Operation::FtsMatchDifferential {
-                    token: token.to_owned(),
+            operations.push(Operation::ReleaseSavepoint { name: savepoint });
+            for &word in FTS_SIM_WORDS {
+                operations.push(Operation::CompareFtsResults {
+                    word: word.to_owned(),
                 });
             }
-            ops.push(if rng.random_bool(0.2) {
+            operations.push(if rng.random_bool(0.2) {
                 Operation::Rollback
             } else {
                 Operation::Commit
             });
             if rng.random_bool(0.5) {
-                ops.push(Operation::WalCheckpoint {
+                operations.push(Operation::WalCheckpoint {
                     mode: "PASSIVE".to_owned(),
                 });
             }
         }
-        for &token in FTS_SIM_TOKENS {
-            ops.push(Operation::FtsMatchDifferential {
-                token: token.to_owned(),
+        for &word in FTS_SIM_WORDS {
+            operations.push(Operation::CompareFtsResults {
+                word: word.to_owned(),
             });
         }
         Box::new(FtsWorkload {
-            results: vec![None; ops.len()],
-            ops,
-            compare_results,
-            index: 0,
+            results: vec![None; operations.len()],
+            operations,
+            result_comparisons,
+            next_op_index: 0,
         })
     }
 }
 
 struct FtsWorkload {
-    ops: Vec<Operation>,
+    operations: Vec<Operation>,
     results: Vec<Option<Vec<Vec<Value>>>>,
-    compare_results: Vec<(usize, usize)>,
-    index: usize,
+    result_comparisons: Vec<(usize, usize)>,
+    next_op_index: usize,
 }
 
 impl ChaoticWorkload for FtsWorkload {
@@ -203,23 +203,23 @@ impl ChaoticWorkload for FtsWorkload {
         match result {
             Some(Err(_)) => return None,
             Some(Ok(rows)) => {
-                let completed = self.index - 1;
-                for &(check, baseline) in &self.compare_results {
-                    if check == completed {
+                let completed_op_index = self.next_op_index - 1;
+                for &(actual_op_index, expected_op_index) in &self.result_comparisons {
+                    if actual_op_index == completed_op_index {
                         assert_eq!(
                             Some(&rows),
-                            self.results[baseline].as_ref(),
-                            "FTS snapshot/rollback changed results: {}",
-                            self.ops[completed].sql()
+                            self.results[expected_op_index].as_ref(),
+                            "FTS results changed in an old reader or after savepoint rollback: {}",
+                            self.operations[completed_op_index].sql()
                         );
                     }
                 }
-                self.results[completed] = Some(rows);
+                self.results[completed_op_index] = Some(rows);
             }
             None => {}
         }
-        let op = self.ops.get(self.index)?.clone();
-        self.index += 1;
+        let op = self.operations.get(self.next_op_index)?.clone();
+        self.next_op_index += 1;
         Some(op)
     }
 }
@@ -241,13 +241,13 @@ impl Whopper {
             Some(Operation::Execute { .. } | Operation::Commit | Operation::WalCheckpoint { .. })
         );
         if writes && self.rng.random_bool(0.02) {
-            self.check_fts_crash_recovery().with_context(|| {
+            self.check_fts_recovery_copy().with_context(|| {
                 format!(
                     "FTS recovery copy: seed={} step={} fiber={fiber_idx}",
                     self.seed, self.current_step
                 )
             })?;
-            self.stats.fts_crash_checks += 1;
+            self.stats.fts_recovery_copies += 1;
         }
         if writes && self.rng.random_bool(0.01) {
             let fiber = &mut self.context.fibers[fiber_idx];
@@ -283,12 +283,12 @@ impl Whopper {
                 }
                 Some(Operation::Rollback)
             };
-            self.stats.fts_abandoned_statements += 1;
+            self.stats.fts_canceled_statements += 1;
         }
         Ok(())
     }
 
-    fn check_fts_crash_recovery(&self) -> anyhow::Result<Vec<Vec<Value>>> {
+    fn check_fts_recovery_copy(&self) -> anyhow::Result<Vec<Vec<Value>>> {
         let files = self.io.db_file_bytes();
         let directory = tempfile::tempdir()?;
         let path = directory.path().join("recovered.db");
@@ -337,12 +337,12 @@ fn check_fts_connection(connection: &Arc<Connection>, enable_mvcc: bool) -> anyh
     } else {
         "BEGIN DEFERRED"
     })?;
-    for &token in FTS_SIM_TOKENS {
-        let op = Operation::FtsMatchDifferential {
-            token: token.to_owned(),
+    for &word in FTS_SIM_WORDS {
+        let op = Operation::CompareFtsResults {
+            word: word.to_owned(),
         };
         let rows = query(connection, &op.sql())?;
-        FtsSelfDifferentialProperty.finish_op(0, 0, None, 0, 0, &op, &Ok(rows))?;
+        FtsResultComparisonProperty.finish_op(0, 0, None, 0, 0, &op, &Ok(rows))?;
     }
     let op = Operation::IntegrityCheck;
     let rows = query(connection, &op.sql())?;
@@ -363,15 +363,15 @@ fn query(connection: &Arc<Connection>, sql: &str) -> anyhow::Result<Vec<Vec<Valu
             turso_core::StepResult::IO | turso_core::StepResult::Yield => {
                 stmt.get_pager().io.step()?
             }
-            other => anyhow::bail!("FTS verification did not complete: {other:?}: {sql}"),
+            other => anyhow::bail!("FTS query did not finish: {other:?}: {sql}"),
         }
     }
-    anyhow::bail!("FTS verification exceeded its step budget: {sql}")
+    anyhow::bail!("FTS query did not finish after 1000000 steps: {sql}")
 }
 
-pub(crate) struct FtsCacheBudget(bool);
+pub(crate) struct FtsCacheOverride(bool);
 
-impl FtsCacheBudget {
+impl FtsCacheOverride {
     pub(crate) fn new(disabled: bool) -> Self {
         if disabled {
             turso_core::index_method::fts::set_fts_retained_cache_bytes_for_test(Some(0));
@@ -380,7 +380,7 @@ impl FtsCacheBudget {
     }
 }
 
-impl Drop for FtsCacheBudget {
+impl Drop for FtsCacheOverride {
     fn drop(&mut self) {
         if self.0 {
             turso_core::index_method::fts::set_fts_retained_cache_bytes_for_test(None);
@@ -392,9 +392,9 @@ impl crate::Stats {
     pub(crate) fn record_fts_op(&mut self, op: &Operation) {
         match op {
             Operation::Execute { sql } if sql == &format!("OPTIMIZE INDEX {FTS_SIM_INDEX}") => {
-                self.fts_optimizes += 1
+                self.fts_optimize_statements += 1
             }
-            Operation::Select { sql } if sql.contains("fts_match") => self.fts_snapshot_reads += 1,
+            Operation::Select { sql } if sql.contains("fts_match") => self.fts_old_view_reads += 1,
             Operation::RollbackToSavepoint { .. } => self.fts_savepoint_rollbacks += 1,
             Operation::Commit => self.fts_commits += 1,
             Operation::WalCheckpoint { .. } => self.fts_checkpoints += 1,
@@ -410,7 +410,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn crash_snapshot_keeps_committed_rows_and_excludes_uncommitted_rows() {
+    fn recovery_copy_keeps_committed_rows_and_excludes_uncommitted_rows() {
         for enable_mvcc in [false, true] {
             let whopper =
                 Whopper::new(FtsProfile::Recovery.options(enable_mvcc).with_seed(811)).unwrap();
@@ -434,11 +434,11 @@ mod tests {
                 .execute("INSERT INTO fts_docs VALUES (72, 'bravo hotel')")
                 .unwrap();
             connection.execute("OPTIMIZE INDEX fts_docs_fts").unwrap();
-            let rows = whopper.check_fts_crash_recovery().unwrap();
+            let rows = whopper.check_fts_recovery_copy().unwrap();
             assert_eq!(rows, committed_rows);
             assert!(!connection.get_auto_commit());
             connection.execute("ROLLBACK").unwrap();
-            assert_eq!(whopper.check_fts_crash_recovery().unwrap(), committed_rows);
+            assert_eq!(whopper.check_fts_recovery_copy().unwrap(), committed_rows);
         }
     }
 
@@ -447,7 +447,7 @@ mod tests {
         for enable_mvcc in [false, true] {
             let whopper =
                 Whopper::new(FtsProfile::Snapshots.options(enable_mvcc).with_seed(813)).unwrap();
-            let _cache_budget = FtsCacheBudget::new(true);
+            let _cache_override = FtsCacheOverride::new(true);
             let reader = &whopper.context.fibers[0].connection;
             let writer = &whopper.context.fibers[1].connection;
             reader
@@ -491,8 +491,8 @@ mod tests {
     fn reopen_reports_fts_result_check_failures_from_unfinished_statements() {
         let mut whopper = Whopper::new(FtsProfile::Merge.options(false).with_seed(812)).unwrap();
         let fiber = &mut whopper.context.fibers[0];
-        fiber.current_op = Some(Operation::FtsMatchDifferential {
-            token: "alpha".to_owned(),
+        fiber.current_op = Some(Operation::CompareFtsResults {
+            word: "alpha".to_owned(),
         });
         fiber.execution_id = Some(1);
         fiber.statement.replace(Some(
@@ -530,7 +530,7 @@ mod tests {
                     "{profile:?} mvcc={enable_mvcc}"
                 );
                 assert!(
-                    whopper.stats.fts_optimizes > 0,
+                    whopper.stats.fts_optimize_statements > 0,
                     "{profile:?} mvcc={enable_mvcc}"
                 );
                 assert!(
@@ -542,18 +542,18 @@ mod tests {
                     "{profile:?} mvcc={enable_mvcc}"
                 );
                 if profile == FtsProfile::Snapshots {
-                    assert!(whopper.stats.fts_snapshot_reads > 0);
+                    assert!(whopper.stats.fts_old_view_reads > 0);
                 }
                 if profile == FtsProfile::Recovery {
-                    assert!(whopper.stats.fts_crash_checks > 0);
-                    assert!(whopper.stats.fts_abandoned_statements > 0);
+                    assert!(whopper.stats.fts_recovery_copies > 0);
+                    assert!(whopper.stats.fts_canceled_statements > 0);
                 }
             }
         }
     }
 
     #[test]
-    fn snapshot_workload_rejects_changed_rows() {
+    fn old_reader_workload_rejects_changed_rows() {
         let mut workload = FtsWorkloadProfile {
             profile: FtsProfile::Snapshots,
             enable_mvcc: false,

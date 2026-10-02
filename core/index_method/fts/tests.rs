@@ -690,7 +690,7 @@ fn segment_byte_cache_keeps_newest_and_respects_budget() {
 
 #[cfg(any(feature = "test_helper", feature = "simulator"))]
 #[test]
-fn zero_cache_budget_discards_searchers_and_segment_bytes() {
+fn zero_cache_limit_removes_searchers_and_segment_bytes() {
     let attachment = test_attachment();
     let (segment, _) = build_and_load_segment(&attachment, &[(7, "alpha"), (11, "bravo")]);
     let mut cursor = FtsCursor::new(&attachment);
@@ -706,17 +706,17 @@ fn zero_cache_budget_discards_searchers_and_segment_bytes() {
         .put(segment.id(), segment.data.clone(), usize::MAX);
 
     set_fts_retained_cache_bytes_for_test(Some(0));
-    let cached_searcher_is_none = cursor.shared.searchers.lock().get(&key).is_none();
-    let cached_bytes = cursor.shared.segment_bytes.lock().get(&segment.id());
+    let old_searcher_removed = cursor.shared.searchers.lock().get(&key).is_none();
+    let cached_segment_bytes = cursor.shared.segment_bytes.lock().get(&segment.id());
     cursor.invalidate_snapshot_view();
-    let rebuilt = cursor.ensure_searcher();
-    let retained_searcher_is_none = cursor.shared.searchers.lock().get(&key).is_none();
+    let rebuild_result = cursor.ensure_searcher();
+    let new_searcher_not_cached = cursor.shared.searchers.lock().get(&key).is_none();
     set_fts_retained_cache_bytes_for_test(None);
 
-    assert!(cached_searcher_is_none);
-    assert!(cached_bytes.is_none());
-    rebuilt.unwrap();
-    assert!(retained_searcher_is_none);
+    assert!(old_searcher_removed);
+    assert!(cached_segment_bytes.is_none());
+    rebuild_result.unwrap();
+    assert!(new_searcher_not_cached);
     assert_eq!(cursor.searcher.as_ref().unwrap().num_docs(), 2);
 }
 

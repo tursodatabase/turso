@@ -156,9 +156,9 @@ pub enum Operation {
     AutoincDelete { id: i64 },
     /// Compare how often each row ID appears in FTS results and in a table scan.
     /// Both reads run in one statement and see the same database view.
-    /// Returns the row count difference, index count, and mismatching IDs with their counts.
-    /// The first two values must be `(0, 1)`; without an index, both reads scan the table.
-    FtsMatchDifferential { token: String },
+    /// Return the row count difference, index count, and IDs whose counts differ.
+    /// The first two values must be `(0, 1)`. Without an index, both reads scan the table.
+    CompareFtsResults { word: String },
 }
 pub type OpResult = Result<Vec<Vec<Value>>, LimboError>;
 /// Context passed to Operation::start_op and Operation::finish_op.
@@ -304,14 +304,14 @@ impl Operation {
                     table = crate::AUTOINC_TABLE_NAME
                 )
             }
-            Operation::FtsMatchDifferential { token } => {
+            Operation::CompareFtsResults { word } => {
                 let table = crate::workloads::FTS_SIM_TABLE;
                 let index = crate::workloads::FTS_SIM_INDEX;
                 format!(
                     "WITH fts_rows(id) AS (\
-                       SELECT id FROM {table} WHERE fts_match(body, '{token}')\
+                       SELECT id FROM {table} WHERE fts_match(body, '{word}')\
                      ), scan_rows(id) AS (\
-                       SELECT id FROM {table} WHERE (' '||body||' ') LIKE '% {token} %'\
+                       SELECT id FROM {table} WHERE (' '||body||' ') LIKE '% {word} %'\
                      ), counts(id, fts_count, scan_count) AS (\
                        SELECT id, count(*), 0 FROM fts_rows GROUP BY id \
                        UNION ALL \
@@ -461,7 +461,7 @@ impl Operation {
             Operation::AutoincDelete { .. } => {
                 stats.deletes += 1;
             }
-            Operation::FtsMatchDifferential { .. } => {
+            Operation::CompareFtsResults { .. } => {
                 stats.fts_checks += 1;
             }
             _ => {}
@@ -478,7 +478,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn fts_differential_sql_detects_duplicate_match_rows() {
+    fn fts_comparison_sql_detects_duplicate_match_rows() {
         let io = Arc::new(MemoryIO::new());
         let database = Database::open_file_with_flags(
             io,
@@ -500,8 +500,8 @@ mod tests {
             .execute("INSERT INTO fts_docs VALUES (1, 'alpha bravo'), (2, 'bravo')")
             .unwrap();
 
-        let sql = Operation::FtsMatchDifferential {
-            token: "alpha".to_string(),
+        let sql = Operation::CompareFtsResults {
+            word: "alpha".to_string(),
         }
         .sql();
         let matching = query_one(&connection, &sql);

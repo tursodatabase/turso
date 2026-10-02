@@ -308,9 +308,9 @@ impl Property for IntegrityCheckProperty {
 /// Compare how often each row ID appears in FTS results and in a table scan.
 /// Both reads run in one statement, so they see the same database view.
 /// Require the FTS index to exist, because without it `fts_match` also scans the table.
-pub struct FtsSelfDifferentialProperty;
+pub struct FtsResultComparisonProperty;
 
-impl Property for FtsSelfDifferentialProperty {
+impl Property for FtsResultComparisonProperty {
     fn finish_op(
         &mut self,
         step: usize,
@@ -321,36 +321,35 @@ impl Property for FtsSelfDifferentialProperty {
         op: &Operation,
         result: &OpResult,
     ) -> anyhow::Result<()> {
-        let Operation::FtsMatchDifferential { token } = op else {
+        let Operation::CompareFtsResults { word } = op else {
             return Ok(());
         };
         let rows = match result {
             Ok(rows) => rows,
             // This valid SQL must not fail with a parse or argument error.
-            // Otherwise, the driver would keep retrying a broken query.
+            // Otherwise, the driver keeps retrying a broken query.
             Err(err @ (LimboError::ParseError(_) | LimboError::InvalidArgument(_))) => {
                 bail!("step {step} fiber {fiber_id}: the FTS comparison query was rejected: {err}")
             }
-            // The driver handles failed operations; there are no rows to compare.
+            // The driver handles failed operations. There are no rows to compare.
             Err(_) => return Ok(()),
         };
         let Some(row) = rows.first() else {
             bail!("step {step} fiber {fiber_id}: the FTS comparison returned no row");
         };
         let row_count_difference = row.first().and_then(Value::as_int);
-        let index_present = row.get(1).and_then(Value::as_int);
-        if index_present != Some(1) {
+        let index_count = row.get(1).and_then(Value::as_int);
+        if index_count != Some(1) {
             bail!(
                 "step {step} fiber {fiber_id}: FTS index {} is missing from sqlite_schema \
-                 (count {index_present:?}); fts_match would also scan the table, so \
-                 the comparison would not test the index",
+                 (count {index_count:?}). Without an index, fts_match also scans the table",
                 crate::workloads::FTS_SIM_INDEX
             );
         }
         if row_count_difference != Some(0) {
             bail!(
                 "step {step} fiber {fiber_id}: fts_match and the table scan disagree \
-                 for token {token:?}: row count difference {row_count_difference:?} \
+                 for word {word:?}: row count difference {row_count_difference:?} \
                  (FTS has extra matches: {:?}, table scan has extra matches: {:?})",
                 row.get(2),
                 row.get(3)
@@ -2132,10 +2131,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn fts_differential_accepts_matching_row_counts() {
-        let mut property = FtsSelfDifferentialProperty;
-        let op = Operation::FtsMatchDifferential {
-            token: "alpha".to_string(),
+    fn fts_comparison_accepts_matching_row_counts() {
+        let mut property = FtsResultComparisonProperty;
+        let op = Operation::CompareFtsResults {
+            word: "alpha".to_string(),
         };
         let result = Ok(vec![vec![
             Value::from_i64(0),
@@ -2148,10 +2147,10 @@ mod tests {
     }
 
     #[test]
-    fn fts_differential_rejects_duplicate_match_rows() {
-        let mut property = FtsSelfDifferentialProperty;
-        let op = Operation::FtsMatchDifferential {
-            token: "alpha".to_string(),
+    fn fts_comparison_rejects_duplicate_match_rows() {
+        let mut property = FtsResultComparisonProperty;
+        let op = Operation::CompareFtsResults {
+            word: "alpha".to_string(),
         };
         let result = Ok(vec![vec![
             Value::from_i64(1),

@@ -59,11 +59,11 @@ impl SimulatorIO {
         self.file_sizes.clone()
     }
 
-    /// Contents of every database file (`.db`, `-wal`, `-log`), keyed by
-    /// that suffix and sorted by it.
+    /// Copy the bytes in each database file (`.db`, `-wal`, `-log`).
+    /// Return `(suffix, bytes)` pairs sorted by suffix.
     pub fn db_file_bytes(&self) -> Vec<(String, Vec<u8>)> {
         let files = self.files.lock().unwrap();
-        let mut out: Vec<(String, Vec<u8>)> = files
+        let mut file_bytes: Vec<(String, Vec<u8>)> = files
             .iter()
             .filter_map(|(path, file)| {
                 let suffix = [".db", "-wal", "-log"]
@@ -74,12 +74,12 @@ impl SimulatorIO {
                 Some((suffix.to_string(), mmap[..actual_size].to_vec()))
             })
             .collect();
-        out.sort_by(|a, b| a.0.cmp(&b.0));
-        out
+        file_bytes.sort_by(|a, b| a.0.cmp(&b.0));
+        file_bytes
     }
 
-    /// Dump all database files to the specified output directory.
-    /// Only copies the actual file content, not the full mmap size.
+    /// Copy all database files to the output directory.
+    /// Copy only the file bytes, not the unused space in the memory mapping.
     pub fn dump_files(&self, out_dir: &std::path::Path) -> anyhow::Result<()> {
         let files = self.files.lock().unwrap();
 
@@ -484,7 +484,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn snapshots_and_dumps_preserve_files_opened_with_noncanonical_paths() {
+    fn file_copies_and_dumps_keep_bytes_when_paths_contain_dot() {
         let directory = tempfile::tempdir().unwrap();
         let output = tempfile::tempdir().unwrap();
         let io = SimulatorIO::new(

@@ -168,8 +168,8 @@ crate::thread::thread_local! {
         const { core::cell::Cell::new(None) };
 }
 
-/// Override the retained-cache budget for tests on the current thread, so
-/// budget eviction is reachable without multi-hundred-MiB indexes.
+/// Set the byte limit for cache data kept between statements on the current thread.
+/// Tests can reach the limit without indexes that use hundreds of MiB.
 /// Pass `None` to restore the default.
 #[cfg(any(feature = "test_helper", feature = "simulator"))]
 pub fn set_fts_retained_cache_bytes_for_test(bytes: Option<usize>) {

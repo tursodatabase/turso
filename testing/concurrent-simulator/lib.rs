@@ -561,11 +561,11 @@ pub struct Stats {
     pub sequence_nextvals: usize,
     /// Completed comparisons between FTS results and a table scan
     pub fts_checks: usize,
-    pub fts_crash_checks: usize,
-    pub fts_abandoned_statements: usize,
-    pub fts_optimizes: usize,
+    pub fts_recovery_copies: usize,
+    pub fts_canceled_statements: usize,
+    pub fts_optimize_statements: usize,
     pub fts_savepoint_rollbacks: usize,
-    pub fts_snapshot_reads: usize,
+    pub fts_old_view_reads: usize,
     pub fts_commits: usize,
     pub fts_checkpoints: usize,
     /// Same-connection checkpoint probes fired against suspended statements
@@ -705,7 +705,7 @@ impl Whopper {
         if opts.fts_profile.is_some() {
             anyhow::ensure!(
                 !opts.enable_encryption,
-                "FTS crash snapshots do not support encryption"
+                "FTS profiles do not support encryption"
             );
             anyhow::ensure!(
                 opts.max_connections >= 2,
@@ -899,8 +899,8 @@ impl Whopper {
             return Ok(StepResult::Ok);
         }
 
-        let _cache_budget =
-            fts::FtsCacheBudget::new(self.fts_profile == Some(fts::FtsProfile::Snapshots));
+        let _cache_override =
+            fts::FtsCacheOverride::new(self.fts_profile == Some(fts::FtsProfile::Snapshots));
         let fiber_idx = self.current_step % self.context.fibers.len();
         self.perform_work(fiber_idx)?;
         self.io.step()?;
@@ -1421,8 +1421,8 @@ impl Whopper {
         }
     }
 
-    /// Notify the operation and result checks when a statement finishes before reopen.
-    /// Use the same callbacks as `step()` so completed commits and rollbacks are checked.
+    /// Update the operation and compare its results when a statement finishes before reopen.
+    /// Use the same callbacks as `step()` for completed commits and rollbacks.
     fn finalize_drained_statement(
         &mut self,
         fiber_idx: usize,
@@ -1433,13 +1433,13 @@ impl Whopper {
         let exec_id = fiber.execution_id.take();
         let txn_id = fiber.txn_id;
 
-        // Drop the statement now that we've taken its result.
+        // Drop the statement after taking its result.
         fiber
             .statement
             .replace(None)
             .unwrap()
             .reset()
-            .expect("statement reset should succeed before restart");
+            .expect("statement reset failed before restart");
         let row_count = fiber.rows.len();
         fiber.rows.clear();
 
@@ -1455,8 +1455,7 @@ impl Whopper {
             return Ok(());
         };
 
-        // Apply state-machine changes (the same call site as step()'s
-        // finish_op block).
+        // Update the simulator state as `step()` does when an operation finishes.
         let current_exec_id = self.context.state.execution_id;
         let mut ctx = OpContext {
             fiber: &mut self.context.fibers[fiber_idx],
