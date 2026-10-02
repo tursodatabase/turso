@@ -638,6 +638,7 @@ fn extract_path_element<R>(
     })
 }
 
+#[inline(always)]
 fn parse_strict_into(val: ValueRef<'_>, json: &mut Jsonb) -> crate::Result<()> {
     if let ValueRef::Text(text) = val {
         let text = text.as_str();

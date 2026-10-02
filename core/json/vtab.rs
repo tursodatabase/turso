@@ -6,12 +6,12 @@ use turso_ext::{ConstraintOp, ConstraintUsage, ResultCode};
 
 use crate::{
     json::{
-        convert_dbtype_to_jsonb,
         jsonb::{IteratorState, Jsonb},
+        parse_strict_into,
         path::{json_path, JsonPath, PathElement},
         vtab::columns::{Columns, Key},
-        Conv,
     },
+    types::AsValueRef,
     vtab::{InternalVirtualTable, InternalVirtualTableCursor},
     Connection, LimboError, Value,
 };
@@ -194,6 +194,7 @@ pub struct JsonEachCursor {
     columns: Columns,
     traversal_mode: JsonTraversalMode,
     object_key: String,
+    root_path: Option<(String, JsonPath<'static>)>,
 }
 
 struct TraversalState {
@@ -213,6 +214,7 @@ impl JsonEachCursor {
             columns: Columns::default(),
             traversal_mode,
             object_key: String::new(),
+            root_path: None,
         }
     }
 
@@ -275,10 +277,10 @@ impl InternalVirtualTableCursor for JsonEachCursor {
             }
         }
 
-        let jsonb = convert_dbtype_to_jsonb(&args[0], Conv::Strict)?;
+        parse_strict_into(args[0].as_value_ref(), &mut self.json)?;
 
         let root = if args.len() == 1 {
-            self.path_to_current_value = InPlaceJsonPath::new_root();
+            self.path_to_current_value.reset_to_root();
             0
         } else {
             let Value::Text(path) = &args[1] else {
@@ -286,16 +288,23 @@ impl InternalVirtualTableCursor for JsonEachCursor {
                     "root path should be text".to_owned(),
                 ));
             };
-            let parsed_path = json_path(path.as_str())?;
-            let Ok(Some(root)) = jsonb::find_path_element(jsonb.as_slice(), &parsed_path) else {
+            let (path_text, parsed_path) = match self.root_path.take() {
+                Some((text, parsed)) if text == path.as_str() => (text, parsed),
+                _ => (
+                    path.as_str().to_owned(),
+                    json_path(path.as_str())?.into_owned(),
+                ),
+            };
+            let found = jsonb::find_path_element(self.json.as_slice(), &parsed_path);
+            self.path_to_current_value
+                .reset_to(&path_text, &parsed_path);
+            self.root_path = Some((path_text, parsed_path));
+            let Ok(Some(root)) = found else {
                 return Ok(false);
             };
-            self.path_to_current_value =
-                InPlaceJsonPath::from_json_path(path.as_str().to_owned(), parsed_path);
             root
         };
 
-        self.json = jsonb;
         let iterator_state = json_iterator_from(&self.json, root)?;
         let innermost_container_path = if matches!(self.traversal_mode, JsonTraversalMode::Tree)
             && matches!(iterator_state, IteratorState::Primitive(_))
@@ -759,39 +768,34 @@ impl InPlaceJsonPath {
         &self.string[0..cursor]
     }
 
-    fn from_json_path(path: String, json_path: JsonPath<'_>) -> Self {
-        let (json_path, last_element) = if json_path.elements.is_empty() {
-            (
-                JsonPath {
-                    elements: vec![PathElement::Root()],
-                },
-                Key::None,
-            )
-        } else {
-            let last_element = json_path
-                .elements
-                .last()
-                .and_then(|path_element| match path_element {
-                    PathElement::Key(cow, _) => Some(Key::String(cow.to_string())),
-                    PathElement::ArrayLocator(Some(idx)) => Some(Key::Integer(*idx as i64)),
-                    _ => None,
-                })
-                .unwrap_or(Key::None);
+    fn reset_to_root(&mut self) {
+        self.string.clear();
+        self.string.push('$');
+        self.element_lengths.clear();
+        self.element_lengths.push(1);
+        self.last_element = Key::None;
+    }
 
-            (json_path, last_element)
-        };
-
-        let element_lengths = json_path
-            .elements
-            .iter()
-            .map(Self::element_length)
-            .collect();
-
-        Self {
-            string: path,
-            element_lengths,
-            last_element,
+    fn reset_to(&mut self, path: &str, json_path: &JsonPath<'_>) {
+        self.string.clear();
+        self.string.push_str(path);
+        self.element_lengths.clear();
+        if json_path.elements.is_empty() {
+            self.element_lengths.push(1);
+            self.last_element = Key::None;
+            return;
         }
+        self.element_lengths
+            .extend(json_path.elements.iter().map(Self::element_length));
+        self.last_element = json_path
+            .elements
+            .last()
+            .and_then(|path_element| match path_element {
+                PathElement::Key(cow, _) => Some(Key::String(cow.to_string())),
+                PathElement::ArrayLocator(Some(idx)) => Some(Key::Integer(*idx as i64)),
+                _ => None,
+            })
+            .unwrap_or(Key::None);
     }
 
     fn element_length(element: &PathElement) -> usize {
