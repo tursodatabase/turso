@@ -3544,3 +3544,14 @@ test json-arrow-extract-integers-past-the-limits-become-real {
 expect {
     real|real|1
 }
+
+test json-array-of-a-constant-in-a-register-that-held-json-text {
+    WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM n WHERE i < 4)
+    SELECT json_array(CASE WHEN i % 2 THEN json('[1]') ELSE '[1]' END) FROM n;
+}
+expect {
+    [[1]]
+    ["[1]"]
+    [[1]]
+    ["[1]"]
+}
