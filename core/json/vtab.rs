@@ -184,7 +184,7 @@ pub struct JsonEachCursor {
     columns: Columns,
     traversal_mode: JsonTraversalMode,
     object_key: String,
-    root_path: Option<(String, JsonPath<'static>)>,
+    root_path: Option<RootPath>,
 }
 
 struct TraversalState {
@@ -278,17 +278,13 @@ impl InternalVirtualTableCursor for JsonEachCursor {
                     "root path should be text".to_owned(),
                 ));
             };
-            let (path_text, parsed_path) = match self.root_path.take() {
-                Some((text, parsed)) if text == path.as_str() => (text, parsed),
-                _ => (
-                    path.as_str().to_owned(),
-                    json_path(path.as_str())?.into_owned(),
-                ),
+            let root_path = match self.root_path.take() {
+                Some(root_path) if root_path.text == path.as_str() => root_path,
+                _ => RootPath::parse(path.as_str())?,
             };
-            let found = jsonb::find_path_element(self.json.as_slice(), &parsed_path);
-            self.path_to_current_value
-                .reset_to(&path_text, &parsed_path);
-            self.root_path = Some((path_text, parsed_path));
+            let found = jsonb::find_path_element(self.json.as_slice(), &root_path.path);
+            self.path_to_current_value.clone_from(&root_path.start);
+            self.root_path = Some(root_path);
             let Ok(Some(root)) = found else {
                 return Ok(false);
             };
@@ -305,7 +301,6 @@ impl InternalVirtualTableCursor for JsonEachCursor {
         };
         self.push_state(iterator_state, innermost_container_path);
 
-        let key = self.path_to_current_value.key().to_owned();
         match self.traversal_mode {
             JsonTraversalMode::Each => self.next(),
             JsonTraversalMode::Tree => {
@@ -316,7 +311,7 @@ impl InternalVirtualTableCursor for JsonEachCursor {
                     self.next()
                 } else {
                     self.columns.set(
-                        &key,
+                        self.path_to_current_value.key(),
                         root,
                         &self.path_to_current_value.string,
                         None,
@@ -703,10 +698,45 @@ mod columns {
     }
 }
 
+struct RootPath {
+    text: String,
+    path: JsonPath<'static>,
+    start: InPlaceJsonPath,
+}
+
+impl RootPath {
+    fn parse(text: &str) -> crate::Result<Self> {
+        let path = json_path(text)?.into_owned();
+        let mut start = InPlaceJsonPath::new_root();
+        start.reset_to(text, &path);
+        Ok(Self {
+            text: text.to_owned(),
+            path,
+            start,
+        })
+    }
+}
+
 struct InPlaceJsonPath {
     string: String,
     element_lengths: Vec<usize>,
     last_element: Key,
+}
+
+impl Clone for InPlaceJsonPath {
+    fn clone(&self) -> Self {
+        Self {
+            string: self.string.clone(),
+            element_lengths: self.element_lengths.clone(),
+            last_element: self.last_element.clone(),
+        }
+    }
+
+    fn clone_from(&mut self, source: &Self) {
+        self.string.clone_from(&source.string);
+        self.element_lengths.clone_from(&source.element_lengths);
+        self.last_element.clone_from(&source.last_element);
+    }
 }
 
 type InPlaceJsonPathCursor = usize;

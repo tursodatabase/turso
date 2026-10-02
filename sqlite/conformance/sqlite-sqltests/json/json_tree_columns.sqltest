@@ -211,3 +211,14 @@ test json-each-columns-have-no-affinity-in-comparisons {
 expect {
     0|0|0|0|0|1|2
 }
+
+test correlated-json-tree-stopped-early-starts-the-next-row-at-its-root {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, j TEXT);
+    INSERT INTO t VALUES (1, '{"a":{"b":[1,2],"c":3}}'), (2, '{"a":{"x":{"y":4}}}'), (3, '{"a":[5,6,7]}');
+    SELECT id, (SELECT fullkey FROM json_tree(t.j, '$.a') LIMIT 1 OFFSET 2), (SELECT group_concat(key, ' ') FROM json_tree(t.j, '$.a')), (SELECT fullkey FROM json_each(t.j, '$.a') LIMIT 1) FROM t ORDER BY id;
+}
+expect {
+    1|$.a.b[0]|a b 0 1 c|$.a.b
+    2|$.a.x.y|a x y|$.a.x
+    3|$.a[1]|a 0 1 2|$.a[0]
+}
