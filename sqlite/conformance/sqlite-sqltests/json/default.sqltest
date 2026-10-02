@@ -3667,3 +3667,10 @@ test json-error-position-of-invalid-escape-after-the-first-chunk {
 expect {
     23
 }
+
+test json-error-position-of-empty-text {
+    SELECT json_error_position(''), json_error_position(CAST(x'' AS TEXT)), json_error_position(char(0)), json_valid('');
+}
+expect {
+    1|1|1|0
+}

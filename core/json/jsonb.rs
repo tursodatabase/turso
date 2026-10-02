@@ -2610,7 +2610,7 @@ impl Jsonb {
         if input.is_empty() {
             return Err(PError::Message {
                 msg: "Unexpected input after json".to_string(),
-                location: None,
+                location: Some(0),
             });
         }
 
