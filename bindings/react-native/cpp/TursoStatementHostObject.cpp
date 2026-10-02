@@ -1,4 +1,5 @@
 #include "TursoStatementHostObject.h"
+#include "TursoArrayBuffer.h"
 
 extern "C" {
 #include <turso.h>
@@ -370,10 +371,8 @@ jsi::Value TursoStatementHostObject::rowValueBytesPtr(jsi::Runtime &rt, const js
     }
 
     // Create ArrayBuffer and copy data
-    jsi::Function arrayBufferCtor = rt.global().getPropertyAsFunction(rt, "ArrayBuffer");
-    jsi::Object arrayBuffer = arrayBufferCtor.callAsConstructor(rt, static_cast<int>(bytes)).asObject(rt);
-    jsi::ArrayBuffer buf = arrayBuffer.getArrayBuffer(rt);
-    memcpy(buf.data(rt), ptr, bytes);
+    jsi::ArrayBuffer arrayBuffer = createArrayBuffer(rt, static_cast<uint64_t>(bytes));
+    memcpy(arrayBuffer.data(rt), ptr, arrayBuffer.size(rt));
 
     return arrayBuffer;
 }
@@ -503,12 +502,10 @@ jsi::Value TursoStatementHostObject::getAllRows(jsi::Runtime &rt) {
                 case TURSO_TYPE_BLOB: {
                     const char* ptr = turso_statement_row_value_bytes_ptr(stmt_, idx);
                     int64_t len = turso_statement_row_value_bytes_count(stmt_, idx);
-                    size_t blobLen = (len > 0) ? static_cast<size_t>(len) : 0;
-                    jsi::Function arrayBufferCtor = rt.global().getPropertyAsFunction(rt, "ArrayBuffer");
-                    jsi::Object arrayBuffer = arrayBufferCtor.callAsConstructor(rt, static_cast<int>(blobLen)).asObject(rt);
+                    uint64_t blobLen = (len > 0) ? static_cast<uint64_t>(len) : 0;
+                    jsi::ArrayBuffer arrayBuffer = createArrayBuffer(rt, blobLen);
                     if (ptr && blobLen > 0) {
-                        jsi::ArrayBuffer buf = arrayBuffer.getArrayBuffer(rt);
-                        memcpy(buf.data(rt), ptr, blobLen);
+                        memcpy(arrayBuffer.data(rt), ptr, arrayBuffer.size(rt));
                     }
                     row.setProperty(rt, colNames[i].c_str(), std::move(arrayBuffer));
                     break;

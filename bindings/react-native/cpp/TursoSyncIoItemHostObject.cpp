@@ -1,4 +1,5 @@
 #include "TursoSyncIoItemHostObject.h"
+#include "TursoArrayBuffer.h"
 
 extern "C" {
 #include <turso_sync.h>
@@ -164,10 +165,8 @@ jsi::Value TursoSyncIoItemHostObject::getHttpRequest(jsi::Runtime &rt) {
     // Body (may be empty)
     if (request.body.ptr && request.body.len > 0) {
         // Create ArrayBuffer for body
-        jsi::Function arrayBufferCtor = rt.global().getPropertyAsFunction(rt, "ArrayBuffer");
-        jsi::Object arrayBuffer = arrayBufferCtor.callAsConstructor(rt, static_cast<int>(request.body.len)).asObject(rt);
-        jsi::ArrayBuffer buf = arrayBuffer.getArrayBuffer(rt);
-        memcpy(buf.data(rt), request.body.ptr, request.body.len);
+        jsi::ArrayBuffer arrayBuffer = createArrayBuffer(rt, request.body.len);
+        memcpy(arrayBuffer.data(rt), request.body.ptr, arrayBuffer.size(rt));
         result.setProperty(rt, "body", arrayBuffer);
     } else {
         result.setProperty(rt, "body", jsi::Value::null());
@@ -224,10 +223,8 @@ jsi::Value TursoSyncIoItemHostObject::getFullWriteRequest(jsi::Runtime &rt) {
 
     // Content
     if (request.content.ptr && request.content.len > 0) {
-        jsi::Function arrayBufferCtor = rt.global().getPropertyAsFunction(rt, "ArrayBuffer");
-        jsi::Object arrayBuffer = arrayBufferCtor.callAsConstructor(rt, static_cast<int>(request.content.len)).asObject(rt);
-        jsi::ArrayBuffer buf = arrayBuffer.getArrayBuffer(rt);
-        memcpy(buf.data(rt), request.content.ptr, request.content.len);
+        jsi::ArrayBuffer arrayBuffer = createArrayBuffer(rt, request.content.len);
+        memcpy(arrayBuffer.data(rt), request.content.ptr, arrayBuffer.size(rt));
         result.setProperty(rt, "content", arrayBuffer);
     } else {
         result.setProperty(rt, "content", jsi::Value::null());
