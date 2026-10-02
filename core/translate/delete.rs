@@ -37,6 +37,7 @@ fn validate_delete(
     {
         crate::bail_parse_error!("table {tbl_name} may not be modified");
     }
+    resolver.with_schema(database_id, |s| s.check_broken_table(tbl_name))?;
     let table = match resolver.with_schema(database_id, |s| s.get_table(tbl_name)) {
         Some(table) => table,
         None => crate::bail_parse_error!(
