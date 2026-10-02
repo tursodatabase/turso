@@ -310,20 +310,18 @@ pub fn register_extension(input: TokenStream) -> TokenStream {
 /// use turso_ext::{scalar, Value};
 /// #[scalar(name = "double", alias = "twice")] // you can provide an <optional> alias
 /// fn double(args: &[Value]) -> Value {
-///       let arg = args.get(0).unwrap();
-///       match arg.value_type() {
-///           ValueType::Float => {
-///               let val = arg.to_float().unwrap();
-///               Value::from_float(val * 2.0)
-///           }
-///           ValueType::Integer => {
-///               let val = arg.to_integer().unwrap();
-///               Value::from_integer(val * 2)
-///           }
-///       }
-///   } else {
-///       Value::null()
-///   }
+///     let arg = args.get(0).unwrap();
+///     match arg.value_type() {
+///         ValueType::Float => {
+///             let val = arg.to_float().unwrap();
+///             Value::from_float(val * 2.0)
+///         }
+///         ValueType::Integer => {
+///             let val = arg.to_integer().unwrap();
+///             Value::from_integer(val * 2)
+///         }
+///         _ => Value::null(),
+///     }
 /// }
 /// ```
 #[proc_macro_attribute]
@@ -523,6 +521,7 @@ pub fn derive_vtab_module(input: TokenStream) -> TokenStream {
 ///
 /// struct ExampleFile {
 ///    file: std::fs::File,
+/// }
 ///
 ///
 /// impl VfsExtension for ExampleFS {
@@ -538,7 +537,7 @@ pub fn derive_vtab_module(input: TokenStream) -> TokenStream {
 ///            .create(flags & 1 != 0)
 ///            .open(path)
 ///            .map_err(|_| ResultCode::Error)?;
-///        Ok(TestFile { file })
+///        Ok(File { file })
 ///    }
 ///
 ///    fn run_once(&self) -> Result<()> {
@@ -562,6 +561,7 @@ pub fn derive_vtab_module(input: TokenStream) -> TokenStream {
 ///    // (optional) method to generate random number. Used for testing
 ///        chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string()
 ///    }
+/// }
 ///
 ///
 /// impl VfsFile for ExampleFile {
@@ -571,10 +571,10 @@ pub fn derive_vtab_module(input: TokenStream) -> TokenStream {
 ///        count: usize,
 ///        offset: i64,
 ///    ) -> Result<i32> {
-///        if file.file.seek(SeekFrom::Start(offset as u64)).is_err() {
+///        if self.file.seek(SeekFrom::Start(offset as u64)).is_err() {
 ///            return Err(ResultCode::Error);
 ///        }
-///        file.file
+///        self.file
 ///            .read(&mut buf[..count])
 ///            .map_err(|_| ResultCode::Error)
 ///            .map(|n| n as i32)
@@ -597,8 +597,7 @@ pub fn derive_vtab_module(input: TokenStream) -> TokenStream {
 ///    fn size(&self) -> i64 {
 ///      self.file.metadata().map(|m| m.len() as i64).unwrap_or(-1)
 ///   }
-///}
-///
+/// }
 ///```
 #[proc_macro_derive(VfsDerive)]
 pub fn derive_vfs_module(input: TokenStream) -> TokenStream {

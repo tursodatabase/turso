@@ -4116,7 +4116,7 @@ pub enum MetadataIoStep {
 }
 
 /// Sub state machine for
-/// [`MvStore::maybe_complete_interrupted_checkpoint_nonblock`]. Tracks the
+/// `MvStore::maybe_complete_interrupted_checkpoint_nonblock`. Tracks the
 /// sequence of IO yields needed to reconcile an interrupted MVCC checkpoint
 /// without blocking: read log header → optional early WAL truncate, or
 /// WAL→DB backfill + db_file.sync + log-header rewrite (with a single-shot
@@ -4172,7 +4172,7 @@ pub enum RetryHeaderPhase {
     },
 }
 
-/// Sub state machine for [`MvStore::try_read_persistent_tx_ts_max_nonblock`].
+/// Sub state machine for `MvStore::try_read_persistent_tx_ts_max_nonblock`.
 /// Holds the prepared metadata-read statement + accumulated value across IO
 /// yields while the SELECT runs cooperatively.
 #[derive(Default)]
@@ -4185,7 +4185,7 @@ pub enum ReadPersistentTxTsMaxState {
     },
 }
 
-/// Sub state machine for [`MvStore::initialize_mvcc_metadata_table_nonblock`].
+/// Sub state machine for `MvStore::initialize_mvcc_metadata_table_nonblock`.
 /// Sequences the CREATE TABLE then INSERT statements, holding each prepared
 /// statement across IO yields.
 #[derive(Default)]
@@ -4664,7 +4664,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
     /// `begin` here: a transaction's *physical* schema (root pages) can run ahead of its *data*
     /// snapshot, because a checkpoint allocating a root page is not a logical schema change.
     /// Whether the btree should actually be read at the snapshot is decided separately by
-    /// [`Self::is_btree_allocated_at`] / [`Self::resolve_root_page_at`], which do gate on
+    /// [`Self::is_btree_allocated`] / `resolve_root_page`, which do gate on
     /// `begin`. `u64::MAX` resolves the current live owner.
     pub fn get_table_id_from_root_page_at(&self, root_page: i64, snapshot_ts: u64) -> MVTableId {
         self.try_get_table_id_from_root_page_at(root_page, snapshot_ts)
@@ -6596,7 +6596,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
     }
 
     /// `begin_tx` with the connection's validated `schema_generation` gate (see
-    /// [`Connection::mvcc_begin_schema_generation`]). Used by the statement begin path so a passive
+    /// `Connection::mvcc_begin_schema_generation`). Used by the statement begin path so a passive
     /// checkpoint that republishes physical roots into the begin window forces a reprepare instead
     /// of a transaction beginning against stale roots.
     pub fn begin_tx_with_schema_generation(
@@ -7246,7 +7246,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
 
     /// Releases a named savepoint and nested savepoints above it.
     ///
-    /// Returns [SavepointResult::Commit] when releasing the root savepoint should commit the
+    /// Returns `SavepointResult::Commit` when releasing the root savepoint should commit the
     /// transaction.
     pub fn release_named_savepoint(&self, tx_id: TxID, name: &str) -> Result<SavepointResult> {
         let tx = self
@@ -7610,7 +7610,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
 
     /// Generate a commit timestamp and call `f` with it while the clock
     /// lock is held, atomically publishing the timestamp before release.
-    /// See [`MvccClock`] for the full explanation.
+    /// See [`crate::mvcc::clock::MvccClock`] for the full explanation.
     pub fn get_commit_timestamp<F: FnOnce(u64)>(&self, f: F) -> u64 {
         self.clock.get_timestamp(f)
     }

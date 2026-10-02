@@ -137,7 +137,7 @@ mod page_inner {
         /// requests unpinning via [Page::unpin], the pin count will still be >0 if the outer
         /// code path has not yet requested to unpin the page as well.
         ///
-        /// Note that [PageCache::clear] evicts the pages even if pinned, so as long as
+        /// Note that `PageCache::clear` evicts the pages even if pinned, so as long as
         /// we clear the page cache on errors, pins will not 'leak'.
         pub pin_count: AtomicUsize,
         /// The WAL frame number this page was loaded from (0 if loaded from main DB file)
@@ -162,7 +162,7 @@ mod page_inner {
 
     // Methods moved from PageContent - these provide btree page access
     impl PageInner {
-        /// Creates a new PageInner from an Arc<Buffer>.
+        /// Creates a new PageInner from an `Arc<Buffer>`.
         pub fn new(buffer: Arc<Buffer>) -> Self {
             let mut inner = Self::unloaded(0);
             inner.set_buffer(buffer);
@@ -1042,7 +1042,7 @@ impl Page {
     }
 
     #[inline]
-    /// caller must ensure that [Pager::dirty_pages] will be updated accordingly
+    /// caller must ensure that `Pager::dirty_pages` will be updated accordingly
     pub fn clear_dirty(&self) {
         tracing::debug!("clear_dirty(page={})", self.get().id());
         self.get().flags.fetch_and(!PAGE_DIRTY, Ordering::Release);
@@ -2645,8 +2645,8 @@ impl Pager {
         PENDING_BYTE
     }
 
-    /// From SQLITE: https://github.com/sqlite/sqlite/blob/7e38287da43ea3b661da3d8c1f431aa907d648c9/src/btreeInt.h#L608 \
-    /// The database page the [PENDING_BYTE] occupies. This page is never used.
+    /// From SQLITE: <https://github.com/sqlite/sqlite/blob/7e38287da43ea3b661da3d8c1f431aa907d648c9/src/btreeInt.h#L608> \
+    /// The database page the `PENDING_BYTE` occupies. This page is never used.
     pub fn pending_byte_page_id(&self) -> Option<u32> {
         // PENDING_BYTE_PAGE(pBt)  ((Pgno)((PENDING_BYTE/((pBt)->pageSize))+1))
         let page_size = self.shared.page_size.load(Ordering::SeqCst);
@@ -3387,8 +3387,8 @@ impl Pager {
     }
 
     /// commit dirty pages from current transaction in WAL mode if this is not nested statement (for nested statements, parent will do the commit)
-    /// if update_transaction_state set to false, then [Connection::transaction_state] left unchanged
-    /// if update_transaction_state set to true, then [Connection::transaction_state] reset to [TransactionState::None] in case when method completes without error
+    /// if update_transaction_state set to false, then `Connection::transaction_state` left unchanged
+    /// if update_transaction_state set to true, then `Connection::transaction_state` reset to `TransactionState::None` in case when method completes without error
     /// `sync_mode` belongs to this pager's database because attached databases
     /// can use a different synchronous mode from the connection's main database.
     #[instrument(skip_all, level = Level::DEBUG)]
@@ -5457,7 +5457,7 @@ impl Pager {
     /// database handle, SQLite checks if if there are other connections to the
     /// same database, and if there are no other database connection (if the
     /// connection being closed is the last open connection to the database),
-    /// then SQLite performs a [checkpoint] before closing the connection and
+    /// then SQLite performs a checkpoint before closing the connection and
     /// deletes the WAL file.
     pub fn checkpoint_shutdown(
         &self,

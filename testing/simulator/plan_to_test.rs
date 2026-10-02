@@ -3,8 +3,8 @@
 //! Usage: plan_to_test <path-to-plan.sql> > test_name.rs
 //!
 //! Parses SQL plan files from the simulator and generates a Rust integration test file.
-//! Lines ending with "-- <number>" indicate which connection should execute that statement.
-//! Lines beginning with "--" are comments and are ignored (except FAULT commands).
+//! Lines ending with "\-\- \<number\>" indicate which connection should execute that statement.
+//! Lines beginning with "\-\-" are comments and are ignored (except FAULT commands).
 
 use anyhow::{Result, bail};
 use regex::Regex;
