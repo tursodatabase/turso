@@ -1532,11 +1532,21 @@ impl BTreeCursor {
                 // page that doesn't exist yet, and re-entry would skip the
                 // `is_none()` branch entirely.
                 let (page, c) = return_if_io!(self.read_page(start_next_page as i64));
-                let mut record_payload =
-                    <crate::alloc::Vec<u8> as crate::alloc::TursoAllocExt>::new();
+                let record_size = payload.len() + remaining_to_read;
+                let record = self
+                    .get_immutable_record_or_create()?
+                    .expect("record was allocated above");
+                let mut record_payload = std::mem::replace(
+                    record.as_blob_mut(),
+                    <crate::alloc::Vec<u8> as crate::alloc::TursoAllocExt>::new(),
+                );
+                if record_payload.capacity() < record_size {
+                    record_payload = <crate::alloc::Vec<u8> as crate::alloc::TursoAllocExt>::new();
+                }
+                record_payload.clear();
                 crate::with_btree_allocation_site!(
                     OverflowRead,
-                    record_payload.try_reserve_exact(payload.len() + remaining_to_read)
+                    record_payload.try_reserve_exact(record_size)
                 )?;
                 record_payload.extend_from_slice(payload);
                 self.read_overflow_state.replace(ReadPayloadOverflow {
@@ -12980,6 +12990,55 @@ mod tests {
         assert!(chain[..data_per_page].iter().all(|&b| b == b'A'));
         assert!(chain[data_per_page..].iter().all(|&b| b == b'B'));
         assert_eq!(record.as_blob().capacity(), bytes.len());
+    }
+
+    #[test]
+    fn overflow_read_reuses_the_record_buffer() {
+        let pager = setup_test_env(5);
+        let mut cursor = BTreeCursor::new_table(pager.clone(), 1, 5);
+        let usable = cursor.usable_space();
+        let data_per_page = usable - 4;
+
+        let load_and_fill = |id: i64, next: u32, fill: u8| {
+            let (page, c) = cursor.read_page_blocking(id).unwrap();
+            if let Some(c) = c {
+                pager.io.wait_for_completion(c).unwrap();
+            }
+            while page.is_locked() {
+                pager.io.step().unwrap();
+            }
+            let buf = page.get_contents().as_ptr();
+            buf[0..4].copy_from_slice(&next.to_be_bytes());
+            buf[4..usable].fill(fill);
+        };
+        load_and_fill(4, 5, b'A');
+        load_and_fill(5, 0, b'B');
+
+        let cursor_pager = cursor.pager.clone();
+        let first_size = 2 * data_per_page;
+        run_until_done(
+            || cursor.process_overflow_read(b"", 4, first_size as u64),
+            &cursor_pager,
+        )
+        .unwrap();
+        let first_buffer = cursor
+            .get_immutable_record()
+            .expect("record was read")
+            .get_payload()
+            .as_ptr();
+
+        let second_size = data_per_page + 10;
+        run_until_done(
+            || cursor.process_overflow_read(b"", 4, second_size as u64),
+            &cursor_pager,
+        )
+        .unwrap();
+        let record = cursor.get_immutable_record().expect("record was read");
+        let bytes = record.get_payload();
+        assert_eq!(bytes.as_ptr(), first_buffer);
+        assert_eq!(bytes.len(), second_size);
+        assert!(bytes[..data_per_page].iter().all(|&b| b == b'A'));
+        assert!(bytes[data_per_page..].iter().all(|&b| b == b'B'));
     }
 
     /// Forces a real spill yield from the finalization `move_to_root_nonblock`
