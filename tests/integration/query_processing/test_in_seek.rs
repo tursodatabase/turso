@@ -1,13 +1,6 @@
+use crate::assertions::{AssertColumn, Cell};
 use crate::common::{limbo_exec_rows, TempDatabase};
-use rusqlite::types::Value;
-
-fn value_as_text(value: &Value) -> Option<&str> {
-    match value {
-        Value::Text(v) => Some(v.as_str()),
-        _ => None,
-    }
-}
-
+use asserting::prelude::*;
 #[test]
 fn large_indexed_in_list_uses_seek_loop() {
     let tmp_db = TempDatabase::new_empty();
@@ -32,18 +25,11 @@ fn large_indexed_in_list_uses_seek_loop() {
         .join(",");
     let query = format!("SELECT count(*) FROM t WHERE x IN ({values})");
 
-    let eqp_rows = limbo_exec_rows(&conn, &format!("EXPLAIN QUERY PLAN {query}"));
-    let plan = eqp_rows
-        .iter()
-        .filter_map(|row| row.get(3).and_then(value_as_text))
-        .collect::<Vec<_>>()
-        .join("\n");
-    assert!(
-        plan.contains("SEARCH t USING COVERING INDEX t_x (x=?)"),
-        "expected IN-list to drive indexed seeks, got:\n{plan}"
-    );
-    assert!(
-        !plan.contains("SCAN t USING COVERING INDEX t_x"),
-        "large IN-list regressed to residual scan:\n{plan}"
-    );
+    assert_that!(limbo_exec_rows(
+        &conn,
+        &format!("EXPLAIN QUERY PLAN {query}")
+    ))
+    .described_as("expected IN-list to drive indexed seeks, not a residual scan")
+    .column(3)
+    .contains(Cell::from("SEARCH t USING COVERING INDEX t_x (x=?)"));
 }

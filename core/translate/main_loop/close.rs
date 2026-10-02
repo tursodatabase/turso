@@ -34,11 +34,14 @@ impl CloseLoop {
             // SEMI/ANTI-JOIN: emit Goto -> outer_next right after the body.
             // For semi-join: after body runs (one match found), skip inner's Next.
             // For anti-join: after body runs (inner exhausted), move to next outer row.
-            let is_semi_or_anti = table
-                .join_info
-                .as_ref()
-                .is_some_and(|ji| ji.is_semi_or_anti());
-            if is_semi_or_anti {
+            let is_hash_anti = matches!(table.op, Operation::HashJoin(ref hj) if
+                hj.join_type == HashJoinType::LeftAnti);
+            let uses_nested_semi_or_anti = !is_hash_anti
+                && table
+                    .join_info
+                    .as_ref()
+                    .is_some_and(|ji| ji.is_semi_or_anti());
+            if uses_nested_semi_or_anti {
                 let sa_meta = t_ctx.meta_semi_anti_joins[table_index]
                     .as_ref()
                     .expect("semi/anti-join must have SemiAntiJoinMetadata");
@@ -95,12 +98,14 @@ impl CloseLoop {
                                     cursor_id: iteration_cursor_id,
                                     pc_if_prev: loop_labels.loop_start,
                                     fullscan,
+                                    is_index: false,
                                 });
                             } else {
                                 program.emit_insn(Insn::Next {
                                     cursor_id: iteration_cursor_id,
                                     pc_if_next: loop_labels.loop_start,
                                     fullscan,
+                                    is_index: false,
                                 });
                             }
                         }
@@ -123,12 +128,14 @@ impl CloseLoop {
                                             cursor_id: *cursor_id,
                                             pc_if_prev: loop_labels.loop_start,
                                             fullscan: false,
+                                            is_index: false,
                                         });
                                     } else {
                                         program.emit_insn(Insn::Next {
                                             cursor_id: *cursor_id,
                                             pc_if_next: loop_labels.loop_start,
                                             fullscan: false,
+                                            is_index: false,
                                         });
                                     }
                                 } else {
@@ -196,12 +203,14 @@ impl CloseLoop {
                                     cursor_id: iteration_cursor_id,
                                     pc_if_prev: loop_labels.loop_start,
                                     fullscan: false,
+                                    is_index: false,
                                 });
                             } else {
                                 program.emit_insn(Insn::Next {
                                     cursor_id: iteration_cursor_id,
                                     pc_if_next: loop_labels.loop_start,
                                     fullscan: false,
+                                    is_index: false,
                                 });
                             }
                         }
@@ -223,6 +232,7 @@ impl CloseLoop {
                                     cursor_id: iteration_cursor_id,
                                     pc_if_next: loop_labels.loop_start,
                                     fullscan: false,
+                                    is_index: false,
                                 });
                             }
 
@@ -233,6 +243,7 @@ impl CloseLoop {
                                 cursor_id: ephemeral_cursor_id,
                                 pc_if_next: outer_loop_start,
                                 fullscan: false,
+                                is_index: false,
                             });
                         }
                     }
@@ -244,6 +255,7 @@ impl CloseLoop {
                         cursor_id: index_cursor_id.unwrap(),
                         pc_if_next: loop_labels.loop_start,
                         fullscan: false,
+                        is_index: false,
                     });
                     program.preassign_label_to_next_insn(loop_labels.loop_end);
                 }
@@ -273,18 +285,12 @@ impl CloseLoop {
                         cursor_id: probe_cursor_id,
                         pc_if_next: loop_labels.loop_start,
                         fullscan: false,
+                        is_index: false,
                     });
                     program.preassign_label_to_next_insn(loop_labels.loop_end);
 
-                    // Outer joins: emit unmatched build rows with NULLs for the probe side.
-                    // This runs BEFORE grace so that in-memory partitions (with valid
-                    // matched_bits from the main probe) are scanned while still available.
-                    // At runtime, the scan skips spilled partitions — those are handled
-                    // per-partition inside the grace loop where matched_bits are still live.
-                    if matches!(
-                        hash_join_op.join_type,
-                        HashJoinType::LeftOuter | HashJoinType::FullOuter
-                    ) {
+                    // Scan in-memory unmatched rows before grace processing starts.
+                    if hash_join_op.join_type.keeps_unmatched_build_rows() {
                         if let Some(hash_ctx) = t_ctx
                             .hash_table_contexts
                             .get(&hash_join_op.build_table_idx)
@@ -302,10 +308,7 @@ impl CloseLoop {
                         }
                     }
 
-                    // Grace hash join processing: process spilled partition pairs.
-                    // At runtime, this is a no-op if the build side didn't spill.
-                    // For LEFT/FULL OUTER, each grace partition gets its own unmatched
-                    // scan before eviction (so matched_bits are still live).
+                    // Process spilled partition pairs. This does nothing without a spill.
                     if let Some(hash_ctx) = t_ctx
                         .hash_table_contexts
                         .get(&hash_join_op.build_table_idx)
@@ -346,7 +349,7 @@ impl CloseLoop {
             // SEMI/ANTI-JOIN: after loop_end (inner loop exhausted).
             // Semi-join: no match found -> skip outer row (Goto -> next_outer).
             // Anti-join: no match found -> run body (Goto -> label_body, jumps backward).
-            if is_semi_or_anti {
+            if uses_nested_semi_or_anti {
                 let sa_meta = t_ctx.meta_semi_anti_joins[table_index]
                     .as_ref()
                     .expect("semi/anti-join must have SemiAntiJoinMetadata");
@@ -367,13 +370,8 @@ impl CloseLoop {
 
             // OUTER JOIN: may still need to emit NULLs for the right table.
             // Outer hash join probes are handled above via check_outer / unmatched scan.
-            let is_outer_hash_join_probe = matches!(
-                table.op,
-                Operation::HashJoin(ref hj) if matches!(
-                    hj.join_type,
-                    HashJoinType::LeftOuter | HashJoinType::FullOuter
-                )
-            );
+            let is_outer_hash_join_probe = matches!(table.op, Operation::HashJoin(ref hj) if
+                matches!(hj.join_type, HashJoinType::LeftOuter | HashJoinType::FullOuter));
             if let Some(join_info) = table.join_info.as_ref() {
                 if join_info.is_outer() && !is_outer_hash_join_probe {
                     let lj_meta = t_ctx.meta_left_joins[table_index].as_ref().unwrap();
@@ -510,6 +508,28 @@ pub(super) fn emit_autoindex(
         pc_if_empty: label_ephemeral_build_loop_start,
     });
     program.preassign_label_to_next_insn(label_ephemeral_build_loop_start);
+    let label_ephemeral_build_loop_next = program.allocate_label();
+    if let Some(filter) = &index.where_clause {
+        let filter_passed = program.allocate_label();
+        // The table's planned operation reads from the new index. While that
+        // index is being built, expressions must read the source cursor.
+        program.set_cursor_override(table_ref_id, table_cursor_id);
+        let result = translate_condition_expr(
+            program,
+            table_references,
+            filter,
+            ConditionMetadata {
+                jump_if_condition_is_true: false,
+                jump_target_when_true: filter_passed,
+                jump_target_when_false: label_ephemeral_build_loop_next,
+                jump_target_when_null: label_ephemeral_build_loop_next,
+            },
+            resolver,
+        );
+        program.clear_cursor_override(table_ref_id);
+        result?;
+        program.preassign_label_to_next_insn(filter_passed);
+    }
     // Emit all columns from source table that are needed in the ephemeral index.
     // Also reserve a register for the rowid if the source table has rowids.
     let num_regs_to_reserve = index.columns.len() + table_has_rowid as usize;
@@ -578,10 +598,12 @@ pub(super) fn emit_autoindex(
         unpacked_count: Some(num_regs_to_reserve as u32),
         flags: IdxInsertFlags::new().use_seek(false),
     });
+    program.preassign_label_to_next_insn(label_ephemeral_build_loop_next);
     program.emit_insn(Insn::Next {
         cursor_id: table_cursor_id,
         pc_if_next: label_ephemeral_build_loop_start,
         fullscan: false,
+        is_index: false,
     });
     program.preassign_label_to_next_insn(label_ephemeral_build_end);
     Ok(AutoIndexResult { use_bloom_filter })

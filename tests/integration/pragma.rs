@@ -1,6 +1,8 @@
+use crate::assertions::{AssertColumn, Cell};
 use crate::common::{limbo_exec_rows, TempDatabase};
+use asserting::prelude::*;
 use rusqlite::types::Value as RValue;
-use turso_core::{Numeric, StepResult, Value};
+use turso_core::StepResult;
 
 #[turso_macros::test(mvcc)]
 fn test_pragma_module_list_returns_list(db: TempDatabase) {
@@ -23,38 +25,16 @@ fn test_pragma_module_list_returns_list(db: TempDatabase) {
 fn test_pragma_module_list_generate_series(db: TempDatabase) {
     let conn = db.connect_limbo();
 
-    let mut rows = conn
-        .query("SELECT * FROM generate_series(1, 3);")
-        .expect("generate_series module not available")
-        .expect("query did not return rows");
+    assert_that!(limbo_exec_rows(
+        &conn,
+        "SELECT * FROM generate_series(1, 3);"
+    ))
+    .is_equal_to(vec![row![1], row![2], row![3]]);
 
-    let mut values = vec![];
-    while let StepResult::Row = rows.step().unwrap() {
-        let row = rows.row().unwrap();
-        values.push(row.get_value(0).clone());
-    }
-
-    assert_eq!(
-        values,
-        vec![Value::from_i64(1), Value::from_i64(2), Value::from_i64(3),]
-    );
-
-    let mut module_list = conn.query("PRAGMA module_list;").unwrap();
-    let mut found = false;
-
-    if let Some(ref mut rows) = module_list {
-        while let StepResult::Row = rows.step().unwrap() {
-            let row = rows.row().unwrap();
-            if let Value::Text(name) = row.get_value(0) {
-                if name.as_str() == "generate_series" {
-                    found = true;
-                    break;
-                }
-            }
-        }
-    }
-
-    assert!(found, "generate_series should appear in module_list");
+    assert_that!(limbo_exec_rows(&conn, "PRAGMA module_list;"))
+        .named("module_list")
+        .column(0)
+        .contains(Cell::from("generate_series"));
 }
 
 #[turso_macros::test(mvcc)]
@@ -73,28 +53,15 @@ fn test_pragma_page_sizes_without_writes_persists(db: TempDatabase) {
         }
 
         let conn = db.connect_limbo();
-        let mut rows = conn.query("PRAGMA page_size").unwrap().unwrap();
-        let StepResult::Row = rows.step().unwrap() else {
-            panic!("expected row");
-        };
-        let row = rows.row().unwrap();
-        let Value::Numeric(Numeric::Integer(page_size)) = row.get_value(0) else {
-            panic!("expected integer value");
-        };
-        assert_eq!(*page_size, test_page_size);
+        assert_that!(limbo_exec_rows(&conn, "PRAGMA page_size"))
+            .is_equal_to(vec![row![test_page_size]]);
 
         // Reopen database and verify page size
         let db = builder.clone().with_db_path(&db.path).build();
         let conn = db.connect_limbo();
-        let mut rows = conn.query("PRAGMA page_size").unwrap().unwrap();
-        let StepResult::Row = rows.step().unwrap() else {
-            panic!("expected row");
-        };
-        let row = rows.row().unwrap();
-        let Value::Numeric(Numeric::Integer(page_size)) = row.get_value(0) else {
-            panic!("expected integer value");
-        };
-        assert_eq!(*page_size, test_page_size);
+        assert_that!(limbo_exec_rows(&conn, "PRAGMA page_size"))
+            .named("page_size after reopen")
+            .is_equal_to(vec![row![test_page_size]]);
     }
 }
 
@@ -120,52 +87,32 @@ fn test_pragma_page_sizes_with_writes_persists(db: TempDatabase) {
                 // Insert a big blob just as a small smoke test that our btree handles this well with different page sizes.
                 conn.execute("INSERT INTO test (id, value) VALUES (2, randomblob(1024*1024))")
                     .unwrap();
-                let mut page_size = conn.pragma_query("page_size").unwrap();
-                let mut page_size = page_size.pop().unwrap();
-                let page_size = page_size.pop().unwrap();
-                let Value::Numeric(Numeric::Integer(page_size)) = page_size else {
-                    panic!("expected integer value");
-                };
-                assert_eq!(page_size, test_page_size);
+                assert_that!(conn.pragma_query("page_size").unwrap())
+                    .is_equal_to(vec![row![test_page_size]]);
             } // Connection is dropped here
 
             // Reopen database and verify page size and data
             let conn = db.connect_limbo();
 
             // Check page size is still test_page_size
-            let mut page_size = conn.pragma_query("page_size").unwrap();
-            let mut page_size = page_size.pop().unwrap();
-            let page_size = page_size.pop().unwrap();
-            let Value::Numeric(Numeric::Integer(page_size)) = page_size else {
-                panic!("expected integer value");
-            };
-            assert_eq!(page_size, test_page_size);
+            assert_that!(conn.pragma_query("page_size").unwrap())
+                .named("page_size after reconnect")
+                .is_equal_to(vec![row![test_page_size]]);
 
             // Verify data can still be read
-            let mut rows = conn
-                .query("SELECT value FROM test WHERE id = 1")
-                .unwrap()
-                .unwrap();
-            rows.run_with_row_callback(|row| {
-                let Value::Text(value) = row.get_value(0) else {
-                    panic!("expected text value");
-                };
-                assert_eq!(value.as_str(), "test data");
-                Ok(())
-            })
-            .unwrap();
+            assert_that!(limbo_exec_rows(
+                &conn,
+                "SELECT value FROM test WHERE id = 1"
+            ))
+            .is_equal_to(vec![row!["test data"]]);
         }
 
         // Drop the db and reopen it, and verify the same
         let db = builder.clone().with_db_path(&db.path).build();
         let conn = db.connect_limbo();
-        let mut page_size = conn.pragma_query("page_size").unwrap();
-        let mut page_size = page_size.pop().unwrap();
-        let page_size = page_size.pop().unwrap();
-        let Value::Numeric(Numeric::Integer(page_size)) = page_size else {
-            panic!("expected integer value");
-        };
-        assert_eq!(page_size, test_page_size);
+        assert_that!(conn.pragma_query("page_size").unwrap())
+            .named("page_size after reopen")
+            .is_equal_to(vec![row![test_page_size]]);
     }
 }
 
@@ -179,89 +126,40 @@ fn test_pragma_fullfsync(db: TempDatabase) {
         .unwrap();
 
     // Query default value (should be 0/off)
-    let mut rows = conn.query("PRAGMA fullfsync").unwrap().unwrap();
-    let StepResult::Row = rows.step().unwrap() else {
-        panic!("expected row");
-    };
-    let row = rows.row().unwrap();
-    let Value::Numeric(Numeric::Integer(value)) = row.get_value(0) else {
-        panic!("expected integer value");
-    };
-    assert_eq!(*value, 0, "fullfsync should default to 0");
-    drop(rows);
+    assert_that!(limbo_exec_rows(&conn, "PRAGMA fullfsync"))
+        .named("fullfsync default")
+        .is_equal_to(vec![row![0]]);
 
     // Enable fullfsync
     conn.execute("PRAGMA fullfsync=1").unwrap();
-
-    // Verify it's enabled
-    let mut rows = conn.query("PRAGMA fullfsync").unwrap().unwrap();
-    let StepResult::Row = rows.step().unwrap() else {
-        panic!("expected row");
-    };
-    let row = rows.row().unwrap();
-    let Value::Numeric(Numeric::Integer(value)) = row.get_value(0) else {
-        panic!("expected integer value");
-    };
-    assert_eq!(*value, 1, "fullfsync should be enabled");
-    drop(rows);
+    assert_that!(limbo_exec_rows(&conn, "PRAGMA fullfsync"))
+        .named("enabled fullfsync")
+        .is_equal_to(vec![row![1]]);
 
     // Do an insert with fullfsync enabled
     conn.execute("INSERT INTO test (id, value) VALUES (1, 'with fullfsync')")
         .unwrap();
-
-    // Verify fullfsync is still enabled after insert
-    let mut rows = conn.query("PRAGMA fullfsync").unwrap().unwrap();
-    let StepResult::Row = rows.step().unwrap() else {
-        panic!("expected row");
-    };
-    let row = rows.row().unwrap();
-    let Value::Numeric(Numeric::Integer(value)) = row.get_value(0) else {
-        panic!("expected integer value");
-    };
-    assert_eq!(*value, 1, "fullfsync should still be enabled after insert");
-    drop(rows);
+    assert_that!(limbo_exec_rows(&conn, "PRAGMA fullfsync"))
+        .named("fullfsync after an insert")
+        .is_equal_to(vec![row![1]]);
 
     // Disable fullfsync
     conn.execute("PRAGMA fullfsync=0").unwrap();
-
-    // Verify it's disabled
-    let mut rows = conn.query("PRAGMA fullfsync").unwrap().unwrap();
-    let StepResult::Row = rows.step().unwrap() else {
-        panic!("expected row");
-    };
-    let row = rows.row().unwrap();
-    let Value::Numeric(Numeric::Integer(value)) = row.get_value(0) else {
-        panic!("expected integer value");
-    };
-    assert_eq!(*value, 0, "fullfsync should be disabled");
-    drop(rows);
+    assert_that!(limbo_exec_rows(&conn, "PRAGMA fullfsync"))
+        .named("disabled fullfsync")
+        .is_equal_to(vec![row![0]]);
 
     // Do an insert with fullfsync disabled
     conn.execute("INSERT INTO test (id, value) VALUES (2, 'without fullfsync')")
         .unwrap();
-
-    // Verify fullfsync is still disabled after insert
-    let mut rows = conn.query("PRAGMA fullfsync").unwrap().unwrap();
-    let StepResult::Row = rows.step().unwrap() else {
-        panic!("expected row");
-    };
-    let row = rows.row().unwrap();
-    let Value::Numeric(Numeric::Integer(value)) = row.get_value(0) else {
-        panic!("expected integer value");
-    };
-    assert_eq!(*value, 0, "fullfsync should still be disabled after insert");
-    drop(rows);
+    assert_that!(limbo_exec_rows(&conn, "PRAGMA fullfsync"))
+        .named("fullfsync after an insert")
+        .is_equal_to(vec![row![0]]);
 
     // Verify both rows exist
-    let mut rows = conn.query("SELECT COUNT(*) FROM test").unwrap().unwrap();
-    let StepResult::Row = rows.step().unwrap() else {
-        panic!("expected row");
-    };
-    let row = rows.row().unwrap();
-    let Value::Numeric(Numeric::Integer(count)) = row.get_value(0) else {
-        panic!("expected integer value");
-    };
-    assert_eq!(*count, 2, "both inserts should have succeeded");
+    assert_that!(limbo_exec_rows(&conn, "SELECT COUNT(*) FROM test"))
+        .named("row count")
+        .is_equal_to(vec![row![2]]);
 }
 
 #[cfg(not(target_vendor = "apple"))]
@@ -295,49 +193,25 @@ fn test_pragma_synchronous_normal(db: TempDatabase) {
         .unwrap();
 
     // Verify data is there
-    let mut rows = conn.query("SELECT COUNT(*) FROM test").unwrap().unwrap();
-    let StepResult::Row = rows.step().unwrap() else {
-        panic!("expected row");
-    };
-    let row = rows.row().unwrap();
-    let Value::Numeric(Numeric::Integer(count)) = row.get_value(0) else {
-        panic!("expected integer value");
-    };
-    assert_eq!(*count, 2, "both inserts should have succeeded");
-    drop(rows);
+    assert_that!(limbo_exec_rows(&conn, "SELECT COUNT(*) FROM test"))
+        .named("row count with synchronous=NORMAL")
+        .is_equal_to(vec![row![2]]);
 
     // Set synchronous=FULL (2) and do another insert
     conn.execute("PRAGMA synchronous=FULL").unwrap();
     conn.execute("INSERT INTO test (id, value) VALUES (3, 'third')")
         .unwrap();
-
-    // Verify all data is there
-    let mut rows = conn.query("SELECT COUNT(*) FROM test").unwrap().unwrap();
-    let StepResult::Row = rows.step().unwrap() else {
-        panic!("expected row");
-    };
-    let row = rows.row().unwrap();
-    let Value::Numeric(Numeric::Integer(count)) = row.get_value(0) else {
-        panic!("expected integer value");
-    };
-    assert_eq!(*count, 3, "all inserts should have succeeded");
-    drop(rows);
+    assert_that!(limbo_exec_rows(&conn, "SELECT COUNT(*) FROM test"))
+        .named("row count with synchronous=FULL")
+        .is_equal_to(vec![row![3]]);
 
     // Set synchronous=OFF (0) and do another insert
     conn.execute("PRAGMA synchronous=OFF").unwrap();
     conn.execute("INSERT INTO test (id, value) VALUES (4, 'fourth')")
         .unwrap();
-
-    // Verify all data is there
-    let mut rows = conn.query("SELECT COUNT(*) FROM test").unwrap().unwrap();
-    let StepResult::Row = rows.step().unwrap() else {
-        panic!("expected row");
-    };
-    let row = rows.row().unwrap();
-    let Value::Numeric(Numeric::Integer(count)) = row.get_value(0) else {
-        panic!("expected integer value");
-    };
-    assert_eq!(*count, 4, "all inserts should have succeeded");
+    assert_that!(limbo_exec_rows(&conn, "SELECT COUNT(*) FROM test"))
+        .named("row count with synchronous=OFF")
+        .is_equal_to(vec![row![4]]);
 
     // Also test numeric values: 0, 1, 2
     conn.execute("PRAGMA synchronous=0").unwrap(); // OFF
@@ -350,15 +224,9 @@ fn test_pragma_synchronous_normal(db: TempDatabase) {
     conn.execute("INSERT INTO test (id, value) VALUES (7, 'seventh')")
         .unwrap();
 
-    let mut rows = conn.query("SELECT COUNT(*) FROM test").unwrap().unwrap();
-    let StepResult::Row = rows.step().unwrap() else {
-        panic!("expected row");
-    };
-    let row = rows.row().unwrap();
-    let Value::Numeric(Numeric::Integer(count)) = row.get_value(0) else {
-        panic!("expected integer value");
-    };
-    assert_eq!(*count, 7, "all inserts should have succeeded");
+    assert_that!(limbo_exec_rows(&conn, "SELECT COUNT(*) FROM test"))
+        .named("row count with numeric synchronous values")
+        .is_equal_to(vec![row![7]]);
 }
 
 #[turso_macros::test(mvcc)]
@@ -371,15 +239,7 @@ fn test_pragma_cache_size_min_value(db: TempDatabase) {
     conn.execute(&query).unwrap();
 
     // Check the value was reset to default (0 in this implementation's logic for overflow)
-    let mut rows = conn.query("PRAGMA cache_size").unwrap().unwrap();
-    let StepResult::Row = rows.step().unwrap() else {
-        panic!("expected row");
-    };
-    let row = rows.row().unwrap();
-    let Value::Numeric(Numeric::Integer(value)) = row.get_value(0) else {
-        panic!("expected integer value");
-    };
-    assert_eq!(*value, 200);
+    assert_that!(limbo_exec_rows(&conn, "PRAGMA cache_size")).is_equal_to(vec![row![200]]);
 }
 
 #[turso_macros::test(mvcc)]
@@ -395,21 +255,15 @@ fn test_pragma_cache_size_i32_min_order_by(db: TempDatabase) {
 
     // Sanity check: the connection must actually hold i32::MIN, otherwise the
     // ORDER BY below no longer exercises the overflow path in op_sorter_open.
-    let rows = limbo_exec_rows(&conn, "PRAGMA cache_size");
-    assert_eq!(rows, vec![vec![RValue::Integer(min_val as i64)]]);
+    assert_that!(limbo_exec_rows(&conn, "PRAGMA cache_size"))
+        .is_equal_to(vec![row![min_val as i64]]);
 
     conn.execute("CREATE TABLE items (id TEXT)").unwrap();
     conn.execute("INSERT INTO items VALUES ('b'), ('a')")
         .unwrap();
 
-    let rows = limbo_exec_rows(&conn, "SELECT id FROM items ORDER BY id");
-    assert_eq!(
-        rows,
-        vec![
-            vec![RValue::Text("a".to_string())],
-            vec![RValue::Text("b".to_string())],
-        ]
-    );
+    assert_that!(limbo_exec_rows(&conn, "SELECT id FROM items ORDER BY id"))
+        .is_equal_to(vec![row!["a"], row!["b"]]);
 }
 
 #[turso_macros::test]
@@ -428,31 +282,22 @@ fn test_pragma_wal_checkpoint_targets_attached_database(db: TempDatabase) {
     // Checkpoint the attached database — before the fix, this would target the
     // main pager instead. The aux pager should have WAL frames, so the returned
     // frame counts must be non-zero.
-    let rows = limbo_exec_rows(&conn, "PRAGMA aux.wal_checkpoint");
-    assert_eq!(
-        rows.len(),
-        1,
-        "wal_checkpoint should return exactly one row"
-    );
-
-    let row = &rows[0];
-    // row is [busy, log, checkpointed]
-    let RValue::Integer(busy) = &row[0] else {
-        panic!("expected integer for busy flag, got {:?}", row[0]);
-    };
-    let RValue::Integer(log) = &row[1] else {
-        panic!("expected integer for log frames, got {:?}", row[1]);
-    };
-    let RValue::Integer(checkpointed) = &row[2] else {
-        panic!("expected integer for checkpointed frames, got {:?}", row[2]);
-    };
-
-    assert_eq!(*busy, 0, "checkpoint should not be busy");
-    assert!(*log > 0, "aux pager should have WAL frames (got {log})");
-    assert!(
-        *checkpointed > 0,
-        "aux pager should have checkpointed frames (got {checkpointed})"
-    );
+    assert_that!(limbo_exec_rows(&conn, "PRAGMA aux.wal_checkpoint"))
+        .named("aux.wal_checkpoint")
+        .single_element()
+        .satisfies_with_message(
+            "report [busy, log, checkpointed] with busy 0 and more than zero frames",
+            |row| {
+                matches!(
+                    row[..],
+                    [
+                        RValue::Integer(0),
+                        RValue::Integer(log),
+                        RValue::Integer(checkpointed)
+                    ] if log > 0 && checkpointed > 0
+                )
+            },
+        );
 }
 
 // Regression tests for https://github.com/tursodatabase/turso/issues/7466:
@@ -483,12 +328,9 @@ fn test_pragma_vtab_query_does_not_break_subsequent_writes(db: TempDatabase) {
 
     // A second connection only sees committed data.
     let conn2 = db.connect_limbo();
-    let rows = limbo_exec_rows(&conn2, "SELECT a, b FROM t");
-    assert_eq!(
-        rows,
-        vec![vec![RValue::Integer(1), RValue::Text("one".to_string())]],
-        "insert after pragma vtab query must be committed"
-    );
+    assert_that!(limbo_exec_rows(&conn2, "SELECT a, b FROM t"))
+        .named("rows committed after a pragma vtab query")
+        .is_equal_to(vec![row![1, "one"]]);
 }
 
 #[turso_macros::test(mvcc)]
@@ -510,12 +352,9 @@ fn test_pragma_function_list_then_create_and_insert(db: TempDatabase) {
     conn.execute("INSERT INTO t VALUES (42)").unwrap();
 
     let conn2 = db.connect_limbo();
-    let rows = limbo_exec_rows(&conn2, "SELECT x FROM t");
-    assert_eq!(
-        rows,
-        vec![vec![RValue::Integer(42)]],
-        "writes after pragma_function_list query must be committed"
-    );
+    assert_that!(limbo_exec_rows(&conn2, "SELECT x FROM t"))
+        .named("rows committed after a pragma_function_list query")
+        .is_equal_to(vec![row![42]]);
 }
 
 #[turso_macros::test(mvcc)]
@@ -539,12 +378,9 @@ fn test_pragma_vtab_partial_scan_does_not_break_subsequent_writes(db: TempDataba
         .unwrap();
 
     let conn2 = db.connect_limbo();
-    let rows = limbo_exec_rows(&conn2, "SELECT a FROM t");
-    assert_eq!(
-        rows,
-        vec![vec![RValue::Integer(1)]],
-        "insert after abandoned pragma vtab scan must be committed"
-    );
+    assert_that!(limbo_exec_rows(&conn2, "SELECT a FROM t"))
+        .named("rows committed after an abandoned pragma vtab scan")
+        .is_equal_to(vec![row![1]]);
 }
 
 #[turso_macros::test(mvcc)]
@@ -566,10 +402,7 @@ fn test_pragma_vtab_query_with_limit_then_write(db: TempDatabase) {
         .unwrap();
 
     let conn2 = db.connect_limbo();
-    let rows = limbo_exec_rows(&conn2, "SELECT a FROM t");
-    assert_eq!(
-        rows,
-        vec![vec![RValue::Integer(2)]],
-        "insert after LIMITed pragma vtab query must be committed"
-    );
+    assert_that!(limbo_exec_rows(&conn2, "SELECT a FROM t"))
+        .named("rows committed after a pragma vtab query with LIMIT")
+        .is_equal_to(vec![row![2]]);
 }

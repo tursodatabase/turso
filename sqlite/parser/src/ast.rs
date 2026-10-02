@@ -819,6 +819,18 @@ pub fn blob_literal_hex(blob: &str) -> &str {
     &blob[2..blob.len() - 1]
 }
 
+/// Decodes the hex digits of a blob literal such as `X'0102'` into the bytes
+/// they stand for. The parser has already checked that the literal is valid hex.
+pub fn blob_literal_bytes(blob: &str) -> impl Iterator<Item = u8> + '_ {
+    blob_literal_hex(blob)
+        .as_bytes()
+        .chunks_exact(2)
+        .map(|pair| {
+            let hex_byte = std::str::from_utf8(pair).expect("parser validated hex string");
+            u8::from_str_radix(hex_byte, 16).expect("parser validated hex digit")
+        })
+}
+
 /// Textual comparison operator in an expression
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
@@ -1297,7 +1309,12 @@ impl Name {
         }
         let value = self.value.as_bytes();
         let safe_char = |&c: &u8| c.is_ascii_alphanumeric() || c == b'_';
-        if !value.is_empty() && value.iter().all(safe_char) && !is_quotable_keyword(value) {
+        let starts_with_digit = value.first().is_some_and(|c| c.is_ascii_digit());
+        if !value.is_empty()
+            && !starts_with_digit
+            && value.iter().all(safe_char)
+            && !is_quotable_keyword(value)
+        {
             self.value.clone()
         } else {
             format!("\"{}\"", self.value.replace("\"", "\"\""))
@@ -1549,6 +1566,8 @@ pub enum ColumnConstraint {
     },
     /// `GENERATED`
     Generated {
+        /// Whether the constraint includes `GENERATED ALWAYS`.
+        generated_always: bool,
         /// expression
         expr: Box<Expr>,
         /// `STORED` / `VIRTUAL`
@@ -1960,6 +1979,13 @@ pub enum PragmaName {
     /// last GC pass) at which MVCC runs an inline, non-blocking garbage
     /// collection pass on the commit path. -1 disables inline GC.
     MvccGcThreshold,
+    /// Sets or queries whether concurrent MVCC commits batch their logical-log
+    /// appends behind a single fsync.
+    MvccGroupCommit,
+    /// Sets or queries the number of visible FTS index segments a statement
+    /// flush may leave behind before the write path merges them. 0 disables
+    /// write-path merging.
+    FtsMergeThreshold,
     /// List all available types (built-in and custom)
     ListTypes,
     /// Deprecated no-op: control whether callback is invoked for empty result sets

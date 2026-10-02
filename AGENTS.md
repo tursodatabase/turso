@@ -55,7 +55,7 @@ limbo/
 ├── testing/        # simulator/, concurrent-simulator/, differential-oracle/
 ├── sync/           # engine/, sdk-kit/ (Turso Cloud sync)
 ├── sdk-kit/        # High-level SDK abstraction
-└── tools/          # dbhash utility
+└── tools/          # dbhash utility, thesis (local Antithesis runner)
 ```
 
 ## Where to Look
@@ -83,7 +83,7 @@ limbo/
 - **[Transaction Correctness](docs/agent-guides/transaction-correctness.md)** - WAL, checkpointing, concurrency
 - **[Storage Format](docs/agent-guides/storage-format.md)** - file format, B-trees, pages
 - **[Async I/O Model](docs/agent-guides/async-io-model.md)** - IOResult, state machines, re-entrancy
-- **[MVCC](docs/agent-guides/mvcc.md)** - experimental multi-version concurrency (WIP)
+- **[MVCC](docs/agent-guides/mvcc.md)** - multi-version concurrency, snapshot isolation, checkpointing
 
 ## Commit Messages
 
@@ -121,6 +121,7 @@ complete example.
 4. **Assert invariants.** Don't silently fail. Don't hedge with if-statements
 5. **Own your regressions.** If tests fail after your change, they are your regressions. Debug them directly. Never stash/revert to "check if they fail on main" — that wastes time and is categorically banned.
 6. **Validate your hypotheses.**: If you suspect a given cause for a bug, validate it and provide incontrovertible evidence. NEVER make unearned assumptions.
+7. **Driver API parity.** Embedded (`bindings/rust`) and serverless (`serverless/rust`) drivers expose the same public API; add features to both in the same change. Spec: `serverless/conformance/differential/README.md`.
 
 ## Always use plain language instead of complex jargon
 
@@ -136,7 +137,10 @@ OOGA BOOGA! Programming already complex! Use simple word! Say what you mean! Exa
 +    fn empty_schema_never_chooses_a_statement_that_needs_a_table() {
 ```
 
-No-one knows what the hell a bootstrap-safe statement is. Everyone knows what "a statement that needs a table" is.
+No-one knows what the hell a bootstrap-safe statement is. Everyone knows what "a statement that needs a table" is. Do
+not use metaphorical language, such as the following terms: load-bearing, pin, bite, sharp, arm, guard, bless, wedge,
+retire, retarget, answer, settle, carry, land, honor.
+Do not make up terms if they have equivalents that are commonly used in the domain.
 
 ## Code flows from top to bottom
 
@@ -153,15 +157,9 @@ fn sync_wal()           // called by write_frames
 When adding a helper, put it below the functions that call it, not at the
 end of the file or wherever the cursor happened to be.
 
-## Use comments only when absolutely necessary
+## Do not add comments
 
-Comments should explain *why*, not *what*. Do not narrate what the code
-already says: no `// Check if the page is dirty` above `if page.is_dirty()`,
-no `// Helper function for X`, no `// Step 1:`. If the code needs a comment
-to be understood, rename the function or variable instead. A comment earns
-its place when it says something the code cannot: an invariant the type
-system does not enforce, a SQLite compatibility quirk, or a workaround for a
-specific bug with a reference.
+- Do not add comments. Instead, focus on making your code expressive.
 
 ## CI Note
 

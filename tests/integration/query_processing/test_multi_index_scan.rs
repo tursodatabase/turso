@@ -1,4 +1,7 @@
+use crate::assertions::{AssertColumn, AssertQueryPlan, Cell};
 use crate::common::{limbo_exec_rows, TempDatabase};
+use asserting::prelude::*;
+use core_tester::common::sqlite_exec_rows;
 
 /// `h.v = 5 OR h.w = 7` can never be TRUE when every column of `h` is NULL,
 /// so the LEFT JOIN behaves like an inner join and must be rewritten to one —
@@ -13,27 +16,12 @@ fn null_rejecting_or_term_converts_left_join_and_uses_multi_index_scan() {
     limbo_exec_rows(&conn, "CREATE INDEX hv ON h(v)");
     limbo_exec_rows(&conn, "CREATE INDEX hw ON h(w)");
 
-    let plan = {
-        let rows = limbo_exec_rows(
-            &conn,
-            "EXPLAIN QUERY PLAN SELECT * FROM g LEFT JOIN h ON g.id = h.id WHERE h.v = 5 OR h.w = 7",
-        );
-        rows.iter()
-            .filter_map(|row| match row.get(3) {
-                Some(rusqlite::types::Value::Text(plan)) => Some(plan.as_str().to_string()),
-                _ => None,
-            })
-            .collect::<Vec<_>>()
-            .join("\n")
-    };
-    assert!(
-        plan.contains("MULTI-INDEX OR"),
-        "expected the OR term to drive a multi-index scan after the join is \
-         rewritten to inner, got:\n{plan}"
-    );
+    assert_that!(limbo_exec_rows(
+        &conn,
+        "EXPLAIN QUERY PLAN SELECT * FROM g LEFT JOIN h ON g.id = h.id WHERE h.v = 5 OR h.w = 7",
+    ))
+    .has_step_containing("MULTI-INDEX OR");
 }
-use core_tester::common::sqlite_exec_rows;
-use rusqlite::types::Value;
 
 #[test]
 /// Regression: a multi-index OR scan driving an outer join's right-hand table
@@ -111,12 +99,9 @@ LEFT JOIN t3 ON {on_condition} \
 JOIN t4 ON t3.b = t4.b OR t3.c = t4.c \
 WHERE t4.b = 8"
         );
-        let sqlite_rows = sqlite_exec_rows(&sqlite_conn, &query);
-        let limbo_rows = limbo_exec_rows(&conn, &query);
-        assert_eq!(
-            sqlite_rows, limbo_rows,
-            "null-extended rows were not filtered by the OR condition, ON `{on_condition}`"
-        );
+        assert_that!(limbo_exec_rows(&conn, &query))
+            .named(format!("rows for ON `{on_condition}`"))
+            .is_equal_to(sqlite_exec_rows(&sqlite_conn, &query));
     }
 
     // The optimization itself still applies where it is sound: the same OR
@@ -124,20 +109,54 @@ WHERE t4.b = 8"
     let inner = "SELECT count(*) FROM t1 \
 JOIN t3 ON t1.a = t3.a \
 JOIN t4 ON t3.b = t4.b OR t3.c = t4.c";
-    let plan = limbo_exec_rows(&conn, &format!("EXPLAIN QUERY PLAN {inner}"))
-        .iter()
-        .filter_map(|row| match row.get(3) {
-            Some(Value::Text(text)) => Some(text.clone()),
-            _ => None,
+    assert_that!(limbo_exec_rows(
+        &conn,
+        &format!("EXPLAIN QUERY PLAN {inner}")
+    ))
+    .has_step_containing("MULTI-INDEX OR t3");
+    assert_that!(limbo_exec_rows(&conn, inner)).is_equal_to(sqlite_exec_rows(&sqlite_conn, inner));
+}
+
+#[test]
+fn debug_tracing_does_not_crash_multi_index_update() {
+    let log = tempfile::NamedTempFile::new().expect("create temporary debug log");
+    let log_file = log.reopen().expect("reopen temporary debug log");
+    let subscriber = tracing_subscriber::fmt()
+        .without_time()
+        .with_ansi(false)
+        .with_max_level(tracing::Level::DEBUG)
+        .with_writer(move || {
+            log_file
+                .try_clone()
+                .expect("clone temporary debug log handle")
         })
-        .collect::<Vec<_>>()
-        .join("\n");
-    assert!(
-        plan.contains("MULTI-INDEX OR t3"),
-        "expected the multi-index OR scan to still be used for an inner join, got:\n{plan}"
-    );
-    assert_eq!(
-        sqlite_exec_rows(&sqlite_conn, inner),
-        limbo_exec_rows(&conn, inner)
-    );
+        .finish();
+
+    tracing::subscriber::with_default(subscriber, || {
+        let tmp_db = TempDatabase::new_empty();
+        let conn = tmp_db.connect_limbo();
+
+        for statement in [
+            "CREATE TABLE t(a INTEGER, b INTEGER, c INTEGER)",
+            "CREATE INDEX ia ON t(a)",
+            "CREATE INDEX ib ON t(b)",
+        ] {
+            limbo_exec_rows(&conn, statement);
+        }
+
+        assert_that!(limbo_exec_rows(
+            &conn,
+            "EXPLAIN QUERY PLAN UPDATE t SET c = 8 WHERE a = 1 OR b = 2",
+        ))
+        .column(3)
+        .contains(Cell::from("MULTI-INDEX OR t (ia, ib)"));
+
+        limbo_exec_rows(&conn, "INSERT INTO t VALUES (1, 2, 0)");
+        limbo_exec_rows(&conn, "UPDATE t SET c = 8 WHERE a = 1 OR b = 2");
+        assert_that!(limbo_exec_rows(&conn, "SELECT c FROM t")).is_equal_to(vec![row![8]]);
+    });
+
+    assert_that!(std::fs::read_to_string(log.path()).expect("read temporary debug log"))
+        .named("debug log")
+        .contains("MULTI-INDEX OR t (ia, ib)");
 }

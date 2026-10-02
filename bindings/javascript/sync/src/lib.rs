@@ -13,7 +13,7 @@ use napi::bindgen_prelude::{AsyncTask, Either5, Null};
 use napi_derive::napi;
 use turso_node::{DatabaseOpts, IoLoopTask};
 use turso_sync_engine::{
-    database_sync_engine::{DatabaseSyncEngine, DatabaseSyncEngineOpts},
+    database_sync_engine::{sync_database_file_paths, DatabaseSyncEngine, DatabaseSyncEngineOpts},
     database_sync_engine_io::SyncEngineIo,
     database_sync_operations::SyncEngineIoStats,
     types::{
@@ -380,6 +380,11 @@ impl SyncEngine {
     }
 
     #[napi]
+    pub fn file_paths(&self) -> Vec<String> {
+        sync_database_file_paths(&self.opts.path)
+    }
+
+    #[napi]
     pub fn connect(&mut self) -> napi::Result<GeneratorHolder> {
         let opts = DatabaseSyncEngineOpts {
             client_name: self.opts.client_name.clone(),
@@ -397,7 +402,11 @@ impl SyncEngine {
                 .map(|x| x.required_metadata_size())
                 .unwrap_or(0),
             partial_sync_opts: self.opts.partial_sync_opts.clone(),
-            remote_encryption_key: self.opts.remote_encryption_key.clone(),
+            remote_encryption_key: self
+                .opts
+                .remote_encryption_key
+                .clone()
+                .map(turso_sync_engine::types::Secret::new),
             push_operations_threshold: self.opts.push_operations_threshold,
             pull_bytes_threshold: self.opts.pull_bytes_threshold,
             logical_mvcc_pull: self.opts.logical_mvcc_pull,

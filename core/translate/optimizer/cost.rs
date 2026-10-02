@@ -117,7 +117,11 @@ pub fn rows_per_leaf_page_for_index(
 /// * `base_row_count` - Total rows in the table
 /// * `num_scans` - Number of times we scan the table (e.g., from outer loop in nested loop join)
 /// * `params` - Cost model parameters
-fn estimate_scan_cost(base_row_count: f64, num_scans: f64, params: &CostModelParams) -> Cost {
+pub(super) fn estimate_scan_cost(
+    base_row_count: f64,
+    num_scans: f64,
+    params: &CostModelParams,
+) -> Cost {
     let table_pages = (base_row_count / params.rows_per_table_page).max(1.0);
 
     // First scan reads all pages; subsequent scans benefit from caching
@@ -146,6 +150,10 @@ pub(super) fn estimate_ephemeral_index_build_cost(
     Cost(row_count * comparisons_per_row * params.cpu_cost_per_seek)
 }
 
+pub(super) fn estimate_sort_cpu_cost(row_count: f64, params: &CostModelParams) -> Cost {
+    Cost(row_count * row_count.max(1.0).log2() * params.sort_cpu_per_row)
+}
+
 /// Estimate how many B-tree levels an index search reads.
 pub(super) fn estimate_btree_depth(row_count: f64, rows_per_page: f64) -> f64 {
     if row_count <= 1.0 {
@@ -163,9 +171,9 @@ pub(super) fn estimate_btree_depth(row_count: f64, rows_per_page: f64) -> f64 {
 ///
 /// # Arguments
 /// * `base_row_count` - Total rows in the table (for estimating tree depth and page counts)
-/// * `tree_depth` - B-tree depth (number of pages to traverse per seek)
+/// * `tree_depth` - Number of B-tree pages read by the first search
 /// * `index_info` - Index properties (covering, unique, etc.)
-/// * `num_seeks` - Number of B-tree traversals (typically = outer cardinality for joins)
+/// * `input_cardinality` - Number of searches, usually one per outer row
 /// * `rows_per_seek` - Expected rows returned per seek (1 for point lookup, more for range)
 /// * `params` - Cost model parameters
 pub fn estimate_index_cost(
@@ -180,7 +188,6 @@ pub fn estimate_index_cost(
     // the entire index, not seeking to specific positions.
     let is_full_scan = (rows_per_seek - base_row_count).abs() < 1.0;
 
-    // Cost of B-tree traversals: each seek traverses tree_depth pages.
     let seek_cost = if is_full_scan {
         // Full scan: one seek to start, then sequential reads.
         // When re-scanned (nested loop inner), first scan is cold, rest are cached.
@@ -189,8 +196,15 @@ pub fn estimate_index_cost(
         } else {
             tree_depth + (input_cardinality - 1.0) * tree_depth * params.cache_reuse_factor
         }
-    } else {
+    } else if input_cardinality <= 1.0 {
         input_cardinality * tree_depth
+    } else {
+        let cached_root_page_cost = params.cache_reuse_factor;
+        let leaf_page_costed_below = if rows_per_seek > 1.0 { 1.0 } else { 0.0 };
+        let repeated_tree_search_cost = (tree_depth - 1.0 + cached_root_page_cost
+            - leaf_page_costed_below)
+            .max(cached_root_page_cost);
+        tree_depth + (input_cardinality - 1.0) * repeated_tree_search_cost
     };
 
     let index_leaf_pages_count = (rows_per_seek / index_info.rows_per_leaf_page).max(1.0);
@@ -249,6 +263,32 @@ pub(crate) fn is_unique_point_lookup(
     index_info.unique && eq_count >= index_info.column_count
 }
 
+/// Returns true when one index search can return at most one row.
+///
+/// A rowid search is unique when `index` is `None` and a plain `=` constrains the rowid.
+/// A secondary-index search is unique only when `=` constrains every column of a unique index.
+/// `IS` does not qualify because a unique index can contain many `NULL` values.
+pub(crate) fn index_access_is_unique_point_lookup(
+    index: Option<&Index>,
+    usable_constraint_refs: &[RangeConstraintRef],
+) -> bool {
+    let index_info = match index {
+        Some(index) => IndexInfo {
+            unique: index.unique,
+            column_count: index.columns.len(),
+            covering: false,
+            rows_per_leaf_page: 0.0,
+        },
+        None => IndexInfo {
+            unique: true,
+            column_count: 1,
+            covering: false,
+            rows_per_leaf_page: 0.0,
+        },
+    };
+    is_unique_point_lookup(index_info, usable_constraint_refs)
+}
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum RowCountEstimate {
     HardcodedFallback(f64),
@@ -289,8 +329,10 @@ pub(crate) fn estimate_rows_per_seek(
     base_row_count: RowCountEstimate,
     analyze_ctx: Option<&AnalyzeCtx>,
 ) -> f64 {
+    let join_probe_constant_selectivity =
+        join_probe_constant_selectivity(constraints, usable_constraint_refs);
     if is_unique_point_lookup(index_info, usable_constraint_refs) {
-        return 1.0;
+        return join_probe_constant_selectivity;
     }
 
     if let Some(ctx) = analyze_ctx {
@@ -318,7 +360,8 @@ pub(crate) fn estimate_rows_per_seek(
                         sel
                     })
                     .product();
-                return (eq_prefix_rows * range_selectivity).max(1.0);
+                return (eq_prefix_rows * range_selectivity).max(1.0)
+                    * join_probe_constant_selectivity;
             }
         }
     }
@@ -340,7 +383,27 @@ pub(crate) fn estimate_rows_per_seek(
         })
         .product();
 
-    (selectivity_multiplier * *base_row_count).max(1.0)
+    (selectivity_multiplier * *base_row_count).max(1.0) * join_probe_constant_selectivity
+}
+
+fn join_probe_constant_selectivity(
+    constraints: &[Constraint],
+    usable_constraint_refs: &[RangeConstraintRef],
+) -> f64 {
+    let equality_constraints = usable_constraint_refs
+        .iter()
+        .take_while(|constraint| constraint.eq.is_some())
+        .map(|constraint| &constraints[constraint.eq.as_ref().unwrap().constraint_pos]);
+    if !equality_constraints
+        .clone()
+        .any(|constraint| !constraint.lhs_mask.is_empty())
+    {
+        return 1.0;
+    }
+    equality_constraints
+        .filter(|constraint| constraint.lhs_mask.is_empty())
+        .map(|constraint| constraint.selectivity)
+        .product()
 }
 
 /// Estimate rows per seek using ANALYZE stats (sqlite_stat1 histogram data).
@@ -452,5 +515,88 @@ pub fn estimate_cost_for_scan_or_seek(
         Cost(base_cost.0 * 2.0)
     } else {
         base_cost
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::translate::optimizer::cost_params::DEFAULT_PARAMS;
+
+    fn covering_index() -> IndexInfo {
+        IndexInfo {
+            unique: false,
+            column_count: 2,
+            covering: true,
+            rows_per_leaf_page: 100.0,
+        }
+    }
+
+    #[test]
+    fn repeated_point_seeks_keep_non_root_page_costs() {
+        let cost =
+            estimate_index_cost(100_000.0, 4.0, covering_index(), 10.0, 1.0, &DEFAULT_PARAMS);
+        let repeated_tree_search_cost = 3.0 + DEFAULT_PARAMS.cache_reuse_factor;
+        let expected_tree_search_cost = 4.0 + 9.0 * repeated_tree_search_cost;
+        let expected_cpu_cost =
+            10.0 * DEFAULT_PARAMS.cpu_cost_per_seek + 10.0 * DEFAULT_PARAMS.cpu_cost_per_row;
+        let expected = expected_tree_search_cost + expected_cpu_cost - DEFAULT_PARAMS.index_bonus;
+        assert!((cost.0 - expected).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn repeated_range_seeks_reuse_cached_root_and_leaf_pages() {
+        let cost = estimate_index_cost(
+            100_000.0,
+            4.0,
+            covering_index(),
+            10.0,
+            100.0,
+            &DEFAULT_PARAMS,
+        );
+        let repeated_tree_search_cost = 2.0 + DEFAULT_PARAMS.cache_reuse_factor;
+        let expected_tree_search_cost = 4.0 + 9.0 * repeated_tree_search_cost;
+        let expected_leaf_cost = 1.0 + 9.0 * DEFAULT_PARAMS.cache_reuse_factor;
+        let expected_cpu_cost =
+            10.0 * DEFAULT_PARAMS.cpu_cost_per_seek + 1_000.0 * DEFAULT_PARAMS.cpu_cost_per_row;
+        let expected = expected_tree_search_cost + expected_leaf_cost + expected_cpu_cost
+            - DEFAULT_PARAMS.index_bonus;
+        assert!((cost.0 - expected).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn lower_cache_reuse_factor_reduces_repeated_read_cost() {
+        let low_reuse_cost = CostModelParams {
+            cache_reuse_factor: 0.8,
+            ..DEFAULT_PARAMS.clone()
+        };
+        let high_reuse_cost = CostModelParams {
+            cache_reuse_factor: 0.2,
+            ..DEFAULT_PARAMS.clone()
+        };
+
+        assert!(
+            estimate_scan_cost(100_000.0, 10.0, &high_reuse_cost)
+                < estimate_scan_cost(100_000.0, 10.0, &low_reuse_cost)
+        );
+        for rows_per_seek in [1.0, 100.0] {
+            assert!(
+                estimate_index_cost(
+                    100_000.0,
+                    4.0,
+                    covering_index(),
+                    10.0,
+                    rows_per_seek,
+                    &high_reuse_cost,
+                ) < estimate_index_cost(
+                    100_000.0,
+                    4.0,
+                    covering_index(),
+                    10.0,
+                    rows_per_seek,
+                    &low_reuse_cost,
+                )
+            );
+        }
     }
 }

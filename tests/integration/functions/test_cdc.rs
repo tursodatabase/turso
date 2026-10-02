@@ -4,7 +4,9 @@ use rusqlite::types::Value;
 use turso_core::types::ImmutableRecord;
 use turso_core::CDC_VERSION_CURRENT;
 
+use crate::assertions::{AssertColumn, Cell};
 use crate::common::{limbo_exec_rows, limbo_exec_rows_fallible, TempDatabase};
+use asserting::prelude::*;
 
 fn replace_column_with_null(rows: Vec<Vec<Value>>, column: usize) -> Vec<Vec<Value>> {
     rows.into_iter()
@@ -305,6 +307,58 @@ fn test_cdc_simple_full(db: TempDatabase) {
                 "t",
                 1,
                 Some(record([Value::Integer(1), Value::Integer(3)])),
+                None,
+                None,
+            ),
+            v2_commit(),
+        ]
+    );
+}
+
+#[turso_macros::test]
+fn test_cdc_delete_all_keeps_one_record_per_deleted_row(db: TempDatabase) {
+    let conn = db.connect_limbo();
+    conn.execute("CREATE TABLE t (x INTEGER PRIMARY KEY, y)")
+        .unwrap();
+    conn.execute("PRAGMA capture_data_changes_conn('full')")
+        .unwrap();
+    conn.execute("INSERT INTO t VALUES (1, 2), (3, 4)").unwrap();
+
+    conn.execute("DELETE FROM t").unwrap();
+
+    assert_eq!(
+        normalize_cdc_v2_rows(limbo_exec_rows(&conn, "SELECT * FROM turso_cdc")),
+        vec![
+            v2_row(
+                1,
+                "t",
+                1,
+                None,
+                Some(record([Value::Integer(1), Value::Integer(2)])),
+                None,
+            ),
+            v2_row(
+                1,
+                "t",
+                3,
+                None,
+                Some(record([Value::Integer(3), Value::Integer(4)])),
+                None,
+            ),
+            v2_commit(),
+            v2_row(
+                -1,
+                "t",
+                1,
+                Some(record([Value::Integer(1), Value::Integer(2)])),
+                None,
+                None,
+            ),
+            v2_row(
+                -1,
+                "t",
+                3,
+                Some(record([Value::Integer(3), Value::Integer(4)])),
                 None,
                 None,
             ),
@@ -1738,10 +1792,11 @@ fn test_cdc_v2_no_change_commit_then_rollback(db: TempDatabase) {
         &conn,
         "SELECT change_txn_id FROM turso_cdc WHERE change_type = 2",
     );
-    assert_eq!(commits.len(), 2);
-    assert!(commits
-        .iter()
-        .all(|row| !matches!(row[0], Value::Integer(-1))));
+    assert_that!(commits)
+        .named("commit records")
+        .has_length(2)
+        .column(0)
+        .does_not_contain(Cell::from(-1));
 }
 
 #[turso_macros::test]

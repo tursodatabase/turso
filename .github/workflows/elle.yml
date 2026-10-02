@@ -25,6 +25,7 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
   ELLE_CLI_REV: 65fafcfa939cced8b7d279db1b2a666929885e65
 
 jobs:

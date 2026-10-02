@@ -322,6 +322,7 @@ pub fn translate_expr(
                         cursor_id: *cursor_id,
                         pc_if_next: label_null_checks_loop_start,
                         fullscan: false,
+                        is_index: false,
                     });
                     // Loop exhausted without finding all-NULL row
                     program.emit_insn(Insn::Goto {
@@ -2060,17 +2061,25 @@ pub fn translate_expr(
                     }
                 },
                 #[cfg(all(feature = "fts", not(target_family = "wasm")))]
-                Func::Fts(_) => {
-                    // FTS functions are handled via index method pattern matching.
-                    // If we reach here, no index matched, so translate as a regular function call.
-                    translate_function(
-                        program,
-                        args,
-                        referenced_tables,
-                        resolver,
-                        target_register,
-                        func_ctx,
-                    )
+                Func::Fts(FtsFunc::Highlight) => translate_function(
+                    program,
+                    args,
+                    referenced_tables,
+                    resolver,
+                    target_register,
+                    func_ctx,
+                ),
+                #[cfg(all(feature = "fts", not(target_family = "wasm")))]
+                Func::Fts(FtsFunc::Score) => translate_fts_score(
+                    program,
+                    referenced_tables,
+                    args,
+                    target_register,
+                    name.as_str(),
+                ),
+                #[cfg(all(feature = "fts", not(target_family = "wasm")))]
+                Func::Fts(FtsFunc::Match) => {
+                    crate::bail_parse_error!("{} requires an FTS index query", name.as_str())
                 }
                 Func::AlterTable(_) => unreachable!(),
             }
@@ -2243,7 +2252,11 @@ pub fn translate_expr(
                             resolver,
                         )
                     }
-                    Some(SelfTableContext::ForDML { dml_ctx, .. }) => {
+                    Some(SelfTableContext::ForDML { dml_ctx, table }) => {
+                        let Some(table_column) = table.columns().get(*column) else {
+                            crate::bail_parse_error!("column index out of bounds");
+                        };
+                        program.set_collation(Some((table_column.collation(), false)));
                         let src_reg = dml_ctx.to_column_reg(*column);
                         program.emit_insn(Insn::Copy {
                             src_reg,
@@ -2681,6 +2694,14 @@ pub fn translate_expr(
             let (is_from_outer_query_scope, table) = referenced_tables
                 .find_table_by_internal_id(*table_ref_id)
                 .expect("table reference should be found");
+            if let Table::Virtual(_) = table {
+                let cursor_id = program.resolve_cursor_id(&CursorKey::table(*table_ref_id));
+                program.emit_insn(Insn::RowId {
+                    cursor_id,
+                    dest: target_register,
+                });
+                return Ok(target_register);
+            }
             let Table::BTree(btree) = table else {
                 crate::bail_parse_error!("no such column: rowid");
             };
@@ -3136,5 +3157,71 @@ pub fn translate_expr(
         program.constant_span_end(span);
     }
 
+    Ok(target_register)
+}
+
+#[cfg(all(feature = "fts", not(target_family = "wasm")))]
+fn translate_fts_score(
+    program: &mut ProgramBuilder,
+    referenced_tables: Option<&TableReferences>,
+    args: &[Box<ast::Expr>],
+    target_register: usize,
+    name: &str,
+) -> Result<usize> {
+    let indexed_columns = args.len().checked_sub(1).filter(|&n| n > 0);
+    let selected_index = indexed_columns.and_then(|n| {
+        let ast::Expr::Column { table, .. } = args[0].as_ref() else {
+            return None;
+        };
+        referenced_tables
+            .and_then(|tables| tables.find_joined_table_by_internal_id(*table))
+            .and_then(|table_ref| match &table_ref.op {
+                Operation::IndexMethodQuery(query)
+                    if query.index.index_method.as_ref().is_some_and(|method| {
+                        method.definition().method_name
+                            == crate::index_method::fts::FTS_INDEX_METHOD_NAME
+                    }) && query.arguments.first().is_some_and(|indexed_query| {
+                        exprs_are_equivalent(indexed_query, args.last().unwrap())
+                    }) && {
+                        let fields = query.index.columns.iter().enumerate()
+                            .filter(|(_, indexed)| args[..n].iter().any(|arg| {
+                                matches!(arg.as_ref(), ast::Expr::Column { column, .. }
+                                    if *column == indexed.pos_in_table)
+                            }))
+                            .map(|(i, _)| i.to_string())
+                            .collect::<Vec<_>>()
+                            .join(",");
+                        n == fields.split(',').count()
+                            && query.arguments.last() == Some(&ast::Expr::Literal(
+                                ast::Literal::String(format!("'{fields}'"))
+                            ))
+                    }
+                        && args[..n].iter().all(|arg| {
+                            matches!(arg.as_ref(), ast::Expr::Column { table, column, .. }
+                                if *table == table_ref.internal_id && query.index.columns.iter().any(|indexed| indexed.pos_in_table == *column))
+                    }) =>
+                {
+                    Some((*table, query))
+                }
+                _ => None,
+            })
+    });
+    let Some((table, query)) = selected_index else {
+        crate::bail_parse_error!(
+            "{} requires columns and query from the selected FTS index",
+            name
+        );
+    };
+    let cursor_id = program.resolve_cursor_id(&CursorKey::index(table, query.index.clone()));
+    let score_column = if matches!(
+        query.pattern_idx as i64,
+        crate::index_method::fts::FTS_PATTERN_MATCH_LIMIT
+            | crate::index_method::fts::FTS_PATTERN_MATCH
+    ) {
+        1
+    } else {
+        0
+    };
+    program.emit_column_or_rowid(cursor_id, score_column, target_register);
     Ok(target_register)
 }

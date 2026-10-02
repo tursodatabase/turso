@@ -59,6 +59,26 @@ impl SimulatorIO {
         self.file_sizes.clone()
     }
 
+    /// Contents of every database file (`.db`, `-wal`, `-log`), keyed by
+    /// that suffix and sorted by it.
+    pub fn db_file_bytes(&self) -> Vec<(String, Vec<u8>)> {
+        let files = self.files.lock().unwrap();
+        let sizes = self.file_sizes.lock().unwrap();
+        let mut out: Vec<(String, Vec<u8>)> = files
+            .iter()
+            .filter_map(|(path, file)| {
+                let suffix = [".db", "-wal", "-log"]
+                    .into_iter()
+                    .find(|suffix| path.ends_with(suffix))?;
+                let actual_size = sizes.get(path).copied().unwrap_or(0) as usize;
+                let mmap = file.mmap.lock().unwrap();
+                Some((suffix.to_string(), mmap[..actual_size].to_vec()))
+            })
+            .collect();
+        out.sort_by(|a, b| a.0.cmp(&b.0));
+        out
+    }
+
     /// Dump all database files to the specified output directory.
     /// Only copies the actual file content, not the full mmap size.
     pub fn dump_files(&self, out_dir: &std::path::Path) -> anyhow::Result<()> {

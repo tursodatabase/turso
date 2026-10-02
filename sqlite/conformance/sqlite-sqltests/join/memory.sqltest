@@ -1,5 +1,149 @@
 @database :memory:
 
+setup indexed-hash-build-rows {
+    CREATE TABLE expression_build_orders(
+        id INTEGER PRIMARY KEY,
+        customer_id INTEGER,
+        order_date TEXT
+    );
+    CREATE INDEX expression_build_order_key
+        ON expression_build_orders(customer_id, lower(order_date));
+    CREATE TABLE expression_build_inventory(product_id INTEGER, quantity INTEGER);
+    INSERT INTO expression_build_orders VALUES
+        (1, 100, 'ABC'), (2, 100, 'DeF'), (3, 100, NULL),
+        (4, 200, 'GHI'), (6, 100, 'xyz');
+    INSERT INTO expression_build_inventory VALUES
+        (1, 2), (1, 3), (2, 4), (3, 5), (5, 6);
+
+    CREATE TABLE covering_build_orders(
+        id INTEGER PRIMARY KEY,
+        customer_id INTEGER,
+        order_date TEXT
+    );
+    INSERT INTO covering_build_orders SELECT * FROM expression_build_orders;
+    CREATE INDEX covering_build_order_key
+        ON covering_build_orders(customer_id, order_date);
+
+    CREATE TABLE expression_covering_build_orders(
+        id INTEGER PRIMARY KEY,
+        customer_id INTEGER,
+        order_date TEXT
+    );
+    INSERT INTO expression_covering_build_orders SELECT * FROM expression_build_orders;
+    CREATE INDEX expression_covering_build_order_key
+        ON expression_covering_build_orders(customer_id, lower(order_date), order_date);
+
+    CREATE TABLE noncovering_build_orders(
+        id INTEGER PRIMARY KEY,
+        customer_id INTEGER,
+        order_date TEXT
+    );
+    INSERT INTO noncovering_build_orders SELECT * FROM expression_build_orders;
+    CREATE INDEX noncovering_build_order_key
+        ON noncovering_build_orders(customer_id);
+
+    CREATE TABLE partial_build_orders(
+        id INTEGER PRIMARY KEY,
+        customer_id INTEGER,
+        order_date TEXT
+    );
+    INSERT INTO partial_build_orders SELECT * FROM expression_build_orders;
+    CREATE INDEX partial_build_order_key
+        ON partial_build_orders(customer_id, order_date)
+        WHERE customer_id = 100;
+
+    CREATE TABLE expression_build_customers(id INTEGER PRIMARY KEY, enabled INTEGER);
+    INSERT INTO expression_build_customers VALUES (100, 1), (200, 0);
+}
+
+@setup indexed-hash-build-rows
+test expression-index-hash-build-keeps-source-column {
+    SELECT orders.id, lower(orders.order_date), inventory.quantity
+    FROM expression_build_orders AS orders
+    JOIN expression_build_inventory AS inventory
+      ON orders.id = inventory.product_id
+    WHERE orders.customer_id = 100
+    ORDER BY orders.id, inventory.quantity;
+}
+expect {
+    1|abc|2
+    1|abc|3
+    2|def|4
+    3||5
+}
+
+@setup indexed-hash-build-rows
+@skip-if sqlite "SQLite does not have a hash join plan"
+test expression-index-hash-build-reads-source-table {
+    EXPLAIN QUERY PLAN
+    SELECT orders.id, lower(orders.order_date), inventory.quantity
+    FROM expression_build_orders AS orders
+    JOIN expression_build_inventory AS inventory
+      ON orders.id = inventory.product_id
+    WHERE orders.customer_id = 100;
+}
+expect pattern {
+    (?s)MATERIALIZE hash build input for expression_build_orders AS orders.*HASH JOIN expression_build_inventory AS inventory.*SEARCH orders USING INTEGER PRIMARY KEY
+}
+
+@setup indexed-hash-build-rows
+@var build_table { expression_build_orders | covering_build_orders | expression_covering_build_orders | noncovering_build_orders | partial_build_orders }
+@var join_type { JOIN | LEFT JOIN | FULL OUTER JOIN }
+@var date_value { orders.order_date | lower(orders.order_date) }
+matrix indexed-hash-build-join-results {
+    SELECT orders.id, $date_value, inventory.quantity
+    FROM $build_table AS orders
+    $join_type expression_build_inventory AS inventory
+      ON orders.id = inventory.product_id
+    WHERE orders.customer_id = 100 OR orders.id IS NULL
+    ORDER BY orders.id, inventory.quantity;
+}
+
+setup expression-index-prefix-stats {
+    ANALYZE;
+    DELETE FROM sqlite_stat1;
+    INSERT INTO sqlite_stat1(tbl, idx, stat) VALUES
+        ('expression_build_customers', NULL, '1000'),
+        ('expression_build_orders', NULL, '100000'),
+        ('expression_build_orders', 'expression_build_order_key', '100000 100'),
+        ('expression_build_inventory', NULL, '100000');
+    ANALYZE sqlite_schema;
+}
+
+@setup indexed-hash-build-rows
+@setup expression-index-prefix-stats
+test expression-index-after-earlier-join-keeps-source-column {
+    SELECT customers.id, orders.id, lower(orders.order_date), inventory.quantity
+    FROM expression_build_customers AS customers
+    CROSS JOIN expression_build_orders AS orders
+    JOIN expression_build_inventory AS inventory
+      ON inventory.product_id = orders.id
+    WHERE orders.customer_id = customers.id AND customers.enabled = 1
+    ORDER BY customers.id, orders.id, inventory.quantity;
+}
+expect {
+    100|1|abc|2
+    100|1|abc|3
+    100|2|def|4
+    100|3||5
+}
+
+@setup indexed-hash-build-rows
+@setup expression-index-prefix-stats
+@skip-if sqlite "SQLite does not have a hash join plan"
+test expression-index-after-earlier-join-reads-source-table {
+    EXPLAIN QUERY PLAN
+    SELECT customers.id, orders.id, lower(orders.order_date), inventory.quantity
+    FROM expression_build_customers AS customers
+    CROSS JOIN expression_build_orders AS orders
+    JOIN expression_build_inventory AS inventory
+      ON inventory.product_id = orders.id
+    WHERE orders.customer_id = customers.id AND customers.enabled = 1;
+}
+expect pattern {
+    (?s)MATERIALIZE hash build input for expression_build_orders AS orders.*SCAN expression_build_customers AS customers.*SEARCH orders USING INDEX expression_build_order_key.*HASH JOIN expression_build_inventory AS inventory
+}
+
 # regression test for issue 2794: not nulling out rowid properly when left join does not match
 @cross-check-integrity
 test min-null-regression-test {
@@ -217,6 +361,41 @@ test test-spill-hash-join-rows {
 expect {
     aaaa|abcd
     aaaa|abcd
+}
+
+@cross-check-integrity
+test hash-join-offset-continues-with-the-next-match {
+    CREATE TABLE offset_hash_left(id INTEGER PRIMARY KEY, key INTEGER);
+    CREATE TABLE offset_hash_right(id INTEGER PRIMARY KEY, key INTEGER);
+    INSERT INTO offset_hash_left SELECT value, value % 20 FROM generate_series(1, 200);
+    INSERT INTO offset_hash_right SELECT value, value % 20 FROM generate_series(1, 220);
+    SELECT count(*) FROM (
+        SELECT offset_hash_left.id, offset_hash_right.id
+        FROM offset_hash_left
+        JOIN offset_hash_right ON offset_hash_left.key = offset_hash_right.key
+        LIMIT 50 OFFSET 500
+    );
+}
+expect {
+    50
+}
+
+@cross-check-integrity
+test hash-left-join-offset-skips-unmatched-rows {
+    CREATE TABLE offset_unmatched_left(x INTEGER);
+    CREATE TABLE offset_unmatched_right(x INTEGER);
+    INSERT INTO offset_unmatched_left
+        VALUES (1), (2), (3), (4), (5), (6), (7), (8), (9), (10);
+    SELECT count(*) FROM (
+        SELECT offset_unmatched_left.x, offset_unmatched_right.x
+        FROM offset_unmatched_left
+        LEFT JOIN offset_unmatched_right
+            ON offset_unmatched_right.x = offset_unmatched_left.x
+        LIMIT 1 OFFSET 1
+    );
+}
+expect {
+    1
 }
 
 @cross-check-integrity
@@ -668,6 +847,27 @@ expect {
     3|3|3
 }
 
+# Keep the selected build rows and their values when an IN seek feeds a hash join.
+@cross-check-integrity
+test hash-build-keeps-in-seek-rows-and-values {
+    CREATE TABLE requested(id INTEGER PRIMARY KEY, limit_value INTEGER);
+    CREATE TABLE allowed(id INTEGER PRIMARY KEY);
+    CREATE TABLE events(requested_id INTEGER, amount INTEGER, active INTEGER);
+    INSERT INTO requested VALUES (1, 10), (2, 20), (3, 30);
+    INSERT INTO allowed VALUES (1), (3);
+    INSERT INTO events VALUES (1, 4, 1), (1, 7, 0), (2, 8, 1), (3, 5, 1), (3, 6, 1);
+    SELECT requested.id, requested.limit_value, coalesce(sum(events.amount), 0)
+    FROM requested
+    LEFT JOIN events ON events.requested_id = requested.id AND events.active = 1
+    WHERE requested.id IN (SELECT id FROM allowed)
+    GROUP BY requested.id
+    ORDER BY requested.id;
+}
+expect {
+    1|10|4
+    3|30|11
+}
+
 # The second hash join builds a3 after an earlier hash join reads a2. The a2
 # table is no longer in the main join order, but a2.b still filters the a3 rows
 # used by the second hash join. Keep that filter when a4 has no matching row.
@@ -748,4 +948,384 @@ test join-3-4-2 {
 }
 expect error {
     cannot join using column d - column not present in both tables
+}
+
+@skip-if sqlite "Turso can replace the reversed primary-key lookup with a hash join"
+test indexed-build-hashes-an-unfiltered-large-probe {
+    CREATE TABLE indexed_hash_parent(id INTEGER PRIMARY KEY, selected INTEGER);
+    CREATE TABLE indexed_hash_child(parent_id INTEGER, payload INTEGER);
+    ANALYZE;
+    DELETE FROM sqlite_stat1;
+    INSERT INTO sqlite_stat1(tbl, idx, stat) VALUES
+        ('indexed_hash_parent', NULL, '200000'),
+        ('indexed_hash_child', NULL, '6000000');
+    ANALYZE sqlite_schema;
+
+    EXPLAIN QUERY PLAN
+    SELECT count(*)
+    FROM indexed_hash_parent AS parent
+    JOIN indexed_hash_child AS child ON child.parent_id = parent.id
+    WHERE parent.selected = 1;
+}
+expect pattern {
+    (?s)HASH JOIN indexed_hash_child AS child.*SCAN indexed_hash_parent AS parent
+}
+
+@skip-if sqlite "Turso compares correlated subqueries with grouped joins"
+test group-sort-cost-keeps-cheaper-correlated-seeks {
+    CREATE TABLE sort_cost_parent(id INTEGER PRIMARY KEY, selected INTEGER);
+    CREATE TABLE sort_cost_filter(id INTEGER PRIMARY KEY, selected INTEGER);
+    CREATE TABLE sort_cost_child(
+        parent_id INTEGER,
+        filter_id INTEGER,
+        value INTEGER,
+        PRIMARY KEY(parent_id, filter_id)
+    );
+    ANALYZE;
+    DELETE FROM sqlite_stat1;
+    INSERT INTO sqlite_stat1(tbl, idx, stat) VALUES
+        ('sort_cost_parent', NULL, '85000'),
+        ('sort_cost_filter', NULL, '100'),
+        ('sort_cost_child', NULL, '800000'),
+        ('sort_cost_child', 'sqlite_autoindex_sort_cost_child_1', '800000 4 1');
+    ANALYZE sqlite_schema;
+
+    EXPLAIN QUERY PLAN
+    SELECT parent.id
+    FROM sort_cost_parent AS parent
+    WHERE parent.selected = 1
+      AND 0 = (
+          SELECT min(child.value)
+          FROM sort_cost_child AS child
+          JOIN sort_cost_filter AS kept ON kept.id = child.filter_id
+          WHERE child.parent_id = parent.id AND kept.selected = 1
+      );
+}
+expect pattern {
+    (?s)CORRELATED SCALAR SUBQUERY.*SEARCH child USING INDEX sqlite_autoindex_sort_cost_child_1 \(parent_id=\?\)
+}
+
+@skip-if sqlite "Turso can use a hash join when an index cannot seek by the join column"
+test index-suffix-does-not-prevent-hash-join {
+    CREATE TABLE suffix_hash_parent(id INTEGER PRIMARY KEY, selected INTEGER);
+    CREATE TABLE suffix_hash_child(
+        group_id INTEGER,
+        parent_id INTEGER,
+        payload INTEGER,
+        PRIMARY KEY(group_id, parent_id)
+    );
+    ANALYZE;
+    DELETE FROM sqlite_stat1;
+    INSERT INTO sqlite_stat1(tbl, idx, stat) VALUES
+        ('suffix_hash_parent', NULL, '1000'),
+        ('suffix_hash_child', NULL, '5000000'),
+        ('suffix_hash_child', 'sqlite_autoindex_suffix_hash_child_1', '5000000 5000 1');
+    ANALYZE sqlite_schema;
+
+    EXPLAIN QUERY PLAN
+    SELECT count(*)
+    FROM suffix_hash_parent AS parent
+    JOIN suffix_hash_child AS child ON child.parent_id = parent.id
+    WHERE parent.selected = 1;
+}
+expect pattern {
+    (?s)HASH JOIN suffix_hash_child AS child.*SCAN suffix_hash_parent AS parent
+}
+
+test index-suffix-join-keeps-null-and-duplicate-rows {
+    CREATE TABLE suffix_result_parent(id INTEGER PRIMARY KEY, selected INTEGER);
+    CREATE TABLE suffix_result_child(
+        group_id INTEGER,
+        parent_id INTEGER,
+        payload INTEGER,
+        PRIMARY KEY(group_id, parent_id)
+    );
+    INSERT INTO suffix_result_parent VALUES (1, 1), (2, 1), (3, 0), (4, 1);
+    INSERT INTO suffix_result_child VALUES
+        (10, 1, 7), (20, 1, 8), (30, 2, 9), (40, NULL, 10), (NULL, 1, 11);
+    ANALYZE;
+    DELETE FROM sqlite_stat1;
+    INSERT INTO sqlite_stat1(tbl, idx, stat) VALUES
+        ('suffix_result_parent', NULL, '1000'),
+        ('suffix_result_child', NULL, '5000000'),
+        ('suffix_result_child', 'sqlite_autoindex_suffix_result_child_1', '5000000 5000 1');
+    ANALYZE sqlite_schema;
+
+    SELECT parent.id, child.group_id, child.payload
+    FROM suffix_result_parent AS parent
+    LEFT JOIN suffix_result_child AS child ON child.parent_id = parent.id
+    WHERE parent.selected = 1
+    ORDER BY parent.id, child.group_id, child.payload;
+}
+expect {
+    1||11
+    1|10|7
+    1|20|8
+    2|30|9
+    4||
+}
+
+@skip-if sqlite "Turso can use a hash join when the current join prefix cannot seek an index"
+test future-table-cannot-make-index-usable {
+    CREATE TABLE future_index_parent(id INTEGER PRIMARY KEY, selected INTEGER);
+    CREATE TABLE future_index_group(id INTEGER PRIMARY KEY);
+    CREATE TABLE future_index_child(
+        group_id INTEGER,
+        parent_id INTEGER,
+        PRIMARY KEY(group_id, parent_id)
+    );
+    ANALYZE;
+    DELETE FROM sqlite_stat1;
+    INSERT INTO sqlite_stat1(tbl, idx, stat) VALUES
+        ('future_index_parent', NULL, '1000'),
+        ('future_index_group', NULL, '1000000'),
+        ('future_index_child', NULL, '5000000'),
+        ('future_index_child', 'sqlite_autoindex_future_index_child_1', '5000000 5000 1');
+    ANALYZE sqlite_schema;
+
+    EXPLAIN QUERY PLAN
+    SELECT count(*)
+    FROM future_index_parent AS parent
+    CROSS JOIN future_index_child AS child ON child.parent_id = parent.id
+    CROSS JOIN future_index_group AS group_table ON child.group_id = group_table.id
+    WHERE parent.selected = 1;
+}
+expect pattern {
+    (?s)HASH JOIN future_index_child AS child.*SEARCH group_table USING INTEGER PRIMARY KEY.*SCAN future_index_parent AS parent
+}
+
+test future-table-index-does-not-change-join-results {
+    CREATE TABLE future_result_parent(id INTEGER PRIMARY KEY, selected INTEGER);
+    CREATE TABLE future_result_group(id INTEGER PRIMARY KEY);
+    CREATE TABLE future_result_child(
+        group_id INTEGER,
+        parent_id INTEGER,
+        PRIMARY KEY(group_id, parent_id)
+    );
+    INSERT INTO future_result_parent VALUES (1, 1), (2, 1), (3, 0);
+    INSERT INTO future_result_group VALUES (10), (30);
+    INSERT INTO future_result_child VALUES
+        (10, 1), (20, 1), (10, 2), (30, 2), (NULL, 1);
+    ANALYZE;
+    DELETE FROM sqlite_stat1;
+    INSERT INTO sqlite_stat1(tbl, idx, stat) VALUES
+        ('future_result_parent', NULL, '1000'),
+        ('future_result_group', NULL, '1000000'),
+        ('future_result_child', NULL, '5000000'),
+        ('future_result_child', 'sqlite_autoindex_future_result_child_1', '5000000 5000 1');
+    ANALYZE sqlite_schema;
+
+    SELECT parent.id, child.group_id, group_table.id
+    FROM future_result_parent AS parent
+    CROSS JOIN future_result_child AS child ON child.parent_id = parent.id
+    CROSS JOIN future_result_group AS group_table ON child.group_id = group_table.id
+    WHERE parent.selected = 1
+    ORDER BY parent.id, child.group_id, group_table.id;
+}
+expect {
+    1|10|10
+    2|10|10
+    2|30|30
+}
+
+setup hash-index-prefix-rows {
+    CREATE TABLE prefix_parent(id INTEGER PRIMARY KEY, selected INTEGER);
+    CREATE TABLE prefix_child(group_id INTEGER, parent_id INTEGER, payload INTEGER,
+        PRIMARY KEY(group_id, parent_id));
+    CREATE INDEX prefix_child_positive
+        ON prefix_child(group_id, parent_id) WHERE payload > 0;
+    INSERT INTO prefix_parent VALUES (1, 1), (2, 1), (3, 1), (4, 0);
+    INSERT INTO prefix_child VALUES
+        (10, 1, -1), (20, 1, 9), (30, 2, 8), (40, 3, -5), (50, NULL, 6);
+    ANALYZE;
+    DELETE FROM sqlite_stat1;
+    INSERT INTO sqlite_stat1(tbl, idx, stat) VALUES
+        ('prefix_parent', NULL, '1000'),
+        ('prefix_child', NULL, '5000000'),
+        ('prefix_child', 'sqlite_autoindex_prefix_child_1', '5000000 5000 1'),
+        ('prefix_child', 'prefix_child_positive', '5000000 5000 1');
+    ANALYZE sqlite_schema;
+}
+
+@setup hash-index-prefix-rows
+@skip-if sqlite "SQLite does not have a hash join plan"
+test range-prefix-still-allows-hash-join {
+    EXPLAIN QUERY PLAN
+    SELECT parent.id, child.group_id, child.payload
+    FROM prefix_parent AS parent
+    LEFT JOIN prefix_child AS child
+      ON child.parent_id = parent.id AND child.group_id > 15 AND child.payload >= 8
+    WHERE parent.selected = 1;
+}
+expect pattern {
+    HASH JOIN prefix_child AS child
+}
+
+@setup hash-index-prefix-rows
+@skip-if sqlite "SQLite does not have a hash join plan"
+test equality-prefix-keeps-index-search {
+    EXPLAIN QUERY PLAN
+    SELECT count(*)
+    FROM prefix_parent AS parent
+    LEFT JOIN prefix_child AS child
+      ON child.parent_id = parent.id AND child.group_id = 10
+    WHERE parent.selected = 1;
+}
+expect pattern {
+    SEARCH child USING COVERING INDEX sqlite_autoindex_prefix_child_1 \(group_id=\? AND parent_id=\?\)
+}
+
+@setup hash-index-prefix-rows
+@var join_type { JOIN | LEFT JOIN }
+@var first_column { child.group_id > 15 | child.group_id IN (10, 20) | child.group_id = 10 | child.payload > 0 }
+matrix index-prefix-join-results {
+    SELECT parent.id, child.group_id, child.payload
+    FROM prefix_parent AS parent
+    $join_type prefix_child AS child
+      ON child.parent_id = parent.id AND $first_column
+    WHERE parent.selected = 1
+    ORDER BY parent.id, child.group_id, child.payload;
+}
+
+@skip-if sqlite "Turso reports hash join estimates in its JSON plan"
+test unique-composite-hash-key-uses-one-key-estimate {
+    CREATE TABLE composite_hash_parent(first INTEGER, second INTEGER, selected INTEGER);
+    CREATE UNIQUE INDEX composite_hash_parent_key
+        ON composite_hash_parent(first, second);
+    CREATE TABLE composite_hash_child(first INTEGER, second INTEGER);
+    ANALYZE;
+    DELETE FROM sqlite_stat1;
+    INSERT INTO sqlite_stat1(tbl, idx, stat) VALUES
+        ('composite_hash_parent', NULL, '1000'),
+        ('composite_hash_parent', 'composite_hash_parent_key', '1000 10 1'),
+        ('composite_hash_child', NULL, '5000');
+    ANALYZE sqlite_schema;
+
+    EXPLAIN QUERY PLAN FORMAT=JSON
+    SELECT count(*)
+    FROM composite_hash_parent AS parent
+    JOIN composite_hash_child AS child
+      ON child.first = parent.first AND child.second = parent.second
+    WHERE parent.selected = 1;
+}
+expect pattern {
+    (?s)"detail":"HASH JOIN composite_hash_child AS child".*"rows_per_input":5
+}
+
+@skip-if sqlite "Turso reports hash join estimates in its JSON plan"
+test unique-hash-key-does-not-apply-to-a-different-collation {
+    CREATE TABLE collation_unique_build(key TEXT UNIQUE);
+    CREATE TABLE collation_unique_probe(key TEXT);
+    INSERT INTO collation_unique_build VALUES
+        ('aaa'), ('aaA'), ('aAa'), ('aAA'),
+        ('Aaa'), ('AaA'), ('AAa'), ('AAA');
+    INSERT INTO collation_unique_probe VALUES ('aaa');
+    ANALYZE;
+
+    EXPLAIN QUERY PLAN FORMAT=JSON
+    SELECT count(*)
+    FROM collation_unique_build
+    CROSS JOIN collation_unique_probe
+      ON collation_unique_probe.key COLLATE NOCASE = collation_unique_build.key;
+}
+expect pattern {
+    (?s)"detail":"HASH JOIN collation_unique_probe".*"rows_per_input":0.1
+}
+
+@skip-if sqlite "Turso reports hash join estimates in its JSON plan"
+test hash-join-cost-includes-rows-visited {
+    CREATE TABLE hash_cost_left(key INTEGER);
+    CREATE TABLE hash_cost_right(key INTEGER);
+
+    EXPLAIN QUERY PLAN FORMAT=JSON
+    SELECT count(*)
+    FROM hash_cost_left
+    JOIN hash_cost_right ON hash_cost_left.key = hash_cost_right.key;
+}
+expect pattern {
+    (?s)"detail":"HASH JOIN hash_cost_right".*"access_cost":300110000
+}
+
+@skip-if sqlite "Turso reports its selected plan in JSON"
+test hash-build-row-limit-counts-prefix-rows {
+    CREATE TABLE prefix_row_limit_outer(value INTEGER);
+    CREATE TABLE prefix_row_limit_build(value INTEGER, key INTEGER);
+    CREATE INDEX prefix_row_limit_build_value
+        ON prefix_row_limit_build(value);
+    CREATE TABLE prefix_row_limit_probe(key INTEGER);
+
+    EXPLAIN QUERY PLAN FORMAT=JSON
+    SELECT count(*)
+    FROM prefix_row_limit_outer AS outer_rows
+    CROSS JOIN prefix_row_limit_build AS build_rows
+      ON build_rows.value = outer_rows.value
+    CROSS JOIN prefix_row_limit_probe AS probe_rows
+      ON build_rows.key = probe_rows.key;
+}
+expect pattern {
+    "detail":"SEARCH probe_rows USING COVERING INDEX ephemeral_prefix_row_limit_probe_t3
+}
+
+@skip-if sqlite "Turso uses its own join cost model"
+test no-stats-hash-join-keeps-unindexed-probe-fanout {
+    CREATE TABLE a(id INTEGER PRIMARY KEY, b_id INTEGER, chosen INTEGER);
+    CREATE TABLE b(id INTEGER PRIMARY KEY, c_key INTEGER);
+    CREATE TABLE c(c_key INTEGER, d_id INTEGER);
+    CREATE TABLE d(id INTEGER PRIMARY KEY);
+
+    EXPLAIN QUERY PLAN FORMAT=JSON
+    SELECT count(*)
+    FROM a
+    CROSS JOIN b ON b.id = a.b_id
+    CROSS JOIN c ON c.c_key = b.c_key
+    CROSS JOIN d ON d.id = c.d_id
+    WHERE a.chosen = 1;
+}
+expect pattern {
+    (?s)"detail":"HASH JOIN c".*"rows_per_input":100000.*"detail":"SEARCH d USING INTEGER PRIMARY KEY
+}
+
+@skip-if sqlite "Turso uses its own join cost model"
+test partial-stats-hash-join-uses-known-unique-key-count {
+    CREATE TABLE a(id INTEGER PRIMARY KEY, b_id INTEGER, chosen INTEGER);
+    CREATE TABLE b(id INTEGER PRIMARY KEY, c_key INTEGER);
+    CREATE UNIQUE INDEX b_c_key ON b(c_key);
+    CREATE TABLE c(c_key INTEGER, d_id INTEGER);
+    CREATE TABLE d(id INTEGER PRIMARY KEY);
+    ANALYZE;
+    DELETE FROM sqlite_stat1;
+    INSERT INTO sqlite_stat1(tbl, idx, stat) VALUES
+        ('b', NULL, '1000'),
+        ('b', 'b_c_key', '1000 1'),
+        ('c', NULL, '5000');
+    ANALYZE sqlite_schema;
+
+    EXPLAIN QUERY PLAN FORMAT=JSON
+    SELECT count(*)
+    FROM a
+    CROSS JOIN b ON b.id = a.b_id
+    CROSS JOIN c ON c.c_key = b.c_key
+    CROSS JOIN d ON d.id = c.d_id
+    WHERE a.chosen = 1;
+}
+expect pattern {
+    (?s)"detail":"HASH JOIN c".*"rows_per_input":5.*"detail":"SEARCH d USING INTEGER PRIMARY KEY
+}
+
+@skip-if sqlite "Turso can materialize a hash build input"
+test materialized-hash-build-keeps-index-search {
+    CREATE TABLE selected_hash_build(id INTEGER PRIMARY KEY, key INTEGER, selected INTEGER);
+    CREATE INDEX selected_hash_build_selected
+        ON selected_hash_build(selected);
+    CREATE TABLE selected_hash_probe(key INTEGER);
+
+    EXPLAIN QUERY PLAN FORMAT=JSON
+    SELECT count(*)
+    FROM selected_hash_build AS build_rows
+    JOIN selected_hash_probe AS probe_rows
+      ON build_rows.key = probe_rows.key
+    WHERE build_rows.selected = 1;
+}
+expect pattern {
+    (?s)"detail":"MATERIALIZE hash build input for selected_hash_build AS build_rows".*"detail":"SEARCH build_rows USING INDEX selected_hash_build_selected.*"detail":"HASH JOIN selected_hash_probe AS probe_rows"
 }

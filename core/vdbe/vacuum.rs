@@ -1,3 +1,4 @@
+use crate::types::IOResultOr;
 use rustc_hash::FxHashMap;
 use std::sync::{atomic::Ordering, Arc};
 
@@ -316,7 +317,7 @@ pub(crate) fn open_vacuum_temp_db(
         Some(codec) => db.connect_with_page_codec(codec)?,
         None => db.connect_with_encryption(encryption_key)?,
     };
-    conn.reset_page_size(page_size)?;
+    conn.reset_page_size(crate::MAIN_DB_ID, page_size)?;
     conn.set_reserved_bytes(reserved_space)?;
     conn.wal_auto_actions_disable();
 
@@ -344,15 +345,22 @@ pub(crate) fn open_vacuum_temp_db(
 fn finalize_vacuum_target_header(
     target_conn: &Arc<Connection>,
     header_meta: &VacuumDbHeaderMeta,
-) -> Result<crate::IOResult<()>> {
+) -> crate::types::IOResultOr<()> {
     if let Some(mv_store) = target_conn.mv_store_for_db(crate::MAIN_DB_ID) {
         let tx_id = target_conn.get_mv_tx_id_for_db(crate::MAIN_DB_ID);
-        return mv_store
-            .with_header_mut(|header| header_meta.apply_to(header), tx_id.as_ref())
-            .map(crate::IOResult::Done);
+        mv_store.with_header_mut(|header| header_meta.apply_to(header), tx_id.as_ref())?;
+        set_mvcc_schema_version_from_header_cookie(target_conn, header_meta.schema_cookie)?;
+        return Ok(crate::IOResult::Done(()));
     }
     let pager = target_conn.pager.load();
     pager.with_header_mut(|header| header_meta.apply_to(header))
+}
+
+fn set_mvcc_schema_version_from_header_cookie(
+    target_conn: &Arc<Connection>,
+    schema_cookie: u32,
+) -> Result<()> {
+    target_conn.with_schema_mut(|schema| schema.schema_version = schema_cookie)
 }
 
 /// Finish a VACUUM INTO output database with durable on-disk state.
@@ -547,7 +555,7 @@ pub(crate) enum VacuumTargetBuildPhase {
 pub(crate) fn vacuum_target_build_step(
     config: &VacuumTargetBuildConfig,
     state: &mut VacuumTargetBuildContext,
-) -> Result<crate::IOResult<()>> {
+) -> crate::types::IOResultOr<()> {
     loop {
         let current_phase = std::mem::take(&mut state.phase);
 
@@ -670,7 +678,7 @@ pub(crate) fn vacuum_target_build_step(
                         return Ok(crate::IOResult::IO(io));
                     }
                     crate::StepResult::Busy | crate::StepResult::Interrupt => {
-                        return Err(LimboError::Busy);
+                        return Err(LimboError::Busy.into());
                     }
                 }
             }
@@ -736,7 +744,7 @@ pub(crate) fn vacuum_target_build_step(
                     return Ok(crate::IOResult::IO(io));
                 }
                 crate::StepResult::Busy | crate::StepResult::Interrupt => {
-                    return Err(LimboError::Busy);
+                    return Err(LimboError::Busy.into());
                 }
             },
 
@@ -873,7 +881,7 @@ pub(crate) fn vacuum_target_build_step(
                     return Ok(crate::IOResult::IO(io));
                 }
                 crate::StepResult::Busy | crate::StepResult::Interrupt => {
-                    return Err(LimboError::Busy);
+                    return Err(LimboError::Busy.into());
                 }
             },
 
@@ -908,7 +916,7 @@ pub(crate) fn vacuum_target_build_step(
                     return Ok(crate::IOResult::IO(io));
                 }
                 crate::StepResult::Busy | crate::StepResult::Interrupt => {
-                    return Err(LimboError::Busy);
+                    return Err(LimboError::Busy.into());
                 }
             },
 
@@ -958,7 +966,7 @@ pub(crate) fn vacuum_target_build_step(
                     return Ok(crate::IOResult::IO(io));
                 }
                 crate::StepResult::Busy | crate::StepResult::Interrupt => {
-                    return Err(LimboError::Busy);
+                    return Err(LimboError::Busy.into());
                 }
             },
 
@@ -1004,7 +1012,7 @@ pub(crate) fn vacuum_target_build_step(
                     return Ok(crate::IOResult::IO(io));
                 }
                 crate::StepResult::Busy | crate::StepResult::Interrupt => {
-                    return Err(LimboError::Busy);
+                    return Err(LimboError::Busy.into());
                 }
             },
 
@@ -1369,7 +1377,7 @@ impl VacuumInPlaceOpContext {
         }
     }
 
-    pub(crate) fn step(&mut self, connection: &Arc<Connection>) -> Result<IOResult<()>> {
+    pub(crate) fn step(&mut self, connection: &Arc<Connection>) -> IOResultOr<()> {
         vacuum_in_place_step(
             connection,
             self.db,
@@ -1560,13 +1568,13 @@ fn start_temp_batch_reads(
         } else {
             None
         };
-        let c = wal.read_frames_batch(
+        let _c = wal.read_frames_batch(
             *start_frame,
             run_pages,
             temp_pager.buffer_pool.clone(),
             run_scratch,
+            Some(&mut group),
         )?;
-        group.add(&c);
     }
     let combined = group.build();
 
@@ -1703,7 +1711,7 @@ fn vacuum_in_place_step(
     temp_db: &mut Option<Box<VacuumTempDb>>,
     committed_image: &mut Option<VacuumCommittedImageMeta>,
     cleanup_state: &mut VacuumInPlaceCleanupState,
-) -> Result<IOResult<()>> {
+) -> IOResultOr<()> {
     let source_pager = connection.get_pager_from_database_index(&db)?;
 
     loop {
@@ -1713,17 +1721,19 @@ fn vacuum_in_place_step(
                 if !connection.auto_commit.load(Ordering::SeqCst) {
                     return Err(LimboError::TxError(
                         "cannot VACUUM from within a transaction".to_string(),
-                    ));
+                    )
+                    .into());
                 }
                 // 2. No other active root statements on this connection.
                 if connection.n_active_root_statements.load(Ordering::SeqCst) != 1 {
                     return Err(LimboError::TxError(
                         "cannot VACUUM - SQL statements in progress".to_string(),
-                    ));
+                    )
+                    .into());
                 }
                 // 3. Reject readonly database, well you cannot edit a readonly db ^_^
                 if connection.is_readonly(db) {
-                    return Err(LimboError::ReadOnly);
+                    return Err(LimboError::ReadOnly.into());
                 }
                 // 4. Resolve source database mode.
                 let source_db = connection.get_source_database(db);
@@ -1732,7 +1742,8 @@ fn vacuum_in_place_step(
                 if source_db.is_in_memory_db() {
                     return Err(LimboError::InternalError(
                         "cannot VACUUM an in-memory database".to_string(),
-                    ));
+                    )
+                    .into());
                 }
                 reject_unsupported_vacuum_auto_vacuum_mode(source_pager.get_auto_vacuum_mode())?;
                 // 6. Reject non-WAL pagers.
@@ -1754,7 +1765,7 @@ fn vacuum_in_place_step(
                     if mv_store.has_uncheckpointed_log()? {
                         return Err(LimboError::TxError(
                             "cannot VACUUM an MVCC database with uncheckpointed changes; run PRAGMA wal_checkpoint(TRUNCATE) first".to_string(),
-                        ));
+                        ).into());
                     }
                     if connection.get_mv_tx_id_for_db(db).is_some() {
                         turso_assert!(
@@ -1764,7 +1775,7 @@ fn vacuum_in_place_step(
                         return Err(LimboError::InternalError(
                             "VACUUM acquired MVCC gate while this connection has an MVCC transaction"
                                 .to_string(),
-                        ));
+                        ).into());
                     }
                     guard.demote_connection();
                     // After demotion this connection stops reading schema-cookie state from the
@@ -1977,7 +1988,7 @@ fn vacuum_in_place_step(
                     return Ok(IOResult::IO(IOCompletions(completion.clone())));
                 }
                 if !completion.succeeded() {
-                    return Err(vacuum_completion_error(completion, "WAL header init"));
+                    return Err(vacuum_completion_error(completion, "WAL header init").into());
                 }
 
                 if !*fsync_phase {
@@ -2044,7 +2055,7 @@ fn vacuum_in_place_step(
                     return Ok(IOResult::IO(IOCompletions(read_completion.clone())));
                 }
                 if !read_completion.succeeded() {
-                    return Err(vacuum_completion_error(read_completion, "temp batch read"));
+                    return Err(vacuum_completion_error(read_completion, "temp batch read").into());
                 }
 
                 // All pages in this batch are loaded. Prepare WAL frames.
@@ -2052,12 +2063,12 @@ fn vacuum_in_place_step(
                     turso_assert!(
                         page.is_loaded(),
                         "VACUUM read batch page must be loaded before WAL prepare",
-                        { "page_id": page.get().id }
+                        { "page_id": page.get().id() }
                     );
                     turso_assert!(
                         !page.is_locked(),
                         "VACUUM read batch page lock leaked before WAL prepare",
-                        { "page_id": page.get().id }
+                        { "page_id": page.get().id() }
                     );
                 }
                 let all_read = *next_page > *total_pages;
@@ -2080,7 +2091,7 @@ fn vacuum_in_place_step(
                 let wal_file = wal.wal_file()?;
                 let mut batch = IOWriteBatch::new(wal_file);
                 batch.writev(prepared.offset, &prepared.bufs);
-                let completions = batch.submit()?;
+                let completions = batch.submit(None)?;
 
                 *phase = VacuumInPlacePhase::WriteWalBatch {
                     total_pages: *total_pages,
@@ -2123,7 +2134,7 @@ fn vacuum_in_place_step(
                 // Check for write errors.
                 for c in completions.iter() {
                     if !c.succeeded() {
-                        return Err(vacuum_completion_error(c, "WAL write"));
+                        return Err(vacuum_completion_error(c, "WAL write").into());
                     }
                 }
 
@@ -2196,7 +2207,7 @@ fn vacuum_in_place_step(
                     return Ok(IOResult::IO(IOCompletions(sync_completion.clone())));
                 }
                 if !sync_completion.succeeded() {
-                    return Err(vacuum_completion_error(sync_completion, "WAL fsync"));
+                    return Err(vacuum_completion_error(sync_completion, "WAL fsync").into());
                 }
                 *phase = VacuumInPlacePhase::PublishWalCommit;
                 continue;
@@ -2588,7 +2599,7 @@ mod tests {
         assert_eq!(runs.len(), 1);
         assert_eq!(runs[0].0, 42);
         assert_eq!(runs[0].1.len(), 1);
-        assert_eq!(runs[0].1[0].get().id, 1);
+        assert_eq!(runs[0].1[0].get().id(), 1);
     }
 
     #[test]
@@ -2607,12 +2618,12 @@ mod tests {
         assert_eq!(runs[0].0, 10);
         assert_eq!(runs[0].1.len(), 3);
         assert_eq!(
-            runs[0].1.iter().map(|p| p.get().id).collect::<Vec<_>>(),
+            runs[0].1.iter().map(|p| p.get().id()).collect::<Vec<_>>(),
             vec![1, 2, 3]
         );
         assert_eq!(runs[1].0, 14);
         assert_eq!(runs[1].1.len(), 1);
-        assert_eq!(runs[1].1[0].get().id, 4);
+        assert_eq!(runs[1].1[0].get().id(), 4);
     }
 
     #[test]
@@ -2668,7 +2679,7 @@ mod tests {
         assert_eq!(runs.len(), 1);
         assert_eq!(runs[0].0, 10);
         assert_eq!(
-            runs[0].1.iter().map(|p| p.get().id).collect::<Vec<_>>(),
+            runs[0].1.iter().map(|p| p.get().id()).collect::<Vec<_>>(),
             vec![2, 3, 1, 4]
         );
     }
@@ -3173,6 +3184,62 @@ mod tests {
             header,
             (42, CacheSize::new(321), TextEncoding::Utf8, 17, 29)
         );
+
+        Ok(())
+    }
+
+    #[cfg(not(target_family = "wasm"))]
+    #[test]
+    fn vacuum_db_header_meta_schema_cookie_survives_mvcc_target_checkpoint() -> Result<()> {
+        let io: Arc<dyn crate::IO> = Arc::new(crate::io::PlatformIO::new()?);
+        let target_dir = tempfile::tempdir().unwrap();
+        let target_path = target_dir.path().join("target.db");
+        let target_path = target_path.to_str().unwrap();
+        let target_db = Database::open_file_with_flags(
+            io,
+            target_path,
+            OpenFlags::Create,
+            DatabaseOpts::new(),
+            None,
+            Arc::new(SqliteDialect),
+        )?;
+        let target_conn = target_db.connect()?;
+        target_conn.execute("PRAGMA journal_mode = 'mvcc'")?;
+        target_conn.wal_auto_actions_disable();
+
+        target_conn.execute("BEGIN IMMEDIATE")?;
+        target_conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)")?;
+        target_conn.execute("INSERT INTO t VALUES (1, 'x')")?;
+
+        let mut source_header = DatabaseHeader::default();
+        source_header.schema_cookie = 41.into();
+        source_header.user_version = 17.into();
+        source_header.application_id = 29.into();
+        let header_meta = VacuumDbHeaderMeta::from_source_header(&source_header);
+
+        match finalize_vacuum_target_header(&target_conn, &header_meta)? {
+            crate::IOResult::Done(()) => {}
+            crate::IOResult::IO(_) => panic!("MVCC header update should not need async I/O"),
+        }
+        target_conn.execute("COMMIT")?;
+        target_conn.checkpoint(crate::CheckpointMode::Truncate {
+            upper_bound_inclusive: None,
+        })?;
+
+        let pager = target_conn.pager.load();
+        let on_disk = pager.io.block(|| {
+            pager.with_header(|header| {
+                (
+                    header.schema_cookie.get(),
+                    header.user_version.get(),
+                    header.application_id.get(),
+                )
+            })
+        })?;
+        assert_eq!(on_disk, (42, 17, 29));
+
+        let schema_version = target_conn.pragma_query("schema_version")?;
+        assert_eq!(schema_version, vec![vec![crate::Value::from_i64(42)]]);
 
         Ok(())
     }

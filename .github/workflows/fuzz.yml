@@ -95,6 +95,35 @@ jobs:
         RUST_BACKTRACE: 1
       run: RUSTFLAGS="--cfg shuttle" cargo run -p turso_stress --locked -- --nr-threads 3 --nr-iterations 300
 
+  fts-stress-test:
+    name: FTS stress (${{ matrix.mode }})
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - mode: wal
+            tx-mode: sqlite
+          - mode: mvcc
+            tx-mode: concurrent
+    steps:
+    - uses: actions/checkout@v4
+    - uses: dtolnay/rust-toolchain@stable
+    - name: Setup mold linker
+      uses: rui314/setup-mold@v1
+    - uses: Swatinem/rust-cache@v2
+      with:
+        prefix-key: "v1-rust"
+        cache-on-failure: true
+    - name: Run FTS stress test
+      env:
+        RUST_BACKTRACE: 1
+      run: >-
+        cargo run -p turso_stress --locked --
+        --fts --tx-mode ${{ matrix.tx-mode }}
+        --nr-threads 2 --nr-iterations 10000
+
   shuttle-stress-test:
     runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 30
@@ -112,6 +141,11 @@ jobs:
         RUST_BACKTRACE: "full"
         RUSTFLAGS: "--cfg=shuttle"
       run: cargo test -p turso_stress --locked --test shuttle_mvcc
+    - name: Run shuttle mvcc checkpoint tests
+      env:
+        RUST_BACKTRACE: "full"
+        RUSTFLAGS: "--cfg=shuttle"
+      run: cargo test -p turso_stress --locked --test shuttle_mvcc_checkpoint
     - name: Run shuttle stress test
       env:
         RUST_BACKTRACE: 1
@@ -119,8 +153,6 @@ jobs:
       run: cargo run -p turso_stress --locked -- --nr-threads 2 --nr-iterations 1000
 
   libfuzzer-scalar-func:
-    # Allow this job to fail without failing the entire CI run
-    continue-on-error: true
     runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 15
     steps:
@@ -139,5 +171,8 @@ jobs:
         cache-on-failure: true
     - name: Install cargo-fuzz
       run: cargo install cargo-fuzz@0.13.0
+    - name: Build all libFuzzer targets
+      run: cargo +nightly-2025-12-17 fuzz build --dev
     - name: Run scalar_func fuzzer
+      continue-on-error: true
       run: cargo +nightly-2025-12-17 fuzz run scalar_func -- -max_total_time=300

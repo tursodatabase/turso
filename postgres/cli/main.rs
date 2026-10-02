@@ -942,6 +942,10 @@ impl Repl {
             let prompt = self.prompt().to_string();
             match rl.readline(&prompt) {
                 Ok(line) => {
+                    if self.input_buf.trim().is_empty() && is_exit_command(&line) {
+                        break;
+                    }
+
                     self.interrupt_count.store(0, Ordering::Release);
                     self.read_state.process(&line);
                     self.input_buf.push_str(&line);
@@ -985,6 +989,12 @@ impl Repl {
             self.consume(false);
         }
     }
+}
+
+fn is_exit_command(line: &str) -> bool {
+    let line = line.trim_end();
+    let line = line.strip_suffix(';').unwrap_or(line).trim_end();
+    line.eq_ignore_ascii_case("exit") || line.eq_ignore_ascii_case("quit")
 }
 
 // ---------------------------------------------------------------------------
@@ -1044,4 +1054,40 @@ fn main() -> anyhow::Result<()> {
         std::process::exit(1);
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_successful_exit_commands() {
+        for command in [
+            "exit", "quit", "EXIT", "QuIt", "exit;", "quit;", "EXIT;", "exit ;  ", "quit ;  ",
+        ] {
+            assert!(
+                is_exit_command(command),
+                "expected {command:?} to be an exit command"
+            );
+        }
+    }
+
+    #[test]
+    fn test_unsuccessful_exit_commands() {
+        for command in [
+            "",
+            " quit ",
+            "exit;;",
+            "exit now",
+            "quitter",
+            "some_exit",
+            "SELECT 'quit';",
+            "quit;;",
+        ] {
+            assert!(
+                !is_exit_command(command),
+                "expected {command:?} not to be an exit command"
+            );
+        }
+    }
 }

@@ -1,0 +1,15 @@
+[package]
+name = "txn-throughput"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "txn-throughput"
+path = "main.rs"
+
+[dependencies]
+turso = { workspace = true }
+rusqlite = { workspace = true }
+clap = { workspace = true, features = ["derive"] }
+tokio = { workspace = true, default-features = true, features = ["full"] }
+libc = "0.2"

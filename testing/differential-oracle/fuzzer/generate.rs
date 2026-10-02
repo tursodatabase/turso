@@ -16,6 +16,9 @@ pub struct GeneratedStatement {
     pub mutates_data: bool,
     pub has_unordered_limit: bool,
     pub unordered_limit_reason: Option<String>,
+    /// The generator added an outer-column dependency to a subquery, so the
+    /// forced-rewrite and disabled-rewrite plans should return the same result.
+    pub check_unnesting_invariant: bool,
 }
 
 impl std::fmt::Display for GeneratedStatement {
@@ -34,10 +37,9 @@ pub enum GeneratorKind {
     SqlGenProp,
 }
 
-/// A named mix of top-level statement weights. Each profile stresses a
-/// different part of the engine so CI can cover several statement mixes
-/// instead of the single default distribution. Profiles are static, so a
-/// failing run reproduces from its seed once the same profile is selected.
+/// A named workload mix. Each profile stresses a different part of the engine
+/// by changing statement weights and, when needed, SELECT generation. Profiles
+/// are static, so a failing run reproduces from its seed and profile.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, clap::ValueEnum)]
 pub enum WeightProfile {
     /// The general-purpose mix: mostly reads and writes, a little DDL.
@@ -49,6 +51,10 @@ pub enum WeightProfile {
     Triggers,
     /// Heavy insert/update/delete to stress constraint and conflict paths.
     Writes,
+    /// SELECT-heavy workload with every supported correlated subquery rewrite.
+    CorrelatedSubqueries,
+    /// SELECT-heavy workload with one to three inner or left equality joins.
+    Joins,
 }
 
 impl WeightProfile {
@@ -89,6 +95,51 @@ impl WeightProfile {
             WeightProfile::Ddl => base(15, 20, 10, 10, 20, 12, 20, 15, 10, 5, 5, 3),
             WeightProfile::Triggers => base(10, 25, 25, 20, 8, 3, 3, 5, 2, 2, 30, 10),
             WeightProfile::Writes => base(10, 35, 30, 20, 5, 2, 3, 5, 2, 1, 5, 3),
+            WeightProfile::CorrelatedSubqueries => base(80, 8, 8, 4, 2, 1, 1, 1, 1, 1, 1, 1),
+            WeightProfile::Joins => base(80, 8, 8, 4, 2, 1, 1, 2, 1, 1, 1, 1),
+        }
+    }
+
+    fn configure_policy(self, policy: &mut Policy) {
+        if self == WeightProfile::CorrelatedSubqueries {
+            let config = &mut policy.select_config;
+            config.subquery_correlation_probability = 1.0;
+            config.subquery_aggregate_probability = 1.0;
+            config.subquery_group_by_probability = 0.0;
+            config.subquery_order_by_probability = 0.0;
+            config.subquery_distinct_probability = 0.0;
+            config.cte_probability = 0.0;
+            config.compound_probability = 0.0;
+            config.expression_count_range = 1..=2;
+
+            policy.max_expr_depth = 2;
+            policy.max_subquery_depth = 1;
+            policy.max_case_branches = 1;
+            policy.max_in_list_size = 3;
+            policy.max_order_by_items = 2;
+            policy.max_group_by_items = 2;
+            policy.expr_weights.case_expr = 0;
+            policy.expr_weights.subquery = 20;
+            policy.expr_weights.in_subquery = 20;
+            policy.expr_weights.exists = 20;
+            policy.expr_config.in_subquery_negation_probability = 0.0;
+            policy.expr_config.exists_negation_probability = 0.5;
+            policy.literal_config.string_max_len = 20;
+            policy.literal_config.blob_max_size = 16;
+        }
+
+        if self == WeightProfile::Joins {
+            let config = &mut policy.select_config;
+            config.join_config.join_probability = 1.0;
+            config.join_config.max_joins = 3;
+            config.join_config.join_type_weights.inner = 60;
+            config.join_config.join_type_weights.left = 40;
+            config.join_config.join_type_weights.cross = 0;
+            config.join_config.join_type_weights.natural = 0;
+            config.join_config.equi_join_probability = 1.0;
+            config.join_config.self_join_probability = 0.0;
+            config.cte_probability = 0.0;
+            config.compound_probability = 0.0;
         }
     }
 }
@@ -154,9 +205,12 @@ impl SqlGenBackend {
         let mut policy = Policy::default()
             .with_stmt_weights(stmt_weights)
             .with_function_config(
-                sql_gen::FunctionConfig::deterministic().disable(&["LIKELY", "UNLIKELY"]),
+                sql_gen::FunctionConfig::deterministic()
+                    .disable(&["LIKELY", "UNLIKELY"])
+                    .without_order_dependent_aggregates(),
             );
         policy.select_config.require_order_by_with_limit = true;
+        profile.configure_policy(&mut policy);
         policy.select_config.window_function_probability = window_function_probability;
         if window_function_probability > 0.0 {
             policy.select_config.window_frame_policy = WindowFramePolicy::Exclude;
@@ -227,12 +281,14 @@ impl SqlGenerator for SqlGenBackend {
             .unordered_limit_reason()
             .or_else(|| stmt.non_unique_order_by_reason(schema))
             .map(str::to_string);
+        let check_unnesting_invariant = self.ctx.take_generated_correlated_subquery();
         Ok(GeneratedStatement {
             sql,
             is_ddl,
             mutates_data,
             has_unordered_limit,
             unordered_limit_reason,
+            check_unnesting_invariant,
         })
     }
 
@@ -263,6 +319,12 @@ impl PropTestBackend {
             .expression
             .base
             .order_by_allow_integer_positions = false;
+        profile
+            .generation
+            .expression
+            .base
+            .function_profile
+            .allow_order_dependent_aggregates = false;
         if recursive_cte_focus {
             profile = profile.read_only();
             profile.generation.expression = profile.generation.expression.clone().simple();
@@ -327,6 +389,7 @@ impl SqlGenerator for PropTestBackend {
             mutates_data,
             has_unordered_limit,
             unordered_limit_reason: None,
+            check_unnesting_invariant: false,
         })
     }
 }
@@ -417,6 +480,28 @@ mod tests {
     }
 
     #[test]
+    fn aggregates_that_depend_on_input_order_are_disabled() {
+        let sql_gen = SqlGenBackend::new(1);
+        assert!(
+            !sql_gen
+                .policy
+                .function_config
+                .allow_order_dependent_aggregates
+        );
+
+        let prop = PropTestBackend::new([1; 32], false);
+        assert!(
+            !prop
+                .profile
+                .generation
+                .expression
+                .base
+                .function_profile
+                .allow_order_dependent_aggregates
+        );
+    }
+
+    #[test]
     fn disabling_alter_actions_leaves_add_column_enabled() {
         let mut policy = Policy::default();
         disable_alter_actions_that_revalidate_schema(&mut policy);
@@ -467,6 +552,8 @@ mod tests {
             WeightProfile::Ddl,
             WeightProfile::Triggers,
             WeightProfile::Writes,
+            WeightProfile::CorrelatedSubqueries,
+            WeightProfile::Joins,
         ] {
             let w = profile.stmt_weights();
             assert!(w.select > 0, "{profile:?} never selects");
@@ -488,5 +575,13 @@ mod tests {
             triggers.create_trigger > WeightProfile::Balanced.stmt_weights().create_trigger,
             "triggers profile should create triggers more often than balanced"
         );
+
+        let joins = SqlGenBackend::new_with_window_weight(1, 0.0, WeightProfile::Joins);
+        assert_eq!(joins.policy.select_config.join_config.join_probability, 1.0);
+        assert_eq!(
+            joins.policy.select_config.join_config.equi_join_probability,
+            1.0
+        );
+        assert_eq!(joins.policy.select_config.join_config.max_joins, 3);
     }
 }

@@ -1,3 +1,4 @@
+use asserting::prelude::*;
 use std::sync::Arc;
 use turso::IoBackend;
 use turso_core::SqliteDialect;
@@ -66,12 +67,108 @@ fn test_database_rename_registry_stale() {
 
     // 5. The new A.db should be empty — querying table 't' should fail.
     let conn_a2 = db_a2.connect().unwrap();
-    let result = conn_a2.execute("SELECT x FROM t");
-    assert!(
-        result.is_err(),
-        "New database at A.db should not have table 't' — \
-         DATABASE_MANAGER returned stale Database after rename"
-    );
+    // A new database at A.db has no table `t`. Before the fix,
+    // DATABASE_MANAGER returned the stale Database after the rename.
+    assert_that!(conn_a2.execute("SELECT x FROM t")).is_err();
+}
+
+fn open_plain_file(path: &std::path::Path) -> turso_core::Result<Arc<Database>> {
+    let io: Arc<dyn turso_core::IO + Send> = Arc::new(turso_core::PlatformIO::new().unwrap());
+    Database::open_file_with_flags(
+        io,
+        path.to_str().unwrap(),
+        OpenFlags::Create,
+        turso_core::DatabaseOpts::new(),
+        None,
+        Arc::new(SqliteDialect),
+    )
+}
+
+/// SQLite must refuse the file as "file is not a database" (SQLITE_NOTADB).
+/// Opening is lazy in SQLite, so run a query to make it read the header.
+fn assert_sqlite_says_not_a_database(path: &std::path::Path) {
+    let conn = rusqlite::Connection::open(path).unwrap();
+    let err = conn
+        .query_row("SELECT count(*) FROM sqlite_schema", [], |_| Ok(()))
+        .unwrap_err();
+    let rusqlite::Error::SqliteFailure(failure, _) = &err else {
+        panic!("expected SQLITE_NOTADB from sqlite, got {err:?}");
+    };
+    assert_that!(failure.code).is_equal_to(rusqlite::ErrorCode::NotADatabase);
+}
+
+fn assert_turso_says_not_a_database(path: &std::path::Path) {
+    match open_plain_file(path) {
+        Err(turso_core::LimboError::NotADB) => {}
+        Err(other) => panic!("expected NotADB for {}, got {other:?}", path.display()),
+        Ok(_) => panic!(
+            "expected NotADB for {}, got a successful open",
+            path.display()
+        ),
+    }
+}
+
+/// A file whose header is garbage must report NotADB ("file is not a
+/// database"), like SQLite, and not a corruption error derived from a
+/// garbage header field such as the page size. The corrupt8.test cascade
+/// started with a garbage header being reported as "invalid page size",
+/// which the sqlite3 compat layer then surfaced as "out of memory".
+#[test]
+fn test_open_garbage_header_reports_not_a_database() {
+    let tmp_dir = tempfile::TempDir::new().unwrap();
+    let path = tmp_dir.path().join("garbage.db");
+    // 1050 zero bytes: no SQLite magic, page size field reads as 0.
+    std::fs::write(&path, vec![0u8; 1050]).unwrap();
+
+    assert_sqlite_says_not_a_database(&path);
+    assert_turso_says_not_a_database(&path);
+}
+
+/// A non-empty file shorter than the 512-byte header can never be a valid
+/// database. SQLite zero-fills the missing bytes and then rejects the header,
+/// so it reports "file is not a database" whether or not the file starts
+/// with the SQLite magic.
+#[test]
+fn test_open_short_file_reports_not_a_database() {
+    let tmp_dir = tempfile::TempDir::new().unwrap();
+
+    let garbage = tmp_dir.path().join("short-garbage.db");
+    std::fs::write(&garbage, vec![0x42u8; 100]).unwrap();
+    assert_sqlite_says_not_a_database(&garbage);
+    assert_turso_says_not_a_database(&garbage);
+
+    let truncated = tmp_dir.path().join("short-truncated.db");
+    let mut bytes = b"SQLite format 3\0".to_vec();
+    bytes.resize(100, 0);
+    std::fs::write(&truncated, bytes).unwrap();
+    assert_sqlite_says_not_a_database(&truncated);
+    assert_turso_says_not_a_database(&truncated);
+}
+
+/// Turso has no fts5 module. Opening a file that has an fts5 table must fail:
+/// with only part of the schema loaded, writes skip index updates and
+/// corrupt the file.
+#[test]
+fn test_open_refuses_file_with_unknown_virtual_table_module() {
+    let tmp_dir = tempfile::TempDir::new().unwrap();
+    let path = tmp_dir.path().join("fts5.db");
+    let sqlite = rusqlite::Connection::open(&path).unwrap();
+    sqlite
+        .execute_batch(
+            "CREATE TABLE a(x); CREATE INDEX ax ON a(x);
+             CREATE VIRTUAL TABLE f USING fts5(b);
+             CREATE TABLE z(y);",
+        )
+        .unwrap();
+    drop(sqlite);
+
+    match open_plain_file(&path) {
+        Err(turso_core::LimboError::ExtensionError(msg)) => {
+            assert_that!(msg).contains("fts5");
+        }
+        Err(other) => panic!("expected missing fts5 module error, got {other:?}"),
+        Ok(_) => panic!("expected missing fts5 module error, got a successful open"),
+    }
 }
 
 /// Regression test: TursoConnection.close() must finalize outstanding statements
@@ -225,7 +322,7 @@ fn test_open_async_requires_storage() {
     )
     .expect_err("open_async without storage must fail");
     assert!(
-        matches!(err, turso_core::LimboError::InvalidArgument(ref m) if m.contains("storage")),
+        matches!(*err, turso_core::LimboError::InvalidArgument(ref m) if m.contains("storage")),
         "expected InvalidArgument about missing storage, got {err:?}"
     );
 }

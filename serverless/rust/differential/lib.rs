@@ -177,6 +177,21 @@ pub enum Op {
         bad_sql: String,
         recovery_op: Box<Op>,
     },
+    /// Parameterized batch through the batch() API (spec op param_batch).
+    ParamBatch {
+        stmts: Vec<BatchStmt>,
+        /// None runs non-transactionally; "deferred"/"immediate" wrap the
+        /// batch in a transaction.
+        mode: Option<String>,
+    },
+}
+
+/// One statement of a [`Op::ParamBatch`].
+#[derive(Debug, Clone)]
+pub enum BatchStmt {
+    Insert { table: String, values: Vec<Val> },
+    Select { table: String },
+    ErrorSql { sql: String },
 }
 
 #[derive(Debug, Clone)]
@@ -433,7 +448,81 @@ pub fn gen_op(tc: &TestCase, table_cols: &mut HashMap<String, usize>, prefix: u3
         },
         "transaction_workflow" => gen_transaction_workflow(tc, table_cols, prefix),
         "error_in_transaction" => gen_error_in_transaction(tc, table_cols, prefix),
+        "param_batch" => {
+            let count: u8 = tc.draw(gs::integers::<u8>());
+            let count = (count % 4) + 1;
+            let stmts = (0..count)
+                .map(|_| {
+                    let pick: u8 = tc.draw(gs::integers::<u8>());
+                    match pick % 3 {
+                        0 => BatchStmt::Insert {
+                            table: table_name(tc, prefix),
+                            values: vec![gen_value(tc), gen_value(tc)],
+                        },
+                        1 => BatchStmt::Select {
+                            table: table_name(tc, prefix),
+                        },
+                        _ => BatchStmt::ErrorSql {
+                            sql: gen_error_sql(tc, prefix),
+                        },
+                    }
+                })
+                .collect();
+            let mode: u8 = tc.draw(gs::integers::<u8>());
+            let mode = match mode % 3 {
+                0 => None,
+                1 => Some("deferred".to_string()),
+                _ => Some("immediate".to_string()),
+            };
+            Op::ParamBatch { stmts, mode }
+        }
         other => panic!("unknown op id in ops.json: {other}"),
+    }
+}
+
+/// Every op id this harness implements. A spec op outside this list fails
+/// the suite deterministically instead of panicking mid-case.
+const SUPPORTED_OP_IDS: &[&str] = &[
+    "create",
+    "create_dynamic",
+    "insert",
+    "insert_returning",
+    "delete_returning",
+    "update_returning",
+    "select",
+    "select_value",
+    "begin",
+    "commit",
+    "rollback",
+    "invalid",
+    "param",
+    "named_param",
+    "numbered_param",
+    "insert_affected",
+    "delete_affected",
+    "update_affected",
+    "insert_rowid",
+    "batch",
+    "select_limit",
+    "select_count",
+    "select_expr",
+    "error_check",
+    "prepared_reuse",
+    "create_trigger",
+    "transaction_workflow",
+    "error_in_transaction",
+    "param_batch",
+];
+
+/// Panics with an actionable message when ops.json contains an operation
+/// this harness does not implement. Call once at suite start.
+pub fn assert_spec_ops_supported() {
+    for op in spec()["ops"].as_array().unwrap() {
+        let id = op["id"].as_str().unwrap();
+        assert!(
+            SUPPORTED_OP_IDS.contains(&id),
+            "op '{id}' in ops.json has no Rust harness support; implement it in gen_op and the parity executors"
+        );
     }
 }
 

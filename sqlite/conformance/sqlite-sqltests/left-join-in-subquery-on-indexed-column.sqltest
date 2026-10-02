@@ -1,0 +1,78 @@
+@database :memory:
+
+# WHERE u.k IN (SELECT ...) on the right table of a LEFT JOIN must also
+# filter the null-extended rows. With an index on u.k the planner used to
+# drive u's loop from the IN values (InSeek), so a left row with no match
+# still came back null-extended, never checked against the IN term (#8753).
+# The join key is INTEGER on one side and TEXT on the other so the ON term
+# cannot become the seek; only the IN term is a candidate.
+
+setup tables {
+    CREATE TABLE t(id INTEGER PRIMARY KEY);
+    CREATE TABLE u(k TEXT);
+    CREATE TABLE v(k TEXT);
+    INSERT INTO t VALUES (5), (7);
+    INSERT INTO u VALUES ('7');
+    INSERT INTO v VALUES ('7'), ('9');
+    CREATE INDEX ui ON u(k);
+}
+
+@setup tables
+test left-join-in-subquery-filters-the-null-extended-row {
+    SELECT group_concat(t.id) FROM t LEFT JOIN u ON t.id = u.k
+    WHERE u.k IN (SELECT k FROM v);
+}
+expect {
+    7
+}
+
+@setup tables
+test left-join-in-empty-subquery-returns-no-rows {
+    SELECT count(*), count(u.k) FROM t LEFT JOIN u ON t.id = u.k
+    WHERE u.k IN (SELECT k FROM v WHERE k = 'a');
+}
+expect {
+    0|0
+}
+
+@setup tables
+test left-join-in-subquery-as-a-delete-filter-spares-the-unmatched-row {
+    DELETE FROM t WHERE id IN (
+        SELECT t.id FROM t LEFT JOIN u ON t.id = u.k
+        WHERE u.k IN (SELECT k FROM v)
+    );
+    SELECT count(*) FROM t;
+}
+expect {
+    1
+}
+
+@setup tables
+test left-join-in-list-filters-the-null-extended-row {
+    SELECT group_concat(t.id) FROM t LEFT JOIN u ON t.id = u.k
+    WHERE u.k IN ('7', '9');
+}
+expect {
+    7
+}
+
+@setup tables
+test left-join-in-subquery-in-the-on-clause-still-seeks {
+    -- ON-clause terms define what a match is, so this IN term may still
+    -- drive the seek; both left rows come back.
+    SELECT t.id, u.k FROM t LEFT JOIN u ON t.id = u.k AND u.k IN (SELECT k FROM v)
+    ORDER BY t.id;
+}
+expect {
+    5|
+    7|7
+}
+
+@setup tables
+test inner-join-in-subquery-on-indexed-column-unchanged {
+    SELECT group_concat(t.id) FROM t JOIN u ON t.id = u.k
+    WHERE u.k IN (SELECT k FROM v);
+}
+expect {
+    7
+}

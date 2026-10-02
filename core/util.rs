@@ -1,11 +1,12 @@
 use crate::alloc::TursoIteratorExt;
 use crate::numeric::StrToF64;
-use crate::schema::ColDef;
+use crate::schema::{ColDef, FromDefinitionFlags};
 use crate::translate::emitter::TransactionMode;
 use crate::translate::expr::{walk_expr, walk_expr_mut, WalkControl};
 use crate::translate::plan::{BitSet, JoinedTable};
 use crate::translate::planner::parse_row_id;
 use crate::types::IOResult;
+use crate::types::IOResultOr;
 use crate::IO;
 use crate::{
     schema::{Column, Schema, Table, Type},
@@ -80,15 +81,15 @@ macro_rules! ends_with_ignore_ascii_case {
 }
 
 pub trait IOExt {
-    fn block<T>(&self, f: impl FnMut() -> Result<IOResult<T>>) -> Result<T>;
+    fn block<T>(&self, f: impl FnMut() -> IOResultOr<T>) -> Result<T>;
     fn wait<T, F>(&self, f: F) -> impl Future<Output = Result<T>> + Send
     where
-        F: FnMut() -> Result<IOResult<T>> + Send,
+        F: FnMut() -> IOResultOr<T> + Send,
         T: Send;
 }
 
 impl<I: ?Sized + IO> IOExt for I {
-    fn block<T>(&self, mut f: impl FnMut() -> Result<IOResult<T>>) -> Result<T> {
+    fn block<T>(&self, mut f: impl FnMut() -> IOResultOr<T>) -> Result<T> {
         Ok(loop {
             match f()? {
                 IOResult::Done(v) => break v,
@@ -99,7 +100,7 @@ impl<I: ?Sized + IO> IOExt for I {
 
     async fn wait<T, F>(&self, mut f: F) -> Result<T>
     where
-        F: FnMut() -> Result<IOResult<T>> + Send,
+        F: FnMut() -> IOResultOr<T> + Send,
         T: Send,
     {
         Ok(loop {
@@ -257,7 +258,7 @@ pub fn parse_schema_rows(
     syms: &SymbolTable,
     resolve_attached_db: &dyn Fn(&str) -> Option<usize>,
     dialect: &dyn crate::dialect::Dialect,
-) -> Result<IOResult<()>> {
+) -> IOResultOr<()> {
     {
         let inner = state
             .inner
@@ -664,6 +665,8 @@ pub fn count_fts_column_args(expr: &Expr) -> usize {
     }
 }
 
+pub const FTS_FIELD_PARAMETER: i32 = i32::MAX;
+
 /// Match FTS function calls where column arguments can appear in any order.
 ///
 /// FTS functions like `fts_match(col1, col2, 'query')` should match
@@ -710,8 +713,9 @@ pub fn try_capture_parameters_column_agnostic(
         return None;
     }
 
-    // Argument counts must match
-    if pattern_args.len() != query_args.len() {
+    let suffix_len = pattern_args.len().checked_sub(num_column_args)?;
+    let query_column_count = query_args.len().checked_sub(suffix_len)?;
+    if query_column_count == 0 || query_column_count > num_column_args {
         return None;
     }
     // Distinctness must match (we don't support it)
@@ -739,12 +743,10 @@ pub fn try_capture_parameters_column_agnostic(
 
     // Split args into column args (reorderable) and remaining args (positional)
     let pattern_col_args = &pattern_args[..num_column_args];
-    let query_col_args = &query_args[..num_column_args];
+    let query_col_args = &query_args[..query_column_count];
     let pattern_rest = &pattern_args[num_column_args..];
-    let query_rest = &query_args[num_column_args..];
+    let query_rest = &query_args[query_column_count..];
 
-    // For column arguments: check that the same set of columns is used (order-independent)
-    // We use a greedy matching approach: for each query column, find a matching pattern column
     let mut matched_pattern_indices = BitSet::default();
 
     for query_col in query_col_args {
@@ -763,15 +765,21 @@ pub fn try_capture_parameters_column_agnostic(
             return None;
         }
     }
-    // All pattern columns must be matched
-    if matched_pattern_indices.count() != pattern_col_args.len() {
-        return None;
-    }
     // Remaining args must match positionally (includes the query string parameter)
     for (pattern_arg, query_arg) in pattern_rest.iter().zip(query_rest.iter()) {
         let result = try_capture_parameters(pattern_arg, query_arg)?;
         captured.extend(result);
     }
+
+    let fields = (0..num_column_args)
+        .filter(|&i| matched_pattern_indices.get(i))
+        .map(|i| i.to_string())
+        .collect::<Vec<_>>()
+        .join(",");
+    captured.insert(
+        FTS_FIELD_PARAMETER,
+        Expr::Literal(Literal::String(format!("'{fields}'"))),
+    );
 
     Some(captured)
 }
@@ -1015,7 +1023,7 @@ pub fn columns_from_create_table_body(
 
     columns
         .iter()
-        .map(Column::try_from)
+        .map(|column| Column::from_definition(column, FromDefinitionFlags::empty()))
         .collect::<crate::Result<Vec<Column>>>()
 }
 
@@ -1569,12 +1577,13 @@ pub struct ViewColumnSchema {
 
 impl ViewColumnSchema {
     /// Get all columns as a flat vector (without table association info)
-    pub fn flat_columns(&self) -> crate::alloc::Vec<Column> {
-        self.columns
+    #[turso_macros::allocation_site(crate::alloc::SchemaAllocationSite::FlatViewColumns)]
+    pub fn flat_columns(&self) -> Result<crate::alloc::Vec<Column>> {
+        Ok(self
+            .columns
             .iter()
             .map(|vc| vc.column.clone())
-            .try_collect()
-            .expect(crate::alloc::ALLOC_ERR_MSG)
+            .try_collect()?)
     }
 
     /// Get columns that belong to a specific table
@@ -2594,7 +2603,7 @@ mod rename_column_view {
         explicit: &[ast::IndexedColumn],
     ) -> Result<crate::alloc::Vec<Column>> {
         let view_column_schema = extract_view_columns(select, schema)?;
-        let mut columns = view_column_schema.flat_columns();
+        let mut columns = view_column_schema.flat_columns()?;
         for (i, indexed_col) in explicit.iter().enumerate() {
             if let Some(col) = columns.get_mut(i) {
                 col.name = Some(indexed_col.col_name.as_str().to_string());

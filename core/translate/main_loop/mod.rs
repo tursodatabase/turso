@@ -7,9 +7,9 @@ use super::{
         TranslateCtx, UpdateRowSource,
     },
     expr::{
-        expr_references_subquery_id, translate_condition_expr, translate_expr,
-        translate_expr_no_constant_opt, walk_expr, ConditionMetadata, NoConstantOptReason,
-        WalkControl,
+        expr_references_outer_query, expr_references_subquery_id, translate_condition_expr,
+        translate_expr, translate_expr_no_constant_opt, walk_expr, ConditionMetadata,
+        NoConstantOptReason, WalkControl,
     },
     group_by::{group_by_agg_phase, GroupByMetadata, GroupByRowSource},
     optimizer::{constraints::BinaryExprSide, Optimizable},
@@ -37,10 +37,7 @@ use crate::{
     types::SeekOp,
     vdbe::{
         affinity::{self, Affinity},
-        builder::{
-            CursorKey, CursorType, HashBuildSignature, MaterializedBuildInputModeTag,
-            ProgramBuilder,
-        },
+        builder::{CursorKey, CursorType, HashBuildSignature, ProgramBuilder},
         insn::{to_u32, CmpInsFlags, HashBuildData, IdxInsertFlags, Insn},
         BranchOffset, CursorID,
     },

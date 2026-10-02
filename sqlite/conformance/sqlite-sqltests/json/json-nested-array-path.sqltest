@@ -1,0 +1,50 @@
+@database :memory:
+
+# A path with two array locators in a row ($[0][2]) walks into the inner
+# array through the outer array's element. The size update after a change
+# used to resize the inner array's header twice, once as the outer entry's
+# element and once as the inner entry's container, which corrupted the
+# document and, when the double count went past the element's size,
+# panicked while encoding a negative size.
+
+test json-remove-key-inside-nested-array {
+    SELECT json_remove('[[1,2,{"Z":5}]]','$[0][2].Z');
+}
+expect {
+    [[1,2,{}]]
+}
+
+test json-insert-key-inside-nested-array {
+    SELECT json_insert('[[1,2,{}]]','$[0][2].Z',5);
+}
+expect {
+    [[1,2,{"Z":5}]]
+}
+
+test json-remove-then-insert-inside-nested-array {
+    SELECT json_insert(json_remove('[[1,2,{"Z":5}]]','$[0][2].Z'),'$[0][2].Z',5)->>'$[0][2].Z';
+}
+expect {
+    5
+}
+
+test json-remove-element-of-triple-nested-array {
+    SELECT json_remove('[[[1,2,3]]]','$[0][0][1]');
+}
+expect {
+    [[[1,3]]]
+}
+
+test json-set-deep-inside-nested-arrays {
+    SELECT json_set('[[{"a":[1,{"b":2}]}]]','$[0][0].a[1].b',3);
+}
+expect {
+    [[{"a":[1,{"b":3}]}]]
+}
+
+test json-remove-inside-nested-array-with-siblings {
+    SELECT json_remove('[1,[{"eeee":1,"ffff":"bag"}],2]','$[1][0].eeee');
+}
+expect {
+    [1,[{"ffff":"bag"}],2]
+}

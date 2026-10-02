@@ -166,6 +166,9 @@ internal static class TursoInterop
     [DllImport(DllName, EntryPoint = "turso_statement_column_name", CallingConvention = CallingConvention.Cdecl)]
     public static extern IntPtr StatementColumnName(TursoStatementHandle statement, UIntPtr index);
 
+    [DllImport(DllName, EntryPoint = "turso_statement_column_decltype", CallingConvention = CallingConvention.Cdecl)]
+    public static extern IntPtr StatementColumnDeclType(TursoStatementHandle statement, UIntPtr index);
+
     [DllImport(DllName, EntryPoint = "turso_statement_row_value_kind", CallingConvention = CallingConvention.Cdecl)]
     public static extern TursoNativeValueType StatementRowValueKind(TursoStatementHandle statement, UIntPtr index);
 

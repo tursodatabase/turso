@@ -334,6 +334,29 @@ public sealed class TursoManagedSyncTests
     }
 
     [Test]
+    public async Task ClosingAConnectionDoesNotDisposeTheExplicitSyncDatabase()
+    {
+        using var httpClient = new HttpClient(new UnexpectedHttpHandler());
+        await using var database = await TursoSyncDatabase.CreateAsync(
+            new TursoSyncDatabaseOptions(":memory:", new Uri("https://example.test"))
+            {
+                BootstrapIfEmpty = false,
+                HttpClient = httpClient,
+            });
+        await using (var connection = await database.ConnectAsync())
+        {
+            connection.ExecuteNonQuery("CREATE TABLE items(value INTEGER)");
+        }
+
+        var stats = await database.GetStatsAsync();
+        await using var reopened = await database.ConnectAsync();
+
+        stats.Revision.Should().NotBeNull();
+        using var query = new TursoCommand(reopened, "SELECT COUNT(*) FROM items");
+        query.ExecuteScalar().Should().Be(0L);
+    }
+
+    [Test]
     public async Task ConnectionQueuedBeforeDisposeIsRejectedAfterItGetsTheGate()
     {
         using var httpClient = new HttpClient(new UnexpectedHttpHandler());

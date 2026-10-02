@@ -24,8 +24,6 @@
 use criterion::{
     criterion_group, criterion_main, BenchmarkId, Criterion, SamplingMode, Throughput,
 };
-#[cfg(not(feature = "codspeed"))]
-use pprof::criterion::{Output, PProfProfiler};
 use turso_core::SqliteDialect;
 
 #[cfg(feature = "codspeed")]
@@ -176,6 +174,7 @@ fn open_turso() -> TursoDatabase {
     )
     .unwrap();
     let conn = db.connect().unwrap();
+    execute_turso(&db, &conn, "PRAGMA fts_merge_threshold = 0");
     execute_turso(
         &db,
         &conn,
@@ -373,6 +372,11 @@ fn bench_queries(criterion: &mut Criterion) {
     let sqlite = open_sqlite();
     populate_turso(&turso, &batches);
     populate_sqlite(&sqlite, &batches);
+    execute_turso(&turso.db, &turso.conn, "OPTIMIZE INDEX docs_fts");
+    sqlite
+        .conn
+        .execute("INSERT INTO docs_fts(docs_fts) VALUES ('optimize')", [])
+        .unwrap();
     assert_workload_parity(&turso, &sqlite);
 
     let mut group = criterion.benchmark_group("FTS comparison - warm queries");
@@ -409,15 +413,6 @@ fn bench_queries(criterion: &mut Criterion) {
     group.finish();
 }
 
-#[cfg(not(feature = "codspeed"))]
-criterion_group! {
-    name = fts_comparison_benches;
-    config = Criterion::default()
-        .with_profiler(PProfProfiler::new(100, Output::Flamegraph(None)));
-    targets = bench_bulk_ingest, bench_queries
-}
-
-#[cfg(feature = "codspeed")]
 criterion_group! {
     name = fts_comparison_benches;
     config = Criterion::default();

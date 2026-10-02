@@ -34,7 +34,7 @@ use crate::{
         Coro, DatabaseMetadata, DatabasePullRevision, DatabaseRowTransformResult,
         DatabaseSavedConfiguration, DatabaseSyncEngineProtocolVersion, DatabaseTapeOperation,
         DatabaseTapeRowChange, DatabaseTapeRowChangeType, DbChangesStatus, DbChangesStreamKind,
-        PartialSyncOpts, RemotePullProtocol, SyncEngineIoResult, SyncEngineStats,
+        PartialSyncOpts, RemotePullProtocol, Secret, SyncEngineIoResult, SyncEngineStats,
         DATABASE_METADATA_VERSION,
     },
     wal_session::WalSession,
@@ -63,7 +63,7 @@ pub struct DatabaseSyncEngineOpts {
     pub db_opts: turso_core::DatabaseOpts,
     pub partial_sync_opts: Option<PartialSyncOpts>,
     /// Base64-encoded encryption key for the Turso Cloud database
-    pub remote_encryption_key: Option<String>,
+    pub remote_encryption_key: Option<Secret>,
     /// When set, [`push_changes_to_remote`] sends the local change set to the
     /// remote in multiple HTTP batches, sealing the current batch as soon as it
     /// has accumulated >= `push_operations_threshold` operations *and* the
@@ -136,6 +136,19 @@ fn db_size_from_page(page: &[u8]) -> u32 {
 }
 fn is_memory(main_db_path: &str) -> bool {
     main_db_path == ":memory:"
+}
+pub fn sync_database_file_paths(main_db_path: &str) -> Vec<String> {
+    vec![
+        // Core opens the database and its WAL.
+        main_db_path.to_string(),
+        create_main_db_wal_path(main_db_path),
+        // Sync keeps rollback data, metadata, and downloaded changes separately.
+        create_revert_db_wal_path(main_db_path),
+        create_meta_path(main_db_path),
+        create_changes_path(main_db_path),
+        // MVCC may be selected only after the remote protocol is known.
+        create_main_db_log_path(main_db_path),
+    ]
 }
 fn create_main_db_wal_path(main_db_path: &str) -> String {
     format!("{main_db_path}-wal")
@@ -583,7 +596,7 @@ fn resolve_remote_pull_protocol(
 /// instead. Never called for page-mode (legacy) replicas.
 fn ensure_logical_mvcc_pull_supported(
     partial_sync_active: bool,
-    remote_encryption_key: Option<&str>,
+    remote_encryption_key: Option<&Secret>,
 ) -> Result<()> {
     if partial_sync_active {
         return Err(Error::DatabaseSyncEngineError(
@@ -952,7 +965,7 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
                         .to_string(),
                 ));
             }
-            ensure_logical_mvcc_pull_supported(partial, opts.remote_encryption_key.as_deref())?;
+            ensure_logical_mvcc_pull_supported(partial, opts.remote_encryption_key.as_ref())?;
         }
 
         let configuration = DatabaseSavedConfiguration {
@@ -974,7 +987,7 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
                 if meta.remote_pull_protocol == RemotePullProtocol::MvccLogical {
                     ensure_logical_mvcc_pull_supported(
                         partial,
-                        opts.remote_encryption_key.as_deref(),
+                        opts.remote_encryption_key.as_ref(),
                     )?;
                 }
                 if metadata_changed {
@@ -997,7 +1010,7 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
                         coro,
                         &sync_engine_io,
                         opts.remote_url.clone(),
-                        opts.remote_encryption_key.as_deref(),
+                        opts.remote_encryption_key.as_ref(),
                     ),
                     &io,
                     main_db_path,
@@ -1010,7 +1023,7 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
                 if remote_pull_protocol == RemotePullProtocol::MvccLogical {
                     ensure_logical_mvcc_pull_supported(
                         partial,
-                        opts.remote_encryption_key.as_deref(),
+                        opts.remote_encryption_key.as_ref(),
                     )?;
                 }
                 let meta = DatabaseMetadata {
@@ -1118,7 +1131,7 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
         sync_engine_io: SyncEngineIoStats<IO>,
         meta: &DatabaseMetadata,
         main_db_path: &str,
-        remote_encryption_key: Option<&str>,
+        remote_encryption_key: Option<&Secret>,
     ) -> Result<Arc<dyn DatabaseStorage>> {
         let db_file = io.open_file(main_db_path, turso_core::OpenFlags::Create, false)?;
         let db_file: Arc<dyn DatabaseStorage> = if let Some(partial_sync_opts) =
@@ -1136,7 +1149,7 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
                 ));
             };
             tracing::info!("create LazyDatabaseStorage database storage");
-            let encoded_key = remote_encryption_key.map(|k| k.to_string());
+            let encoded_key = remote_encryption_key.cloned();
             Arc::new(LazyDatabaseStorage::new(
                 db_file,
                 None, // todo(sivukhin): allocate dirty file for FS IO
@@ -1285,7 +1298,7 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
             sync_engine_io.clone(),
             &meta,
             main_db_path,
-            opts.remote_encryption_key.as_deref(),
+            opts.remote_encryption_key.as_ref(),
         )?;
 
         // Use async database opening that yields on IO for large schemas
@@ -1425,7 +1438,7 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
             WAL_FRAME_HEADER as u64 + WAL_FRAME_SIZE as u64 * main_wal_frames
         };
         Ok(SyncEngineStats {
-            cdc_operations: count_local_changes(coro, &main_conn, change_id).await?,
+            cdc_operations: count_local_changes(coro, &main_conn, &self.opts, change_id).await?,
             main_wal_size,
             revert_wal_size,
             last_pull_unix_time,
@@ -1693,7 +1706,7 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
             coro,
             &self.sync_engine_io,
             self.meta().remote_url(),
-            self.opts.remote_encryption_key.as_deref(),
+            self.opts.remote_encryption_key.as_ref(),
         );
         let mut stream_kind =
             if self.opts.protocol_version_hint == DatabaseSyncEngineProtocolVersion::Legacy {
@@ -1774,7 +1787,7 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
                 if detected == RemotePullProtocol::MvccLogical {
                     ensure_logical_mvcc_pull_supported(
                         self.opts.partial_sync_opts.is_some(),
-                        self.opts.remote_encryption_key.as_deref(),
+                        self.opts.remote_encryption_key.as_ref(),
                     )?;
                     // Deferred replicas may still be in WAL mode locally; the
                     // MVCC page base must be applied to an MVCC-mode database.
@@ -2069,7 +2082,7 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
                         coro,
                         &self.sync_engine_io,
                         self.meta().remote_url(),
-                        self.opts.remote_encryption_key.as_deref(),
+                        self.opts.remote_encryption_key.as_ref(),
                     );
                     Some(apply_transformation(ctx, &local_changes, &local_replay.generator).await?)
                 } else {
@@ -2153,7 +2166,8 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
             let (_, local_last_change_id) =
                 read_last_change_id(coro, &conn, &self.client_unique_id).await?;
             let pending_local_changes =
-                count_local_changes(coro, &conn, local_last_change_id.unwrap_or(0)).await?;
+                count_local_changes(coro, &conn, &self.opts, local_last_change_id.unwrap_or(0))
+                    .await?;
             if pending_local_changes != 0 {
                 return Err(Error::DatabaseSyncEngineError(format!(
                     "replace-base page apply with pending local CDC changes is not wired yet: {pending_local_changes} local changes need replay"
@@ -2514,7 +2528,7 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
                                 coro,
                                 &self.sync_engine_io,
                                 self.meta().remote_url(),
-                                self.opts.remote_encryption_key.as_deref(),
+                                self.opts.remote_encryption_key.as_ref(),
                             );
                             match pull_updates_v1(ctx, changes_file, revision, None, true).await? {
                                 (next_revision, PullUpdatesV1Result::Logical { txns, ops }, _) => {
@@ -2846,7 +2860,7 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
                         coro,
                         &self.sync_engine_io,
                         self.meta().remote_url(),
-                        self.opts.remote_encryption_key.as_deref(),
+                        self.opts.remote_encryption_key.as_ref(),
                     );
                     Some(apply_transformation(ctx, &transform_changes, &replay.generator).await?)
                 } else {
@@ -3155,7 +3169,7 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
             coro,
             &self.sync_engine_io,
             self.meta().remote_url(),
-            self.opts.remote_encryption_key.as_deref(),
+            self.opts.remote_encryption_key.as_ref(),
         );
         let (pull_gen, replay_floor_change_id, change_id) =
             push_logical_changes(ctx, &self.main_tape, &self.client_unique_id, &self.opts).await?;
@@ -3234,9 +3248,10 @@ mod tests {
         replace_base_backup_path, resolve_local_replay_floor_change_id,
         resolve_remote_pull_protocol, should_replay_raw_pages_on_sql_conn,
         should_request_logical_pull, stream_kind_applies_remote_pages,
-        stream_kind_for_pull_updates_v1_result, synced_change_id_after_remote_apply,
-        use_pushed_change_hint_for_local_replay, DatabaseSyncEngine, DatabaseSyncEngineOpts,
-        ReplaceBaseApplyGuard, REPLACE_BASE_LOCAL_REPLAY_FAILURE_AFTER,
+        stream_kind_for_pull_updates_v1_result, sync_database_file_paths,
+        synced_change_id_after_remote_apply, use_pushed_change_hint_for_local_replay,
+        DatabaseSyncEngine, DatabaseSyncEngineOpts, ReplaceBaseApplyGuard,
+        REPLACE_BASE_LOCAL_REPLAY_FAILURE_AFTER,
     };
     use crate::{
         client_proto::{
@@ -3257,7 +3272,8 @@ mod tests {
         types::{
             Coro, DatabaseMetadata, DatabasePullRevision, DatabaseSavedConfiguration,
             DatabaseSyncEngineProtocolVersion, DbChangesStatus, DbChangesStreamKind,
-            PartialSyncOpts, RemotePullProtocol, SyncEngineIoResult, DATABASE_METADATA_VERSION,
+            PartialSyncOpts, RemotePullProtocol, Secret, SyncEngineIoResult,
+            DATABASE_METADATA_VERSION,
         },
         Result,
     };
@@ -3269,6 +3285,21 @@ mod tests {
     };
     use tempfile::NamedTempFile;
     use turso_core::SqliteDialect;
+
+    #[test]
+    fn sync_database_paths_include_core_sync_and_mvcc_files() {
+        assert_eq!(
+            sync_database_file_paths("replica.sqlite"),
+            vec![
+                "replica.sqlite",
+                "replica.sqlite-wal",
+                "replica.sqlite-wal-revert",
+                "replica.sqlite-info",
+                "replica.sqlite-changes",
+                "replica.db-log",
+            ]
+        );
+    }
 
     #[test]
     fn explicit_override_wins_over_persisted_protocol() {
@@ -3298,7 +3329,7 @@ mod tests {
 
     #[test]
     fn logical_mvcc_pull_with_remote_encryption_is_a_hard_error() {
-        assert!(ensure_logical_mvcc_pull_supported(false, Some("key")).is_err());
+        assert!(ensure_logical_mvcc_pull_supported(false, Some(&Secret::new("key"))).is_err());
     }
 
     #[test]
@@ -3746,6 +3777,16 @@ mod tests {
             pull_bytes_threshold: None,
             logical_mvcc_pull: Some(true),
         }
+    }
+
+    #[test]
+    fn opts_debug_output_hides_the_remote_encryption_key() {
+        let mut opts = default_test_opts();
+        opts.remote_encryption_key = Some(Secret::new("c2VjcmV0LWtleQ=="));
+        let printed = format!("{opts:?}");
+        assert!(!printed.contains("c2VjcmV0LWtleQ=="));
+        assert!(printed.contains("remote_encryption_key: Some(<redacted>)"));
+        assert!(printed.contains("client_name: \"test-client\""));
     }
 
     fn replace_base_guard_test_paths(
@@ -4231,9 +4272,10 @@ mod tests {
                     read_last_change_id(&coro, &conn, &engine.client_unique_id)
                         .await
                         .unwrap();
-                let pending_local_changes = count_local_changes(&coro, &conn, change_id.unwrap())
-                    .await
-                    .unwrap();
+                let pending_local_changes =
+                    count_local_changes(&coro, &conn, &engine.opts, change_id.unwrap())
+                        .await
+                        .unwrap();
                 let meta = engine.meta.lock().unwrap().clone();
                 (rows, meta, pull_gen, change_id, pending_local_changes)
             }
@@ -4431,7 +4473,7 @@ mod tests {
                         .await
                         .unwrap();
                 let pending_local_changes =
-                    count_local_changes(&coro, &conn, synced_change_id.unwrap())
+                    count_local_changes(&coro, &conn, &engine.opts, synced_change_id.unwrap())
                         .await
                         .unwrap();
                 let meta = engine.meta.lock().unwrap().clone();
@@ -5090,6 +5132,180 @@ mod tests {
                 genawaiter::GeneratorState::Yielded(..) => io.step().unwrap(),
                 genawaiter::GeneratorState::Complete(result) => break result.unwrap(),
             }
+        }
+    }
+    /// Bootstraps a replica from a canned page stream, makes one local write,
+    /// then checkpoints twice: the first checkpoint folds the WAL frames and
+    /// truncates the WAL file to zero, the second one runs with an empty WAL.
+    fn bootstrap_and_checkpoint_twice(
+        io: Arc<dyn turso_core::IO>,
+        partial_sync_opts: Option<PartialSyncOpts>,
+        db_name: &str,
+    ) -> Result<()> {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let main_path = temp_dir.path().join(db_name).to_string_lossy().to_string();
+        let remote_path = temp_dir
+            .path()
+            .join("remote.db")
+            .to_string_lossy()
+            .to_string();
+
+        let platform_io: Arc<dyn turso_core::IO> = Arc::new(turso_core::PlatformIO::new().unwrap());
+        let remote_db = turso_core::Database::open_file(
+            platform_io.clone(),
+            &remote_path,
+            Arc::new(SqliteDialect),
+        )
+        .unwrap();
+        let remote_conn = remote_db.connect().unwrap();
+        remote_conn
+            .execute("CREATE TABLE items(id INTEGER PRIMARY KEY, value TEXT)")
+            .unwrap();
+        remote_conn
+            .execute("INSERT INTO items VALUES (1, 'remote-a')")
+            .unwrap();
+        let remote_wal_state = remote_conn.wal_state().unwrap();
+        remote_conn
+            .checkpoint(turso_core::CheckpointMode::Truncate {
+                upper_bound_inclusive: Some(remote_wal_state.max_frame),
+            })
+            .unwrap();
+        drop(remote_conn);
+        drop(remote_db);
+        let remote_bytes = std::fs::read(&remote_path).unwrap();
+        assert!(!remote_bytes.is_empty());
+
+        let bootstrap_response =
+            encoded_page_stream_response(&remote_bytes, "g1:o0", PullUpdatesProtocol::Pages);
+        let sync_io = Arc::new(QueuedSyncEngineIo {
+            responses: Mutex::new(vec![bootstrap_response].into_iter().collect()),
+            requests: Mutex::new(Vec::new()),
+        });
+        let sync_engine_io = SyncEngineIoStats::new(sync_io);
+
+        let mut opts = default_test_opts();
+        opts.remote_url = Some("https://example.com".to_string());
+        opts.bootstrap_if_empty = true;
+        opts.logical_mvcc_pull = Some(false);
+        opts.partial_sync_opts = partial_sync_opts;
+
+        let main_wal_path = create_main_db_wal_path(&main_path);
+        let mut gen = genawaiter::sync::Gen::new({
+            let io = io.clone();
+            move |coro| async move {
+                let coro: Coro<()> = coro.into();
+                let engine = DatabaseSyncEngine::create_db(
+                    &coro,
+                    io.clone(),
+                    sync_engine_io.clone(),
+                    &main_path,
+                    opts,
+                )
+                .await?;
+
+                let conn = engine.connect_rw(&coro).await?;
+                conn.execute("INSERT INTO items VALUES (2, 'local-b')")?;
+                drop(conn);
+
+                assert!(
+                    std::fs::metadata(&main_wal_path).unwrap().len() > 0,
+                    "local write must leave frames in the main WAL"
+                );
+                engine.checkpoint(&coro).await?;
+                assert_eq!(
+                    std::fs::metadata(&main_wal_path).unwrap().len(),
+                    0,
+                    "TRUNCATE checkpoint must leave an empty main WAL file"
+                );
+
+                engine.checkpoint(&coro).await
+            }
+        });
+
+        loop {
+            match gen.resume_with(Ok(())) {
+                genawaiter::GeneratorState::Yielded(..) => io.step().unwrap(),
+                genawaiter::GeneratorState::Complete(result) => break result,
+            }
+        }
+    }
+
+    /// Reported bug: on a partial-sync database `checkpoint()` succeeds while
+    /// the main WAL holds frames, and then fails with
+    /// `I/O error (pread): unexpected end of file` on every checkpoint that
+    /// runs while the WAL is empty. Linux-only, because `SparseLinuxIo` is.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn partial_sync_checkpoint_succeeds_when_main_wal_is_empty() {
+        let io: Arc<dyn turso_core::IO> = Arc::new(crate::sparse_io::SparseLinuxIo::new().unwrap());
+        // A prefix covering the whole remote database leaves no holes, so the
+        // failure does not depend on any page being unmaterialized.
+        let result = bootstrap_and_checkpoint_twice(
+            io,
+            Some(PartialSyncOpts {
+                bootstrap_strategy: Some(crate::types::PartialBootstrapStrategy::Prefix {
+                    length: usize::MAX / 2,
+                }),
+                segment_size: 128 * 1024,
+                prefetch: false,
+            }),
+            "partial.db",
+        );
+        assert!(
+            result.is_ok(),
+            "checkpoint on an empty WAL must not fail: {:?}",
+            result.err()
+        );
+    }
+
+    /// Control for [`partial_sync_checkpoint_succeeds_when_main_wal_is_empty`]:
+    /// the very same sequence over a full-sync replica, which always worked
+    /// because `PlatformIO` reports a short read at end of file.
+    #[test]
+    fn full_sync_checkpoint_succeeds_when_main_wal_is_empty() {
+        let io: Arc<dyn turso_core::IO> = Arc::new(turso_core::PlatformIO::new().unwrap());
+        let result = bootstrap_and_checkpoint_twice(io, None, "full.db");
+        assert!(result.is_ok(), "{:?}", result.err());
+    }
+
+    /// `read_wal_salt` is the first read `checkpoint()` performs, and it is
+    /// written for a WAL file that may be shorter than one header: a short
+    /// read means "no salt". Every IO backend must report that short read
+    /// rather than an error, otherwise partial sync (the only user of
+    /// `SparseLinuxIo`) cannot checkpoint an empty WAL. Linux-only, because
+    /// `SparseLinuxIo` is.
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn read_wal_salt_of_empty_wal_file_is_none_on_every_io() {
+        let temp_dir = tempfile::TempDir::new().unwrap();
+        let wal_path = temp_dir
+            .path()
+            .join("empty.db-wal")
+            .to_string_lossy()
+            .to_string();
+        std::fs::write(&wal_path, []).unwrap();
+
+        let platform_io: Arc<dyn turso_core::IO> = Arc::new(turso_core::PlatformIO::new().unwrap());
+        let sparse_io: Arc<dyn turso_core::IO> =
+            Arc::new(crate::sparse_io::SparseLinuxIo::new().unwrap());
+
+        for (name, io) in [("PlatformIO", platform_io), ("SparseLinuxIo", sparse_io)] {
+            let mut gen = genawaiter::sync::Gen::new({
+                let io = io.clone();
+                let wal_path = wal_path.clone();
+                move |coro| async move {
+                    let coro: Coro<()> = coro.into();
+                    let wal = io.try_open(&wal_path)?.expect("wal file exists");
+                    super::read_wal_salt(&coro, &wal).await
+                }
+            });
+            let result = loop {
+                match gen.resume_with(Ok(())) {
+                    genawaiter::GeneratorState::Yielded(..) => io.step().unwrap(),
+                    genawaiter::GeneratorState::Complete(result) => break result,
+                }
+            };
+            assert!(matches!(result, Ok(None)), "{name}: {result:?}");
         }
     }
 }

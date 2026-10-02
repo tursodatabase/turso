@@ -75,7 +75,6 @@ use crate::{
 ///   ```
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum Affinity {
-    // Affinity = 0 is kept as a special value for custom types
     Blob = 1,
     Text = 2,
     Numeric = 3,

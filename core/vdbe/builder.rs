@@ -256,6 +256,10 @@ pub struct ProgramBuilder {
     /// references in non-recursive CTEs and to prevent fallthrough to schema
     /// resolution for same-named tables/views.
     ctes_being_defined: Vec<String>,
+    /// Stack of views currently being expanded, keyed by `(database_id, name)`
+    /// so a view is distinguished from a same-named view in another attached or
+    /// temp schema. Used to detect self-referential views.
+    views_being_expanded: Vec<(usize, String)>,
     /// If this ProgramBuilder is building trigger subprogram, a ref to the trigger is stored here.
     pub trigger: Option<Arc<Trigger>>,
     pub table_reference_counter: TableRefIdCounter,
@@ -463,12 +467,6 @@ impl ProgramBuilderFlags {
     }
 }
 
-#[derive(Debug, Clone, Copy, Eq, PartialEq)]
-pub enum MaterializedBuildInputModeTag {
-    RowidOnly,
-    Payload,
-}
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 /// Signature of a hash build to allow reuse when inputs are unchanged.
 /// TODO: this is very heavy... we might consider hashing instead of storing full data.
@@ -483,8 +481,6 @@ pub struct HashBuildSignature {
     pub use_bloom_filter: bool,
     /// Rowid input cursor when the build side is materialized.
     pub materialized_input_cursor: Option<CursorID>,
-    /// RowidOnly vs KeyPayload
-    pub materialized_mode: Option<MaterializedBuildInputModeTag>,
 }
 
 /// Information about a materialized CTE, used for sharing data across multiple references.
@@ -736,6 +732,7 @@ impl ProgramBuilder {
             next_cte_id: 0,
             materialized_ctes: HashMap::default(),
             ctes_being_defined: Vec::new(),
+            views_being_expanded: Vec::new(),
             next_subquery_eqp_id: 1,
             target_union_type: None,
         }
@@ -816,15 +813,36 @@ impl ProgramBuilder {
         self.ctes_being_defined.extend(masked);
     }
 
-    /// Temporarily take the CTE-being-defined stack (e.g. during view
-    /// expansion, which should not see CTE context from the caller).
-    pub fn take_ctes_being_defined(&mut self) -> Vec<String> {
-        std::mem::take(&mut self.ctes_being_defined)
-    }
+    /// Expand a view with circular-reference tracking and without the caller's
+    /// CTE context. Restore both stacks even when expansion returns an error.
+    pub fn with_view_expansion<T>(
+        &mut self,
+        database_id: usize,
+        name: &str,
+        expand: impl FnOnce(&mut Self) -> crate::Result<T>,
+    ) -> crate::Result<T> {
+        // check
+        if self
+            .views_being_expanded
+            .iter()
+            .any(|(db, n)| *db == database_id && n == name)
+        {
+            crate::bail_parse_error!("view {} is circularly defined", name);
+        }
 
-    /// Restore the CTE-being-defined stack after a context-isolated expansion.
-    pub fn restore_ctes_being_defined(&mut self, saved: Vec<String>) {
-        self.ctes_being_defined = saved;
+        // push
+        self.views_being_expanded
+            .push((database_id, name.to_owned()));
+        let saved_ctes = std::mem::take(&mut self.ctes_being_defined);
+
+        // expand
+        let result = expand(self);
+
+        // pop
+        self.ctes_being_defined = saved_ctes;
+        self.views_being_expanded.pop();
+
+        result
     }
 
     pub const fn set_resolve_type(&mut self, resolve_type: ResolveType) {
@@ -1674,6 +1692,9 @@ impl ProgramBuilder {
                 } => {
                     resolve(target_pc, "NotNull")?;
                 }
+                Insn::IsType { target_pc, .. } => {
+                    resolve(target_pc, "IsType")?;
+                }
                 Insn::ColumnHasField { target_pc, .. } => {
                     resolve(target_pc, "ColumnHasField")?;
                 }
@@ -1760,7 +1781,14 @@ impl ProgramBuilder {
                 Insn::NotFound { target_pc, .. } => resolve(target_pc, "NotFound")?,
                 Insn::FkIfZero { target_pc, .. } => resolve(target_pc, "FkIfZero")?,
                 Insn::Filter { target_pc, .. } => resolve(target_pc, "Filter")?,
-                Insn::HashProbe { target_pc, .. } => resolve(target_pc, "HashProbe")?,
+                Insn::HashProbe {
+                    target_pc,
+                    deferred_target_pc,
+                    ..
+                } => {
+                    resolve(target_pc, "HashProbe")?;
+                    resolve(deferred_target_pc, "HashProbe")?;
+                }
                 Insn::HashNext { target_pc, .. } => resolve(target_pc, "HashNext")?,
                 Insn::HashDistinct { data } => resolve(&mut data.target_pc, "HashDistinct")?,
                 Insn::HashScanUnmatched { target_pc, .. } => {
@@ -2107,6 +2135,7 @@ impl ProgramBuilder {
             cursor_id,
             pc_if_next: loop_start,
             fullscan: false,
+            is_index: false,
         });
         self.preassign_label_to_next_insn(loop_end);
     }
@@ -2253,6 +2282,26 @@ impl ProgramBuilder {
     ) -> crate::Result<PreparedProgram> {
         self.resolve_labels()?;
 
+        // Fill in the is_index field on Next and Prev, now that we know all cursor types
+        for (insn, _) in self.insns.iter_mut() {
+            if let Insn::Next {
+                cursor_id,
+                is_index,
+                ..
+            }
+            | Insn::Prev {
+                cursor_id,
+                is_index,
+                ..
+            } = insn
+            {
+                *is_index = self
+                    .cursor_ref
+                    .get(*cursor_id)
+                    .is_some_and(|(_, cursor_type)| cursor_type.is_index());
+            }
+        }
+
         self.parameters.list.dedup();
 
         // Mirrors SQLite's: usesStmtJournal = isMultiWrite && mayAbort
@@ -2275,6 +2324,11 @@ impl ProgramBuilder {
             result_columns: self.result_columns,
             table_references: self.table_references,
             sql: sql.to_string(),
+            refreshes_analyze_stats: sql
+                .trim_start()
+                .as_bytes()
+                .get(..7)
+                .is_some_and(|head| head.eq_ignore_ascii_case(b"ANALYZE")),
             needs_stmt_subtransactions: crate::Arc::new(crate::AtomicBool::new(
                 needs_stmt_subtransactions,
             )),

@@ -43,6 +43,15 @@ fn error_causes_rollback(err: &LimboError) -> bool {
     matches!(err, LimboError::WriteWriteConflict)
 }
 
+/// `PRAGMA wal_checkpoint` on a connection that has a transaction open is
+/// rejected with `TableLocked`, the same error SQLite returns ("database table
+/// is locked"). The rejection leaves the transaction open, so the connection
+/// can keep running the rest of the plan. Outside a transaction the same error
+/// is a bug and must fail the simulation.
+fn checkpoint_rejected_by_open_transaction(err: &LimboError, db_in_transaction: bool) -> bool {
+    matches!(err, LimboError::TableLocked) && db_in_transaction
+}
+
 use crate::{
     generation::Shadow as _,
     model::{
@@ -238,48 +247,7 @@ pub fn execute_interaction_turso(
                     .execute_query(conn)
                     .inspect_err(|err| tracing::error!(?err))
             };
-
-            if let Err(err) = &results
-                && !interaction.ignore_error
-            {
-                let continuation = match err {
-                    err if is_recoverable_tx_error(err) => {
-                        if error_causes_rollback(err) && env.conn_in_transaction(connection_index) {
-                            env.rollback_conn(connection_index);
-                        }
-                        ExecutionContinuation::NextInteractionOutsideThisProperty
-                    }
-                    LimboError::Constraint(_) => {
-                        let shadow_result =
-                            interaction.shadow(&mut env.get_conn_tables_mut(connection_index));
-                        if shadow_result.is_ok() {
-                            return Err(LimboError::InternalError(format!(
-                                "Turso rejected with constraint error but shadow would accept: {err:?}"
-                            )));
-                        }
-                        ExecutionContinuation::NextInteraction
-                    }
-                    _ => return Err(err.clone()),
-                };
-                stack.push(results);
-                return Ok(continuation);
-            }
-
-            if results.is_err() {
-                stack.push(results);
-                return Ok(ExecutionContinuation::NextInteraction);
-            }
-
-            stack.push(results);
-            // TODO: skip integrity check with mvcc
-            if !env.profile.mvcc && env.rng.random_ratio(1, 10) {
-                let SimConnection::LimboConnection(conn) = &mut env.connections[connection_index]
-                else {
-                    unreachable!()
-                };
-                limbo_integrity_check(conn)?;
-            }
-            env.update_conn_last_interaction(connection_index, Some(query));
+            return finish_turso_query(env, interaction, query, results, stack);
         }
         InteractionType::FsyncQuery(query) => {
             let conn = {
@@ -289,18 +257,26 @@ pub fn execute_interaction_turso(
                 };
                 conn.clone()
             };
-            let results = interaction
-                .execute_fsync_query(conn, env)
-                .inspect_err(|err| tracing::error!(?err));
-
-            stack.push(results);
+            let outcome = interaction.execute_fsync_query(conn, env);
+            if let Err(err) = &outcome.result {
+                tracing::error!(?err);
+            }
 
             let query_interaction = InteractionBuilder::from_interaction(interaction)
                 .interaction(InteractionType::Query(query.clone()))
                 .build()
                 .unwrap();
 
-            execute_interaction(env, &query_interaction, stack)?;
+            if outcome.power_lost {
+                assert!(
+                    outcome.result.is_err(),
+                    "a query interrupted by power loss must not report success"
+                );
+                stack.push(outcome.result);
+                return execute_interaction(env, &query_interaction, stack);
+            }
+
+            return finish_turso_query(env, &query_interaction, query, outcome.result, stack);
         }
         InteractionType::Assertion(_) => {
             interaction.execute_assertion(stack, env)?;
@@ -344,6 +320,69 @@ pub fn execute_interaction_turso(
             "DB succeeded but shadow detected error: {e}"
         )));
     }
+    Ok(ExecutionContinuation::NextInteraction)
+}
+
+fn finish_turso_query(
+    env: &mut SimulatorEnv,
+    interaction: &Interaction,
+    query: &Query,
+    results: ResultSet,
+    stack: &mut Vec<ResultSet>,
+) -> Result<ExecutionContinuation> {
+    let connection_index = interaction.connection_index;
+    if let Err(err) = &results
+        && !interaction.ignore_error
+    {
+        let continuation = match err {
+            err if is_recoverable_tx_error(err) => {
+                if error_causes_rollback(err) && env.conn_in_transaction(connection_index) {
+                    env.rollback_conn(connection_index);
+                }
+                ExecutionContinuation::NextInteractionOutsideThisProperty
+            }
+            err if checkpoint_rejected_by_open_transaction(
+                err,
+                env.conn_db_in_transaction(connection_index),
+            ) =>
+            {
+                ExecutionContinuation::NextInteraction
+            }
+            LimboError::Constraint(_) => {
+                let shadow_result =
+                    interaction.shadow(&mut env.get_conn_tables_mut(connection_index));
+                if shadow_result.is_ok() {
+                    return Err(LimboError::InternalError(format!(
+                        "Turso rejected with constraint error but shadow would accept: {err:?}"
+                    )));
+                }
+                ExecutionContinuation::NextInteraction
+            }
+            _ => return Err(err.clone()),
+        };
+        stack.push(results);
+        return Ok(continuation);
+    }
+
+    if results.is_err() {
+        stack.push(results);
+        return Ok(ExecutionContinuation::NextInteraction);
+    }
+
+    stack.push(results);
+    // TODO: skip integrity check with mvcc
+    if !env.profile.mvcc && env.rng.random_ratio(1, 10) {
+        let SimConnection::LimboConnection(conn) = &mut env.connections[connection_index] else {
+            unreachable!()
+        };
+        limbo_integrity_check(conn)?;
+    }
+    env.update_conn_last_interaction(connection_index, Some(query));
+    interaction
+        .shadow(&mut env.get_conn_tables_mut(connection_index))
+        .map_err(|err| {
+            LimboError::InternalError(format!("DB succeeded but shadow detected error: {err}"))
+        })?;
     Ok(ExecutionContinuation::NextInteraction)
 }
 
@@ -522,5 +561,80 @@ fn execute_query_rusqlite(
             connection.execute(query.to_string().as_str(), ())?;
             Ok(vec![])
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::Savepoint;
+    use crate::profiles::Profile;
+    use crate::runner::cli::SimulatorCLI;
+    use crate::runner::env::{Paths, SimulationType};
+    use clap::Parser as _;
+    use sql_generation::model::query::pragma::{CheckpointMode, Pragma};
+    use std::num::NonZeroUsize;
+    use turso_core::{Database, IO, MemoryIO, SqliteDialect};
+
+    fn memory_connection() -> Arc<Connection> {
+        let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+        let db = Database::open_file(io, ":memory:", Arc::new(SqliteDialect)).unwrap();
+        db.connect().unwrap()
+    }
+
+    fn query_interaction(query: Query) -> Interaction {
+        InteractionBuilder::with_interaction(InteractionType::Query(query))
+            .connection_index(0)
+            .id(NonZeroUsize::new(1).unwrap())
+            .build()
+            .unwrap()
+    }
+
+    #[test]
+    fn checkpoint_inside_savepoint_is_rejected_and_leaves_the_transaction_open() {
+        let conn = memory_connection();
+        conn.execute("CREATE TABLE t(a)").unwrap();
+        conn.execute("SAVEPOINT sp").unwrap();
+        conn.execute("INSERT INTO t VALUES (1)").unwrap();
+
+        let err = conn
+            .execute("PRAGMA wal_checkpoint(PASSIVE)")
+            .expect_err("checkpoint must be rejected while the savepoint is open");
+
+        assert!(matches!(err, LimboError::TableLocked), "{err:?}");
+        assert!(!conn.get_auto_commit());
+
+        conn.execute("INSERT INTO t VALUES (2)").unwrap();
+        conn.execute("RELEASE sp").unwrap();
+    }
+
+    #[test]
+    fn simulation_survives_checkpoint_rejected_by_open_transaction() {
+        let output_dir = tempfile::tempdir().unwrap();
+        let mut env = SimulatorEnv::new(
+            0xB0BA,
+            &SimulatorCLI::parse_from(["limbo_sim", "--io-backend=memory"]),
+            Paths::new(output_dir.path()),
+            SimulationType::Default,
+            &Profile::default(),
+        );
+        env.connect(0);
+
+        let mut stack = Vec::new();
+        let savepoint = query_interaction(Query::Savepoint(Savepoint {
+            name: "sp".to_string(),
+        }));
+        execute_interaction(&mut env, &savepoint, &mut stack).unwrap();
+        assert!(env.conn_db_in_transaction(0));
+
+        let checkpoint = query_interaction(Query::Pragma(Pragma::WalCheckpoint {
+            database: None,
+            mode: CheckpointMode::Passive,
+        }));
+        let continuation = execute_interaction(&mut env, &checkpoint, &mut stack)
+            .expect("a checkpoint rejected by an open transaction is not a simulation failure");
+
+        assert_eq!(continuation, ExecutionContinuation::NextInteraction);
+        assert!(env.conn_db_in_transaction(0));
     }
 }

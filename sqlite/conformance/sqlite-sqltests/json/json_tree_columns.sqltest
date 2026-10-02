@@ -1,0 +1,72 @@
+@database :memory:
+
+# json_tree and json_each expose rowid like any virtual table, so a query
+# can select or join on rt.rowid. The value itself is the engine's own
+# row counter, so only its presence and type are checked here.
+
+test json-tree-rowid-is-selectable {
+    SELECT count(*) FROM (SELECT rt.rowid AS n FROM json_tree('{"a":[1,2]}') AS rt WHERE rt.type NOT IN ('object','array'));
+}
+expect {
+    2
+}
+
+test json-tree-rowid-unqualified {
+    SELECT typeof(rowid) FROM json_tree('[5]') WHERE type='integer';
+}
+expect {
+    integer
+}
+
+test json-tree-rowid-into-table {
+    CREATE TABLE kv(n, key, val);
+    INSERT INTO kv SELECT rt.rowid, rt.fullkey, rt.atom FROM json_tree('{"a":[1,2]}') AS rt WHERE rt.type NOT IN ('object','array');
+    SELECT key, val FROM kv ORDER BY key;
+}
+expect {
+    $.a[0]|1
+    $.a[1]|2
+}
+
+# fullkey quotes an object key unless it starts with an ASCII letter and
+# continues with ASCII letters and digits only, as SQLite does; the empty
+# key is quoted too.
+
+test json-tree-fullkey-quotes-keys-like-sqlite {
+    SELECT fullkey FROM json_tree('{"a":{"":1,"$g":2,"_h":3,"a b":4,"x1":5,"é":6}}') WHERE atom IS NOT NULL;
+}
+expect {
+    $.a.""
+    $.a."$g"
+    $.a."_h"
+    $.a."a b"
+    $.a.x1
+    $.a."é"
+}
+
+test json-tree-fullkey-roundtrips-through-extract {
+    SELECT count(*) FROM json_tree('{"":{"a b":[1,{"$":2}]},"_":3}') AS rt WHERE rt.type NOT IN ('object','array') AND rt.atom IS NOT (json('{"":{"a b":[1,{"$":2}]},"_":3}') ->> rt.fullkey);
+}
+expect {
+    0
+}
+
+# atom is the decoded string, as ->> returns it, not the JSON text with
+# its escapes.
+
+test json-tree-atom-is-decoded-text {
+    SELECT atom, length(atom) FROM json_tree('["a\"b","é","x\ty","\\\\"]') WHERE type='text';
+}
+expect {
+    a"b|3
+    é|1
+    x	y|3
+    \|1
+}
+
+test json-tree-atom-matches-extract {
+    SELECT count(*) FROM json_tree('{"a":"oat\r\n","b":["\fpan\b","gem\"hay","y㑘z"]}') AS rt WHERE rt.type='text' AND rt.atom IS NOT (json('{"a":"oat\r\n","b":["\fpan\b","gem\"hay","y㑘z"]}') ->> rt.fullkey);
+}
+expect {
+    0
+}

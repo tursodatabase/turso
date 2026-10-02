@@ -53,6 +53,11 @@ This project depends on pastey, distributed by the pastey authors:
 * License: licenses/core/pastey-mit-license.md (MIT License)
 * Homepage: https://github.com/AS1100K/pastey
 
+This project depends on tantivy-common, distributed by the Tantivy project authors:
+
+* License: licenses/core/tantivy-common-mit-license.md (MIT License)
+* Homepage: https://github.com/quickwit-oss/tantivy
+
 This project depends on windows-sys, distributed by the Microsoft:
 
 * License: licenses/core/windows-apache.license.md (Apache License v2.0)
@@ -63,3 +68,13 @@ This project depends on SQLAlchemy, distributed by the SQLAlchemy authors:
 
 * License: licenses/bindings/python/sqlalchemy-mit-license.md (MIT License)
 * Homepage: https://github.com/sqlalchemy/sqlalchemy
+
+The FTS benchmark depends on pprof, distributed by the TiKV project:
+
+* License: licenses/perf/pprof-apache-license.md (Apache License v2.0)
+* Homepage: https://github.com/tikv/pprof-rs
+
+The FTS profiler depends on spin, distributed by the spin-rs authors:
+
+* License: licenses/perf/spin-mit-license.md (MIT License)
+* Homepage: https://github.com/mvdnes/spin-rs

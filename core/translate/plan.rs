@@ -58,7 +58,7 @@ fn infer_type_from_expr(expr: &ast::Expr, tables: Option<&TableReferences>) -> A
 /// (TEXT affinity + a numeric arm, or numeric affinity + a text arm), in which
 /// case it is downgraded to BLOB (none) so the column is compared by storage
 /// class.
-fn compound_column_affinity(arms: &[&SelectPlan], i: usize) -> Affinity {
+pub(super) fn compound_column_affinity(arms: &[&SelectPlan], i: usize) -> Affinity {
     if arms.is_empty() {
         return Affinity::None;
     }
@@ -1204,6 +1204,23 @@ pub struct JoinedTable {
     pub database_id: usize,
     /// INDEXED BY / NOT INDEXED hint from the SQL statement.
     pub indexed: Option<ast::Indexed>,
+    /// Cost and row estimates for the selected table access.
+    pub plan_estimate: Option<TablePlanEstimate>,
+}
+
+/// Cost and row estimates for one table in a selected join plan.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct TablePlanEstimate {
+    /// Rows from the join prefix before this table access.
+    pub input_rows: f64,
+    /// Rows that this access returns for each input row.
+    pub rows_per_input: f64,
+    /// Rows from the join prefix after this table access.
+    pub output_rows: f64,
+    /// Cost of this table access for all input rows.
+    pub access_cost: f64,
+    /// Cost of the join prefix through this table access.
+    pub total_cost: f64,
 }
 
 impl JoinedTable {
@@ -1273,6 +1290,11 @@ impl OuterQueryReference {
     /// Returns the columns of the table that this outer query reference refers to.
     pub fn columns(&self) -> &[Column] {
         self.table.columns()
+    }
+
+    pub fn is_cte_name_in_scope(&self) -> bool {
+        (self.cte_id.is_some() || matches!(self.table, Table::RecursiveCteInput(_)))
+            && self.identifier == self.table.get_name()
     }
 
     /// Marks a column as used; used means that the column is referenced in the query.
@@ -1552,6 +1574,15 @@ impl TableReferences {
         self.outer_query_refs
             .iter()
             .find(|t| t.identifier == identifier)
+    }
+
+    pub fn find_cte_outer_query_ref_by_identifier(
+        &self,
+        identifier: &str,
+    ) -> Option<&OuterQueryReference> {
+        self.outer_query_refs
+            .iter()
+            .find(|t| t.identifier == identifier && t.is_cte_name_in_scope())
     }
 
     /// Marks the pre-planned [OuterQueryReference] with the given identifier as
@@ -2213,8 +2244,16 @@ pub enum HashJoinType {
     Inner,
     /// All build rows appear; unmatched build rows get NULLs for the probe side.
     LeftOuter,
+    /// Only unmatched build rows appear.
+    LeftAnti,
     /// Like LeftOuter, plus unmatched probe rows get NULLs for the build side.
     FullOuter,
+}
+
+impl HashJoinType {
+    pub fn keeps_unmatched_build_rows(self) -> bool {
+        matches!(self, Self::LeftOuter | Self::LeftAnti | Self::FullOuter)
+    }
 }
 
 /// Hash join operation metadata
@@ -2229,11 +2268,11 @@ pub struct HashJoinOp {
     pub join_keys: Vec<HashJoinKey>,
     /// Memory budget for hash table
     pub mem_budget: usize,
-    /// Whether the build input should be materialized as a rowid list before hash build.
+    /// Whether to store a filtered build input before building the hash table.
     pub materialize_build_input: bool,
     /// Whether to use a bloom filter on the probe side.
     pub use_bloom_filter: bool,
-    /// Join semantics (inner, left outer, or full outer).
+    /// Join semantics.
     pub join_type: HashJoinType,
 }
 
@@ -2558,6 +2597,7 @@ impl JoinedTable {
             expression_index_usages: Vec::new(),
             database_id: MAIN_DB_ID,
             indexed: None,
+            plan_estimate: None,
         })
     }
 
@@ -2604,6 +2644,7 @@ impl JoinedTable {
             expression_index_usages: Vec::new(),
             database_id: MAIN_DB_ID,
             indexed: None,
+            plan_estimate: None,
         })
     }
 
@@ -2636,6 +2677,7 @@ impl JoinedTable {
             expression_index_usages: Vec::new(),
             database_id: MAIN_DB_ID,
             indexed: None,
+            plan_estimate: None,
         })
     }
 
@@ -2903,20 +2945,12 @@ impl JoinedTable {
                 // rowid is always implicitly covered by the index
                 continue;
             }
-            let covered_by_index = index
-                .columns
-                .iter()
-                .filter(|c| c.pos_in_table == required_col)
-                .any(|c| {
-                    // SQLite doesn't consider fulfill covering indexes with virtual columns,
-                    // see `recomputeColumnsNotIndexed` in `build.c`. We might be able to improve this
-                    // in the future, but for now we do this to ensure correctness.
-                    !btree
-                        .columns()
-                        .get(c.pos_in_table)
-                        .expect("column should be in table")
-                        .is_virtual_generated()
-                });
+            let covered_by_index = index.column_table_pos_to_index_pos(required_col).is_some()
+                && !btree
+                    .columns()
+                    .get(required_col)
+                    .expect("column should be in table")
+                    .is_virtual_generated();
             if !covered_by_index {
                 return false;
             }
@@ -2931,6 +2965,19 @@ impl JoinedTable {
             return false;
         };
         self.index_is_covering(index.as_ref())
+    }
+
+    pub fn selected_index_stores_used_columns(&self) -> bool {
+        let (Some(index), Table::BTree(btree)) = (self.op.index(), &self.table) else {
+            return false;
+        };
+        if index.index_method.is_some() {
+            return false;
+        }
+        if self.col_used_mask.is_empty() {
+            return index.where_clause.is_none();
+        }
+        Self::index_covers_columns(index.as_ref(), btree, &self.col_used_mask)
     }
 
     pub fn column_is_used(&self, index: usize) -> bool {
@@ -3638,6 +3685,8 @@ pub struct NonFromClauseSubquery {
     pub correlated: bool,
     pub origin: SubqueryOrigin,
     pub eval_phase: SubqueryEvalPhase,
+    /// Run after this table when a later loop needs fewer calls.
+    pub preferred_eval_after_table: Option<TableInternalId>,
 }
 
 impl NonFromClauseSubquery {
@@ -3665,6 +3714,7 @@ impl NonFromClauseSubquery {
     /// If the subquery references tables from the parent query, it is evaluated at
     /// the right-most loop that makes those tables available. For hash joins, this
     /// may map a build-table reference to the probe loop where its rows are produced.
+    /// The optimizer can choose a later loop when that loop needs fewer calls.
     pub fn get_eval_at(
         &self,
         join_order: &[JoinOrderMember],
@@ -3676,7 +3726,13 @@ impl NonFromClauseSubquery {
                 return Ok(*evaluated_at);
             }
         };
-        eval_at_for_plan(plan, join_order, table_references)
+        let required_eval_at = eval_at_for_plan(plan, join_order, table_references)?;
+        let preferred_eval_at = self
+            .preferred_eval_after_table
+            .and_then(|table_id| resolve_outer_ref_loop(table_id, join_order, table_references))
+            .map(EvalAt::Loop)
+            .unwrap_or(EvalAt::BeforeLoop);
+        Ok(required_eval_at.max(preferred_eval_at))
     }
 
     /// Consumes the plan and returns it, and sets the subquery to the evaluated state.

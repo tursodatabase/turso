@@ -12,7 +12,7 @@ Usage:
     conn.close()
 """
 
-from .connection import Connection, Cursor, connect
+from .connection import BatchResult, Connection, Cursor, connect
 from .dbapi import (
     # Exception classes
     DatabaseError,
@@ -36,6 +36,7 @@ paramstyle = "qmark"
 
 __all__ = [
     "connect",
+    "BatchResult",
     "Connection",
     "Cursor",
     "Row",

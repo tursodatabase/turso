@@ -39,6 +39,10 @@ jobs:
       - name: Install Rust(stable)
         uses: dtolnay/rust-toolchain@stable
 
+      - name: Setup MSVC
+        if: runner.os == 'Windows'
+        uses: "./.github/shared/setup-msvc"
+
       - name: Setup mold linker
         if: runner.os == 'Linux'
         uses: rui314/setup-mold@v1
@@ -51,9 +55,10 @@ jobs:
 
       - name: Install SQLite
         if: runner.os == 'Windows'
+        shell: pwsh
         run: |
           echo "VCPKG_ROOT=$env:VCPKG_INSTALLATION_ROOT" >> $env:GITHUB_ENV
-          vcpkg install sqlite3:x64-windows-static-md
+          & "$env:VCPKG_INSTALLATION_ROOT\vcpkg.exe" install sqlite3:x64-windows-static-md
 
       - name: Build Turso C bindings
         run: cargo build -p turso_sqlite3 --features capi --locked

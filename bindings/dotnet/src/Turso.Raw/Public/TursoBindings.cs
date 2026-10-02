@@ -242,6 +242,25 @@ public static class TursoBindings
         }
     }
 
+    public static string GetDeclaredTypeName(TursoStatementHandle statement, int ordinal)
+    {
+        statement.ThrowIfInvalid();
+        ArgumentOutOfRangeException.ThrowIfNegative(ordinal);
+
+        var declaredType = TursoInterop.StatementColumnDeclType(statement, ToNativeIndex(ordinal));
+        if (declaredType == IntPtr.Zero)
+            return "";
+
+        try
+        {
+            return Marshal.PtrToStringUTF8(declaredType) ?? "";
+        }
+        finally
+        {
+            TursoInterop.FreeString(declaredType);
+        }
+    }
+
     public static int GetFieldCount(TursoStatementHandle statement)
     {
         statement.ThrowIfInvalid();

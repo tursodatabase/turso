@@ -30,10 +30,6 @@ use turso_parser::ast::ResultColumn;
 use turso_parser::ast::SortOrder;
 use turso_parser::ast::{self, CompoundSelect, Expr};
 
-/// Maximum number of columns in a result set.
-/// SQLite's default SQLITE_MAX_COLUMN is 2000, with a hard upper limit of 32767.
-const SQLITE_MAX_COLUMN: usize = 2000;
-
 #[turso_macros::trace_stack]
 pub fn translate_select(
     select: ast::Select,
@@ -618,7 +614,7 @@ fn prepare_one_select_plan(
                 }
             }
 
-            if plan.result_columns.len() > SQLITE_MAX_COLUMN {
+            if plan.result_columns.len() > crate::types::MAX_COLUMN {
                 crate::bail_parse_error!("too many columns in result set");
             }
 
@@ -866,7 +862,7 @@ fn prepare_one_select_plan(
                 crate::bail_parse_error!("LIMIT clause is not allowed with VALUES clause");
             }
             let len = values[0].len();
-            if len > SQLITE_MAX_COLUMN {
+            if len > crate::types::MAX_COLUMN {
                 crate::bail_parse_error!("too many columns in result set");
             }
             let mut result_columns = Vec::with_capacity(len);

@@ -31,6 +31,7 @@ pub struct Context {
     table_scope: Vec<Vec<ScopedTable>>,
     /// Counter for generating unique table aliases (t0, t1, t2, ...).
     alias_counter: usize,
+    generated_correlated_subquery: bool,
 }
 
 impl Context {
@@ -49,6 +50,7 @@ impl Context {
             subquery_depth: 0,
             table_scope: Vec::new(),
             alias_counter: 0,
+            generated_correlated_subquery: false,
         }
     }
 
@@ -226,6 +228,14 @@ impl Context {
         } else {
             None
         }
+    }
+
+    pub fn record_correlated_subquery(&mut self) {
+        self.generated_correlated_subquery = true;
+    }
+
+    pub fn take_generated_correlated_subquery(&mut self) -> bool {
+        std::mem::take(&mut self.generated_correlated_subquery)
     }
 
     /// Get a reference to the coverage data.

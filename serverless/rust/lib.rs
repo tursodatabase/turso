@@ -23,9 +23,29 @@
 //! # Ok(())
 //! # }
 //! ```
+//!
+//! # Batches
+//!
+//! Multiple parameterized statements can be sent in a single HTTP request
+//! with [`Connection::batch`], or atomically with
+//! [`Connection::transactional_batch`]:
+//!
+//! ```rust,no_run
+//! # async fn run(conn: turso_serverless::Connection) -> turso_serverless::Result<()> {
+//! let results = conn
+//!     .batch([
+//!         ("INSERT INTO users (name) VALUES (?1)", ("Alice",)),
+//!         ("INSERT INTO users (name) VALUES (?1)", ("Bob",)),
+//!     ])
+//!     .await?;
+//! assert_eq!(results.len(), 2);
+//! # Ok(())
+//! # }
+//! ```
 
 use std::{future::Future, pin::Pin, sync::Arc};
 
+pub mod batch;
 mod column;
 pub mod connection;
 mod error;
@@ -37,6 +57,7 @@ mod statement;
 pub mod transaction;
 pub mod value;
 
+pub use batch::{BatchResult, BatchStatement, IntoBatchStatement};
 pub use column::Column;
 pub use connection::Connection;
 pub use error::{BoxError, Error, Result};

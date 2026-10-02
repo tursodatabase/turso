@@ -1,0 +1,116 @@
+@database :memory:
+
+setup schema {
+    CREATE TABLE t(a INT);
+    CREATE TABLE u(a INT);
+    INSERT INTO t VALUES(1),(2),(3);
+    INSERT INTO u VALUES(2);
+}
+
+@setup schema
+@cross-check-integrity
+test delete-target-alias-does-not-shadow-table-in-subquery {
+    DELETE FROM t AS u WHERE a IN (SELECT a FROM u);
+    SELECT a FROM t ORDER BY a;
+}
+expect {
+    1
+    3
+}
+
+@setup schema
+test select-outer-alias-does-not-shadow-table-in-subquery {
+    SELECT (SELECT sum(a) FROM u) FROM t AS u ORDER BY 1 LIMIT 1;
+}
+expect {
+    2
+}
+
+@setup schema
+test unshadowed-subquery-from-name-still-reads-the-table {
+    SELECT (SELECT sum(a) FROM u) FROM u AS x;
+}
+expect {
+    2
+}
+
+setup update_schema {
+    CREATE TABLE w(a INT);
+    INSERT INTO w VALUES(5),(6);
+}
+
+@setup update_schema
+@cross-check-integrity
+test update-target-does-not-shadow-cte-in-subquery {
+    WITH w(a) AS (SELECT 9) UPDATE w SET a = (SELECT a FROM w);
+    SELECT a FROM w ORDER BY a;
+}
+expect {
+    9
+    9
+}
+
+@setup schema
+test cte-alias-does-not-shadow-table-in-subquery {
+    WITH q AS (SELECT 1 AS a) SELECT (SELECT sum(a) FROM u) FROM q AS u;
+}
+expect {
+    2
+}
+
+@setup schema
+test from-subquery-alias-does-not-shadow-table-in-subquery {
+    SELECT (SELECT sum(a) FROM u) FROM (SELECT 1 AS a) AS u;
+}
+expect {
+    2
+}
+
+@setup schema
+test outer-alias-naming-no-table-is-not-resolvable-in-subquery {
+    SELECT (SELECT count(*) FROM y) FROM t AS y;
+}
+expect error {
+    no such table: y
+}
+
+@setup schema
+test from-subquery-alias-naming-no-table-is-not-resolvable-in-subquery {
+    SELECT (SELECT count(*) FROM x) FROM (SELECT 1 AS a) AS x;
+}
+expect error {
+    no such table: x
+}
+
+@setup schema
+test cte-name-is-still-resolvable-in-a-subquery-from-clause {
+    WITH q AS (SELECT 42 AS a) SELECT (SELECT sum(a) FROM q) FROM q;
+}
+expect {
+    42
+}
+
+@setup schema
+test cte-name-is-resolvable-in-a-subquery-when-its-use-is-aliased {
+    WITH q AS (SELECT 42 AS a) SELECT (SELECT sum(a) FROM q) FROM q AS z;
+}
+expect {
+    42
+}
+
+@setup schema
+test recursive-cte-alias-does-not-shadow-table-in-subquery {
+    WITH RECURSIVE seq(x) AS (
+        VALUES(1)
+        UNION ALL
+        SELECT u.x + (SELECT sum(a) FROM u)
+        FROM seq AS u
+        WHERE u.x < 5
+    )
+    SELECT x FROM seq ORDER BY x;
+}
+expect {
+    1
+    3
+    5
+}

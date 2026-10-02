@@ -20,3 +20,68 @@ test avg-large-float-infinity {
 expect {
     Inf
 }
+
+test float-sum-and-avg-compensate-rounding-error {
+    WITH t(x) AS (VALUES(0.1),(0.1),(0.1),(0.1),(0.1),(0.1),(0.1),(0.1),(0.1),(0.1))
+    SELECT sum(x) = 1.0, total(x) = 1.0, avg(x) = 0.1 FROM t;
+}
+expect {
+    1|1|1
+}
+
+test float-sum-after-integer-overflow {
+    WITH t(x) AS (VALUES(9223372036854775807),(1),(0.5),(0.25))
+    SELECT typeof(sum(x)), sum(x), total(x) FROM t;
+}
+expect {
+    real|9.22337203685478e+18|9.22337203685478e+18
+}
+expect @js {
+    real|9223372036854776000|9223372036854776000
+}
+
+test float-avg-then-large-integer {
+    WITH t(x) AS (VALUES(0.5),(9007199254740993),(1.5))
+    SELECT avg(x), sum(x) FROM t;
+}
+expect {
+    3.00239975158033e+15|9.007199254741e+15
+}
+expect @js {
+    3002399751580332|9007199254740996
+}
+
+test float-sum-reaches-infinity-then-finite-value {
+    WITH t(x) AS (VALUES(1e308),(1e308),(-1e308),(0.5))
+    SELECT sum(x), avg(x) FROM t;
+}
+expect {
+    Inf|Inf
+}
+
+test count-mixed-value-types {
+    WITH t(x) AS (VALUES(1),('a'),(NULL),(2.5),(x'00'),(3))
+    SELECT count(x), count(*) FROM t;
+}
+expect {
+    5|6
+}
+
+test float-sum-then-integers {
+    WITH t(x) AS (VALUES(0.5),(1),(-3),(4503599627370495),(4503599627370496),(9007199254740993),(-9223372036854775808),(2))
+    SELECT typeof(sum(x)), sum(x), total(x), avg(x) FROM t;
+}
+expect {
+    real|-9.20535763834529e+18|-9.20535763834529e+18|-1.15066970479316e+18
+}
+expect @js {
+    real|-9205357638345294000|-9205357638345294000|-1150669704793161700
+}
+
+test total-over-integers {
+    WITH t(x) AS (VALUES(9007199254740991),(1),(1),(-2),(4503599627370495))
+    SELECT printf('%.17g', total(x)), printf('%.17g', avg(x)) FROM t;
+}
+expect {
+    13510798882111490|2702159776422297
+}

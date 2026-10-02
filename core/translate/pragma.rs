@@ -26,7 +26,8 @@ use crate::util::{normalize_ident, parse_signed_number, parse_string, IOExt as _
 use crate::vdbe::builder::{ProgramBuilder, ProgramBuilderOpts};
 use crate::vdbe::insn::{Cookie, Insn};
 use crate::{
-    bail_parse_error, CaptureDataChangesInfo, LimboError, Numeric, Value, CDC_VERSION_CURRENT,
+    bail_parse_error, CaptureDataChangesInfo, LimboError, Numeric, Result, Value,
+    CDC_VERSION_CURRENT,
 };
 use std::str::FromStr;
 use strum::IntoEnumIterator;
@@ -211,6 +212,17 @@ fn emit_table_list_rows_for_schema(
     }
 }
 
+/// SQLite matches PRAGMA names without regard to case.
+fn parse_pragma_name(name: &str) -> Option<PragmaName> {
+    if let Ok(pragma) = PragmaName::from_str(name) {
+        return Some(pragma);
+    }
+    if name.bytes().any(|b| b.is_ascii_uppercase()) {
+        return PragmaName::from_str(&name.to_ascii_lowercase()).ok();
+    }
+    None
+}
+
 pub fn translate_pragma(
     resolver: &Resolver,
     name: &ast::QualifiedName,
@@ -227,13 +239,14 @@ pub fn translate_pragma(
         return Ok(());
     }
 
-    let Ok(pragma) = PragmaName::from_str(name.name.as_str()) else {
+    let Some(pragma) = parse_pragma_name(name.name.as_str()) else {
         // SQLite silently ignores unknown PRAGMA names.
         return Ok(());
     };
 
     let database_id = resolver.resolve_database_id(name)?;
     let schema_was_explicit = name.db_name.is_some();
+    let query_only = connection.get_query_only();
 
     let mode = match body {
         None => query_pragma(
@@ -287,6 +300,9 @@ pub fn translate_pragma(
             program.begin_read_operation()?;
         }
         TransactionMode::Write => {
+            if query_only {
+                bail_parse_error!("Cannot execute write statement in query_only mode")
+            }
             let schema_cookie = resolver.with_schema(database_id, |s| s.schema_version);
             program.begin_write_on_database(database_id, schema_cookie)?;
             program.begin_write_operation()?;
@@ -463,7 +479,7 @@ fn update_pragma(
             });
             program.emit_result_row(result_reg, 1);
             program.add_pragma_result_column("max_page_count".into());
-            Ok(TransactionMode::Write)
+            Ok(TransactionMode::Read)
         }
         PragmaName::UserVersion => {
             let data = parse_signed_number(&value)?;
@@ -505,7 +521,7 @@ fn update_pragma(
                 Value::Numeric(Numeric::Float(size)) => f64::from(size) as i64,
                 _ => bail_parse_error!("Invalid value for page size pragma"),
             };
-            update_page_size(connection, page_size as u32)?;
+            update_page_size(connection, database_id, page_size as u32)?;
             Ok(TransactionMode::None)
         }
         PragmaName::AutoVacuum => {
@@ -518,14 +534,14 @@ fn update_pragma(
                         b"none" => Some(AutoVacuumMode::None),
                         b"full" => Some(AutoVacuumMode::Full),
                         b"incremental" => Some(AutoVacuumMode::Incremental),
-                        _ => None,
+                        _ => Some(AutoVacuumMode::None),
                     })
                 }
                 _ => match parse_signed_number(&value) {
                     Ok(Value::Numeric(Numeric::Integer(n @ 0..=2))) => {
                         Some(AutoVacuumMode::from(n as u8))
                     }
-                    _ => None,
+                    _ => Some(AutoVacuumMode::None),
                 },
             };
 
@@ -540,6 +556,8 @@ fn update_pragma(
                         .to_string(),
                 ));
             }
+
+            let pager = connection.get_pager_from_database_index(&database_id)?;
 
             // Like SQLite, the auto-vacuum mode is fixed once page 1 exists,
             // so the pragma is silently ignored after that.
@@ -658,7 +676,7 @@ fn update_pragma(
                     _ => SyncMode::Full,
                 })
             };
-            connection.set_sync_mode(mode);
+            connection.set_sync_mode_for_database(database_id, mode)?;
             Ok(TransactionMode::None)
         }
         PragmaName::DataSyncRetry => {
@@ -690,6 +708,20 @@ fn update_pragma(
             };
 
             connection.set_mvcc_gc_threshold(threshold)?;
+            Ok(TransactionMode::None)
+        }
+        PragmaName::MvccGroupCommit => {
+            connection.set_mvcc_group_commit(parse_pragma_enabled(&value))?;
+            Ok(TransactionMode::None)
+        }
+        PragmaName::FtsMergeThreshold => {
+            let threshold = match parse_signed_number(&value)? {
+                Value::Numeric(Numeric::Integer(size)) if size >= 0 => size,
+                _ => bail_parse_error!(
+                    "fts_merge_threshold must be 0 (disabled) or a positive integer"
+                ),
+            };
+            connection.set_fts_merge_threshold(threshold);
             Ok(TransactionMode::None)
         }
         PragmaName::ForeignKeys => {
@@ -902,8 +934,9 @@ fn query_pragma(
         PragmaName::WalCheckpoint => {
             // Checkpoint uses 3 registers: P1, P2, P3. Ref Insn::Checkpoint for more info.
             // Allocate two more here as one was allocated at the top.
-            let passive_allowed = connection.mv_store_for_db(database_id).is_none()
-                || connection.experimental_mvcc_passive_checkpoint_enabled();
+            let passive_allowed = connection
+                .mv_store_for_db(database_id)
+                .is_none_or(|mv_store| mv_store.uses_passive_checkpoint());
             let mode = match value {
                 Some(ast::Expr::Name(name)) => {
                     let mode_name = normalize_ident(name.as_str());
@@ -1300,7 +1333,7 @@ fn query_pragma(
                     &name,
                 )?;
                 let lookup_name = normalize_table_pragma_lookup_name(table_database_id, &name);
-                resolver.with_schema(table_database_id, |db_schema| {
+                resolver.with_schema(table_database_id, |db_schema| -> Result<()> {
                     if let Some(table) = db_schema.get_table(&lookup_name) {
                         let primary_key_columns = match table.as_ref() {
                             Table::BTree(bt) => Some(bt.primary_key_columns.as_slice()),
@@ -1315,7 +1348,7 @@ fn query_pragma(
                         );
                     } else if let Some(view_mutex) = db_schema.get_materialized_view(&lookup_name) {
                         let view = view_mutex.lock();
-                        let flat_columns = view.column_schema.flat_columns();
+                        let flat_columns = view.column_schema.flat_columns()?;
                         emit_columns_for_table_info(
                             program,
                             &flat_columns,
@@ -1335,7 +1368,8 @@ fn query_pragma(
                             false,
                         );
                     }
-                });
+                    Ok(())
+                })?;
             }
             let col_names = ["cid", "name", "type", "notnull", "dflt_value", "pk"];
             for name in col_names {
@@ -1360,7 +1394,7 @@ fn query_pragma(
                     &name,
                 )?;
                 let lookup_name = normalize_table_pragma_lookup_name(table_database_id, &name);
-                resolver.with_schema(table_database_id, |db_schema| {
+                resolver.with_schema(table_database_id, |db_schema| -> Result<()> {
                     if let Some(table) = db_schema.get_table(&lookup_name) {
                         let primary_key_columns = match table.as_ref() {
                             Table::BTree(bt) => Some(bt.primary_key_columns.as_slice()),
@@ -1375,7 +1409,7 @@ fn query_pragma(
                         );
                     } else if let Some(view_mutex) = db_schema.get_materialized_view(&lookup_name) {
                         let view = view_mutex.lock();
-                        let flat_columns = view.column_schema.flat_columns();
+                        let flat_columns = view.column_schema.flat_columns()?;
                         emit_columns_for_table_info(
                             program,
                             &flat_columns,
@@ -1395,7 +1429,8 @@ fn query_pragma(
                             true,
                         );
                     }
-                });
+                    Ok(())
+                })?;
             }
             let col_names = [
                 "cid",
@@ -1432,18 +1467,17 @@ fn query_pragma(
             Ok(TransactionMode::Read)
         }
         PragmaName::PageSize => {
-            program.emit_int(
-                pager
-                    .io
-                    .block(|| pager.with_header(|header| header.page_size.get()))
-                    .unwrap_or_else(|_| connection.get_page_size().get()) as i64,
-                register,
-            );
+            program.emit_insn(Insn::ReadCookie {
+                db: database_id,
+                dest: register,
+                cookie: Cookie::PageSize,
+            });
             program.emit_result_row(register, 1);
             program.add_pragma_result_column(pragma.to_string());
             Ok(TransactionMode::None)
         }
         PragmaName::AutoVacuum => {
+            let pager = connection.get_pager_from_database_index(&database_id)?;
             let auto_vacuum_mode = pager.get_auto_vacuum_mode();
             let auto_vacuum_mode_i64: i64 = match auto_vacuum_mode {
                 AutoVacuumMode::None => 0,
@@ -1463,36 +1497,23 @@ fn query_pragma(
         }
         PragmaName::IntegrityCheck => {
             let max_errors = parse_max_errors_from_value(&value);
-            // integrity_check verifies the physical file, so for the main MVCC database use the
-            // latest shared schema (which reflects every committed+materialized object) rather
-            // than this connection's possibly-stale tx-snapshot — otherwise a table another
-            // connection just created and checkpointed is missing and its live page is
-            // mis-reported as orphaned.
-            let main_schema = (database_id == 0 && connection.mvcc_enabled())
-                .then(|| connection.db.schema.lock().clone());
-            let schema = main_schema.as_deref().unwrap_or(schema);
             translate_integrity_check(
-                schema,
                 program,
                 resolver,
                 database_id,
                 max_errors,
-                &connection,
+                connection.as_ref(),
             )?;
             Ok(TransactionMode::Read)
         }
         PragmaName::QuickCheck => {
             let max_errors = parse_max_errors_from_value(&value);
-            let main_schema = (database_id == 0 && connection.mvcc_enabled())
-                .then(|| connection.db.schema.lock().clone());
-            let schema = main_schema.as_deref().unwrap_or(schema);
             translate_quick_check(
-                schema,
                 program,
                 resolver,
                 database_id,
                 max_errors,
-                &connection,
+                connection.as_ref(),
             )?;
             Ok(TransactionMode::Read)
         }
@@ -1565,12 +1586,14 @@ fn query_pragma(
         }
         PragmaName::VdbeTrace => Ok(TransactionMode::None),
         PragmaName::FreelistCount => {
-            let value = pager.freepage_list();
-            let register = program.alloc_register();
-            program.emit_int(value as i64, register);
-            program.emit_result_row(register, 1);
+            program.emit_insn(Insn::ReadCookie {
+                db: database_id,
+                dest: register,
+                cookie: Cookie::FreePageCount,
+            });
             program.add_pragma_result_column(pragma.to_string());
-            Ok(TransactionMode::None)
+            program.emit_result_row(register, 1);
+            Ok(TransactionMode::Read)
         }
         PragmaName::EncryptionKey => {
             let msg = {
@@ -1596,7 +1619,7 @@ fn query_pragma(
             Ok(TransactionMode::None)
         }
         PragmaName::Synchronous => {
-            let mode = connection.get_sync_mode();
+            let mode = connection.get_sync_mode_for_database(database_id)?;
             let register = program.alloc_register();
             program.emit_int(mode as i64, register);
             program.emit_result_row(register, 1);
@@ -1621,6 +1644,22 @@ fn query_pragma(
         }
         PragmaName::MvccGcThreshold => {
             let threshold = connection.mvcc_gc_threshold()?;
+            let register = program.alloc_register();
+            program.emit_int(threshold, register);
+            program.emit_result_row(register, 1);
+            program.add_pragma_result_column(pragma.to_string());
+            Ok(TransactionMode::None)
+        }
+        PragmaName::MvccGroupCommit => {
+            let enabled = connection.mvcc_group_commit()?;
+            let register = program.alloc_register();
+            program.emit_int(enabled as i64, register);
+            program.emit_result_row(register, 1);
+            program.add_pragma_result_column(pragma.to_string());
+            Ok(TransactionMode::None)
+        }
+        PragmaName::FtsMergeThreshold => {
+            let threshold = connection.get_fts_merge_threshold();
             let register = program.alloc_register();
             program.emit_int(threshold, register);
             program.emit_result_row(register, 1);
@@ -1908,7 +1947,11 @@ fn update_cache_size(
     Ok(())
 }
 
-fn update_page_size(connection: Arc<crate::Connection>, page_size: u32) -> crate::Result<()> {
-    connection.reset_page_size(page_size)?;
+fn update_page_size(
+    connection: Arc<crate::Connection>,
+    database_id: usize,
+    page_size: u32,
+) -> crate::Result<()> {
+    connection.reset_page_size(database_id, page_size)?;
     Ok(())
 }

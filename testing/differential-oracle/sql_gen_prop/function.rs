@@ -258,6 +258,7 @@ pub struct FunctionProfile {
     pub json_weight: u32,
     pub window_weight: u32,
     pub other_weight: u32,
+    pub allow_order_dependent_aggregates: bool,
 }
 
 impl Default for FunctionProfile {
@@ -274,6 +275,7 @@ impl Default for FunctionProfile {
             json_weight: 3,
             window_weight: 2,
             other_weight: 5,
+            allow_order_dependent_aggregates: true,
         }
     }
 }
@@ -631,6 +633,20 @@ pub fn aggregate_functions() -> Vec<FunctionDef> {
     ]
 }
 
+pub fn aggregate_result_depends_on_input_order(name: &str) -> bool {
+    [
+        "GROUP_CONCAT",
+        "STRING_AGG",
+        "ARRAY_AGG",
+        "JSON_GROUP_ARRAY",
+        "JSONB_GROUP_ARRAY",
+        "JSON_GROUP_OBJECT",
+        "JSONB_GROUP_OBJECT",
+    ]
+    .iter()
+    .any(|candidate| name.eq_ignore_ascii_case(candidate))
+}
+
 /// Built-in date/time functions.
 pub fn datetime_functions() -> Vec<FunctionDef> {
     vec![
@@ -788,6 +804,25 @@ mod tests {
         assert!(registry.in_category(FunctionCategory::String).count() > 0);
         assert!(registry.scalar_functions().count() > 0);
         assert!(registry.aggregate_functions().count() > 0);
+    }
+
+    #[test]
+    fn collection_aggregate_results_depend_on_input_order() {
+        for name in [
+            "GROUP_CONCAT",
+            "STRING_AGG",
+            "ARRAY_AGG",
+            "JSON_GROUP_ARRAY",
+            "JSONB_GROUP_ARRAY",
+            "JSON_GROUP_OBJECT",
+            "JSONB_GROUP_OBJECT",
+        ] {
+            assert!(aggregate_result_depends_on_input_order(name), "{name}");
+        }
+
+        for name in ["COUNT", "SUM", "AVG", "TOTAL", "MIN", "MAX"] {
+            assert!(!aggregate_result_depends_on_input_order(name), "{name}");
+        }
     }
 
     #[test]

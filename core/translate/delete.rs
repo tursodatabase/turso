@@ -67,7 +67,9 @@ fn validate_delete(
             views.iter().fold(String::new(), |_, s| s.to_string() + ", "),
         );
     }
-    Ok(())
+    // Pins the closure's error type: bail_parse_error! is polymorphic over
+    // boxed and unboxed LimboError since the InsnResult migration.
+    Ok::<(), crate::LimboError>(())
     })?;
     Ok(table)
 }
@@ -193,8 +195,6 @@ pub fn prepare_delete_plan(
     connection: &Arc<crate::Connection>,
     database_id: usize,
 ) -> Result<Plan> {
-    let schema = resolver.schema();
-
     let btree_table_for_triggers = table.btree();
     let table = if let Some(table) = table.virtual_table() {
         Table::Virtual(table)
@@ -203,7 +203,9 @@ pub fn prepare_delete_plan(
     } else {
         crate::bail_parse_error!("Table is neither a virtual table nor a btree table");
     };
-    let indexes = schema.get_indices(table.get_name()).cloned().collect();
+    let indexes = resolver.with_schema(database_id, |schema| {
+        schema.get_indices(table.get_name()).cloned().collect()
+    });
     let joined_tables = vec![JoinedTable {
         op: Operation::default_scan_for(&table),
         table,
@@ -215,6 +217,7 @@ pub fn prepare_delete_plan(
         expression_index_usages: Vec::new(),
         database_id,
         indexed,
+        plan_estimate: None,
     }];
     let mut table_references = TableReferences::new(joined_tables, vec![]);
 

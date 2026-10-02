@@ -1,0 +1,132 @@
+# Regression test for https://github.com/tursodatabase/turso/issues/8703
+# ALTER TABLE ADD COLUMN and DROP COLUMN rebuild the stored CREATE TABLE text.
+# The rebuilt text must keep each constraint's ON CONFLICT clause, otherwise a
+# connection that reopens the file enforces ABORT where the schema said ROLLBACK.
+
+@database :memory:
+
+test alter-add-column-keeps-unique-on-conflict-rollback {
+    CREATE TABLE t(id INTEGER, k TEXT UNIQUE ON CONFLICT ROLLBACK, x INTEGER, j TEXT);
+    ALTER TABLE t ADD COLUMN note TEXT;
+    SELECT sql LIKE '%ON CONFLICT ROLLBACK%' FROM sqlite_master WHERE name='t';
+}
+expect {
+    1
+}
+
+test alter-drop-column-keeps-unique-on-conflict-rollback {
+    CREATE TABLE u(id INTEGER, k TEXT UNIQUE ON CONFLICT ROLLBACK, x INTEGER, j TEXT);
+    ALTER TABLE u DROP COLUMN j;
+    SELECT sql LIKE '%ON CONFLICT ROLLBACK%' FROM sqlite_master WHERE name='u';
+}
+expect {
+    1
+}
+
+test alter-add-column-keeps-not-null-on-conflict-ignore {
+    CREATE TABLE t(id INTEGER, k TEXT NOT NULL ON CONFLICT IGNORE, j TEXT);
+    ALTER TABLE t ADD COLUMN note TEXT;
+    SELECT sql LIKE '%NOT NULL ON CONFLICT IGNORE%' FROM sqlite_master WHERE name='t';
+}
+expect {
+    1
+}
+
+test alter-add-column-keeps-primary-key-on-conflict-replace {
+    CREATE TABLE t(id INTEGER PRIMARY KEY ON CONFLICT REPLACE, j TEXT);
+    ALTER TABLE t ADD COLUMN note TEXT;
+    SELECT sql LIKE '%PRIMARY KEY ON CONFLICT REPLACE%' FROM sqlite_master WHERE name='t';
+}
+expect {
+    1
+}
+
+test alter-rename-column-keeps-unique-on-conflict-rollback {
+    CREATE TABLE v(id INTEGER, k TEXT UNIQUE ON CONFLICT ROLLBACK, x INTEGER, j TEXT);
+    ALTER TABLE v RENAME COLUMN j TO j2;
+    SELECT sql LIKE '%ON CONFLICT ROLLBACK%' FROM sqlite_master WHERE name='v';
+}
+expect {
+    1
+}
+
+test alter-add-column-keeps-each-clause-on-its-own-column-constraint {
+    CREATE TABLE t(id INTEGER, a TEXT NOT NULL ON CONFLICT IGNORE UNIQUE ON CONFLICT REPLACE, j TEXT);
+    ALTER TABLE t ADD COLUMN note TEXT;
+    SELECT sql LIKE '%NOT NULL ON CONFLICT IGNORE UNIQUE ON CONFLICT REPLACE%' FROM sqlite_master WHERE name='t';
+}
+expect {
+    1
+}
+
+test alter-drop-column-keeps-each-clause-on-its-own-column-constraint-with-primary-key {
+    CREATE TABLE t(a TEXT NOT NULL ON CONFLICT FAIL PRIMARY KEY ON CONFLICT ROLLBACK, b TEXT NOT NULL ON CONFLICT IGNORE UNIQUE ON CONFLICT REPLACE, j TEXT);
+    ALTER TABLE t DROP COLUMN j;
+    SELECT sql LIKE '%a TEXT NOT NULL ON CONFLICT FAIL PRIMARY KEY ON CONFLICT ROLLBACK, b TEXT NOT NULL ON CONFLICT IGNORE UNIQUE ON CONFLICT REPLACE%' FROM sqlite_master WHERE name='t';
+}
+expect {
+    1
+}
+
+test alter-add-column-keeps-table-primary-key-on-conflict-rollback {
+    CREATE TABLE t(c INTEGER, d TEXT, j TEXT, PRIMARY KEY (c, d) ON CONFLICT ROLLBACK);
+    ALTER TABLE t ADD COLUMN note TEXT;
+    SELECT sql LIKE '%PRIMARY KEY (c, d) ON CONFLICT ROLLBACK%' FROM sqlite_master WHERE name='t';
+}
+expect {
+    1
+}
+
+test alter-drop-column-keeps-table-primary-key-on-conflict-rollback {
+    CREATE TABLE t(c INTEGER, d TEXT, j TEXT, PRIMARY KEY (c, d) ON CONFLICT ROLLBACK);
+    ALTER TABLE t DROP COLUMN j;
+    SELECT sql LIKE '%PRIMARY KEY (c, d) ON CONFLICT ROLLBACK%' FROM sqlite_master WHERE name='t';
+}
+expect {
+    1
+}
+
+test alter-add-column-keeps-table-unique-on-conflict-ignore {
+    CREATE TABLE t(c INTEGER, d TEXT, j TEXT, UNIQUE (c, d) ON CONFLICT IGNORE);
+    ALTER TABLE t ADD COLUMN note TEXT;
+    SELECT sql LIKE '%UNIQUE (c, d) ON CONFLICT IGNORE%' FROM sqlite_master WHERE name='t';
+}
+expect {
+    1
+}
+
+test alter-drop-column-keeps-each-table-unique-clause {
+    CREATE TABLE t(c INTEGER, d TEXT, e TEXT, j TEXT, UNIQUE (c, d) ON CONFLICT IGNORE, UNIQUE (d, e) ON CONFLICT REPLACE);
+    ALTER TABLE t DROP COLUMN j;
+    SELECT sql LIKE '%UNIQUE (c, d) ON CONFLICT IGNORE%UNIQUE (d, e) ON CONFLICT REPLACE%' FROM sqlite_master WHERE name='t';
+}
+expect {
+    1
+}
+
+test alter-add-column-keeps-text-primary-key-on-conflict-replace {
+    CREATE TABLE t(k TEXT PRIMARY KEY ON CONFLICT REPLACE, j TEXT);
+    ALTER TABLE t ADD COLUMN note TEXT;
+    SELECT sql LIKE '%PRIMARY KEY ON CONFLICT REPLACE%' FROM sqlite_master WHERE name='t';
+}
+expect {
+    1
+}
+
+test alter-add-column-keeps-without-rowid-primary-key-on-conflict-ignore {
+    CREATE TABLE t(k TEXT PRIMARY KEY ON CONFLICT IGNORE, j TEXT) WITHOUT ROWID;
+    ALTER TABLE t ADD COLUMN note TEXT;
+    SELECT sql LIKE '%PRIMARY KEY ON CONFLICT IGNORE%' FROM sqlite_master WHERE name='t';
+}
+expect {
+    1
+}
+
+test alter-add-column-keeps-without-rowid-table-primary-key-on-conflict-fail {
+    CREATE TABLE t(c INTEGER, d TEXT, j TEXT, PRIMARY KEY (c, d) ON CONFLICT FAIL) WITHOUT ROWID;
+    ALTER TABLE t ADD COLUMN note TEXT;
+    SELECT sql LIKE '%PRIMARY KEY (c, d) ON CONFLICT FAIL%' FROM sqlite_master WHERE name='t';
+}
+expect {
+    1
+}

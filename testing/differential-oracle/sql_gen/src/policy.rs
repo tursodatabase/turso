@@ -1142,6 +1142,14 @@ pub struct SelectConfig {
     /// Probability of WHERE clause in simple/subquery SELECT.
     pub subquery_where_probability: f64,
 
+    /// Probability that a subquery adds an equality to a compatible column
+    /// from its immediately enclosing SELECT.
+    pub subquery_correlation_probability: f64,
+
+    /// Probability that a scalar subquery without GROUP BY returns one
+    /// aggregate row instead of selecting one input row with LIMIT 1.
+    pub subquery_aggregate_probability: f64,
+
     /// Order direction weights.
     pub order_direction_weights: OrderDirectionWeights,
 
@@ -1233,6 +1241,8 @@ impl Default for SelectConfig {
             column_alias_probability: 0.2,
             max_offset: 100,
             subquery_where_probability: 0.5,
+            subquery_correlation_probability: 0.0,
+            subquery_aggregate_probability: 0.0,
             order_direction_weights: OrderDirectionWeights::default(),
             nulls_order_weights: NullsOrderWeights::default(),
             order_by_column_weight: 6,
@@ -2082,6 +2092,7 @@ pub struct FunctionConfig {
     pub function_weights: Vec<(&'static FunctionDef, u32)>,
     /// Whether to only use deterministic functions.
     pub deterministic_only: bool,
+    pub allow_order_dependent_aggregates: bool,
     /// Category weights for selecting function categories.
     pub category_weights: FunctionCategoryWeights,
 }
@@ -2102,6 +2113,7 @@ impl Default for FunctionConfig {
                 })
                 .collect(),
             deterministic_only: false,
+            allow_order_dependent_aggregates: true,
             category_weights: FunctionCategoryWeights::default(),
         }
     }
@@ -2123,6 +2135,7 @@ impl FunctionConfig {
                 })
                 .collect(),
             deterministic_only: false,
+            allow_order_dependent_aggregates: true,
             category_weights: FunctionCategoryWeights::default(),
         }
     }
@@ -2142,6 +2155,7 @@ impl FunctionConfig {
                 })
                 .collect(),
             deterministic_only: false,
+            allow_order_dependent_aggregates: true,
             category_weights: FunctionCategoryWeights::default(),
         }
     }
@@ -2163,8 +2177,14 @@ impl FunctionConfig {
                 })
                 .collect(),
             deterministic_only: true,
+            allow_order_dependent_aggregates: true,
             category_weights: FunctionCategoryWeights::default(),
         }
+    }
+
+    pub fn without_order_dependent_aggregates(mut self) -> Self {
+        self.allow_order_dependent_aggregates = false;
+        self
     }
 
     /// Disable specific functions by name (sets their weight to 0).

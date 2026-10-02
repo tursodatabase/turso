@@ -886,3 +886,46 @@ test upsert-conflict-target-nulls-first-rejected {
 expect error {
     NULLS
 }
+
+@cross-check-integrity
+test upsert-before-update-trigger-index-delete {
+    CREATE TABLE t(a INTEGER PRIMARY KEY, c INTEGER);
+    CREATE INDEX i ON t(c);
+    INSERT INTO t VALUES(1,1);
+    CREATE TRIGGER tg BEFORE UPDATE ON t BEGIN
+        UPDATE t SET c=c+1 WHERE a=NEW.a;
+    END;
+    INSERT INTO t VALUES(1,9) ON CONFLICT(a) DO UPDATE SET c=c+5;
+    SELECT count(*), group_concat(c) FROM (SELECT c FROM t WHERE c>0 ORDER BY c);
+    PRAGMA integrity_check;
+    DELETE FROM t WHERE a=1;
+    SELECT count(*) FROM t WHERE c>0;
+    PRAGMA integrity_check;
+}
+expect {
+    1|6
+    ok
+    0
+    ok
+}
+
+@cross-check-integrity
+test upsert-before-update-trigger-changes-non-set-column {
+    -- The trigger changes c, which is not in the SET list. The final row
+    -- must keep the trigger's c value; only b gets the SET value.
+    CREATE TABLE t(a INTEGER PRIMARY KEY, b INTEGER, c INTEGER);
+    CREATE INDEX i ON t(c);
+    INSERT INTO t VALUES(1,1,1);
+    CREATE TRIGGER tg BEFORE UPDATE ON t BEGIN
+        UPDATE t SET c=c+10 WHERE a=NEW.a;
+    END;
+    INSERT INTO t VALUES(1,9,9) ON CONFLICT(a) DO UPDATE SET b=b+5;
+    SELECT a, b, c FROM t;
+    SELECT c FROM t WHERE c>0 ORDER BY c;
+    PRAGMA integrity_check;
+}
+expect {
+    1|6|11
+    11
+    ok
+}

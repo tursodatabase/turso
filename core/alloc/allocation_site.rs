@@ -9,6 +9,22 @@ pub enum AllocationSite {
     ValueBlob(ValueBlobAllocationSite),
     Vector(VectorAllocationSite),
     NoFaultInjection,
+    Fts(FtsAllocationSite),
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum FtsAllocationSite {
+    CaptureBuffer,
+    AtomicMetadata,
+    AssembleBuffer,
+    SnapshotMetadata,
+    SnapshotTombstone,
+}
+
+impl From<FtsAllocationSite> for AllocationSite {
+    fn from(site: FtsAllocationSite) -> Self {
+        Self::Fts(site)
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -53,6 +69,7 @@ pub enum MvStoreAllocationSite {
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum SchemaAllocationSite {
     MakeMut,
+    FlatViewColumns,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]

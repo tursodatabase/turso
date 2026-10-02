@@ -7,6 +7,7 @@ use crate::storage::btree::CursorTrait;
 use crate::sync::Arc;
 use crate::sync::Mutex;
 use crate::translate::logical::LogicalPlanBuilder;
+use crate::types::IOResultOr;
 use crate::types::{IOResult, Value};
 use crate::util::{extract_view_columns, ViewColumnSchema};
 use crate::{return_if_io, LimboError, Pager, Result, Statement};
@@ -419,7 +420,7 @@ impl IncrementalView {
         uncommitted: DeltaSet,
         pager: Arc<Pager>,
         execute_state: &mut crate::incremental::compiler::ExecuteState,
-    ) -> crate::Result<crate::types::IOResult<Delta>> {
+    ) -> crate::types::IOResultOr<Delta> {
         // Initialize execute_state with the input data
         *execute_state = crate::incremental::compiler::ExecuteState::Init {
             input_data: uncommitted,
@@ -1148,7 +1149,7 @@ impl IncrementalView {
         conn: &crate::sync::Arc<crate::Connection>,
         pager: &crate::sync::Arc<crate::Pager>,
         _btree_cursor: &mut dyn CursorTrait,
-    ) -> crate::Result<IOResult<()>> {
+    ) -> IOResultOr<()> {
         // Assert that this is a materialized view with a root page
         assert!(
             self.root_page != 0,
@@ -1170,7 +1171,7 @@ impl IncrementalView {
         conn: &crate::sync::Arc<crate::Connection>,
         pager: &crate::sync::Arc<crate::Pager>,
         _btree_cursor: &mut dyn CursorTrait,
-    ) -> crate::Result<IOResult<()>> {
+    ) -> IOResultOr<()> {
         'outer: loop {
             match std::mem::replace(&mut self.populate_state, PopulateState::Done) {
                 PopulateState::Start => {
@@ -1324,7 +1325,7 @@ impl IncrementalView {
                                     rows_processed,
                                     pending_row: None, // No pending row when interrupted between rows
                                 };
-                                return Err(LimboError::Busy);
+                                return Err(LimboError::Busy.into());
                             }
 
                             crate::vdbe::StepResult::IO
@@ -1360,7 +1361,7 @@ impl IncrementalView {
         values: Vec<Value>,
         table_idx: usize,
         pager: Arc<crate::Pager>,
-    ) -> crate::Result<IOResult<()>> {
+    ) -> IOResultOr<()> {
         // Create a single-row delta
         let mut single_row_delta = Delta::new();
         single_row_delta.insert(rowid, values);
@@ -1401,11 +1402,7 @@ impl IncrementalView {
     }
 
     /// Merge a delta set of changes into the view's current state
-    pub fn merge_delta(
-        &mut self,
-        delta_set: DeltaSet,
-        pager: Arc<crate::Pager>,
-    ) -> crate::Result<IOResult<()>> {
+    pub fn merge_delta(&mut self, delta_set: DeltaSet, pager: Arc<crate::Pager>) -> IOResultOr<()> {
         // Early return if all deltas are empty
         if delta_set.is_empty() {
             return Ok(IOResult::Done(()));
@@ -1425,7 +1422,7 @@ mod tests {
     use super::*;
     use crate::alloc::vec;
     use crate::schema::{
-        BTreeCharacteristics, BTreeTable, ColDef, Column as SchemaColumn, Schema, Type,
+        BTreeCharacteristics, BTreeTable, ColDef, ColDefFlags, Column as SchemaColumn, Schema, Type,
     };
     use crate::sync::Arc;
     use turso_parser::ast;
@@ -1445,13 +1442,8 @@ mod tests {
                 Type::Integer,
                 None,
                 ColDef {
-                    primary_key: true,
-                    rowid_alias: true,
-                    notnull: true,
-                    explicit_notnull: false,
-                    unique: false,
-                    hidden: false,
-                    notnull_conflict_clause: None,
+                    flags: ColDefFlags::PrimaryKey | ColDefFlags::RowIdAlias | ColDefFlags::NotNull,
+                    ..Default::default()
                 },
             ),
             SchemaColumn::new_default_text(Some("name".to_string()), "TEXT".to_string(), None),
@@ -1478,13 +1470,8 @@ mod tests {
                 Type::Integer,
                 None,
                 ColDef {
-                    primary_key: true,
-                    rowid_alias: true,
-                    notnull: true,
-                    explicit_notnull: false,
-                    unique: false,
-                    hidden: false,
-                    notnull_conflict_clause: None,
+                    flags: ColDefFlags::PrimaryKey | ColDefFlags::RowIdAlias | ColDefFlags::NotNull,
+                    ..Default::default()
                 },
             ),
             SchemaColumn::new(
@@ -1524,13 +1511,8 @@ mod tests {
                 Type::Integer,
                 None,
                 ColDef {
-                    primary_key: true,
-                    rowid_alias: true,
-                    notnull: true,
-                    explicit_notnull: false,
-                    unique: false,
-                    hidden: false,
-                    notnull_conflict_clause: None,
+                    flags: ColDefFlags::PrimaryKey | ColDefFlags::RowIdAlias | ColDefFlags::NotNull,
+                    ..Default::default()
                 },
             ),
             SchemaColumn::new_default_text(Some("name".to_string()), "TEXT".to_string(), None),

@@ -1,6 +1,10 @@
 {
   "name": "@tursodatabase/serverless",
   "version": "1.4.0",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/tursodatabase/turso"
+  },
   "type": "module",
   "main": "./dist/index.cjs",
   "module": "./dist/index.js",
@@ -38,6 +42,9 @@
     "prepublishOnly": "npm run clean && npm run build",
     "dev": "tsup --watch",
     "test": "ava integration-tests/*.test.mjs"
+  },
+  "overrides": {
+    "esbuild": "0.28.2"
   },
   "keywords": [],
   "author": "",

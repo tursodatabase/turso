@@ -101,10 +101,12 @@ enum MultiIdxBranchAccess {
     },
 }
 
-/// Flattens nested OR expressions into a list of disjuncts.
+/// Flattens nested OR expressions into a list of disjuncts, looking through
+/// grouping parentheses at every level.
 ///
-/// For example, `(a OR b) OR c` becomes `[a, b, c]`.
+/// For example, `(a OR (b OR c)) OR d` becomes `[a, b, c, d]`.
 fn flatten_or_expr(expr: &ast::Expr) -> Vec<&ast::Expr> {
+    let expr = crate::translate::expr::unwrap_parens(expr).unwrap_or(expr);
     match expr {
         ast::Expr::Binary(lhs, ast::Operator::Or, rhs) => {
             let mut result = flatten_or_expr(lhs);
@@ -115,10 +117,15 @@ fn flatten_or_expr(expr: &ast::Expr) -> Vec<&ast::Expr> {
     }
 }
 
-/// Flattens nested AND expressions into a list of conjuncts.
+/// Flattens nested AND expressions into a list of conjuncts, looking through
+/// grouping parentheses at every level.
 ///
-/// For example, `(a AND b) AND c` becomes `[a, b, c]`.
+/// For example, `((a AND b)) AND c` becomes `[a, b, c]`. A BETWEEN that the
+/// planner has already rewritten into `x >= lo AND x <= hi` keeps the
+/// parentheses it was written with, so `(x BETWEEN lo AND hi) AND y = 1`
+/// arrives here as `(x >= lo AND x <= hi) AND y = 1`.
 fn flatten_and_expr(expr: &ast::Expr) -> Vec<&ast::Expr> {
+    let expr = crate::translate::expr::unwrap_parens(expr).unwrap_or(expr);
     match expr {
         ast::Expr::Binary(lhs, ast::Operator::And, rhs) => {
             let mut result = flatten_and_expr(lhs);
@@ -336,6 +343,7 @@ fn choose_multi_index_branch_access(
     rhs_idx: usize,
     schema: &Schema,
     available_indexes: &AvailableIndexes,
+    table_references: &TableReferences,
     base_row_count: RowCountEstimate,
     analyze_stats: &AnalyzeStats,
     params: &CostModelParams,
@@ -406,6 +414,8 @@ fn choose_multi_index_branch_access(
         rhs_table,
         table_constraints,
         lhs_mask,
+        branch_terms,
+        table_references,
         1.0,
         base_row_count,
         params,
@@ -977,13 +987,12 @@ pub fn consider_multi_index_union(
         if term.consumed {
             continue;
         }
-        if !multi_index_can_consume_term(rhs_table, term, table_references) {
-            continue;
-        }
-
         let ast::Expr::Binary(_, ast::Operator::Or, _) = &term.expr else {
             continue;
         };
+        if !multi_index_can_consume_term(rhs_table, term, table_references) {
+            continue;
+        }
 
         let disjuncts = flatten_or_expr(&term.expr);
         if disjuncts.len() < 2 {
@@ -1036,6 +1045,7 @@ pub fn consider_multi_index_union(
                     rhs_idx,
                     schema,
                     available_indexes,
+                    table_references,
                     base_row_count,
                     analyze_stats,
                     params,
@@ -1221,8 +1231,8 @@ mod tests {
     use crate::alloc::TursoSliceExt;
     use crate::{
         schema::{
-            BTreeCharacteristics, BTreeTable, ColDef, Column, Index, IndexColumn, Schema, Table,
-            Type,
+            BTreeCharacteristics, BTreeTable, ColDef, ColDefFlags, Column, Index, IndexColumn,
+            Schema, Table, Type,
         },
         translate::{
             optimizer::{
@@ -1262,8 +1272,7 @@ mod tests {
             c.ty,
             None,
             ColDef {
-                primary_key: false,
-                rowid_alias: c.is_rowid_alias,
+                flags: ColDefFlags::empty().with(ColDefFlags::RowIdAlias, c.is_rowid_alias),
                 ..Default::default()
             },
         )
@@ -1308,6 +1317,7 @@ mod tests {
             column_use_counts: Vec::new(),
             expression_index_usages: Vec::new(),
             database_id: MAIN_DB_ID,
+            plan_estimate: None,
             indexed: None,
         }
     }

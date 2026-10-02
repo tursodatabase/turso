@@ -268,6 +268,14 @@ public sealed class TursoSyncDatabase : IDisposable, IAsyncDisposable
         return new ConnectionOperationLease(_operationLock);
     }
 
+    internal async ValueTask<IDisposable> EnterConnectionOperationAsync(CancellationToken cancellationToken)
+    {
+        ThrowIfIoReentrant();
+        ObjectDisposedException.ThrowIf(Volatile.Read(ref _resourcesDisposed) != 0, this);
+        await _operationLock.WaitAsync(cancellationToken).ConfigureAwait(false);
+        return new ConnectionOperationLease(_operationLock);
+    }
+
     internal void ThrowIfIoReentrant()
     {
         if (_ioCallbackDepth.Value != 0)
@@ -791,10 +799,12 @@ public sealed class TursoSyncDatabase : IDisposable, IAsyncDisposable
         return new Uri(baseText + "/" + path.TrimStart('/'), UriKind.Absolute);
     }
 
-    private static TursoSyncDatabaseConfiguration CreateNativeConfiguration(
+    internal static TursoSyncDatabaseConfiguration CreateNativeConfiguration(
         TursoSyncDatabaseOptions options,
         Uri remoteUri)
     {
+        var partial = options.PartialSync;
+        var encryption = options.RemoteEncryption;
         return new TursoSyncDatabaseConfiguration
         {
             Path = options.Path,
@@ -804,6 +814,21 @@ public sealed class TursoSyncDatabase : IDisposable, IAsyncDisposable
                 ? 0
                 : checked((int)options.LongPollTimeout.Value.TotalMilliseconds),
             BootstrapIfEmpty = options.BootstrapIfEmpty,
+            ReservedBytes = encryption?.ReservedBytes ?? 0,
+            PartialBootstrapStrategyPrefix = partial?.PrefixLength ?? 0,
+            PartialBootstrapStrategyQuery = partial?.Query,
+            PartialBootstrapSegmentSize = partial?.SegmentSize is null ? 0 : (nuint)partial.SegmentSize.Value,
+            PartialBootstrapPrefetch = partial?.Prefetch ?? false,
+            RemoteEncryptionKey = encryption?.Key,
+            RemoteEncryptionCipher = encryption?.NativeName,
+            PushOperationsThreshold = options.PushOperationsThreshold is null
+                ? 0
+                : (nuint)options.PushOperationsThreshold.Value,
+            PullBytesThreshold = options.PullBytesThreshold is null
+                ? 0
+                : (nuint)options.PullBytesThreshold.Value,
+            LogicalMvccPull = options.ForceLogicalMvccPull,
+            ExperimentalFeatures = options.ExperimentalFeatures,
         };
     }
 

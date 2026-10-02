@@ -6656,9 +6656,10 @@ mod fuzz_tests {
                 query = query.replacen("SELECT * FROM ", &replacement, 1);
             }
 
-            // Optionally append LIMIT/OFFSET (with or without subqueries)
+            // Use a stable order because different valid plans can return different rows.
             let limit_clause = gen_limit_offset_clause(&mut rng);
             if !limit_clause.is_empty() {
+                query.push_str(" ORDER BY 1");
                 query.push_str(&limit_clause);
             }
 
