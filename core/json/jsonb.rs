@@ -1227,6 +1227,13 @@ impl Jsonb {
         }
 
         match kind {
+            ElementType::TEXT | ElementType::TEXTRAW | ElementType::TEXTJ
+                if is_ascii_without_special_bytes(&self.data, cursor, end_cursor) =>
+            {
+                // SAFETY: the check above found only ASCII bytes, and every
+                // ASCII byte sequence is valid UTF-8.
+                string.push_str(unsafe { std::str::from_utf8_unchecked(word_slice) });
+            }
             ElementType::TEXT | ElementType::TEXTRAW | ElementType::TEXTJ => {
                 let word = payload_as_str(word_slice).map_err(|_| {
                     LimboError::ParseError("Failed to serialize string!".to_string())
@@ -4831,6 +4838,56 @@ fn find_string_special_byte(input: &[u8], pos: usize, quote: u8) -> usize {
     find_string_special_byte_swar(input, pos, quote)
 }
 
+#[inline]
+fn is_ascii_without_special_bytes(data: &[u8], start: usize, end: usize) -> bool {
+    assert!(start <= end && end <= data.len());
+    #[cfg(target_arch = "x86_64")]
+    {
+        let mut pos = start;
+        while pos + 16 <= end {
+            if string_special_or_non_ascii_mask_sse2(data, pos) != 0 {
+                return false;
+            }
+            pos += 16;
+        }
+        if pos == end {
+            return true;
+        }
+        if pos + 16 <= data.len() {
+            let tail_bits = (1u32 << (end - pos)) - 1;
+            return string_special_or_non_ascii_mask_sse2(data, pos) & tail_bits == 0;
+        }
+        data[pos..end]
+            .iter()
+            .all(|&byte| (0x20..0x80).contains(&byte) && byte != b'"' && byte != b'\\')
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    data[start..end]
+        .iter()
+        .all(|&byte| (0x20..0x80).contains(&byte) && byte != b'"' && byte != b'\\')
+}
+
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+fn string_special_or_non_ascii_mask_sse2(data: &[u8], pos: usize) -> u32 {
+    use std::arch::x86_64::{
+        _mm_cmpeq_epi8, _mm_loadu_si128, _mm_min_epu8, _mm_movemask_epi8, _mm_or_si128,
+        _mm_set1_epi8,
+    };
+    assert!(pos + 16 <= data.len());
+    // SAFETY: SSE2 is part of the x86_64 baseline, so these intrinsics are
+    // always available, and the assert above keeps the 16-byte unaligned
+    // load inside `data`.
+    unsafe {
+        let chunk = _mm_loadu_si128(data.as_ptr().add(pos).cast());
+        let is_quote = _mm_cmpeq_epi8(chunk, _mm_set1_epi8(b'"' as i8));
+        let is_backslash = _mm_cmpeq_epi8(chunk, _mm_set1_epi8(b'\\' as i8));
+        let is_control = _mm_cmpeq_epi8(_mm_min_epu8(chunk, _mm_set1_epi8(0x1F)), chunk);
+        let special = _mm_or_si128(_mm_or_si128(is_quote, is_backslash), is_control);
+        (_mm_movemask_epi8(special) | _mm_movemask_epi8(chunk)) as u32
+    }
+}
+
 pub(crate) fn find_nul(input: &[u8]) -> Option<usize> {
     #[cfg(target_arch = "x86_64")]
     let pos = match find_nul_sse2(input) {
@@ -5213,6 +5270,26 @@ mod tests {
                                 "{element_type:?} {payload:?} {one_byte_size} {parent_depth} {strict}"
                             );
                         }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn ascii_without_special_bytes_check_matches_a_byte_by_byte_check() {
+        let is_plain = |byte: &u8| (0x20..0x80).contains(byte) && *byte != b'"' && *byte != b'\\';
+        for special in [b'"', b'\\', 0x00, 0x1F, 0x7F, 0x80, 0xFF] {
+            for special_pos in 0..40 {
+                let mut data = [b'a'; 40];
+                data[special_pos] = special;
+                for end in 0..=data.len() {
+                    for start in 0..=end {
+                        assert_eq!(
+                            is_ascii_without_special_bytes(&data, start, end),
+                            data[start..end].iter().all(is_plain),
+                            "{special:#x} at {special_pos}, {start}..{end}"
+                        );
                     }
                 }
             }
