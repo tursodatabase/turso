@@ -3729,9 +3729,15 @@ pub fn element_payload(data: &[u8], pos: usize) -> Result<(ElementType, &[u8])> 
 }
 
 pub fn is_valid_element_at(data: &[u8], pos: usize) -> bool {
-    match element_bounds(data, pos) {
-        Ok((_, _, end)) => validate_element(data, pos, end, 0, false).is_ok(),
-        Err(_) => false,
+    let Ok((JsonbHeader(element_type, payload_size), _, end)) = element_bounds(data, pos) else {
+        return false;
+    };
+    match element_type {
+        ElementType::NULL | ElementType::TRUE | ElementType::FALSE => payload_size == 0,
+        ElementType::INT | ElementType::INT5 | ElementType::FLOAT | ElementType::FLOAT5 => {
+            payload_size != 0
+        }
+        _ => validate_element(data, pos, end, 0, false).is_ok(),
     }
 }
 
@@ -4964,6 +4970,39 @@ mod tests {
         for input in &inputs {
             let (json, _) = Jsonb::from_str_tracking(input).unwrap();
             assert!(json.len() <= 2 * input.len() + 16, "{input:.40}");
+        }
+    }
+
+    #[test]
+    fn is_valid_element_at_matches_the_full_check_for_scalars() {
+        for element_type in [
+            ElementType::NULL,
+            ElementType::TRUE,
+            ElementType::FALSE,
+            ElementType::INT,
+            ElementType::INT5,
+            ElementType::FLOAT,
+            ElementType::FLOAT5,
+        ] {
+            for payload in [&b""[..], b"1", b"-12", b"0x1F", b"1.5", b"x"] {
+                for one_byte_size in [false, true] {
+                    let mut data = std::vec::Vec::new();
+                    if one_byte_size {
+                        data.push(element_type as u8 | (SIZE_MARKER_8BIT << 4));
+                        data.push(payload.len() as u8);
+                    } else {
+                        data.push(element_type as u8 | ((payload.len() as u8) << 4));
+                    }
+                    data.extend_from_slice(payload);
+                    let full_check = element_bounds(&data, 0)
+                        .is_ok_and(|(_, _, end)| validate_element(&data, 0, end, 0, false).is_ok());
+                    assert_eq!(
+                        is_valid_element_at(&data, 0),
+                        full_check,
+                        "{element_type:?} {payload:?} {one_byte_size}"
+                    );
+                }
+            }
         }
     }
 
