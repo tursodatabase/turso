@@ -154,12 +154,10 @@ pub enum Operation {
     /// the table some non-trivial churn so the watermark/btree interplay
     /// has fewer trivially-flat scenarios.
     AutoincDelete { id: i64 },
-    /// Self-differential FTS check: within one statement (one snapshot),
-    /// compare the id multiplicities `fts_match` returns against a base-table token scan.
-    /// Returns one row `(multiplicity difference, index present)`; the
-    /// `FtsSelfDifferentialProperty` requires `(0, 1)`. The second column
-    /// matters because `fts_match` has a scalar fallback: without the index
-    /// both sides are table scans and the difference is trivially 0.
+    /// Compare how often each row ID appears in FTS results and in a table scan.
+    /// Both reads run in one statement and see the same database view.
+    /// Returns the row count difference, index count, and mismatching IDs with their counts.
+    /// The first two values must be `(0, 1)`; without an index, both reads scan the table.
     FtsMatchDifferential { token: String },
 }
 pub type OpResult = Result<Vec<Vec<Value>>, LimboError>;
@@ -318,17 +316,17 @@ impl Operation {
                        SELECT id, count(*), 0 FROM fts_rows GROUP BY id \
                        UNION ALL \
                        SELECT id, 0, count(*) FROM scan_rows GROUP BY id\
-                     ), multiplicities(id, fts_count, scan_count) AS (\
+                     ), row_counts(id, fts_count, scan_count) AS (\
                        SELECT id, sum(fts_count), sum(scan_count) FROM counts GROUP BY id\
                      ) SELECT \
                        (SELECT coalesce(sum(abs(fts_count - scan_count)), 0) \
-                          FROM multiplicities), \
+                          FROM row_counts), \
                        (SELECT count(*) FROM sqlite_schema \
                           WHERE type = 'index' AND name = '{index}'), \
                        (SELECT group_concat(id||':'||fts_count||'/'||scan_count) \
-                          FROM multiplicities WHERE fts_count > scan_count), \
+                          FROM row_counts WHERE fts_count > scan_count), \
                        (SELECT group_concat(id||':'||fts_count||'/'||scan_count) \
-                          FROM multiplicities WHERE scan_count > fts_count)"
+                          FROM row_counts WHERE scan_count > fts_count)"
                 )
             }
         }

@@ -559,7 +559,7 @@ pub struct Stats {
     pub corruption_events: usize,
     /// Sequence nextval calls
     pub sequence_nextvals: usize,
-    /// FTS self-differential checks that ran to completion
+    /// Completed comparisons between FTS results and a table scan
     pub fts_checks: usize,
     pub fts_crash_checks: usize,
     pub fts_abandoned_statements: usize,
@@ -703,7 +703,6 @@ impl Whopper {
     /// Create a new Whopper simulator with the given options.
     pub fn new(opts: WhopperOpts) -> anyhow::Result<Self> {
         if opts.fts_profile.is_some() {
-            anyhow::ensure!(opts.enable_mvcc, "FTS profiles require MVCC");
             anyhow::ensure!(
                 !opts.enable_encryption,
                 "FTS crash snapshots do not support encryption"
@@ -1422,10 +1421,8 @@ impl Whopper {
         }
     }
 
-    /// Apply an op-finish callback to properties and the operation itself
-    /// for a statement that finished during reopen drain. Mirrors the
-    /// finish-op block of `step()` so the property checker sees drained
-    /// commits and rollbacks rather than silently losing them.
+    /// Notify the operation and result checks when a statement finishes before reopen.
+    /// Use the same callbacks as `step()` so completed commits and rollbacks are checked.
     fn finalize_drained_statement(
         &mut self,
         fiber_idx: usize,

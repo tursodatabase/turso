@@ -862,8 +862,8 @@ pub fn fts_sim_schema() -> Vec<(String, String)> {
     ]
 }
 
-/// Small fixed vocabulary so the self-differential's padded-LIKE oracle is
-/// exact token matching, and so matches stay non-trivial.
+/// Fixed test words let the table scan match whole words with LIKE.
+/// The small vocabulary makes documents share words.
 pub(crate) const FTS_SIM_TOKENS: &[&str] = &[
     "alpha", "bravo", "charlie", "delta", "echo", "foxtrot", "golf", "hotel",
 ];

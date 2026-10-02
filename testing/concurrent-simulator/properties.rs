@@ -305,11 +305,9 @@ impl Property for IntegrityCheckProperty {
     }
 }
 
-/// The FTS self-differential: `fts_match` and a base-table token scan run
-/// inside one statement (one snapshot), so their id multiplicities must be equal —
-/// the operation's SQL reports the total multiplicity difference, plus
-/// whether the FTS index still exists (without it `fts_match` silently
-/// falls back to a scalar scan and the comparison proves nothing).
+/// Compare how often each row ID appears in FTS results and in a table scan.
+/// Both reads run in one statement, so they see the same database view.
+/// Require the FTS index to exist, because without it `fts_match` also scans the table.
 pub struct FtsSelfDifferentialProperty;
 
 impl Property for FtsSelfDifferentialProperty {
@@ -328,33 +326,32 @@ impl Property for FtsSelfDifferentialProperty {
         };
         let rows = match result {
             Ok(rows) => rows,
-            // The statement is fixed and valid, so a parse or argument
-            // rejection means the table, the index, or `fts_match` itself
-            // regressed; the driver would otherwise retry it forever.
-            Err(err @ (LimboError::ParseError(_) | LimboError::InvalidArgument(_))) => bail!(
-                "step {step} fiber {fiber_id}: the FTS differential statement was rejected: {err}"
-            ),
-            // Contention errors are the driver's business; nothing to check.
+            // This valid SQL must not fail with a parse or argument error.
+            // Otherwise, the driver would keep retrying a broken query.
+            Err(err @ (LimboError::ParseError(_) | LimboError::InvalidArgument(_))) => {
+                bail!("step {step} fiber {fiber_id}: the FTS comparison query was rejected: {err}")
+            }
+            // The driver handles failed operations; there are no rows to compare.
             Err(_) => return Ok(()),
         };
         let Some(row) = rows.first() else {
-            bail!("step {step} fiber {fiber_id}: the FTS differential returned no row");
+            bail!("step {step} fiber {fiber_id}: the FTS comparison returned no row");
         };
-        let multiplicity_difference = row.first().and_then(Value::as_int);
+        let row_count_difference = row.first().and_then(Value::as_int);
         let index_present = row.get(1).and_then(Value::as_int);
         if index_present != Some(1) {
             bail!(
                 "step {step} fiber {fiber_id}: FTS index {} is missing from sqlite_schema \
-                 (count {index_present:?}); fts_match would fall back to a scalar scan and \
-                 the differential would prove nothing",
+                 (count {index_present:?}); fts_match would also scan the table, so \
+                 the comparison would not test the index",
                 crate::workloads::FTS_SIM_INDEX
             );
         }
-        if multiplicity_difference != Some(0) {
+        if row_count_difference != Some(0) {
             bail!(
-                "step {step} fiber {fiber_id}: fts_match and the base-table scan disagree \
-                 for token {token:?}: multiplicity difference {multiplicity_difference:?} \
-                 (fts counts above scan: {:?}, scan counts above fts: {:?})",
+                "step {step} fiber {fiber_id}: fts_match and the table scan disagree \
+                 for token {token:?}: row count difference {row_count_difference:?} \
+                 (FTS has extra matches: {:?}, table scan has extra matches: {:?})",
                 row.get(2),
                 row.get(3)
             );
@@ -2135,7 +2132,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn fts_differential_accepts_matching_multiplicities() {
+    fn fts_differential_accepts_matching_row_counts() {
         let mut property = FtsSelfDifferentialProperty;
         let op = Operation::FtsMatchDifferential {
             token: "alpha".to_string(),
@@ -2166,11 +2163,7 @@ mod tests {
         let error = property
             .finish_op(4, 2, None, 8, 9, &op, &result)
             .unwrap_err();
-        assert!(
-            error
-                .to_string()
-                .contains("multiplicity difference Some(1)")
-        );
+        assert!(error.to_string().contains("row count difference Some(1)"));
         assert!(error.to_string().contains("7:2/1"));
     }
 

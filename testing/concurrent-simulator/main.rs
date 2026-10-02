@@ -157,14 +157,13 @@ fn main() -> anyhow::Result<()> {
             rng.next_u64()
         });
 
-    let enable_mvcc = args.enable_mvcc || FtsProfile::from_mode(&args.mode).is_some();
-    if args.enable_experimental_mvcc_passive_checkpoint && !enable_mvcc {
+    if args.enable_experimental_mvcc_passive_checkpoint && !args.enable_mvcc {
         return Err(anyhow::anyhow!(
             "--enable-experimental-mvcc-passive-checkpoint requires --enable-mvcc"
         ));
     }
 
-    if args.mvcc_checkpoint_threshold.is_some() && !enable_mvcc {
+    if args.mvcc_checkpoint_threshold.is_some() && !args.enable_mvcc {
         return Err(anyhow::anyhow!(
             "--mvcc-checkpoint-threshold requires --enable-mvcc"
         ));
@@ -184,7 +183,7 @@ fn main() -> anyhow::Result<()> {
 fn run_multiprocess(args: &Args, seed: u64) -> anyhow::Result<()> {
     anyhow::ensure!(
         FtsProfile::from_mode(&args.mode).is_none(),
-        "FTS profiles require in-process MVCC"
+        "FTS profiles require one process because multiprocess mode does not run their recovery and cache checks"
     );
     if args.enable_mvcc {
         eprintln!("MVCC mode not yet supported with multiprocess mode");
@@ -341,7 +340,7 @@ fn run_inprocess(args: &Args, seed: u64) -> anyhow::Result<()> {
             loop_err = Some(error);
         }
         println!(
-            "FTS: {} differential checks, {} crash snapshots, {} abandoned statements",
+            "FTS: {} result comparisons, {} recovery copies, {} canceled statements",
             whopper.stats.fts_checks,
             whopper.stats.fts_crash_checks,
             whopper.stats.fts_abandoned_statements
@@ -544,7 +543,7 @@ fn build_inprocess_opts(args: &Args, seed: u64) -> anyhow::Result<WhopperOpts> {
             "FTS profiles do not support encryption"
         );
         let mut opts = profile
-            .options()
+            .options(args.enable_mvcc)
             .with_seed(seed)
             .with_max_connections(args.max_connections)
             .with_keep_files(args.keep)
@@ -672,25 +671,35 @@ mod tests {
     use super::*;
 
     #[test]
-    fn fts_modes_enable_mvcc_and_preserve_cli_overrides() {
+    fn fts_modes_use_the_requested_journal_mode_and_cli_overrides() {
         for mode in ["fts-merge", "fts-snapshots", "fts-recovery"] {
-            let args = Args::parse_from([
-                "whopper",
-                "--mode",
-                mode,
-                "--max-steps",
-                "37",
-                "--max-connections",
-                "3",
-            ]);
-            let opts = build_inprocess_opts(&args, 811).unwrap();
-            assert_eq!(opts.fts_profile, FtsProfile::from_mode(mode));
-            assert_eq!(opts.seed, Some(811));
-            assert_eq!(opts.max_steps, 37);
-            assert_eq!(opts.max_connections, 3);
-            assert!(opts.enable_mvcc);
-            assert!(opts.experimental_mvcc_passive_checkpoint);
-            assert_eq!(opts.chaotic_profiles.len(), 1);
+            for enable_mvcc in [false, true] {
+                let mut arguments = vec![
+                    "whopper",
+                    "--mode",
+                    mode,
+                    "--max-steps",
+                    "37",
+                    "--max-connections",
+                    "3",
+                ];
+                if enable_mvcc {
+                    arguments.push("--enable-mvcc");
+                }
+                let args = Args::parse_from(arguments);
+                let opts = build_inprocess_opts(&args, 811).unwrap();
+                assert_eq!(opts.fts_profile, FtsProfile::from_mode(mode));
+                assert_eq!(opts.seed, Some(811));
+                assert_eq!(opts.max_steps, 37);
+                assert_eq!(opts.max_connections, 3);
+                assert_eq!(opts.enable_mvcc, enable_mvcc);
+                assert_eq!(opts.experimental_mvcc_passive_checkpoint, enable_mvcc);
+                assert_eq!(
+                    opts.disable_mvcc_auto_checkpoint,
+                    enable_mvcc && mode == "fts-recovery"
+                );
+                assert_eq!(opts.chaotic_profiles.len(), 1);
+            }
         }
     }
 
