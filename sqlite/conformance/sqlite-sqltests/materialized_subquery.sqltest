@@ -18,3 +18,93 @@ expect {
     2|1
     2|1
 }
+
+test inner-loop-subquery-runs-once {
+    CREATE TABLE t1(x INT);
+    CREATE TABLE t2(y INT);
+    INSERT INTO t1 VALUES (1), (2), (3);
+    INSERT INTO t2 VALUES (10);
+    SELECT count(*), count(DISTINCT b.r)
+        FROM t1
+        CROSS JOIN (SELECT max(y) + random() AS r FROM t2) AS b;
+}
+expect {
+    3|1
+}
+
+test inner-loop-subquery-runs-once-left-join {
+    CREATE TABLE t1(x INT);
+    CREATE TABLE t2(y INT);
+    INSERT INTO t1 VALUES (1), (2), (3);
+    INSERT INTO t2 VALUES (10);
+    SELECT count(*), count(DISTINCT b.r)
+        FROM t1
+        LEFT JOIN (SELECT max(y) + random() AS r FROM t2) AS b ON 1;
+}
+expect {
+    3|1
+}
+
+test inner-loop-not-materialized-cte-runs-once {
+    CREATE TABLE t1(x INT);
+    CREATE TABLE t2(y INT);
+    INSERT INTO t1 VALUES (1), (2), (3);
+    INSERT INTO t2 VALUES (10);
+    WITH c AS NOT MATERIALIZED (SELECT max(y) + random() AS r FROM t2)
+    SELECT count(*), count(DISTINCT c.r) FROM t1 CROSS JOIN c;
+}
+expect {
+    3|1
+}
+
+test inner-loop-subquery-with-outer-reference-runs-per-row {
+    CREATE TABLE t1(x INT);
+    CREATE TABLE t2(y INT);
+    INSERT INTO t1 VALUES (1), (2), (3);
+    INSERT INTO t2 VALUES (1), (2), (10);
+    SELECT t1.x,
+           (SELECT count(*)
+              FROM t2
+              CROSS JOIN (SELECT y FROM t2 AS t3 WHERE t3.y > t1.x) AS b)
+        FROM t1
+        ORDER BY t1.x;
+}
+expect {
+    1|6
+    2|3
+    3|3
+}
+
+test inner-loop-grouped-subquery-cross-join-aggregate {
+    CREATE TABLE t(d TEXT, kind TEXT, amount INT);
+    INSERT INTO t VALUES
+        ('2024-01-05', 'in', 10), ('2024-01-20', 'out', 5),
+        ('2024-02-03', 'in', 7), ('2024-03-11', 'in', 3),
+        ('2024-03-12', 'fee', 100);
+    SELECT avg(m.net), count(*)
+        FROM (SELECT strftime('%Y-%m', d) AS ym, sum(amount) AS net
+                FROM t WHERE kind IN ('in', 'out') GROUP BY ym) AS m
+        CROSS JOIN (SELECT min(d) AS first_day FROM t WHERE kind IN ('in', 'out')) AS b
+        WHERE m.ym > strftime('%Y-%m', b.first_day);
+}
+expect {
+    5.0|2
+}
+
+test inner-loop-cte-in-two-sibling-subqueries {
+    CREATE TABLE t1(x INT);
+    CREATE TABLE t2(y INT);
+    INSERT INTO t1 VALUES (1), (2);
+    INSERT INTO t2 VALUES (10), (20);
+    WITH c AS (SELECT y FROM t2)
+    SELECT a.x, a.y, b.n
+        FROM (SELECT t1.x, c.y FROM t1 CROSS JOIN c) AS a
+        CROSS JOIN (SELECT count(*) AS n FROM t1 CROSS JOIN c) AS b
+        ORDER BY a.x, a.y;
+}
+expect {
+    1|10|4
+    1|20|4
+    2|10|4
+    2|20|4
+}

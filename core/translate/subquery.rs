@@ -8,7 +8,7 @@ use turso_parser::ast::{self, SortOrder, SubqueryType, TableInternalId};
 use super::{
     emitter::{Resolver, TranslateCtx},
     main_loop::LoopLabels,
-    plan::{Aggregate, Operation, QueryDestination, Search, SelectPlan},
+    plan::{Aggregate, Operation, QueryDestination, Scan, Search, SelectPlan},
     planner::{resolve_window_and_aggregate_functions, TableMask},
 };
 use crate::translate::expr::comparison_affinity;
@@ -60,7 +60,9 @@ pub(crate) enum MaterializedFromClauseSubqueryStorage {
 
 enum FromClauseSubqueryExecutionMode {
     Coroutine,
-    MaterializedTable,
+    MaterializedTable {
+        shared_with_other_cte_references: bool,
+    },
     DirectMaterializedIndex(DirectMaterializedSubquery),
 }
 
@@ -1359,7 +1361,7 @@ fn eqp_subquery_info(
     } else {
         match execution_mode {
             Some(FromClauseSubqueryExecutionMode::Coroutine) | None => EqpSubqueryExec::Coroutine,
-            Some(FromClauseSubqueryExecutionMode::MaterializedTable) => {
+            Some(FromClauseSubqueryExecutionMode::MaterializedTable { .. }) => {
                 EqpSubqueryExec::Materialized
             }
             Some(FromClauseSubqueryExecutionMode::DirectMaterializedIndex(_)) => {
@@ -1377,6 +1379,7 @@ fn eqp_subquery_info(
 fn choose_from_clause_subquery_execution_mode(
     operation: &Operation,
     from_clause_subquery: &crate::schema::FromClauseSubquery,
+    is_inner_loop: bool,
 ) -> FromClauseSubqueryExecutionMode {
     let needs_materialized_seek = matches!(
         operation,
@@ -1402,9 +1405,20 @@ fn choose_from_clause_subquery_execution_mode(
                 affinity_str: super::plan::synthesized_seek_affinity_str(index, seek_def),
             })
         }
-        _ if needs_materialized_seek => FromClauseSubqueryExecutionMode::MaterializedTable,
+        _ if needs_materialized_seek => FromClauseSubqueryExecutionMode::MaterializedTable {
+            shared_with_other_cte_references: true,
+        },
         _ if from_clause_subquery.requires_table_materialization() => {
-            FromClauseSubqueryExecutionMode::MaterializedTable
+            FromClauseSubqueryExecutionMode::MaterializedTable {
+                shared_with_other_cte_references: true,
+            }
+        }
+        Operation::Scan(Scan::Subquery { .. })
+            if is_inner_loop && !plan_has_outer_scope_dependency(&from_clause_subquery.plan) =>
+        {
+            FromClauseSubqueryExecutionMode::MaterializedTable {
+                shared_with_other_cte_references: false,
+            }
         }
         _ => FromClauseSubqueryExecutionMode::Coroutine,
     }
@@ -1455,6 +1469,12 @@ pub fn emit_from_clause_subqueries(
         .map(|m| m.original_idx)
         .try_collect()?;
 
+    let inner_loop_tables: TableMask = join_order
+        .iter()
+        .skip(1)
+        .map(|member| member.original_idx)
+        .try_collect()?;
+
     for table_index in visit_order {
         let table_reference = &mut tables.joined_tables_mut()[table_index];
         let execution_mode = match &table_reference.table {
@@ -1462,6 +1482,7 @@ pub fn emit_from_clause_subqueries(
                 Some(choose_from_clause_subquery_execution_mode(
                     &table_reference.op,
                     from_clause_subquery.as_ref(),
+                    inner_loop_tables.get(table_index),
                 ))
             }
             _ => None,
@@ -1545,7 +1566,9 @@ pub fn emit_from_clause_subqueries(
                     from_clause_subquery.plan.as_mut(),
                     t_ctx,
                 )?),
-                FromClauseSubqueryExecutionMode::MaterializedTable => {
+                FromClauseSubqueryExecutionMode::MaterializedTable {
+                    shared_with_other_cte_references,
+                } => {
                     let (result_columns_start, cte_cursor_id, cte_table) =
                         emit_materialized_subquery_table(
                             program,
@@ -1554,7 +1577,10 @@ pub fn emit_from_clause_subqueries(
                             &from_clause_subquery.columns,
                         )?;
                     from_clause_subquery.materialized_cursor_id = Some(cte_cursor_id);
-                    if let Some(cte_id) = from_clause_subquery.cte_id() {
+                    if let Some(cte_id) = from_clause_subquery
+                        .cte_id()
+                        .filter(|_| shared_with_other_cte_references)
+                    {
                         program.register_materialized_cte(
                             cte_id,
                             MaterializedCteInfo {
