@@ -1809,7 +1809,7 @@ impl Jsonb {
                         msg: "Failed to write header".to_string(),
                         location: Some(start),
                     })?;
-                self.data.extend_from_slice(&input[start..end]);
+                append_bytes(&mut self.data, &input[start..end]);
                 return Ok(end + 1);
             }
         }
@@ -1870,7 +1870,7 @@ impl Jsonb {
                     msg: "Failed to write header".to_string(),
                     location: Some(pos),
                 })?;
-            self.data.extend_from_slice(&input[pos..end]);
+            append_bytes(&mut self.data, &input[pos..end]);
             return Ok(end + 1);
         }
 
@@ -2158,7 +2158,7 @@ impl Jsonb {
                     msg: "Failed to write header".to_string(),
                     location: Some(pos),
                 })?;
-            self.data.extend_from_slice(&input[pos..end]);
+            append_bytes(&mut self.data, &input[pos..end]);
             return Ok(end);
         }
         self.deserialize_number_of_any_form(input, pos, info)
@@ -4517,6 +4517,47 @@ fn scan_quoted_string(input: &[u8], mut pos: usize, quote: u8) -> PResult<(usize
     }
 }
 
+#[inline(always)]
+fn append_bytes(data: &mut ValueBlob, bytes: &[u8]) {
+    let len = bytes.len();
+    if len > 32 {
+        data.extend_from_slice(bytes);
+        return;
+    }
+    data.reserve(len);
+    let old_len = data.len();
+    // SAFETY: `reserve` made room for `len` more bytes after `old_len`. Every
+    // read below is inside `bytes` and every write inside
+    // `old_len..old_len + len`, and the two ranges do not overlap because
+    // `bytes` is not part of `data`. The bytes are initialized before
+    // `set_len` makes them part of the vector.
+    unsafe {
+        let src = bytes.as_ptr();
+        let dst = data.as_mut_ptr().add(old_len);
+        if len >= 16 {
+            let head = src.cast::<[u8; 16]>().read_unaligned();
+            let tail = src.add(len - 16).cast::<[u8; 16]>().read_unaligned();
+            dst.cast::<[u8; 16]>().write_unaligned(head);
+            dst.add(len - 16).cast::<[u8; 16]>().write_unaligned(tail);
+        } else if len >= 8 {
+            let head = src.cast::<u64>().read_unaligned();
+            let tail = src.add(len - 8).cast::<u64>().read_unaligned();
+            dst.cast::<u64>().write_unaligned(head);
+            dst.add(len - 8).cast::<u64>().write_unaligned(tail);
+        } else if len >= 4 {
+            let head = src.cast::<u32>().read_unaligned();
+            let tail = src.add(len - 4).cast::<u32>().read_unaligned();
+            dst.cast::<u32>().write_unaligned(head);
+            dst.add(len - 4).cast::<u32>().write_unaligned(tail);
+        } else if len > 0 {
+            *dst = *src;
+            *dst.add(len / 2) = *src.add(len / 2);
+            *dst.add(len - 1) = *src.add(len - 1);
+        }
+        data.set_len(old_len + len);
+    }
+}
+
 #[cfg_attr(not(debug_assertions), inline(always))]
 fn scan_plain_json_number(input: &[u8], mut pos: usize) -> Option<(usize, bool)> {
     let skip_digits = |mut pos: usize| {
@@ -4803,6 +4844,20 @@ mod tests {
     fn parse_has_json5(input: &str) -> bool {
         let (_, info) = Jsonb::from_str_tracking(input).unwrap();
         info.has_json5
+    }
+
+    #[test]
+    fn append_bytes_matches_extend_from_slice() {
+        let source: std::vec::Vec<u8> = (0..64u8).map(|b| b.wrapping_mul(37) ^ 0x5a).collect();
+        for prefix in 0..3 {
+            for len in 0..=40 {
+                let mut expected = crate::alloc::vec![0xeeu8; prefix];
+                expected.extend_from_slice(&source[..len]);
+                let mut actual = crate::alloc::vec![0xeeu8; prefix];
+                append_bytes(&mut actual, &source[..len]);
+                assert_eq!(actual, expected, "prefix {prefix}, len {len}");
+            }
+        }
     }
 
     #[test]
