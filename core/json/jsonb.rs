@@ -1550,55 +1550,52 @@ impl Jsonb {
         if depth > MAX_JSON_DEPTH {
             return Err(PError::Message {
                 msg: "Too deep".to_string(),
-                location: Some(pos),
+                location: Some(skip_whitespace_tracking(input, pos, info)),
             });
         }
 
-        if pos >= input.len() {
-            return Err(PError::Message {
-                msg: "Unexpected end of input".to_string(),
-                location: Some(pos),
-            });
-        }
-
-        match input[pos] {
-            b'{' => {
-                pos += 1; // consume '{'
-                pos = self.deserialize_obj(input, pos, depth + 1, info)?;
-            }
-            b'[' => {
-                pos += 1; // consume '['
-                pos = self.deserialize_array(input, pos, depth + 1, info)?;
-            }
-            b't' => {
-                pos = self.deserialize_true(input, pos)?;
-            }
-            b'f' => {
-                pos = self.deserialize_false(input, pos)?;
-            }
-            b'n' | b'N' => {
-                pos = self.deserialize_null_or_nan(input, pos, info)?;
-            }
-            b'"' | b'\'' => {
-                pos = self.deserialize_string(input, pos, info)?;
-            }
-            c if c.is_ascii_digit()
-                || c == b'-'
-                || c == b'+'
-                || c == b'.'
-                || c.eq_ignore_ascii_case(&b'i') =>
-            {
-                pos = self.deserialize_number(input, pos, info)?;
-            }
-            _ => {
+        loop {
+            if pos >= input.len() {
                 return Err(PError::Message {
-                    msg: "Unexpected character".to_string(),
+                    msg: "Unexpected end of input".to_string(),
                     location: Some(pos),
                 });
             }
-        }
 
-        Ok(pos)
+            match input[pos] {
+                b'{' => {
+                    pos += 1; // consume '{'
+                    return self.deserialize_obj(input, pos, depth + 1, info);
+                }
+                b'[' => {
+                    pos += 1; // consume '['
+                    return self.deserialize_array(input, pos, depth + 1, info);
+                }
+                b't' => {
+                    return self.deserialize_true(input, pos);
+                }
+                b'f' => {
+                    return self.deserialize_false(input, pos);
+                }
+                b'n' | b'N' => {
+                    return self.deserialize_null_or_nan(input, pos, info);
+                }
+                b'"' | b'\'' => {
+                    return self.deserialize_string(input, pos, info);
+                }
+                c if c.is_ascii_digit()
+                    || c == b'-'
+                    || c == b'+'
+                    || c == b'.'
+                    || c.eq_ignore_ascii_case(&b'i') =>
+                {
+                    return self.deserialize_number(input, pos, info);
+                }
+                _ => {
+                    pos = skip_whitespace_before_value(input, pos, info)?;
+                }
+            }
+        }
     }
 
     #[inline(never)]
@@ -1645,17 +1642,23 @@ impl Jsonb {
                 });
             }
             pos = self.deserialize_string(input, pos, info)?;
-            pos = skip_whitespace_tracking(input, pos, info);
-            if pos >= input.len() || input[pos] != b':' {
-                return Err(PError::Message {
-                    msg: "Expected : after object key".to_string(),
-                    location: Some(pos),
-                });
+            if input.get(pos) != Some(&b':') {
+                pos = skip_whitespace_and_comments(input, pos, info);
+                if pos >= input.len() || input[pos] != b':' {
+                    return Err(PError::Message {
+                        msg: "Expected : after object key".to_string(),
+                        location: Some(pos),
+                    });
+                }
             }
             pos += 1;
-            pos = skip_whitespace_tracking(input, pos, info);
+            if input.get(pos) == Some(&b' ') {
+                pos += 1;
+            }
             pos = self.deserialize_value(input, pos, depth + 1, info)?;
-            pos = skip_whitespace_tracking(input, pos, info);
+            if !matches!(input.get(pos), Some(b',' | b'}')) {
+                pos = skip_whitespace_and_comments(input, pos, info);
+            }
             if pos >= input.len() {
                 return Err(PError::Message {
                     msg: "Unexpected end of input".to_string(),
@@ -1666,7 +1669,15 @@ impl Jsonb {
                 b'}' => break,
                 b',' => {
                     pos += 1;
-                    pos = skip_whitespace_tracking(input, pos, info);
+                    match input.get(pos) {
+                        Some(b'"') => continue,
+                        Some(b' ') if input.get(pos + 1) == Some(&b'"') => {
+                            pos += 1;
+                            continue;
+                        }
+                        _ => {}
+                    }
+                    pos = skip_whitespace_and_comments(input, pos, info);
                     if pos >= input.len() {
                         return Err(PError::Message {
                             msg: "Unexpected end of input after comma in object".to_string(),
@@ -1737,7 +1748,9 @@ impl Jsonb {
                 });
             }
             pos = self.deserialize_value(input, pos, depth + 1, info)?;
-            pos = skip_whitespace_tracking(input, pos, info);
+            if !matches!(input.get(pos), Some(b',' | b']')) {
+                pos = skip_whitespace_and_comments(input, pos, info);
+            }
             if pos >= input.len() {
                 return Err(PError::Message {
                     msg: "Unexpected end of input".to_string(),
@@ -4729,6 +4742,18 @@ fn find_string_special_byte_swar(input: &[u8], mut pos: usize, quote: u8) -> usi
         pos += 1;
     }
     pos
+}
+
+#[inline(never)]
+fn skip_whitespace_before_value(input: &[u8], pos: usize, info: &mut ParseInfo) -> PResult<usize> {
+    let value_pos = skip_whitespace_and_comments(input, pos, info);
+    if value_pos == pos {
+        return Err(PError::Message {
+            msg: "Unexpected character".to_string(),
+            location: Some(pos),
+        });
+    }
+    Ok(value_pos)
 }
 
 /// The common case is no whitespace at all, so the check for it must

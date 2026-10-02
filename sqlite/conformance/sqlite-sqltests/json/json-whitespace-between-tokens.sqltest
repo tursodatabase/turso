@@ -1,0 +1,207 @@
+@database :memory:
+
+# Whitespace and comments at each place between object and array
+# tokens. Expected values come from SQLite 3.45.1.
+
+test json_whitespace_space_before_colon {
+    WITH t(j) AS (SELECT '{"a" :1}') SELECT json_error_position(j), json_valid(j, 6), CASE WHEN json_error_position(j) = 0 THEN json(j) END FROM t;
+}
+expect {
+    0|1|{"a":1}
+}
+
+test json_whitespace_comment_before_colon {
+    WITH t(j) AS (SELECT '{"a"/*c*/:1}') SELECT json_error_position(j), json_valid(j, 6), CASE WHEN json_error_position(j) = 0 THEN json(j) END FROM t;
+}
+expect {
+    0|1|{"a":1}
+}
+
+test json_whitespace_other_byte_before_colon {
+    WITH t(j) AS (SELECT '{"a" x:1}') SELECT json_error_position(j), json_valid(j, 6), CASE WHEN json_error_position(j) = 0 THEN json(j) END FROM t;
+}
+expect {
+    6|0|
+}
+
+test json_whitespace_end_after_key {
+    WITH t(j) AS (SELECT replace(replace('<"a"  ', '<', char(123)), '>', char(125))) SELECT json_error_position(j), json_valid(j, 6), CASE WHEN json_error_position(j) = 0 THEN json(j) END FROM t;
+}
+expect {
+    7|0|
+}
+
+test json_whitespace_space_after_colon {
+    WITH t(j) AS (SELECT '{"a": 1}') SELECT json_error_position(j), json_valid(j, 6), CASE WHEN json_error_position(j) = 0 THEN json(j) END FROM t;
+}
+expect {
+    0|1|{"a":1}
+}
+
+test json_whitespace_two_spaces_after_colon {
+    WITH t(j) AS (SELECT '{"a":  1}') SELECT json_error_position(j), json_valid(j, 6), CASE WHEN json_error_position(j) = 0 THEN json(j) END FROM t;
+}
+expect {
+    0|1|{"a":1}
+}
+
+test json_whitespace_space_and_newline_after_colon {
+    WITH t(j) AS (SELECT '{"a": ' || char(10) || '1}') SELECT json_error_position(j), json_valid(j, 6), CASE WHEN json_error_position(j) = 0 THEN json(j) END FROM t;
+}
+expect {
+    0|1|{"a":1}
+}
+
+test json_whitespace_space_and_comment_after_colon {
+    WITH t(j) AS (SELECT '{"a": /*c*/1}') SELECT json_error_position(j), json_valid(j, 6), CASE WHEN json_error_position(j) = 0 THEN json(j) END FROM t;
+}
+expect {
+    0|1|{"a":1}
+}
+
+test json_whitespace_comment_after_colon {
+    WITH t(j) AS (SELECT '{"a":/*c*/1}') SELECT json_error_position(j), json_valid(j, 6), CASE WHEN json_error_position(j) = 0 THEN json(j) END FROM t;
+}
+expect {
+    0|1|{"a":1}
+}
+
+test json_whitespace_line_comment_after_colon {
+    WITH t(j) AS (SELECT '{"a"://c' || char(10) || '1}') SELECT json_error_position(j), json_valid(j, 6), CASE WHEN json_error_position(j) = 0 THEN json(j) END FROM t;
+}
+expect {
+    0|1|{"a":1}
+}
+
+test json_whitespace_slash_after_colon {
+    WITH t(j) AS (SELECT '{"a":/ 1}') SELECT json_error_position(j), json_valid(j, 6), CASE WHEN json_error_position(j) = 0 THEN json(j) END FROM t;
+}
+expect {
+    6|0|
+}
+
+test json_whitespace_nbsp_after_colon {
+    WITH t(j) AS (SELECT '{"a":' || char(160) || '1}') SELECT json_error_position(j), json_valid(j, 6), CASE WHEN json_error_position(j) = 0 THEN json(j) END FROM t;
+}
+expect {
+    0|1|{"a":1}
+}
+
+test json_whitespace_space_after_object_value {
+    WITH t(j) AS (SELECT '{"a":1 }') SELECT json_error_position(j), json_valid(j, 6), CASE WHEN json_error_position(j) = 0 THEN json(j) END FROM t;
+}
+expect {
+    0|1|{"a":1}
+}
+
+test json_whitespace_space_before_object_comma {
+    WITH t(j) AS (SELECT '{"a":1 ,"b":2}') SELECT json_error_position(j), json_valid(j, 6), CASE WHEN json_error_position(j) = 0 THEN json(j) END FROM t;
+}
+expect {
+    0|1|{"a":1,"b":2}
+}
+
+test json_whitespace_other_byte_after_object_value {
+    WITH t(j) AS (SELECT '{"a":1 x}') SELECT json_error_position(j), json_valid(j, 6), CASE WHEN json_error_position(j) = 0 THEN json(j) END FROM t;
+}
+expect {
+    8|0|
+}
+
+test json_whitespace_end_after_object_value {
+    WITH t(j) AS (SELECT replace(replace('<"a":1  ', '<', char(123)), '>', char(125))) SELECT json_error_position(j), json_valid(j, 6), CASE WHEN json_error_position(j) = 0 THEN json(j) END FROM t;
+}
+expect {
+    9|0|
+}
+
+test json_whitespace_space_after_object_comma {
+    WITH t(j) AS (SELECT '{"a":1, "b":2}') SELECT json_error_position(j), json_valid(j, 6), CASE WHEN json_error_position(j) = 0 THEN json(j) END FROM t;
+}
+expect {
+    0|1|{"a":1,"b":2}
+}
+
+test json_whitespace_two_spaces_after_object_comma {
+    WITH t(j) AS (SELECT '{"a":1,  "b":2}') SELECT json_error_position(j), json_valid(j, 6), CASE WHEN json_error_position(j) = 0 THEN json(j) END FROM t;
+}
+expect {
+    0|1|{"a":1,"b":2}
+}
+
+test json_whitespace_space_and_comment_after_object_comma {
+    WITH t(j) AS (SELECT '{"a":1, /*c*/"b":2}') SELECT json_error_position(j), json_valid(j, 6), CASE WHEN json_error_position(j) = 0 THEN json(j) END FROM t;
+}
+expect {
+    0|1|{"a":1,"b":2}
+}
+
+test json_whitespace_object_trailing_comma {
+    WITH t(j) AS (SELECT '{"a":1,}') SELECT json_error_position(j), json_valid(j, 6), CASE WHEN json_error_position(j) = 0 THEN json(j) END FROM t;
+}
+expect {
+    0|1|{"a":1}
+}
+
+test json_whitespace_object_trailing_comma_and_space {
+    WITH t(j) AS (SELECT '{"a":1, }') SELECT json_error_position(j), json_valid(j, 6), CASE WHEN json_error_position(j) = 0 THEN json(j) END FROM t;
+}
+expect {
+    0|1|{"a":1}
+}
+
+test json_whitespace_object_two_commas {
+    WITH t(j) AS (SELECT '{"a":1, ,"b":2}') SELECT json_error_position(j), json_valid(j, 6), CASE WHEN json_error_position(j) = 0 THEN json(j) END FROM t;
+}
+expect {
+    9|0|
+}
+
+test json_whitespace_object_comma_then_brace {
+    WITH t(j) AS (SELECT replace(replace('<"a":1,<>', '<', char(123)), '>', char(125))) SELECT json_error_position(j), json_valid(j, 6), CASE WHEN json_error_position(j) = 0 THEN json(j) END FROM t;
+}
+expect {
+    8|0|
+}
+
+test json_whitespace_object_comma_then_end {
+    WITH t(j) AS (SELECT replace(replace('<"a":1, ', '<', char(123)), '>', char(125))) SELECT json_error_position(j), json_valid(j, 6), CASE WHEN json_error_position(j) = 0 THEN json(j) END FROM t;
+}
+expect {
+    9|0|
+}
+
+test json_whitespace_object_comma_then_unquoted_key {
+    WITH t(j) AS (SELECT '{"a":1,b:2}') SELECT json_error_position(j), json_valid(j, 6), CASE WHEN json_error_position(j) = 0 THEN json(j) END FROM t;
+}
+expect {
+    0|1|{"a":1,"b":2}
+}
+
+test json_whitespace_space_after_array_value {
+    WITH t(j) AS (SELECT '[1 ,2 ]') SELECT json_error_position(j), json_valid(j, 6), CASE WHEN json_error_position(j) = 0 THEN json(j) END FROM t;
+}
+expect {
+    0|1|[1,2]
+}
+
+test json_whitespace_other_byte_after_array_value {
+    WITH t(j) AS (SELECT '[1 x]') SELECT json_error_position(j), json_valid(j, 6), CASE WHEN json_error_position(j) = 0 THEN json(j) END FROM t;
+}
+expect {
+    4|0|
+}
+
+test json_whitespace_comment_after_array_value {
+    WITH t(j) AS (SELECT '[1/*c*/,2]') SELECT json_error_position(j), json_valid(j, 6), CASE WHEN json_error_position(j) = 0 THEN json(j) END FROM t;
+}
+expect {
+    0|1|[1,2]
+}
+
+test json_whitespace_end_after_array_value {
+    WITH t(j) AS (SELECT '[1  ') SELECT json_error_position(j), json_valid(j, 6), CASE WHEN json_error_position(j) = 0 THEN json(j) END FROM t;
+}
+expect {
+    5|0|
+}
