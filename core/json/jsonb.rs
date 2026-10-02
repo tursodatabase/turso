@@ -1623,15 +1623,17 @@ impl Jsonb {
         }
 
         let header_pos = self.len();
-        self.write_element_header(header_pos, ElementType::OBJECT, 0, false)
+        let first_member_pos = skip_whitespace_tracking(input, pos, info);
+        let empty = input.get(first_member_pos) == Some(&b'}');
+        self.start_container_header(ElementType::OBJECT, empty)
             .map_err(|_| PError::Message {
                 msg: "Failed to write header".to_string(),
                 location: Some(pos),
             })?;
         let obj_start = self.len();
 
-        pos = skip_whitespace_tracking(input, pos, info);
-        if input.get(pos) == Some(&b'}') {
+        pos = first_member_pos;
+        if empty {
             return Ok(pos + 1);
         }
         loop {
@@ -1705,7 +1707,7 @@ impl Jsonb {
         }
         pos += 1;
         let obj_size = self.len() - obj_start;
-        self.write_element_header(header_pos, ElementType::OBJECT, obj_size, false)
+        self.finish_container_header(header_pos, ElementType::OBJECT, obj_size)
             .map_err(|_| PError::Message {
                 msg: "Failed to write header".to_string(),
                 location: Some(pos),
@@ -1729,15 +1731,17 @@ impl Jsonb {
         }
 
         let header_pos = self.len();
-        self.write_element_header(header_pos, ElementType::ARRAY, 0, false)
+        let first_element_pos = skip_whitespace_tracking(input, pos, info);
+        let empty = input.get(first_element_pos) == Some(&b']');
+        self.start_container_header(ElementType::ARRAY, empty)
             .map_err(|_| PError::Message {
                 msg: "Failed to write header".to_string(),
                 location: Some(pos),
             })?;
         let arr_start = self.len();
 
-        pos = skip_whitespace_tracking(input, pos, info);
-        if input.get(pos) == Some(&b']') {
+        pos = first_element_pos;
+        if empty {
             return Ok(pos + 1);
         }
         loop {
@@ -1789,12 +1793,45 @@ impl Jsonb {
         }
         pos += 1;
         let arr_len = self.len() - arr_start;
-        self.write_element_header(header_pos, ElementType::ARRAY, arr_len, false)
+        self.finish_container_header(header_pos, ElementType::ARRAY, arr_len)
             .map_err(|_| PError::Message {
                 msg: "Failed to write header".to_string(),
                 location: Some(pos),
             })?;
         Ok(pos)
+    }
+
+    #[cfg_attr(not(debug_assertions), inline(always))]
+    fn start_container_header(&mut self, element_type: ElementType, empty: bool) -> Result<()> {
+        let type_bits = element_type as u8;
+        if empty {
+            self.data.try_push(type_bits)?;
+        } else {
+            self.data
+                .try_extend([type_bits | (SIZE_MARKER_8BIT << 4), 0])?;
+        }
+        Ok(())
+    }
+
+    #[cfg_attr(not(debug_assertions), inline(always))]
+    fn finish_container_header(
+        &mut self,
+        header_pos: usize,
+        element_type: ElementType,
+        payload_size: usize,
+    ) -> Result<()> {
+        match payload_size {
+            0..=11 => {
+                self.data[header_pos] = element_type as u8 | ((payload_size as u8) << 4);
+                self.data.copy_within(header_pos + 2.., header_pos + 1);
+                self.data.truncate(self.data.len() - 1);
+            }
+            12..=0xFF => self.data[header_pos + 1] = payload_size as u8,
+            _ => {
+                self.write_element_header(header_pos, element_type, payload_size, true)?;
+            }
+        }
+        Ok(())
     }
 
     #[cfg_attr(not(debug_assertions), inline(always))]
