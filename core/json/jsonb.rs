@@ -4511,15 +4511,35 @@ fn json5_whitespace_len(input: &[u8]) -> usize {
 }
 
 fn scan_quoted_string(input: &[u8], mut pos: usize, quote: u8) -> PResult<(usize, ElementType)> {
-    let unexpected_end = |pos: usize| PError::Message {
-        msg: "Unexpected end of input".to_string(),
-        location: Some(pos),
-    };
     let mut element_type = ElementType::TEXT;
+    #[cfg(target_arch = "x86_64")]
+    while pos + 16 <= input.len() {
+        let chunk_start = pos;
+        let mut mask = string_special_byte_mask_sse2(input, chunk_start, quote);
+        pos = chunk_start + 16;
+        while mask != 0 {
+            let at = chunk_start + mask.trailing_zeros() as usize;
+            let c = input[at];
+            if c == quote {
+                return Ok((at, element_type));
+            }
+            let next = if c == b'\\' {
+                scan_escape(input, at + 1, &mut element_type)?
+            } else {
+                element_type = ElementType::TEXT5;
+                at + 1
+            };
+            if next >= chunk_start + 16 {
+                pos = next;
+                break;
+            }
+            mask &= u32::MAX << (next - chunk_start);
+        }
+    }
     loop {
         pos = find_string_special_byte(input, pos, quote);
         let Some(&c) = input.get(pos) else {
-            return Err(unexpected_end(pos));
+            return Err(unexpected_end_of_string(pos));
         };
         if c == quote {
             return Ok((pos, element_type));
@@ -4529,71 +4549,108 @@ fn scan_quoted_string(input: &[u8], mut pos: usize, quote: u8) -> PResult<(usize
             element_type = ElementType::TEXT5;
             continue;
         }
-        let Some(&escape) = input.get(pos) else {
-            return Err(unexpected_end(pos));
-        };
-        pos += 1;
-        match escape {
-            b'b' | b'f' | b'n' | b'r' | b't' | b'\\' | b'"' | b'/' => {
-                if element_type == ElementType::TEXT {
-                    element_type = ElementType::TEXTJ;
-                }
+        pos = scan_escape(input, pos, &mut element_type)?;
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+fn string_special_byte_mask_sse2(input: &[u8], start: usize, quote: u8) -> u32 {
+    use std::arch::x86_64::{
+        _mm_cmpeq_epi8, _mm_loadu_si128, _mm_min_epu8, _mm_movemask_epi8, _mm_or_si128,
+        _mm_set1_epi8,
+    };
+    assert!(start + 16 <= input.len());
+    // SAFETY: SSE2 is part of the x86_64 baseline, so these intrinsics are
+    // always available, and the assertion keeps the 16-byte unaligned load
+    // inside `input`.
+    unsafe {
+        let chunk = _mm_loadu_si128(input.as_ptr().add(start).cast());
+        let is_quote = _mm_cmpeq_epi8(chunk, _mm_set1_epi8(quote as i8));
+        let is_backslash = _mm_cmpeq_epi8(chunk, _mm_set1_epi8(b'\\' as i8));
+        let last_control = _mm_set1_epi8(0x1F);
+        let is_control = _mm_cmpeq_epi8(_mm_min_epu8(chunk, last_control), chunk);
+        _mm_movemask_epi8(_mm_or_si128(
+            _mm_or_si128(is_quote, is_backslash),
+            is_control,
+        )) as u32
+    }
+}
+
+#[inline(always)]
+fn scan_escape(input: &[u8], mut pos: usize, element_type: &mut ElementType) -> PResult<usize> {
+    let Some(&escape) = input.get(pos) else {
+        return Err(unexpected_end_of_string(pos));
+    };
+    pos += 1;
+    match escape {
+        b'b' | b'f' | b'n' | b'r' | b't' | b'\\' | b'"' | b'/' => {
+            if *element_type == ElementType::TEXT {
+                *element_type = ElementType::TEXTJ;
             }
-            b'u' => {
-                if pos + 4 > input.len() {
-                    return Err(PError::Message {
-                        msg: "Incomplete unicode escape sequence".to_string(),
-                        location: Some(pos),
-                    });
-                }
-                if !input[pos..pos + 4].iter().all(|&h| is_hex_digit(h)) {
-                    return Err(PError::Message {
-                        msg: "Invalid unicode escape sequence".to_string(),
-                        location: Some(pos),
-                    });
-                }
-                pos += 4;
-                if element_type == ElementType::TEXT {
-                    element_type = ElementType::TEXTJ;
-                }
-            }
-            b'\n' | b'\'' | b'0' | b'v' => element_type = ElementType::TEXT5,
-            b'\r' => {
-                if input.get(pos) == Some(&b'\n') {
-                    pos += 1;
-                }
-                element_type = ElementType::TEXT5;
-            }
-            0xe2 if pos + 1 < input.len()
-                && input[pos] == 0x80
-                && (input[pos + 1] == 0xa8 || input[pos + 1] == 0xa9) =>
-            {
-                pos += 2;
-                element_type = ElementType::TEXT5;
-            }
-            b'x' => {
-                if pos + 2 > input.len() {
-                    return Err(PError::Message {
-                        msg: "Incopmlete hex escape sequence".to_string(),
-                        location: Some(pos),
-                    });
-                }
-                if !input[pos..pos + 2].iter().all(|&h| is_hex_digit(h)) {
-                    return Err(PError::Message {
-                        msg: "Invalid hex escape sequence".to_string(),
-                        location: Some(pos),
-                    });
-                }
-                pos += 2;
-                element_type = ElementType::TEXT5;
-            }
-            _ => {
+        }
+        b'u' => {
+            if pos + 4 > input.len() {
                 return Err(PError::Message {
-                    msg: "Invalid escape sequence".to_string(),
+                    msg: "Incomplete unicode escape sequence".to_string(),
                     location: Some(pos),
                 });
             }
+            if !input[pos..pos + 4].iter().all(|&h| is_hex_digit(h)) {
+                return Err(PError::Message {
+                    msg: "Invalid unicode escape sequence".to_string(),
+                    location: Some(pos),
+                });
+            }
+            pos += 4;
+            if *element_type == ElementType::TEXT {
+                *element_type = ElementType::TEXTJ;
+            }
         }
+        b'\n' | b'\'' | b'0' | b'v' => *element_type = ElementType::TEXT5,
+        b'\r' => {
+            if input.get(pos) == Some(&b'\n') {
+                pos += 1;
+            }
+            *element_type = ElementType::TEXT5;
+        }
+        0xe2 if pos + 1 < input.len()
+            && input[pos] == 0x80
+            && (input[pos + 1] == 0xa8 || input[pos + 1] == 0xa9) =>
+        {
+            pos += 2;
+            *element_type = ElementType::TEXT5;
+        }
+        b'x' => {
+            if pos + 2 > input.len() {
+                return Err(PError::Message {
+                    msg: "Incopmlete hex escape sequence".to_string(),
+                    location: Some(pos),
+                });
+            }
+            if !input[pos..pos + 2].iter().all(|&h| is_hex_digit(h)) {
+                return Err(PError::Message {
+                    msg: "Invalid hex escape sequence".to_string(),
+                    location: Some(pos),
+                });
+            }
+            pos += 2;
+            *element_type = ElementType::TEXT5;
+        }
+        _ => {
+            return Err(PError::Message {
+                msg: "Invalid escape sequence".to_string(),
+                location: Some(pos),
+            });
+        }
+    }
+    Ok(pos)
+}
+
+fn unexpected_end_of_string(pos: usize) -> PError {
+    PError::Message {
+        msg: "Unexpected end of input".to_string(),
+        location: Some(pos),
     }
 }
 
