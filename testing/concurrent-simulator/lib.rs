@@ -576,6 +576,10 @@ pub struct SimulatorFiber {
     yield_injector: Arc<SimulatorYieldInjector>,
     state: FiberState,
     statement: RefCell<Option<Statement>>,
+    /// A read statement parked mid-execution by `Operation::PausedRead`.
+    /// Other operations run on the connection while it sits here;
+    /// `Operation::ResumePausedRead` moves it back and drains it.
+    paused_statement: RefCell<Option<Statement>>,
     rows: Vec<Vec<Value>>,
     /// Current execution ID for tracing statement lifecycle
     execution_id: Option<u64>,
@@ -1029,8 +1033,28 @@ impl Whopper {
                                     let values: Vec<Value> = row.get_values().cloned().collect();
                                     drop(stmt_borrow);
                                     self.context.fibers[fiber_idx].rows.push(values);
+                                } else {
+                                    drop(stmt_borrow);
                                 }
-                                Ok(None)
+                                if matches!(
+                                    self.context.fibers[fiber_idx].current_op,
+                                    Some(Operation::PausedRead { .. })
+                                ) {
+                                    // A PausedRead completes on its first row:
+                                    // park the still-mid-execution statement on
+                                    // the fiber so later operations run on the
+                                    // same connection while it stays suspended.
+                                    let stmt = self.context.fibers[fiber_idx]
+                                        .statement
+                                        .borrow_mut()
+                                        .take();
+                                    self.context.fibers[fiber_idx]
+                                        .paused_statement
+                                        .replace(stmt);
+                                    Ok(Some(()))
+                                } else {
+                                    Ok(None)
+                                }
                             }
                             turso_core::StepResult::Done => Ok(Some(())),
                             turso_core::StepResult::Busy => Err(turso_core::LimboError::Busy),
@@ -1180,6 +1204,7 @@ impl Whopper {
                         sim_state: &self.context.state,
                         opts: &self.opts,
                         enable_mvcc: self.context.enable_mvcc,
+                        has_paused_read: fiber.paused_statement.borrow().is_some(),
                         tables_vec: self.context.state.tables_vec(),
                     };
 
@@ -1456,7 +1481,7 @@ impl Whopper {
             .context
             .fibers
             .iter()
-            .any(|f| f.statement.borrow().is_some())
+            .any(|f| f.statement.borrow().is_some() || f.paused_statement.borrow().is_some())
         {
             if drain_iterations >= self.max_drain_steps {
                 let stuck: Vec<usize> = self
@@ -1464,7 +1489,10 @@ impl Whopper {
                     .fibers
                     .iter()
                     .enumerate()
-                    .filter_map(|(i, f)| f.statement.borrow().is_some().then_some(i))
+                    .filter_map(|(i, f)| {
+                        (f.statement.borrow().is_some() || f.paused_statement.borrow().is_some())
+                            .then_some(i)
+                    })
                     .collect();
                 anyhow::bail!(
                     "{reason} drain exceeded max_drain_steps ({}) with statements still live on \
@@ -1474,8 +1502,12 @@ impl Whopper {
                 );
             }
             for fiber_idx in 0..self.context.fibers.len() {
-                if self.context.fibers[fiber_idx].statement.borrow().is_none() {
-                    continue;
+                let fiber = &self.context.fibers[fiber_idx];
+                if fiber.statement.borrow().is_none() {
+                    let Some(stmt) = fiber.paused_statement.borrow_mut().take() else {
+                        continue;
+                    };
+                    fiber.statement.replace(Some(stmt));
                 }
                 let Some(op_result) = self.step_drained_statement(fiber_idx) else {
                     continue;
@@ -1503,6 +1535,7 @@ impl Whopper {
             let fibers = self.context.fibers.drain(..).collect::<Vec<_>>();
             for fiber in fibers {
                 drop(fiber.statement.into_inner());
+                drop(fiber.paused_statement.into_inner());
                 if self.close_connections_gracefully {
                     if let Err(e) = fiber.connection.close() {
                         debug!("Error closing connection during restart: {}", e);
@@ -1696,6 +1729,7 @@ impl Whopper {
                 ))),
                 state: FiberState::Idle,
                 statement: RefCell::new(None),
+                paused_statement: RefCell::new(None),
                 rows: vec![],
                 execution_id: None,
                 txn_id: None,

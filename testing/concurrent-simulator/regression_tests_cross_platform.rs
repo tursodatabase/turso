@@ -499,3 +499,155 @@ fn parse_edn_read(slice: &str) -> Option<(String, bool, &str)> {
     }
     Some((key.to_string(), false, rest))
 }
+
+/// Regression test for the production panic
+/// "transaction should exist in txs map"
+/// (https://github.com/tursodatabase/turso-server/issues/2972).
+///
+/// A client that holds a rows handle open (a read statement paused
+/// mid-rows) can run other statements on the same connection, including
+/// COMMIT. COMMIT removes the MVCC transaction from the txs map while the
+/// paused statement's cursors still reference it, and resuming the
+/// statement then panics inside turso_core instead of returning an error.
+///
+/// This drives the whopper simulator with a fixed operation script:
+/// BEGIN CONCURRENT, pause a SELECT after its first row, COMMIT, resume the
+/// SELECT. The run must complete without panicking; finishing the scan or
+/// failing the resumed statement with a clean error are both acceptable.
+/// While the bug exists this test FAILS with the panic.
+#[test]
+fn paused_read_across_commit_must_not_panic() {
+    run_paused_read_across_commit(true);
+}
+
+#[test]
+fn paused_read_across_commit_in_wal_must_not_panic() {
+    run_paused_read_across_commit(false);
+}
+
+#[test]
+fn paused_read_reopen_preserves_autocommit_sequence_value() {
+    use std::sync::Mutex;
+    use turso_whopper::properties::SequenceCorrectnessProperty;
+    use turso_whopper::{Operation, TxMode, Whopper, WhopperOpts};
+
+    let script = ScriptedWorkload {
+        ops: vec![
+            Operation::Execute {
+                sql: "CREATE TABLE kv (key TEXT PRIMARY KEY, value BLOB)".to_string(),
+            },
+            Operation::Execute {
+                sql: "INSERT INTO kv VALUES ('k1', zeroblob(8)), ('k2', zeroblob(8))".to_string(),
+            },
+            Operation::CreateSequence {
+                seq_name: "s".to_string(),
+                start: -1,
+                increment: -1,
+                min_value: -10,
+                max_value: -1,
+                cycle: false,
+            },
+            Operation::Begin {
+                mode: TxMode::Concurrent,
+            },
+            Operation::PausedRead {
+                sql: "SELECT key FROM kv ORDER BY key".to_string(),
+            },
+            Operation::Commit,
+            Operation::NextVal {
+                seq_name: "s".to_string(),
+            },
+            Operation::Begin {
+                mode: TxMode::Concurrent,
+            },
+            Operation::Rollback,
+            Operation::IntegrityCheck,
+        ],
+        next: Mutex::new(0),
+    };
+    let mut whopper = Whopper::new(WhopperOpts {
+        seed: Some(9),
+        max_connections: 1,
+        max_steps: 5_000,
+        enable_mvcc: true,
+        workloads: vec![(1, Box::new(script))],
+        properties: vec![Box::new(SequenceCorrectnessProperty::new())],
+        ..Default::default()
+    })
+    .unwrap();
+    while whopper.stats.integrity_checks == 0 && !whopper.is_done() {
+        whopper.step().unwrap();
+    }
+    assert_eq!(whopper.stats.sequence_nextvals, 1);
+    assert_eq!(whopper.stats.integrity_checks, 1);
+    whopper.reopen().unwrap();
+}
+
+fn run_paused_read_across_commit(enable_mvcc: bool) {
+    use std::sync::Mutex;
+    use turso_whopper::properties::IntegrityCheckProperty;
+    use turso_whopper::{Operation, TxMode, Whopper, WhopperOpts};
+
+    let script = ScriptedWorkload {
+        ops: vec![
+            Operation::Execute {
+                sql: "CREATE TABLE kv (key TEXT PRIMARY KEY, value BLOB)".to_string(),
+            },
+            Operation::Execute {
+                sql: "INSERT INTO kv VALUES ('k1', zeroblob(8)), ('k2', zeroblob(8)), \
+                      ('k3', zeroblob(8))"
+                    .to_string(),
+            },
+            Operation::Begin {
+                mode: if enable_mvcc {
+                    TxMode::Concurrent
+                } else {
+                    TxMode::Deferred
+                },
+            },
+            Operation::PausedRead {
+                sql: "SELECT key, length(value) FROM kv ORDER BY key".to_string(),
+            },
+            Operation::Commit,
+            Operation::WalCheckpoint {
+                mode: "TRUNCATE".to_string(),
+            },
+            Operation::ResumePausedRead,
+            Operation::IntegrityCheck,
+        ],
+        next: Mutex::new(0),
+    };
+
+    let opts = WhopperOpts {
+        seed: Some(if enable_mvcc { 7 } else { 8 }),
+        max_connections: 1,
+        max_steps: 5_000,
+        enable_mvcc,
+        workloads: vec![(1, Box::new(script))],
+        properties: vec![Box::new(IntegrityCheckProperty)],
+        ..Default::default()
+    };
+    let mut whopper = Whopper::new(opts).expect("create whopper");
+    whopper.run().expect("run must complete without panicking");
+    assert_eq!(whopper.stats.integrity_checks, 1);
+}
+
+struct ScriptedWorkload {
+    ops: Vec<turso_whopper::Operation>,
+    next: std::sync::Mutex<usize>,
+}
+
+impl turso_whopper::workloads::Workload for ScriptedWorkload {
+    fn generate(
+        &self,
+        _ctx: &turso_whopper::workloads::WorkloadContext,
+        _rng: &mut rand_chacha::ChaCha8Rng,
+    ) -> Option<turso_whopper::Operation> {
+        let mut next = self.next.lock().unwrap();
+        let op = self.ops.get(*next).cloned();
+        if op.is_some() {
+            *next += 1;
+        }
+        op
+    }
+}

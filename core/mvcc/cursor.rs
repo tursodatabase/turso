@@ -656,6 +656,7 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> MvccLazyCursor<Clock
 
     /// Returns the current row as an immutable record.
     pub fn current_row(&mut self) -> IOResultOr<Option<&crate::types::ImmutableRecord>> {
+        self.db.check_read_tx(self.tx_id)?;
         if self.get_null_flag() {
             return Ok(IOResult::Done(None));
         }
@@ -717,6 +718,7 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> MvccLazyCursor<Clock
     }
 
     pub fn read_mvcc_current_row(&self) -> Result<Option<Row>> {
+        self.db.check_read_tx(self.tx_id)?;
         let (row_id, versions) = match &self.current_pos {
             CursorPosition::Loaded {
                 row_id,
@@ -1259,6 +1261,7 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> CursorTrait
     for MvccLazyCursor<Clock, A>
 {
     fn last(&mut self) -> IOResultOr<()> {
+        self.db.check_read_tx(self.tx_id)?;
         // A cursor may be NullRow'd during outer-join unmatched emission.
         // Repositioning to a real row must clear that synthetic NULL state.
         self.set_null_flag(false);
@@ -1334,6 +1337,7 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> CursorTrait
     ///
     /// Uses dual-cursor approach: only advances the cursor that was just consumed.
     fn next(&mut self) -> IOResultOr<()> {
+        self.db.check_read_tx(self.tx_id)?;
         if self.state.is_none() {
             // If BeforeFirst and peek not initialized, initialize the iterators and peek values
             if matches!(self.current_pos, CursorPosition::BeforeFirst) {
@@ -1428,6 +1432,7 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> CursorTrait
     ///
     /// Uses dual-cursor approach: only advances the cursor that was just consumed.
     fn prev(&mut self) -> IOResultOr<()> {
+        self.db.check_read_tx(self.tx_id)?;
         if self.state.is_none() {
             // If End and peek not initialized, initialize via last()
             if matches!(self.current_pos, CursorPosition::End) {
@@ -1513,6 +1518,7 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> CursorTrait
     }
 
     fn rowid(&mut self) -> IOResultOr<Option<i64>> {
+        self.db.check_read_tx(self.tx_id)?;
         if self.get_null_flag() {
             return Ok(IOResult::Done(None));
         }
@@ -1558,6 +1564,7 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> CursorTrait
     }
 
     fn seek(&mut self, seek_key: SeekKey<'_>, op: SeekOp) -> IOResultOr<SeekResult> {
+        self.db.check_read_tx(self.tx_id)?;
         // gt -> lower_bound bound excluded, we want first row after row_id
         // ge -> lower_bound bound included, we want first row equal to row_id or first row after row_id
         // lt -> upper_bound bound excluded, we want last row before row_id
@@ -1954,6 +1961,7 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> CursorTrait
     }
 
     fn exists(&mut self, key: &Value) -> IOResultOr<bool> {
+        self.db.check_read_tx(self.tx_id)?;
         if self.state.is_none() {
             self.invalidate_record();
             let int_key = match key {
@@ -2091,6 +2099,7 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> CursorTrait
     }
 
     fn count(&mut self) -> IOResultOr<usize> {
+        self.db.check_read_tx(self.tx_id)?;
         loop {
             let state = self.count_state;
             match state {
@@ -2146,6 +2155,7 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> CursorTrait
     }
 
     fn rewind(&mut self) -> IOResultOr<()> {
+        self.db.check_read_tx(self.tx_id)?;
         // A cursor may be NullRow'd during outer-join unmatched emission.
         // Repositioning to a real row must clear that synthetic NULL state.
         self.set_null_flag(false);
@@ -2230,6 +2240,7 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> CursorTrait
     }
 
     fn seek_end(&mut self) -> IOResultOr<()> {
+        self.db.check_read_tx(self.tx_id)?;
         if self.is_btree_allocated() {
             // Defer to btree cursor's seek_end implementation
             self.btree_cursor.seek_end()
