@@ -3,6 +3,7 @@ use crate::schema::Column;
 use crate::sync::atomic::{AtomicPtr, AtomicU64, Ordering};
 use crate::sync::{Arc, RwLock, Weak};
 use crate::util::columns_from_create_table_body;
+use crate::vdbe::Register;
 use crate::{Connection, LimboError, SymbolTable, Value};
 use std::ffi::c_void;
 use std::ptr::NonNull;
@@ -292,15 +293,17 @@ impl VirtualTableCursor {
         }
     }
 
-    pub(crate) fn column(&self, column: usize) -> crate::Result<Value> {
+    pub(crate) fn column_into(&self, column: usize, dest: &mut Register) -> crate::Result<()> {
         if self.null_flag {
-            return Ok(Value::Null);
+            dest.set_null();
+            return Ok(());
         }
         match &self.inner {
-            VirtualTableCursorInner::Pragma(cursor) => cursor.column(column),
-            VirtualTableCursorInner::External(cursor) => cursor.column(column),
-            VirtualTableCursorInner::Internal(cursor) => cursor.read().column(column),
+            VirtualTableCursorInner::Pragma(cursor) => dest.set_value(cursor.column(column)?),
+            VirtualTableCursorInner::External(cursor) => dest.set_value(cursor.column(column)?),
+            VirtualTableCursorInner::Internal(cursor) => cursor.read().column_into(column, dest)?,
         }
+        Ok(())
     }
 
     pub(crate) fn filter(
@@ -614,6 +617,10 @@ pub trait InternalVirtualTableCursor: Send + Sync {
     fn next(&mut self) -> Result<bool, LimboError>;
     fn rowid(&self) -> i64;
     fn column(&self, column: usize) -> Result<Value, LimboError>;
+    fn column_into(&self, column: usize, dest: &mut Register) -> Result<(), LimboError> {
+        dest.set_value(self.column(column)?);
+        Ok(())
+    }
     fn filter(
         &mut self,
         args: &[Value],

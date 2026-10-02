@@ -12,6 +12,7 @@ use crate::{
         vtab::columns::{Columns, Key},
     },
     types::AsValueRef,
+    vdbe::Register,
     vtab::{InternalVirtualTable, InternalVirtualTableCursor},
     Connection, LimboError, Value,
 };
@@ -453,6 +454,14 @@ impl InternalVirtualTableCursor for JsonEachCursor {
             _ => Value::Null,
         })
     }
+
+    fn column_into(&self, idx: usize, dest: &mut Register) -> Result<(), LimboError> {
+        if matches!(idx, COL_VALUE | COL_ATOM) && self.columns.write_text_atom(&self.json, dest)? {
+            return Ok(());
+        }
+        dest.set_value(self.column(idx)?);
+        Ok(())
+    }
 }
 
 fn json_iterator_from(json: &Jsonb, pos: usize) -> crate::Result<IteratorState> {
@@ -494,6 +503,7 @@ mod columns {
             OutputVariant,
         },
         types::Text,
+        vdbe::Register,
         LimboError, Value,
     };
 
@@ -593,6 +603,30 @@ mod columns {
 
         pub(super) fn key(&self) -> Value {
             self.key.key_representation()
+        }
+
+        pub(super) fn write_text_atom(
+            &self,
+            json: &Jsonb,
+            dest: &mut Register,
+        ) -> Result<bool, LimboError> {
+            let Ok((element_type, payload)) = jsonb::element_payload(json.as_slice(), self.value)
+            else {
+                return Ok(false);
+            };
+            if !matches!(element_type, ElementType::TEXT | ElementType::TEXTRAW) {
+                return Ok(false);
+            }
+            let Ok(text) = std::str::from_utf8(payload) else {
+                return Ok(false);
+            };
+            match dest {
+                Register::Value(Value::Text(existing)) => {
+                    existing.replace_with_bytes(text.as_bytes())?
+                }
+                _ => dest.set_text(Text::new(text.to_string()))?,
+            }
+            Ok(true)
         }
 
         fn atom_at(json: &Jsonb, pos: usize) -> Result<Value, LimboError> {
@@ -816,5 +850,34 @@ impl InPlaceJsonPath {
 
     fn key(&self) -> &Key {
         &self.last_element
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn json_each_writes_text_values_into_the_register_buffer() {
+        let mut cursor = JsonEachCursor::empty(JsonTraversalMode::Each);
+        assert!(cursor
+            .filter(&[Value::build_text(r#"["first","second"]"#)], None, 0)
+            .unwrap());
+        let mut dest = Register::Value(Value::build_text(String::with_capacity(64)));
+        cursor.column_into(COL_VALUE, &mut dest).unwrap();
+        assert_eq!(dest.get_value(), &Value::build_text("first"));
+        let first_buffer = text_buffer(&dest);
+
+        assert!(cursor.next().unwrap());
+        cursor.column_into(COL_VALUE, &mut dest).unwrap();
+        assert_eq!(dest.get_value(), &Value::build_text("second"));
+        assert_eq!(text_buffer(&dest), first_buffer);
+    }
+
+    fn text_buffer(register: &Register) -> *const u8 {
+        let Value::Text(text) = register.get_value() else {
+            panic!("the register holds text");
+        };
+        text.as_str().as_ptr()
     }
 }
