@@ -185,6 +185,7 @@ pub struct JsonEachCursor {
     traversal_mode: JsonTraversalMode,
     object_key: String,
     root_path: Option<RootPath>,
+    pop_path_before_next: bool,
 }
 
 struct TraversalState {
@@ -205,6 +206,7 @@ impl JsonEachCursor {
             traversal_mode,
             object_key: String::new(),
             root_path: None,
+            pop_path_before_next: false,
         }
     }
 
@@ -246,6 +248,7 @@ impl InternalVirtualTableCursor for JsonEachCursor {
     ) -> Result<bool, LimboError> {
         self.traversal_states.clear();
         self.rowid = 0;
+        self.pop_path_before_next = false;
 
         if args.is_empty() || args[0] == Value::Null {
             return Ok(false);
@@ -313,10 +316,9 @@ impl InternalVirtualTableCursor for JsonEachCursor {
                     self.columns.set(
                         self.path_to_current_value.key(),
                         root,
-                        &self.path_to_current_value.string,
+                        self.path_to_current_value.cursor(),
                         None,
-                        self.path_to_current_value
-                            .read(self.path_to_current_value.cursor_before_last_element()),
+                        self.path_to_current_value.cursor_before_last_element(),
                     );
                     Ok(true)
                 }
@@ -325,6 +327,9 @@ impl InternalVirtualTableCursor for JsonEachCursor {
     }
 
     fn next(&mut self) -> Result<bool, LimboError> {
+        if std::mem::take(&mut self.pop_path_before_next) {
+            self.path_to_current_value.pop();
+        }
         self.rowid += 1;
         if self.traversal_states.is_empty() {
             return Ok(false);
@@ -366,15 +371,11 @@ impl InternalVirtualTableCursor for JsonEachCursor {
                 self.columns.set(
                     self.path_to_current_value.key(),
                     value,
-                    &self.path_to_current_value.string,
+                    self.path_to_current_value.cursor(),
                     parent_id,
-                    self.path_to_current_value
-                        .read(traversal_state.innermost_container_cursor),
+                    traversal_state.innermost_container_cursor,
                 );
-
-                if !recurses {
-                    self.path_to_current_value.pop();
-                }
+                self.pop_path_before_next = !recurses;
             }
             IteratorState::Object(state) => {
                 let Some(((_idx, key, value), new_state)) = self.json.object_iterator_next(&state)
@@ -403,15 +404,11 @@ impl InternalVirtualTableCursor for JsonEachCursor {
                 self.columns.set(
                     self.path_to_current_value.key(),
                     value,
-                    &self.path_to_current_value.string,
+                    self.path_to_current_value.cursor(),
                     parent_id,
-                    self.path_to_current_value
-                        .read(traversal_state.innermost_container_cursor),
+                    traversal_state.innermost_container_cursor,
                 );
-
-                if !recursing {
-                    self.path_to_current_value.pop();
-                }
+                self.pop_path_before_next = !recursing;
             }
             IteratorState::Primitive(value) => {
                 let key = match self.traversal_mode {
@@ -421,10 +418,9 @@ impl InternalVirtualTableCursor for JsonEachCursor {
                 self.columns.set(
                     key,
                     value,
-                    &self.path_to_current_value.string,
+                    self.path_to_current_value.cursor(),
                     None,
-                    self.path_to_current_value
-                        .read(traversal_state.innermost_container_cursor),
+                    traversal_state.innermost_container_cursor,
                 );
             }
         };
@@ -444,8 +440,8 @@ impl InternalVirtualTableCursor for JsonEachCursor {
             COL_ATOM => self.columns.atom(&self.json)?,
             COL_ID => Value::from_i64(self.rowid),
             COL_PARENT => self.columns.parent(),
-            COL_FULLKEY => self.columns.fullkey(),
-            COL_PATH => self.columns.path(),
+            COL_FULLKEY => self.columns.fullkey(&self.path_to_current_value.string),
+            COL_PATH => self.columns.path(&self.path_to_current_value.string),
             _ => Value::Null,
         })
     }
@@ -544,9 +540,9 @@ mod columns {
     pub(super) struct Columns {
         key: Key,
         value: usize,
-        fullkey: String,
+        fullkey_len: usize,
         parent_id: Option<i64>,
-        innermost_container_path: String,
+        innermost_container_path_len: usize,
     }
 
     impl Default for Columns {
@@ -554,9 +550,9 @@ mod columns {
             Self {
                 key: Key::empty(),
                 value: 0,
-                fullkey: "".to_owned(),
+                fullkey_len: 0,
                 parent_id: None,
-                innermost_container_path: "".to_owned(),
+                innermost_container_path_len: 0,
             }
         }
     }
@@ -566,18 +562,15 @@ mod columns {
             &mut self,
             key: &Key,
             value: usize,
-            fullkey: &str,
+            fullkey_len: usize,
             parent_id: Option<i64>,
-            innermost_container_path: &str,
+            innermost_container_path_len: usize,
         ) {
             self.key.clone_from(key);
             self.value = value;
-            self.fullkey.clear();
-            self.fullkey.push_str(fullkey);
+            self.fullkey_len = fullkey_len;
             self.parent_id = parent_id;
-            self.innermost_container_path.clear();
-            self.innermost_container_path
-                .push_str(innermost_container_path);
+            self.innermost_container_path_len = innermost_container_path_len;
         }
 
         pub(super) fn atom(&self, json: &Jsonb) -> Result<Value, LimboError> {
@@ -654,12 +647,14 @@ mod columns {
             }
         }
 
-        pub(super) fn fullkey(&self) -> Value {
-            Value::Text(Text::new(self.fullkey.clone()))
+        pub(super) fn fullkey(&self, path: &str) -> Value {
+            Value::Text(Text::new(path[..self.fullkey_len].to_owned()))
         }
 
-        pub(super) fn path(&self) -> Value {
-            Value::Text(Text::new(self.innermost_container_path.clone()))
+        pub(super) fn path(&self, path: &str) -> Value {
+            Value::Text(Text::new(
+                path[..self.innermost_container_path_len].to_owned(),
+            ))
         }
 
         pub(super) fn parent(&self) -> Value {
@@ -815,10 +810,6 @@ impl InPlaceJsonPath {
 
     fn cursor(&self) -> InPlaceJsonPathCursor {
         self.string.len()
-    }
-
-    fn read(&self, cursor: InPlaceJsonPathCursor) -> &str {
-        &self.string[0..cursor]
     }
 
     fn reset_to_root(&mut self) {
