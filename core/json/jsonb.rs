@@ -4582,6 +4582,7 @@ fn scan_escape(input: &[u8], mut pos: usize, element_type: &mut ElementType) -> 
     let Some(&escape) = input.get(pos) else {
         return Err(unexpected_end_of_string(pos));
     };
+    let escape_pos = pos;
     pos += 1;
     match escape {
         b'b' | b'f' | b'n' | b'r' | b't' | b'\\' | b'"' | b'/' => {
@@ -4593,13 +4594,13 @@ fn scan_escape(input: &[u8], mut pos: usize, element_type: &mut ElementType) -> 
             if pos + 4 > input.len() {
                 return Err(PError::Message {
                     msg: "Incomplete unicode escape sequence".to_string(),
-                    location: Some(pos),
+                    location: Some(escape_pos),
                 });
             }
             if !input[pos..pos + 4].iter().all(|&h| is_hex_digit(h)) {
                 return Err(PError::Message {
                     msg: "Invalid unicode escape sequence".to_string(),
-                    location: Some(pos),
+                    location: Some(escape_pos),
                 });
             }
             pos += 4;
@@ -4625,13 +4626,13 @@ fn scan_escape(input: &[u8], mut pos: usize, element_type: &mut ElementType) -> 
             if pos + 2 > input.len() {
                 return Err(PError::Message {
                     msg: "Incopmlete hex escape sequence".to_string(),
-                    location: Some(pos),
+                    location: Some(escape_pos),
                 });
             }
             if !input[pos..pos + 2].iter().all(|&h| is_hex_digit(h)) {
                 return Err(PError::Message {
                     msg: "Invalid hex escape sequence".to_string(),
-                    location: Some(pos),
+                    location: Some(escape_pos),
                 });
             }
             pos += 2;
@@ -4640,7 +4641,7 @@ fn scan_escape(input: &[u8], mut pos: usize, element_type: &mut ElementType) -> 
         _ => {
             return Err(PError::Message {
                 msg: "Invalid escape sequence".to_string(),
-                location: Some(pos),
+                location: Some(escape_pos),
             });
         }
     }

@@ -3604,3 +3604,66 @@ test json-string-closing-quote-right-after-an-escape {
 expect {
     0|C80F616161616161616161616161615C6E
 }
+
+test json-error-position-of-invalid-escape {
+    SELECT json_error_position(CAST(X'2261625c7122' AS TEXT));
+}
+expect {
+    5
+}
+
+test json-error-position-of-short-unicode-escape {
+    SELECT json_error_position(CAST(X'2261625c75313222' AS TEXT));
+}
+expect {
+    5
+}
+
+test json-error-position-of-unicode-escape-with-other-bytes {
+    SELECT json_error_position(CAST(X'2261625c755a5a5a5a22' AS TEXT));
+}
+expect {
+    5
+}
+
+test json-error-position-of-short-hex-escape {
+    SELECT json_error_position(CAST(X'2261625c783422' AS TEXT));
+}
+expect {
+    5
+}
+
+test json-error-position-of-hex-escape-with-other-bytes {
+    SELECT json_error_position(CAST(X'2261625c785a5a22' AS TEXT));
+}
+expect {
+    5
+}
+
+test json-error-position-of-invalid-escape-in-single-quotes {
+    SELECT json_error_position(CAST(X'2761625c7127' AS TEXT));
+}
+expect {
+    5
+}
+
+test json-error-position-of-invalid-escape-in-a-key {
+    SELECT json_error_position(CAST(X'7b22615c71223a317d' AS TEXT));
+}
+expect {
+    5
+}
+
+test json-error-position-of-short-unicode-escape-at-the-end {
+    SELECT json_error_position(CAST(X'5b2261625c753132' AS TEXT));
+}
+expect {
+    6
+}
+
+test json-error-position-of-invalid-escape-after-the-first-chunk {
+    SELECT json_error_position(CAST(X'2261616161616161616161616161616161616161615c71626262626262626262626262626262626262626222' AS TEXT));
+}
+expect {
+    23
+}
