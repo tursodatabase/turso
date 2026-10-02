@@ -695,7 +695,9 @@ mod tests {
 
         assert!(cache.lookup(Value::build_text("[2]")).unwrap().is_none());
         assert!(cache
-            .lookup(Value::from_blob(b"[1]".to_vec()))
+            .lookup(Value::from_blob(
+                crate::types::value_blob_from_slice(b"[1]").unwrap()
+            ))
             .unwrap()
             .is_none());
         assert_eq!(cache.lookup(&key).unwrap(), Some(value));
@@ -711,7 +713,7 @@ mod tests {
             cache.insert(key, value.try_clone().unwrap()).unwrap();
         }
 
-        let blob_key = Value::from_blob(b"[0]".to_vec());
+        let blob_key = Value::from_blob(crate::types::value_blob_from_slice(b"[0]").unwrap());
         let blob_value = Jsonb::from_str("[0]").unwrap();
         cache
             .insert(&blob_key, blob_value.try_clone().unwrap())
