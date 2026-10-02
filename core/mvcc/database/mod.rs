@@ -4664,7 +4664,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
     /// `begin` here: a transaction's *physical* schema (root pages) can run ahead of its *data*
     /// snapshot, because a checkpoint allocating a root page is not a logical schema change.
     /// Whether the btree should actually be read at the snapshot is decided separately by
-    /// [`Self::is_btree_allocated`] / `resolve_root_page`, which do gate on
+    /// `is_btree_allocated_at` / `resolve_root_page_at`, which do gate on
     /// `begin`. `u64::MAX` resolves the current live owner.
     pub fn get_table_id_from_root_page_at(&self, root_page: i64, snapshot_ts: u64) -> MVTableId {
         self.try_get_table_id_from_root_page_at(root_page, snapshot_ts)

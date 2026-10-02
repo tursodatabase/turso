@@ -667,7 +667,7 @@ pub fn begin_write_btree_page(
 /// `[1,2,3,6,7,9,10,11,12]`
 //
 /// we want to collect this into runs of:
-/// `[1,2,3]`, `[6,7], [9,10,11,12]`
+/// `[1,2,3]`, `[6,7]`, `[9,10,11,12]`
 /// and submit each run as a `writev` call,
 /// for 3 total syscalls instead of 9.
 ///

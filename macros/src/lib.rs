@@ -537,7 +537,7 @@ pub fn derive_vtab_module(input: TokenStream) -> TokenStream {
 ///            .create(flags & 1 != 0)
 ///            .open(path)
 ///            .map_err(|_| ResultCode::Error)?;
-///        Ok(File { file })
+///        Ok(TestFile { file })
 ///    }
 ///
 ///    fn run_once(&self) -> Result<()> {
