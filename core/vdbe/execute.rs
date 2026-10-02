@@ -1607,31 +1607,14 @@ pub fn op_vfilter(
         } else {
             None
         };
-        let arg_registers = &mut state.registers[*args_reg..*args_reg + *arg_count];
-        let mut args = crate::alloc::Vec::try_with_capacity_ext(*arg_count)?;
-        for register in arg_registers.iter_mut() {
-            let value = match register {
-                Register::Value(value) => std::mem::replace(value, Value::Null),
-                register => register.get_value().try_clone()?,
-            };
-            args.try_push(value)?;
-        }
         let cursor = get_cursor!(state, *cursor_id).as_virtual_mut();
-        let has_rows = cursor.filter(
+        cursor.filter(
             *idx_num as i32,
             idx_str,
-            *arg_count,
-            &args,
+            &mut state.registers[*args_reg..*args_reg + *arg_count],
             #[cfg(feature = "json")]
             &state.json_cache,
-        );
-        let arg_registers = &mut state.registers[*args_reg..*args_reg + *arg_count];
-        for (register, value) in arg_registers.iter_mut().zip(args) {
-            if let Register::Value(slot) = register {
-                *slot = value;
-            }
-        }
-        has_rows?
+        )?
     };
     // Increment filter_operations metric for virtual table filter
     state.metrics.filter_operations = state.metrics.filter_operations.wrapping_add(1);
