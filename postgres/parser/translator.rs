@@ -2469,6 +2469,16 @@ impl PostgreSQLTranslator {
                     "AStar should not be translated as expression".to_string(),
                 ))
             }
+            Some(pg_query::protobuf::node::Node::RowExpr(row_expr)) => {
+                let args = row_expr
+                    .args
+                    .iter()
+                    .map(|e| Ok(Box::new(self.translate_expr(e)?)))
+                    .collect::<Result<Vec<_>, ParseError>>()?;
+                let res = ast::Expr::Parenthesized(args);
+
+                Ok(res)
+            }
             _ => Err(ParseError::ParseError(format!(
                 "Unsupported expression type: {:?}",
                 node.node
@@ -7062,6 +7072,58 @@ mod tests {
                         assert_eq!(args.len(), 3);
                     } else {
                         panic!("Expected FunctionCall for tags[1:3], got: {expr:?}");
+                    }
+                } else {
+                    panic!("Expected Expr column");
+                }
+            } else {
+                panic!("Expected Select variant");
+            }
+        } else {
+            panic!("Expected Select statement");
+        }
+    }
+
+    #[test]
+    fn test_row_expr() {
+        let translator = PostgreSQLTranslator::new();
+        let sql = "SELECT (a,2) > (3,4) FROM t;";
+        let parsed = crate::parse(sql).unwrap();
+        let translated = translator.translate(&parsed).unwrap();
+        if let ast::Stmt::Select(select) = translated {
+            if let ast::OneSelect::Select { columns, .. } = &select.body.select {
+                let col = &columns[0];
+                if let ast::ResultColumn::Expr(expr, _) = col {
+                    if let ast::Expr::Binary(lhs, op, rhs) = &**expr {
+                        assert_eq!(*op, ast::Operator::Greater);
+                        if let ast::Expr::Parenthesized(lhs_elems) = &**lhs {
+                            assert_eq!(lhs_elems.len(), 2);
+                            assert!(
+                                matches!(*lhs_elems[0], ast::Expr::Id(_)),
+                                "expected Id for LHS, got: {lhs_elems:?}"
+                            );
+                            assert!(
+                                matches!(*lhs_elems[1], ast::Expr::Literal(_)),
+                                "expected Literal for LHS, got: {lhs_elems:?}"
+                            );
+                        } else {
+                            panic!("Expected Parenthesized expr for LHS");
+                        }
+                        if let ast::Expr::Parenthesized(rhs_elems) = &**rhs {
+                            assert_eq!(rhs_elems.len(), 2);
+                            assert!(
+                                matches!(*rhs_elems[0], ast::Expr::Literal(_)),
+                                "expected Literal for RHS, got: {rhs_elems:?}"
+                            );
+                            assert!(
+                                matches!(*rhs_elems[1], ast::Expr::Literal(_)),
+                                "expected Literal for RHS, got: {rhs_elems:?}"
+                            );
+                        } else {
+                            panic!("Expected Parenthesized expr for RHS");
+                        }
+                    } else {
+                        panic!("Expected BinaryExpr, got: {expr:?}");
                     }
                 } else {
                     panic!("Expected Expr column");
