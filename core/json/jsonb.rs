@@ -2593,6 +2593,13 @@ impl Jsonb {
         Ok((result, info))
     }
 
+    pub fn replace_with_copy_of(&mut self, other: &Jsonb) -> Result<()> {
+        self.data.clear();
+        self.data.try_reserve(other.data.len())?;
+        self.data.extend_from_slice(&other.data);
+        Ok(())
+    }
+
     pub fn replace_with_parsed_text(&mut self, input: &str) -> PResult<()> {
         self.data.clear();
         self.data

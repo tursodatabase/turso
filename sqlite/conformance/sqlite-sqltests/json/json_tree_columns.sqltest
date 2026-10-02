@@ -222,3 +222,67 @@ expect {
     2|$.a.x.y|a x y|$.a.x
     3|$.a[1]|a 0 1 2|$.a[0]
 }
+
+test json-each-reads-documents-that-extract-parsed-in-the-same-row {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, j);
+    INSERT INTO t VALUES (1, '{"a":1,"b":[1,2]}'), (2, '{"a":2,"b":[3,4]}'), (3, '{"a":3,"b":[5]}'), (4, '{"a":4,"b":[3,4]}'), (5, '{"a":5,"b":[]}'), (6, '{"a":1,"b":[1,2]}'), (7, '{"a":7,"b":[3]}'), (8, '{"a":2,"b":[3,4]}');
+    SELECT id, j->>'$.a', (SELECT group_concat(value) FROM json_each(t.j, '$.b')) FROM t ORDER BY id;
+}
+expect {
+    1|1|1,2
+    2|2|3,4
+    3|3|5
+    4|4|3,4
+    5|5|
+    6|1|1,2
+    7|7|3
+    8|2|3,4
+}
+
+test json-each-in-exists-before-extract-in-the-same-row {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, j);
+    INSERT INTO t VALUES (1, '{"a":1,"b":[1,2]}'), (2, '{"a":2,"b":[3,4]}'), (3, '{"a":3,"b":[5]}'), (4, '{"a":4,"b":[3,4]}'), (5, '{"a":5,"b":[]}'), (6, '{"a":1,"b":[1,2]}'), (7, '{"a":7,"b":[3]}'), (8, '{"a":2,"b":[3,4]}');
+    SELECT id, EXISTS (SELECT 1 FROM json_each(t.j, '$.b') WHERE value = 3) AND j->>'$.a' > 1, j->>'$.a' FROM t ORDER BY id;
+}
+expect {
+    1|0|1
+    2|1|2
+    3|0|3
+    4|1|4
+    5|0|5
+    6|0|1
+    7|1|7
+    8|1|2
+}
+
+test json-tree-reads-documents-that-extract-parsed-in-the-same-row {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, j);
+    INSERT INTO t VALUES (1, '{"a":1,"b":[1,2]}'), (2, '{"a":2,"b":[3,4]}'), (3, '{"a":3,"b":[5]}'), (4, '{"a":4,"b":[3,4]}'), (5, '{"a":5,"b":[]}'), (6, '{"a":1,"b":[1,2]}'), (7, '{"a":7,"b":[3]}'), (8, '{"a":2,"b":[3,4]}');
+    SELECT id, json_extract(j, '$.a'), (SELECT group_concat(fullkey, ' ') FROM json_tree(t.j)) FROM t ORDER BY id;
+}
+expect {
+    1|1|$ $.a $.b $.b[0] $.b[1]
+    2|2|$ $.a $.b $.b[0] $.b[1]
+    3|3|$ $.a $.b $.b[0]
+    4|4|$ $.a $.b $.b[0] $.b[1]
+    5|5|$ $.a $.b
+    6|1|$ $.a $.b $.b[0] $.b[1]
+    7|7|$ $.a $.b $.b[0]
+    8|2|$ $.a $.b $.b[0] $.b[1]
+}
+
+test json-each-over-text-and-jsonb-of-the-same-document {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, j);
+    INSERT INTO t VALUES (1, '{"a":1,"b":[1,2]}'), (2, '{"a":2,"b":[3,4]}'), (3, '{"a":3,"b":[5]}'), (4, '{"a":4,"b":[3,4]}'), (5, '{"a":5,"b":[]}'), (6, '{"a":1,"b":[1,2]}'), (7, '{"a":7,"b":[3]}'), (8, '{"a":2,"b":[3,4]}');
+    SELECT id, jsonb(j) ->> '$.a', (SELECT group_concat(key || '=' || value) FROM json_each(jsonb(t.j))), (SELECT group_concat(key) FROM json_each(t.j)) FROM t ORDER BY id;
+}
+expect {
+    1|1|a=1,b=[1,2]|a,b
+    2|2|a=2,b=[3,4]|a,b
+    3|3|a=3,b=[5]|a,b
+    4|4|a=4,b=[3,4]|a,b
+    5|5|a=5,b=[]|a,b
+    6|1|a=1,b=[1,2]|a,b
+    7|7|a=7,b=[3]|a,b
+    8|2|a=2,b=[3,4]|a,b
+}

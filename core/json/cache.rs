@@ -298,6 +298,13 @@ impl JsonCacheCell {
         read(cache.entry(slot))
     }
 
+    pub fn is_empty(&self) -> bool {
+        let _guard = self.access_guard();
+        // SAFETY: the access guard asserts that no other borrow of the
+        // cache is alive.
+        unsafe { (*self.inner.get()).as_ref() }.is_none_or(|cache| cache.used == 0)
+    }
+
     pub fn clear(&mut self) {
         let _guard = self.access_guard();
         unsafe {

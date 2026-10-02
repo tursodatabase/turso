@@ -10,6 +10,7 @@ use crate::{
         parse_strict_into,
         path::{json_path, JsonPath, PathElement},
         vtab::columns::{Columns, Key},
+        JsonCacheCell,
     },
     types::AsValueRef,
     vdbe::Register,
@@ -246,84 +247,17 @@ impl InternalVirtualTableCursor for JsonEachCursor {
         _idx_str: Option<String>,
         _idx_num: i32,
     ) -> Result<bool, LimboError> {
-        self.traversal_states.clear();
-        self.rowid = 0;
-        self.pop_path_before_next = false;
+        self.filter_document(args, None)
+    }
 
-        if args.is_empty() || args[0] == Value::Null {
-            return Ok(false);
-        }
-        if args.len() == 2 && matches!(self.traversal_mode, JsonTraversalMode::Tree) {
-            if let Value::Text(ref text) = args[1] {
-                if !text.value.is_empty()
-                    && text
-                        .value
-                        .as_bytes()
-                        .windows(3)
-                        .any(|chars| chars == b"[#-")
-                {
-                    return Err(LimboError::InvalidArgument(
-                        "Json paths with negative indices in json_tree are not supported yet"
-                            .to_owned(),
-                    ));
-                }
-            }
-        }
-
-        parse_strict_into(args[0].as_value_ref(), &mut self.json)?;
-
-        let root = if args.len() == 1 {
-            self.path_to_current_value.reset_to_root();
-            0
-        } else {
-            let Value::Text(path) = &args[1] else {
-                return Err(LimboError::InvalidArgument(
-                    "root path should be text".to_owned(),
-                ));
-            };
-            let root_path = match self.root_path.take() {
-                Some(root_path) if root_path.text == path.as_str() => root_path,
-                _ => RootPath::parse(path.as_str())?,
-            };
-            let found = jsonb::find_path_element(self.json.as_slice(), &root_path.path);
-            self.path_to_current_value.clone_from(&root_path.start);
-            self.root_path = Some(root_path);
-            let Ok(Some(root)) = found else {
-                return Ok(false);
-            };
-            root
-        };
-
-        let iterator_state = json_iterator_from(&self.json, root)?;
-        let innermost_container_path = if matches!(self.traversal_mode, JsonTraversalMode::Tree)
-            && matches!(iterator_state, IteratorState::Primitive(_))
-        {
-            self.path_to_current_value.cursor_before_last_element()
-        } else {
-            self.path_to_current_value.cursor()
-        };
-        self.push_state(iterator_state, innermost_container_path);
-
-        match self.traversal_mode {
-            JsonTraversalMode::Each => self.next(),
-            JsonTraversalMode::Tree => {
-                let state = self.peek_state().ok_or_else(|| {
-                    crate::LimboError::InternalError("state stack should not be empty".to_string())
-                })?;
-                if matches!(state.iterator_state, IteratorState::Primitive(_)) {
-                    self.next()
-                } else {
-                    self.columns.set(
-                        self.path_to_current_value.key(),
-                        root,
-                        self.path_to_current_value.cursor(),
-                        None,
-                        self.path_to_current_value.cursor_before_last_element(),
-                    );
-                    Ok(true)
-                }
-            }
-        }
+    fn filter_with_json_cache(
+        &mut self,
+        args: &[Value],
+        _idx_str: Option<String>,
+        _idx_num: i32,
+        json_cache: &JsonCacheCell,
+    ) -> Result<bool, LimboError> {
+        self.filter_document(args, Some(json_cache))
     }
 
     fn next(&mut self) -> Result<bool, LimboError> {
@@ -452,6 +386,100 @@ impl InternalVirtualTableCursor for JsonEachCursor {
         }
         dest.set_value(self.column(idx)?);
         Ok(())
+    }
+}
+
+impl JsonEachCursor {
+    fn filter_document(
+        &mut self,
+        args: &[Value],
+        json_cache: Option<&JsonCacheCell>,
+    ) -> Result<bool, LimboError> {
+        self.traversal_states.clear();
+        self.rowid = 0;
+        self.pop_path_before_next = false;
+
+        if args.is_empty() || args[0] == Value::Null {
+            return Ok(false);
+        }
+        if args.len() == 2 && matches!(self.traversal_mode, JsonTraversalMode::Tree) {
+            if let Value::Text(ref text) = args[1] {
+                if !text.value.is_empty()
+                    && text
+                        .value
+                        .as_bytes()
+                        .windows(3)
+                        .any(|chars| chars == b"[#-")
+                {
+                    return Err(LimboError::InvalidArgument(
+                        "Json paths with negative indices in json_tree are not supported yet"
+                            .to_owned(),
+                    ));
+                }
+            }
+        }
+
+        match json_cache {
+            Some(cache) if !cache.is_empty() => {
+                cache.with_parsed_jsonb(&args[0], parse_strict_into, |cached| {
+                    self.json.replace_with_copy_of(cached)
+                })?
+            }
+            _ => parse_strict_into(args[0].as_value_ref(), &mut self.json)?,
+        }
+
+        let root = if args.len() == 1 {
+            self.path_to_current_value.reset_to_root();
+            0
+        } else {
+            let Value::Text(path) = &args[1] else {
+                return Err(LimboError::InvalidArgument(
+                    "root path should be text".to_owned(),
+                ));
+            };
+            let root_path = match self.root_path.take() {
+                Some(root_path) if root_path.text == path.as_str() => root_path,
+                _ => RootPath::parse(path.as_str())?,
+            };
+            let found = jsonb::find_path_element(self.json.as_slice(), &root_path.path);
+            self.path_to_current_value.clone_from(&root_path.start);
+            self.root_path = Some(root_path);
+            let Ok(Some(root)) = found else {
+                return Ok(false);
+            };
+            root
+        };
+
+        let iterator_state = json_iterator_from(&self.json, root)?;
+        let innermost_container_path = if matches!(self.traversal_mode, JsonTraversalMode::Tree)
+            && matches!(iterator_state, IteratorState::Primitive(_))
+        {
+            self.path_to_current_value.cursor_before_last_element()
+        } else {
+            self.path_to_current_value.cursor()
+        };
+        self.push_state(iterator_state, innermost_container_path);
+
+        match self.traversal_mode {
+            JsonTraversalMode::Each => self.next(),
+            JsonTraversalMode::Tree => {
+                let state = self.peek_state().ok_or_else(|| {
+                    crate::LimboError::InternalError("state stack should not be empty".to_string())
+                })?;
+                if matches!(state.iterator_state, IteratorState::Primitive(_)) {
+                    self.next()
+                } else {
+                    self.columns.set(
+                        self.path_to_current_value.key(),
+                        root,
+                        self.path_to_current_value.cursor(),
+                        None,
+                        self.path_to_current_value.cursor_before_last_element(),
+                    );
+                    Ok(true)
+                }
+            }
+        }
     }
 }
 
@@ -893,6 +921,38 @@ mod tests {
         cursor.column_into(COL_VALUE, &mut dest).unwrap();
         assert_eq!(dest.get_value(), &Value::build_text("second"));
         assert_eq!(text_buffer(&dest), first_buffer);
+    }
+
+    #[test]
+    fn json_each_reads_a_document_from_a_non_empty_statement_cache() {
+        let key = Value::build_text(r#"["parsed"]"#);
+        let cache = JsonCacheCell::new();
+        cache
+            .with_parsed_jsonb(
+                &key,
+                |_, json| {
+                    parse_strict_into(Value::build_text(r#"["cached"]"#).as_value_ref(), json)
+                },
+                |_| Ok(()),
+            )
+            .unwrap();
+        let mut cursor = JsonEachCursor::empty(JsonTraversalMode::Each);
+        assert!(cursor
+            .filter_with_json_cache(&[key], None, 0, &cache)
+            .unwrap());
+        let mut dest = Register::Value(Value::Null);
+        cursor.column_into(COL_VALUE, &mut dest).unwrap();
+        assert_eq!(dest.get_value(), &Value::build_text("cached"));
+    }
+
+    #[test]
+    fn json_each_does_not_fill_an_empty_statement_cache() {
+        let cache = JsonCacheCell::new();
+        let mut cursor = JsonEachCursor::empty(JsonTraversalMode::Each);
+        assert!(cursor
+            .filter_with_json_cache(&[Value::build_text("[1]")], None, 0, &cache)
+            .unwrap());
+        assert!(cache.is_empty());
     }
 
     fn text_buffer(register: &Register) -> *const u8 {

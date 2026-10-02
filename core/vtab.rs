@@ -312,6 +312,7 @@ impl VirtualTableCursor {
         idx_str: Option<String>,
         arg_count: usize,
         args: &[Value],
+        #[cfg(feature = "json")] json_cache: &crate::json::JsonCacheCell,
     ) -> crate::Result<bool> {
         self.null_flag = false;
         match &mut self.inner {
@@ -319,6 +320,11 @@ impl VirtualTableCursor {
             VirtualTableCursorInner::External(cursor) => {
                 cursor.filter(idx_num, idx_str, arg_count, args)
             }
+            #[cfg(feature = "json")]
+            VirtualTableCursorInner::Internal(cursor) => cursor
+                .write()
+                .filter_with_json_cache(args, idx_str, idx_num, json_cache),
+            #[cfg(not(feature = "json"))]
             VirtualTableCursorInner::Internal(cursor) => {
                 cursor.write().filter(args, idx_str, idx_num)
             }
@@ -627,6 +633,16 @@ pub trait InternalVirtualTableCursor: Send + Sync {
         idx_str: Option<String>,
         idx_num: i32,
     ) -> Result<bool, LimboError>;
+    #[cfg(feature = "json")]
+    fn filter_with_json_cache(
+        &mut self,
+        args: &[Value],
+        idx_str: Option<String>,
+        idx_num: i32,
+        _json_cache: &crate::json::JsonCacheCell,
+    ) -> Result<bool, LimboError> {
+        self.filter(args, idx_str, idx_num)
+    }
 }
 
 #[cfg(all(test, feature = "fs"))]

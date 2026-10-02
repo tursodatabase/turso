@@ -1617,7 +1617,14 @@ pub fn op_vfilter(
             args.try_push(value)?;
         }
         let cursor = get_cursor!(state, *cursor_id).as_virtual_mut();
-        let has_rows = cursor.filter(*idx_num as i32, idx_str, *arg_count, &args);
+        let has_rows = cursor.filter(
+            *idx_num as i32,
+            idx_str,
+            *arg_count,
+            &args,
+            #[cfg(feature = "json")]
+            &state.json_cache,
+        );
         let arg_registers = &mut state.registers[*args_reg..*args_reg + *arg_count];
         for (register, value) in arg_registers.iter_mut().zip(args) {
             if let Register::Value(slot) = register {
