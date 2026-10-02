@@ -824,7 +824,7 @@ pub enum Insn {
     /// Parse a JSON text array into a native record-format BLOB, validating
     /// and coercing each element against the declared type using STRICT
     /// type-checking logic (apply_affinity_char + value_type check).
-    /// Input: reg = JSON text like `[1,2,3]`. Output: reg = record-format BLOB.
+    /// Input: reg = JSON text like `'[1,2,3]'`. Output: reg = record-format BLOB.
     /// Raises SQLITE_CONSTRAINT on type mismatch.
     ArrayEncode {
         data: Box<ArrayEncodeData>,

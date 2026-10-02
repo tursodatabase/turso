@@ -17,7 +17,7 @@ use crate::{
     Result,
 };
 
-/// Simple wrapper over [turso_core::Database] which extends its intereface with few methods
+/// Simple wrapper over `turso::Database` which extends its intereface with few methods
 /// to collect changes made to the database and apply/revert arbitrary changes to the database
 pub struct DatabaseTape {
     inner: Arc<turso_core::Database>,

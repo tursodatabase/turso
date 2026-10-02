@@ -571,10 +571,10 @@ pub fn derive_vtab_module(input: TokenStream) -> TokenStream {
 ///        count: usize,
 ///        offset: i64,
 ///    ) -> Result<i32> {
-///        if self.file.seek(SeekFrom::Start(offset as u64)).is_err() {
+///        if file.file.seek(SeekFrom::Start(offset as u64)).is_err() {
 ///            return Err(ResultCode::Error);
 ///        }
-///        self.file
+///        file.file
 ///            .read(&mut buf[..count])
 ///            .map_err(|_| ResultCode::Error)
 ///            .map(|n| n as i32)
