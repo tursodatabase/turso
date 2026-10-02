@@ -162,22 +162,22 @@ const FTS_MAX_CACHED_SEARCHERS: usize = 4;
 /// storage I/O.
 const FTS_MAX_RETAINED_CACHE_BYTES: usize = 192 * 1024 * 1024;
 
-#[cfg(feature = "test_helper")]
+#[cfg(any(feature = "test_helper", feature = "simulator"))]
 crate::thread::thread_local! {
     static FTS_RETAINED_CACHE_BYTES_OVERRIDE: core::cell::Cell<Option<usize>> =
         const { core::cell::Cell::new(None) };
 }
 
-/// Override the retained-cache budget for tests on the current thread, so
-/// budget eviction is reachable without multi-hundred-MiB indexes.
+/// Set the byte limit for cache data kept between statements on the current thread.
+/// Tests can reach the limit without indexes that use hundreds of MiB.
 /// Pass `None` to restore the default.
-#[cfg(feature = "test_helper")]
+#[cfg(any(feature = "test_helper", feature = "simulator"))]
 pub fn set_fts_retained_cache_bytes_for_test(bytes: Option<usize>) {
     FTS_RETAINED_CACHE_BYTES_OVERRIDE.with(|cell| cell.set(bytes));
 }
 
 fn fts_max_retained_cache_bytes() -> usize {
-    #[cfg(feature = "test_helper")]
+    #[cfg(any(feature = "test_helper", feature = "simulator"))]
     if let Some(bytes) = FTS_RETAINED_CACHE_BYTES_OVERRIDE.with(|cell| cell.get()) {
         return bytes;
     }
@@ -414,6 +414,10 @@ impl SegmentByteCache {
     }
 
     fn get(&mut self, id: &SegmentId) -> Option<Arc<SegmentData>> {
+        if fts_max_retained_cache_bytes() == 0 {
+            self.entries.clear();
+            return None;
+        }
         let position = self.entries.iter().position(|(entry, _)| entry == id)?;
         let entry = self.entries.remove(position);
         let data = Arc::clone(&entry.1);
@@ -422,6 +426,10 @@ impl SegmentByteCache {
     }
 
     fn put(&mut self, id: SegmentId, data: Arc<SegmentData>, budget: usize) {
+        if budget == 0 {
+            self.entries.clear();
+            return;
+        }
         self.entries.retain(|(entry, _)| *entry != id);
         self.entries.push((id, data));
         // Always keep the newest entry; evict older ones to fit the budget.
@@ -471,6 +479,10 @@ struct SearcherCache {
 
 impl SearcherCache {
     fn get(&mut self, key: &SearcherKey) -> Option<&SearcherCacheEntry> {
+        if fts_max_retained_cache_bytes() == 0 {
+            self.entries.clear();
+            return None;
+        }
         let position = self.entries.iter().position(|entry| &entry.key == key)?;
         let entry = self.entries.remove(position);
         self.entries.push(entry);
@@ -478,6 +490,10 @@ impl SearcherCache {
     }
 
     fn put(&mut self, entry: SearcherCacheEntry) {
+        if fts_max_retained_cache_bytes() == 0 {
+            self.entries.clear();
+            return;
+        }
         self.entries.retain(|existing| existing.key != entry.key);
         self.entries.push(entry);
         while self.entries.len() > FTS_MAX_CACHED_SEARCHERS {

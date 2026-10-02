@@ -839,12 +839,12 @@ impl Workload for AutoincDeleteWorkload {
 // FTS Workloads
 // ============================================================================
 
-/// The dedicated FTS table churned by the FTS workloads. Kept outside the
-/// generated schema so generic workloads never touch it.
+/// Only FTS workloads change this table.
+/// Other workloads use the generated tables.
 pub const FTS_SIM_TABLE: &str = "fts_docs";
 pub const FTS_SIM_INDEX: &str = "fts_docs_fts";
 
-/// Bootstrap statements for the FTS table and its index.
+/// SQL statements that create the FTS table and its index.
 pub fn fts_sim_schema() -> Vec<(String, String)> {
     vec![
         (
@@ -862,18 +862,18 @@ pub fn fts_sim_schema() -> Vec<(String, String)> {
     ]
 }
 
-/// Small fixed vocabulary so the self-differential's padded-LIKE oracle is
-/// exact token matching, and so matches stay non-trivial.
-const FTS_SIM_TOKENS: &[&str] = &[
+/// Fixed test words let the table scan match whole words with LIKE.
+/// Documents share words because the list is short.
+pub(crate) const FTS_SIM_WORDS: &[&str] = &[
     "alpha", "bravo", "charlie", "delta", "echo", "foxtrot", "golf", "hotel",
 ];
 
-/// Bounded id space so inserts, updates, and deletes collide across fibers.
+/// A small range of row IDs makes connections change the same rows.
 const FTS_SIM_MAX_ID: i64 = 400;
 
 fn fts_sim_body(rng: &mut ChaCha8Rng) -> String {
     let count = rng.random_range(1..=4);
-    FTS_SIM_TOKENS
+    FTS_SIM_WORDS
         .choose_multiple(rng, count)
         .copied()
         .collect::<Vec<_>>()
@@ -884,7 +884,7 @@ fn fts_sim_id(rng: &mut ChaCha8Rng) -> i64 {
     rng.random_range(0..FTS_SIM_MAX_ID)
 }
 
-/// Insert (or replace) one FTS-indexed document.
+/// Insert or replace one document in the table with the FTS index.
 pub struct FtsInsertWorkload;
 
 impl Workload for FtsInsertWorkload {
@@ -899,7 +899,7 @@ impl Workload for FtsInsertWorkload {
     }
 }
 
-/// Rewrite one FTS-indexed document (tombstones + re-insert through FTS).
+/// Update one document and its FTS index entries.
 pub struct FtsUpdateWorkload;
 
 impl Workload for FtsUpdateWorkload {
@@ -912,7 +912,7 @@ impl Workload for FtsUpdateWorkload {
     }
 }
 
-/// Delete one FTS-indexed document.
+/// Delete one document and its FTS index entries.
 pub struct FtsDeleteWorkload;
 
 impl Workload for FtsDeleteWorkload {
@@ -924,7 +924,7 @@ impl Workload for FtsDeleteWorkload {
     }
 }
 
-/// Merge every visible FTS segment (contends on the per-index merge lease).
+/// Request a merge of the FTS index parts visible to this connection.
 pub struct FtsOptimizeWorkload;
 
 impl Workload for FtsOptimizeWorkload {
@@ -935,14 +935,14 @@ impl Workload for FtsOptimizeWorkload {
     }
 }
 
-/// Run the FTS self-differential (see [`Operation::FtsMatchDifferential`]).
+/// Compare FTS results with a table scan using [`Operation::CompareFtsResults`].
 pub struct FtsMatchWorkload;
 
 impl Workload for FtsMatchWorkload {
     fn generate(&self, _ctx: &WorkloadContext, rng: &mut ChaCha8Rng) -> Option<Operation> {
-        let token = FTS_SIM_TOKENS.choose(rng).expect("vocabulary is not empty");
-        Some(Operation::FtsMatchDifferential {
-            token: token.to_string(),
+        let word = FTS_SIM_WORDS.choose(rng).expect("test words are not empty");
+        Some(Operation::CompareFtsResults {
+            word: word.to_string(),
         })
     }
 }

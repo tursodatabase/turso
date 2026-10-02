@@ -541,6 +541,24 @@ jobs:
           - name: btree-rebalance
             iterations: 5
             args: "--mode btree-rebalance --allocation-fault-probability 0"
+          - name: fts-merge-wal
+            iterations: 10
+            args: "--mode fts-merge --max-steps 100000 --allocation-fault-probability 0.001"
+          - name: fts-merge-mvcc
+            iterations: 10
+            args: "--mode fts-merge --enable-mvcc --max-steps 100000 --allocation-fault-probability 0.001"
+          - name: fts-snapshots-wal
+            iterations: 10
+            args: "--mode fts-snapshots --max-steps 100000 --allocation-fault-probability 0.001"
+          - name: fts-snapshots-mvcc
+            iterations: 10
+            args: "--mode fts-snapshots --enable-mvcc --max-steps 100000 --allocation-fault-probability 0.001"
+          - name: fts-recovery-wal
+            iterations: 10
+            args: "--mode fts-recovery --max-steps 100000 --allocation-fault-probability 0.001"
+          - name: fts-recovery-mvcc
+            iterations: 10
+            args: "--mode fts-recovery --enable-mvcc --max-steps 100000 --allocation-fault-probability 0.001"
           - name: multiprocess
             iterations: 10
             args: "--mode fast --multiprocess --connections-per-process 4 --processes 4"
