@@ -1228,21 +1228,20 @@ impl Jsonb {
 
         match kind {
             ElementType::TEXT | ElementType::TEXTRAW | ElementType::TEXTJ => {
-                let word = from_utf8(word_slice).map_err(|_| {
+                let word = payload_as_str(word_slice).map_err(|_| {
                     LimboError::ParseError("Failed to serialize string!".to_string())
                 })?;
 
+                let escape_quotes_and_backslashes = *kind != ElementType::TEXTJ;
                 let mut last_end = 0;
                 let bytes = word.as_bytes();
-                for i in 0..bytes.len() {
-                    let b = bytes[i];
-                    let needs_escape = if *kind == ElementType::TEXTJ {
-                        b <= 0x1F
-                    } else {
-                        b == b'"' || b == b'\\' || b <= 0x1F
+                let mut i = 0;
+                loop {
+                    i = find_string_special_byte(bytes, i, b'"');
+                    let Some(&b) = bytes.get(i) else {
+                        break;
                     };
-
-                    if needs_escape {
+                    if b <= 0x1F || escape_quotes_and_backslashes {
                         string.push_str(&word[last_end..i]);
                         match b {
                             b'"' => string.push_str("\\\""),
@@ -1258,6 +1257,7 @@ impl Jsonb {
                         }
                         last_end = i + 1;
                     }
+                    i += 1;
                 }
                 string.push_str(&word[last_end..]);
             }

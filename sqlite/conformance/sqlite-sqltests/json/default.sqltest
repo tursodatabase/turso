@@ -3744,3 +3744,38 @@ test json-error-position-of-backslash-at-the-end-of-an-unquoted-key {
 expect {
     3
 }
+
+test json-output-sql-text-with-quotes-backslashes-and-control-bytes {
+    SELECT hex(json_array('a"b' || char(92) || 'c' || char(1) || char(10) || char(9) || char(8) || char(12) || char(13) || char(31) || 'é'));
+}
+expect {
+    5B22615C22625C5C635C75303030315C6E5C745C625C665C725C7530303166C3A9225D
+}
+
+test json-output-object-key-and-value-with-escapes {
+    SELECT hex(json_object('k"' || char(10), 'v' || char(92) || char(31) || 'x'));
+}
+expect {
+    7B226B5C225C6E223A22765C5C5C753030316678227D
+}
+
+test json-output-long-sql-text-with-a-quote-and-a-backslash {
+    SELECT hex(json(json_array(printf('%.40c', 'x') || '"' || printf('%.40c', 'y') || char(92))));
+}
+expect {
+    5B22787878787878787878787878787878787878787878787878787878787878787878787878787878785C22797979797979797979797979797979797979797979797979797979797979797979797979797979795C5C225D
+}
+
+test json-output-json-escapes-are-kept {
+    SELECT hex(json('["a' || char(92) || '"b' || char(92) || char(92) || 'c' || char(92) || 'u0001' || char(92) || 'n", "plain text that is longer than sixteen bytes"]'));
+}
+expect {
+    5B22615C22625C5C635C75303030315C6E222C22706C61696E20746578742074686174206973206C6F6E676572207468616E207369787465656E206279746573225D
+}
+
+test json-output-json5-escapes-are-rewritten {
+    SELECT hex(json('{"a":"' || char(92) || 'x41' || char(92) || '0''"}'));
+}
+expect {
+    7B2261223A225C75303034315C753030303027227D
+}
