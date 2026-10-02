@@ -70,3 +70,22 @@ test json-tree-atom-matches-extract {
 expect {
     0
 }
+
+test json-each-columns-of-jsonb-blob-below-a-path {
+    SELECT key, value, type, atom, fullkey, path FROM json_each(jsonb('{"x":1,"a":{"b":[10,"t",{"c":null}],"k y":2.5}}'), '$.a');
+}
+expect {
+    b|[10,"t",{"c":null}]|array||$.a.b|$.a
+    k y|2.5|real|2.5|$.a."k y"|$.a
+}
+
+test json-tree-columns-of-jsonb-blob-below-a-path {
+    SELECT key, value, type, atom, fullkey, path FROM json_tree(jsonb('{"x":1,"a":{"b":[10,"t",{"c":null}],"k y":2.5}}'), '$.a.b');
+}
+expect {
+    b|[10,"t",{"c":null}]|array||$.a.b|$.a
+    0|10|integer|10|$.a.b[0]|$.a.b
+    1|t|text|t|$.a.b[1]|$.a.b
+    2|{"c":null}|object||$.a.b[2]|$.a.b
+    c||null||$.a.b[2].c|$.a.b[2]
+}

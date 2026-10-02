@@ -663,6 +663,7 @@ fn jsonb_blob_document(value: ValueRef<'_>) -> Option<&[u8]> {
     looks_like_jsonb_blob(blob).then_some(blob)
 }
 
+#[inline(always)]
 fn element_to_db_type(data: &[u8], pos: usize, flag: OutputVariant) -> crate::Result<Value> {
     let (element_type, payload) = jsonb::element_payload(data, pos)?;
     if matches!(
