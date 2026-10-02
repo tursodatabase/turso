@@ -19,7 +19,9 @@ use crate::translate::planner::{
     parse_limit, parse_where, plan_ctes_as_outer_refs, resolve_window_and_aggregate_functions,
 };
 use crate::translate::result_row::emit_select_result;
-use crate::translate::subquery::{plan_subqueries_from_select_plan, plan_subqueries_from_values};
+use crate::translate::subquery::{
+    plan_limit_offset_subqueries, plan_subqueries_from_select_plan, plan_subqueries_from_values,
+};
 use crate::translate::window::plan_windows;
 use crate::util::{exprs_are_equivalent, normalize_ident};
 use crate::vdbe::builder::ProgramBuilderOpts;
@@ -254,7 +256,21 @@ pub(crate) fn prepare_select_plan_from_arms(
             );
         }
     }
-    let (limit, offset) = limit.map_or(Ok((None, None)), |limit| parse_limit(limit, resolver))?;
+    let (mut limit, mut offset) =
+        limit.map_or(Ok((None, None)), |limit| parse_limit(limit, resolver))?;
+    let mut cse_map = Vec::new();
+    let mut same_query_map = Vec::new();
+    plan_limit_offset_subqueries(
+        program,
+        &mut last.non_from_clause_subqueries,
+        &mut last.table_references,
+        resolver,
+        connection,
+        limit.as_deref_mut(),
+        offset.as_deref_mut(),
+        &mut cse_map,
+        &mut same_query_map,
+    )?;
 
     // ORDER BY names can come from any arm of a compound SELECT.
     let all_plans: Vec<&SelectPlan> = left
