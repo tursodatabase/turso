@@ -4037,14 +4037,23 @@ fn validate_element_payload(
             while pos < payload_end {
                 let (elem_header, elem_header_size, elem_end) =
                     child_element_header(data, pos, payload_end)?;
-                validate_element_payload(
+                if !is_valid_scalar_in_lenient_check(
                     data,
                     pos,
                     elem_header,
                     elem_header_size,
-                    depth + 1,
+                    depth,
                     strict,
-                )?;
+                ) {
+                    validate_element_payload(
+                        data,
+                        pos,
+                        elem_header,
+                        elem_header_size,
+                        depth + 1,
+                        strict,
+                    )?;
+                }
                 pos = elem_end;
             }
             Ok(())
@@ -4058,14 +4067,23 @@ fn validate_element_payload(
                 if count % 2 == 0 && !elem_header.element_type().is_valid_key() {
                     return Err(pos + 1);
                 }
-                validate_element_payload(
+                if !is_valid_scalar_in_lenient_check(
                     data,
                     pos,
                     elem_header,
                     elem_header_size,
-                    depth + 1,
+                    depth,
                     strict,
-                )?;
+                ) {
+                    validate_element_payload(
+                        data,
+                        pos,
+                        elem_header,
+                        elem_header_size,
+                        depth + 1,
+                        strict,
+                    )?;
+                }
                 pos = elem_end;
                 count += 1;
             }
@@ -4076,6 +4094,36 @@ fn validate_element_payload(
             Ok(())
         }
         _ => Err(start + 1),
+    }
+}
+
+#[inline]
+fn is_valid_scalar_in_lenient_check(
+    data: &[u8],
+    pos: usize,
+    header: JsonbHeader,
+    header_size: usize,
+    parent_depth: usize,
+    strict: bool,
+) -> bool {
+    if strict || parent_depth >= MAX_JSON_DEPTH {
+        return false;
+    }
+    let payload_size = header.payload_size();
+    match header.element_type() {
+        ElementType::NULL | ElementType::TRUE | ElementType::FALSE => payload_size == 0,
+        ElementType::INT | ElementType::INT5 | ElementType::FLOAT | ElementType::FLOAT5 => {
+            payload_size != 0
+        }
+        ElementType::TEXT | ElementType::TEXTJ | ElementType::TEXT5 | ElementType::TEXTRAW => {
+            let payload_start = pos + header_size;
+            payload_as_str(&data[payload_start..payload_start + payload_size]).is_ok()
+        }
+        ElementType::ARRAY
+        | ElementType::OBJECT
+        | ElementType::RESERVED1
+        | ElementType::RESERVED2
+        | ElementType::RESERVED3 => false,
     }
 }
 
@@ -5108,6 +5156,64 @@ mod tests {
                         full_check,
                         "{element_type:?} {payload:?} {one_byte_size}"
                     );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn lenient_scalar_check_accepts_exactly_the_scalars_the_full_check_accepts() {
+        for type_bits in 0..=12u8 {
+            let element_type = ElementType::try_from(type_bits).unwrap();
+            let is_scalar = !matches!(element_type, ElementType::ARRAY | ElementType::OBJECT);
+            for payload in [
+                &b""[..],
+                b"1",
+                b"-12",
+                b"1.5",
+                b"ab",
+                b"\xc3\xa9",
+                b"\xff",
+                b"\x00",
+            ] {
+                for one_byte_size in [false, true] {
+                    let mut data = std::vec::Vec::new();
+                    if one_byte_size {
+                        data.push(type_bits | (SIZE_MARKER_8BIT << 4));
+                        data.push(payload.len() as u8);
+                    } else {
+                        data.push(type_bits | ((payload.len() as u8) << 4));
+                    }
+                    data.extend_from_slice(payload);
+                    let (header, header_size) = JsonbHeader::from_slice(0, &data).unwrap();
+                    for parent_depth in [0, MAX_JSON_DEPTH - 1, MAX_JSON_DEPTH] {
+                        for strict in [false, true] {
+                            let full_check = validate_element_payload(
+                                &data,
+                                0,
+                                header,
+                                header_size,
+                                parent_depth + 1,
+                                strict,
+                            )
+                            .is_ok();
+                            assert_eq!(
+                                is_valid_scalar_in_lenient_check(
+                                    &data,
+                                    0,
+                                    header,
+                                    header_size,
+                                    parent_depth,
+                                    strict,
+                                ),
+                                full_check
+                                    && is_scalar
+                                    && !strict
+                                    && parent_depth < MAX_JSON_DEPTH,
+                                "{element_type:?} {payload:?} {one_byte_size} {parent_depth} {strict}"
+                            );
+                        }
+                    }
                 }
             }
         }
