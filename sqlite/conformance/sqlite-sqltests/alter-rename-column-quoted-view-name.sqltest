@@ -1,0 +1,31 @@
+@database :memory:
+
+# ALTER TABLE ... RENAME COLUMN rewrites the SQL of every view that uses the
+# column with an UPDATE on sqlite_schema. The view name went into that UPDATE
+# unescaped, so a quote in the name broke the statement and a name that closes
+# the quote changed the SQL of every other schema entry too.
+
+@skip-if mvcc "views not supported in MVCC mode"
+test rename-column-with-quote-in-view-name {
+    CREATE TABLE t (a, b);
+    CREATE VIEW "v'q" AS SELECT a, b FROM t;
+    ALTER TABLE t RENAME COLUMN a TO c;
+    SELECT name, sql FROM sqlite_schema WHERE type = 'view';
+}
+expect {
+    v'q|CREATE VIEW "v'q" AS SELECT c, b FROM t
+}
+
+@skip-if mvcc "views not supported in MVCC mode"
+test rename-column-with-view-name-that-closes-the-quote {
+    CREATE TABLE t (a, b);
+    CREATE TABLE other (x);
+    CREATE VIEW "v' OR 1=1 --" AS SELECT a, b FROM t;
+    ALTER TABLE t RENAME COLUMN a TO c;
+    SELECT name, sql FROM sqlite_schema ORDER BY name;
+}
+expect {
+    other|CREATE TABLE other (x)
+    t|CREATE TABLE t (c, b)
+    v' OR 1=1 --|CREATE VIEW "v' OR 1=1 --" AS SELECT c, b FROM t
+}
