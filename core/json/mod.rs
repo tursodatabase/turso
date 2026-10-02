@@ -687,7 +687,7 @@ fn element_to_db_type(data: &[u8], pos: usize, flag: OutputVariant) -> crate::Re
                 return Ok(Value::from_i64(int));
             }
         }
-        let text = std::str::from_utf8(payload);
+        let text = jsonb::payload_as_str(payload);
         match (element_type, text) {
             (ElementType::NULL, _) => return Ok(Value::Null),
             (ElementType::TRUE, _) => return Ok(Value::from_i64(1)),

@@ -4017,7 +4017,7 @@ fn validate_element(
             // later readers decode text payloads as &str, so the
             // payload must be valid UTF-8.
             let payload = &data[payload_start..payload_end];
-            if let Err(e) = std::str::from_utf8(payload) {
+            if let Err(e) = payload_as_str(payload) {
                 return Err(payload_start + e.valid_up_to() + 1);
             }
             Ok(())
@@ -4056,6 +4056,15 @@ fn validate_element(
         }
         _ => Err(start + 1),
     }
+}
+
+#[inline]
+pub(crate) fn payload_as_str(payload: &[u8]) -> std::result::Result<&str, std::str::Utf8Error> {
+    if payload.is_ascii() {
+        // SAFETY: every ASCII byte sequence is valid UTF-8.
+        return Ok(unsafe { std::str::from_utf8_unchecked(payload) });
+    }
+    std::str::from_utf8(payload)
 }
 
 /// Reads the header of the child element at `pos` and returns where the
@@ -5105,6 +5114,25 @@ mod tests {
             assert_eq!(element_end_at(blob, 0).ok(), expected, "{blob:?}");
         }
         assert!(element_end_at(b"\x13", 1).is_err());
+    }
+
+    #[test]
+    fn payload_as_str_matches_from_utf8() {
+        for payload in [
+            &b""[..],
+            b"user_12345",
+            "caf\u{e9}".as_bytes(),
+            "\u{1f600}".as_bytes(),
+            b"ab\xffcd",
+            b"\xc3",
+            b"abc\x80",
+        ] {
+            let expected = std::str::from_utf8(payload).map_err(|e| e.valid_up_to());
+            assert_eq!(
+                payload_as_str(payload).map_err(|e| e.valid_up_to()),
+                expected
+            );
+        }
     }
 
     #[test]
