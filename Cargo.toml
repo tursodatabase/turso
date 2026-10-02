@@ -211,7 +211,7 @@ inherits = "release"
 debug = true
 codegen-units = 1
 panic = "abort"
-lto = true
+lto = false
 
 [profile.bench-profile]
 inherits = "release"
