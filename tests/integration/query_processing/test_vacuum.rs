@@ -430,6 +430,36 @@ fn test_auto_vacuum_pragma_ignored_once_page_one_exists() -> anyhow::Result<()> 
     Ok(())
 }
 
+#[test]
+fn test_auto_vacuum_pragma_on_attached_database_leaves_main_unchanged() -> anyhow::Result<()> {
+    let opts = DatabaseOpts::new().with_autovacuum(true).with_attach(true);
+    let tmp_db = TempDatabase::builder().with_opts(opts).build();
+    let conn = tmp_db.connect_limbo();
+
+    conn.execute("ATTACH ':memory:' AS aux")?;
+    conn.execute("PRAGMA aux.auto_vacuum = full")?;
+    conn.execute("CREATE TABLE aux.a(x)")?;
+    conn.execute("CREATE TABLE main.m(x)")?;
+
+    assert_eq!(scalar_i64(&conn, "PRAGMA aux.auto_vacuum"), 1);
+    assert_eq!(scalar_i64(&conn, "PRAGMA main.auto_vacuum"), 0);
+    Ok(())
+}
+
+#[test]
+fn test_auto_vacuum_pragma_on_temp_database_leaves_main_unchanged() -> anyhow::Result<()> {
+    let opts = DatabaseOpts::new().with_autovacuum(true);
+    let tmp_db = TempDatabase::builder().with_opts(opts).build();
+    let conn = tmp_db.connect_limbo();
+
+    conn.execute("PRAGMA temp.auto_vacuum = full")?;
+    conn.execute("CREATE TEMP TABLE t(x)")?;
+
+    assert_eq!(scalar_i64(&conn, "PRAGMA temp.auto_vacuum"), 1);
+    assert_eq!(scalar_i64(&conn, "PRAGMA main.auto_vacuum"), 0);
+    Ok(())
+}
+
 fn assert_plain_vacuum_preserves_autovacuum_mode(
     pragma_value: &str,
     expected_mode: i64,
