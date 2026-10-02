@@ -764,7 +764,36 @@ impl JsonbHeader {
         self.1
     }
 
+    #[inline]
     pub(super) fn from_slice(cursor: usize, slice: &[u8]) -> Result<(Self, usize)> {
+        const ELEMENT_TYPES: [ElementType; 13] = [
+            ElementType::NULL,
+            ElementType::TRUE,
+            ElementType::FALSE,
+            ElementType::INT,
+            ElementType::INT5,
+            ElementType::FLOAT,
+            ElementType::FLOAT5,
+            ElementType::TEXT,
+            ElementType::TEXTJ,
+            ElementType::TEXT5,
+            ElementType::TEXTRAW,
+            ElementType::ARRAY,
+            ElementType::OBJECT,
+        ];
+        if let Some(&header_byte) = slice.get(cursor) {
+            let size = header_byte >> 4;
+            if let (Some(&element_type), 0..=11) =
+                (ELEMENT_TYPES.get((header_byte & 15) as usize), size)
+            {
+                return Ok((Self(element_type, size as usize), 1));
+            }
+        }
+        Self::from_slice_with_size_bytes(cursor, slice)
+    }
+
+    #[inline(never)]
+    fn from_slice_with_size_bytes(cursor: usize, slice: &[u8]) -> Result<(Self, usize)> {
         match slice.get(cursor) {
             Some(header_byte) => {
                 // Extract first 4 bits (values 0-15)
