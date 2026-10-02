@@ -1527,8 +1527,10 @@ impl Value {
                     }
                     Value::Null => 0,
                 };
-                // Invalid codepoints (negative, surrogates, or > U+10FFFF)
-                // become U+FFFD, matching SQLite.
+                // Negative codepoints and codepoints above U+10FFFF become
+                // U+FFFD, matching SQLite. SQLite writes surrogates as raw
+                // bytes that are not valid UTF-8; Turso text must be valid
+                // UTF-8, so surrogates also become U+FFFD.
                 if codepoint >= 0 {
                     char::from_u32(codepoint as u32).unwrap_or('\u{FFFD}')
                 } else {
