@@ -1632,9 +1632,11 @@ impl Jsonb {
                 location: Some(pos),
             })?;
         let obj_start = self.len();
-        let mut first = true;
 
         pos = skip_whitespace_tracking(input, pos, info);
+        if input.get(pos) == Some(&b'}') {
+            return Ok(pos + 1);
+        }
         loop {
             if pos >= input.len() {
                 return Err(PError::Message {
@@ -1642,24 +1644,28 @@ impl Jsonb {
                     location: Some(pos),
                 });
             }
-
+            pos = self.deserialize_string(input, pos, info)?;
+            pos = skip_whitespace_tracking(input, pos, info);
+            if pos >= input.len() || input[pos] != b':' {
+                return Err(PError::Message {
+                    msg: "Expected : after object key".to_string(),
+                    location: Some(pos),
+                });
+            }
+            pos += 1;
+            pos = skip_whitespace_tracking(input, pos, info);
+            pos = self.deserialize_value(input, pos, depth + 1, info)?;
+            pos = skip_whitespace_tracking(input, pos, info);
+            if pos >= input.len() {
+                return Err(PError::Message {
+                    msg: "Unexpected end of input".to_string(),
+                    location: Some(pos),
+                });
+            }
             match input[pos] {
-                b'}' => {
-                    pos += 1; // consume '}'
-                    if first {
-                        return Ok(pos);
-                    } else {
-                        let obj_size = self.len() - obj_start;
-                        self.write_element_header(header_pos, ElementType::OBJECT, obj_size, false)
-                            .map_err(|_| PError::Message {
-                                msg: "Failed to write header".to_string(),
-                                location: Some(pos),
-                            })?;
-                        return Ok(pos);
-                    }
-                }
-                b',' if !first => {
-                    pos += 1; // consume ','
+                b'}' => break,
+                b',' => {
+                    pos += 1;
                     pos = skip_whitespace_tracking(input, pos, info);
                     if pos >= input.len() {
                         return Err(PError::Message {
@@ -1674,38 +1680,26 @@ impl Jsonb {
                         });
                     }
                     if input[pos] == b'}' {
-                        // Trailing comma
                         info.has_json5 = true;
+                        break;
                     }
                 }
                 _ => {
-                    // Parse key (must be string)
-                    pos = self.deserialize_string(input, pos, info)?;
-
-                    pos = skip_whitespace_tracking(input, pos, info);
-                    if pos >= input.len() || input[pos] != b':' {
-                        return Err(PError::Message {
-                            msg: "Expected : after object key".to_string(),
-                            location: Some(pos),
-                        });
-                    }
-                    pos += 1; // consume ':'
-
-                    pos = skip_whitespace_tracking(input, pos, info);
-
-                    // Parse value - can be any JSON value including another object
-                    pos = self.deserialize_value(input, pos, depth + 1, info)?;
-                    pos = skip_whitespace_tracking(input, pos, info);
-                    if pos < input.len() && !matches!(input[pos], b',' | b'}') {
-                        return Err(PError::Message {
-                            msg: "Should be , or }}".to_string(),
-                            location: Some(pos),
-                        });
-                    }
-                    first = false;
+                    return Err(PError::Message {
+                        msg: "Should be , or }}".to_string(),
+                        location: Some(pos),
+                    });
                 }
             }
         }
+        pos += 1;
+        let obj_size = self.len() - obj_start;
+        self.write_element_header(header_pos, ElementType::OBJECT, obj_size, false)
+            .map_err(|_| PError::Message {
+                msg: "Failed to write header".to_string(),
+                location: Some(pos),
+            })?;
+        Ok(pos)
     }
 
     #[inline(never)]
@@ -1730,9 +1724,11 @@ impl Jsonb {
                 location: Some(pos),
             })?;
         let arr_start = self.len();
-        let mut first = true;
 
         pos = skip_whitespace_tracking(input, pos, info);
+        if input.get(pos) == Some(&b']') {
+            return Ok(pos + 1);
+        }
         loop {
             if pos >= input.len() {
                 return Err(PError::Message {
@@ -1740,24 +1736,18 @@ impl Jsonb {
                     location: Some(pos),
                 });
             }
-
+            pos = self.deserialize_value(input, pos, depth + 1, info)?;
+            pos = skip_whitespace_tracking(input, pos, info);
+            if pos >= input.len() {
+                return Err(PError::Message {
+                    msg: "Unexpected end of input".to_string(),
+                    location: Some(pos),
+                });
+            }
             match input[pos] {
-                b']' => {
-                    pos += 1; // consume ']'
-                    if first {
-                        return Ok(pos);
-                    } else {
-                        let arr_len = self.len() - arr_start;
-                        self.write_element_header(header_pos, ElementType::ARRAY, arr_len, false)
-                            .map_err(|_| PError::Message {
-                                msg: "Failed to write header".to_string(),
-                                location: Some(pos),
-                            })?;
-                        return Ok(pos);
-                    }
-                }
-                b',' if !first => {
-                    pos += 1; // consume ','
+                b']' => break,
+                b',' => {
+                    pos += 1;
                     pos = skip_whitespace_tracking(input, pos, info);
                     if pos >= input.len() {
                         return Err(PError::Message {
@@ -1772,25 +1762,26 @@ impl Jsonb {
                         });
                     }
                     if input[pos] == b']' {
-                        // Trailing comma
                         info.has_json5 = true;
+                        break;
                     }
                 }
                 _ => {
-                    // Parse array element
-                    pos = self.deserialize_value(input, pos, depth + 1, info)?;
-                    pos = skip_whitespace_tracking(input, pos, info);
-                    if pos < input.len() && !matches!(input[pos], b',' | b']') {
-                        return Err(PError::Message {
-                            msg: "Should be , or ]".to_string(),
-                            location: Some(pos),
-                        });
-                    }
-
-                    first = false;
+                    return Err(PError::Message {
+                        msg: "Should be , or ]".to_string(),
+                        location: Some(pos),
+                    });
                 }
             }
         }
+        pos += 1;
+        let arr_len = self.len() - arr_start;
+        self.write_element_header(header_pos, ElementType::ARRAY, arr_len, false)
+            .map_err(|_| PError::Message {
+                msg: "Failed to write header".to_string(),
+                location: Some(pos),
+            })?;
+        Ok(pos)
     }
 
     #[cfg_attr(not(debug_assertions), inline(always))]
