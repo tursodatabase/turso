@@ -292,6 +292,9 @@ pub struct ProgramBuilder {
     /// Maps table internal_id to result_columns_start_reg for FROM clause subqueries.
     /// Used when nested subqueries need to reference columns from outer query subqueries.
     subquery_result_regs: HashMap<TableInternalId, usize>,
+    /// Maps table internal_id to the subroutine that fills an inner-loop
+    /// materialized FROM clause subquery.
+    subquery_fill_subroutines: HashMap<TableInternalId, SubqueryFillSubroutine>,
     /// The mode in which the query is being executed.
     mode: BuilderQueryMode,
     pub flags: ProgramBuilderFlags,
@@ -481,6 +484,14 @@ pub struct HashBuildSignature {
     pub use_bloom_filter: bool,
     /// Rowid input cursor when the build side is materialized.
     pub materialized_input_cursor: Option<CursorID>,
+}
+
+/// Bytecode that fills a materialized FROM clause subquery. The loop that
+/// reads the subquery calls it with Gosub before its first scan.
+#[derive(Debug, Clone, Copy)]
+pub struct SubqueryFillSubroutine {
+    pub start: BranchOffset,
+    pub return_reg: usize,
 }
 
 /// Information about a materialized CTE, used for sharing data across multiple references.
@@ -729,6 +740,7 @@ impl ProgramBuilder {
             hash_build_signatures: HashMap::default(),
             hash_tables_to_keep_open: BitSet::default(),
             subquery_result_regs: HashMap::default(),
+            subquery_fill_subroutines: HashMap::default(),
             next_cte_id: 0,
             materialized_ctes: HashMap::default(),
             ctes_being_defined: Vec::new(),
@@ -910,6 +922,22 @@ impl ProgramBuilder {
     /// Returns None if the subquery hasn't been emitted yet.
     pub fn get_subquery_result_reg(&self, internal_id: TableInternalId) -> Option<usize> {
         self.subquery_result_regs.get(&internal_id).copied()
+    }
+
+    pub fn set_subquery_fill_subroutine(
+        &mut self,
+        internal_id: TableInternalId,
+        subroutine: SubqueryFillSubroutine,
+    ) {
+        self.subquery_fill_subroutines
+            .insert(internal_id, subroutine);
+    }
+
+    pub fn get_subquery_fill_subroutine(
+        &self,
+        internal_id: TableInternalId,
+    ) -> Option<SubqueryFillSubroutine> {
+        self.subquery_fill_subroutines.get(&internal_id).copied()
     }
 
     /// Mark that this statement may modify/insert multiple rows (mirrors SQLite's sqlite3MultiWrite).
