@@ -3773,7 +3773,7 @@ fn find_object_value(
         if found {
             return Ok(Some(value));
         }
-        entry = element_bounds(data, value)?.2;
+        entry = element_end_at(data, value)?;
     }
     Ok(None)
 }
@@ -3790,7 +3790,7 @@ fn find_array_element(data: &[u8], pos: usize, index: Option<i32>) -> Result<Opt
             let mut count = 0usize;
             let mut element = first;
             while element < end {
-                element = element_bounds(data, element)?.2;
+                element = element_end_at(data, element)?;
                 count += 1;
             }
             match count.checked_sub(from_end.unsigned_abs() as usize) {
@@ -3804,9 +3804,27 @@ fn find_array_element(data: &[u8], pos: usize, index: Option<i32>) -> Result<Opt
         if element >= end {
             return Ok(None);
         }
-        element = element_bounds(data, element)?.2;
+        element = element_end_at(data, element)?;
     }
     Ok((element < end).then_some(element))
+}
+
+#[inline(always)]
+fn element_end_at(data: &[u8], pos: usize) -> Result<usize> {
+    if let Some(&header_byte) = data.get(pos) {
+        let header_and_size = match header_byte >> 4 {
+            size @ 0..=11 => Some((1, usize::from(size))),
+            SIZE_MARKER_8BIT => data.get(pos + 1).map(|&size| (2, usize::from(size))),
+            _ => None,
+        };
+        if let Some((header_len, size)) = header_and_size {
+            let end = pos + header_len + size;
+            if header_byte & 15 <= ElementType::OBJECT as u8 && end <= data.len() {
+                return Ok(end);
+            }
+        }
+    }
+    Ok(element_bounds(data, pos)?.2)
 }
 
 fn element_bounds(data: &[u8], pos: usize) -> Result<(JsonbHeader, usize, usize)> {
@@ -5004,6 +5022,30 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn element_end_at_matches_element_bounds() {
+        let mut blobs: std::vec::Vec<std::vec::Vec<u8>> = std::vec::Vec::new();
+        for header_byte in 0..=255u8 {
+            for tail in [
+                &b""[..],
+                b"\x00",
+                b"\x03abc",
+                b"\x05ab",
+                b"\x00\x02xy",
+                b"abcdefghijklmnop",
+            ] {
+                let mut blob = vec![header_byte];
+                blob.extend_from_slice(tail);
+                blobs.push(blob);
+            }
+        }
+        for blob in &blobs {
+            let expected = element_bounds(blob, 0).map(|(_, _, end)| end).ok();
+            assert_eq!(element_end_at(blob, 0).ok(), expected, "{blob:?}");
+        }
+        assert!(element_end_at(b"\x13", 1).is_err());
     }
 
     #[test]
