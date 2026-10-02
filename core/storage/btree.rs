@@ -1532,10 +1532,15 @@ impl BTreeCursor {
                 // page that doesn't exist yet, and re-entry would skip the
                 // `is_none()` branch entirely.
                 let (page, c) = return_if_io!(self.read_page(start_next_page as i64));
-                let payload =
-                    crate::with_btree_allocation_site!(OverflowRead, payload.try_to_vec())?;
+                let mut record_payload =
+                    <crate::alloc::Vec<u8> as crate::alloc::TursoAllocExt>::new();
+                crate::with_btree_allocation_site!(
+                    OverflowRead,
+                    record_payload.try_reserve_exact(payload.len() + remaining_to_read)
+                )?;
+                record_payload.extend_from_slice(payload);
                 self.read_overflow_state.replace(ReadPayloadOverflow {
-                    payload,
+                    payload: record_payload,
                     next_page: start_next_page,
                     remaining_to_read,
                     page,
@@ -1579,10 +1584,11 @@ impl BTreeCursor {
                 page,
             } = self.read_overflow_state.as_mut().unwrap();
             let buf = page.get_contents().as_ptr();
-            crate::with_btree_allocation_site!(
-                OverflowRead,
-                payload.try_extend(buf[4..4 + to_read].iter().copied())
-            )?;
+            turso_assert!(
+                payload.capacity() - payload.len() >= to_read,
+                "overflow payload was reserved for the whole record"
+            );
+            payload.extend_from_slice(&buf[4..4 + to_read]);
             *remaining_to_read -= to_read;
 
             if let Some((new_page, c)) = new_page_and_c {
@@ -1625,16 +1631,10 @@ impl BTreeCursor {
                 .expect("read_overflow_state was checked above")
                 .payload;
 
-            let mut reuse_immutable = self.get_immutable_record_or_create()?;
-            reuse_immutable.as_mut().unwrap().invalidate();
-
-            crate::with_btree_allocation_site!(
-                RecordPayload,
-                reuse_immutable
-                    .as_mut()
-                    .unwrap()
-                    .start_serialization(&payload_swap)
-            )?;
+            let record = self
+                .get_immutable_record_or_create()?
+                .expect("record was allocated above");
+            *record.as_blob_mut() = payload_swap;
 
             break Ok(IOResult::Done(()));
         }
@@ -12938,6 +12938,48 @@ mod tests {
         assert_eq!(bytes.len(), 2 * data_per_page);
         assert!(bytes[..data_per_page].iter().all(|&b| b == b'A'));
         assert!(bytes[data_per_page..].iter().all(|&b| b == b'B'));
+    }
+
+    #[test]
+    fn overflow_read_reserves_the_record_buffer_once() {
+        let pager = setup_test_env(5);
+        let mut cursor = BTreeCursor::new_table(pager.clone(), 1, 5);
+        let usable = cursor.usable_space();
+        let data_per_page = usable - 4;
+
+        let load_and_fill = |id: i64, next: u32, fill: u8| {
+            let (page, c) = cursor.read_page_blocking(id).unwrap();
+            if let Some(c) = c {
+                pager.io.wait_for_completion(c).unwrap();
+            }
+            while page.is_locked() {
+                pager.io.step().unwrap();
+            }
+            let buf = page.get_contents().as_ptr();
+            buf[0..4].copy_from_slice(&next.to_be_bytes());
+            buf[4..usable].fill(fill);
+        };
+        load_and_fill(4, 5, b'A');
+        load_and_fill(5, 0, b'B');
+
+        let local = b"local";
+        let tail_len = 10;
+        let payload_size = (local.len() + data_per_page + tail_len) as u64;
+        let cursor_pager = cursor.pager.clone();
+        run_until_done(
+            || cursor.process_overflow_read(local, 4, payload_size),
+            &cursor_pager,
+        )
+        .unwrap();
+
+        let record = cursor.get_immutable_record().expect("record was read");
+        let bytes = record.get_payload();
+        assert_eq!(bytes.len(), payload_size as usize);
+        assert_eq!(&bytes[..local.len()], local);
+        let chain = &bytes[local.len()..];
+        assert!(chain[..data_per_page].iter().all(|&b| b == b'A'));
+        assert!(chain[data_per_page..].iter().all(|&b| b == b'B'));
+        assert_eq!(record.as_blob().capacity(), bytes.len());
     }
 
     /// Forces a real spill yield from the finalization `move_to_root_nonblock`
