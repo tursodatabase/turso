@@ -3893,11 +3893,32 @@ fn validate_element(
     depth: usize,
     strict: bool,
 ) -> std::result::Result<(), usize> {
-    if depth > MAX_JSON_DEPTH {
+    if start >= end {
         return Err(start + 1);
     }
+    let Ok((header, header_offset)) = JsonbHeader::from_slice(start, data) else {
+        return Err(start + 1);
+    };
+    // The 8-byte size marker lets a header declare a payload close to
+    // usize::MAX, so this must be checked before it is compared below.
+    let Some(payload_end) = (start + header_offset).checked_add(header.payload_size()) else {
+        return Err(start + 1);
+    };
+    if payload_end != end || payload_end > data.len() {
+        return Err(start + 1);
+    }
+    validate_element_payload(data, start, header, header_offset, depth, strict)
+}
 
-    if start >= end {
+fn validate_element_payload(
+    data: &[u8],
+    start: usize,
+    header: JsonbHeader,
+    header_offset: usize,
+    depth: usize,
+    strict: bool,
+) -> std::result::Result<(), usize> {
+    if depth > MAX_JSON_DEPTH {
         return Err(start + 1);
     }
 
@@ -3912,20 +3933,9 @@ fn validate_element(
         return Err(start + 1);
     }
 
-    let Ok((header, header_offset)) = JsonbHeader::from_slice(start, data) else {
-        return Err(start + 1);
-    };
     let payload_start = start + header_offset;
     let payload_size = header.payload_size();
-    // The 8-byte size marker lets a header declare a payload close to
-    // usize::MAX, so this must be checked before it is compared below.
-    let Some(payload_end) = payload_start.checked_add(payload_size) else {
-        return Err(start + 1);
-    };
-
-    if payload_end != end || payload_end > data.len() {
-        return Err(start + 1);
-    }
+    let payload_end = payload_start + payload_size;
 
     match header.element_type() {
         ElementType::NULL | ElementType::TRUE | ElementType::FALSE => {
@@ -4025,8 +4035,16 @@ fn validate_element(
         ElementType::ARRAY => {
             let mut pos = payload_start;
             while pos < payload_end {
-                let elem_end = child_element_end(data, pos, payload_end)?;
-                validate_element(data, pos, elem_end, depth + 1, strict)?;
+                let (elem_header, elem_header_size, elem_end) =
+                    child_element_header(data, pos, payload_end)?;
+                validate_element_payload(
+                    data,
+                    pos,
+                    elem_header,
+                    elem_header_size,
+                    depth + 1,
+                    strict,
+                )?;
                 pos = elem_end;
             }
             Ok(())
@@ -4035,16 +4053,19 @@ fn validate_element(
             let mut pos = payload_start;
             let mut count = 0;
             while pos < payload_end {
-                let elem_end = child_element_end(data, pos, payload_end)?;
-                if count % 2 == 0 {
-                    let Ok((elem_header, _)) = JsonbHeader::from_slice(pos, data) else {
-                        return Err(pos + 1);
-                    };
-                    if !elem_header.element_type().is_valid_key() {
-                        return Err(pos + 1);
-                    }
+                let (elem_header, elem_header_size, elem_end) =
+                    child_element_header(data, pos, payload_end)?;
+                if count % 2 == 0 && !elem_header.element_type().is_valid_key() {
+                    return Err(pos + 1);
                 }
-                validate_element(data, pos, elem_end, depth + 1, strict)?;
+                validate_element_payload(
+                    data,
+                    pos,
+                    elem_header,
+                    elem_header_size,
+                    depth + 1,
+                    strict,
+                )?;
                 pos = elem_end;
                 count += 1;
             }
@@ -4067,14 +4088,14 @@ pub(crate) fn payload_as_str(payload: &[u8]) -> std::result::Result<&str, std::s
     std::str::from_utf8(payload)
 }
 
-/// Reads the header of the child element at `pos` and returns where the
-/// child ends, or the 1-based offset of `pos` when the header is
-/// malformed or the child would run past `payload_end`.
-fn child_element_end(
+/// Reads the header of the child element at `pos` and returns it with its
+/// size and where the child ends, or the 1-based offset of `pos` when the
+/// header is malformed or the child would run past `payload_end`.
+fn child_element_header(
     data: &[u8],
     pos: usize,
     payload_end: usize,
-) -> std::result::Result<usize, usize> {
+) -> std::result::Result<(JsonbHeader, usize, usize), usize> {
     let Ok((elem_header, elem_header_size)) = JsonbHeader::from_slice(pos, data) else {
         return Err(pos + 1);
     };
@@ -4087,7 +4108,7 @@ fn child_element_end(
     if elem_end > payload_end {
         return Err(pos + 1);
     }
-    Ok(elem_end)
+    Ok((elem_header, elem_header_size, elem_end))
 }
 
 /// Validates a text payload the way jsonbValidityCheck does. TEXTRAW
