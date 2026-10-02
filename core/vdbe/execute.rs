@@ -107,7 +107,7 @@ use turso_macros::turso_debug_assert;
 
 use crate::pseudo::PseudoCursor;
 
-use crate::storage::btree::{BTreeCursor, BTreeKey};
+use crate::storage::btree::{BTreeCursor, BTreeKey, ColumnRead};
 
 #[inline]
 fn btree_cursor_with_yield_context(
@@ -2216,15 +2216,28 @@ fn op_column_fetch(
         }
         _ => return op_column_fetch_other(program, state, cursor_id, column, dest, default),
     };
-    let Some(payload) = return_if_io!(state, cursor.record_payload()) else {
-        // A null-row cursor, or one that is not positioned on a valid row
-        // (e.g., empty table). Return NULL, not the column's default value.
-        state.registers[dest].set_null();
+    if let Some(payload) = cursor.positioned_payload_on_leaf_page() {
+        match ValueIterator::new(payload)?.nth_into_register(column, &mut state.registers[dest]) {
+            Some(result) => result?,
+            None => {
+                branches::mark_unlikely();
+                // The record has fewer columns than expected.
+                apply_column_default(default, &mut state.registers[dest])?;
+            }
+        }
         return Ok(InsnFunctionStepResult::Step);
-    };
-    match ValueIterator::new(payload)?.nth_into_register(column, &mut state.registers[dest]) {
-        Some(result) => result?,
-        None => {
+    }
+    match return_if_io!(
+        state,
+        cursor.read_column_without_leaf_payload(column, &mut state.registers[dest])
+    ) {
+        ColumnRead::Decoded => {}
+        ColumnRead::NullRow => {
+            // A null-row cursor, or one that is not positioned on a valid row
+            // (e.g., empty table). Return NULL, not the column's default value.
+            state.registers[dest].set_null();
+        }
+        ColumnRead::MissingColumn => {
             branches::mark_unlikely();
             // The record has fewer columns than expected.
             apply_column_default(default, &mut state.registers[dest])?;
