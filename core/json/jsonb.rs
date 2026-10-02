@@ -1235,7 +1235,12 @@ impl Jsonb {
 
         match kind {
             ElementType::TEXT | ElementType::TEXTRAW | ElementType::TEXTJ
-                if is_ascii_without_special_bytes(&self.data, cursor, end_cursor) =>
+                if is_ascii_without_bytes_to_escape(
+                    &self.data,
+                    cursor,
+                    end_cursor,
+                    *kind != ElementType::TEXTJ,
+                ) =>
             {
                 // SAFETY: the check above found only ASCII bytes, and every
                 // ASCII byte sequence is valid UTF-8.
@@ -4855,13 +4860,23 @@ fn find_string_special_byte(input: &[u8], pos: usize, quote: u8) -> usize {
 }
 
 #[inline]
-fn is_ascii_without_special_bytes(data: &[u8], start: usize, end: usize) -> bool {
+fn is_ascii_without_bytes_to_escape(
+    data: &[u8],
+    start: usize,
+    end: usize,
+    escape_quotes_and_backslashes: bool,
+) -> bool {
     assert!(start <= end && end <= data.len());
+    let needs_no_escape = |byte: &u8| {
+        (0x20..0x80).contains(byte)
+            && !(escape_quotes_and_backslashes && (*byte == b'"' || *byte == b'\\'))
+    };
     #[cfg(target_arch = "x86_64")]
     {
         let mut pos = start;
         while pos + 16 <= end {
-            if string_special_or_non_ascii_mask_sse2(data, pos) != 0 {
+            if bytes_to_escape_or_non_ascii_mask_sse2(data, pos, escape_quotes_and_backslashes) != 0
+            {
                 return false;
             }
             pos += 16;
@@ -4871,21 +4886,23 @@ fn is_ascii_without_special_bytes(data: &[u8], start: usize, end: usize) -> bool
         }
         if pos + 16 <= data.len() {
             let tail_bits = (1u32 << (end - pos)) - 1;
-            return string_special_or_non_ascii_mask_sse2(data, pos) & tail_bits == 0;
+            let mask =
+                bytes_to_escape_or_non_ascii_mask_sse2(data, pos, escape_quotes_and_backslashes);
+            return mask & tail_bits == 0;
         }
-        data[pos..end]
-            .iter()
-            .all(|&byte| (0x20..0x80).contains(&byte) && byte != b'"' && byte != b'\\')
+        data[pos..end].iter().all(needs_no_escape)
     }
     #[cfg(not(target_arch = "x86_64"))]
-    data[start..end]
-        .iter()
-        .all(|&byte| (0x20..0x80).contains(&byte) && byte != b'"' && byte != b'\\')
+    data[start..end].iter().all(needs_no_escape)
 }
 
 #[cfg(target_arch = "x86_64")]
 #[inline(always)]
-fn string_special_or_non_ascii_mask_sse2(data: &[u8], pos: usize) -> u32 {
+fn bytes_to_escape_or_non_ascii_mask_sse2(
+    data: &[u8],
+    pos: usize,
+    escape_quotes_and_backslashes: bool,
+) -> u32 {
     use std::arch::x86_64::{
         _mm_cmpeq_epi8, _mm_loadu_si128, _mm_min_epu8, _mm_movemask_epi8, _mm_or_si128,
         _mm_set1_epi8,
@@ -4896,10 +4913,12 @@ fn string_special_or_non_ascii_mask_sse2(data: &[u8], pos: usize) -> u32 {
     // load inside `data`.
     unsafe {
         let chunk = _mm_loadu_si128(data.as_ptr().add(pos).cast());
-        let is_quote = _mm_cmpeq_epi8(chunk, _mm_set1_epi8(b'"' as i8));
-        let is_backslash = _mm_cmpeq_epi8(chunk, _mm_set1_epi8(b'\\' as i8));
-        let is_control = _mm_cmpeq_epi8(_mm_min_epu8(chunk, _mm_set1_epi8(0x1F)), chunk);
-        let special = _mm_or_si128(_mm_or_si128(is_quote, is_backslash), is_control);
+        let mut special = _mm_cmpeq_epi8(_mm_min_epu8(chunk, _mm_set1_epi8(0x1F)), chunk);
+        if escape_quotes_and_backslashes {
+            let is_quote = _mm_cmpeq_epi8(chunk, _mm_set1_epi8(b'"' as i8));
+            let is_backslash = _mm_cmpeq_epi8(chunk, _mm_set1_epi8(b'\\' as i8));
+            special = _mm_or_si128(special, _mm_or_si128(is_quote, is_backslash));
+        }
         (_mm_movemask_epi8(special) | _mm_movemask_epi8(chunk)) as u32
     }
 }
@@ -5297,19 +5316,29 @@ mod tests {
     }
 
     #[test]
-    fn ascii_without_special_bytes_check_matches_a_byte_by_byte_check() {
-        let is_plain = |byte: &u8| (0x20..0x80).contains(byte) && *byte != b'"' && *byte != b'\\';
-        for special in [b'"', b'\\', 0x00, 0x1F, 0x7F, 0x80, 0xFF] {
-            for special_pos in 0..40 {
-                let mut data = [b'a'; 40];
-                data[special_pos] = special;
-                for end in 0..=data.len() {
-                    for start in 0..=end {
-                        assert_eq!(
-                            is_ascii_without_special_bytes(&data, start, end),
-                            data[start..end].iter().all(is_plain),
-                            "{special:#x} at {special_pos}, {start}..{end}"
-                        );
+    fn ascii_without_bytes_to_escape_check_matches_a_byte_by_byte_check() {
+        for escape_quotes_and_backslashes in [false, true] {
+            let needs_no_escape = |byte: &u8| {
+                (0x20..0x80).contains(byte)
+                    && !(escape_quotes_and_backslashes && (*byte == b'"' || *byte == b'\\'))
+            };
+            for special in [b'"', b'\\', 0x00, 0x1F, 0x7F, 0x80, 0xFF] {
+                for special_pos in 0..40 {
+                    let mut data = [b'a'; 40];
+                    data[special_pos] = special;
+                    for end in 0..=data.len() {
+                        for start in 0..=end {
+                            assert_eq!(
+                                is_ascii_without_bytes_to_escape(
+                                    &data,
+                                    start,
+                                    end,
+                                    escape_quotes_and_backslashes
+                                ),
+                                data[start..end].iter().all(needs_no_escape),
+                                "{special:#x} at {special_pos}, {start}..{end}, {escape_quotes_and_backslashes}"
+                            );
+                        }
                     }
                 }
             }
