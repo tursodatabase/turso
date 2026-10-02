@@ -5,7 +5,7 @@ use crate::alloc::{
 use crate::json::error::{Error as PError, Result as PResult};
 use crate::json::Conv;
 use crate::types::{value_blob_from_slice, ValueBlob};
-use crate::{bail_parse_error, LimboError, Result};
+use crate::{bail_parse_error, turso_debug_assert, LimboError, Result};
 use std::{
     borrow::Cow,
     collections::{HashMap, VecDeque},
@@ -1612,9 +1612,6 @@ impl Jsonb {
                 location: Some(pos),
             });
         }
-        if self.data.capacity() - self.data.len() < 50 {
-            self.data.reserve(self.data.capacity());
-        }
         if pos >= input.len() {
             return Err(PError::Message {
                 msg: "Unexpected end of input".to_string(),
@@ -2588,7 +2585,7 @@ impl Jsonb {
     }
 
     pub fn from_str_tracking(input: &str) -> PResult<(Self, ParseInfo)> {
-        let mut result = Self::new(input.len())?;
+        let mut result = Self::empty();
         let info = result.parse_text_tracking(input)?;
         Ok((result, info))
     }
@@ -2602,9 +2599,6 @@ impl Jsonb {
 
     pub fn replace_with_parsed_text(&mut self, input: &str) -> PResult<()> {
         self.data.clear();
-        self.data
-            .try_reserve(input.len())
-            .map_err(|_| PError::OutOfMemory)?;
         self.parse_text_tracking(input)?;
         Ok(())
     }
@@ -2620,9 +2614,23 @@ impl Jsonb {
             });
         }
 
+        let most_output_bytes = input
+            .len()
+            .checked_mul(2)
+            .and_then(|bytes| bytes.checked_add(16))
+            .ok_or(PError::OutOfMemory)?;
+        self.data
+            .try_reserve(most_output_bytes)
+            .map_err(|_| PError::OutOfMemory)?;
+        let reserved_capacity = self.data.capacity();
+
         // Parse the first complete JSON value
         let mut pos = skip_whitespace_tracking(input, 0, &mut info);
         pos = self.deserialize_value(input, pos, 0, &mut info)?;
+        turso_debug_assert!(
+            self.data.capacity() == reserved_capacity,
+            "the text parser wrote more than two bytes per input byte plus 16"
+        );
 
         // Skip any trailing whitespace
         pos = skip_whitespace_tracking(input, pos, &mut info);
@@ -4917,6 +4925,45 @@ mod tests {
                 append_bytes(&mut actual, &source[..len]);
                 assert_eq!(actual, expected, "prefix {prefix}, len {len}");
             }
+        }
+    }
+
+    #[test]
+    fn text_parse_does_not_grow_its_output_buffer() {
+        let long_string = format!("\"{}\"", "x".repeat(70_000));
+        let mut inputs: std::vec::Vec<String> = [
+            "1",
+            "-1",
+            ".5",
+            "+1",
+            "0x1",
+            "Infinity",
+            "-Infinity",
+            "NaN",
+            "[1]",
+            "[[[[[[[[[[1]]]]]]]]]]",
+            "{a:1}",
+            "{a:{b:{c:{d:[1]}}}}",
+            "[1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1]",
+            "\"\"",
+            "''",
+            "[]",
+            "{}",
+        ]
+        .iter()
+        .map(|input| input.to_string())
+        .collect();
+        inputs.push(format!("{}1{}", "[".repeat(400), "]".repeat(400)));
+        inputs.push(format!("[{}]", "\"x\",".repeat(300) + "1"));
+        inputs.push(format!(
+            "{}{long_string}{}",
+            "[".repeat(300),
+            "]".repeat(300)
+        ));
+        inputs.push(format!("{{\"k\":[{long_string},{long_string}]}}"));
+        for input in &inputs {
+            let (json, _) = Jsonb::from_str_tracking(input).unwrap();
+            assert!(json.len() <= 2 * input.len() + 16, "{input:.40}");
         }
     }
 
