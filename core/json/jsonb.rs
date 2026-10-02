@@ -2972,6 +2972,7 @@ impl Jsonb {
             SegmentVariant::Single(PathElement::Key(path_key, is_raw)) => {
                 if element_type == ElementType::OBJECT {
                     let end_pos = pos + element_size + header_size;
+                    let path_key_has_no_escapes = !*is_raw || !path_key.contains('\\');
 
                     pos += header_size;
 
@@ -2984,9 +2985,17 @@ impl Jsonb {
                         }
 
                         let key_start = pos + key_header_len;
-                        let json_key = read_text_payload(&self.data, key_start, key_len)?;
+                        let found = if path_key_has_no_escapes
+                            && matches!(key_type, ElementType::TEXT | ElementType::TEXTRAW)
+                        {
+                            text_payload_bytes(&self.data, key_start, key_len)?
+                                == path_key.as_bytes()
+                        } else {
+                            let json_key = read_text_payload(&self.data, key_start, key_len)?;
+                            compare((json_key, key_type), (path_key, *is_raw))
+                        };
 
-                        if compare((json_key, key_type), (path_key, *is_raw)) {
+                        if found {
                             if mode.allows_replace() {
                                 let value_pos = pos + key_header_len + key_len;
                                 let key_pos = pos;

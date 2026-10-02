@@ -1276,6 +1276,25 @@ expect {
     v|-5|integer
 }
 
+test json_edit_functions_find_plain_object_keys {
+    SELECT json_set('{"x":1,"ab":2}', '$.ab', 9),
+           json_insert('{"x":1,"ab":2}', '$.ab', 9),
+           json_remove('{"x":1,"ab":2}', '$."ab"');
+}
+expect {
+    {"x":1,"ab":9}|{"x":1,"ab":2}|{"x":1}
+}
+
+test json_edit_functions_find_escaped_and_json5_object_keys {
+    SELECT json_remove('{"a' || char(92) || 'u0062":1,"c":2}', '$.ab'),
+           json_remove('{"ab":1,"c":2}', '$."a' || char(92) || 'u0062"'),
+           json_set('{ab:1}', '$.ab', 7),
+           json_replace(jsonb('{"é":1}'), '$.é', 2);
+}
+expect {
+    {"c":2}|{"c":2}|{"ab":7}|{"é":2}
+}
+
 test json_object_nested {
     SELECT json_object('grandparent',json_object('parent', json_object('child', 'value')));
 }
