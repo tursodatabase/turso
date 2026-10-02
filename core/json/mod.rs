@@ -57,7 +57,11 @@ pub fn get_json(json_value: &Value, indent: Option<&str>) -> crate::Result<Value
             // An infinite REAL argument converts to the payload
             // 9.0e+999, but SQLite's json() renders it as 9e999 (while
             // json_array and json_quote keep the long form) (#4196).
-            json = json.replace("9.0e+999", "9e999");
+            if let Value::Numeric(Numeric::Float(float)) = json_value {
+                if f64::from(*float).is_infinite() {
+                    json = json.replace("9.0e+999", "9e999");
+                }
+            }
 
             if indent.is_some() {
                 // json_pretty() output carries no subtype in SQLite.

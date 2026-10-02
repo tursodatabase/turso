@@ -3779,3 +3779,17 @@ test json-output-json5-escapes-are-rewritten {
 expect {
     7B2261223A225C75303034315C753030303027227D
 }
+
+test json-keeps-the-long-infinity-form-of-json-input {
+    SELECT json(json_array(1e999)), json(jsonb_array(1e999)), json('[9.0e+999]'), json(jsonb('[9.0e+999]')), json('"9.0e+999"');
+}
+expect {
+    [9.0e+999]|[9.0e+999]|[9.0e+999]|[9.0e+999]|"9.0e+999"
+}
+
+test json-writes-an-infinite-real-argument-in-the-short-form {
+    SELECT json(1e999), json(-1e999), json_pretty(1e999);
+}
+expect {
+    9e999|-9e999|9e999
+}
