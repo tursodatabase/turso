@@ -1,0 +1,65 @@
+@database :memory:
+@requires-file materialized_views ""
+@skip-file-if mvcc "materialized_views not supported with mvcc"
+
+# Aggregates must skip NULL inputs: count(x) counts only non-NULL values, and
+# sum(x)/avg(x) over no non-NULL value are NULL, not 0.
+# All expectations below were taken from sqlite3 running the same query
+# against a plain (non-materialized) view.
+
+test matview-aggregates-ignore-null-column-values {
+    CREATE TABLE t(id INTEGER, x INTEGER);
+    INSERT INTO t VALUES (1, NULL), (2, NULL);
+    CREATE MATERIALIZED VIEW v AS
+        SELECT count(x) AS cx, sum(x) AS sx, avg(x) AS ax, count(*) AS n FROM t;
+    SELECT cx, sx, typeof(sx), ax, typeof(ax), n FROM v;
+}
+expect {
+    0||null||null|2
+}
+
+test matview-aggregates-null-column-track-inserts-and-deletes {
+    CREATE TABLE t(id INTEGER, x INTEGER);
+    INSERT INTO t VALUES (1, NULL), (2, NULL);
+    CREATE MATERIALIZED VIEW v AS
+        SELECT count(x) AS cx, sum(x) AS sx, avg(x) AS ax, count(*) AS n FROM t;
+    INSERT INTO t VALUES (3, 10);
+    SELECT cx, sx, typeof(sx), ax, n FROM v;
+    DELETE FROM t WHERE id = 3;
+    SELECT cx, sx, typeof(sx), ax, n FROM v;
+}
+expect {
+    1|10|integer|10.0|3
+    0||null||2
+}
+
+# A row that changes from NULL to a value and back must move count(x) with it.
+test matview-aggregates-null-column-tracks-updates {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, x INTEGER);
+    INSERT INTO t VALUES (1, NULL), (2, 4);
+    CREATE MATERIALIZED VIEW v AS
+        SELECT count(x) AS cx, sum(x) AS sx, avg(x) AS ax FROM t;
+    SELECT cx, sx, typeof(sx), ax FROM v;
+    UPDATE t SET x = NULL WHERE id = 2;
+    SELECT cx, sx, typeof(sx), ax FROM v;
+    UPDATE t SET x = 6 WHERE id = 1;
+    SELECT cx, sx, typeof(sx), ax FROM v;
+}
+expect {
+    1|4|integer|4.0
+    0||null|
+    1|6|integer|6.0
+}
+
+test matview-aggregates-ignore-nulls-per-group {
+    CREATE TABLE g(k TEXT, x INTEGER);
+    INSERT INTO g VALUES ('a', NULL), ('a', 5), ('b', NULL);
+    CREATE MATERIALIZED VIEW v AS
+        SELECT k, count(x) AS cx, sum(x) AS sx, avg(x) AS ax, count(*) AS n
+        FROM g GROUP BY k;
+    SELECT k, cx, sx, typeof(sx), ax, n FROM v ORDER BY k;
+}
+expect {
+    a|1|5|integer|5.0|2
+    b|0||null||1
+}
