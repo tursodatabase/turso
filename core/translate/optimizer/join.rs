@@ -842,10 +842,21 @@ fn join_lhs_and_rhs<'a>(
                     where_clause,
                     where_terms.iter().enumerate().filter_map(|(index, term)| {
                         let (left, right, owner) = term.equal_tables?;
-                        // An outer join condition belongs to that join only.
-                        owner
-                            .is_none_or(|owner| owner == rhs_table_reference.internal_id)
-                            .then_some((index, left, right))
+                        // If this probe is an outer join, a WHERE equality must
+                        // stay a residual filter so it also runs on the
+                        // null-extended rows; using it as a hash key would skip
+                        // them or rewrite a matched row into an unmatched one
+                        // (#8231). An ON-clause term belongs to that join only
+                        // and defines what a match is, so it can still key the
+                        // probe.
+                        let usable = match owner {
+                            Some(owner) => owner == rhs_table_reference.internal_id,
+                            None => !rhs_table_reference
+                                .join_info
+                                .as_ref()
+                                .is_some_and(|ji| ji.is_outer()),
+                        };
+                        usable.then_some((index, left, right))
                     }),
                     max_distinct_build_keys,
                     build_cardinality,

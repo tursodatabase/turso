@@ -1,0 +1,147 @@
+@database :memory:
+
+# A WHERE equality whose sides each name one joined table must not become a
+# hash-join key on a LEFT/RIGHT/FULL JOIN. FROM (including null-extension) is
+# computed before WHERE, so that equality is a residual filter. Using it as a
+# match key drops the filter from null-extended rows and can turn a real ON
+# match into an unmatched row (#8231).
+
+setup unmatched {
+    CREATE TABLE o(a);
+    CREATE TABLE p(a, b);
+    INSERT INTO o VALUES (0);
+    INSERT INTO p VALUES (2, 2);
+}
+
+setup kept-match {
+    CREATE TABLE o(a);
+    CREATE TABLE p(a, b);
+    INSERT INTO o VALUES (0), (2), (3);
+    INSERT INTO p VALUES (2, 2), (3, 9);
+}
+
+setup on-true-empty {
+    CREATE TABLE t1(a);
+    CREATE TABLE t2(b);
+    INSERT INTO t1 VALUES (1);
+}
+
+setup on-true-matched {
+    CREATE TABLE t1(a);
+    CREATE TABLE t2(b);
+    INSERT INTO t1 VALUES (1);
+    INSERT INTO t2 VALUES (5);
+}
+
+@setup unmatched
+test left-join-where-unmatched-coalesce-eq {
+    -- o has no ON match. The null-extended row makes coalesce(NULL, 1) = 0,
+    -- which is false, so SQLite returns nothing.
+    SELECT o.a, p.a, p.b FROM o LEFT JOIN p ON o.a = p.a
+    WHERE coalesce(p.b, 1) = o.a;
+}
+expect {
+}
+
+@setup unmatched
+test left-join-where-operand-order {
+    SELECT o.a, p.a, p.b FROM o LEFT JOIN p ON o.a = p.a
+    WHERE o.a = coalesce(p.b, 1);
+}
+expect {
+}
+
+@setup unmatched
+test left-join-where-coalesce-plus-zero {
+    SELECT o.a, p.a, p.b FROM o LEFT JOIN p ON o.a = p.a
+    WHERE coalesce(p.b, 1) + 0 = o.a;
+}
+expect {
+}
+
+@setup unmatched
+test left-join-where-case-expr {
+    SELECT o.a, p.a, p.b FROM o LEFT JOIN p ON o.a = p.a
+    WHERE CASE WHEN p.b IS NULL THEN 1 ELSE p.b END = o.a;
+}
+expect {
+}
+
+@setup unmatched
+test left-join-where-right-join-spelling {
+    SELECT o.a, p.a, p.b FROM p RIGHT JOIN o ON o.a = p.a
+    WHERE coalesce(p.b, 1) = o.a;
+}
+expect {
+}
+
+@setup unmatched
+test left-join-where-non-equality-stays-empty {
+    SELECT o.a, p.a, p.b FROM o LEFT JOIN p ON o.a = p.a
+    WHERE coalesce(p.b, 1) < o.a;
+}
+expect {
+}
+
+@setup unmatched
+test left-join-where-single-table-stays-empty {
+    SELECT o.a, p.a, p.b FROM o LEFT JOIN p ON o.a = p.a
+    WHERE coalesce(p.b, 1) = 0;
+}
+expect {
+}
+
+@setup on-true-empty
+test left-join-where-on-true-empty-right {
+    SELECT t1.a, t2.b FROM t1 LEFT JOIN t2 ON 1
+    WHERE coalesce(t2.b, 0) = t1.a;
+}
+expect {
+}
+
+@setup on-true-matched
+test left-join-where-on-true-matched-row-fails-where {
+    -- The matched pair is (1, 5): coalesce(5, 1) = 1 is false, so the row
+    -- is dropped. A null-extended row would make coalesce(NULL, 1) = 1 and
+    -- wrongly survive. Re-filtering only unmatched rows still gets this wrong.
+    SELECT t1.a, t2.b FROM t1 LEFT JOIN t2 ON 1
+    WHERE coalesce(t2.b, 1) = t1.a;
+}
+expect {
+}
+
+@setup kept-match
+test left-join-where-inner-join-keeps-filtered-rows {
+    -- Same spanning WHERE equality on an INNER JOIN still filters. (2, 2)
+    -- matches; (3, 9) does not, because coalesce(9, 1) = 3 is false.
+    SELECT o.a, p.a, p.b FROM o INNER JOIN p ON o.a = p.a
+    WHERE coalesce(p.b, 1) = o.a
+    ORDER BY o.a;
+}
+expect {
+    2|2|2
+}
+
+@setup kept-match
+test left-join-where-on-equality-keeps-real-match {
+    -- ON o.a = p.a still keys the join. The WHERE term stays residual:
+    -- the real (2, 2) match is kept, and the unmatched o=0 row is not.
+    SELECT o.a, p.a, p.b FROM o LEFT JOIN p ON o.a = p.a
+    WHERE coalesce(p.b, 1) = o.a
+    ORDER BY o.a;
+}
+expect {
+    2|2|2
+}
+
+@setup on-true-empty
+@skip-if sqlite "EQP text differs; SQLite has no HASH JOIN operator"
+test left-join-where-on-true-plan-is-nested-loop {
+    EXPLAIN QUERY PLAN
+    SELECT t1.a, t2.b FROM t1 LEFT JOIN t2 ON 1
+    WHERE coalesce(t2.b, 0) = t1.a;
+}
+expect {
+    1|0|0|SCAN t1
+    2|0|0|SCAN t2 LEFT-JOIN
+}
