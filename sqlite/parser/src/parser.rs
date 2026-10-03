@@ -389,7 +389,7 @@ impl<'a> Parser<'a> {
             match tt {
                 TK_ID | TK_STRING | TK_JOIN_KW | TK_UNION | TK_EXCEPT | TK_INTERSECT
                 | TK_GENERATED | TK_WITHOUT | TK_COLUMNKW | TK_WINDOW | TK_FILTER | TK_OVER
-                | TK_WITHIN => TK_ID,
+                | TK_WITHIN | TK_LATERAL => TK_ID,
                 _ => tt.fallback_id_if_ok(),
             }
         }
@@ -538,6 +538,32 @@ impl<'a> Parser<'a> {
                     };
 
                     if !can_be_within {
+                        tok.token_type = TK_ID;
+                    }
+                }
+                TK_LATERAL => {
+                    let prev_tt = self.current_token.token_type.unwrap_or(TK_EOF);
+                    let starts_from_item = matches!(prev_tt, TK_FROM | TK_COMMA | TK_JOIN);
+                    let precedes_subquery = starts_from_item
+                        && self.try_parse(|p| {
+                            match p.consume_lexer_without_whitespaces_or_comments() {
+                                None => return Ok(false),
+                                Some(tok) => match tok?.token_type {
+                                    TK_LP => {}
+                                    _ => return Ok(false),
+                                },
+                            }
+
+                            match p.consume_lexer_without_whitespaces_or_comments() {
+                                None => Ok(false),
+                                Some(tok) => match tok?.token_type {
+                                    TK_SELECT | TK_VALUES | TK_WITH => Ok(true),
+                                    _ => Ok(false),
+                                },
+                            }
+                        })?;
+
+                    if !precedes_subquery {
                         tok.token_type = TK_ID;
                     }
                 }
@@ -2928,10 +2954,28 @@ impl<'a> Parser<'a> {
                 TK_INDEXED,
                 TK_JOIN_KW,
                 TK_LP,
-                TK_LBRACKET
+                TK_LBRACKET,
+                TK_LATERAL
             );
 
             match tok.token_type.fallback_id_if_ok() {
+                TK_LATERAL => {
+                    eat_assert!(self, TK_LATERAL);
+                    eat_assert!(self, TK_LP);
+                    let select = self.parse_select()?;
+                    eat_expect!(self, TK_RP);
+                    let alias = self.parse_as()?;
+                    let on_using = self.parse_on_using()?;
+                    result.push(JoinedSelectTable {
+                        operator: op,
+                        table: Box::new(SelectTable::Select {
+                            select,
+                            alias,
+                            lateral: true,
+                        }),
+                        constraint: on_using,
+                    });
+                }
                 TK_ID | TK_STRING | TK_INDEXED | TK_JOIN_KW | TK_LBRACKET => {
                     let name = self.parse_fullname(false)?;
                     match self.peek()? {
@@ -2978,7 +3022,11 @@ impl<'a> Parser<'a> {
                             let on_using = self.parse_on_using()?;
                             result.push(JoinedSelectTable {
                                 operator: op,
-                                table: Box::new(SelectTable::Select(select, alias)),
+                                table: Box::new(SelectTable::Select {
+                                    select,
+                                    alias,
+                                    lateral: false,
+                                }),
                                 constraint: on_using,
                             });
                         }
@@ -3010,10 +3058,26 @@ impl<'a> Parser<'a> {
             TK_INDEXED,
             TK_JOIN_KW,
             TK_LP,
-            TK_LBRACKET
+            TK_LBRACKET,
+            TK_LATERAL
         );
 
         match tok.token_type.fallback_id_if_ok() {
+            TK_LATERAL => {
+                eat_assert!(self, TK_LATERAL);
+                eat_assert!(self, TK_LP);
+                let select = self.parse_select()?;
+                eat_expect!(self, TK_RP);
+                let alias = self.parse_as()?;
+                Ok(FromClause {
+                    select: Box::new(SelectTable::Select {
+                        select,
+                        alias,
+                        lateral: true,
+                    }),
+                    joins: self.parse_joined_tables()?,
+                })
+            }
             TK_ID | TK_STRING | TK_INDEXED | TK_JOIN_KW | TK_LBRACKET => {
                 let name = self.parse_fullname(false)?;
                 match self.peek()? {
@@ -3051,7 +3115,11 @@ impl<'a> Parser<'a> {
                         eat_expect!(self, TK_RP);
                         let alias = self.parse_as()?;
                         Ok(FromClause {
-                            select: Box::new(SelectTable::Select(select, alias)),
+                            select: Box::new(SelectTable::Select {
+                                select,
+                                alias,
+                                lateral: false,
+                            }),
                             joins: self.parse_joined_tables()?,
                         })
                     }
@@ -5486,6 +5554,33 @@ mod tests {
 
             assert!(formatted.contains(comment), "formatted SQL: {formatted}");
             Parser::new(formatted.as_bytes()).next().unwrap().unwrap();
+        }
+    }
+
+    #[test]
+    fn test_lateral_subquery() {
+        for sql in [
+            "SELECT * FROM t1, LATERAL (SELECT t1.a) AS s",
+            "SELECT * FROM t1 LEFT OUTER JOIN LATERAL (VALUES (t1.a)) AS s ON TRUE",
+            "SELECT * FROM LATERAL (WITH c AS (SELECT 1) SELECT * FROM c)",
+        ] {
+            let cmd = Parser::new(sql.as_bytes()).next_cmd().unwrap().unwrap();
+            assert_eq!(cmd.to_string(), format!("{sql};"));
+        }
+    }
+
+    #[test]
+    fn test_lateral_is_a_name_when_no_subquery_follows() {
+        for sql in [
+            "SELECT lateral FROM lateral",
+            "SELECT * FROM t1, lateral",
+            "SELECT * FROM t1 AS lateral",
+            "SELECT * FROM lateral (1)",
+            "SELECT * FROM t1, lateral ((SELECT 1))",
+            "CREATE TABLE lateral (lateral)",
+        ] {
+            let cmd = Parser::new(sql.as_bytes()).next_cmd().unwrap().unwrap();
+            assert_eq!(cmd.to_string(), format!("{sql};"));
         }
     }
 
@@ -9520,8 +9615,8 @@ mod tests {
                                 None,
                             )],
                             from: Some(FromClause {
-                                select: Box::new(SelectTable::Select(
-                                    Select {
+                                select: Box::new(SelectTable::Select {
+                                    select: Select {
                                         with: None,
                                         body: SelectBody {
                                             select: OneSelect::Select {
@@ -9540,8 +9635,9 @@ mod tests {
                                         order_by: vec![],
                                         limit: None,
                                     },
-                                    None,
-                                )),
+                                    alias: None,
+                                    lateral: false,
+                                }),
                                 joins: vec![]
                             }),
                             where_clause: None,
@@ -10263,8 +10359,8 @@ mod tests {
                                 joins: vec![
                                     JoinedSelectTable {
                                         operator: JoinOperator::TypedJoin(None),
-                                        table: Box::new(SelectTable::Select(
-                                            Select {
+                                        table: Box::new(SelectTable::Select {
+                                            select: Select {
                                                 with: None,
                                                 body: SelectBody {
                                                     select: OneSelect::Values(vec![
@@ -10282,8 +10378,9 @@ mod tests {
                                                 order_by: vec![],
                                                 limit: None,
                                             },
-                                            None,
-                                        )),
+                                            alias: None,
+                                            lateral: false,
+                                        }),
                                         constraint: None,
                                     }
                                 ]

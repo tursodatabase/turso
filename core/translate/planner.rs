@@ -19,6 +19,7 @@ use crate::translate::{
         BindingBehavior, WalkControl,
     },
     plan::{NonFromClauseSubquery, SubqueryState},
+    subquery::outer_query_refs_for_correlated_subquery,
 };
 use crate::{
     ast::Limit,
@@ -270,7 +271,9 @@ impl RecursiveRefCounter<'_> {
                 }
                 count
             }
-            ast::SelectTable::Select(subselect, _) => self.count_select(subselect, scope),
+            ast::SelectTable::Select {
+                select: subselect, ..
+            } => self.count_select(subselect, scope),
             ast::SelectTable::Sub(from, _) => {
                 let mut count = self.count_from_table(&from.select, scope);
                 for join in &from.joins {
@@ -344,7 +347,7 @@ impl RecursiveRefCounter<'_> {
                             && !scope.iter().any(|(scope_name, _)| *scope_name == name),
                     )
                 }
-                ast::SelectTable::Select(_, _) => 0,
+                ast::SelectTable::Select { .. } => 0,
                 ast::SelectTable::Sub(from, _) => {
                     count_direct_in_from_table(counter, &from.select, scope)
                         + from
@@ -389,7 +392,9 @@ fn collect_from_select_table(table: &ast::SelectTable, out: &mut Vec<String>) {
                 collect_subquery_table_refs_in_expr(arg, out);
             }
         }
-        ast::SelectTable::Select(subselect, _) => {
+        ast::SelectTable::Select {
+            select: subselect, ..
+        } => {
             collect_from_clause_table_refs(subselect, out);
         }
         ast::SelectTable::Sub(from_clause, _) => {
@@ -1594,9 +1599,20 @@ fn parse_from_clause_table(
             indexed,
             connection,
         ),
-        ast::SelectTable::Select(subselect, maybe_alias) => {
+        ast::SelectTable::Select {
+            select: subselect,
+            alias: maybe_alias,
+            lateral,
+        } => {
+            let lateral = lateral && !table_references.joined_tables().is_empty();
+            let mut outer_query_refs_for_subquery: Vec<OuterQueryReference> = if lateral {
+                outer_query_refs_for_correlated_subquery(table_references)?
+                    .into_iter()
+                    .collect()
+            } else {
+                table_references.outer_query_refs().to_vec()
+            };
             // Make the parent's CTEs visible while planning this inline subquery.
-            let mut outer_query_refs_for_subquery = table_references.outer_query_refs().to_vec();
             let base_outer_query_refs_for_subquery = base_outer_refs_for_cte_planning(
                 table_references.outer_query_refs(),
                 cte_definitions,
@@ -1635,14 +1651,24 @@ fn parse_from_clause_table(
                 });
             }
 
-            let subplan = prepare_select_plan(
-                subselect,
-                resolver,
-                program,
-                &outer_query_refs_for_subquery,
-                QueryDestination::placeholder_for_subquery(),
-                connection,
-            )?;
+            let subplan = if lateral {
+                prepare_lateral_subquery_plan(
+                    subselect,
+                    resolver,
+                    program,
+                    &outer_query_refs_for_subquery,
+                    connection,
+                )?
+            } else {
+                prepare_select_plan(
+                    subselect,
+                    resolver,
+                    program,
+                    &outer_query_refs_for_subquery,
+                    QueryDestination::placeholder_for_subquery(),
+                    connection,
+                )?
+            };
             match &subplan {
                 Plan::Select(_) | Plan::CompoundSelect { .. } | Plan::RecursiveCte(_) => {}
                 Plan::Delete(_) | Plan::Update(_) => {
@@ -1682,6 +1708,32 @@ fn parse_from_clause_table(
             crate::bail_parse_error!("Parenthesized FROM clause subqueries are not supported")
         }
     }
+}
+
+fn prepare_lateral_subquery_plan(
+    select: Select,
+    resolver: &Resolver,
+    program: &mut ProgramBuilder,
+    outer_query_refs: &[OuterQueryReference],
+    connection: &Arc<crate::Connection>,
+) -> Result<Plan> {
+    resolver.begin_collecting_aggregates_from_subqueries();
+    let plan = prepare_select_plan(
+        select,
+        resolver,
+        program,
+        outer_query_refs,
+        QueryDestination::placeholder_for_subquery(),
+        connection,
+    );
+    let aggregates_of_the_enclosing_query = resolver.take_aggregates_from_subqueries();
+    let plan = plan?;
+    if !aggregates_of_the_enclosing_query.is_empty() {
+        crate::bail_parse_error!(
+            "aggregate functions are not allowed in FROM clause of their own query level"
+        );
+    }
+    Ok(plan)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1900,7 +1952,11 @@ fn parse_table(
 
         return program.with_view_expansion(database_id, &view.name, |program| {
             parse_from_clause_table(
-                ast::SelectTable::Select(*subselect, view_alias),
+                ast::SelectTable::Select {
+                    select: *subselect,
+                    alias: view_alias,
+                    lateral: false,
+                },
                 resolver,
                 program,
                 table_references,
@@ -2518,6 +2574,7 @@ fn parse_join(
         cte_definitions,
         connection,
     )?;
+    let lateral_reference = left_table_read_by_rightmost_table(table_references).map(str::to_owned);
 
     let is_cross = matches!(join_operator, ast::JoinOperator::TypedJoin(Some(jt)) if jt.contains(JoinType::CROSS));
 
@@ -2529,6 +2586,12 @@ fn parse_join(
             let is_natural = join_type.contains(JoinType::NATURAL);
             // FULL OUTER: LEFT+RIGHT or bare OUTER
             let is_full = (is_left && is_right) || (is_outer && !is_left && !is_right);
+            if let Some(table) = lateral_reference.as_ref().filter(|_| is_right || is_full) {
+                crate::bail_parse_error!(
+                    "invalid reference to FROM-clause entry for table \"{table}\": \
+                     the combining JOIN type must be INNER or LEFT for a LATERAL reference"
+                );
+            }
 
             if is_right && !is_left && !is_full {
                 // RIGHT JOIN: swap the last two tables, then treat as LEFT JOIN.
@@ -2728,9 +2791,25 @@ fn parse_join(
         join_type: plan_join_type,
         using,
         no_reorder: is_cross,
+        lateral: lateral_reference.is_some(),
     });
 
     Ok(())
+}
+
+fn left_table_read_by_rightmost_table(table_references: &TableReferences) -> Option<&str> {
+    let (last_table, tables_on_its_left) = table_references
+        .joined_tables()
+        .split_last()
+        .expect("the joined table was just added");
+    let Table::FromClauseSubquery(subquery) = &last_table.table else {
+        return None;
+    };
+    let read_table_ids = subquery.plan.used_outer_query_ref_ids();
+    tables_on_its_left
+        .iter()
+        .find(|table| read_table_ids.contains(&table.internal_id))
+        .map(|table| table.identifier.as_str())
 }
 
 pub(crate) fn append_vtab_predicates_to_where_clause(

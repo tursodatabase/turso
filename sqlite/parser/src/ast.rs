@@ -1106,7 +1106,11 @@ pub enum SelectTable {
     /// table function call
     TableCall(QualifiedName, Vec<Box<Expr>>, Option<As>),
     /// `SELECT` subquery
-    Select(Select, Option<As>),
+    Select {
+        select: Select,
+        alias: Option<As>,
+        lateral: bool,
+    },
     /// subquery
     Sub(FromClause, Option<As>),
 }

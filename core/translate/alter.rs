@@ -3761,8 +3761,27 @@ fn apply_from_clause_for_column_rename(
         database_id,
         resolver,
     )?;
+    let mut left_target_qualifiers = Vec::new();
+    let mut seen_left_target_qualifiers = HashSet::default();
+    collect_select_table_target_qualifiers(
+        &from_clause.select,
+        target_table_name,
+        &mut left_target_qualifiers,
+        &mut seen_left_target_qualifiers,
+    );
 
     for join in &mut from_clause.joins {
+        let lateral_target_qualifiers;
+        let table_target_qualifiers = if matches!(
+            join.table.as_ref(),
+            ast::SelectTable::Select { lateral: true, .. }
+        ) {
+            lateral_target_qualifiers =
+                merge_target_qualifiers(visible_target_qualifiers, &left_target_qualifiers);
+            &lateral_target_qualifiers
+        } else {
+            visible_target_qualifiers
+        };
         apply_select_table_for_column_rename(
             mode,
             &mut join.table,
@@ -3770,10 +3789,16 @@ fn apply_from_clause_for_column_rename(
             trigger_table_name,
             target_table_name,
             old_col_norm,
-            visible_target_qualifiers,
+            table_target_qualifiers,
             database_id,
             resolver,
         )?;
+        collect_select_table_target_qualifiers(
+            &join.table,
+            target_table_name,
+            &mut left_target_qualifiers,
+            &mut seen_left_target_qualifiers,
+        );
         if let Some(ast::JoinConstraint::On(expr)) = &mut join.constraint {
             apply_expr_for_column_rename(
                 mode,
@@ -3806,7 +3831,7 @@ fn apply_select_table_for_column_rename(
     resolver: &Resolver,
 ) -> Result<()> {
     match select_table {
-        ast::SelectTable::Select(select, _) => {
+        ast::SelectTable::Select { select, .. } => {
             apply_select_for_column_rename(
                 mode,
                 select,
@@ -5001,7 +5026,7 @@ fn validate_select_table_refs_after_rename_in_table(
             }
             Ok(None)
         }
-        ast::SelectTable::Select(select, _) => validate_select_table_refs_after_rename(
+        ast::SelectTable::Select { select, .. } => validate_select_table_refs_after_rename(
             select,
             altered_table_norm,
             resolver,
@@ -5674,7 +5699,7 @@ fn validate_select_table_column_refs_after_drop(
     altered_database_id: usize,
 ) -> Result<Option<String>> {
     match select_table {
-        ast::SelectTable::Select(select, _) => validate_select_column_refs_after_drop(
+        ast::SelectTable::Select { select, .. } => validate_select_column_refs_after_drop(
             select,
             &[],
             owning_table_columns,
@@ -5781,7 +5806,7 @@ fn collect_select_table_visible_columns(
                 altered_database_id,
             )
         }
-        ast::SelectTable::Select(select, _) => collect_select_output_columns(select),
+        ast::SelectTable::Select { select, .. } => collect_select_output_columns(select),
         ast::SelectTable::Sub(from_clause, _) => collect_from_clause_output_columns(from_clause),
     }
 }
@@ -5839,7 +5864,7 @@ fn collect_select_table_visible_columns_from_output(
 ) -> Vec<String> {
     match select_table {
         ast::SelectTable::Table(..) | ast::SelectTable::TableCall(..) => Vec::new(),
-        ast::SelectTable::Select(select, _) => collect_select_output_columns(select),
+        ast::SelectTable::Select { select, .. } => collect_select_output_columns(select),
         ast::SelectTable::Sub(from_clause, _) => collect_from_clause_output_columns(from_clause),
     }
 }
