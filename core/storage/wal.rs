@@ -4097,8 +4097,11 @@ impl Wal for WalFile {
 
     #[instrument(skip_all, level = Level::DEBUG)]
     fn should_checkpoint(&self, checkpoint_threshold: u32) -> bool {
+        if checkpoint_threshold == 0 {
+            return false;
+        }
         let snapshot = self.load_coordination_snapshot();
-        snapshot.max_frame as usize > checkpoint_threshold as usize + snapshot.nbackfills as usize
+        snapshot.max_frame > u64::from(checkpoint_threshold) + snapshot.nbackfills
     }
 
     #[instrument(skip_all, level = Level::DEBUG)]

@@ -2507,6 +2507,11 @@ impl Connection {
         self.wal_autocheckpoint.load(Ordering::SeqCst)
     }
 
+    pub(crate) fn set_wal_autocheckpoint(&self, frames: u32) {
+        self.wal_autocheckpoint.store(frames, Ordering::SeqCst);
+        self.bump_prepare_context_generation();
+    }
+
     /// Publish the connection's current schema snapshot to the shared database
     /// cache after a successful commit so other live connections can refresh.
     pub fn publish_schema_if_newer(&self) {

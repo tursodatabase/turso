@@ -442,6 +442,29 @@ fn update_pragma(
         PragmaName::LegacyFileFormat | PragmaName::EmptyResultCallbacks => {
             Ok(TransactionMode::None)
         }
+        PragmaName::WalAutocheckpoint => {
+            let data = parse_signed_number(&value)?;
+            let frames = match data {
+                Value::Numeric(Numeric::Integer(i)) => i,
+                Value::Numeric(Numeric::Float(f)) => f64::from(f) as i64,
+                _ => bail_parse_error!("expected integer, got {:?}", data),
+            };
+            let frames = i32::try_from(frames)
+                .ok()
+                .and_then(|frames| u32::try_from(frames).ok())
+                .unwrap_or(0);
+            connection.set_wal_autocheckpoint(frames);
+            query_pragma(
+                PragmaName::WalAutocheckpoint,
+                resolver,
+                None,
+                pager,
+                connection,
+                database_id,
+                schema_was_explicit,
+                program,
+            )
+        }
         PragmaName::WalCheckpoint => query_pragma(
             PragmaName::WalCheckpoint,
             resolver,
@@ -929,6 +952,12 @@ fn query_pragma(
             Ok(TransactionMode::None)
         }
         PragmaName::LegacyFileFormat | PragmaName::EmptyResultCallbacks => {
+            Ok(TransactionMode::None)
+        }
+        PragmaName::WalAutocheckpoint => {
+            program.emit_int(i64::from(connection.get_wal_autocheckpoint()), register);
+            program.emit_result_row(register, 1);
+            program.add_pragma_result_column(pragma.to_string());
             Ok(TransactionMode::None)
         }
         PragmaName::WalCheckpoint => {

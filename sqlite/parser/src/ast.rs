@@ -1971,6 +1971,8 @@ pub enum PragmaName {
     UnstableCaptureDataChangesConn,
     /// Returns the user version of the database file.
     UserVersion,
+    /// Sets or queries the number of WAL frames after which a commit runs an automatic checkpoint.
+    WalAutocheckpoint,
     /// trigger a checkpoint to run on database(s) if WAL is enabled
     WalCheckpoint,
     /// Sets or queries the threshold (in bytes) at which MVCC triggers an automatic checkpoint.
