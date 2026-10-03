@@ -6,8 +6,8 @@ use crate::{
     translate::{
         collate::{get_collseq_from_expr, resolve_comparison_collseq, CollationSeq},
         expr::{
-            as_binary_components, get_expr_affinity, truth_test_rhs, unwrap_parens, walk_expr,
-            walk_expr_mut, WalkControl,
+            as_binary_components, get_expr_affinity, sanitize_string, truth_test_rhs,
+            unwrap_parens, walk_expr, walk_expr_mut, WalkControl,
         },
         expression_index::normalize_expr_for_index_matching,
         plan::{
@@ -101,6 +101,13 @@ pub struct Constraint {
     /// many NULL keys, so such a constraint can match many rows and its cost
     /// and row estimates must not be taken from equality statistics.
     pub null_matching: bool,
+    /// Set for the two range bounds derived from a LIKE or GLOB pattern with a
+    /// literal prefix: `f GLOB 'ab*'` gives `f >= 'ab'` and `f < 'ac'`. Holds
+    /// the collation an index column must use for the bounds to be valid.
+    /// The range can contain rows that the pattern does not match, so an index
+    /// seek on these bounds never consumes the LIKE or GLOB term; it is still
+    /// checked as a filter.
+    pub pattern_collation: Option<CollationSeq>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -223,6 +230,11 @@ impl Constraint {
         });
         self.satisfies_index_affinity(col.affinity())
     }
+
+    /// Whether an index seek on this constraint makes its WHERE term redundant.
+    pub fn consumes_where_term(&self) -> bool {
+        self.pattern_collation.is_none()
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -294,10 +306,12 @@ pub(super) fn automatic_index_terms(
     constraints: &TableConstraints,
 ) -> SmallVec<[ConstraintRef; 4]> {
     let columns = table.columns();
+    let can_key_automatic_index =
+        |term: &Constraint| term.can_drive_index_seek(columns) && term.pattern_collation.is_none();
     let usable_constraints: SmallVec<[&Constraint; 4]> = constraints
         .constraints
         .iter()
-        .filter(|term| term.can_drive_index_seek(columns))
+        .filter(|term| can_key_automatic_index(term))
         .collect();
     let index_columns = ordered_ephemeral_key_columns(&usable_constraints);
 
@@ -305,7 +319,7 @@ pub(super) fn automatic_index_terms(
         .constraints
         .iter()
         .enumerate()
-        .filter(|(_, term)| term.can_drive_index_seek(columns))
+        .filter(|(_, term)| can_key_automatic_index(term))
         .filter_map(|(term_index, term)| {
             let table_col_pos = term.table_col_pos?;
             Some(ConstraintRef {
@@ -815,6 +829,7 @@ pub fn constraints_from_where_clause(
                                 is_rowid: false,
                                 comparison_affinity: cmp_aff,
                                 null_matching: null_matching(rhs),
+                                pattern_collation: None,
                             });
                         }
                     }
@@ -846,6 +861,7 @@ pub fn constraints_from_where_clause(
                                 is_rowid: true,
                                 comparison_affinity: cmp_aff,
                                 null_matching: null_matching(rhs),
+                                pattern_collation: None,
                             });
                         }
                     }
@@ -886,6 +902,7 @@ pub fn constraints_from_where_clause(
                             is_rowid: false,
                             comparison_affinity: cmp_aff,
                             null_matching: null_matching(rhs),
+                            pattern_collation: None,
                         });
                     }
                     _ => {}
@@ -915,6 +932,7 @@ pub fn constraints_from_where_clause(
                                 is_rowid: false,
                                 comparison_affinity: cmp_aff,
                                 null_matching: null_matching(lhs),
+                                pattern_collation: None,
                             });
                         }
                     }
@@ -946,6 +964,7 @@ pub fn constraints_from_where_clause(
                                 is_rowid: true,
                                 comparison_affinity: cmp_aff,
                                 null_matching: null_matching(lhs),
+                                pattern_collation: None,
                             });
                         }
                     }
@@ -986,10 +1005,42 @@ pub fn constraints_from_where_clause(
                             is_rowid: false,
                             comparison_affinity: cmp_aff,
                             null_matching: null_matching(lhs),
+                            pattern_collation: None,
                         });
                     }
                     _ => {}
                 };
+                if let Some(range) = pattern_prefix_range(&term.expr, table_reference)? {
+                    let table_column = &table_reference.table.columns()[range.column];
+                    for (operator, bound) in [
+                        (ast::Operator::GreaterEquals, range.lower_bound),
+                        (ast::Operator::Less, range.upper_bound),
+                    ] {
+                        cs.constraints.push(Constraint {
+                            where_clause_pos: (i, BinaryExprSide::Rhs),
+                            operator: operator.into(),
+                            table_col_pos: Some(range.column),
+                            expr: None,
+                            constraining_expr: Some((operator, bound, Affinity::Blob)),
+                            lhs_mask: TableMask::default(),
+                            selectivity: estimate_constraint_selectivity(
+                                schema,
+                                table_reference,
+                                Some(table_column),
+                                operator.into(),
+                                false,
+                                index_for_column(range.column),
+                                params,
+                                false,
+                            ),
+                            usable,
+                            is_rowid: false,
+                            comparison_affinity: Some(Affinity::Text),
+                            null_matching: false,
+                            pattern_collation: Some(range.collation),
+                        });
+                    }
+                }
             }
 
             // IN expressions are handled separately from binary expressions above because:
@@ -1040,6 +1091,7 @@ pub fn constraints_from_where_clause(
                             is_rowid,
                             comparison_affinity: cmp_aff,
                             null_matching: false,
+                            pattern_collation: None,
                         });
                     }
                     ast::Expr::RowId { table, .. } if *table == table_reference.internal_id => {
@@ -1058,6 +1110,7 @@ pub fn constraints_from_where_clause(
                             is_rowid: true,
                             comparison_affinity: cmp_aff,
                             null_matching: false,
+                            pattern_collation: None,
                         });
                     }
                     _ => {}
@@ -1137,6 +1190,7 @@ pub fn constraints_from_where_clause(
                                 is_rowid,
                                 comparison_affinity: cmp_aff,
                                 null_matching: false,
+                                pattern_collation: None,
                             });
                         }
                         ast::Expr::RowId { table, .. } if *table == table_reference.internal_id => {
@@ -1155,6 +1209,7 @@ pub fn constraints_from_where_clause(
                                 is_rowid: true,
                                 comparison_affinity: cmp_aff,
                                 null_matching: false,
+                                pattern_collation: None,
                             });
                         }
                         _ => {}
@@ -1186,7 +1241,9 @@ pub fn constraints_from_where_clause(
             // comparison collation follows the left operand, so a plain BINARY
             // column on the left disqualifies an index on a NOCASE column even
             // though neither side declares a collation explicitly.
-            let comparison_collation = if constraint.constraining_expr.is_some() {
+            let comparison_collation = if constraint.pattern_collation.is_some() {
+                None
+            } else if constraint.constraining_expr.is_some() {
                 get_collseq_from_expr(
                     constraint.get_constraining_expr_ref(where_clause),
                     table_references,
@@ -1258,7 +1315,9 @@ pub fn constraints_from_where_clause(
                         let index_collation = index.columns[position_in_index]
                             .collation
                             .unwrap_or_default();
-                        if table_collation != index_collation {
+                        let required_collation =
+                            constraint.pattern_collation.unwrap_or(table_collation);
+                        if required_collation != index_collation {
                             continue;
                         }
                         // Custom type columns encode values as blobs. Blob ordering (memcmp)
@@ -1333,6 +1392,100 @@ pub fn constraints_from_where_clause(
     }
 
     Ok(constraints)
+}
+
+struct PatternPrefixRange {
+    column: usize,
+    collation: CollationSeq,
+    lower_bound: ast::Expr,
+    upper_bound: ast::Expr,
+}
+
+/// Returns the range of values that every match of `col GLOB 'prefix*'` or
+/// `col LIKE 'prefix%'` falls into, following SQLite's `isLikeOrGlob()`.
+///
+/// The column must have TEXT affinity: with numeric affinity, stored numbers
+/// sort before all text and a text range would miss them. GLOB compares bytes,
+/// so its range needs a BINARY index. LIKE ignores ASCII case, so its range
+/// needs a NOCASE index. For LIKE, the lower bound is upper case and the upper
+/// bound is lower case, so every case variant of the prefix is also inside the
+/// range when the bounds are cast to BLOB. The prefix stops at the first
+/// non-ASCII character so that incrementing its last character always gives a
+/// valid upper bound.
+fn pattern_prefix_range(
+    expr: &ast::Expr,
+    table_reference: &JoinedTable,
+) -> Result<Option<PatternPrefixRange>> {
+    let ast::Expr::Like {
+        lhs,
+        not: false,
+        op,
+        rhs,
+        escape,
+    } = unwrap_parens(expr)?
+    else {
+        return Ok(None);
+    };
+    let ast::Expr::Column { table, column, .. } = lhs.as_ref() else {
+        return Ok(None);
+    };
+    if *table != table_reference.internal_id || table_reference.btree().is_none() {
+        return Ok(None);
+    }
+    if table_reference.table.columns()[*column].affinity() != Affinity::Text {
+        return Ok(None);
+    }
+    let ast::Expr::Literal(ast::Literal::String(pattern)) = rhs.as_ref() else {
+        return Ok(None);
+    };
+    let (wildcards, collation): (&[char], CollationSeq) = match op {
+        ast::LikeOperator::Glob => (&['*', '?', '['], CollationSeq::Binary),
+        ast::LikeOperator::Like => (&['%', '_'], CollationSeq::NoCase),
+        ast::LikeOperator::Match | ast::LikeOperator::Regexp => return Ok(None),
+    };
+    let escape_char = match escape.as_deref() {
+        None => None,
+        Some(ast::Expr::Literal(ast::Literal::String(escape))) => {
+            let escape = sanitize_string(escape);
+            let mut chars = escape.chars();
+            match (chars.next(), chars.next()) {
+                (Some(escape_char), None) => Some(escape_char),
+                _ => return Ok(None),
+            }
+        }
+        Some(_) => return Ok(None),
+    };
+    let prefix: String = sanitize_string(pattern)
+        .chars()
+        .take_while(|c| {
+            c.is_ascii() && *c != '\0' && !wildcards.contains(c) && Some(*c) != escape_char
+        })
+        .collect();
+    let Some(last_char) = prefix.chars().last() else {
+        return Ok(None);
+    };
+    if last_char == '\x7f' {
+        return Ok(None);
+    }
+    let (lower_bound, mut upper_bound) = match collation {
+        CollationSeq::NoCase => (prefix.to_ascii_uppercase(), prefix.to_ascii_lowercase()),
+        _ => (prefix.clone(), prefix),
+    };
+    let last_char = upper_bound.pop().expect("prefix is not empty");
+    upper_bound.push((last_char as u8 + 1) as char);
+    Ok(Some(PatternPrefixRange {
+        column: *column,
+        collation,
+        lower_bound: string_literal(&lower_bound),
+        upper_bound: string_literal(&upper_bound),
+    }))
+}
+
+fn string_literal(value: &str) -> ast::Expr {
+    ast::Expr::Literal(ast::Literal::String(format!(
+        "'{}'",
+        value.replace('\'', "''")
+    )))
 }
 
 /// A reference to a [Constraint]s in a [TableConstraints] for single column.
@@ -1508,6 +1661,13 @@ pub fn usable_constraints_for_lhs_mask(
                 // constraints on the same column do not change the seek shape.
                 continue;
             }
+            if !merge_pattern_bounds(
+                constraints,
+                usable.last_mut().unwrap(),
+                cref.constraint_vec_pos,
+            ) {
+                continue;
+            }
             match constraints[cref.constraint_vec_pos]
                 .operator
                 .as_ast_operator()
@@ -1582,7 +1742,53 @@ pub fn usable_constraints_for_lhs_mask(
         usable.push(constraint_group);
         current_required_column_pos += 1;
     }
+    if let Some(range) = usable.last() {
+        let pattern_bound_count = [range.lower_bound, range.upper_bound]
+            .into_iter()
+            .flatten()
+            .filter(|&pos| constraints[pos].pattern_collation.is_some())
+            .count();
+        turso_assert!(
+            pattern_bound_count != 1,
+            "LIKE and GLOB prefix bounds must be used as a pair"
+        );
+    }
     usable
+}
+
+/// Decides whether the range bound at `incoming` joins `range`. Bounds from a
+/// LIKE or GLOB prefix are only valid as a pair from the same term, because
+/// the second search for BLOB values casts both bounds. Any other bound on the
+/// column replaces them.
+fn merge_pattern_bounds(
+    constraints: &[Constraint],
+    range: &mut RangeConstraintRef,
+    incoming: usize,
+) -> bool {
+    let pattern_term = |pos: usize| {
+        let constraint = &constraints[pos];
+        constraint
+            .pattern_collation
+            .map(|_| constraint.where_clause_pos.0)
+    };
+    let bounds = [range.lower_bound, range.upper_bound];
+    let has_other_bound = bounds
+        .iter()
+        .flatten()
+        .any(|&pos| pattern_term(pos).is_none());
+    let current_pattern_term = bounds.iter().flatten().find_map(|&pos| pattern_term(pos));
+    match pattern_term(incoming) {
+        Some(term) => {
+            !has_other_bound && current_pattern_term.is_none_or(|current| current == term)
+        }
+        None => {
+            if current_pattern_term.is_some() {
+                range.lower_bound = None;
+                range.upper_bound = None;
+            }
+            true
+        }
+    }
 }
 
 pub fn usable_constraints_for_join_order<'a>(
@@ -2288,6 +2494,7 @@ pub(crate) fn analyze_binary_term_for_index(
         is_rowid,
         comparison_affinity: Some(affinity),
         null_matching,
+        pattern_collation: None,
     };
 
     Some(AnalyzedTerm {
