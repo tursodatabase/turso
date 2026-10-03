@@ -531,6 +531,23 @@ pub(crate) fn emit_materialized_build_inputs(
         plan.table_references.joined_tables_mut()[*build_table_idx].clear_expression_index_usages();
     }
 
+    let non_materialized_build_tables: Vec<usize> = plan
+        .table_references
+        .joined_tables()
+        .iter()
+        .filter_map(|table| match &table.op {
+            Operation::HashJoin(hash_join_op)
+                if !build_inputs.contains_key(&hash_join_op.build_table_idx) =>
+            {
+                Some(hash_join_op.build_table_idx)
+            }
+            _ => None,
+        })
+        .collect();
+    for build_table_idx in non_materialized_build_tables {
+        plan.table_references.joined_tables_mut()[build_table_idx].clear_expression_index_usages();
+    }
+
     // Drop any join-prefix tables already captured by key+payload materializations.
     prune_join_order_for_materialized_inputs(plan, &build_inputs)?;
 
