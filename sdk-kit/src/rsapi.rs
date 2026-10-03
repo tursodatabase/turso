@@ -567,7 +567,10 @@ impl TursoDatabaseConfig {
 
 fn open_flags_from_capi(flags: u32) -> Result<OpenFlags, TursoError> {
     const READONLY: u32 = c::turso_database_open_flags_t_TURSO_DATABASE_OPEN_READONLY;
-    if flags & !READONLY != 0 {
+    const READWRITE: u32 = c::turso_database_open_flags_t_TURSO_DATABASE_OPEN_READWRITE;
+    if flags & !(READONLY | READWRITE) != 0
+        || flags & (READONLY | READWRITE) == (READONLY | READWRITE)
+    {
         return Err(TursoError::Misuse(format!(
             "unknown database open flags: 0x{flags:x}"
         )));
@@ -575,6 +578,8 @@ fn open_flags_from_capi(flags: u32) -> Result<OpenFlags, TursoError> {
 
     if flags & READONLY != 0 {
         Ok(OpenFlags::ReadOnly)
+    } else if flags & READWRITE != 0 {
+        Ok(OpenFlags::None)
     } else {
         Ok(OpenFlags::default())
     }
@@ -893,7 +898,10 @@ impl TursoDatabase {
 
     /// create database holder struct but do not initialize it yet
     /// this can be useful for some environments, where IO operations must be executed in certain fashion (and open do IO under the hood)
-    pub fn new(config: TursoDatabaseConfig) -> Arc<Self> {
+    pub fn new(mut config: TursoDatabaseConfig) -> Arc<Self> {
+        if config.path == ":memory:" {
+            config.open_flags |= OpenFlags::Create;
+        }
         Arc::new(Self {
             config,
             db: Arc::new(Mutex::new(None)),
@@ -1839,6 +1847,43 @@ mod tests {
     use turso_core::{
         LimboError, PageCodec, PageCodecContext, PageCodecHeaderInfo, PageCodecId, Value,
     };
+
+    #[test]
+    fn database_open_flags_distinguish_create_readwrite_and_readonly() {
+        assert_eq!(super::open_flags_from_capi(0).unwrap(), OpenFlags::Create);
+        assert_eq!(
+            super::open_flags_from_capi(
+                c::turso_database_open_flags_t_TURSO_DATABASE_OPEN_READWRITE
+            )
+            .unwrap(),
+            OpenFlags::None
+        );
+        assert_eq!(
+            super::open_flags_from_capi(
+                c::turso_database_open_flags_t_TURSO_DATABASE_OPEN_READONLY
+            )
+            .unwrap(),
+            OpenFlags::ReadOnly
+        );
+        assert!(super::open_flags_from_capi(4).is_err());
+        assert!(super::open_flags_from_capi(3).is_err());
+    }
+
+    #[test]
+    fn memory_database_always_creates_its_backing_store() {
+        for open_flags in [OpenFlags::None, OpenFlags::ReadOnly] {
+            let db = TursoDatabase::new(TursoDatabaseConfig {
+                path: ":memory:".to_string(),
+                open_flags,
+                ..config_with_features(None)
+            });
+            assert!(db.config.open_flags.contains(OpenFlags::Create));
+            assert_eq!(
+                db.config.open_flags.contains(OpenFlags::ReadOnly),
+                open_flags.contains(OpenFlags::ReadOnly)
+            );
+        }
+    }
 
     #[test]
     fn commit_dependency_abort_requires_transaction_retry() {

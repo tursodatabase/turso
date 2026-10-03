@@ -48,6 +48,10 @@ internal struct TursoDatabaseConfig
 
 internal static class TursoInterop
 {
+    internal const uint DatabaseOpenDefault = 0;
+    internal const uint DatabaseOpenReadOnly = 1;
+    internal const uint DatabaseOpenReadWrite = 2;
+
     private const string DllName = "turso_sdk_kit";
 
     static TursoInterop()
