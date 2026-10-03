@@ -3761,8 +3761,27 @@ fn apply_from_clause_for_column_rename(
         database_id,
         resolver,
     )?;
+    let mut left_target_qualifiers = Vec::new();
+    let mut seen_left_target_qualifiers = HashSet::default();
+    collect_select_table_target_qualifiers(
+        &from_clause.select,
+        target_table_name,
+        &mut left_target_qualifiers,
+        &mut seen_left_target_qualifiers,
+    );
 
     for join in &mut from_clause.joins {
+        let lateral_target_qualifiers;
+        let table_target_qualifiers = if matches!(
+            join.table.as_ref(),
+            ast::SelectTable::Select { lateral: true, .. }
+        ) {
+            lateral_target_qualifiers =
+                merge_target_qualifiers(visible_target_qualifiers, &left_target_qualifiers);
+            &lateral_target_qualifiers
+        } else {
+            visible_target_qualifiers
+        };
         apply_select_table_for_column_rename(
             mode,
             &mut join.table,
@@ -3770,10 +3789,16 @@ fn apply_from_clause_for_column_rename(
             trigger_table_name,
             target_table_name,
             old_col_norm,
-            visible_target_qualifiers,
+            table_target_qualifiers,
             database_id,
             resolver,
         )?;
+        collect_select_table_target_qualifiers(
+            &join.table,
+            target_table_name,
+            &mut left_target_qualifiers,
+            &mut seen_left_target_qualifiers,
+        );
         if let Some(ast::JoinConstraint::On(expr)) = &mut join.constraint {
             apply_expr_for_column_rename(
                 mode,

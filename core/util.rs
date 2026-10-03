@@ -3051,10 +3051,25 @@ mod rename_column_view {
                     db_name: table_db_norm,
                 })
             }
-            ast::SelectTable::Select { select, alias, .. } => {
+            ast::SelectTable::Select {
+                select,
+                alias,
+                lateral,
+            } => {
                 let before_cols = select_output_columns(select, ctx, false)?;
-                *changed |=
-                    rewrite_view_select_for_column_rename(select, ctx, &[], visiting_views)?;
+                let lateral_scopes: Vec<&[ViewSourceInfo]> = if *lateral {
+                    std::iter::once(visible_sources)
+                        .chain(outer_scopes.iter().copied())
+                        .collect()
+                } else {
+                    Vec::new()
+                };
+                *changed |= rewrite_view_select_for_column_rename(
+                    select,
+                    ctx,
+                    &lateral_scopes,
+                    visiting_views,
+                )?;
                 let after_cols = select_output_columns(select, ctx, true)?;
                 let rename_map = build_rename_map(&before_cols, &after_cols, &ctx.old_column_norm);
                 let qualifiers = alias
