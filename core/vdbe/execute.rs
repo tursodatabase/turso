@@ -160,7 +160,7 @@ use super::{
         AddSequenceData, AggStepData, ArrayEncodeData, ClearBtreeCount, Cookie, IntegrityCkData,
         RegisterOrLiteral, SortComparatorType, SorterOpenData,
     },
-    CommitState,
+    CommitState, ViewDeltaCommitState,
 };
 use crate::sync::RwLock;
 use turso_parser::ast::{self, ForeignKeyClause, Name, QualifiedName, ResolveType};
@@ -5249,7 +5249,12 @@ pub fn op_auto_commit(
     // This handles main DB commits (Committing), attached DB commits
     // (CommittingAttached), MVCC commits (CommittingMvcc), and attached
     // MVCC commits (CommittingAttachedMvcc) that yielded on IO and need re-entry.
-    if !matches!(state.commit_state, CommitState::Ready) {
+    if !matches!(state.commit_state, CommitState::Ready)
+        || matches!(
+            state.view_delta_state,
+            ViewDeltaCommitState::Processing { .. }
+        )
+    {
         let res = program.commit_txn(pager.clone(), state, mv_store.as_ref(), *rollback);
         let res = state.done_or_suspend(res);
         // Only clear after a final, successful non-rollback COMMIT.
