@@ -1,8 +1,10 @@
+use crate::alloc::{TryClone, TursoAllocExt, TursoVecExt};
 use crate::pragma::{PragmaVirtualTable, PragmaVirtualTableCursor};
 use crate::schema::Column;
 use crate::sync::atomic::{AtomicPtr, AtomicU64, Ordering};
 use crate::sync::{Arc, RwLock, Weak};
 use crate::util::columns_from_create_table_body;
+use crate::vdbe::Register;
 use crate::{Connection, LimboError, SymbolTable, Value};
 use std::ffi::c_void;
 use std::ptr::NonNull;
@@ -245,6 +247,7 @@ enum VirtualTableCursorInner {
 pub struct VirtualTableCursor {
     inner: VirtualTableCursorInner,
     null_flag: bool,
+    filter_args: crate::alloc::Vec<Value>,
 }
 
 crate::assert::assert_send_sync!(VirtualTableCursor);
@@ -254,6 +257,7 @@ impl VirtualTableCursor {
         Self {
             inner: VirtualTableCursorInner::Pragma(Box::new(cursor)),
             null_flag: false,
+            filter_args: TursoAllocExt::new(),
         }
     }
 
@@ -261,6 +265,7 @@ impl VirtualTableCursor {
         Self {
             inner: VirtualTableCursorInner::External(cursor),
             null_flag: false,
+            filter_args: TursoAllocExt::new(),
         }
     }
 
@@ -268,6 +273,7 @@ impl VirtualTableCursor {
         Self {
             inner: VirtualTableCursorInner::Internal(cursor),
             null_flag: false,
+            filter_args: TursoAllocExt::new(),
         }
     }
 
@@ -292,32 +298,72 @@ impl VirtualTableCursor {
         }
     }
 
-    pub(crate) fn column(&self, column: usize) -> crate::Result<Value> {
+    pub(crate) fn column_into(&self, column: usize, dest: &mut Register) -> crate::Result<()> {
         if self.null_flag {
-            return Ok(Value::Null);
+            dest.set_null();
+            return Ok(());
         }
         match &self.inner {
-            VirtualTableCursorInner::Pragma(cursor) => cursor.column(column),
-            VirtualTableCursorInner::External(cursor) => cursor.column(column),
-            VirtualTableCursorInner::Internal(cursor) => cursor.read().column(column),
+            VirtualTableCursorInner::Pragma(cursor) => dest.set_value(cursor.column(column)?),
+            VirtualTableCursorInner::External(cursor) => dest.set_value(cursor.column(column)?),
+            VirtualTableCursorInner::Internal(cursor) => cursor.read().column_into(column, dest)?,
         }
+        Ok(())
     }
 
     pub(crate) fn filter(
         &mut self,
         idx_num: i32,
         idx_str: Option<String>,
-        arg_count: usize,
-        args: crate::alloc::Vec<Value>,
+        arg_registers: &mut [Register],
+        #[cfg(feature = "json")] json_cache: &crate::json::JsonCacheCell,
+    ) -> crate::Result<bool> {
+        let mut args = std::mem::replace(&mut self.filter_args, TursoAllocExt::new());
+        args.clear();
+        for register in arg_registers.iter_mut() {
+            let value = match register {
+                Register::Value(value) => std::mem::replace(value, Value::Null),
+                register => register.get_value().try_clone()?,
+            };
+            args.try_push(value)?;
+        }
+        let has_rows = self.filter_values(
+            idx_num,
+            idx_str,
+            &args,
+            #[cfg(feature = "json")]
+            json_cache,
+        );
+        for (register, value) in arg_registers.iter_mut().zip(args.drain(..)) {
+            if let Register::Value(slot) = register {
+                *slot = value;
+            }
+        }
+        self.filter_args = args;
+        has_rows
+    }
+
+    fn filter_values(
+        &mut self,
+        idx_num: i32,
+        idx_str: Option<String>,
+        args: &[Value],
+        #[cfg(feature = "json")] json_cache: &crate::json::JsonCacheCell,
     ) -> crate::Result<bool> {
         self.null_flag = false;
+        let arg_count = args.len();
         match &mut self.inner {
             VirtualTableCursorInner::Pragma(cursor) => cursor.filter(args),
             VirtualTableCursorInner::External(cursor) => {
                 cursor.filter(idx_num, idx_str, arg_count, args)
             }
+            #[cfg(feature = "json")]
+            VirtualTableCursorInner::Internal(cursor) => cursor
+                .write()
+                .filter_with_json_cache(args, idx_str, idx_num, json_cache),
+            #[cfg(not(feature = "json"))]
             VirtualTableCursorInner::Internal(cursor) => {
-                cursor.write().filter(&args, idx_str, idx_num)
+                cursor.write().filter(args, idx_str, idx_num)
             }
         }
     }
@@ -527,7 +573,7 @@ impl ExtVirtualTableCursor {
         idx_num: i32,
         idx_str: Option<String>,
         arg_count: usize,
-        args: crate::alloc::Vec<Value>,
+        args: &[Value],
     ) -> crate::Result<bool> {
         tracing::trace!("xFilter");
         let ext_args = args.iter().map(|arg| arg.to_ffi()).collect::<Vec<_>>();
@@ -614,12 +660,26 @@ pub trait InternalVirtualTableCursor: Send + Sync {
     fn next(&mut self) -> Result<bool, LimboError>;
     fn rowid(&self) -> i64;
     fn column(&self, column: usize) -> Result<Value, LimboError>;
+    fn column_into(&self, column: usize, dest: &mut Register) -> Result<(), LimboError> {
+        dest.set_value(self.column(column)?);
+        Ok(())
+    }
     fn filter(
         &mut self,
         args: &[Value],
         idx_str: Option<String>,
         idx_num: i32,
     ) -> Result<bool, LimboError>;
+    #[cfg(feature = "json")]
+    fn filter_with_json_cache(
+        &mut self,
+        args: &[Value],
+        idx_str: Option<String>,
+        idx_num: i32,
+        _json_cache: &crate::json::JsonCacheCell,
+    ) -> Result<bool, LimboError> {
+        self.filter(args, idx_str, idx_num)
+    }
 }
 
 #[cfg(all(test, feature = "fs"))]
@@ -706,6 +766,69 @@ mod tests {
             self.position = -1;
             self.next()
         }
+    }
+
+    struct RecordingCursor {
+        seen_args: Vec<Vec<Value>>,
+    }
+
+    impl InternalVirtualTableCursor for RecordingCursor {
+        fn next(&mut self) -> Result<bool, LimboError> {
+            Ok(false)
+        }
+        fn rowid(&self) -> i64 {
+            0
+        }
+        fn column(&self, _column: usize) -> Result<Value, LimboError> {
+            Ok(Value::Null)
+        }
+        fn filter(
+            &mut self,
+            args: &[Value],
+            _idx_str: Option<String>,
+            _idx_num: i32,
+        ) -> Result<bool, LimboError> {
+            self.seen_args.push(args.to_vec());
+            Ok(false)
+        }
+    }
+
+    #[test]
+    fn filter_lends_argument_values_and_gives_them_back() {
+        let recording = Arc::new(RwLock::new(RecordingCursor {
+            seen_args: Vec::new(),
+        }));
+        let mut cursor = VirtualTableCursor::new_internal(recording.clone());
+        #[cfg(feature = "json")]
+        let json_cache = crate::json::JsonCacheCell::new();
+        for round in 0..2 {
+            let mut registers = [
+                Register::Value(Value::build_text(format!("doc {round}"))),
+                Register::Value(Value::from_i64(round)),
+            ];
+            let has_rows = cursor
+                .filter(
+                    0,
+                    None,
+                    &mut registers,
+                    #[cfg(feature = "json")]
+                    &json_cache,
+                )
+                .unwrap();
+            assert!(!has_rows);
+            assert_eq!(
+                registers[0].get_value(),
+                &Value::build_text(format!("doc {round}"))
+            );
+            assert_eq!(registers[1].get_value(), &Value::from_i64(round));
+        }
+        assert_eq!(
+            recording.read().seen_args,
+            vec![
+                vec![Value::build_text("doc 0"), Value::from_i64(0)],
+                vec![Value::build_text("doc 1"), Value::from_i64(1)],
+            ]
+        );
     }
 
     #[test]

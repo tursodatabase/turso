@@ -1,0 +1,123 @@
+@database :memory:
+
+# jsonb() writes the smallest header for each object and array.
+# Expected values come from SQLite 3.45.1.
+
+test jsonb_header_array_payload_0 {
+    SELECT hex(jsonb('[]'));
+}
+expect {
+    0B
+}
+
+test jsonb_header_object_payload_0 {
+    SELECT hex(jsonb('{}'));
+}
+expect {
+    0C
+}
+
+test jsonb_header_array_payload_2 {
+    SELECT hex(jsonb('[1]'));
+}
+expect {
+    2B1331
+}
+
+test jsonb_header_object_payload_3 {
+    SELECT hex(jsonb('{"":1}'));
+}
+expect {
+    3C071331
+}
+
+test jsonb_header_array_payload_11 {
+    SELECT hex(jsonb('["' || printf('%.*c', 10, 'x') || '"]'));
+}
+expect {
+    BBA778787878787878787878
+}
+
+test jsonb_header_object_payload_11 {
+    SELECT hex(jsonb('{"":"' || printf('%.*c', 9, 'x') || '"}'));
+}
+expect {
+    BC0797787878787878787878
+}
+
+test jsonb_header_array_payload_12 {
+    SELECT hex(jsonb('["' || printf('%.*c', 11, 'x') || '"]'));
+}
+expect {
+    CB0CB77878787878787878787878
+}
+
+test jsonb_header_object_payload_12 {
+    SELECT hex(jsonb('{"":"' || printf('%.*c', 10, 'x') || '"}'));
+}
+expect {
+    CC0C07A778787878787878787878
+}
+
+test jsonb_header_array_payload_255 {
+    WITH t(j) AS (SELECT jsonb('["' || printf('%.*c', 253, 'x') || '"]')) SELECT length(j), hex(substr(j, 1, 8)), hex(substr(j, -4)), json(j) = json('["' || printf('%.*c', 253, 'x') || '"]') FROM t;
+}
+expect {
+    257|CBFFC7FD78787878|78787878|1
+}
+
+test jsonb_header_object_payload_255 {
+    WITH t(j) AS (SELECT jsonb('{"":"' || printf('%.*c', 252, 'x') || '"}')) SELECT length(j), hex(substr(j, 1, 8)), hex(substr(j, -4)), json(j) = json('{"":"' || printf('%.*c', 252, 'x') || '"}') FROM t;
+}
+expect {
+    257|CCFF07C7FC787878|78787878|1
+}
+
+test jsonb_header_array_payload_256 {
+    WITH t(j) AS (SELECT jsonb('["' || printf('%.*c', 254, 'x') || '"]')) SELECT length(j), hex(substr(j, 1, 8)), hex(substr(j, -4)), json(j) = json('["' || printf('%.*c', 254, 'x') || '"]') FROM t;
+}
+expect {
+    259|DB0100C7FE787878|78787878|1
+}
+
+test jsonb_header_object_payload_256 {
+    WITH t(j) AS (SELECT jsonb('{"":"' || printf('%.*c', 253, 'x') || '"}')) SELECT length(j), hex(substr(j, 1, 8)), hex(substr(j, -4)), json(j) = json('{"":"' || printf('%.*c', 253, 'x') || '"}') FROM t;
+}
+expect {
+    259|DC010007C7FD7878|78787878|1
+}
+
+test jsonb_header_array_payload_65535 {
+    WITH t(j) AS (SELECT jsonb('["' || printf('%.*c', 65532, 'x') || '"]')) SELECT length(j), hex(substr(j, 1, 8)), hex(substr(j, -4)), json(j) = json('["' || printf('%.*c', 65532, 'x') || '"]') FROM t;
+}
+expect {
+    65538|DBFFFFD7FFFC7878|78787878|1
+}
+
+test jsonb_header_object_payload_65535 {
+    WITH t(j) AS (SELECT jsonb('{"":"' || printf('%.*c', 65531, 'x') || '"}')) SELECT length(j), hex(substr(j, 1, 8)), hex(substr(j, -4)), json(j) = json('{"":"' || printf('%.*c', 65531, 'x') || '"}') FROM t;
+}
+expect {
+    65538|DCFFFF07D7FFFB78|78787878|1
+}
+
+test jsonb_header_array_payload_65536 {
+    WITH t(j) AS (SELECT jsonb('["' || printf('%.*c', 65533, 'x') || '"]')) SELECT length(j), hex(substr(j, 1, 8)), hex(substr(j, -4)), json(j) = json('["' || printf('%.*c', 65533, 'x') || '"]') FROM t;
+}
+expect {
+    65541|EB00010000D7FFFD|78787878|1
+}
+
+test jsonb_header_object_payload_65536 {
+    WITH t(j) AS (SELECT jsonb('{"":"' || printf('%.*c', 65532, 'x') || '"}')) SELECT length(j), hex(substr(j, 1, 8)), hex(substr(j, -4)), json(j) = json('{"":"' || printf('%.*c', 65532, 'x') || '"}') FROM t;
+}
+expect {
+    65541|EC0001000007D7FF|78787878|1
+}
+
+test jsonb_header_nested_containers_of_each_size {
+    WITH t(j) AS (SELECT jsonb('{"a":[1,[2,[]],{"b":"' || printf('%.*c', 20, 'x') || '"}],"c":["' || printf('%.*c', 300, 'y') || '"]}')) SELECT length(j), hex(substr(j, 1, 8)), hex(substr(j, -4)), json(j) = json('{"a":[1,[2,[]],{"b":"' || printf('%.*c', 20, 'x') || '"}],"c":["' || printf('%.*c', 300, 'y') || '"]}') FROM t;
+}
+expect {
+    347|DC01581761CB2013|79797979|1
+}

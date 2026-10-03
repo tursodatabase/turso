@@ -107,7 +107,7 @@ use turso_macros::turso_debug_assert;
 
 use crate::pseudo::PseudoCursor;
 
-use crate::storage::btree::{BTreeCursor, BTreeKey};
+use crate::storage::btree::{BTreeCursor, BTreeKey, ColumnRead};
 
 #[inline]
 fn btree_cursor_with_yield_context(
@@ -1532,12 +1532,14 @@ pub fn op_vopen(
     let CursorType::VirtualTable(virtual_table) = cursor_type else {
         panic!("VOpen on non-virtual table cursor");
     };
-    let cursor = virtual_table.open(program.connection.clone())?;
-    state
+    let slot = state
         .cursors
         .get_mut(*cursor_id)
-        .unwrap_or_else(|| panic!("cursor id {} out of bounds", *cursor_id))
-        .replace(Cursor::Virtual(cursor));
+        .unwrap_or_else(|| panic!("cursor id {} out of bounds", *cursor_id));
+    if !matches!(slot, Some(Cursor::Virtual(_))) {
+        let cursor = virtual_table.open(program.connection.clone())?;
+        slot.replace(Cursor::Virtual(cursor));
+    }
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
 }
@@ -1600,18 +1602,19 @@ pub fn op_vfilter(
         insn
     );
     let has_rows = {
-        let cursor = get_cursor!(state, *cursor_id);
-        let cursor = cursor.as_virtual_mut();
-
-        let args = (0..*arg_count)
-            .map(|i| state.registers[args_reg + i].get_value().try_clone())
-            .try_collect::<Result<crate::alloc::Vec<_>>>()??;
         let idx_str = if let Some(idx_str) = idx_str {
             Some(state.registers[*idx_str].get_value().to_string())
         } else {
             None
         };
-        cursor.filter(*idx_num as i32, idx_str, *arg_count, args)?
+        let cursor = get_cursor!(state, *cursor_id).as_virtual_mut();
+        cursor.filter(
+            *idx_num as i32,
+            idx_str,
+            &mut state.registers[*args_reg..*args_reg + *arg_count],
+            #[cfg(feature = "json")]
+            &state.json_cache,
+        )?
     };
     // Increment filter_operations metric for virtual table filter
     state.metrics.filter_operations = state.metrics.filter_operations.wrapping_add(1);
@@ -1639,12 +1642,8 @@ pub fn op_vcolumn(
         },
         insn
     );
-    let value = {
-        let cursor = state.get_cursor(*cursor_id);
-        let cursor = cursor.as_virtual_mut();
-        cursor.column(*column)?
-    };
-    state.registers[*dest].set_value(value);
+    let cursor = get_cursor!(state, *cursor_id).as_virtual_mut();
+    cursor.column_into(*column, &mut state.registers[*dest])?;
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
 }
@@ -2203,15 +2202,28 @@ fn op_column_fetch(
         }
         _ => return op_column_fetch_other(program, state, cursor_id, column, dest, default),
     };
-    let Some(payload) = return_if_io!(state, cursor.record_payload()) else {
-        // A null-row cursor, or one that is not positioned on a valid row
-        // (e.g., empty table). Return NULL, not the column's default value.
-        state.registers[dest].set_null();
+    if let Some(payload) = cursor.positioned_payload_on_leaf_page() {
+        match ValueIterator::new(payload)?.nth_into_register(column, &mut state.registers[dest]) {
+            Some(result) => result?,
+            None => {
+                branches::mark_unlikely();
+                // The record has fewer columns than expected.
+                apply_column_default(default, &mut state.registers[dest])?;
+            }
+        }
         return Ok(InsnFunctionStepResult::Step);
-    };
-    match ValueIterator::new(payload)?.nth_into_register(column, &mut state.registers[dest]) {
-        Some(result) => result?,
-        None => {
+    }
+    match return_if_io!(
+        state,
+        cursor.read_column_without_leaf_payload(column, &mut state.registers[dest])
+    ) {
+        ColumnRead::Decoded => {}
+        ColumnRead::NullRow => {
+            // A null-row cursor, or one that is not positioned on a valid row
+            // (e.g., empty table). Return NULL, not the column's default value.
+            state.registers[dest].set_null();
+        }
+        ColumnRead::MissingColumn => {
             branches::mark_unlikely();
             // The record has fewer columns than expected.
             apply_column_default(default, &mut state.registers[dest])?;
@@ -6090,7 +6102,10 @@ pub fn op_string8(
     _pager: &Arc<Pager>,
 ) -> InsnResult {
     load_insn!(String8 { value, dest }, insn);
-    state.registers[*dest].set_text(Text::new(value.clone()))?;
+    match &mut state.registers[*dest] {
+        Register::Value(Value::Text(existing)) => existing.do_extend(&value.as_str())?,
+        register => register.set_text(Text::new(value.clone()))?,
+    }
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
 }
@@ -10712,15 +10727,13 @@ pub fn op_function(
                             "bin_record_json_object: function arguments must be of type TEXT and BLOB correspondingly".to_string()
                         ).into());
                     };
-                    let mut columns_json_array =
-                        json::jsonb::Jsonb::from_str(columns_str.as_str())?;
+                    let columns_json_array = json::jsonb::Jsonb::from_str(columns_str.as_str())?;
                     let columns_len = columns_json_array.array_len()?;
 
                     let mut payload_iterator = ValueIterator::new(bin_record.as_slice())?;
 
                     let mut json = json::jsonb::Jsonb::make_empty_obj(columns_len)?;
                     for i in 0..columns_len {
-                        let mut op = json::jsonb::SearchOperation::new(0)?;
                         let path = json::path::JsonPath {
                             elements: vec![
                                 json::path::PathElement::Root(),
@@ -10728,8 +10741,13 @@ pub fn op_function(
                             ],
                         };
 
-                        columns_json_array.operate_on_path(&path, &mut op)?;
-                        let column_name = op.result();
+                        let Some(column_pos) =
+                            json::jsonb::find_path_element(columns_json_array.as_slice(), &path)?
+                        else {
+                            return Err(LimboError::ParseError("Not found!".to_string()).into());
+                        };
+                        let column_name =
+                            json::jsonb::element_at(columns_json_array.as_slice(), column_pos)?;
                         json.append_jsonb_to_end(column_name.data());
 
                         let val = match payload_iterator.next() {

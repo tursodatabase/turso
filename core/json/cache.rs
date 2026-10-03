@@ -1,16 +1,21 @@
-use std::cell::{Cell, UnsafeCell};
+use std::borrow::Cow;
+use std::cell::{Cell, RefCell, UnsafeCell};
 
-use crate::alloc::{TryClone, TryReserveError};
-use crate::types::AsValueRef;
+use crate::alloc::TryClone;
+use crate::types::{AsValueRef, Text};
 use crate::{Value, ValueRef};
 
+use super::json_path_from_db_value;
 use super::jsonb::Jsonb;
+use super::path::JsonPath;
 
 const JSON_CACHE_SIZE: usize = 4;
+const PATH_CACHE_SIZE: usize = 4;
 
 #[derive(Debug)]
 pub struct JsonCache {
     entries: [Option<(Value, Jsonb)>; JSON_CACHE_SIZE],
+    key_lens: [usize; JSON_CACHE_SIZE],
     age: [usize; JSON_CACHE_SIZE],
     used: usize,
     counter: usize,
@@ -20,6 +25,7 @@ impl JsonCache {
     pub fn new() -> Self {
         Self {
             entries: [None, None, None, None],
+            key_lens: [0; JSON_CACHE_SIZE],
             age: [0, 0, 0, 0],
             used: 0,
             counter: 0,
@@ -40,45 +46,78 @@ impl JsonCache {
         oldest_idx
     }
 
-    pub fn insert(
-        &mut self,
-        key: impl AsValueRef,
-        value: &Jsonb,
-    ) -> std::result::Result<(), TryReserveError> {
-        let key = key.as_value_ref();
-        let entry = (key.to_owned()?, value.try_clone()?);
-        if self.used < JSON_CACHE_SIZE {
-            self.entries[self.used] = Some(entry);
-            self.age[self.used] = self.counter;
-            self.counter += 1;
-            self.used += 1
-        } else {
-            let id = self.find_oldest_entry();
-
-            self.entries[id] = Some(entry);
-            self.age[id] = self.counter;
-            self.counter += 1;
-        }
-        Ok(())
+    #[cfg(test)]
+    pub fn insert(&mut self, key: impl AsValueRef, value: Jsonb) -> crate::Result<usize> {
+        self.insert_parsed(key.as_value_ref(), |_, json| {
+            *json = value;
+            Ok(())
+        })
     }
 
-    pub fn lookup(
+    fn insert_parsed(
         &mut self,
-        key: impl AsValueRef,
-    ) -> std::result::Result<Option<Jsonb>, TryReserveError> {
+        key: ValueRef,
+        parse: impl FnOnce(ValueRef, &mut Jsonb) -> crate::Result<()>,
+    ) -> crate::Result<usize> {
+        let slot = if self.used < JSON_CACHE_SIZE {
+            self.used
+        } else {
+            self.find_oldest_entry()
+        };
+        match &mut self.entries[slot] {
+            Some((stored_key, json)) => {
+                let stored = parse(key, json).and_then(|()| copy_key_into(stored_key, key));
+                if let Err(error) = stored {
+                    self.entries[slot] = None;
+                    return Err(error);
+                }
+            }
+            None => {
+                let mut json = Jsonb::empty();
+                parse(key, &mut json)?;
+                self.entries[slot] = Some((key.to_owned()?, json));
+            }
+        }
+        self.key_lens[slot] = key_byte_len(key);
+        if slot == self.used {
+            self.used += 1;
+        }
+        self.age[slot] = self.counter;
+        self.counter += 1;
+        Ok(slot)
+    }
+
+    #[cfg(test)]
+    pub fn lookup(&mut self, key: impl AsValueRef) -> crate::Result<Option<Jsonb>> {
+        match self.find(key) {
+            Some(slot) => Ok(Some(self.entry(slot).try_clone()?)),
+            None => Ok(None),
+        }
+    }
+
+    fn find(&mut self, key: impl AsValueRef) -> Option<usize> {
         let key = key.as_value_ref();
+        let key_len = key_byte_len(key);
         for i in (0..self.used).rev() {
-            if let Some((stored_key, value)) = &self.entries[i] {
+            if self.key_lens[i] != key_len {
+                continue;
+            }
+            if let Some((stored_key, _)) = &self.entries[i] {
                 if key == *stored_key {
-                    let json = value.try_clone()?;
                     self.age[i] = self.counter;
                     self.counter += 1;
-
-                    return Ok(Some(json));
+                    return Some(i);
                 }
             }
         }
-        Ok(None)
+        None
+    }
+
+    fn entry(&self, slot: usize) -> &Jsonb {
+        let (_, json) = self.entries[slot]
+            .as_ref()
+            .expect("a slot returned by find or insert holds an entry");
+        json
     }
 
     pub fn clear(&mut self) {
@@ -87,10 +126,75 @@ impl JsonCache {
     }
 }
 
+fn copy_key_into(stored_key: &mut Value, key: ValueRef) -> crate::Result<()> {
+    match (stored_key, key) {
+        (
+            Value::Text(Text {
+                value: Cow::Owned(text),
+                subtype,
+            }),
+            ValueRef::Text(new_text),
+        ) => {
+            text.clear();
+            text.try_reserve(new_text.value.len())?;
+            text.push_str(new_text.value);
+            *subtype = new_text.subtype;
+        }
+        (Value::Blob(blob), ValueRef::Blob(new_blob)) => {
+            blob.clear();
+            blob.try_reserve(new_blob.len())?;
+            blob.extend_from_slice(new_blob);
+        }
+        (stored_key, key) => *stored_key = key.to_owned()?,
+    }
+    Ok(())
+}
+
+fn key_byte_len(key: ValueRef) -> usize {
+    match key {
+        ValueRef::Text(text) => text.value.len(),
+        ValueRef::Blob(blob) => blob.len(),
+        ValueRef::Null | ValueRef::Numeric(_) => 0,
+    }
+}
+
 #[derive(Debug)]
 pub struct JsonCacheCell {
     inner: UnsafeCell<Option<JsonCache>>,
     accessed: Cell<bool>,
+    paths: RefCell<ParsedPathCache>,
+}
+
+#[derive(Debug, Default)]
+struct ParsedPathCache {
+    entries: Vec<ParsedPath>,
+    next_slot: usize,
+}
+
+#[derive(Debug)]
+struct ParsedPath {
+    text: String,
+    strict: bool,
+    path: JsonPath<'static>,
+}
+
+impl ParsedPathCache {
+    fn find(&self, text: &str, strict: bool) -> Option<usize> {
+        self.entries
+            .iter()
+            .position(|entry| entry.strict == strict && entry.text == text)
+    }
+
+    fn insert(&mut self, entry: ParsedPath) -> usize {
+        if self.entries.len() < PATH_CACHE_SIZE {
+            self.entries.push(entry);
+            return self.entries.len() - 1;
+        }
+        let slot = self.next_slot;
+        self.next_slot = (slot + 1) % PATH_CACHE_SIZE;
+        self.entries[slot] = entry;
+        slot
+    }
 }
 
 struct JsonCacheAccessGuard<'a> {
@@ -112,6 +216,7 @@ impl JsonCacheCell {
         Self {
             inner: UnsafeCell::new(None),
             accessed: Cell::new(false),
+            paths: RefCell::new(ParsedPathCache::default()),
         }
     }
 
@@ -145,31 +250,75 @@ impl JsonCacheCell {
         key: impl AsValueRef,
         value: impl FnOnce(ValueRef) -> crate::Result<Jsonb>,
     ) -> crate::Result<Jsonb> {
+        self.with_jsonb(key, value, |json| Ok(json.try_clone()?))
+    }
+
+    pub fn with_path<R>(
+        &self,
+        path: ValueRef<'_>,
+        strict: bool,
+        read: impl FnOnce(Option<&JsonPath<'_>>) -> crate::Result<R>,
+    ) -> crate::Result<R> {
+        let ValueRef::Text(text) = path else {
+            let parsed = json_path_from_db_value(&path, strict)?;
+            return read(parsed.as_ref());
+        };
+        let mut paths = self.paths.borrow_mut();
+        let slot = match paths.find(text.as_str(), strict) {
+            Some(slot) => slot,
+            None => {
+                let Some(parsed) = json_path_from_db_value(&path, strict)? else {
+                    return read(None);
+                };
+                paths.insert(ParsedPath {
+                    text: text.as_str().to_string(),
+                    strict,
+                    path: parsed.into_owned(),
+                })
+            }
+        };
+        read(Some(&paths.entries[slot].path))
+    }
+
+    pub fn with_jsonb<R>(
+        &self,
+        key: impl AsValueRef,
+        value: impl FnOnce(ValueRef) -> crate::Result<Jsonb>,
+        read: impl FnOnce(&Jsonb) -> crate::Result<R>,
+    ) -> crate::Result<R> {
+        self.with_parsed_jsonb(
+            key,
+            |key, json| {
+                *json = value(key)?;
+                Ok(())
+            },
+            read,
+        )
+    }
+
+    pub fn with_parsed_jsonb<R>(
+        &self,
+        key: impl AsValueRef,
+        parse: impl FnOnce(ValueRef, &mut Jsonb) -> crate::Result<()>,
+        read: impl FnOnce(&Jsonb) -> crate::Result<R>,
+    ) -> crate::Result<R> {
         let key = key.as_value_ref();
         let _guard = self.access_guard();
-        unsafe {
-            let cache_ptr = self.inner.get();
-            if (*cache_ptr).is_none() {
-                *cache_ptr = Some(JsonCache::new());
-            }
+        // SAFETY: the access guard asserts that no other borrow of the
+        // cache is alive, and neither closure can reach this cell.
+        let cache = unsafe { (*self.inner.get()).get_or_insert_with(JsonCache::new) };
+        let slot = match cache.find(key) {
+            Some(slot) => slot,
+            None => cache.insert_parsed(key, parse)?,
+        };
+        read(cache.entry(slot))
+    }
 
-            if let Some(cache) = &mut (*cache_ptr) {
-                if let Some(jsonb) = cache.lookup(key)? {
-                    Ok(jsonb)
-                } else {
-                    let result = value(key);
-                    match result {
-                        Ok(json) => {
-                            cache.insert(key, &json)?;
-                            Ok(json)
-                        }
-                        Err(e) => Err(e),
-                    }
-                }
-            } else {
-                value(key)
-            }
-        }
+    pub fn is_empty(&self) -> bool {
+        let _guard = self.access_guard();
+        // SAFETY: the access guard asserts that no other borrow of the
+        // cache is alive.
+        unsafe { (*self.inner.get()).as_ref() }.is_none_or(|cache| cache.used == 0)
     }
 
     pub fn clear(&mut self) {
@@ -204,6 +353,28 @@ mod tests {
     }
 
     #[test]
+    fn parsed_path_cache_returns_the_same_parse_as_the_parser() {
+        let cache_cell = JsonCacheCell::new();
+        let texts = ["$.a", "$.b[1]", "a", "$", "$.c.d", "$.a", "a", "$[#-1]"];
+        for _ in 0..3 {
+            for text in texts {
+                let value = Value::build_text(text);
+                for strict in [true, false] {
+                    let expected = json_path_from_db_value(&value, strict)
+                        .map(|path| path.map(|path| format!("{:?}", path.elements)))
+                        .map_err(|err| err.to_string());
+                    let cached = cache_cell
+                        .with_path(value.as_value_ref(), strict, |path| {
+                            Ok(path.map(|path| format!("{:?}", path.elements)))
+                        })
+                        .map_err(|err| err.to_string());
+                    assert_eq!(cached, expected, "{text} strict={strict}");
+                }
+            }
+        }
+    }
+
+    #[test]
     fn test_json_cache_new() {
         let cache = JsonCache::new();
         assert_eq!(cache.used, 0);
@@ -220,7 +391,7 @@ mod tests {
 
         // Insert a value
         cache
-            .insert(&key, &value)
+            .insert(&key, value.try_clone().unwrap())
             .expect(crate::alloc::ALLOC_ERR_MSG);
 
         // Verify it was inserted
@@ -259,13 +430,13 @@ mod tests {
         let (key3, value3) = create_test_pair("{\"id\": 3}");
 
         cache
-            .insert(&key1, &value1)
+            .insert(&key1, value1.try_clone().unwrap())
             .expect(crate::alloc::ALLOC_ERR_MSG);
         cache
-            .insert(&key2, &value2)
+            .insert(&key2, value2.try_clone().unwrap())
             .expect(crate::alloc::ALLOC_ERR_MSG);
         cache
-            .insert(&key3, &value3)
+            .insert(&key3, value3.try_clone().unwrap())
             .expect(crate::alloc::ALLOC_ERR_MSG);
 
         // Verify they were all inserted
@@ -297,16 +468,16 @@ mod tests {
         let (key5, value5) = create_test_pair("{\"id\": 5}");
 
         cache
-            .insert(&key1, &value1)
+            .insert(&key1, value1.try_clone().unwrap())
             .expect(crate::alloc::ALLOC_ERR_MSG);
         cache
-            .insert(&key2, &value2)
+            .insert(&key2, value2.try_clone().unwrap())
             .expect(crate::alloc::ALLOC_ERR_MSG);
         cache
-            .insert(&key3, &value3)
+            .insert(&key3, value3.try_clone().unwrap())
             .expect(crate::alloc::ALLOC_ERR_MSG);
         cache
-            .insert(&key4, &value4)
+            .insert(&key4, value4.try_clone().unwrap())
             .expect(crate::alloc::ALLOC_ERR_MSG);
 
         // Cache is now full
@@ -317,7 +488,7 @@ mod tests {
 
         // Insert one more entry - should evict the oldest (key2)
         cache
-            .insert(&key5, &value5)
+            .insert(&key5, value5.try_clone().unwrap())
             .expect(crate::alloc::ALLOC_ERR_MSG);
 
         // Cache size should still be JSON_CACHE_SIZE
@@ -344,13 +515,13 @@ mod tests {
         let (key3, value3) = create_test_pair("{\"id\": 3}");
 
         cache
-            .insert(&key1, &value1)
+            .insert(&key1, value1.try_clone().unwrap())
             .expect(crate::alloc::ALLOC_ERR_MSG);
         cache
-            .insert(&key2, &value2)
+            .insert(&key2, value2.try_clone().unwrap())
             .expect(crate::alloc::ALLOC_ERR_MSG);
         cache
-            .insert(&key3, &value3)
+            .insert(&key3, value3.try_clone().unwrap())
             .expect(crate::alloc::ALLOC_ERR_MSG);
 
         // key1 should be the oldest
@@ -476,5 +647,111 @@ mod tests {
         // The entry should not be cached
         let lookup_result = cache_cell.lookup(&key);
         assert!(lookup_result.is_none());
+    }
+
+    #[test]
+    fn insert_after_eviction_parses_into_the_evicted_buffer() {
+        let mut cache = JsonCache::new();
+        let keys: Vec<Value> = (0..5)
+            .map(|i| Value::build_text(format!("{{\"id\": {i}, \"pad\": \"{}\"}}", "x".repeat(40))))
+            .collect();
+        for key in &keys[..4] {
+            cache
+                .insert_parsed(key.as_value_ref(), |key, json| {
+                    let ValueRef::Text(text) = key else {
+                        unreachable!("the keys are text")
+                    };
+                    json.replace_with_parsed_text(text.as_str())
+                        .map_err(|_| crate::LimboError::ParseError("malformed JSON".to_string()))
+                })
+                .unwrap();
+        }
+
+        let mut reused_capacity = 0;
+        cache
+            .insert_parsed(keys[4].as_value_ref(), |key, json| {
+                reused_capacity = json.data_capacity();
+                let ValueRef::Text(text) = key else {
+                    unreachable!("the keys are text")
+                };
+                json.replace_with_parsed_text(text.as_str())
+                    .map_err(|_| crate::LimboError::ParseError("malformed JSON".to_string()))
+            })
+            .unwrap();
+
+        assert!(reused_capacity > 0);
+        assert!(cache.lookup(&keys[0]).unwrap().is_none());
+        for key in &keys[1..] {
+            let expected = Jsonb::from_str(key.to_text().unwrap()).unwrap();
+            assert_eq!(cache.lookup(key).unwrap(), Some(expected));
+        }
+    }
+
+    #[test]
+    fn lookup_does_not_match_a_key_of_the_same_length_with_other_bytes() {
+        let mut cache = JsonCache::new();
+        let (key, value) = create_test_pair("[1]");
+        cache.insert(&key, value.try_clone().unwrap()).unwrap();
+
+        assert!(cache.lookup(Value::build_text("[2]")).unwrap().is_none());
+        assert!(cache
+            .lookup(Value::from_blob(
+                crate::types::value_blob_from_slice(b"[1]").unwrap()
+            ))
+            .unwrap()
+            .is_none());
+        assert_eq!(cache.lookup(&key).unwrap(), Some(value));
+    }
+
+    #[test]
+    fn insert_after_eviction_replaces_a_text_key_with_a_blob_key() {
+        let mut cache = JsonCache::new();
+        let pairs: Vec<(Value, Jsonb)> = (0..4)
+            .map(|i| create_test_pair(&format!("[{i}]")))
+            .collect();
+        for (key, value) in &pairs {
+            cache.insert(key, value.try_clone().unwrap()).unwrap();
+        }
+
+        let blob_key = Value::from_blob(crate::types::value_blob_from_slice(b"[0]").unwrap());
+        let blob_value = Jsonb::from_str("[0]").unwrap();
+        cache
+            .insert(&blob_key, blob_value.try_clone().unwrap())
+            .unwrap();
+
+        assert!(cache.lookup(&pairs[0].0).unwrap().is_none());
+        assert_eq!(cache.lookup(&blob_key).unwrap(), Some(blob_value));
+        for (key, value) in &pairs[1..] {
+            assert_eq!(cache.lookup(key).unwrap().as_ref(), Some(value));
+        }
+    }
+
+    #[test]
+    fn failed_parse_after_eviction_leaves_the_cache_usable() {
+        let mut cache = JsonCache::new();
+        let pairs: Vec<(Value, Jsonb)> = (0..4)
+            .map(|i| create_test_pair(&format!("{{\"id\": {i}}}")))
+            .collect();
+        for (key, value) in &pairs {
+            cache.insert(key, value.try_clone().unwrap()).unwrap();
+        }
+
+        let (failing_key, _) = create_test_pair("{\"id\": 4}");
+        let result = cache.insert_parsed(failing_key.as_value_ref(), |_, _| {
+            Err(crate::LimboError::ParseError("malformed JSON".to_string()))
+        });
+        assert!(result.is_err());
+        assert_eq!(cache.used, JSON_CACHE_SIZE);
+        assert!(cache.lookup(&failing_key).unwrap().is_none());
+        assert!(cache.lookup(&pairs[0].0).unwrap().is_none());
+        for (key, value) in &pairs[1..] {
+            assert_eq!(cache.lookup(key).unwrap().as_ref(), Some(value));
+        }
+
+        let (next_key, next_value) = create_test_pair("{\"id\": 5}");
+        cache
+            .insert(&next_key, next_value.try_clone().unwrap())
+            .unwrap();
+        assert_eq!(cache.lookup(&next_key).unwrap(), Some(next_value));
     }
 }

@@ -16,8 +16,8 @@ use crate::types::{AsValueRef, Text, TextSubtype, Value, ValueType};
 use crate::{bail_constraint_error, LimboError, ValueRef};
 pub use cache::JsonCacheCell;
 use jsonb::{
-    jsonb_error_position, unescape_string, validate_jsonb, ElementType, Jsonb, JsonbHeader,
-    ParseInfo, PathOperationMode, SearchOperation, SetOperation,
+    find_nul, jsonb_error_position, unescape_string, validate_jsonb, ElementType, Jsonb,
+    JsonbHeader, PathOperationMode, SetOperation,
 };
 use std::borrow::Cow;
 use std::fmt::Write as _;
@@ -31,6 +31,7 @@ pub enum Conv {
 }
 
 #[cfg(feature = "json")]
+#[derive(Clone, Copy)]
 pub enum OutputVariant {
     ElementType,
     ElementTypePlain,
@@ -56,7 +57,11 @@ pub fn get_json(json_value: &Value, indent: Option<&str>) -> crate::Result<Value
             // An infinite REAL argument converts to the payload
             // 9.0e+999, but SQLite's json() renders it as 9e999 (while
             // json_array and json_quote keep the long form) (#4196).
-            json = json.replace("9.0e+999", "9e999");
+            if let Value::Numeric(Numeric::Float(float)) = json_value {
+                if f64::from(*float).is_infinite() {
+                    json = json.replace("9.0e+999", "9e999");
+                }
+            }
 
             if indent.is_some() {
                 // json_pretty() output carries no subtype in SQLite.
@@ -127,22 +132,11 @@ pub fn convert_dbtype_to_jsonb(val: impl AsValueRef, strict: Conv) -> crate::Res
 }
 
 fn parse_as_json_text(slice: &[u8], mode: Conv) -> crate::Result<Jsonb> {
-    let zero_pos = slice.iter().position(|&b| b == 0).unwrap_or(slice.len());
+    let zero_pos = find_nul(slice).unwrap_or(slice.len());
     let truncated = &slice[..zero_pos];
     let str = std::str::from_utf8(truncated)
         .map_err(|_| LimboError::ParseError("malformed JSON".to_string()))?;
     Jsonb::from_str_with_mode(str, mode).map_err(Into::into)
-}
-
-/// Parses like [parse_as_json_text] but also reports whether the text
-/// used any JSON5-only syntax, which json_valid needs to tell strict
-/// RFC 8259 documents apart from merely parseable ones.
-fn parse_as_json_text_tracking(slice: &[u8]) -> crate::Result<(Jsonb, ParseInfo)> {
-    let zero_pos = slice.iter().position(|&b| b == 0).unwrap_or(slice.len());
-    let truncated = &slice[..zero_pos];
-    let str = std::str::from_utf8(truncated)
-        .map_err(|_| LimboError::ParseError("malformed JSON".to_string()))?;
-    Jsonb::from_str_tracking(str).map_err(Into::into)
 }
 
 fn malformed_json_error(error: JsonError) -> LimboError {
@@ -212,9 +206,11 @@ pub fn convert_ref_dbtype_to_jsonb(val: ValueRef<'_>, strict: Conv) -> crate::Re
                 let str = if matches!(strict, Conv::ToString) {
                     str
                 } else {
-                    &str[..str.find('\0').unwrap_or(str.len())]
+                    &str[..find_nul(str.as_bytes()).unwrap_or(str.len())]
                 };
                 Jsonb::from_str_with_mode(str, strict)
+            } else if !jsonb::has_byte_to_escape(text.as_str().as_bytes()) {
+                return Jsonb::from_payload(ElementType::TEXT, text.as_str().as_bytes());
             } else {
                 // Handle as a string literal otherwise
                 // Escape backslashes first, then double quotes
@@ -311,7 +307,7 @@ pub fn convert_ref_dbtype_to_jsonb(val: ValueRef<'_>, strict: Conv) -> crate::Re
             }
         }
         ValueRef::Numeric(Numeric::Integer(int)) => {
-            Jsonb::from_str(&int.to_string()).map_err(malformed_json_error)
+            Jsonb::from_payload(ElementType::INT, int.to_string().as_bytes())
         }
     }
 }
@@ -380,24 +376,22 @@ pub fn json_array_length(
         return Ok(Value::Null);
     }
 
-    let make_jsonb_fn = curry_convert_dbtype_to_jsonb(Conv::Strict);
-    let mut json = json_cache.get_or_insert_with(value, make_jsonb_fn)?;
-
-    if path.is_none() {
-        let len = json.array_len()?;
-        return Ok(Value::from_i64(len as i64));
-    }
-
-    let path = json_path_from_db_value(path.expect("We already checked none"), true)?;
-
-    if let Some(path) = path {
-        let mut op = SearchOperation::new(json.len() / 2)?;
-        let _ = json.operate_on_path(&path, &mut op);
-        if let Ok(len) = op.result().array_len() {
+    json_cache.with_parsed_jsonb(value, parse_strict_into, |json| {
+        let Some(path) = path else {
+            let len = json.array_len()?;
             return Ok(Value::from_i64(len as i64));
-        }
-    }
-    Ok(Value::Null)
+        };
+        json_cache.with_path(path.as_value_ref(), true, |path| {
+            if let Some(path) = path {
+                if let Ok(Some(pos)) = jsonb::find_path_element(json.as_slice(), path) {
+                    if let Ok(len) = jsonb::element_at(json.as_slice(), pos)?.array_len() {
+                        return Ok(Value::from_i64(len as i64));
+                    }
+                }
+            }
+            Ok(Value::Null)
+        })
+    })
 }
 
 pub fn json_set<I, E, V>(args: I, json_cache: &JsonCacheCell) -> crate::Result<Value>
@@ -496,21 +490,12 @@ pub fn json_arrow_extract(
     if let ValueRef::Null = value {
         return Ok(Value::Null);
     }
-
-    let make_jsonb_fn = curry_convert_dbtype_to_jsonb(Conv::Strict);
-    let mut json = json_cache.get_or_insert_with(value, make_jsonb_fn)?;
-    if let Some(path) = json_path_from_db_value(&path, false)? {
-        let mut op = SearchOperation::new(json.len())?;
-        let res = json.operate_on_path(&path, &mut op);
-        let extracted = op.result();
-        if res.is_ok() {
-            Ok(Value::Text(Text::json(extracted.to_string()?)))
-        } else {
-            Ok(Value::Null)
-        }
-    } else {
-        Ok(Value::Null)
-    }
+    let element = extract_path_element(value, &path, false, json_cache, |data, pos| {
+        Ok(Value::Text(Text::json(
+            jsonb::element_at(data, pos)?.to_string()?,
+        )))
+    })?;
+    Ok(element.unwrap_or(Value::Null))
 }
 
 /// Implements the ->> operator. Always returns a SQL representation of the JSON subcomponent.
@@ -524,29 +509,10 @@ pub fn json_arrow_shift_extract(
     if let ValueRef::Null = value {
         return Ok(Value::Null);
     }
-    let make_jsonb_fn = curry_convert_dbtype_to_jsonb(Conv::Strict);
-    let mut json = json_cache.get_or_insert_with(value, make_jsonb_fn)?;
-    if let Some(path) = json_path_from_db_value(&path, false)? {
-        let mut op = SearchOperation::new(json.len())?;
-        let res = json.operate_on_path(&path, &mut op);
-        let extracted = op.result();
-        let element_type = match extracted.element_type() {
-            Err(_) => return Ok(Value::Null),
-            Ok(el) => el,
-        };
-
-        if res.is_ok() {
-            Ok(json_string_to_db_type(
-                extracted,
-                element_type,
-                OutputVariant::ElementTypePlain,
-            )?)
-        } else {
-            Ok(Value::Null)
-        }
-    } else {
-        Ok(Value::Null)
-    }
+    let element = extract_path_element(value, &path, false, json_cache, |data, pos| {
+        element_to_db_type(data, pos, OutputVariant::ElementTypePlain)
+    })?;
+    Ok(element.unwrap_or(Value::Null))
 }
 
 /// Extracts a JSON value from a JSON object or array.
@@ -571,13 +537,7 @@ where
     if paths.len() == 0 {
         return Ok(Value::Null);
     }
-    let convert_to_jsonb = curry_convert_dbtype_to_jsonb(Conv::Strict);
-    let jsonb = json_cache.get_or_insert_with(value, convert_to_jsonb)?;
-    let (json, element_type) = jsonb_extract_internal(jsonb, paths)?;
-
-    let result = json_string_to_db_type(json, element_type, OutputVariant::ElementType)?;
-
-    Ok(result)
+    jsonb_extract_internal(value, paths, json_cache, OutputVariant::ElementType)
 }
 
 pub fn jsonb_extract<I, E, V>(
@@ -598,66 +558,191 @@ where
     if paths.len() == 0 {
         return Ok(Value::Null);
     }
-    let convert_to_jsonb = curry_convert_dbtype_to_jsonb(Conv::Strict);
-    let jsonb = json_cache.get_or_insert_with(value, convert_to_jsonb)?;
-
-    let (json, element_type) = jsonb_extract_internal(jsonb, paths)?;
-    let result = json_string_to_db_type(json, element_type, OutputVariant::ElementType)?;
-
-    Ok(result)
+    jsonb_extract_internal(
+        value.as_value_ref(),
+        paths,
+        json_cache,
+        OutputVariant::ElementType,
+    )
 }
 
-fn jsonb_extract_internal<E, V>(value: Jsonb, mut paths: E) -> crate::Result<(Jsonb, ElementType)>
+fn jsonb_extract_internal<E, V>(
+    value: ValueRef<'_>,
+    mut paths: E,
+    json_cache: &JsonCacheCell,
+    flag: OutputVariant,
+) -> crate::Result<Value>
 where
     V: AsValueRef,
     E: ExactSizeIterator<Item = V>,
 {
-    let null = Jsonb::from_raw_data(JsonbHeader::make_null().into_bytes().as_bytes())?;
     if paths.len() == 1 {
         let first_path = paths.next().ok_or_else(|| {
             crate::LimboError::InternalError("paths should have one element".to_string())
         })?;
-        if let Some(path) = json_path_from_db_value(&first_path, true)? {
-            let mut json = value;
+        let element = extract_path_element(value, &first_path, true, json_cache, |data, pos| {
+            element_to_db_type(data, pos, flag)
+        })?;
+        return Ok(element.unwrap_or(Value::Null));
+    }
 
-            let mut op = SearchOperation::new(json.len())?;
-            let res = json.operate_on_path(&path, &mut op);
-            let extracted = op.result();
-            let element_type = match extracted.element_type() {
-                Err(_) => return Ok((null, ElementType::NULL)),
-                Ok(el) => el,
+    json_cache.with_parsed_jsonb(value, parse_strict_into, |value| {
+        let mut result = Jsonb::make_empty_array(value.len())?;
+        for path in paths {
+            let found = json_cache.with_path(path.as_value_ref(), true, |path| match path {
+                Some(path) => Ok(Some(find_and_read(
+                    value.as_slice(),
+                    path,
+                    jsonb::element_at,
+                )?)),
+                None => Ok(None),
+            })?;
+            match found {
+                Some(Some(element)) => result.append_to_array_unsafe(&element.data()),
+                Some(None) => {
+                    result.append_to_array_unsafe(JsonbHeader::make_null().into_bytes().as_bytes())
+                }
+                None => return Ok(Value::Null),
+            }
+        }
+        result.finalize_unsafe(ElementType::ARRAY)?;
+        json_string_to_db_type(result, ElementType::ARRAY, flag)
+    })
+}
+
+fn extract_path_element<R>(
+    value: ValueRef<'_>,
+    path: &impl AsValueRef,
+    strict_path: bool,
+    json_cache: &JsonCacheCell,
+    read: impl FnOnce(&[u8], usize) -> crate::Result<R>,
+) -> crate::Result<Option<R>> {
+    let path = path.as_value_ref();
+    if let Some(document) = jsonb_blob_document(value) {
+        return json_cache.with_path(path, strict_path, |path| {
+            let Some(path) = path else {
+                return Ok(None);
             };
-            if res.is_ok() {
-                return Ok((extracted, element_type));
-            } else {
-                return Ok((null, ElementType::NULL));
+            match jsonb::find_path_element(document, path) {
+                Ok(None) => Ok(None),
+                Ok(Some(pos)) if jsonb::is_valid_element_at(document, pos) => {
+                    read(document, pos).map(Some)
+                }
+                Ok(Some(_)) | Err(_) => {
+                    json_cache.with_parsed_jsonb(value, parse_strict_into, |json| {
+                        find_and_read(json.as_slice(), path, read)
+                    })
+                }
             }
-        } else {
-            return Ok((null, ElementType::NULL));
+        });
+    }
+    json_cache.with_parsed_jsonb(value, parse_strict_into, |json| {
+        json_cache.with_path(path, strict_path, |path| match path {
+            Some(path) => find_and_read(json.as_slice(), path, read),
+            None => Ok(None),
+        })
+    })
+}
+
+#[inline(always)]
+fn parse_strict_into(val: ValueRef<'_>, json: &mut Jsonb) -> crate::Result<()> {
+    if let ValueRef::Text(text) = val {
+        let text = text.as_str();
+        let text = &text[..find_nul(text.as_bytes()).unwrap_or(text.len())];
+        return json
+            .replace_with_parsed_text(text)
+            .map_err(malformed_json_error);
+    }
+    *json = convert_ref_dbtype_to_jsonb(val, Conv::Strict)?;
+    Ok(())
+}
+
+fn find_and_read<R>(
+    data: &[u8],
+    path: &JsonPath,
+    read: impl FnOnce(&[u8], usize) -> crate::Result<R>,
+) -> crate::Result<Option<R>> {
+    match jsonb::find_path_element(data, path) {
+        Ok(Some(pos)) => read(data, pos).map(Some),
+        Ok(None) | Err(_) => Ok(None),
+    }
+}
+
+fn jsonb_blob_document(value: ValueRef<'_>) -> Option<&[u8]> {
+    let ValueRef::Blob(blob) = value else {
+        return None;
+    };
+    if matches!(
+        blob.first(),
+        Some(b' ' | b'\t' | b'\n' | b'\r' | b'"' | b'-' | b'0'..=b'2')
+    ) {
+        return None;
+    }
+    looks_like_jsonb_blob(blob).then_some(blob)
+}
+
+#[inline(always)]
+fn element_to_db_type(data: &[u8], pos: usize, flag: OutputVariant) -> crate::Result<Value> {
+    let (element_type, payload) = jsonb::element_payload(data, pos)?;
+    if matches!(
+        flag,
+        OutputVariant::ElementType | OutputVariant::ElementTypePlain
+    ) {
+        if element_type == ElementType::INT {
+            if let Some(int) = parse_decimal_i64(payload) {
+                return Ok(Value::from_i64(int));
+            }
+        }
+        let text = jsonb::payload_as_str(payload);
+        match (element_type, text) {
+            (ElementType::NULL, _) => return Ok(Value::Null),
+            (ElementType::TRUE, _) => return Ok(Value::from_i64(1)),
+            (ElementType::FALSE, _) => return Ok(Value::from_i64(0)),
+            (ElementType::FLOAT, Ok(text)) => {
+                if let Ok(float) = text.parse::<f64>() {
+                    return Ok(Value::from_f64(float));
+                }
+            }
+            (ElementType::TEXT | ElementType::TEXTRAW, Ok(text)) => {
+                return Ok(Value::Text(Text::new(text.to_string())));
+            }
+            (ElementType::TEXTJ, Ok(text)) if !payload.iter().any(|&b| b <= 0x1F) => {
+                return Ok(Value::Text(Text::new(unescape_string(text))));
+            }
+            _ => {}
         }
     }
+    let element = jsonb::element_at(data, pos)?;
+    let element_type = match element.element_type() {
+        Ok(element_type) => element_type,
+        Err(_) => return Ok(Value::Null),
+    };
+    json_string_to_db_type(element, element_type, flag)
+}
 
-    let mut json = value;
-    let mut result = Jsonb::make_empty_array(json.len())?;
-
-    // TODO: make an op to avoid creating new json for every path element
-    for path in paths {
-        let path = json_path_from_db_value(&path, true);
-        if let Some(path) = path? {
-            let mut op = SearchOperation::new(json.len())?;
-            let res = json.operate_on_path(&path, &mut op);
-            let extracted = op.result();
-            if res.is_ok() {
-                result.append_to_array_unsafe(&extracted.data());
-            } else {
-                result.append_to_array_unsafe(JsonbHeader::make_null().into_bytes().as_bytes());
-            }
-        } else {
-            return Ok((null, ElementType::NULL));
-        }
+fn parse_decimal_i64(text: &[u8]) -> Option<i64> {
+    let (negative, digits) = match text {
+        [b'-', digits @ ..] => (true, digits),
+        [b'+', digits @ ..] => (false, digits),
+        digits => (false, digits),
+    };
+    if digits.is_empty() {
+        return None;
     }
-    result.finalize_unsafe(ElementType::ARRAY)?;
-    Ok((result, ElementType::ARRAY))
+    let mut value: i64 = 0;
+    for &byte in digits {
+        let digit = byte.wrapping_sub(b'0');
+        if digit > 9 {
+            return None;
+        }
+        value = value.checked_mul(10)?;
+        value = if negative {
+            value.checked_sub(i64::from(digit))?
+        } else {
+            value.checked_add(i64::from(digit))?
+        };
+    }
+    Some(value)
 }
 
 /// converts a `Jsonb` value to a db Value
@@ -822,7 +907,7 @@ pub fn json_error_position(json: impl AsValueRef) -> crate::Result<Value> {
             // Like SQLite, text parsed as a JSON document stops at the
             // first NUL.
             let text = t.as_str();
-            let text = &text[..text.find('\0').unwrap_or(text.len())];
+            let text = &text[..find_nul(text.as_bytes()).unwrap_or(text.len())];
             match Jsonb::from_str(text) {
                 Ok(_) => Ok(Value::from_i64(0)),
                 Err(JsonError::Message { location, .. }) => {
@@ -857,7 +942,7 @@ pub fn json_error_position(json: impl AsValueRef) -> crate::Result<Value> {
             if looks_like_jsonb_blob(blob) {
                 return Ok(Value::from_i64(jsonb_error_position(blob) as i64));
             }
-            let zero_pos = blob.iter().position(|&b| b == 0).unwrap_or(blob.len());
+            let zero_pos = find_nul(blob).unwrap_or(blob.len());
             match Jsonb::from_str(&String::from_utf8_lossy(&blob[..zero_pos])) {
                 Ok(_) => Ok(Value::from_i64(0)),
                 Err(JsonError::Message { location, .. }) => {
@@ -990,21 +1075,22 @@ pub fn is_json_valid(
         ));
     }
 
-    let text_checks = |slice: &[u8]| -> crate::Result<bool> {
+    let text_checks = |text: &str| -> crate::Result<bool> {
         // With neither text flag selected the answer is already 0.
         // SQLite does not parse at all in that case, so a huge input
         // must not turn into an out-of-memory error here either.
         if flags & (JSON_VALID_FLAG_TEXT_STRICT | JSON_VALID_FLAG_TEXT_JSON5) == 0 {
             return Ok(false);
         }
-        match parse_as_json_text_tracking(slice) {
+        let text = &text[..find_nul(text.as_bytes()).unwrap_or(text.len())];
+        match Jsonb::from_str_tracking(text) {
             Ok((_, info)) => Ok(if info.has_json5 {
                 flags & JSON_VALID_FLAG_TEXT_JSON5 != 0
             } else {
                 flags & (JSON_VALID_FLAG_TEXT_STRICT | JSON_VALID_FLAG_TEXT_JSON5) != 0
             }),
-            Err(LimboError::OutOfMemory) => Err(LimboError::OutOfMemory),
-            Err(_) => Ok(false),
+            Err(JsonError::OutOfMemory) => Err(LimboError::OutOfMemory),
+            Err(JsonError::Message { .. }) => Ok(false),
         }
     };
 
@@ -1019,10 +1105,14 @@ pub fn is_json_valid(
                 flags & JSON_VALID_FLAG_BLOB_PROBABLE != 0
                     || (flags & JSON_VALID_FLAG_BLOB_STRICT != 0 && jsonb_error_position(blob) == 0)
             } else {
-                text_checks(blob)?
+                let blob = &blob[..find_nul(blob).unwrap_or(blob.len())];
+                match std::str::from_utf8(blob) {
+                    Ok(text) => text_checks(text)?,
+                    Err(_) => false,
+                }
             }
         }
-        ValueRef::Text(text) => text_checks(text.as_str().as_bytes())?,
+        ValueRef::Text(text) => text_checks(text.as_str())?,
         ValueRef::Numeric(Numeric::Float(float)) => {
             let float: f64 = float.into();
             if float.is_infinite() {
@@ -1098,6 +1188,74 @@ mod tests {
     use super::*;
     use crate::numeric::Numeric;
     use crate::types::Value;
+
+    #[test]
+    fn direct_element_conversion_matches_conversion_through_json_text() {
+        let parsed = Jsonb::from_str(
+            r#"[1, -0, 1.5, 1e400, -2.5e-3, 9223372036854775807, 9223372036854775808,
+               -9223372036854775809, 0x1F, +5, .5, 5., Infinity, -Infinity, NaN,
+               true, false, null, "plain", "esc\n\"é😀\/", 'single\x41',
+               "tab	in", "", {"a":1}, [1,[2]]]"#,
+        )
+        .unwrap();
+        let text_raw = [0x6Bu8, 0x5A, b'a', b'"', b'b', b'\\', b'c'];
+        let text_json_with_control = [0x4Bu8, 0x38, b'a', 0x01, b'\\'];
+        let documents: [&[u8]; 3] = [parsed.as_slice(), &text_raw, &text_json_with_control];
+        for data in documents {
+            let mut index = 0;
+            loop {
+                let path = JsonPath {
+                    elements: vec![PathElement::Root(), PathElement::ArrayLocator(Some(index))],
+                };
+                let Some(pos) = jsonb::find_path_element(data, &path).unwrap() else {
+                    break;
+                };
+                for flag in [OutputVariant::ElementType, OutputVariant::ElementTypePlain] {
+                    let element = jsonb::element_at(data, pos).unwrap();
+                    let element_type = element.element_type().unwrap();
+                    let expected = json_string_to_db_type(element, element_type, flag);
+                    let actual = element_to_db_type(data, pos, flag);
+                    assert_eq!(
+                        format!("{actual:?}"),
+                        format!("{expected:?}"),
+                        "element {index} of {data:?}"
+                    );
+                }
+                index += 1;
+            }
+            assert!(index > 0);
+        }
+    }
+
+    #[test]
+    fn parse_decimal_i64_accepts_what_i64_from_str_accepts() {
+        for text in [
+            "",
+            "-",
+            "+",
+            "0",
+            "-0",
+            "+7",
+            "007",
+            "-1234",
+            "9223372036854775807",
+            "9223372036854775808",
+            "-9223372036854775808",
+            "-9223372036854775809",
+            "1a",
+            " 1",
+            "1.0",
+            "1e3",
+            "--1",
+            "\u{0661}",
+        ] {
+            assert_eq!(
+                parse_decimal_i64(text.as_bytes()),
+                i64::from_str(text).ok(),
+                "{text:?}"
+            );
+        }
+    }
 
     #[test]
     fn json_valid_bad_flags_are_a_plain_sql_error_not_a_constraint() {

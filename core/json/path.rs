@@ -39,6 +39,27 @@ pub struct JsonPath<'a> {
 
 type RawString = bool;
 
+impl JsonPath<'_> {
+    pub fn into_owned(self) -> JsonPath<'static> {
+        JsonPath {
+            elements: self
+                .elements
+                .into_iter()
+                .map(|element| match element {
+                    PathElement::Root() => PathElement::Root(),
+                    PathElement::Key(key, raw) => {
+                        PathElement::Key(Cow::Owned(key.into_owned()), raw)
+                    }
+                    PathElement::ArrayLocator(index) => PathElement::ArrayLocator(index),
+                    PathElement::BracketQuotedKey(key) => {
+                        PathElement::BracketQuotedKey(Cow::Owned(key.into_owned()))
+                    }
+                })
+                .collect(),
+        }
+    }
+}
+
 /// PathElement describes a single element of a JSON path.
 #[derive(Clone, Debug, PartialEq)]
 pub enum PathElement<'a> {
@@ -78,6 +99,39 @@ fn estimate_path_capacity(input: &str) -> usize {
 
 /// Parses path into a Vec of Strings, where each string is a key or an array locator.
 pub fn json_path(path: &str) -> crate::Result<JsonPath<'_>> {
+    match dotted_key_path(path) {
+        Some(json_path) => Ok(json_path),
+        None => parse_json_path(path),
+    }
+}
+
+fn dotted_key_path(path: &str) -> Option<JsonPath<'_>> {
+    let bytes = path.as_bytes();
+    if bytes.first() != Some(&b'$') {
+        return None;
+    }
+    let mut elements = Vec::with_capacity(4);
+    elements.push(PathElement::Root());
+    let mut pos = 1;
+    while pos < bytes.len() {
+        if bytes[pos] != b'.' {
+            return None;
+        }
+        let start = pos + 1;
+        let mut end = start;
+        while end < bytes.len() && (bytes[end].is_ascii_alphanumeric() || bytes[end] == b'_') {
+            end += 1;
+        }
+        if end == start {
+            return None;
+        }
+        elements.push(PathElement::Key(Cow::Borrowed(&path[start..end]), false));
+        pos = end;
+    }
+    Some(JsonPath { elements })
+}
+
+fn parse_json_path(path: &str) -> crate::Result<JsonPath<'_>> {
     if path.is_empty() {
         bail_parse_error!("bad JSON path: '{}'", quote_path(path))
     }
@@ -446,6 +500,31 @@ fn finalize_path<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dotted_key_paths_parse_like_the_full_parser() {
+        for path in [
+            "$",
+            "$.a",
+            "$.score",
+            "$.user.name",
+            "$.a1_B2.c_3",
+            "$.0",
+            "$.a.b.c.d.e",
+        ] {
+            let fast = dotted_key_path(path).expect("dotted key path");
+            assert_eq!(
+                fast.elements,
+                parse_json_path(path).unwrap().elements,
+                "{path}"
+            );
+        }
+        for path in [
+            "", "$.", "$..a", "$.a.", "a.b", "$a", "$.a[0]", "$.\"a\"", "$.a-b", "$.é", "$ .a",
+        ] {
+            assert!(dotted_key_path(path).is_none(), "{path}");
+        }
+    }
 
     #[test]
     fn test_json_path_root() {

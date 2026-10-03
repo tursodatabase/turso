@@ -1,0 +1,90 @@
+@database :memory:
+
+# Column reads of table rows whose record continues on overflow pages,
+# including values that start on the leaf page, values that start on an
+# overflow page and multibyte text that crosses page boundaries.
+
+test column-reads-of-rows-with-overflow-pages {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, a TEXT, b BLOB, c TEXT, d INTEGER, e TEXT, f REAL, g INTEGER);
+    INSERT INTO t VALUES (1, 'small', cast(replace(hex(zeroblob(6000)), '00', 'ab') AS BLOB), replace(hex(zeroblob(3000)), '00', 'é€'), 42, 'tail', 2.5, 9007199254740993);
+    INSERT INTO t VALUES (2, 'x', zeroblob(10), 'short', 7, replace(hex(zeroblob(2500)), '00', '日本'), -1.25, -70000);
+    INSERT INTO t VALUES (3, NULL, cast(replace(hex(zeroblob(1500)), '00', 'z') AS BLOB), NULL, NULL, NULL, NULL, 0);
+    SELECT id, a, length(b), hex(substr(b, 5000, 4)), length(c), substr(c, 2999, 3), d, length(e), substr(e, 4999, 2) FROM t ORDER BY id;
+}
+expect {
+    1|small|12000|62616261|6000|é€é|42|4|
+    2|x|10||5||7|5000|日本
+    3||1500||||||
+}
+
+test column-reads-of-rows-with-overflow-pages-twice {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, a TEXT, b BLOB, c TEXT, d INTEGER, e TEXT, f REAL, g INTEGER);
+    INSERT INTO t VALUES (1, 'small', cast(replace(hex(zeroblob(6000)), '00', 'ab') AS BLOB), replace(hex(zeroblob(3000)), '00', 'é€'), 42, 'tail', 2.5, 9007199254740993);
+    INSERT INTO t VALUES (2, 'x', zeroblob(10), 'short', 7, replace(hex(zeroblob(2500)), '00', '日本'), -1.25, -70000);
+    INSERT INTO t VALUES (3, NULL, cast(replace(hex(zeroblob(1500)), '00', 'z') AS BLOB), NULL, NULL, NULL, NULL, 0);
+    SELECT id, length(c), substr(c, 1, 2), substr(c, 5999, 2) FROM t ORDER BY id;
+    SELECT id, length(c), substr(c, 1, 2), substr(c, 5999, 2) FROM t ORDER BY id;
+}
+expect {
+    1|6000|é€|é€
+    2|5|sh|
+    3|||
+    1|6000|é€|é€
+    2|5|sh|
+    3|||
+}
+
+test column-reads-of-rows-with-overflow-pages-on-small-pages {
+    PRAGMA page_size = 512;
+    CREATE TABLE t(id INTEGER PRIMARY KEY, a TEXT, b BLOB, c TEXT, d INTEGER, e TEXT, f REAL, g INTEGER);
+    INSERT INTO t VALUES (1, 'small', cast(replace(hex(zeroblob(6000)), '00', 'ab') AS BLOB), replace(hex(zeroblob(3000)), '00', 'é€'), 42, 'tail', 2.5, 9007199254740993);
+    INSERT INTO t VALUES (2, 'x', zeroblob(10), 'short', 7, replace(hex(zeroblob(2500)), '00', '日本'), -1.25, -70000);
+    INSERT INTO t VALUES (3, NULL, cast(replace(hex(zeroblob(1500)), '00', 'z') AS BLOB), NULL, NULL, NULL, NULL, 0);
+    SELECT id, a, length(b), hex(substr(b, 5000, 4)), length(c), substr(c, 2999, 3), d, length(e), substr(e, 4999, 2) FROM t ORDER BY id;
+}
+expect {
+    1|small|12000|62616261|6000|é€é|42|4|
+    2|x|10||5||7|5000|日本
+    3||1500||||||
+}
+
+test column-reads-of-numbers-after-overflow-values {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, a TEXT, b BLOB, c TEXT, d INTEGER, e TEXT, f REAL, g INTEGER);
+    INSERT INTO t VALUES (1, 'small', cast(replace(hex(zeroblob(6000)), '00', 'ab') AS BLOB), replace(hex(zeroblob(3000)), '00', 'é€'), 42, 'tail', 2.5, 9007199254740993);
+    INSERT INTO t VALUES (2, 'x', zeroblob(10), 'short', 7, replace(hex(zeroblob(2500)), '00', '日本'), -1.25, -70000);
+    INSERT INTO t VALUES (3, NULL, cast(replace(hex(zeroblob(1500)), '00', 'z') AS BLOB), NULL, NULL, NULL, NULL, 0);
+    SELECT id, d, f, g, typeof(f), typeof(g) FROM t ORDER BY id;
+}
+expect {
+    1|42|2.5|9007199254740993|real|integer
+    2|7|-1.25|-70000|real|integer
+    3|||0|null|integer
+}
+
+test column-reads-of-numbers-after-overflow-values-on-small-pages {
+    PRAGMA page_size = 512;
+    CREATE TABLE t(id INTEGER PRIMARY KEY, a TEXT, b BLOB, c TEXT, d INTEGER, e TEXT, f REAL, g INTEGER);
+    INSERT INTO t VALUES (1, 'small', cast(replace(hex(zeroblob(6000)), '00', 'ab') AS BLOB), replace(hex(zeroblob(3000)), '00', 'é€'), 42, 'tail', 2.5, 9007199254740993);
+    INSERT INTO t VALUES (2, 'x', zeroblob(10), 'short', 7, replace(hex(zeroblob(2500)), '00', '日本'), -1.25, -70000);
+    INSERT INTO t VALUES (3, NULL, cast(replace(hex(zeroblob(1500)), '00', 'z') AS BLOB), NULL, NULL, NULL, NULL, 0);
+    SELECT id, d, f, g, typeof(f), typeof(g) FROM t ORDER BY id;
+}
+expect {
+    1|42|2.5|9007199254740993|real|integer
+    2|7|-1.25|-70000|real|integer
+    3|||0|null|integer
+}
+
+test column-reads-compare-whole-overflow-values {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, a TEXT, b BLOB, c TEXT, d INTEGER, e TEXT, f REAL, g INTEGER);
+    INSERT INTO t VALUES (1, 'small', cast(replace(hex(zeroblob(6000)), '00', 'ab') AS BLOB), replace(hex(zeroblob(3000)), '00', 'é€'), 42, 'tail', 2.5, 9007199254740993);
+    INSERT INTO t VALUES (2, 'x', zeroblob(10), 'short', 7, replace(hex(zeroblob(2500)), '00', '日本'), -1.25, -70000);
+    INSERT INTO t VALUES (3, NULL, cast(replace(hex(zeroblob(1500)), '00', 'z') AS BLOB), NULL, NULL, NULL, NULL, 0);
+    SELECT id, b = cast(replace(hex(zeroblob(6000)), '00', 'ab') AS BLOB), c = replace(hex(zeroblob(3000)), '00', 'é€'), e = replace(hex(zeroblob(2500)), '00', '日本') FROM t ORDER BY id;
+}
+expect {
+    1|1|1|0
+    2|0|0|1
+    3|0||
+}
+

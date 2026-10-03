@@ -4,7 +4,9 @@ use criterion::{black_box, criterion_group, criterion_main, Criterion};
 #[cfg(feature = "codspeed")]
 use codspeed_criterion_compat::{black_box, criterion_group, criterion_main, Criterion};
 use std::sync::Arc;
-use turso_core::{Database, PlatformIO, SqliteDialect};
+use turso_core::{
+    Connection, Database, MemoryIO, PlatformIO, SqliteDialect, Statement, StepResult, Value,
+};
 
 // Title: JSONB Function Benchmarking
 
@@ -946,10 +948,235 @@ fn bench_json_patch(criterion: &mut Criterion) {
     }
 }
 
+#[turso_macros::codspeed_criterion_benchmark]
+fn bench_json_scan(criterion: &mut Criterion) {
+    let enable_rusqlite = std::env::var("DISABLE_RUSQLITE_BENCHMARK").is_err();
+
+    for shape in [DocShape::Small, DocShape::Medium, DocShape::Large] {
+        let docs = shape.documents();
+        #[allow(clippy::arc_with_non_send_sync)]
+        let io = Arc::new(MemoryIO::new());
+        let db = Database::open_file(io, ":memory:", Arc::new(SqliteDialect)).unwrap();
+        let limbo_conn = db.connect().unwrap();
+        load_limbo_docs(&db, &limbo_conn, &docs);
+        let sqlite_conn = enable_rusqlite.then(|| load_sqlite_docs(&docs));
+
+        for (query_name, query) in shape.queries() {
+            let mut group =
+                criterion.benchmark_group(format!("JSON Scan - {} - {query_name}", shape.name()));
+
+            group.bench_function("Limbo", |b| {
+                let mut stmt = limbo_conn.prepare(query).unwrap();
+                b.iter(|| {
+                    step_to_completion(&db, &mut stmt);
+                    stmt.reset().unwrap();
+                });
+            });
+
+            if let Some(sqlite_conn) = &sqlite_conn {
+                group.bench_function("Sqlite3", |b| {
+                    let mut stmt = sqlite_conn.prepare(query).unwrap();
+                    b.iter(|| {
+                        let mut rows = stmt.raw_query();
+                        while let Some(row) = rows.next().unwrap() {
+                            black_box(row);
+                        }
+                    });
+                });
+            }
+
+            group.finish();
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+enum DocShape {
+    Small,
+    Medium,
+    Large,
+}
+
+impl DocShape {
+    fn name(self) -> &'static str {
+        match self {
+            DocShape::Small => "Small",
+            DocShape::Medium => "Medium",
+            DocShape::Large => "Large",
+        }
+    }
+
+    fn documents(self) -> Vec<String> {
+        let mut rng = XorShift(0x9E37_79B9_7F4A_7C15);
+        match self {
+            DocShape::Small => (0..2000).map(|i| small_doc(i, &mut rng)).collect(),
+            DocShape::Medium => (0..200).map(|i| push_event_doc(i, &mut rng, 4)).collect(),
+            DocShape::Large => (0..20).map(|i| push_event_doc(i, &mut rng, 60)).collect(),
+        }
+    }
+
+    fn queries(self) -> Vec<(&'static str, &'static str)> {
+        let mut queries = vec![
+            (
+                "TEXT ->> one path",
+                "SELECT sum(doc->>'$.score') FROM docs_text",
+            ),
+            (
+                "TEXT ->> three paths",
+                "SELECT sum(doc->>'$.id'), sum(doc->>'$.active'), sum(doc->>'$.score') FROM docs_text",
+            ),
+            (
+                "TEXT json_valid",
+                "SELECT count(*) FROM docs_text WHERE json_valid(doc)",
+            ),
+            (
+                "TEXT jsonb",
+                "SELECT sum(length(jsonb(doc))) FROM docs_text",
+            ),
+            (
+                "JSONB ->> one path",
+                "SELECT sum(docb->>'$.score') FROM docs_jsonb",
+            ),
+            (
+                "JSONB ->> three paths",
+                "SELECT sum(docb->>'$.id'), sum(docb->>'$.active'), sum(docb->>'$.score') FROM docs_jsonb",
+            ),
+        ];
+        if matches!(self, DocShape::Small) {
+            queries.push((
+                "TEXT json_each",
+                "SELECT count(*) FROM docs_text, json_each(docs_text.doc, '$.user.tags') WHERE json_each.value = 'admin'",
+            ));
+        }
+        queries
+    }
+}
+
+struct XorShift(u64);
+
+impl XorShift {
+    fn next(&mut self) -> u64 {
+        let mut x = self.0;
+        x ^= x >> 12;
+        x ^= x << 25;
+        x ^= x >> 27;
+        self.0 = x;
+        x.wrapping_mul(0x2545_F491_4F6C_DD1D)
+    }
+}
+
+fn small_doc(i: u64, rng: &mut XorShift) -> String {
+    let active = rng.next() % 3 != 0;
+    let tags = if rng.next() % 5 == 0 {
+        r#""staff","admin""#
+    } else {
+        r#""guest""#
+    };
+    let score = (rng.next() % 20001) as i64 - 10000;
+    let note = "x".repeat((rng.next() % 64) as usize);
+    format!(
+        r#"{{"id":{i},"active":{active},"user":{{"name":"user_{i}","tags":[{tags}]}},"score":{score},"note":"tricky }},{{ \"quoted\" ]\n{{\n {note}"}}"#
+    )
+}
+
+fn push_event_doc(i: u64, rng: &mut XorShift, commits: usize) -> String {
+    let actor = rng.next() % 1_000_000;
+    let repo = rng.next() % 1_000_000;
+    let active = rng.next() % 3 != 0;
+    let score = (rng.next() % 20001) as i64 - 10000;
+    let push_id = rng.next() % 1_000_000_000;
+    let head = hex_sha(rng);
+    let before = hex_sha(rng);
+    let mut doc = format!(
+        r#"{{"id":"{}","type":"PushEvent","actor":{{"id":{actor},"login":"user{actor}","display_login":"user{actor}","gravatar_id":"","url":"https://api.github.com/users/user{actor}","avatar_url":"https://avatars.githubusercontent.com/u/{actor}?"}},"repo":{{"id":{repo},"name":"org{repo}/repo{repo}","url":"https://api.github.com/repos/org{repo}/repo{repo}"}},"payload":{{"repository_id":{repo},"push_id":{push_id},"size":{commits},"distinct_size":{commits},"ref":"refs/heads/main","head":"{head}","before":"{before}","commits":["#,
+        2_489_651_045 + i
+    );
+    for commit in 0..commits {
+        if commit > 0 {
+            doc.push(',');
+        }
+        let sha = hex_sha(rng);
+        let author = rng.next() % 1_000_000;
+        let bug = rng.next() % 10_000;
+        let module = rng.next() % 100;
+        doc.push_str(&format!(
+            r#"{{"sha":"{sha}","author":{{"email":"user{author}@example.com","name":"User {author}"}},"message":"Fix bug {bug} in module {module}\n\nSigned-off-by: User {author} <user{author}@example.com>","distinct":true,"url":"https://api.github.com/repos/org{repo}/repo{repo}/commits/{sha}"}}"#
+        ));
+    }
+    let second = rng.next() % 60;
+    doc.push_str(&format!(
+        r#"]}},"public":true,"created_at":"2015-01-01T15:00:{second:02}Z","active":{active},"score":{score}}}"#
+    ));
+    doc
+}
+
+fn hex_sha(rng: &mut XorShift) -> String {
+    (0..40)
+        .map(|_| char::from_digit((rng.next() % 16) as u32, 16).unwrap())
+        .collect()
+}
+
+fn load_limbo_docs(db: &Database, conn: &Arc<Connection>, docs: &[String]) {
+    conn.execute("CREATE TABLE docs_text (id INTEGER PRIMARY KEY, doc TEXT)")
+        .unwrap();
+    conn.execute("CREATE TABLE docs_jsonb (id INTEGER PRIMARY KEY, docb BLOB)")
+        .unwrap();
+    conn.execute("BEGIN").unwrap();
+    let mut insert = conn
+        .prepare("INSERT INTO docs_text (doc) VALUES (?1)")
+        .unwrap();
+    for doc in docs {
+        insert
+            .bind_at(1usize.try_into().unwrap(), Value::build_text(doc.clone()))
+            .unwrap();
+        step_to_completion(db, &mut insert);
+        insert.reset().unwrap();
+    }
+    conn.execute("COMMIT").unwrap();
+    conn.execute("INSERT INTO docs_jsonb SELECT id, jsonb(doc) FROM docs_text")
+        .unwrap();
+}
+
+fn load_sqlite_docs(docs: &[String]) -> rusqlite::Connection {
+    let conn = rusqlite::Connection::open_in_memory().unwrap();
+    conn.execute_batch(
+        "CREATE TABLE docs_text (id INTEGER PRIMARY KEY, doc TEXT);
+         CREATE TABLE docs_jsonb (id INTEGER PRIMARY KEY, docb BLOB);
+         BEGIN;",
+    )
+    .unwrap();
+    {
+        let mut insert = conn
+            .prepare("INSERT INTO docs_text (doc) VALUES (?1)")
+            .unwrap();
+        for doc in docs {
+            insert.execute([doc]).unwrap();
+        }
+    }
+    conn.execute_batch("COMMIT; INSERT INTO docs_jsonb SELECT id, jsonb(doc) FROM docs_text;")
+        .unwrap();
+    conn
+}
+
+fn step_to_completion(db: &Database, stmt: &mut Statement) {
+    loop {
+        match stmt.step().unwrap() {
+            StepResult::Row => {
+                black_box(stmt.row());
+            }
+            StepResult::IO | StepResult::Yield | StepResult::Sleep { .. } => {
+                db.io.step().unwrap();
+            }
+            StepResult::Done => break,
+            StepResult::Interrupt | StepResult::Busy => unreachable!(),
+        }
+    }
+}
+
 criterion_group! {
     name = benches;
     config = Criterion::default();
-    targets = bench, bench_sequential_jsonb, bench_json_patch
+    targets = bench, bench_sequential_jsonb, bench_json_patch, bench_json_scan
 }
 
 criterion_main!(benches);
