@@ -537,6 +537,7 @@ impl Statement {
 
     fn release_active_root_if_counted(&mut self) {
         if self.counted_as_active_root {
+            let _activity = self.program.connection.statement_activity.lock();
             // Blob count drops before the root count so a concurrent
             // checkpoint-guard read never sees fewer non-blob statements
             // than are really active (a stale-high read only causes a
@@ -553,7 +554,10 @@ impl Statement {
                 .n_active_root_statements
                 .fetch_sub(1, Ordering::SeqCst);
             if previous == 1 {
-                self.program.connection.clear_interrupt_if_idle();
+                self.program
+                    .connection
+                    .interrupt_requested
+                    .store(false, Ordering::SeqCst);
             }
             self.counted_as_active_root = false;
         }
@@ -743,6 +747,10 @@ impl Statement {
                 self.analyze_refresh = Some(RefreshAnalyzeStatsState::Start);
                 return self.drive_analyze_refresh(waker);
             }
+        } else if matches!(res, Ok(StepResult::Interrupt)) || res.is_err() {
+            self.busy = false;
+            self.busy_handler_state = None;
+            self.state.query_deadline = None;
         } else {
             self.busy = true;
         }
@@ -828,9 +836,8 @@ impl Statement {
                     self.pager.io.step()?
                 }
                 vdbe::StepResult::Row => continue,
-                vdbe::StepResult::Interrupt | vdbe::StepResult::Busy => {
-                    return Err(LimboError::Busy)
-                }
+                vdbe::StepResult::Interrupt => return Err(LimboError::Interrupt),
+                vdbe::StepResult::Busy => return Err(LimboError::Busy),
             }
         }
     }
@@ -847,9 +854,8 @@ impl Statement {
                     values.push(self.row().unwrap().get_values().cloned().collect());
                     continue;
                 }
-                vdbe::StepResult::Interrupt | vdbe::StepResult::Busy => {
-                    return Err(LimboError::Busy)
-                }
+                vdbe::StepResult::Interrupt => return Err(LimboError::Interrupt),
+                vdbe::StepResult::Busy => return Err(LimboError::Busy),
             }
         }
     }
@@ -1046,6 +1052,7 @@ impl Statement {
 
         // Save parameters before they are reset
         let parameters = std::mem::take(&mut self.state.parameters);
+        let query_deadline = self.state.query_deadline;
         let (max_registers, cursor_count) = match self.query_mode {
             QueryMode::Normal => (new_program.max_registers, new_program.cursor_ref.len()),
             QueryMode::Explain => (EXPLAIN_COLUMNS.len(), 0),
@@ -1067,6 +1074,7 @@ impl Statement {
         self.program = new_program;
         // Load the parameters back into the state
         self.state.parameters = parameters;
+        self.state.query_deadline = query_deadline;
         Ok(())
     }
 

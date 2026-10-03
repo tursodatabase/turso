@@ -18,6 +18,7 @@ public class SqliteCommand : DbCommand
     private int _commandTimeout = 30;
     private bool _hasOpenReader;
     private global::Turso.TursoCommand? _activeManagedCommand;
+    private TursoInterruptHandle? _activeInterruptHandle;
 
     public SqliteCommand()
     {
@@ -133,6 +134,7 @@ public class SqliteCommand : DbCommand
     public override void Cancel()
     {
         _activeManagedCommand?.Cancel();
+        Volatile.Read(ref _activeInterruptHandle)?.TryInterrupt();
     }
 
     public override int ExecuteNonQuery()
@@ -218,27 +220,27 @@ public class SqliteCommand : DbCommand
     public override async Task<int> ExecuteNonQueryAsync(CancellationToken cancellationToken)
     {
         cancellationToken.ThrowIfCancellationRequested();
-        if (Connection?.IsManagedConnection != true)
-            return ExecuteNonQuery();
-
-        await using var reader = await ExecuteManagedAsync("ExecuteNonQuery", CommandBehavior.Default, cancellationToken)
-            .ConfigureAwait(false);
+        await using var reader = Connection?.IsManagedConnection == true
+            ? await ExecuteManagedAsync("ExecuteNonQuery", CommandBehavior.Default, cancellationToken)
+                .ConfigureAwait(false)
+            : Execute("ExecuteNonQuery", CommandBehavior.Default, cancellationToken);
         while (await reader.ReadAsync(cancellationToken).ConfigureAwait(false))
         {
         }
 
         await reader.CloseAsync().ConfigureAwait(false);
+        if (IsTransactionControlCommand(CommandText))
+            Connection?.Transaction?.MarkCompletedExternally(IsRollbackCommand(CommandText));
         return reader.RecordsAffected;
     }
 
     public override async Task<object?> ExecuteScalarAsync(CancellationToken cancellationToken)
     {
         cancellationToken.ThrowIfCancellationRequested();
-        if (Connection?.IsManagedConnection != true)
-            return ExecuteScalar();
-
-        await using var reader = await ExecuteManagedAsync("ExecuteScalar", CommandBehavior.Default, cancellationToken)
-            .ConfigureAwait(false);
+        await using var reader = Connection?.IsManagedConnection == true
+            ? await ExecuteManagedAsync("ExecuteScalar", CommandBehavior.Default, cancellationToken)
+                .ConfigureAwait(false)
+            : Execute("ExecuteScalar", CommandBehavior.Default, cancellationToken);
         return await reader.ReadAsync(cancellationToken).ConfigureAwait(false)
             ? reader.GetValue(0)
             : null;
@@ -250,7 +252,7 @@ public class SqliteCommand : DbCommand
     {
         cancellationToken.ThrowIfCancellationRequested();
         if (Connection?.IsManagedConnection != true)
-            return Execute("ExecuteReader", behavior);
+            return Execute("ExecuteReader", behavior, cancellationToken);
 
         return await ExecuteManagedAsync("ExecuteReader", behavior, cancellationToken).ConfigureAwait(false);
     }
@@ -266,7 +268,10 @@ public class SqliteCommand : DbCommand
         base.Dispose(disposing);
     }
 
-    private SqliteDataReader Execute(string method, CommandBehavior behavior = CommandBehavior.Default)
+    private SqliteDataReader Execute(
+        string method,
+        CommandBehavior behavior = CommandBehavior.Default,
+        CancellationToken cancellationToken = default)
     {
         EnsureExecutable(method);
         if (Connection!.IsManagedConnection)
@@ -291,6 +296,15 @@ public class SqliteCommand : DbCommand
         if (Connection?.IsReadOnly == true && IsWriteCommand(CommandText))
             throw new SqliteException(Properties.Resources.SqliteNativeError(8, "attempt to write a readonly database"), 8);
 
+        cancellationToken.ThrowIfCancellationRequested();
+        TursoInterruptHandle? interruptHandle =
+            TursoBindings.RetainInterruptHandle(Connection!.DatabaseHandle);
+        var cancellationRegistration = cancellationToken.CanBeCanceled
+            ? cancellationToken.UnsafeRegister(
+                static state => ((TursoInterruptHandle)state!).TryInterrupt(),
+                interruptHandle)
+            : default;
+        Volatile.Write(ref _activeInterruptHandle, interruptHandle);
         var recordsAffected = 0;
         var statements = SplitStatements(CommandText);
         try
@@ -305,26 +319,69 @@ public class SqliteCommand : DbCommand
                 {
                     _hasOpenReader = true;
                     Connection?.ReaderOpened();
-                    return new SqliteDataReader(this, statement, statements[i], statements.Skip(i + 1).ToList(), recordsAffected, behavior, CloseReader);
+                    var reader = new SqliteDataReader(
+                        this,
+                        statement,
+                        statements[i],
+                        statements.Skip(i + 1).ToList(),
+                        recordsAffected,
+                        behavior,
+                        CloseReader,
+                        cancellationToken,
+                        interruptHandle,
+                        cancellationRegistration);
+                    interruptHandle = null;
+                    cancellationRegistration = default;
+                    return reader;
                 }
 
-                while (TursoBindings.Read(statement))
+                using (statement)
                 {
-                }
+                    while (TursoBindings.Read(statement))
+                    {
+                    }
 
-                if (CountsRowsAffected(statements[i]))
-                    recordsAffected += TursoBindings.RowsAffected(statement);
-                statement.Dispose();
+                    if (CountsRowsAffected(statements[i]))
+                        recordsAffected += TursoBindings.RowsAffected(statement);
+                }
             }
         }
         catch (TursoException ex)
         {
+            CompleteTransactionAfterInterrupt(ex);
+            if (ex.IsInterrupt && cancellationToken.IsCancellationRequested)
+                throw new OperationCanceledException("The query was canceled.", ex, cancellationToken);
             throw ToSqliteException(ex);
+        }
+        finally
+        {
+            cancellationRegistration.Dispose();
+            if (interruptHandle is not null)
+            {
+                CompleteNativeExecution(interruptHandle);
+                interruptHandle.Dispose();
+            }
         }
 
         _hasOpenReader = true;
         Connection?.ReaderOpened();
         return new SqliteDataReader(this, recordsAffected, behavior, CloseReader);
+    }
+
+    internal void CompleteTransactionAfterInterrupt(TursoException exception)
+    {
+        if (exception.IsInterrupt
+            && Transaction is { } transaction
+            && Connection is { State: ConnectionState.Open } connection
+            && TursoBindings.IsAutocommit(connection.DatabaseHandle))
+        {
+            transaction.MarkCompletedExternally(rolledBack: true);
+        }
+    }
+
+    internal void CompleteNativeExecution(TursoInterruptHandle interruptHandle)
+    {
+        Interlocked.CompareExchange(ref _activeInterruptHandle, null, interruptHandle);
     }
 
     private async Task PrepareManagedAsync(CancellationToken cancellationToken)
@@ -633,6 +690,7 @@ public class SqliteCommand : DbCommand
         try
         {
             BindParameters(statement);
+            TursoBindings.SetQueryTimeout(statement, TimeSpan.FromSeconds(CommandTimeout));
             return statement;
         }
         catch
@@ -966,7 +1024,10 @@ public class SqliteCommand : DbCommand
         if (sql is not null)
             message = PreserveNoSuchTableCase(message, sql);
 
-        return new SqliteException(Properties.Resources.SqliteNativeError(1, message), 1);
+        var nativeErrorCode = ex.StatusCode == 5 ? 9 : 1;
+        return new SqliteException(
+            Properties.Resources.SqliteNativeError(nativeErrorCode, message),
+            nativeErrorCode);
     }
 
     private static (int ErrorCode, int ExtendedErrorCode) GetRemoteSqliteErrorCodes(
