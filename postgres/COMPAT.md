@@ -177,7 +177,7 @@ INTEGER. Unknown type names pass through as custom types.
 | FETCH FIRST .. WITH TIES | ❌ Not supported | `FETCH FIRST n ROWS ONLY` works (lowered to LIMIT); WITH TIES silently ignored |
 | GROUPING SETS, CUBE and ROLLUP support | ❌ Not supported | Translation error |
 | INSERT/UPDATE/DELETE RETURNING | ✅ Supported | Including `RETURNING *` and UPDATE ... FROM ... RETURNING |
-| LATERAL clause | ❌ Not supported | Keyword accepted but silently ignored |
+| LATERAL clause | 🟡 Partial | LATERAL subqueries work with a comma, [CROSS] JOIN, and LEFT JOIN. Column alias lists such as `AS s(x)` and outer columns in LIMIT/OFFSET are not supported |
 | MERGE | ❌ Not supported | |
 | MERGE ... RETURNING | ❌ Not supported | |
 | Multirow VALUES | ✅ Supported | In INSERT and as standalone VALUES lists |
