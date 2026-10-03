@@ -2,7 +2,7 @@
 source: subquery-sort-elision.sqltest
 expression: |-
   WITH unordered AS (
-          SELECT x, y FROM t1
+          SELECT x, y FROM t1 LIMIT -1
       )
       SELECT x, SUM(y) OVER (ORDER BY x) AS running
       FROM unordered;

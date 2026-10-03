@@ -429,6 +429,7 @@ fn ensure_delete_uses_rowset(program: &mut ProgramBuilder, plan: &mut DeletePlan
     let rowset_plan = SelectPlan {
         table_references: plan.table_references.clone(),
         result_columns: vec![ResultSetColumn {
+            subquery_column_name: None,
             expr: Expr::RowId {
                 database: None,
                 table: rowid_internal_id,

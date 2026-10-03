@@ -2,7 +2,7 @@
 source: subquery-sort-elision.sqltest
 expression: |-
   WITH ordered AS (
-          SELECT x, y FROM t1 ORDER BY x
+          SELECT x, y FROM t1 ORDER BY x LIMIT -1
       )
       SELECT * FROM ordered ORDER BY x;
 info:

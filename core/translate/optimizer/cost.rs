@@ -35,6 +35,7 @@ pub fn where_node_steps(expr: &ast::Expr) -> usize {
         } => when_then_pairs.len().max(1),
         ast::Expr::Register(_)
         | ast::Expr::Collate(..)
+        | ast::Expr::SubqueryColumnValue { .. }
         | ast::Expr::DoublyQualified(..)
         | ast::Expr::Id(_)
         | ast::Expr::Column { .. }

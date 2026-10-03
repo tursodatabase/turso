@@ -83,10 +83,12 @@ pub(crate) mod access_method;
 pub(crate) mod constraints;
 pub(crate) mod cost;
 mod cost_params;
+mod flatten;
 pub(crate) mod join;
 pub(crate) mod lift_common_subexpressions;
 pub(crate) mod multi_index;
 pub(crate) mod order;
+mod push_down;
 pub(crate) mod unnest;
 
 #[derive(Debug, Default)]
@@ -974,6 +976,8 @@ fn optimize_select_plan_with_cache(
     resolver: &Resolver,
     cache: &mut SubqueryPlanCache,
 ) -> Result<()> {
+    flatten::flatten_from_clause_subqueries(plan, resolver)?;
+    push_down::push_where_terms_into_subqueries(plan, resolver)?;
     if !plan
         .non_from_clause_subqueries
         .iter()
@@ -995,12 +999,7 @@ fn optimize_select_plan_with_cache(
         return optimize_select_plan_form(plan, resolver, cache);
     }
 
-    let has_full_join = plan.table_references.joined_tables().iter().any(|table| {
-        table
-            .join_info
-            .as_ref()
-            .is_some_and(JoinInfo::is_full_outer)
-    });
+    let has_full_join = plan.table_references.has_full_join();
     // The correlated form cannot run on every matched and unmatched FULL JOIN
     // row yet. A complete semi-join or anti-join rewrite can, so use it.
     let full_join_rewrite_is_complete = has_full_join
@@ -1647,6 +1646,7 @@ fn build_update_write_set_plan(
 
     let mut result_columns = update_from_set_result_columns;
     result_columns.push(ResultSetColumn {
+        subquery_column_name: None,
         expr: Expr::RowId {
             database: None,
             table: rowid_internal_id,
@@ -1754,6 +1754,7 @@ fn update_from_set_result_columns(set_clauses: &[UpdateSetClause]) -> Vec<Result
         .iter()
         .enumerate()
         .map(|(idx, set_clause)| ResultSetColumn {
+            subquery_column_name: None,
             expr: set_clause.expr.as_ref().clone(),
             alias: Some(update_from_scratch_col_name(idx)),
             implicit_column_name: None,
@@ -1884,18 +1885,10 @@ fn optimize_plan_for_calls(
         optimize_select_plan_with_cache(plan, resolver, cache)
     };
 
-    match plan {
-        Plan::Select(plan) => optimize(plan),
-        Plan::CompoundSelect {
-            left, right_most, ..
-        } => {
-            for (plan, _) in left {
-                optimize(plan)?;
-            }
-            optimize(right_most)
-        }
-        Plan::RecursiveCte(_) | Plan::Delete(_) | Plan::Update(_) => Ok(()),
+    for select in plan.selects_mut() {
+        optimize(select)?;
     }
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2302,7 +2295,9 @@ fn where_term_is_null_rejecting_for_table(
 
         // NULL-propagating wrappers.
         ast::Expr::Unary(_, inner) | ast::Expr::Cast { expr: inner, .. } => rejects(inner),
-        ast::Expr::Collate(inner, _) => rejects(inner),
+        ast::Expr::Collate(inner, _) | ast::Expr::SubqueryColumnValue { expr: inner, .. } => {
+            rejects(inner)
+        }
         // A single-element parenthesized expression is just grouping; a
         // row value (more elements) is compared element-wise and can be
         // TRUE with a NULL element.
@@ -3535,7 +3530,9 @@ impl Optimizable for ast::Expr {
                         .is_some_and(|else_expr| else_expr.is_nonnull(tables))
             }
             Expr::Cast { expr, .. } => expr.is_nonnull(tables),
-            Expr::Collate(expr, _) => expr.is_nonnull(tables),
+            Expr::Collate(expr, _) | Expr::SubqueryColumnValue { expr, .. } => {
+                expr.is_nonnull(tables)
+            }
             Expr::DoublyQualified(..) => {
                 panic!("Do not call is_nonnull before DoublyQualified has been rewritten as Column")
             }
@@ -3641,7 +3638,9 @@ impl Optimizable for ast::Expr {
                         .is_none_or(|else_expr| else_expr.is_constant(resolver))
             }
             Expr::Cast { expr, .. } => expr.is_constant(resolver),
-            Expr::Collate(expr, _) => expr.is_constant(resolver),
+            Expr::Collate(expr, _) | Expr::SubqueryColumnValue { expr, .. } => {
+                expr.is_constant(resolver)
+            }
             // Not constant. Normally rewritten to Expr::Column by the optimizer,
             // but CHECK constraints bypass the rewrite pass and legitimately
             // contain DoublyQualified nodes.

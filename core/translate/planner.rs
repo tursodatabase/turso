@@ -1493,7 +1493,7 @@ fn prepare_recursive_cte_plan(
 fn reject_aggregates_and_windows_in_recursive_query(query: &Plan) -> Result<()> {
     match query {
         Plan::Select(select) => {
-            if !select.aggregates.is_empty() || select.group_by.is_some() {
+            if select.is_aggregate() {
                 crate::bail_parse_error!("recursive aggregate queries not supported");
             }
             if select.window.is_some() {
@@ -1503,12 +1503,7 @@ fn reject_aggregates_and_windows_in_recursive_query(query: &Plan) -> Result<()> 
         Plan::CompoundSelect {
             left, right_most, ..
         } => {
-            if left
-                .iter()
-                .any(|(select, _)| !select.aggregates.is_empty() || select.group_by.is_some())
-                || !right_most.aggregates.is_empty()
-                || right_most.group_by.is_some()
-            {
+            if left.iter().any(|(select, _)| select.is_aggregate()) || right_most.is_aggregate() {
                 crate::bail_parse_error!("recursive aggregate queries not supported");
             }
             if left.iter().any(|(select, _)| select.window.is_some()) || right_most.window.is_some()

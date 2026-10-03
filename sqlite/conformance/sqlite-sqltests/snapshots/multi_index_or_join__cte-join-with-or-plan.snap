@@ -1,7 +1,7 @@
 ---
 source: multi_index_or_join.sqltest
 expression: |-
-  WITH selected_nodes AS (
+  WITH selected_nodes AS MATERIALIZED (
           SELECT id FROM node WHERE id <= 2
       )
       SELECT e.id, e.source_id, e.target_id
@@ -19,6 +19,6 @@ info:
   database: ':memory:'
 ---
 QUERY PLAN
+|--SEARCH node USING INTEGER PRIMARY KEY (rowid=?)
 |--SCAN selected_nodes AS s
-|  `--SEARCH node USING INTEGER PRIMARY KEY (rowid=?)
 `--MULTI-INDEX OR e (idx_edge_source, idx_edge_target)

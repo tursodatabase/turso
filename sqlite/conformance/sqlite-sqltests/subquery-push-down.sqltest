@@ -1,0 +1,304 @@
+@database :memory:
+
+setup schema {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, a INTEGER, b);
+    CREATE INDEX ta ON t(a);
+    INSERT INTO t VALUES (1, 5, 'x'), (2, 5, 'y'), (3, 7, 'x'), (4, NULL, 'z');
+    CREATE TABLE t2(id INTEGER PRIMARY KEY, a INTEGER, b);
+    CREATE INDEX t2a ON t2(a);
+    INSERT INTO t2 VALUES (1, 5, 'q'), (5, 9, 'r'), (6, 7, 'x');
+    CREATE TABLE tx(id INTEGER PRIMARY KEY, a TEXT);
+    INSERT INTO tx VALUES (1, '5'), (2, '05'), (3, 'x');
+    CREATE TABLE g(a, b);
+    INSERT INTO g VALUES (1, 'x'), (1.0, 'y'), (2, 'z');
+    CREATE TABLE h(a TEXT COLLATE NOCASE);
+    INSERT INTO h VALUES ('a'), ('A'), ('b');
+}
+
+@setup schema
+test grouped-subquery-filtered-on-group-key {
+    SELECT * FROM (SELECT a, count(*) AS n FROM t GROUP BY a) WHERE a = 5;
+}
+expect {
+    5|2
+}
+
+@setup schema
+test grouped-subquery-filtered-on-aggregate {
+    SELECT * FROM (SELECT a, count(*) AS n FROM t GROUP BY a) WHERE n = 1 ORDER BY a;
+}
+expect {
+    |1
+    7|1
+}
+
+@setup schema
+test grouped-subquery-with-having-filtered-on-key-and-aggregate {
+    SELECT * FROM (SELECT a, count(*) AS n FROM t GROUP BY a HAVING count(*) > 0) WHERE a > 4 AND n = 2;
+}
+expect {
+    5|2
+}
+
+@setup schema
+test ungrouped-aggregate-subquery-keeps-its-one-row {
+    SELECT * FROM (SELECT max(a) AS m FROM t) WHERE m = 7;
+}
+expect {
+    7
+}
+
+@setup schema
+test union-all-subquery-filtered {
+    SELECT * FROM (SELECT id, a FROM t UNION ALL SELECT id, a FROM t2) WHERE a = 5 ORDER BY id;
+}
+expect {
+    1|5
+    1|5
+    2|5
+}
+
+@setup schema
+test union-all-subquery-filtered-on-expressions {
+    SELECT * FROM (SELECT id, a + 1 AS a1 FROM t UNION ALL SELECT id, a * 2 FROM t2) WHERE a1 >= 8 ORDER BY 1, 2;
+}
+expect {
+    1|10
+    3|8
+    5|18
+    6|14
+}
+
+@setup schema
+test union-subquery-filtered {
+    SELECT * FROM (SELECT a FROM t UNION SELECT a FROM t2) WHERE a >= 7 ORDER BY 1;
+}
+expect {
+    7
+    9
+}
+
+@setup schema
+test except-subquery-filtered {
+    SELECT * FROM (SELECT a FROM t EXCEPT SELECT a FROM t2) WHERE a IS NULL;
+}
+expect {
+
+}
+
+@setup schema
+test intersect-subquery-filtered {
+    SELECT * FROM (SELECT a FROM t INTERSECT SELECT a FROM t2) WHERE a IN (5, 7, 9) ORDER BY 1;
+}
+expect {
+    5
+    7
+}
+
+@setup schema
+test distinct-subquery-filtered {
+    SELECT * FROM (SELECT DISTINCT a FROM t) WHERE a BETWEEN 5 AND 6;
+}
+expect {
+    5
+}
+
+@setup schema
+test union-all-of-integer-and-text-columns-compared-with-text {
+    SELECT * FROM (SELECT a FROM t UNION ALL SELECT a FROM tx) WHERE a = '5' ORDER BY 1;
+}
+expect {
+    5
+}
+
+@setup schema
+test union-all-of-integer-and-text-columns-compared-with-integer {
+    SELECT * FROM (SELECT a FROM t UNION ALL SELECT a FROM tx) WHERE a = 5 ORDER BY 1;
+}
+expect {
+    5
+    5
+}
+
+@setup schema
+test left-join-on-term-filters-the-subquery {
+    SELECT t2.id, s.n FROM t2 LEFT JOIN (SELECT a, count(*) AS n FROM t GROUP BY a) s ON s.a = t2.a AND s.a = 5 ORDER BY t2.id;
+}
+expect {
+    1|2
+    5|
+    6|
+}
+
+@setup schema
+test left-join-where-term-stays-outside {
+    SELECT t2.id, s.n FROM t2 LEFT JOIN (SELECT a, count(*) AS n FROM t GROUP BY a) s ON s.a = t2.a WHERE s.n IS NULL ORDER BY t2.id;
+}
+expect {
+    5|
+}
+
+@setup schema
+test on-term-of-a-later-left-join-stays-outside {
+    SELECT s.a, t2.id FROM (SELECT a, count(*) AS n FROM t GROUP BY a) s LEFT JOIN t2 ON s.a = 5 AND t2.a = s.a ORDER BY 1, 2;
+}
+expect {
+    |
+    5|1
+    7|
+}
+
+@setup schema
+test nocase-group-compared-as-binary {
+    SELECT * FROM (SELECT a, count(*) AS n FROM h GROUP BY a) WHERE a = 'A' COLLATE BINARY;
+}
+expect {
+}
+
+@setup schema
+test nocase-group-compared-as-nocase {
+    SELECT * FROM (SELECT a, count(*) AS n FROM h GROUP BY a) WHERE a = 'A';
+}
+expect {
+    a|2
+}
+
+# SQLite copies these terms into the subquery, so a copy decides which of the
+# merged rows 1 and 1.0 the result shows. Without the copy the merged row is 1.
+@setup schema
+@skip-if sqlite "sqlite copies a term that splits merged rows into the subquery"
+test grouped-subquery-filtered-by-function-of-group-key {
+    SELECT a, n FROM (SELECT a, count(*) AS n FROM g GROUP BY a) WHERE typeof(a) = 'real';
+}
+expect {
+}
+
+@setup schema
+@skip-if sqlite "sqlite copies a term that splits merged rows into the subquery"
+test distinct-subquery-filtered-by-function-of-column {
+    SELECT * FROM (SELECT DISTINCT a FROM g) WHERE typeof(a) = 'real';
+}
+expect {
+}
+
+@setup schema
+test grouped-subquery-filtered-by-function-of-group-key-without-copy {
+    SELECT a, n FROM (SELECT a, count(*) AS n FROM g GROUP BY a LIMIT -1) WHERE typeof(a) = 'real';
+}
+expect {
+}
+
+# A copy of `r > 0` would run random() once for the whole query instead of
+# once for each row, and keep no row half of the time. Each of the 20 runs
+# keeps no row only with probability 2^-800 when the term stays outside.
+test term-on-nondeterministic-column-stays-outside {
+    CREATE TABLE many(x);
+    WITH RECURSIVE c(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM c WHERE i < 400)
+    INSERT INTO many SELECT i FROM c;
+    CREATE VIEW randoms AS
+        SELECT x, random() AS r FROM many UNION ALL SELECT x, random() FROM many;
+    SELECT count(*) > 0 FROM randoms WHERE r > 0;
+    SELECT count(*) > 0 FROM randoms WHERE r > 0;
+    SELECT count(*) > 0 FROM randoms WHERE r > 0;
+    SELECT count(*) > 0 FROM randoms WHERE r > 0;
+    SELECT count(*) > 0 FROM randoms WHERE r > 0;
+    SELECT count(*) > 0 FROM randoms WHERE r > 0;
+    SELECT count(*) > 0 FROM randoms WHERE r > 0;
+    SELECT count(*) > 0 FROM randoms WHERE r > 0;
+    SELECT count(*) > 0 FROM randoms WHERE r > 0;
+    SELECT count(*) > 0 FROM randoms WHERE r > 0;
+    SELECT count(*) > 0 FROM randoms WHERE r > 0;
+    SELECT count(*) > 0 FROM randoms WHERE r > 0;
+    SELECT count(*) > 0 FROM randoms WHERE r > 0;
+    SELECT count(*) > 0 FROM randoms WHERE r > 0;
+    SELECT count(*) > 0 FROM randoms WHERE r > 0;
+    SELECT count(*) > 0 FROM randoms WHERE r > 0;
+    SELECT count(*) > 0 FROM randoms WHERE r > 0;
+    SELECT count(*) > 0 FROM randoms WHERE r > 0;
+    SELECT count(*) > 0 FROM randoms WHERE r > 0;
+    SELECT count(*) > 0 FROM randoms WHERE r > 0;
+}
+expect {
+    1
+    1
+    1
+    1
+    1
+    1
+    1
+    1
+    1
+    1
+    1
+    1
+    1
+    1
+    1
+    1
+    1
+    1
+    1
+    1
+}
+
+@setup schema
+test window-subquery-filtered {
+    SELECT * FROM (SELECT a, row_number() OVER (ORDER BY id) AS r FROM t) WHERE a = 7;
+}
+expect {
+    7|3
+}
+
+@setup schema
+test limit-subquery-filtered {
+    SELECT * FROM (SELECT a FROM t ORDER BY id LIMIT 2) WHERE a = 5;
+}
+expect {
+    5
+    5
+}
+
+@setup schema
+@skip-if sqlite "query plan explanation output is different in sqlite"
+test plan-grouped-subquery-seeks-group-key {
+    EXPLAIN QUERY PLAN SELECT * FROM (SELECT a, count(*) AS n FROM t GROUP BY a) WHERE a = 5;
+}
+expect {
+    1|0|0|SCAN (subquery-0)
+    3|1|0|SEARCH t USING COVERING INDEX ta (a=?)
+}
+
+@setup schema
+@skip-if sqlite "query plan explanation output is different in sqlite"
+test plan-grouped-subquery-scans-for-aggregate-filter {
+    EXPLAIN QUERY PLAN SELECT * FROM (SELECT a, count(*) AS n FROM t GROUP BY a) WHERE n = 5;
+}
+expect {
+    1|0|0|SCAN (subquery-0)
+    3|1|0|SCAN t USING COVERING INDEX ta
+}
+
+@setup schema
+@skip-if sqlite "query plan explanation output is different in sqlite"
+test plan-union-all-subquery-seeks-both-tables {
+    EXPLAIN QUERY PLAN SELECT * FROM (SELECT id, a FROM t UNION ALL SELECT id, a FROM t2) WHERE id = 5;
+}
+expect {
+    1|0|0|SCAN (subquery-0)
+    3|1|0|COMPOUND QUERY
+    4|3|0|LEFT-MOST SUBQUERY
+    5|4|0|SEARCH t USING INTEGER PRIMARY KEY (rowid=?)
+    11|3|0|UNION ALL
+    12|11|0|SEARCH t2 USING INTEGER PRIMARY KEY (rowid=?)
+}
+
+@setup schema
+@skip-if sqlite "query plan explanation output is different in sqlite"
+test plan-distinct-subquery-seeks-index {
+    EXPLAIN QUERY PLAN SELECT * FROM (SELECT DISTINCT a FROM t) WHERE a = 5;
+}
+expect {
+    1|0|0|SCAN (subquery-0)
+    3|1|0|SEARCH t USING COVERING INDEX ta (a=?)
+    5|1|0|USE HASH TABLE FOR DISTINCT
+}

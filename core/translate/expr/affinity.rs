@@ -78,7 +78,9 @@ pub(crate) fn get_expr_affinity(
         ast::Expr::Parenthesized(exprs) if exprs.len() == 1 => {
             get_expr_affinity(exprs.first().unwrap(), referenced_tables, resolver)
         }
-        ast::Expr::Collate(expr, _) => get_expr_affinity(expr, referenced_tables, resolver),
+        ast::Expr::Collate(expr, _) | ast::Expr::SubqueryColumnValue { expr, .. } => {
+            get_expr_affinity(expr, referenced_tables, resolver)
+        }
         // Literals have NO affinity in SQLite.
         ast::Expr::Literal(_) => Affinity::None,
         ast::Expr::Register(reg) => {
@@ -116,7 +118,9 @@ pub(crate) fn expr_data_type(
     referenced_tables: Option<&TableReferences>,
 ) -> StorageClassMask {
     match expr {
-        ast::Expr::Collate(inner, _) | ast::Expr::Unary(ast::UnaryOperator::Positive, inner) => {
+        ast::Expr::Collate(inner, _)
+        | ast::Expr::SubqueryColumnValue { expr: inner, .. }
+        | ast::Expr::Unary(ast::UnaryOperator::Positive, inner) => {
             expr_data_type(inner, referenced_tables)
         }
         ast::Expr::Parenthesized(exprs) if exprs.len() == 1 => {

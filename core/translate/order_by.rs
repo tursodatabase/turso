@@ -192,8 +192,12 @@ impl EmitOrderBy {
             .all(|(e, _, _)| is_orderby_agg_or_const(&t_ctx.resolver, e, aggregates));
 
         let has_explicit_nulls = order_by.iter().any(|(_, _, nulls)| nulls.is_some());
-        let use_heap_sort =
-            !has_distinct && !has_group_by && t_ctx.limit_ctx.is_some() && !has_explicit_nulls;
+        let use_heap_sort = !has_distinct
+            && !has_group_by
+            && t_ctx
+                .limit_ctx
+                .is_some_and(|limit_ctx| limit_ctx.initialize_counter)
+            && !has_explicit_nulls;
 
         // only emit sequence column if (we have GROUP BY and ORDER BY is not only aggregates or constants) OR (we decided to use heap-sort)
         let has_sequence = (has_group_by && !only_aggs) || use_heap_sort;

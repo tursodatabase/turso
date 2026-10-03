@@ -299,6 +299,15 @@ pub fn translate_condition_expr(
         ast::Expr::Collate(_, _) => {
             crate::bail_parse_error!("Collate in WHERE clause is not supported");
         }
+        ast::Expr::SubqueryColumnValue { expr, .. } => {
+            translate_condition_expr(
+                program,
+                referenced_tables,
+                expr,
+                condition_metadata,
+                resolver,
+            )?;
+        }
         ast::Expr::DoublyQualified(_, _, _) | ast::Expr::Id(_) | ast::Expr::Qualified(_, _) => {
             crate::bail_parse_error!(
                 "DoublyQualified/Id/Qualified should have been rewritten to Column during binding"

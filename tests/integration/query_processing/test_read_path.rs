@@ -1066,6 +1066,50 @@ fn test_parameter_column_names(tmp_db: TempDatabase) {
     }
 }
 
+/// A result column that reads a FROM-clause subquery column keeps the name it
+/// has in SQLite after the optimizer merges the subquery into the outer query.
+#[turso_macros::test(mvcc)]
+fn test_merged_subquery_column_names(tmp_db: TempDatabase) {
+    let setup = "CREATE TABLE t(a, b); CREATE VIEW v AS SELECT a AS x, b + 1 AS y FROM t;";
+    let queries = [
+        "SELECT s.x, x, s.x + 0, a FROM (SELECT a AS x, a FROM t) s",
+        "SELECT * FROM v",
+        "SELECT v.x, y FROM v",
+        "WITH c AS (SELECT b AS z FROM t) SELECT z, c.z FROM c",
+    ];
+    let settings = [
+        "PRAGMA full_column_names = 0; PRAGMA short_column_names = 1;",
+        "PRAGMA full_column_names = 1; PRAGMA short_column_names = 0;",
+        "PRAGMA full_column_names = 0; PRAGMA short_column_names = 0;",
+    ];
+
+    let sqlite_conn = rusqlite::Connection::open_in_memory().unwrap();
+    sqlite_conn.execute_batch(setup).unwrap();
+    let conn = tmp_db.connect_limbo();
+    for statement in setup.split_inclusive(';') {
+        conn.execute(statement).unwrap();
+    }
+    for setting in settings {
+        sqlite_conn.execute_batch(setting).unwrap();
+        for statement in setting.split_inclusive(';') {
+            conn.execute(statement).unwrap();
+        }
+        for sql in queries {
+            let sqlite_stmt = sqlite_conn.prepare(sql).unwrap();
+            let expected: Vec<String> = sqlite_stmt
+                .column_names()
+                .into_iter()
+                .map(String::from)
+                .collect();
+            let stmt = conn.prepare(sql).unwrap();
+            let names: Vec<String> = (0..stmt.num_columns())
+                .map(|i| stmt.get_column_name(i).to_string())
+                .collect();
+            assert_eq!(names, expected, "column names for `{sql}` with `{setting}`");
+        }
+    }
+}
+
 /// A fused column-range read (Insn::ColumnRange) must stay correct when
 /// `cursor.record()` yields IO mid-instruction. Records spanning many
 /// overflow pages are scanned through a reopened database whose IO only

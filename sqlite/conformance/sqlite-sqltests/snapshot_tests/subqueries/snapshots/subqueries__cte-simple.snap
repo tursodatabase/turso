@@ -18,6 +18,5 @@ info:
   database: ':memory:'
 ---
 QUERY PLAN
-|--SCAN high_value_products
-|  `--SCAN products
+|--SCAN products
 `--USE SORTER FOR ORDER BY

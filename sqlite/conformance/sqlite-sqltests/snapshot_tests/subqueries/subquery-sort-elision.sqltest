@@ -489,7 +489,7 @@ expect {
 @setup elision_schema
 snapshot-eqp eqp-outer-orderby-elided-by-cte {
     WITH ordered AS (
-        SELECT x, y FROM t1 ORDER BY x
+        SELECT x, y FROM t1 ORDER BY x LIMIT -1
     )
     SELECT * FROM ordered ORDER BY x;
 }
@@ -498,9 +498,9 @@ snapshot-eqp eqp-outer-orderby-elided-by-cte {
 @setup elision_schema
 snapshot-eqp eqp-multi-hop-outer-orderby-elided {
     WITH step1 AS (
-        SELECT x, y FROM t1 ORDER BY x
+        SELECT x, y FROM t1 ORDER BY x LIMIT -1
     ),
-    step2 AS (
+    step2 AS MATERIALIZED (
         SELECT x, y FROM step1
     )
     SELECT * FROM step2 ORDER BY x;
@@ -519,7 +519,7 @@ snapshot-eqp eqp-outer-orderby-elided-by-group {
 @setup elision_schema
 snapshot-eqp eqp-window-sort-elided-by-cte-order {
     WITH ordered AS (
-        SELECT x, y FROM t1 ORDER BY x
+        SELECT x, y FROM t1 ORDER BY x LIMIT -1
     )
     SELECT x, SUM(y) OVER (ORDER BY x) AS running
     FROM ordered;
@@ -529,9 +529,9 @@ snapshot-eqp eqp-window-sort-elided-by-cte-order {
 @setup elision_schema
 snapshot-eqp eqp-window-sort-elided-multi-hop {
     WITH step1 AS (
-        SELECT x, y FROM t1 ORDER BY x
+        SELECT x, y FROM t1 ORDER BY x LIMIT -1
     ),
-    step2 AS (
+    step2 AS MATERIALIZED (
         SELECT x, y FROM step1
     )
     SELECT x, SUM(y) OVER (ORDER BY x) AS running
@@ -552,7 +552,7 @@ snapshot-eqp eqp-window-sort-elided-by-group {
 @setup elision_schema
 snapshot-eqp eqp-outer-orderby-not-elided-no-cte-order {
     WITH unordered AS (
-        SELECT x, y FROM t1
+        SELECT x, y FROM t1 LIMIT -1
     )
     SELECT * FROM unordered ORDER BY x;
 }
@@ -561,7 +561,7 @@ snapshot-eqp eqp-outer-orderby-not-elided-no-cte-order {
 @setup elision_schema
 snapshot-eqp eqp-outer-orderby-not-elided-partial {
     WITH ordered AS (
-        SELECT x, y FROM t1 ORDER BY x
+        SELECT x, y FROM t1 ORDER BY x LIMIT -1
     )
     SELECT * FROM ordered ORDER BY x, y;
 }
@@ -570,7 +570,7 @@ snapshot-eqp eqp-outer-orderby-not-elided-partial {
 @setup elision_schema
 snapshot-eqp eqp-window-sort-not-elided-partial {
     WITH ordered AS (
-        SELECT x, y FROM t1 ORDER BY x
+        SELECT x, y FROM t1 ORDER BY x LIMIT -1
     )
     SELECT x, y, SUM(y) OVER (ORDER BY x, y) AS running
     FROM ordered;
@@ -580,7 +580,7 @@ snapshot-eqp eqp-window-sort-not-elided-partial {
 @setup elision_schema
 snapshot-eqp eqp-window-sort-not-elided-no-cte-order {
     WITH unordered AS (
-        SELECT x, y FROM t1
+        SELECT x, y FROM t1 LIMIT -1
     )
     SELECT x, SUM(y) OVER (ORDER BY x) AS running
     FROM unordered;

@@ -4,7 +4,7 @@ use crate::{
     function::{AccumulatorFunc, AggFunc},
     schema::Table,
     sync::Arc,
-    translate::collate::CollationSeq,
+    translate::collate::{subquery_column_value_collation, CollationSeq},
     vdbe::{
         builder::ProgramBuilder,
         insn::{AggStepData, HashDistinctData, Insn},
@@ -205,6 +205,9 @@ pub(crate) fn agg_arg_collation(
     resolver: &Resolver,
 ) -> CollationSeq {
     // Check if this is a column expression with explicit COLLATE clause
+    if let ast::Expr::SubqueryColumnValue { collation, .. } = expr {
+        return subquery_column_value_collation(collation);
+    }
     if let ast::Expr::Collate(_, collation_name) = expr {
         if let Ok(collation) = resolver.resolve_collation(collation_name.as_str()) {
             return collation;
