@@ -542,6 +542,7 @@ impl Plan {
 
     /// Returns true if this plan or any of its subplans read from the given table.
     /// (Not for Delete/Update plans)
+    #[recursive::recursive]
     fn reads_table(&self, database_id: usize, table_name: &str) -> bool {
         match self {
             Plan::Select(select_plan) => select_plan.reads_table(database_id, table_name),
@@ -3761,6 +3762,7 @@ impl NonFromClauseSubquery {
 }
 
 /// Determine the earliest evaluation point for a nested plan by walking all SELECT components.
+#[recursive::recursive]
 fn eval_at_for_plan(
     plan: &Plan,
     join_order: &[JoinOrderMember],
@@ -3800,6 +3802,7 @@ fn eval_at_for_plan(
 }
 
 /// Returns true if a plan (including compound SELECTs) references outer-scope tables.
+#[recursive::recursive]
 pub fn plan_is_correlated(plan: &Plan) -> bool {
     match plan {
         Plan::Select(select_plan) => select_plan.is_correlated(),
@@ -3866,6 +3869,7 @@ fn select_plan_has_outer_scope_dependency_with_tables(
     has_outer_scope_dependency
 }
 
+#[recursive::recursive]
 fn plan_has_outer_scope_dependency_with_tables(
     plan: &Plan,
     accessible_table_ids: &mut Vec<TableInternalId>,

@@ -62,11 +62,14 @@ struct CteDefinition {
     references_itself: bool,
 }
 
-fn collect_cte_definitions(with: With, program: &mut ProgramBuilder) -> Result<Vec<CteDefinition>> {
+fn collect_cte_definitions(
+    mut with: With,
+    program: &mut ProgramBuilder,
+) -> Result<Vec<CteDefinition>> {
     let mut definitions = Vec::with_capacity(with.ctes.len());
     let mut referenced_table_names_by_cte = Vec::with_capacity(with.ctes.len());
 
-    for cte in with.ctes {
+    for cte in std::mem::take(&mut with.ctes) {
         let name = normalize_ident(cte.tbl_name.as_str());
         if definitions
             .iter()
@@ -111,6 +114,7 @@ fn collect_cte_definitions(with: With, program: &mut ProgramBuilder) -> Result<V
 
 /// Collect all table names referenced in a SELECT's FROM clause.
 /// Used to determine which earlier CTEs a CTE directly depends on.
+#[recursive::recursive]
 fn collect_from_clause_table_refs(select: &Select, out: &mut Vec<String>) {
     collect_from_select_body(&select.body, out);
     collect_subquery_table_refs_in_select_exprs(select, out);
@@ -181,6 +185,7 @@ impl RecursiveRefCounter<'_> {
         }
     }
 
+    #[recursive::recursive]
     fn count_select(&self, select: &Select, scope: &mut RecursiveRefScope) -> usize {
         let scope_base = scope.len();
         self.push_nested_ctes(select.with.as_ref(), scope);
@@ -250,6 +255,7 @@ impl RecursiveRefCounter<'_> {
         }
     }
 
+    #[recursive::recursive]
     fn count_from_table(&self, table: &ast::SelectTable, scope: &mut RecursiveRefScope) -> usize {
         match table {
             ast::SelectTable::Table(name, _, _) => {
@@ -326,6 +332,7 @@ impl RecursiveRefCounter<'_> {
     /// recursive CTE body: direct references to the recursive table in the
     /// arm's FROM clause, and all references reachable from the arm.
     fn count_arm(&self, one: &ast::OneSelect, scope: &mut RecursiveRefScope) -> (usize, usize) {
+        #[recursive::recursive]
         fn count_direct_in_from_table(
             counter: &RecursiveRefCounter,
             table: &ast::SelectTable,
@@ -374,6 +381,7 @@ impl RecursiveRefCounter<'_> {
     }
 }
 
+#[recursive::recursive]
 fn collect_from_select_table(table: &ast::SelectTable, out: &mut Vec<String>) {
     match table {
         ast::SelectTable::Table(qualified_name, _, _) => {

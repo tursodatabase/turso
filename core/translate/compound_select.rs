@@ -259,6 +259,7 @@ pub fn emit_program_for_compound_select(
 // Emits bytecode for a compound SELECT statement. This function processes the rightmost part of
 // the compound SELECT and handles the left parts recursively based on the compound operator type.
 #[allow(clippy::too_many_arguments)]
+#[recursive::recursive]
 fn emit_compound_select(
     program: &mut ProgramBuilder,
     left: &mut [(SelectPlan, CompoundOperator)],

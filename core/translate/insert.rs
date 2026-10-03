@@ -241,12 +241,12 @@ pub fn translate_insert(
     // path which goes through translate_select and handles CTEs properly.
     // We also keep a copy for RETURNING clause subqueries.
     let with_for_returning = with.clone();
-    if let Some(insert_with) = with {
+    if let Some(mut insert_with) = with {
         if let InsertBody::Select(select, _) = &mut body {
             match &mut select.with {
                 Some(select_with) => {
                     // Prepend INSERT's CTEs to SELECT's CTEs
-                    let mut merged = insert_with.ctes;
+                    let mut merged = std::mem::take(&mut insert_with.ctes);
                     merged.append(&mut select_with.ctes);
                     select_with.ctes = merged;
                     select_with.recursive |= insert_with.recursive;

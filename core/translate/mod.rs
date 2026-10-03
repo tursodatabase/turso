@@ -154,6 +154,7 @@ pub fn translate(
 // statements, we would have to return a program builder instead
 /// Translate SQL statement into bytecode program.
 #[turso_macros::trace_stack(detail = stmt_kind(&stmt))]
+#[recursive::recursive]
 pub fn translate_inner(
     stmt: ast::Stmt,
     resolver: &mut Resolver,

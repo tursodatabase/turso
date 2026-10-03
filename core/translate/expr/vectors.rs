@@ -1,6 +1,7 @@
 use super::*;
 
 /// Get the number of values returned by an expression
+#[recursive::recursive]
 pub fn expr_vector_size(expr: &Expr) -> Result<usize> {
     Ok(match unwrap_parens(expr)? {
         Expr::Between {

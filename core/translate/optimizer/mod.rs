@@ -692,6 +692,7 @@ fn subquery_resources(plan: &Plan) -> SubqueryResources {
         }
     }
 
+    #[recursive::recursive]
     fn add_plan(plan: &Plan, resources: &mut SubqueryResources) {
         match plan {
             Plan::Select(plan) => add_select(plan, resources),
@@ -969,6 +970,7 @@ fn rewritten_form_is_emittable(rewritten: &SelectPlan) -> bool {
 }
 
 #[turso_macros::trace_stack]
+#[recursive::recursive]
 fn optimize_select_plan_with_cache(
     plan: &mut SelectPlan,
     resolver: &Resolver,
