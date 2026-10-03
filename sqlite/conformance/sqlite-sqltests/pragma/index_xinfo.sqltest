@@ -83,3 +83,17 @@ expect {
     0|0|a|0|BINARY|1
     1|-1||0|BINARY|0
 }
+
+# Regression test for #9066: in SQLite the rowid entry of an index (cid = -1) has
+# a NULL name, not an empty string. typeof() is in the query because the runner
+# prints NULL and an empty string the same way.
+@cross-check-integrity
+test pragma-index-xinfo-rowid-name-is-null {
+    CREATE TABLE t1(a, b, c);
+    CREATE INDEX idx1 ON t1(b);
+    SELECT seqno, cid, name, typeof(name) FROM pragma_index_xinfo('idx1');
+}
+expect {
+    0|1|b|text
+    1|-1||null
+}
