@@ -1,4 +1,5 @@
 mod test_cdc;
+mod test_create_function;
 mod test_json_malformed_blob;
 mod test_sum;
 mod test_uuid;

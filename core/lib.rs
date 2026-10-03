@@ -81,6 +81,7 @@ mod stats;
 #[cfg(feature = "time")]
 mod time;
 mod translate;
+mod udf;
 mod util;
 #[cfg(feature = "uuid")]
 mod uuid;

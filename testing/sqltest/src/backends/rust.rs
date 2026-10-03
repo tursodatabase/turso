@@ -14,6 +14,7 @@ const TURSO_RUST_EXPERIMENTAL_FEATURES: &[&str] = &[
     "index_method",
     "views",
     "custom_types",
+    "udfs",
     "generated_columns",
     "vacuum",
     "without_rowid",
@@ -26,6 +27,7 @@ fn apply_turso_experimental_features(mut builder: Builder) -> Builder {
             "index_method" => builder.experimental_index_method(true),
             "views" => builder.experimental_materialized_views(true),
             "custom_types" => builder.experimental_custom_types(true),
+            "udfs" => builder.experimental_udfs(true),
             "generated_columns" => builder.experimental_generated_columns(true),
             "vacuum" => builder.experimental_vacuum(true),
             "without_rowid" => builder.experimental_without_rowid(true),
@@ -85,6 +87,7 @@ impl SqlBackend for RustBackend {
             Capability::Trigger,
             Capability::MaterializedViews,
             Capability::CustomTypes,
+            Capability::Udfs,
         ])
     }
 
