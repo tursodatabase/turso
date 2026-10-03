@@ -215,10 +215,15 @@ impl Affinity {
         let is_text = matches!(val, ValueRef::Text(_));
         // Apply affinity conversions
         match self {
-            Affinity::Numeric | Affinity::Integer => is_text
-                .then(|| apply_numeric_affinity(val, false))
-                .flatten()
-                .map(Either::Left),
+            Affinity::Numeric | Affinity::Integer => {
+                if is_text {
+                    apply_numeric_affinity(val, true).map(Either::Left)
+                } else if let ValueRef::Numeric(Numeric::Float(_)) = val {
+                    apply_integer_affinity(val).map(Either::Left)
+                } else {
+                    None
+                }
+            }
 
             Affinity::Text => {
                 // TEXT affinity: Convert numeric values to their text representation
