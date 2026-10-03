@@ -351,3 +351,26 @@ test lateral-is-a-name-outside-a-from-item {
 expect {
     1
 }
+
+test rename-column-rewrites-a-lateral-subquery-in-a-view {
+    CREATE TABLE t1(a);
+    INSERT INTO t1 VALUES (1), (2);
+    CREATE VIEW v1 AS SELECT s.b FROM t1, LATERAL (SELECT t1.a * 3 AS b) AS s;
+    ALTER TABLE t1 RENAME COLUMN a TO c;
+    SELECT * FROM v1;
+}
+expect {
+    3
+    6
+}
+
+test rename-column-rewrites-a-lateral-subquery-in-a-trigger {
+    CREATE TABLE t1(a);
+    CREATE TABLE t2(b);
+    CREATE TRIGGER tr1 AFTER INSERT ON t2 BEGIN INSERT INTO t2 SELECT s.c FROM t1 AS x, LATERAL (SELECT x.a * 10 AS c) AS s WHERE NEW.b = 0; END;
+    ALTER TABLE t1 RENAME COLUMN a TO d;
+    SELECT sql FROM sqlite_schema WHERE name = 'tr1';
+}
+expect {
+    CREATE TRIGGER tr1 AFTER INSERT ON t2 BEGIN INSERT INTO t2 SELECT s.c FROM t1 AS x, LATERAL (SELECT x.d * 10 AS c) AS s WHERE NEW.b = 0; END
+}
