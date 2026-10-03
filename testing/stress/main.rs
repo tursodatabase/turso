@@ -31,6 +31,7 @@ use crate::progress::ProgressBars;
 use crate::sql_logging::SqlLogger;
 use turso::core::clear_database_registry;
 use turso::{Builder, Value};
+use turso_macros::turso_assert_reachable;
 use turso_stress::ThreadId;
 
 /// Represents a column in a SQLite table
@@ -811,6 +812,9 @@ async fn async_main(opts: Opts) -> Result<(), Box<dyn std::error::Error + Send +
                     }
 
                     const INTEGRITY_CHECK_INTERVAL: usize = 100;
+                    if opts.skip_integrity_check {
+                        integrity_check_reachable();
+                    }
                     if !opts.skip_integrity_check && interaction_idx % INTEGRITY_CHECK_INTERVAL == 0
                     {
                         let sql = "PRAGMA integrity_check";
@@ -826,6 +830,7 @@ async fn async_main(opts: Opts) -> Result<(), Box<dyn std::error::Error + Send +
                         match result {
                             Ok(rows) if rows == [Value::Text("ok".into())] => {
                                 sql_logger.log(&thread, sql, "OK");
+                                integrity_check_reachable();
                             }
                             Ok(rows) if rows.is_empty() => {
                                 sql_logger.log(&thread, sql, "ERROR: no rows");
@@ -933,6 +938,10 @@ async fn async_main(opts: Opts) -> Result<(), Box<dyn std::error::Error + Send +
     }
 
     Ok(())
+}
+
+fn integrity_check_reachable() {
+    turso_assert_reachable!("integrity check should complete at least once when it's not disabled");
 }
 
 #[cfg(all(test, not(shuttle)))]
