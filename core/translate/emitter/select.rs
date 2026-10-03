@@ -38,7 +38,11 @@ pub fn emit_program_for_select(
     resolver: &Resolver,
     plan: SelectPlan,
 ) -> Result<()> {
-    emit_program_for_select_with_resolver(program, resolver.fork(), plan)
+    emit_program_for_select_with_resolver(
+        program,
+        resolver.fork_with_outer_column_cache(&plan.table_references),
+        plan,
+    )
 }
 
 pub fn emit_program_for_select_with_resolver(

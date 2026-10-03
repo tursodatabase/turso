@@ -295,6 +295,7 @@ fn translate_integrity_check_for_schema(
                 internal_id: table_ref_id,
                 join_info: None,
                 col_used_mask: ColumnUsedMask::default(),
+                rowid_referenced: false,
                 column_use_counts: Vec::new(),
                 expression_index_usages: Vec::new(),
                 database_id,

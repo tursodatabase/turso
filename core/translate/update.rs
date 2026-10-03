@@ -283,6 +283,7 @@ fn prepare_update_plan(
         op: Operation::default_scan_for(&table),
         join_info: None,
         col_used_mask: ColumnUsedMask::default(),
+        rowid_referenced: false,
         column_use_counts: Vec::new(),
         expression_index_usages: Vec::new(),
         database_id,

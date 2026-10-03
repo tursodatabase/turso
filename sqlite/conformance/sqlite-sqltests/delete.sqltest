@@ -1,5 +1,22 @@
 @database :memory:
 
+@skip-if mvcc "ATTACH is not supported in MVCC mode"
+test delete-correlated-same-name-attached-table {
+    ATTACH ':memory:' AS aux;
+    CREATE TABLE main.target (id INTEGER);
+    CREATE TABLE aux.target (id INTEGER);
+    INSERT INTO main.target VALUES (1), (2);
+    INSERT INTO aux.target VALUES (2);
+    DELETE FROM main.target
+        WHERE EXISTS (SELECT 1 FROM aux.target WHERE main.target.id = aux.target.id);
+    SELECT id FROM main.target;
+    SELECT id FROM aux.target;
+}
+expect {
+    1
+    2
+}
+
 # Basic single row delete test
 @cross-check-integrity
 test delete-single-1 {
