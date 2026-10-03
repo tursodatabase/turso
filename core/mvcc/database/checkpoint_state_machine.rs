@@ -1292,24 +1292,6 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
                                 }
                             }
                         }
-                    } else if is_delete
-                        && version.row.id.table_id == SQLITE_SCHEMA_MVCC_TABLE_ID
-                        && !version.btree_resident
-                    {
-                        // Schema row without a B-tree identity (e.g. sequence, trigger, view).
-                        // If it was never checkpointed to the B-tree, skip the delete — there
-                        // is nothing to remove from the pager.
-                        let begin_ts = match &version.begin() {
-                            Some(TxTimestampOrID::Timestamp(ts)) => Some(*ts),
-                            _ => None,
-                        };
-                        let was_checkpointed =
-                            self.durable_txid_max_old.is_some_and(|txid_max_old| {
-                                begin_ts.is_some_and(|b| b <= u64::from(txid_max_old))
-                            });
-                        if !was_checkpointed {
-                            skip_write = true;
-                        }
                     } else if key.table_id != SQLITE_SCHEMA_MVCC_TABLE_ID
                         && is_delete
                         && !self.table_exists_for_snapshot(key.table_id)
