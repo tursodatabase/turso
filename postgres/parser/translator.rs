@@ -1818,7 +1818,11 @@ impl PostgreSQLTranslator {
             .alias
             .as_ref()
             .map(|a| ast::As::Elided(ast::Name::from_string(a.aliasname.clone())));
-        Ok(ast::SelectTable::Select(select, alias))
+        Ok(ast::SelectTable::Select {
+            select,
+            alias,
+            lateral: false,
+        })
     }
 
     fn translate_range_function(
@@ -1930,7 +1934,11 @@ impl PostgreSQLTranslator {
                 order_by: vec![],
                 limit: None,
             };
-            return Ok(ast::SelectTable::Select(select, alias));
+            return Ok(ast::SelectTable::Select {
+                select,
+                alias,
+                lateral: false,
+            });
         }
 
         Ok(ast::SelectTable::TableCall(
@@ -6215,7 +6223,10 @@ mod tests {
                 assert_eq!(from_clause.joins.len(), 1, "Should have one join");
                 let join = &from_clause.joins[0];
                 assert!(
-                    matches!(join.table.as_ref(), ast::SelectTable::Select(_, Some(_))),
+                    matches!(
+                        join.table.as_ref(),
+                        ast::SelectTable::Select { alias: Some(_), .. }
+                    ),
                     "Join RHS should be a subquery with alias"
                 );
             } else {
