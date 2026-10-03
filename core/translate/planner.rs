@@ -21,6 +21,7 @@ use crate::translate::{
         BindingBehavior, WalkControl,
     },
     plan::{NonFromClauseSubquery, SubqueryState},
+    subquery::outer_query_refs_for_correlated_subquery,
 };
 use crate::{
     ast::Limit,
@@ -1611,20 +1612,24 @@ fn parse_from_clause_table(
             alias: maybe_alias,
             lateral,
         } => {
-            if lateral {
-                crate::bail_parse_error!("LATERAL subqueries are not supported");
-            }
+            let lateral = lateral && !table_references.joined_tables().is_empty();
+            let mut outer_query_refs_for_subquery: Vec<OuterQueryReference> = if lateral {
+                outer_query_refs_for_correlated_subquery(table_references)?
+                    .into_iter()
+                    .collect()
+            } else {
+                table_references.outer_query_refs().to_vec()
+            };
             // Make the parent's CTEs visible while planning this inline subquery.
-            let mut outer_query_refs_for_subquery = table_references.outer_query_refs().to_vec();
             let base_outer_query_refs_for_subquery = base_outer_refs_for_cte_planning(
                 table_references.outer_query_refs(),
                 cte_definitions,
             );
             for (cte_definition_index, cte_definition) in cte_definitions.iter().enumerate() {
-                if outer_query_refs_for_subquery
+                let name_used_by_table_on_the_left = outer_query_refs_for_subquery
                     .iter()
-                    .any(|reference| reference.identifier == cte_definition.name)
-                {
+                    .any(|reference| reference.identifier == cte_definition.name);
+                if name_used_by_table_on_the_left && !lateral {
                     continue;
                 }
                 // This plan only makes the name visible. A later FROM lookup performs
@@ -1648,21 +1653,31 @@ fn parse_from_clause_table(
                         .then(|| cte_definition.select.clone()),
                     cte_explicit_columns: cte_definition.explicit_columns.clone(),
                     cte_id: Some(cte_definition.cte_id),
-                    cte_definition_only: false,
+                    cte_definition_only: name_used_by_table_on_the_left,
                     rowid_referenced: false,
                     outer_join_may_null_extend: false,
                     scope_depth: 0,
                 });
             }
 
-            let subplan = prepare_select_plan(
-                subselect,
-                resolver,
-                program,
-                &outer_query_refs_for_subquery,
-                QueryDestination::placeholder_for_subquery(),
-                connection,
-            )?;
+            let subplan = if lateral {
+                prepare_lateral_subquery_plan(
+                    subselect,
+                    resolver,
+                    program,
+                    &outer_query_refs_for_subquery,
+                    connection,
+                )?
+            } else {
+                prepare_select_plan(
+                    subselect,
+                    resolver,
+                    program,
+                    &outer_query_refs_for_subquery,
+                    QueryDestination::placeholder_for_subquery(),
+                    connection,
+                )?
+            };
             match &subplan {
                 Plan::Select(_) | Plan::CompoundSelect { .. } | Plan::RecursiveCte(_) => {}
                 Plan::Delete(_) | Plan::Update(_) => {
@@ -1932,6 +1947,32 @@ fn parenthesized_join_result_column(expr: Expr, column_name: &str) -> ResultSetC
         implicit_column_name: None,
         contains_aggregates: false,
     }
+}
+
+fn prepare_lateral_subquery_plan(
+    select: Select,
+    resolver: &Resolver,
+    program: &mut ProgramBuilder,
+    outer_query_refs: &[OuterQueryReference],
+    connection: &Arc<crate::Connection>,
+) -> Result<Plan> {
+    resolver.begin_collecting_aggregates_from_subqueries();
+    let plan = prepare_select_plan(
+        select,
+        resolver,
+        program,
+        outer_query_refs,
+        QueryDestination::placeholder_for_subquery(),
+        connection,
+    );
+    let aggregates_of_the_enclosing_query = resolver.take_aggregates_from_subqueries();
+    let plan = plan?;
+    if !aggregates_of_the_enclosing_query.is_empty() {
+        crate::bail_parse_error!(
+            "aggregate functions are not allowed in FROM clause of their own query level"
+        );
+    }
+    Ok(plan)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2890,10 +2931,20 @@ fn parse_join(
         cte_definitions,
         connection,
     )?;
+    let lateral_reference = left_table_read_by_rightmost_table(table_references).map(str::to_owned);
 
     let is_cross = matches!(join_operator, ast::JoinOperator::TypedJoin(Some(jt)) if jt.contains(JoinType::CROSS));
 
     let plan_join_type = PlanJoinType::from_join_operator(&join_operator);
+    if let Some(table) = lateral_reference
+        .as_ref()
+        .filter(|_| plan_join_type.keeps_right_rows())
+    {
+        crate::bail_parse_error!(
+            "invalid reference to FROM-clause entry for table \"{table}\": \
+             the combining JOIN type must be INNER or LEFT for a LATERAL reference"
+        );
+    }
     let natural = matches!(
         join_operator,
         ast::JoinOperator::TypedJoin(Some(join_type))
@@ -3044,6 +3095,7 @@ fn parse_join(
         join_type: plan_join_type,
         using,
         no_reorder: is_cross,
+        lateral: lateral_reference.is_some(),
     });
 
     Ok(())
@@ -3085,6 +3137,21 @@ fn find_left_using_column(
             (table.internal_id, &table.table, column_index)
         },
     ))))
+}
+
+fn left_table_read_by_rightmost_table(table_references: &TableReferences) -> Option<&str> {
+    let (last_table, tables_on_its_left) = table_references
+        .joined_tables()
+        .split_last()
+        .expect("the joined table was just added");
+    let Table::FromClauseSubquery(subquery) = &last_table.table else {
+        return None;
+    };
+    let read_table_ids = subquery.plan.used_outer_query_ref_ids();
+    tables_on_its_left
+        .iter()
+        .find(|table| read_table_ids.contains(&table.internal_id))
+        .map(|table| table.identifier.as_str())
 }
 
 pub(crate) fn append_vtab_predicates_to_where_clause(

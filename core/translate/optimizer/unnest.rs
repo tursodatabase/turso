@@ -414,6 +414,7 @@ fn rewrite_as_semi_or_anti_join(
                 join_type,
                 using: vec![],
                 no_reorder: false,
+                lateral: false,
             });
         }
         plan.table_references.add_joined_table(table);
@@ -632,6 +633,7 @@ fn try_rewrite_single_value_aggregate(
             join_type: JoinType::LeftOuter,
             using: vec![],
             no_reorder: false,
+            lateral: false,
         }),
         subquery_id,
     )?;
@@ -776,6 +778,7 @@ fn rewrite_aggregate_as_join_then_group(
         join_type: JoinType::LeftOuter,
         using: vec![],
         no_reorder: false,
+        lateral: false,
     });
     plan.table_references.add_joined_table(inner_table);
 
