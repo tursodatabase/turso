@@ -1173,6 +1173,14 @@ expect {
     2.0|real
     1|text
 }
+expect @js {
+    |null
+    1|integer
+    1|real
+    2|integer
+    2|real
+    1|text
+}
 
 @setup dedup
 test union-order-by-desc-keeps-first-duplicate {
@@ -1224,6 +1232,20 @@ expect {
     2.0
     2
     2.0
+    1
+    1
+}
+expect @js {
+    
+    
+    1
+    1
+    1
+    1
+    2
+    2
+    2
+    2
     1
     1
 }
