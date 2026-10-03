@@ -79,6 +79,7 @@ the exact display string. `op` adds the structured fields, discriminated by
 | `compound` / `compound_arm`          | compound select and its arms            | `op` (`union_all`/`union`/`intersect`/`except`/`left_most`), `temp_btree`                                                                            |
 | `list_subquery` / `scalar_subquery`  | `IN (SELECT ...)` / scalar subquery     | `subquery_id`, `correlated`                                                                                                                          |
 | `recursive_setup` / `recursive_step` | recursive CTE phases                    |                                                                                                                                                      |
+| `cte_materialize`                  | CTE evaluated once before the main loop | `name`                                                                                                                                               |
 | `constant_row`                       | query with no FROM clause               |                                                                                                                                                      |
 
 Fields that are absent are simply omitted (e.g. `join` on the first table,
