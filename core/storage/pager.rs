@@ -3445,6 +3445,7 @@ impl Pager {
                 _ => {
                     return_if_io!(self.commit_wal(
                         connection.wal_auto_actions(),
+                        connection.get_wal_autocheckpoint(),
                         sync_mode,
                         connection.get_data_sync_retry(),
                     ));
@@ -4488,6 +4489,7 @@ impl Pager {
     pub fn commit_wal(
         &self,
         allowed_auto_actions: WalAutoActions,
+        checkpoint_threshold: u32,
         sync_mode: SyncMode,
         data_sync_retry: bool,
     ) -> IOResultOr<()> {
@@ -4503,7 +4505,12 @@ impl Pager {
             return Ok(IOResult::IO(c));
         }
 
-        let result = self.commit_wal_inner(allowed_auto_actions, sync_mode, data_sync_retry);
+        let result = self.commit_wal_inner(
+            allowed_auto_actions,
+            checkpoint_threshold,
+            sync_mode,
+            data_sync_retry,
+        );
         if result.is_err() {
             self.commit_info.write().reset();
         }
@@ -4519,6 +4526,7 @@ impl Pager {
     fn commit_wal_inner(
         &self,
         allowed_auto_actions: WalAutoActions,
+        checkpoint_threshold: u32,
         sync_mode: SyncMode,
         data_sync_retry: bool,
     ) -> IOResultOr<()> {
@@ -4780,7 +4788,7 @@ impl Pager {
                     commit_info.prepared_frames.clear();
 
                     let need_checkpoint = allowed_auto_actions.contains(WalAutoActions::Checkpoint)
-                        && wal.should_checkpoint();
+                        && wal.should_checkpoint(checkpoint_threshold);
                     if need_checkpoint {
                         commit_info.state = CommitState::AutoCheckpoint;
                     }

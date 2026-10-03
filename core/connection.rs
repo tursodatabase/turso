@@ -5,7 +5,9 @@ use crate::mvcc::yield_points::{FailureInjector, YieldInjector};
 use crate::statement::StatementOrigin;
 use crate::storage::{journal_mode, pager::SavepointResult};
 use crate::sync::{
-    atomic::{AtomicBool, AtomicI32, AtomicI64, AtomicIsize, AtomicU64, AtomicU8, Ordering},
+    atomic::{
+        AtomicBool, AtomicI32, AtomicI64, AtomicIsize, AtomicU32, AtomicU64, AtomicU8, Ordering,
+    },
     Arc, Mutex, RwLock,
 };
 use crate::types::IOResultOr;
@@ -410,6 +412,7 @@ pub struct Connection {
     /// because rotating the WAL header invalidates their published
     /// watermarks.
     pub(super) wal_auto_actions: AtomicU8,
+    pub(super) wal_autocheckpoint: AtomicU32,
     /// Whether MVCC commits should include portable logical-change metadata in
     /// the logical log.
     ///
@@ -2328,6 +2331,7 @@ impl Connection {
                     .block(|| {
                         return_if_io!(pager.commit_wal(
                             WalAutoActions::empty(),
+                            self.get_wal_autocheckpoint(),
                             self.get_sync_mode(),
                             self.get_data_sync_retry(),
                         ));
@@ -2497,6 +2501,10 @@ impl Connection {
             return WalAutoActions::empty();
         }
         WalAutoActions::from_bits_truncate(self.wal_auto_actions.load(Ordering::SeqCst))
+    }
+
+    pub(crate) fn get_wal_autocheckpoint(&self) -> u32 {
+        self.wal_autocheckpoint.load(Ordering::SeqCst)
     }
 
     /// Publish the connection's current schema snapshot to the shared database
