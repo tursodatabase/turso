@@ -45,7 +45,7 @@ QUERY PLAN
 |--SCAN profit
 |  |--MATERIALIZE hash build input for partsupp
 |  |  |--SCAN part
-|  |  `--SEARCH partsupp USING INDEX sqlite_autoindex_partsupp_1 (ps_partkey=?)
+|  |  `--SEARCH partsupp USING INDEX sqlite_autoindex_PARTSUPP_1 (ps_partkey=?)
 |  |--HASH JOIN lineitem
 |  |--SEARCH orders USING INTEGER PRIMARY KEY (rowid=?)
 |  |--SEARCH supplier USING INTEGER PRIMARY KEY (rowid=?)

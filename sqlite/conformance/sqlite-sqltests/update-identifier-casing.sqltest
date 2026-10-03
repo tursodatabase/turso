@@ -1,0 +1,424 @@
+@database :memory:
+
+@cross-check-integrity
+test qualified-update-target-is-case-insensitive {
+    CREATE TABLE ConnectionHistory(ID INTEGER, Name TEXT);
+    INSERT INTO ConnectionHistory VALUES(1, 'before');
+    UPDATE ConnectionHistory
+       SET Name = 'after'
+     WHERE ConnectionHistory.ID = 1;
+    SELECT ID, Name FROM ConnectionHistory;
+}
+expect {
+    1|after
+}
+
+@cross-check-integrity
+test quoted-qualified-update-target-is-case-insensitive {
+    CREATE TABLE "ConnectionHistory"("ID" INTEGER, "Name" TEXT);
+    INSERT INTO "ConnectionHistory" VALUES(1, 'before');
+    UPDATE "ConnectionHistory"
+       SET "Name" = 'after'
+     WHERE "ConnectionHistory"."ID" = 1;
+    SELECT "ID", "Name" FROM "ConnectionHistory";
+}
+expect {
+    1|after
+}
+
+@cross-check-integrity
+test mixed-case-update-alias-is-case-insensitive {
+    CREATE TABLE ConnectionHistory(ID INTEGER, Name TEXT);
+    INSERT INTO ConnectionHistory VALUES(1, 'before');
+    UPDATE ConnectionHistory AS HistoryAlias
+       SET Name = 'after'
+     WHERE historyalias.ID = 1;
+    SELECT ID, Name FROM ConnectionHistory;
+}
+expect {
+    1|after
+}
+
+@cross-check-integrity
+test qualified-update-target-is-visible-in-correlated-subquery {
+    CREATE TABLE ConnectionHistory(ID INTEGER, Name TEXT);
+    INSERT INTO ConnectionHistory VALUES(1, 'before');
+    UPDATE ConnectionHistory
+       SET Name = 'after'
+     WHERE EXISTS (
+       SELECT 1
+        WHERE CONNECTIONHISTORY.ID = 1
+     );
+    SELECT ID, Name FROM ConnectionHistory;
+}
+expect {
+    1|after
+}
+
+@cross-check-integrity
+test mixed-case-update-returning-uses-base-table-name {
+    CREATE TABLE ConnectionHistory(ID INTEGER, Name TEXT);
+    INSERT INTO ConnectionHistory VALUES(1, 'before');
+    UPDATE ConnectionHistory AS HistoryAlias
+       SET Name = 'after'
+     WHERE historyalias.ID = 1
+    RETURNING CONNECTIONHISTORY.ID, Name;
+}
+expect {
+    1|after
+}
+
+@cross-check-integrity
+test rdm-minimal-trigger-qualified-update {
+    CREATE TABLE Connections(ID guid PRIMARY KEY, DATA TEXT, Name TEXT);
+    CREATE TABLE ConnectionHistory(ID guid, DATA TEXT, Name TEXT);
+    CREATE TRIGGER ConnectionsInsert AFTER INSERT ON Connections BEGIN
+      UPDATE ConnectionHistory SET Name='R' WHERE ConnectionHistory.ID=NEW.ID;
+      INSERT INTO ConnectionHistory(ID,DATA,Name) VALUES(NEW.ID,NEW.DATA,NEW.Name);
+    END;
+    INSERT INTO Connections(ID,DATA,Name) VALUES(X'33221100554477668899AABBCCDDEEFF','synthetic-baseline','synthetic connection');
+    SELECT hex(ID), DATA, Name FROM ConnectionHistory ORDER BY rowid;
+}
+expect {
+    33221100554477668899AABBCCDDEEFF|synthetic-baseline|synthetic connection
+}
+
+@cross-check-integrity
+test rdm-v155-insert-trigger-body {
+    CREATE TABLE DatabaseInfo(ConnectionCacheID BLOB);
+    INSERT INTO DatabaseInfo VALUES(NULL);
+    CREATE TABLE Connections(
+      ID guid PRIMARY KEY,
+      DATA TEXT,
+      SecurityGroup TEXT,
+      CustomerID TEXT,
+      ConnectionType TEXT,
+      ConnectionSubType TEXT,
+      GroupName TEXT,
+      Name TEXT,
+      UnsafePassword TEXT,
+      DataSourceID TEXT,
+      MetaData TEXT,
+      CreationDate TEXT,
+      Description TEXT,
+      ModifiedDate TEXT,
+      ModifiedUsername TEXT,
+      ModifiedLoggedUserName TEXT,
+      ParentID TEXT
+    );
+    CREATE TABLE ConnectionHistory(
+      HistoryType TEXT,
+      ConnectionID guid,
+      DATA TEXT,
+      SecurityGroup TEXT,
+      CustomerID TEXT,
+      ConnectionType TEXT,
+      ConnectionSubType TEXT,
+      GroupName TEXT,
+      Name TEXT,
+      UnsafePassword TEXT,
+      DataSourceID TEXT,
+      MetaData TEXT,
+      CreationDate TEXT,
+      Description TEXT,
+      ModifiedDate TEXT,
+      ModifiedUsername TEXT,
+      ModifiedLoggedUserName TEXT,
+      ParentID TEXT
+    );
+    INSERT INTO ConnectionHistory(HistoryType, ConnectionID, Name)
+    VALUES('D', X'33221100554477668899AABBCCDDEEFF', 'deleted');
+    CREATE TRIGGER IF NOT EXISTS Connections_Trigger_Insert INSERT ON Connections
+    BEGIN
+        UPDATE DatabaseInfo SET ConnectionCacheID = randomblob(16);
+        UPDATE ConnectionHistory
+        SET HistoryType = 'R'
+        WHERE ConnectionHistory.ConnectionID = new.ID
+          and ConnectionHistory.HistoryType = 'D';
+        insert into ConnectionHistory (HistoryType, ConnectionID, DATA, SecurityGroup, CustomerID, ConnectionType, ConnectionSubType, GroupName, Name, UnsafePassword, DataSourceID, MetaData, CreationDate, Description, ModifiedDate, ModifiedUsername, ModifiedLoggedUserName, ParentID)
+        select 'I', new.ID, new.DATA, new.SecurityGroup, new.CustomerID, new.ConnectionType, new.ConnectionSubType, new.GroupName, new.Name, new.UnsafePassword, new.DataSourceID, new.MetaData, new.CreationDate, new.Description, ifnull(new.ModifiedDate, datetime('now')), new.ModifiedUsername, new.ModifiedLoggedUserName, new.ParentID;
+    END;
+    INSERT INTO Connections(ID, DATA, Name)
+    VALUES(X'33221100554477668899AABBCCDDEEFF', 'current', 'restored');
+    SELECT HistoryType, hex(ConnectionID), DATA, Name
+      FROM ConnectionHistory
+     ORDER BY rowid;
+    SELECT name, tbl_name
+      FROM sqlite_schema
+     WHERE name = 'Connections_Trigger_Insert';
+}
+expect {
+    R|33221100554477668899AABBCCDDEEFF||deleted
+    I|33221100554477668899AABBCCDDEEFF|current|restored
+    Connections_Trigger_Insert|Connections
+}
+
+@cross-check-integrity
+test sqlite-schema-preserves-table-trigger-and-autoindex-casing {
+    CREATE TABLE Connections(ID guid PRIMARY KEY, DATA TEXT, Name TEXT);
+    CREATE TABLE ConnectionHistory(ID guid, DATA TEXT, Name TEXT);
+    CREATE TRIGGER ConnectionsInsert AFTER INSERT ON Connections BEGIN
+      UPDATE ConnectionHistory SET Name='R' WHERE ConnectionHistory.ID=NEW.ID;
+      INSERT INTO ConnectionHistory(ID,DATA,Name) VALUES(NEW.ID,NEW.DATA,NEW.Name);
+    END;
+    SELECT type, name, tbl_name
+      FROM sqlite_schema
+     WHERE name IN (
+       'ConnectionHistory',
+       'Connections',
+       'ConnectionsInsert',
+       'sqlite_autoindex_Connections_1'
+     )
+     ORDER BY type DESC, name;
+}
+expect {
+    trigger|ConnectionsInsert|Connections
+    table|ConnectionHistory|ConnectionHistory
+    table|Connections|Connections
+    index|sqlite_autoindex_Connections_1|Connections
+}
+
+@cross-check-integrity
+test mixed-case-catalog-objects-can-be-dropped-case-insensitively {
+    CREATE TABLE Connections(ID guid PRIMARY KEY);
+    CREATE TRIGGER ConnectionsInsert AFTER INSERT ON Connections BEGIN
+      SELECT NEW.ID;
+    END;
+    DROP TRIGGER connectionsinsert;
+    DROP TABLE connections;
+    SELECT count(*)
+      FROM sqlite_schema
+     WHERE name IN (
+       'Connections',
+       'ConnectionsInsert',
+       'sqlite_autoindex_Connections_1'
+     );
+}
+expect {
+    0
+}
+
+@cross-check-integrity
+test sqlite-schema-preserves-user-index-casing {
+    CREATE TABLE Connections(ID INTEGER, Name TEXT);
+    CREATE INDEX ConnectionNameIndex ON Connections(Name);
+    SELECT type, name, tbl_name
+      FROM sqlite_schema
+     WHERE name = 'ConnectionNameIndex';
+    PRAGMA index_list(Connections);
+}
+expect {
+    index|ConnectionNameIndex|Connections
+    0|ConnectionNameIndex|0|c|0
+}
+
+@cross-check-integrity
+test sqlite-schema-renames-mixed-case-table-and-index {
+    CREATE TABLE Connections(ID TEXT PRIMARY KEY, Name TEXT);
+    CREATE INDEX ConnectionNameIndex ON Connections(Name);
+    ALTER TABLE connections RENAME TO RenamedConnections;
+    SELECT type, name, tbl_name
+      FROM sqlite_schema
+     WHERE name IN (
+       'RenamedConnections',
+       'ConnectionNameIndex',
+       'sqlite_autoindex_RenamedConnections_1'
+     )
+     ORDER BY type DESC, name;
+    PRAGMA index_list(RenamedConnections);
+}
+expect {
+    table|RenamedConnections|RenamedConnections
+    index|ConnectionNameIndex|RenamedConnections
+    index|sqlite_autoindex_RenamedConnections_1|RenamedConnections
+    0|ConnectionNameIndex|0|c|0
+    1|sqlite_autoindex_RenamedConnections_1|1|pk|0
+}
+
+@cross-check-integrity
+test mixed-case-user-index-can-be-dropped-case-insensitively {
+    CREATE TABLE Connections(ID INTEGER, Name TEXT);
+    CREATE INDEX ConnectionNameIndex ON Connections(Name);
+    DROP INDEX connectionnameindex;
+    SELECT count(*)
+      FROM sqlite_schema
+     WHERE type = 'index'
+       AND name = 'ConnectionNameIndex';
+}
+expect {
+    0
+}
+
+@cross-check-integrity
+test attached-index-uses-attached-table-display-casing {
+    CREATE TABLE SharedName(ID INTEGER, Name TEXT);
+    ATTACH ':memory:' AS aux;
+    CREATE TABLE aux.sHaReDnAmE(ID INTEGER, Name TEXT);
+    CREATE INDEX aux.AuxNameIndex ON sHaReDnAmE(Name);
+    SELECT name, tbl_name
+      FROM aux.sqlite_schema
+     WHERE type = 'index';
+}
+expect {
+    AuxNameIndex|sHaReDnAmE
+}
+
+@cross-check-integrity
+test temp-index-uses-temp-table-display-casing {
+    CREATE TABLE SharedName(ID INTEGER, Name TEXT);
+    CREATE TEMP TABLE sHaReDnAmE(ID INTEGER, Name TEXT);
+    CREATE INDEX temp.TempNameIndex ON sHaReDnAmE(Name);
+    SELECT name, tbl_name
+      FROM temp.sqlite_schema
+     WHERE type = 'index';
+}
+expect {
+    TempNameIndex|sHaReDnAmE
+}
+
+@cross-check-integrity
+test quoted-index-catalog-names-omit-identifier-quotes {
+    CREATE TABLE "QuotedTable"("ID" INTEGER, "Name" TEXT);
+    CREATE INDEX "QuotedNameIndex" ON "QuotedTable"("Name");
+    SELECT name, tbl_name
+      FROM sqlite_schema
+     WHERE type = 'index';
+}
+expect {
+    QuotedNameIndex|QuotedTable
+}
+
+@cross-check-integrity
+test table-rename-does-not-rewrite-another-table-autoindex-prefix {
+    CREATE TABLE Foo(ID TEXT PRIMARY KEY);
+    CREATE TABLE Foo_Bar(ID TEXT PRIMARY KEY);
+    ALTER TABLE foo RENAME TO RenamedFoo;
+    SELECT name, tbl_name
+      FROM sqlite_schema
+     WHERE type = 'index'
+     ORDER BY name;
+}
+expect {
+    sqlite_autoindex_Foo_Bar_1|Foo_Bar
+    sqlite_autoindex_RenamedFoo_1|RenamedFoo
+}
+
+@cross-check-integrity
+test table-rename-does-not-rename-same-named-trigger {
+    CREATE TABLE Foo(ID INTEGER);
+    CREATE TABLE Bar(ID INTEGER);
+    CREATE TRIGGER Foo AFTER INSERT ON Bar BEGIN
+      SELECT NEW.ID;
+    END;
+    ALTER TABLE foo RENAME TO RenamedFoo;
+    SELECT type, name, tbl_name
+      FROM sqlite_schema
+     WHERE name IN ('Foo', 'RenamedFoo')
+     ORDER BY type;
+}
+expect {
+    table|RenamedFoo|RenamedFoo
+    trigger|Foo|Bar
+}
+
+@cross-check-integrity
+test table-rename-preserves-display-casing-in-check-qualifier {
+    CREATE TABLE OldName(A INTEGER, CHECK(OldName.A > 0));
+    ALTER TABLE oldname RENAME TO New_MiXeD;
+    SELECT instr(sql, '"New_MiXeD".A') > 0
+      FROM sqlite_schema
+     WHERE type = 'table'
+       AND name = 'New_MiXeD';
+}
+expect {
+    1
+}
+
+@cross-check-integrity
+test later-column-rename-keeps-table-display-casing-in-trigger-sql {
+    CREATE TABLE OldName(A INTEGER);
+    CREATE TABLE Driver(X INTEGER);
+    CREATE TRIGGER MixedTrigger AFTER INSERT ON Driver BEGIN
+      UPDATE OldName SET A=NEW.X WHERE OldName.A=0;
+    END;
+    ALTER TABLE oldname RENAME TO New_MiXeD;
+    ALTER TABLE new_mixed RENAME COLUMN A TO B;
+    SELECT instr(sql, 'New_MiXeD') > 0,
+           instr(sql, 'new_mixed') = 0
+      FROM sqlite_schema
+     WHERE type = 'trigger'
+       AND name = 'MixedTrigger';
+}
+expect {
+    1|1
+}
+
+@cross-check-integrity
+test later-column-rename-keeps-on-table-display-casing-in-trigger-sql {
+    CREATE TABLE OldName(A INTEGER);
+    CREATE TRIGGER MixedTrigger AFTER UPDATE ON OldName BEGIN
+      UPDATE OldName SET A=NEW.A WHERE OldName.A=OLD.A;
+    END;
+    ALTER TABLE oldname RENAME TO New_MiXeD;
+    ALTER TABLE new_mixed RENAME COLUMN A TO B;
+    SELECT instr(sql, 'ON "New_MiXeD"') > 0,
+           instr(sql, 'UPDATE "New_MiXeD"') > 0,
+           instr(sql, 'new_mixed') = 0
+      FROM sqlite_schema
+     WHERE type = 'trigger'
+       AND name = 'MixedTrigger';
+}
+expect {
+    1|1|1
+}
+
+@cross-check-integrity
+test table-rename-handles-unicode-explicit-index-name {
+    CREATE TABLE Foo(ID INTEGER);
+    CREATE INDEX "abcdefghijklmnopqrsté" ON Foo(ID);
+    ALTER TABLE Foo RENAME TO Bar;
+    SELECT name, tbl_name
+      FROM sqlite_schema
+     WHERE type = 'index';
+    SELECT ID FROM Bar;
+}
+expect {
+    abcdefghijklmnopqrsté|Bar
+}
+
+@cross-check-integrity
+test add-column-after-rename-keeps-table-display-casing {
+    CREATE TABLE Foo(A INTEGER, B INTEGER);
+    ALTER TABLE Foo RENAME TO New_MiXeD;
+    ALTER TABLE new_mixed ADD COLUMN C INTEGER;
+    SELECT name,
+           tbl_name,
+           instr(sql, 'CREATE TABLE "New_MiXeD"') = 1
+      FROM sqlite_schema
+     WHERE type = 'table'
+       AND name = 'New_MiXeD';
+}
+expect {
+    New_MiXeD|New_MiXeD|1
+}
+
+test analyze-uses-mixed-case-index-statistics {
+    CREATE TABLE AnalyzeNames(a INTEGER, b INTEGER);
+    WITH RECURSIVE n(x) AS (
+      VALUES(1)
+      UNION ALL
+      SELECT x + 1 FROM n WHERE x < 10000
+    )
+    INSERT INTO AnalyzeNames SELECT 1, x FROM n;
+    CREATE INDEX GoodIndex ON AnalyzeNames(b);
+    CREATE INDEX BadIndex ON AnalyzeNames(a);
+    ANALYZE;
+    EXPLAIN QUERY PLAN
+      SELECT *
+        FROM AnalyzeNames
+       WHERE a = 1
+         AND b = 9999;
+}
+expect pattern {
+    USING INDEX GoodIndex
+}

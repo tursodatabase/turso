@@ -26,8 +26,8 @@ use crate::{
         trigger::create_trigger_to_sql,
     },
     util::{
-        check_expr_references_column, escape_sql_string_literal, normalize_ident,
-        parse_numeric_literal, rename_identifiers, rewrite_check_expr_table_refs,
+        check_expr_references_column, double_quoted_name, escape_sql_string_literal,
+        normalize_ident, parse_numeric_literal, rename_identifiers, rewrite_check_expr_table_refs,
         rewrite_trigger_cmd_table_refs, rewrite_view_sql_for_column_rename,
     },
     vdbe::{
@@ -865,6 +865,13 @@ pub fn translate_alter_table(
     program.begin_write_on_database(database_id, schema_cookie)?;
     program.begin_write_operation()?;
     let table_name = qualified_name.name.as_str();
+    let table_sql_name = resolver.with_schema(database_id, |schema| {
+        schema
+            .table_sql_names
+            .get(&normalize_ident(table_name))
+            .cloned()
+            .unwrap_or_else(|| table_name.to_owned())
+    });
     // For attached databases, qualify sqlite_schema with the database name
     // so that the UPDATE targets the correct database's schema table.
     let qualified_schema_table = schema_table_name_for_db(resolver, database_id);
@@ -883,12 +890,11 @@ pub fn translate_alter_table(
     };
     if let Some(tbl) = table.virtual_table() {
         if let ast::AlterTableBody::RenameTo(new_name) = &alter_table {
-            let new_name_norm = normalize_ident(new_name.as_str());
             return translate_rename_virtual_table(
                 program,
                 tbl,
                 table_name,
-                new_name_norm,
+                new_name.as_str().to_string(),
                 resolver,
                 connection,
                 database_id,
@@ -1152,7 +1158,7 @@ pub fn translate_alter_table(
 
             btree.columns_mut().remove(dropped_index);
 
-            let sql = escape_sql_string_literal(&btree.to_sql());
+            let sql = escape_sql_string_literal(&btree.to_sql_with_name_sql(&table_sql_name));
 
             let escaped_table_name = escape_sql_string_literal(table_name);
             let stmt = format!(
@@ -1438,7 +1444,7 @@ pub fn translate_alter_table(
             // visible to the empty-table check below.
             column = btree.columns().last().unwrap().clone();
 
-            let escaped = escape_sql_string_literal(&btree.to_sql());
+            let escaped = escape_sql_string_literal(&btree.to_sql_with_name_sql(&table_sql_name));
             let escaped_table_name = escape_sql_string_literal(table_name);
             let stmt = format!(
                 r#"
@@ -2636,7 +2642,7 @@ fn translate_rename_virtual_table(
     program: &mut ProgramBuilder,
     vtab: Arc<VirtualTable>,
     old_name: &str,
-    new_name_norm: String,
+    new_name: String,
     resolver: &Resolver,
     connection: &Arc<crate::Connection>,
     database_id: usize,
@@ -2648,7 +2654,7 @@ fn translate_rename_virtual_table(
         cursor_id: vtab_cur,
     });
 
-    let new_name_reg = program.emit_string8_new_reg(new_name_norm.clone());
+    let new_name_reg = program.emit_string8_new_reg(new_name.clone());
     program.emit_insn(Insn::VRename {
         cursor_id: vtab_cur,
         new_name_reg,
@@ -2680,7 +2686,7 @@ fn translate_rename_virtual_table(
         program.emit_string8_new_reg(old_name.to_string());
         program.mark_last_insn_constant();
 
-        program.emit_string8_new_reg(new_name_norm.clone());
+        program.emit_string8_new_reg(new_name.clone());
         program.mark_last_insn_constant();
 
         let out = program.alloc_registers(ncols);
@@ -2734,7 +2740,7 @@ fn translate_rename_virtual_table(
     program.emit_insn(Insn::RenameTable {
         db: database_id,
         from: old_name.to_owned(),
-        to: new_name_norm,
+        to: new_name,
     });
 
     program.emit_insn(Insn::Close {
@@ -2804,7 +2810,7 @@ fn rewrite_trigger_sql_for_table_rename(
         if qualifier_matches && tbl_name.name.as_str().eq_ignore_ascii_case(old_table_name) {
             ast::QualifiedName {
                 db_name: tbl_name.db_name,
-                name: ast::Name::exact(new_table_name.to_string()),
+                name: double_quoted_name(new_table_name),
                 alias: None,
             }
         } else {
@@ -3034,6 +3040,7 @@ fn rewrite_trigger_sql_for_column_rename(
             trigger_name.name.as_str().to_string(),
             new_sql.clone(),
             tbl_name.name.as_str().to_string(),
+            tbl_name.name.to_string(),
             time,
             new_event,
             for_each_row,

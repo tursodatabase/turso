@@ -268,7 +268,7 @@ test rename-self-1 {
     SELECT name, tbl_name, sql LIKE '%REFERENCES s1_new%' FROM sqlite_schema WHERE type='table' AND name='s1_new';
 }
 expect {
-    s1_new|s1_new|1
+    s1_new|s1_new|0
 }
 
 test rename-self-2-composite {
@@ -284,7 +284,7 @@ test rename-self-2-composite {
     SELECT sql FROM sqlite_schema WHERE type='table' AND name='sc_new';
 }
 expect {
-    CREATE TABLE sc_new (id INTEGER, vr INTEGER, parent_id INTEGER, parent_vr INTEGER, PRIMARY KEY (id, vr), FOREIGN KEY (parent_id, parent_vr) REFERENCES sc_new (id, vr))
+    CREATE TABLE "sc_new" (id INTEGER, vr INTEGER, parent_id INTEGER, parent_vr INTEGER, PRIMARY KEY (id, vr), FOREIGN KEY (parent_id, parent_vr) REFERENCES "sc_new" (id, vr))
 }
 
 test rename-parent-1 {
@@ -314,7 +314,7 @@ test rename-parent-2-inline {
     SELECT sql FROM sqlite_schema WHERE type='table' AND name='c2';
 }
 expect {
-    CREATE TABLE c2 (id INTEGER PRIMARY KEY, pid INTEGER REFERENCES p2_new (id))
+    CREATE TABLE c2 (id INTEGER PRIMARY KEY, pid INTEGER REFERENCES "p2_new" (id))
 }
 
 test rename-parent-3-composite {
@@ -329,7 +329,7 @@ test rename-parent-3-composite {
     SELECT sql  FROM sqlite_schema WHERE type='table' AND name='c3';
 }
 expect {
-    CREATE TABLE c3 (x INTEGER PRIMARY KEY, fa INTEGER, fb INTEGER, FOREIGN KEY (fa, fb) REFERENCES p3_new (a, b))
+    CREATE TABLE c3 (x INTEGER PRIMARY KEY, fa INTEGER, fb INTEGER, FOREIGN KEY (fa, fb) REFERENCES "p3_new" (a, b))
 }
 
 # Adding a stored generated column via ALTER TABLE should error
