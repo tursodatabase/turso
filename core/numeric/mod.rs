@@ -919,6 +919,16 @@ pub fn format_float(v: f64) -> String {
 }
 
 pub fn format_float_for_quote(v: f64) -> String {
+    if v.is_nan() {
+        return "NULL".to_string();
+    }
+    if v.is_infinite() {
+        return if v.is_sign_negative() {
+            "-9.0e+999".to_string()
+        } else {
+            "9.0e+999".to_string()
+        };
+    }
     let default = format_float(v);
     if str_to_f64(&default).map(f64::from) == Some(v) {
         return default;
@@ -935,6 +945,15 @@ fn test_decode_float() {
     assert_eq!(format_float(0.0), "0.0");
     assert_eq!(format_float(4.94e-322), "4.94065645841247e-322");
     assert_eq!(format_float(-20228007.0), "-20228007.0");
+}
+
+#[test]
+fn test_format_float_for_quote() {
+    assert_eq!(format_float_for_quote(f64::INFINITY), "9.0e+999");
+    assert_eq!(format_float_for_quote(f64::NEG_INFINITY), "-9.0e+999");
+    assert_eq!(format_float_for_quote(f64::NAN), "NULL");
+    assert_eq!(format_float_for_quote(12.34), "12.34");
+    assert_eq!(format_float_for_quote(0.0), "0.0");
 }
 
 #[test]
