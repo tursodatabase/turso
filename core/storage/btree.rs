@@ -11455,7 +11455,7 @@ mod tests {
         )
         .unwrap();
         run_until_done(
-            || pager.commit_tx(&conn, conn.get_sync_mode(), true),
+            || pager.commit_tx(&conn, conn.get_sync_mode(), true, false),
             &pager,
         )
         .unwrap();
@@ -11910,7 +11910,7 @@ mod tests {
                 .unwrap();
                 pager
                     .io
-                    .block(|| pager.commit_tx(&conn, conn.get_sync_mode(), true))
+                    .block(|| pager.commit_tx(&conn, conn.get_sync_mode(), true, false))
                     .unwrap();
                 pager.begin_read_tx().unwrap();
                 // FIXME: add sorted vector instead, should be okay for small amounts of keys for now :P, too lazy to fix right now
@@ -12052,7 +12052,7 @@ mod tests {
                 }
                 pager
                     .io
-                    .block(|| pager.commit_tx(&conn, conn.get_sync_mode(), true))
+                    .block(|| pager.commit_tx(&conn, conn.get_sync_mode(), true, false))
                     .unwrap();
             }
 
@@ -12287,7 +12287,7 @@ mod tests {
                 }
                 pager
                     .io
-                    .block(|| pager.commit_tx(&conn, conn.get_sync_mode(), true))
+                    .block(|| pager.commit_tx(&conn, conn.get_sync_mode(), true, false))
                     .unwrap();
             }
 
@@ -12616,7 +12616,7 @@ mod tests {
             }
             pager
                 .io
-                .block(|| pager.commit_tx(&conn, conn.get_sync_mode(), true))
+                .block(|| pager.commit_tx(&conn, conn.get_sync_mode(), true, false))
                 .unwrap();
 
             // Full scan: every key must appear exactly once.

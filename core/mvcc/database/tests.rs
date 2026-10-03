@@ -9879,7 +9879,7 @@ fn test_checkpoint_index_writer_overwrites_existing_interior_key() {
         .unwrap();
     }
     run_pager_until_done(
-        || pager.commit_tx(&db.conn, db.conn.get_sync_mode(), true),
+        || pager.commit_tx(&db.conn, db.conn.get_sync_mode(), true, false),
         pager.as_ref(),
     )
     .unwrap();
@@ -9936,7 +9936,7 @@ fn test_checkpoint_index_writer_overwrites_existing_interior_key() {
         }
     }
     run_pager_until_done(
-        || pager.commit_tx(&db.conn, db.conn.get_sync_mode(), true),
+        || pager.commit_tx(&db.conn, db.conn.get_sync_mode(), true, false),
         pager.as_ref(),
     )
     .unwrap();
