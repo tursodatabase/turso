@@ -600,63 +600,13 @@ fn plan_subqueries_with_outer_query_access<'a>(
     same_query_map: &mut Vec<(ast::Expr, TableInternalId, SubqueryOrigin)>,
     shared: &[ast::Expr],
 ) -> Result<()> {
-    // Most subqueries can reference columns from the outer query,
-    // including nested cases where a subquery inside a subquery references columns from its parent's parent
-    // and so on.
-    let get_outer_query_refs = |referenced_tables: &TableReferences| {
-        let outer_refs = referenced_tables
-            .joined_tables()
-            .iter()
-            .map(|t| {
-                // Extract cte_id from FromClauseSubquery if this is a CTE reference
-                let cte_id = match &t.table {
-                    Table::FromClauseSubquery(subq) => subq.cte_id(),
-                    _ => None,
-                };
-                let outer_ref = OuterQueryReference {
-                    table: t.table.clone(),
-                    identifier: t.identifier.clone(),
-                    internal_id: t.internal_id,
-                    join_info: t.join_info.clone(),
-                    col_used_mask: ColumnUsedMask::default(),
-                    cte_select: None,
-                    cte_explicit_columns: Vec::new(),
-                    cte_id,
-                    cte_definition_only: false,
-                    rowid_referenced: false,
-                    outer_join_may_null_extend: referenced_tables
-                        .outer_join_may_null_extend(t.internal_id),
-                    scope_depth: 0,
-                };
-                Ok::<_, crate::LimboError>(outer_ref)
-            })
-            .chain(referenced_tables.outer_query_refs().iter().map(|t| {
-                Ok(OuterQueryReference {
-                    table: t.table.clone(),
-                    identifier: t.identifier.clone(),
-                    internal_id: t.internal_id,
-                    join_info: t.join_info.clone(),
-                    col_used_mask: ColumnUsedMask::default(),
-                    cte_select: t.cte_select.clone(),
-                    cte_explicit_columns: t.cte_explicit_columns.clone(),
-                    cte_id: t.cte_id, // Preserve CTE ID from outer query refs
-                    cte_definition_only: t.cte_definition_only,
-                    rowid_referenced: false,
-                    outer_join_may_null_extend: t.outer_join_may_null_extend,
-                    scope_depth: t.scope_depth + 1,
-                })
-            }))
-            .try_collect::<Result<crate::alloc::Vec<_>>>()??;
-        Ok(outer_refs)
-    };
-
     let mut subquery_parser = get_subquery_parser(
         program,
         out_subqueries,
         referenced_tables,
         resolver,
         connection,
-        get_outer_query_refs,
+        outer_query_refs_for_correlated_subquery,
         position,
         origin,
         allow_correlated,
@@ -669,6 +619,58 @@ fn plan_subqueries_with_outer_query_access<'a>(
     }
 
     Ok(())
+}
+
+/// Most subqueries can reference columns from the outer query,
+/// including nested cases where a subquery inside a subquery references columns from its parent's parent
+/// and so on.
+fn outer_query_refs_for_correlated_subquery(
+    referenced_tables: &TableReferences,
+) -> Result<crate::alloc::Vec<OuterQueryReference>> {
+    let outer_refs = referenced_tables
+        .joined_tables()
+        .iter()
+        .map(|t| {
+            // Extract cte_id from FromClauseSubquery if this is a CTE reference
+            let cte_id = match &t.table {
+                Table::FromClauseSubquery(subq) => subq.cte_id(),
+                _ => None,
+            };
+            let outer_ref = OuterQueryReference {
+                table: t.table.clone(),
+                identifier: t.identifier.clone(),
+                internal_id: t.internal_id,
+                join_info: t.join_info.clone(),
+                col_used_mask: ColumnUsedMask::default(),
+                cte_select: None,
+                cte_explicit_columns: Vec::new(),
+                cte_id,
+                cte_definition_only: false,
+                rowid_referenced: false,
+                outer_join_may_null_extend: referenced_tables
+                    .outer_join_may_null_extend(t.internal_id),
+                scope_depth: 0,
+            };
+            Ok::<_, crate::LimboError>(outer_ref)
+        })
+        .chain(referenced_tables.outer_query_refs().iter().map(|t| {
+            Ok(OuterQueryReference {
+                table: t.table.clone(),
+                identifier: t.identifier.clone(),
+                internal_id: t.internal_id,
+                join_info: t.join_info.clone(),
+                col_used_mask: ColumnUsedMask::default(),
+                cte_select: t.cte_select.clone(),
+                cte_explicit_columns: t.cte_explicit_columns.clone(),
+                cte_id: t.cte_id, // Preserve CTE ID from outer query refs
+                cte_definition_only: t.cte_definition_only,
+                rowid_referenced: false,
+                outer_join_may_null_extend: t.outer_join_may_null_extend,
+                scope_depth: t.scope_depth + 1,
+            })
+        }))
+        .try_collect::<Result<crate::alloc::Vec<_>>>()??;
+    Ok(outer_refs)
 }
 
 /// Collect every scalar-subquery (`ast::Expr::Subquery`) node that appears anywhere in `exprs`.
