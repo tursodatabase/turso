@@ -1045,14 +1045,6 @@ expect error {
     duplicate WITH table name
 }
 
-# @skip-if sqlite "sqlite supports recursive CTEs"
-# test cte-recursive-unsupported {
-#     WITH RECURSIVE cnt(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM cnt WHERE x<5) SELECT * FROM cnt;
-# }
-# expect error {
-#     Recursive CTEs are not yet supported
-# }
-#
 # @skip-if sqlite "sqlite supports materialized CTEs"
 # test cte-materialized-unsupported {
 #     WITH t AS MATERIALIZED (SELECT 1) SELECT * FROM t;
