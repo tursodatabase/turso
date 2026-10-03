@@ -1821,7 +1821,7 @@ impl PostgreSQLTranslator {
         Ok(ast::SelectTable::Select {
             select,
             alias,
-            lateral: false,
+            lateral: range_sub.lateral,
         })
     }
 
@@ -6183,6 +6183,29 @@ mod tests {
             (
                 "SELECT * FROM a, b CROSS JOIN c",
                 "SELECT * FROM a, b INNER JOIN c",
+            ),
+        ] {
+            let parsed = crate::parse(sql).unwrap();
+            let translated = translator.translate(&parsed).unwrap();
+            assert_eq!(translated.to_string(), expected);
+        }
+    }
+
+    #[test]
+    fn test_lateral_subquery() {
+        let translator = PostgreSQLTranslator::new();
+        for (sql, expected) in [
+            (
+                "SELECT * FROM t1, LATERAL (SELECT t1.a) s",
+                "SELECT * FROM t1, LATERAL (SELECT t1.a) s",
+            ),
+            (
+                "SELECT * FROM t1 LEFT JOIN LATERAL (SELECT t1.a) s ON true",
+                "SELECT * FROM t1 LEFT OUTER JOIN LATERAL (SELECT t1.a) s ON 1",
+            ),
+            (
+                "SELECT * FROM t1, (SELECT 1) s",
+                "SELECT * FROM t1, (SELECT 1) s",
             ),
         ] {
             let parsed = crate::parse(sql).unwrap();
