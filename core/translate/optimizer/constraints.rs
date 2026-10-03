@@ -2144,16 +2144,20 @@ pub(crate) fn summarize_binary_term_for_index(
     subqueries: &[NonFromClauseSubquery],
 ) -> Option<IndexableTermSummary> {
     let BinaryTermIndexInfo {
+        lhs,
+        rhs,
         operator,
         table_col_pos,
         constraining_expr,
         is_rowid,
         ..
     } = analyze_binary_term_index_info(expr, table_id, rowid_alias_column)?;
+    let comparison_collation = resolve_comparison_collseq(lhs, rhs, table_references).ok()?;
 
     let (best_index, constraint_refs) = find_best_index_for_constraint(
         table_col_pos,
         operator,
+        comparison_collation,
         indexes,
         rowid_alias_column,
         is_rowid,
@@ -2211,11 +2215,13 @@ pub(crate) fn analyze_binary_term_for_index(
         side,
         is_rowid,
     } = analyze_binary_term_index_info(expr, table_id, rowid_alias_column)?;
+    let comparison_collation = resolve_comparison_collseq(lhs, rhs, table_references).ok()?;
 
     // Find the best index for this constraint
     let (best_index, constraint_refs) = find_best_index_for_constraint(
         table_col_pos,
         operator,
+        comparison_collation,
         indexes,
         rowid_alias_column,
         is_rowid,
@@ -2298,9 +2304,11 @@ pub(crate) fn analyze_binary_term_for_index(
 }
 
 /// Find the best index for a single constraint.
+#[allow(clippy::too_many_arguments)]
 fn find_best_index_for_constraint(
     table_col_pos: Option<usize>,
     operator: ConstraintOperator,
+    comparison_collation: CollationSeq,
     indexes: Option<&VecDeque<Arc<Index>>>,
     rowid_alias_column: Option<usize>,
     is_rowid: bool,
@@ -2378,7 +2386,9 @@ fn find_best_index_for_constraint(
             if let Some(idx_col_pos) = index.column_table_pos_to_index_pos(col_pos) {
                 // For multi-index OR, we prefer indexes where the constraint column
                 // is the first column (leftmost prefix)
-                if idx_col_pos == 0 {
+                if idx_col_pos == 0
+                    && index.columns[0].collation.unwrap_or_default() == comparison_collation
+                {
                     let constraint_ref = RangeConstraintRef {
                         table_col_pos: Some(col_pos),
                         index_col_pos: 0,
