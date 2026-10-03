@@ -1,0 +1,57 @@
+@database :memory:
+
+setup binary-and-nocase-tables {
+    CREATE TABLE q(x, y TEXT);
+    INSERT INTO q VALUES(1,'a'),(2,'B'),(NULL,'c'),('3','z');
+    CREATE TABLE p(x, y TEXT COLLATE NOCASE);
+    INSERT INTO p VALUES(1,'A'),(2,'b'),(NULL,'C'),(3,NULL),(2,'B'),(1.0,'a');
+}
+
+@setup binary-and-nocase-tables
+test intersect-uses-left-column-binary-collation {
+    SELECT y FROM q INTERSECT SELECT y FROM p;
+}
+expect {
+    B
+    a
+}
+
+@setup binary-and-nocase-tables
+test except-uses-left-column-binary-collation {
+    SELECT y FROM q EXCEPT SELECT y FROM p;
+}
+expect {
+    c
+    z
+}
+
+@setup binary-and-nocase-tables
+test union-uses-left-column-binary-collation {
+    SELECT y FROM q UNION SELECT y FROM p;
+}
+expect {
+
+    A
+    B
+    C
+    a
+    b
+    c
+    z
+}
+
+@setup binary-and-nocase-tables
+test union-all-order-by-uses-left-column-binary-collation {
+    SELECT y FROM q UNION ALL SELECT y FROM p WHERE y IS NOT NULL ORDER BY 1;
+}
+expect {
+    A
+    B
+    B
+    C
+    a
+    a
+    b
+    c
+    z
+}
