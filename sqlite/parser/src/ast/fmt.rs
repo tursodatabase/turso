@@ -1501,7 +1501,14 @@ impl ToTokens for SelectTable {
                 }
                 Ok(())
             }
-            Self::Select(select, alias) => {
+            Self::Select {
+                select,
+                alias,
+                lateral,
+            } => {
+                if *lateral {
+                    s.append(TK_LATERAL, None)?;
+                }
                 s.append(TK_LP, None)?;
                 select.to_tokens(s, context)?;
                 s.append(TK_RP, None)?;

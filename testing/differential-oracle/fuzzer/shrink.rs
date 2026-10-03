@@ -719,7 +719,7 @@ fn walk_select_table(table: &mut SelectTable, f: &mut dyn FnMut(&mut Expr) -> bo
             }
             false
         }
-        SelectTable::Select(select, _) => walk_select(select, f),
+        SelectTable::Select { select, .. } => walk_select(select, f),
         SelectTable::Sub(from, _) => walk_from(from, f),
     }
 }
@@ -834,13 +834,13 @@ fn walk_from_sites(
     from: &mut turso_parser::ast::FromClause,
     f: &mut dyn FnMut(&mut Site<'_>) -> bool,
 ) -> bool {
-    if let SelectTable::Select(select, _) = &mut *from.select {
+    if let SelectTable::Select { select, .. } = &mut *from.select {
         if walk_select_sites(select, f) {
             return true;
         }
     }
     for join in &mut from.joins {
-        if let SelectTable::Select(select, _) = &mut *join.table {
+        if let SelectTable::Select { select, .. } = &mut *join.table {
             if walk_select_sites(select, f) {
                 return true;
             }

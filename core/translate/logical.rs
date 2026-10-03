@@ -614,7 +614,14 @@ impl<'a> LogicalPlanBuilder<'a> {
                     projection: None,
                 }))
             }
-            ast::SelectTable::Select(subquery, _alias) => self.build_select(subquery),
+            ast::SelectTable::Select {
+                select: subquery,
+                lateral: false,
+                ..
+            } => self.build_select(subquery),
+            ast::SelectTable::Select { lateral: true, .. } => Err(LimboError::ParseError(
+                "LATERAL subqueries are not supported in logical plans".to_string(),
+            )),
             ast::SelectTable::TableCall(_, _, _) => Err(LimboError::ParseError(
                 "Table-valued functions are not supported in logical plans".to_string(),
             )),
