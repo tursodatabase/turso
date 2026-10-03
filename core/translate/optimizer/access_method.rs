@@ -378,17 +378,15 @@ pub(super) fn choose_best_btree_candidate(
                 .flatten()
                 {
                     let c = &rhs_constraints.constraints[idx];
-                    mask = mask.iter().chain(c.lhs_mask.iter()).try_collect()?;
+                    mask.union_with(&c.lhs_mask)?;
                 }
             }
             mask
         };
         // Tables whose constraints this loop can account for: the loop's own
         // prerequisite tables plus the current table itself.
-        let allowed_mask: TableMask = loop_prereq_mask
-            .iter()
-            .chain(rhs_table_mask.iter())
-            .try_collect()?;
+        let mut allowed_mask = loop_prereq_mask;
+        allowed_mask.union_with(&rhs_table_mask)?;
 
         // Collect which constraint positions are consumed by the index seek.
         let consumed: SmallVec<[usize; 8]> = usable_constraint_refs

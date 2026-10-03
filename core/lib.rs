@@ -96,6 +96,9 @@ pub use function::MathFunc;
 /// formatting implementation.
 pub use functions::printf::{exec_printf_values, printf_c_arg_plan, PrintfCArg};
 
+#[cfg(any(feature = "fuzz", feature = "bench"))]
+pub use translate::plan::{BitSet, BitSetIter};
+
 use crate::{
     busy::{BusyHandler, BusyHandlerCallback},
     incremental::view::AllViewsTxState,
