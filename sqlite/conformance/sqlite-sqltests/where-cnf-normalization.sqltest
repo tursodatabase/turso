@@ -1,0 +1,191 @@
+@database :memory:
+
+# Conjunctive normal form conversion of WHERE, ON and HAVING predicates.
+#
+# The planner moves each NOT inwards and distributes ORs over ANDs, so that
+# conditions below a NOT or an OR become separate conditions that can drive an
+# index seek. SQL gives three truth values, so each rewrite must keep the NULL
+# behavior of the predicate it replaces. These tests run against SQLite too,
+# which is the reference for that behavior.
+
+setup cnf {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, a INTEGER, b INTEGER, s TEXT);
+    INSERT INTO t VALUES (1,1,1,'aa'),(2,1,NULL,'ab'),(3,NULL,2,NULL),(4,7,7,'zz'),(5,3,9,'am'),(6,NULL,NULL,'b'),(7,0,0,'c');
+    CREATE INDEX ta ON t(a);
+    CREATE INDEX tb ON t(b);
+    CREATE TABLE l(id INTEGER PRIMARY KEY, k INTEGER);
+    INSERT INTO l VALUES (1,1),(2,7),(3,NULL);
+}
+
+@setup cnf
+test not-over-or-of-ranges {
+    SELECT id FROM t WHERE NOT (a > 5 OR b > 5) ORDER BY id;
+}
+expect {
+    1
+    7
+}
+
+@setup cnf
+test not-over-and-of-inequalities {
+    SELECT id FROM t WHERE NOT (a <> 1 AND b <> 2) ORDER BY id;
+}
+expect {
+    1
+    2
+    3
+}
+
+@setup cnf
+test not-over-or-of-null-tests {
+    SELECT id FROM t WHERE NOT (a IS NULL OR b IS NULL) ORDER BY id;
+}
+expect {
+    1
+    4
+    5
+    7
+}
+
+@setup cnf
+test not-over-or-with-not-in {
+    SELECT id FROM t WHERE NOT (a NOT IN (1,3) OR b > 5) ORDER BY id;
+}
+expect {
+    1
+}
+
+@setup cnf
+test not-over-or-with-not-like {
+    SELECT id FROM t WHERE NOT (s NOT LIKE 'a%' OR a > 5) ORDER BY id;
+}
+expect {
+    1
+    2
+    5
+}
+
+@setup cnf
+test not-over-or-with-not-between {
+    SELECT id FROM t WHERE NOT (a NOT BETWEEN 1 AND 3 OR b > 5) ORDER BY id;
+}
+expect {
+    1
+}
+
+@setup cnf
+test not-over-or-of-is-tests {
+    SELECT id FROM t WHERE NOT (a IS 1 OR b IS NOT 7) ORDER BY id;
+}
+expect {
+    4
+}
+
+@setup cnf
+test two-nots-cancel {
+    SELECT id FROM t WHERE NOT (NOT (a = 1)) ORDER BY id;
+}
+expect {
+    1
+    2
+}
+
+@setup cnf
+test shared-condition-in-or-branches {
+    SELECT id FROM t WHERE (a = 1 AND b = 1) OR (a = 1 AND b = 9) ORDER BY id;
+}
+expect {
+    1
+}
+
+@setup cnf
+test shared-condition-below-a-not {
+    SELECT id FROM t WHERE NOT ((a <> 1 OR b <> 1) AND (a <> 1 OR b <> 9)) ORDER BY id;
+}
+expect {
+    1
+}
+
+@setup cnf
+test or-branches-without-shared-condition {
+    SELECT id FROM t WHERE (a = 1 AND b = 1) OR (a = 3 AND b = 9) ORDER BY id;
+}
+expect {
+    1
+    5
+}
+
+@setup cnf
+test row-value-comparison-below-a-not {
+    SELECT id FROM t WHERE NOT ((a, b) = (1, 1)) ORDER BY id;
+}
+expect {
+    3
+    4
+    5
+    7
+}
+
+@setup cnf
+test not-over-or-of-column-truth-tests {
+    SELECT id FROM t WHERE NOT (a OR b) ORDER BY id;
+}
+expect {
+    7
+}
+
+@setup cnf
+test not-over-or-with-a-function-call {
+    SELECT id FROM t WHERE NOT (abs(a) > 5 OR b > 5) ORDER BY id;
+}
+expect {
+    1
+    7
+}
+
+@setup cnf
+test nested-or-parentheses {
+    SELECT id FROM t WHERE a = 1 OR (b = 2 OR b = 9) ORDER BY id;
+}
+expect {
+    1
+    2
+    3
+    5
+}
+
+@setup cnf
+test not-over-or-in-a-left-join-condition {
+    SELECT l.id, t.id FROM l LEFT JOIN t ON NOT (t.a <> l.k OR t.b > 5) ORDER BY l.id, t.id;
+}
+expect {
+    1|1
+    2|
+    3|
+}
+
+@setup cnf
+test not-over-or-in-a-where-clause-after-left-join {
+    SELECT l.id, t.id FROM l LEFT JOIN t ON t.a = l.k WHERE NOT (t.b <> 1 AND t.b <> 7) ORDER BY l.id, t.id;
+}
+expect {
+    1|1
+    2|4
+}
+
+@setup cnf
+test not-over-or-in-having {
+    SELECT a, count(*) FROM t GROUP BY a HAVING NOT (count(*) < 2 OR a IS NULL) ORDER BY a;
+}
+expect {
+    1|2
+}
+
+@setup cnf
+test not-over-or-with-a-subquery {
+    SELECT id FROM t WHERE NOT (a NOT IN (SELECT k FROM l) OR b > 5) ORDER BY id;
+}
+expect {
+    1
+}
+
