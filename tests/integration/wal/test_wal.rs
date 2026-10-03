@@ -1,8 +1,8 @@
-use crate::common::{compute_dbhash, do_flush, maybe_setup_tracing, TempDatabase};
+use crate::common::{compute_dbhash, do_flush, limbo_exec_rows, maybe_setup_tracing, TempDatabase};
 use asserting::prelude::*;
 use std::ops::Deref;
 use std::sync::{Arc, Mutex};
-use turso_core::{Connection, LimboError, Result};
+use turso_core::{CheckpointMode, Connection, LimboError, Result};
 
 #[allow(clippy::arc_with_non_send_sync)]
 #[turso_macros::test]
@@ -39,6 +39,34 @@ fn test_wal_checkpoint_result(tmp_db: TempDatabase) -> Result<()> {
     // A checkpoint must not change the database content.
     assert_that!(hash_after.hash).is_equal_to(hash_before.hash);
 
+    Ok(())
+}
+
+#[allow(clippy::arc_with_non_send_sync)]
+#[turso_macros::test]
+fn test_passive_checkpoint_between_read_and_write_does_not_fail_the_write(
+    tmp_db: TempDatabase,
+) -> Result<()> {
+    let writer = tmp_db.connect_limbo();
+    let checkpointer = tmp_db.connect_limbo();
+    writer.execute("CREATE TABLE t (x)")?;
+    writer.execute("INSERT INTO t VALUES (1)")?;
+
+    writer.execute("BEGIN")?;
+    writer.execute("SELECT * FROM t")?;
+    checkpointer.checkpoint(CheckpointMode::Passive {
+        upper_bound_inclusive: None,
+    })?;
+    writer.execute("INSERT INTO t VALUES (2)")?;
+    writer.execute("COMMIT")?;
+
+    assert_eq!(
+        limbo_exec_rows(&checkpointer, "SELECT x FROM t ORDER BY x"),
+        vec![
+            vec![rusqlite::types::Value::Integer(1)],
+            vec![rusqlite::types::Value::Integer(2)]
+        ]
+    );
     Ok(())
 }
 
