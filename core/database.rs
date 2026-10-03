@@ -1026,6 +1026,32 @@ impl Database {
         Ok(())
     }
 
+    fn check_registry_db_opts(db: &Database, requested: DatabaseOpts) -> Result<()> {
+        let checked = [
+            (
+                "experimental MVCC passive checkpoint",
+                db.opts.enable_experimental_mvcc_passive_checkpoint,
+                requested.enable_experimental_mvcc_passive_checkpoint,
+            ),
+            (
+                "experimental multiprocess WAL",
+                db.opts.enable_multiprocess_wal,
+                requested.enable_multiprocess_wal,
+            ),
+        ];
+        for (name, existing, requested) in checked {
+            if existing != requested {
+                let state = |enabled: bool| if enabled { "enabled" } else { "disabled" };
+                return Err(LimboError::InvalidArgument(format!(
+                    "database is already open with {name} {}; requested {name} {}",
+                    state(existing),
+                    state(requested)
+                )));
+            }
+        }
+        Ok(())
+    }
+
     /// Look up a database in the process-wide registry by file identity.
     /// Returns the cached Database if found, with encryption validation.
     /// This avoids opening a file (and acquiring a file lock) when the
@@ -1034,6 +1060,7 @@ impl Database {
         path: &str,
         encryption_opts: &Option<EncryptionOpts>,
         dialect: &dyn Dialect,
+        db_opts: DatabaseOpts,
         page_codec: Option<&dyn PageCodec>,
     ) -> Result<Option<Arc<Database>>> {
         if is_memory_like(path) {
@@ -1064,6 +1091,7 @@ impl Database {
         db.validate_page_codec(page_codec)?;
 
         Self::check_registry_dialect(&db, dialect)?;
+        Self::check_registry_db_opts(&db, db_opts)?;
 
         Ok(Some(db))
     }
@@ -1129,6 +1157,7 @@ impl Database {
                 path,
                 &options.encryption,
                 options.dialect.as_ref(),
+                options.db_opts,
                 options.page_codec.as_deref(),
             )? {
                 if options.durable_storage.is_some() && db.durable_storage.is_none() {
@@ -1298,6 +1327,7 @@ impl Database {
                             }
                             db.validate_page_codec(options.page_codec.as_deref())?;
                             Self::check_registry_dialect(&db, options.dialect.as_ref())?;
+                            Self::check_registry_db_opts(&db, options.db_opts)?;
                             return Ok(IOResult::Done(db));
                         }
                         // Weak ref expired — treat as absent, fall through to insert Opening.
