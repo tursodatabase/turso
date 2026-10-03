@@ -6,9 +6,7 @@ use crate::mvcc::cursor::CursorYieldPoint;
 use crate::mvcc::yield_hooks::YieldPointMarker;
 use crate::mvcc::yield_points::{YieldInjector, YieldPoint};
 use crate::sync::{Arc, Mutex};
-#[cfg(any(feature = "fts", feature = "io_memory_yield"))]
-use crate::StepResult;
-use crate::{Connection, Database, DatabaseOpts, LimboError, OpenFlags, Result, Value};
+use crate::{Connection, Database, DatabaseOpts, LimboError, OpenFlags, Result, StepResult, Value};
 
 #[derive(Debug)]
 struct FailingPrepareIndexMethod;
@@ -2418,4 +2416,103 @@ fn external_aggregate_context_lives_while_a_prepared_statement_uses_it() {
         1,
         "dropping the last statement releases the replaced registration"
     );
+}
+
+fn open_interrupt_test_connection(path: &str) -> Arc<Connection> {
+    let io = Arc::new(MemoryIO::new());
+    let db = Database::open_file_with_flags(
+        io,
+        path,
+        OpenFlags::default(),
+        DatabaseOpts::new(),
+        None,
+        Arc::new(SqliteDialect),
+    )
+    .unwrap();
+    let conn = db.connect().unwrap();
+    conn.execute("CREATE TABLE t(x)").unwrap();
+    conn
+}
+
+const COUNT_TO_5000: &str =
+    "WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM c WHERE x < 5000)";
+
+fn step_to_end(stmt: &mut crate::Statement) -> StepResult {
+    loop {
+        match stmt.step().unwrap() {
+            StepResult::Row => {}
+            StepResult::IO => stmt.get_pager().io.step().unwrap(),
+            end @ (StepResult::Done | StepResult::Interrupt) => return end,
+            other => panic!("unexpected step result {other:?}"),
+        }
+    }
+}
+
+/// `Connection::interrupt()` checks for an active statement and then sets the
+/// flag. When the statement finishes between the two steps, the flag stays
+/// set with no statement running.
+#[test]
+fn interrupt_left_over_after_the_target_finished_does_not_stop_the_next_statement() {
+    let conn = open_interrupt_test_connection(":memory:interrupt-left-over");
+    let mut target = conn.prepare("SELECT 1").unwrap();
+    assert!(matches!(step_to_end(&mut target), StepResult::Done));
+    drop(target);
+    conn.interrupt_requested
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+
+    let mut insert = conn
+        .prepare(format!("{COUNT_TO_5000} INSERT INTO t SELECT x FROM c"))
+        .unwrap();
+    assert!(matches!(step_to_end(&mut insert), StepResult::Done));
+    drop(insert);
+
+    assert_eq!(scalar_i64(&conn, "SELECT count(*) FROM t"), 5000);
+    assert!(!conn.is_interrupted());
+}
+
+#[test]
+fn interrupt_stops_the_running_statement() {
+    let conn = open_interrupt_test_connection(":memory:interrupt-running");
+    let mut stmt = conn
+        .prepare(format!("{COUNT_TO_5000} SELECT x FROM c"))
+        .unwrap();
+    assert!(matches!(stmt.step().unwrap(), StepResult::Row));
+
+    conn.interrupt();
+
+    assert!(matches!(step_to_end(&mut stmt), StepResult::Interrupt));
+    drop(stmt);
+    assert!(!conn.is_interrupted());
+}
+
+#[test]
+fn a_second_statement_starting_does_not_clear_an_interrupt_for_the_running_one() {
+    let conn = open_interrupt_test_connection(":memory:interrupt-second-statement");
+    let mut first = conn
+        .prepare(format!("{COUNT_TO_5000} SELECT x FROM c"))
+        .unwrap();
+    assert!(matches!(first.step().unwrap(), StepResult::Row));
+
+    conn.interrupt();
+    let mut second = conn
+        .prepare(format!("{COUNT_TO_5000} SELECT x FROM c"))
+        .unwrap();
+    assert!(matches!(step_to_end(&mut second), StepResult::Interrupt));
+
+    assert!(matches!(step_to_end(&mut first), StepResult::Interrupt));
+}
+
+/// Another thread can call `interrupt()` while this connection is starting a
+/// statement. The hook stands in for that thread, at the one moment where the
+/// statement is already counted but has not run yet.
+#[test]
+fn an_interrupt_arriving_while_a_statement_starts_is_not_lost() {
+    let conn = open_interrupt_test_connection(":memory:interrupt-while-starting");
+    *conn.after_counting_root_statement.write() =
+        Some(Arc::new(|conn: &Connection| conn.interrupt()));
+
+    let mut stmt = conn
+        .prepare(format!("{COUNT_TO_5000} SELECT x FROM c"))
+        .unwrap();
+    assert!(matches!(step_to_end(&mut stmt), StepResult::Interrupt));
 }
