@@ -870,6 +870,7 @@ fn join_lhs_and_rhs<'a>(
                     probe_multiplier,
                     hash_can_replace_build_index,
                     subqueries,
+                    joined_tables,
                     params,
                 )? {
                     let mut hash_join_method = hash_join_method;
@@ -2496,6 +2497,7 @@ mod tests {
                 join_type: JoinType::Inner,
                 using: vec![],
                 no_reorder: false,
+                lateral: false,
             }),
             table_id_counter.next(),
         );
@@ -2817,6 +2819,7 @@ mod tests {
                     join_type: JoinType::Inner,
                     using: vec![],
                     no_reorder: false,
+                    lateral: false,
                 }),
                 table_id_counter.next(),
             ),
@@ -3140,6 +3143,7 @@ mod tests {
                     join_type: JoinType::Inner,
                     using: vec![],
                     no_reorder: false,
+                    lateral: false,
                 }),
                 table_id_counter.next(),
             ),
@@ -3261,6 +3265,7 @@ mod tests {
                     join_type: JoinType::Inner,
                     using: vec![],
                     no_reorder: false,
+                    lateral: false,
                 }),
                 table_id_counter.next(),
             ),
@@ -3270,6 +3275,7 @@ mod tests {
                     join_type: JoinType::Inner,
                     using: vec![],
                     no_reorder: false,
+                    lateral: false,
                 }),
                 table_id_counter.next(),
             ),
@@ -3456,6 +3462,7 @@ mod tests {
                     join_type: JoinType::Inner,
                     using: vec![],
                     no_reorder: false,
+                    lateral: false,
                 }),
                 table_id_counter.next(),
             ),
@@ -3465,6 +3472,7 @@ mod tests {
                     join_type: JoinType::Inner,
                     using: vec![],
                     no_reorder: false,
+                    lateral: false,
                 }),
                 table_id_counter.next(),
             ),
@@ -3597,6 +3605,7 @@ mod tests {
                         join_type: JoinType::Inner,
                         using: vec![],
                         no_reorder: false,
+                        lateral: false,
                     }),
                     table_id_counter.next(),
                 )
@@ -3607,6 +3616,7 @@ mod tests {
                     join_type: JoinType::Inner,
                     using: vec![],
                     no_reorder: false,
+                    lateral: false,
                 }),
                 table_id_counter.next(),
             ));
@@ -4348,6 +4358,7 @@ mod tests {
                     join_type: JoinType::Inner,
                     using: vec![],
                     no_reorder: false,
+                    lateral: false,
                 }),
                 table_id_counter.next(),
             ),
@@ -4471,6 +4482,7 @@ mod tests {
                     join_type: JoinType::Inner,
                     using: vec![],
                     no_reorder: false,
+                    lateral: false,
                 }),
                 table_id_counter.next(),
             ),
@@ -4512,6 +4524,7 @@ mod tests {
             1.0,
             true,
             &[],
+            table_references.joined_tables(),
             &DEFAULT_PARAMS,
         )
         .unwrap()

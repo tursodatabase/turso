@@ -2138,6 +2138,7 @@ fn view_sources_from_clause(
                     ast::JoinOperator::TypedJoin(Some(join_type))
                         if join_type.contains(ast::JoinType::CROSS)
                 ),
+                lateral: false,
             }),
             ..right
         });

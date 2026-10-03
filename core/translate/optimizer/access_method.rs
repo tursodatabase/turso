@@ -1353,6 +1353,7 @@ pub fn try_hash_join_access_method(
     probe_multiplier: f64,
     hash_can_replace_build_index: bool,
     subqueries: &[NonFromClauseSubquery],
+    joined_tables: &[JoinedTable],
     params: &CostModelParams,
 ) -> Result<Option<AccessMethod>> {
     if probe_table
@@ -1364,7 +1365,7 @@ pub fn try_hash_join_access_method(
     }
     let hash_join_type = hash_join_type(probe_table);
 
-    if should_not_use_hash_join(build_table, probe_table, subqueries) {
+    if should_not_use_hash_join(build_table, probe_table, subqueries, joined_tables) {
         return Ok(None);
     }
 
@@ -1508,6 +1509,7 @@ fn should_not_use_hash_join(
     build_table: &JoinedTable,
     probe_table: &JoinedTable,
     subqueries: &[NonFromClauseSubquery],
+    joined_tables: &[JoinedTable],
 ) -> bool {
     let (Table::BTree(build_btree), Table::BTree(probe_btree)) =
         (&build_table.table, &probe_table.table)
@@ -1577,6 +1579,13 @@ fn should_not_use_hash_join(
             })
     };
 
+    let some_lateral_subqueries_read_the_joined_tables = || -> bool {
+        tables_read_by_lateral_subqueries(joined_tables).any(|table_internal_id| {
+            table_internal_id == build_table.internal_id
+                || table_internal_id == probe_table.internal_id
+        })
+    };
+
     // we should not use a hash join if...
     !both_sides_have_rowid()
         || both_tables_are_the_same_table()
@@ -1585,6 +1594,20 @@ fn should_not_use_hash_join(
         || build_table_is_null_row()
         || is_using_or_natural_join()
         || some_correlated_subqueries_reference_the_joined_tables()
+        || some_lateral_subqueries_read_the_joined_tables()
+}
+
+pub(super) fn tables_read_by_lateral_subqueries(
+    joined_tables: &[JoinedTable],
+) -> impl Iterator<Item = TableInternalId> + '_ {
+    joined_tables
+        .iter()
+        .filter(|table| table.join_info.as_ref().is_some_and(|ji| ji.lateral))
+        .filter_map(|table| match &table.table {
+            Table::FromClauseSubquery(subquery) => Some(subquery),
+            _ => None,
+        })
+        .flat_map(|subquery| subquery.plan.used_outer_query_ref_ids())
 }
 
 fn hash_join_type(probe_table: &JoinedTable) -> HashJoinType {
