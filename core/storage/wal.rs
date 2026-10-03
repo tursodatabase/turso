@@ -5897,7 +5897,7 @@ impl WalFileShared {
 
     /// Non-blocking entry point for [`WalFileShared::open_shared_if_exists`].
     /// Performs only the synchronous file open (and readonly/NotFound noop
-    /// handling); the WAL recovery scan is driven via [`OpenSharedWal::poll`].
+    /// handling); the WAL recovery scan is driven via `OpenSharedWal::poll`.
     pub fn open_shared_if_exists_begin(
         io: &Arc<dyn IO>,
         path: &str,
