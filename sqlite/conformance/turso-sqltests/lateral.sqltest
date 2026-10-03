@@ -1,0 +1,336 @@
+@database :memory:
+
+# LATERAL subqueries in the FROM clause, with PostgreSQL syntax and results.
+
+setup tables {
+    CREATE TABLE t1(a);
+    CREATE TABLE t2(b, c);
+    INSERT INTO t1 VALUES (1), (2), (3);
+    INSERT INTO t2 VALUES (1, 'x'), (2, 'y'), (2, 'z'), (3, 'w');
+}
+
+@setup tables
+test lateral-reads-a-column-of-the-table-on-its-left {
+    SELECT t1.a, s.b FROM t1, LATERAL (SELECT t1.a * 10 AS b) AS s;
+}
+expect {
+    1|10
+    2|20
+    3|30
+}
+
+@setup tables
+test lateral-runs-again-for-each-row-on-its-left {
+    SELECT t1.a, s.c FROM t1, LATERAL (SELECT c FROM t2 WHERE t2.b = t1.a) AS s ORDER BY 1, 2;
+}
+expect {
+    1|x
+    2|y
+    2|z
+    3|w
+}
+
+@setup tables
+test lateral-limit-applies-to-each-row-on-its-left {
+    SELECT t1.a, s.c
+    FROM t1 JOIN LATERAL (SELECT c FROM t2 WHERE t2.b = t1.a ORDER BY c DESC LIMIT 1) AS s ON 1
+    ORDER BY 1;
+}
+expect {
+    1|x
+    2|z
+    3|w
+}
+
+@setup tables
+test cross-join-lateral {
+    SELECT t1.a, s.n FROM t1 CROSS JOIN LATERAL (SELECT count(*) AS n FROM t2 WHERE t2.b <= t1.a) AS s;
+}
+expect {
+    1|1
+    2|3
+    3|4
+}
+
+@setup tables
+test left-join-lateral-keeps-rows-without-a-match {
+    SELECT t1.a, s.c
+    FROM t1 LEFT JOIN LATERAL (SELECT c FROM t2 WHERE t2.b = t1.a AND c > 'x') AS s ON 1
+    ORDER BY 1, 2;
+}
+expect {
+    1|
+    2|y
+    2|z
+    3|
+}
+
+@setup tables
+test left-join-lateral-on-clause-reads-the-subquery {
+    SELECT t1.a, s.c
+    FROM t1 LEFT JOIN LATERAL (SELECT c FROM t2 WHERE t2.b = t1.a) AS s ON s.c <> 'y'
+    ORDER BY 1, 2;
+}
+expect {
+    1|x
+    2|z
+    3|w
+}
+
+@setup tables
+test lateral-reads-an-earlier-lateral {
+    SELECT t1.a, x.b, y.c
+    FROM t1, LATERAL (SELECT t1.a + 1 AS b) AS x, LATERAL (SELECT x.b * 2 AS c) AS y;
+}
+expect {
+    1|2|4
+    2|3|6
+    3|4|8
+}
+
+@setup tables
+test lateral-reads-a-table-on-the-null-side-of-a-left-join {
+    SELECT t1.a, s.c
+    FROM t1 LEFT JOIN t2 ON t2.b = t1.a + 1, LATERAL (SELECT t2.c AS c) AS s
+    ORDER BY 1, 2;
+}
+expect {
+    1|y
+    1|z
+    2|w
+    3|
+}
+
+@setup tables
+test lateral-compound-select {
+    SELECT t1.a, s.b FROM t1, LATERAL (SELECT t1.a AS b UNION ALL SELECT t1.a + 100) AS s ORDER BY 1, 2;
+}
+expect {
+    1|1
+    1|101
+    2|2
+    2|102
+    3|3
+    3|103
+}
+
+@setup tables
+test lateral-values {
+    SELECT t1.a, s.column1 FROM t1 CROSS JOIN LATERAL (VALUES (t1.a), (t1.a * 10)) AS s ORDER BY 1, 2;
+}
+expect {
+    1|1
+    1|10
+    2|2
+    2|20
+    3|3
+    3|30
+}
+
+@setup tables
+test lateral-group-by {
+    SELECT t1.a, s.b, s.n
+    FROM t1, LATERAL (SELECT b, count(*) AS n FROM t2 WHERE t2.b >= t1.a GROUP BY b) AS s
+    ORDER BY 1, 2;
+}
+expect {
+    1|1|1
+    1|2|2
+    1|3|1
+    2|2|2
+    2|3|1
+    3|3|1
+}
+
+@setup tables
+test lateral-reads-a-subquery-on-its-left {
+    SELECT q.d, s.e FROM (SELECT 7 AS d) AS q, LATERAL (SELECT q.d + 1 AS e) AS s;
+}
+expect {
+    7|8
+}
+
+@setup tables
+test lateral-reads-a-cte-on-its-left {
+    WITH w AS (SELECT a FROM t1 WHERE a < 3)
+    SELECT w.a, s.c FROM w, LATERAL (SELECT c FROM t2 WHERE t2.b = w.a) AS s ORDER BY 1, 2;
+}
+expect {
+    1|x
+    2|y
+    2|z
+}
+
+@setup tables
+test lateral-reads-a-table-valued-function-on-its-left {
+    SELECT g.value, s.b FROM generate_series(1, 3) AS g, LATERAL (SELECT g.value * 2 AS b) AS s;
+}
+expect {
+    1|2
+    2|4
+    3|6
+}
+
+@setup tables
+test lateral-reads-the-rowid-of-the-table-on-its-left {
+    SELECT t1.a, s.r FROM t1, LATERAL (SELECT t1.rowid * 100 AS r) AS s;
+}
+expect {
+    1|100
+    2|200
+    3|300
+}
+
+test lateral-reads-a-covering-index-of-the-table-on-its-left {
+    CREATE TABLE t1(a, d);
+    CREATE INDEX t1_a ON t1(a);
+    INSERT INTO t1 VALUES (3, 30), (1, 10), (2, 20);
+    SELECT t1.a, s.b FROM t1, LATERAL (SELECT t1.a + 1 AS b) AS s ORDER BY t1.a;
+}
+expect {
+    1|2
+    2|3
+    3|4
+}
+
+test lateral-reads-a-column-that-the-index-on-its-left-does-not-cover {
+    CREATE TABLE t1(a, d);
+    CREATE INDEX t1_a ON t1(a);
+    INSERT INTO t1 VALUES (3, 30), (1, 10), (2, 20);
+    SELECT t1.a, s.e FROM t1, LATERAL (SELECT t1.d + 1 AS e) AS s ORDER BY t1.a;
+}
+expect {
+    1|11
+    2|21
+    3|31
+}
+
+@setup tables
+test lateral-inside-a-view {
+    CREATE VIEW v1 AS SELECT t1.a, s.c FROM t1, LATERAL (SELECT c FROM t2 WHERE t2.b = t1.a) AS s;
+    SELECT * FROM v1 ORDER BY 1, 2;
+}
+expect {
+    1|x
+    2|y
+    2|z
+    3|w
+}
+
+@setup tables
+test lateral-inside-a-correlated-subquery {
+    SELECT t1.a, (SELECT max(s.d) FROM t2, LATERAL (SELECT t2.b + t1.a AS d) AS s) FROM t1;
+}
+expect {
+    1|4
+    2|5
+    3|6
+}
+
+@setup tables
+test lateral-inside-a-recursive-cte {
+    WITH RECURSIVE r(x) AS (
+        SELECT 1
+        UNION ALL
+        SELECT s.y FROM r, LATERAL (SELECT r.x + 1 AS y) AS s WHERE r.x < 3
+    )
+    SELECT x FROM r;
+}
+expect {
+    1
+    2
+    3
+}
+
+@setup tables
+test lateral-in-update-from {
+    CREATE TABLE t3(a, e);
+    INSERT INTO t3 VALUES (1, 0), (2, 0);
+    UPDATE t3 SET e = s.e FROM t1, LATERAL (SELECT t1.a * 10 AS e) AS s WHERE t1.a = t3.a;
+    SELECT * FROM t3;
+}
+expect {
+    1|10
+    2|20
+}
+
+test lateral-reads-tables-that-a-hash-join-would-read {
+    CREATE TABLE t1(a, b);
+    CREATE TABLE t2(b, c);
+    INSERT INTO t1 VALUES (1, 1), (2, 2), (3, 2);
+    INSERT INTO t2 VALUES (1, 10), (2, 20), (2, 30);
+    SELECT t1.a, t2.c, s.d
+    FROM t1 JOIN t2 ON t1.b = t2.b, LATERAL (SELECT t1.a + t2.c AS d) AS s
+    ORDER BY 1, 2;
+}
+expect {
+    1|10|11
+    2|20|22
+    2|30|32
+    3|20|23
+    3|30|33
+}
+
+test lateral-as-the-first-from-item {
+    SELECT * FROM LATERAL (SELECT 1 AS a) AS s;
+}
+expect {
+    1
+}
+
+@setup tables
+test lateral-without-a-left-reference-in-a-right-join {
+    SELECT t1.a, s.b FROM t1 RIGHT JOIN LATERAL (SELECT 5 AS b) AS s ON 1 ORDER BY 1;
+}
+expect {
+    1|5
+    2|5
+    3|5
+}
+
+@setup tables
+test subquery-without-lateral-cannot-read-the-table-on-its-left {
+    SELECT * FROM t1, (SELECT t1.a) AS s;
+}
+expect error {
+}
+
+@setup tables
+test lateral-cannot-read-a-table-on-its-right {
+    SELECT * FROM LATERAL (SELECT t1.a) AS s, t1;
+}
+expect error {
+}
+
+@setup tables
+test right-join-lateral-cannot-read-the-table-on-its-left {
+    SELECT * FROM t1 RIGHT JOIN LATERAL (SELECT t1.a) AS s ON 1;
+}
+expect error {
+    the combining JOIN type must be INNER or LEFT for a LATERAL reference
+}
+
+@setup tables
+test full-join-lateral-cannot-read-the-table-on-its-left {
+    SELECT * FROM t1 FULL JOIN LATERAL (SELECT t1.a) AS s ON 1;
+}
+expect error {
+    the combining JOIN type must be INNER or LEFT for a LATERAL reference
+}
+
+@setup tables
+test lateral-cannot-aggregate-only-columns-of-the-tables-on-its-left {
+    SELECT * FROM t1, LATERAL (SELECT sum(t1.a)) AS s;
+}
+expect error {
+    aggregate functions are not allowed in FROM clause of their own query level
+}
+
+test lateral-is-a-name-outside-a-from-item {
+    CREATE TABLE lateral(lateral);
+    INSERT INTO lateral VALUES (1);
+    SELECT lateral FROM lateral;
+}
+expect {
+    1
+}

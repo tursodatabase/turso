@@ -1307,11 +1307,18 @@ pub fn try_hash_join_access_method(
     probe_multiplier: f64,
     hash_can_replace_build_index: bool,
     subqueries: &[NonFromClauseSubquery],
+    joined_tables: &[JoinedTable],
     params: &CostModelParams,
 ) -> Result<Option<AccessMethod>> {
     let hash_join_type = hash_join_type(probe_table);
 
-    if should_not_use_hash_join(build_table, probe_table, subqueries, hash_join_type) {
+    if should_not_use_hash_join(
+        build_table,
+        probe_table,
+        subqueries,
+        joined_tables,
+        hash_join_type,
+    ) {
         return Ok(None);
     }
 
@@ -1454,6 +1461,7 @@ fn should_not_use_hash_join(
     build_table: &JoinedTable,
     probe_table: &JoinedTable,
     subqueries: &[NonFromClauseSubquery],
+    joined_tables: &[JoinedTable],
     join_type: HashJoinType,
 ) -> bool {
     let (Table::BTree(build_btree), Table::BTree(probe_btree)) =
@@ -1526,6 +1534,12 @@ fn should_not_use_hash_join(
             })
     };
 
+    let some_lateral_subqueries_read_tables_on_their_left = || -> bool {
+        joined_tables
+            .iter()
+            .any(|table| table.join_info.as_ref().is_some_and(|ji| ji.lateral))
+    };
+
     // we should not use a hash join if...
     !both_sides_have_rowid()
         || not_full_outer_join_and_both_tables_are_the_same_table()
@@ -1534,6 +1548,7 @@ fn should_not_use_hash_join(
         || build_table_is_null_row()
         || is_using_or_natural_join()
         || some_correlated_subqueries_reference_the_joined_tables()
+        || some_lateral_subqueries_read_tables_on_their_left()
 }
 
 fn hash_join_type(probe_table: &JoinedTable) -> HashJoinType {

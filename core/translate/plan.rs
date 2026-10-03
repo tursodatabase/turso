@@ -1127,6 +1127,7 @@ pub struct JoinInfo {
     /// When true, the optimizer must not reorder this table relative to its
     /// neighbors. Set for CROSS JOIN to match SQLite semantics.
     pub no_reorder: bool,
+    pub lateral: bool,
 }
 
 impl JoinInfo {
@@ -1157,7 +1158,7 @@ impl JoinInfo {
 
     /// Whether the optimizer must preserve this table's position in the join order.
     pub fn is_ordering_constrained(&self) -> bool {
-        self.is_outer() || self.is_semi_or_anti() || self.no_reorder
+        self.is_outer() || self.is_semi_or_anti() || self.no_reorder || self.lateral
     }
 }
 
@@ -2840,7 +2841,7 @@ impl JoinedTable {
                 Ok((table_cursor_id, index_cursor_id))
             }
             Table::Virtual(virtual_table) => {
-                let table_cursor_id = Some(program.alloc_cursor_id_keyed(
+                let table_cursor_id = Some(program.alloc_cursor_id_keyed_if_not_exists(
                     CursorKey::table(self.internal_id),
                     CursorType::VirtualTable(virtual_table.clone()),
                 ));
