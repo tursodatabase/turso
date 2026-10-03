@@ -127,8 +127,7 @@ pub struct InsertEmitCtx<'a> {
     pub table: &'a Arc<BTreeTable>,
 
     /// Index cursors we need to populate for this table
-    /// (idx name, root_page, idx cursor id)
-    pub idx_cursors: Vec<(String, i64, usize)>,
+    pub idx_cursors: Vec<IndexCursor>,
 
     /// Context for if the insert values are materialized first
     /// into a temporary table
@@ -165,6 +164,17 @@ pub struct InsertEmitCtx<'a> {
     pub returning_buffer: Option<ReturningBufferCtx>,
 }
 
+pub struct IndexCursor {
+    pub name: String,
+    pub root_page: i64,
+    pub cursor_id: usize,
+    /// Set when a NoConflict probe positions this cursor on the inserted key.
+    /// Without REPLACE or UPSERT nothing moves it before the deferred
+    /// IdxInsert, which may then reuse the probe (SQLite's
+    /// OPFLAG_USESEEKRESULT).
+    pub no_conflict_probed: bool,
+}
+
 impl<'a> InsertEmitCtx<'a> {
     #[allow(clippy::too_many_arguments)]
     fn new(
@@ -183,11 +193,12 @@ impl<'a> InsertEmitCtx<'a> {
         });
         let mut idx_cursors = Vec::new();
         for idx in &indices {
-            idx_cursors.push((
-                idx.name.clone(),
-                idx.root_page,
-                program.alloc_cursor_index(None, idx)?,
-            ));
+            idx_cursors.push(IndexCursor {
+                name: idx.name.clone(),
+                root_page: idx.root_page,
+                cursor_id: program.alloc_cursor_index(None, idx)?,
+                no_conflict_probed: false,
+            });
         }
         let loop_labels = InsertLoopLabels {
             loop_start: program.allocate_label(),
@@ -958,8 +969,16 @@ pub fn translate_insert(
     // constraints, so we can't skip the commit phase.
     let statement_replace = matches!(ctx.on_conflict, ResolveType::Replace);
     let skip_replace_indexes = has_ddl_replace && !statement_replace;
+    let reuse_no_conflict_seeks = !on_replace && !has_upsert;
     if has_upsert || !statement_replace {
-        emit_commit_phase(program, resolver, &insertion, &ctx, skip_replace_indexes)?;
+        emit_commit_phase(
+            program,
+            resolver,
+            &insertion,
+            &ctx,
+            skip_replace_indexes,
+            reuse_no_conflict_seeks,
+        )?;
     }
 
     resolver.register_affinities.clear();
@@ -1385,6 +1404,7 @@ fn emit_commit_phase(
     insertion: &Insertion,
     ctx: &InsertEmitCtx,
     skip_replace_indexes: bool,
+    reuse_no_conflict_seeks: bool,
 ) -> Result<()> {
     let indices: Vec<_> = resolver.with_schema(ctx.database_id, |s| {
         s.get_indices(ctx.table.name.as_str()).cloned().collect()
@@ -1396,12 +1416,12 @@ fn emit_commit_phase(
         if skip_replace_indexes && index.on_conflict == Some(ResolveType::Replace) {
             continue;
         }
-        let idx_cursor_id = ctx
+        let idx_cursor = ctx
             .idx_cursors
             .iter()
-            .find(|(name, _, _)| name == &index.name)
-            .map(|(_, _, c_id)| *c_id)
+            .find(|idx_cursor| idx_cursor.name == index.name)
             .expect("no cursor found for index");
+        let idx_cursor_id = idx_cursor.cursor_id;
 
         // Re-evaluate partial predicate on the would-be inserted image
         let commit_skip_label =
@@ -1435,12 +1455,13 @@ fn emit_commit_phase(
             index_name: Some(index.name.clone()),
             affinity_str: None,
         });
+        let use_seek = reuse_no_conflict_seeks && idx_cursor.no_conflict_probed;
         program.emit_insn(Insn::IdxInsert {
             cursor_id: idx_cursor_id,
             record_reg,
             unpacked_start: Some(idx_start_reg),
             unpacked_count: Some((num_cols + 1) as u32),
-            flags: IdxInsertFlags::new().nchange(true),
+            flags: IdxInsertFlags::new().nchange(true).use_seek(use_seek),
         });
 
         if let Some(lbl) = commit_skip_label {
@@ -1485,8 +1506,8 @@ fn translate_rows_and_open_tables(
     // Open all the index btrees for writing
     for idx_cursor in ctx.idx_cursors.iter() {
         program.emit_insn(Insn::OpenWrite {
-            cursor_id: idx_cursor.2,
-            root_page: idx_cursor.1.into(),
+            cursor_id: idx_cursor.cursor_id,
+            root_page: idx_cursor.root_page.into(),
             db: ctx.database_id,
         });
     }
@@ -3014,12 +3035,12 @@ fn emit_index_uniqueness_check(
     preflight: &mut PreflightCtx,
 ) -> Result<()> {
     // find which cursor we opened earlier for this index
-    let idx_cursor_id = ctx
+    let idx_cursor_pos = ctx
         .idx_cursors
         .iter()
-        .find(|(name, _, _)| name == &index.name)
-        .map(|(_, _, c_id)| *c_id)
+        .position(|idx_cursor| idx_cursor.name == index.name)
         .expect("no cursor found for index");
+    let idx_cursor_id = ctx.idx_cursors[idx_cursor_pos].cursor_id;
 
     // For partial indexes, evaluate the WHERE clause and skip if false
     let maybe_skip_probe_label =
@@ -3049,7 +3070,7 @@ fn emit_index_uniqueness_check(
     });
 
     if index.unique {
-        emit_unique_index_check(
+        let probe_positions_cursor = emit_unique_index_check(
             program,
             ctx,
             resolver,
@@ -3061,6 +3082,9 @@ fn emit_index_uniqueness_check(
             upsert_catch_all,
             preflight,
         )?;
+        if probe_positions_cursor {
+            ctx.idx_cursors[idx_cursor_pos].no_conflict_probed = true;
+        }
     } else {
         // Non-unique index: insert eagerly only for REPLACE (which doesn't use commit phase).
         // For UPSERT and ABORT/FAIL/IGNORE/ROLLBACK, defer to commit phase.
@@ -3090,7 +3114,9 @@ fn emit_index_uniqueness_check(
     Ok(())
 }
 
-/// Emit bytecode for unique index conflict detection and handling.
+/// Emit bytecode for unique index conflict detection and handling. Returns
+/// whether the NoConflict probe leaves the cursor on the inserted key for the
+/// deferred IdxInsert.
 #[allow(clippy::too_many_arguments)]
 fn emit_unique_index_check(
     program: &mut ProgramBuilder,
@@ -3103,7 +3129,7 @@ fn emit_unique_index_check(
     position: Option<usize>,
     upsert_catch_all: Option<usize>,
     preflight: &mut PreflightCtx,
-) -> Result<()> {
+) -> Result<bool> {
     let aff = index
         .columns
         .iter()
@@ -3167,6 +3193,7 @@ fn emit_unique_index_check(
 
         // continue preflight with next constraint
         program.preassign_label_to_next_insn(next_check);
+        Ok(false)
     } else {
         // No UPSERT: probe for conflicts.
         let ok = program.allocate_label();
@@ -3234,8 +3261,8 @@ fn emit_unique_index_check(
         // For non-REPLACE cases (ABORT/FAIL/IGNORE/ROLLBACK), index inserts are
         // deferred to the commit phase after all constraint checks pass.
         // This prevents stale index entries when a later constraint check fails.
+        Ok(!preflight.on_replace && index.where_clause.is_none())
     }
-    Ok(())
 }
 
 // Preflight phase: evaluate each applicable UNIQUE constraint and probe with NoConflict.
@@ -3851,7 +3878,12 @@ fn emit_replace_delete_conflicting_row(
     let table_name = table.name.as_str();
     let main_cursor_id = ctx.cursor_id;
 
-    for (name, _, index_cursor_id) in ctx.idx_cursors.iter() {
+    for IndexCursor {
+        name,
+        cursor_id: index_cursor_id,
+        ..
+    } in ctx.idx_cursors.iter()
+    {
         let index = resolver
             .with_schema(ctx.database_id, |s| s.get_index(table_name, name).cloned())
             .expect("index to exist");
