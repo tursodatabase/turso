@@ -152,10 +152,17 @@ pub struct StatementProfile {
     pub select: WeightedProfile<SelectProfile>,
     /// INSERT weight and optional generation profile.
     pub insert: WeightedProfile<InsertProfile>,
+    /// INSERT OR REPLACE weight. Uses the INSERT profile.
+    pub insert_or_replace_weight: u32,
+    /// INSERT ... ON CONFLICT DO UPDATE weight. Uses the INSERT profile.
+    pub upsert_weight: u32,
     /// UPDATE weight and optional generation profile.
     pub update: WeightedProfile<UpdateProfile>,
     /// DELETE weight and optional generation profile.
     pub delete: WeightedProfile<DeleteProfile>,
+    /// Weight of a constant-false WHERE on DELETE and UPDATE, against 10 for
+    /// the usual optional WHERE. 0 never generates one.
+    pub constant_false_where_weight: u32,
 
     // DDL weights - Tables
     /// CREATE TABLE weight and optional generation profile.
@@ -178,6 +185,12 @@ pub struct StatementProfile {
     pub create_view_weight: u32,
     /// DROP VIEW weight (no extra profile needed).
     pub drop_view_weight: u32,
+
+    // DDL weights - Materialized views
+    /// CREATE MATERIALIZED VIEW weight.
+    pub create_materialized_view_weight: u32,
+    /// DROP VIEW weight for materialized views.
+    pub drop_materialized_view_weight: u32,
 
     // DDL weights - Triggers
     /// CREATE TRIGGER weight and optional operation-level weights.
@@ -208,8 +221,11 @@ impl Default for StatementProfile {
             // DML - most common operations
             select: WeightedProfile::new(40),
             insert: WeightedProfile::new(25),
+            insert_or_replace_weight: 0,
+            upsert_weight: 0,
             update: WeightedProfile::new(15),
             delete: WeightedProfile::new(10),
+            constant_false_where_weight: 0,
 
             // DDL - less frequent
             create_table: WeightedProfile::new(2),
@@ -220,6 +236,8 @@ impl Default for StatementProfile {
             drop_index_weight: 1,
             create_view_weight: 1,
             drop_view_weight: 1,
+            create_materialized_view_weight: 0,
+            drop_materialized_view_weight: 0,
             create_trigger: WeightedProfile::new(1),
             drop_trigger_weight: 1,
 
@@ -247,8 +265,11 @@ impl StatementProfile {
         Self {
             select: WeightedProfile::new(0),
             insert: WeightedProfile::new(0),
+            insert_or_replace_weight: 0,
+            upsert_weight: 0,
             update: WeightedProfile::new(0),
             delete: WeightedProfile::new(0),
+            constant_false_where_weight: 0,
             create_table: WeightedProfile::new(0),
             create_table_as_weight: 0,
             drop_table_weight: 0,
@@ -257,6 +278,8 @@ impl StatementProfile {
             drop_index_weight: 0,
             create_view_weight: 0,
             drop_view_weight: 0,
+            create_materialized_view_weight: 0,
+            drop_materialized_view_weight: 0,
             create_trigger: WeightedProfile::new(0),
             drop_trigger_weight: 0,
             begin_weight: 0,
@@ -556,7 +579,12 @@ impl StatementProfile {
 
     /// Returns the total DML weight.
     pub fn dml_weight(&self) -> u32 {
-        self.select.weight + self.insert.weight + self.update.weight + self.delete.weight
+        self.select.weight
+            + self.insert.weight
+            + self.insert_or_replace_weight
+            + self.upsert_weight
+            + self.update.weight
+            + self.delete.weight
     }
 
     /// Returns the total DDL weight.
@@ -569,6 +597,8 @@ impl StatementProfile {
             + self.drop_index_weight
             + self.create_view_weight
             + self.drop_view_weight
+            + self.create_materialized_view_weight
+            + self.drop_materialized_view_weight
             + self.create_trigger.weight
             + self.drop_trigger_weight
     }
@@ -617,6 +647,8 @@ impl StatementProfile {
         match kind {
             StatementKind::Select => self.select.weight,
             StatementKind::Insert => self.insert.weight,
+            StatementKind::InsertOrReplace => self.insert_or_replace_weight,
+            StatementKind::Upsert => self.upsert_weight,
             StatementKind::Update => self.update.weight,
             StatementKind::Delete => self.delete.weight,
             StatementKind::CreateTable => self.create_table.weight,
@@ -627,6 +659,8 @@ impl StatementProfile {
             StatementKind::DropIndex => self.drop_index_weight,
             StatementKind::CreateView => self.create_view_weight,
             StatementKind::DropView => self.drop_view_weight,
+            StatementKind::CreateMaterializedView => self.create_materialized_view_weight,
+            StatementKind::DropMaterializedView => self.drop_materialized_view_weight,
             StatementKind::CreateTrigger => self.create_trigger.weight,
             StatementKind::DropTrigger => self.drop_trigger_weight,
             StatementKind::Begin => self.begin_weight,
