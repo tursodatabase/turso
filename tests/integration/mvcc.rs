@@ -1645,3 +1645,54 @@ fn mvcc_passive_checkpoint_must_not_leak_commits_into_pinned_snapshot() {
         "a pinned BEGIN CONCURRENT snapshot must not see a commit that happened after it"
     );
 }
+
+#[test]
+fn mvcc_passive_checkpoint_finishes_while_later_rows_are_inserted() {
+    const ROWS_PER_BATCH: usize = 1024;
+    const MAX_APPENDED_BATCHES: usize = 16;
+
+    let tmp_db = TempDatabase::builder()
+        .with_opts(DatabaseOpts::new().with_experimental_mvcc_passive_checkpoint(true))
+        .with_mvcc(true)
+        .build();
+    let setup = tmp_db.connect_limbo();
+    setup
+        .execute("PRAGMA mvcc_checkpoint_threshold = -1")
+        .unwrap();
+    setup
+        .execute("CREATE TABLE t(id INTEGER PRIMARY KEY)")
+        .unwrap();
+    setup.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+
+    let insert_batch = format!(
+        "INSERT INTO t VALUES {}",
+        std::iter::repeat_n("(NULL)", ROWS_PER_BATCH)
+            .collect::<Vec<_>>()
+            .join(",")
+    );
+    setup.execute(&insert_batch).unwrap();
+    setup
+        .execute("PRAGMA mvcc_checkpoint_threshold = 0")
+        .unwrap();
+
+    let writer = tmp_db.connect_limbo();
+    let checkpoint = tmp_db.connect_limbo();
+    let mut statement = checkpoint.prepare("INSERT INTO t VALUES (NULL)").unwrap();
+    let mut appended_batches = 0;
+
+    loop {
+        match statement.step().unwrap() {
+            StepResult::Yield => {
+                assert!(
+                    appended_batches < MAX_APPENDED_BATCHES,
+                    "passive checkpoint kept scanning rows committed after its snapshot"
+                );
+                writer.execute(&insert_batch).unwrap();
+                appended_batches += 1;
+            }
+            StepResult::IO | StepResult::Sleep { .. } => tmp_db.io.step().unwrap(),
+            StepResult::Done => break,
+            other => panic!("unexpected INSERT result: {other:?}"),
+        }
+    }
+}
