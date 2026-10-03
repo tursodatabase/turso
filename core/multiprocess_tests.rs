@@ -33,6 +33,8 @@ const MULTIPROCESS_SHM_INSERT_AND_CLOSE_CHILD_TEST: &str =
 const MULTIPROCESS_SHM_EXPECT_OPEN_FAILURE_CHILD_TEST: &str =
     "multiprocess_tests::multiprocess_shm_expect_open_failure_child_process";
 const DEFAULT_LOCKED_DB_CHILD_TEST: &str = "multiprocess_tests::default_locked_db_child_process";
+const MULTIPROCESS_CREATE_ROLE_CHILD_TEST: &str =
+    "multiprocess_tests::multiprocess_create_role_child_process";
 const MULTIPROCESS_ASYNC_OPEN_CHILD_TEST: &str =
     "multiprocess_tests::multiprocess_async_open_child_process";
 const MULTIPROCESS_HOLD_OPEN_CHILD_TEST: &str =
@@ -3040,4 +3042,53 @@ fn test_multiprocess_autoinc_burst_no_duplicates() {
     );
 
     observer_conn.close().unwrap();
+}
+
+#[test]
+fn multiprocess_create_role_child_process() {
+    let Some(db_path) = std::env::var_os("TURSO_MULTIPROCESS_DB_PATH") else {
+        return;
+    };
+    let io: Arc<dyn IO> = multiprocess_test_io();
+    let db = open_multiprocess_db(io, db_path.to_str().unwrap()).unwrap();
+    let conn = db.connect().unwrap();
+    let role = std::env::var("TURSO_MULTIPROCESS_ROLE").unwrap();
+    conn.execute(format!("CREATE ROLE {role}")).unwrap();
+}
+
+fn create_role_in_child_process(db_path: &str, role: &str) {
+    let output = Command::new(std::env::current_exe().unwrap())
+        .arg(MULTIPROCESS_CREATE_ROLE_CHILD_TEST)
+        .arg("--exact")
+        .arg("--nocapture")
+        .env("TURSO_MULTIPROCESS_DB_PATH", db_path)
+        .env("TURSO_MULTIPROCESS_ROLE", role)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "child process failed: stdout={}; stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn subprocess_set_role_sees_role_created_by_another_process() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("roles-multiprocess.db");
+    let db_path_str = db_path.to_str().unwrap();
+    let io: Arc<dyn IO> = multiprocess_test_io();
+    let db = open_multiprocess_db(io, db_path_str).unwrap();
+    let conn = db.connect().unwrap();
+    conn.execute("CREATE TABLE t(x)").unwrap();
+    conn.execute("CREATE ROLE bob").unwrap();
+
+    create_role_in_child_process(db_path_str, "alice");
+    conn.set_role(Some("alice")).unwrap();
+    conn.set_role(None).unwrap();
+
+    create_role_in_child_process(db_path_str, "carol");
+    conn.execute("SET ROLE carol").unwrap();
+    assert_eq!(conn.current_role().as_deref(), Some("carol"));
 }

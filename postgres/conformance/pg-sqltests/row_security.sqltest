@@ -1,0 +1,247 @@
+# Roles and row-level security: SET ROLE, ALTER TABLE ... ROW LEVEL
+# SECURITY and SELECT policies. Roles are global in PostgreSQL, so every
+# test drops the table (which drops its policies and grants) and then the
+# role before recreating them. Superusers bypass row-level security, so each
+# test switches to an ordinary role with SET ROLE before reading the table.
+
+@database :memory:
+
+test rls-superuser-sees-all-rows {
+    DROP TABLE IF EXISTS rls_docs;
+    CREATE TABLE rls_docs (id int, owner text);
+    INSERT INTO rls_docs VALUES (1, 'rls_alice'), (2, 'rls_bob');
+    ALTER TABLE rls_docs ENABLE ROW LEVEL SECURITY;
+    SELECT id, owner FROM rls_docs ORDER BY id;
+}
+expect {
+    1|rls_alice
+    2|rls_bob
+}
+
+test rls-set-role-changes-current-user {
+    DROP ROLE IF EXISTS rls_alice;
+    CREATE ROLE rls_alice;
+    SET ROLE rls_alice;
+    SELECT current_user;
+}
+expect {
+    rls_alice
+}
+
+test rls-reset-role-restores-session-user {
+    DROP ROLE IF EXISTS rls_alice;
+    CREATE ROLE rls_alice;
+    SET ROLE rls_alice;
+    RESET ROLE;
+    SELECT CASE WHEN current_user = session_user THEN 'same' ELSE 'different' END;
+}
+expect {
+    same
+}
+
+test rls-set-role-missing-role-errors {
+    SET ROLE rls_no_such_role;
+}
+expect error {}
+
+test rls-enabled-without-policies-hides-all-rows {
+    DROP TABLE IF EXISTS rls_docs;
+    DROP ROLE IF EXISTS rls_alice;
+    CREATE ROLE rls_alice;
+    CREATE TABLE rls_docs (id int, owner text);
+    INSERT INTO rls_docs VALUES (1, 'rls_alice'), (2, 'rls_bob');
+    GRANT SELECT ON rls_docs TO rls_alice;
+    ALTER TABLE rls_docs ENABLE ROW LEVEL SECURITY;
+    SET ROLE rls_alice;
+    SELECT count(*) FROM rls_docs;
+}
+expect {
+    0
+}
+
+test rls-disabled-ignores-policies {
+    DROP TABLE IF EXISTS rls_docs;
+    DROP ROLE IF EXISTS rls_alice;
+    CREATE ROLE rls_alice;
+    CREATE TABLE rls_docs (id int, owner text);
+    INSERT INTO rls_docs VALUES (1, 'rls_alice'), (2, 'rls_bob');
+    GRANT SELECT ON rls_docs TO rls_alice;
+    CREATE POLICY own_rows ON rls_docs USING (owner = current_user);
+    SET ROLE rls_alice;
+    SELECT id FROM rls_docs ORDER BY id;
+}
+expect {
+    1
+    2
+}
+
+test rls-policy-filters-select {
+    DROP TABLE IF EXISTS rls_docs;
+    DROP ROLE IF EXISTS rls_alice;
+    CREATE ROLE rls_alice;
+    CREATE TABLE rls_docs (id int, owner text);
+    INSERT INTO rls_docs VALUES (1, 'rls_alice'), (2, 'rls_bob'), (3, 'rls_alice');
+    GRANT SELECT ON rls_docs TO rls_alice;
+    ALTER TABLE rls_docs ENABLE ROW LEVEL SECURITY;
+    CREATE POLICY own_rows ON rls_docs USING (owner = current_user);
+    SET ROLE rls_alice;
+    SELECT id, owner FROM rls_docs ORDER BY id;
+}
+expect {
+    1|rls_alice
+    3|rls_alice
+}
+
+test rls-policy-filters-count {
+    DROP TABLE IF EXISTS rls_docs;
+    DROP ROLE IF EXISTS rls_alice;
+    CREATE ROLE rls_alice;
+    CREATE TABLE rls_docs (id int, owner text);
+    INSERT INTO rls_docs VALUES (1, 'rls_alice'), (2, 'rls_bob'), (3, 'rls_alice');
+    GRANT SELECT ON rls_docs TO rls_alice;
+    ALTER TABLE rls_docs ENABLE ROW LEVEL SECURITY;
+    CREATE POLICY own_rows ON rls_docs FOR SELECT USING (owner = current_user);
+    SET ROLE rls_alice;
+    SELECT count(*) FROM rls_docs;
+}
+expect {
+    2
+}
+
+test rls-policy-combines-with-user-where {
+    DROP TABLE IF EXISTS rls_docs;
+    DROP ROLE IF EXISTS rls_alice;
+    CREATE ROLE rls_alice;
+    CREATE TABLE rls_docs (id int primary key, owner text);
+    INSERT INTO rls_docs VALUES (1, 'rls_alice'), (2, 'rls_bob'), (3, 'rls_alice');
+    GRANT SELECT ON rls_docs TO rls_alice;
+    ALTER TABLE rls_docs ENABLE ROW LEVEL SECURITY;
+    CREATE POLICY own_rows ON rls_docs USING (owner = current_user);
+    SET ROLE rls_alice;
+    SELECT id FROM rls_docs WHERE id >= 2 ORDER BY id;
+}
+expect {
+    3
+}
+
+test rls-policy-hides-row-from-primary-key-lookup {
+    DROP TABLE IF EXISTS rls_docs;
+    DROP ROLE IF EXISTS rls_alice;
+    CREATE ROLE rls_alice;
+    CREATE TABLE rls_docs (id int primary key, owner text);
+    INSERT INTO rls_docs VALUES (1, 'rls_alice'), (2, 'rls_bob');
+    GRANT SELECT ON rls_docs TO rls_alice;
+    ALTER TABLE rls_docs ENABLE ROW LEVEL SECURITY;
+    CREATE POLICY own_rows ON rls_docs USING (owner = current_user);
+    SET ROLE rls_alice;
+    SELECT count(*) FROM rls_docs WHERE id = 2;
+}
+expect {
+    0
+}
+
+test rls-supabase-select-current-user-form {
+    DROP TABLE IF EXISTS rls_docs;
+    DROP ROLE IF EXISTS rls_alice;
+    CREATE ROLE rls_alice;
+    CREATE TABLE rls_docs (id int, owner text);
+    INSERT INTO rls_docs VALUES (1, 'rls_alice'), (2, 'rls_bob');
+    GRANT SELECT ON rls_docs TO rls_alice;
+    ALTER TABLE rls_docs ENABLE ROW LEVEL SECURITY;
+    CREATE POLICY own_rows ON rls_docs FOR SELECT USING ((SELECT current_user) = owner);
+    SET ROLE rls_alice;
+    SELECT id FROM rls_docs ORDER BY id;
+}
+expect {
+    1
+}
+
+test rls-public-read-policy-shows-all-rows {
+    DROP TABLE IF EXISTS rls_docs;
+    DROP ROLE IF EXISTS rls_alice;
+    CREATE ROLE rls_alice;
+    CREATE TABLE rls_docs (id int, owner text);
+    INSERT INTO rls_docs VALUES (1, 'rls_alice'), (2, 'rls_bob');
+    GRANT SELECT ON rls_docs TO rls_alice;
+    ALTER TABLE rls_docs ENABLE ROW LEVEL SECURITY;
+    CREATE POLICY readable ON rls_docs FOR SELECT USING (true);
+    SET ROLE rls_alice;
+    SELECT id FROM rls_docs ORDER BY id;
+}
+expect {
+    1
+    2
+}
+
+test rls-policies-are-ored {
+    DROP TABLE IF EXISTS rls_docs;
+    DROP ROLE IF EXISTS rls_alice;
+    CREATE ROLE rls_alice;
+    CREATE TABLE rls_docs (id int, owner text, editor text);
+    INSERT INTO rls_docs VALUES (1, 'rls_alice', 'rls_bob'), (2, 'rls_bob', 'rls_alice'), (3, 'rls_bob', 'rls_bob');
+    GRANT SELECT ON rls_docs TO rls_alice;
+    ALTER TABLE rls_docs ENABLE ROW LEVEL SECURITY;
+    CREATE POLICY own_rows ON rls_docs USING (owner = current_user);
+    CREATE POLICY edited_rows ON rls_docs FOR SELECT USING (editor = current_user);
+    SET ROLE rls_alice;
+    SELECT id FROM rls_docs ORDER BY id;
+}
+expect {
+    1
+    2
+}
+
+test rls-drop-policy-removes-filter {
+    DROP TABLE IF EXISTS rls_docs;
+    DROP ROLE IF EXISTS rls_alice;
+    CREATE ROLE rls_alice;
+    CREATE TABLE rls_docs (id int, owner text);
+    INSERT INTO rls_docs VALUES (1, 'rls_alice'), (2, 'rls_bob');
+    GRANT SELECT ON rls_docs TO rls_alice;
+    ALTER TABLE rls_docs ENABLE ROW LEVEL SECURITY;
+    CREATE POLICY own_rows ON rls_docs USING (owner = current_user);
+    CREATE POLICY everything ON rls_docs USING (true);
+    DROP POLICY everything ON rls_docs;
+    SET ROLE rls_alice;
+    SELECT id FROM rls_docs ORDER BY id;
+}
+expect {
+    1
+}
+
+test rls-left-join-null-extends-hidden-rows {
+    DROP TABLE IF EXISTS rls_docs;
+    DROP TABLE IF EXISTS rls_ids;
+    DROP ROLE IF EXISTS rls_alice;
+    CREATE ROLE rls_alice;
+    CREATE TABLE rls_ids (id int);
+    INSERT INTO rls_ids VALUES (1), (2);
+    CREATE TABLE rls_docs (id int, owner text);
+    INSERT INTO rls_docs VALUES (1, 'rls_alice'), (2, 'rls_bob');
+    GRANT SELECT ON rls_ids TO rls_alice;
+    GRANT SELECT ON rls_docs TO rls_alice;
+    ALTER TABLE rls_docs ENABLE ROW LEVEL SECURITY;
+    CREATE POLICY own_rows ON rls_docs USING (owner = current_user);
+    SET ROLE rls_alice;
+    SELECT i.id, d.owner FROM rls_ids i LEFT JOIN rls_docs d ON d.id = i.id ORDER BY i.id;
+}
+expect {
+    1|rls_alice
+    2|
+}
+
+test rls-subquery-is-filtered {
+    DROP TABLE IF EXISTS rls_docs;
+    DROP ROLE IF EXISTS rls_alice;
+    CREATE ROLE rls_alice;
+    CREATE TABLE rls_docs (id int, owner text);
+    INSERT INTO rls_docs VALUES (1, 'rls_alice'), (2, 'rls_bob');
+    GRANT SELECT ON rls_docs TO rls_alice;
+    ALTER TABLE rls_docs ENABLE ROW LEVEL SECURITY;
+    CREATE POLICY own_rows ON rls_docs USING (owner = current_user);
+    SET ROLE rls_alice;
+    SELECT (SELECT max(id) FROM rls_docs), (SELECT count(*) FROM rls_docs WHERE owner = 'rls_bob');
+}
+expect {
+    1|0
+}

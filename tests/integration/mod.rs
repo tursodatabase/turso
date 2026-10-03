@@ -1,5 +1,6 @@
 mod abandoned_create_index;
 mod abandoned_statement_pager;
+mod access_control;
 mod assert_details;
 #[macro_use]
 mod assertions;
@@ -23,6 +24,7 @@ mod query_processing;
 mod query_timeout;
 mod queued_io;
 mod reindex;
+mod row_security;
 mod statement_metadata;
 mod statement_reset;
 mod stmt_journal;

@@ -1876,6 +1876,12 @@ pub fn translate_drop_table(
         );
     };
     validate_drop_table(resolver, database_id, name, connection)?;
+    crate::translate::access_control::emit_drop_table_access_control_cleanup(
+        name,
+        database_id,
+        resolver,
+        program,
+    )?;
     // Check if foreign keys are enabled and if this table is referenced by foreign keys
     // Fire FK actions (CASCADE, SET NULL, SET DEFAULT) or check for violations (RESTRICT, NO ACTION)
     if connection.foreign_keys_enabled()

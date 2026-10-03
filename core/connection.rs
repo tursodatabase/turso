@@ -243,6 +243,13 @@ enum ReparsePhase {
         stmt: Box<Statement>,
         type_rows: Vec<String>,
     },
+    /// Loading roles from the internal access control table. Unlike custom
+    /// types this is not best-effort: a missing row would silently grant or
+    /// remove access.
+    LoadAccessControl {
+        stmt: Box<Statement>,
+        rows: Vec<crate::access_control::AccessControlRow>,
+    },
     /// Best-effort ANALYZE-stats refresh before finalizing.
     RefreshStats {
         stats: crate::stats::RefreshAnalyzeStatsState,
@@ -565,6 +572,8 @@ pub struct Connection {
     pub(crate) prepare_context_generation: AtomicU64,
     /// Per-connection last-returned value for each sequence (for currval()).
     pub(crate) sequence_currvals: RwLock<HashMap<String, i64>>,
+    /// Role set with `set_role()`. `None` is the superuser.
+    pub(crate) current_role: RwLock<Option<String>>,
 }
 
 // SAFETY: This needs to be audited for thread safety.
@@ -1659,9 +1668,7 @@ impl Connection {
                             type_rows: Vec::new(),
                         };
                     } else {
-                        inner.phase = ReparsePhase::RefreshStats {
-                            stats: Default::default(),
-                        };
+                        inner.phase = self.reparse_phase_after_types(&inner.fresh)?;
                     }
                 }
                 ReparsePhase::LoadTypes { stmt, type_rows } => {
@@ -1680,17 +1687,24 @@ impl Connection {
                             if let Err(e) = inner.fresh.load_type_definitions(&type_rows) {
                                 tracing::warn!("Failed to load custom types: {}", e);
                             }
-                            inner.phase = ReparsePhase::RefreshStats {
-                                stats: Default::default(),
-                            };
+                            inner.phase = self.reparse_phase_after_types(&inner.fresh)?;
                         }
                         Err(e) => {
                             tracing::warn!("Failed to load custom types: {}", e);
-                            inner.phase = ReparsePhase::RefreshStats {
-                                stats: Default::default(),
-                            };
+                            inner.phase = self.reparse_phase_after_types(&inner.fresh)?;
                         }
                     }
+                }
+                ReparsePhase::LoadAccessControl { stmt, rows } => {
+                    crate::return_if_io!(stmt.run_with_row_callback_nonblock(|row| {
+                        rows.push(crate::access_control::AccessControlRow::from_row(row)?);
+                        Ok(())
+                    }));
+                    inner.fresh.access_control =
+                        Arc::new(crate::access_control::AccessControlCatalog::load(rows)?);
+                    inner.phase = ReparsePhase::RefreshStats {
+                        stats: Default::default(),
+                    };
                 }
                 ReparsePhase::RefreshStats { stats } => {
                     // Best-effort load stats if sqlite_stat1 is present.
@@ -1994,6 +2008,26 @@ impl Connection {
 
     pub(crate) fn increment_deferred_foreign_key_violations(&self, v: isize) {
         self.fk_deferred_violations.fetch_add(v, Ordering::AcqRel);
+    }
+
+    fn reparse_phase_after_types(self: &Arc<Connection>, fresh: &Schema) -> Result<ReparsePhase> {
+        if !fresh
+            .tables
+            .contains_key(crate::access_control::ACCESS_CONTROL_TABLE_NAME)
+        {
+            return Ok(ReparsePhase::RefreshStats {
+                stats: Default::default(),
+            });
+        }
+        self.with_schema_mut(|schema| {
+            *schema = fresh.try_clone()?;
+            Ok::<_, crate::alloc::TryReserveError>(())
+        })??;
+        let stmt = self.prepare_internal(crate::access_control::LOAD_ACCESS_CONTROL_SQL)?;
+        Ok(ReparsePhase::LoadAccessControl {
+            stmt: Box::new(stmt),
+            rows: Vec::new(),
+        })
     }
 
     /// Query the CREATE TYPE SQL definitions stored in __turso_internal_types.
@@ -3002,6 +3036,42 @@ impl Connection {
 
     pub fn current_schema(&self) -> Arc<Schema> {
         self.schema.read().clone()
+    }
+
+    /// Makes the connection act as `role`, or as the superuser when `role` is
+    /// `None`. Prepared statements are planned again for the new role. A role
+    /// created by another process is found by reading the schema again.
+    pub fn set_role(self: &Arc<Connection>, role: Option<&str>) -> Result<()> {
+        if let Some(role) = role {
+            self.maybe_update_schema();
+            if !self.schema.read().access_control.has_role(role) {
+                self.maybe_reparse_schema()?;
+            }
+        }
+        self.set_role_in_current_schema(role)
+    }
+
+    /// `set_role()` against the schema the connection already has, for
+    /// statements that have made sure the schema is current.
+    pub(crate) fn set_role_in_current_schema(&self, role: Option<&str>) -> Result<()> {
+        let role = match role {
+            Some(role) => {
+                if !self.schema.read().access_control.has_role(role) {
+                    return Err(LimboError::ParseError(format!(
+                        "role \"{role}\" does not exist"
+                    )));
+                }
+                Some(crate::util::normalize_ident(role))
+            }
+            None => None,
+        };
+        *self.current_role.write() = role;
+        self.bump_prepare_context_generation();
+        Ok(())
+    }
+
+    pub fn current_role(&self) -> Option<String> {
+        self.current_role.read().clone()
     }
 
     pub fn attached_database_names(&self) -> Vec<String> {

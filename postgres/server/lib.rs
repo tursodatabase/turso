@@ -25,24 +25,30 @@ use pgwire::messages::data::DataRow;
 use pgwire::tokio::process_socket;
 use pgwire::types::format::FormatOptions;
 
+/// Opens a connection for a new client session.
+pub type Connect = Arc<dyn Fn() -> anyhow::Result<Connection> + Send + Sync>;
+
 pub struct TursoPgServer {
     address: String,
     db_file: String,
-    conn: Arc<Mutex<PgConnection>>,
+    connect: Connect,
     interrupt_count: Arc<AtomicUsize>,
 }
 
 impl TursoPgServer {
+    /// Every client gets its own connection from `connect`, so session
+    /// state such as the role or an open transaction is not shared between
+    /// clients.
     pub fn new(
         address: String,
         db_file: String,
-        conn: Connection,
+        connect: Connect,
         interrupt_count: Arc<AtomicUsize>,
     ) -> Self {
         Self {
             address,
             db_file,
-            conn: Arc::new(Mutex::new(conn)),
+            connect,
             interrupt_count,
         }
     }
@@ -59,21 +65,26 @@ impl TursoPgServer {
             self.address, self.db_file
         );
 
-        let factory = Arc::new(TursoPgFactory {
-            handler: Arc::new(TursoPgHandler {
-                conn: self.conn.clone(),
-                db_file: self.db_file.clone(),
-                query_parser: Arc::new(NoopQueryParser::new()),
-            }),
-        });
-
         loop {
             tokio::select! {
                 result = listener.accept() => {
                     match result {
                         Ok((socket, addr)) => {
                             info!("PostgreSQL client connected from {}", addr);
-                            let factory_ref = factory.clone();
+                            let conn = match (self.connect)() {
+                                Ok(conn) => conn,
+                                Err(e) => {
+                                    error!("Error opening a connection for {}: {}", addr, e);
+                                    continue;
+                                }
+                            };
+                            let factory_ref = Arc::new(TursoPgFactory {
+                                handler: Arc::new(TursoPgHandler {
+                                    conn: Arc::new(Mutex::new(conn)),
+                                    db_file: self.db_file.clone(),
+                                    query_parser: Arc::new(NoopQueryParser::new()),
+                                }),
+                            });
                             tokio::spawn(async move {
                                 if let Err(e) = process_socket(socket, None, factory_ref).await {
                                     error!("Error processing connection from {}: {}", addr, e);
@@ -641,6 +652,8 @@ fn is_pg_non_query(sql: &str) -> bool {
         || upper.starts_with("DROP SCHEMA")
         || upper.starts_with("REFRESH MATERIALIZED VIEW")
         || upper.starts_with("COMMENT")
+        || upper.starts_with("GRANT")
+        || upper.starts_with("REVOKE")
 }
 
 fn command_tag(query: &str, affected_rows: usize) -> Tag {
@@ -657,6 +670,10 @@ fn command_tag(query: &str, affected_rows: usize) -> Tag {
         Tag::new("CREATE INDEX")
     } else if upper.starts_with("CREATE SCHEMA") {
         Tag::new("CREATE SCHEMA")
+    } else if upper.starts_with("CREATE ROLE") {
+        Tag::new("CREATE ROLE")
+    } else if upper.starts_with("CREATE POLICY") {
+        Tag::new("CREATE POLICY")
     } else if is_create_table_as(&upper) {
         // PostgreSQL reports CREATE TABLE AS completion as `SELECT n` (the
         // rows inserted), except WITH NO DATA which skips the insert and
@@ -674,6 +691,10 @@ fn command_tag(query: &str, affected_rows: usize) -> Tag {
         Tag::new("DROP INDEX")
     } else if upper.starts_with("DROP SCHEMA") {
         Tag::new("DROP SCHEMA")
+    } else if upper.starts_with("DROP ROLE") {
+        Tag::new("DROP ROLE")
+    } else if upper.starts_with("DROP POLICY") {
+        Tag::new("DROP POLICY")
     } else if upper.starts_with("DROP") {
         Tag::new("DROP TABLE")
     } else if upper.starts_with("ALTER") {
@@ -690,6 +711,12 @@ fn command_tag(query: &str, affected_rows: usize) -> Tag {
         Tag::new("RELEASE")
     } else if upper.starts_with("SET") {
         Tag::new("SET")
+    } else if upper.starts_with("RESET") {
+        Tag::new("RESET")
+    } else if upper.starts_with("GRANT") {
+        Tag::new("GRANT")
+    } else if upper.starts_with("REVOKE") {
+        Tag::new("REVOKE")
     } else if upper.starts_with("COPY") {
         Tag::new("COPY").with_rows(affected_rows)
     } else if upper.starts_with("COMMENT") {
@@ -930,5 +957,147 @@ mod tests {
 
         assert!(!ends_with_with_no_data("CREATE TABLE T AS SELECT 1"));
         assert!(!ends_with_with_no_data("SELECT 'WITH NO DATA'"));
+    }
+}
+
+#[cfg(test)]
+mod session_tests {
+    use super::*;
+    use turso_pg_client::{BackendEvent, ConnParams, PgConn};
+
+    struct RunningServer {
+        port: u16,
+        interrupt_count: Arc<AtomicUsize>,
+        thread: Option<std::thread::JoinHandle<()>>,
+    }
+
+    impl RunningServer {
+        fn start() -> Self {
+            let (_, db) = turso_pg::open_database(
+                ":memory:",
+                None,
+                turso_core::OpenFlags::default(),
+                turso_core::DatabaseOpts::new(),
+            )
+            .unwrap();
+            let port = std::net::TcpListener::bind("127.0.0.1:0")
+                .unwrap()
+                .local_addr()
+                .unwrap()
+                .port();
+            let interrupt_count = Arc::new(AtomicUsize::new(0));
+            let server = TursoPgServer::new(
+                format!("127.0.0.1:{port}"),
+                ":memory:".to_string(),
+                Arc::new(move || Ok(Connection::new(db.connect()?))),
+                interrupt_count.clone(),
+            );
+            let thread = std::thread::spawn(move || server.run().unwrap());
+            Self {
+                port,
+                interrupt_count,
+                thread: Some(thread),
+            }
+        }
+
+        fn client(&self) -> PgConn {
+            let params = ConnParams {
+                host: "127.0.0.1".to_string(),
+                port: self.port,
+                user: "test".to_string(),
+                password: None,
+                database: "main".to_string(),
+            };
+            for _ in 0..200 {
+                if let Ok(conn) = PgConn::connect(&params, &[]) {
+                    return conn;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            panic!("server did not accept connections");
+        }
+    }
+
+    impl Drop for RunningServer {
+        fn drop(&mut self) {
+            self.interrupt_count.fetch_add(1, Ordering::SeqCst);
+            let _ = std::net::TcpStream::connect(("127.0.0.1", self.port));
+            if let Some(thread) = self.thread.take() {
+                let _ = thread.join();
+            }
+        }
+    }
+
+    fn query(conn: &mut PgConn, sql: &str) -> Vec<BackendEvent> {
+        let events = conn.simple_query(sql).unwrap();
+        if let Some(BackendEvent::ErrorResponse(fields)) = events
+            .iter()
+            .find(|event| matches!(event, BackendEvent::ErrorResponse(_)))
+        {
+            panic!("{sql}: {}", turso_pg_client::error_message(fields));
+        }
+        events
+    }
+
+    fn single_value(conn: &mut PgConn, sql: &str) -> String {
+        query(conn, sql)
+            .into_iter()
+            .find_map(|event| match event {
+                BackendEvent::DataRow(row) => row[0].clone(),
+                _ => None,
+            })
+            .unwrap()
+    }
+
+    #[test]
+    fn test_each_client_has_its_own_role() {
+        let server = RunningServer::start();
+        let mut first = server.client();
+        let mut second = server.client();
+        for sql in [
+            "CREATE TABLE docs (id int, owner text)",
+            "INSERT INTO docs VALUES (1, 'alice'), (2, 'bob')",
+            "CREATE ROLE alice",
+            "ALTER TABLE docs ENABLE ROW LEVEL SECURITY",
+            "CREATE POLICY own ON docs USING (owner = current_user)",
+            "SET ROLE alice",
+        ] {
+            query(&mut first, sql);
+        }
+        assert_eq!(single_value(&mut first, "SELECT count(*) FROM docs"), "1");
+        assert_eq!(single_value(&mut second, "SELECT count(*) FROM docs"), "2");
+        query(&mut second, "RESET ROLE");
+        assert_eq!(single_value(&mut first, "SELECT count(*) FROM docs"), "1");
+    }
+
+    #[test]
+    fn test_access_control_statements_complete_as_commands() {
+        let server = RunningServer::start();
+        let mut client = server.client();
+        query(&mut client, "CREATE TABLE docs (id int, owner text)");
+        for (sql, tag) in [
+            ("CREATE ROLE alice", "CREATE ROLE"),
+            ("GRANT SELECT ON docs TO alice", "GRANT"),
+            ("REVOKE SELECT ON docs FROM alice", "REVOKE"),
+            ("CREATE POLICY own ON docs USING (true)", "CREATE POLICY"),
+            ("DROP POLICY own ON docs", "DROP POLICY"),
+            ("SET ROLE alice", "SET"),
+            ("RESET ROLE", "RESET"),
+            ("DROP ROLE alice", "DROP ROLE"),
+        ] {
+            let events = query(&mut client, sql);
+            assert!(
+                !events
+                    .iter()
+                    .any(|event| matches!(event, BackendEvent::RowDescription(_))),
+                "{sql} returned rows"
+            );
+            assert!(
+                events
+                    .iter()
+                    .any(|event| matches!(event, BackendEvent::CommandComplete(t) if t == tag)),
+                "{sql}: {events:?}"
+            );
+        }
     }
 }

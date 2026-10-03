@@ -1746,13 +1746,16 @@ fn emit_fk_action_subprogram(
         );
         let entry = compile_stack.push(foreign_key, parent_change);
         subprogram_builder.prologue();
-        translate_inner(
+        let role = resolver.role.take();
+        let translated = translate_inner(
             stmt,
             resolver,
             &mut subprogram_builder,
             connection,
             description,
-        )?;
+        );
+        resolver.role = role;
+        translated?;
         subprogram_builder.epilogue(resolver.schema());
         let built = subprogram_builder.build(connection.clone(), true, description)?;
         let prepared = built.prepared().clone();
