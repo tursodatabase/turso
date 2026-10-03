@@ -68,3 +68,38 @@ expect {
     10
     20
 }
+
+# Qualified reference in subquery when an inner scope shadows an outer table alias:
+# Turso must resolve to the innermost table matching the alias AND column name.
+test nested-shadowed-table-alias-different-columns {
+    SELECT
+    (
+        SELECT (SELECT t.x)
+        FROM (SELECT 2 AS y) AS t
+    ) AS from_outer,
+    (
+        SELECT (SELECT t.y)
+        FROM (SELECT 2 AS y) AS t
+    ) AS from_inner
+    FROM (SELECT 1 AS x) AS t;
+}
+expect {
+    1|2
+}
+
+test nested-shadowed-table-alias-single-level {
+    SELECT (SELECT t.x FROM (SELECT 2 AS y) AS t) AS from_outer
+    FROM (SELECT 1 AS x) AS t;
+}
+expect {
+    1
+}
+
+test nested-shadowed-table-alias-same-column {
+    SELECT (SELECT t.x FROM (SELECT 2 AS x) AS t) AS from_inner
+    FROM (SELECT 1 AS x) AS t;
+}
+expect {
+    2
+}
+
