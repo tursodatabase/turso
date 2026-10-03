@@ -133,6 +133,25 @@ fn test_copy_from_file_not_found(db: TempDatabase) {
 }
 
 #[turso_macros::test(mvcc)]
+fn test_copy_from_file_rejected_when_disabled(db: TempDatabase) {
+    let conn = db.connect_postgres();
+    conn.set_allow_filesystem_copy(false);
+
+    conn.execute("CREATE TABLE t (a INTEGER)").unwrap();
+
+    let tsv = write_temp_file("1\n");
+    let sql = format!("COPY t FROM '{}'", tsv.path().display());
+    let err = conn.execute(&sql).unwrap_err().to_string();
+    assert!(
+        err.contains("not allowed on this connection"),
+        "unexpected error: {err}"
+    );
+
+    let rows = query_all(&conn, "SELECT a FROM t");
+    assert!(rows.is_empty());
+}
+
+#[turso_macros::test(mvcc)]
 fn test_copy_from_wrong_column_count(db: TempDatabase) {
     let conn = db.connect_postgres();
 
