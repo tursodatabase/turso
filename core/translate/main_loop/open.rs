@@ -133,49 +133,92 @@ impl OpenLoop {
                                 idx_num,
                                 idx_str,
                                 constraints,
+                                in_args,
                             },
                             Table::Virtual(_),
                         ) => {
-                            let (start_reg, count, maybe_idx_str, maybe_idx_int) = {
-                                let args_needed = constraints.len();
-                                let start_reg = program.alloc_registers(args_needed);
+                            let args_needed = constraints.len();
+                            let start_reg = program.alloc_registers(args_needed);
 
-                                for (argv_index, expr) in constraints.iter().enumerate() {
-                                    let target_reg = start_reg + argv_index;
-                                    translate_expr(
-                                        program,
-                                        Some(table_references),
-                                        expr,
-                                        target_reg,
-                                        &t_ctx.resolver,
-                                    )?;
-                                }
+                            let mut vtab_in_loops = Vec::new();
+                            for (argv_idx, source) in in_args {
+                                let ephemeral_cursor_id = open_in_seek_source_cursor(
+                                    program,
+                                    table_references,
+                                    &t_ctx.resolver,
+                                    None,
+                                    source,
+                                )?;
+                                vtab_in_loops.push((
+                                    *argv_idx,
+                                    InSeekMetadata {
+                                        ephemeral_cursor_id,
+                                        outer_loop_start: program.allocate_label(),
+                                        next_val_label: program.allocate_label(),
+                                    },
+                                ));
+                            }
 
-                                // If best_index provided an idx_str, translate it.
-                                let maybe_idx_str = if let Some(idx_str) = idx_str {
-                                    let reg = program.alloc_register();
-                                    program.emit_insn(Insn::String8 {
-                                        dest: reg,
-                                        value: idx_str.to_owned(),
-                                    });
-                                    Some(reg)
+                            for i in 0..vtab_in_loops.len() {
+                                let pc_if_empty = if i == 0 {
+                                    loop_end
                                 } else {
-                                    None
+                                    vtab_in_loops[i - 1].1.next_val_label
                                 };
-                                (start_reg, args_needed, maybe_idx_str, Some(*idx_num))
+                                let (argv_idx, meta) = &vtab_in_loops[i];
+                                program.emit_insn(Insn::Rewind {
+                                    cursor_id: meta.ephemeral_cursor_id,
+                                    pc_if_empty,
+                                });
+                                program.preassign_label_to_next_insn(meta.outer_loop_start);
+                                program.emit_insn(Insn::Column {
+                                    cursor_id: meta.ephemeral_cursor_id,
+                                    column: 0,
+                                    dest: start_reg + *argv_idx,
+                                    default: None,
+                                });
+                            }
+
+                            for (argv_index, expr) in constraints.iter().enumerate() {
+                                if vtab_in_loops.iter().any(|(i, _)| *i == argv_index) {
+                                    continue;
+                                }
+                                translate_expr(
+                                    program,
+                                    Some(table_references),
+                                    expr,
+                                    start_reg + argv_index,
+                                    &t_ctx.resolver,
+                                )?;
+                            }
+
+                            let maybe_idx_str = if let Some(idx_str) = idx_str {
+                                let reg = program.alloc_register();
+                                program.emit_insn(Insn::String8 {
+                                    dest: reg,
+                                    value: idx_str.to_owned(),
+                                });
+                                Some(reg)
+                            } else {
+                                None
                             };
 
-                            // Emit VFilter with the computed arguments.
+                            let pc_if_empty = vtab_in_loops
+                                .last()
+                                .map(|(_, meta)| meta.next_val_label)
+                                .unwrap_or(loop_end);
                             program.emit_insn(Insn::VFilter {
                                 cursor_id: table_cursor_id
                                     .expect("Virtual tables do not support covering indexes"),
-                                arg_count: count,
+                                arg_count: args_needed,
                                 args_reg: start_reg,
                                 idx_str: maybe_idx_str,
-                                idx_num: maybe_idx_int.unwrap_or(0) as usize,
-                                pc_if_empty: loop_end,
+                                idx_num: *idx_num as usize,
+                                pc_if_empty,
                             });
                             program.preassign_label_to_next_insn(loop_start);
+                            t_ctx.meta_vtab_in[joined_table_index] =
+                                vtab_in_loops.into_iter().map(|(_, meta)| meta).collect();
                         }
                         (
                             Scan::Subquery { iter_dir },
