@@ -260,8 +260,8 @@ pub fn prepare_delete_plan(
         })
         .unwrap_or(false);
 
-    let has_fk_cascade_triggers = match btree_table_for_triggers.as_ref() {
-        Some(bt) => table_has_fk_cascade_triggers(resolver, database_id, &bt.name)?,
+    let has_fk_cascade_writeback = match btree_table_for_triggers.as_ref() {
+        Some(bt) => fk_delete_cascade_may_write_to_target(resolver, database_id, &bt.name)?,
         None => false,
     };
 
@@ -269,7 +269,7 @@ pub fn prepare_delete_plan(
     if has_delete_triggers {
         safety.require(DmlSafetyReason::Trigger);
     }
-    if has_fk_cascade_triggers {
+    if has_fk_cascade_writeback {
         safety.require(DmlSafetyReason::FkCascade);
     }
     if where_clause_has_subquery(&where_predicates) {
@@ -295,10 +295,11 @@ pub fn prepare_delete_plan(
     Ok(Plan::Delete(Box::new(delete_plan)))
 }
 
-/// Returns true if any FK referencing `table_name` (transitively, following CASCADE chains)
-/// has triggers on the child table side, which could write back to `table_name` and
-/// invalidate a live DELETE scan iterator.
-fn table_has_fk_cascade_triggers(
+/// Returns true if deleting from `table_name` can fire an FK action that writes back
+/// to `table_name` itself and invalidate a live DELETE scan iterator. That happens when
+/// an FK referencing `table_name` (transitively, following CASCADE chains) has triggers
+/// on the child table side, or when the chain leads back to `table_name`.
+fn fk_delete_cascade_may_write_to_target(
     resolver: &crate::translate::emitter::Resolver,
     database_id: usize,
     table_name: &str,
@@ -315,7 +316,7 @@ fn table_has_fk_cascade_triggers(
                 "btree table {table_name} missing from schema after delete validation"
             ))
         })?;
-    worklist.push(start);
+    worklist.push(start.clone());
 
     while let Some(current) = worklist.pop() {
         if visited.iter().any(|t| Arc::ptr_eq(t, &current)) {
@@ -329,6 +330,9 @@ fn table_has_fk_cascade_triggers(
         for fk_ref in referencing_fks {
             if matches!(fk_ref.fk.on_delete, RefAct::NoAction | RefAct::Restrict) {
                 continue;
+            }
+            if Arc::ptr_eq(&fk_ref.child_table, &start) {
+                return Ok(true);
             }
             let child_name = fk_ref.child_table.name.as_str();
             let has_triggers = resolver.with_schema(database_id, |s| {
