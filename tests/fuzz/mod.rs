@@ -48,6 +48,7 @@ mod fuzz_tests {
             "SELECT ~ + 3 << - ~ (~ (8)) - + -1 - 3 >> 3 + -6 * (-7 * 9 >> - 2)",
             // [See this issue for more info](https://github.com/tursodatabase/turso/issues/1763)
             "SELECT ((ceil(pow((((2.0))), (-2.0 - -1.0) / log(0.5)))) - -2.0)",
+            "SELECT (+ + - - - ~ (- ((~ + ~ ~ - - ~ -4 << -3))))",
         ] {
             helpers::assert_differential(
                 &limbo_conn,

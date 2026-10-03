@@ -1673,6 +1673,7 @@ impl<'a> Parser<'a> {
         }
     }
 
+    #[recursive::recursive]
     fn parse_expr_operand(&mut self) -> Result<Box<Expr>> {
         // Height of the operand. Leaves keep this default; branches that recurse
         // into sub-expressions overwrite it with `1 + max(child heights)` so the
@@ -2093,6 +2094,7 @@ impl<'a> Parser<'a> {
     /// Parse an expression, bounding both the parser's recursion depth and the
     /// height of the resulting tree by [`MAX_EXPR_DEPTH`]. On return,
     /// `last_expr_height` holds the height of the returned expression.
+    #[recursive::recursive]
     fn parse_expr(&mut self, precedence: u8) -> Result<Box<Expr>> {
         self.expr_nesting_depth += 1;
         if self.expr_nesting_depth as usize > MAX_EXPR_DEPTH {
@@ -3002,6 +3004,7 @@ impl<'a> Parser<'a> {
         Ok(result)
     }
 
+    #[recursive::recursive]
     fn parse_from_clause(&mut self) -> Result<FromClause> {
         let tok = peek_expect!(
             self,
@@ -3385,6 +3388,7 @@ impl<'a> Parser<'a> {
         })
     }
 
+    #[recursive::recursive]
     fn parse_select(&mut self) -> Result<Select> {
         let with = self.parse_with()?;
         self.parse_select_without_cte(with)

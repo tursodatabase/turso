@@ -4030,6 +4030,7 @@ pub(crate) fn index_method_stage_statement_all(state: &mut ProgramState) -> IORe
     return stage_statement_all_cold(state);
 
     #[inline(never)]
+    #[recursive::recursive]
     fn stage_statement_all_cold(state: &mut ProgramState) -> IOResultOr<()> {
         while state.index_method_finalize_cursor < state.cursors.len() {
             let cursor_id = state.index_method_finalize_cursor;
@@ -4095,6 +4096,7 @@ pub(crate) fn index_method_stage_statement_all(state: &mut ProgramState) -> IORe
 /// Discard statement-owned index-method work before a statement savepoint or
 /// transaction is rolled back. Hooks are deliberately infallible and may not
 /// perform I/O.
+#[recursive::recursive]
 pub(crate) fn index_method_abort_statement_all(state: &mut ProgramState) {
     for (cursor_id, cursor_opt) in state.cursors.iter_mut().enumerate() {
         let Some(Cursor::IndexMethod(cursor)) = cursor_opt else {
@@ -4138,10 +4140,14 @@ pub(crate) fn index_method_on_transaction_committed_all(
         subprograms = state.subprogram_stmt_cache.len(),
         "publishing committed index-method state"
     );
-    if !has_index_method_work(state) {
-        connection.index_methods_on_transaction_committed();
-        return;
+    if has_index_method_work(state) {
+        publish_committed_index_method_state(state);
     }
+    connection.index_methods_on_transaction_committed();
+}
+
+#[recursive::recursive]
+fn publish_committed_index_method_state(state: &mut ProgramState) {
     for (cursor_id, cursor_opt) in state.cursors.iter_mut().enumerate() {
         let Some(Cursor::IndexMethod(cursor)) = cursor_opt else {
             continue;
@@ -4163,7 +4169,6 @@ pub(crate) fn index_method_on_transaction_committed_all(
     for statement in state.subprogram_stmt_cache.values_mut() {
         statement.commit_index_methods();
     }
-    connection.index_methods_on_transaction_committed();
 }
 
 /// Transfer the final prepared cursor for every attachment touched by this
@@ -4182,6 +4187,7 @@ pub(crate) fn index_method_register_transaction_all(
 }
 
 #[inline(never)]
+#[recursive::recursive]
 fn register_index_method_transactions(
     state: &mut ProgramState,
     connection: &Connection,
@@ -5883,6 +5889,7 @@ pub fn op_change_count(
 
 /// Execute a subprogram (Program opcode).
 /// Used for both triggers and FK actions (CASCADE, SET NULL, etc.)
+#[recursive::recursive]
 pub fn op_program(
     program: &Program,
     state: &mut ProgramState,

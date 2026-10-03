@@ -728,6 +728,7 @@ impl Database {
         page_codec_id: Option<PageCodecId>,
         dialect: Arc<dyn Dialect>,
     ) -> Result<Self> {
+        crate::stack::configure_stack_growth();
         let path = path.into();
         let wal_path = wal_path.into();
         let shared_wal = WalFileShared::new_noop();

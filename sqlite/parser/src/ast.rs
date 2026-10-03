@@ -948,7 +948,7 @@ pub enum UnaryOperator {
 /// `SELECT` statement
 // https://sqlite.org/lang_select.html
 // https://sqlite.org/syntax/factored-select-stmt.html
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct Select {
     /// CTE
@@ -959,6 +959,18 @@ pub struct Select {
     pub order_by: Vec<SortedColumn>, // ORDER BY term does not match any column in the result set
     /// `LIMIT`
     pub limit: Option<Limit>,
+}
+
+impl Clone for Select {
+    #[recursive::recursive]
+    fn clone(&self) -> Self {
+        Self {
+            with: self.with.clone(),
+            body: self.body.clone(),
+            order_by: self.order_by.clone(),
+            limit: self.limit.clone(),
+        }
+    }
 }
 
 /// `SELECT` body
@@ -2104,6 +2116,13 @@ pub struct With {
     pub recursive: bool,
     /// CTEs
     pub ctes: Vec<CommonTableExpr>,
+}
+
+impl Drop for With {
+    #[recursive::recursive]
+    fn drop(&mut self) {
+        drop(std::mem::take(&mut self.ctes));
+    }
 }
 
 /// CTE materialization
