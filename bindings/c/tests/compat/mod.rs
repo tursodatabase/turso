@@ -916,6 +916,70 @@ mod tests {
         }
     }
 
+    #[cfg(not(feature = "sqlite3"))]
+    #[test]
+    fn test_sqlite3_bind_blob_negative_len_reads_to_nul() {
+        unsafe {
+            let temp_file = tempfile::NamedTempFile::with_suffix(".db").unwrap();
+            let path = std::ffi::CString::new(temp_file.path().to_str().unwrap()).unwrap();
+            let mut db = ptr::null_mut();
+            assert_eq!(sqlite3_open(path.as_ptr(), &mut db), SQLITE_OK);
+
+            let mut stmt = ptr::null_mut();
+            assert_eq!(
+                sqlite3_prepare_v2(
+                    db,
+                    c"CREATE TABLE test_bind_blob_nlen (data BLOB)".as_ptr(),
+                    -1,
+                    &mut stmt,
+                    ptr::null_mut(),
+                ),
+                SQLITE_OK
+            );
+            assert_eq!(sqlite3_step(stmt), SQLITE_DONE);
+            assert_eq!(sqlite3_finalize(stmt), SQLITE_OK);
+
+            let mut stmt = ptr::null_mut();
+            assert_eq!(
+                sqlite3_prepare_v2(
+                    db,
+                    c"INSERT INTO test_bind_blob_nlen (data) VALUES (?)".as_ptr(),
+                    -1,
+                    &mut stmt,
+                    ptr::null_mut(),
+                ),
+                SQLITE_OK
+            );
+            let data = b"abc\0def";
+            assert_eq!(
+                sqlite3_bind_blob(stmt, 1, data.as_ptr() as *const _, -1, None),
+                SQLITE_OK
+            );
+            assert_eq!(sqlite3_step(stmt), SQLITE_DONE);
+            assert_eq!(sqlite3_finalize(stmt), SQLITE_OK);
+
+            let mut stmt = ptr::null_mut();
+            assert_eq!(
+                sqlite3_prepare_v2(
+                    db,
+                    c"SELECT data FROM test_bind_blob_nlen".as_ptr(),
+                    -1,
+                    &mut stmt,
+                    ptr::null_mut(),
+                ),
+                SQLITE_OK
+            );
+            assert_eq!(sqlite3_step(stmt), SQLITE_ROW);
+            let ptr = sqlite3_column_blob(stmt, 0);
+            let n = sqlite3_column_bytes(stmt, 0);
+            let got = std::slice::from_raw_parts(ptr as *const u8, n as usize);
+            assert_eq!(got, b"abc");
+
+            assert_eq!(sqlite3_finalize(stmt), SQLITE_OK);
+            assert_eq!(sqlite3_close(db), SQLITE_OK);
+        }
+    }
+
     #[test]
     fn test_sqlite3_column_type() {
         unsafe {
