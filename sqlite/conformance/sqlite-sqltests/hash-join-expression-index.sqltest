@@ -1,0 +1,54 @@
+@database :memory:
+
+test hash-join-build-table-expression-index-group-by-inner {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, x TEXT);
+    CREATE TABLE u(k INTEGER);
+    INSERT INTO t VALUES(1,'a'),(2,'b');
+    INSERT INTO u VALUES(1),(2);
+    CREATE INDEX i ON t(lower(x));
+    SELECT lower(t.x), count(*) FROM t JOIN u ON u.k=t.id GROUP BY lower(t.x);
+}
+expect {
+    a|1
+    b|1
+}
+
+test hash-join-build-table-expression-index-group-by-left {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, x TEXT);
+    CREATE TABLE u(k INTEGER);
+    INSERT INTO t VALUES(1,'a'),(2,'b');
+    INSERT INTO u VALUES(1),(2);
+    CREATE INDEX i ON t(lower(x));
+    SELECT lower(t.x), count(*) FROM t LEFT JOIN u ON u.k=t.id GROUP BY lower(t.x);
+}
+expect {
+    a|1
+    b|1
+}
+
+test hash-join-build-table-expression-index-order-by {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, x TEXT);
+    CREATE TABLE u(k INTEGER);
+    INSERT INTO t VALUES(1,'a'),(2,'b');
+    INSERT INTO u VALUES(1),(2);
+    CREATE INDEX i ON t(lower(x));
+    SELECT quote(lower(t.x)) FROM t LEFT JOIN u ON u.k=t.id ORDER BY lower(t.x);
+}
+expect {
+    'a'
+    'b'
+}
+
+test hash-join-build-table-expression-index-insert-select {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, x TEXT);
+    CREATE TABLE u(k INTEGER);
+    CREATE TABLE v(g TEXT);
+    INSERT INTO t VALUES(1,'a'),(2,'b');
+    INSERT INTO u VALUES(1),(2);
+    CREATE INDEX i ON t(lower(x));
+    INSERT INTO v SELECT lower(t.x) FROM t LEFT JOIN u ON u.k=t.id GROUP BY lower(t.x);
+    SELECT count(*), quote(max(g)) FROM v;
+}
+expect {
+    2|'b'
+}
