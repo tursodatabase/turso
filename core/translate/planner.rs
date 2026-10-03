@@ -270,7 +270,9 @@ impl RecursiveRefCounter<'_> {
                 }
                 count
             }
-            ast::SelectTable::Select(subselect, _) => self.count_select(subselect, scope),
+            ast::SelectTable::Select {
+                select: subselect, ..
+            } => self.count_select(subselect, scope),
             ast::SelectTable::Sub(from, _) => {
                 let mut count = self.count_from_table(&from.select, scope);
                 for join in &from.joins {
@@ -344,7 +346,7 @@ impl RecursiveRefCounter<'_> {
                             && !scope.iter().any(|(scope_name, _)| *scope_name == name),
                     )
                 }
-                ast::SelectTable::Select(_, _) => 0,
+                ast::SelectTable::Select { .. } => 0,
                 ast::SelectTable::Sub(from, _) => {
                     count_direct_in_from_table(counter, &from.select, scope)
                         + from
@@ -389,7 +391,9 @@ fn collect_from_select_table(table: &ast::SelectTable, out: &mut Vec<String>) {
                 collect_subquery_table_refs_in_expr(arg, out);
             }
         }
-        ast::SelectTable::Select(subselect, _) => {
+        ast::SelectTable::Select {
+            select: subselect, ..
+        } => {
             collect_from_clause_table_refs(subselect, out);
         }
         ast::SelectTable::Sub(from_clause, _) => {
@@ -1594,7 +1598,14 @@ fn parse_from_clause_table(
             indexed,
             connection,
         ),
-        ast::SelectTable::Select(subselect, maybe_alias) => {
+        ast::SelectTable::Select {
+            select: subselect,
+            alias: maybe_alias,
+            lateral,
+        } => {
+            if lateral {
+                crate::bail_parse_error!("LATERAL subqueries are not supported");
+            }
             // Make the parent's CTEs visible while planning this inline subquery.
             let mut outer_query_refs_for_subquery = table_references.outer_query_refs().to_vec();
             let base_outer_query_refs_for_subquery = base_outer_refs_for_cte_planning(
@@ -1900,7 +1911,11 @@ fn parse_table(
 
         return program.with_view_expansion(database_id, &view.name, |program| {
             parse_from_clause_table(
-                ast::SelectTable::Select(*subselect, view_alias),
+                ast::SelectTable::Select {
+                    select: *subselect,
+                    alias: view_alias,
+                    lateral: false,
+                },
                 resolver,
                 program,
                 table_references,
