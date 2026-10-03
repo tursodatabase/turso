@@ -1,0 +1,57 @@
+# LATERAL subqueries through the PostgreSQL frontend.
+#
+# Coverage here asserts behavior that real PostgreSQL also exhibits, so the
+# corpus stays valid for future differential runs against a stock server.
+
+@database :memory:
+
+setup tables {
+    CREATE TABLE t1 (a int);
+    CREATE TABLE t2 (b int, c text);
+    INSERT INTO t1 VALUES (1), (2), (3);
+    INSERT INTO t2 VALUES (1, 'x'), (2, 'y'), (2, 'z'), (3, 'w');
+}
+
+@setup tables
+test lateral-reads-the-table-on-its-left {
+    SELECT t1.a, s.c FROM t1, LATERAL (SELECT c FROM t2 WHERE t2.b = t1.a) AS s ORDER BY 1, 2;
+}
+expect {
+    1|x
+    2|y
+    2|z
+    3|w
+}
+
+@setup tables
+test cross-join-lateral-with-limit {
+    SELECT t1.a, s.c
+    FROM t1 CROSS JOIN LATERAL (SELECT c FROM t2 WHERE t2.b = t1.a ORDER BY c DESC LIMIT 1) AS s
+    ORDER BY 1;
+}
+expect {
+    1|x
+    2|z
+    3|w
+}
+
+@setup tables
+test left-join-lateral-keeps-rows-without-a-match {
+    SELECT t1.a, s.c
+    FROM t1 LEFT JOIN LATERAL (SELECT c FROM t2 WHERE t2.b = t1.a AND c > 'x') AS s ON true
+    ORDER BY 1, 2;
+}
+expect {
+    1|
+    2|y
+    2|z
+    3|
+}
+
+@setup tables
+test right-join-lateral-cannot-read-the-table-on-its-left {
+    SELECT * FROM t1 RIGHT JOIN LATERAL (SELECT t1.a) AS s ON true;
+}
+expect error {
+    invalid reference to FROM-clause entry for table "t1"
+}
