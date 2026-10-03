@@ -1151,3 +1151,79 @@ expect {
     B
     a
 }
+
+# ===== Dedup keeps the first equal-valued row (SQLite merge semantics) =====
+# When a compound select has ORDER BY, equal-valued duplicates of different
+# storage types (1 vs 1.0) keep the earliest-inserted row, not the last.
+
+setup dedup {
+    CREATE TABLE dt (a);
+    INSERT INTO dt VALUES (1), (1.0), (2), (2.0), (NULL), ('1');
+}
+
+@setup dedup
+test union-order-by-keeps-first-duplicate {
+    SELECT a, typeof(a) FROM dt UNION SELECT a, typeof(a) FROM dt ORDER BY a, 2;
+}
+expect {
+    |null
+    1|integer
+    1.0|real
+    2|integer
+    2.0|real
+    1|text
+}
+
+@setup dedup
+test union-order-by-desc-keeps-first-duplicate {
+    SELECT a FROM dt UNION SELECT a FROM dt ORDER BY a DESC;
+}
+expect {
+    1
+    2
+    1
+    
+}
+
+@setup dedup
+test intersect-order-by-keeps-first-duplicate {
+    SELECT a FROM dt INTERSECT SELECT a FROM dt ORDER BY a;
+}
+expect {
+    
+    1
+    2
+    1
+}
+
+@setup dedup
+test union-order-by-insert-keeps-integer-type {
+    CREATE TABLE aud (x);
+    INSERT INTO aud SELECT a FROM dt INTERSECT SELECT a FROM dt ORDER BY a;
+    SELECT x, typeof(x) FROM aud;
+}
+expect {
+    |null
+    1|integer
+    2|integer
+    1|text
+}
+
+@setup dedup
+test union-all-order-by-keeps-all-duplicates {
+    SELECT a FROM dt UNION ALL SELECT a FROM dt ORDER BY a;
+}
+expect {
+    
+    
+    1
+    1.0
+    1
+    1.0
+    2
+    2.0
+    2
+    2.0
+    1
+    1
+}
