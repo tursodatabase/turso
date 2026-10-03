@@ -123,16 +123,18 @@ pub use cdc::{
 pub use connection::SubqueryUnnestingMode;
 pub use connection::{resolve_ext_path, Connection, PrepareOptions, Row, StepResult, SymbolTable};
 pub(crate) use connection::{AtomicTransactionState, TransactionState};
+#[cfg(test)]
+pub(crate) use database::DatabaseKey;
 #[cfg(feature = "simulator")]
-pub use database::{clear_database_registry, SharedWalTestingSnapshot};
+pub use database::SharedWalTestingSnapshot;
+#[cfg(any(test, feature = "simulator"))]
+pub use database::DATABASE_MANAGER;
 pub(crate) use database::{is_memory_like, DatabaseCatalog, InitState};
 pub use database::{
     ConnectAsyncState, Database, DatabaseAllocators, DatabaseOpts, EncryptionOpts,
     OpenDbAsyncPhase, OpenDbAsyncState, OpenOptions, SharedWalCoordinationOpenTelemetryMode,
     SharedWalOpenTelemetry,
 };
-#[cfg(test)]
-pub(crate) use database::{DatabaseKey, RegistryEntry, DATABASE_MANAGER};
 pub use dialect::{Dialect, SqliteDialect};
 pub use error::{io_error, CompletionError, LimboError};
 pub use function::ContextCollationFunction;

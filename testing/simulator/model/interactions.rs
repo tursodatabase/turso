@@ -943,7 +943,12 @@ fn reopen_database(env: &mut SimulatorEnv, power_loss: bool) -> Result<()> {
         // function opens the replacement database. A real process restart has
         // no process-wide database registry, so the simulator must discard it
         // or the new open can return the old Database and its stale handles.
-        turso_core::clear_database_registry();
+        turso_core::DATABASE_MANAGER
+            .remove_path_with_io(env.get_db_path().to_str().unwrap(), env.io.as_ref());
+        for name in &env.attached_dbs {
+            turso_core::DATABASE_MANAGER
+                .remove_path_with_io(env.get_aux_db_path(name).to_str().unwrap(), env.io.as_ref());
+        }
     } else {
         // TODO: for correct reporting of faults we should get all the recorded numbers and transfer to the new file
         env.io.close_files();
