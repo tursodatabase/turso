@@ -26,6 +26,7 @@ pub mod expression;
 pub mod function;
 pub mod generator;
 pub mod insert;
+pub mod materialized_view;
 pub mod profile;
 pub mod result;
 pub mod schema;
@@ -60,7 +61,8 @@ pub use function::{
     Arity, FunctionCategory, FunctionContext, FunctionDef, FunctionProfile, FunctionRegistry,
 };
 pub use generator::{SqlGeneratorKind, WeightedKindIteratorExt};
-pub use insert::InsertStatement;
+pub use insert::{InsertStatement, OnConflict};
+pub use materialized_view::CreateMaterializedViewStatement;
 pub use profile::{
     CreateIndexProfile, CreateTableProfile, CreateTriggerProfile, DeleteProfile,
     ExtendedExpressionProfile, ExtendedFunctionProfile, GenerationProfile, InsertProfile,
@@ -75,7 +77,7 @@ pub use transaction::{
 };
 pub use update::UpdateStatement;
 pub use utility::{AnalyzeStatement, ReindexStatement, VacuumStatement};
-pub use value::SqlValue;
+pub use value::{NarrowValueProfile, SqlValue};
 pub use view::{CreateViewStatement, DropViewStatement};
 
 /// Strategies for generating SQL values and statements.
@@ -106,7 +108,7 @@ pub mod strategies {
     // DROP TABLE
     pub use crate::drop_table::{drop_table, drop_table_for_schema, drop_table_for_table};
     // INSERT
-    pub use crate::insert::insert_for_table;
+    pub use crate::insert::{insert_for_table, insert_or_replace_for_table, upsert_for_table};
     // SELECT
     pub use crate::select::select_for_table;
     // Statement union
@@ -128,6 +130,10 @@ pub mod strategies {
     };
     // Views
     pub use crate::view::{create_view, drop_view, drop_view_for_schema};
+    // Materialized views
+    pub use crate::materialized_view::{
+        create_materialized_view, drop_materialized_view, materialized_view_sources,
+    };
     // Triggers
     pub use crate::create_trigger::{
         create_trigger_for_schema, create_trigger_for_table, create_trigger_with_timing_event,

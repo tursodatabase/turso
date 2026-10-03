@@ -3,7 +3,7 @@ use crate::numeric::Numeric;
 use crate::storage::btree::{BTreeCursor, BTreeKey, CursorTrait};
 use crate::types::IOResultOr;
 use crate::types::{IOResult, ImmutableRecord, SeekKey, SeekOp, SeekResult};
-use crate::{return_if_io, LimboError, Value};
+use crate::{return_if_io, turso_assert, LimboError, Value};
 
 #[derive(Debug, Default)]
 pub enum ReadRecord {
@@ -64,34 +64,26 @@ impl ReadRecord {
     }
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub enum WriteRow {
-    #[default]
-    GetRecord,
-    Delete {
-        rowid: i64,
-    },
+    GetRecord { seek: LeafBoundarySeek },
+    Delete { rowid: i64 },
     DeleteTable,
     DeleteIndex,
-    ComputeNewRowId {
-        final_weight: isize,
-    },
-    InsertNew {
-        rowid: i64,
-        final_weight: isize,
-    },
-    InsertNewRow {
-        rowid: i64,
-        final_weight: isize,
-    },
-    InsertIndex {
-        rowid: i64,
-    },
-    UpdateExisting {
-        rowid: i64,
-        final_weight: isize,
-    },
+    ComputeNewRowId { final_weight: isize },
+    InsertNew { rowid: i64, final_weight: isize },
+    InsertNewRow { rowid: i64, final_weight: isize },
+    InsertIndex { rowid: i64, sought: bool },
+    UpdateExisting { rowid: i64, final_weight: isize },
     Done,
+}
+
+impl Default for WriteRow {
+    fn default() -> Self {
+        Self::GetRecord {
+            seek: LeafBoundarySeek::default(),
+        }
+    }
 }
 
 impl WriteRow {
@@ -115,18 +107,14 @@ impl WriteRow {
     ) -> IOResultOr<()> {
         loop {
             match self {
-                WriteRow::GetRecord => {
-                    // First, seek in the index to find if the row exists
-                    let index_values = index_key.clone();
-                    let index_record =
-                        ImmutableRecord::from_values(&index_values, index_values.len())?;
-
-                    let res = return_if_io!(cursors.index_cursor.seek(
-                        SeekKey::IndexKey(index_record.as_record_ref()),
-                        SeekOp::GE { eq_only: true }
+                WriteRow::GetRecord { seek } => {
+                    let found = return_if_io!(seek_dbsp_index_key(
+                        seek,
+                        &mut cursors.index_cursor,
+                        &index_key
                     ));
 
-                    if !matches!(res, SeekResult::Found) {
+                    if !found {
                         // Row doesn't exist, we'll insert a new one
                         *self = WriteRow::ComputeNewRowId {
                             final_weight: weight,
@@ -261,9 +249,31 @@ impl WriteRow {
                     let btree_key = BTreeKey::new_table_rowid(rowid_val, Some(&immutable_record));
 
                     return_if_io!(cursors.table_cursor.insert(&btree_key));
-                    *self = WriteRow::InsertIndex { rowid: rowid_val };
+                    *self = WriteRow::InsertIndex {
+                        rowid: rowid_val,
+                        sought: false,
+                    };
                 }
-                WriteRow::InsertIndex { rowid } => {
+                WriteRow::InsertIndex {
+                    rowid,
+                    sought: false,
+                } => {
+                    // GetRecord may have left the cursor on the next leaf page,
+                    // which is not where this key must be inserted.
+                    let mut index_values = index_key.clone();
+                    index_values.push(Value::from_i64(*rowid));
+                    let index_record =
+                        ImmutableRecord::from_values(&index_values, index_values.len())?;
+                    return_if_io!(cursors.index_cursor.seek(
+                        SeekKey::IndexKey(index_record.as_record_ref()),
+                        SeekOp::GE { eq_only: false }
+                    ));
+                    *self = WriteRow::InsertIndex {
+                        rowid: *rowid,
+                        sought: true,
+                    };
+                }
+                WriteRow::InsertIndex { rowid, .. } => {
                     // For has_rowid indexes, we need to append the rowid to the index key
                     // Use the function parameter index_key directly
                     let mut index_values = index_key.clone();
@@ -296,6 +306,77 @@ impl WriteRow {
                 }
                 WriteRow::Done => {
                     return Ok(IOResult::Done(()));
+                }
+            }
+        }
+    }
+}
+
+/// Returns whether the DBSP state index holds an entry whose
+/// `(storage_id, key_hash, element_hash)` prefix equals `index_key`, and leaves
+/// the cursor on it. An `eq_only` seek reports `NotFound` when that entry is the
+/// first one on the next leaf page, so this seeks with `eq_only: false`.
+pub fn seek_dbsp_index_key<C: CursorTrait>(
+    seek: &mut LeafBoundarySeek,
+    cursor: &mut C,
+    index_key: &[Value],
+) -> IOResultOr<bool> {
+    let index_record = ImmutableRecord::from_values(index_key, index_key.len())?;
+    let positioned = return_if_io!(seek.seek(
+        cursor,
+        SeekKey::IndexKey(index_record.as_record_ref()),
+        SeekOp::GE { eq_only: false }
+    ));
+    if !positioned {
+        return Ok(IOResult::Done(false));
+    }
+    let record = return_if_io!(cursor.record()).expect("a positioned cursor has a record");
+    let (v0, v1, v2) = record.get_three_values(0, 1, 2)?;
+    let found = v0.to_owned()? == index_key[0]
+        && v1.to_owned()? == index_key[1]
+        && v2.to_owned()? == index_key[2];
+    Ok(IOResult::Done(found))
+}
+
+/// A seek that also reaches an entry which is the first cell of the next leaf page.
+/// The btree answers `TryAdvance` instead of pointing at such an entry, and the caller
+/// has to step there itself. Callers keep this value in their own operation state:
+/// the step can wait for I/O, and the cursor is then in the middle of an advance that
+/// a second seek would discard.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub enum LeafBoundarySeek {
+    #[default]
+    Seeking,
+    Advancing,
+}
+
+impl LeafBoundarySeek {
+    /// Puts `cursor` on the first entry that satisfies `op` and returns whether there
+    /// is one.
+    pub fn seek<C: CursorTrait>(
+        &mut self,
+        cursor: &mut C,
+        key: SeekKey<'_>,
+        op: SeekOp,
+    ) -> IOResultOr<bool> {
+        loop {
+            match self {
+                LeafBoundarySeek::Seeking => match return_if_io!(cursor.seek(key.clone(), op)) {
+                    SeekResult::Found => return Ok(IOResult::Done(true)),
+                    SeekResult::NotFound => return Ok(IOResult::Done(false)),
+                    SeekResult::TryAdvance => *self = LeafBoundarySeek::Advancing,
+                },
+                LeafBoundarySeek::Advancing => {
+                    turso_assert!(
+                        !cursor.get_skip_advance(),
+                        "skip_advance should not be true in the middle of a seek operation"
+                    );
+                    match op {
+                        SeekOp::GT | SeekOp::GE { .. } => return_if_io!(cursor.next()),
+                        SeekOp::LT | SeekOp::LE { .. } => return_if_io!(cursor.prev()),
+                    }
+                    *self = LeafBoundarySeek::Seeking;
+                    return Ok(IOResult::Done(cursor.has_record()));
                 }
             }
         }

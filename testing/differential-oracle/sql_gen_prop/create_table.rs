@@ -288,6 +288,11 @@ pub struct CreateTableProfile {
     pub primary_key: PrimaryKeyProfile,
     /// Profile for non-PK column generation.
     pub column: ColumnProfile,
+    /// Create tables in the main database only, never in `temp` or an attached database.
+    pub main_schema_only: bool,
+    /// Draw 4 in 10 column names from a small pool, so that different tables
+    /// have columns with the same name.
+    pub shared_column_names: bool,
 }
 
 impl Default for CreateTableProfile {
@@ -299,6 +304,8 @@ impl Default for CreateTableProfile {
             strict_probability: 20,
             primary_key: PrimaryKeyProfile::default(),
             column: ColumnProfile::default(),
+            main_schema_only: false,
+            shared_column_names: false,
         }
     }
 }
@@ -313,6 +320,8 @@ impl CreateTableProfile {
             strict_probability: self.strict_probability,
             primary_key: self.primary_key.integer_only(),
             column: self.column.minimal(),
+            main_schema_only: self.main_schema_only,
+            shared_column_names: self.shared_column_names,
         }
     }
 
@@ -325,6 +334,8 @@ impl CreateTableProfile {
             strict_probability: self.strict_probability,
             primary_key: self.primary_key,
             column: self.column.high_constraints(),
+            main_schema_only: self.main_schema_only,
+            shared_column_names: self.shared_column_names,
         }
     }
 
@@ -337,6 +348,8 @@ impl CreateTableProfile {
             strict_probability: self.strict_probability,
             primary_key: self.primary_key.integer_only(),
             column: self.column.full_constraints(),
+            main_schema_only: self.main_schema_only,
+            shared_column_names: self.shared_column_names,
         }
     }
 
@@ -349,6 +362,8 @@ impl CreateTableProfile {
             strict_probability: self.strict_probability,
             primary_key: self.primary_key.none(),
             column: self.column,
+            main_schema_only: self.main_schema_only,
+            shared_column_names: self.shared_column_names,
         }
     }
 
@@ -600,6 +615,13 @@ fn check_constraint_for_column(name: &str, data_type: DataType) -> BoxedStrategy
 
 /// Generate a column definition with profile-controlled constraints.
 pub fn column_def_with_profile(profile: &ColumnProfile) -> BoxedStrategy<ColumnDef> {
+    column_def_named(profile, identifier().boxed())
+}
+
+fn column_def_named(
+    profile: &ColumnProfile,
+    names: BoxedStrategy<String>,
+) -> BoxedStrategy<ColumnDef> {
     let not_null_prob = profile.not_null_probability;
     let unique_prob = profile.unique_probability;
     let default_prob = profile.default_probability;
@@ -607,7 +629,7 @@ pub fn column_def_with_profile(profile: &ColumnProfile) -> BoxedStrategy<ColumnD
     let data_type_weights = profile.data_type_weights.clone();
 
     (
-        identifier(),
+        names,
         data_type_weighted(&data_type_weights),
         0u8..100, // for NOT NULL decision
         0u8..100, // for UNIQUE decision
@@ -658,9 +680,16 @@ pub fn column_def() -> BoxedStrategy<ColumnDef> {
 pub fn primary_key_column_def_with_profile(
     profile: &PrimaryKeyProfile,
 ) -> BoxedStrategy<ColumnDef> {
+    primary_key_column_def_named(profile, identifier().boxed())
+}
+
+fn primary_key_column_def_named(
+    profile: &PrimaryKeyProfile,
+    names: BoxedStrategy<String>,
+) -> BoxedStrategy<ColumnDef> {
     let data_type_weights = profile.data_type_weights.clone();
 
-    (identifier(), data_type_weighted(&data_type_weights))
+    (names, data_type_weighted(&data_type_weights))
         .prop_map(|(name, data_type)| ColumnDef {
             name,
             data_type,
@@ -679,9 +708,12 @@ pub fn primary_key_column_def() -> BoxedStrategy<ColumnDef> {
 }
 
 /// Generate an optional primary key column based on profile settings.
-fn optional_primary_key(profile: &PrimaryKeyProfile) -> BoxedStrategy<Option<ColumnDef>> {
+fn optional_primary_key(
+    profile: &PrimaryKeyProfile,
+    names: BoxedStrategy<String>,
+) -> BoxedStrategy<Option<ColumnDef>> {
     if profile.always_include {
-        primary_key_column_def_with_profile(profile)
+        primary_key_column_def_named(profile, names)
             .prop_map(Some)
             .boxed()
     } else {
@@ -690,7 +722,7 @@ fn optional_primary_key(profile: &PrimaryKeyProfile) -> BoxedStrategy<Option<Col
         (0u8..100)
             .prop_flat_map(move |roll| {
                 if roll < include_prob {
-                    primary_key_column_def_with_profile(&profile)
+                    primary_key_column_def_named(&profile, names.clone())
                         .prop_map(Some)
                         .boxed()
                 } else {
@@ -711,13 +743,16 @@ pub fn create_table(
     schema: &Schema,
     profile: &StatementProfile,
 ) -> BoxedStrategy<CreateTableStatement> {
-    let attached_databases = schema.attached_databases.clone();
-    let mut database_choices = vec![None, Some("temp".to_string())];
-    for db in attached_databases {
-        if db == "temp" {
-            continue;
+    let create_table_profile = profile.create_table_profile();
+    let mut database_choices = vec![None];
+    if !create_table_profile.main_schema_only {
+        database_choices.push(Some("temp".to_string()));
+        for db in &schema.attached_databases {
+            if db == "temp" {
+                continue;
+            }
+            database_choices.push(Some(db.clone()));
         }
-        database_choices.push(Some(db));
     }
     let target_databases: Vec<(Option<String>, std::collections::HashSet<String>)> =
         database_choices
@@ -728,13 +763,13 @@ pub fn create_table(
             })
             .collect();
 
-    // Extract profile values from the CreateTableProfile
-    let create_table_profile = profile.create_table_profile();
     let column_count_range = create_table_profile.column_count_range.clone();
     let column_profile = create_table_profile.column.clone();
     let pk_profile = create_table_profile.primary_key.clone();
     let if_not_exists_prob = create_table_profile.if_not_exists_probability;
     let strict_prob = create_table_profile.strict_probability;
+    let shared_column_names = create_table_profile.shared_column_names;
+    let names = column_names(shared_column_names);
 
     any::<proptest::sample::Index>()
         .prop_flat_map(move |db_idx| {
@@ -749,9 +784,9 @@ pub fn create_table(
                 // Proptest-driven keyword choice (TEMP vs TEMPORARY)
                 // so replay and shrinking are deterministic.
                 any::<bool>(),
-                optional_primary_key(&pk_profile),
+                optional_primary_key(&pk_profile, names.clone()),
                 proptest::collection::vec(
-                    column_def_with_profile(&column_profile),
+                    column_def_named(&column_profile, names.clone()),
                     column_count_range.clone(),
                 ),
             )
@@ -777,6 +812,10 @@ pub fn create_table(
                     columns.push(pk);
                 }
                 columns.extend(other_cols);
+                if shared_column_names {
+                    let mut seen = HashSet::new();
+                    columns.retain(|c| seen.insert(c.name.clone()));
+                }
 
                 // Ensure at least one column exists
                 if columns.is_empty() {
@@ -817,6 +856,29 @@ pub fn create_table(
             },
         )
         .boxed()
+}
+
+const SHARED_COLUMN_NAMES: [&str; 8] = [
+    "id",
+    "name",
+    "kind",
+    "val",
+    "ref_id",
+    "parent_id",
+    "tag",
+    "amount",
+];
+
+fn column_names(shared: bool) -> BoxedStrategy<String> {
+    if shared {
+        prop_oneof![
+            6 => identifier(),
+            4 => proptest::sample::select(&SHARED_COLUMN_NAMES[..]).prop_map(String::from),
+        ]
+        .boxed()
+    } else {
+        identifier().boxed()
+    }
 }
 
 #[cfg(test)]
