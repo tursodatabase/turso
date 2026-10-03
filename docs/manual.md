@@ -912,6 +912,35 @@ CREATE INDEX idx_tags ON articles USING fts (tag) WITH (tokenizer = 'raw');
 | `whitespace` | Split on whitespace only | Space-separated tokens |
 | `ngram` | 2-3 character n-grams | Autocomplete, substring matching |
 
+### JSON Fields
+
+Use `json_fields` to index JSON object columns with Tantivy's native JSON field support:
+
+```sql
+CREATE TABLE docs(id INTEGER PRIMARY KEY, title TEXT, body TEXT, properties TEXT);
+CREATE INDEX docs_fts ON docs USING fts(title, body, properties)
+WITH (json_fields = 'properties', json_tokenizer = 'raw');
+
+INSERT INTO docs VALUES
+    (1, 'Release checklist', 'Meeting notes', '{"person":"PERSON-1","budget":100}');
+
+SELECT id FROM docs
+WHERE fts_match(title, body, properties, 'title:release AND properties.person:PERSON-1');
+
+SELECT id FROM docs
+WHERE fts_match(title, body, properties, 'properties.budget:[50 TO 200]');
+```
+
+Both queries return `1`. The query strings use native Tantivy syntax.
+
+`json_fields` is a comma-separated list of indexed SQL column names, matched case-insensitively. It selects columns, not keys inside JSON objects. Unknown columns, duplicates and empty entries are rejected.
+
+`json_tokenizer` controls string values in all selected JSON columns and defaults to `tokenizer`. It accepts the same tokenizer names. Tantivy's `raw` tokenizer emits each string as one unchanged token: `PERSON-1`, `person-1` and `PERSON 1` remain distinct. Use it for identifiers and exact values. Use `default` for word searches in prose. Other indexed columns keep their `tokenizer` setting. If either tokenizer is `ngram`, `min_gram` and `max_gram` configure its window.
+
+JSON columns accept object text, SQL `NULL` and JSON `null`. Nested objects and arrays are indexed; numeric and boolean values retain their types. Invalid JSON, root arrays/scalars and non-text SQL values, including JSONB blobs, are rejected. Index creation also validates existing rows. Columns omitted from `json_fields` retain ordinary text indexing.
+
+Keys can contain Unicode and punctuation. Escape literal dots in queries: `properties.person\.name:Ann` addresses the key `person.name`, while `properties.person.name:Ann` addresses a nested path. Tantivy 0.26.2 has a known range-query bug for literal dotted keys; exact queries on these keys work.
+
 ### Field Weights
 
 Configure relative importance of indexed columns for relevance scoring:
