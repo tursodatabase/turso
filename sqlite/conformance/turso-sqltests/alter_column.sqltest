@@ -887,3 +887,44 @@ expect {
     text
     ok
 }
+
+# ALTER COLUMN shares the duplicate-name check with RENAME COLUMN. Keeping the
+# name, or changing only its case, must not count as a clash with the column
+# being altered (issue #9429).
+@cross-check-integrity
+test alter-column-keeps-name {
+    CREATE TABLE t (a INTEGER, b TEXT);
+    INSERT INTO t VALUES (1, 'x');
+    ALTER TABLE t ALTER COLUMN a TO a TEXT;
+    SELECT sql FROM sqlite_schema WHERE name = 't';
+    SELECT typeof(a), a FROM t;
+    PRAGMA integrity_check;
+}
+expect {
+    CREATE TABLE t (a TEXT, b TEXT)
+    text|1
+    ok
+}
+
+@cross-check-integrity
+test alter-column-case-only-rename {
+    CREATE TABLE t (a INTEGER, b TEXT);
+    INSERT INTO t VALUES (1, 'x');
+    ALTER TABLE t ALTER COLUMN a TO A TEXT;
+    SELECT sql FROM sqlite_schema WHERE name = 't';
+    SELECT typeof(A), A, b FROM t;
+    PRAGMA integrity_check;
+}
+expect {
+    CREATE TABLE t (A TEXT, b TEXT)
+    text|1|x
+    ok
+}
+
+test fail-alter-column-onto-other-column-with-different-case {
+    CREATE TABLE t (a INTEGER, b TEXT);
+    ALTER TABLE t ALTER COLUMN b TO A TEXT;
+}
+expect error {
+    duplicate column name
+}

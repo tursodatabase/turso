@@ -16931,7 +16931,10 @@ fn rewrite_trigger_for_column_rename(
     for cmd in &mut trigger.commands {
         rewrite_trigger_cmd_column_refs(cmd, table_name, &trigger_tbl, old_col, new_col);
     }
-    if trigger_still_references_renamed_column(trigger, table_name, old_col) {
+    // A case-only rename keeps the column reachable under its old spelling.
+    if !old_col.eq_ignore_ascii_case(new_col)
+        && trigger_still_references_renamed_column(trigger, table_name, old_col)
+    {
         return Err(LimboError::ParseError(format!(
             "error in trigger {} after rename: no such column: {}",
             trigger.name, old_col
