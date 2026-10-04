@@ -288,6 +288,25 @@ expect {
     3|w
 }
 
+test lateral-join-condition-reads-the-table-on-its-left {
+    CREATE TABLE oc_outer(id INTEGER PRIMARY KEY, x INT);
+    CREATE TABLE oc_items(id INTEGER PRIMARY KEY, b INT);
+    INSERT INTO oc_outer VALUES (1, 1), (2, 2), (3, 2);
+    INSERT INTO oc_items VALUES (1, 1), (2, 2);
+    SELECT r.id, s.n
+    FROM oc_outer AS r, LATERAL (
+        SELECT count(*) AS n
+        FROM oc_outer AS m JOIN oc_items AS k ON r.id = m.x
+        WHERE k.b < (SELECT max(w.b) FROM oc_items AS w WHERE r.x > 0)
+    ) AS s
+    ORDER BY r.id;
+}
+expect {
+    1|1
+    2|2
+    3|0
+}
+
 test lateral-as-the-first-from-item {
     SELECT * FROM LATERAL (SELECT 1 AS a) AS s;
 }
