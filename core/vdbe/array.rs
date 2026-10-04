@@ -79,6 +79,23 @@ fn parse_pg_text_array(text: &str) -> Option<Vec<Value>> {
                             b'n' => s.push('\n'),
                             b't' => s.push('\t'),
                             b'r' => s.push('\r'),
+                            b'u' => {
+                                let end = pos + 5;
+                                let code = if end <= bytes.len()
+                                    && bytes[pos + 1..end].iter().all(|b| b.is_ascii_hexdigit())
+                                {
+                                    u32::from_str_radix(&inner[pos + 1..end], 16).ok()
+                                } else {
+                                    None
+                                };
+                                match code.and_then(char::from_u32) {
+                                    Some(ch) => {
+                                        s.push(ch);
+                                        pos += 4;
+                                    }
+                                    None => s.push('u'),
+                                }
+                            }
                             other => s.push(other as char),
                         }
                     }
@@ -106,6 +123,8 @@ fn parse_pg_text_array(text: &str) -> Option<Vec<Value>> {
             let token = &inner[start..pos];
             if token.eq_ignore_ascii_case("null") {
                 elements.push(Value::Null);
+            } else if let Some(blob) = blob_literal(token) {
+                elements.push(blob);
             } else if let Ok(i) = token.parse::<i64>() {
                 elements.push(Value::from_i64(i));
             } else if let Ok(f) = token.parse::<f64>() {
@@ -141,6 +160,31 @@ fn parse_pg_text_array(text: &str) -> Option<Vec<Value>> {
     }
 
     Some(elements)
+}
+
+/// Read an unquoted array token shaped like a SQLite blob literal
+/// (`X'1A2B'`, case-insensitive, even number of hex digits) into a Blob value.
+/// Returns None for any other shape so the caller can fall back to text.
+fn blob_literal(token: &str) -> Option<Value> {
+    let bytes = token.as_bytes();
+    if bytes.len() < 3
+        || !bytes[0].eq_ignore_ascii_case(&b'x')
+        || bytes[1] != b'\''
+        || bytes[bytes.len() - 1] != b'\''
+    {
+        return None;
+    }
+    let hex = &bytes[2..bytes.len() - 1];
+    if hex.len() % 2 != 0 || !hex.iter().all(|b| b.is_ascii_hexdigit()) {
+        return None;
+    }
+    let mut blob = Vec::with_capacity(hex.len() / 2);
+    for pair in hex.chunks_exact(2) {
+        let high = (pair[0] as char).to_digit(16)?;
+        let low = (pair[1] as char).to_digit(16)?;
+        blob.push(((high << 4) | low) as u8);
+    }
+    Value::from_slice(&blob).ok()
 }
 
 /// Pack values into a record-format array blob.
@@ -191,20 +235,25 @@ fn write_value_ref_pg(result: &mut String, val: &crate::ValueRef<'_>) {
             write_pg_text_element(result, t.as_str());
         }
         crate::ValueRef::Blob(b) => {
-            result.push_str("\"X'");
+            result.push_str("X'");
             for byte in *b {
                 let _ = write!(result, "{byte:02X}");
             }
-            result.push_str("'\"");
+            result.push('\'');
         }
     }
 }
 
 /// Write a text element in PG array format.
 /// Simple values are unquoted; values with special chars are double-quoted.
+/// Text that would parse back as something else (a number, a blob literal)
+/// is also quoted so the text form round-trips through parse_pg_text_array.
 fn write_pg_text_element(result: &mut String, s: &str) {
     let needs_quoting = s.is_empty()
         || s.eq_ignore_ascii_case("null")
+        || s.parse::<i64>().is_ok()
+        || s.parse::<f64>().is_ok()
+        || blob_literal(s).is_some()
         || s.contains(|c: char| {
             c == ','
                 || c == '{'
@@ -825,6 +874,84 @@ mod tests {
         };
         let text = serialize_array_from_blob(blob).unwrap();
         assert_eq!(text, "{1,hello,NULL}");
+    }
+
+    #[test]
+    fn test_serialize_quotes_text_that_would_parse_as_number() {
+        let arr = values_to_record_blob(&[
+            Value::build_text("007"),
+            Value::build_text("1e3"),
+            Value::build_text("nan"),
+            Value::build_text("inf"),
+        ])
+        .unwrap();
+        let Value::Blob(blob) = &arr else {
+            panic!("Expected Blob");
+        };
+        let text = serialize_array_from_blob(blob).unwrap();
+        assert_eq!(text, r#"{"007","1e3","nan","inf"}"#);
+        let parsed = parse_text_array(&text).unwrap();
+        assert_eq!(parsed[0], Value::build_text("007"));
+        assert_eq!(parsed[1], Value::build_text("1e3"));
+        assert_eq!(parsed[2], Value::build_text("nan"));
+        assert_eq!(parsed[3], Value::build_text("inf"));
+    }
+
+    #[test]
+    fn test_serialize_blob_element_uses_blob_literal() {
+        let arr = values_to_record_blob(&[Value::from_slice(&[0xDE, 0xAD, 0xBE, 0xEF]).unwrap()])
+            .unwrap();
+        let Value::Blob(blob) = &arr else {
+            panic!("Expected Blob");
+        };
+        let text = serialize_array_from_blob(blob).unwrap();
+        assert_eq!(text, "{X'DEADBEEF'}");
+        let parsed = parse_text_array(&text).unwrap();
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(
+            parsed[0],
+            Value::from_slice(&[0xDE, 0xAD, 0xBE, 0xEF]).unwrap()
+        );
+    }
+
+    #[test]
+    fn test_serialize_quotes_text_shaped_like_blob_literal() {
+        let arr = values_to_record_blob(&[Value::build_text("X'41'")]).unwrap();
+        let Value::Blob(blob) = &arr else {
+            panic!("Expected Blob");
+        };
+        let text = serialize_array_from_blob(blob).unwrap();
+        assert_eq!(text, r#"{"X'41'"}"#);
+        let parsed = parse_text_array(&text).unwrap();
+        assert_eq!(parsed[0], Value::build_text("X'41'"));
+    }
+
+    #[test]
+    fn test_parse_text_array_unicode_escape() {
+        let result = parse_text_array(r#"{"a\u0001b","z"}"#).unwrap();
+        assert_eq!(result[0], Value::build_text("a\u{1}b"));
+        assert_eq!(result[1], Value::build_text("z"));
+    }
+
+    #[test]
+    fn test_serialize_parse_round_trip_preserves_types() {
+        let values = vec![
+            Value::from_i64(7),
+            Value::from_f64(1.5),
+            Value::build_text("plain"),
+            Value::build_text("007"),
+            Value::build_text("a\u{1}b"),
+            Value::build_text("X'AB'"),
+            Value::from_slice(&[1, 2, 3]).unwrap(),
+            Value::Null,
+        ];
+        let arr = values_to_record_blob(&values).unwrap();
+        let Value::Blob(blob) = &arr else {
+            panic!("Expected Blob");
+        };
+        let text = serialize_array_from_blob(blob).unwrap();
+        let parsed = parse_text_array(&text).unwrap();
+        assert_eq!(parsed, values);
     }
 
     #[test]
