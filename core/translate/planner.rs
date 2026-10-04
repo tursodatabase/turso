@@ -2945,6 +2945,12 @@ fn parse_join(
              the combining JOIN type must be INNER or LEFT for a LATERAL reference"
         );
     }
+    if lateral_reference.is_some() && has_right_or_full_join {
+        crate::bail_parse_error!(
+            "RIGHT and FULL joins are not supported in a FROM clause with a LATERAL subquery \
+             that reads a table on its left"
+        );
+    }
     let natural = matches!(
         join_operator,
         ast::JoinOperator::TypedJoin(Some(join_type))
