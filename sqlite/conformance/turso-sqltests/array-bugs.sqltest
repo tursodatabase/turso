@@ -174,3 +174,75 @@ test array-nested-case-display {
 expect {
     {1,2}
 }
+
+test array-text-number-lookalikes-round-trip {
+    CREATE TABLE rtl1 (id INTEGER PRIMARY KEY, tags TEXT[]) STRICT;
+    INSERT INTO rtl1 VALUES (1, ARRAY['007', '1e3', 'nan', 'inf']);
+    SELECT tags FROM rtl1;
+    INSERT INTO rtl1 VALUES (2, '{"007","1e3","nan","inf"}');
+    SELECT tags FROM rtl1 WHERE id = 2;
+}
+expect {
+    {"007","1e3","nan","inf"}
+    {"007","1e3","nan","inf"}
+}
+
+test array-text-blob-literal-lookalike-round-trip {
+    CREATE TABLE rtl2 (id INTEGER PRIMARY KEY, tags TEXT[]) STRICT;
+    INSERT INTO rtl2 VALUES (1, ARRAY['X''41''', 'x''ab''']);
+    SELECT tags FROM rtl2;
+    INSERT INTO rtl2 VALUES (2, '{"X''41''","x''ab''"}');
+    SELECT tags FROM rtl2 WHERE id = 2;
+}
+expect {
+    {"X'41'","x'ab'"}
+    {"X'41'","x'ab'"}
+}
+
+test array-text-control-char-round-trip {
+    CREATE TABLE rcc1 (id INTEGER PRIMARY KEY, tags TEXT[]) STRICT;
+    INSERT INTO rcc1 VALUES (1, ARRAY['a' || char(1) || 'b']);
+    SELECT tags FROM rcc1;
+    INSERT INTO rcc1 VALUES (2, '{"a\u0001b"}');
+    SELECT tags FROM rcc1 ORDER BY id;
+}
+expect {
+    {"a\u0001b"}
+    {"a\u0001b"}
+    {"a\u0001b"}
+}
+
+test array-blob-element-round-trip {
+    CREATE TABLE rb1 (id INTEGER PRIMARY KEY, data BLOB[]) STRICT;
+    INSERT INTO rb1 VALUES (1, ARRAY[x'DEADBEEF']);
+    SELECT data FROM rb1;
+    INSERT INTO rb1 VALUES (2, '{X''DEADBEEF''}');
+    SELECT id, data, hex(data[1]) FROM rb1 ORDER BY id;
+}
+expect {
+    {X'DEADBEEF'}
+    1|{X'DEADBEEF'}|DEADBEEF
+    2|{X'DEADBEEF'}|DEADBEEF
+}
+
+test array-blob-empty-element-round-trip {
+    CREATE TABLE rb2 (id INTEGER PRIMARY KEY, data BLOB[]) STRICT;
+    INSERT INTO rb2 VALUES (1, ARRAY[x'']);
+    SELECT data, length(data[1]) FROM rb2;
+}
+expect {
+    {X''}|0
+}
+
+test array-any-blob-element-round-trip {
+    CREATE TABLE rab1 (id INTEGER PRIMARY KEY, data ANY[]) STRICT;
+    INSERT INTO rab1 VALUES (1, ARRAY[1, x'AB', 'X''CD''']);
+    SELECT data FROM rab1;
+    INSERT INTO rab1 VALUES (2, '{1,X''AB'',"X''CD''"}');
+    SELECT id, data FROM rab1 ORDER BY id;
+}
+expect {
+    {1,X'AB',"X'CD'"}
+    1|{1,X'AB',"X'CD'"}
+    2|{1,X'AB',"X'CD'"}
+}

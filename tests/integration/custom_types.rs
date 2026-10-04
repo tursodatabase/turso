@@ -441,6 +441,84 @@ mod tests {
         }
     }
 
+    /// VACUUM copies rows by selecting them (which decodes arrays to their
+    /// `{...}` text form) and inserting into the rebuilt database. BLOB[]
+    /// elements must survive that decode/encode round trip: they used to be
+    /// emitted as quoted text and the STRICT re-insert failed with
+    /// "cannot store TEXT value in BLOB".
+    #[test]
+    fn test_vacuum_preserves_blob_array_elements() {
+        let temp_dir = TempDir::new().unwrap();
+        let path = temp_dir.path().join("vacuum_blob_array.db");
+        let opts = turso_core::DatabaseOpts::new()
+            .with_custom_types(true)
+            .with_encryption(true);
+        let db = TempDatabase::new_with_existent_with_opts(&path, opts);
+        let conn = db.connect_limbo();
+
+        conn.execute("CREATE TABLE bar(id BLOB PRIMARY KEY, parents BLOB[]) STRICT")
+            .unwrap();
+        conn.execute("INSERT INTO bar VALUES (x'cafe', ARRAY[]), (x'babe', ARRAY[x'cafe'])")
+            .unwrap();
+        conn.execute("VACUUM").unwrap();
+
+        let rows: Vec<(String, String)> =
+            conn.exec_rows("SELECT hex(id), parents FROM bar ORDER BY id");
+        assert_eq!(
+            rows,
+            vec![
+                ("BABE".to_string(), "{X'CAFE'}".to_string()),
+                ("CAFE".to_string(), "{}".to_string()),
+            ]
+        );
+
+        let rows: Vec<(String, String)> = conn
+            .exec_rows("SELECT hex(parents[1]), typeof(parents[1]) FROM bar WHERE id = x'babe'");
+        assert_eq!(rows, vec![("CAFE".to_string(), "blob".to_string())]);
+
+        conn.close().unwrap();
+    }
+
+    /// SELECT displays an array in `{...}` text form and `.dump` writes that
+    /// text into an INSERT. The text must encode each element's type so the
+    /// reload stores the same values: number-looking strings keep their
+    /// quotes, control chars use \u escapes, blob elements use X'..' literals.
+    #[test]
+    fn test_array_text_form_round_trip() {
+        let temp_dir = TempDir::new().unwrap();
+        let path = temp_dir.path().join("array_text_round_trip.db");
+        let opts = turso_core::DatabaseOpts::new()
+            .with_custom_types(true)
+            .with_encryption(true);
+        let db = TempDatabase::new_with_existent_with_opts(&path, opts);
+        let conn = db.connect_limbo();
+
+        conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, tags TEXT[], data BLOB[]) STRICT")
+            .unwrap();
+        conn.execute(
+            "INSERT INTO t VALUES (1, ARRAY['007', '1e3', 'a' || char(1) || 'b', 'X''41'''], ARRAY[x'DEADBEEF'])",
+        )
+        .unwrap();
+
+        let rows: Vec<(String, String)> = conn.exec_rows("SELECT tags, data FROM t WHERE id = 1");
+        assert_eq!(
+            rows,
+            vec![(
+                "{\"007\",\"1e3\",\"a\\u0001b\",\"X'41'\"}".to_string(),
+                "{X'DEADBEEF'}".to_string()
+            )]
+        );
+
+        conn.execute(
+            "INSERT INTO t VALUES (2, '{\"007\",\"1e3\",\"a\\u0001b\",\"X''41''\"}', '{X''DEADBEEF''}')",
+        )
+        .unwrap();
+        let rows: Vec<(String, String)> = conn.exec_rows("SELECT tags, data FROM t ORDER BY id");
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0], rows[1], "re-inserted row must match the original");
+        conn.close().unwrap();
+    }
+
     /// Self-joins on custom type columns must return matching rows.
     ///
     /// The optimizer builds an ephemeral auto-index for the inner table.
