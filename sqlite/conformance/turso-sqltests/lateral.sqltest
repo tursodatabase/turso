@@ -414,6 +414,36 @@ expect error {
     the combining JOIN type must be INNER or LEFT for a LATERAL reference
 }
 
+test full-join-with-a-lateral-that-reads-the-joined-tables {
+    CREATE TABLE f1(a);
+    CREATE TABLE f2(x);
+    SELECT * FROM f1 FULL JOIN f2 ON f1.a = f2.x, LATERAL (SELECT f1.a) AS s;
+}
+expect error {
+    RIGHT and FULL joins are not supported in a FROM clause with a LATERAL subquery that reads a table on its left
+}
+
+test right-join-after-a-lateral-that-reads-the-table-on-its-left {
+    CREATE TABLE f1(a);
+    CREATE TABLE f2(x);
+    SELECT * FROM f1, LATERAL (SELECT f1.a AS v) AS s RIGHT JOIN f2 ON s.v = f2.x;
+}
+expect error {
+    RIGHT and FULL joins are not supported in a FROM clause with a LATERAL subquery that reads a table on its left
+}
+
+test right-join-next-to-a-lateral-that-reads-only-constants {
+    CREATE TABLE f1(a);
+    CREATE TABLE f2(x);
+    INSERT INTO f1 VALUES (1), (2);
+    INSERT INTO f2 VALUES (2), (3);
+    SELECT f1.a, f2.x, s.v FROM f1 RIGHT JOIN f2 ON f1.a = f2.x, LATERAL (SELECT 5 AS v) AS s ORDER BY 2;
+}
+expect {
+    2|2|5
+    |3|5
+}
+
 @setup tables
 test lateral-cannot-aggregate-only-columns-of-the-tables-on-its-left {
     SELECT * FROM t1, LATERAL (SELECT sum(t1.a)) AS s;
