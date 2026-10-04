@@ -263,6 +263,7 @@ pub(super) fn try_emit_expression_index_value(
     referenced_tables: Option<&TableReferences>,
     expr: &ast::Expr,
     target_register: usize,
+    resolver: Option<&Resolver>,
 ) -> Result<bool> {
     let Some(referenced_tables) = referenced_tables else {
         return Ok(false);
@@ -293,6 +294,12 @@ pub(super) fn try_emit_expression_index_value(
         return Ok(false);
     };
     program.emit_column_or_rowid(cursor_id, expr_pos, target_register);
+    let collation_ctx = crate::translate::collate::get_expr_collation_ctx_with_symbols(
+        expr,
+        referenced_tables,
+        resolver.map(|r| r.symbol_table),
+    )?;
+    program.set_collation(collation_ctx);
     Ok(true)
 }
 
