@@ -372,7 +372,10 @@ fn emit_compound_select(
                     is_delete: false,
                 };
 
-                if keep_first_duplicate {
+                let left_has_except = left
+                    .iter()
+                    .any(|(_, op)| matches!(op, CompoundOperator::Except));
+                if keep_first_duplicate && !left_has_except {
                     emit_explain!(
                         program,
                         true,

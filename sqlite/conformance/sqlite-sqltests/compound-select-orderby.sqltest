@@ -1399,3 +1399,32 @@ expect {
 expect @js {
     1|real
 }
+
+@setup dedup_arms
+test union-order-by-except-left-chain {
+    SELECT x, typeof(x) FROM (SELECT x FROM ai EXCEPT SELECT x FROM am2 UNION SELECT x FROM am ORDER BY x);
+}
+expect {
+    1|integer
+    2|integer
+}
+
+@setup dedup_arms
+test union-order-by-except-empties-left-chain {
+    CREATE TABLE d (x);
+    INSERT INTO d VALUES (1), (2), (3);
+    SELECT x FROM d EXCEPT SELECT x FROM d UNION SELECT x FROM d ORDER BY x;
+}
+expect {
+    1
+    2
+    3
+}
+
+test union-order-by-except-in-middle-chain {
+    SELECT 1 UNION SELECT 2 EXCEPT SELECT 2 UNION SELECT 3 ORDER BY 1;
+}
+expect {
+    1
+    3
+}
