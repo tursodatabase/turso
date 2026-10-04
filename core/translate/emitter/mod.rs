@@ -178,6 +178,7 @@ pub struct Resolver<'a> {
     /// Controls whether unresolved double-quoted identifiers fall back to string
     /// literals (SQLite's DQS misfeature) in DML statements.
     pub dqs_dml: DoubleQuotedDml,
+    pub(crate) automatic_index: bool,
     #[cfg(feature = "simulator")]
     subquery_unnesting_mode: crate::SubqueryUnnestingMode,
     /// Schema dialect of the database being compiled against; used when a
@@ -287,6 +288,7 @@ impl<'a> Resolver<'a> {
         symbol_table: &'a SymbolTable,
         enable_custom_types: bool,
         dqs_dml: DoubleQuotedDml,
+        automatic_index: bool,
         dialect: Arc<dyn crate::dialect::Dialect>,
         unqualified_database_search_path: &Option<Vec<String>>,
     ) -> Self {
@@ -307,6 +309,7 @@ impl<'a> Resolver<'a> {
             enclosing_query_aggregates: RefCell::new(Vec::new()),
             enable_custom_types,
             dqs_dml,
+            automatic_index,
             #[cfg(feature = "simulator")]
             subquery_unnesting_mode: crate::SubqueryUnnestingMode::Auto,
             dialect,
@@ -352,6 +355,7 @@ impl<'a> Resolver<'a> {
             enclosing_query_aggregates: RefCell::new(Vec::new()),
             enable_custom_types: self.enable_custom_types,
             dqs_dml: self.dqs_dml,
+            automatic_index: self.automatic_index,
             #[cfg(feature = "simulator")]
             subquery_unnesting_mode: self.subquery_unnesting_mode,
             dialect: self.dialect.clone(),
@@ -379,6 +383,7 @@ impl<'a> Resolver<'a> {
             enclosing_query_aggregates: RefCell::new(Vec::new()),
             enable_custom_types: self.enable_custom_types,
             dqs_dml: self.dqs_dml,
+            automatic_index: self.automatic_index,
             #[cfg(feature = "simulator")]
             subquery_unnesting_mode: self.subquery_unnesting_mode,
             dialect: self.dialect.clone(),

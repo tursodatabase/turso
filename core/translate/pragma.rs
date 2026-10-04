@@ -744,6 +744,11 @@ fn update_pragma(
             connection.set_check_constraints_ignored(enabled);
             Ok(TransactionMode::None)
         }
+        PragmaName::AutomaticIndex => {
+            let enabled = parse_pragma_enabled(&value);
+            connection.set_automatic_index(enabled);
+            Ok(TransactionMode::None)
+        }
         #[cfg(target_vendor = "apple")]
         PragmaName::Fullfsync => {
             let enabled = parse_pragma_enabled(&value);
@@ -1694,6 +1699,14 @@ fn query_pragma(
             let ignored = connection.check_constraints_ignored();
             let register = program.alloc_register();
             program.emit_int(ignored as i64, register);
+            program.emit_result_row(register, 1);
+            program.add_pragma_result_column(pragma.to_string());
+            Ok(TransactionMode::None)
+        }
+        PragmaName::AutomaticIndex => {
+            let enabled = connection.automatic_index();
+            let register = program.alloc_register();
+            program.emit_int(enabled as i64, register);
             program.emit_result_row(register, 1);
             program.add_pragma_result_column(pragma.to_string());
             Ok(TransactionMode::None)

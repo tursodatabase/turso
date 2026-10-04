@@ -49,6 +49,7 @@ pub(crate) struct JoinPlanningContext<'a> {
     pub maybe_order_target: Option<&'a OrderTarget>,
     /// Stop growing a join plan after it costs more than another query form.
     pub cost_limit: Option<Cost>,
+    pub automatic_index: bool,
 }
 
 impl<'a> JoinPlanningContext<'a> {
@@ -58,6 +59,7 @@ impl<'a> JoinPlanningContext<'a> {
         Self {
             maybe_order_target,
             cost_limit: None,
+            automatic_index: true,
         }
     }
 }

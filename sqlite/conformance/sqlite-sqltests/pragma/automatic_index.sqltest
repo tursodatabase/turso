@@ -1,0 +1,39 @@
+@database :memory:
+
+test pragma-automatic-index-default-and-toggle {
+    PRAGMA automatic_index;
+    PRAGMA automatic_index = OFF;
+    PRAGMA automatic_index;
+    PRAGMA automatic_index = ON;
+    PRAGMA automatic_index;
+}
+expect {
+    1
+    0
+    1
+}
+
+test pragma-automatic-index-table-valued {
+    SELECT * FROM pragma_automatic_index;
+    PRAGMA automatic_index = OFF;
+    SELECT * FROM pragma_automatic_index;
+}
+expect {
+    1
+    0
+}
+
+@skip-if sqlite "query plan is different in sqlite"
+test pragma-automatic-index-off-removes-the-automatic-index {
+    CREATE TABLE t1(a, b);
+    CREATE TABLE t2(a, b);
+    EXPLAIN QUERY PLAN SELECT * FROM t1 JOIN t2 ON t1.a = t2.a AND t1.b < t2.b;
+    PRAGMA automatic_index = OFF;
+    EXPLAIN QUERY PLAN SELECT * FROM t1 JOIN t2 ON t1.a = t2.a AND t1.b < t2.b;
+}
+expect {
+    1|0|0|SCAN t1
+    2|0|0|SEARCH t2 USING COVERING INDEX ephemeral_t2_t2 (a=? AND b>?)
+    1|0|0|HASH JOIN t2
+    2|0|0|SCAN t1
+}

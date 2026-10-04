@@ -1143,6 +1143,7 @@ fn find_select_plan_form(
         &mut plan.offset,
         plan.input_cardinality_hint.unwrap_or(1.0),
         cost_limit,
+        resolver.automatic_index,
     )?;
 
     if matches!(plan.simple_aggregate, Some(SimpleAggregate::MinMax(_)))
@@ -2416,6 +2417,7 @@ fn optimize_table_access(
         offset,
         initial_input_cardinality,
         None,
+        resolver.automatic_index,
     )?
     else {
         return Ok(None);
@@ -2451,6 +2453,7 @@ fn find_table_access_plan(
     offset: &mut Option<Box<Expr>>,
     initial_input_cardinality: f64,
     cost_limit: Option<Cost>,
+    automatic_index: bool,
 ) -> Result<Option<TableAccessPlan>> {
     // When optimizer_params feature is enabled, use lazily-loaded params (cached process-wide).
     // Otherwise, use the compile-time static for zero overhead.
@@ -2607,6 +2610,7 @@ fn find_table_access_plan(
     let planning_context = JoinPlanningContext {
         maybe_order_target: maybe_order_target.as_ref(),
         cost_limit,
+        automatic_index,
     };
 
     let Some(best_join_order_result) = compute_best_join_order_with_context(
@@ -4424,6 +4428,7 @@ mod tests {
             syms,
             true,
             DoubleQuotedDml::Enabled,
+            true,
             crate::sync::Arc::new(crate::dialect::SqliteDialect),
             &None,
         )
