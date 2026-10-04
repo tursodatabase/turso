@@ -1,7 +1,9 @@
-use crate::alloc::TryClone;
+use crate::alloc::{DynAllocator, TryClone};
 use crate::error::io_error;
 #[cfg(any(test, injected_yields))]
 use crate::mvcc::yield_points::{FailureInjector, YieldInjector};
+use crate::mvcc::{database::CommitStateMachine, MvccClock};
+use crate::state_machine::StateMachine;
 use crate::statement::StatementOrigin;
 use crate::storage::{journal_mode, pager::SavepointResult};
 use crate::sync::{
@@ -334,6 +336,11 @@ pub enum SyncAutoincrementState {
         rows: Vec<(String, i64)>,
         idx: usize,
         sub: SyncRowStep,
+    },
+    /// Close the transaction the internal statements ran under: commit it if
+    /// it wrote watermark rows, otherwise roll it back.
+    FinishTx {
+        commit_sm: Option<StateMachine<Box<CommitStateMachine<MvccClock, DynAllocator>>>>,
     },
 }
 
@@ -1356,7 +1363,7 @@ impl Connection {
         Ok(())
     }
 
-    fn clear_internal_main_mvcc_tx(&self, pager: &Arc<Pager>) {
+    pub(crate) fn clear_internal_main_mvcc_tx(&self, pager: &Arc<Pager>) {
         let Some(tx_id) = self.get_mv_tx_id() else {
             return;
         };
@@ -4424,7 +4431,8 @@ impl Connection {
                         s.get_btree_table(SQLITE_SEQUENCE_TABLE_NAME).is_some()
                     });
                     if !has_seq_table {
-                        return Ok(IOResult::Done(()));
+                        *state = SyncAutoincrementState::FinishTx { commit_sm: None };
+                        continue;
                     }
                     let stmt = self.prepare_internal(format!(
                         "SELECT name, seq FROM {SQLITE_SEQUENCE_TABLE_NAME}"
@@ -4450,7 +4458,8 @@ impl Connection {
                 }
                 SyncAutoincrementState::Process { rows, idx, sub } => {
                     if *idx >= rows.len() {
-                        return Ok(IOResult::Done(()));
+                        *state = SyncAutoincrementState::FinishTx { commit_sm: None };
+                        continue;
                     }
                     match sub {
                         SyncRowStep::Start => {
@@ -4533,6 +4542,32 @@ impl Connection {
                             *sub = SyncRowStep::Start;
                         }
                     }
+                }
+                SyncAutoincrementState::FinishTx { commit_sm } => {
+                    let mv_store_guard = self.db.get_mv_store();
+                    let (Some(mv_store), Some(tx_id)) =
+                        (mv_store_guard.as_ref(), self.get_mv_tx_id())
+                    else {
+                        return Ok(IOResult::Done(()));
+                    };
+                    if commit_sm.is_none() {
+                        if !mv_store.tx_is_active_with_writes(tx_id) {
+                            let pager = self.pager.load();
+                            self.clear_internal_main_mvcc_tx(&pager);
+                            return Ok(IOResult::Done(()));
+                        }
+                        *commit_sm = Some(mv_store.commit_tx(tx_id, self, MAIN_DB_ID)?);
+                    }
+                    let sm = commit_sm.as_mut().expect("commit_sm set above");
+                    crate::return_if_io!(sm.step(mv_store));
+                    turso_assert!(
+                        sm.is_finalized(),
+                        "MVCC bootstrap transaction commit must be finalized once it returns Done"
+                    );
+                    self.set_mv_tx(None);
+                    let pager = self.pager.load();
+                    pager.cleanup_read_tx();
+                    return Ok(IOResult::Done(()));
                 }
             }
         }
