@@ -76,3 +76,49 @@ fn expression_index_covering_scan() -> anyhow::Result<()> {
     ]);
     Ok(())
 }
+
+#[test]
+fn test_issue_9484_nocase_expression_index_orderby() -> anyhow::Result<()> {
+    let _ = env_logger::try_init();
+    let tmp_db = TempDatabase::new_with_rusqlite("CREATE TABLE t(id INTEGER PRIMARY KEY, a TEXT);");
+    let conn = tmp_db.connect_limbo();
+
+    conn.execute("INSERT INTO t VALUES (1, '[m');")?;
+    conn.execute("INSERT INTO t VALUES (2, '[O');")?;
+    conn.execute("INSERT INTO t VALUES (3, '[Z');")?;
+    conn.execute("CREATE INDEX ta ON t((a||'') COLLATE NOCASE);")?;
+
+    // Basic two comparisons on expression index with ORDER BY
+    let rows = limbo_exec_rows(
+        &conn,
+        "SELECT id FROM t
+         WHERE (a||'') COLLATE NOCASE >= '[m' AND (a||'') COLLATE NOCASE > '[m'
+         ORDER BY (a||'') COLLATE NOCASE",
+    );
+    assert_that!(rows).is_equal_to(vec![row![2], row![3]]);
+
+    // Keyset pagination cursor shape
+    let rows_keyset = limbo_exec_rows(
+        &conn,
+        "SELECT id FROM t
+         WHERE (a||'') COLLATE NOCASE >= '[m' AND ((a||'') COLLATE NOCASE > '[m' OR id < 0)
+         ORDER BY (a||'') COLLATE NOCASE",
+    );
+    assert_that!(rows_keyset).is_equal_to(vec![row![2], row![3]]);
+
+    // COALESCE expression index
+    conn.execute("CREATE TABLE t2(id INTEGER PRIMARY KEY, a TEXT);")?;
+    conn.execute("INSERT INTO t2 VALUES (1, '[m');")?;
+    conn.execute("INSERT INTO t2 VALUES (2, '[O');")?;
+    conn.execute("INSERT INTO t2 VALUES (3, '[Z');")?;
+    conn.execute("CREATE INDEX ta2 ON t2(COALESCE(a, '') COLLATE NOCASE);")?;
+
+    let rows_coalesce = limbo_exec_rows(
+        &conn,
+        "SELECT id FROM t2
+         WHERE COALESCE(a, '') COLLATE NOCASE >= '[m' AND COALESCE(a, '') COLLATE NOCASE > '[m'
+         ORDER BY COALESCE(a, '') COLLATE NOCASE",
+    );
+    assert_that!(rows_coalesce).is_equal_to(vec![row![2], row![3]]);
+    Ok(())
+}

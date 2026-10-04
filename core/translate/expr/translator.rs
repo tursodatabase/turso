@@ -171,7 +171,13 @@ pub fn translate_expr(
             .any(|t| !t.expression_index_usages.is_empty())
     });
     if has_expression_indexes
-        && try_emit_expression_index_value(program, referenced_tables, expr, target_register)?
+        && try_emit_expression_index_value(
+            program,
+            referenced_tables,
+            expr,
+            target_register,
+            Some(resolver),
+        )?
     {
         if let Some(span) = constant_span {
             program.constant_span_end(span);
