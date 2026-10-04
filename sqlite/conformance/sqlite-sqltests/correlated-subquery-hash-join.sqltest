@@ -130,3 +130,29 @@ expect {
     3|0
 }
 
+setup large-tables {
+    CREATE TABLE o(id INTEGER PRIMARY KEY, a INT);
+    CREATE TABLE p(id INTEGER PRIMARY KEY, x INT, y INT);
+    CREATE TABLE q(id INTEGER PRIMARY KEY, x INT, z INT);
+    CREATE INDEX p_x ON p(x);
+    CREATE INDEX q_x ON q(x);
+    CREATE INDEX q_z ON q(z);
+    WITH RECURSIVE c(n) AS (VALUES(1) UNION ALL SELECT n + 1 FROM c WHERE n < 300)
+    INSERT INTO p SELECT n, n % 10, (n * 7) % 31 FROM c;
+    WITH RECURSIVE c(n) AS (VALUES(1) UNION ALL SELECT n + 1 FROM c WHERE n < 300)
+    INSERT INTO q SELECT n, (n * 3) % 10, (n * 11) % 31 FROM c;
+    INSERT INTO o VALUES (1, 1), (2, 2), (3, 3), (4, NULL);
+}
+
+@setup large-tables
+test correlated-subquery-hash-join-build-filter-reads-the-outer-row {
+    SELECT o.id, (SELECT count(*) FROM p JOIN q ON p.y = q.z WHERE q.x IN (SELECT o.a))
+    FROM o
+    ORDER BY o.id;
+}
+expect {
+    1|290
+    2|291
+    3|290
+    4|0
+}

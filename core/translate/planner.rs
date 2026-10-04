@@ -2805,6 +2805,45 @@ pub fn table_mask_from_expr(
     Ok(mask)
 }
 
+pub fn expr_reads_an_outer_query(
+    top_level_expr: &Expr,
+    table_references: &TableReferences,
+    subqueries: &[NonFromClauseSubquery],
+) -> Result<bool> {
+    let is_outer_query_table = |table_id: &TableInternalId| {
+        table_references
+            .find_outer_query_ref_by_internal_id(*table_id)
+            .is_some()
+    };
+    let mut reads_an_outer_query = false;
+    walk_expr(top_level_expr, &mut |expr: &Expr| -> Result<WalkControl> {
+        match expr {
+            Expr::Column { table, .. } | Expr::RowId { table, .. } => {
+                reads_an_outer_query |= is_outer_query_table(table);
+            }
+            Expr::SubqueryResult { subquery_id, .. } => {
+                let Some(subquery) = subqueries.iter().find(|s| s.internal_id == *subquery_id)
+                else {
+                    crate::bail_parse_error!("subquery not found");
+                };
+                reads_an_outer_query |= match &subquery.state {
+                    SubqueryState::Unevaluated { plan } => plan.as_ref().is_some_and(|plan| {
+                        plan.used_outer_query_ref_ids()
+                            .iter()
+                            .any(is_outer_query_table)
+                    }),
+                    SubqueryState::Evaluated { outer_ref_ids, .. } => {
+                        outer_ref_ids.iter().any(is_outer_query_table)
+                    }
+                };
+            }
+            _ => {}
+        }
+        Ok(WalkControl::Continue)
+    })?;
+    Ok(reads_an_outer_query)
+}
+
 /// Determines the earliest loop where an expression can be safely evaluated.
 ///
 /// When a referenced table is not found in `join_order`, we check if it's a hash-join

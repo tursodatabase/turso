@@ -271,6 +271,46 @@ expect {
     3|30|33
 }
 
+setup large-tables {
+    CREATE TABLE o(id INTEGER PRIMARY KEY, a INT);
+    CREATE TABLE p(id INTEGER PRIMARY KEY, x INT, y INT);
+    CREATE TABLE q(id INTEGER PRIMARY KEY, x INT, z INT);
+    CREATE INDEX p_x ON p(x);
+    CREATE INDEX q_x ON q(x);
+    CREATE INDEX q_z ON q(z);
+    WITH RECURSIVE c(n) AS (VALUES(1) UNION ALL SELECT n + 1 FROM c WHERE n < 300)
+    INSERT INTO p SELECT n, n % 10, (n * 7) % 31 FROM c;
+    WITH RECURSIVE c(n) AS (VALUES(1) UNION ALL SELECT n + 1 FROM c WHERE n < 300)
+    INSERT INTO q SELECT n, (n * 3) % 10, (n * 11) % 31 FROM c;
+    INSERT INTO o VALUES (1, 1), (2, 2), (3, 3), (4, NULL);
+}
+
+@setup large-tables
+test lateral-join-whose-filter-reads-the-table-on-its-left {
+    SELECT o.id, s.c
+    FROM o, LATERAL (SELECT count(*) AS c FROM p JOIN q ON p.y = q.z WHERE q.x = o.a) AS s
+    ORDER BY o.id;
+}
+expect {
+    1|290
+    2|291
+    3|290
+    4|0
+}
+
+@setup large-tables
+test lateral-join-whose-in-list-reads-the-table-on-its-left {
+    SELECT o.id, s.c
+    FROM o, LATERAL (SELECT count(*) AS c FROM p JOIN q ON p.y = q.z WHERE q.x IN (o.a, o.a + 1)) AS s
+    ORDER BY o.id;
+}
+expect {
+    1|581
+    2|581
+    3|580
+    4|0
+}
+
 @setup tables
 test lateral-in-list-reads-the-table-on-its-left {
     CREATE INDEX t2_b ON t2(b);
