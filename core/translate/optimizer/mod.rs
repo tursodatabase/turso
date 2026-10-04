@@ -1139,6 +1139,7 @@ fn find_select_plan_form(
         // Every row the WHERE clause keeps reaches the LIMIT unless an aggregate or DISTINCT
         // comes between.
         !plan.distinctness.is_distinct() && plan.aggregates.is_empty(),
+        resolver.automatic_index,
     )?;
 
     if matches!(plan.simple_aggregate, Some(SimpleAggregate::MinMax(_)))
@@ -2483,6 +2484,7 @@ fn optimize_table_access(
         initial_input_cardinality,
         None,
         true,
+        resolver.automatic_index,
     )?
     else {
         return Ok(None);
@@ -2520,6 +2522,7 @@ fn find_table_access_plan(
     initial_input_cardinality: f64,
     cost_limit: Option<Cost>,
     rows_pass_through: bool,
+    automatic_index: bool,
 ) -> Result<Option<TableAccessPlan>> {
     // When optimizer_params feature is enabled, use lazily-loaded params (cached process-wide).
     // Otherwise, use the compile-time static for zero overhead.
@@ -2718,7 +2721,7 @@ fn find_table_access_plan(
     let planning_context = JoinPlanningContext {
         maybe_order_target: maybe_order_target.as_ref(),
         cost_limit,
-        allow_automatic_index: true,
+        allow_automatic_index: automatic_index,
         resolver,
     };
 
@@ -4932,6 +4935,7 @@ mod tests {
             syms,
             true,
             DoubleQuotedDml::Enabled,
+            true,
             crate::sync::Arc::new(crate::dialect::SqliteDialect),
             None,
         )

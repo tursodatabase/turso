@@ -254,6 +254,7 @@ fn build_plan_for_connection(
         &syms,
         connection.experimental_custom_types_enabled(),
         connection.get_dqs_dml().into(),
+        true,
         Arc::new(crate::dialect::SqliteDialect),
         None,
     );

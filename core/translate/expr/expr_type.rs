@@ -646,6 +646,7 @@ mod tests {
             &syms,
             true,
             DoubleQuotedDml::Enabled,
+            true,
             Arc::new(crate::dialect::SqliteDialect),
             None,
         );

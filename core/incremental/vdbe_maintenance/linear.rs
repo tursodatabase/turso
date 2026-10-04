@@ -45,6 +45,7 @@ pub(super) fn emit_filter(
         &syms,
         connection.experimental_custom_types_enabled(),
         connection.get_dqs_dml().into(),
+        true,
         Arc::new(crate::dialect::SqliteDialect),
         None,
     );
@@ -392,6 +393,7 @@ fn emit_project_rows(
         &syms,
         connection.experimental_custom_types_enabled(),
         connection.get_dqs_dml().into(),
+        true,
         Arc::new(crate::dialect::SqliteDialect),
         None,
     );

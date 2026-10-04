@@ -539,6 +539,7 @@ pub(super) fn emit_inner_join(
         &syms,
         connection.experimental_custom_types_enabled(),
         connection.get_dqs_dml().into(),
+        true,
         Arc::new(crate::dialect::SqliteDialect),
         None,
     );
@@ -790,6 +791,7 @@ pub(super) fn emit_semi_or_anti_join(
         &syms,
         connection.experimental_custom_types_enabled(),
         connection.get_dqs_dml().into(),
+        true,
         Arc::new(crate::dialect::SqliteDialect),
         None,
     );
