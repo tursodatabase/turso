@@ -23,7 +23,7 @@ use crate::translate::{
 use crate::{
     emit_explain,
     schema::PseudoCursorType,
-    translate::collate::{get_collseq_from_expr_with_symbols, CollationSeq},
+    translate::collate::{resolve_comparison_collseq_with_symbols, CollationSeq},
     util::exprs_are_equivalent,
     vdbe::{
         builder::{CursorType, ProgramBuilder},
@@ -171,11 +171,12 @@ impl EmitGroupBy {
                 .zip(sort_order.iter())
                 .zip(group_by.nulls_order.iter())
                 .map(|((expr, ord), nulls)| {
-                    let collation = get_collseq_from_expr_with_symbols(
+                    let collation = Some(resolve_comparison_collseq_with_symbols(
+                        expr,
                         expr,
                         &plan.table_references,
                         Some(t_ctx.resolver.symbol_table),
-                    )?;
+                    )?);
                     Ok::<_, crate::LimboError>((*ord, collation, *nulls))
                 })
                 .try_collect::<Result<crate::alloc::Vec<_>>>()??;
@@ -692,12 +693,13 @@ pub fn group_by_process_single_group(
         .enumerate()
         .take(group_by.exprs.len())
     {
-        let maybe_collation = get_collseq_from_expr_with_symbols(
+        let collation = resolve_comparison_collseq_with_symbols(
+            &group_by.exprs[i],
             &group_by.exprs[i],
             &plan.table_references,
             Some(t_ctx.resolver.symbol_table),
         )?;
-        c.collation = maybe_collation.unwrap_or_default();
+        c.collation = collation;
     }
 
     // Compare the group by columns to the previous group by columns to see if we are at a new group or not
