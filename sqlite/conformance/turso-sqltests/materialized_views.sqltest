@@ -2146,6 +2146,26 @@ expect {
     4
 }
 
+test matview-delete-all-rows-temp-table-shadow {
+    CREATE TABLE t(a INTEGER PRIMARY KEY, b TEXT);
+    CREATE TEMP TABLE t(a INTEGER PRIMARY KEY, b TEXT);
+    INSERT INTO t VALUES (9, 'A');
+    CREATE MATERIALIZED VIEW v AS SELECT b, COUNT(*) AS c FROM t GROUP BY b;
+    INSERT INTO t VALUES (10, 'B');
+    SELECT * FROM v ORDER BY b;
+    DELETE FROM t WHERE a = 9;
+    SELECT * FROM v ORDER BY b;
+    DELETE FROM t;
+    SELECT * FROM v ORDER BY b;
+    SELECT COUNT(*) FROM t;
+}
+expect {
+    A|1
+    B|1
+    B|1
+    0
+}
+
 test matview-count-distinct-group-by-empty-start {
     CREATE TABLE measurements(device TEXT, reading INTEGER);
     CREATE MATERIALIZED VIEW device_summary AS
