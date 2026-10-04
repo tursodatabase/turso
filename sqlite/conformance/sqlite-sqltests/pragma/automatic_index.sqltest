@@ -37,3 +37,16 @@ expect {
     1|0|0|HASH JOIN t2
     2|0|0|SCAN t1
 }
+
+test pragma-automatic-index-off-left-join-rows {
+    CREATE TABLE t1(a, b);
+    CREATE TABLE t2(a, b);
+    INSERT INTO t1 VALUES (1, 2), (3, 4);
+    INSERT INTO t2 VALUES (1, 2), (3, 4), (NULL, 4);
+    PRAGMA automatic_index = OFF;
+    SELECT t1.a, t1.b, t2.a, t2.b FROM t1 LEFT JOIN t2 ON t1.a = t2.a AND t2.b = 4 WHERE coalesce(t2.b, 4) = 4 ORDER BY t1.a;
+}
+expect {
+    1|2||
+    3|4|3|4
+}
