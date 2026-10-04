@@ -39,10 +39,6 @@ class InsertTest(BaseModel):
         big_stmt.append("SELECT count(*) FROM test;")
         expected.append(str(self.vals * 2))
 
-        big_stmt.append("DELETE FROM test;")
-        big_stmt.append("SELECT count(*) FROM test;")
-        expected.append(str(0))
-
         big_stmt = "".join(big_stmt)
         expected = "\n".join(expected)
 
@@ -83,7 +79,6 @@ def validate_with_expected(result: str, expected: str):
     return (expected in result, expected)
 
 
-# TODO no delete tests for now
 def blob_tests() -> list[InsertTest]:
     tests: list[InsertTest] = []
 
@@ -153,6 +148,7 @@ def main():
                     test.run(limbo)
                 sleep(0.3)
                 test.test_compat()
+                test_delete(test.db_path)
 
             except Exception as e:
                 console.error(f"Test FAILED: {e}")
@@ -161,6 +157,13 @@ def main():
             # delete db after every compat test so we we have fresh db for next test
             cleanup(test.db_path)
     console.info("All tests passed successfully.")
+
+
+def test_delete(path: str):
+    with TestTursoShell("", flags=path) as shell:
+        shell.run_test("delete-all", "DELETE FROM test; SELECT count(*) FROM test;", "0")
+    with TestTursoShell("", exec_name="sqlite3", flags=path) as shell:
+        shell.run_test("reopen-after-delete", "SELECT count(*) FROM test;", "0")
 
 
 if __name__ == "__main__":
