@@ -6184,6 +6184,10 @@ mod tests {
                 "SELECT * FROM a, b CROSS JOIN c",
                 "SELECT * FROM a, b INNER JOIN c",
             ),
+            (
+                "SELECT * FROM a, b CROSS JOIN LATERAL (SELECT a.x, b.y) s",
+                "SELECT * FROM a, b INNER JOIN LATERAL (SELECT a.x, b.y) s",
+            ),
         ] {
             let parsed = crate::parse(sql).unwrap();
             let translated = translator.translate(&parsed).unwrap();
