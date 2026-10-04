@@ -288,6 +288,26 @@ expect {
     3|w
 }
 
+@setup tables
+test lateral-materialized-cte-reads-the-table-on-its-left {
+    SELECT t1.a, s.c
+    FROM t1, LATERAL (
+        WITH m AS MATERIALIZED (SELECT c FROM t2 WHERE t2.b = t1.a)
+        SELECT c FROM m UNION ALL SELECT c FROM m
+    ) AS s
+    ORDER BY 1, 2;
+}
+expect {
+    1|x
+    1|x
+    2|y
+    2|y
+    2|z
+    2|z
+    3|w
+    3|w
+}
+
 test lateral-join-condition-reads-the-table-on-its-left {
     CREATE TABLE oc_outer(id INTEGER PRIMARY KEY, x INT);
     CREATE TABLE oc_items(id INTEGER PRIMARY KEY, b INT);
