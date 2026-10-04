@@ -323,12 +323,16 @@ fn emit_clear_btree_delete(
     }
 
     let table_name = table_ref.table.get_name();
-    let has_dependent_views = resolver.with_schema(table_ref.database_id, |schema| {
+    let target_schema_tracks_table = resolver.with_schema(table_ref.database_id, |schema| {
         !schema
             .get_dependent_materialized_views(table_name)
             .is_empty()
     });
-    if has_dependent_views {
+    let main_schema_tracks_table = !resolver
+        .schema()
+        .get_dependent_materialized_views(table_name)
+        .is_empty();
+    if target_schema_tracks_table || main_schema_tracks_table {
         return Ok(false);
     }
     if connection.foreign_keys_enabled() {
