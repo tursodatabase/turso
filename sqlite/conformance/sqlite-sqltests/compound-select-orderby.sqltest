@@ -1152,9 +1152,10 @@ expect {
     a
 }
 
-# ===== Dedup keeps the first equal-valued row (SQLite merge semantics) =====
+# ===== Dedup keeps the rightmost arm's row (SQLite merge semantics) =====
 # When a compound select has ORDER BY, equal-valued duplicates of different
-# storage types (1 vs 1.0) keep the earliest-inserted row, not the last.
+# storage types (1 vs 1.0) keep the row produced by the rightmost arm that
+# contains the value; within one arm the earliest row in scan order wins.
 
 setup dedup {
     CREATE TABLE dt (a);
@@ -1248,4 +1249,153 @@ expect @js {
     2
     1
     1
+}
+
+setup dedup_arms {
+    CREATE TABLE ai (x);
+    INSERT INTO ai VALUES (1), (2);
+    CREATE TABLE ar (x);
+    INSERT INTO ar VALUES (1.0), (2.0);
+    CREATE TABLE am (x);
+    INSERT INTO am VALUES (1), (1.0), (2);
+    CREATE TABLE am2 (x);
+    INSERT INTO am2 VALUES (1.0), (1);
+}
+
+@setup dedup_arms
+test union-order-by-right-arm-wins {
+    SELECT x, typeof(x) FROM (SELECT x FROM ai UNION SELECT x FROM ar ORDER BY x);
+}
+expect {
+    1.0|real
+    2.0|real
+}
+expect @js {
+    1|real
+    2|real
+}
+
+@setup dedup_arms
+test union-order-by-swapped-right-arm-wins {
+    SELECT x, typeof(x) FROM (SELECT x FROM ar UNION SELECT x FROM ai ORDER BY x);
+}
+expect {
+    1|integer
+    2|integer
+}
+
+@setup dedup_arms
+test union-order-by-within-arm-first-scan-wins {
+    SELECT x, typeof(x) FROM (SELECT x FROM ai UNION SELECT x FROM am ORDER BY x);
+}
+expect {
+    1|integer
+    2|integer
+}
+
+@setup dedup_arms
+test union-order-by-within-arm-scan-order {
+    SELECT x, typeof(x) FROM (SELECT x FROM ai UNION SELECT x FROM am2 ORDER BY x);
+}
+expect {
+    1.0|real
+    2|integer
+}
+expect @js {
+    1|real
+    2|integer
+}
+
+@setup dedup_arms
+test union-order-by-insert-keeps-right-arm-type {
+    CREATE TABLE aud (x);
+    INSERT INTO aud SELECT x FROM ai UNION SELECT x FROM ar ORDER BY x;
+    SELECT x, typeof(x) FROM aud;
+}
+expect {
+    1.0|real
+    2.0|real
+}
+expect @js {
+    1|real
+    2|real
+}
+
+test union-order-by-constant-arms {
+    SELECT 1 UNION SELECT 1.0 ORDER BY 1;
+}
+expect {
+    1.0
+}
+expect @js {
+    1
+}
+
+test union-order-by-constant-arms-reversed {
+    SELECT 1.0 UNION SELECT 1 ORDER BY 1;
+}
+expect {
+    1
+}
+
+test union-order-by-three-arms {
+    SELECT 1 UNION SELECT 1.0 UNION SELECT 1 ORDER BY 1;
+}
+expect {
+    1
+}
+
+test union-order-by-three-arms-distinct-right {
+    SELECT 1 UNION SELECT 1.0 UNION SELECT 1.5 ORDER BY 1;
+}
+expect {
+    1.0
+    1.5
+}
+expect @js {
+    1
+    1.5
+}
+
+test union-order-by-nested-constant-arms {
+    SELECT a, typeof(a) FROM (SELECT 1 AS a UNION SELECT 1.0 ORDER BY 1);
+}
+expect {
+    1.0|real
+}
+expect @js {
+    1|real
+}
+
+@setup dedup_arms
+test union-order-by-top-level-right-arm {
+    SELECT x FROM ai UNION SELECT x FROM ar ORDER BY x;
+}
+expect {
+    1.0
+    2.0
+}
+expect @js {
+    1
+    2
+}
+
+@setup dedup_arms
+test intersect-order-by-left-arm-wins {
+    SELECT x, typeof(x) FROM (SELECT x FROM ai INTERSECT SELECT x FROM ar ORDER BY x);
+}
+expect {
+    1|integer
+    2|integer
+}
+
+@setup dedup_arms
+test except-order-by-left-arm-wins {
+    SELECT x, typeof(x) FROM (SELECT x FROM am2 EXCEPT SELECT 0 ORDER BY x);
+}
+expect {
+    1.0|real
+}
+expect @js {
+    1|real
 }

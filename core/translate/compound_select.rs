@@ -365,19 +365,6 @@ fn emit_compound_select(
                     affinity_str: affinity_str.clone(),
                     is_delete: false,
                 };
-                emit_compound_select(
-                    program,
-                    left,
-                    plan,
-                    limit,
-                    offset,
-                    resolver,
-                    None,
-                    None,
-                    reg_result_cols_start,
-                    query_destination,
-                )?;
-
                 right_most.query_destination = QueryDestination::EphemeralIndex {
                     cursor_id: dedupe_index.0,
                     index: dedupe_index.1.clone(),
@@ -385,18 +372,65 @@ fn emit_compound_select(
                     is_delete: false,
                 };
 
-                emit_explain!(
-                    program,
-                    true,
-                    EqpDetail::CompoundArm {
-                        op: EqpCompoundOp::Union,
-                        temp_btree: true,
-                    }
-                );
-                right_most_ctx.materialized_build_inputs =
-                    emit_materialized_build_inputs(program, &right_most_ctx.resolver, right_most)?;
-                emit_query(program, right_most, &mut right_most_ctx)?;
-                program.pop_current_parent_explain();
+                if keep_first_duplicate {
+                    emit_explain!(
+                        program,
+                        true,
+                        EqpDetail::CompoundArm {
+                            op: EqpCompoundOp::Union,
+                            temp_btree: true,
+                        }
+                    );
+                    right_most_ctx.materialized_build_inputs = emit_materialized_build_inputs(
+                        program,
+                        &right_most_ctx.resolver,
+                        right_most,
+                    )?;
+                    emit_query(program, right_most, &mut right_most_ctx)?;
+                    program.pop_current_parent_explain();
+
+                    emit_compound_select(
+                        program,
+                        left,
+                        plan,
+                        limit,
+                        offset,
+                        resolver,
+                        None,
+                        None,
+                        reg_result_cols_start,
+                        query_destination,
+                    )?;
+                } else {
+                    emit_compound_select(
+                        program,
+                        left,
+                        plan,
+                        limit,
+                        offset,
+                        resolver,
+                        None,
+                        None,
+                        reg_result_cols_start,
+                        query_destination,
+                    )?;
+
+                    emit_explain!(
+                        program,
+                        true,
+                        EqpDetail::CompoundArm {
+                            op: EqpCompoundOp::Union,
+                            temp_btree: true,
+                        }
+                    );
+                    right_most_ctx.materialized_build_inputs = emit_materialized_build_inputs(
+                        program,
+                        &right_most_ctx.resolver,
+                        right_most,
+                    )?;
+                    emit_query(program, right_most, &mut right_most_ctx)?;
+                    program.pop_current_parent_explain();
+                }
 
                 if new_dedupe_index {
                     read_deduplicated_union_or_except_rows(
