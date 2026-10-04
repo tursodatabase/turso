@@ -55,3 +55,17 @@ test right-join-lateral-cannot-read-the-table-on-its-left {
 expect error {
     invalid reference to FROM-clause entry for table "t1"
 }
+
+@setup tables
+test lateral-after-a-comma-and-a-join-reads-both-items {
+    SELECT t1.a, t2.b, s.v
+    FROM t1, t2 JOIN LATERAL (SELECT t2.b * 10 + t1.a AS v) AS s ON true
+    WHERE t2.b = t1.a
+    ORDER BY 1, 2, 3;
+}
+expect {
+    1|1|11
+    2|2|22
+    2|2|22
+    3|3|33
+}
