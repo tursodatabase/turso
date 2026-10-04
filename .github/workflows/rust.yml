@@ -506,6 +506,7 @@ jobs:
   # investigate and does not block an unrelated pull request. A failure on main
   # is filed as an issue.
   differential-fuzzer:
+    name: differential-fuzzer (${{ matrix.profile }}${{ matrix.generator == 'sql-gen-prop' && ', sql-gen-prop' || '' }})
     runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 30
     permissions:
@@ -519,6 +520,8 @@ jobs:
         # Each profile focuses a different workload so CI covers more than the
         # default statement distribution.
         profile: [balanced, ddl, triggers, writes, correlated-subqueries, joins, ordered-aggregates]
+        # Both generators must stay green on every profile listed above.
+        generator: [sql-gen, sql-gen-prop]
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -537,7 +540,8 @@ jobs:
         run: |
           # Reproduce a failure locally with:
           #   cargo run -p differential-fuzzer --bin differential_fuzzer -- \
-          #     --seed <seed> --profile ${{ matrix.profile }} -n 1000
+          #     --seed <seed> --profile ${{ matrix.profile }} \
+          #     --generator ${{ matrix.generator }} -n 1000
           if [ "$GITHUB_EVENT_NAME" = pull_request ]; then
             seeds=(1 2 3 4 5 6)
           else
@@ -555,11 +559,12 @@ jobs:
             # One slow statement must not consume the complete CI job.
             timeout --kill-after=10s "${DIFFERENTIAL_FUZZER_TIMEOUT_SECONDS}s" \
               target/debug/differential_fuzzer \
-                --seed "$seed" --profile ${{ matrix.profile }} -n 1000 2>&1 \
+                --seed "$seed" --profile ${{ matrix.profile }} \
+                --generator ${{ matrix.generator }} -n 1000 2>&1 \
               | tee "$log" \
               || exit_code=$?
             if [ "$exit_code" -eq 124 ] || [ "$exit_code" -eq 137 ]; then
-              echo "::error::Differential fuzzer timed out after ${DIFFERENTIAL_FUZZER_TIMEOUT_SECONDS} seconds. Seed: $seed. Profile: ${{ matrix.profile }}."
+              echo "::error::Differential fuzzer timed out after ${DIFFERENTIAL_FUZZER_TIMEOUT_SECONDS} seconds. Seed: $seed. Profile: ${{ matrix.profile }}. Generator: ${{ matrix.generator }}."
             fi
             if [ "$exit_code" -ne 0 ]; then
               if [ "$GITHUB_EVENT_NAME" = push ] && [ "$GITHUB_REF" = refs/heads/main ]; then
@@ -567,8 +572,8 @@ jobs:
                 tail -n 100 "$log" | tail -c 60000 > "$log.tail"
                 gh issue create --label fuzzing \
                   --title "differential fuzzer ${{ matrix.profile }} failure seed $seed" \
-                  --body "$(printf 'Exit code %s in %s/%s/actions/runs/%s\n\n```\ncargo run -p differential-fuzzer --bin differential_fuzzer -- --seed %s --profile %s -n 1000\n```\n\nLast 100 lines of output:\n\n````\n%s\n````\n' \
-                    "$exit_code" "$GITHUB_SERVER_URL" "$GITHUB_REPOSITORY" "$GITHUB_RUN_ID" "$seed" "${{ matrix.profile }}" "$(cat "$log.tail")")"
+                  --body "$(printf 'Exit code %s in %s/%s/actions/runs/%s\n\n```\ncargo run -p differential-fuzzer --bin differential_fuzzer -- --seed %s --profile %s --generator %s -n 1000\n```\n\nLast 100 lines of output:\n\n````\n%s\n````\n' \
+                    "$exit_code" "$GITHUB_SERVER_URL" "$GITHUB_REPOSITORY" "$GITHUB_RUN_ID" "$seed" "${{ matrix.profile }}" "${{ matrix.generator }}" "$(cat "$log.tail")")"
               fi
               exit "$exit_code"
             fi
