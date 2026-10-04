@@ -962,11 +962,13 @@ pub fn translate_expr(
                             )
                         }
                         ScalarFunc::ArrayElement => {
+                            let args = expect_arguments_exact!(args, 2, srf);
                             translate_fixed_insn!(program, referenced_tables, resolver, args, target_register,
                                 [array_reg <- 0, index_reg <- 1],
                                 Insn::ArrayElement { array_reg, index_reg, dest: target_register })
                         }
                         ScalarFunc::ArraySetElement => {
+                            let args = expect_arguments_exact!(args, 3, srf);
                             translate_fixed_insn!(program, referenced_tables, resolver, args, target_register,
                                 [array_reg <- 0, index_reg <- 1, value_reg <- 2],
                                 Insn::ArraySetElement { array_reg, index_reg, value_reg, dest: target_register })

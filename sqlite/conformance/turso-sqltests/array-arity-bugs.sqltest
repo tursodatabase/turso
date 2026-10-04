@@ -174,3 +174,61 @@ test array-nested-case-display {
 expect {
     {1,2}
 }
+
+test array-to-string-one-arg {
+    CREATE TABLE a2s1 (id INTEGER PRIMARY KEY, vals TEXT[]) STRICT;
+    INSERT INTO a2s1 VALUES (1, ARRAY['1','2']);
+    SELECT array_to_string(vals) FROM a2s1;
+}
+expect error {
+    wrong number of arguments to function array_to_string\(\)
+}
+
+test array-to-string-four-args {
+    SELECT array_to_string('{1,2,3}', ',', 'x', 'extra');
+}
+expect error {
+    wrong number of arguments to function array_to_string\(\)
+}
+
+test string-to-array-one-arg {
+    SELECT string_to_array('a,b,c');
+}
+expect error {
+    wrong number of arguments to function string_to_array\(\)
+}
+
+test string-to-array-four-args {
+    SELECT string_to_array('a,b', ',', 'x', 'extra');
+}
+expect error {
+    wrong number of arguments to function string_to_array\(\)
+}
+
+test array-length-zero-args {
+    SELECT array_length();
+}
+expect error {
+    wrong number of arguments to function array_length\(\)
+}
+
+test array-length-three-args {
+    SELECT array_length('{1,2,3}', 1, 1);
+}
+expect error {
+    wrong number of arguments to function array_length\(\)
+}
+
+test array-element-one-arg {
+    SELECT array_element('{1,2,3}');
+}
+expect error {
+    wrong number of arguments to function array_element\(\)
+}
+
+test array-set-element-two-args {
+    SELECT array_set_element('{1,2,3}', 1);
+}
+expect error {
+    wrong number of arguments to function array_set_element\(\)
+}

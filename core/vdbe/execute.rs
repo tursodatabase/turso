@@ -233,6 +233,11 @@ mod arg_count {
                 return Err(arg_count::wrong_arg_count($expected, $actual));
             }
         };
+        ($actual:expr, $min:expr, $max:expr) => {
+            if unlikely(!($min..=$max).contains(&$actual)) {
+                return Err(arg_count::wrong_arg_count_range($min, $max, $actual));
+            }
+        };
     }
     pub(super) use check_arg_count;
 
@@ -240,6 +245,12 @@ mod arg_count {
     #[inline(never)]
     pub(super) fn wrong_arg_count(expected: usize, actual: usize) -> Box<LimboError> {
         LimboError::InternalError(format!("expected {expected} argument(s), got {actual}")).into()
+    }
+
+    #[cold]
+    #[inline(never)]
+    pub(super) fn wrong_arg_count_range(min: usize, max: usize, actual: usize) -> Box<LimboError> {
+        LimboError::InternalError(format!("expected {min} to {max} arguments, got {actual}")).into()
     }
 }
 
@@ -11326,6 +11337,7 @@ pub fn op_function(
                 // honors the dimension and walks into nested arrays for dim > 1
                 // (Turso arrays are 1-indexed, so `array_upper(arr, dim)` shares
                 // this code path via its alias and produces the same result).
+                check_arg_count!(arg_count, 1, 2);
                 let arr_val = state.registers[*start_reg].get_value();
                 let dim = if arg_count >= 2 {
                     state.registers[*start_reg + 1]
@@ -11349,6 +11361,7 @@ pub fn op_function(
                 state.registers[*dest].set_value(result);
             }
             ScalarFunc::StringToArray => {
+                check_arg_count!(arg_count, 2, 3);
                 let text = state.registers[*start_reg].get_value().clone();
                 let delimiter = state.registers[*start_reg + 1].get_value().clone();
                 let null_str = if arg_count >= 3 {
@@ -11363,6 +11376,7 @@ pub fn op_function(
                 )?);
             }
             ScalarFunc::ArrayToString => {
+                check_arg_count!(arg_count, 2, 3);
                 let arr_val = state.registers[*start_reg].get_value().clone();
                 let delimiter = state.registers[*start_reg + 1].get_value().clone();
                 let null_str = if arg_count >= 3 {

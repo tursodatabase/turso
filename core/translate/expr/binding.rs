@@ -1046,6 +1046,17 @@ pub(super) fn validate_custom_type_function_call(
         | "array_slice" | "string_to_array" | "array_to_string" | "array_overlap"
         | "array_contains_all" => {
             resolver.require_custom_types("Array features")?;
+            let arg_count = args.len();
+            let valid_arity = match normalized.as_str() {
+                "array" => true,
+                "array_length" => (1..=2).contains(&arg_count),
+                "array_set_element" | "array_slice" => arg_count == 3,
+                "string_to_array" | "array_to_string" => (2..=3).contains(&arg_count),
+                _ => arg_count == 2,
+            };
+            if !valid_arity {
+                crate::bail_parse_error!("wrong number of arguments to function {}()", name);
+            }
         }
         // Structs
         "struct_pack" => {
