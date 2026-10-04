@@ -272,6 +272,10 @@ fn emit_compound_select(
     query_destination: &QueryDestination,
 ) -> crate::Result<()> {
     let compound_select_end = program.allocate_label();
+    let keep_first_duplicate = matches!(
+        query_destination,
+        QueryDestination::EphemeralIndex { index, .. } if index.has_rowid
+    );
     if let Some(limit_ctx) = &limit_ctx {
         program.emit_insn(Insn::IfNot {
             reg: limit_ctx.reg_limit,
@@ -352,7 +356,7 @@ fn emit_compound_select(
                     } if !index.has_rowid => (*cursor_id, index.clone()),
                     _ => {
                         new_dedupe_index = true;
-                        create_dedupe_index(program, plan, right_most)?
+                        create_dedupe_index(program, plan, right_most, keep_first_duplicate)?
                     }
                 };
                 plan.query_destination = QueryDestination::EphemeralIndex {
@@ -361,19 +365,6 @@ fn emit_compound_select(
                     affinity_str: affinity_str.clone(),
                     is_delete: false,
                 };
-                emit_compound_select(
-                    program,
-                    left,
-                    plan,
-                    limit,
-                    offset,
-                    resolver,
-                    None,
-                    None,
-                    reg_result_cols_start,
-                    query_destination,
-                )?;
-
                 right_most.query_destination = QueryDestination::EphemeralIndex {
                     cursor_id: dedupe_index.0,
                     index: dedupe_index.1.clone(),
@@ -381,18 +372,68 @@ fn emit_compound_select(
                     is_delete: false,
                 };
 
-                emit_explain!(
-                    program,
-                    true,
-                    EqpDetail::CompoundArm {
-                        op: EqpCompoundOp::Union,
-                        temp_btree: true,
-                    }
-                );
-                right_most_ctx.materialized_build_inputs =
-                    emit_materialized_build_inputs(program, &right_most_ctx.resolver, right_most)?;
-                emit_query(program, right_most, &mut right_most_ctx)?;
-                program.pop_current_parent_explain();
+                let left_has_except = left
+                    .iter()
+                    .any(|(_, op)| matches!(op, CompoundOperator::Except));
+                if keep_first_duplicate && !left_has_except {
+                    emit_explain!(
+                        program,
+                        true,
+                        EqpDetail::CompoundArm {
+                            op: EqpCompoundOp::Union,
+                            temp_btree: true,
+                        }
+                    );
+                    right_most_ctx.materialized_build_inputs = emit_materialized_build_inputs(
+                        program,
+                        &right_most_ctx.resolver,
+                        right_most,
+                    )?;
+                    emit_query(program, right_most, &mut right_most_ctx)?;
+                    program.pop_current_parent_explain();
+
+                    emit_compound_select(
+                        program,
+                        left,
+                        plan,
+                        limit,
+                        offset,
+                        resolver,
+                        None,
+                        None,
+                        reg_result_cols_start,
+                        query_destination,
+                    )?;
+                } else {
+                    emit_compound_select(
+                        program,
+                        left,
+                        plan,
+                        limit,
+                        offset,
+                        resolver,
+                        None,
+                        None,
+                        reg_result_cols_start,
+                        query_destination,
+                    )?;
+
+                    emit_explain!(
+                        program,
+                        true,
+                        EqpDetail::CompoundArm {
+                            op: EqpCompoundOp::Union,
+                            temp_btree: true,
+                        }
+                    );
+                    right_most_ctx.materialized_build_inputs = emit_materialized_build_inputs(
+                        program,
+                        &right_most_ctx.resolver,
+                        right_most,
+                    )?;
+                    emit_query(program, right_most, &mut right_most_ctx)?;
+                    program.pop_current_parent_explain();
+                }
 
                 if new_dedupe_index {
                     read_deduplicated_union_or_except_rows(
@@ -412,7 +453,8 @@ fn emit_compound_select(
                 // this BEFORE we overwrite it with our own indexes for the intersection.
                 let intersect_destination = right_most.query_destination.clone();
 
-                let (left_cursor_id, left_index) = create_dedupe_index(program, plan, right_most)?;
+                let (left_cursor_id, left_index) =
+                    create_dedupe_index(program, plan, right_most, keep_first_duplicate)?;
                 plan.query_destination = QueryDestination::EphemeralIndex {
                     cursor_id: left_cursor_id,
                     index: left_index.clone(),
@@ -421,7 +463,7 @@ fn emit_compound_select(
                 };
 
                 let (right_cursor_id, right_index) =
-                    create_dedupe_index(program, plan, right_most)?;
+                    create_dedupe_index(program, plan, right_most, keep_first_duplicate)?;
                 right_most.query_destination = QueryDestination::EphemeralIndex {
                     cursor_id: right_cursor_id,
                     index: right_index,
@@ -472,7 +514,7 @@ fn emit_compound_select(
                     } if !index.has_rowid => (*cursor_id, index.clone()),
                     _ => {
                         new_index = true;
-                        create_dedupe_index(program, plan, right_most)?
+                        create_dedupe_index(program, plan, right_most, keep_first_duplicate)?
                     }
                 };
                 plan.query_destination = QueryDestination::EphemeralIndex {
@@ -558,6 +600,7 @@ fn create_dedupe_index(
     program: &mut ProgramBuilder,
     left_select: &SelectPlan,
     right_select: &SelectPlan,
+    unique: bool,
 ) -> crate::Result<(usize, Arc<Index>)> {
     let mut dedupe_columns = right_select
         .result_columns
@@ -596,7 +639,7 @@ fn create_dedupe_index(
         root_page: 0,
         ephemeral: true,
         table_name: String::new(),
-        unique: false,
+        unique,
         has_rowid: false,
         where_clause: None,
         index_method: None,
