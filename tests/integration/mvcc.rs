@@ -1645,3 +1645,46 @@ fn mvcc_passive_checkpoint_must_not_leak_commits_into_pinned_snapshot() {
         "a pinned BEGIN CONCURRENT snapshot must not see a commit that happened after it"
     );
 }
+
+/// Regression test for #9474: converting a WAL database to MVCC runs the
+/// AUTOINCREMENT watermark sync on the user connection. That sync reads
+/// `sqlite_sequence` through an internal statement, which opens an MVCC read
+/// transaction that must be closed when bootstrap finishes. Otherwise its
+/// checkpoint read slot makes the first `wal_checkpoint(TRUNCATE)` return
+/// `database is busy`.
+#[turso_macros::test]
+fn test_wal_checkpoint_after_mvcc_journal_mode_switch_with_autoincrement(
+    db: TempDatabase,
+) -> anyhow::Result<()> {
+    let conn = db.connect_limbo();
+    conn.execute("create table a(id integer primary key autoincrement, v text)")?;
+    conn.execute("pragma journal_mode = 'mvcc'")?;
+    conn.execute("pragma wal_checkpoint(TRUNCATE)")?;
+
+    let rows: Vec<(i64,)> = conn.exec_rows("select id from a");
+    assert_eq!(rows, Vec::<(i64,)>::new());
+
+    Ok(())
+}
+
+/// Same conversion with populated `sqlite_sequence`, which also upserts the
+/// recovered sequence watermarks into the internal backing tables.
+#[turso_macros::test]
+fn test_wal_checkpoint_after_mvcc_journal_mode_switch_with_populated_autoincrement(
+    db: TempDatabase,
+) -> anyhow::Result<()> {
+    let conn = db.connect_limbo();
+    conn.execute("create table a(id integer primary key autoincrement, v text)")?;
+    conn.execute("insert into a(v) values ('x'), ('y')")?;
+    conn.execute("pragma journal_mode = 'mvcc'")?;
+    conn.execute("pragma wal_checkpoint(TRUNCATE)")?;
+
+    let rows: Vec<(i64, String)> = conn.exec_rows("select id, v from a order by id");
+    assert_eq!(rows, vec![(1, "x".to_string()), (2, "y".to_string())]);
+
+    conn.execute("insert into a(v) values ('z')")?;
+    let rows: Vec<(i64,)> = conn.exec_rows("select id from a order by id desc limit 1");
+    assert_eq!(rows, vec![(3,)]);
+
+    Ok(())
+}

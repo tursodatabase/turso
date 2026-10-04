@@ -18905,6 +18905,8 @@ impl Drop for MvccBootstrapGuard {
         if self.connection.is_mvcc_bootstrap_connection() {
             self.connection.promote_to_regular_connection();
         }
+        let pager = self.connection.pager.load();
+        self.connection.clear_internal_main_mvcc_tx(&pager);
         self.connection.db.mv_store.store(None);
     }
 }

@@ -5257,11 +5257,12 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                     *st = BootstrapState::AwaitingGlobalHeader;
                 }
                 BootstrapState::AwaitingGlobalHeader => {
+                    let pager = bootstrap_conn.pager.load();
                     if self.global_header.read().is_none() {
-                        let pager = bootstrap_conn.pager.load();
                         let header = return_if_io!(pager.with_header(|header| *header));
                         self.global_header.write().replace(header);
                     }
+                    bootstrap_conn.clear_internal_main_mvcc_tx(&pager);
                     return Ok(IOResult::Done(()));
                 }
             }
@@ -7016,6 +7017,14 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                 tx.value().state.load(),
                 TransactionState::Active | TransactionState::Preparing(_)
             )
+        })
+    }
+
+    /// Returns true if the transaction is active and carries uncommitted writes.
+    pub fn tx_is_active_with_writes(&self, tx_id: TxID) -> bool {
+        self.txs.get(&tx_id).is_some_and(|tx| {
+            matches!(tx.value().state.load(), TransactionState::Active)
+                && !tx.value().write_set.lock().is_empty()
         })
     }
 
