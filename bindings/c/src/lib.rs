@@ -1071,7 +1071,7 @@ pub unsafe extern "C" fn sqlite3_prepare_v2(
     let sql_bytes: &[u8] = if n_byte < 0 {
         CStr::from_ptr(sql).to_bytes()
     } else {
-        let bounded = std::slice::from_raw_parts(sql as *const u8, n_byte as usize);
+        let bounded = std::slice::from_raw_parts(sql.cast::<u8>(), n_byte as usize);
         bounded
             .iter()
             .position(|&b| b == 0)
@@ -1112,10 +1112,10 @@ pub unsafe extern "C" fn sqlite3_prepare_v2(
         // follows a ';'.
         let mut off = stmt.tail_offset();
         let mut p = off;
-        while p > 0 && (*(sql.add(p - 1) as *const u8)).is_ascii_whitespace() {
+        while p > 0 && (*(sql.add(p - 1).cast::<u8>())).is_ascii_whitespace() {
             p -= 1;
         }
-        if p > 0 && *(sql.add(p - 1) as *const u8) == b';' {
+        if p > 0 && *(sql.add(p - 1).cast::<u8>()) == b';' {
             off = p;
         }
         *tail = sql.add(off);
@@ -1815,7 +1815,7 @@ pub unsafe extern "C" fn turso_printf_va(
         if buf.is_null() {
             return std::ptr::null_mut();
         }
-        std::ptr::copy_nonoverlapping(rendered.as_ptr(), buf as *mut u8, n);
+        std::ptr::copy_nonoverlapping(rendered.as_ptr(), buf.cast::<u8>(), n);
         *buf.add(n) = 0;
         buf
     }
@@ -2038,7 +2038,7 @@ pub unsafe extern "C" fn sqlite3_expanded_sql(stmt: *mut sqlite3_stmt) -> *mut f
     }
     // SAFETY: buf is a fresh allocation of n + 1 bytes; expanded is n bytes.
     unsafe {
-        std::ptr::copy_nonoverlapping(expanded.as_ptr(), buf as *mut u8, n);
+        std::ptr::copy_nonoverlapping(expanded.as_ptr(), buf.cast::<u8>(), n);
         *buf.add(n) = 0;
     }
     buf
@@ -2233,7 +2233,7 @@ pub unsafe extern "C" fn sqlite3_bind_text(
             Err(_) => return SQLITE_ERROR,
         }
     } else {
-        let slice = std::slice::from_raw_parts(text as *const u8, len as usize);
+        let slice = std::slice::from_raw_parts(text.cast::<u8>(), len as usize);
         match std::str::from_utf8(slice) {
             Ok(s) => s.to_owned(),
             Err(_) => return SQLITE_ERROR,
@@ -2248,7 +2248,7 @@ pub unsafe extern "C" fn sqlite3_bind_text(
             return rc;
         }
     } else if ptr_val == static_ptr {
-        let slice = std::slice::from_raw_parts(text as *const u8, str_value.len());
+        let slice = std::slice::from_raw_parts(text.cast::<u8>(), str_value.len());
         let val = Value::from_text(std::str::from_utf8(slice).unwrap());
         let result = stmt_ref.stmt.bind_at(index, val);
         let rc = sqlite3_bind_result(stmt_ref, result);
@@ -2256,7 +2256,7 @@ pub unsafe extern "C" fn sqlite3_bind_text(
             return rc;
         }
     } else {
-        let slice = std::slice::from_raw_parts(text as *const u8, str_value.len());
+        let slice = std::slice::from_raw_parts(text.cast::<u8>(), str_value.len());
         let val = Value::from_text(std::str::from_utf8(slice).unwrap());
         let result = stmt_ref.stmt.bind_at(index, val);
         let rc = sqlite3_bind_result(stmt_ref, result);
@@ -2292,7 +2292,7 @@ pub unsafe extern "C" fn sqlite3_bind_blob(
         return sqlite3_bind_result(stmt_ref, result);
     }
 
-    let slice_blob = std::slice::from_raw_parts(blob as *const u8, len as usize).to_vec();
+    let slice_blob = std::slice::from_raw_parts(blob.cast::<u8>(), len as usize).to_vec();
 
     let val_blob = Value::from_blob(slice_blob);
 
@@ -2882,7 +2882,7 @@ pub unsafe extern "C" fn sqlite3_result_text(
     let s = if len < 0 {
         CStr::from_ptr(text).to_string_lossy().into_owned()
     } else {
-        let bytes = std::slice::from_raw_parts(text as *const u8, len as usize);
+        let bytes = std::slice::from_raw_parts(text.cast::<u8>(), len as usize);
         String::from_utf8_lossy(bytes).into_owned()
     };
     ctx.result = ExtValue::from_text(s);
@@ -2899,7 +2899,7 @@ pub unsafe extern "C" fn sqlite3_result_blob(
         return;
     }
     let ctx = &mut *(context as *mut SqliteContext);
-    let bytes = std::slice::from_raw_parts(blob as *const u8, len as usize).to_vec();
+    let bytes = std::slice::from_raw_parts(blob.cast::<u8>(), len as usize).to_vec();
     ctx.result = ExtValue::from_blob(bytes);
 }
 
@@ -2936,7 +2936,7 @@ pub unsafe extern "C" fn sqlite3_result_error(
     } else if len < 0 {
         CStr::from_ptr(err).to_string_lossy().into_owned()
     } else {
-        let bytes = std::slice::from_raw_parts(err as *const u8, len as usize);
+        let bytes = std::slice::from_raw_parts(err.cast::<u8>(), len as usize);
         String::from_utf8_lossy(bytes).into_owned()
     };
     ctx.result = ExtValue::error_with_message(msg);
@@ -3089,7 +3089,7 @@ pub unsafe extern "C" fn sqlite3_blob_write(
     }
     // SAFETY: data checked non-null and n > 0 and non-negative; the caller
     // guarantees data points to at least n readable bytes.
-    let buf = unsafe { std::slice::from_raw_parts(data as *const u8, n as usize) };
+    let buf = unsafe { std::slice::from_raw_parts(data.cast::<u8>(), n as usize) };
     match blob.write(offset as usize, buf) {
         Ok(()) => SQLITE_OK,
         Err(err) => limbo_err_code(&err),
@@ -3153,8 +3153,8 @@ pub unsafe extern "C" fn sqlite3_strnicmp(
         return 0;
     }
 
-    let mut p_a = a as *const u8;
-    let mut p_b = b as *const u8;
+    let mut p_a = a.cast::<u8>();
+    let mut p_b = b.cast::<u8>();
     let mut rem = n;
 
     while rem > 0 && *p_a != 0 && p_a.read().eq_ignore_ascii_case(&p_b.read()) {
