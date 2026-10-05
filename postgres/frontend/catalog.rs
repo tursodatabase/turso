@@ -3,7 +3,8 @@ use parking_lot::RwLock;
 use rustc_hash::FxHashMap as HashMap;
 use std::sync::Arc;
 use turso_core::{
-    schema::{BTreeTable, Schema, Table},
+    dialect::InternalMigration,
+    schema::{BTreeTable, Schema, Table, View},
     Connection, Dialect, Func, InternalVirtualTable, InternalVirtualTableCursor, LimboError,
     Result, Value, VirtualTable,
 };
@@ -14,6 +15,26 @@ use turso_parser::ast::RefAct;
 const USER_TABLE_OID_START: i64 = 16384;
 const PRIMARY_KEY_AUTOMATIC_INDEX_NAME_PREFIX: &str = "sqlite_autoindex_";
 const STORED_PG_SCHEMA_PREFIX: &str = "/* turso_frontend:postgres */ ";
+const PG_ROLES_SQL: &str = "CREATE TABLE __turso_internal_pg_roles (
+    oid INTEGER PRIMARY KEY,
+    rolname TEXT NOT NULL UNIQUE,
+    rolsuper INTEGER NOT NULL,
+    rolinherit INTEGER NOT NULL,
+    rolcreaterole INTEGER NOT NULL,
+    rolcreatedb INTEGER NOT NULL,
+    rolcanlogin INTEGER NOT NULL,
+    rolreplication INTEGER NOT NULL,
+    rolconnlimit INTEGER NOT NULL,
+    rolpassword TEXT,
+    rolvaliduntil TEXT,
+    rolbypassrls INTEGER NOT NULL,
+    rolconfig TEXT
+)";
+const PG_ROLES_VIEW_SQL: &str = "CREATE VIEW pg_roles AS
+    SELECT oid, rolname, rolsuper, rolinherit, rolcreaterole, rolcreatedb,
+           rolcanlogin, rolreplication, rolconnlimit, CAST(NULL AS TEXT) AS rolpassword,
+           rolvaliduntil, rolbypassrls, rolconfig
+    FROM main.__turso_internal_pg_roles";
 
 #[derive(Debug)]
 pub struct PostgresDialect;
@@ -21,6 +42,17 @@ pub struct PostgresDialect;
 impl Dialect for PostgresDialect {
     fn name(&self) -> &'static str {
         "postgres"
+    }
+
+    fn internal_migrations(&self) -> &'static [InternalMigration] {
+        &[InternalMigration {
+            version: 1,
+            statements: &[
+                PG_ROLES_SQL,
+                "INSERT INTO __turso_internal_pg_roles VALUES
+                    (10, 'turso', 1, 1, 1, 1, 1, 1, -1, NULL, NULL, 1, NULL)",
+            ],
+        }]
     }
 
     fn parse(&self, sql: &str) -> Result<(Option<turso_parser::ast::Cmd>, usize)> {
@@ -141,6 +173,21 @@ impl Dialect for PostgresDialect {
         for vtab in pg_catalog_virtual_tables() {
             schema.add_virtual_table(vtab)?;
         }
+        let table = BTreeTable::from_sql(PG_ROLES_SQL, 0)?;
+        let (cmd, _) = turso_core::dialect::sqlite::parse(PG_ROLES_VIEW_SQL)?;
+        let Some(turso_parser::ast::Cmd::Stmt(turso_parser::ast::Stmt::CreateView {
+            select, ..
+        })) = cmd
+        else {
+            unreachable!("pg_roles definition must be CREATE VIEW");
+        };
+        schema.add_view(View {
+            name: "pg_roles".into(),
+            sql: PG_ROLES_VIEW_SQL.into(),
+            select_stmt: select,
+            columns: table.columns().to_vec(),
+            internal: true,
+        })?;
         Ok(())
     }
 
@@ -202,13 +249,13 @@ pub fn decode_stored_pg_schema_sql(sql: &str) -> Option<&str> {
 
 /// Returns an iterator of (table_name, table_ref) for user tables in deterministic order.
 /// Both pg_class and pg_attribute must use this function to ensure consistent OID assignment.
-fn user_tables_sorted(schema: &Schema) -> Vec<(&String, &Arc<Table>)> {
+pub(crate) fn user_tables_sorted(schema: &Schema) -> Vec<(&String, &Arc<Table>)> {
     let mut tables: Vec<_> = schema
         .tables
         .iter()
         .filter(|(name, table)| {
             // Skip system tables
-            if name.starts_with("sqlite_")
+            if turso_core::schema::is_system_table(name)
                 || name.starts_with("pg_")
                 || name.starts_with("pragma_")
                 || name.starts_with("json_")
@@ -838,131 +885,6 @@ impl InternalVirtualTableCursor for PgAttributeCursor {
         self.current_row = 0;
         self.rows.clear();
         self.load_attributes()?;
-        Ok(!self.rows.is_empty())
-    }
-}
-
-/// Virtual table implementation for pg_catalog.pg_roles
-/// Stub: returns a single hardcoded "turso" superuser role.
-/// TODO: replace with real role data when authentication is implemented.
-#[derive(Debug)]
-pub struct PgRolesTable;
-
-impl PgRolesTable {
-    pub fn new() -> Self {
-        Self
-    }
-
-    /// Stub: returns a single default superuser role.
-    /// Replace this method with real role lookup when auth is implemented.
-    fn roles() -> Vec<Vec<Value>> {
-        vec![vec![
-            Value::from_i64(10),        // oid
-            Value::build_text("turso"), // rolname
-            Value::from_i64(1),         // rolsuper
-            Value::from_i64(1),         // rolinherit
-            Value::from_i64(1),         // rolcreaterole
-            Value::from_i64(1),         // rolcreatedb
-            Value::from_i64(1),         // rolcanlogin
-            Value::from_i64(1),         // rolreplication
-            Value::from_i64(-1),        // rolconnlimit (-1 = no limit)
-            Value::Null,                // rolpassword (never exposed)
-            Value::Null,                // rolvaliduntil
-            Value::from_i64(1),         // rolbypassrls
-            Value::Null,                // rolconfig
-        ]]
-    }
-}
-
-impl InternalVirtualTable for PgRolesTable {
-    fn name(&self) -> String {
-        "pg_roles".to_string()
-    }
-
-    fn open(
-        &self,
-        _conn: Arc<Connection>,
-    ) -> crate::Result<Arc<RwLock<dyn InternalVirtualTableCursor>>> {
-        Ok(Arc::new(RwLock::new(PgRolesCursor {
-            rows: Vec::new(),
-            current_row: 0,
-        })))
-    }
-
-    fn best_index(
-        &self,
-        constraints: &[ConstraintInfo],
-        _order_by: &[OrderByInfo],
-    ) -> Result<IndexInfo, ResultCode> {
-        let constraint_usages = constraints
-            .iter()
-            .map(|_| turso_ext::ConstraintUsage {
-                argv_index: None,
-                omit: false,
-            })
-            .collect();
-
-        Ok(IndexInfo {
-            idx_num: 0,
-            idx_str: None,
-            order_by_consumed: false,
-            estimated_cost: 10.0,
-            estimated_rows: 1,
-            constraint_usages,
-        })
-    }
-
-    fn sql(&self) -> String {
-        "CREATE TABLE pg_roles (
-            oid INTEGER,
-            rolname TEXT,
-            rolsuper INTEGER,
-            rolinherit INTEGER,
-            rolcreaterole INTEGER,
-            rolcreatedb INTEGER,
-            rolcanlogin INTEGER,
-            rolreplication INTEGER,
-            rolconnlimit INTEGER,
-            rolpassword TEXT,
-            rolvaliduntil TEXT,
-            rolbypassrls INTEGER,
-            rolconfig TEXT
-        )"
-        .to_string()
-    }
-}
-
-struct PgRolesCursor {
-    rows: Vec<Vec<Value>>,
-    current_row: usize,
-}
-
-impl InternalVirtualTableCursor for PgRolesCursor {
-    fn next(&mut self) -> Result<bool, LimboError> {
-        self.current_row += 1;
-        Ok(self.current_row < self.rows.len())
-    }
-
-    fn rowid(&self) -> i64 {
-        self.current_row as i64
-    }
-
-    fn column(&self, column: usize) -> Result<Value, LimboError> {
-        if self.current_row < self.rows.len() && column < self.rows[self.current_row].len() {
-            Ok(self.rows[self.current_row][column].clone())
-        } else {
-            Ok(Value::Null)
-        }
-    }
-
-    fn filter(
-        &mut self,
-        _args: &[Value],
-        _idx_str: Option<String>,
-        _idx_num: i32,
-    ) -> Result<bool, LimboError> {
-        self.current_row = 0;
-        self.rows = PgRolesTable::roles();
         Ok(!self.rows.is_empty())
     }
 }
@@ -2978,16 +2900,6 @@ pub fn pg_catalog_virtual_tables() -> Vec<Arc<VirtualTable>> {
             )
             .expect("pg_attribute virtual table creation should not fail"),
         ),
-        // pg_roles virtual table
-        Arc::new(
-            VirtualTable::new_internal(
-                "pg_roles".to_string(),
-                PgRolesTable::new().sql(),
-                VTabKind::VirtualTable,
-                Arc::new(RwLock::new(PgRolesTable::new())),
-            )
-            .expect("pg_roles virtual table creation should not fail"),
-        ),
         // pg_am virtual table
         Arc::new(
             VirtualTable::new_internal(
@@ -3317,7 +3229,7 @@ impl PgGetTableDefCursor {
 
         for (table_name, table) in &schema.tables {
             // Skip system tables
-            if table_name.starts_with("sqlite_")
+            if turso_core::schema::is_system_table(table_name)
                 || table_name == "sqlite_master"
                 || table_name == "sqlite_schema"
             {
@@ -4088,6 +4000,103 @@ mod tests {
                 StepResult::Done => break,
                 _ => {}
             }
+        }
+    }
+
+    #[test]
+    fn pg_roles_reads_persisted_rows_and_survives_reopen() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("roles.db");
+        let path = path.to_str().unwrap();
+        let io: Arc<dyn turso_core::IO> = Arc::new(PlatformIO::new().unwrap());
+        {
+            let db = crate::session::open_database_with_io(
+                io.clone(),
+                path,
+                crate::OpenFlags::Create,
+                crate::DatabaseOpts::new(),
+            )
+            .unwrap();
+            let conn = db.connect().unwrap();
+            assert_eq!(
+                conn.prepare("SELECT oid, rolname, rolcanlogin, rolconnlimit FROM pg_roles")
+                    .unwrap()
+                    .run_collect_rows()
+                    .unwrap(),
+                vec![vec![
+                    Value::from_i64(10),
+                    Value::build_text("turso"),
+                    Value::from_i64(1),
+                    Value::from_i64(-1)
+                ]]
+            );
+            conn.execute("BEGIN IMMEDIATE").unwrap();
+            conn.prepare_internal(
+                "UPDATE __turso_internal_pg_roles SET rolname = 'admin', rolpassword = 'test-verifier' WHERE oid = 10"
+            ).unwrap().run_ignore_rows().unwrap();
+            conn.prepare_internal(
+                "INSERT INTO __turso_internal_pg_roles VALUES
+                 (16400, 'reader', 0, 1, 0, 0, 0, 0, 3, NULL, NULL, 0, NULL)",
+            )
+            .unwrap()
+            .run_ignore_rows()
+            .unwrap();
+            conn.execute("COMMIT").unwrap();
+            assert_eq!(
+                conn.prepare("SELECT rolname FROM pg_roles ORDER BY oid")
+                    .unwrap()
+                    .run_collect_rows()
+                    .unwrap(),
+                vec![
+                    vec![Value::build_text("admin")],
+                    vec![Value::build_text("reader")]
+                ]
+            );
+            conn.close().unwrap();
+        }
+        let db = crate::session::open_database_with_io(
+            io,
+            path,
+            crate::OpenFlags::Create,
+            crate::DatabaseOpts::new(),
+        )
+        .unwrap();
+        let conn1 = crate::Connection::new(db.connect().unwrap());
+        let conn2 = crate::Connection::new(db.connect().unwrap());
+        conn2.execute("CREATE TABLE ordinary (id INTEGER)").unwrap();
+        for conn in [&conn1, &conn2] {
+            assert_eq!(
+                conn.prepare("SELECT oid, rolname, rolconnlimit, rolpassword FROM pg_catalog.pg_roles ORDER BY oid")
+                    .unwrap().run_collect_rows().unwrap(),
+                vec![
+                    vec![Value::from_i64(10), Value::build_text("admin"), Value::from_i64(-1), Value::Null],
+                    vec![Value::from_i64(16400), Value::build_text("reader"), Value::from_i64(3), Value::Null],
+                ]
+            );
+            assert_eq!(
+                conn.prepare("SELECT rolname FROM pg_roles WHERE rolcanlogin = 0")
+                    .unwrap()
+                    .run_collect_rows()
+                    .unwrap(),
+                vec![vec![Value::build_text("reader")]]
+            );
+            assert_eq!(
+                conn.prepare("SELECT tablename FROM pg_tables ORDER BY tablename")
+                    .unwrap()
+                    .run_collect_rows()
+                    .unwrap(),
+                vec![vec![Value::build_text("ordinary")]]
+            );
+            for sql in [
+                "UPDATE pg_roles SET rolname = 'other'",
+                "DELETE FROM pg_roles",
+                "DROP VIEW pg_roles",
+                "DROP TABLE __turso_internal_pg_roles",
+                "UPDATE __turso_internal_pg_roles SET rolname = 'other'",
+            ] {
+                assert!(conn.prepare(sql).is_err(), "{sql}");
+            }
+            conn.close().unwrap();
         }
     }
 }

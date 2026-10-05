@@ -183,15 +183,18 @@ pub(crate) fn classify_schema_entries(
 
 /// Target database feature flags needed for schema replay during a vacuum build.
 pub(crate) fn vacuum_target_opts_from_source(source_db: &Database) -> DatabaseOpts {
-    DatabaseOpts::new()
-        .with_views(source_db.experimental_views_enabled())
-        .with_index_method(source_db.experimental_index_method_enabled())
-        .with_custom_types(source_db.experimental_custom_types_enabled())
-        .with_encryption(source_db.experimental_encryption_enabled())
-        .with_autovacuum(source_db.experimental_autovacuum_enabled())
-        .with_attach(source_db.experimental_attach_enabled())
-        .with_generated_columns(source_db.experimental_generated_columns_enabled())
-        .with_without_rowid(source_db.experimental_without_rowid_enabled())
+    DatabaseOpts {
+        skip_frontend_setup: true,
+        ..DatabaseOpts::new()
+    }
+    .with_views(source_db.experimental_views_enabled())
+    .with_index_method(source_db.experimental_index_method_enabled())
+    .with_custom_types(source_db.experimental_custom_types_enabled())
+    .with_encryption(source_db.experimental_encryption_enabled())
+    .with_autovacuum(source_db.experimental_autovacuum_enabled())
+    .with_attach(source_db.experimental_attach_enabled())
+    .with_generated_columns(source_db.experimental_generated_columns_enabled())
+    .with_without_rowid(source_db.experimental_without_rowid_enabled())
 }
 
 pub(crate) fn reject_unsupported_vacuum_auto_vacuum_mode(mode: AutoVacuumMode) -> Result<()> {
@@ -697,22 +700,11 @@ pub(crate) fn vacuum_target_build_step(
                 let entry = &state.schema_entries[entry_ordinal];
                 let sql = table_sql_for_vacuum_replay(&state.target_conn, &entry.sql)?;
 
-                // System tables (sqlite_stat1, __turso_internal_types, etc.) have
-                // reserved name prefixes that translate_create_table rejects for
-                // user SQL. Temporarily mark the target connection as nested during
-                // prepare() so the reserved-name check is bypassed at compile
-                // time. The guard is only for prepare: keeping it during step()
-                // would make this CREATE TABLE look nested, so its Transaction
-                // opcode would skip write setup.
-                let is_system = crate::schema::is_system_table(&entry.name);
-                if is_system {
-                    state.target_conn.start_nested();
-                }
-                let target_stmt = state.target_conn.prepare(&sql);
-                if is_system {
-                    state.target_conn.end_nested();
-                }
-                let target_stmt = target_stmt?;
+                let target_stmt = if crate::schema::is_system_table(&entry.name) {
+                    state.target_conn.prepare_internal_root(&sql)
+                } else {
+                    state.target_conn.prepare(&sql)
+                }?;
                 state.phase = VacuumTargetBuildPhase::StepCreateTable {
                     target_schema_stmt: Box::new(target_stmt),
                     idx,
@@ -813,19 +805,11 @@ pub(crate) fn vacuum_target_build_step(
                 // SELECT from source, INSERT into the target.
                 let select_stmt = config.source_conn.prepare_internal(&select_sql)?;
 
-                // System tables need nested mode during prepare() to bypass
-                // "may not be modified" checks. Can't use prepare_internal()
-                // because the nested guard must not persist into step() - the
-                // Transaction opcode needs to run for page-level write setup.
-                let is_system = crate::schema::is_system_table(table_name);
-                if is_system {
-                    state.target_conn.start_nested();
-                }
-                let target_insert_stmt = state.target_conn.prepare(&insert_sql);
-                if is_system {
-                    state.target_conn.end_nested();
-                }
-                let target_insert_stmt = target_insert_stmt?;
+                let target_insert_stmt = if crate::schema::is_system_table(table_name) {
+                    state.target_conn.prepare_internal_root(&insert_sql)
+                } else {
+                    state.target_conn.prepare(&insert_sql)
+                }?;
 
                 state.phase = VacuumTargetBuildPhase::CopyRows {
                     select_stmt: Box::new(select_stmt),
@@ -931,10 +915,11 @@ pub(crate) fn vacuum_target_build_step(
 
                 let entry_ordinal = state.indexes_to_create[idx];
                 let entry = &state.schema_entries[entry_ordinal];
-                // Backing-btree indexes for custom index methods were filtered
-                // out when indexes_to_create was built. The remaining CREATE
-                // INDEX statements are user-visible and can use ordinary prepare.
-                let target_stmt = state.target_conn.prepare(&entry.sql)?;
+                let target_stmt = if crate::schema::is_system_table(&entry.tbl_name) {
+                    state.target_conn.prepare_internal_root(&entry.sql)
+                } else {
+                    state.target_conn.prepare(&entry.sql)
+                }?;
                 state.phase = VacuumTargetBuildPhase::StepCreateIndex {
                     target_schema_stmt: Box::new(target_stmt),
                     idx,

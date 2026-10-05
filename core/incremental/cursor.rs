@@ -406,6 +406,7 @@ mod tests {
                 enable_without_rowid: false,
                 enable_experimental_mvcc_passive_checkpoint: false,
                 unsafe_testing: false,
+                skip_frontend_setup: false,
             },
             None,
             Arc::new(SqliteDialect),

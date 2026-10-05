@@ -41,16 +41,21 @@ use crate::{
 use either::Either;
 use rustc_hash::FxHashSet as HashSet;
 
-fn validate(alter_table: &ast::AlterTableBody, table_name: &str) -> Result<()> {
+fn validate(
+    alter_table: &ast::AlterTableBody,
+    table_name: &str,
+    allow_internal_table_writes: bool,
+) -> Result<()> {
     // Check if someone is trying to ALTER a system table
-    if crate::schema::is_system_table(table_name) {
+    if !allow_internal_table_writes && crate::schema::is_system_table(table_name) {
         crate::bail_parse_error!("table {} may not be modified", table_name);
     }
     if let ast::AlterTableBody::RenameTo(new_table_name) = alter_table {
         let normalized_new_name = normalize_ident(new_table_name.as_str());
-        if RESERVED_TABLE_PREFIXES
-            .iter()
-            .any(|prefix| normalized_new_name.starts_with(prefix))
+        if !allow_internal_table_writes
+            && RESERVED_TABLE_PREFIXES
+                .iter()
+                .any(|prefix| normalized_new_name.starts_with(prefix))
         {
             crate::bail_parse_error!("Object name reserved for internal use: {}", new_table_name);
         }
@@ -869,7 +874,11 @@ pub fn translate_alter_table(
     // so that the UPDATE targets the correct database's schema table.
     let qualified_schema_table = schema_table_name_for_db(resolver, database_id);
     let schema_version = resolver.with_schema(database_id, |s| s.schema_version);
-    validate(&alter_table, table_name)?;
+    validate(
+        &alter_table,
+        table_name,
+        resolver.allow_internal_table_writes,
+    )?;
 
     let table_indexes = resolver.with_schema(database_id, |s| {
         s.get_indices(table_name).cloned().collect::<Vec<_>>()

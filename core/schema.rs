@@ -29,6 +29,7 @@ pub struct View {
     pub sql: String,
     pub select_stmt: ast::Select,
     pub columns: Vec<Column>,
+    pub internal: bool,
 }
 
 impl View {
@@ -38,6 +39,7 @@ impl View {
             sql,
             select_stmt,
             columns,
+            internal: false,
         }
     }
 }
@@ -2655,6 +2657,7 @@ impl TryClone for View {
             sql: self.sql.clone(),
             select_stmt: self.select_stmt.clone(),
             columns: self.columns.try_clone()?,
+            internal: self.internal,
         })
     }
 }

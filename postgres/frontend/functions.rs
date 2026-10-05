@@ -1,5 +1,5 @@
-use std::sync::Arc;
-use turso_core::schema::{Schema, Table};
+use crate::catalog::user_tables_sorted;
+use turso_core::schema::Table;
 use turso_core::{Connection, LimboError, Result, Value};
 use turso_parser::ast::RefAct;
 
@@ -249,25 +249,6 @@ fn exec_pg_get_expr(args: &[Value]) -> Result<Value> {
             "Expected text value".to_string(),
         )),
     }
-}
-
-fn user_tables_sorted(schema: &Schema) -> Vec<(&String, &Arc<Table>)> {
-    let mut tables: Vec<_> = schema
-        .tables
-        .iter()
-        .filter(|(name, table)| {
-            if name.starts_with("sqlite_")
-                || name.starts_with("pg_")
-                || name.starts_with("pragma_")
-                || name.starts_with("json_")
-            {
-                return false;
-            }
-            matches!(table.as_ref(), Table::BTree(_))
-        })
-        .collect();
-    tables.sort_by_key(|(name, _)| *name);
-    tables
 }
 
 fn ref_act_to_char(act: &RefAct) -> &'static str {

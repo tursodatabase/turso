@@ -1193,7 +1193,8 @@ pub fn translate_create_table(
     let opts = ProgramBuilderOpts::new(1, 30, 1);
     program.extend(&opts);
 
-    if !connection.is_mvcc_bootstrap_connection()
+    if !resolver.allow_internal_table_writes
+        && !connection.is_mvcc_bootstrap_connection()
         && RESERVED_TABLE_PREFIXES
             .iter()
             .any(|prefix| normalized_tbl_name.starts_with(prefix))
@@ -1342,9 +1343,7 @@ pub fn translate_create_table(
     let sql = if let Some(ref info) = ctas_info {
         info.schema_sql.clone()
     } else {
-        connection
-            .dialect()
-            .format_table_sql(input, &tbl_name, &body)?
+        resolver.dialect.format_table_sql(input, &tbl_name, &body)?
     };
 
     let parse_schema_label = program.allocate_label();
@@ -1835,7 +1834,8 @@ fn validate_drop_table(
     tbl_name: &str,
     connection: &Arc<Connection>,
 ) -> Result<()> {
-    if !connection.is_nested_stmt()
+    if !resolver.allow_internal_table_writes
+        && !connection.is_nested_stmt()
         && crate::schema::is_system_table(tbl_name)
         // special case, allow dropping `sqlite_stat1`
         && !tbl_name.eq_ignore_ascii_case(STATS_TABLE)

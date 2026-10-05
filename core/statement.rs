@@ -56,6 +56,7 @@ type StepResult = vdbe::StepResult;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum StatementOrigin {
     Root,
+    InternalRoot,
     InternalHelper,
     Subprogram,
 }
@@ -632,7 +633,12 @@ impl Statement {
     /// hand back to the caller when the statement must not run yet.
     #[inline(never)]
     fn prepare_step(&mut self, waker: Option<&Waker>) -> Result<Option<StepResult>> {
-        if !self.counted_as_active_root && matches!(self.origin, StatementOrigin::Root) {
+        if !self.counted_as_active_root
+            && matches!(
+                self.origin,
+                StatementOrigin::Root | StatementOrigin::InternalRoot
+            )
+        {
             self.program.connection.start_root_statement()?;
             self.counted_as_active_root = true;
             // After the root count, so the checkpoint guard's subtraction
@@ -1021,7 +1027,7 @@ impl Statement {
         // same-version reprepare still refreshes it.
         conn.refresh_schema_from_shared_for_reprepare();
         let new_program = {
-            let (cmd, _) = conn.parse_sql(&self.program.sql)?;
+            let (cmd, _) = conn.parse_sql_with_origin(&self.program.sql, self.origin)?;
             let cmd = cmd.expect("Same SQL string should be able to be parsed");
 
             let syms = conn.syms.read();

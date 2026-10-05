@@ -82,6 +82,7 @@ pub struct DatabaseOpts {
     pub enable_experimental_mvcc_passive_checkpoint: bool,
     pub unsafe_testing: bool,
     pub(crate) enable_load_extension: bool,
+    pub(crate) skip_frontend_setup: bool,
 }
 
 impl DatabaseOpts {
@@ -339,6 +340,7 @@ pub enum OpenDbAsyncPhase {
     ReadingHeader,
     LoadingSchema,
     BootstrapMvStore,
+    InitializeFrontend,
     Done,
 }
 
@@ -520,6 +522,7 @@ pub struct OpenDbAsyncState {
     /// Sub state machine for `MvStore::bootstrap_nonblock`, driven in
     /// `BootstrapMvStore`.
     mvcc_bootstrap_state: mvcc::database::BootstrapState,
+    frontend_setup_state: crate::dialect::setup::SetupState,
 }
 
 impl Default for OpenDbAsyncState {
@@ -543,12 +546,20 @@ impl OpenDbAsyncState {
             header_validation_state: HeaderValidationState::default(),
             mvcc_bootstrap_conn: None,
             mvcc_bootstrap_state: mvcc::database::BootstrapState::default(),
+            frontend_setup_state: crate::dialect::setup::SetupState::default(),
         }
     }
 }
 
 impl Drop for OpenDbAsyncState {
     fn drop(&mut self) {
+        self.schema_guard = None;
+        self.frontend_setup_state.cancel();
+        if matches!(self.phase, OpenDbAsyncPhase::InitializeFrontend) {
+            if let (Some(conn), Some(pager)) = (&self.conn, &self.pager) {
+                conn.rollback_current_txn_state(pager, true);
+            }
+        }
         if let Some(registry_key) = self.registry_key.take() {
             let mut registry = DATABASE_MANAGER.lock();
             registry.remove(&registry_key);
@@ -1456,6 +1467,12 @@ impl Database {
         );
         if result.is_err() {
             let _ = state.schema_guard.take();
+            state.frontend_setup_state.cancel();
+            if matches!(state.phase, OpenDbAsyncPhase::InitializeFrontend) {
+                if let (Some(conn), Some(pager)) = (&state.conn, &state.pager) {
+                    conn.rollback_current_txn_state(pager, true);
+                }
+            }
         }
         result
     }
@@ -1699,6 +1716,14 @@ impl Database {
                         state.mvcc_bootstrap_conn = None;
                     }
 
+                    state.phase = OpenDbAsyncPhase::InitializeFrontend;
+                }
+
+                OpenDbAsyncPhase::InitializeFrontend => {
+                    let conn = state.conn.as_ref().expect("open connection must exist");
+                    if !opts.skip_frontend_setup {
+                        return_if_io!(state.frontend_setup_state.step(conn));
+                    }
                     state.phase = OpenDbAsyncPhase::Done;
                     return Ok(IOResult::Done(
                         state
