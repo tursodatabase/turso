@@ -896,11 +896,15 @@ That makes the availability picture concrete:
 | --- | --- |
 | `tursodb` CLI | Yes - the CLI enables `fts` by default |
 | Native Rust crate built from source | Yes - add `--features fts` |
-| `@tursodatabase/database` (npm, native addon) | No - built without `fts` |
-| `@tursodatabase/database-wasm` (npm, WASM) | No - not supported on `wasm32` at all |
+| `@tursodatabase/database` (npm, native addon) | Yes - the JS bindings enable `fts` |
+| `@tursodatabase/database-wasm` (npm, WASM) | No - excluded on `wasm32`, see below |
 
-If you are using one of the npm packages and need FTS today, build `tursodb` or a native
-Rust binary from source with `--features fts`.
+The one case that needs a caveat is the native JS addon: `bindings/javascript` does enable
+the `fts` feature, so FTS is compiled in and the `CREATE INDEX ... USING fts` syntax works.
+The caveat is that the index is built on **Tantivy**, which needs native file access. On a
+`wasm32` build the `fts` module is not compiled at all - that is a `#[cfg]` in
+`core/index_method/mod.rs`, not a cargo flag - so the same package reports
+`Parse error: unknown module name: 'fts'` when built for WASM.
 
 When the feature is missing, `CREATE INDEX ... USING fts` does not fail at index-creation
 time; you get an error from the module lookup:
