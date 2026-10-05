@@ -21622,12 +21622,6 @@ fn test_checkpoint_seek_skip_divider_reinsert_loses_row() {
 }
 
 /// Regression test for https://github.com/tursodatabase/turso/issues/7477.
-///
-/// A large committed DELETE whose commit statement is dropped mid-flight
-/// (after its log record is owned, before finishing tombstone TxID
-/// rewriting) must not leave tombstones pointing at the removed TxID;
-/// otherwise a later writer panics with
-/// "check_version_conflicts: tombstone end TxID not found in txn map".
 #[test]
 fn mvcc_bug_repro_dropped_committed_delete_rewrites_all_tombstone_txids() {
     let db = MvccTestDbNoConn::new_with_random_db();
