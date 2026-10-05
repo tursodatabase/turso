@@ -8,10 +8,10 @@
 //! ```
 
 #[cfg(not(feature = "codspeed"))]
-use criterion::{Criterion, criterion_group, criterion_main};
+use criterion::{criterion_group, criterion_main, Criterion};
 
 #[cfg(feature = "codspeed")]
-use codspeed_criterion_compat::{Criterion, criterion_group, criterion_main};
+use codspeed_criterion_compat::{criterion_group, criterion_main, Criterion};
 
 use std::hint::black_box;
 use std::io::Write;
