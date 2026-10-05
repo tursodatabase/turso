@@ -80,6 +80,18 @@ test.skipIf(!leakCheckEnabled)('stats does not leak', { timeout: 300_000 }, asyn
     await db.close();
 })
 
+test.skipIf(!leakCheckEnabled)('local statements on a synced database do not leak', { timeout: 300_000 }, async ({ server, dir }) => {
+    const db = await connectWithSingleRow(server, join(dir, 'local.db'));
+    await expectNoLeak(async () => {
+        const update = await db.prepare("UPDATE t SET v = randomblob(1024) WHERE x = ?");
+        await update.run(1);
+        const select = await db.prepare("SELECT length(v) AS len FROM t WHERE x = ?");
+        assert.deepStrictEqual(await select.get(1), { len: 1024 });
+        await db.checkpoint();
+    });
+    await db.close();
+})
+
 test.skipIf(!leakCheckEnabled)('push to an unreachable server does not leak', { timeout: 300_000 }, async ({ server, dir }) => {
     let url = server.dbUrl();
     const db = await connect({ path: join(dir, 'failed-push.db'), url: () => url });
