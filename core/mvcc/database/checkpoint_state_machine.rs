@@ -1,12 +1,12 @@
 use crate::alloc::{
-    ConcurrentAllocator, TryReserveError, TursoAllocator, TursoIteratorExt, TursoVecExt, Vec,
-    ALLOC_ERR_MSG,
+    ALLOC_ERR_MSG, ConcurrentAllocator, TryReserveError, TursoAllocator, TursoIteratorExt,
+    TursoVecExt, Vec,
 };
 use crate::mvcc::clock::LogicalClock;
 use crate::mvcc::database::{
-    DeleteRowStateMachine, MVTableId, MvStore, Row, RowID, RowKey, RowVersion, SortableIndexKey,
-    TxTimestampOrID, WalPos, WriteRowStateMachine, MVCC_META_KEY_PERSISTENT_TX_TS_MAX,
-    MVCC_META_TABLE_NAME, SQLITE_SCHEMA_MVCC_TABLE_ID,
+    DeleteRowStateMachine, MVCC_META_KEY_PERSISTENT_TX_TS_MAX, MVCC_META_TABLE_NAME, MVTableId,
+    MvStore, Row, RowID, RowKey, RowVersion, SQLITE_SCHEMA_MVCC_TABLE_ID, SortableIndexKey,
+    TxTimestampOrID, WalPos, WriteRowStateMachine,
 };
 use crate::mvcc::database::{IndexRowsEntry, RowVersions};
 #[cfg(any(test, injected_yields))]
@@ -21,16 +21,16 @@ use crate::storage::btree::{BTreeCursor, CursorTrait};
 use crate::storage::pager::CreateBTreeFlags;
 use crate::storage::sqlite3_ondisk::DatabaseHeader;
 use crate::storage::wal::{CheckpointMode, TursoRwLock, WalAutoActions};
-use crate::sync::atomic::Ordering;
 use crate::sync::Arc;
 use crate::sync::RwLock;
+use crate::sync::atomic::Ordering;
 use crate::types::IOResultOr;
 use crate::types::{IOCompletions, IOResult, ImmutableRecord, ImmutableRecordRef};
-use crate::{turso_assert, turso_assert_eq};
 use crate::{
     CheckpointResult, Completion, Connection, Database, IOExt, LimboError, Numeric, Pager, Result,
     SyncMode, TransactionState, Value, ValueRef,
 };
+use crate::{turso_assert, turso_assert_eq};
 use crossbeam_epoch as epoch;
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 use std::num::NonZeroU64;
@@ -59,8 +59,6 @@ const SQLITE_SCHEMA_COLUMN_COUNT: usize = 5;
 enum CollectTablePhase {
     Schema,
     User,
-    /// Full scans only: walk the dirty table keys for their stamps so the
-    /// keys the scan covered can be pruned.
     DirtyStamps,
 }
 
@@ -87,8 +85,6 @@ fn sqlite_schema_row_range_bounds() -> (Bound<RowID>, Bound<RowID>) {
     )
 }
 
-/// The first key of the table after `table_id`. None for sqlite_schema, which
-/// has the largest table id.
 fn next_table_start(table_id: MVTableId) -> Option<RowID> {
     if table_id == SQLITE_SCHEMA_MVCC_TABLE_ID {
         return None;
@@ -97,12 +93,6 @@ fn next_table_start(table_id: MVTableId) -> Option<RowID> {
     Some(RowID::new(next, RowKey::Int(i64::MIN)))
 }
 
-/// Position of a forward walk over a map keyed by RowID. The walk covers one
-/// table at a time. When it enters a table, it reads the last key that the
-/// table has right then and never visits keys above it. Rows that commits
-/// append while the walk runs land above that key, so they cannot keep the
-/// walk from finishing. The table is done when `last_visited` reaches
-/// `table_end`.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct TableWalkCursor {
     last_visited: Option<RowID>,
@@ -115,10 +105,6 @@ impl TableWalkCursor {
     }
 }
 
-/// Walks `map` forward from `cursor` inside `bounds` and calls `visit` on each
-/// entry. Returns true when `visit` returns true, which means that the batch
-/// budget ran out and the caller must yield. Returns false when the walk
-/// reached the end of `bounds`.
 fn walk_table_keys<V, A: SkiplistAllocator>(
     map: &SkipMap<RowID, V, BasicComparator, A>,
     guard: &epoch::Guard,
@@ -156,8 +142,6 @@ fn walk_table_keys<V, A: SkiplistAllocator>(
     }
 }
 
-/// The last key of the table that owns the first key inside `bounds`. None
-/// when `bounds` holds no key.
 fn last_key_of_first_table<V, A: SkiplistAllocator>(
     map: &SkipMap<RowID, V, BasicComparator, A>,
     guard: &epoch::Guard,
@@ -235,8 +219,6 @@ pub enum CheckpointState {
         next_index: usize,
         lwm: u64,
     },
-    /// Drop dirty keys whose chains hold nothing newer than this checkpoint's
-    /// snapshot. Runs after publish so a failed checkpoint keeps every key.
     PruneDirtyKeys,
     Finalize,
 }
@@ -375,16 +357,10 @@ pub struct CheckpointStateMachine<Clock: LogicalClock, A: ConcurrentAllocator = 
     collect_table_phase: CollectTablePhase,
     collect_index_tableid_cursor: Option<MVTableId>,
     collect_index_key_cursor: Option<Arc<SortableIndexKey>>,
-    /// Last key of the index that the full scan is walking, taken when the
-    /// scan entered the index.
     collect_index_key_end: Option<Arc<SortableIndexKey>>,
     collect_dirty_index_cursor: TableWalkCursor,
     collect_index_phase: CollectIndexPhase,
-    /// `Some` when this checkpoint walks every row instead of the dirty keys.
-    /// Holds the store's full-scan generation so success can clear it.
     full_scan_generation: Option<NonZeroU64>,
-    /// Dirty keys visited by collect whose stamp is at or below `snapshot_ts`,
-    /// with that stamp. Prune removes them after publish.
     prune_candidates: Vec<(RowID, u64)>,
     prune_cursor: usize,
     /// Async driver for `CheckpointState::CompactSequences`. Lazily set
@@ -1331,7 +1307,6 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
         Ok(None)
     }
 
-    /// Returns true when the batch budget ran out and the caller must yield.
     fn collect_table_rows_from_store(&mut self, processed: &mut usize) -> Result<bool> {
         let bounds = self.collect_table_bounds();
         let mvstore = self.mvstore.clone();
@@ -1356,8 +1331,6 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
         result
     }
 
-    /// Reads each chain from the store at visit time. GC can unlink a chain and
-    /// a later write can create a fresh one, so the dirty map holds no chains.
     fn collect_table_rows_from_dirty_keys(&mut self, processed: &mut usize) -> Result<bool> {
         let bounds = self.collect_table_bounds();
         let mvstore = self.mvstore.clone();
@@ -1546,9 +1519,6 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
         }
     }
 
-    /// After a full scan, every dirty key with a stamp at or below the
-    /// snapshot is covered by the scan, so it can be pruned. Returns true when
-    /// the batch budget ran out and the caller must yield.
     fn record_dirty_stamps(&mut self, map: DirtyMap, processed: &mut usize) -> Result<bool> {
         let mvstore = self.mvstore.clone();
         let (dirty_keys, mut cursor) = match map {
@@ -1638,8 +1608,6 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
             }
 
             let index_rows_map = outer.value();
-            // Keys that commits append while this scan runs sit above the last
-            // key the index had on entry. The scan stops there so it finishes.
             let key_end = match (&self.collect_index_key_cursor, &self.collect_index_key_end) {
                 (Some(_), Some(end)) => end.clone(),
                 _ => match index_rows_map.back() {
@@ -1746,9 +1714,6 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
         Ok(())
     }
 
-    /// A stamp at or below the snapshot means every commit that marked the
-    /// key committed at or before the snapshot, so this checkpoint collected
-    /// all of its versions and prune can remove the key.
     fn record_prune_candidate(&mut self, key: &RowID, stamp: u64) -> Result<()> {
         if stamp <= self.snapshot_ts {
             self.prune_candidates.try_push((key.clone(), stamp))?;
@@ -1756,8 +1721,6 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
         Ok(())
     }
 
-    /// Removes up to `COLLECT_PREEMPTION_THRESHOLD` prune candidates from the
-    /// dirty maps. Returns a yield when candidates remain.
     fn prune_dirty_keys(&mut self) -> Option<IOCompletions> {
         let mvstore = self.mvstore.clone();
         let end = self.prune_candidates.len().min(
@@ -1768,8 +1731,6 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
             let Some(latest) = mvstore.unmark_checkpoint_dirty_key(key) else {
                 continue;
             };
-            // A commit marked the key after collect visited it. Its versions
-            // are not in this checkpoint, so the key stays dirty.
             if latest != *stamp && mvstore.mark_checkpoint_dirty_key(key, latest).is_err() {
                 mvstore.require_checkpoint_full_scan();
             }
@@ -1781,8 +1742,6 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
         None
     }
 
-    /// Every row a full scan would collect must be a dirty key. Otherwise a
-    /// dirty-key collect skips it and log truncation loses the row.
     #[cfg(debug_assertions)]
     fn debug_assert_checkpointable_table_keys_are_dirty(&self) {
         if self.mvstore.checkpoint_full_scan_generation().is_some() {
@@ -2198,9 +2157,10 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
             )
         })?;
         self.mvstore.global_header.write().replace(header);
-        crate::without_allocation_faults!(self
-            .publish_checkpointed_schema_roots()
-            .expect(crate::alloc::ALLOC_ERR_MSG));
+        crate::without_allocation_faults!(
+            self.publish_checkpointed_schema_roots()
+                .expect(crate::alloc::ALLOC_ERR_MSG)
+        );
         Ok(())
     }
 
@@ -3586,10 +3546,6 @@ impl<'a, 'g, K, V, C: Comparator<K>, A: SkiplistAllocator> CollectEntry<'a, 'g, 
 
 type IndexKeyCursor<'a, 'g, A> = LockstepCursor<'a, 'g, Arc<SortableIndexKey>, RowVersions<A>, A>;
 
-/// A pinned position in a SkipMap that moves forward through keys given in
-/// ascending order. It steps node by node while the next key is near and
-/// seeks when it is far, so a dense run of dirty keys costs a sequential
-/// walk instead of one search per key.
 struct LockstepCursor<'a, 'g, K, V, A: SkiplistAllocator> {
     map: &'a SkipMap<K, V, BasicComparator, A>,
     current: Option<CollectEntry<'a, 'g, K, V, BasicComparator, A>>,
@@ -3607,7 +3563,6 @@ impl<'a, 'g, K: Ord + Clone, V, A: SkiplistAllocator> LockstepCursor<'a, 'g, K, 
         }
     }
 
-    /// Returns the value stored at `key`, or None when the map has no such key.
     fn advance_to(&mut self, key: &K) -> Option<&'a V> {
         let mut steps = 0;
         loop {
@@ -3850,8 +3805,8 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> StateTransition
 mod tests {
     use super::*;
     use crate::alloc::vec;
-    use crate::mvcc::database::tests::MvccTestDbNoConn;
     use crate::mvcc::database::SortableIndexKey;
+    use crate::mvcc::database::tests::MvccTestDbNoConn;
     use crate::translate::collate::CollationSeq;
     use crate::types::{IndexInfo, KeyInfo};
     use turso_parser::ast::SortOrder;
@@ -4111,8 +4066,8 @@ mod tests {
         }
     }
 
-    fn checkpoint_for_collect_tests(
-    ) -> CheckpointStateMachine<crate::mvcc::clock::MvccClock, crate::alloc::DynAllocator> {
+    fn checkpoint_for_collect_tests()
+    -> CheckpointStateMachine<crate::mvcc::clock::MvccClock, crate::alloc::DynAllocator> {
         let db = MvccTestDbNoConn::new();
         let conn = db.connect();
         let mvstore = db.get_mvcc_store();
@@ -4231,7 +4186,6 @@ mod tests {
         mvstore.mark_checkpoint_dirty_key(&key, stamp).unwrap();
     }
 
-    /// The largest timestamp on the version, 0 when it has none.
     fn version_stamp(version: &RowVersion) -> u64 {
         [version.begin(), version.end()]
             .into_iter()
@@ -4243,7 +4197,6 @@ mod tests {
             .unwrap_or(0)
     }
 
-    /// Inserts a chain that no commit marked, like a row that is already in the DB file.
     fn insert_clean_row_version(
         mvstore: &crate::sync::Arc<
             MvStore<crate::mvcc::clock::MvccClock, crate::alloc::DynAllocator>,
@@ -4691,9 +4644,6 @@ mod tests {
         assert!(checkpoint.collect_index_key_cursor.is_none());
     }
 
-    /// Drives `collect` until it stops yielding. After every yield, `append`
-    /// commits rows that sit above the walk, like a writer that keeps
-    /// inserting while the checkpoint runs.
     fn collect_while_rows_are_appended(
         mut collect: impl FnMut() -> Result<Option<IOCompletions>>,
         mut append: impl FnMut(),

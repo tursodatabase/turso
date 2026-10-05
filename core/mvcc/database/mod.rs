@@ -1,16 +1,25 @@
+use crate::Completion;
+use crate::File;
+use crate::IOExt;
+use crate::LimboError;
+use crate::PageSize;
+use crate::Result;
+#[cfg(feature = "conn_raw_api")]
+use crate::Value;
+use crate::ValueRef;
 use crate::alloc::{
-    ConcurrentAllocator, DynAllocator, DynVec, TryReserveError, TursoAllocator,
-    TursoTryWithCapacityExt, TursoVecInExt, ALLOC_ERR_MSG,
+    ALLOC_ERR_MSG, ConcurrentAllocator, DynAllocator, DynVec, TryReserveError, TursoAllocator,
+    TursoTryWithCapacityExt, TursoVecInExt,
 };
 use crate::mvcc::clock::LogicalClock;
-use crate::mvcc::cursor::{static_iterator_hack, MvccIterator};
+use crate::mvcc::cursor::{MvccIterator, static_iterator_hack};
 #[cfg(any(test, injected_yields))]
 use crate::mvcc::yield_hooks::{ProvidesYieldContext, YieldContext, YieldPointMarker};
 use crate::mvcc::yield_points::{inject_transition_failure, inject_transition_yield};
 use crate::schema::{Schema, Sequence, Table};
+use crate::skiplist::SkipMap;
 use crate::skiplist::comparator::BasicComparator;
 use crate::skiplist::map::Entry;
-use crate::skiplist::SkipMap;
 use crate::state_machine::StateMachine;
 use crate::state_machine::StateTransition;
 use crate::state_machine::TransitionResult;
@@ -21,12 +30,11 @@ use crate::storage::btree::CursorValidState;
 use crate::storage::pager::SavepointResult;
 use crate::storage::sqlite3_ondisk::DatabaseHeader;
 use crate::storage::wal::{CheckpointMode, CheckpointResult, TursoRwLock};
+use crate::sync::Arc;
 use crate::sync::atomic::{AtomicBool, AtomicI64};
 use crate::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-use crate::sync::Arc;
 use crate::sync::{Mutex, RwLock};
 use crate::translate::plan::IterationDirection;
-use crate::types::compare_immutable;
 use crate::types::IOCompletions;
 use crate::types::IOResult;
 use crate::types::IOResultOr;
@@ -34,20 +42,12 @@ use crate::types::ImmutableRecord;
 use crate::types::ImmutableRecordRef;
 use crate::types::IndexInfo;
 use crate::types::SeekResult;
-use crate::Completion;
-use crate::File;
-use crate::IOExt;
-use crate::LimboError;
-use crate::PageSize;
-use crate::Result;
-#[cfg(feature = "conn_raw_api")]
-use crate::Value;
-use crate::ValueRef;
-use crate::{io::FileSyncType, io_yield_one, return_if_io};
-use crate::{
-    turso_assert, turso_assert_eq, turso_assert_less_than, turso_assert_reachable, Numeric,
-};
+use crate::types::compare_immutable;
 use crate::{Connection, Pager, SyncMode};
+use crate::{
+    Numeric, turso_assert, turso_assert_eq, turso_assert_less_than, turso_assert_reachable,
+};
+use crate::{io::FileSyncType, io_yield_one, return_if_io};
 use rustc_hash::FxHashMap as HashMap;
 use rustc_hash::FxHashSet as HashSet;
 use std::collections::{BTreeSet, HashMap as StdHashMap};
@@ -56,29 +56,29 @@ use std::marker::PhantomData;
 use std::ops::Bound;
 #[cfg(any(test, injected_yields))]
 use strum::EnumCount;
-use tracing::instrument;
 use tracing::Level;
+use tracing::instrument;
 
 pub mod checkpoint_state_machine;
 pub use checkpoint_state_machine::{
-    sqlite_schema_btree_identity, CheckpointState, CheckpointStateMachine,
+    CheckpointState, CheckpointStateMachine, sqlite_schema_btree_identity,
 };
 
 mod group_commit;
 pub(crate) use group_commit::{CommitCoordinator, GroupBatch, GroupWork};
 
+use super::persistent_storage::logical_log::{
+    HeaderReadResult, IndexOpKind, LOG_HDR_SIZE, ParsedOp, StreamingLogicalLogReader,
+    StreamingResult,
+};
 #[cfg(feature = "conn_raw_api")]
 use super::persistent_storage::logical_log::{
-    parse_ops_from_plaintext, LogSerializer, LOG_RECORD_PREFIX_SIZE,
-};
-use super::persistent_storage::logical_log::{
-    HeaderReadResult, IndexOpKind, ParsedOp, StreamingLogicalLogReader, StreamingResult,
-    LOG_HDR_SIZE,
+    LOG_RECORD_PREFIX_SIZE, LogSerializer, parse_ops_from_plaintext,
 };
 #[cfg(feature = "conn_raw_api")]
 use super::portable_logical::{
-    is_portable_logical_name, is_portable_schema_row, is_portable_table_schema_row,
-    portable_schema_row_from_record, PortableLogicalBuilder, PortableObjectMapEntry,
+    PortableLogicalBuilder, PortableObjectMapEntry, is_portable_logical_name,
+    is_portable_schema_row, is_portable_table_schema_row, portable_schema_row_from_record,
 };
 
 #[cfg(test)]
@@ -1514,10 +1514,6 @@ pub enum CommitState<Clock: LogicalClock, A: ConcurrentAllocator = TursoAllocato
         // the mutex
         state_machine: Box<Mutex<StateMachine<CheckpointStateMachine<Clock, A>>>>,
     },
-    /// Record every write set key in the store's dirty-key maps, in chunks
-    /// of `MVCC_COMMIT_BATCH_SIZE`, before the record reaches the log. The
-    /// next checkpoint collects only those keys. Runs before the log append
-    /// so an allocation failure can still fail the commit.
     MarkDirtyKeys {
         end_ts: u64,
         cursor: usize,
@@ -4482,15 +4478,8 @@ pub struct MvStore<Clock: LogicalClock, A: ConcurrentAllocator = TursoAllocator>
     /// contend on it; only one wins. Needed because the lock no longer guards the start
     /// of the checkpoint (it's acquired after the pager-write phase, not before).
     checkpoint_in_progress: AtomicBool,
-    /// Table row keys that a commit touched and no checkpoint has pruned yet.
-    /// Checkpoint collect visits only these keys instead of every row. The
-    /// value is the end timestamp of the last commit that marked the key.
     pub checkpoint_dirty_table_keys: SkipMap<RowID, AtomicU64, BasicComparator, A>,
-    /// Same for index rows: `table_id` is the index id and `row_id` the index key.
     pub checkpoint_dirty_index_keys: SkipMap<RowID, AtomicU64, BasicComparator, A>,
-    /// Non-zero while the dirty-key maps can be missing keys: a new or
-    /// recovered store, or a checkpoint that could not re-mark a key. The next
-    /// checkpoint scans every row and clears the generation it started with.
     checkpoint_full_scan_generation: AtomicU64,
     /// The highest transaction ID that has been made durable in the WAL.
     /// Used to skip checkpointing transactions from mv store to WAL that have already been processed.
@@ -5316,8 +5305,12 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                     // blocking). A failure here cannot be downgraded: it would
                     // leave the next AUTOINCREMENT INSERT able to re-emit a rowid
                     // already on disk, so it propagates as a bootstrap failure.
-                    return_if_io!(bootstrap_conn
-                        .sync_autoincrement_backing_tables_from_sqlite_sequence_nonblock(sync_st));
+                    return_if_io!(
+                        bootstrap_conn
+                            .sync_autoincrement_backing_tables_from_sqlite_sequence_nonblock(
+                                sync_st
+                            )
+                    );
                     *bootstrap_conn.db.schema.lock() = bootstrap_conn.schema.read().clone();
                     *st = BootstrapState::AwaitingGlobalHeader;
                 }
@@ -6797,9 +6790,10 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                 // Read-only transactions cannot leave row versions with stale TxID
                 // references, so they do not need finalized-state caching.
                 if !tx.write_set.lock().is_empty() {
-                    crate::without_allocation_faults!(self
-                        .insert_finalized_tx_state(tx_id, commit_ts)
-                        .expect(ALLOC_ERR_MSG));
+                    crate::without_allocation_faults!(
+                        self.insert_finalized_tx_state(tx_id, commit_ts)
+                            .expect(ALLOC_ERR_MSG)
+                    );
                 }
             }
             let dep_set = std::mem::take(&mut *tx.commit_dep_set.lock());
@@ -7264,9 +7258,10 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                 if self.is_exclusive_tx(&tx_id) {
                     self.release_exclusive_tx(&tx_id);
                 }
-                crate::without_allocation_faults!(self
-                    .finish_committed_tx(tx_id, connection, db_id)
-                    .expect(ALLOC_ERR_MSG));
+                crate::without_allocation_faults!(
+                    self.finish_committed_tx(tx_id, connection, db_id)
+                        .expect(ALLOC_ERR_MSG)
+                );
             }
             Some(TransactionState::Aborted | TransactionState::Terminated) | None => {
                 if connection.get_mv_tx_id_for_db(db_id) == Some(tx_id) {
@@ -7761,9 +7756,6 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         snapshot_ts
     }
 
-    /// Records `key` for the next checkpoint collect with the end timestamp
-    /// of the commit that touched it. Table and index keys live in separate
-    /// maps because collect walks them in separate phases.
     pub(crate) fn mark_checkpoint_dirty_key(
         &self,
         key: &RowID,
@@ -7773,14 +7765,12 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         loop {
             let entry = dirty_keys.try_get_or_insert(key.clone(), AtomicU64::new(stamp))?;
             entry.value().fetch_max(stamp, Ordering::AcqRel);
-            // A prune can remove the node between the insert and the store.
             if !entry.is_removed() {
                 return Ok(());
             }
         }
     }
 
-    /// Removes `key` from its dirty map and returns the stamp it held.
     pub(crate) fn unmark_checkpoint_dirty_key(&self, key: &RowID) -> Option<u64> {
         self.checkpoint_dirty_keys_for(key)
             .remove(key)
@@ -7797,8 +7787,6 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         }
     }
 
-    /// Marks up to `limit` write set keys of `tx` starting at `from` with `stamp`.
-    /// Returns the next position and the write set length.
     fn mark_tx_write_set_dirty(
         &self,
         tx: &Transaction<A>,
@@ -7815,8 +7803,6 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         Ok((end, total))
     }
 
-    /// `Some` while the dirty-key maps can be missing keys. A checkpoint that
-    /// starts with `Some` scans every row and clears that generation on success.
     pub(crate) fn checkpoint_full_scan_generation(&self) -> Option<std::num::NonZeroU64> {
         std::num::NonZeroU64::new(self.checkpoint_full_scan_generation.load(Ordering::Acquire))
     }
@@ -7826,7 +7812,6 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
             .fetch_add(1, Ordering::AcqRel);
     }
 
-    /// Clears the full-scan request only if no request arrived after `generation` was read.
     pub(crate) fn clear_checkpoint_full_scan(&self, generation: std::num::NonZeroU64) {
         let _ = self.checkpoint_full_scan_generation.compare_exchange(
             generation.get(),
@@ -8856,7 +8841,6 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         if !self.seqcompact_stamp_delete(&rowid, num_cols, end_ts) {
             return;
         }
-        // No transaction write set records this delete, so the key is marked here.
         if self.mark_checkpoint_dirty_key(&rowid, end_ts).is_err() {
             self.require_checkpoint_full_scan();
         }
