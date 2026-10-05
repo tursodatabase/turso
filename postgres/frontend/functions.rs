@@ -3,8 +3,8 @@ use std::sync::Arc;
 use turso_core::schema::{Schema, Table};
 use turso_core::types::IOResultOr;
 use turso_core::{
-    Connection, FunctionArity, FunctionListEntry, IOResult, LimboError, Result, ScalarFunction,
-    ScalarFunctionState, Value,
+    Connection, FunctionArity, FunctionListEntry, IOResult, LimboError, Register, Result,
+    ScalarFunction, ScalarFunctionState, Value,
 };
 use turso_parser::ast::RefAct;
 
@@ -28,8 +28,9 @@ pub(crate) fn function_list() -> Vec<FunctionListEntry> {
 }
 
 macro_rules! scalar_functions {
-    ($($variant:ident($name:literal, $arity:expr, $deterministic:expr)),* $(,)?) => {
-        #[derive(Debug, Clone, Copy)]
+    ($($variant:ident($arity:expr, $deterministic:expr)),* $(,)?) => {
+        #[derive(Debug, Clone, Copy, strum::AsRefStr)]
+        #[strum(serialize_all = "snake_case")]
         enum PgScalarFunction {
             $($variant,)*
         }
@@ -38,9 +39,7 @@ macro_rules! scalar_functions {
 
         impl ScalarFunction for PgScalarFunction {
             fn name(&self) -> &str {
-                match self {
-                    $(Self::$variant => $name,)*
-                }
+                self.as_ref()
             }
 
             fn arity(&self) -> FunctionArity {
@@ -58,7 +57,7 @@ macro_rules! scalar_functions {
             fn call(
                 &self,
                 conn: &Arc<Connection>,
-                args: &[Value],
+                args: &[Register],
                 state: &mut ScalarFunctionState,
             ) -> IOResultOr<Value> {
                 self.execute(conn, args, state)
@@ -68,47 +67,47 @@ macro_rules! scalar_functions {
 }
 
 scalar_functions! {
-    GetUserById("pg_get_userbyid", FunctionArity::Exact(1), true),
-    TableIsVisible("pg_table_is_visible", FunctionArity::Exact(1), true),
-    FunctionIsVisible("pg_function_is_visible", FunctionArity::Exact(1), true),
-    TypeIsVisible("pg_type_is_visible", FunctionArity::Exact(1), true),
-    EncodingToChar("pg_encoding_to_char", FunctionArity::Exact(1), true),
-    GetFunctionResult("pg_get_function_result", FunctionArity::Exact(1), true),
-    GetFunctionArguments("pg_get_function_arguments", FunctionArity::Exact(1), true),
-    GetStatisticsObjDefColumns("pg_get_statisticsobjdef_columns", FunctionArity::Exact(1), true),
-    RelationIsPublishable("pg_relation_is_publishable", FunctionArity::Exact(1), true),
-    QuoteIdent("quote_ident", FunctionArity::Exact(1), true),
-    QuoteLiteral("quote_literal", FunctionArity::Exact(1), true),
-    FormatType("format_type", FunctionArity::OneOf(&[1, 2]), true),
-    GetConstraintDef("pg_get_constraintdef", FunctionArity::OneOf(&[1, 2]), true),
-    GetIndexDef("pg_get_indexdef", FunctionArity::OneOf(&[1, 2]), true),
-    ObjDescription("obj_description", FunctionArity::OneOf(&[1, 2]), true),
-    GetExpr("pg_get_expr", FunctionArity::OneOf(&[2, 3]), true),
-    ToChar("to_char", FunctionArity::Exact(2), true),
-    InputIsValid("pg_input_is_valid", FunctionArity::Exact(2), true),
-    BoolEq("booleq", FunctionArity::Exact(2), true),
-    BoolNe("boolne", FunctionArity::Exact(2), true),
-    ColDescription("col_description", FunctionArity::Exact(2), true),
-    Version("version", FunctionArity::Exact(0), true),
-    CurrentDatabase("current_database", FunctionArity::Exact(0), true),
-    CurrentSchema("current_schema", FunctionArity::Exact(0), true),
-    BackendPid("pg_backend_pid", FunctionArity::Exact(0), true),
-    Now("now", FunctionArity::Variadic, false),
-    ClockTimestamp("clock_timestamp", FunctionArity::Variadic, false),
-    TransactionTimestamp("transaction_timestamp", FunctionArity::Variadic, false),
-    StatementTimestamp("statement_timestamp", FunctionArity::Variadic, false),
+    PgGetUserbyid(FunctionArity::Exact(1), true),
+    PgTableIsVisible(FunctionArity::Exact(1), true),
+    PgFunctionIsVisible(FunctionArity::Exact(1), true),
+    PgTypeIsVisible(FunctionArity::Exact(1), true),
+    PgEncodingToChar(FunctionArity::Exact(1), true),
+    PgGetFunctionResult(FunctionArity::Exact(1), true),
+    PgGetFunctionArguments(FunctionArity::Exact(1), true),
+    PgGetStatisticsobjdefColumns(FunctionArity::Exact(1), true),
+    PgRelationIsPublishable(FunctionArity::Exact(1), true),
+    QuoteIdent(FunctionArity::Exact(1), true),
+    QuoteLiteral(FunctionArity::Exact(1), true),
+    FormatType(FunctionArity::OneOf(&[1, 2]), true),
+    PgGetConstraintdef(FunctionArity::OneOf(&[1, 2]), true),
+    PgGetIndexdef(FunctionArity::OneOf(&[1, 2]), true),
+    ObjDescription(FunctionArity::OneOf(&[1, 2]), true),
+    PgGetExpr(FunctionArity::OneOf(&[2, 3]), true),
+    ToChar(FunctionArity::Exact(2), true),
+    PgInputIsValid(FunctionArity::Exact(2), true),
+    Booleq(FunctionArity::Exact(2), true),
+    Boolne(FunctionArity::Exact(2), true),
+    ColDescription(FunctionArity::Exact(2), true),
+    Version(FunctionArity::Exact(0), true),
+    CurrentDatabase(FunctionArity::Exact(0), true),
+    CurrentSchema(FunctionArity::Exact(0), true),
+    PgBackendPid(FunctionArity::Exact(0), true),
+    Now(FunctionArity::Variadic, false),
+    ClockTimestamp(FunctionArity::Variadic, false),
+    TransactionTimestamp(FunctionArity::Variadic, false),
+    StatementTimestamp(FunctionArity::Variadic, false),
 }
 
 impl PgScalarFunction {
     fn execute(
         &self,
         conn: &Arc<Connection>,
-        args: &[Value],
+        args: &[Register],
         _state: &mut ScalarFunctionState,
     ) -> IOResultOr<Value> {
-        let int_arg =
-            |i: usize, default: i64| args.get(i).and_then(|v| v.as_int()).unwrap_or(default);
-        let text_arg = |i: usize| match args.get(i) {
+        let arg = |i: usize| args.get(i).map(Register::get_value);
+        let int_arg = |i: usize, default: i64| arg(i).and_then(Value::as_int).unwrap_or(default);
+        let text_arg = |i: usize| match arg(i) {
             Some(Value::Text(t)) => t.as_str().to_string(),
             _ => String::new(),
         };
@@ -119,36 +118,36 @@ impl PgScalarFunction {
             | Self::StatementTimestamp => {
                 Value::build_text(Utc::now().format("%Y-%m-%d %H:%M:%S%.3f").to_string())
             }
-            Self::GetUserById => exec_pg_get_user_by_id(int_arg(0, 0)),
-            Self::TableIsVisible | Self::FunctionIsVisible | Self::TypeIsVisible => {
+            Self::PgGetUserbyid => exec_pg_get_user_by_id(int_arg(0, 0)),
+            Self::PgTableIsVisible | Self::PgFunctionIsVisible | Self::PgTypeIsVisible => {
                 exec_pg_is_visible(int_arg(0, 0))
             }
-            Self::GetConstraintDef => exec_pg_get_constraintdef(conn, int_arg(0, 0)),
-            Self::GetIndexDef => exec_pg_get_indexdef(conn, int_arg(0, 0)),
-            Self::EncodingToChar => exec_pg_encoding_to_char(int_arg(0, 0)),
+            Self::PgGetConstraintdef => exec_pg_get_constraintdef(conn, int_arg(0, 0)),
+            Self::PgGetIndexdef => exec_pg_get_indexdef(conn, int_arg(0, 0)),
+            Self::PgEncodingToChar => exec_pg_encoding_to_char(int_arg(0, 0)),
             Self::FormatType => exec_pg_format_type(int_arg(0, 0), int_arg(1, -1)),
-            Self::ToChar => exec_to_char(args.first().unwrap_or(&Value::Null), &text_arg(1)),
-            Self::InputIsValid => {
-                exec_pg_input_is_valid(args.first().unwrap_or(&Value::Null), &text_arg(1))
+            Self::ToChar => exec_to_char(arg(0).unwrap_or(&Value::Null), &text_arg(1)),
+            Self::PgInputIsValid => {
+                exec_pg_input_is_valid(arg(0).unwrap_or(&Value::Null), &text_arg(1))
             }
-            Self::BoolEq => Value::from_i64((args.first() == args.get(1)) as i64),
-            Self::BoolNe => Value::from_i64((args.first() != args.get(1)) as i64),
+            Self::Booleq => Value::from_i64((arg(0) == arg(1)) as i64),
+            Self::Boolne => Value::from_i64((arg(0) != arg(1)) as i64),
             Self::Version => exec_version(),
             Self::CurrentDatabase => {
                 Value::build_text(crate::catalog::db_name_from_path(conn.db_file_path()))
             }
             Self::CurrentSchema => Value::build_text("public"),
-            Self::BackendPid => Value::from_i64(std::process::id() as i64),
-            Self::QuoteIdent => match args.first() {
+            Self::PgBackendPid => Value::from_i64(std::process::id() as i64),
+            Self::QuoteIdent => match arg(0) {
                 Some(Value::Null) | None => Value::Null,
                 _ => Value::build_text(turso_pg_parser::quote_identifier(&text_arg(0))),
             },
-            Self::QuoteLiteral => exec_quote_literal(args.first().unwrap_or(&Value::Null)),
-            Self::GetExpr => exec_pg_get_expr(args)?,
-            Self::GetStatisticsObjDefColumns
-            | Self::RelationIsPublishable
-            | Self::GetFunctionResult
-            | Self::GetFunctionArguments
+            Self::QuoteLiteral => exec_quote_literal(arg(0).unwrap_or(&Value::Null)),
+            Self::PgGetExpr => exec_pg_get_expr(args)?,
+            Self::PgGetStatisticsobjdefColumns
+            | Self::PgRelationIsPublishable
+            | Self::PgGetFunctionResult
+            | Self::PgGetFunctionArguments
             | Self::ObjDescription
             | Self::ColDescription => Value::Null,
         };
@@ -306,10 +305,13 @@ fn exec_pg_input_is_valid(input: &Value, type_name: &str) -> Value {
     Value::from_i64(if valid { 1 } else { 0 })
 }
 
-fn exec_pg_get_expr(args: &[Value]) -> Result<Value> {
-    match args.first() {
+fn exec_pg_get_expr(args: &[Register]) -> Result<Value> {
+    match args.first().map(Register::get_value) {
         Some(Value::Text(expression)) => {
-            if args[1..].iter().any(|arg| matches!(arg, Value::Null)) {
+            if args[1..]
+                .iter()
+                .any(|arg| matches!(arg.get_value(), Value::Null))
+            {
                 return Ok(Value::Null);
             }
 

@@ -272,10 +272,10 @@ mod tests {
         fn call(
             &self,
             _conn: &Arc<crate::Connection>,
-            args: &[crate::Value],
+            args: &[crate::Register],
             _state: &mut crate::ScalarFunctionState,
         ) -> crate::types::IOResultOr<crate::Value> {
-            let Some(v) = args[0].as_int() else {
+            let Some(v) = args[0].get_value().as_int() else {
                 return Err(crate::LimboError::InvalidArgument(
                     "test_add_one expects an integer".to_string(),
                 )
@@ -302,7 +302,7 @@ mod tests {
         fn call(
             &self,
             _conn: &Arc<crate::Connection>,
-            _args: &[crate::Value],
+            _args: &[crate::Register],
             _state: &mut crate::ScalarFunctionState,
         ) -> crate::types::IOResultOr<crate::Value> {
             Ok(crate::IOResult::Done(crate::Value::from_i64(
@@ -326,12 +326,12 @@ mod tests {
         fn call(
             &self,
             _conn: &Arc<crate::Connection>,
-            args: &[crate::Value],
+            args: &[crate::Register],
             _state: &mut crate::ScalarFunctionState,
         ) -> crate::types::IOResultOr<crate::Value> {
-            Ok(crate::IOResult::Done(match args[0] {
+            Ok(crate::IOResult::Done(match args[0].get_value() {
                 crate::Value::Null => crate::Value::from_i64(9),
-                _ => args[0].clone(),
+                value => value.clone(),
             }))
         }
     }
@@ -354,7 +354,7 @@ mod tests {
         fn call(
             &self,
             conn: &Arc<crate::Connection>,
-            args: &[crate::Value],
+            args: &[crate::Register],
             state: &mut crate::ScalarFunctionState,
         ) -> crate::types::IOResultOr<crate::Value> {
             let state = state.get_or_init::<NestedSumState>();
@@ -376,7 +376,7 @@ mod tests {
                 state.sum += row.get_value(0).as_int().unwrap();
                 Ok(())
             }));
-            let offset = args[0].as_int().unwrap();
+            let offset = args[0].get_value().as_int().unwrap();
             if offset < 0 {
                 return Err(crate::LimboError::InvalidArgument(
                     "test_nested_sum expects a nonnegative offset".to_string(),

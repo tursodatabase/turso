@@ -56,10 +56,10 @@ use crate::{
     vdbe::{
         execute::{
             OpAttachState, OpClearBtreeState, OpColumnState, OpDeleteState, OpDeleteSubState,
-            OpDestroyState, OpFunctionState, OpIdxInsertState, OpInitCdcVersionState,
-            OpInsertState, OpInsertSubState, OpJournalModeState, OpNewRowidState,
-            OpNoConflictState, OpParseSchemaState, OpProgramState, OpRowIdState, OpSeekState,
-            OpTransactionState, VacuumIntoOpContext,
+            OpDestroyState, OpIdxInsertState, OpInitCdcVersionState, OpInsertState,
+            OpInsertSubState, OpJournalModeState, OpNewRowidState, OpNoConflictState,
+            OpParseSchemaState, OpProgramState, OpRowIdState, OpSeekState, OpTransactionState,
+            VacuumIntoOpContext,
         },
         hash_table::HashTable,
         metrics::StatementMetrics,
@@ -631,7 +631,7 @@ enum ActiveOpState {
     Attach(OpAttachState),
     JournalMode(OpJournalModeState),
     ParseSchema(OpParseSchemaState),
-    Function(OpFunctionState),
+    Function(crate::ScalarFunctionState),
     HashBuild(Option<OpHashBuildState>),
     HashProbe(Option<OpHashProbeState>),
     InitCdcVersion(OpInitCdcVersionState),
@@ -804,8 +804,8 @@ impl ActiveOpStateSlot {
     active_state_accessor!(
         function,
         Function,
-        OpFunctionState,
-        OpFunctionState::default()
+        crate::ScalarFunctionState,
+        crate::ScalarFunctionState::default()
     );
     active_state_accessor!(hash_build, HashBuild, Option<OpHashBuildState>, None);
     active_state_accessor!(hash_probe, HashProbe, Option<OpHashProbeState>, None);

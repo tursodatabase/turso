@@ -1749,7 +1749,7 @@ pub trait ScalarFunction: Debug + Send + Sync {
     fn call(
         &self,
         conn: &Arc<crate::Connection>,
-        args: &[crate::Value],
+        args: &[crate::Register],
         state: &mut ScalarFunctionState,
     ) -> crate::types::IOResultOr<crate::Value>;
 

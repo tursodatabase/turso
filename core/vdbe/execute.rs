@@ -11549,22 +11549,9 @@ pub fn op_function(
             },
         },
         crate::function::Func::Dialect(function) => {
-            if state.active_op_state.is_idle() {
-                let args = state.registers[*start_reg..*start_reg + arg_count]
-                    .iter()
-                    .map(|r| r.get_value().clone())
-                    .collect();
-                *state.active_op_state.function() = OpFunctionState {
-                    args,
-                    context: crate::ScalarFunctionState::default(),
-                };
-            }
             let function_state = state.active_op_state.function();
-            match function.call(
-                &program.connection,
-                &function_state.args,
-                &mut function_state.context,
-            )? {
+            let args = &state.registers[*start_reg..*start_reg + arg_count];
+            match function.call(&program.connection, args, function_state)? {
                 IOResult::IO(io) => return Ok(state.suspend_on_io(io)),
                 IOResult::Done(result) => {
                     state.active_op_state.clear();
@@ -12258,12 +12245,6 @@ pub fn op_function(
     }
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
-}
-
-#[derive(Default)]
-pub(crate) struct OpFunctionState {
-    args: Vec<Value>,
-    context: crate::ScalarFunctionState,
 }
 
 pub(crate) type OpAttachState = crate::connection::AttachDatabaseState;

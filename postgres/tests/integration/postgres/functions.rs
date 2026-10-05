@@ -144,6 +144,14 @@ fn test_pg_scalar_function_signatures(db: TempDatabase) {
 
     for (sql, expected) in [
         ("SELECT quote_ident('Foo')", Value::build_text("\"Foo\"")),
+        ("SELECT pg_get_userbyid(42)", Value::build_text("turso")),
+        ("SELECT pg_get_constraintdef(0)", Value::Null),
+        ("SELECT pg_get_indexdef(0)", Value::Null),
+        ("SELECT pg_get_statisticsobjdef_columns(0)", Value::Null),
+        ("SELECT booleq(1, 0)", Value::from_i64(0)),
+        ("SELECT booleq(1, 1)", Value::from_i64(1)),
+        ("SELECT boolne(1, 0)", Value::from_i64(1)),
+        ("SELECT boolne(1, 1)", Value::from_i64(0)),
         (
             "SELECT format_type(1043)",
             Value::build_text("character varying"),
@@ -170,7 +178,8 @@ fn test_pg_scalar_function_signatures(db: TempDatabase) {
     let rows = conn
         .prepare_internal(
             "SELECT name, narg, flags FROM pragma_function_list \
-             WHERE name IN ('version', 'quote_ident', 'format_type', 'now') ORDER BY name, narg",
+             WHERE name IN ('version', 'quote_ident', 'format_type', 'now', 'pg_get_userbyid', \
+                            'pg_get_statisticsobjdef_columns', 'booleq') ORDER BY name, narg",
         )
         .unwrap()
         .run_collect_rows()
@@ -178,9 +187,12 @@ fn test_pg_scalar_function_signatures(db: TempDatabase) {
     assert_eq!(
         rows,
         [
+            ("booleq", 2, 2048),
             ("format_type", 1, 2048),
             ("format_type", 2, 2048),
             ("now", -1, 0),
+            ("pg_get_statisticsobjdef_columns", 1, 2048),
+            ("pg_get_userbyid", 1, 2048),
             ("quote_ident", 1, 2048),
             ("version", 0, 2048),
         ]
