@@ -1384,9 +1384,6 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
                                 // No BTreeDestroyIndex needed since there's no physical B-tree.
                                 let index_id = MVTableId(root_page);
                                 self.destroyed_indexes.insert(index_id);
-                                // Defer the removal to the publish window. Pushing to the
-                                // staged op list borrows only that field, so it is allowed
-                                // inside the `self.mvstore.rows` iteration.
                                 self.pending_rootmap_ops
                                     .push(RootMapOp::Remove { id: index_id });
                                 skip_write = true;
@@ -1442,8 +1439,6 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
                                 // No BTreeDestroy needed since there's no physical B-tree.
                                 let table_id = MVTableId::from(root_page);
                                 self.destroyed_tables.insert(table_id);
-                                // Defer the removal to the publish window (push borrows only
-                                // the staged-op field, allowed inside the rows iteration).
                                 self.pending_rootmap_ops
                                     .push(RootMapOp::Remove { id: table_id });
                                 skip_write = true;
