@@ -302,10 +302,22 @@ pub(crate) const fn cold_return<T>(v: T) -> T {
     v
 }
 
+/// Builds the error for [bail_parse_error!]. The message is formatted here, out
+/// of line, so that the many functions that can fail with a parse error do not
+/// each hold the formatting temporaries in their stack frames. This matters
+/// for the functions that translate expressions, which recurse once per level
+/// of an expression.
+#[doc(hidden)]
+#[cold]
+#[inline(never)]
+pub fn parse_error(message: std::fmt::Arguments<'_>) -> LimboError {
+    LimboError::ParseError(std::fmt::format(message))
+}
+
 #[macro_export]
 macro_rules! bail_parse_error {
     ($($arg:tt)*) => {
-        return $crate::error::cold_return(Err($crate::error::LimboError::ParseError(format!($($arg)*)).into()))
+        return $crate::error::cold_return(Err($crate::error::parse_error(format_args!($($arg)*)).into()))
     };
 }
 

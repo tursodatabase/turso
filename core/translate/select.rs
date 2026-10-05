@@ -1507,7 +1507,7 @@ fn push_function_tail_exprs<'a>(stack: &mut Vec<&'a Expr>, tail: &'a ast::Functi
         stack.push(filter_expr);
     }
 
-    let Some(ast::Over::Window(window)) = tail.over_clause.as_ref() else {
+    let Some(ast::Over::Window(window)) = tail.over_clause.as_deref() else {
         return;
     };
 

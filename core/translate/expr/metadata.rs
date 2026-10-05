@@ -8,13 +8,15 @@ pub struct ConditionMetadata {
     pub jump_target_when_null: BranchOffset,
 }
 
+#[inline(never)]
 pub(super) fn translate_between_expr(
     program: &mut ProgramBuilder,
     referenced_tables: Option<&TableReferences>,
-    mut between_expr: ast::Expr,
+    between_expr: &ast::Expr,
     target_register: usize,
     resolver: &Resolver,
 ) -> Result<usize> {
+    let mut between_expr = between_expr.clone();
     let ast::Expr::Between {
         ref mut lhs,
         not,
