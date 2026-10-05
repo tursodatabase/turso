@@ -28,14 +28,14 @@ pub(crate) fn function_list() -> Vec<FunctionListEntry> {
 }
 
 macro_rules! scalar_functions {
-    ($($variant:ident($arity:expr, $deterministic:expr)),* $(,)?) => {
+    ($($($variant:ident)|+($arity:expr, $deterministic:expr) => $call:expr),* $(,)?) => {
         #[derive(Debug, Clone, Copy, strum::AsRefStr)]
         #[strum(serialize_all = "snake_case")]
         enum PgScalarFunction {
-            $($variant,)*
+            $($($variant,)+)*
         }
 
-        const SCALAR_FUNCTIONS: &[PgScalarFunction] = &[$(PgScalarFunction::$variant,)*];
+        const SCALAR_FUNCTIONS: &[PgScalarFunction] = &[$($(PgScalarFunction::$variant,)+)*];
 
         impl ScalarFunction for PgScalarFunction {
             fn name(&self) -> &str {
@@ -44,13 +44,13 @@ macro_rules! scalar_functions {
 
             fn arity(&self) -> FunctionArity {
                 match self {
-                    $(Self::$variant => $arity,)*
+                    $($(Self::$variant)|+ => $arity,)*
                 }
             }
 
             fn is_deterministic(&self) -> bool {
                 match self {
-                    $(Self::$variant => $deterministic,)*
+                    $($(Self::$variant)|+ => $deterministic,)*
                 }
             }
 
@@ -60,98 +60,123 @@ macro_rules! scalar_functions {
                 args: &[Register],
                 state: &mut ScalarFunctionState,
             ) -> IOResultOr<Value> {
-                self.execute(conn, args, state)
+                match self {
+                    $($(Self::$variant)|+ => {
+                        let call: fn(&Arc<Connection>, &[Register], &mut ScalarFunctionState)
+                            -> IOResultOr<Value> = $call;
+                        call(conn, args, state)
+                    },)*
+                }
             }
         }
     };
 }
 
 scalar_functions! {
-    PgGetUserbyid(FunctionArity::Exact(1), true),
-    PgTableIsVisible(FunctionArity::Exact(1), true),
-    PgFunctionIsVisible(FunctionArity::Exact(1), true),
-    PgTypeIsVisible(FunctionArity::Exact(1), true),
-    PgEncodingToChar(FunctionArity::Exact(1), true),
-    PgGetFunctionResult(FunctionArity::Exact(1), true),
-    PgGetFunctionArguments(FunctionArity::Exact(1), true),
-    PgGetStatisticsobjdefColumns(FunctionArity::Exact(1), true),
-    PgRelationIsPublishable(FunctionArity::Exact(1), true),
-    QuoteIdent(FunctionArity::Exact(1), true),
-    QuoteLiteral(FunctionArity::Exact(1), true),
-    FormatType(FunctionArity::OneOf(&[1, 2]), true),
-    PgGetConstraintdef(FunctionArity::OneOf(&[1, 2]), true),
-    PgGetIndexdef(FunctionArity::OneOf(&[1, 2]), true),
-    ObjDescription(FunctionArity::OneOf(&[1, 2]), true),
-    PgGetExpr(FunctionArity::OneOf(&[2, 3]), true),
-    ToChar(FunctionArity::Exact(2), true),
-    PgInputIsValid(FunctionArity::Exact(2), true),
-    Booleq(FunctionArity::Exact(2), true),
-    Boolne(FunctionArity::Exact(2), true),
-    ColDescription(FunctionArity::Exact(2), true),
-    Version(FunctionArity::Exact(0), true),
-    CurrentDatabase(FunctionArity::Exact(0), true),
-    CurrentSchema(FunctionArity::Exact(0), true),
-    PgBackendPid(FunctionArity::Exact(0), true),
-    Now(FunctionArity::Variadic, false),
-    ClockTimestamp(FunctionArity::Variadic, false),
-    TransactionTimestamp(FunctionArity::Variadic, false),
-    StatementTimestamp(FunctionArity::Variadic, false),
+    PgGetUserbyid(FunctionArity::Exact(1), true) => |_, args, _| {
+        Ok(IOResult::Done(exec_pg_get_user_by_id(int_arg(args, 0, 0))))
+    },
+    PgTableIsVisible | PgFunctionIsVisible | PgTypeIsVisible(
+        FunctionArity::Exact(1), true
+    ) => |_, args, _| {
+        Ok(IOResult::Done(exec_pg_is_visible(int_arg(args, 0, 0))))
+    },
+    PgEncodingToChar(FunctionArity::Exact(1), true) => |_, args, _| {
+        Ok(IOResult::Done(exec_pg_encoding_to_char(int_arg(args, 0, 0))))
+    },
+    PgGetFunctionResult | PgGetFunctionArguments
+        | PgGetStatisticsobjdefColumns | PgRelationIsPublishable(
+            FunctionArity::Exact(1), true
+        ) => |_, _, _| {
+        Ok(IOResult::Done(Value::Null))
+    },
+    QuoteIdent(FunctionArity::Exact(1), true) => |_, args, _| {
+        Ok(IOResult::Done(match args[0].get_value() {
+            Value::Null => Value::Null,
+            _ => Value::build_text(turso_pg_parser::quote_identifier(&text_arg(args, 0))),
+        }))
+    },
+    QuoteLiteral(FunctionArity::Exact(1), true) => |_, args, _| {
+        Ok(IOResult::Done(exec_quote_literal(args[0].get_value())))
+    },
+    FormatType(FunctionArity::OneOf(&[1, 2]), true) => |_, args, _| {
+        Ok(IOResult::Done(exec_pg_format_type(
+            int_arg(args, 0, 0),
+            int_arg(args, 1, -1),
+        )))
+    },
+    PgGetConstraintdef(FunctionArity::OneOf(&[1, 2]), true) => |conn, args, _| {
+        Ok(IOResult::Done(exec_pg_get_constraintdef(
+            conn, int_arg(args, 0, 0),
+        )))
+    },
+    PgGetIndexdef(FunctionArity::OneOf(&[1, 2]), true) => |conn, args, _| {
+        Ok(IOResult::Done(exec_pg_get_indexdef(
+            conn, int_arg(args, 0, 0),
+        )))
+    },
+    ObjDescription(FunctionArity::OneOf(&[1, 2]), true) => |_, _, _| {
+        Ok(IOResult::Done(Value::Null))
+    },
+    PgGetExpr(FunctionArity::OneOf(&[2, 3]), true) => |_, args, _| {
+        Ok(IOResult::Done(exec_pg_get_expr(args)?))
+    },
+    ToChar(FunctionArity::Exact(2), true) => |_, args, _| {
+        Ok(IOResult::Done(exec_to_char(
+            args[0].get_value(), &text_arg(args, 1),
+        )))
+    },
+    PgInputIsValid(FunctionArity::Exact(2), true) => |_, args, _| {
+        Ok(IOResult::Done(exec_pg_input_is_valid(
+            args[0].get_value(), &text_arg(args, 1),
+        )))
+    },
+    Booleq(FunctionArity::Exact(2), true) => |_, args, _| {
+        Ok(IOResult::Done(Value::from_i64(
+            (args[0].get_value() == args[1].get_value()) as i64,
+        )))
+    },
+    Boolne(FunctionArity::Exact(2), true) => |_, args, _| {
+        Ok(IOResult::Done(Value::from_i64(
+            (args[0].get_value() != args[1].get_value()) as i64,
+        )))
+    },
+    ColDescription(FunctionArity::Exact(2), true) => |_, _, _| {
+        Ok(IOResult::Done(Value::Null))
+    },
+    Version(FunctionArity::Exact(0), true) => |_, _, _| {
+        Ok(IOResult::Done(exec_version()))
+    },
+    CurrentDatabase(FunctionArity::Exact(0), true) => |conn, _, _| {
+        Ok(IOResult::Done(Value::build_text(
+            crate::catalog::db_name_from_path(conn.db_file_path()),
+        )))
+    },
+    CurrentSchema(FunctionArity::Exact(0), true) => |_, _, _| {
+        Ok(IOResult::Done(Value::build_text("public")))
+    },
+    PgBackendPid(FunctionArity::Exact(0), true) => |_, _, _| {
+        Ok(IOResult::Done(Value::from_i64(std::process::id() as i64)))
+    },
+    Now | ClockTimestamp | TransactionTimestamp | StatementTimestamp(
+        FunctionArity::Variadic, false
+    ) => |_, _, _| {
+        Ok(IOResult::Done(Value::build_text(
+            Utc::now().format("%Y-%m-%d %H:%M:%S%.3f").to_string(),
+        )))
+    },
 }
 
-impl PgScalarFunction {
-    fn execute(
-        &self,
-        conn: &Arc<Connection>,
-        args: &[Register],
-        _state: &mut ScalarFunctionState,
-    ) -> IOResultOr<Value> {
-        let arg = |i: usize| args.get(i).map(Register::get_value);
-        let int_arg = |i: usize, default: i64| arg(i).and_then(Value::as_int).unwrap_or(default);
-        let text_arg = |i: usize| match arg(i) {
-            Some(Value::Text(t)) => t.as_str().to_string(),
-            _ => String::new(),
-        };
-        let value = match self {
-            Self::Now
-            | Self::ClockTimestamp
-            | Self::TransactionTimestamp
-            | Self::StatementTimestamp => {
-                Value::build_text(Utc::now().format("%Y-%m-%d %H:%M:%S%.3f").to_string())
-            }
-            Self::PgGetUserbyid => exec_pg_get_user_by_id(int_arg(0, 0)),
-            Self::PgTableIsVisible | Self::PgFunctionIsVisible | Self::PgTypeIsVisible => {
-                exec_pg_is_visible(int_arg(0, 0))
-            }
-            Self::PgGetConstraintdef => exec_pg_get_constraintdef(conn, int_arg(0, 0)),
-            Self::PgGetIndexdef => exec_pg_get_indexdef(conn, int_arg(0, 0)),
-            Self::PgEncodingToChar => exec_pg_encoding_to_char(int_arg(0, 0)),
-            Self::FormatType => exec_pg_format_type(int_arg(0, 0), int_arg(1, -1)),
-            Self::ToChar => exec_to_char(arg(0).unwrap_or(&Value::Null), &text_arg(1)),
-            Self::PgInputIsValid => {
-                exec_pg_input_is_valid(arg(0).unwrap_or(&Value::Null), &text_arg(1))
-            }
-            Self::Booleq => Value::from_i64((arg(0) == arg(1)) as i64),
-            Self::Boolne => Value::from_i64((arg(0) != arg(1)) as i64),
-            Self::Version => exec_version(),
-            Self::CurrentDatabase => {
-                Value::build_text(crate::catalog::db_name_from_path(conn.db_file_path()))
-            }
-            Self::CurrentSchema => Value::build_text("public"),
-            Self::PgBackendPid => Value::from_i64(std::process::id() as i64),
-            Self::QuoteIdent => match arg(0) {
-                Some(Value::Null) | None => Value::Null,
-                _ => Value::build_text(turso_pg_parser::quote_identifier(&text_arg(0))),
-            },
-            Self::QuoteLiteral => exec_quote_literal(arg(0).unwrap_or(&Value::Null)),
-            Self::PgGetExpr => exec_pg_get_expr(args)?,
-            Self::PgGetStatisticsobjdefColumns
-            | Self::PgRelationIsPublishable
-            | Self::PgGetFunctionResult
-            | Self::PgGetFunctionArguments
-            | Self::ObjDescription
-            | Self::ColDescription => Value::Null,
-        };
-        Ok(IOResult::Done(value))
+fn int_arg(args: &[Register], i: usize, default: i64) -> i64 {
+    args.get(i)
+        .and_then(|arg| arg.get_value().as_int())
+        .unwrap_or(default)
+}
+
+fn text_arg(args: &[Register], i: usize) -> String {
+    match args.get(i).map(Register::get_value) {
+        Some(Value::Text(t)) => t.as_str().to_string(),
+        _ => String::new(),
     }
 }
 
@@ -975,4 +1000,80 @@ fn pg_to_char_numeric(num: f64, format: &str) -> String {
     }
 
     result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    scalar_functions! {
+        TestIo | TestIoAlias(FunctionArity::Exact(1), false) => call_with_io,
+    }
+
+    #[test]
+    fn generated_dispatch_returns_io_and_preserves_callback_state() {
+        let db = crate::open_database_with_io(
+            Arc::new(turso_core::MemoryIO::new()),
+            "scalar-dispatch.db",
+            turso_core::OpenFlags::default(),
+            turso_core::DatabaseOpts::new(),
+        )
+        .unwrap();
+        let conn = db.connect().unwrap();
+
+        assert_eq!(
+            SCALAR_FUNCTIONS
+                .iter()
+                .flat_map(ScalarFunction::function_list)
+                .map(|entry| (entry.name, entry.narg, entry.deterministic))
+                .collect::<Vec<_>>(),
+            vec![
+                ("test_io".to_string(), 1, false),
+                ("test_io_alias".to_string(), 1, false),
+            ]
+        );
+
+        for function in SCALAR_FUNCTIONS {
+            let mut state = ScalarFunctionState::default();
+            let args = [Register::Value(Value::from_i64(2))];
+            let IOResult::IO(io) = function.call(&conn, &args, &mut state).unwrap() else {
+                panic!("expected pending I/O");
+            };
+            assert!(!io.finished());
+            assert!(matches!(
+                function.call(&conn, &args, &mut state).unwrap(),
+                IOResult::IO(_)
+            ));
+            io.0.complete(0);
+            let IOResult::Done(value) = function.call(&conn, &args, &mut state).unwrap() else {
+                panic!("expected completed I/O");
+            };
+            assert_eq!(value, Value::from_i64(13));
+
+            let args = [Register::Value(Value::Null)];
+            let error = function.call(&conn, &args, &mut state).unwrap_err();
+            assert!(error.to_string().contains("expected integer"));
+        }
+        conn.close().unwrap();
+    }
+
+    fn call_with_io(
+        _conn: &Arc<Connection>,
+        args: &[Register],
+        state: &mut ScalarFunctionState,
+    ) -> IOResultOr<Value> {
+        let value = args[0]
+            .get_value()
+            .as_int()
+            .ok_or_else(|| LimboError::InvalidArgument("expected integer".to_string()))?;
+        let completion = state
+            .get_or_init::<Option<turso_core::Completion>>()
+            .get_or_insert_with(|| turso_core::Completion::new_write(|_| {}));
+        if !completion.finished() {
+            return Ok(IOResult::IO(turso_core::types::IOCompletions(
+                completion.clone(),
+            )));
+        }
+        Ok(IOResult::Done(Value::from_i64(value + 11)))
+    }
 }
