@@ -69,6 +69,8 @@ pub struct MaterializedViewCursor {
 
     // State machine for seek operations
     seek_state: SeekState,
+
+    null_row: bool,
 }
 
 impl MaterializedViewCursor {
@@ -88,6 +90,7 @@ impl MaterializedViewCursor {
             current_row: None,
             execute_state: ExecuteState::Uninitialized,
             seek_state: SeekState::Init,
+            null_row: false,
         })
     }
 
@@ -235,6 +238,7 @@ impl MaterializedViewCursor {
             match &mut self.seek_state {
                 SeekState::Init => {
                     self.current_row = None;
+                    self.null_row = false;
                     self.seek_state = SeekState::Seek {
                         target: target_rowid,
                     };
@@ -350,6 +354,9 @@ impl MaterializedViewCursor {
     }
 
     pub fn column(&mut self, col: usize) -> IOResultOr<Value> {
+        if self.null_row {
+            return Ok(IOResult::Done(Value::Null));
+        }
         if let Some((_, ref values)) = self.current_row {
             Ok(IOResult::Done(
                 values.get(col).cloned().unwrap_or(Value::Null),
@@ -360,6 +367,9 @@ impl MaterializedViewCursor {
     }
 
     pub fn rowid(&self) -> IOResultOr<Option<i64>> {
+        if self.null_row {
+            return Ok(IOResult::Done(None));
+        }
         Ok(IOResult::Done(self.current_row.as_ref().map(|(id, _)| *id)))
     }
 
@@ -368,6 +378,10 @@ impl MaterializedViewCursor {
         // Seek GT from i64::MIN to find the first row using internal do_seek
         let _result = return_if_io!(self.do_seek(i64::MIN, SeekOp::GT));
         Ok(IOResult::Done(()))
+    }
+
+    pub fn set_null_flag(&mut self, flag: bool) {
+        self.null_row = flag;
     }
 
     pub fn is_valid(&self) -> Result<bool> {
