@@ -82,7 +82,6 @@ pub struct DatabaseOpts {
     pub enable_experimental_mvcc_passive_checkpoint: bool,
     pub unsafe_testing: bool,
     pub(crate) enable_load_extension: bool,
-    pub(crate) skip_frontend_setup: bool,
 }
 
 impl DatabaseOpts {
@@ -340,7 +339,6 @@ pub enum OpenDbAsyncPhase {
     ReadingHeader,
     LoadingSchema,
     BootstrapMvStore,
-    InitializeFrontend,
     Done,
 }
 
@@ -522,7 +520,6 @@ pub struct OpenDbAsyncState {
     /// Sub state machine for `MvStore::bootstrap_nonblock`, driven in
     /// `BootstrapMvStore`.
     mvcc_bootstrap_state: mvcc::database::BootstrapState,
-    frontend_setup_state: crate::dialect::setup::SetupState,
 }
 
 impl Default for OpenDbAsyncState {
@@ -546,20 +543,12 @@ impl OpenDbAsyncState {
             header_validation_state: HeaderValidationState::default(),
             mvcc_bootstrap_conn: None,
             mvcc_bootstrap_state: mvcc::database::BootstrapState::default(),
-            frontend_setup_state: crate::dialect::setup::SetupState::default(),
         }
     }
 }
 
 impl Drop for OpenDbAsyncState {
     fn drop(&mut self) {
-        self.schema_guard = None;
-        self.frontend_setup_state.cancel();
-        if matches!(self.phase, OpenDbAsyncPhase::InitializeFrontend) {
-            if let (Some(conn), Some(pager)) = (&self.conn, &self.pager) {
-                conn.rollback_current_txn_state(pager, true);
-            }
-        }
         if let Some(registry_key) = self.registry_key.take() {
             let mut registry = DATABASE_MANAGER.lock();
             registry.remove(&registry_key);
@@ -1127,7 +1116,7 @@ impl Database {
     /// when a registry hit short-circuits the open (only possible when
     /// `use_registry` is set).
     #[cfg(feature = "fs")]
-    fn resolve_default_storage(
+    pub(crate) fn resolve_default_storage(
         io: &Arc<dyn IO>,
         path: &str,
         options: &mut OpenOptions,
@@ -1467,12 +1456,6 @@ impl Database {
         );
         if result.is_err() {
             let _ = state.schema_guard.take();
-            state.frontend_setup_state.cancel();
-            if matches!(state.phase, OpenDbAsyncPhase::InitializeFrontend) {
-                if let (Some(conn), Some(pager)) = (&state.conn, &state.pager) {
-                    conn.rollback_current_txn_state(pager, true);
-                }
-            }
         }
         result
     }
@@ -1566,23 +1549,8 @@ impl Database {
                     // Wrap db in Arc before connecting
                     let db = Arc::new(db);
 
-                    // Check: https://github.com/tursodatabase/turso/pull/1761#discussion_r2154013123
-                    let conn = db._connect(
-                        false,
-                        Some(pager.clone()),
-                        state.encryption_key.clone(),
-                        page_codec.clone(),
-                        StatsRefresh::Blocking,
-                    )?;
-
-                    // Acquire schema lock and hold it through ReadingHeader and LoadingSchema phases
-                    // to ensure schema_version and make_from_btree are atomic
-                    let guard = db.schema.lock_arc();
-
                     state.db = Some(db);
                     state.pager = Some(pager);
-                    state.conn = Some(conn);
-                    state.schema_guard = Some(guard);
 
                     state.phase = OpenDbAsyncPhase::ReadingHeader;
                 }
@@ -1592,8 +1560,19 @@ impl Database {
                         .pager
                         .as_ref()
                         .expect("pager must be initialized in Init phase");
-                    let header_schema_cookie =
-                        return_if_io!(pager.with_header(|header| header.schema_cookie.get()));
+                    let (header_schema_cookie, cache_size) =
+                        return_if_io!(pager.with_header(|header| (
+                            header.schema_cookie.get(),
+                            header.default_page_cache_size.get()
+                        )));
+                    let db = state.db.as_ref().expect("db initialized above");
+                    state.conn = Some(db.new_connection(
+                        false,
+                        pager.clone(),
+                        state.encryption_key.clone(),
+                        cache_size,
+                    )?);
+                    state.schema_guard = Some(db.schema.lock_arc());
                     let guard = state
                         .schema_guard
                         .as_mut()
@@ -1700,12 +1679,13 @@ impl Database {
                         // hold it across yields. Re-entry reuses the existing
                         // connection and the persisted `BootstrapState`.
                         if state.mvcc_bootstrap_conn.is_none() {
-                            state.mvcc_bootstrap_conn = Some(db._connect(
+                            let cache_size = return_if_io!(pager
+                                .with_header(|header| { header.default_page_cache_size.get() }));
+                            state.mvcc_bootstrap_conn = Some(db.new_connection(
                                 true,
-                                Some(pager.clone()),
+                                pager.clone(),
                                 state.encryption_key.clone(),
-                                page_codec.clone(),
-                                StatsRefresh::Blocking,
+                                cache_size,
                             )?);
                         }
                         let conn = state.mvcc_bootstrap_conn.as_ref().expect("created above");
@@ -1716,14 +1696,6 @@ impl Database {
                         state.mvcc_bootstrap_conn = None;
                     }
 
-                    state.phase = OpenDbAsyncPhase::InitializeFrontend;
-                }
-
-                OpenDbAsyncPhase::InitializeFrontend => {
-                    let conn = state.conn.as_ref().expect("open connection must exist");
-                    if !opts.skip_frontend_setup {
-                        return_if_io!(state.frontend_setup_state.step(conn));
-                    }
                     state.phase = OpenDbAsyncPhase::Done;
                     return Ok(IOResult::Done(
                         state
@@ -2172,48 +2144,42 @@ impl Database {
                     // Always open shared WAL and set it in the Database and Pager.
                     // MVCC currently requires a WAL open to function.
                     let mut shared_wal = {
+                        #[cfg(host_shared_wal)]
+                        let mut from_authority = None;
                         #[cfg(not(host_shared_wal))]
-                        {
-                            if driver.is_none() {
+                        let from_authority = None;
+                        if driver.is_none() {
+                            #[cfg(host_shared_wal)]
+                            {
+                                let authority = self.open_shared_wal_coordination_for_open()?;
+                                if let Some(authority) = authority.as_ref() {
+                                    if !authority.frame_index_overflowed() {
+                                        from_authority = Some(
+                                            WalFileShared::open_shared_from_authority_if_exists(
+                                                &self.io,
+                                                &self.wal_path,
+                                                self.open_flags,
+                                                authority,
+                                                &self.db_file,
+                                            )?,
+                                        );
+                                    }
+                                }
+                            }
+                            if from_authority.is_none() {
                                 *driver = Some(WalFileShared::open_shared_if_exists_begin(
                                     &self.io,
                                     &self.wal_path,
                                     self.open_flags,
                                 )?);
                             }
-                            return_if_io!(driver.as_mut().expect("driver initialized above").poll())
                         }
-                        #[cfg(host_shared_wal)]
-                        {
-                            // Native-only coordination path: `io.step` pumps
-                            // synchronously here, so the blocking shims are
-                            // fine. (Driver field is unused on host.)
-                            let _ = &driver;
-                            let flags = self.open_flags;
-                            let shared_authority = self.open_shared_wal_coordination_for_open()?;
-                            if let Some(authority) = shared_authority.as_ref() {
-                                if !authority.frame_index_overflowed() {
-                                    WalFileShared::open_shared_from_authority_if_exists(
-                                        &self.io,
-                                        &self.wal_path,
-                                        flags,
-                                        authority,
-                                        &self.db_file,
-                                    )?
-                                } else {
-                                    WalFileShared::open_shared_if_exists(
-                                        &self.io,
-                                        &self.wal_path,
-                                        flags,
-                                    )?
-                                }
-                            } else {
-                                WalFileShared::open_shared_if_exists(
-                                    &self.io,
-                                    &self.wal_path,
-                                    flags,
-                                )?
-                            }
+                        match from_authority {
+                            Some(wal) => wal,
+                            None => return_if_io!(driver
+                                .as_mut()
+                                .expect("driver initialized above")
+                                .poll()),
                         }
                     };
 

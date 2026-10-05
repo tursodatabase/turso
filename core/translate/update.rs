@@ -204,12 +204,10 @@ fn validate_update(
     schema: &Schema,
     table_name: &str,
     is_internal_schema_change: bool,
-    allow_internal_table_writes: bool,
     conn: &Arc<Connection>,
 ) -> crate::Result<()> {
     // Check if this is a system table that should be protected from direct writes
     if !is_internal_schema_change
-        && !allow_internal_table_writes
         && !conn.is_nested_stmt()
         && !conn.is_mvcc_bootstrap_connection()
         && !crate::schema::allow_user_dml(table_name)
@@ -268,7 +266,6 @@ fn prepare_update_plan(
         schema,
         target_name.as_str(),
         is_internal_schema_change,
-        resolver.allow_internal_table_writes,
         connection,
     )?;
 

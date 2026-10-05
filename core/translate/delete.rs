@@ -31,8 +31,7 @@ fn validate_delete(
     connection: &Arc<crate::Connection>,
 ) -> Result<Arc<Table>> {
     // Check if this is a system table that should be protected from direct writes
-    if !resolver.allow_internal_table_writes
-        && !connection.is_nested_stmt()
+    if !connection.is_nested_stmt()
         && !connection.is_mvcc_bootstrap_connection()
         && !crate::schema::allow_user_dml(tbl_name)
     {

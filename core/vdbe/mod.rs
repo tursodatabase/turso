@@ -1954,7 +1954,12 @@ impl Program {
     // `prev_steps` is the vm_steps value at the previous consultation, so the
     // progress handler sees every crossed multiple of its interval.
     #[inline]
-    fn maybe_request_interrupt<I>(&self, state: &mut ProgramState, io: &I, prev_steps: u64) -> bool
+    pub(crate) fn maybe_request_interrupt<I>(
+        &self,
+        state: &mut ProgramState,
+        io: &I,
+        prev_steps: u64,
+    ) -> bool
     where
         I: crate::IO + ?Sized,
     {

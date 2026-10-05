@@ -3516,3 +3516,312 @@ fn test_postgres_catalog_conkey_any_matches_no_rows(db: TempDatabase) {
     let rows = stmt.run_collect_rows().unwrap();
     assert_eq!(rows, vec![vec![Value::from_i64(0)]]);
 }
+
+#[cfg(feature = "io_memory_yield")]
+mod nonblocking {
+    use super::*;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+    use turso_core::{Buffer, Clock, Completion, File, IOResult, MemoryYieldIO, OpenFlags, IO};
+
+    #[test]
+    fn preparing_does_not_execute_frontend_statements() {
+        let (io, conn) = open(false);
+        conn.execute("CREATE TABLE existing (id INTEGER)").unwrap();
+        io.allow_step.store(false, Ordering::SeqCst);
+        for sql in [
+            "CREATE TABLE future (id SERIAL, second BIGSERIAL)",
+            "CREATE SCHEMA future_schema",
+            "DROP SCHEMA public CASCADE",
+            "COPY existing FROM 'missing-input.tsv'",
+            "SET search_path TO missing_schema",
+        ] {
+            let stmt = conn.prepare(sql).unwrap();
+            drop(stmt);
+        }
+        assert!(conn.inner().current_schema().get_table("future").is_none());
+        assert!(conn
+            .inner()
+            .current_schema()
+            .get_sequence("future_id_seq")
+            .is_none());
+        assert!(conn.inner().list_attached_databases().is_empty());
+        assert!(conn.prepare("SELECT id FROM existing").is_ok());
+        io.allow_step.store(true, Ordering::SeqCst);
+    }
+
+    #[test]
+    fn frontend_statements_yield_io_to_the_caller() {
+        for mvcc in [false, true] {
+            let (io, conn) = open(mvcc);
+            let mut serial = conn
+                .prepare("CREATE TABLE serials (a SERIAL, b BIGSERIAL)")
+                .unwrap();
+            assert!(drive(&io, &mut serial).1 > 0);
+            conn.execute("SELECT setval('serials_a_seq', 40)").unwrap();
+            conn.execute(
+                "INSERT INTO serials VALUES (nextval('serials_a_seq'), nextval('serials_b_seq'))",
+            )
+            .unwrap();
+            let mut query = conn.prepare("SELECT a, b FROM serials").unwrap();
+            assert_eq!(
+                drive(&io, &mut query).0,
+                vec![vec![Value::from_i64(41), Value::from_i64(1)]]
+            );
+
+            conn.execute("CREATE TABLE copied (id INTEGER PRIMARY KEY, name TEXT)")
+                .unwrap();
+            write_file(&io, "input.tsv", "7\tO'Brien\n19\t\\N\n");
+            let mut copy = conn.prepare("COPY copied FROM 'input.tsv'").unwrap();
+            assert!(drive(&io, &mut copy).1 > 0);
+            assert_eq!(copy.n_change(), 2);
+            let mut query = conn
+                .prepare("SELECT id, name FROM copied ORDER BY id")
+                .unwrap();
+            assert_eq!(
+                drive(&io, &mut query).0,
+                vec![
+                    vec![Value::from_i64(7), Value::build_text("O'Brien")],
+                    vec![Value::from_i64(19), Value::Null],
+                ]
+            );
+            write_file(&io, "input.tsv", "");
+            copy.reset().unwrap();
+            drive(&io, &mut copy);
+            assert_eq!(copy.n_change(), 0);
+
+            let mut create = conn.prepare("CREATE SCHEMA extra").unwrap();
+            drive(&io, &mut create);
+            assert!(conn
+                .inner()
+                .list_attached_databases()
+                .contains(&"extra".to_string()));
+            conn.execute("CREATE TABLE extra.first_table (id INTEGER)")
+                .unwrap();
+            conn.execute("CREATE TABLE extra.second_table (id INTEGER)")
+                .unwrap();
+            let mut drop_schema = conn.prepare("DROP SCHEMA extra CASCADE").unwrap();
+            drive(&io, &mut drop_schema);
+            assert!(!conn
+                .inner()
+                .list_attached_databases()
+                .contains(&"extra".to_string()));
+            let mut reopen_schema = conn.prepare("CREATE SCHEMA extra").unwrap();
+            assert!(drive(&io, &mut reopen_schema).1 > 0);
+            let mut drop_schema = conn.prepare("DROP SCHEMA extra CASCADE").unwrap();
+            drive(&io, &mut drop_schema);
+
+            conn.inner().get_pager().clear_page_cache(false);
+            let mut defs = conn
+                .prepare("SELECT table_name, ddl FROM pg_get_tabledef WHERE table_name IN ('copied', 'serials') ORDER BY table_name")
+                .unwrap();
+            let (rows, yields) = drive(&io, &mut defs);
+            assert!(yields > 0);
+            assert_eq!(rows.len(), 2);
+            assert_eq!(rows[0][0], Value::build_text("copied"));
+            assert_eq!(
+                rows[0][1],
+                Value::build_text("CREATE TABLE copied (id INTEGER PRIMARY KEY, name TEXT)")
+            );
+            assert_eq!(rows[1][0], Value::build_text("serials"));
+            assert_eq!(
+                rows[1][1],
+                Value::build_text("CREATE TABLE serials (a SERIAL, b BIGSERIAL)")
+            );
+        }
+    }
+
+    #[test]
+    fn copy_error_does_not_commit_partial_rows() {
+        for mvcc in [false, true] {
+            let (io, conn) = open(mvcc);
+            conn.execute("CREATE TABLE copied (id INTEGER PRIMARY KEY)")
+                .unwrap();
+            write_file(&io, "input.tsv", "7\n19\n7\n");
+            let mut copy = conn.prepare("COPY copied FROM 'input.tsv'").unwrap();
+            loop {
+                io.allow_step.store(false, Ordering::SeqCst);
+                let result = copy.run_ignore_rows_nonblock();
+                io.allow_step.store(true, Ordering::SeqCst);
+                match result {
+                    Ok(IOResult::IO(completion)) => completion.wait(io.as_ref()).unwrap(),
+                    Err(err) => {
+                        assert!(err.to_string().contains("UNIQUE"), "{err}");
+                        break;
+                    }
+                    Ok(IOResult::Done(())) => panic!("duplicate key must fail"),
+                }
+            }
+            drop(copy);
+            let mut query = conn.prepare("SELECT COUNT(*) FROM copied").unwrap();
+            assert_eq!(drive(&io, &mut query).0, vec![vec![Value::from_i64(0)]]);
+            assert!(conn.inner().get_auto_commit());
+        }
+    }
+
+    #[test]
+    fn copy_can_be_reset_or_dropped_at_each_io_yield() {
+        for mvcc in [false, true] {
+            let (io, conn) = open(mvcc);
+            conn.execute("CREATE TABLE copied (id INTEGER PRIMARY KEY, name TEXT)")
+                .unwrap();
+            write_file(&io, "input.tsv", "7\tfirst\n19\tsecond\n");
+            let mut copy = conn.prepare("COPY copied FROM 'input.tsv'").unwrap();
+            let yields = drive(&io, &mut copy).1;
+            assert!(yields > 0);
+
+            for reset in [false, true] {
+                for stop_at in 0..yields {
+                    let (io, conn) = open(mvcc);
+                    conn.execute("CREATE TABLE copied (id INTEGER PRIMARY KEY, name TEXT)")
+                        .unwrap();
+                    write_file(&io, "input.tsv", "7\tfirst\n19\tsecond\n");
+                    let mut copy = conn.prepare("COPY copied FROM 'input.tsv'").unwrap();
+                    for index in 0..=stop_at {
+                        io.allow_step.store(false, Ordering::SeqCst);
+                        let result = copy.run_ignore_rows_nonblock();
+                        io.allow_step.store(true, Ordering::SeqCst);
+                        let IOResult::IO(completion) = result.unwrap() else {
+                            panic!("COPY completed before yield {stop_at}");
+                        };
+                        if index != stop_at {
+                            completion.wait(io.as_ref()).unwrap();
+                        }
+                    }
+                    if reset {
+                        copy.reset().unwrap();
+                    } else {
+                        drop(copy);
+                    }
+                    let mut count = conn.prepare("SELECT COUNT(*) FROM copied").unwrap();
+                    let rows = drive(&io, &mut count).0;
+                    assert!(
+                        rows == vec![vec![Value::from_i64(0)]]
+                            || rows == vec![vec![Value::from_i64(2)]],
+                        "COPY must not leave partial rows: {rows:?}"
+                    );
+                    assert!(conn.inner().get_auto_commit());
+                    conn.execute("INSERT INTO copied VALUES (31, 'after cancellation')")
+                        .unwrap();
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn interrupted_frontend_statement_does_not_execute() {
+        let (io, conn) = open(false);
+        conn.execute("CREATE TABLE copied (id INTEGER PRIMARY KEY)")
+            .unwrap();
+        write_file(&io, "input.tsv", "7\n19\n");
+        let mut copy = conn.prepare("COPY copied FROM 'input.tsv'").unwrap();
+        copy.interrupt();
+        io.allow_step.store(false, Ordering::SeqCst);
+        let result = copy.run_ignore_rows_nonblock();
+        io.allow_step.store(true, Ordering::SeqCst);
+        assert!(matches!(result, Err(err) if matches!(*err, turso_core::LimboError::Interrupt)));
+        let mut count = conn.prepare("SELECT COUNT(*) FROM copied").unwrap();
+        assert_eq!(drive(&io, &mut count).0, vec![vec![Value::from_i64(0)]]);
+        copy.reset().unwrap();
+        drive(&io, &mut copy);
+        assert_eq!(copy.n_change(), 2);
+    }
+
+    fn open(mvcc: bool) -> (Arc<StepGuardedIO>, turso_pg::PgConnection) {
+        let io = Arc::new(StepGuardedIO {
+            inner: MemoryYieldIO::new(),
+            allow_step: AtomicBool::new(true),
+        });
+        let path = format!("frontend-{}.db", rand::random::<u64>());
+        let db = turso_pg::open_database_with_io(
+            io.clone(),
+            &path,
+            OpenFlags::default(),
+            turso_core::DatabaseOpts::new()
+                .with_attach(true)
+                .with_views(true),
+        )
+        .unwrap();
+        let conn = turso_pg::PgConnection::new(db.connect().unwrap());
+        if mvcc {
+            conn.pragma_update("journal_mode", "'mvcc'").unwrap();
+        }
+        (io, conn)
+    }
+
+    fn drive(io: &StepGuardedIO, stmt: &mut turso_core::Statement) -> (Vec<Vec<Value>>, usize) {
+        let mut rows = Vec::new();
+        let mut yields = 0;
+        loop {
+            io.allow_step.store(false, Ordering::SeqCst);
+            let result = stmt.run_with_row_callback_nonblock(|row| {
+                rows.push(row.get_values().cloned().collect());
+                Ok(())
+            });
+            io.allow_step.store(true, Ordering::SeqCst);
+            match result.unwrap() {
+                IOResult::Done(()) => return (rows, yields),
+                IOResult::IO(completion) => {
+                    yields += 1;
+                    completion.wait(io).unwrap();
+                }
+            }
+        }
+    }
+
+    fn write_file(io: &StepGuardedIO, path: &str, text: &str) {
+        let file = io.open_file(path, OpenFlags::default(), false).unwrap();
+        io.wait_for_completion(file.truncate(0, Completion::new_trunc(|_| {})).unwrap())
+            .unwrap();
+        io.wait_for_completion(
+            file.pwrite(
+                0,
+                Arc::new(Buffer::new(text.as_bytes().to_vec())),
+                Completion::new_write(|_| {}),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+    }
+
+    struct StepGuardedIO {
+        inner: MemoryYieldIO,
+        allow_step: AtomicBool,
+    }
+
+    impl Clock for StepGuardedIO {
+        fn current_time_monotonic(&self) -> turso_core::MonotonicInstant {
+            self.inner.current_time_monotonic()
+        }
+        fn current_time_wall_clock(&self) -> turso_core::WallClockInstant {
+            self.inner.current_time_wall_clock()
+        }
+    }
+
+    impl IO for StepGuardedIO {
+        fn open_file(
+            &self,
+            path: &str,
+            flags: OpenFlags,
+            direct: bool,
+        ) -> turso_core::Result<Arc<dyn File>> {
+            self.inner.open_file(path, flags, direct)
+        }
+        fn remove_file(&self, path: &str) -> turso_core::Result<()> {
+            self.inner.remove_file(path)
+        }
+        fn file_id(&self, path: &str) -> turso_core::Result<turso_core::io::FileId> {
+            self.inner.file_id(path)
+        }
+        fn supports_shared_wal_coordination(&self) -> bool {
+            false
+        }
+        fn step(&self) -> turso_core::Result<()> {
+            assert!(
+                self.allow_step.load(Ordering::SeqCst),
+                "frontend code must not call IO::step"
+            );
+            self.inner.step()
+        }
+    }
+}

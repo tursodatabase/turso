@@ -123,7 +123,7 @@ pub fn translate(
         if matches!(
             origin,
             crate::statement::StatementOrigin::InternalHelper
-                | crate::statement::StatementOrigin::InternalRoot
+                | crate::statement::StatementOrigin::SqliteRoot
         ) {
             Arc::new(crate::dialect::SqliteDialect) as Arc<dyn crate::dialect::Dialect>
         } else {
@@ -131,8 +131,6 @@ pub fn translate(
         },
         &prepare_options.unqualified_database_search_path,
     );
-    resolver.allow_internal_table_writes =
-        origin == crate::statement::StatementOrigin::InternalRoot;
     #[cfg(feature = "simulator")]
     resolver.set_subquery_unnesting_mode(connection.subquery_unnesting_mode());
 

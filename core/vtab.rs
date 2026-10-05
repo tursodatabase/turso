@@ -309,15 +309,17 @@ impl VirtualTableCursor {
         idx_str: Option<String>,
         arg_count: usize,
         args: crate::alloc::Vec<Value>,
-    ) -> crate::Result<bool> {
+    ) -> crate::types::IOResultOr<bool> {
         self.null_flag = false;
         match &mut self.inner {
-            VirtualTableCursorInner::Pragma(cursor) => cursor.filter(args),
-            VirtualTableCursorInner::External(cursor) => {
-                cursor.filter(idx_num, idx_str, arg_count, args)
+            VirtualTableCursorInner::Pragma(cursor) => {
+                Ok(crate::IOResult::Done(cursor.filter(args)?))
             }
+            VirtualTableCursorInner::External(cursor) => Ok(crate::IOResult::Done(
+                cursor.filter(idx_num, idx_str, arg_count, args)?,
+            )),
             VirtualTableCursorInner::Internal(cursor) => {
-                cursor.write().filter(&args, idx_str, idx_num)
+                cursor.write().filter_nonblock(&args, idx_str, idx_num)
             }
         }
     }
@@ -620,6 +622,15 @@ pub trait InternalVirtualTableCursor: Send + Sync {
         idx_str: Option<String>,
         idx_num: i32,
     ) -> Result<bool, LimboError>;
+
+    fn filter_nonblock(
+        &mut self,
+        args: &[Value],
+        idx_str: Option<String>,
+        idx_num: i32,
+    ) -> crate::types::IOResultOr<bool> {
+        Ok(crate::IOResult::Done(self.filter(args, idx_str, idx_num)?))
+    }
 }
 
 #[cfg(all(test, feature = "fs"))]

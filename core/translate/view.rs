@@ -453,12 +453,6 @@ pub fn translate_drop_view(
     // row whose stored SQL failed to parse at load time. Broken views have no
     // in-memory representation, but DROP VIEW must still delete their row so
     // affected databases can be cleaned up.
-    if resolver.with_schema(database_id, |s| {
-        s.get_view(&normalized_view_name)
-            .is_some_and(|view| view.internal)
-    }) {
-        bail_parse_error!("view {normalized_view_name} may not be dropped");
-    }
     let (is_regular_view, is_materialized_view, is_broken_view) =
         resolver.with_schema(database_id, |s| {
             (

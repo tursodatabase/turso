@@ -10,15 +10,9 @@
 //! build (`pragma_*`, `json_each`/`json_tree`, `sqlite_dbpage`,
 //! `btree_dump`, `sqlite_turso_types`).
 
-pub(crate) mod setup;
 pub mod sqlite;
 
 pub use sqlite::SqliteDialect;
-
-pub struct InternalMigration {
-    pub version: u32,
-    pub statements: &'static [&'static str],
-}
 
 /// SQL dialect layered on top of the engine.
 ///
@@ -34,10 +28,6 @@ pub trait Dialect: Send + Sync + 'static {
     /// created with; the process-wide database registry uses this name to
     /// reject an open whose dialect differs from the already-open instance.
     fn name(&self) -> &'static str;
-
-    fn internal_migrations(&self) -> &'static [InternalMigration] {
-        &[]
-    }
 
     /// Parse the first statement in `sql` into the engine AST.
     ///
@@ -110,9 +100,6 @@ pub trait Dialect: Send + Sync + 'static {
                 "format_rewritten_table_sql requires CREATE TABLE".to_string(),
             ));
         };
-        if crate::schema::is_system_table(tbl_name.name.as_str()) {
-            return SqliteDialect.format_table_sql(&stmt.to_string(), tbl_name, body);
-        }
         self.format_table_sql(&stmt.to_string(), tbl_name, body)
     }
 
@@ -189,16 +176,11 @@ mod tests {
     struct TestDialect {
         parse_calls: AtomicUsize,
         statement_parse_calls: AtomicUsize,
-        migrations: &'static [InternalMigration],
     }
 
     impl Dialect for TestDialect {
         fn name(&self) -> &'static str {
             "test"
-        }
-
-        fn internal_migrations(&self) -> &'static [InternalMigration] {
-            self.migrations
         }
 
         fn parse(&self, sql: &str) -> crate::Result<(Option<turso_parser::ast::Cmd>, usize)> {
@@ -1101,333 +1083,4 @@ mod tests {
             vec![vec![crate::Value::from_i64(42)]]
         );
     }
-
-    #[test]
-    fn internal_migrations_preserve_rows_and_apply_only_new_versions() {
-        let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
-        let path = "frontend-migrations.db";
-        {
-            let dialect = Arc::new(TestDialect {
-                migrations: &INTERNAL_TEST_MIGRATIONS[..1],
-                ..Default::default()
-            });
-            let db = open_db(&io, path, dialect.clone()).unwrap();
-            assert_eq!(dialect.statement_parse_calls.load(Ordering::SeqCst), 0);
-            let conn = db.connect().unwrap();
-            assert_eq!(
-                conn.prepare("SELECT value FROM __turso_internal_test")
-                    .unwrap()
-                    .run_collect_rows()
-                    .unwrap(),
-                vec![vec![crate::Value::from_i64(7)]]
-            );
-            conn.prepare_internal_root("UPDATE __turso_internal_test SET value = 23")
-                .unwrap()
-                .run_ignore_rows()
-                .unwrap();
-            conn.close().unwrap();
-        }
-        for _ in 0..2 {
-            let dialect = Arc::new(TestDialect {
-                migrations: INTERNAL_TEST_MIGRATIONS,
-                ..Default::default()
-            });
-            let db = open_db(&io, path, dialect).unwrap();
-            let conn = db.connect().unwrap();
-            assert_eq!(
-                conn.prepare("SELECT value, extra FROM __turso_internal_test")
-                    .unwrap()
-                    .run_collect_rows()
-                    .unwrap(),
-                vec![vec![crate::Value::from_i64(28), crate::Value::from_i64(19)]]
-            );
-            assert_eq!(
-                conn.prepare(
-                    "SELECT version FROM __turso_internal_frontends WHERE frontend = 'test'"
-                )
-                .unwrap()
-                .run_collect_rows()
-                .unwrap(),
-                vec![vec![crate::Value::from_i64(2)]]
-            );
-            let sql = conn
-                .prepare("SELECT sql FROM sqlite_schema WHERE name = '__turso_internal_test'")
-                .unwrap()
-                .run_collect_rows()
-                .unwrap();
-            assert!(!sql[0][0].to_string().contains("/* test */"));
-            for sql in [
-                "INSERT INTO __turso_internal_test VALUES (1, 2, 3)",
-                "UPDATE __turso_internal_test SET value = 0",
-                "DELETE FROM __turso_internal_test",
-                "DROP TABLE __turso_internal_test",
-                "ALTER TABLE __turso_internal_test ADD COLUMN forbidden",
-                "CREATE INDEX forbidden ON __turso_internal_test(value)",
-            ] {
-                assert!(conn.prepare(sql).is_err(), "{sql}");
-            }
-            conn.close().unwrap();
-        }
-    }
-
-    #[cfg(all(feature = "fs", not(target_family = "wasm")))]
-    #[test]
-    fn internal_migrations_survive_vacuum_without_reseeding() {
-        let dir = tempfile::tempdir().unwrap();
-        let source_path = dir.path().join("source.db");
-        let output_path = dir.path().join("output.db");
-        let io: Arc<dyn IO> = Arc::new(crate::PlatformIO::new().unwrap());
-        let dialect = Arc::new(TestDialect {
-            migrations: INTERNAL_TEST_MIGRATIONS,
-            ..Default::default()
-        });
-        let db = Database::open_file_with_flags(
-            io.clone(),
-            source_path.to_str().unwrap(),
-            OpenFlags::Create,
-            DatabaseOpts::new().with_vacuum(true),
-            None,
-            dialect.clone(),
-        )
-        .unwrap();
-        let conn = db.connect().unwrap();
-        conn.prepare_internal_root("UPDATE __turso_internal_test SET value = 23")
-            .unwrap()
-            .run_ignore_rows()
-            .unwrap();
-        conn.execute(format!("VACUUM INTO '{}'", output_path.display()))
-            .unwrap();
-        conn.execute("VACUUM").unwrap();
-
-        let output_db = Database::open_file(io, output_path.to_str().unwrap(), dialect).unwrap();
-        let output_conn = output_db.connect().unwrap();
-        for conn in [&conn, &output_conn] {
-            assert_eq!(
-                conn.prepare("SELECT value, extra FROM __turso_internal_test")
-                    .unwrap()
-                    .run_collect_rows()
-                    .unwrap(),
-                vec![vec![crate::Value::from_i64(23), crate::Value::from_i64(19)]]
-            );
-            let sql = conn
-                .prepare("SELECT sql FROM sqlite_schema WHERE name = '__turso_internal_test'")
-                .unwrap()
-                .run_collect_rows()
-                .unwrap();
-            assert!(!sql[0][0].to_string().contains("/* test */"));
-            conn.close().unwrap();
-        }
-    }
-
-    #[test]
-    fn failed_internal_migrations_roll_back_tables_and_versions() {
-        let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
-        let path = "frontend-migrations-rollback.db";
-        let dialect = Arc::new(TestDialect {
-            migrations: FAILED_INTERNAL_TEST_MIGRATIONS,
-            ..Default::default()
-        });
-        assert!(open_db(&io, path, dialect).is_err());
-        {
-            let db = open_db(&io, path, Arc::new(TestDialect::default())).unwrap();
-            let conn = db.connect().unwrap();
-            assert!(conn
-                .current_schema()
-                .get_table("__turso_internal_test")
-                .is_none());
-            assert!(conn
-                .current_schema()
-                .get_table("__turso_internal_frontends")
-                .is_none());
-            conn.close().unwrap();
-        }
-        let db = open_db(
-            &io,
-            path,
-            Arc::new(TestDialect {
-                migrations: INTERNAL_TEST_MIGRATIONS,
-                ..Default::default()
-            }),
-        )
-        .unwrap();
-        let conn = db.connect().unwrap();
-        assert_eq!(
-            conn.prepare("SELECT value, extra FROM __turso_internal_test")
-                .unwrap()
-                .run_collect_rows()
-                .unwrap(),
-            vec![vec![crate::Value::from_i64(12), crate::Value::from_i64(19)]]
-        );
-        conn.close().unwrap();
-    }
-
-    #[cfg(feature = "fs")]
-    #[test]
-    fn internal_migrations_allow_readonly_reopen_but_reject_pending_upgrade() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("readonly.db");
-        let path = path.to_str().unwrap();
-        let io: Arc<dyn IO> = Arc::new(crate::PlatformIO::new().unwrap());
-        let first = Arc::new(TestDialect {
-            migrations: &INTERNAL_TEST_MIGRATIONS[..1],
-            ..Default::default()
-        });
-        {
-            let db = Database::open_file(io.clone(), path, first.clone()).unwrap();
-            db.connect().unwrap().close().unwrap();
-        }
-        {
-            let db = Database::open_file_with_flags(
-                io.clone(),
-                path,
-                OpenFlags::ReadOnly,
-                DatabaseOpts::new(),
-                None,
-                first,
-            )
-            .unwrap();
-            let conn = db.connect().unwrap();
-            assert_eq!(
-                conn.prepare("SELECT value FROM __turso_internal_test")
-                    .unwrap()
-                    .run_collect_rows()
-                    .unwrap(),
-                vec![vec![crate::Value::from_i64(7)]]
-            );
-            conn.close().unwrap();
-        }
-        let error = Database::open_file_with_flags(
-            io,
-            path,
-            OpenFlags::ReadOnly,
-            DatabaseOpts::new(),
-            None,
-            Arc::new(TestDialect {
-                migrations: INTERNAL_TEST_MIGRATIONS,
-                ..Default::default()
-            }),
-        )
-        .unwrap_err();
-        assert!(error
-            .to_string()
-            .contains("needs initialization on a writable database"));
-    }
-
-    #[test]
-    fn internal_migrations_upgrade_after_mvcc_recovery() {
-        let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
-        let path = "frontend-migrations-mvcc.db";
-        {
-            let db = open_db(
-                &io,
-                path,
-                Arc::new(TestDialect {
-                    migrations: &INTERNAL_TEST_MIGRATIONS[..1],
-                    ..Default::default()
-                }),
-            )
-            .unwrap();
-            let conn = db.connect().unwrap();
-            conn.execute("PRAGMA journal_mode = mvcc").unwrap();
-            conn.prepare_internal_root("UPDATE __turso_internal_test SET value = 23")
-                .unwrap()
-                .run_ignore_rows()
-                .unwrap();
-            conn.close().unwrap();
-        }
-        for _ in 0..2 {
-            let db = open_db(
-                &io,
-                path,
-                Arc::new(TestDialect {
-                    migrations: INTERNAL_TEST_MIGRATIONS,
-                    ..Default::default()
-                }),
-            )
-            .unwrap();
-            let conn = db.connect().unwrap();
-            assert_eq!(
-                conn.prepare("SELECT value, extra FROM __turso_internal_test")
-                    .unwrap()
-                    .run_collect_rows()
-                    .unwrap(),
-                vec![vec![crate::Value::from_i64(28), crate::Value::from_i64(19)]]
-            );
-            conn.close().unwrap();
-        }
-    }
-
-    #[test]
-    fn failed_internal_upgrade_preserves_existing_rows_and_version() {
-        let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
-        let path = "frontend-upgrade-rollback.db";
-        let first = Arc::new(TestDialect {
-            migrations: &INTERNAL_TEST_MIGRATIONS[..1],
-            ..Default::default()
-        });
-        {
-            let db = open_db(&io, path, first.clone()).unwrap();
-            db.connect().unwrap().close().unwrap();
-        }
-        assert!(open_db(
-            &io,
-            path,
-            Arc::new(TestDialect {
-                migrations: FAILED_INTERNAL_TEST_MIGRATIONS,
-                ..Default::default()
-            }),
-        )
-        .is_err());
-        let db = open_db(&io, path, first).unwrap();
-        let conn = db.connect().unwrap();
-        assert_eq!(
-            conn.prepare("SELECT value FROM __turso_internal_test")
-                .unwrap()
-                .run_collect_rows()
-                .unwrap(),
-            vec![vec![crate::Value::from_i64(7)]]
-        );
-        assert_eq!(
-            conn.prepare("SELECT version FROM __turso_internal_frontends WHERE frontend = 'test'")
-                .unwrap()
-                .run_collect_rows()
-                .unwrap(),
-            vec![vec![crate::Value::from_i64(1)]]
-        );
-        conn.close().unwrap();
-    }
-
-    const INTERNAL_TEST_MIGRATIONS: &[InternalMigration] = &[
-        InternalMigration {
-            version: 1,
-            statements: &[
-                "CREATE TABLE __turso_internal_test (id INTEGER PRIMARY KEY, value INTEGER)",
-                "INSERT INTO __turso_internal_test VALUES (1, 7)",
-                "CREATE INDEX __turso_internal_test_value ON __turso_internal_test(value)",
-            ],
-        },
-        InternalMigration {
-            version: 2,
-            statements: &[
-                "ALTER TABLE __turso_internal_test ADD COLUMN extra INTEGER DEFAULT 19",
-                "ALTER TABLE __turso_internal_test RENAME COLUMN extra TO revision",
-                "ALTER TABLE __turso_internal_test RENAME COLUMN revision TO extra",
-                "UPDATE __turso_internal_test SET value = value + 5",
-            ],
-        },
-    ];
-
-    const FAILED_INTERNAL_TEST_MIGRATIONS: &[InternalMigration] = &[
-        InternalMigration {
-            version: 1,
-            statements: INTERNAL_TEST_MIGRATIONS[0].statements,
-        },
-        InternalMigration {
-            version: 2,
-            statements: &[
-                "UPDATE __turso_internal_test SET value = 100",
-                "INSERT INTO missing_table VALUES (1)",
-            ],
-        },
-    ];
 }

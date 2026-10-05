@@ -1,12 +1,13 @@
 use std::num::NonZero;
 use std::sync::{
     atomic::{AtomicUsize, Ordering},
-    Arc, Mutex,
+    Arc,
 };
 
 use async_trait::async_trait;
 use futures::stream;
 use tokio::net::TcpListener;
+use tokio::sync::Mutex;
 use tracing::{error, info};
 use turso_core::Value;
 use turso_pg::{split_statements, Connection, PgConnection};
@@ -178,7 +179,7 @@ impl SimpleQueryHandler for TursoPgHandler {
     where
         C: ClientInfo + Unpin + Send + Sync,
     {
-        let conn = self.conn.lock().unwrap().clone();
+        let conn = self.conn.lock().await;
 
         // Per the PostgreSQL simple query protocol, a query string may contain
         // multiple semicolon-separated statements. Split and execute each one.
@@ -191,14 +192,14 @@ impl SimpleQueryHandler for TursoPgHandler {
                 .prepare(sql)
                 .map_err(|e| PgWireError::UserError(Box::new(error_info(&e.to_string()))))?;
 
-            self.cleanup_dropped_schema_file(sql);
-
-            if stmt.num_columns() == 0 || is_pg_non_query(sql) {
-                responses.push(execute_non_query(&mut stmt, sql)?);
+            let response = if stmt.num_columns() == 0 || is_pg_non_query(sql) {
+                execute_non_query(&mut stmt, sql).await?
             } else {
                 let header = Arc::new(build_field_info(&stmt, &Format::UnifiedText));
-                responses.push(execute_query(&mut stmt, header)?);
-            }
+                execute_query(&mut stmt, header).await?
+            };
+            self.cleanup_dropped_schema_file(sql);
+            responses.push(response);
         }
 
         Ok(responses)
@@ -223,25 +224,24 @@ impl ExtendedQueryHandler for TursoPgHandler {
     where
         C: ClientInfo + Unpin + Send + Sync,
     {
-        let conn = self.conn.lock().unwrap().clone();
+        let conn = self.conn.lock().await;
         let query = &portal.statement.statement;
 
         let mut stmt = conn
             .prepare(query)
             .map_err(|e| PgWireError::UserError(Box::new(error_info(&e.to_string()))))?;
 
-        // Clean up schema file after successful DROP SCHEMA
-        self.cleanup_dropped_schema_file(query);
-
         // Bind parameters from the portal
         bind_portal_parameters(&mut stmt, portal)?;
 
         if stmt.num_columns() == 0 || is_pg_non_query(query) {
-            return execute_non_query(&mut stmt, query);
+            let response = execute_non_query(&mut stmt, query).await?;
+            self.cleanup_dropped_schema_file(query);
+            return Ok(response);
         }
 
         let header = Arc::new(build_field_info(&stmt, &portal.result_column_format));
-        execute_query(&mut stmt, header)
+        execute_query(&mut stmt, header).await
     }
 
     async fn do_describe_statement<C>(
@@ -252,7 +252,7 @@ impl ExtendedQueryHandler for TursoPgHandler {
     where
         C: ClientInfo + Unpin + Send + Sync,
     {
-        let conn = self.conn.lock().unwrap().clone();
+        let conn = self.conn.lock().await;
         let stmt = conn
             .prepare(&target.statement)
             .map_err(|e| PgWireError::UserError(Box::new(error_info(&e.to_string()))))?;
@@ -275,7 +275,7 @@ impl ExtendedQueryHandler for TursoPgHandler {
     where
         C: ClientInfo + Unpin + Send + Sync,
     {
-        let conn = self.conn.lock().unwrap().clone();
+        let conn = self.conn.lock().await;
         let stmt = conn
             .prepare(&portal.statement.statement)
             .map_err(|e| PgWireError::UserError(Box::new(error_info(&e.to_string()))))?;
@@ -383,39 +383,67 @@ fn scalar_pg_type_to_array_type(scalar: &Type) -> Type {
 }
 
 /// Execute a query that returns rows and build a Query response.
-fn execute_query(
+async fn execute_query(
     stmt: &mut turso_core::Statement,
     header: Arc<Vec<FieldInfo>>,
 ) -> PgWireResult<Response> {
     let mut rows: Vec<PgWireResult<DataRow>> = Vec::new();
     let header_clone = header.clone();
 
-    stmt.run_with_row_callback(|row| {
-        let mut encoder = DataRowEncoder::new(header_clone.clone());
-        for (i, val) in row.get_values().enumerate() {
-            let pg_type = header_clone
-                .get(i)
-                .map(|fi| fi.datatype().clone())
-                .unwrap_or(Type::TEXT);
-            encode_value(&mut encoder, val, &pg_type)?;
+    loop {
+        let result = stmt
+            .run_with_row_callback_nonblock(|row| {
+                let mut encoder = DataRowEncoder::new(header_clone.clone());
+                for (i, val) in row.get_values().enumerate() {
+                    let pg_type = header_clone
+                        .get(i)
+                        .map(|fi| fi.datatype().clone())
+                        .unwrap_or(Type::TEXT);
+                    encode_value(&mut encoder, val, &pg_type)?;
+                }
+                rows.push(encoder.finish());
+                Ok(())
+            })
+            .map_err(|e| PgWireError::UserError(Box::new(error_info(&e.to_string()))))?;
+        match result {
+            turso_core::IOResult::Done(()) => break,
+            turso_core::IOResult::IO(io) => wait_for_io(stmt, io).await?,
         }
-        rows.push(encoder.finish());
-        Ok(())
-    })
-    .map_err(|e| PgWireError::UserError(Box::new(error_info(&e.to_string()))))?;
+    }
 
     let data_stream = stream::iter(rows);
     Ok(Response::Query(QueryResponse::new(header, data_stream)))
 }
 
 /// Execute a non-SELECT statement and build an Execution response.
-fn execute_non_query(stmt: &mut turso_core::Statement, query: &str) -> PgWireResult<Response> {
-    stmt.run_ignore_rows()
-        .map_err(|e| PgWireError::UserError(Box::new(error_info(&e.to_string()))))?;
+async fn execute_non_query(
+    stmt: &mut turso_core::Statement,
+    query: &str,
+) -> PgWireResult<Response> {
+    loop {
+        match stmt
+            .run_ignore_rows_nonblock()
+            .map_err(|e| PgWireError::UserError(Box::new(error_info(&e.to_string()))))?
+        {
+            turso_core::IOResult::Done(()) => break,
+            turso_core::IOResult::IO(io) => wait_for_io(stmt, io).await?,
+        }
+    }
 
     let affected = stmt.n_change();
     let tag = command_tag(query, affected as usize);
     Ok(Response::Execution(tag))
+}
+
+async fn wait_for_io(
+    stmt: &turso_core::Statement,
+    completion: turso_core::types::IOCompletions,
+) -> PgWireResult<()> {
+    let io = stmt.get_pager().io.clone();
+    tokio::task::spawn_blocking(move || completion.wait(io.as_ref()))
+        .await
+        .map_err(|e| PgWireError::UserError(Box::new(error_info(&e.to_string()))))?
+        .map_err(|e| PgWireError::UserError(Box::new(error_info(&e.to_string()))))
 }
 
 /// Extract parameters from a Portal and bind them to a prepared statement.

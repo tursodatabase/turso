@@ -70,8 +70,7 @@ fn validate(
     conn: &Arc<Connection>,
 ) -> Result<()> {
     // Check if this is a system table that should be protected from direct writes
-    if !resolver.allow_internal_table_writes
-        && !conn.is_nested_stmt()
+    if !conn.is_nested_stmt()
         && !conn.is_mvcc_bootstrap_connection()
         && !crate::schema::allow_user_dml(table_name)
     {

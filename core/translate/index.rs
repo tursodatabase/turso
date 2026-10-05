@@ -57,7 +57,6 @@ fn validate(
     original_idx_name: &QualifiedName,
     using: &Option<ast::Name>,
     with_clause: &[(ast::Name, Box<Expr>)],
-    allow_internal_table_writes: bool,
     connection: &Arc<crate::Connection>,
 ) -> crate::Result<()> {
     if !connection.experimental_index_method_enabled()
@@ -73,7 +72,6 @@ fn validate(
     if RESERVED_TABLE_PREFIXES
         .iter()
         .any(|prefix| idx_name.starts_with(prefix) || tbl_name.starts_with(prefix))
-        && !allow_internal_table_writes
         && !connection.is_nested_stmt()
     {
         bail_parse_error!(
@@ -121,7 +119,6 @@ pub fn translate_create_index(
         &original_idx_name,
         &using,
         &with_clause,
-        resolver.allow_internal_table_writes,
         connection,
     )?;
     let opts = ProgramBuilderOpts::new(5, 40, 5);
