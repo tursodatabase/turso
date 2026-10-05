@@ -3342,6 +3342,13 @@ impl Program {
         if matches!(state.active_op_state.state, ActiveOpState::Function(_)) {
             state.active_op_state.clear();
         }
+        if let Err(err) = execute::cleanup_subprogram_state(self, state) {
+            capture_abort_error(
+                &mut abort_error,
+                err,
+                "Failed to clean up subprogram during abort",
+            );
+        }
         // RAISE(IGNORE) rolls nothing back — halt() already staged the
         // trigger's index-method writes and the kept rows keep their index
         // entries — so it must not discard staged index-method work here.

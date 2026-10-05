@@ -1094,6 +1094,158 @@ mod tests {
         }
     }
 
+    #[test]
+    fn dialect_scalar_function_in_trigger_releases_helpers_before_rollback() {
+        for journal_mode in ["wal", "mvcc"] {
+            for nested_trigger in [false, true] {
+                for explicit_transaction in [false, true] {
+                    for cancellation in [
+                        "reset",
+                        "drop",
+                        "error",
+                        "io_error",
+                        "reset_io_error",
+                        "drop_io_error",
+                        "interrupt",
+                    ] {
+                        let case = format!(
+                            "{journal_mode}: {nested_trigger}: {explicit_transaction}: {cancellation}"
+                        );
+                        let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+                        let dialect = Arc::new(TestDialect::default());
+                        let db =
+                            open_db(&io, "dialect-trigger-cleanup.db", dialect.clone()).unwrap();
+                        let conn = db.connect().unwrap();
+                        conn.execute(format!("PRAGMA journal_mode = {journal_mode}"))
+                            .unwrap();
+                        conn.execute("CREATE TABLE t (x INTEGER)").unwrap();
+                        conn.execute("INSERT INTO t VALUES (2), (11)").unwrap();
+                        conn.execute("CREATE TABLE output (x INTEGER PRIMARY KEY)")
+                            .unwrap();
+                        conn.execute("CREATE TABLE trigger_output (x INTEGER PRIMARY KEY)")
+                            .unwrap();
+                        let offset = if cancellation == "error" { -1 } else { 3 };
+                        if nested_trigger {
+                            conn.execute(format!(
+                                "CREATE TRIGGER inner_trigger AFTER INSERT ON trigger_output BEGIN \
+                                    SELECT test_nested_sum({offset}); \
+                                END"
+                            ))
+                            .unwrap();
+                        }
+                        let scalar_call = if nested_trigger {
+                            String::new()
+                        } else {
+                            format!("SELECT test_nested_sum({offset});")
+                        };
+                        conn.execute(format!(
+                            "CREATE TRIGGER outer_trigger AFTER INSERT ON output \
+                                WHEN new.x = 100 BEGIN \
+                                    INSERT INTO trigger_output VALUES (200); \
+                                    {scalar_call} \
+                                END"
+                        ))
+                        .unwrap();
+                        if explicit_transaction {
+                            conn.execute("BEGIN").unwrap();
+                        }
+                        conn.execute("INSERT INTO output VALUES (7), (19)").unwrap();
+                        let total_changes_before = conn.total_changes();
+                        if cancellation == "interrupt" {
+                            conn.set_progress_handler(1, Some(Box::new(|| false)));
+                        }
+                        let mut statement =
+                            conn.prepare("INSERT INTO output VALUES (100)").unwrap();
+                        assert!(matches!(statement.step().unwrap(), crate::StepResult::IO));
+                        let completion = dialect.scalar_completions.lock().pop().unwrap();
+                        if matches!(
+                            cancellation,
+                            "io_error" | "reset_io_error" | "drop_io_error"
+                        ) {
+                            completion.error(crate::error::CompletionError::IOError(
+                                std::io::ErrorKind::Other,
+                                "test scalar I/O",
+                            ));
+                        } else {
+                            completion.complete(0);
+                        }
+                        assert_eq!(statement.n_change(), 1);
+                        assert!(conn.is_nested_stmt());
+
+                        match cancellation {
+                            "reset" => statement.reset().unwrap(),
+                            "drop" | "drop_io_error" => drop(statement),
+                            "reset_io_error" => {
+                                let error = statement.reset().unwrap_err();
+                                assert!(error.to_string().contains("test scalar I/O"));
+                            }
+                            "error" => {
+                                let error = statement.step().unwrap_err();
+                                assert!(error.to_string().contains("nonnegative offset"));
+                            }
+                            "io_error" => {
+                                let error = statement.step().unwrap_err();
+                                assert!(error.to_string().contains("test scalar I/O"));
+                            }
+                            "interrupt" => {
+                                conn.interrupt();
+                                assert!(matches!(
+                                    statement.step().unwrap(),
+                                    crate::StepResult::Interrupt
+                                ));
+                                assert!(!conn.is_nested_stmt());
+                                statement.reset().unwrap();
+                            }
+                            _ => unreachable!(),
+                        }
+                        assert!(!conn.is_nested_stmt(), "{case}");
+                        assert!(conn.executing_triggers.read().is_empty(), "{case}");
+                        assert_eq!(conn.last_insert_rowid(), 100, "{case}");
+                        assert_eq!(conn.changes(), 2, "{case}");
+                        assert_eq!(conn.total_changes() - total_changes_before, 1, "{case}");
+                        assert_eq!(conn.get_auto_commit(), !explicit_transaction, "{case}");
+                        let counts = conn
+                            .prepare(
+                                "SELECT count(*) FROM output \
+                                    UNION ALL SELECT count(*) FROM trigger_output",
+                            )
+                            .unwrap()
+                            .run_collect_rows()
+                            .unwrap();
+                        assert_eq!(
+                            counts,
+                            vec![
+                                vec![crate::Value::from_i64(2)],
+                                vec![crate::Value::from_i64(0)]
+                            ],
+                            "{case}"
+                        );
+                        if explicit_transaction {
+                            conn.execute("COMMIT").unwrap();
+                        }
+                        conn.execute("INSERT INTO output VALUES (29)").unwrap();
+                        conn.close().unwrap();
+                        let reopened = db.connect().unwrap();
+                        assert_eq!(
+                            reopened
+                                .prepare("SELECT x FROM output ORDER BY x")
+                                .unwrap()
+                                .run_collect_rows()
+                                .unwrap(),
+                            vec![
+                                vec![crate::Value::from_i64(7)],
+                                vec![crate::Value::from_i64(19)],
+                                vec![crate::Value::from_i64(29)],
+                            ],
+                            "{case}"
+                        );
+                        reopened.close().unwrap();
+                    }
+                }
+            }
+        }
+    }
+
     #[cfg(feature = "io_memory_yield")]
     #[test]
     fn dialect_scalar_function_propagates_nested_statement_io() {
