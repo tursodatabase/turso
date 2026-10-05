@@ -10407,8 +10407,6 @@ impl RowidAllocator {
     }
 
     pub fn rowid_ceiling_rules_out(&self, rowid: i64) -> bool {
-        // A ceiling <= 0 is not a bound. Keys can sit to its right.
-        //
         //   btree=-5 inserted=0          btree=5 inserted=200
         //   -5  -3   0   3               1   5  100  200  201
         //   [search every probe]         [search]      [skip]
