@@ -166,7 +166,7 @@ impl Drop for SchemaReparseGuard {
     }
 }
 
-#[derive(Debug, Default, Clone)]
+#[derive(Debug, Default)]
 pub struct PrepareOptions {
     pub unqualified_database_search_path: Option<Vec<String>>,
 }
@@ -1023,7 +1023,7 @@ impl Connection {
                 drop(syms);
                 let cmd = {
                     crate::stack::trace_stack!("schema_retry_parse");
-                    let (cmd, _) = self.parse_sql_with_origin(input, origin)?;
+                    let (cmd, _) = self.parse_sql(input)?;
                     let Some(cmd) = cmd else {
                         return Err(err);
                     };
@@ -1058,7 +1058,7 @@ impl Connection {
     }
 
     pub fn prepare_sqlite(self: &Arc<Connection>, sql: impl AsRef<str>) -> Result<Statement> {
-        self.prepare_with_origin(sql, StatementOrigin::SqliteRoot)
+        self.prepare_with_origin(sql, StatementOrigin::Root)
     }
 
     #[doc(hidden)]
@@ -1096,7 +1096,7 @@ impl Connection {
 
             let (cmd, byte_offset_end) = {
                 crate::stack::trace_stack!("parse");
-                self.parse_sql_with_origin(sql, origin)?
+                self.parse_sql(sql)?
             };
             let cmd = match cmd {
                 Some(cmd) => cmd,
@@ -1870,21 +1870,6 @@ impl Connection {
 
     pub(crate) fn parse_sql(&self, sql: &str) -> Result<(Option<Cmd>, usize)> {
         self.db.dialect().parse(sql)
-    }
-
-    pub(crate) fn parse_sql_with_origin(
-        &self,
-        sql: &str,
-        origin: StatementOrigin,
-    ) -> Result<(Option<Cmd>, usize)> {
-        if matches!(
-            origin,
-            StatementOrigin::SqliteRoot | StatementOrigin::InternalHelper
-        ) {
-            crate::dialect::sqlite::parse(sql)
-        } else {
-            self.parse_sql(sql)
-        }
     }
 
     #[cfg(feature = "fs")]

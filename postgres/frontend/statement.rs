@@ -1,9 +1,12 @@
 use std::collections::VecDeque;
+use std::ops::{Deref, DerefMut};
 use std::sync::Arc;
+use std::task::Waker;
+use std::time::Duration;
 
 use turso_core::{
     io::Buffer, types::IOResultOr, Completion, IOResult, LimboError, OpenFlags, PrepareOptions,
-    Result, Statement, StatementExecution,
+    Result, Row, Statement as CoreStatement, StepResult, Value,
 };
 use turso_parser::ast;
 use turso_pg_parser::translator::{PgCopyFromStmt, PgCreateSchemaStmt, PgDropSchemaStmt};
@@ -26,39 +29,164 @@ pub(crate) enum Plan {
 
 pub(crate) fn with_execution(
     conn: Arc<PgConnectionInner>,
-    mut stmt: Statement,
+    stmt: CoreStatement,
     plan: Option<Plan>,
 ) -> Statement {
-    if let Some(plan) = plan {
-        stmt.set_frontend_execution(Box::new(Execution {
-            conn,
-            plan,
-            operation: None,
-        }));
+    Statement {
+        conn,
+        inner: stmt,
+        execution_done: plan.is_none(),
+        plan,
+        operation: None,
+        io_completion: None,
+        interrupted: false,
+        query_timeout_override: None,
     }
-    stmt
 }
 
-struct Execution {
+pub struct Statement {
     conn: Arc<PgConnectionInner>,
-    plan: Plan,
+    inner: CoreStatement,
+    plan: Option<Plan>,
     operation: Option<Operation>,
+    execution_done: bool,
+    io_completion: Option<turso_core::types::IOCompletions>,
+    interrupted: bool,
+    query_timeout_override: Option<Option<Duration>>,
 }
 
-impl StatementExecution for Execution {
-    fn step(&mut self) -> IOResultOr<Option<Statement>> {
-        if self.operation.is_none() {
-            self.operation = Some(Operation::new(&self.conn, &self.plan)?);
-        }
-        let result = self.operation.as_mut().unwrap().step(&self.conn)?;
-        if matches!(result, IOResult::Done(_)) {
-            self.operation = None;
-        }
-        Ok(result)
+impl Statement {
+    pub fn step(&mut self) -> Result<StepResult> {
+        self.step_inner(None)
     }
 
-    fn reset(&mut self) {
+    pub fn step_with_waker(&mut self, waker: &Waker) -> Result<StepResult> {
+        self.step_inner(Some(waker))
+    }
+
+    fn step_inner(&mut self, waker: Option<&Waker>) -> Result<StepResult> {
+        match self.prepare_execution() {
+            Ok(IOResult::IO(io)) => {
+                io.set_waker(waker);
+                let result = if io.is_explicit_yield() {
+                    StepResult::Yield
+                } else {
+                    StepResult::IO
+                };
+                self.io_completion = Some(io);
+                Ok(result)
+            }
+            Ok(IOResult::Done(())) => match waker {
+                Some(waker) => self.inner.step_with_waker(waker),
+                None => self.inner.step(),
+            },
+            Err(err) if matches!(*err, LimboError::Interrupt) => Ok(StepResult::Interrupt),
+            Err(err) => Err(*err),
+        }
+    }
+
+    pub fn take_io_completions(&mut self) -> Option<turso_core::types::IOCompletions> {
+        self.io_completion
+            .take()
+            .or_else(|| self.inner.take_io_completions())
+    }
+
+    pub fn interrupt(&mut self) {
+        self.interrupted = true;
+        self.inner.interrupt();
+    }
+
+    pub fn set_query_timeout_override(&mut self, timeout: Option<Option<Duration>>) {
+        self.query_timeout_override = timeout;
+        self.inner.set_query_timeout_override(timeout);
+    }
+
+    pub fn reset(&mut self) -> Result<()> {
         self.operation = None;
+        self.io_completion = None;
+        self.execution_done = self.plan.is_none();
+        self.interrupted = false;
+        self.query_timeout_override = None;
+        self.inner.reset()
+    }
+
+    pub fn run_ignore_rows_nonblock(&mut self) -> IOResultOr<()> {
+        if let IOResult::IO(io) = self.prepare_execution()? {
+            return Ok(IOResult::IO(io));
+        }
+        self.inner.run_ignore_rows_nonblock()
+    }
+
+    pub fn run_with_row_callback_nonblock(
+        &mut self,
+        func: impl FnMut(&Row) -> Result<()>,
+    ) -> IOResultOr<()> {
+        if let IOResult::IO(io) = self.prepare_execution()? {
+            return Ok(IOResult::IO(io));
+        }
+        self.inner.run_with_row_callback_nonblock(func)
+    }
+
+    pub fn run_ignore_rows(&mut self) -> Result<()> {
+        self.prepare_execution_blocking()?;
+        self.inner.run_ignore_rows()
+    }
+
+    pub fn run_collect_rows(&mut self) -> Result<Vec<Vec<Value>>> {
+        self.prepare_execution_blocking()?;
+        self.inner.run_collect_rows()
+    }
+
+    pub fn run_with_row_callback(&mut self, func: impl FnMut(&Row) -> Result<()>) -> Result<()> {
+        self.prepare_execution_blocking()?;
+        self.inner.run_with_row_callback(func)
+    }
+
+    fn prepare_execution_blocking(&mut self) -> Result<()> {
+        loop {
+            match self.prepare_execution().map_err(|err| *err)? {
+                IOResult::Done(()) => return Ok(()),
+                IOResult::IO(io) => io.wait(self.conn.conn.get_pager().io.as_ref())?,
+            }
+        }
+    }
+
+    fn prepare_execution(&mut self) -> IOResultOr<()> {
+        if self.interrupted || self.conn.conn.is_interrupted() {
+            return Err(LimboError::Interrupt.into());
+        }
+        if self.execution_done {
+            return Ok(IOResult::Done(()));
+        }
+        if self.operation.is_none() {
+            self.operation = Some(Operation::new(&self.conn, self.plan.as_ref().unwrap())?);
+        }
+        let replacement = match self.operation.as_mut().unwrap().step(&self.conn)? {
+            IOResult::Done(replacement) => replacement,
+            IOResult::IO(io) => return Ok(IOResult::IO(io)),
+        };
+        if let Some(mut stmt) = replacement {
+            stmt.set_query_timeout_override(self.query_timeout_override);
+            self.inner = stmt;
+        }
+        self.operation = None;
+        self.io_completion = None;
+        self.execution_done = true;
+        Ok(IOResult::Done(()))
+    }
+}
+
+impl Deref for Statement {
+    type Target = CoreStatement;
+
+    fn deref(&self) -> &Self::Target {
+        &self.inner
+    }
+}
+
+impl DerefMut for Statement {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.inner
     }
 }
 
@@ -103,10 +231,27 @@ impl Operation {
             } => Ok(Self::Batch {
                 statements: statements
                     .iter()
-                    .map(|stmt| Sql::Translated(Box::new(stmt.clone()), options.clone()))
+                    .map(|stmt| {
+                        Sql::Translated(
+                            Box::new(stmt.clone()),
+                            PrepareOptions {
+                                unqualified_database_search_path: options
+                                    .unqualified_database_search_path
+                                    .clone(),
+                            },
+                        )
+                    })
                     .collect(),
                 current: None,
-                main: Some((main.clone(), input.clone(), options.clone())),
+                main: Some((
+                    main.clone(),
+                    input.clone(),
+                    PrepareOptions {
+                        unqualified_database_search_path: options
+                            .unqualified_database_search_path
+                            .clone(),
+                    },
+                )),
             }),
             Plan::SearchPath(path) => {
                 pg_conn.set_search_path(path.clone());

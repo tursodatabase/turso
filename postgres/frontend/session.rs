@@ -3,8 +3,8 @@ use std::sync::{Arc, Mutex};
 
 use crate::aliases;
 use crate::catalog::{self, PostgresDialect};
-use crate::statement::{with_execution, Plan};
-use turso_core::{Connection, LimboError, PrepareOptions, Result, Statement};
+use crate::statement::{with_execution, Plan, Statement};
+use turso_core::{Connection, LimboError, PrepareOptions, Result};
 use turso_parser::ast::{self};
 use turso_pg_parser::translator::{
     is_comment_on, is_refresh_matview, try_extract_copy_from, try_extract_create_schema,
@@ -192,12 +192,15 @@ fn prepare_statement(pg_conn: &Arc<PgConnectionInner>, sql: &str) -> Result<Stat
             unqualified_database_search_path: if path.is_empty() { None } else { Some(path) },
         }
     };
-    let plan = (!translated.prereqs.is_empty()).then(|| Plan::Prerequisites {
-        statements: translated.prereqs,
-        options: options.clone(),
-        main: Box::new(translated.cmd.clone()),
-        input: sql.to_string(),
-    });
+    let plan = (!translated.prereqs.is_empty() && matches!(translated.cmd, ast::Cmd::Stmt(_)))
+        .then(|| Plan::Prerequisites {
+            statements: translated.prereqs,
+            options: PrepareOptions {
+                unqualified_database_search_path: options.unqualified_database_search_path.clone(),
+            },
+            main: Box::new(translated.cmd.clone()),
+            input: sql.to_string(),
+        });
     let stmt = pg_conn
         .conn
         .prepare_translated_cmd_with_options(translated.cmd, sql, &options)?;
@@ -256,7 +259,11 @@ fn try_prepare_special(pg_conn: &Arc<PgConnectionInner>, sql: &str) -> Result<Op
 
     if let Some(show_stmt) = try_extract_show(&parse_result) {
         let pragma_sql = format!("PRAGMA {}", show_stmt.name);
-        return Ok(Some(pg_conn.conn.prepare(&pragma_sql)?));
+        return Ok(Some(with_execution(
+            pg_conn.clone(),
+            pg_conn.conn.prepare(&pragma_sql)?,
+            None,
+        )));
     }
 
     if let Some(stmt) = try_extract_create_schema(&parse_result) {
@@ -307,5 +314,9 @@ fn handle_pg_set(pg_conn: &Arc<PgConnectionInner>, set_stmt: &PgSetStmt) -> Resu
         LimboError::ParseError(format!("SET {}: no value provided", set_stmt.name))
     })?;
     let pragma_sql = format!("PRAGMA {} = {}", set_stmt.name, value.to_sql_string());
-    pg_conn.conn.prepare(&pragma_sql)
+    Ok(with_execution(
+        pg_conn.clone(),
+        pg_conn.conn.prepare(&pragma_sql)?,
+        None,
+    ))
 }

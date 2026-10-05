@@ -56,7 +56,6 @@ type StepResult = vdbe::StepResult;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum StatementOrigin {
     Root,
-    SqliteRoot,
     InternalHelper,
     Subprogram,
 }
@@ -291,11 +290,6 @@ fn combine_arithmetic_primitive(
     }
 }
 
-pub trait StatementExecution: Send + Sync {
-    fn step(&mut self) -> crate::types::IOResultOr<Option<Statement>>;
-    fn reset(&mut self);
-}
-
 pub struct Statement {
     pub(crate) program: vdbe::Program,
     state: vdbe::ProgramState,
@@ -331,8 +325,6 @@ pub struct Statement {
     /// True if this statement called `Connection::start_nested()` during
     /// construction and therefore must call `end_nested()` on drop.
     nested_guard_active: bool,
-    frontend_execution: Option<Box<dyn StatementExecution>>,
-    frontend_execution_done: bool,
 }
 
 crate::assert::assert_send_sync!(Statement);
@@ -414,18 +406,7 @@ impl Statement {
             is_blob_handle: false,
             nested_guard_active,
             analyze_refresh: None,
-            frontend_execution: None,
-            frontend_execution_done: false,
         }
-    }
-
-    pub fn set_frontend_execution(&mut self, execution: Box<dyn StatementExecution>) {
-        turso_assert!(matches!(
-            self.state.execution_state,
-            ProgramExecutionState::Init
-        ));
-        self.frontend_execution = Some(execution);
-        self.frontend_execution_done = false;
     }
 
     /// Mark this statement as the parked backing statement of an incremental
@@ -583,14 +564,6 @@ impl Statement {
     /// gated behind cheap flag tests and kept out of line. A row in the middle
     /// of a scan runs only the interpreter call and the result-row bookkeeping.
     fn _step(&mut self, waker: Option<&Waker>) -> Result<StepResult> {
-        if self.query_mode == QueryMode::Normal
-            && !self.frontend_execution_done
-            && self.frontend_execution.is_some()
-        {
-            if let Some(result) = self.drive_frontend_execution(waker)? {
-                return Ok(result);
-            }
-        }
         // ANALYZE already ran to Done; only its stats refresh is outstanding.
         // Checked first: the root-statement count was released at Done, so
         // `prepare_step` must not re-register this statement as a root.
@@ -626,47 +599,6 @@ impl Statement {
         self.finish_step(res, waker)
     }
 
-    fn drive_frontend_execution(&mut self, waker: Option<&Waker>) -> Result<Option<StepResult>> {
-        if self.program.connection.is_closed() {
-            return Err(LimboError::InternalError("Connection closed".to_string()));
-        }
-        self.arm_query_timeout_if_needed();
-        if self
-            .program
-            .maybe_request_interrupt(&mut self.state, self.pager.io.as_ref(), 0)
-        {
-            return Ok(Some(StepResult::Interrupt));
-        }
-        match self.frontend_execution.as_mut().unwrap().step() {
-            Err(err) => {
-                self.state.execution_state = ProgramExecutionState::Failed;
-                self.frontend_execution_done = true;
-                Err(*err)
-            }
-            Ok(crate::IOResult::IO(io)) => {
-                self.busy = true;
-                io.set_waker(waker);
-                if io.is_explicit_yield() {
-                    return Ok(Some(StepResult::Yield));
-                }
-                self.state.io_completions = Some(io);
-                Ok(Some(StepResult::IO))
-            }
-            Ok(crate::IOResult::Done(replacement)) => {
-                if let Some(mut replacement) = replacement {
-                    replacement.frontend_execution = self.frontend_execution.take();
-                    replacement.tail_offset = self.tail_offset;
-                    replacement.query_timeout_override = self.query_timeout_override;
-                    replacement.state.query_deadline = self.state.query_deadline;
-                    replacement.state.parameters = std::mem::take(&mut self.state.parameters);
-                    *self = replacement;
-                }
-                self.frontend_execution_done = true;
-                Ok(None)
-            }
-        }
-    }
-
     /// Advance the post-ANALYZE stats refresh. Returns `IO`/`Yield` while the
     /// `sqlite_stat1` scan waits and `Done` once it finished or gave up; the
     /// refresh is best-effort, so its errors are logged, not surfaced.
@@ -700,12 +632,7 @@ impl Statement {
     /// hand back to the caller when the statement must not run yet.
     #[inline(never)]
     fn prepare_step(&mut self, waker: Option<&Waker>) -> Result<Option<StepResult>> {
-        if !self.counted_as_active_root
-            && matches!(
-                self.origin,
-                StatementOrigin::Root | StatementOrigin::SqliteRoot
-            )
-        {
+        if !self.counted_as_active_root && matches!(self.origin, StatementOrigin::Root) {
             self.program.connection.start_root_statement()?;
             self.counted_as_active_root = true;
             // After the root count, so the checkpoint guard's subtraction
@@ -1094,7 +1021,7 @@ impl Statement {
         // same-version reprepare still refreshes it.
         conn.refresh_schema_from_shared_for_reprepare();
         let new_program = {
-            let (cmd, _) = conn.parse_sql_with_origin(&self.program.sql, self.origin)?;
+            let (cmd, _) = conn.parse_sql(&self.program.sql)?;
             let cmd = cmd.expect("Same SQL string should be able to be parsed");
 
             let syms = conn.syms.read();
@@ -1549,12 +1476,7 @@ impl Statement {
     }
 
     pub fn reset(&mut self) -> Result<()> {
-        let result = self.reset_internal(None, None, false);
-        if let Some(execution) = &mut self.frontend_execution {
-            execution.reset();
-        }
-        self.frontend_execution_done = false;
-        result
+        self.reset_internal(None, None, false)
     }
 
     /// If `Insn::SequenceBeginInnerTx` swapped the connection's mv_tx to
@@ -1851,7 +1773,6 @@ fn append_expanded_literal(out: &mut String, value: &Value) {
 
 impl Drop for Statement {
     fn drop(&mut self) {
-        self.frontend_execution = None;
         // Keep helper statements nested while drop-time reset/abort cleanup runs.
         // That cleanup consults `is_nested_stmt()` to decide whether top-level
         // transaction/savepoint finalization belongs to this statement or to its
@@ -2105,92 +2026,5 @@ mod tests {
             6,
             "cumulative metrics should include root and trigger writes"
         );
-    }
-
-    #[test]
-    fn frontend_execution_preserves_bindings_and_wakes_the_caller() {
-        use std::sync::atomic::{AtomicUsize, Ordering};
-        use std::task::{Wake, Waker};
-
-        struct WakeCount(AtomicUsize);
-
-        impl Wake for WakeCount {
-            fn wake(self: std::sync::Arc<Self>) {
-                self.0.fetch_add(1, Ordering::SeqCst);
-            }
-        }
-
-        let conn = open_test_connection().unwrap();
-        let completion = crate::Completion::new_write(|_| {});
-        let mut stmt = conn.prepare("SELECT ?1, ?2").unwrap();
-        stmt.bind_at(1.try_into().unwrap(), Value::from_i64(7))
-            .unwrap();
-        stmt.bind_at(2.try_into().unwrap(), Value::from_i64(19))
-            .unwrap();
-        let tail = stmt.tail_offset;
-        stmt.set_query_timeout_override(Some(None));
-        stmt.set_frontend_execution(Box::new(DeferredSelect {
-            conn: conn.clone(),
-            completion: completion.clone(),
-        }));
-        let wake_count = std::sync::Arc::new(WakeCount(AtomicUsize::new(0)));
-        let waker = Waker::from(wake_count.clone());
-        assert!(matches!(
-            stmt.step_with_waker(&waker).unwrap(),
-            StepResult::IO
-        ));
-        assert!(stmt.take_io_completions().is_some());
-        assert_eq!(wake_count.0.load(Ordering::SeqCst), 0);
-        completion.complete(0);
-        assert_eq!(wake_count.0.load(Ordering::SeqCst), 1);
-        assert_eq!(
-            stmt.run_collect_rows().unwrap(),
-            vec![vec![Value::from_i64(19), Value::from_i64(7)]]
-        );
-        assert_eq!(stmt.tail_offset, tail);
-        assert_eq!(stmt.query_timeout_override, Some(None));
-
-        stmt.reset().unwrap();
-        assert!(matches!(
-            stmt.run_ignore_rows_nonblock().unwrap(),
-            crate::IOResult::IO(_)
-        ));
-        stmt.take_io_completions();
-    }
-
-    #[test]
-    fn explain_does_not_run_frontend_execution() {
-        let conn = open_test_connection().unwrap();
-        let mut stmt = conn.prepare("EXPLAIN SELECT 7, 19").unwrap();
-        stmt.set_frontend_execution(Box::new(DeferredSelect {
-            conn,
-            completion: crate::Completion::new_wait(),
-        }));
-        assert!(matches!(
-            stmt.run_ignore_rows_nonblock().unwrap(),
-            crate::IOResult::Done(())
-        ));
-    }
-
-    struct DeferredSelect {
-        conn: Arc<crate::Connection>,
-        completion: crate::Completion,
-    }
-
-    impl StatementExecution for DeferredSelect {
-        fn step(&mut self) -> crate::types::IOResultOr<Option<Statement>> {
-            if !self.completion.finished() {
-                return Ok(crate::IOResult::IO(crate::types::IOCompletions(
-                    self.completion.clone(),
-                )));
-            }
-            Ok(crate::IOResult::Done(Some(
-                self.conn.prepare("SELECT ?2, ?1")?,
-            )))
-        }
-
-        fn reset(&mut self) {
-            self.completion = crate::Completion::new_wait();
-        }
     }
 }

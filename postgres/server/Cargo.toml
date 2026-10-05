@@ -15,7 +15,7 @@ anyhow.workspace = true
 async-trait = "0.1"
 futures = { workspace = true }
 pgwire = "0.36"
-tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "macros", "signal", "sync"] }
+tokio = { version = "1", features = ["rt-multi-thread", "net", "io-util", "macros", "signal", "sync", "time"] }
 tracing = { workspace = true }
 turso_core = { workspace = true, default-features = true, features = [
     "conn_raw_api",

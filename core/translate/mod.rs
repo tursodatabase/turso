@@ -120,11 +120,7 @@ pub fn translate(
         // Engine-generated helper statements are always SQLite text and
         // must resolve functions with SQLite semantics regardless of the
         // database's dialect — the same invariant as unmarked schema rows.
-        if matches!(
-            origin,
-            crate::statement::StatementOrigin::InternalHelper
-                | crate::statement::StatementOrigin::SqliteRoot
-        ) {
+        if matches!(origin, crate::statement::StatementOrigin::InternalHelper) {
             Arc::new(crate::dialect::SqliteDialect) as Arc<dyn crate::dialect::Dialect>
         } else {
             connection.dialect()

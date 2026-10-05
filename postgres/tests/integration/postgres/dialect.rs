@@ -3727,6 +3727,86 @@ mod nonblocking {
         assert_eq!(copy.n_change(), 2);
     }
 
+    #[test]
+    fn copy_keeps_the_timeout_override_on_its_insert() {
+        let (io, conn) = open(false);
+        conn.execute("CREATE TABLE copied (id INTEGER PRIMARY KEY)")
+            .unwrap();
+        write_file(&io, "input.tsv", "7\n19\n");
+        let mut copy = conn.prepare("COPY copied FROM 'input.tsv'").unwrap();
+        copy.set_query_timeout_override(Some(Some(std::time::Duration::ZERO)));
+        loop {
+            io.allow_step.store(false, Ordering::SeqCst);
+            let result = copy.run_ignore_rows_nonblock();
+            io.allow_step.store(true, Ordering::SeqCst);
+            match result {
+                Ok(IOResult::IO(completion)) => completion.wait(io.as_ref()).unwrap(),
+                Err(err) => {
+                    assert!(matches!(*err, turso_core::LimboError::Interrupt));
+                    break;
+                }
+                Ok(IOResult::Done(())) => panic!("COPY must time out"),
+            }
+        }
+        let mut count = conn.prepare("SELECT COUNT(*) FROM copied").unwrap();
+        assert_eq!(drive(&io, &mut count).0, vec![vec![Value::from_i64(0)]]);
+        copy.reset().unwrap();
+        drive(&io, &mut copy);
+        assert_eq!(copy.n_change(), 2);
+    }
+
+    #[test]
+    fn frontend_step_registers_the_completion_waker() {
+        use std::sync::atomic::AtomicUsize;
+        use std::task::{Wake, Waker};
+
+        struct WakeCount(AtomicUsize);
+
+        impl Wake for WakeCount {
+            fn wake(self: Arc<Self>) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
+        let (io, conn) = open(false);
+        conn.execute("CREATE TABLE copied (id INTEGER PRIMARY KEY)")
+            .unwrap();
+        write_file(&io, "input.tsv", "7\n19\n");
+        let mut copy = conn.prepare("COPY copied FROM 'input.tsv'").unwrap();
+        let wake_count = Arc::new(WakeCount(AtomicUsize::new(0)));
+        let waker = Waker::from(wake_count.clone());
+        io.allow_step.store(false, Ordering::SeqCst);
+        let result = copy.step_with_waker(&waker);
+        io.allow_step.store(true, Ordering::SeqCst);
+        assert!(matches!(result.unwrap(), StepResult::IO));
+        let completion = copy.take_io_completions().unwrap();
+        assert_eq!(wake_count.0.load(Ordering::SeqCst), 0);
+        completion.wait(io.as_ref()).unwrap();
+        assert!(wake_count.0.load(Ordering::SeqCst) > 0);
+        drive(&io, &mut copy);
+        assert_eq!(copy.n_change(), 2);
+        let mut query = conn.prepare("SELECT id FROM copied ORDER BY id").unwrap();
+        assert_eq!(
+            drive(&io, &mut query).0,
+            vec![vec![Value::from_i64(7)], vec![Value::from_i64(19)]]
+        );
+    }
+
+    #[test]
+    fn explain_does_not_execute_the_statement() {
+        let (io, conn) = open(false);
+        conn.execute("CREATE TABLE explained (id INTEGER)").unwrap();
+        io.allow_step.store(false, Ordering::SeqCst);
+        let mut stmt = conn
+            .prepare("EXPLAIN INSERT INTO explained SELECT 7 UNION ALL SELECT 19")
+            .unwrap();
+        let rows = stmt.run_collect_rows().unwrap();
+        assert!(!rows.is_empty());
+        io.allow_step.store(true, Ordering::SeqCst);
+        let mut count = conn.prepare("SELECT COUNT(*) FROM explained").unwrap();
+        assert_eq!(drive(&io, &mut count).0, vec![vec![Value::from_i64(0)]]);
+    }
+
     fn open(mvcc: bool) -> (Arc<StepGuardedIO>, turso_pg::PgConnection) {
         let io = Arc::new(StepGuardedIO {
             inner: MemoryYieldIO::new(),
@@ -3749,7 +3829,7 @@ mod nonblocking {
         (io, conn)
     }
 
-    fn drive(io: &StepGuardedIO, stmt: &mut turso_core::Statement) -> (Vec<Vec<Value>>, usize) {
+    fn drive(io: &StepGuardedIO, stmt: &mut turso_pg::Statement) -> (Vec<Vec<Value>>, usize) {
         let mut rows = Vec::new();
         let mut yields = 0;
         loop {
