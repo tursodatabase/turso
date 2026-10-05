@@ -775,8 +775,13 @@ impl Connection {
         })
     }
 
+    /// Returns true once the per-connection temp database has been created.
+    pub(crate) fn has_temp_database(&self) -> bool {
+        self.temp.database.read().is_some()
+    }
+
     pub(crate) fn ensure_temp_database(&self) -> Result<()> {
-        if self.temp.database.read().is_some() {
+        if self.has_temp_database() {
             return Ok(());
         }
 

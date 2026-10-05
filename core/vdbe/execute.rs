@@ -4604,14 +4604,6 @@ pub fn op_transaction_inner(
             "Transaction instruction should not be used in trigger subprograms"
         );
     }
-    if *db == crate::TEMP_DB_ID {
-        program.connection.ensure_temp_database()?;
-    }
-    let pager = pager_for_db(program, pager, *db)?;
-    // Get the MvStore for the specific database (main or attached).
-    let mv_store = mv_store_for_db(program, state, *db);
-    let is_main_db = *db == crate::MAIN_DB_ID;
-    let is_secondary_db = !is_main_db;
     let write = matches!(
         tx_mode,
         TransactionMode::Write | TransactionMode::Concurrent
@@ -4621,6 +4613,26 @@ pub fn op_transaction_inner(
     // `write_databases` count for same-connection writer blocking and
     // active-writer cleanup.
     let statement_writes_db = program.write_databases.get(*db);
+    if *db == crate::TEMP_DB_ID {
+        // BEGIN IMMEDIATE / EXCLUSIVE / CONCURRENT emit a write Transaction for
+        // temp without touching it. Like SQLite (OP_Transaction is a no-op when
+        // the temp btree is not open), don't create the temp database just to
+        // lock it: it is private to this connection, so there is no lock to
+        // contend for. A later statement that uses temp creates it and begins
+        // its transaction lazily, exactly as after BEGIN DEFERRED. Creating it
+        // here would cost a temp file, a page 1 write and an fsync on every
+        // new connection, plus tearing it down on close.
+        if write && !statement_writes_db && !program.connection.has_temp_database() {
+            state.pc += 1;
+            return Ok(InsnFunctionStepResult::Step);
+        }
+        program.connection.ensure_temp_database()?;
+    }
+    let pager = pager_for_db(program, pager, *db)?;
+    // Get the MvStore for the specific database (main or attached).
+    let mv_store = mv_store_for_db(program, state, *db);
+    let is_main_db = *db == crate::MAIN_DB_ID;
+    let is_secondary_db = !is_main_db;
     loop {
         match *state.active_op_state.transaction() {
             OpTransactionState::Start => {
