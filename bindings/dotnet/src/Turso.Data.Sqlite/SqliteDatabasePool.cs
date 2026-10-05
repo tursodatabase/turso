@@ -10,11 +10,12 @@ namespace Turso.Data.Sqlite;
 /// Opening a native database reads the schema and replays the WAL, which dominates the cost of
 /// <see cref="SqliteConnection.Open"/>. The pool keeps one opened database per file and gives each
 /// <see cref="SqliteConnection"/> a fresh native connection on it, so per-connection state such as
-/// PRAGMAs, functions and temp tables never leaks between opens. Each entry also holds one idle
-/// anchor connection: closing the last connection to a database checkpoints the whole WAL, and the
-/// anchor keeps that from happening on every <see cref="SqliteConnection.Close"/>.
+/// PRAGMAs, functions and temp tables never leaks between opens. Native connections are never
+/// reused, so this pools databases rather than connections. Each entry also holds one idle anchor
+/// connection: closing the last connection to a database checkpoints the whole WAL, and the anchor
+/// keeps that from happening on every <see cref="SqliteConnection.Close"/>.
 /// </remarks>
-internal static class SqliteConnectionPool
+internal static class SqliteDatabasePool
 {
     private static readonly object Gate = new();
     private static readonly Dictionary<string, Entry> Entries = new(

@@ -171,7 +171,7 @@ public partial class SqliteConnection : DbConnection
         try
         {
             _database = CanPool(_connectionOptions, filename, sharedMemoryPath)
-                ? SqliteConnectionPool.Connect(filename)
+                ? SqliteDatabasePool.Connect(filename)
                 : TursoBindings.OpenDatabase(filename);
             _dataSource = filename;
             _readOnly = readOnly;
@@ -324,7 +324,7 @@ public partial class SqliteConnection : DbConnection
     ///     Closes every pooled database that has no open connection. Databases still in use close
     ///     when their last connection does.
     /// </summary>
-    public static void ClearAllPools() => SqliteConnectionPool.ClearAll();
+    public static void ClearAllPools() => SqliteDatabasePool.ClearAll();
 
     /// <summary>
     ///     Closes the pooled database used by <paramref name="connection" /> once it has no open
@@ -348,7 +348,7 @@ public partial class SqliteConnection : DbConnection
         }
 
         if (filename is not null && !IsMemoryLike(filename))
-            SqliteConnectionPool.Clear(filename);
+            SqliteDatabasePool.Clear(filename);
     }
 
     public new virtual SqliteTransaction BeginTransaction()
