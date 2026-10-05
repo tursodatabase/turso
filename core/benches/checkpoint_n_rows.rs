@@ -1,9 +1,6 @@
 //! One `PRAGMA wal_checkpoint(PASSIVE)` after inserting N rows.
 //! Insert time is not measured. No helper racing writers.
 //!
-//! `one_delta_checkpoint_ns` times a second checkpoint after N rows sit under
-//! a held snapshot and `delta` more rows commit.
-//!
 //! ```text
 //! cargo bench -p turso_core --bench checkpoint_n_rows --profile bench-profile
 //! CHECKPOINT_N_ROWS_OUT=/path.csv cargo bench -p turso_core --bench checkpoint_n_rows --profile bench-profile
