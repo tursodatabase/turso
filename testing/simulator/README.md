@@ -136,3 +136,15 @@ Notes:
 - [(video) "Testing Distributed Systems w/ Deterministic Simulation" by Will Wilson](https://www.youtube.com/watch?v=4fFDFbi3toc)
 - [(video) FF meetup #4 - Deterministic simulation testing](https://www.youtube.com/live/29Vz5wkoUR8)
 - [(code) Hiisi: a proof of concept libSQL written in Rust following TigerBeetle-style with deterministic simulation testing](https://github.com/penberg/hiisi)
+
+## MVCC validation
+
+MVCC generation uses explicit INTEGER PRIMARY KEY values in INSERTs and UPSERTs.
+Its row model predicts implicit keys from the currently visible maximum, but
+MVCC allocation can retain reservations after rollback. Comparing those
+predicted keys would report a false failure. WAL generation retains implicit-key
+generation.
+
+The final integrity check uses Turso for MVCC and SQLite for WAL. Memory-I/O
+exports include the MVCC logical log so retained failure artifacts can be
+reopened with their committed state.
