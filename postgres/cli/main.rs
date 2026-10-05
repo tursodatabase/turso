@@ -146,9 +146,8 @@ fn auto_attach_pg_schemas(conn: &Connection, db_file: &str) {
             continue;
         };
         let path = entry.path().to_string_lossy().to_string();
-        let sql = format!("ATTACH '{path}' AS \"{schema}\"");
         tracing::info!("Auto-attaching PG schema '{}' from {}", schema, path);
-        if let Err(e) = conn.inner().execute(&sql) {
+        if let Err(e) = conn.attach_schema(schema, &path) {
             tracing::warn!("Failed to attach schema '{}': {}", schema, e);
         }
     }

@@ -2754,6 +2754,10 @@ impl Connection {
         self.db.get_database_canonical_path()
     }
 
+    pub fn database(&self) -> Arc<Database> {
+        self.db.clone()
+    }
+
     /// Check if a specific attached database is read only or not, by its index
     pub fn is_readonly(&self, index: usize) -> bool {
         match index {

@@ -1,7 +1,7 @@
 use std::num::NonZero;
 use std::sync::{
     atomic::{AtomicUsize, Ordering},
-    Arc, Mutex,
+    Arc,
 };
 
 use async_trait::async_trait;
@@ -28,7 +28,9 @@ use pgwire::types::format::FormatOptions;
 pub struct TursoPgServer {
     address: String,
     db_file: String,
-    conn: Arc<Mutex<PgConnection>>,
+    /// Not used to run queries. Each client gets its own session, opened
+    /// from this one so that all sessions share the database's schemas.
+    conn: PgConnection,
     interrupt_count: Arc<AtomicUsize>,
 }
 
@@ -42,7 +44,7 @@ impl TursoPgServer {
         Self {
             address,
             db_file,
-            conn: Arc::new(Mutex::new(conn)),
+            conn,
             interrupt_count,
         }
     }
@@ -58,25 +60,38 @@ impl TursoPgServer {
             "PostgreSQL server listening on {} (database: {})",
             self.address, self.db_file
         );
+        self.serve(listener).await
+    }
 
-        let factory = Arc::new(TursoPgFactory {
-            handler: Arc::new(TursoPgHandler {
-                conn: self.conn.clone(),
-                db_file: self.db_file.clone(),
-                query_parser: Arc::new(NoopQueryParser::new()),
-            }),
-        });
-
+    /// Accepts clients on `listener` until the server is interrupted. Each
+    /// client gets its own session, with its own transaction and settings.
+    pub async fn serve(&self, listener: TcpListener) -> anyhow::Result<()> {
         loop {
             tokio::select! {
                 result = listener.accept() => {
                     match result {
                         Ok((socket, addr)) => {
                             info!("PostgreSQL client connected from {}", addr);
-                            let factory_ref = factory.clone();
+                            let session = match self.conn.new_session() {
+                                Ok(session) => session,
+                                Err(e) => {
+                                    error!("Error opening a session for {}: {}", addr, e);
+                                    continue;
+                                }
+                            };
+                            let factory = Arc::new(TursoPgFactory {
+                                handler: Arc::new(TursoPgHandler {
+                                    conn: session.clone(),
+                                    db_file: self.db_file.clone(),
+                                    query_parser: Arc::new(NoopQueryParser::new()),
+                                }),
+                            });
                             tokio::spawn(async move {
-                                if let Err(e) = process_socket(socket, None, factory_ref).await {
+                                if let Err(e) = process_socket(socket, None, factory).await {
                                     error!("Error processing connection from {}: {}", addr, e);
+                                }
+                                if let Err(e) = session.close() {
+                                    error!("Error closing the session of {}: {}", addr, e);
                                 }
                             });
                         }
@@ -102,7 +117,7 @@ impl TursoPgServer {
 }
 
 struct TursoPgHandler {
-    conn: Arc<Mutex<PgConnection>>,
+    conn: PgConnection,
     db_file: String,
     query_parser: Arc<NoopQueryParser>,
 }
@@ -177,7 +192,7 @@ impl SimpleQueryHandler for TursoPgHandler {
     where
         C: ClientInfo + Unpin + Send + Sync,
     {
-        let conn = self.conn.lock().unwrap().clone();
+        let conn = &self.conn;
 
         // Per the PostgreSQL simple query protocol, a query string may contain
         // multiple semicolon-separated statements. Split and execute each one.
@@ -222,7 +237,7 @@ impl ExtendedQueryHandler for TursoPgHandler {
     where
         C: ClientInfo + Unpin + Send + Sync,
     {
-        let conn = self.conn.lock().unwrap().clone();
+        let conn = &self.conn;
         let query = &portal.statement.statement;
 
         let mut stmt = conn
@@ -251,7 +266,7 @@ impl ExtendedQueryHandler for TursoPgHandler {
     where
         C: ClientInfo + Unpin + Send + Sync,
     {
-        let conn = self.conn.lock().unwrap().clone();
+        let conn = &self.conn;
         let stmt = conn
             .prepare(&target.statement)
             .map_err(|e| PgWireError::UserError(Box::new(error_info(&e.to_string()))))?;
@@ -274,7 +289,7 @@ impl ExtendedQueryHandler for TursoPgHandler {
     where
         C: ClientInfo + Unpin + Send + Sync,
     {
-        let conn = self.conn.lock().unwrap().clone();
+        let conn = &self.conn;
         let stmt = conn
             .prepare(&portal.statement.statement)
             .map_err(|e| PgWireError::UserError(Box::new(error_info(&e.to_string()))))?;
