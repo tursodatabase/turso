@@ -40,7 +40,7 @@ use crate::{
         SeekResult,
     },
     util::IOExt,
-    vdbe::Register,
+    vdbe::{Register, ValueIteratorExt},
     Completion, MvStore,
 };
 use crate::{
@@ -48,7 +48,7 @@ use crate::{
     return_corrupt, return_if_io,
     types::{
         compare_immutable_iter, AsValueRef, IOResult, ImmutableRecord, ImmutableRecordRef, SeekKey,
-        SeekOp, Value, ValueRef,
+        SeekOp, Text, Value, ValueRef,
     },
     LimboError, Result,
 };
@@ -559,6 +559,13 @@ enum OverflowState {
         next: u32,
     },
     Done,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ColumnRead {
+    Decoded,
+    MissingColumn,
+    NullRow,
 }
 
 /// Holds a Record or RowId, so that these can be transformed into a SeekKey to restore
@@ -1532,10 +1539,25 @@ impl BTreeCursor {
                 // page that doesn't exist yet, and re-entry would skip the
                 // `is_none()` branch entirely.
                 let (page, c) = return_if_io!(self.read_page(start_next_page as i64));
-                let payload =
-                    crate::with_btree_allocation_site!(OverflowRead, payload.try_to_vec())?;
+                let record_size = payload.len() + remaining_to_read;
+                let record = self
+                    .get_immutable_record_or_create()?
+                    .expect("record was allocated above");
+                let mut record_payload = std::mem::replace(
+                    record.as_blob_mut(),
+                    <crate::alloc::Vec<u8> as crate::alloc::TursoAllocExt>::new(),
+                );
+                if record_payload.capacity() < record_size {
+                    record_payload = <crate::alloc::Vec<u8> as crate::alloc::TursoAllocExt>::new();
+                }
+                record_payload.clear();
+                crate::with_btree_allocation_site!(
+                    OverflowRead,
+                    record_payload.try_reserve_exact(record_size)
+                )?;
+                record_payload.extend_from_slice(payload);
                 self.read_overflow_state.replace(ReadPayloadOverflow {
-                    payload,
+                    payload: record_payload,
                     next_page: start_next_page,
                     remaining_to_read,
                     page,
@@ -1579,10 +1601,11 @@ impl BTreeCursor {
                 page,
             } = self.read_overflow_state.as_mut().unwrap();
             let buf = page.get_contents().as_ptr();
-            crate::with_btree_allocation_site!(
-                OverflowRead,
-                payload.try_extend(buf[4..4 + to_read].iter().copied())
-            )?;
+            turso_assert!(
+                payload.capacity() - payload.len() >= to_read,
+                "overflow payload was reserved for the whole record"
+            );
+            payload.extend_from_slice(&buf[4..4 + to_read]);
             *remaining_to_read -= to_read;
 
             if let Some((new_page, c)) = new_page_and_c {
@@ -1625,16 +1648,10 @@ impl BTreeCursor {
                 .expect("read_overflow_state was checked above")
                 .payload;
 
-            let mut reuse_immutable = self.get_immutable_record_or_create()?;
-            reuse_immutable.as_mut().unwrap().invalidate();
-
-            crate::with_btree_allocation_site!(
-                RecordPayload,
-                reuse_immutable
-                    .as_mut()
-                    .unwrap()
-                    .start_serialization(&payload_swap)
-            )?;
+            let record = self
+                .get_immutable_record_or_create()?
+                .expect("record was allocated above");
+            *record.as_blob_mut() = payload_swap;
 
             break Ok(IOResult::Done(()));
         }
@@ -6888,30 +6905,7 @@ impl CursorTrait for BTreeCursor {
         if self.null_flag || !self.has_record() {
             return Ok(IOResult::Done(None));
         }
-        let noted = self.noted_payload;
-        if noted.size != 0 {
-            let size = noted.size as usize;
-            // A cell that keeps its whole payload on the page: the rowid
-            // read already found where it starts.
-            if size <= self.payload_limits.max_local_table {
-                let start = noted.start as usize;
-                let contents = self.stack.top_ref().get_contents();
-                if let Some(payload) = contents.payload_on_page(start, size) {
-                    return Ok(IOResult::Done(Some(payload)));
-                }
-            }
-        }
-        let contents = self.stack.top_ref().get_contents();
-        let cell_idx = self.stack.current_cell_index();
-        // Optimistically use a faster decoder that only handles leaf cells without overflow pages.
-        // If this fails, we'll degrade to the slower path.
-        if let Some((payload, start)) =
-            contents.decode_leaf_cell_without_overflow(cell_idx as usize, &self.payload_limits)
-        {
-            self.noted_payload = NotedPayload {
-                start: start as u32,
-                size: payload.len() as u32,
-            };
+        if let Some(payload) = self.payload_on_leaf_page() {
             return Ok(IOResult::Done(Some(payload)));
         }
         return self.record_payload_general();
@@ -7853,6 +7847,252 @@ impl BTreeCursor {
         }
         let record = return_if_io!(self.record());
         Ok(IOResult::Done(record.map(ImmutableRecord::get_payload)))
+    }
+
+    #[inline(always)]
+    pub fn positioned_payload_on_leaf_page(&mut self) -> Option<&'static [u8]> {
+        if self.needs_restore() || self.null_flag || !self.has_record() {
+            return None;
+        }
+        self.payload_on_leaf_page()
+    }
+
+    #[inline(never)]
+    pub fn read_column_without_leaf_payload(
+        &mut self,
+        column: usize,
+        dest: &mut Register,
+    ) -> IOResultOr<ColumnRead> {
+        if !self.needs_restore()
+            && !self.null_flag
+            && self.has_record()
+            && self.read_column_from_cached_overflow_pages(column, dest)?
+        {
+            return Ok(IOResult::Done(ColumnRead::Decoded));
+        }
+        let Some(payload) = return_if_io!(self.record_payload()) else {
+            return Ok(IOResult::Done(ColumnRead::NullRow));
+        };
+        Self::decode_column(payload, column, dest)
+    }
+
+    #[inline(always)]
+    fn decode_column(payload: &[u8], column: usize, dest: &mut Register) -> IOResultOr<ColumnRead> {
+        match crate::types::ValueIterator::new(payload)?.nth_into_register(column, dest) {
+            Some(result) => {
+                result?;
+                Ok(IOResult::Done(ColumnRead::Decoded))
+            }
+            None => Ok(IOResult::Done(ColumnRead::MissingColumn)),
+        }
+    }
+
+    #[inline(always)]
+    fn payload_on_leaf_page(&mut self) -> Option<&'static [u8]> {
+        let noted = self.noted_payload;
+        if noted.size != 0 {
+            let size = noted.size as usize;
+            // A cell that keeps its whole payload on the page: the rowid
+            // read already found where it starts.
+            if size <= self.payload_limits.max_local_table {
+                let start = noted.start as usize;
+                let contents = self.stack.top_ref().get_contents();
+                if let Some(payload) = contents.payload_on_page(start, size) {
+                    return Some(payload);
+                }
+            }
+        }
+        let contents = self.stack.top_ref().get_contents();
+        let cell_idx = self.stack.current_cell_index();
+        // Optimistically use a faster decoder that only handles leaf cells without overflow pages.
+        // If this fails, we'll degrade to the slower path.
+        let (payload, start) =
+            contents.decode_leaf_cell_without_overflow(cell_idx as usize, &self.payload_limits)?;
+        self.noted_payload = NotedPayload {
+            start: start as u32,
+            size: payload.len() as u32,
+        };
+        Some(payload)
+    }
+
+    #[inline(never)]
+    fn read_column_from_cached_overflow_pages(
+        &mut self,
+        column: usize,
+        dest: &mut Register,
+    ) -> Result<bool> {
+        if self
+            .reusable_immutable_record
+            .as_ref()
+            .is_some_and(|record| !record.is_invalidated())
+        {
+            return Ok(false);
+        }
+        let cell_idx = self.stack.current_cell_index();
+        if cell_idx < 0 {
+            return Ok(false);
+        }
+        let contents = self.stack.top_ref().get_contents();
+        if !matches!(contents.page_type()?, PageType::TableLeaf) {
+            return Ok(false);
+        }
+        let (local, _, payload_size, first_overflow_page) =
+            contents.cell_read_payload_at(cell_idx as usize, self.payload_limits)?;
+        let Some(first_overflow_page) = first_overflow_page else {
+            return Ok(false);
+        };
+        let payload_size = payload_size as usize;
+        let Some((serial_type, start, size)) = locate_column(local, payload_size, column) else {
+            return Ok(false);
+        };
+        let end = start + size;
+        if size == 0 {
+            crate::vdbe::decode_serial_type_into_register(serial_type, &mut &[][..], dest)?;
+            return Ok(true);
+        }
+        if end <= local.len() {
+            crate::vdbe::decode_serial_type_into_register(
+                serial_type,
+                &mut &local[start..end],
+                dest,
+            )?;
+            return Ok(true);
+        }
+
+        let bytes_per_page = self.pager.usable_space() - 4;
+        let mut pages: SmallVec<[PageRef; 8]> = SmallVec::new();
+        let mut first_copied_page_start = None;
+        let mut page_start = local.len();
+        let mut next_page = first_overflow_page;
+        while page_start < end {
+            if next_page == 0 {
+                return Ok(false);
+            }
+            let Some(page) = self.pager.cache_get(next_page as usize)? else {
+                return Ok(false);
+            };
+            if !page.is_loaded() {
+                return Ok(false);
+            }
+            next_page = page.get_contents().read_u32_no_offset(0);
+            if page_start + bytes_per_page > start {
+                first_copied_page_start.get_or_insert(page_start);
+                pages.push(page);
+            }
+            page_start += bytes_per_page;
+        }
+        let first_copied_page_start = first_copied_page_start
+            .expect("a value that ends past the leaf page has an overflow page");
+        let value_pieces = ValuePieces {
+            local,
+            pages: &pages,
+            first_copied_page_start,
+            bytes_per_page,
+            start,
+            end,
+        };
+
+        if serial_type < 12 {
+            let mut value = [0u8; 8];
+            let mut filled = 0;
+            value_pieces.for_each(|piece| {
+                value[filled..filled + piece.len()].copy_from_slice(piece);
+                filled += piece.len();
+            });
+            crate::vdbe::decode_serial_type_into_register(
+                serial_type,
+                &mut &value[..filled],
+                dest,
+            )?;
+            return Ok(true);
+        }
+
+        if serial_type % 2 == 0 {
+            let mut blob = match dest {
+                Register::Value(Value::Blob(blob)) => std::mem::replace(
+                    blob,
+                    <crate::types::ValueBlob as crate::alloc::TursoAllocExt>::new(),
+                ),
+                _ => <crate::types::ValueBlob as crate::alloc::TursoAllocExt>::new(),
+            };
+            blob.clear();
+            crate::with_value_blob_allocation_site!(RecordDecode, blob.try_reserve_exact(size))?;
+            value_pieces.for_each(|piece| blob.extend_from_slice(piece));
+            turso_assert_eq!(blob.len(), size, "overflow column copy must fill the value");
+            dest.set_blob(blob)?;
+        } else {
+            let mut text = match dest {
+                Register::Value(Value::Text(Text {
+                    value: std::borrow::Cow::Owned(text),
+                    ..
+                })) => std::mem::take(text).into_bytes(),
+                _ => Vec::new(),
+            };
+            text.clear();
+            text.try_reserve_exact(size)?;
+            value_pieces.for_each(|piece| text.extend_from_slice(piece));
+            turso_assert_eq!(text.len(), size, "overflow column copy must fill the value");
+            if simdutf8::basic::from_utf8(&text).is_err() {
+                mark_unlikely();
+                return Err(LimboError::Corrupt(
+                    "TEXT value contains invalid UTF-8".into(),
+                ));
+            }
+            // SAFETY: simdutf8 has just checked that `text` is valid UTF-8.
+            let text = unsafe { String::from_utf8_unchecked(text) };
+            *dest = Register::Value(Value::Text(Text::new(text)));
+        }
+        return Ok(true);
+
+        struct ValuePieces<'a> {
+            local: &'a [u8],
+            pages: &'a [PageRef],
+            first_copied_page_start: usize,
+            bytes_per_page: usize,
+            start: usize,
+            end: usize,
+        }
+
+        impl ValuePieces<'_> {
+            fn for_each(&self, mut append: impl FnMut(&[u8])) {
+                if self.start < self.local.len() {
+                    append(&self.local[self.start..]);
+                }
+                let mut page_start = self.first_copied_page_start;
+                for page in self.pages {
+                    let data = page.get_contents().as_ptr();
+                    let from = self.start.max(page_start) - page_start;
+                    let to = self.end.min(page_start + self.bytes_per_page) - page_start;
+                    append(&data[4 + from..4 + to]);
+                    page_start += self.bytes_per_page;
+                }
+            }
+        }
+
+        fn locate_column(
+            local: &[u8],
+            payload_size: usize,
+            column: usize,
+        ) -> Option<(u64, usize, usize)> {
+            let (header_size, mut pos) = read_varint(local).ok()?;
+            let header_size = usize::try_from(header_size).ok()?;
+            if header_size > local.len() || header_size < pos {
+                return None;
+            }
+            let mut offset = header_size;
+            let mut index = 0;
+            while pos < header_size {
+                let (serial_type, len) = read_varint(&local[pos..header_size]).ok()?;
+                pos += len;
+                let size = crate::types::get_serial_type_size(serial_type).ok()?;
+                if index == column {
+                    return (offset + size <= payload_size).then_some((serial_type, offset, size));
+                }
+                offset += size;
+                index += 1;
+            }
+            None
+        }
     }
 
     /// True when the next cell is on the same leaf page and no resumable
@@ -12936,6 +13176,144 @@ mod tests {
         let rec_slot = cursor.get_immutable_record_or_create().unwrap();
         let bytes = rec_slot.as_ref().unwrap().get_payload();
         assert_eq!(bytes.len(), 2 * data_per_page);
+        assert!(bytes[..data_per_page].iter().all(|&b| b == b'A'));
+        assert!(bytes[data_per_page..].iter().all(|&b| b == b'B'));
+    }
+
+    #[test]
+    fn overflow_read_reserves_the_record_buffer_once() {
+        let pager = setup_test_env(5);
+        let mut cursor = BTreeCursor::new_table(pager.clone(), 1, 5);
+        let usable = cursor.usable_space();
+        let data_per_page = usable - 4;
+
+        let load_and_fill = |id: i64, next: u32, fill: u8| {
+            let (page, c) = cursor.read_page_blocking(id).unwrap();
+            if let Some(c) = c {
+                pager.io.wait_for_completion(c).unwrap();
+            }
+            while page.is_locked() {
+                pager.io.step().unwrap();
+            }
+            let buf = page.get_contents().as_ptr();
+            buf[0..4].copy_from_slice(&next.to_be_bytes());
+            buf[4..usable].fill(fill);
+        };
+        load_and_fill(4, 5, b'A');
+        load_and_fill(5, 0, b'B');
+
+        let local = b"local";
+        let tail_len = 10;
+        let payload_size = (local.len() + data_per_page + tail_len) as u64;
+        let cursor_pager = cursor.pager.clone();
+        run_until_done(
+            || cursor.process_overflow_read(local, 4, payload_size),
+            &cursor_pager,
+        )
+        .unwrap();
+
+        let record = cursor.get_immutable_record().expect("record was read");
+        let bytes = record.get_payload();
+        assert_eq!(bytes.len(), payload_size as usize);
+        assert_eq!(&bytes[..local.len()], local);
+        let chain = &bytes[local.len()..];
+        assert!(chain[..data_per_page].iter().all(|&b| b == b'A'));
+        assert!(chain[data_per_page..].iter().all(|&b| b == b'B'));
+        assert_eq!(record.as_blob().capacity(), bytes.len());
+    }
+
+    #[test]
+    fn column_of_overflow_row_is_read_without_building_the_record() {
+        let (pager, root_page, _, _) = empty_btree();
+        let max_local = payload_overflow_threshold_max(PageType::TableLeaf, 4096);
+        let mut blob = crate::alloc::vec![0u8; max_local + 4096 * 2];
+        for (i, byte) in blob.iter_mut().enumerate() {
+            *byte = (i % 251) as u8;
+        }
+        let regs = &[
+            Register::Value(Value::from_i64(7)),
+            Register::Value(Value::Blob(blob.clone())),
+            Register::Value(Value::from_i64(9)),
+        ];
+        let record = ImmutableRecord::from_registers(regs, regs.len()).unwrap();
+        let mut cursor = BTreeCursor::new_table(pager.clone(), root_page, 3);
+        run_until_done(
+            || cursor.seek(SeekKey::TableRowId(1), SeekOp::GE { eq_only: true }),
+            pager.deref(),
+        )
+        .unwrap();
+        run_until_done(
+            || cursor.insert(&BTreeKey::new_table_rowid(1, Some(&record))),
+            pager.deref(),
+        )
+        .unwrap();
+        run_until_done(|| cursor.rewind(), pager.deref()).unwrap();
+
+        let mut dest = Register::Value(Value::Null);
+        for (column, expected) in [
+            (1, Value::Blob(blob)),
+            (0, Value::from_i64(7)),
+            (2, Value::from_i64(9)),
+        ] {
+            let read = run_until_done(
+                || cursor.read_column_without_leaf_payload(column, &mut dest),
+                pager.deref(),
+            )
+            .unwrap();
+            assert_eq!(read, ColumnRead::Decoded);
+            assert_eq!(dest.get_value(), &expected);
+        }
+        assert!(cursor
+            .reusable_immutable_record
+            .as_ref()
+            .is_none_or(|record| record.is_invalidated()));
+    }
+
+    #[test]
+    fn overflow_read_reuses_the_record_buffer() {
+        let pager = setup_test_env(5);
+        let mut cursor = BTreeCursor::new_table(pager.clone(), 1, 5);
+        let usable = cursor.usable_space();
+        let data_per_page = usable - 4;
+
+        let load_and_fill = |id: i64, next: u32, fill: u8| {
+            let (page, c) = cursor.read_page_blocking(id).unwrap();
+            if let Some(c) = c {
+                pager.io.wait_for_completion(c).unwrap();
+            }
+            while page.is_locked() {
+                pager.io.step().unwrap();
+            }
+            let buf = page.get_contents().as_ptr();
+            buf[0..4].copy_from_slice(&next.to_be_bytes());
+            buf[4..usable].fill(fill);
+        };
+        load_and_fill(4, 5, b'A');
+        load_and_fill(5, 0, b'B');
+
+        let cursor_pager = cursor.pager.clone();
+        let first_size = 2 * data_per_page;
+        run_until_done(
+            || cursor.process_overflow_read(b"", 4, first_size as u64),
+            &cursor_pager,
+        )
+        .unwrap();
+        let first_buffer = cursor
+            .get_immutable_record()
+            .expect("record was read")
+            .get_payload()
+            .as_ptr();
+
+        let second_size = data_per_page + 10;
+        run_until_done(
+            || cursor.process_overflow_read(b"", 4, second_size as u64),
+            &cursor_pager,
+        )
+        .unwrap();
+        let record = cursor.get_immutable_record().expect("record was read");
+        let bytes = record.get_payload();
+        assert_eq!(bytes.as_ptr(), first_buffer);
+        assert_eq!(bytes.len(), second_size);
         assert!(bytes[..data_per_page].iter().all(|&b| b == b'A'));
         assert!(bytes[data_per_page..].iter().all(|&b| b == b'B'));
     }

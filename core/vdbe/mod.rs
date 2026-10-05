@@ -3974,7 +3974,7 @@ fn start_blob_register(dest: &mut Register, blob_data: &[u8]) -> Result<()> {
 /// Decodes the value of `serial_type` at the front of `data` into `dest`
 /// and moves `data` past it.
 #[inline(always)]
-fn decode_serial_type_into_register(
+pub(crate) fn decode_serial_type_into_register(
     serial_type: u64,
     data: &mut &[u8],
     dest: &mut Register,

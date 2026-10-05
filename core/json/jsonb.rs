@@ -5,7 +5,7 @@ use crate::alloc::{
 use crate::json::error::{Error as PError, Result as PResult};
 use crate::json::Conv;
 use crate::types::{value_blob_from_slice, ValueBlob};
-use crate::{bail_parse_error, LimboError, Result};
+use crate::{bail_parse_error, turso_debug_assert, LimboError, Result};
 use std::{
     borrow::Cow,
     collections::{HashMap, VecDeque},
@@ -40,6 +40,8 @@ const fn make_whitespace_table() -> [u8; 256] {
     table[0xE2] |= 2; // First byte of U+2000..U+200A, U+2028/29/2F, U+205F
     table[0xE3] |= 2; // First byte of U+3000
     table[0xEF] |= 2; // First byte of U+FEFF
+
+    table[b'/' as usize] |= 4;
 
     table
 }
@@ -227,7 +229,7 @@ pub enum ElementType {
 pub enum IteratorState {
     Array(ArrayIteratorState),
     Object(ObjectIteratorState),
-    Primitive(Jsonb),
+    Primitive(usize),
 }
 
 pub enum JsonIndentation<'a> {
@@ -657,46 +659,6 @@ impl PathOperation for InsertOperation {
     }
 }
 
-pub struct SearchOperation {
-    value: Jsonb,
-    mode: PathOperationMode,
-}
-
-impl SearchOperation {
-    pub fn new(capacity: usize) -> std::result::Result<Self, TryReserveError> {
-        Ok(Self {
-            mode: PathOperationMode::ReplaceExisting,
-            value: Jsonb::new(capacity)?,
-        })
-    }
-
-    pub fn result(self) -> Jsonb {
-        self.value
-    }
-}
-
-impl PathOperation for SearchOperation {
-    fn operation_mode(&self) -> PathOperationMode {
-        self.mode
-    }
-
-    fn execute(&mut self, json: &mut Jsonb, mut stack: Vec<JsonTraversalResult>) -> Result<()> {
-        let target = stack.pop().ok_or_else(|| {
-            LimboError::InternalError("stack should not be empty after check".to_string())
-        })?;
-        let idx = if let Some(idx) = target.get_array_index() {
-            idx
-        } else {
-            target.field_value_index
-        };
-        let (JsonbHeader(_, size), header_size) = json.read_header(idx)?;
-        let end = json.element_end(idx, &[header_size, size])?;
-        self.value.data.extend_from_slice(&json.data[idx..end]);
-
-        Ok(())
-    }
-}
-
 impl JsonTraversalResult {
     pub fn new(field_value_index: usize, field_key_index: JsonLocationKind, delta: isize) -> Self {
         Self {
@@ -802,7 +764,36 @@ impl JsonbHeader {
         self.1
     }
 
+    #[inline]
     pub(super) fn from_slice(cursor: usize, slice: &[u8]) -> Result<(Self, usize)> {
+        const ELEMENT_TYPES: [ElementType; 13] = [
+            ElementType::NULL,
+            ElementType::TRUE,
+            ElementType::FALSE,
+            ElementType::INT,
+            ElementType::INT5,
+            ElementType::FLOAT,
+            ElementType::FLOAT5,
+            ElementType::TEXT,
+            ElementType::TEXTJ,
+            ElementType::TEXT5,
+            ElementType::TEXTRAW,
+            ElementType::ARRAY,
+            ElementType::OBJECT,
+        ];
+        if let Some(&header_byte) = slice.get(cursor) {
+            let size = header_byte >> 4;
+            if let (Some(&element_type), 0..=11) =
+                (ELEMENT_TYPES.get((header_byte & 15) as usize), size)
+            {
+                return Ok((Self(element_type, size as usize), 1));
+            }
+        }
+        Self::from_slice_with_size_bytes(cursor, slice)
+    }
+
+    #[inline(never)]
+    fn from_slice_with_size_bytes(cursor: usize, slice: &[u8]) -> Result<(Self, usize)> {
         match slice.get(cursor) {
             Some(header_byte) => {
                 // Extract first 4 bits (values 0-15)
@@ -925,8 +916,8 @@ pub struct ObjectIteratorState {
     index: usize,
 }
 
-pub type ArrayIteratorItem = ((usize, Jsonb), ArrayIteratorState);
-pub type ObjectIteratorItem = ((usize, Jsonb, Jsonb), ObjectIteratorState);
+pub type ArrayIteratorItem = ((usize, usize), ArrayIteratorState);
+pub type ObjectIteratorItem = ((usize, usize, usize), ObjectIteratorState);
 
 impl Jsonb {
     pub fn empty() -> Self {
@@ -940,6 +931,22 @@ impl Jsonb {
         Ok(Self {
             data: <ValueBlob as TursoTryWithCapacityExt>::try_with_capacity_ext(capacity)?,
         })
+    }
+
+    pub(crate) fn from_payload(element_type: ElementType, payload: &[u8]) -> Result<Self> {
+        let mut json = Self::new(payload.len() + 9)?;
+        json.push_element_header(element_type, payload.len())?;
+        json.data.extend_from_slice(payload);
+        Ok(json)
+    }
+
+    pub fn as_slice(&self) -> &[u8] {
+        &self.data
+    }
+
+    #[cfg(test)]
+    pub fn data_capacity(&self) -> usize {
+        self.data.capacity()
     }
 
     pub fn len(&self) -> usize {
@@ -1020,6 +1027,11 @@ impl Jsonb {
         let mut result = String::with_capacity(self.data.len() * 2);
         self.serialize_value(&mut result, 0, 0, &JsonIndentation::None)?;
         Ok(result)
+    }
+
+    pub fn write_element_text(&self, pos: usize, out: &mut String) -> Result<()> {
+        self.serialize_value(out, pos, 0, &JsonIndentation::None)?;
+        Ok(())
     }
 
     /// Returns the decoded text of the single string element this
@@ -1222,22 +1234,33 @@ impl Jsonb {
         }
 
         match kind {
+            ElementType::TEXT | ElementType::TEXTRAW | ElementType::TEXTJ
+                if is_ascii_without_bytes_to_escape(
+                    &self.data,
+                    cursor,
+                    end_cursor,
+                    *kind != ElementType::TEXTJ,
+                ) =>
+            {
+                // SAFETY: the check above found only ASCII bytes, and every
+                // ASCII byte sequence is valid UTF-8.
+                string.push_str(unsafe { std::str::from_utf8_unchecked(word_slice) });
+            }
             ElementType::TEXT | ElementType::TEXTRAW | ElementType::TEXTJ => {
-                let word = from_utf8(word_slice).map_err(|_| {
+                let word = payload_as_str(word_slice).map_err(|_| {
                     LimboError::ParseError("Failed to serialize string!".to_string())
                 })?;
 
+                let escape_quotes_and_backslashes = *kind != ElementType::TEXTJ;
                 let mut last_end = 0;
                 let bytes = word.as_bytes();
-                for i in 0..bytes.len() {
-                    let b = bytes[i];
-                    let needs_escape = if *kind == ElementType::TEXTJ {
-                        b <= 0x1F
-                    } else {
-                        b == b'"' || b == b'\\' || b <= 0x1F
+                let mut i = 0;
+                loop {
+                    i = find_string_special_byte(bytes, i, b'"');
+                    let Some(&b) = bytes.get(i) else {
+                        break;
                     };
-
-                    if needs_escape {
+                    if b <= 0x1F || escape_quotes_and_backslashes {
                         string.push_str(&word[last_end..i]);
                         match b {
                             b'"' => string.push_str("\\\""),
@@ -1253,6 +1276,7 @@ impl Jsonb {
                         }
                         last_end = i + 1;
                     }
+                    i += 1;
                 }
                 string.push_str(&word[last_end..]);
             }
@@ -1534,6 +1558,7 @@ impl Jsonb {
         cursor
     }
 
+    #[cfg_attr(not(debug_assertions), inline(always))]
     fn deserialize_value(
         &mut self,
         input: &[u8],
@@ -1544,58 +1569,55 @@ impl Jsonb {
         if depth > MAX_JSON_DEPTH {
             return Err(PError::Message {
                 msg: "Too deep".to_string(),
-                location: Some(pos),
+                location: Some(skip_whitespace_tracking(input, pos, info)),
             });
         }
 
-        pos = skip_whitespace_tracking(input, pos, info);
-        if pos >= input.len() {
-            return Err(PError::Message {
-                msg: "Unexpected end of input".to_string(),
-                location: Some(pos),
-            });
-        }
-
-        match input[pos] {
-            b'{' => {
-                pos += 1; // consume '{'
-                pos = self.deserialize_obj(input, pos, depth + 1, info)?;
-            }
-            b'[' => {
-                pos += 1; // consume '['
-                pos = self.deserialize_array(input, pos, depth + 1, info)?;
-            }
-            b't' => {
-                pos = self.deserialize_true(input, pos)?;
-            }
-            b'f' => {
-                pos = self.deserialize_false(input, pos)?;
-            }
-            b'n' | b'N' => {
-                pos = self.deserialize_null_or_nan(input, pos, info)?;
-            }
-            b'"' | b'\'' => {
-                pos = self.deserialize_string(input, pos, info)?;
-            }
-            c if c.is_ascii_digit()
-                || c == b'-'
-                || c == b'+'
-                || c == b'.'
-                || c.eq_ignore_ascii_case(&b'i') =>
-            {
-                pos = self.deserialize_number(input, pos, info)?;
-            }
-            _ => {
+        loop {
+            if pos >= input.len() {
                 return Err(PError::Message {
-                    msg: "Unexpected character".to_string(),
+                    msg: "Unexpected end of input".to_string(),
                     location: Some(pos),
                 });
             }
-        }
 
-        Ok(pos)
+            match input[pos] {
+                b'{' => {
+                    pos += 1; // consume '{'
+                    return self.deserialize_obj(input, pos, depth + 1, info);
+                }
+                b'[' => {
+                    pos += 1; // consume '['
+                    return self.deserialize_array(input, pos, depth + 1, info);
+                }
+                b't' => {
+                    return self.deserialize_true(input, pos);
+                }
+                b'f' => {
+                    return self.deserialize_false(input, pos);
+                }
+                b'n' | b'N' => {
+                    return self.deserialize_null_or_nan(input, pos, info);
+                }
+                b'"' | b'\'' => {
+                    return self.deserialize_string(input, pos, info);
+                }
+                c if c.is_ascii_digit()
+                    || c == b'-'
+                    || c == b'+'
+                    || c == b'.'
+                    || c.eq_ignore_ascii_case(&b'i') =>
+                {
+                    return self.deserialize_number(input, pos, info);
+                }
+                _ => {
+                    pos = skip_whitespace_before_value(input, pos, info)?;
+                }
+            }
+        }
     }
 
+    #[inline(never)]
     fn deserialize_obj(
         &mut self,
         input: &[u8],
@@ -1609,9 +1631,6 @@ impl Jsonb {
                 location: Some(pos),
             });
         }
-        if self.data.capacity() - self.data.len() < 50 {
-            self.data.reserve(self.data.capacity());
-        }
         if pos >= input.len() {
             return Err(PError::Message {
                 msg: "Unexpected end of input".to_string(),
@@ -1620,41 +1639,63 @@ impl Jsonb {
         }
 
         let header_pos = self.len();
-        self.write_element_header(header_pos, ElementType::OBJECT, 0, false)
+        let first_member_pos = skip_whitespace_tracking(input, pos, info);
+        let empty = input.get(first_member_pos) == Some(&b'}');
+        self.start_container_header(ElementType::OBJECT, empty)
             .map_err(|_| PError::Message {
                 msg: "Failed to write header".to_string(),
                 location: Some(pos),
             })?;
         let obj_start = self.len();
-        let mut first = true;
 
+        pos = first_member_pos;
+        if empty {
+            return Ok(pos + 1);
+        }
         loop {
-            pos = skip_whitespace_tracking(input, pos, info);
             if pos >= input.len() {
                 return Err(PError::Message {
                     msg: "Unexpected end of input".to_string(),
                     location: Some(pos),
                 });
             }
-
-            match input[pos] {
-                b'}' => {
-                    pos += 1; // consume '}'
-                    if first {
-                        return Ok(pos);
-                    } else {
-                        let obj_size = self.len() - obj_start;
-                        self.write_element_header(header_pos, ElementType::OBJECT, obj_size, false)
-                            .map_err(|_| PError::Message {
-                                msg: "Failed to write header".to_string(),
-                                location: Some(pos),
-                            })?;
-                        return Ok(pos);
-                    }
+            pos = self.deserialize_string(input, pos, info)?;
+            if input.get(pos) != Some(&b':') {
+                pos = skip_whitespace_and_comments(input, pos, info);
+                if pos >= input.len() || input[pos] != b':' {
+                    return Err(PError::Message {
+                        msg: "Expected : after object key".to_string(),
+                        location: Some(pos),
+                    });
                 }
-                b',' if !first => {
-                    pos += 1; // consume ','
-                    pos = skip_whitespace_tracking(input, pos, info);
+            }
+            pos += 1;
+            if input.get(pos) == Some(&b' ') {
+                pos += 1;
+            }
+            pos = self.deserialize_value(input, pos, depth + 1, info)?;
+            if !matches!(input.get(pos), Some(b',' | b'}')) {
+                pos = skip_whitespace_and_comments(input, pos, info);
+            }
+            if pos >= input.len() {
+                return Err(PError::Message {
+                    msg: "Unexpected end of input".to_string(),
+                    location: Some(pos),
+                });
+            }
+            match input[pos] {
+                b'}' => break,
+                b',' => {
+                    pos += 1;
+                    match input.get(pos) {
+                        Some(b'"') => continue,
+                        Some(b' ') if input.get(pos + 1) == Some(&b'"') => {
+                            pos += 1;
+                            continue;
+                        }
+                        _ => {}
+                    }
+                    pos = skip_whitespace_and_comments(input, pos, info);
                     if pos >= input.len() {
                         return Err(PError::Message {
                             msg: "Unexpected end of input after comma in object".to_string(),
@@ -1668,40 +1709,29 @@ impl Jsonb {
                         });
                     }
                     if input[pos] == b'}' {
-                        // Trailing comma
                         info.has_json5 = true;
+                        break;
                     }
                 }
                 _ => {
-                    // Parse key (must be string)
-                    pos = self.deserialize_string(input, pos, info)?;
-
-                    pos = skip_whitespace_tracking(input, pos, info);
-                    if pos >= input.len() || input[pos] != b':' {
-                        return Err(PError::Message {
-                            msg: "Expected : after object key".to_string(),
-                            location: Some(pos),
-                        });
-                    }
-                    pos += 1; // consume ':'
-
-                    pos = skip_whitespace_tracking(input, pos, info);
-
-                    // Parse value - can be any JSON value including another object
-                    pos = self.deserialize_value(input, pos, depth + 1, info)?;
-                    pos = skip_whitespace_tracking(input, pos, info);
-                    if pos < input.len() && !matches!(input[pos], b',' | b'}') {
-                        return Err(PError::Message {
-                            msg: "Should be , or }}".to_string(),
-                            location: Some(pos),
-                        });
-                    }
-                    first = false;
+                    return Err(PError::Message {
+                        msg: "Should be , or }}".to_string(),
+                        location: Some(pos),
+                    });
                 }
             }
         }
+        pos += 1;
+        let obj_size = self.len() - obj_start;
+        self.finish_container_header(header_pos, ElementType::OBJECT, obj_size)
+            .map_err(|_| PError::Message {
+                msg: "Failed to write header".to_string(),
+                location: Some(pos),
+            })?;
+        Ok(pos)
     }
 
+    #[inline(never)]
     fn deserialize_array(
         &mut self,
         input: &[u8],
@@ -1717,40 +1747,40 @@ impl Jsonb {
         }
 
         let header_pos = self.len();
-        self.write_element_header(header_pos, ElementType::ARRAY, 0, false)
+        let first_element_pos = skip_whitespace_tracking(input, pos, info);
+        let empty = input.get(first_element_pos) == Some(&b']');
+        self.start_container_header(ElementType::ARRAY, empty)
             .map_err(|_| PError::Message {
                 msg: "Failed to write header".to_string(),
                 location: Some(pos),
             })?;
         let arr_start = self.len();
-        let mut first = true;
 
+        pos = first_element_pos;
+        if empty {
+            return Ok(pos + 1);
+        }
         loop {
-            pos = skip_whitespace_tracking(input, pos, info);
             if pos >= input.len() {
                 return Err(PError::Message {
                     msg: "Unexpected end of input".to_string(),
                     location: Some(pos),
                 });
             }
-
+            pos = self.deserialize_value(input, pos, depth + 1, info)?;
+            if !matches!(input.get(pos), Some(b',' | b']')) {
+                pos = skip_whitespace_and_comments(input, pos, info);
+            }
+            if pos >= input.len() {
+                return Err(PError::Message {
+                    msg: "Unexpected end of input".to_string(),
+                    location: Some(pos),
+                });
+            }
             match input[pos] {
-                b']' => {
-                    pos += 1; // consume ']'
-                    if first {
-                        return Ok(pos);
-                    } else {
-                        let arr_len = self.len() - arr_start;
-                        self.write_element_header(header_pos, ElementType::ARRAY, arr_len, false)
-                            .map_err(|_| PError::Message {
-                                msg: "Failed to write header".to_string(),
-                                location: Some(pos),
-                            })?;
-                        return Ok(pos);
-                    }
-                }
-                b',' if !first => {
-                    pos += 1; // consume ','
+                b']' => break,
+                b',' => {
+                    pos += 1;
                     pos = skip_whitespace_tracking(input, pos, info);
                     if pos >= input.len() {
                         return Err(PError::Message {
@@ -1765,23 +1795,106 @@ impl Jsonb {
                         });
                     }
                     if input[pos] == b']' {
-                        // Trailing comma
                         info.has_json5 = true;
+                        break;
                     }
                 }
                 _ => {
-                    pos = skip_whitespace_tracking(input, pos, info);
-
-                    // Parse array element
-                    pos = self.deserialize_value(input, pos, depth + 1, info)?;
-
-                    first = false;
+                    return Err(PError::Message {
+                        msg: "Should be , or ]".to_string(),
+                        location: Some(pos),
+                    });
                 }
             }
         }
+        pos += 1;
+        let arr_len = self.len() - arr_start;
+        self.finish_container_header(header_pos, ElementType::ARRAY, arr_len)
+            .map_err(|_| PError::Message {
+                msg: "Failed to write header".to_string(),
+                location: Some(pos),
+            })?;
+        Ok(pos)
     }
 
+    #[cfg_attr(not(debug_assertions), inline(always))]
+    fn start_container_header(&mut self, element_type: ElementType, empty: bool) -> Result<()> {
+        let type_bits = element_type as u8;
+        if empty {
+            self.data.try_push(type_bits)?;
+        } else {
+            self.data
+                .try_extend([type_bits | (SIZE_MARKER_8BIT << 4), 0])?;
+        }
+        Ok(())
+    }
+
+    #[cfg_attr(not(debug_assertions), inline(always))]
+    fn finish_container_header(
+        &mut self,
+        header_pos: usize,
+        element_type: ElementType,
+        payload_size: usize,
+    ) -> Result<()> {
+        match payload_size {
+            0..=11 => {
+                self.data[header_pos] = element_type as u8 | ((payload_size as u8) << 4);
+                self.data.copy_within(header_pos + 2.., header_pos + 1);
+                self.data.truncate(self.data.len() - 1);
+            }
+            12..=0xFF => self.data[header_pos + 1] = payload_size as u8,
+            _ => {
+                self.write_element_header(header_pos, element_type, payload_size, true)?;
+            }
+        }
+        Ok(())
+    }
+
+    #[cfg_attr(not(debug_assertions), inline(always))]
     fn deserialize_string(
+        &mut self,
+        input: &[u8],
+        pos: usize,
+        info: &mut ParseInfo,
+    ) -> PResult<usize> {
+        if input.get(pos) == Some(&b'"') {
+            let start = pos + 1;
+            let end = find_string_special_byte(input, start, b'"');
+            if end < input.len() && input[end] == b'"' {
+                self.push_element_header(ElementType::TEXT, end - start)
+                    .map_err(|_| PError::Message {
+                        msg: "Failed to write header".to_string(),
+                        location: Some(start),
+                    })?;
+                append_bytes(&mut self.data, &input[start..end]);
+                return Ok(end + 1);
+            }
+        }
+        self.deserialize_escaped_or_json5_string(input, pos, info)
+    }
+
+    #[cfg_attr(not(debug_assertions), inline(always))]
+    fn push_element_header(&mut self, element_type: ElementType, len: usize) -> Result<()> {
+        let type_bits = element_type as u8;
+        match len {
+            0..=11 => self.data.push(type_bits | ((len as u8) << 4)),
+            12..=0xFF => self
+                .data
+                .extend_from_slice(&[type_bits | (SIZE_MARKER_8BIT << 4), len as u8]),
+            0x100..=0xFFFF => {
+                let [high, low] = (len as u16).to_be_bytes();
+                self.data
+                    .extend_from_slice(&[type_bits | (SIZE_MARKER_16BIT << 4), high, low]);
+            }
+            _ => {
+                self.write_element_header(self.data.len(), element_type, len, false)?;
+            }
+        }
+        Ok(())
+    }
+
+    #[inline(never)]
+    fn deserialize_escaped_or_json5_string(
         &mut self,
         input: &[u8],
         mut pos: usize,
@@ -1804,45 +1917,21 @@ impl Jsonb {
         }
         pos += 1; // consume quote
 
-        let quoted = quote == b'"' || quote == b'\'';
-        let mut len = 0;
-
-        if quoted {
-            // Try to find the closing quote and check for simple string
-            let mut end_pos = pos;
-            let is_simple = true;
-
-            while end_pos < input.len() {
-                let c = input[end_pos];
-                if c == quote {
-                    // Found end of string - check if it's simple
-                    if is_simple {
-                        let len = end_pos - pos;
-                        let header_pos = self.data.len();
-
-                        // Write header and content
-                        if len <= 11 {
-                            self.data
-                                .push((ElementType::TEXT as u8) | ((len as u8) << 4));
-                        } else {
-                            self.write_element_header(header_pos, ElementType::TEXT, len, false)
-                                .map_err(|_| PError::Message {
-                                    msg: "Failed to write header".to_string(),
-                                    location: Some(pos),
-                                })?;
-                        }
-
-                        self.data.extend_from_slice(&input[pos..end_pos]);
-                        return Ok(end_pos + 1); // Skip past closing quote
-                    }
-                    break;
-                } else if c == b'\\' || c < 32 {
-                    // Not a simple string
-                    break;
-                }
-                end_pos += 1;
+        if quote == b'"' || quote == b'\'' {
+            let (end, element_type) = scan_quoted_string(input, pos, quote)?;
+            if element_type == ElementType::TEXT5 {
+                info.has_json5 = true;
             }
+            self.push_element_header(element_type, end - pos)
+                .map_err(|_| PError::Message {
+                    msg: "Failed to write header".to_string(),
+                    location: Some(pos),
+                })?;
+            append_bytes(&mut self.data, &input[pos..end]);
+            return Ok(end + 1);
         }
+
+        let mut len = 0;
 
         // Write placeholder header to be updated later
         self.write_element_header(string_start, ElementType::TEXT, 0, false)
@@ -1860,54 +1949,49 @@ impl Jsonb {
 
         let mut element_type = ElementType::TEXT;
 
-        // Special case for unquoted JSON5 keys (identifiers)
-        if !quoted {
-            if quote == b'\\' && input.get(pos) == Some(&b'u') {
-                // The key starts with a \uXXXX escape, which SQLite
-                // accepts no matter what it decodes to. Rewind one byte
-                // so the escape handling below consumes it.
-                pos -= 1;
-            } else if !is_json5_id_char(quote, true) {
-                return Err(PError::Message {
-                    msg: "Invalid character in unquoted object key".to_string(),
-                    location: Some(pos),
-                });
-            } else {
-                self.data.push(quote);
-                len += 1;
-            }
+        // Unquoted JSON5 keys (identifiers)
+        if quote == b'\\' && input.get(pos) == Some(&b'u') {
+            // The key starts with a \uXXXX escape, which SQLite
+            // accepts no matter what it decodes to. Rewind one byte
+            // so the escape handling below consumes it.
+            pos -= 1;
+        } else if !is_json5_id_char(quote, true) {
+            return Err(PError::Message {
+                msg: "Invalid character in unquoted object key".to_string(),
+                location: Some(pos - 1),
+            });
+        } else {
+            self.data.push(quote);
+            len += 1;
+        }
 
-            if len > 0 && pos < input.len() && input[pos] == b':' {
-                self.write_element_header(string_start, element_type, len, false)
-                    .map_err(|_| PError::Message {
-                        msg: "Failed to write header".to_string(),
-                        location: Some(pos),
-                    })?;
-                return Ok(pos);
-            }
+        if len > 0 && pos < input.len() && input[pos] == b':' {
+            self.write_element_header(string_start, element_type, len, false)
+                .map_err(|_| PError::Message {
+                    msg: "Failed to write header".to_string(),
+                    location: Some(pos),
+                })?;
+            return Ok(pos);
         }
 
         let mut escape_buffer = [0u8; 6]; // Buffer for escape sequences
-        let mut closed = false;
 
         while pos < input.len() {
             let c = input[pos];
             pos += 1;
 
-            if quoted && c == quote {
-                closed = true;
-                break; // End of string
-            } else if !quoted && (c == b'"' || c == b'\'') {
+            if c == b'"' || c == b'\'' {
                 return Err(PError::Message {
                     msg: "Unexpected input".to_string(),
                     location: Some(pos),
                 });
             } else if c == b'\\' {
+                let backslash_pos = pos - 1;
                 // Handle escape sequences
                 if pos >= input.len() {
                     return Err(PError::Message {
                         msg: "Unexpected end of input".to_string(),
-                        location: Some(pos),
+                        location: Some(backslash_pos),
                     });
                 }
 
@@ -1915,10 +1999,10 @@ impl Jsonb {
                 pos += 1;
 
                 // SQLite allows only \uXXXX escapes in unquoted keys.
-                if !quoted && esc != b'u' {
+                if esc != b'u' {
                     return Err(PError::Message {
                         msg: "Invalid character in unquoted object key".to_string(),
-                        location: Some(pos),
+                        location: Some(backslash_pos),
                     });
                 }
 
@@ -1974,7 +2058,7 @@ impl Jsonb {
                         if pos + 4 > input.len() {
                             return Err(PError::Message {
                                 msg: "Incomplete unicode escape sequence".to_string(),
-                                location: Some(pos),
+                                location: Some(backslash_pos),
                             });
                         }
 
@@ -1986,7 +2070,7 @@ impl Jsonb {
                             if !is_hex_digit(h) {
                                 return Err(PError::Message {
                                     msg: "Invalid unicode escape sequence".to_string(),
-                                    location: Some(pos),
+                                    location: Some(backslash_pos),
                                 });
                             }
                             escape_buffer[2 + i] = h;
@@ -2079,40 +2163,25 @@ impl Jsonb {
                         });
                     }
                 }
-            } else if !quoted
-                && (c == b':'
-                    || c.is_ascii_whitespace()
-                    || (c == b'/' && matches!(input.get(pos), Some(b'/' | b'*'))))
+            } else if c == b':'
+                || c.is_ascii_whitespace()
+                || (c == b'/' && matches!(input.get(pos), Some(b'/' | b'*')))
             {
                 // End of unquoted identifier. A comment right after the
                 // key acts as whitespace, so its opening '/' ends the
                 // key and the whitespace skipping before ':' eats it.
                 pos -= 1; // Put back the terminating character
                 break;
-            } else if !quoted && !is_json5_id_char(c, false) {
+            } else if !is_json5_id_char(c, false) {
                 return Err(PError::Message {
                     msg: "Invalid character in unquoted object key".to_string(),
-                    location: Some(pos),
+                    location: Some(pos - 1),
                 });
-            } else if c <= 0x1F {
-                // Control character
-                element_type = ElementType::TEXT5;
-                self.data.push(c);
-                len += 1;
             } else {
                 // Normal character
                 self.data.push(c);
                 len += 1;
             }
-        }
-
-        // A quoted string must end with its closing quote before the
-        // input runs out.
-        if quoted && !closed {
-            return Err(PError::Message {
-                msg: "Unexpected end of input".to_string(),
-                location: Some(pos),
-            });
         }
 
         if matches!(element_type, ElementType::TEXT5) {
@@ -2129,7 +2198,32 @@ impl Jsonb {
         Ok(pos)
     }
 
+    #[cfg_attr(not(debug_assertions), inline(always))]
     fn deserialize_number(
+        &mut self,
+        input: &[u8],
+        pos: usize,
+        info: &mut ParseInfo,
+    ) -> PResult<usize> {
+        if let Some((end, is_float)) = scan_plain_json_number(input, pos) {
+            let element_type = if is_float {
+                ElementType::FLOAT
+            } else {
+                ElementType::INT
+            };
+            self.push_element_header(element_type, end - pos)
+                .map_err(|_| PError::Message {
+                    msg: "Failed to write header".to_string(),
+                    location: Some(pos),
+                })?;
+            append_bytes(&mut self.data, &input[pos..end]);
+            return Ok(end);
+        }
+        self.deserialize_number_of_any_form(input, pos, info)
+    }
+
+    #[inline(never)]
+    fn deserialize_number_of_any_form(
         &mut self,
         input: &[u8],
         mut pos: usize,
@@ -2484,23 +2578,24 @@ impl Jsonb {
 
         let new_len = header_bytes.len();
 
+        let old_end = self.data.len();
         match new_len.cmp(&old_len) {
             std::cmp::Ordering::Greater => {
-                self.data.try_reserve(new_len - old_len)?;
-                self.data.splice(
-                    cursor + old_len..cursor + old_len,
-                    std::iter::repeat_n(0, new_len - old_len),
-                );
+                let growth = new_len - old_len;
+                self.data.try_reserve(growth)?;
+                self.data.resize(old_end + growth, 0);
+                self.data
+                    .copy_within(cursor + old_len..old_end, cursor + new_len);
             }
             std::cmp::Ordering::Less => {
-                self.data.drain(cursor + new_len..cursor + old_len);
+                self.data
+                    .copy_within(cursor + old_len..old_end, cursor + new_len);
+                self.data.truncate(old_end - (old_len - new_len));
             }
             std::cmp::Ordering::Equal => {}
         }
 
-        for (i, &byte) in header_bytes.iter().enumerate() {
-            self.data[cursor + i] = byte;
-        }
+        self.data[cursor..cursor + new_len].copy_from_slice(header_bytes);
 
         Ok(new_len)
     }
@@ -2510,20 +2605,52 @@ impl Jsonb {
     }
 
     pub fn from_str_tracking(input: &str) -> PResult<(Self, ParseInfo)> {
-        let mut result = Self::new(input.len())?;
+        let mut result = Self::empty();
+        let info = result.parse_text_tracking(input)?;
+        Ok((result, info))
+    }
+
+    pub fn replace_with_copy_of(&mut self, other: &Jsonb) -> Result<()> {
+        self.data.clear();
+        self.data.try_reserve(other.data.len())?;
+        self.data.extend_from_slice(&other.data);
+        Ok(())
+    }
+
+    pub fn replace_with_parsed_text(&mut self, input: &str) -> PResult<()> {
+        self.data.clear();
+        self.parse_text_tracking(input)?;
+        Ok(())
+    }
+
+    fn parse_text_tracking(&mut self, input: &str) -> PResult<ParseInfo> {
         let input = input.as_bytes();
         let mut info = ParseInfo::default();
 
         if input.is_empty() {
             return Err(PError::Message {
                 msg: "Unexpected input after json".to_string(),
-                location: None,
+                location: Some(0),
             });
         }
 
+        let most_output_bytes = input
+            .len()
+            .checked_mul(2)
+            .and_then(|bytes| bytes.checked_add(16))
+            .ok_or(PError::OutOfMemory)?;
+        self.data
+            .try_reserve(most_output_bytes)
+            .map_err(|_| PError::OutOfMemory)?;
+        let reserved_capacity = self.data.capacity();
+
         // Parse the first complete JSON value
-        let mut pos = 0;
-        pos = result.deserialize_value(input, pos, 0, &mut info)?;
+        let mut pos = skip_whitespace_tracking(input, 0, &mut info);
+        pos = self.deserialize_value(input, pos, 0, &mut info)?;
+        turso_debug_assert!(
+            self.data.capacity() == reserved_capacity,
+            "the text parser wrote more than two bytes per input byte plus 16"
+        );
 
         // Skip any trailing whitespace
         pos = skip_whitespace_tracking(input, pos, &mut info);
@@ -2536,7 +2663,7 @@ impl Jsonb {
             });
         }
 
-        Ok((result, info))
+        Ok(info)
     }
 
     pub fn from_str_with_mode(input: &str, mode: Conv) -> PResult<Self> {
@@ -2850,6 +2977,7 @@ impl Jsonb {
             SegmentVariant::Single(PathElement::Key(path_key, is_raw)) => {
                 if element_type == ElementType::OBJECT {
                     let end_pos = pos + element_size + header_size;
+                    let path_key_has_no_escapes = !*is_raw || !path_key.contains('\\');
 
                     pos += header_size;
 
@@ -2862,9 +2990,17 @@ impl Jsonb {
                         }
 
                         let key_start = pos + key_header_len;
-                        let json_key = read_text_payload(&self.data, key_start, key_len)?;
+                        let found = if path_key_has_no_escapes
+                            && matches!(key_type, ElementType::TEXT | ElementType::TEXTRAW)
+                        {
+                            text_payload_bytes(&self.data, key_start, key_len)?
+                                == path_key.as_bytes()
+                        } else {
+                            let json_key = read_text_payload(&self.data, key_start, key_len)?;
+                            compare((json_key, key_type), (path_key, *is_raw))
+                        };
 
-                        if compare((json_key, key_type), (path_key, *is_raw)) {
+                        if found {
                             if mode.allows_replace() {
                                 let value_pos = pos + key_header_len + key_len;
                                 let key_pos = pos;
@@ -3379,104 +3515,89 @@ impl Jsonb {
         Ok(())
     }
 
-    pub fn array_iterator(&self) -> Result<ArrayIteratorState> {
-        let (hdr, off) = self.read_header(0)?;
+    pub fn array_iterator(&self, pos: usize) -> Result<ArrayIteratorState> {
+        let (hdr, off) = self.read_header(pos)?;
         match hdr {
             JsonbHeader(ElementType::ARRAY, len) => Ok(ArrayIteratorState {
-                cursor: off,
-                end: off + len,
+                cursor: pos + off,
+                end: pos + off + len,
                 index: 0,
             }),
             _ => bail_parse_error!("jsonb.array_iterator(): not an array"),
         }
     }
 
-    pub fn array_iterator_next(
-        &self,
-        st: &ArrayIteratorState,
-    ) -> std::result::Result<Option<ArrayIteratorItem>, TryReserveError> {
+    pub fn array_iterator_next(&self, st: &ArrayIteratorState) -> Option<ArrayIteratorItem> {
         if st.cursor >= st.end {
-            return Ok(None);
+            return None;
         }
 
         let Ok((JsonbHeader(_, payload_len), header_len)) = self.read_header(st.cursor) else {
-            return Ok(None);
+            return None;
         };
         let start = st.cursor;
-        let Some(stop) = start.checked_add(header_len + payload_len) else {
-            return Ok(None);
-        };
+        let stop = start.checked_add(header_len + payload_len)?;
 
         if stop > st.end || stop > self.data.len() {
-            return Ok(None);
+            return None;
         }
 
-        let elem = Jsonb::from_raw_data(&self.data[start..stop])?;
         let next = ArrayIteratorState {
             cursor: stop,
             end: st.end,
             index: st.index + 1,
         };
 
-        Ok(Some(((st.index, elem), next)))
+        Some(((st.index, start), next))
     }
 
-    pub fn object_iterator(&self) -> Result<ObjectIteratorState> {
-        let (hdr, off) = self.read_header(0)?;
+    pub fn object_iterator(&self, pos: usize) -> Result<ObjectIteratorState> {
+        let (hdr, off) = self.read_header(pos)?;
         match hdr {
             JsonbHeader(ElementType::OBJECT, len) => Ok(ObjectIteratorState {
-                cursor: off,
-                end: off + len,
+                cursor: pos + off,
+                end: pos + off + len,
                 index: 0,
             }),
             _ => bail_parse_error!("jsonb.object_iterator(): not an object"),
         }
     }
 
-    pub fn object_iterator_next(
-        &self,
-        st: &ObjectIteratorState,
-    ) -> std::result::Result<Option<ObjectIteratorItem>, TryReserveError> {
+    pub fn object_iterator_next(&self, st: &ObjectIteratorState) -> Option<ObjectIteratorItem> {
         if st.cursor >= st.end {
-            return Ok(None);
+            return None;
         }
 
         // key
         let Ok((JsonbHeader(key_ty, key_len), key_hdr_len)) = self.read_header(st.cursor) else {
-            return Ok(None);
+            return None;
         };
         if !key_ty.is_valid_key() {
-            return Ok(None);
+            return None;
         }
         let key_start = st.cursor;
-        let Some(key_stop) = key_start.checked_add(key_hdr_len + key_len) else {
-            return Ok(None);
-        };
+        let key_stop = key_start.checked_add(key_hdr_len + key_len)?;
         if key_stop > st.end || key_stop > self.data.len() {
-            return Ok(None);
+            return None;
         }
 
         // value
         let Ok((JsonbHeader(_, val_len), val_hdr_len)) = self.read_header(key_stop) else {
-            return Ok(None);
+            return None;
         };
         let val_start = key_stop;
-        let Some(val_stop) = val_start.checked_add(val_hdr_len + val_len) else {
-            return Ok(None);
-        };
+        let val_stop = val_start.checked_add(val_hdr_len + val_len)?;
         if val_stop > st.end || val_stop > self.data.len() {
-            return Ok(None);
+            return None;
         }
 
-        let key = Jsonb::from_raw_data(&self.data[key_start..key_stop])?;
-        let value = Jsonb::from_raw_data(&self.data[val_start..val_stop])?;
         let next = ObjectIteratorState {
             cursor: val_stop,
             end: st.end,
             index: st.index + 1,
         };
 
-        Ok(Some(((st.index, key, value), next)))
+        Some(((st.index, key_start, val_start), next))
     }
 
     /// If the iterator points at a container value, return an iterator for that container.
@@ -3568,13 +3689,18 @@ impl std::str::FromStr for Jsonb {
 /// decode would hand invalid UTF-8 to `&str` consumers such as
 /// [`unescape_string`], which is undefined behaviour.
 fn read_text_payload(data: &[u8], start: usize, len: usize) -> Result<&str> {
+    let bytes = text_payload_bytes(data, start, len)?;
+    from_utf8(bytes).map_err(|_| LimboError::ParseError("malformed JSON".to_string()))
+}
+
+fn text_payload_bytes(data: &[u8], start: usize, len: usize) -> Result<&[u8]> {
     let Some(end) = start.checked_add(len) else {
         bail_parse_error!("malformed JSON: text payload size overflow");
     };
     let Some(bytes) = data.get(start..end) else {
         bail_parse_error!("malformed JSON: text payload extends beyond data");
     };
-    from_utf8(bytes).map_err(|_| LimboError::ParseError("malformed JSON".to_string()))
+    Ok(bytes)
 }
 
 /// Picks the element type for an object key created from a path label.
@@ -3603,6 +3729,142 @@ fn new_key_element_type(path_key: &str, is_quoted: bool) -> ElementType {
 /// unquoted label are literal characters), or quoted but containing no
 /// backslash.
 #[inline]
+pub fn find_path_element(data: &[u8], path: &JsonPath) -> Result<Option<usize>> {
+    let mut pos = 0;
+    for segment in path.elements.iter() {
+        let found = match segment {
+            PathElement::Root() => Some(pos),
+            PathElement::Key(key, is_raw) => find_object_value(data, pos, key, *is_raw)?,
+            PathElement::ArrayLocator(index) => find_array_element(data, pos, *index)?,
+            PathElement::BracketQuotedKey(_) => None,
+        };
+        let Some(found) = found else {
+            return Ok(None);
+        };
+        pos = found;
+    }
+    Ok(Some(pos))
+}
+
+pub fn element_at(data: &[u8], pos: usize) -> Result<Jsonb> {
+    let (_, _, end) = element_bounds(data, pos)?;
+    Ok(Jsonb::from_raw_data(&data[pos..end])?)
+}
+
+#[inline]
+pub fn element_payload(data: &[u8], pos: usize) -> Result<(ElementType, &[u8])> {
+    let (JsonbHeader(element_type, _), payload_start, end) = element_bounds(data, pos)?;
+    Ok((element_type, &data[payload_start..end]))
+}
+
+pub fn is_valid_element_at(data: &[u8], pos: usize) -> bool {
+    let Ok((JsonbHeader(element_type, payload_size), _, end)) = element_bounds(data, pos) else {
+        return false;
+    };
+    match element_type {
+        ElementType::NULL | ElementType::TRUE | ElementType::FALSE => payload_size == 0,
+        ElementType::INT | ElementType::INT5 | ElementType::FLOAT | ElementType::FLOAT5 => {
+            payload_size != 0
+        }
+        _ => validate_element(data, pos, end, 0, false).is_ok(),
+    }
+}
+
+fn find_object_value(
+    data: &[u8],
+    pos: usize,
+    key: &str,
+    key_is_quoted: bool,
+) -> Result<Option<usize>> {
+    let (JsonbHeader(element_type, _), payload_start, end) = element_bounds(data, pos)?;
+    if element_type != ElementType::OBJECT {
+        return Ok(None);
+    }
+    let key_has_no_escapes = !key_is_quoted || !key.contains('\\');
+    let mut entry = payload_start;
+    while entry < end {
+        let (JsonbHeader(key_type, key_len), key_header_len) =
+            JsonbHeader::from_slice(entry, data)?;
+        if !key_type.is_valid_key() {
+            bail_parse_error!("Key should be string");
+        }
+        let key_start = entry + key_header_len;
+        let entry_key = text_payload_bytes(data, key_start, key_len)?;
+        let value = key_start + key_len;
+        let found =
+            if key_has_no_escapes && matches!(key_type, ElementType::TEXT | ElementType::TEXTRAW) {
+                entry_key == key.as_bytes()
+            } else {
+                let entry_key = from_utf8(entry_key)
+                    .map_err(|_| LimboError::ParseError("malformed JSON".to_string()))?;
+                compare((entry_key, key_type), (key, key_is_quoted))
+            };
+        if found {
+            return Ok(Some(value));
+        }
+        entry = element_end_at(data, value)?;
+    }
+    Ok(None)
+}
+
+fn find_array_element(data: &[u8], pos: usize, index: Option<i32>) -> Result<Option<usize>> {
+    let (JsonbHeader(element_type, _), first, end) = element_bounds(data, pos)?;
+    if element_type != ElementType::ARRAY {
+        return Ok(None);
+    }
+    let index = match index {
+        None => return Ok(None),
+        Some(index) if index >= 0 => index as usize,
+        Some(from_end) => {
+            let mut count = 0usize;
+            let mut element = first;
+            while element < end {
+                element = element_end_at(data, element)?;
+                count += 1;
+            }
+            match count.checked_sub(from_end.unsigned_abs() as usize) {
+                Some(index) => index,
+                None => return Ok(None),
+            }
+        }
+    };
+    let mut element = first;
+    for _ in 0..index {
+        if element >= end {
+            return Ok(None);
+        }
+        element = element_end_at(data, element)?;
+    }
+    Ok((element < end).then_some(element))
+}
+
+#[inline(always)]
+fn element_end_at(data: &[u8], pos: usize) -> Result<usize> {
+    if let Some(&header_byte) = data.get(pos) {
+        let header_and_size = match header_byte >> 4 {
+            size @ 0..=11 => Some((1, usize::from(size))),
+            SIZE_MARKER_8BIT => data.get(pos + 1).map(|&size| (2, usize::from(size))),
+            _ => None,
+        };
+        if let Some((header_len, size)) = header_and_size {
+            let end = pos + header_len + size;
+            if header_byte & 15 <= ElementType::OBJECT as u8 && end <= data.len() {
+                return Ok(end);
+            }
+        }
+    }
+    Ok(element_bounds(data, pos)?.2)
+}
+
+fn element_bounds(data: &[u8], pos: usize) -> Result<(JsonbHeader, usize, usize)> {
+    let (header, header_size) = JsonbHeader::from_slice(pos, data)?;
+    let payload_start = pos + header_size;
+    match payload_start.checked_add(header.1) {
+        Some(end) if end <= data.len() => Ok((header, payload_start, end)),
+        _ => bail_parse_error!("malformed JSON"),
+    }
+}
+
 fn compare(key: (&str, ElementType), path_key: (&str, bool)) -> bool {
     let (key, element_type) = key;
     let (path_key, is_quoted) = path_key;
@@ -3659,11 +3921,32 @@ fn validate_element(
     depth: usize,
     strict: bool,
 ) -> std::result::Result<(), usize> {
-    if depth > MAX_JSON_DEPTH {
+    if start >= end {
         return Err(start + 1);
     }
+    let Ok((header, header_offset)) = JsonbHeader::from_slice(start, data) else {
+        return Err(start + 1);
+    };
+    // The 8-byte size marker lets a header declare a payload close to
+    // usize::MAX, so this must be checked before it is compared below.
+    let Some(payload_end) = (start + header_offset).checked_add(header.payload_size()) else {
+        return Err(start + 1);
+    };
+    if payload_end != end || payload_end > data.len() {
+        return Err(start + 1);
+    }
+    validate_element_payload(data, start, header, header_offset, depth, strict)
+}
 
-    if start >= end {
+fn validate_element_payload(
+    data: &[u8],
+    start: usize,
+    header: JsonbHeader,
+    header_offset: usize,
+    depth: usize,
+    strict: bool,
+) -> std::result::Result<(), usize> {
+    if depth > MAX_JSON_DEPTH {
         return Err(start + 1);
     }
 
@@ -3678,20 +3961,9 @@ fn validate_element(
         return Err(start + 1);
     }
 
-    let Ok((header, header_offset)) = JsonbHeader::from_slice(start, data) else {
-        return Err(start + 1);
-    };
     let payload_start = start + header_offset;
     let payload_size = header.payload_size();
-    // The 8-byte size marker lets a header declare a payload close to
-    // usize::MAX, so this must be checked before it is compared below.
-    let Some(payload_end) = payload_start.checked_add(payload_size) else {
-        return Err(start + 1);
-    };
-
-    if payload_end != end || payload_end > data.len() {
-        return Err(start + 1);
-    }
+    let payload_end = payload_start + payload_size;
 
     match header.element_type() {
         ElementType::NULL | ElementType::TRUE | ElementType::FALSE => {
@@ -3783,7 +4055,7 @@ fn validate_element(
             // later readers decode text payloads as &str, so the
             // payload must be valid UTF-8.
             let payload = &data[payload_start..payload_end];
-            if let Err(e) = std::str::from_utf8(payload) {
+            if let Err(e) = payload_as_str(payload) {
                 return Err(payload_start + e.valid_up_to() + 1);
             }
             Ok(())
@@ -3791,8 +4063,25 @@ fn validate_element(
         ElementType::ARRAY => {
             let mut pos = payload_start;
             while pos < payload_end {
-                let elem_end = child_element_end(data, pos, payload_end)?;
-                validate_element(data, pos, elem_end, depth + 1, strict)?;
+                let (elem_header, elem_header_size, elem_end) =
+                    child_element_header(data, pos, payload_end)?;
+                if !is_valid_scalar_in_lenient_check(
+                    data,
+                    pos,
+                    elem_header,
+                    elem_header_size,
+                    depth,
+                    strict,
+                ) {
+                    validate_element_payload(
+                        data,
+                        pos,
+                        elem_header,
+                        elem_header_size,
+                        depth + 1,
+                        strict,
+                    )?;
+                }
                 pos = elem_end;
             }
             Ok(())
@@ -3801,16 +4090,28 @@ fn validate_element(
             let mut pos = payload_start;
             let mut count = 0;
             while pos < payload_end {
-                let elem_end = child_element_end(data, pos, payload_end)?;
-                if count % 2 == 0 {
-                    let Ok((elem_header, _)) = JsonbHeader::from_slice(pos, data) else {
-                        return Err(pos + 1);
-                    };
-                    if !elem_header.element_type().is_valid_key() {
-                        return Err(pos + 1);
-                    }
+                let (elem_header, elem_header_size, elem_end) =
+                    child_element_header(data, pos, payload_end)?;
+                if count % 2 == 0 && !elem_header.element_type().is_valid_key() {
+                    return Err(pos + 1);
                 }
-                validate_element(data, pos, elem_end, depth + 1, strict)?;
+                if !is_valid_scalar_in_lenient_check(
+                    data,
+                    pos,
+                    elem_header,
+                    elem_header_size,
+                    depth,
+                    strict,
+                ) {
+                    validate_element_payload(
+                        data,
+                        pos,
+                        elem_header,
+                        elem_header_size,
+                        depth + 1,
+                        strict,
+                    )?;
+                }
                 pos = elem_end;
                 count += 1;
             }
@@ -3824,14 +4125,53 @@ fn validate_element(
     }
 }
 
-/// Reads the header of the child element at `pos` and returns where the
-/// child ends, or the 1-based offset of `pos` when the header is
-/// malformed or the child would run past `payload_end`.
-fn child_element_end(
+#[inline]
+fn is_valid_scalar_in_lenient_check(
+    data: &[u8],
+    pos: usize,
+    header: JsonbHeader,
+    header_size: usize,
+    parent_depth: usize,
+    strict: bool,
+) -> bool {
+    if strict || parent_depth >= MAX_JSON_DEPTH {
+        return false;
+    }
+    let payload_size = header.payload_size();
+    match header.element_type() {
+        ElementType::NULL | ElementType::TRUE | ElementType::FALSE => payload_size == 0,
+        ElementType::INT | ElementType::INT5 | ElementType::FLOAT | ElementType::FLOAT5 => {
+            payload_size != 0
+        }
+        ElementType::TEXT | ElementType::TEXTJ | ElementType::TEXT5 | ElementType::TEXTRAW => {
+            let payload_start = pos + header_size;
+            payload_as_str(&data[payload_start..payload_start + payload_size]).is_ok()
+        }
+        ElementType::ARRAY
+        | ElementType::OBJECT
+        | ElementType::RESERVED1
+        | ElementType::RESERVED2
+        | ElementType::RESERVED3 => false,
+    }
+}
+
+#[inline]
+pub(crate) fn payload_as_str(payload: &[u8]) -> std::result::Result<&str, std::str::Utf8Error> {
+    if payload.is_ascii() {
+        // SAFETY: every ASCII byte sequence is valid UTF-8.
+        return Ok(unsafe { std::str::from_utf8_unchecked(payload) });
+    }
+    std::str::from_utf8(payload)
+}
+
+/// Reads the header of the child element at `pos` and returns it with its
+/// size and where the child ends, or the 1-based offset of `pos` when the
+/// header is malformed or the child would run past `payload_end`.
+fn child_element_header(
     data: &[u8],
     pos: usize,
     payload_end: usize,
-) -> std::result::Result<usize, usize> {
+) -> std::result::Result<(JsonbHeader, usize, usize), usize> {
     let Ok((elem_header, elem_header_size)) = JsonbHeader::from_slice(pos, data) else {
         return Err(pos + 1);
     };
@@ -3844,7 +4184,7 @@ fn child_element_end(
     if elem_end > payload_end {
         return Err(pos + 1);
     }
-    Ok(elem_end)
+    Ok((elem_header, elem_header_size, elem_end))
 }
 
 /// Validates a text payload the way jsonbValidityCheck does. TEXTRAW
@@ -4277,6 +4617,454 @@ fn json5_whitespace_len(input: &[u8]) -> usize {
     }
 }
 
+fn scan_quoted_string(input: &[u8], mut pos: usize, quote: u8) -> PResult<(usize, ElementType)> {
+    let mut element_type = ElementType::TEXT;
+    #[cfg(target_arch = "x86_64")]
+    while pos + 16 <= input.len() {
+        let chunk_start = pos;
+        let mut mask = string_special_byte_mask_sse2(input, chunk_start, quote);
+        pos = chunk_start + 16;
+        while mask != 0 {
+            let at = chunk_start + mask.trailing_zeros() as usize;
+            let c = input[at];
+            if c == quote {
+                return Ok((at, element_type));
+            }
+            let next = if c == b'\\' {
+                scan_escape(input, at + 1, &mut element_type)?
+            } else {
+                element_type = ElementType::TEXT5;
+                at + 1
+            };
+            if next >= chunk_start + 16 {
+                pos = next;
+                break;
+            }
+            mask &= u32::MAX << (next - chunk_start);
+        }
+    }
+    loop {
+        pos = find_string_special_byte(input, pos, quote);
+        let Some(&c) = input.get(pos) else {
+            return Err(unexpected_end_of_string(pos));
+        };
+        if c == quote {
+            return Ok((pos, element_type));
+        }
+        pos += 1;
+        if c != b'\\' {
+            element_type = ElementType::TEXT5;
+            continue;
+        }
+        pos = scan_escape(input, pos, &mut element_type)?;
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+fn string_special_byte_mask_sse2(input: &[u8], start: usize, quote: u8) -> u32 {
+    use std::arch::x86_64::{
+        _mm_cmpeq_epi8, _mm_loadu_si128, _mm_min_epu8, _mm_movemask_epi8, _mm_or_si128,
+        _mm_set1_epi8,
+    };
+    assert!(start + 16 <= input.len());
+    // SAFETY: SSE2 is part of the x86_64 baseline, so these intrinsics are
+    // always available, and the assertion keeps the 16-byte unaligned load
+    // inside `input`.
+    unsafe {
+        let chunk = _mm_loadu_si128(input.as_ptr().add(start).cast());
+        let is_quote = _mm_cmpeq_epi8(chunk, _mm_set1_epi8(quote as i8));
+        let is_backslash = _mm_cmpeq_epi8(chunk, _mm_set1_epi8(b'\\' as i8));
+        let last_control = _mm_set1_epi8(0x1F);
+        let is_control = _mm_cmpeq_epi8(_mm_min_epu8(chunk, last_control), chunk);
+        _mm_movemask_epi8(_mm_or_si128(
+            _mm_or_si128(is_quote, is_backslash),
+            is_control,
+        )) as u32
+    }
+}
+
+#[inline(always)]
+fn scan_escape(input: &[u8], mut pos: usize, element_type: &mut ElementType) -> PResult<usize> {
+    let Some(&escape) = input.get(pos) else {
+        return Err(unexpected_end_of_string(pos));
+    };
+    let escape_pos = pos;
+    pos += 1;
+    match escape {
+        b'b' | b'f' | b'n' | b'r' | b't' | b'\\' | b'"' | b'/' => {
+            if *element_type == ElementType::TEXT {
+                *element_type = ElementType::TEXTJ;
+            }
+        }
+        b'u' => {
+            if pos + 4 > input.len() {
+                return Err(PError::Message {
+                    msg: "Incomplete unicode escape sequence".to_string(),
+                    location: Some(escape_pos),
+                });
+            }
+            if !input[pos..pos + 4].iter().all(|&h| is_hex_digit(h)) {
+                return Err(PError::Message {
+                    msg: "Invalid unicode escape sequence".to_string(),
+                    location: Some(escape_pos),
+                });
+            }
+            pos += 4;
+            if *element_type == ElementType::TEXT {
+                *element_type = ElementType::TEXTJ;
+            }
+        }
+        b'\n' | b'\'' | b'0' | b'v' => *element_type = ElementType::TEXT5,
+        b'\r' => {
+            if input.get(pos) == Some(&b'\n') {
+                pos += 1;
+            }
+            *element_type = ElementType::TEXT5;
+        }
+        0xe2 if pos + 1 < input.len()
+            && input[pos] == 0x80
+            && (input[pos + 1] == 0xa8 || input[pos + 1] == 0xa9) =>
+        {
+            pos += 2;
+            *element_type = ElementType::TEXT5;
+        }
+        b'x' => {
+            if pos + 2 > input.len() {
+                return Err(PError::Message {
+                    msg: "Incopmlete hex escape sequence".to_string(),
+                    location: Some(escape_pos),
+                });
+            }
+            if !input[pos..pos + 2].iter().all(|&h| is_hex_digit(h)) {
+                return Err(PError::Message {
+                    msg: "Invalid hex escape sequence".to_string(),
+                    location: Some(escape_pos),
+                });
+            }
+            pos += 2;
+            *element_type = ElementType::TEXT5;
+        }
+        _ => {
+            return Err(PError::Message {
+                msg: "Invalid escape sequence".to_string(),
+                location: Some(escape_pos),
+            });
+        }
+    }
+    Ok(pos)
+}
+
+fn unexpected_end_of_string(pos: usize) -> PError {
+    PError::Message {
+        msg: "Unexpected end of input".to_string(),
+        location: Some(pos),
+    }
+}
+
+#[inline(always)]
+fn append_bytes(data: &mut ValueBlob, bytes: &[u8]) {
+    let len = bytes.len();
+    if len > 32 {
+        data.extend_from_slice(bytes);
+        return;
+    }
+    data.reserve(len);
+    let old_len = data.len();
+    // SAFETY: `reserve` made room for `len` more bytes after `old_len`. Every
+    // read below is inside `bytes` and every write inside
+    // `old_len..old_len + len`, and the two ranges do not overlap because
+    // `bytes` is not part of `data`. The bytes are initialized before
+    // `set_len` makes them part of the vector.
+    unsafe {
+        let src = bytes.as_ptr();
+        let dst = data.as_mut_ptr().add(old_len);
+        if len >= 16 {
+            let head = src.cast::<[u8; 16]>().read_unaligned();
+            let tail = src.add(len - 16).cast::<[u8; 16]>().read_unaligned();
+            dst.cast::<[u8; 16]>().write_unaligned(head);
+            dst.add(len - 16).cast::<[u8; 16]>().write_unaligned(tail);
+        } else if len >= 8 {
+            let head = src.cast::<u64>().read_unaligned();
+            let tail = src.add(len - 8).cast::<u64>().read_unaligned();
+            dst.cast::<u64>().write_unaligned(head);
+            dst.add(len - 8).cast::<u64>().write_unaligned(tail);
+        } else if len >= 4 {
+            let head = src.cast::<u32>().read_unaligned();
+            let tail = src.add(len - 4).cast::<u32>().read_unaligned();
+            dst.cast::<u32>().write_unaligned(head);
+            dst.add(len - 4).cast::<u32>().write_unaligned(tail);
+        } else if len > 0 {
+            *dst = *src;
+            *dst.add(len / 2) = *src.add(len / 2);
+            *dst.add(len - 1) = *src.add(len - 1);
+        }
+        data.set_len(old_len + len);
+    }
+}
+
+#[cfg_attr(not(debug_assertions), inline(always))]
+fn scan_plain_json_number(input: &[u8], mut pos: usize) -> Option<(usize, bool)> {
+    let skip_digits = |mut pos: usize| {
+        while input.get(pos).is_some_and(u8::is_ascii_digit) {
+            pos += 1;
+        }
+        pos
+    };
+    if input.get(pos) == Some(&b'-') {
+        pos += 1;
+    }
+    match input.get(pos)? {
+        b'0' => pos += 1,
+        b'1'..=b'9' => pos = skip_digits(pos + 1),
+        _ => return None,
+    }
+    let mut is_float = false;
+    if input.get(pos) == Some(&b'.') {
+        let fraction_end = skip_digits(pos + 1);
+        if fraction_end == pos + 1 {
+            return None;
+        }
+        pos = fraction_end;
+        is_float = true;
+    }
+    if matches!(input.get(pos), Some(b'e' | b'E')) {
+        let mut exponent = pos + 1;
+        if matches!(input.get(exponent), Some(b'+' | b'-')) {
+            exponent += 1;
+        }
+        let exponent_end = skip_digits(exponent);
+        if exponent_end == exponent {
+            return None;
+        }
+        pos = exponent_end;
+        is_float = true;
+    }
+    if matches!(
+        input.get(pos),
+        Some(b'0'..=b'9' | b'.' | b'e' | b'E' | b'x' | b'X')
+    ) {
+        return None;
+    }
+    Some((pos, is_float))
+}
+
+#[inline(always)]
+fn find_string_special_byte(input: &[u8], pos: usize, quote: u8) -> usize {
+    #[cfg(target_arch = "x86_64")]
+    let pos = match find_string_special_byte_sse2(input, pos, quote) {
+        Ok(found) => return found,
+        Err(tail_start) => tail_start,
+    };
+    find_string_special_byte_swar(input, pos, quote)
+}
+
+#[inline]
+fn is_ascii_without_bytes_to_escape(
+    data: &[u8],
+    start: usize,
+    end: usize,
+    escape_quotes_and_backslashes: bool,
+) -> bool {
+    assert!(start <= end && end <= data.len());
+    let needs_no_escape = |byte: &u8| {
+        (0x20..0x80).contains(byte)
+            && !(escape_quotes_and_backslashes && (*byte == b'"' || *byte == b'\\'))
+    };
+    #[cfg(target_arch = "x86_64")]
+    {
+        let mut pos = start;
+        while pos + 16 <= end {
+            if bytes_to_escape_or_non_ascii_mask_sse2(data, pos, escape_quotes_and_backslashes) != 0
+            {
+                return false;
+            }
+            pos += 16;
+        }
+        if pos == end {
+            return true;
+        }
+        if pos + 16 <= data.len() {
+            let tail_bits = (1u32 << (end - pos)) - 1;
+            let mask =
+                bytes_to_escape_or_non_ascii_mask_sse2(data, pos, escape_quotes_and_backslashes);
+            return mask & tail_bits == 0;
+        }
+        data[pos..end].iter().all(needs_no_escape)
+    }
+    #[cfg(not(target_arch = "x86_64"))]
+    data[start..end].iter().all(needs_no_escape)
+}
+
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+fn bytes_to_escape_or_non_ascii_mask_sse2(
+    data: &[u8],
+    pos: usize,
+    escape_quotes_and_backslashes: bool,
+) -> u32 {
+    use std::arch::x86_64::{
+        _mm_cmpeq_epi8, _mm_loadu_si128, _mm_min_epu8, _mm_movemask_epi8, _mm_or_si128,
+        _mm_set1_epi8,
+    };
+    assert!(pos + 16 <= data.len());
+    // SAFETY: SSE2 is part of the x86_64 baseline, so these intrinsics are
+    // always available, and the assert above keeps the 16-byte unaligned
+    // load inside `data`.
+    unsafe {
+        let chunk = _mm_loadu_si128(data.as_ptr().add(pos).cast());
+        let mut special = _mm_cmpeq_epi8(_mm_min_epu8(chunk, _mm_set1_epi8(0x1F)), chunk);
+        if escape_quotes_and_backslashes {
+            let is_quote = _mm_cmpeq_epi8(chunk, _mm_set1_epi8(b'"' as i8));
+            let is_backslash = _mm_cmpeq_epi8(chunk, _mm_set1_epi8(b'\\' as i8));
+            special = _mm_or_si128(special, _mm_or_si128(is_quote, is_backslash));
+        }
+        (_mm_movemask_epi8(special) | _mm_movemask_epi8(chunk)) as u32
+    }
+}
+
+pub(crate) fn has_byte_to_escape(bytes: &[u8]) -> bool {
+    find_string_special_byte(bytes, 0, b'"') != bytes.len()
+}
+
+pub(crate) fn find_nul(input: &[u8]) -> Option<usize> {
+    #[cfg(target_arch = "x86_64")]
+    let pos = match find_nul_sse2(input) {
+        Ok(found) => return Some(found),
+        Err(tail_start) => tail_start,
+    };
+    #[cfg(not(target_arch = "x86_64"))]
+    let pos = 0;
+    find_nul_swar(input, pos)
+}
+
+#[cfg(target_arch = "x86_64")]
+fn find_nul_sse2(input: &[u8]) -> Result<usize, usize> {
+    use std::arch::x86_64::{
+        _mm_cmpeq_epi8, _mm_loadu_si128, _mm_min_epu8, _mm_movemask_epi8, _mm_setzero_si128,
+    };
+    let mut pos = 0;
+    // SAFETY: SSE2 is part of the x86_64 baseline, so these intrinsics are
+    // always available, and the loop conditions keep each unaligned load
+    // inside `input`.
+    unsafe {
+        let zero = _mm_setzero_si128();
+        while pos + 64 <= input.len() {
+            let block = input.as_ptr().add(pos);
+            let smallest = _mm_min_epu8(
+                _mm_min_epu8(
+                    _mm_loadu_si128(block.cast()),
+                    _mm_loadu_si128(block.add(16).cast()),
+                ),
+                _mm_min_epu8(
+                    _mm_loadu_si128(block.add(32).cast()),
+                    _mm_loadu_si128(block.add(48).cast()),
+                ),
+            );
+            if _mm_movemask_epi8(_mm_cmpeq_epi8(smallest, zero)) != 0 {
+                break;
+            }
+            pos += 64;
+        }
+        while pos + 16 <= input.len() {
+            let chunk = _mm_loadu_si128(input.as_ptr().add(pos).cast());
+            let mask = _mm_movemask_epi8(_mm_cmpeq_epi8(chunk, zero));
+            if mask != 0 {
+                return Ok(pos + mask.trailing_zeros() as usize);
+            }
+            pos += 16;
+        }
+    }
+    Err(pos)
+}
+
+fn find_nul_swar(input: &[u8], mut pos: usize) -> Option<usize> {
+    const ONES: u64 = u64::from_ne_bytes([0x01; 8]);
+    const HIGH_BITS: u64 = u64::from_ne_bytes([0x80; 8]);
+    while let Some(chunk) = input.get(pos..pos + 8) {
+        let word = u64::from_le_bytes(chunk.try_into().expect("chunk has 8 bytes"));
+        let zero_bytes = word.wrapping_sub(ONES) & !word & HIGH_BITS;
+        if zero_bytes != 0 {
+            return Some(pos + (zero_bytes.trailing_zeros() / 8) as usize);
+        }
+        pos += 8;
+    }
+    input[pos..].iter().position(|&b| b == 0).map(|i| pos + i)
+}
+
+#[cfg(target_arch = "x86_64")]
+#[inline(always)]
+fn find_string_special_byte_sse2(input: &[u8], mut pos: usize, quote: u8) -> Result<usize, usize> {
+    use std::arch::x86_64::{
+        _mm_cmpeq_epi8, _mm_loadu_si128, _mm_min_epu8, _mm_movemask_epi8, _mm_or_si128,
+        _mm_set1_epi8,
+    };
+    // SAFETY: SSE2 is part of the x86_64 baseline, so these intrinsics are
+    // always available, and the loop condition keeps each 16-byte unaligned
+    // load inside `input`.
+    unsafe {
+        let quotes = _mm_set1_epi8(quote as i8);
+        let backslashes = _mm_set1_epi8(b'\\' as i8);
+        let last_control = _mm_set1_epi8(0x1F);
+        while pos + 16 <= input.len() {
+            let chunk = _mm_loadu_si128(input.as_ptr().add(pos).cast());
+            let is_quote = _mm_cmpeq_epi8(chunk, quotes);
+            let is_backslash = _mm_cmpeq_epi8(chunk, backslashes);
+            let is_control = _mm_cmpeq_epi8(_mm_min_epu8(chunk, last_control), chunk);
+            let mask = _mm_movemask_epi8(_mm_or_si128(
+                _mm_or_si128(is_quote, is_backslash),
+                is_control,
+            ));
+            if mask != 0 {
+                return Ok(pos + mask.trailing_zeros() as usize);
+            }
+            pos += 16;
+        }
+    }
+    Err(pos)
+}
+
+#[inline(always)]
+fn find_string_special_byte_swar(input: &[u8], mut pos: usize, quote: u8) -> usize {
+    const ONES: u64 = u64::from_ne_bytes([0x01; 8]);
+    const HIGH_BITS: u64 = u64::from_ne_bytes([0x80; 8]);
+    let quotes = ONES * quote as u64;
+    let backslashes = ONES * b'\\' as u64;
+    while let Some(chunk) = input.get(pos..pos + 8) {
+        let word = u64::from_le_bytes(chunk.try_into().expect("chunk has 8 bytes"));
+        let quote_bytes = word ^ quotes;
+        let backslash_bytes = word ^ backslashes;
+        let matches = (quote_bytes.wrapping_sub(ONES) & !quote_bytes)
+            | (backslash_bytes.wrapping_sub(ONES) & !backslash_bytes)
+            | (word.wrapping_sub(ONES * 0x20) & !word);
+        let matches = matches & HIGH_BITS;
+        if matches != 0 {
+            return pos + (matches.trailing_zeros() / 8) as usize;
+        }
+        pos += 8;
+    }
+    while pos < input.len() {
+        let c = input[pos];
+        if c == quote || c == b'\\' || c < 0x20 {
+            return pos;
+        }
+        pos += 1;
+    }
+    pos
+}
+
+#[inline(never)]
+fn skip_whitespace_before_value(input: &[u8], pos: usize, info: &mut ParseInfo) -> PResult<usize> {
+    let value_pos = skip_whitespace_and_comments(input, pos, info);
+    if value_pos == pos {
+        return Err(PError::Message {
+            msg: "Unexpected character".to_string(),
+            location: Some(pos),
+        });
+    }
+    Ok(value_pos)
+}
+
 /// The common case is no whitespace at all, so the check for it must
 /// inline into the deserializers the way the pre-tracking
 /// implementation did: an outlined call here costs more than the
@@ -4284,7 +5072,7 @@ fn json5_whitespace_len(input: &[u8]) -> usize {
 #[inline(always)]
 pub fn skip_whitespace_tracking(input: &[u8], pos: usize, info: &mut ParseInfo) -> usize {
     // Fast path for non-whitespace, non-comment
-    if pos >= input.len() || ((WS_TABLE[input[pos] as usize] & 3) == 0 && input[pos] != b'/') {
+    if pos >= input.len() || WS_TABLE[input[pos] as usize] == 0 {
         return pos;
     }
     skip_whitespace_and_comments(input, pos, info)
@@ -4381,6 +5169,355 @@ mod tests {
     fn parse_has_json5(input: &str) -> bool {
         let (_, info) = Jsonb::from_str_tracking(input).unwrap();
         info.has_json5
+    }
+
+    #[test]
+    fn append_bytes_matches_extend_from_slice() {
+        let source: std::vec::Vec<u8> = (0..64u8).map(|b| b.wrapping_mul(37) ^ 0x5a).collect();
+        for prefix in 0..3 {
+            for len in 0..=40 {
+                let mut expected = crate::alloc::vec![0xeeu8; prefix];
+                expected.extend_from_slice(&source[..len]);
+                let mut actual = crate::alloc::vec![0xeeu8; prefix];
+                append_bytes(&mut actual, &source[..len]);
+                assert_eq!(actual, expected, "prefix {prefix}, len {len}");
+            }
+        }
+    }
+
+    #[test]
+    fn text_parse_does_not_grow_its_output_buffer() {
+        let long_string = format!("\"{}\"", "x".repeat(70_000));
+        let mut inputs: std::vec::Vec<String> = [
+            "1",
+            "-1",
+            ".5",
+            "+1",
+            "0x1",
+            "Infinity",
+            "-Infinity",
+            "NaN",
+            "[1]",
+            "[[[[[[[[[[1]]]]]]]]]]",
+            "{a:1}",
+            "{a:{b:{c:{d:[1]}}}}",
+            "[1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1]",
+            "\"\"",
+            "''",
+            "[]",
+            "{}",
+        ]
+        .iter()
+        .map(|input| input.to_string())
+        .collect();
+        inputs.push(format!("{}1{}", "[".repeat(400), "]".repeat(400)));
+        inputs.push(format!("[{}]", "\"x\",".repeat(300) + "1"));
+        inputs.push(format!(
+            "{}{long_string}{}",
+            "[".repeat(300),
+            "]".repeat(300)
+        ));
+        inputs.push(format!("{{\"k\":[{long_string},{long_string}]}}"));
+        for input in &inputs {
+            let (json, _) = Jsonb::from_str_tracking(input).unwrap();
+            assert!(json.len() <= 2 * input.len() + 16, "{input:.40}");
+        }
+    }
+
+    #[test]
+    fn is_valid_element_at_matches_the_full_check_for_scalars() {
+        for element_type in [
+            ElementType::NULL,
+            ElementType::TRUE,
+            ElementType::FALSE,
+            ElementType::INT,
+            ElementType::INT5,
+            ElementType::FLOAT,
+            ElementType::FLOAT5,
+        ] {
+            for payload in [&b""[..], b"1", b"-12", b"0x1F", b"1.5", b"x"] {
+                for one_byte_size in [false, true] {
+                    let mut data = std::vec::Vec::new();
+                    if one_byte_size {
+                        data.push(element_type as u8 | (SIZE_MARKER_8BIT << 4));
+                        data.push(payload.len() as u8);
+                    } else {
+                        data.push(element_type as u8 | ((payload.len() as u8) << 4));
+                    }
+                    data.extend_from_slice(payload);
+                    let full_check = element_bounds(&data, 0)
+                        .is_ok_and(|(_, _, end)| validate_element(&data, 0, end, 0, false).is_ok());
+                    assert_eq!(
+                        is_valid_element_at(&data, 0),
+                        full_check,
+                        "{element_type:?} {payload:?} {one_byte_size}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn lenient_scalar_check_accepts_exactly_the_scalars_the_full_check_accepts() {
+        for type_bits in 0..=12u8 {
+            let element_type = ElementType::try_from(type_bits).unwrap();
+            let is_scalar = !matches!(element_type, ElementType::ARRAY | ElementType::OBJECT);
+            for payload in [
+                &b""[..],
+                b"1",
+                b"-12",
+                b"1.5",
+                b"ab",
+                b"\xc3\xa9",
+                b"\xff",
+                b"\x00",
+            ] {
+                for one_byte_size in [false, true] {
+                    let mut data = std::vec::Vec::new();
+                    if one_byte_size {
+                        data.push(type_bits | (SIZE_MARKER_8BIT << 4));
+                        data.push(payload.len() as u8);
+                    } else {
+                        data.push(type_bits | ((payload.len() as u8) << 4));
+                    }
+                    data.extend_from_slice(payload);
+                    let (header, header_size) = JsonbHeader::from_slice(0, &data).unwrap();
+                    for parent_depth in [0, MAX_JSON_DEPTH - 1, MAX_JSON_DEPTH] {
+                        for strict in [false, true] {
+                            let full_check = validate_element_payload(
+                                &data,
+                                0,
+                                header,
+                                header_size,
+                                parent_depth + 1,
+                                strict,
+                            )
+                            .is_ok();
+                            assert_eq!(
+                                is_valid_scalar_in_lenient_check(
+                                    &data,
+                                    0,
+                                    header,
+                                    header_size,
+                                    parent_depth,
+                                    strict,
+                                ),
+                                full_check
+                                    && is_scalar
+                                    && !strict
+                                    && parent_depth < MAX_JSON_DEPTH,
+                                "{element_type:?} {payload:?} {one_byte_size} {parent_depth} {strict}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn ascii_without_bytes_to_escape_check_matches_a_byte_by_byte_check() {
+        for escape_quotes_and_backslashes in [false, true] {
+            let needs_no_escape = |byte: &u8| {
+                (0x20..0x80).contains(byte)
+                    && !(escape_quotes_and_backslashes && (*byte == b'"' || *byte == b'\\'))
+            };
+            for special in [b'"', b'\\', 0x00, 0x1F, 0x7F, 0x80, 0xFF] {
+                for special_pos in 0..40 {
+                    let mut data = [b'a'; 40];
+                    data[special_pos] = special;
+                    for end in 0..=data.len() {
+                        for start in 0..=end {
+                            assert_eq!(
+                                is_ascii_without_bytes_to_escape(
+                                    &data,
+                                    start,
+                                    end,
+                                    escape_quotes_and_backslashes
+                                ),
+                                data[start..end].iter().all(needs_no_escape),
+                                "{special:#x} at {special_pos}, {start}..{end}, {escape_quotes_and_backslashes}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn element_end_at_matches_element_bounds() {
+        let mut blobs: std::vec::Vec<std::vec::Vec<u8>> = std::vec::Vec::new();
+        for header_byte in 0..=255u8 {
+            for tail in [
+                &b""[..],
+                b"\x00",
+                b"\x03abc",
+                b"\x05ab",
+                b"\x00\x02xy",
+                b"abcdefghijklmnop",
+            ] {
+                let mut blob = vec![header_byte];
+                blob.extend_from_slice(tail);
+                blobs.push(blob);
+            }
+        }
+        for blob in &blobs {
+            let expected = element_bounds(blob, 0).map(|(_, _, end)| end).ok();
+            assert_eq!(element_end_at(blob, 0).ok(), expected, "{blob:?}");
+        }
+        assert!(element_end_at(b"\x13", 1).is_err());
+    }
+
+    #[test]
+    fn payload_as_str_matches_from_utf8() {
+        for payload in [
+            &b""[..],
+            b"user_12345",
+            "caf\u{e9}".as_bytes(),
+            "\u{1f600}".as_bytes(),
+            b"ab\xffcd",
+            b"\xc3",
+            b"abc\x80",
+        ] {
+            let expected = std::str::from_utf8(payload).map_err(|e| e.valid_up_to());
+            assert_eq!(
+                payload_as_str(payload).map_err(|e| e.valid_up_to()),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn plain_number_parse_matches_the_general_number_parser() {
+        for input in [
+            "0",
+            "-0",
+            "1",
+            "-1",
+            "123",
+            "1.5",
+            "-1.5e10",
+            "1E+5",
+            "1e-5",
+            "0.0",
+            "0e0",
+            "1.",
+            ".5",
+            "+1",
+            "01",
+            "-01",
+            "0x1F",
+            "0X1f",
+            "1.5.3",
+            "1e5e3",
+            "1e",
+            "1e+",
+            "-",
+            "-.5",
+            "Infinity",
+            "-Infinity",
+            "1x",
+            "12,",
+            "12]",
+            "12 ",
+            "12}",
+            "0,",
+            "-0]",
+            "9223372036854775808",
+            "0.5e",
+            "5e5.",
+            "1.5x",
+            "0.",
+        ] {
+            let bytes = input.as_bytes();
+            let mut plain = Jsonb::new(16).unwrap();
+            let mut general = Jsonb::new(16).unwrap();
+            let mut plain_info = ParseInfo::default();
+            let mut general_info = ParseInfo::default();
+            let plain_result = plain.deserialize_number(bytes, 0, &mut plain_info);
+            let general_result =
+                general.deserialize_number_of_any_form(bytes, 0, &mut general_info);
+            assert_eq!(
+                format!("{plain_result:?}"),
+                format!("{general_result:?}"),
+                "{input}"
+            );
+            if plain_result.is_ok() {
+                assert_eq!(plain.data, general.data, "{input}");
+                assert_eq!(plain_info.has_json5, general_info.has_json5, "{input}");
+            }
+        }
+    }
+
+    #[test]
+    fn nul_search_finds_the_first_nul() {
+        let fill = |input: &mut [u8]| {
+            for (i, byte) in input.iter_mut().enumerate() {
+                *byte = [b'a', 0x80, 0xFF, 0x01, b'"'][i % 5];
+            }
+        };
+        for len in 0..200 {
+            let mut input = vec![0; len];
+            fill(&mut input);
+            assert_eq!(find_nul(&input), None);
+            assert_eq!(find_nul_swar(&input, 0), None);
+            for first in 0..len {
+                fill(&mut input);
+                input[first] = 0;
+                for later in [first + 1, first + 17, first + 70] {
+                    if later < len {
+                        input[later] = 0;
+                    }
+                }
+                assert_eq!(find_nul(&input), Some(first), "len {len}, first {first}");
+                assert_eq!(
+                    find_nul_swar(&input, 0),
+                    Some(first),
+                    "len {len}, first {first}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn string_scan_stops_at_the_same_byte_as_a_byte_by_byte_scan() {
+        let mut state = 0x9E37_79B9_7F4A_7C15u64;
+        let mut next_byte = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state as u8
+        };
+        let special = [b'"', b'\'', b'\\', 0x00, 0x1F, 0x20, 0x7F, 0x80, 0xFF];
+        for len in 0..80 {
+            for _ in 0..100 {
+                let input: Vec<u8> = (0..len)
+                    .map(|_| match next_byte() {
+                        r @ 0..16 => special[r as usize % special.len()],
+                        r @ 16..64 => 0x80 | r,
+                        r => b'a' + r % 26,
+                    })
+                    .collect();
+                for quote in [b'"', b'\''] {
+                    for start in 0..=len {
+                        let expected = (start..len)
+                            .find(|&i| input[i] == quote || input[i] == b'\\' || input[i] < 0x20)
+                            .unwrap_or(len);
+                        assert_eq!(
+                            find_string_special_byte(&input, start, quote),
+                            expected,
+                            "input {input:?}, start {start}, quote {quote}"
+                        );
+                        assert_eq!(
+                            find_string_special_byte_swar(&input, start, quote),
+                            expected,
+                            "input {input:?}, start {start}, quote {quote}"
+                        );
+                    }
+                }
+            }
+        }
     }
 
     #[test]
@@ -5538,26 +6675,18 @@ mod path_operations_tests {
     #[test]
     fn test_search_operation() {
         let json_str = r#"{"person": {"name": "John", "age": 30}}"#;
-        let mut jsonb = Jsonb::from_str(json_str).unwrap();
+        let jsonb = Jsonb::from_str(json_str).unwrap();
 
-        // Create a search operation
-        let mut operation = SearchOperation::new(100).unwrap();
-
-        // Create a path to the "person" property
         let path = create_path(vec![
             PathElement::Root(),
             PathElement::Key(Cow::Borrowed("person"), false),
         ]);
 
-        // Execute the operation
-        let result = jsonb.operate_on_path(&path, &mut operation);
-        assert!(result.is_ok());
-
-        // Get the search result
-        let search_result = operation.result();
-        let result_str = search_result.to_string().unwrap();
-
-        // Verify the search found the correct value
+        let pos = find_path_element(jsonb.as_slice(), &path).unwrap().unwrap();
+        let result_str = element_at(jsonb.as_slice(), pos)
+            .unwrap()
+            .to_string()
+            .unwrap();
         assert_eq!(result_str, r#"{"name":"John","age":30}"#);
     }
 
@@ -5706,7 +6835,7 @@ mod path_operations_tests {
     }
 
     /// A child element whose declared size runs past the buffer must not reach
-    /// the slice in `SearchOperation` or the `drain` in `DeleteOperation`.
+    /// the slice in `element_at` or the `drain` in `DeleteOperation`.
     ///
     /// Blob-sourced documents are validated on the way in, so no SQL input
     /// reaches these ranges today. The checks exist because the sizes are
@@ -5718,18 +6847,17 @@ mod path_operations_tests {
     fn malformed_element_size_is_rejected_before_slicing() {
         // ARRAY (type 11, inline payload size 8) whose single child is a TEXT5
         // with a 1-byte size marker declaring 200 bytes, in a 9-byte buffer.
-        let bytes = [0x8Bu8, 0xC7, 0xC8, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00];
         let path = create_path(vec![
             PathElement::Root(),
             PathElement::ArrayLocator(Some(0)),
         ]);
 
-        let mut jsonb = Jsonb {
+        let jsonb = Jsonb {
             data: crate::alloc::vec![0x8B, 0xC7, 0xC8, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00],
         };
-        let mut search = SearchOperation::new(bytes.len()).unwrap();
+        let found = find_path_element(jsonb.as_slice(), &path).unwrap().unwrap();
         assert!(
-            jsonb.operate_on_path(&path, &mut search).is_err(),
+            element_at(jsonb.as_slice(), found).is_err(),
             "oversized child size must not be sliced out of bounds"
         );
 

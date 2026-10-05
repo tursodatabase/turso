@@ -193,6 +193,46 @@ fn first_nul(bytes: &[u8]) -> Option<usize> {
         .map(|i| base + i)
 }
 
+fn sqlite_text_char_count(s: &str) -> usize {
+    #[cfg(target_arch = "x86_64")]
+    if let Some(count) = ascii_len_before_nul_sse2(s.as_bytes()) {
+        return count;
+    }
+    sqlite_text_prefix(s).chars().count()
+}
+
+#[cfg(target_arch = "x86_64")]
+fn ascii_len_before_nul_sse2(bytes: &[u8]) -> Option<usize> {
+    use std::arch::x86_64::{
+        _mm_cmpeq_epi8, _mm_loadu_si128, _mm_movemask_epi8, _mm_setzero_si128,
+    };
+    let mut pos = 0;
+    // SAFETY: SSE2 is part of the x86_64 baseline, so these intrinsics are
+    // always available, and the loop condition keeps each 16-byte unaligned
+    // load inside `bytes`.
+    unsafe {
+        let zero = _mm_setzero_si128();
+        while pos + 16 <= bytes.len() {
+            let chunk = _mm_loadu_si128(bytes.as_ptr().add(pos).cast());
+            let nul_bits = _mm_movemask_epi8(_mm_cmpeq_epi8(chunk, zero)) as u32;
+            let non_ascii_bits = _mm_movemask_epi8(chunk) as u32;
+            if nul_bits != 0 {
+                let nul_offset = nul_bits.trailing_zeros();
+                let bits_before_nul = (1u32 << nul_offset) - 1;
+                return (non_ascii_bits & bits_before_nul == 0)
+                    .then_some(pos + nul_offset as usize);
+            }
+            if non_ascii_bits != 0 {
+                return None;
+            }
+            pos += 16;
+        }
+    }
+    let tail = &bytes[pos..];
+    let tail_len = tail.iter().position(|&b| b == 0).unwrap_or(tail.len());
+    tail[..tail_len].is_ascii().then_some(pos + tail_len)
+}
+
 enum TrimType {
     All,
     Left,
@@ -207,9 +247,7 @@ impl Value {
 
     pub fn exec_length(&self) -> Self {
         match self {
-            Value::Text(t) => {
-                Value::from_i64(sqlite_text_prefix(t.as_str()).chars().count() as i64)
-            }
+            Value::Text(t) => Value::from_i64(sqlite_text_char_count(t.as_str()) as i64),
             Value::Numeric(_) => {
                 // For numbers, SQLite returns the length of the string representation
                 Value::from_i64(self.to_string().chars().count() as i64)
@@ -2888,6 +2926,25 @@ mod tests {
     fn test_like_with_escape_or_regexmeta_chars() {
         assert!(Value::exec_like(r#"\%A"#, r#"\A"#, None).unwrap());
         assert!(Value::exec_like("%a%a", "aaaa", None).unwrap());
+    }
+
+    #[test]
+    fn text_char_count_matches_counting_chars_before_the_first_nul() {
+        for len in 0..40 {
+            for special_pos in 0..len {
+                for special in ["\0", "é", "日"] {
+                    let mut text = "a".repeat(len);
+                    text.replace_range(special_pos..special_pos + 1, special);
+                    for second_special in ["", "\0", "é"] {
+                        let text = format!("{text}{second_special}b");
+                        let expected = super::sqlite_text_prefix(&text).chars().count();
+                        assert_eq!(super::sqlite_text_char_count(&text), expected, "{text:?}");
+                    }
+                }
+            }
+            let text = "a".repeat(len);
+            assert_eq!(super::sqlite_text_char_count(&text), len);
+        }
     }
 
     #[test]

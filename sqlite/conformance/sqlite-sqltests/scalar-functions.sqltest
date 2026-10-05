@@ -2091,6 +2091,17 @@ expect {
     1
 }
 
+test length-of-long-text-stops-at-nul {
+    SELECT length(printf('%.20c', 'a') || char(0) || 'b'),
+           length(printf('%.40c', 'a')),
+           length(printf('%.18c', 'a') || char(233) || char(0) || 'bb'),
+           length(printf('%.17c', 'a') || char(0) || char(233) || 'bb'),
+           length(printf('%.33c', 'a') || char(26085, 26412));
+}
+expect {
+    20|40|19|17|35
+}
+
 # refer https://github.com/tursodatabase/turso/issues/3285
 test sum-1 {
     select sum('1'+'2');

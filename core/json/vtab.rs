@@ -6,12 +6,14 @@ use turso_ext::{ConstraintOp, ConstraintUsage, ResultCode};
 
 use crate::{
     json::{
-        convert_dbtype_to_jsonb, json_path_from_db_value,
-        jsonb::{IteratorState, Jsonb, SearchOperation},
+        jsonb::{IteratorState, Jsonb},
+        parse_strict_into,
         path::{json_path, JsonPath, PathElement},
         vtab::columns::{Columns, Key},
-        Conv,
+        JsonCacheCell,
     },
+    types::AsValueRef,
+    vdbe::Register,
     vtab::{InternalVirtualTable, InternalVirtualTableCursor},
     Connection, LimboError, Value,
 };
@@ -164,19 +166,8 @@ impl InternalVirtualTable for JsonVirtualTable {
     }
 
     fn sql(&self) -> String {
-        "CREATE TABLE x(
-            key ANY,             -- key for current element relative to its parent
-            value ANY,           -- value for the current element
-            type TEXT,           -- 'object','array','string','integer', etc.
-            atom ANY,            -- value for primitive types, null for array & object
-            id INTEGER,          -- integer ID for this element
-            parent INTEGER,      -- integer ID for the parent of this element
-            fullkey TEXT,        -- full path describing the current element
-            path TEXT,           -- path to the container of the current row
-            json JSON HIDDEN,    -- 1st input parameter: the raw JSON
-            root TEXT HIDDEN     -- 2nd input parameter: the PATH at which to start
-        );"
-        .to_owned()
+        "CREATE TABLE x(key, value, type, atom, id, parent, fullkey, path, json HIDDEN, root HIDDEN)"
+            .to_owned()
     }
 }
 
@@ -193,6 +184,9 @@ pub struct JsonEachCursor {
     traversal_states: Vec<TraversalState>,
     columns: Columns,
     traversal_mode: JsonTraversalMode,
+    object_key: String,
+    root_path: Option<RootPath>,
+    pop_path_before_next: bool,
 }
 
 struct TraversalState {
@@ -211,6 +205,9 @@ impl JsonEachCursor {
             path_to_current_value: InPlaceJsonPath::new_root(),
             columns: Columns::default(),
             traversal_mode,
+            object_key: String::new(),
+            root_path: None,
+            pop_path_before_next: false,
         }
     }
 
@@ -250,8 +247,157 @@ impl InternalVirtualTableCursor for JsonEachCursor {
         _idx_str: Option<String>,
         _idx_num: i32,
     ) -> Result<bool, LimboError> {
+        self.filter_document(args, None)
+    }
+
+    fn filter_with_json_cache(
+        &mut self,
+        args: &[Value],
+        _idx_str: Option<String>,
+        _idx_num: i32,
+        json_cache: &JsonCacheCell,
+    ) -> Result<bool, LimboError> {
+        self.filter_document(args, Some(json_cache))
+    }
+
+    fn next(&mut self) -> Result<bool, LimboError> {
+        if std::mem::take(&mut self.pop_path_before_next) {
+            self.path_to_current_value.pop();
+        }
+        self.rowid += 1;
+        if self.traversal_states.is_empty() {
+            return Ok(false);
+        }
+
+        let traversal_state = self
+            .traversal_states
+            .pop()
+            .expect("traversal state stack is empty");
+
+        let parent_id = if matches!(self.traversal_mode, JsonTraversalMode::Tree) {
+            traversal_state.parent_id
+        } else {
+            None
+        };
+        match traversal_state.iterator_state {
+            IteratorState::Array(state) => {
+                let Some(((idx, value), new_state)) = self.json.array_iterator_next(&state) else {
+                    self.path_to_current_value.pop();
+                    return self.next();
+                };
+
+                let recursing_iterator = if matches!(self.traversal_mode, JsonTraversalMode::Tree) {
+                    self.json
+                        .container_property_iterator(&IteratorState::Array(state))
+                } else {
+                    None
+                };
+                self.push_state(
+                    IteratorState::Array(new_state),
+                    self.path_to_current_value.cursor(),
+                );
+                let recurses = recursing_iterator.is_some();
+                self.path_to_current_value.push_array_index(idx);
+                if let Some(it) = recursing_iterator {
+                    self.push_state(it, self.path_to_current_value.cursor());
+                }
+
+                self.columns.set(
+                    self.path_to_current_value.key(),
+                    value,
+                    self.path_to_current_value.cursor(),
+                    parent_id,
+                    traversal_state.innermost_container_cursor,
+                );
+                self.pop_path_before_next = !recurses;
+            }
+            IteratorState::Object(state) => {
+                let Some(((_idx, key, value), new_state)) = self.json.object_iterator_next(&state)
+                else {
+                    self.path_to_current_value.pop();
+                    return self.next();
+                };
+
+                self.push_state(
+                    IteratorState::Object(new_state),
+                    self.path_to_current_value.cursor(),
+                );
+                self.object_key.clear();
+                self.json.write_element_text(key, &mut self.object_key)?;
+                self.path_to_current_value
+                    .push_object_key(&self.object_key)?;
+                let recursing = matches!(self.traversal_mode, JsonTraversalMode::Tree)
+                    && self
+                        .json
+                        .container_property_iterator(&IteratorState::Object(state))
+                        .is_some_and(|it| {
+                            self.push_state(it, self.path_to_current_value.cursor());
+                            true
+                        });
+
+                self.columns.set(
+                    self.path_to_current_value.key(),
+                    value,
+                    self.path_to_current_value.cursor(),
+                    parent_id,
+                    traversal_state.innermost_container_cursor,
+                );
+                self.pop_path_before_next = !recursing;
+            }
+            IteratorState::Primitive(value) => {
+                let key = match self.traversal_mode {
+                    JsonTraversalMode::Each => &Key::None,
+                    JsonTraversalMode::Tree => self.path_to_current_value.key(),
+                };
+                self.columns.set(
+                    key,
+                    value,
+                    self.path_to_current_value.cursor(),
+                    None,
+                    traversal_state.innermost_container_cursor,
+                );
+            }
+        };
+
+        Ok(true)
+    }
+
+    fn rowid(&self) -> i64 {
+        self.rowid
+    }
+
+    fn column(&self, idx: usize) -> Result<Value, LimboError> {
+        Ok(match idx {
+            COL_KEY => self.columns.key(),
+            COL_VALUE => self.columns.value(&self.json)?,
+            COL_TYPE => self.columns.ttype(&self.json),
+            COL_ATOM => self.columns.atom(&self.json)?,
+            COL_ID => Value::from_i64(self.rowid),
+            COL_PARENT => self.columns.parent(),
+            COL_FULLKEY => self.columns.fullkey(&self.path_to_current_value.string),
+            COL_PATH => self.columns.path(&self.path_to_current_value.string),
+            _ => Value::Null,
+        })
+    }
+
+    fn column_into(&self, idx: usize, dest: &mut Register) -> Result<(), LimboError> {
+        if matches!(idx, COL_VALUE | COL_ATOM) && self.columns.write_text_atom(&self.json, dest)? {
+            return Ok(());
+        }
+        dest.set_value(self.column(idx)?);
+        Ok(())
+    }
+}
+
+impl JsonEachCursor {
+    fn filter_document(
+        &mut self,
+        args: &[Value],
+        json_cache: Option<&JsonCacheCell>,
+    ) -> Result<bool, LimboError> {
         self.traversal_states.clear();
         self.rowid = 0;
+        self.pop_path_before_next = false;
 
         if args.is_empty() || args[0] == Value::Null {
             return Ok(false);
@@ -273,29 +419,38 @@ impl InternalVirtualTableCursor for JsonEachCursor {
             }
         }
 
-        let mut jsonb = convert_dbtype_to_jsonb(&args[0], Conv::Strict)?;
+        match json_cache {
+            Some(cache) if !cache.is_empty() => {
+                cache.with_parsed_jsonb(&args[0], parse_strict_into, |cached| {
+                    self.json.replace_with_copy_of(cached)
+                })?
+            }
+            _ => parse_strict_into(args[0].as_value_ref(), &mut self.json)?,
+        }
 
-        let (path, root_json) = if args.len() == 1 {
-            let path = "$";
-            (path, jsonb)
+        let root = if args.len() == 1 {
+            self.path_to_current_value.reset_to_root();
+            0
         } else {
             let Value::Text(path) = &args[1] else {
                 return Err(LimboError::InvalidArgument(
                     "root path should be text".to_owned(),
                 ));
             };
-            let root_json = if let Some(json) = navigate_to_path(&mut jsonb, &args[1])? {
-                json
-            } else {
+            let root_path = match self.root_path.take() {
+                Some(root_path) if root_path.text == path.as_str() => root_path,
+                _ => RootPath::parse(path.as_str())?,
+            };
+            let found = jsonb::find_path_element(self.json.as_slice(), &root_path.path);
+            self.path_to_current_value.clone_from(&root_path.start);
+            self.root_path = Some(root_path);
+            let Ok(Some(root)) = found else {
                 return Ok(false);
             };
-            (path.as_str(), root_json)
+            root
         };
 
-        self.json = root_json;
-        self.path_to_current_value =
-            InPlaceJsonPath::from_json_path(path.to_owned(), json_path(path)?);
-        let iterator_state = json_iterator_from(&self.json)?;
+        let iterator_state = json_iterator_from(&self.json, root)?;
         let innermost_container_path = if matches!(self.traversal_mode, JsonTraversalMode::Tree)
             && matches!(iterator_state, IteratorState::Primitive(_))
         {
@@ -305,7 +460,6 @@ impl InternalVirtualTableCursor for JsonEachCursor {
         };
         self.push_state(iterator_state, innermost_container_path);
 
-        let key = self.path_to_current_value.key().to_owned();
         match self.traversal_mode {
             JsonTraversalMode::Each => self.next(),
             JsonTraversalMode::Tree => {
@@ -315,161 +469,30 @@ impl InternalVirtualTableCursor for JsonEachCursor {
                 if matches!(state.iterator_state, IteratorState::Primitive(_)) {
                     self.next()
                 } else {
-                    self.columns = Columns::new(
-                        key,
-                        self.json.clone(),
-                        self.path_to_current_value.string.clone(),
+                    self.columns.set(
+                        self.path_to_current_value.key(),
+                        root,
+                        self.path_to_current_value.cursor(),
                         None,
-                        self.path_to_current_value
-                            .read(self.path_to_current_value.cursor_before_last_element())
-                            .to_owned(),
+                        self.path_to_current_value.cursor_before_last_element(),
                     );
                     Ok(true)
                 }
             }
         }
     }
-
-    fn next(&mut self) -> Result<bool, LimboError> {
-        self.rowid += 1;
-        if self.traversal_states.is_empty() {
-            return Ok(false);
-        }
-
-        let traversal_state = self
-            .traversal_states
-            .pop()
-            .expect("traversal state stack is empty");
-
-        let parent_id = if matches!(self.traversal_mode, JsonTraversalMode::Tree) {
-            traversal_state.parent_id
-        } else {
-            None
-        };
-        match traversal_state.iterator_state {
-            IteratorState::Array(state) => {
-                let Some(((idx, value), new_state)) = self.json.array_iterator_next(&state)? else {
-                    self.path_to_current_value.pop();
-                    return self.next();
-                };
-
-                let recursing_iterator = if matches!(self.traversal_mode, JsonTraversalMode::Tree) {
-                    self.json
-                        .container_property_iterator(&IteratorState::Array(state))
-                } else {
-                    None
-                };
-                self.push_state(
-                    IteratorState::Array(new_state),
-                    self.path_to_current_value.cursor(),
-                );
-                let recurses = recursing_iterator.is_some();
-                self.path_to_current_value.push_array_index(&idx);
-                if let Some(it) = recursing_iterator {
-                    self.push_state(it, self.path_to_current_value.cursor());
-                }
-
-                let key = self.path_to_current_value.key().to_owned();
-                self.columns = Columns::new(
-                    key,
-                    value,
-                    self.path_to_current_value.string.clone(),
-                    parent_id,
-                    self.path_to_current_value
-                        .read(traversal_state.innermost_container_cursor)
-                        .to_owned(),
-                );
-
-                if !recurses {
-                    self.path_to_current_value.pop();
-                }
-            }
-            IteratorState::Object(state) => {
-                let Some(((_idx, key, value), new_state)) =
-                    self.json.object_iterator_next(&state)?
-                else {
-                    self.path_to_current_value.pop();
-                    return self.next();
-                };
-
-                self.push_state(
-                    IteratorState::Object(new_state),
-                    self.path_to_current_value.cursor(),
-                );
-                self.path_to_current_value
-                    .push_object_key(&key.to_string()?)?;
-                let recursing = matches!(self.traversal_mode, JsonTraversalMode::Tree)
-                    && self
-                        .json
-                        .container_property_iterator(&IteratorState::Object(state))
-                        .is_some_and(|it| {
-                            self.push_state(it, self.path_to_current_value.cursor());
-                            true
-                        });
-
-                self.columns = Columns::new(
-                    self.path_to_current_value.key().to_owned(),
-                    value,
-                    self.path_to_current_value.string.clone(),
-                    parent_id,
-                    self.path_to_current_value
-                        .read(traversal_state.innermost_container_cursor)
-                        .to_owned(),
-                );
-
-                if !recursing {
-                    self.path_to_current_value.pop();
-                }
-            }
-            IteratorState::Primitive(jsonb) => {
-                let key = match self.traversal_mode {
-                    JsonTraversalMode::Each => Key::None,
-                    JsonTraversalMode::Tree => self.path_to_current_value.key().to_owned(),
-                };
-                self.columns = Columns::new(
-                    key,
-                    jsonb,
-                    self.path_to_current_value.string.clone(),
-                    None,
-                    self.path_to_current_value
-                        .read(traversal_state.innermost_container_cursor)
-                        .to_owned(),
-                );
-            }
-        };
-
-        Ok(true)
-    }
-
-    fn rowid(&self) -> i64 {
-        self.rowid
-    }
-
-    fn column(&self, idx: usize) -> Result<Value, LimboError> {
-        Ok(match idx {
-            COL_KEY => self.columns.key(),
-            COL_VALUE => self.columns.value()?,
-            COL_TYPE => self.columns.ttype(),
-            COL_ATOM => self.columns.atom()?,
-            COL_ID => Value::from_i64(self.rowid),
-            COL_PARENT => self.columns.parent(),
-            COL_FULLKEY => self.columns.fullkey(),
-            COL_PATH => self.columns.path(),
-            _ => Value::Null,
-        })
-    }
 }
 
-fn json_iterator_from(json: &Jsonb) -> crate::Result<IteratorState> {
-    let json_element_type = json.element_type()?;
+fn json_iterator_from(json: &Jsonb, pos: usize) -> crate::Result<IteratorState> {
+    let json_element_type = json.element_type_at(pos)?;
     match json_element_type {
         jsonb::ElementType::ARRAY => {
-            let iter = json.array_iterator()?;
+            let iter = json.array_iterator(pos)?;
             Ok(IteratorState::Array(iter))
         }
 
         jsonb::ElementType::OBJECT => {
-            let iter = json.object_iterator()?;
+            let iter = json.object_iterator(pos)?;
             Ok(IteratorState::Object(iter))
         }
         jsonb::ElementType::NULL
@@ -482,7 +505,7 @@ fn json_iterator_from(json: &Jsonb) -> crate::Result<IteratorState> {
         | jsonb::ElementType::TEXT
         | jsonb::ElementType::TEXT5
         | jsonb::ElementType::TEXTJ
-        | jsonb::ElementType::TEXTRAW => Ok(IteratorState::Primitive(json.clone())),
+        | jsonb::ElementType::TEXTRAW => Ok(IteratorState::Primitive(pos)),
         jsonb::ElementType::RESERVED1
         | jsonb::ElementType::RESERVED2
         | jsonb::ElementType::RESERVED3 => {
@@ -490,36 +513,42 @@ fn json_iterator_from(json: &Jsonb) -> crate::Result<IteratorState> {
         }
     }
 }
-fn navigate_to_path(jsonb: &mut Jsonb, path: &Value) -> Result<Option<Jsonb>, LimboError> {
-    let json_path = json_path_from_db_value(path, true)?.ok_or_else(|| {
-        LimboError::InvalidArgument(format!("path '{path}' is not a valid json path"))
-    })?;
-    let mut search_operation = SearchOperation::new(jsonb.len() / 2)?;
-    if jsonb
-        .operate_on_path(&json_path, &mut search_operation)
-        .is_err()
-    {
-        return Ok(None);
-    }
-    Ok(Some(search_operation.result()))
-}
 
 mod columns {
     use crate::{
         json::{
-            json_string_to_db_type,
+            element_to_db_type,
             jsonb::{self, ElementType, Jsonb},
             OutputVariant,
         },
         types::Text,
+        vdbe::Register,
         LimboError, Value,
     };
 
-    #[derive(Debug, Clone)]
+    #[derive(Debug)]
     pub(super) enum Key {
         Integer(i64),
         String(String),
         None,
+    }
+
+    impl Clone for Key {
+        fn clone(&self) -> Self {
+            match self {
+                Key::Integer(i) => Key::Integer(*i),
+                Key::String(s) => Key::String(s.clone()),
+                Key::None => Key::None,
+            }
+        }
+
+        fn clone_from(&mut self, source: &Self) {
+            if let (Key::String(target), Key::String(source)) = (&mut *self, source) {
+                target.clone_from(source);
+                return;
+            }
+            *self = source.clone();
+        }
     }
 
     impl Key {
@@ -538,52 +567,53 @@ mod columns {
 
     pub(super) struct Columns {
         key: Key,
-        value: Jsonb,
-        fullkey: String,
+        value: usize,
+        fullkey_len: usize,
         parent_id: Option<i64>,
-        innermost_container_path: String,
+        innermost_container_path_len: usize,
     }
 
     impl Default for Columns {
         fn default() -> Columns {
             Self {
                 key: Key::empty(),
-                value: Jsonb::empty(),
-                fullkey: "".to_owned(),
+                value: 0,
+                fullkey_len: 0,
                 parent_id: None,
-                innermost_container_path: "".to_owned(),
+                innermost_container_path_len: 0,
             }
         }
     }
 
     impl Columns {
-        pub(super) fn new(
-            key: Key,
-            value: Jsonb,
-            fullkey: String,
+        pub(super) fn set(
+            &mut self,
+            key: &Key,
+            value: usize,
+            fullkey_len: usize,
             parent_id: Option<i64>,
-            innermost_container_path: String,
-        ) -> Self {
-            Self {
-                key,
-                value,
-                parent_id,
-                fullkey,
-                innermost_container_path,
-            }
+            innermost_container_path_len: usize,
+        ) {
+            self.key.clone_from(key);
+            self.value = value;
+            self.fullkey_len = fullkey_len;
+            self.parent_id = parent_id;
+            self.innermost_container_path_len = innermost_container_path_len;
         }
 
-        pub(super) fn atom(&self) -> Result<Value, LimboError> {
-            Self::atom_from_value(&self.value)
+        pub(super) fn atom(&self, json: &Jsonb) -> Result<Value, LimboError> {
+            Self::atom_at(json, self.value)
         }
 
-        pub(super) fn value(&self) -> Result<Value, LimboError> {
-            let element_type = self.value.element_type()?;
+        pub(super) fn value(&self, json: &Jsonb) -> Result<Value, LimboError> {
+            let element_type = json.element_type_at(self.value)?;
             Ok(match element_type {
                 ElementType::ARRAY | ElementType::OBJECT => {
-                    json_string_to_db_type(self.value.clone(), element_type, OutputVariant::String)?
+                    let mut text = String::new();
+                    json.write_element_text(self.value, &mut text)?;
+                    Value::Text(Text::json(text))
                 }
-                _ => Self::atom_from_value(&self.value)?,
+                _ => Self::atom_at(json, self.value)?,
             })
         }
 
@@ -591,54 +621,68 @@ mod columns {
             self.key.key_representation()
         }
 
-        fn atom_from_value(value: &Jsonb) -> Result<Value, LimboError> {
-            let element_type = value.element_type().expect("invalid value");
-            let string: Result<Value, LimboError> = match element_type {
-                jsonb::ElementType::NULL => Ok(Value::Null),
-                jsonb::ElementType::TRUE => Ok(Value::from_i64(1)),
-                jsonb::ElementType::FALSE => Ok(Value::from_i64(0)),
-                jsonb::ElementType::INT | jsonb::ElementType::INT5 => Self::jsonb_to_integer(value),
-                jsonb::ElementType::FLOAT | jsonb::ElementType::FLOAT5 => {
-                    Self::jsonb_to_float(value)
-                }
-                jsonb::ElementType::TEXT
-                | jsonb::ElementType::TEXTJ
-                | jsonb::ElementType::TEXT5
-                | jsonb::ElementType::TEXTRAW => json_string_to_db_type(
-                    value.clone(),
-                    element_type,
-                    OutputVariant::ElementTypePlain,
-                ),
-                jsonb::ElementType::ARRAY => Ok(Value::Null),
-                jsonb::ElementType::OBJECT => Ok(Value::Null),
-                jsonb::ElementType::RESERVED1 => Ok(Value::Null),
-                jsonb::ElementType::RESERVED2 => Ok(Value::Null),
-                jsonb::ElementType::RESERVED3 => Ok(Value::Null),
+        pub(super) fn write_text_atom(
+            &self,
+            json: &Jsonb,
+            dest: &mut Register,
+        ) -> Result<bool, LimboError> {
+            let Ok((element_type, payload)) = jsonb::element_payload(json.as_slice(), self.value)
+            else {
+                return Ok(false);
             };
-
-            string
+            if !matches!(element_type, ElementType::TEXT | ElementType::TEXTRAW) {
+                return Ok(false);
+            }
+            let Ok(text) = std::str::from_utf8(payload) else {
+                return Ok(false);
+            };
+            match dest {
+                Register::Value(Value::Text(existing)) => {
+                    existing.replace_with_bytes(text.as_bytes())?
+                }
+                _ => dest.set_text(Text::new(text.to_string()))?,
+            }
+            Ok(true)
         }
 
-        fn jsonb_to_integer(value: &Jsonb) -> Result<Value, LimboError> {
-            let string = value.to_string()?;
-            let int = string.parse::<i64>()?;
-
-            Ok(Value::from_i64(int))
+        fn atom_at(json: &Jsonb, pos: usize) -> Result<Value, LimboError> {
+            let (element_type, payload) = jsonb::element_payload(json.as_slice(), pos)?;
+            match element_type {
+                ElementType::NULL => Ok(Value::Null),
+                ElementType::TRUE => Ok(Value::from_i64(1)),
+                ElementType::FALSE => Ok(Value::from_i64(0)),
+                ElementType::INT => Ok(Value::from_i64(number_text(payload)?.parse::<i64>()?)),
+                ElementType::FLOAT => Ok(Value::from_f64(number_text(payload)?.parse::<f64>()?)),
+                ElementType::INT5 => {
+                    let string = jsonb::element_at(json.as_slice(), pos)?.to_string()?;
+                    Ok(Value::from_i64(string.parse::<i64>()?))
+                }
+                ElementType::FLOAT5 => {
+                    let string = jsonb::element_at(json.as_slice(), pos)?.to_string()?;
+                    Ok(Value::from_f64(string.parse::<f64>()?))
+                }
+                ElementType::TEXT
+                | ElementType::TEXTJ
+                | ElementType::TEXT5
+                | ElementType::TEXTRAW => {
+                    element_to_db_type(json.as_slice(), pos, OutputVariant::ElementTypePlain)
+                }
+                ElementType::ARRAY
+                | ElementType::OBJECT
+                | ElementType::RESERVED1
+                | ElementType::RESERVED2
+                | ElementType::RESERVED3 => Ok(Value::Null),
+            }
         }
 
-        fn jsonb_to_float(value: &Jsonb) -> Result<Value, LimboError> {
-            let string = value.to_string()?;
-            let float = string.parse::<f64>()?;
-
-            Ok(Value::from_f64(float))
+        pub(super) fn fullkey(&self, path: &str) -> Value {
+            Value::Text(Text::new(path[..self.fullkey_len].to_owned()))
         }
 
-        pub(super) fn fullkey(&self) -> Value {
-            Value::Text(Text::new(self.fullkey.clone()))
-        }
-
-        pub(super) fn path(&self) -> Value {
-            Value::Text(Text::new(self.innermost_container_path.clone()))
+        pub(super) fn path(&self, path: &str) -> Value {
+            Value::Text(Text::new(
+                path[..self.innermost_container_path_len].to_owned(),
+            ))
         }
 
         pub(super) fn parent(&self) -> Value {
@@ -648,8 +692,8 @@ mod columns {
             }
         }
 
-        pub(super) fn ttype(&self) -> Value {
-            let element_type = self.value.element_type().expect("invalid value");
+        pub(super) fn ttype(&self, json: &Jsonb) -> Value {
+            let element_type = json.element_type_at(self.value).expect("invalid value");
             let ttype = match element_type {
                 jsonb::ElementType::NULL => "null",
                 jsonb::ElementType::TRUE => "true",
@@ -670,12 +714,52 @@ mod columns {
             Value::Text(Text::new(ttype))
         }
     }
+
+    fn number_text(payload: &[u8]) -> Result<&str, LimboError> {
+        std::str::from_utf8(payload)
+            .map_err(|_| LimboError::ParseError("Failed to parse integer".to_string()))
+    }
+}
+
+struct RootPath {
+    text: String,
+    path: JsonPath<'static>,
+    start: InPlaceJsonPath,
+}
+
+impl RootPath {
+    fn parse(text: &str) -> crate::Result<Self> {
+        let path = json_path(text)?.into_owned();
+        let mut start = InPlaceJsonPath::new_root();
+        start.reset_to(text, &path);
+        Ok(Self {
+            text: text.to_owned(),
+            path,
+            start,
+        })
+    }
 }
 
 struct InPlaceJsonPath {
     string: String,
     element_lengths: Vec<usize>,
     last_element: Key,
+}
+
+impl Clone for InPlaceJsonPath {
+    fn clone(&self) -> Self {
+        Self {
+            string: self.string.clone(),
+            element_lengths: self.element_lengths.clone(),
+            last_element: self.last_element.clone(),
+        }
+    }
+
+    fn clone_from(&mut self, source: &Self) {
+        self.string.clone_from(&source.string);
+        self.element_lengths.clone_from(&source.element_lengths);
+        self.last_element.clone_from(&source.last_element);
+    }
 }
 
 type InPlaceJsonPathCursor = usize;
@@ -697,9 +781,28 @@ impl InPlaceJsonPath {
         }
     }
 
-    fn push_array_index(&mut self, idx: &usize) {
-        self.last_element = Key::Integer(*idx as i64);
-        self.push(format!("[{idx}]"));
+    fn push_array_index(&mut self, idx: usize) {
+        self.last_element = Key::Integer(idx as i64);
+        let start = self.string.len();
+        self.string.push('[');
+        push_decimal(&mut self.string, idx);
+        self.string.push(']');
+        self.element_lengths.push(self.string.len() - start);
+
+        fn push_decimal(string: &mut String, mut value: usize) {
+            let mut digits = [0u8; 20];
+            let mut first = digits.len();
+            loop {
+                first -= 1;
+                digits[first] = b'0' + (value % 10) as u8;
+                value /= 10;
+                if value == 0 {
+                    break;
+                }
+            }
+            string
+                .push_str(std::str::from_utf8(&digits[first..]).expect("decimal digits are ASCII"));
+        }
     }
 
     fn push_object_key(&mut self, key: &str) -> crate::Result<()> {
@@ -719,57 +822,52 @@ impl InPlaceJsonPath {
             }
         };
         let unquoted_if_necessary = if needs_quotes { key } else { inner };
-        self.last_element = Key::String(inner.to_owned());
-        self.push(format!(".{unquoted_if_necessary}"));
+        match &mut self.last_element {
+            Key::String(last_key) => {
+                last_key.clear();
+                last_key.push_str(inner);
+            }
+            last_element => *last_element = Key::String(inner.to_owned()),
+        }
+        let start = self.string.len();
+        self.string.push('.');
+        self.string.push_str(unquoted_if_necessary);
+        self.element_lengths.push(self.string.len() - start);
         Ok(())
-    }
-
-    fn push(&mut self, element: String) {
-        self.element_lengths.push(element.len());
-        self.string.push_str(&element);
     }
 
     fn cursor(&self) -> InPlaceJsonPathCursor {
         self.string.len()
     }
 
-    fn read(&self, cursor: InPlaceJsonPathCursor) -> &str {
-        &self.string[0..cursor]
+    fn reset_to_root(&mut self) {
+        self.string.clear();
+        self.string.push('$');
+        self.element_lengths.clear();
+        self.element_lengths.push(1);
+        self.last_element = Key::None;
     }
 
-    fn from_json_path(path: String, json_path: JsonPath<'_>) -> Self {
-        let (json_path, last_element) = if json_path.elements.is_empty() {
-            (
-                JsonPath {
-                    elements: vec![PathElement::Root()],
-                },
-                Key::None,
-            )
-        } else {
-            let last_element = json_path
-                .elements
-                .last()
-                .and_then(|path_element| match path_element {
-                    PathElement::Key(cow, _) => Some(Key::String(cow.to_string())),
-                    PathElement::ArrayLocator(Some(idx)) => Some(Key::Integer(*idx as i64)),
-                    _ => None,
-                })
-                .unwrap_or(Key::None);
-
-            (json_path, last_element)
-        };
-
-        let element_lengths = json_path
-            .elements
-            .iter()
-            .map(Self::element_length)
-            .collect();
-
-        Self {
-            string: path,
-            element_lengths,
-            last_element,
+    fn reset_to(&mut self, path: &str, json_path: &JsonPath<'_>) {
+        self.string.clear();
+        self.string.push_str(path);
+        self.element_lengths.clear();
+        if json_path.elements.is_empty() {
+            self.element_lengths.push(1);
+            self.last_element = Key::None;
+            return;
         }
+        self.element_lengths
+            .extend(json_path.elements.iter().map(Self::element_length));
+        self.last_element = json_path
+            .elements
+            .last()
+            .and_then(|path_element| match path_element {
+                PathElement::Key(cow, _) => Some(Key::String(cow.to_string())),
+                PathElement::ArrayLocator(Some(idx)) => Some(Key::Integer(*idx as i64)),
+                _ => None,
+            })
+            .unwrap_or(Key::None);
     }
 
     fn element_length(element: &PathElement) -> usize {
@@ -801,5 +899,66 @@ impl InPlaceJsonPath {
 
     fn key(&self) -> &Key {
         &self.last_element
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn json_each_writes_text_values_into_the_register_buffer() {
+        let mut cursor = JsonEachCursor::empty(JsonTraversalMode::Each);
+        assert!(cursor
+            .filter(&[Value::build_text(r#"["first","second"]"#)], None, 0)
+            .unwrap());
+        let mut dest = Register::Value(Value::build_text(String::with_capacity(64)));
+        cursor.column_into(COL_VALUE, &mut dest).unwrap();
+        assert_eq!(dest.get_value(), &Value::build_text("first"));
+        let first_buffer = text_buffer(&dest);
+
+        assert!(cursor.next().unwrap());
+        cursor.column_into(COL_VALUE, &mut dest).unwrap();
+        assert_eq!(dest.get_value(), &Value::build_text("second"));
+        assert_eq!(text_buffer(&dest), first_buffer);
+    }
+
+    #[test]
+    fn json_each_reads_a_document_from_a_non_empty_statement_cache() {
+        let key = Value::build_text(r#"["parsed"]"#);
+        let cache = JsonCacheCell::new();
+        cache
+            .with_parsed_jsonb(
+                &key,
+                |_, json| {
+                    parse_strict_into(Value::build_text(r#"["cached"]"#).as_value_ref(), json)
+                },
+                |_| Ok(()),
+            )
+            .unwrap();
+        let mut cursor = JsonEachCursor::empty(JsonTraversalMode::Each);
+        assert!(cursor
+            .filter_with_json_cache(&[key], None, 0, &cache)
+            .unwrap());
+        let mut dest = Register::Value(Value::Null);
+        cursor.column_into(COL_VALUE, &mut dest).unwrap();
+        assert_eq!(dest.get_value(), &Value::build_text("cached"));
+    }
+
+    #[test]
+    fn json_each_does_not_fill_an_empty_statement_cache() {
+        let cache = JsonCacheCell::new();
+        let mut cursor = JsonEachCursor::empty(JsonTraversalMode::Each);
+        assert!(cursor
+            .filter_with_json_cache(&[Value::build_text("[1]")], None, 0, &cache)
+            .unwrap());
+        assert!(cache.is_empty());
+    }
+
+    fn text_buffer(register: &Register) -> *const u8 {
+        let Value::Text(text) = register.get_value() else {
+            panic!("the register holds text");
+        };
+        text.as_str().as_ptr()
     }
 }

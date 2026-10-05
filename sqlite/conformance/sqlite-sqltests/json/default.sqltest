@@ -365,6 +365,41 @@ expect {
     -9e999
 }
 
+test json_array_elements_without_comma_are_malformed {
+    SELECT json('[1 2]');
+}
+expect error {
+    .*malformed JSON.*
+}
+
+test json_valid_rejects_array_elements_without_comma {
+    SELECT json_valid('[1 2]'), json_valid('[[1] [2]]'), json_valid('[1, 2 "a"]');
+}
+expect {
+    0|0|0
+}
+
+test json_error_position_points_at_array_element_without_comma {
+    SELECT json_error_position('[1 2]'), json_error_position('[1,2 3]'), json_error_position('[1  "a"]'), json_error_position('[[1] [2]]');
+}
+expect {
+    4|6|5|6
+}
+
+test json_extract_reads_jsonb_blob_with_malformed_value_outside_the_path {
+    SELECT json_extract(X'8C17611331176217FF', '$.a'), X'8C17611331176217FF' ->> '$.a', X'8C17611331176217FF' -> '$.a';
+}
+expect {
+    1|1|1
+}
+
+test json_extract_skips_jsonb_blob_key_with_invalid_utf8_that_does_not_match {
+    SELECT json_extract(X'8C17FF133117611332', '$.a'), X'8C17FF133117611332' ->> '$.a', json_extract(X'8C17FF133117611332', '$.b') IS NULL;
+}
+expect {
+    2|2|1
+}
+
 test json_extract_malformed_json_1 {
 		SELECT json_extract(X'256162', '$');
 }
@@ -1216,6 +1251,48 @@ test json_object_f64 {
 }
 expect {
     {"key":40.7128}
+}
+
+test jsonb_array_of_sql_text_and_integers {
+    SELECT hex(jsonb_array('x', '', 'é', 'a"b', 'a' || char(92) || 'b', -9223372036854775808, 0, 42));
+}
+expect {
+    CB2B17780727C3A948615C226248615C5C62C3142D393232333337323033363835343737353830381330233432
+}
+
+test jsonb_object_of_long_sql_text_and_integer {
+    SELECT hex(jsonb_object('k', printf('%.20c', 'z'), 'n', 9223372036854775807));
+}
+expect {
+    CC2F176BC7147A7A7A7A7A7A7A7A7A7A7A7A7A7A7A7A7A7A7A7A176EC31339323233333732303336383534373735383037
+}
+
+test json_object_of_sql_text_and_integer_extracts_both {
+    SELECT json_object('k', 'v', 'n', -5) ->> '$.k',
+           json_object('k', 'v', 'n', -5) ->> '$.n',
+           json_type(json_object('k', 'v', 'n', -5), '$.n');
+}
+expect {
+    v|-5|integer
+}
+
+test json_edit_functions_find_plain_object_keys {
+    SELECT json_set('{"x":1,"ab":2}', '$.ab', 9),
+           json_insert('{"x":1,"ab":2}', '$.ab', 9),
+           json_remove('{"x":1,"ab":2}', '$."ab"');
+}
+expect {
+    {"x":1,"ab":9}|{"x":1,"ab":2}|{"x":1}
+}
+
+test json_edit_functions_find_escaped_and_json5_object_keys {
+    SELECT json_remove('{"a' || char(92) || 'u0062":1,"c":2}', '$.ab'),
+           json_remove('{"ab":1,"c":2}', '$."a' || char(92) || 'u0062"'),
+           json_set('{ab:1}', '$.ab', 7),
+           json_replace(jsonb('{"é":1}'), '$.é', 2);
+}
+expect {
+    {"c":2}|{"c":2}|{"ab":7}|{"é":2}
 }
 
 test json_object_nested {
@@ -3487,4 +3564,274 @@ test json_tree_over_null_column {
 }
 expect {
     2
+}
+
+test json-arrow-extract-integer-limits-from-text {
+    SELECT '{"a":9223372036854775807}' ->> '$.a', '{"a":-9223372036854775808}' ->> '$.a', '{"a":-0}' ->> '$.a', typeof('{"a":-0}' ->> '$.a');
+}
+expect {
+    9223372036854775807|-9223372036854775808|0|integer
+}
+
+test json-arrow-extract-integer-limits-from-jsonb {
+    SELECT jsonb('{"a":9223372036854775807}') ->> '$.a', jsonb('{"a":-9223372036854775808}') ->> '$.a', jsonb('[-12,0,7]') ->> '$[0]', jsonb('[-12,0,7]') ->> '$[2]';
+}
+expect {
+    9223372036854775807|-9223372036854775808|-12|7
+}
+
+test json-arrow-extract-integers-past-the-limits-become-real {
+    SELECT typeof('{"a":9223372036854775808}' ->> '$.a'), typeof(jsonb('{"a":-9223372036854775809}') ->> '$.a'), ('{"a":9223372036854775808}' ->> '$.a') = 9223372036854775808.0;
+}
+expect {
+    real|real|1
+}
+
+test json-array-of-a-constant-in-a-register-that-held-json-text {
+    WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i+1 FROM n WHERE i < 4)
+    SELECT json_array(CASE WHEN i % 2 THEN json('[1]') ELSE '[1]' END) FROM n;
+}
+expect {
+    [[1]]
+    ["[1]"]
+    [[1]]
+    ["[1]"]
+}
+
+test json-string-quote-escape-at-the-end-of-the-first-chunk {
+    SELECT json_error_position(CAST(X'2261616161616161616161616161615c22626262626262626262626262626262626262626222' AS TEXT)), CASE WHEN json_error_position(CAST(X'2261616161616161616161616161615c22626262626262626262626262626262626262626222' AS TEXT)) = 0 THEN hex(jsonb(CAST(X'2261616161616161616161616161615c22626262626262626262626262626262626262626222' AS TEXT))) END;
+}
+expect {
+    0|C82461616161616161616161616161615C226262626262626262626262626262626262626262
+}
+
+test json-string-backslash-escape-across-the-chunk-boundary {
+    SELECT json_error_position(CAST(X'226161616161616161616161616161615c5c626262626262626262626262626262626262626222' AS TEXT)), CASE WHEN json_error_position(CAST(X'226161616161616161616161616161615c5c626262626262626262626262626262626262626222' AS TEXT)) = 0 THEN hex(jsonb(CAST(X'226161616161616161616161616161615c5c626262626262626262626262626262626262626222' AS TEXT))) END;
+}
+expect {
+    0|C8256161616161616161616161616161615C5C6262626262626262626262626262626262626262
+}
+
+test json-string-unicode-escape-across-the-chunk-boundary {
+    SELECT json_error_position(CAST(X'22616161616161616161616161615c7530306539626262626262626262626262626262626262626222' AS TEXT)), CASE WHEN json_error_position(CAST(X'22616161616161616161616161615c7530306539626262626262626262626262626262626262626222' AS TEXT)) = 0 THEN hex(jsonb(CAST(X'22616161616161616161616161615c7530306539626262626262626262626262626262626262626222' AS TEXT))) END;
+}
+expect {
+    0|C827616161616161616161616161615C75303065396262626262626262626262626262626262626262
+}
+
+test json-string-escapes-in-every-chunk {
+    SELECT json_error_position(CAST(X'2261625c6e63645c7465665c22676861625c6e63645c7465665c22676861625c6e63645c7465665c22676861625c6e63645c7465665c22676861625c6e63645c7465665c22676861625c6e63645c7465665c22676822' AS TEXT)), CASE WHEN json_error_position(CAST(X'2261625c6e63645c7465665c22676861625c6e63645c7465665c22676861625c6e63645c7465665c22676861625c6e63645c7465665c22676861625c6e63645c7465665c22676861625c6e63645c7465665c22676822' AS TEXT)) = 0 THEN hex(jsonb(CAST(X'2261625c6e63645c7465665c22676861625c6e63645c7465665c22676861625c6e63645c7465665c22676861625c6e63645c7465665c22676861625c6e63645c7465665c22676861625c6e63645c7465665c22676822' AS TEXT))) END;
+}
+expect {
+    0|C85461625C6E63645C7465665C22676861625C6E63645C7465665C22676861625C6E63645C7465665C22676861625C6E63645C7465665C22676861625C6E63645C7465665C22676861625C6E63645C7465665C226768
+}
+
+test json-string-json5-hex-escape-across-the-chunk-boundary {
+    SELECT json_error_position(CAST(X'2761616161616161616161616161615c783431626262626262626262626262626262626262626227' AS TEXT)), CASE WHEN json_error_position(CAST(X'2761616161616161616161616161615c783431626262626262626262626262626262626262626227' AS TEXT)) = 0 THEN hex(jsonb(CAST(X'2761616161616161616161616161615c783431626262626262626262626262626262626262626227' AS TEXT))) END;
+}
+expect {
+    0|C92661616161616161616161616161615C7834316262626262626262626262626262626262626262
+}
+
+test json-string-line-continuation-across-the-chunk-boundary {
+    SELECT json_error_position(CAST(X'2261616161616161616161616161615c0d0a626262626262626262626262626262626262626222' AS TEXT)), CASE WHEN json_error_position(CAST(X'2261616161616161616161616161615c0d0a626262626262626262626262626262626262626222' AS TEXT)) = 0 THEN hex(jsonb(CAST(X'2261616161616161616161616161615c0d0a626262626262626262626262626262626262626222' AS TEXT))) END;
+}
+expect {
+    0|C92561616161616161616161616161615C0D0A6262626262626262626262626262626262626262
+}
+
+test json-string-closing-quote-right-after-an-escape {
+    SELECT json_error_position(CAST(X'22616161616161616161616161615c6e22' AS TEXT)), CASE WHEN json_error_position(CAST(X'22616161616161616161616161615c6e22' AS TEXT)) = 0 THEN hex(jsonb(CAST(X'22616161616161616161616161615c6e22' AS TEXT))) END;
+}
+expect {
+    0|C80F616161616161616161616161615C6E
+}
+
+test json-error-position-of-invalid-escape {
+    SELECT json_error_position(CAST(X'2261625c7122' AS TEXT));
+}
+expect {
+    5
+}
+
+test json-error-position-of-short-unicode-escape {
+    SELECT json_error_position(CAST(X'2261625c75313222' AS TEXT));
+}
+expect {
+    5
+}
+
+test json-error-position-of-unicode-escape-with-other-bytes {
+    SELECT json_error_position(CAST(X'2261625c755a5a5a5a22' AS TEXT));
+}
+expect {
+    5
+}
+
+test json-error-position-of-short-hex-escape {
+    SELECT json_error_position(CAST(X'2261625c783422' AS TEXT));
+}
+expect {
+    5
+}
+
+test json-error-position-of-hex-escape-with-other-bytes {
+    SELECT json_error_position(CAST(X'2261625c785a5a22' AS TEXT));
+}
+expect {
+    5
+}
+
+test json-error-position-of-invalid-escape-in-single-quotes {
+    SELECT json_error_position(CAST(X'2761625c7127' AS TEXT));
+}
+expect {
+    5
+}
+
+test json-error-position-of-invalid-escape-in-a-key {
+    SELECT json_error_position(CAST(X'7b22615c71223a317d' AS TEXT));
+}
+expect {
+    5
+}
+
+test json-error-position-of-short-unicode-escape-at-the-end {
+    SELECT json_error_position(CAST(X'5b2261625c753132' AS TEXT));
+}
+expect {
+    6
+}
+
+test json-error-position-of-invalid-escape-after-the-first-chunk {
+    SELECT json_error_position(CAST(X'2261616161616161616161616161616161616161615c71626262626262626262626262626262626262626222' AS TEXT));
+}
+expect {
+    23
+}
+
+test json-error-position-of-empty-text {
+    SELECT json_error_position(''), json_error_position(CAST(x'' AS TEXT)), json_error_position(char(0)), json_valid('');
+}
+expect {
+    1|1|1|0
+}
+
+test json-error-position-of-comma-where-a-key-starts {
+    SELECT json_error_position(CAST(X'7b2c7d' AS TEXT));
+}
+expect {
+    2
+}
+
+test json-error-position-of-digit-where-a-key-starts {
+    SELECT json_error_position(CAST(X'7b303a317d' AS TEXT));
+}
+expect {
+    2
+}
+
+test json-error-position-of-colon-where-a-key-starts {
+    SELECT json_error_position(CAST(X'7b3a317d' AS TEXT));
+}
+expect {
+    2
+}
+
+test json-error-position-of-comma-after-space-where-a-key-starts {
+    SELECT json_error_position(CAST(X'7b202c7d' AS TEXT));
+}
+expect {
+    3
+}
+
+test json-error-position-of-minus-inside-an-unquoted-key {
+    SELECT json_error_position(CAST(X'7b612d623a317d' AS TEXT));
+}
+expect {
+    3
+}
+
+test json-error-position-of-percent-inside-an-unquoted-key {
+    SELECT json_error_position(CAST(X'7b61622463253a317d' AS TEXT));
+}
+expect {
+    6
+}
+
+test json-error-position-of-invalid-escape-in-an-unquoted-key {
+    SELECT json_error_position(CAST(X'7b615c713a317d' AS TEXT));
+}
+expect {
+    3
+}
+
+test json-error-position-of-invalid-escape-at-the-start-of-an-unquoted-key {
+    SELECT json_error_position(CAST(X'7b5c713a317d' AS TEXT));
+}
+expect {
+    2
+}
+
+test json-error-position-of-short-unicode-escape-in-an-unquoted-key {
+    SELECT json_error_position(CAST(X'7b615c7530303a317d' AS TEXT));
+}
+expect {
+    3
+}
+
+test json-error-position-of-backslash-at-the-end-of-an-unquoted-key {
+    SELECT json_error_position(CAST(X'7b615c' AS TEXT));
+}
+expect {
+    3
+}
+
+test json-output-sql-text-with-quotes-backslashes-and-control-bytes {
+    SELECT hex(json_array('a"b' || char(92) || 'c' || char(1) || char(10) || char(9) || char(8) || char(12) || char(13) || char(31) || 'é'));
+}
+expect {
+    5B22615C22625C5C635C75303030315C6E5C745C625C665C725C7530303166C3A9225D
+}
+
+test json-output-object-key-and-value-with-escapes {
+    SELECT hex(json_object('k"' || char(10), 'v' || char(92) || char(31) || 'x'));
+}
+expect {
+    7B226B5C225C6E223A22765C5C5C753030316678227D
+}
+
+test json-output-long-sql-text-with-a-quote-and-a-backslash {
+    SELECT hex(json(json_array(printf('%.40c', 'x') || '"' || printf('%.40c', 'y') || char(92))));
+}
+expect {
+    5B22787878787878787878787878787878787878787878787878787878787878787878787878787878785C22797979797979797979797979797979797979797979797979797979797979797979797979797979795C5C225D
+}
+
+test json-output-json-escapes-are-kept {
+    SELECT hex(json('["a' || char(92) || '"b' || char(92) || char(92) || 'c' || char(92) || 'u0001' || char(92) || 'n", "plain text that is longer than sixteen bytes"]'));
+}
+expect {
+    5B22615C22625C5C635C75303030315C6E222C22706C61696E20746578742074686174206973206C6F6E676572207468616E207369787465656E206279746573225D
+}
+
+test json-output-json5-escapes-are-rewritten {
+    SELECT hex(json('{"a":"' || char(92) || 'x41' || char(92) || '0''"}'));
+}
+expect {
+    7B2261223A225C75303034315C753030303027227D
+}
+
+test json-keeps-the-long-infinity-form-of-json-input {
+    SELECT json(json_array(1e999)), json(jsonb_array(1e999)), json('[9.0e+999]'), json(jsonb('[9.0e+999]')), json('"9.0e+999"');
+}
+expect {
+    [9.0e+999]|[9.0e+999]|[9.0e+999]|[9.0e+999]|"9.0e+999"
+}
+
+test json-writes-an-infinite-real-argument-in-the-short-form {
+    SELECT json(1e999), json(-1e999), json_pretty(1e999);
+}
+expect {
+    9e999|-9e999|9e999
 }
