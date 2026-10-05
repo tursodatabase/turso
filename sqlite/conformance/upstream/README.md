@@ -72,9 +72,12 @@ and `wal_common.tcl` are the upstream helper files. The one change is in
 tests are plain `tclsh`, so it makes them source `tester.tcl` (with
 `TURSO_CHILD_PROCESS` set so they leave the parent's database alone). The
 testfixture-only commands that upstream provides from C (`sqlite3_test_control`,
-`testvfs`, `load_static_extension`, ...) are defined as no-ops in
+`testvfs`, ...) are defined as no-ops in
 `tester.tcl` so files that call them keep running; tests that depend on
-their effect fail on their own assertions.
+their effect fail on their own assertions. `load_static_extension` comes from
+the TCL binding, which registers `randomjson` and ignores other names. The `csv`
+module is built into `libturso_sqlite3` by the `csv` feature that
+`make -C bindings/tcl` turns on.
 
 ## Blessed and Known-Bad Files
 
