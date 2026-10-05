@@ -1772,6 +1772,7 @@ fn append_expanded_literal(out: &mut String, value: &Value) {
 }
 
 impl Drop for Statement {
+    #[recursive::recursive]
     fn drop(&mut self) {
         // Keep helper statements nested while drop-time reset/abort cleanup runs.
         // That cleanup consults `is_nested_stmt()` to decide whether top-level

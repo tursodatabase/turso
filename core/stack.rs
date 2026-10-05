@@ -11,6 +11,16 @@ macro_rules! trace_stack {
 }
 pub(crate) use trace_stack;
 
+const DEBUG_BUILD_MINIMUM_STACK_SIZE: usize = 1024 * 1024;
+const DEBUG_BUILD_STACK_ALLOCATION_SIZE: usize = 8 * 1024 * 1024;
+
+pub(crate) fn configure_stack_growth() {
+    if cfg!(debug_assertions) {
+        recursive::set_minimum_stack_size(DEBUG_BUILD_MINIMUM_STACK_SIZE);
+        recursive::set_stack_allocation_size(DEBUG_BUILD_STACK_ALLOCATION_SIZE);
+    }
+}
+
 #[cfg(feature = "stacker")]
 pub(crate) struct TraceGuard {
     label: &'static str,

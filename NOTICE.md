@@ -58,6 +58,11 @@ This project depends on tantivy-common, distributed by the Tantivy project autho
 * License: licenses/core/tantivy-common-mit-license.md (MIT License)
 * Homepage: https://github.com/quickwit-oss/tantivy
 
+This project depends on recursive, distributed by Orson R. L. Peters:
+
+* License: licenses/core/recursive-mit-license.md (MIT License)
+* Homepage: https://github.com/orlp/recursive
+
 This project depends on windows-sys, distributed by the Microsoft:
 
 * License: licenses/core/windows-apache.license.md (Apache License v2.0)

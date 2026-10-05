@@ -150,6 +150,7 @@ bigdecimal = "0.4"
 num-bigint = "0.4"
 num-traits = "0.2"
 stacker = { version = "0.1", optional = true }
+recursive = { workspace = true }
 
 [target.'cfg(not(any(target_family = "wasm", all(target_os = "windows", target_arch = "aarch64"))))'.dependencies]
 simsimd = { version = "6.5.3", optional = true }

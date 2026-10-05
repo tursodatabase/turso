@@ -264,6 +264,7 @@ pub(super) fn translate_in_list(
 }
 
 #[instrument(skip(program, referenced_tables, expr, resolver), level = Level::DEBUG)]
+#[recursive::recursive]
 pub fn translate_condition_expr(
     program: &mut ProgramBuilder,
     referenced_tables: &TableReferences,
