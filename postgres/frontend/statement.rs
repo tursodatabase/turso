@@ -1,12 +1,12 @@
 use std::collections::VecDeque;
 use std::ops::{Deref, DerefMut};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::task::Waker;
 use std::time::Duration;
 
 use turso_core::{
-    io::Buffer, types::IOResultOr, Completion, IOResult, LimboError, OpenFlags, PrepareOptions,
-    Result, Row, Statement as CoreStatement, StepResult, Value,
+    types::IOResultOr, Completion, IOResult, LimboError, PrepareOptions, Result, Row,
+    Statement as CoreStatement, StepResult, Value,
 };
 use turso_parser::ast;
 use turso_pg_parser::translator::{PgCopyFromStmt, PgCreateSchemaStmt, PgDropSchemaStmt};
@@ -68,6 +68,9 @@ impl Statement {
         match self.prepare_execution() {
             Ok(IOResult::IO(io)) => {
                 io.set_waker(waker);
+                if io.finished() {
+                    io.0.wake();
+                }
                 let result = if io.is_explicit_yield() {
                     StepResult::Yield
                 } else {
@@ -209,7 +212,7 @@ enum Operation {
     CopyRead {
         spec: PgCopyFromStmt,
         columns: usize,
-        file: Arc<dyn turso_core::File>,
+        data: Arc<OnceLock<std::io::Result<Vec<u8>>>>,
         completion: Completion,
     },
 }
@@ -414,42 +417,35 @@ impl Operation {
                         ))
                         .into());
                     }
-                    let io = conn.get_pager().io.clone();
-                    let file = io
-                        .open_file(&spec.filename, OpenFlags::ReadOnly, false)
+                    let data = Arc::new(OnceLock::new());
+                    let completion = Completion::new_wait();
+                    let filename = spec.filename.clone();
+                    let output = data.clone();
+                    let done = completion.clone();
+                    std::thread::Builder::new()
+                        .spawn(move || {
+                            output
+                                .set(std::fs::read(filename))
+                                .expect("COPY file read result already set");
+                            done.complete(0);
+                        })
                         .map_err(|err| {
                             LimboError::ParseError(format!(
-                                "COPY FROM: cannot read '{}': {err}",
-                                spec.filename
+                                "COPY FROM: cannot start file read: {err}"
                             ))
                         })?;
-                    let size = usize::try_from(file.size()?).map_err(|_| {
-                        LimboError::ParseError("COPY FROM: file too large".to_string())
-                    })?;
-                    let buffer = Arc::new(Buffer::new_temporary(size));
-                    let completion = file.pread(
-                        0,
-                        Completion::new_read(buffer, move |result| match result {
-                            Ok((_, bytes)) if bytes as usize != size => {
-                                Some(turso_core::CompletionError::IOError(
-                                    std::io::ErrorKind::UnexpectedEof,
-                                    "COPY file read",
-                                ))
-                            }
-                            _ => None,
-                        }),
-                    )?;
                     *self = Self::CopyRead {
                         spec: spec.clone(),
                         columns: spec.columns.as_ref().map_or(*columns, Vec::len),
-                        file,
-                        completion,
+                        data,
+                        completion: completion.clone(),
                     };
+                    return Ok(IOResult::IO(turso_core::types::IOCompletions(completion)));
                 }
                 Self::CopyRead {
                     spec,
                     columns,
-                    file: _file,
+                    data,
                     completion,
                 } => {
                     if !completion.finished() {
@@ -464,8 +460,17 @@ impl Operation {
                         ))
                         .into());
                     }
-                    let buffer = completion.as_read().buf();
-                    let data = std::str::from_utf8(buffer.as_slice()).map_err(|err| {
+                    let bytes = data
+                        .get()
+                        .expect("COPY file read must finish before resuming")
+                        .as_ref()
+                        .map_err(|err| {
+                            LimboError::ParseError(format!(
+                                "COPY FROM: cannot read '{}': {err}",
+                                spec.filename
+                            ))
+                        })?;
+                    let data = std::str::from_utf8(bytes).map_err(|err| {
                         LimboError::ParseError(format!("COPY FROM: invalid UTF-8: {err}"))
                     })?;
                     let delimiter = spec

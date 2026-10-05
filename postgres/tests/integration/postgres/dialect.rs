@@ -3522,7 +3522,7 @@ mod nonblocking {
     use super::*;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::sync::Arc;
-    use turso_core::{Buffer, Clock, Completion, File, IOResult, MemoryYieldIO, OpenFlags, IO};
+    use turso_core::{Clock, File, IOResult, MemoryYieldIO, OpenFlags, IO};
 
     #[test]
     fn preparing_does_not_execute_frontend_statements() {
@@ -3571,8 +3571,10 @@ mod nonblocking {
 
             conn.execute("CREATE TABLE copied (id INTEGER PRIMARY KEY, name TEXT)")
                 .unwrap();
-            write_file(&io, "input.tsv", "7\tO'Brien\n19\t\\N\n");
-            let mut copy = conn.prepare("COPY copied FROM 'input.tsv'").unwrap();
+            let input = write_file("7\tO'Brien\n19\t\\N\n");
+            let mut copy = conn
+                .prepare(format!("COPY copied FROM '{}'", input.path().display()))
+                .unwrap();
             assert!(drive(&io, &mut copy).1 > 0);
             assert_eq!(copy.n_change(), 2);
             let mut query = conn
@@ -3585,7 +3587,7 @@ mod nonblocking {
                     vec![Value::from_i64(19), Value::Null],
                 ]
             );
-            write_file(&io, "input.tsv", "");
+            std::fs::write(input.path(), "").unwrap();
             copy.reset().unwrap();
             drive(&io, &mut copy);
             assert_eq!(copy.n_change(), 0);
@@ -3637,8 +3639,10 @@ mod nonblocking {
             let (io, conn) = open(mvcc);
             conn.execute("CREATE TABLE copied (id INTEGER PRIMARY KEY)")
                 .unwrap();
-            write_file(&io, "input.tsv", "7\n19\n7\n");
-            let mut copy = conn.prepare("COPY copied FROM 'input.tsv'").unwrap();
+            let input = write_file("7\n19\n7\n");
+            let mut copy = conn
+                .prepare(format!("COPY copied FROM '{}'", input.path().display()))
+                .unwrap();
             loop {
                 io.allow_step.store(false, Ordering::SeqCst);
                 let result = copy.run_ignore_rows_nonblock();
@@ -3665,8 +3669,10 @@ mod nonblocking {
             let (io, conn) = open(mvcc);
             conn.execute("CREATE TABLE copied (id INTEGER PRIMARY KEY, name TEXT)")
                 .unwrap();
-            write_file(&io, "input.tsv", "7\tfirst\n19\tsecond\n");
-            let mut copy = conn.prepare("COPY copied FROM 'input.tsv'").unwrap();
+            let input = write_file("7\tfirst\n19\tsecond\n");
+            let mut copy = conn
+                .prepare(format!("COPY copied FROM '{}'", input.path().display()))
+                .unwrap();
             let yields = drive(&io, &mut copy).1;
             assert!(yields > 0);
 
@@ -3675,8 +3681,10 @@ mod nonblocking {
                     let (io, conn) = open(mvcc);
                     conn.execute("CREATE TABLE copied (id INTEGER PRIMARY KEY, name TEXT)")
                         .unwrap();
-                    write_file(&io, "input.tsv", "7\tfirst\n19\tsecond\n");
-                    let mut copy = conn.prepare("COPY copied FROM 'input.tsv'").unwrap();
+                    let input = write_file("7\tfirst\n19\tsecond\n");
+                    let mut copy = conn
+                        .prepare(format!("COPY copied FROM '{}'", input.path().display()))
+                        .unwrap();
                     for index in 0..=stop_at {
                         io.allow_step.store(false, Ordering::SeqCst);
                         let result = copy.run_ignore_rows_nonblock();
@@ -3713,8 +3721,10 @@ mod nonblocking {
         let (io, conn) = open(false);
         conn.execute("CREATE TABLE copied (id INTEGER PRIMARY KEY)")
             .unwrap();
-        write_file(&io, "input.tsv", "7\n19\n");
-        let mut copy = conn.prepare("COPY copied FROM 'input.tsv'").unwrap();
+        let input = write_file("7\n19\n");
+        let mut copy = conn
+            .prepare(format!("COPY copied FROM '{}'", input.path().display()))
+            .unwrap();
         copy.interrupt();
         io.allow_step.store(false, Ordering::SeqCst);
         let result = copy.run_ignore_rows_nonblock();
@@ -3732,8 +3742,10 @@ mod nonblocking {
         let (io, conn) = open(false);
         conn.execute("CREATE TABLE copied (id INTEGER PRIMARY KEY)")
             .unwrap();
-        write_file(&io, "input.tsv", "7\n19\n");
-        let mut copy = conn.prepare("COPY copied FROM 'input.tsv'").unwrap();
+        let input = write_file("7\n19\n");
+        let mut copy = conn
+            .prepare(format!("COPY copied FROM '{}'", input.path().display()))
+            .unwrap();
         copy.set_query_timeout_override(Some(Some(std::time::Duration::ZERO)));
         loop {
             io.allow_step.store(false, Ordering::SeqCst);
@@ -3771,8 +3783,10 @@ mod nonblocking {
         let (io, conn) = open(false);
         conn.execute("CREATE TABLE copied (id INTEGER PRIMARY KEY)")
             .unwrap();
-        write_file(&io, "input.tsv", "7\n19\n");
-        let mut copy = conn.prepare("COPY copied FROM 'input.tsv'").unwrap();
+        let input = write_file("7\n19\n");
+        let mut copy = conn
+            .prepare(format!("COPY copied FROM '{}'", input.path().display()))
+            .unwrap();
         let wake_count = Arc::new(WakeCount(AtomicUsize::new(0)));
         let waker = Waker::from(wake_count.clone());
         io.allow_step.store(false, Ordering::SeqCst);
@@ -3780,7 +3794,6 @@ mod nonblocking {
         io.allow_step.store(true, Ordering::SeqCst);
         assert!(matches!(result.unwrap(), StepResult::IO));
         let completion = copy.take_io_completions().unwrap();
-        assert_eq!(wake_count.0.load(Ordering::SeqCst), 0);
         completion.wait(io.as_ref()).unwrap();
         assert!(wake_count.0.load(Ordering::SeqCst) > 0);
         drive(&io, &mut copy);
@@ -3849,19 +3862,10 @@ mod nonblocking {
         }
     }
 
-    fn write_file(io: &StepGuardedIO, path: &str, text: &str) {
-        let file = io.open_file(path, OpenFlags::default(), false).unwrap();
-        io.wait_for_completion(file.truncate(0, Completion::new_trunc(|_| {})).unwrap())
-            .unwrap();
-        io.wait_for_completion(
-            file.pwrite(
-                0,
-                Arc::new(Buffer::new(text.as_bytes().to_vec())),
-                Completion::new_write(|_| {}),
-            )
-            .unwrap(),
-        )
-        .unwrap();
+    fn write_file(text: &str) -> tempfile::NamedTempFile {
+        let file = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(file.path(), text).unwrap();
+        file
     }
 
     struct StepGuardedIO {
