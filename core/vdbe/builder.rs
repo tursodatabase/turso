@@ -300,6 +300,7 @@ pub struct ProgramBuilder {
     free_register_ranges: Vec<Range<usize>>,
     next_free_cursor_id: usize,
     free_cursor_ids: Vec<usize>,
+    custom_key_collation: Option<CollationSeq>,
     next_hash_table_id: usize,
     pub table_references: TableReferences,
     /// Current parsing nesting level
@@ -707,6 +708,7 @@ impl ProgramBuilder {
             free_register_ranges: Vec::new(),
             next_free_cursor_id: 0,
             free_cursor_ids: Vec::new(),
+            custom_key_collation: None,
             next_hash_table_id: HASH_TABLE_ID_BASE,
             insns: Vec::with_capacity(opts.approx_num_insns),
             cursor_ref: Vec::with_capacity(opts.num_cursors),
@@ -1150,6 +1152,9 @@ impl ProgramBuilder {
     }
 
     fn _alloc_cursor_id(&mut self, key: Option<CursorKey>, cursor_type: CursorType) -> usize {
+        if self.custom_key_collation.is_none() {
+            self.custom_key_collation = custom_key_collation(&cursor_type);
+        }
         if let Some(cursor) = self.free_cursor_ids.pop() {
             self.cursor_ref[cursor] = (key, cursor_type);
             return cursor;
@@ -2419,9 +2424,62 @@ impl ProgramBuilder {
         change_cnt_on: bool,
         sql: &str,
     ) -> crate::Result<Program> {
+        if let Some(collation) = self.custom_key_collation {
+            match connection.get_external_collation(collation) {
+                Ok(_) => crate::bail_parse_error!(
+                    "custom collations are not supported in indexes or WITHOUT ROWID tables"
+                ),
+                Err(no_such_collation) => return Err(no_such_collation),
+            }
+        }
+        for (insn, _) in &self.insns {
+            check_custom_collations_registered(insn, &connection)?;
+        }
         let prepare_context = PrepareContext::from_connection(&connection);
         let prepared = self.build_prepared_program(prepare_context, change_cnt_on, sql)?;
         Ok(Program::from_prepared(Arc::new(prepared), connection))
+    }
+}
+
+fn custom_key_collation(cursor_type: &CursorType) -> Option<CollationSeq> {
+    match cursor_type {
+        CursorType::BTreeIndex(index) => index
+            .columns
+            .iter()
+            .filter_map(|column| column.collation)
+            .find(|collation| collation.is_custom()),
+        CursorType::BTreeTable(table) if !table.has_rowid => table
+            .primary_key_index_collations()
+            .flatten()
+            .find(|collation| collation.is_custom()),
+        _ => None,
+    }
+}
+
+fn check_custom_collations_registered(insn: &Insn, connection: &Connection) -> crate::Result<()> {
+    let check = |collation: &CollationSeq| -> crate::Result<()> {
+        if collation.is_custom() {
+            connection.get_external_collation(*collation)?;
+        }
+        Ok(())
+    };
+    match insn {
+        Insn::Eq { collation, .. }
+        | Insn::Ne { collation, .. }
+        | Insn::Lt { collation, .. }
+        | Insn::Le { collation, .. }
+        | Insn::Gt { collation, .. }
+        | Insn::Ge { collation, .. } => collation.iter().try_for_each(check),
+        Insn::Compare { key_info, .. } => key_info.iter().try_for_each(|key| check(&key.collation)),
+        Insn::SorterOpen { data, .. } => data
+            .order_collations_nulls
+            .iter()
+            .filter_map(|(_, collation, _)| collation.as_ref())
+            .try_for_each(check),
+        Insn::AggStep { data, .. } => data.collation.iter().try_for_each(check),
+        Insn::HashBuild { data, .. } => data.collations.iter().try_for_each(check),
+        Insn::HashDistinct { data, .. } => data.collations.iter().try_for_each(check),
+        _ => Ok(()),
     }
 }
 

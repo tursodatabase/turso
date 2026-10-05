@@ -499,3 +499,177 @@ fn create_database_with_sqlite(
     rusqlite::Connection::open(&db_path)?.execute_batch(sql)?;
     Ok((tmp_dir, db_path))
 }
+
+#[test]
+fn test_unknown_collation_fails_only_writes_that_need_it() -> anyhow::Result<()> {
+    let (_tmp_dir, db) = copy_unknown_collation_fixture()?;
+    let conn = db.connect_limbo();
+
+    assert_that!(conn.execute("INSERT INTO t1 VALUES ('c', 3)"))
+        .is_err()
+        .err()
+        .display_string()
+        .contains("no such collation sequence: reverse");
+    assert_that!(conn.execute("DELETE FROM t1 WHERE b = 2"))
+        .is_err()
+        .err()
+        .display_string()
+        .contains("no such collation sequence: reverse");
+    assert_that!(conn.execute("INSERT INTO t3 VALUES ('c')"))
+        .is_err()
+        .err()
+        .display_string()
+        .contains("no such collation sequence: reverse");
+    assert_that!(conn.execute("UPDATE t1 SET a = 'z' WHERE b = 2"))
+        .is_err()
+        .err()
+        .display_string()
+        .contains("no such collation sequence: reverse");
+    assert_that!(conn.execute("INSERT INTO t2 VALUES ('c', 3)"))
+        .is_err()
+        .err()
+        .display_string()
+        .contains("no such collation sequence: reverse");
+    assert_that!(conn.execute("DELETE FROM t2 WHERE b = 1"))
+        .is_err()
+        .err()
+        .display_string()
+        .contains("no such collation sequence: reverse");
+    conn.execute("UPDATE t1 SET b = 3 WHERE b = 1")?;
+    let rows: Vec<(i64,)> = conn.exec_rows("SELECT b FROM t1 ORDER BY b");
+    assert_eq!(rows, vec![(2,), (3,)]);
+    Ok(())
+}
+
+#[test]
+fn test_alter_table_keeps_unknown_collation() -> anyhow::Result<()> {
+    let (_tmp_dir, db) = copy_unknown_collation_fixture()?;
+    let conn = db.connect_limbo();
+
+    conn.execute("ALTER TABLE t1 ADD COLUMN c")?;
+    let rows: Vec<(String,)> = conn.exec_rows("SELECT sql FROM sqlite_schema WHERE name = 't1'");
+    assert_that!(rows[0].0.to_lowercase()).contains("collate reverse");
+
+    conn.execute("ALTER TABLE t3 ADD COLUMN b")?;
+    let rows: Vec<(String,)> = conn.exec_rows("SELECT sql FROM sqlite_schema WHERE name = 't3'");
+    assert_that!(rows[0].0.to_lowercase()).contains("unique (a collate reverse)");
+    Ok(())
+}
+
+#[test]
+fn test_registered_collation_in_schema_is_used_only_outside_indexes() -> anyhow::Result<()> {
+    let (_tmp_dir, db) = copy_unknown_collation_fixture()?;
+    let conn = db.connect_limbo();
+    conn.register_external_collation("reverse".to_string(), 0, reverse_collation, None);
+
+    let rows: Vec<(String,)> = conn.exec_rows("SELECT a FROM t1 ORDER BY a");
+    assert_eq!(rows, vec![("b".to_string(),), ("a".to_string(),)]);
+    for sql in [
+        "INSERT INTO t1 VALUES ('c', 3)",
+        "SELECT a FROM t1 UNION SELECT a FROM t1",
+    ] {
+        assert_that!(conn.execute(sql))
+            .is_err()
+            .err()
+            .display_string()
+            .contains("custom collations are not supported in indexes or WITHOUT ROWID tables");
+    }
+    Ok(())
+}
+
+#[test]
+fn test_without_rowid_table_with_unknown_collation_cannot_be_used() -> anyhow::Result<()> {
+    let tmp_dir = tempfile::TempDir::new()?;
+    let db_path = tmp_dir.path().join("without_rowid.db");
+    let sqlite = rusqlite::Connection::open(&db_path)?;
+    sqlite.execute_batch(
+        "CREATE TABLE w(a TEXT PRIMARY KEY COLLATE nocase, b) WITHOUT ROWID;
+         INSERT INTO w VALUES ('a', 1), ('b', 2);
+         CREATE TABLE wc(a TEXT, b, PRIMARY KEY(a COLLATE nocase)) WITHOUT ROWID;
+         INSERT INTO wc VALUES ('a', 1), ('b', 2);
+         PRAGMA writable_schema = ON;
+         UPDATE sqlite_schema
+            SET sql = replace(sql, 'nocase', 'reverse')
+          WHERE name IN ('w', 'wc');",
+    )?;
+    drop(sqlite);
+    let db = TempDatabase::builder().with_db_path(&db_path).build();
+    let conn = db.connect_limbo();
+
+    for table in ["w", "wc"] {
+        assert_that!(conn.execute(format!("SELECT * FROM {table}")))
+            .is_err()
+            .err()
+            .display_string()
+            .contains("no such collation sequence: reverse");
+        assert_that!(conn.execute(format!("INSERT INTO {table} VALUES ('c', 3)")))
+            .is_err()
+            .err()
+            .display_string()
+            .contains("no such collation sequence: reverse");
+    }
+
+    conn.register_external_collation("reverse".to_string(), 0, reverse_collation, None);
+    for table in ["w", "wc"] {
+        assert_that!(conn.execute(format!("INSERT INTO {table} VALUES ('c', 3)")))
+            .is_err()
+            .err()
+            .display_string()
+            .contains("custom collations are not supported in indexes or WITHOUT ROWID tables");
+    }
+    Ok(())
+}
+
+#[test]
+fn test_without_rowid_key_uses_primary_key_collation_over_column_collation() -> anyhow::Result<()> {
+    let tmp_dir = tempfile::TempDir::new()?;
+    let db_path = tmp_dir.path().join("without_rowid.db");
+    let sqlite = rusqlite::Connection::open(&db_path)?;
+    sqlite.execute_batch(
+        "CREATE TABLE w(a TEXT COLLATE nocase, b, PRIMARY KEY(a COLLATE binary)) WITHOUT ROWID;
+         INSERT INTO w VALUES ('a', 1), ('b', 2);
+         PRAGMA writable_schema = ON;
+         UPDATE sqlite_schema SET sql = replace(sql, 'nocase', 'reverse') WHERE name = 'w';",
+    )?;
+    drop(sqlite);
+    let db = TempDatabase::builder().with_db_path(&db_path).build();
+    let conn = db.connect_limbo();
+
+    conn.execute("INSERT INTO w VALUES ('c', 3)")?;
+    let rows: Vec<(String, i64)> = conn.exec_rows("SELECT a, b FROM w");
+    assert_eq!(
+        rows,
+        vec![
+            ("a".to_string(), 1),
+            ("b".to_string(), 2),
+            ("c".to_string(), 3)
+        ]
+    );
+    Ok(())
+}
+
+unsafe extern "C" fn reverse_collation(
+    _context: usize,
+    left_ptr: *const u8,
+    left_len: usize,
+    right_ptr: *const u8,
+    right_len: usize,
+) -> i32 {
+    let left = unsafe { std::slice::from_raw_parts(left_ptr, left_len) };
+    let right = unsafe { std::slice::from_raw_parts(right_ptr, right_len) };
+    match right.cmp(left) {
+        std::cmp::Ordering::Less => -1,
+        std::cmp::Ordering::Equal => 0,
+        std::cmp::Ordering::Greater => 1,
+    }
+}
+
+fn copy_unknown_collation_fixture() -> anyhow::Result<(tempfile::TempDir, TempDatabase)> {
+    let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../sqlite/conformance/database/unknown_collation.db");
+    let tmp_dir = tempfile::TempDir::new()?;
+    let db_path = tmp_dir.path().join("unknown_collation.db");
+    std::fs::copy(&fixture, &db_path)?;
+    let db = TempDatabase::builder().with_db_path(&db_path).build();
+    Ok((tmp_dir, db))
+}
