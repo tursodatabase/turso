@@ -31,6 +31,36 @@ pub(super) fn binary_expr_shared(
         return Ok(target_register);
     }
 
+    emit_row_valued_binary_expr(
+        program,
+        referenced_tables,
+        e1,
+        e2,
+        op,
+        lhs_arity,
+        target_register,
+        resolver,
+        emit_mode,
+    )
+}
+
+/// Row-valued comparisons are rare, so they get their own function that is
+/// never inlined, to keep their stack slots out of the frame of
+/// [binary_expr_shared()], which is on the stack at every level of a chain
+/// like `a + b + c`.
+#[allow(clippy::too_many_arguments)]
+#[inline(never)]
+fn emit_row_valued_binary_expr(
+    program: &mut ProgramBuilder,
+    referenced_tables: Option<&TableReferences>,
+    e1: &ast::Expr,
+    e2: &ast::Expr,
+    op: &ast::Operator,
+    lhs_arity: usize,
+    target_register: usize,
+    resolver: &Resolver,
+    emit_mode: BinaryEmitMode,
+) -> Result<usize> {
     if !supports_row_value_binary_comparison(op) {
         crate::bail_parse_error!("row value misused");
     }
