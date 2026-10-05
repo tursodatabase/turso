@@ -48,8 +48,8 @@ use crate::{
     },
     types::SeekOp,
     util::{
-        count_fts_column_args, exprs_are_equivalent, simple_bind_expr, try_capture_parameters,
-        try_capture_parameters_column_agnostic,
+        count_fts_column_args, exprs_are_equivalent, normalize_ident, simple_bind_expr,
+        try_capture_parameters, try_capture_parameters_column_agnostic,
     },
     vdbe::{
         affinity::Affinity,
@@ -109,6 +109,7 @@ impl AvailableIndexes {
                 let indexes: VecDeque<_> = resolver.with_schema(jt.database_id, |schema| {
                     schema
                         .indices_including_backing(NamespaceId::ROOT, jt.table.get_name())
+                        .filter(|index| !index.has_custom_collation())
                         .cloned()
                         .collect()
                 });
@@ -2346,6 +2347,7 @@ fn where_term_rejects_null_row(
 /// Enforce INDEXED BY / NOT INDEXED hints by validating index existence and
 /// filtering constraint candidates accordingly.
 fn enforce_indexed_by_hints(
+    resolver: &Resolver,
     table_references: &TableReferences,
     available_indexes: &AvailableIndexes,
     where_clause: &[WhereTerm],
@@ -2375,6 +2377,19 @@ fn enforce_indexed_by_hints(
                 let forced_index =
                     available_indexes.btree_index_by_name(table_ref.internal_id, idx_name);
                 let Some(forced_index) = forced_index else {
+                    let skipped_for_custom_collation =
+                        resolver.with_schema(table_ref.database_id, |schema| {
+                            schema
+                                .get_index(
+                                    NamespaceId::ROOT,
+                                    table_ref.table.get_name(),
+                                    &normalize_ident(idx_name),
+                                )
+                                .is_some_and(|index| index.has_custom_collation())
+                        });
+                    if skipped_for_custom_collation {
+                        crate::bail_parse_error!("no query solution");
+                    }
                     crate::bail_parse_error!("no such index: {}", idx_name);
                 };
                 // A partial index can omit rows that a later RIGHT or FULL JOIN must keep.
@@ -2683,6 +2698,7 @@ fn find_table_access_plan(
     // a null-rejecting WHERE term can turn a LEFT JOIN into an INNER JOIN and
     // then safely prove a forced partial index.
     enforce_indexed_by_hints(
+        resolver,
         table_references,
         available_indexes,
         where_clause,
