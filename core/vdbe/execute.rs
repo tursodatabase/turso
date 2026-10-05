@@ -5821,13 +5821,12 @@ impl Default for OpProgramState {
 
 fn finish_subprogram(
     program: &Program,
-    statement: &Statement,
+    pending_changes: i64,
     is_trigger: bool,
     subprogram_aborted: bool,
     saved_last_insert_rowid: Option<i64>,
     saved_changes_value: Option<i64>,
 ) {
-    let pending_changes = statement.n_total_change();
     if pending_changes != 0 {
         program.connection.add_total_changes(pending_changes);
     }
@@ -5993,7 +5992,7 @@ pub fn op_program(
                                 subprogram_aborted = true;
                                 finish_subprogram(
                                     program,
-                                    &statement,
+                                    statement.n_total_change(),
                                     is_trigger,
                                     subprogram_aborted,
                                     saved_last_insert_rowid,
@@ -6013,7 +6012,7 @@ pub fn op_program(
                             subprogram_aborted = true;
                             finish_subprogram(
                                 program,
-                                &statement,
+                                statement.n_total_change(),
                                 is_trigger,
                                 subprogram_aborted,
                                 saved_last_insert_rowid,
@@ -6025,7 +6024,7 @@ pub fn op_program(
                 }
                 finish_subprogram(
                     program,
-                    &statement,
+                    statement.n_total_change(),
                     is_trigger,
                     subprogram_aborted,
                     saved_last_insert_rowid,
@@ -6051,6 +6050,31 @@ pub fn op_program(
             }
         }
     }
+}
+
+pub(super) fn cleanup_subprogram_state(program: &Program, state: &mut ProgramState) -> Result<()> {
+    let Some(OpProgramState::Step {
+        is_trigger,
+        mut statement,
+        saved_last_insert_rowid,
+        saved_changes_value,
+    }) = state.active_op_state.program_mut().map(std::mem::take)
+    else {
+        return Ok(());
+    };
+
+    let pending_changes = statement.n_total_change();
+    let result = statement.reset();
+    finish_subprogram(
+        program,
+        pending_changes,
+        is_trigger,
+        true,
+        saved_last_insert_rowid,
+        saved_changes_value,
+    );
+    state.active_op_state.clear();
+    result
 }
 
 pub fn op_real(
@@ -11548,17 +11572,16 @@ pub fn op_function(
                 ),
             },
         },
-        crate::function::Func::Dialect(name) => {
-            let args: Vec<Value> = state.registers[*start_reg..*start_reg + arg_count]
-                .iter()
-                .map(|r| r.get_value().clone())
-                .collect();
-            let result = program.connection.dialect().exec_scalar_function(
-                &program.connection,
-                name,
-                &args,
-            )?;
-            state.registers[*dest].set_value(result);
+        crate::function::Func::Dialect(function) => {
+            let function_state = state.active_op_state.function();
+            let args = &state.registers[*start_reg..*start_reg + arg_count];
+            match function.call(&program.connection, args, function_state)? {
+                IOResult::IO(io) => return Ok(state.suspend_on_io(io)),
+                IOResult::Done(result) => {
+                    state.active_op_state.clear();
+                    state.registers[*dest].set_value(result);
+                }
+            }
         }
         crate::function::Func::AlterTable(alter_func) => {
             let r#type = &state.registers[*start_reg].get_value().clone();

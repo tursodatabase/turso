@@ -126,28 +126,13 @@ pub trait Dialect: Send + Sync + 'static {
     /// resolves the built-in set, another dialect resolves its own —
     /// mapping names onto engine primitives where it wants them (usually
     /// by composing with [`sqlite::resolve_builtin_function`]) and onto
-    /// [`crate::Func::Dialect`] for functions it executes
-    /// itself via [`Dialect::exec_scalar_function`]. Consulted
+    /// [`crate::Func::Dialect`] for Rust scalar functions. Consulted
     /// before extension functions; engine-generated helper statements
     /// always resolve with SQLite semantics instead.
     fn resolve_function(&self, name: &str, arg_count: usize) -> crate::Result<Option<crate::Func>>;
 
-    /// Execute a dialect scalar function at runtime.
-    ///
-    /// Receives the connection — unlike extension functions — because
-    /// catalog functions (e.g. `pg_get_tabledef`) need to inspect the
-    /// schema. Only reached through [`crate::Func::Dialect`],
-    /// so a dialect that never resolves to that variant can keep the
-    /// default "no such function" error.
-    fn exec_scalar_function(
-        &self,
-        _conn: &crate::Connection,
-        name: &str,
-        _args: &[crate::Value],
-    ) -> crate::Result<crate::Value> {
-        Err(crate::LimboError::ParseError(format!(
-            "no such function: {name}"
-        )))
+    fn function_list(&self) -> Vec<crate::FunctionListEntry> {
+        Vec::new()
     }
 
     /// Whether this dialect needs the custom-type machinery (DECODE/ENCODE,
@@ -165,7 +150,8 @@ mod tests {
     use crate::schema::BTreeTable;
     use crate::storage::database::DatabaseFile;
     use crate::sync::atomic::{AtomicUsize, Ordering};
-    use crate::{Database, DatabaseOpts, MemoryIO, OpenFlags, IO};
+    use crate::sync::Mutex;
+    use crate::{Database, DatabaseOpts, IOResult, MemoryIO, OpenFlags, IO};
     use std::sync::Arc;
 
     /// A dialect that counts schema-row parses and strips a `/* test */ `
@@ -176,6 +162,8 @@ mod tests {
     struct TestDialect {
         parse_calls: AtomicUsize,
         statement_parse_calls: AtomicUsize,
+        scalar_calls: Arc<AtomicUsize>,
+        scalar_completions: Arc<Mutex<Vec<crate::Completion>>>,
     }
 
     impl Dialect for TestDialect {
@@ -226,29 +214,27 @@ mod tests {
             if name.eq_ignore_ascii_case("nvl") {
                 return sqlite::resolve_builtin_function("coalesce", arg_count);
             }
-            if name.eq_ignore_ascii_case("test_add_one") && arg_count == 1 {
-                return Ok(Some(crate::function::Func::Dialect(
-                    "test_add_one".to_string(),
-                )));
-            }
-            sqlite::resolve_builtin_function(name, arg_count)
-        }
-
-        fn exec_scalar_function(
-            &self,
-            _conn: &crate::Connection,
-            name: &str,
-            args: &[crate::Value],
-        ) -> crate::Result<crate::Value> {
-            assert_eq!(name, "test_add_one");
-            let crate::Value::Numeric(crate::numeric::Numeric::Integer(v)) = args[0] else {
-                return Err(crate::LimboError::InvalidArgument(
-                    "test_add_one expects an integer".to_string(),
-                ));
-            };
-            Ok(crate::Value::Numeric(crate::numeric::Numeric::Integer(
-                v + 1,
-            )))
+            let function: Arc<dyn crate::ScalarFunction> =
+                if name.eq_ignore_ascii_case("test_add_one") {
+                    Arc::new(AddOne)
+                } else if name.eq_ignore_ascii_case("test_counter") {
+                    Arc::new(Counter {
+                        calls: self.scalar_calls.clone(),
+                    })
+                } else if name.eq_ignore_ascii_case("test_null_to_nine") {
+                    Arc::new(NullToNine)
+                } else if name.eq_ignore_ascii_case("test_nested_sum") {
+                    Arc::new(NestedSum {
+                        calls: self.scalar_calls.clone(),
+                        completions: self.scalar_completions.clone(),
+                    })
+                } else {
+                    return sqlite::resolve_builtin_function(name, arg_count);
+                };
+            Ok(function
+                .arity()
+                .accepts(arg_count)
+                .then_some(crate::function::Func::Dialect(function)))
         }
 
         fn register_catalog(
@@ -265,6 +251,149 @@ mod tests {
             )?;
             schema.add_virtual_table(Arc::new(vtab))
         }
+    }
+
+    #[derive(Debug)]
+    struct AddOne;
+
+    impl crate::ScalarFunction for AddOne {
+        fn name(&self) -> &str {
+            "test_add_one"
+        }
+
+        fn arity(&self) -> crate::FunctionArity {
+            crate::FunctionArity::Exact(1)
+        }
+
+        fn is_deterministic(&self) -> bool {
+            true
+        }
+
+        fn call(
+            &self,
+            _conn: &Arc<crate::Connection>,
+            args: &[crate::Register],
+            _state: &mut crate::ScalarFunctionState,
+        ) -> crate::types::IOResultOr<crate::Value> {
+            let Some(v) = args[0].get_value().as_int() else {
+                return Err(crate::LimboError::InvalidArgument(
+                    "test_add_one expects an integer".to_string(),
+                )
+                .into());
+            };
+            Ok(crate::IOResult::Done(crate::Value::from_i64(v + 1)))
+        }
+    }
+
+    #[derive(Debug)]
+    struct Counter {
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl crate::ScalarFunction for Counter {
+        fn name(&self) -> &str {
+            "test_counter"
+        }
+
+        fn arity(&self) -> crate::FunctionArity {
+            crate::FunctionArity::Exact(0)
+        }
+
+        fn call(
+            &self,
+            _conn: &Arc<crate::Connection>,
+            _args: &[crate::Register],
+            _state: &mut crate::ScalarFunctionState,
+        ) -> crate::types::IOResultOr<crate::Value> {
+            Ok(crate::IOResult::Done(crate::Value::from_i64(
+                self.calls.fetch_add(1, Ordering::SeqCst) as i64 + 1,
+            )))
+        }
+    }
+
+    #[derive(Debug)]
+    struct NullToNine;
+
+    impl crate::ScalarFunction for NullToNine {
+        fn name(&self) -> &str {
+            "test_null_to_nine"
+        }
+
+        fn arity(&self) -> crate::FunctionArity {
+            crate::FunctionArity::Exact(1)
+        }
+
+        fn call(
+            &self,
+            _conn: &Arc<crate::Connection>,
+            args: &[crate::Register],
+            _state: &mut crate::ScalarFunctionState,
+        ) -> crate::types::IOResultOr<crate::Value> {
+            Ok(crate::IOResult::Done(match args[0].get_value() {
+                crate::Value::Null => crate::Value::from_i64(9),
+                value => value.clone(),
+            }))
+        }
+    }
+
+    #[derive(Debug)]
+    struct NestedSum {
+        calls: Arc<AtomicUsize>,
+        completions: Arc<Mutex<Vec<crate::Completion>>>,
+    }
+
+    impl crate::ScalarFunction for NestedSum {
+        fn name(&self) -> &str {
+            "test_nested_sum"
+        }
+
+        fn arity(&self) -> crate::FunctionArity {
+            crate::FunctionArity::Exact(1)
+        }
+
+        fn call(
+            &self,
+            conn: &Arc<crate::Connection>,
+            args: &[crate::Register],
+            state: &mut crate::ScalarFunctionState,
+        ) -> crate::types::IOResultOr<crate::Value> {
+            let state = state.get_or_init::<NestedSumState>();
+            if state.statement.is_none() {
+                state.statement = Some(conn.prepare_internal("SELECT x FROM t")?);
+                let completion = crate::Completion::new_write(|_| {});
+                self.completions.lock().push(completion.clone());
+                state.completion = Some(completion);
+                self.calls.fetch_add(1, Ordering::SeqCst);
+            }
+            let completion = state.completion.as_ref().unwrap();
+            if !completion.finished() {
+                return Ok(crate::IOResult::IO(crate::types::IOCompletions(
+                    completion.clone(),
+                )));
+            }
+            let statement = state.statement.as_mut().unwrap();
+            crate::return_if_io!(statement.run_with_row_callback_nonblock(|row| {
+                state.sum += row.get_value(0).as_int().unwrap();
+                Ok(())
+            }));
+            let offset = args[0].get_value().as_int().unwrap();
+            if offset < 0 {
+                return Err(crate::LimboError::InvalidArgument(
+                    "test_nested_sum expects a nonnegative offset".to_string(),
+                )
+                .into());
+            }
+            Ok(crate::IOResult::Done(crate::Value::from_i64(
+                state.sum + offset,
+            )))
+        }
+    }
+
+    #[derive(Default)]
+    struct NestedSumState {
+        statement: Option<crate::Statement>,
+        sum: i64,
+        completion: Option<crate::Completion>,
     }
 
     /// Stores table definitions in syntax that SQLite cannot parse and always
@@ -730,7 +859,6 @@ mod tests {
         let db = open_db(&io, "dialect-funcs.db", Arc::new(TestDialect::default())).unwrap();
         let conn = db.connect().unwrap();
 
-        // Dialect-provided scalar executes through exec_scalar_function.
         let rows = conn
             .prepare("SELECT test_add_one(41)")
             .unwrap()
@@ -760,6 +888,442 @@ mod tests {
         // Unknown names still error.
         let err = conn.prepare("SELECT no_such_function(1)").unwrap_err();
         assert!(err.to_string().contains("no such function"));
+
+        let err = conn.prepare("SELECT test_add_one()").unwrap_err();
+        assert!(err.to_string().contains("no such function"));
+        let err = conn.prepare("SELECT test_add_one(1, 2)").unwrap_err();
+        assert!(err.to_string().contains("no such function"));
+        let err = conn
+            .prepare("SELECT test_add_one(NULL)")
+            .unwrap()
+            .run_collect_rows()
+            .unwrap_err();
+        assert!(err.to_string().contains("test_add_one expects an integer"));
+        conn.close().unwrap();
+    }
+
+    #[test]
+    fn scalar_function_arity_checks_exact_counts_and_overloads() {
+        use crate::FunctionArity;
+
+        for (arity, accepted) in [
+            (FunctionArity::Exact(0), &[0][..]),
+            (FunctionArity::Exact(2), &[2][..]),
+            (FunctionArity::OneOf(&[1, 3]), &[1, 3][..]),
+        ] {
+            for count in 0..=4 {
+                assert_eq!(arity.accepts(count), accepted.contains(&count));
+            }
+        }
+        assert!(FunctionArity::Variadic.accepts(0));
+        assert!(FunctionArity::Variadic.accepts(100));
+    }
+
+    #[test]
+    fn dialect_scalar_function_defaults_to_nondeterministic() {
+        use crate::function::Deterministic;
+
+        let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+        let dialect = Arc::new(TestDialect::default());
+        assert!(!dialect
+            .resolve_function("test_counter", 0)
+            .unwrap()
+            .unwrap()
+            .is_deterministic());
+        assert!(dialect
+            .resolve_function("test_add_one", 1)
+            .unwrap()
+            .unwrap()
+            .is_deterministic());
+
+        let db = open_db(&io, "dialect-counter.db", dialect.clone()).unwrap();
+        let conn = db.connect().unwrap();
+        conn.execute("CREATE TABLE t (x INTEGER)").unwrap();
+        conn.execute("INSERT INTO t VALUES (3), (8), (12)").unwrap();
+        let rows = conn
+            .prepare("SELECT x, test_counter(), test_counter() FROM t ORDER BY x")
+            .unwrap()
+            .run_collect_rows()
+            .unwrap();
+        assert_eq!(
+            rows,
+            vec![
+                vec![
+                    crate::Value::from_i64(3),
+                    crate::Value::from_i64(1),
+                    crate::Value::from_i64(2)
+                ],
+                vec![
+                    crate::Value::from_i64(8),
+                    crate::Value::from_i64(3),
+                    crate::Value::from_i64(4)
+                ],
+                vec![
+                    crate::Value::from_i64(12),
+                    crate::Value::from_i64(5),
+                    crate::Value::from_i64(6)
+                ],
+            ]
+        );
+        assert_eq!(dialect.scalar_calls.load(Ordering::SeqCst), 6);
+        conn.close().unwrap();
+    }
+
+    #[test]
+    fn dialect_scalar_function_resumes_and_clears_each_call_state() {
+        let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+        let dialect = Arc::new(TestDialect::default());
+        let db = open_db(&io, "dialect-scalar-io.db", dialect.clone()).unwrap();
+        let conn = db.connect().unwrap();
+        conn.execute("CREATE TABLE t (x INTEGER)").unwrap();
+        conn.execute("INSERT INTO t VALUES (2), (11)").unwrap();
+        let mut statement = conn
+            .prepare("SELECT x, test_nested_sum(x), test_nested_sum(x + 10) FROM t ORDER BY x")
+            .unwrap();
+
+        for execution in 1..=2 {
+            let (rows, io_count) = run_scalar_statement(&mut statement, &dialect, &io);
+            assert_eq!(io_count, 4);
+            assert_eq!(
+                rows,
+                vec![
+                    vec![
+                        crate::Value::from_i64(2),
+                        crate::Value::from_i64(15),
+                        crate::Value::from_i64(25),
+                    ],
+                    vec![
+                        crate::Value::from_i64(11),
+                        crate::Value::from_i64(24),
+                        crate::Value::from_i64(34),
+                    ],
+                ]
+            );
+            assert_eq!(dialect.scalar_calls.load(Ordering::SeqCst), execution * 4);
+            assert!(!conn.is_nested_stmt());
+            statement.reset().unwrap();
+        }
+        conn.close().unwrap();
+    }
+
+    #[test]
+    fn dialect_scalar_function_releases_helpers_before_rollback() {
+        for journal_mode in ["wal", "mvcc"] {
+            for cancellation in ["reset", "drop", "error", "io_error", "interrupt"] {
+                let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+                let dialect = Arc::new(TestDialect::default());
+                let db = open_db(
+                    &io,
+                    &format!("dialect-scalar-{journal_mode}-{cancellation}.db"),
+                    dialect.clone(),
+                )
+                .unwrap();
+                let conn = db.connect().unwrap();
+                conn.execute(format!("PRAGMA journal_mode = {journal_mode}"))
+                    .unwrap();
+                conn.execute("CREATE TABLE t (x INTEGER)").unwrap();
+                conn.execute("INSERT INTO t VALUES (2), (11)").unwrap();
+                conn.execute("CREATE TABLE output (x INTEGER)").unwrap();
+                if cancellation == "interrupt" {
+                    conn.set_progress_handler(1, Some(Box::new(|| false)));
+                }
+                let offset = if cancellation == "error" { -1 } else { 3 };
+                let mut statement = conn
+                    .prepare(format!(
+                        "INSERT INTO output SELECT 100 UNION ALL SELECT test_nested_sum({offset})"
+                    ))
+                    .unwrap();
+                assert!(matches!(statement.step().unwrap(), crate::StepResult::IO));
+                let completion = dialect.scalar_completions.lock().pop().unwrap();
+                if cancellation == "io_error" {
+                    completion.error(crate::error::CompletionError::IOError(
+                        std::io::ErrorKind::Other,
+                        "test scalar I/O",
+                    ));
+                } else {
+                    completion.complete(0);
+                }
+                assert_eq!(statement.n_change(), 1);
+                assert!(conn.is_nested_stmt());
+
+                match cancellation {
+                    "reset" => statement.reset().unwrap(),
+                    "drop" => drop(statement),
+                    "error" => {
+                        let error = statement.step().unwrap_err();
+                        assert!(error.to_string().contains("nonnegative offset"));
+                    }
+                    "io_error" => {
+                        let error = statement.step().unwrap_err();
+                        assert!(error.to_string().contains("test scalar I/O"));
+                    }
+                    "interrupt" => {
+                        conn.interrupt();
+                        assert!(matches!(
+                            statement.step().unwrap(),
+                            crate::StepResult::Interrupt
+                        ));
+                        assert!(!conn.is_nested_stmt());
+                        statement.reset().unwrap();
+                    }
+                    _ => unreachable!(),
+                }
+                assert!(!conn.is_nested_stmt(), "{journal_mode}: {cancellation}");
+                assert_eq!(
+                    conn.prepare("SELECT count(*) FROM output")
+                        .unwrap()
+                        .run_collect_rows()
+                        .unwrap(),
+                    vec![vec![crate::Value::from_i64(0)]],
+                    "{journal_mode}: {cancellation}"
+                );
+                conn.execute("INSERT INTO output VALUES (29)").unwrap();
+                conn.close().unwrap();
+                let reopened = db.connect().unwrap();
+                assert_eq!(
+                    reopened
+                        .prepare("SELECT x FROM output")
+                        .unwrap()
+                        .run_collect_rows()
+                        .unwrap(),
+                    vec![vec![crate::Value::from_i64(29)]],
+                    "{journal_mode}: {cancellation}"
+                );
+                reopened.close().unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn dialect_scalar_function_in_trigger_releases_helpers_before_rollback() {
+        for journal_mode in ["wal", "mvcc"] {
+            for nested_trigger in [false, true] {
+                for explicit_transaction in [false, true] {
+                    for cancellation in [
+                        "reset",
+                        "drop",
+                        "error",
+                        "io_error",
+                        "reset_io_error",
+                        "drop_io_error",
+                        "interrupt",
+                    ] {
+                        let case = format!(
+                            "{journal_mode}: {nested_trigger}: {explicit_transaction}: {cancellation}"
+                        );
+                        let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+                        let dialect = Arc::new(TestDialect::default());
+                        let db =
+                            open_db(&io, "dialect-trigger-cleanup.db", dialect.clone()).unwrap();
+                        let conn = db.connect().unwrap();
+                        conn.execute(format!("PRAGMA journal_mode = {journal_mode}"))
+                            .unwrap();
+                        conn.execute("CREATE TABLE t (x INTEGER)").unwrap();
+                        conn.execute("INSERT INTO t VALUES (2), (11)").unwrap();
+                        conn.execute("CREATE TABLE output (x INTEGER PRIMARY KEY)")
+                            .unwrap();
+                        conn.execute("CREATE TABLE trigger_output (x INTEGER PRIMARY KEY)")
+                            .unwrap();
+                        let offset = if cancellation == "error" { -1 } else { 3 };
+                        if nested_trigger {
+                            conn.execute(format!(
+                                "CREATE TRIGGER inner_trigger AFTER INSERT ON trigger_output BEGIN \
+                                    SELECT test_nested_sum({offset}); \
+                                END"
+                            ))
+                            .unwrap();
+                        }
+                        let scalar_call = if nested_trigger {
+                            String::new()
+                        } else {
+                            format!("SELECT test_nested_sum({offset});")
+                        };
+                        conn.execute(format!(
+                            "CREATE TRIGGER outer_trigger AFTER INSERT ON output \
+                                WHEN new.x = 100 BEGIN \
+                                    INSERT INTO trigger_output VALUES (200); \
+                                    {scalar_call} \
+                                END"
+                        ))
+                        .unwrap();
+                        if explicit_transaction {
+                            conn.execute("BEGIN").unwrap();
+                        }
+                        conn.execute("INSERT INTO output VALUES (7), (19)").unwrap();
+                        let total_changes_before = conn.total_changes();
+                        if cancellation == "interrupt" {
+                            conn.set_progress_handler(1, Some(Box::new(|| false)));
+                        }
+                        let mut statement =
+                            conn.prepare("INSERT INTO output VALUES (100)").unwrap();
+                        assert!(matches!(statement.step().unwrap(), crate::StepResult::IO));
+                        let completion = dialect.scalar_completions.lock().pop().unwrap();
+                        if matches!(
+                            cancellation,
+                            "io_error" | "reset_io_error" | "drop_io_error"
+                        ) {
+                            completion.error(crate::error::CompletionError::IOError(
+                                std::io::ErrorKind::Other,
+                                "test scalar I/O",
+                            ));
+                        } else {
+                            completion.complete(0);
+                        }
+                        assert_eq!(statement.n_change(), 1);
+                        assert!(conn.is_nested_stmt());
+
+                        match cancellation {
+                            "reset" => statement.reset().unwrap(),
+                            "drop" | "drop_io_error" => drop(statement),
+                            "reset_io_error" => {
+                                let error = statement.reset().unwrap_err();
+                                assert!(error.to_string().contains("test scalar I/O"));
+                            }
+                            "error" => {
+                                let error = statement.step().unwrap_err();
+                                assert!(error.to_string().contains("nonnegative offset"));
+                            }
+                            "io_error" => {
+                                let error = statement.step().unwrap_err();
+                                assert!(error.to_string().contains("test scalar I/O"));
+                            }
+                            "interrupt" => {
+                                conn.interrupt();
+                                assert!(matches!(
+                                    statement.step().unwrap(),
+                                    crate::StepResult::Interrupt
+                                ));
+                                assert!(!conn.is_nested_stmt());
+                                statement.reset().unwrap();
+                            }
+                            _ => unreachable!(),
+                        }
+                        assert!(!conn.is_nested_stmt(), "{case}");
+                        assert!(conn.executing_triggers.read().is_empty(), "{case}");
+                        assert_eq!(conn.last_insert_rowid(), 100, "{case}");
+                        assert_eq!(conn.changes(), 2, "{case}");
+                        assert_eq!(conn.total_changes() - total_changes_before, 1, "{case}");
+                        assert_eq!(conn.get_auto_commit(), !explicit_transaction, "{case}");
+                        let counts = conn
+                            .prepare(
+                                "SELECT count(*) FROM output \
+                                    UNION ALL SELECT count(*) FROM trigger_output",
+                            )
+                            .unwrap()
+                            .run_collect_rows()
+                            .unwrap();
+                        assert_eq!(
+                            counts,
+                            vec![
+                                vec![crate::Value::from_i64(2)],
+                                vec![crate::Value::from_i64(0)]
+                            ],
+                            "{case}"
+                        );
+                        if explicit_transaction {
+                            conn.execute("COMMIT").unwrap();
+                        }
+                        conn.execute("INSERT INTO output VALUES (29)").unwrap();
+                        conn.close().unwrap();
+                        let reopened = db.connect().unwrap();
+                        assert_eq!(
+                            reopened
+                                .prepare("SELECT x FROM output ORDER BY x")
+                                .unwrap()
+                                .run_collect_rows()
+                                .unwrap(),
+                            vec![
+                                vec![crate::Value::from_i64(7)],
+                                vec![crate::Value::from_i64(19)],
+                                vec![crate::Value::from_i64(29)],
+                            ],
+                            "{case}"
+                        );
+                        reopened.close().unwrap();
+                    }
+                }
+            }
+        }
+    }
+
+    #[cfg(feature = "io_memory_yield")]
+    #[test]
+    fn dialect_scalar_function_propagates_nested_statement_io() {
+        let io: Arc<dyn IO> = Arc::new(crate::io::MemoryYieldIO::new());
+        let dialect = Arc::new(TestDialect::default());
+        let db = open_db(&io, "dialect-scalar-nested-io.db", dialect.clone()).unwrap();
+        let conn = db.connect().unwrap();
+        conn.execute("CREATE TABLE t (x INTEGER, padding BLOB)")
+            .unwrap();
+        conn.execute("INSERT INTO t VALUES (2, zeroblob(3000)), (11, zeroblob(3000))")
+            .unwrap();
+        conn.get_pager().clear_page_cache(false);
+
+        let mut statement = conn.prepare("SELECT test_nested_sum(3)").unwrap();
+        assert!(matches!(statement.step().unwrap(), crate::StepResult::IO));
+        dialect.scalar_completions.lock().pop().unwrap().complete(0);
+        let (rows, io_count) = run_scalar_statement(&mut statement, &dialect, &io);
+        assert!(
+            io_count >= 3,
+            "expected reads of the root and two leaf pages"
+        );
+        assert_eq!(rows, vec![vec![crate::Value::from_i64(16)]]);
+        assert_eq!(dialect.scalar_calls.load(Ordering::SeqCst), 1);
+        assert!(!conn.is_nested_stmt());
+        conn.close().unwrap();
+    }
+
+    fn run_scalar_statement(
+        statement: &mut crate::Statement,
+        dialect: &TestDialect,
+        io: &Arc<dyn IO>,
+    ) -> (Vec<Vec<crate::Value>>, usize) {
+        let mut rows = Vec::new();
+        let mut io_count = 0;
+        loop {
+            match statement.step().unwrap() {
+                crate::StepResult::IO => {
+                    io_count += 1;
+                    let calls = dialect.scalar_calls.load(Ordering::SeqCst);
+                    assert!(matches!(statement.step().unwrap(), crate::StepResult::IO));
+                    assert_eq!(dialect.scalar_calls.load(Ordering::SeqCst), calls);
+                    let pending = statement.take_io_completions().unwrap();
+                    assert!(!pending.finished());
+                    if let Some(completion) = dialect.scalar_completions.lock().pop() {
+                        completion.complete(0);
+                    }
+                    io.step().unwrap();
+                    assert!(pending.finished());
+                }
+                crate::StepResult::Row => {
+                    rows.push(statement.row().unwrap().get_values().cloned().collect());
+                }
+                crate::StepResult::Done => return (rows, io_count),
+                other => panic!("unexpected scalar statement result: {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn dialect_scalar_function_can_return_a_value_for_null() {
+        let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+        let db = open_db(&io, "dialect-null.db", Arc::new(TestDialect::default())).unwrap();
+        let conn = db.connect().unwrap();
+        conn.execute("CREATE TABLE lhs (id INTEGER)").unwrap();
+        conn.execute("CREATE TABLE rhs (id INTEGER, value INTEGER)")
+            .unwrap();
+        conn.execute("INSERT INTO lhs VALUES (1), (2)").unwrap();
+        conn.execute("INSERT INTO rhs VALUES (1, 0)").unwrap();
+
+        let rows = conn
+            .prepare(
+                "SELECT lhs.id FROM lhs LEFT JOIN rhs ON rhs.id = lhs.id \
+                 WHERE test_null_to_nine(rhs.value) = 9 ORDER BY lhs.id",
+            )
+            .unwrap()
+            .run_collect_rows()
+            .unwrap();
+        assert_eq!(rows, vec![vec![crate::Value::from_i64(2)]]);
         conn.close().unwrap();
     }
 

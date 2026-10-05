@@ -631,6 +631,7 @@ enum ActiveOpState {
     Attach(OpAttachState),
     JournalMode(OpJournalModeState),
     ParseSchema(OpParseSchemaState),
+    Function(crate::ScalarFunctionState),
     HashBuild(Option<OpHashBuildState>),
     HashProbe(Option<OpHashProbeState>),
     InitCdcVersion(OpInitCdcVersionState),
@@ -657,6 +658,7 @@ impl std::fmt::Debug for ActiveOpState {
             ActiveOpState::Attach(_) => "Attach",
             ActiveOpState::JournalMode(_) => "JournalMode",
             ActiveOpState::ParseSchema(_) => "ParseSchema",
+            ActiveOpState::Function(_) => "Function",
             ActiveOpState::HashBuild(_) => "HashBuild",
             ActiveOpState::HashProbe(_) => "HashProbe",
             ActiveOpState::InitCdcVersion(_) => "InitCdcVersion",
@@ -799,6 +801,12 @@ impl ActiveOpStateSlot {
         OpJournalModeState::default()
     );
     active_state_accessor!(parse_schema, ParseSchema, OpParseSchemaState, None);
+    active_state_accessor!(
+        function,
+        Function,
+        crate::ScalarFunctionState,
+        crate::ScalarFunctionState::default()
+    );
     active_state_accessor!(hash_build, HashBuild, Option<OpHashBuildState>, None);
     active_state_accessor!(hash_probe, HashProbe, Option<OpHashProbeState>, None);
     active_state_accessor!(
@@ -3331,6 +3339,16 @@ impl Program {
         // nested helper statements whose drop releases nested guards. Drop
         // them before the `is_nested_stmt()` check below for the same reason.
         state.close_virtual_table_cursors();
+        if matches!(state.active_op_state.state, ActiveOpState::Function(_)) {
+            state.active_op_state.clear();
+        }
+        if let Err(err) = execute::cleanup_subprogram_state(self, state) {
+            capture_abort_error(
+                &mut abort_error,
+                err,
+                "Failed to clean up subprogram during abort",
+            );
+        }
         // RAISE(IGNORE) rolls nothing back — halt() already staged the
         // trigger's index-method writes and the kept rows keep their index
         // entries — so it must not discard staged index-method work here.
