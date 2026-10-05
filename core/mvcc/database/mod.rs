@@ -10377,17 +10377,16 @@ impl RowidAllocator {
         loop {
             let cur = self.max_rowid.load(Ordering::SeqCst);
             if rowid <= cur {
-                break;
+                return;
             }
             if self
                 .max_rowid
                 .compare_exchange(cur, rowid, Ordering::SeqCst, Ordering::SeqCst)
                 .is_ok()
             {
-                break;
+                return;
             }
         }
-        self.raise_btree_last(rowid);
     }
 
     pub fn btree_last(&self) -> Option<i64> {
@@ -10396,28 +10395,30 @@ impl RowidAllocator {
             .then(|| self.btree_last.load(Ordering::SeqCst))
     }
 
-    pub fn btree_last_rules_out(&self, rowid: i64) -> bool {
-        // A last <= 0 is not a ceiling. Keys can sit to its right.
-        //
-        //   last = -5                    last = 5
-        //   -5  -3   0   3               1   3   5  100
-        //   [search every probe]         [search] [skip]
-        matches!(self.btree_last(), Some(last) if last > 0 && rowid > last)
-    }
-
     pub fn record_btree_last(&self, rowid: Option<i64>) {
         if let Some(rowid) = rowid {
-            self.raise_btree_last(rowid);
+            let _ = self
+                .btree_last
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |cur| {
+                    (rowid > cur).then_some(rowid)
+                });
         }
         self.btree_last_known.store(true, Ordering::SeqCst);
     }
 
-    fn raise_btree_last(&self, rowid: i64) {
-        let _ = self
-            .btree_last
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |cur| {
-                (rowid > cur).then_some(rowid)
-            });
+    pub fn rowid_ceiling_rules_out(&self, rowid: i64) -> bool {
+        // A ceiling <= 0 is not a bound. Keys can sit to its right.
+        //
+        //   btree=-5 inserted=0          btree=5 inserted=200
+        //   -5  -3   0   3               1   5  100  200  201
+        //   [search every probe]         [search]      [skip]
+        matches!(self.rowid_ceiling(), Some(ceiling) if ceiling > 0 && rowid > ceiling)
+    }
+
+    fn rowid_ceiling(&self) -> Option<i64> {
+        let btree = self.btree_last()?;
+        // The getter stays None until NewRowid. Explicit inserts still move the counter.
+        Some(btree.max(self.max_rowid.load(Ordering::SeqCst)))
     }
 
     pub fn is_uninitialized(&self) -> bool {
