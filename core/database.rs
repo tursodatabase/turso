@@ -339,6 +339,9 @@ pub enum OpenDbAsyncPhase {
     ReadingHeader,
     LoadingSchema,
     BootstrapMvStore,
+    /// Loads roles after MVCC recovery, so rows still in the MVCC log are
+    /// included.
+    LoadingAccessControl,
     Done,
 }
 
@@ -520,6 +523,12 @@ pub struct OpenDbAsyncState {
     /// Sub state machine for `MvStore::bootstrap_nonblock`, driven in
     /// `BootstrapMvStore`.
     mvcc_bootstrap_state: mvcc::database::BootstrapState,
+    /// Statement reading the access control table and the rows read so far,
+    /// held across yields in `LoadingAccessControl`.
+    access_control_load: Option<(
+        Box<crate::Statement>,
+        Vec<crate::access_control::AccessControlRow>,
+    )>,
 }
 
 impl Default for OpenDbAsyncState {
@@ -543,6 +552,7 @@ impl OpenDbAsyncState {
             header_validation_state: HeaderValidationState::default(),
             mvcc_bootstrap_conn: None,
             mvcc_bootstrap_state: mvcc::database::BootstrapState::default(),
+            access_control_load: None,
         }
     }
 }
@@ -1699,6 +1709,47 @@ impl Database {
                         state.mvcc_bootstrap_conn = None;
                     }
 
+                    state.phase = OpenDbAsyncPhase::LoadingAccessControl;
+                }
+
+                OpenDbAsyncPhase::LoadingAccessControl => {
+                    let db = state
+                        .db
+                        .as_ref()
+                        .expect("db must be initialized in Init phase");
+                    let has_table = db
+                        .schema
+                        .lock()
+                        .tables
+                        .contains_key(crate::access_control::ACCESS_CONTROL_TABLE_NAME);
+                    if has_table {
+                        if state.access_control_load.is_none() {
+                            let conn = state
+                                .conn
+                                .as_ref()
+                                .expect("conn must be initialized in Init phase");
+                            conn.maybe_update_schema();
+                            let stmt = conn
+                                .prepare_internal(crate::access_control::LOAD_ACCESS_CONTROL_SQL)?;
+                            state.access_control_load = Some((Box::new(stmt), Vec::new()));
+                        }
+                        let (stmt, rows) = state
+                            .access_control_load
+                            .as_mut()
+                            .expect("statement prepared above");
+                        return_if_io!(stmt.run_with_row_callback_nonblock(|row| {
+                            rows.push(crate::access_control::AccessControlRow::from_row(row)?);
+                            Ok(())
+                        }));
+                        let catalog = crate::access_control::AccessControlCatalog::load(rows)?;
+                        state.access_control_load = None;
+                        state.conn = None;
+                        db.with_schema_mut(|schema| {
+                            schema.access_control = Arc::new(catalog);
+                            Ok(())
+                        })?;
+                    }
+
                     state.phase = OpenDbAsyncPhase::Done;
                     return Ok(IOResult::Done(
                         state
@@ -2605,6 +2656,7 @@ impl Database {
             schema_reparse_in_progress: AtomicBool::new(false),
             prepare_context_generation: AtomicU64::new(0),
             sequence_currvals: RwLock::new(HashMap::default()),
+            current_role: RwLock::new(None),
         });
         self.n_connections
             .fetch_add(1, crate::sync::atomic::Ordering::SeqCst);

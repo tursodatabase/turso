@@ -44,7 +44,7 @@ use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 use tracing_subscriber::EnvFilter;
 use turso_core::{DatabaseOpts, LimboError, OpenFlags, Statement, Value};
-use turso_pg::Connection;
+use turso_pg::{Connection, PgSchemas};
 use turso_pg_server::TursoPgServer;
 
 // ---------------------------------------------------------------------------
@@ -100,7 +100,11 @@ fn open_database(
     db_path: &str,
     vfs: Option<&String>,
     readonly: bool,
-) -> anyhow::Result<(Arc<dyn turso_core::IO>, Connection)> {
+) -> anyhow::Result<(
+    Arc<dyn turso_core::IO>,
+    Arc<turso_core::Database>,
+    Connection,
+)> {
     let db_opts = DatabaseOpts::new()
         .with_views(true)
         .with_custom_types(true)
@@ -118,11 +122,13 @@ fn open_database(
 
     let (io, db) =
         turso_pg::open_database(db_path, vfs.map(|v| v.as_str()), flags, db_opts.turso_cli())?;
-    let conn = Connection::new(db.connect()?);
-    Ok((io, conn))
+    let conn = Connection::with_schemas(db.connect()?, PgSchemas::default())?;
+    Ok((io, db, conn))
 }
 
-/// Discover and attach existing PG schema database files in the same directory.
+/// Discover and attach existing PG schema database files in the same directory,
+/// and add the ones that attach to the schemas `conn` shares with other
+/// connections.
 fn auto_attach_pg_schemas(conn: &Connection, db_file: &str) {
     if db_file == ":memory:" {
         return;
@@ -146,9 +152,8 @@ fn auto_attach_pg_schemas(conn: &Connection, db_file: &str) {
             continue;
         };
         let path = entry.path().to_string_lossy().to_string();
-        let sql = format!("ATTACH '{path}' AS \"{schema}\"");
         tracing::info!("Auto-attaching PG schema '{}' from {}", schema, path);
-        if let Err(e) = conn.inner().execute(&sql) {
+        if let Err(e) = conn.attach_schema(schema, &path) {
             tracing::warn!("Failed to attach schema '{}': {}", schema, e);
         }
     }
@@ -1010,7 +1015,7 @@ fn main() -> anyhow::Result<()> {
         .as_ref()
         .map_or(":memory:".to_string(), |p| p.to_string_lossy().to_string());
 
-    let (io, conn) = open_database(&db_file, opts.vfs.as_ref(), opts.readonly)?;
+    let (io, db, conn) = open_database(&db_file, opts.vfs.as_ref(), opts.readonly)?;
 
     let interrupt_count = Arc::new(AtomicUsize::new(0));
     {
@@ -1024,7 +1029,12 @@ fn main() -> anyhow::Result<()> {
     auto_attach_pg_schemas(&conn, &db_file);
     // Server mode: start PG wire protocol server and exit
     if let Some(ref address) = opts.server {
-        let server = TursoPgServer::new(address.clone(), db_file, conn, interrupt_count);
+        let schemas = conn.schemas().clone();
+        let connect = move || -> anyhow::Result<Connection> {
+            Ok(Connection::with_schemas(db.connect()?, schemas.clone())?)
+        };
+        let server =
+            TursoPgServer::new(address.clone(), db_file, Arc::new(connect), interrupt_count);
         return server.run();
     }
 

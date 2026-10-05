@@ -1,4 +1,5 @@
 use crate::sync::Arc;
+use crate::translate::access_control;
 use crate::{turso_assert, turso_assert_greater_than_or_equal};
 
 use super::plan::NamedWindowBound;
@@ -1846,6 +1847,7 @@ fn parse_table(
         let alias = maybe_alias.map(|a| normalize_ident(a.name().as_str()));
         let internal_id = program.table_reference_counter.next();
         let tbl_ref = if let Table::Virtual(tbl) = table.as_ref() {
+            access_control::reject_raw_storage_for_roles(table_name.as_str(), resolver)?;
             transform_args_into_where_terms(args, internal_id, vtab_predicates, table.as_ref())?;
             Table::Virtual(tbl.clone())
         } else if let Table::BTree(table) = table.as_ref() {

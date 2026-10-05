@@ -87,7 +87,11 @@ impl StmtClass {
             | Stmt::DropView { .. }
             | Stmt::DropType { .. }
             | Stmt::DropDomain { .. }
-            | Stmt::DropSequence { .. } => Some(Self::Schema),
+            | Stmt::DropSequence { .. }
+            | Stmt::CreateRole { .. }
+            | Stmt::DropRole { .. }
+            | Stmt::CreatePolicy(_)
+            | Stmt::DropPolicy { .. } => Some(Self::Schema),
             Stmt::Analyze { .. }
             | Stmt::Attach { .. }
             | Stmt::Begin { .. }
@@ -99,7 +103,8 @@ impl StmtClass {
             | Stmt::Rollback { .. }
             | Stmt::Savepoint { .. }
             | Stmt::Vacuum { .. }
-            | Stmt::Optimize { .. } => None,
+            | Stmt::Optimize { .. }
+            | Stmt::SetRole { .. } => None,
         }
     }
 

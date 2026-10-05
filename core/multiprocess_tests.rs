@@ -33,6 +33,8 @@ const MULTIPROCESS_SHM_INSERT_AND_CLOSE_CHILD_TEST: &str =
 const MULTIPROCESS_SHM_EXPECT_OPEN_FAILURE_CHILD_TEST: &str =
     "multiprocess_tests::multiprocess_shm_expect_open_failure_child_process";
 const DEFAULT_LOCKED_DB_CHILD_TEST: &str = "multiprocess_tests::default_locked_db_child_process";
+const MULTIPROCESS_ROLE_STATEMENT_CHILD_TEST: &str =
+    "multiprocess_tests::multiprocess_role_statement_child_process";
 const MULTIPROCESS_ASYNC_OPEN_CHILD_TEST: &str =
     "multiprocess_tests::multiprocess_async_open_child_process";
 const MULTIPROCESS_HOLD_OPEN_CHILD_TEST: &str =
@@ -3040,4 +3042,70 @@ fn test_multiprocess_autoinc_burst_no_duplicates() {
     );
 
     observer_conn.close().unwrap();
+}
+
+#[test]
+fn multiprocess_role_statement_child_process() {
+    let Some(db_path) = std::env::var_os("TURSO_MULTIPROCESS_DB_PATH") else {
+        return;
+    };
+    let io: Arc<dyn IO> = multiprocess_test_io();
+    let db = open_multiprocess_db(io, db_path.to_str().unwrap()).unwrap();
+    let conn = db.connect().unwrap();
+    let sql = std::env::var("TURSO_MULTIPROCESS_SQL").unwrap();
+    conn.execute(sql).unwrap();
+}
+
+fn run_in_child_process(db_path: &str, sql: &str) {
+    let output = Command::new(std::env::current_exe().unwrap())
+        .arg(MULTIPROCESS_ROLE_STATEMENT_CHILD_TEST)
+        .arg("--exact")
+        .arg("--nocapture")
+        .env("TURSO_MULTIPROCESS_DB_PATH", db_path)
+        .env("TURSO_MULTIPROCESS_SQL", sql)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "child process failed: stdout={}; stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn subprocess_set_role_sees_role_created_by_another_process() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("roles-multiprocess.db");
+    let db_path_str = db_path.to_str().unwrap();
+    let io: Arc<dyn IO> = multiprocess_test_io();
+    let db = open_multiprocess_db(io, db_path_str).unwrap();
+    let conn = db.connect().unwrap();
+    conn.execute("CREATE TABLE t(x)").unwrap();
+    conn.execute("CREATE ROLE bob").unwrap();
+
+    run_in_child_process(db_path_str, "CREATE ROLE alice");
+    conn.set_role(Some("alice")).unwrap();
+    conn.set_role(None).unwrap();
+
+    run_in_child_process(db_path_str, "CREATE ROLE carol");
+    conn.execute("SET ROLE carol").unwrap();
+    assert_eq!(conn.current_role().as_deref(), Some("carol"));
+}
+
+#[test]
+fn subprocess_set_role_rejects_role_dropped_by_another_process() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("roles-multiprocess.db");
+    let db_path_str = db_path.to_str().unwrap();
+    let io: Arc<dyn IO> = multiprocess_test_io();
+    let db = open_multiprocess_db(io, db_path_str).unwrap();
+    let conn = db.connect().unwrap();
+    conn.execute("CREATE TABLE t(x)").unwrap();
+    conn.execute("CREATE ROLE alice").unwrap();
+
+    run_in_child_process(db_path_str, "DROP ROLE alice");
+    let err = conn.set_role(Some("alice")).unwrap_err();
+    assert!(err.to_string().contains("does not exist"), "{err}");
+    assert_eq!(conn.current_role(), None);
 }

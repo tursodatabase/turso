@@ -1,3 +1,5 @@
+use std::collections::btree_map::Entry;
+use std::collections::BTreeMap;
 use std::num::NonZero;
 use std::str;
 use std::sync::{Arc, Mutex};
@@ -7,9 +9,9 @@ use crate::catalog::{self, PostgresDialect};
 use turso_core::{Connection, LimboError, PrepareOptions, Result, Statement, Value};
 use turso_parser::ast::{self};
 use turso_pg_parser::translator::{
-    is_comment_on, is_refresh_matview, try_extract_copy_from, try_extract_create_schema,
-    try_extract_drop_schema, try_extract_set, try_extract_show, PgCopyFromStmt, PgCreateSchemaStmt,
-    PgDropSchemaStmt, PgSetStmt, PostgreSQLTranslator,
+    is_comment_on, is_grant_or_revoke, is_refresh_matview, is_set_role, try_extract_copy_from,
+    try_extract_create_schema, try_extract_drop_schema, try_extract_set, try_extract_show,
+    PgCopyFromStmt, PgCreateSchemaStmt, PgDropSchemaStmt, PgSetStmt, PostgreSQLTranslator,
 };
 
 use crate::copy::parse_copy_text_format;
@@ -22,6 +24,7 @@ pub struct PgConnection {
 struct PgConnectionInner {
     conn: Arc<Connection>,
     session_state: Mutex<SessionState>,
+    schemas: PgSchemas,
 }
 
 impl PgConnectionInner {
@@ -34,6 +37,61 @@ impl PgConnectionInner {
 #[derive(Default)]
 struct SessionState {
     search_path: Vec<String>,
+    /// The [PgSchemas] version this connection's attached schemas match.
+    schemas_version: u64,
+    /// The schemas attached to this connection, by name, with the id they
+    /// had in [PgSchemas] when they were attached.
+    attached_schemas: BTreeMap<String, u64>,
+}
+
+/// The schemas created with CREATE SCHEMA, which are databases attached to
+/// each connection. Connections that share this list attach and detach
+/// schemas to match it before every statement, so a schema one connection
+/// creates or drops is seen by the others.
+#[derive(Clone, Default)]
+pub struct PgSchemas {
+    inner: Arc<Mutex<SchemaFiles>>,
+}
+
+#[derive(Default)]
+struct SchemaFiles {
+    /// Increased every time a schema is added or removed.
+    version: u64,
+    schemas: BTreeMap<String, SchemaFile>,
+}
+
+#[derive(Clone)]
+struct SchemaFile {
+    path: String,
+    /// Differs from the id of an earlier schema with the same name, so a
+    /// connection can tell that a schema was dropped and created again.
+    id: u64,
+}
+
+impl PgSchemas {
+    /// Adds a schema and returns its id.
+    fn add(&self, name: String, path: String) -> u64 {
+        let mut files = self.inner.lock().unwrap();
+        files.version += 1;
+        let id = files.version;
+        files.schemas.insert(name, SchemaFile { path, id });
+        id
+    }
+
+    fn remove(&self, name: &str) {
+        let mut files = self.inner.lock().unwrap();
+        files.schemas.remove(name);
+        files.version += 1;
+    }
+
+    fn version(&self) -> u64 {
+        self.inner.lock().unwrap().version
+    }
+
+    fn schemas(&self) -> (u64, BTreeMap<String, SchemaFile>) {
+        let files = self.inner.lock().unwrap();
+        (files.version, files.schemas.clone())
+    }
 }
 
 /// Open a database with the PostgreSQL schema dialect, resolving the IO
@@ -79,12 +137,36 @@ impl PgConnection {
             inner: Arc::new(PgConnectionInner {
                 conn,
                 session_state: Mutex::new(SessionState::default()),
+                schemas: PgSchemas::default(),
             }),
         }
     }
 
+    /// A connection that attaches the schemas in `schemas` now and follows
+    /// the changes other connections make to it.
+    pub fn with_schemas(conn: Arc<Connection>, schemas: PgSchemas) -> Result<Self> {
+        aliases::install(&conn);
+        let inner = Arc::new(PgConnectionInner {
+            conn,
+            session_state: Mutex::new(SessionState::default()),
+            schemas,
+        });
+        attach_shared_schemas(&inner)?;
+        Ok(Self { inner })
+    }
+
     pub fn inner(&self) -> &Arc<Connection> {
         &self.inner.conn
+    }
+
+    pub fn schemas(&self) -> &PgSchemas {
+        &self.inner.schemas
+    }
+
+    /// Attaches the schema database file at `path` as `name` and adds it to
+    /// the schemas this connection shares with other connections.
+    pub fn attach_schema(&self, name: &str, path: &str) -> Result<()> {
+        attach_schema(&self.inner, name, path)
     }
 
     pub fn prepare(&self, sql: impl AsRef<str>) -> Result<Statement> {
@@ -175,6 +257,7 @@ fn prepare_statement(pg_conn: &Arc<PgConnectionInner>, sql: &str) -> Result<Stat
     }
 
     reject_sqlite_catalog_access(sql)?;
+    attach_shared_schemas(pg_conn)?;
 
     if let Some(stmt) = try_prepare_special(pg_conn, sql)? {
         return Ok(stmt);
@@ -206,6 +289,56 @@ fn prepare_statement(pg_conn: &Arc<PgConnectionInner>, sql: &str) -> Result<Stat
     pg_conn
         .conn
         .prepare_translated_cmd_with_options(translated.cmd, sql, &options)
+}
+
+/// Attaches the shared schemas this connection is missing and detaches the
+/// ones another connection dropped, including ones that were dropped and
+/// created again, which have a new database file. Inside a transaction the
+/// schemas stay as they are, because a database cannot be detached while
+/// the transaction uses it, and COMMIT and ROLLBACK must still work.
+fn attach_shared_schemas(pg_conn: &PgConnectionInner) -> Result<()> {
+    if !pg_conn.conn.get_auto_commit() {
+        return Ok(());
+    }
+    let mut state = pg_conn.session_state.lock().unwrap();
+    if state.schemas_version == pg_conn.schemas.version() {
+        return Ok(());
+    }
+    let (version, schemas) = pg_conn.schemas.schemas();
+    let dropped: Vec<String> = state
+        .attached_schemas
+        .iter()
+        .filter(|(name, id)| schemas.get(*name).map(|schema| schema.id) != Some(**id))
+        .map(|(name, _)| name.clone())
+        .collect();
+    for name in dropped {
+        execute_sqlite_internal(&pg_conn.conn, format!("DETACH \"{name}\""))?;
+        state.attached_schemas.remove(&name);
+    }
+    for (name, schema) in schemas {
+        if let Entry::Vacant(entry) = state.attached_schemas.entry(name) {
+            execute_sqlite_internal(&pg_conn.conn, attach_schema_sql(entry.key(), &schema.path))?;
+            entry.insert(schema.id);
+        }
+    }
+    state.schemas_version = version;
+    Ok(())
+}
+
+fn attach_schema(pg_conn: &PgConnectionInner, name: &str, path: &str) -> Result<()> {
+    execute_sqlite_internal(&pg_conn.conn, attach_schema_sql(name, path))?;
+    let id = pg_conn.schemas.add(name.to_string(), path.to_string());
+    pg_conn
+        .session_state
+        .lock()
+        .unwrap()
+        .attached_schemas
+        .insert(name.to_string(), id);
+    Ok(())
+}
+
+fn attach_schema_sql(name: &str, path: &str) -> String {
+    format!("ATTACH '{}' AS \"{}\"", path.replace('\'', "''"), name)
 }
 
 fn reject_catalog_dml(stmt: &ast::Stmt) -> Result<()> {
@@ -253,6 +386,14 @@ fn try_prepare_special(pg_conn: &Arc<PgConnectionInner>, sql: &str) -> Result<Op
         Err(_) => return Ok(None),
     };
 
+    if is_set_role(&parse_result) {
+        return Ok(None);
+    }
+
+    if is_grant_or_revoke(&parse_result) {
+        return Ok(Some(noop_statement(&pg_conn.conn)?));
+    }
+
     if let Some(set_stmt) = try_extract_set(&parse_result) {
         let stmt = handle_pg_set(pg_conn, &set_stmt)?;
         return Ok(Some(stmt));
@@ -264,12 +405,14 @@ fn try_prepare_special(pg_conn: &Arc<PgConnectionInner>, sql: &str) -> Result<Op
     }
 
     if let Some(stmt) = try_extract_create_schema(&parse_result) {
-        handle_pg_create_schema(&pg_conn.conn, &stmt)?;
+        reject_for_roles(&pg_conn.conn, "CREATE SCHEMA")?;
+        handle_pg_create_schema(pg_conn, &stmt)?;
         return Ok(Some(noop_statement(&pg_conn.conn)?));
     }
 
     if let Some(stmt) = try_extract_drop_schema(&parse_result) {
-        handle_pg_drop_schema(&pg_conn.conn, &stmt)?;
+        reject_for_roles(&pg_conn.conn, "DROP SCHEMA")?;
+        handle_pg_drop_schema(pg_conn, &stmt)?;
         return Ok(Some(noop_statement(&pg_conn.conn)?));
     }
 
@@ -289,6 +432,17 @@ fn try_prepare_special(pg_conn: &Arc<PgConnectionInner>, sql: &str) -> Result<Op
     }
 
     Ok(None)
+}
+
+/// Schema commands attach and detach databases with internal statements,
+/// which skip the role checks core does for the statements a client sends.
+fn reject_for_roles(conn: &Connection, command: &str) -> Result<()> {
+    if conn.current_role().is_some() {
+        return Err(LimboError::ParseError(format!(
+            "permission denied: {command} requires the superuser"
+        )));
+    }
+    Ok(())
 }
 
 fn noop_statement(conn: &Arc<Connection>) -> Result<Statement> {
@@ -318,7 +472,8 @@ fn handle_pg_set(pg_conn: &Arc<PgConnectionInner>, set_stmt: &PgSetStmt) -> Resu
     pg_conn.conn.prepare(&pragma_sql)
 }
 
-fn handle_pg_create_schema(conn: &Arc<Connection>, stmt: &PgCreateSchemaStmt) -> Result<()> {
+fn handle_pg_create_schema(pg_conn: &PgConnectionInner, stmt: &PgCreateSchemaStmt) -> Result<()> {
+    let conn = &pg_conn.conn;
     let name = stmt.name.to_lowercase();
     if name == "public" {
         if stmt.if_not_exists {
@@ -339,11 +494,7 @@ fn handle_pg_create_schema(conn: &Arc<Connection>, stmt: &PgCreateSchemaStmt) ->
     }
 
     let path = schema_file_path(conn, &name);
-    execute_sqlite_internal(
-        conn,
-        format!("ATTACH '{}' AS \"{}\"", path.replace('\'', "''"), name),
-    )?;
-    Ok(())
+    attach_schema(pg_conn, &name, &path)
 }
 
 fn schema_file_path(conn: &Connection, schema_name: &str) -> String {
@@ -359,7 +510,8 @@ fn schema_file_path(conn: &Connection, schema_name: &str) -> String {
     }
 }
 
-fn handle_pg_drop_schema(conn: &Arc<Connection>, stmt: &PgDropSchemaStmt) -> Result<()> {
+fn handle_pg_drop_schema(pg_conn: &PgConnectionInner, stmt: &PgDropSchemaStmt) -> Result<()> {
+    let conn = &pg_conn.conn;
     let name = stmt.name.to_lowercase();
     if name == "public" {
         return handle_pg_drop_schema_public(conn, stmt.cascade);
@@ -379,6 +531,13 @@ fn handle_pg_drop_schema(conn: &Arc<Connection>, stmt: &PgDropSchemaStmt) -> Res
     }
 
     execute_sqlite_internal(conn, format!("DETACH \"{name}\""))?;
+    pg_conn.schemas.remove(&name);
+    pg_conn
+        .session_state
+        .lock()
+        .unwrap()
+        .attached_schemas
+        .remove(&name);
     Ok(())
 }
 
@@ -508,7 +667,7 @@ fn list_user_tables(conn: &Arc<Connection>, schema_name: Option<&str>) -> Result
         Some(name) => format!("SELECT name FROM \"{name}\".sqlite_schema WHERE {filter}"),
         None => format!("SELECT name FROM sqlite_schema WHERE {filter}"),
     };
-    let mut stmt = conn.prepare_internal(&sql)?;
+    let mut stmt = conn.prepare_sqlite(&sql)?;
     let rows = stmt.run_collect_rows()?;
     Ok(rows
         .into_iter()

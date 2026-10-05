@@ -763,6 +763,8 @@ pub struct Schema {
     pub generated_columns_enabled: bool,
     /// Named sequences (CREATE SEQUENCE)
     pub sequences: HashMap<String, Arc<Sequence>>,
+    /// Roles, loaded from __turso_internal_access_control
+    pub access_control: Arc<crate::access_control::AccessControlCatalog>,
 }
 
 impl Default for Schema {
@@ -905,6 +907,7 @@ impl Schema {
             type_registry,
             generated_columns_enabled: false,
             sequences: HashMap::default(),
+            access_control: Arc::default(),
         };
         dialect.register_catalog(&mut schema, enable_custom_types)?;
         Ok(schema)
@@ -2834,6 +2837,7 @@ impl TryClone for Schema {
             type_registry: self.type_registry.try_clone()?,
             generated_columns_enabled: self.generated_columns_enabled,
             sequences: self.sequences.try_clone()?,
+            access_control: self.access_control.clone(),
         })
     }
 }

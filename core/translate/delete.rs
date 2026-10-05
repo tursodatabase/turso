@@ -1,5 +1,6 @@
 use crate::schema::{BTreeTable, Table};
 use crate::sync::Arc;
+use crate::translate::access_control;
 use crate::translate::emitter::{emit_program, Resolver};
 use crate::translate::expr::{process_returning_clause, walk_expr, WalkControl};
 use crate::translate::optimizer::optimize_plan;
@@ -96,6 +97,7 @@ pub fn translate_delete(
         program,
         connection,
     )?;
+    access_control::reject_write_with_row_security(&normalized_table_name, database_id, resolver)?;
 
     let schema_cookie = resolver.with_schema(database_id, |s| s.schema_version);
     program.begin_write_on_database(database_id, schema_cookie)?;

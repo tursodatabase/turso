@@ -7,6 +7,7 @@
 //! a SELECT statement will be translated into a sequence of instructions that
 //! will read rows from the database and filter them according to a WHERE clause.
 
+pub(crate) mod access_control;
 pub(crate) mod aggregation;
 pub(crate) mod alter;
 pub(crate) mod analyze;
@@ -129,6 +130,12 @@ pub fn translate(
     );
     #[cfg(feature = "simulator")]
     resolver.set_subquery_unnesting_mode(connection.subquery_unnesting_mode());
+    if !matches!(origin, crate::statement::StatementOrigin::InternalHelper) {
+        resolver.role = connection.current_role();
+    }
+    if resolver.role.is_some() {
+        access_control::reject_statement_not_allowed_for_roles(&stmt)?;
+    }
 
     match stmt {
         // There can be no nesting with pragma, so lift it up here
@@ -185,6 +192,10 @@ pub fn translate_inner(
             | ast::Stmt::Insert { .. }
             | ast::Stmt::CreateSequence { .. }
             | ast::Stmt::DropSequence { .. }
+            | ast::Stmt::CreateRole { .. }
+            | ast::Stmt::DropRole { .. }
+            | ast::Stmt::CreatePolicy(..)
+            | ast::Stmt::DropPolicy { .. }
     );
     let is_vacuum = matches!(stmt, ast::Stmt::Vacuum { .. });
 
@@ -486,6 +497,30 @@ pub fn translate_inner(
         } => {
             sequence::translate_drop_sequence(&seq_name, if_exists, resolver, program)?;
         }
+        ast::Stmt::CreateRole { role_name } => {
+            access_control::translate_create_role(&role_name, resolver, program)?
+        }
+        ast::Stmt::DropRole {
+            if_exists,
+            role_name,
+        } => access_control::translate_drop_role(&role_name, if_exists, resolver, program)?,
+        ast::Stmt::SetRole { role_name } => {
+            access_control::translate_set_role(role_name.as_ref(), program)?
+        }
+        ast::Stmt::CreatePolicy(policy) => {
+            access_control::translate_create_policy(&policy, resolver, program)?
+        }
+        ast::Stmt::DropPolicy {
+            if_exists,
+            policy_name,
+            tbl_name,
+        } => access_control::translate_drop_policy(
+            &policy_name,
+            &tbl_name,
+            if_exists,
+            resolver,
+            program,
+        )?,
     };
 
     if is_write {
@@ -519,7 +554,7 @@ pub fn translate_inner(
     Ok(())
 }
 
-fn stmt_kind(stmt: &ast::Stmt) -> &'static str {
+pub(crate) fn stmt_kind(stmt: &ast::Stmt) -> &'static str {
     match stmt {
         ast::Stmt::AlterTable(_) => "alter_table",
         ast::Stmt::Analyze { .. } => "analyze",
@@ -554,6 +589,11 @@ fn stmt_kind(stmt: &ast::Stmt) -> &'static str {
         ast::Stmt::Optimize { .. } => "optimize",
         ast::Stmt::CreateSequence { .. } => "create_sequence",
         ast::Stmt::DropSequence { .. } => "drop_sequence",
+        ast::Stmt::CreateRole { .. } => "create_role",
+        ast::Stmt::DropRole { .. } => "drop_role",
+        ast::Stmt::SetRole { .. } => "set_role",
+        ast::Stmt::CreatePolicy(..) => "create_policy",
+        ast::Stmt::DropPolicy { .. } => "drop_policy",
     }
 }
 

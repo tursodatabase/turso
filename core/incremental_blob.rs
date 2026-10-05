@@ -280,7 +280,13 @@ impl Connection {
         read_write: bool,
     ) -> Result<Blob> {
         let fk_enforced = self.foreign_keys_enabled();
+        let acting_as_role = self.current_role().is_some();
         let (table_ref, record_column) = self.with_schema_mut(|schema| {
+            if acting_as_role && schema.access_control.has_row_security(table) {
+                return Err(LimboError::ParseError(format!(
+                    "blob access to table \"{table}\" with row-level security is not supported for roles"
+                )));
+            }
             if schema.is_materialized_view(table) || schema.get_view(table).is_some() {
                 return Err(LimboError::InternalError(format!(
                     "cannot open view: {table}"

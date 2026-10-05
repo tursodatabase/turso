@@ -47,6 +47,7 @@ pub(crate) mod btree_dump;
 pub(crate) mod sync;
 pub(crate) mod thread;
 
+mod access_control;
 mod assert;
 mod connection;
 mod database;
