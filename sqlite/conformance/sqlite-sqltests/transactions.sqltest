@@ -94,3 +94,60 @@ expect {
     1
 }
 
+test temp-table-two-inserts-in-immediate-tx-are-both-rolled-back {
+    CREATE TEMP TABLE t(x);
+    BEGIN IMMEDIATE;
+    INSERT INTO temp.t VALUES (1);
+    INSERT INTO temp.t VALUES (2);
+    SELECT group_concat(x) FROM temp.t;
+    ROLLBACK;
+    SELECT count(*) FROM temp.t;
+}
+expect {
+    1,2
+    0
+}
+
+test begin-immediate-and-exclusive-do-not-open-temp-database {
+    CREATE TABLE t(x);
+    BEGIN IMMEDIATE;
+    INSERT INTO t VALUES(1);
+    COMMIT;
+    BEGIN EXCLUSIVE;
+    INSERT INTO t VALUES(1);
+    COMMIT;
+    SELECT name FROM pragma_database_list;
+}
+expect {
+    main
+}
+
+test temp-table-created-in-immediate-tx-is-rolled-back {
+    CREATE TABLE t(x);
+    BEGIN IMMEDIATE;
+    CREATE TEMP TABLE tt(x);
+    INSERT INTO tt VALUES(1);
+    INSERT INTO t VALUES(1);
+    ROLLBACK;
+    SELECT
+        (SELECT count(*) FROM temp.sqlite_schema WHERE name = 'tt'),
+        (SELECT count(*) FROM t);
+}
+expect {
+    0|0
+}
+
+test temp-table-created-in-immediate-tx-then-later-tx-is-rolled-back {
+    BEGIN IMMEDIATE;
+    CREATE TEMP TABLE tt(x);
+    INSERT INTO tt VALUES(1);
+    COMMIT;
+    BEGIN IMMEDIATE;
+    INSERT INTO tt VALUES(2);
+    ROLLBACK;
+    SELECT x FROM tt;
+}
+expect {
+    1
+}
+
