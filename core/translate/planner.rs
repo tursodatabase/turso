@@ -28,7 +28,7 @@ use crate::{
     Result,
 };
 use crate::{
-    function::{AccumulatorFunc, AggFunc, ExtFunc, WindowFunc},
+    function::{AccumulatorFunc, AggFunc, WindowFunc},
     translate::expr::bind_and_rewrite_expr,
 };
 use crate::{
@@ -612,13 +612,6 @@ pub fn resolve_window_and_aggregate_functions(
                         {
                             let func = AggFunc::External(f.func.clone().into());
                             if f.func.is_aggregate() {
-                                if matches!(f.func, ExtFunc::NativeAggregate { .. })
-                                    && filter_over.over_clause.is_some()
-                                {
-                                    crate::bail_parse_error!(
-                                        "native aggregates do not support OVER"
-                                    );
-                                }
                                 if let Some(over_clause) = filter_over.over_clause.as_ref() {
                                     link_with_window(
                                         windows.as_deref_mut(),
@@ -721,13 +714,6 @@ pub fn resolve_window_and_aggregate_functions(
                         if let Some(f) = resolver.symbol_table.resolve_function(name.as_str(), 0) {
                             let func = AggFunc::External(f.func.clone().into());
                             if f.func.is_aggregate() {
-                                if matches!(f.func, ExtFunc::NativeAggregate { .. })
-                                    && filter_over.over_clause.is_some()
-                                {
-                                    crate::bail_parse_error!(
-                                        "native aggregates do not support OVER"
-                                    );
-                                }
                                 if let Some(over_clause) = filter_over.over_clause.as_ref() {
                                     link_with_window(
                                         windows.as_deref_mut(),

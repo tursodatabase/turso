@@ -224,6 +224,7 @@ pub struct OpenOptions {
     wal_path: Option<String>,
     flags: OpenFlags,
     db_opts: DatabaseOpts,
+    pub(crate) native_extensions: crate::native_ext::NativeExtensions,
     encryption: Option<EncryptionOpts>,
     page_codec: Option<Arc<dyn PageCodec>>,
     durable_storage: Option<Arc<dyn crate::mvcc::persistent_storage::DurableStorage>>,
@@ -243,6 +244,7 @@ impl OpenOptions {
             wal_path: None,
             flags: OpenFlags::default(),
             db_opts: DatabaseOpts::default(),
+            native_extensions: crate::native_ext::NativeExtensions::default(),
             encryption: None,
             page_codec: None,
             durable_storage: None,
@@ -727,6 +729,7 @@ impl Database {
         allocators: DatabaseAllocators,
         page_codec_id: Option<PageCodecId>,
         dialect: Arc<dyn Dialect>,
+        native_extensions: &crate::native_ext::NativeExtensions,
     ) -> Result<Self> {
         let path = path.into();
         let wal_path = wal_path.into();
@@ -806,6 +809,7 @@ impl Database {
 
         db.register_global_builtin_extensions()
             .expect("unable to register global extensions");
+        native_extensions.register(&db)?;
         Ok(db)
     }
 
@@ -1335,6 +1339,7 @@ impl Database {
             options.page_codec.clone(),
             options.allocators.clone(),
             options.dialect.clone(),
+            &options.native_extensions,
         );
 
         match &result {
@@ -1412,6 +1417,7 @@ impl Database {
             options.page_codec.clone(),
             options.allocators.clone(),
             options.dialect.clone(),
+            &options.native_extensions,
         )
     }
 
@@ -1432,6 +1438,7 @@ impl Database {
         page_codec: Option<Arc<dyn PageCodec>>,
         allocators: DatabaseAllocators,
         dialect: Arc<dyn Dialect>,
+        native_extensions: &crate::native_ext::NativeExtensions,
     ) -> IOResultOr<Arc<Database>> {
         Self::validate_external_page_codec_options(opts, page_codec.is_some())?;
         if encryption_opts.is_some() && page_codec.is_some() {
@@ -1453,6 +1460,7 @@ impl Database {
             page_codec,
             allocators,
             dialect,
+            native_extensions,
         );
         if result.is_err() {
             let _ = state.schema_guard.take();
@@ -1474,6 +1482,7 @@ impl Database {
         page_codec: Option<Arc<dyn PageCodec>>,
         allocators: DatabaseAllocators,
         dialect: Arc<dyn Dialect>,
+        native_extensions: &crate::native_ext::NativeExtensions,
     ) -> IOResultOr<Arc<Database>> {
         loop {
             tracing::debug!("do_open_async_internal: state.phase={:?}", state.phase);
@@ -1502,6 +1511,7 @@ impl Database {
                         allocators.clone(),
                         page_codec.as_deref().map(PageCodec::codec_id),
                         dialect.clone(),
+                        native_extensions,
                     )?;
                     db.durable_storage.clone_from(&durable_storage);
 

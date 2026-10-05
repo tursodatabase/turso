@@ -304,6 +304,10 @@ impl VirtualTableCursor {
         self.null_flag = flag;
     }
 
+    pub(crate) fn is_native(&self) -> bool {
+        matches!(self.inner, VirtualTableCursorInner::Native(_))
+    }
+
     pub(crate) fn next(&mut self) -> IOResultOr<bool> {
         self.null_flag = false;
         let result = match &mut self.inner {

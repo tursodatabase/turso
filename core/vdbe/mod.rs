@@ -2274,6 +2274,7 @@ impl Program {
         match &result {
             ProgramStep::Row => {}
             ProgramStep::Done => {
+                crate::native_ext::close_cursors(&mut state.cursors);
                 state.execution_state = ProgramExecutionState::Done;
             }
             ProgramStep::Interrupt => {
@@ -3273,6 +3274,9 @@ impl Program {
         }
 
         let mut abort_error: Option<LimboError> = None;
+        if let Err(err) = execute::abort_active_subprogram(self, state, err) {
+            capture_abort_error(&mut abort_error, err, "Failed to abort active subprogram");
+        }
         state.extension_state = crate::native_ext::ExtensionState::None;
         crate::native_ext::abort_aggregates(&mut state.registers);
         state.explicit_checkpoint_guard = None;

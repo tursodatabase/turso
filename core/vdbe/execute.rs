@@ -6062,6 +6062,38 @@ pub fn op_program(
     }
 }
 
+pub(super) fn abort_active_subprogram(
+    program: &Program,
+    state: &mut ProgramState,
+    err: Option<&LimboError>,
+) -> Result<()> {
+    let Some(subprogram) = state.active_op_state.program_mut() else {
+        return Ok(());
+    };
+    let subprogram = std::mem::take(subprogram);
+    state.active_op_state.clear();
+    if let OpProgramState::Step {
+        is_trigger,
+        mut statement,
+        saved_last_insert_rowid,
+        saved_changes_value,
+    } = subprogram
+    {
+        let result = statement.abort_subprogram(err);
+        finish_subprogram(
+            program,
+            &statement,
+            is_trigger,
+            true,
+            saved_last_insert_rowid,
+            saved_changes_value,
+        );
+        result
+    } else {
+        Ok(())
+    }
+}
+
 pub fn op_real(
     _program: &Program,
     state: &mut ProgramState,

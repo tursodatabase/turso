@@ -3,31 +3,34 @@ use crate::alloc::TryClone;
 use crate::sync::{Arc, Mutex};
 use crate::types::{IOCompletions, IOResultOr};
 use crate::{
-    Completion, Database, IOResult, MemoryIO, Numeric, Register, SqliteDialect, Statement,
-    StepResult, Value,
+    Completion, Connection, Database, IOResult, MemoryIO, Numeric, OpenOptions, Register,
+    SqliteDialect, Statement, StepResult, Value,
 };
 use std::sync::atomic::{AtomicUsize, Ordering};
-use turso_ext::{ConstraintOp, ResultCode};
+use turso_ext::{ConstraintOp, ResultCode, VTabCursor, VTabModule, VTable};
 
 #[test]
 fn scalar_calls_resume_independently_and_create_once() {
-    let conn = connection();
     let queue = Arc::new(Mutex::new(Vec::new()));
     let created = Arc::new(AtomicUsize::new(0));
     let dropped = Arc::new(AtomicUsize::new(0));
-    conn.register_native_scalar(
-        "delayed",
-        2,
-        false,
-        DelayedScalar {
-            queue: queue.clone(),
-            created: created.clone(),
-            dropped: dropped.clone(),
-        },
-    )
-    .unwrap();
+    let conn = connection(
+        OpenOptions::new(Arc::new(SqliteDialect))
+            .native_scalar(
+                "delayed",
+                2,
+                false,
+                DelayedScalar {
+                    queue: queue.clone(),
+                    created: created.clone(),
+                    dropped: dropped.clone(),
+                },
+            )
+            .unwrap(),
+    );
     let mut first = conn.prepare("SELECT delayed(7, 3)").unwrap();
-    let mut second = conn.prepare("SELECT delayed(2, 9)").unwrap();
+    let other = conn.db.connect().unwrap();
+    let mut second = other.prepare("SELECT delayed(2, 9)").unwrap();
     assert!(matches!(first.step().unwrap(), StepResult::IO));
     assert!(matches!(second.step().unwrap(), StepResult::IO));
     assert!(matches!(first.step().unwrap(), StepResult::IO));
@@ -44,21 +47,23 @@ fn scalar_calls_resume_independently_and_create_once() {
 
 #[test]
 fn resetting_a_pending_scalar_drops_it_and_starts_a_new_call() {
-    let conn = connection();
     let queue = Arc::new(Mutex::new(Vec::new()));
     let created = Arc::new(AtomicUsize::new(0));
     let dropped = Arc::new(AtomicUsize::new(0));
-    conn.register_native_scalar(
-        "delayed",
-        2,
-        false,
-        DelayedScalar {
-            queue: queue.clone(),
-            created: created.clone(),
-            dropped: dropped.clone(),
-        },
-    )
-    .unwrap();
+    let conn = connection(
+        OpenOptions::new(Arc::new(SqliteDialect))
+            .native_scalar(
+                "delayed",
+                2,
+                false,
+                DelayedScalar {
+                    queue: queue.clone(),
+                    created: created.clone(),
+                    dropped: dropped.clone(),
+                },
+            )
+            .unwrap(),
+    );
     let mut stmt = conn.prepare("SELECT delayed(4, 1)").unwrap();
     assert!(matches!(stmt.step().unwrap(), StepResult::IO));
     stmt.reset().unwrap();
@@ -70,20 +75,22 @@ fn resetting_a_pending_scalar_drops_it_and_starts_a_new_call() {
 
 #[test]
 fn scalar_error_after_io_drops_the_call_and_preserves_the_error() {
-    let conn = connection();
     let queue = Arc::new(Mutex::new(Vec::new()));
     let dropped = Arc::new(AtomicUsize::new(0));
-    conn.register_native_scalar(
-        "delayed",
-        2,
-        false,
-        DelayedScalar {
-            queue: queue.clone(),
-            created: Arc::new(AtomicUsize::new(0)),
-            dropped: dropped.clone(),
-        },
-    )
-    .unwrap();
+    let conn = connection(
+        OpenOptions::new(Arc::new(SqliteDialect))
+            .native_scalar(
+                "delayed",
+                2,
+                false,
+                DelayedScalar {
+                    queue: queue.clone(),
+                    created: Arc::new(AtomicUsize::new(0)),
+                    dropped: dropped.clone(),
+                },
+            )
+            .unwrap(),
+    );
     let mut stmt = conn.prepare("SELECT delayed(-1, 8)").unwrap();
     assert!(matches!(stmt.step().unwrap(), StepResult::IO));
     queue.lock().pop().unwrap().complete(0);
@@ -96,20 +103,22 @@ fn scalar_error_after_io_drops_the_call_and_preserves_the_error() {
 
 #[test]
 fn failed_completion_releases_the_pending_scalar() {
-    let conn = connection();
     let queue = Arc::new(Mutex::new(Vec::new()));
     let dropped = Arc::new(AtomicUsize::new(0));
-    conn.register_native_scalar(
-        "delayed",
-        2,
-        false,
-        DelayedScalar {
-            queue: queue.clone(),
-            created: Arc::new(AtomicUsize::new(0)),
-            dropped: dropped.clone(),
-        },
-    )
-    .unwrap();
+    let conn = connection(
+        OpenOptions::new(Arc::new(SqliteDialect))
+            .native_scalar(
+                "delayed",
+                2,
+                false,
+                DelayedScalar {
+                    queue: queue.clone(),
+                    created: Arc::new(AtomicUsize::new(0)),
+                    dropped: dropped.clone(),
+                },
+            )
+            .unwrap(),
+    );
     let mut stmt = conn.prepare("SELECT delayed(7, 2)").unwrap();
     assert!(matches!(stmt.step().unwrap(), StepResult::IO));
     queue
@@ -125,19 +134,100 @@ fn failed_completion_releases_the_pending_scalar() {
 }
 
 #[test]
+fn abort_releases_nested_trigger_calls_and_restores_trigger_state() {
+    for fail_completion in [true, false] {
+        let queue = Arc::new(Mutex::new(Vec::new()));
+        let dropped = Arc::new(AtomicUsize::new(0));
+        let conn = connection(
+            OpenOptions::new(Arc::new(SqliteDialect))
+                .native_scalar(
+                    "delayed",
+                    2,
+                    false,
+                    DelayedScalar {
+                        queue: queue.clone(),
+                        created: Arc::new(AtomicUsize::new(0)),
+                        dropped: dropped.clone(),
+                    },
+                )
+                .unwrap(),
+        );
+        conn.execute("CREATE TABLE parent(id INTEGER PRIMARY KEY)")
+            .unwrap();
+        conn.execute("CREATE TABLE child(id INTEGER PRIMARY KEY)")
+            .unwrap();
+        conn.execute("CREATE TABLE audit(id INTEGER PRIMARY KEY)")
+            .unwrap();
+        conn.execute("INSERT INTO audit VALUES (501), (502)")
+            .unwrap();
+        conn.execute(
+            "CREATE TRIGGER child_insert AFTER INSERT ON child BEGIN \
+             INSERT INTO audit VALUES (97); SELECT delayed(NEW.id, 8); END",
+        )
+        .unwrap();
+        conn.execute(
+            "CREATE TRIGGER parent_insert AFTER INSERT ON parent BEGIN \
+             INSERT INTO child VALUES (NEW.id + 20); END",
+        )
+        .unwrap();
+        let mut stmt = conn.prepare("INSERT INTO parent VALUES (7)").unwrap();
+        assert!(matches!(stmt.step().unwrap(), StepResult::IO));
+        assert_eq!(conn.executing_triggers.read().len(), 2);
+        assert_eq!(conn.last_insert_rowid(), 97);
+        if fail_completion {
+            queue
+                .lock()
+                .pop()
+                .unwrap()
+                .error(crate::CompletionError::Aborted);
+            assert!(matches!(
+                stmt.step().unwrap_err(),
+                LimboError::CompletionError(crate::CompletionError::Aborted)
+            ));
+        } else {
+            stmt.reset().unwrap();
+        }
+        assert_eq!(dropped.load(Ordering::SeqCst), 1);
+        assert!(conn.executing_triggers.read().is_empty());
+        assert_eq!(conn.last_insert_rowid(), 7);
+        assert!(conn
+            .prepare("SELECT id FROM parent")
+            .unwrap()
+            .run_collect_rows()
+            .unwrap()
+            .is_empty());
+        assert!(conn
+            .prepare("SELECT id FROM child")
+            .unwrap()
+            .run_collect_rows()
+            .unwrap()
+            .is_empty());
+        assert_eq!(
+            conn.prepare("SELECT id FROM audit ORDER BY id")
+                .unwrap()
+                .run_collect_rows()
+                .unwrap(),
+            vec![vec![Value::from_i64(501)], vec![Value::from_i64(502)]]
+        );
+    }
+}
+
+#[test]
 fn aggregates_resume_steps_and_finalization_for_each_group() {
-    let conn = connection();
     let queue = Arc::new(Mutex::new(Vec::new()));
     let created = Arc::new(AtomicUsize::new(0));
-    conn.register_native_aggregate(
-        "weighted",
-        2,
-        WeightedSum {
-            queue: queue.clone(),
-            created: created.clone(),
-        },
-    )
-    .unwrap();
+    let conn = connection(
+        OpenOptions::new(Arc::new(SqliteDialect))
+            .native_aggregate(
+                "weighted",
+                2,
+                WeightedSum {
+                    queue: queue.clone(),
+                    created: created.clone(),
+                },
+            )
+            .unwrap(),
+    );
     let mut stmt = conn
         .prepare(
             "WITH t(g, x, y) AS (VALUES (1, 2, 3), (1, 5, 7), (2, -4, 11)) \
@@ -156,7 +246,8 @@ fn aggregates_resume_steps_and_finalization_for_each_group() {
         ]
     );
     assert_eq!(created.load(Ordering::SeqCst), 4);
-    let mut empty = conn.prepare("SELECT weighted(3, 7) WHERE 0").unwrap();
+    let other = conn.db.connect().unwrap();
+    let mut empty = other.prepare("SELECT weighted(3, 7) WHERE 0").unwrap();
     assert_eq!(
         collect(&mut empty, &queue),
         vec![vec![Value::from_i64(-99)]]
@@ -166,22 +257,24 @@ fn aggregates_resume_steps_and_finalization_for_each_group() {
         .prepare("SELECT weighted(3, 7) OVER ()")
         .unwrap_err()
         .to_string()
-        .contains("do not support OVER"));
+        .contains("cannot be used as a window function"));
 }
 
 #[test]
 fn native_variadic_aggregates_use_callsite_argument_count() {
-    let conn = connection();
     let queue = Arc::new(Mutex::new(Vec::new()));
-    conn.register_native_aggregate(
-        "weighted",
-        -1,
-        WeightedSum {
-            queue: queue.clone(),
-            created: Arc::new(AtomicUsize::new(0)),
-        },
-    )
-    .unwrap();
+    let conn = connection(
+        OpenOptions::new(Arc::new(SqliteDialect))
+            .native_aggregate(
+                "weighted",
+                -1,
+                WeightedSum {
+                    queue: queue.clone(),
+                    created: Arc::new(AtomicUsize::new(0)),
+                },
+            )
+            .unwrap(),
+    );
     let mut stmt = conn
         .prepare("SELECT weighted(3, 11), weighted(5, 2)")
         .unwrap();
@@ -235,18 +328,20 @@ fn copied_aggregate_accumulators_do_not_share_mutable_state() {
 
 #[test]
 fn pending_aggregates_release_state_on_reset_and_failed_completion() {
-    let conn = connection();
     let queue = Arc::new(Mutex::new(Vec::new()));
     let created = Arc::new(AtomicUsize::new(0));
-    conn.register_native_aggregate(
-        "weighted",
-        2,
-        WeightedSum {
-            queue: queue.clone(),
-            created: created.clone(),
-        },
-    )
-    .unwrap();
+    let conn = connection(
+        OpenOptions::new(Arc::new(SqliteDialect))
+            .native_aggregate(
+                "weighted",
+                2,
+                WeightedSum {
+                    queue: queue.clone(),
+                    created: created.clone(),
+                },
+            )
+            .unwrap(),
+    );
     let mut stmt = conn.prepare("SELECT weighted(4, 7)").unwrap();
     assert!(matches!(stmt.step().unwrap(), StepResult::IO));
     stmt.reset().unwrap();
@@ -269,10 +364,9 @@ fn pending_aggregates_release_state_on_reset_and_failed_completion() {
 
 #[test]
 fn virtual_table_filter_next_and_column_resume_without_skipping_rows() {
-    let conn = connection();
     let queue = Arc::new(Mutex::new(Vec::new()));
     let rows = Arc::new(Mutex::new(vec![(1, 4), (2, 9), (3, 17)]));
-    conn.register_native_module(
+    let conn = connection(OpenOptions::new(Arc::new(SqliteDialect)).native_module(
         "native_rows",
         VTabKind::TableValuedFunction,
         RowsModule {
@@ -281,8 +375,7 @@ fn virtual_table_filter_next_and_column_resume_without_skipping_rows() {
             events: Arc::new(Mutex::new(Vec::new())),
             writable: false,
         },
-    )
-    .unwrap();
+    ));
     let mut stmt = conn
         .prepare("SELECT rowid, value FROM native_rows(8)")
         .unwrap();
@@ -302,12 +395,90 @@ fn virtual_table_filter_next_and_column_resume_without_skipping_rows() {
 }
 
 #[test]
+fn native_table_functions_survive_mvcc_schema_refresh_and_other_connection_ddl() {
+    for mvcc in [false, true] {
+        let queue = Arc::new(Mutex::new(Vec::new()));
+        let conn = connection(OpenOptions::new(Arc::new(SqliteDialect)).native_module(
+            "native_rows",
+            VTabKind::TableValuedFunction,
+            RowsModule {
+                queue: queue.clone(),
+                rows: Arc::new(Mutex::new(vec![(1, 4), (2, 9), (3, 17)])),
+                events: Arc::new(Mutex::new(Vec::new())),
+                writable: false,
+            },
+        ));
+        if mvcc {
+            conn.execute("PRAGMA journal_mode = 'mvcc'").unwrap();
+        }
+        let mut stmt = conn.prepare("SELECT value FROM native_rows(8)").unwrap();
+        assert_eq!(
+            collect(&mut stmt, &queue),
+            vec![vec![Value::from_i64(9)], vec![Value::from_i64(17)]]
+        );
+        let other = conn.db.connect().unwrap();
+        other.execute("CREATE TABLE unrelated(value)").unwrap();
+        stmt.reset().unwrap();
+        assert_eq!(
+            collect(&mut stmt, &queue),
+            vec![vec![Value::from_i64(9)], vec![Value::from_i64(17)]]
+        );
+        let mut shared = other.prepare("SELECT value FROM native_rows(16)").unwrap();
+        assert_eq!(
+            collect(&mut shared, &queue),
+            vec![vec![Value::from_i64(17)]]
+        );
+    }
+}
+
+#[test]
+fn native_cursors_close_at_done_in_explicit_transactions_and_triggers() {
+    let queue = Arc::new(Mutex::new(Vec::new()));
+    let conn = connection(OpenOptions::new(Arc::new(SqliteDialect)).native_module(
+        "native_rows",
+        VTabKind::TableValuedFunction,
+        RowsModule {
+            queue: queue.clone(),
+            rows: Arc::new(Mutex::new(vec![(1, 4), (2, 9)])),
+            events: Arc::new(Mutex::new(Vec::new())),
+            writable: false,
+        },
+    ));
+    conn.execute("CREATE TABLE parent(id INTEGER PRIMARY KEY)")
+        .unwrap();
+    {
+        let mut schema = conn.schema.write();
+        let schema = crate::schema::Schema::try_make_mut(&mut schema).unwrap();
+        let table = schema.tables.get_mut("native_rows").unwrap();
+        let crate::schema::Table::Virtual(table) = Arc::make_mut(table) else {
+            unreachable!();
+        };
+        Arc::make_mut(table).innocuous = true;
+    }
+    conn.execute("CREATE TRIGGER parent_insert AFTER INSERT ON parent BEGIN SELECT value FROM native_rows(8) LIMIT 1; END").unwrap();
+    conn.execute("BEGIN").unwrap();
+    let references = Arc::strong_count(&queue);
+    let mut stmt = conn
+        .prepare("SELECT value FROM native_rows(8) LIMIT 1")
+        .unwrap();
+    assert_eq!(collect(&mut stmt, &queue), vec![vec![Value::from_i64(9)]]);
+    assert_eq!(Arc::strong_count(&queue), references);
+    stmt.reset().unwrap();
+    assert_eq!(collect(&mut stmt, &queue), vec![vec![Value::from_i64(9)]]);
+    assert_eq!(Arc::strong_count(&queue), references);
+    let mut insert = conn.prepare("INSERT INTO parent VALUES (7), (12)").unwrap();
+    assert!(collect(&mut insert, &queue).is_empty());
+    assert_eq!(Arc::strong_count(&queue), references);
+    conn.execute("COMMIT").unwrap();
+    assert_eq!(Arc::strong_count(&queue), references);
+}
+
+#[test]
 fn native_writes_yield_and_keep_existing_transaction_callbacks() {
-    let conn = connection();
     let queue = Arc::new(Mutex::new(Vec::new()));
     let rows = Arc::new(Mutex::new(Vec::new()));
     let events = Arc::new(Mutex::new(Vec::new()));
-    conn.register_native_module(
+    let conn = connection(OpenOptions::new(Arc::new(SqliteDialect)).native_module(
         "native_store",
         VTabKind::VirtualTable,
         RowsModule {
@@ -316,8 +487,7 @@ fn native_writes_yield_and_keep_existing_transaction_callbacks() {
             events: events.clone(),
             writable: true,
         },
-    )
-    .unwrap();
+    ));
     conn.execute("CREATE VIRTUAL TABLE store USING native_store")
         .unwrap();
     conn.execute("BEGIN").unwrap();
@@ -355,11 +525,10 @@ fn native_writes_yield_and_keep_existing_transaction_callbacks() {
 
 #[test]
 fn abandoned_native_write_does_not_apply_the_pending_update() {
-    let conn = connection();
     let queue = Arc::new(Mutex::new(Vec::new()));
     let rows = Arc::new(Mutex::new(Vec::new()));
     let events = Arc::new(Mutex::new(Vec::new()));
-    conn.register_native_module(
+    let conn = connection(OpenOptions::new(Arc::new(SqliteDialect)).native_module(
         "native_store",
         VTabKind::VirtualTable,
         RowsModule {
@@ -368,8 +537,7 @@ fn abandoned_native_write_does_not_apply_the_pending_update() {
             events: events.clone(),
             writable: true,
         },
-    )
-    .unwrap();
+    ));
     conn.execute("CREATE VIRTUAL TABLE store USING native_store")
         .unwrap();
     let mut stmt = conn
@@ -401,11 +569,10 @@ fn abandoned_native_write_does_not_apply_the_pending_update() {
 
 #[test]
 fn failed_native_write_rolls_back_earlier_rows() {
-    let conn = connection();
     let queue = Arc::new(Mutex::new(Vec::new()));
     let rows = Arc::new(Mutex::new(vec![(1, 13), (2, 27)]));
     let events = Arc::new(Mutex::new(Vec::new()));
-    conn.register_native_module(
+    let conn = connection(OpenOptions::new(Arc::new(SqliteDialect)).native_module(
         "native_store",
         VTabKind::VirtualTable,
         RowsModule {
@@ -414,8 +581,7 @@ fn failed_native_write_rolls_back_earlier_rows() {
             events: events.clone(),
             writable: true,
         },
-    )
-    .unwrap();
+    ));
     conn.execute("CREATE VIRTUAL TABLE store USING native_store")
         .unwrap();
     let mut stmt = conn
@@ -439,11 +605,10 @@ fn failed_native_write_rolls_back_earlier_rows() {
 
 #[test]
 fn pending_native_write_blocks_another_writer_and_commit() {
-    let conn = connection();
     let queue = Arc::new(Mutex::new(Vec::new()));
     let rows = Arc::new(Mutex::new(Vec::new()));
     let events = Arc::new(Mutex::new(Vec::new()));
-    conn.register_native_module(
+    let conn = connection(OpenOptions::new(Arc::new(SqliteDialect)).native_module(
         "native_store",
         VTabKind::VirtualTable,
         RowsModule {
@@ -452,8 +617,7 @@ fn pending_native_write_blocks_another_writer_and_commit() {
             events: events.clone(),
             writable: true,
         },
-    )
-    .unwrap();
+    ));
     conn.execute("CREATE VIRTUAL TABLE store USING native_store")
         .unwrap();
     conn.execute("BEGIN").unwrap();
@@ -484,24 +648,24 @@ fn pending_native_write_blocks_another_writer_and_commit() {
 
 #[test]
 fn scalar_calls_and_table_updates_share_one_statement_state() {
-    let conn = connection();
     let queue = Arc::new(Mutex::new(Vec::new()));
     let created = Arc::new(AtomicUsize::new(0));
     let dropped = Arc::new(AtomicUsize::new(0));
     let rows = Arc::new(Mutex::new(vec![(1, 4), (2, 9)]));
     let events = Arc::new(Mutex::new(Vec::new()));
-    conn.register_native_scalar(
-        "delayed",
-        2,
-        false,
-        DelayedScalar {
-            queue: queue.clone(),
-            created: created.clone(),
-            dropped: dropped.clone(),
-        },
-    )
-    .unwrap();
-    conn.register_native_module(
+    let options = OpenOptions::new(Arc::new(SqliteDialect))
+        .native_scalar(
+            "delayed",
+            2,
+            false,
+            DelayedScalar {
+                queue: queue.clone(),
+                created: created.clone(),
+                dropped: dropped.clone(),
+            },
+        )
+        .unwrap();
+    let conn = connection(options.native_module(
         "native_store",
         VTabKind::VirtualTable,
         RowsModule {
@@ -510,8 +674,7 @@ fn scalar_calls_and_table_updates_share_one_statement_state() {
             events: events.clone(),
             writable: true,
         },
-    )
-    .unwrap();
+    ));
     conn.execute("CREATE VIRTUAL TABLE store USING native_store")
         .unwrap();
     let mut stmt = conn
@@ -525,8 +688,84 @@ fn scalar_calls_and_table_updates_share_one_statement_state() {
 }
 
 #[test]
+fn c_table_inserts_with_native_arguments_block_other_writes_and_transaction_end() {
+    let queue = Arc::new(Mutex::new(Vec::new()));
+    let conn = connection(
+        OpenOptions::new(Arc::new(SqliteDialect))
+            .native_scalar(
+                "delayed",
+                2,
+                false,
+                DelayedScalar {
+                    queue: queue.clone(),
+                    created: Arc::new(AtomicUsize::new(0)),
+                    dropped: Arc::new(AtomicUsize::new(0)),
+                },
+            )
+            .unwrap(),
+    );
+    let api = unsafe { conn._build_turso_ext() };
+    let code = unsafe { CStoreModule::register_CStoreModule(&api) };
+    unsafe {
+        conn._free_extension_ctx(api);
+    }
+    assert_eq!(code, ResultCode::OK);
+    conn.execute("CREATE VIRTUAL TABLE c_store USING c_store_module")
+        .unwrap();
+    conn.execute("BEGIN").unwrap();
+    let mut first = conn
+        .prepare("INSERT INTO c_store VALUES(delayed(4, 3))")
+        .unwrap();
+    let mut second = conn.prepare("INSERT INTO c_store VALUES(92)").unwrap();
+    assert!(matches!(first.step().unwrap(), StepResult::IO));
+    for sql in ["COMMIT", "ROLLBACK"] {
+        assert!(matches!(
+            conn.execute(sql).unwrap_err(),
+            LimboError::StatementsInProgress(_)
+        ));
+    }
+    assert!(matches!(
+        second.step().unwrap_err(),
+        LimboError::StatementsInProgress(_)
+    ));
+    assert!(collect(&mut first, &queue).is_empty());
+    second.reset().unwrap();
+    assert!(collect(&mut second, &queue).is_empty());
+    conn.execute("COMMIT").unwrap();
+    assert_eq!(
+        conn.prepare("SELECT value FROM c_store")
+            .unwrap()
+            .run_collect_rows()
+            .unwrap(),
+        vec![vec![Value::from_i64(43)], vec![Value::from_i64(92)]]
+    );
+    conn.execute("BEGIN").unwrap();
+    first.reset().unwrap();
+    assert!(collect(&mut first, &queue).is_empty());
+    conn.execute("ROLLBACK").unwrap();
+    assert_eq!(
+        conn.prepare("SELECT value FROM c_store")
+            .unwrap()
+            .run_collect_rows()
+            .unwrap(),
+        vec![vec![Value::from_i64(43)], vec![Value::from_i64(92)]]
+    );
+}
+
+#[test]
 fn c_extensions_still_execute_with_native_registration() {
-    let conn = connection();
+    let conn = connection(
+        OpenOptions::new(Arc::new(SqliteDialect))
+            .native_aggregate(
+                "weighted",
+                2,
+                WeightedSum {
+                    queue: Arc::new(Mutex::new(Vec::new())),
+                    created: Arc::new(AtomicUsize::new(0)),
+                },
+            )
+            .unwrap(),
+    );
     let api = unsafe { conn._build_turso_ext() };
     let name = std::ffi::CString::new("c_double").unwrap();
     let code = unsafe {
@@ -536,15 +775,6 @@ fn c_extensions_still_execute_with_native_registration() {
         conn._free_extension_ctx(api);
     }
     assert_eq!(code, ResultCode::OK);
-    conn.register_native_aggregate(
-        "weighted",
-        2,
-        WeightedSum {
-            queue: Arc::new(Mutex::new(Vec::new())),
-            created: Arc::new(AtomicUsize::new(0)),
-        },
-    )
-    .unwrap();
     assert_eq!(
         conn.prepare("SELECT c_double(6)")
             .unwrap()
@@ -566,15 +796,11 @@ fn c_extensions_still_execute_with_native_registration() {
     );
 }
 
-fn connection() -> Arc<Connection> {
-    Database::open_file(
-        Arc::new(MemoryIO::new()),
-        ":memory:",
-        Arc::new(SqliteDialect),
-    )
-    .unwrap()
-    .connect()
-    .unwrap()
+fn connection(options: OpenOptions) -> Arc<Connection> {
+    Database::open(Arc::new(MemoryIO::new()), ":memory:", options)
+        .unwrap()
+        .connect()
+        .unwrap()
 }
 
 fn collect(stmt: &mut Statement, queue: &Arc<Mutex<Vec<Completion>>>) -> Vec<Vec<Value>> {
@@ -951,6 +1177,112 @@ fn integer(value: &Value) -> i64 {
         panic!("expected integer, got {value:?}");
     };
     *value
+}
+
+#[derive(turso_ext::VTabModuleDerive)]
+struct CStoreModule;
+
+impl VTabModule for CStoreModule {
+    type Table = CStoreTable;
+    const VTAB_KIND: VTabKind = VTabKind::VirtualTable;
+    const NAME: &'static str = "c_store_module";
+    const READONLY: bool = false;
+
+    fn create(
+        _args: &[turso_ext::Value],
+    ) -> std::result::Result<(String, Self::Table), ResultCode> {
+        Ok((
+            "CREATE TABLE x(value INTEGER)".into(),
+            CStoreTable {
+                rows: Vec::new(),
+                before: None,
+            },
+        ))
+    }
+}
+
+struct CStoreTable {
+    rows: Vec<i64>,
+    before: Option<Vec<i64>>,
+}
+
+impl VTable for CStoreTable {
+    type Cursor = CStoreCursor;
+    type Error = String;
+
+    fn open(
+        &self,
+        _conn: Option<std::sync::Arc<turso_ext::Connection>>,
+    ) -> std::result::Result<Self::Cursor, String> {
+        Ok(CStoreCursor {
+            rows: self.rows.clone(),
+            index: 0,
+        })
+    }
+
+    fn begin(&mut self) -> std::result::Result<(), String> {
+        assert!(self.before.is_none());
+        self.before = Some(self.rows.clone());
+        Ok(())
+    }
+
+    fn commit(&mut self) -> std::result::Result<(), String> {
+        assert!(self.before.take().is_some());
+        Ok(())
+    }
+
+    fn rollback(&mut self) -> std::result::Result<(), String> {
+        self.rows = self.before.take().unwrap();
+        Ok(())
+    }
+
+    fn insert(&mut self, args: &[turso_ext::Value]) -> std::result::Result<i64, String> {
+        if self.before.is_none() {
+            return Err("insert without an active transaction".into());
+        }
+        self.rows.push(args[0].to_integer().unwrap());
+        Ok(self.rows.len() as i64)
+    }
+}
+
+struct CStoreCursor {
+    rows: Vec<i64>,
+    index: usize,
+}
+
+impl VTabCursor for CStoreCursor {
+    type Error = String;
+
+    fn filter(&mut self, _args: &[turso_ext::Value], _idx: Option<(&str, i32)>) -> ResultCode {
+        self.index = 0;
+        if self.eof() {
+            ResultCode::EOF
+        } else {
+            ResultCode::OK
+        }
+    }
+
+    fn rowid(&self) -> i64 {
+        self.index as i64 + 1
+    }
+
+    fn column(&self, idx: u32) -> std::result::Result<turso_ext::Value, String> {
+        assert_eq!(idx, 0);
+        Ok(turso_ext::Value::from_integer(self.rows[self.index]))
+    }
+
+    fn eof(&self) -> bool {
+        self.index >= self.rows.len()
+    }
+
+    fn next(&mut self) -> ResultCode {
+        self.index += 1;
+        if self.eof() {
+            ResultCode::EOF
+        } else {
+            ResultCode::OK
+        }
+    }
 }
 
 unsafe extern "C" fn c_double(

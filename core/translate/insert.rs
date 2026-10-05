@@ -285,13 +285,8 @@ pub fn translate_insert(
 
     let fk_enabled = connection.foreign_keys_enabled();
     if let Some(virtual_table) = &table.virtual_table() {
-        if matches!(
-            &virtual_table.vtab_type,
-            crate::vtab::VirtualTableType::Native(_)
-        ) {
-            let schema_cookie = resolver.with_schema(database_id, |s| s.schema_version);
-            program.begin_write_on_database(database_id, schema_cookie)?;
-        }
+        let schema_cookie = resolver.with_schema(database_id, |s| s.schema_version);
+        program.begin_write_on_database(database_id, schema_cookie)?;
         translate_virtual_table_insert(
             program,
             virtual_table.clone(),
