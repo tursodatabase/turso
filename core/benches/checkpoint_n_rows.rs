@@ -1,10 +1,8 @@
 //! One `PRAGMA wal_checkpoint(PASSIVE)` after inserting N rows.
 //! Insert time is not measured. No helper racing writers.
 //!
-//! A second measurement opens a read snapshot, checkpoints N rows while the
-//! snapshot keeps their versions in the store, inserts DELTA more rows, and
-//! times the next checkpoint. That checkpoint only has DELTA rows to write,
-//! so its time shows how much the collect pass depends on N.
+//! `one_delta_checkpoint_ns` times a second checkpoint after N rows sit under
+//! a held snapshot and `delta` more rows commit.
 //!
 //! ```text
 //! cargo bench -p turso_core --bench checkpoint_n_rows --profile bench-profile
@@ -13,10 +11,10 @@
 //! ```
 
 #[cfg(not(feature = "codspeed"))]
-use criterion::{criterion_group, criterion_main, Criterion};
+use criterion::{Criterion, criterion_group, criterion_main};
 
 #[cfg(feature = "codspeed")]
-use codspeed_criterion_compat::{criterion_group, criterion_main, Criterion};
+use codspeed_criterion_compat::{Criterion, criterion_group, criterion_main};
 
 use std::hint::black_box;
 use std::io::Write;
@@ -190,8 +188,6 @@ fn one_checkpoint_ns(n: usize) -> u64 {
     black_box(ns)
 }
 
-/// Holds a read snapshot so the store keeps every version, checkpoints the N
-/// rows, inserts `delta` more rows, and times the checkpoint that writes them.
 fn one_delta_checkpoint_ns(n: usize, delta: usize) -> u64 {
     let loaded = load_n_rows(n);
     let reader = loaded.db.connect().unwrap();
@@ -244,7 +240,6 @@ fn load_n_rows(n: usize) -> Loaded {
     }
 }
 
-/// Inserts rows with ids in `from..to` in one transaction, 1000 rows per statement.
 fn insert_rows(conn: &Arc<Connection>, db: &Arc<Database>, from: usize, to: usize) {
     exec(conn, db, "BEGIN CONCURRENT");
     let batch: usize = 1000;
