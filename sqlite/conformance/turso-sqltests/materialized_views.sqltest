@@ -2538,3 +2538,54 @@ test matview-create-index-is-refused {
 expect error {
     views may not be indexed
 }
+
+test matview-aggregate-with-a-literal-over-an-empty-view {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, k TEXT);
+    CREATE MATERIALIZED VIEW v AS SELECT id, k FROM t;
+    SELECT 'c', count(*) FROM v;
+}
+expect {
+    c|0
+}
+
+test matview-left-join-on-rowid-reads-null-for-an-unmatched-key {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, k TEXT);
+    CREATE MATERIALIZED VIEW v AS SELECT id, k FROM t;
+    INSERT INTO t VALUES (1, 'a');
+    CREATE TABLE probe(id INTEGER PRIMARY KEY, vid);
+    INSERT INTO probe VALUES (1, 1), (2, NULL), (3, 'x');
+    SELECT p.id, v.rowid, v.k FROM probe p LEFT JOIN v ON v.rowid = p.vid ORDER BY p.id;
+}
+expect {
+    1|1|a
+    2||
+    3||
+}
+
+test matview-left-join-on-a-column-reads-null-for-an-unmatched-key {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, k TEXT);
+    CREATE MATERIALIZED VIEW v AS SELECT id, k FROM t;
+    INSERT INTO t VALUES (1, 'a');
+    CREATE TABLE probe(id INTEGER PRIMARY KEY, want TEXT);
+    INSERT INTO probe VALUES (1, 'a'), (2, 'missing');
+    SELECT p.id, v.k FROM probe p LEFT JOIN v ON v.k = p.want ORDER BY p.id;
+}
+expect {
+    1|a
+    2|
+}
+
+test matview-left-join-on-rowid-reads-a-match-after-an-unmatched-key {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, k TEXT);
+    CREATE MATERIALIZED VIEW v AS SELECT id, k FROM t;
+    INSERT INTO t VALUES (1, 'a'), (2, 'b');
+    CREATE TABLE probe(id INTEGER PRIMARY KEY, vid);
+    INSERT INTO probe VALUES (1, NULL), (2, 2), (3, 'x'), (4, 1);
+    SELECT p.id, v.rowid, v.k FROM probe p LEFT JOIN v ON v.rowid = p.vid ORDER BY p.id;
+}
+expect {
+    1||
+    2|2|b
+    3||
+    4|1|a
+}
