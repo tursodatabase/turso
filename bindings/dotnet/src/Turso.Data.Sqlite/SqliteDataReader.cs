@@ -31,6 +31,12 @@ public class SqliteDataReader : DbDataReader
     private int _managedResultIndex;
     private int _managedRowIndex = -1;
 
+    // Declared types and table schemas resolved for the current result set. The fallback
+    // heuristics run PRAGMA queries, so they are computed once per statement, not once per cell.
+    private TursoStatementHandle? _schemaCacheStatement;
+    private string?[] _declaredTypeNames = [];
+    private Dictionary<string, Dictionary<string, SchemaColumnInfo>>? _tableColumnsCache;
+
     internal SqliteDataReader(SqliteCommand command, TursoStatementHandle statement, string currentSql, List<string> remainingSql, int recordsAffected, CommandBehavior behavior, Action closeCallback)
     {
         _command = command;
@@ -1090,6 +1096,31 @@ public class SqliteDataReader : DbDataReader
             return CurrentManagedResult.Columns[ordinal].DataTypeName;
         }
 
+        EnsureSchemaCache();
+        if ((uint)ordinal >= (uint)_declaredTypeNames.Length)
+            return ResolveDeclaredTypeName(ordinal);
+
+        return _declaredTypeNames[ordinal] ??= ResolveDeclaredTypeName(ordinal);
+    }
+
+    private void EnsureSchemaCache()
+    {
+        if (_schemaCacheStatement is not null && ReferenceEquals(_schemaCacheStatement, _statement))
+            return;
+
+        _schemaCacheStatement = _statement;
+        _declaredTypeNames = _statement is null ? [] : new string?[TursoBindings.GetFieldCount(_statement)];
+        _tableColumnsCache = null;
+    }
+
+    private string ResolveDeclaredTypeName(int ordinal)
+    {
+        // The engine knows the declared type of direct column references; the SQL heuristics
+        // below only cover what it leaves unresolved.
+        var nativeDeclaredType = TursoBindings.GetDeclaredTypeName(GetStatement(), ordinal);
+        if (!string.IsNullOrEmpty(nativeDeclaredType))
+            return StripTypeLength(nativeDeclaredType);
+
         if (TryGetSelectSource(out var tableName, out var selections))
         {
             var tableColumns = GetTableColumns(tableName);
@@ -1201,6 +1232,19 @@ public class SqliteDataReader : DbDataReader
     }
 
     private Dictionary<string, SchemaColumnInfo> GetTableColumns(string tableName)
+    {
+        EnsureSchemaCache();
+        _tableColumnsCache ??= new Dictionary<string, Dictionary<string, SchemaColumnInfo>>(StringComparer.OrdinalIgnoreCase);
+        if (!_tableColumnsCache.TryGetValue(tableName, out var columns))
+        {
+            columns = QueryTableColumns(tableName);
+            _tableColumnsCache[tableName] = columns;
+        }
+
+        return columns;
+    }
+
+    private Dictionary<string, SchemaColumnInfo> QueryTableColumns(string tableName)
     {
         var columns = new Dictionary<string, SchemaColumnInfo>(StringComparer.OrdinalIgnoreCase);
         if (_command.Connection is null)

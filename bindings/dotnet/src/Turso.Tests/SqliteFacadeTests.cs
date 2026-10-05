@@ -1047,6 +1047,30 @@ public class SqliteFacadeTests
     }
 
     [Test]
+    public void GetValueResolvesDeclaredTypesForEachResultSet()
+    {
+        using var connection = new SqliteConnection("Data Source=:memory:");
+        connection.Open();
+        connection.ExecuteNonQuery(
+            """
+            CREATE TABLE GuidIds (Id GUID);
+            CREATE TABLE TextIds (Id TEXT);
+            INSERT INTO GuidIds VALUES ('dc0d7e0e-365d-4948-ab9b-8ca8056bf93a'), ('0e7e0ddc-5d36-4849-ab9b-8ca8056bf93a');
+            INSERT INTO TextIds VALUES ('dc0d7e0e-365d-4948-ab9b-8ca8056bf93a');
+            """);
+
+        using var reader = connection.ExecuteReader("SELECT Id FROM GuidIds; SELECT Id FROM TextIds;");
+        reader.Read().Should().BeTrue();
+        reader.GetValue(0).Should().BeOfType<Guid>();
+        reader.Read().Should().BeTrue();
+        reader.GetValue(0).Should().Be(new Guid("0e7e0ddc-5d36-4849-ab9b-8ca8056bf93a"));
+
+        reader.NextResult().Should().BeTrue();
+        reader.Read().Should().BeTrue();
+        reader.GetValue(0).Should().Be("dc0d7e0e-365d-4948-ab9b-8ca8056bf93a");
+    }
+
+    [Test]
     public void GetFieldValueThrowsForNullTypedValues()
     {
         using var connection = new SqliteConnection("Data Source=:memory:");
