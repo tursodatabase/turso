@@ -3769,14 +3769,15 @@ mod nonblocking {
 
     #[test]
     fn frontend_step_registers_the_completion_waker() {
-        use std::sync::atomic::AtomicUsize;
+        use std::sync::{Condvar, Mutex};
         use std::task::{Wake, Waker};
 
-        struct WakeCount(AtomicUsize);
+        struct WakeSignal(Mutex<bool>, Condvar);
 
-        impl Wake for WakeCount {
+        impl Wake for WakeSignal {
             fn wake(self: Arc<Self>) {
-                self.0.fetch_add(1, Ordering::SeqCst);
+                *self.0.lock().unwrap() = true;
+                self.1.notify_all();
             }
         }
 
@@ -3787,15 +3788,24 @@ mod nonblocking {
         let mut copy = conn
             .prepare(format!("COPY copied FROM '{}'", input.path().display()))
             .unwrap();
-        let wake_count = Arc::new(WakeCount(AtomicUsize::new(0)));
-        let waker = Waker::from(wake_count.clone());
+        let wake_signal = Arc::new(WakeSignal(Mutex::new(false), Condvar::new()));
+        let waker = Waker::from(wake_signal.clone());
         io.allow_step.store(false, Ordering::SeqCst);
         let result = copy.step_with_waker(&waker);
         io.allow_step.store(true, Ordering::SeqCst);
         assert!(matches!(result.unwrap(), StepResult::IO));
         let completion = copy.take_io_completions().unwrap();
         completion.wait(io.as_ref()).unwrap();
-        assert!(wake_count.0.load(Ordering::SeqCst) > 0);
+        let (woken, _) = wake_signal
+            .1
+            .wait_timeout_while(
+                wake_signal.0.lock().unwrap(),
+                std::time::Duration::from_secs(5),
+                |woken| !*woken,
+            )
+            .unwrap();
+        assert!(*woken, "completion must wake the caller");
+        drop(woken);
         drive(&io, &mut copy);
         assert_eq!(copy.n_change(), 2);
         let mut query = conn.prepare("SELECT id FROM copied ORDER BY id").unwrap();
