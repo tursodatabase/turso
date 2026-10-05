@@ -141,11 +141,16 @@ impl ExtFunc {
     }
 
     pub fn matches_arg_count(&self, arg_count: usize) -> bool {
+        let argc = self.arg_count();
+        argc < 0 || argc as usize == arg_count
+    }
+
+    pub fn arg_count(&self) -> i32 {
         match self {
             Self::Scalar { argc, .. }
             | Self::Aggregate { argc, .. }
             | Self::NativeScalar { argc, .. }
-            | Self::NativeAggregate { argc, .. } => *argc < 0 || *argc as usize == arg_count,
+            | Self::NativeAggregate { argc, .. } => *argc,
         }
     }
 

@@ -9,9 +9,9 @@ pub use function::AggregateState;
 pub(crate) use function::{
     finalize_aggregate, step_aggregate, step_scalar, AggregateFactory, ScalarFactory,
 };
-pub(crate) use vtab::{create_virtual_table, ModuleImplementation, NativeCursor, NativeTable};
+pub(crate) use vtab::{ModuleFactory, NativeCursor, NativeTable};
 
-use crate::function::{ExtFunc, ExternalFunc};
+use crate::function::ExternalFunc;
 use crate::sync::Arc;
 use crate::types::Cursor;
 use crate::{Database, LimboError, OpenOptions, Result};
@@ -34,14 +34,12 @@ impl OpenOptions {
         let name = crate::util::normalize_ident(name);
         self.native_extensions
             .functions
-            .push(Arc::new(ExternalFunc {
+            .push(Arc::new(ExternalFunc::new_native_scalar(
                 name,
-                func: ExtFunc::NativeScalar {
-                    argc,
-                    deterministic,
-                    function: Arc::new(function),
-                },
-            }));
+                argc,
+                deterministic,
+                function,
+            )));
         Ok(self)
     }
 
@@ -55,13 +53,9 @@ impl OpenOptions {
         let name = crate::util::normalize_ident(name);
         self.native_extensions
             .functions
-            .push(Arc::new(ExternalFunc {
-                name,
-                func: ExtFunc::NativeAggregate {
-                    argc,
-                    function: Arc::new(function),
-                },
-            }));
+            .push(Arc::new(ExternalFunc::new_native_aggregate(
+                name, argc, function,
+            )));
         Ok(self)
     }
 
@@ -74,7 +68,7 @@ impl OpenOptions {
         let name = crate::util::normalize_ident(name);
         let module = Arc::new(crate::ext::VTabImpl {
             module_kind: kind,
-            implementation: ModuleImplementation::Native(Arc::new(module)),
+            implementation: crate::ext::ModuleImplementation::Native(Arc::new(module)),
         });
         self.native_extensions.modules.push((name, module));
         self
@@ -95,17 +89,10 @@ impl NativeExtensions {
                 .insert(function.name.clone(), function.clone());
         }
         for (name, module) in &self.modules {
-            if module.module_kind == VTabKind::TableValuedFunction {
-                let (vtab_type, schema) = module.implementation.create(Vec::new())?;
-                db.register_virtual_table(Arc::new(
-                    crate::vtab::VirtualTable::new_native_function(
-                        name.clone(),
-                        schema,
-                        vtab_type,
-                    )?,
-                ))?;
-            }
             syms.vtab_modules.insert(name.clone(), module.clone());
+            if module.module_kind == VTabKind::TableValuedFunction {
+                db.register_virtual_table(crate::vtab::VirtualTable::function(name, &syms)?)?;
+            }
         }
         Ok(())
     }
@@ -122,7 +109,7 @@ fn validate_arg_count(argc: i32) -> Result<()> {
 
 pub(crate) fn close_cursors(cursors: &mut [Option<Cursor>]) {
     for cursor in cursors {
-        if matches!(cursor, Some(Cursor::Virtual(cursor)) if cursor.is_native()) {
+        if matches!(cursor, Some(Cursor::Virtual(cursor)) if cursor.needs_close_at_done()) {
             *cursor = None;
         }
     }

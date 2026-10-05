@@ -1,11 +1,10 @@
-use super::{ConstraintInfo, ExtensionState, IndexInfo, OrderByInfo, VTabKind};
+use super::{ConstraintInfo, ExtensionState, IndexInfo, OrderByInfo};
 use crate::alloc::TryClone;
 use crate::sync::{Arc, RwLock};
 use crate::types::IOResultOr;
-use crate::vtab::{ExtVirtualTable, VirtualTableType};
 use crate::{Connection, IOResult, LimboError, Result, Value};
 use std::fmt::Debug;
-use turso_ext::{ResultCode, VTabModuleImpl};
+use turso_ext::ResultCode;
 
 pub trait VirtualTableModule: Debug + Send + Sync {
     type Table: VirtualTable + 'static;
@@ -55,92 +54,6 @@ pub trait VirtualTableCursor: Send + Sync {
 
 pub trait TableUpdate: Send + Sync {
     fn step(&mut self) -> IOResultOr<Option<i64>>;
-}
-
-#[derive(Clone, Debug)]
-pub(crate) enum ModuleImplementation {
-    C(Arc<VTabModuleImpl>),
-    Native(Arc<dyn ModuleFactory>),
-}
-
-impl ModuleImplementation {
-    pub(crate) fn create_schema(&self, args: Vec<turso_ext::Value>) -> Result<String> {
-        match self {
-            Self::C(module) => Ok(module.create_schema(args)?),
-            Self::Native(module) => module.schema(&native_args(args)?),
-        }
-    }
-
-    pub(crate) fn create(&self, args: Vec<turso_ext::Value>) -> Result<(VirtualTableType, String)> {
-        match self {
-            Self::C(module) => {
-                let (table, schema) = ExtVirtualTable::create(module.clone(), args)?;
-                Ok((VirtualTableType::External(table), schema))
-            }
-            Self::Native(module) => {
-                let args = native_args(args)?;
-                let schema = module.schema(&args)?;
-                let table = module.create(&args)?;
-                Ok((VirtualTableType::Native(table), schema))
-            }
-        }
-    }
-}
-
-pub(crate) fn create_virtual_table(
-    module_name: &str,
-    module: Option<&Arc<crate::ext::VTabImpl>>,
-    args: Vec<turso_ext::Value>,
-    kind: VTabKind,
-) -> Result<(VirtualTableType, String)> {
-    let module = module.ok_or_else(|| {
-        LimboError::ExtensionError(format!("Virtual table module not found: {module_name}"))
-    })?;
-    if kind != module.module_kind {
-        let expected = match kind {
-            VTabKind::VirtualTable => "virtual table",
-            VTabKind::TableValuedFunction => "table-valued function",
-        };
-        return Err(LimboError::ExtensionError(format!(
-            "{module_name} is not a {expected} module"
-        )));
-    }
-    module.implementation.create(args)
-}
-
-impl crate::vtab::VirtualTable {
-    pub(crate) fn new_native_function(
-        name: String,
-        schema: String,
-        vtab_type: VirtualTableType,
-    ) -> Result<Self> {
-        Ok(Self {
-            name,
-            columns: Self::resolve_columns(schema)?,
-            kind: VTabKind::TableValuedFunction,
-            vtab_type,
-            vtab_id: 0,
-            is_droppable: false,
-            innocuous: false,
-        })
-    }
-}
-
-fn native_args(args: Vec<turso_ext::Value>) -> Result<Vec<Value>> {
-    let mut values = Vec::with_capacity(args.len());
-    let mut error = None;
-    for arg in args {
-        match Value::from_ffi(arg) {
-            Ok(value) => values.push(value),
-            Err(err) => {
-                error.get_or_insert(err);
-            }
-        }
-    }
-    match error {
-        Some(error) => Err(error),
-        None => Ok(values),
-    }
 }
 
 pub(crate) trait ModuleFactory: Debug + Send + Sync {

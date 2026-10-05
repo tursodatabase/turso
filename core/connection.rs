@@ -4595,16 +4595,10 @@ impl Connection {
             .values()
             .map(|f| {
                 let is_agg = f.func.is_aggregate();
-                let argc = match &f.func {
-                    function::ExtFunc::Aggregate { argc, .. }
-                    | function::ExtFunc::Scalar { argc, .. }
-                    | function::ExtFunc::NativeAggregate { argc, .. }
-                    | function::ExtFunc::NativeScalar { argc, .. } => *argc,
-                };
                 (
                     f.name.clone(),
                     is_agg,
-                    argc,
+                    f.func.arg_count(),
                     function::Deterministic::is_deterministic(f.as_ref()),
                 )
             })

@@ -1,5 +1,7 @@
 #[cfg(feature = "fs")]
 mod dynamic;
+mod function;
+mod vtab;
 mod vtab_xconnect;
 use crate::index_method::backing_btree::BackingBtreeIndexMethod;
 #[cfg(all(feature = "fts", not(target_family = "wasm")))]
@@ -15,6 +17,9 @@ use crate::sync::Mutex;
 use crate::UringIO;
 #[cfg(all(target_os = "windows", feature = "experimental_win_iocp", not(miri)))]
 use crate::WindowsIOCP;
+pub(crate) use vtab::{
+    create_virtual_table, ExtensionCursor, ExtensionTable, ModuleImplementation,
+};
 
 use crate::{function::ExternalFunc, Connection, Database};
 use crate::{vtab::VirtualTable, SymbolTable};
@@ -64,7 +69,7 @@ pub(crate) unsafe extern "C" fn register_vtab_module(
     let module = Arc::new(module);
     let vmodule = VTabImpl {
         module_kind: kind,
-        implementation: crate::native_ext::ModuleImplementation::C(module),
+        implementation: ModuleImplementation::C(module),
     };
 
     unsafe {
@@ -94,7 +99,7 @@ pub(crate) unsafe extern "C" fn register_vtab_module(
 #[derive(Clone)]
 pub struct VTabImpl {
     pub module_kind: VTabKind,
-    pub(crate) implementation: crate::native_ext::ModuleImplementation,
+    pub(crate) implementation: ModuleImplementation,
 }
 
 pub(crate) unsafe fn register_scalar_function(

@@ -754,13 +754,14 @@ fn c_table_inserts_with_native_arguments_block_other_writes_and_transaction_end(
 
 #[test]
 fn c_extensions_still_execute_with_native_registration() {
+    let queue = Arc::new(Mutex::new(Vec::new()));
     let conn = connection(
         OpenOptions::new(Arc::new(SqliteDialect))
             .native_aggregate(
                 "weighted",
                 2,
                 WeightedSum {
-                    queue: Arc::new(Mutex::new(Vec::new())),
+                    queue: queue.clone(),
                     created: Arc::new(AtomicUsize::new(0)),
                 },
             )
@@ -782,6 +783,24 @@ fn c_extensions_still_execute_with_native_registration() {
             .unwrap(),
         vec![vec![Value::from_i64(12)]]
     );
+    let mut mixed = conn
+        .prepare(
+            "SELECT c_double(weighted(value, 3)), weighted(value, 5), \
+             c_double(weighted(value, 1) FILTER (WHERE 0)) \
+             FROM (SELECT 4 AS value UNION ALL SELECT 9)",
+        )
+        .unwrap();
+    assert_eq!(
+        collect(&mut mixed, &queue),
+        vec![vec![
+            Value::from_i64(78),
+            Value::from_i64(65),
+            Value::from_i64(-198),
+        ]]
+    );
+    let functions = conn.get_syms_functions();
+    assert!(functions.contains(&("c_double".into(), false, 1, true)));
+    assert!(functions.contains(&("weighted".into(), true, 2, false)));
     #[cfg(feature = "series")]
     assert_eq!(
         conn.prepare("SELECT value FROM generate_series(2, 8, 3)")
@@ -792,6 +811,59 @@ fn c_extensions_still_execute_with_native_registration() {
             vec![Value::from_i64(2)],
             vec![Value::from_i64(5)],
             vec![Value::from_i64(8)]
+        ]
+    );
+}
+
+#[test]
+fn c_and_native_tables_share_cursor_dispatch() {
+    let queue = Arc::new(Mutex::new(Vec::new()));
+    let conn = connection(OpenOptions::new(Arc::new(SqliteDialect)).native_module(
+        "native_rows",
+        VTabKind::TableValuedFunction,
+        RowsModule {
+            queue: queue.clone(),
+            rows: Arc::new(Mutex::new(vec![(1, 4), (2, 9), (3, 17)])),
+            events: Arc::new(Mutex::new(Vec::new())),
+            writable: false,
+        },
+    ));
+    let api = unsafe { conn._build_turso_ext() };
+    let code = unsafe { CStoreModule::register_CStoreModule(&api) };
+    unsafe { conn._free_extension_ctx(api) };
+    assert_eq!(code, ResultCode::OK);
+    conn.execute("CREATE VIRTUAL TABLE c_store USING c_store_module")
+        .unwrap();
+    conn.execute("INSERT INTO c_store VALUES (4)").unwrap();
+    conn.execute("INSERT INTO c_store VALUES (17)").unwrap();
+    let mut stmt = conn
+        .prepare(
+            "SELECT c.rowid, c.value, n.rowid, n.value \
+             FROM c_store c JOIN native_rows(8) n ON c.value = n.value \
+             ORDER BY c.rowid",
+        )
+        .unwrap();
+    assert_eq!(
+        collect(&mut stmt, &queue),
+        vec![vec![
+            Value::from_i64(2),
+            Value::from_i64(17),
+            Value::from_i64(3),
+            Value::from_i64(17),
+        ]]
+    );
+    let mut outer = conn
+        .prepare(
+            "SELECT c.rowid, c.value, n.value \
+             FROM c_store c LEFT JOIN native_rows(8) n ON c.value = n.value \
+             ORDER BY c.rowid",
+        )
+        .unwrap();
+    assert_eq!(
+        collect(&mut outer, &queue),
+        vec![
+            vec![Value::from_i64(1), Value::from_i64(4), Value::Null],
+            vec![Value::from_i64(2), Value::from_i64(17), Value::from_i64(17),],
         ]
     );
 }
