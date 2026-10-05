@@ -43,6 +43,7 @@ Welcome to Turso database manual!
   - [Encryption](#encryption)
   - [Vector search](#vector-search)
   - [Full-Text Search](#full-text-search-experimental)
+    - [Where FTS is available](#where-fts-is-available)
   - [CDC](#cdc-early-preview)
   - [Index Method](#index-method-experimental)
   - [Page Codecs](#page-codecs-experimental)
@@ -879,6 +880,38 @@ LIMIT 5;
 Turso provides full-text search (FTS) capabilities powered by the [Tantivy](https://github.com/quickwit-oss/tantivy) search engine library. FTS enables efficient text search with relevance ranking, boolean queries, phrase matching, and more.
 
 > **Note:** Full-text search is an experimental feature and requires the `fts` feature to be enabled at compile time.
+
+### Where FTS is available
+
+FTS is gated two ways at once, and both have to pass:
+
+* the `fts` cargo feature must be enabled. It is **not** part of `turso_core`'s default
+  feature set.
+* the build target must not be WebAssembly. The index method is compiled out of
+  `wasm32` targets, so no cargo flag can turn it on there.
+
+That makes the availability picture concrete:
+
+| Build | FTS |
+| --- | --- |
+| `tursodb` CLI | Yes - the CLI enables `fts` by default |
+| Native Rust crate built from source | Yes - add `--features fts` |
+| `@tursodatabase/database` (npm, native addon) | No - built without `fts` |
+| `@tursodatabase/database-wasm` (npm, WASM) | No - not supported on `wasm32` at all |
+
+If you are using one of the npm packages and need FTS today, build `tursodb` or a native
+Rust binary from source with `--features fts`.
+
+When the feature is missing, `CREATE INDEX ... USING fts` does not fail at index-creation
+time; you get an error from the module lookup:
+
+```console
+Parse error: unknown module name: 'fts'
+```
+
+Because the WASM build is excluded rather than feature-gated, that error is also what a
+`wasm32` build reports if you compile the feature in yourself - it is not a signal that the
+feature flag was mis-set.
 
 ### Creating an FTS Index
 
