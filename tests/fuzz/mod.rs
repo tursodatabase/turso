@@ -13,6 +13,7 @@ pub mod raise;
 pub mod reindex;
 pub mod rowid_alias;
 pub mod savepoint;
+pub mod sqlite_file_format;
 pub mod subjournal;
 pub mod subquery;
 pub mod temp_tables;
