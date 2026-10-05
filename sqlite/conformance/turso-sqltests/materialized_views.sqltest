@@ -2529,3 +2529,12 @@ test matview-reserved-prefix-sqlite {
 expect error {
     object name reserved for internal use: sqlite_matview
 }
+
+test matview-create-index-is-refused {
+    CREATE TABLE t(id TEXT PRIMARY KEY, st TEXT);
+    CREATE MATERIALIZED VIEW v AS SELECT id, st FROM t;
+    CREATE INDEX idx_v_st ON v(st);
+}
+expect error {
+    views may not be indexed
+}
