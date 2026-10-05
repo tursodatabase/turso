@@ -3,8 +3,21 @@ use crate::function::{ExtFunc, ExternalFunc};
 use crate::native_ext::{AggregateFunction, ExtensionState, ScalarFunction};
 use crate::sync::Arc;
 use crate::types::{AggContext, ExternalAggState, IOResultOr};
-use crate::{IOResult, Register, Result, Value};
+use crate::{IOResult, LimboError, OpenOptions, Register, Result, Value};
 use turso_ext::ValueDestructor;
+
+impl OpenOptions {
+    pub fn extension_function(mut self, mut function: ExternalFunc) -> Result<Self> {
+        if function.func.arg_count() < -1 {
+            return Err(LimboError::InvalidArgument(
+                "function argument count must be at least -1".into(),
+            ));
+        }
+        function.name = crate::util::normalize_ident(&function.name);
+        self.native_extensions.functions.push(Arc::new(function));
+        Ok(self)
+    }
+}
 
 impl ExternalFunc {
     pub fn new_native_scalar<F: ScalarFunction + 'static>(

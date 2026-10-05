@@ -14,7 +14,7 @@ pub(crate) use vtab::{ModuleFactory, NativeCursor, NativeTable};
 use crate::function::ExternalFunc;
 use crate::sync::Arc;
 use crate::types::Cursor;
-use crate::{Database, LimboError, OpenOptions, Result};
+use crate::{Database, OpenOptions, Result};
 
 pub(crate) enum ExtensionState {
     None,
@@ -23,42 +23,6 @@ pub(crate) enum ExtensionState {
 }
 
 impl OpenOptions {
-    pub fn native_scalar<F: ScalarFunction + 'static>(
-        mut self,
-        name: &str,
-        argc: i32,
-        deterministic: bool,
-        function: F,
-    ) -> Result<Self> {
-        validate_arg_count(argc)?;
-        let name = crate::util::normalize_ident(name);
-        self.native_extensions
-            .functions
-            .push(Arc::new(ExternalFunc::new_native_scalar(
-                name,
-                argc,
-                deterministic,
-                function,
-            )));
-        Ok(self)
-    }
-
-    pub fn native_aggregate<F: AggregateFunction + 'static>(
-        mut self,
-        name: &str,
-        argc: i32,
-        function: F,
-    ) -> Result<Self> {
-        validate_arg_count(argc)?;
-        let name = crate::util::normalize_ident(name);
-        self.native_extensions
-            .functions
-            .push(Arc::new(ExternalFunc::new_native_aggregate(
-                name, argc, function,
-            )));
-        Ok(self)
-    }
-
     pub fn native_module<M: VirtualTableModule + 'static>(
         mut self,
         name: &str,
@@ -77,7 +41,7 @@ impl OpenOptions {
 
 #[derive(Clone, Default)]
 pub(crate) struct NativeExtensions {
-    functions: Vec<Arc<ExternalFunc>>,
+    pub(crate) functions: Vec<Arc<ExternalFunc>>,
     modules: Vec<(String, Arc<crate::ext::VTabImpl>)>,
 }
 
@@ -96,15 +60,6 @@ impl NativeExtensions {
         }
         Ok(())
     }
-}
-
-fn validate_arg_count(argc: i32) -> Result<()> {
-    if argc < -1 {
-        return Err(LimboError::InvalidArgument(
-            "function argument count must be at least -1".into(),
-        ));
-    }
-    Ok(())
 }
 
 pub(crate) fn close_cursors(cursors: &mut [Option<Cursor>]) {
