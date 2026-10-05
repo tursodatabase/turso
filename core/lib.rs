@@ -88,9 +88,9 @@ mod uuid;
 mod vdbe;
 mod vtab;
 
-pub use function::Func;
 #[cfg(any(feature = "fuzz", feature = "bench"))]
 pub use function::MathFunc;
+pub use function::{Func, FunctionArity, FunctionListEntry, ScalarFunction, ScalarFunctionState};
 /// The printf engine backing the SQL printf()/format() functions, also used
 /// by the C API's sqlite3_mprintf/sqlite3_snprintf so both share one
 /// formatting implementation.

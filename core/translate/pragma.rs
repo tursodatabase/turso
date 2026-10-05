@@ -1008,7 +1008,16 @@ fn query_pragma(
             }
 
             // External (extension) functions
-            for (name, is_agg, argc, deterministic) in connection.get_syms_functions() {
+            let dialect_functions = connection
+                .dialect()
+                .function_list()
+                .into_iter()
+                .map(|entry| (entry.name, false, entry.narg, entry.deterministic));
+            for (name, is_agg, argc, deterministic) in connection
+                .get_syms_functions()
+                .into_iter()
+                .chain(dialect_functions)
+            {
                 let func_type = if is_agg { "a" } else { "s" };
                 let mut flags = 0;
                 if deterministic {

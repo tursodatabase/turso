@@ -1,10 +1,11 @@
 use crate::sync::Arc;
+use std::any::Any;
 use std::fmt;
 use std::fmt::{Debug, Display};
 use strum::IntoEnumIterator;
 use turso_ext::{
-    ContextDestructor, FinalizeFunction, InitAggFunction, ScalarFunction, StepFunction,
-    ValueDestructor,
+    ContextDestructor, FinalizeFunction, InitAggFunction, ScalarFunction as ExtScalarFunction,
+    StepFunction, ValueDestructor,
 };
 
 use crate::LimboError;
@@ -80,7 +81,7 @@ pub enum ExtFunc {
         context: usize,
         argc: i32,
         deterministic: bool,
-        callback: ScalarFunction,
+        callback: ExtScalarFunction,
         context_destructor: Option<ContextDestructor>,
         value_destructor: Option<ValueDestructor>,
         context_owner: Arc<ExternalContext>,
@@ -174,7 +175,7 @@ impl ExternalFunc {
         argc: i32,
         deterministic: bool,
         context: usize,
-        callback: ScalarFunction,
+        callback: ExtScalarFunction,
         context_destructor: Option<ContextDestructor>,
         value_destructor: Option<ValueDestructor>,
     ) -> Self {
@@ -1529,10 +1530,7 @@ pub enum Func {
     Json(JsonFunc),
     AlterTable(AlterTableFunc),
     External(Arc<ExternalFunc>),
-    /// Scalar function provided by the database's schema dialect (e.g. a
-    /// PostgreSQL catalog function). Resolved and executed through
-    /// [`crate::dialect::Dialect`]; the engine only carries the name.
-    Dialect(String),
+    Dialect(Arc<dyn ScalarFunction>),
 }
 
 impl Display for Func {
@@ -1549,7 +1547,7 @@ impl Display for Func {
             Self::Json(json_func) => write!(f, "{json_func}"),
             Self::External(generic_func) => write!(f, "{generic_func}"),
             Self::AlterTable(alter_func) => write!(f, "{alter_func}"),
-            Self::Dialect(name) => write!(f, "{name}"),
+            Self::Dialect(function) => write!(f, "{}", function.name()),
         }
     }
 }
@@ -1574,10 +1572,7 @@ impl Deterministic for Func {
             Self::Json(json_func) => json_func.is_deterministic(),
             Self::External(external_func) => external_func.is_deterministic(),
             Self::AlterTable(_) => true,
-            // Dialect scalars are catalog readers (stable within a
-            // statement); a dialect that adds a nondeterministic function
-            // should register it as an extension function instead.
-            Self::Dialect(_) => true,
+            Self::Dialect(function) => function.is_deterministic(),
         }
     }
 }
@@ -1620,6 +1615,7 @@ impl Func {
     pub fn can_mask_nulls(&self) -> bool {
         match self {
             Self::Scalar(scalar_func) => scalar_func.can_mask_nulls(),
+            Self::Dialect(_) => true,
             _ => false,
         }
     }
@@ -1739,4 +1735,77 @@ pub struct FunctionListEntry {
     pub func_type: &'static str, // "s" = scalar, "a" = aggregate, "w" = window
     pub narg: i32,               // -1 = variable
     pub deterministic: bool,
+}
+
+pub trait ScalarFunction: Debug + Send + Sync {
+    fn name(&self) -> &str;
+
+    fn arity(&self) -> FunctionArity;
+
+    fn is_deterministic(&self) -> bool {
+        false
+    }
+
+    fn call(
+        &self,
+        conn: &Arc<crate::Connection>,
+        args: &[crate::Value],
+        state: &mut ScalarFunctionState,
+    ) -> crate::types::IOResultOr<crate::Value>;
+
+    fn function_list(&self) -> Vec<FunctionListEntry> {
+        let arity = self.arity();
+        let counts: &[usize] = match &arity {
+            FunctionArity::Exact(count) => std::slice::from_ref(count),
+            FunctionArity::OneOf(counts) => counts,
+            FunctionArity::Variadic => {
+                return vec![FunctionListEntry {
+                    name: self.name().to_string(),
+                    func_type: "s",
+                    narg: -1,
+                    deterministic: self.is_deterministic(),
+                }];
+            }
+        };
+        counts
+            .iter()
+            .map(|&count| FunctionListEntry {
+                name: self.name().to_string(),
+                func_type: "s",
+                narg: i32::try_from(count).expect("function argument count exceeds i32"),
+                deterministic: self.is_deterministic(),
+            })
+            .collect()
+    }
+}
+
+#[derive(Default)]
+pub struct ScalarFunctionState {
+    state: Option<Box<dyn Any + Send + Sync>>,
+}
+
+impl ScalarFunctionState {
+    pub fn get_or_init<T: Default + Send + Sync + 'static>(&mut self) -> &mut T {
+        self.state
+            .get_or_insert_with(|| Box::new(T::default()))
+            .downcast_mut::<T>()
+            .expect("scalar function state type changed during execution")
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub enum FunctionArity {
+    Exact(usize),
+    OneOf(&'static [usize]),
+    Variadic,
+}
+
+impl FunctionArity {
+    pub fn accepts(&self, count: usize) -> bool {
+        match self {
+            Self::Exact(expected) => count == *expected,
+            Self::OneOf(counts) => counts.contains(&count),
+            Self::Variadic => true,
+        }
+    }
 }

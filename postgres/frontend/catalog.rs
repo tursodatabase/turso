@@ -145,14 +145,14 @@ impl Dialect for PostgresDialect {
     }
 
     fn resolve_function(&self, name: &str, arg_count: usize) -> Result<Option<Func>> {
-        if crate::functions::resolve_scalar(name, arg_count) {
-            return Ok(Some(Func::Dialect(name.to_string())));
+        if let Some(function) = crate::functions::resolve_scalar(name, arg_count) {
+            return Ok(Some(Func::Dialect(function)));
         }
         turso_core::dialect::sqlite::resolve_builtin_function(name, arg_count)
     }
 
-    fn exec_scalar_function(&self, conn: &Connection, name: &str, args: &[Value]) -> Result<Value> {
-        crate::functions::exec_scalar(conn, name, args)
+    fn function_list(&self) -> Vec<turso_core::FunctionListEntry> {
+        crate::functions::function_list()
     }
 
     fn requires_custom_types(&self) -> bool {
@@ -1066,7 +1066,10 @@ impl PgProcCursor {
         let mut oid = 1i64;
 
         // Built-in functions from the same registry as PRAGMA function_list
-        for entry in Func::builtin_function_list() {
+        for entry in Func::builtin_function_list()
+            .into_iter()
+            .chain(self.conn.dialect().function_list())
+        {
             let prokind = match entry.func_type {
                 "a" => "a", // aggregate
                 "w" => "w", // window

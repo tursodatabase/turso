@@ -11548,17 +11548,29 @@ pub fn op_function(
                 ),
             },
         },
-        crate::function::Func::Dialect(name) => {
-            let args: Vec<Value> = state.registers[*start_reg..*start_reg + arg_count]
-                .iter()
-                .map(|r| r.get_value().clone())
-                .collect();
-            let result = program.connection.dialect().exec_scalar_function(
+        crate::function::Func::Dialect(function) => {
+            if state.active_op_state.is_idle() {
+                let args = state.registers[*start_reg..*start_reg + arg_count]
+                    .iter()
+                    .map(|r| r.get_value().clone())
+                    .collect();
+                *state.active_op_state.function() = OpFunctionState {
+                    args,
+                    context: crate::ScalarFunctionState::default(),
+                };
+            }
+            let function_state = state.active_op_state.function();
+            match function.call(
                 &program.connection,
-                name,
-                &args,
-            )?;
-            state.registers[*dest].set_value(result);
+                &function_state.args,
+                &mut function_state.context,
+            )? {
+                IOResult::IO(io) => return Ok(state.suspend_on_io(io)),
+                IOResult::Done(result) => {
+                    state.active_op_state.clear();
+                    state.registers[*dest].set_value(result);
+                }
+            }
         }
         crate::function::Func::AlterTable(alter_func) => {
             let r#type = &state.registers[*start_reg].get_value().clone();
@@ -12246,6 +12258,12 @@ pub fn op_function(
     }
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
+}
+
+#[derive(Default)]
+pub(crate) struct OpFunctionState {
+    args: Vec<Value>,
+    context: crate::ScalarFunctionState,
 }
 
 pub(crate) type OpAttachState = crate::connection::AttachDatabaseState;
