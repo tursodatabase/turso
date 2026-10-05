@@ -656,7 +656,7 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> MvccLazyCursor<Clock
     }
 
     fn btree_may_hold(&mut self, rowid: i64) -> Result<bool> {
-        if self.rowid_allocator().btree_last_rules_out(rowid) {
+        if self.rowid_allocator().rowid_ceiling_rules_out(rowid) {
             return Ok(false);
         }
         self.query_btree_version_is_valid(&RowKey::Int(rowid))
