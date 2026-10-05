@@ -1,12 +1,12 @@
 use crate::alloc::{
-    ALLOC_ERR_MSG, ConcurrentAllocator, TryReserveError, TursoAllocator, TursoIteratorExt,
-    TursoVecExt, Vec,
+    ConcurrentAllocator, TryReserveError, TursoAllocator, TursoIteratorExt, TursoVecExt, Vec,
+    ALLOC_ERR_MSG,
 };
 use crate::mvcc::clock::LogicalClock;
 use crate::mvcc::database::{
-    DeleteRowStateMachine, MVCC_META_KEY_PERSISTENT_TX_TS_MAX, MVCC_META_TABLE_NAME, MVTableId,
-    MvStore, Row, RowID, RowKey, RowVersion, SQLITE_SCHEMA_MVCC_TABLE_ID, SortableIndexKey,
-    TxTimestampOrID, WalPos, WriteRowStateMachine,
+    DeleteRowStateMachine, MVTableId, MvStore, Row, RowID, RowKey, RowVersion, SortableIndexKey,
+    TxTimestampOrID, WalPos, WriteRowStateMachine, MVCC_META_KEY_PERSISTENT_TX_TS_MAX,
+    MVCC_META_TABLE_NAME, SQLITE_SCHEMA_MVCC_TABLE_ID,
 };
 use crate::mvcc::database::{IndexRowsEntry, RowVersions};
 #[cfg(any(test, injected_yields))]
@@ -21,16 +21,16 @@ use crate::storage::btree::{BTreeCursor, CursorTrait};
 use crate::storage::pager::CreateBTreeFlags;
 use crate::storage::sqlite3_ondisk::DatabaseHeader;
 use crate::storage::wal::{CheckpointMode, TursoRwLock, WalAutoActions};
+use crate::sync::atomic::Ordering;
 use crate::sync::Arc;
 use crate::sync::RwLock;
-use crate::sync::atomic::Ordering;
 use crate::types::IOResultOr;
 use crate::types::{IOCompletions, IOResult, ImmutableRecord, ImmutableRecordRef};
+use crate::{turso_assert, turso_assert_eq};
 use crate::{
     CheckpointResult, Completion, Connection, Database, IOExt, LimboError, Numeric, Pager, Result,
     SyncMode, TransactionState, Value, ValueRef,
 };
-use crate::{turso_assert, turso_assert_eq};
 use crossbeam_epoch as epoch;
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 use std::num::NonZeroU64;
@@ -2152,10 +2152,9 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
             )
         })?;
         self.mvstore.global_header.write().replace(header);
-        crate::without_allocation_faults!(
-            self.publish_checkpointed_schema_roots()
-                .expect(crate::alloc::ALLOC_ERR_MSG)
-        );
+        crate::without_allocation_faults!(self
+            .publish_checkpointed_schema_roots()
+            .expect(crate::alloc::ALLOC_ERR_MSG));
         Ok(())
     }
 
@@ -3800,8 +3799,8 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> StateTransition
 mod tests {
     use super::*;
     use crate::alloc::vec;
-    use crate::mvcc::database::SortableIndexKey;
     use crate::mvcc::database::tests::MvccTestDbNoConn;
+    use crate::mvcc::database::SortableIndexKey;
     use crate::translate::collate::CollationSeq;
     use crate::types::{IndexInfo, KeyInfo};
     use turso_parser::ast::SortOrder;
@@ -4061,8 +4060,8 @@ mod tests {
         }
     }
 
-    fn checkpoint_for_collect_tests()
-    -> CheckpointStateMachine<crate::mvcc::clock::MvccClock, crate::alloc::DynAllocator> {
+    fn checkpoint_for_collect_tests(
+    ) -> CheckpointStateMachine<crate::mvcc::clock::MvccClock, crate::alloc::DynAllocator> {
         let db = MvccTestDbNoConn::new();
         let conn = db.connect();
         let mvstore = db.get_mvcc_store();
