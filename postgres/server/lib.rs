@@ -1132,6 +1132,15 @@ mod session_tests {
     }
 
     #[test]
+    fn test_drop_schema_cascade_of_empty_schema() {
+        let server = RunningServer::start();
+        let mut client = server.client();
+        query(&mut client, "CREATE SCHEMA s");
+        query(&mut client, "DROP SCHEMA s CASCADE");
+        query(&mut client, "CREATE SCHEMA s");
+    }
+
+    #[test]
     fn test_access_control_statements_complete_as_commands() {
         let server = RunningServer::start();
         let mut client = server.client();

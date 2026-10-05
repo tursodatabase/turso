@@ -667,7 +667,7 @@ fn list_user_tables(conn: &Arc<Connection>, schema_name: Option<&str>) -> Result
         Some(name) => format!("SELECT name FROM \"{name}\".sqlite_schema WHERE {filter}"),
         None => format!("SELECT name FROM sqlite_schema WHERE {filter}"),
     };
-    let mut stmt = conn.prepare_internal(&sql)?;
+    let mut stmt = conn.prepare_sqlite(&sql)?;
     let rows = stmt.run_collect_rows()?;
     Ok(rows
         .into_iter()
