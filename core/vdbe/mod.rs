@@ -878,6 +878,7 @@ pub struct ProgramState {
     /// the progress handler's interval each time the check runs.
     check_interval: u64,
     pub io_completions: Option<IOCompletions>,
+    pub(crate) extension_state: crate::native_ext::ExtensionState,
     pub pc: InsnReference,
     pub(crate) cursors: Vec<Option<Cursor>>,
     /// Immutable execution/storage context captured when each index-method
@@ -1049,6 +1050,7 @@ impl ProgramState {
             check_countdown: 1,
             check_interval: MAX_CHECK_INTERVAL,
             io_completions: None,
+            extension_state: crate::native_ext::ExtensionState::None,
             pc: 0,
             cursors,
             index_method_contexts: vec![None; max_cursors],
@@ -1161,6 +1163,7 @@ impl ProgramState {
 
     pub fn reset(&mut self, max_registers: Option<usize>, max_cursors: Option<usize>) {
         self.io_completions = None;
+        self.extension_state = crate::native_ext::ExtensionState::None;
         self.pc = 0;
 
         if let Some(max_cursors) = max_cursors {
@@ -3270,6 +3273,8 @@ impl Program {
         }
 
         let mut abort_error: Option<LimboError> = None;
+        state.extension_state = crate::native_ext::ExtensionState::None;
+        crate::native_ext::abort_aggregates(&mut state.registers);
         state.explicit_checkpoint_guard = None;
         // PRAGMA journal_mode owns its MVCC checkpoint in active_op_state rather
         // than commit_state. Clean it before transaction abort logic inspects
@@ -3637,6 +3642,18 @@ impl Program {
                         }
                     }
                 },
+            }
+            if (must_rollback_tx_if_needed || inside_explicit_transaction)
+                && !keeps_prior_changes
+                && self.connection.get_auto_commit()
+            {
+                if let Err(err) = execute::vtab_rollback_all(&self.connection) {
+                    capture_abort_error(
+                        &mut abort_error,
+                        err,
+                        "Failed to rollback virtual tables during abort",
+                    );
+                }
             }
         }
         if state.uses_subjournal {

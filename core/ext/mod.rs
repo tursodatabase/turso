@@ -64,7 +64,7 @@ pub(crate) unsafe extern "C" fn register_vtab_module(
     let module = Arc::new(module);
     let vmodule = VTabImpl {
         module_kind: kind,
-        implementation: module,
+        implementation: crate::native_ext::ModuleImplementation::C(module),
     };
 
     unsafe {
@@ -94,7 +94,7 @@ pub(crate) unsafe extern "C" fn register_vtab_module(
 #[derive(Clone)]
 pub struct VTabImpl {
     pub module_kind: VTabKind,
-    pub implementation: Arc<VTabModuleImpl>,
+    pub(crate) implementation: crate::native_ext::ModuleImplementation,
 }
 
 pub(crate) unsafe fn register_scalar_function(

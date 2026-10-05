@@ -1062,6 +1062,7 @@ pub enum AggContext {
     Builtin(Vec<Value>),
     /// External (extension) aggregates need FFI state that can't be serialized.
     External(ExternalAggState),
+    Native(crate::native_ext::AggregateState),
 }
 
 impl TryClone for AggContext {
@@ -1082,7 +1083,7 @@ impl TryClone for AggContext {
                 }
                 Ok(Self::Builtin(values))
             }
-            Self::External(_) => Ok(self.clone()),
+            Self::External(_) | Self::Native(_) => Ok(self.clone()),
         }
     }
 }
@@ -1111,7 +1112,9 @@ impl AggContext {
     pub fn payload_mut(&mut self) -> &mut [Value] {
         match self {
             Self::Builtin(payload) => payload,
-            Self::External(_) => panic!("payload_mut() called on External aggregate"),
+            Self::External(_) | Self::Native(_) => {
+                panic!("payload_mut() called on extension aggregate")
+            }
         }
     }
 
@@ -1120,7 +1123,9 @@ impl AggContext {
     pub fn payload_vec_mut(&mut self) -> &mut Vec<Value> {
         match self {
             Self::Builtin(payload) => payload,
-            Self::External(_) => panic!("payload_vec_mut() called on External aggregate"),
+            Self::External(_) | Self::Native(_) => {
+                panic!("payload_vec_mut() called on extension aggregate")
+            }
         }
     }
 
@@ -1128,7 +1133,9 @@ impl AggContext {
     pub fn payload(&self) -> &[Value] {
         match self {
             Self::Builtin(payload) => payload,
-            Self::External(_) => panic!("payload() called on External aggregate"),
+            Self::External(_) | Self::Native(_) => {
+                panic!("payload() called on extension aggregate")
+            }
         }
     }
 }

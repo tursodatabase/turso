@@ -2,8 +2,9 @@ use crate::pragma::{PragmaVirtualTable, PragmaVirtualTableCursor};
 use crate::schema::Column;
 use crate::sync::atomic::{AtomicPtr, AtomicU64, Ordering};
 use crate::sync::{Arc, RwLock, Weak};
+use crate::types::IOResultOr;
 use crate::util::columns_from_create_table_body;
-use crate::{Connection, LimboError, SymbolTable, Value};
+use crate::{Connection, IOResult, LimboError, SymbolTable, Value};
 use std::ffi::c_void;
 use std::ptr::NonNull;
 use turso_ext::{ConstraintInfo, IndexInfo, OrderByInfo, ResultCode, VTabKind, VTabModuleImpl};
@@ -14,6 +15,7 @@ pub(crate) enum VirtualTableType {
     Pragma(PragmaVirtualTable),
     External(ExtVirtualTable),
     Internal(Arc<RwLock<dyn InternalVirtualTable>>),
+    Native(crate::native_ext::NativeTable),
 }
 
 #[derive(Clone, Debug)]
@@ -40,6 +42,7 @@ impl VirtualTable {
             VirtualTableType::Pragma(_) => true,
             VirtualTableType::External(table) => table.readonly(),
             VirtualTableType::Internal(_) => true,
+            VirtualTableType::Native(table) => table.readonly(),
         }
     }
 
@@ -87,8 +90,12 @@ impl VirtualTable {
     pub(crate) fn function(name: &str, syms: &SymbolTable) -> crate::Result<Arc<VirtualTable>> {
         let module = syms.vtab_modules.get(name);
         let (vtab_type, schema) = if module.is_some() {
-            ExtVirtualTable::create(name, module, Vec::new(), VTabKind::TableValuedFunction)
-                .map(|(vtab, columns)| (VirtualTableType::External(vtab), columns))?
+            crate::native_ext::create_virtual_table(
+                name,
+                module,
+                Vec::new(),
+                VTabKind::TableValuedFunction,
+            )?
         } else {
             return Err(LimboError::ParseError(format!(
                 "No such table-valued function: {name}"
@@ -114,13 +121,17 @@ impl VirtualTable {
         syms: &SymbolTable,
     ) -> crate::Result<Arc<VirtualTable>> {
         let module = syms.vtab_modules.get(module_name);
-        let (table, schema) =
-            ExtVirtualTable::create(module_name, module, args, VTabKind::VirtualTable)?;
+        let (vtab_type, schema) = crate::native_ext::create_virtual_table(
+            module_name,
+            module,
+            args,
+            VTabKind::VirtualTable,
+        )?;
         let vtab = VirtualTable {
             name: tbl_name.unwrap_or(module_name).to_owned(),
             columns: Self::resolve_columns(schema)?,
             kind: VTabKind::VirtualTable,
-            vtab_type: VirtualTableType::External(table),
+            vtab_type,
             vtab_id: VTAB_ID_COUNTER.fetch_add(1, Ordering::Acquire),
             is_droppable: true,
             innocuous: false,
@@ -156,14 +167,25 @@ impl VirtualTable {
             VirtualTableType::Internal(table) => {
                 Ok(VirtualTableCursor::new_internal(table.read().open(conn)?))
             }
+            VirtualTableType::Native(table) => Ok(VirtualTableCursor {
+                inner: VirtualTableCursorInner::Native(table.open(conn, self.vtab_id)?),
+                null_flag: false,
+            }),
         }
     }
 
-    pub(crate) fn update(&self, args: &[Value]) -> crate::Result<Option<i64>> {
+    pub(crate) fn update(
+        &self,
+        args: &[Value],
+        state: &mut crate::native_ext::ExtensionState,
+    ) -> IOResultOr<Option<i64>> {
         match &self.vtab_type {
-            VirtualTableType::Pragma(_) => Err(LimboError::ReadOnly),
-            VirtualTableType::External(table) => table.update(args),
-            VirtualTableType::Internal(_) => Err(LimboError::ReadOnly),
+            VirtualTableType::Pragma(_) => Err(LimboError::ReadOnly.into()),
+            VirtualTableType::External(table) => {
+                table.update(args).map(IOResult::Done).map_err(Into::into)
+            }
+            VirtualTableType::Internal(_) => Err(LimboError::ReadOnly.into()),
+            VirtualTableType::Native(table) => table.update(state, args),
         }
     }
 
@@ -172,6 +194,7 @@ impl VirtualTable {
             VirtualTableType::Pragma(_) => Ok(()),
             VirtualTableType::External(table) => table.destroy(),
             VirtualTableType::Internal(_) => Ok(()),
+            VirtualTableType::Native(table) => table.destroy(),
         }
     }
 
@@ -184,6 +207,7 @@ impl VirtualTable {
             VirtualTableType::Pragma(table) => table.best_index(constraints),
             VirtualTableType::External(table) => table.best_index(constraints, order_by),
             VirtualTableType::Internal(table) => table.read().best_index(constraints, order_by),
+            VirtualTableType::Native(table) => table.best_index(constraints, order_by),
         }
     }
 
@@ -196,6 +220,7 @@ impl VirtualTable {
             VirtualTableType::Internal(_) => Err(LimboError::ExtensionError(
                 "Internal virtual tables currently do not support transactions".to_string(),
             )),
+            VirtualTableType::Native(table) => table.begin(),
         }
     }
 
@@ -208,6 +233,7 @@ impl VirtualTable {
             VirtualTableType::Internal(_) => Err(LimboError::ExtensionError(
                 "Internal virtual tables currently do not support transactions".to_string(),
             )),
+            VirtualTableType::Native(table) => table.commit(),
         }
     }
 
@@ -220,6 +246,7 @@ impl VirtualTable {
             VirtualTableType::Internal(_) => Err(LimboError::ExtensionError(
                 "Internal virtual tables currently do not support transactions".to_string(),
             )),
+            VirtualTableType::Native(table) => table.rollback(),
         }
     }
 
@@ -232,6 +259,7 @@ impl VirtualTable {
             VirtualTableType::Internal(_) => Err(LimboError::ExtensionError(
                 "Internal virtual tables currently do not support renaming".to_string(),
             )),
+            VirtualTableType::Native(table) => table.rename(new_name),
         }
     }
 }
@@ -240,6 +268,7 @@ enum VirtualTableCursorInner {
     Pragma(Box<PragmaVirtualTableCursor>),
     External(ExtVirtualTableCursor),
     Internal(Arc<RwLock<dyn InternalVirtualTableCursor>>),
+    Native(crate::native_ext::NativeCursor),
 }
 
 pub struct VirtualTableCursor {
@@ -275,13 +304,15 @@ impl VirtualTableCursor {
         self.null_flag = flag;
     }
 
-    pub(crate) fn next(&mut self) -> crate::Result<bool> {
+    pub(crate) fn next(&mut self) -> IOResultOr<bool> {
         self.null_flag = false;
-        match &mut self.inner {
+        let result = match &mut self.inner {
             VirtualTableCursorInner::Pragma(cursor) => cursor.next(),
             VirtualTableCursorInner::External(cursor) => cursor.next(),
             VirtualTableCursorInner::Internal(cursor) => cursor.write().next(),
-        }
+            VirtualTableCursorInner::Native(cursor) => return cursor.cursor.next(),
+        };
+        result.map(IOResult::Done).map_err(Into::into)
     }
 
     pub(crate) fn rowid(&self) -> i64 {
@@ -289,18 +320,21 @@ impl VirtualTableCursor {
             VirtualTableCursorInner::Pragma(cursor) => cursor.rowid(),
             VirtualTableCursorInner::External(cursor) => cursor.rowid(),
             VirtualTableCursorInner::Internal(cursor) => cursor.read().rowid(),
+            VirtualTableCursorInner::Native(cursor) => cursor.cursor.rowid(),
         }
     }
 
-    pub(crate) fn column(&self, column: usize) -> crate::Result<Value> {
+    pub(crate) fn column(&mut self, column: usize) -> IOResultOr<Value> {
         if self.null_flag {
-            return Ok(Value::Null);
+            return Ok(IOResult::Done(Value::Null));
         }
-        match &self.inner {
+        let result = match &mut self.inner {
             VirtualTableCursorInner::Pragma(cursor) => cursor.column(column),
             VirtualTableCursorInner::External(cursor) => cursor.column(column),
             VirtualTableCursorInner::Internal(cursor) => cursor.read().column(column),
-        }
+            VirtualTableCursorInner::Native(cursor) => return cursor.cursor.column(column),
+        };
+        result.map(IOResult::Done).map_err(Into::into)
     }
 
     pub(crate) fn filter(
@@ -309,9 +343,9 @@ impl VirtualTableCursor {
         idx_str: Option<String>,
         arg_count: usize,
         args: crate::alloc::Vec<Value>,
-    ) -> crate::Result<bool> {
+    ) -> IOResultOr<bool> {
         self.null_flag = false;
-        match &mut self.inner {
+        let result = match &mut self.inner {
             VirtualTableCursorInner::Pragma(cursor) => cursor.filter(args),
             VirtualTableCursorInner::External(cursor) => {
                 cursor.filter(idx_num, idx_str, arg_count, args)
@@ -319,7 +353,11 @@ impl VirtualTableCursor {
             VirtualTableCursorInner::Internal(cursor) => {
                 cursor.write().filter(&args, idx_str, idx_num)
             }
-        }
+            VirtualTableCursorInner::Native(cursor) => {
+                return cursor.cursor.filter(&args, idx_str.as_deref(), idx_num);
+            }
+        };
+        result.map(IOResult::Done).map_err(Into::into)
     }
 
     pub(crate) fn vtab_id(&self) -> Option<u64> {
@@ -327,6 +365,7 @@ impl VirtualTableCursor {
             VirtualTableCursorInner::Pragma(_) => None,
             VirtualTableCursorInner::External(cursor) => cursor.vtab_id.into(),
             VirtualTableCursorInner::Internal(_) => None,
+            VirtualTableCursorInner::Native(cursor) => Some(cursor.vtab_id),
         }
     }
 }
@@ -367,27 +406,13 @@ impl ExtVirtualTable {
     }
 
     /// takes ownership of the provided Args
-    fn create(
-        module_name: &str,
-        module: Option<&Arc<crate::ext::VTabImpl>>,
+    pub(crate) fn create(
+        implementation: Arc<VTabModuleImpl>,
         args: Vec<turso_ext::Value>,
-        kind: VTabKind,
     ) -> crate::Result<(Self, String)> {
-        let module = module.ok_or_else(|| {
-            LimboError::ExtensionError(format!("Virtual table module not found: {module_name}"))
-        })?;
-        if kind != module.module_kind {
-            let expected = match kind {
-                VTabKind::VirtualTable => "virtual table",
-                VTabKind::TableValuedFunction => "table-valued function",
-            };
-            return Err(LimboError::ExtensionError(format!(
-                "{module_name} is not a {expected} module"
-            )));
-        }
-        let (schema, table_ptr) = module.implementation.create(args)?;
+        let (schema, table_ptr) = implementation.create(args)?;
         let vtab = ExtVirtualTable {
-            implementation: module.implementation.clone(),
+            implementation,
             table_ptr: AtomicPtr::new(table_ptr as *mut c_void),
         };
         Ok((vtab, schema))

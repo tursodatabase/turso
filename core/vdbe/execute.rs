@@ -1611,7 +1611,10 @@ pub fn op_vfilter(
         } else {
             None
         };
-        cursor.filter(*idx_num as i32, idx_str, *arg_count, args)?
+        return_if_io!(
+            state,
+            cursor.filter(*idx_num as i32, idx_str, *arg_count, args)
+        )
     };
     // Increment filter_operations metric for virtual table filter
     state.metrics.filter_operations = state.metrics.filter_operations.wrapping_add(1);
@@ -1642,7 +1645,7 @@ pub fn op_vcolumn(
     let value = {
         let cursor = state.get_cursor(*cursor_id);
         let cursor = cursor.as_virtual_mut();
-        cursor.column(*column)?
+        return_if_io!(state, cursor.column(*column))
     };
     state.registers[*dest].set_value(value);
     state.pc += 1;
@@ -1713,16 +1716,19 @@ pub fn op_vupdate(
         #[cfg(feature = "cli_only")]
         {
             crate::dbpage::update_dbpage(pager, &argv)
+                .map(IOResult::Done)
+                .map_err(Box::new)
         }
         #[cfg(not(feature = "cli_only"))]
         {
             unreachable!("sqlite_dbpage writes require cli_only feature");
         }
     } else {
-        virtual_table.update(&argv)
+        virtual_table.update(&argv, &mut state.extension_state)
     };
     match result {
-        Ok(Some(new_rowid)) => {
+        Ok(IOResult::IO(io)) => return Ok(state.suspend_on_io(io)),
+        Ok(IOResult::Done(Some(new_rowid))) => {
             state.record_rows_written(1);
             if *conflict_action == 5 {
                 // ResolveType::Replace
@@ -1730,7 +1736,7 @@ pub fn op_vupdate(
             }
             state.pc += 1;
         }
-        Ok(None) => {
+        Ok(IOResult::Done(None)) => {
             // no-op or successful update without rowid return
             state.record_rows_written(1);
             state.pc += 1;
@@ -1762,7 +1768,7 @@ pub fn op_vnext(
     let has_more = {
         let cursor = state.get_cursor(*cursor_id);
         let cursor = cursor.as_virtual_mut();
-        cursor.next()?
+        return_if_io!(state, cursor.next())
     };
     if has_more {
         // Increment metrics for row read from virtual table (including materialized views)
@@ -4236,7 +4242,7 @@ fn has_index_method_work(state: &ProgramState) -> bool {
 }
 
 /// Rollback all virtual tables that are part of the current transaction.
-fn vtab_rollback_all(conn: &Connection) -> crate::Result<()> {
+pub(crate) fn vtab_rollback_all(conn: &Connection) -> crate::Result<()> {
     let mut set = conn.vtab_txn_states.write();
     if set.is_empty() {
         return Ok(());
@@ -5331,6 +5337,7 @@ pub fn op_auto_commit(
                 }
                 conn.rollback_attached_wal_txns();
                 conn.rollback_temp_schema();
+                vtab_rollback_all(&conn)?;
                 conn.index_methods_on_transaction_rolled_back();
                 conn.set_tx_state(TransactionState::None);
                 conn.auto_commit.store(true, Ordering::SeqCst);
@@ -5344,6 +5351,7 @@ pub fn op_auto_commit(
                     // persist a partial statement, so COMMIT rolls back the
                     // whole transaction and reports the abandoned write.
                     conn.rollback_manual_txn_cleanup(pager, true);
+                    vtab_rollback_all(&conn)?;
                     return Err(LimboError::TxError(
                         "cannot commit - an unfinished write statement was abandoned".to_string(),
                     )
@@ -5351,6 +5359,7 @@ pub fn op_auto_commit(
                 }
                 // Pre-check deferred FKs; leave tx open and do NOT clear violations
                 check_deferred_fk_on_commit(&conn)?;
+                vtab_commit_all(&conn)?;
                 conn.auto_commit.store(true, Ordering::SeqCst);
                 state.auto_txn_cleanup = TxnCleanup::RollbackTxn;
             }
@@ -9057,6 +9066,25 @@ fn op_agg_step_slow(program: &Program, state: &mut ProgramState, data: &AggStepD
     }
     let func = func.expect_agg();
 
+    if let AggFunc::External(ext_func) = func {
+        if let ExtFunc::NativeAggregate { argc, function } = ext_func.as_ref() {
+            let args = state.registers[*col..*col + (*argc).max(0) as usize]
+                .iter()
+                .map(|arg| arg.get_value().try_clone())
+                .collect::<Result<Vec<_>, _>>()?;
+            return_if_io!(
+                state,
+                crate::native_ext::step_aggregate(
+                    &mut state.registers[*acc_reg],
+                    function.as_ref(),
+                    &args,
+                )
+            );
+            state.pc += 1;
+            return Ok(InsnFunctionStepResult::Step);
+        }
+    }
+
     // Initialize aggregate state if not already done
     if let Register::Value(Value::Null) = state.registers[*acc_reg] {
         // Fast path for the first row of a COUNT group
@@ -9261,6 +9289,21 @@ pub fn op_agg_final(
     }
     let func = func.expect_agg();
 
+    if let AggFunc::External(ext_func) = func {
+        if let ExtFunc::NativeAggregate { function, .. } = ext_func.as_ref() {
+            let value = return_if_io!(
+                state,
+                crate::native_ext::finalize_aggregate(
+                    &mut state.registers[acc_reg],
+                    function.as_ref(),
+                )
+            );
+            state.registers[dest_reg].set_value(value);
+            state.pc += 1;
+            return Ok(InsnFunctionStepResult::Step);
+        }
+    }
+
     if let Register::Aggregate(AggContext::External(_)) = &state.registers[acc_reg] {
         let Register::Aggregate(agg) =
             std::mem::replace(&mut state.registers[acc_reg], Register::Value(Value::Null))
@@ -9276,7 +9319,7 @@ pub fn op_agg_final(
     match &state.registers[acc_reg] {
         Register::Aggregate(agg) => {
             let value = match agg {
-                AggContext::External(_) => {
+                AggContext::External(_) | AggContext::Native(_) => {
                     unreachable!("external aggregates are finalized above")
                 }
                 AggContext::Builtin(payload) => match func {
@@ -11457,6 +11500,17 @@ pub fn op_function(
             }
         }
         crate::function::Func::External(f) => match f.func {
+            ExtFunc::NativeScalar { ref function, .. } => {
+                let value = return_if_io!(
+                    state,
+                    crate::native_ext::step_scalar(
+                        &mut state.extension_state,
+                        function.as_ref(),
+                        &state.registers[*start_reg..*start_reg + arg_count],
+                    )
+                );
+                state.registers[*dest].set_value(value);
+            }
             ExtFunc::Scalar {
                 context,
                 callback,
