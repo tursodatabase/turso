@@ -36,7 +36,8 @@ use turso_core::SqliteDialect;
 /// `Arc<Connection>` held inside `Program`, breaking the reference chain that
 /// would otherwise keep the `turso_core::Database` alive in the
 /// `DATABASE_MANAGER` registry.
-type StatementHandle = Arc<RefCell<Option<turso_core::Statement>>>;
+type StatementCell = RefCell<Option<Box<turso_core::Statement>>>;
+type StatementHandle = Arc<StatementCell>;
 
 /// Step result constants
 const STEP_ROW: u32 = 1;
@@ -71,7 +72,7 @@ pub struct DatabaseInner {
     /// statement id. `close()` upgrades each live handle and sets it to `None`, which
     /// finalizes the statement and releases its `Arc<Connection>`. A `Statement`
     /// removes its own entry when dropped, so the map only holds live statements.
-    stmts: Mutex<HashMap<u64, Weak<RefCell<Option<turso_core::Statement>>>>>,
+    stmts: Mutex<HashMap<u64, Weak<StatementCell>>>,
     next_stmt_id: AtomicU64,
 }
 
@@ -508,7 +509,7 @@ impl Database {
             .map(|i| std::ffi::CString::new(stmt.get_column_name(i).to_string()).unwrap())
             .collect();
         #[allow(clippy::arc_with_non_send_sync)]
-        let stmt: StatementHandle = Arc::new(RefCell::new(Some(stmt)));
+        let stmt: StatementHandle = Arc::new(RefCell::new(Some(Box::new(stmt))));
         let id = inner.next_stmt_id.fetch_add(1, Ordering::Relaxed);
         inner
             .stmts
@@ -686,7 +687,7 @@ impl BatchExecutor {
                     #[allow(clippy::arc_with_non_send_sync)]
                     Ok(Some((stmt, offset))) => {
                         self.position += offset;
-                        let stmt: StatementHandle = Arc::new(RefCell::new(Some(stmt)));
+                        let stmt: StatementHandle = Arc::new(RefCell::new(Some(Box::new(stmt))));
                         stmt.borrow_mut()
                             .as_mut()
                             .unwrap()

@@ -16,6 +16,8 @@ const MAX_JS_HEAP_GROWTH_BYTES = 1024 * 1024;
 const MAX_GC_ROUNDS = 100;
 const ITERATIONS_BETWEEN_GC = 25;
 const UNREACHABLE_URL = 'http://127.0.0.1:1';
+const CLOSED_STATEMENTS = 2000;
+const MAX_BYTES_PER_CLOSED_STATEMENT = 1024;
 
 setFlagsFromString('--expose-gc');
 const gc: () => void = runInNewContext('gc');
@@ -89,6 +91,19 @@ test.skipIf(!leakCheckEnabled)('local statements on a synced database do not lea
         assert.deepStrictEqual(await select.get(1), { len: 1024 });
         await db.checkpoint();
     });
+    await db.close();
+})
+
+test.skipIf(!leakCheckEnabled)('closing a statement frees its memory without waiting for GC', async () => {
+    const db = await connect({ path: ':memory:' });
+    const before = nativeAllocatedBytes()!;
+    for (let i = 0; i < CLOSED_STATEMENTS; i++) {
+        const stmt = await db.prepare("SELECT 1");
+        stmt.close();
+    }
+    const bytesPerStatement = (nativeAllocatedBytes()! - before) / CLOSED_STATEMENTS;
+    console.info(`memory kept per closed statement before GC: ${bytesPerStatement} bytes`);
+    expect(bytesPerStatement, 'closed statements kept their memory until GC').toBeLessThan(MAX_BYTES_PER_CLOSED_STATEMENT);
     await db.close();
 })
 
