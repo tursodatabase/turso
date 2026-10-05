@@ -1978,6 +1978,7 @@ impl Connection {
     pub fn set_check_constraints_ignored(&self, ignore: bool) {
         self.check_constraints_pragma
             .store(ignore, Ordering::Release);
+        self.bump_prepare_context_generation();
     }
 
     pub fn check_constraints_ignored(&self) -> bool {
@@ -5755,6 +5756,23 @@ mod tests {
             err.contains("no such table"),
             "expected no such table after temp reset, got: {err}"
         );
+    }
+
+    #[test]
+    fn test_prepared_insert_checks_constraints_after_ignore_check_constraints_off() {
+        let temp_dir = TempDir::new().unwrap();
+        let db_path = temp_dir.path().join("main.db");
+        let conn = open_connection(&db_path);
+
+        conn.execute("CREATE TABLE t1(a CHECK (a > 0))").unwrap();
+        conn.execute("PRAGMA ignore_check_constraints = ON")
+            .unwrap();
+        let mut stmt = conn.prepare("INSERT INTO t1 VALUES (-1)").unwrap();
+        conn.execute("PRAGMA ignore_check_constraints = OFF")
+            .unwrap();
+
+        let err = stmt.run_ignore_rows().unwrap_err().to_string();
+        assert!(err.contains("CHECK constraint failed"), "got: {err}");
     }
 
     #[test]
