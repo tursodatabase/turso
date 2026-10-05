@@ -478,7 +478,6 @@ struct ColumnPair {
 }
 
 /// Where the aggregate result is stored after a rewrite.
-#[expect(clippy::large_enum_variant)]
 enum AggregateRewrite {
     /// The result is a column in a grouped table. Another reference to the same
     /// subquery can read that column instead of building another grouped table.

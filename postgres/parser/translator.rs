@@ -3123,7 +3123,7 @@ impl PostgreSQLTranslator {
 
         // Translate OVER clause (window function)
         let over_clause = if let Some(ref window_def) = func_call.over {
-            Some(self.translate_window_def(window_def)?)
+            Some(Box::new(self.translate_window_def(window_def)?))
         } else {
             None
         };
@@ -3499,7 +3499,7 @@ impl PostgreSQLTranslator {
                 ));
             }
         };
-        let select = self.translate_select(select_stmt)?;
+        let select = Box::new(self.translate_select(select_stmt)?);
 
         match sub_link.sub_link_type() {
             SubLinkType::ExistsSublink => Ok(ast::Expr::Exists(select)),
@@ -7166,7 +7166,7 @@ mod tests {
                 if let ast::ResultColumn::Expr(expr, _) = &columns[0] {
                     if let ast::Expr::FunctionCall { filter_over, .. } = &**expr {
                         assert!(
-                            matches!(&filter_over.over_clause, Some(ast::Over::Name(n)) if n.as_str() == "w"),
+                            matches!(filter_over.over_clause.as_deref(), Some(ast::Over::Name(n)) if n.as_str() == "w"),
                             "Expected Over::Name(\"w\"), got: {:?}",
                             filter_over.over_clause
                         );
@@ -7270,7 +7270,7 @@ mod tests {
         let ast::Expr::FunctionCall { filter_over, .. } = expr.as_ref() else {
             panic!("expected function call expression, got {expr:?}");
         };
-        let Some(ast::Over::Window(window)) = &filter_over.over_clause else {
+        let Some(ast::Over::Window(window)) = filter_over.over_clause.as_deref() else {
             panic!(
                 "expected inline OVER window, got {:?}",
                 filter_over.over_clause

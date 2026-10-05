@@ -423,6 +423,11 @@ pub enum FieldAccessResolution {
 }
 
 // https://sqlite.org/syntax/expr.html
+//
+// Large and rare parts, such as subqueries and window definitions, are boxed.
+// Every expression is as large as its largest variant, and the functions that
+// parse, clone, drop, and translate expressions recurse once per level of
+// nesting, holding expressions in their stack frames.
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum Expr {
@@ -463,7 +468,7 @@ pub enum Expr {
     /// schema-name.table-name.column-name
     DoublyQualified(Name, Name, Name),
     /// `EXISTS` subquery
-    Exists(Select),
+    Exists(Box<Select>),
     /// Struct/union field access (produced by translator, not parser directly)
     FieldAccess {
         /// base expression (e.g., column reference)
@@ -531,7 +536,7 @@ pub enum Expr {
         /// `NOT`
         not: bool,
         /// subquery
-        rhs: Select,
+        rhs: Box<Select>,
     },
     /// `IN` table name / function
     InTable {
@@ -540,7 +545,7 @@ pub enum Expr {
         /// `NOT`
         not: bool,
         /// table name
-        rhs: QualifiedName,
+        rhs: Box<QualifiedName>,
         /// table function arguments
         args: Vec<Box<Expr>>,
     },
@@ -572,7 +577,7 @@ pub enum Expr {
     /// `RAISE` function call
     Raise(ResolveType, Option<Box<Expr>>),
     /// Subquery expression
-    Subquery(Select),
+    Subquery(Box<Select>),
     /// Unary expression
     Unary(UnaryOperator, Box<Expr>),
     /// Parameters
@@ -731,7 +736,7 @@ impl Expr {
         Expr::InSelect {
             lhs: Box::new(lhs),
             not,
-            rhs: select,
+            rhs: Box::new(select),
         }
     }
 
@@ -2233,8 +2238,9 @@ pub enum UpsertDo {
 pub struct FunctionTail {
     /// `FILTER` clause
     pub filter_clause: Option<Box<Expr>>,
-    /// `OVER` clause
-    pub over_clause: Option<Over>,
+    /// `OVER` clause. Boxed because it is large and rare: stored inline, it
+    /// would make every [Expr] as large as a window definition.
+    pub over_clause: Option<Box<Over>>,
 }
 
 /// Function call `OVER` clause

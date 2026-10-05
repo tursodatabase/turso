@@ -172,10 +172,10 @@ fn is_bare_subquery(e: &Expr) -> bool {
 }
 
 /// Unwrap a bare subquery previously confirmed by [`is_bare_subquery`].
-fn into_bare_subquery(e: Box<Expr>) -> Select {
-    match *e {
+fn into_bare_subquery(e: Expr) -> Box<Select> {
+    match e {
         Expr::Subquery(select) => select,
-        Expr::Parenthesized(mut inner) => into_bare_subquery(inner.pop().expect("single element")),
+        Expr::Parenthesized(mut inner) => into_bare_subquery(*inner.pop().expect("single element")),
         _ => unreachable!("into_bare_subquery called on a non-subquery expression"),
     }
 }
@@ -1652,7 +1652,7 @@ impl<'a> Parser<'a> {
         self.last_expr_height = max_h;
         Ok(FunctionTail {
             filter_clause,
-            over_clause,
+            over_clause: over_clause.map(Box::new),
         })
     }
 
@@ -1824,7 +1824,7 @@ impl<'a> Parser<'a> {
         eat_expect!(self, TK_RP);
         // Subquery is compiled separately: a leaf for height.
         self.last_expr_height = 1;
-        Ok(Box::new(Expr::Subquery(select)))
+        Ok(Box::new(Expr::Subquery(Box::new(select))))
     }
 
     #[inline(never)]
@@ -1850,7 +1850,7 @@ impl<'a> Parser<'a> {
         eat_expect!(self, TK_RP);
         // Subquery is compiled separately: a leaf for height.
         self.last_expr_height = 1;
-        Ok(Box::new(Expr::Exists(select)))
+        Ok(Box::new(Expr::Exists(Box::new(select))))
     }
 
     #[inline(never)]
@@ -2374,7 +2374,7 @@ impl<'a> Parser<'a> {
                             Box::new(Expr::InSelect {
                                 lhs,
                                 not,
-                                rhs: select,
+                                rhs: Box::new(select),
                             }),
                             false,
                         ))
@@ -2406,7 +2406,7 @@ impl<'a> Parser<'a> {
                                     lhs,
                                     not,
                                     rhs: into_bare_subquery(
-                                        exprs.into_iter().next().expect("one element"),
+                                        *exprs.into_iter().next().expect("one element"),
                                     ),
                                 }),
                                 false,
@@ -2439,7 +2439,7 @@ impl<'a> Parser<'a> {
                     Box::new(Expr::InTable {
                         lhs,
                         not,
-                        rhs: name,
+                        rhs: Box::new(name),
                         args: exprs,
                     }),
                     false,
@@ -6363,7 +6363,7 @@ mod tests {
                         select: OneSelect::Select {
                             distinctness: None,
                             columns: vec![ResultColumn::Expr(
-                                Box::new(Expr::Exists(Select {
+                                Box::new(Expr::Exists(Box::new(Select {
                                     with: None,
                                     body: SelectBody {
                                         select: OneSelect::Select {
@@ -6383,7 +6383,7 @@ mod tests {
                                     },
                                     order_by: vec![],
                                     limit: None,
-                                })),
+                                }))),
                                 None,
                             )],
                             from: None,
@@ -6500,7 +6500,7 @@ mod tests {
                         select: OneSelect::Select {
                             distinctness: None,
                             columns: vec![ResultColumn::Expr(
-                                Box::new(Expr::Subquery(Select {
+                                Box::new(Expr::Subquery(Box::new(Select {
                                     with: None,
                                     body: SelectBody {
                                         select: OneSelect::Select {
@@ -6520,7 +6520,7 @@ mod tests {
                                     },
                                     order_by: vec![],
                                     limit: None,
-                                })),
+                                }))),
                                 None,
                             )],
                             from: None,
@@ -6839,7 +6839,7 @@ mod tests {
                                         filter_clause: Some(Box::new(Expr::Id(Name::exact(
                                             "x".to_owned(),
                                         )))),
-                                        over_clause: Some(Over::Name(Name::exact(
+                                        over_clause: boxed_over(Over::Name(Name::exact(
                                             "window_name".to_owned(),
                                         ))),
                                     },
@@ -6876,7 +6876,7 @@ mod tests {
                                     within_group: vec![],
                                     filter_over: FunctionTail {
                                         filter_clause: None,
-                                        over_clause: Some(Over::Window(Window {
+                                        over_clause: boxed_over(Over::Window(Window {
                                             base: None,
                                             partition_by: vec![Box::new(Expr::Id(Name::exact(
                                                 "product".to_owned(),
@@ -6918,7 +6918,7 @@ mod tests {
                                     within_group: vec![],
                                     filter_over: FunctionTail {
                                         filter_clause: None,
-                                        over_clause: Some(Over::Window(Window {
+                                        over_clause: boxed_over(Over::Window(Window {
                                             base: Some(Name::exact("test".to_owned())),
                                             partition_by: vec![Box::new(Expr::Id(Name::exact(
                                                 "product".to_owned(),
@@ -6960,7 +6960,7 @@ mod tests {
                                     within_group: vec![],
                                     filter_over: FunctionTail {
                                         filter_clause: None,
-                                        over_clause: Some(Over::Window(Window {
+                                        over_clause: boxed_over(Over::Window(Window {
                                             base: Some(Name::exact("test".to_owned())),
                                             partition_by: vec![Box::new(Expr::Id(Name::exact(
                                                 "product".to_owned(),
@@ -7008,7 +7008,7 @@ mod tests {
                                     within_group: vec![],
                                     filter_over: FunctionTail {
                                         filter_clause: None,
-                                        over_clause: Some(Over::Window(Window {
+                                        over_clause: boxed_over(Over::Window(Window {
                                             base: Some(Name::exact("test".to_owned())),
                                             partition_by: vec![Box::new(Expr::Id(Name::exact(
                                                 "product".to_owned(),
@@ -7055,7 +7055,7 @@ mod tests {
                                     within_group: vec![],
                                     filter_over: FunctionTail {
                                         filter_clause: None,
-                                        over_clause: Some(Over::Window(Window {
+                                        over_clause: boxed_over(Over::Window(Window {
                                             base: Some(Name::exact("test".to_owned())),
                                             partition_by: vec![Box::new(Expr::Id(Name::exact(
                                                 "product".to_owned(),
@@ -7102,7 +7102,7 @@ mod tests {
                                     within_group: vec![],
                                     filter_over: FunctionTail {
                                         filter_clause: None,
-                                        over_clause: Some(Over::Window(Window {
+                                        over_clause: boxed_over(Over::Window(Window {
                                             base: Some(Name::exact("test".to_owned())),
                                             partition_by: vec![Box::new(Expr::Id(Name::exact(
                                                 "product".to_owned(),
@@ -7149,7 +7149,7 @@ mod tests {
                                     within_group: vec![],
                                     filter_over: FunctionTail {
                                         filter_clause: None,
-                                        over_clause: Some(Over::Window(Window {
+                                        over_clause: boxed_over(Over::Window(Window {
                                             base: Some(Name::exact("test".to_owned())),
                                             partition_by: vec![Box::new(Expr::Id(Name::exact(
                                                 "product".to_owned(),
@@ -7196,7 +7196,7 @@ mod tests {
                                     within_group: vec![],
                                     filter_over: FunctionTail {
                                         filter_clause: None,
-                                        over_clause: Some(Over::Window(Window {
+                                        over_clause: boxed_over(Over::Window(Window {
                                             base: Some(Name::exact("test".to_owned())),
                                             partition_by: vec![Box::new(Expr::Id(Name::exact(
                                                 "product".to_owned(),
@@ -7243,7 +7243,7 @@ mod tests {
                                     within_group: vec![],
                                     filter_over: FunctionTail {
                                         filter_clause: None,
-                                        over_clause: Some(Over::Window(Window {
+                                        over_clause: boxed_over(Over::Window(Window {
                                             base: Some(Name::exact("test".to_owned())),
                                             partition_by: vec![Box::new(Expr::Id(Name::exact(
                                                 "product".to_owned(),
@@ -7290,7 +7290,7 @@ mod tests {
                                     within_group: vec![],
                                     filter_over: FunctionTail {
                                         filter_clause: None,
-                                        over_clause: Some(Over::Window(Window {
+                                        over_clause: boxed_over(Over::Window(Window {
                                             base: Some(Name::exact("test".to_owned())),
                                             partition_by: vec![Box::new(Expr::Id(Name::exact(
                                                 "product".to_owned(),
@@ -7337,7 +7337,7 @@ mod tests {
                                     within_group: vec![],
                                     filter_over: FunctionTail {
                                         filter_clause: None,
-                                        over_clause: Some(Over::Window(Window {
+                                        over_clause: boxed_over(Over::Window(Window {
                                             base: Some(Name::exact("test".to_owned())),
                                             partition_by: vec![Box::new(Expr::Id(Name::exact(
                                                 "product".to_owned(),
@@ -7386,7 +7386,7 @@ mod tests {
                                     within_group: vec![],
                                     filter_over: FunctionTail {
                                         filter_clause: None,
-                                        over_clause: Some(Over::Window(Window {
+                                        over_clause: boxed_over(Over::Window(Window {
                                             base: Some(Name::exact("test".to_owned())),
                                             partition_by: vec![Box::new(Expr::Id(Name::exact(
                                                 "product".to_owned(),
@@ -7435,7 +7435,7 @@ mod tests {
                                     within_group: vec![],
                                     filter_over: FunctionTail {
                                         filter_clause: None,
-                                        over_clause: Some(Over::Window(Window {
+                                        over_clause: boxed_over(Over::Window(Window {
                                             base: Some(Name::exact("test".to_owned())),
                                             partition_by: vec![Box::new(Expr::Id(Name::exact(
                                                 "product".to_owned(),
@@ -7482,7 +7482,7 @@ mod tests {
                                     within_group: vec![],
                                     filter_over: FunctionTail {
                                         filter_clause: None,
-                                        over_clause: Some(Over::Window(Window {
+                                        over_clause: boxed_over(Over::Window(Window {
                                             base: Some(Name::exact("test".to_owned())),
                                             partition_by: vec![Box::new(Expr::Id(Name::exact(
                                                 "product".to_owned(),
@@ -7529,7 +7529,7 @@ mod tests {
                                     within_group: vec![],
                                     filter_over: FunctionTail {
                                         filter_clause: None,
-                                        over_clause: Some(Over::Window(Window {
+                                        over_clause: boxed_over(Over::Window(Window {
                                             base: Some(Name::exact("test".to_owned())),
                                             partition_by: vec![Box::new(Expr::Id(Name::exact(
                                                 "product".to_owned(),
@@ -7576,7 +7576,7 @@ mod tests {
                                     within_group: vec![],
                                     filter_over: FunctionTail {
                                         filter_clause: None,
-                                        over_clause: Some(Over::Window(Window {
+                                        over_clause: boxed_over(Over::Window(Window {
                                             base: Some(Name::exact("test".to_owned())),
                                             partition_by: vec![Box::new(Expr::Id(Name::exact(
                                                 "product".to_owned(),
@@ -7947,7 +7947,7 @@ mod tests {
                                     Box::new(Expr::InSelect {
                                         lhs: Box::new(Expr::Literal(Literal::Numeric("1".to_owned()))),
                                         not: false,
-                                        rhs: Select {
+                                        rhs: Box::new(Select {
                                             with: None,
                                             body: SelectBody {
                                                 select: OneSelect::Select {
@@ -7965,7 +7965,7 @@ mod tests {
                                             },
                                             order_by: vec![],
                                             limit: None
-                                        },
+                                        }),
                                     }),
                                     Operator::And,
                                     Box::new(Expr::Literal(Literal::Numeric("1".to_owned()))),
@@ -7995,7 +7995,7 @@ mod tests {
                                     Box::new(Expr::InSelect {
                                         lhs: Box::new(Expr::Literal(Literal::Numeric("1".to_owned()))),
                                         not: true,
-                                        rhs: Select {
+                                        rhs: Box::new(Select {
                                             with: None,
                                             body: SelectBody {
                                                 select: OneSelect::Select {
@@ -8013,7 +8013,7 @@ mod tests {
                                             },
                                             order_by: vec![],
                                             limit: None
-                                        },
+                                        }),
                                     }),
                                     Operator::And,
                                     Box::new(Expr::Literal(Literal::Numeric("1".to_owned()))),
@@ -8077,11 +8077,11 @@ mod tests {
                                     Box::new(Expr::InTable {
                                         lhs: Box::new(Expr::Literal(Literal::Numeric("1".to_owned()))),
                                         not: false,
-                                        rhs: QualifiedName {
+                                        rhs: Box::new(QualifiedName {
                                             db_name: None,
                                             name: Name::exact("test".to_owned()),
                                             alias: None,
-                                        },
+                                        }),
                                         args: vec![
                                             Box::new(Expr::Literal(Literal::Numeric("1".to_owned()))),
                                             Box::new(Expr::Literal(Literal::Numeric("2".to_owned()))),
@@ -13437,5 +13437,9 @@ mod tests {
         } else {
             panic!("expected Select");
         }
+    }
+
+    fn boxed_over(over: Over) -> Option<Box<Over>> {
+        Some(Box::new(over))
     }
 }
