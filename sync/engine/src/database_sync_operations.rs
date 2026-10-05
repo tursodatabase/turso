@@ -1253,33 +1253,41 @@ fn append_schema_ops(
     ops: &mut Vec<LogicalOp>,
 ) -> Result<()> {
     let mut drops = Vec::new();
-    let mut table_changes = Vec::new();
-    let mut creates = Vec::new();
+    let mut table_refreshes_and_creates = Vec::new();
+    let mut non_table_creates = Vec::new();
     for delta in deltas.into_values() {
-        match (delta.old, delta.new) {
-            (Some(old), Some(new)) if is_table(&old) => {
-                if is_logically_replayable_table(&old.name) {
-                    table_changes.push(schema_logical_op(&new, LogicalSchemaAction::Refresh)?);
-                }
+        let old = delta
+            .old
+            .filter(|row| is_logically_replayable_table(&row.name));
+        let new = delta
+            .new
+            .filter(|row| is_logically_replayable_table(&row.name));
+        match (old, new) {
+            (None, None) => {}
+            (None, Some(new)) if is_table(&new) => table_refreshes_and_creates
+                .push(schema_logical_op(&new, LogicalSchemaAction::Create)?),
+            (None, Some(new)) => {
+                non_table_creates.push(schema_logical_op(&new, LogicalSchemaAction::Create)?)
             }
-            (old, new) => {
-                if let Some(old) = old.filter(|old| is_logically_replayable_table(&old.name)) {
-                    drops.push(schema_logical_op(&old, LogicalSchemaAction::Drop)?);
-                }
-                if let Some(new) = new.filter(|new| is_logically_replayable_table(&new.name)) {
-                    let create = schema_logical_op(&new, LogicalSchemaAction::Create)?;
-                    if is_table(&new) {
-                        table_changes.push(create);
-                    } else {
-                        creates.push(create);
-                    }
-                }
+            (Some(old), None) => drops.push(schema_logical_op(&old, LogicalSchemaAction::Drop)?),
+            (Some(old), Some(new)) if !old.row_type.eq_ignore_ascii_case(&new.row_type) => {
+                return Err(Error::DatabaseSyncEngineError(format!(
+                    "schema row {} changed type from '{}' to '{}'",
+                    new.name, old.row_type, new.row_type
+                )));
+            }
+            (Some(_), Some(new)) if is_table(&new) => table_refreshes_and_creates
+                .push(schema_logical_op(&new, LogicalSchemaAction::Refresh)?),
+            (Some(old), Some(new)) => {
+                drops.push(schema_logical_op(&old, LogicalSchemaAction::Drop)?);
+                non_table_creates.push(schema_logical_op(&new, LogicalSchemaAction::Create)?);
             }
         }
     }
     ops.extend(drops);
-    ops.extend(table_changes);
-    ops.extend(creates);
+    ops.extend(table_refreshes_and_creates);
+    // these may depend on new or altered tables, so we emit them after all tables have been updated
+    ops.extend(non_table_creates);
     Ok(())
 }
 
