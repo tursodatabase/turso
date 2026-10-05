@@ -1,31 +1,28 @@
-use std::num::NonZero;
 use std::str;
 use std::sync::{Arc, Mutex};
 
 use crate::aliases;
 use crate::catalog::{self, PostgresDialect};
-use turso_core::{Connection, LimboError, PrepareOptions, Result, Statement, Value};
+use crate::statement::{with_execution, Plan, Statement};
+use turso_core::{Connection, LimboError, PrepareOptions, Result};
 use turso_parser::ast::{self};
 use turso_pg_parser::translator::{
     is_comment_on, is_refresh_matview, try_extract_copy_from, try_extract_create_schema,
-    try_extract_drop_schema, try_extract_set, try_extract_show, PgCopyFromStmt, PgCreateSchemaStmt,
-    PgDropSchemaStmt, PgSetStmt, PostgreSQLTranslator,
+    try_extract_drop_schema, try_extract_set, try_extract_show, PgSetStmt, PostgreSQLTranslator,
 };
-
-use crate::copy::parse_copy_text_format;
 
 #[derive(Clone)]
 pub struct PgConnection {
     inner: Arc<PgConnectionInner>,
 }
 
-struct PgConnectionInner {
-    conn: Arc<Connection>,
+pub(crate) struct PgConnectionInner {
+    pub(crate) conn: Arc<Connection>,
     session_state: Mutex<SessionState>,
 }
 
 impl PgConnectionInner {
-    fn set_search_path(&self, path: Vec<String>) {
+    pub(crate) fn set_search_path(&self, path: Vec<String>) {
         let mut state = self.session_state.lock().unwrap();
         state.search_path = path;
     }
@@ -114,7 +111,7 @@ impl PgConnection {
 
     pub fn pragma_update(&self, name: &str, value: impl std::fmt::Display) -> Result<()> {
         let sql = format!("PRAGMA {name} = {value}");
-        let mut stmt = self.inner.conn.prepare_internal(sql)?;
+        let mut stmt = self.inner.conn.prepare_sqlite(sql)?;
         stmt.run_ignore_rows()
     }
 
@@ -195,17 +192,19 @@ fn prepare_statement(pg_conn: &Arc<PgConnectionInner>, sql: &str) -> Result<Stat
             unqualified_database_search_path: if path.is_empty() { None } else { Some(path) },
         }
     };
-    for prereq in translated.prereqs {
-        let input = prereq.to_string();
-        let mut stmt = pg_conn
-            .conn
-            .prepare_translated_stmt_with_options(prereq, &input, &options)?;
-        stmt.run_ignore_rows()?;
-    }
-
-    pg_conn
+    let plan = (!translated.prereqs.is_empty() && matches!(translated.cmd, ast::Cmd::Stmt(_)))
+        .then(|| Plan::Prerequisites {
+            statements: translated.prereqs,
+            options: PrepareOptions {
+                unqualified_database_search_path: options.unqualified_database_search_path.clone(),
+            },
+            main: Box::new(translated.cmd.clone()),
+            input: sql.to_string(),
+        });
+    let stmt = pg_conn
         .conn
-        .prepare_translated_cmd_with_options(translated.cmd, sql, &options)
+        .prepare_translated_cmd_with_options(translated.cmd, sql, &options)?;
+    Ok(with_execution(pg_conn.clone(), stmt, plan))
 }
 
 fn reject_catalog_dml(stmt: &ast::Stmt) -> Result<()> {
@@ -260,44 +259,45 @@ fn try_prepare_special(pg_conn: &Arc<PgConnectionInner>, sql: &str) -> Result<Op
 
     if let Some(show_stmt) = try_extract_show(&parse_result) {
         let pragma_sql = format!("PRAGMA {}", show_stmt.name);
-        return Ok(Some(pg_conn.conn.prepare(&pragma_sql)?));
+        return Ok(Some(with_execution(
+            pg_conn.clone(),
+            pg_conn.conn.prepare(&pragma_sql)?,
+            None,
+        )));
     }
 
     if let Some(stmt) = try_extract_create_schema(&parse_result) {
-        handle_pg_create_schema(&pg_conn.conn, &stmt)?;
-        return Ok(Some(noop_statement(&pg_conn.conn)?));
+        return Ok(Some(noop_statement(
+            pg_conn,
+            Some(Plan::CreateSchema(stmt)),
+        )?));
     }
 
     if let Some(stmt) = try_extract_drop_schema(&parse_result) {
-        handle_pg_drop_schema(&pg_conn.conn, &stmt)?;
-        return Ok(Some(noop_statement(&pg_conn.conn)?));
+        return Ok(Some(noop_statement(pg_conn, Some(Plan::DropSchema(stmt)))?));
     }
 
     if is_refresh_matview(&parse_result) {
-        return Ok(Some(noop_statement(&pg_conn.conn)?));
+        return Ok(Some(noop_statement(pg_conn, None)?));
     }
 
     if is_comment_on(&parse_result) {
-        return Ok(Some(noop_statement(&pg_conn.conn)?));
+        return Ok(Some(noop_statement(pg_conn, None)?));
     }
 
     if let Some(stmt) = try_extract_copy_from(&parse_result) {
-        let rows_inserted = handle_pg_copy_from(&pg_conn.conn, &stmt)?;
-        let stmt = noop_statement(&pg_conn.conn)?;
-        stmt.set_n_change(rows_inserted as i64);
-        return Ok(Some(stmt));
+        return Ok(Some(noop_statement(pg_conn, Some(Plan::Copy(stmt)))?));
     }
 
     Ok(None)
 }
 
-fn noop_statement(conn: &Arc<Connection>) -> Result<Statement> {
-    conn.prepare("SELECT 0 WHERE 0")
-}
-
-fn execute_sqlite_internal(conn: &Arc<Connection>, sql: impl AsRef<str>) -> Result<()> {
-    let mut stmt = conn.prepare_internal(sql)?;
-    stmt.run_ignore_rows()
+fn noop_statement(pg_conn: &Arc<PgConnectionInner>, plan: Option<Plan>) -> Result<Statement> {
+    Ok(with_execution(
+        pg_conn.clone(),
+        pg_conn.conn.prepare("SELECT 0 WHERE 0")?,
+        plan,
+    ))
 }
 
 fn handle_pg_set(pg_conn: &Arc<PgConnectionInner>, set_stmt: &PgSetStmt) -> Result<Statement> {
@@ -308,223 +308,15 @@ fn handle_pg_set(pg_conn: &Arc<PgConnectionInner>, set_stmt: &PgSetStmt) -> Resu
             .map(|value| value.as_search_path_name().map(str::to_owned))
             .collect::<Option<Vec<_>>>()
             .ok_or_else(|| LimboError::ParseError("incorrect format".to_string()))?;
-        pg_conn.set_search_path(path);
-        return noop_statement(&pg_conn.conn);
+        return noop_statement(pg_conn, Some(Plan::SearchPath(path)));
     }
     let value = set_stmt.values.first().ok_or_else(|| {
         LimboError::ParseError(format!("SET {}: no value provided", set_stmt.name))
     })?;
     let pragma_sql = format!("PRAGMA {} = {}", set_stmt.name, value.to_sql_string());
-    pg_conn.conn.prepare(&pragma_sql)
-}
-
-fn handle_pg_create_schema(conn: &Arc<Connection>, stmt: &PgCreateSchemaStmt) -> Result<()> {
-    let name = stmt.name.to_lowercase();
-    if name == "public" {
-        if stmt.if_not_exists {
-            return Ok(());
-        }
-        return Err(LimboError::ParseError(format!(
-            "schema \"{name}\" already exists"
-        )));
-    }
-
-    if schema_exists(conn, &name)? {
-        if stmt.if_not_exists {
-            return Ok(());
-        }
-        return Err(LimboError::ParseError(format!(
-            "schema \"{name}\" already exists"
-        )));
-    }
-
-    let path = schema_file_path(conn, &name);
-    execute_sqlite_internal(
-        conn,
-        format!("ATTACH '{}' AS \"{}\"", path.replace('\'', "''"), name),
-    )?;
-    Ok(())
-}
-
-fn schema_file_path(conn: &Connection, schema_name: &str) -> String {
-    let main_path = conn.db_file_path();
-    let filename = format!("turso-postgres-schema-{schema_name}.db");
-    if main_path == ":memory:" {
-        filename
-    } else {
-        let parent = std::path::Path::new(&main_path)
-            .parent()
-            .unwrap_or_else(|| std::path::Path::new("."));
-        parent.join(&filename).to_string_lossy().to_string()
-    }
-}
-
-fn handle_pg_drop_schema(conn: &Arc<Connection>, stmt: &PgDropSchemaStmt) -> Result<()> {
-    let name = stmt.name.to_lowercase();
-    if name == "public" {
-        return handle_pg_drop_schema_public(conn, stmt.cascade);
-    }
-
-    if !schema_exists(conn, &name)? {
-        if stmt.if_exists {
-            return Ok(());
-        }
-        return Err(LimboError::ParseError(format!(
-            "schema \"{name}\" does not exist"
-        )));
-    }
-
-    if stmt.cascade {
-        drop_all_tables_in_schema(conn, &name)?;
-    }
-
-    execute_sqlite_internal(conn, format!("DETACH \"{name}\""))?;
-    Ok(())
-}
-
-fn handle_pg_drop_schema_public(conn: &Arc<Connection>, cascade: bool) -> Result<()> {
-    let table_names = list_user_tables(conn, None)?;
-    if !cascade && !table_names.is_empty() {
-        return Err(LimboError::ParseError(
-            "cannot drop schema \"public\" because other objects depend on it".to_string(),
-        ));
-    }
-
-    for table_name in table_names {
-        let mut stmt = conn.prepare(format!("DROP TABLE \"{table_name}\""))?;
-        stmt.run_ignore_rows()?;
-    }
-    Ok(())
-}
-
-fn drop_all_tables_in_schema(conn: &Arc<Connection>, schema_name: &str) -> Result<()> {
-    for table_name in list_user_tables(conn, Some(schema_name))? {
-        let mut stmt = conn.prepare(format!("DROP TABLE \"{schema_name}\".\"{table_name}\"",))?;
-        stmt.run_ignore_rows()?;
-    }
-    Ok(())
-}
-
-fn handle_pg_copy_from(conn: &Arc<Connection>, stmt: &PgCopyFromStmt) -> Result<usize> {
-    let data = std::fs::read_to_string(&stmt.filename).map_err(|e| {
-        LimboError::ParseError(format!("COPY FROM: cannot read '{}': {}", stmt.filename, e))
-    })?;
-
-    let table_name = match &stmt.schema_name {
-        Some(schema) => format!("\"{schema}\".\"{}\"", stmt.table_name),
-        None => format!("\"{}\"", stmt.table_name),
-    };
-    let column_names = get_table_columns(conn, &stmt.table_name, stmt.schema_name.as_deref())?;
-    if column_names.is_empty() {
-        return Err(LimboError::ParseError(format!(
-            "COPY FROM: table '{}' not found or has no columns",
-            stmt.table_name
-        )));
-    }
-
-    let (insert_cols, num_columns) = match &stmt.columns {
-        Some(cols) => {
-            let col_list = cols
-                .iter()
-                .map(|c| format!("\"{c}\""))
-                .collect::<Vec<_>>()
-                .join(", ");
-            (format!(" ({col_list})"), cols.len())
-        }
-        None => (String::new(), column_names.len()),
-    };
-
-    let placeholders = (0..num_columns).map(|_| "?").collect::<Vec<_>>().join(", ");
-    let insert_sql = format!("INSERT INTO {table_name}{insert_cols} VALUES ({placeholders})");
-
-    let delimiter = stmt
-        .delimiter
-        .as_ref()
-        .and_then(|d| d.chars().next())
-        .unwrap_or('\t');
-    let null_string = stmt.null_string.as_deref().unwrap_or("\\N");
-
-    let mut rows = parse_copy_text_format(&data, delimiter, null_string, num_columns)?;
-    if stmt.header && !rows.is_empty() {
-        rows.remove(0);
-    }
-
-    let rows_inserted = rows.len();
-    let mut begin = conn.prepare_sqlite("BEGIN")?;
-    begin.run_ignore_rows()?;
-
-    let result = (|| {
-        let mut insert_stmt = conn.prepare_sqlite(&insert_sql)?;
-        for row in &rows {
-            for (i, val) in row.iter().enumerate() {
-                let index = NonZero::new(i + 1).unwrap();
-                match val {
-                    Some(s) => insert_stmt.bind_at(index, Value::build_text(s.clone()))?,
-                    None => insert_stmt.bind_at(index, Value::Null)?,
-                }
-            }
-            insert_stmt.run_ignore_rows()?;
-            insert_stmt.reset()?;
-            insert_stmt.clear_bindings();
-        }
-
-        let mut commit = conn.prepare_sqlite("COMMIT")?;
-        commit.run_ignore_rows()?;
-        Ok(rows_inserted)
-    })();
-
-    if result.is_err() {
-        if let Ok(mut rollback) = conn.prepare_sqlite("ROLLBACK") {
-            let _ = rollback.run_ignore_rows();
-        }
-    }
-
-    result
-}
-
-fn get_table_columns(
-    conn: &Arc<Connection>,
-    table_name: &str,
-    schema_name: Option<&str>,
-) -> Result<Vec<String>> {
-    let sql = match schema_name {
-        Some(schema) => format!("PRAGMA \"{schema}\".table_info('{table_name}')"),
-        None => format!("PRAGMA table_info('{table_name}')"),
-    };
-    let mut stmt = conn.prepare_internal(&sql)?;
-    let rows = stmt.run_collect_rows()?;
-    Ok(rows
-        .into_iter()
-        .filter_map(|row| match row.get(1) {
-            Some(Value::Text(t)) => Some(t.as_str().to_string()),
-            _ => None,
-        })
-        .collect())
-}
-
-fn list_user_tables(conn: &Arc<Connection>, schema_name: Option<&str>) -> Result<Vec<String>> {
-    let filter = "type='table' AND name NOT LIKE 'sqlite_%' AND name NOT LIKE '__turso_internal_%'";
-    let sql = match schema_name {
-        Some(name) => format!("SELECT name FROM \"{name}\".sqlite_schema WHERE {filter}"),
-        None => format!("SELECT name FROM sqlite_schema WHERE {filter}"),
-    };
-    let mut stmt = conn.prepare_internal(&sql)?;
-    let rows = stmt.run_collect_rows()?;
-    Ok(rows
-        .into_iter()
-        .filter_map(|row| match row.first() {
-            Some(Value::Text(t)) => Some(t.as_str().to_string()),
-            _ => None,
-        })
-        .collect())
-}
-
-fn schema_exists(conn: &Arc<Connection>, schema_name: &str) -> Result<bool> {
-    let sql = format!(
-        "SELECT 1 FROM pragma_database_list WHERE name = '{}'",
-        schema_name.replace('\'', "''")
-    );
-    let mut stmt = conn.prepare_internal(&sql)?;
-    let rows = stmt.run_collect_rows()?;
-    Ok(!rows.is_empty())
+    Ok(with_execution(
+        pg_conn.clone(),
+        pg_conn.conn.prepare(&pragma_sql)?,
+        None,
+    ))
 }

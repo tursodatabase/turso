@@ -1,12 +1,14 @@
 use std::num::NonZero;
 use std::sync::{
     atomic::{AtomicUsize, Ordering},
-    Arc, Mutex,
+    Arc,
 };
+use std::time::Duration;
 
 use async_trait::async_trait;
 use futures::stream;
 use tokio::net::TcpListener;
+use tokio::sync::Mutex;
 use tracing::{error, info};
 use turso_core::Value;
 use turso_pg::{split_statements, Connection, PgConnection};
@@ -67,9 +69,12 @@ impl TursoPgServer {
                 query_parser: Arc::new(NoopQueryParser::new()),
             }),
         });
+        let io = self.conn.lock().await.inner().get_pager().io.clone();
+        let mut io_task = tokio::spawn(poll_io(io));
 
         loop {
             tokio::select! {
+                result = &mut io_task => return Ok(result??),
                 result = listener.accept() => {
                     match result {
                         Ok((socket, addr)) => {
@@ -98,7 +103,18 @@ impl TursoPgServer {
             }
         }
 
+        io_task.abort();
+        let _ = io_task.await;
         Ok(())
+    }
+}
+
+async fn poll_io(io: Arc<dyn turso_core::IO>) -> turso_core::Result<()> {
+    let mut timer = tokio::time::interval(Duration::from_millis(1));
+    timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    loop {
+        timer.tick().await;
+        io.step()?;
     }
 }
 
@@ -178,7 +194,7 @@ impl SimpleQueryHandler for TursoPgHandler {
     where
         C: ClientInfo + Unpin + Send + Sync,
     {
-        let conn = self.conn.lock().unwrap().clone();
+        let conn = self.conn.lock().await;
 
         // Per the PostgreSQL simple query protocol, a query string may contain
         // multiple semicolon-separated statements. Split and execute each one.
@@ -191,14 +207,14 @@ impl SimpleQueryHandler for TursoPgHandler {
                 .prepare(sql)
                 .map_err(|e| PgWireError::UserError(Box::new(error_info(&e.to_string()))))?;
 
-            self.cleanup_dropped_schema_file(sql);
-
-            if stmt.num_columns() == 0 || is_pg_non_query(sql) {
-                responses.push(execute_non_query(&mut stmt, sql)?);
+            let response = if stmt.num_columns() == 0 || is_pg_non_query(sql) {
+                execute_non_query(&mut stmt, sql).await?
             } else {
                 let header = Arc::new(build_field_info(&stmt, &Format::UnifiedText));
-                responses.push(execute_query(&mut stmt, header)?);
-            }
+                execute_query(&mut stmt, header).await?
+            };
+            self.cleanup_dropped_schema_file(sql);
+            responses.push(response);
         }
 
         Ok(responses)
@@ -223,25 +239,24 @@ impl ExtendedQueryHandler for TursoPgHandler {
     where
         C: ClientInfo + Unpin + Send + Sync,
     {
-        let conn = self.conn.lock().unwrap().clone();
+        let conn = self.conn.lock().await;
         let query = &portal.statement.statement;
 
         let mut stmt = conn
             .prepare(query)
             .map_err(|e| PgWireError::UserError(Box::new(error_info(&e.to_string()))))?;
 
-        // Clean up schema file after successful DROP SCHEMA
-        self.cleanup_dropped_schema_file(query);
-
         // Bind parameters from the portal
         bind_portal_parameters(&mut stmt, portal)?;
 
         if stmt.num_columns() == 0 || is_pg_non_query(query) {
-            return execute_non_query(&mut stmt, query);
+            let response = execute_non_query(&mut stmt, query).await?;
+            self.cleanup_dropped_schema_file(query);
+            return Ok(response);
         }
 
         let header = Arc::new(build_field_info(&stmt, &portal.result_column_format));
-        execute_query(&mut stmt, header)
+        execute_query(&mut stmt, header).await
     }
 
     async fn do_describe_statement<C>(
@@ -252,7 +267,7 @@ impl ExtendedQueryHandler for TursoPgHandler {
     where
         C: ClientInfo + Unpin + Send + Sync,
     {
-        let conn = self.conn.lock().unwrap().clone();
+        let conn = self.conn.lock().await;
         let stmt = conn
             .prepare(&target.statement)
             .map_err(|e| PgWireError::UserError(Box::new(error_info(&e.to_string()))))?;
@@ -275,7 +290,7 @@ impl ExtendedQueryHandler for TursoPgHandler {
     where
         C: ClientInfo + Unpin + Send + Sync,
     {
-        let conn = self.conn.lock().unwrap().clone();
+        let conn = self.conn.lock().await;
         let stmt = conn
             .prepare(&portal.statement.statement)
             .map_err(|e| PgWireError::UserError(Box::new(error_info(&e.to_string()))))?;
@@ -383,39 +398,63 @@ fn scalar_pg_type_to_array_type(scalar: &Type) -> Type {
 }
 
 /// Execute a query that returns rows and build a Query response.
-fn execute_query(
-    stmt: &mut turso_core::Statement,
+async fn execute_query(
+    stmt: &mut turso_pg::Statement,
     header: Arc<Vec<FieldInfo>>,
 ) -> PgWireResult<Response> {
     let mut rows: Vec<PgWireResult<DataRow>> = Vec::new();
     let header_clone = header.clone();
 
-    stmt.run_with_row_callback(|row| {
-        let mut encoder = DataRowEncoder::new(header_clone.clone());
-        for (i, val) in row.get_values().enumerate() {
-            let pg_type = header_clone
-                .get(i)
-                .map(|fi| fi.datatype().clone())
-                .unwrap_or(Type::TEXT);
-            encode_value(&mut encoder, val, &pg_type)?;
+    loop {
+        let result = stmt
+            .run_with_row_callback_nonblock(|row| {
+                let mut encoder = DataRowEncoder::new(header_clone.clone());
+                for (i, val) in row.get_values().enumerate() {
+                    let pg_type = header_clone
+                        .get(i)
+                        .map(|fi| fi.datatype().clone())
+                        .unwrap_or(Type::TEXT);
+                    encode_value(&mut encoder, val, &pg_type)?;
+                }
+                rows.push(encoder.finish());
+                Ok(())
+            })
+            .map_err(|e| PgWireError::UserError(Box::new(error_info(&e.to_string()))))?;
+        match result {
+            turso_core::IOResult::Done(()) => break,
+            turso_core::IOResult::IO(io) => wait_for_io(io).await?,
         }
-        rows.push(encoder.finish());
-        Ok(())
-    })
-    .map_err(|e| PgWireError::UserError(Box::new(error_info(&e.to_string()))))?;
+    }
 
     let data_stream = stream::iter(rows);
     Ok(Response::Query(QueryResponse::new(header, data_stream)))
 }
 
 /// Execute a non-SELECT statement and build an Execution response.
-fn execute_non_query(stmt: &mut turso_core::Statement, query: &str) -> PgWireResult<Response> {
-    stmt.run_ignore_rows()
-        .map_err(|e| PgWireError::UserError(Box::new(error_info(&e.to_string()))))?;
+async fn execute_non_query(stmt: &mut turso_pg::Statement, query: &str) -> PgWireResult<Response> {
+    loop {
+        match stmt
+            .run_ignore_rows_nonblock()
+            .map_err(|e| PgWireError::UserError(Box::new(error_info(&e.to_string()))))?
+        {
+            turso_core::IOResult::Done(()) => break,
+            turso_core::IOResult::IO(io) => wait_for_io(io).await?,
+        }
+    }
 
     let affected = stmt.n_change();
     let tag = command_tag(query, affected as usize);
     Ok(Response::Execution(tag))
+}
+
+async fn wait_for_io(completion: turso_core::types::IOCompletions) -> PgWireResult<()> {
+    if completion.is_explicit_yield() {
+        tokio::task::yield_now().await;
+    }
+    completion
+        .0
+        .await
+        .map_err(|e| PgWireError::UserError(Box::new(error_info(&e.to_string()))))
 }
 
 /// Extract parameters from a Portal and bind them to a prepared statement.
@@ -763,6 +802,115 @@ fn error_info(message: &str) -> ErrorInfo {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use futures::poll;
+    use std::task::Poll;
+    use turso_core::{Clock, Completion, IO};
+
+    #[tokio::test]
+    async fn timer_task_drives_io_and_stops_when_aborted() {
+        let io = Arc::new(PollingIO {
+            expected_task: std::sync::Mutex::new(None),
+            steps: AtomicUsize::new(0),
+            completion: Completion::new_wait(),
+            fail: false,
+        });
+        let wait = wait_for_io(turso_core::types::IOCompletions(io.completion.clone()));
+        tokio::pin!(wait);
+        assert!(matches!(poll!(&mut wait), Poll::Pending));
+        assert_eq!(io.steps.load(Ordering::SeqCst), 0);
+
+        let task = tokio::spawn(poll_io(io.clone()));
+        *io.expected_task.lock().unwrap() = Some(task.id());
+        tokio::time::timeout(Duration::from_secs(1), wait)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(io.steps.load(Ordering::SeqCst) >= 3);
+        assert!(io.completion.succeeded());
+
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        let steps = io.steps.load(Ordering::SeqCst);
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        assert_eq!(io.steps.load(Ordering::SeqCst), steps);
+    }
+
+    #[tokio::test]
+    async fn timer_task_returns_io_errors() {
+        let io = Arc::new(PollingIO {
+            expected_task: std::sync::Mutex::new(None),
+            steps: AtomicUsize::new(0),
+            completion: Completion::new_wait(),
+            fail: true,
+        });
+        let task = tokio::spawn(poll_io(io.clone()));
+        *io.expected_task.lock().unwrap() = Some(task.id());
+        let result = tokio::time::timeout(Duration::from_secs(1), task)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            matches!(result, Err(turso_core::LimboError::InternalError(message)) if message == "poll failed")
+        );
+        assert_eq!(io.steps.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn wait_returns_completion_errors() {
+        let completion = Completion::new_wait();
+        completion.abort();
+        assert!(wait_for_io(turso_core::types::IOCompletions(completion))
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("aborted"));
+    }
+
+    struct PollingIO {
+        expected_task: std::sync::Mutex<Option<tokio::task::Id>>,
+        steps: AtomicUsize,
+        completion: Completion,
+        fail: bool,
+    }
+
+    impl Clock for PollingIO {
+        fn current_time_monotonic(&self) -> turso_core::MonotonicInstant {
+            turso_core::io::clock::DefaultClock.current_time_monotonic()
+        }
+
+        fn current_time_wall_clock(&self) -> turso_core::WallClockInstant {
+            turso_core::io::clock::DefaultClock.current_time_wall_clock()
+        }
+    }
+
+    impl IO for PollingIO {
+        fn open_file(
+            &self,
+            _path: &str,
+            _flags: turso_core::OpenFlags,
+            _direct: bool,
+        ) -> turso_core::Result<Arc<dyn turso_core::File>> {
+            unreachable!()
+        }
+
+        fn remove_file(&self, _path: &str) -> turso_core::Result<()> {
+            unreachable!()
+        }
+
+        fn step(&self) -> turso_core::Result<()> {
+            assert_eq!(tokio::task::try_id(), *self.expected_task.lock().unwrap());
+            let steps = self.steps.fetch_add(1, Ordering::SeqCst) + 1;
+            if self.fail {
+                return Err(turso_core::LimboError::InternalError(
+                    "poll failed".to_string(),
+                ));
+            }
+            if steps == 3 {
+                self.completion.complete(0);
+            }
+            Ok(())
+        }
+    }
 
     #[test]
     fn test_pg_bytes_to_value_integer() {

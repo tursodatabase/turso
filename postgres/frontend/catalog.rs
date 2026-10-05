@@ -3296,6 +3296,8 @@ struct PgGetTableDefCursor {
     rows: Vec<Vec<Value>>,
     current_row: usize,
     row_count: usize,
+    sql_query: Option<Box<turso_core::Statement>>,
+    sql_map: HashMap<String, String>,
 }
 
 impl PgGetTableDefCursor {
@@ -3305,13 +3307,12 @@ impl PgGetTableDefCursor {
             rows: Vec::new(),
             current_row: 0,
             row_count: 0,
+            sql_query: None,
+            sql_map: HashMap::default(),
         }
     }
 
     fn load_table_defs(&mut self) -> Result<(), LimboError> {
-        // Query sqlite_master for all table SQL, keyed by name
-        let sql_map = self.load_sqlite_master_sql()?;
-
         let schema = self.conn.current_schema();
         self.rows.clear();
 
@@ -3329,7 +3330,7 @@ impl PgGetTableDefCursor {
                 continue;
             };
 
-            let postgres_ddl = match sql_map.get(table_name) {
+            let postgres_ddl = match self.sql_map.get(table_name) {
                 Some(schema_sql) => decode_stored_pg_schema_sql(schema_sql)
                     .map(str::to_string)
                     .unwrap_or_else(|| self.convert_to_postgres_ddl(schema_sql)),
@@ -3344,21 +3345,6 @@ impl PgGetTableDefCursor {
         }
 
         Ok(())
-    }
-
-    /// Read all table SQL strings from sqlite_master into a map.
-    fn load_sqlite_master_sql(&self) -> Result<HashMap<String, String>, LimboError> {
-        let mut map = HashMap::default();
-        let mut stmt = self
-            .conn
-            .prepare_internal("SELECT name, sql FROM sqlite_schema WHERE type = 'table'")?;
-        let rows = stmt.run_collect_rows()?;
-        for row in rows {
-            if let (Some(Value::Text(name)), Some(Value::Text(sql))) = (row.first(), row.get(1)) {
-                map.insert(name.as_str().to_string(), sql.as_str().to_string());
-            }
-        }
-        Ok(map)
     }
 
     fn convert_to_postgres_ddl(&self, sqlite_ddl: &str) -> String {
@@ -3419,10 +3405,44 @@ impl InternalVirtualTableCursor for PgGetTableDefCursor {
         _idx_str: Option<String>,
         _idx_num: i32,
     ) -> Result<bool, LimboError> {
-        self.current_row = 0;
+        Err(LimboError::InternalError(
+            "pg_get_tabledef requires nonblocking filtering".to_string(),
+        ))
+    }
+
+    fn filter_nonblock(
+        &mut self,
+        _args: &[Value],
+        _idx_str: Option<String>,
+        _idx_num: i32,
+    ) -> turso_core::types::IOResultOr<bool> {
+        if self.sql_query.is_none() {
+            self.current_row = 0;
+            self.rows.clear();
+            self.sql_map.clear();
+            self.sql_query = Some(Box::new(self.conn.prepare_internal(
+                "SELECT name, sql FROM sqlite_schema WHERE type = 'table'",
+            )?));
+        }
+        if let turso_core::IOResult::IO(io) = self
+            .sql_query
+            .as_mut()
+            .unwrap()
+            .run_with_row_callback_nonblock(|row| {
+                if let (Value::Text(name), Value::Text(sql)) = (row.get_value(0), row.get_value(1))
+                {
+                    self.sql_map
+                        .insert(name.as_str().to_string(), sql.as_str().to_string());
+                }
+                Ok(())
+            })?
+        {
+            return Ok(turso_core::IOResult::IO(io));
+        }
+        self.sql_query = None;
         self.load_table_defs()?;
         self.row_count = self.rows.len();
-        Ok(!self.rows.is_empty())
+        Ok(turso_core::IOResult::Done(!self.rows.is_empty()))
     }
 }
 

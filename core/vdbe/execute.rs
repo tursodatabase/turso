@@ -1611,7 +1611,10 @@ pub fn op_vfilter(
         } else {
             None
         };
-        cursor.filter(*idx_num as i32, idx_str, *arg_count, args)?
+        match cursor.filter(*idx_num as i32, idx_str, *arg_count, args)? {
+            IOResult::Done(has_rows) => has_rows,
+            IOResult::IO(io) => return Ok(state.suspend_on_io(io)),
+        }
     };
     // Increment filter_operations metric for virtual table filter
     state.metrics.filter_operations = state.metrics.filter_operations.wrapping_add(1);

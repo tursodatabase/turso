@@ -261,6 +261,7 @@ pub(crate) enum AttachDatabaseState {
 pub(crate) enum AttachDatabaseState {
     #[default]
     Start,
+    Open(Box<AttachDatabaseOpenState>),
     Init(Box<AttachDatabaseInitState>),
     Bootstrap(Box<AttachDatabaseBootstrapState>),
     Publish {
@@ -269,6 +270,17 @@ pub(crate) enum AttachDatabaseState {
         pager: Arc<Pager>,
     },
     Done,
+}
+
+#[cfg(feature = "fs")]
+pub(crate) struct AttachDatabaseOpenState {
+    io: Arc<dyn IO>,
+    path: String,
+    options: crate::OpenOptions,
+    db: Option<Arc<Database>>,
+    modeof: Option<String>,
+    encryption_key: Option<EncryptionKey>,
+    state: crate::OpenDbAsyncState,
 }
 
 #[cfg(feature = "fs")]
@@ -1920,13 +1932,13 @@ impl Connection {
     }
 
     #[cfg(feature = "fs")]
-    fn from_uri_attached(
+    fn prepare_attached_database_open(
         uri: &str,
         mut db_opts: DatabaseOpts,
         main_db_flags: OpenFlags,
         io: Arc<dyn IO>,
         dialect: Arc<dyn crate::Dialect>,
-    ) -> Result<(Arc<Database>, Option<EncryptionOpts>)> {
+    ) -> Result<AttachDatabaseOpenState> {
         let opts = OpenOptions::parse(uri)?;
         let mut flags = opts.get_flags()?;
         if main_db_flags.contains(OpenFlags::ReadOnly) {
@@ -1950,20 +1962,24 @@ impl Connection {
             db_opts = db_opts.with_encryption(true);
         }
         let io = opts.vfs.map(Database::io_for_vfs).unwrap_or(Ok(io))?;
-        let db = Database::open_file_with_flags(
-            io.clone(),
-            &opts.path,
-            flags,
-            db_opts,
-            encryption_opts.clone(),
-            dialect,
-        )?;
-        if let Some(modeof) = opts.modeof {
-            let perms = std::fs::metadata(modeof).map_err(|e| io_error(e, "metadata"))?;
-            std::fs::set_permissions(&opts.path, perms.permissions())
-                .map_err(|e| io_error(e, "set_permissions"))?;
-        }
-        Ok((db, encryption_opts))
+        let encryption_key = encryption_opts
+            .as_ref()
+            .map(|enc| EncryptionKey::from_hex_string(&enc.hexkey))
+            .transpose()?;
+        let mut options = crate::OpenOptions::new(dialect)
+            .flags(flags)
+            .db_opts(db_opts)
+            .encryption(encryption_opts);
+        let db = Database::resolve_default_storage(&io, &opts.path, &mut options, true)?;
+        Ok(AttachDatabaseOpenState {
+            io,
+            path: opts.path,
+            options,
+            db,
+            modeof: opts.modeof,
+            encryption_key,
+            state: crate::OpenDbAsyncState::new(),
+        })
     }
 
     pub fn set_foreign_keys_enabled(&self, enable: bool) {
@@ -3535,15 +3551,33 @@ impl Connection {
                         self.db.io.clone()
                     };
                     let main_db_flags = self.db.open_flags;
-                    let (db, encryption_opts) = Self::from_uri_attached(
+                    let open = Self::prepare_attached_database_open(
                         path,
                         db_opts,
                         main_db_flags,
                         io,
                         self.db.dialect(),
                     )?;
+                    *state = AttachDatabaseState::Open(Box::new(open));
+                }
+                AttachDatabaseState::Open(open) => {
+                    let db = match open.db.take() {
+                        Some(db) => db,
+                        None => crate::return_if_io!(Database::open_async(
+                            &mut open.state,
+                            open.io.clone(),
+                            &open.path,
+                            &open.options,
+                        )),
+                    };
+                    if let Some(modeof) = &open.modeof {
+                        let perms =
+                            std::fs::metadata(modeof).map_err(|e| io_error(e, "metadata"))?;
+                        std::fs::set_permissions(&open.path, perms.permissions())
+                            .map_err(|e| io_error(e, "set_permissions"))?;
+                    }
                     let attached_is_fresh = !db.initialized();
-                    if !is_memory_db {
+                    if !is_memory_like(path) {
                         Self::validate_attach_target(&db, attached_is_fresh, alias)?;
                     }
                     self.reject_unsupported_fresh_mvcc_attach_durable_storage(
@@ -3551,12 +3585,7 @@ impl Connection {
                         &db,
                         attached_is_fresh,
                     )?;
-
-                    let encryption_key = if let Some(ref enc) = encryption_opts {
-                        Some(EncryptionKey::from_hex_string(&enc.hexkey)?)
-                    } else {
-                        None
-                    };
+                    let encryption_key = open.encryption_key.take();
 
                     *state = AttachDatabaseState::Init(Box::new(AttachDatabaseInitState {
                         alias: alias.to_string(),
