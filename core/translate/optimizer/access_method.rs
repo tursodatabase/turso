@@ -412,6 +412,7 @@ pub(super) fn choose_best_btree_candidate(
             .enumerate()
             .filter(|(i, c)| {
                 !consumed.contains(i)
+                    && c.consumes_where_term()
                     && c.usable
                     && allowed_mask.contains_all_set_bits_of(&c.lhs_mask)
                     && matches!(
@@ -470,8 +471,10 @@ fn consumed_where_terms_from_constraint_refs(
         .into_iter()
         .flatten()
         {
-            let where_term_idx = constraints[constraint_idx].where_clause_pos.0;
-            consumed.set(where_term_idx)?;
+            let constraint = &constraints[constraint_idx];
+            if constraint.consumes_where_term() {
+                consumed.set(constraint.where_clause_pos.0)?;
+            }
         }
     }
     Ok(consumed)

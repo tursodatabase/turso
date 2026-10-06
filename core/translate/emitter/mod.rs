@@ -12,7 +12,7 @@ use super::{
         walk_expr, BindingBehavior, NoConstantOptReason, WalkControl,
     },
     group_by::GroupByMetadata,
-    main_loop::{LeftJoinMetadata, LoopLabels, SemiAntiJoinMetadata},
+    main_loop::{BlobPass, LeftJoinMetadata, LoopLabels, SemiAntiJoinMetadata},
     order_by::SortMetadata,
     plan::{
         BitSet, HashJoinType, JoinedTable, NonFromClauseSubquery, Plan, ResultSetColumn,
@@ -1081,6 +1081,8 @@ pub struct TranslateCtx<'a> {
     pub meta_window: Option<WindowMetadata<'a>>,
     /// Metadata stored during `open_loop` for `Search::InSeek`, consumed by `close_loop`.
     pub meta_in_seeks: Vec<Option<InSeekMetadata>>,
+    /// Stored during `open_loop` for a LIKE or GLOB prefix seek, consumed by `close_loop`.
+    pub meta_blob_passes: Vec<Option<BlobPass>>,
     pub unsafe_testing: bool,
 }
 
@@ -1120,6 +1122,7 @@ impl<'a> TranslateCtx<'a> {
             cdc_cursor_id: None,
             meta_window: None,
             meta_in_seeks: (0..table_count).map(|_| None).collect(),
+            meta_blob_passes: (0..table_count).map(|_| None).collect(),
             unsafe_testing,
         }
     }

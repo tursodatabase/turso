@@ -129,6 +129,7 @@ fn constraint_output_multipliers_for(
             && !consumed_where_terms.get(constraint.where_clause_pos.0)
             && !skipped_where_terms.get(constraint.where_clause_pos.0)
             && !where_clause[constraint.where_clause_pos.0].consumed
+            && constraint.consumes_where_term()
             && include(constraint)
     }) {
         multiplier *= constraint.selectivity;

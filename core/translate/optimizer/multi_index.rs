@@ -480,7 +480,9 @@ fn partition_residual_multi_or_exprs(
                 .into_iter()
                 .flatten()
                 {
-                    consumed[constraints[idx].where_clause_pos.0] = true;
+                    if constraints[idx].consumes_where_term() {
+                        consumed[constraints[idx].where_clause_pos.0] = true;
+                    }
                 }
             }
         }
