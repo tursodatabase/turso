@@ -7149,8 +7149,8 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         let write_set = tx.write_set.lock().take();
         let mut removed_versions = 0;
         for (rowid, row_versions) in write_set.entries {
-            let (removed, restores_rowid) =
-                Self::rollback_version_chain(tx_id, &mut row_versions.write());
+            let mut versions = row_versions.write();
+            let (removed, restores_rowid) = Self::rollback_version_chain(tx_id, &mut versions);
             removed_versions += removed;
             // Rollback made this row visible again. For example, if rowid 3 is restored,
             // the next INSERT without an explicit rowid must choose 4, not reuse 3.
@@ -7158,7 +7158,12 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
                 self.bump_rowid_allocator_for_restored_row(&rowid);
             }
             if let Some(end_ts) = dirty_stamp {
-                self.unmark_checkpoint_dirty_key_if_stamp(&rowid, end_ts);
+                if !versions
+                    .iter()
+                    .any(Self::version_keeps_checkpoint_dirty_key)
+                {
+                    self.unmark_checkpoint_dirty_key_if_stamp(&rowid, end_ts);
+                }
             }
         }
         self.dec_live_version_count_approx(removed_versions);
@@ -7221,6 +7226,18 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
             true
         });
         (before - versions.len(), restores_rowid)
+    }
+
+    fn version_keeps_checkpoint_dirty_key(version: &RowVersion) -> bool {
+        version.btree_resident
+            || matches!(
+                version.begin(),
+                Some(TxTimestampOrID::Timestamp(_)) | Some(TxTimestampOrID::TxID(_))
+            )
+            || matches!(
+                version.end(),
+                Some(TxTimestampOrID::Timestamp(_)) | Some(TxTimestampOrID::TxID(_))
+            )
     }
 
     fn cleanup_dropped_commit(&self, tx_id: TxID, connection: &Connection, db_id: usize) {

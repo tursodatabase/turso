@@ -1665,6 +1665,43 @@ fn failed_index_commit_does_not_leave_checkpoint_work() {
     );
 }
 
+#[test]
+fn failed_update_keeps_committed_row_on_truncate_checkpoint() {
+    let io = Arc::new(CheckpointYieldIo::new());
+    static NEXT_PATH: AtomicUsize = AtomicUsize::new(0);
+    let path = format!(
+        "mvcc-dirty-key-failed-update-{}.db",
+        NEXT_PATH.fetch_add(1, Ordering::SeqCst)
+    );
+    let open = || {
+        Database::open(
+            io.clone(),
+            &path,
+            OpenOptions::new(Arc::new(SqliteDialect)).db_opts(DatabaseOpts::new()),
+        )
+        .unwrap()
+    };
+    let db = open();
+    let conn = db.connect().unwrap();
+    conn.execute("PRAGMA journal_mode = 'mvcc'").unwrap();
+    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)")
+        .unwrap();
+    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+    conn.execute("INSERT INTO t VALUES (2, 'v')").unwrap();
+    io.inner.fault_after(".db-log", QueuedIoOpKind::Pwrite, 0);
+    assert!(conn.execute("UPDATE t SET v = 'u' WHERE id = 2").is_err());
+    io.inner.clear_fault();
+    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+    drop(conn);
+    drop(db);
+
+    let db = open();
+    let conn = db.connect().unwrap();
+    conn.execute("PRAGMA journal_mode = 'mvcc'").unwrap();
+    let rows: Vec<(i64, String)> = conn.exec_rows("SELECT id, v FROM t");
+    assert_eq!(rows, vec![(2, "v".to_string())]);
+}
+
 fn checkpoint_yields_after_optional_failed_commit(indexed: bool, fail_commit: bool) -> usize {
     let io = Arc::new(CheckpointYieldIo::new());
     let db = open_checkpoint_yield_database(io.clone());
