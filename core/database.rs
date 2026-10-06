@@ -82,6 +82,9 @@ pub struct DatabaseOpts {
     pub enable_experimental_mvcc_passive_checkpoint: bool,
     pub unsafe_testing: bool,
     pub(crate) enable_load_extension: bool,
+    /// ATTACH opens the database: its tables use the types of the main
+    /// database, so ATTACH checks their column types, not the open.
+    pub(crate) opened_by_attach: bool,
 }
 
 impl DatabaseOpts {
@@ -92,6 +95,11 @@ impl DatabaseOpts {
     #[cfg(feature = "cli_only")]
     pub fn turso_cli(mut self) -> Self {
         self.enable_load_extension = true;
+        self
+    }
+
+    pub(crate) fn opened_by_attach(mut self) -> Self {
+        self.opened_by_attach = true;
         self
     }
 
@@ -1703,6 +1711,14 @@ impl Database {
                         })();
                         if let Err(e) = load_result {
                             tracing::warn!("Failed to load custom types during open: {}", e);
+                        }
+                        let db = state
+                            .db
+                            .as_ref()
+                            .expect("db must be initialized in Init phase");
+                        if !db.opts.opened_by_attach {
+                            let schema = db.schema.lock().clone();
+                            schema.check_column_types_resolve(&schema)?;
                         }
                     }
 

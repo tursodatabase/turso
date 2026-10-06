@@ -197,3 +197,69 @@ fn pg_prefix_is_reserved_for_built_in_types(db: TempDatabase) {
         );
     }
 }
+
+fn attach_schema_file(db: &TempDatabase, schema: &str) -> turso_core::Result<PgConnection> {
+    let path = db
+        .path
+        .with_file_name(format!("turso-postgres-schema-{schema}.db"));
+    let core = db.connect_limbo();
+    core.execute(format!("ATTACH '{}' AS {schema}", path.display()))?;
+    Ok(PgConnection::new(core))
+}
+
+/// A table in a schema file uses the types of the main database.
+#[turso_macros::test]
+fn schema_file_tables_resolve_types_through_the_main_database(db: TempDatabase) {
+    let conn = db.connect_postgres();
+    conn.execute("CREATE TYPE mood AS ENUM ('sad', 'ok')")
+        .unwrap();
+    conn.execute("CREATE SCHEMA s").unwrap();
+    conn.execute("CREATE TABLE s.t (id integer PRIMARY KEY, m mood)")
+        .unwrap();
+    conn.execute("INSERT INTO s.t VALUES (1, 'ok')").unwrap();
+    drop(conn);
+    let schema_file = db.path.with_file_name("turso-postgres-schema-s.db");
+
+    let db = db.reopen();
+    let conn = attach_schema_file(&db, "s").unwrap();
+    assert_eq!(rows(&conn, "SELECT id, m FROM s.t"), ["1|ok"]);
+    assert!(conn.execute("INSERT INTO s.t VALUES (2, 'angry')").is_err());
+    drop(conn);
+    drop(db);
+
+    let io: std::sync::Arc<dyn turso_core::IO + Send> =
+        std::sync::Arc::new(turso_core::PlatformIO::new().unwrap());
+    let Err(err) = turso_core::Database::open_file_with_flags(
+        io,
+        schema_file.to_str().unwrap(),
+        turso_core::OpenFlags::default(),
+        turso_core::DatabaseOpts::new().with_custom_types(true),
+        None,
+        std::sync::Arc::new(turso_core::SqliteDialect),
+    ) else {
+        panic!("a schema file without the types of its main database must not open");
+    };
+    assert!(
+        err.to_string()
+            .contains("column t.m has type \"mood\", which this database does not define"),
+        "{err}"
+    );
+
+    let other = TempDatabase::builder().build();
+    for suffix in ["", "-wal"] {
+        let file = format!("turso-postgres-schema-s.db{suffix}");
+        std::fs::copy(
+            schema_file.with_file_name(&file),
+            other.path.with_file_name(&file),
+        )
+        .unwrap();
+    }
+    let Err(err) = attach_schema_file(&other, "s") else {
+        panic!("a main database without the type must refuse the schema file");
+    };
+    assert!(
+        err.to_string()
+            .contains("column t.m has type \"mood\", which this database does not define"),
+        "{err}"
+    );
+}

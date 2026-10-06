@@ -1118,11 +1118,51 @@ impl Schema {
     /// type affinities on all STRICT tables. This is the shared entry point
     /// used by both initial database open and schema reparse.
     pub fn load_type_definitions(&mut self, type_sqls: &[String]) -> crate::Result<()> {
+        let mut first_error = None;
         for sql in type_sqls {
-            self.add_type_from_sql(sql)?;
+            if let Err(e) = self.add_type_from_sql(sql) {
+                first_error.get_or_insert(e);
+            }
         }
         self.resolve_all_custom_type_affinities()?;
+        first_error.map_or(Ok(()), Err)
+    }
+
+    /// Refuse a STRICT table with a column type that is not a primitive and
+    /// does not resolve to one through the types of `types`. This binary
+    /// cannot read the values of such a column: the type is missing, or a
+    /// later version added it. `types` is the schema whose types the tables
+    /// use: the main schema, also for the tables of an attached database.
+    pub fn check_column_types_resolve(&self, types: &Schema) -> Result<()> {
+        for table in self.tables.values() {
+            let Some(table) = table.btree() else {
+                continue;
+            };
+            if !table.is_strict {
+                continue;
+            }
+            for column in table.columns() {
+                if !types.type_resolves_to_primitive(&column.ty_str) {
+                    return Err(LimboError::ParseError(format!(
+                        "column {}.{} has type \"{}\", which this database does not define: the type is missing, or a later version of Turso created the table",
+                        table.name,
+                        column.name.as_deref().unwrap_or_default(),
+                        column.ty_str
+                    )));
+                }
+            }
+        }
         Ok(())
+    }
+
+    fn type_resolves_to_primitive(&self, type_name: &str) -> bool {
+        if is_strict_primitive_type(type_name) {
+            return true;
+        }
+        matches!(
+            self.resolve_type_unchecked(type_name),
+            Ok(Some(resolved)) if is_strict_primitive_type(&resolved.primitive)
+        )
     }
 
     /// Resolve custom type affinities for all STRICT tables in the schema.

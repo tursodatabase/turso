@@ -1659,6 +1659,7 @@ impl Connection {
                             type_rows: Vec::new(),
                         };
                     } else {
+                        self.check_reparsed_column_types(&inner.fresh)?;
                         inner.phase = ReparsePhase::RefreshStats {
                             stats: Default::default(),
                         };
@@ -1680,12 +1681,14 @@ impl Connection {
                             if let Err(e) = inner.fresh.load_type_definitions(&type_rows) {
                                 tracing::warn!("Failed to load custom types: {}", e);
                             }
+                            self.check_reparsed_column_types(&inner.fresh)?;
                             inner.phase = ReparsePhase::RefreshStats {
                                 stats: Default::default(),
                             };
                         }
                         Err(e) => {
                             tracing::warn!("Failed to load custom types: {}", e);
+                            self.check_reparsed_column_types(&inner.fresh)?;
                             inner.phase = ReparsePhase::RefreshStats {
                                 stats: Default::default(),
                             };
@@ -1714,6 +1717,15 @@ impl Connection {
                 }
             }
         }
+    }
+
+    /// The MVCC bootstrap reparses only the database file; the open checks
+    /// the column types after the log recovery.
+    fn check_reparsed_column_types(&self, schema: &Schema) -> Result<()> {
+        if !self.experimental_custom_types_enabled() || self.is_mvcc_bootstrap_connection() {
+            return Ok(());
+        }
+        schema.check_column_types_resolve(schema)
     }
 
     pub(crate) fn read_current_schema_cookie(&self) -> Result<u32> {
@@ -3525,7 +3537,8 @@ impl Connection {
                         .with_index_method(self.db.experimental_index_method_enabled())
                         .with_vacuum(self.db.experimental_vacuum_enabled())
                         .with_generated_columns(self.db.experimental_generated_columns_enabled())
-                        .with_without_rowid(self.db.experimental_without_rowid_enabled());
+                        .with_without_rowid(self.db.experimental_without_rowid_enabled())
+                        .opened_by_attach();
                     let is_memory_db = is_memory_like(path);
                     let io: Arc<dyn IO> = if is_memory_db {
                         Arc::new(MemoryIO::new())
@@ -3663,6 +3676,10 @@ impl Connection {
                     };
                 }
                 AttachDatabaseState::Publish { alias, db, pager } => {
+                    if db.experimental_custom_types_enabled() {
+                        let attached_schema = db.schema.lock().clone();
+                        attached_schema.check_column_types_resolve(&self.schema.read())?;
+                    }
                     self.has_non_main_pagers.store(true, Ordering::Release);
                     self.attached_databases.write().insert(
                         alias.as_str(),

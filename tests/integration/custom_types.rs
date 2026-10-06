@@ -638,6 +638,90 @@ mod tests {
         assert_eq!(rows, vec![(1, "2.50".to_string())]);
     }
 
+    /// Run `sql` with SQLite on a file that Turso wrote. SQLite expects an
+    /// automatic index for the PRIMARY KEY of the types table, which Turso
+    /// does not create, so the table SQL has no PRIMARY KEY during the edit.
+    fn edit_with_sqlite(path: &std::path::Path, sql: &str) {
+        const TYPES_TABLE_SQL: &str =
+            "CREATE TABLE __turso_internal_types(name TEXT PRIMARY KEY, sql TEXT)";
+        let set_types_table_sql = |sql: &str| {
+            format!("UPDATE sqlite_master SET sql = '{sql}' WHERE name = '__turso_internal_types';")
+        };
+        rusqlite::Connection::open(path)
+            .unwrap()
+            .execute_batch(&format!(
+                "PRAGMA writable_schema = ON; {}",
+                set_types_table_sql("CREATE TABLE __turso_internal_types(name TEXT, sql TEXT)")
+            ))
+            .unwrap();
+        rusqlite::Connection::open(path)
+            .unwrap()
+            .execute_batch(&format!(
+                "PRAGMA writable_schema = ON; {sql}; {}",
+                set_types_table_sql(TYPES_TABLE_SQL)
+            ))
+            .unwrap();
+    }
+
+    /// A column type that does not resolve to a primitive type: the stored
+    /// values have no meaning for this binary.
+    #[test]
+    fn test_open_refuses_column_types_that_do_not_resolve() {
+        for (change, error) in [
+            (
+                "UPDATE __turso_internal_types SET sql = 'CREATE DOMAIN d AS pg_later_type' WHERE name = 'd'",
+                "column x.a has type \"d\", which this database does not define",
+            ),
+            (
+                "DELETE FROM __turso_internal_types WHERE name = 'd'",
+                "column x.a has type \"d\", which this database does not define",
+            ),
+            (
+                "UPDATE sqlite_master SET sql = 'CREATE TABLE x (id INTEGER PRIMARY KEY, a d, b pg_later_type) STRICT' WHERE name = 'x'",
+                "column x.b has type \"pg_later_type\", which this database does not define",
+            ),
+        ] {
+            let temp_dir = TempDir::new().unwrap();
+            let path = temp_dir.path().join("unresolved_type.db");
+            create_file(
+                &path,
+                false,
+                "CREATE DOMAIN d AS INTEGER CHECK (value > 0);
+                 CREATE TABLE x(id INTEGER PRIMARY KEY, a d) STRICT;
+                 INSERT INTO x VALUES (1, 5);",
+            );
+            edit_with_sqlite(&path, change);
+            let Err(err) = open_file(&path, true) else {
+                panic!("the open must fail: {change}");
+            };
+            assert_that!(err.to_string()).contains(error);
+        }
+    }
+
+    /// One type that does not load must not hide the types after it.
+    #[test]
+    fn test_types_after_a_type_that_does_not_load_still_load() {
+        let temp_dir = TempDir::new().unwrap();
+        let path = temp_dir.path().join("bad_type_first.db");
+        create_file(
+            &path,
+            false,
+            "CREATE DOMAIN a_unused AS INTEGER;
+             CREATE DOMAIN z_used AS INTEGER CHECK (value > 0);
+             CREATE TABLE x(id INTEGER PRIMARY KEY, a z_used) STRICT;",
+        );
+        edit_with_sqlite(
+            &path,
+            "UPDATE __turso_internal_types SET sql = 'CREATE DOMAIN a_unused AS' WHERE name = 'a_unused'",
+        );
+        let db = open_file(&path, true).unwrap();
+        let conn = db.connect().unwrap();
+        assert_that!(conn.execute("INSERT INTO x VALUES (1, -5)"))
+            .err()
+            .display_string()
+            .contains("CHECK constraint failed");
+    }
+
     #[test]
     fn test_pg_storage_option_survives_alter_table_and_reopen() {
         for mvcc in [false, true] {
