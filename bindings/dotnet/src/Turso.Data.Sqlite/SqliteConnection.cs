@@ -338,7 +338,7 @@ public partial class SqliteConnection : DbConnection
         {
             try
             {
-                filename = NormalizeDataSource(connection._connectionOptions);
+                filename = NormalizeDataSource(connection._connectionOptions).Filename;
             }
             catch (SqliteException)
             {

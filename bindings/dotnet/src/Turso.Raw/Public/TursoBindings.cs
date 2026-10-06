@@ -41,7 +41,11 @@ public static class TursoBindings
     {
         ArgumentNullException.ThrowIfNull(path);
 
-        var databasePtr = NewOpenedDatabase(path, cipher: null, hexkey: null);
+        var databasePtr = NewOpenedDatabase(
+            path,
+            cipher: null,
+            hexkey: null,
+            TursoDatabaseOpenMode.CreateIfMissing);
         return TursoSharedDatabaseHandle.FromPtr(databasePtr);
     }
 
@@ -364,7 +368,7 @@ public static class TursoBindings
         string? hexkey,
         TursoDatabaseOpenMode mode)
     {
-        var databasePtr = NewOpenedDatabase(path, cipher, hexkey);
+        var databasePtr = NewOpenedDatabase(path, cipher, hexkey, mode);
         var connectionPtr = IntPtr.Zero;
         try
         {
@@ -382,7 +386,11 @@ public static class TursoBindings
         }
     }
 
-    private static IntPtr NewOpenedDatabase(string path, string? cipher, string? hexkey)
+    private static IntPtr NewOpenedDatabase(
+        string path,
+        string? cipher,
+        string? hexkey,
+        TursoDatabaseOpenMode mode)
     {
         using var pathString = NativeUtf8String.From(path);
         using var featuresString = NativeUtf8String.From(cipher is null ? null : "encryption");
