@@ -481,6 +481,49 @@ fn user_type_with_pg_prefix_of_base_file_still_works() {
     );
 }
 
+/// A user type of the base file has the name of the built-in type pg_int8
+/// and is the type of a PRIMARY KEY. Only the built-in type makes a rowid
+/// alias, so the tables keep their rows and their indexes. DDL that would
+/// store such a table as canonical SQL, where the column would be a rowid
+/// alias, is refused.
+#[test]
+fn user_type_pg_int8_primary_key_of_base_file_is_not_a_rowid_alias() {
+    let dir = copy_fixtures(&["pg_v1_pg_int8_pk.db"]);
+    let db = open(dir.path().join("pg_v1_pg_int8_pk.db"), false);
+    let conn = db.connect_postgres();
+    conn.execute("INSERT INTO k VALUES ('c', 'third')").unwrap();
+    conn.execute("INSERT INTO r2 VALUES ('c', 'third')")
+        .unwrap();
+    assert!(conn.execute("INSERT INTO k VALUES ('d', 'x')").is_err());
+    assert!(conn.execute("INSERT INTO k VALUES ('a', 'x')").is_err());
+    for refused in [
+        "ALTER TABLE k ADD COLUMN w text",
+        "ALTER TABLE r2 ADD COLUMN w text",
+        "ALTER TABLE k RENAME TO k5",
+        "VACUUM",
+    ] {
+        let err = conn.inner().execute(refused).unwrap_err();
+        assert!(
+            err.to_string().contains(
+                "PRIMARY KEY column id has the user type pg_int8, which has the name of a built-in type"
+            ),
+            "{refused}: {err}"
+        );
+    }
+    assert_eq!(core_rows(conn.inner(), "PRAGMA integrity_check"), ["ok"]);
+    drop(conn);
+    let db = db.reopen();
+    let conn = db.connect_postgres();
+    assert_eq!(
+        rows(&conn, "SELECT id, v FROM k ORDER BY id"),
+        ["a|first", "c|third"]
+    );
+    assert_eq!(
+        rows(&conn, "SELECT id, v FROM r2 ORDER BY id"),
+        ["b|second", "c|third"]
+    );
+}
+
 /// New tables store timestamps, dates, times, numerics and bigints as
 /// integers. Their values equal the values of the base file, also in joins
 /// with and without an index.

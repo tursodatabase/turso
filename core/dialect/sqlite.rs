@@ -44,15 +44,40 @@ impl super::Dialect for SqliteDialect {
     }
 
     fn parse_table_sql(&self, sql: &str, root_page: i64) -> crate::Result<BTreeTable> {
-        BTreeTable::from_sql(&canonical_table_sql(sql)?, root_page)
+        match super::decode_stored_table_sql(sql) {
+            super::StoredTableSql::Canonical(sql) => BTreeTable::from_sql(sql, root_page),
+            super::StoredTableSql::RenamedByOlderPostgresFrontend(sql) => {
+                let (tbl_name, body) = create_table_parts(parse_table_sql_ast(&sql)?);
+                BTreeTable::from_older_postgres_frontend_ast(&tbl_name, &body, root_page)
+            }
+            super::StoredTableSql::Postgres(_) => Err(older_postgres_frontend_ddl_error()),
+        }
     }
 
     fn parse_table_sql_ast(&self, sql: &str) -> crate::Result<turso_parser::ast::Stmt> {
-        parse_table_sql_ast(&canonical_table_sql(sql)?)
+        match super::decode_stored_table_sql(sql) {
+            super::StoredTableSql::Canonical(sql) => parse_table_sql_ast(sql),
+            super::StoredTableSql::RenamedByOlderPostgresFrontend(sql) => {
+                let stmt = parse_table_sql_ast(&sql)?;
+                if let turso_parser::ast::Stmt::CreateTable { tbl_name, body, .. } = &stmt {
+                    super::refuse_older_postgres_frontend_rewrite(tbl_name, body)?;
+                }
+                Ok(stmt)
+            }
+            super::StoredTableSql::Postgres(_) => Err(older_postgres_frontend_ddl_error()),
+        }
     }
 
     fn table_sql_for_replay(&self, sql: &str) -> crate::Result<String> {
-        table_sql_for_replay(&canonical_table_sql(sql)?)
+        match super::decode_stored_table_sql(sql) {
+            super::StoredTableSql::Canonical(sql) => table_sql_for_replay(sql),
+            super::StoredTableSql::RenamedByOlderPostgresFrontend(sql) => {
+                let (tbl_name, body) = create_table_parts(parse_table_sql_ast(&sql)?);
+                super::refuse_older_postgres_frontend_rewrite(&tbl_name, &body)?;
+                table_sql_for_replay(&sql)
+            }
+            super::StoredTableSql::Postgres(_) => Err(older_postgres_frontend_ddl_error()),
+        }
     }
 
     fn register_catalog(
@@ -71,13 +96,22 @@ impl super::Dialect for SqliteDialect {
 /// The SQLite parser would read the PostgreSQL DDL of an older PostgreSQL
 /// frontend as a table without STRICT and without custom types, and show
 /// its raw stored values. Refuse it.
-fn canonical_table_sql(sql: &str) -> crate::Result<std::borrow::Cow<'_, str>> {
-    match super::decode_stored_table_sql(sql) {
-        super::StoredTableSql::Canonical(sql) => Ok(sql),
-        super::StoredTableSql::Postgres(_) => Err(crate::LimboError::ParseError(
-            "a table in this database was created by the PostgreSQL frontend of an older version: open the database with tursopg".to_string(),
-        )),
-    }
+fn older_postgres_frontend_ddl_error() -> crate::LimboError {
+    crate::LimboError::ParseError(
+        "a table in this database was created by the PostgreSQL frontend of an older version: open the database with tursopg".to_string(),
+    )
+}
+
+fn create_table_parts(
+    stmt: turso_parser::ast::Stmt,
+) -> (
+    turso_parser::ast::QualifiedName,
+    turso_parser::ast::CreateTableBody,
+) {
+    let turso_parser::ast::Stmt::CreateTable { tbl_name, body, .. } = stmt else {
+        unreachable!("parse_table_sql_ast returns CREATE TABLE");
+    };
+    (tbl_name, body)
 }
 
 /// Parse the first SQLite statement in `sql` and return its consumed byte count.

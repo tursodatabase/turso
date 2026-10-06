@@ -130,8 +130,8 @@ test explain-bigint-range-search {
     EXPLAIN SELECT id FROM orders WHERE total BETWEEN 100 AND 200;
 }
 expect {
-    1|0|0|SEARCH orders USING INDEX sqlite_autoindex_orders_1 (id>?)
-    1|0|0|SEARCH orders USING INDEX orders_total (total>=? AND total<=?)
+    1|0|0|SEARCH orders USING INTEGER PRIMARY KEY (rowid=?)
+    1|0|0|SEARCH orders USING COVERING INDEX orders_total (total>=? AND total<=?)
 }
 
 @setup typed_columns

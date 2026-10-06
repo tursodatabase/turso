@@ -21,7 +21,11 @@ const POSTGRES_TABLE_MARKER: &str = "/* turso_frontend:postgres */";
 /// The SQL of a `sqlite_schema` table row.
 pub enum StoredTableSql<'a> {
     /// Turso SQL, which the SQLite parser reads.
-    Canonical(std::borrow::Cow<'a, str>),
+    Canonical(&'a str),
+    /// Turso SQL with the PGSTORAGE option of a table that ALTER TABLE ...
+    /// RENAME of an older PostgreSQL frontend stored after
+    /// [`POSTGRES_TABLE_MARKER`].
+    RenamedByOlderPostgresFrontend(String),
     /// PostgreSQL DDL that an older PostgreSQL frontend stored after
     /// [`POSTGRES_TABLE_MARKER`].
     Postgres(&'a str),
@@ -29,7 +33,7 @@ pub enum StoredTableSql<'a> {
 
 pub fn decode_stored_table_sql(sql: &str) -> StoredTableSql<'_> {
     let Some(payload) = sql.strip_prefix(POSTGRES_TABLE_MARKER) else {
-        return StoredTableSql::Canonical(std::borrow::Cow::Borrowed(sql));
+        return StoredTableSql::Canonical(sql);
     };
     let payload = payload.trim_start();
     // ALTER TABLE ... RENAME of older versions stored the marker before
@@ -52,13 +56,25 @@ pub fn decode_stored_table_sql(sql: &str) -> StoredTableSql<'_> {
                 constraints,
                 options,
             };
-            StoredTableSql::Canonical(std::borrow::Cow::Owned(format!(
+            StoredTableSql::RenamedByOlderPostgresFrontend(format!(
                 "CREATE TABLE {} {body}",
                 tbl_name.name.as_ident()
-            )))
+            ))
         }
         _ => StoredTableSql::Postgres(payload),
     }
+}
+
+/// Refuse to store a table of an older PostgreSQL frontend as canonical SQL
+/// when the canonical SQL would make its PRIMARY KEY a rowid alias: the
+/// rows of such a table keep the key in the record and in an index.
+pub fn refuse_older_postgres_frontend_rewrite(
+    tbl_name: &turso_parser::ast::QualifiedName,
+    body: &turso_parser::ast::CreateTableBody,
+) -> crate::Result<()> {
+    let stored = crate::schema::BTreeTable::from_older_postgres_frontend_ast(tbl_name, body, 0)?;
+    let canonical = crate::schema::BTreeTable::from_create_table_ast(tbl_name, body, 0)?;
+    stored.refuse_primary_key_that_becomes_rowid_alias(&canonical)
 }
 
 /// SQL dialect layered on top of the engine.

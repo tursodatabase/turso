@@ -278,6 +278,12 @@ pub(crate) fn pg_storage_type_shows_text(name: &str) -> bool {
     .any(|pg_name| pg_name.eq_ignore_ascii_case(name))
 }
 
+/// `pg_int4` and `pg_int8`: a single-column PRIMARY KEY of these types in a
+/// table with the PGSTORAGE option is a rowid alias.
+pub(crate) fn is_pg_int_type_name(name: &str) -> bool {
+    name.eq_ignore_ascii_case("pg_int4") || name.eq_ignore_ascii_case("pg_int8")
+}
+
 pub(crate) fn is_pg_storage_type_name(name: &str) -> bool {
     PG_STORAGE_TYPE_NAMES
         .iter()
@@ -3882,6 +3888,21 @@ impl BTreeTable {
         create_table(tbl_name.name.as_str(), body, root_page)
     }
 
+    /// Build a table that the PostgreSQL frontend of an older version
+    /// stored. In these tables only `INTEGER` makes a rowid alias.
+    pub fn from_older_postgres_frontend_ast(
+        tbl_name: &ast::QualifiedName,
+        body: &CreateTableBody,
+        root_page: i64,
+    ) -> Result<BTreeTable> {
+        create_table_with_rowid_alias_types(
+            tbl_name.name.as_str(),
+            body,
+            root_page,
+            RowidAliasTypes::IntegerOnly,
+        )
+    }
+
     /// [`BTreeTable::to_sql`] for `sqlite_schema`: fails if the text does not
     /// load back as this table.
     pub(crate) fn to_checked_sql(&self) -> Result<String> {
@@ -3901,7 +3922,26 @@ impl BTreeTable {
                 "table SQL loads back as a different table: {sql}"
             )));
         }
-        Ok(())
+        self.refuse_primary_key_that_becomes_rowid_alias(&loaded)
+    }
+
+    /// The PostgreSQL frontend of older versions stored tables whose
+    /// PRIMARY KEY can have a user type named `pg_int4` or `pg_int8`. Such a
+    /// column is not a rowid alias. Canonical SQL would make it one, so
+    /// refuse to store the table as canonical SQL.
+    pub(crate) fn refuse_primary_key_that_becomes_rowid_alias(
+        &self,
+        loaded: &BTreeTable,
+    ) -> Result<()> {
+        match (self.get_rowid_alias_column(), loaded.get_rowid_alias_column()) {
+            (None, Some((_, column))) => Err(LimboError::ParseError(format!(
+                "cannot store table {} again: its PRIMARY KEY column {} has the user type {}, which has the name of a built-in type",
+                self.name,
+                column.name.as_deref().unwrap_or_default(),
+                column.ty_str
+            ))),
+            _ => Ok(()),
+        }
     }
 
     /// Reconstruct the SQL for the table.
@@ -4838,6 +4878,26 @@ fn constraint_column_collation(expr: &Expr) -> Result<(&Expr, Option<CollationSe
 }
 
 pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> Result<BTreeTable> {
+    create_table_with_rowid_alias_types(tbl_name, body, root_page, RowidAliasTypes::IntegerAndPgInt)
+}
+
+/// The column types that make a single-column PRIMARY KEY a rowid alias.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RowidAliasTypes {
+    /// `INTEGER`, and `pg_int4` or `pg_int8` in a table with the PGSTORAGE
+    /// option.
+    IntegerAndPgInt,
+    /// `INTEGER` only. The PostgreSQL frontend of older versions stored
+    /// tables that can use a user type named `pg_int4` or `pg_int8`.
+    IntegerOnly,
+}
+
+fn create_table_with_rowid_alias_types(
+    tbl_name: &str,
+    body: &CreateTableBody,
+    root_page: i64,
+    rowid_alias_types: RowidAliasTypes,
+) -> Result<BTreeTable> {
     let table_name = normalize_ident(tbl_name);
     trace!("Creating table {}", table_name);
     let has_rowid;
@@ -5275,7 +5335,10 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
                     .with(ColDefFlags::PrimaryKey, primary_key)
                     .with(
                         ColDefFlags::RowIdAlias,
-                        typename_exactly_integer
+                        (typename_exactly_integer
+                            || (rowid_alias_types == RowidAliasTypes::IntegerAndPgInt
+                                && is_pg_storage
+                                && is_pg_int_type_name(&ty_str)))
                             && primary_key
                             && !primary_key_desc_columns_constraint,
                     )
@@ -6001,6 +6064,13 @@ impl Column {
     #[inline]
     pub fn is_rowid_alias(&self) -> bool {
         self.info.is_rowid_alias()
+    }
+
+    /// A rowid alias of type `pg_int4` or `pg_int8`. As in PostgreSQL, an
+    /// INSERT that omits it uses its DEFAULT, and NULL is a NOT NULL error:
+    /// the INSERT does not generate a rowid for it.
+    pub fn is_pg_int_rowid_alias(&self) -> bool {
+        self.is_rowid_alias() && is_pg_int_type_name(&self.ty_str)
     }
     #[inline]
     pub fn notnull(&self) -> bool {
@@ -6883,6 +6953,73 @@ mod tests {
         assert!(
             !column.is_rowid_alias(),
             "column 'a´ shouldn't be a rowid alias because table has composite primary key"
+        );
+        Ok(())
+    }
+
+    #[test]
+    pub fn pg_int_primary_key_is_a_rowid_alias_only_in_a_pgstorage_table() -> Result<()> {
+        for (sql, is_rowid_alias) in [
+            (
+                "CREATE TABLE t (a pg_int4 PRIMARY KEY) STRICT, PGSTORAGE",
+                true,
+            ),
+            (
+                "CREATE TABLE t (a PG_INT8 PRIMARY KEY) STRICT, PGSTORAGE",
+                true,
+            ),
+            (
+                "CREATE TABLE t (a pg_int8, PRIMARY KEY (a)) STRICT, PGSTORAGE",
+                true,
+            ),
+            (
+                "CREATE TABLE t (a pg_int8 PRIMARY KEY DESC) STRICT, PGSTORAGE",
+                false,
+            ),
+            (
+                "CREATE TABLE t (a pg_int8, b INTEGER, PRIMARY KEY (a, b)) STRICT, PGSTORAGE",
+                false,
+            ),
+            ("CREATE TABLE t (a pg_int8 PRIMARY KEY) STRICT", false),
+            (
+                "CREATE TABLE t (a bigint PRIMARY KEY) STRICT, PGSTORAGE",
+                false,
+            ),
+            (
+                "CREATE TABLE t (a INTEGER PRIMARY KEY) STRICT, PGSTORAGE",
+                true,
+            ),
+        ] {
+            let table = BTreeTable::from_sql(sql, 0)?;
+            assert_eq!(table.columns[0].is_rowid_alias(), is_rowid_alias, "{sql}");
+            assert_eq!(
+                table.columns[0].is_pg_int_rowid_alias(),
+                is_rowid_alias && !sql.contains("INTEGER"),
+                "{sql}"
+            );
+        }
+        Ok(())
+    }
+
+    /// The PostgreSQL frontend of older versions stored tables that can use
+    /// a user type named pg_int8 for a PRIMARY KEY. Such a column is not a
+    /// rowid alias, and canonical SQL, where it would be one, is refused.
+    #[test]
+    pub fn pg_int_primary_key_of_an_older_postgres_frontend_is_not_a_rowid_alias() -> Result<()> {
+        let sql = "CREATE TABLE t (a pg_int8 PRIMARY KEY, b TEXT) STRICT, PGSTORAGE";
+        let Some(Cmd::Stmt(Stmt::CreateTable { tbl_name, body, .. })) =
+            Parser::new(sql.as_bytes()).next_cmd()?
+        else {
+            panic!("not a CREATE TABLE");
+        };
+        let table = BTreeTable::from_older_postgres_frontend_ast(&tbl_name, &body, 0)?;
+        assert!(!table.columns[0].is_rowid_alias());
+        let err = table.check_sql_loads_back(sql).unwrap_err();
+        assert!(
+            err.to_string().contains(
+                "cannot store table t again: its PRIMARY KEY column a has the user type pg_int8"
+            ),
+            "{err}"
         );
         Ok(())
     }

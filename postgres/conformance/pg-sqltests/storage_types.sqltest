@@ -181,3 +181,16 @@ expect {
     5
     1
 }
+
+test bigint-primary-key-refuses-null {
+    CREATE TABLE k (id bigint PRIMARY KEY, v text);
+    INSERT INTO k VALUES (NULL, 'a');
+}
+expect error {}
+
+test bigint-primary-key-update-to-null-is-refused {
+    CREATE TABLE k (id bigint PRIMARY KEY, v text);
+    INSERT INTO k VALUES (1, 'a');
+    UPDATE k SET id = NULL;
+}
+expect error {}

@@ -2,7 +2,7 @@ use super::gencol::compute_virtual_columns;
 use super::TranslateCtx;
 use crate::alloc::{TryClone, TursoIteratorExt};
 use crate::schema::{Column, ColumnLayout, GeneratedType, Table};
-use crate::translate::insert::halt_desc_and_on_error;
+use crate::translate::insert::{emit_rowid_alias_not_null_check, halt_desc_and_on_error};
 use crate::translate::plan::ColumnMask;
 use crate::translate::stmt_journal::any_effective_replace;
 use crate::vdbe::builder::SelfTableContext;
@@ -794,6 +794,20 @@ fn emit_update_column_values<'a>(
                 rowid_set_clause_reg,
                 &t_ctx.resolver,
             )?;
+            if let Some(rowid_alias) = column_ctx
+                .target_table
+                .table
+                .columns()
+                .iter()
+                .find(|column| column.is_pg_int_rowid_alias())
+            {
+                emit_rowid_alias_not_null_check(
+                    program,
+                    column_ctx.target_table.table.get_name(),
+                    rowid_alias,
+                    rowid_set_clause_reg,
+                );
+            }
             program.emit_insn(Insn::MustBeInt {
                 reg: rowid_set_clause_reg,
                 target_pc: None,
@@ -839,6 +853,14 @@ fn emit_update_column_values<'a>(
                         rowid_set_clause_reg,
                         &t_ctx.resolver,
                     )?;
+                    if table_column.is_pg_int_rowid_alias() {
+                        emit_rowid_alias_not_null_check(
+                            program,
+                            column_ctx.target_table.table.get_name(),
+                            table_column,
+                            rowid_set_clause_reg,
+                        );
+                    }
 
                     program.emit_insn(Insn::MustBeInt {
                         reg: rowid_set_clause_reg,

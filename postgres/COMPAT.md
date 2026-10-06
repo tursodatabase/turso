@@ -135,7 +135,9 @@ New tables store some types as integers, with the built-in types
 Tables of older versions keep their types: timestamps keep milliseconds,
 and numeric truncates to the scale. A user type of an older version can have
 the name of a built-in `pg_` type. Then a new table cannot use that built-in
-type ("needs the built-in type"), until the user type is dropped.
+type ("needs the built-in type"), until the user type is dropped. When a user
+type named `pg_int4` or `pg_int8` is the type of a PRIMARY KEY, ALTER TABLE
+and VACUUM refuse to store the table again ("cannot store table").
 
 Comparisons do not cast a literal or a parameter to the type of the column.
 A timestamp, date, time, uuid or enum column compares its text form with the

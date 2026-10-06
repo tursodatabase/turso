@@ -495,3 +495,155 @@ test add-column-with-now-default-to-an-empty-table {
 expect {
     1
 }
+
+@requires strict "uses STRICT tables"
+test pg-int-primary-key-is-a-rowid-alias {
+    CREATE TABLE k4(id pg_int4 PRIMARY KEY, v TEXT) STRICT, PGSTORAGE;
+    CREATE TABLE k8(id pg_int8 PRIMARY KEY, v TEXT) STRICT, PGSTORAGE;
+    INSERT INTO k4 VALUES (5, 'a');
+    INSERT INTO k8 VALUES (9000000000, 'b');
+    SELECT id, rowid, typeof(id) FROM k4;
+    SELECT id, rowid, typeof(id) FROM k8;
+    SELECT count(*) FROM sqlite_schema WHERE type = 'index';
+    EXPLAIN QUERY PLAN SELECT v FROM k8 WHERE id = 3;
+}
+expect {
+    5|5|integer
+    9000000000|9000000000|integer
+    0
+    1|0|0|SEARCH k8 USING INTEGER PRIMARY KEY (rowid=?)
+}
+
+@requires strict "uses STRICT tables"
+test pg-int-primary-key-of-a-table-without-pgstorage-is-refused {
+    CREATE TABLE k(id pg_int8 PRIMARY KEY) STRICT;
+}
+expect error {
+    column k.id has type "pg_int8", which only a table with the PGSTORAGE option can use
+}
+
+@requires strict "uses STRICT tables"
+test pg-int-rowid-alias-omitted-uses-the-default {
+    CREATE SEQUENCE s_id_seq;
+    CREATE TABLE s(id pg_int4 PRIMARY KEY DEFAULT (nextval('s_id_seq')), v TEXT) STRICT, PGSTORAGE;
+    INSERT INTO s (v) VALUES ('a'), ('b');
+    INSERT INTO s VALUES (10, 'c');
+    INSERT INTO s (v) VALUES ('d') RETURNING id, v;
+    INSERT INTO s VALUES (DEFAULT, 'e') RETURNING id;
+    INSERT INTO s DEFAULT VALUES RETURNING id;
+    SELECT id, v FROM s ORDER BY id;
+}
+expect {
+    3|d
+    4
+    5
+    1|a
+    2|b
+    3|d
+    4|e
+    5|
+    10|c
+}
+
+@requires strict "uses STRICT tables"
+test pg-int-rowid-alias-omitted-without-default-is-a-not-null-error {
+    CREATE TABLE k(id pg_int8 PRIMARY KEY, v TEXT) STRICT, PGSTORAGE;
+    INSERT INTO k (v) VALUES ('a');
+}
+expect error {
+    NOT NULL constraint failed: k.id
+}
+
+@requires strict "uses STRICT tables"
+test pg-int-rowid-alias-null-is-a-not-null-error {
+    CREATE SEQUENCE s_id_seq;
+    CREATE TABLE s(id pg_int4 PRIMARY KEY DEFAULT (nextval('s_id_seq')), v TEXT) STRICT, PGSTORAGE;
+    INSERT INTO s VALUES (NULL, 'a');
+}
+expect error {
+    NOT NULL constraint failed: s.id
+}
+
+@requires strict "uses STRICT tables"
+test pg-int-rowid-alias-null-through-rowid-is-a-not-null-error {
+    CREATE TABLE k(id pg_int8 PRIMARY KEY, v TEXT) STRICT, PGSTORAGE;
+    INSERT INTO k (rowid, v) VALUES (NULL, 'a');
+}
+expect error {
+    NOT NULL constraint failed: k.id
+}
+
+@requires strict "uses STRICT tables"
+test pg-int-rowid-alias-null-from-select-is-a-not-null-error {
+    CREATE TABLE k(id pg_int8 PRIMARY KEY, v TEXT) STRICT, PGSTORAGE;
+    INSERT INTO k SELECT 1, 'a' UNION ALL SELECT NULL, 'b';
+}
+expect error {
+    NOT NULL constraint failed: k.id
+}
+
+@requires strict "uses STRICT tables"
+test pg-int-rowid-alias-null-with-or-ignore-skips-the-row {
+    CREATE TABLE k(id pg_int8 PRIMARY KEY, v TEXT) STRICT, PGSTORAGE;
+    INSERT OR IGNORE INTO k VALUES (NULL, 'a'), (2, 'b');
+    INSERT OR REPLACE INTO k VALUES (2, 'c');
+    SELECT id, v FROM k;
+}
+expect {
+    2|c
+}
+
+@requires strict "uses STRICT tables"
+test pg-int-rowid-alias-update-to-null-is-a-not-null-error {
+    CREATE TABLE k(id pg_int8 PRIMARY KEY, v TEXT) STRICT, PGSTORAGE;
+    INSERT INTO k VALUES (1, 'a');
+    UPDATE k SET id = NULL;
+}
+expect error {
+    NOT NULL constraint failed: k.id
+}
+
+@requires strict "uses STRICT tables"
+test pg-int-rowid-alias-update-of-rowid-to-null-is-a-not-null-error {
+    CREATE TABLE k(id pg_int8 PRIMARY KEY, v TEXT) STRICT, PGSTORAGE;
+    INSERT INTO k VALUES (1, 'a');
+    UPDATE k SET rowid = NULL;
+}
+expect error {
+    NOT NULL constraint failed: k.id
+}
+
+@requires strict "uses STRICT tables"
+test pg-int-rowid-alias-upsert-to-null-is-a-not-null-error {
+    CREATE TABLE k(id pg_int8 PRIMARY KEY, v TEXT UNIQUE) STRICT, PGSTORAGE;
+    INSERT INTO k VALUES (1, 'a');
+    INSERT INTO k VALUES (2, 'a') ON CONFLICT (v) DO UPDATE SET id = NULL;
+}
+expect error {
+    NOT NULL constraint failed: k.id
+}
+
+@requires strict "uses STRICT tables"
+test pg-int-rowid-alias-update-and-upsert-keep-integer-keys {
+    CREATE TABLE k(id pg_int8 PRIMARY KEY, v TEXT UNIQUE) STRICT, PGSTORAGE;
+    INSERT INTO k VALUES (1, 'a');
+    UPDATE k SET id = 7;
+    INSERT INTO k VALUES (2, 'a') ON CONFLICT (v) DO UPDATE SET id = 8 RETURNING id, v;
+    SELECT id, rowid, v FROM k;
+}
+expect {
+    8|a
+    8|8|a
+}
+
+@requires strict "uses STRICT tables"
+test integer-rowid-alias-of-a-table-without-pg-types-keeps-generating-ids {
+    CREATE TABLE k(id INTEGER PRIMARY KEY, v TEXT) STRICT, PGSTORAGE;
+    INSERT INTO k (v) VALUES ('a');
+    INSERT INTO k VALUES (NULL, 'b');
+    SELECT id, v FROM k ORDER BY id;
+}
+expect {
+    1|a
+    2|b
+}

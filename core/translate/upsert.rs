@@ -14,7 +14,9 @@ use crate::translate::fkeys::{
     affected_parent_fks_for_update, emit_fk_child_update_counters, emit_fk_update_parent_actions,
     fire_fk_update_actions, ParentKeyNewProbeMode,
 };
-use crate::translate::insert::{format_unique_violation_desc, InsertEmitCtx};
+use crate::translate::insert::{
+    emit_rowid_alias_not_null_check, format_unique_violation_desc, InsertEmitCtx,
+};
 use crate::translate::plan::ColumnMask;
 use crate::translate::planner::ROWID_STRS;
 use crate::translate::trigger_exec::{
@@ -705,6 +707,9 @@ pub fn emit_upsert(
                 dst_reg: r,
                 extra_amount: 0,
             });
+            if col.is_pg_int_rowid_alias() {
+                emit_rowid_alias_not_null_check(program, table.get_name(), col, r);
+            }
             program.emit_insn(Insn::MustBeInt {
                 reg: r,
                 target_pc: None,
