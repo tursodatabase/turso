@@ -178,6 +178,7 @@ pub struct Builder {
     enable_without_rowid: bool,
     enable_mvcc_passive_checkpoint: bool,
     enable_mvcc_checkpoint_skip_wal: bool,
+    assume_torn_write_protection: bool,
     vfs: IoBackend,
     encryption_opts: Option<turso_sdk_kit::rsapi::EncryptionOpts>,
     io: Option<Arc<dyn turso_core::IO>>,
@@ -200,6 +201,7 @@ impl Builder {
             enable_without_rowid: false,
             enable_mvcc_passive_checkpoint: false,
             enable_mvcc_checkpoint_skip_wal: false,
+            assume_torn_write_protection: false,
             vfs: IoBackend::Default,
             encryption_opts: None,
             io: None,
@@ -276,6 +278,11 @@ impl Builder {
         self
     }
 
+    pub fn assume_torn_write_protection(mut self, enabled: bool) -> Self {
+        self.assume_torn_write_protection = enabled;
+        self
+    }
+
     pub fn with_io(mut self, vfs: impl Into<IoBackend>) -> Self {
         self.vfs = vfs.into();
         self
@@ -327,6 +334,9 @@ impl Builder {
         }
         if self.enable_mvcc_checkpoint_skip_wal {
             features.push("mvcc_checkpoint_skip_wal");
+        }
+        if self.assume_torn_write_protection {
+            features.push("assume_torn_write_protection");
         }
         if features.is_empty() {
             return None;

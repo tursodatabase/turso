@@ -403,6 +403,7 @@ impl TursoDatabaseConfig {
                 "without_rowid" => opts.with_without_rowid(true),
                 "mvcc_passive_checkpoint" => opts.with_experimental_mvcc_passive_checkpoint(true),
                 "mvcc_checkpoint_skip_wal" => opts.with_experimental_mvcc_checkpoint_skip_wal(true),
+                "assume_torn_write_protection" => opts.with_assume_torn_write_protection(true),
                 // "strict" is always enabled, kept for backwards compatibility
                 _ => opts,
             };

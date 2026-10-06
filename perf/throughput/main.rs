@@ -52,7 +52,8 @@ pub enum CheckpointMode {
     /// Blocking checkpoint that drops row versions once they are in the B-tree.
     Truncate,
     /// Blocking checkpoint that writes its pages directly to the database
-    /// file, without writing them to the WAL first.
+    /// file with atomic page writes, without the WAL. Only when the storage
+    /// has torn-write protection, or with --assume-torn-write-protection.
     TruncateSkipWal,
 }
 
@@ -133,6 +134,13 @@ struct Args {
     checkpointer: u64,
 
     #[arg(
+        long = "assume-torn-write-protection",
+        help = "Act as if the storage has torn-write protection, for --checkpoint-mode \
+                truncate-skip-wal on storage without it. Turso only; NOT crash-safe"
+    )]
+    assume_torn_write_protection: bool,
+
+    #[arg(
         long = "no-group-commit",
         help = "Turn off Turso MVCC group commit, so every transaction writes and syncs the \
                 logical log on its own. SQLite ignores this"
@@ -206,6 +214,7 @@ pub struct Config {
     pub mvcc_checkpoint_threshold: Option<i64>,
     pub checkpointer: Option<Duration>,
     pub group_commit: bool,
+    pub assume_torn_write_protection: bool,
 }
 
 impl Config {
@@ -379,6 +388,7 @@ fn main() {
         mvcc_checkpoint_threshold: args.mvcc_checkpoint_threshold,
         checkpointer: (args.checkpointer > 0).then(|| Duration::from_millis(args.checkpointer)),
         group_commit: !args.no_group_commit,
+        assume_torn_write_protection: args.assume_torn_write_protection,
     };
 
     let cpu_before = cpu_time();

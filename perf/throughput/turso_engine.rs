@@ -213,7 +213,9 @@ async fn count_rows(db: &Database) -> u64 {
 }
 
 async fn setup(config: &Config) -> Database {
-    let builder = Builder::new_local(&config.db_path).with_io(config.io.as_str());
+    let builder = Builder::new_local(&config.db_path)
+        .with_io(config.io.as_str())
+        .assume_torn_write_protection(config.assume_torn_write_protection);
     let builder = match (config.mode, config.checkpoint_mode) {
         (TxnMode::Concurrent, CheckpointMode::Passive) => {
             builder.experimental_mvcc_passive_checkpoint(true)

@@ -29,6 +29,16 @@ const VALUE_LEN: usize = 100;
 enum Mode {
     Wal,
     SkipWal,
+    Passive,
+}
+
+impl Mode {
+    fn checkpoint_sql(self) -> &'static str {
+        match self {
+            Mode::Wal | Mode::SkipWal => "PRAGMA wal_checkpoint(TRUNCATE)",
+            Mode::Passive => "PRAGMA wal_checkpoint(PASSIVE)",
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -59,14 +69,17 @@ fn bench_mvcc_checkpoint_skip_wal(criterion: &mut Criterion) {
         for sync in syncs() {
             let mut wal = Bench::open(Mode::Wal, workload, sync);
             let mut skip_wal = Bench::open(Mode::SkipWal, workload, sync);
+            let mut passive = Bench::open(Mode::Passive, workload, sync);
             eprintln!(
                 "atomic write units of {}: {:?}",
                 skip_wal.db_path,
-                atomic_write_units(&skip_wal.db_path)
+                PlatformIO::new()
+                    .unwrap()
+                    .atomic_write_units(&skip_wal.db_path)
             );
             for rows in rows_per_checkpoint() {
                 for round in 0..rounds(rows) {
-                    for bench in [&mut wal, &mut skip_wal] {
+                    for bench in [&mut wal, &mut skip_wal, &mut passive] {
                         let sample = bench.change_rows_and_checkpoint(rows, round);
                         eprintln!("{}", sample.to_csv());
                         if let Some(file) = out.as_mut() {
@@ -78,6 +91,7 @@ fn bench_mvcc_checkpoint_skip_wal(criterion: &mut Criterion) {
                 }
             }
             wal.assert_same_rows_as(&skip_wal);
+            wal.assert_same_rows_as(&passive);
         }
     }
     print_summary(&samples);
@@ -158,14 +172,17 @@ impl Bench {
         let db_path = dir.path().join("bench.db").to_str().unwrap().to_string();
         let counters = Arc::new(IoCounters::default());
         let io = Arc::new(CountingIo {
-            inner: Arc::new(PlatformIO::new().unwrap()),
+            inner: io_backend(),
             counters: counters.clone(),
         });
         let db = Database::open_file_with_flags(
             io,
             &db_path,
             OpenFlags::default(),
-            DatabaseOpts::new().with_experimental_mvcc_checkpoint_skip_wal(mode == Mode::SkipWal),
+            DatabaseOpts::new()
+                .with_experimental_mvcc_checkpoint_skip_wal(mode == Mode::SkipWal)
+                .with_assume_torn_write_protection(mode == Mode::SkipWal)
+                .with_experimental_mvcc_passive_checkpoint(mode == Mode::Passive),
             None,
             Arc::new(SqliteDialect),
         )
@@ -198,10 +215,7 @@ impl Bench {
             _dir: dir,
         };
         bench.insert_rows((0..BASE_ROWS).map(|k| k * ID_SPACING));
-        bench
-            .conn
-            .execute("PRAGMA wal_checkpoint(TRUNCATE)")
-            .unwrap();
+        bench.conn.execute(mode.checkpoint_sql()).unwrap();
         bench
     }
 
@@ -231,9 +245,7 @@ impl Bench {
         let db_size_before = std::fs::metadata(&self.db_path).unwrap().len();
         let io_before = self.counters.snapshot();
         let started = Instant::now();
-        self.conn
-            .execute("PRAGMA wal_checkpoint(TRUNCATE)")
-            .unwrap();
+        self.conn.execute(self.mode.checkpoint_sql()).unwrap();
         let took = started.elapsed();
         let io = self.counters.snapshot().minus(&io_before);
         let db_size_after = std::fs::metadata(&self.db_path).unwrap().len();
@@ -309,39 +321,13 @@ impl Bench {
     }
 }
 
-#[cfg(target_os = "linux")]
-fn atomic_write_units(path: &str) -> Option<(u32, u32)> {
-    const STATX_WRITE_ATOMIC: u32 = 0x0001_0000;
-    #[repr(C)]
-    struct StatxWithAtomicWrite {
-        mask: u32,
-        fields_before_atomic_write: [u8; 0xa8 - 4],
-        atomic_write_unit_min: u32,
-        atomic_write_unit_max: u32,
-        fields_after_atomic_write: [u8; 0x100 - 0xb0],
+fn io_backend() -> Arc<dyn IO> {
+    match std::env::var("MVCC_CHECKPOINT_SKIP_WAL_IO").as_deref() {
+        #[cfg(all(target_os = "linux", feature = "io_uring"))]
+        Ok("io_uring") => Arc::new(turso_core::UringIO::new().unwrap()),
+        Ok("syscall") | Err(_) => Arc::new(PlatformIO::new().unwrap()),
+        Ok(other) => panic!("unknown MVCC_CHECKPOINT_SKIP_WAL_IO: {other}"),
     }
-    let path = std::ffi::CString::new(path).ok()?;
-    let mut statx = std::mem::MaybeUninit::<StatxWithAtomicWrite>::zeroed();
-    let rc = unsafe {
-        libc::statx(
-            libc::AT_FDCWD,
-            path.as_ptr(),
-            0,
-            STATX_WRITE_ATOMIC,
-            statx.as_mut_ptr().cast(),
-        )
-    };
-    if rc != 0 {
-        return None;
-    }
-    let statx = unsafe { statx.assume_init() };
-    (statx.mask & STATX_WRITE_ATOMIC != 0 && statx.atomic_write_unit_max > 0)
-        .then_some((statx.atomic_write_unit_min, statx.atomic_write_unit_max))
-}
-
-#[cfg(not(target_os = "linux"))]
-fn atomic_write_units(_path: &str) -> Option<(u32, u32)> {
-    None
 }
 
 struct Sample {
@@ -388,7 +374,7 @@ impl Sample {
 
 fn print_summary(samples: &[Sample]) {
     eprintln!();
-    eprintln!("workload,sync,rows,wal_p50_ms,skip_wal_p50_ms,speedup,wal_mib_written,skip_wal_mib_written,wal_fsyncs,skip_wal_fsyncs,db_pages_written,new_db_pages");
+    eprintln!("workload,sync,rows,wal_p50_ms,skip_wal_p50_ms,passive_p50_ms,speedup,wal_mib_written,skip_wal_mib_written,passive_mib_written,wal_fsyncs,skip_wal_fsyncs,passive_fsyncs,db_pages_written,new_db_pages");
     let mut keys: Vec<(String, String, i64)> = samples
         .iter()
         .map(|s| (format!("{:?}", s.workload), format!("{:?}", s.sync), s.rows))
@@ -408,6 +394,7 @@ fn print_summary(samples: &[Sample]) {
         };
         let wal = of_mode(Mode::Wal);
         let skip_wal = of_mode(Mode::SkipWal);
+        let passive = of_mode(Mode::Passive);
         let p50 = |samples: &[&Sample]| {
             let mut ms: Vec<f64> = samples.iter().map(|s| s.ms).collect();
             ms.sort_by(|a, b| a.partial_cmp(b).unwrap());
@@ -420,14 +407,16 @@ fn print_summary(samples: &[Sample]) {
         let fsyncs = |s: &Sample| s.io.total_syncs() as f64;
         let db_pages = |s: &Sample| s.io.files[FileKind::Db as usize].bytes_written as f64 / 4096.0;
         let new_pages = |s: &Sample| (s.db_size_after - s.db_size_before) as f64 / 4096.0;
-        let (wal_p50, skip_wal_p50) = (p50(&wal), p50(&skip_wal));
+        let (wal_p50, skip_wal_p50, passive_p50) = (p50(&wal), p50(&skip_wal), p50(&passive));
         eprintln!(
-            "{workload},{sync},{rows},{wal_p50:.2},{skip_wal_p50:.2},{:.2},{:.2},{:.2},{:.1},{:.1},{:.0},{:.0}",
+            "{workload},{sync},{rows},{wal_p50:.2},{skip_wal_p50:.2},{passive_p50:.2},{:.2},{:.2},{:.2},{:.2},{:.1},{:.1},{:.1},{:.0},{:.0}",
             wal_p50 / skip_wal_p50,
             mean(&wal, &mib),
             mean(&skip_wal, &mib),
+            mean(&passive, &mib),
             mean(&wal, &fsyncs),
             mean(&skip_wal, &fsyncs),
+            mean(&passive, &fsyncs),
             mean(&skip_wal, &db_pages),
             mean(&skip_wal, &new_pages),
         );
@@ -555,6 +544,18 @@ impl IO for CountingIo {
         self.inner.remove_file(path)
     }
 
+    fn atomic_write_units(&self, path: &str) -> Option<turso_core::io::AtomicWriteUnits> {
+        self.inner.atomic_write_units(path)
+    }
+
+    fn open_file_for_direct_io(&self, path: &str) -> turso_core::Result<Arc<dyn File>> {
+        Ok(Arc::new(CountingFile {
+            kind: FileKind::of(path),
+            inner: self.inner.open_file_for_direct_io(path)?,
+            counters: self.counters.clone(),
+        }))
+    }
+
     fn step(&self) -> turso_core::Result<()> {
         self.inner.step()
     }
@@ -632,6 +633,20 @@ impl File for CountingFile {
             .fetch_add(bytes as u64, Ordering::Relaxed);
         counters.writes.fetch_add(1, Ordering::Relaxed);
         self.inner.pwritev(pos, buffers, c)
+    }
+
+    fn pwrite_atomic(
+        &self,
+        pos: u64,
+        buffer: Arc<Buffer>,
+        c: Completion,
+    ) -> turso_core::Result<Completion> {
+        let counters = self.counters();
+        counters
+            .bytes_written
+            .fetch_add(buffer.len() as u64, Ordering::Relaxed);
+        counters.writes.fetch_add(1, Ordering::Relaxed);
+        self.inner.pwrite_atomic(pos, buffer, c)
     }
 
     fn sync(&self, c: Completion, sync_type: FileSyncType) -> turso_core::Result<Completion> {
