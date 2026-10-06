@@ -139,19 +139,24 @@ type ("needs the built-in type"), until the user type is dropped. When a user
 type named `pg_int4` or `pg_int8` is the type of a PRIMARY KEY, ALTER TABLE
 and VACUUM refuse to store the table again ("cannot store table").
 
+A decimal constant, such as `1234567890123456.78`, and a parameter of type
+NUMERIC become a float, which keeps 15 significant digits. To store or
+compare a numeric value with more digits exactly, write it as a quoted
+literal or bind it as text.
+
 Comparisons do not cast a literal or a parameter to the type of the column.
 A timestamp, date, time, uuid or enum column compares its text form with the
 operand as written, and a boolean column compares 0 or 1. As a result,
 `ts = '2024-01-01'` does not find `2024-01-01 00:00:00`, an upper-case uuid
 literal finds no row, `flag = 't'` finds no row, and an enum literal that is
-not a label finds no row instead of an error. A numeric column compares with
-a literal by its value. With a parameter or another expression, a numeric
-column of a new table (precision 18 or less) compares as a number, and a
-numeric column of an older table compares its text form. An index on the
-column gives the same rows as a scan.
-One error depends on the plan: a numeric literal that is not a number, as in
-`n = 'abc'`, is an error with an index, but without an index it is an error
-only when a row gets to the comparison.
+not a label finds no row instead of an error. A numeric column compares as
+a decimal with a literal, a negative literal, a parameter, an expression, a
+number column and the result of numeric arithmetic, as in PostgreSQL; with a
+text column it compares its text form. Arithmetic of a numeric column of a new
+table with these operands gives a decimal. An index on the column gives the
+same rows as a scan. One error depends on the plan: text that is not a
+number, as in `n = 'abc'`, is an error with an index, but without an index it
+is an error only when a row gets to the comparison.
 
 An explicit cast to date, time, timetz, timestamp or timestamptz, such as
 `'2024-01-01'::timestamp` or `timestamp '2024-01-01'`, gives the text that a

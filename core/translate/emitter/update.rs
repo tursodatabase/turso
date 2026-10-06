@@ -27,7 +27,7 @@ use crate::{
             emit_dml_expr_index_value, emit_returning_results, emit_returning_scan_back,
             emit_stored_column, emit_table_column, restore_returning_row_image_in_cache,
             seed_returning_row_image_in_cache, translate_expr, translate_expr_no_constant_opt,
-            NoConstantOptReason, ReturningBufferCtx,
+            IndexExprKind, NoConstantOptReason, ReturningBufferCtx,
         },
         fkeys::{
             affected_parent_fks_for_update, emit_fk_child_update_counters,
@@ -1882,6 +1882,7 @@ fn emit_update_insns<'a>(
                 program,
                 &t_ctx.resolver,
                 new_where_expr,
+                IndexExprKind::Expression,
                 columns,
                 &mut column_regs,
                 &bt,

@@ -895,7 +895,10 @@ expect {
     0
 }
 
-# --- numeric: only `column = literal` seeks, and the term stays as a filter ---
+# --- numeric: only equality seeks, and the term stays as a filter ---
+# The comparison functions of numeric read the other operand as the value
+# that the user wrote: a literal, a negative literal, a parameter or an
+# expression.
 
 @requires strict "uses STRICT tables"
 @setup numerics
@@ -923,8 +926,8 @@ expect {
     1
     1
     1
-    0
-    0
+    1
+    1
     2
     2
 }
@@ -938,8 +941,8 @@ test numeric-or-of-two-indexed-columns-same-rows-with-and-without-index {
     SELECT group_concat(id) FROM (SELECT id FROM p NOT INDEXED WHERE n = 12.5 OR m = 2 ORDER BY id);
 }
 expect {
-    0
-    0
+    2
+    2
     1,2
     1,2
 }
@@ -995,8 +998,8 @@ test numeric-expression-index-same-rows-with-and-without-index {
     SELECT id FROM x NOT INDEXED WHERE val * 2 = '100.0000';
 }
 expect {
-    0
-    0
+    1
+    1
     3
     3
 }
@@ -1051,7 +1054,7 @@ test numeric-invalid-literal-with-index-raises-error-on-empty-table {
     SELECT count(*) FROM e WHERE n = 'abc';
 }
 expect error {
-    invalid input for type numeric
+    invalid numeric value: "abc"
 }
 
 # --- user types that DECODE to another value or compare with functions ---

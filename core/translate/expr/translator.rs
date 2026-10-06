@@ -620,9 +620,15 @@ fn try_translate_custom_type_operator(
     target_register: usize,
     resolver: &Resolver,
 ) -> Result<bool> {
-    let Some(resolved) =
-        find_custom_type_operator(e1, e2, op, referenced_tables, resolver.schema())
-    else {
+    let decoded_self_table = resolver.decoded_self_table();
+    let Some(resolved) = find_custom_type_operator(
+        e1,
+        e2,
+        op,
+        referenced_tables,
+        resolver.schema(),
+        decoded_self_table.as_deref(),
+    ) else {
         return Ok(false);
     };
     let result_reg =
@@ -1995,7 +2001,8 @@ fn translate_function_call_expr(
                 | ScalarFunc::PgTimestampSeekKey
                 | ScalarFunc::PgDateSeekKey
                 | ScalarFunc::PgTimeSeekKey
-                | ScalarFunc::PgNumericSeekKey => {
+                | ScalarFunc::PgNumericSeekKey
+                | ScalarFunc::NumericSeekKey => {
                     unreachable!("no function name resolves to {srf}")
                 }
                 ScalarFunc::TestUintEncode

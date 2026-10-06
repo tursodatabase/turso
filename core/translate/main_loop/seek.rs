@@ -1,5 +1,5 @@
 use super::*;
-use crate::function::{Func, FuncCtx};
+use crate::function::{Func, FuncCtx, ScalarFunc};
 use crate::functions::seek_key::NoSeekKey;
 use crate::schema::{IndexUse, SeekKeyFunction};
 use crate::translate::plan::BitSet;
@@ -510,28 +510,35 @@ impl<'a, 'plan> SeekEmitter<'a, 'plan> {
                     },
                 });
             }
-            IndexUse::EncodedLiteralEquality => {
-                turso_assert!(is_equality, "an encoded literal can only seek for equality");
+            IndexUse::NumericEquality => {
+                turso_assert!(is_equality, "a numeric key can only seek for equality");
                 let column = &self.table.columns()[index.columns[pos].pos_in_table];
-                let type_def = self
-                    .t_ctx
-                    .resolver
-                    .schema()
-                    .get_type_def(&column.ty_str, self.table.table.is_strict())
-                    .expect("an encoded literal seek needs a custom type")
-                    .clone();
-                let encode = type_def
-                    .encode()
-                    .expect("an encoded literal seek needs an ENCODE");
-                crate::translate::expr::emit_type_expr(
+                let [precision, scale] = column.ty_params.as_slice() else {
+                    unreachable!("a numeric column has a precision and a scale");
+                };
+                let args = self.program.alloc_registers(3);
+                self.program.emit_insn(Insn::Copy {
+                    src_reg: operand_reg,
+                    dst_reg: args,
+                    extra_amount: 0,
+                });
+                translate_expr(
                     self.program,
-                    encode,
-                    operand_reg,
-                    key_reg,
-                    column,
-                    &type_def,
+                    None,
+                    precision,
+                    args + 1,
                     &self.t_ctx.resolver,
                 )?;
+                translate_expr(self.program, None, scale, args + 2, &self.t_ctx.resolver)?;
+                self.program.emit_insn(Insn::Function {
+                    constant_mask: 0,
+                    start_reg: args,
+                    dest: key_reg,
+                    func: FuncCtx {
+                        func: Func::Scalar(ScalarFunc::NumericSeekKey),
+                        arg_count: 3,
+                    },
+                });
             }
             IndexUse::Plain | IndexUse::Unusable => {
                 unreachable!("{index_use:?} never turns an operand into an index key")

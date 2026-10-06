@@ -215,10 +215,13 @@ pub struct Resolver<'a> {
 struct SelfTableScope {
     context: SelfTableContext,
     affinities: Option<Arc<[Affinity]>>,
+    /// The column registers hold the values that the columns show, so the
+    /// operators of the column types apply as for a column of a table.
+    columns_are_decoded: bool,
 }
 
 impl SelfTableScope {
-    fn new(context: SelfTableContext) -> Self {
+    fn new(context: SelfTableContext, columns_are_decoded: bool) -> Self {
         let affinities = match &context {
             SelfTableContext::ForDML { table, .. } => {
                 Some(table.columns().iter().map(|c| c.affinity()).collect())
@@ -235,6 +238,7 @@ impl SelfTableScope {
         Self {
             context,
             affinities,
+            columns_are_decoded,
         }
     }
 
@@ -404,14 +408,45 @@ impl<'a> Resolver<'a> {
         f: impl FnOnce(&mut ProgramBuilder, Option<&SelfTableContext>) -> Result<T>,
     ) -> Result<T> {
         match ctx {
-            Some(ctx) => {
-                let scope = SelfTableScope::new(ctx.clone());
-                let prev = self.self_table_scope.borrow_mut().replace(scope);
-                let result = f(program, Some(ctx));
-                *self.self_table_scope.borrow_mut() = prev;
-                result
-            }
+            Some(ctx) => self.with_self_table_scope(program, ctx, false, f),
             None => f(program, None),
+        }
+    }
+
+    /// [Resolver::with_self_table_context] for column registers that hold the
+    /// values that the columns show, as in the expressions and WHERE clauses
+    /// of indexes.
+    pub(crate) fn with_decoded_self_table_context<T>(
+        &self,
+        program: &mut ProgramBuilder,
+        ctx: &SelfTableContext,
+        f: impl FnOnce(&mut ProgramBuilder, Option<&SelfTableContext>) -> Result<T>,
+    ) -> Result<T> {
+        self.with_self_table_scope(program, ctx, true, f)
+    }
+
+    fn with_self_table_scope<T>(
+        &self,
+        program: &mut ProgramBuilder,
+        ctx: &SelfTableContext,
+        columns_are_decoded: bool,
+        f: impl FnOnce(&mut ProgramBuilder, Option<&SelfTableContext>) -> Result<T>,
+    ) -> Result<T> {
+        let scope = SelfTableScope::new(ctx.clone(), columns_are_decoded);
+        let prev = self.self_table_scope.borrow_mut().replace(scope);
+        let result = f(program, Some(ctx));
+        *self.self_table_scope.borrow_mut() = prev;
+        result
+    }
+
+    /// The table of the current DML self-table scope when its column
+    /// registers hold the values that the columns show.
+    pub(crate) fn decoded_self_table(&self) -> Option<Arc<BTreeTable>> {
+        let scope = self.self_table_scope.borrow();
+        let scope = scope.as_ref().filter(|scope| scope.columns_are_decoded)?;
+        match &scope.context {
+            SelfTableContext::ForDML { table, .. } => Some(Arc::clone(table)),
+            SelfTableContext::ForSelect { .. } => None,
         }
     }
 
@@ -2172,6 +2207,7 @@ fn emit_index_column_value_new_image(
             program,
             resolver,
             expr,
+            crate::translate::expr::IndexExprKind::of(idx_col),
             columns,
             &mut column_regs,
             table,

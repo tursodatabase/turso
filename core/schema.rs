@@ -229,7 +229,7 @@ pub enum TypeDefKind {
 pub(crate) enum IndexUse {
     Plain,
     KeyFunction(SeekKeyFunction),
-    EncodedLiteralEquality,
+    NumericEquality,
     Unusable,
 }
 
@@ -2878,7 +2878,7 @@ fn resolved_type_index_use(resolved: &ResolvedType, collation: CollationSeq) -> 
         if declares_comparison_function(td) {
             let leaf = resolved.leaf();
             return if leaf.is_builtin && leaf.name == "numeric" {
-                IndexUse::EncodedLiteralEquality
+                IndexUse::NumericEquality
             } else {
                 IndexUse::Unusable
             };

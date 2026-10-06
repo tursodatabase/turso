@@ -6,9 +6,8 @@ use crate::{
     translate::{
         collate::{get_collseq_from_expr, resolve_comparison_collseq, CollationSeq},
         expr::{
-            as_binary_components, comparison_calls_type_function,
-            equality_calls_type_function_with_encoded_literal, get_expr_affinity, truth_test_rhs,
-            unwrap_parens, walk_expr, walk_expr_mut, WalkControl,
+            as_binary_components, comparison_calls_type_function, get_expr_affinity,
+            truth_test_rhs, unwrap_parens, walk_expr, walk_expr_mut, WalkControl,
         },
         expression_index::normalize_expr_for_index_matching,
         plan::{
@@ -857,7 +856,13 @@ pub fn constraints_from_where_clause(
                                 is_rowid: true,
                                 comparison_affinity: cmp_aff,
                                 null_matching: null_matching(rhs),
-                                index_use: IndexUse::Plain,
+                                index_use: plain_index_use(
+                                    operator.as_ast_operator(),
+                                    lhs,
+                                    rhs,
+                                    table_references,
+                                    schema,
+                                ),
                             });
                         }
                     }
@@ -968,7 +973,13 @@ pub fn constraints_from_where_clause(
                                 is_rowid: true,
                                 comparison_affinity: cmp_aff,
                                 null_matching: null_matching(lhs),
-                                index_use: IndexUse::Plain,
+                                index_use: plain_index_use(
+                                    operator.as_ast_operator(),
+                                    lhs,
+                                    rhs,
+                                    table_references,
+                                    schema,
+                                ),
                             });
                         }
                     }
@@ -1245,8 +1256,9 @@ pub fn constraints_from_where_clause(
                 _ => {}
             }
 
-            if constraint.is_rowid
-                || rowid_alias_column.is_some_and(|p| constraint.table_col_pos == Some(p))
+            if constraint.index_use != IndexUse::Unusable
+                && (constraint.is_rowid
+                    || rowid_alias_column.is_some_and(|p| constraint.table_col_pos == Some(p)))
             {
                 let rowid_candidate = cs
                     .candidates
@@ -1367,7 +1379,7 @@ fn column_constraint_index_use(
 ) -> IndexUse {
     let operator = operator.as_ast_operator();
     match schema.column_index_use(column, table_reference.table.is_strict()) {
-        IndexUse::Plain => IndexUse::Plain,
+        IndexUse::Plain => plain_index_use(operator, lhs, rhs, table_references, schema),
         IndexUse::KeyFunction(SeekKeyFunction::PgNumeric)
             if !operator.as_ref().is_some_and(|operator| {
                 comparison_calls_type_function(lhs, rhs, operator, Some(table_references), schema)
@@ -1389,18 +1401,38 @@ fn column_constraint_index_use(
         {
             IndexUse::KeyFunction(function)
         }
-        IndexUse::EncodedLiteralEquality
+        IndexUse::NumericEquality
             if operator == Some(ast::Operator::Equals)
-                && equality_calls_type_function_with_encoded_literal(
+                && comparison_calls_type_function(
                     lhs,
                     rhs,
+                    &ast::Operator::Equals,
                     Some(table_references),
                     schema,
                 ) =>
         {
-            IndexUse::EncodedLiteralEquality
+            IndexUse::NumericEquality
         }
         _ => IndexUse::Unusable,
+    }
+}
+
+/// A seek on a plain column compares the stored value with the standard
+/// comparison. A comparison with a decimal calls the decimal function of
+/// the other operand instead, so the seek can find other rows: refuse it.
+fn plain_index_use(
+    operator: Option<ast::Operator>,
+    lhs: &ast::Expr,
+    rhs: &ast::Expr,
+    table_references: &TableReferences,
+    schema: &Schema,
+) -> IndexUse {
+    if operator.is_some_and(|operator| {
+        comparison_calls_type_function(lhs, rhs, &operator, Some(table_references), schema)
+    }) {
+        IndexUse::Unusable
+    } else {
+        IndexUse::Plain
     }
 }
 

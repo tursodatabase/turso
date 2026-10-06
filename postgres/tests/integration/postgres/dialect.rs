@@ -1,4 +1,4 @@
-use crate::common::TempDatabase;
+use crate::common::{rows, TempDatabase};
 use turso_core::{Numeric, StepResult, Value};
 
 #[turso_macros::test(mvcc)]
@@ -3610,6 +3610,62 @@ fn test_postgres_numeric_equality_with_bound_parameter_same_rows_with_and_withou
              column as a number, and each parameter finds its row as in PostgreSQL"
         );
     }
+}
+
+/// numeric(18,2) holds 18 digits, more than a float keeps. A quoted literal
+/// and a text parameter keep every digit, and a comparison reads the
+/// parameter as a decimal, with and without an index. A negative quoted
+/// literal and an expression compare as decimals too.
+#[turso_macros::test(mvcc)]
+fn test_postgres_numeric_keeps_eighteen_digits(db: TempDatabase) {
+    let conn = db.connect_postgres();
+    conn.execute("CREATE TABLE big (id int PRIMARY KEY, n numeric(18,2))")
+        .unwrap();
+    conn.execute("CREATE INDEX big_n ON big (n)").unwrap();
+    conn.execute("CREATE TABLE big_plain (id int PRIMARY KEY, n numeric(18,2))")
+        .unwrap();
+    for table in ["big", "big_plain"] {
+        conn.execute(format!(
+            "INSERT INTO {table} VALUES (1, '1234567890123456.78'), (2, '1234567890123456.77'), \
+             (3, '-1234567890123456.78')"
+        ))
+        .unwrap();
+    }
+    assert_eq!(
+        rows(&conn, "SELECT n FROM big ORDER BY id"),
+        [
+            "1234567890123456.78",
+            "1234567890123456.77",
+            "-1234567890123456.78"
+        ]
+    );
+    for (condition, param, expected) in [
+        ("n = $1", "1234567890123456.78", vec![1]),
+        ("n > $1", "1234567890123456.77", vec![1]),
+        ("n <= $1", "1234567890123456.77", vec![2, 3]),
+        ("n = $1", "1234567890123456.7", vec![]),
+        ("n < $1", "-1234567890123456.77", vec![3]),
+    ] {
+        for table in ["big", "big_plain"] {
+            let ids = rows_with_param(
+                &conn,
+                &format!("SELECT id FROM {table} WHERE {condition} ORDER BY id"),
+                Value::from_text(param.to_owned()),
+            );
+            let expected: Vec<Vec<Value>> = expected
+                .iter()
+                .map(|id| vec![Value::from_i64(*id)])
+                .collect();
+            assert_eq!(ids, expected, "{table}: {condition} with {param}");
+        }
+    }
+    assert_eq!(
+        rows(
+            &conn,
+            "SELECT id FROM big WHERE n > '-1234567890123456.78' AND n * 1 < '1234567890123456.78' ORDER BY id"
+        ),
+        ["2"]
+    );
 }
 
 /// Run `sql` with `$1` bound to `param` and return all rows.

@@ -647,3 +647,196 @@ expect {
     1|a
     2|b
 }
+
+@requires custom_types "uses CREATE DOMAIN"
+@requires strict "uses STRICT tables"
+test domain-over-a-pg-type-expression-and-partial-index-keep-their-keys {
+    CREATE DOMAIN recent AS pg_timestamp CHECK (value > '2020-01-01');
+    CREATE TABLE d(id pg_int4 PRIMARY KEY, ts recent) STRICT, PGSTORAGE;
+    INSERT INTO d VALUES (1, '2024-01-01 10:00');
+    CREATE INDEX d_day ON d(pg_date(ts));
+    CREATE INDEX d_late ON d(id) WHERE ts > '2024-06-01';
+    INSERT INTO d VALUES (2, '2024-07-01 10:00'), (3, '2024-08-01');
+    PRAGMA integrity_check;
+    DELETE FROM d WHERE id = 2;
+    UPDATE d SET ts = '2025-01-01' WHERE id = 3;
+    PRAGMA integrity_check;
+    SELECT id, pg_date(ts) FROM d ORDER BY id;
+    SELECT id FROM d WHERE ts > '2024-06-01';
+}
+expect {
+    ok
+    ok
+    1|2024-01-01
+    3|2025-01-01
+    3
+}
+
+@requires strict "uses STRICT tables"
+@setup amounts
+test numeric-compares-other-operands-as-values-with-and-without-index {
+    SELECT group_concat(id) FROM (SELECT id FROM pa WHERE n > -1 ORDER BY id);
+    SELECT group_concat(id) FROM (SELECT id FROM pa NOT INDEXED WHERE n > -1 ORDER BY id);
+    SELECT group_concat(id) FROM (SELECT id FROM pa WHERE n = abs(-12.5) ORDER BY id);
+    SELECT group_concat(id) FROM (SELECT id FROM pa NOT INDEXED WHERE n = abs(-12.5) ORDER BY id);
+    SELECT group_concat(id) FROM (SELECT id FROM pa WHERE n * 2 > 25 ORDER BY id);
+    SELECT group_concat(id) FROM (SELECT id FROM pa WHERE -1 < n ORDER BY id);
+    SELECT group_concat(id) FROM (SELECT id FROM pa WHERE n = 0.1 + 0.9 + 11.5 ORDER BY id);
+}
+expect {
+    1,2,3,4
+    1,2,3,4
+    1
+    1
+    4
+    1,2,3,4
+    1
+}
+
+@requires strict "uses STRICT tables"
+test numeric-compares-columns-of-other-number-types-as-values {
+    CREATE TABLE big(id pg_int4 PRIMARY KEY, n pg_numeric(18,2), i pg_int8, r REAL, t TEXT) STRICT, PGSTORAGE;
+    INSERT INTO big VALUES (1, '9007199254740993.00', 9007199254740993, 0.1, '9007199254740993'), (2, 0.1, 9007199254740992, 0.1, 'x');
+    SELECT group_concat(id) FROM (SELECT id FROM big WHERE n = i ORDER BY id);
+    SELECT group_concat(id) FROM (SELECT id FROM big WHERE n = r ORDER BY id);
+    SELECT group_concat(id) FROM (SELECT id FROM big WHERE n > i ORDER BY id);
+    SELECT group_concat(id) FROM (SELECT id FROM big WHERE t = n ORDER BY id);
+    CREATE TABLE other(i pg_int8, r REAL);
+    INSERT INTO other VALUES (9007199254740993, 0.1);
+    CREATE INDEX big_n ON big(n);
+    SELECT group_concat(big.id) FROM other JOIN big ON big.n = other.i;
+    SELECT group_concat(big.id) FROM other JOIN big NOT INDEXED ON big.n = other.i;
+    SELECT group_concat(big.id) FROM other JOIN big ON big.n = other.r;
+    SELECT group_concat(big.id) FROM other JOIN big NOT INDEXED ON big.n = other.r;
+}
+expect {
+    1
+    2
+    
+    
+    1
+    1
+    2
+    2
+}
+
+@requires strict "uses STRICT tables"
+test numeric-arithmetic-with-columns-and-expressions-gives-decimals {
+    CREATE TABLE ar(id pg_int4 PRIMARY KEY, price pg_numeric(10,2), qty pg_int4) STRICT, PGSTORAGE;
+    INSERT INTO ar VALUES (1, 12.5, 3);
+    SELECT price * qty, price + abs(-1), price - (qty * 2), typeof(price * qty) FROM ar;
+}
+expect {
+    37.50|13.50|6.50|text
+}
+
+@requires strict "uses STRICT tables"
+test v1-numeric-compares-literals-as-values-with-and-without-index {
+    CREATE TABLE p(id INTEGER PRIMARY KEY, n numeric(10,2)) STRICT;
+    INSERT INTO p VALUES (1, 1.00), (2, -1.5), (3, 12.5);
+    CREATE INDEX p_n ON p(n);
+    SELECT count(*) FROM p WHERE n = 1.005;
+    SELECT count(*) FROM p NOT INDEXED WHERE n = 1.005;
+    SELECT count(*) FROM p WHERE n < 1e12;
+    SELECT count(*) FROM p NOT INDEXED WHERE n < 1e12;
+    SELECT group_concat(id) FROM (SELECT id FROM p WHERE n = -1.5 ORDER BY id);
+    SELECT group_concat(id) FROM (SELECT id FROM p NOT INDEXED WHERE n = -1.5 ORDER BY id);
+    SELECT group_concat(id) FROM (SELECT id FROM p WHERE n > -2 ORDER BY id);
+    SELECT group_concat(id) FROM (SELECT id FROM p WHERE n = 12.50 ORDER BY id);
+    SELECT n * 2 FROM p WHERE id = 3;
+    EXPLAIN QUERY PLAN SELECT id FROM p WHERE n = 12.5;
+}
+expect {
+    0
+    0
+    3
+    3
+    2
+    2
+    1,2,3
+    3
+    25.0000
+    1|0|0|SEARCH p USING COVERING INDEX p_n (n=?)
+}
+
+@requires strict "uses STRICT tables"
+test v1-numeric-invalid-text-raises-with-and-without-index {
+    CREATE TABLE p(id INTEGER PRIMARY KEY, n numeric(10,2)) STRICT;
+    INSERT INTO p VALUES (1, 1);
+    CREATE INDEX p_n ON p(n);
+    SELECT count(*) FROM p WHERE n = '1.5abc';
+}
+expect error {
+    invalid numeric value: "1.5abc"
+}
+
+@requires strict "uses STRICT tables"
+test numeric-expression-index-gives-the-same-keys-to-insert-and-create-index {
+    CREATE TABLE x(id pg_int4 PRIMARY KEY, val pg_numeric(10,2), qty pg_int4) STRICT, PGSTORAGE;
+    INSERT INTO x VALUES (1, 10, 2);
+    CREATE INDEX x_double ON x((val * 2));
+    CREATE INDEX x_total ON x((val * qty));
+    CREATE INDEX x_big ON x(id) WHERE val > 15;
+    INSERT INTO x VALUES (2, 20, 3), (3, 12, 1);
+    PRAGMA integrity_check;
+    UPDATE x SET val = val + 1;
+    DELETE FROM x WHERE id = 2;
+    PRAGMA integrity_check;
+    SELECT id FROM x WHERE val * 2 = 22;
+    SELECT id FROM x WHERE val > 15;
+}
+expect {
+    ok
+    ok
+    1
+}
+
+@requires strict "uses STRICT tables"
+test numeric-generated-column-index-gives-the-same-keys-to-insert-and-create-index {
+    CREATE TABLE g(id INTEGER PRIMARY KEY, price numeric(10,2), dbl TEXT GENERATED ALWAYS AS (price * 2) VIRTUAL, big INTEGER GENERATED ALWAYS AS (price > 15) VIRTUAL) STRICT;
+    CREATE TABLE pg(id pg_int4 PRIMARY KEY, price pg_numeric(10,2), dbl TEXT GENERATED ALWAYS AS (price * 2) VIRTUAL) STRICT, PGSTORAGE;
+    INSERT INTO g (id, price) VALUES (1, 12.5);
+    INSERT INTO pg (id, price) VALUES (1, 12.5);
+    CREATE INDEX g_dbl ON g(dbl);
+    CREATE INDEX g_big ON g(big);
+    CREATE INDEX pg_dbl ON pg(dbl);
+    INSERT INTO g (id, price) VALUES (2, 20);
+    INSERT INTO pg (id, price) VALUES (2, 20);
+    UPDATE g SET price = 3 WHERE id = 1;
+    UPDATE pg SET price = 3 WHERE id = 1;
+    PRAGMA integrity_check;
+    SELECT id, dbl FROM g ORDER BY id;
+    SELECT id, dbl FROM pg ORDER BY id;
+    DELETE FROM g;
+    DELETE FROM pg;
+    PRAGMA integrity_check;
+}
+expect {
+    ok
+    1|6.0
+    2|40.0
+    1|6.0
+    2|40.0
+    ok
+}
+
+@requires strict "uses STRICT tables"
+test v1-numeric-expression-index-gives-the-same-keys-to-insert-and-create-index {
+    CREATE TABLE x(id INTEGER PRIMARY KEY, val numeric(10,2)) STRICT;
+    INSERT INTO x VALUES (1, 10);
+    CREATE INDEX x_double ON x((val * 2));
+    CREATE INDEX x_big ON x(id) WHERE val > 5;
+    INSERT INTO x VALUES (2, 20), (3, 4);
+    PRAGMA integrity_check;
+    SELECT id, val * 2 FROM x INDEXED BY x_double WHERE val * 2 > 0 ORDER BY id;
+    DELETE FROM x WHERE id IN (2, 3);
+    UPDATE x SET val = 11;
+    PRAGMA integrity_check;
+}
+expect {
+    ok
+    1|20.0000
+    2|40.0000
+    3|8.0000
+    ok
+}

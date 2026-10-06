@@ -194,3 +194,23 @@ test bigint-primary-key-update-to-null-is-refused {
     UPDATE k SET id = NULL;
 }
 expect error {}
+
+@setup amounts
+test numeric-compares-negative-literals-and-expressions {
+    SELECT id FROM price WHERE amount > -1 ORDER BY id;
+    SELECT id FROM price_plain WHERE amount > -1 ORDER BY id;
+    SELECT id FROM price WHERE amount * 2 > 25 ORDER BY id;
+    SELECT id, amount * big FROM price WHERE id = 5;
+}
+expect {
+    1
+    2
+    3
+    4
+    1
+    2
+    3
+    4
+    4
+    5|-84.00
+}

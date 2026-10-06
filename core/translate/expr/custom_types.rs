@@ -129,25 +129,40 @@ pub(super) fn expr_custom_type_info(
     expr: &ast::Expr,
     referenced_tables: Option<&TableReferences>,
     schema: &Schema,
+    decoded_self_table: Option<&BTreeTable>,
 ) -> Option<ExprCustomTypeInfo> {
-    if let ast::Expr::Column {
+    let (col, is_strict) = operand_column(expr, referenced_tables, decoded_self_table)?;
+    let type_name = &col.ty_str;
+    let type_def = schema.get_type_def(type_name, is_strict)?;
+    Some(ExprCustomTypeInfo {
+        type_name: type_name.to_lowercase(),
+        column: col.clone(),
+        type_def: Arc::clone(type_def),
+    })
+}
+
+/// The table column that an `Expr::Column` reads, and whether its table is
+/// STRICT. A column of the self table resolves only when its register holds
+/// the value that the column shows.
+fn operand_column<'a>(
+    expr: &ast::Expr,
+    referenced_tables: Option<&'a TableReferences>,
+    decoded_self_table: Option<&'a BTreeTable>,
+) -> Option<(&'a Column, bool)> {
+    let ast::Expr::Column {
         table: table_ref_id,
         column,
         ..
     } = expr
-    {
-        let tables = referenced_tables?;
-        let (_, table) = tables.find_table_by_internal_id(*table_ref_id)?;
-        let col = table.get_column_at(*column)?;
-        let type_name = &col.ty_str;
-        let type_def = schema.get_type_def(type_name, table.is_strict())?;
-        return Some(ExprCustomTypeInfo {
-            type_name: type_name.to_lowercase(),
-            column: col.clone(),
-            type_def: Arc::clone(type_def),
-        });
+    else {
+        return None;
+    };
+    if table_ref_id.is_self_table() {
+        let table = decoded_self_table?;
+        return Some((table.columns().get(*column)?, table.is_strict));
     }
-    None
+    let (_, table) = referenced_tables?.find_table_by_internal_id(*table_ref_id)?;
+    Some((table.get_column_at(*column)?, table.is_strict()))
 }
 
 /// Get the effective type name of a literal expression.
@@ -212,17 +227,7 @@ pub(crate) fn comparison_calls_type_function(
     referenced_tables: Option<&TableReferences>,
     schema: &Schema,
 ) -> bool {
-    find_custom_type_operator(e1, e2, op, referenced_tables, schema).is_some()
-}
-
-pub(crate) fn equality_calls_type_function_with_encoded_literal(
-    e1: &ast::Expr,
-    e2: &ast::Expr,
-    referenced_tables: Option<&TableReferences>,
-    schema: &Schema,
-) -> bool {
-    find_custom_type_operator(e1, e2, &ast::Operator::Equals, referenced_tables, schema)
-        .is_some_and(|resolved| resolved.encode_info.is_some())
+    find_custom_type_operator(e1, e2, op, referenced_tables, schema, None).is_some()
 }
 
 /// Find a custom type operator function for a binary expression.
@@ -230,113 +235,252 @@ pub(crate) fn equality_calls_type_function_with_encoded_literal(
 /// Operators fire when:
 /// 1. Both operands are columns of the same custom type, OR
 /// 2. One operand is a custom type column and the other is a literal whose type
-///    is compatible with the custom type's `value` input type.
+///    is compatible with the custom type's `value` input type, OR
+/// 3. One operand is a decimal: a column of `numeric` or `pg_numeric`, or
+///    the result of their arithmetic. The decimal operator functions read the
+///    other operand as the value that the user wrote: a literal, a negative
+///    literal, a parameter, an expression, a column whose affinity stores
+///    numbers, or a column of another built-in integer or decimal type.
+///    Arithmetic of `numeric` keeps rule 2: stored expression indexes depend
+///    on it.
 ///
 /// When case 2 applies, the literal is encoded before being passed to the operator
-/// function so both arguments are in the same (encoded) representation.
+/// function so both arguments are in the same (encoded) representation. The
+/// built-in types of the PostgreSQL frontend and the comparisons of `numeric`
+/// read the literal as the user wrote it.
 pub(super) fn find_custom_type_operator(
     e1: &ast::Expr,
     e2: &ast::Expr,
     op: &ast::Operator,
     referenced_tables: Option<&TableReferences>,
     schema: &Schema,
+    decoded_self_table: Option<&BTreeTable>,
 ) -> Option<ResolvedOperator> {
     let op_str = operator_to_str(op)?;
-    let lhs_info = expr_custom_type_info(e1, referenced_tables, schema);
-    let rhs_info = expr_custom_type_info(e2, referenced_tables, schema);
+    let lhs_info = expr_custom_type_info(e1, referenced_tables, schema, decoded_self_table);
+    let rhs_info = expr_custom_type_info(e2, referenced_tables, schema, decoded_self_table);
 
-    // Try to find a direct or derived operator match on a type definition.
-    let find_in_type_def = |type_def: &TypeDef| -> Option<(String, bool, bool)> {
-        // Direct match: just check op symbol (no right_type constraint)
-        for op_def in type_def.operators() {
-            if op_def.op == op_str {
-                // Naked operator (func_name = None): fall through to standard comparison
-                let func_name = op_def.func_name.as_ref()?;
-                return Some((func_name.clone(), false, false));
+    let operator_of = |type_def: &TypeDef, encode_info: Option<OperatorEncodeInfo>| {
+        find_operator_function(type_def, op_str, op).map(|(func_name, swap_args, negate)| {
+            ResolvedOperator {
+                func_name,
+                swap_args,
+                negate,
+                encode_info,
             }
-        }
-
-        // Derive missing operators from < and =
-        let find_op = |sym: &str| -> Option<String> {
-            type_def
-                .operators()
-                .iter()
-                .find(|o| o.op == sym)
-                .and_then(|o| o.func_name.clone())
-        };
-
-        match *op {
-            // a > b  →  lt(b, a)
-            ast::Operator::Greater => find_op("<").map(|f| (f, true, false)),
-            // a >= b  →  NOT lt(a, b)
-            ast::Operator::GreaterEquals => find_op("<").map(|f| (f, false, true)),
-            // a <= b  →  NOT lt(b, a)
-            ast::Operator::LessEquals => find_op("<").map(|f| (f, true, true)),
-            // a != b  →  NOT eq(a, b)
-            ast::Operator::NotEquals => find_op("=").map(|f| (f, false, true)),
-            _ => None,
-        }
+        })
     };
 
     // Case 1: Both operands are custom type columns of the SAME type.
     if let (Some(ref lhs), Some(ref rhs)) = (&lhs_info, &rhs_info) {
         if lhs.type_name == rhs.type_name {
-            if let Some((func_name, swap_args, negate)) = find_in_type_def(&lhs.type_def) {
-                return Some(ResolvedOperator {
-                    func_name,
-                    swap_args,
-                    negate,
-                    encode_info: None,
-                });
-            }
+            return operator_of(&lhs.type_def, None);
+        }
+        // A decimal reads a column of another number type as a user value.
+        if reads_user_value(&lhs.type_def, op) && is_number_type(&rhs.type_def) {
+            return operator_of(&lhs.type_def, None);
+        }
+        if reads_user_value(&rhs.type_def, op) && is_number_type(&lhs.type_def) {
+            return operator_of(&rhs.type_def, None);
         }
         // Different custom types: fall through to standard operator.
         return None;
     }
 
-    // Case 2: LHS is custom type, RHS is a compatible literal.
-    if let Some(ref lhs) = lhs_info {
-        if let Some(lit_type) = literal_type_name(e2) {
-            if literal_compatible_with_value_type(lit_type, lhs.type_def.value_input_type()) {
-                if let Some((func_name, swap_args, negate)) = find_in_type_def(&lhs.type_def) {
-                    return Some(ResolvedOperator {
-                        func_name,
-                        swap_args,
-                        negate,
-                        encode_info: literal_encode_info(lhs, EncodeArg::Second),
-                    });
+    // Case 2: One operand is a custom type column, the other a compatible literal.
+    for (column, other, which) in [
+        (&lhs_info, e2, EncodeArg::Second),
+        (&rhs_info, e1, EncodeArg::First),
+    ] {
+        let Some(column) = column else {
+            continue;
+        };
+        if let Some(lit_type) = literal_type_name(other) {
+            if literal_compatible_with_value_type(lit_type, column.type_def.value_input_type()) {
+                let encode_info = literal_encode_info(column, which, op);
+                if let Some(resolved) = operator_of(&column.type_def, encode_info) {
+                    return Some(resolved);
                 }
             }
         }
+        // Case 3: a decimal column reads the other operand as a user value.
+        if reads_user_value(&column.type_def, op)
+            && is_user_value(other, referenced_tables, decoded_self_table)
+        {
+            return operator_of(&column.type_def, None);
+        }
     }
 
-    // Case 3: RHS is custom type, LHS is a compatible literal (reversed).
-    if let Some(ref rhs) = rhs_info {
-        if let Some(lit_type) = literal_type_name(e1) {
-            if literal_compatible_with_value_type(lit_type, rhs.type_def.value_input_type()) {
-                if let Some((func_name, swap_args, negate)) = find_in_type_def(&rhs.type_def) {
-                    return Some(ResolvedOperator {
-                        func_name,
-                        swap_args,
-                        negate,
-                        encode_info: literal_encode_info(rhs, EncodeArg::First),
-                    });
-                }
-            }
+    // Case 3: the result of decimal arithmetic compares as a decimal.
+    if is_comparison(op) {
+        let is_decimal = |expr: &ast::Expr| {
+            is_decimal_value(expr, referenced_tables, schema, decoded_self_table)
+        };
+        let is_number = |expr: &ast::Expr, info: &Option<ExprCustomTypeInfo>| match info {
+            Some(info) => is_number_type(&info.type_def),
+            None => is_user_value(expr, referenced_tables, decoded_self_table),
+        };
+        if (is_decimal(e1) && is_number(e2, &rhs_info))
+            || (is_decimal(e2) && is_number(e1, &lhs_info))
+        {
+            let numeric = schema.get_type_def_unchecked("numeric")?;
+            return operator_of(numeric, None);
         }
     }
 
     None
 }
 
+/// The function of `op` in the operators of a type: direct, or derived from
+/// '<' and '='. Returns the function name, whether to swap the arguments,
+/// and whether to negate the result.
+fn find_operator_function(
+    type_def: &TypeDef,
+    op_str: &str,
+    op: &ast::Operator,
+) -> Option<(String, bool, bool)> {
+    // Direct match: just check op symbol (no right_type constraint)
+    for op_def in type_def.operators() {
+        if op_def.op == op_str {
+            // Naked operator (func_name = None): fall through to standard comparison
+            let func_name = op_def.func_name.as_ref()?;
+            return Some((func_name.clone(), false, false));
+        }
+    }
+
+    // Derive missing operators from < and =
+    let find_op = |sym: &str| -> Option<String> {
+        type_def
+            .operators()
+            .iter()
+            .find(|o| o.op == sym)
+            .and_then(|o| o.func_name.clone())
+    };
+
+    match *op {
+        // a > b  →  lt(b, a)
+        ast::Operator::Greater => find_op("<").map(|f| (f, true, false)),
+        // a >= b  →  NOT lt(a, b)
+        ast::Operator::GreaterEquals => find_op("<").map(|f| (f, false, true)),
+        // a <= b  →  NOT lt(b, a)
+        ast::Operator::LessEquals => find_op("<").map(|f| (f, true, true)),
+        // a != b  →  NOT eq(a, b)
+        ast::Operator::NotEquals => find_op("=").map(|f| (f, false, true)),
+        _ => None,
+    }
+}
+
+fn is_comparison(op: &ast::Operator) -> bool {
+    matches!(
+        op,
+        ast::Operator::Less
+            | ast::Operator::LessEquals
+            | ast::Operator::Greater
+            | ast::Operator::GreaterEquals
+            | ast::Operator::Equals
+            | ast::Operator::NotEquals
+    )
+}
+
+/// The built-in decimal types, whose operator functions compare exactly.
+fn is_decimal_type(type_def: &TypeDef) -> bool {
+    type_def.is_builtin && matches!(type_def.name.as_str(), "numeric" | "pg_numeric")
+}
+
+/// The built-in integer and decimal types.
+fn is_number_type(type_def: &TypeDef) -> bool {
+    type_def.is_builtin
+        && matches!(
+            type_def.name.as_str(),
+            "numeric" | "pg_numeric" | "bigint" | "smallint" | "pg_int4" | "pg_int8"
+        )
+}
+
+/// The decimal operator functions read the other operand as a user value:
+/// the comparisons of both decimal types, and the arithmetic of `pg_numeric`.
+fn reads_user_value(type_def: &TypeDef, op: &ast::Operator) -> bool {
+    is_decimal_type(type_def) && (is_comparison(op) || type_def.name == "pg_numeric")
+}
+
+/// An operand that is not a column of a custom type: any expression, or a
+/// column whose affinity stores numbers. A decimal function would raise an
+/// error for the text of a text column, which standard comparison compares.
+fn is_user_value(
+    expr: &ast::Expr,
+    referenced_tables: Option<&TableReferences>,
+    decoded_self_table: Option<&BTreeTable>,
+) -> bool {
+    match expr {
+        ast::Expr::Column { .. } => operand_column(expr, referenced_tables, decoded_self_table)
+            .is_some_and(|(column, _)| {
+                matches!(
+                    column.affinity(),
+                    Affinity::Integer | Affinity::Real | Affinity::Numeric
+                )
+            }),
+        ast::Expr::Id(_)
+        | ast::Expr::Name(_)
+        | ast::Expr::Qualified(..)
+        | ast::Expr::DoublyQualified(..) => false,
+        _ => true,
+    }
+}
+
+/// The value of decimal arithmetic, or of a cast to a decimal type with a
+/// precision and a scale.
+fn is_decimal_value(
+    expr: &ast::Expr,
+    referenced_tables: Option<&TableReferences>,
+    schema: &Schema,
+    decoded_self_table: Option<&BTreeTable>,
+) -> bool {
+    match expr {
+        ast::Expr::Parenthesized(exprs) if exprs.len() == 1 => {
+            is_decimal_value(&exprs[0], referenced_tables, schema, decoded_self_table)
+        }
+        ast::Expr::Binary(lhs, op, rhs)
+            if matches!(
+                op,
+                ast::Operator::Add
+                    | ast::Operator::Subtract
+                    | ast::Operator::Multiply
+                    | ast::Operator::Divide
+            ) =>
+        {
+            find_custom_type_operator(lhs, rhs, op, referenced_tables, schema, decoded_self_table)
+                .is_some_and(|resolved| {
+                    matches!(
+                        resolved.func_name.as_str(),
+                        "numeric_add" | "numeric_sub" | "numeric_mul" | "numeric_div"
+                    )
+                })
+        }
+        ast::Expr::Cast {
+            type_name:
+                Some(ast::Type {
+                    name,
+                    size: Some(ast::TypeSize::TypeSize(..)),
+                    ..
+                }),
+            ..
+        } => schema
+            .get_type_def_unchecked(name)
+            .is_some_and(|type_def| is_decimal_type(type_def)),
+        _ => false,
+    }
+}
+
 /// The operator functions of a built-in type of the PostgreSQL frontend read
 /// the literal as the user wrote it: its ENCODE gives the stored integer, not
-/// a value that the functions can compare with the decoded column.
+/// a value that the functions can compare with the decoded column. The
+/// comparisons of `numeric` read it as the user wrote it too, so that a
+/// literal with more fraction digits than the column does not match.
 fn literal_encode_info(
     column: &ExprCustomTypeInfo,
     which: EncodeArg,
+    op: &ast::Operator,
 ) -> Option<OperatorEncodeInfo> {
-    if column.type_def.is_pg_storage_type() {
+    if column.type_def.is_pg_storage_type() || reads_user_value(&column.type_def, op) {
         return None;
     }
     Some(OperatorEncodeInfo {
@@ -358,10 +502,12 @@ fn literal_encode_info(
 ///
 /// The expression is resolved via `resolve_gencol_expr_columns` and custom-type
 /// columns are decoded in-place in `column_regs`.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn emit_dml_expr_index_value(
     program: &mut ProgramBuilder,
     resolver: &Resolver,
     mut expr: ast::Expr,
+    expr_kind: IndexExprKind,
     columns: &[Column],
     column_regs: &mut [usize],
     table: &Arc<BTreeTable>,
@@ -374,13 +520,15 @@ pub(crate) fn emit_dml_expr_index_value(
         if col.is_rowid_alias() {
             continue;
         }
-        if let Some(type_def) = resolver.schema().get_type_def(&col.ty_str, is_strict) {
-            if type_def.decode().is_some() {
-                let src_reg = column_regs[i];
-                let tmp = program.alloc_register();
-                emit_user_facing_column_value(program, src_reg, tmp, col, is_strict, resolver)?;
-                column_regs[i] = tmp;
-            }
+        let decodes = matches!(
+            resolver.schema().resolve_type(&col.ty_str, is_strict),
+            Ok(Some(resolved)) if resolved.chain.iter().any(|td| td.decode().is_some())
+        );
+        if decodes {
+            let src_reg = column_regs[i];
+            let tmp = program.alloc_register();
+            emit_user_facing_column_value(program, src_reg, tmp, col, is_strict, resolver)?;
+            column_regs[i] = tmp;
         }
     }
 
@@ -389,11 +537,38 @@ pub(crate) fn emit_dml_expr_index_value(
         dml_ctx: DmlColumnContext::from_column_reg_mapping(pairs),
         table: Arc::clone(table),
     };
-    resolver.with_self_table_context(program, Some(&ctx), |program, _| {
+    let translate = |program: &mut ProgramBuilder, _: Option<&SelfTableContext>| {
         translate_expr(program, None, &expr, dest_reg, resolver)?;
         Ok(())
-    })?;
-    Ok(())
+    };
+    match expr_kind {
+        IndexExprKind::Expression => {
+            resolver.with_decoded_self_table_context(program, &ctx, translate)
+        }
+        IndexExprKind::GeneratedColumn => {
+            resolver.with_self_table_context(program, Some(&ctx), translate)
+        }
+    }
+}
+
+/// Where the expression of an index comes from. CREATE INDEX and DELETE
+/// evaluate an index expression and the WHERE of a partial index with the
+/// operators of the column types. A query reads a generated column without
+/// them. INSERT and UPDATE must compute the same keys.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum IndexExprKind {
+    Expression,
+    GeneratedColumn,
+}
+
+impl IndexExprKind {
+    pub(crate) fn of(index_column: &crate::schema::IndexColumn) -> Self {
+        if index_column.pos_in_table == crate::schema::EXPR_INDEX_SENTINEL {
+            Self::Expression
+        } else {
+            Self::GeneratedColumn
+        }
+    }
 }
 
 /// Emit bytecode that transforms a stored column value into its user-facing

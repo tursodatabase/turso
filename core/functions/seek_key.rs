@@ -119,6 +119,35 @@ pub(crate) fn exec_pg_numeric_seek_key(
     Ok(key.map_or(Value::Null, Value::from_i64))
 }
 
+/// The key of an equality seek on the `numeric` type: the stored blob of the
+/// operand when a value of the column can equal it, else NULL. Text that is
+/// not a number raises the error of `numeric_eq`, so the error does not
+/// depend on the plan.
+pub(crate) fn exec_numeric_seek_key(
+    operand: &Value,
+    precision: &Value,
+    scale: &Value,
+) -> Result<Value> {
+    let (Value::Numeric(Numeric::Integer(precision)), Value::Numeric(Numeric::Integer(scale))) =
+        (precision, scale)
+    else {
+        unreachable!("the seek passes the integer precision and scale of the column");
+    };
+    if matches!(operand, Value::Null) {
+        return Ok(Value::Null);
+    }
+    let decimal = value_to_bigdecimal(operand)?;
+    if decimal.with_scale(*scale) != decimal {
+        return Ok(Value::Null);
+    }
+    Ok(
+        match crate::numeric::decimal::validate_precision_scale(&decimal, *precision, *scale) {
+            Ok(stored) => Value::from_blob(crate::numeric::decimal::bigdecimal_to_blob(&stored)),
+            Err(_) => Value::Null,
+        },
+    )
+}
+
 fn seek_bound(no_key: &Value) -> NoSeekKey {
     let Value::Numeric(Numeric::Integer(no_key)) = no_key else {
         unreachable!("the seek passes an integer for the missing key, got {no_key:?}");
@@ -494,6 +523,46 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// The key of an equality seek on a `numeric` column is the stored blob
+    /// of the value that equals the operand, and NULL when no value of the
+    /// column equals it.
+    #[test]
+    fn v1_numeric_seek_key_is_the_blob_of_the_equal_value() {
+        use crate::numeric::decimal::{bigdecimal_to_blob, validate_precision_scale};
+        let mut rng = ChaCha8Rng::seed_from_u64(29);
+        for _ in 0..5_000 {
+            let precision = rng.random_range(1..=18);
+            let scale = rng.random_range(0..=precision);
+            let limit = 10i64.pow(precision as u32) - 1;
+            let near = rng.random_range(-limit..=limit);
+            let operand = numeric_operand(&mut rng, near, scale);
+            let key = exec_numeric_seek_key(
+                &operand,
+                &Value::from_i64(precision),
+                &Value::from_i64(scale),
+            )
+            .unwrap();
+            for stored in [near, near.saturating_add(1).min(limit), -near] {
+                let decimal = bigdecimal::BigDecimal::new(stored.into(), scale);
+                let blob = Value::from_blob(bigdecimal_to_blob(
+                    &validate_precision_scale(&decimal, precision, scale).unwrap(),
+                ));
+                assert_eq!(
+                    key == blob,
+                    decimal == value_to_bigdecimal(&operand).unwrap(),
+                    "{operand:?} and {decimal} at numeric({precision}, {scale})"
+                );
+            }
+        }
+        let err = exec_numeric_seek_key(
+            &Value::build_text("12.5abc"),
+            &Value::from_i64(10),
+            &Value::from_i64(2),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("invalid numeric value"), "{err}");
     }
 
     #[test]

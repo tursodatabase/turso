@@ -93,8 +93,7 @@ pub use columns::{emit_table_column, emit_table_column_for_dml};
 pub use condition::translate_condition_expr;
 pub(crate) use custom_types::{
     comparison_calls_type_function, emit_dml_expr_index_value, emit_trigger_decode_registers,
-    emit_type_expr, emit_user_facing_column_value,
-    equality_calls_type_function_with_encoded_literal,
+    emit_type_expr, emit_user_facing_column_value, IndexExprKind,
 };
 pub use emission::{
     emit_function_call, emit_literal, process_returning_clause, ReturningBufferCtx,

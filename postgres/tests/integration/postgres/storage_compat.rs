@@ -524,6 +524,30 @@ fn user_type_pg_int8_primary_key_of_base_file_is_not_a_rowid_alias() {
     );
 }
 
+/// The base file has an index on numeric arithmetic and a partial index on
+/// a numeric comparison, made after the rows. An INSERT, an UPDATE and a
+/// DELETE compute the keys of these indexes as CREATE INDEX did.
+#[test]
+fn numeric_expression_indexes_of_base_file_keep_their_keys() {
+    let dir = copy_fixtures(&["pg_v1_numeric_expr_index.db"]);
+    let db = open(dir.path().join("pg_v1_numeric_expr_index.db"), false);
+    let conn = db.connect_postgres();
+    conn.execute("DELETE FROM x WHERE id = 1").unwrap();
+    conn.execute("UPDATE x SET val = 21 WHERE id = 2").unwrap();
+    conn.execute("INSERT INTO x VALUES (4, 30), (5, 1)")
+        .unwrap();
+    conn.execute("UPDATE x SET val = 16 WHERE id = 3").unwrap();
+    assert_eq!(core_rows(conn.inner(), "PRAGMA integrity_check"), ["ok"]);
+    assert_eq!(
+        rows(&conn, "SELECT id, val * 2 FROM x ORDER BY id"),
+        ["2|42.0000", "3|32.0000", "4|60.0000", "5|2.00"]
+    );
+    assert_eq!(
+        rows(&conn, "SELECT id FROM x WHERE val > 15 ORDER BY id"),
+        ["2", "3", "4"]
+    );
+}
+
 /// New tables store timestamps, dates, times, numerics and bigints as
 /// integers. Their values equal the values of the base file, also in joins
 /// with and without an index.

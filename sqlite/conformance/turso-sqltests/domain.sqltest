@@ -875,6 +875,32 @@ expect {
 }
 
 @requires custom_types "uses CREATE DOMAIN"
+test domain-over-decoding-type-expression-and-partial-index-keep-their-keys {
+    CREATE TYPE cents BASE integer ENCODE value * 100 DECODE value / 100;
+    CREATE DOMAIN money AS cents;
+    CREATE TABLE m(id INTEGER PRIMARY KEY, a money) STRICT;
+    INSERT INTO m VALUES (1, 5);
+    CREATE INDEX m_double ON m((a * 2));
+    CREATE INDEX m_big ON m(id) WHERE a > 6;
+    INSERT INTO m VALUES (2, 7), (3, 1);
+    PRAGMA integrity_check;
+    SELECT id FROM m WHERE a > 6;
+    SELECT id FROM m INDEXED BY m_double WHERE a * 2 = 14;
+    UPDATE m SET a = 8 WHERE id = 3;
+    DELETE FROM m WHERE id = 2;
+    PRAGMA integrity_check;
+    SELECT id, a FROM m ORDER BY id;
+}
+expect {
+    ok
+    2
+    2
+    ok
+    1|5
+    3|8
+}
+
+@requires custom_types "uses CREATE DOMAIN"
 test domain-group-by {
     CREATE DOMAIN category AS text CHECK (length(value) > 0);
     CREATE TABLE t1(cat category, val integer) STRICT;
