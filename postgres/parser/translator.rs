@@ -336,6 +336,7 @@ impl PostgreSQLTranslator {
                 options: ast::TableOptions {
                     without_rowid_text: None,
                     strict_text: Some("STRICT".to_string()),
+                    pg_storage: false,
                 },
             },
         };

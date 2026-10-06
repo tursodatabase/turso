@@ -1739,6 +1739,10 @@ impl ToTokens for TableOptions {
             s.append(TK_WITHOUT, None)?;
             s.append(TK_ID, Some(rowid.trim_start()))?;
         }
+        if self.pg_storage {
+            separate(s)?;
+            s.append(TK_ID, Some("PGSTORAGE"))?;
+        }
         Ok(())
     }
 }

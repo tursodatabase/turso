@@ -1848,3 +1848,25 @@ test filter-numeric-group-concat {
 expect {
     Alice,Carol
 }
+
+@requires strict "uses STRICT tables"
+test pg-storage-table-option-survives-alter-table {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, n numeric(10,2), gone TEXT) STRICT, PGSTORAGE;
+    INSERT INTO t VALUES (1, 2.5, 'x');
+    ALTER TABLE t ADD COLUMN c TEXT;
+    ALTER TABLE t DROP COLUMN gone;
+    ALTER TABLE t RENAME TO t2;
+    SELECT sql FROM sqlite_schema WHERE name = 't2';
+    SELECT id, n, c FROM t2;
+}
+expect {
+    CREATE TABLE t2 (id INTEGER PRIMARY KEY, n numeric (10, 2), c TEXT) STRICT, PGSTORAGE
+    1|2.50|
+}
+
+test pg-storage-table-must-be-strict {
+    CREATE TABLE t(id INTEGER PRIMARY KEY) PGSTORAGE;
+}
+expect error {
+    PGSTORAGE table t must be STRICT
+}

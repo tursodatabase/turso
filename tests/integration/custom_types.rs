@@ -533,4 +533,114 @@ mod tests {
             );
         }
     }
+
+    fn open_file(
+        path: &std::path::Path,
+        custom_types: bool,
+    ) -> turso_core::Result<std::sync::Arc<turso_core::Database>> {
+        let io: std::sync::Arc<dyn turso_core::IO + Send> =
+            std::sync::Arc::new(turso_core::PlatformIO::new().unwrap());
+        turso_core::Database::open_file_with_flags(
+            io,
+            path.to_str().unwrap(),
+            turso_core::OpenFlags::Create,
+            turso_core::DatabaseOpts::new().with_custom_types(custom_types),
+            None,
+            std::sync::Arc::new(turso_core::SqliteDialect),
+        )
+    }
+
+    fn create_file(path: &std::path::Path, mvcc: bool, sql: &str) {
+        let db = open_file(path, true).unwrap();
+        let conn = db.connect().unwrap();
+        if mvcc {
+            conn.pragma_update("journal_mode", "'mvcc'").unwrap();
+        }
+        conn.execute(sql).unwrap();
+        conn.close().unwrap();
+    }
+
+    #[test]
+    fn test_pg_storage_option_survives_alter_table_and_reopen() {
+        for mvcc in [false, true] {
+            let temp_dir = TempDir::new().unwrap();
+            let path = temp_dir.path().join("pg_storage.db");
+            create_file(
+                &path,
+                mvcc,
+                "CREATE TABLE t(id INTEGER PRIMARY KEY, n numeric(10,2), gone TEXT) STRICT, PGSTORAGE;
+                 INSERT INTO t VALUES (1, 2.5, 'x');
+                 ALTER TABLE t ADD COLUMN c TEXT;
+                 ALTER TABLE t DROP COLUMN gone;
+                 ALTER TABLE t RENAME COLUMN c TO d;
+                 ALTER TABLE t RENAME TO t2;",
+            );
+
+            let db = open_file(&path, true).unwrap();
+            let conn = db.connect().unwrap();
+            let sql: Vec<(String,)> =
+                conn.exec_rows("SELECT sql FROM sqlite_schema WHERE name = 't2'");
+            assert_eq!(
+                sql,
+                vec![(
+                    "CREATE TABLE t2 (id INTEGER PRIMARY KEY, n numeric (10, 2), d TEXT) STRICT, PGSTORAGE"
+                        .to_string(),
+                )],
+                "mvcc={mvcc}"
+            );
+            conn.execute("INSERT INTO t2 VALUES (2, 3, 'y')").unwrap();
+            let rows: Vec<(i64, String, String)> =
+                conn.exec_rows("SELECT id, n, coalesce(d, 'NULL') FROM t2 ORDER BY id");
+            assert_eq!(
+                rows,
+                vec![
+                    (1, "2.50".to_string(), "NULL".to_string()),
+                    (2, "3.00".to_string(), "y".to_string())
+                ],
+                "mvcc={mvcc}"
+            );
+            conn.close().unwrap();
+        }
+    }
+
+    #[test]
+    fn test_open_without_custom_types_refuses_tables_that_need_them() {
+        for mvcc in [false, true] {
+            for (sql, error) in [
+                (
+                    "CREATE TABLE p(id INTEGER PRIMARY KEY, a TEXT) STRICT, PGSTORAGE",
+                    "table p was created by the PostgreSQL frontend",
+                ),
+                (
+                    "CREATE TABLE u(id INTEGER PRIMARY KEY, b uuid) STRICT",
+                    "column u.b has type \"uuid\", which needs custom types",
+                ),
+                (
+                    "CREATE TABLE a(id INTEGER PRIMARY KEY, c INTEGER[]) STRICT",
+                    "column a.c has type \"INTEGER[]\", which needs custom types",
+                ),
+            ] {
+                let temp_dir = TempDir::new().unwrap();
+                let path = temp_dir.path().join("needs_custom_types.db");
+                create_file(&path, mvcc, sql);
+                let Err(err) = open_file(&path, false) else {
+                    panic!("open without custom types must fail: mvcc={mvcc}, {sql}");
+                };
+                assert_that!(err.to_string()).contains(error);
+                open_file(&path, true).unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn test_create_pg_storage_table_needs_custom_types() {
+        let temp_dir = TempDir::new().unwrap();
+        let path = temp_dir.path().join("pg_storage_create.db");
+        let db = open_file(&path, false).unwrap();
+        let conn = db.connect().unwrap();
+        assert_that!(conn.execute("CREATE TABLE p(id INTEGER PRIMARY KEY) STRICT, PGSTORAGE"))
+            .err()
+            .display_string()
+            .contains("PGSTORAGE table p needs custom types");
+    }
 }

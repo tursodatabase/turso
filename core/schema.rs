@@ -785,6 +785,9 @@ pub struct Schema {
     /// Custom type registry, loaded from sqlite_turso_types
     pub type_registry: HashMap<String, Arc<TypeDef>>,
 
+    /// Whether this schema can read tables that need custom types.
+    pub custom_types_enabled: bool,
+
     pub generated_columns_enabled: bool,
     /// Named sequences (CREATE SEQUENCE)
     pub sequences: HashMap<String, Arc<Sequence>>,
@@ -928,6 +931,7 @@ impl Schema {
             broken_views: HashSet::default(),
             dropped_root_pages: HashSet::default(),
             type_registry,
+            custom_types_enabled: enable_custom_types,
             generated_columns_enabled: false,
             sequences: HashMap::default(),
         };
@@ -2011,6 +2015,7 @@ impl Schema {
                 primary_key_columns: vec![],
                 has_rowid: true,
                 is_strict: false,
+                is_pg_storage: false,
                 has_autoincrement: false,
                 foreign_keys: vec![],
                 check_constraints: vec![],
@@ -2176,6 +2181,9 @@ impl Schema {
                             "table '{}' uses generated columns but the generated_columns feature is not enabled",
                             table.name
                         )));
+                    }
+                    if !self.custom_types_enabled {
+                        refuse_table_that_needs_custom_types(&table)?;
                     }
 
                     // Detect sequence-backing tables by name prefix.
@@ -2670,6 +2678,42 @@ impl Schema {
     }
 }
 
+/// Without custom types, the stored values of these tables have no
+/// meaning: refuse them instead of showing raw values and writing values
+/// that no type checked.
+fn refuse_table_that_needs_custom_types(table: &BTreeTable) -> Result<()> {
+    if table.is_pg_storage {
+        return Err(LimboError::ParseError(format!(
+            "table {} was created by the PostgreSQL frontend: open the database with tursopg or enable custom types",
+            table.name
+        )));
+    }
+    if !table.is_strict {
+        return Ok(());
+    }
+    let Some(column) = table
+        .columns()
+        .iter()
+        .find(|column| column.is_array() || !is_strict_primitive_type(&column.ty_str))
+    else {
+        return Ok(());
+    };
+    Err(LimboError::ParseError(format!(
+        "column {}.{} has type \"{}{}\", which needs custom types: enable custom types or open the database with tursopg",
+        table.name,
+        column.name.as_deref().unwrap_or_default(),
+        column.ty_str,
+        if column.is_array() { "[]" } else { "" }
+    )))
+}
+
+pub(crate) fn is_strict_primitive_type(type_name: &str) -> bool {
+    turso_macros::match_ignore_ascii_case!(match type_name.as_bytes() {
+        b"INT" | b"INTEGER" | b"REAL" | b"TEXT" | b"BLOB" | b"ANY" => true,
+        _ => false,
+    })
+}
+
 fn resolved_type_index_use(resolved: &ResolvedType, collation: CollationSeq) -> IndexUse {
     if resolved
         .chain
@@ -2804,6 +2848,7 @@ impl TryClone for BTreeTable {
             columns: self.columns.try_clone()?,
             has_rowid: self.has_rowid,
             is_strict: self.is_strict,
+            is_pg_storage: self.is_pg_storage,
             has_autoincrement: self.has_autoincrement,
             unique_sets: self.unique_sets.try_clone()?,
             foreign_keys: self.foreign_keys.try_clone()?,
@@ -2950,6 +2995,7 @@ impl TryClone for Schema {
             broken_views: self.broken_views.try_clone()?,
             dropped_root_pages: self.dropped_root_pages.try_clone()?,
             type_registry: self.type_registry.try_clone()?,
+            custom_types_enabled: self.custom_types_enabled,
             generated_columns_enabled: self.generated_columns_enabled,
             sequences: self.sequences.try_clone()?,
         })
@@ -3299,6 +3345,8 @@ bitflags! {
         const STRICT            = 0b0000_0010;
         /// Table has an `AUTOINCREMENT` column.
         const HAS_AUTOINCREMENT = 0b0000_0100;
+        /// Table is declared `PGSTORAGE`.
+        const PG_STORAGE        = 0b0000_1000;
     }
 }
 
@@ -3402,6 +3450,9 @@ pub struct BTreeTable {
     columns: Vec<Column>,
     pub has_rowid: bool,
     pub is_strict: bool,
+    /// The table has the `PGSTORAGE` option: a table of the PostgreSQL
+    /// frontend, which needs custom types to be read.
+    pub is_pg_storage: bool,
     pub has_autoincrement: bool,
     pub unique_sets: Vec<UniqueSet>,
     pub foreign_keys: Vec<Arc<ForeignKey>>,
@@ -3468,6 +3519,7 @@ impl BTreeTable {
             columns,
             has_rowid,
             is_strict: characteristics.contains(BTreeCharacteristics::STRICT),
+            is_pg_storage: characteristics.contains(BTreeCharacteristics::PG_STORAGE),
             has_autoincrement: characteristics.contains(BTreeCharacteristics::HAS_AUTOINCREMENT),
             unique_sets,
             foreign_keys,
@@ -3898,6 +3950,10 @@ impl BTreeTable {
             } else {
                 sql.push_str(" WITHOUT ROWID");
             }
+        }
+        if self.is_pg_storage {
+            turso_assert!(self.is_strict, "a PGSTORAGE table is STRICT");
+            sql.push_str(", PGSTORAGE");
         }
 
         sql
@@ -4589,6 +4645,7 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
     let mut check_constraints = vec![];
     let mut cols: Vec<Column> = vec![];
     let is_strict: bool;
+    let is_pg_storage: bool;
     let mut unique_sets_columns: Vec<UniqueSet> = vec![];
     let mut unique_sets_constraints: Vec<UniqueSet> = vec![];
     match body {
@@ -4599,6 +4656,7 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
         } => {
             has_rowid = !options.contains_without_rowid();
             is_strict = options.contains_strict();
+            is_pg_storage = options.pg_storage;
             let column_fk_count = columns
                 .iter()
                 .flat_map(|col| col.constraints.iter())
@@ -5124,6 +5182,7 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
         has_autoincrement,
         columns: cols,
         is_strict,
+        is_pg_storage,
         foreign_keys,
         unique_sets: {
             // If there are any unique sets that have identical column names in the same order (even if they are PRIMARY KEY and UNIQUE and have different sort orders), remove the duplicates.
@@ -5839,6 +5898,7 @@ pub fn sqlite_schema_table() -> Result<BTreeTable> {
         name: "sqlite_schema".to_string(),
         has_rowid: true,
         is_strict: false,
+        is_pg_storage: false,
         has_autoincrement: false,
         primary_key_columns: try_vec![]?,
         columns,
@@ -6971,6 +7031,7 @@ mod tests {
             name: "t1".to_string(),
             has_rowid: true,
             is_strict: false,
+            is_pg_storage: false,
             has_autoincrement: false,
             primary_key_columns: vec![("nonexistent".to_string(), SortOrder::Asc)],
             columns,

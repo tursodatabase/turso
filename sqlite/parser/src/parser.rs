@@ -3518,6 +3518,10 @@ impl<'a> Parser<'a> {
                             options.strict_text = Some(from_bytes(tok.as_bytes()));
                             Ok(())
                         }
+                        b"PGSTORAGE" => {
+                            options.pg_storage = true;
+                            Ok(())
+                        }
                         _ => Err(Error::Custom(format!(
                             "unknown table option: {}",
                             from_bytes(tok.as_bytes())
@@ -3622,6 +3626,12 @@ impl<'a> Parser<'a> {
                             )));
                         }
                     }
+                }
+
+                if options.pg_storage && !options.contains_strict() {
+                    return Err(Error::Custom(format!(
+                        "PGSTORAGE table {tbl_name} must be STRICT"
+                    )));
                 }
 
                 // primary key check
@@ -5478,6 +5488,14 @@ mod tests {
                 "CREATE TABLE t (a INTEGER PRIMARY KEY) WITHOUT ROWID, strict",
                 "strict, WITHOUT ROWID",
             ),
+            (
+                "CREATE TABLE t (a INTEGER PRIMARY KEY) pgstorage, STRICT",
+                "STRICT, PGSTORAGE",
+            ),
+            (
+                "CREATE TABLE t (a INTEGER PRIMARY KEY) PGSTORAGE, WITHOUT ROWID, STRICT",
+                "STRICT, WITHOUT ROWID, PGSTORAGE",
+            ),
         ] {
             let command = Parser::new(sql.as_bytes()).next_cmd().unwrap().unwrap();
             let formatted = command.to_string();
@@ -5491,6 +5509,14 @@ mod tests {
                 .unwrap();
             assert_eq!(parsed.to_string(), formatted);
         }
+    }
+
+    #[test]
+    fn pg_storage_table_must_be_strict() {
+        let err = Parser::new(b"CREATE TABLE t (a INTEGER) PGSTORAGE")
+            .next_cmd()
+            .unwrap_err();
+        assert_eq!(err.to_string(), "PGSTORAGE table t must be STRICT");
     }
 
     #[test]
@@ -11957,7 +11983,7 @@ mod tests {
                                 }
                             },
                         ],
-                        options: TableOptions { without_rowid_text: None, strict_text: Some("STRICT".to_string()) },
+                        options: TableOptions { without_rowid_text: None, strict_text: Some("STRICT".to_string()), pg_storage: false },
                     },
                 })],
             ),
@@ -12016,7 +12042,7 @@ mod tests {
                                 }
                             },
                         ],
-                        options: TableOptions { without_rowid_text: Some("WITHOUT ROWID".to_string()), strict_text: None },
+                        options: TableOptions { without_rowid_text: Some("WITHOUT ROWID".to_string()), strict_text: None, pg_storage: false },
                     },
                 })],
             ),

@@ -787,6 +787,12 @@ fn validate(
         }
 
         let is_strict = options.contains_strict();
+        if options.pg_storage && !conn.experimental_custom_types_enabled() {
+            bail_parse_error!(
+                "PGSTORAGE table {} needs custom types: enable custom types",
+                table_name
+            );
+        }
 
         for c in columns {
             if let Some(ref col_type) = c.col_type {

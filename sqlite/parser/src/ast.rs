@@ -1676,6 +1676,9 @@ pub struct TableOptions {
     pub without_rowid_text: Option<String>,
     /// Original text for STRICT option (e.g., "STRICT", "strict", "StRiCt")
     pub strict_text: Option<String>,
+    /// `PGSTORAGE`: a table of the PostgreSQL frontend. Its column types are
+    /// the built-in PostgreSQL types of Turso, so a reader needs custom types.
+    pub pg_storage: bool,
 }
 
 impl TableOptions {
@@ -1684,6 +1687,7 @@ impl TableOptions {
         Self {
             without_rowid_text: None,
             strict_text: None,
+            pg_storage: false,
         }
     }
 
@@ -1702,6 +1706,7 @@ impl TableOptions {
         match flag {
             TableOptionsFlag::WithoutRowid => self.contains_without_rowid(),
             TableOptionsFlag::Strict => self.contains_strict(),
+            TableOptionsFlag::PgStorage => self.pg_storage,
         }
     }
 }
@@ -1711,6 +1716,7 @@ impl TableOptions {
 pub enum TableOptionsFlag {
     WithoutRowid,
     Strict,
+    PgStorage,
 }
 
 /// Sort orders
