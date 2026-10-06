@@ -21,7 +21,8 @@ info:
   database: ':memory:'
 ---
 QUERY PLAN
-|--SCAN products
+|--MATERIALIZE prices
+|  `--SCAN products
 |--SCAN prices AS p1
 `--CORRELATED SCALAR SUBQUERY 1
    `--SEARCH p2 USING INDEX ephemeral_subquery_t7 (price<?)
