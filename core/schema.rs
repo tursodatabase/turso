@@ -2132,17 +2132,10 @@ impl Schema {
                     };
                     self.add_virtual_table(vtab)?;
                 } else {
-                    let table = dialect.parse_table_sql(sql, root_page)?;
-                    let table_sql_name = match dialect.parse_table_sql_ast(sql)? {
-                        Stmt::CreateTable { tbl_name, .. } => tbl_name.name.to_string(),
-                        other => {
-                            return Err(LimboError::Corrupt(format!(
-                                "sqlite_schema table row {name} has unexpected SQL {sql:?}: parsed as {other:?}"
-                            )));
-                        }
-                    };
+                    let (table, table_sql_name) =
+                        dialect.parse_table_sql_with_name(sql, root_page)?;
                     self.table_sql_names
-                        .insert(normalize_ident(table_name), table_sql_name);
+                        .insert(normalize_ident(table_name), table_sql_name.to_string());
 
                     if table.has_virtual_columns && !self.generated_columns_enabled {
                         return Err(LimboError::ParseError(format!(
@@ -3575,11 +3568,16 @@ impl BTreeTable {
     }
 
     pub fn from_sql(sql: &str, root_page: i64) -> Result<BTreeTable> {
+        Ok(Self::from_sql_with_name(sql, root_page)?.0)
+    }
+
+    pub fn from_sql_with_name(sql: &str, root_page: i64) -> Result<(BTreeTable, ast::Name)> {
         let mut parser = Parser::new(sql.as_bytes());
         let cmd = parser.next_cmd()?;
         match cmd {
             Some(Cmd::Stmt(Stmt::CreateTable { tbl_name, body, .. })) => {
-                Self::from_create_table_ast(&tbl_name, &body, root_page)
+                let table = Self::from_create_table_ast(&tbl_name, &body, root_page)?;
+                Ok((table, tbl_name.name))
             }
             Some(Cmd::Stmt(Stmt::CreateVirtualTable(vtab))) => Err(LimboError::Corrupt(format!(
                 "sqlite_schema root_page must be 0 for virtual table {}, got {root_page}",

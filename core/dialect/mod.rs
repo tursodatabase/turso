@@ -52,6 +52,22 @@ pub trait Dialect: Send + Sync + 'static {
         root_page: i64,
     ) -> crate::Result<crate::schema::BTreeTable>;
 
+    fn parse_table_sql_with_name(
+        &self,
+        sql: &str,
+        root_page: i64,
+    ) -> crate::Result<(crate::schema::BTreeTable, turso_parser::ast::Name)> {
+        let table = self.parse_table_sql(sql, root_page)?;
+        let turso_parser::ast::Stmt::CreateTable { tbl_name, .. } =
+            self.parse_table_sql_ast(sql)?
+        else {
+            return Err(crate::LimboError::Corrupt(format!(
+                "persisted table SQL is not CREATE TABLE: {sql:?}"
+            )));
+        };
+        Ok((table, tbl_name.name))
+    }
+
     /// Decode a storage-backed table's persisted SQL into its `CREATE TABLE`
     /// AST.
     ///
@@ -415,6 +431,39 @@ mod tests {
             path,
             crate::OpenOptions::new(dialect).storage(db_file),
         )
+    }
+
+    #[test]
+    fn sqlite_table_parse_preserves_rendered_name() {
+        for (sql_name, display_name) in [
+            ("MiXeD", "MiXeD"),
+            ("\"New_MiXeD\"", "New_MiXeD"),
+            ("\"A\"\"B\"", "A\"B"),
+            ("[Mixed Name]", "Mixed Name"),
+        ] {
+            let sql = format!("CREATE TABLE {sql_name} (x INTEGER)");
+            let (table, name) = SqliteDialect.parse_table_sql_with_name(&sql, 42).unwrap();
+            assert_eq!(table.name, crate::util::normalize_ident(display_name));
+            assert_eq!(table.root_page, 42);
+            assert_eq!(table.columns().len(), 1);
+            assert_eq!(name.as_str(), display_name);
+            assert_eq!(name.to_string(), sql_name);
+        }
+        assert!(SqliteDialect
+            .parse_table_sql_with_name("CREATE INDEX i ON t (x)", 42)
+            .is_err());
+    }
+
+    #[test]
+    fn default_table_parse_preserves_dialect_behavior_and_rendered_name() {
+        let dialect = TestDialect::default();
+        let (table, name) = dialect
+            .parse_table_sql_with_name("/* test */ CREATE TABLE \"MiXeD\" (x INTEGER)", 42)
+            .unwrap();
+        assert_eq!(dialect.parse_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(table.name, "mixed");
+        assert_eq!(table.root_page, 42);
+        assert_eq!(name.to_string(), "\"MiXeD\"");
     }
 
     #[test]
