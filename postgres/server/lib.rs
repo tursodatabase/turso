@@ -659,6 +659,8 @@ fn command_tag(query: &str, affected_rows: usize) -> Tag {
         Tag::new("CREATE INDEX")
     } else if upper.starts_with("CREATE SCHEMA") {
         Tag::new("CREATE SCHEMA")
+    } else if upper.starts_with("CREATE ROLE") {
+        Tag::new("CREATE ROLE")
     } else if is_create_table_as(&upper) {
         // PostgreSQL reports CREATE TABLE AS completion as `SELECT n` (the
         // rows inserted), except WITH NO DATA which skips the insert and
@@ -902,6 +904,11 @@ mod tests {
         assert!(!is_pg_non_query(
             "SELECT set_config('search_path', '', false)"
         ));
+    }
+
+    #[test]
+    fn create_role_has_its_own_command_tag() {
+        assert_eq!(command_tag("CREATE ROLE alice", 0), Tag::new("CREATE ROLE"));
     }
 
     #[test]

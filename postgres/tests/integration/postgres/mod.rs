@@ -4,6 +4,7 @@ mod dialect;
 mod domain;
 mod functions;
 mod parse_edge_cases;
+mod role;
 mod sequence;
 mod table;
 mod type_aliases;
