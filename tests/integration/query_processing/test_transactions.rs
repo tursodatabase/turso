@@ -2361,3 +2361,58 @@ fn test_concurrent_autoincrement_no_database_busy(tmp_db: TempDatabase) {
         "Two autoincrement inserts got the same rowid"
     );
 }
+
+/// BEGIN IMMEDIATE emits a write Transaction for temp, but must not create the
+/// per-connection temp database just to lock it (SQLite treats it as a no-op
+/// while temp is not open). Creating it costs a temp file and an fsync on
+/// every new connection.
+#[turso_macros::test]
+fn test_begin_immediate_does_not_create_temp_database(tmp_db: TempDatabase) {
+    let conn = tmp_db.connect_limbo();
+    conn.execute("CREATE TABLE t (x)").unwrap();
+    for sql in ["BEGIN IMMEDIATE", "BEGIN EXCLUSIVE"] {
+        conn.execute(sql).unwrap();
+        conn.execute("INSERT INTO t VALUES (1)").unwrap();
+        conn.execute("COMMIT").unwrap();
+    }
+    let dbs: Vec<(i64, String, String)> = conn.exec_rows("PRAGMA database_list");
+    assert!(
+        dbs.iter().all(|(_, name, _)| name != "temp"),
+        "temp database should not be initialized: {dbs:?}"
+    );
+}
+
+/// When BEGIN IMMEDIATE skips the not-yet-created temp database, temp objects
+/// created later in the same transaction must still commit and roll back with it.
+#[turso_macros::test]
+fn test_begin_immediate_lazily_created_temp_follows_transaction(tmp_db: TempDatabase) {
+    let conn = tmp_db.connect_limbo();
+    conn.execute("CREATE TABLE t (x)").unwrap();
+
+    // Temp created inside an IMMEDIATE transaction, then rolled back.
+    conn.execute("BEGIN IMMEDIATE").unwrap();
+    conn.execute("CREATE TEMP TABLE tt (x)").unwrap();
+    conn.execute("INSERT INTO tt VALUES (1)").unwrap();
+    conn.execute("INSERT INTO t VALUES (1)").unwrap();
+    conn.execute("ROLLBACK").unwrap();
+    let rows: Vec<(String,)> =
+        conn.exec_rows("SELECT name FROM temp.sqlite_schema WHERE name = 'tt'");
+    assert!(rows.is_empty(), "temp table survived rollback: {rows:?}");
+    let rows: Vec<(i64,)> = conn.exec_rows("SELECT count(*) FROM t");
+    assert_eq!(rows, vec![(0,)]);
+
+    // Temp created inside an IMMEDIATE transaction, then committed.
+    conn.execute("BEGIN IMMEDIATE").unwrap();
+    conn.execute("CREATE TEMP TABLE tt (x)").unwrap();
+    conn.execute("INSERT INTO tt VALUES (1)").unwrap();
+    conn.execute("COMMIT").unwrap();
+    let rows: Vec<(i64,)> = conn.exec_rows("SELECT x FROM tt");
+    assert_eq!(rows, vec![(1,)]);
+
+    // Temp now exists, so BEGIN IMMEDIATE locks it and a rollback reverts it.
+    conn.execute("BEGIN IMMEDIATE").unwrap();
+    conn.execute("INSERT INTO tt VALUES (2)").unwrap();
+    conn.execute("ROLLBACK").unwrap();
+    let rows: Vec<(i64,)> = conn.exec_rows("SELECT x FROM tt");
+    assert_eq!(rows, vec![(1,)]);
+}
