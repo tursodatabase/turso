@@ -583,3 +583,33 @@ fn user_type_with_built_in_name_of_base_file_hides_the_built_in_type() {
         ["CREATE TABLE n2 (d pg_date) STRICT, PGSTORAGE"]
     );
 }
+
+/// A cast to timestamp gives the text of the new type, with up to six
+/// fraction digits. A timestamp column of the base file keeps three
+/// fraction digits, so a cast with more digits does not find its value.
+#[test]
+fn casts_compare_with_the_text_of_base_file_columns() {
+    let dir = copy_fixtures(&[MAIN]);
+    let db = open(dir.path().join(MAIN), false);
+    let conn = db.connect_postgres();
+    for (sql, expected) in [
+        (
+            "SELECT id FROM all_types WHERE ts = '2024-01-02 03:04:05.678'::timestamp",
+            vec!["1"],
+        ),
+        (
+            "SELECT id FROM all_types WHERE ts = '2024-01-02 03:04:05.678123'::timestamp",
+            vec![],
+        ),
+        (
+            "SELECT id FROM all_types WHERE d = '2024-02-29 10:00'::date",
+            vec!["1"],
+        ),
+        (
+            "SELECT id FROM all_types WHERE tz = '2024-01-02 03:04:05+02'::timestamptz",
+            vec!["1"],
+        ),
+    ] {
+        assert_eq!(rows(&conn, sql), expected, "{sql}");
+    }
+}
