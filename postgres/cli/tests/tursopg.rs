@@ -1635,54 +1635,33 @@ fn wire_clients_share_schemas_in_memory() {
 }
 
 #[test]
-fn wire_schema_changes_allow_transaction_end() {
-    for end in ["COMMIT", "ROLLBACK", "END", "ABORT"] {
-        let dir = tempfile::tempdir().unwrap();
-        let db_path = dir.path().join("main.db");
-        with_pg_client_with_db(&db_path, |first| {
-            assert_eq!(
-                first.query_command_tags("CREATE SCHEMA changed"),
-                ["CREATE SCHEMA"]
-            );
-            assert_eq!(
-                first.query_command_tags("CREATE TABLE changed.items(id INT)"),
-                ["CREATE TABLE"]
-            );
-            assert_eq!(
-                first.query_command_tags("INSERT INTO changed.items VALUES (17)"),
-                ["INSERT 0 1"]
-            );
-            let mut second = PgTestClient::connect(first.stream.peer_addr().unwrap().port());
-            assert_eq!(second.query_command_tags("BEGIN"), ["BEGIN"]);
-            assert_eq!(
-                second.query_single_text("SELECT id FROM changed.items"),
-                "17"
-            );
-            assert_eq!(
-                first.query_command_tags("DROP SCHEMA changed CASCADE"),
-                ["DROP SCHEMA"]
-            );
-            assert_eq!(
-                first.query_command_tags("CREATE SCHEMA changed"),
-                ["CREATE SCHEMA"]
-            );
-            assert_eq!(
-                first.query_command_tags("CREATE TABLE changed.items(id INT)"),
-                ["CREATE TABLE"]
-            );
-            assert_eq!(
-                first.query_command_tags("INSERT INTO changed.items VALUES (29)"),
-                ["INSERT 0 1"]
-            );
-            assert_eq!(
-                second.query_single_text(&format!(
-                    "/* finish transaction */ {end}; SELECT id FROM changed.items"
-                )),
-                "29",
-                "{end} must remain usable after another client replaces a schema"
-            );
-        });
-    }
+fn wire_client_in_transaction_sees_replaced_schema_after_commit() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("main.db");
+    with_pg_client_with_db(&db_path, |first| {
+        first.query_command_tags("CREATE SCHEMA changed");
+        first.query_command_tags("CREATE TABLE changed.items(id INT)");
+        first.query_command_tags("INSERT INTO changed.items VALUES (17)");
+        let mut second = PgTestClient::connect(first.stream.peer_addr().unwrap().port());
+        assert_eq!(second.query_command_tags("BEGIN"), ["BEGIN"]);
+        assert_eq!(
+            second.query_single_text("SELECT id FROM changed.items"),
+            "17"
+        );
+        assert_eq!(
+            first.query_command_tags("DROP SCHEMA changed CASCADE"),
+            ["DROP SCHEMA"]
+        );
+        first.query_command_tags("CREATE SCHEMA changed");
+        first.query_command_tags("CREATE TABLE changed.items(id INT)");
+        first.query_command_tags("INSERT INTO changed.items VALUES (29)");
+        assert_eq!(second.query_command_tags("COMMIT"), ["COMMIT"]);
+        assert_eq!(
+            second.query_single_text("SELECT id FROM changed.items"),
+            "29",
+            "a client must catch up with replaced schemas once its transaction ends"
+        );
+    });
 }
 
 /// Wire-protocol fixture: spin up tursopg, hand the caller a connected

@@ -7319,9 +7319,7 @@ dependencies = [
  "tokio",
  "tracing",
  "turso_core",
- "turso_parser",
  "turso_pg",
- "turso_pg_parser",
 ]
 
 [[package]]

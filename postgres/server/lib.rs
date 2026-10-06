@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 use std::num::NonZero;
 use std::sync::{
-    atomic::{AtomicUsize, Ordering},
+    atomic::{AtomicU64, AtomicUsize, Ordering},
     Arc, Mutex,
 };
 
@@ -54,13 +54,13 @@ impl TursoPgServer {
     }
 
     async fn run_async(&self) -> anyhow::Result<()> {
-        let conn = PgConnection::new(self.db.connect()?);
-        auto_attach_pg_schemas(&conn, &self.db_file);
-        let mut schemas = PgSchemas::default();
-        schemas.update(&conn);
-        conn.close()?;
-        drop(conn);
-        let schemas = Arc::new(Mutex::new(schemas));
+        let schemas = {
+            let conn = PgConnection::new(self.db.connect()?);
+            auto_attach_pg_schemas(&conn, &self.db_file);
+            let paths = attached_schemas(&conn);
+            conn.close()?;
+            Arc::new(Mutex::new(SharedSchemas { version: 1, paths }))
+        };
         let listener = TcpListener::bind(&self.address).await?;
         println!(
             "PostgreSQL server listening on {} (database: {})",
@@ -90,7 +90,7 @@ impl TursoPgServer {
                                         conn,
                                         db_file,
                                         schemas,
-                                        attached_schemas: Mutex::new(BTreeMap::new()),
+                                        schemas_version: AtomicU64::new(0),
                                         query_parser: Arc::new(NoopQueryParser::new()),
                                     }),
                                 });
@@ -157,8 +157,8 @@ pub fn auto_attach_pg_schemas(conn: &PgConnection, db_file: &str) {
 struct TursoPgHandler {
     conn: PgConnection,
     db_file: String,
-    schemas: Arc<Mutex<PgSchemas>>,
-    attached_schemas: Mutex<BTreeMap<String, u64>>,
+    schemas: Arc<Mutex<SharedSchemas>>,
+    schemas_version: AtomicU64,
     query_parser: Arc<NoopQueryParser>,
 }
 
@@ -285,130 +285,101 @@ impl ExtendedQueryHandler for TursoPgHandler {
 
 impl TursoPgHandler {
     fn prepare(&self, sql: &str) -> turso_core::Result<turso_core::Statement> {
-        let parsed = turso_pg_parser::parse(sql).ok();
-        let translated = parsed.as_ref().and_then(|parsed| {
-            turso_pg_parser::translator::PostgreSQLTranslator::new()
-                .translate(parsed)
-                .ok()
-        });
-        if matches!(
-            translated,
-            Some(
-                turso_parser::ast::Stmt::Commit { .. }
-                    | turso_parser::ast::Stmt::Rollback { .. }
-                    | turso_parser::ast::Stmt::Release { .. }
-            )
-        ) {
+        if self.conn.inner().get_auto_commit() {
+            self.attach_schemas_from_other_clients()?;
+        }
+        if !is_schema_change(sql) {
             return self.conn.prepare(sql);
         }
-
-        let mut schemas = self.schemas.lock().unwrap();
-        let mut attached = self.attached_schemas.lock().unwrap();
-        let outdated: Vec<_> = attached
-            .iter()
-            .filter(|(name, generation)| {
-                schemas.schemas.get(*name).map(|(_, current)| current) != Some(*generation)
-            })
-            .map(|(name, _)| name.clone())
-            .collect();
-        if !outdated.is_empty() && !self.conn.inner().get_auto_commit() {
-            return Err(turso_core::LimboError::InvalidArgument(
-                "schema changed in another session; end the transaction before querying again"
-                    .to_string(),
-            ));
-        }
-        for name in outdated {
-            self.conn
-                .inner()
-                .prepare_internal(format!("DETACH \"{}\"", name.replace('"', "\"\"")))?
-                .run_ignore_rows()?;
-            attached.remove(&name);
-        }
-        for (name, (path, generation)) in &schemas.schemas {
-            if !attached.contains_key(name) {
-                self.conn
-                    .inner()
-                    .prepare_internal(format!(
-                        "ATTACH '{}' AS \"{}\"",
-                        path.replace('\'', "''"),
-                        name.replace('"', "\"\"")
-                    ))?
-                    .run_ignore_rows()?;
-                attached.insert(name.clone(), *generation);
-            }
-        }
-
-        let changes_schema = parsed.as_ref().is_some_and(|parsed| {
-            turso_pg_parser::translator::try_extract_create_schema(parsed).is_some()
-                || turso_pg_parser::translator::try_extract_drop_schema(parsed).is_some()
-        });
-        if !changes_schema {
-            drop(attached);
-            drop(schemas);
-            return self.conn.prepare(sql);
-        }
-
+        let before = attached_schemas(&self.conn);
         let result = self.conn.prepare(sql);
-        for path in schemas.update(&self.conn) {
-            self.cleanup_dropped_schema_file(&path);
+        let after = attached_schemas(&self.conn);
+        if before != after {
+            self.publish_schema_change(&before, &after);
         }
-        *attached = schemas
-            .schemas
-            .iter()
-            .map(|(name, (_, generation))| (name.clone(), *generation))
-            .collect();
         result
     }
 
-    fn cleanup_dropped_schema_file(&self, path: &str) {
+    fn attach_schemas_from_other_clients(&self) -> turso_core::Result<()> {
+        let shared = self.schemas.lock().unwrap();
+        if self.schemas_version.load(Ordering::Relaxed) == shared.version {
+            return Ok(());
+        }
+        for name in attached_schemas(&self.conn).keys() {
+            self.run_internal(format!("DETACH \"{}\"", name.replace('"', "\"\"")))?;
+        }
+        for (name, path) in &shared.paths {
+            self.run_internal(format!(
+                "ATTACH '{}' AS \"{}\"",
+                path.replace('\'', "''"),
+                name.replace('"', "\"\"")
+            ))?;
+        }
+        self.schemas_version
+            .store(shared.version, Ordering::Relaxed);
+        Ok(())
+    }
+
+    fn run_internal(&self, sql: String) -> turso_core::Result<()> {
+        self.conn.inner().prepare_internal(sql)?.run_ignore_rows()
+    }
+
+    fn publish_schema_change(
+        &self,
+        before: &BTreeMap<String, String>,
+        after: &BTreeMap<String, String>,
+    ) {
+        let mut shared = self.schemas.lock().unwrap();
+        let was_current = self.schemas_version.load(Ordering::Relaxed) == shared.version;
+        for name in before.keys().filter(|name| !after.contains_key(*name)) {
+            if let Some(path) = shared.paths.remove(name) {
+                self.delete_schema_file(&path);
+            }
+        }
+        for (name, path) in after.iter().filter(|(name, _)| !before.contains_key(*name)) {
+            shared.paths.insert(name.clone(), path.clone());
+        }
+        shared.version += 1;
+        if was_current {
+            self.schemas_version
+                .store(shared.version, Ordering::Relaxed);
+        }
+    }
+
+    fn delete_schema_file(&self, path: &str) {
         if self.db_file == ":memory:" {
             return;
         }
         let schema_file = std::path::Path::new(path);
-        if schema_file.exists() {
-            if let Err(e) = std::fs::remove_file(schema_file) {
-                tracing::warn!("Failed to delete schema file {:?}: {}", schema_file, e);
-            } else {
-                tracing::info!("Deleted schema file {:?}", schema_file);
-            }
-            let _ = std::fs::remove_file(schema_file.with_extension("db-wal"));
-            let _ = std::fs::remove_file(schema_file.with_extension("db-shm"));
+        if !schema_file.exists() {
+            return;
         }
+        match std::fs::remove_file(schema_file) {
+            Ok(()) => tracing::info!("Deleted schema file {:?}", schema_file),
+            Err(e) => tracing::warn!("Failed to delete schema file {:?}: {}", schema_file, e),
+        }
+        let _ = std::fs::remove_file(schema_file.with_extension("db-wal"));
+        let _ = std::fs::remove_file(schema_file.with_extension("db-shm"));
     }
 }
 
-#[derive(Default)]
-struct PgSchemas {
-    generation: u64,
-    schemas: BTreeMap<String, (String, u64)>,
+fn is_schema_change(sql: &str) -> bool {
+    let upper = sql.trim().to_uppercase();
+    upper.starts_with("CREATE SCHEMA") || upper.starts_with("DROP SCHEMA")
 }
 
-impl PgSchemas {
-    fn update(&mut self, conn: &PgConnection) -> Vec<String> {
-        let current: BTreeMap<_, _> = conn
-            .inner()
-            .list_all_databases()
-            .into_iter()
-            .filter(|(_, name, _)| name != "main" && name != "temp")
-            .map(|(_, name, path)| (name, path))
-            .collect();
-        let mut removed = Vec::new();
-        self.schemas.retain(|name, (path, _)| {
-            if current.contains_key(name) {
-                true
-            } else {
-                removed.push(path.clone());
-                false
-            }
-        });
-        for (name, path) in current {
-            self.schemas.entry(name).or_insert_with(|| {
-                self.generation += 1;
-                (path, self.generation)
-            });
-        }
-        removed
-    }
+fn attached_schemas(conn: &PgConnection) -> BTreeMap<String, String> {
+    conn.inner()
+        .list_all_databases()
+        .into_iter()
+        .filter(|(_, name, _)| name != "main" && name != "temp")
+        .map(|(_, name, path)| (name, path))
+        .collect()
+}
+
+struct SharedSchemas {
+    version: u64,
+    paths: BTreeMap<String, String>,
 }
 
 /// Build FieldInfo metadata from a prepared statement's column information.
