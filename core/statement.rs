@@ -1893,6 +1893,22 @@ mod tests {
     }
 
     #[test]
+    fn finish_seek_counts_a_deferred_table_seek() {
+        let conn = open_test_connection().unwrap();
+        conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, a INT, b INT)")
+            .unwrap();
+        conn.execute("CREATE INDEX t_a ON t(a)").unwrap();
+        conn.execute("INSERT INTO t VALUES (1, 1, 10), (2, 2, 20)")
+            .unwrap();
+
+        // The index finds the row, and FinishSeek moves the table cursor to it.
+        let mut stmt = conn.prepare("UPDATE t SET b = 5 WHERE a = 1").unwrap();
+        stmt.run_ignore_rows().unwrap();
+        assert_eq!(stmt.metrics().btree_deferred_seeks, 1);
+        assert_eq!(stmt.metrics().btree_table_seeks, 1);
+    }
+
+    #[test]
     fn test_metrics_persist_across_reset() {
         let conn = open_test_connection().unwrap();
         conn.execute("CREATE TABLE t(x)").unwrap();

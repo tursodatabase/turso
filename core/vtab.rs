@@ -284,6 +284,10 @@ impl VirtualTableCursor {
         self.null_flag = flag;
     }
 
+    pub(crate) fn get_null_flag(&self) -> bool {
+        self.null_flag
+    }
+
     pub(crate) fn needs_close_at_done(&self) -> bool {
         matches!(&self.inner, VirtualTableCursorInner::External(cursor) if cursor.needs_close_at_done())
     }

@@ -744,7 +744,7 @@ pub trait Wal: Debug + Send + Sync {
     /// all changes were stored locally.
     fn finish_append_frames_commit(&self) -> Result<()>;
 
-    fn should_checkpoint(&self) -> bool;
+    fn should_checkpoint(&self, checkpoint_threshold: u32) -> bool;
     /// Checkpoint the WAL into the database file.
     /// `sync_mode` controls the WAL durability barrier: unless it is
     /// [SyncMode::Off], the WAL is fsynced before any frame is backfilled so
@@ -987,12 +987,9 @@ impl WalCoordination for InProcessWalCoordination {
         let range = frame_watermark
             .map(|x| 0..=x)
             .unwrap_or(min_frame..=max_frame);
-        let result = frame_cache.get(&page_id).and_then(|frames| {
-            frames
-                .iter()
-                .rfind(|&&frame| range.contains(&frame))
-                .copied()
-        });
+        let result = frame_cache
+            .get(&page_id)
+            .and_then(|frames| shared.runtime.latest_frame_in_range(frames, &range));
         result
     }
 
@@ -1000,11 +997,9 @@ impl WalCoordination for InProcessWalCoordination {
         let shared = self.shared.read();
         let frame_cache = shared.runtime.frame_cache.lock();
         let mut list = Vec::with_capacity(frame_cache.len());
+        let range = min_frame..=max_frame;
         for (&page_id, frames) in frame_cache.iter() {
-            if let Some(&frame_id) = frames
-                .iter()
-                .rfind(|&&frame| (min_frame..=max_frame).contains(&frame))
-            {
+            if let Some(frame_id) = shared.runtime.latest_frame_in_range(frames, &range) {
                 list.push((page_id, frame_id));
             }
         }
@@ -2809,7 +2804,6 @@ pub struct WalFile {
     write_lock_held: AtomicBool,
 
     ongoing_checkpoint: RwLock<OngoingCheckpoint>,
-    checkpoint_threshold: usize,
     /// This is the index to the read_lock in WalFileShared that we are holding. This lock contains
     /// the max frame for this connection.
     max_frame_read_lock_index: AtomicUsize,
@@ -2848,7 +2842,6 @@ impl fmt::Debug for WalFile {
             .field("syncing", &self.syncing.load(Ordering::Relaxed))
             .field("page_size", &self.page_size())
             .field("ongoing_checkpoint", &*self.ongoing_checkpoint.read())
-            .field("checkpoint_threshold", &self.checkpoint_threshold)
             .field("max_frame_read_lock_index", &self.max_frame_read_lock_index)
             .field("max_frame", &self.max_frame)
             .field("min_frame", &self.min_frame)
@@ -2970,6 +2963,29 @@ pub struct WalSharedRuntime {
     /// Tracks how far the process-local `frame_cache` is known to be complete
     /// for overflow fallback in the current WAL generation.
     pub overflow_fallback_coverage: Arc<SpinLock<OverflowFallbackCoverage>>,
+    #[cfg(test)]
+    pub(crate) frames_compared: AtomicU64,
+}
+
+impl WalSharedRuntime {
+    fn latest_frame_in_range(
+        &self,
+        frames: &[u64],
+        range: &std::ops::RangeInclusive<u64>,
+    ) -> Option<u64> {
+        let end = frames.partition_point(|&frame| {
+            #[cfg(test)]
+            self.frames_compared.fetch_add(1, Ordering::Relaxed);
+            frame <= *range.end()
+        });
+        let frame = *frames[..end].last()?;
+        range.contains(&frame).then_some(frame)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn take_frames_compared_for_tests(&self) -> u64 {
+        self.frames_compared.swap(0, Ordering::Relaxed)
+    }
 }
 
 /// Drivable result of [`WalFileShared::open_shared_if_exists_begin`]. Either an
@@ -4098,9 +4114,12 @@ impl Wal for WalFile {
     }
 
     #[instrument(skip_all, level = Level::DEBUG)]
-    fn should_checkpoint(&self) -> bool {
+    fn should_checkpoint(&self, checkpoint_threshold: u32) -> bool {
+        if checkpoint_threshold == 0 {
+            return false;
+        }
         let snapshot = self.load_coordination_snapshot();
-        snapshot.max_frame as usize > self.checkpoint_threshold + snapshot.nbackfills as usize
+        snapshot.max_frame > u64::from(checkpoint_threshold) + snapshot.nbackfills
     }
 
     #[instrument(skip_all, level = Level::DEBUG)]
@@ -4844,7 +4863,6 @@ impl WalFile {
                 pages_to_checkpoint: Vec::new(),
                 inflight_reads: Vec::with_capacity(MAX_INFLIGHT_READS),
             }),
-            checkpoint_threshold: 1000,
             buffer_pool,
             checkpoint_seq: AtomicU32::new(0),
             syncing: Arc::new(AtomicBool::new(false)),
@@ -5001,9 +5019,12 @@ impl WalFile {
                     tracing::debug!(
                         "checkpoint_inner::Start: min_frame={oc_min_frame}, max_frame={oc_max_frame}"
                     );
-                    let mut to_checkpoint = self
-                        .coordination
-                        .iter_latest_frames(oc_min_frame, oc_max_frame);
+                    let mut to_checkpoint = if oc_max_frame < oc_min_frame {
+                        Vec::new()
+                    } else {
+                        self.coordination
+                            .iter_latest_frames(oc_min_frame, oc_max_frame)
+                    };
                     // sort by frame_id for read locality
                     to_checkpoint.sort_unstable_by(|a, b| (a.1, a.0).cmp(&(b.1, b.0)));
                     // Every frame we are about to backfill must be durable in
@@ -5881,6 +5902,8 @@ impl WalFileShared {
                 overflow_fallback_coverage: Arc::new(SpinLock::new(
                     OverflowFallbackCoverage::default(),
                 )),
+                #[cfg(test)]
+                frames_compared: AtomicU64::new(0),
             },
         };
         Ok(Arc::new(RwLock::new(shared)))
@@ -5897,7 +5920,7 @@ impl WalFileShared {
 
     /// Non-blocking entry point for [`WalFileShared::open_shared_if_exists`].
     /// Performs only the synchronous file open (and readonly/NotFound noop
-    /// handling); the WAL recovery scan is driven via [`OpenSharedWal::poll`].
+    /// handling); the WAL recovery scan is driven via `OpenSharedWal::poll`.
     pub fn open_shared_if_exists_begin(
         io: &Arc<dyn IO>,
         path: &str,
@@ -5957,6 +5980,8 @@ impl WalFileShared {
                 overflow_fallback_coverage: Arc::new(SpinLock::new(
                     OverflowFallbackCoverage::default(),
                 )),
+                #[cfg(test)]
+                frames_compared: AtomicU64::new(0),
             },
         };
         Arc::new(RwLock::new(shared))
@@ -5999,6 +6024,8 @@ impl WalFileShared {
                 overflow_fallback_coverage: Arc::new(SpinLock::new(
                     OverflowFallbackCoverage::default(),
                 )),
+                #[cfg(test)]
+                frames_compared: AtomicU64::new(0),
             },
         };
         Ok(Arc::new(RwLock::new(shared)))
@@ -6441,6 +6468,51 @@ pub mod test {
             0,
             "SyncMode::Off must not publish positive nbackfills as durable shared state"
         );
+    }
+
+    #[test]
+    fn in_process_checkpoint_with_no_frames_to_backfill_compares_no_frames() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let path = temp_dir.path().join("late-reader.db");
+        let db = Database::open_file(
+            shared_wal_test_io(),
+            path.to_str().unwrap(),
+            Arc::new(SqliteDialect),
+        )
+        .unwrap();
+        let writer = db.connect().unwrap();
+        writer
+            .execute("create table test(id integer primary key, value text)")
+            .unwrap();
+        bulk_inserts(&writer, 20, 10);
+        let reader = db.connect().unwrap();
+        reader.execute("begin").unwrap();
+        let reader_rows = count_test_table(&reader);
+        let pager = writer.pager.load();
+        let wal = pager.wal.as_ref().unwrap();
+        let held_frame = wal.get_max_frame_in_wal();
+        bulk_inserts(&writer, 20, 10);
+        assert!(wal.get_max_frame_in_wal() > held_frame);
+        let passive = CheckpointMode::Passive {
+            upper_bound_inclusive: None,
+        };
+        let frames_compared = || {
+            db.shared_wal
+                .read()
+                .runtime
+                .take_frames_compared_for_tests()
+        };
+        frames_compared();
+        let checkpoint = run_checkpoint_until_done(&pager, passive);
+        assert_eq!(checkpoint.wal_total_backfilled, held_frame);
+        assert!(frames_compared() > 0);
+
+        let checkpoint = run_checkpoint_until_done(&pager, passive);
+        assert_eq!(checkpoint.wal_total_backfilled, held_frame);
+        assert_eq!(checkpoint.wal_checkpoint_backfilled, 0);
+        assert_eq!(frames_compared(), 0);
+        assert_eq!(count_test_table(&reader), reader_rows);
+        reader.execute("commit").unwrap();
     }
 
     fn make_test_wal() -> (Arc<RwLock<WalFileShared>>, WalFile) {
@@ -7554,6 +7626,52 @@ pub mod test {
             wal.connection_state(),
             WalConnectionState::new(updated, ReadGuardKind::None)
         );
+    }
+
+    #[test]
+    fn latest_frame_in_range_returns_the_newest_frame_inside_the_range() {
+        let shared = WalFileShared::new_noop();
+        let shared = shared.read();
+        let latest_frame_in_range = |frames: &[u64], range: &std::ops::RangeInclusive<u64>| {
+            shared.runtime.latest_frame_in_range(frames, range)
+        };
+        let frames = [2, 5, 9, 14];
+        assert_eq!(latest_frame_in_range(&frames, &(0..=20)), Some(14));
+        assert_eq!(latest_frame_in_range(&frames, &(0..=13)), Some(9));
+        assert_eq!(latest_frame_in_range(&frames, &(5..=8)), Some(5));
+        assert_eq!(latest_frame_in_range(&frames, &(9..=9)), Some(9));
+        assert_eq!(latest_frame_in_range(&frames, &(6..=8)), None);
+        assert_eq!(latest_frame_in_range(&frames, &(15..=20)), None);
+        assert_eq!(latest_frame_in_range(&frames, &(0..=1)), None);
+        let empty_range = std::ops::RangeInclusive::new(9, 5);
+        assert_eq!(latest_frame_in_range(&frames, &empty_range), None);
+        assert_eq!(latest_frame_in_range(&[], &(0..=20)), None);
+    }
+
+    #[test]
+    fn in_process_frame_lookups_compare_few_frames_when_a_page_has_many_frames() {
+        let shared = WalFileShared::new_noop();
+        let coordination = make_test_coordination(&shared);
+        let frame_count = 1000u64;
+        for frame_id in 1..=frame_count {
+            coordination.cache_frame(7, frame_id);
+        }
+        let max_frames_compared = 2 * u64::from(frame_count.ilog2() + 1);
+        let frames_compared = || shared.read().runtime.take_frames_compared_for_tests();
+        frames_compared();
+
+        for (min_frame, max_frame) in [(1, 10), (500, 990)] {
+            assert_eq!(
+                coordination.find_frame(7, min_frame, max_frame, None),
+                Some(max_frame)
+            );
+            assert!((1..=max_frames_compared).contains(&frames_compared()));
+            assert_eq!(
+                coordination.iter_latest_frames(min_frame, max_frame),
+                vec![(7, max_frame)]
+            );
+            assert!((1..=max_frames_compared).contains(&frames_compared()));
+        }
     }
 
     #[test]

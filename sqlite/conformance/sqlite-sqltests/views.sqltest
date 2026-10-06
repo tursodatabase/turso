@@ -372,6 +372,30 @@ expect {
 }
 
 @cross-check-integrity
+test view-star-expands-the-columns-of-other-views {
+    CREATE TABLE view_source(x INTEGER, y TEXT);
+    INSERT INTO view_source VALUES (1, 'a');
+    CREATE VIEW view_inner AS SELECT * FROM view_source;
+    CREATE VIEW view_cross AS SELECT * FROM view_inner JOIN view_inner AS w;
+    CREATE VIEW view_natural_views AS SELECT * FROM view_inner NATURAL JOIN view_inner AS w;
+    CREATE VIEW view_using_views AS SELECT * FROM view_inner JOIN view_inner AS w USING (x);
+    CREATE VIEW view_full_using_views AS
+        SELECT * FROM view_inner FULL JOIN view_inner AS w USING (x);
+    SELECT group_concat(name) FROM pragma_table_info('view_cross');
+    SELECT group_concat(name) FROM pragma_table_info('view_natural_views');
+    SELECT group_concat(name) FROM pragma_table_info('view_using_views');
+    SELECT group_concat(name) FROM pragma_table_info('view_full_using_views');
+    SELECT * FROM view_using_views;
+}
+expect {
+    x,y,x:1,y:1
+    x,y
+    x,y,y:1
+    x,y,y:1
+    1|a|a
+}
+
+@cross-check-integrity
 test view-star-natural-join-with-derived-table {
     CREATE TABLE view_natural_right(x INTEGER, z TEXT);
     CREATE VIEW view_natural AS

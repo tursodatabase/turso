@@ -1281,7 +1281,7 @@ impl Schema {
         Ok(())
     }
 
-    /// Like [`remove_triggers_for_table`] but only removes triggers whose
+    /// Like [`Self::remove_triggers_for_table`] but only removes triggers whose
     /// `target_database_id` matches `target_db` (or is `None`, meaning
     /// "targets the parent schema's table of this name", which also
     /// applies). Used from `DROP TABLE main.t` to clean up temp triggers

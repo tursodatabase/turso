@@ -123,6 +123,7 @@ pub fn translate_expr(
         referenced_tables,
         expr,
         target_register,
+        resolver,
     )? {
         translate_expr_by_kind(program, referenced_tables, expr, target_register, resolver)?;
     }
@@ -173,6 +174,9 @@ fn translate_expr_by_kind(
         }
         ast::Expr::Exists(_) => {
             crate::bail_parse_error!("EXISTS is not supported in this position")
+        }
+        ast::Expr::MergedColumn(_) => {
+            translate_merged_column(program, referenced_tables, expr, target_register, resolver)
         }
         ast::Expr::FunctionCall { .. } => translate_function_call_expr(
             program,
@@ -319,17 +323,19 @@ fn try_emit_expression_index_value_if_any(
     referenced_tables: Option<&TableReferences>,
     expr: &ast::Expr,
     target_register: usize,
+    resolver: &Resolver,
 ) -> Result<bool> {
-    let has_expression_indexes = referenced_tables.is_some_and(|tables| {
-        tables
-            .joined_tables()
-            .iter()
-            .any(|t| !t.expression_index_usages.is_empty())
-    });
+    let has_expression_indexes = !program.flags.skip_expression_index_values()
+        && referenced_tables.is_some_and(|tables| {
+            tables
+                .joined_tables()
+                .iter()
+                .any(|t| !t.expression_index_usages.is_empty())
+        });
     if !has_expression_indexes {
         return Ok(false);
     }
-    try_emit_expression_index_value(program, referenced_tables, expr, target_register)
+    try_emit_expression_index_value(program, referenced_tables, expr, target_register, resolver)
 }
 
 #[inline(never)]
@@ -2391,20 +2397,22 @@ fn translate_column_expr(
     else {
         unreachable!("translate_column_expr expects Expr::Column");
     };
-    // When a cursor override is active for this table, we bypass all index logic
-    // and read directly from the override cursor. This is used during hash join
-    // build phases where we iterate using a separate cursor and don't want to use any index.
-    let has_cursor_override = program.has_cursor_override(*table_ref_id);
+    // A table cursor override identifies a row from a separate table read.
+    // The planned index cursors do not identify that row, so use the override directly.
+    let has_table_cursor_override = program.has_table_cursor_override(*table_ref_id);
 
     let (index, index_method, use_covering_index) = {
-        if has_cursor_override {
+        if has_table_cursor_override {
             (None, None, false)
         } else if let Some(table_reference) = referenced_tables
             .expect("table_references needed translating Expr::Column")
             .find_joined_table_by_internal_id(*table_ref_id)
         {
             (
-                table_reference.op.index(),
+                table_reference
+                    .op
+                    .index()
+                    .filter(|_| !table_reference.requires_table_cursor_for_unmatched_rows()),
                 if let Operation::IndexMethodQuery(index_method) = &table_reference.op {
                     Some(index_method)
                 } else {
@@ -2556,6 +2564,12 @@ fn translate_column_expr(
                     _ => {
                         let read_cursor = if read_from_index {
                             index_cursor_id.expect("index cursor should be opened")
+                        } else if is_btree_index {
+                            table_cursor_id.unwrap_or_else(|| {
+                                panic!(
+                                    "column {column} of table {table_ref_id} is not stored in the index and the table cursor is not open"
+                                )
+                            })
                         } else {
                             table_cursor_id
                                 .or(index_cursor_id)
@@ -2724,7 +2738,9 @@ fn translate_column_expr(
                         index: Some(index), ..
                     }) = &table_reference.op
                     {
-                        if index.ephemeral {
+                        if index.ephemeral
+                            && !table_reference.requires_table_cursor_for_unmatched_rows()
+                        {
                             // Read from the index cursor. Index columns may be reordered
                             // (key columns first), so find the index column position that
                             // corresponds to the original subquery column position.
@@ -2843,15 +2859,18 @@ fn translate_rowid_expr(
         return Ok(target_register);
     }
 
-    // When a cursor override is active, always read rowid from the override cursor.
-    let has_cursor_override = program.has_cursor_override(*table_ref_id);
-    let (index, use_covering_index) = if has_cursor_override {
+    // A table cursor override identifies the current row from a separate read.
+    let has_table_cursor_override = program.has_table_cursor_override(*table_ref_id);
+    let (index, use_covering_index) = if has_table_cursor_override {
         (None, false)
     } else if let Some(table_reference) =
         referenced_tables.find_joined_table_by_internal_id(*table_ref_id)
     {
         (
-            table_reference.op.index(),
+            table_reference
+                .op
+                .index()
+                .filter(|_| !table_reference.requires_table_cursor_for_unmatched_rows()),
             table_reference.utilizes_covering_index(),
         )
     } else {
@@ -3411,5 +3430,57 @@ fn translate_fts_score(
         0
     };
     program.emit_column_or_rowid(cursor_id, score_column, target_register);
+    Ok(target_register)
+}
+
+/// Emit the value of a merged USING column (see [ast::Expr::MergedColumn]).
+///
+/// For `[t1.a, t2.a]` this emits:
+///
+/// ```text
+///   Column t1.a -> r
+///   NotNull r -> end
+///   Column t2.a -> r
+/// end:
+/// ```
+///
+/// so `r` holds the first non-NULL source value. The collation comes from
+/// `t1.a` alone.
+#[inline(never)]
+fn translate_merged_column(
+    program: &mut ProgramBuilder,
+    referenced_tables: Option<&TableReferences>,
+    expr: &ast::Expr,
+    target_register: usize,
+    resolver: &Resolver,
+) -> Result<usize> {
+    let ast::Expr::MergedColumn(columns) = expr else {
+        unreachable!("translate_merged_column expects Expr::MergedColumn");
+    };
+    assert!(columns.len() >= 2);
+    let end_label = program.allocate_label();
+    let mut first_collation = None;
+    for (index, column) in columns.iter().enumerate() {
+        let register = translate_expr_no_constant_opt(
+            program,
+            referenced_tables,
+            column,
+            target_register,
+            resolver,
+            NoConstantOptReason::RegisterReuse,
+        )?;
+        if index == 0 {
+            first_collation = program.curr_collation_ctx();
+        }
+        program.reset_collation();
+        if index + 1 < columns.len() {
+            program.emit_insn(Insn::NotNull {
+                reg: register,
+                target_pc: end_label,
+            });
+        }
+    }
+    program.preassign_label_to_next_insn(end_label);
+    program.set_collation(first_collation);
     Ok(target_register)
 }

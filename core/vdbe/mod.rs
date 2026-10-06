@@ -15,7 +15,7 @@
 //!
 //! You can find a full list of SQLite opcodes at:
 //!
-//! https://www.sqlite.org/opcode.html
+//! <https://www.sqlite.org/opcode.html>
 
 use crate::alloc::{TryReserveError, TursoFromIterator};
 use crate::translate::plan::BitSet;
@@ -60,7 +60,7 @@ use crate::{
             OpAttachState, OpClearBtreeState, OpColumnState, OpDeleteState, OpDeleteSubState,
             OpDestroyState, OpIdxInsertState, OpInitCdcVersionState, OpInsertState,
             OpInsertSubState, OpJournalModeState, OpNewRowidState, OpNoConflictState,
-            OpParseSchemaState, OpProgramState, OpRowIdState, OpSeekState, OpTransactionState,
+            OpParseSchemaState, OpProgramState, OpSeekState, OpTransactionState,
             VacuumIntoOpContext,
         },
         hash_table::HashTable,
@@ -611,7 +611,7 @@ pub struct OpHashProbeState {
 }
 
 // repr(u8): with the tag in its own byte, the idle test that every Column
-// and RowId runs is one byte compare instead of a niche computation on a
+// runs is one byte compare instead of a niche computation on a
 // nested payload.
 #[repr(u8)]
 enum ActiveOpState {
@@ -628,7 +628,6 @@ enum ActiveOpState {
     Insert(OpInsertState),
     NoConflict(OpNoConflictState),
     Column(OpColumnState),
-    RowId(OpRowIdState),
     Transaction(OpTransactionState),
     Attach(OpAttachState),
     JournalMode(OpJournalModeState),
@@ -654,7 +653,6 @@ impl std::fmt::Debug for ActiveOpState {
             ActiveOpState::Insert(_) => "Insert",
             ActiveOpState::NoConflict(_) => "NoConflict",
             ActiveOpState::Column(_) => "Column",
-            ActiveOpState::RowId(_) => "RowId",
             ActiveOpState::Transaction(_) => "Transaction",
             ActiveOpState::Attach(_) => "Attach",
             ActiveOpState::JournalMode(_) => "JournalMode",
@@ -786,7 +784,6 @@ impl ActiveOpStateSlot {
         OpNoConflictState::Start
     );
     active_state_accessor!(column, Column, OpColumnState, OpColumnState::Start);
-    active_state_accessor!(row_id, RowId, OpRowIdState, OpRowIdState::Start);
     active_state_accessor!(
         transaction,
         Transaction,
@@ -842,6 +839,8 @@ impl ActiveOpStateSlot {
 pub(crate) struct DeferredSeekState {
     pub index_cursor_id: CursorID,
     pub table_cursor_id: CursorID,
+    /// The rowid that DeferredSeek saves before the index can move.
+    pub rowid: i64,
 }
 
 pub(crate) enum VacuumOpState {
@@ -985,7 +984,7 @@ pub struct ProgramState {
     /// Set by InitCdcVersion opcode, applied at Halt/Done so that if the
     /// transaction rolls back, the connection's CDC state remains unchanged.
     ///
-    /// capture_data_changes has type Option<CaptureDataChangesInfo> (off mode is None)
+    /// capture_data_changes has type `Option<CaptureDataChangesInfo>` (off mode is None)
     /// so, for pending_cdc_info we wrap it in one more Option<...> layer to represent if mode changed during program execution
     pub(crate) pending_cdc_info: Option<Option<CaptureDataChangesInfo>>,
     /// Cached subprogram Statements keyed by the PC of the Program instruction.
@@ -1607,6 +1606,9 @@ impl ProgramState {
                             attached_mv.release_savepoint(tx_id);
                         }
                     });
+                    for p in &attached_pagers {
+                        p.release_savepoint()?;
+                    }
                     Ok(())
                 } else if self.uses_subjournal || !attached_pagers.is_empty() {
                     if self.uses_subjournal {
@@ -1638,6 +1640,13 @@ impl ProgramState {
                             }
                         }
                     });
+                    for p in &attached_pagers {
+                        if let Err(e) = p.rollback_to_newest_savepoint() {
+                            if err.is_none() {
+                                err = Some(e);
+                            }
+                        }
+                    }
                     err
                 } else if self.uses_subjournal {
                     match pager.rollback_to_newest_savepoint() {
@@ -1848,7 +1857,7 @@ pub struct PreparedProgram {
     pub parameters: crate::parameters::Parameters,
     pub change_cnt_on: bool,
     /// Flag that detect if the sqlite statement will directly manipulate the database file.\
-    /// mirrors: https://sqlite.org/c3ref/stmt_readonly.html.
+    /// mirrors: <https://sqlite.org/c3ref/stmt_readonly.html>.
     pub readonly: bool,
     pub result_columns: Vec<ResultSetColumn>,
     pub table_references: TableReferences,
@@ -1859,7 +1868,7 @@ pub struct PreparedProgram {
     pub refreshes_analyze_stats: bool,
     /// Whether the statement needs to be wrapped in a statement subtransaction
     /// when run as part of an interactive (non-autocommit) transaction.
-    /// See [crate::vdbe::builder::ProgramBuilder::is_multi_write] and [crate::vdbe::builder::ProgramBuilder::may_abort] for more details.
+    /// See `crate::vdbe::builder::ProgramBuilder::is_multi_write` and [crate::vdbe::builder::ProgramBuilder::may_abort] for more details.
     pub needs_stmt_subtransactions: Arc<AtomicBool>,
     /// If this Program is a trigger subprogram, a ref to the trigger is stored here.
     pub trigger: Option<Arc<Trigger>>,
@@ -3199,6 +3208,7 @@ impl Program {
                     // the checkpoint logic can leave read locks held.
                     match attached_pager.commit_wal(
                         WalAutoActions::empty(),
+                        connection.get_wal_autocheckpoint(),
                         connection.get_sync_mode_for_database(db_id)?,
                         connection.get_data_sync_retry(),
                     ) {
@@ -3263,7 +3273,7 @@ impl Program {
     /// Statement teardown passes its actual counted state: a statement that
     /// already finished was released on Done or on its step error, so the
     /// counted statements are all siblings (see
-    /// [`ProgramState::can_autocommit_now`]).
+    /// `ProgramState::can_autocommit_now`).
     pub fn abort(
         &self,
         pager: &Arc<Pager>,

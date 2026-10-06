@@ -1,5 +1,84 @@
 use super::*;
 
+/// Emit the start of the two-level loop for an `IN` search.
+///
+/// The outer loop reads one value from the `IN` list. The inner loop reads all
+/// table or index rows that match that value.
+/// The main loop and the unmatched-right read use this bytecode shape.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn emit_in_seek_start(
+    program: &mut ProgramBuilder,
+    table_references: &TableReferences,
+    resolver: &Resolver<'_>,
+    index: Option<&Arc<Index>>,
+    source: &InSeekSource,
+    table_cursor_id: Option<CursorID>,
+    index_cursor_id: Option<CursorID>,
+    loop_start: BranchOffset,
+    loop_end: BranchOffset,
+) -> Result<InSeekMetadata> {
+    let source_cursor_id =
+        open_in_seek_source_cursor(program, table_references, resolver, index, source)?;
+    program.emit_insn(Insn::NullRow {
+        cursor_id: source_cursor_id,
+    });
+    program.emit_insn(Insn::Rewind {
+        cursor_id: source_cursor_id,
+        pc_if_empty: loop_end,
+    });
+
+    let outer_loop_start = program.allocate_label();
+    program.preassign_label_to_next_insn(outer_loop_start);
+    let seek_reg = program.alloc_register();
+    program.emit_insn(Insn::Column {
+        cursor_id: source_cursor_id,
+        column: 0,
+        dest: seek_reg,
+        default: None,
+    });
+
+    let next_value = program.allocate_label();
+    program.emit_insn(Insn::IsNull {
+        reg: seek_reg,
+        target_pc: next_value,
+    });
+    if index.is_none() {
+        program.emit_insn(Insn::SeekRowid {
+            cursor_id: table_cursor_id.expect("a rowid IN search must have a table cursor"),
+            src_reg: seek_reg,
+            target_pc: next_value,
+        });
+    } else {
+        let index_cursor_id =
+            index_cursor_id.expect("an indexed IN search must have an index cursor");
+        program.emit_insn(Insn::SeekGE {
+            cursor_id: index_cursor_id,
+            start_reg: seek_reg,
+            num_regs: 1,
+            target_pc: next_value,
+            is_index: true,
+            eq_only: false,
+            null_matching_mask: Default::default(),
+        });
+        program.preassign_label_to_next_insn(loop_start);
+        program.emit_insn(Insn::IdxGT {
+            cursor_id: index_cursor_id,
+            start_reg: seek_reg,
+            num_regs: 1,
+            target_pc: next_value,
+        });
+        if let Some(table_cursor_id) = table_cursor_id {
+            program.emit_deferred_seek(index_cursor_id, table_cursor_id);
+        }
+    }
+
+    Ok(InSeekMetadata {
+        ephemeral_cursor_id: source_cursor_id,
+        outer_loop_start,
+        next_val_label: next_value,
+    })
+}
+
 /// Open or reuse the ephemeral cursor that supplies RHS values for an IN-seek.
 ///
 /// Literal lists are materialized once into a unique ephemeral index so both
@@ -15,10 +94,15 @@ pub(super) fn open_in_seek_source_cursor(
 ) -> Result<CursorID> {
     match source {
         InSeekSource::LiteralList { values, affinity } => {
-            let label_once_end = program.allocate_label();
-            program.emit_insn(Insn::Once {
-                target_pc_when_reentered: label_once_end,
-            });
+            let label_once_end = if values.iter().all(|value| value.is_constant(resolver)) {
+                let label_once_end = program.allocate_label();
+                program.emit_insn(Insn::Once {
+                    target_pc_when_reentered: label_once_end,
+                });
+                Some(label_once_end)
+            } else {
+                None
+            };
             let collation = index
                 .as_ref()
                 .and_then(|idx| idx.columns.first())
@@ -75,9 +159,37 @@ pub(super) fn open_in_seek_source_cursor(
                     flags: IdxInsertFlags::new().no_op_duplicate(),
                 });
             }
-            program.preassign_label_to_next_insn(label_once_end);
+            if let Some(label_once_end) = label_once_end {
+                program.preassign_label_to_next_insn(label_once_end);
+            }
             Ok(eph_cursor)
         }
         InSeekSource::Subquery { cursor_id } => Ok(*cursor_id),
     }
+}
+
+/// Emit the end of the two-level loop for an `IN` search.
+pub(super) fn emit_in_seek_end(
+    program: &mut ProgramBuilder,
+    index_cursor_id: Option<CursorID>,
+    loop_start: BranchOffset,
+    meta: &InSeekMetadata,
+) {
+    if let Some(index_cursor_id) = index_cursor_id {
+        // An index key can identify more than one row. The inner loop reads all
+        // matching rows before the outer loop advances to the next `IN` value.
+        program.emit_insn(Insn::Next {
+            cursor_id: index_cursor_id,
+            pc_if_next: loop_start,
+            fullscan: false,
+            is_index: false,
+        });
+    }
+    program.preassign_label_to_next_insn(meta.next_val_label);
+    program.emit_insn(Insn::Next {
+        cursor_id: meta.ephemeral_cursor_id,
+        pc_if_next: meta.outer_loop_start,
+        fullscan: false,
+        is_index: false,
+    });
 }

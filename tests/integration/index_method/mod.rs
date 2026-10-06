@@ -3551,24 +3551,32 @@ fn fts_argument_dependencies_hash_join(tmp_db: TempDatabase) {
     ] {
         conn.execute(sql).unwrap();
     }
-    for join in ["JOIN", "FULL JOIN"] {
-        let query = format!(
-            "SELECT d.body, q.term FROM d {join} q ON d.term = q.term
-                             WHERE fts_match(d.body, d.term) ORDER BY d.body"
-        );
-        let expected = if join == "JOIN" {
-            vec![row!["database", "database NOT sql"]]
-        } else {
-            vec![row!["database", "database NOT sql"], row!["sql", NULL]]
-        };
-        assert_eq!(limbo_exec_rows(&conn, &query), expected);
-        assert_that!(limbo_exec_rows(
-            &conn,
-            &format!("EXPLAIN QUERY PLAN {query}")
-        ))
-        .has_step_containing("HASH JOIN");
-        assert_fts_indexed_predicate(&conn, &query);
-    }
+    let query = "SELECT d.body, q.term FROM d JOIN q ON d.term = q.term
+                 WHERE fts_match(d.body, d.term) ORDER BY d.body";
+    assert_eq!(
+        limbo_exec_rows(&conn, query),
+        vec![row!["database", "database NOT sql"]]
+    );
+    assert_that!(limbo_exec_rows(
+        &conn,
+        &format!("EXPLAIN QUERY PLAN {query}")
+    ))
+    .has_step_containing("HASH JOIN");
+    assert_fts_indexed_predicate(&conn, query);
+
+    // The FULL JOIN's unmatched q rows have a NULL d, so the WHERE term cannot
+    // use the FTS index for d, and fts_match has no direct evaluation. SQLite
+    // fails the same way: "unable to use function MATCH in the requested context".
+    let error = conn
+        .prepare(
+            "SELECT d.body, q.term FROM d FULL JOIN q ON d.term = q.term
+             WHERE fts_match(d.body, d.term)",
+        )
+        .expect_err("fts_match on the left table of a FULL JOIN must fail");
+    assert!(
+        error.to_string().contains("requires an FTS index query"),
+        "{error}"
+    );
 }
 
 #[cfg(all(feature = "fts", not(target_family = "wasm")))]

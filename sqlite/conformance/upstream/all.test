@@ -214,7 +214,7 @@ set test_files {
   e_reindex            fail
   e_resolve            fail
   e_select             fail
-  e_select2            fail
+  e_select2            pass
   e_totalchanges       fail
   e_update             fail
   e_uri                fail
@@ -329,13 +329,13 @@ set test_files {
   join6                pass
   join7                fail
   join8                fail
-  join9                fail
-  joinA                fail
-  joinB                fail
-  joinC                fail
+  join9                pass
+  joinA                pass
+  joinB                pass
+  joinC                pass
   joinD                fail
   joinE                pass
-  joinF                fail
+  joinF                pass
   joinH                fail
   journal1             fail
   journal2             fail
@@ -603,7 +603,7 @@ set test_files {
   tkt-868145d012       pass
   tkt-8c63ff0ec        pass
   tkt-91e2e8ba6f       pass
-  tkt-99378177930f87bd fail
+  tkt-99378177930f87bd pass
   tkt-9a8b09f8e6       pass
   tkt-9d68c883         fail
   tkt-9f2eb3abac       pass
@@ -640,7 +640,7 @@ set test_files {
   tkt1512              fail
   tkt1514              fail
   tkt1536              pass
-  tkt1537              fail
+  tkt1537              pass
   tkt1567              fail
   tkt1644              fail
   tkt1667              pass
@@ -756,7 +756,7 @@ set test_files {
   upfrom1              fail
   upfrom2              fail
   upfrom3              fail
-  upfrom4              fail
+  upfrom4              pass
   upsert1              fail
   upsert2              fail
   upsert3              pass

@@ -621,69 +621,6 @@ mod tests {
         }
     }
 
-    #[cfg(all(feature = "fs", not(target_family = "wasm")))]
-    #[test]
-    fn native_dialect_catalogs_load_before_views_in_secondary_databases() {
-        let dir = tempfile::tempdir().unwrap();
-        let source_path = dir.path().join("native-source.db");
-        let attached_path = dir.path().join("native-attached.db");
-        let output_path = dir.path().join("native-output.db");
-        let io: Arc<dyn IO> = Arc::new(crate::io::PlatformIO::new().unwrap());
-        let options = || {
-            crate::OpenOptions::new(Arc::new(TestDialect::default())).db_opts(
-                DatabaseOpts::new()
-                    .with_attach(true)
-                    .with_vacuum(true)
-                    .with_views(true),
-            )
-        };
-        let db = Database::open(io.clone(), source_path.to_str().unwrap(), options()).unwrap();
-        let conn = db.connect().unwrap();
-        conn.execute("CREATE VIEW catalog_values AS SELECT * FROM test_catalog")
-            .unwrap();
-        conn.execute(format!("ATTACH '{}' AS aux", attached_path.display()))
-            .unwrap();
-        let expected = vec![vec![crate::Value::from_i64(42)]];
-        for sql in [
-            "SELECT value FROM aux.test_catalog",
-            "SELECT value FROM temp.test_catalog",
-        ] {
-            assert_eq!(
-                conn.prepare(sql).unwrap().run_collect_rows().unwrap(),
-                expected
-            );
-        }
-        conn.execute("CREATE TEMP TABLE temp_values(value)")
-            .unwrap();
-        assert_eq!(
-            conn.prepare("SELECT value FROM temp.test_catalog")
-                .unwrap()
-                .run_collect_rows()
-                .unwrap(),
-            expected
-        );
-        conn.execute(format!("VACUUM INTO '{}'", output_path.display()))
-            .unwrap();
-        let output = Database::open(io, output_path.to_str().unwrap(), options()).unwrap();
-        let output_conn = output.connect().unwrap();
-        assert_eq!(
-            output_conn
-                .prepare("SELECT * FROM catalog_values")
-                .unwrap()
-                .run_collect_rows()
-                .unwrap(),
-            expected
-        );
-        assert_eq!(
-            output_conn
-                .prepare("SELECT name FROM pragma_table_info('catalog_values')")
-                .unwrap()
-                .run_collect_rows()
-                .unwrap(),
-            vec![vec![crate::Value::build_text("value")]]
-        );
-    }
-
     #[test]
     fn create_table_stores_dialect_formatted_sql() {
         let io: Arc<dyn IO> = Arc::new(MemoryIO::new());

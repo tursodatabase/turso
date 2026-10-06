@@ -500,6 +500,22 @@ pub enum Expr {
         /// `FILTER`
         filter_over: FunctionTail,
     },
+    /// The value of an unqualified USING column that more than one table can supply.
+    ///
+    /// In `SELECT a FROM t1 FULL JOIN t2 USING(a)`, a row can be missing from
+    /// either table, so `a` is `t1.a` when that is not NULL and `t2.a` otherwise.
+    /// This node holds the source columns in that order: `[t1.a, t2.a]`.
+    ///
+    /// The value is the same as `coalesce(t1.a, t2.a)`, but comparisons treat it
+    /// like the column `t1.a`: it takes the affinity and collation of its first
+    /// column. A user-written `coalesce()` has no affinity and can take its
+    /// collation from any argument. With `t1.a INTEGER` and a row only in `t2`
+    /// whose `a` is the text `'7'`, `a = 7` is true but `coalesce(t1.a, t2.a) = 7`
+    /// is false. SQLite gets the same effect by marking its internal coalesce
+    /// call with `SQLITE_AFF_DEFER`.
+    ///
+    /// The parser never creates this node. Name binding creates it.
+    MergedColumn(Vec<Box<Expr>>),
     /// Identifier
     Id(Name),
     /// Column
@@ -697,7 +713,7 @@ pub enum SubqueryType {
         num_regs: usize,
     },
     /// IN subquery; result is stored in an ephemeral index.
-    /// Example: x <NOT> IN (SELECT ...)
+    /// Example: `x <NOT> IN (SELECT ...)`
     In {
         cursor_id: usize,
         /// Affinity string used by the IN operator probe and ephemeral materialization.
@@ -1328,7 +1344,7 @@ impl Name {
 
     /// Checks if a name represents a quoted string that should get fallback behavior
     /// Need to detect legacy conversion of double quoted keywords to string literals
-    /// (see https://sqlite.org/lang_keywords.html)
+    /// (see <https://sqlite.org/lang_keywords.html>)
     ///
     /// Also, used to detect string literals in PRAGMA cases
     pub fn quoted_with(&self, quote: char) -> bool {
@@ -1882,7 +1898,7 @@ pub enum PragmaName {
     ApplicationId,
     /// set the autovacuum mode
     AutoVacuum,
-    /// set the busy_timeout (see https://www.sqlite.org/pragma.html#pragma_busy_timeout)
+    /// set the busy_timeout (see <https://www.sqlite.org/pragma.html#pragma_busy_timeout>)
     BusyTimeout,
     /// `cache_size` pragma
     CacheSize,
@@ -1945,7 +1961,7 @@ pub enum PragmaName {
     SchemaVersion,
     /// Deprecated: control whether unaliased column names omit the table name prefix
     ShortColumnNames,
-    /// Alias for `require_where` pragma, as an homage to MySQL (https://dev.mysql.com/doc/refman/9.6/en/mysql-tips.html#safe-updates)
+    /// Alias for `require_where` pragma, as an homage to MySQL (<https://dev.mysql.com/doc/refman/9.6/en/mysql-tips.html#safe-updates>)
     IAmADummy,
     /// Reject DELETE/UPDATE without WHERE clause
     RequireWhere,
@@ -1976,6 +1992,8 @@ pub enum PragmaName {
     UnstableCaptureDataChangesConn,
     /// Returns the user version of the database file.
     UserVersion,
+    /// Sets or queries the number of WAL frames after which a commit runs an automatic checkpoint.
+    WalAutocheckpoint,
     /// trigger a checkpoint to run on database(s) if WAL is enabled
     WalCheckpoint,
     /// Sets or queries the threshold (in bytes) at which MVCC triggers an automatic checkpoint.

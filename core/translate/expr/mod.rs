@@ -19,9 +19,7 @@ use crate::schema::{
     ParenthesizedJoinColumnVisibility, Table, Type, TypeDef,
 };
 use crate::sync::Arc;
-use crate::translate::expression_index::{
-    normalize_expr_for_index_matching, single_table_column_usage,
-};
+use crate::translate::expression_index::selected_expression_index;
 use crate::translate::plan::{ColumnMask, Operation, ResultSetColumn, Search};
 use crate::translate::planner::parse_row_id;
 use crate::util::{exprs_are_equivalent, normalize_ident, parse_numeric_literal};
@@ -87,8 +85,8 @@ pub(crate) use arrays::{
     emit_array_decode, emit_custom_type_decode_columns, emit_custom_type_encode_columns,
 };
 pub(crate) use binary::expr_is_array;
-pub(super) use binding::find_unqualified_column;
 pub use binding::{bind_and_rewrite_expr, BindingBehavior};
+pub(super) use binding::{find_unqualified_column, lookup_unqualified_column};
 pub use columns::{emit_table_column, emit_table_column_for_dml};
 pub use condition::translate_condition_expr;
 pub(crate) use custom_types::{

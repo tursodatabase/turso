@@ -114,7 +114,7 @@ pub fn one_of<T, R: Rng + ?Sized>(choices: Vec<ArbitraryFromFunc<R, T>>, rng: &m
 }
 
 /// backtrack is a helper function for composing different "failable" generators.
-/// The function takes a list of functions that return an Option<T>, along with number of retries
+/// The function takes a list of functions that return an `Option<T>`, along with number of retries
 /// to make before giving up.
 pub fn backtrack<T, R: Rng + ?Sized>(mut choices: Vec<Choice<R, T>>, rng: &mut R) -> Option<T> {
     loop {

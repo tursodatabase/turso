@@ -1038,11 +1038,7 @@ expect {
     3
 }
 
-# SQLite supports FULL JOIN with the recursive table on the left, but our
-# FULL OUTER implementation requires a hash join and the recursive input
-# cannot be its build side. Verify we return a useful error.
-@skip-if sqlite "supported in sqlite"
-test recursive-cte-full-join-recursive-on-left-not-supported {
+test recursive-cte-full-join-recursive-on-left {
     CREATE TABLE edge_for_recursive_full(parent INTEGER, child INTEGER);
     INSERT INTO edge_for_recursive_full VALUES(1, 2);
     WITH RECURSIVE path(node) AS (
@@ -1056,14 +1052,13 @@ test recursive-cte-full-join-recursive-on-left-not-supported {
     )
     SELECT node FROM path;
 }
-expect error {
-    FULL OUTER JOIN with a recursive reference is not yet supported
+expect {
+    1
+    2
 }
 
-# Like recursive-on-left FULL JOIN above, this needs a hash join with the
-# recursive input as a build side, which is not supported yet.
-@skip-if sqlite "supported in sqlite"
-test recursive-cte-full-join-recursive-on-right-not-supported {
+@skip-if sqlite "SQLite 3.53 reports ON clause references tables to its right"
+test recursive-cte-full-join-recursive-on-right-with-on-clause {
     CREATE TABLE edge_for_invalid_recursive_full(parent INTEGER, child INTEGER);
     INSERT INTO edge_for_invalid_recursive_full VALUES(1, 2);
     WITH RECURSIVE path(node) AS (
@@ -1076,8 +1071,75 @@ test recursive-cte-full-join-recursive-on-right-not-supported {
     )
     SELECT node FROM path;
 }
-expect error {
-    FULL OUTER JOIN with a recursive reference is not yet supported
+expect {
+    1
+    2
+}
+
+test recursive-cte-full-join-checks-the-current-row-on-the-right {
+    CREATE TABLE edge_for_recursive_using(x INTEGER);
+    INSERT INTO edge_for_recursive_using VALUES(1);
+    WITH RECURSIVE path(x) AS (
+        VALUES(1)
+        UNION ALL
+        SELECT CASE
+                   WHEN edge_for_recursive_using.x IS NULL THEN path.x+100
+                   ELSE path.x+1
+               END
+          FROM edge_for_recursive_using FULL JOIN path USING(x)
+         WHERE x<4
+        LIMIT 3
+    )
+    SELECT x FROM path;
+}
+expect {
+    1
+    2
+    3
+}
+
+# path.x rejects the NULL right side. SQLite therefore reduces FULL to RIGHT.
+# Without that reduction, the recursive pseudo-row leaks into an unmatched-left row.
+test recursive-cte-full-join-reduces-to-right-join {
+    CREATE TABLE edge_for_full_reduction(x INTEGER);
+    INSERT INTO edge_for_full_reduction VALUES(1);
+    WITH RECURSIVE path(x) AS (
+        VALUES(1)
+        UNION ALL
+        SELECT CASE
+                   WHEN edge_for_full_reduction.x IS NULL THEN path.x+100
+                   ELSE path.x+1
+               END
+          FROM edge_for_full_reduction FULL JOIN path USING(x)
+         WHERE path.x<4
+        LIMIT 4
+    )
+    SELECT x FROM path;
+}
+expect {
+    1
+    2
+    102
+}
+
+test recursive-cte-right-join-does-not-repeat-a-matched-current-row {
+    CREATE TABLE edge_for_recursive_match(x INTEGER);
+    INSERT INTO edge_for_recursive_match VALUES(1),(3);
+    WITH RECURSIVE path(x) AS (
+        VALUES(1)
+        UNION ALL
+        SELECT x+1
+          FROM edge_for_recursive_match RIGHT JOIN path USING(x)
+         WHERE x<4
+        LIMIT 4
+    )
+    SELECT x FROM path;
+}
+expect {
+    1
+    2
+    3
+    4
 }
 
 @skip-if sqlite "SQLite 3.53 rejects this form due to an upstream regression; 3.43-3.50 accept"

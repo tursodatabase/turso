@@ -1057,7 +1057,7 @@ impl Default for SumAggState {
 /// to share code between register-based and hash-based aggregation (future enhancement).
 #[derive(Debug, PartialEq)]
 pub enum AggContext {
-    /// Built-in aggregates store state as a flat Vec<Value> payload.
+    /// Built-in aggregates store state as a flat `Vec<Value>` payload.
     /// The layout depends on the aggregate function (see init_agg_payload).
     Builtin(Vec<Value>),
     /// External (extension) aggregates need FFI state that can't be serialized.
@@ -3175,7 +3175,7 @@ const I48_LOW: i64 = -140737488355328;
 const I48_HIGH: i64 = 140737488355327;
 
 /// Sqlite Serial Types
-/// https://www.sqlite.org/fileformat.html#record_format
+/// <https://www.sqlite.org/fileformat.html#record_format>
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 #[repr(transparent)]
 pub struct SerialType(u64);
@@ -3631,6 +3631,20 @@ impl Cursor {
             }
         }
     }
+
+    /// Whether the cursor is on a synthetic null row. See [Insn::NullRow]
+    pub fn get_null_flag(&self) -> bool {
+        match self {
+            Self::BTree(cursor, ..) => cursor.get_null_flag(),
+            Self::Dyn(cursor, ..) => cursor.get_null_flag(),
+            Self::Virtual(cursor) => cursor.get_null_flag(),
+            Self::NullRow => true,
+            Self::IndexMethod(_)
+            | Self::Pseudo(_)
+            | Self::Sorter(_)
+            | Self::MaterializedView(_) => false,
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -3738,7 +3752,7 @@ impl<T> IOResult<T> {
     }
 }
 
-/// Evaluate a IOResultOr<T>, if IO return IO.
+/// Evaluate a [`IOResultOr<T>`], if IO return IO.
 #[macro_export]
 macro_rules! return_if_io {
     ($expr:expr) => {
@@ -3781,7 +3795,7 @@ pub enum SeekResult {
     /// In this case Seek can position cursor to the leaf page boundaries (before the start, after the end)
     /// (e.g. if leaf page holds rows with keys from range [1..10], key 10 is absent and [SeekOp] is >= 10)
     ///
-    /// turso-db has this extra [SeekResult] in order to make [BTreeCursor::seek] method to position cursor at
+    /// turso-db has this extra [SeekResult] in order to make `BTreeCursor::seek` method to position cursor at
     /// the leaf of potential insertion, but also communicate to caller the fact that current cursor position
     /// doesn't hold a matching entry
     /// (necessary for Seek{XX} VM op-codes, so these op-codes will try to advance cursor in order to move it to matching entry)

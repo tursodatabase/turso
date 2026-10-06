@@ -1051,6 +1051,9 @@ pub struct Transaction<A: RowVersionAllocator = TursoAllocator> {
     /// materialization's frames are at-or-below this read mark (or in an earlier, backfilled WAL
     /// epoch). See [`MvStore::is_btree_readable_at`] / [`MvStore::compute_min_reader_mark`].
     read_mark: WalPos,
+    /// Table and index ids this transaction allocated with `CreateBtree`. No other
+    /// transaction can see these objects, so rollback drops their row maps whole.
+    created_table_ids: Mutex<Vec<MVTableId>>,
 }
 
 impl<A: RowVersionAllocator> Transaction<A> {
@@ -1077,6 +1080,7 @@ impl<A: RowVersionAllocator> Transaction<A> {
             abort_now: AtomicBool::new(false),
             commit_dep_set: Mutex::new(HashSet::default()),
             holds_blocking_checkpoint_read: AtomicBool::new(false),
+            created_table_ids: Mutex::new(Vec::new()),
         }
     }
 
@@ -4116,7 +4120,7 @@ pub enum MetadataIoStep {
 }
 
 /// Sub state machine for
-/// [`MvStore::maybe_complete_interrupted_checkpoint_nonblock`]. Tracks the
+/// `MvStore::maybe_complete_interrupted_checkpoint_nonblock`. Tracks the
 /// sequence of IO yields needed to reconcile an interrupted MVCC checkpoint
 /// without blocking: read log header → optional early WAL truncate, or
 /// WAL→DB backfill + db_file.sync + log-header rewrite (with a single-shot
@@ -4172,7 +4176,7 @@ pub enum RetryHeaderPhase {
     },
 }
 
-/// Sub state machine for [`MvStore::try_read_persistent_tx_ts_max_nonblock`].
+/// Sub state machine for `MvStore::try_read_persistent_tx_ts_max_nonblock`.
 /// Holds the prepared metadata-read statement + accumulated value across IO
 /// yields while the SELECT runs cooperatively.
 #[derive(Default)]
@@ -4185,7 +4189,7 @@ pub enum ReadPersistentTxTsMaxState {
     },
 }
 
-/// Sub state machine for [`MvStore::initialize_mvcc_metadata_table_nonblock`].
+/// Sub state machine for `MvStore::initialize_mvcc_metadata_table_nonblock`.
 /// Sequences the CREATE TABLE then INSERT statements, holding each prepared
 /// statement across IO yields.
 #[derive(Default)]
@@ -4664,7 +4668,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
     /// `begin` here: a transaction's *physical* schema (root pages) can run ahead of its *data*
     /// snapshot, because a checkpoint allocating a root page is not a logical schema change.
     /// Whether the btree should actually be read at the snapshot is decided separately by
-    /// [`Self::is_btree_allocated_at`] / [`Self::resolve_root_page_at`], which do gate on
+    /// `is_btree_allocated_at` / `resolve_root_page_at`, which do gate on
     /// `begin`. `u64::MAX` resolves the current live owner.
     pub fn get_table_id_from_root_page_at(&self, root_page: i64, snapshot_ts: u64) -> MVTableId {
         self.try_get_table_id_from_root_page_at(root_page, snapshot_ts)
@@ -5361,6 +5365,17 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
     /// will be positive and corresponds to the actual physical page.
     pub fn get_next_table_id(&self) -> i64 {
         self.next_table_id.fetch_sub(1, Ordering::SeqCst)
+    }
+
+    /// Records that `tx_id` allocated `table_id` with `CreateBtree`, so rollback can drop
+    /// everything stored under it.
+    pub fn record_created_table_id(&self, tx_id: TxID, table_id: i64) {
+        if let Some(tx) = self.txs.get(&tx_id) {
+            tx.value()
+                .created_table_ids
+                .lock()
+                .push(MVTableId::new(table_id));
+        }
     }
 
     pub fn get_next_rowid(&self) -> i64 {
@@ -6596,7 +6611,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
     }
 
     /// `begin_tx` with the connection's validated `schema_generation` gate (see
-    /// [`Connection::mvcc_begin_schema_generation`]). Used by the statement begin path so a passive
+    /// `Connection::mvcc_begin_schema_generation`). Used by the statement begin path so a passive
     /// checkpoint that republishes physical roots into the begin window forces a reprepare instead
     /// of a transaction beginning against stale roots.
     pub fn begin_tx_with_schema_generation(
@@ -7079,18 +7094,26 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         // Transfer ownership under the lock so we can drop it before taking
         // row-version-chain locks.
         let write_set = tx.write_set.lock().take();
-        for (_rowid, row_versions) in write_set.entries {
-            let mut restored_rowid = None;
-            for rv in row_versions.write().iter_mut() {
-                if rollback_row_version(tx_id, rv) {
-                    restored_rowid = Some(rv.row.id.clone());
-                }
-            }
+        let mut removed_versions = 0;
+        for (rowid, row_versions) in write_set.entries {
+            let (removed, restores_rowid) =
+                Self::rollback_version_chain(tx_id, &mut row_versions.write());
+            removed_versions += removed;
             // Rollback made this row visible again. For example, if rowid 3 is restored,
             // the next INSERT without an explicit rowid must choose 4, not reuse 3.
-            if let Some(rowid) = restored_rowid {
+            if restores_rowid {
                 self.bump_rowid_allocator_for_restored_row(&rowid);
             }
+        }
+        self.dec_live_version_count_approx(removed_versions);
+
+        // The loop above emptied the chains but left their slots. A table or index this
+        // transaction created never existed for anyone else, and its id is never reused,
+        // so nothing would ever reclaim those slots. E.g. a CREATE INDEX that is retried
+        // and rolled back over and over would leave one full set of keys per attempt.
+        let created_table_ids = std::mem::take(&mut *tx.created_table_ids.lock());
+        for table_id in created_table_ids {
+            self.drop_created_btree(table_id);
         }
 
         if let Some(connection) = connection {
@@ -7111,6 +7134,41 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         // read lock), so no future txs.get() for this tx_id can come from a
         // speculative read path.
         crate::without_allocation_faults!(self.remove_tx(tx_id).expect(ALLOC_ERR_MSG));
+    }
+
+    /// Removes the slots of a table or index created by a transaction that rolled back.
+    /// Writers retry when their slot is unlinked, and no other transaction can write to an
+    /// object that only existed in the aborted transaction's schema. The index's own map
+    /// stays in `index_rows`: open cursors iterate it through `static_iterator_hack!`, which
+    /// is only sound while that map lives as long as the store.
+    fn drop_created_btree(&self, table_id: MVTableId) {
+        if let Some(index) = self.index_rows.get(&table_id) {
+            self.bump_index_rows_epoch();
+            for entry in index.value().iter() {
+                entry.remove();
+            }
+        }
+        let start = RowID::new(table_id, RowKey::Int(i64::MIN));
+        let end = RowID::new(table_id, RowKey::Int(i64::MAX));
+        for entry in self.rows.range(start..=end) {
+            entry.remove();
+        }
+    }
+
+    fn rollback_version_chain(tx_id: u64, versions: &mut RowVersionChain<A>) -> (usize, bool) {
+        let before = versions.len();
+        let mut restores_rowid = false;
+        versions.retain_mut(|version| {
+            restores_rowid |= rollback_restores_rowid(tx_id, version);
+            if version.begin() == Some(TxTimestampOrID::TxID(tx_id)) {
+                return false;
+            }
+            if version.end() == Some(TxTimestampOrID::TxID(tx_id)) {
+                version.set_end(None);
+            }
+            true
+        });
+        (before - versions.len(), restores_rowid)
     }
 
     fn cleanup_dropped_commit(&self, tx_id: TxID, connection: &Connection, db_id: usize) {
@@ -7246,7 +7304,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
 
     /// Releases a named savepoint and nested savepoints above it.
     ///
-    /// Returns [SavepointResult::Commit] when releasing the root savepoint should commit the
+    /// Returns `SavepointResult::Commit` when releasing the root savepoint should commit the
     /// transaction.
     pub fn release_named_savepoint(&self, tx_id: TxID, name: &str) -> Result<SavepointResult> {
         let tx = self
@@ -7610,7 +7668,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
 
     /// Generate a commit timestamp and call `f` with it while the clock
     /// lock is held, atomically publishing the timestamp before release.
-    /// See [`MvccClock`] for the full explanation.
+    /// See [`crate::mvcc::clock::MvccClock`] for the full explanation.
     pub fn get_commit_timestamp<F: FnOnce(u64)>(&self, f: F) -> u64 {
         self.clock.get_timestamp(f)
     }
@@ -8246,7 +8304,8 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
             .iter()
             .filter_map(|entry| {
                 let tx_id = *entry.key();
-                (!referenced_tx_ids.contains(&tx_id)).then_some(tx_id)
+                let still_retiring = self.txs.contains_key(&tx_id);
+                (!referenced_tx_ids.contains(&tx_id) && !still_retiring).then_some(tx_id)
             })
             .collect();
 
@@ -10317,22 +10376,6 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
             false
         }
     }
-}
-
-fn rollback_row_version(tx_id: u64, rv: &mut RowVersion) -> bool {
-    let restores_rowid = rollback_restores_rowid(tx_id, rv);
-    if rv.begin() == Some(TxTimestampOrID::TxID(tx_id)) {
-        // If the transaction has aborted,
-        // it marks all its new versions as garbage and sets their Begin
-        // and End timestamps to infinity to make them invisible
-        // See section 2.4: https://www.cs.cmu.edu/~15721-f24/papers/Hekaton.pdf
-        rv.set_begin(None);
-        rv.set_end(None);
-    } else if rv.end() == Some(TxTimestampOrID::TxID(tx_id)) {
-        // undo deletions by this transaction
-        rv.set_end(None);
-    }
-    restores_rowid
 }
 
 fn rollback_restores_rowid(tx_id: u64, rv: &RowVersion) -> bool {

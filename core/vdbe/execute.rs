@@ -879,6 +879,38 @@ pub fn op_null_row(
     Ok(InsnFunctionStepResult::Step)
 }
 
+pub fn op_if_null_row(
+    _program: &Program,
+    state: &mut ProgramState,
+    insn: &Insn,
+    _pager: &Arc<Pager>,
+) -> InsnResult {
+    load_insn!(
+        IfNullRow {
+            cursor_id,
+            target_pc,
+            dest
+        },
+        insn
+    );
+    if !target_pc.is_offset() {
+        crate::bail_corrupt_error!("Unresolved label: {target_pc:?}");
+    }
+    let cursor_is_null = state
+        .cursors
+        .get(*cursor_id)
+        .expect("cursor_id should be valid")
+        .as_ref()
+        .is_some_and(Cursor::get_null_flag);
+    if cursor_is_null {
+        state.registers[*dest].set_null();
+        state.pc = target_pc.as_offset_int();
+    } else {
+        state.pc += 1;
+    }
+    Ok(InsnFunctionStepResult::Step)
+}
+
 pub fn op_compare(
     _program: &Program,
     state: &mut ProgramState,
@@ -1962,14 +1994,7 @@ pub fn op_last(
 #[derive(Debug, Clone, Copy)]
 pub enum OpColumnState {
     Start,
-    Rowid {
-        index_cursor_id: usize,
-        table_cursor_id: usize,
-    },
-    Seek {
-        rowid: i64,
-        table_cursor_id: usize,
-    },
+    Seek { rowid: i64, table_cursor_id: usize },
     GetColumn,
 }
 
@@ -2106,69 +2131,26 @@ fn op_column_deferred(
     'outer: loop {
         match *state.active_op_state.column() {
             OpColumnState::Start => {
-                if let Some(deferred) = state.deferred_seeks[cursor_id].take() {
-                    *state.active_op_state.column() = OpColumnState::Rowid {
-                        index_cursor_id: deferred.index_cursor_id,
+                // SQLite gives a null row priority over a pending deferred seek.
+                // A later outer join can leave both states set on one cursor.
+                if state.get_cursor(cursor_id).get_null_flag() {
+                    fetch.write_null_regs(state);
+                    break 'outer;
+                } else if let Some(deferred) = state.deferred_seeks[cursor_id].take() {
+                    *state.active_op_state.column() = OpColumnState::Seek {
+                        rowid: deferred.rowid,
                         table_cursor_id: deferred.table_cursor_id,
                     };
                 } else {
                     *state.active_op_state.column() = OpColumnState::GetColumn;
                 }
             }
-            OpColumnState::Rowid {
-                index_cursor_id,
-                table_cursor_id,
-            } => {
-                let Some(rowid) = ({
-                    let index_cursor = state.get_cursor(index_cursor_id);
-                    match index_cursor {
-                        Cursor::BTree(cursor, ..) => return_if_io!(state, cursor.rowid()),
-                        Cursor::Dyn(cursor, ..) => return_if_io!(state, cursor.rowid()),
-                        Cursor::IndexMethod(cursor) => return_if_io!(state, cursor.query_rowid()),
-                        _ => panic!("unexpected cursor type"),
-                    }
-                }) else {
-                    fetch.write_null_regs(state);
-                    break 'outer;
-                };
-                *state.active_op_state.column() = OpColumnState::Seek {
-                    rowid,
-                    table_cursor_id,
-                };
-            }
             OpColumnState::Seek {
                 rowid,
                 table_cursor_id,
             } => {
-                {
-                    let table_cursor = state.get_cursor(table_cursor_id);
-                    // MaterializedView cursors shouldn't go through deferred seek logic
-                    // but if we somehow get here, handle it appropriately
-                    match table_cursor {
-                        Cursor::MaterializedView(mv_cursor) => {
-                            // Seek to the rowid in the materialized view
-                            return_if_io!(
-                                state,
-                                mv_cursor
-                                    .seek(SeekKey::TableRowId(rowid), SeekOp::GE { eq_only: true })
-                            );
-                        }
-                        _ => {
-                            // Regular btree cursor
-                            let table_cursor = table_cursor.as_btree_mut();
-                            return_if_io!(
-                                state,
-                                table_cursor
-                                    .seek(SeekKey::TableRowId(rowid), SeekOp::GE { eq_only: true })
-                            );
-                        }
-                    }
-                }
-                state.metrics.btree_seeks = state.metrics.btree_seeks.wrapping_add(1);
-                state.metrics.btree_table_seeks = state.metrics.btree_table_seeks.wrapping_add(1);
-                state.metrics.btree_deferred_seeks =
-                    state.metrics.btree_deferred_seeks.wrapping_add(1);
-                state.metrics.search_count = state.metrics.search_count.wrapping_add(1);
+                return_if_io!(state, seek_deferred_row(state, table_cursor_id, rowid));
+                count_deferred_seek(state);
                 *state.active_op_state.column() = OpColumnState::GetColumn;
             }
             OpColumnState::GetColumn => {
@@ -4610,14 +4592,6 @@ pub fn op_transaction_inner(
             "Transaction instruction should not be used in trigger subprograms"
         );
     }
-    if *db == crate::TEMP_DB_ID {
-        program.connection.ensure_temp_database()?;
-    }
-    let pager = pager_for_db(program, pager, *db)?;
-    // Get the MvStore for the specific database (main or attached).
-    let mv_store = mv_store_for_db(program, state, *db);
-    let is_main_db = *db == crate::MAIN_DB_ID;
-    let is_secondary_db = !is_main_db;
     let write = matches!(
         tx_mode,
         TransactionMode::Write | TransactionMode::Concurrent
@@ -4627,6 +4601,26 @@ pub fn op_transaction_inner(
     // `write_databases` count for same-connection writer blocking and
     // active-writer cleanup.
     let statement_writes_db = program.write_databases.get(*db);
+    if *db == crate::TEMP_DB_ID {
+        // BEGIN IMMEDIATE / EXCLUSIVE / CONCURRENT emit a write Transaction for
+        // temp without touching it. Like SQLite (OP_Transaction is a no-op when
+        // the temp btree is not open), don't create the temp database just to
+        // lock it: it is private to this connection, so there is no lock to
+        // contend for. A later statement that uses temp creates it and begins
+        // its transaction lazily, exactly as after BEGIN DEFERRED. Creating it
+        // here would cost a temp file, a page 1 write and an fsync on every
+        // new connection, plus tearing it down on close.
+        if write && !statement_writes_db && !program.connection.has_temp_database() {
+            state.pc += 1;
+            return Ok(InsnFunctionStepResult::Step);
+        }
+        program.connection.ensure_temp_database()?;
+    }
+    let pager = pager_for_db(program, pager, *db)?;
+    // Get the MvStore for the specific database (main or attached).
+    let mv_store = mv_store_for_db(program, state, *db);
+    let is_main_db = *db == crate::MAIN_DB_ID;
+    let is_secondary_db = !is_main_db;
     loop {
         match *state.active_op_state.transaction() {
             OpTransactionState::Start => {
@@ -6176,20 +6170,6 @@ pub fn op_row_data(
     Ok(InsnFunctionStepResult::Step)
 }
 
-#[derive(Debug, Clone, Copy)]
-pub enum OpRowIdState {
-    Start,
-    Record {
-        index_cursor_id: usize,
-        table_cursor_id: usize,
-    },
-    Seek {
-        rowid: i64,
-        table_cursor_id: usize,
-    },
-    GetRowid,
-}
-
 // Not in test builds: inline(always) makes fn-item coercions produce
 // per-site copies in debug, breaking test_make_sure_correct_insn_table's
 // pointer-identity check.
@@ -6201,96 +6181,24 @@ pub fn op_row_id(
     _pager: &Arc<Pager>,
 ) -> InsnResult {
     load_insn!(RowId { cursor_id, dest }, insn);
-    // Fast path: no deferred seek pending and no suspended state machine, so
-    // the op-state slot (enum write + drop on clear) is bypassed. On an IO
-    // yield nothing is persisted and this path simply re-executes.
-    if state.active_op_state.is_idle() && state.deferred_seeks[*cursor_id].is_none() {
-        let result = op_row_id_read(state, *cursor_id, *dest)?;
-        if matches!(result, InsnFunctionStepResult::Step) {
-            state.pc += 1;
+    if let Some(deferred) = &state.deferred_seeks[*cursor_id] {
+        let rowid = deferred.rowid;
+        // SQLite gives a null row priority over a pending deferred seek.
+        // A later outer join can leave both states set on one cursor.
+        // Like SQLite, RowId does not finish the deferred table seek.
+        if state.get_cursor(*cursor_id).get_null_flag() {
+            state.registers[*dest].set_null();
+        } else {
+            state.registers[*dest].set_int(rowid);
         }
-        return Ok(result);
+        state.pc += 1;
+        return Ok(InsnFunctionStepResult::Step);
     }
-    op_row_id_deferred(state, *cursor_id, *dest)
-}
-
-/// RowId when a deferred seek is pending or the read was suspended for IO
-/// inside the seek: drives the op-state machine to completion.
-#[inline(never)]
-fn op_row_id_deferred(state: &mut ProgramState, cursor_id: usize, dest: usize) -> InsnResult {
-    loop {
-        match *state.active_op_state.row_id() {
-            OpRowIdState::Start => {
-                if let Some(deferred) = state.deferred_seeks[cursor_id].take() {
-                    *state.active_op_state.row_id() = OpRowIdState::Record {
-                        index_cursor_id: deferred.index_cursor_id,
-                        table_cursor_id: deferred.table_cursor_id,
-                    };
-                } else {
-                    *state.active_op_state.row_id() = OpRowIdState::GetRowid;
-                }
-            }
-            OpRowIdState::Record {
-                index_cursor_id,
-                table_cursor_id,
-            } => {
-                let rowid = {
-                    let index_cursor = state.get_cursor(index_cursor_id);
-                    match index_cursor {
-                        Cursor::BTree(..) | Cursor::Dyn(..) => {
-                            let index_cursor = index_cursor.as_btree_mut();
-                            let record = return_if_io!(state, index_cursor.record());
-                            let record =
-                                record.as_ref().expect("index cursor should have a record");
-                            let rowid = record
-                                .last_value()
-                                .expect("record should have a last value");
-                            match rowid {
-                                Ok(ValueRef::Numeric(Numeric::Integer(rowid))) => rowid,
-                                _ => unreachable!(),
-                            }
-                        }
-                        Cursor::IndexMethod(index_cursor) => {
-                            return_if_io!(state, index_cursor.query_rowid())
-                                .expect("index cursor should have a rowid")
-                        }
-                        _ => panic!("unexpected cursor type"),
-                    }
-                };
-                *state.active_op_state.row_id() = OpRowIdState::Seek {
-                    rowid,
-                    table_cursor_id,
-                }
-            }
-            OpRowIdState::Seek {
-                rowid,
-                table_cursor_id,
-            } => {
-                {
-                    let table_cursor = state.get_cursor(table_cursor_id);
-                    let table_cursor = table_cursor.as_btree_mut();
-                    return_if_io!(
-                        state,
-                        table_cursor.seek(SeekKey::TableRowId(rowid), SeekOp::GE { eq_only: true })
-                    );
-                }
-                *state.active_op_state.row_id() = OpRowIdState::GetRowid;
-            }
-            OpRowIdState::GetRowid => {
-                let result = op_row_id_read(state, cursor_id, dest)?;
-                if !matches!(result, InsnFunctionStepResult::Step) {
-                    // IO yield: the slot stays at GetRowid so the resume
-                    // re-enters this arm.
-                    return Ok(result);
-                }
-                break;
-            }
-        }
+    let result = op_row_id_read(state, *cursor_id, *dest)?;
+    if matches!(result, InsnFunctionStepResult::Step) {
+        state.pc += 1;
     }
-
-    state.active_op_state.clear();
-    state.pc += 1;
-    Ok(InsnFunctionStepResult::Step)
+    Ok(result)
 }
 
 /// Reads the rowid of the cursor's current position into a register.
@@ -6322,6 +6230,7 @@ fn op_row_id_read(state: &mut ProgramState, cursor_id: usize, dest: usize) -> In
             }
             Some(Cursor::MaterializedView(mv_cursor)) => mv_cursor.rowid(),
             Some(Cursor::IndexMethod(cursor)) => cursor.query_rowid(),
+            Some(Cursor::Pseudo(_)) => Ok(IOResult::Done(None)),
             _ => {
                 mark_unlikely();
                 Err(LimboError::InternalError(
@@ -6474,12 +6383,73 @@ pub fn op_deferred_seek(
         },
         insn
     );
+    let rowid = {
+        let index_cursor = state.get_cursor(*index_cursor_id);
+        match index_cursor {
+            Cursor::BTree(index_cursor, _) => return_if_io!(state, index_cursor.rowid()),
+            Cursor::Dyn(index_cursor, _) => return_if_io!(state, index_cursor.rowid()),
+            Cursor::IndexMethod(index_cursor) => return_if_io!(state, index_cursor.query_rowid()),
+            _ => panic!("DeferredSeek requires an index cursor"),
+        }
+    }
+    .expect("DeferredSeek index cursor must have a rowid");
+    // SQLite clears the table's null row when the index identifies a row.
+    // The table read stays deferred until a later instruction needs it.
+    state.get_cursor(*table_cursor_id).set_null_flag(false);
     state.deferred_seeks[*table_cursor_id] = Some(DeferredSeekState {
         index_cursor_id: *index_cursor_id,
         table_cursor_id: *table_cursor_id,
+        rowid,
     });
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
+}
+
+/// Complete the table move recorded by DeferredSeek.
+///
+/// SQLite emits this before a write when no Column instruction had to move
+/// the table cursor.
+pub fn op_finish_seek(
+    _program: &Program,
+    state: &mut ProgramState,
+    insn: &Insn,
+    _pager: &Arc<Pager>,
+) -> InsnResult {
+    load_insn!(FinishSeek { cursor_id }, insn);
+    let Some(rowid) = state.deferred_seeks[*cursor_id]
+        .as_ref()
+        .map(|deferred| deferred.rowid)
+    else {
+        state.pc += 1;
+        return Ok(InsnFunctionStepResult::Step);
+    };
+    return_if_io!(state, seek_deferred_row(state, *cursor_id, rowid));
+    state.deferred_seeks[*cursor_id] = None;
+    count_deferred_seek(state);
+    state.pc += 1;
+    Ok(InsnFunctionStepResult::Step)
+}
+
+/// Move a table cursor to the row that DeferredSeek saved.
+fn seek_deferred_row(
+    state: &mut ProgramState,
+    table_cursor_id: usize,
+    rowid: i64,
+) -> IOResultOr<SeekResult> {
+    let key = SeekKey::TableRowId(rowid);
+    let op = SeekOp::GE { eq_only: true };
+    match state.get_cursor(table_cursor_id) {
+        // Materialized views should not use deferred seeks, but seek them correctly if one does.
+        Cursor::MaterializedView(mv_cursor) => mv_cursor.seek(key, op),
+        table_cursor => table_cursor.as_btree_mut().seek(key, op),
+    }
+}
+
+fn count_deferred_seek(state: &mut ProgramState) {
+    state.metrics.btree_seeks = state.metrics.btree_seeks.wrapping_add(1);
+    state.metrics.btree_table_seeks = state.metrics.btree_table_seeks.wrapping_add(1);
+    state.metrics.btree_deferred_seeks = state.metrics.btree_deferred_seeks.wrapping_add(1);
+    state.metrics.search_count = state.metrics.search_count.wrapping_add(1);
 }
 
 /// Separate enum for seek key to avoid lifetime issues
@@ -6499,8 +6469,8 @@ pub enum OpSeekState {
     Start,
     /// Position cursor with seek operation with (rowid, op) search parameters
     Seek { key: OpSeekKey, op: SeekOp },
-    /// Advance cursor (with [BTreeCursor::next]/[BTreeCursor::prev] methods) which was
-    /// positioned after [OpSeekState::Seek] state if [BTreeCursor::seek] returned [SeekResult::TryAdvance]
+    /// Advance cursor (with `BTreeCursor::next`/`BTreeCursor::prev` methods) which was
+    /// positioned after [OpSeekState::Seek] state if `BTreeCursor::seek` returned [SeekResult::TryAdvance]
     Advance { op: SeekOp },
     /// Move cursor to the last BTree row if DB knows that comparison result will be fixed (due to type ordering, e.g. NUMBER always <= TEXT)
     MoveLast,
@@ -9932,76 +9902,58 @@ pub fn op_function(
                 )?);
             }
             JsonFunc::JsonRemove => {
-                if let Ok(json) = json_remove(
+                let json = json_remove(
                     registers_to_ref_values(&state.registers[*start_reg..*start_reg + arg_count]),
                     &state.json_cache,
-                ) {
-                    state.registers[*dest].set_value(json);
-                } else {
-                    state.registers[*dest].set_null();
-                }
+                )?;
+                state.registers[*dest].set_value(json);
             }
             JsonFunc::JsonbRemove => {
-                if let Ok(json) = jsonb_remove(
+                let json = jsonb_remove(
                     registers_to_ref_values(&state.registers[*start_reg..*start_reg + arg_count]),
                     &state.json_cache,
-                ) {
-                    state.registers[*dest].set_value(json);
-                } else {
-                    state.registers[*dest].set_null();
-                }
+                )?;
+                state.registers[*dest].set_value(json);
             }
             JsonFunc::JsonReplace => {
                 if arg_count % 2 == 0 {
                     bail_constraint_error!("json_replace() needs an odd number of arguments")
                 }
-                if let Ok(json) = json_replace(
+                let json = json_replace(
                     registers_to_ref_values(&state.registers[*start_reg..*start_reg + arg_count]),
                     &state.json_cache,
-                ) {
-                    state.registers[*dest].set_value(json);
-                } else {
-                    state.registers[*dest].set_null();
-                }
+                )?;
+                state.registers[*dest].set_value(json);
             }
             JsonFunc::JsonbReplace => {
                 if arg_count % 2 == 0 {
                     bail_constraint_error!("json_replace() needs an odd number of arguments")
                 }
-                if let Ok(json) = jsonb_replace(
+                let json = jsonb_replace(
                     registers_to_ref_values(&state.registers[*start_reg..*start_reg + arg_count]),
                     &state.json_cache,
-                ) {
-                    state.registers[*dest].set_value(json);
-                } else {
-                    state.registers[*dest].set_null();
-                }
+                )?;
+                state.registers[*dest].set_value(json);
             }
             JsonFunc::JsonInsert => {
                 if arg_count % 2 == 0 {
                     bail_constraint_error!("json_insert() needs an odd number of arguments")
                 }
-                if let Ok(json) = json_insert(
+                let json = json_insert(
                     registers_to_ref_values(&state.registers[*start_reg..*start_reg + arg_count]),
                     &state.json_cache,
-                ) {
-                    state.registers[*dest].set_value(json);
-                } else {
-                    state.registers[*dest].set_null();
-                }
+                )?;
+                state.registers[*dest].set_value(json);
             }
             JsonFunc::JsonbInsert => {
                 if arg_count % 2 == 0 {
                     bail_constraint_error!("json_insert() needs an odd number of arguments")
                 }
-                if let Ok(json) = jsonb_insert(
+                let json = jsonb_insert(
                     registers_to_ref_values(&state.registers[*start_reg..*start_reg + arg_count]),
                     &state.json_cache,
-                ) {
-                    state.registers[*dest].set_value(json);
-                } else {
-                    state.registers[*dest].set_null();
-                }
+                )?;
+                state.registers[*dest].set_value(json);
             }
             JsonFunc::JsonPretty => {
                 let json_value = &state.registers[*start_reg];
@@ -13918,6 +13870,9 @@ pub fn op_create_btree(
 
     if let Some(mv_store) = mv_store.as_ref() {
         let root_page = mv_store.get_next_table_id();
+        if let Some(tx_id) = program.connection.get_mv_tx_id_for_db(*db) {
+            mv_store.record_created_table_id(tx_id, root_page);
+        }
         state.registers[*root].set_int(root_page);
         state.pc += 1;
         return Ok(InsnFunctionStepResult::Step);
@@ -20199,6 +20154,45 @@ mod tests {
         let version_integer = 3046001;
         let expected = "3.46.1";
         assert_eq!(execute_turso_version(version_integer), expected);
+    }
+
+    #[test]
+    fn if_null_row_does_nothing_for_unopened_cursor() {
+        let stmt = prepare_test_statement();
+        let mut state = ProgramState::new(1, 1);
+        state.set_register(0, Register::Value(Value::from_i64(7)));
+        let insn = Insn::IfNullRow {
+            cursor_id: 0,
+            target_pc: BranchOffset::Offset(9),
+            dest: 0,
+        };
+
+        let step = op_if_null_row(stmt.get_program(), &mut state, &insn, stmt.get_pager())
+            .expect("IfNullRow must accept an unopened cursor");
+
+        assert!(matches!(step, InsnFunctionStepResult::Step));
+        assert_eq!(state.pc, 1);
+        assert_eq!(state.get_register(0).get_value(), &Value::from_i64(7));
+    }
+
+    #[test]
+    fn if_null_row_clears_destination_and_jumps() {
+        let stmt = prepare_test_statement();
+        let mut state = ProgramState::new(1, 1);
+        state.cursors[0] = Some(Cursor::NullRow);
+        state.set_register(0, Register::Value(Value::from_i64(7)));
+        let insn = Insn::IfNullRow {
+            cursor_id: 0,
+            target_pc: BranchOffset::Offset(9),
+            dest: 0,
+        };
+
+        let step = op_if_null_row(stmt.get_program(), &mut state, &insn, stmt.get_pager())
+            .expect("IfNullRow must accept a null-row cursor");
+
+        assert!(matches!(step, InsnFunctionStepResult::Step));
+        assert_eq!(state.pc, 9);
+        assert_eq!(state.get_register(0).get_value(), &Value::Null);
     }
 
     #[test]

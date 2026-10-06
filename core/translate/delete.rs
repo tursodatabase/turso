@@ -208,6 +208,7 @@ pub fn prepare_delete_plan(
     });
     let joined_tables = vec![JoinedTable {
         op: Operation::default_scan_for(&table),
+        unmatched_right_rows_plan: None,
         table,
         identifier: qualified_name.identifier(),
         internal_id: program.table_reference_counter.next(),
@@ -462,7 +463,6 @@ fn ensure_delete_uses_rowset(program: &mut ProgramBuilder, plan: &mut DeletePlan
         // WHERE subqueries should already be planned into this SelectPlan when needed.
         non_from_clause_subqueries: vec![],
         input_cardinality_hint: None,
-        using_results_are_explicit: false,
         estimated_output_rows: None,
         estimated_cost: None,
         simple_aggregate: None,
