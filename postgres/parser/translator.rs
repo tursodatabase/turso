@@ -2326,13 +2326,30 @@ impl PostgreSQLTranslator {
                     ) => Ok(ast::Expr::Literal(ast::Literal::CurrentTimestamp)),
                     Ok(
                         SqlValueFunctionOp::SvfopCurrentUser
-                        | SqlValueFunctionOp::SvfopSessionUser
                         | SqlValueFunctionOp::SvfopUser
                         | SqlValueFunctionOp::SvfopCurrentRole,
-                    ) => {
-                        // Return empty string stub for user functions
-                        Ok(ast::Expr::Literal(ast::Literal::String("''".into())))
-                    }
+                    ) => Ok(ast::Expr::FunctionCall {
+                        name: ast::Name::from_string("current_user"),
+                        distinctness: None,
+                        args: vec![],
+                        order_by: vec![],
+                        within_group: vec![],
+                        filter_over: ast::FunctionTail {
+                            filter_clause: None,
+                            over_clause: None,
+                        },
+                    }),
+                    Ok(SqlValueFunctionOp::SvfopSessionUser) => Ok(ast::Expr::FunctionCall {
+                        name: ast::Name::from_string("session_user"),
+                        distinctness: None,
+                        args: vec![],
+                        order_by: vec![],
+                        within_group: vec![],
+                        filter_over: ast::FunctionTail {
+                            filter_clause: None,
+                            over_clause: None,
+                        },
+                    }),
                     // The bare keywords route through the frontend scalars so both
                     // syntaxes share one implementation and agree with pg_catalog.
                     Ok(SqlValueFunctionOp::SvfopCurrentSchema) => Ok(ast::Expr::FunctionCall {
