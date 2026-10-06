@@ -810,6 +810,22 @@ mod tests {
     }
 
     #[test]
+    fn role_without_privileges_cannot_read_currval() {
+        let conn = open_connection();
+        conn.execute("CREATE SEQUENCE s").unwrap();
+        conn.execute("SELECT nextval('s')").unwrap();
+        create_role(&conn, "alice").unwrap();
+        set_role(&conn, "alice").unwrap();
+
+        let error = conn.execute("SELECT currval('s')").unwrap_err();
+
+        assert_eq!(
+            denial(error),
+            PermissionDenied::privilege(Action::Use, Object::Sequence("s".to_string()))
+        );
+    }
+
+    #[test]
     fn role_without_privileges_can_read_the_schema_again() {
         let conn = open_connection();
         conn.execute("CREATE TABLE t (x)").unwrap();
@@ -972,6 +988,23 @@ mod tests {
         create_role(&conn2, "alice").unwrap();
 
         assert!(conn1.role_catalog().get_by_name("alice").is_some());
+    }
+
+    #[test]
+    fn role_without_privileges_cannot_read_the_sequence_watermark() {
+        let conn = open_connection();
+        conn.execute("CREATE SEQUENCE s").unwrap();
+        create_role(&conn, "alice").unwrap();
+        set_role(&conn, "alice").unwrap();
+
+        let error = conn
+            .execute("SELECT sequence_watermark_experimental('s')")
+            .unwrap_err();
+
+        assert_eq!(
+            denial(error),
+            PermissionDenied::privilege(Action::Use, Object::Sequence("s".to_string()))
+        );
     }
 
     #[test]
