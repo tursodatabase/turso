@@ -295,12 +295,12 @@ fn describe_table_shows_default_expressions() {
     assert_eq!(output.status.code(), Some(0));
     let out = stdout(&output);
     assert!(
-        out.contains("now"),
-        "\\d should show now() default, got: {out}"
+        out.contains("| now ()") && !out.contains("(now ())"),
+        "\\d should show the now() default without parentheses, got: {out}"
     );
     assert!(
-        out.contains("gen_random_uuid"),
-        "\\d should show gen_random_uuid() default, got: {out}"
+        out.contains("| gen_random_uuid () |"),
+        "\\d should show the gen_random_uuid() default without parentheses, got: {out}"
     );
 }
 

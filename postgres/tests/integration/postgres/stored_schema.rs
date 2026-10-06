@@ -310,3 +310,29 @@ fn vacuum_keeps_tables_and_values(db: TempDatabase) {
         ["1|2.50|ok|2024-01-01 10:00:00", "2|3.00|sad|NULL"]
     );
 }
+
+#[turso_macros::test]
+fn catalog_shows_postgres_ddl_and_defaults_of_new_tables(db: TempDatabase) {
+    let conn = db.connect_postgres();
+    conn.execute(
+        "CREATE TABLE c (id serial PRIMARY KEY, n numeric(10,2) NOT NULL, \
+         ts timestamp DEFAULT now(), t text, r double precision, b bytea, k integer UNIQUE)",
+    )
+    .unwrap();
+    let ddl: Vec<String> = rows(&conn, "SELECT table_name, ddl FROM pg_get_tabledef")
+        .into_iter()
+        .filter_map(|row| row.strip_prefix("c|").map(str::to_string))
+        .collect();
+    assert_eq!(
+        ddl,
+        [
+            "CREATE TABLE c (id serial PRIMARY KEY, n numeric (10, 2) NOT NULL, \
+          ts timestamp DEFAULT (now ()), t text, r double precision, b bytea, \
+          k integer UNIQUE)"
+        ]
+    );
+    assert_eq!(
+        rows(&conn, "SELECT adnum, adbin FROM pg_attrdef ORDER BY adnum"),
+        ["1|nextval ('c_id_seq')", "3|now ()"]
+    );
+}

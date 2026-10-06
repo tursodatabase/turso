@@ -2732,11 +2732,19 @@ impl PgAttrdefCursor {
 
             for (col_idx, col) in btree.columns().iter().enumerate() {
                 if let Some(default_expr) = &col.default {
+                    // Stored SQL puts a DEFAULT expression in parentheses;
+                    // PostgreSQL shows the expression alone.
+                    let default_sql = match default_expr.as_ref() {
+                        turso_parser::ast::Expr::Parenthesized(exprs) if exprs.len() == 1 => {
+                            exprs[0].to_string()
+                        }
+                        expr => expr.to_string(),
+                    };
                     self.rows.push(vec![
-                        Value::from_i64(attrdef_oid),                // oid
-                        Value::from_i64(table_oid),                  // adrelid
-                        Value::from_i64(col_idx as i64 + 1),         // adnum (1-based)
-                        Value::build_text(default_expr.to_string()), // adbin
+                        Value::from_i64(attrdef_oid),        // oid
+                        Value::from_i64(table_oid),          // adrelid
+                        Value::from_i64(col_idx as i64 + 1), // adnum (1-based)
+                        Value::build_text(default_sql),      // adbin
                     ]);
                     attrdef_oid += 1;
                 }
@@ -3301,6 +3309,9 @@ impl PgGetTableDefCursor {
                 .map(|sql| decode_stored_table_sql(sql))
             {
                 Some(StoredTableSql::Postgres(ddl)) => ddl.to_string(),
+                Some(StoredTableSql::Canonical(sql)) if btree_table.is_pg_storage => {
+                    pg_storage_table_ddl(sql)?
+                }
                 Some(StoredTableSql::Canonical(sql)) => self.convert_to_postgres_ddl(sql),
                 None => self.convert_to_postgres_ddl(&btree_table.to_sql()),
             };
@@ -3361,6 +3372,69 @@ impl PgGetTableDefCursor {
         postgres_ddl = postgres_ddl.replace(" WITHOUT ROWID", "");
 
         postgres_ddl
+    }
+}
+
+/// PostgreSQL DDL for a table of the PostgreSQL frontend that
+/// `sqlite_schema` stores as canonical Turso SQL.
+fn pg_storage_table_ddl(sql: &str) -> Result<String> {
+    let turso_parser::ast::Stmt::CreateTable {
+        tbl_name, mut body, ..
+    } = turso_core::dialect::sqlite::parse_table_sql_ast(sql)?
+    else {
+        unreachable!("parse_table_sql_ast returns CREATE TABLE");
+    };
+    let turso_parser::ast::CreateTableBody::ColumnsAndConstraints {
+        columns, options, ..
+    } = &mut body
+    else {
+        unreachable!("a stored table has columns");
+    };
+    *options = turso_parser::ast::TableOptions::empty();
+    for column in columns.iter_mut() {
+        let serial_sequence = format!(
+            "'{}_{}_seq'",
+            tbl_name.name.as_str(),
+            column.col_name.as_str()
+        );
+        let is_serial = column.constraints.iter().any(|constraint| {
+            matches!(&constraint.constraint, turso_parser::ast::ColumnConstraint::Default(expr)
+                if default_calls_nextval(expr, &serial_sequence))
+        });
+        if is_serial {
+            column.constraints.retain(|constraint| {
+                !matches!(
+                    constraint.constraint,
+                    turso_parser::ast::ColumnConstraint::Default(_)
+                )
+            });
+        }
+        if let Some(col_type) = column.col_type.as_mut() {
+            col_type.name = postgres_type_name(&col_type.name, is_serial).to_string();
+        }
+    }
+    Ok(format!("CREATE TABLE {} {body}", tbl_name.name.as_ident()))
+}
+
+fn default_calls_nextval(expr: &turso_parser::ast::Expr, sequence: &str) -> bool {
+    use turso_parser::ast::{Expr, Literal};
+    let expr = match expr {
+        Expr::Parenthesized(exprs) if exprs.len() == 1 => exprs[0].as_ref(),
+        expr => expr,
+    };
+    matches!(expr, Expr::FunctionCall { name, args, .. }
+        if name.as_str().eq_ignore_ascii_case("nextval")
+            && matches!(args.as_slice(), [arg] if matches!(arg.as_ref(), Expr::Literal(Literal::String(s)) if s == sequence)))
+}
+
+fn postgres_type_name(turso_type: &str, is_serial: bool) -> &str {
+    match turso_type.to_ascii_uppercase().as_str() {
+        "INTEGER" if is_serial => "serial",
+        "INTEGER" => "integer",
+        "REAL" => "double precision",
+        "TEXT" => "text",
+        "BLOB" => "bytea",
+        _ => turso_type,
     }
 }
 
