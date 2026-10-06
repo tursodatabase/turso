@@ -6535,7 +6535,7 @@ pub mod test {
     }
 
     #[test]
-    fn test_checkpoint_sync_mode_off_leaves_backfill_unpublished() {
+    fn test_checkpoint_sync_mode_off_publishes_backfill() {
         let (db, _path) = get_database();
         let wal_shared = db.shared_wal.clone();
         let conn = db.connect().unwrap();
@@ -6554,8 +6554,8 @@ pub mod test {
         );
         assert_eq!(
             wal_shared.read().metadata.nbackfills.load(Ordering::SeqCst),
-            0,
-            "SyncMode::Off must not publish positive nbackfills as durable shared state"
+            result.wal_total_backfilled,
+            "SyncMode::Off must publish the backfilled frames, or the next checkpoint copies them again"
         );
     }
 

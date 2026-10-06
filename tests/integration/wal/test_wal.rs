@@ -426,3 +426,34 @@ fn test_close_fsyncs_the_wal_only_when_the_close_checkpoint_does_not() -> anyhow
     }
     Ok(())
 }
+
+#[test]
+fn test_synchronous_off_auto_checkpoint_restarts_the_wal() -> anyhow::Result<()> {
+    let db_path_sim = "synchronous-off-auto-checkpoint-restarts-the-wal.db";
+    let wal_path_sim = format!("{db_path_sim}-wal");
+    let io = Arc::new(UnreliableIo::new());
+    let db = Database::open_file(io.clone(), db_path_sim, Arc::new(SqliteDialect))?;
+    let conn = db.connect()?;
+    conn.execute("PRAGMA synchronous=OFF")?;
+    conn.execute("PRAGMA wal_autocheckpoint=10")?;
+    conn.execute("CREATE TABLE t(x)")?;
+    for i in 0..200 {
+        conn.execute(format!("INSERT INTO t VALUES ({i})"))?;
+    }
+
+    let wal_frames = execute_and_get_ints(&conn, "PRAGMA wal_checkpoint(PASSIVE)")?[1];
+    assert!(
+        wal_frames < 50,
+        "the WAL must restart after each auto-checkpoint, but it holds {wal_frames} frames"
+    );
+    assert_eq!(
+        execute_and_get_ints(&conn, "SELECT count(*) FROM t")?,
+        vec![200]
+    );
+    assert_eq!(
+        io.sync_count(&wal_path_sim),
+        0,
+        "synchronous=OFF must not fsync the WAL when the WAL restarts"
+    );
+    Ok(())
+}

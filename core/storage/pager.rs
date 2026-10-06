@@ -1306,7 +1306,8 @@ enum CheckpointPhase {
         clear_page_cache: bool,
         max_frame: u64,
     },
-    /// Publish the durable backfill progress after the proof is installed and synced.
+    /// Publish the backfill progress after the durable proof is installed and synced,
+    /// or right after the backfill when sync_mode is OFF.
     PublishBackfill {
         clear_page_cache: bool,
         max_frame: u64,
@@ -5091,10 +5092,17 @@ impl Pager {
                             clear_page_cache,
                             page1_invalidated: false,
                         };
-                    } else if res.wal_checkpoint_backfilled == 0
-                        || sync_mode == crate::SyncMode::Off
-                    {
+                    } else if res.wal_checkpoint_backfilled == 0 {
                         state.phase = CheckpointPhase::Finalize { clear_page_cache };
+                    } else if sync_mode == crate::SyncMode::Off {
+                        state.phase = if mode.should_restart_log() {
+                            CheckpointPhase::Finalize { clear_page_cache }
+                        } else {
+                            CheckpointPhase::PublishBackfill {
+                                clear_page_cache,
+                                max_frame: res.wal_total_backfilled,
+                            }
+                        };
                     } else {
                         state.phase = CheckpointPhase::SyncDbFile { clear_page_cache };
                     }
