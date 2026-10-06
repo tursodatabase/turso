@@ -10,7 +10,7 @@ use std::path::Path;
 use std::sync::Arc;
 use tempfile::TempDir;
 use turso_core::SqliteDialect;
-use turso_core::{Database, DatabaseOpts, OpenFlags};
+use turso_core::{Database, DatabaseOpts, OpenFlags, TEMP_DB_ID};
 
 const PAGE_SIZE_OFFSET: u64 = 16;
 const RESERVED_SPACE_OFFSET: u64 = 20;
@@ -715,8 +715,8 @@ fn test_attach_create_stores_canonical_schema_sql_on_main() -> anyhow::Result<()
 // Transaction-opcode emission tests
 //
 // SQLite emits `Transaction` for every open database (main, temp, each
-// attached) on `BEGIN IMMEDIATE` and `BEGIN EXCLUSIVE`. Verify that turso
-// emits the same number, covering the db-id set we expect.
+// attached) on `BEGIN IMMEDIATE` and `BEGIN EXCLUSIVE`. Turso emits the same
+// opcodes except the one for temp. Verify the count and the db-id set.
 // ---------------------------------------------------------------------------
 
 /// Extract the set of `p1` (db index) values from `Transaction` opcodes
@@ -750,7 +750,10 @@ fn test_begin_immediate_transaction_count_no_attached(_tmp_db: TempDatabase) -> 
     let sqlite_ids =
         transaction_db_ids_from_explain(&sqlite_exec_rows(&sqlite, "EXPLAIN BEGIN IMMEDIATE"));
 
-    assert_that!(&turso_ids).has_length(sqlite_ids.len());
+    assert_that!(&sqlite_ids).contains(&(TEMP_DB_ID as i64));
+    assert_that!(&turso_ids)
+        .has_length(sqlite_ids.len() - 1)
+        .does_not_contain(&(TEMP_DB_ID as i64));
     // Transaction for main, which is db 0.
     assert_that!(turso_ids).contains(0);
     Ok(())
@@ -775,7 +778,10 @@ fn test_begin_immediate_transaction_count_one_attached(
     let sqlite_ids =
         transaction_db_ids_from_explain(&sqlite_exec_rows(&sqlite, "EXPLAIN BEGIN IMMEDIATE"));
 
-    assert_that!(&turso_ids).has_length(sqlite_ids.len());
+    assert_that!(&sqlite_ids).contains(&(TEMP_DB_ID as i64));
+    assert_that!(&turso_ids)
+        .has_length(sqlite_ids.len() - 1)
+        .does_not_contain(&(TEMP_DB_ID as i64));
     // Transaction for main, then for the attached database, which gets
     // index 2 because slot 1 is always temp.
     assert_that!(turso_ids)
@@ -804,7 +810,10 @@ fn test_begin_immediate_transaction_count_two_attached(
     let sqlite_ids =
         transaction_db_ids_from_explain(&sqlite_exec_rows(&sqlite, "EXPLAIN BEGIN IMMEDIATE"));
 
-    assert_that!(&turso_ids).has_length(sqlite_ids.len());
+    assert_that!(&sqlite_ids).contains(&(TEMP_DB_ID as i64));
+    assert_that!(&turso_ids)
+        .has_length(sqlite_ids.len() - 1)
+        .does_not_contain(&(TEMP_DB_ID as i64));
     // Transaction for main, then for both attached databases.
     assert_that!(&turso_ids).contains(&0);
     assert_that!(turso_ids)
@@ -827,9 +836,12 @@ fn test_begin_immediate_transaction_count_with_temp(_tmp_db: TempDatabase) -> an
     let sqlite_ids =
         transaction_db_ids_from_explain(&sqlite_exec_rows(&sqlite, "EXPLAIN BEGIN IMMEDIATE"));
 
-    assert_that!(&turso_ids).has_length(sqlite_ids.len());
-    // Transaction for main and for temp, which is db 1.
-    assert_that!(turso_ids).contains(0).contains(1);
+    assert_that!(&sqlite_ids).contains(&(TEMP_DB_ID as i64));
+    assert_that!(&turso_ids)
+        .has_length(sqlite_ids.len() - 1)
+        .does_not_contain(&(TEMP_DB_ID as i64));
+    // Transaction for main only, even though temp has a table.
+    assert_that!(turso_ids).contains(0);
     Ok(())
 }
 
