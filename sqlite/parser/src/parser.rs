@@ -5467,6 +5467,33 @@ mod tests {
     }
 
     #[test]
+    fn table_options_are_printed_with_commas() {
+        for (sql, printed) in [
+            ("CREATE TABLE t (a INTEGER PRIMARY KEY) STRICT", "STRICT"),
+            (
+                "CREATE TABLE t (a INTEGER PRIMARY KEY) without  rowid",
+                "WITHOUT rowid",
+            ),
+            (
+                "CREATE TABLE t (a INTEGER PRIMARY KEY) WITHOUT ROWID, strict",
+                "strict, WITHOUT ROWID",
+            ),
+        ] {
+            let command = Parser::new(sql.as_bytes()).next_cmd().unwrap().unwrap();
+            let formatted = command.to_string();
+            assert_eq!(
+                formatted,
+                format!("CREATE TABLE t (a INTEGER PRIMARY KEY) {printed};")
+            );
+            let parsed = Parser::new(formatted.as_bytes())
+                .next_cmd()
+                .unwrap()
+                .unwrap();
+            assert_eq!(parsed.to_string(), formatted);
+        }
+    }
+
+    #[test]
     fn default_literals_and_names_are_printed_without_parentheses() {
         let sql = "CREATE TABLE t (a DEFAULT 1, b DEFAULT - 1, c DEFAULT + 1.5, d DEFAULT 'x', e DEFAULT NULL, f DEFAULT CURRENT_TIMESTAMP, g DEFAULT TRUE, h DEFAULT X'00', i DEFAULT name, j DEFAULT (1 + 2), k DEFAULT - 'x')";
         let command = Parser::new(sql.as_bytes()).next_cmd().unwrap().unwrap();

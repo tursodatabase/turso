@@ -1702,25 +1702,44 @@ impl ToTokens for CreateTableBody {
                     comma(constraints, s, context)?;
                 }
                 s.append(TK_RP, None)?;
-                // Use the original text if available
-                if let Some(ref without_rowid) = options.without_rowid_text {
-                    // Split "WITHOUT ROWID" back into tokens
-                    let parts: Vec<&str> = without_rowid.split_whitespace().collect();
-                    if parts.len() == 2 {
-                        s.append(TK_WITHOUT, None)?;
-                        s.append(TK_ID, Some(parts[1]))?;
-                    }
-                }
-                if let Some(ref strict) = options.strict_text {
-                    s.append(TK_ID, Some(strict))?;
-                }
-                Ok(())
+                options.to_tokens(s, context)
             }
             Self::AsSelect(select) => {
                 s.append(TK_AS, None)?;
                 select.to_tokens(s, context)
             }
         }
+    }
+}
+
+impl_display_for_to_tokens!(TableOptions);
+impl ToTokens for TableOptions {
+    fn to_tokens<S: TokenStream + ?Sized, C: ToSqlContext>(
+        &self,
+        s: &mut S,
+        _context: &C,
+    ) -> Result<(), S::Error> {
+        let mut first = true;
+        let mut separate = |s: &mut S| {
+            if first {
+                first = false;
+                return Ok(());
+            }
+            s.append(TK_COMMA, None)
+        };
+        if let Some(ref strict) = self.strict_text {
+            separate(s)?;
+            s.append(TK_ID, Some(strict))?;
+        }
+        if let Some(ref without_rowid) = self.without_rowid_text {
+            let (_, rowid) = without_rowid
+                .split_once(char::is_whitespace)
+                .expect("the parser stores WITHOUT ROWID as two words");
+            separate(s)?;
+            s.append(TK_WITHOUT, None)?;
+            s.append(TK_ID, Some(rowid.trim_start()))?;
+        }
+        Ok(())
     }
 }
 

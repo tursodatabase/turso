@@ -104,3 +104,12 @@ test without-rowid-foreign-keys-rejected {
 expect error {
     foreign keys on WITHOUT ROWID tables are not supported
 }
+
+test without-rowid-strict-table {
+    CREATE TABLE t(a TEXT PRIMARY KEY, b INTEGER) WITHOUT ROWID, STRICT;
+    INSERT INTO t VALUES ('k', 1);
+    SELECT a, b FROM t;
+}
+expect {
+    k|1
+}
