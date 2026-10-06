@@ -218,6 +218,9 @@ async fn setup(config: &Config) -> Database {
         (TxnMode::Concurrent, CheckpointMode::Passive) => {
             builder.experimental_mvcc_passive_checkpoint(true)
         }
+        (TxnMode::Concurrent, CheckpointMode::TruncateSkipWal) => {
+            builder.experimental_mvcc_checkpoint_skip_wal(true)
+        }
         (TxnMode::Concurrent, CheckpointMode::Truncate) | (TxnMode::Immediate, _) => builder,
     };
     let db = builder.build().await.unwrap();

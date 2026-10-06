@@ -51,6 +51,9 @@ pub enum CheckpointMode {
     Passive,
     /// Blocking checkpoint that drops row versions once they are in the B-tree.
     Truncate,
+    /// Blocking checkpoint that writes its pages directly to the database
+    /// file, without writing them to the WAL first.
+    TruncateSkipWal,
 }
 
 #[derive(Parser)]

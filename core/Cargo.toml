@@ -229,6 +229,10 @@ name = "checkpoint_n_rows"
 harness = false
 
 [[bench]]
+name = "mvcc_checkpoint_skip_wal"
+harness = false
+
+[[bench]]
 name = "logical_log_serialization"
 harness = false
 required-features = ["bench"]
