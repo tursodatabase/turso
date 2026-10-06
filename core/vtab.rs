@@ -27,9 +27,9 @@ pub struct VirtualTable {
     pub(crate) vtab_id: u64,
     /// Whether `DROP TABLE` may remove this table from its schema.
     pub(crate) is_droppable: bool,
-    // Whether this virtual table is safe to use from within triggers and views.
-    // Corresponds to SQLite's SQLITE_VTAB_INNOCUOUS flag.
-    pub(crate) innocuous: bool,
+    /// Whether triggers can read this virtual table.
+    /// This permission does not allow writes from triggers.
+    pub(crate) allows_reads_in_triggers: bool,
 }
 
 impl VirtualTable {
@@ -81,7 +81,7 @@ impl VirtualTable {
             vtab_type: VirtualTableType::Internal(table),
             vtab_id: 0,
             is_droppable: false,
-            innocuous: true,
+            allows_reads_in_triggers: true,
         })
     }
 
@@ -107,7 +107,8 @@ impl VirtualTable {
             vtab_type,
             vtab_id: 0,
             is_droppable: false,
-            innocuous: module.is_some_and(|module| module.implementation.innocuous()),
+            allows_reads_in_triggers: module
+                .is_some_and(|module| module.implementation.allows_reads_in_triggers()),
         };
         Ok(Arc::new(vtab))
     }
@@ -128,7 +129,8 @@ impl VirtualTable {
             vtab_type,
             vtab_id: VTAB_ID_COUNTER.fetch_add(1, Ordering::Acquire),
             is_droppable: true,
-            innocuous: module.is_some_and(|module| module.implementation.innocuous()),
+            allows_reads_in_triggers: module
+                .is_some_and(|module| module.implementation.allows_reads_in_triggers()),
         };
         Ok(Arc::new(vtab))
     }

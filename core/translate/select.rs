@@ -134,7 +134,7 @@ fn plan_first_virtual_table_name(plan: &Plan) -> Option<String> {
 fn select_plan_first_virtual_table_name(select_plan: &SelectPlan) -> Option<String> {
     for joined_table in select_plan.joined_tables() {
         match &joined_table.table {
-            Table::Virtual(virtual_table) if !virtual_table.innocuous => {
+            Table::Virtual(virtual_table) if !virtual_table.allows_reads_in_triggers => {
                 return Some(virtual_table.name.clone())
             }
             Table::FromClauseSubquery(from_clause_subquery) => {
