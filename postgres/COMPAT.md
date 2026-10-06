@@ -69,7 +69,7 @@ Basics not enumerated by the official feature matrix.
 The pg_catalog tables emulated (live, reflecting real schema): `pg_class`,
 `pg_namespace`, `pg_attribute`, `pg_type` (builtin + array + enum types),
 `pg_index`, `pg_constraint`, `pg_attrdef`, `pg_tables`, `pg_sequences`,
-`pg_database`, `pg_roles` (single hardcoded `turso` role), `pg_proc`, `pg_am`,
+`pg_database`, `pg_roles` (built-in `postgres` superuser and roles from `CREATE ROLE`), `pg_proc`, `pg_am`,
 plus `pg_input_error_info`. Present but always empty: `pg_policy`,
 `pg_trigger`, `pg_statistic_ext`, `pg_inherits`, `pg_rewrite`,
 `pg_foreign_table`, `pg_partitioned_table`, `pg_collation`, `pg_description`,

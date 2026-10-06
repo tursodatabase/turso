@@ -7,6 +7,7 @@ use turso_core::{
     dialect::POSTGRES_TABLE_SQL_PREFIX,
     native_ext::{VirtualTable, VirtualTableCursor, VirtualTableModule},
     schema::{BTreeTable, Index, Schema, Table},
+    security::roles::{BuiltinRoleNames, Role, RoleId},
     Connection, Dialect, Func, IOResult, LimboError, OpenOptions, Result, Statement, Value,
 };
 use turso_ext::{ConstraintInfo, IndexInfo, OrderByInfo, ResultCode, VTabKind};
@@ -31,6 +32,13 @@ pub struct PostgresDialect;
 impl Dialect for PostgresDialect {
     fn name(&self) -> &'static str {
         "postgres"
+    }
+
+    fn builtin_role_names(&self) -> BuiltinRoleNames {
+        BuiltinRoleNames {
+            superuser: "postgres",
+            public: "public",
+        }
     }
 
     fn parse(&self, sql: &str) -> Result<(Option<turso_parser::ast::Cmd>, usize)> {
@@ -613,9 +621,39 @@ impl SnapshotRows for PgAttributeTable {
     }
 }
 
-/// Virtual table implementation for pg_catalog.pg_roles
-/// Stub: returns a single hardcoded "turso" superuser role.
-/// TODO: replace with real role data when authentication is implemented.
+const SUPERUSER_OID: i64 = 10;
+const USER_ROLE_OID_START: i64 = 16384;
+
+/// Returns the PostgreSQL OID of a role. The built-in superuser has the OID
+/// of the PostgreSQL bootstrap superuser, and `public` has OID 0, as in
+/// PostgreSQL's access control lists.
+pub(crate) fn role_oid(id: RoleId) -> i64 {
+    match id {
+        RoleId::SUPERUSER => SUPERUSER_OID,
+        RoleId::PUBLIC => 0,
+        _ => USER_ROLE_OID_START + id.get(),
+    }
+}
+
+/// Returns the roles that PostgreSQL lists in `pg_roles`. PostgreSQL has no
+/// row for `public`.
+pub(crate) fn listed_roles(conn: &Connection) -> Vec<Role> {
+    conn.role_catalog()
+        .iter()
+        .filter(|role| role.id != RoleId::PUBLIC)
+        .cloned()
+        .collect()
+}
+
+fn superuser_name(conn: &Connection) -> String {
+    conn.role_catalog()
+        .get(RoleId::SUPERUSER)
+        .expect("the role catalog always has the superuser")
+        .name
+        .clone()
+}
+
+/// Virtual table implementation for pg_catalog.pg_roles.
 #[derive(Debug)]
 struct PgRolesTable;
 
@@ -639,25 +677,32 @@ impl SnapshotRows for PgRolesTable {
     const ESTIMATED_COST: f64 = 10.0;
     const ESTIMATED_ROWS: u32 = 1;
 
-    /// Stub: returns a single default superuser role.
-    /// Replace this method with real role lookup when auth is implemented.
-    fn load_rows(_conn: &Connection) -> Vec<Vec<Value>> {
-        vec![vec![
-            Value::from_i64(10),        // oid
-            Value::build_text("turso"), // rolname
-            Value::from_i64(1),         // rolsuper
-            Value::from_i64(1),         // rolinherit
-            Value::from_i64(1),         // rolcreaterole
-            Value::from_i64(1),         // rolcreatedb
-            Value::from_i64(1),         // rolcanlogin
-            Value::from_i64(1),         // rolreplication
-            Value::from_i64(-1),        // rolconnlimit (-1 = no limit)
-            Value::Null,                // rolpassword (never exposed)
-            Value::Null,                // rolvaliduntil
-            Value::from_i64(1),         // rolbypassrls
-            Value::Null,                // rolconfig
-        ]]
+    fn load_rows(conn: &Connection) -> Vec<Vec<Value>> {
+        listed_roles(conn).iter().map(role_row).collect()
     }
+}
+
+/// `CREATE ROLE` creates roles that cannot log in, so only the built-in
+/// superuser can.
+fn role_row(role: &Role) -> Vec<Value> {
+    let superuser = Value::from_i64(role.superuser as i64);
+    let can_login = role.id == RoleId::SUPERUSER;
+    let bypasses_rls = role.superuser || role.ignores_row_policies;
+    vec![
+        Value::from_i64(role_oid(role.id)),   // oid
+        Value::build_text(role.name.clone()), // rolname
+        superuser.clone(),                    // rolsuper
+        Value::from_i64(1),                   // rolinherit
+        superuser.clone(),                    // rolcreaterole
+        superuser.clone(),                    // rolcreatedb
+        Value::from_i64(can_login as i64),    // rolcanlogin
+        superuser,                            // rolreplication
+        Value::from_i64(-1),                  // rolconnlimit (-1 = no limit)
+        Value::Null,                          // rolpassword (never exposed)
+        Value::Null,                          // rolvaliduntil
+        Value::from_i64(bypasses_rls as i64), // rolbypassrls
+        Value::Null,                          // rolconfig
+    ]
 }
 
 /// Virtual table implementation for pg_catalog.pg_proc
@@ -991,11 +1036,12 @@ impl SnapshotRows for PgTablesTable {
         let schema = conn.current_schema();
         let mut rows = Vec::new();
 
+        let owner = superuser_name(conn);
         for (table_name, _) in user_tables_sorted(&schema) {
             rows.push(vec![
                 Value::Text("public".into()),           // schemaname
                 Value::Text(table_name.clone().into()), // tablename
-                Value::Text("turso".into()),            // tableowner
+                Value::Text(owner.clone().into()),      // tableowner
                 Value::Null,                            // tablespace
                 Value::from_i64(0),                     // hasindexes
                 Value::from_i64(0),                     // hasrules
@@ -1976,15 +2022,15 @@ impl SnapshotRows for PgSequencesTable {
                     .get_sequence_currval(&seq_name)
                     .unwrap_or(seq.start_value);
                 rows.push(vec![
-                    Value::build_text("public"),           // schemaname
-                    Value::build_text(seq_name),           // sequencename
-                    Value::build_text("turso"),            // sequenceowner
-                    Value::build_text("bigint"),           // data_type
-                    Value::from_i64(seq.start_value),      // start_value
-                    Value::from_i64(seq.min_value),        // min_value
-                    Value::from_i64(seq.max_value),        // max_value
-                    Value::from_i64(seq.increment_by),     // increment_by
-                    Value::from_i64(i64::from(seq.cycle)), // cycle
+                    Value::build_text("public"),             // schemaname
+                    Value::build_text(seq_name),             // sequencename
+                    Value::build_text(superuser_name(conn)), // sequenceowner
+                    Value::build_text("bigint"),             // data_type
+                    Value::from_i64(seq.start_value),        // start_value
+                    Value::from_i64(seq.min_value),          // min_value
+                    Value::from_i64(seq.max_value),          // max_value
+                    Value::from_i64(seq.increment_by),       // increment_by
+                    Value::from_i64(i64::from(seq.cycle)),   // cycle
                     Value::from_i64(1), // cache_size (PG default; Turso doesn't cache)
                     Value::from_i64(last_val), // last_value
                 ]);
