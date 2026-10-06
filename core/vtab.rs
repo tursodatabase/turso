@@ -27,8 +27,8 @@ pub struct VirtualTable {
     pub(crate) vtab_id: u64,
     /// Whether `DROP TABLE` may remove this table from its schema.
     pub(crate) is_droppable: bool,
-    /// Whether triggers can read this virtual table.
-    /// This permission does not allow writes from triggers.
+    // Whether this virtual table is safe to use from within triggers and views.
+    // Corresponds to SQLite's SQLITE_VTAB_INNOCUOUS flag.
     pub(crate) innocuous: bool,
 }
 
