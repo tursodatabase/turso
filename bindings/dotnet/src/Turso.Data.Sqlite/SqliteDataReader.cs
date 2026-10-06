@@ -31,11 +31,10 @@ public class SqliteDataReader : DbDataReader
     private int _managedResultIndex;
     private int _managedRowIndex = -1;
 
-    // Declared types and table schemas resolved for the current result set. The fallback
-    // heuristics run PRAGMA queries, so they are computed once per statement, not once per cell.
-    private TursoStatementHandle? _schemaCacheStatement;
+    // Declared types resolved for the current result set, so GetValue does not cross into
+    // native code for them on every cell.
+    private TursoStatementHandle? _declaredTypeStatement;
     private string?[] _declaredTypeNames = [];
-    private Dictionary<string, Dictionary<string, SchemaColumnInfo>>? _tableColumnsCache;
 
     internal SqliteDataReader(SqliteCommand command, TursoStatementHandle statement, string currentSql, List<string> remainingSql, int recordsAffected, CommandBehavior behavior, Action closeCallback)
     {
@@ -1096,60 +1095,28 @@ public class SqliteDataReader : DbDataReader
             return CurrentManagedResult.Columns[ordinal].DataTypeName;
         }
 
-        EnsureSchemaCache();
+        EnsureDeclaredTypeCache();
         if ((uint)ordinal >= (uint)_declaredTypeNames.Length)
-            return ResolveDeclaredTypeName(ordinal);
+            throw new ArgumentOutOfRangeException(nameof(ordinal), ordinal, null);
 
         return _declaredTypeNames[ordinal] ??= ResolveDeclaredTypeName(ordinal);
     }
 
-    private void EnsureSchemaCache()
+    private void EnsureDeclaredTypeCache()
     {
-        if (_schemaCacheStatement is not null && ReferenceEquals(_schemaCacheStatement, _statement))
+        if (_declaredTypeStatement is not null && ReferenceEquals(_declaredTypeStatement, _statement))
             return;
 
-        _schemaCacheStatement = _statement;
+        _declaredTypeStatement = _statement;
         _declaredTypeNames = _statement is null ? [] : new string?[TursoBindings.GetFieldCount(_statement)];
-        _tableColumnsCache = null;
     }
 
     private string ResolveDeclaredTypeName(int ordinal)
     {
-        // The engine knows the declared type of direct column references; the SQL heuristics
-        // below only cover what it leaves unresolved.
-        var nativeDeclaredType = TursoBindings.GetDeclaredTypeName(GetStatement(), ordinal);
-        if (!string.IsNullOrEmpty(nativeDeclaredType))
-            return StripTypeLength(nativeDeclaredType);
-
-        if (TryGetSelectSource(out var tableName, out var selections))
-        {
-            var tableColumns = GetTableColumns(tableName);
-            var columnName = GetName(ordinal);
-            var selection = ordinal < selections.Count ? selections[ordinal] : columnName;
-            var baseColumnName = ResolveBaseColumnName(selection, columnName, tableColumns);
-            if (baseColumnName is not null && tableColumns.TryGetValue(baseColumnName, out var columnInfo))
-                return StripTypeLength(columnInfo.TypeName);
-        }
-
-        var match = Regex.Match(_command.CommandText, @"^\s*SELECT\s+(?<column>[\w\[\]""`]+)\s+FROM\s+(?<table>[\w\[\]""`]+)", RegexOptions.IgnoreCase);
-        if (!match.Success || _command.Connection is null)
-            return string.Empty;
-
-        var column = UnquoteIdentifier(match.Groups["column"].Value);
-        if (!string.Equals(column, GetName(ordinal), StringComparison.OrdinalIgnoreCase))
-            return string.Empty;
-
-        var table = UnquoteIdentifier(match.Groups["table"].Value);
-        using var command = _command.Connection.CreateCommand();
-        command.CommandText = $"PRAGMA table_info({QuoteIdentifier(table)});";
-        using var reader = command.ExecuteReader();
-        while (reader.Read())
-        {
-            if (string.Equals(reader.GetString(1), column, StringComparison.OrdinalIgnoreCase))
-                return StripTypeLength(reader.GetString(2));
-        }
-
-        return string.Empty;
+        // Like sqlite3_column_decltype: the declared type of a direct table-column reference,
+        // nothing for an expression.
+        var declaredType = TursoBindings.GetDeclaredTypeName(GetStatement(), ordinal);
+        return string.IsNullOrEmpty(declaredType) ? string.Empty : StripTypeLength(declaredType);
     }
 
     private static string InferDataTypeName(string expression)
@@ -1232,19 +1199,6 @@ public class SqliteDataReader : DbDataReader
     }
 
     private Dictionary<string, SchemaColumnInfo> GetTableColumns(string tableName)
-    {
-        EnsureSchemaCache();
-        _tableColumnsCache ??= new Dictionary<string, Dictionary<string, SchemaColumnInfo>>(StringComparer.OrdinalIgnoreCase);
-        if (!_tableColumnsCache.TryGetValue(tableName, out var columns))
-        {
-            columns = QueryTableColumns(tableName);
-            _tableColumnsCache[tableName] = columns;
-        }
-
-        return columns;
-    }
-
-    private Dictionary<string, SchemaColumnInfo> QueryTableColumns(string tableName)
     {
         var columns = new Dictionary<string, SchemaColumnInfo>(StringComparer.OrdinalIgnoreCase);
         if (_command.Connection is null)

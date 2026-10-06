@@ -1071,6 +1071,28 @@ public class SqliteFacadeTests
     }
 
     [Test]
+    public void GetValueResolvesDeclaredTypesThroughAliasesAndJoins()
+    {
+        using var connection = new SqliteConnection("Data Source=:memory:");
+        connection.Open();
+        connection.ExecuteNonQuery(
+            """
+            CREATE TABLE GuidIds (Id GUID);
+            CREATE TABLE TextIds (Id TEXT);
+            INSERT INTO GuidIds VALUES ('dc0d7e0e-365d-4948-ab9b-8ca8056bf93a');
+            INSERT INTO TextIds VALUES ('dc0d7e0e-365d-4948-ab9b-8ca8056bf93a');
+            """);
+
+        using var reader = connection.ExecuteReader("SELECT t.Id AS TextId, g.Id AS GuidId FROM TextIds t JOIN GuidIds g ON g.Id = t.Id");
+        reader.Read().Should().BeTrue();
+        reader.GetDataTypeName(0).Should().Be("TEXT");
+        reader.GetValue(0).Should().Be("dc0d7e0e-365d-4948-ab9b-8ca8056bf93a");
+        reader.GetDataTypeName(1).Should().Be("GUID");
+        reader.GetValue(1).Should().Be(new Guid("dc0d7e0e-365d-4948-ab9b-8ca8056bf93a"));
+        reader.Invoking(r => r.GetDataTypeName(2)).Should().Throw<ArgumentOutOfRangeException>();
+    }
+
+    [Test]
     public void GetFieldValueThrowsForNullTypedValues()
     {
         using var connection = new SqliteConnection("Data Source=:memory:");
