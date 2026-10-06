@@ -2,7 +2,7 @@ use crate::alloc::TryClone;
 use crate::function::ExternalFunc;
 use crate::native_ext::*;
 use crate::sync::{Arc, Mutex};
-use crate::types::{IOCompletions, IOResultOr};
+use crate::types::{AggContext, ExternalAggState, IOCompletions, IOResultOr};
 use crate::{
     Completion, Connection, Database, IOResult, LimboError, MemoryIO, Numeric, OpenOptions,
     Register, Result, SqliteDialect, Statement, StepResult, Value,
@@ -444,14 +444,25 @@ fn live_aggregate_accumulators_cannot_be_copied() {
         step_aggregate(&mut original, &factory, &args).unwrap(),
         IOResult::IO(_)
     ));
-    assert!(catch_unwind(AssertUnwindSafe(|| original.clone())).is_err());
-    assert!(catch_unwind(AssertUnwindSafe(|| original.try_clone())).is_err());
-    let mut destination = Register::Value(Value::from_i64(97));
-    assert!(catch_unwind(AssertUnwindSafe(|| {
-        destination.try_clone_from(&original)
-    }))
-    .is_err());
-    assert_eq!(destination.get_value(), &Value::from_i64(97));
+    let builtin = Register::Aggregate(AggContext::Builtin(crate::alloc::vec![
+        Value::from_i64(17),
+        Value::build_text("aggregate payload"),
+    ]));
+    let external = Register::Aggregate(AggContext::External(ExternalAggState {
+        context: 0,
+        state: std::ptr::null_mut(),
+        argc: 2,
+        step_fn: unused_aggregate_step,
+        finalize_fn: unused_aggregate_finalize,
+        aggregate_destructor: None,
+        value_destructor: None,
+    }));
+    for source in [&builtin, &external, &original] {
+        assert!(catch_unwind(AssertUnwindSafe(|| source.try_clone())).is_err());
+        let mut destination = Register::Value(Value::from_i64(97));
+        assert!(catch_unwind(AssertUnwindSafe(|| { destination.try_clone_from(source) })).is_err());
+        assert_eq!(destination.get_value(), &Value::from_i64(97));
+    }
     finish(&factory.queue, || {
         step_aggregate(&mut original, &factory, &args)
     });
