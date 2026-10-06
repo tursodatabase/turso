@@ -141,6 +141,7 @@ fn emit_seek_multi_index_branch(
     SeekEmitter::new(
         program,
         table_references,
+        table,
         seek_def,
         t_ctx,
         branch_cursor_id,

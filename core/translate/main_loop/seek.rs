@@ -1,15 +1,23 @@
 use super::*;
+use crate::function::{Func, FuncCtx};
+use crate::functions::seek_key::NoSeekKey;
+use crate::schema::IndexUse;
 use crate::translate::plan::BitSet;
 use crate::vdbe::insn::NullMatchingMask;
 use turso_parser::ast::NullsOrder;
 
 fn index_seek_affinities(seek_def: &SeekDef, seek_key: &SeekKey) -> String {
     // Apply the constraint's resolved comparison affinity to the seek key,
-    // not the indexed column's affinity.
+    // not the indexed column's affinity. A component that the seek turns into
+    // an index key already holds the stored form, so it gets no affinity.
     seek_def
         .iter(seek_key)
         .zip(seek_def.iter_affinity(seek_key))
-        .map(|(key_component, aff)| match key_component {
+        .enumerate()
+        .map(|(pos, (key_component, aff))| match key_component {
+            _ if seek_def.key_component_index_use(pos) != IndexUse::Plain => {
+                affinity::SQLITE_AFF_BLOB
+            }
             SeekKeyComponent::Expr(expr) if aff.expr_needs_no_affinity_change(expr) => {
                 affinity::SQLITE_AFF_BLOB
             }
@@ -18,62 +26,11 @@ fn index_seek_affinities(seek_def: &SeekDef, seek_key: &SeekKey) -> String {
         .collect()
 }
 
-fn encode_seek_keys_for_custom_types(
-    program: &mut ProgramBuilder,
-    tables: &TableReferences,
-    seek_index: &Arc<Index>,
-    start_reg: usize,
-    num_keys: usize,
-    idx_col_offset: usize,
-    resolver: &Resolver<'_>,
-) -> crate::Result<()> {
-    let table = tables
-        .find_table_by_identifier(&seek_index.table_name)
-        .or_else(|| tables.find_table_by_table_name(&seek_index.table_name));
-    let table = match table {
-        Some(t) => t,
-        None => return Ok(()),
-    };
-    let columns = table.columns();
-    for i in 0..num_keys {
-        let idx_col_pos = idx_col_offset + i;
-        if idx_col_pos >= seek_index.columns.len() {
-            break;
-        }
-        let idx_col = &seek_index.columns[idx_col_pos];
-        let table_col = match columns.get(idx_col.pos_in_table) {
-            Some(c) => c,
-            None => continue,
-        };
-        let type_def = match resolver
-            .schema()
-            .get_type_def(&table_col.ty_str, table.is_strict())
-        {
-            Some(td) => td,
-            None => continue,
-        };
-        let encode_expr = match type_def.encode() {
-            Some(e) => e,
-            None => continue,
-        };
-        let reg = start_reg + i;
-        let skip_label = program.allocate_label();
-        program.emit_insn(Insn::IsNull {
-            reg,
-            target_pc: skip_label,
-        });
-        crate::translate::expr::emit_type_expr(
-            program,
-            encode_expr,
-            reg,
-            reg,
-            table_col,
-            type_def,
-            resolver,
-        )?;
-        program.preassign_label_to_next_insn(skip_label);
-    }
-    Ok(())
+/// Which end of the index range a seek key bounds, in index storage order.
+#[derive(Clone, Copy)]
+enum StoredRangeEnd {
+    Low,
+    High,
 }
 
 /// Seek-based loop setup.
@@ -84,6 +41,7 @@ fn encode_seek_keys_for_custom_types(
 pub(super) struct SeekEmitter<'a, 'plan> {
     program: &'a mut ProgramBuilder,
     tables: &'a TableReferences,
+    table: &'a JoinedTable,
     seek_def: &'a SeekDef,
     t_ctx: &'a mut TranslateCtx<'plan>,
     seek_cursor_id: usize,
@@ -98,6 +56,7 @@ impl<'a, 'plan> SeekEmitter<'a, 'plan> {
     pub(super) fn new(
         program: &'a mut ProgramBuilder,
         tables: &'a TableReferences,
+        table: &'a JoinedTable,
         seek_def: &'a SeekDef,
         t_ctx: &'a mut TranslateCtx<'plan>,
         seek_cursor_id: usize,
@@ -108,6 +67,7 @@ impl<'a, 'plan> SeekEmitter<'a, 'plan> {
         Self {
             program,
             tables,
+            table,
             seek_def,
             t_ctx,
             seek_cursor_id,
@@ -166,7 +126,8 @@ impl<'a, 'plan> SeekEmitter<'a, 'plan> {
             return Ok(());
         }
 
-        for (i, key) in self.seek_def.iter(&self.seek_def.start).enumerate() {
+        let seek_def = self.seek_def;
+        for (i, key) in seek_def.iter(&seek_def.start).enumerate() {
             let reg = self.start_reg + i;
             match key {
                 SeekKeyComponent::Expr(expr) => {
@@ -190,6 +151,11 @@ impl<'a, 'plan> SeekEmitter<'a, 'plan> {
                             target_pc: self.loop_end,
                         });
                     }
+                    let start_end = match self.seek_def.iter_dir {
+                        IterationDirection::Forwards => StoredRangeEnd::Low,
+                        IterationDirection::Backwards => StoredRangeEnd::High,
+                    };
+                    self.emit_index_key(i, reg, expr, &seek_def.start, start_end)?;
                 }
                 SeekKeyComponent::Null => self.program.emit_null(reg, None),
                 SeekKeyComponent::None => {
@@ -210,15 +176,6 @@ impl<'a, 'plan> SeekEmitter<'a, 'plan> {
         let null_matching_mask = NullMatchingMask::from(null_matching_bits);
 
         if let Some(idx) = self.seek_index {
-            encode_seek_keys_for_custom_types(
-                self.program,
-                self.tables,
-                idx,
-                self.start_reg,
-                num_regs,
-                0,
-                &self.t_ctx.resolver,
-            )?;
             let affinities = index_seek_affinities(self.seek_def, &self.seek_def.start);
             if affinities.chars().any(|c| c != affinity::SQLITE_AFF_BLOB) {
                 self.program.emit_insn(Insn::Affinity {
@@ -324,9 +281,10 @@ impl<'a, 'plan> SeekEmitter<'a, 'plan> {
             return Ok(());
         }
 
-        let num_regs = self.seek_def.size(&self.seek_def.end);
-        let last_reg = self.start_reg + self.seek_def.prefix.len();
-        match &self.seek_def.end.last_component {
+        let seek_def = self.seek_def;
+        let num_regs = seek_def.size(&seek_def.end);
+        let last_reg = self.start_reg + seek_def.prefix.len();
+        match &seek_def.end.last_component {
             SeekKeyComponent::Expr(expr) => {
                 translate_expr_no_constant_opt(
                     self.program,
@@ -336,16 +294,24 @@ impl<'a, 'plan> SeekEmitter<'a, 'plan> {
                     &self.t_ctx.resolver,
                     NoConstantOptReason::RegisterReuse,
                 )?;
-                if let Some(idx) = self.seek_index {
-                    encode_seek_keys_for_custom_types(
-                        self.program,
-                        self.tables,
-                        idx,
-                        last_reg,
-                        1,
-                        self.seek_def.prefix.len(),
-                        &self.t_ctx.resolver,
-                    )?;
+                if !expr.is_nonnull(self.tables) {
+                    self.program.emit_insn(Insn::IsNull {
+                        reg: last_reg,
+                        target_pc: self.loop_end,
+                    });
+                }
+                let end_end = match self.seek_def.iter_dir {
+                    IterationDirection::Forwards => StoredRangeEnd::High,
+                    IterationDirection::Backwards => StoredRangeEnd::Low,
+                };
+                self.emit_index_key(
+                    seek_def.prefix.len(),
+                    last_reg,
+                    expr,
+                    &seek_def.end,
+                    end_end,
+                )?;
+                if self.seek_index.is_some() {
                     let affinities = index_seek_affinities(self.seek_def, &self.seek_def.end);
                     if affinities.chars().any(|c| c != affinity::SQLITE_AFF_BLOB) {
                         self.program.emit_insn(Insn::Affinity {
@@ -354,12 +320,6 @@ impl<'a, 'plan> SeekEmitter<'a, 'plan> {
                             affinities,
                         });
                     }
-                }
-                if !expr.is_nonnull(self.tables) {
-                    self.program.emit_insn(Insn::IsNull {
-                        reg: last_reg,
-                        target_pc: self.loop_end,
-                    });
                 }
             }
             SeekKeyComponent::Null => self.program.emit_null(last_reg, None),
@@ -462,5 +422,103 @@ impl<'a, 'plan> SeekEmitter<'a, 'plan> {
     pub(super) fn emit(mut self, loop_start: BranchOffset, use_bloom_filter: bool) -> Result<()> {
         self.emit_start_bound(use_bloom_filter)?;
         self.emit_termination(loop_start)
+    }
+
+    /// Turn the operand in `reg`, the key component at `pos` of `seek_key`,
+    /// into the stored form that the index compares. An equality component
+    /// that has no stored form ends the loop. A range component that has no
+    /// stored form gets a key beyond every stored value at `range_end`, so the
+    /// range has no limit on that side; its WHERE term stays as a filter.
+    fn emit_index_key(
+        &mut self,
+        pos: usize,
+        reg: usize,
+        operand: &Expr,
+        seek_key: &SeekKey,
+        range_end: StoredRangeEnd,
+    ) -> Result<()> {
+        let index_use = self.seek_def.key_component_index_use(pos);
+        if index_use == IndexUse::Plain {
+            return Ok(());
+        }
+        let index = self
+            .seek_index
+            .expect("only an index seek turns an operand into an index key");
+        let is_equality = pos < self.seek_def.prefix.len();
+        match index_use {
+            IndexUse::KeyFunction(function) => {
+                let affinity = self
+                    .seek_def
+                    .iter_affinity(seek_key)
+                    .nth(pos)
+                    .expect("key component must have an affinity");
+                if !affinity.expr_needs_no_affinity_change(operand) {
+                    self.program.emit_insn(Insn::Affinity {
+                        start_reg: reg,
+                        count: std::num::NonZeroUsize::new(1).unwrap(),
+                        affinities: affinity.aff_mask().to_string(),
+                    });
+                }
+                let no_key = if is_equality {
+                    NoSeekKey::Null
+                } else {
+                    match (range_end, index.columns[pos].order) {
+                        (StoredRangeEnd::Low, SortOrder::Asc)
+                        | (StoredRangeEnd::High, SortOrder::Desc) => NoSeekKey::BelowEveryValue,
+                        (StoredRangeEnd::High, SortOrder::Asc)
+                        | (StoredRangeEnd::Low, SortOrder::Desc) => NoSeekKey::AboveEveryValue,
+                    }
+                };
+                let args = self.program.alloc_registers(2);
+                self.program.emit_insn(Insn::Copy {
+                    src_reg: reg,
+                    dst_reg: args,
+                    extra_amount: 0,
+                });
+                self.program.emit_int(no_key as i64, args + 1);
+                self.program.emit_insn(Insn::Function {
+                    constant_mask: 0,
+                    start_reg: args,
+                    dest: reg,
+                    func: FuncCtx {
+                        func: Func::Scalar(function.scalar_func()),
+                        arg_count: 2,
+                    },
+                });
+            }
+            IndexUse::EncodedLiteralEquality => {
+                turso_assert!(is_equality, "an encoded literal can only seek for equality");
+                let column = &self.table.columns()[index.columns[pos].pos_in_table];
+                let type_def = self
+                    .t_ctx
+                    .resolver
+                    .schema()
+                    .get_type_def(&column.ty_str, self.table.table.is_strict())
+                    .expect("an encoded literal seek needs a custom type")
+                    .clone();
+                let encode = type_def
+                    .encode()
+                    .expect("an encoded literal seek needs an ENCODE");
+                crate::translate::expr::emit_type_expr(
+                    self.program,
+                    encode,
+                    reg,
+                    reg,
+                    column,
+                    &type_def,
+                    &self.t_ctx.resolver,
+                )?;
+            }
+            IndexUse::Plain | IndexUse::Unusable => {
+                unreachable!("{index_use:?} never turns an operand into an index key")
+            }
+        }
+        if is_equality {
+            self.program.emit_insn(Insn::IsNull {
+                reg,
+                target_pc: self.loop_end,
+            });
+        }
+        Ok(())
     }
 }

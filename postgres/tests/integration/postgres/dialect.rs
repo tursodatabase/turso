@@ -3492,6 +3492,129 @@ fn test_postgres_ne_all_bound_array_param(db: TempDatabase) {
 }
 
 #[turso_macros::test(mvcc)]
+fn test_postgres_uuid_index_lookup_with_bound_parameter(db: TempDatabase) {
+    let conn = db.connect_postgres();
+    conn.execute("CREATE TABLE acct (id uuid PRIMARY KEY, name text)")
+        .unwrap();
+    conn.execute("CREATE TABLE acct_plain (id uuid, name text)")
+        .unwrap();
+    for table in ["acct", "acct_plain"] {
+        conn.execute(&format!(
+            "INSERT INTO {table} VALUES ('a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11', 'alice'), \
+             ('00000000-0000-4000-8000-000000000001', 'bob')"
+        ))
+        .unwrap();
+    }
+
+    let lookup = |table: &str, param: &str| {
+        rows_with_param(
+            &conn,
+            &format!("SELECT name FROM {table} WHERE id = $1"),
+            Value::from_text(param.to_owned()),
+        )
+    };
+    assert_eq!(
+        lookup("acct", "a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11"),
+        vec![vec![Value::build_text("alice")]]
+    );
+    for param in [
+        "a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11",
+        "A0EEBC99-9C0B-4EF8-BB6D-6BB9BD380A11",
+        "a0eebc999c0b4ef8bb6d6bb9bd380a11",
+        "not a uuid",
+    ] {
+        assert_eq!(
+            lookup("acct", param),
+            lookup("acct_plain", param),
+            "the index changed the rows for {param}"
+        );
+    }
+
+    let range = |table: &str| {
+        rows_with_param(
+            &conn,
+            &format!("SELECT name FROM {table} WHERE id > $1 ORDER BY name"),
+            Value::from_text("B".to_owned()),
+        )
+    };
+    assert_eq!(range("acct"), range("acct_plain"));
+}
+
+#[turso_macros::test(mvcc)]
+fn test_postgres_timestamp_range_with_bound_parameter_uses_index(db: TempDatabase) {
+    let conn = db.connect_postgres();
+    conn.execute("CREATE TABLE ev (id int PRIMARY KEY, ts timestamp)")
+        .unwrap();
+    conn.execute("CREATE INDEX ev_ts ON ev (ts)").unwrap();
+    conn.execute(
+        "INSERT INTO ev VALUES (1, '2024-01-01 00:00:00'), (2, '2024-01-01 10:30:00'), \
+         (3, '2024-01-02 08:00:00')",
+    )
+    .unwrap();
+
+    let mut stmt = conn
+        .prepare("EXPLAIN SELECT id FROM ev WHERE ts > $1")
+        .unwrap();
+    let plan = stmt.run_collect_rows().unwrap();
+    assert_eq!(
+        plan.iter()
+            .map(|row| row[3].to_string())
+            .collect::<Vec<_>>(),
+        vec!["SEARCH ev USING COVERING INDEX ev_ts (ts>?)".to_string()]
+    );
+
+    let rows = rows_with_param(
+        &conn,
+        "SELECT id FROM ev WHERE ts > $1 ORDER BY id",
+        Value::from_text("2024-01-01 00:00:00".to_owned()),
+    );
+    assert_eq!(
+        rows,
+        vec![vec![Value::from_i64(2)], vec![Value::from_i64(3)]]
+    );
+}
+
+#[turso_macros::test(mvcc)]
+fn test_postgres_numeric_equality_with_bound_parameter_same_rows_with_and_without_index(
+    db: TempDatabase,
+) {
+    let conn = db.connect_postgres();
+    conn.execute("CREATE TABLE pa (id int PRIMARY KEY, n numeric(10,2))")
+        .unwrap();
+    conn.execute("CREATE INDEX pa_n ON pa (n)").unwrap();
+    conn.execute("CREATE TABLE pa_plain (id int PRIMARY KEY, n numeric(10,2))")
+        .unwrap();
+    for table in ["pa", "pa_plain"] {
+        conn.execute(&format!(
+            "INSERT INTO {table} VALUES (1, 1.5), (2, 12.25), (3, -2)"
+        ))
+        .unwrap();
+    }
+    for param in [
+        Value::from_f64(1.5),
+        Value::from_text("12.25".to_owned()),
+        Value::from_i64(-2),
+    ] {
+        let count = |table: &str| {
+            rows_with_param(
+                &conn,
+                &format!("SELECT count(*) FROM {table} WHERE n = $1"),
+                param.clone(),
+            )
+        };
+        assert_eq!(count("pa"), count("pa_plain"), "for {param:?}");
+    }
+}
+
+/// Run `sql` with `$1` bound to `param` and return all rows.
+fn rows_with_param(conn: &turso_pg::PgConnection, sql: &str, param: Value) -> Vec<Vec<Value>> {
+    let mut stmt = conn.prepare(sql).unwrap();
+    stmt.bind_at(std::num::NonZero::new(1).unwrap(), param)
+        .unwrap();
+    stmt.run_collect_rows().unwrap()
+}
+
+#[turso_macros::test(mvcc)]
 fn test_postgres_catalog_conkey_any_matches_no_rows(db: TempDatabase) {
     let conn = db.connect_postgres();
     conn.execute("CREATE TABLE pkt (a int, b int, PRIMARY KEY (a, b))")

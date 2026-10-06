@@ -481,7 +481,7 @@ fn translate_leaf_condition_expr(
         ast::Expr::Binary(e1, op, e2) => {
             // Check if either operand has a custom type with a matching operator
             if let Some(resolved) =
-                find_custom_type_operator(e1, e2, op, Some(referenced_tables), resolver)
+                find_custom_type_operator(e1, e2, op, Some(referenced_tables), resolver.schema())
             {
                 let result_reg = emit_custom_type_operator(
                     program,

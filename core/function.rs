@@ -905,6 +905,12 @@ pub enum ScalarFunc {
     NumericDiv,
     NumericLt,
     NumericEq,
+    /// `uuid_seek_key(value, no_key)` returns the 16-byte blob of a canonical
+    /// UUID text (36 lowercase characters with hyphens), because only that
+    /// text is equal to a DECODEd `uuid` value. For other input it returns
+    /// the value that `no_key` names (see
+    /// [crate::functions::seek_key::NoSeekKey]).
+    UuidSeekKey,
     // Array construction / element access (desugared from ARRAY[…] and expr[n] syntax)
     Array,
     ArrayElement,
@@ -1033,7 +1039,8 @@ impl Deterministic for ScalarFunc {
             | ScalarFunc::NumericMul
             | ScalarFunc::NumericDiv
             | ScalarFunc::NumericLt
-            | ScalarFunc::NumericEq => true,
+            | ScalarFunc::NumericEq
+            | ScalarFunc::UuidSeekKey => true,
             ScalarFunc::Array
             | ScalarFunc::ArrayElement
             | ScalarFunc::ArraySetElement
@@ -1182,6 +1189,7 @@ impl Display for ScalarFunc {
             Self::NumericDiv => "numeric_div",
             Self::NumericLt => "numeric_lt",
             Self::NumericEq => "numeric_eq",
+            Self::UuidSeekKey => "uuid_seek_key",
             Self::Array => "array",
             Self::ArrayElement => "array_element",
             Self::ArraySetElement => "array_set_element",
@@ -1228,6 +1236,7 @@ impl ScalarFunc {
                 | Self::BinRecordJsonObject
                 | Self::ConnTxnId
                 | Self::IsAutocommit
+                | Self::UuidSeekKey
         )
     }
 
@@ -1305,7 +1314,8 @@ impl ScalarFunc {
             | Self::TableColumnsJsonArray
             | Self::BinRecordJsonObject
             | Self::ConnTxnId
-            | Self::IsAutocommit => &[0],
+            | Self::IsAutocommit
+            | Self::UuidSeekKey => &[0],
             // Scalar max/min (multi-arg)
             Self::Max | Self::Min => &[-1],
             // SQL-standard string and math extensions

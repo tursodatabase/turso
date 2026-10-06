@@ -620,7 +620,9 @@ fn try_translate_custom_type_operator(
     target_register: usize,
     resolver: &Resolver,
 ) -> Result<bool> {
-    let Some(resolved) = find_custom_type_operator(e1, e2, op, referenced_tables, resolver) else {
+    let Some(resolved) =
+        find_custom_type_operator(e1, e2, op, referenced_tables, resolver.schema())
+    else {
         return Ok(false);
     };
     let result_reg =
@@ -1899,6 +1901,9 @@ fn translate_function_call_expr(
                 ScalarFunc::ConnTxnId | ScalarFunc::IsAutocommit => {
                     crate::bail_parse_error!("{} is an internal function used by CDC", srf);
                 }
+                ScalarFunc::UuidSeekKey => {
+                    crate::bail_parse_error!("{} is an internal function used by index seeks", srf);
+                }
                 ScalarFunc::TestUintEncode
                 | ScalarFunc::TestUintDecode
                 | ScalarFunc::TestUintAdd
@@ -2580,8 +2585,11 @@ fn translate_column_expr(
                         // For custom type columns with ENCODE/DECODE and a
                         // default, suppress the Column instruction's default.
                         // We handle short records (ALTER TABLE ADD COLUMN) via
-                        // ColumnHasField after the Column instruction.
-                        let col_ref = table.get_column_at(column);
+                        // ColumnHasField after the Column instruction. An index
+                        // record always holds all of its columns.
+                        let col_ref = (!read_from_index)
+                            .then(|| table.get_column_at(column))
+                            .flatten();
                         if let Some(col) = col_ref {
                             if col.default.is_some() {
                                 if let Ok(Some(resolved)) = resolver
@@ -2626,20 +2634,19 @@ fn translate_column_expr(
                     // (ALTER TABLE ADD COLUMN) return NULL.  Use
                     // ColumnHasField to detect short records and compute
                     // ENCODE(DEFAULT) at runtime via bytecode.
-                    if let Some(type_def) = resolver
-                        .schema()
-                        .get_type_def(&column.ty_str, table.is_strict())
-                    {
+                    let short_record_type_def = (!read_from_index)
+                        .then(|| {
+                            resolver
+                                .schema()
+                                .get_type_def(&column.ty_str, table.is_strict())
+                        })
+                        .flatten();
+                    if let Some(type_def) = short_record_type_def {
                         if type_def.encode().is_some() {
                             if let Some(ref default_expr) = column.default {
-                                // Reconstruct the cursor id used for reading
-                                let read_cursor = if read_from_index {
-                                    index_cursor_id.expect("index cursor should be opened")
-                                } else {
-                                    table_cursor_id
-                                        .or(index_cursor_id)
-                                        .expect("cursor should be opened")
-                                };
+                                let read_cursor = table_cursor_id
+                                    .or(index_cursor_id)
+                                    .expect("cursor should be opened");
                                 let done_label = program.allocate_label();
                                 // Jump past the default block if the record
                                 // actually has this column (not a short record).

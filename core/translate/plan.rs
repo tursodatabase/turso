@@ -2,8 +2,8 @@ use crate::{
     alloc::{self, TursoIteratorExt, TursoVecExt},
     function::{AccumulatorFunc, AggFunc},
     schema::{
-        BTreeTable, ColDef, Column, FromClauseSubquery, Index, PseudoCursorType, RecursiveCteInput,
-        Schema, Table, ROWID_SENTINEL,
+        BTreeTable, ColDef, Column, FromClauseSubquery, Index, IndexUse, PseudoCursorType,
+        RecursiveCteInput, Schema, Table, ROWID_SENTINEL,
     },
     translate::{
         collate::{get_collseq_from_expr, CollationSeq},
@@ -3004,6 +3004,9 @@ pub struct SeekDef {
     pub end: SeekKey,
     /// The direction of the scan that follows the seek.
     pub iter_dir: IterationDirection,
+    /// How the seek turns the expression of the last component of `start`
+    /// and `end` into an index key.
+    pub last_component_index_use: IndexUse,
 }
 
 pub struct SeekDefKeyIterator<'a, T> {
@@ -3087,6 +3090,15 @@ impl SeekDef {
             seek_key: key,
             pos: 0,
             _t: PhantomData,
+        }
+    }
+
+    /// How the seek turns the expression of the key component at `pos` into
+    /// an index key.
+    pub fn key_component_index_use(&self, pos: usize) -> IndexUse {
+        match self.prefix.get(pos) {
+            Some(component) => component.index_use,
+            None => self.last_component_index_use,
         }
     }
 

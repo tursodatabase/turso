@@ -1020,14 +1020,9 @@ fn index_columns_order_consumed<'a>(
             break;
         }
 
-        // Custom type columns store encoded blobs. The B-tree's byte order
-        // does not match the custom type's order.
         if let ColumnTarget::Column(col_no) = &target_col.target {
             if let Some(col) = table_ref.table.columns().get(*col_no) {
-                if schema
-                    .get_type_def(&col.ty_str, table_ref.table.is_strict())
-                    .is_some()
-                {
+                if !schema.column_index_gives_order(col, table_ref.table.is_strict()) {
                     break;
                 }
             }

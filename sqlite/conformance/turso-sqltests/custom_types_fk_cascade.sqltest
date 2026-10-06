@@ -178,9 +178,31 @@ test cascade-text-based-type {
     INSERT INTO parent VALUES ('hello');
     INSERT INTO child VALUES (1, 'hello');
 
-    UPDATE parent SET id = 'world' WHERE id = 'hello';
+    UPDATE parent SET id = 'world' WHERE id = 'HELLO';
     SELECT parent_id FROM child;
 }
 expect {
     WORLD
+}
+
+# The stored value 'HELLO' is the value that the WHERE term compares, so
+# 'hello' matches no row, with or without the primary key index.
+@requires strict "uses STRICT tables"
+@requires custom_types "uses custom types"
+test cascade-text-based-type-where-compares-stored-value {
+    PRAGMA foreign_keys = ON;
+    CREATE TYPE upper_text BASE text ENCODE upper(value) DECODE value;
+    CREATE TABLE parent(id upper_text PRIMARY KEY) STRICT;
+    CREATE TABLE child(id INTEGER PRIMARY KEY, parent_id upper_text
+        REFERENCES parent(id) ON UPDATE CASCADE ON DELETE CASCADE) STRICT;
+
+    INSERT INTO parent VALUES ('hello');
+    INSERT INTO child VALUES (1, 'hello');
+
+    UPDATE parent SET id = 'world' WHERE id = 'hello';
+    UPDATE parent NOT INDEXED SET id = 'world' WHERE id = 'hello';
+    SELECT parent_id FROM child;
+}
+expect {
+    HELLO
 }

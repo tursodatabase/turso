@@ -11285,6 +11285,14 @@ pub fn op_function(
                     }
                 };
             }
+            ScalarFunc::UuidSeekKey => {
+                check_arg_count!(arg_count, 2);
+                let key = crate::functions::seek_key::exec_uuid_seek_key(
+                    state.registers[*start_reg].get_value(),
+                    state.registers[*start_reg + 1].get_value(),
+                )?;
+                state.registers[*dest].set_value(key);
+            }
             ScalarFunc::ArrayAppend => {
                 check_arg_count!(arg_count, 2);
                 let arr_val = state.registers[*start_reg].get_value().clone();

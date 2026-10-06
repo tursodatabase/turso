@@ -18,7 +18,7 @@ use crate::{
     schema::Schema,
     stats::AnalyzeStats,
     translate::{
-        expr::expr_references_subquery_id,
+        expr::{as_binary_components, comparison_calls_type_function, expr_references_subquery_id},
         optimizer::{
             access_method::{
                 estimate_hash_join_cost, tables_in_equal_test, try_hash_join_access_method,
@@ -1285,7 +1285,7 @@ pub(crate) fn compute_best_join_order_with_context<'a>(
     // The DP algorithm has O(2^n) complexity which becomes prohibitively slow
     // beyond ~12 tables. The greedy algorithm is O(n²) and produces good
     // (though not always optimal) plans.
-    let where_terms = build_where_term_info(where_clause, table_references, subqueries)?;
+    let where_terms = build_where_term_info(where_clause, table_references, subqueries, schema)?;
     if num_tables > GREEDY_JOIN_THRESHOLD {
         return compute_greedy_join_order(
             joined_tables,
@@ -2333,6 +2333,7 @@ fn build_where_term_info(
     where_clause: &[WhereTerm],
     table_references: &TableReferences,
     subqueries: &[NonFromClauseSubquery],
+    schema: &Schema,
 ) -> Result<Vec<WhereTermInfo>> {
     where_clause
         .iter()
@@ -2345,10 +2346,32 @@ fn build_where_term_info(
                 equal_tables: (!term.consumed)
                     .then(|| tables_in_equal_test(&term.expr))
                     .flatten()
+                    .filter(|_| {
+                        !equal_test_calls_type_function(&term.expr, table_references, schema)
+                    })
                     .map(|(left, right)| (left, right, term.from_outer_join)),
             })
         })
         .collect()
+}
+
+/// A hash join compares its keys with plain equality, so it cannot run an
+/// equal test that calls the `=` function of a custom type.
+fn equal_test_calls_type_function(
+    expr: &turso_parser::ast::Expr,
+    table_references: &TableReferences,
+    schema: &Schema,
+) -> bool {
+    let Ok(Some((left, _, right))) = as_binary_components(expr) else {
+        return false;
+    };
+    comparison_calls_type_function(
+        left,
+        right,
+        &Operator::Equals,
+        Some(table_references),
+        schema,
+    )
 }
 
 /// Return the extra `WHERE` work that can run after this table.
@@ -2623,7 +2646,8 @@ mod tests {
             Operator::Or,
             Box::new(check(second_id)),
         ))];
-        let where_terms = build_where_term_info(&two_table_where, &table_references, &[])?;
+        let where_terms =
+            build_where_term_info(&two_table_where, &table_references, &[], &Schema::default())?;
 
         let mut joined_mask = TableMask::default();
         joined_mask.set(0)?;
@@ -2641,7 +2665,12 @@ mod tests {
         ));
         term.from_outer_join = Some(second_id);
         let outer_join_where = vec![term];
-        let where_terms = build_where_term_info(&outer_join_where, &table_references, &[])?;
+        let where_terms = build_where_term_info(
+            &outer_join_where,
+            &table_references,
+            &[],
+            &Schema::default(),
+        )?;
 
         let mut joined_mask = TableMask::default();
         joined_mask.set(0)?;

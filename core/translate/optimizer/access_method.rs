@@ -7,7 +7,7 @@ use turso_ext::{ConstraintInfo, ConstraintUsage, ResultCode};
 use turso_parser::ast::{self, SortOrder, TableInternalId};
 
 use crate::alloc::{TursoIteratorExt, TursoTryWithCapacityExt, TursoVecExt};
-use crate::schema::Schema;
+use crate::schema::{IndexUse, Schema};
 use crate::stats::AnalyzeStats;
 use crate::translate::expr::{as_binary_components, comparison_affinity, walk_expr, WalkControl};
 use crate::translate::optimizer::constraints::{
@@ -482,8 +482,9 @@ fn consume_partial_index_predicate_terms(
     index: &Index,
     rhs_table: &JoinedTable,
     where_clause: &[WhereTerm],
+    schema: &Schema,
 ) -> Result<()> {
-    let predicate_terms = partial_index_predicate_terms(index, rhs_table, where_clause)
+    let predicate_terms = partial_index_predicate_terms(index, rhs_table, where_clause, schema)
         .expect("selected partial index predicate must be implied by query");
     for term_idx in predicate_terms {
         consumed.set(term_idx)?;
@@ -581,7 +582,7 @@ pub(super) fn choose_best_in_seek_candidate(
                     && constraint.table_col_pos.is_some()
                     && constraint.table_col_pos == first_col_pos
             };
-            if !matches {
+            if !matches || constraint.index_use != IndexUse::Plain {
                 continue;
             }
 
@@ -884,6 +885,7 @@ fn find_best_access_method_for_btree(
             index,
             rhs_table,
             where_clause,
+            schema,
         )?;
     }
     let mut best_access_method = AccessMethod {
@@ -1008,6 +1010,7 @@ fn find_best_access_method_for_btree(
                         index,
                         rhs_table,
                         where_clause,
+                        schema,
                     )?;
                 }
             }

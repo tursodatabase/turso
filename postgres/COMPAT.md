@@ -118,6 +118,15 @@ numeric(p,s) keep their type modifiers. interval, xml, tsvector/tsquery,
 bit/varbit, geometric types degrade to TEXT; money to REAL; OID/reg* types to
 INTEGER. Unknown type names pass through as custom types.
 
+Comparisons do not cast a literal or a parameter to the type of the column.
+A timestamp, date, time, uuid or enum column compares its text form with the
+operand as written, and a boolean column compares 0 or 1. As a result,
+`ts = '2024-01-01'` does not find `2024-01-01 00:00:00`, an upper-case uuid
+literal finds no row, `flag = 't'` finds no row, and an enum literal that is
+not a label finds no row instead of an error. A numeric column compares with
+a literal by its value, but with a parameter or another expression it
+compares its text form. An index on the column gives the same rows as a scan.
+
 | Feature | Status | Notes |
 |---------|--------|-------|
 | Arrays of compound types | ❌ Not supported | |

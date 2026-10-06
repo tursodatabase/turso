@@ -18,8 +18,8 @@ use crate::{
     index_method::{IndexMethodAttachment, IndexMethodCostContext, IndexMethodCostEstimate},
     numeric::Numeric,
     schema::{
-        BTreeCharacteristics, BTreeTable, ColDef, Column, Index, IndexColumn, Schema, Table, Type,
-        ROWID_SENTINEL,
+        BTreeCharacteristics, BTreeTable, ColDef, Column, Index, IndexColumn, IndexUse, Schema,
+        Table, Type, ROWID_SENTINEL,
     },
     translate::{
         expr::{
@@ -2321,6 +2321,7 @@ fn enforce_indexed_by_hints(
     where_clause: &[WhereTerm],
     simple_aggregate: Option<&SimpleAggregate>,
     constraints_per_table: &mut [TableConstraints],
+    schema: &Schema,
 ) -> Result<()> {
     for (i, table_ref) in table_references.joined_tables().iter().enumerate() {
         let Some(ref indexed) = table_ref.indexed else {
@@ -2342,7 +2343,12 @@ fn enforce_indexed_by_hints(
                     crate::bail_parse_error!("no such index: {}", idx_name);
                 };
                 let forced_partial_index_unusable = forced_index.where_clause.is_some()
-                    && !can_use_partial_index(forced_index.as_ref(), table_ref, where_clause);
+                    && !can_use_partial_index(
+                        forced_index.as_ref(),
+                        table_ref,
+                        where_clause,
+                        schema,
+                    );
                 if forced_partial_index_unusable
                     && matches!(simple_aggregate, Some(SimpleAggregate::Count))
                 {
@@ -2602,6 +2608,7 @@ fn find_table_access_plan(
         where_clause,
         simple_aggregate,
         &mut constraints_per_table,
+        schema,
     )?;
 
     let planning_context = JoinPlanningContext {
@@ -2911,6 +2918,7 @@ fn apply_table_access_plan(
                             &table_references.joined_tables()[table_idx],
                             where_clause,
                             is_outer_join,
+                            resolver.schema(),
                         );
                     }
                     table_references.joined_tables_mut()[table_idx].op =
@@ -2931,6 +2939,7 @@ fn apply_table_access_plan(
                             &table_references.joined_tables()[table_idx],
                             where_clause,
                             is_outer_join,
+                            resolver.schema(),
                         );
                     }
                     mark_seek_constraints_consumed(
@@ -3176,6 +3185,7 @@ fn apply_table_access_plan(
                         &table_references.joined_tables()[table_idx],
                         where_clause,
                         is_outer_join,
+                        resolver.schema(),
                     );
                 }
                 where_clause[*where_term_idx].consumed = true;
@@ -3360,6 +3370,9 @@ fn mark_seek_constraints_consumed(
         ] {
             let Some(pos) = pos else { continue };
             let constraint = &constraints[pos];
+            if constraint.index_use != IndexUse::Plain {
+                continue;
+            }
             let where_term = &mut where_clause[constraint.where_clause_pos.0];
             if where_term.consumed {
                 continue;
@@ -3380,9 +3393,11 @@ fn mark_partial_index_predicate_terms_consumed(
     table_reference: &JoinedTable,
     where_clause: &mut [WhereTerm],
     is_outer_join: bool,
+    schema: &Schema,
 ) {
-    let predicate_terms = partial_index_predicate_terms(index, table_reference, where_clause)
-        .expect("selected partial index predicate must be implied by query");
+    let predicate_terms =
+        partial_index_predicate_terms(index, table_reference, where_clause, schema)
+            .expect("selected partial index predicate must be implied by query");
     for term_idx in predicate_terms {
         let where_term = &mut where_clause[term_idx];
         if where_term.consumed {
@@ -4007,6 +4022,7 @@ pub fn build_seek_def_from_constraints(
                 op: end_op,
                 affinity: Affinity::Blob,
             },
+            last_component_index_use: IndexUse::Plain,
         });
     }
     // Extract the key values and operators
@@ -4072,6 +4088,7 @@ fn build_seek_def(
                 op: end_op,
                 affinity: Affinity::Blob,
             },
+            last_component_index_use: IndexUse::Plain,
         });
     }
     turso_assert!(last.lower_bound.is_some() || last.upper_bound.is_some());
@@ -4079,6 +4096,7 @@ fn build_seek_def(
     // pop last key as we will do some form of range search
     let last = key.pop().unwrap();
     let stored_nulls = last.nulls_order;
+    let last_component_index_use = last.index_use;
     // after that all key components must be equality constraints
     turso_debug_assert!(key.iter().all(|k| k.eq.is_some()));
 
@@ -4275,6 +4293,7 @@ fn build_seek_def(
                 iter_dir,
                 start,
                 end,
+                last_component_index_use,
             }
         }
         IterationDirection::Backwards => {
@@ -4396,6 +4415,7 @@ fn build_seek_def(
                 iter_dir,
                 start,
                 end,
+                last_component_index_use,
             }
         }
     })

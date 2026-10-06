@@ -225,6 +225,41 @@ pub enum TypeDefKind {
     Union(UnionDef),
 }
 
+/// How an index on a column can find rows. See [Schema::column_index_use].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IndexUse {
+    /// The stored value is the value that expressions compare, so the index
+    /// works as it does for a column without a custom type.
+    Plain,
+    /// The stored values sort like the values that expressions compare. The
+    /// seek key is the function of the operand, and the WHERE term stays as a
+    /// filter.
+    KeyFunction(SeekKeyFunction),
+    /// Only `column = literal` can seek. The scan calls the type's `=`
+    /// function with the encoded literal, and equal values have equal
+    /// encodings, so the seek key is the encoded literal. The WHERE term stays
+    /// as a filter.
+    EncodedLiteralEquality,
+    /// The index cannot find rows or give an order for the column.
+    Unusable,
+}
+
+/// A function that maps an operand to the stored value that compares with
+/// every stored value as the operand compares with the DECODEd value. See
+/// [ScalarFunc::UuidSeekKey] for what it returns when no such value exists.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SeekKeyFunction {
+    Uuid,
+}
+
+impl SeekKeyFunction {
+    pub fn scalar_func(self) -> ScalarFunc {
+        match self {
+            Self::Uuid => ScalarFunc::UuidSeekKey,
+        }
+    }
+}
+
 /// Custom type definition, loaded from sqlite_turso_types
 #[derive(Debug, Clone)]
 /// A fully-resolved custom type: the chain of TypeDefs from the named type
@@ -946,6 +981,40 @@ impl Schema {
     /// CREATE TABLE validation, CAST).
     pub fn get_type_def_unchecked(&self, type_name: &str) -> Option<&Arc<TypeDef>> {
         self.type_registry.get(&type_name.to_lowercase())
+    }
+
+    /// How an index on `column` can find rows. Expressions compare the
+    /// DECODEd value of a column, but an index holds the stored value.
+    pub fn column_index_use(&self, column: &Column, is_strict: bool) -> IndexUse {
+        if column.is_array() {
+            return IndexUse::Unusable;
+        }
+        match self.resolve_type(&column.ty_str, is_strict) {
+            Ok(None) => IndexUse::Plain,
+            Ok(Some(resolved)) => resolved_type_index_use(&resolved, column.collation()),
+            Err(_) => IndexUse::Unusable,
+        }
+    }
+
+    /// Whether the order of an index on `column` is the order that a sort of
+    /// the column gives. A type with a DECODE and no `<` operator cannot be
+    /// sorted, so its index must not give an order either.
+    pub fn column_index_gives_order(&self, column: &Column, is_strict: bool) -> bool {
+        if !matches!(
+            self.column_index_use(column, is_strict),
+            IndexUse::Plain | IndexUse::KeyFunction(_)
+        ) {
+            return false;
+        }
+        let Ok(Some(resolved)) = self.resolve_type(&column.ty_str, is_strict) else {
+            return true;
+        };
+        let decodes = resolved.chain.iter().any(|td| td.decode().is_some());
+        let declares_less_than = resolved
+            .chain
+            .iter()
+            .any(|td| td.operators().iter().any(|op| op.op == "<"));
+        !decodes || declares_less_than
     }
 
     /// Resolve a custom type fully: look it up (with strictness gate) and chase
@@ -2609,6 +2678,62 @@ impl Schema {
         }
 
         None
+    }
+}
+
+fn resolved_type_index_use(resolved: &ResolvedType, collation: CollationSeq) -> IndexUse {
+    if resolved
+        .chain
+        .iter()
+        .any(|td| !matches!(td.kind, TypeDefKind::Custom { .. }))
+    {
+        return IndexUse::Unusable;
+    }
+    if resolved.chain.iter().any(declares_comparison_function) {
+        let leaf = resolved.leaf();
+        return if leaf.is_builtin && leaf.name == "numeric" {
+            IndexUse::EncodedLiteralEquality
+        } else {
+            IndexUse::Unusable
+        };
+    }
+    let mut key_function = None;
+    for td in resolved.chain.iter() {
+        if decode_returns_stored_value(td) {
+            continue;
+        }
+        match builtin_seek_key_function(td) {
+            Some(function) if key_function.is_none() => key_function = Some(function),
+            _ => return IndexUse::Unusable,
+        }
+    }
+    match key_function {
+        None => IndexUse::Plain,
+        Some(function) if collation == CollationSeq::Binary => IndexUse::KeyFunction(function),
+        Some(_) => IndexUse::Unusable,
+    }
+}
+
+fn declares_comparison_function(td: &Arc<TypeDef>) -> bool {
+    td.operators().iter().any(|op| {
+        op.func_name.is_some() && matches!(op.op.as_str(), "<" | "<=" | ">" | ">=" | "=" | "!=")
+    })
+}
+
+/// A DECODE of `value` returns the stored value. The built-in `boolean` type
+/// only stores 0 and 1, which its DECODE returns unchanged.
+fn decode_returns_stored_value(td: &TypeDef) -> bool {
+    match td.decode() {
+        None => true,
+        Some(ast::Expr::Id(name)) => name.as_str().eq_ignore_ascii_case("value"),
+        Some(_) => td.is_builtin && td.name == "boolean",
+    }
+}
+
+fn builtin_seek_key_function(td: &TypeDef) -> Option<SeekKeyFunction> {
+    match (td.is_builtin, td.name.as_str()) {
+        (true, "uuid") => Some(SeekKeyFunction::Uuid),
+        _ => None,
     }
 }
 

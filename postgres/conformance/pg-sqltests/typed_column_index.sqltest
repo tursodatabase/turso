@@ -1,0 +1,205 @@
+# Indexes on columns of PostgreSQL types that Turso stores in another form
+# (timestamp, date, uuid, numeric, bigint, smallint, varchar).
+#
+# Each `_plain` table holds the same rows as its indexed twin but has no
+# index, so a comparison of the two counts shows that a query gives the same
+# rows with and without the index. Coverage here asserts behavior that real
+# PostgreSQL also exhibits.
+
+@database :memory:
+
+setup events {
+    CREATE TABLE ev (id int PRIMARY KEY, ts timestamp, day date, created_at timestamp DEFAULT now());
+    CREATE INDEX ev_ts ON ev (ts);
+    CREATE INDEX ev_day ON ev (day);
+    CREATE INDEX ev_created_at ON ev (created_at);
+    CREATE TABLE ev_plain (id int PRIMARY KEY, ts timestamp, day date);
+    INSERT INTO ev (id, ts, day, created_at) VALUES
+        (1, '2024-01-01 00:00:00', '2024-01-01', '2020-02-02 02:02:02'),
+        (2, '2024-01-01 10:30:00', '2024-01-05', '2020-03-03 03:03:03'),
+        (3, '2024-01-02 08:00:00', '2024-01-31', '2020-04-04 04:04:04'),
+        (4, NULL, NULL, NULL);
+    INSERT INTO ev_plain (id, ts, day) VALUES
+        (1, '2024-01-01 00:00:00', '2024-01-01'),
+        (2, '2024-01-01 10:30:00', '2024-01-05'),
+        (3, '2024-01-02 08:00:00', '2024-01-31'),
+        (4, NULL, NULL);
+}
+
+setup accounts {
+    CREATE TABLE acct (id uuid PRIMARY KEY, name text);
+    CREATE TABLE acct_plain (id uuid, name text);
+    INSERT INTO acct VALUES
+        ('a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11', 'alice'),
+        ('00000000-0000-4000-8000-000000000001', 'bob'),
+        ('ffffffff-ffff-4fff-bfff-ffffffffffff', 'carol');
+    INSERT INTO acct_plain SELECT id, name FROM acct;
+}
+
+setup amounts {
+    CREATE TABLE pa (id int PRIMARY KEY, n numeric(10,2));
+    CREATE TABLE pb (id int PRIMARY KEY, m numeric(10,3));
+    CREATE TABLE pa_plain (id int PRIMARY KEY, n numeric(10,2));
+    CREATE INDEX pa_n ON pa (n);
+    INSERT INTO pa WITH RECURSIVE s(v) AS (SELECT 1 UNION ALL SELECT v + 1 FROM s WHERE v < 200) SELECT v, v / 4.0 FROM s;
+    INSERT INTO pa VALUES (201, -1.5);
+    INSERT INTO pb SELECT id, n FROM pa WHERE id <= 200;
+    INSERT INTO pa_plain SELECT id, n FROM pa;
+}
+
+setup integers {
+    CREATE TABLE ni (id int PRIMARY KEY, big bigint, small smallint, name varchar(5));
+    CREATE INDEX ni_big ON ni (big);
+    CREATE INDEX ni_small ON ni (small);
+    CREATE INDEX ni_name ON ni (name);
+    INSERT INTO ni VALUES (1, -10, -3, 'ab'), (2, 5, 7, 'b'), (3, 9000000000, 30000, 'ccc');
+}
+
+@setup events
+test timestamp-range-returns-rows {
+    SELECT id FROM ev WHERE ts > '2024-01-01 12:00:00' ORDER BY id;
+}
+expect {
+    3
+}
+
+@setup events
+test timestamp-order-by-desc-limit {
+    SELECT id FROM ev WHERE ts IS NOT NULL ORDER BY ts DESC LIMIT 2;
+}
+expect {
+    3
+    2
+}
+
+@setup events
+test timestamp-with-default-read-from-index {
+    SELECT id, created_at FROM ev WHERE created_at > '2020-01-01' ORDER BY created_at DESC LIMIT 1;
+    SELECT max(created_at) FROM ev;
+}
+expect {
+    3|2020-04-04 04:04:04
+    2020-04-04 04:04:04
+}
+
+@setup events
+test date-between-returns-rows {
+    SELECT id FROM ev WHERE day BETWEEN '2024-01-05' AND '2024-01-31' ORDER BY id;
+}
+expect {
+    2
+    3
+}
+
+@setup events
+test timestamp-equality-with-date-literal-same-rows-with-and-without-index {
+    SELECT CASE WHEN (SELECT count(*) FROM ev WHERE ts = '2024-01-01') = (SELECT count(*) FROM ev_plain WHERE ts = '2024-01-01') THEN 'same' ELSE 'different' END;
+}
+expect {
+    same
+}
+
+@setup events
+test timestamp-range-with-date-literal-same-rows-with-and-without-index {
+    SELECT CASE WHEN (SELECT count(*) FROM ev WHERE ts > '2024-01-01') = (SELECT count(*) FROM ev_plain WHERE ts > '2024-01-01') THEN 'same' ELSE 'different' END;
+    SELECT CASE WHEN (SELECT count(*) FROM ev WHERE ts <= '2024-01-01') = (SELECT count(*) FROM ev_plain WHERE ts <= '2024-01-01') THEN 'same' ELSE 'different' END;
+}
+expect {
+    same
+    same
+}
+
+@setup accounts
+test uuid-primary-key-lookup {
+    SELECT name FROM acct WHERE id = 'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11';
+}
+expect {
+    alice
+}
+
+@setup accounts
+test uuid-in-list-returns-rows {
+    SELECT name FROM acct WHERE id IN ('a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11', '00000000-0000-4000-8000-000000000001') ORDER BY name;
+}
+expect {
+    alice
+    bob
+}
+
+@setup accounts
+test uuid-range-and-order {
+    SELECT name FROM acct WHERE id > '50000000-0000-4000-8000-000000000000' ORDER BY id;
+    SELECT name FROM acct ORDER BY id DESC LIMIT 1;
+}
+expect {
+    alice
+    carol
+    carol
+}
+
+@setup accounts
+test uuid-upper-case-literal-same-rows-with-and-without-index {
+    SELECT CASE WHEN (SELECT count(*) FROM acct WHERE id = 'A0EEBC99-9C0B-4EF8-BB6D-6BB9BD380A11') = (SELECT count(*) FROM acct_plain WHERE id = 'A0EEBC99-9C0B-4EF8-BB6D-6BB9BD380A11') THEN 'same' ELSE 'different' END;
+}
+expect {
+    same
+}
+
+@setup amounts
+test numeric-join-across-scales {
+    SELECT count(*) FROM pa_plain JOIN pb ON pa_plain.n = pb.m;
+    SELECT count(*) FROM pa_plain WHERE EXISTS (SELECT 1 FROM pb WHERE pb.m = pa_plain.n);
+}
+expect {
+    200
+    200
+}
+
+@setup amounts
+test numeric-equality-returns-rows {
+    SELECT id FROM pa WHERE n = 1.5;
+}
+expect {
+    6
+}
+
+@setup amounts
+test numeric-negative-literal-same-rows-with-and-without-index {
+    SELECT CASE WHEN (SELECT count(*) FROM pa WHERE n = -1.5) = (SELECT count(*) FROM pa_plain WHERE n = -1.5) THEN 'same' ELSE 'different' END;
+}
+expect {
+    same
+}
+
+@setup integers
+test bigint-range-returns-rows {
+    SELECT id FROM ni WHERE big > -5 ORDER BY id;
+    SELECT id FROM ni WHERE big BETWEEN -10 AND 5 ORDER BY id;
+}
+expect {
+    2
+    3
+    1
+    2
+}
+
+@setup integers
+test smallint-out-of-range-literal-finds-no-rows {
+    SELECT count(*) FROM ni WHERE small = 40000;
+    SELECT count(*) FROM ni WHERE small < 40000;
+}
+expect {
+    0
+    3
+}
+
+@setup integers
+test varchar-literal-longer-than-type-finds-no-rows {
+    SELECT count(*) FROM ni WHERE name = 'abcdefgh';
+    SELECT id FROM ni WHERE name >= 'b' ORDER BY id;
+}
+expect {
+    0
+    2
+    3
+}

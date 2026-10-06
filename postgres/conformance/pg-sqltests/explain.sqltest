@@ -88,3 +88,67 @@ test explain-format-json-errors {
     EXPLAIN (FORMAT JSON) SELECT 1;
 }
 expect error {}
+
+# Indexes on timestamp, date, bigint and uuid columns give range searches and
+# an order, like indexes on int columns. A numeric equal test calls the
+# numeric `=` function, so a hash join cannot run it.
+
+setup typed_columns {
+    CREATE TABLE ev (id int PRIMARY KEY, ts timestamp, day date, note text);
+    CREATE INDEX ev_ts ON ev (ts);
+    CREATE INDEX ev_day ON ev (day);
+    CREATE TABLE orders (id bigint PRIMARY KEY, total bigint);
+    CREATE INDEX orders_total ON orders (total);
+    CREATE TABLE acct (id uuid PRIMARY KEY, name text);
+    CREATE TABLE pa (id int PRIMARY KEY, n numeric(10,2));
+    CREATE TABLE pb (id int PRIMARY KEY, m numeric(10,3));
+    INSERT INTO pa WITH RECURSIVE s(v) AS (SELECT 1 UNION ALL SELECT v + 1 FROM s WHERE v < 200) SELECT v, v / 4.0 FROM s;
+    INSERT INTO pb SELECT id, n FROM pa;
+}
+
+@setup typed_columns
+test explain-timestamp-and-date-range-search {
+    EXPLAIN SELECT id FROM ev WHERE ts > '2024-01-01 12:00:00';
+    EXPLAIN SELECT count(*) FROM ev WHERE day BETWEEN '2024-01-05' AND '2024-01-31';
+}
+expect {
+    1|0|0|SEARCH ev USING COVERING INDEX ev_ts (ts>?)
+    1|0|0|SEARCH ev USING COVERING INDEX ev_day (day>=? AND day<=?)
+}
+
+@setup typed_columns
+test explain-timestamp-order-by-limit-uses-index-order {
+    EXPLAIN SELECT id, note FROM ev ORDER BY ts DESC LIMIT 10;
+    EXPLAIN SELECT max(ts) FROM ev;
+}
+expect {
+    1|0|0|SCAN ev USING INDEX ev_ts
+    1|0|0|SCAN ev USING COVERING INDEX ev_ts
+}
+
+@setup typed_columns
+test explain-bigint-range-search {
+    EXPLAIN SELECT total FROM orders WHERE id > 5;
+    EXPLAIN SELECT id FROM orders WHERE total BETWEEN 100 AND 200;
+}
+expect {
+    1|0|0|SEARCH orders USING INDEX sqlite_autoindex_orders_1 (id>?)
+    1|0|0|SEARCH orders USING INDEX orders_total (total>=? AND total<=?)
+}
+
+@setup typed_columns
+test explain-uuid-range-search {
+    EXPLAIN SELECT name FROM acct WHERE id > 'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11';
+}
+expect {
+    1|0|0|SEARCH acct USING INDEX sqlite_autoindex_acct_1 (id>?)
+}
+
+@setup typed_columns
+test explain-numeric-join-is-not-a-hash-join {
+    EXPLAIN SELECT count(*) FROM pa JOIN pb ON pa.n = pb.m;
+}
+expect {
+    1|0|0|SCAN pa
+    2|0|0|SCAN pb
+}

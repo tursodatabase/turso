@@ -364,6 +364,7 @@ impl OpenLoop {
                             SeekEmitter::new(
                                 program,
                                 table_references,
+                                table,
                                 seek_def,
                                 t_ctx,
                                 seek_cursor_id,

@@ -7,7 +7,7 @@
 //! top.
 
 use crate::alloc::{TryClone, TursoIteratorExt};
-use crate::schema::{Index, Schema};
+use crate::schema::{Index, IndexUse, Schema};
 use crate::stats::AnalyzeStats;
 use crate::translate::expr::expr_references_any_subquery;
 use crate::translate::optimizer::access_method::{
@@ -364,7 +364,13 @@ fn choose_multi_index_branch_access(
 
     let mut best_branch = chosen_seek
         .as_ref()
-        .filter(|chosen| !chosen.constraint_refs.is_empty())
+        .filter(|chosen| {
+            !chosen.constraint_refs.is_empty()
+                && seek_uses_only_plain_constraints(
+                    &table_constraints.constraints,
+                    &chosen.constraint_refs,
+                )
+        })
         .map(|chosen| {
             let index_info = index_info_for_branch(
                 chosen.index.as_deref(),
@@ -443,6 +449,24 @@ fn choose_multi_index_branch_access(
     Ok(best_branch)
 }
 
+/// A multi-index branch consumes its whole term, so every constraint of its
+/// seek must find exactly the rows for which it is true.
+fn seek_uses_only_plain_constraints(
+    constraints: &[Constraint],
+    constraint_refs: &[RangeConstraintRef],
+) -> bool {
+    constraint_refs.iter().all(|cref| {
+        [
+            cref.eq.as_ref().map(|eq| eq.constraint_pos),
+            cref.lower_bound,
+            cref.upper_bound,
+        ]
+        .into_iter()
+        .flatten()
+        .all(|pos| constraints[pos].index_use == IndexUse::Plain)
+    })
+}
+
 /// Residual output from [`partition_residual_multi_or_exprs`].
 struct MultiOrResidualPrePostFilters {
     pre_filter_exprs: Vec<ast::Expr>,
@@ -456,6 +480,7 @@ struct MultiOrResidualPrePostFilters {
 ///
 /// Returns `None` if any residual contains a subquery or has an unresolvable
 /// table mask—matching the old `residual_tables_mask` rejection.
+#[allow(clippy::too_many_arguments)]
 fn partition_residual_multi_or_exprs(
     branch_terms: &[WhereTerm],
     access: &MultiIdxBranchAccess,
@@ -464,6 +489,7 @@ fn partition_residual_multi_or_exprs(
     lhs_mask: &TableMask,
     table_references: &TableReferences,
     subqueries: &[NonFromClauseSubquery],
+    schema: &Schema,
 ) -> Result<Option<MultiOrResidualPrePostFilters>> {
     let mut consumed = vec![false; branch_terms.len()];
     match access {
@@ -489,7 +515,7 @@ fn partition_residual_multi_or_exprs(
     if let Some(index) = index {
         if index.where_clause.is_some() {
             let Some(predicate_terms) =
-                partial_index_predicate_terms(index, rhs_table, branch_terms)
+                partial_index_predicate_terms(index, rhs_table, branch_terms, schema)
             else {
                 return Ok(None);
             };
@@ -852,6 +878,7 @@ fn analyze_and_terms_for_multi_index(
             rowid_alias_column,
             table_references,
             subqueries,
+            schema,
         ) else {
             continue;
         };
@@ -878,7 +905,7 @@ fn analyze_and_terms_for_multi_index(
             // An unproven partial index cannot be the single-index alternative
             // that suppresses intersection planning.
             if index.where_clause.is_some()
-                && !can_use_partial_index(index, table_reference, where_clause)
+                && !can_use_partial_index(index, table_reference, where_clause, schema)
             {
                 continue;
             }
@@ -1065,6 +1092,7 @@ pub fn consider_multi_index_union(
                     lhs_mask,
                     table_references,
                     subqueries,
+                    schema,
                 )?
                 else {
                     return Ok(None);

@@ -175,3 +175,32 @@ snapshot-eqp multi_index_and_eqp {
 snapshot multi_index_and {
     SELECT * FROM t WHERE a = 1 AND b = 2;
 }
+# An intersection branch seeks one index per term, so each index must compare
+# like its term. Here the terms compare with BINARY, but both indexes are NOCASE.
+test multi-index-and-skips-index-with-other-collation {
+    CREATE TABLE tc(a TEXT COLLATE NOCASE, b TEXT COLLATE NOCASE);
+    CREATE INDEX tc_a ON tc(a);
+    CREATE INDEX tc_b ON tc(b);
+    WITH RECURSIVE s(v) AS (SELECT 1 UNION ALL SELECT v + 1 FROM s WHERE v < 2000)
+    INSERT INTO tc SELECT char(65 + v % 26) || v, char(97 + v % 26) || v FROM s;
+    ANALYZE;
+    SELECT count(*) FROM tc WHERE a < 'x' COLLATE BINARY AND b < 'y' COLLATE BINARY;
+}
+expect {
+    1847
+}
+
+# The terms convert the TEXT column values to numbers, but the TEXT indexes
+# hold text, so they cannot find the rows.
+test multi-index-and-skips-index-with-other-affinity {
+    CREATE TABLE ta(a TEXT, b TEXT);
+    CREATE INDEX ta_a ON ta(a);
+    CREATE INDEX ta_b ON ta(b);
+    WITH RECURSIVE s(v) AS (SELECT 1 UNION ALL SELECT v + 1 FROM s WHERE v < 2000)
+    INSERT INTO ta SELECT v, v FROM s;
+    ANALYZE;
+    SELECT count(*) FROM ta WHERE a < CAST(50 AS INTEGER) AND b < CAST(60 AS INTEGER);
+}
+expect {
+    49
+}

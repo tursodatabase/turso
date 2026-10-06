@@ -128,7 +128,7 @@ pub(super) struct ExprCustomTypeInfo {
 pub(super) fn expr_custom_type_info(
     expr: &ast::Expr,
     referenced_tables: Option<&TableReferences>,
-    resolver: &Resolver,
+    schema: &Schema,
 ) -> Option<ExprCustomTypeInfo> {
     if let ast::Expr::Column {
         table: table_ref_id,
@@ -140,9 +140,7 @@ pub(super) fn expr_custom_type_info(
         let (_, table) = tables.find_table_by_internal_id(*table_ref_id)?;
         let col = table.get_column_at(*column)?;
         let type_name = &col.ty_str;
-        let type_def = resolver
-            .schema()
-            .get_type_def(type_name, table.is_strict())?;
+        let type_def = schema.get_type_def(type_name, table.is_strict())?;
         return Some(ExprCustomTypeInfo {
             type_name: type_name.to_lowercase(),
             column: col.clone(),
@@ -207,6 +205,30 @@ pub(super) struct ResolvedOperator {
     encode_info: Option<OperatorEncodeInfo>,
 }
 
+/// Whether `e1 op e2` compiles to a call of a custom type operator function
+/// instead of a plain comparison.
+pub(crate) fn comparison_calls_type_function(
+    e1: &ast::Expr,
+    e2: &ast::Expr,
+    op: &ast::Operator,
+    referenced_tables: Option<&TableReferences>,
+    schema: &Schema,
+) -> bool {
+    find_custom_type_operator(e1, e2, op, referenced_tables, schema).is_some()
+}
+
+/// Whether `e1 = e2` compiles to a call of the type's `=` function with one
+/// operand that is a literal ENCODEd to the column's type.
+pub(crate) fn equality_calls_type_function_with_encoded_literal(
+    e1: &ast::Expr,
+    e2: &ast::Expr,
+    referenced_tables: Option<&TableReferences>,
+    schema: &Schema,
+) -> bool {
+    find_custom_type_operator(e1, e2, &ast::Operator::Equals, referenced_tables, schema)
+        .is_some_and(|resolved| resolved.encode_info.is_some())
+}
+
 /// Find a custom type operator function for a binary expression.
 ///
 /// Operators fire when:
@@ -221,11 +243,11 @@ pub(super) fn find_custom_type_operator(
     e2: &ast::Expr,
     op: &ast::Operator,
     referenced_tables: Option<&TableReferences>,
-    resolver: &Resolver,
+    schema: &Schema,
 ) -> Option<ResolvedOperator> {
     let op_str = operator_to_str(op)?;
-    let lhs_info = expr_custom_type_info(e1, referenced_tables, resolver);
-    let rhs_info = expr_custom_type_info(e2, referenced_tables, resolver);
+    let lhs_info = expr_custom_type_info(e1, referenced_tables, schema);
+    let rhs_info = expr_custom_type_info(e2, referenced_tables, schema);
 
     // Try to find a direct or derived operator match on a type definition.
     let find_in_type_def = |type_def: &TypeDef| -> Option<(String, bool, bool)> {
