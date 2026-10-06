@@ -2,7 +2,7 @@ use super::{cost_params::CostModelParams, AvailableIndexes};
 use crate::alloc::TursoIteratorExt;
 use crate::translate::expr::comparison_affinity;
 use crate::{
-    schema::{Column, Index, IndexUse, Schema},
+    schema::{Column, Index, IndexColumn, IndexUse, Schema},
     translate::{
         collate::{get_collseq_from_expr, resolve_comparison_collseq, CollationSeq},
         expr::{
@@ -102,9 +102,6 @@ pub struct Constraint {
     /// many NULL keys, so such a constraint can match many rows and its cost
     /// and row estimates must not be taken from equality statistics.
     pub null_matching: bool,
-    /// How an index on the constrained column can use this constraint. Only a
-    /// [IndexUse::Plain] constraint can be consumed by a seek; the others stay
-    /// as filters.
     pub index_use: IndexUse,
 }
 
@@ -1291,16 +1288,11 @@ pub fn constraints_from_where_clause(
                         "constraint collation must match table column collation"
                     );
                     if let Some(table_col_pos) = constraint.table_col_pos {
-                        let constrained_column = &table_reference.table.columns()[table_col_pos];
-                        let table_collation = constrained_column.collation();
-                        let index_collation = index.columns[position_in_index]
-                            .collation
-                            .unwrap_or_default();
-                        if table_collation != index_collation {
-                            continue;
-                        }
-                        let idx_col_aff = constrained_column.affinity();
-                        if !constraint.satisfies_index_affinity(idx_col_aff) {
+                        if !index_column_seeks_like_table_column(
+                            &table_reference.table.columns()[table_col_pos],
+                            &index.columns[position_in_index],
+                            constraint.comparison_affinity,
+                        ) {
                             continue;
                         }
                     }
@@ -1405,33 +1397,6 @@ fn column_constraint_index_use(
     }
 }
 
-/// An index computes an expression (of an expression index or of a partial
-/// index WHERE) from DECODEd column values when it writes a row. A query
-/// computes the same value only when every column in the expression stores
-/// the value that expressions compare.
-fn expression_index_use(
-    schema: &Schema,
-    table_reference: &JoinedTable,
-    expr: &ast::Expr,
-) -> IndexUse {
-    let is_strict = table_reference.table.is_strict();
-    let mut index_use = IndexUse::Plain;
-    walk_expr(expr, &mut |expr| -> Result<WalkControl> {
-        if let ast::Expr::Column { table, column, .. } = expr {
-            if *table == table_reference.internal_id
-                && schema.column_index_use(&table_reference.table.columns()[*column], is_strict)
-                    != IndexUse::Plain
-            {
-                index_use = IndexUse::Unusable;
-                return Ok(WalkControl::SkipChildren);
-            }
-        }
-        Ok(WalkControl::Continue)
-    })
-    .expect("reading an expression cannot fail");
-    index_use
-}
-
 fn in_constraint_index_use(
     schema: &Schema,
     table_reference: &JoinedTable,
@@ -1494,12 +1459,11 @@ pub struct SeekRangeConstraint {
     pub eq: Option<(ast::Operator, ast::Expr, Affinity)>,
     pub lower_bound: Option<(ast::Operator, ast::Expr, Affinity)>,
     pub upper_bound: Option<(ast::Operator, ast::Expr, Affinity)>,
-    /// How the seek turns the constraining expressions into index keys.
-    pub index_use: IndexUse,
+    pub(crate) index_use: IndexUse,
 }
 
 impl SeekRangeConstraint {
-    pub fn new_eq(
+    pub(crate) fn new_eq(
         sort_order: SortOrder,
         nulls_order: ast::NullsOrder,
         eq: (ast::Operator, ast::Expr, Affinity),
@@ -1514,7 +1478,7 @@ impl SeekRangeConstraint {
             index_use,
         }
     }
-    pub fn new_range(
+    pub(crate) fn new_range(
         sort_order: SortOrder,
         nulls_order: ast::NullsOrder,
         lower_bound: Option<(ast::Operator, ast::Expr, Affinity)>,
@@ -1842,6 +1806,31 @@ pub(super) fn partial_index_predicate_terms(
     Some(matched_terms)
     // TODO: recognize implication beyond syntactic equivalence (e.g. `x = 5` implies
     // `x IS NOT NULL`, `x > 10` implies `x > 5`).
+}
+
+fn expression_index_use(
+    schema: &Schema,
+    table_reference: &JoinedTable,
+    expr: &ast::Expr,
+) -> IndexUse {
+    let is_strict = table_reference.table.is_strict();
+    let mut index_use = IndexUse::Plain;
+    walk_expr(expr, &mut |expr| -> Result<WalkControl> {
+        if let ast::Expr::Column { table, column, .. } = expr {
+            if *table == table_reference.internal_id
+                && schema.column_type_has_operator_function(
+                    &table_reference.table.columns()[*column],
+                    is_strict,
+                )
+            {
+                index_use = IndexUse::Unusable;
+                return Ok(WalkControl::SkipChildren);
+            }
+        }
+        Ok(WalkControl::Continue)
+    })
+    .expect("the walk callback returns no error");
+    index_use
 }
 
 pub(super) fn partial_index(index: Option<&Arc<Index>>) -> Option<&Index> {
@@ -2275,7 +2264,7 @@ pub(crate) fn summarize_binary_term_for_index(
     table_references: &TableReferences,
     subqueries: &[NonFromClauseSubquery],
     schema: &Schema,
-) -> Option<IndexableTermSummary> {
+) -> Result<Option<IndexableTermSummary>> {
     let BinaryTermIndexInfo {
         lhs,
         rhs,
@@ -2284,7 +2273,10 @@ pub(crate) fn summarize_binary_term_for_index(
         constraining_expr,
         is_rowid,
         ..
-    } = analyze_binary_term_index_info(expr, table_id, rowid_alias_column)?;
+    } = match analyze_binary_term_index_info(expr, table_id, rowid_alias_column) {
+        Some(info) => info,
+        None => return Ok(None),
+    };
 
     let (best_index, constraint_refs) = find_best_index_for_constraint(
         table_col_pos,
@@ -2297,9 +2289,9 @@ pub(crate) fn summarize_binary_term_for_index(
         (lhs, rhs),
         table_references,
         schema,
-    );
+    )?;
     if constraint_refs.is_empty() {
-        return None;
+        return Ok(None);
     }
 
     let lhs_mask = table_mask_from_expr(constraining_expr, table_references, subqueries)
@@ -2311,14 +2303,14 @@ pub(crate) fn summarize_binary_term_for_index(
         .position(|t| t.internal_id == table_id)
         .expect("target table must exist in table_references");
     if lhs_mask.get(table_pos) {
-        return None;
+        return Ok(None);
     }
 
-    Some(IndexableTermSummary {
+    Ok(Some(IndexableTermSummary {
         table_col_pos,
         lhs_mask,
         best_index,
-    })
+    }))
 }
 
 /// Analyzes a single binary expression to determine if it can use an index.
@@ -2339,7 +2331,7 @@ pub(crate) fn analyze_binary_term_for_index(
     subqueries: &[NonFromClauseSubquery],
     schema: &Schema,
     params: &CostModelParams,
-) -> Option<AnalyzedTerm> {
+) -> Result<Option<AnalyzedTerm>> {
     let BinaryTermIndexInfo {
         lhs,
         rhs,
@@ -2348,7 +2340,10 @@ pub(crate) fn analyze_binary_term_for_index(
         constraining_expr,
         side,
         is_rowid,
-    } = analyze_binary_term_index_info(expr, table_id, rowid_alias_column)?;
+    } = match analyze_binary_term_index_info(expr, table_id, rowid_alias_column) {
+        Some(info) => info,
+        None => return Ok(None),
+    };
 
     // Find the best index for this constraint
     let (best_index, constraint_refs) = find_best_index_for_constraint(
@@ -2362,11 +2357,11 @@ pub(crate) fn analyze_binary_term_for_index(
         (lhs, rhs),
         table_references,
         schema,
-    );
+    )?;
 
     // If no index can be used, this term is not indexable
     if constraint_refs.is_empty() {
-        return None;
+        return Ok(None);
     }
 
     let table_column = table_col_pos.and_then(|pos| table_reference.table.columns().get(pos));
@@ -2397,7 +2392,7 @@ pub(crate) fn analyze_binary_term_for_index(
         .position(|t| t.internal_id == table_id)
     {
         if lhs_mask.get(table_pos) {
-            return None;
+            return Ok(None);
         }
     }
 
@@ -2432,11 +2427,11 @@ pub(crate) fn analyze_binary_term_for_index(
         index_use: IndexUse::Plain,
     };
 
-    Some(AnalyzedTerm {
+    Ok(Some(AnalyzedTerm {
         constraint,
         best_index,
         constraint_refs,
-    })
+    }))
 }
 
 /// Find the best index for a single constraint.
@@ -2452,7 +2447,7 @@ fn find_best_index_for_constraint(
     (lhs, rhs): (&ast::Expr, &ast::Expr),
     table_references: &TableReferences,
     schema: &Schema,
-) -> (Option<Arc<Index>>, Vec<RangeConstraintRef>) {
+) -> Result<(Option<Arc<Index>>, Vec<RangeConstraintRef>)> {
     // Handle implicit rowid (no alias column, table_col_pos is None)
     if is_rowid && table_col_pos.is_none() {
         let constraint_ref = RangeConstraintRef {
@@ -2478,11 +2473,11 @@ fn find_best_index_for_constraint(
                 _ => None,
             },
         };
-        return (None, vec![constraint_ref]);
+        return Ok((None, vec![constraint_ref]));
     }
 
     let Some(col_pos) = table_col_pos else {
-        return (None, vec![]);
+        return Ok((None, vec![]));
     };
 
     // Check rowid index first if this is a rowid constraint
@@ -2510,7 +2505,7 @@ fn find_best_index_for_constraint(
                 _ => None,
             },
         };
-        return (None, vec![constraint_ref]);
+        return Ok((None, vec![constraint_ref]));
     }
 
     // Find the best index that has this column as its first column
@@ -2537,7 +2532,7 @@ fn find_best_index_for_constraint(
                         (lhs, rhs),
                         table_references,
                         schema,
-                    )
+                    )?
                 {
                     let constraint_ref = RangeConstraintRef {
                         table_col_pos: Some(col_pos),
@@ -2562,19 +2557,15 @@ fn find_best_index_for_constraint(
                             _ => None,
                         },
                     };
-                    return (Some(index.clone()), vec![constraint_ref]);
+                    return Ok((Some(index.clone()), vec![constraint_ref]));
                 }
             }
         }
     }
 
-    (None, vec![])
+    Ok((None, vec![]))
 }
 
-/// Whether a seek on the first column of `index` finds exactly the rows for
-/// which the term `lhs op rhs` on table column `col_pos` is true: the stored
-/// value must be the compared value, and the index must compare with the
-/// term's collation and affinity.
 fn index_column_compares_like_term(
     index: &Index,
     table_reference: &JoinedTable,
@@ -2582,18 +2573,26 @@ fn index_column_compares_like_term(
     (lhs, rhs): (&ast::Expr, &ast::Expr),
     table_references: &TableReferences,
     schema: &Schema,
-) -> bool {
+) -> Result<bool> {
     let column = &table_reference.table.columns()[col_pos];
     if schema.column_index_use(column, table_reference.table.is_strict()) != IndexUse::Plain {
-        return false;
+        return Ok(false);
     }
-    let Ok(term_collation) = resolve_comparison_collseq(lhs, rhs, table_references) else {
-        return false;
-    };
-    let index_collation = index.columns[0].collation.unwrap_or_default();
-    if term_collation != column.collation() || index_collation != column.collation() {
-        return false;
+    if resolve_comparison_collseq(lhs, rhs, table_references)? != column.collation() {
+        return Ok(false);
     }
-    let term_affinity = comparison_affinity(lhs, rhs, Some(table_references), None);
-    column.affinity().index_affinity_ok(term_affinity)
+    Ok(index_column_seeks_like_table_column(
+        column,
+        &index.columns[0],
+        Some(comparison_affinity(lhs, rhs, Some(table_references), None)),
+    ))
+}
+
+fn index_column_seeks_like_table_column(
+    column: &Column,
+    index_column: &IndexColumn,
+    comparison_affinity: Option<Affinity>,
+) -> bool {
+    index_column.collation.unwrap_or_default() == column.collation()
+        && comparison_affinity.is_none_or(|affinity| column.affinity().index_affinity_ok(affinity))
 }

@@ -8,8 +8,7 @@ use turso_parser::ast::NullsOrder;
 
 fn index_seek_affinities(seek_def: &SeekDef, seek_key: &SeekKey) -> String {
     // Apply the constraint's resolved comparison affinity to the seek key,
-    // not the indexed column's affinity. A component that the seek turns into
-    // an index key already holds the stored form, so it gets no affinity.
+    // not the indexed column's affinity.
     seek_def
         .iter(seek_key)
         .zip(seek_def.iter_affinity(seek_key))
@@ -26,7 +25,6 @@ fn index_seek_affinities(seek_def: &SeekDef, seek_key: &SeekKey) -> String {
         .collect()
 }
 
-/// Which end of the index range a seek key bounds, in index storage order.
 #[derive(Clone, Copy)]
 enum StoredRangeEnd {
     Low,
@@ -131,11 +129,12 @@ impl<'a, 'plan> SeekEmitter<'a, 'plan> {
             let reg = self.start_reg + i;
             match key {
                 SeekKeyComponent::Expr(expr) => {
+                    let operand_reg = self.operand_register(i, reg);
                     translate_expr_no_constant_opt(
                         self.program,
                         Some(self.tables),
                         expr,
-                        reg,
+                        operand_reg,
                         &self.t_ctx.resolver,
                         NoConstantOptReason::RegisterReuse,
                     )?;
@@ -147,15 +146,22 @@ impl<'a, 'plan> SeekEmitter<'a, 'plan> {
                         && !self.seek_def.is_null_matching_key_component(i)
                     {
                         self.program.emit_insn(Insn::IsNull {
-                            reg,
+                            reg: operand_reg,
                             target_pc: self.loop_end,
                         });
                     }
-                    let start_end = match self.seek_def.iter_dir {
+                    let start_key_range_end = match self.seek_def.iter_dir {
                         IterationDirection::Forwards => StoredRangeEnd::Low,
                         IterationDirection::Backwards => StoredRangeEnd::High,
                     };
-                    self.emit_index_key(i, reg, expr, &seek_def.start, start_end)?;
+                    self.emit_index_key(
+                        i,
+                        operand_reg,
+                        reg,
+                        expr,
+                        &seek_def.start,
+                        start_key_range_end,
+                    )?;
                 }
                 SeekKeyComponent::Null => self.program.emit_null(reg, None),
                 SeekKeyComponent::None => {
@@ -286,30 +292,32 @@ impl<'a, 'plan> SeekEmitter<'a, 'plan> {
         let last_reg = self.start_reg + seek_def.prefix.len();
         match &seek_def.end.last_component {
             SeekKeyComponent::Expr(expr) => {
+                let operand_reg = self.operand_register(seek_def.prefix.len(), last_reg);
                 translate_expr_no_constant_opt(
                     self.program,
                     Some(self.tables),
                     expr,
-                    last_reg,
+                    operand_reg,
                     &self.t_ctx.resolver,
                     NoConstantOptReason::RegisterReuse,
                 )?;
                 if !expr.is_nonnull(self.tables) {
                     self.program.emit_insn(Insn::IsNull {
-                        reg: last_reg,
+                        reg: operand_reg,
                         target_pc: self.loop_end,
                     });
                 }
-                let end_end = match self.seek_def.iter_dir {
+                let end_key_range_end = match self.seek_def.iter_dir {
                     IterationDirection::Forwards => StoredRangeEnd::High,
                     IterationDirection::Backwards => StoredRangeEnd::Low,
                 };
                 self.emit_index_key(
                     seek_def.prefix.len(),
+                    operand_reg,
                     last_reg,
                     expr,
                     &seek_def.end,
-                    end_end,
+                    end_key_range_end,
                 )?;
                 if self.seek_index.is_some() {
                     let affinities = index_seek_affinities(self.seek_def, &self.seek_def.end);
@@ -424,15 +432,18 @@ impl<'a, 'plan> SeekEmitter<'a, 'plan> {
         self.emit_termination(loop_start)
     }
 
-    /// Turn the operand in `reg`, the key component at `pos` of `seek_key`,
-    /// into the stored form that the index compares. An equality component
-    /// that has no stored form ends the loop. A range component that has no
-    /// stored form gets a key beyond every stored value at `range_end`, so the
-    /// range has no limit on that side; its WHERE term stays as a filter.
+    fn operand_register(&mut self, pos: usize, key_reg: usize) -> usize {
+        match self.seek_def.key_component_index_use(pos) {
+            IndexUse::KeyFunction(_) => self.program.alloc_registers(2),
+            _ => key_reg,
+        }
+    }
+
     fn emit_index_key(
         &mut self,
         pos: usize,
-        reg: usize,
+        operand_reg: usize,
+        key_reg: usize,
         operand: &Expr,
         seek_key: &SeekKey,
         range_end: StoredRangeEnd,
@@ -454,8 +465,8 @@ impl<'a, 'plan> SeekEmitter<'a, 'plan> {
                     .expect("key component must have an affinity");
                 if !affinity.expr_needs_no_affinity_change(operand) {
                     self.program.emit_insn(Insn::Affinity {
-                        start_reg: reg,
-                        count: std::num::NonZeroUsize::new(1).unwrap(),
+                        start_reg: operand_reg,
+                        count: std::num::NonZeroUsize::MIN,
                         affinities: affinity.aff_mask().to_string(),
                     });
                 }
@@ -469,17 +480,11 @@ impl<'a, 'plan> SeekEmitter<'a, 'plan> {
                         | (StoredRangeEnd::Low, SortOrder::Desc) => NoSeekKey::AboveEveryValue,
                     }
                 };
-                let args = self.program.alloc_registers(2);
-                self.program.emit_insn(Insn::Copy {
-                    src_reg: reg,
-                    dst_reg: args,
-                    extra_amount: 0,
-                });
-                self.program.emit_int(no_key as i64, args + 1);
+                self.program.emit_int(no_key as i64, operand_reg + 1);
                 self.program.emit_insn(Insn::Function {
                     constant_mask: 0,
-                    start_reg: args,
-                    dest: reg,
+                    start_reg: operand_reg,
+                    dest: key_reg,
                     func: FuncCtx {
                         func: Func::Scalar(function.scalar_func()),
                         arg_count: 2,
@@ -502,8 +507,8 @@ impl<'a, 'plan> SeekEmitter<'a, 'plan> {
                 crate::translate::expr::emit_type_expr(
                     self.program,
                     encode,
-                    reg,
-                    reg,
+                    operand_reg,
+                    key_reg,
                     column,
                     &type_def,
                     &self.t_ctx.resolver,
@@ -515,7 +520,7 @@ impl<'a, 'plan> SeekEmitter<'a, 'plan> {
         }
         if is_equality {
             self.program.emit_insn(Insn::IsNull {
-                reg,
+                reg: key_reg,
                 target_pc: self.loop_end,
             });
         }

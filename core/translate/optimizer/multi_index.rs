@@ -449,8 +449,6 @@ fn choose_multi_index_branch_access(
     Ok(best_branch)
 }
 
-/// A multi-index branch consumes its whole term, so every constraint of its
-/// seek must find exactly the rows for which it is true.
 fn seek_uses_only_plain_constraints(
     constraints: &[Constraint],
     constraint_refs: &[RangeConstraintRef],
@@ -845,7 +843,7 @@ fn analyze_and_terms_for_multi_index(
     subqueries: &[NonFromClauseSubquery],
     schema: &Schema,
     params: &CostModelParams,
-) -> Option<AndClauseDecomposition> {
+) -> Result<Option<AndClauseDecomposition>> {
     let table_id = table_reference.internal_id;
     let indexes = available_indexes.indexes_for_table(table_reference.internal_id);
     let rowid_alias_column = table_reference
@@ -879,7 +877,8 @@ fn analyze_and_terms_for_multi_index(
             table_references,
             subqueries,
             schema,
-        ) else {
+        )?
+        else {
             continue;
         };
 
@@ -895,7 +894,7 @@ fn analyze_and_terms_for_multi_index(
     }
 
     if candidate_branches.len() < 2 {
-        return None;
+        return Ok(None);
     }
 
     // If a composite index already covers multiple constrained columns, prefer
@@ -931,7 +930,7 @@ fn analyze_and_terms_for_multi_index(
                 }
             }
             if columns_covered >= 2 {
-                return None;
+                return Ok(None);
             }
         }
     }
@@ -952,7 +951,7 @@ fn analyze_and_terms_for_multi_index(
     }
 
     if selected_branches.len() < 2 {
-        return None;
+        return Ok(None);
     }
 
     let unique_branches = selected_branches
@@ -970,24 +969,24 @@ fn analyze_and_terms_for_multi_index(
                 subqueries,
                 schema,
                 params,
-            )
+            )?
             .expect("multi-index prepass accepted a term that full analysis rejected");
 
             turso_assert_eq!(analyzed.constraint.table_col_pos, branch.table_col_pos);
 
-            AndBranch {
+            Ok(AndBranch {
                 where_term_idx: branch.where_term_idx,
                 constraint: analyzed.constraint,
                 index: analyzed.best_index,
                 constraint_refs: analyzed.constraint_refs,
-            }
+            })
         })
-        .collect::<Vec<_>>();
+        .collect::<Result<Vec<_>>>()?;
 
-    Some(AndClauseDecomposition {
+    Ok(Some(AndClauseDecomposition {
         term_indices: unique_branches.iter().map(|b| b.where_term_idx).collect(),
         branches: unique_branches,
-    })
+    }))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1162,7 +1161,8 @@ pub fn consider_multi_index_intersection(
         subqueries,
         schema,
         params,
-    ) else {
+    )?
+    else {
         return Ok(None);
     };
 

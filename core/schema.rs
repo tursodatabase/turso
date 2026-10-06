@@ -225,35 +225,21 @@ pub enum TypeDefKind {
     Union(UnionDef),
 }
 
-/// How an index on a column can find rows. See [Schema::column_index_use].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum IndexUse {
-    /// The stored value is the value that expressions compare, so the index
-    /// works as it does for a column without a custom type.
+pub(crate) enum IndexUse {
     Plain,
-    /// The stored values sort like the values that expressions compare. The
-    /// seek key is the function of the operand, and the WHERE term stays as a
-    /// filter.
     KeyFunction(SeekKeyFunction),
-    /// Only `column = literal` can seek. The scan calls the type's `=`
-    /// function with the encoded literal, and equal values have equal
-    /// encodings, so the seek key is the encoded literal. The WHERE term stays
-    /// as a filter.
     EncodedLiteralEquality,
-    /// The index cannot find rows or give an order for the column.
     Unusable,
 }
 
-/// A function that maps an operand to the stored value that compares with
-/// every stored value as the operand compares with the DECODEd value. See
-/// [ScalarFunc::UuidSeekKey] for what it returns when no such value exists.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SeekKeyFunction {
+pub(crate) enum SeekKeyFunction {
     Uuid,
 }
 
 impl SeekKeyFunction {
-    pub fn scalar_func(self) -> ScalarFunc {
+    pub(crate) fn scalar_func(self) -> ScalarFunc {
         match self {
             Self::Uuid => ScalarFunc::UuidSeekKey,
         }
@@ -370,6 +356,10 @@ impl TypeDef {
             TypeDefKind::Custom { operators, .. } => operators,
             _ => &[],
         }
+    }
+
+    pub(crate) fn can_be_sorted(&self) -> bool {
+        self.decode().is_none() || self.operators().iter().any(|op| op.op == "<")
     }
 
     /// Returns the default expression (Custom types only).
@@ -983,38 +973,37 @@ impl Schema {
         self.type_registry.get(&type_name.to_lowercase())
     }
 
-    /// How an index on `column` can find rows. Expressions compare the
-    /// DECODEd value of a column, but an index holds the stored value.
-    pub fn column_index_use(&self, column: &Column, is_strict: bool) -> IndexUse {
+    pub(crate) fn column_index_gives_order(&self, column: &Column, is_strict: bool) -> bool {
+        matches!(
+            self.column_index_use(column, is_strict),
+            IndexUse::Plain | IndexUse::KeyFunction(_)
+        ) && self
+            .get_type_def(&column.ty_str, is_strict)
+            .is_none_or(|type_def| type_def.can_be_sorted())
+    }
+
+    pub(crate) fn column_index_use(&self, column: &Column, is_strict: bool) -> IndexUse {
         if column.is_array() {
             return IndexUse::Unusable;
         }
-        match self.resolve_type(&column.ty_str, is_strict) {
-            Ok(None) => IndexUse::Plain,
-            Ok(Some(resolved)) => resolved_type_index_use(&resolved, column.collation()),
-            Err(_) => IndexUse::Unusable,
-        }
+        self.resolve_column_type(column, is_strict)
+            .map_or(IndexUse::Plain, |resolved| {
+                resolved_type_index_use(&resolved, column.collation())
+            })
     }
 
-    /// Whether the order of an index on `column` is the order that a sort of
-    /// the column gives. A type with a DECODE and no `<` operator cannot be
-    /// sorted, so its index must not give an order either.
-    pub fn column_index_gives_order(&self, column: &Column, is_strict: bool) -> bool {
-        if !matches!(
-            self.column_index_use(column, is_strict),
-            IndexUse::Plain | IndexUse::KeyFunction(_)
-        ) {
-            return false;
-        }
-        let Ok(Some(resolved)) = self.resolve_type(&column.ty_str, is_strict) else {
-            return true;
-        };
-        let decodes = resolved.chain.iter().any(|td| td.decode().is_some());
-        let declares_less_than = resolved
-            .chain
-            .iter()
-            .any(|td| td.operators().iter().any(|op| op.op == "<"));
-        !decodes || declares_less_than
+    pub(crate) fn column_type_has_operator_function(
+        &self,
+        column: &Column,
+        is_strict: bool,
+    ) -> bool {
+        self.resolve_column_type(column, is_strict)
+            .is_some_and(|resolved| resolved.chain.iter().any(declares_operator_function))
+    }
+
+    fn resolve_column_type(&self, column: &Column, is_strict: bool) -> Option<ResolvedType> {
+        self.resolve_type(&column.ty_str, is_strict)
+            .expect("DROP TYPE refuses a type that a column or a domain uses")
     }
 
     /// Resolve a custom type fully: look it up (with strictness gate) and chase
@@ -2720,12 +2709,16 @@ fn declares_comparison_function(td: &Arc<TypeDef>) -> bool {
     })
 }
 
-/// A DECODE of `value` returns the stored value. The built-in `boolean` type
-/// only stores 0 and 1, which its DECODE returns unchanged.
+fn declares_operator_function(td: &Arc<TypeDef>) -> bool {
+    td.operators().iter().any(|op| op.func_name.is_some())
+}
+
 fn decode_returns_stored_value(td: &TypeDef) -> bool {
     match td.decode() {
         None => true,
         Some(ast::Expr::Id(name)) => name.as_str().eq_ignore_ascii_case("value"),
+        // The ENCODE of the built-in boolean stores only 0 and 1, and its DECODE
+        // returns both unchanged.
         Some(_) => td.is_builtin && td.name == "boolean",
     }
 }

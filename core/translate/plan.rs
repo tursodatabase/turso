@@ -3004,9 +3004,7 @@ pub struct SeekDef {
     pub end: SeekKey,
     /// The direction of the scan that follows the seek.
     pub iter_dir: IterationDirection,
-    /// How the seek turns the expression of the last component of `start`
-    /// and `end` into an index key.
-    pub last_component_index_use: IndexUse,
+    pub(crate) range_component_index_use: Option<IndexUse>,
 }
 
 pub struct SeekDefKeyIterator<'a, T> {
@@ -3093,12 +3091,12 @@ impl SeekDef {
         }
     }
 
-    /// How the seek turns the expression of the key component at `pos` into
-    /// an index key.
-    pub fn key_component_index_use(&self, pos: usize) -> IndexUse {
+    pub(crate) fn key_component_index_use(&self, pos: usize) -> IndexUse {
         match self.prefix.get(pos) {
             Some(component) => component.index_use,
-            None => self.last_component_index_use,
+            None => self
+                .range_component_index_use
+                .expect("a key component after the equality prefix bounds a range"),
         }
     }
 

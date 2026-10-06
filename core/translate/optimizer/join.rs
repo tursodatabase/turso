@@ -2355,16 +2355,15 @@ fn build_where_term_info(
         .collect()
 }
 
-/// A hash join compares its keys with plain equality, so it cannot run an
-/// equal test that calls the `=` function of a custom type.
 fn equal_test_calls_type_function(
     expr: &turso_parser::ast::Expr,
     table_references: &TableReferences,
     schema: &Schema,
 ) -> bool {
-    let Ok(Some((left, _, right))) = as_binary_components(expr) else {
-        return false;
-    };
+    let (left, _, right) = as_binary_components(expr)
+        .ok()
+        .flatten()
+        .expect("tables_in_equal_test accepted this term as a binary equality");
     comparison_calls_type_function(
         left,
         right,

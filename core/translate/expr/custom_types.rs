@@ -205,8 +205,6 @@ pub(super) struct ResolvedOperator {
     encode_info: Option<OperatorEncodeInfo>,
 }
 
-/// Whether `e1 op e2` compiles to a call of a custom type operator function
-/// instead of a plain comparison.
 pub(crate) fn comparison_calls_type_function(
     e1: &ast::Expr,
     e2: &ast::Expr,
@@ -217,8 +215,6 @@ pub(crate) fn comparison_calls_type_function(
     find_custom_type_operator(e1, e2, op, referenced_tables, schema).is_some()
 }
 
-/// Whether `e1 = e2` compiles to a call of the type's `=` function with one
-/// operand that is a literal ENCODEd to the column's type.
 pub(crate) fn equality_calls_type_function_with_encoded_literal(
     e1: &ast::Expr,
     e2: &ast::Expr,

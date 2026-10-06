@@ -2897,7 +2897,6 @@ fn apply_table_access_plan(
                         &constraints_per_table[table_idx].constraints,
                         constraint_refs,
                         where_clause,
-                        resolver,
                     )?));
                     *build_index = false;
                 }
@@ -3828,7 +3827,6 @@ fn ephemeral_index_build(
     constraints: &[Constraint],
     constraint_refs: &[RangeConstraintRef],
     where_clause: &[WhereTerm],
-    resolver: &Resolver<'_>,
 ) -> Result<Index> {
     let mut ephemeral_columns: crate::alloc::Vec<IndexColumn> = table_reference
         .columns()
@@ -3886,7 +3884,6 @@ fn ephemeral_index_build(
             constraints,
             constraint_refs,
             where_clause,
-            resolver,
         )
         .map(Box::new),
         has_rowid: table_reference
@@ -3920,7 +3917,6 @@ fn autoindex_prefilter(
     constraints: &[Constraint],
     constraint_refs: &[RangeConstraintRef],
     where_clause: &[WhereTerm],
-    resolver: &Resolver<'_>,
 ) -> Option<Expr> {
     let is_outer_join = table_reference
         .join_info
@@ -3952,11 +3948,8 @@ fn autoindex_prefilter(
             let depends_on_another_table = !constraint.lhs_mask.is_empty();
             let is_virtual_column = column.is_virtual_generated();
             let is_array = column.is_array();
-            let has_custom_type = resolver
-                .schema()
-                .get_type_def(&column.ty_str, table_reference.table.is_strict())
-                .is_some();
-            if depends_on_another_table || is_virtual_column || is_array || has_custom_type {
+            let compares_stored_value = constraint.index_use == IndexUse::Plain;
+            if depends_on_another_table || is_virtual_column || is_array || !compares_stored_value {
                 continue;
             }
 
@@ -4022,7 +4015,7 @@ pub fn build_seek_def_from_constraints(
                 op: end_op,
                 affinity: Affinity::Blob,
             },
-            last_component_index_use: IndexUse::Plain,
+            range_component_index_use: None,
         });
     }
     // Extract the key values and operators
@@ -4088,7 +4081,7 @@ fn build_seek_def(
                 op: end_op,
                 affinity: Affinity::Blob,
             },
-            last_component_index_use: IndexUse::Plain,
+            range_component_index_use: None,
         });
     }
     turso_assert!(last.lower_bound.is_some() || last.upper_bound.is_some());
@@ -4096,7 +4089,7 @@ fn build_seek_def(
     // pop last key as we will do some form of range search
     let last = key.pop().unwrap();
     let stored_nulls = last.nulls_order;
-    let last_component_index_use = last.index_use;
+    let range_component_index_use = Some(last.index_use);
     // after that all key components must be equality constraints
     turso_debug_assert!(key.iter().all(|k| k.eq.is_some()));
 
@@ -4293,7 +4286,7 @@ fn build_seek_def(
                 iter_dir,
                 start,
                 end,
-                last_component_index_use,
+                range_component_index_use,
             }
         }
         IterationDirection::Backwards => {
@@ -4415,7 +4408,7 @@ fn build_seek_def(
                 iter_dir,
                 start,
                 end,
-                last_component_index_use,
+                range_component_index_use,
             }
         }
     })

@@ -174,9 +174,7 @@ pub fn translate_create_index(
                             col.name
                         );
                     }
-                    if type_def.decode().is_some()
-                        && !type_def.operators().iter().any(|op| op.op == "<")
-                    {
+                    if !type_def.can_be_sorted() {
                         bail_parse_error!(
                             "cannot create index on column '{}' of type '{}': type does not declare OPERATOR '<'",
                             col.name,

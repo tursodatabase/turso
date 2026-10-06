@@ -497,4 +497,40 @@ mod tests {
             "LEFT JOIN on custom type column should find matches and produce NULLs for non-matches"
         );
     }
+
+    #[test]
+    fn test_min_max_of_indexed_custom_type_column_reads_one_index_entry() {
+        let opts = turso_core::DatabaseOpts::new().with_custom_types(true);
+        let db = TempDatabase::builder().with_opts(opts).build();
+        let conn = db.connect_limbo();
+        conn.execute("CREATE TABLE ev(id INTEGER PRIMARY KEY, ts timestamp, v uuid) STRICT")
+            .unwrap();
+        conn.execute("CREATE INDEX ev_ts ON ev(ts)").unwrap();
+        conn.execute("CREATE INDEX ev_v ON ev(v)").unwrap();
+
+        for query in [
+            "SELECT max(ts) FROM ev",
+            "SELECT min(ts) FROM ev",
+            "SELECT max(v) FROM ev",
+            "SELECT min(v) FROM ev",
+        ] {
+            let opcodes: Vec<String> =
+                crate::common::limbo_exec_rows(&conn, &format!("EXPLAIN {query}"))
+                    .into_iter()
+                    .map(|row| match &row[1] {
+                        rusqlite::types::Value::Text(opcode) => opcode.clone(),
+                        other => panic!("opcode column holds {other:?}"),
+                    })
+                    .collect();
+            let agg_step = opcodes
+                .iter()
+                .position(|opcode| opcode == "AggStep")
+                .unwrap_or_else(|| panic!("{query} has no AggStep: {opcodes:?}"));
+            assert_eq!(
+                opcodes[agg_step + 1],
+                "Goto",
+                "{query} must stop after the first index entry: {opcodes:?}"
+            );
+        }
+    }
 }

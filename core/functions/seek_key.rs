@@ -3,24 +3,18 @@ use crate::{turso_assert_eq, Numeric, Result};
 
 const UUID_TEXT_LEN: usize = 36;
 const UUID_HYPHEN_POSITIONS: [usize; 4] = [8, 13, 18, 23];
-/// Every integer sorts below every blob.
+// An integer sorts below every blob, and 17 bytes of 0xff sort above every 16-byte blob.
 const KEY_BELOW_EVERY_UUID: i64 = 0;
-/// A blob of 17 bytes of 0xff sorts above every 16-byte blob.
 const KEY_ABOVE_EVERY_UUID: [u8; 17] = [0xff; 17];
 
-/// What a seek key function returns when no stored value compares with the
-/// other stored values as the operand does. The seek passes it as an integer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum NoSeekKey {
-    /// NULL: an equality seek finds no row.
+pub(crate) enum NoSeekKey {
     Null = 0,
-    /// A key below every stored value.
     BelowEveryValue = -1,
-    /// A key above every stored value.
     AboveEveryValue = 1,
 }
 
-pub fn exec_uuid_seek_key(value: &Value, no_key: &Value) -> Result<Value> {
+pub(crate) fn exec_uuid_seek_key(value: &Value, no_key: &Value) -> Result<Value> {
     if let Value::Text(text) = value {
         if let Some(bytes) = canonical_uuid_bytes(text.as_str().as_bytes()) {
             return Ok(Value::from_slice(&bytes)?);

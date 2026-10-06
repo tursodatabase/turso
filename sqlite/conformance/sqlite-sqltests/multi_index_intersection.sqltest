@@ -175,6 +175,7 @@ snapshot-eqp multi_index_and_eqp {
 snapshot multi_index_and {
     SELECT * FROM t WHERE a = 1 AND b = 2;
 }
+
 # An intersection branch seeks one index per term, so each index must compare
 # like its term. Here the terms compare with BINARY, but both indexes are NOCASE.
 test multi-index-and-skips-index-with-other-collation {

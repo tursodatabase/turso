@@ -119,10 +119,7 @@ fn is_custom_type_without_lt(
         if let Some((_, table)) = referenced_tables.find_table_by_internal_id(*table_ref_id) {
             if let Some(col) = table.get_column_at(*column) {
                 if let Some(type_def) = schema.get_type_def(&col.ty_str, table.is_strict()) {
-                    if type_def.decode().is_some() {
-                        // No `<` operator at all (naked or with function)
-                        return !type_def.operators().iter().any(|op| op.op == "<");
-                    }
+                    return !type_def.can_be_sorted();
                 }
             }
         }

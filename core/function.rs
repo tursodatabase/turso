@@ -905,11 +905,6 @@ pub enum ScalarFunc {
     NumericDiv,
     NumericLt,
     NumericEq,
-    /// `uuid_seek_key(value, no_key)` returns the 16-byte blob of a canonical
-    /// UUID text (36 lowercase characters with hyphens), because only that
-    /// text is equal to a DECODEd `uuid` value. For other input it returns
-    /// the value that `no_key` names (see
-    /// [crate::functions::seek_key::NoSeekKey]).
     UuidSeekKey,
     // Array construction / element access (desugared from ARRAY[…] and expr[n] syntax)
     Array,

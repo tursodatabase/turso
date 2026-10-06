@@ -1141,8 +1141,6 @@ fn column_pair_compares_the_same(
     {
         return Ok(false);
     }
-    // Grouping and joining compare with plain equality, not with the `=`
-    // function of a custom type.
     if comparison_calls_type_function(
         &pair.inner,
         &pair.outer,

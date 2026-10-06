@@ -159,6 +159,54 @@ expect {
 
 @requires strict "uses STRICT tables"
 @setup temporal
+test timestamp-group-by-uses-index-order {
+    EXPLAIN QUERY PLAN SELECT ts, count(*) FROM ev GROUP BY ts;
+    SELECT ts, count(*) FROM ev GROUP BY ts;
+}
+expect {
+    1|0|0|SCAN ev USING COVERING INDEX ev_ts
+    |1
+    2024-01-01 00:00:00|1
+    2024-01-01 10:30:00|1
+    2024-01-02 08:00:00|1
+    2024-02-01 00:00:00|1
+}
+
+@requires strict "uses STRICT tables"
+@setup temporal
+test timestamp-is-seeks-index {
+    EXPLAIN QUERY PLAN SELECT id FROM ev WHERE ts IS '2024-01-01 00:00:00';
+    SELECT id FROM ev WHERE ts IS '2024-01-01 00:00:00';
+    SELECT id FROM ev NOT INDEXED WHERE ts IS '2024-01-01 00:00:00';
+}
+expect {
+    1|0|0|SEARCH ev USING COVERING INDEX ev_ts (ts=?)
+    1
+    1
+}
+
+@requires strict "uses STRICT tables"
+@setup temporal
+test timestamp-update-through-range-seek {
+    CREATE TABLE ev2(id INTEGER PRIMARY KEY, ts timestamp) STRICT;
+    CREATE INDEX ev2_ts ON ev2(ts);
+    INSERT INTO ev2 VALUES (1, '2024-01-01 00:00:00'), (2, '2024-03-01 00:00:00'), (3, '2023-01-01 00:00:00'), (4, NULL);
+    EXPLAIN QUERY PLAN UPDATE ev2 SET ts = '2025-' || substr(ts, 6) WHERE ts > '2023-06-01';
+    UPDATE ev2 SET ts = '2025-' || substr(ts, 6) WHERE ts > '2023-06-01';
+    SELECT id, ts FROM ev2 ORDER BY id;
+    PRAGMA integrity_check;
+}
+expect {
+    2|0|0|SEARCH ev2 USING COVERING INDEX ev2_ts (ts>?)
+    1|2025-01-01 00:00:00
+    2|2025-03-01 00:00:00
+    3|2023-01-01 00:00:00
+    4|
+    ok
+}
+
+@requires strict "uses STRICT tables"
+@setup temporal
 test timestamp-order-by-same-rows-with-and-without-index {
     SELECT id FROM ev ORDER BY ts DESC LIMIT 2;
     SELECT id FROM ev NOT INDEXED ORDER BY ts DESC LIMIT 2;
@@ -194,6 +242,21 @@ test bigint-range-uses-index {
 }
 expect {
     1|0|0|SEARCH n USING COVERING INDEX n_big (big>?)
+}
+
+@requires strict "uses STRICT tables"
+@setup integers
+test bigint-order-by-limit-uses-index-order {
+    EXPLAIN QUERY PLAN SELECT id FROM n ORDER BY big LIMIT 2;
+    SELECT id FROM n ORDER BY big LIMIT 2;
+    SELECT id FROM n NOT INDEXED ORDER BY big LIMIT 2;
+}
+expect {
+    1|0|0|SCAN n USING COVERING INDEX n_big
+    4
+    1
+    4
+    1
 }
 
 @requires strict "uses STRICT tables"
@@ -343,6 +406,84 @@ expect {
     c
     a
     c
+}
+
+@requires strict "uses STRICT tables"
+test inet-unique-same-rows-with-and-without-index {
+    CREATE TABLE ip(id INTEGER PRIMARY KEY, a inet UNIQUE) STRICT;
+    INSERT INTO ip VALUES (1, '10.0.0.1'), (2, '192.168.0.1'), (3, '::1');
+    SELECT count(*) FROM ip WHERE a = '10.0.0.1/32';
+    SELECT count(*) FROM ip NOT INDEXED WHERE a = '10.0.0.1/32';
+    SELECT count(*) FROM ip WHERE a = 'junk';
+    SELECT count(*) FROM ip NOT INDEXED WHERE a = 'junk';
+    SELECT group_concat(id) FROM (SELECT id FROM ip WHERE a > '10.0.0.1' ORDER BY id);
+    SELECT group_concat(id) FROM (SELECT id FROM ip NOT INDEXED WHERE a > '10.0.0.1' ORDER BY id);
+}
+expect {
+    0
+    0
+    0
+    0
+    2,3
+    2,3
+}
+
+@requires strict "uses STRICT tables"
+test json-primary-key-same-rows-with-and-without-index {
+    CREATE TABLE jt(a json PRIMARY KEY, id INTEGER) STRICT;
+    INSERT INTO jt VALUES ('{"a":1}', 1), ('[1,2]', 2);
+    SELECT count(*) FROM jt WHERE a = '{"a": 1}';
+    SELECT count(*) FROM jt NOT INDEXED WHERE a = '{"a": 1}';
+    SELECT id FROM jt WHERE a = '{"a":1}';
+    SELECT id FROM jt NOT INDEXED WHERE a = '{"a":1}';
+}
+expect {
+    0
+    0
+    1
+    1
+}
+
+@requires strict "uses STRICT tables"
+test jsonb-unique-same-rows-with-and-without-index {
+    CREATE TABLE jb(id INTEGER PRIMARY KEY, a jsonb UNIQUE) STRICT;
+    INSERT INTO jb VALUES (1, '{"a":1}'), (2, '[1,2]');
+    SELECT count(*) FROM jb WHERE a = '{"a": 1}';
+    SELECT count(*) FROM jb NOT INDEXED WHERE a = '{"a": 1}';
+    SELECT id FROM jb WHERE a = '{"a":1}';
+    SELECT id FROM jb NOT INDEXED WHERE a = '{"a":1}';
+}
+expect {
+    0
+    0
+    1
+    1
+}
+
+@requires strict "uses STRICT tables"
+test time-and-timestamptz-same-rows-with-and-without-index {
+    CREATE TABLE tm(id INTEGER PRIMARY KEY, t time, tz timestamptz) STRICT;
+    CREATE INDEX tm_t ON tm(t);
+    CREATE INDEX tm_tz ON tm(tz);
+    INSERT INTO tm VALUES (1, '10:30', '2024-06-01'), (2, '11:00:00.5', '2024-06-01 10:00:00+02:00');
+    SELECT count(*) FROM tm WHERE t = '10:30';
+    SELECT count(*) FROM tm NOT INDEXED WHERE t = '10:30';
+    SELECT id FROM tm WHERE t = '10:30:00';
+    SELECT id FROM tm NOT INDEXED WHERE t = '10:30:00';
+    SELECT count(*) FROM tm WHERE tz = '2024-06-01';
+    SELECT count(*) FROM tm NOT INDEXED WHERE tz = '2024-06-01';
+    SELECT group_concat(id) FROM (SELECT id FROM tm WHERE tz >= '2024-06-01 08:00:00' ORDER BY id);
+    SELECT group_concat(id) FROM (SELECT id FROM tm NOT INDEXED WHERE tz >= '2024-06-01 08:00:00' ORDER BY id);
+}
+expect {
+    0
+    0
+    1
+    1
+    0
+    0
+    2
+    2
 }
 
 # --- uuid: the index holds 16-byte blobs, expressions see lowercase text ---
@@ -495,6 +636,265 @@ expect {
     1
 }
 
+# --- joins: the seek key is a column of the other table ---
+
+setup join_keys {
+    CREATE TABLE ev(id INTEGER PRIMARY KEY, ts timestamp) STRICT;
+    CREATE INDEX ev_ts ON ev(ts);
+    CREATE TABLE ev_plain(id INTEGER PRIMARY KEY, ts timestamp) STRICT;
+    CREATE TABLE kt(id INTEGER PRIMARY KEY, d TEXT) STRICT;
+    CREATE INDEX kt_d ON kt(d);
+    CREATE TABLE kt_plain(id INTEGER PRIMARY KEY, d TEXT) STRICT;
+    INSERT INTO ev VALUES (1, '2024-01-01 00:00:00'), (2, '2024-01-02 10:00:00'), (3, NULL);
+    INSERT INTO ev_plain SELECT * FROM ev;
+    INSERT INTO kt VALUES (1, '2024-01-01'), (2, '2024-01-02 10:00:00'), (3, 'junk'), (4, NULL);
+    INSERT INTO kt_plain SELECT * FROM kt;
+    CREATE TABLE ub(id INTEGER PRIMARY KEY, v uuid) STRICT;
+    CREATE INDEX ub_v ON ub(v);
+    CREATE TABLE ub_plain(id INTEGER PRIMARY KEY, v uuid) STRICT;
+    CREATE TABLE ku(id INTEGER PRIMARY KEY, t TEXT) STRICT;
+    CREATE INDEX ku_t ON ku(t);
+    CREATE TABLE ku_plain(id INTEGER PRIMARY KEY, t TEXT) STRICT;
+    INSERT INTO ub VALUES (10, 'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11'), (11, '00000000-0000-4000-8000-000000000001'), (12, NULL);
+    INSERT INTO ub_plain SELECT * FROM ub;
+    INSERT INTO ku VALUES (1, 'A0EEBC99-9C0B-4EF8-BB6D-6BB9BD380A11'), (2, '00000000-0000-4000-8000-000000000001'), (3, 'junk'), (4, NULL);
+    INSERT INTO ku_plain SELECT * FROM ku;
+    CREATE TABLE pn(id INTEGER PRIMARY KEY, n numeric(10,2)) STRICT;
+    CREATE INDEX pn_n ON pn(n);
+    CREATE TABLE kn(id INTEGER PRIMARY KEY, d TEXT) STRICT;
+    CREATE INDEX kn_d ON kn(d);
+    INSERT INTO pn VALUES (1, 12.5), (2, -1.5), (3, 0), (4, NULL);
+    INSERT INTO kn VALUES (1, '12.50'), (2, '12.5'), (3, '-1.50'), (4, 'junk'), (5, NULL);
+}
+
+@requires strict "uses STRICT tables"
+@setup join_keys
+test timestamp-join-seeks-inner-index-with-outer-column {
+    EXPLAIN QUERY PLAN SELECT kt.id, ev.id FROM kt CROSS JOIN ev ON ev.ts = kt.d;
+    EXPLAIN QUERY PLAN SELECT kt.id, ev.id FROM kt CROSS JOIN ev ON ev.ts > kt.d;
+    EXPLAIN QUERY PLAN SELECT kt_plain.id, ev_plain.id FROM kt_plain JOIN ev_plain ON ev_plain.ts = kt_plain.d;
+}
+expect {
+    1|0|0|SCAN kt
+    2|0|0|SEARCH ev USING COVERING INDEX ev_ts (ts=?)
+    1|0|0|SCAN kt
+    2|0|0|SEARCH ev USING COVERING INDEX ev_ts (ts>?)
+    1|0|0|HASH JOIN ev_plain
+    2|0|0|SCAN kt_plain
+}
+
+@requires strict "uses STRICT tables"
+@setup join_keys
+test timestamp-join-same-rows-in-every-plan {
+    SELECT group_concat(pair) FROM (SELECT kt.id || ':' || ev.id AS pair FROM kt CROSS JOIN ev ON ev.ts = kt.d ORDER BY 1);
+    SELECT group_concat(pair) FROM (SELECT kt.id || ':' || ev.id AS pair FROM kt CROSS JOIN ev NOT INDEXED ON ev.ts = kt.d ORDER BY 1);
+    SELECT group_concat(pair) FROM (SELECT kt.id || ':' || ev.id AS pair FROM ev CROSS JOIN kt ON kt.d = ev.ts ORDER BY 1);
+    SELECT group_concat(pair) FROM (SELECT kt_plain.id || ':' || ev_plain.id AS pair FROM kt_plain JOIN ev_plain ON ev_plain.ts = kt_plain.d ORDER BY 1);
+    SELECT group_concat(pair) FROM (SELECT kt.id || ':' || ev.id AS pair FROM kt CROSS JOIN ev ON ev.ts > kt.d ORDER BY 1);
+    SELECT group_concat(pair) FROM (SELECT kt.id || ':' || ev.id AS pair FROM kt CROSS JOIN ev NOT INDEXED ON ev.ts > kt.d ORDER BY 1);
+    SELECT group_concat(pair) FROM (SELECT kt.id || ':' || ev.id AS pair FROM ev CROSS JOIN kt ON kt.d < ev.ts ORDER BY 1);
+}
+expect {
+    2:2
+    2:2
+    2:2
+    2:2
+    1:1,1:2
+    1:1,1:2
+    1:1,1:2
+}
+
+@requires strict "uses STRICT tables"
+@setup join_keys
+test uuid-join-seeks-inner-index-with-outer-column {
+    EXPLAIN QUERY PLAN SELECT ku.id, ub.id FROM ku CROSS JOIN ub ON ub.v = ku.t;
+    EXPLAIN QUERY PLAN SELECT ku.id, ub.id FROM ku CROSS JOIN ub ON ub.v >= ku.t;
+    EXPLAIN QUERY PLAN SELECT ku_plain.id, ub_plain.id FROM ku_plain JOIN ub_plain ON ub_plain.v = ku_plain.t;
+}
+expect {
+    1|0|0|SCAN ku
+    2|0|0|SEARCH ub USING COVERING INDEX ub_v (v=?)
+    1|0|0|SCAN ku
+    2|0|0|SEARCH ub USING COVERING INDEX ub_v (v>=?)
+    1|0|0|HASH JOIN ub_plain
+    2|0|0|SCAN ku_plain
+}
+
+@requires strict "uses STRICT tables"
+@setup join_keys
+test uuid-join-same-rows-in-every-plan {
+    SELECT group_concat(pair) FROM (SELECT ku.id || ':' || ub.id AS pair FROM ku CROSS JOIN ub ON ub.v = ku.t ORDER BY 1);
+    SELECT group_concat(pair) FROM (SELECT ku.id || ':' || ub.id AS pair FROM ku CROSS JOIN ub NOT INDEXED ON ub.v = ku.t ORDER BY 1);
+    SELECT group_concat(pair) FROM (SELECT ku.id || ':' || ub.id AS pair FROM ub CROSS JOIN ku ON ku.t = ub.v ORDER BY 1);
+    SELECT group_concat(pair) FROM (SELECT ku_plain.id || ':' || ub_plain.id AS pair FROM ku_plain JOIN ub_plain ON ub_plain.v = ku_plain.t ORDER BY 1);
+    SELECT group_concat(pair) FROM (SELECT ku.id || ':' || ub.id AS pair FROM ku CROSS JOIN ub ON ub.v >= ku.t ORDER BY 1);
+    SELECT group_concat(pair) FROM (SELECT ku.id || ':' || ub.id AS pair FROM ku CROSS JOIN ub NOT INDEXED ON ub.v >= ku.t ORDER BY 1);
+    SELECT group_concat(pair) FROM (SELECT ku.id || ':' || ub.id AS pair FROM ub CROSS JOIN ku ON ku.t <= ub.v ORDER BY 1);
+}
+expect {
+    2:11
+    2:11
+    2:11
+    2:11
+    1:10,2:10,2:11
+    1:10,2:10,2:11
+    1:10,2:10,2:11
+}
+
+@requires strict "uses STRICT tables"
+@setup join_keys
+test numeric-join-same-rows-in-every-plan-with-text-keys {
+    SELECT group_concat(pair) FROM (SELECT kn.id || ':' || pn.id AS pair FROM kn CROSS JOIN pn ON pn.n = kn.d ORDER BY 1);
+    SELECT group_concat(pair) FROM (SELECT kn.id || ':' || pn.id AS pair FROM kn CROSS JOIN pn NOT INDEXED ON pn.n = kn.d ORDER BY 1);
+    SELECT group_concat(pair) FROM (SELECT kn.id || ':' || pn.id AS pair FROM pn CROSS JOIN kn ON kn.d = pn.n ORDER BY 1);
+    SELECT group_concat(pair) FROM (SELECT kn.id || ':' || pn.id AS pair FROM kn CROSS JOIN pn ON pn.n > kn.d ORDER BY 1);
+    SELECT group_concat(pair) FROM (SELECT kn.id || ':' || pn.id AS pair FROM kn CROSS JOIN pn NOT INDEXED ON pn.n > kn.d ORDER BY 1);
+    SELECT group_concat(pair) FROM (SELECT kn.id || ':' || pn.id AS pair FROM pn CROSS JOIN kn ON kn.d < pn.n ORDER BY 1);
+}
+expect {
+    1:1,3:2
+    1:1,3:2
+    1:1,3:2
+    2:1,3:1,3:3
+    2:1,3:1,3:3
+    2:1,3:1,3:3
+}
+
+# --- IN (SELECT ...): the IN seek uses only a Plain column ---
+
+@requires strict "uses STRICT tables"
+@setup uuids
+test uuid-in-subquery-same-rows-with-and-without-index {
+    CREATE TABLE s(x TEXT) STRICT;
+    INSERT INTO s VALUES ('a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11'), ('00000000-0000-4000-8000-000000000001'), ('FFFFFFFF-FFFF-4FFF-BFFF-FFFFFFFFFFFF'), ('junk'), (NULL);
+    SELECT group_concat(id) FROM (SELECT id FROM u WHERE v IN (SELECT x FROM s) ORDER BY id);
+    SELECT group_concat(id) FROM (SELECT id FROM u NOT INDEXED WHERE v IN (SELECT x FROM s) ORDER BY id);
+    SELECT group_concat(id) FROM (SELECT id FROM u WHERE v NOT IN (SELECT x FROM s WHERE x IS NOT NULL) ORDER BY id);
+    SELECT group_concat(id) FROM (SELECT id FROM u NOT INDEXED WHERE v NOT IN (SELECT x FROM s WHERE x IS NOT NULL) ORDER BY id);
+}
+expect {
+    1,2
+    1,2
+    3,5
+    3,5
+}
+
+@requires strict "uses STRICT tables"
+test decode-to-another-value-in-subquery-same-rows-with-and-without-index {
+    CREATE TYPE ci(value text) BASE text ENCODE value DECODE lower(value) OPERATOR '<';
+    CREATE TABLE c(id INTEGER PRIMARY KEY, v ci) STRICT;
+    CREATE INDEX c_v ON c(v);
+    INSERT INTO c VALUES (1, 'ABC'), (2, 'abc'), (3, 'xyz');
+    CREATE TABLE s(x TEXT) STRICT;
+    INSERT INTO s VALUES ('abc'), ('XYZ');
+    SELECT group_concat(id) FROM (SELECT id FROM c WHERE v IN (SELECT x FROM s) ORDER BY id);
+    SELECT group_concat(id) FROM (SELECT id FROM c NOT INDEXED WHERE v IN (SELECT x FROM s) ORDER BY id);
+}
+expect {
+    1,2
+    1,2
+}
+
+@requires strict "uses STRICT tables"
+@setup uuids
+test uuid-null-operand-same-rows-with-and-without-index {
+    SELECT count(*) FROM u WHERE v = NULL;
+    SELECT count(*) FROM u NOT INDEXED WHERE v = NULL;
+    SELECT count(*) FROM u WHERE v > NULL;
+    SELECT count(*) FROM u NOT INDEXED WHERE v > NULL;
+    SELECT count(*) FROM u WHERE v < NULL;
+    SELECT count(*) FROM u INDEXED BY u_v_desc WHERE v < NULL;
+}
+expect {
+    0
+    0
+    0
+    0
+    0
+    0
+}
+
+@requires strict "uses STRICT tables"
+@setup uuids
+test uuid-is-same-rows-with-and-without-index {
+    SELECT id FROM u WHERE v IS NULL;
+    SELECT id FROM u NOT INDEXED WHERE v IS NULL;
+    SELECT id FROM u WHERE v IS 'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11';
+    SELECT id FROM u NOT INDEXED WHERE v IS 'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11';
+    SELECT count(*) FROM u WHERE v IS 'A0EEBC99-9C0B-4EF8-BB6D-6BB9BD380A11';
+    SELECT count(*) FROM u NOT INDEXED WHERE v IS 'A0EEBC99-9C0B-4EF8-BB6D-6BB9BD380A11';
+}
+expect {
+    4
+    4
+    1
+    1
+    0
+    0
+}
+
+@requires strict "uses STRICT tables"
+@setup uuids
+test uuid-first-column-of-index-same-rows-with-and-without-index {
+    CREATE INDEX u_v_k ON u(v, k);
+    SELECT count(*) FROM u INDEXED BY u_v_k WHERE v = 'A0EEBC99-9C0B-4EF8-BB6D-6BB9BD380A12' AND k > 1;
+    SELECT count(*) FROM u NOT INDEXED WHERE v = 'A0EEBC99-9C0B-4EF8-BB6D-6BB9BD380A12' AND k > 1;
+    SELECT id FROM u INDEXED BY u_v_k WHERE v = 'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a12' AND k > 1;
+    SELECT id FROM u NOT INDEXED WHERE v = 'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a12' AND k > 1;
+}
+expect {
+    0
+    0
+    5
+    5
+}
+
+@requires strict "uses STRICT tables"
+@setup uuids
+test uuid-order-by-limit-and-group-by-use-index-order {
+    EXPLAIN QUERY PLAN SELECT id FROM u INDEXED BY u_v ORDER BY v LIMIT 2;
+    EXPLAIN QUERY PLAN SELECT v, count(*) FROM u INDEXED BY u_v GROUP BY v;
+    SELECT id FROM u INDEXED BY u_v ORDER BY v LIMIT 2;
+    SELECT id FROM u NOT INDEXED ORDER BY v LIMIT 2;
+}
+expect {
+    1|0|0|SCAN u USING COVERING INDEX u_v
+    1|0|0|SCAN u USING COVERING INDEX u_v
+    4
+    2
+    4
+    2
+}
+
+@requires strict "uses STRICT tables"
+@setup uuids
+test uuid-delete-through-range-seek {
+    EXPLAIN QUERY PLAN DELETE FROM u WHERE v >= 'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11';
+    DELETE FROM u WHERE v >= 'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11';
+    SELECT group_concat(id) FROM (SELECT id FROM u ORDER BY id);
+    PRAGMA integrity_check;
+}
+expect {
+    5|0|0|SEARCH u USING COVERING INDEX u_v_desc (v<=?)
+    2,4
+    ok
+}
+
+@requires strict "uses STRICT tables"
+@setup temporal
+test timestamp-null-operand-same-rows-with-and-without-index {
+    SELECT count(*) FROM ev WHERE ts > NULL;
+    SELECT count(*) FROM ev NOT INDEXED WHERE ts > NULL;
+    SELECT count(*) FROM ev WHERE ts = NULL;
+    SELECT count(*) FROM ev NOT INDEXED WHERE ts = NULL;
+}
+expect {
+    0
+    0
+    0
+    0
+}
+
 # --- numeric: only `column = literal` seeks, and the term stays as a filter ---
 
 @requires strict "uses STRICT tables"
@@ -513,23 +913,35 @@ test numeric-equality-same-rows-with-and-without-index {
     SELECT id FROM p NOT INDEXED WHERE n = 12.5;
     SELECT id FROM p WHERE n = '12.50';
     SELECT id FROM p NOT INDEXED WHERE n = '12.50';
-    SELECT (SELECT count(*) FROM p WHERE n = -1.5) = (SELECT count(*) FROM p NOT INDEXED WHERE n = -1.5);
+    SELECT count(*) FROM p WHERE n = -1.5;
+    SELECT count(*) FROM p NOT INDEXED WHERE n = -1.5;
+    SELECT id FROM p WHERE n = '-1.50';
+    SELECT id FROM p NOT INDEXED WHERE n = '-1.50';
 }
 expect {
     1
     1
     1
     1
-    1
+    0
+    0
+    2
+    2
 }
 
 @requires strict "uses STRICT tables"
 @setup numerics
 test numeric-or-of-two-indexed-columns-same-rows-with-and-without-index {
-    SELECT (SELECT group_concat(id) FROM (SELECT id FROM p WHERE n = -1.5 OR m = -2.5 ORDER BY id)) IS (SELECT group_concat(id) FROM (SELECT id FROM p NOT INDEXED WHERE n = -1.5 OR m = -2.5 ORDER BY id));
+    SELECT count(*) FROM p WHERE n = -1.5 OR m = -2.5;
+    SELECT count(*) FROM p NOT INDEXED WHERE n = -1.5 OR m = -2.5;
+    SELECT group_concat(id) FROM (SELECT id FROM p WHERE n = 12.5 OR m = 2 ORDER BY id);
+    SELECT group_concat(id) FROM (SELECT id FROM p NOT INDEXED WHERE n = 12.5 OR m = 2 ORDER BY id);
 }
 expect {
-    1
+    0
+    0
+    1,2
+    1,2
 }
 
 @requires strict "uses STRICT tables"
@@ -577,10 +989,69 @@ test numeric-expression-index-same-rows-with-and-without-index {
     CREATE TABLE x(id INTEGER PRIMARY KEY, val numeric(10,2)) STRICT;
     CREATE INDEX x_double ON x(val * 2);
     INSERT INTO x VALUES (1, 10), (2, 20), (3, 50);
-    SELECT (SELECT count(*) FROM x WHERE val * 2 = 100) = (SELECT count(*) FROM x NOT INDEXED WHERE val * 2 = 100);
+    SELECT count(*) FROM x WHERE val * 2 = 100;
+    SELECT count(*) FROM x NOT INDEXED WHERE val * 2 = 100;
+    SELECT id FROM x WHERE val * 2 = '100.0000';
+    SELECT id FROM x NOT INDEXED WHERE val * 2 = '100.0000';
 }
 expect {
+    0
+    0
+    3
+    3
+}
+
+@requires strict "uses STRICT tables"
+test numeric-second-column-of-index-same-rows-with-and-without-index {
+    CREATE TABLE pk(id INTEGER PRIMARY KEY, k INTEGER, n numeric(10,2)) STRICT;
+    CREATE INDEX pk_k_n ON pk(k, n);
+    INSERT INTO pk VALUES (1, 1, 12.5), (2, 1, -1.5), (3, 2, 12.5), (4, 1, NULL);
+    EXPLAIN QUERY PLAN SELECT id FROM pk WHERE k = 1 AND n = 12.5;
+    SELECT group_concat(id) FROM (SELECT id FROM pk WHERE k = 1 AND n = 12.5 ORDER BY id);
+    SELECT group_concat(id) FROM (SELECT id FROM pk NOT INDEXED WHERE k = 1 AND n = 12.5 ORDER BY id);
+    SELECT group_concat(id) FROM (SELECT id FROM pk WHERE k = 1 AND n > 0 ORDER BY id);
+    SELECT group_concat(id) FROM (SELECT id FROM pk NOT INDEXED WHERE k = 1 AND n > 0 ORDER BY id);
+}
+expect {
+    1|0|0|SEARCH pk USING COVERING INDEX pk_k_n (k=? AND n=?)
     1
+    1
+    1
+    1
+}
+
+@requires strict "uses STRICT tables"
+@setup numerics
+test numeric-equality-with-null-same-rows-with-and-without-index {
+    SELECT count(*) FROM p WHERE n = NULL;
+    SELECT count(*) FROM p NOT INDEXED WHERE n = NULL;
+}
+expect {
+    0
+    0
+}
+
+# Known difference between plans: the seek ENCODEs the literal once before it
+# reads a row, and the scan ENCODEs it only for a row that reaches the
+# comparison. With no such row, only the seek raises the error.
+@requires strict "uses STRICT tables"
+test numeric-invalid-literal-without-index-gives-no-row-of-empty-table {
+    CREATE TABLE e(id INTEGER PRIMARY KEY, n numeric(10,2)) STRICT;
+    CREATE INDEX e_n ON e(n);
+    SELECT count(*) FROM e NOT INDEXED WHERE n = 'abc';
+}
+expect {
+    0
+}
+
+@requires strict "uses STRICT tables"
+test numeric-invalid-literal-with-index-raises-error-on-empty-table {
+    CREATE TABLE e(id INTEGER PRIMARY KEY, n numeric(10,2)) STRICT;
+    CREATE INDEX e_n ON e(n);
+    SELECT count(*) FROM e WHERE n = 'abc';
+}
+expect error {
+    invalid input for type numeric
 }
 
 # --- user types that DECODE to another value or compare with functions ---
@@ -628,6 +1099,58 @@ test greater-than-function-same-rows-with-and-without-index {
 expect {
     1,3
     1,3
+}
+
+# An expression index and a partial index compute their expression from the
+# DECODEd column values, as the query does, unless the type has an operator
+# function: then the query calls the function and a write does not.
+@requires strict "uses STRICT tables"
+test uuid-expression-and-partial-index-same-rows-with-and-without-index {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, u uuid, k INTEGER) STRICT;
+    INSERT INTO t VALUES (1, 'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11', 1), (2, '00000000-0000-4000-8000-000000000001', 2);
+    CREATE INDEX t_lu ON t(lower(u));
+    CREATE INDEX t_k_part ON t(k) WHERE u > 'b';
+    INSERT INTO t VALUES (3, 'ffffffff-0000-4000-8000-000000000001', 3);
+    UPDATE t SET u = 'cccccccc-0000-4000-8000-000000000001' WHERE id = 2;
+    EXPLAIN QUERY PLAN SELECT id FROM t WHERE lower(u) >= 'b';
+    EXPLAIN QUERY PLAN SELECT id FROM t WHERE k > 0 AND u > 'b';
+    SELECT group_concat(id) FROM (SELECT id FROM t WHERE lower(u) >= 'b' ORDER BY id);
+    SELECT group_concat(id) FROM (SELECT id FROM t NOT INDEXED WHERE lower(u) >= 'b' ORDER BY id);
+    SELECT group_concat(id) FROM (SELECT id FROM t WHERE k > 0 AND u > 'b' ORDER BY id);
+    SELECT group_concat(id) FROM (SELECT id FROM t NOT INDEXED WHERE k > 0 AND u > 'b' ORDER BY id);
+}
+expect {
+    1|0|0|SEARCH t USING INDEX t_lu (lower (u)>=?)
+    1|0|0|SEARCH t USING COVERING INDEX t_k_part (k>?)
+    2,3
+    2,3
+    2,3
+    2,3
+}
+
+@requires strict "uses STRICT tables"
+test decode-to-another-value-expression-and-partial-index-same-rows-with-and-without-index {
+    CREATE TYPE ci(value text) BASE text ENCODE value DECODE lower(value) OPERATOR '<';
+    CREATE TABLE c(id INTEGER PRIMARY KEY, v ci, k INTEGER) STRICT;
+    INSERT INTO c VALUES (1, 'XYZ', 1), (2, 'abc', 2);
+    CREATE INDEX c_part ON c(k) WHERE v = 'abc';
+    CREATE INDEX c_expr ON c(v || 'x');
+    UPDATE c SET v = 'ABC' WHERE id = 1;
+    INSERT INTO c VALUES (3, 'AbC', 3);
+    EXPLAIN QUERY PLAN SELECT id FROM c WHERE k > 0 AND v = 'abc';
+    EXPLAIN QUERY PLAN SELECT id FROM c WHERE v || 'x' = 'abcx';
+    SELECT group_concat(id) FROM (SELECT id FROM c WHERE k > 0 AND v = 'abc' ORDER BY id);
+    SELECT group_concat(id) FROM (SELECT id FROM c NOT INDEXED WHERE k > 0 AND v = 'abc' ORDER BY id);
+    SELECT group_concat(id) FROM (SELECT id FROM c WHERE v || 'x' = 'abcx' ORDER BY id);
+    SELECT group_concat(id) FROM (SELECT id FROM c NOT INDEXED WHERE v || 'x' = 'abcx' ORDER BY id);
+}
+expect {
+    1|0|0|SEARCH c USING COVERING INDEX c_part (k>?)
+    1|0|0|SEARCH c USING INDEX c_expr (v || 'x'=?)
+    1,2,3
+    1,2,3
+    1,2,3
+    1,2,3
 }
 
 # --- arrays compare element by element, the index compares the record blob ---

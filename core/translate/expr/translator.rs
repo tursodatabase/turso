@@ -1902,7 +1902,7 @@ fn translate_function_call_expr(
                     crate::bail_parse_error!("{} is an internal function used by CDC", srf);
                 }
                 ScalarFunc::UuidSeekKey => {
-                    crate::bail_parse_error!("{} is an internal function used by index seeks", srf);
+                    unreachable!("no function name resolves to {srf}")
                 }
                 ScalarFunc::TestUintEncode
                 | ScalarFunc::TestUintDecode
