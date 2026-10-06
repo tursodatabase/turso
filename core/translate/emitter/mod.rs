@@ -2355,7 +2355,7 @@ pub(crate) fn emit_check_constraints<'a>(
     program: &mut ProgramBuilder,
     check_constraints: &[CheckConstraint],
     resolver: &mut Resolver,
-    table_name: &str,
+    table: &BTreeTable,
     rowid_reg: usize,
     column_mappings: impl Iterator<Item = (&'a str, usize)>,
     connection: &Arc<Connection>,
@@ -2367,7 +2367,13 @@ pub(crate) fn emit_check_constraints<'a>(
         return Ok(());
     }
 
-    let column_mappings: Vec<(&str, usize)> = column_mappings.collect();
+    let table_name = table.name.as_str();
+    let column_mappings = column_mappings
+        .map(|(col_name, register)| {
+            emit_value_that_check_reads(program, resolver, table, col_name, register)
+                .map(|register| (col_name, register))
+        })
+        .collect::<Result<Vec<(&str, usize)>>>()?;
     let initial_cache_size = resolver.expr_to_reg_cache.len();
     let joined_table = referenced_tables.and_then(|tables| tables.joined_tables().first());
 
@@ -2453,4 +2459,36 @@ pub(crate) fn emit_check_constraints<'a>(
     resolver.expr_to_reg_cache_enabled = false;
 
     result
+}
+
+/// A CHECK reads the value that a column shows. The registers hold stored
+/// values, and the built-in types of the PostgreSQL frontend store another
+/// value than the value that they show: decode it into a new register.
+fn emit_value_that_check_reads(
+    program: &mut ProgramBuilder,
+    resolver: &Resolver,
+    table: &BTreeTable,
+    col_name: &str,
+    register: usize,
+) -> Result<usize> {
+    let Some((_, column)) = table.get_column(col_name) else {
+        return Ok(register);
+    };
+    let reads_decoded_value = matches!(
+        resolver.schema().resolve_type(&column.ty_str, table.is_strict),
+        Ok(Some(resolved)) if resolved.check_reads_decoded_value()
+    );
+    if !reads_decoded_value || column.is_rowid_alias() {
+        return Ok(register);
+    }
+    let decoded = program.alloc_register();
+    crate::translate::expr::emit_user_facing_column_value(
+        program,
+        register,
+        decoded,
+        column,
+        table.is_strict,
+        resolver,
+    )?;
+    Ok(decoded)
 }

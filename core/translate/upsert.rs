@@ -795,7 +795,7 @@ pub fn emit_upsert(
             program,
             &bt.check_constraints,
             resolver,
-            &bt.name,
+            &bt,
             new_rowid_reg.unwrap_or(ctx.conflict_rowid_reg),
             bt.columns().iter().enumerate().filter_map(|(idx, col)| {
                 col.name

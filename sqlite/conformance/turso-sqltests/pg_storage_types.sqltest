@@ -428,11 +428,24 @@ expect error {
 }
 
 @requires strict "uses STRICT tables"
-test check-compares-pg-numeric-columns-only-at-the-same-scale {
+test check-compares-pg-numeric-columns-of-different-scales {
     CREATE TABLE ck(id INTEGER PRIMARY KEY, a pg_numeric(10,2), b pg_numeric(10,3), CHECK (a >= b)) STRICT, PGSTORAGE;
+    INSERT INTO ck VALUES (1, 10, 9);
+    INSERT INTO ck VALUES (2, 9.5, 9.5);
+    SELECT id, a, b FROM ck ORDER BY id;
+}
+expect {
+    1|10.00|9.000
+    2|9.50|9.500
+}
+
+@requires strict "uses STRICT tables"
+test check-compares-pg-numeric-columns-of-different-scales-refuses-a-row {
+    CREATE TABLE ck(id INTEGER PRIMARY KEY, a pg_numeric(10,2), b pg_numeric(10,3), CHECK (a >= b)) STRICT, PGSTORAGE;
+    INSERT INTO ck VALUES (1, 1, 2);
 }
 expect error {
-    type mismatch in CHECK constraint: cannot compare pg_numeric
+    CHECK constraint failed: a >= b
 }
 
 @requires strict "uses STRICT tables"
@@ -646,6 +659,130 @@ test integer-rowid-alias-of-a-table-without-pg-types-keeps-generating-ids {
 expect {
     1|a
     2|b
+}
+
+@requires strict "uses STRICT tables"
+test check-of-plain-custom-types-compares-like-the-base-type {
+    CREATE TABLE ck(id pg_int4 PRIMARY KEY, a pg_int4 CHECK (a > 0), b pg_int8 CHECK (b > 0), c bigint CHECK (c > 0), d smallint CHECK (d < 100), ts timestamp CHECK (ts > '2020-01-01')) STRICT, PGSTORAGE;
+    INSERT INTO ck VALUES (1, 1, 2, 3, 4, '2024-01-01 10:00:00');
+    SELECT a, b, c, d, ts FROM ck;
+}
+expect {
+    1|2|3|4|2024-01-01 10:00:00
+}
+
+@requires strict "uses STRICT tables"
+test check-of-plain-custom-types-refuses-a-row {
+    CREATE TABLE ck(id pg_int4 PRIMARY KEY, b pg_int8 CHECK (b > 0)) STRICT, PGSTORAGE;
+    INSERT INTO ck VALUES (1, -2);
+}
+expect error {
+    CHECK constraint failed: b > 0
+}
+
+@requires strict "uses STRICT tables"
+test check-reads-the-value-of-temporal-and-numeric-columns {
+    CREATE TABLE ck(id pg_int4 PRIMARY KEY, ts pg_timestamp CHECK (ts > '2020-01-01'), tz pg_timestamptz CHECK (tz < '2100-01-01'), d pg_date CHECK (d >= '2020-01-01'), t pg_time CHECK (t < '18:00'), n pg_numeric(10,2) CHECK (n > 0), m pg_numeric(10,2) CHECK (m > -1.5 AND m * 2 < 10), CHECK (ts > CAST('2021-01-01' AS pg_timestamp))) STRICT, PGSTORAGE;
+    INSERT INTO ck VALUES (1, '2024-01-01', '2024-01-01 10:00+02', '2024-01-01', '10:00', 0.01, -1.49);
+    UPDATE ck SET id = 2;
+    SELECT id, ts, tz, d, t, n, m FROM ck;
+}
+expect {
+    2|2024-01-01 00:00:00|2024-01-01 08:00:00|2024-01-01|10:00:00|0.01|-1.49
+}
+
+@requires strict "uses STRICT tables"
+test check-reads-the-value-of-a-timestamp-column-and-refuses-a-row {
+    CREATE TABLE ck(id pg_int4 PRIMARY KEY, ts pg_timestamp CHECK (ts > '2020-01-01')) STRICT, PGSTORAGE;
+    INSERT INTO ck VALUES (1, '2019-12-31 23:59:59');
+}
+expect error {
+    CHECK constraint failed: ts > '2020-01-01'
+}
+
+@requires strict "uses STRICT tables"
+test check-reads-the-value-of-a-numeric-column-and-refuses-a-row {
+    CREATE TABLE ck(id pg_int4 PRIMARY KEY, m pg_numeric(10,2) CHECK (m > -1.5)) STRICT, PGSTORAGE;
+    INSERT INTO ck VALUES (1, -1.5);
+}
+expect error {
+    CHECK constraint failed: m > -1.5
+}
+
+@requires strict "uses STRICT tables"
+test check-reads-the-value-in-an-update-of-another-column {
+    CREATE TABLE ck(id pg_int4 PRIMARY KEY, d pg_date, e pg_date, v TEXT, CHECK (d < e)) STRICT, PGSTORAGE;
+    INSERT INTO ck VALUES (1, '2024-01-01', '2024-02-01', 'a');
+    UPDATE ck SET v = 'b';
+    UPDATE ck SET e = '2023-12-31';
+}
+expect error {
+    CHECK constraint failed: d < e
+}
+
+@requires strict "uses STRICT tables"
+test check-reads-the-value-in-an-upsert {
+    CREATE TABLE ck(id pg_int4 PRIMARY KEY, d pg_date CHECK (d > '2020-01-01')) STRICT, PGSTORAGE;
+    INSERT INTO ck VALUES (1, '2024-01-01');
+    INSERT INTO ck VALUES (1, '2024-01-01') ON CONFLICT (id) DO UPDATE SET d = '2019-01-01';
+}
+expect error {
+    CHECK constraint failed: d > '2020-01-01'
+}
+
+@requires strict "uses STRICT tables"
+test check-of-add-column-reads-the-value-of-the-default {
+    CREATE TABLE a(id pg_int4 PRIMARY KEY) STRICT, PGSTORAGE;
+    INSERT INTO a VALUES (1);
+    ALTER TABLE a ADD COLUMN d pg_date DEFAULT '2024-03-01 10:00' CHECK (d = '2024-03-01');
+    ALTER TABLE a ADD COLUMN n pg_numeric(10,2) DEFAULT 1.5 CHECK (n > 1);
+    SELECT id, d, n FROM a;
+}
+expect {
+    1|2024-03-01|1.50
+}
+
+@requires strict "uses STRICT tables"
+test check-of-add-column-reads-the-value-of-the-default-and-refuses-it {
+    CREATE TABLE a(id pg_int4 PRIMARY KEY) STRICT, PGSTORAGE;
+    INSERT INTO a VALUES (1);
+    ALTER TABLE a ADD COLUMN ts pg_timestamp DEFAULT '2019-01-01' CHECK (ts > '2020-01-01');
+}
+expect error {
+    CHECK constraint failed
+}
+
+@requires custom_types "uses CREATE DOMAIN"
+@requires strict "uses STRICT tables"
+test domain-check-over-a-pg-type-reads-the-value {
+    CREATE DOMAIN recent AS pg_timestamp CHECK (value > '2020-01-01');
+    CREATE TABLE dm(id pg_int4 PRIMARY KEY, ts recent) STRICT, PGSTORAGE;
+    INSERT INTO dm VALUES (1, '2024-01-01 10:00');
+    SELECT ts, CAST('2024-05-01' AS recent) FROM dm;
+}
+expect {
+    2024-01-01 10:00:00|2024-05-01 00:00:00
+}
+
+@requires custom_types "uses CREATE DOMAIN"
+@requires strict "uses STRICT tables"
+test domain-check-over-a-pg-type-refuses-a-row {
+    CREATE DOMAIN recent AS pg_timestamp CHECK (value > '2020-01-01');
+    CREATE TABLE dm(id pg_int4 PRIMARY KEY, ts recent) STRICT, PGSTORAGE;
+    INSERT INTO dm VALUES (1, '2019-01-01');
+}
+expect error {
+    CHECK constraint failed
+}
+
+@requires custom_types "uses CREATE DOMAIN"
+@requires strict "uses STRICT tables"
+test domain-check-over-a-pg-type-refuses-a-cast {
+    CREATE DOMAIN recent AS pg_timestamp CHECK (value > '2020-01-01');
+    SELECT CAST('2019-01-01' AS recent);
+}
+expect error {
+    value for domain recent violates check constraint
 }
 
 @requires custom_types "uses CREATE DOMAIN"

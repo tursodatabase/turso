@@ -776,6 +776,8 @@ fn translate_cast_expr(
 
             // Domains: apply parent encode chain, then validate constraints
             // on the encoded value (domain CHECK sees the stored representation).
+            // Over a built-in type of the PostgreSQL frontend, the CHECK and
+            // the cast read the value that a column of the type shows.
             if resolved.is_domain() {
                 // Apply encode from parent custom types (domain itself has encode: None)
                 let cast_col = Column::new(
@@ -801,8 +803,6 @@ fn translate_cast_expr(
                     }
                 }
 
-                // Validate domain constraints on the encoded value
-                emit_domain_cast_constraints(program, &resolved.chain, target_register, resolver)?;
                 if resolved.needs_pg_storage() {
                     emit_cast_value_decode(
                         program,
@@ -812,6 +812,7 @@ fn translate_cast_expr(
                         resolver,
                     )?;
                 }
+                emit_domain_cast_constraints(program, &resolved.chain, target_register, resolver)?;
                 return Ok(target_register);
             }
 

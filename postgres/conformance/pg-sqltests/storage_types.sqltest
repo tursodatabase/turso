@@ -195,6 +195,42 @@ test bigint-primary-key-update-to-null-is-refused {
 }
 expect error {}
 
+test check-on-integer-and-bigint-columns {
+    CREATE TABLE ck (id int PRIMARY KEY, a int CHECK (a > 0), b bigint CHECK (b > 0));
+    INSERT INTO ck VALUES (1, 1, 2);
+    SELECT id, a, b FROM ck;
+}
+expect {
+    1|1|2
+}
+
+test check-on-integer-and-bigint-columns-refuses-a-row {
+    CREATE TABLE ck (id int PRIMARY KEY, a int CHECK (a > 0), b bigint CHECK (b > 0));
+    INSERT INTO ck VALUES (1, 1, -2);
+}
+expect error {}
+
+test check-on-timestamp-date-and-numeric-columns {
+    CREATE TABLE ck (id int PRIMARY KEY, ts timestamp CHECK (ts > '2020-01-01'), d date CHECK (d >= '2020-01-01'::date), price numeric(10,2) CHECK (price > 0), a numeric(10,2), b numeric(10,3), CHECK (a >= b));
+    INSERT INTO ck VALUES (1, '2024-01-01 10:00', '2024-01-01', 0.01, 10, 9);
+    SELECT id, ts, d, price, a, b FROM ck;
+}
+expect {
+    1|2024-01-01 10:00:00|2024-01-01|0.01|10.00|9.000
+}
+
+test check-on-timestamp-column-refuses-a-row {
+    CREATE TABLE ck (id int PRIMARY KEY, ts timestamp CHECK (ts > '2020-01-01'));
+    INSERT INTO ck VALUES (1, '2019-12-31 23:59:59');
+}
+expect error {}
+
+test check-across-numeric-scales-refuses-a-row {
+    CREATE TABLE ck (id int PRIMARY KEY, a numeric(10,2), b numeric(10,3), CHECK (a >= b));
+    INSERT INTO ck VALUES (1, 1, 2);
+}
+expect error {}
+
 @setup amounts
 test numeric-compares-negative-literals-and-expressions {
     SELECT id FROM price WHERE amount > -1 ORDER BY id;

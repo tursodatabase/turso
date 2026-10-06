@@ -663,7 +663,7 @@ fn emit_add_virtual_column_validation(
             program,
             &check_constraints,
             &mut check_resolver,
-            resolved_table.name.as_str(),
+            &resolved_table,
             rowid_reg,
             resolved_table
                 .columns()
@@ -732,6 +732,7 @@ fn emit_add_column_check_validation(
         Some(expr) if !crate::util::expr_contains_null(expr) => *expr.clone(),
         _ => return Ok(()),
     };
+    let default_expr = value_that_check_reads(default_expr, column, btree, resolver);
 
     // Collect CHECK constraints from column-level constraints + domain CHECKs.
     // Domain CHECKs use `value` as placeholder which must be rewritten to the column name.
@@ -847,6 +848,36 @@ fn emit_add_column_check_validation(
 
     program.preassign_label_to_next_insn(skip_check_label);
     Ok(())
+}
+
+/// A CHECK reads the value that a column of a built-in type of the
+/// PostgreSQL frontend shows: the DEFAULT through a cast to the column type.
+fn value_that_check_reads(
+    default_expr: ast::Expr,
+    column: &Column,
+    btree: &BTreeTable,
+    resolver: &Resolver,
+) -> ast::Expr {
+    let reads_decoded_value = matches!(
+        resolver.schema().resolve_type(&column.ty_str, btree.is_strict),
+        Ok(Some(resolved)) if resolved.check_reads_decoded_value()
+    );
+    if !reads_decoded_value {
+        return default_expr;
+    }
+    let size = match column.ty_params.as_slice() {
+        [max_size] => Some(ast::TypeSize::MaxSize(max_size.clone())),
+        [precision, scale] => Some(ast::TypeSize::TypeSize(precision.clone(), scale.clone())),
+        _ => None,
+    };
+    ast::Expr::Cast {
+        expr: Box::new(default_expr),
+        type_name: Some(ast::Type {
+            name: column.ty_str.clone(),
+            size,
+            array_dimensions: 0,
+        }),
+    }
 }
 
 pub fn translate_alter_table(

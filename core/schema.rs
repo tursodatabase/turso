@@ -300,6 +300,26 @@ impl ResolvedType {
     pub(crate) fn needs_pg_storage(&self) -> bool {
         self.chain.iter().any(|td| td.is_pg_storage_type())
     }
+
+    /// A CHECK reads the DECODEd value of a column of this type: the chain
+    /// has a built-in type of the PostgreSQL frontend that stores another
+    /// value than the value that it shows.
+    pub(crate) fn check_reads_decoded_value(&self) -> bool {
+        self.chain
+            .iter()
+            .any(|td| td.is_pg_storage_type() && !decode_returns_stored_value(td))
+    }
+
+    /// Every type of the chain stores the value that it shows and has no
+    /// comparison function, so a CHECK compares the value like a value of the
+    /// primitive type.
+    pub(crate) fn stores_the_value_it_shows(&self) -> bool {
+        self.chain.iter().all(|td| {
+            matches!(td.kind, TypeDefKind::Custom { .. })
+                && decode_returns_stored_value(td)
+                && !declares_comparison_function(td)
+        })
+    }
 }
 
 /// Custom type definition, loaded from sqlite_turso_types

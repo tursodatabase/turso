@@ -595,32 +595,11 @@ fn resolve_json_func_return_type(func: &crate::function::JsonFunc) -> Result<Che
 /// Resolve a column's type from its definition.
 fn resolve_column_type(col: &ast::ColumnDefinition, resolver: &Resolver) -> Result<CheckExprType> {
     if let Some(ref col_type) = col.col_type {
-        let check_type = resolve_type_name(&col_type.name, resolver)?;
-        Ok(with_stored_scale(check_type, col_type, resolver))
+        resolve_type_name(&col_type.name, resolver)
     } else {
         // No type specified — in STRICT tables this would be caught elsewhere,
         // but treat as ANY for CHECK validation purposes.
         Ok(CheckExprType::Any)
-    }
-}
-
-/// A CHECK reads the stored value. pg_numeric stores the value times
-/// 10^scale, so only columns with the same parameters compare correctly.
-fn with_stored_scale(
-    check_type: CheckExprType,
-    col_type: &ast::Type,
-    resolver: &Resolver,
-) -> CheckExprType {
-    let is_builtin_pg_numeric = col_type.name.eq_ignore_ascii_case("pg_numeric")
-        && resolver
-            .schema()
-            .get_type_def_unchecked(&col_type.name)
-            .is_some_and(|type_def| type_def.is_builtin);
-    match (check_type, &col_type.size) {
-        (CheckExprType::CustomType(name), Some(size)) if is_builtin_pg_numeric => {
-            CheckExprType::CustomType(format!("{name}({size})"))
-        }
-        (check_type, _) => check_type,
     }
 }
 
@@ -640,9 +619,20 @@ fn resolve_type_name(type_name: &str, resolver: &Resolver) -> Result<CheckExprTy
     }
     // Check if it's a known custom type
     if let Ok(Some(resolved)) = resolver.schema().resolve_type_unchecked(type_name) {
-        // Domains are transparent wrappers — resolve to the base primitive type
-        // so CHECK constraint type checking compares primitives, not domain names.
-        if resolved.is_domain() {
+        // A CHECK reads the value that a column of a built-in type of the
+        // PostgreSQL frontend shows: the text of a date or time, and the
+        // decimal text of a numeric, which its operator functions compare.
+        if resolved.check_reads_decoded_value() {
+            return Ok(if resolved.chain.iter().any(|td| td.name == "pg_numeric") {
+                CheckExprType::Real
+            } else {
+                CheckExprType::Text
+            });
+        }
+        // Domains are transparent wrappers, and a type that stores the value
+        // it shows compares like its primitive type, so CHECK constraint type
+        // checking compares primitives, not type names.
+        if resolved.is_domain() || resolved.stores_the_value_it_shows() {
             return resolve_type_name(&resolved.primitive, resolver);
         }
         return Ok(CheckExprType::CustomType(type_name.to_lowercase()));

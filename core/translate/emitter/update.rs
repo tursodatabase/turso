@@ -1789,7 +1789,7 @@ fn emit_update_insns<'a>(
                 program,
                 &relevant_checks,
                 &mut t_ctx.resolver,
-                &btree_table.name,
+                &btree_table,
                 effective_rowid_reg,
                 btree_table
                     .columns()

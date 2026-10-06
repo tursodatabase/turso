@@ -174,12 +174,14 @@ indexes and views, such a cast is a call of the function `pg_timestamp`,
 `pg_timestamptz`, `pg_date` or `pg_time`. Older versions do not have these
 functions, so they refuse such SQL.
 
-A CHECK constraint reads the stored value of a column. Thus a CHECK that
-compares a timestamp, date or time column of a new table with a value is
-refused, as for older tables, and a CHECK that compares two numeric columns
-needs the same precision and scale. ALTER TABLE ... ADD COLUMN of a
-timestamp, date or time column with the DEFAULT `'now'`, `'today'`,
-`'tomorrow'` or `'yesterday'` needs an empty table.
+A CHECK constraint and the CHECK of a domain read the value that a column
+shows, so `ts timestamp CHECK (ts > '2020-01-01')`, `price numeric(10,2)
+CHECK (price > 0)` and a CHECK that compares numeric columns of different
+scales work. A CHECK on integer, bigint, smallint and the columns of older
+tables of type timestamp, date or time compares like a CHECK on the base type.
+ALTER TABLE ... ADD COLUMN of a timestamp, date or time column with the
+DEFAULT `'now'`, `'today'`, `'tomorrow'` or `'yesterday'` needs an empty
+table.
 
 | Feature | Status | Notes |
 |---------|--------|-------|

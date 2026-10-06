@@ -823,7 +823,7 @@ pub fn translate_insert(
         program,
         &ctx.table.check_constraints,
         resolver,
-        &ctx.table.name,
+        ctx.table,
         insertion.key_register(),
         insertion.col_mappings.iter().filter_map(|m| {
             m.column.name.as_deref().map(|n| {
