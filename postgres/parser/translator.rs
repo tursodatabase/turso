@@ -20,15 +20,34 @@ pub struct TranslateResult {
     pub cmd: ast::Cmd,
 }
 
+/// Which Turso column types the PostgreSQL types of a CREATE TABLE get.
+///
+/// Older Turso versions stored the PostgreSQL DDL of a table and translated
+/// it again at every load. Such a table must keep the column types it was
+/// created with, so it uses `V1`, which never changes. New DDL uses `V2`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum TypeMapping {
+    V1,
+    #[default]
+    V2,
+}
+
 /// Translates a PostgreSQL query into Turso's AST
 #[derive(Default)]
 pub struct PostgreSQLTranslator {
-    // TODO: Add schema information, type mappings, etc.
+    type_mapping: TypeMapping,
 }
 
 impl PostgreSQLTranslator {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// A translator for the PostgreSQL DDL that an older Turso stored for a table.
+    pub fn for_stored_table() -> Self {
+        Self {
+            type_mapping: TypeMapping::V1,
+        }
     }
 
     /// Build a `QualifiedName` from a PG `RangeVar`, preserving schema qualifier.
@@ -336,7 +355,7 @@ impl PostgreSQLTranslator {
                 options: ast::TableOptions {
                     without_rowid_text: None,
                     strict_text: Some("STRICT".to_string()),
-                    pg_storage: false,
+                    pg_storage: true,
                 },
             },
         };
@@ -388,7 +407,7 @@ impl PostgreSQLTranslator {
 
         let is_serial = is_serial_type(&pg_type);
 
-        let mapping = map_pg_type(&pg_type, &typmods).ok_or_else(|| {
+        let mapping = map_pg_type(&pg_type, &typmods, self.type_mapping).ok_or_else(|| {
             ParseError::ParseError(format!("unsupported PostgreSQL type: {pg_type}"))
         })?;
 
@@ -788,7 +807,7 @@ impl PostgreSQLTranslator {
 
         let pg_type = extract_type_name(col_def)?;
         let typmods = extract_integer_typmods(col_def);
-        let mapping = map_pg_type(&pg_type, &typmods).ok_or_else(|| {
+        let mapping = map_pg_type(&pg_type, &typmods, self.type_mapping).ok_or_else(|| {
             ParseError::ParseError(format!("unsupported PostgreSQL type: {pg_type}"))
         })?;
         let size = match mapping.type_params.as_slice() {
@@ -3960,7 +3979,7 @@ impl PostgreSQLTranslator {
             .as_ref()
             .ok_or_else(|| ParseError::ParseError("CREATE DOMAIN missing base type".into()))?;
         let pg_type = extract_type_name_from_typename(type_name_node)?;
-        let base_type = match map_pg_type(&pg_type, &[]) {
+        let base_type = match map_pg_type(&pg_type, &[], self.type_mapping) {
             Some(mapping) => mapping.type_name,
             None => pg_type, // custom type or domain — pass through
         };
@@ -4108,8 +4127,6 @@ impl PgTypeMapping {
     }
 }
 
-/// PostgreSQL to Turso type mapping.
-/// Returns Turso custom type names (e.g. "boolean", "varchar(100)") when a
 /// Returns true if the given PG type name is a serial variant (auto-incrementing integer).
 /// Covers all PostgreSQL serial aliases: serial, serial2, serial4, serial8,
 /// smallserial, bigserial.
@@ -4120,10 +4137,20 @@ fn is_serial_type(pg_type: &str) -> bool {
     )
 }
 
+/// PostgreSQL to Turso type mapping.
+/// Returns Turso custom type names (e.g. "boolean", "varchar(100)") when a
 /// built-in Turso type exists, otherwise returns the base SQLite type.
 /// For array types (e.g. `INTEGER[]`, `_int4`), returns the base scalar type
 /// with `array_dimensions > 0` so native Turso arrays are used.
-pub fn map_pg_type(pg_type: &str, params: &[i64]) -> Option<PgTypeMapping> {
+pub fn map_pg_type(pg_type: &str, params: &[i64], mapping: TypeMapping) -> Option<PgTypeMapping> {
+    match mapping {
+        TypeMapping::V1 | TypeMapping::V2 => map_pg_type_v1(pg_type, params),
+    }
+}
+
+/// The mapping of `TypeMapping::V1`. Tables in existing files depend on it:
+/// never change it.
+fn map_pg_type_v1(pg_type: &str, params: &[i64]) -> Option<PgTypeMapping> {
     // Check for array types first
     if pg_type.ends_with("[]") || pg_type.starts_with('_') {
         let (base, dims) = if pg_type.ends_with("[]") {
@@ -4136,7 +4163,7 @@ pub fn map_pg_type(pg_type: &str, params: &[i64]) -> Option<PgTypeMapping> {
             (&pg_type[1..], 1u32)
         };
         // Recursively map the base type as a scalar
-        let scalar = map_pg_type(base, params)?;
+        let scalar = map_pg_type_v1(base, params)?;
         return Some(PgTypeMapping {
             type_name: scalar.type_name,
             array_dimensions: scalar.array_dimensions + dims,
@@ -4997,64 +5024,70 @@ mod tests {
         let a = PgTypeMapping::array;
 
         // Base types (no Turso custom type)
-        assert_eq!(map_pg_type("INTEGER", no_params), Some(s("INTEGER")));
-        assert_eq!(map_pg_type("SERIAL", no_params), Some(s("INTEGER")));
-        assert_eq!(map_pg_type("REAL", no_params), Some(s("REAL")));
-        assert_eq!(map_pg_type("TEXT", no_params), Some(s("TEXT")));
-        assert_eq!(map_pg_type("BLOB", no_params), Some(s("BLOB")));
+        assert_eq!(map_pg_type_v1("INTEGER", no_params), Some(s("INTEGER")));
+        assert_eq!(map_pg_type_v1("SERIAL", no_params), Some(s("INTEGER")));
+        assert_eq!(map_pg_type_v1("REAL", no_params), Some(s("REAL")));
+        assert_eq!(map_pg_type_v1("TEXT", no_params), Some(s("TEXT")));
+        assert_eq!(map_pg_type_v1("BLOB", no_params), Some(s("BLOB")));
 
         // Turso custom type equivalents
-        assert_eq!(map_pg_type("BOOLEAN", no_params), Some(s("boolean")));
-        assert_eq!(map_pg_type("SMALLINT", no_params), Some(s("smallint")));
-        assert_eq!(map_pg_type("BIGINT", no_params), Some(s("bigint")));
-        assert_eq!(map_pg_type("UUID", no_params), Some(s("uuid")));
-        assert_eq!(map_pg_type("DATE", no_params), Some(s("date")));
-        assert_eq!(map_pg_type("TIME", no_params), Some(s("time")));
-        assert_eq!(map_pg_type("TIMESTAMP", no_params), Some(s("timestamp")));
+        assert_eq!(map_pg_type_v1("BOOLEAN", no_params), Some(s("boolean")));
+        assert_eq!(map_pg_type_v1("SMALLINT", no_params), Some(s("smallint")));
+        assert_eq!(map_pg_type_v1("BIGINT", no_params), Some(s("bigint")));
+        assert_eq!(map_pg_type_v1("UUID", no_params), Some(s("uuid")));
+        assert_eq!(map_pg_type_v1("DATE", no_params), Some(s("date")));
+        assert_eq!(map_pg_type_v1("TIME", no_params), Some(s("time")));
+        assert_eq!(map_pg_type_v1("TIMESTAMP", no_params), Some(s("timestamp")));
         assert_eq!(
-            map_pg_type("TIMESTAMPTZ", no_params),
+            map_pg_type_v1("TIMESTAMPTZ", no_params),
             Some(s("timestamptz"))
         );
-        assert_eq!(map_pg_type("BYTEA", no_params), Some(s("bytea")));
-        assert_eq!(map_pg_type("INET", no_params), Some(s("inet")));
-        assert_eq!(map_pg_type("JSON", no_params), Some(s("json")));
-        assert_eq!(map_pg_type("JSONB", no_params), Some(s("jsonb")));
+        assert_eq!(map_pg_type_v1("BYTEA", no_params), Some(s("bytea")));
+        assert_eq!(map_pg_type_v1("INET", no_params), Some(s("inet")));
+        assert_eq!(map_pg_type_v1("JSON", no_params), Some(s("json")));
+        assert_eq!(map_pg_type_v1("JSONB", no_params), Some(s("jsonb")));
 
         // Parametric types — base name + params separated
         assert_eq!(
-            map_pg_type("VARCHAR", &[100]),
+            map_pg_type_v1("VARCHAR", &[100]),
             Some(PgTypeMapping::with_params("varchar", vec![100]))
         );
-        assert_eq!(map_pg_type("VARCHAR", no_params), Some(s("TEXT")));
+        assert_eq!(map_pg_type_v1("VARCHAR", no_params), Some(s("TEXT")));
         assert_eq!(
-            map_pg_type("NUMERIC", &[10, 2]),
+            map_pg_type_v1("NUMERIC", &[10, 2]),
             Some(PgTypeMapping::with_params("numeric", vec![10, 2]))
         );
         assert_eq!(
-            map_pg_type("NUMERIC", &[10]),
+            map_pg_type_v1("NUMERIC", &[10]),
             Some(PgTypeMapping::with_params("numeric", vec![10, 0]))
         );
-        assert_eq!(map_pg_type("NUMERIC", no_params), Some(s("REAL")));
+        assert_eq!(map_pg_type_v1("NUMERIC", no_params), Some(s("REAL")));
 
         // Network types → custom types
-        assert_eq!(map_pg_type("CIDR", no_params), Some(s("cidr")));
-        assert_eq!(map_pg_type("MACADDR", no_params), Some(s("macaddr")));
-        assert_eq!(map_pg_type("MACADDR8", no_params), Some(s("macaddr8")));
+        assert_eq!(map_pg_type_v1("CIDR", no_params), Some(s("cidr")));
+        assert_eq!(map_pg_type_v1("MACADDR", no_params), Some(s("macaddr")));
+        assert_eq!(map_pg_type_v1("MACADDR8", no_params), Some(s("macaddr8")));
 
         // Array types → base type + dimensions
-        assert_eq!(map_pg_type("INTEGER[]", no_params), Some(a("INTEGER", 1)));
-        assert_eq!(map_pg_type("TEXT[]", no_params), Some(a("TEXT", 1)));
-        assert_eq!(map_pg_type("TEXT[][]", no_params), Some(a("TEXT", 2)));
-        assert_eq!(map_pg_type("BOOLEAN[]", no_params), Some(a("boolean", 1)));
-        assert_eq!(map_pg_type("BIGINT[]", no_params), Some(a("bigint", 1)));
-        assert_eq!(map_pg_type("VARCHAR[]", no_params), Some(a("TEXT", 1)));
+        assert_eq!(
+            map_pg_type_v1("INTEGER[]", no_params),
+            Some(a("INTEGER", 1))
+        );
+        assert_eq!(map_pg_type_v1("TEXT[]", no_params), Some(a("TEXT", 1)));
+        assert_eq!(map_pg_type_v1("TEXT[][]", no_params), Some(a("TEXT", 2)));
+        assert_eq!(
+            map_pg_type_v1("BOOLEAN[]", no_params),
+            Some(a("boolean", 1))
+        );
+        assert_eq!(map_pg_type_v1("BIGINT[]", no_params), Some(a("bigint", 1)));
+        assert_eq!(map_pg_type_v1("VARCHAR[]", no_params), Some(a("TEXT", 1)));
         // PG internal array notation
-        assert_eq!(map_pg_type("_int4", no_params), Some(a("INTEGER", 1)));
-        assert_eq!(map_pg_type("_text", no_params), Some(a("TEXT", 1)));
+        assert_eq!(map_pg_type_v1("_int4", no_params), Some(a("INTEGER", 1)));
+        assert_eq!(map_pg_type_v1("_text", no_params), Some(a("TEXT", 1)));
 
         // Unknown types pass through as-is (for user-defined enums etc.)
         assert_eq!(
-            map_pg_type("SOMECUSTOMTYPE", no_params),
+            map_pg_type_v1("SOMECUSTOMTYPE", no_params),
             Some(s("somecustomtype"))
         );
     }
@@ -7476,5 +7509,60 @@ mod tests {
             err.to_string().contains("SEARCH clause"),
             "expected SEARCH clause rejection, got: {err}"
         );
+    }
+
+    /// Tables of older files are translated again at every load with
+    /// TypeMapping::V1. Their column types, rowid alias, NOT NULL and the
+    /// order of their UNIQUE sets (which names the automatic indexes) must
+    /// never change, so this text must never change either.
+    #[test]
+    fn stored_tables_keep_their_v1_translation() {
+        let corpus = [
+            "CREATE TABLE t (a boolean, b bool, c smallint, d int2, e bigint, f int8, g uuid, \
+             h date, i time, j timetz, k timestamp, l timestamptz, m bytea, n inet, o json, \
+             p jsonb, q cidr, r macaddr, s macaddr8, u text, v name, w interval)",
+            "CREATE TABLE t (a varchar(10), b char(3), c varchar, d numeric(10,2), e numeric(5), \
+             f decimal, g real, h double precision, i float8, j money, k timestamp(3), l time(6))",
+            "CREATE TABLE t (a integer[], b text[][], c _int4, d numeric(10,2)[], e mood, f posint[])",
+            "CREATE TABLE t (id serial PRIMARY KEY, a smallserial, b bigserial, c serial4, d serial8)",
+            "CREATE TABLE t (id bigint PRIMARY KEY, u int UNIQUE, v text NOT NULL UNIQUE, w int, \
+             UNIQUE (w), UNIQUE (u, w))",
+            "CREATE TABLE t (a int, b int, c text UNIQUE, PRIMARY KEY (b, a), UNIQUE (a))",
+            "CREATE TABLE t (id integer PRIMARY KEY, p integer REFERENCES t (id) ON DELETE CASCADE, \
+             q int, FOREIGN KEY (q) REFERENCES t (id))",
+            "CREATE TABLE t (a int GENERATED ALWAYS AS (1) STORED, b int GENERATED ALWAYS AS IDENTITY, \
+             c text COLLATE \"C\")",
+            "CREATE TABLE t (a text DEFAULT 'x'::text, b timestamp DEFAULT now(), \
+             c int DEFAULT -1 CHECK (c > -5), d text CHECK (d::date <> '2024-01-01'), \
+             e boolean DEFAULT false, f int[] DEFAULT ARRAY[1, 2], CHECK (c < 10))",
+            "CREATE TABLE s.t (id serial PRIMARY KEY, a text)",
+        ];
+        let translated: Vec<String> = corpus
+            .iter()
+            .map(|ddl| {
+                let parse_result = crate::parse(ddl).unwrap();
+                let ast::Stmt::CreateTable { tbl_name, body, .. } =
+                    PostgreSQLTranslator::for_stored_table()
+                        .translate(&parse_result)
+                        .unwrap()
+                else {
+                    panic!("not a CREATE TABLE: {ddl}");
+                };
+                format!("CREATE TABLE {} {body}", tbl_name.name.as_ident())
+            })
+            .collect();
+        let expected = [
+            "CREATE TABLE t (a boolean, b boolean, c smallint, d smallint, e bigint, f bigint, g uuid, h date, i time, j time, k timestamp, l timestamptz, m bytea, n inet, o json, p jsonb, q cidr, r macaddr, s macaddr8, u TEXT, v TEXT, w TEXT) STRICT, PGSTORAGE",
+            "CREATE TABLE t (a varchar (10), b TEXT, c TEXT, d numeric (10, 2), e numeric (5, 0), f REAL, g REAL, h REAL, i REAL, j REAL, k timestamp, l time) STRICT, PGSTORAGE",
+            "CREATE TABLE t (a INTEGER[], b TEXT[][], c INTEGER[], d numeric (10, 2)[], e mood, f posint[]) STRICT, PGSTORAGE",
+            "CREATE TABLE t (id INTEGER PRIMARY KEY DEFAULT (nextval ('t_id_seq')), a INTEGER NOT NULL DEFAULT (nextval ('t_a_seq')), b INTEGER NOT NULL DEFAULT (nextval ('t_b_seq')), c INTEGER NOT NULL DEFAULT (nextval ('t_c_seq')), d INTEGER NOT NULL DEFAULT (nextval ('t_d_seq'))) STRICT, PGSTORAGE",
+            "CREATE TABLE t (id bigint PRIMARY KEY, u INTEGER UNIQUE, v TEXT NOT NULL UNIQUE, w INTEGER, UNIQUE (w), UNIQUE (u, w)) STRICT, PGSTORAGE",
+            "CREATE TABLE t (a INTEGER, b INTEGER, c TEXT UNIQUE, PRIMARY KEY (b, a), UNIQUE (a)) STRICT, PGSTORAGE",
+            "CREATE TABLE t (id INTEGER PRIMARY KEY, p INTEGER REFERENCES t (id) ON DELETE CASCADE, q INTEGER, FOREIGN KEY (q) REFERENCES t (id)) STRICT, PGSTORAGE",
+            "CREATE TABLE t (a INTEGER, b INTEGER, c TEXT) STRICT, PGSTORAGE",
+            "CREATE TABLE t (a TEXT DEFAULT (CAST ('x' AS TEXT)), b timestamp DEFAULT (now ()), c INTEGER DEFAULT -1 CHECK (c > -5), d TEXT CHECK (CAST (d AS date) != '2024-01-01'), e boolean DEFAULT 0, f INTEGER[] DEFAULT (array (1, 2)), CHECK (c < 10)) STRICT, PGSTORAGE",
+            "CREATE TABLE t (id INTEGER PRIMARY KEY DEFAULT (nextval ('t_id_seq')), a TEXT) STRICT, PGSTORAGE",
+        ];
+        assert_eq!(translated, expected);
     }
 }

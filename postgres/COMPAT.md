@@ -357,6 +357,16 @@ Backup and restore is not supported.
 
 Upgrade is not supported.
 
+Storage of table definitions: `sqlite_schema` stores each new table as Turso
+SQL with the table options `STRICT, PGSTORAGE`, so tursopg and tursodb (with
+custom types) load the same table. Older versions stored the PostgreSQL DDL
+of a table after a `/* turso_frontend:postgres */` marker. tursopg still
+reads these tables with the type mapping of the older versions, and the first
+ALTER TABLE on such a table stores it in the new form. Older versions of
+tursopg and tursodb refuse a table with the `PGSTORAGE` option ("unknown
+table option"). Thus a file is a one-way upgrade: after the first CREATE TABLE
+or ALTER TABLE of this version, older versions cannot open it.
+
 ## Data Import & Export
 
 | Feature | Status | Notes |

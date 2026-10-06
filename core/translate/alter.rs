@@ -1152,7 +1152,7 @@ pub fn translate_alter_table(
 
             btree.columns_mut().remove(dropped_index);
 
-            let sql = escape_sql_string_literal(&btree.to_sql());
+            let sql = escape_sql_string_literal(&btree.to_checked_sql()?);
 
             let escaped_table_name = escape_sql_string_literal(table_name);
             let stmt = format!(
@@ -1440,7 +1440,7 @@ pub fn translate_alter_table(
             // visible to the empty-table check below.
             column = btree.columns().last().unwrap().clone();
 
-            let escaped = escape_sql_string_literal(&btree.to_sql());
+            let escaped = escape_sql_string_literal(&btree.to_checked_sql()?);
             let escaped_table_name = escape_sql_string_literal(table_name);
             let stmt = format!(
                 r#"

@@ -3730,6 +3730,28 @@ impl BTreeTable {
         create_table(tbl_name.name.as_str(), body, root_page)
     }
 
+    /// [`BTreeTable::to_sql`] for `sqlite_schema`: fails if the text does not
+    /// load back as this table.
+    pub(crate) fn to_checked_sql(&self) -> Result<String> {
+        let sql = self.to_sql();
+        self.check_sql_loads_back(&sql)?;
+        Ok(sql)
+    }
+
+    /// Fail if `sql` does not load back as this table. A stored row that
+    /// does not load makes the database file impossible to open.
+    pub(crate) fn check_sql_loads_back(&self, sql: &str) -> Result<()> {
+        let loaded = BTreeTable::from_sql(sql, self.root_page).map_err(|e| {
+            LimboError::InternalError(format!("table SQL does not load back: {e}: {sql}"))
+        })?;
+        if loaded.to_sql() != self.to_sql() {
+            return Err(LimboError::InternalError(format!(
+                "table SQL loads back as a different table: {sql}"
+            )));
+        }
+        Ok(())
+    }
+
     /// Reconstruct the SQL for the table.
     /// FIXME: this makes us incompatible with SQLite since sqlite stores the user-provided SQL as is in
     /// `sqlite_schema.sql`

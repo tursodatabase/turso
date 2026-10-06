@@ -3,6 +3,7 @@ use parking_lot::RwLock;
 use rustc_hash::FxHashMap as HashMap;
 use std::sync::Arc;
 use turso_core::{
+    dialect::{decode_stored_table_sql, StoredTableSql},
     schema::{BTreeTable, Schema, Table},
     Connection, Dialect, Func, InternalVirtualTable, InternalVirtualTableCursor, LimboError,
     Result, Value, VirtualTable,
@@ -13,7 +14,6 @@ use turso_parser::ast::RefAct;
 /// Starting OID for user tables (matches PostgreSQL convention)
 const USER_TABLE_OID_START: i64 = 16384;
 const PRIMARY_KEY_AUTOMATIC_INDEX_NAME_PREFIX: &str = "sqlite_autoindex_";
-const STORED_PG_SCHEMA_PREFIX: &str = "/* turso_frontend:postgres */ ";
 
 #[derive(Debug)]
 pub struct PostgresDialect;
@@ -50,90 +50,49 @@ impl Dialect for PostgresDialect {
     }
 
     fn parse_table_sql(&self, sql: &str, root_page: i64) -> Result<BTreeTable> {
-        // Schema rows written by internal SQLite paths (e.g. sqlite_sequence)
-        // carry no frontend marker and are plain SQLite SQL.
-        let Some(raw_sql) = decode_stored_pg_schema_sql(sql) else {
-            return BTreeTable::from_sql(sql, root_page);
-        };
-
-        let parse_result =
-            turso_pg_parser::parse(raw_sql).map_err(|e| LimboError::ParseError(e.to_string()))?;
-        let translator = turso_pg_parser::translator::PostgreSQLTranslator::new();
-        let stmt = translator
-            .translate(&parse_result)
-            .map_err(|e| LimboError::ParseError(e.to_string()))?;
-        match stmt {
-            turso_parser::ast::Stmt::CreateTable { tbl_name, body, .. } => {
+        match decode_stored_table_sql(sql) {
+            StoredTableSql::Canonical(sql) => BTreeTable::from_sql(sql, root_page),
+            StoredTableSql::Postgres(ddl) => {
+                let turso_parser::ast::Stmt::CreateTable { tbl_name, body, .. } =
+                    translate_stored_table(ddl)?
+                else {
+                    unreachable!("translate_stored_table returns CREATE TABLE");
+                };
                 BTreeTable::from_create_table_ast(&tbl_name, &body, root_page)
             }
-            _ => Err(LimboError::ParseError(
-                "expected CREATE TABLE statement".to_string(),
-            )),
         }
     }
 
     fn parse_table_sql_ast(&self, sql: &str) -> Result<turso_parser::ast::Stmt> {
-        // Schema rows written by internal SQLite paths (e.g. sqlite_sequence)
-        // carry no frontend marker and are plain SQLite SQL.
-        let Some(raw_sql) = decode_stored_pg_schema_sql(sql) else {
-            return turso_core::dialect::sqlite::parse_table_sql_ast(sql);
-        };
-
-        let parse_result =
-            turso_pg_parser::parse(raw_sql).map_err(|e| LimboError::ParseError(e.to_string()))?;
-        let translator = turso_pg_parser::translator::PostgreSQLTranslator::new();
-        let stmt = translator
-            .translate(&parse_result)
-            .map_err(|e| LimboError::ParseError(e.to_string()))?;
-        match stmt {
-            stmt @ turso_parser::ast::Stmt::CreateTable { .. } => Ok(stmt),
-            _ => Err(LimboError::ParseError(
-                "expected CREATE TABLE statement".to_string(),
-            )),
+        match decode_stored_table_sql(sql) {
+            StoredTableSql::Canonical(sql) => turso_core::dialect::sqlite::parse_table_sql_ast(sql),
+            StoredTableSql::Postgres(ddl) => translate_stored_table(ddl),
         }
     }
 
     fn table_sql_for_replay(&self, sql: &str) -> Result<String> {
-        let Some(raw_sql) = decode_stored_pg_schema_sql(sql) else {
-            return turso_core::dialect::sqlite::table_sql_for_replay(sql);
-        };
-
-        let stmt = self.parse_table_sql_ast(sql)?;
-        let turso_parser::ast::Stmt::CreateTable {
-            mut tbl_name,
-            temporary,
-            if_not_exists,
-            body,
-        } = stmt
-        else {
-            unreachable!("parse_table_sql_ast returned a non-CREATE TABLE statement");
-        };
-
-        // Unqualified statements replay as the original PostgreSQL DDL. A
-        // schema-qualified statement targets an attached database the replay
-        // destination does not have, so re-render the translated AST without
-        // the qualifier; the canonical text round-trips through the SQLite
-        // fallback in `Dialect::parse`.
-        if tbl_name.db_name.take().is_none() {
-            return Ok(raw_sql.to_string());
+        match decode_stored_table_sql(sql) {
+            StoredTableSql::Canonical(sql) => {
+                turso_core::dialect::sqlite::table_sql_for_replay(sql)
+            }
+            StoredTableSql::Postgres(ddl) => {
+                let turso_parser::ast::Stmt::CreateTable { tbl_name, body, .. } =
+                    translate_stored_table(ddl)?
+                else {
+                    unreachable!("translate_stored_table returns CREATE TABLE");
+                };
+                turso_core::dialect::sqlite::format_table_sql(&tbl_name, &body)
+            }
         }
-
-        Ok(turso_parser::ast::Stmt::CreateTable {
-            tbl_name,
-            temporary,
-            if_not_exists,
-            body,
-        }
-        .to_string())
     }
 
     fn format_table_sql(
         &self,
-        input: &str,
-        _tbl_name: &turso_parser::ast::QualifiedName,
-        _body: &turso_parser::ast::CreateTableBody,
+        _input: &str,
+        tbl_name: &turso_parser::ast::QualifiedName,
+        body: &turso_parser::ast::CreateTableBody,
     ) -> Result<String> {
-        Ok(encode_pg_schema_sql(input))
+        turso_core::dialect::sqlite::format_table_sql(tbl_name, body)
     }
 
     fn register_catalog(&self, schema: &mut Schema, enable_custom_types: bool) -> Result<()> {
@@ -192,12 +151,20 @@ pub fn is_catalog_table_name(name: &str) -> bool {
     )
 }
 
-pub fn encode_pg_schema_sql(sql: &str) -> String {
-    format!("{STORED_PG_SCHEMA_PREFIX}{sql}")
-}
-
-pub fn decode_stored_pg_schema_sql(sql: &str) -> Option<&str> {
-    sql.strip_prefix(STORED_PG_SCHEMA_PREFIX)
+/// Translate the PostgreSQL DDL that an older Turso stored for a table, with
+/// the type mapping of that version.
+fn translate_stored_table(ddl: &str) -> Result<turso_parser::ast::Stmt> {
+    let parse_result =
+        turso_pg_parser::parse(ddl).map_err(|e| LimboError::ParseError(e.to_string()))?;
+    let stmt = turso_pg_parser::translator::PostgreSQLTranslator::for_stored_table()
+        .translate(&parse_result)
+        .map_err(|e| LimboError::ParseError(e.to_string()))?;
+    match stmt {
+        stmt @ turso_parser::ast::Stmt::CreateTable { .. } => Ok(stmt),
+        _ => Err(LimboError::ParseError(
+            "expected CREATE TABLE statement".to_string(),
+        )),
+    }
 }
 
 /// Returns an iterator of (table_name, table_ref) for user tables in deterministic order.
@@ -3329,10 +3296,12 @@ impl PgGetTableDefCursor {
                 continue;
             };
 
-            let postgres_ddl = match sql_map.get(table_name) {
-                Some(schema_sql) => decode_stored_pg_schema_sql(schema_sql)
-                    .map(str::to_string)
-                    .unwrap_or_else(|| self.convert_to_postgres_ddl(schema_sql)),
+            let postgres_ddl = match sql_map
+                .get(table_name)
+                .map(|sql| decode_stored_table_sql(sql))
+            {
+                Some(StoredTableSql::Postgres(ddl)) => ddl.to_string(),
+                Some(StoredTableSql::Canonical(sql)) => self.convert_to_postgres_ddl(sql),
                 None => self.convert_to_postgres_ddl(&btree_table.to_sql()),
             };
 

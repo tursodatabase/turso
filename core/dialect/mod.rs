@@ -14,6 +14,40 @@ pub mod sqlite;
 
 pub use sqlite::SqliteDialect;
 
+/// The text that older versions of the PostgreSQL frontend wrote before the
+/// PostgreSQL DDL of a table in `sqlite_schema`.
+pub const POSTGRES_TABLE_MARKER: &str = "/* turso_frontend:postgres */";
+
+/// The SQL of a `sqlite_schema` table row.
+pub enum StoredTableSql<'a> {
+    /// Turso SQL, which the SQLite parser reads.
+    Canonical(&'a str),
+    /// PostgreSQL DDL that an older PostgreSQL frontend stored after
+    /// [`POSTGRES_TABLE_MARKER`].
+    Postgres(&'a str),
+}
+
+pub fn decode_stored_table_sql(sql: &str) -> StoredTableSql<'_> {
+    let Some(payload) = sql.strip_prefix(POSTGRES_TABLE_MARKER) else {
+        return StoredTableSql::Canonical(sql);
+    };
+    let payload = payload.trim_start();
+    // ALTER TABLE ... RENAME of older versions stored the marker before
+    // canonical STRICT SQL. PostgreSQL DDL has no STRICT option.
+    let renamed_by_older_version = matches!(
+        sqlite::parse_table_sql_ast(payload),
+        Ok(turso_parser::ast::Stmt::CreateTable {
+            body: turso_parser::ast::CreateTableBody::ColumnsAndConstraints { ref options, .. },
+            ..
+        }) if options.contains_strict()
+    );
+    if renamed_by_older_version {
+        StoredTableSql::Canonical(payload)
+    } else {
+        StoredTableSql::Postgres(payload)
+    }
+}
+
 /// SQL dialect layered on top of the engine.
 ///
 /// Every [`crate::Database`] carries a dialect, supplied explicitly by
@@ -63,14 +97,14 @@ pub trait Dialect: Send + Sync + 'static {
     /// fallback required by [`Dialect::parse_table_sql`].
     fn parse_table_sql_ast(&self, sql: &str) -> crate::Result<turso_parser::ast::Stmt>;
 
-    /// Recover SQL that can be prepared to recreate a persisted table.
+    /// Recover canonical SQLite SQL that recreates a persisted table.
     ///
-    /// Dialects that wrap original frontend DDL in their stored representation
-    /// must unwrap it here so replay preserves that DDL. The returned statement
-    /// must create the table in the connection's main schema, even when the
-    /// persisted statement originally qualified the source database. Unmarked
-    /// internal engine tables must retain the SQLite fallback used by the
-    /// schema parsing methods.
+    /// Dialects that stored frontend DDL must return the canonical text of
+    /// the table that the DDL loads as, so replay keeps the column types. The
+    /// returned statement must create the table in the connection's main
+    /// schema, even when the persisted statement originally qualified the
+    /// source database. Unmarked internal engine tables must retain the
+    /// SQLite fallback used by the schema parsing methods.
     fn table_sql_for_replay(&self, sql: &str) -> crate::Result<String>;
 
     /// Produce the SQL text to store in `sqlite_schema` for a
@@ -78,9 +112,8 @@ pub trait Dialect: Send + Sync + 'static {
     ///
     /// `input` is the original statement text as the user wrote it, in the
     /// frontend's dialect; `tbl_name` and `body` are the translated AST.
-    /// The SQLite dialect formats canonical SQLite text from the AST; a
-    /// frontend dialect typically stores `input` with a marker it can
-    /// recognize in [`Dialect::parse_table_sql`].
+    /// The built-in dialects store canonical SQLite text from the AST
+    /// ([`sqlite::format_table_sql`]), so every dialect loads the same table.
     fn format_table_sql(
         &self,
         input: &str,

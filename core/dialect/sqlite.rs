@@ -61,16 +61,7 @@ impl super::Dialect for SqliteDialect {
         tbl_name: &turso_parser::ast::QualifiedName,
         body: &turso_parser::ast::CreateTableBody,
     ) -> crate::Result<String> {
-        match body {
-            turso_parser::ast::CreateTableBody::ColumnsAndConstraints { .. } => Ok(format!(
-                "CREATE TABLE {} {}",
-                tbl_name.name.as_ident(),
-                body
-            )),
-            turso_parser::ast::CreateTableBody::AsSelect(_) => {
-                crate::bail_parse_error!("CREATE TABLE AS SELECT is not supported")
-            }
-        }
+        format_table_sql(tbl_name, body)
     }
 
     fn register_catalog(
@@ -104,6 +95,22 @@ pub fn parse_table_sql_ast(sql: &str) -> crate::Result<turso_parser::ast::Stmt> 
             "persisted table SQL is not CREATE TABLE: {other:?}"
         ))),
     }
+}
+
+/// Render the canonical SQL that `sqlite_schema` stores for a table. The
+/// name has no database qualifier. Fails if the text does not load back as
+/// the same table, because a stored row that does not load makes the file
+/// impossible to open.
+pub fn format_table_sql(
+    tbl_name: &turso_parser::ast::QualifiedName,
+    body: &turso_parser::ast::CreateTableBody,
+) -> crate::Result<String> {
+    if let turso_parser::ast::CreateTableBody::AsSelect(_) = body {
+        crate::bail_parse_error!("CREATE TABLE AS SELECT is not supported");
+    }
+    let sql = format!("CREATE TABLE {} {}", tbl_name.name.as_ident(), body);
+    crate::schema::create_table(tbl_name.name.as_str(), body, 0)?.check_sql_loads_back(&sql)?;
+    Ok(sql)
 }
 
 /// Recover persisted SQLite table SQL for schema replay.
