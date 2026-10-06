@@ -9159,6 +9159,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         )?;
         fresh.generated_columns_enabled = connection.db.experimental_generated_columns_enabled();
         fresh.schema_version = cookie;
+        Self::rehydrate_table_valued_functions(&mut fresh, preserved_table_valued_functions);
         let mut from_sql_indexes = crate::alloc::vec![];
         let mut automatic_indices = HashMap::default();
         let mut dbsp_state_roots: HashMap<String, i64> = HashMap::default();
@@ -9255,7 +9256,6 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
             dbsp_state_roots,
             dbsp_state_index_roots,
         )?;
-        Self::rehydrate_table_valued_functions(&mut fresh, preserved_table_valued_functions);
 
         Ok(Arc::new(fresh))
     }
@@ -10111,6 +10111,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         )?;
         fresh.generated_columns_enabled = connection.db.experimental_generated_columns_enabled();
         fresh.schema_version = cookie;
+        Self::rehydrate_table_valued_functions(&mut fresh, preserved_table_valued_functions);
         let mut from_sql_indexes =
             crate::alloc::Vec::try_with_capacity_ext(10).expect(crate::alloc::ALLOC_ERR_MSG);
         let mut automatic_indices: HashMap<String, crate::alloc::Vec<(String, i64)>> =
@@ -10209,7 +10210,6 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
             dbsp_state_roots,
             dbsp_state_index_roots,
         )?;
-        Self::rehydrate_table_valued_functions(&mut fresh, preserved_table_valued_functions);
 
         Ok(Arc::new(fresh))
     }
