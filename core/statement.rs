@@ -70,6 +70,12 @@ pub enum StatementStatusCounter {
     RowsWritten,
 }
 
+impl StatementOrigin {
+    pub(crate) const fn needs_nested_guard(self) -> bool {
+        matches!(self, Self::InternalHelper)
+    }
+}
+
 /// Structured type information for a result column.
 ///
 /// Returned by [`Statement::get_column_type_info`]. Surfaces the array depth
@@ -316,6 +322,9 @@ pub struct Statement {
     /// explicit checkpoints can subtract it — an open blob handle must not
     /// block checkpointing for its whole lifetime.
     is_blob_handle: bool,
+    /// True if this statement called `Connection::start_nested()` during
+    /// construction and therefore must call `end_nested()` on drop.
+    nested_guard_active: bool,
 }
 
 crate::assert::assert_send_sync!(Statement);
@@ -358,6 +367,7 @@ impl Statement {
             query_mode,
             tail_offset,
             StatementOrigin::Root,
+            false,
         )
     }
 
@@ -368,6 +378,7 @@ impl Statement {
         query_mode: QueryMode,
         tail_offset: usize,
         origin: StatementOrigin,
+        nested_guard_active: bool,
     ) -> Self {
         let (max_registers, cursor_count) = match query_mode {
             QueryMode::Normal => (program.max_registers, program.cursor_ref.len()),
@@ -393,6 +404,7 @@ impl Statement {
             origin,
             counted_as_active_root: false,
             is_blob_handle: false,
+            nested_guard_active,
             analyze_refresh: None,
         }
     }
@@ -552,7 +564,6 @@ impl Statement {
     /// gated behind cheap flag tests and kept out of line. A row in the middle
     /// of a scan runs only the interpreter call and the result-row bookkeeping.
     fn _step(&mut self, waker: Option<&Waker>) -> Result<StepResult> {
-        let _scope = self.origin.enter(&self.program.connection);
         // ANALYZE already ran to Done; only its stats refresh is outstanding.
         // Checked first: the root-statement count was released at Done, so
         // `prepare_step` must not re-register this statement as a root.
@@ -1541,7 +1552,6 @@ impl Statement {
         max_cursors: Option<usize>,
         preserve_active_root_count: bool,
     ) -> Result<()> {
-        let _scope = self.origin.enter(&self.program.connection);
         fn capture_reset_error(
             reset_error: &mut Option<LimboError>,
             err: LimboError,
@@ -1769,25 +1779,15 @@ fn append_expanded_literal(out: &mut String, value: &Value) {
 
 impl Drop for Statement {
     fn drop(&mut self) {
+        // Keep helper statements nested while drop-time reset/abort cleanup runs.
+        // That cleanup consults `is_nested_stmt()` to decide whether top-level
+        // transaction/savepoint finalization belongs to this statement or to its
+        // parent, so we release the nested guard only after reset completes.
         self.reset_best_effort();
-    }
-}
-
-impl StatementOrigin {
-    pub(crate) fn enter(self, connection: &Arc<Connection>) -> Option<NestedStatementScope> {
-        if self != Self::InternalHelper {
-            return None;
+        if self.nested_guard_active {
+            self.program.connection.end_nested();
+            self.nested_guard_active = false;
         }
-        connection.start_nested();
-        Some(NestedStatementScope(connection.clone()))
-    }
-}
-
-pub(crate) struct NestedStatementScope(Arc<Connection>);
-
-impl Drop for NestedStatementScope {
-    fn drop(&mut self) {
-        self.0.end_nested();
     }
 }
 

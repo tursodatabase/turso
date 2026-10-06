@@ -1074,35 +1074,45 @@ impl Connection {
             ));
         }
 
-        let _scope = origin.enter(self);
-        let sql = sql.as_ref();
-        tracing::debug!("Preparing: {}", sql);
+        let needs_nested_guard = origin.needs_nested_guard();
+        if needs_nested_guard {
+            self.start_nested();
+        }
+        let result = (|| {
+            let sql = sql.as_ref();
+            tracing::debug!("Preparing: {}", sql);
 
-        let (cmd, byte_offset_end) = {
-            crate::stack::trace_stack!("parse");
-            self.parse_sql(sql)?
-        };
-        let cmd = match cmd {
-            Some(cmd) => cmd,
-            None => {
-                return Err(LimboError::InvalidArgument(
-                    "The supplied SQL string contains no statements".to_string(),
-                ));
-            }
-        };
-        let input = str::from_utf8(&sql.as_bytes()[..byte_offset_end])
-            .unwrap()
-            .trim();
-        let prepare_options = PrepareOptions::default();
-        let (program, pager, mode) = self.compile_cmd(cmd, input, origin, &prepare_options)?;
+            let (cmd, byte_offset_end) = {
+                crate::stack::trace_stack!("parse");
+                self.parse_sql(sql)?
+            };
+            let cmd = match cmd {
+                Some(cmd) => cmd,
+                None => {
+                    return Err(LimboError::InvalidArgument(
+                        "The supplied SQL string contains no statements".to_string(),
+                    ));
+                }
+            };
+            let input = str::from_utf8(&sql.as_bytes()[..byte_offset_end])
+                .unwrap()
+                .trim();
+            let prepare_options = PrepareOptions::default();
+            let (program, pager, mode) = self.compile_cmd(cmd, input, origin, &prepare_options)?;
 
-        Ok(Statement::new_with_origin(
-            program,
-            pager,
-            mode,
-            byte_offset_end,
-            origin,
-        ))
+            Ok(Statement::new_with_origin(
+                program,
+                pager,
+                mode,
+                byte_offset_end,
+                origin,
+                needs_nested_guard,
+            ))
+        })();
+        if result.is_err() && needs_nested_guard {
+            self.end_nested();
+        }
+        result
     }
 
     /// Prepare an already-translated statement while keeping the original
@@ -1159,9 +1169,25 @@ impl Connection {
         if self.is_closed() {
             return Err(LimboError::InternalError("Connection closed".to_string()));
         }
-        let _scope = origin.enter(self);
-        let (program, pager, mode) = self.compile_cmd(cmd, input, origin, prepare_options)?;
-        Ok(Statement::new_with_origin(program, pager, mode, 0, origin))
+        let needs_nested_guard = origin.needs_nested_guard();
+        if needs_nested_guard {
+            self.start_nested();
+        }
+        let result = (|| {
+            let (program, pager, mode) = self.compile_cmd(cmd, input, origin, prepare_options)?;
+            Ok(Statement::new_with_origin(
+                program,
+                pager,
+                mode,
+                0,
+                origin,
+                needs_nested_guard,
+            ))
+        })();
+        if result.is_err() && needs_nested_guard {
+            self.end_nested();
+        }
+        result
     }
 
     /// Whether this is an internal connection used for MVCC bootstrap
