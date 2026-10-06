@@ -16,7 +16,7 @@ pub trait VirtualTableModule: Debug + Send + Sync {
     /// of an unrelated write.
     /// Return `true` only if the module is safe to call this way.
     /// This permits reads only, not writes from triggers.
-    fn allows_reads_in_triggers(&self) -> bool {
+    fn innocuous(&self) -> bool {
         false
     }
 }
@@ -67,7 +67,7 @@ pub trait TableUpdate: Send + Sync {
 pub(crate) trait ModuleFactory: Debug + Send + Sync {
     fn schema(&self, args: &[Value]) -> Result<String>;
     fn create(&self, args: &[Value]) -> Result<NativeTable>;
-    fn allows_reads_in_triggers(&self) -> bool;
+    fn innocuous(&self) -> bool;
 }
 
 impl<M: VirtualTableModule> ModuleFactory for M {
@@ -81,8 +81,8 @@ impl<M: VirtualTableModule> ModuleFactory for M {
         )))))
     }
 
-    fn allows_reads_in_triggers(&self) -> bool {
-        VirtualTableModule::allows_reads_in_triggers(self)
+    fn innocuous(&self) -> bool {
+        VirtualTableModule::innocuous(self)
     }
 }
 

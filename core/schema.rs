@@ -2682,7 +2682,7 @@ impl TryClone for VirtualTable {
             vtab_type: self.vtab_type.clone(),
             vtab_id: self.vtab_id,
             is_droppable: self.is_droppable,
-            allows_reads_in_triggers: self.allows_reads_in_triggers,
+            innocuous: self.innocuous,
         })
     }
 }
