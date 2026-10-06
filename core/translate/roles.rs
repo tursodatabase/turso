@@ -14,7 +14,7 @@ use std::sync::Arc;
 
 use turso_parser::ast;
 
-use crate::schema::BTreeTable;
+use crate::schema::{BTreeTable, Schema, SEQ_BACKING_TABLE_PREFIX};
 use crate::security::roles::{CREATE_ROLES_TABLE_SQL, ROLES_TABLE_NAME};
 use crate::storage::pager::CreateBTreeFlags;
 use crate::translate::emitter::Resolver;
@@ -23,7 +23,8 @@ use crate::vdbe::builder::{CursorType, ProgramBuilder};
 use crate::vdbe::insn::{to_u32, Cookie, InsertFlags, Insn, RegisterOrLiteral};
 use crate::{bail_parse_error, Connection, LimboError, Result, MAIN_DB_ID};
 
-/// Fails if the current role may not run `stmt` at all.
+/// Fails if the current role may not run `stmt` at all. Statements that pass
+/// are checked again by [`check_storage_access`] once they are compiled.
 pub fn check_statement_privileges(
     stmt: &ast::Stmt,
     resolver: &Resolver,
@@ -119,6 +120,76 @@ fn schema_denial(name: &ast::QualifiedName) -> String {
         _ => "public",
     };
     format!("permission denied for schema {schema}")
+}
+
+/// Fails if the compiled program reads or writes a database object that the
+/// current role has no privileges on. Every access to stored data goes
+/// through one of the instructions checked here, so a statement cannot reach
+/// an object without being checked.
+pub fn check_storage_access(
+    program: &ProgramBuilder,
+    resolver: &Resolver,
+    connection: &Connection,
+) -> Result<()> {
+    if resolver
+        .schema()
+        .roles
+        .is_superuser(connection.current_role())
+    {
+        return Ok(());
+    }
+    for (insn, _) in &program.insns {
+        let (db, root_page) = match insn {
+            Insn::OpenRead { db, root_page, .. } => (*db, Some(*root_page)),
+            Insn::OpenWrite {
+                db,
+                root_page: RegisterOrLiteral::Literal(root_page),
+                ..
+            } => (*db, Some(*root_page)),
+            Insn::OpenWrite { db, .. } => (*db, None),
+            Insn::ClearBtree { db, root, .. } | Insn::Destroy { db, root, .. } => {
+                (*db, Some(*root))
+            }
+            Insn::CreateBtree { db, .. } => (*db, None),
+            _ => continue,
+        };
+        let object = root_page.and_then(|root_page| {
+            resolver.with_schema(db, |schema| object_with_root_page(schema, root_page))
+        });
+        let denial = match object {
+            Some(object) => format!("permission denied for {object}"),
+            None => "permission denied to access database storage".to_string(),
+        };
+        return Err(LimboError::PermissionDenied(denial));
+    }
+    Ok(())
+}
+
+/// Describes the object stored at `root_page` the way PostgreSQL names it in
+/// a permission error, for example `table t` or `sequence s`. An index is
+/// described by the table it belongs to.
+fn object_with_root_page(schema: &Schema, root_page: i64) -> Option<String> {
+    let table_name = schema
+        .tables
+        .values()
+        .filter_map(|table| table.btree())
+        .find(|table| table.root_page == root_page)
+        .map(|table| table.name.clone())
+        .or_else(|| {
+            schema
+                .indexes
+                .values()
+                .flatten()
+                .find(|index| index.root_page == root_page)
+                .map(|index| index.table_name.clone())
+        })?;
+    if let Some(sequence_name) = table_name.strip_prefix(SEQ_BACKING_TABLE_PREFIX) {
+        return Some(format!("sequence {sequence_name}"));
+    }
+    if schema.materialized_view_names.contains(&table_name) {
+        return Some(format!("materialized view {table_name}"));
+    }
+    Some(format!("table {table_name}"))
 }
 
 /// Switches the connection to `role_name`, or back to the session role when
@@ -267,7 +338,9 @@ mod tests {
     use turso_parser::ast;
 
     use crate::security::roles::RoleId;
-    use crate::{Connection, Database, DatabaseOpts, MemoryIO, OpenFlags, SqliteDialect, IO};
+    use crate::{
+        Connection, Database, DatabaseOpts, MemoryIO, OpenFlags, SqliteDialect, StepResult, IO,
+    };
 
     #[test]
     fn create_role_adds_the_role_to_the_catalog() {
@@ -361,6 +434,64 @@ mod tests {
         conn.execute("SELECT 1").unwrap();
         reset_role(&conn).unwrap();
         conn.execute("CREATE TABLE t (x)").unwrap();
+    }
+
+    #[test]
+    fn role_without_privileges_cannot_read_or_change_tables() {
+        let conn = open_connection();
+        conn.execute("CREATE TABLE t (x)").unwrap();
+        create_role(&conn, "alice").unwrap();
+        set_role(&conn, "alice").unwrap();
+
+        for sql in [
+            "SELECT * FROM t",
+            "INSERT INTO t VALUES (1)",
+            "UPDATE t SET x = 2",
+            "DELETE FROM t",
+        ] {
+            let error = conn.execute(sql).unwrap_err();
+            assert_eq!(error.to_string(), "permission denied for table t", "{sql}");
+        }
+    }
+
+    #[test]
+    fn role_without_privileges_cannot_use_sequences() {
+        let conn = open_connection();
+        conn.execute("CREATE SEQUENCE s").unwrap();
+        create_role(&conn, "alice").unwrap();
+        set_role(&conn, "alice").unwrap();
+
+        let error = conn.execute("SELECT nextval('s')").unwrap_err();
+
+        assert_eq!(error.to_string(), "permission denied for sequence s");
+    }
+
+    #[test]
+    fn open_pragma_cursor_does_not_skip_privilege_checks() {
+        let conn = open_connection();
+        conn.execute("CREATE TABLE t (x)").unwrap();
+        create_role(&conn, "alice").unwrap();
+        let mut pragma = conn
+            .prepare("SELECT * FROM pragma_table_info('t')")
+            .unwrap();
+        assert!(matches!(pragma.step().unwrap(), StepResult::Row));
+        set_role(&conn, "alice").unwrap();
+
+        let error = conn.prepare("SELECT * FROM t").err().unwrap();
+
+        assert_eq!(error.to_string(), "permission denied for table t");
+    }
+
+    #[test]
+    fn role_without_privileges_can_read_the_schema_again() {
+        let conn = open_connection();
+        conn.execute("CREATE TABLE t (x)").unwrap();
+        create_role(&conn, "alice").unwrap();
+        set_role(&conn, "alice").unwrap();
+
+        conn.reparse_schema().unwrap();
+
+        assert!(conn.role_catalog().get_by_name("alice").is_some());
     }
 
     #[test]

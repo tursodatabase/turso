@@ -131,7 +131,8 @@ pub fn translate(
     #[cfg(feature = "simulator")]
     resolver.set_subquery_unnesting_mode(connection.subquery_unnesting_mode());
 
-    let check_privileges = matches!(origin, crate::statement::StatementOrigin::Root);
+    let check_privileges = matches!(origin, crate::statement::StatementOrigin::Root)
+        && !connection.schema_reparse_in_progress();
     if check_privileges {
         roles::check_statement_privileges(&stmt, &resolver, &connection)?;
     }
@@ -152,6 +153,10 @@ pub fn translate(
     };
 
     program.epilogue(schema);
+
+    if check_privileges {
+        roles::check_storage_access(&program, &resolver, &connection)?;
+    }
 
     program.build(connection, change_cnt_on, input)
 }
