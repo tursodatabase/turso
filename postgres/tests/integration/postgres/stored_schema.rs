@@ -1,23 +1,5 @@
-use crate::common::TempDatabase;
-use turso_core::Value;
+use crate::common::{core_rows, open_with_sqlite_dialect, rows, TempDatabase};
 use turso_pg::PgConnection;
-
-fn rows(conn: &PgConnection, sql: &str) -> Vec<String> {
-    let mut stmt = conn.query(sql).unwrap().unwrap();
-    stmt.run_collect_rows()
-        .unwrap()
-        .into_iter()
-        .map(|row| {
-            row.iter()
-                .map(|value| match value {
-                    Value::Null => "NULL".to_string(),
-                    value => value.to_string(),
-                })
-                .collect::<Vec<_>>()
-                .join("|")
-        })
-        .collect()
-}
 
 #[turso_macros::test(mvcc)]
 fn add_and_drop_column_keep_function_defaults_readable(db: TempDatabase) {
@@ -48,38 +30,6 @@ fn add_and_drop_column_keep_function_defaults_readable(db: TempDatabase) {
     );
 }
 
-fn open_with_sqlite_dialect(path: &std::path::Path) -> std::sync::Arc<turso_core::Connection> {
-    let io: std::sync::Arc<dyn turso_core::IO + Send> =
-        std::sync::Arc::new(turso_core::PlatformIO::new().unwrap());
-    let db = turso_core::Database::open_file_with_flags(
-        io,
-        path.to_str().unwrap(),
-        turso_core::OpenFlags::default(),
-        turso_core::DatabaseOpts::new().with_custom_types(true),
-        None,
-        std::sync::Arc::new(turso_core::SqliteDialect),
-    )
-    .unwrap();
-    db.connect().unwrap()
-}
-
-fn sqlite_rows(conn: &std::sync::Arc<turso_core::Connection>, sql: &str) -> Vec<String> {
-    let mut stmt = conn.prepare(sql).unwrap();
-    stmt.run_collect_rows()
-        .unwrap()
-        .into_iter()
-        .map(|row| {
-            row.iter()
-                .map(|value| match value {
-                    Value::Null => "NULL".to_string(),
-                    value => value.to_string(),
-                })
-                .collect::<Vec<_>>()
-                .join("|")
-        })
-        .collect()
-}
-
 #[turso_macros::test(mvcc)]
 fn new_tables_store_sql_that_both_dialects_load(db: TempDatabase) {
     let conn = db.connect_postgres();
@@ -103,9 +53,9 @@ fn new_tables_store_sql_that_both_dialects_load(db: TempDatabase) {
     let path = db.path.clone();
     drop(db);
 
-    let conn = open_with_sqlite_dialect(&path);
+    let conn = open_with_sqlite_dialect(&path).unwrap().connect().unwrap();
     assert_eq!(
-        sqlite_rows(&conn, "SELECT sql FROM sqlite_schema WHERE name = 't'"),
+        core_rows(&conn, "SELECT sql FROM sqlite_schema WHERE name = 't'"),
         [
             "CREATE TABLE t (id INTEGER PRIMARY KEY DEFAULT (nextval ('t_id_seq')), \
           a bigint UNIQUE, n numeric (10, 2) DEFAULT 1.5, ts timestamp, d TEXT[] DEFAULT '{}', \
@@ -115,7 +65,7 @@ fn new_tables_store_sql_that_both_dialects_load(db: TempDatabase) {
     );
     let expected = ["1|7|2.50|2024-01-01 10:00:00|{}|ok|3|vv|1"];
     assert_eq!(
-        sqlite_rows(&conn, "SELECT id, a, n, ts, d, m, p, v, b FROM t"),
+        core_rows(&conn, "SELECT id, a, n, ts, d, m, p, v, b FROM t"),
         expected
     );
     for bad in [
@@ -227,16 +177,7 @@ fn schema_file_tables_resolve_types_through_the_main_database(db: TempDatabase) 
     drop(conn);
     drop(db);
 
-    let io: std::sync::Arc<dyn turso_core::IO + Send> =
-        std::sync::Arc::new(turso_core::PlatformIO::new().unwrap());
-    let Err(err) = turso_core::Database::open_file_with_flags(
-        io,
-        schema_file.to_str().unwrap(),
-        turso_core::OpenFlags::default(),
-        turso_core::DatabaseOpts::new().with_custom_types(true),
-        None,
-        std::sync::Arc::new(turso_core::SqliteDialect),
-    ) else {
+    let Err(err) = open_with_sqlite_dialect(&schema_file) else {
         panic!("a schema file without the types of its main database must not open");
     };
     assert!(
@@ -262,23 +203,6 @@ fn schema_file_tables_resolve_types_through_the_main_database(db: TempDatabase) 
             .contains("column t.m has type \"mood\", which this database does not define"),
         "{err}"
     );
-}
-
-fn core_rows(conn: &std::sync::Arc<turso_core::Connection>, sql: &str) -> Vec<String> {
-    let mut stmt = conn.prepare(sql).unwrap();
-    stmt.run_collect_rows()
-        .unwrap()
-        .into_iter()
-        .map(|row| {
-            row.iter()
-                .map(|value| match value {
-                    Value::Null => "NULL".to_string(),
-                    value => value.to_string(),
-                })
-                .collect::<Vec<_>>()
-                .join("|")
-        })
-        .collect()
 }
 
 /// VACUUM through the core API of a PostgreSQL connection: the replayed

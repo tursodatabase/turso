@@ -1,5 +1,5 @@
 -- Written by tursopg at commit e6c79b43 (before canonical table storage):
---   tursopg -q /abs/path/pg_v1_storage.db "$(cat pg_v1_storage.sql)"
+--   tursopg -q /abs/path/pg_v1_storage.db "$(grep -v '^--' pg_v1_storage.sql)"
 -- Then turso-postgres-schema-s.db was opened alone with the same tursopg to checkpoint its WAL.
 CREATE TYPE mood AS ENUM ('sad', 'ok', 'happy');
 CREATE DOMAIN posint AS integer CHECK (VALUE > 0);

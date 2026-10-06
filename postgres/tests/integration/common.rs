@@ -241,3 +241,50 @@ impl TempDatabase {
         TempDatabase::builder().with_db_path(path).build()
     }
 }
+
+/// A row as `value|value|...`, with `NULL` for a null value.
+pub fn format_row(row: &[turso_core::Value]) -> String {
+    row.iter()
+        .map(|value| match value {
+            turso_core::Value::Null => "NULL".to_string(),
+            value => value.to_string(),
+        })
+        .collect::<Vec<_>>()
+        .join("|")
+}
+
+/// The rows of a PostgreSQL query, formatted with [`format_row`].
+pub fn rows(conn: &Connection, sql: &str) -> Vec<String> {
+    let mut stmt = conn
+        .query(sql)
+        .unwrap_or_else(|e| panic!("{sql}: {e}"))
+        .unwrap();
+    stmt.run_collect_rows()
+        .unwrap()
+        .iter()
+        .map(|row| format_row(row))
+        .collect()
+}
+
+/// The rows of a query of a core connection, formatted with [`format_row`].
+pub fn core_rows(conn: &Arc<turso_core::Connection>, sql: &str) -> Vec<String> {
+    let mut stmt = conn.prepare(sql).unwrap_or_else(|e| panic!("{sql}: {e}"));
+    stmt.run_collect_rows()
+        .unwrap()
+        .iter()
+        .map(|row| format_row(row))
+        .collect()
+}
+
+/// Open a database file with the SQLite dialect and custom types.
+pub fn open_with_sqlite_dialect(path: &std::path::Path) -> turso_core::Result<Arc<Database>> {
+    let io: Arc<dyn IO + Send> = Arc::new(turso_core::PlatformIO::new().unwrap());
+    Database::open_file_with_flags(
+        io,
+        path.to_str().unwrap(),
+        turso_core::OpenFlags::default(),
+        turso_core::DatabaseOpts::new().with_custom_types(true),
+        None,
+        Arc::new(turso_core::SqliteDialect),
+    )
+}

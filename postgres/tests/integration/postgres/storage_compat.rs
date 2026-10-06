@@ -2,11 +2,9 @@
 //! fixtures/pg_v1, made by tursopg at commit e6c79b43) must keep their
 //! values and stay writable.
 
-use crate::common::TempDatabase;
+use crate::common::{core_rows, open_with_sqlite_dialect, rows, TempDatabase};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use tempfile::TempDir;
-use turso_core::Value;
 use turso_pg::PgConnection;
 
 const MAIN: &str = "pg_v1_storage.db";
@@ -41,46 +39,6 @@ fn connect_with_schema_file(db: &TempDatabase, mvcc: bool) -> PgConnection {
         .unwrap();
     }
     PgConnection::new(core)
-}
-
-fn format_row(row: &[Value]) -> String {
-    row.iter()
-        .map(|value| match value {
-            Value::Null => "NULL".to_string(),
-            value => value.to_string(),
-        })
-        .collect::<Vec<_>>()
-        .join("|")
-}
-
-fn rows(conn: &PgConnection, sql: &str) -> Vec<String> {
-    let mut stmt = conn.query(sql).unwrap().unwrap();
-    stmt.run_collect_rows()
-        .unwrap()
-        .iter()
-        .map(|row| format_row(row))
-        .collect()
-}
-
-fn core_rows(conn: &Arc<turso_core::Connection>, sql: &str) -> Vec<String> {
-    let mut stmt = conn.prepare(sql).unwrap_or_else(|e| panic!("{sql}: {e}"));
-    stmt.run_collect_rows()
-        .unwrap()
-        .iter()
-        .map(|row| format_row(row))
-        .collect()
-}
-
-fn open_with_sqlite_dialect(path: &Path) -> turso_core::Result<Arc<turso_core::Database>> {
-    let io: Arc<dyn turso_core::IO + Send> = Arc::new(turso_core::PlatformIO::new().unwrap());
-    turso_core::Database::open_file_with_flags(
-        io,
-        path.to_str().unwrap(),
-        turso_core::OpenFlags::default(),
-        turso_core::DatabaseOpts::new().with_custom_types(true),
-        None,
-        Arc::new(turso_core::SqliteDialect),
-    )
 }
 
 const ALL_TYPES: &str =
