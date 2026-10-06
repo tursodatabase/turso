@@ -66,3 +66,173 @@ test alter-add-notnull-type-default-empty-table {
 expect {
     1|Alice|75
 }
+
+# Rows inserted before ALTER TABLE ADD COLUMN have no field for the new
+# column. Every read of such a row, and every index built from it, must use
+# the ENCODEd DEFAULT, the value that an INSERT stores.
+setup short_records {
+    CREATE DOMAIN day_stamp AS timestamp;
+    CREATE TABLE t(id INTEGER PRIMARY KEY, b INTEGER UNIQUE, c INTEGER) STRICT;
+    INSERT INTO t(b) VALUES (1), (2);
+    ALTER TABLE t ADD COLUMN ts timestamp DEFAULT '2024-06-01';
+    ALTER TABLE t ADD COLUMN u uuid DEFAULT 'A0EEBC99-9C0B-4EF8-BB6D-6BB9BD380A11';
+    ALTER TABLE t ADD COLUMN f boolean DEFAULT 'true';
+    ALTER TABLE t ADD COLUMN d day_stamp DEFAULT '2024-06-02';
+    INSERT INTO t(b, ts, u, f, d) VALUES (3, '2023-01-01', '00000000-0000-4000-8000-000000000001', 0, '2023-01-02');
+    CREATE INDEX t_ts ON t(ts);
+    CREATE INDEX t_u ON t(u);
+    CREATE INDEX t_f ON t(f);
+    CREATE INDEX t_d ON t(d);
+}
+
+@requires strict "uses STRICT tables"
+@setup short_records
+test short-record-reads-encoded-default {
+    SELECT b, ts, u, f, d FROM t NOT INDEXED ORDER BY b;
+}
+expect {
+    1|2024-06-01 00:00:00|a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11|1|2024-06-02 00:00:00
+    2|2024-06-01 00:00:00|a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11|1|2024-06-02 00:00:00
+    3|2023-01-01 00:00:00|00000000-0000-4000-8000-000000000001|0|2023-01-02 00:00:00
+}
+
+@requires strict "uses STRICT tables"
+@setup short_records
+test short-record-order-by-uses-encoded-default {
+    SELECT b, ts FROM t NOT INDEXED ORDER BY ts DESC, b;
+    SELECT b, d FROM t NOT INDEXED ORDER BY d, b;
+}
+expect {
+    1|2024-06-01 00:00:00
+    2|2024-06-01 00:00:00
+    3|2023-01-01 00:00:00
+    3|2023-01-02 00:00:00
+    1|2024-06-02 00:00:00
+    2|2024-06-02 00:00:00
+}
+
+@requires strict "uses STRICT tables"
+@setup short_records
+test short-record-index-range-same-rows-with-and-without-index {
+    SELECT group_concat(b) FROM (SELECT b FROM t WHERE ts > '2024-06-01' ORDER BY b);
+    SELECT group_concat(b) FROM (SELECT b FROM t NOT INDEXED WHERE ts > '2024-06-01' ORDER BY b);
+    SELECT group_concat(b) FROM (SELECT b FROM t WHERE ts BETWEEN '2024-01-01' AND '2025-01-01' ORDER BY b);
+    SELECT group_concat(b) FROM (SELECT b FROM t NOT INDEXED WHERE ts BETWEEN '2024-01-01' AND '2025-01-01' ORDER BY b);
+    SELECT group_concat(b) FROM (SELECT b FROM t WHERE u >= 'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11' ORDER BY b);
+    SELECT group_concat(b) FROM (SELECT b FROM t NOT INDEXED WHERE u >= 'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11' ORDER BY b);
+    SELECT group_concat(b) FROM (SELECT b FROM t WHERE f BETWEEN 1 AND 1 ORDER BY b);
+    SELECT group_concat(b) FROM (SELECT b FROM t NOT INDEXED WHERE f BETWEEN 1 AND 1 ORDER BY b);
+    SELECT group_concat(b) FROM (SELECT b FROM t WHERE f IN (1) ORDER BY b);
+    SELECT group_concat(b) FROM (SELECT b FROM t WHERE d >= '2024-06-02' ORDER BY b);
+    SELECT group_concat(b) FROM (SELECT b FROM t NOT INDEXED WHERE d >= '2024-06-02' ORDER BY b);
+}
+expect {
+    1,2
+    1,2
+    1,2
+    1,2
+    1,2
+    1,2
+    1,2
+    1,2
+    1,2
+    1,2
+    1,2
+}
+
+@requires strict "uses STRICT tables"
+@setup short_records
+test short-record-covering-index-reads-encoded-default {
+    SELECT b, ts FROM t INDEXED BY t_ts WHERE ts > '2000-01-01' ORDER BY b;
+    SELECT b, f FROM t INDEXED BY t_f WHERE f IS NOT NULL ORDER BY b;
+}
+expect {
+    1|2024-06-01 00:00:00
+    2|2024-06-01 00:00:00
+    3|2023-01-01 00:00:00
+    1|1
+    2|1
+    3|0
+}
+
+@requires strict "uses STRICT tables"
+test short-record-auto-index-same-rows-as-scan {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, b INTEGER) STRICT;
+    INSERT INTO t(b) VALUES (1), (2);
+    ALTER TABLE t ADD COLUMN ts timestamp DEFAULT '2024-06-01';
+    WITH RECURSIVE s(v) AS (SELECT 1 UNION ALL SELECT v + 1 FROM s WHERE v < 200) INSERT INTO t(b, ts) SELECT v + 10, '2022-01-01' FROM s;
+    CREATE TABLE k(x TEXT, y INTEGER) STRICT;
+    INSERT INTO k VALUES ('2024-06-01 00:00:00', 5), ('2022-01-01 00:00:00', 12);
+    EXPLAIN QUERY PLAN SELECT k.x, t.b FROM k LEFT JOIN t ON t.ts = k.x AND t.b < k.y;
+    SELECT k.x, t.b FROM k LEFT JOIN t ON t.ts = k.x AND t.b < k.y ORDER BY 1, 2;
+    SELECT k.x, t.b FROM k LEFT JOIN t NOT INDEXED ON t.ts = k.x AND t.b < k.y ORDER BY 1, 2;
+}
+expect {
+    1|0|0|SCAN k
+    2|0|0|SEARCH t USING COVERING INDEX ephemeral_t_t2 (ts=? AND b<?) LEFT-JOIN
+    2022-01-01 00:00:00|11
+    2024-06-01 00:00:00|1
+    2024-06-01 00:00:00|2
+    2022-01-01 00:00:00|11
+    2024-06-01 00:00:00|1
+    2024-06-01 00:00:00|2
+}
+
+@requires strict "uses STRICT tables"
+@setup short_records
+test short-record-integrity-check-accepts-encoded-default {
+    PRAGMA integrity_check;
+}
+expect {
+    ok
+}
+
+@requires strict "uses STRICT tables"
+@setup short_records
+test short-record-update-of-other-column-keeps-encoded-default {
+    UPDATE t SET c = 7 WHERE b = 1;
+    SELECT b, c, ts, u, f, d FROM t NOT INDEXED WHERE b = 1;
+    SELECT group_concat(b) FROM (SELECT b FROM t WHERE ts = '2024-06-01 00:00:00' ORDER BY b);
+    PRAGMA integrity_check;
+}
+expect {
+    1|7|2024-06-01 00:00:00|a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11|1|2024-06-02 00:00:00
+    1,2
+    ok
+}
+
+@requires strict "uses STRICT tables"
+@setup short_records
+test short-record-upsert-keeps-encoded-default {
+    INSERT INTO t(b) VALUES (1) ON CONFLICT(b) DO UPDATE SET c = 8;
+    SELECT b, c, ts, f FROM t NOT INDEXED WHERE b = 1;
+    PRAGMA integrity_check;
+}
+expect {
+    1|8|2024-06-01 00:00:00|1
+    ok
+}
+
+@requires strict "uses STRICT tables"
+@setup short_records
+test short-record-delete-removes-index-entries {
+    DELETE FROM t WHERE b = 2;
+    PRAGMA integrity_check;
+    SELECT group_concat(b) FROM (SELECT b FROM t INDEXED BY t_ts WHERE ts > '2000-01-01' ORDER BY b);
+}
+expect {
+    ok
+    1,3
+}
+
+@requires strict "uses STRICT tables"
+@setup short_records
+test short-record-drop-column-keeps-encoded-default {
+    ALTER TABLE t DROP COLUMN c;
+    SELECT b, ts, u, f, d FROM t NOT INDEXED WHERE b = 1;
+    PRAGMA integrity_check;
+}
+expect {
+    1|2024-06-01 00:00:00|a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11|1|2024-06-02 00:00:00
+    ok
+}

@@ -1419,10 +1419,11 @@ pub fn emit_upsert(
             let before_rec = if program.capture_data_changes_info().has_before() {
                 Some(emit_cdc_full_record(
                     program,
+                    resolver,
                     table.columns(),
                     ctx.cursor_id,
                     ctx.conflict_rowid_reg,
-                ))
+                )?)
             } else {
                 None
             };
@@ -1473,10 +1474,11 @@ pub fn emit_upsert(
             let before_rec = if program.capture_data_changes_info().has_before() {
                 Some(emit_cdc_full_record(
                     program,
+                    resolver,
                     table.columns(),
                     ctx.cursor_id,
                     ctx.conflict_rowid_reg,
-                ))
+                )?)
             } else {
                 None
             };

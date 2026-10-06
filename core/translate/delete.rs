@@ -177,7 +177,7 @@ pub fn translate_delete(
     )?;
     let opts = ProgramBuilderOpts::new(1, estimate_num_instructions(delete), 0);
     program.extend(&opts);
-    emit_program(connection, resolver, program, delete_plan, |_| {})?;
+    emit_program(connection, resolver, program, delete_plan, |_| Ok(()))?;
     Ok(())
 }
 

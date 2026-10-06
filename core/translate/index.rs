@@ -12,8 +12,8 @@ use crate::translate::{
         OperationMode, Resolver,
     },
     expr::{
-        bind_and_rewrite_expr, translate_condition_expr, translate_expr, unwrap_parens, walk_expr,
-        BindingBehavior, ConditionMetadata, WalkControl,
+        bind_and_rewrite_expr, emit_stored_column, translate_condition_expr, translate_expr,
+        unwrap_parens, walk_expr, BindingBehavior, ConditionMetadata, WalkControl,
     },
     insert::format_unique_violation_desc,
     plan::{ColumnUsedMask, IterationDirection, JoinedTable, Operation, Scan, TableReferences},
@@ -1167,7 +1167,13 @@ fn emit_index_column_value_from_cursor(
             }
         }
     } else {
-        program.emit_column_or_rowid(table_cursor_id, idx_col.pos_in_table, dest_reg);
+        emit_stored_column(
+            program,
+            table_cursor_id,
+            idx_col.pos_in_table,
+            dest_reg,
+            resolver,
+        )?;
     }
     Ok(())
 }
@@ -1328,10 +1334,11 @@ pub fn translate_drop_index(
         let before_record_reg = if program.capture_data_changes_info().has_before() {
             Some(emit_cdc_full_record(
                 program,
+                resolver,
                 sqlite_table.columns(),
                 sqlite_schema_cursor_id,
                 row_id_reg,
-            ))
+            )?)
         } else {
             None
         };

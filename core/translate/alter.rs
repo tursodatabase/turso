@@ -21,7 +21,7 @@ use crate::{
     },
     translate::{
         emitter::{emit_check_constraints, gencol::compute_virtual_columns, Resolver},
-        expr::{translate_expr, walk_expr, walk_expr_mut, WalkControl},
+        expr::{emit_stored_column, translate_expr, walk_expr, walk_expr_mut, WalkControl},
         plan::{ColumnMask, ColumnUsedMask, OuterQueryReference, TableReferences},
         trigger::create_trigger_to_sql,
     },
@@ -1203,13 +1203,14 @@ pub fn translate_alter_table(
                     if let Some((source_column_by_schema_idx, layout)) = &rewrite_rows {
                         emit_rewrite_table_rows(
                             program,
+                            resolver,
                             original_btree.clone(),
                             &btree,
                             source_column_by_schema_idx,
                             layout,
                             connection,
                             database_id,
-                        );
+                        )?;
                     }
 
                     program.emit_insn(Insn::SetCookie {
@@ -1223,7 +1224,8 @@ pub fn translate_alter_table(
                         db: database_id,
                         table: btree.name.clone(),
                         column_index: dropped_index,
-                    })
+                    });
+                    Ok(())
                 },
             )?
         }
@@ -1560,6 +1562,7 @@ pub fn translate_alter_table(
                             foreign_keys: btree.foreign_keys.to_vec(),
                         }),
                     });
+                    Ok(())
                 },
             )?
         }
@@ -1777,7 +1780,7 @@ pub fn translate_alter_table(
                     program,
                     connection,
                     input,
-                    |_program| {},
+                    |_program| Ok(()),
                 )?;
             }
 
@@ -2218,7 +2221,7 @@ pub fn translate_alter_table(
                     program,
                     connection,
                     input,
-                    |_program| {},
+                    |_program| Ok(()),
                 )?;
             }
 
@@ -2252,7 +2255,7 @@ pub fn translate_alter_table(
                     program,
                     connection,
                     input,
-                    |_program| {},
+                    |_program| Ok(()),
                 )?;
             }
 
@@ -2308,13 +2311,14 @@ pub fn translate_alter_table(
                     let layout = altered_table.column_layout()?;
                     emit_rewrite_table_rows(
                         program,
+                        resolver,
                         original_btree.clone(),
                         &altered_table,
                         &source_column_by_schema_idx,
                         &layout,
                         connection,
                         database_id,
-                    );
+                    )?;
                 }
                 emit_rewrite_table_indexes(
                     program,
@@ -2553,15 +2557,17 @@ fn emit_rewrite_table_indexes(
 /// `source_column_by_schema_idx` is indexed by the rewritten table's schema order. Each
 /// entry is either the physical column index to read from the old row image or `None`
 /// for virtual generated columns, which are omitted from the stored record entirely.
+#[allow(clippy::too_many_arguments)]
 fn emit_rewrite_table_rows(
     program: &mut ProgramBuilder,
+    resolver: &Resolver,
     original_btree: Arc<BTreeTable>,
     rewritten_table: &BTreeTable,
     source_column_by_schema_idx: &[Option<usize>],
     layout: &ColumnLayout,
     connection: &Arc<crate::Connection>,
     database_id: usize,
-) {
+) -> Result<()> {
     turso_assert_eq!(
         source_column_by_schema_idx.len(),
         rewritten_table.columns().len()
@@ -2589,11 +2595,13 @@ fn emit_rewrite_table_rows(
                 continue;
             };
 
-            program.emit_column_or_rowid(
+            emit_stored_column(
+                program,
                 cursor_id,
                 *source_column_idx,
                 layout.to_register(base_dest_reg, schema_idx),
-            );
+                resolver,
+            )?;
         }
 
         let record = program.alloc_register();
@@ -2620,7 +2628,8 @@ fn emit_rewrite_table_rows(
             flag: crate::vdbe::insn::InsertFlags(0),
             table_name: table_name.clone(),
         });
-    });
+        Ok(())
+    })
 }
 
 fn non_virtual_affinity_str(table: &BTreeTable) -> String {

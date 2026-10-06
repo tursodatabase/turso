@@ -255,6 +255,10 @@ ALTER TABLE users ADD COLUMN email varchar(255);
 
 The added column follows the same STRICT type-checking rules as columns defined in the original CREATE TABLE.
 
+Rows that existed before ALTER TABLE ADD COLUMN do not store the new column. Turso reads the ENCODEd DEFAULT for these rows, the same value that an INSERT stores. Indexes, UPDATE and ALTER TABLE also use this value.
+
+An index that an older Turso version created on such a column can hold the DEFAULT before ENCODE. For these indexes, `PRAGMA integrity_check` reports rows that are missing from the index, and a DELETE or UPDATE of these rows fails with a corrupt database error. To correct the index, run `REINDEX` on it. In MVCC mode, drop the index and create it again.
+
 ## Built-in Types
 
 Turso provides the following built-in custom types in STRICT tables:

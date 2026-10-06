@@ -70,7 +70,7 @@ pub fn translate_update(
 
     let opts = ProgramBuilderOpts::new(1, 20, 4);
     program.extend(&opts);
-    emit_program(connection, resolver, program, plan, |_| {})?;
+    emit_program(connection, resolver, program, plan, |_| Ok(()))?;
     Ok(())
 }
 
@@ -142,7 +142,7 @@ pub fn translate_update_for_schema_change(
     program: &mut ProgramBuilder,
     connection: &Arc<crate::Connection>,
     ddl_query: &str,
-    after: impl FnOnce(&mut ProgramBuilder),
+    after: impl FnOnce(&mut ProgramBuilder) -> crate::Result<()>,
 ) -> crate::Result<()> {
     let plan = prepare_and_optimize_update_plan(
         program,

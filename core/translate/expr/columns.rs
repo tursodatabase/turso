@@ -77,9 +77,67 @@ pub(super) fn do_emit_table_column(
             })?;
             program.emit_column_affinity(target_register, column.affinity());
         }
-        _ => {
-            program.emit_column_or_rowid(cursor_id, column_index, target_register);
-        }
+        _ => emit_stored_column(program, cursor_id, column_index, target_register, resolver)?,
     }
     Ok(())
+}
+
+pub(crate) fn emit_stored_column(
+    program: &mut ProgramBuilder,
+    cursor_id: CursorID,
+    column_index: usize,
+    target_register: usize,
+    resolver: &Resolver,
+) -> Result<()> {
+    let Some(table) = program.btree_table_from_cursor(cursor_id).cloned() else {
+        program.emit_column_or_rowid(cursor_id, column_index, target_register);
+        return Ok(());
+    };
+    let column = &table.columns()[column_index];
+    let Some(default) = column
+        .default
+        .as_deref()
+        .filter(|_| column_encodes_stored_value(column, table.is_strict, resolver))
+    else {
+        program.emit_column_or_rowid(cursor_id, column_index, target_register);
+        return Ok(());
+    };
+    program.flags.set_suppress_column_default(true);
+    program.emit_column_or_rowid(cursor_id, column_index, target_register);
+    let record_has_field = program.allocate_label();
+    program.emit_column_has_field(cursor_id, column_index, record_has_field);
+    translate_expr_no_constant_opt(
+        program,
+        None,
+        default,
+        target_register,
+        resolver,
+        NoConstantOptReason::RegisterReuse,
+    )?;
+    emit_custom_type_encode_columns(
+        program,
+        resolver,
+        std::slice::from_ref(column),
+        target_register,
+        None,
+        &table.name,
+        &ColumnLayout::Identity { column_count: 1 },
+    )?;
+    program.preassign_label_to_next_insn(record_has_field);
+    Ok(())
+}
+
+fn column_encodes_stored_value(column: &Column, is_strict: bool, resolver: &Resolver) -> bool {
+    if !is_strict {
+        return false;
+    }
+    if column.is_array() {
+        return true;
+    }
+    resolver
+        .schema()
+        .resolve_type_unchecked(&column.ty_str)
+        .ok()
+        .flatten()
+        .is_some_and(|resolved| resolved.chain.iter().any(|td| td.encode().is_some()))
 }

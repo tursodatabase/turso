@@ -8,8 +8,9 @@ use super::{
         update::emit_program_for_update,
     },
     expr::{
-        bind_and_rewrite_expr, emit_table_column, translate_expr, translate_expr_no_constant_opt,
-        walk_expr, BindingBehavior, NoConstantOptReason, WalkControl,
+        bind_and_rewrite_expr, emit_stored_column, emit_table_column, translate_expr,
+        translate_expr_no_constant_opt, walk_expr, BindingBehavior, NoConstantOptReason,
+        WalkControl,
     },
     group_by::GroupByMetadata,
     main_loop::{LeftJoinMetadata, LoopLabels, SemiAntiJoinMetadata},
@@ -1169,7 +1170,7 @@ pub fn emit_program(
     resolver: &Resolver,
     program: &mut ProgramBuilder,
     plan: Plan,
-    after: impl FnOnce(&mut ProgramBuilder),
+    after: impl FnOnce(&mut ProgramBuilder) -> Result<()>,
 ) -> Result<()> {
     match plan {
         Plan::Select(plan) => emit_program_for_select(program, resolver, *plan),
@@ -1290,10 +1291,11 @@ pub(super) fn emit_make_record<'a>(
 
 pub fn emit_cdc_full_record(
     program: &mut ProgramBuilder,
+    resolver: &Resolver,
     columns: &[Column],
     table_cursor_id: usize,
     rowid_reg: usize,
-) -> usize {
+) -> Result<usize> {
     let storable_count = columns.iter().filter(|c| !c.is_virtual_generated()).count();
     let columns_reg = program.alloc_registers(storable_count + 1);
     let mut slot = 0;
@@ -1308,7 +1310,13 @@ pub fn emit_cdc_full_record(
                 extra_amount: 0,
             });
         } else {
-            program.emit_column_or_rowid(table_cursor_id, i, columns_reg + 1 + slot);
+            emit_stored_column(
+                program,
+                table_cursor_id,
+                i,
+                columns_reg + 1 + slot,
+                resolver,
+            )?;
         }
         slot += 1;
     }
@@ -1325,7 +1333,7 @@ pub fn emit_cdc_full_record(
         index_name: None,
         affinity_str: Some(affinity_str),
     });
-    columns_reg
+    Ok(columns_reg)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2003,26 +2011,27 @@ pub(crate) fn emit_columns_and_dependencies(
     };
 
     let mut extra_idx = 0;
-    let pairs = table.columns().iter().enumerate().map(|(idx, col)| {
+    let mut pairs = Vec::with_capacity(table.columns().len());
+    for (idx, col) in table.columns().iter().enumerate() {
         let reg = if let Some(pos) = non_rowid_target_positions[idx] {
             let reg = target_base + pos;
             if !col.is_virtual_generated() {
-                program.emit_column_or_rowid(cursor_id, idx, reg);
+                emit_stored_column(program, cursor_id, idx, reg, resolver)?;
             }
             reg
         } else if col.is_rowid_alias() {
             rowid_reg
         } else if dependencies.get(idx) {
             let reg = extra_base + extra_idx;
-            program.emit_column_or_rowid(cursor_id, idx, reg);
+            emit_stored_column(program, cursor_id, idx, reg, resolver)?;
             extra_idx += 1;
             reg
         } else {
             0
         };
-        (col, reg)
-    });
-    let dml_ctx = DmlColumnContext::from_column_reg_mapping(pairs);
+        pairs.push((col, reg));
+    }
+    let dml_ctx = DmlColumnContext::from_column_reg_mapping(pairs.into_iter());
     if targets
         .iter()
         .all(|&idx| !table.columns()[idx].is_rowid_alias())
@@ -2102,7 +2111,13 @@ pub(crate) fn emit_index_column_value_old_image(
             resolver,
         )?;
     } else {
-        program.emit_column_or_rowid(table_cursor_id, idx_col.pos_in_table, dest_reg);
+        emit_stored_column(
+            program,
+            table_cursor_id,
+            idx_col.pos_in_table,
+            dest_reg,
+            resolver,
+        )?;
     }
     Ok(())
 }

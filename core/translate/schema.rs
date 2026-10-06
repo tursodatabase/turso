@@ -1951,10 +1951,11 @@ pub fn translate_drop_table(
         let before_record_reg = if program.capture_data_changes_info().has_before() {
             Some(emit_cdc_full_record(
                 program,
+                resolver,
                 schema_table.columns(),
                 sqlite_schema_cursor_id_0,
                 row_id_reg,
-            ))
+            )?)
         } else {
             None
         };

@@ -1,6 +1,6 @@
 use crate::alloc::Arc;
 use crate::schema::Column;
-use crate::translate::expr::emit_table_column;
+use crate::translate::expr::{emit_stored_column, emit_table_column};
 use crate::vdbe::affinity::Affinity;
 use crate::vdbe::builder::SelfTableContext;
 use crate::{
@@ -768,7 +768,7 @@ fn emit_column(
     let col_value_reg = program.alloc_register();
     match col_ref {
         BoundIndexColumn::Column(idx) => {
-            program.emit_column_or_rowid(table_cursor_id, *idx, col_value_reg);
+            emit_stored_column(program, table_cursor_id, *idx, col_value_reg, resolver)?;
         }
         BoundIndexColumn::Expr(expr, affinity) => {
             let self_table_context =

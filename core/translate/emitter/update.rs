@@ -25,7 +25,7 @@ use crate::{
         eqp::eqp_detail_for_table_op,
         expr::{
             emit_dml_expr_index_value, emit_returning_results, emit_returning_scan_back,
-            emit_table_column, restore_returning_row_image_in_cache,
+            emit_stored_column, emit_table_column, restore_returning_row_image_in_cache,
             seed_returning_row_image_in_cache, translate_expr, translate_expr_no_constant_opt,
             NoConstantOptReason, ReturningBufferCtx,
         },
@@ -99,7 +99,7 @@ pub fn emit_program_for_update(
     resolver: &Resolver,
     program: &mut ProgramBuilder,
     mut plan: UpdatePlan,
-    after: impl FnOnce(&mut ProgramBuilder),
+    after: impl FnOnce(&mut ProgramBuilder) -> Result<()>,
 ) -> Result<()> {
     program.set_resolve_type(plan.or_conflict.unwrap_or(ResolveType::Abort));
     program
@@ -479,7 +479,7 @@ pub fn emit_program_for_update(
         program.emit_insn(Insn::FkCheck { deferred: false });
         emit_returning_scan_back(program, buf);
     }
-    after(program);
+    after(program)?;
 
     program.result_columns = plan.returning.unwrap_or_default();
     program.table_references.extend(write_phase_tables);
@@ -977,18 +977,21 @@ fn emit_update_column_values<'a>(
                             column: idx,
                             dest: target_reg,
                         });
+                    } else if let Some((index_cursor_id, index_column)) = column_ctx
+                        .index
+                        .as_ref()
+                        .zip(column_idx_in_index)
+                        .map(|((_, cursor_id), index_column)| (*cursor_id, index_column))
+                    {
+                        program.emit_column_or_rowid(index_cursor_id, index_column, target_reg);
                     } else {
-                        let cursor_id = column_ctx
-                            .index
-                            .as_ref()
-                            .filter(|_| column_idx_in_index.is_some())
-                            .map(|(_, id)| *id)
-                            .unwrap_or(column_ctx.target_table_cursor_id);
-                        program.emit_column_or_rowid(
-                            cursor_id,
-                            column_idx_in_index.unwrap_or(idx),
+                        emit_stored_column(
+                            program,
+                            column_ctx.target_table_cursor_id,
+                            idx,
                             target_reg,
-                        );
+                            &t_ctx.resolver,
+                        )?;
                     }
                 }
                 GeneratedType::Virtual { .. } => {
@@ -2313,10 +2316,11 @@ fn emit_update_insns<'a>(
             let cdc_before_reg = if program.capture_data_changes_info().has_before() {
                 Some(emit_cdc_full_record(
                     program,
+                    &t_ctx.resolver,
                     target_table.table.columns(),
                     target_table_cursor_id,
                     cdc_rowid_before_reg.expect("cdc_rowid_before_reg must be set"),
-                ))
+                )?)
             } else {
                 None
             };
