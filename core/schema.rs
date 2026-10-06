@@ -3416,8 +3416,6 @@ bitflags! {
         const STRICT            = 0b0000_0010;
         /// Table has an `AUTOINCREMENT` column.
         const HAS_AUTOINCREMENT = 0b0000_0100;
-        /// Table is declared `PGSTORAGE`.
-        const PG_STORAGE        = 0b0000_1000;
     }
 }
 
@@ -3590,7 +3588,7 @@ impl BTreeTable {
             columns,
             has_rowid,
             is_strict: characteristics.contains(BTreeCharacteristics::STRICT),
-            is_pg_storage: characteristics.contains(BTreeCharacteristics::PG_STORAGE),
+            is_pg_storage: false,
             has_autoincrement: characteristics.contains(BTreeCharacteristics::HAS_AUTOINCREMENT),
             unique_sets,
             foreign_keys,

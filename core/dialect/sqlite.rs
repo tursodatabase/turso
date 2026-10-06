@@ -55,15 +55,6 @@ impl super::Dialect for SqliteDialect {
         table_sql_for_replay(&canonical_table_sql(sql)?)
     }
 
-    fn format_table_sql(
-        &self,
-        _input: &str,
-        tbl_name: &turso_parser::ast::QualifiedName,
-        body: &turso_parser::ast::CreateTableBody,
-    ) -> crate::Result<String> {
-        format_table_sql(tbl_name, body)
-    }
-
     fn register_catalog(
         &self,
         schema: &mut Schema,

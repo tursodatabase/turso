@@ -5,9 +5,9 @@ use crate::LimboError;
 use crate::ext::VTabImpl;
 use crate::function::{Deterministic, Func, MathFunc, ScalarFunc};
 use crate::schema::{
-    create_table, translate_ident_to_string_literal, BTreeCharacteristics, BTreeTable, ColDef,
-    Column, SchemaObjectType, Table, Type, RESERVED_TABLE_PREFIXES, SQLITE_SEQUENCE_TABLE_NAME,
-    TURSO_TYPES_TABLE_NAME,
+    create_table, is_strict_primitive_type, translate_ident_to_string_literal,
+    BTreeCharacteristics, BTreeTable, ColDef, Column, SchemaObjectType, Table, Type,
+    RESERVED_TABLE_PREFIXES, SQLITE_SEQUENCE_TABLE_NAME, TURSO_TYPES_TABLE_NAME,
 };
 use crate::stats::STATS_TABLE;
 use crate::storage::pager::CreateBTreeFlags;
@@ -797,11 +797,7 @@ fn validate(
         for c in columns {
             if let Some(ref col_type) = c.col_type {
                 let type_name = &col_type.name;
-                let name_bytes = type_name.as_bytes();
-                let is_builtin = turso_macros::match_ignore_ascii_case!(match name_bytes {
-                    b"INT" | b"INTEGER" | b"REAL" | b"TEXT" | b"BLOB" | b"ANY" => true,
-                    _ => false,
-                });
+                let is_builtin = is_strict_primitive_type(type_name);
 
                 // Array columns require STRICT tables because the encode/decode
                 // pipeline is only emitted for STRICT tables.
@@ -1342,9 +1338,7 @@ pub fn translate_create_table(
     };
 
     // For CTAS, use the pre-built SQL string; for regular CREATE TABLE, let
-    // the schema dialect format the SQL to store (the SQLite dialect renders
-    // canonical text from the AST, a frontend dialect preserves its own
-    // input text).
+    // the schema dialect format the SQL to store.
     let sql = if let Some(ref info) = ctas_info {
         info.schema_sql.clone()
     } else {
@@ -2700,12 +2694,7 @@ pub fn translate_create_type(
 ) -> Result<()> {
     let normalized_name = normalize_ident(type_name);
 
-    // Reject names that shadow SQLite base types
-    let is_base_type = turso_macros::match_ignore_ascii_case!(match normalized_name.as_bytes() {
-        b"INT" | b"INTEGER" | b"REAL" | b"TEXT" | b"BLOB" | b"ANY" => true,
-        _ => false,
-    });
-    if is_base_type {
+    if is_strict_primitive_type(&normalized_name) {
         bail_parse_error!("cannot create type \"{normalized_name}\": name is a built-in type");
     }
     if has_reserved_type_prefix(&normalized_name) {
@@ -2855,12 +2844,7 @@ pub fn translate_create_domain(
 ) -> Result<()> {
     let normalized_name = normalize_ident(domain_name);
 
-    // Reject names that shadow SQLite base types
-    let is_base_type = turso_macros::match_ignore_ascii_case!(match normalized_name.as_bytes() {
-        b"INT" | b"INTEGER" | b"REAL" | b"TEXT" | b"BLOB" | b"ANY" => true,
-        _ => false,
-    });
-    if is_base_type {
+    if is_strict_primitive_type(&normalized_name) {
         bail_parse_error!("cannot create domain \"{normalized_name}\": name is a built-in type");
     }
     if has_reserved_type_prefix(&normalized_name) {

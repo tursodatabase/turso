@@ -26,7 +26,7 @@ pub struct TranslateResult {
 /// it again at every load. Such a table must keep the column types it was
 /// created with, so it uses `V1`, which never changes. New DDL uses `V2`.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub enum TypeMapping {
+enum TypeMapping {
     V1,
     #[default]
     V2,
@@ -4131,7 +4131,7 @@ fn is_serial_type(pg_type: &str) -> bool {
 /// built-in Turso type exists, otherwise returns the base SQLite type.
 /// For array types (e.g. `INTEGER[]`, `_int4`), returns the base scalar type
 /// with `array_dimensions > 0` so native Turso arrays are used.
-pub fn map_pg_type(pg_type: &str, params: &[i64], mapping: TypeMapping) -> Option<PgTypeMapping> {
+fn map_pg_type(pg_type: &str, params: &[i64], mapping: TypeMapping) -> Option<PgTypeMapping> {
     match mapping {
         TypeMapping::V1 | TypeMapping::V2 => map_pg_type_v1(pg_type, params),
     }

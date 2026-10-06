@@ -16,7 +16,7 @@ pub use sqlite::SqliteDialect;
 
 /// The text that older versions of the PostgreSQL frontend wrote before the
 /// PostgreSQL DDL of a table in `sqlite_schema`.
-pub const POSTGRES_TABLE_MARKER: &str = "/* turso_frontend:postgres */";
+const POSTGRES_TABLE_MARKER: &str = "/* turso_frontend:postgres */";
 
 /// The SQL of a `sqlite_schema` table row.
 pub enum StoredTableSql<'a> {
@@ -125,21 +125,22 @@ pub trait Dialect: Send + Sync + 'static {
     ///
     /// `input` is the original statement text as the user wrote it, in the
     /// frontend's dialect; `tbl_name` and `body` are the translated AST.
-    /// The built-in dialects store canonical SQLite text from the AST
+    /// The default stores canonical SQLite text from the AST
     /// ([`sqlite::format_table_sql`]), so every dialect loads the same table.
     fn format_table_sql(
         &self,
-        input: &str,
+        _input: &str,
         tbl_name: &turso_parser::ast::QualifiedName,
         body: &turso_parser::ast::CreateTableBody,
-    ) -> crate::Result<String>;
+    ) -> crate::Result<String> {
+        sqlite::format_table_sql(tbl_name, body)
+    }
 
     /// Produce stored SQL after the engine rewrites a `CREATE TABLE` AST.
     ///
     /// Schema rewrites cannot reuse the original frontend text because it no
-    /// longer describes the rewritten table. Dialects that need syntax beyond
-    /// a marker around canonical SQL can override this to render their native
-    /// table definition from the rewritten AST.
+    /// longer describes the rewritten table. A dialect that stores its own
+    /// syntax can override this to render it from the rewritten AST.
     fn format_rewritten_table_sql(&self, stmt: &turso_parser::ast::Stmt) -> crate::Result<String> {
         let turso_parser::ast::Stmt::CreateTable { tbl_name, body, .. } = stmt else {
             return Err(crate::LimboError::InternalError(

@@ -1706,7 +1706,6 @@ impl TableOptions {
         match flag {
             TableOptionsFlag::WithoutRowid => self.contains_without_rowid(),
             TableOptionsFlag::Strict => self.contains_strict(),
-            TableOptionsFlag::PgStorage => self.pg_storage,
         }
     }
 }
@@ -1716,7 +1715,6 @@ impl TableOptions {
 pub enum TableOptionsFlag {
     WithoutRowid,
     Strict,
-    PgStorage,
 }
 
 /// Sort orders

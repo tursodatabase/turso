@@ -88,15 +88,6 @@ impl Dialect for PostgresDialect {
         }
     }
 
-    fn format_table_sql(
-        &self,
-        _input: &str,
-        tbl_name: &turso_parser::ast::QualifiedName,
-        body: &turso_parser::ast::CreateTableBody,
-    ) -> Result<String> {
-        turso_core::dialect::sqlite::format_table_sql(tbl_name, body)
-    }
-
     fn register_catalog(&self, schema: &mut Schema, enable_custom_types: bool) -> Result<()> {
         turso_core::dialect::sqlite::register_builtin_catalog(schema, enable_custom_types)?;
         for vtab in pg_catalog_virtual_tables() {
