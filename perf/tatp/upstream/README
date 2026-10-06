@@ -1,0 +1,94 @@
+README.txt
+Telecom Application Transaction Processing (TATP) Benchmark v. 1.1.1 
+for Linux 64-bit (x86, AMD64, EM64) with solidDB
+Package build no. 1
+Date 2012-01-27
+
+Introduction 
+------------ 
+
+Telecom Application Transaction Processing (TATP) Benchmark Suite is a
+database benchmark designed to generate a database request load
+typical for a HLR (Home Location Register) database in the mobile
+networks.
+
+This software package includes all the necessary files to set up the
+benchmark environment and to execute the benchmark. In addition to the
+binary executables, the source code is present too.
+The executable binaries are built under Linux kernel version 2.6.16.60-0.54.5-smp, with gcc version 4.1.2 and glibc version 2.4.
+
+Note on the executables in this package: the TATP binaries have been linked with the solidDB 7.0 ODBC driver (dynamic library 'sacl2x6470.so'). The library is not included in the package. It has to be located in the library load path.
+
+Directories
+-----------
+bin/	- executables for the benchmark suite + the following input files:
+	  	- TATP initialization file (tatp.ini)
+		- transaction files for different DBMSs (e.g. tr_mix_solid.sql)
+		- target database initialization file (targetDBInit.sql)
+		- a generic target database schema file (targetDBSchema.sql)
+                - target database schema files for DB2 (targetDBSchema_db2.sql) 
+                  and Informix (targetDBSchema_ids.sql)
+                - an example Remote Nodes file (remoteNodes.ini)
+                - an example solidDB client-side configuration file (solid.ini)
+
+ddf/	- example Data Definition Files
+
+doc/	- user's guides (in PDF format)
+
+images/ - HTML help files
+
+source/ - source code and Makefile needed to build the TATP programs
+tdf/	- example Test Definition Files
+tirdb/	- input/result database (TIRDB) initialization files
+
+Root-level files
+-----------------
+README                   (this file)
+index.html               Welcome page, start from here!
+license_agreement.html   license texts
+tatp_relnotes.html       Release Notes
+tatp_faq.html            FAQ
+quick.html               Quick Start Guide for TATP trial
+solid_unixodbc.html      unixODBC Guide
+accelerator.html         Instructions for using solidDB Accelerator
+
+
+Running a trial of TATP
+-----------------------
+To try the TATP Suite software in a single computer, read 'quick.html'
+
+Preparing to run production TATP tests
+--------------------------------------
+The 'bin/' directory contains the executables and a set of input
+files needed to run the TATP benchmark. Of the input files, tatp.ini
+and a transaction file are mandatory to run the benchmark.
+
+You need to define a DDF (Data Definition File, example files are
+located in 'ddf/') and a TDF (Test Definition File, example
+files are located in 'tdf/') to run a benchmark.
+
+Prior to the first TATP run you may want to install the input/result
+database (TIRDB). Any database product supporting an ODBC connection
+can be used as TIRDB. Use the 'tirdb/tirdb.sql' script to
+create the TIRDB. The script 'tirdb/initDataExample.sql' can
+be used to feed initial data to TIRDB.
+
+Running the benchmark
+---------------------
+The TATP benchmark can be run directly from the bin/
+folder by issuing the command
+
+  tatp <parameters> file.ddf file1.tdf file2.tdf ...
+
+For more info, see 'index.html'
+
+Building TATP from source code
+------------------------------
+The included Makefile provides options for building TATP with unixODBC (product-agnostic driver manager), with static solidDB driver library, the solidDB Accelerator (LLA) library and solidDB shared memory access (SMA) library. See the Makefile for instructions.
+
+Contact and support
+-------------------
+
+http://sourceforge.net/projects/tatpbenchmark/
+
+Copyright IBM Corporation 2004, 2011.
