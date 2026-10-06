@@ -2,6 +2,7 @@ use crate::alloc::TryClone;
 use crate::error::io_error;
 #[cfg(any(test, injected_yields))]
 use crate::mvcc::yield_points::{FailureInjector, YieldInjector};
+use crate::security::roles::RoleCatalog;
 use crate::statement::StatementOrigin;
 use crate::storage::{journal_mode, pager::SavepointResult};
 use crate::sync::{
@@ -3849,6 +3850,14 @@ impl Connection {
 
     pub(crate) fn attached_databases(&self) -> &RwLock<DatabaseCatalog> {
         &self.attached_databases
+    }
+
+    /// Returns the roles of the main database as seen by this connection.
+    /// Outside a transaction, this includes roles that other connections
+    /// committed.
+    pub fn role_catalog(&self) -> Arc<RoleCatalog> {
+        self.maybe_update_schema();
+        self.with_schema(MAIN_DB_ID, |schema| schema.roles.clone())
     }
 
     /// Access schema for a database using a closure pattern to avoid cloning

@@ -688,6 +688,11 @@ impl ToTokens for Stmt {
                 }
                 Ok(())
             }
+            Self::CreateRole { role_name } => {
+                s.append(TK_CREATE, None)?;
+                s.append(TK_ID, Some("ROLE"))?;
+                s.append(TK_ID, Some(role_name))
+            }
             Self::CreateType {
                 if_not_exists,
                 type_name,

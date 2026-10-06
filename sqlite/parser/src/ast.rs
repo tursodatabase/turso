@@ -200,6 +200,11 @@ pub enum Stmt {
         /// type body
         body: CreateTypeBody,
     },
+    /// `CREATE ROLE`
+    CreateRole {
+        /// role name
+        role_name: String,
+    },
     /// `CREATE DOMAIN`
     CreateDomain {
         /// `IF NOT EXISTS`

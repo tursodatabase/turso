@@ -80,6 +80,7 @@ impl StmtClass {
             | Stmt::CreateVirtualTable(_)
             | Stmt::CreateType { .. }
             | Stmt::CreateDomain { .. }
+            | Stmt::CreateRole { .. }
             | Stmt::CreateSequence { .. }
             | Stmt::DropIndex { .. }
             | Stmt::DropTable { .. }

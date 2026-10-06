@@ -1985,6 +1985,21 @@ pub fn insn_to_row(
                 0,
                 "ADD TYPE".to_string(),
             ),
+            Insn::AddRole {
+                db,
+                id_reg,
+                name,
+                superuser,
+                can_login,
+            } => (
+                "AddRole",
+                *db as i64,
+                *id_reg as i64,
+                0,
+                Value::build_text(name.clone()),
+                0,
+                format!("add role {name} id=r[{id_reg}] superuser={superuser} can_login={can_login}"),
+            ),
             Insn::DropView { db, view_name } => (
                 "DropView",
                 *db as i64,
