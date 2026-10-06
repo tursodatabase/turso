@@ -490,10 +490,11 @@ impl<'a> Resolver<'a> {
                 .map(|temp_db| temp_db.db.schema.lock().clone())
                 .unwrap_or_else(|| {
                     // with_options only fails if built-in type SQL is malformed (programmer bug).
-                    Arc::new(
+                    let mut schema =
                         Schema::with_options(self.enable_custom_types, self.dialect.as_ref())
-                            .expect("built-in type definitions are malformed"),
-                    )
+                            .expect("built-in type definitions are malformed");
+                    schema.copy_table_valued_functions(self.schema);
+                    Arc::new(schema)
                 }),
             _ => {
                 let attached_dbs = self.attached_databases.read();

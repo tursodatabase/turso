@@ -239,7 +239,7 @@ impl OpenOptions {
     /// The dialect has no default: it is fixed at open time and shared by
     /// every user of the instance, so the caller must choose it explicitly.
     pub fn new(dialect: Arc<dyn Dialect>) -> Self {
-        Self {
+        let options = Self {
             storage: None,
             wal_path: None,
             flags: OpenFlags::default(),
@@ -249,8 +249,9 @@ impl OpenOptions {
             page_codec: None,
             durable_storage: None,
             allocators: DatabaseAllocators::default(),
-            dialect,
-        }
+            dialect: dialect.clone(),
+        };
+        dialect.register_native_extensions(options)
     }
 
     pub fn storage(mut self, storage: Arc<dyn DatabaseStorage>) -> Self {

@@ -11,6 +11,14 @@ pub trait VirtualTableModule: Debug + Send + Sync {
 
     fn schema(&self, args: &[Value]) -> Result<String>;
     fn create(&self, args: &[Value]) -> Result<Self::Table>;
+    /// Whether triggers can read tables created by this module.
+    /// Defaults to `false` because a trigger can call extension code as part
+    /// of an unrelated write.
+    /// Return `true` only if the module is safe to call this way.
+    /// This permits reads only, not writes from triggers.
+    fn innocuous(&self) -> bool {
+        false
+    }
 }
 
 pub trait VirtualTable: Debug + Send + Sync {
@@ -59,6 +67,7 @@ pub trait TableUpdate: Send + Sync {
 pub(crate) trait ModuleFactory: Debug + Send + Sync {
     fn schema(&self, args: &[Value]) -> Result<String>;
     fn create(&self, args: &[Value]) -> Result<NativeTable>;
+    fn innocuous(&self) -> bool;
 }
 
 impl<M: VirtualTableModule> ModuleFactory for M {
@@ -70,6 +79,10 @@ impl<M: VirtualTableModule> ModuleFactory for M {
         Ok(NativeTable(Arc::new(RwLock::new(Box::new(
             VirtualTableModule::create(self, args)?,
         )))))
+    }
+
+    fn innocuous(&self) -> bool {
+        VirtualTableModule::innocuous(self)
     }
 }
 

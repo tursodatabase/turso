@@ -731,29 +731,140 @@ fn native_table_functions_survive_mvcc_schema_refresh_and_other_connection_ddl()
 }
 
 #[test]
-fn native_cursors_close_at_done_in_explicit_transactions_and_triggers() {
+fn native_table_function_views_survive_checkpoint_and_reopen() {
+    for mvcc in [false, true] {
+        let io = Arc::new(MemoryIO::new());
+        let path = format!("native-view-{mvcc}.db");
+        let queue = Arc::new(Mutex::new(Vec::new()));
+        let module = RowsModule {
+            queue: queue.clone(),
+            rows: Arc::new(Mutex::new(vec![(1, 4), (2, 9), (3, 17)])),
+            events: Arc::new(Mutex::new(Vec::new())),
+            writable: false,
+        };
+        let open = || {
+            Database::open(
+                io.clone(),
+                &path,
+                OpenOptions::new(Arc::new(SqliteDialect))
+                    .db_opts(
+                        crate::DatabaseOpts::new()
+                            .with_views(true)
+                            .with_experimental_mvcc_passive_checkpoint(true),
+                    )
+                    .native_module("native_rows", VTabKind::TableValuedFunction, module.clone()),
+            )
+            .unwrap()
+        };
+        let columns = |conn: &Arc<Connection>| {
+            conn.prepare("SELECT name FROM pragma_table_info('native_view') ORDER BY cid")
+                .unwrap()
+                .run_collect_rows()
+                .unwrap()
+        };
+        let expected_columns = vec![
+            vec![Value::build_text("value")],
+            vec![Value::build_text("lower_bound")],
+        ];
+        {
+            let db = open();
+            let conn = db.connect().unwrap();
+            if mvcc {
+                conn.execute("PRAGMA journal_mode = 'mvcc'").unwrap();
+            }
+            conn.execute("CREATE VIEW native_view AS SELECT * FROM native_rows(8)")
+                .unwrap();
+            assert_eq!(columns(&conn), expected_columns);
+            conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+            assert_eq!(columns(&conn), expected_columns);
+        }
+        let db = open();
+        let conn = db.connect().unwrap();
+        assert_eq!(columns(&conn), expected_columns);
+        let mut stmt = conn
+            .prepare("SELECT value FROM native_view ORDER BY value")
+            .unwrap();
+        assert_eq!(
+            collect(&mut stmt, &queue),
+            vec![vec![Value::from_i64(9)], vec![Value::from_i64(17)]]
+        );
+    }
+}
+
+#[test]
+fn native_table_functions_survive_temp_table_rollback() {
     let queue = Arc::new(Mutex::new(Vec::new()));
     let conn = connection(OpenOptions::new(Arc::new(SqliteDialect)).native_module(
         "native_rows",
         VTabKind::TableValuedFunction,
         RowsModule {
             queue: queue.clone(),
-            rows: Arc::new(Mutex::new(vec![(1, 4), (2, 9)])),
+            rows: Arc::new(Mutex::new(vec![(1, 4), (2, 9), (3, 17)])),
             events: Arc::new(Mutex::new(Vec::new())),
             writable: false,
         },
     ));
+    let sql = "SELECT value FROM temp.native_rows(8)";
+    let expected = vec![vec![Value::from_i64(9)], vec![Value::from_i64(17)]];
+    let mut stmt = conn.prepare(sql).unwrap();
+    assert_eq!(collect(&mut stmt, &queue), expected);
+    conn.execute("BEGIN").unwrap();
+    conn.execute("CREATE TEMP TABLE temp_values(value)")
+        .unwrap();
+    conn.execute("ROLLBACK").unwrap();
+    let mut stmt = conn.prepare(sql).unwrap();
+    assert_eq!(collect(&mut stmt, &queue), expected);
+}
+
+#[test]
+fn native_modules_require_trigger_permission_for_both_table_kinds() {
+    for kind in [VTabKind::VirtualTable, VTabKind::TableValuedFunction] {
+        let module = RowsModule {
+            queue: Arc::new(Mutex::new(Vec::new())),
+            rows: Arc::new(Mutex::new(Vec::new())),
+            events: Arc::new(Mutex::new(Vec::new())),
+            writable: false,
+        };
+        let conn = connection(
+            OpenOptions::new(Arc::new(SqliteDialect))
+                .native_module("restricted_rows", kind, module.clone())
+                .native_module("allowed_rows", kind, InnocuousModule(module)),
+        );
+        if kind == VTabKind::VirtualTable {
+            conn.execute("CREATE VIRTUAL TABLE restricted USING restricted_rows")
+                .unwrap();
+            conn.execute("CREATE VIRTUAL TABLE allowed USING allowed_rows")
+                .unwrap();
+        }
+        for (name, expected) in if kind == VTabKind::VirtualTable {
+            [("restricted", false), ("allowed", true)]
+        } else {
+            [("restricted_rows", false), ("allowed_rows", true)]
+        } {
+            let table = conn.current_schema().get_table(name).unwrap();
+            let crate::schema::Table::Virtual(table) = table.as_ref() else {
+                panic!("expected virtual table {name}");
+            };
+            assert_eq!(table.innocuous, expected, "{name}");
+        }
+    }
+}
+
+#[test]
+fn native_cursors_close_at_done_in_explicit_transactions_and_triggers() {
+    let queue = Arc::new(Mutex::new(Vec::new()));
+    let conn = connection(OpenOptions::new(Arc::new(SqliteDialect)).native_module(
+        "native_rows",
+        VTabKind::TableValuedFunction,
+        InnocuousModule(RowsModule {
+            queue: queue.clone(),
+            rows: Arc::new(Mutex::new(vec![(1, 4), (2, 9)])),
+            events: Arc::new(Mutex::new(Vec::new())),
+            writable: false,
+        }),
+    ));
     conn.execute("CREATE TABLE parent(id INTEGER PRIMARY KEY)")
         .unwrap();
-    {
-        let mut schema = conn.schema.write();
-        let schema = crate::schema::Schema::try_make_mut(&mut schema).unwrap();
-        let table = schema.tables.get_mut("native_rows").unwrap();
-        let crate::schema::Table::Virtual(table) = Arc::make_mut(table) else {
-            unreachable!();
-        };
-        Arc::make_mut(table).innocuous = true;
-    }
     conn.execute("CREATE TRIGGER parent_insert AFTER INSERT ON parent BEGIN SELECT value FROM native_rows(8) LIMIT 1; END").unwrap();
     conn.execute("BEGIN").unwrap();
     let references = Arc::strong_count(&queue);
@@ -1400,6 +1511,25 @@ impl ArgumentsModule {
 }
 
 #[derive(Debug)]
+struct InnocuousModule<M>(M);
+
+impl<M: VirtualTableModule> VirtualTableModule for InnocuousModule<M> {
+    type Table = M::Table;
+
+    fn schema(&self, args: &[Value]) -> Result<String> {
+        self.0.schema(args)
+    }
+
+    fn create(&self, args: &[Value]) -> Result<Self::Table> {
+        self.0.create(args)
+    }
+
+    fn innocuous(&self) -> bool {
+        true
+    }
+}
+
+#[derive(Clone, Debug)]
 struct RowsModule {
     queue: Arc<Mutex<Vec<Completion>>>,
     rows: Arc<Mutex<Vec<(i64, i64)>>>,
