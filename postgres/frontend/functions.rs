@@ -38,7 +38,7 @@ pub(crate) fn exec_scalar(conn: &Connection, name: &str, args: &[Value]) -> Resu
         _ => String::new(),
     };
     match name {
-        "pg_get_userbyid" => Ok(exec_pg_get_user_by_id(int_arg(0, 0))),
+        "pg_get_userbyid" => Ok(exec_pg_get_user_by_id(conn, int_arg(0, 0))),
         "pg_table_is_visible" | "pg_function_is_visible" | "pg_type_is_visible" => {
             Ok(exec_pg_is_visible(int_arg(0, 0)))
         }
@@ -84,8 +84,14 @@ pub(crate) fn exec_scalar(conn: &Connection, name: &str, args: &[Value]) -> Resu
     }
 }
 
-fn exec_pg_get_user_by_id(_oid: i64) -> Value {
-    Value::build_text("turso")
+fn exec_pg_get_user_by_id(conn: &Connection, oid: i64) -> Value {
+    let name = conn
+        .role_catalog()
+        .iter()
+        .find(|role| crate::catalog::role_oid(role.id) == oid)
+        .map(|role| role.name.clone())
+        .unwrap_or_else(|| format!("unknown (OID={oid})"));
+    Value::build_text(name)
 }
 
 fn exec_pg_is_visible(_oid: i64) -> Value {

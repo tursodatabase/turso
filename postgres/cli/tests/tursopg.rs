@@ -422,8 +422,8 @@ fn du_lists_roles() {
     assert_eq!(output.status.code(), Some(0));
     let out = stdout(&output);
     assert!(
-        out.contains("turso"),
-        "\\du should list 'turso', got: {out}"
+        out.contains("postgres"),
+        "\\du should list 'postgres', got: {out}"
     );
 }
 
