@@ -1561,7 +1561,7 @@ pub fn op_vcreate(
     let args = if let Some(args_reg) = args_reg {
         if let Register::Record(rec) = &state.registers[*args_reg] {
             rec.iter()?
-                .map(|v| v.map(|v| v.to_ffi()))
+                .map(|v| Ok::<_, LimboError>(v?.to_owned()?))
                 .collect::<Result<_, _>>()?
         } else {
             mark_unlikely();

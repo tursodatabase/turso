@@ -12,21 +12,20 @@ pub(crate) enum ModuleImplementation {
 }
 
 impl ModuleImplementation {
-    pub(crate) fn create_schema(&self, args: Vec<turso_ext::Value>) -> Result<String> {
+    pub(crate) fn create_schema(&self, args: Vec<Value>) -> Result<String> {
         match self {
-            Self::C(module) => Ok(module.create_schema(args)?),
-            Self::Native(module) => module.schema(&native_args(args)?),
+            Self::C(module) => Ok(module.create_schema(args.iter().map(Value::to_ffi).collect())?),
+            Self::Native(module) => module.schema(&args),
         }
     }
 
-    pub(crate) fn create(&self, args: Vec<turso_ext::Value>) -> Result<(VirtualTableType, String)> {
+    pub(crate) fn create(&self, args: Vec<Value>) -> Result<(VirtualTableType, String)> {
         let (table, schema) = match self {
             Self::C(module) => {
                 let (table, schema) = ExtVirtualTable::create(module.clone(), args)?;
                 (ExtensionTable::C(table), schema)
             }
             Self::Native(module) => {
-                let args = native_args(args)?;
                 let schema = module.schema(&args)?;
                 (ExtensionTable::Native(module.create(&args)?), schema)
             }
@@ -38,7 +37,7 @@ impl ModuleImplementation {
 pub(crate) fn create_virtual_table(
     module_name: &str,
     module: Option<&Arc<super::VTabImpl>>,
-    args: Vec<turso_ext::Value>,
+    args: Vec<Value>,
     kind: VTabKind,
 ) -> Result<(VirtualTableType, String)> {
     let module = module.ok_or_else(|| {
@@ -54,23 +53,6 @@ pub(crate) fn create_virtual_table(
         )));
     }
     module.implementation.create(args)
-}
-
-fn native_args(args: Vec<turso_ext::Value>) -> Result<Vec<Value>> {
-    let mut values = Vec::with_capacity(args.len());
-    let mut error = None;
-    for arg in args {
-        match Value::from_ffi(arg) {
-            Ok(value) => values.push(value),
-            Err(err) => {
-                error.get_or_insert(err);
-            }
-        }
-    }
-    match error {
-        Some(error) => Err(error),
-        None => Ok(values),
-    }
 }
 
 #[derive(Clone, Debug)]
