@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.8.2 -- 2026-10-06
+
+### Updated
+
+* bindings/dotnet: pool local databases in Turso.Data.Sqlite (Marc-André Moreau)
+* scripts: preserve external dependencies when updating versions (Pekka Enberg)
+* sync: rename and drop columns when an MVCC pull refreshes a table (Mikaël Francoeur)
+
+### Fixed
+
+* sync: fix table refresh replay for tables with generated columns (Mikaël Francoeur)
+
 ## 0.8.1 -- 2026-09-29
 
 ### Updated
