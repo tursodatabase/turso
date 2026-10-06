@@ -1,5 +1,4 @@
-use std::sync::Arc;
-use turso_core::schema::{Schema, Table};
+use turso_core::schema::Table;
 use turso_core::{Connection, LimboError, Result, Value};
 use turso_parser::ast::RefAct;
 
@@ -257,25 +256,6 @@ fn exec_pg_get_expr(args: &[Value]) -> Result<Value> {
     }
 }
 
-fn user_tables_sorted(schema: &Schema) -> Vec<(&String, &Arc<Table>)> {
-    let mut tables: Vec<_> = schema
-        .tables
-        .iter()
-        .filter(|(name, table)| {
-            if name.starts_with("sqlite_")
-                || name.starts_with("pg_")
-                || name.starts_with("pragma_")
-                || name.starts_with("json_")
-            {
-                return false;
-            }
-            matches!(table.as_ref(), Table::BTree(_))
-        })
-        .collect();
-    tables.sort_by_key(|(name, _)| *name);
-    tables
-}
-
 fn ref_act_to_char(act: &RefAct) -> &'static str {
     match act {
         RefAct::NoAction => "a",
@@ -298,7 +278,7 @@ fn ref_act_to_sql(code: &str) -> &'static str {
 
 fn pg_get_constraintdef(conn: &Connection, target_oid: i64) -> Option<String> {
     let schema = conn.current_schema();
-    let tables = user_tables_sorted(&schema);
+    let tables = crate::catalog::user_tables_sorted(&schema);
     let num_tables = tables.len() as i64;
 
     let mut next_index_oid = USER_TABLE_OID_START + num_tables;
@@ -378,7 +358,7 @@ fn pg_get_constraintdef(conn: &Connection, target_oid: i64) -> Option<String> {
 
 fn pg_get_indexdef(conn: &Connection, target_oid: i64) -> Option<String> {
     let schema = conn.current_schema();
-    let tables = user_tables_sorted(&schema);
+    let tables = crate::catalog::user_tables_sorted(&schema);
     let num_tables = tables.len() as i64;
 
     let mut index_oid = USER_TABLE_OID_START + num_tables;

@@ -3,7 +3,7 @@ use parking_lot::RwLock;
 use rustc_hash::FxHashMap as HashMap;
 use std::sync::Arc;
 use turso_core::{
-    schema::{BTreeTable, Schema, Table},
+    schema::{BTreeTable, Schema, Table, TURSO_INTERNAL_PREFIX},
     security::roles::{Role, RoleId, SUPERUSER_NAME},
     Connection, Dialect, Func, InternalVirtualTable, InternalVirtualTableCursor, LimboError,
     Result, Value, VirtualTable,
@@ -203,13 +203,14 @@ pub fn decode_stored_pg_schema_sql(sql: &str) -> Option<&str> {
 
 /// Returns an iterator of (table_name, table_ref) for user tables in deterministic order.
 /// Both pg_class and pg_attribute must use this function to ensure consistent OID assignment.
-fn user_tables_sorted(schema: &Schema) -> Vec<(&String, &Arc<Table>)> {
+pub(crate) fn user_tables_sorted(schema: &Schema) -> Vec<(&String, &Arc<Table>)> {
     let mut tables: Vec<_> = schema
         .tables
         .iter()
         .filter(|(name, table)| {
             // Skip system tables
             if name.starts_with("sqlite_")
+                || name.starts_with(TURSO_INTERNAL_PREFIX)
                 || name.starts_with("pg_")
                 || name.starts_with("pragma_")
                 || name.starts_with("json_")

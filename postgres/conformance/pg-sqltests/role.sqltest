@@ -102,3 +102,35 @@ test create-role-committed-is-listed {
 expect {
     cr_committed
 }
+
+test pg-tables-does-not-list-the-roles-table {
+    CREATE ROLE pt_role;
+    SELECT count(*) FROM pg_tables WHERE tablename LIKE '%roles%';
+}
+expect {
+    0
+}
+
+test pg-get-indexdef-finds-index-after-create-role {
+    CREATE TABLE gi_table (x int);
+    CREATE INDEX gi_index ON gi_table (x);
+    CREATE ROLE gi_role;
+    SELECT CASE
+        WHEN pg_get_indexdef(i.indexrelid) LIKE 'CREATE INDEX gi_index ON %' THEN 'found'
+        ELSE 'missing'
+    END
+    FROM pg_index i JOIN pg_class c ON c.oid = i.indexrelid
+    WHERE c.relname = 'gi_index';
+}
+expect {
+    found
+}
+
+test pg-get-constraintdef-finds-constraint-after-create-role {
+    CREATE TABLE gc_table (x int PRIMARY KEY);
+    CREATE ROLE gc_role;
+    SELECT pg_get_constraintdef(oid) FROM pg_constraint WHERE conname = 'gc_table_pkey';
+}
+expect {
+    PRIMARY KEY (x)
+}
