@@ -785,6 +785,29 @@ impl Expr {
             _ => true,
         }
     }
+
+    /// Whether `DEFAULT <self>` parses back without parentheses. The column
+    /// DEFAULT grammar accepts only a literal, a signed literal, a name or a
+    /// parenthesized expression.
+    pub fn parses_after_default_without_parens(&self) -> bool {
+        match self {
+            Expr::Literal(literal) => !matches!(literal, Literal::Keyword(_)),
+            Expr::Id(_) | Expr::Parenthesized(_) => true,
+            Expr::Unary(UnaryOperator::Positive | UnaryOperator::Negative, operand) => matches!(
+                operand.as_ref(),
+                Expr::Literal(
+                    Literal::Numeric(_)
+                        | Literal::String(_)
+                        | Literal::Blob(_)
+                        | Literal::Null
+                        | Literal::CurrentDate
+                        | Literal::CurrentTime
+                        | Literal::CurrentTimestamp
+                )
+            ),
+            _ => false,
+        }
+    }
 }
 
 /// SQL literal

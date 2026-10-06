@@ -3736,8 +3736,11 @@ impl BTreeTable {
             }
 
             if let Some(default) = &column.default {
-                sql.push_str(" DEFAULT ");
-                sql.push_str(&default.to_string());
+                if default.parses_after_default_without_parens() {
+                    sql.push_str(&format!(" DEFAULT {default}"));
+                } else {
+                    sql.push_str(&format!(" DEFAULT ({default})"));
+                }
             }
 
             if let Some(collation) = column.collation_opt() {

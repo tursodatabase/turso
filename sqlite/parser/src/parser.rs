@@ -5467,6 +5467,82 @@ mod tests {
     }
 
     #[test]
+    fn default_literals_and_names_are_printed_without_parentheses() {
+        let sql = "CREATE TABLE t (a DEFAULT 1, b DEFAULT - 1, c DEFAULT + 1.5, d DEFAULT 'x', e DEFAULT NULL, f DEFAULT CURRENT_TIMESTAMP, g DEFAULT TRUE, h DEFAULT X'00', i DEFAULT name, j DEFAULT (1 + 2), k DEFAULT - 'x')";
+        let command = Parser::new(sql.as_bytes()).next_cmd().unwrap().unwrap();
+        assert_eq!(command.to_string(), format!("{sql};"));
+    }
+
+    #[test]
+    fn default_expressions_are_printed_in_parentheses() {
+        let column = |constraint_expr: Expr| ColumnDefinition {
+            col_name: Name::exact("a".to_string()),
+            col_type: None,
+            constraints: vec![NamedColumnConstraint {
+                name: None,
+                constraint: ColumnConstraint::Default(Box::new(constraint_expr)),
+            }],
+        };
+        let string = |s: &str| Expr::Literal(Literal::String(format!("'{s}'")));
+        let call = Expr::FunctionCall {
+            name: Name::exact("nextval".to_string()),
+            distinctness: None,
+            args: vec![Box::new(string("t_id_seq"))],
+            order_by: vec![],
+            within_group: vec![],
+            filter_over: FunctionTail {
+                filter_clause: None,
+                over_clause: None,
+            },
+        };
+        let defaults = [
+            (call, "(nextval ('t_id_seq'))"),
+            (
+                Expr::cast(
+                    string("a"),
+                    Some(Type {
+                        name: "TEXT".to_string(),
+                        size: None,
+                        array_dimensions: 0,
+                    }),
+                ),
+                "(CAST ('a' AS TEXT))",
+            ),
+            (
+                Expr::binary(string("a"), Operator::Concat, string("b")),
+                "('a' || 'b')",
+            ),
+            (
+                Expr::unary(
+                    UnaryOperator::Negative,
+                    Expr::Id(Name::exact("x".to_string())),
+                ),
+                "(- x)",
+            ),
+            (
+                Expr::unary(UnaryOperator::Negative, Expr::Literal(Literal::True)),
+                "(- TRUE)",
+            ),
+        ];
+        for (default, printed) in defaults {
+            let create = Stmt::CreateTable {
+                temporary: false,
+                if_not_exists: false,
+                tbl_name: QualifiedName::single(Name::exact("t".to_string())),
+                body: CreateTableBody::ColumnsAndConstraints {
+                    columns: vec![column(default)],
+                    constraints: vec![],
+                    options: TableOptions::empty(),
+                },
+            };
+            let sql = create.to_string();
+            assert_eq!(sql, format!("CREATE TABLE t (a DEFAULT {printed})"));
+            let parsed = Parser::new(sql.as_bytes()).next_cmd().unwrap().unwrap();
+            assert_eq!(parsed.to_string(), format!("{sql};"));
+        }
+    }
+
+    #[test]
     fn test_variable_index_bounds() {
         for sql in ["SELECT ?0", "SELECT ?250001"] {
             let mut p = Parser::new(sql.as_bytes());

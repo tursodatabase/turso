@@ -34,6 +34,7 @@ unsafe impl Send for TempDatabase {}
 #[derive(Debug, Default, Clone)]
 pub struct TempDatabaseBuilder {
     db_name: Option<String>,
+    db_path: Option<PathBuf>,
     opts: Option<turso_core::DatabaseOpts>,
     init_sql: Option<String>,
     enable_mvcc: bool,
@@ -119,6 +120,7 @@ impl TempDatabaseBuilder {
     pub const fn new() -> Self {
         Self {
             db_name: None,
+            db_path: None,
             opts: None,
             init_sql: None,
             enable_mvcc: false,
@@ -128,6 +130,13 @@ impl TempDatabaseBuilder {
 
     pub fn with_db_name(mut self, db_name: impl AsRef<str>) -> Self {
         self.db_name = Some(db_name.as_ref().to_string());
+        self
+    }
+
+    /// Open the database file at `path` instead of a new file.
+    #[allow(dead_code)]
+    pub fn with_db_path(mut self, path: impl Into<PathBuf>) -> Self {
+        self.db_path = Some(path.into());
         self
     }
 
@@ -166,12 +175,15 @@ impl TempDatabaseBuilder {
             opts = opts.with_views(true);
         }
 
-        let db_name = self
-            .db_name
-            .unwrap_or_else(|| format!("test-{}.db", rng().next_u32()));
-        let temp_dir = TempDir::new().unwrap();
-        let db_path = temp_dir.path().join(db_name);
-        delete_at_process_exit(temp_dir);
+        let db_path = self.db_path.unwrap_or_else(|| {
+            let db_name = self
+                .db_name
+                .unwrap_or_else(|| format!("test-{}.db", rng().next_u32()));
+            let temp_dir = TempDir::new().unwrap();
+            let db_path = temp_dir.path().join(db_name);
+            delete_at_process_exit(temp_dir);
+            db_path
+        });
 
         if let Some(init_sql) = &self.init_sql {
             let connection = rusqlite::Connection::open(&db_path).unwrap();
@@ -218,5 +230,13 @@ impl TempDatabase {
 
     pub fn connect_postgres(&self) -> Connection {
         Connection::new(self.connect_limbo())
+    }
+
+    /// Close the database and open its file again.
+    #[allow(dead_code)]
+    pub fn reopen(self) -> TempDatabase {
+        let path = self.path.clone();
+        drop(self);
+        TempDatabase::builder().with_db_path(path).build()
     }
 }

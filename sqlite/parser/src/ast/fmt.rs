@@ -1830,7 +1830,12 @@ impl ToTokens for ColumnConstraint {
             }
             Self::Default(expr) => {
                 s.append(TK_DEFAULT, None)?;
-                expr.to_tokens(s, context)
+                if expr.parses_after_default_without_parens() {
+                    return expr.to_tokens(s, context);
+                }
+                s.append(TK_LP, None)?;
+                expr.to_tokens(s, context)?;
+                s.append(TK_RP, None)
             }
             Self::Collate { collation_name } => {
                 s.append(TK_COLLATE, None)?;
