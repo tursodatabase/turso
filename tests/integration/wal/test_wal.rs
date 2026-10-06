@@ -389,3 +389,40 @@ fn test_synchronous_off_does_not_fsync_the_wal() -> anyhow::Result<()> {
     );
     Ok(())
 }
+
+#[test]
+fn test_close_fsyncs_the_wal_only_when_the_close_checkpoint_does_not() -> anyhow::Result<()> {
+    for (sync_mode, checkpoint_on_close, expected_wal_syncs) in [
+        ("OFF", true, 0),
+        ("NORMAL", true, 2),
+        ("FULL", true, 1),
+        ("NORMAL", false, 1),
+    ] {
+        let db_path_sim = format!("close-wal-fsyncs-{sync_mode}-{checkpoint_on_close}.db");
+        let wal_path_sim = format!("{db_path_sim}-wal");
+        let io = Arc::new(UnreliableIo::new());
+        let db = Database::open_file(io.clone(), &db_path_sim, Arc::new(SqliteDialect))?;
+        let conn = db.connect()?;
+        conn.execute(format!("PRAGMA synchronous={sync_mode}"))?;
+        if !checkpoint_on_close {
+            conn.wal_auto_actions_disable();
+        }
+        conn.execute("CREATE TABLE t(x)")?;
+        conn.execute("INSERT INTO t VALUES (1)")?;
+
+        let wal_syncs_before = io.sync_count(&wal_path_sim);
+        conn.close()?;
+        assert_eq!(
+            io.sync_count(&wal_path_sim) - wal_syncs_before,
+            expected_wal_syncs,
+            "WAL fsyncs at close with synchronous={sync_mode}, checkpoint on close: {checkpoint_on_close}"
+        );
+        if sync_mode != "OFF" {
+            assert!(
+                !io.has_unsynced_writes(&db_path_sim) && !io.has_unsynced_writes(&wal_path_sim),
+                "close with synchronous={sync_mode} left writes that no fsync covers"
+            );
+        }
+    }
+    Ok(())
+}

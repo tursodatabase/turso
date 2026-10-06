@@ -5478,38 +5478,42 @@ impl Pager {
         allowed_auto_actions: WalAutoActions,
         sync_mode: crate::SyncMode,
     ) -> Result<()> {
-        let mut attempts = 0;
+        let Some(wal) = self.wal.as_ref() else {
+            turso_soft_unreachable!("checkpoint_shutdown() called on database without WAL");
+            return Err(LimboError::InternalError(
+                "checkpoint_shutdown() called on database without WAL".to_string(),
+            ));
+        };
+        if allowed_auto_actions.contains(WalAutoActions::Checkpoint)
+            && self.truncate_checkpoint_on_shutdown(sync_mode)
         {
-            let Some(wal) = self.wal.as_ref() else {
-                turso_soft_unreachable!("checkpoint_shutdown() called on database without WAL");
-                return Err(LimboError::InternalError(
-                    "checkpoint_shutdown() called on database without WAL".to_string(),
-                ));
-            };
-            // fsync the wal syncronously before beginning checkpoint
+            // TODO: delete the WAL file here after truncate checkpoint, but *only* if we are sure that
+            // no other connections have opened since.
+            return Ok(());
+        }
+        if sync_mode != crate::SyncMode::Off {
             let c = wal.sync(self.get_sync_type())?;
             self.io.wait_for_completion(c)?;
         }
-        if allowed_auto_actions.contains(WalAutoActions::Checkpoint) {
-            while let Err(LimboError::Busy) = self.blocking_checkpoint(
+        Ok(())
+    }
+
+    fn truncate_checkpoint_on_shutdown(&self, sync_mode: crate::SyncMode) -> bool {
+        for _ in 0..4 {
+            match self.blocking_checkpoint(
                 CheckpointMode::Truncate {
                     upper_bound_inclusive: None,
                 },
                 sync_mode,
             ) {
-                if attempts == 3 {
-                    // don't return error on `close` if we are unable to checkpoint, we can silently fail
-                    tracing::warn!(
-                        "Failed to checkpoint WAL on shutdown after 3 attempts, giving up"
-                    );
-                    return Ok(());
-                }
-                attempts += 1;
+                Ok(_) => return true,
+                Err(LimboError::Busy) => continue,
+                Err(_) => return false,
             }
         }
-        // TODO: delete the WAL file here after truncate checkpoint, but *only* if we are sure that
-        // no other connections have opened since.
-        Ok(())
+        // don't return error on `close` if we are unable to checkpoint, we can silently fail
+        tracing::warn!("Failed to checkpoint WAL on shutdown after 3 attempts, giving up");
+        false
     }
 
     /// Perform a blocking checkpoint with the specified mode.
