@@ -692,7 +692,7 @@ pub enum SubqueryType {
         num_regs: usize,
     },
     /// IN subquery; result is stored in an ephemeral index.
-    /// Example: x <NOT> IN (SELECT ...)
+    /// Example: `x <NOT> IN (SELECT ...)`
     In {
         cursor_id: usize,
         /// Affinity string used by the IN operator probe and ephemeral materialization.
@@ -1323,7 +1323,7 @@ impl Name {
 
     /// Checks if a name represents a quoted string that should get fallback behavior
     /// Need to detect legacy conversion of double quoted keywords to string literals
-    /// (see https://sqlite.org/lang_keywords.html)
+    /// (see <https://sqlite.org/lang_keywords.html>)
     ///
     /// Also, used to detect string literals in PRAGMA cases
     pub fn quoted_with(&self, quote: char) -> bool {
@@ -1877,7 +1877,7 @@ pub enum PragmaName {
     ApplicationId,
     /// set the autovacuum mode
     AutoVacuum,
-    /// set the busy_timeout (see https://www.sqlite.org/pragma.html#pragma_busy_timeout)
+    /// set the busy_timeout (see <https://www.sqlite.org/pragma.html#pragma_busy_timeout>)
     BusyTimeout,
     /// `cache_size` pragma
     CacheSize,
@@ -1940,7 +1940,7 @@ pub enum PragmaName {
     SchemaVersion,
     /// Deprecated: control whether unaliased column names omit the table name prefix
     ShortColumnNames,
-    /// Alias for `require_where` pragma, as an homage to MySQL (https://dev.mysql.com/doc/refman/9.6/en/mysql-tips.html#safe-updates)
+    /// Alias for `require_where` pragma, as an homage to MySQL (<https://dev.mysql.com/doc/refman/9.6/en/mysql-tips.html#safe-updates>)
     IAmADummy,
     /// Reject DELETE/UPDATE without WHERE clause
     RequireWhere,
