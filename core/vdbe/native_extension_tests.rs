@@ -731,6 +731,109 @@ fn native_table_functions_survive_mvcc_schema_refresh_and_other_connection_ddl()
 }
 
 #[test]
+fn native_table_function_view_columns_survive_refresh_reopen_and_checkpoint() {
+    for mvcc in [false, true] {
+        let io = Arc::new(MemoryIO::new());
+        let path = format!("native-view-{mvcc}.db");
+        let queue = Arc::new(Mutex::new(Vec::new()));
+        let module = RowsModule {
+            queue: queue.clone(),
+            rows: Arc::new(Mutex::new(vec![(1, 4), (2, 9), (3, 17)])),
+            events: Arc::new(Mutex::new(Vec::new())),
+            writable: false,
+        };
+        let open = || {
+            Database::open(
+                io.clone(),
+                &path,
+                OpenOptions::new(Arc::new(SqliteDialect))
+                    .db_opts(
+                        crate::DatabaseOpts::new()
+                            .with_views(true)
+                            .with_experimental_mvcc_passive_checkpoint(true),
+                    )
+                    .native_module("native_rows", VTabKind::TableValuedFunction, module.clone()),
+            )
+            .unwrap()
+        };
+        let columns = |conn: &Arc<Connection>| {
+            conn.prepare("SELECT name FROM pragma_table_info('native_view') ORDER BY cid")
+                .unwrap()
+                .run_collect_rows()
+                .unwrap()
+        };
+        let expected_columns = vec![
+            vec![Value::build_text("value")],
+            vec![Value::build_text("lower_bound")],
+        ];
+        {
+            let db = open();
+            let conn = db.connect().unwrap();
+            if mvcc {
+                conn.execute("PRAGMA journal_mode = 'mvcc'").unwrap();
+            }
+            conn.execute("CREATE VIEW native_view AS SELECT * FROM native_rows(8)")
+                .unwrap();
+            conn.execute(
+                "CREATE VIEW native_join AS WITH existing AS (SELECT value FROM native_view WHERE value > 10) SELECT existing.value FROM existing JOIN native_rows USING(value)",
+            )
+            .unwrap();
+            assert_eq!(columns(&conn), expected_columns);
+            conn.force_reparse_schema_without_publish().unwrap();
+            assert_eq!(columns(&conn), expected_columns);
+            let mut stmt = conn
+                .prepare("SELECT value FROM native_view ORDER BY value")
+                .unwrap();
+            assert_eq!(
+                collect(&mut stmt, &queue),
+                vec![vec![Value::from_i64(9)], vec![Value::from_i64(17)]]
+            );
+        }
+        let db = open();
+        let conn = db.connect().unwrap();
+        assert_eq!(columns(&conn), expected_columns);
+        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+        conn.force_reparse_schema_without_publish().unwrap();
+        assert_eq!(columns(&conn), expected_columns);
+        let mut stmt = conn.prepare("SELECT value FROM native_join").unwrap();
+        assert_eq!(collect(&mut stmt, &queue), vec![vec![Value::from_i64(17)]]);
+    }
+}
+
+#[test]
+fn native_table_functions_remain_in_empty_temp_schema_after_rollback() {
+    let queue = Arc::new(Mutex::new(Vec::new()));
+    let conn = connection(OpenOptions::new(Arc::new(SqliteDialect)).native_module(
+        "native_rows",
+        VTabKind::TableValuedFunction,
+        RowsModule {
+            queue: queue.clone(),
+            rows: Arc::new(Mutex::new(vec![(1, 4), (2, 9), (3, 17)])),
+            events: Arc::new(Mutex::new(Vec::new())),
+            writable: false,
+        },
+    ));
+    for (sql, expected) in [
+        (
+            "SELECT value FROM temp.native_rows(8)",
+            vec![vec![Value::from_i64(9)], vec![Value::from_i64(17)]],
+        ),
+        (
+            "SELECT value FROM temp.native_rows(16)",
+            vec![vec![Value::from_i64(17)]],
+        ),
+    ] {
+        let mut stmt = conn.prepare(sql).unwrap();
+        assert_eq!(collect(&mut stmt, &queue), expected);
+        conn.execute("BEGIN").unwrap();
+        conn.execute("CREATE TEMP TABLE temp_values(value)")
+            .unwrap();
+        conn.execute("ROLLBACK").unwrap();
+        assert!(conn.empty_temp_schema().get_table("native_rows").is_some());
+    }
+}
+
+#[test]
 fn native_modules_require_trigger_permission_for_both_table_kinds() {
     for kind in [VTabKind::VirtualTable, VTabKind::TableValuedFunction] {
         let module = RowsModule {
@@ -795,6 +898,68 @@ fn native_cursors_close_at_done_in_explicit_transactions_and_triggers() {
     assert_eq!(Arc::strong_count(&queue), references);
     conn.execute("COMMIT").unwrap();
     assert_eq!(Arc::strong_count(&queue), references);
+}
+
+#[test]
+fn suspended_internal_helper_does_not_change_sibling_writer_accounting() {
+    let queue = Arc::new(Mutex::new(Vec::new()));
+    let conn = connection(OpenOptions::new(Arc::new(SqliteDialect)).native_module(
+        "native_rows",
+        VTabKind::TableValuedFunction,
+        RowsModule {
+            queue,
+            rows: Arc::new(Mutex::new(vec![(1, 9)])),
+            events: Arc::new(Mutex::new(Vec::new())),
+            writable: false,
+        },
+    ));
+    conn.execute("CREATE TABLE writes(value)").unwrap();
+    assert!(conn
+        .prepare_internal("SELECT * FROM missing_helper_table")
+        .is_err());
+    assert!(!conn.is_nested_stmt());
+    let mut helper = conn
+        .prepare_internal("SELECT value FROM native_rows(8)")
+        .unwrap();
+    assert!(!conn.is_nested_stmt());
+    assert!(matches!(helper.step().unwrap(), StepResult::IO));
+    assert!(!conn.is_nested_stmt());
+    assert!(matches!(helper.step().unwrap(), StepResult::IO));
+    assert!(!conn.is_nested_stmt());
+
+    let mut writer = conn
+        .prepare("INSERT INTO writes VALUES (7) RETURNING value")
+        .unwrap();
+    assert!(matches!(writer.step().unwrap(), StepResult::Row));
+    assert_eq!(writer.row().unwrap().get_value(0), &Value::from_i64(7));
+    let mut sibling = conn.prepare("INSERT INTO writes SELECT 9").unwrap();
+    let result = sibling.step();
+    assert!(
+        matches!(
+            result,
+            Err(LimboError::StatementsInProgress(
+                "cannot start a write statement"
+            ))
+        ),
+        "unexpected sibling result: {result:?}"
+    );
+    drop(sibling);
+    helper.reset().unwrap();
+    assert!(!conn.is_nested_stmt());
+    drop(helper);
+    assert!(!conn.is_nested_stmt());
+    writer.run_ignore_rows().unwrap();
+    drop(writer);
+    conn.execute("INSERT INTO writes VALUES (11)").unwrap();
+    let observer = conn.db.connect().unwrap();
+    assert_eq!(
+        observer
+            .prepare("SELECT value FROM writes ORDER BY value")
+            .unwrap()
+            .run_collect_rows()
+            .unwrap(),
+        vec![vec![Value::from_i64(7)], vec![Value::from_i64(11)]]
+    );
 }
 
 #[test]
