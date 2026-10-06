@@ -33,6 +33,15 @@ pub trait Dialect: Send + Sync + 'static {
     /// reject an open whose dialect differs from the already-open instance.
     fn name(&self) -> &'static str;
 
+    /// The names of the built-in superuser and `public` roles, as this
+    /// dialect's users see them.
+    fn builtin_role_names(&self) -> crate::security::roles::BuiltinRoleNames {
+        crate::security::roles::BuiltinRoleNames {
+            superuser: "superuser",
+            public: "public",
+        }
+    }
+
     /// Parse the first statement in `sql` into the engine AST.
     ///
     /// Returns the parsed command, if any, and the number of input bytes
