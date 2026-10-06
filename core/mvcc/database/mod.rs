@@ -8246,7 +8246,8 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
             .iter()
             .filter_map(|entry| {
                 let tx_id = *entry.key();
-                (!referenced_tx_ids.contains(&tx_id)).then_some(tx_id)
+                let still_retiring = self.txs.contains_key(&tx_id);
+                (!referenced_tx_ids.contains(&tx_id) && !still_retiring).then_some(tx_id)
             })
             .collect();
 
