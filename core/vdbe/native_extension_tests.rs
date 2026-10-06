@@ -12,11 +12,24 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use turso_ext::{ConstraintOp, ResultCode, VTabCursor, VTabModule, VTable};
 
 #[test]
-fn extension_functions_validate_argument_counts() {
+fn extension_constructors_validate_argument_counts() {
     for (argc, valid) in [(-2, false), (-1, true), (0, true), (2, true)] {
         let queue = Arc::new(Mutex::new(Vec::new()));
         let functions = [
             ExternalFunc::new_scalar("c_double".into(), argc, true, 0, c_double, None, None),
+            ExternalFunc::new_aggregate(
+                "c_aggregate".into(),
+                argc,
+                0,
+                (
+                    unused_aggregate_init,
+                    unused_aggregate_step,
+                    unused_aggregate_finalize,
+                ),
+                None,
+                None,
+                None,
+            ),
             ExternalFunc::new_native_scalar(
                 "delayed".into(),
                 argc,
@@ -36,10 +49,12 @@ fn extension_functions_validate_argument_counts() {
                 },
             ),
         ];
-        for function in functions {
-            let result = OpenOptions::new(Arc::new(SqliteDialect)).extension_function(function);
+        for result in functions {
             if valid {
-                let options = result.unwrap();
+                let function = result.unwrap();
+                assert_eq!(function.func.arg_count(), argc);
+                let options =
+                    OpenOptions::new(Arc::new(SqliteDialect)).extension_function(function);
                 assert_eq!(options.native_extensions.functions.len(), 1);
                 assert_eq!(
                     options.native_extensions.functions[0].func.arg_count(),
@@ -53,13 +68,94 @@ fn extension_functions_validate_argument_counts() {
 }
 
 #[test]
+fn rejected_c_functions_leave_context_ownership_with_the_caller() {
+    let conn = connection(OpenOptions::new(Arc::new(SqliteDialect)));
+    let api = unsafe { conn._build_turso_ext() };
+    let name = std::ffi::CString::new("rejected").unwrap();
+    let function_count = conn.syms.read().functions.len();
+    for aggregate in [false, true] {
+        for register in [false, true] {
+            let drops = Arc::new(AtomicUsize::new(0));
+            let context = Box::into_raw(Box::new(drops.clone())) as usize;
+            if register {
+                let code = unsafe {
+                    if aggregate {
+                        (api.register_aggregate_function)(
+                            api.ctx,
+                            name.as_ptr(),
+                            -2,
+                            context,
+                            unused_aggregate_init,
+                            unused_aggregate_step,
+                            unused_aggregate_finalize,
+                            Some(drop_context),
+                            None,
+                            None,
+                        )
+                    } else {
+                        (api.register_scalar_function)(
+                            api.ctx,
+                            name.as_ptr(),
+                            -2,
+                            false,
+                            context,
+                            c_double,
+                            Some(drop_context),
+                            None,
+                        )
+                    }
+                };
+                assert_eq!(code, ResultCode::InvalidArgs);
+                assert_eq!(conn.syms.read().functions.len(), function_count);
+            } else {
+                let result = if aggregate {
+                    ExternalFunc::new_aggregate(
+                        "rejected".into(),
+                        -2,
+                        context,
+                        (
+                            unused_aggregate_init,
+                            unused_aggregate_step,
+                            unused_aggregate_finalize,
+                        ),
+                        Some(drop_context),
+                        None,
+                        None,
+                    )
+                } else {
+                    ExternalFunc::new_scalar(
+                        "rejected".into(),
+                        -2,
+                        false,
+                        context,
+                        c_double,
+                        Some(drop_context),
+                        None,
+                    )
+                };
+                assert!(matches!(result, Err(LimboError::InvalidArgument(_))));
+            }
+            assert_eq!(drops.load(Ordering::SeqCst), 0);
+            unsafe { drop_context(context) };
+            assert_eq!(drops.load(Ordering::SeqCst), 1);
+        }
+    }
+    unsafe { conn._free_extension_ctx(api) };
+
+    unsafe extern "C" fn drop_context(context: usize) {
+        let drops = unsafe { Box::from_raw(context as *mut Arc<AtomicUsize>) };
+        drops.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
+#[test]
 fn scalar_calls_resume_independently_and_create_once() {
     let queue = Arc::new(Mutex::new(Vec::new()));
     let created = Arc::new(AtomicUsize::new(0));
     let dropped = Arc::new(AtomicUsize::new(0));
     let conn = connection(
-        OpenOptions::new(Arc::new(SqliteDialect))
-            .extension_function(ExternalFunc::new_native_scalar(
+        OpenOptions::new(Arc::new(SqliteDialect)).extension_function(
+            ExternalFunc::new_native_scalar(
                 "DeLaYeD".into(),
                 2,
                 false,
@@ -68,8 +164,9 @@ fn scalar_calls_resume_independently_and_create_once() {
                     created: created.clone(),
                     dropped: dropped.clone(),
                 },
-            ))
+            )
             .unwrap(),
+        ),
     );
     let mut first = conn.prepare("SELECT delayed(7, 3)").unwrap();
     let other = conn.db.connect().unwrap();
@@ -94,8 +191,8 @@ fn resetting_a_pending_scalar_drops_it_and_starts_a_new_call() {
     let created = Arc::new(AtomicUsize::new(0));
     let dropped = Arc::new(AtomicUsize::new(0));
     let conn = connection(
-        OpenOptions::new(Arc::new(SqliteDialect))
-            .extension_function(ExternalFunc::new_native_scalar(
+        OpenOptions::new(Arc::new(SqliteDialect)).extension_function(
+            ExternalFunc::new_native_scalar(
                 "delayed".into(),
                 2,
                 false,
@@ -104,8 +201,9 @@ fn resetting_a_pending_scalar_drops_it_and_starts_a_new_call() {
                     created: created.clone(),
                     dropped: dropped.clone(),
                 },
-            ))
+            )
             .unwrap(),
+        ),
     );
     let mut stmt = conn.prepare("SELECT delayed(4, 1)").unwrap();
     assert!(matches!(stmt.step().unwrap(), StepResult::IO));
@@ -121,8 +219,8 @@ fn scalar_error_after_io_drops_the_call_and_preserves_the_error() {
     let queue = Arc::new(Mutex::new(Vec::new()));
     let dropped = Arc::new(AtomicUsize::new(0));
     let conn = connection(
-        OpenOptions::new(Arc::new(SqliteDialect))
-            .extension_function(ExternalFunc::new_native_scalar(
+        OpenOptions::new(Arc::new(SqliteDialect)).extension_function(
+            ExternalFunc::new_native_scalar(
                 "delayed".into(),
                 2,
                 false,
@@ -131,8 +229,9 @@ fn scalar_error_after_io_drops_the_call_and_preserves_the_error() {
                     created: Arc::new(AtomicUsize::new(0)),
                     dropped: dropped.clone(),
                 },
-            ))
+            )
             .unwrap(),
+        ),
     );
     let mut stmt = conn.prepare("SELECT delayed(-1, 8)").unwrap();
     assert!(matches!(stmt.step().unwrap(), StepResult::IO));
@@ -149,8 +248,8 @@ fn failed_completion_releases_the_pending_scalar() {
     let queue = Arc::new(Mutex::new(Vec::new()));
     let dropped = Arc::new(AtomicUsize::new(0));
     let conn = connection(
-        OpenOptions::new(Arc::new(SqliteDialect))
-            .extension_function(ExternalFunc::new_native_scalar(
+        OpenOptions::new(Arc::new(SqliteDialect)).extension_function(
+            ExternalFunc::new_native_scalar(
                 "delayed".into(),
                 2,
                 false,
@@ -159,8 +258,9 @@ fn failed_completion_releases_the_pending_scalar() {
                     created: Arc::new(AtomicUsize::new(0)),
                     dropped: dropped.clone(),
                 },
-            ))
+            )
             .unwrap(),
+        ),
     );
     let mut stmt = conn.prepare("SELECT delayed(7, 2)").unwrap();
     assert!(matches!(stmt.step().unwrap(), StepResult::IO));
@@ -182,8 +282,8 @@ fn abort_releases_nested_trigger_calls_and_restores_trigger_state() {
         let queue = Arc::new(Mutex::new(Vec::new()));
         let dropped = Arc::new(AtomicUsize::new(0));
         let conn = connection(
-            OpenOptions::new(Arc::new(SqliteDialect))
-                .extension_function(ExternalFunc::new_native_scalar(
+            OpenOptions::new(Arc::new(SqliteDialect)).extension_function(
+                ExternalFunc::new_native_scalar(
                     "delayed".into(),
                     2,
                     false,
@@ -192,8 +292,9 @@ fn abort_releases_nested_trigger_calls_and_restores_trigger_state() {
                         created: Arc::new(AtomicUsize::new(0)),
                         dropped: dropped.clone(),
                     },
-                ))
+                )
                 .unwrap(),
+            ),
         );
         conn.execute("CREATE TABLE parent(id INTEGER PRIMARY KEY)")
             .unwrap();
@@ -260,16 +361,17 @@ fn aggregates_resume_steps_and_finalization_for_each_group() {
     let queue = Arc::new(Mutex::new(Vec::new()));
     let created = Arc::new(AtomicUsize::new(0));
     let conn = connection(
-        OpenOptions::new(Arc::new(SqliteDialect))
-            .extension_function(ExternalFunc::new_native_aggregate(
+        OpenOptions::new(Arc::new(SqliteDialect)).extension_function(
+            ExternalFunc::new_native_aggregate(
                 "weighted".into(),
                 2,
                 WeightedSum {
                     queue: queue.clone(),
                     created: created.clone(),
                 },
-            ))
+            )
             .unwrap(),
+        ),
     );
     conn.set_vdbe_trace(true);
     let mut stmt = conn
@@ -309,16 +411,17 @@ fn aggregates_resume_steps_and_finalization_for_each_group() {
 fn native_variadic_aggregates_use_callsite_argument_count() {
     let queue = Arc::new(Mutex::new(Vec::new()));
     let conn = connection(
-        OpenOptions::new(Arc::new(SqliteDialect))
-            .extension_function(ExternalFunc::new_native_aggregate(
+        OpenOptions::new(Arc::new(SqliteDialect)).extension_function(
+            ExternalFunc::new_native_aggregate(
                 "weighted".into(),
                 -1,
                 WeightedSum {
                     queue: queue.clone(),
                     created: Arc::new(AtomicUsize::new(0)),
                 },
-            ))
+            )
             .unwrap(),
+        ),
     );
     let mut stmt = conn
         .prepare("SELECT weighted(3, 11), weighted(5, 2)")
@@ -373,16 +476,17 @@ fn pending_aggregates_release_state_on_reset_and_failed_completion() {
     let queue = Arc::new(Mutex::new(Vec::new()));
     let created = Arc::new(AtomicUsize::new(0));
     let conn = connection(
-        OpenOptions::new(Arc::new(SqliteDialect))
-            .extension_function(ExternalFunc::new_native_aggregate(
+        OpenOptions::new(Arc::new(SqliteDialect)).extension_function(
+            ExternalFunc::new_native_aggregate(
                 "weighted".into(),
                 2,
                 WeightedSum {
                     queue: queue.clone(),
                     created: created.clone(),
                 },
-            ))
+            )
             .unwrap(),
+        ),
     );
     conn.set_vdbe_trace(true);
     let mut stmt = conn.prepare("SELECT weighted(4, 7)").unwrap();
@@ -837,8 +941,8 @@ fn scalar_calls_and_table_updates_share_one_statement_state() {
     let dropped = Arc::new(AtomicUsize::new(0));
     let rows = Arc::new(Mutex::new(vec![(1, 4), (2, 9)]));
     let events = Arc::new(Mutex::new(Vec::new()));
-    let options = OpenOptions::new(Arc::new(SqliteDialect))
-        .extension_function(ExternalFunc::new_native_scalar(
+    let options = OpenOptions::new(Arc::new(SqliteDialect)).extension_function(
+        ExternalFunc::new_native_scalar(
             "delayed".into(),
             2,
             false,
@@ -847,8 +951,9 @@ fn scalar_calls_and_table_updates_share_one_statement_state() {
                 created: created.clone(),
                 dropped: dropped.clone(),
             },
-        ))
-        .unwrap();
+        )
+        .unwrap(),
+    );
     let conn = connection(options.native_module(
         "native_store",
         VTabKind::VirtualTable,
@@ -875,8 +980,8 @@ fn scalar_calls_and_table_updates_share_one_statement_state() {
 fn c_table_inserts_with_native_arguments_block_other_writes_and_transaction_end() {
     let queue = Arc::new(Mutex::new(Vec::new()));
     let conn = connection(
-        OpenOptions::new(Arc::new(SqliteDialect))
-            .extension_function(ExternalFunc::new_native_scalar(
+        OpenOptions::new(Arc::new(SqliteDialect)).extension_function(
+            ExternalFunc::new_native_scalar(
                 "delayed".into(),
                 2,
                 false,
@@ -885,8 +990,9 @@ fn c_table_inserts_with_native_arguments_block_other_writes_and_transaction_end(
                     created: Arc::new(AtomicUsize::new(0)),
                     dropped: Arc::new(AtomicUsize::new(0)),
                 },
-            ))
+            )
             .unwrap(),
+        ),
     );
     let api = unsafe { conn._build_turso_ext() };
     let code = unsafe { CStoreModule::register_CStoreModule(&api) };
@@ -941,25 +1047,21 @@ fn c_extensions_still_execute_with_native_registration() {
     let queue = Arc::new(Mutex::new(Vec::new()));
     let conn = connection(
         OpenOptions::new(Arc::new(SqliteDialect))
-            .extension_function(ExternalFunc::new_native_aggregate(
-                "WeIgHtEd".into(),
-                2,
-                WeightedSum {
-                    queue: queue.clone(),
-                    created: Arc::new(AtomicUsize::new(0)),
-                },
-            ))
-            .unwrap()
-            .extension_function(ExternalFunc::new_scalar(
-                "C_OpEn_DoUbLe".into(),
-                1,
-                true,
-                0,
-                c_double,
-                None,
-                None,
-            ))
-            .unwrap(),
+            .extension_function(
+                ExternalFunc::new_native_aggregate(
+                    "WeIgHtEd".into(),
+                    2,
+                    WeightedSum {
+                        queue: queue.clone(),
+                        created: Arc::new(AtomicUsize::new(0)),
+                    },
+                )
+                .unwrap(),
+            )
+            .extension_function(
+                ExternalFunc::new_scalar("C_OpEn_DoUbLe".into(), 1, true, 0, c_double, None, None)
+                    .unwrap(),
+            ),
     );
     let other = conn.db.connect().unwrap();
     assert_eq!(
@@ -1625,6 +1727,26 @@ impl VTabCursor for CStoreCursor {
             ResultCode::OK
         }
     }
+}
+
+unsafe extern "C" fn unused_aggregate_init(_context: usize) -> *mut turso_ext::AggCtx {
+    unreachable!("the test never creates an aggregate accumulator")
+}
+
+unsafe extern "C" fn unused_aggregate_step(
+    _context: usize,
+    _ctx: *mut turso_ext::AggCtx,
+    _argc: i32,
+    _argv: *const turso_ext::Value,
+) -> turso_ext::Value {
+    unreachable!("the test never steps an aggregate")
+}
+
+unsafe extern "C" fn unused_aggregate_finalize(
+    _context: usize,
+    _ctx: *mut turso_ext::AggCtx,
+) -> turso_ext::Value {
+    unreachable!("the test never finalizes an aggregate")
 }
 
 unsafe extern "C" fn c_double(
