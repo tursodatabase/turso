@@ -3342,7 +3342,7 @@ mod tests {
         let pager = target_conn.pager.load();
 
         assert!(!target_conn.get_auto_commit());
-        assert!(target_conn.is_nested_stmt());
+        assert!(!target_conn.is_nested_stmt());
 
         context.cleanup_after_error()?;
 

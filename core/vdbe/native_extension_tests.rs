@@ -798,6 +798,68 @@ fn native_cursors_close_at_done_in_explicit_transactions_and_triggers() {
 }
 
 #[test]
+fn suspended_internal_helper_does_not_change_sibling_writer_accounting() {
+    let queue = Arc::new(Mutex::new(Vec::new()));
+    let conn = connection(OpenOptions::new(Arc::new(SqliteDialect)).native_module(
+        "native_rows",
+        VTabKind::TableValuedFunction,
+        RowsModule {
+            queue,
+            rows: Arc::new(Mutex::new(vec![(1, 9)])),
+            events: Arc::new(Mutex::new(Vec::new())),
+            writable: false,
+        },
+    ));
+    conn.execute("CREATE TABLE writes(value)").unwrap();
+    assert!(conn
+        .prepare_internal("SELECT * FROM missing_helper_table")
+        .is_err());
+    assert!(!conn.is_nested_stmt());
+    let mut helper = conn
+        .prepare_internal("SELECT value FROM native_rows(8)")
+        .unwrap();
+    assert!(!conn.is_nested_stmt());
+    assert!(matches!(helper.step().unwrap(), StepResult::IO));
+    assert!(!conn.is_nested_stmt());
+    assert!(matches!(helper.step().unwrap(), StepResult::IO));
+    assert!(!conn.is_nested_stmt());
+
+    let mut writer = conn
+        .prepare("INSERT INTO writes VALUES (7) RETURNING value")
+        .unwrap();
+    assert!(matches!(writer.step().unwrap(), StepResult::Row));
+    assert_eq!(writer.row().unwrap().get_value(0), &Value::from_i64(7));
+    let mut sibling = conn.prepare("INSERT INTO writes SELECT 9").unwrap();
+    let result = sibling.step();
+    assert!(
+        matches!(
+            result,
+            Err(LimboError::StatementsInProgress(
+                "cannot start a write statement"
+            ))
+        ),
+        "unexpected sibling result: {result:?}"
+    );
+    drop(sibling);
+    helper.reset().unwrap();
+    assert!(!conn.is_nested_stmt());
+    drop(helper);
+    assert!(!conn.is_nested_stmt());
+    writer.run_ignore_rows().unwrap();
+    drop(writer);
+    conn.execute("INSERT INTO writes VALUES (11)").unwrap();
+    let observer = conn.db.connect().unwrap();
+    assert_eq!(
+        observer
+            .prepare("SELECT value FROM writes ORDER BY value")
+            .unwrap()
+            .run_collect_rows()
+            .unwrap(),
+        vec![vec![Value::from_i64(7)], vec![Value::from_i64(11)]]
+    );
+}
+
+#[test]
 fn native_writes_yield_and_keep_existing_transaction_callbacks() {
     let queue = Arc::new(Mutex::new(Vec::new()));
     let rows = Arc::new(Mutex::new(Vec::new()));

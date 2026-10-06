@@ -5925,7 +5925,6 @@ pub fn op_program(
                             QueryMode::Normal,
                             0,
                             crate::statement::StatementOrigin::Subprogram,
-                            false,
                         ))
                     };
 
