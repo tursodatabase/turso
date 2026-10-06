@@ -750,7 +750,9 @@ pub trait Wal: Debug + Send + Sync {
     /// Checkpoint the WAL into the database file.
     /// `sync_mode` controls the WAL durability barrier: unless it is
     /// [SyncMode::Off], the WAL is fsynced before any frame is backfilled so
-    /// that a crash mid-backfill can always be healed by WAL recovery.
+    /// that a crash mid-backfill can always be healed by WAL recovery. The
+    /// fsync is skipped when an earlier WAL fsync already covered every frame
+    /// that the checkpoint backfills (see [Wal::record_synced_frames]).
     fn checkpoint(
         &self,
         pager: &Pager,
@@ -766,6 +768,7 @@ pub trait Wal: Debug + Send + Sync {
     ) -> Result<Option<Completion>>;
     fn publish_backfill(&self, max_frame: u64);
     fn sync(&self, sync_type: FileSyncType) -> Result<Completion>;
+    fn record_synced_frames(&self, max_frame: u64, sync_type: FileSyncType);
     fn is_syncing(&self) -> bool;
     /// Whether the WAL file is dirty: frames were appended that no successful
     /// WAL fsync has covered yet. A dirty WAL owes an fsync before a commit
@@ -2966,6 +2969,7 @@ pub struct WalSharedRuntime {
     /// Tracks how far the process-local `frame_cache` is known to be complete
     /// for overflow fallback in the current WAL generation.
     pub overflow_fallback_coverage: Arc<SpinLock<OverflowFallbackCoverage>>,
+    pub synced_frames: SpinLock<Option<SyncedWalFrames>>,
     #[cfg(test)]
     pub(crate) frames_compared: AtomicU64,
 }
@@ -3065,6 +3069,50 @@ impl OverflowFallbackCoverage {
     #[cfg(host_shared_wal)]
     pub(crate) fn covers(&self, snapshot: SharedWalCoordinationHeader, max_frame: u64) -> bool {
         self.same_generation(snapshot) && self.max_frame >= max_frame
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SyncedWalFrames {
+    checkpoint_seq: u32,
+    salt_1: u32,
+    salt_2: u32,
+    max_frame: u64,
+    sync_type: FileSyncType,
+}
+
+impl SyncedWalFrames {
+    fn record(
+        synced: &mut Option<Self>,
+        header: &WalHeader,
+        max_frame: u64,
+        sync_type: FileSyncType,
+    ) {
+        if let Some(previous) = synced {
+            if previous.same_generation(header) && previous.sync_type == sync_type {
+                previous.max_frame = previous.max_frame.max(max_frame);
+                return;
+            }
+        }
+        *synced = Some(Self {
+            checkpoint_seq: header.checkpoint_seq,
+            salt_1: header.salt_1,
+            salt_2: header.salt_2,
+            max_frame,
+            sync_type,
+        });
+    }
+
+    fn covers(&self, header: &WalHeader, max_frame: u64, sync_type: FileSyncType) -> bool {
+        self.same_generation(header)
+            && self.max_frame >= max_frame
+            && (self.sync_type == sync_type || self.sync_type == FileSyncType::FullFsync)
+    }
+
+    fn same_generation(&self, header: &WalHeader) -> bool {
+        self.checkpoint_seq == header.checkpoint_seq
+            && self.salt_1 == header.salt_1
+            && self.salt_2 == header.salt_2
     }
 }
 
@@ -4209,6 +4257,18 @@ impl Wal for WalFile {
         Ok(c)
     }
 
+    fn record_synced_frames(&self, max_frame: u64, sync_type: FileSyncType) {
+        let header = self.coordination.wal_header();
+        self.with_shared(|shared| {
+            SyncedWalFrames::record(
+                &mut shared.runtime.synced_frames.lock(),
+                &header,
+                max_frame,
+                sync_type,
+            );
+        });
+    }
+
     // Currently used for assertion purposes
     fn is_syncing(&self) -> bool {
         self.syncing.load(Ordering::Acquire)
@@ -5041,9 +5101,13 @@ impl WalFile {
                     // so the checkpoint owes that fsync itself. The barrier is
                     // issued after the frame range is fixed (under the
                     // checkpoint locks), so it covers exactly the frames that
-                    // will be backfilled. Skipped only under synchronous=OFF,
-                    // which forgoes crash durability entirely.
-                    let needs_wal_sync = !to_checkpoint.is_empty() && sync_mode != SyncMode::Off;
+                    // will be backfilled. Skipped under synchronous=OFF, which
+                    // forgoes crash durability entirely, and when an earlier
+                    // WAL fsync already covered every frame up to max_frame
+                    // (e.g. the fsync of a synchronous=FULL commit).
+                    let needs_wal_sync = !to_checkpoint.is_empty()
+                        && sync_mode != SyncMode::Off
+                        && !self.frames_already_synced(oc_max_frame, pager.get_sync_type());
                     {
                         let mut oc = self.ongoing_checkpoint.write();
                         oc.pages_to_checkpoint = to_checkpoint;
@@ -5275,6 +5339,17 @@ impl WalFile {
                 }
             }
         }
+    }
+
+    fn frames_already_synced(&self, max_frame: u64, sync_type: FileSyncType) -> bool {
+        let header = self.coordination.wal_header();
+        self.with_shared(|shared| {
+            shared
+                .runtime
+                .synced_frames
+                .lock()
+                .is_some_and(|synced| synced.covers(&header, max_frame, sync_type))
+        })
     }
 
     /// Coordinate what the maximum safe frame is for us to backfill when checkpointing.
@@ -5912,6 +5987,7 @@ impl WalFileShared {
                 overflow_fallback_coverage: Arc::new(SpinLock::new(
                     OverflowFallbackCoverage::default(),
                 )),
+                synced_frames: SpinLock::new(None),
                 #[cfg(test)]
                 frames_compared: AtomicU64::new(0),
             },
@@ -5990,6 +6066,7 @@ impl WalFileShared {
                 overflow_fallback_coverage: Arc::new(SpinLock::new(
                     OverflowFallbackCoverage::default(),
                 )),
+                synced_frames: SpinLock::new(None),
                 #[cfg(test)]
                 frames_compared: AtomicU64::new(0),
             },
@@ -6034,6 +6111,7 @@ impl WalFileShared {
                 overflow_fallback_coverage: Arc::new(SpinLock::new(
                     OverflowFallbackCoverage::default(),
                 )),
+                synced_frames: SpinLock::new(None),
                 #[cfg(test)]
                 frames_compared: AtomicU64::new(0),
             },
@@ -6107,6 +6185,7 @@ impl WalFileShared {
             Ordering::Release,
         );
         self.runtime.overflow_fallback_coverage = restored.runtime.overflow_fallback_coverage;
+        self.runtime.synced_frames = restored.runtime.synced_frames;
     }
 }
 

@@ -4789,6 +4789,14 @@ impl Pager {
                     wal.commit_prepared_frames(&commit_info.prepared_frames);
                     wal.finalize_committed_pages(&commit_info.prepared_frames);
                     wal.finish_append_frames_commit()?;
+                    if sync_mode == SyncMode::Full {
+                        let last_frame = commit_info
+                            .prepared_frames
+                            .last()
+                            .expect("a commit that reaches WalCommitDone prepared frames")
+                            .final_max_frame;
+                        wal.record_synced_frames(last_frame, self.get_sync_type());
+                    }
                     self.dirty_pages.write().clear();
                     commit_info.prepared_frames.clear();
 

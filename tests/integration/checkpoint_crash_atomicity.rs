@@ -351,3 +351,177 @@ fn first_full_commit_on_fresh_database_fsyncs_the_wal() -> anyhow::Result<()> {
     );
     Ok(())
 }
+
+#[test]
+fn auto_checkpoint_after_full_commit_does_not_fsync_the_wal_again() -> anyhow::Result<()> {
+    let db_path_sim = "auto-checkpoint-after-full-commit.db";
+    let wal_path_sim = format!("{db_path_sim}-wal");
+    let io = Arc::new(UnreliableIo::new());
+    let db = Database::open_file_with_flags(
+        io.clone(),
+        db_path_sim,
+        OpenFlags::default(),
+        DatabaseOpts::new(),
+        None,
+        Arc::new(SqliteDialect),
+    )?;
+    let conn = db.connect()?;
+    conn.execute("PRAGMA synchronous=FULL")?;
+    conn.execute("CREATE TABLE t(x)")?;
+    conn.execute("INSERT INTO t VALUES (1)")?;
+    conn.execute("PRAGMA wal_autocheckpoint=1")?;
+
+    let db_syncs_before = io.sync_count(db_path_sim);
+    let wal_syncs_before = io.sync_count(&wal_path_sim);
+    conn.execute("INSERT INTO t VALUES (2)")?;
+    assert_eq!(
+        io.sync_count(db_path_sim) - db_syncs_before,
+        1,
+        "the INSERT must run an auto-checkpoint that backfills and fsyncs the database file"
+    );
+    assert_eq!(
+        io.sync_count(&wal_path_sim) - wal_syncs_before,
+        1,
+        "the commit fsync already made the WAL durable, so the auto-checkpoint \
+         must not fsync the WAL again"
+    );
+    Ok(())
+}
+
+const HALF_ROWS: usize = 256;
+
+fn open_durable_table_of_a_rows(
+    db_path_sim: &str,
+) -> anyhow::Result<(Arc<UnreliableIo>, Arc<turso_core::Connection>)> {
+    let io = Arc::new(UnreliableIo::new());
+    let db = Database::open_file_with_flags(
+        io.clone(),
+        db_path_sim,
+        OpenFlags::default(),
+        DatabaseOpts::new(),
+        None,
+        Arc::new(SqliteDialect),
+    )?;
+    let conn = db.connect()?;
+    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)")?;
+    conn.execute("BEGIN")?;
+    for i in 0..2 * HALF_ROWS {
+        conn.execute(format!("INSERT INTO t VALUES({i}, '{}')", "A".repeat(120)))?;
+    }
+    conn.execute("COMMIT")?;
+    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")?;
+    io.mark_all_durable();
+    Ok((io, conn))
+}
+
+fn crash_during_passive_checkpoint_and_recover(
+    io: &UnreliableIo,
+    conn: &Arc<turso_core::Connection>,
+    db_path_sim: &str,
+) -> anyhow::Result<(tempfile::TempDir, Arc<turso_core::Connection>)> {
+    io.arm_crash_on_sync(db_path_sim);
+    conn.execute("PRAGMA wal_checkpoint(PASSIVE)")?;
+    let snapshot = io
+        .take_crash_snapshot()
+        .expect("checkpoint never issued the post-backfill DB fsync; crash point not reached");
+    assert!(
+        snapshot.writes_persisted >= 1 && snapshot.writes_dropped >= 1,
+        "crash model must persist a strict subset of the backfill writes \
+         (persisted={}, dropped={})",
+        snapshot.writes_persisted,
+        snapshot.writes_dropped,
+    );
+    let dir = tempfile::TempDir::new()?;
+    let db_path = dir.path().join("recovered.db");
+    std::fs::write(
+        &db_path,
+        snapshot
+            .files
+            .get(db_path_sim)
+            .expect("db file missing from crash snapshot"),
+    )?;
+    if let Some(wal) = snapshot.files.get(&format!("{db_path_sim}-wal")) {
+        std::fs::write(dir.path().join("recovered.db-wal"), wal)?;
+    }
+    let recovered_db = Database::open_file(
+        Arc::new(turso_core::PlatformIO::new()?),
+        db_path.to_str().unwrap(),
+        Arc::new(SqliteDialect),
+    )?;
+    let recovered = recovered_db.connect()?;
+    assert_eq!(
+        query_rows(&recovered, "PRAGMA integrity_check")?,
+        vec!["ok".to_string()],
+        "recovered database failed integrity_check"
+    );
+    Ok((dir, recovered))
+}
+
+fn first_letters_of_each_half(
+    conn: &Arc<turso_core::Connection>,
+) -> anyhow::Result<(String, String)> {
+    let letters = |sql: String| -> anyhow::Result<String> {
+        Ok(query_rows(conn, &sql)?
+            .iter()
+            .map(|v| v[..1].to_string())
+            .collect())
+    };
+    Ok((
+        letters(format!(
+            "SELECT DISTINCT v FROM t WHERE id < {HALF_ROWS} ORDER BY v"
+        ))?,
+        letters(format!(
+            "SELECT DISTINCT v FROM t WHERE id >= {HALF_ROWS} ORDER BY v"
+        ))?,
+    ))
+}
+
+#[test]
+fn checkpoint_fsyncs_normal_frames_committed_after_a_full_commit() -> anyhow::Result<()> {
+    let db_path_sim = "checkpoint-normal-frames-after-full-commit.db";
+    let (io, conn) = open_durable_table_of_a_rows(db_path_sim)?;
+    conn.execute("PRAGMA synchronous=FULL")?;
+    conn.execute(format!(
+        "UPDATE t SET v = '{}' WHERE id < {HALF_ROWS}",
+        "B".repeat(120)
+    ))?;
+    conn.execute("PRAGMA synchronous=NORMAL")?;
+    conn.execute(format!(
+        "UPDATE t SET v = '{}' WHERE id >= {HALF_ROWS}",
+        "C".repeat(120)
+    ))?;
+
+    let (_dir, recovered) = crash_during_passive_checkpoint_and_recover(&io, &conn, db_path_sim)?;
+    let halves = first_letters_of_each_half(&recovered)?;
+    assert!(
+        [("A", "A"), ("B", "A"), ("B", "C")]
+            .iter()
+            .any(|(first, second)| halves == (first.to_string(), second.to_string())),
+        "torn recovery: the database matches no committed prefix; halves: {halves:?}"
+    );
+    Ok(())
+}
+
+#[test]
+fn checkpoint_fsyncs_frames_of_a_new_wal_generation() -> anyhow::Result<()> {
+    let db_path_sim = "checkpoint-fsyncs-new-wal-generation.db";
+    let (io, conn) = open_durable_table_of_a_rows(db_path_sim)?;
+    conn.execute("PRAGMA synchronous=FULL")?;
+    conn.execute(format!("UPDATE t SET v = '{}'", "B".repeat(120)))?;
+    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")?;
+    conn.execute("PRAGMA synchronous=NORMAL")?;
+    conn.execute(format!(
+        "UPDATE t SET v = '{}' WHERE id >= {HALF_ROWS}",
+        "C".repeat(120)
+    ))?;
+
+    let (_dir, recovered) = crash_during_passive_checkpoint_and_recover(&io, &conn, db_path_sim)?;
+    let halves = first_letters_of_each_half(&recovered)?;
+    assert!(
+        [("B", "B"), ("B", "C")]
+            .iter()
+            .any(|(first, second)| halves == (first.to_string(), second.to_string())),
+        "torn recovery: the database matches no committed prefix; halves: {halves:?}"
+    );
+    Ok(())
+}
