@@ -3674,6 +3674,40 @@ mod database_tests {
 
     #[cfg(feature = "fs")]
     #[test]
+    fn roles_are_reloaded_after_vacuum() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("roles.db");
+        let db = Database::open_file_with_flags(
+            Arc::new(PlatformIO::new().unwrap()),
+            path.to_str().unwrap(),
+            OpenFlags::Create,
+            DatabaseOpts::new().with_vacuum(true),
+            None,
+            Arc::new(SqliteDialect),
+        )
+        .unwrap();
+        let conn = db.connect().unwrap();
+        let create_role = turso_parser::ast::Cmd::Stmt(turso_parser::ast::Stmt::CreateRole {
+            role_name: "alice".to_string(),
+        });
+        conn.prepare_translated_cmd(create_role, "CREATE ROLE alice")
+            .unwrap()
+            .run_ignore_rows()
+            .unwrap();
+
+        conn.execute("VACUUM").unwrap();
+
+        assert!(conn.role_catalog().get_by_name("alice").is_some());
+        assert!(db
+            .connect()
+            .unwrap()
+            .role_catalog()
+            .get_by_name("alice")
+            .is_some());
+    }
+
+    #[cfg(feature = "fs")]
+    #[test]
     fn roles_are_loaded_on_open_when_the_schema_cookie_is_zero() {
         let dir = tempfile::TempDir::new().unwrap();
         let path = dir.path().join("roles.db");
@@ -3716,7 +3750,6 @@ mod database_tests {
             .is_some());
     }
 
-    #[cfg(feature = "fs")]
     #[cfg(feature = "fs")]
     fn roles_are_loaded_on_mvcc_open(checkpoint: bool) {
         let dir = tempfile::TempDir::new().unwrap();

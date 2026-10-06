@@ -2,7 +2,7 @@ use crate::alloc::TryClone;
 use crate::error::io_error;
 #[cfg(any(test, injected_yields))]
 use crate::mvcc::yield_points::{FailureInjector, YieldInjector};
-use crate::security::roles::RoleCatalog;
+use crate::security::roles::{RoleCatalog, ROLES_TABLE_NAME, SELECT_ROLES_SQL};
 use crate::statement::StatementOrigin;
 use crate::storage::{journal_mode, pager::SavepointResult};
 use crate::sync::{
@@ -243,6 +243,11 @@ enum ReparsePhase {
     LoadTypes {
         stmt: Box<Statement>,
         type_rows: Vec<String>,
+    },
+    /// Loading roles from the roles table into the role catalog.
+    LoadRoles {
+        stmt: Box<Statement>,
+        rows: Vec<Vec<Value>>,
     },
     /// Best-effort ANALYZE-stats refresh before finalizing.
     RefreshStats {
@@ -1660,9 +1665,7 @@ impl Connection {
                             type_rows: Vec::new(),
                         };
                     } else {
-                        inner.phase = ReparsePhase::RefreshStats {
-                            stats: Default::default(),
-                        };
+                        inner.phase = self.load_roles_phase(&inner.fresh)?;
                     }
                 }
                 ReparsePhase::LoadTypes { stmt, type_rows } => {
@@ -1681,17 +1684,27 @@ impl Connection {
                             if let Err(e) = inner.fresh.load_type_definitions(&type_rows) {
                                 tracing::warn!("Failed to load custom types: {}", e);
                             }
-                            inner.phase = ReparsePhase::RefreshStats {
-                                stats: Default::default(),
-                            };
+                            inner.phase = self.load_roles_phase(&inner.fresh)?;
                         }
                         Err(e) => {
                             tracing::warn!("Failed to load custom types: {}", e);
-                            inner.phase = ReparsePhase::RefreshStats {
-                                stats: Default::default(),
-                            };
+                            inner.phase = self.load_roles_phase(&inner.fresh)?;
                         }
                     }
+                }
+                ReparsePhase::LoadRoles { stmt, rows } => {
+                    crate::return_if_io!(stmt.run_with_row_callback_nonblock(|row| {
+                        turso_assert!(
+                            !matches!(self.get_tx_state(), TransactionState::None),
+                            "roles must be read in a transaction"
+                        );
+                        rows.push(row.get_values().cloned().collect());
+                        Ok(())
+                    }));
+                    inner.fresh.roles = Arc::new(RoleCatalog::from_rows(rows)?);
+                    inner.phase = ReparsePhase::RefreshStats {
+                        stats: Default::default(),
+                    };
                 }
                 ReparsePhase::RefreshStats { stats } => {
                     // Best-effort load stats if sqlite_stat1 is present.
@@ -1715,6 +1728,27 @@ impl Connection {
                 }
             }
         }
+    }
+
+    /// Returns the phase that loads the roles table into `fresh`, or the
+    /// stats refresh phase if the database has no roles table. The fresh
+    /// schema is installed first, because the current schema may not contain
+    /// the roles table yet.
+    fn load_roles_phase(self: &Arc<Connection>, fresh: &Schema) -> Result<ReparsePhase> {
+        if !fresh.tables.contains_key(ROLES_TABLE_NAME) {
+            return Ok(ReparsePhase::RefreshStats {
+                stats: Default::default(),
+            });
+        }
+        self.with_schema_mut(|schema| {
+            *schema = fresh.try_clone()?;
+            Ok::<_, crate::alloc::TryReserveError>(())
+        })??;
+        let stmt = self.prepare(SELECT_ROLES_SQL)?;
+        Ok(ReparsePhase::LoadRoles {
+            stmt: Box::new(stmt),
+            rows: Vec::new(),
+        })
     }
 
     pub(crate) fn read_current_schema_cookie(&self) -> Result<u32> {
