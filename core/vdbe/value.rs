@@ -2569,7 +2569,7 @@ mod tests {
 
         let str1 = Register::Value(Value::build_text("A"));
         let str2 = Register::Value(Value::build_text("z"));
-        let input_str_vec = [str2, str1.clone()];
+        let input_str_vec = [&str2, &str1];
         assert_eq!(
             Value::exec_min(input_str_vec.iter().map(|v| v.get_value())),
             Value::build_text("A")
