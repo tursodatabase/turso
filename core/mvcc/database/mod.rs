@@ -1051,6 +1051,9 @@ pub struct Transaction<A: RowVersionAllocator = TursoAllocator> {
     /// materialization's frames are at-or-below this read mark (or in an earlier, backfilled WAL
     /// epoch). See [`MvStore::is_btree_readable_at`] / [`MvStore::compute_min_reader_mark`].
     read_mark: WalPos,
+    /// Table and index ids this transaction allocated with `CreateBtree`. No other
+    /// transaction can see these objects, so rollback drops their row maps whole.
+    created_table_ids: Mutex<Vec<MVTableId>>,
 }
 
 impl<A: RowVersionAllocator> Transaction<A> {
@@ -1077,6 +1080,7 @@ impl<A: RowVersionAllocator> Transaction<A> {
             abort_now: AtomicBool::new(false),
             commit_dep_set: Mutex::new(HashSet::default()),
             holds_blocking_checkpoint_read: AtomicBool::new(false),
+            created_table_ids: Mutex::new(Vec::new()),
         }
     }
 
@@ -5363,6 +5367,17 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         self.next_table_id.fetch_sub(1, Ordering::SeqCst)
     }
 
+    /// Records that `tx_id` allocated `table_id` with `CreateBtree`, so rollback can drop
+    /// everything stored under it.
+    pub fn record_created_table_id(&self, tx_id: TxID, table_id: i64) {
+        if let Some(tx) = self.txs.get(&tx_id) {
+            tx.value()
+                .created_table_ids
+                .lock()
+                .push(MVTableId::new(table_id));
+        }
+    }
+
     pub fn get_next_rowid(&self) -> i64 {
         self.next_rowid.fetch_add(1, Ordering::SeqCst) as i64
     }
@@ -7092,6 +7107,15 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         }
         self.dec_live_version_count_approx(removed_versions);
 
+        // The loop above emptied the chains but left their slots. A table or index this
+        // transaction created never existed for anyone else, and its id is never reused,
+        // so nothing would ever reclaim those slots. E.g. a CREATE INDEX that is retried
+        // and rolled back over and over would leave one full set of keys per attempt.
+        let created_table_ids = std::mem::take(&mut *tx.created_table_ids.lock());
+        for table_id in created_table_ids {
+            self.drop_created_btree(table_id);
+        }
+
         if let Some(connection) = connection {
             if connection.schema.read().schema_version > connection.db.schema.lock().schema_version
             {
@@ -7110,6 +7134,21 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         // read lock), so no future txs.get() for this tx_id can come from a
         // speculative read path.
         crate::without_allocation_faults!(self.remove_tx(tx_id).expect(ALLOC_ERR_MSG));
+    }
+
+    /// Removes the row maps of a table or index created by a transaction that rolled back.
+    /// Writers retry when their slot is unlinked, and no other transaction can write to an
+    /// object that only existed in the aborted transaction's schema.
+    fn drop_created_btree(&self, table_id: MVTableId) {
+        if let Some(index) = self.index_rows.get(&table_id) {
+            self.bump_index_rows_epoch();
+            index.remove();
+        }
+        let start = RowID::new(table_id, RowKey::Int(i64::MIN));
+        let end = RowID::new(table_id, RowKey::Int(i64::MAX));
+        for entry in self.rows.range(start..=end) {
+            entry.remove();
+        }
     }
 
     fn rollback_version_chain(tx_id: u64, versions: &mut RowVersionChain<A>) -> (usize, bool) {

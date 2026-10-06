@@ -7533,6 +7533,7 @@ fn new_tx_in<A: super::RowVersionAllocator>(
         holds_blocking_checkpoint_read: AtomicBool::new(false),
         schema_generation_at_begin: 0,
         read_mark: crate::mvcc::database::WalPos::ORIGIN,
+        created_table_ids: Mutex::new(Vec::new()),
     }
 }
 
@@ -9224,6 +9225,7 @@ fn transaction_display() {
         holds_blocking_checkpoint_read: AtomicBool::new(false),
         schema_generation_at_begin: 0,
         read_mark: crate::mvcc::database::WalPos::ORIGIN,
+        created_table_ids: Mutex::new(Vec::new()),
     };
 
     let expected = "{ state: Preparing(20250915), id: 42, begin_ts: 20250914, write_set: [RowID { table_id: MVTableId(-2), row_id: Int(11) }, RowID { table_id: MVTableId(-2), row_id: Int(13) }] }";
@@ -11302,6 +11304,70 @@ fn transaction_rollback_removes_created_versions_immediately() {
     assert_eq!(db.mvcc_store.live_version_count_approx(), 0);
     let dropped = db.mvcc_store.drop_unused_row_versions();
     assert_eq!(dropped, 0);
+}
+
+#[test]
+fn rollback_drops_row_maps_of_btrees_created_by_the_transaction() {
+    let db = MvccTestDb::new();
+    let conn = &db.conn;
+    // Nothing else may reclaim slots: disable the checkpoint and inline GC.
+    conn.execute("PRAGMA mvcc_checkpoint_threshold = -1")
+        .unwrap();
+    conn.execute("PRAGMA mvcc_gc_threshold = -1").unwrap();
+    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)")
+        .unwrap();
+    conn.execute("BEGIN").unwrap();
+    for i in 0..100 {
+        conn.execute(format!("INSERT INTO t VALUES ({i}, 'v{i}')"))
+            .unwrap();
+    }
+    conn.execute("COMMIT").unwrap();
+
+    let index_slots = || -> usize {
+        db.mvcc_store
+            .index_rows
+            .iter()
+            .map(|index| index.value().len())
+            .sum()
+    };
+    let table_slots = || -> usize {
+        db.mvcc_store
+            .rows
+            .iter()
+            .filter(|entry| entry.key().table_id != SQLITE_SCHEMA_MVCC_TABLE_ID)
+            .count()
+    };
+    let index_maps_before = db.mvcc_store.index_rows.len();
+    let index_slots_before = index_slots();
+    let table_slots_before = table_slots();
+
+    // A retried CREATE INDEX gets a new index id every attempt. Before the fix, each
+    // rolled-back attempt left one slot per indexed row behind.
+    for _ in 0..5 {
+        conn.execute("BEGIN").unwrap();
+        conn.execute("CREATE INDEX idx_v ON t(v)").unwrap();
+        assert_eq!(index_slots(), index_slots_before + 100);
+        conn.execute("ROLLBACK").unwrap();
+        assert_eq!(db.mvcc_store.index_rows.len(), index_maps_before);
+        assert_eq!(index_slots(), index_slots_before);
+    }
+
+    // The same for a table created and filled in the rolled-back transaction.
+    conn.execute("BEGIN").unwrap();
+    conn.execute("CREATE TABLE u(id INTEGER PRIMARY KEY, v TEXT)")
+        .unwrap();
+    for i in 0..50 {
+        conn.execute(format!("INSERT INTO u VALUES ({i}, 'u{i}')"))
+            .unwrap();
+    }
+    assert_eq!(table_slots(), table_slots_before + 50);
+    conn.execute("ROLLBACK").unwrap();
+    assert_eq!(table_slots(), table_slots_before);
+
+    // A committed CREATE INDEX keeps its rows.
+    conn.execute("CREATE INDEX idx_v ON t(v)").unwrap();
+    assert_eq!(db.mvcc_store.index_rows.len(), index_maps_before + 1);
+    assert_eq!(index_slots(), index_slots_before + 100);
 }
 
 /// GC trims chains with retain()/clear(), which keeps the Vec's allocation.
