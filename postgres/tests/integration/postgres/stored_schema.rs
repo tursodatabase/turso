@@ -159,3 +159,25 @@ fn rename_keeps_the_file_readable(db: TempDatabase) {
         ["1|2.50", "2|3.00"]
     );
 }
+
+#[turso_macros::test(mvcc)]
+fn alter_column_type_is_refused_and_keeps_the_table(db: TempDatabase) {
+    let conn = db.connect_postgres();
+    conn.execute("CREATE TABLE ac (id bigint PRIMARY KEY, i integer, ts text)")
+        .unwrap();
+    conn.execute("INSERT INTO ac VALUES (1, 7, 'hello')")
+        .unwrap();
+    let err = conn
+        .execute("ALTER TABLE ac ALTER COLUMN i TYPE numeric(10,2)")
+        .unwrap_err();
+    assert!(
+        err.to_string()
+            .contains("ALTER TABLE ... ALTER COLUMN ... TYPE is not supported"),
+        "{err}"
+    );
+    drop(conn);
+
+    let db = db.reopen();
+    let conn = db.connect_postgres();
+    assert_eq!(rows(&conn, "SELECT id, i, ts FROM ac"), ["1|7|hello"]);
+}

@@ -46,7 +46,7 @@ Basics not enumerated by the official feature matrix.
 | DELETE | 🟡 Partial | `USING` clause silently dropped |
 | CREATE TABLE | ✅ Supported | PK, NOT NULL, UNIQUE, DEFAULT, CHECK, FK (with ON DELETE/UPDATE actions); IF NOT EXISTS; tables are created STRICT |
 | CREATE TABLE AS / SELECT INTO | ✅ Supported | Schema derived from the SELECT; WITH NO DATA supported (lowered to LIMIT 0, so errors in an overridden LIMIT go unreported); explicit column list rejected; INTO on the first leaf of a compound SELECT (legal in PG) rejected; TEMP silently ignored; completes with `SELECT n` like PostgreSQL, though an IF NOT EXISTS skip tags `SELECT 0` instead of `CREATE TABLE AS` |
-| ALTER TABLE | 🟡 Partial | ADD/DROP COLUMN, RENAME TABLE/COLUMN work; ALTER COLUMN TYPE translates but fails at execution; SET/DROP DEFAULT, SET/DROP NOT NULL, ADD CONSTRAINT rejected |
+| ALTER TABLE | 🟡 Partial | ADD/DROP COLUMN, RENAME TABLE/COLUMN work; ALTER COLUMN TYPE, SET/DROP DEFAULT, SET/DROP NOT NULL, ADD CONSTRAINT rejected |
 | CREATE INDEX | ✅ Supported | UNIQUE, multi-column, partial (WHERE), expression indexes, IF NOT EXISTS |
 | CREATE VIEW | ✅ Supported | Column aliases supported; TEMP silently ignored |
 | COMMENT ON | 🟡 Partial | Accepted but discarded; comments are not persisted in `pg_description` |
@@ -231,7 +231,7 @@ to integer.
 | ALTER TABLE ... ADD UNIQUE/PRIMARY KEY USING INDEX | ❌ Not supported | ADD CONSTRAINT is rejected |
 | ALTER TABLE ... SET ACCESS METHOD | ❌ Not supported | |
 | ALTER TABLE ... SET LOGGED / UNLOGGED | ❌ Not supported | |
-| Changing column types (ALTER TABLE .. ALTER COLUMN TYPE) | ❌ Not supported | Translates but breaks at execution ("no such column" on subsequent use) |
+| Changing column types (ALTER TABLE .. ALTER COLUMN TYPE) | ❌ Not supported | Rejected with an error. The stored values are not converted to the new type |
 | CREATE ACCESS METHOD | ❌ Not supported | |
 | CREATE TABLE ... (LIKE) with foreign tables, views and composite types | ❌ Not supported | LIKE is silently ignored |
 | DROP object IF EXISTS | ✅ Supported | TABLE, INDEX, VIEW, MATERIALIZED VIEW, TYPE, DOMAIN, SEQUENCE, SCHEMA |

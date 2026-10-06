@@ -704,28 +704,9 @@ impl PostgreSQLTranslator {
                 ast::AlterTableBody::DropColumn(ast::Name::from_string(&cmd.name))
             }
             AlterTableType::AtAlterColumnType => {
-                // ALTER TABLE t ALTER COLUMN c TYPE new_type
-                // Map to AlterColumn with the new column definition
-                let col_def = match &cmd.def {
-                    Some(def_node) => match &def_node.node {
-                        Some(Node::ColumnDef(cd)) => cd,
-                        _ => {
-                            return Err(ParseError::ParseError(
-                                "ALTER COLUMN TYPE: expected ColumnDef".into(),
-                            ));
-                        }
-                    },
-                    None => {
-                        return Err(ParseError::ParseError(
-                            "ALTER COLUMN TYPE: missing column definition".into(),
-                        ));
-                    }
-                };
-                let col = self.translate_column_def(col_def)?;
-                ast::AlterTableBody::AlterColumn {
-                    old: ast::Name::from_string(&cmd.name),
-                    new: col,
-                }
+                return Err(ParseError::ParseError(
+                    "ALTER TABLE ... ALTER COLUMN ... TYPE is not supported".into(),
+                ));
             }
             AlterTableType::AtColumnDefault => {
                 return Err(ParseError::ParseError(
@@ -6798,22 +6779,15 @@ mod tests {
     }
 
     #[test]
-    fn test_alter_table_alter_column_type() {
+    fn test_alter_table_alter_column_type_unsupported() {
         let translator = PostgreSQLTranslator::new();
         let sql = "ALTER TABLE users ALTER COLUMN age TYPE bigint";
         let parsed = crate::parse(sql).unwrap();
-        let translated = translator.translate(&parsed).unwrap();
-
-        if let ast::Stmt::AlterTable(alter) = translated {
-            assert_eq!(alter.name.name.as_str(), "users");
-            if let ast::AlterTableBody::AlterColumn { old, .. } = &alter.body {
-                assert_eq!(old.as_str(), "age");
-            } else {
-                panic!("Expected AlterColumn, got: {:?}", alter.body);
-            }
-        } else {
-            panic!("Expected AlterTable");
-        }
+        let err = translator.translate(&parsed).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "ALTER TABLE ... ALTER COLUMN ... TYPE is not supported"
+        );
     }
 
     #[test]
