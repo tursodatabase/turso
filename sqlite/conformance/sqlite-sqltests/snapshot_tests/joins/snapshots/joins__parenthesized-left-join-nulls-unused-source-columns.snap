@@ -32,7 +32,7 @@ addr  opcode            p1  p2  p3  p4        p5  comment
    5    Integer          0   9   0             0  r[9]=0
    6    Once            15   0   0             0  goto 15
    7    OpenAutoindex    2   0   0             0  cursor=2
-   8    Rewind           1   9   0             0  Rewind table nested_prune_right
+   8    Rewind           1  15   0             0  Rewind table nested_prune_right
    9      ColumnRange    1   0  10  2          0  r[10..11]=nested_prune_right.id..value
   10      RowId          1  12   0             0  r[12]=nested_prune_right.rowid
   11      MakeRecord    10   3  13             0  r[13]=mkrec(r[10..12]); for ephemeral_nested_prune_right_t3
@@ -67,7 +67,7 @@ addr  opcode            p1  p2  p3  p4        p5  comment
   40    Yield            1  63   0             0
   41    Once            50   0   0             0  goto 50
   42    OpenAutoindex    4   0   0             0  cursor=4
-  43    Rewind           3  44   0             0  Rewind table nested_prune_outer
+  43    Rewind           3  50   0             0  Rewind table nested_prune_outer
   44      ColumnRange    3   0  19  2          0  r[19..20]=nested_prune_outer.id..value
   45      RowId          3  21   0             0  r[21]=nested_prune_outer.rowid
   46      MakeRecord    19   3  22             0  r[22]=mkrec(r[19..21]); for ephemeral_nested_prune_outer_t1

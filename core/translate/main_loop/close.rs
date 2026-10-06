@@ -505,7 +505,7 @@ pub(super) fn emit_autoindex(
     let label_ephemeral_build_loop_start = program.allocate_label();
     program.emit_insn(Insn::Rewind {
         cursor_id: table_cursor_id,
-        pc_if_empty: label_ephemeral_build_loop_start,
+        pc_if_empty: label_ephemeral_build_end,
     });
     program.preassign_label_to_next_insn(label_ephemeral_build_loop_start);
     let label_ephemeral_build_loop_next = program.allocate_label();
