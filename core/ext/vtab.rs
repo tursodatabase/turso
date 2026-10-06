@@ -33,10 +33,10 @@ impl ModuleImplementation {
         Ok((VirtualTableType::External(table), schema))
     }
 
-    pub(crate) fn allows_reads_in_triggers(&self) -> bool {
+    pub(crate) fn innocuous(&self) -> bool {
         match self {
             Self::C(_) => false,
-            Self::Native(module) => module.allows_reads_in_triggers(),
+            Self::Native(module) => module.innocuous(),
         }
     }
 }
