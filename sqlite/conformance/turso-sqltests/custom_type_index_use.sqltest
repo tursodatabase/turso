@@ -1034,9 +1034,9 @@ expect {
     0
 }
 
-# Known difference between plans: the seek ENCODEs the literal once before it
-# reads a row, and the scan ENCODEs it only for a row that reaches the
-# comparison. With no such row, only the seek raises the error.
+# Known difference between plans: the seek computes the key of the literal
+# once before it reads a row, and the scan compares it only for a row that
+# reaches the comparison. With no such row, only the seek raises the error.
 @requires strict "uses STRICT tables"
 test numeric-invalid-literal-without-index-gives-no-row-of-empty-table {
     CREATE TABLE e(id INTEGER PRIMARY KEY, n numeric(10,2)) STRICT;

@@ -488,6 +488,7 @@ fn translate_leaf_condition_expr(
                 Some(referenced_tables),
                 resolver.schema(),
                 decoded_self_table.as_deref(),
+                resolver.numeric_comparisons(),
             ) {
                 let result_reg = emit_custom_type_operator(
                     program,

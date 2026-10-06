@@ -1,6 +1,7 @@
 //! Files that tursopg wrote before canonical table storage (the fixtures in
 //! fixtures/pg_v1, made by tursopg at commit e6c79b43) must keep their
-//! values and stay writable.
+//! values and stay writable. The fixtures named sqlite_v1_* were made by
+//! tursodb at the same commit with the SQLite dialect.
 
 use crate::common::{core_rows, open_with_sqlite_dialect, rows, TempDatabase};
 use std::path::{Path, PathBuf};
@@ -548,6 +549,87 @@ fn numeric_expression_indexes_of_base_file_keep_their_keys() {
     );
 }
 
+/// The base file has indexes whose keys and WHERE clauses compare a numeric
+/// with arithmetic, a list and a decimal literal. The base binary computed
+/// them with the comparison rules of its version, which are not the rules of
+/// queries today. A DELETE, an UPDATE, an INSERT and an UPSERT compute the
+/// keys as the base binary did.
+#[test]
+fn numeric_comparison_indexes_of_base_file_keep_their_keys() {
+    let dir = copy_fixtures(&["pg_v1_numeric_comparison_index.db"]);
+    let db = open(dir.path().join("pg_v1_numeric_comparison_index.db"), false);
+    let conn = db.connect_postgres();
+    assert_eq!(core_rows(conn.inner(), "PRAGMA integrity_check"), ["ok"]);
+    for sql in [
+        "DELETE FROM p WHERE id = 1",
+        "UPDATE p SET price = 70 WHERE id = 2",
+        "INSERT INTO p VALUES (4, 'a', 70, 10, 60)",
+        "INSERT INTO p VALUES (3, 'c', 1, 10, 20) ON CONFLICT (id) DO UPDATE SET price = excluded.price",
+        "DELETE FROM p WHERE id = 2",
+        "INSERT INTO p VALUES (5, 'b', 80, 10, 60)",
+    ] {
+        conn.execute(sql).unwrap();
+    }
+    assert_eq!(core_rows(conn.inner(), "PRAGMA integrity_check"), ["ok"]);
+    assert_eq!(
+        rows(&conn, "SELECT id, name, price FROM p ORDER BY id"),
+        ["3|c|1.00", "4|a|70.00", "5|b|80.00"]
+    );
+}
+
+/// [numeric_comparison_indexes_of_base_file_keep_their_keys] for a file of
+/// the SQLite dialect, whose indexes also compare with a negative literal.
+#[test]
+fn numeric_comparison_indexes_of_sqlite_dialect_base_file_keep_their_keys() {
+    let file = "sqlite_v1_numeric_comparison_index.db";
+    let dir = copy_fixtures(&[file]);
+    let db = open_with_sqlite_dialect(&dir.path().join(file)).unwrap();
+    let conn = db.connect().unwrap();
+    assert_eq!(core_rows(&conn, "PRAGMA integrity_check"), ["ok"]);
+    for sql in [
+        "DELETE FROM v WHERE id = 1",
+        "UPDATE v SET val = -3 WHERE id = 2",
+        "INSERT INTO v VALUES (4, 'a', 7, 1)",
+        "INSERT OR REPLACE INTO v VALUES (3, 'c', -2, 1)",
+        "INSERT INTO v VALUES (2, 'b', 9, 1) ON CONFLICT (id) DO UPDATE SET val = excluded.val",
+        "DELETE FROM v WHERE id = 4",
+        "INSERT INTO v VALUES (5, 'a', 8, 1)",
+    ] {
+        conn.execute(sql).unwrap();
+    }
+    assert_eq!(core_rows(&conn, "PRAGMA integrity_check"), ["ok"]);
+    assert_eq!(
+        core_rows(&conn, "SELECT id, name, val FROM v ORDER BY id"),
+        ["2|b|9.00", "3|c|-2.00", "5|a|8.00"]
+    );
+}
+
+/// The base file has a user type named pg_date. A database whose tables use
+/// the built-in pg_date refuses to attach it: one name cannot have two types.
+#[test]
+fn attach_of_base_file_with_user_type_named_like_a_built_in_type_is_refused() {
+    let dir = copy_fixtures(&["pg_v1_pg_prefix_type.db"]);
+    let db = open(dir.path().join("main.db"), false);
+    let conn = db.connect_postgres();
+    conn.execute("CREATE TABLE m (id int PRIMARY KEY, d date)")
+        .unwrap();
+    let attach = format!(
+        "ATTACH '{}' AS old",
+        dir.path().join("pg_v1_pg_prefix_type.db").display()
+    );
+    let err = conn
+        .inner()
+        .execute(attach)
+        .and_then(|_| conn.inner().execute("SELECT x FROM old.pd"))
+        .unwrap_err();
+    assert!(
+        err.to_string().contains(
+            "column pd.x uses type \"pg_date\", which the attached database and the main database define differently"
+        ),
+        "{err}"
+    );
+}
+
 /// A FOREIGN KEY compares stored values. A new table stores a numeric of
 /// precision at most 18 as an integer, so a reference from it to a numeric
 /// column of the base file is refused. A bigint stores the same integer in
@@ -562,7 +644,7 @@ fn foreign_keys_to_base_file_columns_need_the_same_stored_form() {
         .unwrap_err();
     assert!(
         err.to_string().contains(
-            "column c of type pg_numeric stores its values in another form than column c of type numeric"
+            "refs_comp.c stores decimals as integers with scale 1, but comp.c stores the values of type numeric"
         ),
         "{err}"
     );

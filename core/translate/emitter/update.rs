@@ -24,10 +24,11 @@ use crate::{
         },
         eqp::eqp_detail_for_table_op,
         expr::{
-            emit_dml_expr_index_value, emit_returning_results, emit_returning_scan_back,
-            emit_stored_column, emit_table_column, restore_returning_row_image_in_cache,
-            seed_returning_row_image_in_cache, translate_expr, translate_expr_no_constant_opt,
-            IndexExprKind, NoConstantOptReason, ReturningBufferCtx,
+            column_encodes_stored_value, emit_dml_expr_index_value, emit_returning_results,
+            emit_returning_scan_back, emit_stored_column, emit_table_column,
+            restore_returning_row_image_in_cache, seed_returning_row_image_in_cache,
+            translate_expr, translate_expr_no_constant_opt, IndexExprKind, NoConstantOptReason,
+            ReturningBufferCtx,
         },
         fkeys::{
             affected_parent_fks_for_update, emit_fk_child_update_counters,
@@ -900,15 +901,11 @@ fn emit_update_column_values<'a>(
                             // Columns with custom type encode must not have their
                             // SET expressions hoisted as constants. See the doc
                             // comment on NoConstantOptReason::CustomTypeEncode.
-                            let has_custom_encode = {
-                                let ty = &table_column.ty_str;
-                                !ty.is_empty()
-                                    && t_ctx
-                                        .resolver
-                                        .schema
-                                        .get_type_def_unchecked(ty)
-                                        .is_some_and(|td| td.encode().is_some())
-                            };
+                            let has_custom_encode = column_encodes_stored_value(
+                                table_column,
+                                column_ctx.target_table.table.is_strict(),
+                                &t_ctx.resolver,
+                            );
                             let translate_result = if has_custom_encode {
                                 translate_expr_no_constant_opt(
                                     program,
@@ -1845,14 +1842,16 @@ fn emit_update_insns<'a>(
                 .bind_where_expr(Some(table_references), resolver)?
                 .expect("index.where_clause was checked to be Some above");
             let old_satisfied_reg = program.alloc_register();
-            translate_expr_no_constant_opt(
-                program,
-                Some(table_references),
-                &where_clause,
-                old_satisfied_reg,
-                &t_ctx.resolver,
-                NoConstantOptReason::RegisterReuse,
-            )?;
+            t_ctx.resolver.with_index_expression(|| {
+                translate_expr_no_constant_opt(
+                    program,
+                    Some(table_references),
+                    &where_clause,
+                    old_satisfied_reg,
+                    &t_ctx.resolver,
+                    NoConstantOptReason::RegisterReuse,
+                )
+            })?;
 
             // Evaluate the partial index predicate against the NEW row image.
             // We use emit_dml_expr_index_value which properly sets up SelfTableContext::ForDML,

@@ -331,3 +331,150 @@ expect {
     4
     5|-84.00
 }
+
+test insert-of-several-rows-uses-constant-defaults-for-every-row {
+    CREATE TABLE c (id serial PRIMARY KEY, v text, n numeric(10,2) DEFAULT 1, d date DEFAULT '2024-01-01', ts timestamp DEFAULT '2024-01-01 10:00', tz timestamptz DEFAULT '2024-01-01 10:00+02', t time DEFAULT '10:00');
+    INSERT INTO c (v) VALUES ('a'), ('b'), ('c');
+    INSERT INTO c (v) SELECT 'g' FROM generate_series(1, 2);
+    SELECT id, v, n, d, ts, tz, t FROM c ORDER BY id;
+}
+expect {
+    1|a|1.00|2024-01-01|2024-01-01 10:00:00|2024-01-01 08:00:00+00|10:00:00
+    2|b|1.00|2024-01-01|2024-01-01 10:00:00|2024-01-01 08:00:00+00|10:00:00
+    3|c|1.00|2024-01-01|2024-01-01 10:00:00|2024-01-01 08:00:00+00|10:00:00
+    4|g|1.00|2024-01-01|2024-01-01 10:00:00|2024-01-01 08:00:00+00|10:00:00
+    5|g|1.00|2024-01-01|2024-01-01 10:00:00|2024-01-01 08:00:00+00|10:00:00
+}
+
+test insert-of-several-rows-uses-clock-defaults-for-every-row {
+    CREATE TABLE c (id serial PRIMARY KEY, v text, tz timestamptz DEFAULT CURRENT_TIMESTAMP, d date DEFAULT CURRENT_DATE, ts timestamp DEFAULT LOCALTIMESTAMP, n timestamp DEFAULT 'now');
+    INSERT INTO c (v) VALUES ('a'), ('b'), ('c');
+    INSERT INTO c (v) SELECT 'g' FROM generate_series(1, 2);
+    SELECT count(*) FROM c WHERE tz > '2020-01-01' AND d > '2020-01-01' AND ts > '2020-01-01' AND n > '2020-01-01';
+}
+expect {
+    5
+}
+
+test insert-of-several-rows-uses-domain-defaults-for-every-row {
+    CREATE DOMAIN day AS date DEFAULT '2024-01-01';
+    CREATE DOMAIN tod AS time DEFAULT '10:30';
+    CREATE TABLE c (id serial PRIMARY KEY, v text, d day, t tod);
+    INSERT INTO c (v) VALUES ('a'), ('b');
+    SELECT id, d, t FROM c ORDER BY id;
+}
+expect {
+    1|2024-01-01|10:30:00
+    2|2024-01-01|10:30:00
+}
+
+test update-of-domain-columns-over-temporal-types-in-several-rows {
+    CREATE DOMAIN tstz AS timestamptz;
+    CREATE DOMAIN day AS date;
+    CREATE DOMAIN recent AS timestamp CHECK (VALUE > '2020-01-01');
+    CREATE DOMAIN tod AS time;
+    CREATE TABLE c (id serial PRIMARY KEY, a tstz, b day, r recent, t tod);
+    INSERT INTO c (a, b, r, t) VALUES ('2024-01-01', '2024-01-01', '2024-01-01', '10:00'), ('2024-01-02', '2024-01-02', '2024-01-02', '11:00');
+    UPDATE c SET a = '2025-01-01', b = '2025-01-02', r = '2025-01-03', t = '12:00';
+    SELECT id, a, b, r, t FROM c ORDER BY id;
+}
+expect {
+    1|2025-01-01 00:00:00+00|2025-01-02|2025-01-03 00:00:00|12:00:00
+    2|2025-01-01 00:00:00+00|2025-01-02|2025-01-03 00:00:00|12:00:00
+}
+
+test index-on-a-cast-of-a-text-column-to-time-is-refused {
+    CREATE TABLE t (id int PRIMARY KEY, s text);
+    CREATE INDEX t_tm ON t ((s::time));
+}
+expect error {}
+
+test index-on-a-cast-of-a-text-column-to-date-is-refused {
+    CREATE TABLE t (id int PRIMARY KEY, s text);
+    CREATE INDEX t_d ON t ((s::date));
+}
+expect error {}
+
+test index-on-a-cast-of-a-text-column-to-timestamp-is-refused {
+    CREATE TABLE t (id int PRIMARY KEY, s text);
+    CREATE INDEX t_ts ON t ((s::timestamp));
+}
+expect error {}
+
+test partial-index-on-a-cast-of-a-text-column-to-timestamptz-is-refused {
+    CREATE TABLE t (id int PRIMARY KEY, s text);
+    CREATE INDEX t_tz ON t (id) WHERE s::timestamptz > '2024-01-01';
+}
+expect error {}
+
+test index-on-a-cast-of-a-temporal-column-keeps-its-keys {
+    CREATE DOMAIN recent AS timestamp CHECK (VALUE > '2020-01-01');
+    CREATE TABLE t (id int PRIMARY KEY, ts timestamp, tz timestamptz, r recent);
+    CREATE INDEX t_day ON t ((ts::date));
+    CREATE INDEX t_time ON t ((tz::time));
+    CREATE INDEX t_r ON t ((r::date::timestamp));
+    CREATE INDEX t_late ON t (id) WHERE ts::time > '12:00';
+    INSERT INTO t VALUES (1, '2024-01-01 13:00', '2024-01-01 10:00+02', '2024-03-01 10:00'), (2, '2024-01-02 09:00', '2024-01-02', '2024-03-02');
+    DELETE FROM t WHERE id = 1;
+    UPDATE t SET ts = '2024-01-05 14:00' WHERE id = 2;
+    SELECT id, ts::date, tz::time, r::date::timestamp FROM t;
+}
+expect {
+    2|2024-01-05|00:00:00|2024-03-02 00:00:00
+}
+
+test date-with-a-year-of-one-or-two-digits-is-refused {
+    SELECT '24-01-15'::date;
+}
+expect error {}
+
+test date-with-a-year-of-three-digits {
+    SELECT '124-01-01'::date;
+}
+expect {
+    0124-01-01
+}
+
+test time-fraction-rounds-half-to-even {
+    SELECT '2024-01-01 10:00:00.0000005'::timestamp, '2024-01-01 10:00:00.0000025'::timestamp, '2024-01-01 10:00:00.1234565'::timestamp, '10:00:00.0000015'::time;
+}
+expect {
+    2024-01-01 10:00:00|2024-01-01 10:00:00.000002|2024-01-01 10:00:00.123456|10:00:00.000002
+}
+
+test numeric-input-accepts-surrounding-spaces-in-comparisons {
+    CREATE TABLE t (id int PRIMARY KEY, n numeric(10,2));
+    INSERT INTO t VALUES (1, ' 7 ');
+    SELECT id, n FROM t WHERE n = ' 7 ';
+}
+expect {
+    1|7.00
+}
+
+test numeric-input-refuses-underscores-at-the-end {
+    CREATE TABLE t (id int PRIMARY KEY, n numeric(10,2));
+    INSERT INTO t VALUES (1, '1000_');
+}
+expect error {}
+
+test numeric-input-refuses-double-underscores {
+    CREATE TABLE t (id int PRIMARY KEY, n numeric(10,2));
+    INSERT INTO t VALUES (1, '1__000');
+}
+expect error {}
+
+test numeric-input-accepts-single-underscores-between-digits {
+    CREATE TABLE t (id int PRIMARY KEY, n numeric(10,2));
+    INSERT INTO t VALUES (1, '1_000.5');
+    SELECT n FROM t;
+}
+expect {
+    1000.50
+}
+
+test add-column-refuses-a-default-that-the-type-refuses {
+    CREATE TABLE a (id int PRIMARY KEY, v text);
+    INSERT INTO a VALUES (1, 'a');
+    ALTER TABLE a ADD COLUMN t time DEFAULT '25:00';
+}
+expect error {}

@@ -1599,3 +1599,32 @@ expect {
     1|42
     2|42
 }
+
+@requires custom_types "uses CREATE DOMAIN"
+test domain-over-encoding-type-update-of-several-rows-encodes-each-value-once {
+    CREATE TYPE cents BASE integer ENCODE value * 100 DECODE value / 100;
+    CREATE DOMAIN money AS cents;
+    CREATE TABLE m(id INTEGER PRIMARY KEY, a money) STRICT;
+    INSERT INTO m VALUES (1, 1), (2, 2), (3, 3);
+    UPDATE m SET a = 5;
+    SELECT id, a FROM m ORDER BY id;
+}
+expect {
+    1|5
+    2|5
+    3|5
+}
+
+@requires custom_types "uses CREATE DOMAIN"
+test domain-over-encoding-type-default-of-several-rows-encodes-each-value-once {
+    CREATE TYPE cents BASE integer ENCODE value * 100 DECODE value / 100;
+    CREATE DOMAIN money AS cents DEFAULT 5;
+    CREATE TABLE m(id INTEGER PRIMARY KEY, v TEXT, a money, b cents DEFAULT 7) STRICT;
+    INSERT INTO m (id, v) VALUES (1, 'a'), (2, 'b'), (3, 'c');
+    SELECT id, a, b FROM m ORDER BY id;
+}
+expect {
+    1|5|7
+    2|5|7
+    3|5|7
+}

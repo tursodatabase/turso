@@ -4,7 +4,7 @@ use rustc_hash::FxHashMap as HashMap;
 use std::sync::Arc;
 use turso_core::{
     dialect::{decode_stored_table_sql, refuse_older_postgres_frontend_rewrite, StoredTableSql},
-    schema::{BTreeTable, Schema, Table},
+    schema::{BTreeTable, PgStorageType, Schema, Table},
     Connection, Dialect, Func, InternalVirtualTable, InternalVirtualTableCursor, LimboError,
     Result, Value, VirtualTable,
 };
@@ -246,21 +246,25 @@ fn sqlite_type_to_pg_oid(ty_str: &str) -> i64 {
         "CIDR" => 650,
         "MACADDR" => 829,
         "OID" => 26,
-        "PG_INT4" => 23,
-        "PG_INT8" => 20,
-        "PG_TIMESTAMP" => 1114,
-        "PG_TIMESTAMPTZ" => 1184,
-        "PG_DATE" => 1082,
-        "PG_TIME" => 1083,
-        "PG_NUMERIC" => 1700,
         _ => 25, // default to text
     }
 }
 
 /// A database of an older version can have a user type with the name of a
-/// built-in `pg_` type.
+/// built-in type of the PostgreSQL frontend: its column shows as text.
+fn column_type_oid(schema: &Schema, ty_str: &str) -> i64 {
+    match schema
+        .get_type_def_unchecked(ty_str)
+        .and_then(|type_def| type_def.pg_storage_type())
+    {
+        Some(pg_type) => i64::from(pg_type.oid()),
+        None if PgStorageType::from_type_name(ty_str).is_some() => 25,
+        None => sqlite_type_to_pg_oid(ty_str),
+    }
+}
+
 fn is_user_type_with_builtin_name(schema: &Schema, ty_str: &str) -> bool {
-    ty_str.to_lowercase().starts_with("pg_")
+    PgStorageType::from_type_name(ty_str).is_some()
         && schema
             .get_type_def_unchecked(ty_str)
             .is_some_and(|type_def| !type_def.is_builtin)
@@ -781,11 +785,7 @@ impl PgAttributeCursor {
             let columns = table.columns();
             for (i, col) in columns.iter().enumerate() {
                 let col_name = col.name.clone().unwrap_or_default();
-                let type_oid = if is_user_type_with_builtin_name(&schema, &col.ty_str) {
-                    25
-                } else {
-                    sqlite_type_to_pg_oid(&col.ty_str)
-                };
+                let type_oid = column_type_oid(&schema, &col.ty_str);
                 let attnum = (i + 1) as i64; // 1-based
                 let notnull = if col.notnull() { 1i64 } else { 0i64 };
                 let has_def = if col.default.is_some() { 1i64 } else { 0i64 };
@@ -3461,8 +3461,8 @@ fn pg_storage_table_ddl(sql: &str, schema: &Schema) -> Result<String> {
             (
                 ty.array_dimensions == 0
                     && (ty.name.eq_ignore_ascii_case("INTEGER")
-                        || ((ty.name.eq_ignore_ascii_case("pg_int4")
-                            || ty.name.eq_ignore_ascii_case("pg_int8"))
+                        || (PgStorageType::from_type_name(&ty.name)
+                            .is_some_and(PgStorageType::is_rowid_alias_type)
                             && !is_user_type_with_builtin_name(schema, &ty.name))),
                 ty.array_dimensions == 0 && ty.name.eq_ignore_ascii_case("boolean"),
             )
@@ -3552,106 +3552,58 @@ fn postgres_default(expr: turso_parser::ast::Expr, is_boolean: bool) -> turso_pa
 /// The translation stores `ARRAY[...]` as a call of `array` and a cast to
 /// timestamp, timestamptz, date or time as a call of the function of the
 /// built-in type. PostgreSQL knows neither function.
-fn postgres_expr(expr: turso_parser::ast::Expr) -> turso_parser::ast::Expr {
+fn postgres_expr(mut expr: turso_parser::ast::Expr) -> turso_parser::ast::Expr {
     use turso_parser::ast::Expr;
-    let convert_all = |exprs: Vec<Box<Expr>>| -> Vec<Box<Expr>> {
-        exprs
-            .into_iter()
-            .map(|expr| Box::new(postgres_expr(*expr)))
-            .collect()
-    };
-    match expr {
-        Expr::FunctionCall { name, args, .. } if name.as_str().eq_ignore_ascii_case("array") => {
-            Expr::Array {
-                elements: convert_all(args),
-            }
-        }
-        Expr::FunctionCall { name, mut args, .. }
-            if args.len() == 1 && pg_cast_function_type(name.as_str()).is_some() =>
+    turso_core::walk_expr_mut(&mut expr, &mut |expr: &mut Expr| {
+        let Expr::FunctionCall { name, args, .. } = expr else {
+            return Ok(turso_core::WalkControl::Continue);
+        };
+        if name.as_str().eq_ignore_ascii_case("array") {
+            *expr = Expr::Array {
+                elements: std::mem::take(args)
+                    .into_iter()
+                    .map(|element| Box::new(postgres_expr(*element)))
+                    .collect(),
+            };
+            return Ok(turso_core::WalkControl::SkipChildren);
+        } else if let Some(type_name) =
+            pg_cast_function_type(name.as_str()).filter(|_| args.len() == 1)
         {
-            Expr::Cast {
-                expr: Box::new(postgres_expr(*args.remove(0))),
+            *expr = Expr::Cast {
+                expr: args.pop().expect("one argument"),
                 type_name: Some(turso_parser::ast::Type {
-                    name: pg_cast_function_type(name.as_str())
-                        .expect("checked above")
-                        .to_string(),
+                    name: type_name.to_string(),
                     size: None,
                     array_dimensions: 0,
                 }),
-            }
+            };
         }
-        Expr::FunctionCall {
-            name,
-            distinctness,
-            args,
-            order_by,
-            within_group,
-            filter_over,
-        } => Expr::FunctionCall {
-            name,
-            distinctness,
-            args: convert_all(args),
-            order_by,
-            within_group,
-            filter_over,
-        },
-        Expr::Parenthesized(exprs) => Expr::Parenthesized(convert_all(exprs)),
-        Expr::Cast { expr, type_name } => Expr::Cast {
-            expr: Box::new(postgres_expr(*expr)),
-            type_name,
-        },
-        Expr::Binary(lhs, op, rhs) => Expr::Binary(
-            Box::new(postgres_expr(*lhs)),
-            op,
-            Box::new(postgres_expr(*rhs)),
-        ),
-        Expr::Unary(op, expr) => Expr::Unary(op, Box::new(postgres_expr(*expr))),
-        Expr::Between {
-            lhs,
-            not,
-            start,
-            end,
-        } => Expr::Between {
-            lhs: Box::new(postgres_expr(*lhs)),
-            not,
-            start: Box::new(postgres_expr(*start)),
-            end: Box::new(postgres_expr(*end)),
-        },
-        Expr::InList { lhs, not, rhs } => Expr::InList {
-            lhs: Box::new(postgres_expr(*lhs)),
-            not,
-            rhs: convert_all(rhs),
-        },
-        expr => expr,
-    }
+        Ok(turso_core::WalkControl::Continue)
+    })
+    .expect("the callback returns no error");
+    expr
 }
 
 fn pg_cast_function_type(function: &str) -> Option<&'static str> {
-    match function.to_ascii_lowercase().as_str() {
-        "pg_timestamp" => Some("timestamp"),
-        "pg_timestamptz" => Some("timestamptz"),
-        "pg_date" => Some("date"),
-        "pg_time" => Some("time"),
-        _ => None,
-    }
+    PgStorageType::from_type_name(function)
+        .filter(|pg_type| pg_type.is_date_or_time())
+        .map(PgStorageType::postgres_name)
 }
 
 fn postgres_type_name(turso_type: &str, is_serial: bool) -> &str {
+    if let Some(pg_type) = PgStorageType::from_type_name(turso_type) {
+        return match (pg_type, is_serial) {
+            (PgStorageType::Int4, true) => "serial",
+            (PgStorageType::Int8, true) => "bigserial",
+            _ => pg_type.postgres_name(),
+        };
+    }
     match turso_type.to_ascii_uppercase().as_str() {
         "INTEGER" if is_serial => "serial",
         "INTEGER" => "integer",
         "REAL" => "double precision",
         "TEXT" => "text",
         "BLOB" => "bytea",
-        "PG_INT4" if is_serial => "serial",
-        "PG_INT4" => "integer",
-        "PG_INT8" if is_serial => "bigserial",
-        "PG_INT8" => "bigint",
-        "PG_TIMESTAMP" => "timestamp",
-        "PG_TIMESTAMPTZ" => "timestamptz",
-        "PG_DATE" => "date",
-        "PG_TIME" => "time",
-        "PG_NUMERIC" => "numeric",
         _ => turso_type,
     }
 }

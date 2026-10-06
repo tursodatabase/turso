@@ -21,7 +21,10 @@ use crate::{
     },
     translate::{
         emitter::{emit_check_constraints, gencol::compute_virtual_columns, Resolver},
-        expr::{emit_stored_column, translate_expr, walk_expr, walk_expr_mut, WalkControl},
+        expr::{
+            emit_stored_column, translate_expr, translate_expr_no_constant_opt, walk_expr,
+            walk_expr_mut, NoConstantOptReason, WalkControl,
+        },
         plan::{ColumnMask, ColumnUsedMask, OuterQueryReference, TableReferences},
         trigger::create_trigger_to_sql,
     },
@@ -732,7 +735,7 @@ fn emit_add_column_check_validation(
         Some(expr) if !crate::util::expr_contains_null(expr) => *expr.clone(),
         _ => return Ok(()),
     };
-    let default_expr = value_that_check_reads(default_expr, column, btree, resolver);
+    let default_expr = value_that_check_reads(default_expr, column, btree, resolver)?;
 
     // Collect CHECK constraints from column-level constraints + domain CHECKs.
     // Domain CHECKs use `value` as placeholder which must be rewritten to the column name.
@@ -857,21 +860,60 @@ fn value_that_check_reads(
     column: &Column,
     btree: &BTreeTable,
     resolver: &Resolver,
-) -> ast::Expr {
-    let reads_decoded_value = matches!(
-        resolver.schema().resolve_type(&column.ty_str, btree.is_strict),
-        Ok(Some(resolved)) if resolved.check_reads_decoded_value()
-    );
+) -> Result<ast::Expr> {
+    let reads_decoded_value = resolver
+        .schema()
+        .resolve_type(&column.ty_str, btree.is_strict)?
+        .is_some_and(|resolved| resolved.check_reads_decoded_value());
     if !reads_decoded_value {
-        return default_expr;
+        return Ok(default_expr);
     }
+    Ok(cast_to_column_type(default_expr, column))
+}
+
+/// The rows of a table read the ENCODEd DEFAULT of a column that ADD COLUMN
+/// adds, so a DEFAULT that the ENCODE refuses makes every row unreadable.
+/// Refuse it when the table has rows.
+fn emit_add_column_default_encode_validation(
+    program: &mut ProgramBuilder,
+    original_btree: &Arc<BTreeTable>,
+    column: &Column,
+    default_expr: &ast::Expr,
+    resolver: &Resolver,
+    database_id: usize,
+) -> Result<()> {
+    let check_cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(original_btree.clone()));
+    program.emit_insn(Insn::OpenRead {
+        cursor_id: check_cursor_id,
+        root_page: original_btree.root_page,
+        db: database_id,
+    });
+    let table_is_empty = program.allocate_label();
+    program.emit_insn(Insn::Rewind {
+        cursor_id: check_cursor_id,
+        pc_if_empty: table_is_empty,
+    });
+    let reg = program.alloc_register();
+    translate_expr_no_constant_opt(
+        program,
+        None,
+        &cast_to_column_type(default_expr.clone(), column),
+        reg,
+        resolver,
+        NoConstantOptReason::RegisterReuse,
+    )?;
+    program.preassign_label_to_next_insn(table_is_empty);
+    Ok(())
+}
+
+fn cast_to_column_type(expr: ast::Expr, column: &Column) -> ast::Expr {
     let size = match column.ty_params.as_slice() {
         [max_size] => Some(ast::TypeSize::MaxSize(max_size.clone())),
         [precision, scale] => Some(ast::TypeSize::TypeSize(precision.clone(), scale.clone())),
         _ => None,
     };
     ast::Expr::Cast {
-        expr: Box::new(default_expr),
+        expr: Box::new(expr),
         type_name: Some(ast::Type {
             name: column.ty_str.clone(),
             size,
@@ -1355,12 +1397,24 @@ pub fn translate_alter_table(
                             "unknown datatype for {table_name}.{new_column_name}: \"{ty}\""
                         )));
                     }
+                    let column_name = format!("{table_name}.{new_column_name}");
                     crate::translate::schema::validate_pg_storage_column_type(
                         ty,
                         btree.is_pg_storage,
-                        &format!("{table_name}.{new_column_name}"),
+                        &column_name,
                         resolver,
                         connection,
+                    )?;
+                    let params: Vec<&ast::Expr> = column
+                        .ty_params
+                        .iter()
+                        .map(|param| param.as_ref())
+                        .collect();
+                    crate::translate::schema::validate_numeric_type_parameters(
+                        ty,
+                        &params,
+                        &column_name,
+                        resolver,
                     )?;
                 }
 
@@ -1514,11 +1568,11 @@ pub fn translate_alter_table(
                 )?;
             } else {
                 // Check if we need to verify the table is empty at runtime.
-                let type_default = resolver
+                let resolved_type = resolver
                     .schema()
-                    .resolve_type(&column.ty_str, btree.is_strict)
-                    .ok()
-                    .flatten()
+                    .resolve_type(&column.ty_str, btree.is_strict)?;
+                let type_default = resolved_type
+                    .as_ref()
                     .and_then(|r| r.default_expr().cloned());
                 let effective_default = column.default.as_deref().or(type_default.as_ref());
                 let needs_notnull_check = column.notnull()
@@ -1529,12 +1583,11 @@ pub fn translate_alter_table(
                 // bare identifiers qualify. Anything else — (5 + 3), random(),
                 // CURRENT_TIMESTAMP — is permitted only if the table is empty,
                 // checked at runtime (mirroring SQLite's sqlite3ErrorIfNotEmpty).
-                let reads_clock_at_every_read = btree.is_pg_storage
-                    && crate::schema::pg_storage_type_shows_text(&column.ty_str)
-                    && column
-                        .default
-                        .as_deref()
-                        .is_some_and(crate::schema::is_pg_clock_word);
+                let reads_clock_at_every_read = resolved_type
+                    .as_ref()
+                    .and_then(|resolved| resolved.pg_storage_type()?.temporal())
+                    .is_some()
+                    && effective_default.is_some_and(crate::schema::is_pg_clock_word);
                 let needs_nondeterministic_check = reads_clock_at_every_read
                     || column.default.as_ref().is_some_and(|default| {
                         default_requires_empty_table(default)
@@ -1576,6 +1629,25 @@ pub fn translate_alter_table(
 
                 if default_type_mismatch {
                     emit_add_column_default_type_validation(program, &original_btree, database_id)?;
+                }
+
+                if let Some(default_expr) = effective_default.filter(|default| {
+                    !needs_nondeterministic_check
+                        && !crate::util::expr_contains_null(default)
+                        && crate::translate::expr::column_encodes_stored_value(
+                            &column,
+                            btree.is_strict,
+                            resolver,
+                        )
+                }) {
+                    emit_add_column_default_encode_validation(
+                        program,
+                        &original_btree,
+                        &column,
+                        default_expr,
+                        resolver,
+                        database_id,
+                    )?;
                 }
 
                 emit_add_column_check_validation(

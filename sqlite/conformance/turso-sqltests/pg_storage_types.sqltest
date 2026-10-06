@@ -55,7 +55,7 @@ test temporal-input-rounds-to-microseconds {
     SELECT pg_timestamp('2024-01-01 10:00:00.1234565'), pg_timestamp('2024-01-01 23:59:59.9999995'), pg_time('10:00:00.0000004');
 }
 expect {
-    2024-01-01 10:00:00.123457|2024-01-02 00:00:00|10:00:00
+    2024-01-01 10:00:00.123456|2024-01-02 00:00:00|10:00:00
 }
 
 test temporal-input-errors {
@@ -161,6 +161,8 @@ expect {
     1
 }
 
+# The stored integer gives a temporal column the INTEGER affinity, so the
+# text '2024' compares as the number 2024, which every text value exceeds.
 @requires strict "uses STRICT tables"
 @setup events
 test temporal-comparison-with-a-number-same-rows-with-and-without-index {
@@ -479,6 +481,7 @@ expect {
 }
 
 @requires strict "uses STRICT tables"
+@skip-if mvcc "plain VACUUM requires PRAGMA wal_checkpoint(TRUNCATE) first on an MVCC database"
 @setup events
 test vacuum-keeps-the-values {
     VACUUM;
@@ -984,7 +987,7 @@ test foreign-key-between-different-stored-forms-is-refused {
     CREATE TABLE child(id pg_int4 PRIMARY KEY, d pg_date REFERENCES parent(d)) STRICT, PGSTORAGE;
 }
 expect error {
-    foreign key mismatch - "child" referencing "parent": column d of type pg_date stores its values in another form than column d of type date
+    foreign key mismatch - "child" referencing "parent": child.d stores date values as integers, but parent.d stores the values of type date
 }
 
 @requires strict "uses STRICT tables"
@@ -993,7 +996,7 @@ test foreign-key-to-a-parent-created-later-with-another-stored-form-is-refused {
     CREATE TABLE parent(n pg_numeric(12,4) PRIMARY KEY) STRICT, PGSTORAGE;
 }
 expect error {
-    foreign key mismatch - "child" referencing "parent": column n of type pg_numeric stores its values in another form than column n of type pg_numeric
+    foreign key mismatch - "child" referencing "parent": child.n stores decimals as integers with scale 2, but parent.n stores decimals as integers with scale 4
 }
 
 @requires strict "uses STRICT tables"
@@ -1003,7 +1006,7 @@ test foreign-key-of-add-column-with-another-stored-form-is-refused {
     ALTER TABLE child ADD COLUMN d pg_date REFERENCES parent(d);
 }
 expect error {
-    foreign key mismatch - "child" referencing "parent": column d of type pg_date stores its values in another form than column d of type date
+    foreign key mismatch - "child" referencing "parent": child.d stores date values as integers, but parent.d stores the values of type date
 }
 
 @requires strict "uses STRICT tables"
@@ -1042,4 +1045,278 @@ test create-table-as-select-keeps-the-text-of-pg-columns {
 expect {
     2024-01-01 10:00:00|12.50|7|text|text|integer
     CREATE TABLE copy(ts TEXT,n TEXT,i INT)
+}
+
+@requires strict "uses STRICT tables"
+test insert-or-replace-of-several-rows-uses-constant-defaults-for-every-row {
+    CREATE TABLE c(id pg_int4 PRIMARY KEY, v TEXT, n pg_numeric(10,2) DEFAULT 2, d pg_date DEFAULT '2024-01-01', t pg_time DEFAULT '10:00') STRICT, PGSTORAGE;
+    INSERT OR REPLACE INTO c (id, v) VALUES (1, 'a'), (2, 'b'), (3, 'c');
+    INSERT INTO c (id, v) SELECT id + 10, v FROM c;
+    SELECT id, v, n, d, t FROM c ORDER BY id;
+}
+expect {
+    1|a|2.00|2024-01-01|10:00:00
+    2|b|2.00|2024-01-01|10:00:00
+    3|c|2.00|2024-01-01|10:00:00
+    11|a|2.00|2024-01-01|10:00:00
+    12|b|2.00|2024-01-01|10:00:00
+    13|c|2.00|2024-01-01|10:00:00
+}
+
+@requires strict "uses STRICT tables"
+test expression-index-refuses-a-cast-function-of-a-text-column {
+    CREATE TABLE e(id INTEGER PRIMARY KEY, s TEXT) STRICT, PGSTORAGE;
+    CREATE INDEX e_day ON e(pg_date(s));
+}
+expect error {
+    invalid expression in CREATE INDEX
+}
+
+@requires strict "uses STRICT tables"
+test expression-index-refuses-a-cast-of-a-text-column {
+    CREATE TABLE e(id INTEGER PRIMARY KEY, s TEXT) STRICT, PGSTORAGE;
+    CREATE INDEX e_time ON e(CAST(s AS pg_time));
+}
+expect error {
+    invalid expression in CREATE INDEX
+}
+
+@requires strict "uses STRICT tables"
+test expression-index-refuses-a-cast-of-now {
+    CREATE TABLE e(id INTEGER PRIMARY KEY, ts pg_timestamp) STRICT, PGSTORAGE;
+    CREATE INDEX e_now ON e((CAST('now' AS pg_timestamp)));
+}
+expect error {
+    invalid expression in CREATE INDEX
+}
+
+@requires strict "uses STRICT tables"
+test partial-index-refuses-a-cast-expression-of-now {
+    CREATE TABLE e(id INTEGER PRIMARY KEY, ts pg_timestamp) STRICT, PGSTORAGE;
+    CREATE INDEX e_future ON e(id) WHERE ts > CAST('now' AS pg_timestamp);
+}
+expect error {
+    cannot use aggregate, window functions or reference other tables in WHERE clause of CREATE INDEX
+}
+
+@requires custom_types "uses CREATE DOMAIN"
+@requires strict "uses STRICT tables"
+test expression-index-refuses-a-cast-of-a-text-column-to-a-domain-over-a-pg-type {
+    CREATE DOMAIN recent AS pg_timestamp CHECK (value > '2020-01-01');
+    CREATE TABLE e(id INTEGER PRIMARY KEY, s TEXT) STRICT, PGSTORAGE;
+    CREATE INDEX e_recent ON e(CAST(s AS recent));
+}
+expect error {
+    invalid expression in CREATE INDEX
+}
+
+@requires custom_types "uses CREATE DOMAIN"
+@requires strict "uses STRICT tables"
+test expression-index-on-casts-of-pg-columns-keeps-its-keys {
+    CREATE DOMAIN recent AS pg_timestamp CHECK (value > '2020-01-01');
+    CREATE TABLE e(id INTEGER PRIMARY KEY, ts pg_timestamp, r recent) STRICT, PGSTORAGE;
+    CREATE INDEX e_day ON e(CAST(ts AS pg_date));
+    CREATE INDEX e_r ON e(pg_timestamp(pg_date(r)));
+    CREATE INDEX e_late ON e(id) WHERE CAST(ts AS pg_time) > '12:00';
+    INSERT INTO e VALUES (1, '2024-01-01 13:00', '2024-03-01 10:00'), (2, '2024-01-02 09:00', '2024-03-02');
+    DELETE FROM e WHERE id = 1;
+    UPDATE e SET ts = '2024-01-05 14:00' WHERE id = 2;
+    SELECT id, CAST(ts AS pg_date), pg_timestamp(pg_date(r)) FROM e;
+    PRAGMA integrity_check;
+}
+expect {
+    2|2024-01-05|2024-03-02 00:00:00
+    ok
+}
+
+test pg-numeric-decode-refuses-a-scale-out-of-range {
+    SELECT pg_numeric_decode(5, 25);
+}
+expect error {
+    pg_numeric needs a scale from 0 to 18, got 25
+}
+
+test pg-numeric-decode-refuses-a-negative-scale {
+    SELECT pg_numeric_decode(5, -1);
+}
+expect error {
+    pg_numeric needs a scale from 0 to 18, got -1
+}
+
+@requires strict "uses STRICT tables"
+test numeric-column-refuses-a-scale-that-is-not-an-integer {
+    CREATE TABLE y(id INTEGER PRIMARY KEY, n numeric(10, 2.5)) STRICT;
+}
+expect error {
+    column y.n: numeric scale must be an integer, got 2.5
+}
+
+@requires strict "uses STRICT tables"
+test pg-numeric-column-refuses-a-scale-that-is-not-an-integer {
+    CREATE TABLE y(id INTEGER PRIMARY KEY, n pg_numeric(10, 2.5)) STRICT, PGSTORAGE;
+}
+expect error {
+    column y.n: pg_numeric scale must be an integer, got 2.5
+}
+
+@requires strict "uses STRICT tables"
+test pg-numeric-column-refuses-a-negative-scale {
+    CREATE TABLE y(id INTEGER PRIMARY KEY, n pg_numeric(10, -1)) STRICT, PGSTORAGE;
+}
+expect error {
+    column y.n: pg_numeric scale must be from 0 to the precision 10, got -1
+}
+
+@requires strict "uses STRICT tables"
+test pg-numeric-column-refuses-a-scale-above-the-precision {
+    CREATE TABLE y(id INTEGER PRIMARY KEY, n pg_numeric(10, 30)) STRICT, PGSTORAGE;
+}
+expect error {
+    column y.n: pg_numeric scale must be from 0 to the precision 10, got 30
+}
+
+@requires strict "uses STRICT tables"
+test pg-numeric-column-refuses-a-precision-above-18 {
+    CREATE TABLE y(id INTEGER PRIMARY KEY, n pg_numeric(19, 2)) STRICT, PGSTORAGE;
+}
+expect error {
+    column y.n: pg_numeric precision must be at most 18, got 19
+}
+
+@requires strict "uses STRICT tables"
+test pg-numeric-add-column-refuses-a-scale-that-is-not-an-integer {
+    CREATE TABLE y(id INTEGER PRIMARY KEY) STRICT, PGSTORAGE;
+    ALTER TABLE y ADD COLUMN n pg_numeric(10, 2.5);
+}
+expect error {
+    column y.n: pg_numeric scale must be an integer, got 2.5
+}
+
+test temporal-input-refuses-a-year-of-one-or-two-digits {
+    SELECT pg_date('1-01-01');
+}
+expect error {
+    invalid input syntax for type date: "1-01-01"
+}
+
+test timestamp-input-refuses-a-year-of-two-digits {
+    SELECT pg_timestamp('99-12-31 10:00');
+}
+expect error {
+    invalid input syntax for type timestamp: "99-12-31 10:00"
+}
+
+test temporal-input-accepts-a-year-of-three-digits {
+    SELECT pg_date('124-01-01'), pg_timestamp('0124-01-01 10:00');
+}
+expect {
+    0124-01-01|0124-01-01 10:00:00
+}
+
+test temporal-input-rounds-half-to-even {
+    SELECT pg_timestamp('2024-01-01 10:00:00.0000005'), pg_timestamp('2024-01-01 10:00:00.0000025'), pg_time('10:00:00.1234565'), pg_time('10:00:00.5000005'), pg_time('23:59:59.9999995');
+}
+expect {
+    2024-01-01 10:00:00|2024-01-01 10:00:00.000002|10:00:00.123456|10:00:00.5|24:00:00
+}
+
+@requires custom_types "uses CREATE DOMAIN"
+@requires strict "uses STRICT tables"
+test add-column-of-a-domain-with-now-default-needs-an-empty-table {
+    CREATE DOMAIN tod AS pg_time;
+    CREATE TABLE a(id INTEGER PRIMARY KEY) STRICT, PGSTORAGE;
+    INSERT INTO a VALUES (1);
+    ALTER TABLE a ADD COLUMN t tod DEFAULT 'now';
+}
+expect error {
+    Cannot add a column with non-constant default
+}
+
+@requires strict "uses STRICT tables"
+test foreign-key-to-a-renamed-parent-of-another-stored-form-is-refused-at-insert {
+    PRAGMA foreign_keys = ON;
+    CREATE TABLE child(id pg_int4 PRIMARY KEY, d pg_date REFERENCES p2(d)) STRICT, PGSTORAGE;
+    CREATE TABLE p(d date PRIMARY KEY) STRICT;
+    ALTER TABLE p RENAME TO p2;
+    INSERT INTO p2 VALUES ('2024-01-01');
+    INSERT INTO child VALUES (1, '2024-01-01');
+}
+expect error {
+    foreign key mismatch - "child" referencing "p2": child.d stores date values as integers, but p2.d stores the values of type date
+}
+
+@requires strict "uses STRICT tables"
+test numeric-text-with-spaces-compares-like-the-stored-value {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, n pg_numeric(10,2)) STRICT, PGSTORAGE;
+    INSERT INTO t VALUES (1, ' 7 ');
+    SELECT id, n FROM t WHERE n = ' 7 ';
+    SELECT id FROM t WHERE n = '7.00';
+}
+expect {
+    1|7.00
+    1
+}
+
+test numeric-text-refuses-misplaced-underscores {
+    SELECT CAST('1__000' AS pg_numeric(10,2));
+}
+expect error {
+    invalid input syntax for type numeric: "1__000"
+}
+
+test numeric-text-refuses-a-trailing-underscore {
+    SELECT CAST('1000_' AS pg_numeric(10,2));
+}
+expect error {
+    invalid input syntax for type numeric: "1000_"
+}
+
+test numeric-text-accepts-single-underscores-between-digits {
+    SELECT CAST('1_000.5' AS pg_numeric(10,2));
+}
+expect {
+    1000.50
+}
+
+@requires strict "uses STRICT tables"
+@requires trigger "uses triggers"
+test trigger-reads-the-values-of-temporal-columns {
+    CREATE TABLE ev(id pg_int4 PRIMARY KEY, ts pg_timestamp, d pg_date) STRICT, PGSTORAGE;
+    CREATE TABLE log(id INTEGER PRIMARY KEY, what TEXT) STRICT;
+    CREATE TRIGGER ev_new AFTER INSERT ON ev WHEN NEW.ts > '2024-01-01' BEGIN
+        INSERT INTO log(what) VALUES ('new ' || NEW.ts || ' ' || NEW.d);
+    END;
+    CREATE TRIGGER ev_moved AFTER UPDATE ON ev WHEN OLD.d < NEW.d BEGIN
+        INSERT INTO log(what) VALUES ('moved ' || OLD.d || ' ' || NEW.d);
+    END;
+    INSERT INTO ev VALUES (1, '2023-12-31 10:00', '2023-12-31'), (2, '2024-01-02 10:00:00.5', '2024-01-02');
+    UPDATE ev SET d = '2024-02-01' WHERE id = 2;
+    UPDATE ev SET d = '2020-01-01' WHERE id = 1;
+    SELECT what FROM log ORDER BY id;
+}
+expect {
+    new 2024-01-02 10:00:00.5 2024-01-02
+    moved 2024-01-02 2024-02-01
+}
+
+@requires strict "uses STRICT tables"
+test add-column-refuses-a-default-that-the-type-refuses {
+    CREATE TABLE a(id INTEGER PRIMARY KEY) STRICT, PGSTORAGE;
+    INSERT INTO a VALUES (1);
+    ALTER TABLE a ADD COLUMN t pg_time DEFAULT '25:00';
+}
+expect error {
+    date/time field value out of range: "25:00"
+}
+
+@requires strict "uses STRICT tables"
+test add-column-with-a-valid-default-reads-it-in-old-rows {
+    CREATE TABLE a(id INTEGER PRIMARY KEY) STRICT, PGSTORAGE;
+    INSERT INTO a VALUES (1);
+    ALTER TABLE a ADD COLUMN t pg_time DEFAULT '23:00';
+    ALTER TABLE a ADD COLUMN n pg_numeric(10,2) DEFAULT 1.005;
+    SELECT id, t, n FROM a;
+}
+expect {
+    1|23:00:00|1.01
 }

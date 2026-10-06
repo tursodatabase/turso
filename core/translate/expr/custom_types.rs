@@ -227,7 +227,30 @@ pub(crate) fn comparison_calls_type_function(
     referenced_tables: Option<&TableReferences>,
     schema: &Schema,
 ) -> bool {
-    find_custom_type_operator(e1, e2, op, referenced_tables, schema, None).is_some()
+    find_custom_type_operator(
+        e1,
+        e2,
+        op,
+        referenced_tables,
+        schema,
+        None,
+        NumericComparisons::Decimal,
+    )
+    .is_some()
+}
+
+/// How a comparison with a value of the built-in `numeric` type reads the
+/// other operand.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum NumericComparisons {
+    /// As a decimal value, as PostgreSQL does.
+    Decimal,
+    /// As older versions did: a literal is ENCODEd, and any other operand
+    /// compares with the standard rules. Older versions computed the keys
+    /// and the WHERE clauses of indexes with these rules, so the keys of an
+    /// index must use them. `pg_numeric` is newer and always compares
+    /// decimals.
+    OfIndexKeys,
 }
 
 /// Find a custom type operator function for a binary expression.
@@ -255,8 +278,10 @@ pub(super) fn find_custom_type_operator(
     referenced_tables: Option<&TableReferences>,
     schema: &Schema,
     decoded_self_table: Option<&BTreeTable>,
+    numeric_comparisons: NumericComparisons,
 ) -> Option<ResolvedOperator> {
     let op_str = operator_to_str(op)?;
+    let reads_user_value = |type_def: &TypeDef| reads_user_value(type_def, op, numeric_comparisons);
     let lhs_info = expr_custom_type_info(e1, referenced_tables, schema, decoded_self_table);
     let rhs_info = expr_custom_type_info(e2, referenced_tables, schema, decoded_self_table);
 
@@ -277,10 +302,10 @@ pub(super) fn find_custom_type_operator(
             return operator_of(&lhs.type_def, None);
         }
         // A decimal reads a column of another number type as a user value.
-        if reads_user_value(&lhs.type_def, op) && is_number_type(&rhs.type_def) {
+        if reads_user_value(&lhs.type_def) && is_number_type(&rhs.type_def) {
             return operator_of(&lhs.type_def, None);
         }
-        if reads_user_value(&rhs.type_def, op) && is_number_type(&lhs.type_def) {
+        if reads_user_value(&rhs.type_def) && is_number_type(&lhs.type_def) {
             return operator_of(&rhs.type_def, None);
         }
         // Different custom types: fall through to standard operator.
@@ -297,14 +322,15 @@ pub(super) fn find_custom_type_operator(
         };
         if let Some(lit_type) = literal_type_name(other) {
             if literal_compatible_with_value_type(lit_type, column.type_def.value_input_type()) {
-                let encode_info = literal_encode_info(column, which, op);
+                let encode_info =
+                    literal_encode_info(column, which, reads_user_value(&column.type_def));
                 if let Some(resolved) = operator_of(&column.type_def, encode_info) {
                     return Some(resolved);
                 }
             }
         }
         // Case 3: a decimal column reads the other operand as a user value.
-        if reads_user_value(&column.type_def, op)
+        if reads_user_value(&column.type_def)
             && is_user_value(other, referenced_tables, decoded_self_table)
         {
             return operator_of(&column.type_def, None);
@@ -314,7 +340,16 @@ pub(super) fn find_custom_type_operator(
     // Case 3: the result of decimal arithmetic compares as a decimal.
     if is_comparison(op) {
         let is_decimal = |expr: &ast::Expr| {
-            is_decimal_value(expr, referenced_tables, schema, decoded_self_table)
+            decimal_value(
+                expr,
+                referenced_tables,
+                schema,
+                decoded_self_table,
+                numeric_comparisons,
+            )
+            .is_some_and(|decimal| {
+                numeric_comparisons == NumericComparisons::Decimal || decimal == Decimal::PgNumeric
+            })
         };
         let is_number = |expr: &ast::Expr, info: &Option<ExprCustomTypeInfo>| match info {
             Some(info) => is_number_type(&info.type_def),
@@ -382,24 +417,36 @@ fn is_comparison(op: &ast::Operator) -> bool {
     )
 }
 
-/// The built-in decimal types, whose operator functions compare exactly.
-fn is_decimal_type(type_def: &TypeDef) -> bool {
-    type_def.is_builtin && matches!(type_def.name.as_str(), "numeric" | "pg_numeric")
+fn is_numeric_v1(type_def: &TypeDef) -> bool {
+    type_def.is_builtin && type_def.name == "numeric"
 }
 
-/// The built-in integer and decimal types.
 fn is_number_type(type_def: &TypeDef) -> bool {
-    type_def.is_builtin
-        && matches!(
-            type_def.name.as_str(),
-            "numeric" | "pg_numeric" | "bigint" | "smallint" | "pg_int4" | "pg_int8"
-        )
+    match type_def.pg_storage_type() {
+        Some(pg_type) => matches!(
+            pg_type,
+            PgStorageType::Int4 | PgStorageType::Int8 | PgStorageType::Numeric
+        ),
+        None => {
+            type_def.is_builtin
+                && matches!(type_def.name.as_str(), "numeric" | "bigint" | "smallint")
+        }
+    }
 }
 
 /// The decimal operator functions read the other operand as a user value:
 /// the comparisons of both decimal types, and the arithmetic of `pg_numeric`.
-fn reads_user_value(type_def: &TypeDef, op: &ast::Operator) -> bool {
-    is_decimal_type(type_def) && (is_comparison(op) || type_def.name == "pg_numeric")
+fn reads_user_value(
+    type_def: &TypeDef,
+    op: &ast::Operator,
+    numeric_comparisons: NumericComparisons,
+) -> bool {
+    if type_def.pg_storage_type() == Some(PgStorageType::Numeric) {
+        return true;
+    }
+    is_numeric_v1(type_def)
+        && is_comparison(op)
+        && numeric_comparisons == NumericComparisons::Decimal
 }
 
 /// An operand that is not a column of a custom type: any expression, or a
@@ -426,18 +473,33 @@ fn is_user_value(
     }
 }
 
-/// The value of decimal arithmetic, or of a cast to a decimal type with a
-/// precision and a scale.
-fn is_decimal_value(
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Decimal {
+    Numeric,
+    PgNumeric,
+}
+
+/// The decimal type of decimal arithmetic, or of a cast to a decimal type
+/// with a precision and a scale. Arithmetic with a `pg_numeric` operand gives
+/// a `pg_numeric`.
+fn decimal_value(
     expr: &ast::Expr,
     referenced_tables: Option<&TableReferences>,
     schema: &Schema,
     decoded_self_table: Option<&BTreeTable>,
-) -> bool {
+    numeric_comparisons: NumericComparisons,
+) -> Option<Decimal> {
+    let decimal = |expr: &ast::Expr| {
+        decimal_value(
+            expr,
+            referenced_tables,
+            schema,
+            decoded_self_table,
+            numeric_comparisons,
+        )
+    };
     match expr {
-        ast::Expr::Parenthesized(exprs) if exprs.len() == 1 => {
-            is_decimal_value(&exprs[0], referenced_tables, schema, decoded_self_table)
-        }
+        ast::Expr::Parenthesized(exprs) if exprs.len() == 1 => decimal(&exprs[0]),
         ast::Expr::Binary(lhs, op, rhs)
             if matches!(
                 op,
@@ -447,13 +509,33 @@ fn is_decimal_value(
                     | ast::Operator::Divide
             ) =>
         {
-            find_custom_type_operator(lhs, rhs, op, referenced_tables, schema, decoded_self_table)
-                .is_some_and(|resolved| {
-                    matches!(
-                        resolved.func_name.as_str(),
-                        "numeric_add" | "numeric_sub" | "numeric_mul" | "numeric_div"
-                    )
-                })
+            let resolved = find_custom_type_operator(
+                lhs,
+                rhs,
+                op,
+                referenced_tables,
+                schema,
+                decoded_self_table,
+                numeric_comparisons,
+            )?;
+            if !matches!(
+                resolved.func_name.as_str(),
+                "numeric_add" | "numeric_sub" | "numeric_mul" | "numeric_div"
+            ) {
+                return None;
+            }
+            let is_pg_numeric = |operand: &ast::Expr| {
+                decimal(operand) == Some(Decimal::PgNumeric)
+                    || expr_custom_type_info(operand, referenced_tables, schema, decoded_self_table)
+                        .is_some_and(|info| {
+                            info.type_def.pg_storage_type() == Some(PgStorageType::Numeric)
+                        })
+            };
+            Some(if is_pg_numeric(lhs) || is_pg_numeric(rhs) {
+                Decimal::PgNumeric
+            } else {
+                Decimal::Numeric
+            })
         }
         ast::Expr::Cast {
             type_name:
@@ -463,10 +545,17 @@ fn is_decimal_value(
                     ..
                 }),
             ..
-        } => schema
-            .get_type_def_unchecked(name)
-            .is_some_and(|type_def| is_decimal_type(type_def)),
-        _ => false,
+        } => {
+            let type_def = schema.get_type_def_unchecked(name)?;
+            if type_def.pg_storage_type() == Some(PgStorageType::Numeric) {
+                Some(Decimal::PgNumeric)
+            } else if is_numeric_v1(type_def) {
+                Some(Decimal::Numeric)
+            } else {
+                None
+            }
+        }
+        _ => None,
     }
 }
 
@@ -478,9 +567,9 @@ fn is_decimal_value(
 fn literal_encode_info(
     column: &ExprCustomTypeInfo,
     which: EncodeArg,
-    op: &ast::Operator,
+    reads_user_value: bool,
 ) -> Option<OperatorEncodeInfo> {
-    if column.type_def.is_pg_storage_type() || reads_user_value(&column.type_def, op) {
+    if column.type_def.is_pg_storage_type() || reads_user_value {
         return None;
     }
     Some(OperatorEncodeInfo {
@@ -520,10 +609,10 @@ pub(crate) fn emit_dml_expr_index_value(
         if col.is_rowid_alias() {
             continue;
         }
-        let decodes = matches!(
-            resolver.schema().resolve_type(&col.ty_str, is_strict),
-            Ok(Some(resolved)) if resolved.chain.iter().any(|td| td.decode().is_some())
-        );
+        let decodes = resolver
+            .schema()
+            .resolve_type(&col.ty_str, is_strict)?
+            .is_some_and(|resolved| resolved.chain.iter().any(|td| td.decode().is_some()));
         if decodes {
             let src_reg = column_regs[i];
             let tmp = program.alloc_register();
@@ -541,14 +630,14 @@ pub(crate) fn emit_dml_expr_index_value(
         translate_expr(program, None, &expr, dest_reg, resolver)?;
         Ok(())
     };
-    match expr_kind {
+    resolver.with_index_expression(|| match expr_kind {
         IndexExprKind::Expression => {
             resolver.with_decoded_self_table_context(program, &ctx, translate)
         }
         IndexExprKind::GeneratedColumn => {
             resolver.with_self_table_context(program, Some(&ctx), translate)
         }
-    }
+    })
 }
 
 /// Where the expression of an index comes from. CREATE INDEX and DELETE

@@ -1,10 +1,9 @@
-use crate::numeric::decimal::value_to_bigdecimal;
+use crate::numeric::decimal::{parse_decimal_text, value_to_bigdecimal};
 use crate::types::Value;
-use crate::{LimboError, Numeric, Result};
+use crate::{turso_assert_eq, LimboError, Numeric, Result};
 use bigdecimal::BigDecimal;
 use num_bigint::{BigInt, Sign};
 use num_traits::{ToPrimitive, Zero};
-use std::str::FromStr;
 
 const MICROSECONDS_PER_SECOND: i64 = 1_000_000;
 const MICROSECONDS_PER_MINUTE: i64 = 60 * MICROSECONDS_PER_SECOND;
@@ -65,7 +64,7 @@ pub(crate) fn exec_pg_temporal_decode(kind: PgTemporal, value: &Value) -> Result
         Value::Null => return Ok(Value::Null),
         Value::Numeric(Numeric::Integer(stored)) => *stored,
         other => {
-            return Err(LimboError::Constraint(format!(
+            return Err(LimboError::Corrupt(format!(
                 "stored {} value is not an integer: {}",
                 kind.type_name(),
                 describe_value(other)
@@ -73,7 +72,7 @@ pub(crate) fn exec_pg_temporal_decode(kind: PgTemporal, value: &Value) -> Result
         }
     };
     let text = format_temporal(kind, stored).ok_or_else(|| {
-        LimboError::Constraint(format!(
+        LimboError::Corrupt(format!(
             "stored {} value {stored} is out of range",
             kind.type_name()
         ))
@@ -93,24 +92,15 @@ pub(crate) fn exec_pg_numeric_encode(
 ) -> Result<Value> {
     let precision = numeric_type_parameter("precision", precision)?;
     let scale = numeric_type_parameter("scale", scale)?;
-    if !(1..=MAX_NUMERIC_PRECISION).contains(&precision) || !(0..=precision).contains(&scale) {
-        return Err(LimboError::Constraint(format!(
-            "pg_numeric needs a precision from 1 to {MAX_NUMERIC_PRECISION} and a scale from 0 to the precision, got ({precision}, {scale})"
-        )));
-    }
+    check_numeric_type_parameters(precision, scale)?;
     let decimal = match value {
         Value::Null => return Ok(Value::Null),
-        Value::Text(text) => {
-            let trimmed = text
-                .as_str()
-                .trim_matches(|c: char| c.is_ascii_whitespace());
-            BigDecimal::from_str(trimmed).map_err(|_| {
-                LimboError::Constraint(format!(
-                    "invalid input syntax for type numeric: \"{}\"",
-                    text.as_str()
-                ))
-            })?
-        }
+        Value::Text(text) => parse_decimal_text(text.as_str()).ok_or_else(|| {
+            LimboError::Constraint(format!(
+                "invalid input syntax for type numeric: \"{}\"",
+                text.as_str()
+            ))
+        })?,
         Value::Numeric(_) => value_to_bigdecimal(value)?,
         Value::Blob(_) => {
             return Err(LimboError::Constraint(
@@ -118,19 +108,21 @@ pub(crate) fn exec_pg_numeric_encode(
             ))
         }
     };
-    let limit = 10i128.pow(precision as u32);
+    let overflow = || {
+        LimboError::Constraint(format!(
+            "numeric field overflow: a field with precision {precision}, scale {scale} must round to an absolute value less than 10^{}",
+            precision - scale
+        ))
+    };
     let rounded = match scale_decimal(&decimal, scale) {
         ScaledDecimal::InRange {
             truncated,
             remainder,
         } => truncated + i128::from(remainder.rounds_away_from_zero()) * truncated_sign(&decimal),
-        ScaledDecimal::Above | ScaledDecimal::Below => limit,
+        ScaledDecimal::Above | ScaledDecimal::Below => return Err(overflow()),
     };
-    if rounded.abs() >= limit {
-        return Err(LimboError::Constraint(format!(
-            "numeric field overflow: a field with precision {precision}, scale {scale} must round to an absolute value less than 10^{}",
-            precision - scale
-        )));
+    if rounded.abs() >= 10i128.pow(precision as u32) {
+        return Err(overflow());
     }
     Ok(Value::from_i64(
         i64::try_from(rounded).expect("a value below 10^18 fits an i64"),
@@ -139,19 +131,20 @@ pub(crate) fn exec_pg_numeric_encode(
 
 pub(crate) fn exec_pg_numeric_decode(value: &Value, scale: &Value) -> Result<Value> {
     let scale = numeric_type_parameter("scale", scale)?;
+    check_numeric_scale(scale)?;
     match value {
         Value::Null => Ok(Value::Null),
         Value::Numeric(Numeric::Integer(stored)) => {
             Ok(Value::build_text(format_scaled_integer(*stored, scale)))
         }
-        other => Err(LimboError::Constraint(format!(
+        other => Err(LimboError::Corrupt(format!(
             "stored numeric value is not an integer: {}",
             describe_value(other)
         ))),
     }
 }
 
-fn numeric_type_parameter(name: &str, value: &Value) -> Result<i64> {
+pub(crate) fn numeric_type_parameter(name: &str, value: &Value) -> Result<i64> {
     match value {
         Value::Numeric(Numeric::Integer(value)) => Ok(*value),
         other => Err(LimboError::Constraint(format!(
@@ -159,6 +152,24 @@ fn numeric_type_parameter(name: &str, value: &Value) -> Result<i64> {
             describe_value(other)
         ))),
     }
+}
+
+pub(crate) fn check_numeric_scale(scale: i64) -> Result<()> {
+    if !(0..=MAX_NUMERIC_PRECISION).contains(&scale) {
+        return Err(LimboError::Constraint(format!(
+            "pg_numeric needs a scale from 0 to {MAX_NUMERIC_PRECISION}, got {scale}"
+        )));
+    }
+    Ok(())
+}
+
+fn check_numeric_type_parameters(precision: i64, scale: i64) -> Result<()> {
+    if !(1..=MAX_NUMERIC_PRECISION).contains(&precision) || !(0..=precision).contains(&scale) {
+        return Err(LimboError::Constraint(format!(
+            "pg_numeric needs a precision from 1 to {MAX_NUMERIC_PRECISION} and a scale from 0 to the precision, got ({precision}, {scale})"
+        )));
+    }
+    Ok(())
 }
 
 fn truncated_sign(decimal: &BigDecimal) -> i128 {
@@ -232,7 +243,7 @@ pub(crate) fn scale_decimal(decimal: &BigDecimal, scale: i64) -> ScaledDecimal {
     } else {
         ScaledDecimal::Above
     };
-    let digit_count = digits.magnitude().to_string().len() as i64;
+    let digit_count = decimal_digit_count(digits.magnitude());
     let shift = scale.saturating_sub(exponent);
     if digit_count.saturating_add(shift) > 19 {
         return out_of_range;
@@ -266,6 +277,13 @@ pub(crate) fn scale_decimal(decimal: &BigDecimal, scale: i64) -> ScaledDecimal {
             .to_i128()
             .expect("a quotient below 10^19 fits an i128"),
         remainder,
+    }
+}
+
+fn decimal_digit_count(magnitude: &num_bigint::BigUint) -> i64 {
+    match magnitude.to_u128() {
+        Some(small) => i64::from(small.ilog10()) + 1,
+        None => magnitude.to_string().len() as i64,
     }
 }
 
@@ -356,10 +374,19 @@ fn special_word(kind: PgTemporal, text: &str) -> Option<std::result::Result<i64,
     })
 }
 
+/// The words that PostgreSQL reads as a time from the clock.
+pub(crate) const CLOCK_WORDS: [&str; 4] = ["now", "today", "tomorrow", "yesterday"];
+
+pub(crate) fn is_clock_word(text: &str) -> bool {
+    CLOCK_WORDS
+        .iter()
+        .any(|word| word.eq_ignore_ascii_case(text))
+}
+
 fn current_microseconds_since_2000() -> i64 {
     let since_unix_epoch = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default();
+        .expect("the system clock is after 1970");
     since_unix_epoch.as_micros() as i64 - UNIX_DAYS_AT_2000_01_01 * MICROSECONDS_PER_DAY
 }
 
@@ -541,7 +568,7 @@ impl<'a> Cursor<'a> {
     }
 
     fn date(&mut self) -> std::result::Result<CivilDate, TemporalError> {
-        let year = self.number(1, 9)?;
+        let year = self.number(3, 9)?;
         self.expect(b'-')?;
         let month = self.number(1, 2)?;
         self.expect(b'-')?;
@@ -582,13 +609,14 @@ impl<'a> Cursor<'a> {
         if digits == 0 {
             return Err(TemporalError::Syntax);
         }
-        let fraction = &self.bytes[self.position..self.position + digits];
+        let point = self.position - 1;
+        turso_assert_eq!(self.bytes[point], b'.');
         self.position += digits;
-        let microsecond = (0..6).fold(0i64, |value, i| {
-            value * 10 + fraction.get(i).map_or(0, |digit| i64::from(digit - b'0'))
-        });
-        let rounds_up = fraction.get(6).is_some_and(|digit| *digit >= b'5');
-        Ok(microsecond + i64::from(rounds_up))
+        let fraction: f64 = std::str::from_utf8(&self.bytes[point..self.position])
+            .expect("a point and ASCII digits")
+            .parse()
+            .expect("a point and ASCII digits parse as a number");
+        Ok((fraction * MICROSECONDS_PER_SECOND as f64).round_ties_even() as i64)
     }
 
     fn offset_seconds(&mut self) -> std::result::Result<i64, TemporalError> {
@@ -876,6 +904,39 @@ mod tests {
     }
 
     #[test]
+    fn years_of_three_or_more_digits_are_accepted() {
+        assert_eq!(round_trip(PgTemporal::Date, "124-01-01"), "0124-01-01");
+        assert_eq!(round_trip(PgTemporal::Date, "0001-01-01"), "0001-01-01");
+        assert_eq!(
+            round_trip(PgTemporal::Timestamp, "999-12-31 10:00"),
+            "0999-12-31 10:00:00"
+        );
+    }
+
+    #[test]
+    fn fraction_at_half_rounds_as_postgresql() {
+        for (input, expected) in [
+            ("10:00:00.0000005", "10:00:00"),
+            ("10:00:00.0000015", "10:00:00.000002"),
+            ("10:00:00.0000025", "10:00:00.000002"),
+            ("10:00:00.1234565", "10:00:00.123456"),
+            ("10:00:00.5000005", "10:00:00.5"),
+            ("10:00:00.12345651", "10:00:00.123457"),
+            ("23:59:59.9999995", "24:00:00"),
+            ("10:59:59.99999999999999999999", "11:00:00"),
+        ] {
+            assert_eq!(round_trip(PgTemporal::Time, input), expected, "{input}");
+        }
+    }
+
+    #[test]
+    fn clock_words_are_the_words_that_read_the_clock() {
+        for word in CLOCK_WORDS {
+            assert!(special_word(PgTemporal::Date, word).is_some(), "{word}");
+        }
+    }
+
+    #[test]
     fn words_that_depend_on_the_clock_are_accepted() {
         let today = encode(PgTemporal::Date, "today").unwrap();
         assert!(today > encode(PgTemporal::Date, "2026-01-01").unwrap());
@@ -916,6 +977,11 @@ mod tests {
             ),
             (PgTemporal::Timestamp, "2024/01/01", "invalid input syntax"),
             (PgTemporal::Timestamp, "20240101", "invalid input syntax"),
+            (PgTemporal::Timestamp, "1-2-3", "invalid input syntax"),
+            (PgTemporal::Timestamptz, "12-01-01", "invalid input syntax"),
+            (PgTemporal::Date, "1-01-01", "invalid input syntax"),
+            (PgTemporal::Date, "24-01-15", "invalid input syntax"),
+            (PgTemporal::Time, "99-12-31 10:00", "invalid input syntax"),
             (
                 PgTemporal::Timestamp,
                 "2024-02-30",
@@ -1118,10 +1184,17 @@ mod tests {
                 "{input}: {message}"
             );
         }
-        assert!(numeric_text("abc", 10, 2)
-            .unwrap_err()
-            .to_string()
-            .contains("invalid input syntax for type numeric"));
+        for input in ["abc", "1__000", "1000_", "_1000", "1_.5", "1._5"] {
+            assert!(
+                numeric_text(input, 10, 2)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("invalid input syntax for type numeric"),
+                "{input}"
+            );
+        }
+        assert_eq!(numeric_text(" 7 ", 10, 2).unwrap(), 700);
+        assert_eq!(numeric_text("1_000.5_0", 10, 2).unwrap(), 100_050);
         assert!(numeric(Value::from_slice(b"x").unwrap(), 10, 2).is_err());
         assert!(numeric_text("1", 19, 2).is_err());
         assert!(numeric_text("1", 10, 11).is_err());
@@ -1130,6 +1203,26 @@ mod tests {
                 .unwrap(),
             Value::Null
         );
+    }
+
+    #[test]
+    fn numeric_decode_refuses_a_scale_out_of_range() {
+        for scale in [-1, 19, 25] {
+            let message = exec_pg_numeric_decode(&Value::from_i64(5), &Value::from_i64(scale))
+                .unwrap_err()
+                .to_string();
+            assert!(
+                message.contains(&format!(
+                    "pg_numeric needs a scale from 0 to 18, got {scale}"
+                )),
+                "{message}"
+            );
+        }
+        assert!(exec_pg_numeric_decode(&Value::from_i64(5), &Value::from_f64(2.5)).is_err());
+        assert!(matches!(
+            exec_pg_numeric_decode(&Value::build_text("5"), &Value::from_i64(2)),
+            Err(LimboError::Corrupt(_))
+        ));
     }
 
     #[test]

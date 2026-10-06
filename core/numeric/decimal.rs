@@ -139,13 +139,32 @@ pub(crate) fn value_to_bigdecimal(val: &Value) -> crate::Result<BigDecimal> {
         Value::Numeric(Numeric::Integer(i)) => Ok(BigDecimal::from(*i)),
         Value::Numeric(Numeric::Float(f)) => BigDecimal::from_str(&f.to_string())
             .map_err(|_| LimboError::Constraint(format!("invalid numeric value: {f}"))),
-        Value::Text(t) => BigDecimal::from_str(&t.value)
-            .map_err(|_| LimboError::Constraint(format!("invalid numeric value: \"{}\"", t.value))),
+        Value::Text(t) => parse_decimal_text(&t.value).ok_or_else(|| {
+            LimboError::Constraint(format!("invalid numeric value: \"{}\"", t.value))
+        }),
         Value::Blob(b) => blob_to_bigdecimal(b),
         _ => Err(LimboError::Constraint(format!(
             "cannot convert to numeric: \"{val}\""
         ))),
     }
+}
+
+/// Parse decimal text as PostgreSQL does: surrounding whitespace is ignored,
+/// and an underscore must stand between two digits.
+pub(crate) fn parse_decimal_text(text: &str) -> Option<BigDecimal> {
+    use std::str::FromStr;
+    let text = text.trim_matches(|c: char| c.is_ascii_whitespace());
+    let bytes = text.as_bytes();
+    let underscores_between_digits = bytes.iter().enumerate().all(|(i, byte)| {
+        *byte != b'_'
+            || (i > 0
+                && bytes[i - 1].is_ascii_digit()
+                && bytes.get(i + 1).is_some_and(u8::is_ascii_digit))
+    });
+    if !underscores_between_digits {
+        return None;
+    }
+    BigDecimal::from_str(text).ok()
 }
 
 /// Format a BigDecimal as a string, preserving trailing zeros for the scale.

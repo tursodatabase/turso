@@ -5,10 +5,9 @@ use crate::LimboError;
 use crate::ext::VTabImpl;
 use crate::function::{Deterministic, Func, MathFunc, ScalarFunc};
 use crate::schema::{
-    create_table, is_pg_storage_type_name, is_strict_primitive_type,
-    translate_ident_to_string_literal, BTreeCharacteristics, BTreeTable, ColDef, Column,
-    SchemaObjectType, Table, Type, RESERVED_TABLE_PREFIXES, SQLITE_SEQUENCE_TABLE_NAME,
-    TURSO_TYPES_TABLE_NAME,
+    create_table, is_strict_primitive_type, translate_ident_to_string_literal,
+    BTreeCharacteristics, BTreeTable, ColDef, Column, PgStorageType, SchemaObjectType, Table, Type,
+    RESERVED_TABLE_PREFIXES, SQLITE_SEQUENCE_TABLE_NAME, TURSO_TYPES_TABLE_NAME,
 };
 use crate::stats::STATS_TABLE;
 use crate::storage::pager::CreateBTreeFlags;
@@ -623,11 +622,13 @@ fn resolve_type_name(type_name: &str, resolver: &Resolver) -> Result<CheckExprTy
         // PostgreSQL frontend shows: the text of a date or time, and the
         // decimal text of a numeric, which its operator functions compare.
         if resolved.check_reads_decoded_value() {
-            return Ok(if resolved.chain.iter().any(|td| td.name == "pg_numeric") {
-                CheckExprType::Real
-            } else {
-                CheckExprType::Text
-            });
+            return Ok(
+                if resolved.pg_storage_type() == Some(PgStorageType::Numeric) {
+                    CheckExprType::Real
+                } else {
+                    CheckExprType::Text
+                },
+            );
         }
         // Domains are transparent wrappers, and a type that stores the value
         // it shows compares like its primitive type, so CHECK constraint type
@@ -850,13 +851,22 @@ fn validate(
                 }
 
                 if !is_builtin && is_strict {
+                    let column = format!("{table_name}.{}", c.col_name);
                     validate_pg_storage_column_type(
                         type_name,
                         options.pg_storage,
-                        &format!("{table_name}.{}", c.col_name),
+                        &column,
                         resolver,
                         conn,
                     )?;
+                    let params: Vec<&ast::Expr> = match &col_type.size {
+                        Some(ast::TypeSize::TypeSize(precision, scale)) => {
+                            vec![precision.as_ref(), scale.as_ref()]
+                        }
+                        Some(ast::TypeSize::MaxSize(size)) => vec![size.as_ref()],
+                        None => vec![],
+                    };
+                    validate_numeric_type_parameters(type_name, &params, &column, resolver)?;
                     let type_def = resolver.schema().get_type_def_unchecked(type_name);
                     {
                         match type_def {
@@ -951,7 +961,7 @@ pub(crate) fn validate_pg_storage_column_type(
     }
     if pg_storage
         && !conn.is_nested_stmt()
-        && is_pg_storage_type_name(type_name)
+        && PgStorageType::from_type_name(type_name).is_some()
         && schema
             .get_type_def_unchecked(type_name)
             .is_some_and(|type_def| !type_def.is_builtin)
@@ -961,6 +971,63 @@ pub(crate) fn validate_pg_storage_column_type(
         );
     }
     Ok(())
+}
+
+/// The precision and the scale of a new `numeric` or `pg_numeric` column
+/// must be integers that the ENCODE of the type accepts. Older versions
+/// stored such columns without this check, so it runs only for new columns.
+pub(crate) fn validate_numeric_type_parameters(
+    type_name: &str,
+    params: &[&ast::Expr],
+    column: &str,
+    resolver: &Resolver,
+) -> Result<()> {
+    let Some(type_def) = resolver.schema().get_type_def_unchecked(type_name) else {
+        return Ok(());
+    };
+    let max_precision = match (type_def.is_builtin, type_def.name.as_str()) {
+        (true, "numeric") => i64::MAX,
+        (true, "pg_numeric") => PgStorageType::MAX_NUMERIC_PRECISION,
+        _ => return Ok(()),
+    };
+    let [precision, scale] = params else {
+        return Ok(());
+    };
+    let type_name = &type_def.name;
+    let Some(precision) = integer_literal(precision) else {
+        bail_parse_error!(
+            "column {column}: {type_name} precision must be an integer, got {precision}"
+        );
+    };
+    let Some(scale) = integer_literal(scale) else {
+        bail_parse_error!("column {column}: {type_name} scale must be an integer, got {scale}");
+    };
+    if precision < 1 {
+        bail_parse_error!(
+            "column {column}: {type_name} precision must be positive, got {precision}"
+        );
+    }
+    if precision > max_precision {
+        bail_parse_error!(
+            "column {column}: {type_name} precision must be at most {max_precision}, got {precision}"
+        );
+    }
+    if !(0..=precision).contains(&scale) {
+        bail_parse_error!(
+            "column {column}: {type_name} scale must be from 0 to the precision {precision}, got {scale}"
+        );
+    }
+    Ok(())
+}
+
+fn integer_literal(expr: &ast::Expr) -> Option<i64> {
+    match expr {
+        ast::Expr::Literal(ast::Literal::Numeric(digits)) => digits.parse().ok(),
+        ast::Expr::Unary(ast::UnaryOperator::Negative, operand) => {
+            integer_literal(operand)?.checked_neg()
+        }
+        _ => None,
+    }
 }
 
 /// Schema information derived from a CTAS SELECT.
@@ -1033,7 +1100,7 @@ fn derive_ctas_schema(
         let ty = compound_arms
             .as_ref()
             .map(|arms| compound_column_affinity(arms, column_index).short_type_name())
-            .unwrap_or_else(|| col.declared_type(table_refs));
+            .unwrap_or_else(|| col.declared_type(table_refs, resolver.schema()));
 
         let quoted = quote_identifier(&name);
         if ty.is_empty() {

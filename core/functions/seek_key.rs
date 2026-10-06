@@ -1,10 +1,10 @@
 use crate::functions::pg_types::{
-    format_temporal, parse_canonical_temporal, scale_decimal, PgTemporal, Remainder, ScaledDecimal,
-    TemporalText, NUMERIC_STORED_LIMIT,
+    check_numeric_scale, format_temporal, numeric_type_parameter, parse_canonical_temporal,
+    scale_decimal, PgTemporal, Remainder, ScaledDecimal, TemporalText, NUMERIC_STORED_LIMIT,
 };
 use crate::numeric::decimal::value_to_bigdecimal;
 use crate::types::Value;
-use crate::{turso_assert_eq, Numeric, Result};
+use crate::{turso_assert_eq, LimboError, Numeric, Result};
 
 const UUID_TEXT_LEN: usize = 36;
 const UUID_HYPHEN_POSITIONS: [usize; 4] = [8, 13, 18, 23];
@@ -78,9 +78,8 @@ pub(crate) fn exec_pg_numeric_seek_key(
     no_key: &Value,
     scale: &Value,
 ) -> Result<Value> {
-    let Value::Numeric(Numeric::Integer(scale)) = scale else {
-        unreachable!("the seek passes the integer scale of the column, got {scale:?}");
-    };
+    let scale = numeric_type_parameter("scale", scale)?;
+    check_numeric_scale(scale)?;
     if matches!(operand, Value::Null) {
         return Ok(Value::Null);
     }
@@ -94,7 +93,7 @@ pub(crate) fn exec_pg_numeric_seek_key(
         NoSeekKey::Null => None,
         NoSeekKey::BelowEveryValue | NoSeekKey::AboveEveryValue => Some(i64::MIN),
     };
-    let key = match scale_decimal(&decimal, *scale) {
+    let key = match scale_decimal(&decimal, scale) {
         ScaledDecimal::Above => above_every_value,
         ScaledDecimal::Below => below_every_value,
         ScaledDecimal::InRange { truncated, .. } if truncated >= NUMERIC_STORED_LIMIT => {
@@ -128,10 +127,15 @@ pub(crate) fn exec_numeric_seek_key(
     precision: &Value,
     scale: &Value,
 ) -> Result<Value> {
-    let (Value::Numeric(Numeric::Integer(precision)), Value::Numeric(Numeric::Integer(scale))) =
-        (precision, scale)
-    else {
-        unreachable!("the seek passes the integer precision and scale of the column");
+    let Value::Numeric(Numeric::Integer(precision)) = precision else {
+        return Err(LimboError::Constraint(
+            "numeric_encode: precision must be an integer".to_string(),
+        ));
+    };
+    let Value::Numeric(Numeric::Integer(scale)) = scale else {
+        return Err(LimboError::Constraint(
+            "numeric_encode: scale must be an integer".to_string(),
+        ));
     };
     if matches!(operand, Value::Null) {
         return Ok(Value::Null);
@@ -525,9 +529,6 @@ mod tests {
         }
     }
 
-    /// The key of an equality seek on a `numeric` column is the stored blob
-    /// of the value that equals the operand, and NULL when no value of the
-    /// column equals it.
     #[test]
     fn v1_numeric_seek_key_is_the_blob_of_the_equal_value() {
         use crate::numeric::decimal::{bigdecimal_to_blob, validate_precision_scale};
@@ -575,5 +576,30 @@ mod tests {
         .unwrap_err()
         .to_string();
         assert!(message.contains("invalid numeric value"), "{message}");
+    }
+
+    #[test]
+    fn numeric_seek_keys_refuse_type_parameters_that_are_not_integers() {
+        let operand = Value::from_i64(1);
+        let message =
+            exec_pg_numeric_seek_key(&operand, &no_key(NoSeekKey::Null), &Value::from_f64(2.5))
+                .unwrap_err()
+                .to_string();
+        assert!(message.contains("scale must be an integer"), "{message}");
+        assert!(
+            exec_pg_numeric_seek_key(&operand, &no_key(NoSeekKey::Null), &Value::from_i64(30))
+                .is_err()
+        );
+        let message = exec_numeric_seek_key(&operand, &Value::from_i64(10), &Value::from_f64(2.5))
+            .unwrap_err()
+            .to_string();
+        assert!(message.contains("scale must be an integer"), "{message}");
+        let message = exec_numeric_seek_key(&operand, &Value::from_f64(10.5), &Value::from_i64(2))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            message.contains("precision must be an integer"),
+            "{message}"
+        );
     }
 }

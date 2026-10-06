@@ -134,11 +134,11 @@ pub struct ColumnTypeInfo {
     /// than raw bytes. The `kind` field carries that distinction directly
     /// without forcing the caller to re-query the schema.
     pub kind: ColumnTypeKind,
-    /// `true` when the declared type is a built-in type of Turso (`uuid`,
-    /// `numeric`, `pg_timestamp`, ...), `false` for a primitive and for a
-    /// `CREATE TYPE` / `CREATE DOMAIN` of the database. A database of an
-    /// older version can have a user type with the name of a built-in type.
-    pub is_builtin_type: bool,
+    /// The built-in type of the PostgreSQL frontend in the type chain: the
+    /// declared type, or the type that a domain is built on. `None` for every
+    /// other type, also for a user type of an older database that has the
+    /// name of such a type.
+    pub pg_storage_type: Option<crate::schema::PgStorageType>,
 }
 
 /// Classification of a result column's declared type.
@@ -170,269 +170,6 @@ pub enum ColumnTypeKind {
     /// Values are stored as BLOBs containing a tag and a payload; the
     /// declared name carries the variant schema.
     Union,
-}
-
-/// Recursively infer the result primitive of a non-table-column expression
-/// and return its uppercase name (`"INTEGER"`, `"REAL"`, `"TEXT"`,
-/// `"NUMERIC"`, `"BLOB"`) or `None` when no determination can be made.
-///
-/// Used by [`Statement::get_column_type_info`] to give wire-protocol layers
-/// a usable type for `SELECT 1+1`-style result columns. Goes beyond SQLite's
-/// `get_expr_affinity` (which deliberately stops at binary operators because
-/// SQLite's affinity model is about *column* coercion, not expression
-/// inference) by walking through arithmetic, bitwise, comparison, logical,
-/// and concat operators — letting `SELECT 42 + 1` report INT4 to a
-/// PostgreSQL client the way PG itself does.
-fn infer_expression_primitive(
-    expr: &turso_parser::ast::Expr,
-    referenced_tables: Option<&translate::plan::TableReferences>,
-) -> Option<&'static str> {
-    use turso_parser::ast::{Expr, Operator, UnaryOperator};
-
-    match expr {
-        // Bare literal: read the parsed concrete value type.
-        Expr::Literal(lit) => match translate::alter::literal_default_value(lit)
-            .ok()?
-            .value_type()
-        {
-            crate::types::ValueType::Integer => Some("INTEGER"),
-            crate::types::ValueType::Float => Some("REAL"),
-            crate::types::ValueType::Text => Some("TEXT"),
-            _ => None,
-        },
-        Expr::Parenthesized(exprs) if exprs.len() == 1 => {
-            infer_expression_primitive(exprs.first().unwrap(), referenced_tables)
-        }
-        Expr::Collate(inner, _) => infer_expression_primitive(inner, referenced_tables),
-        Expr::Unary(op, inner) => match op {
-            UnaryOperator::Not | UnaryOperator::BitwiseNot => Some("INTEGER"),
-            UnaryOperator::Negative => Some(combine_arithmetic_primitive(
-                Some("INTEGER"),
-                infer_expression_primitive(inner, referenced_tables),
-            )),
-            UnaryOperator::Positive => infer_expression_primitive(inner, referenced_tables),
-        },
-        Expr::Binary(left, op, right) => match op {
-            // Arithmetic: widen INTEGER × INTEGER to INTEGER, anything mixed
-            // with REAL becomes REAL, fall through to NUMERIC otherwise.
-            Operator::Add
-            | Operator::Subtract
-            | Operator::Multiply
-            | Operator::Divide
-            | Operator::Modulus => {
-                let l = infer_expression_primitive(left, referenced_tables);
-                let r = infer_expression_primitive(right, referenced_tables);
-                Some(combine_arithmetic_primitive(l, r))
-            }
-            // Bitwise: result is always INTEGER in both SQLite and PG.
-            Operator::BitwiseAnd
-            | Operator::BitwiseOr
-            | Operator::BitwiseNot
-            | Operator::LeftShift
-            | Operator::RightShift => Some("INTEGER"),
-            // Comparison and logical: SQLite returns 0/1 INTEGER; tursopg
-            // maps INTEGER to BOOL at the wire layer for boolean columns,
-            // but the type the wire layer reports is still INTEGER here.
-            Operator::Equals
-            | Operator::NotEquals
-            | Operator::Less
-            | Operator::LessEquals
-            | Operator::Greater
-            | Operator::GreaterEquals
-            | Operator::Is
-            | Operator::IsNot
-            | Operator::And
-            | Operator::Or
-            | Operator::ArrayContains
-            | Operator::ArrayOverlap => Some("INTEGER"),
-            // Concat is always TEXT.
-            Operator::Concat => Some("TEXT"),
-            // JSON ops fall through to the affinity machinery — `->` returns
-            // JSON / blob, `->>` returns TEXT; the existing affinity rules
-            // give the correct answer.
-            Operator::ArrowRight | Operator::ArrowRightShift => affinity_to_primitive(
-                translate::expr::get_expr_affinity(expr, referenced_tables, None),
-            ),
-        },
-        Expr::RowId { .. } => Some("INTEGER"),
-        // The built-in types of the PostgreSQL frontend that store an
-        // integer for a date, a time or a decimal show text.
-        Expr::Column { table, column, .. }
-            if referenced_tables
-                .and_then(|tables| tables.find_table_by_internal_id(*table))
-                .and_then(|(_, table)| table.is_strict().then(|| table.get_column_at(*column)))
-                .flatten()
-                .is_some_and(|column| {
-                    crate::schema::pg_storage_type_shows_text(&column.ty_str)
-                }) =>
-        {
-            Some("TEXT")
-        }
-        // CAST, column references, and anything else: defer to the affinity
-        // machinery, which handles these shapes correctly.
-        _ => affinity_to_primitive(translate::expr::get_expr_affinity(
-            expr,
-            referenced_tables,
-            None,
-        )),
-    }
-}
-
-/// Map [`crate::vdbe::affinity::Affinity`] to the uppercase primitive name
-/// `infer_expression_primitive` returns. `Blob` collapses to `None` because
-/// SQLite's "no determined affinity" sentinel isn't a usable wire type.
-fn affinity_to_primitive(affinity: crate::vdbe::affinity::Affinity) -> Option<&'static str> {
-    match affinity {
-        crate::vdbe::affinity::Affinity::Integer => Some("INTEGER"),
-        crate::vdbe::affinity::Affinity::Real => Some("REAL"),
-        crate::vdbe::affinity::Affinity::Text => Some("TEXT"),
-        crate::vdbe::affinity::Affinity::Numeric => Some("NUMERIC"),
-        crate::vdbe::affinity::Affinity::Blob | crate::vdbe::affinity::Affinity::None => None,
-    }
-}
-
-/// Pick the widening primitive for an arithmetic binary op given each
-/// operand's inferred primitive. `INTEGER + INTEGER -> INTEGER`,
-/// `INTEGER + REAL -> REAL`, everything else collapses to `NUMERIC` (the
-/// safe wire default for a mixed-affinity numeric result).
-fn combine_arithmetic_primitive(
-    left: Option<&'static str>,
-    right: Option<&'static str>,
-) -> &'static str {
-    match (left, right) {
-        (Some("INTEGER"), Some("INTEGER")) => "INTEGER",
-        (Some("INTEGER"), Some("REAL"))
-        | (Some("REAL"), Some("INTEGER"))
-        | (Some("REAL"), Some("REAL")) => "REAL",
-        _ => "NUMERIC",
-    }
-}
-
-/// The type of a result expression. A direct table-column reference gives
-/// the declared name, array depth, and any registered CREATE TYPE / CREATE
-/// DOMAIN resolution. A column of a FROM-clause subquery (a view, a CTE)
-/// gives the type of the subquery's result expression. Anything else gives
-/// the primitive that [`infer_expression_primitive`] infers.
-fn expression_type_info(
-    expr: &turso_parser::ast::Expr,
-    table_references: &translate::plan::TableReferences,
-    schema: &crate::schema::Schema,
-) -> Option<ColumnTypeInfo> {
-    let turso_parser::ast::Expr::Column {
-        table,
-        column: column_idx,
-        ..
-    } = expr
-    else {
-        if let Some(info) = pg_storage_expression_type_info(expr, table_references, schema) {
-            return Some(info);
-        }
-        let name = infer_expression_primitive(expr, Some(table_references))?;
-        return Some(ColumnTypeInfo {
-            declared_name: name.to_string(),
-            array_dimensions: 0,
-            base_type: None,
-            kind: ColumnTypeKind::Builtin,
-            is_builtin_type: false,
-        });
-    };
-    let (_, table_ref) = table_references.find_table_by_internal_id(*table)?;
-    if let crate::schema::Table::FromClauseSubquery(subquery) = table_ref {
-        if let translate::plan::Plan::Select(plan) = subquery.plan.as_ref() {
-            if let Some(result_column) = plan.result_columns.get(*column_idx) {
-                return expression_type_info(&result_column.expr, &plan.table_references, schema);
-            }
-        }
-    }
-    let table_column = table_ref.get_column_at(*column_idx)?;
-    let declared_name = table_column.ty_str.clone();
-    let array_dimensions = table_column.array_dimensions();
-    let resolved = schema
-        .resolve_type(&declared_name, table_ref.is_strict())
-        .ok()
-        .flatten();
-    // `kind` is computed from the leaf TypeDef in the resolution chain:
-    // STRUCT and UNION are tagged on `TypeDefKind`, DOMAIN is tagged
-    // separately on `TypeDef.is_domain`, and anything else registered
-    // through CREATE TYPE is a Custom. A column whose declared name
-    // does not appear in the type registry is a Builtin.
-    let (base_type, kind, is_builtin_type) = match resolved {
-        Some(resolved) => {
-            let leaf = resolved.leaf();
-            let kind = if leaf.is_struct() {
-                ColumnTypeKind::Struct
-            } else if leaf.is_union() {
-                ColumnTypeKind::Union
-            } else if leaf.is_domain {
-                ColumnTypeKind::Domain
-            } else {
-                ColumnTypeKind::Custom
-            };
-            (
-                Some(resolved.primitive.to_uppercase()),
-                kind,
-                leaf.is_builtin,
-            )
-        }
-        None => (None, ColumnTypeKind::Builtin, false),
-    };
-    Some(ColumnTypeInfo {
-        declared_name,
-        array_dimensions,
-        base_type,
-        kind,
-        is_builtin_type,
-    })
-}
-
-/// The type of an expression that gives a value of a built-in type of the
-/// PostgreSQL frontend: MIN and MAX of such a value, a cast to such a type,
-/// and decimal arithmetic.
-fn pg_storage_expression_type_info(
-    expr: &turso_parser::ast::Expr,
-    table_references: &translate::plan::TableReferences,
-    schema: &crate::schema::Schema,
-) -> Option<ColumnTypeInfo> {
-    use turso_parser::ast::{Expr, Operator};
-    let type_name = match expr {
-        Expr::FunctionCall { name, args, .. }
-            if args.len() == 1
-                && (name.as_str().eq_ignore_ascii_case("min")
-                    || name.as_str().eq_ignore_ascii_case("max")) =>
-        {
-            return expression_type_info(&args[0], table_references, schema)
-                .filter(|info| info.is_builtin_type);
-        }
-        Expr::FunctionCall { name, args, .. } if args.len() == 1 => name.as_str(),
-        Expr::Cast {
-            type_name: Some(type_name),
-            ..
-        } => type_name.name.as_str(),
-        Expr::Binary(
-            lhs,
-            Operator::Add | Operator::Subtract | Operator::Multiply | Operator::Divide,
-            rhs,
-        ) if [lhs, rhs].iter().any(|operand| {
-            expression_type_info(operand, table_references, schema).is_some_and(|info| {
-                info.is_builtin_type && info.declared_name.eq_ignore_ascii_case("pg_numeric")
-            })
-        }) =>
-        {
-            "pg_numeric"
-        }
-        _ => return None,
-    };
-    let type_def = schema.get_type_def_unchecked(type_name)?;
-    if !type_def.is_pg_storage_type() {
-        return None;
-    }
-    Some(ColumnTypeInfo {
-        declared_name: type_def.name.clone(),
-        array_dimensions: 0,
-        base_type: Some(type_def.base().to_uppercase()),
-        kind: ColumnTypeKind::Custom,
-        is_builtin_type: true,
-    })
 }
 
 pub struct Statement {
@@ -1815,6 +1552,305 @@ impl Statement {
     /// Prefer to use helper methods instead such as [Self::run_with_row_callback]
     pub fn _io(&self) -> &dyn crate::IO {
         self.pager.io.as_ref()
+    }
+}
+
+/// The type of a result expression. A direct table-column reference gives
+/// the declared name, array depth, and any registered CREATE TYPE / CREATE
+/// DOMAIN resolution. A column of a FROM-clause subquery (a view, a CTE)
+/// gives the type of the subquery's result expression. Anything else gives
+/// the primitive that [`infer_expression_primitive`] infers.
+fn expression_type_info(
+    expr: &turso_parser::ast::Expr,
+    table_references: &translate::plan::TableReferences,
+    schema: &crate::schema::Schema,
+) -> Option<ColumnTypeInfo> {
+    let turso_parser::ast::Expr::Column {
+        table,
+        column: column_idx,
+        ..
+    } = expr
+    else {
+        if let Some(info) = pg_storage_expression_type_info(expr, table_references, schema) {
+            return Some(info);
+        }
+        let name = infer_expression_primitive(expr, Some(table_references), schema)?;
+        return Some(ColumnTypeInfo {
+            declared_name: name.to_string(),
+            array_dimensions: 0,
+            base_type: None,
+            kind: ColumnTypeKind::Builtin,
+            pg_storage_type: None,
+        });
+    };
+    let (_, table_ref) = table_references.find_table_by_internal_id(*table)?;
+    if let crate::schema::Table::FromClauseSubquery(subquery) = table_ref {
+        if let translate::plan::Plan::Select(plan) = subquery.plan.as_ref() {
+            if let Some(result_column) = plan.result_columns.get(*column_idx) {
+                return expression_type_info(&result_column.expr, &plan.table_references, schema);
+            }
+        }
+    }
+    let table_column = table_ref.get_column_at(*column_idx)?;
+    let resolved = schema
+        .resolve_type(&table_column.ty_str, table_ref.is_strict())
+        .ok()
+        .flatten();
+    Some(resolved_type_info(
+        table_column.ty_str.clone(),
+        table_column.array_dimensions(),
+        resolved,
+    ))
+}
+
+/// The type of an expression that gives a value of a built-in type of the
+/// PostgreSQL frontend: MIN and MAX of such a value, a cast to such a type
+/// or to a domain over it, and decimal arithmetic.
+fn pg_storage_expression_type_info(
+    expr: &turso_parser::ast::Expr,
+    table_references: &translate::plan::TableReferences,
+    schema: &crate::schema::Schema,
+) -> Option<ColumnTypeInfo> {
+    use crate::schema::PgStorageType;
+    use turso_parser::ast::{Expr, Operator};
+    let type_name = match expr {
+        Expr::FunctionCall { name, args, .. }
+            if args.len() == 1
+                && (name.as_str().eq_ignore_ascii_case("min")
+                    || name.as_str().eq_ignore_ascii_case("max")) =>
+        {
+            return expression_type_info(&args[0], table_references, schema)
+                .filter(|info| info.pg_storage_type.is_some());
+        }
+        Expr::FunctionCall { name, args, .. } if args.len() == 1 => {
+            let pg_type = PgStorageType::from_type_name(name.as_str())
+                .filter(|pg_type| pg_type.temporal().is_some())?;
+            return Some(pg_storage_type_info(
+                pg_type.type_name().to_string(),
+                pg_type,
+            ));
+        }
+        Expr::Cast {
+            type_name: Some(type_name),
+            ..
+        } => type_name.name.as_str(),
+        Expr::Binary(
+            lhs,
+            Operator::Add | Operator::Subtract | Operator::Multiply | Operator::Divide,
+            rhs,
+        ) if [lhs, rhs].iter().any(|operand| {
+            expression_type_info(operand, table_references, schema)
+                .is_some_and(|info| info.pg_storage_type == Some(PgStorageType::Numeric))
+        }) =>
+        {
+            return Some(pg_storage_type_info(
+                PgStorageType::Numeric.type_name().to_string(),
+                PgStorageType::Numeric,
+            ));
+        }
+        _ => return None,
+    };
+    let resolved = schema.resolve_type_unchecked(type_name).ok().flatten()?;
+    resolved.pg_storage_type()?;
+    Some(resolved_type_info(type_name.to_string(), 0, Some(resolved)))
+}
+
+/// `kind` is computed from the leaf TypeDef in the resolution chain: STRUCT
+/// and UNION are tagged on `TypeDefKind`, DOMAIN is tagged separately on
+/// `TypeDef.is_domain`, and anything else registered through CREATE TYPE is
+/// a Custom. A name that does not appear in the type registry is a Builtin.
+/// A value of a type that stores an integer for a date, a time or a decimal
+/// is text.
+fn resolved_type_info(
+    declared_name: String,
+    array_dimensions: u32,
+    resolved: Option<crate::schema::ResolvedType>,
+) -> ColumnTypeInfo {
+    let Some(resolved) = resolved else {
+        return ColumnTypeInfo {
+            declared_name,
+            array_dimensions,
+            base_type: None,
+            kind: ColumnTypeKind::Builtin,
+            pg_storage_type: None,
+        };
+    };
+    let leaf = resolved.leaf();
+    let kind = if leaf.is_struct() {
+        ColumnTypeKind::Struct
+    } else if leaf.is_union() {
+        ColumnTypeKind::Union
+    } else if leaf.is_domain {
+        ColumnTypeKind::Domain
+    } else {
+        ColumnTypeKind::Custom
+    };
+    let pg_storage_type = resolved.pg_storage_type();
+    let base_type = if pg_storage_type.is_some_and(|pg_type| pg_type.stores_another_value()) {
+        "TEXT".to_string()
+    } else {
+        resolved.primitive.to_uppercase()
+    };
+    ColumnTypeInfo {
+        declared_name,
+        array_dimensions,
+        base_type: Some(base_type),
+        kind,
+        pg_storage_type,
+    }
+}
+
+fn pg_storage_type_info(
+    declared_name: String,
+    pg_type: crate::schema::PgStorageType,
+) -> ColumnTypeInfo {
+    ColumnTypeInfo {
+        declared_name,
+        array_dimensions: 0,
+        base_type: Some(
+            if pg_type.stores_another_value() {
+                "TEXT"
+            } else {
+                "INTEGER"
+            }
+            .to_string(),
+        ),
+        kind: ColumnTypeKind::Custom,
+        pg_storage_type: Some(pg_type),
+    }
+}
+
+/// Recursively infer the result primitive of a non-table-column expression
+/// and return its uppercase name (`"INTEGER"`, `"REAL"`, `"TEXT"`,
+/// `"NUMERIC"`, `"BLOB"`) or `None` when no determination can be made.
+///
+/// Used by [`Statement::get_column_type_info`] to give wire-protocol layers
+/// a usable type for `SELECT 1+1`-style result columns. Goes beyond SQLite's
+/// `get_expr_affinity` (which deliberately stops at binary operators because
+/// SQLite's affinity model is about *column* coercion, not expression
+/// inference) by walking through arithmetic, bitwise, comparison, logical,
+/// and concat operators — letting `SELECT 42 + 1` report INT4 to a
+/// PostgreSQL client the way PG itself does.
+fn infer_expression_primitive(
+    expr: &turso_parser::ast::Expr,
+    referenced_tables: Option<&translate::plan::TableReferences>,
+    schema: &crate::schema::Schema,
+) -> Option<&'static str> {
+    use turso_parser::ast::{Expr, Operator, UnaryOperator};
+
+    match expr {
+        // Bare literal: read the parsed concrete value type.
+        Expr::Literal(lit) => match translate::alter::literal_default_value(lit)
+            .ok()?
+            .value_type()
+        {
+            crate::types::ValueType::Integer => Some("INTEGER"),
+            crate::types::ValueType::Float => Some("REAL"),
+            crate::types::ValueType::Text => Some("TEXT"),
+            _ => None,
+        },
+        Expr::Parenthesized(exprs) if exprs.len() == 1 => {
+            infer_expression_primitive(exprs.first().unwrap(), referenced_tables, schema)
+        }
+        Expr::Collate(inner, _) => infer_expression_primitive(inner, referenced_tables, schema),
+        Expr::Unary(op, inner) => match op {
+            UnaryOperator::Not | UnaryOperator::BitwiseNot => Some("INTEGER"),
+            UnaryOperator::Negative => Some(combine_arithmetic_primitive(
+                Some("INTEGER"),
+                infer_expression_primitive(inner, referenced_tables, schema),
+            )),
+            UnaryOperator::Positive => infer_expression_primitive(inner, referenced_tables, schema),
+        },
+        Expr::Binary(left, op, right) => match op {
+            // Arithmetic: widen INTEGER × INTEGER to INTEGER, anything mixed
+            // with REAL becomes REAL, fall through to NUMERIC otherwise.
+            Operator::Add
+            | Operator::Subtract
+            | Operator::Multiply
+            | Operator::Divide
+            | Operator::Modulus => {
+                let l = infer_expression_primitive(left, referenced_tables, schema);
+                let r = infer_expression_primitive(right, referenced_tables, schema);
+                Some(combine_arithmetic_primitive(l, r))
+            }
+            // Bitwise: result is always INTEGER in both SQLite and PG.
+            Operator::BitwiseAnd
+            | Operator::BitwiseOr
+            | Operator::BitwiseNot
+            | Operator::LeftShift
+            | Operator::RightShift => Some("INTEGER"),
+            // Comparison and logical: SQLite returns 0/1 INTEGER; tursopg
+            // maps INTEGER to BOOL at the wire layer for boolean columns,
+            // but the type the wire layer reports is still INTEGER here.
+            Operator::Equals
+            | Operator::NotEquals
+            | Operator::Less
+            | Operator::LessEquals
+            | Operator::Greater
+            | Operator::GreaterEquals
+            | Operator::Is
+            | Operator::IsNot
+            | Operator::And
+            | Operator::Or
+            | Operator::ArrayContains
+            | Operator::ArrayOverlap => Some("INTEGER"),
+            // Concat is always TEXT.
+            Operator::Concat => Some("TEXT"),
+            // JSON ops fall through to the affinity machinery — `->` returns
+            // JSON / blob, `->>` returns TEXT; the existing affinity rules
+            // give the correct answer.
+            Operator::ArrowRight | Operator::ArrowRightShift => affinity_to_primitive(
+                translate::expr::get_expr_affinity(expr, referenced_tables, None),
+            ),
+        },
+        Expr::RowId { .. } => Some("INTEGER"),
+        Expr::Column { table, column, .. }
+            if referenced_tables
+                .and_then(|tables| tables.find_table_by_internal_id(*table))
+                .and_then(|(_, table)| {
+                    schema.column_pg_storage_type(table.get_column_at(*column)?, table.is_strict())
+                })
+                .is_some_and(crate::schema::PgStorageType::stores_another_value) =>
+        {
+            Some("TEXT")
+        }
+        // CAST, column references, and anything else: defer to the affinity
+        // machinery, which handles these shapes correctly.
+        _ => affinity_to_primitive(translate::expr::get_expr_affinity(
+            expr,
+            referenced_tables,
+            None,
+        )),
+    }
+}
+
+/// Map [`crate::vdbe::affinity::Affinity`] to the uppercase primitive name
+/// `infer_expression_primitive` returns. `Blob` collapses to `None` because
+/// SQLite's "no determined affinity" sentinel isn't a usable wire type.
+fn affinity_to_primitive(affinity: crate::vdbe::affinity::Affinity) -> Option<&'static str> {
+    match affinity {
+        crate::vdbe::affinity::Affinity::Integer => Some("INTEGER"),
+        crate::vdbe::affinity::Affinity::Real => Some("REAL"),
+        crate::vdbe::affinity::Affinity::Text => Some("TEXT"),
+        crate::vdbe::affinity::Affinity::Numeric => Some("NUMERIC"),
+        crate::vdbe::affinity::Affinity::Blob | crate::vdbe::affinity::Affinity::None => None,
+    }
+}
+
+/// Pick the widening primitive for an arithmetic binary op given each
+/// operand's inferred primitive. `INTEGER + INTEGER -> INTEGER`,
+/// `INTEGER + REAL -> REAL`, everything else collapses to `NUMERIC` (the
+/// safe wire default for a mixed-affinity numeric result).
+fn combine_arithmetic_primitive(
+    left: Option<&'static str>,
+    right: Option<&'static str>,
+) -> &'static str {
+    match (left, right) {
+        (Some("INTEGER"), Some("INTEGER")) => "INTEGER",
+        (Some("INTEGER"), Some("REAL"))
+        | (Some("REAL"), Some("INTEGER"))
+        | (Some("REAL"), Some("REAL")) => "REAL",
+        _ => "NUMERIC",
     }
 }
 

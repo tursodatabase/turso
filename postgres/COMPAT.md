@@ -128,8 +128,13 @@ New tables store some types as integers, with the built-in types
 
 - timestamp and timestamptz store microseconds since 2000-01-01 (UTC for
   timestamptz), date stores days and time stores microseconds since
-  midnight. Values keep six fraction digits. The years 1 to 9999 are
-  supported; `infinity` and BC dates are not.
+  midnight. Values keep six fraction digits, rounded half to even as in
+  PostgreSQL. The years 1 to 9999 are supported; `infinity` and BC dates are
+  not. A year must have at least three digits: PostgreSQL reads `1-2-3` as a
+  month, a day and a year, but Turso refuses it.
+- `'now'`, `'today'`, `'tomorrow'` and `'yesterday'` read the clock for each
+  value. PostgreSQL uses the start time of the transaction, so two rows of
+  one INSERT can get different times in Turso.
 - numeric(p,s) with a precision of at most 18 stores the value times 10^s,
   rounded half away from zero, as in PostgreSQL. A larger precision, and
   numeric without a precision, keep the older mapping.
@@ -140,7 +145,8 @@ New tables store some types as integers, with the built-in types
   identity columns), and NULL is a NOT NULL error, also without a DEFAULT.
   The PRIMARY KEY of an older table keeps generating ids. The range of
   integer is not checked.
-- Domains use the same types as columns.
+- Domains use the same types as columns, except that a domain over
+  numeric(p,s) stores a float.
 - Array element types and timetz keep the older mapping.
 
 Tables of older versions keep their types: timestamps keep milliseconds,
@@ -162,12 +168,32 @@ operand as written, and a boolean column compares 0 or 1. As a result,
 literal finds no row, `flag = 't'` finds no row, and an enum literal that is
 not a label finds no row instead of an error. A numeric column compares as
 a decimal with a literal, a negative literal, a parameter, an expression, a
-number column and the result of numeric arithmetic, as in PostgreSQL; with a
-text column it compares its text form. Arithmetic of a numeric column of a new
-table with these operands gives a decimal. An index on the column gives the
-same rows as a scan. One error depends on the plan: text that is not a
+number column and the result of numeric arithmetic, as in PostgreSQL. With a
+text column, both values become floats, which keep 15 significant digits.
+`CASE n WHEN ...`, `NULLIF`, `greatest`, `least` and an IN list on numeric
+arithmetic, such as `n * 2 IN (14, 3)`, compare the text of the numeric value,
+not the decimal. Arithmetic of a numeric column of a new table with these
+operands gives a decimal, but `-n` gives a float. An index on the column gives
+the same rows as a scan. Some errors depend on the plan: text that is not a
 number, as in `n = 'abc'`, is an error with an index, but without an index it
-is an error only when a row gets to the comparison.
+is an error only when a row gets to the comparison. A range seek can also
+skip the bound that is not a number, as in `n > 'abc' AND n <= -1000`.
+
+An expression index and the WHERE clause of a partial index on a numeric
+column of an older table, or of a numeric without a precision of at most 18,
+compare with the rules of older versions, because older versions built the
+existing indexes with them: a literal is rounded to the scale of the column,
+and other operands compare with the standard rules. The planner does not use
+such an index for a query, so queries give the rows of PostgreSQL.
+
+A timestamp, timestamptz, date or time column of a new table compares a
+text operand that looks like a number as a number: `d < '2024'` finds no row.
+A column of an older table compares the text. PostgreSQL refuses `'2024'`
+as a date.
+
+CREATE TABLE AS stores the values of timestamp, date, time and numeric
+columns of a new table as text, so a numeric comparison on the copy compares
+text.
 
 An explicit cast to date, time, timetz, timestamp or timestamptz, such as
 `'2024-01-01'::timestamp` or `timestamp '2024-01-01'`, gives the text that a
@@ -183,16 +209,22 @@ does not find the value `2024-01-01 10:00:00.123` of an older table. In the
 CHECK and DEFAULT expressions of a new table, and in the expressions of
 indexes and views, such a cast is a call of the function `pg_timestamp`,
 `pg_timestamptz`, `pg_date` or `pg_time`. Older versions do not have these
-functions, so they refuse such SQL.
+functions, so they refuse such SQL. As in PostgreSQL, an index expression or
+the WHERE clause of a partial index cannot cast a text column to these
+types, because the value `'now'` gives a different result at each
+evaluation. A cast of a timestamp, timestamptz, date or time column is
+accepted. A cast to a domain, such as `'2024-01-01'::recent`, does not apply
+the domain: it gives a number.
 
 A CHECK constraint and the CHECK of a domain read the value that a column
 shows, so `ts timestamp CHECK (ts > '2020-01-01')`, `price numeric(10,2)
 CHECK (price > 0)` and a CHECK that compares numeric columns of different
 scales work. A CHECK on integer, bigint, smallint and the columns of older
 tables of type timestamp, date or time compares like a CHECK on the base type.
-ALTER TABLE ... ADD COLUMN of a timestamp, date or time column with the
-DEFAULT `'now'`, `'today'`, `'tomorrow'` or `'yesterday'` needs an empty
-table.
+ALTER TABLE ... ADD COLUMN of a timestamp, date or time column, or of a
+domain over these types, with the DEFAULT `'now'`, `'today'`, `'tomorrow'` or
+`'yesterday'` needs an empty table. On a table with rows, ADD COLUMN refuses a
+DEFAULT that the column type does not accept, such as `time DEFAULT '25:00'`.
 
 A FOREIGN KEY compares the stored values of its columns. A FOREIGN KEY
 between two columns that store their values in different forms is refused,

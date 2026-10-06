@@ -1,4 +1,4 @@
-use crate::common::TempDatabase;
+use crate::common::{rows, TempDatabase};
 use turso_core::{Numeric, StepResult, Value};
 
 #[turso_macros::test]
@@ -929,6 +929,38 @@ fn test_pg_create_table_columns_in_pg_attribute(db: TempDatabase) {
     assert_eq!(columns[1].0, "name");
     assert_eq!(columns[1].1, "text");
     assert_eq!(columns[2].0, "price");
+}
+
+#[turso_macros::test]
+fn pg_attribute_shows_the_types_of_columns_that_store_integers(db: TempDatabase) {
+    let conn = db.connect_postgres();
+    conn.execute(
+        "CREATE TABLE ty (a int, b bigint, c serial, d timestamp, e timestamptz, f date, \
+         g time, h numeric(10,2), i smallint, j bigserial)",
+    )
+    .unwrap();
+    assert_eq!(
+        rows(
+            &conn,
+            "SELECT a.attname, a.atttypid, t.typname, format_type(a.atttypid, a.atttypmod) \
+             FROM pg_attribute a \
+             JOIN pg_class c ON a.attrelid = c.oid \
+             JOIN pg_type t ON a.atttypid = t.oid \
+             WHERE c.relname = 'ty' AND a.attnum > 0 ORDER BY a.attnum"
+        ),
+        [
+            "a|23|int4|integer",
+            "b|20|int8|bigint",
+            "c|23|int4|integer",
+            "d|1114|timestamp|timestamp without time zone",
+            "e|1184|timestamptz|timestamp with time zone",
+            "f|1082|date|date",
+            "g|1083|time|time without time zone",
+            "h|1700|numeric|numeric",
+            "i|21|int2|smallint",
+            "j|20|int8|bigint",
+        ]
+    );
 }
 
 #[turso_macros::test]

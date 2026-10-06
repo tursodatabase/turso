@@ -2,6 +2,7 @@ use crate::alloc::vec;
 use crate::alloc::TursoFromIterator;
 use crate::alloc::*;
 use crate::function::{Deterministic, Func, ScalarFunc};
+use crate::functions::pg_types::PgTemporal;
 use crate::incremental::view::IncrementalView;
 use crate::incremental::{compiler::DBSP_CIRCUIT_VERSION, operator::create_dbsp_state_index};
 use crate::index_method::{IndexMethodAttachment, IndexMethodConfiguration};
@@ -251,74 +252,6 @@ impl SeekKeyFunction {
             Self::PgTime => ScalarFunc::PgTimeSeekKey,
             Self::PgNumeric => ScalarFunc::PgNumericSeekKey,
         }
-    }
-}
-
-/// The built-in types of the tables that the PostgreSQL frontend creates.
-/// A table needs the PGSTORAGE option to use them in a column.
-pub(crate) const PG_STORAGE_TYPE_NAMES: [&str; 7] = [
-    "pg_int4",
-    "pg_int8",
-    "pg_timestamp",
-    "pg_timestamptz",
-    "pg_date",
-    "pg_time",
-    "pg_numeric",
-];
-
-pub(crate) fn pg_storage_type_shows_text(name: &str) -> bool {
-    [
-        "pg_timestamp",
-        "pg_timestamptz",
-        "pg_date",
-        "pg_time",
-        "pg_numeric",
-    ]
-    .iter()
-    .any(|pg_name| pg_name.eq_ignore_ascii_case(name))
-}
-
-/// `pg_int4` and `pg_int8`: a single-column PRIMARY KEY of these types in a
-/// table with the PGSTORAGE option is a rowid alias.
-pub(crate) fn is_pg_int_type_name(name: &str) -> bool {
-    name.eq_ignore_ascii_case("pg_int4") || name.eq_ignore_ascii_case("pg_int8")
-}
-
-pub(crate) fn is_pg_storage_type_name(name: &str) -> bool {
-    PG_STORAGE_TYPE_NAMES
-        .iter()
-        .any(|pg_name| pg_name.eq_ignore_ascii_case(name))
-}
-
-impl TypeDef {
-    pub(crate) fn is_pg_storage_type(&self) -> bool {
-        self.is_builtin && is_pg_storage_type_name(&self.name)
-    }
-}
-
-impl ResolvedType {
-    pub(crate) fn needs_pg_storage(&self) -> bool {
-        self.chain.iter().any(|td| td.is_pg_storage_type())
-    }
-
-    /// A CHECK reads the DECODEd value of a column of this type: the chain
-    /// has a built-in type of the PostgreSQL frontend that stores another
-    /// value than the value that it shows.
-    pub(crate) fn check_reads_decoded_value(&self) -> bool {
-        self.chain
-            .iter()
-            .any(|td| td.is_pg_storage_type() && !decode_returns_stored_value(td))
-    }
-
-    /// Every type of the chain stores the value that it shows and has no
-    /// comparison function, so a CHECK compares the value like a value of the
-    /// primitive type.
-    pub(crate) fn stores_the_value_it_shows(&self) -> bool {
-        self.chain.iter().all(|td| {
-            matches!(td.kind, TypeDefKind::Custom { .. })
-                && decode_returns_stored_value(td)
-                && !declares_comparison_function(td)
-        })
     }
 }
 
@@ -612,6 +545,162 @@ impl TypeDef {
     }
 }
 
+impl TypeDef {
+    pub fn pg_storage_type(&self) -> Option<PgStorageType> {
+        if !self.is_builtin {
+            return None;
+        }
+        PgStorageType::from_type_name(&self.name)
+    }
+
+    pub(crate) fn is_pg_storage_type(&self) -> bool {
+        self.pg_storage_type().is_some()
+    }
+}
+
+impl ResolvedType {
+    /// The built-in type of the PostgreSQL frontend in the chain: the type of
+    /// the column, or the type that a domain is built on.
+    pub fn pg_storage_type(&self) -> Option<PgStorageType> {
+        self.chain.iter().find_map(|td| td.pg_storage_type())
+    }
+
+    pub(crate) fn needs_pg_storage(&self) -> bool {
+        self.pg_storage_type().is_some()
+    }
+
+    pub(crate) fn check_reads_decoded_value(&self) -> bool {
+        self.pg_storage_type()
+            .is_some_and(PgStorageType::stores_another_value)
+    }
+
+    /// Every type of the chain stores the value that it shows and has no
+    /// comparison function, so a CHECK compares the value like a value of the
+    /// primitive type.
+    pub(crate) fn stores_the_value_it_shows(&self) -> bool {
+        self.chain.iter().all(|td| {
+            matches!(td.kind, TypeDefKind::Custom { .. })
+                && decode_returns_stored_value(td)
+                && !declares_comparison_function(td)
+        })
+    }
+}
+
+/// The built-in types of the tables that the PostgreSQL frontend creates. A
+/// table needs the PGSTORAGE option to use them in a column.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PgStorageType {
+    Int4,
+    Int8,
+    Timestamp,
+    Timestamptz,
+    Date,
+    Time,
+    Numeric,
+}
+
+impl PgStorageType {
+    pub const ALL: [Self; 7] = [
+        Self::Int4,
+        Self::Int8,
+        Self::Timestamp,
+        Self::Timestamptz,
+        Self::Date,
+        Self::Time,
+        Self::Numeric,
+    ];
+
+    pub const MAX_NUMERIC_PRECISION: i64 = crate::functions::pg_types::MAX_NUMERIC_PRECISION;
+
+    pub fn from_type_name(name: &str) -> Option<Self> {
+        Self::ALL
+            .into_iter()
+            .find(|pg_type| pg_type.type_name().eq_ignore_ascii_case(name))
+    }
+
+    pub fn type_name(self) -> &'static str {
+        match self {
+            Self::Int4 => "pg_int4",
+            Self::Int8 => "pg_int8",
+            Self::Timestamp => "pg_timestamp",
+            Self::Timestamptz => "pg_timestamptz",
+            Self::Date => "pg_date",
+            Self::Time => "pg_time",
+            Self::Numeric => "pg_numeric",
+        }
+    }
+
+    pub fn postgres_name(self) -> &'static str {
+        match self {
+            Self::Int4 => "integer",
+            Self::Int8 => "bigint",
+            Self::Timestamp => "timestamp",
+            Self::Timestamptz => "timestamptz",
+            Self::Date => "date",
+            Self::Time => "time",
+            Self::Numeric => "numeric",
+        }
+    }
+
+    pub fn oid(self) -> u32 {
+        match self {
+            Self::Int4 => 23,
+            Self::Int8 => 20,
+            Self::Timestamp => 1114,
+            Self::Timestamptz => 1184,
+            Self::Date => 1082,
+            Self::Time => 1083,
+            Self::Numeric => 1700,
+        }
+    }
+
+    pub fn stores_another_value(self) -> bool {
+        !matches!(self, Self::Int4 | Self::Int8)
+    }
+
+    /// A single-column PRIMARY KEY of the type in a table with the PGSTORAGE
+    /// option is a rowid alias.
+    pub fn is_rowid_alias_type(self) -> bool {
+        matches!(self, Self::Int4 | Self::Int8)
+    }
+
+    pub fn is_date_or_time(self) -> bool {
+        self.temporal().is_some()
+    }
+
+    pub(crate) fn temporal(self) -> Option<PgTemporal> {
+        match self {
+            Self::Timestamp => Some(PgTemporal::Timestamp),
+            Self::Timestamptz => Some(PgTemporal::Timestamptz),
+            Self::Date => Some(PgTemporal::Date),
+            Self::Time => Some(PgTemporal::Time),
+            Self::Int4 | Self::Int8 | Self::Numeric => None,
+        }
+    }
+
+    /// The function of a cast to a date or time type: it gives the text that
+    /// a column of the type shows.
+    pub(crate) fn temporal_cast_function(self) -> Option<ScalarFunc> {
+        match self {
+            Self::Timestamp => Some(ScalarFunc::PgTimestamp),
+            Self::Timestamptz => Some(ScalarFunc::PgTimestamptz),
+            Self::Date => Some(ScalarFunc::PgDate),
+            Self::Time => Some(ScalarFunc::PgTime),
+            Self::Int4 | Self::Int8 | Self::Numeric => None,
+        }
+    }
+
+    pub(crate) fn seek_key_function(self) -> Option<SeekKeyFunction> {
+        match self {
+            Self::Timestamp | Self::Timestamptz => Some(SeekKeyFunction::PgTimestamp),
+            Self::Date => Some(SeekKeyFunction::PgDate),
+            Self::Time => Some(SeekKeyFunction::PgTime),
+            Self::Numeric => Some(SeekKeyFunction::PgNumeric),
+            Self::Int4 | Self::Int8 => None,
+        }
+    }
+}
+
 /// Accumulators for schema loading - kept separate to avoid moving through state variants
 struct MakeFromBtreeAccumulators {
     from_sql_indexes: Vec<UnparsedFromSqlIndex>,
@@ -875,6 +964,16 @@ impl Default for Schema {
     }
 }
 
+fn builtin_type(name: &str) -> Option<Arc<TypeDef>> {
+    static BUILTIN_TYPES: crate::sync::LazyLock<HashMap<String, Arc<TypeDef>>> =
+        crate::sync::LazyLock::new(|| {
+            let mut registry = HashMap::default();
+            bootstrap_builtin_types(&mut registry).expect("the built-in type definitions parse");
+            registry
+        });
+    BUILTIN_TYPES.get(name).cloned()
+}
+
 fn bootstrap_builtin_types(registry: &mut HashMap<String, Arc<TypeDef>>) -> crate::Result<()> {
     use turso_parser::ast::{Cmd, Stmt};
     use turso_parser::parser::Parser;
@@ -1088,6 +1187,15 @@ impl Schema {
             .is_some_and(|resolved| resolved.chain.iter().any(declares_operator_function))
     }
 
+    pub(crate) fn column_pg_storage_type(
+        &self,
+        column: &Column,
+        is_strict: bool,
+    ) -> Option<PgStorageType> {
+        self.resolve_column_type(column, is_strict)?
+            .pg_storage_type()
+    }
+
     fn resolve_column_type(&self, column: &Column, is_strict: bool) -> Option<ResolvedType> {
         self.resolve_type(&column.ty_str, is_strict)
             .expect("DROP TYPE refuses a type that a column or a domain uses")
@@ -1118,14 +1226,12 @@ impl Schema {
         Ok(Some(ResolvedType { primitive, chain }))
     }
 
-    /// Remove a type. A user type of an older file can have the name of a
-    /// built-in type; removing it makes the built-in type visible again.
+    /// A user type of an older file can have the name of a built-in type;
+    /// removing it makes the built-in type visible again.
     pub fn remove_type(&mut self, type_name: &str) {
         let key = type_name.to_lowercase();
         self.type_registry.remove(&key);
-        let mut builtin_types = HashMap::default();
-        bootstrap_builtin_types(&mut builtin_types).expect("built-in type definitions parse");
-        if let Some(builtin) = builtin_types.remove(&key) {
+        if let Some(builtin) = builtin_type(&key) {
             self.type_registry.insert(key, builtin);
         }
     }
@@ -2836,10 +2942,6 @@ impl Schema {
         Ok(())
     }
 
-    /// A FOREIGN KEY compares the stored values of its columns. The built-in
-    /// types of the PostgreSQL frontend store a date, a time or a decimal as
-    /// an integer, which a column of another type stores in another form, so
-    /// refuse a FOREIGN KEY between such columns.
     fn refuse_fk_between_stored_forms(
         &self,
         child: &BTreeTable,
@@ -2847,43 +2949,37 @@ impl Schema {
         parent: &BTreeTable,
         parent_column: &Column,
     ) -> Result<()> {
-        let child_form = self.decoded_stored_form(child, child_column);
-        let parent_form = self.decoded_stored_form(parent, parent_column);
+        let child_form = self.stored_form(child, child_column);
+        let parent_form = self.stored_form(parent, parent_column);
         if child_form == parent_form {
             return Ok(());
         }
         Err(crate::LimboError::ForeignKeyConstraint(format!(
-            "foreign key mismatch - \"{}\" referencing \"{}\": column {} of type {} stores its values in another form than column {} of type {}",
+            "foreign key mismatch - \"{}\" referencing \"{}\": {}.{} stores {}, but {}.{} stores {}",
             child.name,
             parent.name,
+            child.name,
             child_column.name.as_deref().unwrap_or_default(),
-            child_column.ty_str,
+            child_form.describe(child_column),
+            parent.name,
             parent_column.name.as_deref().unwrap_or_default(),
-            parent_column.ty_str,
+            parent_form.describe(parent_column),
         )))
     }
 
-    /// The built-in type of the PostgreSQL frontend in the type chain of a
-    /// column that stores another value than the value it shows, and the
-    /// scale of a `pg_numeric`.
-    fn decoded_stored_form(&self, table: &BTreeTable, column: &Column) -> Option<(String, String)> {
-        let resolved = self
-            .resolve_type(&column.ty_str, table.is_strict)
-            .ok()
-            .flatten()?;
-        let type_def = resolved
-            .chain
-            .iter()
-            .find(|td| td.is_pg_storage_type() && !decode_returns_stored_value(td))?;
-        let scale = match type_def.name.as_str() {
-            "pg_numeric" => column
-                .ty_params
-                .get(1)
-                .map(|scale| scale.to_string())
-                .unwrap_or_default(),
-            _ => String::new(),
+    fn stored_form(&self, table: &BTreeTable, column: &Column) -> StoredForm {
+        let Some(pg_type) = self
+            .resolve_column_type(column, table.is_strict)
+            .and_then(|resolved| resolved.pg_storage_type())
+            .filter(|pg_type| pg_type.stores_another_value())
+        else {
+            return StoredForm::OfItsType;
         };
-        Some((type_def.name.clone(), scale))
+        let scale = match pg_type {
+            PgStorageType::Numeric => column.ty_params.get(1).map(|scale| scale.to_string()),
+            _ => None,
+        };
+        StoredForm::Integer { pg_type, scale }
     }
 
     /// Returns if any table declares a FOREIGN KEY whose parent is `table_name`.
@@ -3053,16 +3149,39 @@ fn decode_returns_stored_value(td: &TypeDef) -> bool {
 }
 
 fn builtin_seek_key_function(td: &TypeDef) -> Option<SeekKeyFunction> {
-    if !td.is_builtin {
-        return None;
+    if td.is_builtin && td.name == "uuid" {
+        return Some(SeekKeyFunction::Uuid);
     }
-    match td.name.as_str() {
-        "uuid" => Some(SeekKeyFunction::Uuid),
-        "pg_timestamp" | "pg_timestamptz" => Some(SeekKeyFunction::PgTimestamp),
-        "pg_date" => Some(SeekKeyFunction::PgDate),
-        "pg_time" => Some(SeekKeyFunction::PgTime),
-        "pg_numeric" => Some(SeekKeyFunction::PgNumeric),
-        _ => None,
+    td.pg_storage_type()?.seek_key_function()
+}
+
+/// How a column stores its values, for a FOREIGN KEY. The built-in types of
+/// the PostgreSQL frontend store a date, a time or a decimal as an integer,
+/// which a column of another type stores in another form.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum StoredForm {
+    OfItsType,
+    Integer {
+        pg_type: PgStorageType,
+        scale: Option<String>,
+    },
+}
+
+impl StoredForm {
+    fn describe(&self, column: &Column) -> String {
+        match self {
+            Self::OfItsType => format!("the values of type {}", column.ty_str),
+            Self::Integer {
+                pg_type: PgStorageType::Numeric,
+                scale,
+            } => format!(
+                "decimals as integers with scale {}",
+                scale.as_deref().unwrap_or("0")
+            ),
+            Self::Integer { pg_type, .. } => {
+                format!("{} values as integers", pg_type.postgres_name())
+            }
+        }
     }
 }
 
@@ -4764,7 +4883,24 @@ pub fn render_gencol_expr_sql_with_new_names(expr: &Expr, columns: &[Column]) ->
     Ok(clone.to_string())
 }
 
-pub(crate) fn is_deterministic_schema_function_call(func: &Func, args: &[Box<Expr>]) -> bool {
+/// What a check of a schema expression (an index expression, the WHERE
+/// clause of a partial index, a generated column) knows about the columns
+/// that the expression reads.
+#[derive(Clone, Copy)]
+pub(crate) enum SchemaExprColumns<'a> {
+    /// The columns of this table.
+    Of(&'a Schema, &'a BTreeTable),
+    /// Nothing: only a literal operand passes the check.
+    Unknown,
+    /// The statement that created the expression checked it.
+    Checked,
+}
+
+pub(crate) fn is_deterministic_schema_function_call(
+    func: &Func,
+    args: &[Box<Expr>],
+    columns: SchemaExprColumns,
+) -> bool {
     match func {
         Func::Scalar(
             ScalarFunc::Date
@@ -4775,28 +4911,121 @@ pub(crate) fn is_deterministic_schema_function_call(func: &Func, args: &[Box<Exp
             | ScalarFunc::StrfTime
             | ScalarFunc::TimeDiff,
         ) => is_deterministic_datetime_call(func, args),
-        Func::Scalar(
-            ScalarFunc::PgTimestampEncode
+        Func::Scalar(scalar) if is_pg_temporal_function(scalar) => args
+            .iter()
+            .all(|arg| is_never_a_clock_word(arg.as_ref(), columns)),
+        _ => func.is_deterministic(),
+    }
+}
+
+/// A cast to a date or time type of the PostgreSQL frontend, or to a domain
+/// over one, reads the clock for a word like 'now'. In a schema expression
+/// its operand must never be such a word.
+pub(crate) fn is_deterministic_schema_cast(
+    operand: &Expr,
+    type_name: &ast::Type,
+    columns: SchemaExprColumns,
+) -> bool {
+    let reads_the_clock = match columns {
+        SchemaExprColumns::Of(schema, _) => schema
+            .resolve_type_unchecked(&type_name.name)
+            .ok()
+            .flatten()
+            .and_then(|resolved| resolved.pg_storage_type()?.temporal())
+            .is_some(),
+        SchemaExprColumns::Unknown | SchemaExprColumns::Checked => {
+            PgStorageType::from_type_name(&type_name.name)
+                .and_then(PgStorageType::temporal)
+                .is_some()
+        }
+    };
+    !reads_the_clock || is_never_a_clock_word(operand, columns)
+}
+
+fn is_pg_temporal_function(func: &ScalarFunc) -> bool {
+    matches!(
+        func,
+        ScalarFunc::PgTimestampEncode
             | ScalarFunc::PgTimestamptzEncode
             | ScalarFunc::PgDateEncode
             | ScalarFunc::PgTimeEncode
-            | ScalarFunc::PgTimestamp
-            | ScalarFunc::PgTimestamptz
-            | ScalarFunc::PgDate
-            | ScalarFunc::PgTime,
-        ) => !args.iter().any(|arg| is_pg_clock_word(arg.as_ref())),
-        _ => func.is_deterministic(),
+    ) || PgStorageType::ALL
+        .iter()
+        .any(|pg_type| pg_type.temporal_cast_function().as_ref() == Some(func))
+}
+
+/// The value is never a word like 'now': a literal that is not such a word,
+/// a column of a date or time type, or the result of a cast to a date or time
+/// type.
+fn is_never_a_clock_word(expr: &Expr, columns: SchemaExprColumns) -> bool {
+    match expr {
+        Expr::Parenthesized(exprs) if exprs.len() == 1 => is_never_a_clock_word(&exprs[0], columns),
+        Expr::Literal(_) => !is_pg_clock_word(expr),
+        Expr::Id(name)
+        | Expr::Name(name)
+        | Expr::Qualified(_, name)
+        | Expr::DoublyQualified(_, _, name) => match columns {
+            SchemaExprColumns::Of(schema, table) => table
+                .get_column(&normalize_ident(name.as_str()))
+                .is_some_and(|(_, column)| column_shows_date_or_time(schema, table, column)),
+            SchemaExprColumns::Unknown => false,
+            SchemaExprColumns::Checked => true,
+        },
+        Expr::FunctionCall { name, args, .. }
+            if Func::resolve_function(name.as_str(), args.len()).is_ok_and(|func| {
+                matches!(func, Some(Func::Scalar(scalar)) if is_pg_temporal_function(&scalar))
+            }) =>
+        {
+            true
+        }
+        Expr::Cast {
+            type_name: Some(type_name),
+            ..
+        } if match columns {
+            SchemaExprColumns::Of(schema, _) => type_shows_date_or_time(schema, &type_name.name),
+            SchemaExprColumns::Unknown | SchemaExprColumns::Checked => {
+                PgStorageType::from_type_name(&type_name.name)
+                    .and_then(PgStorageType::temporal)
+                    .is_some()
+            }
+        } =>
+        {
+            true
+        }
+        _ => matches!(columns, SchemaExprColumns::Checked),
     }
+}
+
+fn column_shows_date_or_time(schema: &Schema, table: &BTreeTable, column: &Column) -> bool {
+    table.is_strict && type_shows_date_or_time(schema, &column.ty_str)
+}
+
+/// The ENCODE of these built-in types stores canonical text or an integer,
+/// never a word like 'now'.
+fn type_shows_date_or_time(schema: &Schema, type_name: &str) -> bool {
+    schema
+        .resolve_type_unchecked(type_name)
+        .ok()
+        .flatten()
+        .is_some_and(|resolved| {
+            resolved.chain.iter().any(|td| {
+                td.pg_storage_type()
+                    .and_then(PgStorageType::temporal)
+                    .is_some()
+                    || (td.is_builtin
+                        && matches!(
+                            td.name.as_str(),
+                            "date" | "time" | "timestamp" | "timestamptz"
+                        ))
+            })
+        })
 }
 
 pub(crate) fn is_pg_clock_word(expr: &Expr) -> bool {
     match expr {
         Expr::Parenthesized(exprs) if exprs.len() == 1 => is_pg_clock_word(&exprs[0]),
         Expr::Literal(ast::Literal::String(value)) => {
-            let word = value.trim_matches('\'').trim();
-            ["now", "today", "tomorrow", "yesterday"]
-                .iter()
-                .any(|clock_word| word.eq_ignore_ascii_case(clock_word))
+            crate::functions::pg_types::is_clock_word(value.trim_matches('\'').trim())
         }
         Expr::Literal(
             ast::Literal::CurrentDate | ast::Literal::CurrentTime | ast::Literal::CurrentTimestamp,
@@ -4896,7 +5125,7 @@ pub(crate) fn validate_generated_expr(expr: &Expr) -> Result<()> {
             if matches!(func, Func::Agg(_)) {
                 bail_parse_error!("aggregate functions prohibited in generated columns");
             }
-            if !is_deterministic_schema_function_call(&func, args) {
+            if !is_deterministic_schema_function_call(&func, args, SchemaExprColumns::Unknown) {
                 bail_parse_error!("non-deterministic functions prohibited in generated columns");
             }
             for arg in args {
@@ -4952,7 +5181,12 @@ pub(crate) fn validate_generated_expr(expr: &Expr) -> Result<()> {
                 validate_generated_expr(e)?;
             }
         }
-        Expr::Cast { expr, .. } => {
+        Expr::Cast { expr, type_name } => {
+            if type_name.as_ref().is_some_and(|type_name| {
+                !is_deterministic_schema_cast(expr, type_name, SchemaExprColumns::Unknown)
+            }) {
+                bail_parse_error!("non-deterministic functions prohibited in generated columns");
+            }
             validate_generated_expr(expr)?;
         }
         Expr::InList { lhs, rhs, .. } => {
@@ -5476,7 +5710,8 @@ fn create_table_with_rowid_alias_types(
                         (typename_exactly_integer
                             || (rowid_alias_types == RowidAliasTypes::IntegerAndPgInt
                                 && is_pg_storage
-                                && is_pg_int_type_name(&ty_str)))
+                                && PgStorageType::from_type_name(&ty_str)
+                                    .is_some_and(PgStorageType::is_rowid_alias_type)))
                             && primary_key
                             && !primary_key_desc_columns_constraint,
                     )
@@ -6208,7 +6443,9 @@ impl Column {
     /// INSERT that omits it uses its DEFAULT, and NULL is a NOT NULL error:
     /// the INSERT does not generate a rowid for it.
     pub fn is_pg_int_rowid_alias(&self) -> bool {
-        self.is_rowid_alias() && is_pg_int_type_name(&self.ty_str)
+        self.is_rowid_alias()
+            && PgStorageType::from_type_name(&self.ty_str)
+                .is_some_and(PgStorageType::is_rowid_alias_type)
     }
     #[inline]
     pub fn notnull(&self) -> bool {
@@ -6647,9 +6884,14 @@ impl Index {
 
     /// Walk the where_clause Expr of a partial index and validate that it doesn't reference any other
     /// tables or use any disallowed constructs.
-    pub fn validate_where_expr(&self, table: &Table, _resolver: &Resolver) -> bool {
+    pub fn validate_where_expr(&self, table: &Table, resolver: &Resolver) -> bool {
         let Some(where_clause) = &self.where_clause else {
             return true;
+        };
+        let btree = table.btree();
+        let columns = match btree.as_deref() {
+            Some(btree) => SchemaExprColumns::Of(resolver.schema(), btree),
+            None => SchemaExprColumns::Unknown,
         };
 
         let tbl_norm = self.table_name.as_str();
@@ -6665,7 +6907,7 @@ impl Index {
             let n = normalize_ident(name);
             Func::resolve_function(&n, args.len()).is_ok_and(|f| {
                 f.is_some_and(|f| {
-                    f.is_deterministic() && is_deterministic_schema_function_call(&f, args)
+                    f.is_deterministic() && is_deterministic_schema_function_call(&f, args, columns)
                 })
             })
         };
@@ -6713,6 +6955,14 @@ impl Index {
                         if !is_deterministic_fn(name.as_str(), args) {
                             ok = false;
                         }
+                    }
+                }
+                Expr::Cast {
+                    expr,
+                    type_name: Some(type_name),
+                } => {
+                    if !is_deterministic_schema_cast(expr, type_name, columns) {
+                        ok = false;
                     }
                 }
                 // Explicitly disallowed constructs
@@ -7139,9 +7389,6 @@ mod tests {
         Ok(())
     }
 
-    /// The PostgreSQL frontend of older versions stored tables that can use
-    /// a user type named pg_int8 for a PRIMARY KEY. Such a column is not a
-    /// rowid alias, and canonical SQL, where it would be one, is refused.
     #[test]
     pub fn pg_int_primary_key_of_an_older_postgres_frontend_is_not_a_rowid_alias() -> Result<()> {
         let sql = "CREATE TABLE t (a pg_int8 PRIMARY KEY, b TEXT) STRICT, PGSTORAGE";

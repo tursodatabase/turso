@@ -464,20 +464,22 @@ fn translate_integrity_check_for_schema(
             if let Some(where_expr) = bound_index.where_expr.as_ref() {
                 let where_failed = skip_current_index;
                 let where_true_fallthrough = program.allocate_label();
-                translate_condition_expr(
-                    program,
-                    &table_references,
-                    where_expr,
-                    ConditionMetadata {
-                        // For partial indexes, rows that evaluate predicate to FALSE/NULL
-                        // are not part of the index and must be skipped.
-                        jump_if_condition_is_true: false,
-                        jump_target_when_true: where_true_fallthrough,
-                        jump_target_when_false: where_failed,
-                        jump_target_when_null: where_failed,
-                    },
-                    resolver,
-                )?;
+                resolver.with_index_expression(|| {
+                    translate_condition_expr(
+                        program,
+                        &table_references,
+                        where_expr,
+                        ConditionMetadata {
+                            // For partial indexes, rows that evaluate predicate to FALSE/NULL
+                            // are not part of the index and must be skipped.
+                            jump_if_condition_is_true: false,
+                            jump_target_when_true: where_true_fallthrough,
+                            jump_target_when_false: where_failed,
+                            jump_target_when_null: where_failed,
+                        },
+                        resolver,
+                    )
+                })?;
                 program.preassign_label_to_next_insn(where_true_fallthrough);
             }
 
@@ -513,21 +515,23 @@ fn translate_integrity_check_for_schema(
                                 }
                             });
 
-                        resolver.with_self_table_context(
-                            program,
-                            self_table_context.as_ref(),
-                            |program, _| {
-                                translate_expr_no_constant_opt(
-                                    program,
-                                    Some(&table_references),
-                                    expr,
-                                    target,
-                                    resolver,
-                                    NoConstantOptReason::RegisterReuse,
-                                )?;
-                                Ok(())
-                            },
-                        )?;
+                        resolver.with_index_expression(|| {
+                            resolver.with_self_table_context(
+                                program,
+                                self_table_context.as_ref(),
+                                |program, _| {
+                                    translate_expr_no_constant_opt(
+                                        program,
+                                        Some(&table_references),
+                                        expr,
+                                        target,
+                                        resolver,
+                                        NoConstantOptReason::RegisterReuse,
+                                    )?;
+                                    Ok(())
+                                },
+                            )
+                        })?;
                         if let Some(aff) = affinity {
                             program.emit_column_affinity(target, *aff);
                         }

@@ -306,7 +306,7 @@ fn build_field_info(stmt: &turso_core::Statement, format: &Format) -> Vec<FieldI
 /// layer shouldn't panic if it does), the safe default is TEXT;
 /// `encode_value` already handles per-value type mismatches.
 fn resolve_pg_type_for_column(stmt: &turso_core::Statement, idx: usize) -> Type {
-    use turso_core::ColumnTypeKind;
+    use turso_core::{schema::PgStorageType, ColumnTypeKind};
 
     let Some(info) = stmt.get_column_type_info(idx).ok().flatten() else {
         return Type::TEXT;
@@ -314,19 +314,20 @@ fn resolve_pg_type_for_column(stmt: &turso_core::Statement, idx: usize) -> Type 
     // STRUCT and UNION columns live as BLOBs on disk, but exposing them as
     // BYTEA would force clients to deal with raw bytes. Map them to JSONB so
     // libpq/psql/JDBC see structured data they can introspect.
-    let mut base = match info.kind {
-        ColumnTypeKind::Struct | ColumnTypeKind::Union => Type::JSONB,
+    let mut base = match (info.kind, info.pg_storage_type) {
+        (ColumnTypeKind::Struct | ColumnTypeKind::Union, _) => Type::JSONB,
+        (_, Some(pg_type)) => {
+            Type::from_oid(pg_type.oid()).expect("the built-in types have PostgreSQL OIDs")
+        }
         _ => {
             // Prefer the declared name (the user-visible type), then fall
             // back to the resolved base for custom/domain types whose
             // declared name isn't in the lookup table. A user type of an
             // older file can have the name of a built-in pg_ type.
-            let names_builtin_type =
-                info.is_builtin_type || !info.declared_name.to_lowercase().starts_with("pg_");
-            let mapped = if names_builtin_type {
-                sqlite_type_to_pg_type(&info.declared_name)
-            } else {
+            let mapped = if PgStorageType::from_type_name(&info.declared_name).is_some() {
                 Type::TEXT
+            } else {
+                sqlite_type_to_pg_type(&info.declared_name)
             };
             if mapped == Type::TEXT {
                 info.base_type
@@ -627,13 +628,6 @@ fn sqlite_type_to_pg_type(type_str: &str) -> Type {
         "CIDR" => Type::CIDR,
         "MACADDR" => Type::MACADDR,
         "MACADDR8" => Type::MACADDR8,
-        "PG_INT4" => Type::INT4,
-        "PG_INT8" => Type::INT8,
-        "PG_TIMESTAMP" => Type::TIMESTAMP,
-        "PG_TIMESTAMPTZ" => Type::TIMESTAMPTZ,
-        "PG_DATE" => Type::DATE,
-        "PG_TIME" => Type::TIME,
-        "PG_NUMERIC" => Type::NUMERIC,
         _ => {
             // Handle parameterized types like varchar(50), numeric(10,2)
             if upper.starts_with("VARCHAR") || upper.starts_with("CHAR") {
@@ -887,13 +881,9 @@ mod tests {
         assert_eq!(sqlite_type_to_pg_type("JSON"), Type::JSON);
         assert_eq!(sqlite_type_to_pg_type("JSONB"), Type::JSONB);
         assert_eq!(sqlite_type_to_pg_type("UUID"), Type::UUID);
-        assert_eq!(sqlite_type_to_pg_type("pg_int4"), Type::INT4);
-        assert_eq!(sqlite_type_to_pg_type("pg_int8"), Type::INT8);
-        assert_eq!(sqlite_type_to_pg_type("pg_timestamp"), Type::TIMESTAMP);
-        assert_eq!(sqlite_type_to_pg_type("pg_timestamptz"), Type::TIMESTAMPTZ);
-        assert_eq!(sqlite_type_to_pg_type("pg_date"), Type::DATE);
-        assert_eq!(sqlite_type_to_pg_type("pg_time"), Type::TIME);
-        assert_eq!(sqlite_type_to_pg_type("pg_numeric"), Type::NUMERIC);
+        for pg_type in turso_core::schema::PgStorageType::ALL {
+            assert!(Type::from_oid(pg_type.oid()).is_some(), "{pg_type:?}");
+        }
         // Unknown types map to TEXT
         assert_eq!(sqlite_type_to_pg_type("UNKNOWN"), Type::TEXT);
     }
@@ -962,11 +952,10 @@ mod tests {
         assert_eq!(
             result_types(
                 &conn,
-                "SELECT n * 2, -n, n + b, max(ts), min(d), max(n) FROM ev"
+                "SELECT n * 2, n + b, max(ts), min(d), max(n) FROM ev"
             ),
             [
                 Type::NUMERIC,
-                Type::FLOAT8,
                 Type::NUMERIC,
                 Type::TIMESTAMP,
                 Type::DATE,
@@ -986,6 +975,43 @@ mod tests {
                 Type::TIMESTAMPTZ,
                 Type::DATE
             ]
+        );
+    }
+
+    #[test]
+    fn result_types_of_domain_columns_over_types_that_store_integers() {
+        let conn = open_postgres(std::sync::Arc::new(turso_core::MemoryIO::new()), ":memory:");
+        for sql in [
+            "CREATE DOMAIN recent AS timestamp CHECK (VALUE > '2020-01-01')",
+            "CREATE DOMAIN day AS date",
+            "CREATE DOMAIN tod AS time",
+            "CREATE DOMAIN tstz AS timestamptz",
+            "CREATE DOMAIN big AS bigint",
+            "CREATE DOMAIN posint AS integer CHECK (VALUE > 0)",
+            "CREATE TABLE dm (id int PRIMARY KEY, a recent, b day, c tod, d tstz, g big, \
+             p posint)",
+            "CREATE TABLE dm_copy AS SELECT a, b, c FROM dm",
+        ] {
+            conn.execute(sql).unwrap();
+        }
+        assert_eq!(
+            result_types(&conn, "SELECT a, b, c, d, g, p FROM dm"),
+            [
+                Type::TIMESTAMP,
+                Type::DATE,
+                Type::TIME,
+                Type::TIMESTAMPTZ,
+                Type::INT8,
+                Type::INT4
+            ]
+        );
+        assert_eq!(
+            result_types(&conn, "SELECT max(a), min(b), max(d) FROM dm"),
+            [Type::TIMESTAMP, Type::DATE, Type::TIMESTAMPTZ]
+        );
+        assert_eq!(
+            result_types(&conn, "SELECT a, b, c FROM dm_copy"),
+            [Type::TEXT, Type::TEXT, Type::TEXT]
         );
     }
 

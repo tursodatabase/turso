@@ -10,7 +10,7 @@ use super::{
     expr::{
         bind_and_rewrite_expr, emit_stored_column, emit_table_column, translate_expr,
         translate_expr_no_constant_opt, walk_expr, BindingBehavior, NoConstantOptReason,
-        WalkControl,
+        NumericComparisons, WalkControl,
     },
     group_by::GroupByMetadata,
     main_loop::{LeftJoinMetadata, LoopLabels, SemiAntiJoinMetadata},
@@ -50,7 +50,7 @@ use crate::{
 };
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 use std::borrow::Cow;
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use turso_parser::ast::{
     self, Expr, Literal, ResolveType, SubqueryType, TableInternalId, TriggerTime,
 };
@@ -165,6 +165,7 @@ pub struct Resolver<'a> {
     /// Context and metadata for resolving Expr::Column values that use
     /// [TableInternalId::SELF_TABLE] as a placeholder.
     self_table_scope: RefCell<Option<SelfTableScope>>,
+    numeric_comparisons: Cell<NumericComparisons>,
     /// One list per enclosing query, mirroring SQLite's NameContext chain
     /// (resolve.c `resolveExprStep`). An aggregate whose argument columns
     /// belong to an enclosing query is computed by that query, not by the
@@ -215,8 +216,6 @@ pub struct Resolver<'a> {
 struct SelfTableScope {
     context: SelfTableContext,
     affinities: Option<Arc<[Affinity]>>,
-    /// The column registers hold the values that the columns show, so the
-    /// operators of the column types apply as for a column of a table.
     columns_are_decoded: bool,
 }
 
@@ -309,6 +308,7 @@ impl<'a> Resolver<'a> {
             register_collations: HashMap::default(),
             subquery_affinities: RefCell::new(HashMap::default()),
             self_table_scope: RefCell::new(None),
+            numeric_comparisons: Cell::new(NumericComparisons::Decimal),
             enclosing_query_aggregates: RefCell::new(Vec::new()),
             enable_custom_types,
             dqs_dml,
@@ -354,6 +354,7 @@ impl<'a> Resolver<'a> {
             register_collations: HashMap::default(),
             subquery_affinities: RefCell::new(self.subquery_affinities.borrow().clone()),
             self_table_scope: RefCell::new(self.self_table_scope.borrow().clone()),
+            numeric_comparisons: self.numeric_comparisons.clone(),
             enclosing_query_aggregates: RefCell::new(Vec::new()),
             enable_custom_types: self.enable_custom_types,
             dqs_dml: self.dqs_dml,
@@ -381,6 +382,7 @@ impl<'a> Resolver<'a> {
             register_collations: self.register_collations.clone(),
             subquery_affinities: RefCell::new(self.subquery_affinities.borrow().clone()),
             self_table_scope: RefCell::new(self.self_table_scope.borrow().clone()),
+            numeric_comparisons: self.numeric_comparisons.clone(),
             enclosing_query_aggregates: RefCell::new(Vec::new()),
             enable_custom_types: self.enable_custom_types,
             dqs_dml: self.dqs_dml,
@@ -439,8 +441,22 @@ impl<'a> Resolver<'a> {
         result
     }
 
-    /// The table of the current DML self-table scope when its column
-    /// registers hold the values that the columns show.
+    /// Run `f` while it translates the expression or the WHERE clause of an
+    /// index. The keys of indexes in existing files compare `numeric` values
+    /// with the rules of older versions.
+    pub(crate) fn with_index_expression<T>(&self, f: impl FnOnce() -> T) -> T {
+        let previous = self
+            .numeric_comparisons
+            .replace(NumericComparisons::OfIndexKeys);
+        let result = f();
+        self.numeric_comparisons.set(previous);
+        result
+    }
+
+    pub(crate) fn numeric_comparisons(&self) -> NumericComparisons {
+        self.numeric_comparisons.get()
+    }
+
     pub(crate) fn decoded_self_table(&self) -> Option<Arc<BTreeTable>> {
         let scope = self.self_table_scope.borrow();
         let scope = scope.as_ref().filter(|scope| scope.columns_are_decoded)?;
@@ -2113,16 +2129,18 @@ pub(crate) fn emit_index_column_value_old_image(
             table_ref_id: table_internal_id,
             referenced_tables: table_references.clone(),
         };
-        resolver.with_self_table_context(program, Some(&self_table_context), |program, _| {
-            translate_expr_no_constant_opt(
-                program,
-                Some(table_references),
-                &expr,
-                dest_reg,
-                resolver,
-                NoConstantOptReason::RegisterReuse,
-            )?;
-            Ok(())
+        resolver.with_index_expression(|| {
+            resolver.with_self_table_context(program, Some(&self_table_context), |program, _| {
+                translate_expr_no_constant_opt(
+                    program,
+                    Some(table_references),
+                    &expr,
+                    dest_reg,
+                    resolver,
+                    NoConstantOptReason::RegisterReuse,
+                )?;
+                Ok(())
+            })
         })?;
         // For virtual generated column references, apply the column's
         // declared affinity to the computed expression result.
@@ -2471,13 +2489,13 @@ fn emit_value_that_check_reads(
     col_name: &str,
     register: usize,
 ) -> Result<usize> {
-    let Some((_, column)) = table.get_column(col_name) else {
-        return Ok(register);
-    };
-    let reads_decoded_value = matches!(
-        resolver.schema().resolve_type(&column.ty_str, table.is_strict),
-        Ok(Some(resolved)) if resolved.check_reads_decoded_value()
-    );
+    let (_, column) = table
+        .get_column(col_name)
+        .expect("a CHECK reads the columns of its table");
+    let reads_decoded_value = resolver
+        .schema()
+        .resolve_type(&column.ty_str, table.is_strict)?
+        .is_some_and(|resolved| resolved.check_reads_decoded_value());
     if !reads_decoded_value || column.is_rowid_alias() {
         return Ok(register);
     }

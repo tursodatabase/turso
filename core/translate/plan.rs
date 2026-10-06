@@ -2,8 +2,8 @@ use crate::{
     alloc::{self, TursoIteratorExt, TursoVecExt},
     function::{AccumulatorFunc, AggFunc},
     schema::{
-        BTreeTable, ColDef, Column, FromClauseSubquery, Index, IndexUse, PseudoCursorType,
-        RecursiveCteInput, Schema, Table, ROWID_SENTINEL,
+        BTreeTable, ColDef, Column, FromClauseSubquery, Index, IndexUse, PgStorageType,
+        PseudoCursorType, RecursiveCteInput, Schema, Table, ROWID_SENTINEL,
     },
     translate::{
         collate::{get_collseq_from_expr, CollationSeq},
@@ -167,13 +167,14 @@ impl ResultSetColumn {
     /// matching SQLite's `azType[]` in `createTableStmt()` (build.c). A
     /// column of a built-in type of the PostgreSQL frontend that stores an
     /// integer for a date, a time or a decimal shows text: TEXT keeps it.
-    pub fn declared_type(&self, tables: &TableReferences) -> &'static str {
+    pub fn declared_type(&self, tables: &TableReferences, schema: &Schema) -> &'static str {
         if let ast::Expr::Column { table, column, .. } = &self.expr {
             let shows_text = tables
                 .find_table_by_internal_id(*table)
-                .filter(|(_, table)| table.is_strict())
-                .and_then(|(_, table)| table.get_column_at(*column))
-                .is_some_and(|column| crate::schema::pg_storage_type_shows_text(&column.ty_str));
+                .and_then(|(_, table)| {
+                    schema.column_pg_storage_type(table.get_column_at(*column)?, table.is_strict())
+                })
+                .is_some_and(PgStorageType::stores_another_value);
             if shows_text {
                 return "TEXT";
             }

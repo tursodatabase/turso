@@ -281,10 +281,15 @@ fn catalog_shows_postgres_ddl_and_defaults_of_new_tables(db: TempDatabase) {
         (
             "CREATE TABLE g (d date DEFAULT '2024-01-01'::date, tz timestamptz, tm time, \
              big bigint, t text CHECK (t::date > '2020-01-01' AND t::time < '23:00'), \
+             u text CHECK (CASE WHEN u::date > '2020-01-01' THEN true ELSE false END), \
+             v text CHECK (v::timestamp IS NOT NULL), \
              CHECK (t::timestamptz > '2000-01-01'))",
             "g|CREATE TABLE g (d date DEFAULT (CAST ('2024-01-01' AS date)), tz timestamptz, \
              tm time, big bigint, t text CHECK (CAST (t AS date) > '2020-01-01' \
-             AND CAST (t AS time) < '23:00'), CHECK (CAST (t AS timestamptz) > '2000-01-01'))",
+             AND CAST (t AS time) < '23:00'), \
+             u text CHECK (CASE WHEN CAST (u AS date) > '2020-01-01' THEN 1 ELSE 0 END), \
+             v text CHECK (CAST (v AS timestamp) NOTNULL), \
+             CHECK (CAST (t AS timestamptz) > '2000-01-01'))",
         ),
     ];
     for (create, _) in tables {

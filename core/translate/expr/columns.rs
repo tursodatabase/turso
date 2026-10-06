@@ -127,7 +127,11 @@ pub(crate) fn emit_stored_column(
     Ok(())
 }
 
-fn column_encodes_stored_value(column: &Column, is_strict: bool, resolver: &Resolver) -> bool {
+pub(crate) fn column_encodes_stored_value(
+    column: &Column,
+    is_strict: bool,
+    resolver: &Resolver,
+) -> bool {
     if !is_strict {
         return false;
     }

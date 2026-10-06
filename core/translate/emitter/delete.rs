@@ -770,14 +770,16 @@ fn emit_delete_row_common(
                     .expect("index.where_clause was checked to be Some above");
                 let skip_label = program.allocate_label();
                 let reg = program.alloc_register();
-                translate_expr_no_constant_opt(
-                    program,
-                    Some(table_references),
-                    &where_copy,
-                    reg,
-                    &t_ctx.resolver,
-                    NoConstantOptReason::RegisterReuse,
-                )?;
+                t_ctx.resolver.with_index_expression(|| {
+                    translate_expr_no_constant_opt(
+                        program,
+                        Some(table_references),
+                        &where_copy,
+                        reg,
+                        &t_ctx.resolver,
+                        NoConstantOptReason::RegisterReuse,
+                    )
+                })?;
                 program.emit_insn(Insn::IfNot {
                     reg,
                     jump_if_null: true,

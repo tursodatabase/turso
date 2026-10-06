@@ -67,6 +67,33 @@ fn test_copy_from_basic(db: TempDatabase) {
 }
 
 #[turso_macros::test(mvcc)]
+fn copy_into_columns_that_store_integers(db: TempDatabase) {
+    let conn = db.connect_postgres();
+    conn.execute(
+        "CREATE TABLE ev (id bigint PRIMARY KEY, ts timestamp, tz timestamptz, d date, t time, \
+         n numeric(10,2))",
+    )
+    .unwrap();
+    let tsv = write_temp_file(
+        "1\t2024-01-01 10:00:00.123456\t2024-01-01 10:00+02\t2024-01-05\t23:59:59.5\t12.345\n\
+         2\t\\N\t\\N\t\\N\t\\N\t\\N\n",
+    );
+    conn.execute(format!("COPY ev FROM '{}'", tsv.path().display()))
+        .unwrap();
+    let rows = query_all(&conn, "SELECT id, ts, tz, d, t, n FROM ev ORDER BY id");
+    assert_eq!(rows.len(), 2);
+    assert_int(&rows[0][0], 1);
+    assert_text(&rows[0][1], "2024-01-01 10:00:00.123456");
+    assert_text(&rows[0][2], "2024-01-01 08:00:00");
+    assert_text(&rows[0][3], "2024-01-05");
+    assert_text(&rows[0][4], "23:59:59.5");
+    assert_text(&rows[0][5], "12.35");
+    for value in &rows[1][1..] {
+        assert_null(value);
+    }
+}
+
+#[turso_macros::test(mvcc)]
 fn test_copy_from_null_values(db: TempDatabase) {
     let conn = db.connect_postgres();
 

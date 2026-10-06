@@ -15,10 +15,11 @@ use crate::{
             emit_make_record, prepare_cdc_if_necessary, OperationMode, Resolver,
         },
         expr::{
-            bind_and_rewrite_expr, emit_returning_results, emit_returning_scan_back,
-            process_returning_clause, restore_returning_row_image_in_cache,
-            seed_returning_row_image_in_cache, translate_expr, translate_expr_no_constant_opt,
-            walk_expr, BindingBehavior, NoConstantOptReason, ReturningBufferCtx, WalkControl,
+            bind_and_rewrite_expr, column_encodes_stored_value, emit_returning_results,
+            emit_returning_scan_back, process_returning_clause,
+            restore_returning_row_image_in_cache, seed_returning_row_image_in_cache,
+            translate_expr, translate_expr_no_constant_opt, walk_expr, BindingBehavior,
+            NoConstantOptReason, ReturningBufferCtx, WalkControl,
         },
         fkeys::{
             build_index_affinity_string, emit_fk_restrict_halt, emit_fk_violation,
@@ -2838,7 +2839,14 @@ fn translate_key(
         }) => {
             match column.default.as_ref() {
                 Some(default_expr) => {
-                    translate_expr(program, None, default_expr, *register, resolver)?;
+                    translate_default(
+                        program,
+                        column,
+                        default_expr,
+                        *register,
+                        resolver,
+                        is_strict,
+                    )?;
                 }
                 None => program.emit_insn(Insn::Null {
                     dest: *register,
@@ -2908,10 +2916,24 @@ fn translate_column(
             dest_end: None,
         });
     } else if let Some(default_expr) = column.default.as_ref() {
-        translate_expr(program, None, default_expr, column_register, resolver)?;
+        translate_default(
+            program,
+            column,
+            default_expr,
+            column_register,
+            resolver,
+            is_strict,
+        )?;
     } else if let Ok(Some(resolved)) = resolver.schema().resolve_type(&column.ty_str, is_strict) {
         if let Some(default_expr) = resolved.default_expr() {
-            translate_expr(program, None, default_expr, column_register, resolver)?;
+            translate_default(
+                program,
+                column,
+                default_expr,
+                column_register,
+                resolver,
+                is_strict,
+            )?;
         } else {
             program.emit_insn(Insn::Null {
                 dest: column_register,
@@ -2925,6 +2947,30 @@ fn translate_column(
         });
     }
     Ok(())
+}
+
+/// The ENCODE of a column runs in place on its register for each row, so a
+/// constant DEFAULT of such a column must not be hoisted out of the loop.
+fn translate_default(
+    program: &mut ProgramBuilder,
+    column: &Column,
+    default_expr: &ast::Expr,
+    column_register: usize,
+    resolver: &Resolver,
+    is_strict: bool,
+) -> Result<usize> {
+    if column_encodes_stored_value(column, is_strict, resolver) {
+        translate_expr_no_constant_opt(
+            program,
+            None,
+            default_expr,
+            column_register,
+            resolver,
+            NoConstantOptReason::CustomTypeEncode,
+        )
+    } else {
+        translate_expr(program, None, default_expr, column_register, resolver)
+    }
 }
 
 /// Emit bytecode to check PRIMARY KEY uniqueness constraint.
@@ -3936,14 +3982,16 @@ fn emit_replace_delete_conflicting_row(
                 .expect("index.where_clause was checked to be Some above");
             let skip_label = program.allocate_label();
             let reg = program.alloc_register();
-            translate_expr_no_constant_opt(
-                program,
-                Some(table_references),
-                &where_copy,
-                reg,
-                resolver,
-                NoConstantOptReason::RegisterReuse,
-            )?;
+            resolver.with_index_expression(|| {
+                translate_expr_no_constant_opt(
+                    program,
+                    Some(table_references),
+                    &where_copy,
+                    reg,
+                    resolver,
+                    NoConstantOptReason::RegisterReuse,
+                )
+            })?;
             program.emit_insn(Insn::IfNot {
                 reg,
                 jump_if_null: true,

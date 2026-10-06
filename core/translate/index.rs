@@ -23,8 +23,8 @@ use crate::vdbe::insn::{to_u32, ClearBtreeCount, CmpInsFlags, Cookie};
 use crate::{bail_parse_error, CaptureDataChangesExt, LimboError, MAIN_DB_ID, TEMP_DB_ID};
 use crate::{
     schema::{
-        is_deterministic_schema_function_call, BTreeTable, Index, IndexColumn, PseudoCursorType,
-        SchemaObjectType,
+        is_deterministic_schema_cast, is_deterministic_schema_function_call, BTreeTable, Index,
+        IndexColumn, PseudoCursorType, SchemaExprColumns, SchemaObjectType,
     },
     storage::pager::CreateBTreeFlags,
     util::{escape_sql_string_literal, normalize_ident, PRIMARY_KEY_AUTOMATIC_INDEX_NAME_PREFIX},
@@ -389,18 +389,20 @@ pub(crate) fn emit_refill_index(
         if let Some(where_clause) = where_clause {
             let label = program.allocate_label();
             let condition_true_label = program.allocate_label();
-            translate_condition_expr(
-                program,
-                &table_references,
-                &where_clause,
-                ConditionMetadata {
-                    jump_if_condition_is_true: false,
-                    jump_target_when_false: label,
-                    jump_target_when_true: condition_true_label,
-                    jump_target_when_null: label,
-                },
-                resolver,
-            )?;
+            resolver.with_index_expression(|| {
+                translate_condition_expr(
+                    program,
+                    &table_references,
+                    &where_clause,
+                    ConditionMetadata {
+                        jump_if_condition_is_true: false,
+                        jump_target_when_false: label,
+                        jump_target_when_true: condition_true_label,
+                        jump_target_when_null: label,
+                    },
+                    resolver,
+                )
+            })?;
             program.preassign_label_to_next_insn(condition_true_label);
             skip_row_label = Some(label);
         }
@@ -490,18 +492,20 @@ pub(crate) fn emit_refill_index(
         if let Some(where_clause) = where_clause {
             let label = program.allocate_label();
             let condition_true_label = program.allocate_label();
-            translate_condition_expr(
-                program,
-                &table_references,
-                &where_clause,
-                ConditionMetadata {
-                    jump_if_condition_is_true: false,
-                    jump_target_when_false: label,
-                    jump_target_when_true: condition_true_label,
-                    jump_target_when_null: label,
-                },
-                resolver,
-            )?;
+            resolver.with_index_expression(|| {
+                translate_condition_expr(
+                    program,
+                    &table_references,
+                    &where_clause,
+                    ConditionMetadata {
+                        jump_if_condition_is_true: false,
+                        jump_target_when_false: label,
+                        jump_target_when_true: condition_true_label,
+                        jump_target_when_null: label,
+                    },
+                    resolver,
+                )
+            })?;
             program.preassign_label_to_next_insn(condition_true_label);
             skip_row_label = Some(label);
         }
@@ -945,7 +949,11 @@ fn resolve_sorted_columns_with_resolver(
                 .expect("resolved index columns vector was preallocated to cols.len()");
             continue;
         }
-        if !validate_index_expression(unwrapped_expr, table) {
+        let columns = match resolver {
+            Some(resolver) => SchemaExprColumns::Of(resolver.schema(), table),
+            None => SchemaExprColumns::Checked,
+        };
+        if !validate_index_expression(unwrapped_expr, table, columns) {
             crate::bail_parse_error!("Error: invalid expression in CREATE INDEX: {}", sc.expr);
         }
         resolved
@@ -1034,7 +1042,7 @@ fn resolve_index_column<'a>(
 /// Expressions in CREATE INDEX statements may not use subqueries.
 /// Additionally, a standalone string literal is interpreted as a column name (for backwards
 /// compatibility with SQLite), not as a string literal. It is rejected if no such column exists.
-fn validate_index_expression(expr: &Expr, table: &BTreeTable) -> bool {
+fn validate_index_expression(expr: &Expr, table: &BTreeTable, columns: SchemaExprColumns) -> bool {
     // A top-level string literal would have been handled by resolve_index_column().
     // If we get here with a string literal, it means the column doesn't exist.
     // (SQLite interprets standalone string literals as column names for backwards compat.)
@@ -1054,8 +1062,9 @@ fn validate_index_expression(expr: &Expr, table: &BTreeTable) -> bool {
     let is_tbl = |ns: &str| normalize_ident(ns).eq_ignore_ascii_case(&tbl_norm);
     let is_deterministic_fn = |name: &str, args: &[Box<Expr>]| {
         let n = normalize_ident(name);
-        Func::resolve_function(&n, args.len())
-            .is_ok_and(|f| f.is_some_and(|f| is_deterministic_schema_function_call(&f, args)))
+        Func::resolve_function(&n, args.len()).is_ok_and(|f| {
+            f.is_some_and(|f| is_deterministic_schema_function_call(&f, args, columns))
+        })
     };
 
     let mut ok = true;
@@ -1107,6 +1116,14 @@ fn validate_index_expression(expr: &Expr, table: &BTreeTable) -> bool {
                     }
                 }
             }
+            Expr::Cast {
+                expr,
+                type_name: Some(type_name),
+            } => {
+                if !is_deterministic_schema_cast(expr, type_name, columns) {
+                    ok = false;
+                }
+            }
             // Explicitly disallowed constructs
             Expr::Exists(_)
             | Expr::InSelect { .. }
@@ -1152,9 +1169,11 @@ fn emit_index_column_value_from_cursor(
                     table_ref_id: jt.internal_id,
                     referenced_tables: table_references.clone(),
                 });
-        resolver.with_self_table_context(program, self_table_context.as_ref(), |program, _| {
-            translate_expr(program, Some(table_references), &expr, dest_reg, resolver)?;
-            Ok(())
+        resolver.with_index_expression(|| {
+            resolver.with_self_table_context(program, self_table_context.as_ref(), |program, _| {
+                translate_expr(program, Some(table_references), &expr, dest_reg, resolver)?;
+                Ok(())
+            })
         })?;
         // For virtual generated column references, apply the column's
         // declared affinity to the computed expression result.
