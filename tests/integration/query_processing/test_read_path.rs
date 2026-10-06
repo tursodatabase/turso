@@ -1,7 +1,9 @@
 use crate::assertions::{AssertColumn, Cell};
 use crate::common::{limbo_exec_rows, sqlite_exec_rows, ExecRows, TempDatabase};
 use asserting::prelude::*;
+use rusqlite::types::Value::Text;
 use rusqlite::Connection as SqliteConnection;
+use std::sync::Arc;
 use tempfile::TempDir;
 use turso_core::{LimboError, StepResult, Value};
 
@@ -1157,4 +1159,47 @@ fn test_column_range_reentry_after_io_yield() -> anyhow::Result<()> {
         .collect();
     assert_eq!(rows, expected);
     Ok(())
+}
+
+#[test]
+fn explain_names_the_column_that_is_read_after_a_virtual_column() {
+    let opts = turso_core::DatabaseOpts::new().with_generated_columns(true);
+    let tmp_db = TempDatabase::builder().with_opts(opts).build();
+    let conn = tmp_db.connect_limbo();
+    conn.execute("CREATE TABLE t(a, b AS (a * 2), c, d)")
+        .unwrap();
+
+    assert_eq!(
+        column_read_comments(&conn, "EXPLAIN SELECT d FROM t"),
+        vec!["r[1]=t.d"]
+    );
+    assert_eq!(
+        column_read_comments(&conn, "EXPLAIN SELECT c, d FROM t"),
+        vec!["r[1..2]=t.c..d"]
+    );
+}
+
+#[turso_macros::test]
+fn explain_names_the_column_that_is_read_in_a_without_rowid_table(tmp_db: TempDatabase) {
+    let conn = tmp_db.connect_limbo();
+    conn.execute("CREATE TABLE w(a, b, c PRIMARY KEY) WITHOUT ROWID")
+        .unwrap();
+
+    assert_eq!(
+        column_read_comments(&conn, "EXPLAIN SELECT a FROM w"),
+        vec!["r[1]=w.a"]
+    );
+}
+
+fn column_read_comments(conn: &Arc<turso_core::Connection>, query: &str) -> Vec<String> {
+    let mut comments = Vec::new();
+    for row in limbo_exec_rows(conn, query) {
+        let [_, Text(opcode), .., Text(comment)] = row.as_slice() else {
+            panic!("unexpected EXPLAIN row: {row:?}");
+        };
+        if opcode == "Column" || opcode == "ColumnRange" {
+            comments.push(comment.clone());
+        }
+    }
+    comments
 }

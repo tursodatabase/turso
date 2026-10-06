@@ -3829,6 +3829,12 @@ impl BTreeTable {
         self.logical_to_physical_map[logical]
     }
 
+    pub fn physical_to_logical_column(&self, physical: usize) -> Option<usize> {
+        self.logical_to_physical_map
+            .iter()
+            .position(|&offset| offset == physical)
+    }
+
     pub fn build_logical_to_physical_map(
         columns: &[Column],
         primary_key_columns: &[(String, SortOrder)],
