@@ -3,19 +3,14 @@ use crate::function::{ExtFunc, ExternalFunc};
 use crate::native_ext::{AggregateFunction, ExtensionState, ScalarFunction};
 use crate::sync::Arc;
 use crate::types::{AggContext, ExternalAggState, IOResultOr};
-use crate::{IOResult, LimboError, OpenOptions, Register, Result, Value};
+use crate::{IOResult, OpenOptions, Register, Result, Value};
 use turso_ext::ValueDestructor;
 
 impl OpenOptions {
-    pub fn extension_function(mut self, mut function: ExternalFunc) -> Result<Self> {
-        if function.func.arg_count() < -1 {
-            return Err(LimboError::InvalidArgument(
-                "function argument count must be at least -1".into(),
-            ));
-        }
+    pub fn extension_function(mut self, mut function: ExternalFunc) -> Self {
         function.name = crate::util::normalize_ident(&function.name);
         self.native_extensions.functions.push(Arc::new(function));
-        Ok(self)
+        self
     }
 }
 
@@ -25,29 +20,31 @@ impl ExternalFunc {
         argc: i32,
         deterministic: bool,
         function: F,
-    ) -> Self {
-        Self {
+    ) -> Result<Self> {
+        Self::validate_arg_count(argc)?;
+        Ok(Self {
             name,
             func: ExtFunc::NativeScalar {
                 argc,
                 deterministic,
                 function: Arc::new(function),
             },
-        }
+        })
     }
 
     pub fn new_native_aggregate<F: AggregateFunction + 'static>(
         name: String,
         argc: i32,
         function: F,
-    ) -> Self {
-        Self {
+    ) -> Result<Self> {
+        Self::validate_arg_count(argc)?;
+        Ok(Self {
             name,
             func: ExtFunc::NativeAggregate {
                 argc,
                 function: Arc::new(function),
             },
-        }
+        })
     }
 }
 
