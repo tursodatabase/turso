@@ -960,8 +960,32 @@ mod tests {
             [Type::TIME, Type::INT8]
         );
         assert_eq!(
-            result_types(&conn, "SELECT n * 2, -n, n + b, max(ts) FROM ev"),
-            [Type::FLOAT8, Type::FLOAT8, Type::FLOAT8, Type::TEXT]
+            result_types(
+                &conn,
+                "SELECT n * 2, -n, n + b, max(ts), min(d), max(n) FROM ev"
+            ),
+            [
+                Type::NUMERIC,
+                Type::FLOAT8,
+                Type::NUMERIC,
+                Type::TIMESTAMP,
+                Type::DATE,
+                Type::NUMERIC
+            ]
+        );
+        assert_eq!(
+            result_types(
+                &conn,
+                "SELECT '2024-01-01'::timestamp, '2024-01-01'::date, '10:00'::time, \
+                 '2024-01-01'::timestamptz, ts::date FROM ev"
+            ),
+            [
+                Type::TIMESTAMP,
+                Type::DATE,
+                Type::TIME,
+                Type::TIMESTAMPTZ,
+                Type::DATE
+            ]
         );
     }
 

@@ -324,6 +324,9 @@ fn expression_type_info(
         ..
     } = expr
     else {
+        if let Some(info) = pg_storage_expression_type_info(expr, table_references, schema) {
+            return Some(info);
+        }
         let name = infer_expression_primitive(expr, Some(table_references))?;
         return Some(ColumnTypeInfo {
             declared_name: name.to_string(),
@@ -379,6 +382,56 @@ fn expression_type_info(
         base_type,
         kind,
         is_builtin_type,
+    })
+}
+
+/// The type of an expression that gives a value of a built-in type of the
+/// PostgreSQL frontend: MIN and MAX of such a value, a cast to such a type,
+/// and decimal arithmetic.
+fn pg_storage_expression_type_info(
+    expr: &turso_parser::ast::Expr,
+    table_references: &translate::plan::TableReferences,
+    schema: &crate::schema::Schema,
+) -> Option<ColumnTypeInfo> {
+    use turso_parser::ast::{Expr, Operator};
+    let type_name = match expr {
+        Expr::FunctionCall { name, args, .. }
+            if args.len() == 1
+                && (name.as_str().eq_ignore_ascii_case("min")
+                    || name.as_str().eq_ignore_ascii_case("max")) =>
+        {
+            return expression_type_info(&args[0], table_references, schema)
+                .filter(|info| info.is_builtin_type);
+        }
+        Expr::FunctionCall { name, args, .. } if args.len() == 1 => name.as_str(),
+        Expr::Cast {
+            type_name: Some(type_name),
+            ..
+        } => type_name.name.as_str(),
+        Expr::Binary(
+            lhs,
+            Operator::Add | Operator::Subtract | Operator::Multiply | Operator::Divide,
+            rhs,
+        ) if [lhs, rhs].iter().any(|operand| {
+            expression_type_info(operand, table_references, schema).is_some_and(|info| {
+                info.is_builtin_type && info.declared_name.eq_ignore_ascii_case("pg_numeric")
+            })
+        }) =>
+        {
+            "pg_numeric"
+        }
+        _ => return None,
+    };
+    let type_def = schema.get_type_def_unchecked(type_name)?;
+    if !type_def.is_pg_storage_type() {
+        return None;
+    }
+    Some(ColumnTypeInfo {
+        declared_name: type_def.name.clone(),
+        array_dimensions: 0,
+        base_type: Some(type_def.base().to_uppercase()),
+        kind: ColumnTypeKind::Custom,
+        is_builtin_type: true,
     })
 }
 

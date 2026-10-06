@@ -164,8 +164,20 @@ impl ResultSetColumn {
     }
 
     /// Returns the canonical short type name for this column's affinity,
-    /// matching SQLite's `azType[]` in `createTableStmt()` (build.c).
+    /// matching SQLite's `azType[]` in `createTableStmt()` (build.c). A
+    /// column of a built-in type of the PostgreSQL frontend that stores an
+    /// integer for a date, a time or a decimal shows text: TEXT keeps it.
     pub fn declared_type(&self, tables: &TableReferences) -> &'static str {
+        if let ast::Expr::Column { table, column, .. } = &self.expr {
+            let shows_text = tables
+                .find_table_by_internal_id(*table)
+                .filter(|(_, table)| table.is_strict())
+                .and_then(|(_, table)| table.get_column_at(*column))
+                .is_some_and(|column| crate::schema::pg_storage_type_shows_text(&column.ty_str));
+            if shows_text {
+                return "TEXT";
+            }
+        }
         get_expr_affinity(&self.expr, Some(tables), None).short_type_name()
     }
 }

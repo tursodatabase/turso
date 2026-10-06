@@ -1030,3 +1030,16 @@ test foreign-key-between-the-same-stored-forms-refuses-a-missing-parent {
 expect error {
     FOREIGN KEY constraint failed
 }
+
+@requires strict "uses STRICT tables"
+test create-table-as-select-keeps-the-text-of-pg-columns {
+    CREATE TABLE src(id pg_int4 PRIMARY KEY, ts pg_timestamp, n pg_numeric(10,2), i pg_int8) STRICT, PGSTORAGE;
+    INSERT INTO src VALUES (1, '2024-01-01 10:00', 12.5, 7);
+    CREATE TABLE copy AS SELECT ts, n, i FROM src;
+    SELECT ts, n, i, typeof(ts), typeof(n), typeof(i) FROM copy;
+    SELECT sql FROM sqlite_schema WHERE name = 'copy';
+}
+expect {
+    2024-01-01 10:00:00|12.50|7|text|text|integer
+    CREATE TABLE copy(ts TEXT,n TEXT,i INT)
+}
