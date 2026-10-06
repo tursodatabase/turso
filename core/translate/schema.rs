@@ -431,12 +431,25 @@ fn resolve_scalar_func_return_type(
         | ScalarFunc::TestUintEq
         | ScalarFunc::NumericLt
         | ScalarFunc::NumericEq
+        | ScalarFunc::PgTimestampEncode
+        | ScalarFunc::PgTimestamptzEncode
+        | ScalarFunc::PgDateEncode
+        | ScalarFunc::PgTimeEncode
+        | ScalarFunc::PgNumericEncode
         | ScalarFunc::ValidateIpAddr
         | ScalarFunc::GetByte
         | ScalarFunc::UnixEpoch => Ok(CheckExprType::Integer),
 
         // Functions that always return TEXT
-        ScalarFunc::Upper
+        ScalarFunc::PgTimestampDecode
+        | ScalarFunc::PgDateDecode
+        | ScalarFunc::PgTimeDecode
+        | ScalarFunc::PgTimestamp
+        | ScalarFunc::PgTimestamptz
+        | ScalarFunc::PgDate
+        | ScalarFunc::PgTime
+        | ScalarFunc::PgNumericDecode
+        | ScalarFunc::Upper
         | ScalarFunc::Lower
         | ScalarFunc::Trim
         | ScalarFunc::LTrim

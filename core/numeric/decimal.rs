@@ -2,6 +2,8 @@ use bigdecimal::BigDecimal;
 use num_bigint::{BigInt, Sign};
 
 use crate::alloc::TursoVecExt;
+use crate::numeric::Numeric;
+use crate::types::Value;
 use crate::{LimboError, ValueBlob};
 
 const NUMERIC_BLOB_VERSION: u8 = 0x01;
@@ -128,6 +130,22 @@ pub fn blob_to_bigdecimal(blob: &[u8]) -> crate::Result<BigDecimal> {
     let sign = if limbs.is_empty() { Sign::NoSign } else { sign };
     let bigint = BigInt::new(sign, limbs);
     Ok(BigDecimal::new(bigint, scale))
+}
+
+/// Parse a Value (text, int, float, or blob) into a BigDecimal.
+pub(crate) fn value_to_bigdecimal(val: &Value) -> crate::Result<BigDecimal> {
+    use std::str::FromStr;
+    match val {
+        Value::Numeric(Numeric::Integer(i)) => Ok(BigDecimal::from(*i)),
+        Value::Numeric(Numeric::Float(f)) => BigDecimal::from_str(&f.to_string())
+            .map_err(|_| LimboError::Constraint(format!("invalid numeric value: {f}"))),
+        Value::Text(t) => BigDecimal::from_str(&t.value)
+            .map_err(|_| LimboError::Constraint(format!("invalid numeric value: \"{}\"", t.value))),
+        Value::Blob(b) => blob_to_bigdecimal(b),
+        _ => Err(LimboError::Constraint(format!(
+            "cannot convert to numeric: \"{val}\""
+        ))),
+    }
 }
 
 /// Format a BigDecimal as a string, preserving trailing zeros for the scale.

@@ -273,23 +273,6 @@ impl<T> OrOverflow<T> for Option<T> {
     }
 }
 
-/// Parse a Value (text, int, float, or blob) into a BigDecimal.
-fn value_to_bigdecimal(val: &Value) -> Result<bigdecimal::BigDecimal> {
-    use bigdecimal::BigDecimal;
-    use std::str::FromStr;
-    match val {
-        Value::Numeric(Numeric::Integer(i)) => Ok(BigDecimal::from(*i)),
-        Value::Numeric(Numeric::Float(f)) => BigDecimal::from_str(&f.to_string())
-            .map_err(|_| LimboError::Constraint(format!("invalid numeric value: {f}"))),
-        Value::Text(t) => BigDecimal::from_str(&t.value)
-            .map_err(|_| LimboError::Constraint(format!("invalid numeric value: \"{}\"", t.value))),
-        Value::Blob(b) => crate::numeric::decimal::blob_to_bigdecimal(b),
-        _ => Err(LimboError::Constraint(format!(
-            "cannot convert to numeric: \"{val}\""
-        ))),
-    }
-}
-
 /// Create a sort comparator closure from a SortComparatorType enum.
 fn make_sort_comparator(
     cmp_type: &SortComparatorType,
@@ -306,7 +289,10 @@ fn make_sort_comparator(
                         // Decode from ValueRef to Value for value_to_bigdecimal
                         let a_val = a.to_owned()?;
                         let b_val = b.to_owned()?;
-                        match (value_to_bigdecimal(&a_val), value_to_bigdecimal(&b_val)) {
+                        match (
+                            crate::numeric::decimal::value_to_bigdecimal(&a_val),
+                            crate::numeric::decimal::value_to_bigdecimal(&b_val),
+                        ) {
                             (Ok(a_dec), Ok(b_dec)) => a_dec.cmp(&b_dec),
                             _ => a.partial_cmp(b).unwrap_or(Ordering::Equal),
                         }
@@ -11244,8 +11230,8 @@ pub fn op_function(
                 let result = match (&lhs_val, &rhs_val) {
                     (Value::Null, _) | (_, Value::Null) => Value::Null,
                     _ => {
-                        let a = value_to_bigdecimal(&lhs_val)?;
-                        let b = value_to_bigdecimal(&rhs_val)?;
+                        let a = crate::numeric::decimal::value_to_bigdecimal(&lhs_val)?;
+                        let b = crate::numeric::decimal::value_to_bigdecimal(&rhs_val)?;
                         let res = match scalar_func {
                             ScalarFunc::NumericAdd => a + b,
                             ScalarFunc::NumericSub => a - b,
@@ -11274,8 +11260,8 @@ pub fn op_function(
                 match (&lhs_val, &rhs_val) {
                     (Value::Null, _) | (_, Value::Null) => state.registers[*dest].set_null(),
                     _ => {
-                        let a = value_to_bigdecimal(&lhs_val)?;
-                        let b = value_to_bigdecimal(&rhs_val)?;
+                        let a = crate::numeric::decimal::value_to_bigdecimal(&lhs_val)?;
+                        let b = crate::numeric::decimal::value_to_bigdecimal(&rhs_val)?;
                         let cmp_result = match scalar_func {
                             ScalarFunc::NumericLt => a < b,
                             ScalarFunc::NumericEq => a == b,
@@ -11290,6 +11276,73 @@ pub fn op_function(
                 let key = crate::functions::seek_key::exec_uuid_seek_key(
                     state.registers[*start_reg].get_value(),
                     state.registers[*start_reg + 1].get_value(),
+                )?;
+                state.registers[*dest].set_value(key);
+            }
+            ScalarFunc::PgTimestampEncode
+            | ScalarFunc::PgTimestamptzEncode
+            | ScalarFunc::PgDateEncode
+            | ScalarFunc::PgTimeEncode => {
+                check_arg_count!(arg_count, 1);
+                let stored = crate::functions::pg_types::exec_pg_temporal_encode(
+                    pg_temporal_kind(scalar_func),
+                    state.registers[*start_reg].get_value(),
+                )?;
+                state.registers[*dest].set_value(stored);
+            }
+            ScalarFunc::PgTimestampDecode | ScalarFunc::PgDateDecode | ScalarFunc::PgTimeDecode => {
+                check_arg_count!(arg_count, 1);
+                let decoded = crate::functions::pg_types::exec_pg_temporal_decode(
+                    pg_temporal_kind(scalar_func),
+                    state.registers[*start_reg].get_value(),
+                )?;
+                state.registers[*dest].set_value(decoded);
+            }
+            ScalarFunc::PgTimestamp
+            | ScalarFunc::PgTimestamptz
+            | ScalarFunc::PgDate
+            | ScalarFunc::PgTime => {
+                check_arg_count!(arg_count, 1);
+                let value = crate::functions::pg_types::exec_pg_temporal_cast(
+                    pg_temporal_kind(scalar_func),
+                    state.registers[*start_reg].get_value(),
+                )?;
+                state.registers[*dest].set_value(value);
+            }
+            ScalarFunc::PgNumericEncode => {
+                check_arg_count!(arg_count, 3);
+                let stored = crate::functions::pg_types::exec_pg_numeric_encode(
+                    state.registers[*start_reg].get_value(),
+                    state.registers[*start_reg + 1].get_value(),
+                    state.registers[*start_reg + 2].get_value(),
+                )?;
+                state.registers[*dest].set_value(stored);
+            }
+            ScalarFunc::PgNumericDecode => {
+                check_arg_count!(arg_count, 2);
+                let decoded = crate::functions::pg_types::exec_pg_numeric_decode(
+                    state.registers[*start_reg].get_value(),
+                    state.registers[*start_reg + 1].get_value(),
+                )?;
+                state.registers[*dest].set_value(decoded);
+            }
+            ScalarFunc::PgTimestampSeekKey
+            | ScalarFunc::PgDateSeekKey
+            | ScalarFunc::PgTimeSeekKey => {
+                check_arg_count!(arg_count, 2);
+                let key = crate::functions::seek_key::exec_pg_temporal_seek_key(
+                    pg_temporal_kind(scalar_func),
+                    state.registers[*start_reg].get_value(),
+                    state.registers[*start_reg + 1].get_value(),
+                )?;
+                state.registers[*dest].set_value(key);
+            }
+            ScalarFunc::PgNumericSeekKey => {
+                check_arg_count!(arg_count, 3);
+                let key = crate::functions::seek_key::exec_pg_numeric_seek_key(
+                    state.registers[*start_reg].get_value(),
+                    state.registers[*start_reg + 1].get_value(),
+                    state.registers[*start_reg + 2].get_value(),
                 )?;
                 state.registers[*dest].set_value(key);
             }
@@ -12254,6 +12307,26 @@ pub fn op_function(
     }
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
+}
+
+fn pg_temporal_kind(func: &ScalarFunc) -> crate::functions::pg_types::PgTemporal {
+    use crate::functions::pg_types::PgTemporal;
+    match func {
+        ScalarFunc::PgTimestampEncode
+        | ScalarFunc::PgTimestampDecode
+        | ScalarFunc::PgTimestamp
+        | ScalarFunc::PgTimestampSeekKey => PgTemporal::Timestamp,
+        ScalarFunc::PgTimestamptzEncode | ScalarFunc::PgTimestamptz => PgTemporal::Timestamptz,
+        ScalarFunc::PgDateEncode
+        | ScalarFunc::PgDateDecode
+        | ScalarFunc::PgDate
+        | ScalarFunc::PgDateSeekKey => PgTemporal::Date,
+        ScalarFunc::PgTimeEncode
+        | ScalarFunc::PgTimeDecode
+        | ScalarFunc::PgTime
+        | ScalarFunc::PgTimeSeekKey => PgTemporal::Time,
+        other => unreachable!("{other} is not a function of a PostgreSQL date or time type"),
+    }
 }
 
 pub(crate) type OpAttachState = crate::connection::AttachDatabaseState;

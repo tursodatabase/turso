@@ -906,6 +906,23 @@ pub enum ScalarFunc {
     NumericLt,
     NumericEq,
     UuidSeekKey,
+    PgTimestampEncode,
+    PgTimestamptzEncode,
+    PgDateEncode,
+    PgTimeEncode,
+    PgTimestampDecode,
+    PgDateDecode,
+    PgTimeDecode,
+    PgTimestamp,
+    PgTimestamptz,
+    PgDate,
+    PgTime,
+    PgNumericEncode,
+    PgNumericDecode,
+    PgTimestampSeekKey,
+    PgDateSeekKey,
+    PgTimeSeekKey,
+    PgNumericSeekKey,
     // Array construction / element access (desugared from ARRAY[…] and expr[n] syntax)
     Array,
     ArrayElement,
@@ -1035,7 +1052,24 @@ impl Deterministic for ScalarFunc {
             | ScalarFunc::NumericDiv
             | ScalarFunc::NumericLt
             | ScalarFunc::NumericEq
-            | ScalarFunc::UuidSeekKey => true,
+            | ScalarFunc::UuidSeekKey
+            | ScalarFunc::PgTimestampDecode
+            | ScalarFunc::PgDateDecode
+            | ScalarFunc::PgTimeDecode
+            | ScalarFunc::PgNumericEncode
+            | ScalarFunc::PgNumericDecode
+            | ScalarFunc::PgTimestampSeekKey
+            | ScalarFunc::PgDateSeekKey
+            | ScalarFunc::PgTimeSeekKey
+            | ScalarFunc::PgNumericSeekKey
+            | ScalarFunc::PgTimestampEncode
+            | ScalarFunc::PgTimestamptzEncode
+            | ScalarFunc::PgDateEncode
+            | ScalarFunc::PgTimeEncode
+            | ScalarFunc::PgTimestamp
+            | ScalarFunc::PgTimestamptz
+            | ScalarFunc::PgDate
+            | ScalarFunc::PgTime => true,
             ScalarFunc::Array
             | ScalarFunc::ArrayElement
             | ScalarFunc::ArraySetElement
@@ -1185,6 +1219,23 @@ impl Display for ScalarFunc {
             Self::NumericLt => "numeric_lt",
             Self::NumericEq => "numeric_eq",
             Self::UuidSeekKey => "uuid_seek_key",
+            Self::PgTimestampEncode => "pg_timestamp_encode",
+            Self::PgTimestamptzEncode => "pg_timestamptz_encode",
+            Self::PgDateEncode => "pg_date_encode",
+            Self::PgTimeEncode => "pg_time_encode",
+            Self::PgTimestampDecode => "pg_timestamp_decode",
+            Self::PgDateDecode => "pg_date_decode",
+            Self::PgTimeDecode => "pg_time_decode",
+            Self::PgTimestamp => "pg_timestamp",
+            Self::PgTimestamptz => "pg_timestamptz",
+            Self::PgDate => "pg_date",
+            Self::PgTime => "pg_time",
+            Self::PgNumericEncode => "pg_numeric_encode",
+            Self::PgNumericDecode => "pg_numeric_decode",
+            Self::PgTimestampSeekKey => "pg_timestamp_seek_key",
+            Self::PgDateSeekKey => "pg_date_seek_key",
+            Self::PgTimeSeekKey => "pg_time_seek_key",
+            Self::PgNumericSeekKey => "pg_numeric_seek_key",
             Self::Array => "array",
             Self::ArrayElement => "array_element",
             Self::ArraySetElement => "array_set_element",
@@ -1232,6 +1283,10 @@ impl ScalarFunc {
                 | Self::ConnTxnId
                 | Self::IsAutocommit
                 | Self::UuidSeekKey
+                | Self::PgTimestampSeekKey
+                | Self::PgDateSeekKey
+                | Self::PgTimeSeekKey
+                | Self::PgNumericSeekKey
         )
     }
 
@@ -1310,7 +1365,11 @@ impl ScalarFunc {
             | Self::BinRecordJsonObject
             | Self::ConnTxnId
             | Self::IsAutocommit
-            | Self::UuidSeekKey => &[0],
+            | Self::UuidSeekKey
+            | Self::PgTimestampSeekKey
+            | Self::PgDateSeekKey
+            | Self::PgTimeSeekKey
+            | Self::PgNumericSeekKey => &[0],
             // Scalar max/min (multi-arg)
             Self::Max | Self::Min => &[-1],
             // SQL-standard string and math extensions
@@ -1336,6 +1395,19 @@ impl ScalarFunc {
             | Self::NumericLt
             | Self::NumericEq => &[2],
             Self::NumericEncode => &[3],
+            Self::PgTimestampEncode
+            | Self::PgTimestamptzEncode
+            | Self::PgDateEncode
+            | Self::PgTimeEncode
+            | Self::PgTimestampDecode
+            | Self::PgDateDecode
+            | Self::PgTimeDecode
+            | Self::PgTimestamp
+            | Self::PgTimestamptz
+            | Self::PgDate
+            | Self::PgTime => &[1],
+            Self::PgNumericDecode => &[2],
+            Self::PgNumericEncode => &[3],
             // Array construction / element access
             Self::Array => &[-1], // variable arity
             Self::ArrayElement => &[2],

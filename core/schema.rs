@@ -4516,7 +4516,33 @@ pub(crate) fn is_deterministic_schema_function_call(func: &Func, args: &[Box<Exp
             | ScalarFunc::StrfTime
             | ScalarFunc::TimeDiff,
         ) => is_deterministic_datetime_call(func, args),
+        Func::Scalar(
+            ScalarFunc::PgTimestampEncode
+            | ScalarFunc::PgTimestamptzEncode
+            | ScalarFunc::PgDateEncode
+            | ScalarFunc::PgTimeEncode
+            | ScalarFunc::PgTimestamp
+            | ScalarFunc::PgTimestamptz
+            | ScalarFunc::PgDate
+            | ScalarFunc::PgTime,
+        ) => !args.iter().any(|arg| is_pg_clock_word(arg.as_ref())),
         _ => func.is_deterministic(),
+    }
+}
+
+pub(crate) fn is_pg_clock_word(expr: &Expr) -> bool {
+    match expr {
+        Expr::Parenthesized(exprs) if exprs.len() == 1 => is_pg_clock_word(&exprs[0]),
+        Expr::Literal(ast::Literal::String(value)) => {
+            let word = value.trim_matches('\'').trim();
+            ["now", "today", "tomorrow", "yesterday"]
+                .iter()
+                .any(|clock_word| word.eq_ignore_ascii_case(clock_word))
+        }
+        Expr::Literal(
+            ast::Literal::CurrentDate | ast::Literal::CurrentTime | ast::Literal::CurrentTimestamp,
+        ) => true,
+        _ => false,
     }
 }
 
@@ -6346,9 +6372,13 @@ impl Index {
             })
         };
         let is_tbl = |ns: &str| normalize_ident(ns) == tbl_norm;
-        let is_deterministic_fn = |name: &str, argc: usize| {
+        let is_deterministic_fn = |name: &str, args: &[Box<Expr>]| {
             let n = normalize_ident(name);
-            Func::resolve_function(&n, argc).is_ok_and(|f| f.is_some_and(|f| f.is_deterministic()))
+            Func::resolve_function(&n, args.len()).is_ok_and(|f| {
+                f.is_some_and(|f| {
+                    f.is_deterministic() && is_deterministic_schema_function_call(&f, args)
+                })
+            })
         };
 
         let mut ok = true;
@@ -6383,15 +6413,15 @@ impl Index {
                     if filter_over.over_clause.is_some() {
                         ok = false;
                     } else {
-                        let argc = match e {
-                            Expr::FunctionCall { args, .. } => args.len(),
-                            Expr::FunctionCallStar { .. } => 0,
+                        let args = match e {
+                            Expr::FunctionCall { args, .. } => args.as_slice(),
+                            Expr::FunctionCallStar { .. } => &[],
                             _ => unreachable!(),
                         };
                         // Reject non-deterministic functions. Function arguments can reference
                         // columns of the indexed table (e.g., LENGTH(t0.c0)), which will be
                         // validated by the Expr::Id and Expr::Qualified cases during the walk.
-                        if !is_deterministic_fn(name.as_str(), argc) {
+                        if !is_deterministic_fn(name.as_str(), args) {
                             ok = false;
                         }
                     }

@@ -1901,7 +1901,11 @@ fn translate_function_call_expr(
                 ScalarFunc::ConnTxnId | ScalarFunc::IsAutocommit => {
                     crate::bail_parse_error!("{} is an internal function used by CDC", srf);
                 }
-                ScalarFunc::UuidSeekKey => {
+                ScalarFunc::UuidSeekKey
+                | ScalarFunc::PgTimestampSeekKey
+                | ScalarFunc::PgDateSeekKey
+                | ScalarFunc::PgTimeSeekKey
+                | ScalarFunc::PgNumericSeekKey => {
                     unreachable!("no function name resolves to {srf}")
                 }
                 ScalarFunc::TestUintEncode
@@ -1928,7 +1932,20 @@ fn translate_function_call_expr(
                 | ScalarFunc::NumericMul
                 | ScalarFunc::NumericDiv
                 | ScalarFunc::NumericLt
-                | ScalarFunc::NumericEq => translate_function(
+                | ScalarFunc::NumericEq
+                | ScalarFunc::PgTimestampEncode
+                | ScalarFunc::PgTimestamptzEncode
+                | ScalarFunc::PgDateEncode
+                | ScalarFunc::PgTimeEncode
+                | ScalarFunc::PgTimestampDecode
+                | ScalarFunc::PgDateDecode
+                | ScalarFunc::PgTimeDecode
+                | ScalarFunc::PgTimestamp
+                | ScalarFunc::PgTimestamptz
+                | ScalarFunc::PgDate
+                | ScalarFunc::PgTime
+                | ScalarFunc::PgNumericEncode
+                | ScalarFunc::PgNumericDecode => translate_function(
                     program,
                     args,
                     referenced_tables,
