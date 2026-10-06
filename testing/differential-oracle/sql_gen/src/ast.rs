@@ -2934,6 +2934,7 @@ mod tests {
             indexes: vec![],
             triggers: vec![],
             attached_databases: vec![],
+            has_sequence_table: false,
         };
 
         // ORDER BY non-unique column with LIMIT → should be detected
@@ -2982,6 +2983,7 @@ mod tests {
             indexes: vec![],
             triggers: vec![],
             attached_databases: vec![],
+            has_sequence_table: false,
         };
 
         // ORDER BY primary key with LIMIT → deterministic, no detection
@@ -3051,6 +3053,7 @@ mod tests {
             indexes: vec![],
             triggers: vec![],
             attached_databases: vec![],
+            has_sequence_table: false,
         };
 
         // Nested scalar subquery with non-unique ORDER BY + LIMIT
