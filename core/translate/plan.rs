@@ -1696,12 +1696,17 @@ impl TableReferences {
             return;
         };
         let normalized = normalize_expr_for_index_matching(expr, table_ref, self);
+        let may_be_null_row = self.outer_join_may_null_extend(table_id);
         if let Some(table_ref_mut) = self
             .joined_tables_mut()
             .iter_mut()
             .find(|t| t.internal_id == table_id)
         {
-            table_ref_mut.register_expression_index_usage(normalized, columns_mask);
+            table_ref_mut.register_expression_index_usage(
+                normalized,
+                columns_mask,
+                may_be_null_row,
+            );
         }
     }
 
@@ -2419,6 +2424,9 @@ pub struct ExpressionIndexUsage {
     /// Columns required to compute the expression. Helps decide whether using
     /// the expression value from the index fully covers those column reads.
     pub columns_mask: ColumnUsedMask,
+    /// An outer join can set this table to a null row. That row computes the
+    /// expression from the table columns, so the index key does not cover them.
+    pub may_be_null_row: bool,
 }
 
 /// Represents one key pair in a hash join equality condition.
@@ -2956,6 +2964,7 @@ impl JoinedTable {
         &mut self,
         normalized_expr: ast::Expr,
         columns_mask: ColumnUsedMask,
+        may_be_null_row: bool,
     ) {
         if columns_mask.is_empty() {
             return;
@@ -2970,6 +2979,7 @@ impl JoinedTable {
         self.expression_index_usages.push(ExpressionIndexUsage {
             normalized_expr: Box::new(normalized_expr),
             columns_mask,
+            may_be_null_row,
         });
     }
 
@@ -2996,11 +3006,11 @@ impl JoinedTable {
                 false
             };
 
-            if index
-                .expression_to_index_pos(&usage.normalized_expr)
-                .is_some()
-                || matches_where_clause
-            {
+            let index_key_covers_columns = !usage.may_be_null_row
+                && index
+                    .expression_to_index_pos(&usage.normalized_expr)
+                    .is_some();
+            if index_key_covers_columns || matches_where_clause {
                 any_covered = true;
                 for col_idx in usage.columns_mask.iter() {
                     if col_idx >= coverage_counts.len() {
