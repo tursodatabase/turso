@@ -7734,6 +7734,38 @@ fn test_drop_unused_row_versions_prunes_unreferenced_finalized_tx_states() {
     );
 }
 
+#[test]
+fn test_gc_keeps_finalized_tx_state_of_tx_still_in_txs() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let conn = db.connect();
+    let mvcc_store = db.get_mvcc_store();
+    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v INTEGER)")
+        .unwrap();
+
+    conn.execute("BEGIN CONCURRENT").unwrap();
+    conn.execute("INSERT INTO t VALUES (1, 1)").unwrap();
+    let tx_id = conn.get_mv_tx_id().unwrap();
+    conn.set_yield_injector(Some(FixedYieldInjector::new([
+        CommitYieldPoint::BeforeFinishCommittedTx.point(),
+    ])));
+    let mut commit = conn.prepare("COMMIT").unwrap();
+    assert!(matches!(commit.step().unwrap(), StepResult::Yield));
+
+    let commit_ts = match mvcc_store.txs.get(&tx_id).unwrap().value().state.load() {
+        TransactionState::Committed(ts) => ts,
+        other => panic!("writer should be committed, got {other:?}"),
+    };
+    mvcc_store
+        .insert_finalized_tx_state(tx_id, commit_ts)
+        .unwrap();
+    mvcc_store.drop_unused_row_versions();
+
+    assert!(
+        lookup_finalized_tx_state(&mvcc_store.finalized_tx_states, tx_id).is_some(),
+        "GC removed the finalized state of a writer that is still in txs"
+    );
+}
+
 /// Test Hekaton register-and-report: speculative read increments CommitDepCounter
 /// and adds to CommitDepSet.
 #[test]
