@@ -87,6 +87,7 @@ impl Context {
             Origin::LeftJoin => "left_join",
             Origin::CrossJoin => "cross_join",
             Origin::NaturalJoin => "natural_join",
+            Origin::ParenthesizedJoin => "parenthesized_join",
             Origin::CompoundUnion => "compound_union",
             Origin::CompoundUnionAll => "compound_union_all",
             Origin::CompoundIntersect => "compound_intersect",

@@ -3,11 +3,12 @@ use crate::{turso_assert, turso_assert_greater_than_or_equal};
 
 use super::plan::NamedWindowBound;
 use super::{
-    expr::{walk_expr, walk_expr_mut},
+    expr::{find_unqualified_column, walk_expr, walk_expr_mut},
     plan::{
-        Aggregate, ColumnMask, ColumnUsedMask, Distinctness, EvalAt, IterationDirection, JoinInfo,
-        JoinOrderMember, JoinType as PlanJoinType, JoinedTable, Operation, OuterQueryReference,
-        Plan, QueryDestination, ResultSetColumn, Scan, TableReferences, WhereTerm,
+        query_output_columns, Aggregate, ColumnMask, ColumnUsedMask, Distinctness, EvalAt,
+        IterationDirection, JoinInfo, JoinOrderMember, JoinType as PlanJoinType, JoinedTable,
+        Operation, OuterQueryReference, Plan, QueryDestination, ResultSetColumn, Scan,
+        TableReferences, WhereTerm,
     },
     select::{prepare_select_plan, prepare_select_plan_from_arms},
 };
@@ -23,7 +24,10 @@ use crate::translate::{
 use crate::{
     ast::Limit,
     function::Func,
-    schema::Table,
+    schema::{
+        ParenthesizedJoinColumn, ParenthesizedJoinColumnSource, ParenthesizedJoinColumnVisibility,
+        Table,
+    },
     util::{exprs_are_equivalent, normalize_ident},
     Result,
 };
@@ -1678,10 +1682,302 @@ fn parse_from_clause_table(
             None, // table-valued functions don't support INDEXED BY
             connection,
         ),
-        ast::SelectTable::Sub(..) => {
-            crate::bail_parse_error!("Parenthesized FROM clause subqueries are not supported")
+        ast::SelectTable::Sub(from_clause, maybe_alias) if from_clause.joins.is_empty() => {
+            // SQLite unwraps a one-source group. An outer alias replaces the
+            // alias inside the parentheses, including when the outer alias is absent.
+            let table = replace_select_table_alias(*from_clause.select, maybe_alias);
+            parse_from_clause_table(
+                table,
+                resolver,
+                program,
+                table_references,
+                vtab_predicates,
+                cte_definitions,
+                connection,
+            )
+        }
+        ast::SelectTable::Sub(from_clause, maybe_alias) => {
+            // SQLite represents a parenthesized join group as a SELECT * subquery.
+            // It names an unaliased group "(join-N)" in query plans.
+            let alias = maybe_alias.unwrap_or_else(|| {
+                ast::As::As(ast::Name::exact(format!(
+                    "(join-{})",
+                    table_references.joined_tables().len()
+                )))
+            });
+            let join_select = ast::Select {
+                with: None,
+                body: ast::SelectBody {
+                    select: ast::OneSelect::Select {
+                        distinctness: None,
+                        columns: vec![ast::ResultColumn::Star],
+                        from: Some(from_clause),
+                        where_clause: None,
+                        group_by: None,
+                        window_clause: Vec::new(),
+                    },
+                    compounds: Vec::new(),
+                },
+                order_by: Vec::new(),
+                limit: None,
+            };
+            parse_from_clause_table(
+                ast::SelectTable::Select(join_select, Some(alias)),
+                resolver,
+                program,
+                table_references,
+                vtab_predicates,
+                cte_definitions,
+                connection,
+            )?;
+            let table = table_references
+                .joined_tables_mut()
+                .last_mut()
+                .expect("the nested SELECT added one table");
+            keep_parenthesized_join_columns(table)
         }
     }
+}
+
+/// Keep the source columns that SQLite stores for a parenthesized join.
+///
+/// A normal `SELECT *` removes duplicate `USING` columns and all rowids.
+/// SQLite keeps those values because an outer query can use qualified names.
+fn keep_parenthesized_join_columns(table: &mut JoinedTable) -> Result<()> {
+    let Table::FromClauseSubquery(subquery) = &mut table.table else {
+        unreachable!("a parenthesized join must produce a subquery table");
+    };
+    let subquery = Arc::make_mut(subquery);
+    let Plan::Select(plan) = subquery.plan.as_mut() else {
+        unreachable!("a parenthesized join must produce one SELECT plan");
+    };
+
+    let source_tables = plan.table_references.joined_tables();
+    let mut result_columns = Vec::new();
+    let mut join_columns = crate::alloc::vec![];
+    let mut used_columns = Vec::new();
+
+    let right_join_swapped = plan.table_references.right_join_swapped();
+    let source_order: Vec<_> = if right_join_swapped {
+        source_tables.iter().enumerate().rev().collect()
+    } else {
+        source_tables.iter().enumerate().collect()
+    };
+    for (table_index, source_table) in source_order {
+        let next_using = if right_join_swapped {
+            (table_index == 1).then_some(source_table)
+        } else {
+            source_tables.get(table_index + 1)
+        }
+        .and_then(|next| next.join_info.as_ref())
+        .map(|join| join.using.as_slice())
+        .unwrap_or_default();
+
+        // SQLite stores one canonical value before the source columns on both
+        // sides of `USING`. Outer unqualified names find this value first.
+        for using_name in next_using {
+            let column_name = using_name.as_str();
+            let (expr, source_columns) =
+                resolve_parenthesized_using_column(source_tables, table_index, column_name)?;
+            used_columns.extend(source_columns);
+            result_columns.push(parenthesized_join_result_column(expr, column_name));
+            join_columns.push(ParenthesizedJoinColumn {
+                source: ParenthesizedJoinColumnSource::Using {
+                    column_name: column_name.to_string(),
+                },
+                visibility: ParenthesizedJoinColumnVisibility::Visible,
+            });
+        }
+
+        let hidden_by_using = |column_name: &str| {
+            source_table
+                .join_info
+                .as_ref()
+                .is_some_and(|join| join.merges_column(column_name))
+                || (right_join_swapped
+                    && source_tables[1]
+                        .join_info
+                        .as_ref()
+                        .is_some_and(|join| join.merges_column(column_name)))
+                || next_using
+                    .iter()
+                    .any(|name| name.as_str().eq_ignore_ascii_case(column_name))
+        };
+
+        let database_id = matches!(source_table.table, Table::BTree(_) | Table::Virtual(_))
+            .then_some(source_table.database_id);
+        let source_join_columns = source_table.table.parenthesized_join_columns();
+        for (column_index, column) in source_table.columns().iter().enumerate() {
+            let Some(column_name) = column.name.as_deref() else {
+                continue;
+            };
+            let mut join_column = match source_join_columns {
+                // SQLite does not copy rowid entries through a second join group.
+                Some(saved) if saved[column_index].source.is_rowid() => continue,
+                Some(saved) => saved[column_index].clone(),
+                None if column.hidden() => continue,
+                None => ParenthesizedJoinColumn {
+                    source: ParenthesizedJoinColumnSource::Table {
+                        database_id,
+                        table_name: source_table.identifier.clone(),
+                        column_name: column_name.to_string(),
+                    },
+                    visibility: ParenthesizedJoinColumnVisibility::Visible,
+                },
+            };
+            if hidden_by_using(column_name) {
+                join_column.visibility = ParenthesizedJoinColumnVisibility::QualifiedOnly;
+            }
+            result_columns.push(parenthesized_join_result_column(
+                Expr::Column {
+                    database: None,
+                    table: source_table.internal_id,
+                    column: column_index,
+                    is_rowid_alias: column.is_rowid_alias(),
+                },
+                column_name,
+            ));
+            join_columns.push(join_column);
+            used_columns.push((source_table.internal_id, column_index));
+        }
+
+        let has_rowid = match &source_table.table {
+            Table::BTree(btree) => btree.has_rowid,
+            Table::Virtual(_) => true,
+            Table::FromClauseSubquery(_) | Table::RecursiveCteInput(_) => false,
+        };
+        if !has_rowid {
+            continue;
+        }
+        // SQLite uses the first rowid alias that is not a declared column.
+        if let Some(rowid_name) = ["_ROWID_", "ROWID", "OID"]
+            .into_iter()
+            .find(|name| source_table.table.get_column_by_name(name).is_none())
+        {
+            result_columns.push(parenthesized_join_result_column(
+                Expr::RowId {
+                    database: None,
+                    table: source_table.internal_id,
+                },
+                rowid_name,
+            ));
+            join_columns.push(ParenthesizedJoinColumn {
+                source: ParenthesizedJoinColumnSource::RowId {
+                    database_id,
+                    table_name: source_table.identifier.clone(),
+                },
+                visibility: ParenthesizedJoinColumnVisibility::Visible,
+            });
+        }
+    }
+
+    plan.result_columns = result_columns;
+    plan.using_results_are_explicit = true;
+    for (table_id, column_index) in used_columns {
+        plan.table_references
+            .mark_column_used(table_id, column_index);
+    }
+
+    subquery.columns = query_output_columns(&subquery.plan, None)?;
+    assert_eq!(subquery.columns.len(), join_columns.len());
+    for column_index in 0..subquery.columns.len() {
+        let original_name = subquery.columns[column_index]
+            .name
+            .clone()
+            .expect("each generated join column has an alias");
+        let mut column_name = original_name.clone();
+        let mut suffix = 0;
+        let base_name = original_name
+            .rsplit_once(':')
+            .filter(|(_, suffix)| suffix.chars().all(|ch| ch.is_ascii_digit()))
+            .map_or(original_name.as_str(), |(base, _)| base);
+        while let Some(previous_index) =
+            subquery.columns[..column_index].iter().position(|column| {
+                column
+                    .name
+                    .as_deref()
+                    .is_some_and(|name| name.eq_ignore_ascii_case(&column_name))
+            })
+        {
+            // SQLite omits every later collision from `*`. It also hides a
+            // repeated merged value from bare-name lookup. An unrelated source
+            // column stays visible to lookup and makes the bare name ambiguous.
+            if join_columns[previous_index].source.is_using() {
+                let join_column = &mut join_columns[column_index];
+                if join_column.source.is_using() {
+                    join_column.visibility = ParenthesizedJoinColumnVisibility::QualifiedOnly;
+                } else if join_column.visibility != ParenthesizedJoinColumnVisibility::QualifiedOnly
+                {
+                    join_column.visibility = ParenthesizedJoinColumnVisibility::HiddenFromStar;
+                }
+            }
+            suffix += 1;
+            column_name = format!("{base_name}:{suffix}");
+        }
+        subquery.columns[column_index].name = Some(column_name);
+    }
+    subquery.parenthesized_join_columns = Some(join_columns);
+    Ok(())
+}
+
+fn parenthesized_join_result_column(expr: Expr, column_name: &str) -> ResultSetColumn {
+    ResultSetColumn {
+        expr,
+        alias: Some(column_name.to_string()),
+        implicit_column_name: None,
+        contains_aggregates: false,
+    }
+}
+
+fn resolve_parenthesized_using_column(
+    tables: &[JoinedTable],
+    last_table_index: usize,
+    column_name: &str,
+) -> Result<(Expr, Vec<(TableInternalId, usize)>)> {
+    let mut expr = None;
+    let mut used_columns = Vec::new();
+    for (table_index, table) in tables.iter().enumerate() {
+        let join_info = table.join_info.as_ref();
+        let merges_column = join_info.is_some_and(|join| join.merges_column(column_name));
+        let is_full_outer = join_info.is_some_and(JoinInfo::is_full_outer);
+        if expr.is_some() && merges_column && !is_full_outer {
+            continue;
+        }
+        let Some(column_index) = find_unqualified_column(&table.table, column_name)? else {
+            continue;
+        };
+        if expr.is_some() && !merges_column {
+            crate::bail_parse_error!("ambiguous column name: {}", column_name);
+        }
+        if table_index > last_table_index + 1 {
+            continue;
+        }
+        let source = Expr::Column {
+            database: None,
+            table: table.internal_id,
+            column: column_index,
+            is_rowid_alias: table.columns()[column_index].is_rowid_alias(),
+        };
+        expr = Some(match expr.take() {
+            None => source,
+            Some(previous) => Expr::FunctionCall {
+                name: ast::Name::exact("coalesce".to_string()),
+                distinctness: None,
+                args: vec![Box::new(previous), Box::new(source)],
+                order_by: vec![],
+                within_group: vec![],
+                filter_over: ast::FunctionTail {
+                    filter_clause: None,
+                    over_clause: None,
+                },
+            },
+        });
+        used_columns.push((table.internal_id, column_index));
+    }
+    Ok((
+        expr.expect("USING already proved that the column exists"),
+        used_columns,
+    ))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2168,8 +2464,14 @@ pub fn parse_from(
 
     // Process FROM clause if present
     if let Some(from_owned) = from {
-        let select_owned = from_owned.select;
-        let joins_owned = from_owned.joins;
+        let mut select_owned = from_owned.select;
+        let mut joins_owned = from_owned.joins;
+        // SQLite removes an unaliased group when it starts the FROM clause.
+        // Keep the inner joins before the joins that follow the group.
+        while let ast::SelectTable::Sub(inner, None) = *select_owned {
+            select_owned = inner.select;
+            joins_owned.splice(0..0, inner.joins);
+        }
         parse_from_clause_table(
             *select_owned,
             resolver,
@@ -2196,6 +2498,17 @@ pub fn parse_from(
 
     program.unmask_shadowed_ctes_being_defined(shadowed_outer_ctes);
     Ok(())
+}
+
+fn replace_select_table_alias(table: ast::SelectTable, alias: Option<ast::As>) -> ast::SelectTable {
+    match table {
+        ast::SelectTable::Table(name, _, indexed) => ast::SelectTable::Table(name, alias, indexed),
+        ast::SelectTable::TableCall(name, args, _) => {
+            ast::SelectTable::TableCall(name, args, alias)
+        }
+        ast::SelectTable::Select(select, _) => ast::SelectTable::Select(select, alias),
+        ast::SelectTable::Sub(from, _) => ast::SelectTable::Sub(from, alias),
+    }
 }
 
 #[turso_macros::trace_stack]

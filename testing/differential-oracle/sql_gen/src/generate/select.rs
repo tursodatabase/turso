@@ -253,7 +253,7 @@ fn generate_select_impl_inner<C: Capabilities>(
 
     // --- JOINs ---
     let join_config = &select_config.join_config;
-    let joins = if mode == SelectMode::Full
+    let mut joins = if mode == SelectMode::Full
         && ctx.gen_bool_with_prob(join_config.join_probability)
         && !generator.schema().tables.is_empty()
     {
@@ -261,6 +261,9 @@ fn generate_select_impl_inner<C: Capabilities>(
     } else {
         vec![]
     };
+    if !joins.is_empty() && ctx.gen_bool_with_prob(join_config.parenthesized_group_probability) {
+        add_parenthesized_groups(ctx, &mut joins);
+    }
 
     let gb_prob = match mode {
         SelectMode::Full => select_config.group_by_probability,
@@ -1370,6 +1373,7 @@ pub(crate) fn generate_join_clauses<C: Capabilities>(
                         table: joined_table.qualified_name(),
                         alias,
                         constraint: Some(JoinConstraint::On(on_expr)),
+                        closed_groups: vec![],
                     });
                     continue;
                 }
@@ -1391,10 +1395,24 @@ pub(crate) fn generate_join_clauses<C: Capabilities>(
             table: joined_table.qualified_name(),
             alias,
             constraint,
+            closed_groups: vec![],
         });
     }
 
     Ok(joins)
+}
+
+/// Wrap the FROM table and the joins after it in one or more parenthesized
+/// groups. Every group starts at the FROM table, so an ON condition inside a
+/// group only uses tables that are also inside it.
+fn add_parenthesized_groups(ctx: &mut Context, joins: &mut [JoinClause]) {
+    let group_count = ctx.gen_range_inclusive(1, joins.len());
+    for _ in 0..group_count {
+        let last_join = ctx.gen_range(joins.len());
+        let alias = ctx.gen_bool_with_prob(0.5).then(|| ctx.next_table_alias());
+        joins[last_join].closed_groups.push(alias);
+    }
+    ctx.scope(Origin::ParenthesizedJoin, |_| {});
 }
 
 /// Generate the ON condition for a JOIN.
@@ -2674,6 +2692,61 @@ mod tests {
             }
         }
         assert!(found_join, "Should generate at least one JOIN query");
+    }
+
+    #[test]
+    fn parenthesized_groups_start_at_the_from_table() {
+        use crate::policy::JoinConfig;
+
+        let policy = Policy::default().with_select_config(crate::policy::SelectConfig {
+            join_config: JoinConfig {
+                join_probability: 1.0,
+                max_joins: 3,
+                parenthesized_group_probability: 1.0,
+                ..Default::default()
+            },
+            group_by_probability: 0.0,
+            cte_probability: 0.0,
+            compound_probability: 0.0,
+            ..Default::default()
+        });
+        let schema = SchemaBuilder::new()
+            .table(Table::new(
+                "users",
+                vec![
+                    ColumnDef::new("id", DataType::Integer).primary_key(),
+                    ColumnDef::new("age", DataType::Integer),
+                ],
+            ))
+            .table(Table::new(
+                "orders",
+                vec![
+                    ColumnDef::new("id", DataType::Integer).primary_key(),
+                    ColumnDef::new("user_id", DataType::Integer),
+                ],
+            ))
+            .build();
+        let generator: SqlGen<Full> = SqlGen::new(schema, policy);
+
+        let mut found_aliased_group = false;
+        for seed in 0..100 {
+            let mut ctx = Context::new_with_seed(seed);
+            let select = generate_select_impl(&generator, &mut ctx, SelectMode::Full).unwrap();
+            let group_count: usize = select
+                .joins
+                .iter()
+                .map(|join| join.closed_groups.len())
+                .sum();
+            assert!(group_count >= 1);
+            let sql = select.to_string();
+            let from = format!(" FROM {}", "(".repeat(group_count));
+            assert!(sql.contains(&from), "{sql}");
+            found_aliased_group |= select
+                .joins
+                .iter()
+                .any(|join| join.closed_groups.iter().any(Option::is_some));
+        }
+        assert!(found_aliased_group);
     }
 
     #[test]
