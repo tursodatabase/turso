@@ -2751,14 +2751,7 @@ impl PgAttrdefCursor {
 
             for (col_idx, col) in btree.columns().iter().enumerate() {
                 if let Some(default_expr) = &col.default {
-                    // Stored SQL puts a DEFAULT expression in parentheses;
-                    // PostgreSQL shows the expression alone.
-                    let default_sql = match default_expr.as_ref() {
-                        turso_parser::ast::Expr::Parenthesized(exprs) if exprs.len() == 1 => {
-                            exprs[0].to_string()
-                        }
-                        expr => expr.to_string(),
-                    };
+                    let default_sql = without_outer_parentheses(default_expr).to_string();
                     self.rows.push(vec![
                         Value::from_i64(attrdef_oid),        // oid
                         Value::from_i64(table_oid),          // adrelid
@@ -3396,54 +3389,147 @@ impl PgGetTableDefCursor {
 
 /// PostgreSQL DDL for a table of the PostgreSQL frontend that
 /// `sqlite_schema` stores as canonical Turso SQL.
+///
+/// The stored SQL has the types and DEFAULTs of the translation, not the
+/// text of the user DDL. A serial, bigserial and smallserial column are all
+/// an INTEGER column with the DEFAULT `nextval('<table>_<column>_seq')`, so
+/// they show as `serial`.
 fn pg_storage_table_ddl(sql: &str) -> Result<String> {
-    let turso_parser::ast::Stmt::CreateTable {
+    use turso_parser::ast::{ColumnConstraint, CreateTableBody, Stmt, TableOptions};
+    let Stmt::CreateTable {
         tbl_name, mut body, ..
     } = turso_core::dialect::sqlite::parse_table_sql_ast(sql)?
     else {
         unreachable!("parse_table_sql_ast returns CREATE TABLE");
     };
-    let turso_parser::ast::CreateTableBody::ColumnsAndConstraints {
+    let CreateTableBody::ColumnsAndConstraints {
         columns, options, ..
     } = &mut body
     else {
         unreachable!("a stored table has columns");
     };
-    *options = turso_parser::ast::TableOptions::empty();
+    *options = TableOptions::empty();
     for column in columns.iter_mut() {
         let serial_sequence = format!(
-            "'{}_{}_seq'",
-            tbl_name.name.as_str(),
-            column.col_name.as_str()
+            "'{}'",
+            turso_pg_parser::translator::serial_sequence_name(
+                tbl_name.name.as_str(),
+                column.col_name.as_str()
+            )
         );
-        let is_serial = column.constraints.iter().any(|constraint| {
-            matches!(&constraint.constraint, turso_parser::ast::ColumnConstraint::Default(expr)
-                if default_calls_nextval(expr, &serial_sequence))
+        let (is_integer, is_boolean) = column.col_type.as_ref().map_or((false, false), |ty| {
+            (
+                ty.array_dimensions == 0 && ty.name.eq_ignore_ascii_case("INTEGER"),
+                ty.array_dimensions == 0 && ty.name.eq_ignore_ascii_case("boolean"),
+            )
         });
-        if is_serial {
-            column.constraints.retain(|constraint| {
-                !matches!(
-                    constraint.constraint,
-                    turso_parser::ast::ColumnConstraint::Default(_)
-                )
+        let is_serial = is_integer
+            && column.constraints.iter().any(|constraint| {
+                matches!(&constraint.constraint, ColumnConstraint::Default(expr)
+                    if default_calls_nextval(expr, &serial_sequence))
             });
-        }
+        column.constraints.retain_mut(|constraint| {
+            let ColumnConstraint::Default(expr) = &mut constraint.constraint else {
+                return true;
+            };
+            if is_serial {
+                return false;
+            }
+            **expr = postgres_default(std::mem::take(&mut **expr), is_boolean);
+            true
+        });
         if let Some(col_type) = column.col_type.as_mut() {
             col_type.name = postgres_type_name(&col_type.name, is_serial).to_string();
         }
+        column.col_name = postgres_name(&column.col_name);
     }
-    Ok(format!("CREATE TABLE {} {body}", tbl_name.name.as_ident()))
+    Ok(format!(
+        "CREATE TABLE {} {body}",
+        postgres_name(&tbl_name.name).as_ident()
+    ))
+}
+
+/// PostgreSQL folds a name without quotes to lower case.
+fn postgres_name(name: &turso_parser::ast::Name) -> turso_parser::ast::Name {
+    if name.as_str().bytes().any(|byte| byte.is_ascii_uppercase()) {
+        turso_parser::ast::Name::from_string(format!("\"{}\"", name.as_str().replace('"', "\"\"")))
+    } else {
+        name.clone()
+    }
 }
 
 fn default_calls_nextval(expr: &turso_parser::ast::Expr, sequence: &str) -> bool {
     use turso_parser::ast::{Expr, Literal};
-    let expr = match expr {
-        Expr::Parenthesized(exprs) if exprs.len() == 1 => exprs[0].as_ref(),
-        expr => expr,
-    };
-    matches!(expr, Expr::FunctionCall { name, args, .. }
+    matches!(without_outer_parentheses(expr), Expr::FunctionCall { name, args, .. }
         if name.as_str().eq_ignore_ascii_case("nextval")
             && matches!(args.as_slice(), [arg] if matches!(arg.as_ref(), Expr::Literal(Literal::String(s)) if s == sequence)))
+}
+
+/// Stored SQL puts a DEFAULT expression in parentheses; PostgreSQL shows the
+/// expression alone.
+fn without_outer_parentheses(expr: &turso_parser::ast::Expr) -> &turso_parser::ast::Expr {
+    match expr {
+        turso_parser::ast::Expr::Parenthesized(exprs) if exprs.len() == 1 => &exprs[0],
+        expr => expr,
+    }
+}
+
+/// The translation stores a boolean DEFAULT as 0 or 1 and `ARRAY[...]` as
+/// a call of `array`. PostgreSQL refuses both in the DDL.
+fn postgres_default(expr: turso_parser::ast::Expr, is_boolean: bool) -> turso_parser::ast::Expr {
+    use turso_parser::ast::{Expr, Literal};
+    match expr {
+        Expr::Literal(Literal::Numeric(number)) if is_boolean && number == "0" => {
+            Expr::Literal(Literal::False)
+        }
+        Expr::Literal(Literal::Numeric(number)) if is_boolean && number == "1" => {
+            Expr::Literal(Literal::True)
+        }
+        expr => with_array_literals(expr),
+    }
+}
+
+fn with_array_literals(expr: turso_parser::ast::Expr) -> turso_parser::ast::Expr {
+    use turso_parser::ast::Expr;
+    let convert_all = |exprs: Vec<Box<Expr>>| -> Vec<Box<Expr>> {
+        exprs
+            .into_iter()
+            .map(|expr| Box::new(with_array_literals(*expr)))
+            .collect()
+    };
+    match expr {
+        Expr::FunctionCall { name, args, .. } if name.as_str().eq_ignore_ascii_case("array") => {
+            Expr::Array {
+                elements: convert_all(args),
+            }
+        }
+        Expr::FunctionCall {
+            name,
+            distinctness,
+            args,
+            order_by,
+            within_group,
+            filter_over,
+        } => Expr::FunctionCall {
+            name,
+            distinctness,
+            args: convert_all(args),
+            order_by,
+            within_group,
+            filter_over,
+        },
+        Expr::Parenthesized(exprs) => Expr::Parenthesized(convert_all(exprs)),
+        Expr::Cast { expr, type_name } => Expr::Cast {
+            expr: Box::new(with_array_literals(*expr)),
+            type_name,
+        },
+        Expr::Binary(lhs, op, rhs) => Expr::Binary(
+            Box::new(with_array_literals(*lhs)),
+            op,
+            Box::new(with_array_literals(*rhs)),
+        ),
+        expr => expr,
+    }
 }
 
 fn postgres_type_name(turso_type: &str, is_serial: bool) -> &str {

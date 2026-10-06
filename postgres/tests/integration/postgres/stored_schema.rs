@@ -238,27 +238,59 @@ fn vacuum_keeps_tables_and_values(db: TempDatabase) {
 #[turso_macros::test]
 fn catalog_shows_postgres_ddl_and_defaults_of_new_tables(db: TempDatabase) {
     let conn = db.connect_postgres();
-    conn.execute(
-        "CREATE TABLE c (id serial PRIMARY KEY, n numeric(10,2) NOT NULL, \
-         ts timestamp DEFAULT now(), t text, r double precision, b bytea, k integer UNIQUE)",
-    )
-    .unwrap();
-    let ddl: Vec<String> = rows(&conn, "SELECT table_name, ddl FROM pg_get_tabledef")
-        .into_iter()
-        .filter_map(|row| row.strip_prefix("c|").map(str::to_string))
-        .collect();
-    assert_eq!(
-        ddl,
-        [
-            "CREATE TABLE c (id serial PRIMARY KEY, n numeric (10, 2) NOT NULL, \
-          ts timestamp DEFAULT (now ()), t text, r double precision, b bytea, \
-          k integer UNIQUE)"
-        ]
+    conn.execute("CREATE SEQUENCE f_c_seq").unwrap();
+    let tables = [
+        (
+            "CREATE TABLE c (id serial PRIMARY KEY, n numeric(10,2) NOT NULL, \
+             ts timestamp DEFAULT now(), t text, r double precision, b bytea, k integer UNIQUE)",
+            "c|CREATE TABLE c (id serial PRIMARY KEY, n numeric (10, 2) NOT NULL, \
+             ts timestamp DEFAULT (now ()), t text, r double precision, b bytea, \
+             k integer UNIQUE)",
+        ),
+        (
+            "CREATE TABLE f (a bigserial PRIMARY KEY, b smallserial, \
+             c bigint DEFAULT nextval('f_c_seq'), d text DEFAULT nextval('f_c_seq'), \
+             e boolean DEFAULT false, g boolean DEFAULT true, h integer[] DEFAULT ARRAY[1, 2], \
+             i integer[][] DEFAULT ARRAY[ARRAY[1], ARRAY[2]])",
+            "f|CREATE TABLE f (a serial PRIMARY KEY, b serial NOT NULL, \
+             c bigint DEFAULT (nextval ('f_c_seq')), d text DEFAULT (nextval ('f_c_seq')), \
+             e boolean DEFAULT FALSE, g boolean DEFAULT TRUE, h integer[] DEFAULT (ARRAY[1, 2]), \
+             i integer[][] DEFAULT (ARRAY[ARRAY[1], ARRAY[2]]))",
+        ),
+        (
+            "CREATE TABLE \"MixedT\" (id serial PRIMARY KEY, \"Value\" text)",
+            "mixedt|CREATE TABLE \"MixedT\" (id serial PRIMARY KEY, \"Value\" text)",
+        ),
+    ];
+    for (create, _) in tables {
+        conn.execute(create).unwrap();
+    }
+    let ddl: Vec<String> = rows(
+        &conn,
+        "SELECT table_name, ddl FROM pg_get_tabledef \
+         WHERE table_name IN ('c', 'f', 'mixedt') ORDER BY table_name",
     );
+    let mut expected: Vec<&str> = tables.iter().map(|(_, ddl)| *ddl).collect();
+    expected.sort();
+    assert_eq!(ddl, expected);
     assert_eq!(
-        rows(&conn, "SELECT adnum, adbin FROM pg_attrdef ORDER BY adnum"),
+        rows(
+            &conn,
+            "SELECT adnum, adbin FROM pg_attrdef JOIN pg_class ON pg_class.oid = adrelid \
+             WHERE relname = 'c' ORDER BY adnum"
+        ),
         ["1|nextval ('c_id_seq')", "3|now ()"]
     );
+
+    let other = TempDatabase::builder().build();
+    let other_conn = other.connect_postgres();
+    other_conn.execute("CREATE SEQUENCE f_c_seq").unwrap();
+    for row in ddl {
+        let (_, ddl) = row.split_once('|').unwrap();
+        other_conn
+            .execute(ddl)
+            .unwrap_or_else(|e| panic!("{ddl}: {e}"));
+    }
 }
 
 /// A table in a schema file uses the types of the main database, so DROP

@@ -376,6 +376,12 @@ such a table, also when a DEFAULT calls a function, and the table gets the
 expressions of a table with the marker keep the casts of the older version:
 `x::date`, `x::time` and `x::timestamp` are a cast to TEXT there.
 
+`pg_get_tabledef` shows the stored column types and DEFAULT expressions, not
+the text of the CREATE TABLE. For example, `real` and `numeric` show as
+`double precision`, `timetz` as `time`, `char(n)` and `varchar` as `text`,
+and `bigserial` and `smallserial` as `serial`. IDENTITY and COLLATE are not
+shown, because the stored table does not have them.
+
 tursopg attaches the schema files next to the database at start. A schema
 file that does not attach, for example because its tables use a type that
 the database does not define, gives a warning on stderr.

@@ -479,9 +479,8 @@ impl PostgreSQLTranslator {
         // Build constraints list
         let mut constraints = Vec::new();
 
-        // For serial columns, add DEFAULT nextval('tablename_colname_seq')
         if is_serial && default_expr.is_none() {
-            let seq_name = format!("{}_{}_seq", table_name.to_lowercase(), name.to_lowercase());
+            let seq_name = serial_sequence_name(table_name, &name);
             serial_sequences.push(seq_name.clone());
             default_expr = Some(ast::Expr::FunctionCall {
                 name: ast::Name::from_string("nextval"),
@@ -4106,6 +4105,15 @@ impl PgTypeMapping {
             type_params: vec![],
         }
     }
+}
+
+/// The sequence that a serial column gets: `<table>_<column>_seq`.
+pub fn serial_sequence_name(table_name: &str, column_name: &str) -> String {
+    format!(
+        "{}_{}_seq",
+        table_name.to_lowercase(),
+        column_name.to_lowercase()
+    )
 }
 
 /// Returns true if the given PG type name is a serial variant (auto-incrementing integer).
