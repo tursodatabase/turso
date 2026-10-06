@@ -115,7 +115,7 @@ impl VirtualTable {
     pub fn table(
         tbl_name: Option<&str>,
         module_name: &str,
-        args: Vec<turso_ext::Value>,
+        args: Vec<Value>,
         syms: &SymbolTable,
     ) -> crate::Result<Arc<VirtualTable>> {
         let module = syms.vtab_modules.get(module_name);
@@ -385,8 +385,9 @@ impl ExtVirtualTable {
     /// takes ownership of the provided Args
     pub(crate) fn create(
         implementation: Arc<VTabModuleImpl>,
-        args: Vec<turso_ext::Value>,
+        args: Vec<Value>,
     ) -> crate::Result<(Self, String)> {
+        let args = args.iter().map(Value::to_ffi).collect();
         let (schema, table_ptr) = implementation.create(args)?;
         let vtab = ExtVirtualTable {
             implementation,
