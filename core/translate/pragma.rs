@@ -1087,7 +1087,7 @@ fn query_pragma(
             for col_name in pragma_meta.columns.iter() {
                 program.add_pragma_result_column(col_name.to_string());
             }
-            Ok(TransactionMode::None)
+            Ok(TransactionMode::Read)
         }
         PragmaName::IndexXinfo => {
             let index_name = match value {
@@ -1149,7 +1149,7 @@ fn query_pragma(
             for col_name in pragma_meta.columns.iter() {
                 program.add_pragma_result_column(col_name.to_string());
             }
-            Ok(TransactionMode::None)
+            Ok(TransactionMode::Read)
         }
         PragmaName::IndexList => {
             let table_name = match value {
@@ -1213,7 +1213,7 @@ fn query_pragma(
             for col_name in pragma_meta.columns.iter() {
                 program.add_pragma_result_column(col_name.to_string());
             }
-            Ok(TransactionMode::None)
+            Ok(TransactionMode::Read)
         }
         PragmaName::ForeignKeyList => {
             let table_name = match value {
@@ -1278,7 +1278,7 @@ fn query_pragma(
             for col_name in pragma_meta.columns.iter() {
                 program.add_pragma_result_column(col_name.to_string());
             }
-            Ok(TransactionMode::None)
+            Ok(TransactionMode::Read)
         }
         PragmaName::TableList => {
             let name = match value {
@@ -1315,7 +1315,7 @@ fn query_pragma(
             for col_name in pragma_meta.columns.iter() {
                 program.add_pragma_result_column(col_name.to_string());
             }
-            Ok(TransactionMode::None)
+            Ok(TransactionMode::Read)
         }
         PragmaName::TableInfo => {
             let name = match value {
@@ -1376,7 +1376,7 @@ fn query_pragma(
             for name in col_names {
                 program.add_pragma_result_column(name.into());
             }
-            Ok(TransactionMode::None)
+            Ok(TransactionMode::Read)
         }
         PragmaName::TableXinfo => {
             let name = match value {
@@ -1445,7 +1445,7 @@ fn query_pragma(
             for name in col_names {
                 program.add_pragma_result_column(name.into());
             }
-            Ok(TransactionMode::None)
+            Ok(TransactionMode::Read)
         }
         PragmaName::UserVersion => {
             program.emit_insn(Insn::ReadCookie {

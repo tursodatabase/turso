@@ -123,6 +123,68 @@ fn test_temp_schema_change_invalidates_unrelated_prepared_statement(
     Ok(())
 }
 
+#[test]
+fn test_prepared_schema_pragmas_reprepare_after_ddl() -> Result<()> {
+    let cases: [(&[&str], &str, &[&str]); 7] = [
+        (
+            &["CREATE TABLE t1(a)"],
+            "PRAGMA table_info(t1)",
+            &["ALTER TABLE t1 ADD COLUMN b"],
+        ),
+        (
+            &["CREATE TABLE t1(a)"],
+            "PRAGMA table_xinfo(t1)",
+            &["ALTER TABLE t1 ADD COLUMN b"],
+        ),
+        (
+            &["CREATE TABLE t1(a)"],
+            "PRAGMA table_list",
+            &["CREATE TABLE t2(a)"],
+        ),
+        (
+            &["CREATE TABLE t1(a, b)", "CREATE INDEX i1 ON t1(a)"],
+            "PRAGMA index_list(t1)",
+            &["CREATE INDEX i2 ON t1(b)"],
+        ),
+        (
+            &["CREATE TABLE t1(a, b)", "CREATE INDEX i1 ON t1(a)"],
+            "PRAGMA index_info(i1)",
+            &["DROP INDEX i1", "CREATE INDEX i1 ON t1(b)"],
+        ),
+        (
+            &["CREATE TABLE t1(a, b)", "CREATE INDEX i1 ON t1(a)"],
+            "PRAGMA index_xinfo(i1)",
+            &["DROP INDEX i1", "CREATE INDEX i1 ON t1(b)"],
+        ),
+        (
+            &[
+                "CREATE TABLE t1(a PRIMARY KEY)",
+                "CREATE TABLE t2(b REFERENCES t1(a))",
+            ],
+            "PRAGMA foreign_key_list(t2)",
+            &["DROP TABLE t2", "CREATE TABLE t2(b)"],
+        ),
+    ];
+    for (setup, pragma, ddl) in cases {
+        let tmp_db = TempDatabase::new_empty();
+        let conn = tmp_db.connect_limbo();
+        for sql in setup {
+            conn.execute(*sql)?;
+        }
+        let mut stmt = conn.prepare(pragma)?;
+        stmt.run_collect_rows()?;
+        for sql in ddl {
+            conn.execute(*sql)?;
+        }
+
+        stmt.reset()?;
+        let reused = stmt.run_collect_rows()?;
+        let fresh = conn.prepare(pragma)?.run_collect_rows()?;
+        assert_that!(reused).named(pragma).is_equal_to(fresh);
+    }
+    Ok(())
+}
+
 /// Test that deferred_seeks vector is properly resized when a statement is reprepared
 /// with a larger cursor count due to schema changes (e.g., new index creation).
 ///
