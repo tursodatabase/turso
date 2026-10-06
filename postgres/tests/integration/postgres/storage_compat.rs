@@ -155,6 +155,9 @@ fn base_file_accepts_writes_and_alter_table() {
             .unwrap();
         conn.execute("ALTER TABLE added DROP COLUMN when_ts")
             .unwrap();
+        conn.execute("ALTER TABLE dropped RENAME TO dropped2")
+            .unwrap();
+        conn.execute("ALTER TABLE child DROP COLUMN note").unwrap();
         conn.execute("INSERT INTO big2 VALUES (7, 'third', 3)")
             .unwrap();
         if !mvcc {
@@ -167,13 +170,17 @@ fn base_file_accepts_writes_and_alter_table() {
 
         let db = open(path, mvcc);
         let core = db.connect_limbo();
+        // The base stored `added` and `dropped` without the marker after its
+        // ADD and DROP COLUMN, so nothing shows that they are PostgreSQL tables.
         assert_eq!(
             core_rows(
                 &core,
-                "SELECT sql FROM sqlite_schema WHERE name IN ('all_types', 'big2', 'comp', 'child') \
+                "SELECT sql FROM sqlite_schema \
+                 WHERE name IN ('added', 'all_types', 'big2', 'child', 'comp', 'dropped2') \
                  ORDER BY name"
             ),
             [
+                "CREATE TABLE added (id INTEGER PRIMARY KEY, a TEXT, extra INTEGER DEFAULT 7) STRICT",
                 "CREATE TABLE all_types (id INTEGER PRIMARY KEY DEFAULT (nextval ('all_types_id_seq')), \
                  b boolean, s smallint, i INTEGER, bi bigint, r REAL, dp REAL, n numeric(10, 2), \
                  v varchar(10), t TEXT, \"by\" bytea, u uuid, d date, tm time, ts timestamp, \
@@ -182,10 +189,11 @@ fn base_file_accepts_writes_and_alter_table() {
                  extra TEXT DEFAULT 'e') STRICT, PGSTORAGE",
                 "CREATE TABLE big2 (id bigint PRIMARY KEY, label TEXT UNIQUE, qty INTEGER \
                  CHECK (qty >= 0)) STRICT, PGSTORAGE",
-                "CREATE TABLE child (id INTEGER PRIMARY KEY, big_id bigint REFERENCES big2 (id), \
-                 note TEXT DEFAULT 'none') STRICT, PGSTORAGE",
+                "CREATE TABLE child (id INTEGER PRIMARY KEY, big_id bigint, \
+                 FOREIGN KEY (big_id) REFERENCES big2(id)) STRICT, PGSTORAGE",
                 "CREATE TABLE comp (a INTEGER, b TEXT, c2 numeric (5, 1), PRIMARY KEY (a, b), \
                  UNIQUE (c2)) STRICT, PGSTORAGE",
+                "CREATE TABLE dropped2 (id INTEGER PRIMARY KEY, keep TEXT, n numeric (10, 2)) STRICT",
             ],
             "mvcc={mvcc}"
         );
@@ -216,6 +224,16 @@ fn base_file_accepts_writes_and_alter_table() {
         assert_eq!(
             rows(&conn, "SELECT * FROM added ORDER BY id"),
             ["1|a|7", "2|b|8"],
+            "mvcc={mvcc}"
+        );
+        assert_eq!(
+            rows(&conn, "SELECT * FROM child"),
+            ["1|9000000001"],
+            "mvcc={mvcc}"
+        );
+        assert_eq!(
+            rows(&conn, "SELECT * FROM dropped2"),
+            ["1|k|3.75"],
             "mvcc={mvcc}"
         );
         if !mvcc {
@@ -436,7 +454,8 @@ fn more_types_of_base_file_keep_their_values() {
     assert_eq!(core_rows(conn.inner(), "PRAGMA integrity_check"), ["ok"]);
 }
 
-/// A user type named like a built-in type of the next steps keeps working.
+/// A user type named like a built-in type of the next steps keeps working,
+/// also after an ALTER stores the table as canonical SQL.
 #[test]
 fn user_type_with_pg_prefix_of_base_file_still_works() {
     let dir = copy_fixtures(&["pg_v1_pg_prefix_type.db"]);
@@ -444,8 +463,20 @@ fn user_type_with_pg_prefix_of_base_file_still_works() {
     let conn = db.connect_postgres();
     conn.execute("INSERT INTO pd VALUES (2, 'b')").unwrap();
     assert!(conn.execute("INSERT INTO pd VALUES (3, 'c')").is_err());
+    conn.execute("ALTER TABLE pd ADD COLUMN note text").unwrap();
+    drop(conn);
+    let db = db.reopen();
+    let conn = db.connect_postgres();
     assert_eq!(
-        rows(&conn, "SELECT id, x FROM pd ORDER BY id"),
-        ["1|a", "2|b"]
+        core_rows(
+            conn.inner(),
+            "SELECT sql FROM sqlite_schema WHERE name = 'pd'"
+        ),
+        ["CREATE TABLE pd (id INTEGER PRIMARY KEY, x pg_date, note TEXT) STRICT, PGSTORAGE"]
+    );
+    assert!(conn.execute("INSERT INTO pd VALUES (3, 'c', 'n')").is_err());
+    assert_eq!(
+        rows(&conn, "SELECT id, x, note FROM pd ORDER BY id"),
+        ["1|a|NULL", "2|b|NULL"]
     );
 }

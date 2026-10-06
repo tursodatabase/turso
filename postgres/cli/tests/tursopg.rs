@@ -953,6 +953,10 @@ fn copy_from_file_not_found_repl() {
 /// for a free ephemeral port and verify our own child is the process that
 /// came up on it, retrying with a fresh port if the child dies on bind.
 fn start_tursopg_server() -> (Child, u16) {
+    start_tursopg_server_with_db(":memory:")
+}
+
+fn start_tursopg_server_with_db(db_path: &str) -> (Child, u16) {
     for _ in 0..10 {
         let port = TcpListener::bind("127.0.0.1:0")
             .unwrap()
@@ -961,7 +965,7 @@ fn start_tursopg_server() -> (Child, u16) {
             .port();
         let addr = format!("127.0.0.1:{port}");
         let mut child = Command::new(env!("CARGO_BIN_EXE_tursopg"))
-            .arg(":memory:")
+            .arg(db_path)
             .arg("--server")
             .arg(&addr)
             .stdout(Stdio::piped())
@@ -1570,6 +1574,51 @@ fn schema_file_that_is_not_attached_gives_a_warning() {
             && stderr.contains("column st.m has type \"mood\""),
         "{stderr}"
     );
+}
+
+/// The values of a file that the tursopg of commit e6c79b43 wrote keep
+/// their type OIDs and their text over the wire. The text is what the
+/// server of that commit sends.
+#[test]
+fn wire_values_of_a_file_of_an_older_version() {
+    let dir = test_dir("wire-pg-v1");
+    copy_pg_v1_fixtures(&dir, &["pg_v1_storage.db", "turso-postgres-schema-s.db"]);
+    let (mut server, port) =
+        start_tursopg_server_with_db(dir.join("pg_v1_storage.db").to_str().unwrap());
+    let mut client = PgTestClient::connect(port);
+    let mut values = Vec::new();
+    for column in [
+        "bi", "b", "n", "ts", "tz", "d", "tm", "u", "m", "ia", "p", "mo",
+    ] {
+        let sql = format!("SELECT {column} FROM all_types WHERE id = 1");
+        let oids = client.query_column_oids(&sql);
+        values.push(format!(
+            "{column}|{oids:?}|{}",
+            client.query_single_text(&sql)
+        ));
+    }
+    let st = client.query_single_text("SELECT m FROM s.st WHERE id = 1");
+    server.kill().ok();
+    server.wait().ok();
+    std::fs::remove_dir_all(&dir).unwrap();
+    assert_eq!(
+        values,
+        [
+            "bi|[20]|9000000000",
+            "b|[16]|t",
+            "n|[701]|12.34",
+            "ts|[1114]|2024-01-02 03:04:05.678",
+            "tz|[1184]|2024-01-02 01:04:05+00",
+            "d|[1082]|2024-02-29",
+            "tm|[1083]|10:11:12.5",
+            "u|[2950]|01945ca0-3189-76c0-9a8f-caf310fc8b8e",
+            "m|[25]|happy",
+            "ia|[1007]|{1,2,3}",
+            "p|[23]|5",
+            "mo|[701]|7.5",
+        ]
+    );
+    assert_eq!(st, "ok");
 }
 
 /// A new directory for the files of one test.

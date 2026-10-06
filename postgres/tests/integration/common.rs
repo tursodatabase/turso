@@ -242,17 +242,6 @@ impl TempDatabase {
     }
 }
 
-/// A row as `value|value|...`, with `NULL` for a null value.
-pub fn format_row(row: &[turso_core::Value]) -> String {
-    row.iter()
-        .map(|value| match value {
-            turso_core::Value::Null => "NULL".to_string(),
-            value => value.to_string(),
-        })
-        .collect::<Vec<_>>()
-        .join("|")
-}
-
 /// The rows of a PostgreSQL query, formatted with [`format_row`].
 pub fn rows(conn: &Connection, sql: &str) -> Vec<String> {
     let mut stmt = conn
@@ -274,6 +263,17 @@ pub fn core_rows(conn: &Arc<turso_core::Connection>, sql: &str) -> Vec<String> {
         .iter()
         .map(|row| format_row(row))
         .collect()
+}
+
+/// A row as `value|value|...`, with `NULL` for a null value.
+fn format_row(row: &[turso_core::Value]) -> String {
+    row.iter()
+        .map(|value| match value {
+            turso_core::Value::Null => "NULL".to_string(),
+            value => value.to_string(),
+        })
+        .collect::<Vec<_>>()
+        .join("|")
 }
 
 /// Open a database file with the SQLite dialect and custom types.

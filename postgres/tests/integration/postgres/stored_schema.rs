@@ -224,6 +224,9 @@ fn vacuum_keeps_tables_and_values(db: TempDatabase) {
     assert_eq!(before.len(), 3);
 
     core.execute("VACUUM").unwrap();
+    let copy = db.path.with_file_name("vacuum-into-copy.db");
+    core.execute(format!("VACUUM INTO '{}'", copy.display()))
+        .unwrap();
 
     assert_eq!(core_rows(&core, schema_sql), before);
     assert_eq!(core_rows(&core, "PRAGMA integrity_check"), ["ok"]);
@@ -232,6 +235,20 @@ fn vacuum_keeps_tables_and_values(db: TempDatabase) {
     assert_eq!(
         rows(&conn, "SELECT id, n, m, ts FROM v ORDER BY id"),
         ["1|2.50|ok|2024-01-01 10:00:00", "2|3.00|sad|NULL"]
+    );
+
+    let copy = TempDatabase::builder().with_db_path(copy).build();
+    let copy_conn = copy.connect_postgres();
+    assert_eq!(core_rows(copy_conn.inner(), schema_sql), before);
+    copy_conn
+        .execute("INSERT INTO v (n, m) VALUES (4, 'ok')")
+        .unwrap();
+    assert!(copy_conn
+        .execute("INSERT INTO v (n, m) VALUES (5, 'angry')")
+        .is_err());
+    assert_eq!(
+        rows(&copy_conn, "SELECT id, n, m, ts FROM v ORDER BY id"),
+        ["1|2.50|ok|2024-01-01 10:00:00", "2|4.00|ok|NULL"]
     );
 }
 
@@ -354,5 +371,45 @@ fn engine_tables_are_not_postgres_tables() {
             "turso_cdc_version|CREATE TABLE turso_cdc_version \
              (table_name TEXT PRIMARY KEY, version TEXT NOT NULL)",
         ]
+    );
+}
+
+/// RENAME COLUMN of a parent column rewrites the stored SQL of the child
+/// table.
+#[turso_macros::test(mvcc)]
+fn rename_column_of_a_parent_keeps_the_child_table(db: TempDatabase) {
+    let conn = db.connect_postgres();
+    conn.execute("CREATE TABLE parent (id integer PRIMARY KEY, n numeric(10,2))")
+        .unwrap();
+    conn.execute(
+        "CREATE TABLE child (id integer PRIMARY KEY, \
+         pid integer REFERENCES parent (id), ts timestamp DEFAULT now())",
+    )
+    .unwrap();
+    conn.execute("INSERT INTO parent VALUES (1, 2.5)").unwrap();
+    conn.execute("INSERT INTO child (id, pid, ts) VALUES (1, 1, '2024-01-01 10:00:00')")
+        .unwrap();
+    conn.execute("ALTER TABLE parent RENAME COLUMN id TO pkey")
+        .unwrap();
+    drop(conn);
+
+    let db = db.reopen();
+    let conn = db.connect_postgres();
+    assert_eq!(
+        core_rows(
+            conn.inner(),
+            "SELECT sql FROM sqlite_schema WHERE name = 'child'"
+        ),
+        [
+            "CREATE TABLE child (id INTEGER PRIMARY KEY, pid INTEGER REFERENCES parent (pkey), \
+          ts timestamp DEFAULT (now ())) STRICT, PGSTORAGE"
+        ]
+    );
+    assert_eq!(
+        rows(
+            &conn,
+            "SELECT child.id, parent.n, child.ts FROM child JOIN parent ON parent.pkey = child.pid"
+        ),
+        ["1|2.50|2024-01-01 10:00:00"]
     );
 }

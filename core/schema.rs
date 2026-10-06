@@ -7945,6 +7945,28 @@ mod tests {
             }
         }
     }
+
+    #[test]
+    fn check_sql_loads_back_refuses_sql_of_another_table() -> Result<()> {
+        let table = BTreeTable::from_sql("CREATE TABLE t (a INTEGER, b TEXT) STRICT", 2)?;
+        table.check_sql_loads_back(&table.to_sql())?;
+        let err = table
+            .check_sql_loads_back("CREATE TABLE t (a INTEGER) STRICT")
+            .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("table SQL loads back as a different table"),
+            "{err}"
+        );
+        let err = table
+            .check_sql_loads_back("CREATE TABLE t (a INTEGER DEFAULT nextval ('s'), b TEXT) STRICT")
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("table SQL does not load back"),
+            "{err}"
+        );
+        Ok(())
+    }
 }
 
 mod column_info {
