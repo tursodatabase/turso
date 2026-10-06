@@ -118,14 +118,35 @@ numeric(p,s) keep their type modifiers. interval, xml, tsvector/tsquery,
 bit/varbit, geometric types degrade to TEXT; money to REAL; OID/reg* types to
 INTEGER. Unknown type names pass through as custom types.
 
+New tables store some types as integers, with the built-in types
+`pg_timestamp`, `pg_timestamptz`, `pg_date`, `pg_time`, `pg_numeric` and
+`pg_int8`:
+
+- timestamp and timestamptz store microseconds since 2000-01-01 (UTC for
+  timestamptz), date stores days and time stores microseconds since
+  midnight. Values keep six fraction digits. The years 1 to 9999 are
+  supported; `infinity` and BC dates are not.
+- numeric(p,s) with a precision of at most 18 stores the value times 10^s,
+  rounded half away from zero, as in PostgreSQL. A larger precision, and
+  numeric without a precision, keep the older mapping.
+- bigint stores an integer.
+- Array element types, timetz and domains keep the older mapping.
+
+Tables of older versions keep their types: timestamps keep milliseconds,
+and numeric truncates to the scale. A user type of an older version can have
+the name of a built-in `pg_` type. Then a new table cannot use that built-in
+type ("needs the built-in type"), until the user type is dropped.
+
 Comparisons do not cast a literal or a parameter to the type of the column.
 A timestamp, date, time, uuid or enum column compares its text form with the
 operand as written, and a boolean column compares 0 or 1. As a result,
 `ts = '2024-01-01'` does not find `2024-01-01 00:00:00`, an upper-case uuid
 literal finds no row, `flag = 't'` finds no row, and an enum literal that is
 not a label finds no row instead of an error. A numeric column compares with
-a literal by its value, but with a parameter or another expression it
-compares its text form. An index on the column gives the same rows as a scan.
+a literal by its value. With a parameter or another expression, a numeric
+column of a new table (precision 18 or less) compares as a number, and a
+numeric column of an older table compares its text form. An index on the
+column gives the same rows as a scan.
 One error depends on the plan: a numeric literal that is not a number, as in
 `n = 'abc'`, is an error with an index, but without an index it is an error
 only when a row gets to the comparison.
@@ -134,9 +155,24 @@ An explicit cast to date, time, timetz, timestamp or timestamptz, such as
 `'2024-01-01'::timestamp` or `timestamp '2024-01-01'`, gives the text that a
 column of that type stores (`2024-01-01 00:00:00`), so `ts =
 '2024-01-01'::timestamp` finds the row. A cast of text that the column type
-does not accept, such as an offset without minutes (`+02`), is an error. A
-cast to uuid is still a cast to text, and a cast to boolean is still a cast
-to integer.
+does not accept is an error. A cast to uuid is still a cast to text, and a
+cast to boolean is still a cast to integer.
+
+A cast to timestamp, timestamptz, date or time gives the text of the new
+types, with up to six fraction digits. A column of an older table keeps at
+most three fraction digits, so `ts = '2024-01-01 10:00:00.123456'::timestamp`
+does not find the value `2024-01-01 10:00:00.123` of an older table. In the
+CHECK and DEFAULT expressions of a new table, and in the expressions of
+indexes and views, such a cast is a call of the function `pg_timestamp`,
+`pg_timestamptz`, `pg_date` or `pg_time`. Older versions do not have these
+functions, so they refuse such SQL.
+
+A CHECK constraint reads the stored value of a column. Thus a CHECK that
+compares a timestamp, date or time column of a new table with a value is
+refused, as for older tables, and a CHECK that compares two numeric columns
+needs the same precision and scale. ALTER TABLE ... ADD COLUMN of a
+timestamp, date or time column with the DEFAULT `'now'`, `'today'`,
+`'tomorrow'` or `'yesterday'` needs an empty table.
 
 | Feature | Status | Notes |
 |---------|--------|-------|
@@ -150,7 +186,7 @@ to integer.
 | Phrase search | ❌ Not supported | tsvector/tsquery degrade to TEXT; no full-text search |
 | Range types | ❌ Not supported | |
 | smallserial type | ✅ Supported | serial2/serial4/serial8 aliases too; serial implies NOT NULL + implicit sequence, not PRIMARY KEY |
-| Type modifier support | ✅ Supported | varchar(n) length enforced ("value too long for varchar"); numeric(p,s) scale applied |
+| Type modifier support | ✅ Supported | varchar(n) length enforced ("value too long for varchar"); numeric(p,s) rounds to the scale in new tables (truncates in older tables) |
 | UUIDv7 | ❌ Not supported | |
 | XML data type | ❌ Not supported | xml columns degrade to TEXT; no XML functions |
 
@@ -379,8 +415,9 @@ expressions of a table with the marker keep the casts of the older version:
 `pg_get_tabledef` shows the stored column types and DEFAULT expressions, not
 the text of the CREATE TABLE. For example, `real` and `numeric` show as
 `double precision`, `timetz` as `time`, `char(n)` and `varchar` as `text`,
-and `bigserial` and `smallserial` as `serial`. IDENTITY and COLLATE are not
-shown, because the stored table does not have them.
+and `bigserial` and `smallserial` as `serial`. The built-in `pg_` types show
+with their PostgreSQL names. IDENTITY and COLLATE are not shown, because the
+stored table does not have them.
 
 tursopg attaches the schema files next to the database at start. A schema
 file that does not attach, for example because its tables use a type that

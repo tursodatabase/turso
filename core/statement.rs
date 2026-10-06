@@ -134,6 +134,11 @@ pub struct ColumnTypeInfo {
     /// than raw bytes. The `kind` field carries that distinction directly
     /// without forcing the caller to re-query the schema.
     pub kind: ColumnTypeKind,
+    /// `true` when the declared type is a built-in type of Turso (`uuid`,
+    /// `numeric`, `pg_timestamp`, ...), `false` for a primitive and for a
+    /// `CREATE TYPE` / `CREATE DOMAIN` of the database. A database of an
+    /// older version can have a user type with the name of a built-in type.
+    pub is_builtin_type: bool,
 }
 
 /// Classification of a result column's declared type.
@@ -250,6 +255,19 @@ fn infer_expression_primitive(
             ),
         },
         Expr::RowId { .. } => Some("INTEGER"),
+        // The built-in types of the PostgreSQL frontend that store an
+        // integer for a date, a time or a decimal show text.
+        Expr::Column { table, column, .. }
+            if referenced_tables
+                .and_then(|tables| tables.find_table_by_internal_id(*table))
+                .and_then(|(_, table)| table.is_strict().then(|| table.get_column_at(*column)))
+                .flatten()
+                .is_some_and(|column| {
+                    crate::schema::pg_storage_type_shows_text(&column.ty_str)
+                }) =>
+        {
+            Some("TEXT")
+        }
         // CAST, column references, and anything else: defer to the affinity
         // machinery, which handles these shapes correctly.
         _ => affinity_to_primitive(translate::expr::get_expr_affinity(
@@ -288,6 +306,80 @@ fn combine_arithmetic_primitive(
         | (Some("REAL"), Some("REAL")) => "REAL",
         _ => "NUMERIC",
     }
+}
+
+/// The type of a result expression. A direct table-column reference gives
+/// the declared name, array depth, and any registered CREATE TYPE / CREATE
+/// DOMAIN resolution. A column of a FROM-clause subquery (a view, a CTE)
+/// gives the type of the subquery's result expression. Anything else gives
+/// the primitive that [`infer_expression_primitive`] infers.
+fn expression_type_info(
+    expr: &turso_parser::ast::Expr,
+    table_references: &translate::plan::TableReferences,
+    schema: &crate::schema::Schema,
+) -> Option<ColumnTypeInfo> {
+    let turso_parser::ast::Expr::Column {
+        table,
+        column: column_idx,
+        ..
+    } = expr
+    else {
+        let name = infer_expression_primitive(expr, Some(table_references))?;
+        return Some(ColumnTypeInfo {
+            declared_name: name.to_string(),
+            array_dimensions: 0,
+            base_type: None,
+            kind: ColumnTypeKind::Builtin,
+            is_builtin_type: false,
+        });
+    };
+    let (_, table_ref) = table_references.find_table_by_internal_id(*table)?;
+    if let crate::schema::Table::FromClauseSubquery(subquery) = table_ref {
+        if let translate::plan::Plan::Select(plan) = subquery.plan.as_ref() {
+            if let Some(result_column) = plan.result_columns.get(*column_idx) {
+                return expression_type_info(&result_column.expr, &plan.table_references, schema);
+            }
+        }
+    }
+    let table_column = table_ref.get_column_at(*column_idx)?;
+    let declared_name = table_column.ty_str.clone();
+    let array_dimensions = table_column.array_dimensions();
+    let resolved = schema
+        .resolve_type(&declared_name, table_ref.is_strict())
+        .ok()
+        .flatten();
+    // `kind` is computed from the leaf TypeDef in the resolution chain:
+    // STRUCT and UNION are tagged on `TypeDefKind`, DOMAIN is tagged
+    // separately on `TypeDef.is_domain`, and anything else registered
+    // through CREATE TYPE is a Custom. A column whose declared name
+    // does not appear in the type registry is a Builtin.
+    let (base_type, kind, is_builtin_type) = match resolved {
+        Some(resolved) => {
+            let leaf = resolved.leaf();
+            let kind = if leaf.is_struct() {
+                ColumnTypeKind::Struct
+            } else if leaf.is_union() {
+                ColumnTypeKind::Union
+            } else if leaf.is_domain {
+                ColumnTypeKind::Domain
+            } else {
+                ColumnTypeKind::Custom
+            };
+            (
+                Some(resolved.primitive.to_uppercase()),
+                kind,
+                leaf.is_builtin,
+            )
+        }
+        None => (None, ColumnTypeKind::Builtin, false),
+    };
+    Some(ColumnTypeInfo {
+        declared_name,
+        array_dimensions,
+        base_type,
+        kind,
+        is_builtin_type,
+    })
 }
 
 pub struct Statement {
@@ -1275,76 +1367,12 @@ impl Statement {
         let Some(column) = self.program.result_columns.get(idx) else {
             return Ok(None);
         };
-        // Direct table-column reference: pull declared name, array depth, and
-        // any registered CREATE TYPE / CREATE DOMAIN resolution out of the
-        // schema. Anything else falls through to the expression-affinity
-        // inference path below.
-        if let turso_parser::ast::Expr::Column {
-            table,
-            column: column_idx,
-            ..
-        } = &column.expr
-        {
-            let Some((_, table_ref)) = self
-                .program
-                .table_references
-                .find_table_by_internal_id(*table)
-            else {
-                return Ok(None);
-            };
-            let Some(table_column) = table_ref.get_column_at(*column_idx) else {
-                return Ok(None);
-            };
-            let declared_name = table_column.ty_str.clone();
-            let array_dimensions = table_column.array_dimensions();
-            let schema = self.program.connection.schema.read();
-            let resolved = schema
-                .resolve_type(&declared_name, table_ref.is_strict())
-                .ok()
-                .flatten();
-            // `kind` is computed from the leaf TypeDef in the resolution chain:
-            // STRUCT and UNION are tagged on `TypeDefKind`, DOMAIN is tagged
-            // separately on `TypeDef.is_domain`, and anything else registered
-            // through CREATE TYPE is a Custom. A column whose declared name
-            // does not appear in the type registry is a Builtin.
-            let (base_type, kind) = match resolved {
-                Some(resolved) => {
-                    let leaf = resolved.leaf();
-                    let kind = if leaf.is_struct() {
-                        ColumnTypeKind::Struct
-                    } else if leaf.is_union() {
-                        ColumnTypeKind::Union
-                    } else if leaf.is_domain {
-                        ColumnTypeKind::Domain
-                    } else {
-                        ColumnTypeKind::Custom
-                    };
-                    (Some(resolved.primitive.to_uppercase()), kind)
-                }
-                None => (None, ColumnTypeKind::Builtin),
-            };
-            drop(schema);
-            return Ok(Some(ColumnTypeInfo {
-                declared_name,
-                array_dimensions,
-                base_type,
-                kind,
-            }));
-        }
-        // Not a table column: infer the result primitive from the
-        // expression's shape (literal value type, operand types of a binary
-        // op, the CAST target, etc.).
-        let Some(name) =
-            infer_expression_primitive(&column.expr, Some(&self.program.table_references))
-        else {
-            return Ok(None);
-        };
-        Ok(Some(ColumnTypeInfo {
-            declared_name: name.to_string(),
-            array_dimensions: 0,
-            base_type: None,
-            kind: ColumnTypeKind::Builtin,
-        }))
+        let schema = self.program.connection.schema.read();
+        Ok(expression_type_info(
+            &column.expr,
+            &self.program.table_references,
+            &schema,
+        ))
     }
 
     /// Returns the type affinity name of a result column (e.g., "INTEGER", "TEXT", "REAL", "BLOB", "NUMERIC").

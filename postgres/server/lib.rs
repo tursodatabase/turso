@@ -319,8 +319,15 @@ fn resolve_pg_type_for_column(stmt: &turso_core::Statement, idx: usize) -> Type 
         _ => {
             // Prefer the declared name (the user-visible type), then fall
             // back to the resolved base for custom/domain types whose
-            // declared name isn't in the lookup table.
-            let mapped = sqlite_type_to_pg_type(&info.declared_name);
+            // declared name isn't in the lookup table. A user type of an
+            // older file can have the name of a built-in pg_ type.
+            let names_builtin_type =
+                info.is_builtin_type || !info.declared_name.to_lowercase().starts_with("pg_");
+            let mapped = if names_builtin_type {
+                sqlite_type_to_pg_type(&info.declared_name)
+            } else {
+                Type::TEXT
+            };
             if mapped == Type::TEXT {
                 info.base_type
                     .as_deref()
@@ -620,6 +627,13 @@ fn sqlite_type_to_pg_type(type_str: &str) -> Type {
         "CIDR" => Type::CIDR,
         "MACADDR" => Type::MACADDR,
         "MACADDR8" => Type::MACADDR8,
+        "PG_INT4" => Type::INT4,
+        "PG_INT8" => Type::INT8,
+        "PG_TIMESTAMP" => Type::TIMESTAMP,
+        "PG_TIMESTAMPTZ" => Type::TIMESTAMPTZ,
+        "PG_DATE" => Type::DATE,
+        "PG_TIME" => Type::TIME,
+        "PG_NUMERIC" => Type::NUMERIC,
         _ => {
             // Handle parameterized types like varchar(50), numeric(10,2)
             if upper.starts_with("VARCHAR") || upper.starts_with("CHAR") {
@@ -873,8 +887,102 @@ mod tests {
         assert_eq!(sqlite_type_to_pg_type("JSON"), Type::JSON);
         assert_eq!(sqlite_type_to_pg_type("JSONB"), Type::JSONB);
         assert_eq!(sqlite_type_to_pg_type("UUID"), Type::UUID);
+        assert_eq!(sqlite_type_to_pg_type("pg_int4"), Type::INT4);
+        assert_eq!(sqlite_type_to_pg_type("pg_int8"), Type::INT8);
+        assert_eq!(sqlite_type_to_pg_type("pg_timestamp"), Type::TIMESTAMP);
+        assert_eq!(sqlite_type_to_pg_type("pg_timestamptz"), Type::TIMESTAMPTZ);
+        assert_eq!(sqlite_type_to_pg_type("pg_date"), Type::DATE);
+        assert_eq!(sqlite_type_to_pg_type("pg_time"), Type::TIME);
+        assert_eq!(sqlite_type_to_pg_type("pg_numeric"), Type::NUMERIC);
         // Unknown types map to TEXT
         assert_eq!(sqlite_type_to_pg_type("UNKNOWN"), Type::TEXT);
+    }
+
+    fn open_postgres(
+        io: std::sync::Arc<dyn turso_core::IO>,
+        path: &str,
+    ) -> std::sync::Arc<turso_core::Connection> {
+        turso_pg::open_database_with_io(
+            io,
+            path,
+            turso_core::OpenFlags::default(),
+            turso_core::DatabaseOpts::new().with_custom_types(true),
+        )
+        .unwrap()
+        .connect()
+        .unwrap()
+    }
+
+    fn result_types(conn: &std::sync::Arc<turso_core::Connection>, sql: &str) -> Vec<Type> {
+        let stmt = conn.prepare(sql).unwrap();
+        (0..stmt.num_columns())
+            .map(|idx| resolve_pg_type_for_column(&stmt, idx))
+            .collect()
+    }
+
+    /// New tables store dates, times and small numerics as integers and
+    /// show text. A column of a subquery, a CTE or a view keeps the type of
+    /// the table column, and arithmetic on a numeric is not an integer.
+    #[test]
+    fn result_types_of_columns_that_store_integers() {
+        let conn = open_postgres(std::sync::Arc::new(turso_core::MemoryIO::new()), ":memory:");
+        conn.execute(
+            "CREATE TABLE ev (id int PRIMARY KEY, ts timestamp, tz timestamptz, d date, \
+             t time, n numeric(10,2), b bigint)",
+        )
+        .unwrap();
+        conn.execute("CREATE VIEW v AS SELECT t, b FROM ev")
+            .unwrap();
+        assert_eq!(
+            result_types(&conn, "SELECT ts, tz, d, t, n, b FROM ev"),
+            [
+                Type::TIMESTAMP,
+                Type::TIMESTAMPTZ,
+                Type::DATE,
+                Type::TIME,
+                Type::NUMERIC,
+                Type::INT8
+            ]
+        );
+        assert_eq!(
+            result_types(&conn, "SELECT x.ts, x.n FROM (SELECT ts, n FROM ev) x"),
+            [Type::TIMESTAMP, Type::NUMERIC]
+        );
+        assert_eq!(
+            result_types(
+                &conn,
+                "WITH c AS (SELECT d, tz FROM ev) SELECT d, tz FROM c"
+            ),
+            [Type::DATE, Type::TIMESTAMPTZ]
+        );
+        assert_eq!(
+            result_types(&conn, "SELECT t, b FROM v"),
+            [Type::TIME, Type::INT8]
+        );
+        assert_eq!(
+            result_types(&conn, "SELECT n * 2, -n, n + b, max(ts) FROM ev"),
+            [Type::FLOAT8, Type::FLOAT8, Type::FLOAT8, Type::TEXT]
+        );
+    }
+
+    /// A file of an older version can have a user type named pg_date. Its
+    /// column is not a date column.
+    #[test]
+    fn result_type_of_a_user_type_with_a_built_in_name() {
+        let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../tests/integration/postgres/fixtures/pg_v1/pg_v1_pg_prefix_type.db");
+        let path =
+            std::env::temp_dir().join(format!("pg_v1_pg_prefix_type-{}.db", std::process::id()));
+        std::fs::copy(fixture, &path).unwrap();
+        let conn = open_postgres(
+            std::sync::Arc::new(turso_core::PlatformIO::new().unwrap()),
+            path.to_str().unwrap(),
+        );
+        assert_eq!(result_types(&conn, "SELECT x FROM pd"), [Type::TEXT]);
+        drop(conn);
+        for suffix in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(format!("{}{suffix}", path.display()));
+        }
     }
 
     #[test]

@@ -58,7 +58,7 @@ fn new_tables_store_sql_that_both_dialects_load(db: TempDatabase) {
         core_rows(&conn, "SELECT sql FROM sqlite_schema WHERE name = 't'"),
         [
             "CREATE TABLE t (id INTEGER PRIMARY KEY DEFAULT (nextval ('t_id_seq')), \
-          a bigint UNIQUE, n numeric (10, 2) DEFAULT 1.5, ts timestamp, d TEXT[] DEFAULT '{}', \
+          a pg_int8 UNIQUE, n pg_numeric (10, 2) DEFAULT 1.5, ts pg_timestamp, d TEXT[] DEFAULT '{}', \
           m mood, p posint, v varchar (10) CHECK (length (v) > 1), b boolean DEFAULT 1, \
           UNIQUE (a, n)) STRICT, PGSTORAGE"
         ]
@@ -278,6 +278,14 @@ fn catalog_shows_postgres_ddl_and_defaults_of_new_tables(db: TempDatabase) {
             "CREATE TABLE \"MixedT\" (id serial PRIMARY KEY, \"Value\" text)",
             "mixedt|CREATE TABLE \"MixedT\" (id serial PRIMARY KEY, \"Value\" text)",
         ),
+        (
+            "CREATE TABLE g (d date DEFAULT '2024-01-01'::date, tz timestamptz, tm time, \
+             big bigint, t text CHECK (t::date > '2020-01-01' AND t::time < '23:00'), \
+             CHECK (t::timestamptz > '2000-01-01'))",
+            "g|CREATE TABLE g (d date DEFAULT (CAST ('2024-01-01' AS date)), tz timestamptz, \
+             tm time, big bigint, t text CHECK (CAST (t AS date) > '2020-01-01' \
+             AND CAST (t AS time) < '23:00'), CHECK (CAST (t AS timestamptz) > '2000-01-01'))",
+        ),
     ];
     for (create, _) in tables {
         conn.execute(create).unwrap();
@@ -285,7 +293,7 @@ fn catalog_shows_postgres_ddl_and_defaults_of_new_tables(db: TempDatabase) {
     let ddl: Vec<String> = rows(
         &conn,
         "SELECT table_name, ddl FROM pg_get_tabledef \
-         WHERE table_name IN ('c', 'f', 'mixedt') ORDER BY table_name",
+         WHERE table_name IN ('c', 'f', 'g', 'mixedt') ORDER BY table_name",
     );
     let mut expected: Vec<&str> = tables.iter().map(|(_, ddl)| *ddl).collect();
     expected.sort();
@@ -402,7 +410,7 @@ fn rename_column_of_a_parent_keeps_the_child_table(db: TempDatabase) {
         ),
         [
             "CREATE TABLE child (id INTEGER PRIMARY KEY, pid INTEGER REFERENCES parent (pkey), \
-          ts timestamp DEFAULT (now ())) STRICT, PGSTORAGE"
+          ts pg_timestamp DEFAULT (now ())) STRICT, PGSTORAGE"
         ]
     );
     assert_eq!(

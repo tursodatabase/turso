@@ -480,3 +480,106 @@ fn user_type_with_pg_prefix_of_base_file_still_works() {
         ["1|a|NULL", "2|b|NULL"]
     );
 }
+
+/// New tables store timestamps, dates, times, numerics and bigints as
+/// integers. Their values equal the values of the base file, also in joins
+/// with and without an index.
+#[test]
+fn new_tables_join_tables_of_base_file() {
+    let dir = copy_fixtures(&[MAIN]);
+    let db = open(dir.path().join(MAIN), false);
+    let conn = db.connect_postgres();
+    conn.execute(
+        "CREATE TABLE fresh (id int PRIMARY KEY, bi bigint, n numeric(10,2), d date, \
+         tm time, ts timestamp, tz timestamptz)",
+    )
+    .unwrap();
+    conn.execute("INSERT INTO fresh SELECT id, bi, n, d, tm, ts, tz FROM all_types")
+        .unwrap();
+    assert_eq!(
+        core_rows(
+            conn.inner(),
+            "SELECT sql FROM sqlite_schema WHERE name = 'fresh'"
+        ),
+        [
+            "CREATE TABLE fresh (id INTEGER PRIMARY KEY, bi pg_int8, n pg_numeric (10, 2), \
+          d pg_date, tm pg_time, ts pg_timestamp, tz pg_timestamptz) STRICT, PGSTORAGE"
+        ]
+    );
+    let columns = "id, bi, n, d, tm, ts, tz";
+    assert_eq!(
+        rows(&conn, &format!("SELECT {columns} FROM fresh ORDER BY id")),
+        rows(
+            &conn,
+            &format!("SELECT {columns} FROM all_types ORDER BY id")
+        )
+    );
+    for column in ["bi", "n", "d", "tm", "ts", "tz"] {
+        let join =
+            format!("SELECT count(*) FROM all_types a JOIN fresh f ON f.{column} = a.{column}");
+        let reverse =
+            format!("SELECT count(*) FROM fresh f JOIN all_types a ON a.{column} = f.{column}");
+        assert_eq!(rows(&conn, &join), ["2"], "{column}");
+        conn.execute(format!("CREATE INDEX fresh_{column} ON fresh ({column})"))
+            .unwrap();
+        assert_eq!(rows(&conn, &join), ["2"], "{column} with an index");
+        assert_eq!(rows(&conn, &reverse), ["2"], "{column} with an index");
+    }
+    assert_eq!(core_rows(conn.inner(), "PRAGMA integrity_check"), ["ok"]);
+}
+
+/// A user type of the base file has the name of the built-in type pg_date.
+/// The tables of the file keep the user type, and a cast to date still gives
+/// a date. A new table cannot use the built-in type until the user type is
+/// dropped.
+#[test]
+fn user_type_with_built_in_name_of_base_file_hides_the_built_in_type() {
+    let dir = copy_fixtures(&["pg_v1_pg_prefix_type.db"]);
+    let db = open(dir.path().join("pg_v1_pg_prefix_type.db"), false);
+    let conn = db.connect_postgres();
+    assert_eq!(
+        rows(&conn, "SELECT '2024-01-01 10:00'::date"),
+        ["2024-01-01"]
+    );
+    let err = conn.execute("CREATE TABLE n (d date)").unwrap_err();
+    assert!(
+        err.to_string()
+            .contains("column n.d needs the built-in type pg_date, but a user type of this database has that name"),
+        "{err}"
+    );
+    conn.execute("CREATE TABLE n (ts timestamp)").unwrap();
+    conn.execute("ALTER TABLE pd ADD COLUMN note text").unwrap();
+    assert_eq!(
+        rows(
+            &conn,
+            "SELECT atttypid FROM pg_attribute WHERE attname = 'x'"
+        ),
+        ["25"]
+    );
+    assert_eq!(
+        rows(
+            &conn,
+            "SELECT ddl FROM pg_get_tabledef WHERE table_name IN ('pd', 'none')"
+        ),
+        ["CREATE TABLE pd (id integer PRIMARY KEY, x pg_date, note text)"]
+    );
+    conn.inner().execute("VACUUM").unwrap();
+    assert_eq!(rows(&conn, "SELECT id, x FROM pd"), ["1|a"]);
+    conn.execute("DROP TABLE pd").unwrap();
+    conn.execute("DROP TYPE pg_date").unwrap();
+    conn.execute("CREATE TABLE n2 (d date)").unwrap();
+    conn.execute("INSERT INTO n2 VALUES ('2024-01-01 10:00')")
+        .unwrap();
+    assert_eq!(rows(&conn, "SELECT d FROM n2"), ["2024-01-01"]);
+    drop(conn);
+    let db = db.reopen();
+    let conn = db.connect_postgres();
+    assert_eq!(rows(&conn, "SELECT d FROM n2"), ["2024-01-01"]);
+    assert_eq!(
+        core_rows(
+            conn.inner(),
+            "SELECT sql FROM sqlite_schema WHERE name = 'n2'"
+        ),
+        ["CREATE TABLE n2 (d pg_date) STRICT, PGSTORAGE"]
+    );
+}

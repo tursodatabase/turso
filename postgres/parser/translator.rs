@@ -2199,6 +2199,23 @@ impl PostgreSQLTranslator {
                     ParseError::ParseError("TypeCast missing inner expression".into())
                 })?;
                 let expr = Box::new(self.translate_expr(arg)?);
+                if let Some(function) = type_cast
+                    .type_name
+                    .as_ref()
+                    .and_then(|type_name| pg_cast_function(type_name, self.type_mapping))
+                {
+                    return Ok(ast::Expr::FunctionCall {
+                        name: ast::Name::from_string(function),
+                        distinctness: None,
+                        args: vec![expr],
+                        order_by: vec![],
+                        within_group: vec![],
+                        filter_over: ast::FunctionTail {
+                            filter_clause: None,
+                            over_clause: None,
+                        },
+                    });
+                }
                 let type_name = type_cast
                     .type_name
                     .as_ref()
@@ -3959,7 +3976,7 @@ impl PostgreSQLTranslator {
             .as_ref()
             .ok_or_else(|| ParseError::ParseError("CREATE DOMAIN missing base type".into()))?;
         let pg_type = extract_type_name_from_typename(type_name_node)?;
-        let base_type = match map_pg_type(&pg_type, &[], self.type_mapping) {
+        let base_type = match map_pg_type(&pg_type, &[], DOMAIN_BASE_TYPE_MAPPING) {
             Some(mapping) => mapping.type_name,
             None => pg_type, // custom type or domain — pass through
         };
@@ -4133,9 +4150,53 @@ fn is_serial_type(pg_type: &str) -> bool {
 /// with `array_dimensions > 0` so native Turso arrays are used.
 fn map_pg_type(pg_type: &str, params: &[i64], mapping: TypeMapping) -> Option<PgTypeMapping> {
     match mapping {
-        TypeMapping::V1 | TypeMapping::V2 => map_pg_type_v1(pg_type, params),
+        TypeMapping::V1 => map_pg_type_v1(pg_type, params),
+        TypeMapping::V2 => map_pg_type_v2(pg_type, params),
     }
 }
+
+/// The mapping of `TypeMapping::V2`. Timestamps, dates, times, bigints and
+/// numerics with a precision of at most 18 get built-in types that store
+/// integers. The integer and serial types keep the `INTEGER` of `V1`, which
+/// can be a rowid alias. Arrays and every other type keep the mapping of `V1`.
+fn map_pg_type_v2(pg_type: &str, params: &[i64]) -> Option<PgTypeMapping> {
+    if pg_type.ends_with("[]") || pg_type.starts_with('_') {
+        return map_pg_type_v1(pg_type, params);
+    }
+    let type_name = match pg_type.to_uppercase().as_str() {
+        "BIGINT" | "INT8" => "pg_int8",
+        "TIMESTAMP" => "pg_timestamp",
+        "TIMESTAMPTZ" => "pg_timestamptz",
+        "DATE" => "pg_date",
+        "TIME" => "pg_time",
+        "NUMERIC" | "DECIMAL" => {
+            let (precision, scale) = match params {
+                [precision, scale] => (*precision, *scale),
+                [precision] => (*precision, 0),
+                _ => return map_pg_type_v1(pg_type, params),
+            };
+            if (1..=PG_NUMERIC_MAX_PRECISION).contains(&precision)
+                && (0..=precision).contains(&scale)
+            {
+                return Some(PgTypeMapping::with_params(
+                    "pg_numeric",
+                    vec![precision, scale],
+                ));
+            }
+            return map_pg_type_v1(pg_type, params);
+        }
+        _ => return map_pg_type_v1(pg_type, params),
+    };
+    Some(PgTypeMapping::scalar(type_name))
+}
+
+/// The largest precision of a numeric that the stored integer of `pg_numeric`
+/// can hold.
+const PG_NUMERIC_MAX_PRECISION: i64 = 18;
+
+/// A domain keeps the base types of `V1`: a domain CHECK reads the stored
+/// value, and the built-in types of `V2` store integers.
+const DOMAIN_BASE_TYPE_MAPPING: TypeMapping = TypeMapping::V1;
 
 /// The mapping of `TypeMapping::V1`. Tables in existing files depend on it:
 /// never change it.
@@ -4316,6 +4377,38 @@ fn translate_create_enum(
             default: None,
         },
     })
+}
+
+/// `TypeMapping::V2` casts to timestamp, timestamptz, date and time call the
+/// function of the built-in type, which gives the value that a column of the
+/// type shows. A version that does not have the function refuses SQL that
+/// stores such a cast, for example the WHERE clause of a partial index.
+fn pg_cast_function(
+    type_name: &pg_query::protobuf::TypeName,
+    mapping: TypeMapping,
+) -> Option<&'static str> {
+    use pg_query::protobuf::node::Node;
+
+    if mapping == TypeMapping::V1 || !type_name.array_bounds.is_empty() {
+        return None;
+    }
+    let mut parts = type_name
+        .names
+        .iter()
+        .filter_map(|name_node| match &name_node.node {
+            Some(Node::String(s)) if s.sval != "pg_catalog" => Some(s.sval.as_str()),
+            _ => None,
+        });
+    let (Some(name), None) = (parts.next(), parts.next()) else {
+        return None;
+    };
+    match name.to_uppercase().as_str() {
+        "TIMESTAMP" => Some("pg_timestamp"),
+        "TIMESTAMPTZ" => Some("pg_timestamptz"),
+        "DATE" => Some("pg_date"),
+        "TIME" => Some("pg_time"),
+        _ => None,
+    }
 }
 
 /// Convert a pg_query TypeName to a Turso AST Type for use in CAST expressions.
@@ -5123,7 +5216,7 @@ mod tests {
             if let ast::CreateTableBody::ColumnsAndConstraints { columns, .. } = body {
                 let col = &columns[0];
                 let col_type = col.col_type.as_ref().unwrap();
-                assert_eq!(col_type.name, "numeric");
+                assert_eq!(col_type.name, "pg_numeric");
                 assert!(
                     matches!(col_type.size, Some(ast::TypeSize::TypeSize(_, _))),
                     "expected TypeSize, got {:?}",
@@ -7557,5 +7650,56 @@ mod tests {
             "CREATE TABLE t (id INTEGER PRIMARY KEY DEFAULT (nextval ('t_id_seq')), a TEXT) STRICT, PGSTORAGE",
         ];
         assert_eq!(translated, expected);
+    }
+
+    /// New tables store timestamps, dates, times, bigints and numerics with a
+    /// precision of at most 18 as integers. A cast to a date or time type
+    /// calls the function of the built-in type.
+    #[test]
+    fn new_tables_use_the_v2_translation() {
+        let corpus = [
+            "CREATE TABLE t (a boolean, c smallint, e bigint, f int8, h date, i time, j timetz, \
+             k timestamp, l timestamptz, k3 timestamp(3), l6 time(6))",
+            "CREATE TABLE t (d numeric(10,2), e numeric(5), f decimal, g numeric(18,18), \
+             h numeric(19,2), i numeric(5,6))",
+            "CREATE TABLE t (a timestamp[], b date[], c numeric(10,2)[], d int8[], e _date)",
+            "CREATE TABLE t (id bigint PRIMARY KEY, a serial, b bigserial, c integer)",
+            "CREATE TABLE t (a text CHECK (a::date <> '2024-01-01'), b timestamp DEFAULT '2024-01-01'::timestamp, \
+             c text CHECK (c::timetz > '10:00' AND c::timestamptz > timestamp '2000-01-01'))",
+        ];
+        let translated: Vec<String> = corpus
+            .iter()
+            .map(|ddl| {
+                let parse_result = crate::parse(ddl).unwrap();
+                let ast::Stmt::CreateTable { tbl_name, body, .. } = PostgreSQLTranslator::new()
+                    .translate(&parse_result)
+                    .unwrap()
+                else {
+                    panic!("not a CREATE TABLE: {ddl}");
+                };
+                format!("CREATE TABLE {} {body}", tbl_name.name.as_ident())
+            })
+            .collect();
+        let expected = [
+            "CREATE TABLE t (a boolean, c smallint, e pg_int8, f pg_int8, h pg_date, i pg_time, j time, k pg_timestamp, l pg_timestamptz, k3 pg_timestamp, l6 pg_time) STRICT, PGSTORAGE",
+            "CREATE TABLE t (d pg_numeric (10, 2), e pg_numeric (5, 0), f REAL, g pg_numeric (18, 18), h numeric (19, 2), i numeric (5, 6)) STRICT, PGSTORAGE",
+            "CREATE TABLE t (a timestamp[], b date[], c numeric (10, 2)[], d bigint[], e date[]) STRICT, PGSTORAGE",
+            "CREATE TABLE t (id pg_int8 PRIMARY KEY, a INTEGER NOT NULL DEFAULT (nextval ('t_a_seq')), b INTEGER NOT NULL DEFAULT (nextval ('t_b_seq')), c INTEGER) STRICT, PGSTORAGE",
+            "CREATE TABLE t (a TEXT CHECK (pg_date (a) != '2024-01-01'), b pg_timestamp DEFAULT (pg_timestamp ('2024-01-01')), c TEXT CHECK (CAST (c AS time) > '10:00' AND pg_timestamptz (c) > pg_timestamp ('2000-01-01'))) STRICT, PGSTORAGE",
+        ];
+        assert_eq!(translated, expected);
+    }
+
+    #[test]
+    fn domains_keep_the_v1_base_types() {
+        let parse_result =
+            crate::parse("CREATE DOMAIN d AS timestamp CHECK (VALUE > '2020-01-01')").unwrap();
+        let ast::Stmt::CreateDomain { base_type, .. } = PostgreSQLTranslator::new()
+            .translate(&parse_result)
+            .unwrap()
+        else {
+            panic!("not a CREATE DOMAIN");
+        };
+        assert_eq!(base_type, "timestamp");
     }
 }

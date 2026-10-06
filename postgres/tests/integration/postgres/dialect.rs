@@ -3590,10 +3590,10 @@ fn test_postgres_numeric_equality_with_bound_parameter_same_rows_with_and_withou
         ))
         .unwrap();
     }
-    for (param, turso_count) in [
-        (Value::from_f64(1.5), 0),
-        (Value::from_text("12.25".to_owned()), 1),
-        (Value::from_i64(-2), 0),
+    for param in [
+        Value::from_f64(1.5),
+        Value::from_text("12.25".to_owned()),
+        Value::from_i64(-2),
     ] {
         let count = |table: &str| {
             rows_with_param(
@@ -3605,10 +3605,9 @@ fn test_postgres_numeric_equality_with_bound_parameter_same_rows_with_and_withou
         assert_eq!(count("pa"), count("pa_plain"), "for {param:?}");
         assert_eq!(
             count("pa"),
-            vec![vec![Value::from_i64(turso_count)]],
-            "for {param:?}: a parameter compares with the text of the column and is not cast \
-             to numeric, so only the text '12.25' finds its row (PostgreSQL finds one row for \
-             each parameter)"
+            vec![vec![Value::from_i64(1)]],
+            "for {param:?}: numeric(10,2) stores an integer, so the comparison reads the \
+             column as a number, and each parameter finds its row as in PostgreSQL"
         );
     }
 }

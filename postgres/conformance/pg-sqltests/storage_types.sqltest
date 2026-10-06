@@ -1,0 +1,183 @@
+# Values of the column types that new tables store as integers: timestamp,
+# timestamptz, date, time, bigint and numeric(p, s) with p <= 18. Coverage
+# here asserts behavior that real PostgreSQL also exhibits (with the session
+# time zone UTC).
+
+@database :memory:
+
+setup events {
+    CREATE TABLE ev (id int PRIMARY KEY, ts timestamp, tz timestamptz, d date, t time);
+    CREATE INDEX ev_ts ON ev (ts);
+    CREATE INDEX ev_d ON ev (d);
+    CREATE TABLE ev_plain (id int PRIMARY KEY, ts timestamp, tz timestamptz, d date, t time);
+    INSERT INTO ev VALUES
+        (1, '2024-01-01 00:00:00', '2024-01-01 10:00:00+02', '2024-01-01', '00:00:00'),
+        (2, '2024-01-01 10:30:00.25', '2024-01-01T10:30:00Z', '2024-01-05', '10:30'),
+        (3, '2024-01-02 08:00:00.123456', '2024-01-02 08:00:00-05:30', '2024-01-31 23:00', '23:59:59.999999'),
+        (4, '1999-12-31 23:59:59', '1999-12-31', '1999-12-31', '24:00:00'),
+        (5, NULL, NULL, NULL, NULL);
+    INSERT INTO ev_plain SELECT * FROM ev;
+}
+
+setup amounts {
+    CREATE TABLE price (id int PRIMARY KEY, amount numeric(10,2), big bigint);
+    CREATE INDEX price_amount ON price (amount);
+    CREATE TABLE price_plain (id int PRIMARY KEY, amount numeric(10,2), big bigint);
+    INSERT INTO price VALUES (1, 12.5, 9000000000), (2, '-0.005', -5), (3, 1.005, 0), (4, 99999999.99, NULL), (5, -12, 7);
+    INSERT INTO price_plain SELECT * FROM price;
+}
+
+@setup events
+test temporal-values-keep-microseconds {
+    SELECT id, ts, tz, d, t FROM ev ORDER BY id;
+}
+expect {
+    1|2024-01-01 00:00:00|2024-01-01 08:00:00+00|2024-01-01|00:00:00
+    2|2024-01-01 10:30:00.25|2024-01-01 10:30:00+00|2024-01-05|10:30:00
+    3|2024-01-02 08:00:00.123456|2024-01-02 13:30:00+00|2024-01-31|23:59:59.999999
+    4|1999-12-31 23:59:59|1999-12-31 00:00:00+00|1999-12-31|24:00:00
+    5||||
+}
+
+@setup events
+test temporal-order-and-min-max {
+    SELECT id FROM ev WHERE ts IS NOT NULL ORDER BY ts DESC;
+    SELECT min(ts), max(t), min(d) FROM ev;
+}
+expect {
+    3
+    2
+    1
+    4
+    1999-12-31 23:59:59|24:00:00|1999-12-31
+}
+
+@setup events
+test timestamp-range-with-date-bound-same-rows-with-and-without-index {
+    SELECT id FROM ev WHERE ts >= '2024-01-01' AND ts < '2024-01-02' ORDER BY id;
+    SELECT id FROM ev_plain WHERE ts >= '2024-01-01' AND ts < '2024-01-02' ORDER BY id;
+}
+expect {
+    1
+    2
+    1
+    2
+}
+
+@setup events
+test date-range-same-rows-with-and-without-index {
+    SELECT id FROM ev WHERE d BETWEEN '2024-01-01' AND '2024-01-05' ORDER BY id;
+    SELECT id FROM ev_plain WHERE d BETWEEN '2024-01-01' AND '2024-01-05' ORDER BY id;
+}
+expect {
+    1
+    2
+    1
+    2
+}
+
+@setup events
+test cast-literal-finds-rows-with-and-without-index {
+    SELECT id FROM ev WHERE ts = '2024-01-01'::timestamp;
+    SELECT id FROM ev_plain WHERE ts = '2024-01-01'::timestamp;
+    SELECT id FROM ev WHERE d = '2024-01-31 23:00'::date;
+    SELECT id FROM ev WHERE t = '10:30'::time;
+}
+expect {
+    1
+    1
+    3
+    2
+}
+
+test temporal-casts-give-the-text-of-the-type {
+    SELECT '2024-01-01'::timestamp, '2024-01-01 10:00:00.120'::timestamp, '2024-01-01 10:00'::date, '10:00:00.50'::time;
+}
+expect {
+    2024-01-01 00:00:00|2024-01-01 10:00:00.12|2024-01-01|10:00:00.5
+}
+
+test timestamp-input-error {
+    CREATE TABLE bad_ts (ts timestamp);
+    INSERT INTO bad_ts VALUES ('not a timestamp');
+}
+expect error {
+    invalid input syntax for type timestamp: "not a timestamp"
+}
+
+test date-input-error {
+    CREATE TABLE bad_d (d date);
+    INSERT INTO bad_d VALUES ('2024-02-30');
+}
+expect error {
+    date/time field value out of range: "2024-02-30"
+}
+
+@setup amounts
+test numeric-rounds-half-away-from-zero {
+    SELECT id, amount, big FROM price ORDER BY id;
+}
+expect {
+    1|12.50|9000000000
+    2|-0.01|-5
+    3|1.01|0
+    4|99999999.99|
+    5|-12.00|7
+}
+
+@setup amounts
+test numeric-literal-comparisons-same-rows-with-and-without-index {
+    SELECT id FROM price WHERE amount = 1.005;
+    SELECT id FROM price WHERE amount = 1.01;
+    SELECT id FROM price_plain WHERE amount = 1.01;
+    SELECT id FROM price WHERE amount > 1.005 ORDER BY id;
+    SELECT id FROM price_plain WHERE amount > 1.005 ORDER BY id;
+    SELECT count(*) FROM price WHERE amount < 1e12;
+}
+expect {
+    3
+    3
+    1
+    3
+    4
+    1
+    3
+    4
+    5
+}
+
+@setup amounts
+test numeric-order-and-arithmetic {
+    SELECT id FROM price ORDER BY amount;
+    SELECT amount + 1, amount * 2 FROM price WHERE id = 1;
+    SELECT min(amount), max(amount) FROM price;
+}
+expect {
+    5
+    2
+    3
+    1
+    4
+    13.50|25.00
+    -12.00|99999999.99
+}
+
+test numeric-overflow-error {
+    CREATE TABLE bad_n (n numeric(10,2));
+    INSERT INTO bad_n VALUES (99999999.995);
+}
+expect error {
+    numeric field overflow
+}
+
+@setup amounts
+test bigint-range-same-rows-with-and-without-index {
+    SELECT id FROM price WHERE big > 0 ORDER BY big;
+    SELECT id FROM price_plain WHERE big > 0 ORDER BY big;
+}
+expect {
+    5
+    1
+    5
+    1
+}

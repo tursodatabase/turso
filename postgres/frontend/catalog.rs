@@ -230,8 +230,24 @@ fn sqlite_type_to_pg_oid(ty_str: &str) -> i64 {
         "CIDR" => 650,
         "MACADDR" => 829,
         "OID" => 26,
+        "PG_INT4" => 23,
+        "PG_INT8" => 20,
+        "PG_TIMESTAMP" => 1114,
+        "PG_TIMESTAMPTZ" => 1184,
+        "PG_DATE" => 1082,
+        "PG_TIME" => 1083,
+        "PG_NUMERIC" => 1700,
         _ => 25, // default to text
     }
+}
+
+/// A database of an older version can have a user type with the name of a
+/// built-in `pg_` type.
+fn is_user_type_with_builtin_name(schema: &Schema, ty_str: &str) -> bool {
+    ty_str.to_lowercase().starts_with("pg_")
+        && schema
+            .get_type_def_unchecked(ty_str)
+            .is_some_and(|type_def| !type_def.is_builtin)
 }
 
 /// Build a mapping from table name to OID for all user tables.
@@ -749,7 +765,11 @@ impl PgAttributeCursor {
             let columns = table.columns();
             for (i, col) in columns.iter().enumerate() {
                 let col_name = col.name.clone().unwrap_or_default();
-                let type_oid = sqlite_type_to_pg_oid(&col.ty_str);
+                let type_oid = if is_user_type_with_builtin_name(&schema, &col.ty_str) {
+                    25
+                } else {
+                    sqlite_type_to_pg_oid(&col.ty_str)
+                };
                 let attnum = (i + 1) as i64; // 1-based
                 let notnull = if col.notnull() { 1i64 } else { 0i64 };
                 let has_def = if col.default.is_some() { 1i64 } else { 0i64 };
@@ -3313,7 +3333,7 @@ impl PgGetTableDefCursor {
             {
                 Some(StoredTableSql::Postgres(ddl)) => ddl.to_string(),
                 Some(StoredTableSql::Canonical(sql)) if btree_table.is_pg_storage => {
-                    pg_storage_table_ddl(&sql)?
+                    pg_storage_table_ddl(&sql, &schema)?
                 }
                 Some(StoredTableSql::Canonical(sql)) => self.convert_to_postgres_ddl(&sql),
                 None => self.convert_to_postgres_ddl(&btree_table.to_sql()),
@@ -3385,8 +3405,10 @@ impl PgGetTableDefCursor {
 /// text of the user DDL. A serial, bigserial and smallserial column are all
 /// an INTEGER column with the DEFAULT `nextval('<table>_<column>_seq')`, so
 /// they show as `serial`.
-fn pg_storage_table_ddl(sql: &str) -> Result<String> {
-    use turso_parser::ast::{ColumnConstraint, CreateTableBody, Stmt, TableOptions};
+fn pg_storage_table_ddl(sql: &str, schema: &Schema) -> Result<String> {
+    use turso_parser::ast::{
+        ColumnConstraint, CreateTableBody, Stmt, TableConstraint, TableOptions,
+    };
     let Stmt::CreateTable {
         tbl_name, mut body, ..
     } = turso_core::dialect::sqlite::parse_table_sql_ast(sql)?
@@ -3394,12 +3416,20 @@ fn pg_storage_table_ddl(sql: &str) -> Result<String> {
         unreachable!("parse_table_sql_ast returns CREATE TABLE");
     };
     let CreateTableBody::ColumnsAndConstraints {
-        columns, options, ..
+        columns,
+        options,
+        constraints,
     } = &mut body
     else {
         unreachable!("a stored table has columns");
     };
     *options = TableOptions::empty();
+    for constraint in constraints.iter_mut() {
+        if let TableConstraint::Check { expr, source } = &mut constraint.constraint {
+            **expr = postgres_expr(std::mem::take(&mut **expr));
+            *source = None;
+        }
+    }
     for column in columns.iter_mut() {
         let serial_sequence = format!(
             "'{}'",
@@ -3419,18 +3449,25 @@ fn pg_storage_table_ddl(sql: &str) -> Result<String> {
                 matches!(&constraint.constraint, ColumnConstraint::Default(expr)
                     if default_calls_nextval(expr, &serial_sequence))
             });
-        column.constraints.retain_mut(|constraint| {
-            let ColumnConstraint::Default(expr) = &mut constraint.constraint else {
-                return true;
-            };
-            if is_serial {
-                return false;
-            }
-            **expr = postgres_default(std::mem::take(&mut **expr), is_boolean);
-            true
-        });
+        column
+            .constraints
+            .retain_mut(|constraint| match &mut constraint.constraint {
+                ColumnConstraint::Default(_) if is_serial => false,
+                ColumnConstraint::Default(expr) => {
+                    **expr = postgres_default(std::mem::take(&mut **expr), is_boolean);
+                    true
+                }
+                ColumnConstraint::Check { expr, source } => {
+                    **expr = postgres_expr(std::mem::take(&mut **expr));
+                    *source = None;
+                    true
+                }
+                _ => true,
+            });
         if let Some(col_type) = column.col_type.as_mut() {
-            col_type.name = postgres_type_name(&col_type.name, is_serial).to_string();
+            if !is_user_type_with_builtin_name(schema, &col_type.name) {
+                col_type.name = postgres_type_name(&col_type.name, is_serial).to_string();
+            }
         }
         column.col_name = postgres_name(&column.col_name);
     }
@@ -3476,22 +3513,39 @@ fn postgres_default(expr: turso_parser::ast::Expr, is_boolean: bool) -> turso_pa
         Expr::Literal(Literal::Numeric(number)) if is_boolean && number == "1" => {
             Expr::Literal(Literal::True)
         }
-        expr => with_array_literals(expr),
+        expr => postgres_expr(expr),
     }
 }
 
-fn with_array_literals(expr: turso_parser::ast::Expr) -> turso_parser::ast::Expr {
+/// The translation stores `ARRAY[...]` as a call of `array` and a cast to
+/// timestamp, timestamptz, date or time as a call of the function of the
+/// built-in type. PostgreSQL knows neither function.
+fn postgres_expr(expr: turso_parser::ast::Expr) -> turso_parser::ast::Expr {
     use turso_parser::ast::Expr;
     let convert_all = |exprs: Vec<Box<Expr>>| -> Vec<Box<Expr>> {
         exprs
             .into_iter()
-            .map(|expr| Box::new(with_array_literals(*expr)))
+            .map(|expr| Box::new(postgres_expr(*expr)))
             .collect()
     };
     match expr {
         Expr::FunctionCall { name, args, .. } if name.as_str().eq_ignore_ascii_case("array") => {
             Expr::Array {
                 elements: convert_all(args),
+            }
+        }
+        Expr::FunctionCall { name, mut args, .. }
+            if args.len() == 1 && pg_cast_function_type(name.as_str()).is_some() =>
+        {
+            Expr::Cast {
+                expr: Box::new(postgres_expr(*args.remove(0))),
+                type_name: Some(turso_parser::ast::Type {
+                    name: pg_cast_function_type(name.as_str())
+                        .expect("checked above")
+                        .to_string(),
+                    size: None,
+                    array_dimensions: 0,
+                }),
             }
         }
         Expr::FunctionCall {
@@ -3511,15 +3565,42 @@ fn with_array_literals(expr: turso_parser::ast::Expr) -> turso_parser::ast::Expr
         },
         Expr::Parenthesized(exprs) => Expr::Parenthesized(convert_all(exprs)),
         Expr::Cast { expr, type_name } => Expr::Cast {
-            expr: Box::new(with_array_literals(*expr)),
+            expr: Box::new(postgres_expr(*expr)),
             type_name,
         },
         Expr::Binary(lhs, op, rhs) => Expr::Binary(
-            Box::new(with_array_literals(*lhs)),
+            Box::new(postgres_expr(*lhs)),
             op,
-            Box::new(with_array_literals(*rhs)),
+            Box::new(postgres_expr(*rhs)),
         ),
+        Expr::Unary(op, expr) => Expr::Unary(op, Box::new(postgres_expr(*expr))),
+        Expr::Between {
+            lhs,
+            not,
+            start,
+            end,
+        } => Expr::Between {
+            lhs: Box::new(postgres_expr(*lhs)),
+            not,
+            start: Box::new(postgres_expr(*start)),
+            end: Box::new(postgres_expr(*end)),
+        },
+        Expr::InList { lhs, not, rhs } => Expr::InList {
+            lhs: Box::new(postgres_expr(*lhs)),
+            not,
+            rhs: convert_all(rhs),
+        },
         expr => expr,
+    }
+}
+
+fn pg_cast_function_type(function: &str) -> Option<&'static str> {
+    match function.to_ascii_lowercase().as_str() {
+        "pg_timestamp" => Some("timestamp"),
+        "pg_timestamptz" => Some("timestamptz"),
+        "pg_date" => Some("date"),
+        "pg_time" => Some("time"),
+        _ => None,
     }
 }
 
@@ -3530,6 +3611,13 @@ fn postgres_type_name(turso_type: &str, is_serial: bool) -> &str {
         "REAL" => "double precision",
         "TEXT" => "text",
         "BLOB" => "bytea",
+        "PG_INT4" => "integer",
+        "PG_INT8" => "bigint",
+        "PG_TIMESTAMP" => "timestamp",
+        "PG_TIMESTAMPTZ" => "timestamptz",
+        "PG_DATE" => "date",
+        "PG_TIME" => "time",
+        "PG_NUMERIC" => "numeric",
         _ => turso_type,
     }
 }
