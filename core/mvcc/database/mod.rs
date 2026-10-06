@@ -7113,10 +7113,13 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         if let Some(connection) = connection {
             connection.set_mv_tx_for_db(db, None);
         }
-        turso_assert!(matches!(
-            tx.state.load(),
-            TransactionState::Active | TransactionState::Preparing(_)
-        ));
+        let dirty_stamp = match tx.state.load() {
+            TransactionState::Active => None,
+            TransactionState::Preparing(end_ts) => Some(end_ts),
+            other => {
+                unreachable!("rollback_tx requires Active or Preparing, got {other:?}")
+            }
+        };
         tx.state.store(TransactionState::Aborted);
         tracing::trace!("abort(tx_id={})", tx_id);
         self.unlock_commit_lock_if_held(tx);
@@ -7153,6 +7156,9 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
             // the next INSERT without an explicit rowid must choose 4, not reuse 3.
             if restores_rowid {
                 self.bump_rowid_allocator_for_restored_row(&rowid);
+            }
+            if let Some(end_ts) = dirty_stamp {
+                self.unmark_checkpoint_dirty_key_if_stamp(&rowid, end_ts);
             }
         }
         self.dec_live_version_count_approx(removed_versions);
@@ -7769,6 +7775,18 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         self.checkpoint_dirty_keys_for(key)
             .remove(key)
             .map(|entry| entry.value().load(Ordering::Acquire))
+    }
+
+    fn unmark_checkpoint_dirty_key_if_stamp(&self, key: &RowID, stamp: u64) {
+        let Some(actual) = self.unmark_checkpoint_dirty_key(key) else {
+            return;
+        };
+        if actual == stamp {
+            return;
+        }
+        if self.mark_checkpoint_dirty_key(key, actual).is_err() {
+            self.require_checkpoint_full_scan();
+        }
     }
 
     fn checkpoint_dirty_keys_for(
