@@ -29,7 +29,7 @@ pub struct VirtualTable {
     pub(crate) is_droppable: bool,
     /// Whether triggers can read this virtual table.
     /// This permission does not allow writes from triggers.
-    pub(crate) allows_reads_in_triggers: bool,
+    pub(crate) innocuous: bool,
 }
 
 impl VirtualTable {
@@ -81,7 +81,7 @@ impl VirtualTable {
             vtab_type: VirtualTableType::Internal(table),
             vtab_id: 0,
             is_droppable: false,
-            allows_reads_in_triggers: true,
+            innocuous: true,
         })
     }
 
@@ -107,8 +107,7 @@ impl VirtualTable {
             vtab_type,
             vtab_id: 0,
             is_droppable: false,
-            allows_reads_in_triggers: module
-                .is_some_and(|module| module.implementation.allows_reads_in_triggers()),
+            innocuous: module.is_some_and(|module| module.implementation.innocuous()),
         };
         Ok(Arc::new(vtab))
     }
@@ -129,8 +128,7 @@ impl VirtualTable {
             vtab_type,
             vtab_id: VTAB_ID_COUNTER.fetch_add(1, Ordering::Acquire),
             is_droppable: true,
-            allows_reads_in_triggers: module
-                .is_some_and(|module| module.implementation.allows_reads_in_triggers()),
+            innocuous: module.is_some_and(|module| module.implementation.innocuous()),
         };
         Ok(Arc::new(vtab))
     }
