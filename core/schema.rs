@@ -3334,6 +3334,9 @@ pub struct CheckConstraint {
     /// Column name if this is a column-level CHECK constraint (defined inline with the column).
     /// None if this is a table-level CHECK constraint.
     pub column: Option<String>,
+    /// The CHECK of the domain type of `column`. The table SQL does not
+    /// contain it: the domain gives it at every load.
+    pub from_domain: bool,
 }
 
 impl CheckConstraint {
@@ -3348,6 +3351,7 @@ impl CheckConstraint {
             expr: expr.clone(),
             source: source.map(|s| s.to_string()),
             column: column.map(|s| s.to_string()),
+            from_domain: false,
         }
     }
 
@@ -3701,6 +3705,7 @@ impl BTreeTable {
                         expr: *rewritten,
                         source: None,
                         column: Some(col_name.clone()),
+                        from_domain: true,
                     })?;
                 }
             }
@@ -3709,6 +3714,7 @@ impl BTreeTable {
         for col_idx in notnull_cols {
             self.columns[col_idx].set_notnull(true);
         }
+        self.check_constraints.retain(|check| !check.from_domain);
         self.check_constraints.try_extend(new_checks)?;
         Ok(())
     }
@@ -3884,7 +3890,9 @@ impl BTreeTable {
 
             // Add column-level CHECK constraints inline
             for check_constraint in &self.check_constraints {
-                if check_constraint.column.as_deref() == Some(column_name) {
+                if check_constraint.column.as_deref() == Some(column_name)
+                    && !check_constraint.from_domain
+                {
                     sql.push(' ');
                     if let Some(name) = &check_constraint.name {
                         sql.push_str("CONSTRAINT ");

@@ -55,3 +55,26 @@ test alter-add-column-chained-domain-check {
 }
 expect error {
 }
+
+test alter-table-does-not-copy-domain-checks-into-table-sql {
+    CREATE DOMAIN posint AS INTEGER CHECK (value > 0);
+    CREATE TABLE t0(id INTEGER PRIMARY KEY, p posint, x TEXT) STRICT;
+    ALTER TABLE t0 ADD COLUMN a TEXT;
+    ALTER TABLE t0 ADD COLUMN b posint;
+    ALTER TABLE t0 DROP COLUMN x;
+    SELECT sql FROM sqlite_schema WHERE name = 't0';
+}
+expect {
+    CREATE TABLE t0 (id INTEGER PRIMARY KEY, p posint, a TEXT, b posint) STRICT
+}
+
+test alter-table-keeps-domain-checks {
+    CREATE DOMAIN posint AS INTEGER CHECK (value > 0);
+    CREATE TABLE t0(id INTEGER PRIMARY KEY, p posint, x TEXT) STRICT;
+    ALTER TABLE t0 ADD COLUMN b posint;
+    ALTER TABLE t0 DROP COLUMN x;
+    INSERT INTO t0 VALUES (1, 1, -1);
+}
+expect error {
+    CHECK constraint failed
+}
