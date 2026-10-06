@@ -2198,3 +2198,446 @@ test right-join-does-not-reuse-left-cte-cursor {
 expect {
     NULL|NULL|NULL|NULL|200
 }
+
+# The first FULL JOIN gives the middle table a null row. SQLite does not
+# start the later index range when its key comes from that null row.
+@cross-check-integrity
+test full-join-range-seek-stops-on-null-left-key {
+    CREATE TABLE null_range_source(id INTEGER PRIMARY KEY, value REAL);
+    CREATE INDEX null_range_source_value ON null_range_source(value);
+    INSERT INTO null_range_source VALUES(1,-4.0);
+    CREATE TABLE null_range_middle(key REAL NOT NULL);
+
+    SELECT quote(left_row.id), quote(null_range_middle.key),
+           quote(right_row.id)
+      FROM null_range_source AS left_row
+      FULL JOIN null_range_middle ON true
+      FULL JOIN null_range_source AS right_row
+                INDEXED BY null_range_source_value
+        ON null_range_middle.key<=right_row.value
+     ORDER BY left_row.id NULLS FIRST, right_row.id NULLS FIRST;
+}
+expect {
+    NULL|NULL|1
+    1|NULL|NULL
+}
+
+# An INTEGER PRIMARY KEY is normally not null. The first FULL JOIN can still
+# replace it with NULL, so the later range seek must not use it.
+@cross-check-integrity
+test full-join-range-seek-stops-on-null-primary-key {
+    CREATE TABLE null_primary_left(seed INTEGER);
+    INSERT INTO null_primary_left VALUES(1);
+    CREATE TABLE null_primary_middle(id INTEGER PRIMARY KEY);
+    CREATE TABLE null_primary_right(value INTEGER);
+    CREATE INDEX null_primary_right_value ON null_primary_right(value);
+    INSERT INTO null_primary_right VALUES(1);
+
+    SELECT quote(null_primary_left.seed), quote(null_primary_middle.id),
+           quote(null_primary_right.value)
+      FROM null_primary_left
+      FULL JOIN null_primary_middle ON true
+      FULL JOIN null_primary_right INDEXED BY null_primary_right_value
+        ON null_primary_middle.id<=null_primary_right.value
+     ORDER BY null_primary_left.seed NULLS FIRST,
+              null_primary_right.value NULLS FIRST;
+}
+expect {
+    NULL|NULL|1
+    1|NULL|NULL
+}
+
+# The first FULL JOIN can also replace an implicit rowid with NULL. SQLite
+# checks for that NULL before it starts the later rowid range seek.
+@cross-check-integrity
+test full-join-rowid-range-seek-stops-on-null-key {
+    CREATE TABLE null_rowid_left(seed INTEGER);
+    INSERT INTO null_rowid_left VALUES(1);
+    CREATE TABLE null_rowid_middle(value INTEGER);
+    CREATE TABLE null_rowid_right(id INTEGER PRIMARY KEY);
+    INSERT INTO null_rowid_right VALUES(1);
+
+    SELECT quote(null_rowid_left.seed), quote(null_rowid_middle.rowid),
+           quote(null_rowid_right.id)
+      FROM null_rowid_left
+      FULL JOIN null_rowid_middle ON true
+      FULL JOIN null_rowid_right
+        ON null_rowid_middle.rowid<=null_rowid_right.id
+     ORDER BY null_rowid_left.seed NULLS FIRST,
+              null_rowid_right.id NULLS FIRST;
+}
+expect {
+    NULL|NULL|1
+    1|NULL|NULL
+}
+
+# A correlated query has only an outer table reference, not the outer FROM
+# list. It must still know that the FULL JOIN can make the key NULL.
+@cross-check-integrity
+test correlated-range-seek-stops-on-null-outer-key {
+    CREATE TABLE correlated_null_left(id INTEGER);
+    INSERT INTO correlated_null_left VALUES(1);
+    CREATE TABLE correlated_null_middle(key INTEGER NOT NULL);
+    CREATE TABLE correlated_null_values(value INTEGER);
+    CREATE INDEX correlated_null_values_value
+        ON correlated_null_values(value);
+    INSERT INTO correlated_null_values VALUES(2);
+
+    SELECT quote(correlated_null_left.id), (
+               SELECT count(*)
+                 FROM correlated_null_values
+                      INDEXED BY correlated_null_values_value
+                WHERE correlated_null_middle.key<=value
+           )
+      FROM correlated_null_left
+      FULL JOIN correlated_null_middle ON true;
+}
+expect {
+    1|0
+}
+
+# The other tests have few rows, so the matched-rows index fits in one page
+# and its bloom filter rarely gives a false positive. Here 3333 of 6666
+# big_right rows match, so that index spans many pages, and the unmatched-rows
+# pass checks 6666 rowids against it.
+@cross-check-integrity
+test right-and-full-join-with-a-large-matched-rows-index {
+    CREATE TABLE big_left(id INTEGER PRIMARY KEY, v INT);
+    CREATE TABLE big_right(id INTEGER PRIMARY KEY, w INT);
+    WITH RECURSIVE n(i) AS (VALUES(1) UNION ALL SELECT i + 1 FROM n WHERE i < 20000)
+    INSERT INTO big_left SELECT i, i % 7 FROM n WHERE i % 2 = 0;
+    WITH RECURSIVE n(i) AS (VALUES(1) UNION ALL SELECT i + 1 FROM n WHERE i < 20000)
+    INSERT INTO big_right SELECT i, i % 5 FROM n WHERE i % 3 = 0;
+
+    SELECT 'right', count(*), count(big_left.id), count(big_right.id),
+           sum(big_right.id) FILTER (WHERE big_left.id IS NULL)
+      FROM big_left RIGHT JOIN big_right ON big_left.id = big_right.id;
+    SELECT 'full', count(*), count(big_left.id), count(big_right.id),
+           sum(big_left.id) FILTER (WHERE big_right.id IS NULL),
+           sum(big_right.id) FILTER (WHERE big_left.id IS NULL)
+      FROM big_left FULL JOIN big_right ON big_left.id = big_right.id;
+    SELECT 'full-where', count(*), sum(coalesce(big_left.id, big_right.id))
+      FROM big_left FULL JOIN big_right ON big_left.id = big_right.id
+     WHERE coalesce(big_left.v, big_right.w) = 3;
+}
+expect {
+    right|6666|3333|6666|33326667
+    full|13333|10000|6666|66673334|33326667
+    full-where|2095|20943903
+}
+
+# The matrices below are compared against SQLite. ra and rb are the two sides
+# of most joins: both have NULL keys, duplicate keys (ra.k=2, rb.k=3), and rows
+# without a match. rc is a third table with duplicate and NULL keys, and rv is
+# a view over rb. right_full_extra_indexes adds multi-column and expression
+# indexes for the access-path matrices.
+setup right_full_tables {
+    CREATE TABLE ra(id INTEGER PRIMARY KEY, k INT, v INT);
+    CREATE TABLE rb(id INTEGER PRIMARY KEY, k INT, v INT);
+    CREATE TABLE rc(k INT, w TEXT);
+    CREATE INDEX rb_k ON rb(k);
+    CREATE INDEX rc_k ON rc(k);
+    CREATE VIEW rv AS SELECT k, v * 10 AS v10 FROM rb WHERE k IS NOT NULL;
+    INSERT INTO ra VALUES (1, 1, 10), (2, 2, 20), (3, 2, 21), (4, NULL, 40), (5, 5, NULL);
+    INSERT INTO rb VALUES (1, 1, 100), (2, 2, 200), (3, 3, 300), (4, NULL, 400), (5, 3, NULL);
+    INSERT INTO rc VALUES (1, 'c1'), (3, 'c3'), (3, 'c3b'), (6, 'c6'), (NULL, 'cn');
+}
+
+@setup right_full_tables
+@var j { JOIN | LEFT JOIN | RIGHT JOIN | FULL JOIN | CROSS JOIN }
+@var on { ON a.k = b.k | ON a.k = b.k AND b.v > 150 | ON a.k < b.k | ON a.k IS b.k | ON 1 | ON 0 | USING(k) | ON a.k = b.k OR b.k IS NULL }
+@var cols { a.id, b.id, a.k, b.k | a.id, b.id, k, a.v + b.v | a.id, b.id, typeof(b.k), coalesce(a.v, b.v) }
+matrix two-table-join-types-and-conditions {
+    SELECT $cols FROM ra AS a $j rb AS b $on ORDER BY 1, 2, 3, 4;
+}
+
+@setup right_full_tables
+@var lhs { ra AS a | rc AS c }
+@var j { NATURAL JOIN | NATURAL LEFT JOIN | NATURAL RIGHT JOIN | NATURAL FULL JOIN }
+@var rhs { rc AS c2 | ra AS a2 | (SELECT k, w FROM rc) AS s }
+matrix natural-join-types {
+    SELECT * FROM $lhs $j $rhs ORDER BY 1, 2, 3, 4;
+}
+
+@setup right_full_tables
+@var j1 { JOIN | LEFT JOIN | RIGHT JOIN | FULL JOIN }
+@var c1 { ON a.k = b.k | USING(k) }
+@var j2 { JOIN | LEFT JOIN | RIGHT JOIN | FULL JOIN }
+@var c2 { ON b.k = c.k | ON a.k = c.k | USING(k) | ON c.k > coalesce(a.k, b.k) }
+@var cols { a.id, b.id, c.rowid, k | a.id, b.id, c.rowid, c.w | a.id, b.id, c.rowid, a.v + coalesce(b.v, 0) }
+matrix three-table-chains {
+    SELECT $cols FROM ra AS a $j1 rb AS b $c1 $j2 rc AS c $c2 ORDER BY 1, 2, 3, 4;
+}
+
+@setup right_full_tables
+@var j1 { LEFT JOIN | RIGHT JOIN | FULL JOIN }
+@var j2 { LEFT JOIN | RIGHT JOIN | FULL JOIN }
+@var w {
+    1 | a.k IS NULL | b.k IS NULL | c.k IS NULL | a.v > 15 | b.v > 150 | c.w > 'c1' |
+    coalesce(a.k, b.k, c.k) > 1 | a.id IS NOT NULL OR c.k IS NULL | NOT (b.v > 150) |
+    b.v IN (100, 300) | a.k = c.k
+}
+matrix where-terms-and-outer-join-reduction {
+    SELECT a.id, b.id, c.rowid FROM ra AS a $j1 rb AS b ON a.k = b.k $j2 rc AS c ON b.k = c.k
+     WHERE $w ORDER BY 1, 2, 3;
+}
+
+@setup right_full_tables
+@var from {
+    ra AS a RIGHT JOIN rb AS b ON a.id = b.k |
+    ra AS a FULL JOIN rb AS b ON a.id = b.k |
+    ra AS a RIGHT JOIN rb AS b INDEXED BY rb_k ON a.k = b.k |
+    ra AS a FULL JOIN rb AS b NOT INDEXED ON a.k = b.k |
+    ra AS a RIGHT JOIN rc AS c ON c.k = a.k |
+    rc AS c RIGHT JOIN ra AS a ON c.k = a.k |
+    ra AS a RIGHT JOIN rb AS b ON b.k IN (1, 3) AND a.k = b.k |
+    ra AS a RIGHT JOIN rb AS b ON a.k = b.k AND (b.k = 1 OR b.v = 300) |
+    ra AS a FULL JOIN rb AS b ON a.v = b.v / 10 |
+    ra AS a RIGHT JOIN json_each('[1,2,7]') AS j ON j.value = a.k |
+    json_each('[1,2,7]') AS j FULL JOIN ra AS a ON j.value = a.k |
+    ra AS a RIGHT JOIN rv ON rv.k = a.k |
+    ra AS a FULL JOIN (SELECT k, count(*) AS n FROM rb GROUP BY k) AS s ON s.k = a.k |
+    ra AS a RIGHT JOIN rb AS b ON a.k = b.k RIGHT JOIN rc AS c ON c.k = b.k
+}
+@var proj { count(*), total(a.id), count(a.k) | max(a.id), min(a.v), count(DISTINCT a.k) }
+@var w { 1 | a.id IS NULL | a.k > 1 | a.id IS NOT NULL }
+matrix access-paths-under-right-and-full-joins {
+    SELECT $proj FROM $from WHERE $w;
+}
+
+@setup right_full_tables
+@var j { RIGHT JOIN | FULL JOIN }
+@var sel {
+    coalesce(a.k, b.k) AS key, count(*), total(a.v), total(b.v) |
+    DISTINCT a.k IS NULL, b.k IS NULL |
+    a.id, b.id, row_number() OVER (ORDER BY a.id, b.id) |
+    a.id, b.id, sum(b.v) OVER (PARTITION BY a.k IS NULL ORDER BY a.id, b.id) |
+    max(a.id), min(b.id)
+}
+@var tail { GROUP BY 1 ORDER BY 1 | ORDER BY 1, 2 | ORDER BY 1, 2 LIMIT 3 OFFSET 1 }
+matrix aggregates-windows-and-limits {
+    SELECT $sel FROM ra AS a $j rb AS b ON a.k = b.k $tail;
+}
+
+@setup right_full_tables
+@var j { RIGHT JOIN | FULL JOIN }
+@var expr {
+    (SELECT count(*) FROM rc WHERE rc.k = a.k) |
+    (SELECT count(*) FROM rc WHERE rc.k = b.k) |
+    (SELECT max(w) FROM rc WHERE rc.k = coalesce(a.k, b.k)) |
+    EXISTS (SELECT 1 FROM rc WHERE rc.k = b.k) |
+    a.k IN (SELECT k FROM rc) |
+    (SELECT count(*) FROM rc RIGHT JOIN ra AS a2 ON a2.k = rc.k WHERE a2.id = a.id)
+}
+matrix correlated-subquery-in-result {
+    SELECT a.id, b.id, $expr FROM ra AS a $j rb AS b ON a.k = b.k ORDER BY 1, 2;
+}
+
+@setup right_full_tables
+@var j { RIGHT JOIN | FULL JOIN }
+@var pred {
+    EXISTS (SELECT 1 FROM rc WHERE rc.k = b.k) |
+    NOT EXISTS (SELECT 1 FROM rc WHERE rc.k = a.k) |
+    b.k IN (SELECT k FROM rc) |
+    a.v > (SELECT min(v) FROM rb WHERE rb.k = a.k) |
+    coalesce(a.k, b.k) NOT IN (SELECT k FROM rc WHERE k IS NOT NULL)
+}
+matrix correlated-subquery-in-where {
+    SELECT a.id, b.id FROM ra AS a $j rb AS b ON a.k = b.k WHERE $pred ORDER BY 1, 2;
+}
+
+@setup right_full_tables
+@var j { LEFT JOIN | RIGHT JOIN | FULL JOIN }
+@var on { ON a.k = b.k AND b.k = r.k | ON a.k = r.k | ON a.k = b.k WHERE b.k = r.k | ON a.k = b.k WHERE a.k IS r.k }
+matrix right-and-full-join-inside-correlated-subquery {
+    SELECT r.rowid, (SELECT count(*) FROM ra AS a $j rb AS b $on) FROM rc AS r ORDER BY 1;
+}
+
+@setup right_full_tables
+@var j1 { JOIN | LEFT JOIN | RIGHT JOIN | FULL JOIN }
+@var j2 { JOIN | LEFT JOIN | RIGHT JOIN | FULL JOIN }
+@var cols { k, a.k, b.k, c.k | a.id, b.id, c.rowid, k | k, typeof(k), a.id, c.w }
+matrix merged-using-columns-through-chains {
+    SELECT $cols FROM ra AS a $j1 rb AS b USING(k) $j2 rc AS c USING(k) ORDER BY 1, 2, 3, 4;
+}
+
+@setup right_full_tables
+@var j1 { JOIN | LEFT JOIN | RIGHT JOIN | FULL JOIN }
+@var j2 { JOIN | LEFT JOIN | RIGHT JOIN | FULL JOIN }
+matrix star-through-using-chains {
+    SELECT * FROM ra AS a $j1 rb AS b USING(k) $j2 rc AS c USING(k) ORDER BY a.id, b.id, c.rowid;
+}
+
+@setup right_full_tables
+@var lhs { ra AS a | (SELECT * FROM ra) AS a | (ra AS a) | ra AS a CROSS JOIN (SELECT 1 AS one) AS o }
+@var rhs {
+    rb AS b |
+    (SELECT * FROM rb WHERE v IS NOT NULL) AS b |
+    (rb AS b JOIN rc AS c2 ON c2.k = b.k) |
+    (SELECT k, max(v) AS v, min(id) AS id FROM rb GROUP BY k) AS b
+}
+@var j { RIGHT JOIN | FULL JOIN }
+matrix subquery-and-group-sources {
+    SELECT a.id, b.id, a.k, b.k FROM $lhs $j $rhs ON a.k = b.k ORDER BY 1, 2, 3, 4;
+}
+
+@setup right_full_tables
+@var j { RIGHT JOIN | FULL JOIN }
+@var with {
+    WITH q AS (SELECT * FROM rb) |
+    WITH q AS MATERIALIZED (SELECT * FROM rb) |
+    WITH q AS (SELECT k, count(*) AS id FROM rb GROUP BY k)
+}
+matrix cte-as-right-side {
+    $with SELECT a.id, q.id, q.k FROM ra AS a $j q ON a.k = q.k ORDER BY 1, 2, 3;
+}
+
+setup right_full_extra_indexes {
+    CREATE INDEX rb_expr ON rb(k, coalesce(v, -1));
+    CREATE INDEX ra_kv ON ra(k, v);
+    CREATE INDEX rc_kw ON rc(k, w);
+}
+
+@setup right_full_tables
+@var j1 { LEFT JOIN | RIGHT JOIN | FULL JOIN }
+@var j2 { LEFT JOIN | RIGHT JOIN | FULL JOIN }
+@var j3 { LEFT JOIN | RIGHT JOIN | FULL JOIN }
+@var on3 { ON c.k = d.k | ON a.k = d.k | USING(k) }
+matrix four-table-chains {
+    SELECT a.id, b.id, c.rowid, d.id
+      FROM ra AS a $j1 rb AS b ON a.k = b.k $j2 rc AS c ON b.k = c.k $j3 ra AS d $on3
+     ORDER BY 1, 2, 3, 4;
+}
+
+@setup right_full_tables
+@var form {
+    (ra AS a RIGHT JOIN rb AS b ON a.k = b.k) AS g FULL JOIN rc AS c ON c.k = b.k |
+    (ra AS a FULL JOIN rb AS b ON a.k = b.k) AS g RIGHT JOIN rc AS c ON c.k = a.k |
+    rc AS c RIGHT JOIN (ra AS a FULL JOIN rb AS b USING(k)) AS g USING(k) |
+    rc AS c FULL JOIN (ra AS a RIGHT JOIN rb AS b USING(k)) AS g ON g.k = c.k |
+    (ra AS a RIGHT JOIN rb AS b ON a.k = b.k RIGHT JOIN rc AS c ON c.k = b.k) |
+    ((ra AS a FULL JOIN rb AS b USING(k)) AS g1 FULL JOIN rc AS c USING(k)) AS g2 |
+    ra AS a RIGHT JOIN (rb AS b FULL JOIN rc AS c USING(k)) AS g USING(k)
+}
+@var cols { a.id, b.id, c.rowid, k | a.id, b.id, c.rowid, c.w | count(*), count(a.id), count(b.id), count(c.k) }
+matrix groups-mixing-right-and-full-joins {
+    SELECT $cols FROM $form ORDER BY 1, 2, 3, 4;
+}
+
+@setup right_full_tables
+@setup right_full_extra_indexes
+@var j { RIGHT JOIN | FULL JOIN | LEFT JOIN }
+@var e { coalesce(b.v, -1) | coalesce(b.v, -1) + 1 | b.k IS NULL | a.v }
+matrix expression-index-values-on-right-and-full-null-rows {
+    SELECT a.id, b.id, $e FROM ra AS a $j rb AS b ON a.k = b.k ORDER BY 1, 2, 3;
+}
+
+@setup right_full_tables
+@setup right_full_extra_indexes
+@var j { RIGHT JOIN | FULL JOIN | LEFT JOIN }
+@var e { b.k IS NULL | a.v | a.v + b.k }
+matrix expression-index-values-grouped-on-right-and-full-null-rows {
+    SELECT $e, count(*), sum(a.id) FROM ra AS a $j rb AS b ON a.k = b.k GROUP BY 1 ORDER BY 1;
+}
+
+# SQLite 3.50 groups the unmatched RIGHT JOIN rows under one wrong index value
+# here, and SQLite 3.53 returns these rows. CI runs SQLite 3.50, so this case is
+# not a matrix expansion and does not run against SQLite.
+@skip-if sqlite "bug in SQLite 3.50: unmatched RIGHT JOIN rows are grouped under a wrong expression-index value; fixed by 3.53"
+@setup right_full_tables
+@setup right_full_extra_indexes
+test expression-index-value-grouped-on-right-join-null-rows {
+    SELECT coalesce(b.v, -1), count(*), sum(a.id)
+      FROM ra AS a RIGHT JOIN rb AS b ON a.k = b.k
+     GROUP BY 1 ORDER BY 1;
+}
+expect {
+    -1|1|
+    100|1|1
+    200|2|5
+    300|1|
+    400|1|
+}
+
+@setup right_full_tables
+@setup right_full_extra_indexes
+@var j { RIGHT JOIN | FULL JOIN }
+@var order {
+    b.k, b.id, a.id | b.k DESC, b.id, a.id | a.k, a.id, b.id | a.k DESC, a.id, b.id |
+    coalesce(a.k, b.k), a.id, b.id | b.id, a.id
+}
+@var limit { | LIMIT 3 | LIMIT 2 OFFSET 2 }
+matrix order-by-and-limit-with-unmatched-rows {
+    SELECT a.id, b.id, a.k, b.k FROM ra AS a $j rb AS b ON a.k = b.k ORDER BY $order $limit;
+}
+
+@setup right_full_tables
+@setup right_full_extra_indexes
+@var j { RIGHT JOIN | FULL JOIN }
+@var w {
+    b.k = 3 | b.k > 1 | b.id BETWEEN 2 AND 4 | b.k IN (1, 3) | b.k IS NULL | b.v = 300 |
+    a.id = 2 | a.k > 1 | a.k IN (2, 5) | b.k = 3 OR a.k = 1
+}
+matrix where-seeks-on-preserved-and-null-extended-sides {
+    SELECT a.id, b.id FROM ra AS a $j rb AS b ON a.k = b.k WHERE $w ORDER BY 1, 2;
+}
+
+# Join keys whose type affinity and collation decide which rows match. If an
+# index search on the right table applied the wrong affinity or collation, it
+# would miss a matching row, and the unmatched-rows pass would emit that right
+# row a second time with NULL on the left. Every table holds the same values,
+# converted by its column type. kr_text_nocase_idx has a NOCASE index on a
+# BINARY column, so only a NOCASE comparison may search it.
+setup join_key_types {
+    CREATE TABLE kl_int(k INTEGER);
+    CREATE TABLE kl_text(k TEXT);
+    CREATE TABLE kl_real(k REAL);
+    CREATE TABLE kl_nocase(k TEXT COLLATE NOCASE);
+    CREATE TABLE kl_any(k);
+    CREATE TABLE kr_int(k INTEGER);
+    CREATE TABLE kr_text(k TEXT);
+    CREATE TABLE kr_real(k REAL);
+    CREATE TABLE kr_nocase(k TEXT COLLATE NOCASE);
+    CREATE TABLE kr_any(k);
+    CREATE TABLE kr_int_idx(k INTEGER);
+    CREATE TABLE kr_text_idx(k TEXT);
+    CREATE TABLE kr_real_idx(k REAL);
+    CREATE TABLE kr_nocase_idx(k TEXT COLLATE NOCASE);
+    CREATE TABLE kr_any_idx(k);
+    CREATE TABLE kr_text_nocase_idx(k TEXT);
+    CREATE INDEX kr_int_idx_k ON kr_int_idx(k);
+    CREATE INDEX kr_text_idx_k ON kr_text_idx(k);
+    CREATE INDEX kr_real_idx_k ON kr_real_idx(k);
+    CREATE INDEX kr_nocase_idx_k ON kr_nocase_idx(k);
+    CREATE INDEX kr_any_idx_k ON kr_any_idx(k);
+    CREATE INDEX kr_text_nocase_idx_k ON kr_text_nocase_idx(k COLLATE NOCASE);
+    INSERT INTO kl_any VALUES (1), ('1'), (1.0), ('01'), ('a'), ('A'), (NULL);
+    INSERT INTO kl_int SELECT k FROM kl_any;
+    INSERT INTO kl_text SELECT k FROM kl_any;
+    INSERT INTO kl_real SELECT k FROM kl_any;
+    INSERT INTO kl_nocase SELECT k FROM kl_any;
+    INSERT INTO kr_int SELECT k FROM kl_any;
+    INSERT INTO kr_text SELECT k FROM kl_any;
+    INSERT INTO kr_real SELECT k FROM kl_any;
+    INSERT INTO kr_nocase SELECT k FROM kl_any;
+    INSERT INTO kr_any SELECT k FROM kl_any;
+    INSERT INTO kr_int_idx SELECT k FROM kl_any;
+    INSERT INTO kr_text_idx SELECT k FROM kl_any;
+    INSERT INTO kr_real_idx SELECT k FROM kl_any;
+    INSERT INTO kr_nocase_idx SELECT k FROM kl_any;
+    INSERT INTO kr_any_idx SELECT k FROM kl_any;
+    INSERT INTO kr_text_nocase_idx SELECT k FROM kl_any;
+}
+
+@setup join_key_types
+@var l { kl_int | kl_text | kl_real | kl_nocase | kl_any }
+@var r {
+    kr_int | kr_text | kr_real | kr_nocase | kr_any | kr_int_idx | kr_text_idx | kr_real_idx |
+    kr_nocase_idx | kr_any_idx | kr_text_nocase_idx
+}
+@var j { RIGHT JOIN | FULL JOIN }
+@var c { | COLLATE NOCASE | COLLATE BINARY }
+matrix right-and-full-join-key-affinity-and-collation {
+    SELECT l.rowid, r.rowid FROM $l AS l $j $r AS r ON l.k = r.k $c
+     ORDER BY l.rowid NULLS FIRST, r.rowid NULLS FIRST;
+}
