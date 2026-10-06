@@ -820,6 +820,12 @@ impl Statement {
             .map_err(|err| *err)
     }
 
+    pub(crate) fn abort_subprogram(&mut self, err: Option<&LimboError>) -> Result<()> {
+        let result = self.program.abort(&self.pager, err, &mut self.state, false);
+        self.state.execution_state = vdbe::ProgramExecutionState::Failed;
+        result
+    }
+
     pub fn run_ignore_rows(&mut self) -> Result<()> {
         loop {
             match self.step()? {

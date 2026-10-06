@@ -1055,36 +1055,14 @@ impl Default for SumAggState {
 /// Aggregate context for accumulating values during GROUP BY.
 /// Built-in aggregates use a flat payload representation for efficiency and
 /// to share code between register-based and hash-based aggregation (future enhancement).
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, PartialEq)]
 pub enum AggContext {
     /// Built-in aggregates store state as a flat Vec<Value> payload.
     /// The layout depends on the aggregate function (see init_agg_payload).
     Builtin(Vec<Value>),
     /// External (extension) aggregates need FFI state that can't be serialized.
     External(ExternalAggState),
-}
-
-impl TryClone for AggContext {
-    type Error = TryReserveError;
-
-    /// Fallible clone: the builtin payload's Vec and each contained Text/Blob
-    /// go through fallible reservation. External state holds only FFI
-    /// pointers and copies without allocating.
-    #[turso_macros::allocation_site(crate::alloc::ValueBlobAllocationSite::CloneFrom)]
-    fn try_clone(&self) -> Result<Self, Self::Error> {
-        match self {
-            Self::Builtin(payload) => {
-                let mut values = Vec::try_with_capacity_ext(payload.len())?;
-                for value in payload {
-                    let mut copy = Value::Null;
-                    copy.try_clone_from(value)?;
-                    values.push(copy);
-                }
-                Ok(Self::Builtin(values))
-            }
-            Self::External(_) => Ok(self.clone()),
-        }
-    }
+    Native(crate::native_ext::AggregateState),
 }
 
 impl AggContext {
@@ -1111,7 +1089,9 @@ impl AggContext {
     pub fn payload_mut(&mut self) -> &mut [Value] {
         match self {
             Self::Builtin(payload) => payload,
-            Self::External(_) => panic!("payload_mut() called on External aggregate"),
+            Self::External(_) | Self::Native(_) => {
+                panic!("payload_mut() called on extension aggregate")
+            }
         }
     }
 
@@ -1120,7 +1100,9 @@ impl AggContext {
     pub fn payload_vec_mut(&mut self) -> &mut Vec<Value> {
         match self {
             Self::Builtin(payload) => payload,
-            Self::External(_) => panic!("payload_vec_mut() called on External aggregate"),
+            Self::External(_) | Self::Native(_) => {
+                panic!("payload_vec_mut() called on extension aggregate")
+            }
         }
     }
 
@@ -1128,7 +1110,9 @@ impl AggContext {
     pub fn payload(&self) -> &[Value] {
         match self {
             Self::Builtin(payload) => payload,
-            Self::External(_) => panic!("payload() called on External aggregate"),
+            Self::External(_) | Self::Native(_) => {
+                panic!("payload() called on extension aggregate")
+            }
         }
     }
 }

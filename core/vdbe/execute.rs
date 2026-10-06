@@ -67,7 +67,7 @@ use crate::{
     get_cursor, info, is_attached_db,
     storage::wal::CheckpointResult,
     turso_assert,
-    types::{AggContext, Cursor, ExternalAggState, SeekKey, SeekOp, SumAggState, Value, ValueType},
+    types::{AggContext, Cursor, SeekKey, SeekOp, SumAggState, Value, ValueType},
     util::{cast_real_to_integer, checked_cast_text_to_numeric},
     vdbe::{
         builder::CursorType,
@@ -83,7 +83,7 @@ use crate::{
         SQLITE_CONSTRAINT_NOTNULL, SQLITE_CONSTRAINT_PRIMARYKEY, SQLITE_CONSTRAINT_TRIGGER,
         SQLITE_ERROR, SQLITE_FULL,
     },
-    function::{AggFunc, ExtFunc, MathFunc, MathFuncArity, ScalarFunc, VectorFunc},
+    function::{AggFunc, MathFunc, MathFuncArity, ScalarFunc, VectorFunc},
     functions::{
         datetime::{
             exec_date, exec_datetime_full, exec_julianday, exec_strftime, exec_time, exec_unixepoch,
@@ -1561,7 +1561,7 @@ pub fn op_vcreate(
     let args = if let Some(args_reg) = args_reg {
         if let Register::Record(rec) = &state.registers[*args_reg] {
             rec.iter()?
-                .map(|v| v.map(|v| v.to_ffi()))
+                .map(|v| Ok::<_, LimboError>(v?.to_owned()?))
                 .collect::<Result<_, _>>()?
         } else {
             mark_unlikely();
@@ -1611,7 +1611,10 @@ pub fn op_vfilter(
         } else {
             None
         };
-        cursor.filter(*idx_num as i32, idx_str, *arg_count, args)?
+        return_if_io!(
+            state,
+            cursor.filter(*idx_num as i32, idx_str, *arg_count, args)
+        )
     };
     // Increment filter_operations metric for virtual table filter
     state.metrics.filter_operations = state.metrics.filter_operations.wrapping_add(1);
@@ -1642,7 +1645,7 @@ pub fn op_vcolumn(
     let value = {
         let cursor = state.get_cursor(*cursor_id);
         let cursor = cursor.as_virtual_mut();
-        cursor.column(*column)?
+        return_if_io!(state, cursor.column(*column))
     };
     state.registers[*dest].set_value(value);
     state.pc += 1;
@@ -1713,16 +1716,19 @@ pub fn op_vupdate(
         #[cfg(feature = "cli_only")]
         {
             crate::dbpage::update_dbpage(pager, &argv)
+                .map(IOResult::Done)
+                .map_err(Box::new)
         }
         #[cfg(not(feature = "cli_only"))]
         {
             unreachable!("sqlite_dbpage writes require cli_only feature");
         }
     } else {
-        virtual_table.update(&argv)
+        virtual_table.update(&argv, &mut state.extension_state)
     };
     match result {
-        Ok(Some(new_rowid)) => {
+        Ok(IOResult::IO(io)) => return Ok(state.suspend_on_io(io)),
+        Ok(IOResult::Done(Some(new_rowid))) => {
             state.record_rows_written(1);
             if *conflict_action == 5 {
                 // ResolveType::Replace
@@ -1730,7 +1736,7 @@ pub fn op_vupdate(
             }
             state.pc += 1;
         }
-        Ok(None) => {
+        Ok(IOResult::Done(None)) => {
             // no-op or successful update without rowid return
             state.record_rows_written(1);
             state.pc += 1;
@@ -1762,7 +1768,7 @@ pub fn op_vnext(
     let has_more = {
         let cursor = state.get_cursor(*cursor_id);
         let cursor = cursor.as_virtual_mut();
-        cursor.next()?
+        return_if_io!(state, cursor.next())
     };
     if has_more {
         // Increment metrics for row read from virtual table (including materialized views)
@@ -4236,7 +4242,7 @@ fn has_index_method_work(state: &ProgramState) -> bool {
 }
 
 /// Rollback all virtual tables that are part of the current transaction.
-fn vtab_rollback_all(conn: &Connection) -> crate::Result<()> {
+pub(crate) fn vtab_rollback_all(conn: &Connection) -> crate::Result<()> {
     let mut set = conn.vtab_txn_states.write();
     if set.is_empty() {
         return Ok(());
@@ -5331,6 +5337,7 @@ pub fn op_auto_commit(
                 }
                 conn.rollback_attached_wal_txns();
                 conn.rollback_temp_schema();
+                vtab_rollback_all(&conn)?;
                 conn.index_methods_on_transaction_rolled_back();
                 conn.set_tx_state(TransactionState::None);
                 conn.auto_commit.store(true, Ordering::SeqCst);
@@ -5344,6 +5351,7 @@ pub fn op_auto_commit(
                     // persist a partial statement, so COMMIT rolls back the
                     // whole transaction and reports the abandoned write.
                     conn.rollback_manual_txn_cleanup(pager, true);
+                    vtab_rollback_all(&conn)?;
                     return Err(LimboError::TxError(
                         "cannot commit - an unfinished write statement was abandoned".to_string(),
                     )
@@ -5351,6 +5359,7 @@ pub fn op_auto_commit(
                 }
                 // Pre-check deferred FKs; leave tx open and do NOT clear violations
                 check_deferred_fk_on_commit(&conn)?;
+                vtab_commit_all(&conn)?;
                 conn.auto_commit.store(true, Ordering::SeqCst);
                 state.auto_txn_cleanup = TxnCleanup::RollbackTxn;
             }
@@ -6050,6 +6059,38 @@ pub fn op_program(
                 return Ok(InsnFunctionStepResult::Step);
             }
         }
+    }
+}
+
+pub(super) fn abort_active_subprogram(
+    program: &Program,
+    state: &mut ProgramState,
+    err: Option<&LimboError>,
+) -> Result<()> {
+    let Some(subprogram) = state.active_op_state.program_mut() else {
+        return Ok(());
+    };
+    let subprogram = std::mem::take(subprogram);
+    state.active_op_state.clear();
+    if let OpProgramState::Step {
+        is_trigger,
+        mut statement,
+        saved_last_insert_rowid,
+        saved_changes_value,
+    } = subprogram
+    {
+        let result = statement.abort_subprogram(err);
+        finish_subprogram(
+            program,
+            &statement,
+            is_trigger,
+            true,
+            saved_last_insert_rowid,
+            saved_changes_value,
+        );
+        result
+    } else {
+        Ok(())
     }
 }
 
@@ -9057,6 +9098,15 @@ fn op_agg_step_slow(program: &Program, state: &mut ProgramState, data: &AggStepD
     }
     let func = func.expect_agg();
 
+    if let AggFunc::External(ext_func) = func {
+        return_if_io!(
+            state,
+            ext_func.step_aggregate(&mut state.registers, *acc_reg, *col)
+        );
+        state.pc += 1;
+        return Ok(InsnFunctionStepResult::Step);
+    }
+
     // Initialize aggregate state if not already done
     if let Register::Value(Value::Null) = state.registers[*acc_reg] {
         // Fast path for the first row of a COUNT group
@@ -9081,38 +9131,12 @@ fn op_agg_step_slow(program: &Program, state: &mut ProgramState, data: &AggStepD
                 return Ok(InsnFunctionStepResult::Step);
             }
         }
-        state.registers[*acc_reg] = match func {
-            AggFunc::External(ext_func) => match ext_func.as_ref() {
-                ExtFunc::Aggregate {
-                    context,
-                    init,
-                    step,
-                    finalize,
-                    argc,
-                    aggregate_destructor,
-                    value_destructor,
-                    ..
-                } => Register::Aggregate(AggContext::External(ExternalAggState {
-                    context: *context,
-                    state: unsafe { (init)(*context) },
-                    argc: (*argc).max(0) as usize,
-                    step_fn: *step,
-                    finalize_fn: *finalize,
-                    aggregate_destructor: *aggregate_destructor,
-                    value_destructor: *value_destructor,
-                })),
-                _ => unreachable!("scalar function called in aggregate context"),
-            },
-            _ => {
-                // Built-in aggregates use flat payload
-                let mut payload = state
-                    .spare_agg_payloads
-                    .pop()
-                    .unwrap_or_else(|| crate::alloc::vec![]);
-                init_agg_payload(func, &mut payload)?;
-                Register::Aggregate(AggContext::Builtin(payload))
-            }
-        };
+        let mut payload = state
+            .spare_agg_payloads
+            .pop()
+            .unwrap_or_else(|| crate::alloc::vec![]);
+        init_agg_payload(func, &mut payload)?;
+        state.registers[*acc_reg] = Register::Aggregate(AggContext::Builtin(payload));
     }
 
     let current_collation = collation.unwrap_or(CollationSeq::Binary);
@@ -9131,52 +9155,7 @@ fn op_agg_step_slow(program: &Program, state: &mut ProgramState, data: &AggStepD
     // Step the aggregate
     match func {
         AggFunc::External(_) => {
-            // External aggregates use FFI and need special handling
-            let (context, step_fn, state_ptr, argc, aggregate_destructor, value_destructor) = {
-                let Register::Aggregate(agg) = &state.registers[*acc_reg] else {
-                    unreachable!();
-                };
-                let AggContext::External(agg_state) = agg else {
-                    unreachable!();
-                };
-                (
-                    agg_state.context,
-                    agg_state.step_fn,
-                    agg_state.state,
-                    agg_state.argc,
-                    agg_state.aggregate_destructor,
-                    agg_state.value_destructor,
-                )
-            };
-            let mut ext_values = Vec::with_capacity(argc);
-            if argc != 0 {
-                let register_slice = &state.registers[*col..*col + argc];
-                for ov in register_slice.iter() {
-                    ext_values.push(ov.get_value().to_ffi());
-                }
-            }
-            let argv_ptr = if ext_values.is_empty() {
-                std::ptr::null()
-            } else {
-                ext_values.as_ptr()
-            };
-            let mut result = unsafe { step_fn(context, state_ptr, argc as i32, argv_ptr) };
-            let value = Value::from_ffi_ref(&result);
-            if let Some(value_destructor) = value_destructor {
-                unsafe { value_destructor(&mut result) };
-            } else {
-                unsafe { result.__free_internal_type() };
-            }
-            for ext_value in ext_values {
-                unsafe { ext_value.__free_internal_type() };
-            }
-            if let Err(err) = value {
-                if let Some(aggregate_destructor) = aggregate_destructor {
-                    unsafe { aggregate_destructor(state_ptr as usize) };
-                }
-                state.registers[*acc_reg].set_value(Value::Null);
-                return Err(err.into());
-            }
+            unreachable!("extension aggregates are stepped above")
         }
         _ => {
             let maybe_arg2 = match func {
@@ -9261,13 +9240,11 @@ pub fn op_agg_final(
     }
     let func = func.expect_agg();
 
-    if let Register::Aggregate(AggContext::External(_)) = &state.registers[acc_reg] {
-        let Register::Aggregate(agg) =
-            std::mem::replace(&mut state.registers[acc_reg], Register::Value(Value::Null))
-        else {
-            unreachable!("register was checked to hold an external aggregate");
-        };
-        let value = agg.compute_external()?;
+    if let AggFunc::External(ext_func) = func {
+        let value = return_if_io!(
+            state,
+            ext_func.finalize_aggregate(&mut state.registers[acc_reg])
+        );
         state.registers[dest_reg].set_value(value);
         state.pc += 1;
         return Ok(InsnFunctionStepResult::Step);
@@ -9276,7 +9253,7 @@ pub fn op_agg_final(
     match &state.registers[acc_reg] {
         Register::Aggregate(agg) => {
             let value = match agg {
-                AggContext::External(_) => {
+                AggContext::External(_) | AggContext::Native(_) => {
                     unreachable!("external aggregates are finalized above")
                 }
                 AggContext::Builtin(payload) => match func {
@@ -9332,32 +9309,8 @@ pub fn op_agg_final(
                     state.registers[dest_reg]
                         .set_blob(json::jsonb::Jsonb::make_empty_obj(1)?.data())?;
                 }
-                AggFunc::External(ext_func) => {
-                    let value = match ext_func.as_ref() {
-                        ExtFunc::Aggregate {
-                            context,
-                            init,
-                            finalize,
-                            aggregate_destructor,
-                            value_destructor,
-                            ..
-                        } => {
-                            let aggregate_context = unsafe { init(*context) };
-                            let mut result = unsafe { finalize(*context, aggregate_context) };
-                            let value = Value::from_ffi_ref(&result);
-                            if let Some(value_destructor) = value_destructor {
-                                unsafe { value_destructor(&mut result) };
-                            } else {
-                                unsafe { result.__free_internal_type() };
-                            }
-                            if let Some(aggregate_destructor) = aggregate_destructor {
-                                unsafe { aggregate_destructor(aggregate_context as usize) };
-                            }
-                            value?
-                        }
-                        _ => unreachable!("scalar function called in aggregate context"),
-                    };
-                    state.registers[dest_reg].set_value(value);
+                AggFunc::External(_) => {
+                    unreachable!("extension aggregates are finalized above")
                 }
                 _ => {
                     state.registers[dest_reg].set_value(Value::Null);
@@ -11456,48 +11409,16 @@ pub fn op_function(
                 }
             }
         }
-        crate::function::Func::External(f) => match f.func {
-            ExtFunc::Scalar {
-                context,
-                callback,
-                context_destructor,
-                value_destructor,
-                ..
-            } => {
-                let mut ext_values = Vec::with_capacity(arg_count);
-                if arg_count != 0 {
-                    let register_slice = &state.registers[*start_reg..*start_reg + arg_count];
-                    for ov in register_slice.iter() {
-                        ext_values.push(ov.get_value().to_ffi());
-                    }
-                }
-                let argv_ptr = if ext_values.is_empty() {
-                    std::ptr::null()
-                } else {
-                    ext_values.as_ptr()
-                };
-                let mut result = unsafe {
-                    callback(
-                        context,
-                        arg_count as i32,
-                        argv_ptr,
-                        context_destructor,
-                        value_destructor,
-                    )
-                };
-                let value = Value::from_ffi_ref(&result);
-                if let Some(value_destructor) = value_destructor {
-                    unsafe { value_destructor(&mut result) };
-                } else {
-                    unsafe { result.__free_internal_type() };
-                }
-                for ext_value in ext_values {
-                    unsafe { ext_value.__free_internal_type() };
-                }
-                state.registers[*dest].set_value(value?);
-            }
-            _ => unreachable!("aggregate called in scalar context"),
-        },
+        crate::function::Func::External(f) => {
+            let value = return_if_io!(
+                state,
+                f.func.call_scalar(
+                    &mut state.extension_state,
+                    &state.registers[*start_reg..*start_reg + arg_count],
+                )
+            );
+            state.registers[*dest].set_value(value);
+        }
         crate::function::Func::Math(math_func) => match math_func.arity() {
             MathFuncArity::Nullary => match math_func {
                 MathFunc::Pi => {

@@ -385,7 +385,7 @@ pub fn module_name_from_sql(sql: &str) -> Result<&str> {
 
 // CREATE VIRTUAL TABLE table_name USING module_name(arg1, arg2, ...);
 // CREATE VIRTUAL TABLE table_name USING module_name;
-pub fn module_args_from_sql(sql: &str) -> Result<Vec<turso_ext::Value>> {
+pub fn module_args_from_sql(sql: &str) -> Result<Vec<Value>> {
     if !sql.contains('(') {
         return Ok(vec![]);
     }
@@ -411,7 +411,7 @@ pub fn module_args_from_sql(sql: &str) -> Result<Vec<turso_ext::Value>> {
                         chars.next();
                     } else {
                         in_quotes = false;
-                        args.push(turso_ext::Value::from_text(current_arg.trim().to_string()));
+                        args.push(Value::from_text(current_arg.trim().to_string()));
                         current_arg.clear();
                         // Skip until comma or end
                         while let Some(&nc) = chars.peek() {
@@ -434,7 +434,7 @@ pub fn module_args_from_sql(sql: &str) -> Result<Vec<turso_ext::Value>> {
             ',' => {
                 if !in_quotes {
                     if !current_arg.trim().is_empty() {
-                        args.push(turso_ext::Value::from_text(current_arg.trim().to_string()));
+                        args.push(Value::from_text(current_arg.trim().to_string()));
                         current_arg.clear();
                     }
                 } else {
@@ -448,7 +448,7 @@ pub fn module_args_from_sql(sql: &str) -> Result<Vec<turso_ext::Value>> {
     }
 
     if !current_arg.trim().is_empty() && !in_quotes {
-        args.push(turso_ext::Value::from_text(current_arg.trim().to_string()));
+        args.push(Value::from_text(current_arg.trim().to_string()));
     }
 
     if in_quotes {
@@ -6561,9 +6561,6 @@ pub mod tests {
         assert_eq!(args.len(), 2);
         assert_eq!("arg1", args[0].to_text().unwrap());
         assert_eq!("arg2", args[1].to_text().unwrap());
-        for arg in args {
-            unsafe { arg.__free_internal_type() }
-        }
     }
 
     #[test]
@@ -6573,9 +6570,6 @@ pub mod tests {
         assert_eq!(args.len(), 2);
         assert_eq!(args[0].to_text().unwrap(), "a'b");
         assert_eq!(args[1].to_text().unwrap(), "c");
-        for arg in args {
-            unsafe { arg.__free_internal_type() }
-        }
     }
 
     #[test]
@@ -6596,9 +6590,6 @@ pub mod tests {
         let args = module_args_from_sql(sql).unwrap();
         assert_eq!(args.len(), 1);
         assert_eq!("arg1", args[0].to_text().unwrap());
-        for arg in args {
-            unsafe { arg.__free_internal_type() }
-        }
     }
 
     #[test]

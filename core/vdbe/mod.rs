@@ -34,6 +34,8 @@ pub mod explain;
 pub mod hash_table;
 pub mod insn;
 pub mod metrics;
+#[cfg(test)]
+mod native_extension_tests;
 pub mod rowset;
 pub mod sorter;
 #[cfg(test)]
@@ -307,7 +309,7 @@ impl CommitState {
     }
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, PartialEq)]
 pub enum Register {
     Value(Value),
     Aggregate(AggContext),
@@ -320,7 +322,7 @@ impl TryClone for Register {
     fn try_clone(&self) -> Result<Self, Self::Error> {
         match self {
             Register::Value(value) => Ok(Register::Value(value.try_clone()?)),
-            Register::Aggregate(context) => Ok(Register::Aggregate(context.try_clone()?)),
+            Register::Aggregate(_) => unreachable!("aggregate accumulators cannot be copied"),
             Register::Record(record) => Ok(Register::Record(ImmutableRecord::copy_payload(
                 record.get_payload(),
                 RecordBuf::alloc(),
@@ -351,7 +353,7 @@ impl TryClone for Register {
                     RecordBuf::alloc(),
                 )?);
             }
-            (dst, Register::Aggregate(src)) => *dst = Register::Aggregate(src.try_clone()?),
+            (_, Register::Aggregate(_)) => unreachable!("aggregate accumulators cannot be copied"),
         }
         Ok(())
     }
@@ -878,6 +880,7 @@ pub struct ProgramState {
     /// the progress handler's interval each time the check runs.
     check_interval: u64,
     pub io_completions: Option<IOCompletions>,
+    pub(crate) extension_state: crate::native_ext::ExtensionState,
     pub pc: InsnReference,
     pub(crate) cursors: Vec<Option<Cursor>>,
     /// Immutable execution/storage context captured when each index-method
@@ -900,7 +903,7 @@ pub struct ProgramState {
     cursor_seqs: Vec<i64>,
     registers: Box<[Register]>,
     /// Trace state: register snapshot for diffing.
-    pre_op_registers: Option<Box<[Register]>>,
+    pre_op_registers: Option<Box<[String]>>,
     pub(crate) result_row: Option<Row>,
     last_compare: Option<std::cmp::Ordering>,
     deferred_seeks: Vec<Option<DeferredSeekState>>,
@@ -1044,11 +1047,15 @@ impl ProgramState {
     pub fn new(max_registers: usize, max_cursors: usize) -> Self {
         let cursors: Vec<Option<Cursor>> = (0..max_cursors).map(|_| None).collect();
         let cursor_seqs = vec![0i64; max_cursors];
-        let registers = vec![Register::Value(Value::Null); max_registers].into_boxed_slice();
+        let registers = (0..max_registers)
+            .map(|_| Register::Value(Value::Null))
+            .collect::<Vec<_>>()
+            .into_boxed_slice();
         Self {
             check_countdown: 1,
             check_interval: MAX_CHECK_INTERVAL,
             io_completions: None,
+            extension_state: crate::native_ext::ExtensionState::None,
             pc: 0,
             cursors,
             index_method_contexts: vec![None; max_cursors],
@@ -1161,6 +1168,7 @@ impl ProgramState {
 
     pub fn reset(&mut self, max_registers: Option<usize>, max_cursors: Option<usize>) {
         self.io_completions = None;
+        self.extension_state = crate::native_ext::ExtensionState::None;
         self.pc = 0;
 
         if let Some(max_cursors) = max_cursors {
@@ -2218,20 +2226,24 @@ impl Program {
         if !vdbe_trace {
             return;
         }
+        let snapshots: Box<[_]> = state
+            .registers
+            .iter()
+            .map(|register| format!("{register:?}"))
+            .collect();
         // Diff registers from PREVIOUS opcode
         // The last opcode (Halt) won't have its diff printed, but Halt
         // doesn't write to any registers
-        if let Some(ref old) = state.pre_op_registers {
-            for (i, (old_reg, new_reg)) in old.iter().zip(state.registers.iter()).enumerate() {
+        if let Some(old) = state.pre_op_registers.take() {
+            for (i, (old_reg, new_reg)) in old.iter().zip(snapshots.iter()).enumerate() {
                 if old_reg != new_reg {
-                    match new_reg {
+                    match &state.registers[i] {
                         Register::Value(v) => eprintln!("R[{i}] = {v}"),
                         Register::Aggregate(_) => eprintln!("R[{i}] = <aggregate>"),
                         Register::Record(_) => eprintln!("R[{i}] = <record>"),
                     }
                 }
             }
-            state.pre_op_registers = None;
         }
 
         // Print CURRENT opcode
@@ -2249,7 +2261,7 @@ impl Program {
             )
         );
         // Snapshot for next iteration
-        state.pre_op_registers = Some(state.registers.clone());
+        state.pre_op_registers = Some(snapshots);
     }
 
     /// Step in [QueryMode::Normal]
@@ -2271,6 +2283,7 @@ impl Program {
         match &result {
             ProgramStep::Row => {}
             ProgramStep::Done => {
+                crate::native_ext::close_cursors(&mut state.cursors);
                 state.execution_state = ProgramExecutionState::Done;
             }
             ProgramStep::Interrupt => {
@@ -3270,6 +3283,11 @@ impl Program {
         }
 
         let mut abort_error: Option<LimboError> = None;
+        if let Err(err) = execute::abort_active_subprogram(self, state, err) {
+            capture_abort_error(&mut abort_error, err, "Failed to abort active subprogram");
+        }
+        state.extension_state = crate::native_ext::ExtensionState::None;
+        crate::native_ext::abort_aggregates(&mut state.registers);
         state.explicit_checkpoint_guard = None;
         // PRAGMA journal_mode owns its MVCC checkpoint in active_op_state rather
         // than commit_state. Clean it before transaction abort logic inspects
@@ -3637,6 +3655,18 @@ impl Program {
                         }
                     }
                 },
+            }
+            if (must_rollback_tx_if_needed || inside_explicit_transaction)
+                && !keeps_prior_changes
+                && self.connection.get_auto_commit()
+            {
+                if let Err(err) = execute::vtab_rollback_all(&self.connection) {
+                    capture_abort_error(
+                        &mut abort_error,
+                        err,
+                        "Failed to rollback virtual tables during abort",
+                    );
+                }
             }
         }
         if state.uses_subjournal {
@@ -4334,12 +4364,10 @@ mod tests {
     }
 
     #[test]
-    fn register_try_clone_copies_each_variant() {
+    fn register_try_clone_copies_values_and_records() {
         let record_values = [Value::from_i64(1), Value::build_text("record payload")];
-        let aggregate_values = crate::alloc::vec![Value::build_text("aggregate payload")];
         let registers = [
             Register::Value(Value::build_text("value")),
-            Register::Aggregate(AggContext::Builtin(aggregate_values)),
             Register::Record(
                 ImmutableRecord::from_values(&record_values, record_values.len()).unwrap(),
             ),
@@ -4388,14 +4416,6 @@ mod tests {
             Register::Record(record) => assert_eq!(record.get_payload().as_ptr(), ptr),
             _ => unreachable!(),
         }
-
-        let src = Register::Aggregate(AggContext::Builtin(crate::alloc::vec![
-            Value::build_text("agg state"),
-            Value::from_i64(2),
-        ]));
-        let mut dst = Register::Value(Value::Null);
-        dst.try_clone_from(&src).unwrap();
-        assert_eq!(dst, src);
     }
 
     #[test]

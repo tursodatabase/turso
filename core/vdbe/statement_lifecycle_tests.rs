@@ -2375,15 +2375,18 @@ unsafe extern "C" fn keepalive_finalize(
 fn register_keepalive_aggregate(conn: &Arc<Connection>) {
     conn.syms.write().functions.insert(
         "keepalive_agg".to_string(),
-        Arc::new(crate::function::ExternalFunc::new_aggregate(
-            "keepalive_agg".to_string(),
-            1,
-            0,
-            (keepalive_init, keepalive_step, keepalive_finalize),
-            Some(keepalive_destroy_context),
-            None,
-            None,
-        )),
+        Arc::new(
+            crate::function::ExternalFunc::new_aggregate(
+                "keepalive_agg".to_string(),
+                1,
+                0,
+                (keepalive_init, keepalive_step, keepalive_finalize),
+                Some(keepalive_destroy_context),
+                None,
+                None,
+            )
+            .unwrap(),
+        ),
     );
     conn.bump_prepare_context_generation();
 }
