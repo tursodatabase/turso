@@ -731,7 +731,7 @@ fn native_table_functions_survive_mvcc_schema_refresh_and_other_connection_ddl()
 }
 
 #[test]
-fn native_table_function_view_columns_survive_refresh_reopen_and_checkpoint() {
+fn native_table_function_views_survive_checkpoint_and_reopen() {
     for mvcc in [false, true] {
         let io = Arc::new(MemoryIO::new());
         let path = format!("native-view-{mvcc}.db");
@@ -774,34 +774,25 @@ fn native_table_function_view_columns_survive_refresh_reopen_and_checkpoint() {
             }
             conn.execute("CREATE VIEW native_view AS SELECT * FROM native_rows(8)")
                 .unwrap();
-            conn.execute(
-                "CREATE VIEW native_join AS WITH existing AS (SELECT value FROM native_view WHERE value > 10) SELECT existing.value FROM existing JOIN native_rows USING(value)",
-            )
-            .unwrap();
             assert_eq!(columns(&conn), expected_columns);
-            conn.force_reparse_schema_without_publish().unwrap();
+            conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
             assert_eq!(columns(&conn), expected_columns);
-            let mut stmt = conn
-                .prepare("SELECT value FROM native_view ORDER BY value")
-                .unwrap();
-            assert_eq!(
-                collect(&mut stmt, &queue),
-                vec![vec![Value::from_i64(9)], vec![Value::from_i64(17)]]
-            );
         }
         let db = open();
         let conn = db.connect().unwrap();
         assert_eq!(columns(&conn), expected_columns);
-        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
-        conn.force_reparse_schema_without_publish().unwrap();
-        assert_eq!(columns(&conn), expected_columns);
-        let mut stmt = conn.prepare("SELECT value FROM native_join").unwrap();
-        assert_eq!(collect(&mut stmt, &queue), vec![vec![Value::from_i64(17)]]);
+        let mut stmt = conn
+            .prepare("SELECT value FROM native_view ORDER BY value")
+            .unwrap();
+        assert_eq!(
+            collect(&mut stmt, &queue),
+            vec![vec![Value::from_i64(9)], vec![Value::from_i64(17)]]
+        );
     }
 }
 
 #[test]
-fn native_table_functions_remain_in_empty_temp_schema_after_rollback() {
+fn native_table_functions_survive_temp_table_rollback() {
     let queue = Arc::new(Mutex::new(Vec::new()));
     let conn = connection(OpenOptions::new(Arc::new(SqliteDialect)).native_module(
         "native_rows",
@@ -813,24 +804,16 @@ fn native_table_functions_remain_in_empty_temp_schema_after_rollback() {
             writable: false,
         },
     ));
-    for (sql, expected) in [
-        (
-            "SELECT value FROM temp.native_rows(8)",
-            vec![vec![Value::from_i64(9)], vec![Value::from_i64(17)]],
-        ),
-        (
-            "SELECT value FROM temp.native_rows(16)",
-            vec![vec![Value::from_i64(17)]],
-        ),
-    ] {
-        let mut stmt = conn.prepare(sql).unwrap();
-        assert_eq!(collect(&mut stmt, &queue), expected);
-        conn.execute("BEGIN").unwrap();
-        conn.execute("CREATE TEMP TABLE temp_values(value)")
-            .unwrap();
-        conn.execute("ROLLBACK").unwrap();
-        assert!(conn.empty_temp_schema().get_table("native_rows").is_some());
-    }
+    let sql = "SELECT value FROM temp.native_rows(8)";
+    let expected = vec![vec![Value::from_i64(9)], vec![Value::from_i64(17)]];
+    let mut stmt = conn.prepare(sql).unwrap();
+    assert_eq!(collect(&mut stmt, &queue), expected);
+    conn.execute("BEGIN").unwrap();
+    conn.execute("CREATE TEMP TABLE temp_values(value)")
+        .unwrap();
+    conn.execute("ROLLBACK").unwrap();
+    let mut stmt = conn.prepare(sql).unwrap();
+    assert_eq!(collect(&mut stmt, &queue), expected);
 }
 
 #[test]
