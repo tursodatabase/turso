@@ -1,0 +1,52 @@
+@database :temp:
+@skip-file-if sqlite "MVCC is not supported in SQLite"
+
+# Regression coverage for https://github.com/tursodatabase/turso/issues/9029:
+# under MVCC, a NULL INTEGER PRIMARY KEY on a table without AUTOINCREMENT
+# was assigned one past the maximum rowid of rows that had already been
+# deleted, instead of one past the largest rowid currently in the table.
+
+test mvcc-null-rowid-after-delete-all {
+    PRAGMA journal_mode='MVCC';
+    CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT);
+    INSERT INTO t VALUES (1000, 'a'), (1001, 'b'), (1002, 'c');
+    DELETE FROM t WHERE TRUE;
+    INSERT INTO t VALUES (10, 'x'), (11, 'y'), (NULL, 'z');
+    SELECT id, v FROM t ORDER BY id;
+}
+expect {
+    mvcc
+    10|x
+    11|y
+    12|z
+}
+
+test mvcc-null-rowid-after-delete-max-row {
+    PRAGMA journal_mode='MVCC';
+    CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT);
+    INSERT INTO t VALUES (1, 'a'), (2, 'b'), (500, 'c');
+    DELETE FROM t WHERE id = 500;
+    INSERT INTO t VALUES (NULL, 'd');
+    SELECT id, v FROM t ORDER BY id;
+}
+expect {
+    mvcc
+    1|a
+    2|b
+    3|d
+}
+
+test mvcc-null-rowid-after-delete-in-separate-statements {
+    PRAGMA journal_mode='MVCC';
+    CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT);
+    INSERT INTO t VALUES (1000, 'a');
+    DELETE FROM t;
+    INSERT INTO t VALUES (5, 'b');
+    INSERT INTO t VALUES (NULL, 'c');
+    SELECT id, v FROM t ORDER BY id;
+}
+expect {
+    mvcc
+    5|b
+    6|c
+}
