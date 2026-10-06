@@ -11,6 +11,9 @@ pub trait VirtualTableModule: Debug + Send + Sync {
 
     fn schema(&self, args: &[Value]) -> Result<String>;
     fn create(&self, args: &[Value]) -> Result<Self::Table>;
+    fn innocuous(&self) -> bool {
+        false
+    }
 }
 
 pub trait VirtualTable: Debug + Send + Sync {
@@ -59,6 +62,7 @@ pub trait TableUpdate: Send + Sync {
 pub(crate) trait ModuleFactory: Debug + Send + Sync {
     fn schema(&self, args: &[Value]) -> Result<String>;
     fn create(&self, args: &[Value]) -> Result<NativeTable>;
+    fn innocuous(&self) -> bool;
 }
 
 impl<M: VirtualTableModule> ModuleFactory for M {
@@ -70,6 +74,10 @@ impl<M: VirtualTableModule> ModuleFactory for M {
         Ok(NativeTable(Arc::new(RwLock::new(Box::new(
             VirtualTableModule::create(self, args)?,
         )))))
+    }
+
+    fn innocuous(&self) -> bool {
+        VirtualTableModule::innocuous(self)
     }
 }
 

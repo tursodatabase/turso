@@ -107,7 +107,7 @@ impl VirtualTable {
             vtab_type,
             vtab_id: 0,
             is_droppable: false,
-            innocuous: false,
+            innocuous: module.is_some_and(|module| module.implementation.innocuous()),
         };
         Ok(Arc::new(vtab))
     }
@@ -128,7 +128,7 @@ impl VirtualTable {
             vtab_type,
             vtab_id: VTAB_ID_COUNTER.fetch_add(1, Ordering::Acquire),
             is_droppable: true,
-            innocuous: false,
+            innocuous: module.is_some_and(|module| module.implementation.innocuous()),
         };
         Ok(Arc::new(vtab))
     }
