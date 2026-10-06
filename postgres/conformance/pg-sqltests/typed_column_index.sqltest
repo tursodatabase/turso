@@ -1,5 +1,6 @@
 # Indexes on columns of PostgreSQL types that Turso stores in another form
-# (timestamp, date, uuid, numeric, bigint, smallint, varchar).
+# (timestamp, timestamptz, date, time, uuid, numeric, boolean, bigint,
+# smallint, varchar).
 #
 # Each `_plain` table holds the same rows as its indexed twin but has no
 # index, so a comparison of the two counts shows that a query gives the same
@@ -45,6 +46,16 @@ setup amounts {
     INSERT INTO pa VALUES (201, -1.5);
     INSERT INTO pb SELECT id, n FROM pa WHERE id <= 200;
     INSERT INTO pa_plain SELECT id, n FROM pa;
+}
+
+setup flags_and_times {
+    CREATE TABLE ft (id int PRIMARY KEY, flag boolean, t time, tz timestamptz);
+    CREATE INDEX ft_flag ON ft (flag);
+    CREATE INDEX ft_t ON ft (t);
+    CREATE INDEX ft_tz ON ft (tz);
+    CREATE TABLE ft_plain (id int PRIMARY KEY, flag boolean, t time, tz timestamptz);
+    INSERT INTO ft VALUES (1, true, '10:30:00', '2024-06-01 00:00:00'), (2, false, '11:00:00', '2024-06-02 00:00:00');
+    INSERT INTO ft_plain SELECT * FROM ft;
 }
 
 setup integers {
@@ -202,4 +213,81 @@ expect {
     0
     2
     3
+}
+
+@setup flags_and_times
+test boolean-text-literal-same-rows-with-and-without-index {
+    SELECT CASE WHEN (SELECT count(*) FROM ft WHERE flag = 't') = (SELECT count(*) FROM ft_plain WHERE flag = 't') THEN 'same' ELSE 'different' END;
+}
+expect {
+    same
+}
+
+@setup flags_and_times
+test time-and-timestamptz-short-literal-same-rows-with-and-without-index {
+    SELECT CASE WHEN (SELECT count(*) FROM ft WHERE t = '10:30') = (SELECT count(*) FROM ft_plain WHERE t = '10:30') THEN 'same' ELSE 'different' END;
+    SELECT CASE WHEN (SELECT count(*) FROM ft WHERE tz = '2024-06-01') = (SELECT count(*) FROM ft_plain WHERE tz = '2024-06-01') THEN 'same' ELSE 'different' END;
+}
+expect {
+    same
+    same
+}
+
+@setup events
+test timestamp-and-date-cast-literal-finds-rows-with-and-without-index {
+    SELECT id FROM ev WHERE ts = '2024-01-01'::timestamp;
+    SELECT id FROM ev_plain WHERE ts = '2024-01-01'::timestamp;
+    SELECT id FROM ev WHERE ts = timestamp '2024-01-01';
+    SELECT id FROM ev_plain WHERE ts = timestamp '2024-01-01';
+    SELECT id FROM ev WHERE day = '2024-01-01 12:00:00'::date;
+    SELECT id FROM ev_plain WHERE day = '2024-01-01 12:00:00'::date;
+}
+expect {
+    1
+    1
+    1
+    1
+    1
+    1
+}
+
+@setup flags_and_times
+test time-and-timestamptz-cast-literal-finds-rows-with-and-without-index {
+    SELECT id FROM ft WHERE t = '10:30'::time;
+    SELECT id FROM ft_plain WHERE t = '10:30'::time;
+    SELECT id FROM ft WHERE tz = '2024-06-01'::timestamptz;
+    SELECT id FROM ft_plain WHERE tz = '2024-06-01'::timestamptz;
+}
+expect {
+    1
+    1
+    1
+    1
+}
+
+test temporal-cast-gives-the-text-of-the-type {
+    SELECT '2024-01-01'::timestamp, '2024-01-15 10:30:00'::date, '10:30'::time;
+}
+expect {
+    2024-01-01 00:00:00|2024-01-15|10:30:00
+}
+
+@setup events
+test timestamp-join-same-rows-with-and-without-index {
+    SELECT CASE WHEN (SELECT count(*) FROM ev_plain JOIN ev ON ev.ts = ev_plain.ts) = (SELECT count(*) FROM ev_plain a JOIN ev_plain b ON b.ts = a.ts) THEN 'same' ELSE 'different' END;
+    SELECT CASE WHEN (SELECT count(*) FROM ev_plain JOIN ev ON ev.ts > ev_plain.ts) = (SELECT count(*) FROM ev_plain a JOIN ev_plain b ON b.ts > a.ts) THEN 'same' ELSE 'different' END;
+}
+expect {
+    same
+    same
+}
+
+@setup accounts
+test uuid-join-same-rows-with-and-without-index {
+    SELECT CASE WHEN (SELECT count(*) FROM acct_plain JOIN acct ON acct.id = acct_plain.id) = (SELECT count(*) FROM acct_plain a JOIN acct_plain b ON b.id = a.id) THEN 'same' ELSE 'different' END;
+    SELECT CASE WHEN (SELECT count(*) FROM acct_plain JOIN acct ON acct.id > acct_plain.id) = (SELECT count(*) FROM acct_plain a JOIN acct_plain b ON b.id > a.id) THEN 'same' ELSE 'different' END;
+}
+expect {
+    same
+    same
 }

@@ -126,6 +126,17 @@ literal finds no row, `flag = 't'` finds no row, and an enum literal that is
 not a label finds no row instead of an error. A numeric column compares with
 a literal by its value, but with a parameter or another expression it
 compares its text form. An index on the column gives the same rows as a scan.
+One error depends on the plan: a numeric literal that is not a number, as in
+`n = 'abc'`, is an error with an index, but without an index it is an error
+only when a row gets to the comparison.
+
+An explicit cast to date, time, timetz, timestamp or timestamptz, such as
+`'2024-01-01'::timestamp` or `timestamp '2024-01-01'`, gives the text that a
+column of that type stores (`2024-01-01 00:00:00`), so `ts =
+'2024-01-01'::timestamp` finds the row. A cast of text that the column type
+does not accept, such as an offset without minutes (`+02`), is an error. A
+cast to uuid is still a cast to text, and a cast to boolean is still a cast
+to integer.
 
 | Feature | Status | Notes |
 |---------|--------|-------|

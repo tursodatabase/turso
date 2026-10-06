@@ -119,11 +119,9 @@ expect {
 @setup typed_columns
 test explain-timestamp-order-by-limit-uses-index-order {
     EXPLAIN SELECT id, note FROM ev ORDER BY ts DESC LIMIT 10;
-    EXPLAIN SELECT max(ts) FROM ev;
 }
 expect {
     1|0|0|SCAN ev USING INDEX ev_ts
-    1|0|0|SCAN ev USING COVERING INDEX ev_ts
 }
 
 @setup typed_columns

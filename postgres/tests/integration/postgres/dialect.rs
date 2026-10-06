@@ -3499,7 +3499,7 @@ fn test_postgres_uuid_index_lookup_with_bound_parameter(db: TempDatabase) {
     conn.execute("CREATE TABLE acct_plain (id uuid, name text)")
         .unwrap();
     for table in ["acct", "acct_plain"] {
-        conn.execute(&format!(
+        conn.execute(format!(
             "INSERT INTO {table} VALUES ('a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11', 'alice'), \
              ('00000000-0000-4000-8000-000000000001', 'bob')"
         ))
@@ -3585,15 +3585,15 @@ fn test_postgres_numeric_equality_with_bound_parameter_same_rows_with_and_withou
     conn.execute("CREATE TABLE pa_plain (id int PRIMARY KEY, n numeric(10,2))")
         .unwrap();
     for table in ["pa", "pa_plain"] {
-        conn.execute(&format!(
+        conn.execute(format!(
             "INSERT INTO {table} VALUES (1, 1.5), (2, 12.25), (3, -2)"
         ))
         .unwrap();
     }
-    for param in [
-        Value::from_f64(1.5),
-        Value::from_text("12.25".to_owned()),
-        Value::from_i64(-2),
+    for (param, turso_count) in [
+        (Value::from_f64(1.5), 0),
+        (Value::from_text("12.25".to_owned()), 1),
+        (Value::from_i64(-2), 0),
     ] {
         let count = |table: &str| {
             rows_with_param(
@@ -3603,6 +3603,13 @@ fn test_postgres_numeric_equality_with_bound_parameter_same_rows_with_and_withou
             )
         };
         assert_eq!(count("pa"), count("pa_plain"), "for {param:?}");
+        assert_eq!(
+            count("pa"),
+            vec![vec![Value::from_i64(turso_count)]],
+            "for {param:?}: a parameter compares with the text of the column and is not cast \
+             to numeric, so only the text '12.25' finds its row (PostgreSQL finds one row for \
+             each parameter)"
+        );
     }
 }
 
