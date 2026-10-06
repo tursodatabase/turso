@@ -272,6 +272,7 @@ pub struct SchemaBuilder {
     tables: Vec<TableRef>,
     indexes: Vec<IndexRef>,
     views: Vec<ViewRef>,
+    materialized_views: Vec<TableRef>,
     triggers: Vec<TriggerRef>,
     attached_databases: Vec<String>,
 }
@@ -296,6 +297,12 @@ impl SchemaBuilder {
         self
     }
 
+    /// Adds a materialized view as the relation it exposes: its name and output columns.
+    pub fn add_materialized_view(mut self, view: Table) -> Self {
+        self.materialized_views.push(Rc::new(view));
+        self
+    }
+
     pub fn add_trigger(mut self, trigger: Trigger) -> Self {
         self.triggers.push(Rc::new(trigger));
         self
@@ -313,6 +320,7 @@ impl SchemaBuilder {
             tables: Rc::new(self.tables),
             indexes: Rc::new(self.indexes),
             views: Rc::new(self.views),
+            materialized_views: Rc::new(self.materialized_views),
             triggers: Rc::new(self.triggers),
             attached_databases: self.attached_databases,
         }
@@ -328,6 +336,7 @@ pub struct Schema {
     pub tables: Rc<Vec<TableRef>>,
     pub indexes: Rc<Vec<IndexRef>>,
     pub views: Rc<Vec<ViewRef>>,
+    pub materialized_views: Rc<Vec<TableRef>>,
     pub triggers: Rc<Vec<TriggerRef>>,
     /// Names of attached databases (e.g. ["aux"]).
     /// Empty means only the main database is available.
@@ -371,6 +380,14 @@ impl Schema {
     /// Returns all view names in the schema.
     pub fn view_names(&self) -> HashSet<String> {
         self.views.iter().map(|v| v.name.clone()).collect()
+    }
+
+    /// Returns all materialized view names in the schema.
+    pub fn materialized_view_names(&self) -> HashSet<String> {
+        self.materialized_views
+            .iter()
+            .map(|v| v.name.clone())
+            .collect()
     }
 
     /// Returns a table by name.
