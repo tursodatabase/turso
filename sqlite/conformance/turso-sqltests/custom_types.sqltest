@@ -1891,3 +1891,54 @@ test create-type-with-built-in-name {
 expect error {
     type uuid already exists
 }
+
+@requires strict "uses STRICT tables"
+test alter-column-refuses-type-change-of-custom-type {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, n numeric(10,2)) STRICT, PGSTORAGE;
+    INSERT INTO t VALUES (1, 2.5);
+    ALTER TABLE t ALTER COLUMN n TO n2 TEXT;
+}
+expect error {
+    cannot change the type of column n from numeric to TEXT
+}
+
+@requires strict "uses STRICT tables"
+test alter-column-refuses-change-between-custom-types {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, ts timestamp) STRICT;
+    INSERT INTO t VALUES (1, '2024-01-02 03:04:05');
+    ALTER TABLE t ALTER COLUMN ts TO d date;
+}
+expect error {
+    cannot change the type of column ts from timestamp to date
+}
+
+@requires strict "uses STRICT tables"
+test alter-column-refuses-change-to-custom-type {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, b BLOB) STRICT;
+    ALTER TABLE t ALTER COLUMN b TO u uuid;
+}
+expect error {
+    cannot change the type of column b from BLOB to uuid
+}
+
+@requires strict "uses STRICT tables"
+test alter-column-refuses-change-of-array-dimensions {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, a INTEGER[]) STRICT;
+    ALTER TABLE t ALTER COLUMN a TO b INTEGER;
+}
+expect error {
+    cannot change the type of column a from INTEGER\[\] to INTEGER:
+}
+
+@requires strict "uses STRICT tables"
+test alter-column-keeps-the-same-custom-type {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, n numeric(10,2)) STRICT;
+    INSERT INTO t VALUES (1, 2.5);
+    ALTER TABLE t ALTER COLUMN n TO amount numeric(10,2) NOT NULL;
+    SELECT sql FROM sqlite_schema WHERE name = 't';
+    SELECT id, amount FROM t;
+}
+expect {
+    CREATE TABLE t (id INTEGER PRIMARY KEY, amount numeric (10, 2) NOT NULL) STRICT
+    1|2.50
+}

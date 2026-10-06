@@ -15,8 +15,8 @@ use crate::{
     error::SQLITE_CONSTRAINT_CHECK,
     function::{AlterTableFunc, Func},
     schema::{
-        collect_column_dependencies_of_expr, BTreeTable, CheckConstraint, Column, ColumnLayout,
-        ForeignKey, FromDefinitionFlags, Index, Table, EXPR_INDEX_SENTINEL,
+        collect_column_dependencies_of_expr, is_strict_primitive_type, BTreeTable, CheckConstraint,
+        Column, ColumnLayout, ForeignKey, FromDefinitionFlags, Index, Table, EXPR_INDEX_SENTINEL,
         RESERVED_TABLE_PREFIXES,
     },
     translate::{
@@ -1878,6 +1878,15 @@ pub fn translate_alter_table(
                                 .with(FromDefinitionFlags::InStrictTable, btree.is_strict),
                         )?;
                         let old_column = &btree.columns()[column_index];
+                        if btree.is_strict
+                            && changes_custom_column_type(old_column, &replacement_column)
+                        {
+                            bail_parse_error!(
+                                "cannot change the type of column {from} from {} to {}: the stored values of a custom type or an array are not converted",
+                                declared_type(old_column),
+                                declared_type(&replacement_column)
+                            );
+                        }
                         let becomes_generated =
                             !old_column.is_generated() && replacement_column.is_generated();
                         // Toggling the virtual-generated bit changes whether the column
@@ -2361,6 +2370,25 @@ pub fn translate_alter_table(
 // Example: `x NUMERIC -> y TEXT` requires rebuilding `INDEX ON t(x)` with TEXT
 // keys; `g AS ('old:' || a) -> g AS ('new:' || a)` requires rebuilding
 // `INDEX ON t(g)` even though `g` is virtual and table rows are not rewritten.
+/// A column of a custom type or an array stores the encoded form of its
+/// type, and ALTER COLUMN does not convert stored values.
+fn changes_custom_column_type(old: &Column, new: &Column) -> bool {
+    let is_custom =
+        |column: &Column| column.is_array() || !is_strict_primitive_type(&column.ty_str);
+    let same_type = old.ty_str.eq_ignore_ascii_case(&new.ty_str)
+        && old.ty_params == new.ty_params
+        && old.array_dimensions() == new.array_dimensions();
+    !same_type && (is_custom(old) || is_custom(new))
+}
+
+fn declared_type(column: &Column) -> String {
+    format!(
+        "{}{}",
+        column.ty_str,
+        "[]".repeat(column.array_dimensions() as usize)
+    )
+}
+
 fn indexes_affected_by_column_rewrite(
     original_table: &BTreeTable,
     rewritten_table: &BTreeTable,
