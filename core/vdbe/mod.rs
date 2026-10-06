@@ -34,6 +34,8 @@ pub mod explain;
 pub mod hash_table;
 pub mod insn;
 pub mod metrics;
+#[cfg(test)]
+mod native_extension_tests;
 pub mod rowset;
 pub mod sorter;
 #[cfg(test)]
