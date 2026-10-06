@@ -324,6 +324,88 @@ public class SqliteFacadeTests
     }
 
     [Test]
+    public void PooledConnectionsDoNotShareConnectionState()
+    {
+        using var directory = new TemporaryDirectory();
+        var path = Path.Combine(directory.Path, "pooled-state.db");
+        using (var first = new SqliteConnection($"Data Source={path}"))
+        {
+            first.Open();
+            first.ExecuteNonQuery("CREATE TABLE Data(Value INTEGER); PRAGMA foreign_keys = ON;");
+            first.ExecuteScalar<long>("PRAGMA foreign_keys;").Should().Be(1);
+        }
+
+        using var second = new SqliteConnection($"Data Source={path}");
+        second.Open();
+        second.ExecuteScalar<long>("PRAGMA foreign_keys;").Should().Be(0);
+        second.ExecuteScalar<long>("SELECT COUNT(*) FROM Data;").Should().Be(0);
+    }
+
+    [Test]
+    public void ClosingPooledConnectionRollsBackOpenTransaction()
+    {
+        using var directory = new TemporaryDirectory();
+        var path = Path.Combine(directory.Path, "pooled-rollback.db");
+        using (var setup = new SqliteConnection($"Data Source={path}"))
+        {
+            setup.Open();
+            setup.ExecuteNonQuery("CREATE TABLE Data(Value INTEGER);");
+        }
+
+        using (var writer = new SqliteConnection($"Data Source={path}"))
+        {
+            writer.Open();
+            writer.ExecuteNonQuery("BEGIN; INSERT INTO Data VALUES (1);");
+        }
+
+        using var reader = new SqliteConnection($"Data Source={path}");
+        reader.Open();
+        reader.ExecuteScalar<long>("SELECT COUNT(*) FROM Data;").Should().Be(0);
+    }
+
+    [Test]
+    public void ClearPoolReleasesDatabaseFiles()
+    {
+        using var directory = new TemporaryDirectory();
+        var path = Path.Combine(directory.Path, "pooled-clear.db");
+        using (var connection = new SqliteConnection($"Data Source={path}"))
+        {
+            connection.Open();
+            connection.ExecuteNonQuery("CREATE TABLE Data(Value INTEGER); INSERT INTO Data VALUES (1);");
+            connection.Close();
+            SqliteConnection.ClearPool(connection);
+        }
+
+        File.Delete(path);
+        File.Delete(path + "-wal");
+        File.Exists(path).Should().BeFalse();
+
+        using var reopened = new SqliteConnection($"Data Source={path}");
+        reopened.Open();
+        reopened.ExecuteScalar<long>("SELECT COUNT(*) FROM sqlite_master;").Should().Be(0);
+    }
+
+    [Test]
+    public void FailedPooledOpenDoesNotKeepFileOpen()
+    {
+        using var directory = new TemporaryDirectory();
+        var path = Path.Combine(directory.Path, "pooled-not-a-database.db");
+        var garbage = new byte[8192];
+        Array.Fill(garbage, (byte)0x5A);
+        File.WriteAllBytes(path, garbage);
+
+        using (var connection = new SqliteConnection($"Data Source={path}"))
+            Assert.Throws<SqliteException>(() => connection.Open());
+
+        File.Delete(path);
+        File.Exists(path).Should().BeFalse();
+
+        using var reopened = new SqliteConnection($"Data Source={path}");
+        reopened.Open();
+        reopened.ExecuteScalar<long>("SELECT COUNT(*) FROM sqlite_master;").Should().Be(0);
+    }
+
+    [Test]
     public void StateChangeFiresForOpenAndClose()
     {
         using var connection = new SqliteConnection("Data Source=:memory:");
@@ -1184,6 +1266,7 @@ public class SqliteFacadeTests
 
         public void Dispose()
         {
+            SqliteConnection.ClearAllPools();
             if (Directory.Exists(Path))
                 Directory.Delete(Path, recursive: true);
         }
