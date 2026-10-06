@@ -11302,6 +11302,12 @@ pub fn op_function(
                 state.registers[*dest].set_value(result);
             }
             ScalarFunc::StringToArray => {
+                if arg_count < 2 || arg_count > 3 {
+                    return Err(LimboError::InternalError(format!(
+                        "string_to_array takes 2 or 3 arguments, got {arg_count}"
+                    ))
+                    .into());
+                }
                 let text = state.registers[*start_reg].get_value().clone();
                 let delimiter = state.registers[*start_reg + 1].get_value().clone();
                 let null_str = if arg_count >= 3 {
@@ -11316,6 +11322,12 @@ pub fn op_function(
                 )?);
             }
             ScalarFunc::ArrayToString => {
+                if arg_count < 2 || arg_count > 3 {
+                    return Err(LimboError::InternalError(format!(
+                        "array_to_string takes 2 or 3 arguments, got {arg_count}"
+                    ))
+                    .into());
+                }
                 let arr_val = state.registers[*start_reg].get_value().clone();
                 let delimiter = state.registers[*start_reg + 1].get_value().clone();
                 let null_str = if arg_count >= 3 {
