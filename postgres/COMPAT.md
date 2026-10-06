@@ -372,7 +372,9 @@ a table as Turso SQL without the marker. Nothing shows that such a table is a
 table of the PostgreSQL frontend, so it does not get the `PGSTORAGE` option.
 RENAME of older versions stored the marker before Turso SQL. tursopg reads
 such a table, also when a DEFAULT calls a function, and the table gets the
-`PGSTORAGE` option at its next ALTER TABLE.
+`PGSTORAGE` option at its next ALTER TABLE. The CHECK and DEFAULT
+expressions of a table with the marker keep the casts of the older version:
+`x::date`, `x::time` and `x::timestamp` are a cast to TEXT there.
 
 tursopg attaches the schema files next to the database at start. A schema
 file that does not attach, for example because its tables use a type that

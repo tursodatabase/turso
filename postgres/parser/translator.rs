@@ -2203,7 +2203,7 @@ impl PostgreSQLTranslator {
                 let type_name = type_cast
                     .type_name
                     .as_ref()
-                    .and_then(pg_type_name_to_ast_type);
+                    .and_then(|type_name| pg_type_name_to_ast_type(type_name, self.type_mapping));
                 Ok(ast::Expr::Cast { expr, type_name })
             }
             Some(pg_query::protobuf::node::Node::SubLink(sub_link)) => {
@@ -4311,8 +4311,13 @@ fn translate_create_enum(
 }
 
 /// Convert a pg_query TypeName to a Turso AST Type for use in CAST expressions.
-/// Maps PG types to their base SQLite storage types.
-fn pg_type_name_to_ast_type(type_name: &pg_query::protobuf::TypeName) -> Option<ast::Type> {
+/// Maps PG types to their base SQLite storage types. `TypeMapping::V1` keeps
+/// the casts of the version that stored the table: a cast to a date or time
+/// type is a cast to TEXT.
+fn pg_type_name_to_ast_type(
+    type_name: &pg_query::protobuf::TypeName,
+    mapping: TypeMapping,
+) -> Option<ast::Type> {
     use pg_query::protobuf::node::Node;
 
     let mut parts = Vec::new();
@@ -4338,6 +4343,9 @@ fn pg_type_name_to_ast_type(type_name: &pg_query::protobuf::TypeName) -> Option<
         // to INTEGER for SQLite VDBE compatibility. A temporal type maps to
         // its custom type, whose ENCODE gives the text that a column stores.
         "BOOLEAN" | "BOOL" => "INTEGER",
+        "DATE" | "TIME" | "TIMETZ" | "TIMESTAMP" | "TIMESTAMPTZ" if mapping == TypeMapping::V1 => {
+            "TEXT"
+        }
         "DATE" => "date",
         "TIME" | "TIMETZ" => "time",
         "TIMESTAMP" => "timestamp",
@@ -7508,7 +7516,10 @@ mod tests {
              c text COLLATE \"C\")",
             "CREATE TABLE t (a text DEFAULT 'x'::text, b timestamp DEFAULT now(), \
              c int DEFAULT -1 CHECK (c > -5), d text CHECK (d::date <> '2024-01-01'), \
-             e boolean DEFAULT false, f int[] DEFAULT ARRAY[1, 2], CHECK (c < 10))",
+             e boolean DEFAULT false, f int[] DEFAULT ARRAY[1, 2], \
+             g text CHECK (g::timestamp > '2024-01-01' AND g::time < '23:00' \
+             AND g::timestamptz > timestamp '2000-01-01'), h text DEFAULT '2024-01-01'::date, \
+             CHECK (c < 10))",
             "CREATE TABLE s.t (id serial PRIMARY KEY, a text)",
         ];
         let translated: Vec<String> = corpus
@@ -7534,7 +7545,7 @@ mod tests {
             "CREATE TABLE t (a INTEGER, b INTEGER, c TEXT UNIQUE, PRIMARY KEY (b, a), UNIQUE (a)) STRICT, PGSTORAGE",
             "CREATE TABLE t (id INTEGER PRIMARY KEY, p INTEGER REFERENCES t (id) ON DELETE CASCADE, q INTEGER, FOREIGN KEY (q) REFERENCES t (id)) STRICT, PGSTORAGE",
             "CREATE TABLE t (a INTEGER, b INTEGER, c TEXT) STRICT, PGSTORAGE",
-            "CREATE TABLE t (a TEXT DEFAULT (CAST ('x' AS TEXT)), b timestamp DEFAULT (now ()), c INTEGER DEFAULT -1 CHECK (c > -5), d TEXT CHECK (CAST (d AS date) != '2024-01-01'), e boolean DEFAULT 0, f INTEGER[] DEFAULT (array (1, 2)), CHECK (c < 10)) STRICT, PGSTORAGE",
+            "CREATE TABLE t (a TEXT DEFAULT (CAST ('x' AS TEXT)), b timestamp DEFAULT (now ()), c INTEGER DEFAULT -1 CHECK (c > -5), d TEXT CHECK (CAST (d AS TEXT) != '2024-01-01'), e boolean DEFAULT 0, f INTEGER[] DEFAULT (array (1, 2)), g TEXT CHECK (CAST (g AS TEXT) > '2024-01-01' AND CAST (g AS TEXT) < '23:00' AND CAST (g AS TEXT) > CAST ('2000-01-01' AS TEXT)), h TEXT DEFAULT (CAST ('2024-01-01' AS TEXT)), CHECK (c < 10)) STRICT, PGSTORAGE",
             "CREATE TABLE t (id INTEGER PRIMARY KEY DEFAULT (nextval ('t_id_seq')), a TEXT) STRICT, PGSTORAGE",
         ];
         assert_eq!(translated, expected);

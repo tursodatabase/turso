@@ -383,6 +383,59 @@ fn renamed_table_with_function_defaults_of_base_file_loads() {
     );
 }
 
+/// More types of the base tursopg, and CHECK constraints with casts to date
+/// and timestamp. The base translated these casts to a cast to TEXT, so the
+/// rows of the base file keep the meaning of their CHECK.
+#[test]
+fn more_types_of_base_file_keep_their_values() {
+    let dir = copy_fixtures(&["pg_v1_more_types.db"]);
+    let db = open(dir.path().join("pg_v1_more_types.db"), false);
+    let conn = db.connect_postgres();
+    assert_eq!(
+        rows(&conn, "SELECT * FROM more_types ORDER BY id"),
+        [
+            "1|10:00:00|12345|12345.67890|3.25|ab|08:00:2b:01:02:03:04:05",
+            "2|NULL|-7|NULL|NULL|NULL|NULL"
+        ]
+    );
+    assert_eq!(
+        rows(&conn, "SELECT * FROM more_arrays ORDER BY id"),
+        [
+            "1|{9000000000,-1}|{1,0}|{01945ca0-3189-76c0-9a8f-caf310fc8b8e}",
+            "2|{}|{}|{}"
+        ]
+    );
+    assert_eq!(
+        rows(&conn, "SELECT * FROM ck ORDER BY id"),
+        [
+            "1|2024-01-01 10:00:00|NULL",
+            "2|garbage|NULL",
+            "3|NULL|2024-01-02"
+        ]
+    );
+    conn.execute("INSERT INTO more_types (tt, n5, n30) VALUES ('11:00:00', 5, 1.5)")
+        .unwrap();
+    assert_eq!(
+        rows(&conn, "SELECT id, tt, n5, n30 FROM more_types WHERE id = 3"),
+        ["3|11:00:00|5|1.50000"]
+    );
+    for accepted in [
+        "INSERT INTO ck VALUES (4, '2024-01-01 12:00:00', NULL)",
+        "INSERT INTO ck VALUES (5, 'garbage', NULL)",
+    ] {
+        conn.execute(accepted)
+            .unwrap_or_else(|e| panic!("{accepted}: {e}"));
+    }
+    for refused in [
+        "INSERT INTO ck VALUES (6, NULL, '2024-01-01')",
+        "INSERT INTO ck VALUES (7, '2024-01-01', NULL)",
+        "INSERT INTO more_types (n5) VALUES (123456)",
+    ] {
+        assert!(conn.execute(refused).is_err(), "{refused}");
+    }
+    assert_eq!(core_rows(conn.inner(), "PRAGMA integrity_check"), ["ok"]);
+}
+
 /// A user type named like a built-in type of the next steps keeps working.
 #[test]
 fn user_type_with_pg_prefix_of_base_file_still_works() {
