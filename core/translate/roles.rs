@@ -138,6 +138,11 @@ pub fn check_storage_access(
     {
         return Ok(());
     }
+    if let Some(view_name) = program.referenced_views.first() {
+        return Err(LimboError::PermissionDenied(format!(
+            "permission denied for view {view_name}"
+        )));
+    }
     for (insn, _) in &program.insns {
         let (db, root_page) = match insn {
             Insn::OpenRead { db, root_page, .. } => (*db, Some(*root_page)),
@@ -480,6 +485,26 @@ mod tests {
         let error = conn.prepare("SELECT * FROM t").err().unwrap();
 
         assert_eq!(error.to_string(), "permission denied for table t");
+    }
+
+    #[test]
+    fn role_without_privileges_cannot_read_views() {
+        let conn = open_connection();
+        conn.execute("CREATE TABLE t (x)").unwrap();
+        conn.execute("CREATE VIEW over_table AS SELECT x FROM t")
+            .unwrap();
+        conn.execute("CREATE VIEW constant AS SELECT 'secret' AS value")
+            .unwrap();
+        create_role(&conn, "alice").unwrap();
+        set_role(&conn, "alice").unwrap();
+
+        for view in ["over_table", "constant"] {
+            let error = conn.execute(format!("SELECT * FROM {view}")).unwrap_err();
+            assert_eq!(
+                error.to_string(),
+                format!("permission denied for view {view}")
+            );
+        }
     }
 
     #[test]
