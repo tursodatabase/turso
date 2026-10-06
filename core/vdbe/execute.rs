@@ -10624,6 +10624,12 @@ pub fn op_function(
                 if !program.connection.can_load_extensions() {
                     crate::bail_parse_error!("runtime extension loading is disabled");
                 }
+                if !program.connection.current_role_is_superuser() {
+                    return Err(LimboError::PermissionDenied(
+                        "permission denied for function load_extension".to_string(),
+                    )
+                    .into());
+                }
                 let extension = &state.registers[*start_reg];
                 let ext = resolve_ext_path(&extension.get_value().to_string())?;
                 program.connection.load_extension(ext)?;
