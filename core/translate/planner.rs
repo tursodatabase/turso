@@ -2100,6 +2100,7 @@ fn parse_table(
     let regular_view =
         resolver.with_schema(database_id, |schema| schema.get_view(table_name.as_str()));
     if let Some(view) = regular_view {
+        program.referenced_views.push(view.name.clone());
         // Views are essentially query aliases, so just Expand the view as a subquery.
         let mut view_select = view.select_stmt.clone();
         if let ast::OneSelect::Select {
@@ -2363,6 +2364,7 @@ pub fn parse_from(
                 &cte_definitions,
             );
             for (cte_definition_index, cte_definition) in cte_definitions.iter().enumerate() {
+                let views_read_before_planning = program.referenced_views.len();
                 let cte_table = plan_cte(
                     cte_definition_index,
                     &cte_definitions,
@@ -2372,6 +2374,9 @@ pub fn parse_from(
                     connection,
                     false,
                 )?;
+                program
+                    .referenced_views
+                    .truncate(views_read_before_planning);
                 table_references.add_outer_query_reference(OuterQueryReference {
                     identifier: cte_definition.name.clone(),
                     internal_id: cte_table.internal_id,

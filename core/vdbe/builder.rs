@@ -237,6 +237,9 @@ pub struct ProgramBuilder {
     /// because they never need to use [ProgramBuilder::resolve_cursor_id] to find it
     /// again. Hence, the key is optional.
     pub cursor_ref: Vec<(Option<CursorKey>, CursorType)>,
+    /// Every view that the program reads. A view is replaced by its query,
+    /// so it opens no storage of its own.
+    pub referenced_views: Vec<String>,
     /// The original indexes of the instructions that open the CDC table to
     /// write change records. The records are the engine's own, so the
     /// privilege checks skip these instructions.
@@ -714,6 +717,7 @@ impl ProgramBuilder {
             next_hash_table_id: HASH_TABLE_ID_BASE,
             insns: Vec::with_capacity(opts.approx_num_insns),
             cursor_ref: Vec::with_capacity(opts.num_cursors),
+            referenced_views: Vec::new(),
             change_capture_writes: Vec::new(),
             constant_spans: Vec::new(),
             label_to_resolved_offset: Vec::with_capacity(opts.approx_num_labels),
