@@ -103,6 +103,150 @@ expect {
     cr_committed
 }
 
+test set-role-changes-current-user {
+    CREATE ROLE sr_current;
+    SET ROLE sr_current;
+    SELECT current_user;
+}
+expect {
+    sr_current
+}
+
+test set-role-keeps-session-user {
+    CREATE ROLE sr_session;
+    SET ROLE sr_session;
+    SELECT CASE WHEN session_user = 'sr_session' THEN 'changed' ELSE 'kept' END;
+}
+expect {
+    kept
+}
+
+test reset-role-returns-to-session-user {
+    CREATE ROLE sr_reset;
+    SET ROLE sr_reset;
+    RESET ROLE;
+    SELECT CASE WHEN current_user = session_user THEN 'session user' ELSE 'other' END;
+}
+expect {
+    session user
+}
+
+test set-role-none-returns-to-session-user {
+    CREATE ROLE sr_none;
+    SET ROLE sr_none;
+    SET ROLE NONE;
+    SELECT CASE WHEN current_user = session_user THEN 'session user' ELSE 'other' END;
+}
+expect {
+    session user
+}
+
+test set-role-to-missing-role-fails {
+    SET ROLE sr_missing;
+}
+expect error {
+    role "sr_missing" does not exist
+}
+
+test role-without-privileges-can-select-without-tables {
+    CREATE ROLE sr_no_tables;
+    SET ROLE sr_no_tables;
+    SELECT 1 + 1, upper('x');
+}
+expect {
+    2|X
+}
+
+test role-without-privileges-cannot-select-from-table {
+    CREATE TABLE sr_select (x int);
+    CREATE ROLE sr_selector;
+    SET ROLE sr_selector;
+    SELECT * FROM sr_select;
+}
+expect error {
+    permission denied for table sr_select
+}
+
+test role-without-privileges-cannot-insert-into-table {
+    CREATE TABLE sr_insert (x int);
+    CREATE ROLE sr_inserter;
+    SET ROLE sr_inserter;
+    INSERT INTO sr_insert VALUES (1);
+}
+expect error {
+    permission denied for table sr_insert
+}
+
+test role-without-privileges-cannot-update-table {
+    CREATE TABLE sr_update (x int);
+    CREATE ROLE sr_updater;
+    SET ROLE sr_updater;
+    UPDATE sr_update SET x = 1;
+}
+expect error {
+    permission denied for table sr_update
+}
+
+test role-without-privileges-cannot-delete-from-table {
+    CREATE TABLE sr_delete (x int);
+    CREATE ROLE sr_deleter;
+    SET ROLE sr_deleter;
+    DELETE FROM sr_delete;
+}
+expect error {
+    permission denied for table sr_delete
+}
+
+test role-without-privileges-cannot-use-sequence {
+    CREATE SEQUENCE sr_sequence;
+    CREATE ROLE sr_sequence_user;
+    SET ROLE sr_sequence_user;
+    SELECT nextval('sr_sequence');
+}
+expect error {
+    permission denied for sequence sr_sequence
+}
+
+test role-without-privileges-cannot-create-table {
+    CREATE ROLE sr_creator;
+    SET ROLE sr_creator;
+    CREATE TABLE sr_created (x int);
+}
+expect error {
+    permission denied for schema public
+}
+
+test role-without-privileges-cannot-drop-table {
+    CREATE TABLE sr_drop (x int);
+    CREATE ROLE sr_dropper;
+    SET ROLE sr_dropper;
+    DROP TABLE sr_drop;
+}
+expect error {
+    must be owner of table sr_drop
+}
+
+test role-without-privileges-cannot-create-role {
+    CREATE ROLE sr_role_creator;
+    SET ROLE sr_role_creator;
+    CREATE ROLE sr_role_created;
+}
+expect error {
+    permission denied to create role
+}
+
+test reset-role-restores-superuser-privileges {
+    CREATE TABLE sr_restore (x int);
+    INSERT INTO sr_restore VALUES (1);
+    CREATE ROLE sr_restorer;
+    SET ROLE sr_restorer;
+    RESET ROLE;
+    SELECT x FROM sr_restore;
+}
+expect {
+    1
+}
+
 test pg-tables-does-not-list-the-roles-table {
     CREATE ROLE pt_role;
     SELECT count(*) FROM pg_tables WHERE tablename LIKE '%roles%';
@@ -133,4 +277,36 @@ test pg-get-constraintdef-finds-constraint-after-create-role {
 }
 expect {
     PRIMARY KEY (x)
+}
+
+test role-without-privileges-cannot-select-from-view-without-tables {
+    CREATE VIEW sr_constant_view AS SELECT 'secret' AS value;
+    CREATE ROLE sr_constant_viewer;
+    SET ROLE sr_constant_viewer;
+    SELECT * FROM sr_constant_view;
+}
+expect error {
+    permission denied for view sr_constant_view
+}
+
+test role-without-privileges-cannot-select-from-view {
+    CREATE TABLE sr_view_table (x int);
+    CREATE VIEW sr_view AS SELECT x FROM sr_view_table;
+    CREATE ROLE sr_viewer;
+    SET ROLE sr_viewer;
+    SELECT * FROM sr_view;
+}
+expect error {
+    permission denied for view sr_view
+}
+
+test role-without-privileges-cannot-use-currval {
+    CREATE SEQUENCE sr_currval_sequence;
+    SELECT nextval('sr_currval_sequence');
+    CREATE ROLE sr_currval_user;
+    SET ROLE sr_currval_user;
+    SELECT currval('sr_currval_sequence');
+}
+expect error {
+    permission denied for sequence sr_currval_sequence
 }

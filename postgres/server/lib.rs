@@ -692,6 +692,8 @@ fn command_tag(query: &str, affected_rows: usize) -> Tag {
         Tag::new("RELEASE")
     } else if upper.starts_with("SET") {
         Tag::new("SET")
+    } else if upper.starts_with("RESET") {
+        Tag::new("RESET")
     } else if upper.starts_with("COPY") {
         Tag::new("COPY").with_rows(affected_rows)
     } else if upper.starts_with("COMMENT") {
@@ -768,6 +770,11 @@ mod tests {
     #[test]
     fn create_role_has_its_own_command_tag() {
         assert_eq!(command_tag("CREATE ROLE alice", 0), Tag::new("CREATE ROLE"));
+    }
+
+    #[test]
+    fn reset_has_its_own_command_tag() {
+        assert_eq!(command_tag("RESET ROLE", 0), Tag::new("RESET"));
     }
 
     #[test]
