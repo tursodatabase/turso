@@ -5,6 +5,7 @@ mod domain;
 mod functions;
 mod parse_edge_cases;
 mod sequence;
+mod storage_compat;
 mod stored_schema;
 mod table;
 mod type_aliases;
