@@ -118,6 +118,48 @@ JOIN t4 ON t3.b = t4.b OR t3.c = t4.c";
 }
 
 #[test]
+/// Regression: a multi-index AND scan on the *left* table of a LEFT JOIN was
+/// driven by a term from that join's ON clause, filtering out the very rows the
+/// join then owed back null-extended.
+fn multi_index_and_scan_not_driven_by_another_joins_on_term() {
+    let tmp_db = TempDatabase::new_empty();
+    let sqlite_conn = rusqlite::Connection::open_in_memory().unwrap();
+    let conn = tmp_db.connect_limbo();
+
+    for stmt in [
+        "CREATE TABLE t(id INTEGER PRIMARY KEY, s TEXT, g INTEGER)",
+        "CREATE TABLE u(uid INTEGER)",
+        "INSERT INTO t VALUES(1,'a',1),(2,'b',1)",
+        "INSERT INTO u VALUES(1)",
+        "CREATE INDEX i1 ON t(s)",
+        "CREATE INDEX i2 ON t(g)",
+    ] {
+        limbo_exec_rows(&conn, stmt);
+        sqlite_conn.execute(stmt, []).unwrap();
+    }
+
+    let unmatched = "SELECT t.id FROM t LEFT JOIN u ON u.uid = t.id AND t.s = 'a' WHERE t.g > 0";
+    let select = format!("{unmatched} ORDER BY t.id");
+    assert_that!(limbo_exec_rows(&conn, &select))
+        .named("rows the LEFT JOIN must null-extend")
+        .is_equal_to(sqlite_exec_rows(&sqlite_conn, &select));
+
+    // Still usable where t is the join's own right-hand side.
+    let rhs = "SELECT t.id FROM u LEFT JOIN t ON t.s = 'a' AND t.g > 0 ORDER BY t.id";
+    assert_that!(limbo_exec_rows(&conn, rhs))
+        .named("ON clause constraining the join's own table")
+        .is_equal_to(sqlite_exec_rows(&sqlite_conn, rhs));
+
+    let delete = format!("DELETE FROM t WHERE id NOT IN ({unmatched})");
+    limbo_exec_rows(&conn, &delete);
+    sqlite_conn.execute(&delete, []).unwrap();
+    let count = "SELECT count(*) FROM t";
+    assert_that!(limbo_exec_rows(&conn, count))
+        .named("rows surviving the delete")
+        .is_equal_to(sqlite_exec_rows(&sqlite_conn, count));
+}
+
+#[test]
 fn debug_tracing_does_not_crash_multi_index_update() {
     let log = tempfile::NamedTempFile::new().expect("create temporary debug log");
     let log_file = log.reopen().expect("reopen temporary debug log");
