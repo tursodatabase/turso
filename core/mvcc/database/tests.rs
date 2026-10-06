@@ -7015,7 +7015,7 @@ fn probe_exists(db: &MvccTestDb, cursor: &mut crate::MvCursor, rowid: i64) -> (b
 }
 
 #[test]
-fn exists_skips_the_btree_for_a_rowid_above_the_allocator_max() {
+fn exists_skips_the_btree_for_a_rowid_above_its_last_row() {
     let db = MvccTestDb::new();
     db.conn
         .execute("CREATE TABLE t(x INTEGER PRIMARY KEY, v TEXT)")
@@ -24106,9 +24106,6 @@ fn step_until_busy_then_release(
     }
 }
 
-/// Non-positive rowids never take the skip. Recovery can leave a committed
-/// rowid above a non-positive physical last, and the store last can sit
-/// above that last, so the skip bound is not a safe ceiling here.
 #[test]
 fn notexists_descends_the_btree_for_non_positive_rowids() {
     let db = MvccTestDbNoConn::new_with_random_db();

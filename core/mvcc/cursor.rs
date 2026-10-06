@@ -5,8 +5,8 @@ use crate::types::IOResultOr;
 
 use crate::mvcc::clock::LogicalClock;
 use crate::mvcc::database::{
-    create_seek_range, MVTableId, MvStore, MvccReadSnapshot, Row, RowID, RowKey, RowVersions,
-    RowidAllocator, SortableIndexKey,
+    create_seek_range, BtreeLast, MVTableId, MvStore, MvccReadSnapshot, Row, RowID, RowKey,
+    RowVersions, RowidAllocator, SortableIndexKey,
 };
 #[cfg(any(test, injected_yields))]
 use crate::mvcc::yield_hooks::{ProvidesYieldContext, YieldContext, YieldPointMarker};
@@ -655,11 +655,8 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> MvccLazyCursor<Clock
             .clone()
     }
 
-    fn btree_may_hold(&mut self, rowid: i64) -> Result<bool> {
-        if self.rowid_allocator().rowid_ceiling_rules_out(rowid) {
-            return Ok(false);
-        }
-        self.query_btree_version_is_valid(&RowKey::Int(rowid))
+    fn btree_may_hold(&mut self, last: BtreeLast, rowid: i64) -> Result<bool> {
+        Ok(last.may_hold(rowid) && self.query_btree_version_is_valid(&RowKey::Int(rowid))?)
     }
 
     /// Forward-direction shadow check: `IndexShadowScan` fast-path for index
@@ -2063,12 +2060,13 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> CursorTrait
                         self.state = None;
                         return Ok(IOResult::Done(false));
                     }
-                    if self.rowid_allocator().btree_last().is_none() {
+                    let Some(last) = self.rowid_allocator().btree_last(self.snapshot.read_mark)
+                    else {
                         self.state
                             .replace(MvccLazyCursorState::Exists(ExistsState::SeekBtreeLast));
                         continue;
-                    }
-                    if !self.btree_may_hold(int_key)? {
+                    };
+                    if !self.btree_may_hold(last, int_key)? {
                         self.state = None;
                         return Ok(IOResult::Done(false));
                     }
@@ -2082,9 +2080,12 @@ impl<Clock: LogicalClock + 'static, A: ConcurrentAllocator> CursorTrait
                         .replace(MvccLazyCursorState::Exists(ExistsState::ReadBtreeLast));
                 }
                 Some(MvccLazyCursorState::Exists(ExistsState::ReadBtreeLast)) => {
-                    let btree_max = return_if_io!(self.btree_cursor.rowid());
-                    self.rowid_allocator().record_btree_last(btree_max);
-                    if !self.btree_may_hold(int_key)? {
+                    let last = BtreeLast {
+                        read_mark: self.snapshot.read_mark,
+                        rowid: return_if_io!(self.btree_cursor.rowid()),
+                    };
+                    self.rowid_allocator().record_btree_last(last);
+                    if !self.btree_may_hold(last, int_key)? {
                         self.state = None;
                         return Ok(IOResult::Done(false));
                     }
