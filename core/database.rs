@@ -80,6 +80,7 @@ pub struct DatabaseOpts {
     pub enable_multiprocess_wal: bool,
     pub enable_without_rowid: bool,
     pub enable_experimental_mvcc_passive_checkpoint: bool,
+    pub enable_experimental_mvcc_checkpoint_skip_wal: bool,
     pub unsafe_testing: bool,
     pub(crate) enable_load_extension: bool,
 }
@@ -127,6 +128,11 @@ impl DatabaseOpts {
 
     pub fn with_experimental_mvcc_passive_checkpoint(mut self, enable: bool) -> Self {
         self.enable_experimental_mvcc_passive_checkpoint = enable;
+        self
+    }
+
+    pub fn with_experimental_mvcc_checkpoint_skip_wal(mut self, enable: bool) -> Self {
+        self.enable_experimental_mvcc_checkpoint_skip_wal = enable;
         self
     }
 
@@ -3410,6 +3416,10 @@ impl Database {
 
     pub fn experimental_mvcc_passive_checkpoint_enabled(&self) -> bool {
         self.opts.enable_experimental_mvcc_passive_checkpoint
+    }
+
+    pub fn experimental_mvcc_checkpoint_skip_wal_enabled(&self) -> bool {
+        self.opts.enable_experimental_mvcc_checkpoint_skip_wal
     }
 
     pub fn experimental_attach_enabled(&self) -> bool {

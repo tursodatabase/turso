@@ -66,6 +66,7 @@ struct FileShadow {
     durable: Vec<u8>,
     /// Writes/truncates issued since the last fsync, in submission order.
     unsynced: Vec<UnsyncedOp>,
+    bytes_written: usize,
 }
 
 impl FileShadow {
@@ -183,6 +184,15 @@ impl UnreliableIo {
             .collect()
     }
 
+    pub fn bytes_written(&self, path: &str) -> usize {
+        self.state
+            .files
+            .lock()
+            .unwrap()
+            .get(path)
+            .map_or(0, |shadow| shadow.lock().unwrap().bytes_written)
+    }
+
     /// True when `path` has writes not yet covered by a successful fsync.
     pub fn has_unsynced_writes(&self, path: &str) -> bool {
         self.state
@@ -283,14 +293,14 @@ impl File for UnreliableFile {
         buffer: Arc<Buffer>,
         c: Completion,
     ) -> turso_core::Result<Completion> {
-        self.shadow
-            .lock()
-            .unwrap()
-            .unsynced
-            .push(UnsyncedOp::Write {
+        {
+            let mut shadow = self.shadow.lock().unwrap();
+            shadow.bytes_written += buffer.len();
+            shadow.unsynced.push(UnsyncedOp::Write {
                 pos: pos as usize,
                 data: buffer.as_slice().to_vec(),
             });
+        }
         self.inner.pwrite(pos, buffer, c)
     }
 
@@ -304,6 +314,7 @@ impl File for UnreliableFile {
             let mut shadow = self.shadow.lock().unwrap();
             let mut off = pos as usize;
             for buffer in &buffers {
+                shadow.bytes_written += buffer.len();
                 shadow.unsynced.push(UnsyncedOp::Write {
                     pos: off,
                     data: buffer.as_slice().to_vec(),

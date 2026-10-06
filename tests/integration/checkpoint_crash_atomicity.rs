@@ -351,3 +351,101 @@ fn first_full_commit_on_fresh_database_fsyncs_the_wal() -> anyhow::Result<()> {
     );
     Ok(())
 }
+
+fn run_mvcc_checkpoint_crash_scenario(skip_wal: bool) -> anyhow::Result<()> {
+    let db_path_owned = format!("mvcc-checkpoint-crash-skip-wal-{skip_wal}.db");
+    let db_path_sim: &str = &db_path_owned;
+    let log_path_sim = std::path::Path::new(db_path_sim)
+        .with_extension("db-log")
+        .to_str()
+        .unwrap()
+        .to_string();
+    const ROWS_BEFORE: i64 = 1000;
+    let value = "A".repeat(100);
+
+    let io = Arc::new(UnreliableIo::new());
+    let db = Database::open_file_with_flags(
+        io.clone(),
+        db_path_sim,
+        OpenFlags::default(),
+        DatabaseOpts::new().with_experimental_mvcc_checkpoint_skip_wal(skip_wal),
+        None,
+        Arc::new(SqliteDialect),
+    )?;
+    let conn = db.connect()?;
+    conn.execute("PRAGMA journal_mode = 'mvcc'")?;
+    conn.execute("PRAGMA mvcc_checkpoint_threshold = -1")?;
+    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)")?;
+    conn.execute("BEGIN")?;
+    for i in 0..ROWS_BEFORE {
+        conn.execute(format!("INSERT INTO t VALUES({}, '{value}')", i * 1000))?;
+    }
+    conn.execute("COMMIT")?;
+    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")?;
+    io.mark_all_durable();
+
+    conn.execute("BEGIN")?;
+    for i in 0..ROWS_BEFORE {
+        conn.execute(format!("INSERT INTO t VALUES({}, '{value}')", i * 1000 + 500))?;
+    }
+    conn.execute("COMMIT")?;
+
+    io.arm_crash_on_sync(db_path_sim);
+    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")?;
+    let snapshot = io
+        .take_crash_snapshot()
+        .expect("checkpoint never fsynced the database file; crash point not reached");
+    assert!(
+        snapshot.writes_persisted >= 1 && snapshot.writes_dropped >= 1,
+        "crash model must persist a strict subset of the database file writes \
+         (persisted={}, dropped={})",
+        snapshot.writes_persisted,
+        snapshot.writes_dropped,
+    );
+
+    let dir = tempfile::TempDir::new()?;
+    let db_path = dir.path().join("recovered.db");
+    for (path_sim, path) in [
+        (db_path_sim.to_string(), db_path.clone()),
+        (
+            format!("{db_path_sim}-wal"),
+            dir.path().join("recovered.db-wal"),
+        ),
+        (log_path_sim, dir.path().join("recovered.db-log")),
+    ] {
+        if let Some(bytes) = snapshot.files.get(&path_sim) {
+            std::fs::write(path, bytes)?;
+        }
+    }
+    let recovered_db = Database::open_file(
+        Arc::new(turso_core::PlatformIO::new()?),
+        db_path.to_str().unwrap(),
+        Arc::new(SqliteDialect),
+    )?;
+    let recovered = recovered_db.connect()?;
+
+    let integrity = query_rows(&recovered, "PRAGMA integrity_check")?;
+    assert_eq!(
+        integrity,
+        vec!["ok".to_string()],
+        "recovered database failed integrity_check"
+    );
+    let count = query_rows(&recovered, "SELECT COUNT(*) FROM t")?;
+    assert_eq!(
+        count,
+        vec![(2 * ROWS_BEFORE).to_string()],
+        "rows were lost across crash recovery"
+    );
+    Ok(())
+}
+
+#[test]
+fn mvcc_checkpoint_crash_during_db_fsync_recovers_every_row() -> anyhow::Result<()> {
+    run_mvcc_checkpoint_crash_scenario(false)
+}
+
+#[test]
+#[ignore = "a checkpoint that skips the WAL is not crash-safe: atomic page writes do not make a multi-page B-tree change atomic"]
+fn mvcc_checkpoint_skip_wal_crash_during_db_fsync_recovers_every_row() -> anyhow::Result<()> {
+    run_mvcc_checkpoint_crash_scenario(true)
+}

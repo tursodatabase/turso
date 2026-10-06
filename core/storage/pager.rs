@@ -1257,6 +1257,19 @@ enum CommitState {
     AutoCheckpoint,
 }
 
+#[derive(Default)]
+enum DbFileCommitState {
+    #[default]
+    WritePages,
+    WaitWrites {
+        writes: Completion,
+        write_error: Arc<crate::sync::OnceLock<CompletionError>>,
+    },
+    WaitSync {
+        sync: Completion,
+    },
+}
+
 #[derive(Debug, Default)]
 struct CheckpointState {
     phase: CheckpointPhase,
@@ -1637,6 +1650,9 @@ pub struct Pager {
     subjournal: RwLock<Option<Subjournal>>,
     savepoints: Arc<RwLock<Vec<Savepoint>>>,
     commit_info: RwLock<CommitInfo>,
+    db_file_commit_state: RwLock<DbFileCommitState>,
+    spill_to_db_file: AtomicBool,
+    wrote_pages_to_db_file: AtomicBool,
     checkpoint_state: RwLock<CheckpointState>,
     syncing: Arc<AtomicBool>,
     auto_vacuum_mode: AtomicU8,
@@ -1951,6 +1967,9 @@ impl Pager {
                 page_sources: Vec::new(),
                 page_source_cursor: 0,
             }),
+            db_file_commit_state: RwLock::new(DbFileCommitState::default()),
+            spill_to_db_file: AtomicBool::new(false),
+            wrote_pages_to_db_file: AtomicBool::new(false),
             syncing: Arc::new(AtomicBool::new(false)),
             checkpoint_state: RwLock::new(CheckpointState::default()),
             buffer_pool,
@@ -2180,6 +2199,15 @@ impl Pager {
     /// Get whether cache spilling is enabled.
     pub fn get_spill_enabled(&self) -> bool {
         self.page_cache.read().is_spill_enabled()
+    }
+
+    pub fn set_spill_to_db_file(&self, enabled: bool) {
+        self.spill_to_db_file.store(enabled, Ordering::Release);
+        self.wrote_pages_to_db_file.store(false, Ordering::Release);
+    }
+
+    pub fn has_written_pages_to_db_file(&self) -> bool {
+        self.wrote_pages_to_db_file.load(Ordering::Acquire)
     }
 
     /// Open the subjournal if not yet open.
@@ -3483,6 +3511,153 @@ impl Pager {
         }
     }
 
+    pub fn commit_tx_to_db_file(
+        &self,
+        connection: &Connection,
+        sync_mode: SyncMode,
+        update_transaction_state: bool,
+    ) -> IOResultOr<()> {
+        let Some(wal) = self.wal.as_ref() else {
+            return Err(LimboError::InternalError(
+                "commit_tx_to_db_file() called without WAL".into(),
+            )
+            .into());
+        };
+        loop {
+            let state = std::mem::take(&mut *self.db_file_commit_state.write());
+            match state {
+                DbFileCommitState::WritePages => {
+                    if let IOResult::IO(c) = self.wait_for_spill_completions()? {
+                        return Ok(IOResult::IO(c));
+                    }
+                    turso_assert_eq!(
+                        wal.get_max_frame_in_wal(),
+                        0,
+                        "WAL frames would hide the pages written to the database file"
+                    );
+                    let write_error = Arc::new(crate::sync::OnceLock::new());
+                    let mut group = CompletionGroup::new(|_| {});
+                    if let Err(err) =
+                        self.write_dirty_pages_to_db_file(write_error.clone(), &mut group)
+                    {
+                        Self::partial_db_file_commit("write", err);
+                    }
+                    *self.db_file_commit_state.write() = DbFileCommitState::WaitWrites {
+                        writes: group.build(),
+                        write_error,
+                    };
+                }
+                DbFileCommitState::WaitWrites {
+                    writes,
+                    write_error,
+                } => {
+                    if !writes.finished() {
+                        *self.db_file_commit_state.write() = DbFileCommitState::WaitWrites {
+                            writes: writes.clone(),
+                            write_error,
+                        };
+                        io_yield_one!(writes);
+                    }
+                    if let Some(err) = write_error.get().copied().or(writes.get_error()) {
+                        Self::partial_db_file_commit("write", err);
+                    }
+                    if sync_mode == SyncMode::Off {
+                        self.finish_db_file_commit(connection, update_transaction_state)?;
+                        return Ok(IOResult::Done(()));
+                    }
+                    let sync = self
+                        .db_file
+                        .sync(Completion::new_sync(|_| {}), self.get_sync_type())
+                        .unwrap_or_else(|err| Self::partial_db_file_commit("fsync", err));
+                    *self.db_file_commit_state.write() = DbFileCommitState::WaitSync { sync };
+                }
+                DbFileCommitState::WaitSync { sync } => {
+                    if !sync.finished() {
+                        *self.db_file_commit_state.write() =
+                            DbFileCommitState::WaitSync { sync: sync.clone() };
+                        io_yield_one!(sync);
+                    }
+                    if let Some(err) = sync.get_error() {
+                        Self::partial_db_file_commit("fsync", err);
+                    }
+                    self.finish_db_file_commit(connection, update_transaction_state)?;
+                    return Ok(IOResult::Done(()));
+                }
+            }
+        }
+    }
+
+    fn write_dirty_pages_to_db_file(
+        &self,
+        write_error: Arc<crate::sync::OnceLock<CompletionError>>,
+        group: &mut CompletionGroup,
+    ) -> Result<()> {
+        self.wrote_pages_to_db_file.store(true, Ordering::Release);
+        let mut buffers = std::collections::BTreeMap::new();
+        {
+            let dirty_pages = self.dirty_pages.read();
+            let mut cache = self.page_cache.write();
+            for page_id in dirty_pages.iter() {
+                let Some(page) = cache.peek(&PageCacheKey::new(page_id as usize), false) else {
+                    continue;
+                };
+                if !page.is_dirty() {
+                    continue;
+                }
+                turso_assert!(
+                    page.is_loaded() && page.get().overflow_cells.is_empty(),
+                    "dirty page must be loaded and have no overflow cells at commit time",
+                    { "page_id": page_id }
+                );
+                let buffer = page
+                    .get()
+                    .buffer()
+                    .cloned()
+                    .expect("loaded page has a buffer");
+                buffers.insert(page_id as usize, buffer);
+            }
+        }
+        sqlite3_ondisk::write_pages_vectored(
+            self,
+            buffers,
+            Arc::new(AtomicBool::new(false)),
+            write_error,
+            group,
+        )?;
+        Ok(())
+    }
+
+    fn finish_db_file_commit(
+        &self,
+        connection: &Connection,
+        update_transaction_state: bool,
+    ) -> Result<()> {
+        {
+            let mut dirty_pages = self.dirty_pages.write();
+            let mut cache = self.page_cache.write();
+            for page_id in dirty_pages.iter() {
+                if let Some(page) = cache.peek(&PageCacheKey::new(page_id as usize), false) {
+                    page.clear_dirty();
+                }
+            }
+            dirty_pages.clear();
+        }
+        let wal = self
+            .wal
+            .as_ref()
+            .expect("checked by commit_tx_to_db_file()");
+        wal.end_write_tx();
+        wal.end_read_tx();
+        if update_transaction_state {
+            connection.set_tx_state(TransactionState::None);
+        }
+        self.clear_savepoints()
+    }
+
+    fn partial_db_file_commit(operation: &str, err: impl std::fmt::Display) -> ! {
+        panic!("database file has a partial MVCC checkpoint: {operation} failed: {err}");
+    }
+
     #[instrument(skip_all, level = Level::DEBUG)]
     pub fn rollback_tx(&self, connection: &Connection) {
         if connection.is_nested_stmt() {
@@ -4228,7 +4403,11 @@ impl Pager {
                             }
                             let page_count = pages.len();
                             tracing::debug!("try_spill_dirty_pages: spilling {} pages", page_count);
-                            if let Some(wal) = self.wal.as_ref() {
+                            let wal = self
+                                .wal
+                                .as_ref()
+                                .filter(|_| !self.spill_to_db_file.load(Ordering::Acquire));
+                            if let Some(wal) = wal {
                                 let page_sz = self.get_page_size().unwrap_or_default();
 
                                 // Ensure WAL is initialized. Most of the time this
@@ -4253,7 +4432,8 @@ impl Pager {
                                 }
                             } else {
                                 let mut group = CompletionGroup::new(|_| {});
-                                // Ephemeral table case: write directly to temp file
+                                // Ephemeral table, or a checkpoint that skips the WAL: write directly to the database file
+                                self.wrote_pages_to_db_file.store(true, Ordering::Release);
                                 for page in &pages {
                                     page.set_write_pending();
                                 }

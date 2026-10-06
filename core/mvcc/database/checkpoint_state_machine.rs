@@ -290,6 +290,7 @@ pub struct CheckpointStateMachine<Clock: LogicalClock, A: ConcurrentAllocator = 
     /// `index_write_set` slots whose pager write or delete finished. Slots, not
     /// keys: `SortableIndexKey` is not `Hash`.
     written_index_slots: HashSet<usize>,
+    skip_wal: bool,
 }
 
 /// One pending compaction job in the per-checkpoint sequence sweep.
@@ -874,6 +875,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
             freed_root_pages: HashSet::default(),
             written_table_rowids: HashSet::default(),
             written_index_slots: HashSet::default(),
+            skip_wal: false,
         }
     }
 
@@ -909,6 +911,9 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
     /// of `step()`. This mirrors `step()` error handling and also resets pager/WAL
     /// checkpoint bookkeeping.
     pub fn cleanup_after_external_io_error(&mut self, err: LimboError) -> Result<()> {
+        if self.lock_states.pager_write_tx && self.pager.has_written_pages_to_db_file() {
+            panic!("database file has a partial MVCC checkpoint: checkpoint failed after it wrote pages to the database file: {err}");
+        }
         // run storage cleanup within proper checkpoint context (e.g. pager has pending read/write txn)
         let result = self.mvstore.storage.on_checkpoint_end(Err(err));
 
@@ -919,6 +924,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
         self.pending_rootmap_ops.clear();
         self.pending_alloc_roots.clear();
 
+        self.pager.set_spill_to_db_file(false);
         if self.lock_states.pager_write_tx {
             self.pager.rollback_tx(self.connection.as_ref());
             if self.update_transaction_state {
@@ -2251,6 +2257,8 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
                     }); // TODO: schema_did_change??
                 }
                 self.lock_states.pager_write_tx = true;
+                self.skip_wal = self.can_skip_wal();
+                self.pager.set_spill_to_db_file(self.skip_wal);
                 self.state = CheckpointState::WriteRow {
                     write_set_index: 0,
                     requires_seek: true,
@@ -2861,15 +2869,25 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
                     // On commit_tx failure the `?` rolls back the pager txn; durable_txid_max and
                     // the log offset stay put, so a retry re-stages from the previous boundary.
                     tracing::debug!("Committing pager transaction");
-                    match self.pager.commit_tx(
-                        &self.connection,
-                        self.sync_mode,
-                        self.update_transaction_state,
-                    )? {
+                    let commit = if self.skip_wal {
+                        self.pager.commit_tx_to_db_file(
+                            &self.connection,
+                            self.sync_mode,
+                            self.update_transaction_state,
+                        )?
+                    } else {
+                        self.pager.commit_tx(
+                            &self.connection,
+                            self.sync_mode,
+                            self.update_transaction_state,
+                        )?
+                    };
+                    match commit {
                         IOResult::Done(_) => {
                             self.pager_commit_done = true;
                             self.lock_states.pager_read_tx = false;
                             self.lock_states.pager_write_tx = false;
+                            self.pager.set_spill_to_db_file(false);
                         }
                         IOResult::IO(io) => return Ok(TransitionResult::Io(io)),
                     }
@@ -3043,10 +3061,15 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
                         .checkpoint_result
                         .as_mut()
                         .expect("checkpoint_result should be set");
-                    if let IOResult::IO(io) =
-                        wal.truncate_wal(checkpoint_result, self.pager.get_sync_type())?
-                    {
-                        return Ok(TransitionResult::Io(io));
+                    let wal_file_already_empty = self.skip_wal
+                        && !checkpoint_result.wal_truncate_sent
+                        && wal.wal_file()?.size()? == 0;
+                    if !wal_file_already_empty {
+                        if let IOResult::IO(io) =
+                            wal.truncate_wal(checkpoint_result, self.pager.get_sync_type())?
+                        {
+                            return Ok(TransitionResult::Io(io));
+                        }
                     }
                 }
                 // Passive leaves the WAL non-empty; the logical log is already truncated, so
@@ -3120,6 +3143,18 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
                 ))
             }
         }
+    }
+
+    fn can_skip_wal(&self) -> bool {
+        self.database
+            .experimental_mvcc_checkpoint_skip_wal_enabled()
+            && self.lock_states.blocking_checkpoint_lock_held
+            && self.clears_whole_logical_log()
+            && self
+                .pager
+                .wal
+                .as_ref()
+                .is_some_and(|wal| wal.get_max_frame_in_wal() == 0)
     }
 }
 

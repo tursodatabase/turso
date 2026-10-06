@@ -1,4 +1,5 @@
 use crate::common::{ExecRows, TempDatabase};
+use crate::unreliable_io::UnreliableIo;
 use asserting::prelude::*;
 use std::path::Path;
 use std::sync::Arc;
@@ -1644,4 +1645,148 @@ fn mvcc_passive_checkpoint_must_not_leak_commits_into_pinned_snapshot() {
         vec![(2,)],
         "a pinned BEGIN CONCURRENT snapshot must not see a commit that happened after it"
     );
+}
+
+#[test]
+fn mvcc_checkpoint_skip_wal_writes_pages_only_to_db_file() {
+    let db_path = "mvcc-checkpoint-skip-wal.db";
+    let wal_path = format!("{db_path}-wal");
+    let io = Arc::new(UnreliableIo::new());
+    let open = || {
+        Database::open_file_with_flags(
+            io.clone(),
+            db_path,
+            OpenFlags::default(),
+            DatabaseOpts::new().with_experimental_mvcc_checkpoint_skip_wal(true),
+            None,
+            Arc::new(SqliteDialect),
+        )
+        .unwrap()
+    };
+    let padding = "x".repeat(200);
+    let mut expected: Vec<(i64, String)> = (0..3000)
+        .map(|id| (id, format!("first-{id}-{padding}")))
+        .collect();
+
+    let db = open();
+    let writer = db.connect().unwrap();
+    writer.execute("PRAGMA journal_mode = 'mvcc'").unwrap();
+    writer
+        .execute("PRAGMA mvcc_checkpoint_threshold = -1")
+        .unwrap();
+    writer.execute("PRAGMA cache_size = 10").unwrap();
+    writer
+        .execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)")
+        .unwrap();
+    writer.execute("CREATE INDEX t_v ON t(v)").unwrap();
+    writer.execute("BEGIN").unwrap();
+    for (id, v) in &expected {
+        writer
+            .execute(format!("INSERT INTO t VALUES({id}, '{v}')"))
+            .unwrap();
+    }
+    writer.execute("COMMIT").unwrap();
+    let wal_bytes_before_checkpoints = io.bytes_written(&wal_path);
+    writer.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+
+    let reader = db.connect().unwrap();
+    let rows: Vec<(i64, String)> = reader.exec_rows("SELECT id, v FROM t ORDER BY id");
+    assert_eq!(rows, expected);
+
+    writer
+        .execute("UPDATE t SET v = 'second-' || id WHERE id % 2 = 0")
+        .unwrap();
+    writer.execute("DELETE FROM t WHERE id % 3 = 0").unwrap();
+    writer.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+    for (id, v) in expected.iter_mut() {
+        if *id % 2 == 0 {
+            *v = format!("second-{id}");
+        }
+    }
+    expected.retain(|(id, _)| id % 3 != 0);
+
+    assert_eq!(
+        io.bytes_written(&wal_path),
+        wal_bytes_before_checkpoints,
+        "a checkpoint that skips the WAL must not write to the WAL file"
+    );
+    let rows: Vec<(i64, String)> = reader.exec_rows("SELECT id, v FROM t ORDER BY id");
+    assert_eq!(rows, expected);
+    let rows_from_index: Vec<(i64, String)> =
+        reader.exec_rows("SELECT id, v FROM t INDEXED BY t_v ORDER BY v");
+    let mut expected_by_value = expected.clone();
+    expected_by_value.sort_by(|a, b| a.1.cmp(&b.1));
+    assert_eq!(rows_from_index, expected_by_value);
+    let integrity: Vec<(String,)> = reader.exec_rows("PRAGMA integrity_check");
+    assert_eq!(integrity, vec![("ok".to_string(),)]);
+
+    drop(reader);
+    drop(writer);
+    drop(db);
+    let db = open();
+    let conn = db.connect().unwrap();
+    let rows: Vec<(i64, String)> = conn.exec_rows("SELECT id, v FROM t ORDER BY id");
+    assert_eq!(rows, expected);
+}
+
+#[test]
+fn mvcc_auto_checkpoint_skip_wal_keeps_every_commit() {
+    let db_path = "mvcc-auto-checkpoint-skip-wal.db";
+    let wal_path = format!("{db_path}-wal");
+    let io = Arc::new(UnreliableIo::new());
+    let open = || {
+        Database::open_file_with_flags(
+            io.clone(),
+            db_path,
+            OpenFlags::default(),
+            DatabaseOpts::new().with_experimental_mvcc_checkpoint_skip_wal(true),
+            None,
+            Arc::new(SqliteDialect),
+        )
+        .unwrap()
+    };
+
+    let db = open();
+    let writer = db.connect().unwrap();
+    writer.execute("PRAGMA journal_mode = 'mvcc'").unwrap();
+    writer
+        .execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v INTEGER)")
+        .unwrap();
+    writer.execute("PRAGMA mvcc_checkpoint_threshold = 0").unwrap();
+    let wal_bytes_before_checkpoints = io.bytes_written(&wal_path);
+    let reader = db.connect().unwrap();
+    let mut expected = std::collections::BTreeMap::new();
+    for i in 0..200i64 {
+        writer
+            .execute(format!("INSERT INTO t VALUES({i}, {i})"))
+            .unwrap();
+        expected.insert(i, i);
+        if i % 5 == 4 {
+            writer
+                .execute(format!("UPDATE t SET v = v * 10 WHERE id = {}", i - 2))
+                .unwrap();
+            *expected.get_mut(&(i - 2)).unwrap() *= 10;
+            writer
+                .execute(format!("DELETE FROM t WHERE id = {}", i - 4))
+                .unwrap();
+            expected.remove(&(i - 4));
+            let rows: Vec<(i64, i64)> = reader.exec_rows("SELECT id, v FROM t ORDER BY id");
+            assert_eq!(rows, expected.clone().into_iter().collect::<Vec<_>>());
+        }
+    }
+    assert_eq!(
+        io.bytes_written(&wal_path),
+        wal_bytes_before_checkpoints,
+        "a checkpoint that skips the WAL must not write to the WAL file"
+    );
+
+    drop(reader);
+    drop(writer);
+    drop(db);
+    let db = open();
+    let conn = db.connect().unwrap();
+    let rows: Vec<(i64, i64)> = conn.exec_rows("SELECT id, v FROM t ORDER BY id");
+    assert_eq!(rows, expected.into_iter().collect::<Vec<_>>());
+    let integrity: Vec<(String,)> = conn.exec_rows("PRAGMA integrity_check");
+    assert_eq!(integrity, vec![("ok".to_string(),)]);
 }

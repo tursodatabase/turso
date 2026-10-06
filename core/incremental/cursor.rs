@@ -405,6 +405,7 @@ mod tests {
                 enable_multiprocess_wal: false,
                 enable_without_rowid: false,
                 enable_experimental_mvcc_passive_checkpoint: false,
+                enable_experimental_mvcc_checkpoint_skip_wal: false,
                 unsafe_testing: false,
             },
             None,
