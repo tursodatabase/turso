@@ -980,6 +980,10 @@ pub struct JoinConfig {
 
     /// Probability of joining the same table again (self-join).
     pub self_join_probability: f64,
+
+    /// Probability of wrapping the FROM table and some of the joins after it
+    /// in parentheses, as in `(t1 JOIN t2 ON ...) AS g JOIN t3 ON ...`.
+    pub parenthesized_group_probability: f64,
 }
 
 impl Default for JoinConfig {
@@ -990,6 +994,7 @@ impl Default for JoinConfig {
             join_type_weights: JoinTypeWeights::default(),
             equi_join_probability: 0.7,
             self_join_probability: 0.15,
+            parenthesized_group_probability: 0.0,
         }
     }
 }

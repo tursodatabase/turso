@@ -1878,3 +1878,238 @@ matrix grouped-star-with-a-later-using-join {
       $join_type (SELECT $direct_id AS id) AS same
       USING(id);
 }
+
+setup pj {
+    CREATE TABLE pa(id INT, x INT, v TEXT);
+    CREATE TABLE pb(id INT, x INT, w TEXT);
+    CREATE TABLE pc(id INT, y INT, v TEXT);
+    CREATE TABLE pd(k INT PRIMARY KEY, id INT);
+    CREATE INDEX pb_id ON pb(id);
+    CREATE INDEX pc_id_y ON pc(id, y);
+    CREATE VIEW pv AS SELECT id, x * 2 AS x2 FROM pb WHERE id IS NOT NULL;
+    INSERT INTO pa VALUES (1, 10, 'a1'), (2, 20, 'a2'), (3, NULL, 'c3'), (4, 40, NULL);
+    INSERT INTO pb VALUES (1, 10, 'b1'), (2, NULL, 'b2'), (2, 21, 'b2x'), (5, 50, 'b5'), (NULL, 60, 'bn');
+    INSERT INTO pc VALUES (1, 100, 'a1'), (3, 300, 'c3'), (5, 500, NULL), (6, 600, 'c6'), (NULL, 700, 'cn');
+    INSERT INTO pd VALUES (1, 1), (2, 3), (3, 6), (4, NULL);
+}
+
+@setup pj
+@var j1 { JOIN | LEFT JOIN | RIGHT JOIN }
+@var c1 { USING(id) | ON a.id = b.id | ON a.x = b.x OR b.id IS NULL }
+@var j2 { JOIN | LEFT JOIN }
+@var c2 { ON b.id = c.id | ON a.id = c.id | ON c.v = a.v }
+@var cols { a.id, b.id, c.id, id | a.rowid, b.x, c.y, x | a.v, b.w, c.v, quote(v) | b.rowid, c.rowid, typeof(id), a.x + b.x }
+matrix group-on-left-of-join {
+    SELECT $cols FROM (pa AS a $j1 pb AS b $c1) $j2 pc AS c $c2 ORDER BY 1, 2, 3, 4;
+}
+
+@setup pj
+@var j1 { JOIN | LEFT JOIN | RIGHT JOIN }
+@var c1 { USING(id) | ON a.id = b.id | ON a.x = b.x OR b.id IS NULL }
+@var j2 { JOIN | LEFT JOIN | RIGHT JOIN }
+@var c2 { USING(id) | ON g.id = c.id | ON b.id = c.id | ON c.v = g.v }
+@var cols { g.id, g.x, g.v, g.w | a.id, b.id, c.id, id | a.rowid, b.rowid, c.rowid, x | g.rowid, a.v, c.v, w }
+matrix aliased-group-on-left-of-join {
+    SELECT $cols FROM (pa AS a $j1 pb AS b $c1) AS g $j2 pc AS c $c2 ORDER BY 1, 2, 3, 4;
+}
+
+@setup pj
+@var j1 { JOIN | LEFT JOIN }
+@var c1 { USING(id) | ON a.id = b.id | ON a.id = c.id | ON a.v = c.v }
+@var j2 { JOIN | LEFT JOIN | RIGHT JOIN }
+@var c2 { USING(id) | ON b.id = c.id | ON b.x < c.y }
+@var cols { a.id, b.id, c.id, id | a.rowid, b.x, c.y, x | a.v, b.w, c.v, quote(v) | b.rowid, c.rowid, typeof(id), a.x + b.x }
+matrix group-on-right-of-join {
+    SELECT $cols FROM pa AS a $j1 (pb AS b $j2 pc AS c $c2) $c1 ORDER BY 1, 2, 3, 4;
+}
+
+@setup pj
+@var form {
+    (pa AS a JOIN pb AS b USING(id) LEFT JOIN pc AS c USING(id)) |
+    (pa AS a JOIN pb AS b USING(id) LEFT JOIN pc AS c USING(id)) AS g |
+    ((pa AS a JOIN pb AS b USING(id))) LEFT JOIN pc AS c USING(id) |
+    ((pa AS a LEFT JOIN pb AS b USING(id)) AS g1 RIGHT JOIN pc AS c USING(id)) AS g2 |
+    pa AS a LEFT JOIN ((pb AS b JOIN pc AS c USING(id))) USING(id) |
+    pa AS a NATURAL JOIN (pb AS b NATURAL JOIN pc AS c) |
+    (pa AS a NATURAL LEFT JOIN pb AS b) AS g NATURAL RIGHT JOIN pc AS c |
+    (pa AS a CROSS JOIN pb AS b) JOIN pc AS c ON c.id = b.id AND c.id = a.id |
+    (pa AS a, pb AS b) JOIN pc AS c ON c.id = b.id |
+    pa AS a, (pb AS b JOIN pc AS c USING(id)) |
+    (pa AS a JOIN pd AS d USING(id)) LEFT JOIN pb AS b USING(id) LEFT JOIN pc AS c USING(id) |
+    (pa AS a JOIN pv USING(id)) JOIN pb AS b USING(id) JOIN pc AS c ON c.id = pv.id |
+    (pa AS a RIGHT JOIN (pb AS b LEFT JOIN pc AS c USING(id)) USING(id)) |
+    (pa) AS a JOIN (pb AS b) USING(id) LEFT JOIN (pc) AS c USING(id) |
+    (pa AS a JOIN (pb AS b JOIN (pc AS c) USING(id)) USING(id)) |
+    (pa AS a LEFT JOIN pb AS b ON a.id = b.id AND b.x > 15) LEFT JOIN pc AS c ON c.id = coalesce(b.id, a.id) |
+    pc AS c RIGHT JOIN (pa AS a LEFT JOIN pb AS b USING(id)) USING(id)
+}
+@var cols { a.id, b.id, c.id, id | a.rowid, b.rowid, c.rowid, rowid | a.x, b.x, c.y, x | a.v, c.v, b.w, v }
+@var filter { 1 | b.id IS NULL | c.id IS NULL | a.x > 10 OR c.y > 100 }
+matrix group-forms {
+    SELECT $cols FROM $form WHERE $filter ORDER BY 1, 2, 3, 4;
+}
+
+@setup pj
+@var form {
+    (pa AS a JOIN pb AS b USING(id)) LEFT JOIN pc AS c USING(id) |
+    (pa AS a LEFT JOIN pb AS b USING(id)) AS g RIGHT JOIN pc AS c ON c.id = g.id |
+    pa AS a RIGHT JOIN (pb AS b LEFT JOIN pc AS c USING(id)) AS g ON g.id = a.id |
+    (pa AS a NATURAL JOIN pb AS b) AS g NATURAL LEFT JOIN pc AS c |
+    ((pa AS a JOIN pb AS b ON a.id = b.id) AS g1 JOIN pc AS c ON c.id = g1.id) AS g |
+    pc AS c JOIN (pa AS a RIGHT JOIN pb AS b USING(id)) AS g ON g.id = c.id |
+    (pa AS a CROSS JOIN pb AS b) AS g JOIN pc AS c ON c.id = a.id AND c.id = b.id
+}
+@var star { * | a.* | b.* | c.* | g.* | a.*, c.* | c.*, b.*, a.id }
+matrix group-star-expansion {
+    SELECT $star FROM $form ORDER BY a.rowid, b.rowid, c.rowid;
+}
+
+@setup pj
+@var form {
+    (pa AS a JOIN pb AS b USING(id)) AS g |
+    (pa AS a JOIN pb AS b ON a.id = b.id) AS g |
+    (pa AS a NATURAL JOIN pb AS b) AS g |
+    (pa AS a LEFT JOIN pb AS b USING(id)) AS g |
+    (pa AS a RIGHT JOIN pb AS b USING(id)) AS g |
+    (pa AS a JOIN pd AS d USING(id)) AS g |
+    ((pa AS a JOIN pb AS b USING(id)) JOIN pc AS c USING(id)) AS g |
+    (pa JOIN pb USING(id)) AS g |
+    (pa AS a JOIN pa AS b USING(id)) AS g |
+    (main.pa AS a JOIN pb AS b USING(id)) AS g |
+    pc AS c JOIN (pa AS a JOIN pb AS b USING(id)) AS g USING(id) |
+    (pa AS a JOIN pb AS b USING(id)) |
+    pc AS c JOIN (pa AS a JOIN pb AS b USING(id)) ON c.id = a.id |
+    (pa AS a JOIN pv AS v USING(id)) AS g |
+    (pa AS a JOIN (SELECT id, 1 AS x FROM pb) AS b USING(id)) AS g |
+    (pa AS a JOIN json_each('[1,2]') AS j ON j.value = a.id) AS g |
+    (pa AS a JOIN pragma_table_info('pb') AS j ON j.cid = a.id) AS g
+}
+@var ref { a.id | b.id | g.id | id | ID | a.rowid | b.rowid | g.rowid | rowid | oid | _rowid_ | a.x | b.x | x | g.x | "x:1" | g."x:1" | v | w | main.a.id | main.pa.id | pa.id | pb.id | c.id | d.k | k | j.value | value | j.name | name | v.x2 }
+matrix name-lookup-through-groups {
+    SELECT $ref FROM $form ORDER BY 1;
+}
+
+@setup pj
+@var form {
+    (pa AS a JOIN pb AS b USING(id)) AS g |
+    (pa AS a NATURAL JOIN pb AS b) AS g |
+    (pa AS a LEFT JOIN pb AS b USING(id)) AS g |
+    ((pa AS a JOIN pb AS b USING(id)) JOIN pd AS d USING(id)) AS g |
+    (pa JOIN pb USING(id)) AS g |
+    (pa AS a JOIN pb AS b USING(id)) |
+    pc AS c JOIN (pa AS a JOIN pb AS b USING(id)) ON c.id = a.id
+}
+@var ref { a.id | b.id | g.id | id | a.rowid | b.rowid | rowid | a.x | b.x | x | g.x | v | w | pa.id | pb.x | d.k }
+matrix name-lookup-in-later-on-clause {
+    SELECT count(*), sum(c2.y) FROM $form JOIN pc AS c2 ON c2.id = $ref;
+}
+
+@setup pj
+@var form {
+    (pa AS a JOIN pb AS b USING(id)) AS g |
+    (pa AS a LEFT JOIN pb AS b USING(id)) AS g |
+    (pa AS a NATURAL JOIN pb AS b) AS g |
+    (pa AS a JOIN pb AS b USING(id))
+}
+@var ref { a.id | b.id | g.id | id | a.rowid | b.rowid | rowid | b.x | x | g.x | v | w }
+matrix name-lookup-in-where-and-group-by {
+    SELECT $ref, count(*) FROM $form WHERE $ref IS NOT NULL GROUP BY $ref ORDER BY 1;
+}
+
+@setup pj
+@var j { JOIN | LEFT JOIN | RIGHT JOIN }
+@var key { id | a.id | b.id | g.id | b.x IS NULL | g.w }
+@var agg { count(*) | count(b.w) | sum(c.y) | max(a.v) | total(DISTINCT b.x) }
+@var having { 1 | count(*) > 1 | max(c.rowid) IS NOT NULL }
+matrix group-aggregates {
+    SELECT $key, $agg FROM (pa AS a $j pb AS b USING(id)) AS g LEFT JOIN pc AS c USING(id)
+     GROUP BY $key HAVING $having ORDER BY 1;
+}
+
+@setup pj
+@var sub {
+    SELECT count(*) FROM (pb AS b JOIN pc AS c USING(id)) WHERE b.id = a.id |
+    SELECT max(c.y) FROM (pb AS b LEFT JOIN pc AS c USING(id)) AS g WHERE g.id >= a.id |
+    SELECT id FROM (pb AS b JOIN pc AS c USING(id)) WHERE id = a.id LIMIT 1 |
+    SELECT b.w FROM (pb AS b JOIN pc AS c ON c.id = a.id) ORDER BY b.rowid LIMIT 1 |
+    SELECT count(*) FROM (pb AS b RIGHT JOIN pc AS c USING(id)) WHERE id IS a.id |
+    SELECT EXISTS (SELECT 1 FROM (pb AS b JOIN pc AS c USING(id)) AS g WHERE g.id = a.id) |
+    SELECT a.id IN (SELECT id FROM (pb AS b JOIN pc AS c USING(id))) |
+    SELECT count(*) FROM (pb AS b JOIN pa AS a USING(id)) WHERE a.x = 10 |
+    SELECT count(*) FROM (pb AS b JOIN pc AS c USING(id)) AS a WHERE a.id = 1 |
+    SELECT (SELECT c.v FROM (pb AS b JOIN pc AS c USING(id)) WHERE id = a.id) |
+    SELECT count(*) FROM (pb AS b LEFT JOIN (pc AS c JOIN pd AS d USING(id)) USING(id)) WHERE d.k > a.id
+}
+@var pred {
+    1 |
+    EXISTS (SELECT 1 FROM (pb AS b JOIN pc AS c USING(id)) WHERE b.id = a.id) |
+    a.id NOT IN (SELECT id FROM (pb AS b LEFT JOIN pc AS c USING(id)) WHERE id IS NOT NULL) |
+    a.x > (SELECT min(b.x) FROM (pb AS b JOIN pc AS c ON b.id = c.id))
+}
+matrix group-in-subquery {
+    SELECT a.id, ($sub) FROM pa AS a WHERE $pred ORDER BY 1;
+}
+
+@setup pj
+@var outer { a.id | b.id | g.id | id | a.rowid | b.rowid | g.x | x | v | w }
+@var inner { pc AS c | (pc AS c JOIN pd AS d USING(id)) | (pc AS c LEFT JOIN pb AS b USING(id)) AS g2 }
+matrix correlated-subquery-reads-group-names {
+    SELECT a.rowid, b.rowid, (SELECT count(*) FROM $inner WHERE c.id = $outer)
+      FROM (pa AS a LEFT JOIN pb AS b USING(id)) AS g ORDER BY 1, 2;
+}
+
+@setup pj
+@var body {
+    SELECT * FROM (pa AS a JOIN pb AS b USING(id)) |
+    SELECT * FROM (pa AS a LEFT JOIN pb AS b USING(id)) AS g |
+    SELECT a.*, b.x FROM (pa AS a RIGHT JOIN pb AS b ON a.id = b.id) |
+    SELECT id, a.v FROM (pa AS a NATURAL JOIN (pb AS b JOIN pc AS c USING(id)))
+}
+@var cols { id | x | count(*) | count(DISTINCT id) }
+matrix cte-over-group {
+    WITH q AS ($body) SELECT $cols FROM q ORDER BY 1;
+}
+
+@setup pj
+@var cols { q.*, c.y | id, c.y | q.id, c.id, id | count(*) }
+matrix cte-inside-group {
+    WITH q AS (SELECT id, x FROM pb WHERE id IS NOT NULL)
+    SELECT $cols FROM (q JOIN pc AS c USING(id)) LEFT JOIN pa AS a USING(id) ORDER BY 1, 2;
+}
+
+@setup pj
+@var j { JOIN | LEFT JOIN | RIGHT JOIN }
+@var win {
+    row_number() OVER (ORDER BY a.rowid, b.rowid) |
+    sum(b.x) OVER (PARTITION BY id ORDER BY a.rowid, b.rowid) |
+    count(*) OVER (PARTITION BY g.id ORDER BY a.rowid, b.rowid ROWS 1 PRECEDING) |
+    lag(g.w) OVER (ORDER BY a.rowid, b.rowid) |
+    max(a.v) OVER (PARTITION BY b.x IS NULL)
+}
+matrix group-window-functions {
+    SELECT a.rowid, b.rowid, $win FROM (pa AS a $j pb AS b USING(id)) AS g ORDER BY 1, 2;
+}
+
+@setup pj
+@var left { id | b.x | a.rowid }
+@var op { UNION | UNION ALL | INTERSECT | EXCEPT }
+@var right { id | g.id | c.y }
+matrix group-compound-select {
+    SELECT $left FROM (pa AS a JOIN pb AS b USING(id))
+    $op SELECT $right FROM (pb AS b LEFT JOIN pc AS c USING(id)) AS g
+    ORDER BY 1;
+}
+
+@setup pj
+@var j { JOIN | LEFT JOIN | RIGHT JOIN }
+@var shape { DISTINCT id ORDER BY 1 | DISTINCT b.x IS NULL, c.id IS NULL ORDER BY 1, 2 | id ORDER BY id LIMIT 2 OFFSET 1 | DISTINCT g.v ORDER BY 1 LIMIT 3 }
+matrix group-distinct-and-limit {
+    SELECT $shape FROM (pa AS a $j pb AS b USING(id)) AS g LEFT JOIN pc AS c USING(id);
+}
+
+@setup pj
+@var c1 { USING(id) | ON a.id = b.id | ON a.id = c.id }
+@var cols { a.id, b.id, c.id, id | a.rowid, b.rowid, c.rowid, w | b.x, c.y, g.id, g.v }
+matrix right-join-into-group {
+    SELECT $cols FROM pa AS a RIGHT JOIN (pb AS b JOIN pc AS c USING(id)) AS g $c1 ORDER BY 1, 2, 3, 4;
+}

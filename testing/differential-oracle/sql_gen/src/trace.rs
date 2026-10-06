@@ -48,6 +48,7 @@ pub enum Origin {
     LeftJoin,
     CrossJoin,
     NaturalJoin,
+    ParenthesizedJoin,
     CompoundUnion,
     CompoundUnionAll,
     CompoundIntersect,

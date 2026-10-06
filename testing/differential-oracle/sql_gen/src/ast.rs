@@ -668,6 +668,9 @@ pub struct JoinClause {
     pub table: String,
     pub alias: Option<String>,
     pub constraint: Option<JoinConstraint>,
+    /// Parenthesized groups that end after this join, innermost first. Each
+    /// group starts before the FROM table. An entry holds the group alias.
+    pub closed_groups: Vec<Option<String>>,
 }
 
 /// The type of JOIN.
@@ -787,7 +790,7 @@ impl fmt::Display for SelectStmt {
         }
 
         if let Some(from) = &self.from {
-            write!(f, " FROM {}", from.table)?;
+            write!(f, " FROM {}{}", group_starts(&self.joins), from.table)?;
             if let Some(alias) = &from.alias {
                 write!(f, " AS {alias}")?;
             }
@@ -806,6 +809,7 @@ impl fmt::Display for SelectStmt {
             if let Some(JoinConstraint::On(expr)) = &join.constraint {
                 write!(f, " ON {expr}")?;
             }
+            write_group_ends(f, join)?;
         }
 
         if let Some(where_clause) = &self.where_clause {
@@ -1048,7 +1052,7 @@ impl fmt::Display for UpdateStmt {
         }
 
         if let Some(from) = &self.from {
-            write!(f, " FROM {}", from.table)?;
+            write!(f, " FROM {}{}", group_starts(&self.joins), from.table)?;
             if let Some(alias) = &from.alias {
                 write!(f, " AS {alias}")?;
             }
@@ -1069,6 +1073,7 @@ impl fmt::Display for UpdateStmt {
             if let Some(JoinConstraint::On(expr)) = &join.constraint {
                 write!(f, " ON {expr}")?;
             }
+            write_group_ends(f, join)?;
         }
 
         if let Some(where_clause) = &self.where_clause {
@@ -1087,6 +1092,21 @@ impl fmt::Display for UpdateStmt {
 
         Ok(())
     }
+}
+
+fn group_starts(joins: &[JoinClause]) -> String {
+    let group_count = joins.iter().map(|join| join.closed_groups.len()).sum();
+    "(".repeat(group_count)
+}
+
+fn write_group_ends(f: &mut fmt::Formatter<'_>, join: &JoinClause) -> fmt::Result {
+    for alias in &join.closed_groups {
+        write!(f, ")")?;
+        if let Some(alias) = alias {
+            write!(f, " AS {alias}")?;
+        }
+    }
+    Ok(())
 }
 
 /// A DELETE statement.
@@ -2387,6 +2407,7 @@ mod tests {
                     table: Some("u".to_string()),
                     column: "id".to_string(),
                 }))),
+                closed_groups: vec![],
             }],
             where_clause: None,
             group_by: None,
@@ -2442,6 +2463,7 @@ mod tests {
                 table: "j".to_string(),
                 alias: None,
                 constraint: None,
+                closed_groups: vec![],
             }],
             where_clause: None,
             conflict: None,
