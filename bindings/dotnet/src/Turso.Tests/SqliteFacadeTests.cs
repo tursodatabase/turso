@@ -1093,6 +1093,31 @@ public class SqliteFacadeTests
     }
 
     [Test]
+    public void GetValueUsesStorageTypeWhenNoDeclaredTypeIsAvailable()
+    {
+        using var connection = new SqliteConnection("Data Source=:memory:");
+        connection.Open();
+        connection.ExecuteNonQuery(
+            """
+            CREATE TABLE Items (Id GUID, Untyped);
+            INSERT INTO Items VALUES ('dc0d7e0e-365d-4948-ab9b-8ca8056bf93a', 'dc0d7e0e-365d-4948-ab9b-8ca8056bf93a');
+            """);
+
+        // An expression over a GUID column and a column declared without a type have no declared type,
+        // so values are returned as stored instead of being converted to Guid.
+        using var reader = connection.ExecuteReader("SELECT lower(Id), Untyped, Id || '', 1 + 1 FROM Items");
+        reader.Read().Should().BeTrue();
+        reader.GetDataTypeName(0).Should().Be("TEXT");
+        reader.GetValue(0).Should().Be("dc0d7e0e-365d-4948-ab9b-8ca8056bf93a");
+        reader.GetDataTypeName(1).Should().Be("TEXT");
+        reader.GetValue(1).Should().Be("dc0d7e0e-365d-4948-ab9b-8ca8056bf93a");
+        reader.GetDataTypeName(2).Should().Be("TEXT");
+        reader.GetValue(2).Should().Be("dc0d7e0e-365d-4948-ab9b-8ca8056bf93a");
+        reader.GetDataTypeName(3).Should().Be("INTEGER");
+        reader.GetValue(3).Should().Be(2L);
+    }
+
+    [Test]
     public void GetFieldValueThrowsForNullTypedValues()
     {
         using var connection = new SqliteConnection("Data Source=:memory:");
