@@ -8,10 +8,11 @@ use turso_core::{
     native_ext::{VirtualTable, VirtualTableCursor, VirtualTableModule},
     schema::{BTreeTable, Index, Schema, Table, TURSO_INTERNAL_PREFIX},
     security::roles::{BuiltinRoleNames, Role, RoleId},
-    Connection, Dialect, Func, IOResult, LimboError, OpenOptions, Result, Statement, Value,
+    walk_expr_mut, Connection, Dialect, Func, IOResult, LimboError, OpenOptions, Result, Statement,
+    Value, WalkControl,
 };
 use turso_ext::{ConstraintInfo, IndexInfo, OrderByInfo, ResultCode, VTabKind};
-use turso_parser::ast::RefAct;
+use turso_parser::ast::{self, RefAct};
 
 pub use turso_pg_parser::translator::is_catalog_table_name;
 
@@ -1925,7 +1926,7 @@ impl SnapshotRows for PgConstraintTable {
                     Value::Null,                     // conppeqop
                     Value::Null,                     // conffeqop
                     Value::Null,                     // conexclop
-                    Value::build_text(chk.expr.to_string()), // conbin
+                    Value::build_text(render_expr(&chk.expr)), // conbin
                 ]);
                 constraint_oid += 1;
             }
@@ -1973,10 +1974,10 @@ impl SnapshotRows for PgAttrdefTable {
             for (col_idx, col) in btree.columns().iter().enumerate() {
                 if let Some(default_expr) = &col.default {
                     rows.push(vec![
-                        Value::from_i64(attrdef_oid),                // oid
-                        Value::from_i64(table_oid),                  // adrelid
-                        Value::from_i64(col_idx as i64 + 1),         // adnum (1-based)
-                        Value::build_text(default_expr.to_string()), // adbin
+                        Value::from_i64(attrdef_oid),                 // oid
+                        Value::from_i64(table_oid),                   // adrelid
+                        Value::from_i64(col_idx as i64 + 1),          // adnum (1-based)
+                        Value::build_text(render_expr(default_expr)), // adbin
                     ]);
                     attrdef_oid += 1;
                 }
@@ -3434,13 +3435,39 @@ pub(crate) fn pg_get_constraintdef(conn: &Connection, target_oid: i64) -> Option
         // CHECK constraints
         for chk in &btree.check_constraints {
             if constraint_oid == target_oid {
-                return Some(format!("CHECK ({})", chk.expr));
+                return Some(format!("CHECK ({})", render_expr(&chk.expr)));
             }
             constraint_oid += 1;
         }
     }
 
     None
+}
+
+fn render_expr(expr: &ast::Expr) -> String {
+    let mut expr = expr.clone();
+    walk_expr_mut(&mut expr, &mut |expr| {
+        if let ast::Expr::FunctionCall { name, args, .. } = expr {
+            if args.is_empty() {
+                if let Some(keyword) = role_keyword(name.as_str()) {
+                    *expr = ast::Expr::Id(ast::Name::from_string(keyword));
+                }
+            }
+        }
+        Ok(WalkControl::Continue)
+    })
+    .expect("rewriting role functions does not fail");
+    expr.to_string()
+}
+
+fn role_keyword(function_name: &str) -> Option<&'static str> {
+    if function_name.eq_ignore_ascii_case("current_user") {
+        Some("CURRENT_USER")
+    } else if function_name.eq_ignore_ascii_case("session_user") {
+        Some("SESSION_USER")
+    } else {
+        None
+    }
 }
 
 /// Look up an index by OID and return its definition (CREATE INDEX ...).

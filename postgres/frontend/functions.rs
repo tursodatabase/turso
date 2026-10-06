@@ -1,6 +1,7 @@
 use chrono::Utc;
 use std::{fmt, sync::Arc};
 use turso_core::native_ext::{FunctionArity, ReturnType, ScalarCall, ScalarFunction};
+use turso_core::security::roles::RoleId;
 use turso_core::types::IOResultOr;
 use turso_core::{
     Connection, ExternalFunc, IOResult, LimboError, OpenOptions, Register, Result, Value,
@@ -83,6 +84,7 @@ scalar_functions! {
     Version(FunctionArity::Exact(0), true, Text),
     CurrentDatabase(FunctionArity::Exact(0), false, Text),
     CurrentSchema(FunctionArity::Exact(0), true, Text),
+    CurrentUser | SessionUser(FunctionArity::Exact(0), false, Text),
     PgBackendPid(FunctionArity::Exact(0), true, Integer),
     PgIsInRecovery(FunctionArity::Exact(0), false, Text),
     Now | ClockTimestamp | TransactionTimestamp | StatementTimestamp(FunctionArity::Variadic, false, Text),
@@ -138,6 +140,8 @@ impl ScalarCall for PgScalarFunction {
                 Value::build_text(crate::catalog::db_name_from_path(connection.db_file_path()))
             }
             Self::CurrentSchema => Value::build_text("public"),
+            Self::CurrentUser => role_name(connection, connection.current_role()),
+            Self::SessionUser => role_name(connection, connection.session_role()),
             Self::PgBackendPid => Value::from_i64(std::process::id() as i64),
             Self::PgIsInRecovery => {
                 // Temporary pg_dump compatibility: "t" means true, not actual recovery state.
@@ -449,16 +453,24 @@ fn exec_set_config(conn: &Connection, args: &[Register]) -> Result<Value> {
     }
 }
 
+fn role_name(conn: &Connection, role: RoleId) -> Value {
+    let roles = conn.role_catalog();
+    let role = roles
+        .get(role)
+        .expect("the role of a connection is in its role catalog");
+    Value::build_text(role.name.clone())
+}
+
 fn exec_pg_get_user_by_id(conn: &Connection, oid: i64) -> Value {
     let name = role_name_by_oid(conn, oid).unwrap_or_else(|| format!("unknown (OID={oid})"));
     Value::build_text(name)
 }
 
 fn role_name_by_oid(conn: &Connection, oid: i64) -> Option<String> {
-    crate::catalog::listed_roles(conn)
-        .into_iter()
-        .find(|role| crate::catalog::role_oid(role.id) == oid)
-        .map(|role| role.name)
+    conn.role_catalog()
+        .iter()
+        .find(|role| role.id != RoleId::PUBLIC && crate::catalog::role_oid(role.id) == oid)
+        .map(|role| role.name.clone())
 }
 
 fn exec_pg_is_visible(_oid: i64) -> Value {

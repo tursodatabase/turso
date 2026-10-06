@@ -110,6 +110,24 @@ fn roles_are_kept_after_vacuum() {
     );
 }
 
+#[test]
+fn current_user_and_session_user_name_the_superuser() {
+    let db = TempDatabase::builder().build();
+    let conn = db.connect_postgres();
+
+    assert_eq!(current_user(&conn), "postgres");
+    let mut stmt = conn.query("SELECT session_user").unwrap().unwrap();
+    assert_eq!(
+        stmt.run_collect_rows().unwrap()[0][0].to_string(),
+        "postgres"
+    );
+}
+
+fn current_user(conn: &PgConnection) -> String {
+    let mut stmt = conn.query("SELECT current_user").unwrap().unwrap();
+    stmt.run_collect_rows().unwrap()[0][0].to_string()
+}
+
 fn role_names(conn: &PgConnection) -> Vec<String> {
     let mut stmt = conn
         .query("SELECT rolname FROM pg_roles ORDER BY oid")
