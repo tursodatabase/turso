@@ -307,7 +307,7 @@ impl CommitState {
     }
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, PartialEq)]
 pub enum Register {
     Value(Value),
     Aggregate(AggContext),
@@ -320,7 +320,7 @@ impl TryClone for Register {
     fn try_clone(&self) -> Result<Self, Self::Error> {
         match self {
             Register::Value(value) => Ok(Register::Value(value.try_clone()?)),
-            Register::Aggregate(context) => Ok(Register::Aggregate(context.try_clone()?)),
+            Register::Aggregate(_) => unreachable!("aggregate accumulators cannot be copied"),
             Register::Record(record) => Ok(Register::Record(ImmutableRecord::copy_payload(
                 record.get_payload(),
                 RecordBuf::alloc(),
@@ -351,7 +351,7 @@ impl TryClone for Register {
                     RecordBuf::alloc(),
                 )?);
             }
-            (dst, Register::Aggregate(src)) => *dst = Register::Aggregate(src.try_clone()?),
+            (_, Register::Aggregate(_)) => unreachable!("aggregate accumulators cannot be copied"),
         }
         Ok(())
     }
@@ -1045,7 +1045,10 @@ impl ProgramState {
     pub fn new(max_registers: usize, max_cursors: usize) -> Self {
         let cursors: Vec<Option<Cursor>> = (0..max_cursors).map(|_| None).collect();
         let cursor_seqs = vec![0i64; max_cursors];
-        let registers = vec![Register::Value(Value::Null); max_registers].into_boxed_slice();
+        let registers = (0..max_registers)
+            .map(|_| Register::Value(Value::Null))
+            .collect::<Vec<_>>()
+            .into_boxed_slice();
         Self {
             check_countdown: 1,
             check_interval: MAX_CHECK_INTERVAL,
@@ -4359,12 +4362,10 @@ mod tests {
     }
 
     #[test]
-    fn register_try_clone_copies_each_variant() {
+    fn register_try_clone_copies_values_and_records() {
         let record_values = [Value::from_i64(1), Value::build_text("record payload")];
-        let aggregate_values = crate::alloc::vec![Value::build_text("aggregate payload")];
         let registers = [
             Register::Value(Value::build_text("value")),
-            Register::Aggregate(AggContext::Builtin(aggregate_values)),
             Register::Record(
                 ImmutableRecord::from_values(&record_values, record_values.len()).unwrap(),
             ),
@@ -4413,14 +4414,6 @@ mod tests {
             Register::Record(record) => assert_eq!(record.get_payload().as_ptr(), ptr),
             _ => unreachable!(),
         }
-
-        let src = Register::Aggregate(AggContext::Builtin(crate::alloc::vec![
-            Value::build_text("agg state"),
-            Value::from_i64(2),
-        ]));
-        let mut dst = Register::Value(Value::Null);
-        dst.try_clone_from(&src).unwrap();
-        assert_eq!(dst, src);
     }
 
     #[test]

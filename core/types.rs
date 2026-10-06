@@ -1065,39 +1065,6 @@ pub enum AggContext {
     Native(crate::native_ext::AggregateState),
 }
 
-impl Clone for AggContext {
-    fn clone(&self) -> Self {
-        match self {
-            Self::Builtin(payload) => Self::Builtin(payload.clone()),
-            Self::External(state) => Self::External(state.clone()),
-            Self::Native(_) => unreachable!("native aggregate accumulators cannot be copied"),
-        }
-    }
-}
-
-impl TryClone for AggContext {
-    type Error = TryReserveError;
-
-    /// Fallible clone: the builtin payload's Vec and each contained Text/Blob
-    /// go through fallible reservation. External state holds only FFI
-    /// pointers and copies without allocating.
-    #[turso_macros::allocation_site(crate::alloc::ValueBlobAllocationSite::CloneFrom)]
-    fn try_clone(&self) -> Result<Self, Self::Error> {
-        match self {
-            Self::Builtin(payload) => {
-                let mut values = Vec::try_with_capacity_ext(payload.len())?;
-                for value in payload {
-                    let mut copy = Value::Null;
-                    copy.try_clone_from(value)?;
-                    values.push(copy);
-                }
-                Ok(Self::Builtin(values))
-            }
-            Self::External(_) | Self::Native(_) => Ok(self.clone()),
-        }
-    }
-}
-
 impl AggContext {
     pub fn compute_external(self) -> Result<Value> {
         if let Self::External(ext_state) = &self {
