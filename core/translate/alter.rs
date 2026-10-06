@@ -1839,7 +1839,13 @@ pub fn translate_alter_table(
                 )));
             };
 
-            if btree.get_column(col_name).is_some() {
+            // Column names are case-insensitive, so this lookup also finds the
+            // column being altered when only the case changes (`a` -> `A`).
+            // That is not a clash, same as in SQLite.
+            if btree
+                .get_column(col_name)
+                .is_some_and(|(idx, _)| idx != column_index)
+            {
                 return Err(LimboError::ParseError(format!(
                     "duplicate column name: \"{col_name}\""
                 )));
@@ -2985,17 +2991,21 @@ fn rewrite_trigger_sql_for_column_rename(
         new_commands.push(new_cmd);
     }
 
-    validate_trigger_after_column_rename(
-        &new_event,
-        new_when_clause.as_deref(),
-        &new_commands,
-        trigger_table.as_ref(),
-        trigger_table_name_raw,
-        &target_table_name,
-        &old_col_norm,
-        trigger_database_id,
-        resolver,
-    )?;
+    // After a case-only rename the rewritten references still match the old
+    // name, and that is fine: the column is still there.
+    if old_col_norm != new_col_norm {
+        validate_trigger_after_column_rename(
+            &new_event,
+            new_when_clause.as_deref(),
+            &new_commands,
+            trigger_table.as_ref(),
+            trigger_table_name_raw,
+            &target_table_name,
+            &old_col_norm,
+            trigger_database_id,
+            resolver,
+        )?;
+    }
 
     // Reconstruct the SQL
     let new_sql = create_trigger_to_sql(
