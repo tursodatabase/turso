@@ -1657,7 +1657,9 @@ fn mvcc_checkpoint_skip_wal_writes_pages_only_to_db_file() {
             io.clone(),
             db_path,
             OpenFlags::default(),
-            DatabaseOpts::new().with_experimental_mvcc_checkpoint_skip_wal(true),
+            DatabaseOpts::new()
+                .with_experimental_mvcc_checkpoint_skip_wal(true)
+                .with_assume_torn_write_protection(true),
             None,
             Arc::new(SqliteDialect),
         )
@@ -1739,7 +1741,9 @@ fn mvcc_auto_checkpoint_skip_wal_keeps_every_commit() {
             io.clone(),
             db_path,
             OpenFlags::default(),
-            DatabaseOpts::new().with_experimental_mvcc_checkpoint_skip_wal(true),
+            DatabaseOpts::new()
+                .with_experimental_mvcc_checkpoint_skip_wal(true)
+                .with_assume_torn_write_protection(true),
             None,
             Arc::new(SqliteDialect),
         )
@@ -1752,7 +1756,9 @@ fn mvcc_auto_checkpoint_skip_wal_keeps_every_commit() {
     writer
         .execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v INTEGER)")
         .unwrap();
-    writer.execute("PRAGMA mvcc_checkpoint_threshold = 0").unwrap();
+    writer
+        .execute("PRAGMA mvcc_checkpoint_threshold = 0")
+        .unwrap();
     let wal_bytes_before_checkpoints = io.bytes_written(&wal_path);
     let reader = db.connect().unwrap();
     let mut expected = std::collections::BTreeMap::new();
@@ -1789,4 +1795,36 @@ fn mvcc_auto_checkpoint_skip_wal_keeps_every_commit() {
     assert_eq!(rows, expected.into_iter().collect::<Vec<_>>());
     let integrity: Vec<(String,)> = conn.exec_rows("PRAGMA integrity_check");
     assert_eq!(integrity, vec![("ok".to_string(),)]);
+}
+
+#[test]
+fn mvcc_checkpoint_keeps_wal_without_torn_write_protection() {
+    let db_path = "mvcc-checkpoint-skip-wal-unprotected.db";
+    let wal_path = format!("{db_path}-wal");
+    let io = Arc::new(UnreliableIo::new());
+    let db = Database::open_file_with_flags(
+        io.clone(),
+        db_path,
+        OpenFlags::default(),
+        DatabaseOpts::new().with_experimental_mvcc_checkpoint_skip_wal(true),
+        None,
+        Arc::new(SqliteDialect),
+    )
+    .unwrap();
+    let conn = db.connect().unwrap();
+    conn.execute("PRAGMA journal_mode = 'mvcc'").unwrap();
+    conn.execute("PRAGMA mvcc_checkpoint_threshold = -1")
+        .unwrap();
+    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT)")
+        .unwrap();
+    conn.execute("INSERT INTO t VALUES (1, 'a'), (2, 'b')")
+        .unwrap();
+    let wal_bytes_before_checkpoint = io.bytes_written(&wal_path);
+    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+    assert!(
+        io.bytes_written(&wal_path) > wal_bytes_before_checkpoint,
+        "storage without torn-write protection must keep the WAL in the checkpoint"
+    );
+    let rows: Vec<(i64, String)> = conn.exec_rows("SELECT id, v FROM t ORDER BY id");
+    assert_eq!(rows, vec![(1, "a".to_string()), (2, "b".to_string())]);
 }

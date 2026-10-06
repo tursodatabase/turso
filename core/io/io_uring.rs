@@ -473,6 +473,7 @@ impl IO for UringIO {
             state: self.state.clone(),
             caps: self.caps.clone(),
             file,
+            unlock_on_drop: true,
         });
         if std::env::var(common::ENV_DISABLE_FILE_LOCK).is_err()
             && !flags.intersects(OpenFlags::ReadOnly | OpenFlags::NoLock)
@@ -485,6 +486,20 @@ impl IO for UringIO {
     fn remove_file(&self, path: &str) -> Result<()> {
         std::fs::remove_file(path).map_err(|e| io_error(e, "remove_file"))?;
         Ok(())
+    }
+
+    fn atomic_write_units(&self, path: &str) -> Option<crate::io::AtomicWriteUnits> {
+        common::statx_atomic_write_units(path)
+    }
+
+    fn open_file_for_direct_io(&self, path: &str) -> Result<Arc<dyn File>> {
+        Ok(Arc::new(UringFile {
+            ring: self.ring.clone(),
+            state: self.state.clone(),
+            caps: self.caps.clone(),
+            file: common::open_with_direct_io(path)?,
+            unlock_on_drop: false,
+        }))
     }
 
     fn cancel(&self, completions: &[Completion]) -> Result<()> {
@@ -684,6 +699,7 @@ pub struct UringFile {
     state: Arc<Mutex<RingState>>,
     caps: Arc<UringCapabilities>,
     file: std::fs::File,
+    unlock_on_drop: bool,
 }
 
 impl Deref for UringFile {
@@ -810,6 +826,37 @@ impl File for UringFile {
         Ok(c)
     }
 
+    fn pwrite_atomic(
+        &self,
+        pos: u64,
+        buffer: Arc<crate::Buffer>,
+        c: Completion,
+    ) -> Result<Completion> {
+        let write = {
+            let ptr = buffer.as_ptr();
+            let len = buffer.len();
+            let fd = io_uring::types::Fd(self.file.as_raw_fd());
+            trace!("pwrite_atomic(pos = {}, length = {})", pos, len);
+            match buffer.fixed_id() {
+                Some(idx) => io_uring::opcode::WriteFixed::new(fd, ptr, len as u32, idx as u16)
+                    .offset(pos)
+                    .rw_flags(libc::RWF_ATOMIC)
+                    .build()
+                    .user_data(get_key(c.clone())),
+                None => io_uring::opcode::Write::new(fd, ptr, len as u32)
+                    .offset(pos)
+                    .rw_flags(libc::RWF_ATOMIC)
+                    .build()
+                    .user_data(get_key(c.clone())),
+            }
+        };
+        c.keep_write_buffer_alive(buffer);
+        let mut state = self.state.lock();
+        // SAFETY: holding `state` Mutex.
+        unsafe { state.submit_entry(&self.ring, &write)? };
+        Ok(c)
+    }
+
     fn sync(&self, c: Completion, _sync_type: crate::io::FileSyncType) -> Result<Completion> {
         trace!("sync()");
         let fd = io_uring::types::Fd(self.file.as_raw_fd());
@@ -903,7 +950,9 @@ impl File for UringFile {
 
 impl Drop for UringFile {
     fn drop(&mut self) {
-        self.unlock_file().expect("Failed to unlock file");
+        if self.unlock_on_drop {
+            self.unlock_file().expect("Failed to unlock file");
+        }
     }
 }
 

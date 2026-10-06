@@ -3,6 +3,7 @@ use crate::assert::assert_send_sync;
 use crate::io::AtomicFileSyncType;
 use crate::io::FileSyncType;
 use crate::io::WriteBatch;
+use crate::storage::atomic_page_writer::AtomicPageWriter;
 use crate::storage::btree::PinGuard;
 use crate::storage::subjournal::Subjournal;
 use crate::storage::wal::{CheckpointLockSource, PreparedFrames};
@@ -1260,8 +1261,14 @@ enum CommitState {
 #[derive(Default)]
 enum DbFileCommitState {
     #[default]
-    WritePages,
-    WaitWrites {
+    Start,
+    WriteBatch {
+        page_ids: Vec<usize>,
+        next: usize,
+    },
+    WaitBatch {
+        page_ids: Vec<usize>,
+        next: usize,
         writes: Completion,
         write_error: Arc<crate::sync::OnceLock<CompletionError>>,
     },
@@ -1651,7 +1658,7 @@ pub struct Pager {
     savepoints: Arc<RwLock<Vec<Savepoint>>>,
     commit_info: RwLock<CommitInfo>,
     db_file_commit_state: RwLock<DbFileCommitState>,
-    spill_to_db_file: AtomicBool,
+    spill_to_db_file: RwLock<Option<Arc<AtomicPageWriter>>>,
     wrote_pages_to_db_file: AtomicBool,
     checkpoint_state: RwLock<CheckpointState>,
     syncing: Arc<AtomicBool>,
@@ -1968,7 +1975,7 @@ impl Pager {
                 page_source_cursor: 0,
             }),
             db_file_commit_state: RwLock::new(DbFileCommitState::default()),
-            spill_to_db_file: AtomicBool::new(false),
+            spill_to_db_file: RwLock::new(None),
             wrote_pages_to_db_file: AtomicBool::new(false),
             syncing: Arc::new(AtomicBool::new(false)),
             checkpoint_state: RwLock::new(CheckpointState::default()),
@@ -2201,8 +2208,8 @@ impl Pager {
         self.page_cache.read().is_spill_enabled()
     }
 
-    pub fn set_spill_to_db_file(&self, enabled: bool) {
-        self.spill_to_db_file.store(enabled, Ordering::Release);
+    pub(crate) fn set_spill_to_db_file(&self, writer: Option<Arc<AtomicPageWriter>>) {
+        *self.spill_to_db_file.write() = writer;
         self.wrote_pages_to_db_file.store(false, Ordering::Release);
     }
 
@@ -3511,9 +3518,10 @@ impl Pager {
         }
     }
 
-    pub fn commit_tx_to_db_file(
+    pub(crate) fn commit_tx_to_db_file(
         &self,
         connection: &Connection,
+        writer: &AtomicPageWriter,
         sync_mode: SyncMode,
         update_transaction_state: bool,
     ) -> IOResultOr<()> {
@@ -3526,7 +3534,7 @@ impl Pager {
         loop {
             let state = std::mem::take(&mut *self.db_file_commit_state.write());
             match state {
-                DbFileCommitState::WritePages => {
+                DbFileCommitState::Start => {
                     if let IOResult::IO(c) = self.wait_for_spill_completions()? {
                         return Ok(IOResult::IO(c));
                     }
@@ -3535,24 +3543,56 @@ impl Pager {
                         0,
                         "WAL frames would hide the pages written to the database file"
                     );
+                    let page_ids = self
+                        .dirty_pages
+                        .read()
+                        .iter()
+                        .map(|page_id| page_id as usize)
+                        .collect();
+                    *self.db_file_commit_state.write() =
+                        DbFileCommitState::WriteBatch { page_ids, next: 0 };
+                }
+                DbFileCommitState::WriteBatch { page_ids, next } => {
+                    if next == page_ids.len() {
+                        if sync_mode == SyncMode::Off {
+                            self.finish_db_file_commit(connection, update_transaction_state)?;
+                            return Ok(IOResult::Done(()));
+                        }
+                        let sync = self
+                            .db_file
+                            .sync(Completion::new_sync(|_| {}), self.get_sync_type())
+                            .unwrap_or_else(|err| Self::partial_db_file_commit("fsync", err));
+                        *self.db_file_commit_state.write() = DbFileCommitState::WaitSync { sync };
+                        continue;
+                    }
+                    let end = (next + AtomicPageWriter::MAX_PAGES_IN_FLIGHT).min(page_ids.len());
                     let write_error = Arc::new(crate::sync::OnceLock::new());
                     let mut group = CompletionGroup::new(|_| {});
-                    if let Err(err) =
-                        self.write_dirty_pages_to_db_file(write_error.clone(), &mut group)
-                    {
+                    if let Err(err) = self.write_dirty_pages_to_db_file(
+                        writer,
+                        &page_ids[next..end],
+                        write_error.clone(),
+                        &mut group,
+                    ) {
                         Self::partial_db_file_commit("write", err);
                     }
-                    *self.db_file_commit_state.write() = DbFileCommitState::WaitWrites {
+                    *self.db_file_commit_state.write() = DbFileCommitState::WaitBatch {
+                        page_ids,
+                        next: end,
                         writes: group.build(),
                         write_error,
                     };
                 }
-                DbFileCommitState::WaitWrites {
+                DbFileCommitState::WaitBatch {
+                    page_ids,
+                    next,
                     writes,
                     write_error,
                 } => {
                     if !writes.finished() {
-                        *self.db_file_commit_state.write() = DbFileCommitState::WaitWrites {
+                        *self.db_file_commit_state.write() = DbFileCommitState::WaitBatch {
+                            page_ids,
+                            next,
                             writes: writes.clone(),
                             write_error,
                         };
@@ -3561,15 +3601,8 @@ impl Pager {
                     if let Some(err) = write_error.get().copied().or_else(|| writes.get_error()) {
                         Self::partial_db_file_commit("write", err);
                     }
-                    if sync_mode == SyncMode::Off {
-                        self.finish_db_file_commit(connection, update_transaction_state)?;
-                        return Ok(IOResult::Done(()));
-                    }
-                    let sync = self
-                        .db_file
-                        .sync(Completion::new_sync(|_| {}), self.get_sync_type())
-                        .unwrap_or_else(|err| Self::partial_db_file_commit("fsync", err));
-                    *self.db_file_commit_state.write() = DbFileCommitState::WaitSync { sync };
+                    *self.db_file_commit_state.write() =
+                        DbFileCommitState::WriteBatch { page_ids, next };
                 }
                 DbFileCommitState::WaitSync { sync } => {
                     if !sync.finished() {
@@ -3589,41 +3622,51 @@ impl Pager {
 
     fn write_dirty_pages_to_db_file(
         &self,
+        writer: &AtomicPageWriter,
+        page_ids: &[usize],
         write_error: Arc<crate::sync::OnceLock<CompletionError>>,
         group: &mut CompletionGroup,
     ) -> Result<()> {
         self.wrote_pages_to_db_file.store(true, Ordering::Release);
-        let mut buffers = std::collections::BTreeMap::new();
-        {
-            let dirty_pages = self.dirty_pages.read();
+        let pages: Vec<(usize, Arc<Buffer>)> = {
             let mut cache = self.page_cache.write();
-            for page_id in dirty_pages.iter() {
-                let Some(page) = cache.peek(&PageCacheKey::new(page_id as usize), false) else {
-                    continue;
-                };
-                if !page.is_dirty() {
-                    continue;
+            page_ids
+                .iter()
+                .filter_map(|&page_id| {
+                    let page = cache.peek(&PageCacheKey::new(page_id), false)?;
+                    if !page.is_dirty() {
+                        return None;
+                    }
+                    turso_assert!(
+                        page.is_loaded() && page.get().overflow_cells.is_empty(),
+                        "dirty page must be loaded and have no overflow cells at commit time",
+                        { "page_id": page_id }
+                    );
+                    let buffer = page
+                        .get()
+                        .buffer()
+                        .cloned()
+                        .expect("loaded page has a buffer");
+                    Some((page_id, buffer))
+                })
+                .collect()
+        };
+        let io_ctx = self.io_ctx.read();
+        for (page_id, buffer) in pages {
+            let write_error = write_error.clone();
+            let expected_bytes = buffer.len() as i32;
+            let c = Completion::new_write(move |res| match res {
+                Ok(written) if written == expected_bytes => {}
+                Ok(_) => {
+                    let _ = write_error.set(CompletionError::ShortWrite);
                 }
-                turso_assert!(
-                    page.is_loaded() && page.get().overflow_cells.is_empty(),
-                    "dirty page must be loaded and have no overflow cells at commit time",
-                    { "page_id": page_id }
-                );
-                let buffer = page
-                    .get()
-                    .buffer()
-                    .cloned()
-                    .expect("loaded page has a buffer");
-                buffers.insert(page_id as usize, buffer);
-            }
+                Err(err) => {
+                    let _ = write_error.set(err);
+                }
+            });
+            group.add(&c);
+            drop(writer.write_page(page_id, buffer, &io_ctx, c)?);
         }
-        sqlite3_ondisk::write_pages_vectored(
-            self,
-            buffers,
-            Arc::new(AtomicBool::new(false)),
-            write_error,
-            group,
-        )?;
         Ok(())
     }
 
@@ -4403,10 +4446,8 @@ impl Pager {
                             }
                             let page_count = pages.len();
                             tracing::debug!("try_spill_dirty_pages: spilling {} pages", page_count);
-                            let wal = self
-                                .wal
-                                .as_ref()
-                                .filter(|_| !self.spill_to_db_file.load(Ordering::Acquire));
+                            let spill_writer = self.spill_to_db_file.read().clone();
+                            let wal = self.wal.as_ref().filter(|_| spill_writer.is_none());
                             if let Some(wal) = wal {
                                 let page_sz = self.get_page_size().unwrap_or_default();
 
@@ -4437,7 +4478,11 @@ impl Pager {
                                 for page in &pages {
                                     page.set_write_pending();
                                 }
-                                let completions = self.spill_pages_to_disk(&pages, &mut group)?;
+                                let completions = self.spill_pages_to_disk(
+                                    &pages,
+                                    &mut group,
+                                    spill_writer.as_deref(),
+                                )?;
                                 if completions.is_empty() {
                                     self.finish_ephemeral_spill(&pages);
                                     return Ok(IOResult::Done(()));
@@ -4612,10 +4657,15 @@ impl Pager {
         &self,
         pages: &[PinGuard],
         group: &mut CompletionGroup,
+        writer: Option<&AtomicPageWriter>,
     ) -> Result<Vec<Completion>> {
         let mut completions: Vec<Completion> = Vec::with_capacity(pages.len());
         for page in pages {
-            match begin_write_btree_page(self, &page.to_page(), Some(group)) {
+            let write = match writer {
+                Some(writer) => self.write_spilled_page_atomically(writer, &page.to_page(), group),
+                None => begin_write_btree_page(self, &page.to_page(), Some(group)),
+            };
+            match write {
                 Ok(c) => completions.push(c),
                 Err(e) => {
                     self.io.cancel(&completions)?;
@@ -4626,6 +4676,29 @@ impl Pager {
         }
 
         Ok(completions)
+    }
+
+    fn write_spilled_page_atomically(
+        &self,
+        writer: &AtomicPageWriter,
+        page: &PageRef,
+        group: &mut CompletionGroup,
+    ) -> Result<Completion> {
+        let page_finish = page.clone();
+        let buffer = page.get().buffer().cloned().expect("buffer not loaded");
+        let expected_bytes = buffer.len() as i32;
+        let c = Completion::new_write(move |res: Result<i32, CompletionError>| {
+            let Ok(written) = res else {
+                return;
+            };
+            page_finish.clear_dirty();
+            turso_assert!(
+                written == expected_bytes,
+                "wrote({written}) != expected({expected_bytes})"
+            );
+        });
+        group.add(&c);
+        writer.write_page(page.get().id(), buffer, &self.io_ctx.read(), c)
     }
 
     /// Check if the cache needs spilling and attempt to spill if necessary.

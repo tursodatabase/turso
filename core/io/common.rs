@@ -1,5 +1,53 @@
 pub const ENV_DISABLE_FILE_LOCK: &str = "LIMBO_DISABLE_FILE_LOCK";
 
+#[cfg(target_os = "linux")]
+pub(crate) fn statx_atomic_write_units(path: &str) -> Option<super::AtomicWriteUnits> {
+    const STATX_WRITE_ATOMIC: u32 = 0x0001_0000;
+    #[repr(C)]
+    struct StatxWithAtomicWriteUnits {
+        mask: u32,
+        fields_before_atomic_write_units: [u8; 0xa8 - 4],
+        atomic_write_unit_min: u32,
+        atomic_write_unit_max: u32,
+        fields_after_atomic_write_units: [u8; 0x100 - 0xb0],
+    }
+    const _: () = assert!(
+        std::mem::size_of::<StatxWithAtomicWriteUnits>() == std::mem::size_of::<libc::statx>()
+    );
+    let path = std::ffi::CString::new(path).ok()?;
+    let mut statx = std::mem::MaybeUninit::<StatxWithAtomicWriteUnits>::zeroed();
+    let rc = unsafe {
+        libc::statx(
+            libc::AT_FDCWD,
+            path.as_ptr(),
+            0,
+            STATX_WRITE_ATOMIC,
+            statx.as_mut_ptr().cast(),
+        )
+    };
+    if rc != 0 {
+        return None;
+    }
+    let statx = unsafe { statx.assume_init() };
+    (statx.mask & STATX_WRITE_ATOMIC != 0 && statx.atomic_write_unit_max > 0).then_some(
+        super::AtomicWriteUnits {
+            min_bytes: statx.atomic_write_unit_min,
+            max_bytes: statx.atomic_write_unit_max,
+        },
+    )
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn open_with_direct_io(path: &str) -> crate::Result<std::fs::File> {
+    use std::os::unix::fs::OpenOptionsExt;
+    std::fs::File::options()
+        .read(true)
+        .write(true)
+        .custom_flags(libc::O_DIRECT)
+        .open(path)
+        .map_err(|e| crate::error::io_error(e, "open"))
+}
+
 #[cfg(test)]
 pub mod tests {
     use crate::{Result, IO};

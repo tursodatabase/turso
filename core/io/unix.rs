@@ -63,6 +63,7 @@ impl IO for UnixIO {
         let unix_file = Arc::new(UnixFile {
             file,
             path: path.to_string(),
+            unlock_on_drop: true,
         });
         if std::env::var(common::ENV_DISABLE_FILE_LOCK).is_err()
             && !flags.intersects(OpenFlags::ReadOnly | OpenFlags::NoLock)
@@ -77,6 +78,20 @@ impl IO for UnixIO {
         Ok(())
     }
 
+    #[cfg(target_os = "linux")]
+    fn atomic_write_units(&self, path: &str) -> Option<super::AtomicWriteUnits> {
+        common::statx_atomic_write_units(path)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn open_file_for_direct_io(&self, path: &str) -> Result<Arc<dyn File>> {
+        Ok(Arc::new(UnixFile {
+            file: common::open_with_direct_io(path)?,
+            path: path.to_string(),
+            unlock_on_drop: false,
+        }))
+    }
+
     #[instrument(err, skip_all, level = Level::TRACE)]
     fn step(&self) -> Result<()> {
         Ok(())
@@ -86,6 +101,7 @@ impl IO for UnixIO {
 pub struct UnixFile {
     file: std::fs::File,
     path: String,
+    unlock_on_drop: bool,
 }
 
 pub(crate) struct UnixSharedWalMapping {
@@ -451,6 +467,44 @@ impl File for UnixFile {
         Ok(c)
     }
 
+    #[cfg(target_os = "linux")]
+    #[instrument(err, skip_all, level = Level::TRACE)]
+    fn pwrite_atomic(
+        &self,
+        pos: u64,
+        buffer: Arc<crate::Buffer>,
+        c: Completion,
+    ) -> Result<Completion> {
+        let slice = buffer.as_slice();
+        let iov = libc::iovec {
+            iov_base: slice.as_ptr() as *mut libc::c_void,
+            iov_len: slice.len(),
+        };
+        loop {
+            let n = unsafe {
+                libc::pwritev2(
+                    self.file.as_raw_fd(),
+                    &iov,
+                    1,
+                    pos as libc::off_t,
+                    libc::RWF_ATOMIC,
+                )
+            };
+            if n == -1 {
+                let e = std::io::Error::last_os_error();
+                if e.kind() == ErrorKind::Interrupted {
+                    continue;
+                }
+                return Err(io_error(e, "pwritev2"));
+            }
+            if n as usize != slice.len() {
+                return Err(LimboError::CompletionError(CompletionError::ShortWrite));
+            }
+            c.complete(n as i32);
+            return Ok(c);
+        }
+    }
+
     #[instrument(err, skip_all, level = Level::TRACE)]
     fn sync(&self, c: Completion, sync_type: FileSyncType) -> Result<Completion> {
         let result = unsafe {
@@ -581,7 +635,9 @@ fn trim_iovecs(iov: &mut Vec<libc::iovec>, mut n: usize) {
 
 impl Drop for UnixFile {
     fn drop(&mut self) {
-        self.unlock_file().expect("Failed to unlock file");
+        if self.unlock_on_drop {
+            self.unlock_file().expect("Failed to unlock file");
+        }
     }
 }
 
@@ -608,5 +664,37 @@ mod tests {
         let slice = unsafe { std::slice::from_raw_parts(mapped.ptr().as_ptr(), mapped.len()) };
         assert_eq!(&slice[..128], &bytes[4096..4096 + 128]);
         assert_eq!(&slice[mapped.len() - 128..], &bytes[4096 + 81920 - 128..4096 + 81920]);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn pwrite_atomic_succeeds_only_where_statx_reports_atomic_writes() {
+        const PAGE_SIZE: usize = 4096;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("atomic.db");
+        std::fs::write(&path, vec![0u8; 2 * PAGE_SIZE]).unwrap();
+        let path = path.to_str().unwrap();
+        let io: Arc<dyn IO> = Arc::new(UnixIO::new().unwrap());
+        let file = io.open_file_for_direct_io(path).unwrap();
+        let pool = crate::storage::buffer_pool::BufferPool::begin_init(&io, 64 * PAGE_SIZE);
+        pool.finalize_with_page_size(PAGE_SIZE).unwrap();
+        let page = Arc::new(pool.get_page());
+        page.as_mut_slice().fill(7);
+        assert_eq!(page.as_ptr() as usize % PAGE_SIZE, 0);
+
+        let write = file.pwrite_atomic(PAGE_SIZE as u64, page, Completion::new_write(|_| {}));
+
+        if io
+            .atomic_write_units(path)
+            .is_some_and(|units| units.covers(PAGE_SIZE))
+        {
+            assert!(write.unwrap().succeeded());
+            assert_eq!(std::fs::read(path).unwrap()[PAGE_SIZE..], [7u8; PAGE_SIZE]);
+        } else {
+            assert!(
+                write.is_err(),
+                "RWF_ATOMIC must be refused where statx reports no atomic writes"
+            );
+        }
     }
 }

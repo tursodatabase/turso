@@ -368,7 +368,9 @@ fn run_mvcc_checkpoint_crash_scenario(skip_wal: bool) -> anyhow::Result<()> {
         io.clone(),
         db_path_sim,
         OpenFlags::default(),
-        DatabaseOpts::new().with_experimental_mvcc_checkpoint_skip_wal(skip_wal),
+        DatabaseOpts::new()
+            .with_experimental_mvcc_checkpoint_skip_wal(skip_wal)
+            .with_assume_torn_write_protection(skip_wal),
         None,
         Arc::new(SqliteDialect),
     )?;
@@ -386,7 +388,10 @@ fn run_mvcc_checkpoint_crash_scenario(skip_wal: bool) -> anyhow::Result<()> {
 
     conn.execute("BEGIN")?;
     for i in 0..ROWS_BEFORE {
-        conn.execute(format!("INSERT INTO t VALUES({}, '{value}')", i * 1000 + 500))?;
+        conn.execute(format!(
+            "INSERT INTO t VALUES({}, '{value}')",
+            i * 1000 + 500
+        ))?;
     }
     conn.execute("COMMIT")?;
 

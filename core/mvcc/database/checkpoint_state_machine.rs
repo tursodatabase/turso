@@ -15,6 +15,7 @@ use crate::schema::{Index, Schema};
 use crate::skiplist::base::RefEntry;
 use crate::skiplist::SkiplistAllocator;
 use crate::state_machine::{StateMachine, StateTransition, TransitionResult};
+use crate::storage::atomic_page_writer::AtomicPageWriter;
 use crate::storage::btree::{BTreeCursor, CursorTrait};
 use crate::storage::pager::CreateBTreeFlags;
 use crate::storage::sqlite3_ondisk::DatabaseHeader;
@@ -290,7 +291,7 @@ pub struct CheckpointStateMachine<Clock: LogicalClock, A: ConcurrentAllocator = 
     /// `index_write_set` slots whose pager write or delete finished. Slots, not
     /// keys: `SortableIndexKey` is not `Hash`.
     written_index_slots: HashSet<usize>,
-    skip_wal: bool,
+    atomic_page_writer: Option<Arc<AtomicPageWriter>>,
 }
 
 /// One pending compaction job in the per-checkpoint sequence sweep.
@@ -875,7 +876,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
             freed_root_pages: HashSet::default(),
             written_table_rowids: HashSet::default(),
             written_index_slots: HashSet::default(),
-            skip_wal: false,
+            atomic_page_writer: None,
         }
     }
 
@@ -924,7 +925,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
         self.pending_rootmap_ops.clear();
         self.pending_alloc_roots.clear();
 
-        self.pager.set_spill_to_db_file(false);
+        self.pager.set_spill_to_db_file(None);
         if self.lock_states.pager_write_tx {
             self.pager.rollback_tx(self.connection.as_ref());
             if self.update_transaction_state {
@@ -2257,8 +2258,9 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
                     }); // TODO: schema_did_change??
                 }
                 self.lock_states.pager_write_tx = true;
-                self.skip_wal = self.can_skip_wal();
-                self.pager.set_spill_to_db_file(self.skip_wal);
+                self.atomic_page_writer = self.atomic_page_writer_for_skip_wal();
+                self.pager
+                    .set_spill_to_db_file(self.atomic_page_writer.clone());
                 self.state = CheckpointState::WriteRow {
                     write_set_index: 0,
                     requires_seek: true,
@@ -2869,25 +2871,25 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
                     // On commit_tx failure the `?` rolls back the pager txn; durable_txid_max and
                     // the log offset stay put, so a retry re-stages from the previous boundary.
                     tracing::debug!("Committing pager transaction");
-                    let commit = if self.skip_wal {
-                        self.pager.commit_tx_to_db_file(
+                    let commit = match &self.atomic_page_writer {
+                        Some(writer) => self.pager.commit_tx_to_db_file(
+                            &self.connection,
+                            writer,
+                            self.sync_mode,
+                            self.update_transaction_state,
+                        )?,
+                        None => self.pager.commit_tx(
                             &self.connection,
                             self.sync_mode,
                             self.update_transaction_state,
-                        )?
-                    } else {
-                        self.pager.commit_tx(
-                            &self.connection,
-                            self.sync_mode,
-                            self.update_transaction_state,
-                        )?
+                        )?,
                     };
                     match commit {
                         IOResult::Done(_) => {
                             self.pager_commit_done = true;
                             self.lock_states.pager_read_tx = false;
                             self.lock_states.pager_write_tx = false;
-                            self.pager.set_spill_to_db_file(false);
+                            self.pager.set_spill_to_db_file(None);
                         }
                         IOResult::IO(io) => return Ok(TransitionResult::Io(io)),
                     }
@@ -3061,7 +3063,7 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
                         .checkpoint_result
                         .as_mut()
                         .expect("checkpoint_result should be set");
-                    let wal_file_already_empty = self.skip_wal
+                    let wal_file_already_empty = self.atomic_page_writer.is_some()
                         && !checkpoint_result.wal_truncate_sent
                         && wal.wal_file()?.size()? == 0;
                     if !wal_file_already_empty {
@@ -3145,16 +3147,24 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> CheckpointStateMachine<Clock, 
         }
     }
 
-    fn can_skip_wal(&self) -> bool {
-        self.database
+    fn atomic_page_writer_for_skip_wal(&self) -> Option<Arc<AtomicPageWriter>> {
+        let wal_has_no_frames = self
+            .pager
+            .wal
+            .as_ref()
+            .is_some_and(|wal| wal.get_max_frame_in_wal() == 0);
+        let can_skip_wal = self
+            .database
             .experimental_mvcc_checkpoint_skip_wal_enabled()
+            && !self.database.is_in_memory_db()
             && self.lock_states.blocking_checkpoint_lock_held
             && self.clears_whole_logical_log()
-            && self
-                .pager
-                .wal
-                .as_ref()
-                .is_some_and(|wal| wal.get_max_frame_in_wal() == 0)
+            && wal_has_no_frames;
+        if !can_skip_wal {
+            return None;
+        }
+        self.database
+            .atomic_page_writer(self.pager.get_page_size_unchecked().get() as usize)
     }
 }
 

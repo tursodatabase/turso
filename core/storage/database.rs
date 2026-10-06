@@ -292,13 +292,7 @@ impl DatabaseStorage for DatabaseFile {
         let Some(pos) = (page_idx as u64 - 1).checked_mul(buffer_size as u64) else {
             return Err(LimboError::IntegerOverflow);
         };
-        let buffer = match io_ctx.page_transform() {
-            PageTransform::Codec(ctx) => {
-                encode_buffer(page_idx, buffer, ctx.as_ref(), PageLocation::Database)?
-            }
-            PageTransform::Checksum(ctx) => checksum_buffer(page_idx, buffer, ctx),
-            PageTransform::None => buffer,
-        };
+        let buffer = encode_page_for_database_file(page_idx, buffer, io_ctx)?;
         self.file.pwrite(pos, buffer, c)
     }
 
@@ -364,6 +358,20 @@ impl DatabaseFile {
     pub fn new(file: Arc<dyn crate::io::File>) -> Self {
         Self { file }
     }
+}
+
+pub(crate) fn encode_page_for_database_file(
+    page_idx: usize,
+    buffer: Arc<Buffer>,
+    io_ctx: &IOContext,
+) -> Result<Arc<Buffer>> {
+    Ok(match io_ctx.page_transform() {
+        PageTransform::Codec(ctx) => {
+            encode_buffer(page_idx, buffer, ctx.as_ref(), PageLocation::Database)?
+        }
+        PageTransform::Checksum(ctx) => checksum_buffer(page_idx, buffer, ctx),
+        PageTransform::None => buffer,
+    })
 }
 
 fn encode_buffer(

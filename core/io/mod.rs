@@ -136,6 +136,18 @@ pub enum FileSyncType {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AtomicWriteUnits {
+    pub min_bytes: u32,
+    pub max_bytes: u32,
+}
+
+impl AtomicWriteUnits {
+    pub fn covers(&self, write_len: usize) -> bool {
+        self.min_bytes as usize <= write_len && write_len <= self.max_bytes as usize
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SharedWalLockKind {
     LinuxOfd,
     ProcessScopedFcntl,
@@ -198,6 +210,13 @@ pub trait File: Send + Sync {
     }
     fn size(&self) -> Result<u64>;
     fn truncate(&self, len: u64, c: Completion) -> Result<Completion>;
+
+    fn pwrite_atomic(&self, pos: u64, buffer: Arc<Buffer>, c: Completion) -> Result<Completion> {
+        let _ = (pos, buffer, c);
+        Err(crate::LimboError::InternalError(
+            "this file does not support atomic writes".to_string(),
+        ))
+    }
 
     /// Optional method implemented by the IO which supports "partial" files (e.g. file with "holes")
     /// This method is used in sync engine only for now (in partial sync mode) and never used in the core database code
@@ -430,6 +449,15 @@ pub trait IO: Clock + Send + Sync {
 
     // remove_file is used in the sync-engine
     fn remove_file(&self, path: &str) -> Result<()>;
+
+    fn atomic_write_units(&self, path: &str) -> Option<AtomicWriteUnits> {
+        let _ = path;
+        None
+    }
+
+    fn open_file_for_direct_io(&self, path: &str) -> Result<Arc<dyn File>> {
+        self.open_file(path, OpenFlags::NoLock, false)
+    }
 
     /// Whether this IO backend can back host-filesystem shared WAL coordination.
     fn supports_shared_wal_coordination(&self) -> bool {

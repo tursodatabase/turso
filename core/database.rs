@@ -28,6 +28,7 @@ use crate::{
     stats::{refresh_analyze_stats, refresh_analyze_stats_nonblock, RefreshAnalyzeStatsState},
     storage::{
         self,
+        atomic_page_writer::AtomicPageWriter,
         checksum::CHECKSUM_REQUIRED_RESERVED_BYTES,
         encryption::{AtomicCipherMode, SQLITE_HEADER, TURSO_HEADER_PREFIX},
         journal_mode,
@@ -81,6 +82,7 @@ pub struct DatabaseOpts {
     pub enable_without_rowid: bool,
     pub enable_experimental_mvcc_passive_checkpoint: bool,
     pub enable_experimental_mvcc_checkpoint_skip_wal: bool,
+    pub assume_torn_write_protection: bool,
     pub unsafe_testing: bool,
     pub(crate) enable_load_extension: bool,
 }
@@ -133,6 +135,11 @@ impl DatabaseOpts {
 
     pub fn with_experimental_mvcc_checkpoint_skip_wal(mut self, enable: bool) -> Self {
         self.enable_experimental_mvcc_checkpoint_skip_wal = enable;
+        self
+    }
+
+    pub fn with_assume_torn_write_protection(mut self, enable: bool) -> Self {
+        self.assume_torn_write_protection = enable;
         self
     }
 
@@ -652,6 +659,7 @@ pub struct Database<
     pub(crate) incarnation: u64,
 
     pager_state: Arc<SharedPagerState>,
+    atomic_page_writer: crate::sync::OnceLock<Option<Arc<AtomicPageWriter>>>,
 
     // Encryption
     encryption_cipher_mode: AtomicCipherMode,
@@ -801,6 +809,7 @@ impl Database {
             },
 
             pager_state: Arc::new(SharedPagerState::new(init_page_1)),
+            atomic_page_writer: crate::sync::OnceLock::new(),
 
             encryption_cipher_mode: AtomicCipherMode::new(
                 encryption_cipher_mode.unwrap_or(CipherMode::None),
@@ -3420,6 +3429,25 @@ impl Database {
 
     pub fn experimental_mvcc_checkpoint_skip_wal_enabled(&self) -> bool {
         self.opts.enable_experimental_mvcc_checkpoint_skip_wal
+    }
+
+    pub(crate) fn atomic_page_writer(&self, page_size: usize) -> Option<Arc<AtomicPageWriter>> {
+        self.atomic_page_writer
+            .get_or_init(|| {
+                AtomicPageWriter::open(
+                    &self.io,
+                    &self.path,
+                    page_size,
+                    self.opts.assume_torn_write_protection,
+                )
+                .unwrap_or_else(|err| {
+                    tracing::warn!("cannot open the database file for atomic writes: {err}");
+                    None
+                })
+                .map(Arc::new)
+            })
+            .clone()
+            .filter(|writer| writer.page_size() == page_size)
     }
 
     pub fn experimental_attach_enabled(&self) -> bool {
