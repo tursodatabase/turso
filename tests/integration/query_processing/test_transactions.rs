@@ -2361,3 +2361,109 @@ fn test_concurrent_autoincrement_no_database_busy(tmp_db: TempDatabase) {
         "Two autoincrement inserts got the same rowid"
     );
 }
+
+#[turso_macros::test]
+fn test_failed_first_temp_write_in_immediate_tx_is_undone(tmp_db: TempDatabase) {
+    let conn = tmp_db.connect_limbo();
+    conn.execute("CREATE TEMP TABLE t (x UNIQUE)").unwrap();
+    conn.execute("INSERT INTO t VALUES (1)").unwrap();
+
+    conn.execute("BEGIN IMMEDIATE").unwrap();
+    assert!(conn.execute("INSERT INTO t VALUES (2), (1)").is_err());
+    conn.execute("COMMIT").unwrap();
+
+    let rows: Vec<(i64,)> = conn.exec_rows("SELECT x FROM t");
+    assert_eq!(rows, vec![(1,)]);
+}
+
+#[turso_macros::test]
+fn test_failed_main_write_from_temp_trigger_in_immediate_tx_undoes_temp_rows(tmp_db: TempDatabase) {
+    let conn = tmp_db.connect_limbo();
+    conn.execute("CREATE TABLE m (x UNIQUE)").unwrap();
+    conn.execute("INSERT INTO m VALUES (1)").unwrap();
+    conn.execute("CREATE TEMP TABLE t (x)").unwrap();
+    conn.execute(
+        "CREATE TEMP TRIGGER tr AFTER INSERT ON t BEGIN INSERT INTO m VALUES (new.x); END",
+    )
+    .unwrap();
+
+    conn.execute("BEGIN IMMEDIATE").unwrap();
+    assert!(conn.execute("INSERT INTO t VALUES (2), (1)").is_err());
+    conn.execute("COMMIT").unwrap();
+
+    let rows: Vec<(i64, i64)> =
+        conn.exec_rows("SELECT (SELECT count(*) FROM t), (SELECT count(*) FROM m)");
+    assert_eq!(rows, vec![(0, 1)]);
+}
+
+#[turso_macros::test(mvcc)]
+fn test_insert_or_rollback_in_immediate_tx_undoes_earlier_temp_writes(tmp_db: TempDatabase) {
+    let conn = tmp_db.connect_limbo();
+    conn.execute("CREATE TABLE m (x UNIQUE)").unwrap();
+    conn.execute("INSERT INTO m VALUES (1)").unwrap();
+    conn.execute("CREATE TEMP TABLE t (x)").unwrap();
+
+    conn.execute("BEGIN IMMEDIATE").unwrap();
+    conn.execute("INSERT INTO t VALUES (1)").unwrap();
+    assert!(conn
+        .execute("INSERT OR ROLLBACK INTO m VALUES (1)")
+        .is_err());
+    assert!(conn.execute("COMMIT").is_err());
+
+    let rows: Vec<(i64,)> = conn.exec_rows("SELECT count(*) FROM t");
+    assert_eq!(rows, vec![(0,)]);
+}
+
+#[turso_macros::test(mvcc)]
+fn test_insert_or_fail_in_immediate_tx_keeps_temp_rows_written_before_the_failure(
+    tmp_db: TempDatabase,
+) {
+    let conn = tmp_db.connect_limbo();
+    conn.execute("CREATE TEMP TABLE t (x UNIQUE)").unwrap();
+    conn.execute("INSERT INTO t VALUES (1)").unwrap();
+
+    conn.execute("BEGIN IMMEDIATE").unwrap();
+    assert!(conn
+        .execute("INSERT OR FAIL INTO t VALUES (2), (1), (3)")
+        .is_err());
+    conn.execute("COMMIT").unwrap();
+
+    let rows: Vec<(i64,)> = conn.exec_rows("SELECT x FROM t ORDER BY x");
+    assert_eq!(rows, vec![(1,), (2,)]);
+}
+
+#[turso_macros::test]
+fn test_temp_table_still_works_after_begin_immediate_is_busy_on_attached_db(tmp_db: TempDatabase) {
+    let aux_path = tmp_db
+        .path
+        .parent()
+        .unwrap()
+        .join("aux_busy_begin_immediate.db")
+        .to_string_lossy()
+        .to_string();
+    let holder = tmp_db.connect_limbo();
+    let conn = tmp_db.connect_limbo();
+    holder
+        .execute(format!("ATTACH '{aux_path}' AS aux"))
+        .unwrap();
+    holder.execute("CREATE TABLE aux.a (x)").unwrap();
+    conn.execute(format!("ATTACH '{aux_path}' AS aux")).unwrap();
+    conn.execute("CREATE TEMP TABLE t (x)").unwrap();
+    conn.execute("INSERT INTO t VALUES (1)").unwrap();
+
+    holder.execute("BEGIN").unwrap();
+    holder.execute("INSERT INTO aux.a VALUES (1)").unwrap();
+    assert!(matches!(
+        conn.execute("BEGIN IMMEDIATE"),
+        Err(LimboError::Busy)
+    ));
+
+    conn.execute("INSERT INTO t VALUES (2)").unwrap();
+    holder.execute("COMMIT").unwrap();
+    conn.execute("BEGIN IMMEDIATE").unwrap();
+    conn.execute("INSERT INTO t VALUES (3)").unwrap();
+    conn.execute("ROLLBACK").unwrap();
+
+    let rows: Vec<(i64,)> = conn.exec_rows("SELECT x FROM t ORDER BY x");
+    assert_eq!(rows, vec![(1,), (2,)]);
+}

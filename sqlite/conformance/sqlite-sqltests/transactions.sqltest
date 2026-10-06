@@ -151,3 +151,167 @@ expect {
     1
 }
 
+test temp-store-can-change-in-immediate-tx-that-has-not-used-temp {
+    BEGIN IMMEDIATE;
+    PRAGMA temp_store = MEMORY;
+    COMMIT;
+    PRAGMA temp_store;
+}
+expect {
+    2
+}
+
+test temp-page-count-is-zero-in-immediate-tx-that-has-not-used-temp {
+    BEGIN IMMEDIATE;
+    PRAGMA temp.page_count;
+    COMMIT;
+}
+expect {
+    0
+}
+
+test temp-wal-checkpoint-after-immediate-tx-that-has-not-used-temp {
+    BEGIN IMMEDIATE;
+    COMMIT;
+    PRAGMA temp.wal_checkpoint;
+}
+expect {
+    0|-1|-1
+}
+
+@requires trigger "needs triggers"
+test immediate-tx-rollback-undoes-temp-trigger-writes-from-main-insert {
+    CREATE TABLE m(x);
+    CREATE TEMP TABLE log(x);
+    CREATE TEMP TRIGGER tr AFTER INSERT ON m BEGIN INSERT INTO log VALUES (new.x); END;
+    BEGIN IMMEDIATE;
+    INSERT INTO m VALUES (1);
+    SELECT (SELECT count(*) FROM m), (SELECT count(*) FROM log);
+    ROLLBACK;
+    SELECT (SELECT count(*) FROM m), (SELECT count(*) FROM log);
+}
+expect {
+    1|1
+    0|0
+}
+
+test immediate-tx-rollback-undoes-temp-user-version {
+    CREATE TEMP TABLE t(x);
+    BEGIN IMMEDIATE;
+    PRAGMA temp.user_version = 5;
+    PRAGMA temp.user_version;
+    ROLLBACK;
+    PRAGMA temp.user_version;
+}
+expect {
+    5
+    0
+}
+
+test immediate-tx-rollback-restores-dropped-temp-table-and-index {
+    CREATE TEMP TABLE t(x);
+    INSERT INTO t VALUES (1);
+    CREATE INDEX temp.ti ON t(x);
+    BEGIN IMMEDIATE;
+    DROP TABLE t;
+    ROLLBACK;
+    SELECT x FROM t;
+    SELECT name FROM temp.sqlite_schema WHERE name IN ('t', 'ti') ORDER BY name;
+    PRAGMA temp.integrity_check;
+}
+expect {
+    1
+    t
+    ti
+    ok
+}
+
+test immediate-tx-rollback-restores-temp-autoincrement-counter {
+    CREATE TEMP TABLE t(id INTEGER PRIMARY KEY AUTOINCREMENT, x);
+    INSERT INTO t(x) VALUES ('a');
+    BEGIN IMMEDIATE;
+    INSERT INTO t(x) VALUES ('b');
+    ROLLBACK;
+    INSERT INTO t(x) VALUES ('c');
+    SELECT id, x FROM t;
+}
+expect {
+    1|a
+    2|c
+}
+
+test immediate-tx-savepoints-cover-temp-table-first-written-after-them {
+    CREATE TABLE m(x);
+    CREATE TEMP TABLE t(x);
+    BEGIN IMMEDIATE;
+    SAVEPOINT a;
+    INSERT INTO m VALUES (10);
+    SAVEPOINT b;
+    INSERT INTO t VALUES (1);
+    RELEASE b;
+    SAVEPOINT c;
+    INSERT INTO t VALUES (2);
+    ROLLBACK TO a;
+    INSERT INTO t VALUES (3);
+    COMMIT;
+    SELECT (SELECT group_concat(x) FROM t), (SELECT count(*) FROM m);
+}
+expect {
+    3|0
+}
+
+test immediate-tx-savepoint-covers-temp-table-first-read-after-it {
+    CREATE TEMP TABLE t(x);
+    BEGIN IMMEDIATE;
+    SAVEPOINT a;
+    SELECT count(*) FROM t;
+    SAVEPOINT b;
+    INSERT INTO t VALUES (1);
+    ROLLBACK TO a;
+    INSERT INTO t VALUES (2);
+    COMMIT;
+    SELECT group_concat(x) FROM t;
+}
+expect {
+    0
+    2
+}
+
+test exclusive-tx-read-then-write-temp-table-then-rollback {
+    CREATE TEMP TABLE t(x);
+    INSERT INTO t VALUES (1);
+    BEGIN EXCLUSIVE;
+    SELECT group_concat(x) FROM t;
+    INSERT INTO t VALUES (2);
+    UPDATE t SET x = x * 10;
+    DELETE FROM t WHERE x = 10;
+    SELECT group_concat(x) FROM t;
+    ROLLBACK;
+    SELECT group_concat(x) FROM t;
+}
+expect {
+    1
+    20
+    1
+}
+
+test immediate-tx-temp-table-created-after-savepoint-is-removed-by-rollback-to {
+    BEGIN IMMEDIATE;
+    SAVEPOINT sp;
+    CREATE TEMP TABLE t(x);
+    INSERT INTO t VALUES (1);
+    ROLLBACK TO sp;
+    CREATE TEMP TABLE t2(y);
+    INSERT INTO t2 VALUES (2);
+    RELEASE sp;
+    COMMIT;
+    SELECT y FROM t2;
+    SELECT name FROM temp.sqlite_schema WHERE type = 'table' ORDER BY name;
+    PRAGMA temp.integrity_check;
+}
+expect {
+    2
+    t2
+    ok
+}
+
