@@ -1302,6 +1302,11 @@ pub fn translate_create_table(
         }
     }
 
+    let new_table = Arc::new(create_table(&normalized_tbl_name, &body, 0)?);
+    resolver.with_schema(database_id, |schema| {
+        schema.refuse_fks_between_stored_forms(&new_table)
+    })?;
+
     let mut has_autoincrement = false;
     if let ast::CreateTableBody::ColumnsAndConstraints {
         columns,

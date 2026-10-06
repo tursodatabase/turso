@@ -977,3 +977,56 @@ expect {
     3|8.0000
     ok
 }
+
+@requires strict "uses STRICT tables"
+test foreign-key-between-different-stored-forms-is-refused {
+    CREATE TABLE parent(d date PRIMARY KEY) STRICT;
+    CREATE TABLE child(id pg_int4 PRIMARY KEY, d pg_date REFERENCES parent(d)) STRICT, PGSTORAGE;
+}
+expect error {
+    foreign key mismatch - "child" referencing "parent": column d of type pg_date stores its values in another form than column d of type date
+}
+
+@requires strict "uses STRICT tables"
+test foreign-key-to-a-parent-created-later-with-another-stored-form-is-refused {
+    CREATE TABLE child(id pg_int4 PRIMARY KEY, n pg_numeric(10,2) REFERENCES parent(n)) STRICT, PGSTORAGE;
+    CREATE TABLE parent(n pg_numeric(12,4) PRIMARY KEY) STRICT, PGSTORAGE;
+}
+expect error {
+    foreign key mismatch - "child" referencing "parent": column n of type pg_numeric stores its values in another form than column n of type pg_numeric
+}
+
+@requires strict "uses STRICT tables"
+test foreign-key-of-add-column-with-another-stored-form-is-refused {
+    CREATE TABLE parent(d date PRIMARY KEY) STRICT;
+    CREATE TABLE child(id pg_int4 PRIMARY KEY) STRICT, PGSTORAGE;
+    ALTER TABLE child ADD COLUMN d pg_date REFERENCES parent(d);
+}
+expect error {
+    foreign key mismatch - "child" referencing "parent": column d of type pg_date stores its values in another form than column d of type date
+}
+
+@requires strict "uses STRICT tables"
+test foreign-key-between-the-same-stored-forms {
+    PRAGMA foreign_keys = ON;
+    CREATE TABLE parent(id pg_int8 PRIMARY KEY, d pg_date UNIQUE, n pg_numeric(10,2) UNIQUE) STRICT, PGSTORAGE;
+    CREATE TABLE child(id pg_int4 PRIMARY KEY, p pg_int4 REFERENCES parent(id), d pg_date REFERENCES parent(d), n pg_numeric(12,2) REFERENCES parent(n)) STRICT, PGSTORAGE;
+    INSERT INTO parent VALUES (1, '2024-01-01', 1.5);
+    INSERT INTO child VALUES (1, 1, '2024-01-01', 1.5);
+    SELECT count(*) FROM child;
+}
+expect {
+    1
+}
+
+@requires strict "uses STRICT tables"
+test foreign-key-between-the-same-stored-forms-refuses-a-missing-parent {
+    PRAGMA foreign_keys = ON;
+    CREATE TABLE parent(id pg_int8 PRIMARY KEY, d pg_date UNIQUE) STRICT, PGSTORAGE;
+    CREATE TABLE child(id pg_int4 PRIMARY KEY, d pg_date REFERENCES parent(d)) STRICT, PGSTORAGE;
+    INSERT INTO parent VALUES (1, '2024-01-01');
+    INSERT INTO child VALUES (1, '2024-01-02');
+}
+expect error {
+    FOREIGN KEY constraint failed
+}

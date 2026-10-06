@@ -194,6 +194,12 @@ ALTER TABLE ... ADD COLUMN of a timestamp, date or time column with the
 DEFAULT `'now'`, `'today'`, `'tomorrow'` or `'yesterday'` needs an empty
 table.
 
+A FOREIGN KEY compares the stored values of its columns. A FOREIGN KEY
+between two columns that store their values in different forms is refused,
+for example a timestamp, date, time or numeric column of a new table and a
+column of another type or of an older table, or two numeric columns with
+different scales. PostgreSQL accepts some of these keys.
+
 | Feature | Status | Notes |
 |---------|--------|-------|
 | Arrays of compound types | ❌ Not supported | |

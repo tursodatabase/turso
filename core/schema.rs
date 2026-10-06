@@ -2757,6 +2757,17 @@ impl Schema {
         };
 
         fk.validate()?;
+        for (&child_column, parent_name) in child_pos.iter().zip(parent_cols.iter()) {
+            let Some((_, parent_column)) = parent_tbl.get_column(parent_name) else {
+                continue;
+            };
+            self.refuse_fk_between_stored_forms(
+                child,
+                &child.columns[child_column],
+                parent_tbl,
+                parent_column,
+            )?;
+        }
         Ok(ResolvedFkRef {
             child_table: Arc::clone(child),
             fk: Arc::clone(fk),
@@ -2766,6 +2777,113 @@ impl Schema {
             parent_uses_rowid,
             parent_unique_index,
         })
+    }
+
+    /// Refuse the FOREIGN KEYs of a new table, and the FOREIGN KEYs of other
+    /// tables that reference it, whose columns store their values in
+    /// different forms.
+    pub(crate) fn refuse_fks_between_stored_forms(&self, table: &Arc<BTreeTable>) -> Result<()> {
+        for fk in table.foreign_keys.iter() {
+            let parent_name = normalize_ident(&fk.parent_table);
+            let parent = if parent_name == table.name {
+                Arc::clone(table)
+            } else {
+                match self.get_btree_table(&parent_name) {
+                    Some(parent) => parent,
+                    None => continue,
+                }
+            };
+            self.refuse_fk_columns_between_stored_forms(fk, table, &parent)?;
+        }
+        for child in self.tables.values().filter_map(|t| t.btree()) {
+            if child.name == table.name {
+                continue;
+            }
+            for fk in child
+                .foreign_keys
+                .iter()
+                .filter(|fk| normalize_ident(&fk.parent_table) == table.name)
+            {
+                self.refuse_fk_columns_between_stored_forms(fk, &child, table)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn refuse_fk_columns_between_stored_forms(
+        &self,
+        fk: &ForeignKey,
+        child: &BTreeTable,
+        parent: &BTreeTable,
+    ) -> Result<()> {
+        let parent_columns: Vec<&str> = if fk.parent_columns.is_empty() {
+            parent
+                .primary_key_columns
+                .iter()
+                .map(|(name, _)| name.as_str())
+                .collect()
+        } else {
+            fk.parent_columns.iter().map(String::as_str).collect()
+        };
+        for (child_name, parent_name) in fk.child_columns.iter().zip(parent_columns) {
+            let (Some((_, child_column)), Some((_, parent_column))) =
+                (child.get_column(child_name), parent.get_column(parent_name))
+            else {
+                continue;
+            };
+            self.refuse_fk_between_stored_forms(child, child_column, parent, parent_column)?;
+        }
+        Ok(())
+    }
+
+    /// A FOREIGN KEY compares the stored values of its columns. The built-in
+    /// types of the PostgreSQL frontend store a date, a time or a decimal as
+    /// an integer, which a column of another type stores in another form, so
+    /// refuse a FOREIGN KEY between such columns.
+    fn refuse_fk_between_stored_forms(
+        &self,
+        child: &BTreeTable,
+        child_column: &Column,
+        parent: &BTreeTable,
+        parent_column: &Column,
+    ) -> Result<()> {
+        let child_form = self.decoded_stored_form(child, child_column);
+        let parent_form = self.decoded_stored_form(parent, parent_column);
+        if child_form == parent_form {
+            return Ok(());
+        }
+        Err(crate::LimboError::ForeignKeyConstraint(format!(
+            "foreign key mismatch - \"{}\" referencing \"{}\": column {} of type {} stores its values in another form than column {} of type {}",
+            child.name,
+            parent.name,
+            child_column.name.as_deref().unwrap_or_default(),
+            child_column.ty_str,
+            parent_column.name.as_deref().unwrap_or_default(),
+            parent_column.ty_str,
+        )))
+    }
+
+    /// The built-in type of the PostgreSQL frontend in the type chain of a
+    /// column that stores another value than the value it shows, and the
+    /// scale of a `pg_numeric`.
+    fn decoded_stored_form(&self, table: &BTreeTable, column: &Column) -> Option<(String, String)> {
+        let resolved = self
+            .resolve_type(&column.ty_str, table.is_strict)
+            .ok()
+            .flatten()?;
+        let type_def = resolved
+            .chain
+            .iter()
+            .find(|td| td.is_pg_storage_type() && !decode_returns_stored_value(td))?;
+        let scale = match type_def.name.as_str() {
+            "pg_numeric" => column
+                .ty_params
+                .get(1)
+                .map(|scale| scale.to_string())
+                .unwrap_or_default(),
+            _ => String::new(),
+        };
+        Some((type_def.name.clone(), scale))
     }
 
     /// Returns if any table declares a FOREIGN KEY whose parent is `table_name`.

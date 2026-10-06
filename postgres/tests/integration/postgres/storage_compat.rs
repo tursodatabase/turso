@@ -548,6 +548,37 @@ fn numeric_expression_indexes_of_base_file_keep_their_keys() {
     );
 }
 
+/// A FOREIGN KEY compares stored values. A new table stores a numeric of
+/// precision at most 18 as an integer, so a reference from it to a numeric
+/// column of the base file is refused. A bigint stores the same integer in
+/// both versions.
+#[test]
+fn foreign_keys_to_base_file_columns_need_the_same_stored_form() {
+    let dir = copy_fixtures(&[MAIN]);
+    let db = open(dir.path().join(MAIN), false);
+    let conn = db.connect_postgres();
+    let err = conn
+        .execute("CREATE TABLE refs_comp (id int PRIMARY KEY, c numeric(5,1) REFERENCES comp (c))")
+        .unwrap_err();
+    assert!(
+        err.to_string().contains(
+            "column c of type pg_numeric stores its values in another form than column c of type numeric"
+        ),
+        "{err}"
+    );
+    conn.execute("CREATE TABLE refs_big (id int PRIMARY KEY, b bigint REFERENCES big (id))")
+        .unwrap();
+    conn.execute("INSERT INTO refs_big SELECT id, id FROM big")
+        .unwrap();
+    assert_eq!(
+        rows(
+            &conn,
+            "SELECT count(*) FROM refs_big JOIN big ON big.id = refs_big.b"
+        ),
+        rows(&conn, "SELECT count(*) FROM big")
+    );
+}
+
 /// New tables store timestamps, dates, times, numerics and bigints as
 /// integers. Their values equal the values of the base file, also in joins
 /// with and without an index.

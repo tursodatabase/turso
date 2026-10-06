@@ -1477,6 +1477,10 @@ pub fn translate_alter_table(
             // Refresh local `column` from btree so that domain NOT NULL is
             // visible to the empty-table check below.
             column = btree.columns().last().unwrap().clone();
+            let altered = Arc::new(btree.clone());
+            resolver.with_schema(database_id, |schema| {
+                schema.refuse_fks_between_stored_forms(&altered)
+            })?;
 
             let escaped = escape_sql_string_literal(&btree.to_checked_sql()?);
             let escaped_table_name = escape_sql_string_literal(table_name);
