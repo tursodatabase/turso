@@ -225,7 +225,7 @@ impl PostgreSQLTranslator {
     fn translate_create_table(
         &self,
         create: &pg_query::protobuf::CreateStmt,
-    ) -> Result<(ast::Stmt, Vec<String>), ParseError> {
+    ) -> Result<(ast::Stmt, Vec<ast::Stmt>), ParseError> {
         use pg_query::protobuf::node::Node;
         use pg_query::protobuf::ConstrType;
 
@@ -244,8 +244,8 @@ impl PostgreSQLTranslator {
 
         let mut columns = Vec::new();
         let mut table_constraints = Vec::new();
-        // Collect implicit sequence names for serial columns
-        let mut serial_sequences: Vec<String> = Vec::new();
+        // Collect the implicit sequences of serial and identity columns
+        let mut serial_sequences: Vec<ast::Stmt> = Vec::new();
 
         // Extract table name for serial sequence naming
         let tbl_name_str = tbl_name.name.as_str().to_string();
@@ -368,21 +368,7 @@ impl PostgreSQLTranslator {
         &self,
         create: &pg_query::protobuf::CreateStmt,
     ) -> Result<TranslateResult, ParseError> {
-        let (stmt, serial_sequences) = self.translate_create_table(create)?;
-
-        let prereqs = serial_sequences
-            .into_iter()
-            .map(|seq_name| ast::Stmt::CreateSequence {
-                if_not_exists: true,
-                seq_name: ast::QualifiedName::single(ast::Name::from_string(seq_name)),
-                start: None,
-                increment: None,
-                min_value: None,
-                max_value: None,
-                cycle: false,
-            })
-            .collect();
-
+        let (stmt, prereqs) = self.translate_create_table(create)?;
         Ok(TranslateResult {
             prereqs,
             cmd: ast::Cmd::Stmt(stmt),
@@ -396,7 +382,7 @@ impl PostgreSQLTranslator {
         col_def: &pg_query::protobuf::ColumnDef,
         has_table_pk: bool,
         table_name: &str,
-        serial_sequences: &mut Vec<String>,
+        serial_sequences: &mut Vec<ast::Stmt>,
     ) -> Result<ast::ColumnDefinition, ParseError> {
         use pg_query::protobuf::node::Node;
         use pg_query::protobuf::ConstrType;
@@ -405,7 +391,8 @@ impl PostgreSQLTranslator {
         let pg_type = extract_type_name(col_def)?;
         let typmods = extract_integer_typmods(col_def);
 
-        let is_serial = is_serial_type(&pg_type);
+        let identity = self.identity_sequence_options(col_def)?;
+        let is_serial = is_serial_type(&pg_type) || identity.is_some();
 
         let mapping = map_pg_type(&pg_type, &typmods, self.type_mapping).ok_or_else(|| {
             ParseError::ParseError(format!("unsupported PostgreSQL type: {pg_type}"))
@@ -481,7 +468,16 @@ impl PostgreSQLTranslator {
 
         if is_serial && default_expr.is_none() {
             let seq_name = serial_sequence_name(table_name, &name);
-            serial_sequences.push(seq_name.clone());
+            let options = identity.unwrap_or_default();
+            serial_sequences.push(ast::Stmt::CreateSequence {
+                if_not_exists: true,
+                seq_name: ast::QualifiedName::single(ast::Name::from_string(seq_name.clone())),
+                start: options.start,
+                increment: options.increment,
+                min_value: options.min_value,
+                max_value: options.max_value,
+                cycle: options.cycle,
+            });
             default_expr = Some(ast::Expr::FunctionCall {
                 name: ast::Name::from_string("nextval"),
                 distinctness: None,
@@ -555,6 +551,35 @@ impl PostgreSQLTranslator {
             col_type,
             constraints,
         })
+    }
+
+    /// The sequence options of a `GENERATED ... AS IDENTITY` column. Tables of
+    /// `TypeMapping::V1` ignore IDENTITY: their rowid alias makes the ids.
+    fn identity_sequence_options(
+        &self,
+        col_def: &pg_query::protobuf::ColumnDef,
+    ) -> Result<Option<SequenceOptions>, ParseError> {
+        use pg_query::protobuf::node::Node;
+        use pg_query::protobuf::ConstrType;
+
+        if self.type_mapping == TypeMapping::V1 {
+            return Ok(None);
+        }
+        let identity = col_def
+            .constraints
+            .iter()
+            .find_map(|node| match &node.node {
+                Some(Node::Constraint(constraint))
+                    if ConstrType::try_from(constraint.contype)
+                        == Ok(ConstrType::ConstrIdentity) =>
+                {
+                    Some(constraint)
+                }
+                _ => None,
+            });
+        identity
+            .map(|constraint| sequence_options(&constraint.options))
+            .transpose()
     }
 
     /// Convert a PgForeignKey to an AST ForeignKeyClause.
@@ -1244,7 +1269,8 @@ impl PostgreSQLTranslator {
 
         let (body, columns) = if !select_stmt.values_lists.is_empty() {
             // VALUES clause — compute which columns are DEFAULT in ALL rows.
-            let (rows, default_mask) = self.translate_values(&select_stmt.values_lists)?;
+            let (rows, default_mask) =
+                self.translate_values(&select_stmt.values_lists, has_explicit_columns)?;
             // Strip columns that use DEFAULT in every row
             let filtered_columns: Vec<ast::Name> = columns
                 .into_iter()
@@ -1292,19 +1318,27 @@ impl PostgreSQLTranslator {
     /// which column positions contain DEFAULT in every row. These positions should
     /// be stripped from the INSERT column list since SQLite doesn't support DEFAULT
     /// in VALUES — omitting the column achieves the same effect.
-    /// Columns with DEFAULT in only SOME rows keep the DEFAULT as NULL.
+    /// Columns with DEFAULT in only SOME rows keep the DEFAULT, which core
+    /// replaces with the column DEFAULT. Without a column list, every DEFAULT
+    /// stays: there is no column name to strip.
     // The Box<Expr> is required by ast::OneSelect::Values(Vec<Vec<Box<Expr>>>)
     #[allow(clippy::vec_box, clippy::type_complexity)]
     fn translate_values(
         &self,
         values_lists: &[pg_query::protobuf::Node],
+        has_explicit_columns: bool,
     ) -> Result<(Vec<Vec<Box<ast::Expr>>>, Vec<bool>), ParseError> {
         use pg_query::protobuf::node::Node;
 
         // First pass: compute the default mask across ALL rows.
         // A column is "all defaults" only if every row has DEFAULT for that position.
         let mut default_mask: Vec<bool> = Vec::new();
-        for (row_idx, row_node) in values_lists.iter().enumerate() {
+        let rows_with_column_names = if has_explicit_columns {
+            values_lists
+        } else {
+            &[]
+        };
+        for (row_idx, row_node) in rows_with_column_names.iter().enumerate() {
             if let Some(Node::List(list)) = &row_node.node {
                 if row_idx == 0 {
                     default_mask = list
@@ -1325,7 +1359,7 @@ impl PostgreSQLTranslator {
         }
 
         // Second pass: translate values, filtering out all-default columns.
-        // Columns with DEFAULT in only some rows emit NULL (via translate_expr).
+        // Columns with DEFAULT in only some rows keep DEFAULT (via translate_expr).
         let mut rows = Vec::new();
         for row_node in values_lists.iter() {
             match &row_node.node {
@@ -3887,64 +3921,15 @@ impl PostgreSQLTranslator {
             .as_ref()
             .ok_or_else(|| ParseError::ParseError("CREATE SEQUENCE missing name".into()))?;
         let seq_name = self.qualified_name_from_range_var(relation);
-
-        let mut start = None;
-        let mut increment = None;
-        let mut min_value = None;
-        let mut max_value = None;
-        let mut cycle = false;
-
-        for opt_node in &seq.options {
-            if let Some(pg_query::protobuf::node::Node::DefElem(elem)) = &opt_node.node {
-                match elem.defname.as_str() {
-                    "start" => {
-                        start = extract_def_elem_int(elem);
-                    }
-                    "increment" => {
-                        increment = extract_def_elem_int(elem);
-                    }
-                    "minvalue" => {
-                        min_value = extract_def_elem_int(elem);
-                    }
-                    "maxvalue" => {
-                        max_value = extract_def_elem_int(elem);
-                    }
-                    "cycle" => {
-                        // pg_query emits Boolean(true) for CYCLE, Boolean(false) for NO CYCLE
-                        cycle = extract_def_elem_bool(elem);
-                    }
-                    "cache" => {
-                        // Turso's disk-only sequence implementation never
-                        // caches values, so a `CACHE n` clause is otherwise
-                        // a no-op. We still validate the value against the
-                        // PostgreSQL contract (`CACHE` must be >= 1) so
-                        // that `CACHE 0` errors with the same message a
-                        // real PG server would produce. Surfacing the
-                        // requested value through to the runtime would
-                        // require resurrecting per-sequence in-memory
-                        // descriptor state we have intentionally removed
-                        // (see feedback-sequences-disk-only memory).
-                        if let Some(cache) = extract_def_elem_int(elem) {
-                            if cache < 1 {
-                                return Err(ParseError::ParseError(format!(
-                                    "CACHE ({cache}) must be greater than zero"
-                                )));
-                            }
-                        }
-                    }
-                    _ => {} // ignore other unknown options
-                }
-            }
-        }
-
+        let options = sequence_options(&seq.options)?;
         Ok(ast::Stmt::CreateSequence {
             if_not_exists: seq.if_not_exists,
             seq_name,
-            start,
-            increment,
-            min_value,
-            max_value,
-            cycle,
+            start: options.start,
+            increment: options.increment,
+            min_value: options.min_value,
+            max_value: options.max_value,
+            cycle: options.cycle,
         })
     }
 
@@ -3976,7 +3961,7 @@ impl PostgreSQLTranslator {
             .as_ref()
             .ok_or_else(|| ParseError::ParseError("CREATE DOMAIN missing base type".into()))?;
         let pg_type = extract_type_name_from_typename(type_name_node)?;
-        let base_type = match map_pg_type(&pg_type, &[], DOMAIN_BASE_TYPE_MAPPING) {
+        let base_type = match map_pg_type(&pg_type, &[], self.type_mapping) {
             Some(mapping) => mapping.type_name,
             None => pg_type, // custom type or domain — pass through
         };
@@ -4133,6 +4118,63 @@ pub fn serial_sequence_name(table_name: &str, column_name: &str) -> String {
     )
 }
 
+/// The options of CREATE SEQUENCE and of a `GENERATED ... AS IDENTITY` column.
+#[derive(Default)]
+struct SequenceOptions {
+    start: Option<i64>,
+    increment: Option<i64>,
+    min_value: Option<i64>,
+    max_value: Option<i64>,
+    cycle: bool,
+}
+
+fn sequence_options(options: &[pg_query::protobuf::Node]) -> Result<SequenceOptions, ParseError> {
+    let mut sequence_options = SequenceOptions::default();
+    for opt_node in options {
+        if let Some(pg_query::protobuf::node::Node::DefElem(elem)) = &opt_node.node {
+            match elem.defname.as_str() {
+                "start" => {
+                    sequence_options.start = extract_def_elem_int(elem);
+                }
+                "increment" => {
+                    sequence_options.increment = extract_def_elem_int(elem);
+                }
+                "minvalue" => {
+                    sequence_options.min_value = extract_def_elem_int(elem);
+                }
+                "maxvalue" => {
+                    sequence_options.max_value = extract_def_elem_int(elem);
+                }
+                "cycle" => {
+                    // pg_query emits Boolean(true) for CYCLE, Boolean(false) for NO CYCLE
+                    sequence_options.cycle = extract_def_elem_bool(elem);
+                }
+                "cache" => {
+                    // Turso's disk-only sequence implementation never
+                    // caches values, so a `CACHE n` clause is otherwise
+                    // a no-op. We still validate the value against the
+                    // PostgreSQL contract (`CACHE` must be >= 1) so
+                    // that `CACHE 0` errors with the same message a
+                    // real PG server would produce. Surfacing the
+                    // requested value through to the runtime would
+                    // require resurrecting per-sequence in-memory
+                    // descriptor state we have intentionally removed
+                    // (see feedback-sequences-disk-only memory).
+                    if let Some(cache) = extract_def_elem_int(elem) {
+                        if cache < 1 {
+                            return Err(ParseError::ParseError(format!(
+                                "CACHE ({cache}) must be greater than zero"
+                            )));
+                        }
+                    }
+                }
+                _ => {} // ignore other unknown options
+            }
+        }
+    }
+    Ok(sequence_options)
+}
+
 /// Returns true if the given PG type name is a serial variant (auto-incrementing integer).
 /// Covers all PostgreSQL serial aliases: serial, serial2, serial4, serial8,
 /// smallserial, bigserial.
@@ -4155,16 +4197,17 @@ fn map_pg_type(pg_type: &str, params: &[i64], mapping: TypeMapping) -> Option<Pg
     }
 }
 
-/// The mapping of `TypeMapping::V2`. Timestamps, dates, times, bigints and
+/// The mapping of `TypeMapping::V2`. Integers, timestamps, dates, times and
 /// numerics with a precision of at most 18 get built-in types that store
-/// integers. The integer and serial types keep the `INTEGER` of `V1`, which
-/// can be a rowid alias. Arrays and every other type keep the mapping of `V1`.
+/// integers. A single-column PRIMARY KEY of `pg_int4` or `pg_int8` is a rowid
+/// alias. Arrays and every other type keep the mapping of `V1`.
 fn map_pg_type_v2(pg_type: &str, params: &[i64]) -> Option<PgTypeMapping> {
     if pg_type.ends_with("[]") || pg_type.starts_with('_') {
         return map_pg_type_v1(pg_type, params);
     }
     let type_name = match pg_type.to_uppercase().as_str() {
-        "BIGINT" | "INT8" => "pg_int8",
+        "INTEGER" | "INT" | "INT4" | "SERIAL" | "SERIAL4" | "SMALLSERIAL" | "SERIAL2" => "pg_int4",
+        "BIGINT" | "INT8" | "BIGSERIAL" | "SERIAL8" => "pg_int8",
         "TIMESTAMP" => "pg_timestamp",
         "TIMESTAMPTZ" => "pg_timestamptz",
         "DATE" => "pg_date",
@@ -4193,10 +4236,6 @@ fn map_pg_type_v2(pg_type: &str, params: &[i64]) -> Option<PgTypeMapping> {
 /// The largest precision of a numeric that the stored integer of `pg_numeric`
 /// can hold.
 const PG_NUMERIC_MAX_PRECISION: i64 = 18;
-
-/// A domain keeps the base types of `V1`: a domain CHECK reads the stored
-/// value, and the built-in types of `V2` store integers.
-const DOMAIN_BASE_TYPE_MAPPING: TypeMapping = TypeMapping::V1;
 
 /// The mapping of `TypeMapping::V1`. Tables in existing files depend on it:
 /// never change it.
@@ -7662,8 +7701,11 @@ mod tests {
              k timestamp, l timestamptz, k3 timestamp(3), l6 time(6))",
             "CREATE TABLE t (d numeric(10,2), e numeric(5), f decimal, g numeric(18,18), \
              h numeric(19,2), i numeric(5,6))",
-            "CREATE TABLE t (a timestamp[], b date[], c numeric(10,2)[], d int8[], e _date)",
-            "CREATE TABLE t (id bigint PRIMARY KEY, a serial, b bigserial, c integer)",
+            "CREATE TABLE t (a timestamp[], b date[], c numeric(10,2)[], d int8[], e _date, f integer[])",
+            "CREATE TABLE t (id bigint PRIMARY KEY, a serial, b bigserial, c integer, d int, e int4, \
+             f smallserial, g serial8, h oid)",
+            "CREATE TABLE t (id int GENERATED ALWAYS AS IDENTITY PRIMARY KEY, \
+             b bigint GENERATED BY DEFAULT AS IDENTITY (START WITH 100 INCREMENT BY 10))",
             "CREATE TABLE t (a text CHECK (a::date <> '2024-01-01'), b timestamp DEFAULT '2024-01-01'::timestamp, \
              c text CHECK (c::timetz > '10:00' AND c::timestamptz > timestamp '2000-01-01'))",
         ];
@@ -7683,23 +7725,83 @@ mod tests {
         let expected = [
             "CREATE TABLE t (a boolean, c smallint, e pg_int8, f pg_int8, h pg_date, i pg_time, j time, k pg_timestamp, l pg_timestamptz, k3 pg_timestamp, l6 pg_time) STRICT, PGSTORAGE",
             "CREATE TABLE t (d pg_numeric (10, 2), e pg_numeric (5, 0), f REAL, g pg_numeric (18, 18), h numeric (19, 2), i numeric (5, 6)) STRICT, PGSTORAGE",
-            "CREATE TABLE t (a timestamp[], b date[], c numeric (10, 2)[], d bigint[], e date[]) STRICT, PGSTORAGE",
-            "CREATE TABLE t (id pg_int8 PRIMARY KEY, a INTEGER NOT NULL DEFAULT (nextval ('t_a_seq')), b INTEGER NOT NULL DEFAULT (nextval ('t_b_seq')), c INTEGER) STRICT, PGSTORAGE",
+            "CREATE TABLE t (a timestamp[], b date[], c numeric (10, 2)[], d bigint[], e date[], f INTEGER[]) STRICT, PGSTORAGE",
+            "CREATE TABLE t (id pg_int8 PRIMARY KEY, a pg_int4 NOT NULL DEFAULT (nextval ('t_a_seq')), b pg_int8 NOT NULL DEFAULT (nextval ('t_b_seq')), c pg_int4, d pg_int4, e pg_int4, f pg_int4 NOT NULL DEFAULT (nextval ('t_f_seq')), g pg_int8 NOT NULL DEFAULT (nextval ('t_g_seq')), h INTEGER) STRICT, PGSTORAGE",
+            "CREATE TABLE t (id pg_int4 PRIMARY KEY DEFAULT (nextval ('t_id_seq')), b pg_int8 NOT NULL DEFAULT (nextval ('t_b_seq'))) STRICT, PGSTORAGE",
             "CREATE TABLE t (a TEXT CHECK (pg_date (a) != '2024-01-01'), b pg_timestamp DEFAULT (pg_timestamp ('2024-01-01')), c TEXT CHECK (CAST (c AS time) > '10:00' AND pg_timestamptz (c) > pg_timestamp ('2000-01-01'))) STRICT, PGSTORAGE",
         ];
         assert_eq!(translated, expected);
     }
 
+    /// An identity column gets a sequence with the options of the column,
+    /// like a serial column. The translation of stored tables ignores
+    /// IDENTITY: their INTEGER rowid alias makes the ids.
     #[test]
-    fn domains_keep_the_v1_base_types() {
-        let parse_result =
-            crate::parse("CREATE DOMAIN d AS timestamp CHECK (VALUE > '2020-01-01')").unwrap();
-        let ast::Stmt::CreateDomain { base_type, .. } = PostgreSQLTranslator::new()
+    fn identity_columns_get_a_sequence() {
+        let ddl = "CREATE TABLE t (id bigint GENERATED BY DEFAULT AS IDENTITY \
+                   (START WITH 100 INCREMENT BY 10 MINVALUE 5 MAXVALUE 1000 CYCLE) PRIMARY KEY)";
+        let parse_result = crate::parse(ddl).unwrap();
+        let translated = PostgreSQLTranslator::new()
+            .translate_with_prereqs(&parse_result)
+            .unwrap();
+        let prereqs: Vec<String> = translated
+            .prereqs
+            .iter()
+            .map(|stmt| stmt.to_string())
+            .collect();
+        assert_eq!(
+            prereqs,
+            ["CREATE SEQUENCE IF NOT EXISTS t_id_seq START WITH 100 INCREMENT BY 10 MINVALUE 5 MAXVALUE 1000 CYCLE"]
+        );
+        let ast::Stmt::CreateTable { body, .. } = PostgreSQLTranslator::for_stored_table()
             .translate(&parse_result)
             .unwrap()
         else {
-            panic!("not a CREATE DOMAIN");
+            panic!("not a CREATE TABLE");
         };
-        assert_eq!(base_type, "timestamp");
+        assert_eq!(
+            body.to_string(),
+            "(id bigint PRIMARY KEY) STRICT, PGSTORAGE"
+        );
+    }
+
+    /// Without a column list, DEFAULT in VALUES stays: core reads the
+    /// DEFAULT of the column at its position.
+    #[test]
+    fn default_in_values_without_column_list_stays() {
+        let parse_result = crate::parse("INSERT INTO s VALUES (DEFAULT, 'a')").unwrap();
+        let stmt = PostgreSQLTranslator::new()
+            .translate(&parse_result)
+            .unwrap();
+        assert_eq!(stmt.to_string(), "INSERT INTO s VALUES (DEFAULT, 'a')");
+        let parse_result = crate::parse("INSERT INTO s (id, v) VALUES (DEFAULT, 'a')").unwrap();
+        let stmt = PostgreSQLTranslator::new()
+            .translate(&parse_result)
+            .unwrap();
+        assert_eq!(stmt.to_string(), "INSERT INTO s (v) VALUES ('a')");
+    }
+
+    #[test]
+    fn domains_use_the_v2_base_types() {
+        for (ddl, expected) in [
+            (
+                "CREATE DOMAIN d AS timestamp CHECK (VALUE > '2020-01-01')",
+                "pg_timestamp",
+            ),
+            ("CREATE DOMAIN d AS integer CHECK (VALUE > 0)", "pg_int4"),
+            ("CREATE DOMAIN d AS bigint", "pg_int8"),
+            ("CREATE DOMAIN d AS date", "pg_date"),
+            ("CREATE DOMAIN d AS numeric(10,2)", "REAL"),
+            ("CREATE DOMAIN d AS text", "TEXT"),
+        ] {
+            let parse_result = crate::parse(ddl).unwrap();
+            let ast::Stmt::CreateDomain { base_type, .. } = PostgreSQLTranslator::new()
+                .translate(&parse_result)
+                .unwrap()
+            else {
+                panic!("not a CREATE DOMAIN");
+            };
+            assert_eq!(base_type, expected, "{ddl}");
+        }
     }
 }

@@ -2389,9 +2389,15 @@ fn test_postgres_insert_default(db: TempDatabase) {
     conn.execute("INSERT INTO t (id, name, score) VALUES (2, 'alice', DEFAULT), (3, DEFAULT, 99)")
         .unwrap();
 
-    // All columns DEFAULT
-    conn.execute("INSERT INTO t (id, name, score) VALUES (DEFAULT, DEFAULT, DEFAULT)")
-        .unwrap();
+    // All columns DEFAULT: id has no DEFAULT, and a PRIMARY KEY is NOT NULL,
+    // as in PostgreSQL.
+    let err = conn
+        .execute("INSERT INTO t (id, name, score) VALUES (DEFAULT, DEFAULT, DEFAULT)")
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("NOT NULL constraint failed: t.id"),
+        "{err}"
+    );
 
     // Verify results
     let mut stmt = conn
@@ -2413,15 +2419,12 @@ fn test_postgres_insert_default(db: TempDatabase) {
             _ => {}
         }
     }
-    // id=DEFAULT → NULL (no default defined), all others get their defaults
-    // INTEGER PRIMARY KEY with NULL → auto-assigned rowid
     assert_eq!(
         results,
         vec![
             "1,unknown,42", // name=DEFAULT → 'unknown'
             "2,alice,0",    // score=DEFAULT → 0
             "3,unknown,99", // name=DEFAULT → 'unknown'
-            "4,unknown,0",  // all DEFAULT
         ]
     );
 }

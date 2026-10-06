@@ -57,7 +57,7 @@ fn new_tables_store_sql_that_both_dialects_load(db: TempDatabase) {
     assert_eq!(
         core_rows(&conn, "SELECT sql FROM sqlite_schema WHERE name = 't'"),
         [
-            "CREATE TABLE t (id INTEGER PRIMARY KEY DEFAULT (nextval ('t_id_seq')), \
+            "CREATE TABLE t (id pg_int4 PRIMARY KEY DEFAULT (nextval ('t_id_seq')), \
           a pg_int8 UNIQUE, n pg_numeric (10, 2) DEFAULT 1.5, ts pg_timestamp, d TEXT[] DEFAULT '{}', \
           m mood, p posint, v varchar (10) CHECK (length (v) > 1), b boolean DEFAULT 1, \
           UNIQUE (a, n)) STRICT, PGSTORAGE"
@@ -269,7 +269,7 @@ fn catalog_shows_postgres_ddl_and_defaults_of_new_tables(db: TempDatabase) {
              c bigint DEFAULT nextval('f_c_seq'), d text DEFAULT nextval('f_c_seq'), \
              e boolean DEFAULT false, g boolean DEFAULT true, h integer[] DEFAULT ARRAY[1, 2], \
              i integer[][] DEFAULT ARRAY[ARRAY[1], ARRAY[2]])",
-            "f|CREATE TABLE f (a serial PRIMARY KEY, b serial NOT NULL, \
+            "f|CREATE TABLE f (a bigserial PRIMARY KEY, b serial NOT NULL, \
              c bigint DEFAULT (nextval ('f_c_seq')), d text DEFAULT (nextval ('f_c_seq')), \
              e boolean DEFAULT FALSE, g boolean DEFAULT TRUE, h integer[] DEFAULT (ARRAY[1, 2]), \
              i integer[][] DEFAULT (ARRAY[ARRAY[1], ARRAY[2]]))",
@@ -409,7 +409,7 @@ fn rename_column_of_a_parent_keeps_the_child_table(db: TempDatabase) {
             "SELECT sql FROM sqlite_schema WHERE name = 'child'"
         ),
         [
-            "CREATE TABLE child (id INTEGER PRIMARY KEY, pid INTEGER REFERENCES parent (pkey), \
+            "CREATE TABLE child (id pg_int4 PRIMARY KEY, pid pg_int4 REFERENCES parent (pkey), \
           ts pg_timestamp DEFAULT (now ())) STRICT, PGSTORAGE"
         ]
     );

@@ -569,7 +569,7 @@ fn new_tables_join_tables_of_base_file() {
             "SELECT sql FROM sqlite_schema WHERE name = 'fresh'"
         ),
         [
-            "CREATE TABLE fresh (id INTEGER PRIMARY KEY, bi pg_int8, n pg_numeric (10, 2), \
+            "CREATE TABLE fresh (id pg_int4 PRIMARY KEY, bi pg_int8, n pg_numeric (10, 2), \
           d pg_date, tm pg_time, ts pg_timestamp, tz pg_timestamptz) STRICT, PGSTORAGE"
         ]
     );

@@ -3459,7 +3459,11 @@ fn pg_storage_table_ddl(sql: &str, schema: &Schema) -> Result<String> {
         );
         let (is_integer, is_boolean) = column.col_type.as_ref().map_or((false, false), |ty| {
             (
-                ty.array_dimensions == 0 && ty.name.eq_ignore_ascii_case("INTEGER"),
+                ty.array_dimensions == 0
+                    && (ty.name.eq_ignore_ascii_case("INTEGER")
+                        || ((ty.name.eq_ignore_ascii_case("pg_int4")
+                            || ty.name.eq_ignore_ascii_case("pg_int8"))
+                            && !is_user_type_with_builtin_name(schema, &ty.name))),
                 ty.array_dimensions == 0 && ty.name.eq_ignore_ascii_case("boolean"),
             )
         });
@@ -3467,6 +3471,15 @@ fn pg_storage_table_ddl(sql: &str, schema: &Schema) -> Result<String> {
             && column.constraints.iter().any(|constraint| {
                 matches!(&constraint.constraint, ColumnConstraint::Default(expr)
                     if default_calls_nextval(expr, &serial_sequence))
+            })
+            && column.constraints.iter().any(|constraint| {
+                matches!(
+                    &constraint.constraint,
+                    ColumnConstraint::NotNull {
+                        nullable: false,
+                        ..
+                    } | ColumnConstraint::PrimaryKey { .. }
+                )
             });
         column
             .constraints
@@ -3630,7 +3643,9 @@ fn postgres_type_name(turso_type: &str, is_serial: bool) -> &str {
         "REAL" => "double precision",
         "TEXT" => "text",
         "BLOB" => "bytea",
+        "PG_INT4" if is_serial => "serial",
         "PG_INT4" => "integer",
+        "PG_INT8" if is_serial => "bigserial",
         "PG_INT8" => "bigint",
         "PG_TIMESTAMP" => "timestamp",
         "PG_TIMESTAMPTZ" => "timestamptz",
