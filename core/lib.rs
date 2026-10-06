@@ -35,6 +35,7 @@ pub mod native_ext;
 #[cfg(any(feature = "fuzz", feature = "bench"))]
 pub mod numeric;
 pub mod schema;
+pub mod security;
 pub mod skiplist;
 pub mod state_machine;
 pub mod storage;
