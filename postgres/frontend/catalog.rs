@@ -292,6 +292,10 @@ impl PgClassTable {
 }
 
 impl InternalVirtualTable for PgClassTable {
+    fn readable_without_privileges(&self) -> bool {
+        true
+    }
+
     fn name(&self) -> String {
         "pg_class".to_string()
     }
@@ -538,6 +542,10 @@ impl PgNamespaceTable {
 }
 
 impl InternalVirtualTable for PgNamespaceTable {
+    fn readable_without_privileges(&self) -> bool {
+        true
+    }
+
     fn name(&self) -> String {
         "pg_namespace".to_string()
     }
@@ -680,6 +688,10 @@ impl PgAttributeTable {
 }
 
 impl InternalVirtualTable for PgAttributeTable {
+    fn readable_without_privileges(&self) -> bool {
+        true
+    }
+
     fn name(&self) -> String {
         "pg_attribute".to_string()
     }
@@ -891,6 +903,10 @@ fn role_row(role: &Role) -> Vec<Value> {
 }
 
 impl InternalVirtualTable for PgRolesTable {
+    fn readable_without_privileges(&self) -> bool {
+        true
+    }
+
     fn name(&self) -> String {
         "pg_roles".to_string()
     }
@@ -997,6 +1013,10 @@ impl PgProcTable {
 }
 
 impl InternalVirtualTable for PgProcTable {
+    fn readable_without_privileges(&self) -> bool {
+        true
+    }
+
     fn name(&self) -> String {
         "pg_proc".to_string()
     }
@@ -1218,6 +1238,10 @@ pub(crate) fn db_name_from_path(path: &str) -> String {
 }
 
 impl InternalVirtualTable for PgDatabaseTable {
+    fn readable_without_privileges(&self) -> bool {
+        true
+    }
+
     fn name(&self) -> String {
         "pg_database".to_string()
     }
@@ -1361,6 +1385,10 @@ impl PgAmTable {
 }
 
 impl InternalVirtualTable for PgAmTable {
+    fn readable_without_privileges(&self) -> bool {
+        true
+    }
+
     fn name(&self) -> String {
         "pg_am".to_string()
     }
@@ -1453,6 +1481,10 @@ struct EmptyPgCatalogTable {
 }
 
 impl InternalVirtualTable for EmptyPgCatalogTable {
+    fn readable_without_privileges(&self) -> bool {
+        true
+    }
+
     fn name(&self) -> String {
         self.name.clone()
     }
@@ -1541,6 +1573,10 @@ impl PgTablesTable {
 }
 
 impl InternalVirtualTable for PgTablesTable {
+    fn readable_without_privileges(&self) -> bool {
+        true
+    }
+
     fn name(&self) -> String {
         "pg_tables".to_string()
     }
@@ -1967,6 +2003,10 @@ impl PgTypeTable {
 }
 
 impl InternalVirtualTable for PgTypeTable {
+    fn readable_without_privileges(&self) -> bool {
+        true
+    }
+
     fn name(&self) -> String {
         "pg_type".to_string()
     }
@@ -2174,6 +2214,10 @@ impl PgIndexTable {
 }
 
 impl InternalVirtualTable for PgIndexTable {
+    fn readable_without_privileges(&self) -> bool {
+        true
+    }
+
     fn name(&self) -> String {
         "pg_index".to_string()
     }
@@ -2351,6 +2395,10 @@ impl PgConstraintTable {
 }
 
 impl InternalVirtualTable for PgConstraintTable {
+    fn readable_without_privileges(&self) -> bool {
+        true
+    }
+
     fn name(&self) -> String {
         "pg_constraint".to_string()
     }
@@ -2714,6 +2762,10 @@ impl PgAttrdefTable {
 }
 
 impl InternalVirtualTable for PgAttrdefTable {
+    fn readable_without_privileges(&self) -> bool {
+        true
+    }
+
     fn name(&self) -> String {
         "pg_attrdef".to_string()
     }
@@ -2838,6 +2890,10 @@ impl PgSequencesTable {
 }
 
 impl InternalVirtualTable for PgSequencesTable {
+    fn readable_without_privileges(&self) -> bool {
+        true
+    }
+
     fn name(&self) -> String {
         "pg_sequences".to_string()
     }
@@ -2911,10 +2967,15 @@ impl PgSequencesCursor {
                 let seq_name = seq.name.clone();
                 // currval is per-connection; expose this connection's last
                 // value via the connection currval map, falling back to start.
-                let last_val = self
-                    .conn
-                    .get_sequence_currval(&seq_name)
-                    .unwrap_or(seq.start_value);
+                let last_value = if self.conn.current_role_is_superuser() {
+                    Value::from_i64(
+                        self.conn
+                            .get_sequence_currval(&seq_name)
+                            .unwrap_or(seq.start_value),
+                    )
+                } else {
+                    Value::Null
+                };
                 self.rows.push(vec![
                     Value::build_text("public"),           // schemaname
                     Value::build_text(seq_name),           // sequencename
@@ -2926,7 +2987,7 @@ impl PgSequencesCursor {
                     Value::from_i64(seq.increment_by),     // increment_by
                     Value::from_i64(i64::from(seq.cycle)), // cycle
                     Value::from_i64(1), // cache_size (PG default; Turso doesn't cache)
-                    Value::from_i64(last_val), // last_value
+                    last_value,         // last_value
                 ]);
             }
         }
@@ -3223,6 +3284,10 @@ impl InternalVirtualTableCursor for PgInputErrorInfoCursor {
 }
 
 impl InternalVirtualTable for PgInputErrorInfoTable {
+    fn readable_without_privileges(&self) -> bool {
+        true
+    }
+
     fn name(&self) -> String {
         "pg_input_error_info".to_string()
     }
@@ -3445,6 +3510,10 @@ impl InternalVirtualTableCursor for PgGetTableDefCursor {
 }
 
 impl InternalVirtualTable for PgGetTableDefTable {
+    fn readable_without_privileges(&self) -> bool {
+        true
+    }
+
     fn name(&self) -> String {
         "pg_get_tabledef".to_string()
     }

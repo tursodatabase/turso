@@ -310,3 +310,28 @@ test role-without-privileges-cannot-use-currval {
 expect error {
     permission denied for sequence sr_currval_sequence
 }
+
+test role-without-privileges-does-not-see-last-value-of-sequence {
+    CREATE SEQUENCE sr_last_value_sequence;
+    SELECT nextval('sr_last_value_sequence');
+    CREATE ROLE sr_last_value_user;
+    SET ROLE sr_last_value_user;
+    SELECT CASE WHEN last_value IS NULL THEN 'hidden' ELSE 'shown' END
+    FROM pg_sequences WHERE sequencename = 'sr_last_value_sequence';
+}
+expect {
+    1
+    hidden
+}
+
+test role-without-privileges-can-read-catalogs {
+    CREATE TABLE rc_table (x int);
+    CREATE ROLE rc_reader;
+    SET ROLE rc_reader;
+    SELECT CASE WHEN count(*) > 0 THEN 'readable' ELSE 'empty' END FROM pg_roles;
+    SELECT CASE WHEN count(*) > 0 THEN 'readable' ELSE 'empty' END FROM pg_class;
+}
+expect {
+    readable
+    readable
+}
