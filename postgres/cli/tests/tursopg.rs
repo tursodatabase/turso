@@ -1387,6 +1387,98 @@ fn wire_clients_have_separate_search_paths() {
 }
 
 #[test]
+fn wire_clients_resolve_unqualified_tables_in_schema_name_order() {
+    with_pg_client(|first| {
+        let port = first.stream.peer_addr().unwrap().port();
+        let mut second = PgTestClient::connect(port);
+        for sql in [
+            "CREATE SCHEMA z",
+            "CREATE TABLE z.items(id INT)",
+            "INSERT INTO z.items VALUES (17)",
+            "CREATE SCHEMA a",
+            "CREATE TABLE a.items(id INT)",
+            "INSERT INTO a.items VALUES (29)",
+        ] {
+            assert!(!first.query_command_tags(sql).is_empty(), "{sql}");
+        }
+        assert_eq!(
+            (
+                first.query_single_text("SELECT id FROM items"),
+                second.query_single_text("SELECT id FROM items"),
+            ),
+            ("29".to_string(), "29".to_string()),
+        );
+        assert_eq!(
+            first.query_command_tags("UPDATE items SET id = id + 100"),
+            ["UPDATE 1"]
+        );
+        assert_eq!(second.query_single_text("SELECT id FROM a.items"), "129");
+        assert_eq!(second.query_single_text("SELECT id FROM z.items"), "17");
+        let mut third = PgTestClient::connect(port);
+        assert_eq!(
+            third.extended_query_single_text("SELECT id FROM items"),
+            "129"
+        );
+
+        assert!(!first
+            .query_command_tags("CREATE TABLE items(id INT); INSERT INTO items VALUES (43)")
+            .is_empty());
+        assert_eq!(first.query_single_text("SELECT id FROM items"), "43");
+        assert_eq!(second.query_single_text("SELECT id FROM items"), "43");
+        first.query_command_tags("SET search_path TO z, a");
+        assert_eq!(first.query_single_text("SELECT id FROM items"), "17");
+        assert_eq!(
+            second.extended_query_single_text("SELECT id FROM items"),
+            "43"
+        );
+    });
+}
+
+#[test]
+fn wire_clients_resolve_unqualified_tables_after_schema_replacement() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("main.db");
+    with_pg_client_with_db(&db_path, |first| {
+        let port = first.stream.peer_addr().unwrap().port();
+        for sql in [
+            "CREATE SCHEMA a",
+            "CREATE TABLE a.items(id INT)",
+            "INSERT INTO a.items VALUES (17)",
+            "CREATE SCHEMA z",
+            "CREATE TABLE z.items(id INT)",
+            "INSERT INTO z.items VALUES (29)",
+        ] {
+            assert!(!first.query_command_tags(sql).is_empty(), "{sql}");
+        }
+        let mut second = PgTestClient::connect(port);
+        assert_eq!(first.query_single_text("SELECT id FROM items"), "17");
+        assert_eq!(second.query_single_text("SELECT id FROM items"), "17");
+        assert_eq!(
+            first.query_command_tags("DROP SCHEMA a CASCADE"),
+            ["DROP SCHEMA"]
+        );
+        assert_eq!(second.query_single_text("SELECT id FROM items"), "29");
+        for sql in [
+            "CREATE SCHEMA m",
+            "CREATE SCHEMA a",
+            "CREATE TABLE a.items(id INT)",
+            "INSERT INTO a.items VALUES (43)",
+        ] {
+            assert!(!first.query_command_tags(sql).is_empty(), "{sql}");
+        }
+        let mut third = PgTestClient::connect(port);
+        assert_eq!(
+            (
+                first.query_single_text("SELECT id FROM items"),
+                second.extended_query_single_text("SELECT id FROM items"),
+                third.query_single_text("SELECT id FROM items"),
+            ),
+            ("43".to_string(), "43".to_string(), "43".to_string()),
+        );
+    });
+}
+
+#[test]
 fn wire_clients_have_separate_extended_queries() {
     with_pg_client(|first| {
         let mut second = PgTestClient::connect(first.stream.peer_addr().unwrap().port());

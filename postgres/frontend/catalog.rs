@@ -93,6 +93,10 @@ impl Dialect for PostgresDialect {
         }
     }
 
+    fn search_attached_databases_by_name(&self) -> bool {
+        true
+    }
+
     fn table_sql_for_replay(&self, sql: &str) -> Result<String> {
         let Some(raw_sql) = decode_stored_pg_schema_sql(sql) else {
             return turso_core::dialect::sqlite::table_sql_for_replay(sql);
