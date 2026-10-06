@@ -2559,6 +2559,12 @@ fn translate_column_expr(
                     _ => {
                         let read_cursor = if read_from_index {
                             index_cursor_id.expect("index cursor should be opened")
+                        } else if is_btree_index {
+                            table_cursor_id.unwrap_or_else(|| {
+                                panic!(
+                                    "column {column} of table {table_ref_id} is not stored in the index and the table cursor is not open"
+                                )
+                            })
                         } else {
                             table_cursor_id
                                 .or(index_cursor_id)
