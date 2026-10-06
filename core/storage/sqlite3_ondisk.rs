@@ -39,7 +39,7 @@
 //!
 //! For more information, see the SQLite file format specification:
 //!
-//! https://www.sqlite.org/fileformat.html
+//! <https://www.sqlite.org/fileformat.html>
 
 #![allow(clippy::arc_with_non_send_sync)]
 
@@ -470,7 +470,7 @@ impl Default for WalHeader {
 }
 
 /// Immediately following the wal-header are zero or more frames.
-/// Each frame consists of a 24-byte frame-header followed by <page-size> bytes of page data.
+/// Each frame consists of a 24-byte frame-header followed by `<page-size>` bytes of page data.
 /// The frame-header is six big-endian 32-bit unsigned integer values, as follows:
 #[allow(dead_code)]
 #[derive(Debug, Default, Copy, Clone)]
@@ -664,10 +664,10 @@ pub fn begin_write_btree_page(
 ///
 /// we have a batch of pages to write, lets say the following:
 /// (they are already sorted by id thanks to BTreeMap)
-/// [1,2,3,6,7,9,10,11,12]
+/// `[1,2,3,6,7,9,10,11,12]`
 //
 /// we want to collect this into runs of:
-/// [1,2,3], [6,7], [9,10,11,12]
+/// `[1,2,3]`, `[6,7]`, `[9,10,11,12]`
 /// and submit each run as a `writev` call,
 /// for 3 total syscalls instead of 9.
 ///
@@ -1519,7 +1519,7 @@ pub fn write_varint_to_vec(value: u64, payload: &mut Vec<u8>) {
 /// Created by [`BuildSharedWal::begin`] (which performs only synchronous
 /// setup and may complete immediately for an empty/headerless WAL), then
 /// driven via [`BuildSharedWal::poll`] until it returns `Done`. All recovery
-/// state lives in the [`StreamingWalReader`] (atomics + `RwLock<StreamingState>`)
+/// state lives in the `StreamingWalReader` (atomics + `RwLock<StreamingState>`)
 /// and is updated by the read completions' callbacks, so the only state this
 /// driver tracks is which phase/completion it's waiting on.
 pub struct BuildSharedWal {

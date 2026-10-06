@@ -107,16 +107,16 @@
 //! A one-value subquery stays as it is unless its result for an empty input is known.
 //!
 //! References:
-//! - SQLite subquery results: https://sqlite.org/lang_expr.html#subquery_expressions
-//! - PostgreSQL subquery results: https://www.postgresql.org/docs/current/functions-subquery.html
-//! - MySQL semi-joins: https://dev.mysql.com/doc/refman/8.4/en/semijoins-antijoins.html
-//! - MySQL scalar decorrelation: https://dev.mysql.com/doc/refman/8.4/en/correlated-subqueries.html
-//! - MySQL optimizer switches: https://dev.mysql.com/doc/refman/8.0/en/switchable-optimizations.html
-//! - MariaDB semi-joins: https://mariadb.com/docs/server/ha-and-performance/optimization-and-tuning/query-optimizations/subquery-optimizations/semi-join-subquery-optimizations
-//! - MariaDB materialization: https://mariadb.com/docs/server/ha-and-performance/optimization-and-tuning/query-optimizations/subquery-optimizations/optimization-strategies/semi-join-materialization-strategy
-//! - MariaDB subquery cache: https://mariadb.com/docs/server/ha-and-performance/optimization-and-tuning/query-optimizations/subquery-optimizations/subquery-cache
-//! - Neumann and Kemper, Unnesting Arbitrary Queries: https://db.cs.tum.edu/teaching/ws2122/foundationsde/unnesting.pdf
-//! - Neumann, A Formalization of Top-Down Unnesting: https://arxiv.org/abs/2412.04294
+//! - SQLite subquery results: <https://sqlite.org/lang_expr.html#subquery_expressions>
+//! - PostgreSQL subquery results: <https://www.postgresql.org/docs/current/functions-subquery.html>
+//! - MySQL semi-joins: <https://dev.mysql.com/doc/refman/8.4/en/semijoins-antijoins.html>
+//! - MySQL scalar decorrelation: <https://dev.mysql.com/doc/refman/8.4/en/correlated-subqueries.html>
+//! - MySQL optimizer switches: <https://dev.mysql.com/doc/refman/8.0/en/switchable-optimizations.html>
+//! - MariaDB semi-joins: <https://mariadb.com/docs/server/ha-and-performance/optimization-and-tuning/query-optimizations/subquery-optimizations/semi-join-subquery-optimizations>
+//! - MariaDB materialization: <https://mariadb.com/docs/server/ha-and-performance/optimization-and-tuning/query-optimizations/subquery-optimizations/optimization-strategies/semi-join-materialization-strategy>
+//! - MariaDB subquery cache: <https://mariadb.com/docs/server/ha-and-performance/optimization-and-tuning/query-optimizations/subquery-optimizations/subquery-cache>
+//! - Neumann and Kemper, Unnesting Arbitrary Queries: <https://db.cs.tum.edu/teaching/ws2122/foundationsde/unnesting.pdf>
+//! - Neumann, A Formalization of Top-Down Unnesting: <https://arxiv.org/abs/2412.04294>
 
 use rustc_hash::FxHashMap as HashMap;
 use smallvec::SmallVec;

@@ -1,5 +1,5 @@
 //! VDBE bytecode generation for pragma statements.
-//! More info: https://www.sqlite.org/pragma.html.
+//! More info: <https://www.sqlite.org/pragma.html>.
 
 use crate::alloc::TursoIteratorExt;
 use crate::sync::Arc;

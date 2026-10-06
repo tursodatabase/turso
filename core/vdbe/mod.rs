@@ -15,7 +15,7 @@
 //!
 //! You can find a full list of SQLite opcodes at:
 //!
-//! https://www.sqlite.org/opcode.html
+//! <https://www.sqlite.org/opcode.html>
 
 use crate::alloc::{TryReserveError, TursoFromIterator};
 use crate::translate::plan::BitSet;
@@ -985,7 +985,7 @@ pub struct ProgramState {
     /// Set by InitCdcVersion opcode, applied at Halt/Done so that if the
     /// transaction rolls back, the connection's CDC state remains unchanged.
     ///
-    /// capture_data_changes has type Option<CaptureDataChangesInfo> (off mode is None)
+    /// capture_data_changes has type `Option<CaptureDataChangesInfo>` (off mode is None)
     /// so, for pending_cdc_info we wrap it in one more Option<...> layer to represent if mode changed during program execution
     pub(crate) pending_cdc_info: Option<Option<CaptureDataChangesInfo>>,
     /// Cached subprogram Statements keyed by the PC of the Program instruction.
@@ -1848,7 +1848,7 @@ pub struct PreparedProgram {
     pub parameters: crate::parameters::Parameters,
     pub change_cnt_on: bool,
     /// Flag that detect if the sqlite statement will directly manipulate the database file.\
-    /// mirrors: https://sqlite.org/c3ref/stmt_readonly.html.
+    /// mirrors: <https://sqlite.org/c3ref/stmt_readonly.html>.
     pub readonly: bool,
     pub result_columns: Vec<ResultSetColumn>,
     pub table_references: TableReferences,
@@ -1859,7 +1859,7 @@ pub struct PreparedProgram {
     pub refreshes_analyze_stats: bool,
     /// Whether the statement needs to be wrapped in a statement subtransaction
     /// when run as part of an interactive (non-autocommit) transaction.
-    /// See [crate::vdbe::builder::ProgramBuilder::is_multi_write] and [crate::vdbe::builder::ProgramBuilder::may_abort] for more details.
+    /// See `crate::vdbe::builder::ProgramBuilder::is_multi_write` and [crate::vdbe::builder::ProgramBuilder::may_abort] for more details.
     pub needs_stmt_subtransactions: Arc<AtomicBool>,
     /// If this Program is a trigger subprogram, a ref to the trigger is stored here.
     pub trigger: Option<Arc<Trigger>>,
@@ -3263,7 +3263,7 @@ impl Program {
     /// Statement teardown passes its actual counted state: a statement that
     /// already finished was released on Done or on its step error, so the
     /// counted statements are all siblings (see
-    /// [`ProgramState::can_autocommit_now`]).
+    /// `ProgramState::can_autocommit_now`).
     pub fn abort(
         &self,
         pager: &Arc<Pager>,

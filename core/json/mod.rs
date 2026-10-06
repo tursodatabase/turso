@@ -486,7 +486,7 @@ where
 }
 
 /// Implements the -> operator. Always returns a proper JSON value.
-/// https://sqlite.org/json1.html#the_and_operators
+/// <https://sqlite.org/json1.html#the_and_operators>
 pub fn json_arrow_extract(
     value: impl AsValueRef,
     path: impl AsValueRef,
@@ -514,7 +514,7 @@ pub fn json_arrow_extract(
 }
 
 /// Implements the ->> operator. Always returns a SQL representation of the JSON subcomponent.
-/// https://sqlite.org/json1.html#the_and_operators
+/// <https://sqlite.org/json1.html#the_and_operators>
 pub fn json_arrow_shift_extract(
     value: impl AsValueRef,
     path: impl AsValueRef,
@@ -551,7 +551,7 @@ pub fn json_arrow_shift_extract(
 
 /// Extracts a JSON value from a JSON object or array.
 /// If there's only a single path, the return value might be either a TEXT or a database type.
-/// https://sqlite.org/json1.html#the_json_extract_function
+/// <https://sqlite.org/json1.html#the_json_extract_function>
 pub fn json_extract<I, E, V>(
     value: impl AsValueRef,
     paths: I,

@@ -1523,7 +1523,7 @@ pub enum Expr {
     Parenthesized(Box<Expr>),
     /// ARRAY[expr, expr, ...] — array literal constructor
     ArrayLiteral(ArrayLiteralExpr),
-    /// expr[n] — array subscript
+    /// `expr[n]` — array subscript
     ArraySubscript(Box<ArraySubscriptExpr>),
     /// `func(args) OVER (PARTITION BY ... ORDER BY ...)`.
     WindowFunction(Box<WindowFunctionExpr>),
@@ -2283,7 +2283,7 @@ impl fmt::Display for ArrayLiteralExpr {
     }
 }
 
-/// An array subscript expression: expr[index]
+/// An array subscript expression: `expr[index]`
 #[derive(Debug, Clone)]
 pub struct ArraySubscriptExpr {
     pub array: Expr,

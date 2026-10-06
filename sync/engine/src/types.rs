@@ -588,7 +588,7 @@ impl From<&DatabaseTapeRowChangeType> for DatabaseChangeType {
 
 /// [DatabaseTapeOperation] extends [DatabaseTapeRowChange] by adding information about transaction boundary
 ///
-/// This helps [crate::database_tape::DatabaseTapeSession] to properly maintain transaction state and COMMIT or ROLLBACK changes in appropriate time
+/// This helps `crate::database_tape::DatabaseTapeSession` to properly maintain transaction state and COMMIT or ROLLBACK changes in appropriate time
 /// by consuming events from [crate::database_tape::DatabaseChangesIterator]
 #[derive(Debug)]
 pub enum DatabaseTapeOperation {

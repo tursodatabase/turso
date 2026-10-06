@@ -21,7 +21,7 @@ pub trait LogicalClock: Send + Sync {
 
 /// A mutex-guarded clock for concurrent MVCC use.
 ///
-/// The lock is held across the `f` callback in [`get_timestamp`], ensuring
+/// The lock is held across the `f` callback in [`LogicalClock::get_timestamp`], ensuring
 /// that a commit timestamp is published (e.g. stored as `Preparing(ts)`)
 /// before any other transaction can generate a higher timestamp. This closes
 /// the TOCTOU window between timestamp generation and `Preparing` state

@@ -623,7 +623,7 @@ impl ProgramBuilderOpts {
 
 /// Use this macro to emit an OP_Explain instruction.
 /// Please use this macro instead of calling emit_explain() directly,
-/// because we want to avoid building the [EqpDetail] if we are not in explain mode.
+/// because we want to avoid building the `EqpDetail` if we are not in explain mode.
 #[macro_export]
 macro_rules! emit_explain {
     ($builder:expr, $push:expr, $detail:expr) => {
@@ -949,7 +949,7 @@ impl ProgramBuilder {
         &self.capture_data_changes_info
     }
 
-    /// Whether the main database uses MVCC journal mode. See [`Self::mvcc_enabled`].
+    /// Whether the main database uses MVCC journal mode. See `Self::mvcc_enabled`.
     pub const fn is_mvcc_enabled(&self) -> bool {
         self.mvcc_enabled
     }
@@ -1002,7 +1002,7 @@ impl ProgramBuilder {
     }
 
     /// Get the index of the next constant span.
-    /// Used in [crate::translate::expr::translate_expr_no_constant_opt()] to invalidate
+    /// Used in `crate::translate::expr::translate_expr_no_constant_opt()` to invalidate
     /// all constant spans after the given index.
     pub const fn constant_spans_next_idx(&self) -> usize {
         self.constant_spans.len()
@@ -1010,7 +1010,7 @@ impl ProgramBuilder {
 
     /// Invalidate all constant spans after the given index. This is used when we want to
     /// be sure that constant optimization is never used for translating a given expression.
-    /// See [crate::translate::expr::translate_expr_no_constant_opt()] for more details.
+    /// See `crate::translate::expr::translate_expr_no_constant_opt()` for more details.
     pub fn constant_spans_invalidate_after(&mut self, idx: usize) {
         self.constant_spans.truncate(idx);
     }
@@ -1978,7 +1978,7 @@ impl ProgramBuilder {
         }
     }
 
-    /// Tries to mirror: https://github.com/sqlite/sqlite/blob/e77e589a35862f6ac9c4141cfd1beb2844b84c61/src/build.c#L5379
+    /// Tries to mirror: <https://github.com/sqlite/sqlite/blob/e77e589a35862f6ac9c4141cfd1beb2844b84c61/src/build.c#L5379>
     pub fn begin_write_operation(&mut self) -> Result<(), alloc::TryReserveError> {
         self.txn_mode = TransactionMode::Write;
         self.write_databases.set(crate::MAIN_DB_ID)
