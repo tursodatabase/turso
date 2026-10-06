@@ -1408,7 +1408,7 @@ impl VirtualTableModule for EmptyPgCatalogTable {
         Ok(self.clone())
     }
 
-    fn innocuous(&self) -> bool {
+    fn allows_reads_in_triggers(&self) -> bool {
         true
     }
 }
@@ -3077,7 +3077,7 @@ where
         Ok((self.create)())
     }
 
-    fn innocuous(&self) -> bool {
+    fn allows_reads_in_triggers(&self) -> bool {
         true
     }
 }
