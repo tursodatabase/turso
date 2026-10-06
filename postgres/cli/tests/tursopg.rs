@@ -1552,3 +1552,39 @@ fn schema_sidecar_reattaches_on_reopen() {
         "expected 'persisted' in output, got: {out}"
     );
 }
+
+/// tursopg attaches the schema files next to the database. A schema file
+/// whose tables use a type that the database does not define is not
+/// attached, and tursopg says so.
+#[test]
+fn schema_file_that_is_not_attached_gives_a_warning() {
+    let dir = test_dir("schema-warning");
+    copy_pg_v1_fixtures(&dir, &["turso-postgres-schema-s.db"]);
+    let output = run_tursopg_with_db(dir.join("main.db"), b"SELECT 1;\n");
+    std::fs::remove_dir_all(&dir).unwrap();
+    assert_eq!(output.status.code(), Some(0));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("warning: schema \"s\" from ")
+            && stderr.contains("is not attached: ")
+            && stderr.contains("column st.m has type \"mood\""),
+        "{stderr}"
+    );
+}
+
+/// A new directory for the files of one test.
+fn test_dir(name: &str) -> std::path::PathBuf {
+    let dir = std::env::temp_dir().join(format!("tursopg-{name}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    dir
+}
+
+/// Copy fixtures that the tursopg of commit e6c79b43 wrote into `dir`.
+fn copy_pg_v1_fixtures(dir: &std::path::Path, files: &[&str]) {
+    let fixtures = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../tests/integration/postgres/fixtures/pg_v1");
+    for file in files {
+        std::fs::copy(fixtures.join(file), dir.join(file)).unwrap();
+    }
+}

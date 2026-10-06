@@ -2973,17 +2973,23 @@ pub fn translate_drop_type(
         bail_parse_error!("cannot drop built-in type: {normalized_name}");
     }
 
-    // Check if any table uses this type
-    for (_, table) in resolver.schema().tables.iter() {
-        for col in table.columns() {
-            if normalize_ident(&col.ty_str) == normalized_name {
-                bail_parse_error!(
-                    "cannot drop type {normalized_name}: used by column {} in table {}",
-                    col.name.as_deref().unwrap_or("?"),
-                    table.get_name()
-                );
+    // The tables of attached databases use the types of the main database.
+    let attached_database_ids = resolver.attached_database_ids_in_search_order()?;
+    for database_id in std::iter::once(MAIN_DB_ID).chain(attached_database_ids) {
+        resolver.with_schema(database_id, |schema| -> Result<()> {
+            for table in schema.tables.values() {
+                for col in table.columns() {
+                    if normalize_ident(&col.ty_str) == normalized_name {
+                        bail_parse_error!(
+                            "cannot drop type {normalized_name}: used by column {} in table {}",
+                            col.name.as_deref().unwrap_or("?"),
+                            table.get_name()
+                        );
+                    }
+                }
             }
-        }
+            Ok(())
+        })?;
     }
 
     // Check if any other type/domain depends on this type

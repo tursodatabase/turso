@@ -150,6 +150,7 @@ fn auto_attach_pg_schemas(conn: &Connection, db_file: &str) {
         tracing::info!("Auto-attaching PG schema '{}' from {}", schema, path);
         if let Err(e) = conn.inner().execute(&sql) {
             tracing::warn!("Failed to attach schema '{}': {}", schema, e);
+            eprintln!("warning: schema \"{schema}\" from {path} is not attached: {e}");
         }
     }
 }

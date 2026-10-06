@@ -142,7 +142,7 @@ to integer.
 |---------|--------|-------|
 | Arrays of compound types | ❌ Not supported | |
 | Array support | ✅ Supported | `type[]` columns, ARRAY[...] literals, subscripts `a[i]`, slices `a[i:j]`, `@>`, `<@`, `&&`, array_length, array_append, array_agg; backed by native Turso arrays |
-| ENUM data type | ✅ Supported | CREATE TYPE ... AS ENUM; values validated on write; DROP TYPE [IF EXISTS] |
+| ENUM data type | ✅ Supported | CREATE TYPE ... AS ENUM; values validated on write; DROP TYPE [IF EXISTS], refused while a table of any schema uses the type |
 | GUID/UUID data type | ✅ Supported | uuid columns, gen_random_uuid(), input validation, text casts |
 | macaddr8 data type | ✅ Supported | Along with inet, cidr, macaddr (round-trip tested) |
 | Multiranges | ❌ Not supported | |
@@ -366,6 +366,10 @@ ALTER TABLE on such a table stores it in the new form. Older versions of
 tursopg and tursodb refuse a table with the `PGSTORAGE` option ("unknown
 table option"). Thus a file is a one-way upgrade: after the first CREATE TABLE
 or ALTER TABLE of this version, older versions cannot open it.
+
+tursopg attaches the schema files next to the database at start. A schema
+file that does not attach, for example because its tables use a type that
+the database does not define, gives a warning on stderr.
 
 ## Data Import & Export
 

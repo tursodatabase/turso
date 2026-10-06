@@ -260,3 +260,39 @@ fn catalog_shows_postgres_ddl_and_defaults_of_new_tables(db: TempDatabase) {
         ["1|nextval ('c_id_seq')", "3|now ()"]
     );
 }
+
+/// A table in a schema file uses the types of the main database, so DROP
+/// TYPE and DROP DOMAIN refuse a type that such a table uses.
+#[turso_macros::test]
+fn drop_type_refuses_a_type_that_a_schema_file_table_uses(db: TempDatabase) {
+    let conn = db.connect_postgres();
+    conn.execute("CREATE TYPE mood AS ENUM ('sad', 'ok')")
+        .unwrap();
+    conn.execute("CREATE DOMAIN posint AS integer CHECK (VALUE > 0)")
+        .unwrap();
+    conn.execute("CREATE SCHEMA s").unwrap();
+    conn.execute("CREATE TABLE s.t (id integer PRIMARY KEY, m mood, p posint)")
+        .unwrap();
+    conn.execute("INSERT INTO s.t VALUES (1, 'ok', 2)").unwrap();
+    for (sql, error) in [
+        (
+            "DROP TYPE mood",
+            "cannot drop type mood: used by column m in table t",
+        ),
+        (
+            "DROP DOMAIN posint",
+            "cannot drop type posint: used by column p in table t",
+        ),
+    ] {
+        let err = conn.execute(sql).unwrap_err();
+        assert!(err.to_string().contains(error), "{sql}: {err}");
+    }
+    drop(conn);
+
+    let db = db.reopen();
+    let conn = attach_schema_file(&db, "s").unwrap();
+    assert_eq!(rows(&conn, "SELECT id, m, p FROM s.t"), ["1|ok|2"]);
+    assert!(conn
+        .execute("INSERT INTO s.t VALUES (2, 'angry', 3)")
+        .is_err());
+}
