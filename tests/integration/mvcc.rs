@@ -1,10 +1,13 @@
 use crate::common::{ExecRows, TempDatabase};
+use crate::queued_io::{QueuedIo, QueuedIoOpKind};
 use asserting::prelude::*;
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use turso_core::{
-    mvcc::persistent_storage::logical_log::LogTxFrameInfo, Database, DatabaseOpts, EncryptionKey,
-    EncryptionOpts, OpenFlags, SqliteDialect, StepResult,
+    mvcc::persistent_storage::logical_log::LogTxFrameInfo, Clock, Completion, Database,
+    DatabaseOpts, EncryptionKey, EncryptionOpts, File, MonotonicInstant, OpenFlags, OpenOptions,
+    SqliteDialect, StepResult, WallClockInstant, IO,
 };
 
 /// Create a new database file at `path` with MVCC journal mode enabled.
@@ -1644,4 +1647,144 @@ fn mvcc_passive_checkpoint_must_not_leak_commits_into_pinned_snapshot() {
         vec![(2,)],
         "a pinned BEGIN CONCURRENT snapshot must not see a commit that happened after it"
     );
+}
+
+#[test]
+fn failed_table_commit_does_not_leave_checkpoint_work() {
+    assert_eq!(
+        checkpoint_yields_after_optional_failed_commit(false, true),
+        checkpoint_yields_after_optional_failed_commit(false, false)
+    );
+}
+
+#[test]
+fn failed_index_commit_does_not_leave_checkpoint_work() {
+    assert_eq!(
+        checkpoint_yields_after_optional_failed_commit(true, true),
+        checkpoint_yields_after_optional_failed_commit(true, false)
+    );
+}
+
+fn checkpoint_yields_after_optional_failed_commit(indexed: bool, fail_commit: bool) -> usize {
+    let io = Arc::new(CheckpointYieldIo::new());
+    let db = open_checkpoint_yield_database(io.clone());
+    let conn = db.connect().unwrap();
+    conn.execute("PRAGMA mvcc_checkpoint_threshold = -1")
+        .unwrap();
+    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY)")
+        .unwrap();
+    if indexed {
+        conn.execute("CREATE INDEX t_id ON t(id)").unwrap();
+    }
+    conn.execute("PRAGMA wal_checkpoint(PASSIVE)").unwrap();
+
+    if fail_commit {
+        conn.execute("BEGIN CONCURRENT").unwrap();
+        for rowid in 0..=1024 {
+            conn.execute(format!("INSERT INTO t VALUES ({rowid})"))
+                .unwrap();
+        }
+        io.inner.fault_after(".db-log", QueuedIoOpKind::Pwrite, 0);
+        assert!(conn.execute("COMMIT").is_err());
+        io.inner.clear_fault();
+        let rows = conn
+            .prepare("SELECT count(*) FROM t")
+            .unwrap()
+            .run_collect_rows()
+            .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0][0].as_int(), Some(0));
+    }
+
+    conn.execute("PRAGMA wal_checkpoint(PASSIVE)").unwrap();
+    conn.execute("INSERT INTO t VALUES (2000000)").unwrap();
+    io.start_counting();
+    conn.execute("PRAGMA wal_checkpoint(PASSIVE)").unwrap();
+    io.finish_counting()
+}
+
+fn open_checkpoint_yield_database(io: Arc<CheckpointYieldIo>) -> Arc<Database> {
+    static NEXT_PATH: AtomicUsize = AtomicUsize::new(0);
+    let path = format!(
+        "mvcc-dirty-key-api-{}.db",
+        NEXT_PATH.fetch_add(1, Ordering::SeqCst)
+    );
+    let db = Database::open(
+        io,
+        &path,
+        OpenOptions::new(Arc::new(SqliteDialect))
+            .db_opts(DatabaseOpts::new().with_experimental_mvcc_passive_checkpoint(true)),
+    )
+    .unwrap();
+    db.connect()
+        .unwrap()
+        .execute("PRAGMA journal_mode = 'mvcc'")
+        .unwrap();
+    db
+}
+
+struct CheckpointYieldIo {
+    inner: Arc<QueuedIo>,
+    yields: AtomicUsize,
+    armed: AtomicBool,
+}
+
+impl CheckpointYieldIo {
+    fn new() -> Self {
+        Self {
+            inner: Arc::new(QueuedIo::new()),
+            yields: AtomicUsize::new(0),
+            armed: AtomicBool::new(false),
+        }
+    }
+
+    fn start_counting(&self) {
+        self.yields.store(0, Ordering::SeqCst);
+        self.armed.store(true, Ordering::SeqCst);
+    }
+
+    fn finish_counting(&self) -> usize {
+        self.armed.store(false, Ordering::SeqCst);
+        self.yields.load(Ordering::SeqCst)
+    }
+}
+
+impl Clock for CheckpointYieldIo {
+    fn current_time_monotonic(&self) -> MonotonicInstant {
+        self.inner.current_time_monotonic()
+    }
+
+    fn current_time_wall_clock(&self) -> WallClockInstant {
+        self.inner.current_time_wall_clock()
+    }
+}
+
+impl IO for CheckpointYieldIo {
+    fn open_file(
+        &self,
+        path: &str,
+        flags: OpenFlags,
+        direct: bool,
+    ) -> turso_core::Result<Arc<dyn File>> {
+        self.inner.open_file(path, flags, direct)
+    }
+
+    fn remove_file(&self, path: &str) -> turso_core::Result<()> {
+        self.inner.remove_file(path)
+    }
+
+    fn file_id(&self, path: &str) -> turso_core::Result<turso_core::io::FileId> {
+        self.inner.file_id(path)
+    }
+
+    fn step(&self) -> turso_core::Result<()> {
+        self.inner.step()
+    }
+
+    fn wait_for_completion(&self, completion: Completion) -> turso_core::Result<()> {
+        if completion.is_explicit_yield() && self.armed.load(Ordering::SeqCst) {
+            self.yields.fetch_add(1, Ordering::SeqCst);
+        }
+        self.inner.wait_for_completion(completion)
+    }
 }
