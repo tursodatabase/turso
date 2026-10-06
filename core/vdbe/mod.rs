@@ -1607,6 +1607,9 @@ impl ProgramState {
                             attached_mv.release_savepoint(tx_id);
                         }
                     });
+                    for p in &attached_pagers {
+                        p.release_savepoint()?;
+                    }
                     Ok(())
                 } else if self.uses_subjournal || !attached_pagers.is_empty() {
                     if self.uses_subjournal {
@@ -1638,6 +1641,13 @@ impl ProgramState {
                             }
                         }
                     });
+                    for p in &attached_pagers {
+                        if let Err(e) = p.rollback_to_newest_savepoint() {
+                            if err.is_none() {
+                                err = Some(e);
+                            }
+                        }
+                    }
                     err
                 } else if self.uses_subjournal {
                     match pager.rollback_to_newest_savepoint() {
