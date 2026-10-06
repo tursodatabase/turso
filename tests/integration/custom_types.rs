@@ -588,6 +588,56 @@ mod tests {
         }
     }
 
+    fn write_table_sql(path: &std::path::Path, sql: &str) {
+        let sqlite = rusqlite::Connection::open(path).unwrap();
+        sqlite
+            .execute_batch("CREATE TABLE t(id bigint PRIMARY KEY, n); PRAGMA writable_schema = ON;")
+            .unwrap();
+        sqlite
+            .execute("UPDATE sqlite_master SET sql = ?1 WHERE name = 't'", [sql])
+            .unwrap();
+    }
+
+    /// Older versions of the PostgreSQL frontend stored PostgreSQL DDL after a
+    /// marker comment. The SQLite parser reads it as a table without STRICT.
+    #[test]
+    fn test_sqlite_dialect_refuses_postgres_ddl_of_older_versions() {
+        let temp_dir = TempDir::new().unwrap();
+        let path = temp_dir.path().join("pg_marker.db");
+        write_table_sql(
+            &path,
+            "/* turso_frontend:postgres */ CREATE TABLE t (id bigint PRIMARY KEY, n numeric(10,2))",
+        );
+        for custom_types in [false, true] {
+            let Err(err) = open_file(&path, custom_types) else {
+                panic!("the SQLite dialect must refuse PostgreSQL DDL");
+            };
+            assert_that!(err.to_string()).contains("created by the PostgreSQL frontend");
+        }
+    }
+
+    /// RENAME of older versions of the PostgreSQL frontend stored the marker
+    /// before canonical STRICT SQL.
+    #[test]
+    fn test_marker_before_canonical_sql_loads_as_canonical_sql() {
+        let temp_dir = TempDir::new().unwrap();
+        let path = temp_dir.path().join("pg_marker_rename.db");
+        write_table_sql(
+            &path,
+            "/* turso_frontend:postgres */ CREATE TABLE t (id bigint PRIMARY KEY, n numeric (10, 2)) STRICT",
+        );
+        let Err(err) = open_file(&path, false) else {
+            panic!("a table with custom types needs custom types");
+        };
+        assert_that!(err.to_string()).contains("column t.id has type \"bigint\"");
+
+        let db = open_file(&path, true).unwrap();
+        let conn = db.connect().unwrap();
+        conn.execute("INSERT INTO t VALUES (1, 2.5)").unwrap();
+        let rows: Vec<(i64, String)> = conn.exec_rows("SELECT id, n FROM t");
+        assert_eq!(rows, vec![(1, "2.50".to_string())]);
+    }
+
     #[test]
     fn test_pg_storage_option_survives_alter_table_and_reopen() {
         for mvcc in [false, true] {

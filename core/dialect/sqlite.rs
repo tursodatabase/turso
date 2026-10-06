@@ -44,15 +44,15 @@ impl super::Dialect for SqliteDialect {
     }
 
     fn parse_table_sql(&self, sql: &str, root_page: i64) -> crate::Result<BTreeTable> {
-        BTreeTable::from_sql(sql, root_page)
+        BTreeTable::from_sql(canonical_table_sql(sql)?, root_page)
     }
 
     fn parse_table_sql_ast(&self, sql: &str) -> crate::Result<turso_parser::ast::Stmt> {
-        parse_table_sql_ast(sql)
+        parse_table_sql_ast(canonical_table_sql(sql)?)
     }
 
     fn table_sql_for_replay(&self, sql: &str) -> crate::Result<String> {
-        table_sql_for_replay(sql)
+        table_sql_for_replay(canonical_table_sql(sql)?)
     }
 
     fn format_table_sql(
@@ -74,6 +74,18 @@ impl super::Dialect for SqliteDialect {
 
     fn resolve_function(&self, name: &str, arg_count: usize) -> crate::Result<Option<Func>> {
         resolve_builtin_function(name, arg_count)
+    }
+}
+
+/// The SQLite parser would read the PostgreSQL DDL of an older PostgreSQL
+/// frontend as a table without STRICT and without custom types, and show
+/// its raw stored values. Refuse it.
+fn canonical_table_sql(sql: &str) -> crate::Result<&str> {
+    match super::decode_stored_table_sql(sql) {
+        super::StoredTableSql::Canonical(sql) => Ok(sql),
+        super::StoredTableSql::Postgres(_) => Err(crate::LimboError::ParseError(
+            "a table in this database was created by the PostgreSQL frontend of an older version: open the database with tursopg".to_string(),
+        )),
     }
 }
 
