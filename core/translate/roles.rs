@@ -12,6 +12,7 @@
 
 use std::sync::Arc;
 
+use turso_ext::VTabKind;
 use turso_parser::ast;
 
 use crate::schema::{BTreeTable, Schema, SEQ_BACKING_TABLE_PREFIX};
@@ -21,6 +22,7 @@ use crate::translate::emitter::Resolver;
 use crate::translate::schema::{emit_schema_entry, SchemaEntryType, SQLITE_TABLEID};
 use crate::vdbe::builder::{CursorType, ProgramBuilder};
 use crate::vdbe::insn::{to_u32, Cookie, InsertFlags, Insn, RegisterOrLiteral};
+use crate::vtab::VirtualTableType;
 use crate::{bail_parse_error, Connection, LimboError, Result, MAIN_DB_ID};
 
 /// Fails if the current role may not run `stmt` at all. Statements that pass
@@ -166,6 +168,23 @@ pub fn check_storage_access(
             None => "permission denied to access database storage".to_string(),
         };
         return Err(LimboError::PermissionDenied(denial));
+    }
+    for virtual_table in &program.opened_virtual_tables {
+        let readable = match &virtual_table.vtab_type {
+            VirtualTableType::Internal(table) => table.read().readable_without_privileges(),
+            VirtualTableType::External(_) => virtual_table.kind == VTabKind::TableValuedFunction,
+            VirtualTableType::Pragma(_) => false,
+        };
+        if !readable {
+            let object = match virtual_table.kind {
+                VTabKind::TableValuedFunction => "function",
+                VTabKind::VirtualTable => "table",
+            };
+            return Err(LimboError::PermissionDenied(format!(
+                "permission denied for {object} {}",
+                virtual_table.name
+            )));
+        }
     }
     Ok(())
 }
@@ -505,6 +524,23 @@ mod tests {
                 format!("permission denied for view {view}")
             );
         }
+    }
+
+    #[test]
+    fn role_without_privileges_may_use_only_virtual_tables_that_allow_it() {
+        let conn = open_connection();
+        conn.execute("CREATE TABLE t (x)").unwrap();
+        create_role(&conn, "alice").unwrap();
+        set_role(&conn, "alice").unwrap();
+
+        let pragma = conn
+            .execute("SELECT * FROM pragma_table_info('t')")
+            .unwrap_err();
+        assert_eq!(
+            pragma.to_string(),
+            "permission denied for function pragma_table_info"
+        );
+        conn.execute("SELECT * FROM json_each('[1, 2]')").unwrap();
     }
 
     #[test]

@@ -238,6 +238,9 @@ pub struct ProgramBuilder {
     /// because they never need to use [ProgramBuilder::resolve_cursor_id] to find it
     /// again. Hence, the key is optional.
     pub cursor_ref: Vec<(Option<CursorKey>, CursorType)>,
+    /// Every virtual table that the program opens a cursor on. Cursor ids
+    /// are reused, so `cursor_ref` alone does not list all of them.
+    pub opened_virtual_tables: Vec<Arc<VirtualTable>>,
     /// Every view that the program reads. A view is replaced by its query,
     /// so it opens no storage of its own.
     pub referenced_views: Vec<String>,
@@ -702,6 +705,7 @@ impl ProgramBuilder {
             next_hash_table_id: HASH_TABLE_ID_BASE,
             insns: Vec::with_capacity(opts.approx_num_insns),
             cursor_ref: Vec::with_capacity(opts.num_cursors),
+            opened_virtual_tables: Vec::new(),
             referenced_views: Vec::new(),
             constant_spans: Vec::new(),
             label_to_resolved_offset: Vec::with_capacity(opts.approx_num_labels),
@@ -1143,6 +1147,9 @@ impl ProgramBuilder {
     }
 
     fn _alloc_cursor_id(&mut self, key: Option<CursorKey>, cursor_type: CursorType) -> usize {
+        if let CursorType::VirtualTable(virtual_table) = &cursor_type {
+            self.opened_virtual_tables.push(virtual_table.clone());
+        }
         if let Some(cursor) = self.free_cursor_ids.pop() {
             self.cursor_ref[cursor] = (key, cursor_type);
             return cursor;
