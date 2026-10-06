@@ -1,6 +1,18 @@
-//! Bytecode for role statements.
+//! Bytecode for role statements, and the privilege checks that run when a
+//! statement is prepared.
+//!
+//! Privileges are checked when a statement is prepared, against the role that
+//! is current at that time. Changing the role makes prepared statements
+//! prepare again, so a statement always runs with the privileges of the
+//! current role.
+//!
+//! Ownership and `GRANT` do not exist yet, so a role that is not a superuser
+//! has no privileges on any database object. It may still run statements that
+//! touch no database object, such as `SELECT 1`, and switch roles.
 
 use std::sync::Arc;
+
+use turso_parser::ast;
 
 use crate::schema::BTreeTable;
 use crate::security::roles::{CREATE_ROLES_TABLE_SQL, ROLES_TABLE_NAME};
@@ -9,7 +21,105 @@ use crate::translate::emitter::Resolver;
 use crate::translate::schema::{emit_schema_entry, SchemaEntryType, SQLITE_TABLEID};
 use crate::vdbe::builder::{CursorType, ProgramBuilder};
 use crate::vdbe::insn::{to_u32, Cookie, InsertFlags, Insn, RegisterOrLiteral};
-use crate::{bail_parse_error, Result, MAIN_DB_ID};
+use crate::{bail_parse_error, Connection, LimboError, Result, MAIN_DB_ID};
+
+/// Fails if the current role may not run `stmt` at all.
+pub fn check_statement_privileges(
+    stmt: &ast::Stmt,
+    resolver: &Resolver,
+    connection: &Connection,
+) -> Result<()> {
+    if resolver
+        .schema()
+        .roles
+        .is_superuser(connection.current_role())
+    {
+        return Ok(());
+    }
+    let denial = match stmt {
+        ast::Stmt::Select(_)
+        | ast::Stmt::Insert { .. }
+        | ast::Stmt::Update(_)
+        | ast::Stmt::Delete { .. }
+        | ast::Stmt::Begin { .. }
+        | ast::Stmt::Commit { .. }
+        | ast::Stmt::Rollback { .. }
+        | ast::Stmt::Savepoint { .. }
+        | ast::Stmt::Release { .. }
+        | ast::Stmt::SetRole { .. } => return Ok(()),
+        ast::Stmt::CreateTable {
+            temporary: true, ..
+        }
+        | ast::Stmt::CreateView {
+            temporary: true, ..
+        }
+        | ast::Stmt::CreateTrigger {
+            temporary: true, ..
+        } => "permission denied to create temporary objects".to_string(),
+        ast::Stmt::CreateTable { tbl_name, .. } => schema_denial(tbl_name),
+        ast::Stmt::CreateView { view_name, .. }
+        | ast::Stmt::CreateMaterializedView { view_name, .. } => schema_denial(view_name),
+        ast::Stmt::CreateVirtualTable(create) => schema_denial(&create.tbl_name),
+        ast::Stmt::CreateSequence { seq_name, .. } => schema_denial(seq_name),
+        ast::Stmt::CreateType { .. } | ast::Stmt::CreateDomain { .. } => {
+            "permission denied for schema public".to_string()
+        }
+        ast::Stmt::CreateIndex { tbl_name, .. } => {
+            format!("must be owner of table {}", tbl_name.as_str())
+        }
+        ast::Stmt::CreateTrigger { tbl_name, .. } => {
+            format!("permission denied for table {}", tbl_name.name.as_str())
+        }
+        ast::Stmt::AlterTable(alter) => {
+            format!("must be owner of table {}", alter.name.name.as_str())
+        }
+        ast::Stmt::DropTable { tbl_name, .. } => {
+            format!("must be owner of table {}", tbl_name.name.as_str())
+        }
+        ast::Stmt::DropIndex { idx_name, .. } => {
+            format!("must be owner of index {}", idx_name.name.as_str())
+        }
+        ast::Stmt::DropView { view_name, .. } => {
+            format!("must be owner of view {}", view_name.name.as_str())
+        }
+        ast::Stmt::DropTrigger { trigger_name, .. } => {
+            format!("must be owner of trigger {}", trigger_name.name.as_str())
+        }
+        ast::Stmt::DropType { type_name, .. } => format!("must be owner of type {type_name}"),
+        ast::Stmt::DropDomain { domain_name, .. } => {
+            format!("must be owner of type {domain_name}")
+        }
+        ast::Stmt::DropSequence { seq_name, .. } => {
+            format!("must be owner of sequence {}", seq_name.name.as_str())
+        }
+        ast::Stmt::CreateRole { .. } => "permission denied to create role".to_string(),
+        ast::Stmt::Pragma {
+            name,
+            body: Some(_),
+        } => format!(
+            "permission denied to set parameter \"{}\"",
+            name.name.as_str()
+        ),
+        ast::Stmt::Pragma { name, body: None } => {
+            format!("permission denied to examine \"{}\"", name.name.as_str())
+        }
+        ast::Stmt::Analyze { .. } => "permission denied to run ANALYZE".to_string(),
+        ast::Stmt::Vacuum { .. } => "permission denied to run VACUUM".to_string(),
+        ast::Stmt::Reindex { .. } => "permission denied to run REINDEX".to_string(),
+        ast::Stmt::Optimize { .. } => "permission denied to run OPTIMIZE".to_string(),
+        ast::Stmt::Attach { .. } => "permission denied to attach a database".to_string(),
+        ast::Stmt::Detach { .. } => "permission denied to detach a database".to_string(),
+    };
+    Err(LimboError::PermissionDenied(denial))
+}
+
+fn schema_denial(name: &ast::QualifiedName) -> String {
+    let schema = match &name.db_name {
+        Some(db_name) if db_name.as_str() != "main" => db_name.as_str(),
+        _ => "public",
+    };
+    format!("permission denied for schema {schema}")
+}
 
 /// Switches the connection to `role_name`, or back to the session role when
 /// `role_name` is `None`. The role is looked up when the statement runs. The
@@ -221,6 +331,36 @@ mod tests {
             "SET ROLE inside a transaction block is not supported"
         );
         assert_eq!(conn.current_role(), RoleId::SUPERUSER);
+    }
+
+    #[test]
+    fn role_without_privileges_cannot_create_objects() {
+        let conn = open_connection();
+        create_role(&conn, "alice").unwrap();
+        set_role(&conn, "alice").unwrap();
+
+        let create_table = conn.execute("CREATE TABLE t (x)").unwrap_err();
+        let create_role_error = create_role(&conn, "bob").unwrap_err();
+
+        assert_eq!(
+            create_table.to_string(),
+            "permission denied for schema public"
+        );
+        assert_eq!(
+            create_role_error.to_string(),
+            "permission denied to create role"
+        );
+    }
+
+    #[test]
+    fn role_without_privileges_can_run_statements_without_objects() {
+        let conn = open_connection();
+        create_role(&conn, "alice").unwrap();
+        set_role(&conn, "alice").unwrap();
+
+        conn.execute("SELECT 1").unwrap();
+        reset_role(&conn).unwrap();
+        conn.execute("CREATE TABLE t (x)").unwrap();
     }
 
     #[test]
