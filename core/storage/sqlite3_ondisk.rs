@@ -1583,6 +1583,8 @@ impl BuildSharedWal {
                 overflow_fallback_coverage: Arc::new(SpinLock::new(
                     OverflowFallbackCoverage::default(),
                 )),
+                #[cfg(test)]
+                frames_compared: AtomicU64::new(0),
             },
         }));
 
