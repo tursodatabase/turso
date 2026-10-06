@@ -1009,6 +1009,25 @@ test.serial("Statement.all() [statement safe integers]", async (t) => {
   t.deepEqual(await stmt.raw().all(), expected);
 });
 
+test.serial("Statement.all() [column names that are JavaScript object properties]", async (t) => {
+  const db = t.context.db;
+  await db.exec("DROP TABLE IF EXISTS t");
+  await db.exec("CREATE TABLE t (id INTEGER PRIMARY KEY, length INTEGER, map INTEGER, toString INTEGER, hasOwnProperty INTEGER)");
+  await db.exec("INSERT INTO t VALUES (1, 42, 43, 44, 45)");
+
+  const stmt = await db.prepare("SELECT * FROM t");
+  const expected = { id: 1, length: 42, map: 43, toString: 44, hasOwnProperty: 45 };
+  t.deepEqual(await stmt.all(), [expected]);
+  t.deepEqual(await stmt.get(), expected);
+  t.deepEqual(await stmt.raw().all(), [[1, 42, 43, 44, 45]]);
+
+  stmt.raw(false).safeIntegers();
+  const expectedBigInt = { id: 1n, length: 42n, map: 43n, toString: 44n, hasOwnProperty: 45n };
+  t.deepEqual(await stmt.all(), [expectedBigInt]);
+  t.deepEqual(await stmt.get(), expectedBigInt);
+  t.deepEqual(await stmt.raw().all(), [[1n, 42n, 43n, 44n, 45n]]);
+});
+
 // ==========================================================================
 // Big integers
 //
