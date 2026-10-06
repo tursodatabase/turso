@@ -3613,6 +3613,7 @@ impl Cursor {
             Self::BTree(cursor, ..) => cursor.set_null_flag(flag),
             Self::Dyn(cursor, ..) => cursor.set_null_flag(flag),
             Self::Virtual(cursor) => cursor.set_null_flag(flag),
+            Self::MaterializedView(cursor) => cursor.set_null_flag(flag),
             // A pseudo cursor always decodes columns from its content
             // register. SQLite's OP_NullRow likewise leaves pseudo-cursor
             // column reads untouched: nullRow is the steady state for pseudo
