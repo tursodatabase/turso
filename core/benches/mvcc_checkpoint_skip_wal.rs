@@ -153,7 +153,8 @@ struct Bench {
 impl Bench {
     fn open(mode: Mode, workload: Workload, sync: Sync) -> Self {
         let dir =
-            tempfile::tempdir_in(std::env::var("BENCH_DIR").unwrap_or(".".to_string())).unwrap();
+            tempfile::tempdir_in(std::env::var("BENCH_DIR").unwrap_or_else(|_| ".".to_string()))
+                .unwrap();
         let db_path = dir.path().join("bench.db").to_str().unwrap().to_string();
         let counters = Arc::new(IoCounters::default());
         let io = Arc::new(CountingIo {

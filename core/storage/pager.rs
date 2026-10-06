@@ -3558,7 +3558,7 @@ impl Pager {
                         };
                         io_yield_one!(writes);
                     }
-                    if let Some(err) = write_error.get().copied().or(writes.get_error()) {
+                    if let Some(err) = write_error.get().copied().or_else(|| writes.get_error()) {
                         Self::partial_db_file_commit("write", err);
                     }
                     if sync_mode == SyncMode::Off {
