@@ -1054,6 +1054,23 @@ impl Connection {
         self.prepare_with_origin(sql, StatementOrigin::InternalHelper)
     }
 
+    /// Prepare SQL that the engine wrote, such as the statements of VACUUM.
+    /// It is always SQLite SQL, so the dialect parser of the connection must
+    /// not translate it again.
+    pub(crate) fn prepare_engine_sql(
+        self: &Arc<Connection>,
+        sql: &str,
+        origin: StatementOrigin,
+    ) -> Result<Statement> {
+        let (cmd, _) = crate::dialect::sqlite::parse(sql)?;
+        let cmd = cmd.ok_or_else(|| {
+            LimboError::InvalidArgument(
+                "The supplied SQL string contains no statements".to_string(),
+            )
+        })?;
+        self.prepare_cmd_with_input_and_origin(cmd, sql, origin, &PrepareOptions::default())
+    }
+
     #[instrument(skip_all, level = Level::DEBUG)]
     pub fn _prepare(self: &Arc<Connection>, sql: impl AsRef<str>) -> Result<Statement> {
         self.prepare_with_origin(sql, StatementOrigin::Root)

@@ -31,3 +31,21 @@ test vacuum-rejects-query-only {
 expect error {
     Cannot execute VACUUM in query_only mode
 }
+
+@skip-if mvcc "plain VACUUM requires PRAGMA wal_checkpoint(TRUNCATE) first on an MVCC database"
+@requires strict "uses STRICT tables"
+@requires custom_types "uses custom types"
+test vacuum-keeps-pg-storage-tables {
+    CREATE TYPE mood(value text) BASE text ENCODE CASE WHEN value IN ('sad', 'ok') THEN value ELSE RAISE(ABORT, 'invalid mood') END DECODE value;
+    CREATE TABLE p(id INTEGER PRIMARY KEY, n numeric(10,2), m mood) STRICT, PGSTORAGE;
+    INSERT INTO p VALUES (1, 2.5, 'ok');
+    VACUUM;
+    PRAGMA integrity_check;
+    SELECT sql FROM sqlite_schema WHERE name = 'p';
+    SELECT id, n, m FROM p;
+}
+expect {
+    ok
+    CREATE TABLE p (id INTEGER PRIMARY KEY, n numeric (10, 2), m mood) STRICT, PGSTORAGE
+    1|2.50|ok
+}

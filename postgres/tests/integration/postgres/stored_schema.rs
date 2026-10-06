@@ -263,3 +263,50 @@ fn schema_file_tables_resolve_types_through_the_main_database(db: TempDatabase) 
         "{err}"
     );
 }
+
+fn core_rows(conn: &std::sync::Arc<turso_core::Connection>, sql: &str) -> Vec<String> {
+    let mut stmt = conn.prepare(sql).unwrap();
+    stmt.run_collect_rows()
+        .unwrap()
+        .into_iter()
+        .map(|row| {
+            row.iter()
+                .map(|value| match value {
+                    Value::Null => "NULL".to_string(),
+                    value => value.to_string(),
+                })
+                .collect::<Vec<_>>()
+                .join("|")
+        })
+        .collect()
+}
+
+/// VACUUM through the core API of a PostgreSQL connection: the replayed
+/// table SQL must create the same tables, internal tables included.
+#[turso_macros::test]
+fn vacuum_keeps_tables_and_values(db: TempDatabase) {
+    let conn = db.connect_postgres();
+    conn.execute("CREATE TYPE mood AS ENUM ('sad', 'ok')")
+        .unwrap();
+    conn.execute("CREATE TABLE v (id serial PRIMARY KEY, n numeric(10,2), m mood, ts timestamp)")
+        .unwrap();
+    conn.execute("CREATE INDEX v_ts ON v (ts)").unwrap();
+    conn.execute("INSERT INTO v (n, m, ts) VALUES (2.5, 'ok', '2024-01-01 10:00:00')")
+        .unwrap();
+    let core = db.connect_limbo();
+    let schema_sql = "SELECT name, replace(sql, ' ', '') FROM sqlite_schema \
+                      WHERE type = 'table' ORDER BY name";
+    let before = core_rows(&core, schema_sql);
+    assert_eq!(before.len(), 3);
+
+    core.execute("VACUUM").unwrap();
+
+    assert_eq!(core_rows(&core, schema_sql), before);
+    assert_eq!(core_rows(&core, "PRAGMA integrity_check"), ["ok"]);
+    conn.execute("INSERT INTO v (n, m) VALUES (3, 'sad')")
+        .unwrap();
+    assert_eq!(
+        rows(&conn, "SELECT id, n, m, ts FROM v ORDER BY id"),
+        ["1|2.50|ok|2024-01-01 10:00:00", "2|3.00|sad|NULL"]
+    );
+}

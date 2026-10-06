@@ -5,6 +5,7 @@ use std::sync::{atomic::Ordering, Arc};
 use crate::error::LimboError;
 use crate::io::{Buffer, Completion, CompletionGroup, WriteBatch as IOWriteBatch};
 use crate::schema::{BTreeTable, Schema, TypeDef};
+use crate::statement::StatementOrigin;
 use crate::storage::pager::{AutoVacuumMode, Page, PageRef, Pager};
 use crate::storage::sqlite3_ondisk::{
     CacheSize, DatabaseHeader, PageSize, RawVersion, TextEncoding, WAL_FRAME_HEADER_SIZE,
@@ -621,7 +622,9 @@ pub(crate) fn vacuum_target_build_step(
                         crate::mvcc::database::MVCC_META_TABLE_NAME
                     )
                 };
-                let schema_stmt = config.source_conn.prepare_internal(schema_sql.as_str())?;
+                let schema_stmt = config
+                    .source_conn
+                    .prepare_engine_sql(schema_sql.as_str(), StatementOrigin::InternalHelper)?;
 
                 state.phase = VacuumTargetBuildPhase::CollectSchemaRows {
                     schema_stmt: Box::new(schema_stmt),
@@ -708,7 +711,9 @@ pub(crate) fn vacuum_target_build_step(
                 if is_system {
                     state.target_conn.start_nested();
                 }
-                let target_stmt = state.target_conn.prepare(&sql);
+                let target_stmt = state
+                    .target_conn
+                    .prepare_engine_sql(&sql, StatementOrigin::Root);
                 if is_system {
                     state.target_conn.end_nested();
                 }
@@ -811,7 +816,9 @@ pub(crate) fn vacuum_target_build_step(
                 )?;
 
                 // SELECT from source, INSERT into the target.
-                let select_stmt = config.source_conn.prepare_internal(&select_sql)?;
+                let select_stmt = config
+                    .source_conn
+                    .prepare_engine_sql(&select_sql, StatementOrigin::InternalHelper)?;
 
                 // System tables need nested mode during prepare() to bypass
                 // "may not be modified" checks. Can't use prepare_internal()
@@ -821,7 +828,9 @@ pub(crate) fn vacuum_target_build_step(
                 if is_system {
                     state.target_conn.start_nested();
                 }
-                let target_insert_stmt = state.target_conn.prepare(&insert_sql);
+                let target_insert_stmt = state
+                    .target_conn
+                    .prepare_engine_sql(&insert_sql, StatementOrigin::Root);
                 if is_system {
                     state.target_conn.end_nested();
                 }
@@ -934,7 +943,9 @@ pub(crate) fn vacuum_target_build_step(
                 // Backing-btree indexes for custom index methods were filtered
                 // out when indexes_to_create was built. The remaining CREATE
                 // INDEX statements are user-visible and can use ordinary prepare.
-                let target_stmt = state.target_conn.prepare(&entry.sql)?;
+                let target_stmt = state
+                    .target_conn
+                    .prepare_engine_sql(&entry.sql, StatementOrigin::Root)?;
                 state.phase = VacuumTargetBuildPhase::StepCreateIndex {
                     target_schema_stmt: Box::new(target_stmt),
                     idx,
@@ -980,7 +991,9 @@ pub(crate) fn vacuum_target_build_step(
 
                 let entry_ordinal = state.post_data_entries[idx];
                 let entry = &state.schema_entries[entry_ordinal];
-                let target_stmt = state.target_conn.prepare(&entry.sql)?;
+                let target_stmt = state
+                    .target_conn
+                    .prepare_engine_sql(&entry.sql, StatementOrigin::Root)?;
                 state.phase = VacuumTargetBuildPhase::StepPostData {
                     target_schema_stmt: Box::new(target_stmt),
                     idx,
