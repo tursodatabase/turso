@@ -4973,18 +4973,24 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         loop {
             match st {
                 InitMetadataTableState::Start => {
-                    let stmt = connection.prepare(format!(
-                        "CREATE TABLE IF NOT EXISTS {MVCC_META_TABLE_NAME}(k TEXT, v INTEGER NOT NULL)"
-                    ))?;
+                    let stmt = connection.prepare_engine_sql(
+                        &format!(
+                            "CREATE TABLE IF NOT EXISTS {MVCC_META_TABLE_NAME}(k TEXT, v INTEGER NOT NULL)"
+                        ),
+                        crate::statement::StatementOrigin::Root,
+                    )?;
                     *st = InitMetadataTableState::CreateTable {
                         stmt: Box::new(stmt),
                     };
                 }
                 InitMetadataTableState::CreateTable { stmt } => {
                     return_if_io!(stmt.run_ignore_rows_nonblock());
-                    let stmt = connection.prepare(format!(
-                        "INSERT OR IGNORE INTO {MVCC_META_TABLE_NAME}(rowid, k, v) VALUES (1, '{MVCC_META_KEY_PERSISTENT_TX_TS_MAX}', 0)"
-                    ))?;
+                    let stmt = connection.prepare_engine_sql(
+                        &format!(
+                            "INSERT OR IGNORE INTO {MVCC_META_TABLE_NAME}(rowid, k, v) VALUES (1, '{MVCC_META_KEY_PERSISTENT_TX_TS_MAX}', 0)"
+                        ),
+                        crate::statement::StatementOrigin::Root,
+                    )?;
                     *st = InitMetadataTableState::Insert {
                         stmt: Box::new(stmt),
                     };

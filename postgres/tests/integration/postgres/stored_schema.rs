@@ -296,3 +296,31 @@ fn drop_type_refuses_a_type_that_a_schema_file_table_uses(db: TempDatabase) {
         .execute("INSERT INTO s.t VALUES (2, 'angry', 3)")
         .is_err());
 }
+
+/// The engine creates its own tables with SQLite SQL, also on a connection
+/// of the PostgreSQL frontend. They are not tables of the PostgreSQL
+/// frontend.
+#[test]
+fn engine_tables_are_not_postgres_tables() {
+    let db = TempDatabase::builder().with_mvcc(true).build();
+    let conn = db.connect_postgres();
+    conn.inner()
+        .execute("PRAGMA capture_data_changes_conn('full')")
+        .unwrap();
+    conn.execute("CREATE TABLE t (id integer PRIMARY KEY, a text)")
+        .unwrap();
+    conn.execute("INSERT INTO t VALUES (1, 'x')").unwrap();
+    assert_eq!(
+        core_rows(
+            conn.inner(),
+            "SELECT name, sql FROM sqlite_schema \
+             WHERE name IN ('__turso_internal_mvcc_meta', 'turso_cdc_version') ORDER BY name"
+        ),
+        [
+            "__turso_internal_mvcc_meta|CREATE TABLE __turso_internal_mvcc_meta \
+             (k TEXT, v INTEGER NOT NULL)",
+            "turso_cdc_version|CREATE TABLE turso_cdc_version \
+             (table_name TEXT PRIMARY KEY, version TEXT NOT NULL)",
+        ]
+    );
+}

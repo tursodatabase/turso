@@ -15497,7 +15497,7 @@ pub struct OpInitCdcVersionInner {
 pub type OpInitCdcVersionState = Option<Box<OpInitCdcVersionInner>>;
 
 fn prepare_cdc_internal(conn: &Arc<Connection>, sql: String) -> Result<crate::Statement> {
-    let stmt = conn.prepare_internal(sql)?;
+    let stmt = conn.prepare_engine_sql(&sql, crate::statement::StatementOrigin::InternalHelper)?;
     stmt.program
         .prepared
         .needs_stmt_subtransactions
