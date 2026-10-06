@@ -582,7 +582,7 @@ fn native_module_creation_and_reload_receive_sql_arguments_as_core_values() {
             0,
             Some("CREATE VIRTUAL TABLE reloaded USING argument_module(alpha, 73, -4.25)"),
             &conn.syms.read(),
-            &mut vec![],
+            &mut crate::alloc::vec![],
             &mut crate::HashMap::default(),
             &mut crate::HashMap::default(),
             &mut crate::HashMap::default(),
@@ -633,7 +633,7 @@ fn c_module_creation_converts_core_arguments_at_the_callback() {
                     let table = result.unwrap();
                     let mut cursor = table.open(conn.clone()).unwrap();
                     assert!(matches!(
-                        cursor.filter(0, None, 0, crate::alloc::Vec::new()).unwrap(),
+                        cursor.filter(0, None, 0, crate::alloc::vec![]).unwrap(),
                         IOResult::Done(true)
                     ));
                     let IOResult::Done(value) = cursor.column(0).unwrap() else {
@@ -1440,18 +1440,19 @@ impl VirtualTable for RowsTable {
         constraints: &[ConstraintInfo],
         _order_by: &[OrderByInfo],
     ) -> Result<IndexInfo, ResultCode> {
-        let mut info = IndexInfo::default();
-        info.idx_num = 7;
-        info.idx_str = Some("lower".into());
-        info.constraint_usages = constraints
-            .iter()
-            .map(|c| ConstraintUsage {
-                argv_index: (c.column_index == 1 && c.op == ConstraintOp::Eq && c.usable)
-                    .then_some(1),
-                omit: c.column_index == 1 && c.op == ConstraintOp::Eq && c.usable,
-            })
-            .collect();
-        Ok(info)
+        Ok(IndexInfo {
+            idx_num: 7,
+            idx_str: Some("lower".into()),
+            constraint_usages: constraints
+                .iter()
+                .map(|c| ConstraintUsage {
+                    argv_index: (c.column_index == 1 && c.op == ConstraintOp::Eq && c.usable)
+                        .then_some(1),
+                    omit: c.column_index == 1 && c.op == ConstraintOp::Eq && c.usable,
+                })
+                .collect(),
+            ..Default::default()
+        })
     }
 
     fn readonly(&self) -> bool {
