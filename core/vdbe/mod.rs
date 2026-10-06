@@ -901,7 +901,7 @@ pub struct ProgramState {
     cursor_seqs: Vec<i64>,
     registers: Box<[Register]>,
     /// Trace state: register snapshot for diffing.
-    pre_op_registers: Option<Box<[Register]>>,
+    pre_op_registers: Option<Box<[String]>>,
     pub(crate) result_row: Option<Row>,
     last_compare: Option<std::cmp::Ordering>,
     deferred_seeks: Vec<Option<DeferredSeekState>>,
@@ -2221,20 +2221,24 @@ impl Program {
         if !vdbe_trace {
             return;
         }
+        let snapshots: Box<[_]> = state
+            .registers
+            .iter()
+            .map(|register| format!("{register:?}"))
+            .collect();
         // Diff registers from PREVIOUS opcode
         // The last opcode (Halt) won't have its diff printed, but Halt
         // doesn't write to any registers
-        if let Some(ref old) = state.pre_op_registers {
-            for (i, (old_reg, new_reg)) in old.iter().zip(state.registers.iter()).enumerate() {
+        if let Some(old) = state.pre_op_registers.take() {
+            for (i, (old_reg, new_reg)) in old.iter().zip(snapshots.iter()).enumerate() {
                 if old_reg != new_reg {
-                    match new_reg {
+                    match &state.registers[i] {
                         Register::Value(v) => eprintln!("R[{i}] = {v}"),
                         Register::Aggregate(_) => eprintln!("R[{i}] = <aggregate>"),
                         Register::Record(_) => eprintln!("R[{i}] = <record>"),
                     }
                 }
             }
-            state.pre_op_registers = None;
         }
 
         // Print CURRENT opcode
@@ -2252,7 +2256,7 @@ impl Program {
             )
         );
         // Snapshot for next iteration
-        state.pre_op_registers = Some(state.registers.clone());
+        state.pre_op_registers = Some(snapshots);
     }
 
     /// Step in [QueryMode::Normal]

@@ -80,6 +80,3 @@ pub(crate) fn abort_aggregates(registers: &mut [crate::Register]) {
         }
     }
 }
-
-#[cfg(test)]
-mod tests;

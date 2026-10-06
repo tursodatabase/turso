@@ -15,7 +15,7 @@ pub trait ScalarCall: Send + Sync {
 }
 
 pub trait AggregateFunction: Debug + Send + Sync {
-    type Accumulator: Aggregate + Clone + 'static;
+    type Accumulator: Aggregate + 'static;
 
     fn create_accumulator(&self) -> Result<Self::Accumulator>;
 }
@@ -103,7 +103,7 @@ fn ensure_accumulator<'a>(
 }
 
 #[derive(Debug)]
-pub struct AggregateState(Box<dyn CloneAggregate>);
+pub struct AggregateState(Box<dyn Aggregate>);
 
 impl AggregateState {
     pub(crate) fn step(&mut self, args: &[Value]) -> IOResultOr<()> {
@@ -115,24 +115,8 @@ impl AggregateState {
     }
 }
 
-impl Clone for AggregateState {
-    fn clone(&self) -> Self {
-        Self(self.0.clone_accumulator())
-    }
-}
-
 impl PartialEq for AggregateState {
     fn eq(&self, other: &Self) -> bool {
         std::ptr::eq(self.0.as_ref(), other.0.as_ref())
-    }
-}
-
-trait CloneAggregate: Aggregate {
-    fn clone_accumulator(&self) -> Box<dyn CloneAggregate>;
-}
-
-impl<A: Aggregate + Clone + 'static> CloneAggregate for A {
-    fn clone_accumulator(&self) -> Box<dyn CloneAggregate> {
-        Box::new(self.clone())
     }
 }

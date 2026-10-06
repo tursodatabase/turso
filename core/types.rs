@@ -1055,7 +1055,7 @@ impl Default for SumAggState {
 /// Aggregate context for accumulating values during GROUP BY.
 /// Built-in aggregates use a flat payload representation for efficiency and
 /// to share code between register-based and hash-based aggregation (future enhancement).
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, PartialEq)]
 pub enum AggContext {
     /// Built-in aggregates store state as a flat Vec<Value> payload.
     /// The layout depends on the aggregate function (see init_agg_payload).
@@ -1063,6 +1063,16 @@ pub enum AggContext {
     /// External (extension) aggregates need FFI state that can't be serialized.
     External(ExternalAggState),
     Native(crate::native_ext::AggregateState),
+}
+
+impl Clone for AggContext {
+    fn clone(&self) -> Self {
+        match self {
+            Self::Builtin(payload) => Self::Builtin(payload.clone()),
+            Self::External(state) => Self::External(state.clone()),
+            Self::Native(_) => unreachable!("native aggregate accumulators cannot be copied"),
+        }
+    }
 }
 
 impl TryClone for AggContext {
