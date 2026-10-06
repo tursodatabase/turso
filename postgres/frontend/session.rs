@@ -4,6 +4,7 @@ use std::str;
 use std::sync::{Arc, Mutex};
 
 use crate::catalog::{self, PostgresDialect};
+use turso_core::security::permission::{Action, Object, PermissionDenied};
 use turso_core::{Connection, LimboError, PrepareOptions, Result, Statement, Value};
 use turso_parser::ast::{self};
 use turso_pg_parser::translator::{
@@ -272,11 +273,20 @@ fn try_prepare_special(pg_conn: &Arc<PgConnectionInner>, sql: &str) -> Result<Op
     }
 
     if let Some(stmt) = try_extract_create_schema(&parse_result) {
+        require_superuser(&pg_conn.conn, || {
+            PermissionDenied::privilege(
+                Action::Create,
+                Object::Database(catalog::db_name_from_path(pg_conn.conn.db_file_path())),
+            )
+        })?;
         handle_pg_create_schema(&pg_conn.conn, &stmt)?;
         return Ok(Some(noop_statement(&pg_conn.conn)?));
     }
 
     if let Some(stmt) = try_extract_drop_schema(&parse_result) {
+        require_superuser(&pg_conn.conn, || {
+            PermissionDenied::owner(Action::Drop, Object::Schema(stmt.name.to_lowercase()))
+        })?;
         handle_pg_drop_schema(&pg_conn.conn, &stmt)?;
         return Ok(Some(noop_statement(&pg_conn.conn)?));
     }
@@ -290,6 +300,9 @@ fn try_prepare_special(pg_conn: &Arc<PgConnectionInner>, sql: &str) -> Result<Op
     }
 
     if let Some(stmt) = try_extract_copy_from(&parse_result) {
+        require_superuser(&pg_conn.conn, || {
+            PermissionDenied::privilege(Action::Read, Object::File(stmt.filename.clone()))
+        })?;
         let rows_inserted = handle_pg_copy_from(&pg_conn.conn, &stmt)?;
         let stmt = noop_statement(&pg_conn.conn)?;
         stmt.set_n_change(rows_inserted as i64);
@@ -297,6 +310,16 @@ fn try_prepare_special(pg_conn: &Arc<PgConnectionInner>, sql: &str) -> Result<Op
     }
 
     Ok(None)
+}
+
+/// Statements that the frontend runs itself, outside the privilege checks of
+/// core, are allowed only for a superuser.
+fn require_superuser(conn: &Connection, denial: impl FnOnce() -> PermissionDenied) -> Result<()> {
+    if conn.role_catalog().is_superuser(conn.current_role()) {
+        Ok(())
+    } else {
+        Err(LimboError::PermissionDenied(Box::new(denial())))
+    }
 }
 
 fn noop_statement(conn: &Arc<Connection>) -> Result<Statement> {

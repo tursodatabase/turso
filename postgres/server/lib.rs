@@ -25,24 +25,28 @@ use pgwire::messages::data::DataRow;
 use pgwire::tokio::process_socket;
 use pgwire::types::format::FormatOptions;
 
+type Connect = dyn Fn() -> anyhow::Result<Connection> + Send + Sync;
+
 pub struct TursoPgServer {
     address: String,
     db_file: String,
-    conn: Arc<Mutex<PgConnection>>,
+    connect: Arc<Connect>,
     interrupt_count: Arc<AtomicUsize>,
 }
 
 impl TursoPgServer {
+    /// Every client gets its own connection from `connect`, so session
+    /// state such as the current role is not shared between clients.
     pub fn new(
         address: String,
         db_file: String,
-        conn: Connection,
+        connect: impl Fn() -> anyhow::Result<Connection> + Send + Sync + 'static,
         interrupt_count: Arc<AtomicUsize>,
     ) -> Self {
         Self {
             address,
             db_file,
-            conn: Arc::new(Mutex::new(conn)),
+            connect: Arc::new(connect),
             interrupt_count,
         }
     }
@@ -60,24 +64,32 @@ impl TursoPgServer {
             self.db_file
         );
 
-        let factory = Arc::new(TursoPgFactory {
-            handler: Arc::new(TursoPgHandler {
-                conn: self.conn.clone(),
-                db_file: self.db_file.clone(),
-                query_parser: Arc::new(NoopQueryParser::new()),
-            }),
-        });
-
         loop {
             tokio::select! {
                 result = listener.accept() => {
                     match result {
                         Ok((socket, addr)) => {
                             info!("PostgreSQL client connected from {}", addr);
-                            let factory_ref = factory.clone();
+                            let conn = match (self.connect)() {
+                                Ok(conn) => conn,
+                                Err(e) => {
+                                    error!("Error opening a connection for {}: {}", addr, e);
+                                    continue;
+                                }
+                            };
+                            let factory = Arc::new(TursoPgFactory {
+                                handler: Arc::new(TursoPgHandler {
+                                    conn: Arc::new(Mutex::new(conn.clone())),
+                                    db_file: self.db_file.clone(),
+                                    query_parser: Arc::new(NoopQueryParser::new()),
+                                }),
+                            });
                             tokio::spawn(async move {
-                                if let Err(e) = process_socket(socket, None, factory_ref).await {
+                                if let Err(e) = process_socket(socket, None, factory).await {
                                     error!("Error processing connection from {}: {}", addr, e);
+                                }
+                                if let Err(e) = conn.close() {
+                                    error!("Error closing the connection for {}: {}", addr, e);
                                 }
                             });
                         }
@@ -182,14 +194,15 @@ impl SimpleQueryHandler for TursoPgHandler {
 
         // Per the PostgreSQL simple query protocol, a query string may contain
         // multiple semicolon-separated statements. Split and execute each one.
-        let statements = split_statements(query)
-            .map_err(|e| PgWireError::UserError(Box::new(error_info(&e.to_string()))))?;
+        let statements = split_statements(query).map_err(|e| {
+            PgWireError::UserError(Box::new(error_info(&turso_pg::error_message(&e))))
+        })?;
 
         let mut responses = Vec::new();
         for sql in &statements {
-            let mut stmt = conn
-                .prepare(sql)
-                .map_err(|e| PgWireError::UserError(Box::new(error_info(&e.to_string()))))?;
+            let mut stmt = conn.prepare(sql).map_err(|e| {
+                PgWireError::UserError(Box::new(error_info(&turso_pg::error_message(&e))))
+            })?;
 
             self.cleanup_dropped_schema_file(sql);
 
@@ -226,9 +239,9 @@ impl ExtendedQueryHandler for TursoPgHandler {
         let conn = self.conn.lock().unwrap().clone();
         let query = &portal.statement.statement;
 
-        let mut stmt = conn
-            .prepare(query)
-            .map_err(|e| PgWireError::UserError(Box::new(error_info(&e.to_string()))))?;
+        let mut stmt = conn.prepare(query).map_err(|e| {
+            PgWireError::UserError(Box::new(error_info(&turso_pg::error_message(&e))))
+        })?;
 
         // Clean up schema file after successful DROP SCHEMA
         self.cleanup_dropped_schema_file(query);
@@ -253,9 +266,9 @@ impl ExtendedQueryHandler for TursoPgHandler {
         C: ClientInfo + Unpin + Send + Sync,
     {
         let conn = self.conn.lock().unwrap().clone();
-        let stmt = conn
-            .prepare(&target.statement)
-            .map_err(|e| PgWireError::UserError(Box::new(error_info(&e.to_string()))))?;
+        let stmt = conn.prepare(&target.statement).map_err(|e| {
+            PgWireError::UserError(Box::new(error_info(&turso_pg::error_message(&e))))
+        })?;
 
         let param_types: Vec<Type> = target
             .parameter_types
@@ -276,9 +289,9 @@ impl ExtendedQueryHandler for TursoPgHandler {
         C: ClientInfo + Unpin + Send + Sync,
     {
         let conn = self.conn.lock().unwrap().clone();
-        let stmt = conn
-            .prepare(&portal.statement.statement)
-            .map_err(|e| PgWireError::UserError(Box::new(error_info(&e.to_string()))))?;
+        let stmt = conn.prepare(&portal.statement.statement).map_err(|e| {
+            PgWireError::UserError(Box::new(error_info(&turso_pg::error_message(&e))))
+        })?;
 
         let fields = build_field_info(&stmt, &portal.result_column_format);
         Ok(DescribePortalResponse::new(fields))
@@ -402,7 +415,7 @@ fn execute_query(
         rows.push(encoder.finish());
         Ok(())
     })
-    .map_err(|e| PgWireError::UserError(Box::new(error_info(&e.to_string()))))?;
+    .map_err(|e| PgWireError::UserError(Box::new(error_info(&turso_pg::error_message(&e)))))?;
 
     let data_stream = stream::iter(rows);
     Ok(Response::Query(QueryResponse::new(header, data_stream)))
@@ -411,7 +424,7 @@ fn execute_query(
 /// Execute a non-SELECT statement and build an Execution response.
 fn execute_non_query(stmt: &mut turso_core::Statement, query: &str) -> PgWireResult<Response> {
     stmt.run_ignore_rows()
-        .map_err(|e| PgWireError::UserError(Box::new(error_info(&e.to_string()))))?;
+        .map_err(|e| PgWireError::UserError(Box::new(error_info(&turso_pg::error_message(&e)))))?;
 
     let affected = stmt.n_change();
     let tag = command_tag(query, affected as usize);
@@ -694,6 +707,8 @@ fn command_tag(query: &str, affected_rows: usize) -> Tag {
         Tag::new("RELEASE")
     } else if upper.starts_with("SET") {
         Tag::new("SET")
+    } else if upper.starts_with("RESET") {
+        Tag::new("RESET")
     } else if upper.starts_with("COPY") {
         Tag::new("COPY").with_rows(affected_rows)
     } else if upper.starts_with("COMMENT") {
@@ -909,6 +924,11 @@ mod tests {
     #[test]
     fn create_role_has_its_own_command_tag() {
         assert_eq!(command_tag("CREATE ROLE alice", 0), Tag::new("CREATE ROLE"));
+    }
+
+    #[test]
+    fn reset_has_its_own_command_tag() {
+        assert_eq!(command_tag("RESET ROLE", 0), Tag::new("RESET"));
     }
 
     #[test]

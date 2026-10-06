@@ -1,7 +1,10 @@
 mod catalog;
 mod copy;
+mod error;
 mod functions;
 mod session;
+
+pub use error::error_message;
 
 pub use session::PgConnection as Connection;
 pub use session::{

@@ -101,7 +101,7 @@ fn open_database(
     vfs: Option<&String>,
     readonly: bool,
     enable_load_extension: bool,
-) -> anyhow::Result<(Arc<dyn turso_core::IO>, Connection)> {
+) -> anyhow::Result<(Arc<dyn turso_core::IO>, Arc<turso_core::Database>)> {
     let db_opts = DatabaseOpts::new()
         .with_views(true)
         .with_custom_types(true)
@@ -123,8 +123,13 @@ fn open_database(
     };
 
     let (io, db) = turso_pg::open_database(db_path, vfs.map(|v| v.as_str()), flags, db_opts)?;
-    let conn = Connection::connect(&db)?;
-    Ok((io, conn))
+    Ok((io, db))
+}
+
+fn connect(db: &Arc<turso_core::Database>, db_file: &str) -> anyhow::Result<Connection> {
+    let conn = Connection::connect(db)?;
+    auto_attach_pg_schemas(&conn, db_file);
+    Ok(conn)
 }
 
 /// Discover and attach existing PG schema database files in the same directory.
@@ -225,7 +230,7 @@ fn cmd_list_tables(conn: &Connection, w: &mut dyn Write) {
             let _ = writeln!(w, "No tables found.");
         }
         Err(e) => {
-            let _ = writeln!(w, "Error: {e}");
+            let _ = writeln!(w, "Error: {}", turso_pg::error_message(&e));
         }
     }
 }
@@ -278,7 +283,7 @@ fn cmd_describe_table(conn: &Connection, table_name: &str, w: &mut dyn Write) {
             let _ = writeln!(w, "Table '{table_name}' not found.");
         }
         Err(e) => {
-            let _ = writeln!(w, "Error: {e}");
+            let _ = writeln!(w, "Error: {}", turso_pg::error_message(&e));
         }
     }
 }
@@ -299,7 +304,7 @@ fn cmd_list_databases(conn: &Connection, w: &mut dyn Write) {
         }
         Ok(None) => {}
         Err(e) => {
-            let _ = writeln!(w, "Error: {e}");
+            let _ = writeln!(w, "Error: {}", turso_pg::error_message(&e));
         }
     }
 }
@@ -339,7 +344,7 @@ fn cmd_list_indexes(conn: &Connection, w: &mut dyn Write) {
             let _ = writeln!(w, "No indexes found.");
         }
         Err(e) => {
-            let _ = writeln!(w, "Error: {e}");
+            let _ = writeln!(w, "Error: {}", turso_pg::error_message(&e));
         }
     }
 }
@@ -366,7 +371,7 @@ fn cmd_list_views(conn: &Connection, w: &mut dyn Write) {
             let _ = writeln!(w, "No views found.");
         }
         Err(e) => {
-            let _ = writeln!(w, "Error: {e}");
+            let _ = writeln!(w, "Error: {}", turso_pg::error_message(&e));
         }
     }
 }
@@ -400,7 +405,7 @@ fn cmd_list_schemas(conn: &Connection, w: &mut dyn Write) {
             let _ = writeln!(w, "No schemas found.");
         }
         Err(e) => {
-            let _ = writeln!(w, "Error: {e}");
+            let _ = writeln!(w, "Error: {}", turso_pg::error_message(&e));
         }
     }
 }
@@ -431,7 +436,7 @@ fn cmd_list_types(conn: &Connection, w: &mut dyn Write) {
             let _ = writeln!(w, "No types found.");
         }
         Err(e) => {
-            let _ = writeln!(w, "Error: {e}");
+            let _ = writeln!(w, "Error: {}", turso_pg::error_message(&e));
         }
     }
 }
@@ -463,7 +468,7 @@ fn cmd_list_roles(conn: &Connection, w: &mut dyn Write) {
             let _ = writeln!(w, "No roles found.");
         }
         Err(e) => {
-            let _ = writeln!(w, "Error: {e}");
+            let _ = writeln!(w, "Error: {}", turso_pg::error_message(&e));
         }
     }
 }
@@ -499,7 +504,7 @@ fn cmd_list_functions(conn: &Connection, w: &mut dyn Write) {
             let _ = writeln!(w, "No functions found.");
         }
         Err(e) => {
-            let _ = writeln!(w, "Error: {e}");
+            let _ = writeln!(w, "Error: {}", turso_pg::error_message(&e));
         }
     }
 }
@@ -595,7 +600,7 @@ fn cmd_list_tables_extended(conn: &Connection, w: &mut dyn Write) {
             let _ = writeln!(w, "No tables found.");
         }
         Err(e) => {
-            let _ = writeln!(w, "Error: {e}");
+            let _ = writeln!(w, "Error: {}", turso_pg::error_message(&e));
         }
     }
 }
@@ -692,14 +697,14 @@ fn execute_sql(
                     print_result_set(stmt, table_config, w)
                 };
                 if let Err(e) = result {
-                    let _ = writeln!(w, "Error: {e}");
+                    let _ = writeln!(w, "Error: {}", turso_pg::error_message(&e));
                     had_error = true;
                     break;
                 }
             }
             Ok(None) => {}
             Err(ref e) => {
-                let _ = writeln!(w, "Error: {e}");
+                let _ = writeln!(w, "Error: {}", turso_pg::error_message(e));
                 had_error = true;
                 break;
             }
@@ -1015,7 +1020,7 @@ fn main() -> anyhow::Result<()> {
         .as_ref()
         .map_or(":memory:".to_string(), |p| p.to_string_lossy().to_string());
 
-    let (io, conn) = open_database(
+    let (io, db) = open_database(
         &db_file,
         opts.vfs.as_ref(),
         opts.readonly,
@@ -1031,12 +1036,19 @@ fn main() -> anyhow::Result<()> {
         .expect("Error setting Ctrl-C handler");
     }
 
-    auto_attach_pg_schemas(&conn, &db_file);
     // Server mode: start PG wire protocol server and exit
     if let Some(ref address) = opts.server {
-        let server = TursoPgServer::new(address.clone(), db_file, conn, interrupt_count);
+        let connect_db_file = db_file.clone();
+        let server = TursoPgServer::new(
+            address.clone(),
+            db_file,
+            move || connect(&db, &connect_db_file),
+            interrupt_count,
+        );
         return server.run();
     }
+
+    let conn = connect(&db, &db_file)?;
 
     let table_config = TableConfig::adaptive_colors();
 

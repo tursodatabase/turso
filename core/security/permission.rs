@@ -114,6 +114,7 @@ pub enum Object {
     Role(String),
     /// A connection or database setting, such as a pragma.
     Setting(String),
+    File(String),
     /// Storage that does not belong to a known object.
     Storage,
 }
@@ -133,6 +134,7 @@ impl fmt::Display for Object {
             Object::Function(name) => write!(f, "function {name}"),
             Object::Role(name) => write!(f, "role {name}"),
             Object::Setting(name) => write!(f, "setting {name}"),
+            Object::File(name) => write!(f, "file {name}"),
             Object::Storage => f.write_str("database storage"),
         }
     }
