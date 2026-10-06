@@ -2,13 +2,13 @@ use super::{cost_params::CostModelParams, AvailableIndexes};
 use crate::alloc::TursoIteratorExt;
 use crate::translate::expr::comparison_affinity;
 use crate::{
-    schema::{Column, Index, IndexColumn, IndexUse, Schema},
+    schema::{Column, Index, IndexColumn, IndexUse, Schema, SeekKeyFunction},
     translate::{
         collate::{get_collseq_from_expr, resolve_comparison_collseq, CollationSeq},
         expr::{
-            as_binary_components, equality_calls_type_function_with_encoded_literal,
-            get_expr_affinity, truth_test_rhs, unwrap_parens, walk_expr, walk_expr_mut,
-            WalkControl,
+            as_binary_components, comparison_calls_type_function,
+            equality_calls_type_function_with_encoded_literal, get_expr_affinity, truth_test_rhs,
+            unwrap_parens, walk_expr, walk_expr_mut, WalkControl,
         },
         expression_index::normalize_expr_for_index_matching,
         plan::{
@@ -1368,6 +1368,13 @@ fn column_constraint_index_use(
     let operator = operator.as_ast_operator();
     match schema.column_index_use(column, table_reference.table.is_strict()) {
         IndexUse::Plain => IndexUse::Plain,
+        IndexUse::KeyFunction(SeekKeyFunction::PgNumeric)
+            if !operator.as_ref().is_some_and(|operator| {
+                comparison_calls_type_function(lhs, rhs, operator, Some(table_references), schema)
+            }) =>
+        {
+            IndexUse::Unusable
+        }
         IndexUse::KeyFunction(function)
             if matches!(
                 operator,

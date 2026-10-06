@@ -314,6 +314,13 @@ expect {
     macaddr(value text)|text|value|value||
     macaddr8(value text)|text|value|value||
     numeric(value any, precision integer, scale integer)|blob|numeric_encode (value, precision, scale)|numeric_decode (value)||'+' numeric_add, '-' numeric_sub, '*' numeric_mul, '/' numeric_div, '<' numeric_lt, '=' numeric_eq
+    pg_date(value any)|integer|pg_date_encode (value)|pg_date_decode (value)||'<'
+    pg_int4(value integer)|integer||||
+    pg_int8(value integer)|integer||||
+    pg_numeric(value any, precision integer, scale integer)|integer|pg_numeric_encode (value, precision, scale)|pg_numeric_decode (value, scale)||'+' numeric_add, '-' numeric_sub, '*' numeric_mul, '/' numeric_div, '<' numeric_lt, '=' numeric_eq
+    pg_time(value any)|integer|pg_time_encode (value)|pg_time_decode (value)||'<'
+    pg_timestamp(value any)|integer|pg_timestamp_encode (value)|pg_timestamp_decode (value)||'<'
+    pg_timestamptz(value any)|integer|pg_timestamptz_encode (value)|pg_timestamp_decode (value)||'<'
     smallint(value integer)|integer|CASE WHEN value BETWEEN - 32768 AND 32767 THEN value ELSE RAISE (ABORT, 'integer out of range for smallint') END|value||'<'
     time(value text)|text|CASE WHEN value IS NULL THEN NULL WHEN time (value) IS NULL THEN RAISE (ABORT, 'invalid time value') ELSE rtrim (rtrim (strftime ('%H:%M:%f', value), '0'), '.') END|value||'<'
     timestamp(value text)|text|CASE WHEN value IS NULL THEN NULL WHEN datetime (value) IS NULL THEN RAISE (ABORT, 'invalid timestamp value') ELSE rtrim (rtrim (strftime ('%Y-%m-%d %H:%M:%f', value), '0'), '.') END|value||'<'
@@ -348,6 +355,13 @@ expect {
     macaddr(value text)|text|value|value||
     macaddr8(value text)|text|value|value||
     numeric(value any, precision integer, scale integer)|blob|numeric_encode (value, precision, scale)|numeric_decode (value)||'+' numeric_add, '-' numeric_sub, '*' numeric_mul, '/' numeric_div, '<' numeric_lt, '=' numeric_eq
+    pg_date(value any)|integer|pg_date_encode (value)|pg_date_decode (value)||'<'
+    pg_int4(value integer)|integer||||
+    pg_int8(value integer)|integer||||
+    pg_numeric(value any, precision integer, scale integer)|integer|pg_numeric_encode (value, precision, scale)|pg_numeric_decode (value, scale)||'+' numeric_add, '-' numeric_sub, '*' numeric_mul, '/' numeric_div, '<' numeric_lt, '=' numeric_eq
+    pg_time(value any)|integer|pg_time_encode (value)|pg_time_decode (value)||'<'
+    pg_timestamp(value any)|integer|pg_timestamp_encode (value)|pg_timestamp_decode (value)||'<'
+    pg_timestamptz(value any)|integer|pg_timestamptz_encode (value)|pg_timestamp_decode (value)||'<'
     smallint(value integer)|integer|CASE WHEN value BETWEEN - 32768 AND 32767 THEN value ELSE RAISE (ABORT, 'integer out of range for smallint') END|value||'<'
     test_uint(value any)|text|test_uint_encode (value)|test_uint_decode (value)|0|'+' test_uint_add
     time(value text)|text|CASE WHEN value IS NULL THEN NULL WHEN time (value) IS NULL THEN RAISE (ABORT, 'invalid time value') ELSE rtrim (rtrim (strftime ('%H:%M:%f', value), '0'), '.') END|value||'<'

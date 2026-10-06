@@ -303,11 +303,7 @@ pub(super) fn find_custom_type_operator(
                         func_name,
                         swap_args,
                         negate,
-                        encode_info: Some(OperatorEncodeInfo {
-                            column: lhs.column.clone(),
-                            type_def: lhs.type_def.clone(),
-                            which: EncodeArg::Second,
-                        }),
+                        encode_info: literal_encode_info(lhs, EncodeArg::Second),
                     });
                 }
             }
@@ -323,11 +319,7 @@ pub(super) fn find_custom_type_operator(
                         func_name,
                         swap_args,
                         negate,
-                        encode_info: Some(OperatorEncodeInfo {
-                            column: rhs.column.clone(),
-                            type_def: rhs.type_def.clone(),
-                            which: EncodeArg::First,
-                        }),
+                        encode_info: literal_encode_info(rhs, EncodeArg::First),
                     });
                 }
             }
@@ -335,6 +327,23 @@ pub(super) fn find_custom_type_operator(
     }
 
     None
+}
+
+/// The operator functions of a built-in type of the PostgreSQL frontend read
+/// the literal as the user wrote it: its ENCODE gives the stored integer, not
+/// a value that the functions can compare with the decoded column.
+fn literal_encode_info(
+    column: &ExprCustomTypeInfo,
+    which: EncodeArg,
+) -> Option<OperatorEncodeInfo> {
+    if column.type_def.is_pg_storage_type() {
+        return None;
+    }
+    Some(OperatorEncodeInfo {
+        column: column.column.clone(),
+        type_def: column.type_def.clone(),
+        which,
+    })
 }
 
 /// Evaluate an expression-index expression in a DML context (INSERT/UPDATE/UPSERT).

@@ -5,9 +5,10 @@ use crate::LimboError;
 use crate::ext::VTabImpl;
 use crate::function::{Deterministic, Func, MathFunc, ScalarFunc};
 use crate::schema::{
-    create_table, is_strict_primitive_type, translate_ident_to_string_literal,
-    BTreeCharacteristics, BTreeTable, ColDef, Column, SchemaObjectType, Table, Type,
-    RESERVED_TABLE_PREFIXES, SQLITE_SEQUENCE_TABLE_NAME, TURSO_TYPES_TABLE_NAME,
+    create_table, is_pg_storage_type_name, is_strict_primitive_type,
+    translate_ident_to_string_literal, BTreeCharacteristics, BTreeTable, ColDef, Column,
+    SchemaObjectType, Table, Type, RESERVED_TABLE_PREFIXES, SQLITE_SEQUENCE_TABLE_NAME,
+    TURSO_TYPES_TABLE_NAME,
 };
 use crate::stats::STATS_TABLE;
 use crate::storage::pager::CreateBTreeFlags;
@@ -594,11 +595,32 @@ fn resolve_json_func_return_type(func: &crate::function::JsonFunc) -> Result<Che
 /// Resolve a column's type from its definition.
 fn resolve_column_type(col: &ast::ColumnDefinition, resolver: &Resolver) -> Result<CheckExprType> {
     if let Some(ref col_type) = col.col_type {
-        resolve_type_name(&col_type.name, resolver)
+        let check_type = resolve_type_name(&col_type.name, resolver)?;
+        Ok(with_stored_scale(check_type, col_type, resolver))
     } else {
         // No type specified — in STRICT tables this would be caught elsewhere,
         // but treat as ANY for CHECK validation purposes.
         Ok(CheckExprType::Any)
+    }
+}
+
+/// A CHECK reads the stored value. pg_numeric stores the value times
+/// 10^scale, so only columns with the same parameters compare correctly.
+fn with_stored_scale(
+    check_type: CheckExprType,
+    col_type: &ast::Type,
+    resolver: &Resolver,
+) -> CheckExprType {
+    let is_builtin_pg_numeric = col_type.name.eq_ignore_ascii_case("pg_numeric")
+        && resolver
+            .schema()
+            .get_type_def_unchecked(&col_type.name)
+            .is_some_and(|type_def| type_def.is_builtin);
+    match (check_type, &col_type.size) {
+        (CheckExprType::CustomType(name), Some(size)) if is_builtin_pg_numeric => {
+            CheckExprType::CustomType(format!("{name}({size})"))
+        }
+        (check_type, _) => check_type,
     }
 }
 
@@ -838,6 +860,13 @@ fn validate(
                 }
 
                 if !is_builtin && is_strict {
+                    validate_pg_storage_column_type(
+                        type_name,
+                        options.pg_storage,
+                        &format!("{table_name}.{}", c.col_name),
+                        resolver,
+                        conn,
+                    )?;
                     let type_def = resolver.schema().get_type_def_unchecked(type_name);
                     {
                         match type_def {
@@ -907,6 +936,39 @@ fn validate(
                 );
             }
         }
+    }
+    Ok(())
+}
+
+/// A column of a built-in type of the PostgreSQL frontend needs a table with
+/// PGSTORAGE. A user type of an older file can hide such a type: then a new
+/// column cannot use the built-in type. A replay of a stored table (VACUUM)
+/// runs nested and keeps the user type.
+pub(crate) fn validate_pg_storage_column_type(
+    type_name: &str,
+    pg_storage: bool,
+    column: &str,
+    resolver: &Resolver,
+    conn: &Connection,
+) -> Result<()> {
+    let schema = resolver.schema();
+    if !pg_storage
+        && matches!(schema.resolve_type_unchecked(type_name), Ok(Some(resolved)) if resolved.needs_pg_storage())
+    {
+        bail_parse_error!(
+            "column {column} has type \"{type_name}\", which only a table with the PGSTORAGE option can use"
+        );
+    }
+    if pg_storage
+        && !conn.is_nested_stmt()
+        && is_pg_storage_type_name(type_name)
+        && schema
+            .get_type_def_unchecked(type_name)
+            .is_some_and(|type_def| !type_def.is_builtin)
+    {
+        bail_parse_error!(
+            "column {column} needs the built-in type {type_name}, but a user type of this database has that name: older versions allowed type names that start with pg_"
+        );
     }
     Ok(())
 }

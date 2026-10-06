@@ -1,7 +1,7 @@
 use super::*;
 use crate::function::{Func, FuncCtx};
 use crate::functions::seek_key::NoSeekKey;
-use crate::schema::IndexUse;
+use crate::schema::{IndexUse, SeekKeyFunction};
 use crate::translate::plan::BitSet;
 use crate::vdbe::insn::NullMatchingMask;
 use turso_parser::ast::NullsOrder;
@@ -434,6 +434,7 @@ impl<'a, 'plan> SeekEmitter<'a, 'plan> {
 
     fn operand_register(&mut self, pos: usize, key_reg: usize) -> usize {
         match self.seek_def.key_component_index_use(pos) {
+            IndexUse::KeyFunction(SeekKeyFunction::PgNumeric) => self.program.alloc_registers(3),
             IndexUse::KeyFunction(_) => self.program.alloc_registers(2),
             _ => key_reg,
         }
@@ -463,7 +464,9 @@ impl<'a, 'plan> SeekEmitter<'a, 'plan> {
                     .iter_affinity(seek_key)
                     .nth(pos)
                     .expect("key component must have an affinity");
-                if !affinity.expr_needs_no_affinity_change(operand) {
+                if function != SeekKeyFunction::PgNumeric
+                    && !affinity.expr_needs_no_affinity_change(operand)
+                {
                     self.program.emit_insn(Insn::Affinity {
                         start_reg: operand_reg,
                         count: std::num::NonZeroUsize::MIN,
@@ -481,13 +484,29 @@ impl<'a, 'plan> SeekEmitter<'a, 'plan> {
                     }
                 };
                 self.program.emit_int(no_key as i64, operand_reg + 1);
+                let mut arg_count = 2;
+                if function == SeekKeyFunction::PgNumeric {
+                    let column = &self.table.columns()[index.columns[pos].pos_in_table];
+                    let scale = column
+                        .ty_params
+                        .get(1)
+                        .expect("a pg_numeric column has a precision and a scale");
+                    translate_expr(
+                        self.program,
+                        None,
+                        scale,
+                        operand_reg + 2,
+                        &self.t_ctx.resolver,
+                    )?;
+                    arg_count = 3;
+                }
                 self.program.emit_insn(Insn::Function {
                     constant_mask: 0,
                     start_reg: operand_reg,
                     dest: key_reg,
                     func: FuncCtx {
                         func: Func::Scalar(function.scalar_func()),
-                        arg_count: 2,
+                        arg_count,
                     },
                 });
             }

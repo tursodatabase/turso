@@ -1324,6 +1324,13 @@ pub fn translate_alter_table(
                             "unknown datatype for {table_name}.{new_column_name}: \"{ty}\""
                         )));
                     }
+                    crate::translate::schema::validate_pg_storage_column_type(
+                        ty,
+                        btree.is_pg_storage,
+                        &format!("{table_name}.{new_column_name}"),
+                        resolver,
+                        connection,
+                    )?;
                 }
 
                 default_type_mismatch = btree.is_strict && strict_default_type_mismatch(&column)?;
@@ -1487,9 +1494,17 @@ pub fn translate_alter_table(
                 // bare identifiers qualify. Anything else — (5 + 3), random(),
                 // CURRENT_TIMESTAMP — is permitted only if the table is empty,
                 // checked at runtime (mirroring SQLite's sqlite3ErrorIfNotEmpty).
-                let needs_nondeterministic_check = column.default.as_ref().is_some_and(|default| {
-                    default_requires_empty_table(default) || !is_strict_constant_default(default)
-                });
+                let reads_clock_at_every_read = btree.is_pg_storage
+                    && crate::schema::pg_storage_type_shows_text(&column.ty_str)
+                    && column
+                        .default
+                        .as_deref()
+                        .is_some_and(crate::schema::is_pg_clock_word);
+                let needs_nondeterministic_check = reads_clock_at_every_read
+                    || column.default.as_ref().is_some_and(|default| {
+                        default_requires_empty_table(default)
+                            || !is_strict_constant_default(default)
+                    });
 
                 let (needs_empty_table_check, error_message) = if needs_notnull_check {
                     (true, "Cannot add a NOT NULL column with default value NULL")

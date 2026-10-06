@@ -15,7 +15,8 @@ use crate::function::JsonFunc;
 use crate::function::{AggFunc, Func, FuncCtx, MathFuncArity, ScalarFunc, VectorFunc};
 use crate::functions::datetime;
 use crate::schema::{
-    BTreeTable, ColDef, Column, ColumnLayout, GeneratedType, Schema, Table, Type, TypeDef,
+    BTreeTable, ColDef, Column, ColumnLayout, GeneratedType, ResolvedType, Schema, Table, Type,
+    TypeDef,
 };
 use crate::sync::Arc;
 use crate::translate::expression_index::{

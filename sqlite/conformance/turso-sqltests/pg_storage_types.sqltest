@@ -1,0 +1,497 @@
+@database :temp:
+@requires-file custom_types "uses custom types"
+
+# The built-in types that the tables of the PostgreSQL frontend use: pg_int4,
+# pg_int8, pg_timestamp, pg_timestamptz, pg_date, pg_time and pg_numeric.
+# Each stores an integer and shows PostgreSQL text. Only a table with the
+# PGSTORAGE option can use them in a column. Every query that compares a
+# column with an index must give the same rows with NOT INDEXED.
+
+setup events {
+    CREATE TABLE ev(id INTEGER PRIMARY KEY, ts pg_timestamp, tz pg_timestamptz, d pg_date, t pg_time) STRICT, PGSTORAGE;
+    CREATE INDEX ev_ts ON ev(ts);
+    CREATE INDEX ev_tz ON ev(tz);
+    CREATE INDEX ev_d ON ev(d);
+    CREATE INDEX ev_t ON ev(t);
+    INSERT INTO ev VALUES (1, '2024-01-01 00:00:00', '2024-01-01 10:00:00+02', '2024-01-01', '00:00:00');
+    INSERT INTO ev VALUES (2, '2024-01-01 10:30:00.25', '2024-01-01T10:30:00Z', '2024-01-05', '10:30');
+    INSERT INTO ev VALUES (3, '2024-01-02 08:00:00.123456', '2024-01-02 08:00:00-05:30', '2024-01-31 23:00', '23:59:59.999999');
+    INSERT INTO ev VALUES (4, '1999-12-31 23:59:59', '1999-12-31', '1999-12-31', '24:00:00');
+    INSERT INTO ev VALUES (5, NULL, NULL, NULL, NULL);
+}
+
+setup amounts {
+    CREATE TABLE pa(id INTEGER PRIMARY KEY, n pg_numeric(10,2)) STRICT, PGSTORAGE;
+    CREATE INDEX pa_n ON pa(n);
+    CREATE TABLE pb(id INTEGER PRIMARY KEY, m pg_numeric(12,4)) STRICT, PGSTORAGE;
+    CREATE INDEX pb_m ON pb(m);
+    INSERT INTO pa VALUES (1, 12.5), (2, '-0.005'), (3, 1.005), (4, 99999999.99), (5, -12), (6, NULL);
+    INSERT INTO pb SELECT id, n FROM pa;
+}
+
+@requires strict "uses STRICT tables"
+@setup events
+test temporal-columns-show-postgresql-text {
+    SELECT id, ts, tz, d, t, typeof(ts) FROM ev ORDER BY id;
+}
+expect {
+    1|2024-01-01 00:00:00|2024-01-01 08:00:00|2024-01-01|00:00:00|text
+    2|2024-01-01 10:30:00.25|2024-01-01 10:30:00|2024-01-05|10:30:00|text
+    3|2024-01-02 08:00:00.123456|2024-01-02 13:30:00|2024-01-31|23:59:59.999999|text
+    4|1999-12-31 23:59:59|1999-12-31 00:00:00|1999-12-31|24:00:00|text
+    5|||||null
+}
+
+test temporal-functions-store-integers-from-2000 {
+    SELECT pg_timestamp_encode('2000-01-01 00:00:01'), pg_timestamptz_encode('2000-01-01 01:00:00+01'), pg_date_encode('1999-12-31'), pg_time_encode('00:00:00.000001');
+    SELECT pg_timestamp_decode(-1), pg_date_decode(8766), pg_time_decode(86400000000);
+}
+expect {
+    1000000|0|-1|1
+    1999-12-31 23:59:59.999999|2024-01-01|24:00:00
+}
+
+test temporal-input-rounds-to-microseconds {
+    SELECT pg_timestamp('2024-01-01 10:00:00.1234565'), pg_timestamp('2024-01-01 23:59:59.9999995'), pg_time('10:00:00.0000004');
+}
+expect {
+    2024-01-01 10:00:00.123457|2024-01-02 00:00:00|10:00:00
+}
+
+test temporal-input-errors {
+    SELECT pg_date('2024-02-30');
+}
+expect error {
+    date/time field value out of range: "2024-02-30"
+}
+
+test temporal-input-refuses-a-number {
+    SELECT pg_timestamp_encode(20240101);
+}
+expect error {
+    invalid input for type timestamp: integer 20240101 is not text
+}
+
+test temporal-input-refuses-years-after-9999 {
+    SELECT pg_timestamp('10000-01-01');
+}
+expect error {
+    timestamp out of range: "10000-01-01"
+}
+
+test temporal-input-refuses-infinity {
+    SELECT pg_date('infinity');
+}
+expect error {
+    infinity is not supported
+}
+
+@requires strict "uses STRICT tables"
+test temporal-column-refuses-invalid-input {
+    CREATE TABLE bad(id INTEGER PRIMARY KEY, ts pg_timestamp) STRICT, PGSTORAGE;
+    INSERT INTO bad VALUES (1, 'not a timestamp');
+}
+expect error {
+    invalid input syntax for type timestamp: "not a timestamp"
+}
+
+@requires strict "uses STRICT tables"
+@setup events
+test temporal-order-by-same-with-and-without-index {
+    SELECT group_concat(id) FROM (SELECT id FROM ev ORDER BY ts DESC);
+    SELECT group_concat(id) FROM (SELECT id FROM ev NOT INDEXED ORDER BY ts DESC);
+    SELECT group_concat(id) FROM (SELECT id FROM ev ORDER BY t);
+    SELECT group_concat(id) FROM (SELECT id FROM ev NOT INDEXED ORDER BY t);
+    SELECT min(ts), max(ts), min(d), max(t) FROM ev;
+}
+expect {
+    3,2,1,4,5
+    3,2,1,4,5
+    5,1,2,3,4
+    5,1,2,3,4
+    1999-12-31 23:59:59|2024-01-02 08:00:00.123456|1999-12-31|24:00:00
+}
+
+@requires strict "uses STRICT tables"
+@setup events
+test timestamp-range-with-date-only-bound-seeks {
+    EXPLAIN QUERY PLAN SELECT id FROM ev WHERE ts >= '2024-01-01' AND ts < '2024-01-02';
+}
+expect {
+    1|0|0|SEARCH ev USING COVERING INDEX ev_ts (ts>=? AND ts<?)
+}
+
+@requires strict "uses STRICT tables"
+@setup events
+test timestamp-range-with-date-only-bound-same-rows-with-and-without-index {
+    SELECT group_concat(id) FROM (SELECT id FROM ev WHERE ts >= '2024-01-01' AND ts < '2024-01-02' ORDER BY id);
+    SELECT group_concat(id) FROM (SELECT id FROM ev NOT INDEXED WHERE ts >= '2024-01-01' AND ts < '2024-01-02' ORDER BY id);
+    SELECT group_concat(id) FROM (SELECT id FROM ev WHERE ts > '2024-01-01 10:30:00.25' ORDER BY id);
+    SELECT group_concat(id) FROM (SELECT id FROM ev NOT INDEXED WHERE ts > '2024-01-01 10:30:00.25' ORDER BY id);
+    SELECT group_concat(id) FROM (SELECT id FROM ev WHERE ts <= '2024-01-01 10:30:00.250' ORDER BY id);
+    SELECT group_concat(id) FROM (SELECT id FROM ev NOT INDEXED WHERE ts <= '2024-01-01 10:30:00.250' ORDER BY id);
+}
+expect {
+    1,2
+    1,2
+    3
+    3
+    1,2,4
+    1,2,4
+}
+
+@requires strict "uses STRICT tables"
+@setup events
+test temporal-equality-compares-the-text {
+    SELECT count(*) FROM ev WHERE ts = '2024-01-01';
+    SELECT count(*) FROM ev NOT INDEXED WHERE ts = '2024-01-01';
+    SELECT count(*) FROM ev WHERE ts = '2024-01-01 00:00:00';
+    SELECT count(*) FROM ev WHERE d = '2024-01-05';
+    SELECT count(*) FROM ev WHERE t = '10:30';
+    SELECT count(*) FROM ev NOT INDEXED WHERE t = '10:30';
+    SELECT count(*) FROM ev WHERE t = '10:30:00';
+}
+expect {
+    0
+    0
+    1
+    1
+    0
+    0
+    1
+}
+
+@requires strict "uses STRICT tables"
+@setup events
+test temporal-comparison-with-a-number-same-rows-with-and-without-index {
+    SELECT count(*) FROM ev WHERE ts > 2024;
+    SELECT count(*) FROM ev NOT INDEXED WHERE ts > 2024;
+    SELECT count(*) FROM ev WHERE d < '2024';
+    SELECT count(*) FROM ev NOT INDEXED WHERE d < '2024';
+    SELECT count(*) FROM ev WHERE t >= x'00';
+    SELECT count(*) FROM ev NOT INDEXED WHERE t >= x'00';
+}
+expect {
+    4
+    4
+    0
+    0
+    0
+    0
+}
+
+@requires strict "uses STRICT tables"
+@setup events
+test date-and-time-ranges-same-rows-with-and-without-index {
+    SELECT group_concat(id) FROM (SELECT id FROM ev WHERE d BETWEEN '2024-01-01' AND '2024-01-05' ORDER BY id);
+    SELECT group_concat(id) FROM (SELECT id FROM ev NOT INDEXED WHERE d BETWEEN '2024-01-01' AND '2024-01-05' ORDER BY id);
+    SELECT group_concat(id) FROM (SELECT id FROM ev WHERE t > '10:30' ORDER BY id);
+    SELECT group_concat(id) FROM (SELECT id FROM ev NOT INDEXED WHERE t > '10:30' ORDER BY id);
+    SELECT group_concat(id) FROM (SELECT id FROM ev WHERE tz < '2024-01-01 10' ORDER BY id);
+    SELECT group_concat(id) FROM (SELECT id FROM ev NOT INDEXED WHERE tz < '2024-01-01 10' ORDER BY id);
+}
+expect {
+    1,2
+    1,2
+    2,3,4
+    2,3,4
+    1,4
+    1,4
+}
+
+@requires strict "uses STRICT tables"
+@setup events
+test timestamp-join-with-text-column-same-rows-with-and-without-index {
+    CREATE TABLE marks(label TEXT, at TEXT) STRICT;
+    INSERT INTO marks VALUES ('a', '2024-01-01 00:00:00'), ('b', '2024-01-01'), ('c', '2024-01-01 10:30:00.25');
+    SELECT group_concat(label || id) FROM (SELECT label, id FROM marks JOIN ev ON ev.ts = marks.at ORDER BY label);
+    SELECT group_concat(label || id) FROM (SELECT label, id FROM marks JOIN ev NOT INDEXED ON ev.ts = marks.at ORDER BY label);
+}
+expect {
+    a1,c2
+    a1,c2
+}
+
+@requires strict "uses STRICT tables"
+test casts-give-the-value-a-column-shows {
+    SELECT CAST('2024-01-01' AS pg_timestamp), CAST('2024-01-01 10:00+02' AS pg_timestamptz), CAST('2024-01-01 10:00' AS pg_date), CAST('10:00:00.50' AS pg_time);
+    SELECT CAST(1.239 AS pg_numeric(10,2)), CAST('-0.005' AS pg_numeric(10,2)), CAST('5' AS pg_int8), typeof(CAST('5' AS pg_int8)), CAST(5.7 AS pg_int4);
+}
+expect {
+    2024-01-01 00:00:00|2024-01-01 08:00:00|2024-01-01|10:00:00.5
+    1.24|-0.01|5|integer|5
+}
+
+@requires strict "uses STRICT tables"
+@setup amounts
+test numeric-rounds-half-away-from-zero-and-keeps-the-scale {
+    SELECT id, n, m FROM pa JOIN pb USING (id) ORDER BY id;
+    SELECT pg_numeric_encode('12.5', 10, 2), pg_numeric_decode(-5, 2);
+}
+expect {
+    1|12.50|12.5000
+    2|-0.01|-0.0100
+    3|1.01|1.0100
+    4|99999999.99|99999999.9900
+    5|-12.00|-12.0000
+    6||
+    1250|-0.05
+}
+
+@requires strict "uses STRICT tables"
+test numeric-overflow-is-refused {
+    CREATE TABLE big(id INTEGER PRIMARY KEY, n pg_numeric(10,2)) STRICT, PGSTORAGE;
+    INSERT INTO big VALUES (1, 99999999.995);
+}
+expect error {
+    numeric field overflow: a field with precision 10, scale 2 must round to an absolute value less than 10
+}
+
+@requires strict "uses STRICT tables"
+test numeric-refuses-invalid-text {
+    CREATE TABLE bad(id INTEGER PRIMARY KEY, n pg_numeric(10,2)) STRICT, PGSTORAGE;
+    INSERT INTO bad VALUES (1, '12.5abc');
+}
+expect error {
+    invalid input syntax for type numeric: "12.5abc"
+}
+
+@requires strict "uses STRICT tables"
+@setup amounts
+test numeric-literal-comparisons-same-rows-with-and-without-index {
+    SELECT group_concat(id) FROM (SELECT id FROM pa WHERE n = 12.5 ORDER BY id);
+    SELECT group_concat(id) FROM (SELECT id FROM pa NOT INDEXED WHERE n = 12.5 ORDER BY id);
+    SELECT group_concat(id) FROM (SELECT id FROM pa WHERE n = '12.50' ORDER BY id);
+    SELECT count(*) FROM pa WHERE n = 1.005;
+    SELECT count(*) FROM pa NOT INDEXED WHERE n = 1.005;
+    SELECT group_concat(id) FROM (SELECT id FROM pa WHERE n > 1.005 ORDER BY id);
+    SELECT group_concat(id) FROM (SELECT id FROM pa NOT INDEXED WHERE n > 1.005 ORDER BY id);
+    SELECT group_concat(id) FROM (SELECT id FROM pa WHERE n <= -0.01 ORDER BY id);
+    SELECT group_concat(id) FROM (SELECT id FROM pa NOT INDEXED WHERE n <= -0.01 ORDER BY id);
+    SELECT count(*) FROM pa WHERE n < 1e12;
+    SELECT count(*) FROM pa NOT INDEXED WHERE n < 1e12;
+}
+expect {
+    1
+    1
+    1
+    0
+    0
+    1,3,4
+    1,3,4
+    2,5
+    2,5
+    5
+    5
+}
+
+@requires strict "uses STRICT tables"
+@setup amounts
+test numeric-literal-comparisons-seek {
+    EXPLAIN QUERY PLAN SELECT id FROM pa WHERE n = 12.5;
+    EXPLAIN QUERY PLAN SELECT id FROM pa WHERE n > 1.005;
+}
+expect {
+    1|0|0|SEARCH pa USING COVERING INDEX pa_n (n=?)
+    1|0|0|SEARCH pa USING COVERING INDEX pa_n (n>?)
+}
+
+@requires strict "uses STRICT tables"
+@setup amounts
+test numeric-invalid-literal-raises-with-and-without-index {
+    SELECT count(*) FROM pa WHERE n = '12.5abc';
+}
+expect error {
+    invalid numeric value: "12.5abc"
+}
+
+@requires strict "uses STRICT tables"
+@setup amounts
+test numeric-arithmetic-reads-the-literal-as-a-value {
+    SELECT n + 1, n * 1.1, n - n FROM pa WHERE id = 1;
+}
+expect {
+    13.50|13.750|0.00
+}
+
+@requires strict "uses STRICT tables"
+@setup amounts
+test numeric-order-same-with-and-without-index {
+    SELECT group_concat(id) FROM (SELECT id FROM pa ORDER BY n);
+    SELECT group_concat(id) FROM (SELECT id FROM pa NOT INDEXED ORDER BY n);
+    SELECT group_concat(n) FROM (SELECT n FROM pa GROUP BY n);
+    SELECT min(n), max(n) FROM pa;
+}
+expect {
+    6,5,2,3,1,4
+    6,5,2,3,1,4
+    -12.00,-0.01,1.01,12.50,99999999.99
+    -12.00|99999999.99
+}
+
+@requires strict "uses STRICT tables"
+@setup amounts
+test numeric-join-across-scales-same-rows-with-and-without-index {
+    SELECT group_concat(pair) FROM (SELECT pa.id || '=' || pb.id AS pair FROM pa JOIN pb ON pb.m = pa.n ORDER BY pa.id);
+    SELECT count(*) FROM pa JOIN pb ON pb.m = pa.n;
+    SELECT count(*) FROM pa JOIN pb NOT INDEXED ON pb.m = pa.n;
+    SELECT count(*) FROM pb JOIN pa ON pa.n = pb.m;
+}
+expect {
+    1=1,2=2,3=3,4=4,5=5
+    5
+    5
+    5
+}
+
+@requires strict "uses STRICT tables"
+test pg-types-need-a-pgstorage-table {
+    CREATE TABLE t(x pg_timestamp) STRICT;
+}
+expect error {
+    column t.x has type "pg_timestamp", which only a table with the PGSTORAGE option can use
+}
+
+@requires strict "uses STRICT tables"
+test pg-types-need-a-pgstorage-table-for-add-column {
+    CREATE TABLE t(x INTEGER) STRICT;
+    ALTER TABLE t ADD COLUMN y pg_numeric(10,2);
+}
+expect error {
+    column t.y has type "pg_numeric", which only a table with the PGSTORAGE option can use
+}
+
+@requires strict "uses STRICT tables"
+test pg-types-need-a-pgstorage-table-through-a-domain {
+    CREATE DOMAIN day AS pg_date;
+    CREATE TABLE t(x day) STRICT;
+}
+expect error {
+    column t.x has type "day", which only a table with the PGSTORAGE option can use
+}
+
+@requires strict "uses STRICT tables"
+test pg-types-in-a-pgstorage-table-through-a-domain {
+    CREATE DOMAIN day AS pg_date;
+    CREATE TABLE t(id INTEGER PRIMARY KEY, x day) STRICT, PGSTORAGE;
+    INSERT INTO t VALUES (1, '2024-03-01 10:00');
+    SELECT x, CAST('2024-03-02' AS day) FROM t;
+}
+expect {
+    2024-03-01|2024-03-02
+}
+
+@requires strict "uses STRICT tables"
+test pg-int8-and-pg-int4-store-integers {
+    CREATE TABLE ints(id INTEGER PRIMARY KEY, a pg_int4, b pg_int8) STRICT, PGSTORAGE;
+    CREATE INDEX ints_b ON ints(b);
+    INSERT INTO ints VALUES (1, 7, 9000000000), (2, -7, -5), (3, '12', '13');
+    SELECT id, a, b, typeof(a), typeof(b) FROM ints ORDER BY b;
+    EXPLAIN QUERY PLAN SELECT id FROM ints WHERE b > 0;
+}
+expect {
+    2|-7|-5|integer|integer
+    3|12|13|integer|integer
+    1|7|9000000000|integer|integer
+    1|0|0|SEARCH ints USING COVERING INDEX ints_b (b>?)
+}
+
+@requires strict "uses STRICT tables"
+test expression-index-on-a-cast-function {
+    CREATE TABLE e(id INTEGER PRIMARY KEY, ts pg_timestamp) STRICT, PGSTORAGE;
+    CREATE INDEX e_day ON e(pg_date(ts));
+    INSERT INTO e VALUES (1, '2024-01-01 10:00'), (2, '2024-01-02 00:00');
+    SELECT id FROM e WHERE pg_date(ts) = '2024-01-01';
+    PRAGMA integrity_check;
+}
+expect {
+    1
+    ok
+}
+
+@requires strict "uses STRICT tables"
+test partial-index-refuses-a-cast-of-now {
+    CREATE TABLE e(id INTEGER PRIMARY KEY, ts pg_timestamp) STRICT, PGSTORAGE;
+    CREATE INDEX e_future ON e(id) WHERE ts > pg_timestamp('now');
+}
+expect error {
+    cannot use aggregate, window functions or reference other tables in WHERE clause of CREATE INDEX
+}
+
+@requires strict "uses STRICT tables"
+test expression-index-refuses-a-cast-of-today {
+    CREATE TABLE e(id INTEGER PRIMARY KEY, ts pg_timestamp) STRICT, PGSTORAGE;
+    CREATE INDEX e_today ON e(pg_date(' Today '));
+}
+expect error {
+    invalid expression in CREATE INDEX
+}
+
+@requires strict "uses STRICT tables"
+test check-compares-pg-numeric-columns-only-at-the-same-scale {
+    CREATE TABLE ck(id INTEGER PRIMARY KEY, a pg_numeric(10,2), b pg_numeric(10,3), CHECK (a >= b)) STRICT, PGSTORAGE;
+}
+expect error {
+    type mismatch in CHECK constraint: cannot compare pg_numeric
+}
+
+@requires strict "uses STRICT tables"
+test check-of-pg-numeric-columns-with-the-same-scale {
+    CREATE TABLE ck(id INTEGER PRIMARY KEY, a pg_numeric(10,2), b pg_numeric(10,2), CHECK (a >= b)) STRICT, PGSTORAGE;
+    INSERT INTO ck VALUES (1, 10, 9.99);
+    SELECT a, b FROM ck;
+}
+expect {
+    10.00|9.99
+}
+
+@requires strict "uses STRICT tables"
+test check-of-pg-numeric-columns-with-the-same-scale-refuses-a-row {
+    CREATE TABLE ck(id INTEGER PRIMARY KEY, a pg_numeric(10,2), b pg_numeric(10,2), CHECK (a >= b)) STRICT, PGSTORAGE;
+    INSERT INTO ck VALUES (2, 1, 2);
+}
+expect error {
+    CHECK constraint failed
+}
+
+@requires strict "uses STRICT tables"
+test upsert-keeps-the-exact-values {
+    CREATE TABLE u(id INTEGER PRIMARY KEY, ts pg_timestamp, n pg_numeric(18,6), note TEXT) STRICT, PGSTORAGE;
+    INSERT INTO u VALUES (1, '2024-01-01 10:00:00.000001', '123456789012.345678', 'a');
+    INSERT INTO u VALUES (1, '2000-01-01', 0, 'b') ON CONFLICT (id) DO UPDATE SET note = excluded.note;
+    SELECT ts, n, note FROM u;
+}
+expect {
+    2024-01-01 10:00:00.000001|123456789012.345678|b
+}
+
+@requires strict "uses STRICT tables"
+@setup events
+test vacuum-keeps-the-values {
+    VACUUM;
+    SELECT id, ts, tz, d, t FROM ev WHERE id = 3;
+}
+expect {
+    3|2024-01-02 08:00:00.123456|2024-01-02 13:30:00|2024-01-31|23:59:59.999999
+}
+
+@requires strict "uses STRICT tables"
+test add-column-with-now-default-needs-an-empty-table {
+    CREATE TABLE a(id INTEGER PRIMARY KEY) STRICT, PGSTORAGE;
+    INSERT INTO a VALUES (1);
+    ALTER TABLE a ADD COLUMN ts pg_timestamp DEFAULT 'now';
+}
+expect error {
+    Cannot add a column with non-constant default
+}
+
+@requires strict "uses STRICT tables"
+test add-column-with-now-default-to-an-empty-table {
+    CREATE TABLE a(id INTEGER PRIMARY KEY) STRICT, PGSTORAGE;
+    ALTER TABLE a ADD COLUMN ts pg_timestamp DEFAULT 'now';
+    INSERT INTO a (id) VALUES (1);
+    SELECT count(*) FROM a WHERE ts > '2020-01-01';
+}
+expect {
+    1
+}

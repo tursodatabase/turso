@@ -236,13 +236,63 @@ pub(crate) enum IndexUse {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SeekKeyFunction {
     Uuid,
+    PgTimestamp,
+    PgDate,
+    PgTime,
+    PgNumeric,
 }
 
 impl SeekKeyFunction {
     pub(crate) fn scalar_func(self) -> ScalarFunc {
         match self {
             Self::Uuid => ScalarFunc::UuidSeekKey,
+            Self::PgTimestamp => ScalarFunc::PgTimestampSeekKey,
+            Self::PgDate => ScalarFunc::PgDateSeekKey,
+            Self::PgTime => ScalarFunc::PgTimeSeekKey,
+            Self::PgNumeric => ScalarFunc::PgNumericSeekKey,
         }
+    }
+}
+
+/// The built-in types of the tables that the PostgreSQL frontend creates.
+/// A table needs the PGSTORAGE option to use them in a column.
+pub(crate) const PG_STORAGE_TYPE_NAMES: [&str; 7] = [
+    "pg_int4",
+    "pg_int8",
+    "pg_timestamp",
+    "pg_timestamptz",
+    "pg_date",
+    "pg_time",
+    "pg_numeric",
+];
+
+pub(crate) fn pg_storage_type_shows_text(name: &str) -> bool {
+    [
+        "pg_timestamp",
+        "pg_timestamptz",
+        "pg_date",
+        "pg_time",
+        "pg_numeric",
+    ]
+    .iter()
+    .any(|pg_name| pg_name.eq_ignore_ascii_case(name))
+}
+
+pub(crate) fn is_pg_storage_type_name(name: &str) -> bool {
+    PG_STORAGE_TYPE_NAMES
+        .iter()
+        .any(|pg_name| pg_name.eq_ignore_ascii_case(name))
+}
+
+impl TypeDef {
+    pub(crate) fn is_pg_storage_type(&self) -> bool {
+        self.is_builtin && is_pg_storage_type_name(&self.name)
+    }
+}
+
+impl ResolvedType {
+    pub(crate) fn needs_pg_storage(&self) -> bool {
+        self.chain.iter().any(|td| td.is_pg_storage_type())
     }
 }
 
@@ -832,6 +882,13 @@ fn bootstrap_builtin_types(registry: &mut HashMap<String, Arc<TypeDef>>) -> crat
         "CREATE TYPE macaddr8(value text) BASE text ENCODE value DECODE value",
         "CREATE TYPE bytea(value blob) BASE blob OPERATOR '<'",
         "CREATE TYPE numeric(value any, precision integer, scale integer) BASE blob ENCODE numeric_encode(value, precision, scale) DECODE numeric_decode(value) OPERATOR '+' numeric_add OPERATOR '-' numeric_sub OPERATOR '*' numeric_mul OPERATOR '/' numeric_div OPERATOR '<' numeric_lt OPERATOR '=' numeric_eq",
+        "CREATE TYPE pg_int4(value integer) BASE integer",
+        "CREATE TYPE pg_int8(value integer) BASE integer",
+        "CREATE TYPE pg_timestamp(value any) BASE integer ENCODE pg_timestamp_encode(value) DECODE pg_timestamp_decode(value) OPERATOR '<'",
+        "CREATE TYPE pg_timestamptz(value any) BASE integer ENCODE pg_timestamptz_encode(value) DECODE pg_timestamp_decode(value) OPERATOR '<'",
+        "CREATE TYPE pg_date(value any) BASE integer ENCODE pg_date_encode(value) DECODE pg_date_decode(value) OPERATOR '<'",
+        "CREATE TYPE pg_time(value any) BASE integer ENCODE pg_time_encode(value) DECODE pg_time_decode(value) OPERATOR '<'",
+        "CREATE TYPE pg_numeric(value any, precision integer, scale integer) BASE integer ENCODE pg_numeric_encode(value, precision, scale) DECODE pg_numeric_decode(value, scale) OPERATOR '+' numeric_add OPERATOR '-' numeric_sub OPERATOR '*' numeric_mul OPERATOR '/' numeric_div OPERATOR '<' numeric_lt OPERATOR '=' numeric_eq",
     ];
 
     for sql in type_sqls {
@@ -1035,8 +1092,16 @@ impl Schema {
         Ok(Some(ResolvedType { primitive, chain }))
     }
 
+    /// Remove a type. A user type of an older file can have the name of a
+    /// built-in type; removing it makes the built-in type visible again.
     pub fn remove_type(&mut self, type_name: &str) {
-        self.type_registry.remove(&type_name.to_lowercase());
+        let key = type_name.to_lowercase();
+        self.type_registry.remove(&key);
+        let mut builtin_types = HashMap::default();
+        bootstrap_builtin_types(&mut builtin_types).expect("built-in type definitions parse");
+        if let Some(builtin) = builtin_types.remove(&key) {
+            self.type_registry.insert(key, builtin);
+        }
     }
 
     /// Chase the base type chain: domain_a → domain_b → integer
@@ -1158,13 +1223,21 @@ impl Schema {
                         table.name
                     )));
                 }
+                if !table.is_pg_storage
+                    && matches!(types.resolve_type_unchecked(&column.ty_str), Ok(Some(resolved)) if resolved.needs_pg_storage())
+                {
+                    return Err(LimboError::ParseError(format!(
+                        "column {}.{column_name} has type \"{}\", which only a table with the PGSTORAGE option can use",
+                        table.name, column.ty_str
+                    )));
+                }
             }
         }
         Ok(())
     }
 
-    /// The first user type in the type chain of `type_name` whose definition
-    /// in this schema is not the definition in `types`.
+    /// The first type in the type chain of `type_name` whose definition in
+    /// this schema is not the definition in `types`.
     fn type_defined_differently(&self, types: &Schema, type_name: &str) -> Option<String> {
         let Ok(Some(resolved)) = self.resolve_type_unchecked(type_name) else {
             return None;
@@ -1172,12 +1245,11 @@ impl Schema {
         resolved
             .chain
             .iter()
-            .filter(|own| !own.is_builtin)
             .find(|own| {
                 types
                     .type_registry
                     .get(&own.name.to_lowercase())
-                    .is_none_or(|other| other.sql != own.sql)
+                    .is_none_or(|other| other.is_builtin != own.is_builtin || other.sql != own.sql)
             })
             .map(|own| own.name.clone())
     }
@@ -2789,22 +2861,24 @@ fn resolved_type_index_use(resolved: &ResolvedType, collation: CollationSeq) -> 
     {
         return IndexUse::Unusable;
     }
-    if resolved.chain.iter().any(declares_comparison_function) {
-        let leaf = resolved.leaf();
-        return if leaf.is_builtin && leaf.name == "numeric" {
-            IndexUse::EncodedLiteralEquality
-        } else {
-            IndexUse::Unusable
-        };
-    }
     let mut key_function = None;
     for td in resolved.chain.iter() {
-        if decode_returns_stored_value(td) {
+        if let Some(function) = builtin_seek_key_function(td) {
+            if key_function.replace(function).is_some() {
+                return IndexUse::Unusable;
+            }
             continue;
         }
-        match builtin_seek_key_function(td) {
-            Some(function) if key_function.is_none() => key_function = Some(function),
-            _ => return IndexUse::Unusable,
+        if declares_comparison_function(td) {
+            let leaf = resolved.leaf();
+            return if leaf.is_builtin && leaf.name == "numeric" {
+                IndexUse::EncodedLiteralEquality
+            } else {
+                IndexUse::Unusable
+            };
+        }
+        if !decode_returns_stored_value(td) {
+            return IndexUse::Unusable;
         }
     }
     match key_function {
@@ -2835,8 +2909,15 @@ fn decode_returns_stored_value(td: &TypeDef) -> bool {
 }
 
 fn builtin_seek_key_function(td: &TypeDef) -> Option<SeekKeyFunction> {
-    match (td.is_builtin, td.name.as_str()) {
-        (true, "uuid") => Some(SeekKeyFunction::Uuid),
+    if !td.is_builtin {
+        return None;
+    }
+    match td.name.as_str() {
+        "uuid" => Some(SeekKeyFunction::Uuid),
+        "pg_timestamp" | "pg_timestamptz" => Some(SeekKeyFunction::PgTimestamp),
+        "pg_date" => Some(SeekKeyFunction::PgDate),
+        "pg_time" => Some(SeekKeyFunction::PgTime),
+        "pg_numeric" => Some(SeekKeyFunction::PgNumeric),
         _ => None,
     }
 }

@@ -797,10 +797,25 @@ fn translate_cast_expr(
 
                 // Validate domain constraints on the encoded value
                 emit_domain_cast_constraints(program, &resolved.chain, target_register, resolver)?;
+                if resolved.needs_pg_storage() {
+                    emit_cast_value_decode(
+                        program,
+                        &resolved,
+                        &cast_col,
+                        target_register,
+                        resolver,
+                    )?;
+                }
                 return Ok(target_register);
             }
 
             let type_def = resolved.leaf();
+            if type_def.is_pg_storage_type()
+                && (type_def.name != "pg_numeric" || ty_params.len() == 2)
+            {
+                emit_pg_storage_cast(program, type_def, &ty_params, target_register, resolver)?;
+                return Ok(target_register);
+            }
             // If the custom type requires parameters but the CAST
             // doesn't provide them (e.g. CAST(x AS NUMERIC) vs
             // CAST(x AS numeric(10,2))), fall through to regular CAST.
@@ -846,6 +861,81 @@ fn translate_cast_expr(
         affinity: type_affinity,
     });
     Ok(target_register)
+}
+
+fn emit_cast_value_decode(
+    program: &mut ProgramBuilder,
+    resolved: &ResolvedType,
+    cast_col: &Column,
+    reg: usize,
+    resolver: &Resolver,
+) -> Result<()> {
+    let skip_label = program.allocate_label();
+    program.emit_insn(Insn::IsNull {
+        reg,
+        target_pc: skip_label,
+    });
+    for td in resolved.chain.iter().rev() {
+        if let Some(decode_expr) = td.decode() {
+            emit_type_expr(program, decode_expr, reg, reg, cast_col, td, resolver)?;
+        }
+    }
+    program.preassign_label_to_next_insn(skip_label);
+    Ok(())
+}
+
+/// A cast to a built-in type of the PostgreSQL frontend gives the value that
+/// a column of the type shows, not the stored integer.
+fn emit_pg_storage_cast(
+    program: &mut ProgramBuilder,
+    type_def: &TypeDef,
+    ty_params: &[Box<ast::Expr>],
+    reg: usize,
+    resolver: &Resolver,
+) -> Result<()> {
+    let cast_function = match type_def.name.as_str() {
+        "pg_int4" | "pg_int8" => {
+            program.emit_insn(Insn::Cast {
+                reg,
+                affinity: Affinity::Integer,
+            });
+            return Ok(());
+        }
+        "pg_numeric" => {
+            let mut cast_col = Column::new(
+                None,
+                type_def.name.clone(),
+                None,
+                None,
+                Type::Null,
+                None,
+                ColDef::default(),
+            );
+            cast_col.ty_params = ty_params.to_vec();
+            let resolved = ResolvedType {
+                primitive: type_def.base().to_string(),
+                chain: vec![Arc::new(type_def.clone())],
+            };
+            let encode = type_def.encode().expect("pg_numeric has an ENCODE");
+            emit_type_expr(program, encode, reg, reg, &cast_col, type_def, resolver)?;
+            return emit_cast_value_decode(program, &resolved, &cast_col, reg, resolver);
+        }
+        "pg_timestamp" => ScalarFunc::PgTimestamp,
+        "pg_timestamptz" => ScalarFunc::PgTimestamptz,
+        "pg_date" => ScalarFunc::PgDate,
+        "pg_time" => ScalarFunc::PgTime,
+        other => unreachable!("{other} is not a built-in type of the PostgreSQL frontend"),
+    };
+    program.emit_insn(Insn::Function {
+        constant_mask: 0,
+        start_reg: reg,
+        dest: reg,
+        func: FuncCtx {
+            func: Func::Scalar(cast_function),
+            arg_count: 1,
+        },
+    });
+    Ok(())
 }
 
 #[inline(never)]
