@@ -1051,6 +1051,9 @@ pub struct Transaction<A: RowVersionAllocator = TursoAllocator> {
     /// materialization's frames are at-or-below this read mark (or in an earlier, backfilled WAL
     /// epoch). See [`MvStore::is_btree_readable_at`] / [`MvStore::compute_min_reader_mark`].
     read_mark: WalPos,
+    /// Table and index ids this transaction allocated with `CreateBtree`. No other
+    /// transaction can see these objects, so rollback drops their row maps whole.
+    created_table_ids: Mutex<Vec<MVTableId>>,
 }
 
 impl<A: RowVersionAllocator> Transaction<A> {
@@ -1077,6 +1080,7 @@ impl<A: RowVersionAllocator> Transaction<A> {
             abort_now: AtomicBool::new(false),
             commit_dep_set: Mutex::new(HashSet::default()),
             holds_blocking_checkpoint_read: AtomicBool::new(false),
+            created_table_ids: Mutex::new(Vec::new()),
         }
     }
 
@@ -5363,6 +5367,17 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         self.next_table_id.fetch_sub(1, Ordering::SeqCst)
     }
 
+    /// Records that `tx_id` allocated `table_id` with `CreateBtree`, so rollback can drop
+    /// everything stored under it.
+    pub fn record_created_table_id(&self, tx_id: TxID, table_id: i64) {
+        if let Some(tx) = self.txs.get(&tx_id) {
+            tx.value()
+                .created_table_ids
+                .lock()
+                .push(MVTableId::new(table_id));
+        }
+    }
+
     pub fn get_next_rowid(&self) -> i64 {
         self.next_rowid.fetch_add(1, Ordering::SeqCst) as i64
     }
@@ -7079,18 +7094,26 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         // Transfer ownership under the lock so we can drop it before taking
         // row-version-chain locks.
         let write_set = tx.write_set.lock().take();
-        for (_rowid, row_versions) in write_set.entries {
-            let mut restored_rowid = None;
-            for rv in row_versions.write().iter_mut() {
-                if rollback_row_version(tx_id, rv) {
-                    restored_rowid = Some(rv.row.id.clone());
-                }
-            }
+        let mut removed_versions = 0;
+        for (rowid, row_versions) in write_set.entries {
+            let (removed, restores_rowid) =
+                Self::rollback_version_chain(tx_id, &mut row_versions.write());
+            removed_versions += removed;
             // Rollback made this row visible again. For example, if rowid 3 is restored,
             // the next INSERT without an explicit rowid must choose 4, not reuse 3.
-            if let Some(rowid) = restored_rowid {
+            if restores_rowid {
                 self.bump_rowid_allocator_for_restored_row(&rowid);
             }
+        }
+        self.dec_live_version_count_approx(removed_versions);
+
+        // The loop above emptied the chains but left their slots. A table or index this
+        // transaction created never existed for anyone else, and its id is never reused,
+        // so nothing would ever reclaim those slots. E.g. a CREATE INDEX that is retried
+        // and rolled back over and over would leave one full set of keys per attempt.
+        let created_table_ids = std::mem::take(&mut *tx.created_table_ids.lock());
+        for table_id in created_table_ids {
+            self.drop_created_btree(table_id);
         }
 
         if let Some(connection) = connection {
@@ -7111,6 +7134,37 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
         // read lock), so no future txs.get() for this tx_id can come from a
         // speculative read path.
         crate::without_allocation_faults!(self.remove_tx(tx_id).expect(ALLOC_ERR_MSG));
+    }
+
+    /// Removes the row maps of a table or index created by a transaction that rolled back.
+    /// Writers retry when their slot is unlinked, and no other transaction can write to an
+    /// object that only existed in the aborted transaction's schema.
+    fn drop_created_btree(&self, table_id: MVTableId) {
+        if let Some(index) = self.index_rows.get(&table_id) {
+            self.bump_index_rows_epoch();
+            index.remove();
+        }
+        let start = RowID::new(table_id, RowKey::Int(i64::MIN));
+        let end = RowID::new(table_id, RowKey::Int(i64::MAX));
+        for entry in self.rows.range(start..=end) {
+            entry.remove();
+        }
+    }
+
+    fn rollback_version_chain(tx_id: u64, versions: &mut RowVersionChain<A>) -> (usize, bool) {
+        let before = versions.len();
+        let mut restores_rowid = false;
+        versions.retain_mut(|version| {
+            restores_rowid |= rollback_restores_rowid(tx_id, version);
+            if version.begin() == Some(TxTimestampOrID::TxID(tx_id)) {
+                return false;
+            }
+            if version.end() == Some(TxTimestampOrID::TxID(tx_id)) {
+                version.set_end(None);
+            }
+            true
+        });
+        (before - versions.len(), restores_rowid)
     }
 
     fn cleanup_dropped_commit(&self, tx_id: TxID, connection: &Connection, db_id: usize) {
@@ -10318,22 +10372,6 @@ impl<Clock: LogicalClock, A: ConcurrentAllocator> MvStore<Clock, A> {
             false
         }
     }
-}
-
-fn rollback_row_version(tx_id: u64, rv: &mut RowVersion) -> bool {
-    let restores_rowid = rollback_restores_rowid(tx_id, rv);
-    if rv.begin() == Some(TxTimestampOrID::TxID(tx_id)) {
-        // If the transaction has aborted,
-        // it marks all its new versions as garbage and sets their Begin
-        // and End timestamps to infinity to make them invisible
-        // See section 2.4: https://www.cs.cmu.edu/~15721-f24/papers/Hekaton.pdf
-        rv.set_begin(None);
-        rv.set_end(None);
-    } else if rv.end() == Some(TxTimestampOrID::TxID(tx_id)) {
-        // undo deletions by this transaction
-        rv.set_end(None);
-    }
-    restores_rowid
 }
 
 fn rollback_restores_rowid(tx_id: u64, rv: &RowVersion) -> bool {

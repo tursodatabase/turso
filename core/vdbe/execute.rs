@@ -13962,6 +13962,9 @@ pub fn op_create_btree(
 
     if let Some(mv_store) = mv_store.as_ref() {
         let root_page = mv_store.get_next_table_id();
+        if let Some(tx_id) = program.connection.get_mv_tx_id_for_db(*db) {
+            mv_store.record_created_table_id(tx_id, root_page);
+        }
         state.registers[*root].set_int(root_page);
         state.pc += 1;
         return Ok(InsnFunctionStepResult::Step);
