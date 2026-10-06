@@ -199,8 +199,9 @@ impl ExternalFunc {
         callback: ScalarFunction,
         context_destructor: Option<ContextDestructor>,
         value_destructor: Option<ValueDestructor>,
-    ) -> Self {
-        Self {
+    ) -> crate::Result<Self> {
+        Self::validate_arg_count(argc)?;
+        Ok(Self {
             name,
             func: ExtFunc::Scalar {
                 context,
@@ -211,7 +212,7 @@ impl ExternalFunc {
                 value_destructor,
                 context_owner: ExternalContext::new(context, context_destructor),
             },
-        }
+        })
     }
 
     pub fn new_aggregate(
@@ -222,8 +223,9 @@ impl ExternalFunc {
         context_destructor: Option<ContextDestructor>,
         aggregate_destructor: Option<ContextDestructor>,
         value_destructor: Option<ValueDestructor>,
-    ) -> Self {
-        Self {
+    ) -> crate::Result<Self> {
+        Self::validate_arg_count(argc)?;
+        Ok(Self {
             name,
             func: ExtFunc::Aggregate {
                 context,
@@ -236,7 +238,16 @@ impl ExternalFunc {
                 value_destructor,
                 context_owner: ExternalContext::new(context, context_destructor),
             },
+        })
+    }
+
+    pub(crate) fn validate_arg_count(argc: i32) -> crate::Result<()> {
+        if argc < -1 {
+            return Err(LimboError::InvalidArgument(
+                "function argument count must be at least -1".into(),
+            ));
         }
+        Ok(())
     }
 }
 
